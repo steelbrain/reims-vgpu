@@ -24,22 +24,30 @@
 //! slot of address space 0 holds (the log before its start among them), a slot whose read KVM
 //! refused, a host that reads the log itself ([`DirtyHost::for_each_slot`] false), a flush past
 //! its time, and the host's writes where a granule's place in the host's record does not keep
-//! its guest address's offset in a [`GRANULE`]. Each costs a copy, never a missed write.
+//! its guest address's offset in a [`GRANULE`](reims_vgpu_core::memory::dirty::GRANULE). Each costs a copy, never a missed write.
 //!
 //! The log is started ([`DirtyHost::start`]) at the first harvest, not with the device: KVM maps
 //! a logged slot's pages 4 KiB at a time, so a device whose runtime never asks costs the guest
 //! no huge pages.
 
+// KVM is a Linux service, not a Unix service. Keep its harvest machinery
+// available to tests on every host without compiling it into macOS/Windows.
+#[cfg(any(target_os = "linux", test))]
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::{self, JoinHandle, Thread};
+#[cfg(any(target_os = "linux", test))]
+use std::thread;
+use std::thread::{JoinHandle, Thread};
 use std::time::Duration;
 
-use reims_vgpu_core::memory::dirty::{DirtyLog, DirtyStamp, GRANULE, PAGE_SIZE};
+use reims_vgpu_core::memory::dirty::DirtyLog;
+#[cfg(any(target_os = "linux", test))]
+use reims_vgpu_core::memory::dirty::{DirtyStamp, GRANULE, PAGE_SIZE};
 
 /// How long a flush of the vCPUs may take: the log's own wait, past which a harvest no longer
 /// spares the copy it was wanted for.
+#[cfg(any(target_os = "linux", test))]
 const FLUSH_TIMEOUT: Duration = Duration::from_millis(4);
 
 /// One memory slot of the host's KVM VM that logs dirty pages ([`DirtyHost::for_each_slot`]).
@@ -80,7 +88,7 @@ pub trait DirtyHost: Send + Sync {
     /// ORs into `words`, one bit a 4 KiB page from `host_offset`, the pages of `length` bytes
     /// the host itself wrote since its last take, and clears them in its record. Called only
     /// inside [`DirtyHost::for_each_slot`]'s `slot`, with `host_offset` and `length` multiples
-    /// of [`GRANULE`].
+    /// of [`GRANULE`](reims_vgpu_core::memory::dirty::GRANULE).
     fn take_host_writes(&self, host_offset: u64, length: u64, words: &mut [u64]);
 }
 
@@ -102,6 +110,7 @@ impl std::fmt::Debug for DirtySource {
 }
 
 /// KVM's two dirty-log ioctls on one slot (the VM's in the product, a fake in tests).
+#[cfg(any(target_os = "linux", test))]
 pub(crate) trait KvmLog: Send {
     /// `KVM_GET_DIRTY_LOG` into `bitmap`, which holds a bit for each of the slot's pages.
     fn get(&self, slot: u32, bitmap: &mut [u64]) -> bool;
@@ -111,10 +120,12 @@ pub(crate) trait KvmLog: Send {
 }
 
 /// The VM's file descriptor, borrowed from the host.
+#[cfg(target_os = "linux")]
 struct VmFd(i32);
 
 /// `struct kvm_dirty_log` (linux/kvm.h).
 #[repr(C)]
+#[cfg(target_os = "linux")]
 struct KvmDirtyLog {
     slot: u32,
     padding1: u32,
@@ -123,6 +134,7 @@ struct KvmDirtyLog {
 
 /// `struct kvm_clear_dirty_log` (linux/kvm.h).
 #[repr(C)]
+#[cfg(target_os = "linux")]
 struct KvmClearDirtyLog {
     slot: u32,
     num_pages: u32,
@@ -131,12 +143,16 @@ struct KvmClearDirtyLog {
 }
 
 /// `_IOW(KVMIO, 0x42, struct kvm_dirty_log)`.
+#[cfg(target_os = "linux")]
 const KVM_GET_DIRTY_LOG: u64 = 0x4010_ae42;
 /// `_IOWR(KVMIO, 0xc0, struct kvm_clear_dirty_log)`.
+#[cfg(target_os = "linux")]
 const KVM_CLEAR_DIRTY_LOG: u64 = 0xc018_aec0;
 
+#[cfg(target_os = "linux")]
 const _: () = assert!(size_of::<KvmDirtyLog>() == 16 && size_of::<KvmClearDirtyLog>() == 24);
 
+#[cfg(target_os = "linux")]
 impl KvmLog for VmFd {
     fn get(&self, slot: u32, bitmap: &mut [u64]) -> bool {
         let mut log = KvmDirtyLog {
@@ -164,6 +180,7 @@ impl KvmLog for VmFd {
 /// Whether the CPU buffers a vCPU's dirty pages until the vCPU exits: `pml` of `kvm_intel`, or
 /// of `kvm_amd` where KVM has it. Without it KVM write-protects a logged page, and marks it in the
 /// slot's log at the fault, before the write completes.
+#[cfg(target_os = "linux")]
 fn cpu_buffers_writes() -> bool {
     [
         "/sys/module/kvm_intel/parameters/pml",
@@ -174,6 +191,7 @@ fn cpu_buffers_writes() -> bool {
 }
 
 /// The scratch one harvest uses, kept for the next.
+#[cfg(any(target_os = "linux", test))]
 #[derive(Default)]
 pub(crate) struct Scratch {
     watched: Vec<Range<u64>>,
@@ -188,6 +206,7 @@ pub(crate) struct Scratch {
 }
 
 /// The `n` bits of `bitmap` from bit `at`, `n` at most 64, in the low bits of the result.
+#[cfg(any(target_os = "linux", test))]
 fn bits(bitmap: &[u64], at: u64, n: u64) -> u64 {
     let (w, s) = ((at / 64) as usize, at % 64);
     let lo = bitmap.get(w).copied().unwrap_or(0) >> s;
@@ -205,6 +224,7 @@ fn bits(bitmap: &[u64], at: u64, n: u64) -> u64 {
 }
 
 /// Sets in `bitmap` the low `n` bits of `value` from bit `at`.
+#[cfg(any(target_os = "linux", test))]
 fn set_bits(bitmap: &mut [u64], at: u64, value: u64) {
     let (w, s) = ((at / 64) as usize, at % 64);
     if let Some(x) = bitmap.get_mut(w) {
@@ -218,6 +238,7 @@ fn set_bits(bitmap: &mut [u64], at: u64, value: u64) {
 }
 
 /// One slot's part of a harvest (step 3 of the module docs).
+#[cfg(any(target_os = "linux", test))]
 fn harvest_slot(host: &dyn DirtyHost, kvm: &dyn KvmLog, s: &mut Scratch, slot: KvmSlot) {
     let base = slot.guest_physical_address;
     let end = base.saturating_add(slot.length);
@@ -312,6 +333,7 @@ fn harvest_slot(host: &dyn DirtyHost, kvm: &dyn KvmLog, s: &mut Scratch, slot: K
 }
 
 /// The log's side of a harvest: [`DirtyLog`]'s, or a test's.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) trait HarvestLog {
     /// [`DirtyLog::begin`].
     fn begin(&self, watched: &mut Vec<Range<u64>>) -> Option<DirtyStamp>;
@@ -319,6 +341,7 @@ pub(crate) trait HarvestLog {
     fn end(&self, stamp: DirtyStamp, written: &[u64]) -> bool;
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl HarvestLog for DirtyLog {
     fn begin(&self, watched: &mut Vec<Range<u64>>) -> Option<DirtyStamp> {
         DirtyLog::begin(self, watched)
@@ -330,6 +353,7 @@ impl HarvestLog for DirtyLog {
 }
 
 /// One harvest of `log` (the module docs).
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn harvest(
     log: &dyn HarvestLog,
     host: &dyn DirtyHost,
@@ -364,6 +388,7 @@ pub(crate) fn harvest(
 
 /// What the harvest thread and the log's hook share.
 struct Wake {
+    #[cfg(any(target_os = "linux", test))]
     wanted: AtomicBool,
     stop: AtomicBool,
     thread: std::sync::OnceLock<Thread>,
@@ -387,12 +412,14 @@ pub(crate) struct Harvester {
 
 impl Harvester {
     /// The log of the guest's RAM `ram` (guest physical ranges), harvested from `source`.
+    #[cfg(target_os = "linux")]
     pub(crate) fn new(ram: &[Range<u64>], source: DirtySource) -> Harvester {
         let kvm = VmFd(source.kvm_vm_fd);
         Harvester::with_kvm(ram, source.host, Box::new(kvm), cpu_buffers_writes())
     }
 
-    /// As [`Harvester::new`], over `kvm`, flushing the vCPUs where `flush` (tests).
+    /// The KVM harvest over `kvm`, flushing the vCPUs where `flush` (also used by tests).
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn with_kvm(
         ram: &[Range<u64>],
         host: Arc<dyn DirtyHost>,

@@ -14,6 +14,7 @@ mod files;
 mod hints;
 mod host_ram;
 mod import;
+#[path = "standin.rs"]
 mod surface;
 mod threads;
 mod vm;
@@ -26,9 +27,10 @@ use metal2vulkan_runtime as rt;
 pub use clock::LinuxClock;
 pub use device_lend::{DeviceLend, LendRefusal, LentDmaBuf, lend_to_devices};
 pub use files::{GuestMemoryLease, lease_guest_memory};
-pub use surface::{LinuxSurface, LinuxSurfaces, attachment};
+pub use surface::{StandInSurface as LinuxSurface, StandInSurfaces as LinuxSurfaces, attachment};
 pub use threads::LinuxThreads;
 pub use vm::LinuxVm;
+pub(crate) use vm::OwnMemory;
 
 #[cfg(test)]
 pub(crate) use import::views_through_dma_bufs;
@@ -134,4 +136,19 @@ pub fn default_registry_id() -> Option<u64> {
 /// is no Metal here to ask.
 pub fn default_gpu_core_count() -> Option<u64> {
     None
+}
+
+/// The host's usable memory, in bytes, as Linux counts it (`MemTotal`): the largest allocation
+/// the stand-in makes, as macOS's IOSurface makes none past `hw.memsize_usable` (module docs).
+fn physical_memory() -> u64 {
+    // SAFETY: sysconf reads a system value.
+    let (pages, page) = unsafe {
+        (
+            libc::sysconf(libc::_SC_PHYS_PAGES),
+            libc::sysconf(libc::_SC_PAGESIZE),
+        )
+    };
+    u64::try_from(pages)
+        .unwrap_or(0)
+        .saturating_mul(u64::try_from(page).unwrap_or(0))
 }

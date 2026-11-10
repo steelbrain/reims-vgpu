@@ -372,7 +372,7 @@ pub(crate) fn choose(
     #[cfg(target_os = "macos")]
     let _ = need;
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let _ = (open, runtime);
+    let _ = (open, runtime, need);
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let picked = Picked {
         label: "none",

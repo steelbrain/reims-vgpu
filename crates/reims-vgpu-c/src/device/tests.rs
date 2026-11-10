@@ -567,7 +567,7 @@ fn memory_files_are_duplicated() {
     let flags = unsafe { libc::fcntl(dup, libc::F_GETFD) };
     assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
     let ino = |fd: i32| {
-        let mut st = MaybeUninit::<libc::stat>::zeroed();
+        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
         // SAFETY: `st` is a writable `struct stat`, and `fd` is open.
         assert_eq!(unsafe { libc::fstat(fd, st.as_mut_ptr()) }, 0);
         // SAFETY: filled by the call above.

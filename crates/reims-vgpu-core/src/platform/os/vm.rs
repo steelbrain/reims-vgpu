@@ -63,6 +63,18 @@ pub trait HostVm: Send + Sync {
     fn page_shift(&self) -> u32;
     /// `mach_vm_allocate(task, &a, len, VM_FLAGS_ANYWHERE)`: a fresh zero-filled range.
     fn allocate_anywhere(&self, len: u64) -> Result<HostAddr, KernReturn>;
+    /// Reserve a task's address space with no access. The default preserves Mach's allocation,
+    /// protection and failure cleanup; hosts with sparse placeholders can avoid committing the
+    /// unused address space. Later overwrite/remap calls must work anywhere in the reservation.
+    fn reserve_noaccess(&self, len: u64) -> Result<HostAddr, KernReturn> {
+        let address = self.allocate_anywhere(len)?;
+        if let Err(error) = self.protect_max(address, len, VmProt::NONE) {
+            let _ = self.deallocate(address, len);
+            return Err(error);
+        }
+        Ok(address)
+    }
+
     /// The same call, [`HostVm::allocate_anywhere`], for a range core then names in address
     /// ranges, which the platform maps again as an alias of its pages (the detach heap's
     /// temporary). On Mach any range can be aliased; a platform whose fresh ranges cannot be

@@ -9,7 +9,7 @@
 //! AppKit's window takes, in points.
 
 #![cfg_attr(
-    all(not(target_os = "linux"), not(test)),
+    all(not(any(target_os = "linux", target_os = "windows")), not(test)),
     expect(dead_code, reason = "macOS's SDL windows open in AppKit's frames")
 )]
 

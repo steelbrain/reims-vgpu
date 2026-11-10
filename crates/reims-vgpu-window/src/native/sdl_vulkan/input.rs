@@ -25,7 +25,7 @@
 //! - **Keys** by position ([`super::keymap`]), one down and one up each: the host's repeats are
 //!   dropped, since the guest repeats a held key itself. With no menu of the host's to drive,
 //!   every key goes to the guest, captured or not, but what the compositor keeps for itself while
-//!   not captured. Pressing Ctrl, Alt and Super together while captured lifts every key held and
+//!   not captured. Ctrl+Alt on Windows, Ctrl+Alt+Super elsewhere, lifts every key held and
 //!   releases capture: the chord the title names.
 //! - **No stuck keys**: losing the keyboard, releasing capture and closing send an up for every
 //!   key held; losing the keyboard and closing lift the buttons held too.
@@ -48,7 +48,11 @@ use crate::scroll::POINTS_PER_LINE;
 pub(crate) const FOCUS_CLICK_NS: u64 = 100_000_000;
 
 /// What the title ends with while captured: what capture is on and how to release it.
+#[cfg(not(target_os = "windows"))]
 const CAPTURED_SUFFIX: &str = " \u{2014} input captured (press Ctrl+Alt+Super to release)";
+/// Windows uses the familiar VM release chord, without requiring the Windows key.
+#[cfg(target_os = "windows")]
+const CAPTURED_SUFFIX: &str = " \u{2014} input captured (press Ctrl+Alt to release)";
 
 /// What the window knows when an event reaches it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -280,7 +284,14 @@ impl Input {
         if let Some(event) = self.keys.key_down(usage, repeat) {
             self.out.push(ToHost::Key(event));
         }
-        if self.capture.release_chord(self.keys.held_modifiers()) {
+        let held = self.keys.held_modifiers();
+        // Keep the platform's release gesture inside the real key-state path:
+        // release_capture lifts all guest keys before SDL removes both grabs.
+        #[cfg(target_os = "windows")]
+        let release = self.is_captured() && held.control && held.option;
+        #[cfg(not(target_os = "windows"))]
+        let release = self.capture.release_chord(held);
+        if release {
             return self.release_capture();
         }
         Reaction::default()
@@ -491,6 +502,7 @@ mod tests {
     }
 
     /// Ctrl+Alt+Super while captured lifts every key and releases capture
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn ctrl_alt_super_releases_capture() {
         let mut input = focused();
@@ -592,5 +604,47 @@ mod tests {
         assert_eq!(button_bit(4), BUTTON_SIDE);
         assert_eq!(button_bit(5), BUTTON_EXTRA);
         assert_eq!(button_bit(6), 0);
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_release_tests {
+    use super::*;
+
+    /// A Windows user can leave the VM with Ctrl+Alt alone. Releasing capture
+    /// lifts every held guest key and removes pointer confinement immediately.
+    #[test]
+    fn ctrl_alt_releases_pointer_and_all_held_keys() {
+        let mut input = Input::new();
+        input.focus_gained(0);
+        let at = At {
+            point: Some((10.0, 10.0)),
+            image: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            guest: Some((100, 100)),
+        };
+        input.button_down(BUTTON_LEFT, 1_000_000_000, &at);
+        input.button_up(BUTTON_LEFT, &at);
+        assert!(input.is_captured());
+        input.key(0x04, true, false);
+        input.take();
+        assert!(!input.key(0xe0, true, false).capture_changed);
+        let reaction = input.key(0xe2, true, false);
+        assert!(reaction.capture_changed && !input.is_captured());
+        assert!(input.pointer_confinement(at.image).is_none());
+        let events = input.take();
+        for key in [0x04, 0xe0, 0xe2] {
+            assert!(events.contains(&ToHost::Key(KeyEvent::up(key))));
+            input.key(key, false, false);
+        }
+        assert!(
+            input.take().is_empty(),
+            "physical key-ups must not duplicate releases"
+        );
+        assert_eq!(input.title_suffix(), UNCAPTURED_SUFFIX);
     }
 }
