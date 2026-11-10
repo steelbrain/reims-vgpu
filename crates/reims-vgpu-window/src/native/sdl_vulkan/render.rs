@@ -365,6 +365,9 @@ mod tests {
 
 #[cfg(test)]
 mod ready_retry_tests {
+    use reims_vgpu_core::platform::os::Clock as _;
+    use reims_vgpu_vulkan::os::OsClock;
+
     use super::*;
 
     /// A new guest frame arriving during image acquisition already satisfies
@@ -379,6 +382,9 @@ mod ready_retry_tests {
             ..Layout::default()
         });
         surface.set_visible(true);
+        // Measure the real condvar wait using the host's platform clock, the
+        // same time contract used by the renderer's other platform services.
+        let clock = OsClock::new();
         let mut best = std::time::Duration::MAX;
         for _ in 0..3 {
             surface.request_draw();
@@ -386,9 +392,9 @@ mod ready_retry_tests {
             // This update occurs while the caller was acquiring an image,
             // before next(retry) can start waiting on the condition variable.
             surface.request_draw();
-            let began = std::time::Instant::now();
+            let began = clock.now_mono();
             assert!(surface.next(Some(previous)).is_some());
-            best = best.min(began.elapsed());
+            best = best.min(clock.now_mono().saturating_duration_since(began));
         }
         eprintln!("ready retry wait: {best:?}; retry interval: {RETRY:?}");
         assert!(
