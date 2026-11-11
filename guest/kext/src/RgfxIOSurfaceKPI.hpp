@@ -159,10 +159,13 @@ IOReturn rgfxIOSurfaceSetValue(OSObject *surface, const char *key, const OSMetaC
 extern "C" {
 // IOSurfaceRoot::updateLimits(unsigned int, unsigned int, unsigned int, unsigned int, unsigned
 // int): ORs `planeMask` into the plane offsets' mask and `rowMask` into the bytes per row's, and
-// lowers the root's three other limits to `a`, `b` and `c` where those are less
-// (kRgfxIOSurfaceNoLimit leaves each as it is).
-void rgfxIOSurfaceRootUpdateLimits(void *root, uint32_t planeMask, uint32_t rowMask, uint32_t a,
-                                   uint32_t b, uint32_t c)
+// lowers the root's three other limits, which IOSurfaceGetPropertyMaximum answers, to
+// `bytesPerRow` (kIOSurfaceBytesPerRow's), `width` (kIOSurfaceWidth's) and `height`
+// (kIOSurfaceHeight's) where those are less (kRgfxIOSurfaceNoLimit leaves each as it is). Which
+// limit each lowers is measured: a probe kext's three distinct values read back in a macOS
+// 13.7.8 guest.
+void rgfxIOSurfaceRootUpdateLimits(void *root, uint32_t planeMask, uint32_t rowMask,
+                                   uint32_t bytesPerRow, uint32_t width, uint32_t height)
     __asm__("__ZN13IOSurfaceRoot12updateLimitsEjjjjj");
 }
 

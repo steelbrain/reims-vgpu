@@ -624,9 +624,10 @@ private:
 	// video caps the host wrote (RgfxVideoCodecs.hpp): HEVC decode, where the host has it.
 	void publishVideoCodecs();
 	// Has IOSurface align the bytes per row it works out for a surface as the host's GPU takes
-	// such rows in place, from the host's device info (RgfxSurfaceRows.hpp), as a GPU's
-	// accelerator does at its start; a no-op where the host asks no more than IOSurface's own.
-	void alignSurfaceRows();
+	// such rows in place (RgfxSurfaceRows.hpp; IOSurface's own where the host asks no more), and
+	// answer surfaces no larger than the device's textures take (RgfxSurfaceLimits.hpp), from
+	// the host's device info, as a GPU's accelerator does at its start.
+	void setSurfaceLimits();
 	// A fresh block in place's SURFACE_PAGES (RgfxAcceleratorContexts.cpp): its `count` runs of
 	// the surface's `length` bytes written at `size` bytes into the block of `total` bytes at
 	// `offset`, and posted for context `context`, its block cached where `cached`, else asking

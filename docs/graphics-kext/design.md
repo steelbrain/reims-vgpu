@@ -771,6 +771,17 @@ Stages:
       `minimumLinearTextureAlignmentForPixelFormat:`, so rows at 256 bytes
       lie inside what Macs do. A host whose GPU has memory of its own
       answers 0, its guest's rows as they were.
+      At the same start the kext lowers the largest surface IOSurface
+      answers to `IOSurfaceGetPropertyMaximum`, as a Mac's GPU accelerators
+      do: as wide and as tall as the device's 2D textures (the device
+      info's `max_texture_width_2d` and `max_texture_height_2d`, which the
+      bundle answers to Metal: 16384 on our device), and 16 bytes a pixel
+      of that width a row, the largest pixel a texture over a surface has
+      (`guest/kext/src/RgfxSurfaceLimits.hpp`). Macs answer 16384 wide and
+      tall (the Intel and AMD Mac with 131072 bytes a row, the M3 with
+      32768). Left at IOSurface's own INT_MAX, Safari 16.6 under macOS 13
+      drew no tiles of a page that scrolls only vertically at 1x
+      (**measured**, 13.7.8; docs/lessons.md).
 
 15. **The stage 3 stack is IOGPUFamily.** x86-64 macOS 26 carries IOGPUFamily
     and IOGPU.framework, and the x86-64 port runs Metal compositing on them:

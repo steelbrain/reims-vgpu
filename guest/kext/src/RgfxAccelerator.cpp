@@ -23,6 +23,7 @@
 #include "RgfxIOSurfaceKPI.hpp"
 #include "RgfxPciClass.hpp"
 #include "RgfxRegionMapping.hpp"
+#include "RgfxSurfaceLimits.hpp"
 #include "RgfxSurfaceRows.hpp"
 #include "RgfxTrace.hpp"
 #include "RgfxVideoCodecs.hpp"
@@ -425,7 +426,7 @@ bool RgfxAccelerator::start(IOService *provider)
 	// registerService.
 	publishVideoCodecs();
 	// Before any process that lays out a surface: WindowServer starts after the kernel's boot.
-	alignSurfaceRows();
+	setSurfaceLimits();
 	// Name this accelerator on the framebuffer, if it has started already (else the display
 	// pipe's first association does).
 	OSSafeReleaseNULL(fb);
@@ -732,17 +733,20 @@ void RgfxAccelerator::nameProviderForVideo()
 	pci->setName("GFX0");
 }
 
-void RgfxAccelerator::alignSurfaceRows()
+static_assert(kRgfxIOSurfaceNoLimit == kRgfxSurfaceNoLimit, "IOSurfaceRoot's own limit");
+
+void RgfxAccelerator::setSurfaceLimits()
 {
 	const void *info = nullptr;
-	IOMemoryMap *map = mapDeviceInfo(kRgfxSurfaceRowsEnd, &info);
+	const uint64_t end = kRgfxSurfaceRowsEnd > kRgfxSurfaceLimitsEnd ? kRgfxSurfaceRowsEnd
+	                                                                 : kRgfxSurfaceLimitsEnd;
+	IOMemoryMap *map = mapDeviceInfo(end, &info);
 	if (!map)
 		return;
-	const uint32_t align =
-	    rgfxSurfaceRowAlignmentFrom(static_cast<const uint8_t *>(info) + kRgfxSurfaceRowsFirst);
+	const uint8_t *bytes = static_cast<const uint8_t *>(info);
+	const uint32_t align = rgfxSurfaceRowAlignmentFrom(bytes + kRgfxSurfaceRowsFirst);
+	const RgfxSurfaceLimits limits = rgfxSurfaceLimitsFrom(bytes + kRgfxSurfaceLimitsFirst);
 	map->release();
-	if (align <= kRgfxSurfaceRowsLeast)
-		return;
 	// IOSurfaceRoot starts with IOSurface.kext, which a GPU's accelerator waits for as well.
 	OSDictionary *matching = IOService::serviceMatching("IOSurfaceRoot");
 	IOService *root =
@@ -750,16 +754,21 @@ void RgfxAccelerator::alignSurfaceRows()
 	OSSafeReleaseNULL(matching);
 	if (!root) {
 		IOLog("RgfxAccelerator: no IOSurfaceRoot: surfaces' rows stay at IOSurface's alignment, "
-		      "not the host GPU's %u bytes\n",
+		      "not the host GPU's %u bytes, and IOSurface's limits stay its own\n",
 		      align);
 		return;
 	}
-	rgfxIOSurfaceRootUpdateLimits(root, 0, align - 1, kRgfxIOSurfaceNoLimit, kRgfxIOSurfaceNoLimit,
-	                              kRgfxIOSurfaceNoLimit);
+	// A row mask of 0 ORs nothing in: IOSurface's own alignment where the host asks no more.
+	rgfxIOSurfaceRootUpdateLimits(root, 0, align > kRgfxSurfaceRowsLeast ? align - 1 : 0,
+	                              limits.bytesPerRow, limits.width, limits.height);
 	root->release();
-	IOLog("RgfxAccelerator: IOSurface aligns the bytes per row it works out to %u, as the host's "
-	      "GPU takes rows in place\n",
-	      align);
+	if (align > kRgfxSurfaceRowsLeast)
+		IOLog("RgfxAccelerator: IOSurface aligns the bytes per row it works out to %u, as the "
+		      "host's GPU takes rows in place\n",
+		      align);
+	IOLog("RgfxAccelerator: IOSurface answers surfaces of at most %u x %u and %u bytes a row, as "
+	      "the device's textures take them\n",
+	      limits.width, limits.height, limits.bytesPerRow);
 }
 
 void RgfxAccelerator::publishVideoCodecs()
