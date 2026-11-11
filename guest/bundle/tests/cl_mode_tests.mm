@@ -157,6 +157,14 @@ void test_cl_bindings_of()
 	array.arguments.push_back(node(5, "air.texture", 0, 0));
 	array.arguments.back().count = 2;
 	CHECK(!RgfxClBindingsOf(array, b, why) && b.buffers.empty() && !why.empty());
+	// A 1D image and a 1D array image are refused, until the host reads the 2D textures Apple's
+	// OpenCL binds for them (RgfxClMode.hpp).
+	for (const char *type : {"texture1d<unknown, read>", "texture1d_array<unknown, read>"}) {
+		RgfxAirEntry oneD = images;
+		oneD.arguments.push_back(node(8, "air.texture", 2, 0));
+		oneD.arguments.back().typeName = type;
+		CHECK(!RgfxClBindingsOf(oneD, b, why) && b.textures.empty() && why.find("1D image") != std::string::npos);
+	}
 	RgfxAirEntry t = k;
 	t.arguments.push_back(node(5, "air.indirect_buffer", 0, 0));
 	CHECK(!RgfxClBindingsOf(t, b, why) && b.buffers.empty() && !why.empty());
@@ -432,6 +440,9 @@ const ImageKernel kImageKernels[] = {
      {{"s", 3, 0, 0, 0, 0, 0, false}, {"i", 2, 0, 0, 0, 0, 0, false}, {"w", 2, 1, 2, 0, 0, 0, false}},
      {0, 2, 2}, {}},
 };
+// The kernels of a 1D image, which are not made (RgfxClMode.hpp): no function of OpenCL mode.
+// Their entries above are the x86 Macs' answers, for when the host reads such images.
+const char *const kRefusedImageKernels[] = {"__entry_img_kinds"};
 const ImageKernel kDepthKernel = {"__entry_img_depth", {3}, {}, {}, {0},
                                   {{"z", 2, 0, 0, 0, 0, 0, false}, {"o", 0, 3, 1, 4, 4, 3, false}}, {2, 0},
                                   {true, false}};
@@ -483,6 +494,13 @@ void checkImageKernels(id<MTLDevice> metal, NSString *source, const ImageKernel 
 		const ImageKernel &want = kernels[k];
 		RgfxFunction *kernel = (RgfxFunction *)[program newFunctionWithName:@(want.name)];
 		id<MTLFunction> variant = [kernel newFunctionWithPluginData:plugin bitcodeType:2];
+		bool refused = false;
+		for (const char *name : kRefusedImageKernels)
+			refused = refused || strcmp(name, want.name) == 0;
+		if (refused) {
+			CHECK(kernel != nil && variant == nil);
+			continue;
+		}
 		if (![(id)variant isKindOfClass:[RgfxFunction class]])
 			fprintf(stderr, "cl_mode_tests: %s: no function of OpenCL mode\n", want.name);
 		CHECK([(id)variant isKindOfClass:[RgfxFunction class]]);

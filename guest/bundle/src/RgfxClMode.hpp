@@ -33,6 +33,12 @@
  * reqd_work_group_size is the entry node's `air.work_group_size` (RgfxAirEntry); an image is an
  * `air.texture` and a sampler argument an `air.sampler`, each at its index.
  *
+ * A kernel of a 1D image is not made. Its image is a `texture1d<unknown, ...>` (image1d_t) or a
+ * `texture1d_array<unknown, ...>` (image1d_array_t), and Apple's OpenCL binds a 2D texture of
+ * height 1 or a 2D array for it (measured through the OpenCL API on a 26.6.1 guest); Metal reads
+ * those (measured: both x86 Macs), the host's pipeline reads nothing of them yet. A kernel that
+ * reads zeros is worse than one the guest is told was not made.
+ *
  * Our own C++.
  */
 #ifndef RGFX_CL_MODE_HPP_
@@ -62,7 +68,7 @@ constexpr uint32_t kRgfxClHiddenBuffers = 3;
 
 /// What `entry`, a kernel of Metal's compile of OpenCL C, binds in OpenCL mode, in `out`. False,
 /// with `why`, where it is no kernel, or an argument is of a kind or address space the rule does
-/// not cover, or an array of images or samplers; `out` then holds nothing.
+/// not cover, an array of images or samplers, or a 1D image; `out` then holds nothing.
 bool RgfxClBindingsOf(const RgfxAirEntry &entry, RgfxClBindings &out, std::string &why);
 
 #endif // RGFX_CL_MODE_HPP_
