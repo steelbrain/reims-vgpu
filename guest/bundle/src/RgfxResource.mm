@@ -11,6 +11,11 @@
 #import "RgfxInterop.h"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mach/mach_time.h>
+#include <mutex>
+#include <os/log.h>
 #include <unistd.h>
 
 #include "RgfxSerializer.hpp"
@@ -18,7 +23,103 @@
 namespace {
 // The last allocation id taken (rgfxAllocationId): every object takes the next as it is made.
 std::atomic<uint64_t> g_lastAllocationId{0};
+
+// The threads in RgfxResourceWaitUntilComplete, which sleep on `g_landedWake` under
+// `g_landedLock` until the count they wait on is 0: RgfxInFlightEnd wakes them where it makes a
+// count 0 and any waits. A waiter is counted before it reads its count, and a count is lowered
+// before the waiters are read, both sequentially consistent, so one of the two sees the other.
+std::atomic<uint32_t> g_landedWaiters{0};
+std::mutex g_landedLock;
+std::condition_variable g_landedWake;
+// Set by RgfxResourceWaitsStop: the waits end, and no later one waits.
+std::atomic<bool> g_waitsStopped{false};
+
+// The resource SPI's answers so far in the process, a diagnostic: waitUntilComplete's calls,
+// those that waited, the time they waited and the longest, and the NO answers of isComplete and
+// isWriteComplete. An os_log line (debug) says them at most every kWaitsReportNs while waits or
+// NO answers come.
+std::atomic<uint64_t> g_waitCalls{0};
+std::atomic<uint64_t> g_waited{0};
+std::atomic<uint64_t> g_waitedNs{0};
+std::atomic<uint64_t> g_longestNs{0};
+std::atomic<uint64_t> g_notComplete{0};
+std::atomic<uint64_t> g_waitsReported{0};
+constexpr uint64_t kWaitsReportNs = 10ull * NSEC_PER_SEC;
+
+uint64_t nowNs()
+{
+	static const mach_timebase_info_data_t base = [] {
+		mach_timebase_info_data_t b;
+		mach_timebase_info(&b);
+		return b;
+	}();
+	return mach_absolute_time() * base.numer / base.denom;
+}
+
+void reportWaits(uint64_t now)
+{
+	uint64_t last = g_waitsReported.load(std::memory_order_relaxed);
+	if (now - last < kWaitsReportNs ||
+	    !g_waitsReported.compare_exchange_strong(last, now, std::memory_order_relaxed))
+		return;
+	os_log_debug(OS_LOG_DEFAULT,
+	             "RGFX: resource waits so far: %llu waitUntilComplete calls, %llu waited, %.2f ms "
+	             "in all, longest %.2f ms; %llu isComplete or isWriteComplete answered NO",
+	             (unsigned long long)g_waitCalls.load(), (unsigned long long)g_waited.load(),
+	             g_waitedNs.load() / 1e6, g_longestNs.load() / 1e6,
+	             (unsigned long long)g_notComplete.load());
+}
 } // namespace
+
+void RgfxInFlightEnd(__unsafe_unretained RgfxResource *r)
+{
+	if (__atomic_sub_fetch(r->_rgfxInFlightAt, 1u, __ATOMIC_SEQ_CST) == 0 &&
+	    g_landedWaiters.load(std::memory_order_seq_cst) != 0) {
+		std::lock_guard<std::mutex> hold(g_landedLock);
+		g_landedWake.notify_all();
+	}
+}
+
+void RgfxResourceWaitsStop(void)
+{
+	g_waitsStopped.store(true);
+	std::lock_guard<std::mutex> hold(g_landedLock);
+	g_landedWake.notify_all();
+}
+
+BOOL RgfxResourceIsComplete(__unsafe_unretained RgfxResource *r)
+{
+	if (__atomic_load_n(r->_rgfxInFlightAt, __ATOMIC_SEQ_CST) == 0)
+		return YES;
+	g_notComplete.fetch_add(1, std::memory_order_relaxed);
+	reportWaits(nowNs());
+	return NO;
+}
+
+void RgfxResourceWaitUntilComplete(__unsafe_unretained RgfxResource *r)
+{
+	g_waitCalls.fetch_add(1, std::memory_order_relaxed);
+	const uint32_t *count = r->_rgfxInFlightAt;
+	if (__atomic_load_n(count, __ATOMIC_SEQ_CST) == 0 || g_waitsStopped.load())
+		return;
+	const uint64_t start = nowNs();
+	g_landedWaiters.fetch_add(1, std::memory_order_seq_cst);
+	{
+		std::unique_lock<std::mutex> hold(g_landedLock);
+		// Woken where any count reaches 0, so the count is read again each time.
+		while (__atomic_load_n(count, __ATOMIC_SEQ_CST) != 0 && !g_waitsStopped.load())
+			g_landedWake.wait_for(hold, std::chrono::seconds(1));
+	}
+	g_landedWaiters.fetch_sub(1, std::memory_order_seq_cst);
+	const uint64_t end = nowNs(), waited = end - start;
+	g_waited.fetch_add(1, std::memory_order_relaxed);
+	g_waitedNs.fetch_add(waited, std::memory_order_relaxed);
+	uint64_t longest = g_longestNs.load(std::memory_order_relaxed);
+	while (waited > longest &&
+	       !g_longestNs.compare_exchange_weak(longest, waited, std::memory_order_relaxed)) {
+	}
+	reportWaits(end);
+}
 
 BOOL RgfxResourcesAlias(RgfxResource *a, id b)
 {
@@ -62,6 +163,7 @@ BOOL RgfxResourcesAlias(RgfxResource *a, id b)
 		_responsibleProcess = getpid();
 		_purgeableState.store(MTLPurgeableStateNonVolatile);
 		_allocationId = g_lastAllocationId.fetch_add(1) + 1;
+		_rgfxInFlightAt = &_rgfxInFlight;
 	}
 	return self;
 }

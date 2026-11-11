@@ -41,6 +41,7 @@
 %enc-base Metal's base command encoder, _MTLCommandEncoder, its base parallel render encoder, _MTLParallelRenderCommandEncoder, and their IOAccel subclasses (read from code: macOS 27.0.1's Metal on the M3 Max; src/RgfxCommandObjects.mm, the encoders' SPI sections); that the AMD 5300M's and the Intel 630's encoders answer from these classes, not from their own, is to be measured with oracle_spi_members' answering class
 %pipe-base Metal's base pipelines, _MTLComputePipelineState and _MTLRenderPipelineState (read from code: macOS 27.0.1's Metal on the M3 Max; src/RgfxComputePipelineState.mm and src/RgfxRenderPipelineState.mm, their SPI sections); that the AMD 5300M's and the Intel 630's pipelines answer from these classes, not from their own, is to be measured with oracle_spi_members' answering class
 %spi-answers what a fresh object of the kind of the AMD 5300M's and of the Intel 630's answers, for a member that takes no argument (measured: macOS 26.7.1, tools/oracle/oracle_spi_members.m answers)
+%in-flight NO while a command buffer that names the resource's memory is submitted and its completion is yet to be taken, for any use, and YES before and after, as the Intel 630 answers (measured: macOS 26.7.1, tools/oracle/oracle_complete.m; docs/graphics-kext/dgpu-oracle.md, Q26; RGFX_RESOURCE_SPI)
 %old-only a member only older guest releases' protocols carry (tests/protocol_members_releases.txt), with no public counterpart; no app pass on the releases that carry it showed a guest framework sending it to the bundle's objects (the bundle logs each selector it does not recognize, RGFX: unrecognized), so a call raises an unrecognized selector, as it did before
 %old-only-device a member only macOS 11's or 12's MTLDeviceSPI carries (tests/protocol_members_releases.txt): on those releases the device's IOGPU base answers it, the guest's own class (measured: macOS 11.7.11, the device answers it); on the Mac the base lacks it
 
@@ -1338,9 +1339,9 @@ doesAliasAllResources:count: implemented
 doesAliasAnyResources:count: implemented
 doesAliasResource: implemented
 iosurface metal the device makes no buffer over an IOSurface, as neither x86 Mac does (newBufferWithIOSurface:), so the buffer lies in none, as a buffer made from a length or bytes answers none (measured: M3 Max, macOS 27)
-isComplete metal YES, as Metal's resources answer even while a command buffer that writes them is in flight (measured: M3 Max, macOS 27; RGFX_RESOURCE_SPI)
+isComplete implemented %in-flight (the M3 Max answers the same, macOS 27)
 isPurgeable implemented
-isWriteComplete metal YES, as Metal's resources answer even while a command buffer that writes them is in flight (measured: M3 Max, macOS 27; RGFX_RESOURCE_SPI)
+isWriteComplete gap %in-flight (the M3 Max answers YES for a buffer that only reads it, macOS 27, which arm64 guests do not get: they see NO, as isComplete answers)
 newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage: implemented
 newTiledTextureWithDescriptor:offset:bytesPerRow: implemented
 parentGPUAddress absent %spi-neither
@@ -1351,7 +1352,7 @@ resourceIndex absent %spi-differ (the Intel 630 answers it)
 setParentGPUAddress: absent %spi-neither
 setParentGPUSize: absent %spi-neither
 unfilteredResourceOptions implemented
-waitUntilComplete metal returns at once, as Metal's resources do (measured: M3 Max, macOS 27; RGFX_RESOURCE_SPI)
+waitUntilComplete implemented waits while isComplete answers NO, as the Intel 630's and the M3 Max's do (measured, %in-flight)
 [RgfxCmdBuffer]
 __waitUntilCompletedAsync: implemented
 __waitUntilScheduledAsync: implemented
@@ -1597,13 +1598,13 @@ doesAliasResource: implemented
 getHeader:headerSize: unsupported an indirect command buffer's driver header
 gpuAddress gap 0: the buffer's commands live on the host, so the guest sees no GPU address of them; both x86 Macs answer their buffer's (%spi-answers)
 gpuHandle implemented
-isComplete metal YES, as a fresh buffer of both x86 Macs answers (measured: macOS 26.7.1, tools/oracle/oracle_spi_members.m ask answers) and Metal's resources answer even while a command buffer that writes them is in flight (measured: M3 Max, macOS 27; RGFX_RESOURCE_SPI)
+isComplete implemented %in-flight (the M3 Max answers the same, macOS 27)
 isPurgeable implemented
-isWriteComplete metal YES, as a fresh buffer of both x86 Macs answers (measured: macOS 26.7.1, tools/oracle/oracle_spi_members.m ask answers) and Metal's resources answer even while a command buffer that writes them is in flight (measured: M3 Max, macOS 27; RGFX_RESOURCE_SPI)
+isWriteComplete gap %in-flight (the M3 Max answers YES for a buffer that only reads it, macOS 27, which arm64 guests do not get: they see NO, as isComplete answers)
 resourceIndex implemented
 unfilteredResourceOptions implemented
 uniqueIdentifier implemented
-waitUntilComplete metal returns at once, as Metal's resources do (measured: M3 Max, macOS 27; RGFX_RESOURCE_SPI)
+waitUntilComplete implemented waits while isComplete answers NO, as the Intel 630's and the M3 Max's do (measured, %in-flight)
 [RgfxIndirectComputeCommand]
 dispatchThreadgroupsArguments unsupported reading back what an indirect command was given
 dispatchThreadsArguments unsupported reading back what an indirect command was given
@@ -1831,11 +1832,11 @@ doesAliasResource: implemented
 generateMipmapLevel:slice: absent %spi-neither
 gpuAddress implemented
 gpuHandle implemented
-isComplete metal YES, as Metal's resources answer even while a command buffer that writes them is in flight (measured: M3 Max, macOS 27; RGFX_RESOURCE_SPI)
+isComplete implemented %in-flight (the M3 Max answers the same, macOS 27)
 isCompressed implemented
 isDrawable metal the device's textures are no drawable's: Metal answers NO for every texture an app makes (private, shared, IOSurface and views)
 isPurgeable implemented
-isWriteComplete metal YES, as Metal's resources answer even while a command buffer that writes them is in flight (measured: M3 Max, macOS 27; RGFX_RESOURCE_SPI)
+isWriteComplete gap %in-flight (the M3 Max answers YES for a buffer that only reads it, macOS 27, which arm64 guests do not get: they see NO, as isComplete answers)
 newCompressedTextureViewWithPixelFormat:textureType:level:slice: absent %spi-neither
 newTextureViewWithPixelFormat:resourceIndex: implemented
 newTextureViewWithPixelFormat:textureType:levels:slices:resourceIndex: implemented
@@ -1847,7 +1848,7 @@ sparseSurfaceDefaultValue absent %spi-neither
 swizzleKey implemented
 unfilteredResourceOptions implemented
 uniqueIdentifier implemented
-waitUntilComplete metal returns at once, as Metal's resources do (measured: M3 Max, macOS 27; RGFX_RESOURCE_SPI)
+waitUntilComplete implemented waits while isComplete answers NO, as the Intel 630's and the M3 Max's do (measured, %in-flight)
 writeAccessPattern absent %spi-neither
 
 # The members only older guest releases' protocols carry (tests/protocol_members_releases.txt).

@@ -1257,6 +1257,10 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	                                         serializer:serializer];
 	if (t != nil) {
 		t->_buffer = buffer;
+		// Its texels are the buffer's bytes: the buffers in flight that name either count for
+		// both (RGFX_RESOURCE_SPI's isComplete and waitUntilComplete).
+		if (RgfxIsResource(buffer))
+			t->_rgfxInFlightAt = ((RgfxResource *)buffer)->_rgfxInFlightAt;
 		t->_bufferOffset = offset;
 		t->_bufferBytesPerRow = bytesPerRow;
 		[t rgfxTakeDescriptor:descriptor];
@@ -1631,6 +1635,9 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	                                            serializer:_serializer];
 	if (view != nil) {
 		view->_parent = self;
+		// Its texels are its texture's: the buffers in flight that name either count for both
+		// (RGFX_RESOURCE_SPI's isComplete and waitUntilComplete).
+		view->_rgfxInFlightAt = _rgfxInFlightAt;
 		// A view of a texture over an IOSurface writes and reads the surface's texels.
 		view->_rgfxSurfaceRoot = _rgfxSurfaceRoot;
 		view->_parentLevel = static_cast<NSUInteger>(base);

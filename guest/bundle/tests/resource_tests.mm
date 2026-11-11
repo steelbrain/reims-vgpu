@@ -853,6 +853,17 @@ void test_texture_answers()
 		id<MTLTexture> linearView = [linear newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
 		CHECK(linearView != nil && [internals(linearView) gpuAddress] == [internals(linear) gpuAddress]);
 		CHECK([internals(linearView) virtualAddress] == [internals(linear) virtualAddress]);
+		// A command buffer in flight that names a view of a texture over a buffer names the
+		// texture's and the buffer's memory too: each answers NO (RGFX_RESOURCE_SPI), and
+		// another buffer and its texture YES.
+		RgfxInFlightBegin((RgfxResource *)linearView);
+		CHECK(![internals(buffer) isComplete] && ![internals(linear) isComplete] &&
+		      ![internals(linearView) isWriteComplete]);
+		CHECK([internals(privBuffer) isComplete] && [internals(privLinear) isComplete]);
+		RgfxInFlightEnd((RgfxResource *)linearView);
+		CHECK([internals(buffer) isComplete] && [internals(linear) isWriteComplete] &&
+		      [internals(linearView) isComplete]);
+		[internals(linearView) waitUntilComplete];
 
 		// Textures over one IOSurface plane, and a view of one, share an allocation and an address,
 		// with no CPU address, and alias nothing.

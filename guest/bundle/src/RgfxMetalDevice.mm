@@ -271,6 +271,8 @@ RgfxCompletionThread::WaitResult rgfxKextWaitCompletions(void *context, uint64_t
 		return RgfxCompletionThread::kRetry; // a signal broke the sleep
 	os_log_error(OS_LOG_DEFAULT, "RGFX: the completion wait ended kr=0x%x; waiters take the rings",
 	             kr);
+	// A resource's wait has no ring to take: it waits no more.
+	RgfxResourceWaitsStop();
 	return RgfxCompletionThread::kStop;
 }
 
@@ -899,6 +901,7 @@ RGFX_LOG_UNRECOGNIZED
 	_completions = std::make_unique<RgfxCompletionThread>(&rgfxKextWaitCompletions, connContext);
 	if (!_completions->start()) {
 		os_log_error(OS_LOG_DEFAULT, "RGFX: no completion thread; waiters take the rings");
+		RgfxResourceWaitsStop();
 		_completions.reset();
 	}
 	return self;

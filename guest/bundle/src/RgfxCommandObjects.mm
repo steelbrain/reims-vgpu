@@ -164,13 +164,52 @@ void rgfxNoteShadowUse(RgfxEncoder *enc, __unsafe_unretained id obj, bool writes
 /// The objects a command buffer keeps from its encode until it completes or goes
 /// (RgfxEncoder::setKeeper): locked, as a parallel pass's sub-encoders keep on their own threads.
 /// Each object comes once a command buffer (its keep stamp), so the lock is taken once an object.
+/// The resources among them are in flight from the buffer's submission (begin) until its
+/// results land where the CPU sees them (land): the resource SPI's isComplete answers NO and its
+/// waitUntilComplete waits meanwhile (RGFX_RESOURCE_SPI).
 struct RgfxKept {
 	os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
 	std::vector<id> objects;
+	// The objects counted in flight at begin, the first of `objects`; whether begin and land ran.
+	size_t inFlight = 0;
+	bool begun = false;
+	bool landed = false;
 
-	/// Lets every object go, outside the lock (a dealloc may run).
+	/// Counts the resources kept so far in flight (RgfxInFlightBegin), once, and only before
+	/// land: the buffer is submitted.
+	void begin()
+	{
+		os_unfair_lock_lock(&lock);
+		if (!begun && !landed) {
+			for (__unsafe_unretained id object : objects) {
+				if (RgfxIsResource(object))
+					RgfxInFlightBegin((RgfxResource *)object);
+			}
+			inFlight = objects.size();
+			begun = true;
+		}
+		os_unfair_lock_unlock(&lock);
+	}
+
+	/// Counts the resources begin counted out of flight (RgfxInFlightEnd), once: the buffer's
+	/// results are where the CPU sees them, or it goes without them.
+	void land()
+	{
+		os_unfair_lock_lock(&lock);
+		if (begun && !landed) {
+			for (size_t i = 0; i < inFlight; i++) {
+				if (RgfxIsResource(objects[i]))
+					RgfxInFlightEnd((RgfxResource *)objects[i]);
+			}
+		}
+		landed = true;
+		os_unfair_lock_unlock(&lock);
+	}
+
+	/// Lets every object go, outside the lock (a dealloc may run), landed first.
 	void clear()
 	{
+		land();
 		std::vector<id> gone;
 		os_unfair_lock_lock(&lock);
 		gone.swap(objects);
@@ -1766,7 +1805,8 @@ enum RgfxStage : unsigned {
 	if (_scheduled != nil && !_scheduledLeft.exchange(true))
 		dispatch_group_leave(_scheduled);
 	// A buffer never committed, or whose completion never came, gives its slot back, and lets
-	// what it kept go with it.
+	// what it kept go with it, out of flight.
+	_kept.land();
 	[self rgfxGiveSlotBack];
 	// And the block its message lay in, as its completion would have: a buffer posted with a
 	// completion to come is kept until it comes (the reader holds it), so the host has read the
@@ -2385,6 +2425,11 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 			dispatch_semaphore_signal(writtenBack);
 		});
 	}
+	// With no copy to write back, its results are where the CPU sees them: the resources it
+	// kept are out of flight here, as Metal's are once the GPU is done, not behind the queue's
+	// earlier handlers; else once the copies are written back (rgfxWriteBackCopies).
+	if (_writtenBack == nil)
+		_kept.land();
 	[self rgfxGiveSlotBack];
 	[self rgfxNoteGPUTimes:msg];
 }
@@ -2414,7 +2459,8 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 }
 
 // Writes back what this buffer wrote of its copies, on its queue's write-back queue: its
-// surfaces' copies, then the app memory under its no-copy buffers.
+// surfaces' copies, then the app memory under its no-copy buffers; the resources it kept are
+// then out of flight.
 - (void)rgfxWriteBackCopies
 {
 	rgfxIOSurfaceWriteBack(_surfaceWrites);
@@ -2422,6 +2468,7 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	for (const std::shared_ptr<RgfxMemoryShadow> &shadow : _shadowWrites)
 		shadow->writeBack();
 	_shadowWrites.clear();
+	_kept.land();
 }
 
 // Delivers the host's completion for this command buffer, on its queue's completion queue (or on
@@ -2455,6 +2502,9 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	for (const std::shared_ptr<RgfxMemoryShadow> &shadow : _shadowWrites)
 		shadow->writeBack();
 	_shadowWrites.clear();
+	// The resources it kept are out of flight before it is seen complete, where its take did
+	// not do it.
+	_kept.land();
 	// A buffer some of whose inline bytes found no chunk ran without those bindings, so it fails.
 	if (msg->status == RGFX_CB_OK && _uploadsFailed) {
 		// It ran without some of its bindings, so it fails as Metal's does when memory runs out.
@@ -2522,10 +2572,15 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 // The buffer is submitted (its CB_SUBMITTED, or its scheduling where none came first), once:
 // commitAndWaitUntilSubmitted returns. Its status stays Committed until it is scheduled, as
 // Metal's may at that return (measured on the M3 Max, an AMD 5300M and an Intel 630,
-// docs/graphics-kext/dgpu-oracle.md, Q7).
+// docs/graphics-kext/dgpu-oracle.md, Q7). The resources it keeps are in flight from here
+// (RgfxKept::begin), counted before anyone sees it submitted: a caller that finds it not yet
+// submitted waits, in begin, for one counting them.
 - (void)rgfxReachSubmitted
 {
-	_submittedReached.store(true);
+	if (!_submittedReached.load(std::memory_order_acquire)) {
+		_kept.begin();
+		_submittedReached.store(true, std::memory_order_release);
+	}
 	if (_submitted != nil && !_submittedLeft.exchange(true))
 		dispatch_group_leave(_submitted);
 }

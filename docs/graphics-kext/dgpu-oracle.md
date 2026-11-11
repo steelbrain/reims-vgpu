@@ -11,7 +11,7 @@ The probes are in `guest/bundle/tools/oracle` ([README](../../guest/bundle/tools
 `oracle_iosurface`, `oracle_storage`, `oracle_passes`, `oracle_cmdbuf`, `oracle_caps`,
 `oracle_errors`, `oracle_source`, `oracle_ycbcr`, `oracle_ca_ycbcr`, `oracle_sampler`,
 `oracle_icb`, `oracle_order`, `oracle_names`, `oracle_surftex`, `oracle_reflection`,
-`oracle_mesh`, `oracle_events`, `oracle_texdesc` and `oracle_nilbind`; the upload costs (Q17)
+`oracle_mesh`, `oracle_events`, `oracle_texdesc`, `oracle_nilbind` and `oracle_complete`; the upload costs (Q17)
 are `guest/bundle/tools/upload_probe.m`'s.
 
 **Machines.** Every claim below is measured, on:
@@ -1427,6 +1427,51 @@ What our stack does with an object whose posted create the host refused (`decode
   the draws are dropped until another is, and a blit from or to one is dropped, where both Macs
   end the process at nil: the bundle does not know the create was refused, so cannot end it.
 - A use list's entry of one is nil, as the Intel goes on.
+
+## Q26: when a resource is complete, and what orders a read-back across queues
+
+Probe: `oracle_complete DEVICE answers 300` and `... answers 300 sched`, and `oracle_complete
+DEVICE xqueue 200`, 11-11, the M3 Max on macOS 27 among them. Each command buffer spins about
+300 ms (200 ms for `xqueue`) before it uses the resource.
+
+| asked | AMD | Intel 630 | M3 |
+|---|---|---|---|
+| right after the commit (status Committed), any use | `isComplete` and `isWriteComplete` YES, `waitUntilComplete` returns at once | the same | the same |
+| once `waitUntilScheduled` returns, a render pass, a kernel's write or a blit into the texture, a kernel's write of a buffer | YES, at once | NO and NO; the wait returns as the buffer's GPU work ends (297 to 425 ms), its status then still Scheduled in 6 of 12 cases | NO and NO; the wait returns at 285 to 290 ms, status Scheduled |
+| the same, a kernel that only reads the texture or the buffer | YES, at once | NO and NO; waits | `isComplete` NO, `isWriteComplete` YES; waits |
+| a buffer not committed | YES, at once | the same | the same |
+| a resource only a completed buffer named, while a buffer of a second queue runs | YES, at once | the same | the same |
+
+Managed and Private storage answer alike. Once the buffer completed, every answer is YES.
+
+`xqueue`: whether queue B's buffer, committed once queue A's is scheduled, completes before A's
+(5 rounds each):
+
+| B's buffer | AMD | Intel 630 | M3 |
+|---|---|---|---|
+| empty | before A | before A | before A |
+| a blit encoder with no command | before A | after A | before A |
+| `synchronizeTexture:` of the texture A clears, or of another | before A | after A | before A |
+| a compute dispatch of one thread | after A | after A | before A |
+| that synchronize after the texture's `waitUntilComplete` | before A (the wait does not wait) | after A | after A |
+
+So `isComplete` is *(class 2)*: the AMD answers YES while the 630 and the M3 answer NO, and
+the M3 tells reads from writes for `isWriteComplete`. Before the buffer is scheduled, and for
+one not committed, all three answer YES at once *(class 3)*. On the M3 only the wait orders a
+second queue's synchronize behind the first queue's buffer; on the AMD nothing does, and the
+630 runs the two queues' buffers in order, an empty one aside.
+
+What our stack does *(class 2, the 630's answer)*: a resource answers NO to both, for any use,
+and `waitUntilComplete` waits, from the buffer's submission (`commitAndWaitUntilSubmitted`'s
+return, or its scheduling) until the bundle takes its completion and has written back what it
+wrote of copies (`RGFX_RESOURCE_SPI`, `RgfxKept`); a view of a texture, and a texture over a
+buffer, count with the memory they lie over. Until 11-11 it answered YES at once, the M3's
+answer right after the commit: Apple's GL renderer on macOS 11.7.11 reads a drawable back with
+the texture's `waitUntilComplete`, then a `synchronizeTexture:` on a queue of its own and
+`getBytes:`, and on a unified-memory host, where the synchronize is a no-op that finished
+before the draw, the read saw the texture as it was before the draw (Safari's WebGL reads,
+about 2.5% of them on a 780M). The M3's `isWriteComplete` YES for a read-only use is not kept:
+arm64 guests see NO, which only waits for readers too.
 
 ## Not measured
 

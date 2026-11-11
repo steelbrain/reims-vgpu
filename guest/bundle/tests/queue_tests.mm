@@ -73,6 +73,18 @@ int rgfxQueueTimings(int rounds);
 }
 @end
 
+// A handle that answers the resource SPI as the bundle's buffers and textures do
+// (RGFX_RESOURCE_SPI).
+@interface QueueTestSpiHandle : QueueTestHandle
+- (BOOL)isComplete;
+- (BOOL)isWriteComplete;
+- (void)waitUntilComplete;
+@end
+
+@implementation QueueTestSpiHandle
+RGFX_RESOURCE_SPI
+@end
+
 // The command-buffer SPI the guest's frameworks send (MTLCommandBufferSPI), as the AMD 5300M's and
 // the Intel 630's buffers answer it.
 @protocol QueueTestCommandBufferSPI
@@ -1207,6 +1219,89 @@ void test_submitted_waits_for_the_buffers_before()
 	}
 }
 
+// A resource answers isComplete and isWriteComplete NO, and its waitUntilComplete waits, while a
+// command buffer that names it is submitted and its completion is yet to be taken: the Intel
+// 630's answers once the buffer is scheduled, for any use (docs/graphics-kext/dgpu-oracle.md,
+// Q26). Before (encoded, or committed and not yet submitted) it answers YES at once, as all three
+// Macs do, and so does a resource no buffer in flight names. Apple's GL renderer reads a texture
+// back with getBytes: after its waitUntilComplete, behind a draw committed on another queue with
+// unretained references, as this one is: answered at once, the read saw the texture as it was
+// before the draw (macOS 11.7.11's Safari WebGL on a 780M host). The wait ends at the
+// completion's take, not behind an earlier buffer's handler on its queue, as the 630's returns
+// with the buffer still Scheduled.
+void test_resources_wait_for_their_buffers_in_flight()
+{
+	@autoreleasepool {
+		Queue q(true);
+		Driven driven({&q});
+		auto spiHandle = [](uint64_t objId) {
+			return [[QueueTestSpiHandle alloc] initWithObjId:objId device:nil serializer:nullptr];
+		};
+		auto draw = [](id<MTLCommandBuffer> cb, id<MTLTexture> target) {
+			MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+			rp.colorAttachments[0].texture = target;
+			[[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+		};
+		QueueTestSpiHandle *drawn = spiHandle(51), *other = spiHandle(52);
+		id<MTLCommandBuffer> cb = [q.queue commandBufferWithUnretainedReferences];
+		draw(cb, (id<MTLTexture>)drawn);
+		CHECK([drawn isComplete] && [drawn isWriteComplete]);
+		[cb commit];
+		CHECK([drawn isComplete] && [drawn isWriteComplete]);
+		const uint64_t seqno = nextSeqno(q);
+		hostScheduled(q, *driven.kext, seqno, cb);
+		[cb waitUntilScheduled];
+		CHECK(![drawn isComplete] && ![drawn isWriteComplete]);
+		CHECK([other isComplete] && [other isWriteComplete]);
+		[other waitUntilComplete];
+		std::atomic<bool> waited{false};
+		dispatch_semaphore_t done = dispatch_semaphore_create(0);
+		std::thread waiter([&] {
+			[drawn waitUntilComplete];
+			waited.store(true);
+			dispatch_semaphore_signal(done);
+		});
+		CHECK(waitFor(done, 0.1) != 0 && !waited.load());
+		hostComplete(q, *driven.kext, seqno, cb);
+		CHECK(waitFor(done, 5) == 0);
+		waiter.join();
+		CHECK([drawn isComplete] && [drawn isWriteComplete]);
+		[cb waitUntilCompleted];
+		CHECK(cb.status == MTLCommandBufferStatusCompleted);
+
+		// Behind a buffer of its queue whose completed handler has not returned, the wait ends at
+		// the take of its own buffer's completion, with that buffer not yet complete.
+		dispatch_semaphore_t release = dispatch_semaphore_create(0);
+		id<MTLCommandBuffer> first = [q.queue commandBuffer];
+		[first addCompletedHandler:^(id<MTLCommandBuffer>) {
+			dispatch_semaphore_wait(release, DISPATCH_TIME_FOREVER);
+		}];
+		[first commit];
+		const uint64_t firstSeqno = nextSeqno(q);
+		id<MTLCommandBuffer> second = [q.queue commandBuffer];
+		draw(second, (id<MTLTexture>)drawn);
+		[second commit];
+		const uint64_t secondSeqno = nextSeqno(q);
+		hostScheduled(q, *driven.kext, firstSeqno, first);
+		hostScheduled(q, *driven.kext, secondSeqno, second);
+		[second waitUntilScheduled];
+		CHECK(![drawn isComplete]);
+		hostComplete(q, *driven.kext, firstSeqno, first);
+		hostComplete(q, *driven.kext, secondSeqno, second);
+		std::thread late([&] {
+			[drawn waitUntilComplete];
+			dispatch_semaphore_signal(done);
+		});
+		CHECK(waitFor(done, 5) == 0);
+		late.join();
+		CHECK(second.status != MTLCommandBufferStatusCompleted);
+		dispatch_semaphore_signal(release);
+		[second waitUntilCompleted];
+		CHECK(first.status == MTLCommandBufferStatusCompleted &&
+		      second.status == MTLCommandBufferStatusCompleted);
+	}
+}
+
 // A second enqueue, an enqueue after the commit and a second commit end the process at the call
 // with Metal's words, as Metal does on all three GPUs. (They used to do nothing.)
 void test_enqueue_and_commit_are_once()
@@ -2124,6 +2219,7 @@ void rgfxQueueTests(const char *self)
 	test_buffers_run_in_enqueue_order();
 	test_threads_commit_in_enqueue_order();
 	test_submitted_waits_for_the_buffers_before();
+	test_resources_wait_for_their_buffers_in_flight();
 	test_enqueue_and_commit_are_once();
 	test_buffers_let_go_give_their_blocks_back();
 	test_in_place_writes_retire_at_the_take();

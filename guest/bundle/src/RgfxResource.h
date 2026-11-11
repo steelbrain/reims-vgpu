@@ -63,6 +63,12 @@ NS_ASSUME_NONNULL_BEGIN
 	// The texture over an IOSurface the object is, or views through any views (a view holds
 	// its texture, so this outlives it); nil for every other.
 	__unsafe_unretained id _Nullable _rgfxSurfaceRoot;
+	// The command buffers in flight that name the object's memory: submitted and not yet
+	// complete (RgfxInFlightBegin, RgfxInFlightEnd), counted where `_rgfxInFlightAt` points: at
+	// `_rgfxInFlight`, or at the count of the object whose memory it lies over (a view's texture,
+	// a texture's buffer), which it holds. Read and written by atomic builtins.
+	uint32_t _rgfxInFlight;
+	uint32_t *_Nonnull _rgfxInFlightAt;
 }
 
 /// The object's guest-picked id (0 names no object).
@@ -168,6 +174,31 @@ inline uint64_t RgfxResourceId(__unsafe_unretained id _Nullable obj)
 
 /// Whether `a`'s memory meets `b`'s: both lie in one heap over byte ranges that meet.
 BOOL RgfxResourcesAlias(RgfxResource *a, id _Nullable b);
+
+/// Counts `r`'s memory in flight in one more command buffer, as the buffer is submitted.
+inline void RgfxInFlightBegin(__unsafe_unretained RgfxResource *r)
+{
+	__atomic_fetch_add(r->_rgfxInFlightAt, 1u, __ATOMIC_SEQ_CST);
+}
+
+/// Counts `r`'s memory out of one command buffer, as the buffer's results land where the CPU
+/// sees them, and wakes the threads waiting for it (RgfxResourceWaitUntilComplete) where none
+/// is left.
+void RgfxInFlightEnd(__unsafe_unretained RgfxResource *r);
+
+/// The resource SPI's isComplete and isWriteComplete (RGFX_RESOURCE_SPI): whether no command
+/// buffer that names `r`'s memory is in flight.
+BOOL RgfxResourceIsComplete(__unsafe_unretained RgfxResource *r);
+
+/// The resource SPI's waitUntilComplete (RGFX_RESOURCE_SPI): returns once no command buffer that
+/// names `r`'s memory is in flight, or once RgfxResourceWaitsStop was called.
+void RgfxResourceWaitUntilComplete(__unsafe_unretained RgfxResource *r);
+
+/// Ends RgfxResourceWaitUntilComplete's waits, those under way and every later one: no thread
+/// takes the process's completions as they come any more (its completion thread ended, or never
+/// started), so a count in flight may not fall until a waiter of a command buffer takes them. A
+/// wait then returns at once, as it did before any wait was kept.
+void RgfxResourceWaitsStop(void);
 #endif
 
 /// The resource SPI members (RgfxMetalPrivate.h) a buffer and a texture answer alike, as Metal's
@@ -176,8 +207,16 @@ BOOL RgfxResourcesAlias(RgfxResource *a, id _Nullable b);
 ///  - doesAliasResource: YES only where both lie in one heap over byte ranges that meet, so a
 ///    resource in no heap aliases nothing, itself included; doesAliasAllResources:count: and
 ///    doesAliasAnyResources:count: ask it of each of a list (YES and NO for an empty one);
-///  - isComplete and isWriteComplete YES, even while a command buffer that writes it is in
-///    flight, and waitUntilComplete returns at once;
+///  - isComplete and isWriteComplete NO, and waitUntilComplete waits, while a command buffer
+///    that names it, or a view of its memory, is submitted and its results are yet to land where
+///    the CPU sees them: from its commitAndWaitUntilSubmitted's return, or its scheduling, to its
+///    completion's take (RgfxInFlightBegin, RgfxInFlightEnd), for any use. That is the Intel
+///    630's answer (macOS 26.7.1); the M3 Max answers isComplete NO for any use and
+///    isWriteComplete NO for a write alone, and waits too; the AMD 5300M answers YES and returns
+///    at once. All three answer YES and return at once for a buffer not yet scheduled, or not
+///    committed. Apple's GL renderer reads a texture back with getBytes: after its
+///    waitUntilComplete and a synchronize on a queue of its own, which does not wait for the
+///    draw's queue: an answer at once read the texture as it was before the draw;
 ///  - isPurgeable YES once made Volatile or Empty, NO before and once NonVolatile again.
 /// The macro goes in the class's @implementation.
 #define RGFX_RESOURCE_SPI                                                                          \
@@ -209,14 +248,15 @@ BOOL RgfxResourcesAlias(RgfxResource *a, id _Nullable b);
 	}                                                                                              \
 	-(BOOL)isComplete                                                                              \
 	{                                                                                              \
-		return YES;                                                                                \
+		return RgfxResourceIsComplete(self);                                                       \
 	}                                                                                              \
 	-(BOOL)isWriteComplete                                                                         \
 	{                                                                                              \
-		return YES;                                                                                \
+		return RgfxResourceIsComplete(self);                                                       \
 	}                                                                                              \
 	-(void)waitUntilComplete                                                                       \
 	{                                                                                              \
+		RgfxResourceWaitUntilComplete(self);                                                       \
 	}                                                                                              \
 	-(BOOL)isPurgeable                                                                             \
 	{                                                                                              \
