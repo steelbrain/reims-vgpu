@@ -358,10 +358,13 @@ fn lane(mut identity: IdentityCaps, compile_threads: u64, guest_ram: Option<u64>
 ///
 /// The RAM is what the host's memory map holds
 /// ([`GraphicsConfig::memory_map`](crate::GraphicsConfig::memory_map)): on QEMU's `q35`, the
-/// guest's RAM (guests of 8 GiB were told 6442450944 bytes, three quarters of it, in macOS 14.8.9
-/// and 26.7.2 on an Iris Xe); on its `vmapple` under HVF, the guest's RAM and the firmware's
-/// 1 MiB and the config's 64 KiB, which add 816 KiB to the answer for a guest of 8 GiB (a macOS
-/// 27.0.1 guest was told 6443286528 bytes, 0.7505 of its `hw.memsize`).
+/// guest's RAM (guests of 8 GiB were told 6442450944 bytes, three quarters of it, in macOS
+/// 11.7.11, 12.7.6, 13.7.8, 14.8.9, 15.8.2 and 26.7.2 on a Radeon 780M, and in 14.8.9 and 26.7.2
+/// on an Iris Xe); on its `vmapple` under TCG on Linux, the guest's RAM too (macOS 14.6.1, 15.6.1
+/// and 26.6.2 guests of 8 GiB were told 6442450944 bytes on a Radeon 780M); on its `vmapple` under
+/// HVF on a Mac, the guest's RAM and the firmware's 1 MiB and the config's 64 KiB, which add
+/// 816 KiB to the answer for a guest of 8 GiB (a macOS 27.0.1 guest on an Apple M3 Max was told
+/// 6443286528 bytes, 0.7505 of its `hw.memsize`).
 fn lane_working_set(platform: Option<u64>, unified: bool, guest_ram: Option<u64>) -> Option<u64> {
     const PAGE: u64 = 16 << 10;
     match (platform, guest_ram) {
