@@ -106,6 +106,13 @@ Unset or unparsable values give the defaults below.
   where its pixels halve exactly, and a guest given a 3841 × 2161 mode
   never brought its display up, HiDPI or not.
   `test: geometry::a_drawable_offers_a_mode_a_multiple_of_16_wide_drawn_unscaled`
+- That guest is told the scale of the screen the window was last drawn on,
+  and its display is as dense as that screen, 110 pixels per inch a point
+  of it. An arm64 guest runs at 1x on a screen at 1x and HiDPI on one above
+  1x, at every window size. An x86-64 macOS 26 guest decides by the window's
+  width alone, on any screen: HiDPI from 3840 pixels wide, 1x below. A
+  window moved to a screen of another scale gives the guest a new mode.
+  `test: geometry::the_layout_carries_the_screen_s_scale`, `manual`
 - Sharp on every screen: one drawable pixel per screen pixel, following the
   window across screens of different scale. `manual`
 - Native full screen (the green button, ⌃⌘F) keeps the ratio. `manual`
