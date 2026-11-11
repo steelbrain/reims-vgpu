@@ -395,8 +395,8 @@ pub(crate) struct CopyTimes {
 
 /// What a `SURFACE_DOWNLOAD`'s or a `BLOCK_RELEASE`'s answer waited for once it was carried out:
 /// the cache, how its pages took it, and the copy the answer came with, for the line of an
-/// answer that came late ([`super::Decoder::timed`]). Diagnostics only: nothing reads it to
-/// decide anything.
+/// answer that came late ([`super::GraphicsDecoder::timed`]). Diagnostics only: nothing reads it
+/// to decide anything.
 #[derive(Default)]
 pub(crate) struct CopyTrace {
     traced: Mutex<Traced>,
