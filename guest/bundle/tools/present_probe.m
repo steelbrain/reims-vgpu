@@ -23,6 +23,15 @@
 //   link_hz         CVDisplayLink callbacks a second, link_period_ms the period it states;
 //   vsync_ms_p05/p50/p95/absmax  from each presentedTime to the nearest refresh the display link
 //                   gave (its callbacks' current time), signed, and the largest distance.
+// Then one line "present_probe-timeline: key=value ...", where a run that falls short shows when:
+//   occlusion       each change of the window's occlusion state, as seconds:visible (1) or not
+//                   (0), from the run's start (the window's ordering front);
+//   committed, presented, dropped, wait_ms_max  per half second of the measured window, by
+//                   commit time: frames committed, presented, dropped, and nextDrawable's longest
+//                   block;
+//   first_waits_ms  the first 12 blocks of nextDrawable from the run's start, warm-up included,
+//                   as seconds:milliseconds; long_waits_ms the first 20 of 100 ms or more;
+//   presented_first_s, presented_last_s  the first and last presentedTime, from the run's start.
 // It needs the logged-in user's window server session (launchctl asuser).
 // Build (-arch arm64 for an Apple-silicon Mac):
 //   xcrun clang -arch x86_64 -fobjc-arc -Wall -Wextra -Werror -Wno-unused-parameter
@@ -64,6 +73,23 @@ static double percentile(NSArray<NSNumber *> *values, double p)
 	NSArray *s = [values sortedArrayUsingSelector:@selector(compare:)];
 	NSUInteger i = (NSUInteger)(p * (double)(s.count - 1) + 0.5);
 	return [s[i] doubleValue];
+}
+
+// The timeline line's series, from the run's start (gT0).
+static double gT0;
+static NSString *gTimeline;
+enum { kBucketsMax = 512 };
+static const double kBucket = 0.5;
+
+static int gCommittedB[kBucketsMax], gPresentedB[kBucketsMax], gDroppedB[kBucketsMax];
+static double gWaitMaxB[kBucketsMax];
+
+static NSString *joinInts(const int *v, int n)
+{
+	NSMutableArray *a = [NSMutableArray arrayWithCapacity:(NSUInteger)n];
+	for (int i = 0; i < n; i++)
+		[a addObject:[NSString stringWithFormat:@"%d", v[i]]];
+	return [a componentsJoinedByString:@","];
 }
 
 static _Atomic int gLinkTicks;
@@ -119,6 +145,18 @@ static NSString *run(void)
 	view.layer = layer;
 	view.wantsLayer = YES;
 	win.contentView = view;
+	NSMutableArray<NSString *> *occlusion = [NSMutableArray array];
+	id occlusionObserver = [NSNotificationCenter.defaultCenter
+	    addObserverForName:NSWindowDidChangeOcclusionStateNotification
+	                object:win
+	                 queue:NSOperationQueue.mainQueue
+	            usingBlock:^(NSNotification *note) {
+		            const BOOL visible = (win.occlusionState & NSWindowOcclusionStateVisible) != 0;
+		            @synchronized(occlusion) {
+			            [occlusion addObject:[NSString stringWithFormat:@"%.2f:%d", now() - gT0, visible]];
+		            }
+	            }];
+	gT0 = now();
 	[win orderFrontRegardless];
 
 	CVDisplayLinkRef link = NULL;
@@ -137,6 +175,11 @@ static NSString *run(void)
 		__block atomic_int dropped = 0, answered = 0;
 		int submitted = 0, nils = 0, linkStart = 0;
 		const double start = now(), measure = start + 1, end = measure + gSeconds;
+		const int buckets = MIN(kBucketsMax, (int)ceil(gSeconds / kBucket));
+		int (^bucketOf)(double) = ^int(double t) {
+			return MAX(0, MIN(buckets - 1, (int)floor((t - measure) / kBucket)));
+		};
+		NSMutableArray<NSString *> *firstWaits = [NSMutableArray array], *longWaits = [NSMutableArray array];
 		double next = start;
 		BOOL counting = NO;
 		id<MTLCommandBuffer> last = nil;
@@ -150,6 +193,10 @@ static NSString *run(void)
 				const double asked = now();
 				id<CAMetalDrawable> d = [layer nextDrawable];
 				const double got = now();
+				if (firstWaits.count < 12)
+					[firstWaits addObject:[NSString stringWithFormat:@"%.2f:%.1f", asked - gT0, (got - asked) * 1e3]];
+				if (got - asked >= 0.1 && longWaits.count < 20)
+					[longWaits addObject:[NSString stringWithFormat:@"%.2f:%.1f", asked - gT0, (got - asked) * 1e3]];
 				if (d == nil) {
 					nils++;
 					continue;
@@ -171,11 +218,15 @@ static NSString *run(void)
 				if (counting) {
 					submitted++;
 					[waits addObject:@((got - asked) * 1e3)];
+					const int b = bucketOf(committed);
+					gCommittedB[b]++;
+					gWaitMaxB[b] = MAX(gWaitMaxB[b], (got - asked) * 1e3);
 					[d addPresentedHandler:^(id<MTLDrawable> dr) {
 						atomic_fetch_add(&answered, 1);
 						const double t = dr.presentedTime;
 						if (t > 0) {
 							[lock lock];
+							gPresentedB[b]++;
 							[presented addObject:@(t)];
 							[latency addObject:@((t - committed) * 1e3)];
 							if (gAt > 0)
@@ -183,6 +234,9 @@ static NSString *run(void)
 							[lock unlock];
 						} else {
 							atomic_fetch_add(&dropped, 1);
+							[lock lock];
+							gDroppedB[b]++;
+							[lock unlock];
 						}
 					}];
 				}
@@ -247,6 +301,22 @@ static NSString *run(void)
 		                     atomic_load(&gLinkPeriodNs) / 1e6, percentile(offs, 0.05), percentile(offs, 0.5),
 		                     percentile(offs, 0.95), percentile(absOffs, 1),
 		                     (long)screen.maximumFramesPerSecond, gSeconds];
+		NSMutableArray *waitMax = [NSMutableArray arrayWithCapacity:(NSUInteger)buckets];
+		for (int i = 0; i < buckets; i++)
+			[waitMax addObject:[NSString stringWithFormat:@"%.0f", gWaitMaxB[i]]];
+		NSString *seen;
+		@synchronized(occlusion) {
+			seen = [occlusion componentsJoinedByString:@","];
+		}
+		gTimeline = [NSString
+		    stringWithFormat:@"occlusion=%@ bucket_s=%.1f committed=%@ presented=%@ dropped=%@ wait_ms_max=%@ "
+		                     @"first_waits_ms=%@ long_waits_ms=%@ presented_first_s=%.2f presented_last_s=%.2f",
+		                     seen.length ? seen : @"none", kBucket, joinInts(gCommittedB, buckets),
+		                     joinInts(gPresentedB, buckets), joinInts(gDroppedB, buckets),
+		                     [waitMax componentsJoinedByString:@","], [firstWaits componentsJoinedByString:@","],
+		                     longWaits.count ? [longWaits componentsJoinedByString:@","] : @"none",
+		                     ts.count ? [ts.firstObject doubleValue] - gT0 : 0,
+		                     ts.count ? [ts.lastObject doubleValue] - gT0 : 0];
 		[lock unlock];
 		dispatch_async(dispatch_get_main_queue(), ^{
 			[NSApp stop:nil];
@@ -268,6 +338,7 @@ static NSString *run(void)
 		CVDisplayLinkStop(link);
 		CVDisplayLinkRelease(link);
 	}
+	[NSNotificationCenter.defaultCenter removeObserver:occlusionObserver];
 	[win orderOut:nil];
 	return result ?: @"FAIL the render thread gave no result";
 }
@@ -310,6 +381,8 @@ int main(int argc, char **argv)
 		}
 		NSString *r = run();
 		printf("present_probe: %s\n", r.UTF8String);
+		if (gTimeline)
+			printf("present_probe-timeline: %s\n", gTimeline.UTF8String);
 		return [r hasPrefix:@"OK"] ? 0 : 1;
 	}
 }
