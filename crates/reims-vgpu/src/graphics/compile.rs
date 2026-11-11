@@ -772,6 +772,19 @@ mod tests {
         panic!("{n} compiles did not start");
     }
 
+    /// Waits until `pool`'s threads have taken `n` compiles; the contexts of those taken, in
+    /// order.
+    fn took(pool: &CompilePool, n: usize) -> Vec<u32> {
+        for _ in 0..5000 {
+            let now = pool.taken();
+            if now.len() >= n {
+                return now;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the threads did not take {n} compiles");
+    }
+
     /// The process's exit waits for a compile in progress, and the pool starts no compile once
     /// it began: a child exits 300 ms before its one thread's first compile ends, with a second
     /// queued behind it, which never runs (the module doc, "At the exit"). The second's thread
@@ -811,11 +824,13 @@ mod tests {
     }
 
     /// One context's backlog holds no other context's create: with four threads busy on context
-    /// 1's twenty compiles, context 2's single create is taken as the first of them ends, though
-    /// all four end before a thread takes the next, and so finishes one compile time after that,
-    /// where in the order compiles were handed over it would wait for five. The order is read as
-    /// the pool took the compiles: a thread put off between its take and its compile's start lets
-    /// a compile taken after its own start first
+    /// 1's twenty compiles, context 2's single create is the fifth compile taken, as the first of
+    /// the four ends, though all four end before a thread takes the next, where in the order
+    /// compiles were handed over it would be taken after the twenty. The order is read as the
+    /// pool took the compiles: a thread put off between its take and its compile's start lets a
+    /// compile taken after its own start first. The order alone is checked, not when the create
+    /// finished: one compile time after the release on an idle host, it took more than three
+    /// under a loaded host's test run (0.46 s, with four sleeping threads)
     #[test]
     fn a_context_s_create_waits_behind_no_other_context_s_backlog() {
         const TAKES: Duration = Duration::from_millis(100);
@@ -832,22 +847,21 @@ mod tests {
                 TAKES,
             );
         }
-        let (finished, finish) = mpsc::channel::<Instant>();
+        let (finished, finish) = mpsc::channel::<()>();
         let create: CompileJob = {
             let starts = Arc::clone(&starts);
             Box::new(move || {
                 starts.lock().push("2".to_owned());
                 std::thread::sleep(TAKES);
-                let _ = finished.send(Instant::now());
+                let _ = finished.send(());
             })
         };
         assert!(
             pool.submit(CompileOf::new(CompileKind::Pipeline, obj(2, 1)), create)
                 .is_ok()
         );
-        let released = Instant::now();
         pool.release();
-        let done = finish
+        finish
             .recv_timeout(Duration::from_secs(10))
             .expect("context 2's create never ran");
         let taken = pool.taken();
@@ -856,12 +870,6 @@ mod tests {
             at.is_some_and(|at| at <= 4),
             "context 2's create was taken late: {taken:?}, started in {:?}",
             starts.lock().clone()
-        );
-        // Handed over last, it would finish after six compile times; it waits for one.
-        let took = done.saturating_duration_since(released);
-        assert!(
-            took < 3 * TAKES,
-            "context 2's create finished {took:?} after the release, more than a compile's wait"
         );
     }
 
@@ -883,13 +891,7 @@ mod tests {
             Duration::ZERO,
         );
         // The thread takes 1.0 and holds at the gate; then 1 hands over two more, 2 its create.
-        for _ in 0..5000 {
-            if !pool.taken().is_empty() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(pool.taken(), [1], "the thread took no compile");
+        assert_eq!(took(&pool, 1), [1], "the thread took no compile");
         for name in ["1.1", "1.2"] {
             compile(
                 &pool,
@@ -931,7 +933,7 @@ mod tests {
                 .is_ok()
         );
         // The one thread holds the blocker; then three contexts' compiles wait.
-        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(took(&pool, 1), [9], "the thread took no blocker");
         for i in 0..3 {
             compile(
                 &pool,
@@ -983,7 +985,7 @@ mod tests {
             pool.submit(CompileOf::new(CompileKind::Pipeline, obj(9, 1)), blocker)
                 .is_ok()
         );
-        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(took(&pool, 1), [9], "the thread took no blocker");
         compile(
             &pool,
             &starts,
