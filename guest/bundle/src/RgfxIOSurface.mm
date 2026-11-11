@@ -522,6 +522,10 @@ struct RgfxSurfaceShadow {
 	RgfxRegion *region = nullptr; // where the block goes back at the copy's end
 	id<MTLBuffer> buffer = nil; // the Shared buffer over the view: the pages, or the block
 	std::mutex lock;            // one sync at a time in this process
+	// Held by the thread that makes the view, from its entry in the registry until its buffer,
+	// and a copy's first upload, are made: a thread that finds the view meanwhile waits for it
+	// (shadowFor), as its texture names the buffer.
+	std::mutex making;
 	bool shared = false;        // the plane's shared block, else this process's own
 	bool inPlace = false;       // the GPU uses the surface's pages; the block holds no copy
 	bool cached = false;        // in place, and its GPU copy is the host's device cache
@@ -939,14 +943,21 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, RgfxRegion *r
 	uint32_t surfaceId = IOSurfaceGetID(surface);
 	Registry &r = registry();
 	std::shared_ptr<RgfxSurfaceShadow> shadow;
+	// The new view's `making`, held from its entry in the registry until this returns; after
+	// `shadow`, so it is let go before a view not made dies.
+	std::unique_lock<std::mutex> making;
 	{
-		std::lock_guard<std::mutex> g(r.lock);
+		std::unique_lock<std::mutex> g(r.lock);
 		auto it = r.shadows.find(surfaceId);
 		if (it != r.shadows.end()) {
 			shadow = it->second.lock();
 			// A live copy holds its surface, so its id still names that surface.
 			if (shadow != nullptr) {
-				return shadow;
+				// Its maker may be making its buffer still: once it lets go, the buffer is
+				// made, or never will be (the maker logged why), and no view is given.
+				g.unlock();
+				std::lock_guard<std::mutex> made(shadow->making);
+				return shadow->buffer != nil ? shadow : nullptr;
 			}
 		}
 		shadow = std::make_shared<RgfxSurfaceShadow>();
@@ -1058,6 +1069,7 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, RgfxRegion *r
 		shadow->readers = shadow->writers + 1;
 		if (!shadow->shared || sharedBlock.fresh)
 			std::memset(static_cast<void *>(shadow->writers), 0, 2 * sizeof(RgfxSurfaceWriters));
+		making = std::unique_lock<std::mutex>(shadow->making);
 		r.shadows[surfaceId] = shadow;
 	}
 	uint64_t offset = shadow->block.offset;

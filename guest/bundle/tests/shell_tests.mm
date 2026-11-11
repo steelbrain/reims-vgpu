@@ -76,6 +76,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -12232,6 +12233,89 @@ void test_iosurface_planes()
 	CFRelease(plain);
 }
 
+// Two threads make textures over one surface at once, as ImageIO's do over the tiles of one
+// decoded picture: the second finds the view the first is still making, waits until the first
+// has made its buffer, and names that buffer too. It names no buffer at all (0, which the host
+// answers as a bad reference) if it takes the view before the buffer is made. The second texture
+// is asked while the first's buffer create rings the doorbell, before that create returns.
+void test_iosurface_texture_waits_for_a_view_being_made()
+{
+	struct Bell {
+		std::atomic<int> rings{0};
+		std::function<void()> first;
+		static void ring(void *c, uint32_t)
+		{
+			Bell *b = static_cast<Bell *>(c);
+			if (b->rings.fetch_add(1) == 0 && b->first)
+				b->first();
+		}
+	} bell;
+	// As Fixture's, with this test's doorbell; never freed, as Fixture's are not.
+	TestRing &ring = *new TestRing(0x8000);
+	RgfxRingWriter &writer = *new RgfxRingWriter(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID,
+	                                             &Bell::ring, &bell);
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	RgfxSerializer &ser = *new RgfxSerializer(writer, ids);
+	ring.setConsumerIdle(1); // host idle, so each post rings the doorbell
+	int calls = 0;
+	ids.setResourceIdSource(&oneChunk, &calls);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth : @16,
+		(id)kIOSurfaceHeight : @16,
+		(id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+	};
+	IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(surface != nullptr);
+	auto texture = [&]() {
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:8
+		                                                      height:8
+		                                                   mipmapped:NO];
+		return [RgfxIOSurfaceTexture textureWithDescriptor:td
+		                                        iosurface:surface
+		                                            plane:0
+		                                           origin:MTLOriginMake(8, 8, 0)
+		                                           region:&region
+		                                           device:nil
+		                                       serializer:&ser];
+	};
+	@autoreleasepool {
+		RgfxIOSurfaceTexture *second = nil;
+		std::atomic<bool> secondMade{false};
+		std::thread other;
+		bell.first = [&] {
+			other = std::thread([&] {
+				@autoreleasepool {
+					second = texture();
+				}
+				secondMade = true;
+			});
+			// Time for the second to reach the view and post its texture, were it not to wait.
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+			CHECK(!secondMade);
+		};
+		RgfxIOSurfaceTexture *first = texture();
+		other.join();
+		CHECK(first != nil && second != nil && bell.rings == 3);
+		auto buffer = expectMessage<RgfxBufferOverHostMemory>(ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		CHECK(buffer.obj_id != 0);
+		for (int i = 0; i < 2; i++) {
+			auto m = expectMessage<RgfxSurfaceTextureMessage>(ring, RGFX_CMD_TEXTURE_FROM_IOSURFACE);
+			CHECK(m.texture.buffer_obj_id == buffer.obj_id && m.texture.offset == 8 * 256 + 8 * 4);
+		}
+		CHECK(ringEmpty(ring));
+		bell.first = nullptr;
+	}
+	drainRing(ring); // the textures' and the buffer's destroys
+	CFRelease(surface);
+}
+
 // The shared copy block a texture over a surface takes in these tests, at `offset` in the region.
 struct SurfaceBlockAt {
 	uint64_t offset;
@@ -15859,6 +15943,7 @@ int main(int argc, char **argv)
 		test_iosurface_copy_block_after_destroys();
 		test_iosurface_shared_block();
 		test_iosurface_planes();
+		test_iosurface_texture_waits_for_a_view_being_made();
 		test_iosurface_cpu_access_in_the_texture_s_format();
 		test_iosurface_block_compressed_textures_are_made();
 		test_iosurface_writers();
