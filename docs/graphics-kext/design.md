@@ -269,6 +269,10 @@ Stages:
     `ai.aneesiqbal.ReimsGraphics.graft-bound` on its provider, and the
     manifest carries each personality's provider matching (its
     `IOProviderClass` and `IOPCIPrimaryMatch`: the 1234:5247 device).
+    The personalities hold those and the keys that name the driver
+    (`IOClass`, `CFBundleIdentifier`, `IOProbeScore`, `IOMatchCategory`)
+    alone: the accelerator sets its driver keys on its registry entry in
+    `start` ("Stage 3 accelerator kext").
     OpenCore links that dormant kext in the Boot collection. Graft
     (`guest/graft`, a copy of Graft's release build) starts from its own
     kext start and finds ReimsGraphics among the placed kexts by its
@@ -810,7 +814,7 @@ Stages:
     `/Library/GPUBundles` and open IOAccelerator user clients. A video
     plug-in of our own in `/Library/Video/Plug-Ins` is no way in: CoreMedia
     lists only Apple-signed plug-ins.
-    - **Identity:** the accelerator's personality names the bundle,
+    - **Identity:** the accelerator's registry entry names the bundle,
       `reims-graphics`, as the video driver, with `IOVARendererID` 0x1020004,
       the AMD Navi family's, and `IOGVACodec`; the bundle exports the two
       entry points beside its Metal device
@@ -3332,7 +3336,7 @@ How a Metal bundle plugs into macOS, in Apple's own terms (notes:
 
 - **Discovery/load.** The bundle installs under `/Library/GPUBundles/`. Metal
   does not scan that directory; it loads the bundle from two properties on the
-  accelerator service's IOKit personality — `MetalPluginName` (the path) and
+  accelerator service's registry entry — `MetalPluginName` (the path) and
   `MetalPluginClassName` (the Obj-C class Metal instantiates as the
   `MTLDevice`) — under `IOMatchCategory IOAccelerator`. So stage 3 needs a
   guest **accelerator kext** that matches our PCI device and publishes those
@@ -3448,14 +3452,22 @@ How a Metal bundle plugs into macOS, in Apple's own terms (notes:
 IOService in the one kext, on the same PCI device as the Stage-2 framebuffer:
 the framebuffer matches in category `IOFramebuffer`, the accelerator in category
 `IOAccelerator`, both children of the one `IOPCIDevice`. Its `Info.plist`
-personality carries `MetalPluginName = reims-graphics` (the bundle
+personality holds only what matches the provider and names the driver, as
+Graft takes a personality's other keys for the provider's matching ("Graft",
+above). The accelerator sets its driver keys on its registry entry at the
+start of `start`, before it registers (`setDriverKeys`), of the same types on
+x86-64 and arm64: `MetalPluginName = reims-graphics` (the bundle
 `/Library/GPUBundles/reims-graphics.bundle`) and `MetalPluginClassName
 = RgfxMetalDevice`, which is how Metal (`IOServiceMatching("IOAccelerator")`)
-finds and loads the bundle. The accelerator maps BAR 0 for the doorbell and
+finds and loads the bundle; `IOGLBundleName` (OpenGL, below);
+`IODVDBundleName`, `IOVARendererID` and `IOGVACodec` (hardware video,
+Decided 16); `AcceleratorProperties`, whose
+`IOAccelDisplayPipeCapabilities` say the display pipe and its transactions
+are supported; and `DisplayPortCount` 1. The accelerator maps BAR 0 for the doorbell and
 holds BAR 2 to map each process's part of it in; it touches no pixels and no
 control ring (the framebuffer owns those).
 
-**OpenGL.** The personality also carries `IOGLBundleName =
+**OpenGL.** The accelerator also carries `IOGLBundleName =
 AppleMetalOpenGLRenderer`, the GL renderer OpenGL loads for an accelerator: the
 system's own GL over Metal, which finds its Metal device among
 `MTLCopyAllDevices()` by the accelerator's registry entry ID (the device's
@@ -3668,7 +3680,7 @@ builds a pipe), and refuses the rest.
 ## Open
 
 - **Stage 3 bundle placement — RESOLVED:** the bundle sits in
-  `/Library/GPUBundles` and our accelerator kext's personality carries
+  `/Library/GPUBundles` and our accelerator's registry entry carries
   `MetalPluginName`/`MetalPluginClassName`. The library-validation boot state
   is settled: the install kext gives the bundle the rootless storage class so
   Metal trusts its path, and answers the library-validation, mmap and signature

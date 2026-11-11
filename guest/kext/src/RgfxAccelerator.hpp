@@ -7,11 +7,12 @@
  * the accelerator and the framebuffer to share a provider).
  *
  * What it is for: Metal does not scan /Library/GPUBundles. It loads our guest GPU
- * bundle from two properties on THIS service's IOKit personality — MetalPluginName
+ * bundle from two properties on THIS service's registry entry — MetalPluginName
  * (the bundle path) and MetalPluginClassName (the Obj-C class Metal instantiates as
  * the MTLDevice, RgfxMetalDevice) — which it finds because the service matches
- * IOServiceMatching("IOAccelerator") under IOMatchCategory IOAccelerator. Those two
- * keys live in src/Info.plist's accelerator personality (stage3-apple-metal-iface.md
+ * IOServiceMatching("IOAccelerator") under IOMatchCategory IOAccelerator. start sets
+ * those two keys, with the accelerator's other driver keys, on the entry before it
+ * registers the service (RgfxAccelerator.cpp, setDriverKeys; stage3-apple-metal-iface.md
  * section 1). This service then exposes, over OUR protocol (not Apple's IOGPU
  * user-client ABI), the two things the bundle's transport needs:
  *   - the process's part of the device's BAR-2 region, mapped into the Metal client's

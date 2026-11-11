@@ -3,8 +3,8 @@
  * (AppleMetalOpenGLRenderer) makes its shaders with: newFunctionWithGLIR:, newFunctionWithGLCoreIR:
  * and newFunctionWithGLESIR:, each with and without an inputs description, answer a function of
  * the IR (RgfxGLFunction.h), whose variants are libraries of the device. The renderer reaches the
- * device by the accelerator's IOGLBundleName (guest/kext/src/Info.plist); Metal's own devices
- * answer these members from Metal's base device class.
+ * device by the accelerator's IOGLBundleName (guest/kext/src/RgfxAccelerator.cpp); Metal's own
+ * devices answer these members from Metal's base device class.
  *
  * Like the rest of the device it is compiled into the bundle but not linked into the unit tests
  * (RgfxMetalDevice.h). Our own ObjC++.

@@ -330,9 +330,55 @@ uint64_t RgfxAccelerator::featureWord() const
 
 // MARK: - IOService
 
+namespace {
+// The size, in bits, of the driver keys' numbers: 64, as the kernel makes a plist's <integer>, so
+// a process reads each as a 64-bit CFNumber (kCFNumberSInt64Type).
+constexpr unsigned kDriverKeyNumberBits = 64;
+
+// The accelerator's driver keys, on its registry entry, where the guest's frameworks read them:
+// Metal the bundle and the class it makes the device of (MetalPluginName, MetalPluginClassName),
+// OpenGL its renderer (IOGLBundleName), AppleGVA its video driver (IODVDBundleName,
+// IOVARendererID, IOGVACodec), the display pipe's capabilities (AcceleratorProperties), and the
+// display count (DisplayPortCount); the same on x86-64 and arm64. The personality holds only what
+// matches the provider and names the driver: Graft records the rest of a personality as the
+// provider's matching. Set at the start of start, before registerService lets any process find
+// the accelerator and before the bundle's check reads MetalPluginName.
+bool setDriverKeys(IOService *service)
+{
+	OSDictionary *pipe = OSDictionary::withCapacity(2);
+	OSDictionary *accel = OSDictionary::withCapacity(2);
+	OSString *category = OSString::withCString("IOAccelerator");
+	OSNumber *ports = OSNumber::withNumber(1ull, kDriverKeyNumberBits);
+	OSNumber *renderer = OSNumber::withNumber(0x1020004ull, kDriverKeyNumberBits);
+	bool set = pipe && accel && category && ports && renderer &&
+	           pipe->setObject("DisplayPipeSupported", kOSBooleanTrue) &&
+	           pipe->setObject("TransactionsSupported", kOSBooleanTrue) &&
+	           accel->setObject("IOAccelDisplayPipeCapabilities", pipe) &&
+	           accel->setObject("IOMatchCategory", category) &&
+	           service->setProperty("AcceleratorProperties", accel) &&
+	           service->setProperty("DisplayPortCount", ports) &&
+	           service->setProperty("IODVDBundleName", "reims-graphics") &&
+	           service->setProperty("IOGLBundleName", "AppleMetalOpenGLRenderer") &&
+	           service->setProperty("IOGVACodec", "RgfxVideo") &&
+	           service->setProperty("IOVARendererID", renderer) &&
+	           service->setProperty("MetalPluginClassName", "RgfxMetalDevice") &&
+	           service->setProperty("MetalPluginName", "reims-graphics");
+	OSSafeReleaseNULL(renderer);
+	OSSafeReleaseNULL(ports);
+	OSSafeReleaseNULL(category);
+	OSSafeReleaseNULL(accel);
+	OSSafeReleaseNULL(pipe);
+	return set;
+}
+} // namespace
+
 bool RgfxAccelerator::start(IOService *provider)
 {
 	ReimsGraphics *fb = nullptr;
+	if (!setDriverKeys(this)) {
+		IOLog("RgfxAccelerator: no memory for its driver keys: not starting\n");
+		return false;
+	}
 	pci = OSDynamicCast(IOPCIDevice, provider);
 	if (!pci)
 		return false;
@@ -380,9 +426,8 @@ bool RgfxAccelerator::start(IOService *provider)
 		goto fail;
 	}
 
-	// The Metal discovery keys (MetalPluginName / MetalPluginClassName) and the PCI
-	// match that make Metal load the bundle are in src/Info.plist's accelerator
-	// personality, so they are already registry properties on this service; so is
+	// The Metal discovery keys (MetalPluginName / MetalPluginClassName) that make Metal
+	// load the bundle are on this service already (setDriverKeys, above); so is
 	// IOGLBundleName, the GL renderer OpenGL loads for it (AppleMetalOpenGLRenderer,
 	// which runs on the bundle's Metal device). The
 	// accelerator does not touch pixels or the control ring (the framebuffer owns

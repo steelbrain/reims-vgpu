@@ -2,7 +2,7 @@
  * RgfxMetalPrivate: minimal forward-declarations of the Apple-private Metal
  * interface the reims-graphics guest bundle plugs into. Metal loads our bundle as
  * the guest's MTLDevice (via MetalPluginName/MetalPluginClassName on the
- * accelerator's IOKit personality) and expects a device that subclasses Apple's
+ * accelerator's registry entry) and expects a device that subclasses Apple's
  * private IOAccel-backed Metal base class and conforms to <MTLDevice, MTLDeviceSPI>
  * (docs/graphics-kext/design.md, Stage 3; and the Stage-3 Apple-interface notes).
  *
