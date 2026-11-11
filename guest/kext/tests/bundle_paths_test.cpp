@@ -43,12 +43,17 @@ int main()
 	CHECK(rgfxBundlePaths(fits.c_str(), 4294967295u, &paths));
 	CHECK(std::strstr(paths.marker, "wire-version-4294967295") != nullptr);
 	// What counts on disk, given RgfxGate's pass: the bundle, once no pass is under way.
-	CHECK(rgfxBundleRegisters(kRgfxGateAbsent, true));
-	CHECK(rgfxBundleRegisters(kRgfxGateDone, true));
-	CHECK(!rgfxBundleRegisters(kRgfxGateInstalling, true));
-	CHECK(!rgfxBundleRegisters(kRgfxGateAbsent, false));
-	CHECK(!rgfxBundleRegisters(kRgfxGateDone, false));
-	CHECK(!rgfxBundleRegisters(kRgfxGateInstalling, false));
+	CHECK(rgfxBundleRegisters(kRgfxGateAbsent, true, true));
+	CHECK(rgfxBundleRegisters(kRgfxGateDone, true, true));
+	CHECK(!rgfxBundleRegisters(kRgfxGateInstalling, true, true));
+	CHECK(!rgfxBundleRegisters(kRgfxGateAbsent, false, true));
+	CHECK(!rgfxBundleRegisters(kRgfxGateDone, false, true));
+	CHECK(!rgfxBundleRegisters(kRgfxGateInstalling, false, true));
+	// No framebuffer started: no registration, whatever the disk holds.
+	CHECK(!rgfxBundleRegisters(kRgfxGateAbsent, true, false));
+	CHECK(!rgfxBundleRegisters(kRgfxGateDone, true, false));
+	CHECK(!rgfxBundleRegisters(kRgfxGateInstalling, true, false));
+	CHECK(!rgfxBundleRegisters(kRgfxGateDone, false, false));
 	CHECK(!std::strcmp(kRgfxGateInstallDoneKey, "RgfxGateInstallDone"));
 	std::printf("bundle_paths_test: OK (%d checks)\n", checks);
 	return 0;

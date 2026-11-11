@@ -363,30 +363,38 @@ public:
 	// before it has started. A lookup that finds it names this accelerator on it by its path as
 	// it stands (IOAccelTypes), as a display pipe's accelerator does.
 	ReimsGraphics *copyFramebuffer();
+	// Whether that framebuffer has started (ReimsGraphics::hasStarted): before, and once its stop
+	// has begun, the device holds nothing of any context, and no message of one reaches it.
+	bool framebufferStarted();
 
 	// The bundle (RgfxAccelerator.cpp, "The bundle"): the accelerator registers only once the
-	// bundle MetalPluginName names is on disk, and opens no user client before. A check from
-	// start repeats until the bundle is there; the framebuffer's first server connection,
-	// WindowServer's, settles it with a last check of its own, before IOFramebuffer makes the
-	// connection, and no check runs after. A bundle installed later is used from the next boot.
+	// bundle MetalPluginName names is on disk and the framebuffer has started, and opens no user
+	// client before. A check from start repeats until both hold; the framebuffer's first server
+	// connection, WindowServer's, settles it with a last check of its own, before IOFramebuffer
+	// makes the connection, and no check runs after. A bundle installed later is used from the
+	// next boot.
 	void settleBundle();
 
 	// The processes' contexts (RgfxAcceleratorContexts.cpp). A context number is handed out once
 	// (from 1); a run of units of the GPU-address space (RgfxContextSlots.hpp), `*units` from
 	// `*first`, is held until the close: the units a context holds, or RGFX_CONTEXT_VA_SPAN's
 	// for a bundle that takes no span from the kext (`oldSpan`). WindowServer's
-	// (`windowServer`) may take the last units free. kIOReturnNoResources where no run is free.
+	// (`windowServer`) may take the last units free. kIOReturnNoResources where no run is free,
+	// kIOReturnNotReady where the framebuffer has not started (framebufferStarted), taking none.
 	IOReturn openContext(UInt32 *context, bool oldSpan, bool windowServer, UInt32 *first,
 	                     UInt32 *units);
 	// How a context's close ended (closeContext).
 	enum CloseAnswer {
 		// Answered OK in time: the device holds nothing of the context, and every command
 		// buffer of it has finished. Its units are given back, and the caller lets go of the
-		// rest (freeIdChunks, freeBlocks, dropSurfaceBlocks closed).
+		// rest (freeIdChunks, freeBlocks, dropSurfaceBlocks closed). So too where no framebuffer
+		// has started to post the close through: none has carried a message of the context since
+		// the device's last reset, which drops every context's objects (design.md, "Reset"), so
+		// the device holds nothing of it.
 		kCloseAnswered,
-		// Refused, or never posted: the device may hold all of it for good, its units too, so
-		// the caller keeps the rest from use (keepIdChunks, keepBlocks, dropSurfaceBlocks not
-		// closed).
+		// Refused, or not posted to a started framebuffer: the device may hold all of it for
+		// good, its units too, so the caller keeps the rest from use (keepIdChunks, keepBlocks,
+		// dropSurfaceBlocks not closed).
 		kCloseRefused,
 		// Not answered in kCloseAnswerMs: the caller hands the rest to the close (parkClose
 		// with `*late`), whose answer, however late, lets go of all of it as one in time does.

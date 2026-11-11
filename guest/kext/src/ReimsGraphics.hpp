@@ -228,6 +228,12 @@ public:
 	void scanoutOwnerMoved(task_t owner);
 	// The accelerator on our PCI device, retained for the caller, or nullptr before it started.
 	RgfxAccelerator *copyAccelerator();
+	// Whether the framebuffer has started: its start has taken the device and brought its rings
+	// up, and is in the class's start or has returned true, and its stop has not begun. The rings
+	// then carry the accelerator's messages. Before, after a start that failed (which resets the
+	// device) and from the stop on (which resets it at its end), the device holds nothing of any
+	// process's context (design.md, "Reset").
+	bool hasStarted() const { return __atomic_load_n(&started, __ATOMIC_ACQUIRE); }
 
 	typedef void (*PipeVblankHook)(OSObject *client, UInt64 count, UInt64 time, UInt64 next);
 	typedef void (*PipePresentHook)(OSObject *client, UInt64 seqno, UInt32 status, UInt64 time);
@@ -610,6 +616,9 @@ private:
 	// start's and stop's alone: whether start reset the device to take it. Only a device taken is
 	// reset when the kext lets it go; one refused before stays as the firmware left it.
 	bool taken;
+	// hasStarted's: set as start calls the class's start, cleared where the start fails and as
+	// stop begins.
+	bool started;
 };
 
 #endif // REIMS_GRAPHICS_HPP_

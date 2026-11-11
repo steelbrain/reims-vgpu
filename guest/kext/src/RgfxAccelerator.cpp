@@ -60,6 +60,12 @@ OSDefineMetaClassAndStructors(RgfxAccelerator, IOAccelerator);
 // there were none, so WindowServer composites in software: a bundle that refused to make a
 // device under a registered accelerator would leave WindowServer aborting, as with no bundle.
 //
+// The accelerator registers only once the framebuffer has started too (ReimsGraphics::hasStarted):
+// a process's context reaches the device only through the framebuffer's rings, so with no
+// framebuffer (one whose start failed, as arm64 27.0.1's once did) every context Metal opened
+// would have its messages and its close refused. The check repeats until both hold; with the
+// bundle found and no framebuffer started it says so once.
+//
 // Where RgfxGate installs the bundle, nothing on disk counts while its install pass is under way
 // (rgfxBundleRegisters): an update that keeps the wire version finds the old bundle and its
 // marker before the pass drops the marker and rewrites the files. The pass publishes itself on
@@ -102,8 +108,10 @@ struct BundleWatch {
 	// The bundle's executable and its marker for this kext's wire version, NAME the
 	// accelerator's MetalPluginName (the bundle's Makefile names its executable so).
 	RgfxBundlePaths paths;
+	// The check's own: whether it has said the bundle waits for the framebuffer.
+	bool toldFramebuffer;
 };
-BundleWatch bundle = {nullptr, kBundleWatching, nullptr, false, {}};
+BundleWatch bundle = {nullptr, kBundleWatching, nullptr, false, {}, false};
 
 // What the lookups find.
 enum BundleFound : UInt32 {
@@ -197,7 +205,8 @@ void registerAccelerator(RgfxAccelerator *accelerator, const char *when)
 	IOLockUnlock(bundle.lock);
 }
 
-// The repeating check, on a thread call: registers the accelerator once the bundle is there.
+// The repeating check, on a thread call: registers the accelerator once the bundle is there and
+// the framebuffer has started.
 void checkBundle(thread_call_param_t accelerator, thread_call_param_t)
 {
 	IOLockLock(bundle.lock);
@@ -205,8 +214,15 @@ void checkBundle(thread_call_param_t accelerator, thread_call_param_t)
 	IOLockUnlock(bundle.lock);
 	// The pass first: once it has ended, the disk holds what it left.
 	const RgfxGatePass gate = gatePass();
-	bool found = rgfxBundleRegisters(gate, gate != kRgfxGateInstalling &&
-	                                           bundleOnDisk() == kBundleOurs);
+	const bool ours = gate != kRgfxGateInstalling && bundleOnDisk() == kBundleOurs;
+	const bool framebuffer = static_cast<RgfxAccelerator *>(accelerator)->framebufferStarted();
+	bool found = rgfxBundleRegisters(gate, ours, framebuffer);
+	if (ours && !framebuffer && !bundle.toldFramebuffer) {
+		bundle.toldFramebuffer = true;
+		IOLog("RgfxAccelerator: the bundle is at %s, and the framebuffer has not started: not "
+		      "registered until it has\n",
+		      bundle.paths.executable);
+	}
 	IOLockLock(bundle.lock);
 	bool watching = bundle.state == kBundleWatching;
 	if (watching && found)
@@ -263,7 +279,9 @@ void RgfxAccelerator::settleBundle()
 			gate = gatePass();
 		}
 		BundleFound found = gate == kRgfxGateInstalling ? kBundleAbsent : bundleOnDisk();
-		if (rgfxBundleRegisters(gate, found == kBundleOurs)) {
+		// The framebuffer that calls this is registered, its start under way or done: its
+		// connection is the server's first.
+		if (rgfxBundleRegisters(gate, found == kBundleOurs, true)) {
 			if (leaveWatching(kBundleRegistering))
 				registerAccelerator(this, " as WindowServer opens the display");
 		} else if (leaveWatching(kBundleSettled)) {
@@ -622,6 +640,14 @@ ReimsGraphics *RgfxAccelerator::copyFramebuffer()
 		}
 	}
 	return found;
+}
+
+bool RgfxAccelerator::framebufferStarted()
+{
+	ReimsGraphics *fb = copyFramebuffer();
+	const bool started = fb && fb->hasStarted();
+	OSSafeReleaseNULL(fb);
+	return started;
 }
 
 IODeviceMemory *RgfxAccelerator::copyRegion() const

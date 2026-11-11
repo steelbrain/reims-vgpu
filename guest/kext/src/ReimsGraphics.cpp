@@ -1142,6 +1142,7 @@ bool ReimsGraphics::start(IOService *provider)
 	presentsLock = IOLockAlloc();
 	if (!submitLock || !interruptLock || !stateLock || !presentsLock)
 		return false;
+	started = false;
 	nextSeqno = 1;
 	largestScanout = 0;
 	bootScreenSeqno = 0;
@@ -1386,9 +1387,13 @@ bool ReimsGraphics::start(IOService *provider)
 		goto fail;
 #endif
 
+	// The device is ours and its rings are up: contexts may open from here, as the class's start
+	// can register the framebuffer and WindowServer open it before it returns.
+	__atomic_store_n(&started, true, __ATOMIC_RELEASE);
 	if (super::start(provider))
 		return true;
 fail:
+	__atomic_store_n(&started, false, __ATOMIC_RELEASE);
 #if defined(__arm64e__)
 	stopMobile();
 #endif
@@ -1399,6 +1404,7 @@ fail:
 
 void ReimsGraphics::stop(IOService *provider)
 {
+	__atomic_store_n(&started, false, __ATOMIC_RELEASE);
 #if defined(__arm64e__)
 	stopMobile();
 #endif

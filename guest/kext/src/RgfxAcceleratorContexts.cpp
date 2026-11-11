@@ -900,6 +900,14 @@ IOReturn RgfxAccelerator::openContext(UInt32 *context, bool oldSpan, bool window
 {
 	if (!startContexts())
 		return kIOReturnNotReady;
+	// The context's messages reach the device only through the framebuffer's rings: none opens
+	// before it has started, as none could post a message or its close. The accelerator registers
+	// only once it has ("The bundle", RgfxAccelerator.cpp), so this answers only a framebuffer
+	// that stopped since.
+	if (!framebufferStarted()) {
+		IOLog("RgfxAccelerator: no context opened: the framebuffer has not started\n");
+		return kIOReturnNotReady;
+	}
 	IOLockLock(contextLock);
 	const UInt32 want = oldSpan ? kRgfxContextOldSpanUnits : contextUnits;
 	UInt32 at = 0;
@@ -927,6 +935,19 @@ RgfxAccelerator::CloseAnswer RgfxAccelerator::closeContext(UInt32 context, UInt3
 	*late = -1;
 	if (!startContexts())
 		return kCloseRefused;
+	// With no framebuffer started there is nothing to post the close through, and nothing of the
+	// context to close: the context opened while one had started (openContext), and its stop
+	// resets the device on the way out, which drops every context's objects with no answer owed
+	// (design.md, "Reset"). What the context held is given back as an answered close gives it.
+	if (!framebufferStarted()) {
+		IOLockLock(contextLock);
+		rgfxContextSlotsGive(slots, first, units);
+		IOLockUnlock(contextLock);
+		IOLog("RgfxAccelerator: context %u closed with no framebuffer started, which the device "
+		      "holds nothing of (unit %u, %u units)\n",
+		      context, first, units);
+		return kCloseAnswered;
+	}
 	RgfxContextClose close = {};
 	close.context = context;
 	// The close's entry is the answer's to find, its seqno written before the device sees the

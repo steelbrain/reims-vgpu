@@ -3479,6 +3479,18 @@ registers only once its bundle is on disk:
   connection waits up to 5 s for it, and leaves the accelerator unregistered
   for the boot where the pass is still under way. Without RgfxGate there is no
   property, and the check counts what it finds.
+- **The framebuffer comes first too.** A process's context reaches the
+  device only through the framebuffer's rings, so the check registers the
+  accelerator only once the framebuffer has started as well: its start has
+  taken the device and brought its rings up (`ReimsGraphics::hasStarted`).
+  The check says once in the kernel log when the bundle waits for it. A
+  context opens only while the framebuffer is started (`kIOReturnNotReady`
+  otherwise, taking no units), and a close that finds none started gives its
+  context's units back at once: none has carried a message of the context
+  since the device's last reset (a failed start's or the stop's), which
+  dropped every context's objects ("Reset"). Seen on arm64 27.0.1, where an
+  accelerator registered after ReimsGraphics' start failed had its contexts'
+  messages and closes refused, and their units kept from use for good.
 - **A bundle installed later takes effect at the next boot**: a running
   WindowServer never sees a GPU appear under it. The guest's install puts the
   bundle in place and reboots.

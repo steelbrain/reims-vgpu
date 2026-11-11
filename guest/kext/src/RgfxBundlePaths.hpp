@@ -60,12 +60,15 @@ enum RgfxGatePass : unsigned {
 };
 
 // Whether the accelerator registers for what a check finds: its own bundle on disk (`ours`, the
-// executable with this kext's marker), and no install pass of RgfxGate's under way. A pass under
-// way may be about to rewrite the bundle under the marker an older pass left (an update that keeps
-// the wire version), so a bundle found then does not count.
-inline bool rgfxBundleRegisters(RgfxGatePass gate, bool ours)
+// executable with this kext's marker), no install pass of RgfxGate's under way, and the
+// framebuffer started (`framebuffer`). A pass under way may be about to rewrite the bundle under
+// the marker an older pass left (an update that keeps the wire version), so a bundle found then
+// does not count. Every message of a process's context reaches the device through the
+// framebuffer's rings, so an accelerator registered before the framebuffer has started would hand
+// Metal a GPU that cannot answer: its contexts' messages and their closes would all be refused.
+inline bool rgfxBundleRegisters(RgfxGatePass gate, bool ours, bool framebuffer)
 {
-	return gate != kRgfxGateInstalling && ours;
+	return gate != kRgfxGateInstalling && ours && framebuffer;
 }
 
 #endif // RGFX_BUNDLE_PATHS_HPP_
