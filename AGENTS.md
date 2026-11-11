@@ -190,8 +190,10 @@ Three tiers:
   do not see which code a guest's frameworks pick from the device's answers,
   nor a death every boot reaches ([docs/lessons.md](docs/lessons.md)). For
   the table's row: first look up each code the change would end the process
-  on in the last good boot's logged degradation counts, which needs no GPU;
-  then boot each guest cold and fail on any `reims-vgpu: fatal` line. An
+  on in the last good boot's logged degradation counts (its last
+  `reims-vgpu: degradation counts:` line, [docs/conventions.md](docs/conventions.md)),
+  which needs no GPU; then boot each guest cold and fail on any
+  `reims-vgpu: fatal` line. An
   answer stays as it was until the guests boot with the new one, and each
   exact fix of a death lands with a test of its pattern in a shader of our
   own.
