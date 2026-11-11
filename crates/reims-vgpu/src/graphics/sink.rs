@@ -2039,7 +2039,10 @@ mod tests {
 
         const W: u32 = 3840;
         const H: u32 = 4;
-        let region = Arc::new(Region::new(reims_vgpu_graphics::REGION_SIZE as usize).unwrap());
+        let region = Arc::new(crate::platform::test_region(
+            &**platform,
+            reims_vgpu_graphics::REGION_SIZE as usize,
+        ));
         // Channel c of pixel (x, y) at `n` values: each takes every value along a row.
         let value = |c: u32, x: u32, y: u32, n: u32| match c {
             0 => x % n,
@@ -2244,7 +2247,10 @@ mod tests {
     fn a_pass_writes_every_pixel<P: ApiPlatform>(platform: &Arc<P>) {
         use reims_vgpu_graphics::wire::RGFX_ALLOCATIONS_OFFSET;
 
-        let region = Arc::new(Region::new(reims_vgpu_graphics::REGION_SIZE as usize).unwrap());
+        let region = Arc::new(crate::platform::test_region(
+            &**platform,
+            reims_vgpu_graphics::REGION_SIZE as usize,
+        ));
         let new_texture = |format: u64, usage: u64, (width, height): (u32, u32)| {
             let descriptor = platform.texture_descriptor(&TextureDesc {
                 pixel_format: format,

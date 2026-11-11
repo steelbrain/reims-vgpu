@@ -339,7 +339,8 @@ fn addr_of(at: NonNull<u8>) -> u64 {
 /// Learns whether `device` imports a view mapped through dma-bufs as it is mapped, as the
 /// platform's imports hand the runtime a view ([`host_memory`]): a no-copy buffer over a view of
 /// pages backwards, one more than udmabuf takes in one dma-buf, so two, made as an import is,
-/// placed outside the guest's numbering and released at once. Where the device does not take it
+/// placed outside the guest's numbering and released at once, its pages unmapped once the runtime
+/// freed its import ([`ProbePages`]). Where the device does not take it
 /// through the dma-bufs its source makes, views are mapped from their files from then on
 /// ([`IMPORTS_NEED_FILES`]): where it refuses it, or makes a copy of the view in its place as
 /// its import failed (the runtime's `copied-host-pages`, which the probe's call hears unheard,
@@ -368,6 +369,12 @@ pub(crate) fn learn_view_imports(device: &rt::Device) {
     let (Ok(src), Ok(view)) = (vm::allocate_aliasable(length), vm.allocate_anywhere(length)) else {
         return;
     };
+    // Unmapped as they drop: once the runtime freed the probe's import, where it makes one.
+    let probe = ProbePages {
+        view: view.addr().to_u64(),
+        src: src.addr().to_u64(),
+        length,
+    };
     let runs: Vec<_> = (0..count)
         .map(|i| (src.wrapping_add((count - 1 - i) * page), page))
         .collect();
@@ -376,13 +383,13 @@ pub(crate) fn learn_view_imports(device: &rt::Device) {
         && !files::through_pieces(first, first + length).is_empty();
     if through && let Some(at) = address(first) {
         let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // SAFETY: the view is mapped, read and write, and stays so until after the buffer, which
-        // has no deallocator or keep-alive, is released: its import is freed in the release.
+        // SAFETY: the view is mapped, read and write, and stays so until the runtime drops the
+        // keep-alive, which owns it and its pages' file, once it freed the import.
         let memory = unsafe { host_memory_noting(at, Some(Arc::clone(&asked))) };
         let contents = rt::BufferContents::NoCopy {
             memory,
             deallocator: None,
-            keep_alive: None,
+            keep_alive: Some(crate::gpu::backing::keep_alive(probe)),
         };
         let descriptor = rt::BufferDescriptor::new(length, rt::ResourceOptions::shared(), contents)
             .with_placement(rt::AddressPlacement::Outside);
@@ -421,9 +428,32 @@ pub(crate) fn learn_view_imports(device: &rt::Device) {
         // Either way the device copies by runs of the guest's RAM: one whose views are mapped
         // from their files takes objects over the RAM too (`super::host_ram`).
         super::host_ram::hand_ram_to(device);
+    } else {
+        drop(probe);
     }
-    let _ = vm.deallocate(view, length);
-    let _ = vm.deallocate(src, length);
+}
+
+/// The pages of [`learn_view_imports`]' probe, its view and the file pages it shows, each
+/// `length` bytes from its first byte: unmapped as it drops, which, where the probe's buffer was
+/// made, is the runtime's drop of the buffer's keep-alive, once it freed the import (Vulkan
+/// requires imported pages to stay mapped while the import lives, `crate::remap`'s module docs);
+/// a free on another of the runtime's threads (its residency thread's) may come after the
+/// buffer's release returned.
+#[derive(Debug)]
+struct ProbePages {
+    view: u64,
+    src: u64,
+    length: u64,
+}
+
+impl Drop for ProbePages {
+    fn drop(&mut self) {
+        use crate::core::platform::os::vm::HostVm as _;
+        let vm = super::LinuxVm::new();
+        for first in [self.view, self.src] {
+            let _ = vm.deallocate(HostAddr::from_addr(first.to_usize()), self.length);
+        }
+    }
 }
 
 // SAFETY: `at` is an address only, which nothing here reads through: it is handed to the runtime;

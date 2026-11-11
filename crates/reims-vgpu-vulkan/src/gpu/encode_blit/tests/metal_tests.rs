@@ -94,8 +94,8 @@ fn copied_past_a_no_copy_buffer_on<P: crate::core::platform::Platform>(
     let read = unsafe { std::slice::from_raw_parts(down.contents().as_ptr::<u8>(), 64) };
     let read = read.to_vec();
     drop((cb, short));
-    // SAFETY: allocated above with `layout`; the buffer over it is gone.
-    unsafe { dealloc(page, layout) };
+    // SAFETY: allocated above with `layout`; the buffer over it and its import are gone.
+    crate::remap::free_unimported(page, 16384, || unsafe { dealloc(page, layout) });
     read
 }
 

@@ -3003,8 +3003,10 @@ pub(crate) mod tests {
             .unwrap();
         assert!(made.is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        // SAFETY: allocated above with `layout`; no buffer is left over it.
-        unsafe { dealloc(mem, layout) };
+        // SAFETY: allocated above with `layout`; no buffer or import is left over it.
+        crate::remap::free_unimported(mem, layout.size() as u64, || unsafe {
+            dealloc(mem, layout)
+        });
     }
 
     /// newBufferWithDescriptor: makes a no-copy buffer at a pinned address, whose deallocator
@@ -3070,8 +3072,10 @@ pub(crate) mod tests {
         // SAFETY: a Shared buffer's 16 bytes, which nothing else touches.
         let read = unsafe { std::slice::from_raw_parts(copied.contents().as_ptr::<u8>(), 16) };
         assert_eq!(read, &words);
-        // SAFETY: allocated above with `layout`; the buffer over it is gone.
-        unsafe { dealloc(mem, layout) };
+        // SAFETY: allocated above with `layout`; the buffer over it and its import are gone.
+        crate::remap::free_unimported(mem, layout.size() as u64, || unsafe {
+            dealloc(mem, layout)
+        });
     }
 
     /// A pin Metal's space refuses is nil only once the runtime has checked the rest of the
@@ -3373,8 +3377,8 @@ pub(crate) mod tests {
         // SAFETY: the host memory, which the blit's writes finished.
         let after = unsafe { std::slice::from_raw_parts(memory, LENGTH) }.to_vec();
         drop((t, b));
-        // SAFETY: allocated above with `layout`; the buffer over it is gone.
-        unsafe { dealloc(memory, layout) };
+        // SAFETY: allocated above with `layout`; the buffer over it and its import are gone.
+        crate::remap::free_unimported(memory, LENGTH as u64, || unsafe { dealloc(memory, layout) });
         [made, rewritten, after]
     }
 

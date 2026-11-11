@@ -107,9 +107,11 @@ impl Pages {
 }
 
 impl Drop for Pages {
+    /// Unmaps the pages through the platform's VM, which waits for the runtime to free the
+    /// imports of the buffers over them (`crate::remap`).
     fn drop(&mut self) {
         assert!(
-            crate::os::OsVm::new()
+            crate::remap::VulkanVm::new()
                 .deallocate(self.at, self.len)
                 .is_success()
         );

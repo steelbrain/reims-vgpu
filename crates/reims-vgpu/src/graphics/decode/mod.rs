@@ -9010,7 +9010,7 @@ lacks {part}"
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
         );
         let replies = Arc::new(reims_vgpu_vulkan::core::sync::Mutex::new(Vec::new()));
         let sink_replies = Arc::clone(&replies);
@@ -9303,7 +9303,7 @@ lacks {part}"
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
         );
         let replies = Arc::new(reims_vgpu_vulkan::core::sync::Mutex::new(Vec::new()));
         let sink_replies = Arc::clone(&replies);
@@ -9522,7 +9522,7 @@ lacks {part}"
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
         );
         let replies = Arc::new(reims_vgpu_vulkan::core::sync::Mutex::new(Vec::new()));
         let sink_replies = Arc::clone(&replies);
@@ -9750,7 +9750,7 @@ lacks {part}"
         crate::graphics::reserve_guest_texture_ids(platform.as_ref(), &device);
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(Region::new(0x10000).unwrap()),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
         );
         let grant = RgfxResourceIdChunk {
             header: RgfxMsgHeader {
@@ -10461,8 +10461,8 @@ lacks {part}"
         // The shared block, then one reference block a step.
         let block_at = |k: u64| blocks + k * SHARED_BLOCK;
         let size = block_at(1 + STEPS as u64) + RGFX_CURSOR_SPAN;
-        let region = Arc::new(Region::new(size as usize).unwrap());
         let platform = P::process();
+        let region = Arc::new(crate::platform::test_region(&*platform, size as usize));
         let device = platform.metal_device(None).unwrap();
         crate::graphics::reserve_guest_texture_ids(platform.as_ref(), &device);
         // The guest's RAM, where the surface lies in place, outlives the decoder and its views.
@@ -10878,6 +10878,52 @@ lacks {part}"
             }
         }
         Ok(())
+    }
+
+    /// On the Vulkan platform, a test's region ([`crate::platform::test_region`]) is the
+    /// platform's memory, whose pages stay mapped past the region's drop while the import of a
+    /// no-copy buffer over them lives, and are unmapped once the runtime freed it, as the
+    /// device's region is: a test that drops its decoder, and with it its buffers, before its
+    /// region may still have an import of the region freed on another thread, as a completed
+    /// command buffer's handler lets go of the buffers it used (on a Radeon 780M an unmap under
+    /// that free faulted the kernel, `docs/lessons.md`)
+    #[test]
+    fn on_vulkan_a_test_region_outlives_the_imports_of_its_pages() {
+        use reims_vgpu_vulkan::core::platform::HostRange;
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+
+        use crate::platform::ApiPlatform as _;
+
+        // Whether the page at `at` is mapped, read without touching it.
+        let mapped = |at: *mut u8| {
+            // SAFETY: `msync` of one page, which reads no byte and fails where none is mapped.
+            unsafe { libc::msync(at.cast(), 1, libc::MS_ASYNC) == 0 }
+        };
+        let platform = reims_vgpu_vulkan::VulkanPlatform::process();
+        let device = platform.metal_device(None).unwrap();
+        let region = crate::platform::test_region(&*platform, 0x10000);
+        let base = region.base();
+        // SAFETY: the region's first 16 KiB, mapped until the import over them is freed.
+        let bytes = unsafe { HostRange::new(HostPtr::from_ptr(base), 0x4000) };
+        let buffer = device
+            .new_buffer_over_host_memory(OnFault::Die, bytes, 0, None)
+            .unwrap()
+            .unwrap();
+        drop(region);
+        assert!(
+            mapped(base),
+            "the region's pages outlive it while the buffer's import lives"
+        );
+        drop(buffer);
+        let first = std::ptr::NonNull::new(base).unwrap();
+        assert!(
+            reims_vgpu_vulkan::remap::wait_unimported(
+                first,
+                0x10000,
+                std::time::Duration::from_secs(30)
+            ),
+            "the runtime freed the import"
+        );
     }
 
     /// [`shared_surface_composites`] on the Vulkan platform by `path`, of BGRA8 and of RGBA16F:

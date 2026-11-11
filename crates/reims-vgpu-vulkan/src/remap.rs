@@ -119,6 +119,18 @@
 //!   import in each execbuffer, and one listing an import whose pages a surface's release had
 //!   unmapped failed with `EFAULT`, which ANV answers as the device lost.
 //!
+//! **Memory the library does not unmap** (the host's RAM, a test's own memory): its owner unmaps
+//! it, with no call of [`VulkanVm`], so no hold defers that unmap. Before it unmaps or frees memory
+//! a runtime import may lie over, it drops the objects over it and waits for the runtime to free
+//! their imports ([`wait_unimported`]), which comes after the objects go where a command buffer
+//! or another of the runtime's threads still holds an import, and frees it beside the owner's next
+//! steps. The wait reads the holds, and the keeps of the runtime's own imports of the guest's RAM
+//! whole ([`ImportKeep`], `os/linux/host_ram.rs`), which defer no unmap. Measured on a Radeon 780M
+//! (RADV, Linux 7.3.3, 2026-11-11): a test's `munmap` of its region, anonymous memory a no-copy
+//! buffer's import still lay over while a completed command buffer's handler freed it on another
+//! thread, faulted the kernel in amdgpu's notifier (`amdgpu_hmm_invalidate_gfx`), and the GPU's
+//! work hung until a reboot.
+//!
 //! What a report costs, measured on the M3 Max (release build, 100,000 calls, three runs): with
 //! no no-copy buffer live, nothing a 270 ns `mach_vm_deallocate` shows above its noise; with
 //! 1,000 live no-copy buffers the runtime imported, 40 to 62 ns per `deallocate`.
@@ -244,6 +256,10 @@ static OVERWRITES: Mutex<()> = Mutex::new(());
 /// them ([`after_unmaps`]).
 static UNMAPPED: Condvar = Condvar::new();
 
+/// Raised as a hold or a keep goes, under [`HOLDS`], for [`wait_unimported`]'s waiters: a
+/// notify with none waiting is an atomic load.
+static GONE: Condvar = Condvar::new();
+
 /// Waits, in [`OVERWRITES`]' order, while a released hold's unmap being made meets `pages`, so
 /// an overwrite of them lands after it rather than under it.
 fn after_unmaps(pages: &Range<u64>) {
@@ -302,12 +318,14 @@ impl UnmapHold {
 impl Drop for UnmapHold {
     /// Unmaps what waited for this hold and no other, calling nothing else: decided in
     /// [`OVERWRITES`]' order where an unmap waits, and made outside it, marked as being made
-    /// meanwhile, so an overwrite of other pages never waits for them.
+    /// meanwhile, so an overwrite of other pages never waits for them. Wakes the waits for the
+    /// imports ([`wait_unimported`]).
     fn drop(&mut self) {
         {
             let mut holds = HOLDS.lock();
             if !holds.unmaps_wait() {
                 holds.release(self.first, self.id);
+                GONE.notify_all();
                 return;
             }
         }
@@ -316,6 +334,7 @@ impl Drop for UnmapHold {
             let mut holds = HOLDS.lock();
             let free = holds.release(self.first, self.id);
             holds.unmapping(&free);
+            GONE.notify_all();
             free
         };
         if free.is_empty() {
@@ -333,6 +352,82 @@ impl Drop for UnmapHold {
         HOLDS.lock().unmapped(&free);
         UNMAPPED.notify_all();
     }
+}
+
+/// A keep of host pages a runtime import holds whose unmap is not the library's (the guest's RAM,
+/// which the runtime imports whole, `os/linux/host_ram.rs`), which the runtime is given in the
+/// import's keep-alive: while it lives, [`wait_unimported`] waits for it, and it defers no unmap,
+/// as the library makes none of those pages (module docs, "Memory the library does not unmap").
+#[derive(Debug)]
+pub(crate) struct ImportKeep {
+    /// The first byte of its pages.
+    first: u64,
+    /// Its number among the holds and keeps.
+    id: u64,
+}
+
+impl ImportKeep {
+    /// A keep of the pages the `length` bytes at `bytes` lie in (one page for a length of 0).
+    pub(crate) fn new(bytes: NonNull<u8>, length: u64) -> ImportKeep {
+        let at = HostPtr::from_ptr(bytes.as_ptr());
+        let (at, length) = pages(at, length.max(1), OsVm::new().page_size());
+        let first = at.addr().to_u64();
+        let id = HOLDS.lock().keep(first..first.saturating_add(length));
+        ImportKeep { first, id }
+    }
+}
+
+impl Drop for ImportKeep {
+    /// Forgets the keep, and wakes the waits for the imports.
+    fn drop(&mut self) {
+        HOLDS.lock().unkeep(self.first, self.id);
+        GONE.notify_all();
+    }
+}
+
+/// Waits, at most `bound`, until no runtime import of this platform's holds a page of the
+/// `length` bytes at `at` (one page for a length of 0): until every hold ([`UnmapHold`], which
+/// each no-copy buffer and heap the platform makes over memory it is given carries) and every
+/// keep ([`ImportKeep`]) that meets them went, each once the runtime freed its import. Whether
+/// none holds them then. The owner of memory the library does not unmap calls it after it let go
+/// of every object over the memory, and before it unmaps or frees it (module docs, "Memory the
+/// library does not unmap"); where it answers `false`, the memory is left mapped, or the import
+/// would lie over pages gone. Call it holding no lock a runtime thread may need: the frees it
+/// waits for run on those threads.
+pub fn wait_unimported(at: NonNull<u8>, length: u64, bound: std::time::Duration) -> bool {
+    use crate::core::platform::os::clock::{Clock as _, Deadline};
+    let (first, length) = pages(
+        HostPtr::from_ptr(at.as_ptr()),
+        length.max(1),
+        OsVm::new().page_size(),
+    );
+    let first = first.addr().to_u64();
+    let asked = first..first.saturating_add(length);
+    let clock = crate::os::OsClock::new();
+    let deadline = Deadline::Mono(clock.now_mono().saturating_add(bound));
+    let mut holds = HOLDS.lock();
+    while holds.imported(&asked) {
+        if clock.wait_until(&GONE, &mut holds, deadline).timed_out() {
+            return !holds.imported(&asked);
+        }
+    }
+    true
+}
+
+/// For tests: runs `free`, which frees the `length` bytes at `at`, a test's own memory that a
+/// no-copy object lay over, once no import of the runtime's lies over them any more
+/// ([`wait_unimported`]); panics, the memory kept, where an import outlives 30 s.
+#[cfg(test)]
+pub(crate) fn free_unimported(at: *mut u8, length: u64, free: impl FnOnce()) {
+    let Some(first) = NonNull::new(at) else {
+        return free();
+    };
+    let bound = std::time::Duration::from_secs(30);
+    assert!(
+        wait_unimported(first, length, bound),
+        "an import over {length:#x} bytes at {at:?} outlived {bound:?}"
+    );
+    free();
 }
 
 /// Whether an unmap of a page of the `length` bytes at `at` waits for a hold, or is being made,
@@ -716,6 +811,53 @@ mod tests {
         for (p, length) in [(other, page), (src, page)] {
             assert!(OsVm::new().deallocate(p, length).is_success());
         }
+    }
+
+    /// A wait for the imports over pages ends once the last hold and keep that meets them went,
+    /// each on another thread, and at once where none meets them; past its bound, with one live,
+    /// it answers that one is
+    #[test]
+    fn a_wait_for_the_imports_ends_as_the_last_hold_or_keep_over_the_pages_goes() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::time::Duration;
+
+        let vm = OsVm::new();
+        let page = vm.page_size();
+        let at = vm.allocate_anywhere(3 * page).unwrap();
+        let first = NonNull::new(at.as_ptr::<u8>()).unwrap();
+        let second = NonNull::new(at.wrapping_add(page).as_ptr::<u8>()).unwrap();
+        let third = NonNull::new(at.wrapping_add(2 * page).as_ptr::<u8>()).unwrap();
+        let hold = UnmapHold::new(first, page);
+        let keep = ImportKeep::new(second, 0x10);
+        assert!(
+            wait_unimported(third, page, Duration::ZERO),
+            "pages no hold or keep meets"
+        );
+        assert!(
+            !wait_unimported(first, 2 * page, Duration::from_millis(20)),
+            "past its bound, a hold and a keep live"
+        );
+        let gone = Arc::new(AtomicU8::new(0));
+        let dropper = {
+            let gone = Arc::clone(&gone);
+            std::thread::Builder::new().spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                gone.store(1, Ordering::SeqCst);
+                drop(hold);
+                std::thread::sleep(Duration::from_millis(30));
+                gone.store(2, Ordering::SeqCst);
+                drop(keep);
+            })
+        };
+        assert!(wait_unimported(first, 2 * page, Duration::from_secs(30)));
+        assert_eq!(
+            gone.load(Ordering::SeqCst),
+            2,
+            "the wait ended after the keep went, the last"
+        );
+        dropper.unwrap().join().unwrap();
+        assert!(vm.deallocate(at, 3 * page).is_success());
     }
 
     /// A `deallocate` of pages a hold meets reports them at the call and answers success,

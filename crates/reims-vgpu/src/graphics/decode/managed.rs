@@ -1981,7 +1981,7 @@ mod tests {
         let device = platform.metal_device(None).unwrap();
         crate::graphics::reserve_guest_texture_ids(platform.as_ref(), &device);
         let size = BLOCKS + 0x10_0000 + RGFX_CURSOR_SPAN;
-        let region = Arc::new(Region::new(size as usize).unwrap());
+        let region = Arc::new(crate::platform::test_region(&*platform, size as usize));
         let mut dec = GraphicsDecoder::<P>::new(Arc::clone(&platform), Arc::clone(&region));
         dec.set_unified_memory(true);
         dec.hold_resource_ids(0, 0);

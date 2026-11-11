@@ -52,7 +52,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use reims_vgpu_graphics::region::Region;
 use reims_vgpu_graphics::wire::{
     RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES,
     RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_SURFACE_PAGES,
@@ -218,11 +217,28 @@ pub(in crate::graphics::decode) struct Ram {
 }
 
 impl Drop for Ram {
+    /// Unmaps the RAM once no import of the runtime's lies over it any more: the objects over it
+    /// went before it, and the runtime may free their imports after they went, on its own threads
+    /// (`reims_vgpu_vulkan::remap`'s module docs, "Memory the library does not unmap"). Where an
+    /// import outlives the wait, the RAM stays mapped.
     fn drop(&mut self) {
-        // SAFETY: the RAM's own mapping, which no device or view uses any more.
+        let Some(at) = std::ptr::NonNull::new(self.at) else {
+            return;
+        };
+        if !reims_vgpu_vulkan::remap::wait_unimported(at, self.length, IMPORTS_BOUND) {
+            eprintln!(
+                "the test's guest RAM stays mapped: an import over it outlived {IMPORTS_BOUND:?}"
+            );
+            return;
+        }
+        // SAFETY: the RAM's own mapping, which no device, view or import uses any more.
         unsafe { libc::munmap(self.at.cast(), self.length.to_usize()) };
     }
 }
+
+/// The longest a test's memory waits, before it is unmapped, for the runtime to free the imports
+/// over it ([`Ram`]'s drop).
+pub(in crate::graphics::decode) const IMPORTS_BOUND: Duration = Duration::from_secs(30);
 
 /// `length` bytes of guest RAM at [`RAM`], every page touched where `touched`, else none: a
 /// memfd's shared mapping on Linux (with huge pages asked for where `RGK_BENCH_THP=1`), sealed as
@@ -335,7 +351,7 @@ fn measure<P: ApiPlatform>(label: &str) {
     let lease: Lease = Arc::from(platform.guest_memory(&ram.map));
     let core = CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
     let size = BLOCK + 0x10_0000 + RGFX_CURSOR_SPAN;
-    let region = Arc::new(Region::new(size.to_usize()).expect("a region"));
+    let region = Arc::new(crate::platform::test_region(&*platform, size.to_usize()));
     let mut dec = GraphicsDecoder::<P>::new(Arc::clone(&platform), region);
     dec.set_guest_memory(Arc::clone(&core), Arc::clone(&lease));
     let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
@@ -537,7 +553,7 @@ fn measure_takes<P: ApiPlatform>(label: &str) {
         let core =
             CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
         let size = BLOCK + takes * block_size + 0x10_0000 + RGFX_CURSOR_SPAN;
-        let region = Arc::new(Region::new(size.to_usize()).expect("a region"));
+        let region = Arc::new(crate::platform::test_region(&*platform, size.to_usize()));
         let mut dec = GraphicsDecoder::<P>::new(Arc::clone(&platform), region);
         dec.set_guest_memory(Arc::clone(&core), Arc::clone(&lease));
         let mut steps: [Step; 7] = Default::default();
@@ -698,7 +714,7 @@ fn measure_large_takes<P: ApiPlatform>(label: &str) {
         let core =
             CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
         let size = BLOCK + takes * block_size + 0x10_0000 + RGFX_CURSOR_SPAN;
-        let region = Arc::new(Region::new(size.to_usize()).expect("a region"));
+        let region = Arc::new(crate::platform::test_region(&*platform, size.to_usize()));
         let mut dec = GraphicsDecoder::<P>::new(Arc::clone(&platform), region);
         dec.set_guest_memory(Arc::clone(&core), Arc::clone(&lease));
         let mut steps: [Step; 6] = Default::default();
@@ -899,8 +915,12 @@ mod raw {
                     }
                 });
                 let pointer = NonNull::new(view).expect("a view");
+                // Each import's keep-alive holds a sender, which goes as the runtime drops it,
+                // once it freed the import: the channel closes once both did.
+                let (freed, imports_freed) = std::sync::mpsc::channel::<()>();
                 let import = |vouched: bool| {
-                    // SAFETY: the view stays mapped, writable, until after the buffer's drop.
+                    // SAFETY: the view stays mapped, writable, until the runtime dropped the
+                    // keep-alive, which the view's unmap waits for.
                     let memory = unsafe {
                         let m = rt::HostMemory::new(pointer);
                         if vouched { m.assume_writable() } else { m }
@@ -908,7 +928,7 @@ mod raw {
                     let contents = rt::BufferContents::NoCopy {
                         memory,
                         deallocator: None,
-                        keep_alive: None,
+                        keep_alive: Some(Box::new(freed.clone())),
                     };
                     device.new_buffer_with_descriptor(rt::BufferDescriptor::new(
                         case.length,
@@ -920,7 +940,15 @@ mod raw {
                 steps[2].time(|| drop(checked));
                 let vouched = steps[3].time(|| import(true)).expect("an import");
                 steps[4].time(|| drop(vouched));
-                // SAFETY: the view made above, which no buffer lies over any more.
+                drop(freed);
+                assert!(
+                    matches!(
+                        imports_freed.recv_timeout(IMPORTS_BOUND),
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+                    ),
+                    "the runtime freed both imports"
+                );
+                // SAFETY: the view made above, which no buffer or import lies over any more.
                 steps[5].time(|| unsafe { libc::munmap(view.cast(), len) });
             }
             for (step, name) in steps.iter().zip([

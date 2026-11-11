@@ -64,6 +64,25 @@ pub trait ApiPlatform: Platform {
     }
 }
 
+/// A graphics device's region of `len` bytes for a test on `platform`, as the device takes one
+/// ([`crate::GraphicsDevice::with_platform`]): the platform's own memory where it gives one, else
+/// the region's own anonymous mapping. On a platform whose runtime imports host memory (Vulkan's),
+/// the platform's memory goes through its VM, whose unmap of the pages waits until the runtime
+/// freed every import of them (`reims_vgpu_vulkan::remap`), where `Region::new`'s drop unmaps
+/// them at once: on a Radeon 780M (RADV, Linux 7.3.3) a test's region unmapped so, while a
+/// completed command buffer's handler freed a no-copy buffer's import of it on another thread,
+/// faulted the kernel in amdgpu's notifier (`docs/lessons.md`).
+#[cfg(test)]
+pub(crate) fn test_region<P: ApiPlatform>(
+    platform: &P,
+    len: usize,
+) -> reims_vgpu_graphics::region::Region {
+    platform
+        .graphics_region(len)
+        .or_else(|| reims_vgpu_graphics::region::Region::new(len))
+        .expect("a region")
+}
+
 /// The API's state for one platform instance.
 pub(crate) struct ApiState<P: Platform> {
     /// The display thread, made at the first device whose host takes the cursor.

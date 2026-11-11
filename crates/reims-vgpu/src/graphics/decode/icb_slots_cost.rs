@@ -163,7 +163,7 @@ impl<P: ApiPlatform> Bench<P> {
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let size = SLOTS_AT + (COMMANDS * STRIDE).next_multiple_of(0x1_0000) + RGFX_CURSOR_SPAN;
-        let region = Arc::new(Region::new(size as usize).unwrap());
+        let region = Arc::new(crate::platform::test_region(&*platform, size as usize));
         let mut decoder = GraphicsDecoder::<P>::new(Arc::clone(&platform), Arc::clone(&region));
         let create = RgfxIcbCreate {
             header: RgfxMsgHeader {

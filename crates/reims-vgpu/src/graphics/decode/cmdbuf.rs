@@ -5430,7 +5430,7 @@ mod tests {
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
         );
         let submitted = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&submitted);
@@ -5568,7 +5568,7 @@ mod tests {
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
         );
         let posted = Arc::new(Mutex::new(Vec::<(u32, u64, u64)>::new()));
         let sink = Arc::clone(&posted);
@@ -5695,7 +5695,7 @@ mod tests {
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
         );
         let completed = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&completed);
@@ -5842,7 +5842,7 @@ mod tests {
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
         );
         // B's records, and every completion.
         let records = Arc::new(Mutex::new(Vec::new()));
@@ -6002,7 +6002,7 @@ mod tests {
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
         );
         let completed = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&completed);
@@ -6192,7 +6192,7 @@ mod tests {
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::new(
             Arc::clone(&platform),
-            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
         );
         dec.hold_resource_ids(0, 0);
         let queue = RgfxQueueCreate {

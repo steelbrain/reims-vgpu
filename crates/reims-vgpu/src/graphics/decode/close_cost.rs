@@ -110,7 +110,7 @@ fn made<P: ApiPlatform>(kind: Kind, n: u64) -> (GraphicsDecoder<P>, P::Device) {
     let platform = P::process();
     let device = platform.metal_device(None).unwrap();
     let region_size = RGFX_CONTEXT_ALLOCATIONS_OFFSET + n * HOST_LENGTH + RGFX_CURSOR_SPAN;
-    let region = reims_vgpu_graphics::region::Region::new(region_size as usize).unwrap();
+    let region = crate::platform::test_region(&*platform, region_size as usize);
     let mut decoder = GraphicsDecoder::<P>::new(Arc::clone(&platform), Arc::new(region));
     let o = OnFault::Die;
     let pipeline_functions = match kind {

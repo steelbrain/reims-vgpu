@@ -38,7 +38,9 @@
 //!   alone, as its views do, so its copies by runs always have the source of lists.
 //! - **For how long.** A device's use of a lease's RAM goes with the lease ([`LeasedRam`]'s drop),
 //!   which drops after core's teardown released every object over the RAM; the runtime frees the
-//!   RAM's imports once no command buffer holds them.
+//!   RAM's imports once no command buffer holds them, and then drops the RAM's keep-alive, a keep
+//!   of each range (`crate::remap::ImportKeep`), which an owner that unmaps the RAM waits for
+//!   first (`crate::remap::wait_unimported`, a test's RAM).
 //! - **Nothing may discard the RAM's pages** while a device uses it (a balloon, free page
 //!   reporting, memory hot-unplug): the device holds the pages it imported, and would go on
 //!   reading the old ones. The VMs `reims-ctl` makes have none.
@@ -138,12 +140,20 @@ fn runtime_ram(ranges: &[(u64, u64)]) -> Option<rt::HostRam> {
             ))
         })
         .collect();
+    // The keep-alive the runtime drops once no device holds a chunk of the RAM: a keep of each
+    // range, which a wait for the imports over the RAM reads (`crate::remap::wait_unimported`).
+    let keeps: Vec<crate::remap::ImportKeep> = (pairs.iter())
+        .map(|&(at, length)| crate::remap::ImportKeep::new(at, length))
+        .collect();
     // SAFETY: each range is the host's own mapping of the guest's RAM, which the host keeps
     // mapped, readable and writable, with the same backing, while any device made over its
-    // memory map lives (`docs/api.md`, `RvgMemoryRange`); every device's use of it goes with the
-    // lease, which drops after core's teardown, and the runtime holds the RAM no longer than its
-    // uses and the objects and command buffers over it.
-    let ram = match unsafe { rt::HostRam::new(&pairs, None) } {
+    // memory map lives (`docs/api.md`, `RvgMemoryRange`), and until the runtime let go of the
+    // keep-alive where the host unmaps it (`crate::remap`, "Memory the library does not
+    // unmap"); every device's use of it goes with the lease, which drops after core's teardown,
+    // and the runtime holds the RAM no longer than its uses and the objects and command buffers
+    // over it.
+    let keep = crate::gpu::backing::keep_alive(keeps);
+    let ram = match unsafe { rt::HostRam::new(&pairs, Some(keep)) } {
         Ok(ram) => ram,
         Err(refusal) => {
             log::warn!(
@@ -486,10 +496,13 @@ mod tests {
         ];
         assert_eq!(b_bytes, [0, 0xa5, 0xa5]);
         drop((cb, e, q, a, b, lease));
-        // Through the platform's VM, which leaves pages a device's import still holds mapped
-        // until the runtime has freed it: the device lives on past the lease.
+        // Once the runtime freed its imports of the RAM's chunks (the RAM's keep-alive), through
+        // the platform's VM, which leaves pages a buffer's import still holds mapped until the
+        // runtime has freed it: the device lives on past the lease.
         let start_at = HostPtr::from_ptr(start.cast::<u8>());
-        assert!(VulkanVm::new().deallocate(start_at, length).is_success());
+        crate::remap::free_unimported(start.cast(), length, || {
+            assert!(VulkanVm::new().deallocate(start_at, length).is_success());
+        });
     }
     /// A device that copies the RAM by its runs ([`super::copies`]) gathers runs of it into a
     /// buffer, and scatters a buffer back into them, byte for byte in the runs' order, scattered
@@ -601,10 +614,13 @@ mod tests {
             "the buffer, in the runs' order; the rest as it was"
         );
         drop((cb, e, q, into, from, lease));
-        // Through the platform's VM, which leaves pages a device's import still holds mapped
-        // until the runtime has freed it: the device lives on past the lease.
+        // Once the runtime freed its imports of the RAM's chunks (the RAM's keep-alive), through
+        // the platform's VM, which leaves pages a buffer's import still holds mapped until the
+        // runtime has freed it: the device lives on past the lease.
         let start_at = HostPtr::from_ptr(start.cast::<u8>());
-        assert!(VulkanVm::new().deallocate(start_at, length).is_success());
+        crate::remap::free_unimported(start.cast(), length, || {
+            assert!(VulkanVm::new().deallocate(start_at, length).is_success());
+        });
     }
 
     /// A device that copies the RAM by its runs scatters a buffer into runs that start and end
@@ -721,10 +737,13 @@ mod tests {
             "the rows' texels in their runs; every byte beside them as it was"
         );
         drop((cb, e, q, from, lease));
-        // Through the platform's VM, which leaves pages a device's import still holds mapped
-        // until the runtime has freed it: the device lives on past the lease.
+        // Once the runtime freed its imports of the RAM's chunks (the RAM's keep-alive), through
+        // the platform's VM, which leaves pages a buffer's import still holds mapped until the
+        // runtime has freed it: the device lives on past the lease.
         let start_at = HostPtr::from_ptr(start.cast::<u8>());
-        assert!(VulkanVm::new().deallocate(start_at, length).is_success());
+        crate::remap::free_unimported(start.cast(), length, || {
+            assert!(VulkanVm::new().deallocate(start_at, length).is_success());
+        });
     }
 
     /// What a slab of guest RAM costs on this device (arch-shared-mem's design): placement heaps
@@ -978,10 +997,13 @@ mod tests {
         };
         assert_eq!(byte, 0x5a, "the fill reached the RAM");
         drop((q, placed, keep, lease));
-        // Through the platform's VM, which leaves pages a device's import still holds mapped
-        // until the runtime has freed it: the device lives on past the lease.
+        // Once the runtime freed its imports of the RAM's chunks (the RAM's keep-alive), through
+        // the platform's VM, which leaves pages a buffer's import still holds mapped until the
+        // runtime has freed it: the device lives on past the lease.
         let start_at = HostPtr::from_ptr(start.cast::<u8>());
-        assert!(VulkanVm::new().deallocate(start_at, length).is_success());
+        crate::remap::free_unimported(start.cast(), length, || {
+            assert!(VulkanVm::new().deallocate(start_at, length).is_success());
+        });
     }
 
     /// What a slab's buffers cost as no-copy buffers over its pages, each at an offset of a buffer

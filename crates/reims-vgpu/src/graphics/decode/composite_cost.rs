@@ -306,7 +306,7 @@ impl<P: ApiPlatform> Bench<P> {
         let device = platform.metal_device(None).unwrap();
         let chunk = (shape.quads() * QUAD).next_multiple_of(0x4000);
         let region_size = RGFX_CONTEXT_ALLOCATIONS_OFFSET + chunk + RGFX_CURSOR_SPAN;
-        let region = reims_vgpu_graphics::region::Region::new(region_size as usize).unwrap();
+        let region = crate::platform::test_region(&*platform, region_size as usize);
         for quad in 0..shape.quads() {
             let at = RGFX_CONTEXT_ALLOCATIONS_OFFSET + quad * QUAD;
             assert!(region.write(at, quad_positions(shape, quad).as_bytes()));
