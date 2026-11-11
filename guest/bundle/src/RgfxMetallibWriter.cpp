@@ -145,8 +145,12 @@ std::vector<uint8_t> RgfxWriteMetallib(const RgfxMetallibFunction &f)
 bool RgfxMetallibOfClLibrary(const uint8_t *bytes, size_t length, std::vector<uint8_t> &out)
 {
 	constexpr size_t kPairsAt = 0x10, kPairs = 10, kEntryWords = 7;
-	if (bytes == nullptr || length < kPairsAt + 8 * kPairs || le32(bytes) != 1 || le32(bytes + 4) != 0 ||
-	    le32(bytes + 8) != 0 || le32(bytes + 12) != 0)
+	if (bytes == nullptr || length < kPairsAt + 8 * kPairs || le32(bytes) != 1 || le32(bytes + 4) != 0)
+		return false;
+	// The pair at 8 places the compiler's warnings, or is 0 and 0 where it gave none: not read, but
+	// inside the bytes.
+	const uint64_t warningsAt = le32(bytes + 8), warningsSize = le32(bytes + 12);
+	if (warningsAt > length || warningsSize > length - warningsAt || (warningsAt == 0 && warningsSize != 0))
 		return false;
 	// A section's bytes, where its pair places them inside `bytes`.
 	auto section = [&](size_t n, const uint8_t **at, size_t *size) {

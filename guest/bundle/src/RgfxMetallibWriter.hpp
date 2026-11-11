@@ -63,13 +63,19 @@ std::vector<uint8_t> RgfxWriteMetallib(const RgfxMetallibFunction &f);
 /// metadata, read from metal2vulkan's code at the pin).
 /// False, with `out` untouched, where `bytes` are not that container or do not read whole. The
 /// layout (measured: macOS 26.7.1, the Intel UHD 630's and the AMD Radeon Pro 5300M's devices, 15
-/// programs of our own of one or two kernels; macOS 27, the M3 Max's, two of them; macOS 11.7.11
-/// on the device, the Metal source of a test program of our own of a kernel, a vertex and a
-/// fragment function, and Core Image's kernels of one):
-///   - the u32 1, then 12 zero bytes;
+/// programs of our own of one or two kernels, and 8 more, 3 of them warned of; macOS 27, the M3
+/// Max's, two of them; macOS 11.7.11 on the device, the Metal source of a test program of our own
+/// of a kernel, a vertex and a fragment function, and Core Image's kernels of one; macOS 26.6.1 on
+/// the device, Geekbench 7's OpenCL programs, which warn):
+///   - the u32 1, then a u32 0 (not read);
+///   - at 8, a pair of a u32 offset and a u32 size placing the compiler's warnings, its
+///     "program_source:LINE:COLUMN: warning: ..." lines as text, NUL-terminated, the first
+///     section (at 0x68); 0 and 0 where the compile gave none (not read; checked to be inside the
+///     bytes);
 ///   - from 0x10, ten pairs of a u32 offset and a u32 size, of which the first places the
 ///     function table and the fourth the modules (the others are not read: the second holds 8
-///     zero bytes a function, the sixth "default.metallib", the seventh a u32 count and the names);
+///     zero bytes a function, the sixth "default.metallib", the seventh a u32 count and the names),
+///     then 8 zero bytes (not read); the sections follow from 0x68;
 ///   - the function table: a u16 (3 on macOS 11.7.11, 8 on macOS 26.7.1, 9 on macOS 27; not
 ///     read), the u16s 2, 1 and 1 (2, 3 and 2 on macOS 11.7.11), a u32 count, then each
 ///     function's seven u32s and its NUL-terminated name. The first u32 is the stage, as TYPE

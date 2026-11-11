@@ -397,6 +397,25 @@ std::vector<uint8_t> clContainer(const std::vector<RgfxMetallibFunction> &fs)
 	return out;
 }
 
+// `c`, a container of clContainer's, as Metal's compiler answers it where the compile warned
+// (measured: macOS 26.7.1, the Intel 630 and the AMD 5300M alike; Geekbench 7's programs on
+// macOS 26.6.1): the warnings' text, NUL-terminated, at 0x68, placed by the pair at 8, and every
+// other section after it.
+std::vector<uint8_t> withWarnings(const std::vector<uint8_t> &c, const std::string &text)
+{
+	std::vector<uint8_t> out(c.begin(), c.begin() + 0x68);
+	out.insert(out.end(), text.begin(), text.end());
+	out.push_back(0);
+	const uint32_t shift = static_cast<uint32_t>(text.size() + 1);
+	out.insert(out.end(), c.begin() + 0x68, c.end());
+	for (size_t at = 0x10; at < 0x60; at += 8)
+		if (le32(out.data() + at) >= 0x68)
+			set32(out, at, le32(out.data() + at) + shift);
+	set32(out, 8, 0x68);
+	set32(out, 12, shift);
+	return out;
+}
+
 } // namespace
 
 // Metal's compiler over OpenCL C source, as the GL renderer's cl2Metal compiles a compute program
@@ -487,6 +506,21 @@ void test_cl_library()
 	CHECK(RgfxMetallibOfClLibrary(c11.data(), c11.size(), out11) && out11 == out);
 	// Another head after the first u16 stays refused.
 	CHECK(broken(table + 4, 0x00020001));
+	// A compile that warned: its warnings' text ahead of the other sections, read past alike; a
+	// pair at 8 outside the bytes, or of a size at no offset, is refused.
+	const std::vector<uint8_t> cw =
+	    withWarnings(container, "program_source:2:35: warning: comparison of integers of different signs");
+	std::vector<uint8_t> outw;
+	CHECK(RgfxMetallibOfClLibrary(cw.data(), cw.size(), outw) && outw == out);
+	const auto brokenW = [&](size_t at, uint32_t value) {
+		std::vector<uint8_t> c = cw;
+		set32(c, at, value);
+		return !RgfxMetallibOfClLibrary(c.data(), c.size(), none);
+	};
+	CHECK(brokenW(8, static_cast<uint32_t>(cw.size()) + 1));  // the warnings past the end
+	CHECK(brokenW(12, static_cast<uint32_t>(cw.size())));     // the warnings running past the end
+	CHECK(brokenW(8, 0));                                     // a size at no offset
+	CHECK(none == std::vector<uint8_t>{7});
 	// A vertex and a fragment stage (macOS 11's render functions) carry into the .metallib's TYPE.
 	std::vector<uint8_t> cs = container, outs;
 	set32(cs, table + 12, 0);
@@ -512,6 +546,18 @@ void test_cl_library()
 	CHECK(RgfxMetallibOfClLibrary(static_cast<const uint8_t *>(bytes.bytes), bytes.length, out));
 	CHECK([metalLoads(metal, out, {}) isEqualToArray:names]);
 	CHECK(names.count == 2);
+	// And of a program its compiler warns of (a signed and an unsigned integer compared).
+	bytes = clLibraryBytes(metal,
+	                       @"__kernel void clip(__global float *a, uint n) {\n"
+	                       @"  int i = get_global_id(0); if (i >= n) return; a[i] *= 2.0f; }\n",
+	                       &names);
+	CHECK(bytes.length > 0x68);
+	if (bytes.length > 0x68 && le32(static_cast<const uint8_t *>(bytes.bytes) + 8) == 0)
+		fprintf(stderr, "gl_tests: this Mac's Metal gave no warnings for the program that warns\n");
+	out.clear();
+	CHECK(RgfxMetallibOfClLibrary(static_cast<const uint8_t *>(bytes.bytes), bytes.length, out));
+	CHECK([metalLoads(metal, out, {}) isEqualToArray:names]);
+	CHECK(names.count == 1);
 }
 
 // A library made from an OpenCL container's kernels keeps the container as the bytes it was
