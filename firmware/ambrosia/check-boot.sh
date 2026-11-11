@@ -513,7 +513,10 @@ if [[ -n $ssh_s ]]; then
   fi
   ws_was=
   [[ -n $ws_pid && -n $ws_now && $ws_now != "$ws_pid" ]] && ws_was=", the desktop's was $ws_pid"
-  denied=$(G 120 "log show --last boot --style compact --predicate 'eventMessage CONTAINS \"reims-graphics\"' 2>/dev/null | grep -c -i -E 'amfi|library validation|not valid|code signature'")
+  # The guest's log is read with /usr/bin/log by its path: the guest user's shell is zsh, whose
+  # `log` builtin takes the name over ssh and fails on these arguments, so a bare `log show`
+  # read no line and the checks below counted 0 of everything.
+  denied=$(G 120 "/usr/bin/log show --last boot --style compact --predicate 'eventMessage CONTAINS \"reims-graphics\"' 2>/dev/null | grep -c -i -E 'amfi|library validation|not valid|code signature'")
   denied=$(echo "$denied" | tail -1)
   [[ $denied =~ ^[0-9]+$ ]] || denied=
   if [[ -z $ws_now ]]; then
@@ -534,7 +537,9 @@ if [[ -n $ssh_s ]]; then
   panics_read=1
   panics=$(G 60 "echo '$GUEST_PASS' | sudo -S -p '' sh -c 'find /Library/Logs/DiagnosticReports -maxdepth 2 -type f \\( -name \"*.panic\" -o -name \"panic-*\" \\) -mmin -$run_min | while read -r f; do if grep -q -E \"ai\\.aneesiqbal|mach_vm_region|IOIteratePageableMaps\" \"\$f\"; then echo \"\$f (names our kexts)\"; else echo \"\$f\"; fi; done'") || panics_read=0
   # The count lines, then a line that says the log was read: grep's status is 1 for no lines.
-  kc=$(G 120 "log show --last boot --style compact --predicate 'eventMessage CONTAINS \"RgfxAccelerator: \"' 2>/dev/null | grep -E 'counting an IOSurface|not a buffer the kernel allocated|could not be mapped to count'; echo check-boot-read")
+  # The kext's IOLog lines reach the kernel's message buffer but not the unified log, so they are
+  # read with dmesg (128 KiB: a long boot can wrap its first lines out).
+  kc=$(G 120 "echo '$GUEST_PASS' | sudo -S -p '' dmesg 2>/dev/null | grep -E 'RgfxAccelerator: .*(counting an IOSurface|not a buffer the kernel allocated|could not be mapped to count)'; echo check-boot-read")
   kc_read=0
   [[ $kc == *check-boot-read ]] && kc_read=1
   kc=$(echo "$kc" | grep -v '^check-boot-read$')
@@ -542,7 +547,7 @@ if [[ -n $ssh_s ]]; then
 
   # The accessibility matrix, read while this boot is still the last one: WindowServer logs each
   # time it cannot set it. Then a line that says the log was read: grep's status is 1 for none.
-  ax=$(G 120 "log show --last boot --style compact --predicate 'eventMessage CONTAINS \"accessibility matrix\"' 2>/dev/null | grep -c 'not able to set accessibility matrix'; echo check-boot-read")
+  ax=$(G 120 "/usr/bin/log show --last boot --style compact --predicate 'eventMessage CONTAINS \"accessibility matrix\"' 2>/dev/null | grep -c 'not able to set accessibility matrix'; echo check-boot-read")
   ax_n=$(echo "$ax" | head -1)
   if [[ $ax != *check-boot-read || ! $ax_n =~ ^[0-9]+$ ]]; then
     verdict ax-matrix FAIL "unread: this boot's log not read in time"
