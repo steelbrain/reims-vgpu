@@ -11374,14 +11374,14 @@ lacks {part}"
         let side = TILED_SIZE / 2;
         for (i, texel) in level.chunks(4).enumerate() {
             let (x, y) = (i as u64 % side, i as u64 / side);
-            for c in 0..4 {
+            for (c, &got) in texel.iter().enumerate() {
                 let sum: u32 = [(0, 0), (1, 0), (0, 1), (1, 1)]
                     .iter()
                     .map(|&(dx, dy)| u32::from(tiled_texel(2 * x + dx, 2 * y + dy, seed)[c]))
                     .sum();
                 let want = sum as f64 / 4.0;
-                if (f64::from(texel[c]) - want).abs() > 1.0 {
-                    return Err(format!("({x}, {y}) channel {c}: {}, not {want}", texel[c]));
+                if (f64::from(got) - want).abs() > 1.0 {
+                    return Err(format!("({x}, {y}) channel {c}: {got}, not {want}"));
                 }
             }
         }
