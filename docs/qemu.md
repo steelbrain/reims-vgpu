@@ -188,6 +188,13 @@ is its transport:
   cursor, and under `-display none` the console has no display: the window
   shows the cursor as the host's pointer.
 - It has no default option ROM: `romfile=` names one.
+- **QEMU's quit:** once `vm_shutdown` stopped the VM for good, a VM-state
+  handler tears the device down, BAR 2 out of the guest's address space
+  first, so that the library's release of its last device lets go of the
+  GPU device before the process exits (docs/api.md, "The process's exit").
+  A shutdown whose action pauses the VM (`-action shutdown=pause`,
+  `-no-shutdown`), and a quit of a VM stopped before it, keep the device to
+  the exit, as before.
 - **The machine:** macOS places every 64-bit prefetchable BAR below 4 GiB,
   where a 1 GiB BAR needs the window to start at or below 0x4000_0000. So a
   q35 machine with the device keeps at most 1 GiB of the guest's RAM below
@@ -217,6 +224,13 @@ was 256 MiB:
   mHz; STATUS 0 empties the completion ring;
 - under `-display none`, the window opens and the library imports the
   region for it with no refusal.
+
+**Measured** on an RTX 3090 (NVIDIA 620.70.06) under KVM, macOS 26.7.2 with
+the window open: the guest's `shutdown -h now` ended QEMU 11 s later with
+exit code 0, the library's let-go of its one GPU device logged
+(`reims_vgpu_vulkan::let_go`, at debug), no `reims-vgpu: fatal` line and no
+core. Realized paused (`-S`) and quit through QMP, QEMU exited 0 with the
+device kept to the exit.
 
 ### Measuring WindowServer's composites
 

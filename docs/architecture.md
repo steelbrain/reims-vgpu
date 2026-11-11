@@ -626,6 +626,10 @@ docs/api.md is the C API's specification; the header repeats each rule where it 
   runs once, when the last closure built from the table goes. The window's table (`window.rs`) is
   held beside the device's and let go of first: its `destroy` runs when the release closes the
   window.
+- The release of the process's last device lets go of the GPU devices the platform keeps
+  (`GraphicsDevice::let_go_of_gpu`, `reims_vgpu_vulkan::let_go`), after a wait of at most 5 s
+  for that device's threads, objects and GPU work, so that no runtime device is live as the
+  process exits ([api.md](api.md), "The process's exit").
 - A call that can fail answers an `RvgStatus` (`status.rs`), a plain `u32`, and
   `rvg_status_message` describes each.
 - Every call of a host function runs in `ffi::host_call` (6.7).
