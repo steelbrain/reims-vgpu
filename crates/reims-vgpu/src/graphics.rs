@@ -1111,6 +1111,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 "the device was reset: {dropped} objects of {} contexts dropped",
                 contexts.len()
             );
+            // What the boot before the reset degraded, and the lines it repeated
+            // (docs/conventions.md).
+            reims_vgpu_vulkan::answer::write_counts();
         });
     }
 

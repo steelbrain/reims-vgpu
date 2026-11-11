@@ -414,7 +414,8 @@ through dma-bufs"). How the GPU then takes those pages depends on its driver:
   a view is made of, answers `KERN_NO_SPACE` with nothing mapped, an
   IOSurface stand-in's memory is none, an import's twin is none, and a buffer
   over a surface or a heap over address ranges is nil. Each is counted and
-  logged at the first and at each power of two. A replace whose alias is
+  logged at the first and at each power of two, those after the first at
+  debug (docs/conventions.md). A replace whose alias is
   refused still ends the process. With `REIMS_VGPU_STRICT=1` each ends the
   process at the call, naming the numbers.
 - **Where `/dev/udmabuf` is not the process's** (the device node is the `kvm`
@@ -435,14 +436,16 @@ What gets logged:
 - Where udmabuf is not the process's, a warning when the guest's RAM is
   leased, if the RAM at a mapping per 4 KiB page would not fit.
 - Each answer given for want of mappings, counted, at the first and at each
-  power of two.
+  power of two (after the first at debug), and in the degradation counts as
+  `out-of-host-memory`.
 - On a device that needs pages mapped from their files, an information line
   if imports of all of the guest's RAM, a mapping per 4 KiB page, would come
   within the headroom of the budget, with the `sysctl -w
   vm.max_map_count=...` value that covers them (2^23, 8,388,608, for a 16 GiB
   guest): past that, buffers and heaps not bound in a chunk are copied.
 - Each buffer, heap or rebind copied for want of mappings is counted with
-  its bytes, logged at the first and at each power of two, and written to
+  its bytes, logged at the first and at each power of two (after the first
+  at debug), and written to
   the trace (`nrcopy` for pages left in dma-bufs, `notwin` for read-only
   pages with no twin: first byte, length, mappings it would have taken).
 - On a device that needs pages mapped from their files but takes no host

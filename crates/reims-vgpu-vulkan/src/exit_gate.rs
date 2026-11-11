@@ -169,13 +169,21 @@ unsafe extern "C" {
 }
 
 /// The hook (the module docs): closes the gate, then waits for the steps in progress on other
-/// threads. A later run finds it closed and returns.
+/// threads, then writes the process's degradation counts and the log's count of its repeated
+/// lines (`crate::answer::write_counts`). A later run finds it closed and returns.
 extern "C" fn at_exit() {
     if CLOSED.load(Ordering::SeqCst) {
         return;
     }
     let _ = EXITING_HERE.try_with(|e| e.set(true));
     CLOSED.store(true, Ordering::SeqCst);
+    wait_for_others();
+    crate::answer::write_counts();
+}
+
+/// The hook's wait for the steps in progress on threads other than the exiting one (the module
+/// docs).
+fn wait_for_others() {
     let own = DEPTH.try_with(Cell::get).unwrap_or(0);
     let others = || IN_PROGRESS.load(Ordering::SeqCst).saturating_sub(own);
     if others() == 0 {

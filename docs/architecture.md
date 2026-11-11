@@ -859,6 +859,11 @@ Apple's paravirtualized device.
   unconditionally and in the same order, so the process does the same with logging on or off.
 - **Where lines go** is `logging.rs`'s: the host's own `log` logger, or with `REIMS_VGPU_LOG` the
   library's, to stderr.
+- **Once per kind.** The library's logger writes a warn or error line, and an info line that names
+  a `kind`, once per kind: its call site and the class of the cause it names
+  (`kind:% = error`), the later ones at debug and counted. Its count of them, and the runtime's
+  degradation counts (`answer::write_counts`), are written at each device reset and at the exit
+  (docs/conventions.md). A line on a per-event path is debug or trace.
 - **Tests** that are about a line read it through `testkit::logs::capture`, which relies on
   nextest's one process per test.
 

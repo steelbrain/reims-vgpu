@@ -95,13 +95,13 @@
 //!
 //! **A degradation of a kind [`HEARD`] lists is heard** by the call here it is announced inside
 //! ([`hearing`]), at every occurrence too: the call dies where an answer it gives would differ
-//! from Metal's, and otherwise goes on, the notice relayed (the first time alone, for
-//! [`RELAYED_ONCE`]'s kinds).
+//! from Metal's, and otherwise goes on, the notice relayed the first time alone and counted
+//! ([`RELAYED_ONCE`]).
 //!
 //! **Every other kind is relayed**: it goes to stderr as the runtime writes it without a sink
 //! ([`relay`]), as every other message of the runtime's own does (its pipeline-creation log among
 //! them; a `Verbose` one, which the runtime gives a sink alone, goes to the log at debug), each
-//! line naming its kind. Each is relayed for one of these reasons, named at the kind
+//! line naming its kind, and is counted. Each is relayed for one of these reasons, named at the kind
 //! in the placement test (`every_degradation_kind_is_placed_once`):
 //! - Metal's answer at a cost Metal does not pay, in time or memory (the performance kinds);
 //! - measured equal to Metal's answer on this host;
@@ -1470,7 +1470,8 @@ pub const DIES: [rt::Degradation; 145] = [
 ///   `HeapTwoPlaneLayout` instead, of [`DIES`]), announced on the caller's thread inside the
 ///   placement's call, which dies where a buffer or texture of the heap that lives
 ///   shares a byte with it: the heap's cover, the buffer over all of it core makes with each
-///   heap, included, so in every heap core makes ([`crate::gpu::resource::Placements`]);
+///   heap, included, so in every heap core makes ([`crate::gpu::resource::Placements`]). Relayed
+///   the first time alone ([`RELAYED_ONCE`]);
 /// - `OptimizedDepthStencilTexture`, a depth or stencil texture without
 ///   `allowGPUOptimizedContents`, whose layout MoltenVK keeps GPU-optimized: the runtime sizes it
 ///   as Metal's texture with the property on, larger than Metal's with it off (16512 bytes for a 64
@@ -1592,31 +1593,39 @@ pub const HEARD: [rt::Degradation; 7] = [
     rt::Degradation::HalfOutputPrecision,
 ];
 
-/// The kinds of [`HEARD`] the runtime would announce once per device but for `announce_each`,
-/// which asks for each occurrence only so a call here can hear it: relayed the first time alone,
-/// as without a sink, so a guest's every pass does not log one ([`notice`]).
-const RELAYED_ONCE: [rt::Degradation; 6] = [
-    rt::Degradation::OptimizedDepthStencilTexture,
-    rt::Degradation::RasterizationRateMap,
-    rt::Degradation::HeapTextureUntiledLayout,
-    rt::Degradation::HeapTextureLosslessLayout,
-    rt::Degradation::UnmeasuredHeapTextureSize,
-    rt::Degradation::HalfOutputPrecision,
-];
+/// The kinds the runtime would announce once per device but for `announce_each`, which asks for
+/// each occurrence only so a call here can hear it: every kind of [`HEARD`], relayed the first
+/// time alone, as without a sink, so a guest's every pass or texture does not log one, and
+/// counted ([`notice`], [`degradation_counts`]).
+const RELAYED_ONCE: [rt::Degradation; HEARD.len()] = HEARD;
 
-/// The kinds of [`RELAYED_ONCE`] this process relayed, a bit each at the kind's place there: a
-/// notice of one is announced at every occurrence (a heap's texture, a draw's bind), on whatever
-/// thread meets it, so no lock is taken for it.
-static RELAYED_KINDS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-const _: () = assert!(RELAYED_ONCE.len() <= 8, "a bit of RELAYED_KINDS each");
+/// How many notices of each kind of [`RELAYED_ONCE`] this process had, at the kind's place there:
+/// a notice of one is announced at every occurrence (a heap's texture, a draw's bind), on
+/// whatever thread meets it, so no lock is taken for it.
+static RELAYED_ONCE_COUNTS: [std::sync::atomic::AtomicU64; RELAYED_ONCE.len()] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; RELAYED_ONCE.len()];
 
 /// Whether `kind` is of [`RELAYED_ONCE`] and this is the process's first notice of it, which is
-/// relayed ([`RELAYED_KINDS`]).
+/// relayed, counting it ([`RELAYED_ONCE_COUNTS`]).
 fn first_relayed_once(kind: rt::Degradation) -> Option<bool> {
     use std::sync::atomic::Ordering;
     let at = RELAYED_ONCE.iter().position(|&k| k == kind)?;
-    let bit = 1u8 << at;
-    Some(RELAYED_KINDS.fetch_or(bit, Ordering::Relaxed) & bit == 0)
+    Some(RELAYED_ONCE_COUNTS[at].fetch_add(1, Ordering::Relaxed) == 0)
+}
+
+/// The kinds neither of [`DIES`] nor of [`HEARD`] the runtime announced in this process, each
+/// with how many times: once per device, as the runtime announces them, but in the modes that
+/// announce each occurrence ([`notice`]).
+static ANNOUNCED: crate::core::sync::Mutex<Vec<(rt::Degradation, u64)>> =
+    crate::core::sync::Mutex::new(Vec::new());
+
+/// Counts a notice of `kind`, neither of [`DIES`] nor of [`HEARD`] ([`ANNOUNCED`]).
+fn count_announced(kind: rt::Degradation) {
+    let mut announced = ANNOUNCED.lock();
+    match announced.iter_mut().find(|(k, _)| *k == kind) {
+        Some((_, n)) => *n += 1,
+        None => announced.push((kind, 1)),
+    }
 }
 
 /// What every call here reads of this thread on its way in and out ([`inside`]): one lookup of
@@ -1950,7 +1959,8 @@ static TRACED_KINDS: crate::core::sync::Mutex<Vec<rt::Degradation>> =
 /// of [`HEARD`] is kept for the
 /// [`hearing`] it was announced inside; every other message, and every one of [`HEARD`] too,
 /// goes to [`relay`], to stderr (a `Verbose` one of the runtime's own to the log at debug), but
-/// a kind of [`RELAYED_ONCE`] after its first.
+/// a kind of [`RELAYED_ONCE`] after its first. Each degradation relayed is counted
+/// ([`degradation_counts`]).
 pub fn notice(message: &rt::DebugMessage) {
     let Some(notice) = &message.degradation else {
         relay(message);
@@ -1978,8 +1988,10 @@ pub fn notice(message: &rt::DebugMessage) {
         }
         #[cfg(test)]
         RELAYED.lock().push(notice.degradation);
-        if first_relayed_once(notice.degradation) == Some(false) {
-            return;
+        match first_relayed_once(notice.degradation) {
+            Some(false) => return,
+            Some(true) => {}
+            None => count_announced(notice.degradation),
         }
         relay(message);
         return;
@@ -2058,14 +2070,64 @@ pub(crate) fn least_severity() -> rt::MessageSeverity {
 /// has not measured is made).
 const RUNTIME_MESSAGES: &str = "metal2vulkan-";
 
-/// Writes `message`, which the runtime gave the sink, on stderr ([`relay_to`]).
+/// Writes `message`, which the runtime gave the sink, on stderr ([`relay_to`]): a driver's or a
+/// layer's the first time alone of its id name and the class of its text
+/// (`core::logging::class`), the later ones counted ([`DRIVER_SAID`]), as one comes at each call
+/// that meets its cause.
 fn relay(message: &rt::DebugMessage) {
+    if !message.id_name.starts_with(RUNTIME_MESSAGES)
+        && message.severity == rt::MessageSeverity::Error
+        && !DRIVER_SAID.lock().first(&message.id_name, &message.text)
+    {
+        return;
+    }
     relay_to(
         &mut std::io::stderr(),
         message.severity,
         &message.id_name,
         &message.text,
     );
+}
+
+/// The driver's and layers' messages [`relay`] took, by id name and the class of their text.
+static DRIVER_SAID: crate::core::sync::Mutex<Said> = crate::core::sync::Mutex::new(Said::new());
+
+/// Messages by id name and the class of their text (`core::logging::class`), each with how many
+/// came, in the order of their first.
+struct Said(Vec<(String, String, u64)>);
+
+impl Said {
+    const fn new() -> Said {
+        Said(Vec::new())
+    }
+
+    /// Counts a message of `id_name` and `text`: whether it is the first of its id name and
+    /// class.
+    fn first(&mut self, id_name: &str, text: &str) -> bool {
+        let class = crate::core::logging::class(text);
+        match (self.0.iter_mut()).find(|(id, c, _)| id == id_name && c == class) {
+            Some((_, _, n)) => {
+                *n += 1;
+                false
+            }
+            None => {
+                self.0.push((id_name.to_owned(), class.to_owned(), 1));
+                true
+            }
+        }
+    }
+
+    /// Each id name with how many messages of it came, of every class.
+    fn counts(&self) -> Vec<(String, u64)> {
+        let mut counts: Vec<(String, u64)> = Vec::new();
+        for (id, _, n) in &self.0 {
+            match counts.iter_mut().find(|(i, _)| i == id) {
+                Some((_, all)) => *all += n,
+                None => counts.push((id.clone(), *n)),
+            }
+        }
+        counts
+    }
 }
 
 /// Writes `text`, a message of `severity` and id name `id_name` the runtime gave the sink, on `w`
@@ -2541,8 +2603,9 @@ static OUT_OF_HOST_MEMORY: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// (`vm.max_map_count`), of open files or of memory, where Metal's call needs none: in strict
 /// mode the process ends there, naming `detail`, as it did before; by default the caller answers
 /// as Metal's call does when memory runs out (`KERN_NO_SPACE`, no memory, a nil object), and the
-/// answer is counted ([`out_of_host_memory_count`]) and logged at the first and at each power of
-/// two. `detail` is asked only for a line.
+/// answer is counted ([`out_of_host_memory_count`], [`degradation_counts`]) and logged at the
+/// first, and at each power of two, at debug after the first (`core::logging`'s once per kind).
+/// `detail` is asked only for a line.
 pub(crate) fn out_of_host_memory(call: &'static str, detail: impl FnOnce() -> String) {
     use std::sync::atomic::Ordering;
     if strict() {
@@ -2577,6 +2640,78 @@ pub fn inexact_counts() -> Vec<(Inexact, u64)> {
         .map(|(&k, c)| (k, c.load(Ordering::Relaxed)))
         .filter(|&(_, n)| n > 0)
         .collect()
+}
+
+/// Each kind this process relayed or counted, with how many times, by its code: the degradations
+/// of [`DIES`] relayed ([`relayed_counts`]) or relayed natively (`native::counts`), those of
+/// [`RELAYED_ONCE`] and the others the runtime announced, the kinds of [`Inexact`]
+/// ([`inexact_counts`]), the calls answered as when memory runs out (`out-of-host-memory`,
+/// [`out_of_host_memory_count`]), and the driver's and layers' messages relayed, by id name
+/// ([`relay`]). Sorted by code, a code met twice summed.
+pub fn degradation_counts() -> Vec<(String, u64)> {
+    use std::sync::atomic::Ordering;
+    let code = |(k, n): (rt::Degradation, u64)| (k.code().to_owned(), n);
+    let mut all: Vec<(String, u64)> = (relayed_counts().into_iter().map(code))
+        .chain(native::counts().into_iter().map(code))
+        .chain(
+            (RELAYED_ONCE.iter().zip(&RELAYED_ONCE_COUNTS))
+                .map(|(&k, c)| code((k, c.load(Ordering::Relaxed)))),
+        )
+        .chain(ANNOUNCED.lock().iter().copied().map(code))
+        .chain((inexact_counts().into_iter()).map(|(k, n)| (k.code().to_owned(), n)))
+        .chain(std::iter::once((
+            "out-of-host-memory".to_owned(),
+            out_of_host_memory_count(),
+        )))
+        .chain(DRIVER_SAID.lock().counts())
+        .filter(|&(_, n)| n > 0)
+        .collect();
+    all.sort();
+    all.dedup_by(|later, kept| {
+        let same = later.0 == kept.0;
+        if same {
+            kept.1 += later.1;
+        }
+        same
+    });
+    all
+}
+
+/// The line of `counts` ([`degradation_counts`]), with its newline:
+/// `reims-vgpu: degradation counts: <code> <n>, <code> <n>, …`; `None` for none.
+fn counts_line(counts: &[(String, u64)]) -> Option<String> {
+    if counts.is_empty() {
+        return None;
+    }
+    let counts: Vec<String> = counts.iter().map(|(c, n)| format!("{c} {n}")).collect();
+    Some(format!(
+        "reims-vgpu: degradation counts: {}\n",
+        counts.join(", ")
+    ))
+}
+
+/// The line [`write_counts`] last wrote.
+static COUNTS_WRITTEN: crate::core::sync::Mutex<String> =
+    crate::core::sync::Mutex::new(String::new());
+
+/// Writes, on stderr, the line of the process's [`degradation_counts`] since it began, where any
+/// and where they changed since this last wrote them: `reims-vgpu: degradation counts: <code>
+/// <n>, …` ([`counts_line`]), the line the codes of a boot's degradations are read from; and the
+/// log's count of the lines it wrote at debug after their kind's first
+/// ([`crate::core::logging::write_repeats`]). A device's reset and the process's exit write them
+/// (`reims-vgpu`'s reset, [`crate::exit_gate`]).
+pub fn write_counts() {
+    crate::core::logging::write_repeats();
+    let Some(line) = counts_line(&degradation_counts()) else {
+        return;
+    };
+    let mut written = COUNTS_WRITTEN.lock();
+    if *written == line {
+        return;
+    }
+    // One write, so the line never interleaves with another thread's.
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
+    *written = line;
 }
 
 /// Parks this thread for good, where Metal's call never returns: a wait Metal never returns
@@ -2681,6 +2816,48 @@ mod tests {
             format!(
                 "{creation}\n{validation}\n{late}\n{evicted}\n{unwritten}\n{compile}\n{degraded}\n"
             )
+        );
+    }
+
+    /// A driver's message is relayed the first time alone of its id name and the class of its
+    /// text, the later ones counted by id name
+    #[test]
+    fn a_drivers_message_is_relayed_once_per_id_name_and_class() {
+        let mut said = Said::new();
+        let failed = |code: u32| format!("VK_ERROR_INITIALIZATION_FAILED: compile failed ({code})");
+        assert!(said.first("mvk-error", &failed(3)));
+        assert!(!said.first("mvk-error", &failed(4)), "the same class");
+        assert!(said.first("mvk-error", "VK_ERROR_OUT_OF_DEVICE_MEMORY: no memory"));
+        assert!(said.first("VUID-x", &failed(3)), "another id name");
+        assert_eq!(
+            said.counts(),
+            [("mvk-error".to_owned(), 3), ("VUID-x".to_owned(), 1)]
+        );
+    }
+
+    /// Every kind of [`HEARD`] is relayed the first time alone, and counted: the counts name it
+    /// by its code, and the counts' line names each code with its count
+    #[test]
+    fn heard_kinds_are_relayed_once_and_counted() {
+        assert_eq!(RELAYED_ONCE, HEARD);
+        let kind = rt::Degradation::HeapTwoPlaneTexture;
+        let before = (degradation_counts().into_iter())
+            .find(|(c, _)| c == kind.code())
+            .map_or(0, |(_, n)| n);
+        let first = first_relayed_once(kind);
+        assert_eq!(first, Some(before == 0));
+        assert_eq!(first_relayed_once(kind), Some(false));
+        let after = (degradation_counts().into_iter()).find(|(c, _)| c == kind.code());
+        assert_eq!(after, Some((kind.code().to_owned(), before + 2)));
+
+        assert_eq!(counts_line(&[]), None);
+        assert_eq!(
+            counts_line(&[
+                ("inexact-heap-layout".to_owned(), 3),
+                ("out-of-host-memory".to_owned(), 1)
+            ])
+            .as_deref(),
+            Some("reims-vgpu: degradation counts: inexact-heap-layout 3, out-of-host-memory 1\n")
         );
     }
 
