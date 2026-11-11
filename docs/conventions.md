@@ -83,6 +83,38 @@ repeats the ones code cites.
   that changes its test.
 - **Comments** say why, in terms of what the guest or host observes ("the
   stamp is in guest memory before its interrupt"), and may name a test.
+- **Each degradation is logged once per boot, then counted.** A
+  degradation, fallback, refusal or unsupported case writes its first line
+  of each kind, and counts the rest:
+  - The library's logger (`reims_vgpu_vulkan::core::logging`) writes a warn
+    or error line, and an info line that names a `kind`, once per kind: the
+    first at its level, each later one at debug, counted. The kind is the
+    call site, and the class of the cause where the site names one,
+    `log::warn!(target: "…", kind:% = error; "…: {error}")`: the cause's
+    text up to its first digit, quote or `;`. A site with one cause names
+    none.
+  - The runtime's degradations, inexact values and the driver's error
+    messages are relayed on stderr the first time alone of each kind
+    (`answer`), and counted.
+  - At each reset of the device and at the process's exit, two lines give
+    the counts. `reims-vgpu: degradation counts: <code> <n>, <code> <n>, …`,
+    on stderr, sorted by code, is every kind relayed or counted since the
+    process began: the runtime's degradation codes
+    (`metal2vulkan-degrade-…`), `inexact-…`, `out-of-host-memory` and the
+    driver's message id names; a boot's degradations are read from its last
+    such line. `reims-vgpu INFO reims_vgpu_vulkan::core::logging: lines
+    repeated since the last count: <n> more of <file>:<line>[ [<kind>]]
+    (<target>: <the first line's message>); …` is how many lines of each
+    kind the logger wrote at debug since its last such line.
+  - No line at info or above fires per present, frame, draw, command
+    buffer, ring message, interrupt or other per-event path: such a line is
+    debug or trace, under a target of its own where a tool counts it
+    (`reims_vgpu::graphics::shown`, `::library` and `::queues`, which the
+    lane gate's boots log at debug). Info keeps state changes (modes, the
+    display between the scanout and a surface, starts and stops, a new kind
+    of degradation) and summaries, at most once a minute.
+  - QEMU's `reims-graphics-pci` says a failure the guest can repeat with
+    `error_report_once`.
 - Tests sit in `mod tests` beside the code and are named by behaviour.
 - **Integers**: std spells wrapping, overflowing, widening and sign
   reinterpretation (`wrapping_add`, `overflowing_mul`, `u64::from`,
