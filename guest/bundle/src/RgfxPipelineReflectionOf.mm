@@ -12,6 +12,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -26,25 +27,34 @@ void logOnce(NSString *what, NSString *why)
 }
 
 // A kernel's entry as its pipeline of OpenCL mode binds it (RgfxClMode.hpp; measured: macOS
-// 26.7.1, the Intel 630 and the AMD 5300M alike, through the GL renderer): each __global and
-// __constant pointer at its index plus 3; each value passed by value a buffer at its index plus 3,
-// read only and no constant buffer, of the value's type, size and alignment; each __local pointer
-// the threadgroup memory at its own index; then the three buffers the renderer binds, after the
-// kernel's own arguments.
+// 26.7.1, the Intel 630 and the AMD 5300M alike, through the GL renderer, and driving OpenCL mode
+// directly for images and samplers): each __global and __constant pointer at its index plus 3;
+// each value passed by value a buffer at its index plus 3, read only and no constant buffer, of
+// the value's type, size and alignment; each __local pointer the threadgroup memory at its own
+// index; each image and sampler at its own. The arguments are in the kernel's order, the values
+// after all the others (img_mixed's `pre, in, s, k, out` is answered `pre, in, s, out, k`); then
+// the three buffers the renderer binds.
 RgfxAirEntry clModeEntry(const RgfxAirEntry &entry, const RgfxClBindings &cl)
 {
 	RgfxAirEntry out = entry;
-	for (RgfxAirNode &n : out.arguments) {
+	std::vector<RgfxAirNode> values;
+	out.arguments.clear();
+	for (RgfxAirNode n : entry.arguments) {
 		if (n.kind == "air.constant") {
 			n.kind = "air.buffer";
 			n.hasAddressSpace = true;
 			n.addressSpace = 1;
 			n.access = RgfxAirAccess::Read;
 			n.index += kRgfxClHiddenBuffers;
-		} else if (n.kind == "air.buffer" && n.hasAddressSpace && n.addressSpace != 3) {
-			n.index += kRgfxClHiddenBuffers;
+			values.push_back(std::move(n));
+			continue;
 		}
+		if (n.kind == "air.buffer" && n.hasAddressSpace && n.addressSpace != 3)
+			n.index += kRgfxClHiddenBuffers;
+		out.arguments.push_back(std::move(n));
 	}
+	for (RgfxAirNode &n : values)
+		out.arguments.push_back(std::move(n));
 	static const struct {
 		const char *name, *type;
 		RgfxAirAccess access;

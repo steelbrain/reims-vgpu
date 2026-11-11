@@ -33,6 +33,10 @@ bool RgfxClBindingsOf(const RgfxAirEntry &entry, RgfxClBindings &out, std::strin
 		}
 		if (n.kind == "air.buffer" && n.hasAddressSpace && n.addressSpace == 3)
 			continue; // __local: the threadgroup memory at its own index
+		if ((n.kind == "air.texture" || n.kind == "air.sampler") && n.count == 1) {
+			(n.kind == "air.texture" ? b.textures : b.samplers).push_back(n.index); // at its own index
+			continue;
+		}
 		why = "an argument of " + n.kind + " is not one OpenCL mode was measured with";
 		return false;
 	}

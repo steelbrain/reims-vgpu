@@ -64,14 +64,19 @@ NSArray<NSNumber *> *numbersOf(const std::vector<uint32_t> &values)
 }
 
 // The plugin return data of a kernel's function of OpenCL mode, as Metal answers it
-// (RgfxClMode.hpp): its buffers' and values' indices, its entry's name and its
+// (RgfxClMode.hpp): its buffers', values', samplers' and images' indices, its entry's name and its
 // reqd_work_group_size, in a binary property list.
 NSData *clReturnData(const RgfxClBindings &b, const std::string &entry)
 {
 	NSMutableDictionary *d = [NSMutableDictionary dictionary];
-	d[@"LinkerScript_buffer_bindings"] = numbersOf(b.buffers);
+	if (!b.buffers.empty())
+		d[@"LinkerScript_buffer_bindings"] = numbersOf(b.buffers);
 	if (!b.byValue.empty())
 		d[@"LinkerScript_byVal_bindings"] = numbersOf(b.byValue);
+	if (!b.samplers.empty())
+		d[@"LinkerScript_sampler_bindings"] = numbersOf(b.samplers);
+	if (!b.textures.empty())
+		d[@"LinkerScript_texture_bindings"] = numbersOf(b.textures);
 	d[@"LinkerScript_function_name"] = @(entry.c_str());
 	if (b.hasWorkGroupSize)
 		d[@"air.work_group_size"] = @[ @(b.workGroupSize[0]), @(b.workGroupSize[1]), @(b.workGroupSize[2]) ];

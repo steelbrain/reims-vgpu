@@ -313,10 +313,24 @@ bool textureType(const std::string &name, NSUInteger &type, NSUInteger &dataType
 			found = true;
 		}
 	}
+	// An OpenCL C image's sample type is `unknown` (`texture2d<unknown, read>`, Metal's compile of
+	// an image2d_t), which Metal's pipelines of OpenCL mode answer as MTLDataTypeNone; they answer
+	// its 1D images as 2D textures, image1d_t's texture1d a 2D one and image1d_array_t's
+	// texture1d_array a 2D array one (measured: macOS 26.7.1, the Intel 630 and the AMD 5300M
+	// alike, of every image of OpenCL C 1.2 and image2d_depth_t).
+	const std::string sample = n.substr(open + 1, comma - open - 1);
+	if (sample == "unknown") {
+		if (type == MTLTextureType1D)
+			type = MTLTextureType2D;
+		else if (type == MTLTextureType1DArray)
+			type = MTLTextureType2DArray;
+		dataType = MTLDataTypeNone;
+		return found;
+	}
 	// A texture of ulong is one of 64-bit atomics (measured: the Intel UHD Graphics 630 answers it of
 	// MTLDataTypeULong; the AMD Radeon Pro 5300M makes no pipeline of one).
 	uint32_t align = 0;
-	return found && valueType(n.substr(open + 1, comma - open - 1), dataType, align) &&
+	return found && valueType(sample, dataType, align) &&
 	       (dataType == MTLDataTypeFloat || dataType == MTLDataTypeHalf || dataType == MTLDataTypeInt ||
 	        dataType == MTLDataTypeUInt || dataType == MTLDataTypeShort || dataType == MTLDataTypeUShort ||
 	        dataType == MTLDataTypeULong);
