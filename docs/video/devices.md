@@ -49,7 +49,10 @@ the device info (`GraphicsDevice::with_platform`, in `graphics.rs`):
   256 bytes, `BufferDescriptor::with_aligned_byte`), so textures over the planes lie in the cache
   rather than in the runtime's shadows (`surface_cache::aligned_byte`): from the layout the
   kext's ask gives, or on a GPU of its own memory the layout a cached or deferred block's
-  `SURFACE_PAGES` carries, the exportable caches NVDEC lands its pictures in among them.
+  `SURFACE_PAGES` carries, the exportable caches NVDEC lands its pictures in among them. That
+  holds where the runtime binds images in the cache's memory: on the RTX 5080 metal2vulkan makes
+  each exportable buffer its own dedicated allocation and binds no image there, so the planes'
+  textures over NVDEC's caches stay its shadows wherever the byte lies (measured 2026-11-11).
 - **The layouts**: an `RgfxVideoOutputLayout` per entry, which says how a surface is laid out
   to take a picture's whole coded rows and columns in place. An arm that lands every picture by
   a copy of its crop answers zero, and every entry's is zero where the flag is set, since a

@@ -81,7 +81,12 @@
 //!   [`CacheLayout`]), whichever way the cache is made, its exportable one among them: CoreVideo
 //!   lays a frame's planes 32 bytes into their surface, off every linear image's alignment
 //!   measured, and the textures over a decoder's planes are then images of the cache's memory,
-//!   not the runtime's shadows. Only the ask's layout makes the copies take texels alone.
+//!   not the runtime's shadows, where the platform binds images in that memory. On the RTX 5080
+//!   (driver 615.71) metal2vulkan makes each exportable buffer its own dedicated allocation, to
+//!   which it binds no image, so every texture over an exportable cache stays its shadow wherever
+//!   the byte lies (**measured** 2026-11-11, a macOS 26.6.1 guest's 4K60 videos in Safari: 2850
+//!   of the 4063 shadowed IOSurface textures named the exported memory, the NV12 and P010
+//!   planes' 1586 among them). Only the ask's layout makes the copies take texels alone.
 //!   A download or a release copies nothing where, as its copy is made (at once, or in the
 //!   finish of a buffer begun before it), the CPU's generation in the block's header
 //!   ([`CPU_GEN_OFFSET`]) has moved past the cache's: the lock that asked gave up waiting for the
