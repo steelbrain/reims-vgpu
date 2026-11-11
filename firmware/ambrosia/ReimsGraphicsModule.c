@@ -119,12 +119,27 @@ typedef struct {
 
 /* ------ Device memory, barriers and the counter ------ */
 
+//
+// Each access to the device's memory is one instruction: a plain LDRH, STRH,
+// LDR or STR at a base register's address, written out. A hypervisor that
+// emulates the device's registers or its configuration space decodes a
+// guest's access from its abort's syndrome, which the CPU gives only for a
+// single load or store without writeback. A pre- or post-indexed, pair or
+// SIMD&FP access aborts with no syndrome (ISV 0), and KVM hands that to QEMU,
+// which decodes it only with its own instruction emulator. A volatile access
+// fixes the access's size and count, not the instruction the compiler picks
+// (BarSize's read of ECAM compiled to a pre-indexed LDR).
+//
+
 static inline uint16_t
 Read16 (
   uint64_t  Address
   )
 {
-  return *(volatile uint16_t *)(uintptr_t)Address;
+  uint16_t  Value;
+
+  __asm__ volatile ("ldrh %w0, [%1]" : "=r" (Value) : "r" (Address) : "memory");
+  return Value;
 }
 
 static inline void
@@ -133,7 +148,7 @@ Write16 (
   uint16_t  Value
   )
 {
-  *(volatile uint16_t *)(uintptr_t)Address = Value;
+  __asm__ volatile ("strh %w0, [%1]" : : "rZ" (Value), "r" (Address) : "memory");
 }
 
 static inline uint32_t
@@ -141,7 +156,10 @@ Read32 (
   uint64_t  Address
   )
 {
-  return *(volatile uint32_t *)(uintptr_t)Address;
+  uint32_t  Value;
+
+  __asm__ volatile ("ldr %w0, [%1]" : "=r" (Value) : "r" (Address) : "memory");
+  return Value;
 }
 
 static inline void
@@ -150,7 +168,7 @@ Write32 (
   uint32_t  Value
   )
 {
-  *(volatile uint32_t *)(uintptr_t)Address = Value;
+  __asm__ volatile ("str %w0, [%1]" : : "rZ" (Value), "r" (Address) : "memory");
 }
 
 static inline uint64_t
@@ -158,7 +176,10 @@ Read64 (
   uint64_t  Address
   )
 {
-  return *(volatile uint64_t *)(uintptr_t)Address;
+  uint64_t  Value;
+
+  __asm__ volatile ("ldr %x0, [%1]" : "=r" (Value) : "r" (Address) : "memory");
+  return Value;
 }
 
 static inline void
@@ -167,7 +188,7 @@ Write64 (
   uint64_t  Value
   )
 {
-  *(volatile uint64_t *)(uintptr_t)Address = Value;
+  __asm__ volatile ("str %x0, [%1]" : : "rZ" (Value), "r" (Address) : "memory");
 }
 
 /**

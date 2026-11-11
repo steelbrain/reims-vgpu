@@ -50,4 +50,33 @@ inline void rgfxRegisterWriteBarrier()
 #endif
 }
 
+// A 32-bit load or store of the device's registers (BAR 0), each one instruction. On arm64 a
+// hypervisor that emulates the registers decodes a guest's access to them from its abort's
+// syndrome, which the CPU gives only for a single load or store without writeback; a pre- or
+// post-indexed, pair or SIMD&FP access aborts with no syndrome (ISV 0), and KVM hands that to
+// QEMU, which decodes it only with its own instruction emulator. A volatile access fixes the
+// access's size and count, not the instruction the compiler picks, so on arm64 each is written
+// out: an LDR or STR of a W register at a base register's address, as Linux's readl and writel
+// are. x86-64 has no such limit and keeps the volatile access. BAR 2, the region, is RAM to the
+// hypervisor (QEMU's reims-graphics-pci maps it so), and its accesses do not reach it.
+inline uint32_t rgfxRegisterRead32(const volatile uint8_t *at)
+{
+#if defined(__aarch64__)
+	uint32_t value;
+	__asm__ volatile("ldr %w0, [%1]" : "=r"(value) : "r"(at) : "memory");
+	return value;
+#else
+	return *reinterpret_cast<const volatile uint32_t *>(at);
+#endif
+}
+
+inline void rgfxRegisterWrite32(volatile uint8_t *at, uint32_t value)
+{
+#if defined(__aarch64__)
+	__asm__ volatile("str %w0, [%1]" : : "rZ"(value), "r"(at) : "memory");
+#else
+	*reinterpret_cast<volatile uint32_t *>(at) = value;
+#endif
+}
+
 #endif // RGFX_REGION_MAPPING_HPP_

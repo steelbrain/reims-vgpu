@@ -190,13 +190,13 @@ inline UInt64 clockAbsolute(UInt64 ns)
 
 UInt32 ReimsGraphics::readRegister(UInt32 offset) const
 {
-	return *reinterpret_cast<const volatile UInt32 *>(registers + offset);
+	return rgfxRegisterRead32(registers + offset);
 }
 
 void ReimsGraphics::writeRegister(UInt32 offset, UInt32 value)
 {
 	rgfxRegisterWriteBarrier();
-	*reinterpret_cast<volatile UInt32 *>(registers + offset) = value;
+	rgfxRegisterWrite32(registers + offset, value);
 }
 
 volatile UInt8 *ReimsGraphics::ring(UInt32 offset) const

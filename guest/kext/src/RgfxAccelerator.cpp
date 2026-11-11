@@ -291,13 +291,13 @@ void RgfxAccelerator::settleBundle()
 
 UInt32 RgfxAccelerator::readRegister(UInt32 offset) const
 {
-	return *reinterpret_cast<const volatile UInt32 *>(registers + offset);
+	return rgfxRegisterRead32(registers + offset);
 }
 
 void RgfxAccelerator::writeRegister(UInt32 offset, UInt32 value)
 {
 	rgfxRegisterWriteBarrier();
-	*reinterpret_cast<volatile UInt32 *>(registers + offset) = value;
+	rgfxRegisterWrite32(registers + offset, value);
 }
 
 uint64_t RgfxAccelerator::featureWord() const
