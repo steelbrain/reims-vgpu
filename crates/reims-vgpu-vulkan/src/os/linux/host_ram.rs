@@ -147,7 +147,7 @@ fn runtime_ram(ranges: &[(u64, u64)]) -> Option<rt::HostRam> {
         Ok(ram) => ram,
         Err(refusal) => {
             log::warn!(
-                target: "reims_vgpu_vulkan::os",
+                target: "reims_vgpu_vulkan::os", kind:% = refusal;
                 "the guest's RAM is not handed to devices whole ({refusal}): buffers over its \
                  pages keep imports of their own"
             );
@@ -309,7 +309,10 @@ pub(crate) fn copy_from_host_ram(
 
 /// A refusal of a copy by runs, logged.
 fn refused(error: rt::Error) -> RunsCopyRefused {
-    log::warn!(target: "reims_vgpu::vulkan", "the runtime refused a copy by runs: {error}");
+    log::warn!(
+        target: "reims_vgpu::vulkan", kind:% = error;
+        "the runtime refused a copy by runs: {error}"
+    );
     RunsCopyRefused
 }
 

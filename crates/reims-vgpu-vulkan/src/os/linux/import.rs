@@ -246,7 +246,8 @@ pub(crate) fn views_through_dma_bufs() -> bool {
 
 /// Imports refused at the views' budget, of one kind: how many and their bytes, each written to
 /// the trace (its first byte, its length and the mappings it would have taken) and the count
-/// logged at the first and at each power of two.
+/// logged at the first and at each power of two, at debug after the first (`core::logging`'s once
+/// per kind).
 struct Refused {
     /// The trace record's name.
     record: &'static str,

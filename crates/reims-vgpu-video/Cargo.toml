@@ -12,7 +12,7 @@ workspace = true
 
 [dependencies]
 thiserror = "2"
-log = "0.4"
+log = { version = "0.4", features = ["kv"] }
 # The locks the video code takes, the Vulkan crate's core's (`core::sync`).
 parking_lot.workspace = true
 # The Annex B start-code scan (`codec::h264::nal`), a vectorized substring search.

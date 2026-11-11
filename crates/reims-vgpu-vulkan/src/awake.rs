@@ -237,7 +237,7 @@ fn keep(device: &rt::Device, shared: &Shared, look: Duration) {
                     None => Toucher::new(device).and_then(|made| toucher.insert(made).touch()),
                 };
                 if let Err(e) = touched {
-                    log::warn!(target: TARGET, "the GPU is no longer kept awake: {e}");
+                    log::warn!(target: TARGET, kind:% = e; "the GPU is no longer kept awake: {e}");
                     drop(toucher.take());
                     drop(held);
                     return;

@@ -161,7 +161,7 @@ impl Keeper {
             Ok(()) => self.bytes += framed.len() as u64,
             Err(e) => {
                 log::warn!(
-                    target: "reims_vgpu_vulkan::records",
+                    target: "reims_vgpu_vulkan::records", kind:% = e;
                     "a pipeline record was not appended to {}: {e}; no more are kept",
                     self.path.display()
                 );

@@ -553,7 +553,7 @@ fn mouse_rect(image: Rect) -> SDL_Rect {
 /// Logs that SDL refused `what` for the window titled `title`.
 pub(crate) fn refused(what: &str, title: &str) {
     log::warn!(
-        target: "reims_vgpu_window",
+        target: "reims_vgpu_window", kind:% = what;
         "window {title:?}: {what}: {}",
         sdl_error()
     );

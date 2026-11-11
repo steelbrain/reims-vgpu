@@ -53,7 +53,7 @@ impl FrameSink for VulkanScanoutSink {
             })),
             Err(refused) => {
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:% = refused;
                     "no swapchain for the graphics display's window ({refused}): it stays empty"
                 );
                 None

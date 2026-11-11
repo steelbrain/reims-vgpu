@@ -174,6 +174,7 @@ impl Lingering {
             let mut state = self.shared.lock();
             state.ever_kept += 1;
             log::error!(
+                kind:% = what;
                 "{what}: the device did not finish it in {:.1} s; it is kept, with what the \
                  device may still write, until the device is done ({} kept now, {} ever)",
                 DEVICE_WAIT.as_secs_f64(),

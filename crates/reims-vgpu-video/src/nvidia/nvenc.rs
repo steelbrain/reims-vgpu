@@ -549,14 +549,14 @@ impl Session {
         };
         let current = match self.gpu.push() {
             Ok(current) => current,
-            Err(e) => return log::warn!("{e}"),
+            Err(e) => return log::warn!(kind:% = e; "{e}"),
         };
         // SAFETY: a live session and one of its buffers, which it locked,
         // unlocked once.
         let status = unsafe { unlock(self.encoder, output) };
         drop(current);
         if let Err(e) = self.check("nvEncUnlockBitstream", status) {
-            log::warn!("{e}");
+            log::warn!(kind:% = e; "{e}");
         }
     }
 
@@ -575,7 +575,7 @@ impl Session {
                 .any(|kept| kept.handle == output && kept.kind == BufferKind::Bitstream)
         });
         if frames && let Err(e) = self.encode_picture(Submission::End) {
-            log::warn!("{e}");
+            log::warn!(kind:% = e; "{e}");
         }
         for output in submitted {
             match locks::lock_now(call, self.encoder, &self.gpu, output) {
@@ -584,10 +584,10 @@ impl Session {
                 }
                 Ok(Lock { status, .. }) => {
                     if let Err(e) = self.check("nvEncLockBitstream", status) {
-                        log::warn!("{e}");
+                        log::warn!(kind:% = e; "{e}");
                     }
                 }
-                Err(e) => log::warn!("{e}"),
+                Err(e) => log::warn!(kind:% = e; "{e}"),
             }
         }
     }
@@ -824,7 +824,10 @@ impl Drop for Session {
             return;
         }
         drop(locks);
-        let current = self.gpu.push().inspect_err(|e| log::warn!("{e}"));
+        let current = self
+            .gpu
+            .push()
+            .inspect_err(|e| log::warn!(kind:% = e; "{e}"));
         let api = &self.nvenc.api;
         // Its buffers first, as the header asks; none is locked, since each
         // lock is undone before the call that made it returns.
@@ -838,7 +841,7 @@ impl Drop for Session {
             // point destroys, destroyed once, as the session goes.
             let status = unsafe { destroy(self.encoder, kept.handle) };
             if let Err(e) = self.check("destroying an NVENC buffer", status) {
-                log::warn!("{e}");
+                log::warn!(kind:% = e; "{e}");
             }
         }
         let Some(destroy) = api.nvEncDestroyEncoder else {
@@ -850,7 +853,7 @@ impl Drop for Session {
         let status = unsafe { destroy(self.encoder) };
         drop(current);
         if let Err(e) = check_status("nvEncDestroyEncoder", status, None) {
-            log::warn!("{e}");
+            log::warn!(kind:% = e; "{e}");
         }
     }
 }
@@ -877,7 +880,7 @@ impl Session {
             stuck: RefCell::new(None),
         };
         let Some(locks) = locks else {
-            log::error!("{what}: no thread finishes it, and it is leaked");
+            log::error!(kind:% = what; "{what}: no thread finishes it, and it is leaked");
             std::mem::forget(session);
             return;
         };
@@ -989,7 +992,7 @@ impl<'a> Locked<'a> {
 impl Drop for Locked<'_> {
     fn drop(&mut self) {
         if let Err(e) = self.release() {
-            log::warn!("{e}");
+            log::warn!(kind:% = e; "{e}");
         }
     }
 }

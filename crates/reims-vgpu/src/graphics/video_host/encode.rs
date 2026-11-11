@@ -516,7 +516,10 @@ fn finish_frames<P: Platform>(
             Err(error) => {
                 let failed = counts.lock().frames[2];
                 if failed < FAILURES_LOGGED {
-                    log::error!("hardware video: {name}: a frame was not encoded: {error}");
+                    log::error!(
+                        kind:% = error;
+                        "hardware video: {name}: a frame was not encoded: {error}"
+                    );
                 }
                 let result = RgfxVideoEncodeResult {
                     status: RGFX_VIDEO_ENCODE_FAILED,
@@ -550,7 +553,10 @@ fn finish_frames<P: Platform>(
         // The holds go, and the brackets end, before the guest may read them.
         drop((source, out));
         if let Err(raise) = event.set_signaled_value(value) {
-            log::error!("hardware video: {name}: the session's signal of {value}: {raise}");
+            log::error!(
+                kind:% = raise;
+                "hardware video: {name}: the session's signal of {value}: {raise}"
+            );
         }
     }
 }

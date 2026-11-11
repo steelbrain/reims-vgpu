@@ -342,7 +342,7 @@ impl<P: Platform> PresentQueue<P> {
             reims_vgpu_vulkan::core::raise::refusals::refusing(move || drop(waiting))
         {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = refusal;
                 "the presents waiting were dropped at the device's reset, and a texture's release \
                  was refused: {refusal}"
             );

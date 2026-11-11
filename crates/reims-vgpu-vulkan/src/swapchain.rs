@@ -392,7 +392,10 @@ impl Fences {
         match unsafe { vk.create_fence(&vk::FenceCreateInfo::default(), None) } {
             Ok(fence) => Some(fence),
             Err(e) => {
-                log::warn!(target: "reims_vgpu_vulkan::swapchain", "vkCreateFence: {e}");
+                log::warn!(
+                    target: "reims_vgpu_vulkan::swapchain", kind:? = e;
+                    "vkCreateFence: {e}"
+                );
                 None
             }
         }
@@ -796,7 +799,7 @@ impl Swapchain {
                 Ok(()) => self.refusing = false,
                 Err(e) if self.lost => {
                     log::warn!(
-                        target: "reims_vgpu_vulkan::swapchain",
+                        target: "reims_vgpu_vulkan::swapchain", kind:? = e;
                         "no swapchain ({e}): the surface is lost"
                     );
                     return Acquired::Failed;
@@ -804,7 +807,7 @@ impl Swapchain {
                 Err(e) => {
                     if !self.refusing {
                         log::warn!(
-                            target: "reims_vgpu_vulkan::swapchain",
+                            target: "reims_vgpu_vulkan::swapchain", kind:? = e;
                             "no swapchain yet ({e}): tried again at the next draw"
                         );
                     }
@@ -859,7 +862,7 @@ impl Swapchain {
             }
             Err(e) => {
                 log::warn!(
-                    target: "reims_vgpu_vulkan::swapchain",
+                    target: "reims_vgpu_vulkan::swapchain", kind:? = e;
                     "vkAcquireNextImageKHR: {e}: the window stops presenting"
                 );
                 Acquired::Failed
@@ -874,7 +877,10 @@ impl Swapchain {
             Ok(()) => {
                 // SAFETY: the fence has signalled, and nothing else waits on it.
                 if let Err(e) = unsafe { self.vk.reset_fences(&[self.fence]) } {
-                    log::warn!(target: "reims_vgpu_vulkan::swapchain", "vkResetFences: {e}");
+                    log::warn!(
+                        target: "reims_vgpu_vulkan::swapchain", kind:? = e;
+                        "vkResetFences: {e}"
+                    );
                     return Acquired::Failed;
                 }
                 self.pending = None;
@@ -888,7 +894,10 @@ impl Swapchain {
                 Acquired::Retry
             }
             Err(e) => {
-                log::warn!(target: "reims_vgpu_vulkan::swapchain", "vkWaitForFences: {e}");
+                log::warn!(
+                    target: "reims_vgpu_vulkan::swapchain", kind:? = e;
+                    "vkWaitForFences: {e}"
+                );
                 Acquired::Failed
             }
         }
@@ -961,7 +970,7 @@ impl Swapchain {
             // The image stays taken, its semaphore perhaps never signalled: the swapchain is
             // made again, which gives every image back.
             log::warn!(
-                target: "reims_vgpu_vulkan::swapchain",
+                target: "reims_vgpu_vulkan::swapchain", kind:? = e;
                 "a window frame was not scheduled ({e:?}): the swapchain is made again"
             );
             self.stale = true;
@@ -1021,7 +1030,10 @@ impl Swapchain {
             Ok(suboptimal) => self.stale |= suboptimal,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.stale = true,
             Err(e) => {
-                log::warn!(target: "reims_vgpu_vulkan::swapchain", "vkQueuePresentKHR: {e}");
+                log::warn!(
+                    target: "reims_vgpu_vulkan::swapchain", kind:? = e;
+                    "vkQueuePresentKHR: {e}"
+                );
                 self.stale = true;
             }
         }
@@ -1130,7 +1142,7 @@ impl Swapchain {
         // `None`: a recovery moved the queue, after it waited for the old one to idle (the
         // module doc, "Across the device's recoveries").
         if let Some(Err(e)) = idle {
-            log::warn!(target: "reims_vgpu_vulkan::swapchain", "vkQueueWaitIdle: {e}");
+            log::warn!(target: "reims_vgpu_vulkan::swapchain", kind:? = e; "vkQueueWaitIdle: {e}");
         }
         self.presents.idle();
         // Every enqueued present's fence has signalled.
@@ -1149,7 +1161,10 @@ impl Swapchain {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(e) => {
-                    log::warn!(target: "reims_vgpu_vulkan::swapchain", "vkGetFenceStatus: {e}");
+                    log::warn!(
+                        target: "reims_vgpu_vulkan::swapchain", kind:? = e;
+                        "vkGetFenceStatus: {e}"
+                    );
                     break;
                 }
             }

@@ -20,6 +20,21 @@
 //! evaluates its arguments only when a logger takes it, so no argument has an effect. A value a
 //! line shows that has one (a read of guest memory, a question to Metal) is read before the line,
 //! whether or not it is written.
+//!
+//! **A warn or error line is written once per kind.** Such a line says a fallback, a refusal or a
+//! failure, whose cause may come again at every event that meets it (a guest's message, a frame,
+//! an object's release). This logger writes the first line of each kind at its level, and each
+//! later one at debug, where the filter takes debug for its target, counting it ([`Kinds`]). A
+//! kind is the line's call site (its file and line) and, where the line names one, the class of
+//! its [`KIND`] key-value, which tells apart the causes one site reports: the cause itself,
+//! `log::warn!(target: "…", kind:% = error; "… was refused: {error}")`, whose text up to its
+//! first digit, quote or `;` is its class ([`class`]), so a size, an address or a name in it
+//! makes no kind of its own. An info line that names a [`KIND`] is written once per kind too: a
+//! fallback each session or object may take, said once per process. [`write_repeats`] writes how
+//! many lines of each kind came after its first since its last line, at a device's reset and at
+//! the process's exit (`crate::answer::write_counts`). Other info lines, and debug and trace
+//! lines, are written as they come: a line at info is never on a path every event takes
+//! (docs/conventions.md).
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -133,6 +148,158 @@ pub fn stderr_line(level: Level, target: &str, message: &str) -> String {
     format!("reims-vgpu {level} {target}: {message}\n")
 }
 
+/// The key-value a warn or error line names its cause by, where its call site reports more than
+/// one (the module docs): the [`class`] of its value's `Display` text, with the call site, is the
+/// line's kind.
+pub const KIND: &str = "kind";
+
+/// How many kinds of warn and error lines the logger tells apart; a line of a kind past them is
+/// written at debug, and counted with the others past them ([`Kinds::past`]).
+const KINDS_KEPT: usize = 256;
+
+/// The class of a cause's text, which a line's [`KIND`] names: its text up to its first ASCII
+/// digit, `"`, `` ` `` or `;`, less the spaces and opening punctuation it then ends with. What
+/// varies between causes of one class (a size, an address, an index, a quoted name, a clause of
+/// detail) comes after it: `too small: 16 x 16` is of the class `too small`,
+/// `NoFunction("main0")` of `NoFunction`.
+pub fn class(text: &str) -> &str {
+    let end = text
+        .find(|c: char| c.is_ascii_digit() || matches!(c, '"' | '`' | ';'))
+        .unwrap_or(text.len());
+    text[..end].trim_end_matches(|c: char| c.is_whitespace() || "([{<:,=#".contains(c))
+}
+
+/// The target of [`write_repeats`]'s line.
+const REPEATS_TARGET: &str = "reims_vgpu_vulkan::core::logging";
+
+/// How many characters of a kind's first line [`write_repeats`]'s line shows.
+const FIRST_SHOWN: usize = 120;
+
+/// A line's kind: its call site, and the [`class`] of the [`KIND`] it names ("" for none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Site {
+    file: &'static str,
+    line: u32,
+    kind: String,
+}
+
+impl Site {
+    /// `record`'s, where it is written once per kind (the module docs): a warn or error line, or
+    /// an info line that names a [`KIND`], whose call site is known, as it is for every line of
+    /// `log`'s macros.
+    fn of(record: &Record<'_>) -> Option<Site> {
+        let kind = (record.key_values().get(log::kv::Key::from_str(KIND)))
+            .map(|kind| class(&kind.to_string()).to_owned());
+        if record.level() > Level::Warn && (record.level() > Level::Info || kind.is_none()) {
+            return None;
+        }
+        Some(Site {
+            file: record.file_static()?,
+            line: record.line()?,
+            kind: kind.unwrap_or_default(),
+        })
+    }
+}
+
+/// The lines of one kind the logger wrote or counted.
+struct Kind {
+    site: Site,
+    /// The first line's target and message, cut to [`FIRST_SHOWN`] characters.
+    first: String,
+    /// How many lines of the kind came after the first.
+    after: u64,
+    /// Of them, how many [`write_repeats`] has counted.
+    counted: u64,
+}
+
+/// The kinds of warn and error lines the logger took, in the order of their first lines (the
+/// module docs). A process meets a few dozen at most, so a list serves.
+struct Kinds {
+    kept: Vec<Kind>,
+    /// Lines of kinds past the first [`KINDS_KEPT`], each written at debug.
+    past: u64,
+    /// Of them, how many [`write_repeats`] has counted.
+    past_counted: u64,
+}
+
+impl Kinds {
+    /// An empty list, for a `static`'s initializer.
+    const fn new() -> Kinds {
+        Kinds {
+            kept: Vec::new(),
+            past: 0,
+            past_counted: 0,
+        }
+    }
+
+    /// Notes a line of `site`: whether it is its kind's first, which is written at its level.
+    fn note(&mut self, site: &Site) -> bool {
+        if let Some(kind) = self.kept.iter_mut().find(|kind| kind.site == *site) {
+            kind.after += 1;
+            return false;
+        }
+        if self.kept.len() == KINDS_KEPT {
+            self.past += 1;
+            return false;
+        }
+        self.kept.push(Kind {
+            site: site.clone(),
+            first: String::new(),
+            after: 0,
+            counted: 0,
+        });
+        true
+    }
+
+    /// Keeps the first line of `site`'s kind, of `target` and `message`, for [`Self::repeats`].
+    fn describe(&mut self, site: &Site, target: &str, message: &str) {
+        if let Some(kind) = self.kept.iter_mut().find(|kind| kind.site == *site) {
+            let mut first = format!("{target}: {message}");
+            if let Some((cut, _)) = first.char_indices().nth(FIRST_SHOWN) {
+                first.truncate(cut);
+                first.push('…');
+            }
+            kind.first = first;
+        }
+    }
+
+    /// The line counting each kind that had lines after its first since the last count, in the
+    /// order of their first lines, then the lines of kinds past the first [`KINDS_KEPT`]; `None`
+    /// where there were none.
+    fn repeats(&mut self) -> Option<String> {
+        let mut line = String::new();
+        for kind in &mut self.kept {
+            let more = kind.after - kind.counted;
+            if more == 0 {
+                continue;
+            }
+            kind.counted = kind.after;
+            if !line.is_empty() {
+                line.push_str("; ");
+            }
+            let Site {
+                file,
+                line: at,
+                kind: named,
+            } = &kind.site;
+            let _ = write!(line, "{more} more of {file}:{at}");
+            if !named.is_empty() {
+                let _ = write!(line, " [{named}]");
+            }
+            let _ = write!(line, " ({})", kind.first);
+        }
+        let past = self.past - self.past_counted;
+        if past > 0 {
+            self.past_counted = self.past;
+            if !line.is_empty() {
+                line.push_str("; ");
+            }
+            let _ = write!(line, "{past} of kinds past the first {KINDS_KEPT}");
+        }
+        (!line.is_empty()).then(|| format!("lines repeated since the last count: {line}"))
+    }
+}
+
 /// The logger: the environment's filter, the host's hook, and stderr.
 struct Logger {
     /// `REIMS_VGPU_LOG`'s filter, read on first use; `None` if it is not set.
@@ -143,6 +310,8 @@ struct Logger {
     /// the lock for a line that is not written. Every encoder call of the Vulkan platform asks
     /// whether its debug line is on, from as many walk threads as run at once.
     hook_level: AtomicUsize,
+    /// The kinds of warn and error lines taken (the module docs).
+    kinds: Mutex<Kinds>,
 }
 
 /// A hook's level as [`Logger::hook_level`] keeps it: 0 for no hook, else the level's place in
@@ -164,6 +333,7 @@ impl Logger {
             env: OnceLock::new(),
             hook: Mutex::new(None),
             hook_level: AtomicUsize::new(0),
+            kinds: Mutex::new(Kinds::new()),
         }
     }
 
@@ -219,23 +389,69 @@ impl Log for Logger {
         }
         // The hook is called without the lock: it may write lines of its own, or be replaced.
         let hook = self.hook.lock().clone();
-        if record.level() > self.level(record.target(), hook.as_ref().map(|(level, _)| *level)) {
+        let up_to = self.level(record.target(), hook.as_ref().map(|(level, _)| *level));
+        if record.level() > up_to {
+            return;
+        }
+        // A warn or error line after its kind's first is a debug line, counted (the module
+        // docs).
+        let site = Site::of(record);
+        let first = (site.as_ref()).is_none_or(|site| self.kinds.lock().note(site));
+        let level = if first { record.level() } else { Level::Debug };
+        if level > up_to {
             return;
         }
         let mut message = String::new();
         // A `Display` impl that fails leaves what it wrote.
         let _ = write!(message, "{}", record.args());
-        match hook {
-            Some((_, hook)) => hook(record.level(), record.target(), &message),
-            None => {
-                let line = stderr_line(record.level(), record.target(), &message);
-                // One write per line, so lines from different threads do not interleave.
-                let _ = std::io::stderr().write_all(line.as_bytes());
-            }
+        if let (true, Some(site)) = (first, &site) {
+            self.kinds.lock().describe(site, record.target(), &message);
         }
+        write_to(hook, level, record.target(), &message);
     }
 
     fn flush(&self) {}
+}
+
+/// Writes `message`, a line of `level` and `target` the filter passed, to `hook`, or to stderr
+/// without one.
+fn write_to(hook: Option<HookEntry>, level: Level, target: &str, message: &str) {
+    match hook {
+        Some((_, hook)) => hook(level, target, message),
+        None => {
+            let line = stderr_line(level, target, message);
+            // One write per line, so lines from different threads do not interleave.
+            let _ = std::io::stderr().write_all(line.as_bytes());
+        }
+    }
+}
+
+impl Logger {
+    /// Writes the line counting the lines that came after their kind's first since the last
+    /// such line, where any did ([`Kinds::repeats`]): a summary, at info, under
+    /// [`REPEATS_TARGET`], where the filter takes it.
+    fn write_repeats(&self) {
+        let hook = self.hook.lock().clone();
+        if Level::Info > self.level(REPEATS_TARGET, hook.as_ref().map(|(level, _)| *level)) {
+            return;
+        }
+        let Some(line) = self.kinds.lock().repeats() else {
+            return;
+        };
+        write_to(hook, Level::Info, REPEATS_TARGET, &line);
+    }
+}
+
+/// Writes how many lines of each kind came after its first since the last count, one line at
+/// info (the module docs), where any did and the process's logger is this module's:
+/// `reims-vgpu INFO reims_vgpu_vulkan::core::logging: lines repeated since the last count: <n>
+/// more of <file>:<line>[ [<kind>]] (<the first line's target>: <its message>); …[; <n> of kinds
+/// past the first 256]`, the first line cut at 120 characters. A device's reset and the process's
+/// exit write it (`crate::answer::write_counts`).
+pub fn write_repeats() {
+    if OURS.get() == Some(&true) {
+        LOGGER.write_repeats();
+    }
 }
 
 static LOGGER: Logger = Logger::new();
@@ -314,7 +530,266 @@ mod tests {
             env: OnceLock::from(env.map(Filter::parse)),
             hook: Mutex::new(None),
             hook_level: AtomicUsize::new(0),
+            kinds: Mutex::new(Kinds::new()),
         }
+    }
+
+    /// `l` with a hook that keeps every line its filter passes.
+    fn hooked(l: &Logger) -> Seen {
+        let (seen, hook) = recording_hook();
+        l.keep(
+            &mut l.hook.lock(),
+            Some((LevelFilter::Trace, Arc::from(hook))),
+        );
+        seen
+    }
+
+    /// Writes `text` at `level` from the call site `x.rs:line`, naming `kind` where given, as
+    /// `log`'s macros do.
+    fn write_from(l: &Logger, level: Level, line: u32, kind: Option<&str>, text: &str) {
+        let kinds = kind.map(|kind| [(KIND, kind)]);
+        let none: [(&str, &str); 0] = [];
+        l.log(
+            &Record::builder()
+                .args(format_args!("{text}"))
+                .level(level)
+                .target("reims_vgpu::graphics")
+                .file_static(Some("x.rs"))
+                .line(Some(line))
+                .key_values(match &kinds {
+                    Some(kinds) => kinds as &dyn log::kv::Source,
+                    None => &none,
+                })
+                .build(),
+        );
+    }
+
+    /// The levels and messages `seen` kept, taken.
+    fn taken(seen: &Seen) -> Vec<(Level, String)> {
+        (seen.lock().drain(..))
+            .map(|(level, _, message)| (level, message))
+            .collect()
+    }
+
+    /// A warn or error line of a kind already written is a debug line, and counted: the count
+    /// names its call site and its first line, once
+    #[test]
+    fn a_kinds_later_lines_are_debug_lines_and_counted() {
+        let l = logger(Some("debug"));
+        let seen = hooked(&l);
+        write_from(&l, Level::Warn, 7, None, "refused 1");
+        write_from(&l, Level::Warn, 7, None, "refused 2");
+        write_from(&l, Level::Error, 9, None, "broken");
+        write_from(&l, Level::Warn, 7, None, "refused 3");
+        assert_eq!(
+            taken(&seen),
+            [
+                (Level::Warn, "refused 1".to_owned()),
+                (Level::Debug, "refused 2".to_owned()),
+                (Level::Error, "broken".to_owned()),
+                (Level::Debug, "refused 3".to_owned()),
+            ]
+        );
+        l.write_repeats();
+        assert_eq!(
+            taken(&seen),
+            [(
+                Level::Info,
+                "lines repeated since the last count: 2 more of x.rs:7 (reims_vgpu::graphics: \
+                 refused 1)"
+                    .to_owned()
+            )]
+        );
+        l.write_repeats();
+        assert_eq!(taken(&seen), [], "nothing repeated since");
+        write_from(&l, Level::Error, 9, None, "broken again");
+        l.write_repeats();
+        assert_eq!(
+            taken(&seen),
+            [
+                (Level::Debug, "broken again".to_owned()),
+                (
+                    Level::Info,
+                    "lines repeated since the last count: 1 more of x.rs:9 \
+                     (reims_vgpu::graphics: broken)"
+                        .to_owned()
+                ),
+            ]
+        );
+    }
+
+    /// A line naming a new kind at a site written before is written at its level; a line of a
+    /// kind written before, at debug
+    #[test]
+    fn a_new_kind_at_a_site_is_written_at_its_level() {
+        let l = logger(Some("debug"));
+        let seen = hooked(&l);
+        write_from(&l, Level::Warn, 7, Some("Abi"), "refused: abi");
+        write_from(&l, Level::Warn, 7, Some("Driver"), "refused: driver");
+        write_from(&l, Level::Warn, 7, Some("Abi"), "refused: abi again");
+        write_from(&l, Level::Warn, 7, None, "refused");
+        assert_eq!(
+            taken(&seen),
+            [
+                (Level::Warn, "refused: abi".to_owned()),
+                (Level::Warn, "refused: driver".to_owned()),
+                (Level::Debug, "refused: abi again".to_owned()),
+                (Level::Warn, "refused".to_owned()),
+            ]
+        );
+        l.write_repeats();
+        assert_eq!(
+            taken(&seen),
+            [(
+                Level::Info,
+                "lines repeated since the last count: 1 more of x.rs:7 [Abi] \
+                 (reims_vgpu::graphics: refused: abi)"
+                    .to_owned()
+            )]
+        );
+    }
+
+    /// Under a filter that takes no debug line, a kind's later lines are not written, but still
+    /// counted; info lines, and lines with no call site, are written at every occurrence
+    #[test]
+    fn a_kinds_later_lines_are_counted_where_debug_is_off() {
+        let l = logger(Some("info"));
+        let seen = hooked(&l);
+        for n in 0..3 {
+            write_from(&l, Level::Warn, 7, None, &format!("refused {n}"));
+            write_from(&l, Level::Info, 8, None, &format!("shown {n}"));
+        }
+        write(&l, Level::Warn, "reims_vgpu::graphics", "no site");
+        write(&l, Level::Warn, "reims_vgpu::graphics", "no site");
+        assert_eq!(
+            taken(&seen),
+            [
+                (Level::Warn, "refused 0".to_owned()),
+                (Level::Info, "shown 0".to_owned()),
+                (Level::Info, "shown 1".to_owned()),
+                (Level::Info, "shown 2".to_owned()),
+                (Level::Warn, "no site".to_owned()),
+                (Level::Warn, "no site".to_owned()),
+            ]
+        );
+        l.write_repeats();
+        assert_eq!(
+            taken(&seen),
+            [(
+                Level::Info,
+                "lines repeated since the last count: 2 more of x.rs:7 (reims_vgpu::graphics: \
+                 refused 0)"
+                    .to_owned()
+            )]
+        );
+    }
+
+    /// An info line that names a kind is written once per kind, its later lines at debug and
+    /// counted, as a warn line's
+    #[test]
+    fn an_info_line_naming_a_kind_is_written_once_per_kind() {
+        let l = logger(Some("debug"));
+        let seen = hooked(&l);
+        write_from(&l, Level::Info, 8, Some("in place"), "landed in place");
+        write_from(&l, Level::Info, 8, Some("copied"), "landed copied");
+        write_from(&l, Level::Info, 8, Some("in place"), "landed in place");
+        assert_eq!(
+            taken(&seen),
+            [
+                (Level::Info, "landed in place".to_owned()),
+                (Level::Info, "landed copied".to_owned()),
+                (Level::Debug, "landed in place".to_owned()),
+            ]
+        );
+        l.write_repeats();
+        assert_eq!(
+            taken(&seen),
+            [(
+                Level::Info,
+                "lines repeated since the last count: 1 more of x.rs:8 [in place] \
+                 (reims_vgpu::graphics: landed in place)"
+                    .to_owned()
+            )]
+        );
+    }
+
+    /// A kind's class is its text up to its first digit or quote: the causes one site reports
+    /// differ by it, and not by a size, an address or a name past it
+    #[test]
+    fn a_kinds_class_is_its_text_before_any_digit_or_quote() {
+        assert_eq!(class("Abi"), "Abi");
+        assert_eq!(class("too small: 16 x 16"), "too small");
+        assert_eq!(class("NoFunction(\"main0\")"), "NoFunction");
+        assert_eq!(class("ERROR_DEVICE_LOST"), "ERROR_DEVICE_LOST");
+        assert_eq!(
+            class("the library's function `f` is missing"),
+            "the library's function"
+        );
+        assert_eq!(class("0x1000"), "");
+        assert_eq!(class("nil; its functions: vertex"), "nil");
+
+        let l = logger(Some("debug"));
+        let seen = hooked(&l);
+        write_from(&l, Level::Warn, 7, Some("too small: 16 x 16"), "a");
+        write_from(&l, Level::Warn, 7, Some("too small: 8 x 8"), "b");
+        write_from(&l, Level::Warn, 7, Some("too large: 8 x 8"), "c");
+        assert_eq!(
+            taken(&seen),
+            [
+                (Level::Warn, "a".to_owned()),
+                (Level::Debug, "b".to_owned()),
+                (Level::Warn, "c".to_owned()),
+            ]
+        );
+    }
+
+    /// Past the first 256 kinds, a line of a new kind is written at debug and counted with the
+    /// others past them
+    #[test]
+    fn kinds_past_the_first_256_are_counted_together() {
+        let l = logger(Some("info"));
+        let seen = hooked(&l);
+        for line in 0..KINDS_KEPT as u32 + 2 {
+            write_from(&l, Level::Warn, line, None, "refused");
+        }
+        assert_eq!(taken(&seen).len(), KINDS_KEPT);
+        l.write_repeats();
+        assert_eq!(
+            taken(&seen),
+            [(
+                Level::Info,
+                "lines repeated since the last count: 2 of kinds past the first 256".to_owned()
+            )]
+        );
+    }
+
+    /// The count of a kind cuts its first line at 120 characters; under a filter that drops
+    /// info lines for its target, no count is written
+    #[test]
+    fn the_count_cuts_long_first_lines_and_follows_the_filter() {
+        let l = logger(Some("debug"));
+        let seen = hooked(&l);
+        let long = "x".repeat(200);
+        write_from(&l, Level::Warn, 7, None, &long);
+        write_from(&l, Level::Warn, 7, None, &long);
+        let _ = taken(&seen);
+        l.write_repeats();
+        let shown = format!("reims_vgpu::graphics: {long}");
+        let cut: String = shown.chars().take(FIRST_SHOWN).collect();
+        assert_eq!(
+            taken(&seen),
+            [(
+                Level::Info,
+                format!("lines repeated since the last count: 1 more of x.rs:7 ({cut}…)")
+            )]
+        );
+
+        let l = logger(Some("debug,reims_vgpu_vulkan::core::logging=error"));
+        let seen = hooked(&l);
+        write_from(&l, Level::Warn, 7, None, "refused");
+        write_from(&l, Level::Warn, 7, None, "refused");
+        l.write_repeats();
+        assert_eq!(taken(&seen).len(), 2, "the two lines, and no count");
     }
 
     fn write(l: &Logger, level: Level, target: &str, text: &str) {

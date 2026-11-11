@@ -1417,7 +1417,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             Ok(Some(Err(why))) => {
                 self.uncache_surface(device, pages.block_offset);
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:? = why;
                     "the IOSurface block of {:#x} bytes at {:#x}: no view of its {:#x} bytes in \
                      {} runs ({why:?}); the surface takes a copy block",
                     pages.block_size, pages.block_offset, pages.length, runs.len()
@@ -1427,7 +1427,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             Err(raise) => {
                 self.uncache_surface(device, pages.block_offset);
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:% = raise;
                     "the IOSurface block of {:#x} bytes at {:#x}: the platform raised at the \
                      buffer over its view ({raise:?}); the surface takes a copy block",
                     pages.block_size, pages.block_offset
@@ -1587,7 +1587,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 Ok(false) => RGFX_STATUS_REFUSED,
                 Err(raise) => {
                     log::warn!(
-                        target: "reims_vgpu::graphics",
+                        target: "reims_vgpu::graphics", kind:% = raise;
                         "the IOSurface block at {block:#x}: the platform raised at its \
                          deferred device cache ({raise:?}); its pages are named instead"
                     );
@@ -1663,7 +1663,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             match taken {
                 Some(Some(true)) => {
                     log::warn!(
-                        target: "reims_vgpu::graphics",
+                        target: "reims_vgpu::graphics", kind:% = why;
                         "the IOSurface block at {block:#x}: its deferred device cache took its {} \
                          runs copied, the host's CPU moving its bytes: {why}",
                         runs.len()
@@ -1675,7 +1675,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
         }
         log::warn!(
-            target: "reims_vgpu::graphics",
+            target: "reims_vgpu::graphics", kind:% = why;
             "the IOSurface block at {block:#x}: its deferred device cache took none of its {} \
              runs: {why}; the cache keeps its bytes, its pages not named",
             runs.len()
@@ -1804,7 +1804,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                  {length:#x} bytes; its buffers lie over its pages"
             ),
             Err(raise) => log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = raise;
                 "the IOSurface block at {block:#x}: the platform raised at its device cache \
                  ({raise:?}); its buffers lie over its pages"
             ),
@@ -1865,12 +1865,12 @@ impl<P: Platform> GraphicsDecoder<P> {
                 self.shared.surface_worker.drop_later(block, block, import);
             }
             Ok(Err(why)) => log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:? = why;
                 "the IOSurface block at {block:#x}: no device cache, and no view of its pages \
                  ({why:?}); its buffers are refused"
             ),
             Err(raise) => log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = raise;
                 "the IOSurface block at {block:#x}: no device cache, and the platform raised at \
                  the buffer over its view ({raise:?}); its buffers are refused"
             ),
@@ -1885,7 +1885,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         if let Err(raise) = self.surface_caches.released(device, block, Box::new(|| {})) {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = raise;
                 "the IOSurface block at {block:#x}: the platform raised at the copy of its device \
                  cache into its pages ({raise:?})"
             );
@@ -1962,7 +1962,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 slow.fetch_add(1, Ordering::Relaxed);
                 let ran = MonoTime::from_nanos(ran_at.load(Ordering::Relaxed));
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:% = what;
                     "the IOSurface block at {block:#x}: a {what} answered {} ms after it was \
                      asked: {} ms for its SURFACE_PAGES, {} ms behind the command buffers that \
                      may write its device cache, then {} ms for its copy into the pages",
@@ -2116,7 +2116,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             && let Err(raise) = refusing(|| release.signal(queue, &self.shared.commit_cancel))
         {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = raise;
                 "queue {queue_obj_id:#x}'s surface timeline was ended, and its last signal \
                  faulted: {raise}"
             );
@@ -2583,7 +2583,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             ObjHandle::SharedEvent(event) => {
                 if let Err(raise) = refusing(|| event.set_signaled_value(u64::MAX)) {
                     log::warn!(
-                        target: "reims_vgpu::graphics",
+                        target: "reims_vgpu::graphics", kind:% = raise;
                         "context {context}'s shared event {id:#x} was not set past every value at \
                          its close: {raise}"
                     );
@@ -2624,7 +2624,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                  close: the platform made no command buffer"
             ),
             Err(raise) => log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = raise;
                 "context {context}'s {plain} events were not signalled past every value at its \
                  close: {raise}"
             ),
@@ -2680,7 +2680,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let states = std::mem::take(&mut *shared.contexts.lock());
         if let Err(refusal) = refusals::refusing(move || drop(states)) {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = refusal;
                 "the contexts' tables were let go of at the device's reset, and a release was \
                  refused: {refusal}"
             );
@@ -2689,7 +2689,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let cache = shared.libraries.lock().take_cache();
         if let Err(refusal) = refusals::refusing(move || drop(cache)) {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = refusal;
                 "the library cache was let go of at the device's reset, and a release was \
                  refused: {refusal}"
             );
@@ -2791,7 +2791,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             Ok(sa) => answer(RGFX_STATUS_OK, sa.size, sa.align),
             Err(raise) => {
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:% = raise;
                     "heap texture size of format {}, type {}, {}x{}x{} not answered: {raise}",
                     m.desc.pixel_format,
                     m.desc.texture_type,
@@ -2889,7 +2889,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     && let Err(raise) = refusing(|| event.set_signaled_value(u64::MAX))
                 {
                     log::warn!(
-                        target: "reims_vgpu::graphics",
+                        target: "reims_vgpu::graphics", kind:% = raise;
                         "shared event {:#x}, the last holder of a closed context's, was not set \
                          past every value at its destroy: {raise}",
                         m.obj_id
@@ -3549,7 +3549,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let run = move || {
             if let Err(raise) = refusing(op) {
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:% = raise;
                     "{what} of object {obj_id:#x} was not carried out: the platform raised \
                      ({raise:?})"
                 );
@@ -5180,7 +5180,7 @@ impl<P: Platform> Closed<P> {
             && let Err(refusal) = refusals::refusing(move || drop(views))
         {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = refusal;
                 "context {context}'s pages blocks' views were let go of at its close, and a \
                  release was refused: {refusal}"
             );
@@ -5201,7 +5201,7 @@ pub(crate) fn drop_refused<T>(id: u64, value: T) {
 /// Logs the refused release of object `id` ([`drop_refused`]).
 fn refused_release(id: u64, refusal: &refusals::Refusal) {
     log::warn!(
-        target: "reims_vgpu::graphics",
+        target: "reims_vgpu::graphics", kind:% = refusal;
         "object {id:#x} was let go of, and its release was refused: {refusal}"
     );
 }

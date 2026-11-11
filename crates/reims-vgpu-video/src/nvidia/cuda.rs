@@ -355,7 +355,7 @@ impl Drop for Gpu {
         // the Gpu, since everything that uses it holds it.
         let result = unsafe { (self.cuda.f.cuDevicePrimaryCtxRelease)(self.device) };
         if let Err(e) = self.cuda.check("cuDevicePrimaryCtxRelease", result) {
-            log::warn!("{e}");
+            log::warn!(kind:% = e; "{e}");
         }
     }
 }
@@ -424,7 +424,7 @@ impl Drop for Stream {
         // wait for it.
         let result = unsafe { (cuda.f.cuStreamDestroy_v2)(self.handle) };
         if let Err(e) = cuda.check("cuStreamDestroy", result) {
-            log::warn!("{e}");
+            log::warn!(kind:% = e; "{e}");
         }
     }
 }
@@ -491,7 +491,7 @@ impl Drop for Pinned {
         // SAFETY: allocated by cuMemHostAlloc, freed once.
         let result = unsafe { (cuda.f.cuMemFreeHost)(self.at.cast::<c_void>()) };
         if let Err(e) = cuda.check("cuMemFreeHost", result) {
-            log::warn!("{e}");
+            log::warn!(kind:% = e; "{e}");
         }
     }
 }
@@ -513,7 +513,7 @@ impl Drop for Current<'_> {
         // ours; the pointer is to a live CUcontext.
         let result = unsafe { (self.gpu.cuda.f.cuCtxPopCurrent_v2)(&raw mut popped) };
         match self.gpu.cuda.check("cuCtxPopCurrent", result) {
-            Err(e) => log::warn!("{e}"),
+            Err(e) => log::warn!(kind:% = e; "{e}"),
             Ok(()) if popped != self.gpu.context => {
                 log::warn!("cuCtxPopCurrent popped another context than the GPU's");
             }

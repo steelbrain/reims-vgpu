@@ -111,14 +111,14 @@ pub fn run_completed(
 ) {
     let info = carried.run(read).unwrap_or_else(|refusal| {
         log::warn!(
-            target: "reims_vgpu::refused",
+            target: "reims_vgpu::refused", kind:% = refusal;
             "a command buffer's completion was refused, and the command buffer failed: {refusal}"
         );
         CompletedInfo::refused(&refusal)
     });
     if let Err(refusal) = carried.run(|| block(info)) {
         log::warn!(
-            target: "reims_vgpu::refused",
+            target: "reims_vgpu::refused", kind:% = refusal;
             "a command buffer's completed handler was refused: {refusal}"
         );
     }

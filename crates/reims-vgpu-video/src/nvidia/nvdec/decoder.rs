@@ -304,7 +304,7 @@ impl Made {
             let _current = match self.gpu.push() {
                 Ok(current) => current,
                 Err(e) => {
-                    log::warn!("an NVDEC decoder is left undestroyed: {e}");
+                    log::warn!(kind:% = e; "an NVDEC decoder is left undestroyed: {e}");
                     return;
                 }
             };
@@ -312,7 +312,7 @@ impl Made {
             // destroyed once, when no picture holds it and no decoder took it.
             let result = unsafe { (self.nvdec.f.cuvidDestroyDecoder)(self.handle) };
             if let Err(e) = self.gpu.cuda().check("cuvidDestroyDecoder", result) {
-                log::warn!("{e}");
+                log::warn!(kind:% = e; "{e}");
             }
         }
         drop(self.stream);
@@ -797,6 +797,7 @@ impl Staging {
             Ok(pinned) => Staging::Pinned(pinned),
             Err(error) => {
                 log::warn!(
+                    kind:% = error;
                     "no page-locked staging memory of {needed} bytes, so this decoder's \
                      pictures are copied through pageable memory: {error}"
                 );
@@ -1293,7 +1294,7 @@ impl Drop for UnfinishedPicture {
         // `calls` with the context pushed, once the copies from it are done.
         let result = unsafe { (inner.nvdec.f.cuvidUnmapVideoFrame64)(inner.handle(), address) };
         if let Err(e) = inner.gpu.cuda().check("cuvidUnmapVideoFrame64", result) {
-            log::warn!("{e}");
+            log::warn!(kind:% = e; "{e}");
         }
     }
 }
@@ -1375,7 +1376,7 @@ impl<'a> MappedFrame<'a> {
 impl Drop for MappedFrame<'_> {
     fn drop(&mut self) {
         if let Err(e) = self.release() {
-            log::warn!("{e}");
+            log::warn!(kind:% = e; "{e}");
         }
     }
 }

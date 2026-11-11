@@ -166,8 +166,6 @@ pub(crate) struct ScanoutDraw<P: Platform> {
     color_pipelines: Mutex<ColorPipelines<P>>,
     /// The colour's buffers, made for the colour of that count of changes.
     color_buffers: Mutex<Option<(u64, ColorBuffers<P>)>>,
-    /// Whether a draw was refused yet: the first refusal is logged at WARN ([`Self::scoped`]).
-    refused: AtomicBool,
     /// The colour's table last drawn (the module doc).
     color_table: Mutex<Option<ColorTable<P>>>,
     /// The ramps the tables of surfaces are drawn from, by pixel format, made at their first use.
@@ -458,7 +456,6 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             color_functions: std::sync::OnceLock::new(),
             color_pipelines: Mutex::default(),
             color_buffers: Mutex::default(),
-            refused: AtomicBool::new(false),
             color_table: Mutex::new(None),
             ramps: Mutex::default(),
             scanout_ramp: std::sync::OnceLock::new(),
@@ -479,18 +476,12 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         match refusals::refusing(draw) {
             Ok(drawn) => drawn,
             Err(refusal) => {
-                if self.refused.swap(true, Ordering::AcqRel) {
-                    log::debug!(
-                        target: "reims_vgpu::graphics",
-                        "a draw of the display was refused: {refusal}"
-                    );
-                } else {
-                    log::warn!(
-                        target: "reims_vgpu::graphics",
-                        "a draw of the display was refused, and the window keeps the frame it \
-                         shows: {refusal} (later refusals are logged at debug)"
-                    );
-                }
+                // Once per kind of refusal; later ones at debug, counted (`core::logging`).
+                log::warn!(
+                    target: "reims_vgpu::graphics", kind:% = refusal;
+                    "a draw of the display was refused, and the window keeps the frame it shows: \
+                     {refusal}"
+                );
                 None
             }
         }

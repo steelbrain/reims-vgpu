@@ -892,7 +892,7 @@ impl<P: Platform> Presented<P> {
             reims_vgpu_vulkan::core::raise::refusals::refusing(move || drop(shown))
         {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = refusal;
                 "the texture of IOSurface {previous} was let go of, and its release was refused: \
                  {refusal}"
             );
@@ -925,7 +925,7 @@ impl<P: Platform> Presented<P> {
             reims_vgpu_vulkan::core::raise::refusals::refusing(move || drop(shown))
         {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = refusal;
                 "the texture of IOSurface {previous} was let go of at the device's reset, and its \
                  release was refused: {refusal}"
             );
@@ -1156,7 +1156,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 Box::new(move || drop(held)),
                 Box::new(move |raise| {
                     log::warn!(
-                        target: "reims_vgpu::graphics",
+                        target: "reims_vgpu::graphics", kind:% = raise;
                         "the block at {offset:#x}: the platform raised at its device cache's \
                          write back ({raise:?})"
                     );
@@ -1474,7 +1474,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             Ok(Err(e)) => {
                 let (ty, seqno, obj_id) = message_identity(message);
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:? = e;
                     "a message (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) was not \
                      carried out: {e:?}"
                 );
@@ -1485,7 +1485,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             Err(raise) => {
                 let (ty, seqno, obj_id) = message_identity(message);
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:% = raise;
                     "a message (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) faulted: \
                      {raise}"
                 );
@@ -1699,7 +1699,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             Err(e) => {
                 let (ty, seqno, obj_id) = message_identity(message);
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:? = e;
                     "a pipeline create (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) was not \
                      carried out: {e:?}"
                 );
@@ -1731,7 +1731,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             let compiled = compile_refusing::<P>(&self.device, job);
             if let Some(reason) = compiled.refusal() {
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:% = reason;
                     "a pipeline create (seqno {seqno}, object {obj_id:#x}) was refused: {reason}"
                 );
             }
@@ -1837,7 +1837,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let answer = entry::run(|_| refusing(|| decoder.sampler_state(&self.device, message)));
         let answer = answer.unwrap_or_else(|raise| {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = raise;
                 "a sampler create (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) faulted: \
                  {raise}"
             );
@@ -1974,7 +1974,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let answer = entry::run(|_| refusing(|| decoder.icb_state(&self.device, message)));
         let answer = answer.unwrap_or_else(|raise| {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = raise;
                 "an indirect command buffer create (type {ty:#x}, seqno {seqno}, object \
                  {obj_id:#x}) faulted: {raise}"
             );
@@ -2008,7 +2008,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let (seqno, status) = answer.unwrap_or((Some(seqno), RGFX_STATUS_REFUSED));
         if status != RGFX_STATUS_OK {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = status;
                 "an argument layout (type {ty:#x}, object {obj_id:#x}) was answered status \
                  {status}"
             );
@@ -2034,7 +2034,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             LibraryStart::Refused { error, answer } => {
                 let (ty, seqno, obj_id) = message_identity(message);
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:? = error;
                     "a library create (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) was not \
                      carried out: {error:?}"
                 );
@@ -2073,7 +2073,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             if status != RGFX_STATUS_OK {
                 let reason = reason.as_deref().unwrap_or("it was cancelled");
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:% = reason;
                     "a library create (seqno {seqno}, object {obj_id:#x}) was refused: {reason}"
                 );
             }
@@ -2101,7 +2101,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 entry::run(|_| decoder.fill_presented(&self.device, iosurface_id, generation));
             filled.unwrap_or_else(|raise| {
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:% = raise;
                     "IOSurface {iosurface_id}: the platform raised at its device cache's fill for \
                      a present ({raise:?})"
                 );
@@ -2144,7 +2144,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     fn display_color(&self, color: &RgfxDisplayColor, entries: &[RgfxColorEntry]) {
         if let Err(dropped) = self.color.lock().part(color, entries) {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:? = dropped;
                 "a display colour part of transaction {} (stage {}, entries {} on of {}, {} \
                  carried) was dropped ({dropped:?}): the stage keeps its table",
                 color.transaction_id,
@@ -2648,6 +2648,7 @@ fn reserve_guest_texture_ids<P: Platform>(platform: &P, device: &P::Device) {
     let ids: Vec<u64> = guest_texture_ids().collect();
     if let Err(raise) = refusing(|| device.reserve_resource_indices(0, &ids)) {
         log::error!(
+            kind:% = raise;
             "the guest's texture resource ids are not reserved ({raise}): its textures may \
              share ids with the host's"
         );

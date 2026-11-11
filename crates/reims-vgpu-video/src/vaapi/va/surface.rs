@@ -643,6 +643,7 @@ impl Surface {
             Ok(read) => read,
             Err(Fallback::Staged(error)) => {
                 log::warn!(
+                    kind:% = error;
                     "the staged copy back failed, so this pool's frames come back through \
                      vaGetImage from now on: {error}"
                 );

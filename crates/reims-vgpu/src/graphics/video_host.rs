@@ -858,14 +858,20 @@ fn land_pictures<P: Platform>(
                 let mut counts = counts.lock();
                 counts.failed += 1;
                 if counts.failed <= FAILURES_LOGGED {
-                    log::error!("hardware video: {name}: a picture did not land: {error}");
+                    log::error!(
+                        kind:% = error;
+                        "hardware video: {name}: a picture did not land: {error}"
+                    );
                 }
             }
         }
         // The output's holds go, and its bracket ends, before the guest may read it.
         drop((output, _bitstream));
         if let Err(raise) = event.set_signaled_value(value) {
-            log::error!("hardware video: {name}: the session's signal of {value}: {raise}");
+            log::error!(
+                kind:% = raise;
+                "hardware video: {name}: the session's signal of {value}: {raise}"
+            );
         }
     }
 }

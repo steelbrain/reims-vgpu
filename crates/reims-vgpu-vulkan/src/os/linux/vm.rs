@@ -403,7 +403,7 @@ fn no_space(what: &str) -> KernReturn {
     let at_limit = at_the_limit(&mappings, &limit);
     if at_limit && AT_LIMIT.with(|a| a.replace(a.get().map(|_| true)).is_some()) {
         log::warn!(
-            target: "reims_vgpu_vulkan::os",
+            target: "reims_vgpu_vulkan::os", kind:% = what;
             "{what}: the kernel refused the map at the process's limit of mappings, {mappings} of \
              vm.max_map_count {limit} held, {} of them the library's views of memory: folding the \
              views no import holds, to try again",
@@ -424,7 +424,7 @@ fn no_space(what: &str) -> KernReturn {
         return NO_SPACE;
     }
     log::error!(
-        target: "reims_vgpu_vulkan::os",
+        target: "reims_vgpu_vulkan::os", kind:% = what;
         "{what}: the kernel refused the map (ENOMEM): the process has {mappings} mappings, \
          vm.max_map_count is {limit}"
     );

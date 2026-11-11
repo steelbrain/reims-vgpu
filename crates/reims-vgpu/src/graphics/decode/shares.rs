@@ -429,7 +429,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             && let Err(raise) = super::refusing(|| event.set_signaled_value(u64::MAX))
         {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = raise;
                 "shared event named {:#x} was not set past every value at its last hold's going: \
                  {raise}",
                 m.name

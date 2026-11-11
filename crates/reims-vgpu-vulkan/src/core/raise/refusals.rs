@@ -108,7 +108,7 @@ pub fn refusing<T>(f: impl FnOnce() -> T) -> Result<T, Refusal> {
             Err(other) => match panic_message(&*other) {
                 Some(message) if panics_refused() => {
                     log::error!(
-                        target: "reims_vgpu::refused",
+                        target: "reims_vgpu::refused", kind:% = message;
                         "a panic in a refusal scope, a bug, refused the op it met: {message}"
                     );
                     Err(Refusal {

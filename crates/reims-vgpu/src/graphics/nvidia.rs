@@ -344,7 +344,10 @@ fn supported(gpu: &Gpu, codec: NvdecCodec, bit_depth: u32) -> Option<DecodeCapab
         Ok(caps) if caps.supported => Some(caps),
         Ok(_) => None,
         Err(error) => {
-            log::warn!("hardware video: {NAME}'s caps of {codec:?} at {bit_depth} bits: {error}");
+            log::warn!(
+                kind:% = error;
+                "hardware video: {NAME}'s caps of {codec:?} at {bit_depth} bits: {error}"
+            );
             None
         }
     }

@@ -349,7 +349,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         if let Some((op, index, why)) = first {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = why;
                 "indirect command buffer {:#x}: {refused} of {records} records not carried out; \
                  the first, op {op:#04x} at command {index}: {why}",
                 m.obj_id
@@ -383,7 +383,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         if let Some((icb, index, why)) = &tally.first {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = why;
                 "ICB_SLOTS of {} runs (the first on buffer {:#x}): {} of {} runs and fields not \
                  carried out; the first, buffer {icb:#x} at command {index}: {why}",
                 m.run_count,

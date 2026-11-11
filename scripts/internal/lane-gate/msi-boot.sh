@@ -74,6 +74,16 @@ START=$(date +%s)
 T0=$START
 log() { echo "$(date +%T) $*" | tee -a "$R/boot.log"; }
 kv() { echo "$1 $2" >> "$R/host.txt"; }
+# How many lines of the warning whose message starts with $1 (an ERE) the library wrote into log
+# $2: the library writes the first of each kind at warn and the later ones at debug, counting them
+# in its line of repeats at each reset and at the exit (docs/conventions.md), "<n> more of
+# <file>:<line>[ [<kind>]] (<target>: <the first line's message>)".
+warned() {
+  local first more
+  first=$(grep -cE " WARN [^ ]+: $1" "$2")
+  more=$(grep -oE "[0-9]+ more of [^ ]+( \[[^]]*\])? \([^ ]+: $1" "$2" | awk '{ s += $1 } END { print s + 0 }')
+  echo $((first + more))
+}
 # The host CPU's heat now: "PKG_C PKG_COUNT PKG_MS CORE_COUNT CORE_MS" (thermal.txt's fields, the
 # counters the largest over the CPUs), read with the shell's own read, as a sampler does it once a
 # second over 30-odd CPUs.
@@ -218,7 +228,7 @@ finish() {
     # whose runs were not all carried out.
     kv queues_unshared "$(grep -c 'made unshared' "$B/launch.log")"
     kv submit_room_posted "$(grep -c 'SUBMIT_ROOM posted' "$B/launch.log")"
-    kv icb_slots_refused "$(grep -c 'ICB_SLOTS of .* not carried out' "$B/launch.log")"
+    kv icb_slots_refused "$(warned 'ICB_SLOTS of' "$B/launch.log")"
     # The boot's hold of host quiet: HOST_QUIET where no build ran beside QEMU, HOST_NOT_QUIET where
     # the wait for running builds ran out (msi-launch.sh).
     case $(grep -m1 -o -E 'HOST_(NOT_)?QUIET' "$B/launch.log") in

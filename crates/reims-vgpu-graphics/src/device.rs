@@ -1573,7 +1573,7 @@ impl Shared {
                     }
                     Err(broken) => {
                         log::error!(
-                            target: "reims_vgpu_graphics",
+                            target: "reims_vgpu_graphics", kind:% = broken;
                             "the control submission ring is broken ({broken}): it takes nothing \
                              more until the device is reset"
                         );
@@ -1702,7 +1702,7 @@ impl Shared {
                 Posted::NoRoom => return Post::NoRoom,
                 Posted::Broken(broken) => {
                     log::warn!(
-                        target: "reims_vgpu_graphics",
+                        target: "reims_vgpu_graphics", kind:% = broken;
                         "the control completion ring is broken ({broken}): an event is dropped"
                     );
                     return Post::Dropped;
@@ -2349,7 +2349,7 @@ impl Shared {
                 }
                 if let Err(broken) = &next {
                     log::error!(
-                        target: "reims_vgpu_graphics",
+                        target: "reims_vgpu_graphics", kind:% = broken;
                         "queue {:#x}'s submission ring is broken ({broken}): it takes nothing \
                          more until the device is reset", queue.obj_id
                     );
@@ -2602,7 +2602,7 @@ impl Shared {
                 Posted::NoRoom => return Post::NoRoom,
                 Posted::Broken(broken) => {
                     log::warn!(
-                        target: "reims_vgpu_graphics",
+                        target: "reims_vgpu_graphics", kind:% = broken;
                         "queue {:#x}'s completion ring is broken ({broken}): an event is dropped",
                         queue.obj_id
                     );

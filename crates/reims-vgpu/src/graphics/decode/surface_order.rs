@@ -616,7 +616,7 @@ impl<P: Platform> SurfaceOrder<P> {
                 && let Err(refusal) = refusals::refusing(move || drop(q.event))
             {
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:% = refusal;
                     "queue {id:#x}'s surface timeline was let go of, and its release was \
                      refused: {refusal}"
                 );
@@ -631,7 +631,7 @@ impl<P: Platform> SurfaceOrder<P> {
         let queues = std::mem::take(&mut self.queues);
         if let Err(refusal) = refusals::refusing(move || drop(queues)) {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = refusal;
                 "the surface timelines were let go of at the device's reset, and a release was \
                  refused: {refusal}"
             );

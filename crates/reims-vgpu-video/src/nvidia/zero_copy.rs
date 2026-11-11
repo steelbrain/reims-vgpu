@@ -115,7 +115,7 @@ impl Drop for Registration {
             (registration.cuMemHostUnregister)(self.view.first.as_ptr().cast::<c_void>())
         };
         if let Err(error) = cuda.check("cuMemHostUnregister", result) {
-            log::warn!("{error}");
+            log::warn!(kind:% = error; "{error}");
         }
     }
 }

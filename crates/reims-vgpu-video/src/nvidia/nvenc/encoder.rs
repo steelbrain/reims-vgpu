@@ -535,10 +535,10 @@ impl Drop for NvencEncoder {
             match self.flush() {
                 Ok(bitstreams) => {
                     for e in bitstreams.into_iter().filter_map(Result::err) {
-                        log::warn!("{e}");
+                        log::warn!(kind:% = e; "{e}");
                     }
                 }
-                Err(e) => log::warn!("{e}"),
+                Err(e) => log::warn!(kind:% = e; "{e}"),
             }
         }
         // The session destroys its buffers, then itself, as its field

@@ -150,12 +150,12 @@ impl Drop for ImportedBuffer {
         // reference says a mapped buffer is.
         let freed = unsafe { (cuda.f.cuMemFree_v2)(self.address) };
         if let Err(error) = cuda.check("cuMemFree", freed) {
-            log::warn!("{error}");
+            log::warn!(kind:% = error; "{error}");
         }
         // SAFETY: imported by `import`, destroyed once, its mapping freed above.
         let destroyed = unsafe { (external.cuDestroyExternalMemory)(self.memory) };
         if let Err(error) = cuda.check("cuDestroyExternalMemory", destroyed) {
-            log::warn!("{error}");
+            log::warn!(kind:% = error; "{error}");
         }
     }
 }

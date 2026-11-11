@@ -725,7 +725,7 @@ impl Progress {
         };
         let refused = |what: &str, refusal: refusals::Refusal| {
             log::warn!(
-                target: "reims_vgpu::refused",
+                target: "reims_vgpu::refused", kind:% = refusal;
                 "a command buffer's {what} as it ended was refused: {refusal}"
             );
         };
@@ -794,7 +794,7 @@ impl Ending {
                 && let Err(refusal) = carried.run(|| refused(sel))
             {
                 log::warn!(
-                    target: "reims_vgpu::refused",
+                    target: "reims_vgpu::refused", kind:% = refusal;
                     "a refused command buffer's execution of an indirect command buffer: {refusal}"
                 );
             }

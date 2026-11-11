@@ -1826,7 +1826,7 @@ impl<P: Platform> SurfaceCaches<P> {
         }
         if let Err(raise) = event.set_signaled_value(cache.made) {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = raise;
                 "the IOSurface block at {block:#x}: the platform raised at the set of its device \
                  cache's new event ({raise:?}); its deferred copies are waited for on the CPU"
             );
@@ -2014,7 +2014,7 @@ impl<P: Platform> SurfaceCaches<P> {
                     Ok(made) => made,
                     Err(raise) => {
                         log::warn!(
-                            target: "reims_vgpu::graphics",
+                            target: "reims_vgpu::graphics", kind:% = raise;
                             "the IOSurface block at {block:#x}: the platform raised at a fill of \
                              its device cache made behind the command buffers it waited for \
                              ({raise:?}); it is not made"
@@ -2094,7 +2094,7 @@ impl<P: Platform> SurfaceCaches<P> {
             );
             if let Err(raise) = event.set_signaled_value(number) {
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:% = raise;
                     "the IOSurface block at {block:#x}: the platform raised at the set of its \
                      device cache's event ({raise:?})"
                 );
@@ -2629,7 +2629,7 @@ impl<P: Platform> SurfaceCaches<P> {
         }
         self.counts.behind += 1;
         log::warn!(
-            target: "reims_vgpu::graphics",
+            target: "reims_vgpu::graphics", kind:% = message;
             "the IOSurface block at {block:#x}: a {message} of its device cache, of CPU \
              generation {held}, copies nothing: the CPU's generation moved to {cpu} under a lock \
              that did not wait for the copy"
@@ -2816,7 +2816,7 @@ impl<P: Platform> SurfaceCaches<P> {
         }
         if let Err(refusal) = refusals::refusing(move || drop((caches, ends, deferred))) {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = refusal;
                 "the IOSurface device caches were let go of at the device's reset, and a release \
                  was refused: {refusal}"
             );
@@ -3178,7 +3178,7 @@ impl<P: Platform> Caches<P> {
                 refusals::refusing(move || drop((end, made, read_back_end, swept)))
         {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = refusal;
                 "queue {queue:#x}'s spare end event or transfer queue, or a gone queue's end \
                  event, was let go of, and its release was refused: {refusal}"
             );
@@ -3196,7 +3196,7 @@ impl<P: Platform> Caches<P> {
         }
         if let Err(refusal) = refusals::refusing(move || drop(ends)) {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = refusal;
                 "queue {queue:#x}'s end event, or another gone queue's, was let go of, and its \
                  release was refused: {refusal}"
             );
@@ -3461,7 +3461,7 @@ impl<P: Platform> Caches<P> {
             && let Err(refusal) = refusals::refusing(move || drop(spare))
         {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = refusal;
                 "a device cache's spare event was let go of, and its release was refused: \
                  {refusal}"
             );
@@ -3558,7 +3558,7 @@ impl<P: Platform> Caches<P> {
             && let Err(raise) = refusing(|| state.early_copies(queue, on, &uses.blocks))
         {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = raise;
                 "queue {queue:#x}: the platform raised at an early copy of a device cache into \
                  its pages ({raise:?}); the lock that follows downloads it"
             );
@@ -4241,7 +4241,7 @@ fn copy<P: Platform>(
                     cache.pages = Some(CachePages::View(import));
                 }
                 Err(why) => log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:? = why;
                     "the IOSurface block at {block:#x}: the platform refused a copy by its pages' \
                      runs, and no view of them was made ({why:?}); the copy is not made"
                 ),

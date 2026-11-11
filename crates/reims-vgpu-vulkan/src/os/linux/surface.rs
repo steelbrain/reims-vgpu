@@ -464,7 +464,7 @@ fn view(runs: &[std::ops::Range<u64>], length: u64, zeros: u64, read_only: bool)
     .ok()?;
     let refused = |what: &str| {
         log::warn!(
-            target: "reims_vgpu_vulkan::os",
+            target: "reims_vgpu_vulkan::os", kind:% = what;
             "IOSurface over the guest's pages: {what}; refused"
         );
         let _ = vm.deallocate(at, whole);

@@ -1425,7 +1425,7 @@ impl<P: Platform> SurfaceViews<P> {
         self.laid_out.clear();
         if let Err(refusal) = refusals::refusing(move || drop((views, private, cache))) {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = refusal;
                 "the IOSurface views were let go of at the device's reset, and a release was \
                  refused: {refusal}"
             );

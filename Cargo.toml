@@ -55,8 +55,9 @@ lzma-rs = "0.3.0"
 # core (architecture 2.2)
 parking_lot = "0.12.5"
 zerocopy = { version = "0.8.27", features = ["derive"] }
-# every crate's lines, and the default stderr logger (core::logging)
-log = "0.4.34"
+# every crate's lines, and the default stderr logger (core::logging); `kv` for a line's `kind`,
+# which tells the logger's kinds apart at one call site
+log = { version = "0.4.34", features = ["kv"] }
 # The macOS sides of the crates. objc2 `exception` is always on; `catch-all` is never enabled
 # (architecture 2.3). objc2's checks (a message to nil, a missing method, the encodings) are
 # debug assertions: on in dev, off in `checked` (the objc2 profile override below).

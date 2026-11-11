@@ -478,7 +478,7 @@ fn create_buffer<T>(
 
 /// Logs that `sel` answered nil, its buffer refused for `why`.
 fn no_buffer(sel: &'static str, why: &dyn std::fmt::Display) {
-    log::warn!(target: "reims_vgpu_vulkan::gpu", "{sel} answered nil: {why}");
+    log::warn!(target: "reims_vgpu_vulkan::gpu", kind:% = why; "{sel} answered nil: {why}");
 }
 
 /// What Metal answers where the runtime refuses a buffer or heap made at `placing`'s address:
