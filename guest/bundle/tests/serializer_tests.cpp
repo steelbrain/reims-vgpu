@@ -569,6 +569,8 @@ void test_caps()
 	info.write_rounding_modes[1] = 1; // mode 2
 	info.limits[kRgfxLimitDeviceLinearTextureAlignmentBytes] = 64;
 	info.limits[kRgfxLimitLinearTextureAlignmentBytes] = 256;
+	info.limits[kRgfxLimitIOSurfaceReadOnlyTextureAlignmentBytes] = 32;
+	info.limits[kRgfxLimitIOSurfaceTextureAlignmentBytes] = 128;
 	info.limits[kRgfxLimitMaxViewportCount] = 16; // last by position
 	info.flags[kRgfxFlagAreRasterOrderGroupsSupported] = 1; // first by position
 	info.flags[kRgfxFlagSupportsTileShaders] = 1;           // last by position
@@ -628,6 +630,10 @@ void test_caps()
 	CHECK(caps.supportsWriteRoundingMode(2));
 	CHECK(!caps.supportsWriteRoundingMode(1));
 	CHECK(caps.limit(kRgfxLimitDeviceLinearTextureAlignmentBytes) == 64);
+	// The IOSurface alignments the device answers, at their places between the linear ones.
+	CHECK(caps.limit(kRgfxLimitIOSurfaceReadOnlyTextureAlignmentBytes) == 32);
+	CHECK(caps.limit(kRgfxLimitIOSurfaceTextureAlignmentBytes) == 128);
+	CHECK(caps.limit(kRgfxLimitLinearTextureAlignmentBytes) == 256);
 	CHECK(caps.limit(kRgfxLimitMaxViewportCount) == 16);
 	CHECK(caps.flag(kRgfxFlagAreRasterOrderGroupsSupported));
 	CHECK(caps.flag(kRgfxFlagSupportsTileShaders));

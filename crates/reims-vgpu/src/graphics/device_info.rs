@@ -359,16 +359,24 @@ fn lane_max_buffer_length(platform: Option<u64>, working_set: Option<u64>) -> Op
 /// dma-buf pages in place only with its rows a multiple of 256 bytes apart (metal2vulkan's
 /// `dma_buf.rs`, measured on Mesa 26.0.8 and 26.2.4), and shadows one at any other pitch; how many
 /// of a guest's textures this moves in place is unmeasured. Any 256-byte layout is one the
-/// platform's 16 takes too. An IOSurface's rows follow none of the device's answers: a surface made
-/// with no pitch named (`IOSurfaceCreate`, and CoreVideo's buffers and pools) takes rows at
-/// IOSurface's own alignment, `IOSurfaceGetPropertyAlignment(kIOSurfaceBytesPerRow)`, 64 bytes on
-/// the 5300M's Mac (macOS 26.7.1), whose device answers this 256 and
-/// `iosurfaceTextureAlignmentBytes` 16: 4032 bytes for 1001 `BGRA` pixels, 7360 for 1831 and 14656
-/// for 3662, the pitches metal2vulkan measured a macOS 26.7.2 guest's surfaces at on RADV. So on
-/// RADV a texture over such a surface at a pitch that is not a multiple of 256 is the runtime's
-/// shadow (its refused pitch), which no answer here moves in place: in two cold boots of that guest
-/// on a Radeon 780M, 583 and 639 textures over the guest's pages were shadows for their pitch,
-/// against 532 and 503 in place.
+/// platform's 16 takes too. An IOSurface's rows follow two other answers. A surface made with no
+/// pitch named (`IOSurfaceCreate`, and CoreVideo's buffers and pools) takes rows at IOSurface's own
+/// alignment, `IOSurfaceGetPropertyAlignment(kIOSurfaceBytesPerRow)`: 64 bytes on the 5300M's Mac
+/// (macOS 26.7.1), and here the device info's `linear_row_alignment` where the guest's kext raises
+/// it to that (256 bytes in macOS 11.7.11 and 14.8.9 guests on a Radeon 780M). CoreAnimation names
+/// the rows of its backing stores' surfaces itself, rounded to the device's
+/// `iosurfaceTextureAlignmentBytes` and to no less than 64 bytes, and IOSurface keeps them; the
+/// device answers the platform's `iosurfaceTextureAlignmentBytes` and
+/// `iosurfaceReadOnlyTextureAlignmentBytes` unchanged (the 5300M, the 630 and the M3 Max answer
+/// 16). So on RADV a texture over such a surface at a pitch that is not a multiple of 256 is the
+/// runtime's shadow (its refused pitch) where the platform answers less than 256 there: over a
+/// cold boot and a 15 s Safari scroll of a macOS 11.7.11 guest on a Radeon 780M, 1399 textures
+/// were shadows for their pitch with the platform's 16 (A8 rows of 64 and 128 bytes, a BGRA8
+/// surface 463 pixels wide at 1856), and 11 with the guest's device answering 512 there instead.
+/// metal2vulkan measured a macOS 26.7.2 guest's surfaces on RADV at 4032 bytes for 1001 `BGRA`
+/// pixels, 7360 for 1831 and 14656 for 3662, and in two cold boots of that guest on a Radeon 780M
+/// 583 and 639 textures over the guest's pages were shadows for their pitch, against 532 and 503
+/// in place.
 pub const LANE_LINEAR_TEXTURE_ALIGNMENT: u64 = 256;
 
 /// The device's `NSUInteger` SPI answers where the lane's differ from the platform's: the linear

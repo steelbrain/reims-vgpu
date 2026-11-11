@@ -462,8 +462,8 @@ heapBufferSizeAndAlignWithLength:options: partial the host's heap buffer alignme
 heapTextureSizeAndAlignWithDescriptor: implemented
 indirectArgumentBufferCapabilities base %base-spi
 indirectArgumentBufferDecodingData base %base-spi
-iosurfaceReadOnlyTextureAlignmentBytes base %base-spi
-iosurfaceTextureAlignmentBytes base %base-spi
+iosurfaceReadOnlyTextureAlignmentBytes implemented
+iosurfaceTextureAlignmentBytes implemented
 isASTCPixelFormatsSupported base %base-spi
 isAnisoSampleFixSupported base %base-spi
 isBCTextureCompressionSupported base %base-spi
