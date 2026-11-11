@@ -1431,13 +1431,13 @@ What our stack does with an object whose posted create the host refused (`decode
 ## Q26: when a resource is complete, and what orders a read-back across queues
 
 Probe: `oracle_complete DEVICE answers 300` and `... answers 300 sched`, and `oracle_complete
-DEVICE xqueue 200`, 11-11, the M3 Max on macOS 27 among them. Each command buffer spins about
-300 ms (200 ms for `xqueue`) before it uses the resource.
+DEVICE xqueue 200`, 11-11 (m3-max-17599, 17600 and 17601), the M3 Max on macOS 27 among them.
+Each command buffer spins about 300 ms (200 ms for `xqueue`) before it uses the resource.
 
 | asked | AMD | Intel 630 | M3 |
 |---|---|---|---|
 | right after the commit (status Committed), any use | `isComplete` and `isWriteComplete` YES, `waitUntilComplete` returns at once | the same | the same |
-| once `waitUntilScheduled` returns, a render pass, a kernel's write or a blit into the texture, a kernel's write of a buffer | YES, at once | NO and NO; the wait returns as the buffer's GPU work ends (297 to 425 ms), its status then still Scheduled in 6 of 12 cases | NO and NO; the wait returns at 285 to 290 ms, status Scheduled |
+| once `waitUntilScheduled` returns, a render pass, a kernel's write or a blit into the texture, a kernel's write of a buffer | YES, at once | NO and NO; the wait returns as the buffer's GPU work ends (298 to 428 ms), its status then still Scheduled in 7 of 12 cases | NO and NO; the wait returns at 293 to 299 ms, its status then still Scheduled in 8 of 12 cases |
 | the same, a kernel that only reads the texture or the buffer | YES, at once | NO and NO; waits | `isComplete` NO, `isWriteComplete` YES; waits |
 | a buffer not committed | YES, at once | the same | the same |
 | a resource only a completed buffer named, while a buffer of a second queue runs | YES, at once | the same | the same |
