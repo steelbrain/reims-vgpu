@@ -31,9 +31,10 @@
  * Of what the class implements for every subclass, ReimsGraphics overrides what reads the
  * class's provider as an AppleARMIODevice unchecked where a process reaches it: get_dot_pitch. And
  * as the paravirtual display does, it overrides set_digital_out_mode, which the class answers
- * kIOReturnUnsupported, to set the mode WindowServer picks of those it publishes. Unlike the
- * paravirtual display, which publishes three colour modes, it publishes one, and the device lists
- * one mode, so WindowServer picks none: the display starts in its preferred mode (start_hardware).
+ * kIOReturnUnsupported, to set the mode WindowServer picks of those it publishes: a timing for each
+ * mode the device lists, each in one colour mode where the paravirtual display publishes three.
+ * The display is external and plugged in from its start, as the paravirtual display's are, so
+ * WindowServer reads its modes, and sets one, at its start and at each change (start_hardware).
  * And it overrides swap_set_color_matrix, which the class answers kIOReturnUnsupported, so
  * WindowServer, which sets its accessibility matrix at each swap until the call succeeds, sets it
  * once: it answers 0 and the display shows the matrix (RgfxMobileColor.hpp).
@@ -406,8 +407,12 @@ void ReimsGraphics::detachMobileNode()
 // publishes its own (read from macOS 27.0.1's AppleParavirtGPU, AppleParavirtDisplay's
 // createDisplayAttributes), with the values the x86-64 framebuffer's EDID gives
 // (RgfxDisplayIdentity.hpp):
-// - external: false for the device's first display, which IOMobileFramebuffer.framework then
-//   names primary-0, and true for the others, which it names external-N;
+// - external: true, as the paravirtual display publishes it of every display (read from 14.6.1's,
+//   15.6.1's, 26.6.2's and 27.0.1's AppleParavirtGPU), which IOMobileFramebuffer.framework then
+//   names external-N. WindowServer asks for the hot-plug notices of an external display, and of an
+//   internal one only on 27.0.1, where the machine is virtual (14.6.1's, 15.6.1's, 26.6.2's and
+//   27.0.1's QuartzCore, AccelServer's constructor): so a change of the device's modes reaches
+//   WindowServer on every release (republishMobileDisplay);
 // - IOMFBUUID: the display's UUID, a fixed one of ours: "RVG" in ASCII, the product code, the
 //   version and variant bits of RFC 9562's custom UUIDs (8), and the serial;
 // - DisplayAttributes: the product (manufacturer, product code, serial, name, year), sRGB's
@@ -433,7 +438,7 @@ void ReimsGraphics::publishMobileDisplay()
 	IOLockUnlock(stateLock);
 	const uint32_t serial = rgfxDisplaySerial(id);
 
-	setProperty("external", id != 0);
+	setProperty("external", true);
 	char uuid[40];
 	snprintf(uuid, sizeof(uuid), "52564700-%04X-8000-8000-%012X", kRgfxDisplayProduct, serial);
 	setProperty("IOMFBUUID", uuid);
@@ -499,8 +504,8 @@ void ReimsGraphics::publishMobileDisplay()
 		scaling->release();
 	}
 	publishMobileModes();
-	IOLog("ReimsGraphics: display %u is %s, %ux%u native, UUID %s\n", id,
-	      id != 0 ? "external" : "primary", native.width, native.height, uuid);
+	IOLog("ReimsGraphics: display %u is external, %ux%u native, UUID %s\n", id, native.width,
+	      native.height, uuid);
 }
 
 namespace {
@@ -588,11 +593,12 @@ void ReimsGraphics::publishMobileModes()
 // them again from its host's modes and tells them it is plugged in (hotPlug_notify 1), and on 27.0.1
 // sends its own clients kIOMessageServicePropertyChange. The display here does the same, in that
 // order, but keeps its attributes published while it makes them again; a display that has told no
-// hot-plug client it is plugged in, as none has from its start, tells them only that. And as
-// WindowServer sets no mode of a display that publishes one colour mode and one timing
-// (start_hardware), a display whose timing the device no longer lists shows the new start timing,
-// as start_hardware does, before it tells anyone. On a thread call: the mode's set waits for the
-// device's answers, which the device's work loop, where the change is found, takes.
+// hot-plug client it is plugged in, as none has before start_hardware, tells them only that.
+// WindowServer then reads the new modes and sets one (set_digital_out_mode). Before it tells
+// anyone, a display whose timing the device no longer lists shows the new start timing, as
+// start_hardware does, so the display shows a mode it publishes until WindowServer sets one. On a
+// thread call: the mode's set waits for the device's answers, which the device's work loop, where
+// the change is found, takes.
 void ReimsGraphics::mobileDisplayChanged(thread_call_param_t self, thread_call_param_t)
 {
 	static_cast<ReimsGraphics *>(self)->republishMobileDisplay();
@@ -1071,12 +1077,11 @@ RgfxIOMFBWord ReimsGraphics::start_hardware()
 			OSSafeReleaseNULL(answer);
 		}
 	}
-	// The display starts in its preferred mode, as a panel does. WindowServer reads an internal
-	// display's timings only where it publishes two colour modes or two timings: with one of each
-	// it sets no mode and takes the display's size from get_display_size, which answers the
-	// class's fields (read from 14.6.1's and 27.0.1's QuartzCore, IOMFBDisplay's
-	// update_framebuffer_locked and set_physical_and_canvas_sizes). The device lists one mode,
-	// so the size must be there before WindowServer opens the framebuffer.
+	// The display starts in its preferred mode, as a panel does, and is plugged in, as the
+	// paravirtual display tells the class's hot-plug clients once it has published a display
+	// (hotPlug_notify 1, its createDisplayAttributes): WindowServer reads an external display's
+	// modes only while the class's get_digital_out_state answers it plugged in (14.6.1's
+	// QuartzCore, IOMFBDisplay's update_framebuffer_locked), and then sets one of them.
 	IOLockLock(stateLock);
 	const uint32_t startTiming =
 	    rgfxMobileStartTimingId(modeSet.modes, modeSet.modeCount, modeSet.preferredId);
@@ -1089,6 +1094,8 @@ RgfxIOMFBWord ReimsGraphics::start_hardware()
 	      start.refreshMhz % 1000);
 	if (mobilePipe)
 		setPipeVblankEnabled(this, true);
+	rgfxLegacyHotPlugNotify(this, 1);
+	mobileHotPlugged = true;
 	if (logged(kStartHardware))
 		IOLog("ReimsGraphics: start_hardware(): power driver 0x%x, vblanks on\n", power);
 	return 1;

@@ -339,10 +339,13 @@ Stages:
       a timing for each mode the device lists and one 8-bit colour mode.
       WindowServer sets one of them by its colour and timing IDs
       (set_digital_out_mode), which the device then shows by `SET_SCANOUT`,
-      as x86-64's setDisplayMode does. With one colour mode and one timing,
-      WindowServer sets none and reads the display's size from the class
-      (QuartzCore's IOMFBDisplay), so the display starts in its preferred
-      mode (start_hardware).
+      as x86-64's setDisplayMode does. The display is external and
+      plugged in from its start (`hotPlug_notify`), as the paravirtual
+      display's are: WindowServer reads an external display's modes, and
+      sets one, at its start and at each hot-plug notice, and asks for an
+      internal display's notices only on 27 (QuartzCore's AccelServer and
+      IOMFBDisplay). The display starts in its preferred mode
+      (start_hardware), which WindowServer then sets.
     - The arm64 display's cursor and mode changes, as the paravirtual
       display has them: a swap's layer 1 is the display's cursor
       (RgfxMobileCursor.hpp), and the display publishes `CursorPlane`. A
