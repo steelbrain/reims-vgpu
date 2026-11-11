@@ -1163,7 +1163,8 @@ pub fn created_or_decided<T>(
 ///   and `DevicePackConversion`, its `air.pack` and `air.unpack` of a normalized format), its
 ///   rounding of a `half` result (`NativeHalfConversion` and `NativeHalfQuantize`), its sampling
 ///   (`DeviceSampling` and `DeviceTexelConversion`), its vertex input's conversion of a normalized
-///   attribute (`DeviceVertexConversion`) and its alpha to coverage (`DeviceAlphaCoverage`). On a
+///   attribute (`DeviceVertexConversion`), its alpha to coverage (`DeviceAlphaCoverage`) and its
+///   logic operation on a 10-bit attachment's own codes (`NativeLogicOperation`). On a
 ///   device that runs on Metal (MoltenVK) the runtime answers most as Metal's own functions,
 ///   sampler and conversions, which announce nothing there, and one announced there dies (its
 ///   filter of a two-plane YCbCr texture announces `YCbCrFilterNotExact` instead). The runtime
@@ -1329,7 +1330,7 @@ pub fn created_or_decided<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 147] = [
+pub const DIES: [rt::Degradation; 148] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1460,6 +1461,7 @@ pub const DIES: [rt::Degradation; 147] = [
     rt::Degradation::DevicePackConversion,
     rt::Degradation::DeviceVertexConversion,
     rt::Degradation::DeviceAlphaCoverage,
+    rt::Degradation::NativeLogicOperation,
     rt::Degradation::ProvokingVertexLines,
     rt::Degradation::ProvokingVertexUnmatched,
     rt::Degradation::DeviceWideLines,
@@ -3011,6 +3013,12 @@ mod tests {
         //   is not measured to clear it no slower, where an M3's draws read zero or the clear
         //   value. Metal leaves a `DontCare` load's contents undefined, and the pass keeps none of
         //   the attachment's texels, as it stores none.
+        // - `VertexFetchMayWrap`: an element a draw's `uint` indices or indirect arguments name
+        //   2^32 bytes or more past a vertex buffer's bind offset, on lavapipe, whose
+        //   fixed-function fetch wraps there, where Metal reads zero past the buffer's end. A
+        //   policy's default, as `DontCareUnstoredLoad` is: `vertex_reach` of `EXACT_FORMS`
+        //   selects the exact form, which pulls such a layout, at its cost in the accuracy
+        //   ledger. No other driver differs.
         // - `DrawnDepthCopy`: a copy into a multisampled depth texture, or a pass's copies of a
         //   separate depth texture through its scratch image, which a fragment-depth draw writes
         //   where Metal copies the bytes: no copy of the device keeps a multisampled depth's
@@ -3095,12 +3103,13 @@ mod tests {
         //   writes 1, the AMD Radeon Pro 5300M and the Intel UHD Graphics 630 the samples that
         //   passed, as the runtime records), so no one nonzero value is Metal's; 0 where none
         //   passed, as Metal's.
-        const PRECISION: [D; 13] = [
+        const PRECISION: [D; 14] = [
             D::UncalibratedGpuTimes,
             D::UntimedCommandBuffer,
             D::GpuTimesFromHost,
             D::DontCareLoadTiles,
             D::DontCareUnstoredLoad,
+            D::VertexFetchMayWrap,
             D::ExtendedRangeBitsKept,
             D::DrawnDepthCopy,
             D::UnnamedShadowedTexture,
@@ -3228,6 +3237,7 @@ mod tests {
                 D::DevicePackConversion,
                 D::DeviceVertexConversion,
                 D::DeviceAlphaCoverage,
+                D::NativeLogicOperation,
             ]
         );
         // These stay deaths on native devices too, as neither a fact of the device nor the
