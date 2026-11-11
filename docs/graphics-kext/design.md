@@ -2390,11 +2390,17 @@ process's lies over them in place (`BUFFER_OVER_HOST_MEMORY` at their offset).
 Metal makes one over any range the process maps readable, at any alignment:
 malloc'd, `vm_allocate`d, read-only, or a file mapping (measured on an M3 Max,
 16 KiB and 4 KiB pages). Writable Shared or Managed memory the kext wires lies
-in place (`PagesBlock`, `BUFFER_OVER_PAGES`). A Managed one is one copy on every
-host, as the Intel UHD 630's no-copy Managed buffer is (dgpu-oracle.md Q3): the
-host's buffer over the pages is a Shared one, and its `didModifyRange:` and a
-blit's synchronize of it, or of a texture over it, send nothing. Over any other
-memory (read-only, or memory the kext or host makes no pages block of) the buffer lies
+in place (`PagesBlock`, `BUFFER_OVER_PAGES`). A Managed one is a Managed buffer
+whose CPU copy is the Shared buffer over the pages (`MANAGED_BUFFER_CREATE`, as
+a slab's, above): two copies where the host's GPU has memory of its own,
+as the AMD Radeon Pro 5300M's no-copy Managed buffer is, its GPU copy filled
+from the pages at the create, and one copy, over the pages, where the GPU
+shares the CPU's memory, as the Intel UHD 630's is (dgpu-oracle.md Q3). Its
+`didModifyRange:`, and a blit's synchronize of it or of a texture over it, go
+to the host as any Managed buffer's do; Apple's OpenCL makes them around its
+maps of a buffer's memory. Over any other memory (read-only, a Managed buffer's
+where the device makes no Managed buffer over a Shared one, or memory the kext
+or host makes no pages block of) the buffer lies
 over a range of a slab of its own options, as a device buffer of them does
 ("Shared and Managed buffers lie in slabs"): the process's own pages where
 the device takes them, so no app-sized copy lies in the region. `contents`

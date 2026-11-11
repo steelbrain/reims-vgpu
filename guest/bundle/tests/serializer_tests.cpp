@@ -775,6 +775,9 @@ void test_creates_with_no_address_post_nothing()
 	RgfxCreated bh = ser.createBufferOverHostMemory(past, 0, 0x50000);
 	RgfxCreated bp = ser.createBufferOverPages(past, 0, 0x60000, 0x1000, 0x123);
 	RgfxCreated wraps = ser.createBufferOverPages(UINT64_MAX - 0x100, 0, 0x60000, 0x1000, 0x123);
+	RgfxCreated mp = ser.createManagedBuffer(1, past, 0x10);
+	RgfxCreated mwraps = ser.createManagedBuffer(1, UINT64_MAX - 0x100, 0x10,
+	                                             RgfxSerializer::kDefaultAddressAlign, 0x123);
 	RgfxCreated hp = ser.createHeapOverPages(past, 0, 1, 0x60000, 0x4000);
 	RgfxTextureDescriptor desc = {};
 	desc.pixel_format = 80;
@@ -783,7 +786,7 @@ void test_creates_with_no_address_post_nothing()
 	desc.mipmap_level_count = desc.array_length = desc.sample_count = 1;
 	RgfxCreated t = ser.createTexture(desc, RGFX_OBJ_NONE, 0, 256, past);
 	RgfxCreated tm = ser.createManagedTexture(desc, 9, 4, 1, 1, 0, 256, past);
-	for (const RgfxCreated &c : {h, hh, b, bh, bp, wraps, hp, t, tm})
+	for (const RgfxCreated &c : {h, hh, b, bh, bp, wraps, mp, mwraps, hp, t, tm})
 		CHECK(!c.posted && c.obj_id == 0 && c.gpu_address == 0 && c.resource_id == 0);
 	RgfxMsgHeader header = {};
 	std::vector<uint8_t> bytes;
@@ -856,6 +859,19 @@ void test_lifecycle_messages()
 	CHECK(bpm.offset == 0x123 && bpm.length == 0x3000 && bpm.reserved_44 == 0);
 	RgfxCreated next = ser.createBuffer(0x1000, 0);
 	CHECK(next.gpu_address >= bp.gpu_address + RgfxIdSpace::addressSpan(0x3123));
+	(void)expectMessage<RgfxBufferCreate>(ring, RGFX_CMD_BUFFER_CREATE);
+
+	// A Managed buffer over that one, as a no-copy Managed buffer over the pages is: its pick
+	// holds the span from the page's start too, and its address keeps the offset.
+	RgfxCreated mb = ser.createManagedBuffer(bp.obj_id, 0x3000, 0x10,
+	                                         RgfxSerializer::kDefaultAddressAlign, 0x123);
+	CHECK(mb.posted && mb.gpu_address % RgfxIdSpace::kAddressGranule == 0);
+	auto mbm = expectMessage<RgfxManagedBufferCreate>(ring, RGFX_CMD_MANAGED_BUFFER_CREATE);
+	CHECK(mbm.obj_id == mb.obj_id && mbm.cpu_buffer_obj_id == bp.obj_id);
+	CHECK(mbm.gpu_address == mb.gpu_address + 0x123 && mbm.length == 0x3000 &&
+	      mbm.options == 0x10);
+	RgfxCreated beyond = ser.createBuffer(0x1000, 0);
+	CHECK(beyond.gpu_address >= mb.gpu_address + RgfxIdSpace::addressSpan(0x3123));
 	(void)expectMessage<RgfxBufferCreate>(ring, RGFX_CMD_BUFFER_CREATE);
 
 	// A slab's heap over a pages block's guest RAM, at an address of its size.

@@ -162,10 +162,6 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 	// a buffer over pages lies past it by its pointer's offset in its page; 0 for any other,
 	// whose pick is `_gpuAddress`.
 	uint64_t _addressPick;
-	// YES for a Managed no-copy buffer over the app's own pages in place (bufferOverPagesOf): one
-	// copy, the app's memory, which the host's GPU uses as a Shared buffer's, so neither
-	// didModifyRange: nor a synchronize has anything to bring over.
-	BOOL _oneCopy;
 	// A no-copy buffer over the app's own pages (bufferOverPagesOf): the region whose pages block
 	// it lies over, which the buffer leaves joinable no longer as it goes (RgfxRegion::leavePages),
 	// and the block's offset; null for any other.
@@ -362,16 +358,19 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 	if (pointer != nullptr && !rgfxMappedReadable(pointer, length, &writable))
 		return nil;
 	// The app's own pages in place, where the kext wires them for the buffer and the host maps
-	// them: nothing copied or synced, a Managed buffer's one copy (bufferOverPagesOf). Read-only
-	// memory, and memory the kext or the host makes no pages block of, takes a shadow in a slab
-	// below. Read-only memory stays out of place: Metal makes the buffer, its GPU reads see the
-	// memory, and its blit fills and kernel stores complete with their writes dropped, the memory
-	// and a file mapped under it unchanged (the AMD 5300M and the Intel UHD 630 under macOS 26.7.1,
-	// oracle_bundle nocopy.ro; the M3, docs/accuracy-ledger.md `read-only-pages-written`). The
-	// host's buffer over a pages block takes the GPU's writes (BUFFER_OVER_PAGES has no read-only
-	// form), so in place they would reach pages the process maps read-only, a file's among them;
-	// the shadow never writes back to read-only memory, which drops them as Metal does.
-	if (pointer != nullptr && writable && region->hasPagesBlocks()) {
+	// them: a Shared buffer's memory, and a Managed buffer's CPU copy, where the device makes a
+	// Managed buffer over a Shared one (bufferOverPagesOf). Read-only memory, and memory the kext
+	// or the host makes no pages block of, takes a shadow in a slab below. Read-only memory stays
+	// out of place: Metal makes the buffer, its GPU reads see the memory, and its blit fills and
+	// kernel stores complete with their writes dropped, the memory and a file mapped under it
+	// unchanged (the AMD 5300M and the Intel UHD 630 under macOS 26.7.1, oracle_bundle
+	// nocopy.ro; the M3, docs/accuracy-ledger.md `read-only-pages-written`). The host's buffer
+	// over a pages block takes the GPU's writes (BUFFER_OVER_PAGES has no read-only form), so in
+	// place they would reach pages the process maps read-only, a file's among them; the shadow
+	// never writes back to read-only memory, which drops them as Metal does.
+	const bool managed = (options & MTLResourceStorageModeMask) == MTLResourceStorageModeManaged;
+	if (pointer != nullptr && writable && region->hasPagesBlocks() &&
+	    (!managed || slabs->overCopy(static_cast<uint32_t>(options)))) {
 		RgfxBuffer *inPlace = [RgfxBuffer bufferOverPagesOf:pointer
 		                                             length:length
 		                                            options:options
@@ -433,12 +432,16 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 
 // A no-copy buffer over the app's own pages (bufferWithBytesNoCopy): a pages block of them, and a
 // buffer over its view at the pointer's offset in its page, which keeps the block until the host
-// has dropped the buffer. Nil where the kext gives no block, or the device never got the create.
-// A Managed one is one copy, the app's memory, as the Intel 630's no-copy Managed buffer is (the
-// GPU sees a CPU write with no didModifyRange:, and the CPU a GPU write with no synchronize;
-// docs/graphics-kext/dgpu-oracle.md, Q3; the AMD 5300M's is two copies, which Metal's contract
-// for the mode allows either way): the host's buffer over the pages is a Shared one, and the
-// buffer answers the Managed options it was asked.
+// has dropped the buffer. Nil where the kext gives no block, or the device never got a create.
+// A Managed one is a Managed buffer whose CPU copy is a Shared one over the view
+// (MANAGED_BUFFER_CREATE), which the host makes two copies where its GPU has memory of its own,
+// as Metal keeps the AMD 5300M's no-copy Managed buffer (its GPU sees a CPU write only after a
+// didModifyRange:, and its CPU a GPU write only after a synchronize; docs/graphics-kext/
+// dgpu-oracle.md, Q3), and one copy, over the pages, where its GPU shares the CPU's memory, as the
+// Intel 630's is. Its didModifyRange: and a blit's synchronize of it reach the host, which Apple's
+// OpenCL makes around its maps of a buffer's memory: a synchronizeResource: before a map, a
+// didModifyRange: after a map for writing (measured: a macOS 26.6.1 guest on the RTX 5080 host,
+// 2026-11-11). The Managed buffer's address keeps the pointer's offset in its page too.
 //
 // Buffers over the same bytes share their pages block (RgfxRegion::acquirePages), so the host
 // makes one view of the pages, and one copy where it copies them rather than importing them, as on
@@ -467,28 +470,56 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 #endif
 	const uint64_t offset = reinterpret_cast<uintptr_t>(pointer) & (page - 1);
 	const bool managed = (options & MTLResourceStorageModeMask) == MTLResourceStorageModeManaged;
-	const MTLResourceOptions onHost =
+	const MTLResourceOptions overPages =
 	    managed ? (options & ~MTLResourceStorageModeMask) | MTLResourceStorageModeShared : options;
-	RgfxCreated created = serializer->createBufferOverPages(length, static_cast<uint32_t>(onHost),
-	                                                        block.offset, block.size, offset);
+	RgfxCreated created = serializer->createBufferOverPages(
+	    length, static_cast<uint32_t>(overPages), block.offset, block.size, offset);
+	const uint64_t at = block.offset;
 	if (created.obj_id == 0 || serializer->refused(created)) {
-		region->leavePages(block.offset);
-		region->release(block.offset); // no buffer lies over the block
+		region->leavePages(at);
+		region->release(at); // no buffer lies over the block
 		return nil;
+	}
+	// A Managed one's CPU copy: the Shared buffer over the pages, destroyed once the Managed
+	// buffer's destroy is posted, its address then given back, and then the block.
+	const RgfxObjId copy = managed ? created.obj_id : 0;
+	const uint64_t copyPick = created.gpu_address;
+	if (managed) {
+		created = serializer->createManagedBuffer(copy, length, static_cast<uint32_t>(options),
+		                                          RgfxSerializer::kDefaultAddressAlign, offset);
+		if (created.obj_id == 0 || serializer->refused(created)) {
+			region->leavePages(at);
+			serializer->destroy(copy, [serializer, copyPick, region, at] {
+				serializer->releaseAddress(copyPick);
+				region->release(at);
+			});
+			return nil;
+		}
 	}
 	// The block goes back once the host has dropped the buffer, then the caller's memory: the
 	// kext unwires its pages once the device has answered the block's release. It is joinable no
 	// longer once the buffer has gone for the app (dealloc).
-	const uint64_t at = block.offset;
+	void (^released)(void) = ^{
+		region->release(at);
+		if (appDeallocator != nil)
+			appDeallocator(pointer, length);
+	};
 	RgfxBuffer *buffer = [[RgfxBuffer alloc] initWithObjId:created.obj_id
 	                                            gpuAddress:created.gpu_address + offset
 	                                                length:length
 	                                               options:options
 	                                              contents:pointer
 	                                           deallocator:^{
-		                                           region->release(at);
-		                                           if (appDeallocator != nil)
-			                                           appDeallocator(pointer, length);
+		                                           if (copy == 0) {
+			                                           released();
+			                                           return;
+		                                           }
+		                                           serializer->destroy(copy, [serializer,
+		                                                                      copyPick,
+		                                                                      released] {
+			                                           serializer->releaseAddress(copyPick);
+			                                           released();
+		                                           });
 	                                           }
 	                                                device:device
 	                                            serializer:serializer];
@@ -498,15 +529,9 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 	}
 	buffer->_ownsAddress = YES;
 	buffer->_addressPick = created.gpu_address;
-	buffer->_oneCopy = managed;
 	buffer->_pagesRegion = region;
 	buffer->_pagesBlock = at;
 	return buffer;
-}
-
-- (BOOL)rgfxOneCopy
-{
-	return _oneCopy;
 }
 
 - (std::shared_ptr<RgfxMemoryShadow>)rgfxShadow
@@ -673,12 +698,12 @@ RGFX_RESOURCE_SPI
 
 - (void)didModifyRange:(NSRange)range
 {
-	// A Managed buffer's contents are its CPU copy, a region block: the host copies the range
-	// to the GPU's copy before any command buffer committed after this, on any queue
+	// A Managed buffer's contents are its CPU copy, in the process's memory: the host copies the
+	// range to the GPU's copy before any command buffer committed after this, on any queue
 	// (RGFX_CMD_BUFFER_DID_MODIFY_RANGE). A Shared or Private buffer has nothing to tell, as
-	// Metal does nothing for one, and neither has a Managed one of one copy (rgfxOneCopy).
-	if ([self storageMode] != MTLStorageModeManaged || _ownsContents || _oneCopy ||
-	    _serializer == nullptr || range.length == 0) {
+	// Metal does nothing for one.
+	if ([self storageMode] != MTLStorageModeManaged || _ownsContents || _serializer == nullptr ||
+	    range.length == 0) {
 		return;
 	}
 	// A no-copy buffer's CPU copy is the app's memory: the block takes its bytes first.

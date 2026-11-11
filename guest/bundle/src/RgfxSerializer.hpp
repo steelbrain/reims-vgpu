@@ -381,9 +381,12 @@ public:
 
 	/// A Managed buffer of `length` bytes at a picked GPU address, its CPU copy the first `length`
 	/// bytes of the Shared buffer `cpu_buffer` over the process's memory (`MANAGED_BUFFER_CREATE`,
-	/// where the device took RGFX_FEATURE_MANAGED_BUFFER_SLABS).
+	/// where the device took RGFX_FEATURE_MANAGED_BUFFER_SLABS). The pick holds `offset` bytes
+	/// more, and the buffer's address is the pick plus `offset`, as a no-copy buffer's over the
+	/// app's pages keeps its pointer's offset in its page (createBufferOverPages). The answer's
+	/// `gpu_address` is the address picked, given back through releaseAddress.
 	RgfxCreated createManagedBuffer(RgfxObjId cpu_buffer, uint64_t length, uint32_t options,
-	                                uint64_t align = kDefaultAddressAlign);
+	                                uint64_t align = kDefaultAddressAlign, uint64_t offset = 0);
 
 	/// The process wrote `length` bytes at `location` of Managed buffer `buffer`'s CPU copy
 	/// (`didModifyRange:`): every command buffer committed after it sees them. False where the

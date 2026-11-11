@@ -327,6 +327,10 @@ public:
 	bool makeBuffer(const Range &range, uint64_t length, uint32_t options,
 	                RgfxSlabSource::Made *out);
 
+	/// Whether a Managed buffer of `options` lies over a Shared copy (MANAGED OVER A COPY): the
+	/// device took RGFX_FEATURE_MANAGED_BUFFER_SLABS, and makes one over any Shared buffer.
+	bool overCopy(uint32_t options) const { return m_source.overCopy(options); }
+
 	/// The clock the idle times are read from, in ms: `now(context)`, for the tests; the steady
 	/// clock where none is set. Set before any take.
 	typedef uint64_t (*Clock)(void *context);

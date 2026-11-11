@@ -116,7 +116,8 @@ static inline BOOL RgfxMakesNoResourceOf(MTLResourceOptions options)
 /// process's) the host sees in place. Shared or Managed bytes the process may write, where
 /// `region` has pages blocks (RgfxRegion::acquirePages), the host sees in place too: the kext
 /// wires their pages for the buffer's life, the buffer's GPU address keeps the pointer's offset
-/// in its page, and a Managed one is one copy (rgfxOneCopy). Read-only bytes, and those the kext
+/// in its page, and a Managed one's CPU copy is a Shared buffer over them, where `slabs` lays
+/// Managed buffers over Shared copies (RgfxSlabs::overCopy). Read-only bytes, and those the kext
 /// or the host makes no pages block of, get a range of a
 /// slab of `slabs` as a device buffer of their options does (RgfxSlabs.hpp), the GPU's copy,
 /// synced with them at the command buffers that use the buffer (RgfxMemoryShadow.hpp): the
@@ -141,11 +142,6 @@ static inline BOOL RgfxMakesNoResourceOf(MTLResourceOptions options)
 /// The GPU's copy of app memory the buffer lies over (a no-copy buffer's outside the device
 /// region), null for any other.
 - (std::shared_ptr<RgfxMemoryShadow>)rgfxShadow;
-
-/// Whether the buffer is a Managed one of one copy: a no-copy buffer over the app's own pages in
-/// place, which the host's GPU uses as a Shared buffer's memory, so neither its didModifyRange:
-/// nor a blit's synchronize of it, or of a texture over it, has anything to bring over.
-- (BOOL)rgfxOneCopy;
 #endif
 
 /// Designated initialiser: wraps an already-created host buffer. `objId` and
