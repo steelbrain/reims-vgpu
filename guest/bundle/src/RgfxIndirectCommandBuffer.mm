@@ -4,6 +4,7 @@
  */
 
 #import "RgfxIndirectCommandBuffer.h"
+#include "RgfxLogOnce.hpp"
 #import "RgfxInterop.h"
 
 #import "RgfxResource.h" // RgfxResolveHazardTracking
@@ -200,9 +201,11 @@ NSRange RgfxIcbClamp(id icb, NSRange range)
 	// A create the device never got, one the host refused, or one not answered made no buffer:
 	// nil, as Metal answers one it cannot make. One the kext timed out on is destroyed behind.
 	if (serializer->refused(created) || created.status != RGFX_STATUS_OK) {
-		NSLog(@"RGFX: newIndirectCommandBufferWithDescriptor: no buffer of %lu commands (status "
-		      @"0x%x)",
-		      (unsigned long)maxCount, created.status);
+		static char site;
+		if (rgfxLogFirst(&site, created.status))
+			NSLog(@"RGFX: newIndirectCommandBufferWithDescriptor: no buffer of %lu commands "
+			      @"(status 0x%x)",
+			      (unsigned long)maxCount, created.status);
 		return nil;
 	}
 	RgfxIndirectCommandBuffer *icb = [[RgfxIndirectCommandBuffer alloc] initWithObjId:created.obj_id

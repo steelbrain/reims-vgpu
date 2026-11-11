@@ -9,6 +9,7 @@
  */
 
 #import "RgfxMetalDevice.h"
+#include "RgfxLogOnce.hpp"
 
 #import "RgfxBuffer.h"
 #import "RgfxInterop.h"
@@ -564,8 +565,10 @@ uint32_t rgfxKextShareEvent(void *context, RgfxObjId event)
 	uint32_t outCount = 1;
 	kr = IOConnectCallScalarMethod(port, kRgfxSharedEventMethodExport, in, 3, &status, &outCount);
 	if (kr != KERN_SUCCESS || outCount != 1 || status != RGFX_STATUS_OK) {
-		os_log_error(OS_LOG_DEFAULT, "RGFX: shared event 0x%llx: no port (kr=0x%x status %llu)",
-		             (unsigned long long)event, kr, (unsigned long long)status);
+		static char site;
+		if (rgfxLogFirst(&site, (static_cast<uint64_t>(kr) << 32) ^ status))
+			os_log_error(OS_LOG_DEFAULT, "RGFX: shared event 0x%llx: no port (kr=0x%x status %llu)",
+			             (unsigned long long)event, kr, (unsigned long long)status);
 		IOServiceClose(port);
 		return MACH_PORT_NULL;
 	}

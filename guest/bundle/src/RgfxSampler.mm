@@ -3,6 +3,7 @@
  */
 
 #import "RgfxSampler.h"
+#include "RgfxLogOnce.hpp"
 
 #import "RgfxMetalPrivate.h"
 
@@ -56,7 +57,10 @@ RgfxSamplerParams RgfxSamplerParamsOf(MTLSamplerDescriptor *d)
 	// (kRgfxNoAnswer), made no sampler: nil, as Metal answers a sampler it cannot make. One the
 	// kext timed out on is followed by its destroy there, so nothing is left to let go.
 	if (serializer->refused(created) || created.status != RGFX_STATUS_OK) {
-		NSLog(@"RGFX: newSamplerStateWithDescriptor: no sampler (status 0x%x)", created.status);
+		static char site;
+		if (rgfxLogFirst(&site, created.status))
+			NSLog(@"RGFX: newSamplerStateWithDescriptor: no sampler (status 0x%x)",
+			      created.status);
 		return nil;
 	}
 	RgfxSampler *sampler = [[RgfxSampler alloc] initWithObjId:created.obj_id

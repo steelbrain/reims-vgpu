@@ -3,6 +3,7 @@
  */
 
 #import "RgfxIOSurface.h"
+#include "RgfxLogOnce.hpp"
 
 #import "RgfxBuffer.h"
 
@@ -259,8 +260,9 @@ NilLog &nilLog()
 }
 
 /// newTextureWithDescriptor:iosurface:plane: answers nil for `surface`, as Metal does a texture
-/// it cannot make, for `cause`, which `detail` says more of: logged once per surface and cause,
-/// so a texture asked for every frame logs once.
+/// it cannot make, for `cause`, which `detail` says more of: counted per surface and cause, and
+/// logged once per cause and pixel format in the process (docs/conventions.md), so a texture
+/// asked for every frame, over a surface new each frame or not, logs once.
 void logNoTexture(IOSurfaceRef surface, const char *cause, const std::string &detail)
 {
 	std::string line = describe(surface) + ": no texture (" + cause + "): " + detail;
@@ -277,7 +279,10 @@ void logNoTexture(IOSurfaceRef surface, const char *cause, const std::string &de
 		}
 		entry.second = line;
 	}
-	NSLog(@"RGFX: %s", line.c_str());
+	static char site;
+	const uint32_t format = surface != nullptr ? IOSurfaceGetPixelFormat(surface) : 0;
+	if (rgfxLogFirst(&site, rgfxLogKindOf(cause) ^ format))
+		NSLog(@"RGFX: %s", line.c_str());
 }
 
 /// The surface's YCbCr matrix as one of RGFX_YCBCR_MATRIX_*. CoreVideo keeps a pixel buffer's
@@ -415,7 +420,8 @@ std::atomic<uint64_t> gCopiedRefused{0};     // the kext gave no block in place
 std::atomic<uint64_t> gCopyShared{0};
 std::atomic<uint64_t> gCopyOwn{0};
 
-const uint64_t kCopyReportNs = 10ull * 1000 * 1000 * 1000;
+// A summary, at most once a minute (docs/conventions.md).
+const uint64_t kCopyReportNs = 60ull * 1000 * 1000 * 1000;
 
 uint64_t nowNs()
 {

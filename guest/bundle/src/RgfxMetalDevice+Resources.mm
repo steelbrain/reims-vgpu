@@ -5,6 +5,7 @@
  */
 
 #import "RgfxMetalDevice+Resources.h"
+#include "RgfxLogOnce.hpp"
 
 #import "RgfxBlockCall.h"
 #import "RgfxBuffer.h"
@@ -30,22 +31,16 @@
 
 namespace {
 
-// A nil the device's creator `creator` answers for `cause`, asked for `asked`: logged once at the
-// info level (`log show --info`), by creator, cause and what was asked, so a process that ends at
-// a nil it was given (14.6.1's WindowServer ends at a texture's, in SkyLight's
-// MetalBacking::AbortWithTextureInfo) has the device's answer named beside it. A creator asked
-// the same every frame logs once; the set is bounded, as a long session asks many shapes.
+// A nil the device's creator `creator` answers for `cause`, asked for `asked`: logged at the info
+// level (`log show --info`) once per creator and cause in the process (docs/conventions.md), what
+// was asked the first time named, so a process that ends at a nil it was given (14.6.1's
+// WindowServer ends at a texture's, in SkyLight's MetalBacking::AbortWithTextureInfo) has the
+// device's answer named beside it. A creator asked every frame, the same or not, logs once.
 void noteNil(const char *creator, const char *cause, const std::string &asked)
 {
-	static std::mutex lock;
-	static std::set<std::string> *seen = new std::set<std::string>(); // never destroyed
-	{
-		std::lock_guard<std::mutex> g(lock);
-		if (seen->size() >= 4096)
-			seen->clear();
-		if (!seen->insert(std::string(creator) + "|" + cause + "|" + asked).second)
-			return;
-	}
+	static char site;
+	if (!rgfxLogFirst(&site, rgfxLogKindOf(creator) ^ (rgfxLogKindOf(cause) * 31)))
+		return;
 	os_log_info(OS_LOG_DEFAULT,
 	            "RGFX: the device answers nil at %{public}s (%{public}s): %{public}s", creator,
 	            cause, asked.c_str());

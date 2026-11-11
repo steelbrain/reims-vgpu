@@ -4,6 +4,7 @@
  */
 
 #import "RgfxComputePipelineState.h"
+#include "RgfxLogOnce.hpp"
 
 #import <objc/message.h>
 
@@ -62,7 +63,9 @@ NSError *foreignFunctionError(NSString *what, id<MTLFunction> fn)
 {
 	NSString *msg = [NSString stringWithFormat:@"compute pipeline: %@ %@ (%@) is not from a library of this device",
 	                                           what, fn.name, NSStringFromClass([(id)fn class])];
-	NSLog(@"RGFX: %@", msg);
+	static char site;
+	if (rgfxLogFirst(&site))
+		NSLog(@"RGFX: %@", msg);
 	return RgfxMakeError(RgfxMetalErrorInvalidDescriptor, msg);
 }
 
@@ -349,7 +352,8 @@ NSError *foreignFunctionError(NSString *what, id<MTLFunction> fn)
 - (void)rgfxTakeAnswer:(const RgfxPipelineReflection *)r
 {
 	_answer.take(*r);
-	if (r->status != RGFX_PIPELINE_OK)
+	static char site;
+	if (r->status != RGFX_PIPELINE_OK && rgfxLogFirst(&site, r->status))
 		NSLog(@"RGFX: the device refused compute pipeline %llu, made as an equal one it accepted",
 		      static_cast<unsigned long long>(self.rgfxObjId));
 }

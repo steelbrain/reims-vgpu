@@ -40,6 +40,7 @@
  */
 
 #import "RgfxCommandObjects.h"
+#include "RgfxLogOnce.hpp"
 #import "RgfxBuffer.h"
 #import "RgfxComputePipelineState.h"
 #import "RgfxEvent.h"
@@ -111,12 +112,12 @@ namespace {
 // no mesh pipeline can be made, so it draws nothing.
 constexpr const char *kNoMeshes = "mesh shading (the host makes no mesh pipeline)";
 
-/// Whether the `n`th (from 0) occurrence of a repeated log line is logged: the first 16, then
-/// every power of two, so a frame loop's stays visible without flooding the log.
+/// Whether the `n`th (from 0) occurrence of a repeated log line is logged: the first alone, as
+/// for every degradation (docs/conventions.md); `count` counts them all.
 bool logEventOp(std::atomic<uint64_t> &count, uint64_t *n)
 {
 	*n = count.fetch_add(1, std::memory_order_relaxed);
-	return *n < 16 || (*n & (*n - 1)) == 0;
+	return *n == 0;
 }
 
 std::atomic<uint64_t> g_foreignEvents{0};
@@ -135,8 +136,8 @@ bool rgfxPutBytes(RgfxUploadArena *uploads, const void *bytes, NSUInteger length
 	uint64_t n = 0;
 	if (logEventOp(g_bytesDropped, &n)) {
 		NSLog(@"RGFX: %lu inline bytes have no upload chunk (no region room): their binding is "
-		      @"not made, and the command buffer fails (so far: %llu)",
-		      (unsigned long)length, (unsigned long long)(n + 1));
+		      @"not made, and the command buffer fails",
+		      (unsigned long)length);
 	}
 	return false;
 }
@@ -2200,9 +2201,11 @@ enum RgfxStage : unsigned {
 	if (!posted) {
 		// No block for it: the buffer fails as Metal's does when memory runs out, and its
 		// handlers run off the committing thread.
-		NSLog(@"RGFX: command buffer 0x%llx: no region block for its %llu bytes: it fails "
-		      @"with MTLCommandBufferErrorOutOfMemory",
-		      (unsigned long long)[self rgfxObjId], (unsigned long long)messageBytes);
+		static char site;
+		if (rgfxLogFirst(&site))
+			NSLog(@"RGFX: command buffer 0x%llx: no region block for its %llu bytes: it fails "
+			      @"with MTLCommandBufferErrorOutOfMemory",
+			      (unsigned long long)[self rgfxObjId], (unsigned long long)messageBytes);
 		RgfxCbComplete failed = {};
 		failed.header.type = RGFX_EVT_CB_COMPLETE;
 		failed.cb_obj_id = [self rgfxObjId];
@@ -2464,8 +2467,10 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	// A buffer some of whose inline bytes found no chunk ran without those bindings, so it fails.
 	if (msg->status == RGFX_CB_OK && _uploadsFailed) {
 		// It ran without some of its bindings, so it fails as Metal's does when memory runs out.
-		NSLog(@"RGFX: a command buffer's inline bytes (set*Bytes:) found no room in the "
-		      @"device's memory; it fails as out of memory");
+		static char site;
+		if (rgfxLogFirst(&site))
+			NSLog(@"RGFX: a command buffer's inline bytes (set*Bytes:) found no room in the "
+			      @"device's memory; it fails as out of memory");
 		_cbError = rgfxCommandBufferError(MTLCommandBufferErrorOutOfMemory);
 		_status.store(MTLCommandBufferStatusError);
 	} else if (msg->status == RGFX_CB_OK) {
@@ -2685,9 +2690,8 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	uint64_t n = 0;
 	if (logEventOp(g_foreignEvents, &n)) {
 		NSLog(@"RGFX: command buffer 0x%llx: %s an event %@ that no device of ours made, value "
-		      @"%llu: not carried (so far: %llu)",
-		      (unsigned long long)[self rgfxObjId], op, event, (unsigned long long)value,
-		      (unsigned long long)(n + 1));
+		      @"%llu: not carried",
+		      (unsigned long long)[self rgfxObjId], op, event, (unsigned long long)value);
 	}
 	return 0;
 }

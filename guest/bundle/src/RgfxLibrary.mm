@@ -6,6 +6,7 @@
  */
 
 #import "RgfxLibrary.h"
+#include "RgfxLogOnce.hpp"
 #import "RgfxArgumentEncoder.h"
 #import "RgfxBlockCall.h"
 #import "RgfxUnsupported.h"
@@ -698,7 +699,8 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 		if (entries == nullptr)
 			why = "its module declares no such entry point";
 	}
-	if (entries == nullptr && why != nullptr)
+	static char site;
+	if (entries == nullptr && why != nullptr && rgfxLogFirst(&site, rgfxLogKindOf(why)))
 		NSLog(@"RGFX: %s: its nodes were not read (%s): pipelines of it answer no reflection",
 		      name.c_str(), why);
 	_entries.emplace(name, entries);

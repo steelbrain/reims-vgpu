@@ -45,8 +45,9 @@
  * every plane. Where the kext gives no shared block, the process keeps a block of its own for the
  * surface. The kext gives a surface's blocks in one mode, so every holder of a surface copied
  * copies it. Each view made, in place or a copy and why, and each copy's block, shared or the
- * process's own, is counted in the "surface copies" line the process logs (os_log, info) every
- * 10 s while views are made or copied; the kext logs why it first refused a shared block.
+ * process's own, is counted in the "surface copies" line the process logs (os_log, info) once a
+ * minute at most while views are made or copied; the kext logs why it first refused a shared
+ * block.
  *
  * The copy holds the planes in plane order, each from a kShadowRowAlign multiple, its rows
  * kShadowRowAlign apart, as the surface's own memory holds them one after another; a header past
@@ -111,8 +112,9 @@
  *
  * A texture the creator cannot make is nil, as Metal answers one, and never silently: each cause
  * (no view in place and no room for a copy, a plane past the surface's, no texture resource id
- * left, ...) logs one "RGFX:" line per surface naming the surface and the checks that refused,
- * however often the texture is asked for (rgfxIOSurfaceNilLog).
+ * left, ...) logs one "RGFX:" line per cause and pixel format in the process, naming the first
+ * surface and the checks that refused, however often and over however many surfaces the texture
+ * is asked for; each surface's count and line are kept (rgfxIOSurfaceNilLog).
  *
  * Left for later, for a copy: syncing the pages at the CPU's lock instead of at every GPU
  * write's completion (the device cache's sync); CPU writes made without a lock. In either

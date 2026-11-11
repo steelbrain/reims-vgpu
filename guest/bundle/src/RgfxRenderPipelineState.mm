@@ -4,6 +4,7 @@
  */
 
 #import "RgfxRenderPipelineState.h"
+#include "RgfxLogOnce.hpp"
 #import "RgfxUnsupported.h"
 
 #import <objc/message.h>
@@ -333,7 +334,9 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 		NSString *msg = [NSString
 		    stringWithFormat:@"render pipeline: function %@ (%@) is not from a library of this device",
 		                     foreign.name, NSStringFromClass([(id)foreign class])];
-		NSLog(@"RGFX: %@", msg);
+		static char site;
+		if (rgfxLogFirst(&site))
+			NSLog(@"RGFX: %@", msg);
 		if (error)
 			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor, msg);
 		return nil;
@@ -351,7 +354,9 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 		NSString *msg = [NSString
 		    stringWithFormat:@"render pipeline: linked function %@ (%@) is not from a library of this device",
 		                     foreignLinked.name, NSStringFromClass([(id)foreignLinked class])];
-		NSLog(@"RGFX: %@", msg);
+		static char site;
+		if (rgfxLogFirst(&site))
+			NSLog(@"RGFX: %@", msg);
 		if (error)
 			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor, msg);
 		return nil;
@@ -531,7 +536,9 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 		NSString *msg = [NSString
 		    stringWithFormat:@"render pipeline: function %@ (%@) is not from a library of this device",
 		                     foreign.name, NSStringFromClass([(id)foreign class])];
-		NSLog(@"RGFX: %@", msg);
+		static char site;
+		if (rgfxLogFirst(&site))
+			NSLog(@"RGFX: %@", msg);
 		if (error)
 			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor, msg);
 		return nil;
@@ -557,7 +564,9 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 		NSString *msg = [NSString
 		    stringWithFormat:@"render pipeline: linked function %@ (%@) is not from a library of this device",
 		                     foreignLinked.name, NSStringFromClass([(id)foreignLinked class])];
-		NSLog(@"RGFX: %@", msg);
+		static char site;
+		if (rgfxLogFirst(&site))
+			NSLog(@"RGFX: %@", msg);
 		if (error)
 			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor, msg);
 		return nil;
@@ -744,7 +753,8 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 - (void)rgfxTakeAnswer:(const RgfxPipelineReflection *)r
 {
 	_answer.take(*r);
-	if (r->status != RGFX_PIPELINE_OK)
+	static char site;
+	if (r->status != RGFX_PIPELINE_OK && rgfxLogFirst(&site, r->status))
 		NSLog(@"RGFX: the device refused render pipeline %llu, made as an equal one it accepted",
 		      static_cast<unsigned long long>(self.rgfxObjId));
 }

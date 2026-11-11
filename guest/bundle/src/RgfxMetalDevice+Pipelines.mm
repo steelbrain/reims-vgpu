@@ -4,6 +4,7 @@
  */
 
 #import "RgfxMetalDevice+Pipelines.h"
+#include "RgfxLogOnce.hpp"
 
 #import "RgfxArgumentEncoder.h"
 #import "RgfxBinaryArchive.h"
@@ -191,7 +192,8 @@ bool fileIdentity(const char *path, RgfxFileIdentity &out)
 {
 	NSError *error = nil;
 	id<MTLLibrary> lib = [super newLibraryWithData:data error:&error];
-	if (lib == nil)
+	static char site;
+	if (lib == nil && rgfxLogFirst(&site, static_cast<uint64_t>(error.code)))
 		NSLog(@"RGFX: Metal's own library over %zu bytes: %@", dispatch_data_get_size(data),
 		      error.localizedDescription);
 	return lib;

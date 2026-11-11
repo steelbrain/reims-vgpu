@@ -4,6 +4,7 @@
  */
 
 #include "RgfxSerializer.hpp"
+#include "RgfxLogOnce.hpp"
 
 #include "RgfxIcbSlotTable.hpp"
 
@@ -756,8 +757,10 @@ void RgfxSerializer::postIcbMessage(IcbMessage &message, RgfxIcbFlush *flush)
 	if (!m_control.tryPost(RGFX_CMD_ICB_WRITE, message.bytes.data(), size, nullptr)) {
 		// The kext refused it, or the ring had no room: the buffer's commands keep what they
 		// had, as a lost encode.
-		std::fprintf(stderr, "RGFX: ICB_WRITE of %u bytes into 0x%llx was not posted\n", size,
-		             static_cast<unsigned long long>(message.icb));
+		static char site;
+		if (rgfxLogFirst(&site))
+			std::fprintf(stderr, "RGFX: ICB_WRITE of %u bytes into 0x%llx was not posted\n",
+			             size, static_cast<unsigned long long>(message.icb));
 	}
 	if (flush != nullptr) {
 		flush->messages++;
@@ -786,7 +789,9 @@ void RgfxSerializer::postIcbSlots(const std::vector<RgfxIcbSlotRun> &runs, RgfxI
 		const auto start = std::chrono::steady_clock::now();
 		if (!m_control.tryPost(RGFX_CMD_ICB_SLOTS, bytes.data(), size, nullptr)) {
 			// As a lost ICB_WRITE: the commands keep what they had.
-			std::fprintf(stderr, "RGFX: ICB_SLOTS of %zu runs was not posted\n", n);
+			static char site;
+			if (rgfxLogFirst(&site))
+				std::fprintf(stderr, "RGFX: ICB_SLOTS of %zu runs was not posted\n", n);
 		}
 		if (flush != nullptr) {
 			flush->messages++;

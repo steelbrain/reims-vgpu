@@ -5,6 +5,7 @@
  */
 
 #include "RgfxRingWriter.hpp"
+#include "RgfxLogOnce.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -25,8 +26,9 @@ constexpr uint32_t kProducerWaiting = __builtin_offsetof(RgfxRingHeader, produce
 // before it looks again: a backstop only.
 constexpr uint32_t kRoomBackstopUs = 20000;
 
-// How often a writer's room line is logged at most, while its posts sleep for room.
-constexpr uint64_t kSleepsLogNs = 1000000000;
+// How often a writer's room line is logged at most, while its posts sleep for room: a summary,
+// once a minute (docs/conventions.md).
+constexpr uint64_t kSleepsLogNs = 60ull * 1000000000;
 
 // A message's header is 16 bytes; sizes are a multiple of 8.
 constexpr uint32_t kHeaderBytes = sizeof(RgfxMsgHeader);
