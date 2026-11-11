@@ -357,10 +357,11 @@ fn lane(mut identity: IdentityCaps, compile_threads: u64, guest_ram: Option<u64>
 /// runtime's blocks, the page's frames and the display's presents.
 ///
 /// The RAM is what the host's memory map holds
-/// ([`GraphicsConfig::memory_map`](crate::GraphicsConfig::memory_map)), within a MiB of the
-/// guest's `hw.memsize`: QEMU's `vmapple` under HVF maps its firmware's 1 MiB and its config's
-/// 64 KiB too, which add 816 KiB to the answer for a guest of 8 GiB (0.7501 of its RAM), and
-/// `q35`'s map leaves out the 384 KiB below 1 MiB that VGA and the ROMs hold.
+/// ([`GraphicsConfig::memory_map`](crate::GraphicsConfig::memory_map)): on QEMU's `q35`, the
+/// guest's RAM (guests of 8 GiB were told 6442450944 bytes, three quarters of it, in macOS 14.8.9
+/// and 26.7.2 on an Iris Xe); on its `vmapple` under HVF, the guest's RAM and the firmware's
+/// 1 MiB and the config's 64 KiB, which add 816 KiB to the answer for a guest of 8 GiB (a macOS
+/// 27.0.1 guest was told 6443286528 bytes, 0.7505 of its `hw.memsize`).
 fn lane_working_set(platform: Option<u64>, unified: bool, guest_ram: Option<u64>) -> Option<u64> {
     const PAGE: u64 = 16 << 10;
     match (platform, guest_ram) {
