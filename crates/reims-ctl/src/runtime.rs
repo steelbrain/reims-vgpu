@@ -1149,8 +1149,11 @@ mod tests {
         }
     }
 
+    /// A command's program, arguments and environment changes, as [`command_of`] reads them.
+    type CommandParts = (String, Vec<String>, Vec<(String, Option<String>)>);
+
     /// The program, arguments and environment changes `inv`'s command runs with.
-    fn command_of(inv: &Invocation) -> (String, Vec<String>, Vec<(String, Option<String>)>) {
+    fn command_of(inv: &Invocation) -> CommandParts {
         let cmd = inv.command();
         let s = |o: &std::ffi::OsStr| o.to_string_lossy().into_owned();
         let mut envs: Vec<_> = cmd.get_envs().map(|(k, v)| (s(k), v.map(s))).collect();
