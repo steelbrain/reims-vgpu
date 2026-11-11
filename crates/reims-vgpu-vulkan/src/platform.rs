@@ -781,7 +781,10 @@ pub(crate) mod tests {
         assert_eq!(fast.extended_range_blits, ExtendedRangeBlitPolicy::Kept);
         assert_eq!(fast.queue_sharing, QueueSharingPolicy::Adaptive);
         assert_eq!(fast.dont_care_colors, DontCareColorPolicy::Driver);
-        assert_eq!(fast.unstored_dont_care_loads, UnstoredDontCarePolicy::Driver);
+        assert_eq!(
+            fast.unstored_dont_care_loads,
+            UnstoredDontCarePolicy::Driver
+        );
         for unchanged in [
             None,
             Some(""),
