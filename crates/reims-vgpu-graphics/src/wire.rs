@@ -942,9 +942,11 @@ pub const RGFX_EVT_CB_SCHEDULED: u32 = 0x405;
 /// [`RGFX_FEATURE_CB_SUBMITTED`]: a command buffer that asked for it
 /// ([`RGFX_OP_SUBMITTED`](crate::ops::RGFX_OP_SUBMITTED)) is submitted, as Metal's is when its
 /// `commitAndWaitUntilSubmitted` returns. Posted once, ahead of the buffer's [`RgfxCbScheduled`]
-/// and [`RgfxCbComplete`]: as soon as the host takes it, before it carries out its ops, where it
-/// waits for no event, the host fills no device cache it uses first and no buffer before it on its
-/// queue waits; else once its waits are satisfied, at its scheduling.
+/// and [`RgfxCbComplete`]: as soon as the host takes it, before it carries out its ops and before
+/// the fills of device caches it uses first that the host makes at once, where it waits for no
+/// event, follows no deferred copy of a device cache, and has no buffer before it on its queue
+/// that waits for one and is not yet scheduled; else once its waits are satisfied, at its
+/// scheduling.
 pub const RGFX_EVT_CB_SUBMITTED: u32 = 0x406;
 /// Event `ICB_STATE` ([`RgfxIcbState`], on the control completion ring): an `ICB_CREATE`'s
 /// answer.
