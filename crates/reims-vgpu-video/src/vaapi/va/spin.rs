@@ -65,8 +65,8 @@ use std::ffi::CStr;
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::MetadataExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::core::runtime::{Runtime, StdRuntime};
@@ -282,8 +282,6 @@ pub(crate) struct Spin {
 /// The device, the shader's pipeline and the flag, freed once the shader
 /// has ended and nothing holds them.
 struct Gpu {
-    _entry: ash::Entry,
-    instance: ash::Instance,
     device: ash::Device,
     queue: vk::Queue,
     memory: vk::DeviceMemory,
@@ -362,7 +360,6 @@ impl Drop for Gpu {
             self.device.unmap_memory(self.memory);
             self.device.free_memory(self.memory, None);
             self.device.destroy_device(None);
-            self.instance.destroy_instance(None);
         }
         LIVE.fetch_sub(1, Ordering::SeqCst);
         stop_watching();
@@ -466,6 +463,30 @@ fn failed(what: &str) -> impl FnOnce(vk::Result) -> String + '_ {
     move |result| format!("{what}: {result}")
 }
 
+/// The Vulkan loader and the one instance every spin of the process makes its device on, made at
+/// the first spin and kept until the process ends, never destroyed. With NVIDIA's driver
+/// installed beside amdgpu's, a process that destroyed its last instance (the loader unloads the
+/// drivers with it) and closed the loader died at its exit, in NVIDIA's `libEGL_nvidia.so.0`,
+/// which NVIDIA's Vulkan driver had loaded and was unloaded by then, after its test had passed
+/// (measured 2026-11-11 on a host with an RX 7900 XTX under RADV, Mesa 26.2.6, and an RTX 2080
+/// under NVIDIA 620.70.06: every run with both drivers, none with RADV's alone).
+fn vulkan() -> Result<&'static (ash::Entry, ash::Instance), NoSpin> {
+    static VULKAN: OnceLock<Result<(ash::Entry, ash::Instance), String>> = OnceLock::new();
+    VULKAN
+        .get_or_init(|| {
+            // SAFETY: loads the system's Vulkan loader, kept open for the process.
+            let entry = unsafe { ash::Entry::load() }.map_err(|e| format!("no Vulkan: {e}"))?;
+            let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
+            let info = vk::InstanceCreateInfo::default().application_info(&app);
+            // SAFETY: a valid create info, for the call.
+            let instance = unsafe { entry.create_instance(&info, None) }
+                .map_err(failed("vkCreateInstance"))?;
+            Ok((entry, instance))
+        })
+        .as_ref()
+        .map_err(|why| NoSpin::Failed(why.clone()))
+}
+
 /// Why no spin is made.
 #[derive(Debug)]
 pub(crate) enum NoSpin {
@@ -511,16 +532,10 @@ impl Spin {
                 "amdgpu.lockup_timeout {limit:?} is under {LIMIT:?}"
             )));
         }
-        // SAFETY: loads the system's Vulkan loader.
-        let entry = unsafe { ash::Entry::load() }.map_err(|e| format!("no Vulkan: {e}"))?;
-        let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
-        let info = vk::InstanceCreateInfo::default().application_info(&app);
-        // SAFETY: a valid create info, for the call.
-        let instance =
-            unsafe { entry.create_instance(&info, None) }.map_err(failed("vkCreateInstance"))?;
+        let (_, instance) = vulkan()?;
         // On an error, what was made is left to the process's end: the
         // test fails.
-        let gpu = Self::on(entry, instance, (major, minor), ring)?;
+        let gpu = Self::on(instance, (major, minor), ring)?;
         LIVE.fetch_add(1, Ordering::SeqCst);
         watch();
         Ok(Spin {
@@ -531,12 +546,7 @@ impl Spin {
 
     /// The device and the shader on `instance`'s device of the render node
     /// `node`.
-    fn on(
-        entry: ash::Entry,
-        instance: ash::Instance,
-        node: (i64, i64),
-        ring: Ring,
-    ) -> Result<Gpu, NoSpin> {
+    fn on(instance: &ash::Instance, node: (i64, i64), ring: Ring) -> Result<Gpu, NoSpin> {
         // SAFETY: the instance's own calls, with valid out-pointers.
         let physicals = unsafe { instance.enumerate_physical_devices() }
             .map_err(failed("vkEnumeratePhysicalDevices"))?;
@@ -653,7 +663,6 @@ impl Spin {
                 _ => {
                     device.destroy_buffer(buffer, None);
                     device.destroy_device(None);
-                    instance.destroy_instance(None);
                     let lacks = if timestamps {
                         "the host resets no query (hostQueryReset)"
                     } else {
@@ -807,8 +816,6 @@ impl Spin {
                 .create_fence(&vk::FenceCreateInfo::default(), None)
                 .map_err(failed("vkCreateFence"))?;
             Ok(Gpu {
-                _entry: entry,
-                instance,
                 device,
                 queue,
                 memory,
