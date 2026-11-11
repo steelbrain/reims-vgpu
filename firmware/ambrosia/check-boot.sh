@@ -91,6 +91,15 @@
 #              entitlement only Apple's signatures may carry, is killed (exit 137), and 5 s later
 #              kern.bootsessionuuid is the login's. It runs last of the guest's checks, after
 #              every read of this boot's log, as a failure can take the guest down.
+#   screen     the display at the end, as QMP's screendump has it (screen.png, else screen.ppm), is
+#              not one colour or nearly so: its commonest colour covers at most 90% of it, and it
+#              has at least 1024 distinct colours. A desktop composited empty is one colour while
+#              WindowServer still presents, which metal-app, measuring presentation and not pixels,
+#              passes. Measured on 2026-11-11 over the screendumps of 69 passing boots under HVF
+#              (14.6.1, 15.6.1, 26.6.2, 27.0.1 and 27.2.1, white-widget and clean desktops among
+#              them): the commonest colour on 3.7% to 21.0% of the screen and 240414 to 404446
+#              distinct colours; the 48 of 27.0.1, 3.7% to 5.0% and 395116 to 404446. An
+#              all-black frame has one colour on all of it.
 #   no-fatal   no `reims-vgpu: fatal` line in QEMU's log or the serial log.
 #
 # OUT keeps serial.log, qemu.log, screen.png (QMP's screendump of the display at the end, before
@@ -285,7 +294,7 @@ qpid=$!
 # --- the checks ---------------------------------------------------------------------------------
 
 names=(firmware console ssh sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map page-count ax-matrix
-  amfi-refuse no-fatal)
+  amfi-refuse screen no-fatal)
 # What a check reports beside its verdict, printed under it: neither a pass nor a failure.
 findings=()
 # The guest's kern.bootsessionuuid at the login and after the Metal work, the panic reports
@@ -574,6 +583,83 @@ fi
 qmp "{\"execute\": \"screendump\", \"arguments\": {\"filename\": \"$out/screen.png\", \"format\": \"png\"}}" > /dev/null 2>&1 ||
   qmp "{\"execute\": \"screendump\", \"arguments\": {\"filename\": \"$out/screen.ppm\"}}" > /dev/null 2>&1
 stop_qemu
+
+# The screendump's colours: "DISTINCT SHARE", how many distinct colours it has and the share of
+# its pixels the commonest covers, read by the standard library alone (zlib for an 8-bit PNG, as
+# QEMU writes it, or a binary PPM); else "unread: WHY".
+screen_colours() {
+  python3 -I - "$1" << 'PY' 2>&1 | tail -1
+import collections, struct, sys, zlib
+path = sys.argv[1]
+try:
+    d = open(path, 'rb').read()
+    if d[:8] == b'\x89PNG\r\n\x1a\n':
+        i, idat, hdr = 8, [], None
+        while i + 8 <= len(d):
+            n, t = struct.unpack('>I4s', d[i:i + 8])
+            if t == b'IHDR':
+                hdr = struct.unpack('>IIBBBBB', d[i + 8:i + 21])
+            elif t == b'IDAT':
+                idat.append(d[i + 8:i + 8 + n])
+            elif t == b'IEND':
+                break
+            i += 12 + n
+        w, h, depth, ctype, _, _, interlace = hdr
+        if depth != 8 or interlace or ctype not in (0, 2, 4, 6):
+            raise ValueError(f'a PNG of depth {depth}, colour type {ctype}, interlace {interlace}')
+        bpp = {0: 1, 2: 3, 4: 2, 6: 4}[ctype]
+        raw, stride, prev, px = zlib.decompress(b''.join(idat)), w * bpp, bytearray(w * bpp), []
+        for y in range(h):
+            at = y * (stride + 1)
+            f, line = raw[at], bytearray(raw[at + 1:at + 1 + stride])
+            for x in range(stride) if f else ():
+                a = line[x - bpp] if x >= bpp else 0
+                b = prev[x]
+                c = prev[x - bpp] if x >= bpp else 0
+                if f == 1:
+                    line[x] = (line[x] + a) & 255
+                elif f == 2:
+                    line[x] = (line[x] + b) & 255
+                elif f == 3:
+                    line[x] = (line[x] + ((a + b) >> 1)) & 255
+                elif f == 4:
+                    q = a + b - c
+                    pa, pb, pc = abs(q - a), abs(q - b), abs(q - c)
+                    line[x] = (line[x] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+            px.extend(bytes(line[x:x + min(bpp, 3)]) for x in range(0, stride, bpp))
+            prev = line
+    else:
+        parts = d.split(maxsplit=4)
+        if len(parts) < 5 or parts[0] != b'P6' or parts[3] != b'255':
+            raise ValueError('neither an 8-bit PNG nor an 8-bit binary PPM')
+        w, h, body = int(parts[1]), int(parts[2]), parts[4]
+        px = [body[i:i + 3] for i in range(0, w * h * 3, 3)]
+    if not px:
+        raise ValueError('no pixels')
+    colours = collections.Counter(px)
+    print(f'{len(colours)} {colours.most_common(1)[0][1] / len(px):.4f}')
+except Exception as e:
+    print(f'unread: {e}')
+PY
+}
+shot=$out/screen.png
+[[ -s $shot ]] || shot=$out/screen.ppm
+if [[ ! -s $shot ]]; then
+  verdict screen FAIL "no screendump: QMP's screendump wrote no screen.png or screen.ppm"
+else
+  sc=$(screen_colours "$shot")
+  read -r sc_n sc_top <<< "$sc"
+  if ! [[ $sc_n =~ ^[0-9]+$ && $sc_top =~ ^[0-9.]+$ ]]; then
+    verdict screen FAIL "$(basename "$shot") ${sc:-unread}"
+  else
+    sc_say="$(basename "$shot"): $sc_n distinct colours, the commonest on $(awk -v t="$sc_top" 'BEGIN { printf "%.1f", t * 100 }')% of it"
+    if awk -v t="$sc_top" -v n="$sc_n" 'BEGIN { exit !(t <= 0.9 && n >= 1024) }'; then
+      verdict screen PASS "$sc_say"
+    else
+      verdict screen FAIL "$sc_say: one colour or nearly so (a pass has the commonest on at most 90% and 1024 colours or more)"
+    fi
+  fi
+fi
 
 # What the host's log says of the display and of deaths, once QEMU has ended.
 presents=$(grep -c -E 'the display shows IOSurface [1-9]' "$out/qemu.log")

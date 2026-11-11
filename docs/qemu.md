@@ -1091,8 +1091,16 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/target/ambrosia.bin \
   a copy of `/usr/bin/true` signed ad hoc with `com.apple.rootless.install`
   is killed by AMFI (exit 137), its refusal passing through RgfxGate's
   signature hook, and 5 s later `kern.bootsessionuuid` is still the
-  login's. `no-fatal`: no `reims-vgpu: fatal` line in QEMU's log or the
-  serial log. A reading in the guest that printed nothing fails its check as
+  login's. `screen`: QMP's screendump at the end (`screen.png`, else
+  `screen.ppm`) is not one colour or nearly so: its commonest colour covers
+  at most 90% of it, and it has 1024 distinct colours or more. A desktop
+  that WindowServer composites empty is one colour while it still presents,
+  which `metal-app` passes, as it measures presentation and not pixels. The
+  bounds are well clear of the screendumps of 69 passing boots under HVF
+  on 2026-11-11 (14.6.1, 15.6.1, 26.6.2, 27.0.1 and 27.2.1): the commonest
+  colour on 3.7% to 21.0% of the screen, and 240,414 to 404,446 distinct
+  colours.
+  `no-fatal`: no `reims-vgpu: fatal` line in QEMU's log or the serial log. A reading in the guest that printed nothing fails its check as
   unread (a desktop poll that never answered is no desktop), and under TCG
   each command in the guest, each SSH login the boot waits on, and the wait
   for the desktop have 5 times their HVF limits.
