@@ -57,21 +57,24 @@
 #              the end; and the host's log says the display shows an IOSurface the guest
 #              presented.
 #   metal-app  present_probe, an on-screen Metal app, ran full-screen for 10 s in the user's
-#              session, as the lane gate's present phase: OK, frames presented, and at most a
-#              tenth dropped or unanswered (report.py's bar for the correctness boot). Under TCG
-#              it passes on OK, frames presented and at most 3 unanswered; its drops and rates
-#              are printed but not judged, as the emulated CPU sets the rate WindowServer
-#              composites at, and pacing is judged under HVF only. Beside the probe's line, the
-#              host's count of display flips during the probe's call, WindowServer's own present
-#              rate, to read its drops against. A probe that falls short while Setup Assistant
-#              runs fails as unread, naming it: its full-screen window covers the probe's, whose
-#              frames are then never shown. On Linux the line also gives the host's pressure over
-#              the probe's call, as /proc/pressure and /proc/vmstat count it: the time a second
-#              that some task waited for a CPU, for memory and for IO, the time all did for
+#              session, as the lane gate's present phase, from a second after its window was first
+#              shown: it waits up to 60 s for that (-v 60), as under TCG the guest's post-login
+#              launches can hold a new window back for seconds (docs/lessons.md), and visible_s on
+#              its line is the wait. It passes on OK, frames presented, and at most a tenth dropped
+#              or unanswered (report.py's bar for the correctness boot). Under TCG it passes on OK,
+#              frames presented and at most 3 unanswered; its drops and rates are printed but not
+#              judged, as the emulated CPU sets the rate WindowServer composites at, and pacing is
+#              judged under HVF only. Beside the probe's line, the host's count of display flips
+#              during the probe's call, WindowServer's own present rate, to read its drops against.
+#              A probe that falls short while Setup Assistant runs fails as unread, naming it: its
+#              full-screen window covers the probe's, whose frames are then never shown. A window
+#              not shown within the wait fails, saying so. On Linux the line also gives the host's
+#              pressure over the probe's call, as /proc/pressure and /proc/vmstat count it: the time
+#              a second that some task waited for a CPU, for memory and for IO, the time all did for
 #              memory, and the direct compactions and reclaims; a probe that falls short beside
-#              other work on the host shows it there. The probe is full-screen at the status
-#              level, which needs no right to be in front: WindowServer denied a probe started
-#              over SSH that right, and its titled window was never shown (docs/lessons.md).
+#              other work on the host shows it there. The probe is full-screen at the status level,
+#              which needs no right to be in front: WindowServer denied a probe started over SSH
+#              that right, and its titled window was never shown (docs/lessons.md).
 #   bundle-install
 #              RgfxGate installed the Metal bundle, as it records it and as the disk shows it:
 #              its Graft client state (GraftClient.ai.aneesiqbal.RgfxGate) reads installed,
@@ -492,7 +495,7 @@ if [[ -n $ssh_s ]]; then
     # debug); those during the probe's call are WindowServer's own
     # presents, the rate the probe's frames can reach the display at.
     p0=$(host_pressure) q0=$(wc -l < "$out/qemu.log") t0=$SECONDS
-    probe=$(G 60 "echo '$GUEST_PASS' | sudo -S -p '' launchctl asuser \$(id -u) sudo -u \$(id -un) perl -e 'alarm shift @ARGV; exec @ARGV' $((40 * slow)) \$HOME/ambrosia-check/present_probe -t 10" |
+    probe=$(G 90 "echo '$GUEST_PASS' | sudo -S -p '' launchctl asuser \$(id -u) sudo -u \$(id -un) perl -e 'alarm shift @ARGV; exec @ARGV' $((80 * slow)) \$HOME/ambrosia-check/present_probe -t 10 -v 60" |
       grep '^present_probe:' | head -1)
     flips=$(tail -n +"$((q0 + 1))" "$out/qemu.log" | grep -c -E 'the display shows IOSurface [1-9]') secs=$((SECONDS - t0))
     ws_say="WindowServer: $flips display flips in the probe's ${secs} s call ($(perl -e 'printf "%.1f", $ARGV[0] / ($ARGV[1] || 1)' "$flips" "$secs")/s)"
@@ -510,6 +513,8 @@ if [[ -n $ssh_s ]]; then
       verdict metal-app PASS "${probe#present_probe: }; $ws_say"
     elif [[ -n $cover_say ]]; then
       verdict metal-app FAIL "unread: $cover_say; ${probe:-present_probe printed no result line}; $ws_say"
+    elif [[ $probe == *" visible_s=none"* ]]; then
+      verdict metal-app FAIL "its window was not shown in 60 s: ${probe#present_probe: }; $ws_say"
     else
       verdict metal-app FAIL "${probe:-present_probe printed no result line}; $ws_say"
     fi

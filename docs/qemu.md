@@ -1079,7 +1079,11 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/target/ambrosia.bin \
   Metal device that is not Apple's paravirtual one, WindowServer's pid kept,
   and the host's log showing an IOSurface the guest presented.
   `metal-app`: `present_probe` full-screen in the user's session, under
-  `report.py`'s bar; under TCG it passes on frames presented with at most 3
+  `report.py`'s bar, measured from a second after its window is first shown,
+  which it waits up to 60 s for (`-v 60`, the line's `visible_s`): under TCG
+  the guest's post-login launches can hold a new window back for seconds
+  ([lessons.md](lessons.md)), and a window not shown in that time fails,
+  saying so. Under TCG it passes on frames presented with at most 3
   answers missing, and its drops are printed but not judged, as the emulated
   CPU sets WindowServer's composite rate (pacing is judged under HVF only).
   Its line also gives the host's display flips during the probe,
@@ -1225,11 +1229,11 @@ refresh thread does, kept every tick in every run, at most 5.9 ms late.
   run with no lease (job `m3-max-17037`) put the device on it.
 - **The whole machine**, for a run that gates a change: `--exclusive
   --hold-line`, as for any boot whose timings decide its verdict ("Booting a
-  guest to check a change", above). Under TCG, `metal-app` passes only on
-  frames shown within the probe's 10 s, and the emulated guest gets through
-  its work at the pace of the CPU its vCPUs get. Beside a build that used 34
-  minutes of CPU in 4 min 18 s (job `m3-max-17260`), 14.6.1's probe showed
-  no frame (job `m3-max-17111`). The probe's line gives the host's pressure
+  guest to check a change", above). Under TCG the emulated guest gets
+  through its work at the pace of the CPU its vCPUs get. Beside a build that
+  used 34 minutes of CPU in 4 min 18 s (job `m3-max-17260`), 14.6.1's probe
+  window was not shown within the probe's 10 s, before `metal-app` waited
+  for it (job `m3-max-17111`). The probe's line gives the host's pressure
   over its run, so a run beside other work shows it.
 - **The device's library and our QEMU, built on the node**, in one potluck
   workspace that the boots then reuse (`--workspace`): `cargo xtask dist`
