@@ -315,7 +315,9 @@ pub fn map_count_note(n: u64, memory_mib: u64) -> Option<String> {
 /// details; None for other VMs. An offline installer, which reims-util names
 /// `…-offline-installer.img`, installs from its script; any other installer boots Recovery,
 /// whose Reinstall macOS installs it. For a disk on NVMe, they first say to move it to SATA
-/// ([`DiskController`]).
+/// ([`DiskController`]). An offline installer holds its release whole, so its steps say to
+/// install with the VM's network off, which keeps macOS's installer from downloading an update
+/// as it installs, and to turn the network back on afterwards.
 pub fn install_steps(vm: &Vm) -> Option<String> {
     let q = vm.config.q35.as_ref()?;
     let installer = q.installer.as_ref()?;
@@ -336,11 +338,26 @@ pub fn install_steps(vm: &Vm) -> Option<String> {
              form). "
         ),
     };
+    let network_off = if offline && vm.config.network.enabled {
+        format!(
+            "Its installer holds the whole release, so turn the VM's network off before you \
+             start it (reims-ctl set {name} --network false, or Network in its edit form): with \
+             a network, macOS's installer can download an update as it installs, a second \
+             download of the release. "
+        )
+    } else {
+        String::new()
+    };
+    let network_on = if offline {
+        format!(" and turn its network back on (reims-ctl set {name} --network)")
+    } else {
+        String::new()
+    };
     Some(format!(
-        "{first}To install macOS, start {name}: OpenCore boots its installer into macOS \
-         Recovery. If the VM's disk is new, open Disk Utility, erase it (QEMU HARDDISK Media) as \
-         APFS and quit Disk Utility. Then {last}. Once macOS is installed, eject the installer \
-         (reims-ctl eject {name})."
+        "{first}{network_off}To install macOS, start {name}: OpenCore boots its installer into \
+         macOS Recovery. If the VM's disk is new, open Disk Utility, erase it (QEMU HARDDISK \
+         Media) as APFS and quit Disk Utility. Then {last}. Once macOS is installed, eject the \
+         installer (reims-ctl eject {name}){network_on}."
     ))
 }
 
@@ -1180,7 +1197,47 @@ mod tests {
         let steps = install_steps(&vm).unwrap();
         assert!(
             steps.ends_with("eject the installer (reims-ctl eject t).")
-                && !steps.contains("error mode"),
+                && !steps.contains("error mode")
+                && !steps.contains("--network"),
+            "{steps}"
+        );
+    }
+
+    /// An offline installer's steps say to install with the network off, before the VM starts,
+    /// and to turn it back on with the installer ejected; with the network already off, only the
+    /// second.
+    #[test]
+    fn offline_install_steps_install_with_the_network_off() {
+        let config = r#"
+            name = "t"
+            profile = "q35-x86_64"
+            cpus = 2
+            memory_mib = 4096
+            disk = "disk.qcow2"
+            [q35]
+            opencore = "opencore.qcow2"
+            firmware_code = "OVMF_CODE.fd"
+            firmware_vars = "OVMF_VARS.fd"
+            installer = "macos-26.6.2-offline-installer.img"
+        "#;
+        let mut vm = Vm {
+            dir: "/vms/t".into(),
+            config: toml::from_str(config).unwrap(),
+        };
+        let off = "turn the VM's network off before you start it (reims-ctl set t --network false";
+        let on = "eject the installer (reims-ctl eject t) and turn its network back on (reims-ctl \
+                  set t --network).";
+        let steps = install_steps(&vm).unwrap();
+        assert!(
+            steps.contains(off)
+                && steps.find(off) < steps.find("To install macOS, start t")
+                && steps.ends_with(on),
+            "{steps}"
+        );
+        vm.config.network.enabled = false;
+        let steps = install_steps(&vm).unwrap();
+        assert!(
+            !steps.contains("--network false") && steps.ends_with(on),
             "{steps}"
         );
     }

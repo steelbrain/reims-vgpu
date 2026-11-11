@@ -1521,13 +1521,22 @@ impl App {
                 false,
                 "Keep the library's log and the serial console, for bug reports.",
             ),
+            Field::toggle(
+                "network",
+                "Network",
+                true,
+                "User-mode networking (NAT). Installing from an offline installer, turn it off: \
+                 with a network, its installer can download an update as it installs, a second \
+                 download of the release. Turn it on in the VM's edit form once macOS is set up.",
+            ),
             Field::text(
                 "ssh_port",
                 "SSH port",
                 "",
                 "Optional: a port on 127.0.0.1 forwarded to the guest's SSH (Remote Login).",
             )
-            .placeholder("optional"),
+            .placeholder("optional")
+            .show_if("network", &["yes"]),
         ]);
         let form = Form::new("New VM", "create", fields);
         self.overlay = Some(Overlay::Form(FormKind::Create, form));
@@ -1818,7 +1827,10 @@ impl App {
         }
         s.display.check()?;
         s.logs = f.toggle("logs");
-        s.ssh_port = ssh_port_field(f)?;
+        s.network = f.toggle("network");
+        if s.network {
+            s.ssh_port = ssh_port_field(f)?;
+        }
         Ok(s)
     }
 

@@ -64,6 +64,8 @@ pub struct Spec {
     pub gpu: Gpu,
     pub logs: bool,
     pub audio: bool,
+    /// Its network card: on unless said off (an offline installer installs best without one).
+    pub network: bool,
     pub ssh_port: Option<u16>,
     pub mac: Option<String>,
     // q35
@@ -87,6 +89,7 @@ impl Spec {
             gpu: Gpu::default(),
             logs: false,
             audio: true,
+            network: true,
             ssh_port: None,
             mac: None,
             macos: None,
@@ -296,7 +299,7 @@ fn base_config(spec: &Spec, profile: Profile, disk: PathBuf, disk_format: ImageF
             backend: None,
         },
         network: Network {
-            enabled: true,
+            enabled: spec.network,
             mac: spec.mac.clone().unwrap_or_else(random_mac),
             ssh_port: spec.ssh_port.and_then(ssh_port),
         },

@@ -240,8 +240,9 @@ const CREATE_EXAMPLES: &str = r"
     # macOS is installed, reims-ctl eject mac takes the installer out
     reims-ctl create mac --macos tahoe --start
 
-    # One exact release, which installs with no network (13 to 20 GB)
-    reims-ctl create mac --macos 26.6.2 --offline --start
+    # One exact release, which installs with no network (13 to 20 GB); with the VM's
+    # network off, its installer downloads no update as it installs
+    reims-ctl create mac --macos 26.6.2 --offline --network false --start
 
     # An installer of your own, such as a recovery image (BaseSystem.dmg)
     reims-ctl create mac --installer ~/Downloads/BaseSystem.dmg
@@ -288,7 +289,8 @@ pub struct CreateArgs {
     pub macos: Option<String>,
     /// With --macos, an offline installer of one release (13 to 20 GB), which installs with no
     /// network, rather than Apple's recovery image (about 1 GB), which downloads the newest
-    /// release as it installs
+    /// release as it installs. Install it with the VM's network off (--network false), so its
+    /// installer downloads no update
     #[arg(long, requires = "macos")]
     pub offline: bool,
     /// An installer image of your own, attached as a disk: a raw image, such as a recovery
@@ -325,6 +327,10 @@ pub struct CreateArgs {
     /// OpenCore's boot chime plays on
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub audio: Option<bool>,
+    /// Its network card (user-mode NAT); --network false makes it with none, as an offline
+    /// installer's install is best done
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub network: Option<bool>,
     /// Forward this port on 127.0.0.1 to the guest's SSH port; 0 for none
     #[arg(long)]
     pub ssh_port: Option<u16>,
@@ -684,6 +690,7 @@ fn create_cmd(a: CreateArgs, host: Host) -> Result<()> {
     }
     s.logs = a.logs.unwrap_or(false);
     s.audio = a.audio.unwrap_or(true);
+    s.network = a.network.unwrap_or(true);
     s.ssh_port = a.ssh_port;
     let vm = create::create(s, host, &mut |p| println!("{name}: {p}")).map_err(|e| {
         if source {
