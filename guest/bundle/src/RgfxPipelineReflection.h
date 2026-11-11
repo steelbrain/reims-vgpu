@@ -41,6 +41,17 @@
 // The objects are Metal's own reflection classes, made through their initialisers, with the
 // instance variables those leave unset set by name, each class, initialiser and instance variable
 // looked up at run time: what is missing makes no reflection.
+// Before macOS 13, whose Metal has no binding classes (MTLBindingInternal and its kind), each
+// binding is an argument of Metal's MTLArgumentInternal, of the binding's name, type (MTLArgumentType
+// numbers each kind as MTLBindingType does), access, index, use (its `active`) and array length,
+// and of the binding's own type object, from which its getters answer; built-ins and an argument
+// buffer's constants are of that release's MTLBuiltInArgument and MTLIndirectConstantArgument,
+// which are MTLArgumentInternal's; the pipelines' reflections keep no binding lists and no print
+// style, and a struct type is made of no type name where its class takes none (macOS 11). Mesh
+// pipelines and objects' payloads, macOS 13's, answer none (measured: macOS 11.7.11's and 12.7.6's
+// classes, their instance variables and methods). The GL renderer reads a stage's uniforms and
+// textures from these arguments, beside its variant's return data (measured: macOS 11.7.11, a
+// reflection of return data alone binds none of them).
 //
 // What is left out, logged once per reason, answering nil (no reflection, as the device did
 // before):
@@ -140,6 +151,11 @@ id _Nullable RgfxComputePipelineReflectionOf(id<MTLFunction> _Nullable kernel,
 id _Nullable RgfxRenderPipelineReflectionOf(id<MTLFunction> _Nullable vertex,
                                             MTLVertexDescriptor *_Nullable vertexDescriptor,
                                             id<MTLFunction> _Nullable fragment, MTLPipelineOption options);
+// For tests: answers from then on of the classes `standIns` names in place of Metal's (each Metal
+// class's name, to its stand-in, or to NSNull for one Metal is to lack), as on a release whose
+// Metal has those; nil goes back to Metal's own.
+void RgfxPipelineReflectionUseClassesForTests(NSDictionary<NSString *, id> *_Nullable standIns);
+
 // The reflection a function answers by itself (RgfxFunctionReflectionMake): nil, logged once per
 // reason, where it is not made.
 id _Nullable RgfxFunctionReflectionOf(id<MTLFunction> function);

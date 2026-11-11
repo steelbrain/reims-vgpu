@@ -1,7 +1,7 @@
 // RgfxPipelineReflection: see RgfxPipelineReflection.h. Our own ObjC++: Metal's reflection classes,
 // their initialisers and their instance variables are named as the Objective-C runtime lists them
 // (measured: macOS 26.7.1, AMD Radeon Pro 5300M and Intel UHD Graphics 630; tools/oracle
-// oracle_reflection's class dump).
+// oracle_reflection's class dump; macOS 11.7.11 and 12.7.6, the classes' dump in a guest).
 #import "RgfxPipelineReflection.h"
 
 #import "RgfxMetalPrivate.h"
@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 #include <set>
 #include <string>
 
@@ -82,6 +83,9 @@ NS_ASSUME_NONNULL_BEGIN
              elementIsIndirectArgumentBuffer:(BOOL)elementIsIndirectArgumentBuffer
                             isConstantBuffer:(BOOL)isConstantBuffer
                                     doRetain:(BOOL)doRetain;
+// A struct type's before macOS 12, of no type name (measured: macOS 11.7.11).
+- (nullable instancetype)initWithMembers:(__unsafe_unretained id _Nonnull const *_Nullable)members
+                                   count:(NSUInteger)count;
 - (void)setIsIndirectArgumentBuffer:(BOOL)value;
 - (void)setIndirectArgumentIndexStride:(NSUInteger)stride;
 - (void)setVertexDescriptorBuffer:(BOOL)value;
@@ -153,63 +157,121 @@ bool isStageInput(const std::string &kind)
 }
 
 // The classes the answers are made of, each looked up once with the initialiser it is made with.
+// macOS 11 and 12 have no binding classes (MTLBinding is macOS 13's), and macOS 11's struct type
+// takes no type name (measured: macOS 11.7.11 and 12.7.6, the classes' dump in a guest): there each
+// binding is an argument, Metal's MTLArgumentInternal of its type object (`legacy`), and a struct
+// type is made of its members alone.
 struct Classes {
 	Class type, structType, arrayType, pointerType, textureType, member, binding, bufferBinding, textureBinding,
-	    threadgroupBinding, builtIn, indirectConstant, payload, meshBuiltIn, compute, render;
-	NSString *missing; // the first class or initialiser that is not there, or nil
+	    threadgroupBinding, builtIn, indirectConstant, payload, meshBuiltIn, compute, render, argument;
+	bool legacy = false;      // no binding classes: arguments are `argument`'s
+	bool namedStructs = true; // the struct type's initialiser takes a type name
+	NSString *missing;        // the first class or initialiser that is not there, or nil
 };
+
+// The class Metal names `name`, or its stand-in among `standIns`
+// (RgfxPipelineReflectionUseClassesForTests).
+Class classNamed(NSDictionary<NSString *, id> *standIns, const char *name)
+{
+	id stand = standIns[@(name)];
+	if (stand == nil)
+		return NSClassFromString(@(name));
+	return stand == [NSNull null] ? Nil : (Class)stand;
+}
+
+Classes lookUpClasses(NSDictionary<NSString *, id> *standIns)
+{
+	Classes c;
+	struct Needed {
+		Class *cls;
+		const char *name;
+		SEL init;
+	};
+	// Each class of `list` with its initialiser; false, setting `missing`, at the first missing.
+	auto find = [&c, standIns](const Needed *list, size_t count) {
+		for (size_t i = 0; i < count; i++) {
+			const Needed &n = list[i];
+			*n.cls = classNamed(standIns, n.name);
+			if (*n.cls == Nil || ![*n.cls instancesRespondToSelector:n.init]) {
+				c.missing = [NSString stringWithFormat:@"-[%s %s]", n.name, sel_getName(n.init)];
+				return false;
+			}
+		}
+		return true;
+	};
+	const Needed kTypes[] = {
+	    {&c.type, "MTLTypeInternal", @selector(initWithDataType:)},
+	    {&c.structType, "MTLStructTypeInternal", @selector(initWithMembers:count:typeName:)},
+	    {&c.arrayType, "MTLArrayTypeInternal",
+	     @selector(initWithArrayLength:elementType:stride:pixelFormat:aluType:details:)},
+	    {&c.pointerType, "MTLPointerTypeInternal",
+	     @selector(initWithElementType:elementTypeDescription:access:alignment:dataSize:
+	                   elementIsIndirectArgumentBuffer:isConstantBuffer:doRetain:)},
+	    {&c.textureType, "MTLTextureReferenceTypeInternal",
+	     @selector(initWithDataType:textureType:access:isDepthTexture:)},
+	    {&c.member, "MTLStructMemberInternal",
+	     @selector(initWithName:offset:dataType:pixelFormat:aluType:indirectArgumentIndex:render_target:
+	                   raster_order_group:details:)},
+	};
+	const Needed kBindings[] = {
+	    {&c.binding, "MTLBindingInternal", @selector(initWithName:type:access:index:active:arrayLength:)},
+	    {&c.bufferBinding, "MTLBufferBindingInternal",
+	     @selector(initWithName:type:access:isActive:locationIndex:arraySize:dataType:pixelFormat:aluType:
+	                   isConstantBuffer:dataSize:alignment:)},
+	    {&c.textureBinding, "MTLTextureBindingInternal",
+	     @selector(initWithName:access:isActive:locationIndex:arraySize:dataType:textureType:isDepthTexture:)},
+	    {&c.threadgroupBinding, "MTLThreadgroupMemoryBindingInternal",
+	     @selector(initWithName:type:access:isActive:locationIndex:arraySize:dataType:dataSize:alignment:)},
+	};
+	const Needed kArguments[] = {
+	    {&c.builtIn, "MTLBuiltInArgument", @selector(initWithName:type:access:active:index:dataType:builtInType:)},
+	    {&c.indirectConstant, "MTLIndirectConstantArgument",
+	     @selector(initWithName:type:access:isActive:locationIndex:dataType:pixelFormat:aluType:dataSize:
+	                   alignment:)},
+	};
+	const Needed kMeshes[] = {
+	    {&c.payload, "MTLObjectPayloadBindingInternal",
+	     @selector(initWithName:type:access:isActive:locationIndex:arraySize:dataType:dataSize:alignment:)},
+	    {&c.meshBuiltIn, "MTLBuiltInMeshArgument",
+	     @selector(initWithName:type:access:active:index:dataType:builtInType:meshVertexStructType:
+	                   meshPrimitiveStructType:meshVertexCount:meshPrimitiveCount:meshTopologyType:)},
+	};
+	const Needed kPipelines[] = {
+	    {&c.compute, "MTLComputePipelineReflectionInternal", @selector(init)},
+	    {&c.render, "MTLRenderPipelineReflectionInternal", @selector(init)},
+	};
+	const Needed kLegacy[] = {
+	    {&c.argument, "MTLArgumentInternal",
+	     @selector(initWithName:type:access:index:active:arrayLength:typeDescription:)},
+	};
+	// Before macOS 13, no binding classes and no mesh's (both macOS 13's); before macOS 12, a struct
+	// type of no type name.
+	c.legacy = classNamed(standIns, "MTLBindingInternal") == Nil;
+	Class structType = classNamed(standIns, "MTLStructTypeInternal");
+	c.namedStructs = !c.legacy || structType == Nil ||
+	                 [structType instancesRespondToSelector:@selector(initWithMembers:count:typeName:)];
+	Needed types[std::size(kTypes)];
+	std::copy(std::begin(kTypes), std::end(kTypes), types);
+	if (!c.namedStructs)
+		types[1].init = @selector(initWithMembers:count:);
+	if (!find(types, std::size(types)))
+		return c;
+	if (c.legacy) {
+		find(kLegacy, std::size(kLegacy)) && find(kArguments, std::size(kArguments)) &&
+		    find(kPipelines, std::size(kPipelines));
+		return c;
+	}
+	find(kBindings, std::size(kBindings)) && find(kArguments, std::size(kArguments)) &&
+	    find(kMeshes, std::size(kMeshes)) && find(kPipelines, std::size(kPipelines));
+	return c;
+}
+
+const Classes *gTestClassSet; // the stand-ins' (RgfxPipelineReflectionUseClassesForTests), or null
 
 const Classes &classes()
 {
-	static Classes c;
-	static dispatch_once_t once;
-	dispatch_once(&once, ^{
-		const struct {
-			Class *cls;
-			const char *name;
-			SEL init;
-		} kNeeded[] = {
-		    {&c.type, "MTLTypeInternal", @selector(initWithDataType:)},
-		    {&c.structType, "MTLStructTypeInternal", @selector(initWithMembers:count:typeName:)},
-		    {&c.arrayType, "MTLArrayTypeInternal",
-		     @selector(initWithArrayLength:elementType:stride:pixelFormat:aluType:details:)},
-		    {&c.pointerType, "MTLPointerTypeInternal",
-		     @selector(initWithElementType:elementTypeDescription:access:alignment:dataSize:
-		                   elementIsIndirectArgumentBuffer:isConstantBuffer:doRetain:)},
-		    {&c.textureType, "MTLTextureReferenceTypeInternal",
-		     @selector(initWithDataType:textureType:access:isDepthTexture:)},
-		    {&c.member, "MTLStructMemberInternal",
-		     @selector(initWithName:offset:dataType:pixelFormat:aluType:indirectArgumentIndex:render_target:
-		                   raster_order_group:details:)},
-		    {&c.binding, "MTLBindingInternal", @selector(initWithName:type:access:index:active:arrayLength:)},
-		    {&c.bufferBinding, "MTLBufferBindingInternal",
-		     @selector(initWithName:type:access:isActive:locationIndex:arraySize:dataType:pixelFormat:aluType:
-		                   isConstantBuffer:dataSize:alignment:)},
-		    {&c.textureBinding, "MTLTextureBindingInternal",
-		     @selector(initWithName:access:isActive:locationIndex:arraySize:dataType:textureType:isDepthTexture:)},
-		    {&c.threadgroupBinding, "MTLThreadgroupMemoryBindingInternal",
-		     @selector(initWithName:type:access:isActive:locationIndex:arraySize:dataType:dataSize:alignment:)},
-		    {&c.builtIn, "MTLBuiltInArgument", @selector(initWithName:type:access:active:index:dataType:builtInType:)},
-		    {&c.indirectConstant, "MTLIndirectConstantArgument",
-		     @selector(initWithName:type:access:isActive:locationIndex:dataType:pixelFormat:aluType:dataSize:
-		                   alignment:)},
-		    {&c.payload, "MTLObjectPayloadBindingInternal",
-		     @selector(initWithName:type:access:isActive:locationIndex:arraySize:dataType:dataSize:alignment:)},
-		    {&c.meshBuiltIn, "MTLBuiltInMeshArgument",
-		     @selector(initWithName:type:access:active:index:dataType:builtInType:meshVertexStructType:
-		                   meshPrimitiveStructType:meshVertexCount:meshPrimitiveCount:meshTopologyType:)},
-		    {&c.compute, "MTLComputePipelineReflectionInternal", @selector(init)},
-		    {&c.render, "MTLRenderPipelineReflectionInternal", @selector(init)},
-		};
-		for (const auto &n : kNeeded) {
-			*n.cls = NSClassFromString(@(n.name));
-			if (*n.cls == Nil || ![*n.cls instancesRespondToSelector:n.init]) {
-				c.missing = [NSString stringWithFormat:@"-[%s %s]", n.name, sel_getName(n.init)];
-				return;
-			}
-		}
-	});
-	return c;
+	static const Classes c = lookUpClasses(nil);
+	return gTestClassSet != nullptr ? *gTestClassSet : c;
 }
 
 // The instance variable `name` of `o`'s class or a superclass, of an encoding of `type`'s first
@@ -474,7 +536,8 @@ struct Maker {
 		std::vector<__unsafe_unretained id> list(members.count);
 		for (NSUInteger i = 0; i < members.count; i++)
 			list[i] = members[i];
-		id s = [make(c.structType) initWithMembers:list.data() count:list.size() typeName:nil];
+		id s = c.namedStructs ? [make(c.structType) initWithMembers:list.data() count:list.size() typeName:nil]
+		                      : [make(c.structType) initWithMembers:list.data() count:list.size()];
 		if (argumentBuffer)
 			[s setIsIndirectArgumentBuffer:YES];
 		return s;
@@ -666,6 +729,10 @@ struct Maker {
 			}
 			const NSUInteger access = accessOf(n.access);
 			id t = texture(dataType, type, access, depth);
+			if (c.legacy) {
+				*info = t;
+				return argument(legacyArgument(name, MTLArgumentTypeTexture, access, n.index, used, n.count, t), used);
+			}
 			id b = [make(c.textureBinding) initWithName:name
 			                                    access:access
 			                                  isActive:used
@@ -681,6 +748,10 @@ struct Maker {
 			return argument(b, used);
 		}
 		if (n.kind == "air.sampler") {
+			if (c.legacy)
+				return argument(legacyArgument(name, MTLArgumentTypeSampler, MTLArgumentAccessReadOnly, n.index, used,
+				                               n.count, nil),
+				                used);
 			id b = [make(c.binding) initWithName:name
 			                               type:MTLBindingTypeSampler
 			                             access:MTLBindingAccessReadOnly
@@ -693,6 +764,8 @@ struct Maker {
 		if (tableType(n.kind, &table)) {
 			// Read only whatever the AIR's access (measured: an intersection function table of
 			// air.read_write answers MTLBindingAccessReadOnly), of no type object.
+			if (c.legacy)
+				return argument(legacyArgument(name, table, MTLArgumentAccessReadOnly, n.index, used, n.count, nil), used);
 			id b = [make(c.binding) initWithName:name
 			                               type:table
 			                             access:MTLBindingAccessReadOnly
@@ -742,6 +815,13 @@ struct Maker {
 			}
 			const NSUInteger alignment = n.hasTypeAlign ? n.typeAlign : align;
 			id p = pointer(type, element, MTLBindingAccessReadOnly, alignment, n.typeSize, false, false);
+			if (c.legacy) {
+				*info = p;
+				return p == nil ? nil
+				                : argument(legacyArgument(name, kValueBindingType, MTLArgumentAccessReadOnly, n.index,
+				                                          used, 1, p),
+				                           used);
+			}
 			id b = [make(c.bufferBinding) initWithName:name
 			                                     type:kValueBindingType
 			                                   access:MTLBindingAccessReadOnly
@@ -760,6 +840,10 @@ struct Maker {
 			return argument(b, used);
 		}
 		if (n.kind == "air.payload") {
+			if (c.legacy) {
+				fail(@"Metal has no MTLObjectPayloadBindingInternal");
+				return nil;
+			}
 			if (n.layout == nullptr || !n.hasTypeSize || !n.hasTypeAlign) {
 				fail(@"a payload of other than a struct");
 				return nil;
@@ -807,6 +891,13 @@ struct Maker {
 			if (argumentBuffer || m != nullptr)
 				return nil;
 			id p = pointer(type, st, access, n.typeAlign, n.typeSize, false, false);
+			if (c.legacy) {
+				*info = p;
+				return p == nil ? nil
+				                : argument(legacyArgument(name, MTLArgumentTypeThreadgroupMemory, access, n.index, used,
+				                                          n.count, p),
+				                           used);
+			}
 			id b = [make(c.threadgroupBinding) initWithName:name
 			                                          type:MTLBindingTypeThreadgroupMemory
 			                                        access:access
@@ -828,6 +919,12 @@ struct Maker {
 		const bool constant = n.addressSpace == 2;
 		const NSUInteger alignment = constant ? kConstantBufferAlignment : n.typeAlign;
 		id p = pointer(type, st, access, alignment, n.typeSize, argumentBuffer, constant);
+		if (c.legacy) {
+			*info = p;
+			return p == nil ? nil
+			                : argument(legacyArgument(name, MTLArgumentTypeBuffer, access, n.index, used, n.count, p),
+			                           used);
+		}
 		id b = [make(c.bufferBinding) initWithName:name
 		                                     type:MTLBindingTypeBuffer
 		                                   access:access
@@ -846,14 +943,32 @@ struct Maker {
 		return argument(b, used);
 	}
 
-	// `b`, an argument, used or not.
+	// `b`, an argument, used or not. Before macOS 13 an argument is one by its class, and its use is
+	// its `active`, where its class has no setter of either.
 	id argument(id b, BOOL used)
 	{
 		if (b == nil)
 			return nil;
-		[b setIsArgument:YES];
-		[b setIsUsed:used];
+		if (!c.legacy || [b respondsToSelector:@selector(setIsArgument:)])
+			[b setIsArgument:YES];
+		if (!c.legacy || [b respondsToSelector:@selector(setIsUsed:)])
+			[b setIsUsed:used];
 		return b;
+	}
+
+	// Before macOS 13, an argument of any kind: Metal's MTLArgumentInternal of its argument type
+	// (MTLArgumentType, which numbers each kind as MTLBindingType does), access, index, use, array
+	// length and type object, whose getters answer from that object's.
+	id legacyArgument(NSString *name, NSUInteger type, NSUInteger access, NSUInteger index, BOOL used,
+	                  NSUInteger arrayLength, id typeInfo)
+	{
+		return [make(c.argument) initWithName:name
+		                                 type:type
+		                               access:access
+		                                index:index
+		                               active:used
+		                          arrayLength:arrayLength
+		                      typeDescription:typeInfo];
 	}
 
 	// A descriptor's buffer, the `ordinal`th of its buffers in buffer index order.
@@ -861,7 +976,19 @@ struct Maker {
 	{
 		id p = pointer(MTLDataTypeStruct, nil, MTLBindingAccessReadOnly, kDescriptorBufferAlignment,
 		               static_cast<NSUInteger>(d.stride), false, false);
-		id b = [make(c.bufferBinding) initWithName:[NSString stringWithFormat:@"%@.%zu", prefix, ordinal]
+		NSString *name = [NSString stringWithFormat:@"%@.%zu", prefix, ordinal];
+		if (c.legacy) {
+			id b = p == nil ? nil
+			                : legacyArgument(name, MTLArgumentTypeBuffer, MTLArgumentAccessReadOnly, d.index, used, 1, p);
+			if (b == nil)
+				return nil;
+			if ([b respondsToSelector:@selector(setVertexDescriptorBuffer:)])
+				[b setVertexDescriptorBuffer:YES];
+			if ([b respondsToSelector:@selector(setIsUsed:)])
+				[b setIsUsed:used];
+			return b;
+		}
+		id b = [make(c.bufferBinding) initWithName:name
 		                                     type:MTLBindingTypeBuffer
 		                                   access:MTLBindingAccessReadOnly
 		                                 isActive:used
@@ -887,6 +1014,10 @@ struct Maker {
 		*listed = true;
 		NSString *name = @(n.name.c_str());
 		if (n.kind == "air.mesh") {
+			if (c.legacy) {
+				fail(@"Metal has no MTLBuiltInMeshArgument");
+				return nil;
+			}
 			if (!n.hasMesh)
 				return nil;
 			NSUInteger topology = 0;
@@ -1074,6 +1205,17 @@ NSArray *listOf(NSMutableArray *a)
 
 } // namespace
 
+void RgfxPipelineReflectionUseClassesForTests(NSDictionary<NSString *, id> *standIns)
+{
+	static Classes set;
+	if (standIns == nil) {
+		gTestClassSet = nullptr;
+		return;
+	}
+	set = lookUpClasses(standIns);
+	gTestClassSet = &set;
+}
+
 std::vector<RgfxDescriptorBuffer> RgfxVertexDescriptorBuffers(MTLVertexDescriptor *descriptor)
 {
 	std::vector<RgfxDescriptorBuffer> out;
@@ -1224,7 +1366,8 @@ id RgfxComputePipelineReflectionMake(const RgfxStageReflection &kernel, NSString
 	if (r == nil || !m.setObject(r, "_arguments", kernel.bindings) ||
 	    (kernel.pluginReturnData != nil && keepsReturnData &&
 	     !m.setObject(r, "_pluginReturnData", kernel.pluginReturnData)) ||
-	    !m.setObject(r, "_bindings", kernel.bindings ? [NSArray arrayWithArray:kernel.bindings] : nil) ||
+	    (!c.legacy &&
+	     !m.setObject(r, "_bindings", kernel.bindings ? [NSArray arrayWithArray:kernel.bindings] : nil)) ||
 	    !m.setObject(r, "_builtInArguments", kernel.builtIns) || !m.setNumber(r, "_traceBufferIndex", 'I', kNoIndex)) {
 		*why = m.why ?: @"Metal's compute pipeline reflection was not made";
 		return nil;
@@ -1252,7 +1395,7 @@ id RgfxFunctionReflectionMake(const RgfxStageReflection &stage, NSString *__stro
 	// (measured: macOS 26.7.1's does).
 	const bool keepsReturnData = class_getInstanceVariable(cls, "_pluginReturnData") != nullptr;
 	if (r == nil || !m.setObject(r, "_arguments", stage.bindings) ||
-	    !m.setObject(r, "_bindings", stage.bindings ? [NSArray arrayWithArray:stage.bindings] : nil) ||
+	    (!c.legacy && !m.setObject(r, "_bindings", stage.bindings ? [NSArray arrayWithArray:stage.bindings] : nil)) ||
 	    !m.setObject(r, "_builtInArguments", stage.builtIns) ||
 	    (stage.pluginReturnData != nil && keepsReturnData &&
 	     !m.setObject(r, "_pluginReturnData", stage.pluginReturnData))) {
@@ -1287,7 +1430,7 @@ id RgfxRenderPipelineReflectionMake(const RgfxStageReflection *vertex, const Rgf
 		if (!ok || s.stage == nullptr || s.stage->bindings == nil)
 			continue;
 		ok = m.setObject(r, s.arguments, s.stage->bindings) &&
-		     m.setObject(r, s.bindings, [NSArray arrayWithArray:s.stage->bindings]);
+		     (c.legacy || m.setObject(r, s.bindings, [NSArray arrayWithArray:s.stage->bindings]));
 	}
 	for (const auto &s : kStages) {
 		if (ok && s.stage != nullptr && s.stage->builtIns != nil && s.builtIns != nullptr)
@@ -1302,7 +1445,7 @@ id RgfxRenderPipelineReflectionMake(const RgfxStageReflection *vertex, const Rgf
 	const uint64_t stride = vertex != nullptr ? vertex->outputBytes + kPostVertexDumpPadding : 0;
 	ok = ok && m.setNumber(r, "_postVertexDumpStride", 'Q', stride) &&
 	     m.setNumber(r, "_traceBufferIndex", 'I', kNoIndex) &&
-	     m.setNumber(r, "_printStyle", 'Q', mesh != nullptr ? kMeshPrintStyle : kVertexPrintStyle);
+	     (c.legacy || m.setNumber(r, "_printStyle", 'Q', mesh != nullptr ? kMeshPrintStyle : kVertexPrintStyle));
 	if (!ok) {
 		*why = m.why ?: @"Metal's render pipeline reflection was not made";
 		return nil;

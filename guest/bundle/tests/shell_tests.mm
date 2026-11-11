@@ -5241,6 +5241,479 @@ void test_pipeline_reflection_from_air()
 	CHECK(number(mesh, @"postVertexDumpStride") == 0 && [ask(mesh, @"vertexBindings") count] == 0);
 }
 
+} // namespace
+
+// Stand-ins of macOS 11.7.11's reflection classes that differ from macOS 13's and later, each of
+// the instance variables, initialiser and getters that release's Metal has (measured: the classes'
+// instance variables and methods in an 11.7.11 guest): its MTLArgumentInternal, the class of every
+// argument, and its built-in and indirect constant arguments, which are of that class; its struct
+// type, of no type name; and its pipelines' reflections, which keep no binding lists. Our own.
+@interface RgfxTestsArgument11 : NSObject {
+@public
+	NSString *_name;
+	NSUInteger _type;
+	NSUInteger _access;
+	NSUInteger _index;
+	char _active;
+	NSUInteger _arrayLength;
+	id _typeInfo;
+}
+- (instancetype)initWithName:(NSString *)name
+                        type:(NSUInteger)type
+                      access:(NSUInteger)access
+                       index:(NSUInteger)index
+                      active:(BOOL)active
+                 arrayLength:(NSUInteger)arrayLength
+             typeDescription:(id)typeDescription;
+@end
+
+@implementation RgfxTestsArgument11
+- (instancetype)initWithName:(NSString *)name
+                        type:(NSUInteger)type
+                      access:(NSUInteger)access
+                       index:(NSUInteger)index
+                      active:(BOOL)active
+                 arrayLength:(NSUInteger)arrayLength
+             typeDescription:(id)typeDescription
+{
+	if ((self = [super init])) {
+		_name = [name copy];
+		_type = type;
+		_access = access;
+		_index = index;
+		_active = active;
+		_arrayLength = arrayLength;
+		_typeInfo = typeDescription;
+	}
+	return self;
+}
+- (NSString *)name
+{
+	return _name;
+}
+- (NSUInteger)type
+{
+	return _type;
+}
+- (NSUInteger)access
+{
+	return _access;
+}
+- (NSUInteger)index
+{
+	return _index;
+}
+- (BOOL)isActive
+{
+	return _active != 0;
+}
+- (NSUInteger)arrayLength
+{
+	return _arrayLength;
+}
+- (id)dataTypeDescription
+{
+	return _typeInfo;
+}
+@end
+
+@interface RgfxTestsBuiltInArgument11 : RgfxTestsArgument11 {
+	uint16_t _builtInType;
+	uint16_t _builtInDataType;
+}
+@end
+
+@implementation RgfxTestsBuiltInArgument11
+- (instancetype)initWithName:(NSString *)name
+                        type:(NSUInteger)type
+                      access:(NSUInteger)access
+                      active:(BOOL)active
+                       index:(NSUInteger)index
+                    dataType:(NSUInteger)dataType
+                 builtInType:(NSUInteger)builtInType
+{
+	if ((self = [super initWithName:name
+	                           type:type
+	                         access:access
+	                          index:index
+	                         active:active
+	                    arrayLength:1
+	                typeDescription:nil])) {
+		_builtInType = static_cast<uint16_t>(builtInType);
+		_builtInDataType = static_cast<uint16_t>(dataType);
+	}
+	return self;
+}
+- (NSUInteger)builtInType
+{
+	return _builtInType;
+}
+- (NSUInteger)builtInDataType
+{
+	return _builtInDataType;
+}
+@end
+
+@interface RgfxTestsIndirectConstant11 : RgfxTestsArgument11 {
+	uint16_t _dataType;
+	uint16_t _alignment;
+	uint16_t _dataSize;
+	NSUInteger _pixelFormat;
+	NSUInteger _aluType;
+}
+@end
+
+@implementation RgfxTestsIndirectConstant11
+- (instancetype)initWithName:(NSString *)name
+                        type:(NSUInteger)type
+                      access:(NSUInteger)access
+                    isActive:(BOOL)isActive
+               locationIndex:(NSUInteger)locationIndex
+                    dataType:(NSUInteger)dataType
+                 pixelFormat:(NSUInteger)pixelFormat
+                     aluType:(NSUInteger)aluType
+                    dataSize:(NSUInteger)dataSize
+                   alignment:(NSUInteger)alignment
+{
+	if ((self = [super initWithName:name
+	                           type:type
+	                         access:access
+	                          index:locationIndex
+	                         active:isActive
+	                    arrayLength:1
+	                typeDescription:nil])) {
+		_dataType = static_cast<uint16_t>(dataType);
+		_alignment = static_cast<uint16_t>(alignment);
+		_dataSize = static_cast<uint16_t>(dataSize);
+		_pixelFormat = pixelFormat;
+		_aluType = aluType;
+	}
+	return self;
+}
+- (NSUInteger)indirectConstantDataSize
+{
+	return _dataSize;
+}
+- (NSUInteger)indirectConstantDataType
+{
+	return _dataType;
+}
+@end
+
+@interface RgfxTestsStructType11 : NSObject {
+	NSUInteger _dataType;
+	NSDictionary *_dictionary;
+	NSArray *_members;
+	char _isIndirectArgumentBuffer;
+}
+@end
+
+@implementation RgfxTestsStructType11
+- (instancetype)initWithMembers:(__unsafe_unretained id const *)members count:(NSUInteger)count
+{
+	if ((self = [super init])) {
+		_dataType = MTLDataTypeStruct;
+		_members = [NSArray arrayWithObjects:members count:count];
+	}
+	return self;
+}
+- (void)setIsIndirectArgumentBuffer:(BOOL)value
+{
+	_isIndirectArgumentBuffer = value;
+}
+- (BOOL)isIndirectArgumentBuffer
+{
+	return _isIndirectArgumentBuffer != 0;
+}
+- (NSArray *)members
+{
+	return _members;
+}
+- (NSUInteger)dataType
+{
+	return _dataType;
+}
+- (id)memberByName:(NSString *)name
+{
+	for (id m in _members)
+		if ([[m name] isEqualToString:name])
+			return m;
+	return nil;
+}
+@end
+
+@interface RgfxTestsRenderReflection11 : NSObject {
+	uint64_t _flags;
+	NSArray *_vertexBuiltInArguments;
+	NSUInteger _postVertexDumpStride;
+	NSArray *_postVertexDumpOutputs;
+	NSArray *_inferredInputs;
+	NSArray *_vertexArguments;
+	NSArray *_fragmentArguments;
+	NSArray *_tileArguments;
+	NSArray *_tileBuiltInArguments;
+	id _imageBlockDataReturn;
+	NSDictionary *_performanceStatistics;
+	uint32_t _traceBufferIndex;
+	NSData *_vertexPluginReturnData;
+	NSData *_fragmentPluginReturnData;
+	NSArray *_constantSamplerUniqueIdentifiers;
+	NSArray *_constantSamplerDescriptors;
+	NSDictionary *_vertexResourceBindingIndexRemappingTable;
+	NSDictionary *_fragmentResourceBindingIndexRemappingTable;
+}
+@end
+
+@implementation RgfxTestsRenderReflection11
+- (NSArray *)vertexArguments
+{
+	return _vertexArguments;
+}
+- (NSArray *)fragmentArguments
+{
+	return _fragmentArguments;
+}
+- (NSArray *)vertexBuiltInArguments
+{
+	return _vertexBuiltInArguments;
+}
+- (NSData *)vertexPluginReturnData
+{
+	return _vertexPluginReturnData;
+}
+- (NSData *)fragmentPluginReturnData
+{
+	return _fragmentPluginReturnData;
+}
+- (NSUInteger)postVertexDumpStride
+{
+	return _postVertexDumpStride;
+}
+- (uint32_t)traceBufferIndex
+{
+	return _traceBufferIndex;
+}
+@end
+
+@interface RgfxTestsComputeReflection11 : NSObject {
+	NSArray *_arguments;
+	NSArray *_builtInArguments;
+	NSDictionary *_performanceStatistics;
+	uint64_t _flags;
+	uint32_t _traceBufferIndex;
+	NSData *_pluginReturnData;
+	NSArray *_constantSamplerUniqueIdentifiers;
+	NSArray *_constantSamplerDescriptors;
+	NSDictionary *_computeResourceBindingIndexRemappingTable;
+}
+@end
+
+@implementation RgfxTestsComputeReflection11
+- (NSArray *)arguments
+{
+	return _arguments;
+}
+- (NSArray *)builtInArguments
+{
+	return _builtInArguments;
+}
+- (NSData *)pluginReturnData
+{
+	return _pluginReturnData;
+}
+- (uint32_t)traceBufferIndex
+{
+	return _traceBufferIndex;
+}
+@end
+
+namespace {
+
+// Before macOS 13, whose Metal has no binding classes, a pipeline's reflection is made of the
+// classes its release has (RgfxPipelineReflection.h). With the stand-ins above in place of Metal's,
+// as macOS 11.7.11 has them, and as macOS 12.7.6 has them (its struct type Metal's own, of a type
+// name), over test_pipeline_reflection_from_air's library: every binding is an argument of the
+// release's MTLArgumentInternal, of the binding's name, type, access, index, use and array length,
+// its type object the binding's own (a buffer's pointer type, a texture's texture type, none for a
+// sampler); built-ins and an argument buffer's constants are of the release's classes; no binding
+// list is set; the stages' plugin return data are kept; and a mesh pipeline, which Metal before
+// macOS 13 has not, answers none. Metal's own classes answer again after.
+void test_pipeline_reflection_before_macos13()
+{
+	Fixture fx(0x80000); // the library's bytes fit
+	const char *path = getenv("RGFX_ORACLE_REFLECTION");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	uint32_t status = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.bytes
+	                                         length:bytes.length
+	                                            key:nullptr
+	                                         device:nil
+	                                     serializer:&fx.ser
+	                                         status:&status];
+	CHECK(lib != nil);
+	[lib rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		     (void)bytes;
+	     })
+	       shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+		       return nil;
+	       }];
+	auto ask = [](id object, NSString *member) -> id {
+		return ((id (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(member));
+	};
+	auto number = [](id object, NSString *member) {
+		return ((NSUInteger(*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(member));
+	};
+	auto flag = [](id object, NSString *member) {
+		return ((BOOL (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(member));
+	};
+	// Each argument's name, its type and whether it is active, in order; empty where one is not of
+	// the release's argument class.
+	auto shape = [&](NSArray *arguments) {
+		std::string out;
+		for (id a in arguments) {
+			if (![a isKindOfClass:[RgfxTestsArgument11 class]])
+				return std::string("(not an argument of the release's)");
+			out += std::string([ask(a, @"name") UTF8String]) + ":" + std::to_string(number(a, @"type")) +
+			       (flag(a, @"isActive") ? "" : "-") + " ";
+		}
+		return out;
+	};
+	auto fn = [&](NSString *name) { return [lib newFunctionWithName:name]; };
+	const MTLPipelineOption both = MTLPipelineOptionBindingInfo | MTLPipelineOptionBufferTypeInfo;
+	NSNull *none = [NSNull null];
+
+	for (int release : {11, 12}) {
+		NSMutableDictionary *standIns = [@{
+			@"MTLBindingInternal" : none,
+			@"MTLBufferBindingInternal" : none,
+			@"MTLTextureBindingInternal" : none,
+			@"MTLThreadgroupMemoryBindingInternal" : none,
+			@"MTLObjectPayloadBindingInternal" : none,
+			@"MTLBuiltInMeshArgument" : none,
+			@"MTLArgumentInternal" : [RgfxTestsArgument11 class],
+			@"MTLBuiltInArgument" : [RgfxTestsBuiltInArgument11 class],
+			@"MTLIndirectConstantArgument" : [RgfxTestsIndirectConstant11 class],
+			@"MTLStructTypeInternal" : [RgfxTestsStructType11 class],
+			@"MTLRenderPipelineReflectionInternal" : [RgfxTestsRenderReflection11 class],
+			@"MTLComputePipelineReflectionInternal" : [RgfxTestsComputeReflection11 class],
+		} mutableCopy];
+		if (release == 12)
+			[standIns removeObjectForKey:@"MTLStructTypeInternal"];
+		Class structClass = release == 11 ? [RgfxTestsStructType11 class] : NSClassFromString(@"MTLStructTypeInternal");
+		RgfxPipelineReflectionUseClassesForTests(standIns);
+
+		// A kernel's: its buffers', textures', sampler's and threadgroup memory's arguments.
+		id basic = RgfxComputePipelineReflectionOf(fn(@"k_basic"), nil, both);
+		CHECK([basic class] == [RgfxTestsComputeReflection11 class]);
+		NSArray *arguments = ask(basic, @"arguments");
+		CHECK(shape(arguments) == "out:0 params:0 in:0 r:2 s:2 w:2 rw:2 smp:3 tg:1 ");
+		if (arguments.count == 9) {
+			id params = ask(arguments[1], @"dataTypeDescription");
+			CHECK([NSStringFromClass([params class]) isEqualToString:@"MTLPointerTypeInternal"] &&
+			      number(params, @"alignment") == 32 && number(params, @"dataSize") == 192 &&
+			      number(params, @"elementType") == MTLDataTypeStruct && number(arguments[1], @"index") == 1 &&
+			      number(arguments[1], @"arrayLength") == 1);
+			id members = ask(ask(params, @"elementStructType"), @"members");
+			CHECK([ask(params, @"elementStructType") class] == structClass && [members count] == 12);
+			if ([members count] == 12) {
+				MTLStructMember *counts = members[6], *inner = members[7];
+				CHECK([counts.name isEqualToString:@"counts"] && counts.arrayType.arrayLength == 3 &&
+				      [inner.structType class] == structClass);
+			}
+			CHECK(number(arguments[0], @"access") == MTLArgumentAccessReadWrite &&
+			      number(ask(arguments[0], @"dataTypeDescription"), @"alignment") == 4);
+			id rw = ask(arguments[6], @"dataTypeDescription");
+			CHECK(number(arguments[5], @"access") == MTLArgumentAccessWriteOnly && number(arguments[6], @"index") == 3 &&
+			      [NSStringFromClass([rw class]) isEqualToString:@"MTLTextureReferenceTypeInternal"] &&
+			      number(rw, @"textureType") == MTLTextureType2D && number(rw, @"textureDataType") == MTLDataTypeHalf);
+			CHECK(ask(arguments[7], @"dataTypeDescription") == nil);
+			id tg = ask(arguments[8], @"dataTypeDescription");
+			CHECK(number(tg, @"dataSize") == 4 && number(tg, @"alignment") == 4);
+		}
+		NSArray *builtIns = ask(basic, @"builtInArguments");
+		CHECK(builtIns.count == 2);
+		if (builtIns.count == 2)
+			CHECK([builtIns[0] class] == [RgfxTestsBuiltInArgument11 class] && number(builtIns[0], @"type") == 15 &&
+			      number(builtIns[0], @"builtInType") == 5 &&
+			      number(builtIns[0], @"builtInDataType") == MTLDataTypeUInt2 && number(builtIns[1], @"builtInType") == 8);
+		CHECK(shape(ask(RgfxComputePipelineReflectionOf(fn(@"k_unused"), nil, both), @"arguments")) ==
+		      "used:0 unused:0- unusedConstant:0- unusedTexture:2- unusedSampler:3- unusedMemory:1- ");
+		CHECK(shape(ask(RgfxComputePipelineReflectionOf(fn(@"k_tables"), nil, both), @"arguments")) ==
+		      "table:24 intersections:27 primitives:25 instances:26 out:0 ");
+		// An argument buffer: its struct an argument buffer's, its constant the release's.
+		id ab = ask(
+		    [ask(RgfxComputePipelineReflectionOf(fn(@"k_argument_buffer"), nil, both), @"arguments") firstObject],
+		    @"dataTypeDescription");
+		id abStruct = ask(ab, @"elementStructType");
+		CHECK(flag(ab, @"elementIsArgumentBuffer") && [abStruct class] == structClass &&
+		      flag(abStruct, @"isIndirectArgumentBuffer"));
+		NSArray *abMembers = ask(abStruct, @"members");
+		CHECK(abMembers.count == 7);
+		if (abMembers.count == 7) {
+			id constant = ask(abMembers[3], @"indirectArgumentType");
+			CHECK([constant class] == [RgfxTestsIndirectConstant11 class] && number(constant, @"type") == 4 &&
+			      number(constant, @"indirectConstantDataSize") == 4);
+		}
+
+		// A render pipeline's: each stage's arguments, the descriptor's buffers first.
+		id buffers = RgfxRenderPipelineReflectionOf(fn(@"v_buffers"), nil, fn(@"f_textures"), both);
+		CHECK([buffers class] == [RgfxTestsRenderReflection11 class]);
+		CHECK(shape(ask(buffers, @"vertexArguments")) == "uniforms:0 positions:0 unusedUV:0- heights:2 ");
+		NSArray *fragmentArguments = ask(buffers, @"fragmentArguments");
+		CHECK(shape(fragmentArguments) ==
+		      "color:2 unusedTexture:2- shadow:2 smp:3 unusedSampler:3- tint:0 unusedBuffer:0- ");
+		if (fragmentArguments.count == 7)
+			CHECK(flag(ask(fragmentArguments[2], @"dataTypeDescription"), @"isDepthTexture") &&
+			      !flag(ask(fragmentArguments[0], @"dataTypeDescription"), @"isDepthTexture"));
+		NSArray *vertexBuiltIns = ask(buffers, @"vertexBuiltInArguments");
+		CHECK(vertexBuiltIns.count == 2 && [vertexBuiltIns[0] class] == [RgfxTestsBuiltInArgument11 class]);
+		MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+		vd.attributes[0].format = MTLVertexFormatFloat4;
+		vd.attributes[1].format = MTLVertexFormatFloat2;
+		vd.attributes[1].bufferIndex = 1;
+		vd.attributes[2].format = MTLVertexFormatFloat4;
+		vd.attributes[2].offset = 16;
+		vd.attributes[5].format = MTLVertexFormatFloat;
+		vd.attributes[5].bufferIndex = 2;
+		vd.layouts[0].stride = 32;
+		vd.layouts[1].stride = 8;
+		vd.layouts[2].stride = 4;
+		id stageIn = RgfxRenderPipelineReflectionOf(fn(@"v_stage_in"), vd, fn(@"f_plain"), both);
+		NSArray *vertex = ask(stageIn, @"vertexArguments");
+		CHECK(shape(vertex) == "vertexBuffer.0:0 vertexBuffer.1:0 vertexBuffer.2:0- mvp:0 ");
+		if (vertex.count == 4)
+			CHECK(number(ask(vertex[0], @"dataTypeDescription"), @"dataSize") == 32 &&
+			      number(ask(vertex[0], @"dataTypeDescription"), @"alignment") == 4 && number(vertex[2], @"index") == 2 &&
+			      number(ask(vertex[3], @"dataTypeDescription"), @"alignment") == 32);
+		CHECK(ask(stageIn, @"fragmentArguments") == nil && number(stageIn, @"postVertexDumpStride") == 36 &&
+		      number(stageIn, @"traceBufferIndex") == 0xFFFFFFFF);
+
+		// A GL variant's return data, each stage's and a kernel's.
+		NSData *vertexData = [@"vertex" dataUsingEncoding:NSUTF8StringEncoding];
+		NSData *fragmentData = [@"fragment" dataUsingEncoding:NSUTF8StringEncoding];
+		RgfxStageReflection v, f, k;
+		v.pluginReturnData = vertexData;
+		f.pluginReturnData = fragmentData;
+		k.pluginReturnData = fragmentData;
+		NSString *why = nil;
+		id gl = RgfxRenderPipelineReflectionMake(&v, &f, nullptr, nullptr, &why);
+		CHECK([gl class] == [RgfxTestsRenderReflection11 class] &&
+		      [ask(gl, @"vertexPluginReturnData") isEqualToData:vertexData] &&
+		      [ask(gl, @"fragmentPluginReturnData") isEqualToData:fragmentData]);
+		CHECK([ask(RgfxComputePipelineReflectionMake(k, &why), @"pluginReturnData") isEqualToData:fragmentData]);
+
+		// No mesh pipeline's.
+		CHECK(RgfxMeshPipelineReflectionOf(fn(@"o_payload"), fn(@"m_payload"), fn(@"f_mesh"), both) == nil);
+	}
+	RgfxPipelineReflectionUseClassesForTests(nil);
+	id own = RgfxComputePipelineReflectionOf(fn(@"k_basic"), nil, both);
+	CHECK([NSStringFromClass([own class]) isEqualToString:@"MTLComputePipelineReflectionInternal"] &&
+	      [ask(own, @"bindings") count] == 9);
+}
+
 // A visible function answers its reflection from its signature in its AIR module
 // (RgfxReflection.h), as Metal's own function on a device with a compiler does, and asks no shadow
 // for it: over tests/air_arguments.metal's stitchable functions, each return type and argument
@@ -15890,6 +16363,7 @@ int main(int argc, char **argv)
 		test_constants_without_cnst_resolve_from_air();
 		test_stitchable_reflection_from_air();
 		test_pipeline_reflection_from_air();
+		test_pipeline_reflection_before_macos13();
 		test_library_members_as_metal();
 		test_library_type_and_install_name();
 		test_command_graph();
