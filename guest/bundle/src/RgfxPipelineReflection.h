@@ -42,16 +42,18 @@
 // instance variables those leave unset set by name, each class, initialiser and instance variable
 // looked up at run time: what is missing makes no reflection.
 // Before macOS 13, whose Metal has no binding classes (MTLBindingInternal and its kind), each
-// binding is an argument of Metal's MTLArgumentInternal, of the binding's name, type (MTLArgumentType
-// numbers each kind as MTLBindingType does), access, index, use (its `active`) and array length,
-// and of the binding's own type object, from which its getters answer; built-ins and an argument
-// buffer's constants are of that release's MTLBuiltInArgument and MTLIndirectConstantArgument,
-// which are MTLArgumentInternal's; the pipelines' reflections keep no binding lists and no print
+// binding is an argument of that release's argument class of its kind (MTLBufferArgument,
+// MTLTextureArgument, MTLThreadgroupMemoryArgument, and MTLArgumentInternal for the others), made
+// by the initialiser macOS 13's binding class of the kind takes (MTLArgumentType numbers each kind
+// as MTLBindingType does), its use its `active`, of the binding's own type object; only an
+// argument of its kind's class answers that kind's getters, which the guest's frameworks ask;
+// built-ins and an argument buffer's constants are of that release's MTLBuiltInArgument and
+// MTLIndirectConstantArgument; the pipelines' reflections keep no binding lists and no print
 // style, and a struct type is made of no type name where its class takes none (macOS 11). Mesh
 // pipelines and objects' payloads, macOS 13's, answer none (measured: macOS 11.7.11's and 12.7.6's
-// classes, their instance variables and methods). The GL renderer reads a stage's uniforms and
-// textures from these arguments, beside its variant's return data (measured: macOS 11.7.11, a
-// reflection of return data alone binds none of them).
+// classes, their instance variables and methods, and each argument class's getters). The GL
+// renderer reads a stage's uniforms and textures from these arguments, beside its variant's return
+// data (measured: macOS 11.7.11, a reflection of return data alone binds none of them).
 //
 // What is left out, logged once per reason, answering nil (no reflection, as the device did
 // before):

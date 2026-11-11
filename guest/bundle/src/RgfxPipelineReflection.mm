@@ -159,12 +159,18 @@ bool isStageInput(const std::string &kind)
 // The classes the answers are made of, each looked up once with the initialiser it is made with.
 // macOS 11 and 12 have no binding classes (MTLBinding is macOS 13's), and macOS 11's struct type
 // takes no type name (measured: macOS 11.7.11 and 12.7.6, the classes' dump in a guest): there each
-// binding is an argument, Metal's MTLArgumentInternal of its type object (`legacy`), and a struct
-// type is made of its members alone.
+// binding is an argument of the release's argument classes (`legacy`), and a struct type is made of
+// its members alone. A buffer's, a texture's and threadgroup memory's argument is of the class of
+// its kind (MTLBufferArgument, MTLTextureArgument, MTLThreadgroupMemoryArgument), which takes the
+// initialiser macOS 13's binding class of that kind takes; any other is an MTLArgumentInternal. Only
+// an argument of its kind's class answers that kind's getters: the guest's frameworks ask them (the
+// GL renderer asks a vertex descriptor's buffer for its bufferDataType), and on an argument of
+// another class each such getter fails its assertion and ends the process (measured: macOS 11.7.11
+// and 12.7.6, each getter of each class, made by each initialiser, in a guest).
 struct Classes {
 	Class type, structType, arrayType, pointerType, textureType, member, binding, bufferBinding, textureBinding,
-	    threadgroupBinding, builtIn, indirectConstant, payload, meshBuiltIn, compute, render, argument;
-	bool legacy = false;      // no binding classes: arguments are `argument`'s
+	    threadgroupBinding, builtIn, indirectConstant, payload, meshBuiltIn, compute, render;
+	bool legacy = false;      // no binding classes: the bindings are the release's arguments
 	bool namedStructs = true; // the struct type's initialiser takes a type name
 	NSString *missing;        // the first class or initialiser that is not there, or nil
 };
@@ -240,9 +246,16 @@ Classes lookUpClasses(NSDictionary<NSString *, id> *standIns)
 	    {&c.compute, "MTLComputePipelineReflectionInternal", @selector(init)},
 	    {&c.render, "MTLRenderPipelineReflectionInternal", @selector(init)},
 	};
-	const Needed kLegacy[] = {
-	    {&c.argument, "MTLArgumentInternal",
-	     @selector(initWithName:type:access:index:active:arrayLength:typeDescription:)},
+	// Before macOS 13, the release's argument classes in their place, of the same initialisers.
+	const Needed kLegacyBindings[] = {
+	    {&c.binding, "MTLArgumentInternal", @selector(initWithName:type:access:index:active:arrayLength:)},
+	    {&c.bufferBinding, "MTLBufferArgument",
+	     @selector(initWithName:type:access:isActive:locationIndex:arraySize:dataType:pixelFormat:aluType:
+	                   isConstantBuffer:dataSize:alignment:)},
+	    {&c.textureBinding, "MTLTextureArgument",
+	     @selector(initWithName:access:isActive:locationIndex:arraySize:dataType:textureType:isDepthTexture:)},
+	    {&c.threadgroupBinding, "MTLThreadgroupMemoryArgument",
+	     @selector(initWithName:type:access:isActive:locationIndex:arraySize:dataType:dataSize:alignment:)},
 	};
 	// Before macOS 13, no binding classes and no mesh's (both macOS 13's); before macOS 12, a struct
 	// type of no type name.
@@ -257,7 +270,7 @@ Classes lookUpClasses(NSDictionary<NSString *, id> *standIns)
 	if (!find(types, std::size(types)))
 		return c;
 	if (c.legacy) {
-		find(kLegacy, std::size(kLegacy)) && find(kArguments, std::size(kArguments)) &&
+		find(kLegacyBindings, std::size(kLegacyBindings)) && find(kArguments, std::size(kArguments)) &&
 		    find(kPipelines, std::size(kPipelines));
 		return c;
 	}
@@ -729,10 +742,6 @@ struct Maker {
 			}
 			const NSUInteger access = accessOf(n.access);
 			id t = texture(dataType, type, access, depth);
-			if (c.legacy) {
-				*info = t;
-				return argument(legacyArgument(name, MTLArgumentTypeTexture, access, n.index, used, n.count, t), used);
-			}
 			id b = [make(c.textureBinding) initWithName:name
 			                                    access:access
 			                                  isActive:used
@@ -748,10 +757,6 @@ struct Maker {
 			return argument(b, used);
 		}
 		if (n.kind == "air.sampler") {
-			if (c.legacy)
-				return argument(legacyArgument(name, MTLArgumentTypeSampler, MTLArgumentAccessReadOnly, n.index, used,
-				                               n.count, nil),
-				                used);
 			id b = [make(c.binding) initWithName:name
 			                               type:MTLBindingTypeSampler
 			                             access:MTLBindingAccessReadOnly
@@ -764,8 +769,6 @@ struct Maker {
 		if (tableType(n.kind, &table)) {
 			// Read only whatever the AIR's access (measured: an intersection function table of
 			// air.read_write answers MTLBindingAccessReadOnly), of no type object.
-			if (c.legacy)
-				return argument(legacyArgument(name, table, MTLArgumentAccessReadOnly, n.index, used, n.count, nil), used);
 			id b = [make(c.binding) initWithName:name
 			                               type:table
 			                             access:MTLBindingAccessReadOnly
@@ -815,13 +818,6 @@ struct Maker {
 			}
 			const NSUInteger alignment = n.hasTypeAlign ? n.typeAlign : align;
 			id p = pointer(type, element, MTLBindingAccessReadOnly, alignment, n.typeSize, false, false);
-			if (c.legacy) {
-				*info = p;
-				return p == nil ? nil
-				                : argument(legacyArgument(name, kValueBindingType, MTLArgumentAccessReadOnly, n.index,
-				                                          used, 1, p),
-				                           used);
-			}
 			id b = [make(c.bufferBinding) initWithName:name
 			                                     type:kValueBindingType
 			                                   access:MTLBindingAccessReadOnly
@@ -891,13 +887,6 @@ struct Maker {
 			if (argumentBuffer || m != nullptr)
 				return nil;
 			id p = pointer(type, st, access, n.typeAlign, n.typeSize, false, false);
-			if (c.legacy) {
-				*info = p;
-				return p == nil ? nil
-				                : argument(legacyArgument(name, MTLArgumentTypeThreadgroupMemory, access, n.index, used,
-				                                          n.count, p),
-				                           used);
-			}
 			id b = [make(c.threadgroupBinding) initWithName:name
 			                                          type:MTLBindingTypeThreadgroupMemory
 			                                        access:access
@@ -919,12 +908,6 @@ struct Maker {
 		const bool constant = n.addressSpace == 2;
 		const NSUInteger alignment = constant ? kConstantBufferAlignment : n.typeAlign;
 		id p = pointer(type, st, access, alignment, n.typeSize, argumentBuffer, constant);
-		if (c.legacy) {
-			*info = p;
-			return p == nil ? nil
-			                : argument(legacyArgument(name, MTLArgumentTypeBuffer, access, n.index, used, n.count, p),
-			                           used);
-		}
 		id b = [make(c.bufferBinding) initWithName:name
 		                                     type:MTLBindingTypeBuffer
 		                                   access:access
@@ -956,38 +939,12 @@ struct Maker {
 		return b;
 	}
 
-	// Before macOS 13, an argument of any kind: Metal's MTLArgumentInternal of its argument type
-	// (MTLArgumentType, which numbers each kind as MTLBindingType does), access, index, use, array
-	// length and type object, whose getters answer from that object's.
-	id legacyArgument(NSString *name, NSUInteger type, NSUInteger access, NSUInteger index, BOOL used,
-	                  NSUInteger arrayLength, id typeInfo)
-	{
-		return [make(c.argument) initWithName:name
-		                                 type:type
-		                               access:access
-		                                index:index
-		                               active:used
-		                          arrayLength:arrayLength
-		                      typeDescription:typeInfo];
-	}
-
 	// A descriptor's buffer, the `ordinal`th of its buffers in buffer index order.
 	id descriptorBuffer(NSString *prefix, size_t ordinal, const RgfxDescriptorBuffer &d, bool used)
 	{
 		id p = pointer(MTLDataTypeStruct, nil, MTLBindingAccessReadOnly, kDescriptorBufferAlignment,
 		               static_cast<NSUInteger>(d.stride), false, false);
 		NSString *name = [NSString stringWithFormat:@"%@.%zu", prefix, ordinal];
-		if (c.legacy) {
-			id b = p == nil ? nil
-			                : legacyArgument(name, MTLArgumentTypeBuffer, MTLArgumentAccessReadOnly, d.index, used, 1, p);
-			if (b == nil)
-				return nil;
-			if ([b respondsToSelector:@selector(setVertexDescriptorBuffer:)])
-				[b setVertexDescriptorBuffer:YES];
-			if ([b respondsToSelector:@selector(setIsUsed:)])
-				[b setIsUsed:used];
-			return b;
-		}
 		id b = [make(c.bufferBinding) initWithName:name
 		                                     type:MTLBindingTypeBuffer
 		                                   access:MTLBindingAccessReadOnly
@@ -1002,9 +959,11 @@ struct Maker {
 		                                alignment:kDescriptorBufferAlignment];
 		if (p == nil || b == nil || !setObject(b, "_typeInfo", p))
 			return nil;
-		// No argument of the function's (measured: isArgument 0).
+		// No argument of the function's (measured: isArgument 0). Before macOS 13 its use is its
+		// `active` alone.
 		[b setVertexDescriptorBuffer:YES];
-		[b setIsUsed:used];
+		if (!c.legacy || [b respondsToSelector:@selector(setIsUsed:)])
+			[b setIsUsed:used];
 		return b;
 	}
 
