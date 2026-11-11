@@ -920,11 +920,13 @@ struct SamplerAnswer {
 };
 
 // A device-placed texture's GPU address holds its allocatedSize: textures (Private, Shared and
-// Managed, of one level, mipmapped, arrays and up to 16 MiB) and buffers made in turn lie in GPU
-// address ranges of their bytes no two of which meet, each at a 4 KiB page or past it by
-// nothing, as both x86 Macs' are (oracle_bundle texaddr: the AMD 5300M and the Intel 630 under
-// macOS 26.7.1 place successive textures past each other's allocatedSize). A texture keeps its
-// address while it lives, and the range goes back once it is let go.
+// Managed, of one level, mipmapped, arrays, of the two-plane XR10 formats and up to 16 MiB) and
+// buffers made in turn lie in GPU address ranges of their bytes no two of which meet, each at a
+// 4 KiB page or past it by nothing, as both x86 Macs' are (oracle_bundle texaddr: the AMD 5300M
+// and the Intel 630 under macOS 26.7.1 place successive textures past each other's
+// allocatedSize). A two-plane XR10 texture takes both its planes, 4 bytes a texel of colour and 1
+// of alpha, at every level. A texture keeps its address while it lives, and the range goes back
+// once it is let go.
 void test_device_texture_addresses_hold_their_bytes()
 {
 	Fixture fx;
@@ -950,9 +952,17 @@ void test_device_texture_addresses_hold_their_bytes()
 		shared.storageMode = MTLStorageModeShared;
 		MTLTextureDescriptor *managed = texture2D(MTLPixelFormatRGBA8Unorm, 300, 300, read);
 		managed.storageMode = MTLStorageModeManaged;
+		MTLTextureDescriptor *xr10 = texture2D(MTLPixelFormatRGBA8Unorm, 64, 64, read);
+		xr10.pixelFormat = (MTLPixelFormat)550; // RGB10A8_2P_XR10
+		MTLTextureDescriptor *xr10Mips = texture2D(MTLPixelFormatRGBA8Unorm, 128, 128, read);
+		xr10Mips.pixelFormat = (MTLPixelFormat)551; // its sRGB twin
+		xr10Mips.mipmapLevelCount = 8;
+		CHECK(device(xr10).allocatedSize == 64 * 64 * 5);
+		CHECK(device(xr10Mips).allocatedSize ==
+		      (128 * 128 + 64 * 64 + 32 * 32 + 16 * 16 + 8 * 8 + 4 * 4 + 2 * 2 + 1) * 5);
 		NSArray<MTLTextureDescriptor *> *shapes = @[
 			texture2D(MTLPixelFormatRGBA8Unorm, 64, 64, read), mips, array, shared,
-			texture2D(MTLPixelFormatRGBA8Unorm, 2048, 2048, read), managed
+			texture2D(MTLPixelFormatRGBA8Unorm, 2048, 2048, read), managed, xr10, xr10Mips
 		];
 		struct Range {
 			id resource;

@@ -1042,11 +1042,20 @@ void rgfxEndAtInvalidSurfaceTexture(MTLTextureDescriptor *descriptor, IOSurfaceR
 @end
 
 namespace {
-// The bytes a texture of shape `d` of memory of its own takes, which its allocatedSize answers:
-// every level of every slice and sample, in its format's blocks (0 for a format not sized here).
+// The bytes a texel of RGB10A8_2P_XR10 or its sRGB twin (550, 551) takes in the texture's memory:
+// its colour's 32-bit word in the first plane and its alpha's byte in the second, both planes at
+// the texture's size (RgfxTexture.h). rgfxBlockShapeOf leaves the two unsized, as no CPU copy of
+// one is made.
+constexpr uint32_t kRgfxXR10TwoPlaneTexelBytes = 4 + 1;
+
+// The bytes a texture of shape `d` of memory of its own takes, which its allocatedSize answers
+// and its GPU address range holds: every level of every slice and sample, in its format's blocks,
+// and for a two-plane XR10 format both planes (0 for a format not sized here).
 uint64_t rgfxTextureBytes(const RgfxTextureDescriptor &d)
 {
 	RgfxBlockShape b = rgfxBlockShapeOf(static_cast<MTLPixelFormat>(d.pixel_format));
+	if (d.pixel_format == 550 || d.pixel_format == 551)
+		b = {kRgfxXR10TwoPlaneTexelBytes, 1, 1};
 	uint64_t slices = d.array_length ? d.array_length : 1;
 	if (d.texture_type == MTLTextureTypeCube || d.texture_type == MTLTextureTypeCubeArray) {
 		slices *= 6;
