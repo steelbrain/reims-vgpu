@@ -188,8 +188,10 @@ pub struct GraphicsConfig {
     /// The guest's RAM, with the files behind it, through which the GPU uses an IOSurface's own
     /// pages in place (`RGFX_FEATURE_SURFACE_PAGES`, where the host's page is the guest's 4 KiB, or
     /// 16 KiB for a guest that takes `RGFX_FEATURE_PAGES_16K`); `None` keeps each surface's GPU
-    /// view a copy of its pages in the region. The pages stay the guest's RAM while the device
-    /// lives: a host that discards guest RAM (a balloon, hot-unplug) gives none.
+    /// view a copy of its pages in the region. On a GPU that shares the CPU's memory the device
+    /// answers `recommendedMaxWorkingSetSize` from the RAM the map holds (`device_info`'s
+    /// `lane_working_set`). The pages stay the guest's RAM while the device lives: a host that
+    /// discards guest RAM (a balloon, hot-unplug) gives none.
     pub memory_map: Option<MemoryMap>,
     /// The guest's architecture, which the device's answer of `isFramebufferReadSupported` follows
     /// (`device_info`'s `lane_flags`).
@@ -307,11 +309,17 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // answers `hasUnifiedMemory` alike, from the blob.
             let unified_memory = identity.flags.has_unified_memory.unwrap_or(false);
             let meshes = device_info::makes_mesh_pipelines(&identity);
+            // The guest's RAM, as much of it as the host maps: the working set a GPU that shares
+            // the CPU's memory answers follows it (`device_info`'s `lane_working_set`).
+            let guest_ram = (config.memory_map.as_ref())
+                .map(|map| map.ranges().iter().map(|r| r.physical_length).sum::<u64>())
+                .filter(|&bytes| bytes > 0);
             let mut info = device_info(
                 &gpu_device.caps(),
                 identity,
                 pool.threads().to_u64(),
                 config.guest_arch,
+                guest_ram,
             );
             let mut decoder = GraphicsDecoder::new(Arc::clone(&platform), Arc::clone(&region));
             decoder.set_unified_memory(unified_memory);

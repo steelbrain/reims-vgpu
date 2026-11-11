@@ -172,10 +172,11 @@ Objective-C.
 
 Everything a host can set that shapes what the library does, beside the guest's own input:
 - **The config**: the device's callbacks, its window (its callbacks and the mode it opens at),
-  the guest's RAM with the files behind it, which let the GPU use an IOSurface's own pages in place,
-  and the guest's architecture, which the device's `isFramebufferReadSupported` follows: the
-  host GPU's answer for an arm64 guest, no for an x86-64 one. Zero is every field's default
-  (section 1): an x86-64 guest.
+  the guest's RAM with the files behind it, which let the GPU use an IOSurface's own pages in place
+  and, on a host GPU that shares the CPU's memory, set the device's `recommendedMaxWorkingSetSize`
+  (three quarters of that RAM, at most the host GPU's answer), and the guest's architecture,
+  which the device's `isFramebufferReadSupported` follows: the host GPU's answer for an arm64
+  guest, no for an x86-64 one. Zero is every field's default (section 1): an x86-64 guest.
 - **Cargo features**, for a host that builds the library: `macos-sdl` (on by default) builds
   SDL3's window into the macOS library ([development.md](development.md)). `vulkan`
   (`reims-vgpu`, `reims-vgpu-c`) changes nothing: the Vulkan platform is the API's only one, and

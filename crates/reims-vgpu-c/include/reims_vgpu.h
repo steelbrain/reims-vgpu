@@ -412,9 +412,12 @@ typedef struct {
   // The guest's RAM, or NULL. With it, where the host's page is the guest's 4 KiB, or 16 KiB
   // for a guest that lays its pages out in 16 KiB (`RGFX_FEATURE_PAGES_16K`), the GPU uses an
   // IOSurface's own pages in place, through views of them; without it each surface's GPU view
-  // is a copy of its pages in the region. The map's pages stay the guest's RAM while the device
-  // lives: a host that discards guest RAM (a balloon, virtio-mem, hot-unplug) passes NULL. Its
-  // ranges may not overlap.
+  // is a copy of its pages in the region. On a host GPU that shares the CPU's memory the device
+  // answers `recommendedMaxWorkingSetSize` as three quarters of the RAM the map holds, rounded
+  // down to 16 KiB, or the host GPU's answer where that is less; with no map, and on a GPU of
+  // its own memory, the host GPU's. The map's pages stay the guest's RAM while the device lives:
+  // a host that discards guest RAM (a balloon, virtio-mem, hot-unplug) passes NULL. Its ranges
+  // may not overlap.
   const RvgMemoryMap *memory_map;
   // With `memory_map`: the files behind its ranges, NULL for none, one entry per range, each
   // duplicated during the create. Refused (RVG_ERR_INVALID_ARGUMENT), in this order: files

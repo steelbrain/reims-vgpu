@@ -532,6 +532,53 @@ fn device_info_is_written_into_the_region_at_init() {
     assert_eq!(feature_set(10005), Some(1));
 }
 
+/// The guest's RAM the host maps reaches the blob: on the fake's GPU, which shares the CPU's
+/// memory, the working set is three quarters of it rounded down to 16 KiB and `maxBufferLength`
+/// three quarters of that, for an x86-64 and an arm64 guest alike; with no map, the platform's
+#[test]
+fn the_blob_answers_a_unified_gpu_s_working_set_from_the_guest_s_mapped_ram() {
+    use reims_vgpu_vulkan::core::testkit::GuestRam;
+
+    let sizes = |guest_arch: GuestArch, mapped: bool| {
+        let platform = Arc::new(FakePlatform::new());
+        assert_eq!(
+            platform.device().identity_caps().flags.has_unified_memory,
+            Some(true)
+        );
+        let ram = GuestRam::with_range(0x10_0000, 0x10_0000).unwrap();
+        platform.fake_vm().adopt(&ram);
+        let mut map = crate::MemoryMap::new();
+        for r in ram.ranges() {
+            // SAFETY: the fake RAM stays mapped while the device, dropped before it, lives.
+            unsafe {
+                map.push(
+                    r.physical_address,
+                    r.physical().physical_length,
+                    r.host().as_ptr(),
+                );
+            }
+        }
+        let config = GraphicsConfig {
+            memory_map: mapped.then_some(map),
+            guest_arch,
+            ..GraphicsConfig::default()
+        };
+        let device = GraphicsDevice::with_platform(platform, config).unwrap();
+        let info = device_info_of(&device);
+        (
+            info.sizes[0],
+            info.sizes[reims_vgpu_graphics::wire::RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH],
+        )
+    };
+    // 1 MiB of RAM: 786432 bytes, 48 pages of 16 KiB, and 589824, 36 of them.
+    for guest in [GuestArch::X86_64, GuestArch::Arm64] {
+        assert_eq!(sizes(guest, true), (786_432, 589_824), "{guest:?}");
+    }
+    let platform = sizes(GuestArch::X86_64, false);
+    assert_eq!(platform.0, FAKE_OWN_MEMORY);
+    assert_eq!(sizes(GuestArch::Arm64, false), platform);
+}
+
 /// The config's guest architecture reaches the blob: an x86-64 guest's device answers
 /// `isFramebufferReadSupported` no, an arm64 guest's the platform's yes (the fake's), and the
 /// families alike for both

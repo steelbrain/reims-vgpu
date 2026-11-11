@@ -300,6 +300,7 @@ fn cap_apple_families(identity: &mut IdentityCaps, wired: &[Piece]) {
 /// | `supportsCounterSampling:` | no, at every point | counter sample buffers |
 /// | `supportsRasterizationRateMapWithLayerCount:` | no, of every count | rasterization rate maps |
 /// | `maximumConcurrentCompilationTaskCount` | the device's compile threads, which run its pipeline compiles | nothing: the device's own answer |
+/// | `recommendedMaxWorkingSetSize` | on a GPU that shares the CPU's memory, three quarters of the guest's RAM rounded down to 16 KiB, or the platform's where that is less or the host maps no RAM; on a GPU of its own memory the platform's ([`lane_working_set`]) | nothing: a choice |
 /// | `maxBufferLength` | the platform's, but at most three quarters of `recommendedMaxWorkingSetSize`, rounded down to 16 KiB ([`lane_max_buffer_length`]) | nothing: a choice |
 /// | `minimumLinearTextureAlignmentForPixelFormat:` and the SPI `linearTextureAlignmentBytes` and `deviceLinearTextureAlignmentBytes` | 256 bytes, or the platform's where larger ([`LANE_LINEAR_TEXTURE_ALIGNMENT`]) | nothing: a choice |
 /// | `isFramebufferReadSupported` (SPI) | no for an x86-64 guest; the platform's for an arm64 guest ([`lane_flags`]) | nothing: a choice |
@@ -310,7 +311,7 @@ fn cap_apple_families(identity: &mut IdentityCaps, wired: &[Piece]) {
 ///
 /// `hasUnifiedMemory` is the platform's: the decoder keeps `Managed` resources in one copy or two
 /// by the same answer (docs/graphics-kext/design.md, Decided 4).
-fn lane(mut identity: IdentityCaps, compile_threads: u64) -> IdentityCaps {
+fn lane(mut identity: IdentityCaps, compile_threads: u64, guest_ram: Option<u64>) -> IdentityCaps {
     cap_apple_families(&mut identity, WIRED);
     identity.families[at(MTL_GPU_FAMILY_METAL4)] = Some(false);
     let f = &mut identity.flags;
@@ -329,10 +330,43 @@ fn lane(mut identity: IdentityCaps, compile_threads: u64) -> IdentityCaps {
     identity.counter_sampling = [Some(false); 5];
     identity.sizes.largest_rasterization_rate_map_layer_count = Some(0);
     identity.sizes.maximum_concurrent_compilation_task_count = Some(compile_threads);
+    let unified = identity.flags.has_unified_memory == Some(true);
     let z = &mut identity.sizes;
+    z.recommended_max_working_set_size =
+        lane_working_set(z.recommended_max_working_set_size, unified, guest_ram);
     z.max_buffer_length =
         lane_max_buffer_length(z.max_buffer_length, z.recommended_max_working_set_size);
     identity
+}
+
+/// `recommendedMaxWorkingSetSize`, which the guest's kext also states as the GPU's memory
+/// (`VRAM,totalMB`, its `RgfxMemorySize.hpp`) and [`lane_max_buffer_length`] follows, on a GPU
+/// that shares the CPU's memory (`unified`) for a guest with `guest_ram` bytes of RAM where the
+/// host maps it: three quarters of that RAM, rounded down to 16 KiB, or the platform's where that
+/// is less; on a GPU of its own memory, or with no map, the platform's. A Mac's GPU that shares
+/// its memory answers a share of the Mac's RAM, from an Intel UHD Graphics 630's 1610612736 bytes
+/// of 64 GiB (0.023, macOS 26.7.1) to an Apple M3 Max's 55662788608 of 64 GiB (0.81, macOS
+/// 27.0.1), and three quarters lies between. The Vulkan platform answers the host GPU's
+/// device-local memory, which on a GPU that shares the CPU's memory is a share of the host's RAM
+/// and can be more than the guest's: guests of 8 GiB were told 11864629248 bytes on a Radeon 780M
+/// (macOS 11.7.11, 12.7.6 and 26.7.2) and 24950464512 on an Iris Xe (macOS 14.8.9). A GPU of its
+/// own memory answers that memory, as an AMD Radeon Pro 5300M answers 4278190080 bytes, its 4 GiB
+/// less 16 MiB (macOS 26.7.1), whatever the Mac's RAM: the platform's answer is the host GPU's
+/// own. Over a cold boot and a Safari scroll of a macOS 14.8.9 guest on an Iris Xe, told
+/// 24950464512, 5726617600, 4278190080 or 1610612736 bytes, the guest's work was the same: the
+/// runtime's blocks, the page's frames and the display's presents.
+///
+/// The RAM is what the host's memory map holds
+/// ([`GraphicsConfig::memory_map`](crate::GraphicsConfig::memory_map)), within a MiB of the
+/// guest's `hw.memsize`: QEMU's `vmapple` under HVF maps its firmware's 1 MiB and its config's
+/// 64 KiB too, which add 816 KiB to the answer for a guest of 8 GiB (0.7501 of its RAM), and
+/// `q35`'s map leaves out the 384 KiB below 1 MiB that VGA and the ROMs hold.
+fn lane_working_set(platform: Option<u64>, unified: bool, guest_ram: Option<u64>) -> Option<u64> {
+    const PAGE: u64 = 16 << 10;
+    match (platform, guest_ram) {
+        (Some(set), Some(ram)) if unified => Some(set.min(ram / 4 * 3 / PAGE * PAGE)),
+        (set, _) => set,
+    }
 }
 
 /// `maxBufferLength`: the platform's, but at most three quarters of `recommended_max_working_set`,
@@ -427,16 +461,17 @@ fn lane_flags(mut flags: Flags, guest: GuestArch) -> Flags {
 }
 
 /// The device-info caps blob for `caps` and `identity`, of a device that runs `compile_threads`
-/// pipeline compiles at once for a guest of `guest`'s architecture: every value the guest bundle
-/// reads once at init, the host device's answers but where the lane's own differ ([`lane`],
-/// [`lane_flags`]).
+/// pipeline compiles at once for a guest of `guest`'s architecture with `guest_ram` bytes of RAM
+/// where the host maps it: every value the guest bundle reads once at init, the host device's
+/// answers but where the lane's own differ ([`lane`], [`lane_flags`]).
 pub fn device_info(
     caps: &DeviceCaps,
     identity: IdentityCaps,
     compile_threads: u64,
     guest: GuestArch,
+    guest_ram: Option<u64>,
 ) -> RgfxDeviceInfo {
-    let identity = lane(identity, compile_threads);
+    let identity = lane(identity, compile_threads, guest_ram);
     let mut info = RgfxDeviceInfo {
         version: RGFX_DEVICE_INFO_VERSION,
         registry_id: caps.registry_id,
@@ -646,7 +681,13 @@ mod tests {
     fn mirrors_the_device_caps() {
         let p = Arc::new(FakePlatform::new());
         let caps = p.device().caps();
-        let info = device_info(&caps, p.device().identity_caps(), 4, GuestArch::X86_64);
+        let info = device_info(
+            &caps,
+            p.device().identity_caps(),
+            4,
+            GuestArch::X86_64,
+            None,
+        );
 
         assert_eq!(info.version, RGFX_DEVICE_INFO_VERSION);
         assert_eq!(info.registry_id, caps.registry_id);
@@ -673,7 +714,13 @@ mod tests {
         let p = Arc::new(FakePlatform::new());
         let mut caps = (*p.device().caps()).clone();
         caps.families[6] = Ok(false);
-        let info = device_info(&caps, p.device().identity_caps(), 4, GuestArch::X86_64);
+        let info = device_info(
+            &caps,
+            p.device().identity_caps(),
+            4,
+            GuestArch::X86_64,
+            None,
+        );
         assert_eq!(info.family_count, 21);
         for yes in [2001, 2002, 3001, 3002, 3003, 5001] {
             assert_eq!(family(&info, yes), Some(1), "family {yes}");
@@ -711,6 +758,7 @@ mod tests {
             p.device().identity_caps(),
             4,
             GuestArch::X86_64,
+            None,
         );
         assert_eq!(info.feature_set_count as usize, FEATURE_SETS.len());
         for set in [10000, 10001, 10003, 10004, 10005] {
@@ -843,7 +891,7 @@ mod tests {
         let mut identity = p.device().identity_caps();
         identity.flags.has_unified_memory = Some(false);
         identity.flags.is_low_power = Some(true);
-        let info = device_info(&caps, identity.clone(), 4, GuestArch::X86_64);
+        let info = device_info(&caps, identity.clone(), 4, GuestArch::X86_64, None);
         assert_eq!(
             &info.name[..info.name_len as usize],
             b"NVIDIA GeForce RTX 5080 Laptop GPU"
@@ -919,7 +967,7 @@ mod tests {
         identity.sizes.max_buffer_length = Some(1 << 40);
         identity.sizes.recommended_max_working_set_size = Some(17_094_934_528);
         // The fake answers 16 for both alignments, and yes for every SPI flag.
-        let info = device_info(&caps, identity.clone(), 4, GuestArch::X86_64);
+        let info = device_info(&caps, identity.clone(), 4, GuestArch::X86_64, None);
         assert_eq!(info.sizes[7], 12_821_200_896);
         // device_linear_texture_alignment_bytes first, linear_texture_alignment_bytes fourth.
         assert_eq!(info.limits[0], 256);
@@ -934,9 +982,61 @@ mod tests {
         // A platform that needs more than 256 bytes keeps its own.
         caps.limits.linear_texture_alignment_bytes = 512;
         caps.limits.device_linear_texture_alignment_bytes = 1024;
-        let info = device_info(&caps, identity, 4, GuestArch::X86_64);
+        let info = device_info(&caps, identity, 4, GuestArch::X86_64, None);
         assert_eq!(info.limits[0], 1024);
         assert_eq!(info.limits[3], 512);
+    }
+
+    /// On a GPU that shares the CPU's memory the working set is three quarters of the guest's RAM
+    /// rounded down to 16 KiB, for an x86-64 and an arm64 guest alike, or the platform's where that
+    /// is less or the host maps no RAM; on a GPU of its own memory it is the platform's;
+    /// `maxBufferLength` follows the working set
+    #[test]
+    fn a_unified_gpu_s_working_set_is_three_quarters_of_the_guest_s_ram() {
+        const GIB: u64 = 1 << 30;
+        // A Radeon 780M answers 11864629248 bytes; a guest of 8 GiB is told 6 GiB.
+        let radeon = Some(11_864_629_248);
+        assert_eq!(lane_working_set(radeon, true, Some(8 * GIB)), Some(6 * GIB));
+        // Rounded down to 16 KiB: 8 GiB and 1 MiB give 6 GiB and 48 pages, 8 GiB and 4 KiB 6 GiB.
+        assert_eq!(
+            lane_working_set(Some(1 << 40), true, Some(8 * GIB + (1 << 20))),
+            Some(6 * GIB + 786_432)
+        );
+        assert_eq!(
+            lane_working_set(Some(1 << 40), true, Some(8 * GIB + 4096)),
+            Some(6 * GIB)
+        );
+        // Never above the platform's; the platform's with no RAM, or no answer with none of its.
+        assert_eq!(
+            lane_working_set(Some(4 * GIB), true, Some(8 * GIB)),
+            Some(4 * GIB)
+        );
+        assert_eq!(lane_working_set(radeon, true, None), radeon);
+        assert_eq!(lane_working_set(None, true, Some(8 * GIB)), None);
+        // A GPU of its own memory: an RTX 5080's 17094934528 bytes stand.
+        let geforce = Some(17_094_934_528);
+        assert_eq!(lane_working_set(geforce, false, Some(8 * GIB)), geforce);
+
+        // In the blob: the working set first, and maxBufferLength three quarters of it, alike
+        // for both architectures.
+        const MAX_BUFFER_LENGTH: usize =
+            reims_vgpu_graphics::wire::RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH;
+        let p = Arc::new(FakePlatform::new());
+        let caps = p.device().caps();
+        let mut identity = p.device().identity_caps();
+        identity.flags.has_unified_memory = Some(true);
+        identity.sizes.recommended_max_working_set_size = radeon;
+        identity.sizes.max_buffer_length = Some(1 << 40);
+        for guest in [GuestArch::X86_64, GuestArch::Arm64] {
+            let info = device_info(&caps, identity.clone(), 4, guest, Some(8 * GIB));
+            assert_eq!(info.sizes[0], 6 * GIB, "{guest:?}");
+            assert_eq!(info.sizes[MAX_BUFFER_LENGTH], 4_831_838_208, "{guest:?}");
+        }
+        identity.flags.has_unified_memory = Some(false);
+        identity.sizes.recommended_max_working_set_size = geforce;
+        let info = device_info(&caps, identity, 4, GuestArch::X86_64, Some(8 * GIB));
+        assert_eq!(info.sizes[0], 17_094_934_528);
+        assert_eq!(info.sizes[MAX_BUFFER_LENGTH], 12_821_200_896);
     }
 
     /// `isFramebufferReadSupported` follows the guest: an x86-64 guest's device answers no, an
@@ -952,8 +1052,8 @@ mod tests {
         let mut caps = (*p.device().caps()).clone();
         let identity = p.device().identity_caps();
         assert!(caps.flags.is_framebuffer_read_supported);
-        let x86 = device_info(&caps, identity.clone(), 4, GuestArch::X86_64);
-        let arm64 = device_info(&caps, identity.clone(), 4, GuestArch::Arm64);
+        let x86 = device_info(&caps, identity.clone(), 4, GuestArch::X86_64, None);
+        let arm64 = device_info(&caps, identity.clone(), 4, GuestArch::Arm64, None);
         assert_eq!(x86.flags[FRAMEBUFFER_READ], 0);
         assert_eq!(arm64.flags[FRAMEBUFFER_READ], 1);
         let at = std::mem::offset_of!(RgfxDeviceInfo, flags) + FRAMEBUFFER_READ;
@@ -969,7 +1069,7 @@ mod tests {
         }
 
         caps.flags.is_framebuffer_read_supported = false;
-        let arm64 = device_info(&caps, identity, 4, GuestArch::Arm64);
+        let arm64 = device_info(&caps, identity, 4, GuestArch::Arm64, None);
         assert_eq!(arm64.flags[FRAMEBUFFER_READ], 0);
 
         assert_eq!(GuestArch::default(), GuestArch::X86_64);
@@ -984,7 +1084,7 @@ mod tests {
         let mut identity = p.device().identity_caps();
         // The fake answers sample count 8 (index 3) with a present no.
         assert_eq!(
-            device_info(&caps, identity.clone(), 4, GuestArch::X86_64).sample_counts[3],
+            device_info(&caps, identity.clone(), 4, GuestArch::X86_64, None).sample_counts[3],
             0
         );
         // A family the platform could not answer at all (a gap) also reads 0.
@@ -993,7 +1093,7 @@ mod tests {
         identity.feature_sets[0] = None;
         identity.flags.is_low_power = None;
         identity.sizes.location = None;
-        let info = device_info(&caps, identity.clone(), 4, GuestArch::X86_64);
+        let info = device_info(&caps, identity.clone(), 4, GuestArch::X86_64, None);
         assert_eq!(family(&info, -1009), Some(0));
         assert_eq!(family(&info, 1009), Some(0));
         assert_eq!(feature_set(&info, 0), Some(0));
@@ -1003,14 +1103,14 @@ mod tests {
         caps.families[6] = Ok(true);
         assert_eq!(
             family(
-                &device_info(&caps, identity.clone(), 4, GuestArch::X86_64),
+                &device_info(&caps, identity.clone(), 4, GuestArch::X86_64, None),
                 -1009
             ),
             Some(1)
         );
         // 255 ASCII bytes and a two-byte character: the character does not fit, and is left out.
         caps.name = Some(format!("{}\u{e9}", "a".repeat(255)));
-        let info = device_info(&caps, identity, 4, GuestArch::X86_64);
+        let info = device_info(&caps, identity, 4, GuestArch::X86_64, None);
         assert_eq!(info.name_len, 255);
     }
 }
