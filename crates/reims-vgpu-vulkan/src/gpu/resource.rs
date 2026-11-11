@@ -2773,17 +2773,22 @@ pub(crate) mod tests {
     /// A device cache made as the host's video makes those it lands its pictures in (an
     /// exportable `Private` buffer, NVDEC's) of a 4K NV12 frame as CoreVideo lays it, its luma
     /// plane 32 bytes in and its chroma plane after its rows, with that first plane's byte placed
-    /// for textures in place (`aligned_byte`), takes the textures over both planes in its memory:
-    /// once the device's checks of its exported memory are known, the runtime's answer for each
+    /// for textures in place (`aligned_byte`), lays both planes' texels on the device's lines of
+    /// memory, and takes their textures in its memory where the device's check of its exported
+    /// memory passed: once the check's verdicts are known, the runtime's answer for each plane
     /// (`Buffer::texture_placement_with_iosurface_plane`, the making's own decision) is a linear
-    /// image of the cache's memory, not a shadow, which copies the plane in before each command
-    /// buffer's use of it. Made without the byte, as every exportable cache was, the planes lie 32
-    /// bytes past the runtime's boundary, off every linear image's alignment measured (128 on an
-    /// RTX 5080 Laptop GPU, 256 on RADV, 64 on lavapipe), and their textures were shadows: that
-    /// answer is printed, not checked. Linux's: MoltenVK exports no buffer's memory.
+    /// image of the cache's memory where the verdict for reads of texels on lines passed, which
+    /// copies nothing, and else the shadow that verdict names, of texels on lines. The verdict is
+    /// the device's record of its driver's check where one holds it (the shader cache's, the
+    /// tests' own under `HOME`), else the check's in this process; the report of it
+    /// (`Device::in_place_check_report`) says which the answer took. Made without the byte, as
+    /// every exportable cache was, the planes lie 32 bytes past the runtime's boundary, off every
+    /// linear image's alignment measured (128 on an RTX 5080 Laptop GPU, 256 on RADV, 64 on
+    /// lavapipe), and their textures were shadows: that answer is printed, not checked. Linux's:
+    /// MoltenVK exports no buffer's memory.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_device_cache_lays_its_planes_in_its_memory_from_its_first_planes_byte() {
+    fn a_device_cache_lays_its_planes_on_the_devices_lines_from_its_first_planes_byte() {
         const WIDTH: u64 = 3840;
         const HEIGHT: u64 = 2160;
         const LUMA_AT: u64 = 0x20;
@@ -2830,11 +2835,31 @@ pub(crate) mod tests {
         };
         let unplaced = placements(None);
         eprintln!("the planes' textures over a cache made with no aligned byte: {unplaced:?}");
-        assert_eq!(
-            placements(Some(LUMA_AT)),
-            [rt::TexturePlacement::NotHostPages; 2],
-            "both planes' textures in the cache's memory"
+        let placed = placements(Some(LUMA_AT));
+        let report = d.raw.in_place_check_report();
+        let on_lines = |answer: &rt::TexturePlacement| match answer {
+            rt::TexturePlacement::NotHostPages => true,
+            rt::TexturePlacement::Shadow(
+                rt::TextureShadowReason::Unchecked { row_ends, .. }
+                | rt::TextureShadowReason::CheckFailed { row_ends, .. },
+            ) => *row_ends == rt::InPlaceRowEnds::OnLines,
+            _ => false,
+        };
+        assert!(
+            placed.iter().all(on_lines),
+            "both planes' texels on the device's lines: {placed:?}\n{report:#?}"
         );
+        if report
+            .iter()
+            .any(|line| line == "ExportedFd, rows on lines: Passed")
+        {
+            assert_eq!(
+                placed,
+                [rt::TexturePlacement::NotHostPages; 2],
+                "both planes' textures in the cache's memory\n{report:#?}"
+            );
+        }
+        eprintln!("the planes' textures over a cache made with it: {placed:?}\n{report:#?}");
     }
 
     /// The bytes a runtime call reads in place are the range itself, at its pointer and of its
