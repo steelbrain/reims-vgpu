@@ -68,11 +68,11 @@ run_info() {
 	esac
 	# Graft says whether it bound ReimsGraphics: the registry root's
 	# GraftClient.ai.aneesiqbal.ReimsGraphics reads "bound: imports and vtables committed;
-	# waiting for device 0x52471234 to open the gate" once every site and vtable is written, and
-	# "bound: imports and vtables committed; activation gate open on the device nub" once Graft
-	# has set the gate property on the device's nub, which lets IOKit construct and start
-	# ReimsGraphics. Only the open gate passes; any other value, a refusal naming what Graft
-	# declined among them, is printed.
+	# waiting for a provider of personality <names> to open the gate" once every site and vtable
+	# is written, and "bound: imports and vtables committed; activation gate open on a provider of
+	# personality <name>" once Graft has set the gate property on the device's nub, which lets
+	# IOKit construct and start ReimsGraphics. Only the open gate passes; any other value, a
+	# refusal naming what Graft declined among them, is printed.
 	local bind
 	bind=$(ioreg -l -w0 -d1 2>/dev/null | grep -o -E '"GraftClient\.ai\.aneesiqbal\.ReimsGraphics" = "[^"]{0,160}"' |
 		sed 's/^[^=]*= //')

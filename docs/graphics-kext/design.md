@@ -266,20 +266,23 @@ Stages:
     (`__DATA,__graft`) of every imported site and of the library classes it
     derives from, with no System-collection `OSBundleLibraries`. Its
     personalities stay, each gated by an `IOPropertyMatch` requiring
-    `ai.aneesiqbal.ReimsGraphics.graft-bound` on the device nub, and the
-    manifest names the device (its `IOPCIPrimaryMatch`). OpenCore links that
-    dormant kext in the Boot collection. Graft (`guest/graft`, a copy of
-    Graft's release build) starts from its own kext start. Once the
-    libraries are registered, it checks each parent class's size and vtable
-    against the running library, resolves each site by name, writes the
-    sites and vtables, then sets the gate property on the 1234:5247 nub and
-    registers the nub again. The registry root's
+    `ai.aneesiqbal.ReimsGraphics.graft-bound` on its provider, and the
+    manifest carries each personality's provider matching (its
+    `IOProviderClass` and `IOPCIPrimaryMatch`: the 1234:5247 device).
+    OpenCore links that dormant kext in the Boot collection. Graft
+    (`guest/graft`, a copy of Graft's release build) starts from its own
+    kext start and finds ReimsGraphics among the placed kexts by its
+    manifest. Once the libraries are registered, it checks each parent
+    class's size and vtable against the running library, resolves each site
+    by name, writes the sites and vtables, then sets the gate property on
+    each nub a personality's provider matching matches, the 1234:5247 nub,
+    and registers the nub again. The registry root's
     `GraftClient.ai.aneesiqbal.ReimsGraphics` reads `bound: imports and
-    vtables committed; waiting for device 0x52471234 to open the gate` once
-    the sites and vtables are written while no such nub is published yet,
-    and `bound: imports and vtables committed; activation gate open on the
-    device nub` once the property is set on it, which the lane gate's
-    `graft-bind` check requires. Until then the passive property match fails,
+    vtables committed; waiting for a provider of personality <names> to
+    open the gate` once the sites and vtables are written while no such nub
+    is published yet, and `bound: imports and vtables committed; activation
+    gate open on a provider of personality <name>` once the property is set
+    on one, which the lane gate's `graft-bind` check requires. Until then the passive property match fails,
     so IOKit does not even construct ReimsGraphics' classes, whose parent
     constructors run through the sites (an `IOResourceMatch` would hold
     back only `start()`). On a missing symbol or a layout that
@@ -318,7 +321,9 @@ Stages:
       arm64e kext has a Graft declaration and an Info.plist of its own
       (src/graft-arm64e.json, src/Info-arm64e.plist): IOFramebuffer and
       IOAccelerator from IOGraphicsFamily, and no device control. The set
-      starts with Graft's arm64e build, Graft-arm64e.kext from guest/graft.
+      starts with Graft's arm64e build, Graft-arm64e.kext from guest/graft,
+      which starts each library the arm64e manifest declares,
+      IOMobileGraphicsFamily among them, before it binds against it.
     - The arm64 display (owner, 2026-11-08): an arm64 WindowServer drives no
       IOFramebuffer (measured on 27.0.1 with SIP on: a bound IOFramebuffer
       consumer got no user client, and the system had no

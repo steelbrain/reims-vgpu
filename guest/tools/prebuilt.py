@@ -145,8 +145,9 @@ def stage(out, work, arch="x86_64"):
         if not exe.is_file():
             raise SystemExit(f"prebuilt: {kext} has no executable {exe.name}")
         infos[kext.name] = info
-    # Graft's staging keeps the personalities, each gated on the device nub by the property
-    # Graft sets once it has bound the kext, so none is even constructed before that.
+    # Graft's staging keeps the personalities, each gated on its provider by the property Graft
+    # sets, once it has bound the kext, on each nub a personality's provider matching matches, so
+    # none is even constructed before that.
     personalities = infos["ReimsGraphics.kext"].get("IOKitPersonalities", {})
     gate = {"ai.aneesiqbal.ReimsGraphics.graft-bound": True}
     if not personalities or any(p.get("IOPropertyMatch") != gate for p in personalities.values()):
