@@ -2126,8 +2126,9 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 
 	if (_buffer != nil && level == 0) {
 		// Its first level lies in the buffer, rows _bufferBytesPerRow apart, and each slice of a
-		// 2D array (the linear form's) rgfxBufferSlicePitch after the one before. A tiled
-		// texture's other levels are the device's own, which a blit reaches (below).
+		// 2D array (the linear form's) rgfxBufferSlicePitch after the one before; the CPU reaches
+		// a tiled texture's level 0 there too, not in the device's copy. A tiled texture's other
+		// levels are the device's copy's, which a blit reaches (below).
 		uint8_t *contents = static_cast<uint8_t *>([_buffer contents]);
 		RgfxBlockShape b = rgfxBlockShapeOf(self.pixelFormat);
 		const uint64_t slices =
@@ -2152,6 +2153,14 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 			const uint64_t first = static_cast<uint64_t>(at - contents);
 			const uint64_t span = (shape.rows - 1) * _bufferBytesPerRow + shape.rowBytes;
 			[_buffer didModifyRange:NSMakeRange(first, span)];
+			// A tiled texture's copy of the bytes takes them again at its next use, as after its
+			// didModifyData (didModifyData, below): Metal's getBytes: and replaceRegion: of a tiled
+			// texture's level 0 read and write the buffer's bytes, not the copy, and the next GPU
+			// use after a replaceRegion: of level 0 reads every level made from the new bytes,
+			// where a CPU write of the bytes alone is not taken (measured on the AMD 5300M and the
+			// Intel 630 under macOS 26.7.1, docs/graphics-kext/dgpu-oracle.md, Q11).
+			if (_desc.mipmap_level_count > 1 && _serializer != nullptr)
+				_serializer->textureDidModifyData([self rgfxObjId]);
 		}
 		return;
 	}

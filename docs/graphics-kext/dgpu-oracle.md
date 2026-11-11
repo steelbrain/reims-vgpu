@@ -552,6 +552,26 @@ zero drew such a picture black or dark (26.7.2 walks 15511, 15613 and 15614 on a
 and an RTX 3090, 11-11). The bundle tells the host a mipmapped texture's `didModifyData`
 (`TEXTURE_DID_MODIFY_DATA`), and the copy is taken again at its next use, as on the x86 Macs.
 
+The CPU's calls on such a texture were measured next (11-11, the same probe), 256 x 256 RGBA8 of
+9 levels by both forms, Shared and Managed descriptors. The texture was made over 0x40, read by a
+blit, then each step ran in turn:
+
+| step | AMD | Intel 630 |
+|---|---|---|
+| `getBytes:` of level 0 before any GPU use | the bytes | the process crashes in Metal (a segmentation fault) |
+| `getBytes:` of level 0 after the CPU rewrote the bytes to 0x20 with no call, after a `replaceRegion:` of level 0, and after a blit wrote level 0 | the buffer's bytes as they lie each time, not the copy | the same |
+| `getBytes:` of level 1 at the same points | made from the bytes as they lie: 32, then 96 | what the copy held then, 64 and 64, with a Shared descriptor; 58 and 58 with a Managed one |
+| `replaceRegion:` of level 0 with 0x60 | the buffer's bytes become 0x60, and the next GPU use reads every level 0x60: the copy is taken again with no `didModifyData` | the same |
+| `replaceRegion:` of level 1 with 0x70 | `getBytes:` of level 1 reads 0x70 back; no GPU use sees it, before or after a `didModifyData` (level 1 stays made from level 0) | the same with a Shared descriptor; with a Managed one the process crashes in Metal (a bus error) at it |
+
+So the CPU reaches level 0 in the buffer's bytes, and a `replaceRegion:` of level 0 takes the
+copy again as `didModifyData` does *(class 3: both agree)*. The bundle does both: its `getBytes:`
+and `replaceRegion:` of level 0 address the buffer, and a `replaceRegion:` of level 0 of the
+tiled form also sends `TEXTURE_DID_MODIFY_DATA`. The CPU's level 1 and up differ between the two
+GPUs *(class 2)*; the bundle reads and writes them in the device's copy by a blit, so a
+`replaceRegion:` of level 1 or up reaches the GPU's use until the copy is taken again, which
+neither x86 Mac's does. No app is known to write those levels by the CPU.
+
 *(class 2: the tiled forms are x86's alone.)* WindowServer's tiled backings use the buffer's SPI
 (RgfxBuffer.mm). Our stack: the public form ends the process at more than one level with
 Metal's words *(class 3)*, sending the host nothing; the tiled forms make one *(class 3)*:

@@ -1260,7 +1260,19 @@ void test_tiled_texture_over_backing()
 	          .obj_id == [(RgfxTexture *)levels rgfxObjId]);
 	[(id<RgfxMetalTextureInternals>)tex didModifyData];
 	CHECK(ringEmpty(fx.ring));
+	// A replaceRegion: of its level 0 writes the buffer's bytes and tells the host as its
+	// didModifyData does, as Metal's copy takes the bytes again at its next use after one; the
+	// one of one level's tells nothing.
+	[levels replaceRegion:MTLRegionMake2D(0, 0, 2, 1) mipmapLevel:0 withBytes:in bytesPerRow:8];
+	CHECK(std::memcmp(&memory[tileOffset], in, 8) == 0);
+	CHECK(expectMessage<RgfxTextureDidModifyData>(fx.ring, RGFX_CMD_TEXTURE_DID_MODIFY_DATA)
+	          .obj_id == [(RgfxTexture *)levels rgfxObjId]);
+	CHECK(ringEmpty(fx.ring));
+	[tex replaceRegion:MTLRegionMake2D(1, 1, 2, 1) mipmapLevel:0 withBytes:in bytesPerRow:8];
+	CHECK(ringEmpty(fx.ring));
 	fx.ser.setCarriesTextureDidModifyData(false);
+	[levels replaceRegion:MTLRegionMake2D(0, 0, 2, 1) mipmapLevel:0 withBytes:in bytesPerRow:8];
+	CHECK(ringEmpty(fx.ring));
 	desc.mipmapLevelCount = 1;
 	// So does a type other than 2D, which the AMD and the Intel GPU make and the host does not
 	// carry over a buffer.
