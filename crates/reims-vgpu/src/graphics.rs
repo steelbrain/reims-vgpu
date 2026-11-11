@@ -246,9 +246,24 @@ pub struct GraphicsDevice<P: ApiPlatform = DefaultPlatform> {
     shown: Option<Arc<Shown>>,
     /// The host's reads of what the display shows ([`GraphicsDevice::read_display`]).
     read: DisplayRead<P>,
+    /// The stage-3 decoder's state while it lives: once the device ended, what holds the GPU
+    /// device until its threads, its objects and their GPU work let go ([`ENDING`]).
+    ending: Weak<GraphicsControl<P>>,
     /// The platform the decoder runs on.
     platform: PhantomData<fn() -> P>,
 }
+
+/// How many graphics devices live in the process, of every platform: made and not dropped
+/// ([`GraphicsDevice::let_go_of_gpu`]).
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// The decoder states of the graphics devices that ended, while one lives
+/// ([`GraphicsDevice::let_go_of_gpu`]'s warning).
+static ENDING: Mutex<Vec<Weak<dyn std::any::Any + Send + Sync>>> = Mutex::new(Vec::new());
+
+/// How long the C API's release of the process's last graphics device waits for the device's
+/// threads, objects and GPU work to let go of the GPU device ([`GraphicsDevice::let_go_of_gpu`]).
+pub const LET_GO_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl<P: ApiPlatform> std::fmt::Debug for GraphicsDevice<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -511,10 +526,12 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             };
             let device = reims_vgpu_graphics::Device::new(region, host, Box::new(screen))
                 .ok_or(Error::HostResources)?;
+            LIVE.fetch_add(1, Ordering::SeqCst);
             Ok(GraphicsDevice {
                 window,
                 device,
                 cursor,
+                ending: Arc::downgrade(&control),
                 #[cfg(any(test, feature = "testkit"))]
                 control,
                 #[cfg(test)]
@@ -625,11 +642,61 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
 
 impl<P: ApiPlatform> Drop for GraphicsDevice<P> {
     /// The window closes, then the device ends; neither waits (`reims-vgpu-graphics`'s `device`).
+    /// The device no longer counts among those alive ([`GraphicsDevice::let_go_of_gpu`]).
     fn drop(&mut self) {
         entry::run(|_| {
             drop(self.window.take());
         });
+        let ending: Weak<dyn std::any::Any + Send + Sync> = self.ending.clone();
+        let mut ended = ENDING.lock();
+        ended.retain(|state| state.strong_count() > 0);
+        ended.push(ending);
+        drop(ended);
+        LIVE.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+impl<P: ApiPlatform> GraphicsDevice<P> {
+    /// Where no graphics device lives in the process, lets go of the GPU devices the platform
+    /// keeps for it ([`ApiPlatform::let_go_of_devices`]): what the C API's release of the last
+    /// one does, with [`LET_GO_BOUND`], so that no runtime device is live as the process exits
+    /// (on NVIDIA's driver an exit with one live can end in `SIGSEGV` inside the driver's exit
+    /// handler, `reims_vgpu_vulkan::let_go`). It waits, at most `bound`, for the ended devices'
+    /// threads, their objects and their GPU work to let go of the GPU devices; a device callback
+    /// still running holds them up, one blocked on a lock the caller holds until the bound. Past
+    /// the bound it lets go of nothing, says what still held them in a warning, and answers it as
+    /// `Err`. `Ok(false)` where a graphics device lives, letting go of nothing; `Ok(true)` once
+    /// let go of. A device made after it runs on a new GPU device of the platform's.
+    pub fn let_go_of_gpu(bound: std::time::Duration) -> Result<bool, String> {
+        if LIVE.load(Ordering::SeqCst) != 0 {
+            return Ok(false);
+        }
+        entry::run(|_| {
+            let let_go = P::process().let_go_of_devices(bound);
+            let_go.map(|()| true).map_err(|held| held_up(bound, &held))
+        })
+    }
+}
+
+/// The warning of a let-go that waited out its `bound` ([`GraphicsDevice::let_go_of_gpu`]), `held`
+/// the platform's account of the devices still held: it names the ended graphics devices whose
+/// decoder still lives, too. Logged, and answered.
+fn held_up(bound: std::time::Duration, held: &str) -> String {
+    let ending = (ENDING.lock().iter())
+        .filter(|state| state.strong_count() > 0)
+        .count();
+    let decoders = match ending {
+        0 => String::new(),
+        n => format!(
+            "the decoder of {n} ended graphics devices still lives (its threads, a callback \
+             among them, its objects or their GPU work), and "
+        ),
+    };
+    let line = format!(
+        "the GPU device stays for the process: after {bound:?}, {decoders}{held} still held it"
+    );
+    log::warn!("{line}");
+    line
 }
 
 /// The stage-3 decoder and the device handle it drives, shared by the device's [`Host`], which

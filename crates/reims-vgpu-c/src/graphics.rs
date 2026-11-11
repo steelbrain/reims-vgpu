@@ -337,15 +337,28 @@ unsafe fn create(
 /// Drops the host's reference; the last one closes the window, waiting for nothing, and ends the
 /// device's threads without waiting for them: the callbacks' destroy runs once both have ended,
 /// possibly after this returns, and the region stays mapped until then and until the window's
-/// GPU work has let it go. The host unmaps BAR 2 from the guest first. Calls back: never.
+/// GPU work has let it go. The release of the process's last graphics device then waits, at most
+/// 5 s, for its threads, its objects and their GPU work to let go of the GPU device, and lets go
+/// of every GPU device the library keeps for the process, so that none is live as the process
+/// exits: on NVIDIA's driver an exit with one live can end in SIGSEGV inside the driver's exit
+/// handler. A device callback still running holds the wait up, one that waits for a lock the host
+/// holds around this call for the whole 5 s; past them the library keeps the GPU device for the
+/// process, and logs a warning saying what held it. A device created after it runs on a new GPU
+/// device. The host unmaps BAR 2 from the guest first. Calls back: never.
 ///
 /// # Safety
 /// `device` is NULL or a live graphics device handle, not used again.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rvg_graphics_device_release(device: *mut RvgGraphicsDevice) {
     ffi::export(|| {
+        if device.is_null() {
+            return;
+        }
         // SAFETY: the caller's contract.
-        unsafe { handle::release(device) }
+        unsafe { handle::release(device) };
+        // Where that ended the process's last device, the GPU devices go: the Rust API decides
+        // and logs (`GraphicsDevice::let_go_of_gpu`).
+        let _ = GraphicsDevice::<Plat>::let_go_of_gpu(reims_vgpu::LET_GO_BOUND);
     })
 }
 

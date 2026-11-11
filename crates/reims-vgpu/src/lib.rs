@@ -37,7 +37,7 @@ pub use cursor::{CursorGlyph, CursorGlyphFn, CursorMoveFn, CursorShowFn};
 pub use error::Error;
 pub use graphics::{
     GraphicsCallbacks, GraphicsConfig, GraphicsDevice, GraphicsRaiseFn, GraphicsVideo,
-    GraphicsVideoSession, GuestArch, PlanePages, VideoDecode, VideoPlane,
+    GraphicsVideoSession, GuestArch, LET_GO_BOUND, PlanePages, VideoDecode, VideoPlane,
 };
 pub use memory::{MemoryFile, MemoryMap};
 pub use platform::ApiPlatform;

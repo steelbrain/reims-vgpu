@@ -51,6 +51,15 @@ pub trait ApiPlatform: Platform {
         None
     }
 
+    /// Lets go of the GPU devices the platform keeps for the process, once nothing beyond its own
+    /// keeps holds one, waiting at most `bound` for that: a device made after it is a new one.
+    /// `Err` names what still held one when the wait ended, and nothing is let go then. Nothing
+    /// to let go of by default.
+    fn let_go_of_devices(&self, bound: std::time::Duration) -> Result<(), String> {
+        let _ = bound;
+        Ok(())
+    }
+
     /// The host's hardware video for a graphics device on `device`, the guest's video driver's
     /// (`crate::GraphicsVideo`), whose host APIs' threads and waits are `runtime`'s; `None` where
     /// the platform has none, and by default.

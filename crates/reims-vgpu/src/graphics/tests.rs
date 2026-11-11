@@ -90,6 +90,84 @@ fn a_headless_device_answers_its_guest() {
     assert_eq!(words, [1920, 1080, 60_000]);
 }
 
+/// The guest's ask for its displays on `device`'s control ring, with its completion armed: the
+/// device's control thread answers it and raises.
+fn ask_displays<P: ApiPlatform>(device: &GraphicsDevice<P>) {
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    // SAFETY: the region is the device's, mapped while it lives, and the rings' fields are at
+    // their offsets; nothing else writes the guest's side.
+    unsafe {
+        let base = device.region_base();
+        let ring = base.add(RGFX_CONTROL_SUBMIT_OFFSET as usize + 256);
+        let header = RgfxMsgHeader {
+            r#type: RGFX_CMD_GET_DISPLAYS,
+            size: 16,
+            seqno: 1,
+        };
+        std::ptr::copy_nonoverlapping(
+            std::ptr::from_ref(&header).cast::<u8>(),
+            ring,
+            size_of::<RgfxMsgHeader>(),
+        );
+        let armed = base.add(RGFX_CONTROL_COMPLETE_OFFSET as usize + 0xc0);
+        std::sync::atomic::AtomicU32::from_ptr(armed.cast()).store(1, Ordering::SeqCst);
+        let producer = base.add(RGFX_CONTROL_SUBMIT_OFFSET as usize);
+        std::sync::atomic::AtomicU64::from_ptr(producer.cast()).store(16, Ordering::SeqCst);
+    }
+    device.mmio_write(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
+}
+
+/// On the Vulkan platform, the let-go of the GPU device after the process's last graphics device
+/// ([`GraphicsDevice::let_go_of_gpu`], the C API's release) waits for a device callback blocked
+/// on a lock the releasing thread holds only its bound: the callback holds the device's control
+/// thread, and so its decoder and the GPU device, so the let-go names the ended decoder and lets
+/// go of nothing, and returns, never in a deadlock. Once the lock goes, the callback returns, the
+/// device's threads end, and the next let-go lets go of the GPU device. Each runs on a thread of
+/// its own, whose answer the test waits for at most 30 s, so a let-go that never returned fails
+/// the test at that wait
+#[test]
+fn on_vulkan_the_let_go_waits_for_a_callback_blocked_on_the_releasers_lock_only_its_bound() {
+    use std::sync::mpsc;
+    let let_go = |bound: Duration| {
+        let (answer, answered) = mpsc::channel();
+        let letting_go = std::thread::Builder::new().spawn(move || {
+            let _ = answer.send(GraphicsDevice::<crate::DefaultPlatform>::let_go_of_gpu(
+                bound,
+            ));
+        });
+        letting_go.unwrap();
+        answered.recv_timeout(Duration::from_secs(30))
+    };
+    let lock = Arc::new(Mutex::new(()));
+    let (entered, blocked) = mpsc::channel();
+    let in_callback = Arc::clone(&lock);
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks {
+            raise_interrupt: Some(Arc::new(move |_| {
+                let _ = entered.send(());
+                drop(in_callback.lock());
+            })),
+            ..GraphicsCallbacks::default()
+        },
+        window: None,
+        memory_map: None,
+        guest_arch: GuestArch::X86_64,
+    };
+    let device = GraphicsDevice::with_platform(crate::singleton::platform(), config).unwrap();
+    let held = lock.lock();
+    ask_displays(&device);
+    blocked.recv_timeout(Duration::from_secs(10)).unwrap();
+    drop(device);
+    let answer = let_go(Duration::from_millis(300)).expect("the let-go returned");
+    let held_up = answer.unwrap_err();
+    assert!(
+        held_up.contains("the decoder of 1 ended graphics devices"),
+        "{held_up}"
+    );
+    drop(held);
+    assert_eq!(let_go(Duration::from_secs(20)), Ok(Ok(true)));
+}
+
 /// The host screen's rate in thousandths of a hertz, rounded; 60 Hz for a rate that is none
 #[test]
 fn a_screen_s_rate_is_kept_in_millihertz() {

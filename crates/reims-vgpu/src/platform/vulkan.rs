@@ -58,6 +58,13 @@ impl ApiPlatform for VulkanPlatform {
         unsafe { reims_vgpu_graphics::region::Region::over(base, len, Box::new(memory)) }
     }
 
+    /// The platform's let-go of the runtime's devices it keeps, their caches and their threads
+    /// (`reims_vgpu_vulkan::let_go`): each runtime device whose last handle that was is torn
+    /// down on the calling thread before this returns.
+    fn let_go_of_devices(&self, bound: std::time::Duration) -> Result<(), String> {
+        reims_vgpu_vulkan::let_go::let_go_of_devices(bound).map(|_| ())
+    }
+
     /// The whole texture, through the runtime's `get_bytes`
     /// (`reims_vgpu_vulkan::api::read_pixels`).
     fn read_pixels(

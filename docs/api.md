@@ -37,7 +37,7 @@ every call to the host are the device's, and a window's are the window's.
 
 | object | made by | released by | its end |
 |---|---|---|---|
-| `RvgGraphicsDevice` | `rvg_graphics_device_create` | `rvg_graphics_device_release` | its window closes and its threads end at its release, waited for by nothing; its region stays mapped until both threads and the window's GPU work have let it go |
+| `RvgGraphicsDevice` | `rvg_graphics_device_create` | `rvg_graphics_device_release` | its window closes and its threads end at its release, waited for by nothing but the release of the process's last device ("The process's exit"); its region stays mapped until both threads and the window's GPU work have let it go |
 
 - **One reference.** The host owns exactly one reference to a device; there is no retain.
 - **NULL.** A release of NULL does nothing. Elsewhere a NULL handle is `RVG_ERR_INVALID_ARGUMENT`
@@ -96,8 +96,9 @@ refusal logs a line saying which, and no file is duplicated until every entry ha
 - **Calling back.** Only `rvg_graphics_device_mmio_write_taking` calls back, and only
   `raise_interrupt`, on the calling thread, for a doorbell it answers there (section 5). A refused
   create runs its tables' destroys; no other function calls back.
-- **Waiting.** No function waits for the device's threads, the display thread or the main thread.
-  A STATUS write of 0 and `rvg_graphics_device_reset` wait only for the command the device's control
+- **Waiting.** No function waits for the display thread or the main thread, and none but the
+  release of the process's last graphics device waits for the device's threads: that one waits
+  for them at most 5 s ("The process's exit"). A STATUS write of 0 and `rvg_graphics_device_reset` wait only for the command the device's control
   thread is taking, and for a take of a queue's ring or a post onto one under way, none of which
   waits for anything of the host's. `rvg_graphics_device_read_display` waits for its own draw on the
   GPU, on a queue of its own, and one read runs at a time.
@@ -135,6 +136,23 @@ and then the exit goes on. Work that would begin once it ran, on the library's t
 call of the host's on another thread, parks that thread for good instead, so no work of the
 library's runs beside the GPU driver's destructors. A call on the exiting thread, from a later exit
 handler, runs as before. The host does nothing for it: QEMU's quit waits for it.
+
+The library keeps the GPU device it opens for the process, with what it makes of it for itself,
+while any graphics device lives, and a device created after another was released runs on the same
+one. The release of the process's last graphics device lets go of it: it waits, at most 5 s, for
+that device's threads, its objects and their GPU work to let go of the GPU device, and then lets go
+of every GPU device the library keeps, whose runtime is torn down on the releasing thread before
+the release returns (`reims_vgpu_vulkan::let_go`). So no GPU device is live as the process exits:
+on NVIDIA's proprietary driver an exit with one live can end with `SIGSEGV` inside the driver's own
+exit handler, which tears its SPIR-V compiler down while a worker thread of the driver's still runs
+in it (on an RTX 3090, 6 of 80 exits right after the device's check of textures over host pages,
+none with the device let go of first). A device callback still running holds that wait up: one
+that waits for a lock the host holds around the release, for the whole 5 s. Past them the library
+keeps its GPU devices for the process, as it does while a device lives, and logs a warning saying
+what still held them. A device created after the let-go runs on a new GPU device, whose numbering
+starts again. QEMU releases its device as it quits, once the VM stopped for good (its
+`vm_shutdown`), with the BQL held, which none of its callbacks takes; a VM whose shutdown action
+pauses it keeps its device to the exit.
 
 ## 2. The C header
 
@@ -241,8 +259,9 @@ A queue's worker, the display thread among them, has core's `WORKER_STACK`, 512 
 ### The locks around `raise_interrupt`
 
 The device's callbacks may wait for a lock the host holds while it calls the device (QEMU's BQL):
-no function of the device waits for its threads, and the library calls them with no lock held that
-one of its functions waits for, directly or through a thread of the library's. `raise_interrupt`
+no function of the device waits for its threads, but the release of the process's last device,
+which waits for them at most 5 s (section 1, "The process's exit"), and the library calls them with
+no lock held that one of its functions waits for, directly or through a thread of the library's. `raise_interrupt`
 may run under these:
 - a command queue's claim on its next message, on the queue's service thread and inside
   `rvg_graphics_device_mmio_write_taking`;
@@ -307,6 +326,8 @@ lets the device go, so the window table's `destroy` runs first.
 
 - A device callback may block on the host's lock, as above; `raise_interrupt` inside
   `rvg_graphics_device_mmio_write_taking` must not wait for a lock the host holds around that call.
+  One that waits for a lock the host holds around the release of the process's last device holds
+  that release up for 5 s, and the GPU device then stays for the process (section 1).
 - A window callback must not block at all ("The main thread", above).
 - No device callback may release its own device (the header's "May call").
 
