@@ -1844,17 +1844,35 @@ enabled, the host sends `VBLANK` at each refresh of the window's screen.
 tells it the scale of the screen its window was last drawn on, and the kext
 gives the OS the display's density from it, 110 pixels per inch a point
 (`guest/kext/src/RgfxDisplayIdentity.hpp`): 110 at 1x, 220 at 2x, 231 at
-2.1, and 110 before the window first draws. The x86-64 kext puts it in the
-EDID's size and each mode's size in millimetres, and the arm64 kext in
+2.1, and 110 before the window first draws. The x86-64 kext puts it in each
+mode's size in millimetres and in the EDID's size, which is a 1920 × 1080
+display's at that density whatever the window's size, and the arm64 kext in
 `DisplayAttributes`' size and the dot pitch. The modes are valid for HiDPI
 (`kDisplayModeValidForHiResFlag`, on x86-64) only on a screen above 1x, at
-any size whose pixels halve exactly. The guests decide their default scale
-differently (measured): arm64's WindowServer follows the published size, so
-it runs at 1x on a 1x screen and HiDPI above 1x at every size, while x86-64
-macOS 26.7.2 decides by width alone: it starts HiDPI on a mode at least 3840
-pixels wide and at 1x below that, whatever the EDID's density and the flag
-(at 330 ppi, modes 2400 to 3648 pixels wide still started at 1x, and on a 1x
-screen, with no mode valid for HiDPI, a 3888 pixels wide one started HiDPI).
+any size whose pixels halve exactly. arm64's WindowServer follows the
+published size (measured): it runs at 1x on a 1x screen and HiDPI above 1x
+at every size. x86-64 macOS starts a display HiDPI on a default mode of at
+least 3840 × 2160, from 3800 pixels wide where its EDID is 32 inches across
+or more, and, where the display is built in, on a default mode of at least
+2048 × 1536 at more than 160 pixels per inch (read from macOS 26.7.2's
+CoreDisplay). The x86-64 framebuffer says its display is built in
+(`kIOConnectionBuiltIn`, as a Mac's own panel is), and its EDID is at most
+20 inches across, so on a screen at 1.5x or more (above 160 pixels per inch)
+the guest runs HiDPI at every window size from 2048 × 1536, at 1x below
+that, and on a screen at 1.45x or less at 1x up to 3840 × 2160 (measured on
+26.7.2 at 2.1 and at 1, and on 11.7.11 to 15.8.2 at 2.1). Before, with no
+connection flags and the EDID at the window's size, it started at 1x on
+every window from 2400 to 3648 pixels wide at 330 ppi, and HiDPI on a 3888
+pixels wide one on a 1x screen (measured). The EDID names the window's size
+in a text descriptor, so each window size is a display of its own to the
+guest, which keeps a mode chosen for it. WindowServer keeps a mode while the
+framebuffer lists it valid: with an EDID that stayed the same across sizes
+it kept its old mode through every resize, and it restored a mode chosen at
+one size to a display resized to another (measured;
+[lessons](../lessons.md)). The framebuffer lists the mode set until another
+is set, for a WindowServer that reads it mid-change
+(`RgfxDisplayModes.hpp`), and answers it never shown and not valid once the
+device no longer shows it.
 
 **Refresh times.** The host stamps each `VBLANK` with its refresh's time on
 the display's grid, a period after the one before, on its monotonic clock. It
