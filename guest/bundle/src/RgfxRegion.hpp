@@ -46,7 +46,9 @@
 #define RGFX_REGION_HPP_
 
 #include <cstdint>
+#include <map>
 #include <mutex>
+#include <tuple>
 
 #include "reims_graphics_wire.h"
 
@@ -109,8 +111,9 @@ public:
 	/// (WRITE-COMBINED PARTS); the whole block write-back otherwise.
 	Block allocate(uint64_t size, uint64_t align, uint64_t writeCombinedFrom);
 
-	/// Hands back the block at region offset `offset` (one allocate() returned) to the block
-	/// source; nothing without one.
+	/// Hands back the block at region offset `offset` (one allocate() or acquirePages() returned)
+	/// to the block source; nothing without one. A pages block given more than once
+	/// (acquirePages' `join`) goes back at the release for the last time it was given.
 	void release(uint64_t offset);
 
 	/// Where blocks come from: `alloc` places `size` bytes aligned to `align` and writes the
@@ -253,7 +256,24 @@ public:
 	/// The pages block of the `length` bytes at `address` (PagesBlockFn): `ok` false without a
 	/// pages block source, or where it gives none. Its `ptr` is null: the process never maps a
 	/// pages block, which holds the device's runs alone.
-	Block acquirePages(const void *address, uint64_t length, bool writable);
+	///
+	/// With a `join` other than kPagesOwn, a block given for the same bytes, writability and
+	/// `join` that is still joinable is given again rather than a new one, so the device makes one
+	/// view of the pages, and one copy of them where it copies them: two no-copy buffers over the
+	/// same memory lie in one host memory, as on a Mac they lie in the same pages. A block stays
+	/// joinable until leavePages() was called for each time it was given: the caller calls it as
+	/// the object over the block goes for the app, while the app still keeps the memory, so a
+	/// block is never joined over memory the app freed and took again at the same address. It goes
+	/// back through the block source at the release() for the last time it was given.
+	Block acquirePages(const void *address, uint64_t length, bool writable,
+	                   uint32_t join = kPagesOwn);
+
+	/// acquirePages' `join` for a block of its own, given to no one else.
+	static const uint32_t kPagesOwn = 0;
+
+	/// The pages block at `offset` is no longer joinable for one of the times acquirePages gave
+	/// it (its object went for the app); nothing for a block given with kPagesOwn.
+	void leavePages(uint64_t offset);
 
 	/// A submission + completion ring pair (see RingPair). Each data size must be a
 	/// power of two; `complete_data_size` may be 0 (no completion ring placed).
@@ -303,6 +323,28 @@ private:
 #if defined(__arm64__)
 	uint64_t m_pagesPage = 0x1000; // pagesPage()
 #endif
+	// The pages blocks given with a join (acquirePages): the joinable ones by their bytes,
+	// writability and join, and each such block's counts by its offset, under m_pagesLock.
+	struct PagesRange {
+		uintptr_t address;
+		uint64_t length;
+		bool writable;
+		uint32_t join;
+		bool operator<(const PagesRange &o) const
+		{
+			return std::tie(address, length, writable, join) <
+			       std::tie(o.address, o.length, o.writable, o.join);
+		}
+	};
+	struct JoinedPages {
+		PagesRange range;
+		uint64_t size;
+		uint32_t joinable; // the times given whose leavePages has not come
+		uint32_t held;     // the times given whose release has not come
+	};
+	std::map<PagesRange, uint64_t> m_joinablePages;
+	std::map<uint64_t, JoinedPages> m_joinedPages;
+	std::mutex m_pagesLock;
 	SurfaceWritesFn m_writesNote = nullptr; // the surface write source, where set (the kext)
 	SurfaceRetireFn m_writesRetire = nullptr;
 	void *m_writesContext = nullptr;

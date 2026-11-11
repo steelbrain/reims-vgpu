@@ -27,6 +27,15 @@ namespace {
 /// the device's view of a block starts at the page of the buffer's first byte.
 constexpr uint64_t kRgfxGuestPage = 0x1000;
 
+/// MTLResourceOptions bit 24, Metal's private bit, which a create carries to the host
+/// (kRgfxHostResourceOptions) and the host's runtime takes as read-only memory.
+constexpr MTLResourceOptions kBit24 = 1u << 24;
+
+/// The joins of no-copy buffers over the app's own pages (RgfxRegion::acquirePages): one of
+/// buffers with bit 24, and one of the rest.
+constexpr uint32_t kPagesJoin = 1;
+constexpr uint32_t kPagesJoinBit24 = 2;
+
 // The whole 4 KiB pages `length` bytes at `pointer` lie in, which both x86-64 Macs' GPUs answer a
 // buffer's allocatedSize with (oracle_bundle buffers and nocopy.*, AMD 5300M and Intel 630, macOS
 // 26.7.1): a buffer made from a length or bytes in any storage mode answers its length rounded up
@@ -157,6 +166,11 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 	// copy, the app's memory, which the host's GPU uses as a Shared buffer's, so neither
 	// didModifyRange: nor a synchronize has anything to bring over.
 	BOOL _oneCopy;
+	// A no-copy buffer over the app's own pages (bufferOverPagesOf): the region whose pages block
+	// it lies over, which the buffer leaves joinable no longer as it goes (RgfxRegion::leavePages),
+	// and the block's offset; null for any other.
+	RgfxRegion *_pagesRegion;
+	uint64_t _pagesBlock;
 }
 
 + (instancetype)bufferWithLength:(NSUInteger)length
@@ -425,6 +439,14 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 // docs/graphics-kext/dgpu-oracle.md, Q3; the AMD 5300M's is two copies, which Metal's contract
 // for the mode allows either way): the host's buffer over the pages is a Shared one, and the
 // buffer answers the Managed options it was asked.
+//
+// Buffers over the same bytes share their pages block (RgfxRegion::acquirePages), so the host
+// makes one view of the pages, and one copy where it copies them rather than importing them, as on
+// a Mac they lie in the same pages. Apple's OpenCL makes such buffers: a Shared no-copy one over
+// its staging pages at each clEnqueueWriteBuffer, the same pages each time, while the one before
+// still lives (measured: a macOS 26.6.1 guest on the RTX 5080 host, 2026-11-11). One with Metal's
+// private bit 24, which the host's runtime takes as read-only memory, joins only its own kind,
+// never a writable one's view.
 + (instancetype)bufferOverPagesOf:(void *)pointer
                            length:(NSUInteger)length
                           options:(MTLResourceOptions)options
@@ -433,7 +455,8 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
                            device:(id<MTLDevice>)device
                        serializer:(RgfxSerializer *)serializer
 {
-	RgfxRegion::Block block = region->acquirePages(pointer, length, true);
+	const uint32_t join = (options & kBit24) != 0 ? kPagesJoinBit24 : kPagesJoin;
+	RgfxRegion::Block block = region->acquirePages(pointer, length, true, join);
 	if (!block.ok)
 		return nil;
 	// The block's view starts at the page of the pointer's first byte, of the kext's page.
@@ -449,11 +472,13 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 	RgfxCreated created = serializer->createBufferOverPages(length, static_cast<uint32_t>(onHost),
 	                                                        block.offset, block.size, offset);
 	if (created.obj_id == 0 || serializer->refused(created)) {
+		region->leavePages(block.offset);
 		region->release(block.offset); // no buffer lies over the block
 		return nil;
 	}
 	// The block goes back once the host has dropped the buffer, then the caller's memory: the
-	// kext unwires its pages once the device has answered the block's release.
+	// kext unwires its pages once the device has answered the block's release. It is joinable no
+	// longer once the buffer has gone for the app (dealloc).
 	const uint64_t at = block.offset;
 	RgfxBuffer *buffer = [[RgfxBuffer alloc] initWithObjId:created.obj_id
 	                                            gpuAddress:created.gpu_address + offset
@@ -467,11 +492,15 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 	                                           }
 	                                                device:device
 	                                            serializer:serializer];
-	if (buffer != nil) {
-		buffer->_ownsAddress = YES;
-		buffer->_addressPick = created.gpu_address;
-		buffer->_oneCopy = managed;
+	if (buffer == nil) {
+		region->leavePages(at);
+		return nil;
 	}
+	buffer->_ownsAddress = YES;
+	buffer->_addressPick = created.gpu_address;
+	buffer->_oneCopy = managed;
+	buffer->_pagesRegion = region;
+	buffer->_pagesBlock = at;
 	return buffer;
 }
 
@@ -541,6 +570,10 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 	// caller's pages), so nothing reuses it while the host may still read it.
 	if (_ownsContents)
 		std::free(_contents);
+	// Gone for the app, which may free the memory under it once its deallocator runs: a buffer
+	// made since over the same bytes takes a block of its own.
+	if (_pagesRegion != nullptr)
+		_pagesRegion->leavePages(_pagesBlock);
 	void (^deallocator)(void) = _hostDeallocator;
 	RgfxSerializer *serializer = _serializer;
 	uint64_t address = !_ownsAddress ? 0 : _addressPick != 0 ? _addressPick : _gpuAddress;

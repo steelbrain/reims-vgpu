@@ -2959,6 +2959,85 @@ void test_region_pages_blocks()
 	CHECK(src.released.size() == 1 && src.released[0] == mem.size() - 0x800);
 }
 
+// A pages block asked with a join (RgfxRegion::acquirePages) is given again for the same bytes,
+// writability and join while it is joinable, the kext asked once: it stays joinable until
+// leavePages came for each time it was given, and goes back to the block source at the release
+// for the last of them, whichever order those come in. Other bytes, another writability, another
+// join and kPagesOwn each take a block of their own; once a block is joinable no longer, the same
+// bytes take a new block though the old one is still held.
+void test_region_pages_joins()
+{
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	struct Source {
+		int asked = 0;
+		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x10000;
+		std::vector<uint64_t> released;
+		static bool block(void *c, const void *, uint64_t, bool, uint64_t *offset, uint64_t *size)
+		{
+			Source *s = static_cast<Source *>(c);
+			s->asked++;
+			*offset = s->next;
+			*size = 0x4000;
+			s->next += 0x4000;
+			return true;
+		}
+		static bool alloc(void *, uint64_t, uint64_t, uint64_t *) { return false; }
+		static void release(void *c, uint64_t offset)
+		{
+			static_cast<Source *>(c)->released.push_back(offset);
+		}
+	} src;
+	region.setBlockSource(&Source::alloc, &Source::release, &src);
+	region.setPagesBlockSource(&Source::block, &src);
+	static uint8_t bytes[0x8000];
+	const uint32_t join = 1;
+
+	RgfxRegion::Block a = region.acquirePages(bytes, 0x4000, true, join);
+	RgfxRegion::Block b = region.acquirePages(bytes, 0x4000, true, join);
+	CHECK(a.ok && b.ok && a.offset == b.offset && a.size == b.size && b.ptr == nullptr);
+	CHECK(src.asked == 1);
+	// Each of these takes a block of its own.
+	const RgfxRegion::Block others[] = {
+	    region.acquirePages(bytes, 0x3000, true, join),
+	    region.acquirePages(bytes + 0x1000, 0x4000, true, join),
+	    region.acquirePages(bytes, 0x4000, false, join),
+	    region.acquirePages(bytes, 0x4000, true, join + 1),
+	    region.acquirePages(bytes, 0x4000, true, RgfxRegion::kPagesOwn),
+	    region.acquirePages(bytes, 0x4000, true, RgfxRegion::kPagesOwn),
+	};
+	CHECK(src.asked == 7);
+	for (const RgfxRegion::Block &o : others)
+		CHECK(o.ok && o.offset != a.offset);
+	CHECK(others[4].offset != others[5].offset);
+
+	// The first holder's release before its leave: held still, and joinable.
+	region.release(a.offset);
+	CHECK(src.released.empty());
+	RgfxRegion::Block c = region.acquirePages(bytes, 0x4000, true, join);
+	CHECK(c.ok && c.offset == a.offset && src.asked == 7);
+	region.leavePages(a.offset);
+	region.leavePages(a.offset);
+	CHECK(region.acquirePages(bytes, 0x4000, true, join).offset == a.offset && src.asked == 7);
+	// The last leave: the same bytes take a new block while the old one is held.
+	region.leavePages(a.offset);
+	region.leavePages(a.offset);
+	RgfxRegion::Block d = region.acquirePages(bytes, 0x4000, true, join);
+	CHECK(d.ok && d.offset != a.offset && src.asked == 8);
+	region.leavePages(a.offset); // past the last leave: nothing
+	region.release(a.offset);
+	region.release(a.offset);
+	CHECK(src.released.empty());
+	region.release(a.offset); // the last of the four
+	CHECK(src.released.size() == 1 && src.released[0] == a.offset);
+	region.release(d.offset);
+	CHECK(src.released.size() == 2 && src.released[1] == d.offset);
+	// A block of kPagesOwn goes back at its one release.
+	region.leavePages(others[4].offset);
+	region.release(others[4].offset);
+	CHECK(src.released.size() == 3 && src.released[2] == others[4].offset);
+}
+
 // Where the kext maps parts of blocks write-combined, a block asked with a write-combined part
 // takes it from the write-combined source, and one asked without from the block source; a queue's
 // submission ring's data starts its block's second page, write-combined, with the ring's header
@@ -3038,6 +3117,7 @@ int main()
 	test_id_space();
 	test_obj_ids_are_given_once();
 	test_region_pages_blocks();
+	test_region_pages_joins();
 	test_region_write_combined_parts();
 	test_address_picks();
 	test_resource_id_chunks();

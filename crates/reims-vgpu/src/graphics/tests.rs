@@ -9333,6 +9333,62 @@ fn buffer_over_pages(obj_id: u64, length: u64) -> Vec<u8> {
     .to_vec()
 }
 
+/// Two `BUFFER_OVER_PAGES` over one pages block, as the guest sends for two no-copy buffers over
+/// the same bytes (Apple's OpenCL makes one over its staging pages at each write), lie in
+/// its one view: the view and its import are made once, and a buffer over the view for each. The
+/// block's release is refused while either lives, and answered once both are destroyed
+#[test]
+fn two_buffers_over_one_pages_block_lie_in_its_one_view() {
+    let (device, platform, _ram, page) = surface_device(8);
+    let mut guest = Guest::new(&device);
+    guest.send(&device, block_grant(1, SURFACE_BLOCK, SURFACE_BLOCK_SIZE));
+    let mut pages = surface_pages(&device, page, &[(5, 2), (1, 1)]);
+    pages.extend_from_slice(
+        RgfxSurfacePagesCache {
+            flags: RGFX_SURFACE_PAGES_PRIVATE,
+            reserved_04: 0,
+        }
+        .as_bytes(),
+    );
+    guest.send(&device, pages);
+    let pages_seqno = guest.seqno;
+    let answer = complete_of(&guest.event().expect("the SURFACE_PAGES' answer"));
+    assert_eq!(answer, (pages_seqno, RGFX_STATUS_OK));
+    let worker = device.control.decoder();
+    worker.surface_worker().flush();
+    let mark = platform.call_log().mark();
+
+    guest.send(&device, buffer_over_pages(obj(1, 11), 3 * page));
+    guest.send(&device, buffer_over_pages(obj(1, 12), 3 * page));
+    assert!(objects_become(&device, 2), "both buffers made");
+    worker.surface_worker().flush();
+    let made = platform.call_log().sels_since(mark);
+    let buffers = made
+        .iter()
+        .filter(|&&s| s == "newBufferWithDescriptor:")
+        .count();
+    assert_eq!(
+        buffers, 3,
+        "the view's import, and a buffer over it for each: {made:?}"
+    );
+    assert_eq!(worker.views_of_surfaces().counts().private, 1, "one view");
+
+    let release = || block_release(1, SURFACE_BLOCK, SURFACE_BLOCK_SIZE);
+    assert_eq!(
+        answered(&device, &mut guest, release()),
+        RGFX_STATUS_REFUSED,
+        "both lie in it"
+    );
+    guest.send(&device, object_destroy(obj(1, 11)));
+    assert_eq!(
+        answered(&device, &mut guest, release()),
+        RGFX_STATUS_REFUSED,
+        "the second lies in it"
+    );
+    guest.send(&device, object_destroy(obj(1, 12)));
+    assert_eq!(answered(&device, &mut guest, release()), RGFX_STATUS_OK);
+}
+
 /// A pages block's view, which its first `BUFFER_OVER_PAGES` makes, is made off ring 0's threads:
 /// while it is being made, ring 0 goes on with another context's messages, before and after the
 /// buffer's context's next messages, an object's create and the buffer's destroy, and the block's

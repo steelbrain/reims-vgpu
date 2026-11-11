@@ -11260,6 +11260,110 @@ void test_no_copy_buffers_in_place()
 	CHECK(!RgfxMemoryShadow::anyLive());
 }
 
+// Two no-copy buffers over the same writable bytes of the app's (Apple's OpenCL makes a Shared one
+// over its staging pages at each write; here a Shared and a Managed one) lie over one pages
+// block (RgfxRegion::acquirePages): the kext asked once, and two BUFFER_OVER_PAGES naming that
+// block, each with an object and a GPU address of its own, so the host makes one view of the
+// pages and one copy of them where it copies them. The block goes back once the host has dropped
+// both, not at the first. One of bit 24, or over other bytes, takes a block of its own, and once
+// both have gone for the app the same bytes take a new block.
+void test_no_copy_buffers_over_the_same_bytes_share_a_block()
+{
+	@autoreleasepool {
+	QueueFixture f;
+	(void)expectQueueCreate(f.control);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x200000, 0xff);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	RgfxRegionSlabSource slabSource(region, f.ser);
+	RgfxSlabs slabs(slabSource);
+	struct Pages {
+		int asked = 0;
+		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x100000;
+		static bool block(void *c, const void *, uint64_t, bool, uint64_t *offset, uint64_t *size)
+		{
+			Pages *p = static_cast<Pages *>(c);
+			p->asked++;
+			*offset = p->next;
+			*size = 0x5000;
+			p->next += 0x10000;
+			return true;
+		}
+	} pages;
+	region.setPagesBlockSource(&Pages::block, &pages);
+	vm_address_t app = 0;
+	CHECK(vm_allocate(mach_task_self(), &app, 0x10000, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
+	uint8_t *p = reinterpret_cast<uint8_t *>(app);
+	auto noCopy = [&](void *ptr, NSUInteger length, MTLResourceOptions options) {
+		return [RgfxBuffer bufferWithBytesNoCopy:ptr
+		                                  length:length
+		                                 options:options
+		                             deallocator:nil
+		                                  region:&region
+		                                   slabs:&slabs
+		                                  device:nil
+		                              serializer:&f.ser];
+	};
+	const uint64_t joined = pages.next;
+	auto heldJoined = [&] {
+		return std::find(blocks.released.begin(), blocks.released.end(), joined) ==
+		       blocks.released.end();
+	};
+	@autoreleasepool {
+		RgfxBuffer *shared = noCopy(p, 0x4000, 0x100000 | MTLResourceStorageModeShared);
+		CHECK(shared != nil && [shared contents] == p && pages.asked == 1);
+		auto one = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+		@autoreleasepool {
+			RgfxBuffer *managed = noCopy(p, 0x4000, 0x100000 | MTLResourceStorageModeManaged);
+			CHECK(managed != nil && [managed contents] == p && pages.asked == 1);
+			auto two = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+			CHECK(one.block_offset == joined && two.block_offset == joined);
+			CHECK(one.block_size == 0x5000 && two.block_size == 0x5000);
+			CHECK(one.obj_id == shared.rgfxObjId && two.obj_id == managed.rgfxObjId);
+			CHECK(one.obj_id != two.obj_id && shared.gpuAddress != managed.gpuAddress);
+			CHECK((two.options & MTLResourceStorageModeMask) == MTLResourceStorageModeShared);
+			// Bit 24, and fewer bytes: blocks of their own.
+			RgfxBuffer *bit24 = noCopy(p, 0x4000, MTLResourceStorageModeShared | (1u << 24));
+			auto three = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+			RgfxBuffer *fewer = noCopy(p, 0x2000, MTLResourceStorageModeShared);
+			auto four = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+			CHECK(bit24 != nil && fewer != nil && pages.asked == 3);
+			CHECK(three.block_offset != joined && four.block_offset != joined &&
+			      three.block_offset != four.block_offset);
+		}
+		// The Managed one, the bit 24 one and the shorter one gone: theirs back, the joined
+		// block still under the Shared one.
+		CHECK(eventually([&] { return blocks.released.size() == 2; }));
+		CHECK(heldJoined());
+		drainRing(f.control);
+		// Joinable still while the Shared one lives.
+		@autoreleasepool {
+			RgfxBuffer *again = noCopy(p, 0x4000, MTLResourceStorageModeShared);
+			CHECK(again != nil && pages.asked == 3);
+			auto five = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+			CHECK(five.block_offset == joined);
+		}
+		drainRing(f.control);
+		CHECK(heldJoined());
+	}
+	CHECK(eventually([&] { return !heldJoined(); }));
+	CHECK(blocks.released.size() == 3);
+	drainRing(f.control);
+	// Both gone for the app: the same bytes take a new block.
+	@autoreleasepool {
+		RgfxBuffer *later = noCopy(p, 0x4000, MTLResourceStorageModeShared);
+		CHECK(later != nil && pages.asked == 4);
+		auto six = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+		CHECK(six.block_offset != joined);
+	}
+	CHECK(eventually([&] { return blocks.released.size() == 4; }));
+	drainRing(f.control);
+	vm_deallocate(mach_task_self(), app, 0x10000);
+	}
+	CHECK(!RgfxMemoryShadow::anyLive());
+}
+
 
 // A no-copy buffer's GPU copy (its shadow) is a range of a slab of its options, as a device
 // buffer's is (RgfxBuffer.h): with the process's own pages as the slabs' first source, the
@@ -16747,6 +16851,7 @@ int main(int argc, char **argv)
 		test_managed_texture_copy_block_after_destroys();
 		test_no_copy_buffers();
 		test_no_copy_buffers_in_place();
+		test_no_copy_buffers_over_the_same_bytes_share_a_block();
 		test_no_copy_shadows_lie_in_slabs();
 		test_binds_note_shadow_writes();
 		test_block_call();

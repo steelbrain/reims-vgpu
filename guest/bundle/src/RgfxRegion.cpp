@@ -159,21 +159,54 @@ void RgfxRegion::setPagesBlockSource(PagesBlockFn acquire, void *context)
 	m_pagesBlockContext = context;
 }
 
-RgfxRegion::Block RgfxRegion::acquirePages(const void *address, uint64_t length, bool writable)
+RgfxRegion::Block RgfxRegion::acquirePages(const void *address, uint64_t length, bool writable,
+                                           uint32_t join)
 {
 	Block out = {};
+	if (m_pagesBlock == nullptr)
+		return out; // ok == false
+	const PagesRange range = {reinterpret_cast<uintptr_t>(address), length, writable, join};
+	if (join != kPagesOwn) {
+		std::lock_guard<std::mutex> guard(m_pagesLock);
+		auto it = m_joinablePages.find(range);
+		if (it != m_joinablePages.end()) {
+			JoinedPages &joined = m_joinedPages.at(it->second);
+			joined.joinable++;
+			joined.held++;
+			out.offset = it->second;
+			out.size = joined.size;
+			out.ok = true;
+			return out;
+		}
+	}
 	uint64_t offset = 0, size = 0;
-	if (m_pagesBlock == nullptr ||
-	    !m_pagesBlock(m_pagesBlockContext, address, length, writable, &offset, &size))
+	if (!m_pagesBlock(m_pagesBlockContext, address, length, writable, &offset, &size))
 		return out; // ok == false
 	if (offset < m_floor || offset > m_size || size > m_size - offset) {
 		release(offset);
 		return out;
 	}
+	// A block the kext gave for the same bytes on another thread meanwhile stays the one joined;
+	// this one is its own.
+	if (join != kPagesOwn) {
+		std::lock_guard<std::mutex> guard(m_pagesLock);
+		if (m_joinablePages.emplace(range, offset).second)
+			m_joinedPages[offset] = JoinedPages{range, size, 1, 1};
+	}
 	out.offset = offset;
 	out.size = size;
 	out.ok = true;
 	return out;
+}
+
+void RgfxRegion::leavePages(uint64_t offset)
+{
+	std::lock_guard<std::mutex> guard(m_pagesLock);
+	auto it = m_joinedPages.find(offset);
+	if (it == m_joinedPages.end() || it->second.joinable == 0)
+		return;
+	if (--it->second.joinable == 0)
+		m_joinablePages.erase(it->second.range);
 }
 
 void RgfxRegion::releaseSurface(uint64_t offset)
@@ -185,6 +218,17 @@ void RgfxRegion::releaseSurface(uint64_t offset)
 
 void RgfxRegion::release(uint64_t offset)
 {
+	{
+		std::lock_guard<std::mutex> guard(m_pagesLock);
+		auto it = m_joinedPages.find(offset);
+		if (it != m_joinedPages.end()) {
+			if (--it->second.held != 0)
+				return;
+			if (it->second.joinable != 0)
+				m_joinablePages.erase(it->second.range);
+			m_joinedPages.erase(it);
+		}
+	}
 	if (m_release != nullptr) {
 		m_release(m_sourceContext, offset);
 	}
