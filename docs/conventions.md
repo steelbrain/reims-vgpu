@@ -115,6 +115,14 @@ repeats the ones code cites.
     of degradation) and summaries, at most once a minute.
   - QEMU's `reims-graphics-pci` says a failure the guest can repeat with
     `error_report_once`.
+  - The guest's kexts log a failure a caller can repeat once a boot per
+    kind (`rgfxFirstCalls`, `guest/kext/src/RgfxTrace.hpp`), and the Metal
+    bundle once a process per kind (`rgfxLogFirst`,
+    `guest/bundle/src/RgfxLogOnce.hpp`); the kind is the site, and a status,
+    selector or reason where the site has several. Their summaries (the
+    rings' room, the releases, the dormant blocks, the swaps, the surface
+    copies) come at most once a minute, and a bring-up trace logs its first
+    calls alone.
 - Tests sit in `mod tests` beside the code and are named by behaviour.
 - **Integers**: std spells wrapping, overflowing, widening and sign
   reinterpretation (`wrapping_add`, `overflowing_mul`, `u64::from`,
