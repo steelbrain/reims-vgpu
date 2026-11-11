@@ -791,14 +791,25 @@ Stages:
       Macs without an Intel GPU, or where `com.apple.AppleGVA`'s
       `gvaForceAMDKE` is set; elsewhere, an iMac20,1 among them, it looks for
       an Intel GPU and gives up without one. RgfxGate's install thread keeps
-      the key set in `/Library/Preferences/com.apple.AppleGVA.plist` at every
-      boot, after the bundle step (`guest/rgfxgate/src/RgfxGatePrefs.cpp`): an
+      the key set at every boot, after the bundle step
+      (`guest/rgfxgate/src/RgfxGatePrefs.cpp`), in two files:
+      `/Library/Preferences/com.apple.AppleGVA.plist`, and the global domain's
+      for every user, `/Library/Preferences/.GlobalPreferences.plist`. An
       absent file gets a fresh XML plist, an XML plist gets the key with every
       other byte kept, a binary one, as cfprefsd writes it (`defaults delete`
       leaves an empty one), gets the key with every object kept, and an
       unreadable one is left and logged.
       AppleGVA reads it from the next service start (measured on the guest,
-      macOS 26.6.1).
+      macOS 26.6.1). The global domain is for the processes that run AppleGVA
+      in a sandbox of their own: Safari's H.264 decodes in WebKit's GPU
+      process, not in VTDecoderXPCService, and that process's sandbox denies
+      it `com.apple.AppleGVA.plist` (the kernel logs `deny(1) file-read-data`)
+      while it reads the global domains. With the key in the AppleGVA file
+      alone, AppleGVA there found no Intel GPU and every H.264 video in Safari
+      decoded in software; with the key in the global domain the same
+      process's sessions reached the driver (measured on the guest, macOS
+      26.6.1, a 4K60 H.264 clip on the RTX 5080: NVDEC decoded all 980 of its
+      pictures). Safari's HEVC decodes in VTDecoderXPCService either way.
     - **The GPU is named GFX0.** AppleGVA's video routing finds the GPU by
       the name real AMD Macs give its PCI device, `GFX0`. HEVC needs it: the
       accelerator names its IOPCIDevice provider `GFX0` in `start`, before
