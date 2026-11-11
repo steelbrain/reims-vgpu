@@ -151,12 +151,17 @@ The video crates' checks:
   ulimit -c 0
   cargo nextest run --workspace --no-fail-fast \
     --features reims-vgpu-vulkan/testkit,reims-vgpu/testkit,reims-vgpu/vulkan,reims-vgpu-c/vulkan
+  # on the NVIDIA host, the same with --profile nvidia
   cargo nextest run -p reims-vgpu-video --run-ignored only -E 'test(/^vaapi::/)'   # the VA-API host
   cargo nextest run -p reims-vgpu-video --run-ignored only -E 'test(/^nvidia::/)'  # the NVIDIA host
   ```
   The features are `cargo xtask check`'s on Linux. The ignored tests check
   the bindings against libva's and NVIDIA's headers, and the hardware's own
-  answers on the GPU.
+  answers on the GPU. The NVIDIA host's `nvidia` profile runs at most three
+  tests that make a Vulkan device at a time (`.config/nextest.toml`): each
+  test process makes a device of its own, up to 16 at once where a QEMU
+  makes one, and an RTX 2080 behind a Thunderbolt link, whose BAR1 is
+  256 MiB, refuses a new device once the live ones hold too much of it.
 - **The conformance suite**, where the `vaapi` module's decoders change:
   `crates/reims-vgpu-video/tools/h264-check.sh NODE` and
   `hevc-check.sh NODE` on each render node
