@@ -32,8 +32,9 @@ pub const RVG_ERR_METAL: u32 = 3;
 /// The call's GPU work ended with an error.
 pub const RVG_ERR_GPU: u32 = 4;
 
-/// The host refused the memory, a pipe or a thread the call needs: the graphics device's region
-/// or its threads (rvg_graphics_device_create).
+/// The host refused the memory, a pipe, a thread or the GPU device the call needs: the graphics
+/// device's region, its threads, or its GPU device, where the host has none the library can use
+/// or its driver refused it (rvg_graphics_device_create).
 pub const RVG_ERR_HOST_RESOURCES: u32 = 5;
 
 /// The status of a Rust API error.
@@ -54,7 +55,7 @@ const MESSAGES: [&std::ffi::CStr; 6] = [
     c"unsupported struct size",
     c"the platform refused an object",
     c"GPU error",
-    c"the host refused memory, a pipe or a thread",
+    c"the host refused memory, a pipe, a thread or a GPU device",
 ];
 
 /// A static, NUL-terminated description of `status`; "unknown status" for a value this
@@ -90,7 +91,7 @@ mod tests {
         assert_eq!(message(RVG_ERR_GPU), MESSAGES[4].to_str().unwrap());
         assert_eq!(
             message(RVG_ERR_HOST_RESOURCES),
-            "the host refused memory, a pipe or a thread"
+            "the host refused memory, a pipe, a thread or a GPU device"
         );
         assert_eq!(message(6), "unknown status");
         assert_eq!(message(u32::MAX), "unknown status");

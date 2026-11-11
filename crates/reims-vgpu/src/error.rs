@@ -10,8 +10,9 @@ pub enum Error {
     Metal,
     /// The call's GPU work ended with an error.
     Gpu,
-    /// The host refused the memory, a pipe or a thread a device needs: the graphics device's
-    /// region, or its threads.
+    /// The host refused the memory, a pipe, a thread or the GPU device a device needs: the
+    /// graphics device's region, its threads, or its GPU device (the host has none the platform
+    /// can use, or its driver refused it).
     HostResources,
 }
 
@@ -21,7 +22,7 @@ impl std::fmt::Display for Error {
             Error::InvalidArgument => "invalid argument",
             Error::Metal => "the platform refused an object",
             Error::Gpu => "the GPU work failed",
-            Error::HostResources => "the host refused memory, a pipe or a thread",
+            Error::HostResources => "the host refused memory, a pipe, a thread or a GPU device",
         })
     }
 }

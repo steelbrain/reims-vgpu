@@ -155,8 +155,15 @@ impl VulkanPlatform {
 
 /// The devices `make` makes, a creator standing for `sel` (`MTLCreateSystemDefaultDevice()`,
 /// `MTLCopyAllDevices()`): none where the runtime finds no Vulkan device it can use, or no Vulkan
-/// loader. Any other refusal dies at `sel`, naming it. A device that lists a window extension the
-/// options name but lacks its feature (`Error::ExtensionFeature`, `swapchainMaintenance1`) dies at `sel`
+/// loader; none too where the host's Vulkan driver refuses the device
+/// ([`refused_by_the_driver`]), logged at error naming the refusal, as a host with no device it
+/// could use: the caller answers as it does with none (the graphics device's create
+/// `Error::HostResources`, `RVG_ERR_HOST_RESOURCES`). On an RTX 2080 whose BAR1 is 256 MiB, of
+/// which each device maps 67 MiB, 8 processes making a device at once had 4 to 6 of them refused
+/// so (`VK_ERROR_INITIALIZATION_FAILED`, **measured** 2026-11-11, driver 620.70.06).
+///
+/// Any other refusal dies at `sel`, naming it. A device that lists a window extension the options
+/// name but lacks its feature (`Error::ExtensionFeature`, `swapchainMaintenance1`) dies at `sel`
 /// too, naming the extension and the feature: the runtime refuses it rather than enable the
 /// extension without the feature, and the window's probe names the extension only where every
 /// device has the feature, asked as the runtime asks ([`crate::os::add_window_extensions`]). So
@@ -169,8 +176,26 @@ fn made_devices(
 ) -> Vec<rt::Device> {
     get(sel, || match make() {
         Err(rt::Error::NoDevice | rt::Error::LoaderNotFound(_)) => Ok(Vec::new()),
+        Err(e) if refused_by_the_driver(&e) => {
+            log::error!(
+                target: "reims_vgpu_vulkan::device",
+                "{sel}: the host's Vulkan driver refused the device ({e}): none is made, as on a \
+                 host with no Vulkan device"
+            );
+            Ok(Vec::new())
+        }
         made => made,
     })
+}
+
+/// Whether `e`, a refusal of a device's make, is the host's Vulkan driver's: a Vulkan call's
+/// failure (`VK_ERROR_INITIALIZATION_FAILED` and the rest), its memory run out, or its device
+/// lost. Every other is the library's or the runtime's own.
+fn refused_by_the_driver(e: &rt::Error) -> bool {
+    matches!(
+        e,
+        rt::Error::Vulkan(_) | rt::Error::OutOfMemory(_) | rt::Error::DeviceLost
+    )
 }
 
 /// The creator [`Platform::open_device`] stands for, which its deaths name.
@@ -801,8 +826,30 @@ pub(crate) mod tests {
         assert!(format!("{:?}", Obj::new(3u8)).ends_with(" 3>"));
     }
 
+    /// A device the host's Vulkan driver refuses is none at its creator, as with no device or no
+    /// loader: a Vulkan call's failure (an RTX 2080's `VK_ERROR_INITIALIZATION_FAILED` with its
+    /// BAR1 full), its memory run out, or its device lost; the caller then answers as with no
+    /// device, where it died at the creator before
+    #[test]
+    fn a_device_the_driver_refuses_is_none_at_the_creator() {
+        for sel in ["MTLCreateSystemDefaultDevice()", "MTLCopyAllDevices()"] {
+            for refusal in [
+                rt::Error::Vulkan(rt::VkResultCode(-3)),
+                rt::Error::OutOfMemory(rt::MemoryKind::Device),
+                rt::Error::OutOfMemory(rt::MemoryKind::Host),
+                rt::Error::DeviceLost,
+            ] {
+                assert!(
+                    made_devices(sel, || Err(refusal.clone())).is_empty(),
+                    "{refusal}"
+                );
+            }
+        }
+    }
+
     /// A device creator dies at its selector where the runtime refuses its devices otherwise than
-    /// for having none, naming the refusal; with no device or no loader it makes none
+    /// for having none or for the driver's refusal, naming the refusal; with no device or no
+    /// loader it makes none
     #[test]
     fn a_refused_device_dies_at_the_creator() {
         use crate::core::raise::death::DeathKind;

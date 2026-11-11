@@ -226,7 +226,8 @@ unsafe fn live<'a>(device: *const RvgGraphicsDevice, call: &'static str) -> &'a 
 /// tables, before either table is the library's: a struct_size refusal runs no destroy, and a
 /// later refusal runs both, the window's first. Refusals: RVG_ERR_INVALID_ARGUMENT,
 /// RVG_ERR_UNSUPPORTED, RVG_ERR_HOST_RESOURCES (the host refused the region's memory, a pipe or
-/// a thread). Calls back: never, but a refusal's destroys.
+/// a thread, or has no GPU device the library can use: none, or one its driver refused). Calls
+/// back: never, but a refusal's destroys.
 ///
 /// # Safety
 /// `config` is NULL or a live config; `device` is NULL or writable.

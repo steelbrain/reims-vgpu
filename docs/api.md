@@ -79,7 +79,7 @@ unknown status as a failure.
 | 2 | `RVG_ERR_UNSUPPORTED` | a larger `struct_size` with non-zero bytes the library does not know |
 | 3 | `RVG_ERR_METAL` | the platform refused the display's texture or its draw (`rvg_graphics_device_read_display`) |
 | 4 | `RVG_ERR_GPU` | the call's GPU work ended with an error |
-| 5 | `RVG_ERR_HOST_RESOURCES` | the host refused the device's region (its memory), a pipe or a thread |
+| 5 | `RVG_ERR_HOST_RESOURCES` | the host refused the device's region (its memory), a pipe or a thread, or has no GPU device the library can use: none, or one its Vulkan driver refused |
 
 `rvg_graphics_device_create` reads, in order, the config, its callbacks, its window config and the
 window's callbacks, then the memory map and the files behind its ranges. The struct checks

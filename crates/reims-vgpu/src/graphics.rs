@@ -265,7 +265,8 @@ impl GraphicsDevice<DefaultPlatform> {
 
 impl<P: ApiPlatform> GraphicsDevice<P> {
     /// A device whose window draws on `platform`. [`Error::HostResources`] where the host
-    /// refuses the region's memory, a pipe or a thread.
+    /// refuses the region's memory, a pipe or a thread, or has no GPU device the platform can use
+    /// (none, or one its driver refused).
     pub fn with_platform(platform: Arc<P>, config: GraphicsConfig) -> Result<Self, Error> {
         entry::run(|_| {
             let size = usize::try_from(reims_vgpu_graphics::REGION_SIZE)

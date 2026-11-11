@@ -57,8 +57,9 @@
 // The call's GPU work ended with an error.
 #define RVG_ERR_GPU 4
 
-// The host refused the memory, a pipe or a thread the call needs: the graphics device's region
-// or its threads (rvg_graphics_device_create).
+// The host refused the memory, a pipe, a thread or the GPU device the call needs: the graphics
+// device's region, its threads, or its GPU device, where the host has none the library can use
+// or its driver refused it (rvg_graphics_device_create).
 #define RVG_ERR_HOST_RESOURCES 5
 
 // The left button, in an RvgWindowPointerFn's `buttons`.
@@ -443,7 +444,8 @@ const char *rvg_status_message(RvgStatus status);
 // tables, before either table is the library's: a struct_size refusal runs no destroy, and a
 // later refusal runs both, the window's first. Refusals: RVG_ERR_INVALID_ARGUMENT,
 // RVG_ERR_UNSUPPORTED, RVG_ERR_HOST_RESOURCES (the host refused the region's memory, a pipe or
-// a thread). Calls back: never, but a refusal's destroys.
+// a thread, or has no GPU device the library can use: none, or one its driver refused). Calls
+// back: never, but a refusal's destroys.
 //
 // # Safety
 // `config` is NULL or a live config; `device` is NULL or writable.
