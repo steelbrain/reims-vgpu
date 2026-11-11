@@ -11,8 +11,8 @@
 //! plane's verdicts pass for all three: a read, a render and a shader's write. The class is the
 //! buffer's import (`rt::HostBacking`): by pointer (ANV, MoltenVK), or as dma-bufs (RADV), where
 //! the runtime binds each texture to a dma-buf of the texture's own pages, so those pages must fit
-//! in one ([`crate::os::one_dma_buf_fits`]). A copy of the pages in the device's own memory (the
-//! runtime's `copied-host-pages`) holds no texture in place.
+//! in one (`crate::os::one_dma_buf_fits`, on Linux). A copy of the pages in the device's own
+//! memory (the runtime's `copied-host-pages`) holds no texture in place.
 //!
 //! Not asked: the pitch the device lays a linear image's rows at, which a texture over a device
 //! cache meets as one over the pages does; and the width of the texels a shader writes, which the
