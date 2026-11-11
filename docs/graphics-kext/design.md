@@ -476,15 +476,21 @@ Stages:
       which every buffer over the block is, so every texture over the
       surface, of any shape, plane or format, lies over the same bytes. The
       block's `SURFACE_PAGES` carries the surface's `RgfxSurfacePagesLayout`
-      where the bundle gave it, a deferred block's too, and the host places
-      the cache by it alone: its first plane's first byte where the host's
-      GPU's textures over the cache may start in place, as CoreVideo lays a
-      frame's planes 32 bytes into their surface, past every linear image's
-      alignment measured (128 bytes on an RTX 5080 Laptop GPU, 256 on RADV),
-      so the textures over a decoder's planes are images of the cache's own
-      memory, not the runtime's shadows, which copy them in before each
-      command buffer's use. The answer and the copies are those of a message
-      with no layout. Each
+      where the bundle gave it, a deferred block's too, and the host lays
+      the cache out by it as by an ask's layout (below, *Device caches on a
+      GPU that shares the CPU's memory*): its first plane's first byte where
+      the host's GPU's textures over the cache may start in place, as
+      CoreVideo lays a frame's planes 32 bytes into their surface, past every
+      linear image's alignment measured (128 bytes on an RTX 5080 Laptop
+      GPU, 256 on RADV), so the textures over a decoder's planes are images
+      of the cache's own memory, not the runtime's shadows, which copy them
+      in before each command buffer's use; and its copies into the pages
+      take the surface's texels alone, each plane's rows, so its buffer
+      declares the bytes between a texture's rows unobserved, and a texture
+      whose rows lie with bytes between them may be an image over the
+      cache's memory too, where the runtime makes one (on an RTX 2080 it
+      makes none, for reasons of its own: `decode::surface_cache`). The
+      answer is that of a message with no layout. Each
       command buffer names the cached surfaces it uses
       (`RGFX_OP_SURFACE_USE`) with the kext's count of the surface's
       read-write locks when it was committed; the host fills the cache from

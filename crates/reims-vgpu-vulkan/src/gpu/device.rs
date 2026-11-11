@@ -670,7 +670,7 @@ impl VulkanDevice {
     /// `newBufferWithLength:options:`'s buffer (`new_buffer_of_length`), declaring the bytes
     /// between a texture's rows over it unobserved where `padding_unobserved`, and its byte
     /// `aligned_byte` on a multiple of 256 bytes of its memory where given
-    /// (`new_buffer_of_length_padding_unobserved`, `new_buffer_of_length_aligned`), in memory
+    /// (`new_buffer_of_length_padding_unobserved`), in memory
     /// exportable as `export` where given (`new_dma_buf_buffer_of_length_padding_unobserved`). A
     /// buffer to export is no buffer of Metal's: any refusal of it answers `None`, logged at debug,
     /// and the caller makes the buffer as any other, where one Metal makes refuses as
@@ -1185,19 +1185,6 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         options: u64,
     ) -> RaiseResult<Option<VulkanBuffer>> {
         self.buffer_of_length(length, options, false, None, None)
-    }
-
-    /// [`VulkanDevice::buffer_of_length`]'s, its byte `aligned_byte` on a multiple of 256 bytes of
-    /// its memory (`BufferDescriptor::with_aligned_byte`), which takes at most 255 bytes more of
-    /// it, with no declaration of the bytes between a texture's rows.
-    fn new_buffer_of_length_aligned(
-        &self,
-        _on: OnFault,
-        length: u64,
-        options: u64,
-        aligned_byte: u64,
-    ) -> RaiseResult<Option<VulkanBuffer>> {
-        self.buffer_of_length(length, options, false, Some(aligned_byte), None)
     }
 
     /// As `new_buffer_of_length`'s, with the runtime's declaration that the bytes between the

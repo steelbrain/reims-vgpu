@@ -614,22 +614,18 @@ fn slow_copy(split: &surface_cache::CopySplit) -> String {
 }
 
 /// What `layout`, the layout a cached or deferred block's `SURFACE_PAGES` carries, gives the
-/// block's device cache ([`surface_cache::CacheLayout::Carried`]): its surface's planes, and its
-/// first plane's byte ([`surface_cache::aligned_byte`]), which places the cache, `None` where that
-/// plane starts at the surface's first byte. A layout that does not lie in the surface's `length`
-/// bytes ([`surface_pages::layout_planes`]) gives nothing
+/// block's device cache ([`surface_cache::CacheLayout::Carried`]): its surface's planes, which
+/// place the cache and cut its copies into the pages to the surface's texels. A layout that does
+/// not lie in the surface's `length` bytes ([`surface_pages::layout_planes`]) gives nothing
 /// ([`surface_cache::CacheLayout::Unknown`]), which is logged and changes nothing else: the
-/// message is answered as with no layout, the layout only placing and making the cache.
+/// message is answered as with no layout, the layout only making the cache.
 fn carried_layout(
     block: u64,
     layout: &RgfxSurfacePagesLayout,
     length: u64,
 ) -> surface_cache::CacheLayout {
     match surface_pages::layout_planes(layout, length) {
-        Some(planes) => surface_cache::CacheLayout::Carried {
-            planes: planes.len(),
-            first_plane: surface_cache::aligned_byte(&planes),
-        },
+        Some(planes) => surface_cache::CacheLayout::Carried(planes),
         None => {
             log::warn!(
                 target: "reims_vgpu::graphics",
