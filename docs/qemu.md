@@ -1168,6 +1168,28 @@ threads stay at the default QoS. A gate's 27.0.1 probe ran at 39.1 frames a
 second (CVDisplayLink 45.4 Hz) beside a full-core `cargo xtask dist` on the
 same Mac for this reason.
 
+**Beside a build on Linux** (measured 2026-11-11 on `homelab-um870-1`, a
+Ryzen 7 8745H with 16 threads on CachyOS, x86-64 macOS 26.7.2 (25G332) on
+KVM with 8 vCPUs and the Radeon 780M, `present_probe` full screen for 10 s
+beside N `yes` processes at nice 0, jobs `m3-max-14318`, `14617` and
+`14702`): ananicy-cpp runs `qemu-system-x86_64` at nice 9 (its `Heavy_CPU`
+type), and within one cgroup nice alone divides the CPU, so each of QEMU's
+threads weighs 110 against a spinning process's 1024. With QEMU and the
+processes in one cgroup, as a VM reims-ctl left in the cgroup of the
+terminal that started it shares that terminal's build, the guest ran the
+probe at 60.0 frames a second alone, and beside 16 processes it did not
+finish the probe's 10 s within 2 minutes; beside 64 it did not answer a new
+SSH login. With the 64 processes in a systemd user scope of their own and
+QEMU where it was, it ran at 29.0 and 50.2 frames a second in two boots.
+reims-ctl now starts QEMU in a systemd user scope of its own,
+`reims-ctl-NAME.scope` (`runtime::launch`); with the processes in the
+starting cgroup, the guest ran the probe at 39.7 frames a second beside 16
+(CVDisplayLink at 51.1 Hz, gaps of at most 399 ms, the guest's 5 ms sleeps
+at most 245 ms late) and at 32.2 beside 64 (53.1 Hz, 293 ms, 169 ms): its
+cgroup and the build's weigh the same, and the guest's frame rate follows
+its vCPUs' share. A host thread sleeping to a 60 Hz grid, as the device's
+refresh thread does, kept every tick in every run, at most 5.9 ms late.
+
 **A TCG run** (`-t`) runs on a Linux member. What it needs:
 - **A node** with the arm64 guests: `homelab-um870-1` holds reflink copies of
   all five in `~/.cache/rvg-vms` (`macos-13-arm64` to `macos-27-0-arm64`,
