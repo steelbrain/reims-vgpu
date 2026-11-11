@@ -1083,7 +1083,12 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/target/ambrosia.bin \
   answers missing, and its drops are printed but not judged, as the emulated
   CPU sets WindowServer's composite rate (pacing is judged under HVF only).
   Its line also gives the host's display flips during the probe,
-  WindowServer's own present rate. A probe that falls short while Setup
+  WindowServer's own present rate, and on Linux the host's pressure over it
+  (`/proc/pressure`: the time a second some task waited for a CPU, for
+  memory and for IO, and all did for memory; `/proc/vmstat`: direct
+  compactions and reclaims). The probe's window is full-screen at the status
+  level, which needs no right to be in front ([lessons.md](lessons.md)). A
+  probe that falls short while Setup
   Assistant runs fails as unread, naming it, as its full-screen window
   covers the probe's. `bundle-install`: RgfxGate's Graft client state reads
   installed, tagged or present, and `/Library/GPUBundles/reims-graphics.bundle`
@@ -1212,7 +1217,20 @@ refresh thread does, kept every tick in every run, at most 5.9 ms late.
   the guests first.
 - **A GPU** for the device: the library runs the guest's Metal calls on the
   host's GPU over Vulkan, so the potluck job holds one, `--gpu 780m` on
-  `homelab-um870-1` (its Radeon 780M, on RADV).
+  `homelab-um870-1` (its Radeon 780M, on RADV). The script runs the device
+  on that GPU: it names the lease's first GPU (`POTLUCK_GPUS`) in
+  `MESA_VK_DEVICE_SELECT`, and stops where neither is given, since on a host
+  with several GPUs the library takes its own pick
+  ([lessons.md](lessons.md)). `homelab-um870-1` also has an RTX 3090, and a
+  run with no lease (job `m3-max-17037`) put the device on it.
+- **The whole machine**, for a run that gates a change: `--exclusive
+  --hold-line`, as for any boot whose timings decide its verdict ("Booting a
+  guest to check a change", above). Under TCG, `metal-app` passes only on
+  frames shown within the probe's 10 s, and the emulated guest gets through
+  its work at the pace of the CPU its vCPUs get. Beside a build that used 34
+  minutes of CPU in 4 min 18 s (job `m3-max-17260`), 14.6.1's probe showed
+  no frame (job `m3-max-17111`). The probe's line gives the host's pressure
+  over its run, so a run beside other work shows it.
 - **The device's library and our QEMU, built on the node**, in one potluck
   workspace that the boots then reuse (`--workspace`): `cargo xtask dist`
   (the library on Vulkan, `target/dist-vulkan`), then our QEMU at

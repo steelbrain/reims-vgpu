@@ -14,7 +14,10 @@
 #   -q FILE  our QEMU's qemu-system-aarch64 with reims-graphics-pci (docs/qemu.md, "arm64 guests:
 #            the device on Ambrosia"); default $QEMU
 #   -t       TCG, for a Linux member, in place of HVF (docs/qemu.md, "arm64 guests: the boot
-#            check of our configuration", says what such a run needs)
+#            check of our configuration", says what such a run needs). The device runs on the GPU
+#            the run is given: the one a potluck job holds (POTLUCK_GPUS, its first), else the one
+#            MESA_VK_DEVICE_SELECT names; with neither the script stops, as on a host with several
+#            GPUs the library would take its own pick (docs/lessons.md).
 #   -b FILE  the configuration bundle; default build/Config.cpio (make config-bundle)
 #   -T DIR   the guest probes, bench and present_probe; default build/guest-tools (make
 #            guest-tools, on a Mac)
@@ -62,7 +65,13 @@
 #              host's count of display flips during the probe's call, WindowServer's own present
 #              rate, to read its drops against. A probe that falls short while Setup Assistant
 #              runs fails as unread, naming it: its full-screen window covers the probe's, whose
-#              frames are then never shown.
+#              frames are then never shown. On Linux the line also gives the host's pressure over
+#              the probe's call, as /proc/pressure and /proc/vmstat count it: the time a second
+#              that some task waited for a CPU, for memory and for IO, the time all did for
+#              memory, and the direct compactions and reclaims; a probe that falls short beside
+#              other work on the host shows it there. The probe is full-screen at the status
+#              level, which needs no right to be in front: WindowServer denied a probe started
+#              over SSH that right, and its titled window was never shown (docs/lessons.md).
 #   bundle-install
 #              RgfxGate installed the Metal bundle, as it records it and as the disk shows it:
 #              its Graft client state (GraftClient.ai.aneesiqbal.RgfxGate) reads installed,
@@ -134,6 +143,14 @@ GUEST_USER=${GUEST_USER:-aneesiqbal} GUEST_PASS=${GUEST_PASS:-aneesiqbal}
 
 ram=8G
 if ((tcg)); then
+  # The GPU the run is given (the header's -t): a potluck job's lease names it as vendor:device@bus.
+  gpu=${POTLUCK_GPUS:-}
+  gpu=${gpu%%,*} gpu=${gpu%%@*}
+  if [[ $gpu == *:* ]]; then
+    export MESA_VK_DEVICE_SELECT="$gpu!"
+  elif [[ -z ${MESA_VK_DEVICE_SELECT:-} ]]; then
+    die "no GPU given: run in a job that holds one (POTLUCK_GPUS) or name it in MESA_VK_DEVICE_SELECT"
+  fi
   accel=(-accel tcg,thread=multi) limit=300 desktop_wait=300 slow=5
   machine=",memory-backend=ram,dump-guest-core=off"
   mem=(-m "$ram" -object "memory-backend-memfd,id=ram,size=$ram,share=on")
@@ -169,6 +186,26 @@ qmp_sock=$out/qmp.sock
 
 now() { perl -MTime::HiRes=time -e 'printf "%.1f\n", time'; }
 since() { perl -e 'printf "%.1f\n", $ARGV[0] - $ARGV[1]' "$(now)" "$1"; }
+# The host's pressure counters (Linux): cpu some, memory some and full, io some and full, in µs,
+# then direct compactions and direct reclaims, one line; nothing where /proc/pressure is not.
+host_pressure() {
+  [[ -r /proc/pressure/memory ]] || return 0
+  local r
+  for r in cpu memory io; do
+    awk '{ for (i = 2; i <= NF; i++) if (sub(/^total=/, "", $i)) printf "%s ", $i }' "/proc/pressure/$r"
+  done
+  awk '$1 == "compact_stall" { c = $2 } $1 ~ /^allocstall_/ { a += $2 } END { printf "%d %d\n", c, a }' /proc/vmstat
+}
+# Two readings of host_pressure over SECS seconds, said: the waits as ms a second, and the counts.
+host_pressure_say() {
+  perl -e 'my @a = split " ", $ARGV[0]; my @b = split " ", $ARGV[1]; my $s = $ARGV[2] || 1;
+    my @d = map { $b[$_] - $a[$_] } 0 .. $#a; my $ms = sub { sprintf "%.0f", $d[$_[0]] / 1000 / $s };
+    # cpu some, then cpu full where the kernel counts it (skipped), memory some and full, io some and full.
+    my $o = @d == 8 ? 1 : 0;
+    printf "cpu some %s ms/s, memory some %s full %s ms/s, io some %s full %s ms/s, ",
+      $ms->(0), $ms->(1 + $o), $ms->(2 + $o), $ms->(3 + $o), $ms->(4 + $o);
+    printf "%d compaction stalls, %d direct reclaims", $d[-2], $d[-1]' "$1" "$2" "$3"
+}
 # A QMP command, given as JSON: prints the answer, and fails where QEMU answered an error.
 qmp() {
   python3 -I - "$qmp_sock" "$1" << 'PY'
@@ -454,11 +491,12 @@ if [[ -n $ssh_s ]]; then
     # The host logs each display flip (reims_vgpu::graphics::shown, which this run names at
     # debug); those during the probe's call are WindowServer's own
     # presents, the rate the probe's frames can reach the display at.
-    q0=$(wc -l < "$out/qemu.log") t0=$SECONDS
+    p0=$(host_pressure) q0=$(wc -l < "$out/qemu.log") t0=$SECONDS
     probe=$(G 60 "echo '$GUEST_PASS' | sudo -S -p '' launchctl asuser \$(id -u) sudo -u \$(id -un) perl -e 'alarm shift @ARGV; exec @ARGV' $((40 * slow)) \$HOME/ambrosia-check/present_probe -t 10" |
       grep '^present_probe:' | head -1)
     flips=$(tail -n +"$((q0 + 1))" "$out/qemu.log" | grep -c -E 'the display shows IOSurface [1-9]') secs=$((SECONDS - t0))
     ws_say="WindowServer: $flips display flips in the probe's ${secs} s call ($(perl -e 'printf "%.1f", $ARGV[0] / ($ARGV[1] || 1)' "$flips" "$secs")/s)"
+    [[ -n $p0 ]] && ws_say="$ws_say; host over it: $(host_pressure_say "$p0" "$(host_pressure)" "$secs")"
     # report.py's bar for the correctness boot: frames presented, and at most a tenth lost, a
     # loss being a drop or an answer still missing beyond the last 3. Under TCG: frames
     # presented and at most 3 answers missing; drops are not judged.
