@@ -6,8 +6,12 @@
 // Each case prints "NAME: pass" or "NAME: FAIL (got r,g,b,a, want r,g,b,a)" (with the link log
 // where the program does not link), and the last line counts them. The cases run in a 4.1 core
 // context, except those named legacy-*, which run in a legacy one. Those named msaa-* draw into a
-// framebuffer of 4 samples, resolved into the one read, and those named point-* draw points. It
-// makes no window.
+// framebuffer of 4 samples, resolved into the one read, and those named point-* draw points. A
+// case with a draw of its own (the provoking-vertex and primitive-restart cases) draws with it in
+// place of the quad, and may check more pixels than the centre; one whose GL lacks what it draws
+// prints "NAME: skip (why)" and is not counted. GL_CASES_RENDERER=TEXT runs the cases on the first
+// renderer whose GL_RENDERER string holds TEXT (offline renderers included), and -v prints the
+// renderer each context runs on. It makes no window.
 // Our own code.
 #define GL_SILENCE_DEPRECATION 1
 #import <Foundation/Foundation.h>
@@ -23,12 +27,15 @@ extern void glTexCoord2f(GLfloat, GLfloat);
 extern void glColor4f(GLfloat, GLfloat, GLfloat, GLfloat);
 extern void glEnable(GLenum);
 extern void glAlphaFunc(GLenum, GLfloat);
+extern void glShadeModel(GLenum);
 #define GL_QUADS 0x0007
 #define GL_POLYGON 0x0009
 #define GL_POINT_SPRITE 0x8861
 #define GL_TEXTURE_2D_LEGACY 0x0DE1
 #define GL_ALPHA_TEST 0x0BC0
 #define GL_VERTEX_PROGRAM_TWO_SIDE 0x8643
+#define GL_FLAT_LEGACY 0x1D00
+#define GL_PRIMITIVE_RESTART_FIXED_INDEX_CASES 0x8D69
 
 static BOOL gVerbose = NO;
 
@@ -39,6 +46,16 @@ typedef struct {
 	GLenum primitive; // what the quad's draw uses: GL_TRIANGLE_STRIP by default
 	uint8_t want[4];
 	uint8_t tolerance;
+	// A draw of the case's own in place of the quad: 1 where it drew, 0 where the context lacks
+	// what it needs (the case is skipped); `skip` says what.
+	int (*draw)(GLuint program, const char **skip);
+	// The pixel `want` is read at, where not the default; and up to two more, each with its value.
+	GLint x, y;
+	struct {
+		GLint x, y;
+		uint8_t want[4];
+	} more[2];
+	int moreCount;
 } Case;
 
 static GLuint compile(GLenum type, const char *src, BOOL *ok) {
@@ -271,6 +288,170 @@ static void setupLegacyTexture(GLuint p) {
 	texture2D(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, 2, 2, px, GL_NEAREST);
 }
 
+// --- draws of their own: the provoking vertex and primitive restart --------------------------
+
+// Vertices of position (x, y) and colour (r, g, b, a), from `v` (6 floats each), into a new vertex
+// array: position at attribute 0, colour at the program's `col` where it has one.
+static void vertices(GLuint program, const float *v, int count) {
+	GLuint vao = 0, vbo = 0;
+	glGenVertexArrays(1, &vao);
+	glBindVertexArray(vao);
+	glGenBuffers(1, &vbo);
+	glBindBuffer(GL_ARRAY_BUFFER, vbo);
+	glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(float) * 6 * (size_t)count), v, GL_STATIC_DRAW);
+	glEnableVertexAttribArray(0);
+	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), 0);
+	const GLint col = glGetAttribLocation(program, "col");
+	if (col >= 0) {
+		glEnableVertexAttribArray((GLuint)col);
+		glVertexAttribPointer((GLuint)col, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (const void *)(2 * sizeof(float)));
+	}
+}
+
+// One triangle over the centre, its vertices red, green and blue: its flat colour is the provoking
+// vertex's, the third's (blue) under GL's default last-vertex convention, the first's (red) under
+// the first-vertex one.
+static const float kTriangle[18] = {-1, -1, 1, 0, 0, 1, 3, -1, 0, 1, 0, 1, -1, 3, 0, 0, 1, 1};
+static int drawProvokingTriangle(GLuint p, const char **skip) {
+	vertices(p, kTriangle, 3);
+	glDrawArrays(GL_TRIANGLES, 0, 3);
+	return 1;
+}
+
+// A strip of two triangles over the framebuffer: triangle 0 (vertices 0, 1, 2) below the diagonal
+// from (1, -1) to (-1, 1), triangle 1 (1, 2, 3) above it; vertices red, green, blue and white.
+// Triangle i's provoking vertex is i + 2 under the last-vertex convention (blue below, white above)
+// and i under the first-vertex one (red below, green above).
+static const float kStrip[24] = {-1, -1, 1, 0, 0, 1, 1, -1, 0, 1, 0, 1, -1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1};
+static int drawProvokingStrip(GLuint p, const char **skip) {
+	vertices(p, kStrip, 4);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	return 1;
+}
+
+// A line along row 32, red at its left end and green at its right: its flat colour is the second
+// vertex's (green) under the last-vertex convention, the first's (red) under the first-vertex one.
+static const float kLine[12] = {-1, 0.015625f, 1, 0, 0, 1, 1, 0.015625f, 0, 1, 0, 1};
+static int drawProvokingLine(GLuint p, const char **skip) {
+	vertices(p, kLine, 2);
+	glDrawArrays(GL_LINES, 0, 2);
+	return 1;
+}
+
+static void setupFirstVertex(GLuint p) {
+	glProvokingVertex(GL_FIRST_VERTEX_CONVENTION);
+}
+
+// The restart strips: two strips of one triangle each, A in the lower-left corner (vertices 0, 1,
+// 2) and B in the upper-right (4, 5, 6), split by the restart index. Vertex 3, at (1, -1), is drawn
+// only where the strip does not restart there: then triangle (2, 3, 4) covers the centre. White on
+// the blue clear: the centre stays blue where the strip restarts, and pixels (4, 4) in A and (60,
+// 60) in B are white.
+static const float kRestart[7][2] = {{-1, -1}, {-0.5f, -1}, {-1, -0.5f}, {1, -1}, {1, 1}, {0.5f, 1}, {1, 0.5f}};
+
+// The strip's vertices into a buffer of `count` (at least 7), white, with the restart strip's
+// vertex 3 also at index `at3` where that is not 3.
+static void restartVertices(GLuint p, int count, int at3) {
+	float *v = calloc((size_t)count * 6, sizeof(float));
+	for (int i = 0; i < count; i++) {
+		const int k = i < 7 ? i : i == at3 ? 3 : 0;
+		v[i * 6 + 0] = kRestart[k][0];
+		v[i * 6 + 1] = kRestart[k][1];
+		for (int c = 2; c < 6; c++) v[i * 6 + c] = 1;
+	}
+	vertices(p, v, count);
+	free(v);
+}
+
+// The strip drawn over 16- or 32-bit indices 0, 1, 2, `split`, 4, 5, 6.
+static void restartDraw(GLenum type, uint32_t split) {
+	const uint32_t idx[7] = {0, 1, 2, split, 4, 5, 6};
+	GLuint ibo = 0;
+	glGenBuffers(1, &ibo);
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+	if (type == GL_UNSIGNED_SHORT) {
+		uint16_t idx16[7];
+		for (int i = 0; i < 7; i++) idx16[i] = (uint16_t)idx[i];
+		glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx16, idx16, GL_STATIC_DRAW);
+	} else
+		glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
+	glDrawElements(GL_TRIANGLE_STRIP, 7, type, 0);
+}
+
+// Restart on at index 3, a vertex index the strip also uses: 16- and 32-bit.
+static int drawRestartIndex16(GLuint p, const char **skip) {
+	restartVertices(p, 7, 3);
+	glEnable(GL_PRIMITIVE_RESTART);
+	glPrimitiveRestartIndex(3);
+	restartDraw(GL_UNSIGNED_SHORT, 3);
+	return 1;
+}
+static int drawRestartIndex32(GLuint p, const char **skip) {
+	restartVertices(p, 7, 3);
+	glEnable(GL_PRIMITIVE_RESTART);
+	glPrimitiveRestartIndex(3);
+	restartDraw(GL_UNSIGNED_INT, 3);
+	return 1;
+}
+
+// Restart on at the 16-bit all-ones index.
+static int drawRestartAllOnes(GLuint p, const char **skip) {
+	restartVertices(p, 7, 3);
+	glEnable(GL_PRIMITIVE_RESTART);
+	glPrimitiveRestartIndex(0xffff);
+	restartDraw(GL_UNSIGNED_SHORT, 0xffff);
+	return 1;
+}
+
+// Restart off, a strip through vertex 0xffff (16-bit), which sits where vertex 3 does: GL draws it
+// as a vertex, so the centre is covered.
+static int drawRestartOff(GLuint p, const char **skip) {
+	restartVertices(p, 0x10000, 0xffff);
+	glDisable(GL_PRIMITIVE_RESTART);
+	restartDraw(GL_UNSIGNED_SHORT, 0xffff);
+	return 1;
+}
+
+// The strip drawn with restart on at 3, then again with restart off: the second draws vertex 3, so
+// the centre is covered.
+static int drawRestartOnThenOff(GLuint p, const char **skip) {
+	restartVertices(p, 7, 3);
+	glEnable(GL_PRIMITIVE_RESTART);
+	glPrimitiveRestartIndex(3);
+	restartDraw(GL_UNSIGNED_SHORT, 3);
+	glDisable(GL_PRIMITIVE_RESTART);
+	restartDraw(GL_UNSIGNED_SHORT, 3);
+	return 1;
+}
+
+// GL_PRIMITIVE_RESTART_FIXED_INDEX (GL 4.3), where the context has it: the 32-bit strip restarts at
+// 0xffffffff.
+static int drawRestartFixed(GLuint p, const char **skip) {
+	while (glGetError() != GL_NO_ERROR) {
+	}
+	glEnable(GL_PRIMITIVE_RESTART_FIXED_INDEX_CASES);
+	if (glGetError() != GL_NO_ERROR) {
+		*skip = "no GL_PRIMITIVE_RESTART_FIXED_INDEX";
+		return 0;
+	}
+	restartVertices(p, 7, 3);
+	restartDraw(GL_UNSIGNED_INT, 0xffffffffu);
+	return 1;
+}
+
+// Legacy flat shading (glShadeModel GL_FLAT) of a fixed-function triangle, its vertices red, green
+// and blue: the last vertex's colour, blue.
+static int drawLegacyFlat(GLuint p, const char **skip) {
+	glShadeModel(GL_FLAT_LEGACY);
+	glBegin(GL_TRIANGLES);
+	for (int i = 0; i < 3; i++) {
+		glColor4f(kTriangle[i * 6 + 2], kTriangle[i * 6 + 3], kTriangle[i * 6 + 4], 1);
+		glVertex2f(kTriangle[i * 6], kTriangle[i * 6 + 1]);
+	}
+	glEnd();
+	return 1;
+}
+
 // --- the cases ------------------------------------------------------------------------------
 
 #define VS41 "#version 410\nin vec2 p; out vec2 uv; void main() { uv = p * 0.5 + 0.5; gl_Position = vec4(p, 0.5, 1.0); }\n"
@@ -279,6 +460,11 @@ static void setupLegacyTexture(GLuint p) {
 // (0.516, 0.234) from the upper-left origin and (0.516, 0.766) from the lower-left.
 #define VSPOINT "#version 410\nin vec2 p; void main() { gl_PointSize = 32.0; gl_Position = vec4(0.0, -0.25, 0.5, 1.0); }\n"
 #define FSPOINT "#version 410\nout vec4 o; void main() { o = vec4(gl_PointCoord, 0.0, 1.0); }\n"
+// A flat colour from each vertex's.
+#define VSFLAT "#version 410\nin vec2 p; in vec4 col; flat out vec4 c; void main() { c = col; gl_Position = vec4(p, 0.5, 1.0); }\n"
+#define FSFLAT "#version 410\nflat in vec4 c; out vec4 o; void main() { o = c; }\n"
+#define FSWHITE FS41("void main() { o = vec4(1.0); }")
+#define RESTART_MORE {{4, 4, {255, 255, 255, 255}}, {60, 60, {255, 255, 255, 255}}}, 2
 
 static const Case kCases[] = {
     {"constant", VS41, FS41("void main() { o = vec4(0.25, 0.5, 0.75, 1.0); }"), NULL, 0, {64, 128, 191, 255}, 1},
@@ -356,17 +542,40 @@ static const Case kCases[] = {
      "#version 120\nvoid main() { gl_FragColor = gl_Color; }\n", setupTwoSide, 0, {255, 0, 0, 255}, 0},
     {"legacy-fixed-quads", NULL, NULL, setupLegacyTexture, GL_QUADS, {255, 255, 255, 255}, 0},
     {"legacy-fixed-polygon", NULL, NULL, NULL, GL_POLYGON, {255, 128, 0, 255}, 1},
+    {"provoking-last", VSFLAT, FSFLAT, NULL, 0, {0, 0, 255, 255}, 0, drawProvokingTriangle},
+    {"provoking-first", VSFLAT, FSFLAT, setupFirstVertex, 0, {255, 0, 0, 255}, 0, drawProvokingTriangle},
+    {"provoking-strip-last", VSFLAT, FSFLAT, NULL, 0, {255, 255, 255, 255}, 0, drawProvokingStrip, 40, 40,
+     {{20, 20, {0, 0, 255, 255}}}, 1},
+    {"provoking-strip-first", VSFLAT, FSFLAT, setupFirstVertex, 0, {0, 255, 0, 255}, 0, drawProvokingStrip, 40, 40,
+     {{20, 20, {255, 0, 0, 255}}}, 1},
+    {"provoking-line-last", VSFLAT, FSFLAT, NULL, 0, {0, 255, 0, 255}, 0, drawProvokingLine},
+    {"provoking-line-first", VSFLAT, FSFLAT, setupFirstVertex, 0, {255, 0, 0, 255}, 0, drawProvokingLine},
+    {"restart-index16", VS41, FSWHITE, NULL, 0, {64, 128, 191, 255}, 0, drawRestartIndex16, 0, 0, RESTART_MORE},
+    {"restart-index32", VS41, FSWHITE, NULL, 0, {64, 128, 191, 255}, 0, drawRestartIndex32, 0, 0, RESTART_MORE},
+    {"restart-allones", VS41, FSWHITE, NULL, 0, {64, 128, 191, 255}, 0, drawRestartAllOnes, 0, 0, RESTART_MORE},
+    {"restart-off", VS41, FSWHITE, NULL, 0, {255, 255, 255, 255}, 0, drawRestartOff, 0, 0, RESTART_MORE},
+    {"restart-on-then-off", VS41, FSWHITE, NULL, 0, {255, 255, 255, 255}, 0, drawRestartOnThenOff, 0, 0, RESTART_MORE},
+    {"restart-fixed", VS41, FSWHITE, NULL, 0, {64, 128, 191, 255}, 0, drawRestartFixed, 0, 0, RESTART_MORE},
+    {"legacy-flat", NULL, NULL, NULL, 0, {0, 0, 255, 255}, 0, drawLegacyFlat},
 };
 
 // --- running one ----------------------------------------------------------------------------
 
-static CGLContextObj makeContext(BOOL legacy) {
-	CGLPixelFormatAttribute attrs[] = {kCGLPFAAccelerated,
-	                                   kCGLPFAOpenGLProfile,
-	                                   (CGLPixelFormatAttribute)(legacy ? kCGLOGLPVersion_Legacy : kCGLOGLPVersion_GL4_Core),
-	                                   kCGLPFAColorSize,
-	                                   (CGLPixelFormatAttribute)24,
-	                                   (CGLPixelFormatAttribute)0};
+// A context of the legacy or the 4.1 core profile, on renderer `rendererID` where it is not 0.
+static CGLContextObj contextOn(BOOL legacy, GLint rendererID) {
+	CGLPixelFormatAttribute attrs[12];
+	int a = 0;
+	attrs[a++] = kCGLPFAAccelerated;
+	attrs[a++] = kCGLPFAOpenGLProfile;
+	attrs[a++] = (CGLPixelFormatAttribute)(legacy ? kCGLOGLPVersion_Legacy : kCGLOGLPVersion_GL4_Core);
+	attrs[a++] = kCGLPFAColorSize;
+	attrs[a++] = (CGLPixelFormatAttribute)24;
+	if (rendererID) {
+		attrs[a++] = kCGLPFAAllowOfflineRenderers;
+		attrs[a++] = kCGLPFARendererID;
+		attrs[a++] = (CGLPixelFormatAttribute)rendererID;
+	}
+	attrs[a] = (CGLPixelFormatAttribute)0;
 	CGLPixelFormatObj pf = NULL;
 	GLint n = 0;
 	if (CGLChoosePixelFormat(attrs, &pf, &n) != kCGLNoError || !pf) return NULL;
@@ -376,7 +585,41 @@ static CGLContextObj makeContext(BOOL legacy) {
 	return ctx;
 }
 
-static BOOL runCase(const Case *c) {
+// The renderer GL_CASES_RENDERER names (the first whose GL_RENDERER string holds it, among the
+// virtual screens of a pixel format that allows offline renderers), or 0 for the default; -1
+// where none does.
+static GLint gRendererID = 0;
+static GLint pickRenderer(void) {
+	const char *want = getenv("GL_CASES_RENDERER");
+	if (!want || !want[0]) return 0;
+	CGLPixelFormatAttribute attrs[] = {kCGLPFAAccelerated, kCGLPFAAllowOfflineRenderers, kCGLPFAOpenGLProfile,
+	                                   (CGLPixelFormatAttribute)kCGLOGLPVersion_GL4_Core, (CGLPixelFormatAttribute)0};
+	CGLPixelFormatObj pf = NULL;
+	GLint screens = 0;
+	if (CGLChoosePixelFormat(attrs, &pf, &screens) != kCGLNoError || !pf) return -1;
+	GLint found = -1;
+	for (GLint i = 0; i < screens && found < 0; i++) {
+		GLint id = 0;
+		CGLDescribePixelFormat(pf, i, kCGLPFARendererID, &id);
+		CGLContextObj ctx = contextOn(NO, id);
+		if (!ctx) continue;
+		CGLSetCurrentContext(ctx);
+		const char *name = (const char *)glGetString(GL_RENDERER);
+		printf("# renderer 0x%x: %s\n", id, name ? name : "?");
+		if (name && strstr(name, want)) found = id;
+		CGLSetCurrentContext(NULL);
+		CGLDestroyContext(ctx);
+	}
+	CGLDestroyPixelFormat(pf);
+	return found;
+}
+
+static CGLContextObj makeContext(BOOL legacy) {
+	return contextOn(legacy, gRendererID);
+}
+
+// 1 where the case passes, 0 where it fails, -1 where it is skipped.
+static int runCase(const Case *c) {
 	const BOOL legacy = strncmp(c->name, "legacy-", 7) == 0;
 	const GLsizei samples = strncmp(c->name, "msaa-", 5) == 0 ? 4 : 0;
 	CGLContextObj ctx = makeContext(legacy);
@@ -385,6 +628,7 @@ static BOOL runCase(const Case *c) {
 		return NO;
 	}
 	CGLSetCurrentContext(ctx);
+	if (gVerbose) printf("  %s on %s, %s\n", c->name, (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION));
 	// A 64x64 RGBA8 framebuffer with a depth-stencil buffer.
 	GLuint fb = 0, colour = 0, ds = 0;
 	glGenFramebuffers(1, &fb);
@@ -441,7 +685,15 @@ static BOOL runCase(const Case *c) {
 
 	const float quad[8] = {-1, -1, 1, -1, -1, 1, 1, 1};
 	GLuint vao = 0, vbo = 0;
-	if (c->vs) {
+	if (c->draw) {
+		const char *skip = "";
+		if (!c->draw(program, &skip)) {
+			printf("%s: skip (%s)\n", c->name, skip);
+			CGLSetCurrentContext(NULL);
+			CGLDestroyContext(ctx);
+			return -1;
+		}
+	} else if (c->vs) {
 		if (!legacy) {
 			glGenVertexArrays(1, &vao);
 			glBindVertexArray(vao);
@@ -486,19 +738,36 @@ static BOOL runCase(const Case *c) {
 	uint8_t got[4] = {0};
 	// The centre for every case, but discard's and clip distance's, whose quads cover only the left
 	// part: a pixel right of them.
-	const GLint x = strcmp(c->name, "discard") == 0 || strcmp(c->name, "clipdistance") == 0 ? 48 : 32;
-	glReadPixels(x, 32, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, got);
+	const GLint x = c->x ? c->x : strcmp(c->name, "discard") == 0 || strcmp(c->name, "clipdistance") == 0 ? 48 : 32;
+	const GLint y = c->y ? c->y : 32;
+	glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, got);
 	GLenum e = glGetError();
 	BOOL pass = e == GL_NO_ERROR;
 	for (int i = 0; i < 4; i++) pass = pass && abs((int)got[i] - (int)c->want[i]) <= c->tolerance;
+	char detail[512] = "";
+	if (!pass)
+		snprintf(detail, sizeof detail, " (%d,%d) got %u,%u,%u,%u, want %u,%u,%u,%u, glGetError 0x%x;", x, y, got[0], got[1],
+		         got[2], got[3], c->want[0], c->want[1], c->want[2], c->want[3], e);
+	for (int m = 0; m < c->moreCount; m++) {
+		uint8_t more[4] = {0};
+		glReadPixels(c->more[m].x, c->more[m].y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, more);
+		BOOL ok = YES;
+		for (int i = 0; i < 4; i++) ok = ok && abs((int)more[i] - (int)c->more[m].want[i]) <= c->tolerance;
+		if (!ok) {
+			const size_t used = strlen(detail);
+			snprintf(detail + used, sizeof detail - used, " (%d,%d) got %u,%u,%u,%u, want %u,%u,%u,%u;", c->more[m].x,
+			         c->more[m].y, more[0], more[1], more[2], more[3], c->more[m].want[0], c->more[m].want[1],
+			         c->more[m].want[2], c->more[m].want[3]);
+		}
+		pass = pass && ok;
+	}
 	if (pass)
 		printf("%s: pass\n", c->name);
 	else
-		printf("%s: FAIL (got %u,%u,%u,%u, want %u,%u,%u,%u, glGetError 0x%x)\n", c->name, got[0], got[1], got[2], got[3],
-		       c->want[0], c->want[1], c->want[2], c->want[3], e);
+		printf("%s: FAIL (%s)\n", c->name, detail + 1);
 	CGLSetCurrentContext(NULL);
 	CGLDestroyContext(ctx);
-	return pass;
+	return pass ? 1 : 0;
 }
 
 int main(int argc, char **argv) {
@@ -509,15 +778,25 @@ int main(int argc, char **argv) {
 			gVerbose = YES;
 			first = 2;
 		}
-		int passed = 0, ran = 0;
+		gRendererID = pickRenderer();
+		if (gRendererID < 0) {
+			printf("gl_cases: no renderer's name holds %s\n", getenv("GL_CASES_RENDERER"));
+			return 1;
+		}
+		int passed = 0, ran = 0, skipped = 0;
 		for (size_t i = 0; i < sizeof kCases / sizeof kCases[0]; i++) {
 			BOOL wanted = argc <= first;
 			for (int a = first; a < argc; a++) wanted = wanted || strcmp(argv[a], kCases[i].name) == 0;
 			if (!wanted) continue;
+			const int r = runCase(&kCases[i]);
+			if (r < 0) {
+				skipped++;
+				continue;
+			}
 			ran++;
-			passed += runCase(&kCases[i]) ? 1 : 0;
+			passed += r;
 		}
-		printf("gl_cases: %d of %d pass\n", passed, ran);
+		printf("gl_cases: %d of %d pass, %d skipped\n", passed, ran, skipped);
 		return passed == ran ? 0 : 1;
 	}
 }
