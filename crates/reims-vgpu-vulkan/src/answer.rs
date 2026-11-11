@@ -1164,7 +1164,8 @@ pub fn created_or_decided<T>(
 ///   rounding of a `half` result (`NativeHalfConversion` and `NativeHalfQuantize`), its sampling
 ///   (`DeviceSampling` and `DeviceTexelConversion`), its vertex input's conversion of a normalized
 ///   attribute (`DeviceVertexConversion`), its alpha to coverage (`DeviceAlphaCoverage`) and its
-///   logic operation on a 10-bit attachment's own codes (`NativeLogicOperation`). On a
+///   logic operation on a 10-bit or signed normalized attachment's own codes
+///   (`NativeLogicOperation`). On a
 ///   device that runs on Metal (MoltenVK) the runtime answers most as Metal's own functions,
 ///   sampler and conversions, which announce nothing there, and one announced there dies (its
 ///   filter of a two-plane YCbCr texture announces `YCbCrFilterNotExact` instead). The runtime

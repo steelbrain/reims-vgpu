@@ -89,8 +89,8 @@ pub struct NativeRelay {
 /// average); `DevicePackConversion` (its conversions of packed normalized values),
 /// `DeviceVertexConversion` (its vertex input's conversion of a normalized attribute),
 /// `DeviceAlphaCoverage` (its alpha to coverage) and `NativeLogicOperation` (its logic operation on
-/// a 10-bit attachment's own codes). A device that runs on Metal (MoltenVK) is an Apple GPU, where
-/// each still dies.
+/// a 10-bit or signed normalized attachment's own codes). A device that runs on Metal (MoltenVK) is
+/// an Apple GPU, where each still dies.
 ///
 /// These die here, as on MoltenVK, as no class covers them: blending, storage, tessellation,
 /// depth, layout, the band's rasterization, a pass's tile store and when a command buffer is seen
@@ -456,14 +456,16 @@ pub const NATIVE_RELAYED: [NativeRelay; 39] = [
     NativeRelay {
         kind: rt::Degradation::NativeLogicOperation,
         ground: "class (e): a render pipeline's private logic operation drawn by the device's \
-                 `logicOp` into an `RGB10A2Unorm` or `BGR10A2Unorm` attachment, which operates \
-                 on the channels' own 10-bit and 2-bit codes where Metal operates on the codes \
-                 widened to 16 bits and narrows the result, so a channel may store another code \
-                 (lavapipe's xor: green 938 where Metal's rule gives 937; the runtime's record, \
-                 with no bound, as the result follows the codes' bits). Every other format's \
-                 logic operation is Metal's. The runtime gives the device's operation off Apple's \
-                 GPUs, as for its maths and sampling, and draws it in the fragment function on \
-                 MoltenVK, which has no `logicOp`",
+                 `logicOp` into an `RGB10A2Unorm`, `BGR10A2Unorm` or signed normalized \
+                 attachment, which operates on the channels' stored codes themselves, where Metal \
+                 operates on a 10-bit or 2-bit code widened to 16 bits and narrows the result, \
+                 and reads and stores a signed channel's lowest code as the code above it, so a \
+                 channel may store another code (lavapipe's xor: green 938 where Metal's rule \
+                 gives 937, and 0x60 over a signed 0x80 where Metal's gives 0x61; the runtime's \
+                 record, with no bound, as the result follows the codes' bits). Every other \
+                 format's logic operation is Metal's. The runtime gives the device's operation \
+                 off Apple's GPUs, as for its maths and sampling, and draws it in the fragment \
+                 function on MoltenVK, which has no `logicOp`",
     },
 ];
 
