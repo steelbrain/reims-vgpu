@@ -191,8 +191,9 @@ memory for the boot, since a MAC check may still be reading it. Requests are
 serialized. Graft refuses the routes when:
 
 - an operation is not one of the three, is named twice, or is already routed by
-  an earlier client. One operation belongs to one client for the boot, so every
-  callable original Graft hands back is AMFI's own function;
+  an earlier client, which the refusal names. One operation belongs to one client
+  for the boot, so every callable original Graft hands back is AMFI's own
+  function;
 - the slot in the current table does not point into AMFI's code, or is not
   signed with the discriminator Graft derives from the operation's prototype, as
   on a release that changed that prototype;

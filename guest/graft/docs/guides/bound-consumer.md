@@ -93,7 +93,10 @@ matches. A bound
 consumer calls nothing in Graft, so it needs no dependency on it. The build
 refuses a personality whose `IOPropertyMatch` already holds the gate's key, as
 a staged Info.plist's do, since Graft would then watch only for nubs whose gate
-is already open. Give it the Info.plist you wrote.
+is already open. Give it the Info.plist you wrote. It also refuses a
+personality whose `IOPropertyExistsMatch` names the gate's key, since the
+personality would then match on the key Graft sets rather than on its
+provider.
 
 ## 4. Link through consumer.mk
 

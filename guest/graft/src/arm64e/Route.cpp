@@ -24,6 +24,7 @@
 #include "MachO.h"
 #include "Policy.h"
 #include <IOKit/IOLib.h>
+#include <mach/kmod.h>
 #include <mach/vm_prot.h>
 #include <stdarg.h>
 #include <string.h>
@@ -42,14 +43,16 @@ IOLock *routeLock;
 // currently points at are kept: AMFI's own before any client routes, the newest
 // shadow afterwards. Each client request copies the current ops and conf, routes
 // its operations into the copy, and swaps the element from the current conf to
-// the copy, so several clients route one after another. routedOp marks each
-// operation one client already holds, so the next finds AMFI's own function in
-// the current ops rather than a prior client's replacement.
+// the copy, so several clients route one after another. routedBy names the
+// client that holds each operation, empty while none does, so the next client
+// is refused it, by that name, rather than handed a prior client's replacement
+// as AMFI's original. A copy, since a client's identifier string need not
+// outlive its call.
 bool established;
 uint64_t policyElement;
 uint64_t currentConf;
 uint64_t currentOps;
-bool routedOp[arm64::OperationCount];
+char routedBy[arm64::OperationCount][KMOD_MAX_NAME];
 
 static_assert(arm64::OpsSize % sizeof(uint64_t) == 0, "shadow ops alignment");
 static_assert(arm64::ConfSize % sizeof(uint64_t) == 0, "shadow conf alignment");
@@ -310,13 +313,15 @@ bool routeKernel(const char *client, const RouteRequest *requests, size_t count)
                 ok = false;
                 break;
             }
-        // Refuse an operation a prior client already routed. Its slot in the
-        // current ops points at that client's replacement, not AMFI's own
-        // function, so routing it again would hand this client a non-AMFI
-        // original. One operation belongs to one client for the boot.
+        // Refuse an operation a prior client already routed, naming that
+        // client. Its slot in the current ops points at the client's
+        // replacement, not AMFI's own function, so routing it again would hand
+        // this client a non-AMFI original. One operation belongs to one client
+        // for the boot.
         const arm64::Operation *op = arm64::operationFor(request.symbol);
-        if (op && routedOp[static_cast<size_t>(op - &arm64::Operations[0])]) {
-            refuse("%s: already routed by an earlier client", request.symbol);
+        const char *heldBy = op ? routedBy[static_cast<size_t>(op - &arm64::Operations[0])] : "";
+        if (heldBy[0]) {
+            refuse("%s: already routed by %s", request.symbol, heldBy);
             ok = false;
             break;
         }
@@ -428,7 +433,8 @@ bool routeKernel(const char *client, const RouteRequest *requests, size_t count)
             for (size_t i = 0; i < count; ++i) {
                 const arm64::Operation *op = arm64::operationFor(names[i]);
                 if (op)
-                    routedOp[static_cast<size_t>(op - &arm64::Operations[0])] = true;
+                    strlcpy(routedBy[static_cast<size_t>(op - &arm64::Operations[0])],
+                            client ? client : "Graft", KMOD_MAX_NAME);
                 note("route: %s installed (AMFI ops +0x%x via shadow)", names[i],
                      static_cast<unsigned>(slots[i].offset));
             }

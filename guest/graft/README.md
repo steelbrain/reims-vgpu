@@ -43,9 +43,9 @@ own.
 ## Status
 
 This is release 0.2.0. It passes the host tests and the build checks
-([CONTRIBUTING.md](CONTRIBUTING.md#checks)), and its boots are pending: every
-boot below ran release 0.1.0, with SIP on (`csr-active-config` 0) and no
-boot-arg for Graft or the kexts it serves.
+([CONTRIBUTING.md](CONTRIBUTING.md#checks)), and the boots below ran its
+kexts, with SIP on (`csr-active-config` 0) and no boot-arg for Graft or the
+kexts it serves.
 
 Several boots used the guest kexts of reims-vgpu, a paravirtual GPU for macOS
 virtual machines: its display and Metal driver is a bound consumer, and the
@@ -53,21 +53,37 @@ kext that installs its Metal bundle is an owned client.
 
 **x86-64, on macOS 11.7.11 and 26.7.2.**
 
-- Graft alone, with the test kexts `tests/kexts/core-probe` and
-  `examples/hello-consumer` and no boot-args at all, booted to the desktop.
-  Graft bound the hello consumer and opened its gate, and routed six kernel
-  functions, each of which the system then called.
+- Graft alone, with this repository's two consumers and two clients
+  (`examples/hello-consumer`, `tests/kexts/gate-probe`,
+  `tests/kexts/core-probe` and `examples/hello-client`) and no boot-args at
+  all, booted to the desktop. Graft bound both consumers, and opened each
+  one's gate on the provider its personalities match: `IOResources`, and the
+  PCI host bridge by its class. It routed six kernel functions for one client,
+  each of which the system then called, and resolved a kernel symbol for the
+  other.
+- On 26.7.2, with gate-probe built to declare a class the kernel does not
+  register, Graft refused that consumer, naming the class, and it never
+  loaded. The other consumer was still bound and the client still routed.
 - With reims-vgpu's guest kexts on its paravirtual GPU, Graft bound the display
-  driver and routed for its installer, the kexts installed themselves on that
-  boot, and WindowServer used Metal on the device.
+  driver and routed six kernel functions for its installer. The installer
+  wrote its Metal bundle, WindowServer mapped it, and Metal ran on the
+  device.
 
 **arm64e, on macOS 14.6.1, 15.6.1, 26.6.2 and 27.0.1**, under Ambrosia 0.1.1,
-the arm64 boot firmware Graft was developed with. With reims-vgpu's guest
-kexts, Graft bound the display driver, building its vtable at bind in the
-running release's layout, and routed three AMFI operations for its installer.
-The installer wrote its bundle, and a binary that AMFI must refuse was still
-refused. These boots checked Graft's part; the display reaching a desktop
-composited with Metal is reims-vgpu's open work on arm64.
+the arm64 boot firmware Graft was developed with.
+
+- Graft alone, with the same two consumers, `examples/hello-client`, and
+  `tests/kexts/route-probe`, a client that routes three AMFI operations: Graft
+  bound both consumers and opened their gates, and routed the three
+  operations, each of which the system then called. A copy of route-probe
+  under an identifier of its own, asking for the same operations later in the
+  boot, was refused, naming route-probe as the client that holds them.
+- With reims-vgpu's guest kexts, Graft bound the display driver, building its
+  vtable at bind in the running release's layout, and routed three AMFI
+  operations for its installer. The installer wrote its bundle, WindowServer
+  mapped it and composited with Metal on the device, and a binary that AMFI
+  must refuse was still refused. The same checks passed on macOS 27.2.1 under
+  a development build of Ambrosia, since 0.1.1 does not boot 27.2.1.
 
 Development builds before 0.1.0 also passed the x86-64 checks with
 reims-vgpu's kexts on macOS 12.7.6, 13.7.8, 14.8.9, 15.7.9, 15.8.2 and 26.6.1,

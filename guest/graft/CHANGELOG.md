@@ -47,7 +47,7 @@ and opened the consumer's gate only on one PCI device, which the SDK named.
 - On arm64e, several clients can route. Each request copies the current AMFI
   policy, AMFI's own or the newest shadow, and swaps the policy list's element
   to the copy with one compare-and-exchange. An operation an earlier client
-  routed is refused to the next.
+  routed is refused to the next, naming that client.
 - On arm64e, starts each library a consumer's manifest declares, with
   `OSKextLoadKextWithIdentifier`, before binding against it, and refuses the
   consumer if that start fails. `Graft-arm64e.kext` no longer lists a display
@@ -60,7 +60,7 @@ and opened the consumer's gate only on one PCI device, which the SDK named.
   `IOMatchCategory`. It requires each personality to name an
   `IOProviderClass`, and no longer requires one PCI device. It refuses a
   personality whose `IOPropertyMatch` already holds the gate's key, as a
-  staged Info.plist's do.
+  staged Info.plist's do, or whose `IOPropertyExistsMatch` names it.
 
 **Examples and tests**
 

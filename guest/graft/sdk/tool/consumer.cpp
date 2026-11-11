@@ -954,7 +954,10 @@ std::string gateKey(const Plist &info) {
 // personality's own IOPropertyMatch, where it has one, is a dictionary or a list
 // of them any one of which matches, and none may hold the gate key already, as a
 // staged Info.plist's do: Graft would then watch only for nubs whose gate is
-// already open, and never open one.
+// already open, and never open one. Nor may its IOPropertyExistsMatch name the
+// key, as a string, an element of a list or a key of a dictionary, which IOKit
+// reads alike: a nub would then match on the key Graft sets, not on the
+// provider the author described.
 const Plist &personalities(const Plist &info) {
     std::string key = gateKey(info);
     const Plist *personalities = info.find("IOKitPersonalities");
@@ -986,6 +989,17 @@ const Plist &personalities(const Plist &info) {
                         key +
                         " in its IOPropertyMatch; give the Info.plist as written, not a "
                         "staged one");
+        const Plist *exists = value.find("IOPropertyExistsMatch");
+        auto names = [&key](const Plist &one) {
+            return one.kind == Plist::Kind::String && one.text == key;
+        };
+        if (exists && (names(*exists) ||
+                       (exists->kind == Plist::Kind::Array &&
+                        std::any_of(exists->array.begin(), exists->array.end(), names)) ||
+                       (exists->kind == Plist::Kind::Dict && exists->find(key))))
+            throw Error("consumer personality " + name + " names the activation key " + key +
+                        " in its IOPropertyExistsMatch; Graft sets that key itself once it "
+                        "binds the consumer, so leave it out");
     }
     return *personalities;
 }

@@ -465,6 +465,33 @@ class RefusalTest(unittest.TestCase):
             self.assertRefused(process, reason)
             self.assertFalse((self.inputs.root / f"{name}/Fixture.kext").exists())
 
+    def test_a_personality_whose_existence_match_names_the_gate(self):
+        # IOKit reads IOPropertyExistsMatch as one key, or each element of a list or
+        # each key of a dictionary, and matches a nub that has any of them, so naming
+        # the gate key there would match on the key Graft sets.
+        key = f"{IDENTIFIER}.graft-bound"
+        reason = (
+            f"consumer personality Fixture names the activation key {key} in its "
+            "IOPropertyExistsMatch; Graft sets that key itself once it binds the consumer, "
+            "so leave it out"
+        )
+        cases = (
+            ("exists", key),
+            ("exists-list", ["model", key]),
+            ("exists-dict", {key: True}),
+        )
+        for name, match in cases:
+            info = fixture_info()
+            info["IOKitPersonalities"]["Fixture"]["IOPropertyExistsMatch"] = match
+            path = self.inputs.write(f"{name}.plist", plistlib.dumps(info))
+            process = self.inputs.build(name, info_plist=path)
+            self.assertRefused(process, reason)
+            self.assertFalse((self.inputs.root / f"{name}/Fixture.kext").exists())
+        info = fixture_info()
+        info["IOKitPersonalities"]["Fixture"]["IOPropertyExistsMatch"] = ["model", "vendor"]
+        path = self.inputs.write("exists-other.plist", plistlib.dumps(info))
+        self.assertEqual(self.inputs.build("exists-other", info_plist=path).returncode, 0)
+
     def test_compiler_flags_for_another_architecture(self):
         process = self.inputs.build("other-arch", flags=["-arch", "arm64e", f"-I{FIXTURE}"])
         self.assertRefused(process, "the compiler flags target arm64e, not ARCH's x86_64")

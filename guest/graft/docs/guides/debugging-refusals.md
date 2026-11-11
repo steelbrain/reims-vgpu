@@ -207,7 +207,7 @@ arm64e route refusals, in the order Graft checks:
 | `transaction: N requests exceed the 3 routable operations` | the call asks for more routes than there are operations |
 | `invalid request N` | request `N` has no operation, replacement or original, or its original is not pointer-aligned |
 | `request N: duplicate original storage` | two requests store their original in the same place |
-| `<operation>: already routed by an earlier client` | an earlier client already routed that operation this boot; one operation belongs to one client |
+| `<operation>: already routed by <client>` | the named client already routed that operation this boot; one operation belongs to one client |
 | `AMFI image or its executable range not found` | Graft could not find AMFI's code in the Boot collection |
 | `the client <id> names no placed image` | the firmware published no device-tree node for `<id>`, the identifier the call passes, so Graft cannot tie the replacement to that kext's code |
 | `the client's placed image cannot be read (<why>)` | the firmware names an image for the client's bundle identifier, but its load commands are malformed or its header lies outside its segments |
