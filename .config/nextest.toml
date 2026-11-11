@@ -84,3 +84,35 @@ threads-required = "num-test-threads"
 platform = 'cfg(target_os = "linux")'
 filter = 'binary_id(reims-vgpu-vulkan) & test(=gpu::resource::tests::a_device_cache_lays_its_planes_on_the_devices_lines_from_its_first_planes_byte)'
 success-output = "final"
+
+# The NVIDIA hosts' legs (`--profile nvidia`, AGENTS.md "The video crates' checks"): at most three
+# tests that make a Vulkan device at a time, the keep-awake's exit test, whose 8 children each
+# make one, taking all three. Each test process makes a device of its own, up to 16 at once where
+# a QEMU makes one, and NVIDIA's driver holds what each live device takes. On an RTX 2080 behind a
+# Thunderbolt 3 link, whose BAR1 is 256 MiB (no Resizable BAR), each device maps 67 MiB of it
+# (metal2vulkan's first 64 MiB block of write-combined memory), and a `vkCreateDevice` made while
+# the live ones leave too little is refused with VK_ERROR_INITIALIZATION_FAILED (NVRM:
+# "dmaAllocMapping_GM107: can't alloc VA space for mapping"); its channel heap holds 160 to 190
+# queues' channels too, a device taking 17 of them (NVRM: "Instance block allocation ... failed").
+# Measured 2026-11-11, driver 620.70.06: 6 test processes at once passed and 8 failed 4 to 6 of
+# them; a whole leg at 16 test threads failed 20 tests, a different 20 each run, each passing
+# alone (m3-max-15516, m3-max-15566, m3-max-15797, m3-max-15798). The driver makes the devices
+# of every process one at a time (about 0.45 s each for one of 16 queues), so the bound costs
+# the leg little.
+[test-groups]
+vulkan-devices = { max-threads = 3 }
+
+[[profile.nvidia.overrides]]
+platform = 'cfg(target_os = "linux")'
+filter = 'binary_id(reims-vgpu-vulkan) & test(=awake::tests::an_exit_amid_touches_ends_with_its_status)'
+test-group = "vulkan-devices"
+threads-required = 3
+
+[[profile.nvidia.overrides]]
+platform = 'cfg(target_os = "linux")'
+filter = '''
+    (package(reims-vgpu-vulkan) & !(binary_id(reims-vgpu-vulkan) & test(/^core::/)))
+  | (package(reims-vgpu) & test(/on_vulkan/))
+  | package(reims-vgpu-c)
+'''
+test-group = "vulkan-devices"
