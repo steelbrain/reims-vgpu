@@ -209,6 +209,22 @@ std::string rgfxFamilyNameOf(const char *name);
 /// with the others (tools/gl_cases.m, measured: macOS 26.6.1 on an RTX 5080 host).
 std::string rgfxVendorNameOf(const char *name);
 
+/// `iosurfaceTextureAlignmentBytes` and `iosurfaceReadOnlyTextureAlignmentBytes`: 16, as Metal's
+/// devices answer the first (measured: the AMD 5300M, the Intel 630 and the M3 Max,
+/// docs/graphics-kext/dgpu-oracle.md) and the IOGPU base answered both, whatever the host's GPU
+/// answers in the blob (kRgfxLimitIOSurfaceTextureAlignmentBytes and
+/// kRgfxLimitIOSurfaceReadOnlyTextureAlignmentBytes). CoreAnimation makes no Metal texture of an
+/// IOSurface whose rows or planes are not at a multiple of the device's answer, and draws nothing
+/// of a layer it has no texture of; the surfaces other code makes carry rows of their own, which
+/// no answer of the device moves: IOSurface's own 64 bytes where the kext asks for no more (a host
+/// GPU of its own memory), and those of the video frames Safari shows. Measured in macOS 26.7.2
+/// guests answering the host's 128 (an RTX 3090 and an RTX 2080): WindowServer made no texture of
+/// surfaces with rows of 192 to 14272 bytes ("Row bytes (5312) not 128 aligned"), and Safari drew
+/// its pages blank and WebGL black, every time; answering the host's 256 on a Radeon 780M,
+/// WindowServer found Safari's 1920x1080 and 3840x2160 video frames without "the proper data
+/// alignment".
+constexpr uint64_t kRgfxIOSurfaceTextureAlignmentBytes = 16;
+
 class RgfxCaps {
 public:
 	RgfxCaps();

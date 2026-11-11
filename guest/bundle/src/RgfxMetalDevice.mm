@@ -1271,23 +1271,21 @@ RGFX_LOG_UNRECOGNIZED
 	return _caps.limit(kRgfxLimitDeviceLinearTextureAlignmentBytes);
 }
 
-// The host's answers, the runtime's: the alignment its device takes a texture over an IOSurface's
-// rows at. The AMD 5300M, the Intel 630 and the M3 Max answer 16. CoreAnimation rounds the rows of
-// the IOSurfaces it makes for its backing stores to iosurfaceTextureAlignmentBytes, to no less
-// than 64 bytes, and names those rows to IOSurface, which keeps them: so this answer, not
-// IOSurface's own alignment, decides whether the host's GPU can take such a surface's texture in
-// place. Measured in a macOS 11.7.11 guest on a Radeon 780M: answering 16, A8 backing stores 125
-// pixels wide had rows of 128 bytes and 45 wide rows of 64; answering 512, a 1200-pixel BGRA8
-// surface's rows went from 4800 bytes to 5120, and of 1399 textures the runtime shadowed for their
-// rows over a 15 s scroll in Safari 11 were left. Left to the IOGPU base, these answered 16 there.
+// Metal's 16 for both, never the host's answer (kRgfxIOSurfaceTextureAlignmentBytes says why):
+// CoreAnimation makes no texture of a surface whose rows are not at a multiple of it, and other
+// code's surfaces carry rows at IOSurface's own alignment, 64 bytes. CoreAnimation also rounds the
+// rows of its own backing stores' IOSurfaces to iosurfaceTextureAlignmentBytes, to no less than 64
+// bytes, so on a GPU that takes a linear image in place only at rows a multiple of 256 (RADV) many
+// of them are the runtime's shadows: measured in a macOS 11.7.11 guest on a Radeon 780M, 1399
+// textures over a cold boot and a 15 s Safari scroll, and 11 answering 512.
 - (NSUInteger)iosurfaceTextureAlignmentBytes
 {
-	return _caps.limit(kRgfxLimitIOSurfaceTextureAlignmentBytes);
+	return kRgfxIOSurfaceTextureAlignmentBytes;
 }
 
 - (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes
 {
-	return _caps.limit(kRgfxLimitIOSurfaceReadOnlyTextureAlignmentBytes);
+	return kRgfxIOSurfaceTextureAlignmentBytes;
 }
 
 - (MTLSize)sparseTileSizeWithTextureType:(MTLTextureType)textureType

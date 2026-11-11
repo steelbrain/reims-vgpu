@@ -18,6 +18,7 @@
 %no-peers a view of the object on another GPU of a peer group: no buffer or texture of the device is one, and Metal answers nil for an object that is not (measured for a texture: M3 Max)
 %no-sparse the device makes no sparse buffers or textures (their creators are RGFX_UNSUPPORTED), so no resource of it has a sparse tier, tiles or a mip tail
 %pipeline-reflection Metal answers nil for a pipeline a device makes, reflection asked for or not (measured: M3 Max, compute and render; AMD 5300M and Intel 630, render)
+%iosurface-rows Metal's 16, as the AMD 5300M, the Intel 630 and the M3 Max answer (measured), not the host's answer: CoreAnimation makes no texture of a surface whose rows are not at a multiple of it, and the surfaces other code makes carry rows at IOSurface's own alignment, 64 bytes, which the host's answer can exceed (src/RgfxCaps.hpp, kRgfxIOSurfaceTextureAlignmentBytes)
 %no-validation the device validates no shader, and Metal answers MTLShaderValidationDisabled for a pipeline made without validation (measured: M3 Max, compute and render; AMD 5300M and Intel 630, render)
 %absent-as-metal none of Metal's own devices answers it either (measured with respondsToSelector:, M3 Max on macOS 27 and the AMD 5300M and Intel 630 on macOS 26.7.1), so a caller that sends it to any device checks first
 %base-creator left to the base, as tests/inherited_tests.mm lists, with why
@@ -462,8 +463,8 @@ heapBufferSizeAndAlignWithLength:options: partial the host's heap buffer alignme
 heapTextureSizeAndAlignWithDescriptor: implemented
 indirectArgumentBufferCapabilities base %base-spi
 indirectArgumentBufferDecodingData base %base-spi
-iosurfaceReadOnlyTextureAlignmentBytes implemented
-iosurfaceTextureAlignmentBytes implemented
+iosurfaceReadOnlyTextureAlignmentBytes metal %iosurface-rows
+iosurfaceTextureAlignmentBytes metal %iosurface-rows
 isASTCPixelFormatsSupported base %base-spi
 isAnisoSampleFixSupported base %base-spi
 isBCTextureCompressionSupported base %base-spi

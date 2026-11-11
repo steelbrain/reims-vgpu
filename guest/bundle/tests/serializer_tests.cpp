@@ -641,6 +641,28 @@ void test_caps()
 	CHECK(std::strcmp(caps.name(), "NVIDIA GeForce RTX 5080 Laptop GPU") == 0);
 }
 
+// The device answers Metal's 16 for both IOSurface alignments whatever the host answers
+// (kRgfxIOSurfaceTextureAlignmentBytes): CoreAnimation makes no texture of a surface whose rows are
+// not at a multiple of the answer, and draws nothing of its layer. The rows are those WindowServer
+// made no texture of in macOS 26.7.2 guests answering an RTX 3090's and an RTX 2080's 128, where
+// Safari drew its pages blank, and IOSurface's own alignment, 64 bytes.
+void test_iosurface_alignments_divide_other_codes_surface_rows()
+{
+	CHECK(kRgfxIOSurfaceTextureAlignmentBytes == 16);
+	const uint64_t rows[] = {64, 192, 448, 576, 704, 1088, 1216, 4160, 5184, 5312, 14272};
+	for (uint64_t r : rows)
+		CHECK(r % kRgfxIOSurfaceTextureAlignmentBytes == 0);
+	// The host's answers stay in the caps, and only there.
+	RgfxDeviceInfo info = {};
+	info.version = RGFX_DEVICE_INFO_VERSION;
+	info.limits[kRgfxLimitIOSurfaceReadOnlyTextureAlignmentBytes] = 128;
+	info.limits[kRgfxLimitIOSurfaceTextureAlignmentBytes] = 256;
+	RgfxCaps caps;
+	CHECK(caps.load(info));
+	CHECK(caps.limit(kRgfxLimitIOSurfaceReadOnlyTextureAlignmentBytes) == 128);
+	CHECK(caps.limit(kRgfxLimitIOSurfaceTextureAlignmentBytes) == 256);
+}
+
 // The MTLDeviceSPI feature queries the device answers itself (RgfxCaps::spiFeature): each YES on
 // a host of the Mac2 family whose flags and read-write tier say yes, as Metal's devices answer,
 // and each NO on a host of no Mac2 family with no flags and no tier, and with no caps at all.
@@ -3140,6 +3162,7 @@ int main()
 	test_small_resource_id_chunks();
 	test_resource_id_chunk_size_is_the_grant_s();
 	test_caps();
+	test_iosurface_alignments_divide_other_codes_surface_rows();
 	test_spi_features();
 	test_family_names();
 	test_vendor_names();
