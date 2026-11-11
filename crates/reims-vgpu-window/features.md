@@ -109,9 +109,15 @@ Unset or unparsable values give the defaults below.
 - That guest is told the scale of the screen the window was last drawn on,
   and its display is as dense as that screen, 110 pixels per inch a point
   of it. An arm64 guest runs at 1x on a screen at 1x and HiDPI on one above
-  1x, at every window size. An x86-64 macOS 26 guest decides by the window's
-  width alone, on any screen: HiDPI from 3840 pixels wide, 1x below. A
-  window moved to a screen of another scale gives the guest a new mode.
+  1x, at every window size. An x86-64 guest starts HiDPI on a screen at 1.5x
+  or more at every window size from 2048 × 1536 pixels, and at 1x below that
+  and on a screen at 1.45x or less, up to 3840 × 2160 pixels, from which
+  macOS starts any display HiDPI. Each window size is a display of its own
+  to an x86-64 guest: a mode the person chooses is kept for that size,
+  through restarts, and comes back when the window is that size again, and a
+  resize to another size gives that size's mode. So on a screen above 1x and
+  under 1.5x a chosen HiDPI mode does not follow a resize. A window moved to
+  a screen of another scale gives the guest a new mode.
   `test: geometry::the_layout_carries_the_screen_s_scale`, `manual`
 - Sharp on every screen: one drawable pixel per screen pixel, following the
   window across screens of different scale. `manual`
