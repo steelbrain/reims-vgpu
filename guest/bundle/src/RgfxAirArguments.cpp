@@ -2837,6 +2837,29 @@ bool functionsOf(const Module &m, std::vector<RgfxAirFunction> &out)
 	return true;
 }
 
+// A buffer node's address space where its node names none: its parameter's, the address space of
+// the entry point's parameter at the node's position, where that is a pointer. Before macOS 13 the
+// compiler writes no air.address_space on a buffer argument, device, constant or threadgroup alike,
+// and its parameter's pointer is of that space (measured: macOS 11.7.11's and 12.7.6's compiler, a
+// kernel's, a vertex function's and a fragment function's buffers, in a guest); macOS 13's and
+// later write it.
+void addressSpaceFromParameter(const Module &m, uint64_t function, RgfxAirNode &n)
+{
+	if (n.hasAddressSpace || !n.hasPosition || (n.kind != "air.buffer" && n.kind != "air.indirect_buffer") ||
+	    m.code == nullptr || function >= m.code->globals.size())
+		return;
+	const RgfxAirCode &c = *m.code;
+	const uint32_t type = c.globals[static_cast<size_t>(function)].type;
+	if (type >= c.types.size() || c.types[type].kind != RgfxAirCode::Kind::Function ||
+	    n.position >= c.types[type].params.size())
+		return;
+	const uint32_t param = c.types[type].params[n.position];
+	if (param >= c.types.size() || c.types[param].kind != RgfxAirCode::Kind::Pointer)
+		return;
+	n.hasAddressSpace = true;
+	n.addressSpace = c.types[param].width;
+}
+
 // The entry points' nodes whole of the module `m` (rgfxReadAirEntries).
 bool entriesOf(const Module &m, RgfxAirEntries &out)
 {
@@ -2877,6 +2900,7 @@ bool entriesOf(const Module &m, RgfxAirEntries &out)
 					out = {};
 					return false;
 				}
+				addressSpaceFromParameter(m, fn->value, n);
 				e.arguments.push_back(std::move(n));
 			}
 			for (size_t k = 3; k < entry->ops.size(); k++) {

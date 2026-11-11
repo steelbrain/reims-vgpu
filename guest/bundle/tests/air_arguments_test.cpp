@@ -5,7 +5,9 @@
 // answer for a binding of a kind the reader does not know; each stitchable function's signature,
 // type by type, and an unknown one where it has a type the reader does not know; each module's
 // function constants, as its function's CNST tag lists them; the same over the .metallib built
-// from tests/air_arguments_old.metal for macOS 10.12 (RGFX_AIR_ARGUMENTS_OLD); every node of an
+// from tests/air_arguments_old.metal for macOS 10.12 (RGFX_AIR_ARGUMENTS_OLD); each buffer's
+// address space where a module built for macOS 11 names none (RGFX_AIR_ARGUMENTS_11, from
+// tests/air_arguments_11.metal); every node of an
 // entry point whole (rgfxReadAirEntries), over the oracle probe's library (RGFX_ORACLE_REFLECTION,
 // built from tools/oracle/oracle_reflection.metal); no answer, nor a crash, for bytes that are
 // not such a module; one read of each module answering what the three readers answer, and the
@@ -1048,6 +1050,48 @@ int main()
 		check(oldCompared.first == 3 && oldCompared.second == 1,
 		      "the older functions' constants compared (" + std::to_string(oldCompared.first) +
 		          ", " + std::to_string(oldCompared.second) + " with constants)");
+	}
+
+	// A module built for macOS 11 (tests/air_arguments_11.metal, RGFX_AIR_ARGUMENTS_11) names no
+	// air.address_space on its buffers, as the compiler of macOS 11 and 12 writes them: each
+	// buffer's address space is its parameter's (device 1, constant 2, threadgroup 3), and nothing
+	// else of a node takes one.
+	{
+		const char *path11 = std::getenv("RGFX_AIR_ARGUMENTS_11");
+		check(path11 != nullptr, "RGFX_AIR_ARGUMENTS_11 names the macOS 11 test library");
+		const std::vector<uint8_t> lib11 = readFile(path11);
+		auto entry11 = [&](const std::string &name) {
+			const uint8_t *bc = nullptr;
+			size_t n = 0;
+			RgfxAirEntries e;
+			const bool read = rgfxMetallibBitcode(lib11.data(), lib11.size(), name, &bc, &n) &&
+			                  rgfxReadAirEntries(bc, n, e);
+			check(read, name + ": its nodes are read");
+			const std::string text(reinterpret_cast<const char *>(bc), read ? n : 0);
+			check(read && text.find("air.address_space") == std::string::npos &&
+			          text.find("air.arg_type_size") != std::string::npos,
+			      name + ": its module names no address space, and names its pointees' sizes");
+			for (const RgfxAirEntry &x : e.entries)
+				if (x.name == name)
+					return x;
+			check(false, name + ": its module declares it");
+			return RgfxAirEntry{};
+		};
+		auto space = [](const RgfxAirEntry &e, const std::string &arg) -> int {
+			for (const RgfxAirNode &n : e.arguments)
+				if (n.name == arg)
+					return n.hasAddressSpace ? static_cast<int>(n.addressSpace) : -1;
+			return -2;
+		};
+		const RgfxAirEntry k = entry11("k_11");
+		check(space(k, "out") == 1 && space(k, "params") == 2 && space(k, "tg") == 3,
+		      "k_11: a device buffer, a constant struct and threadgroup memory, of their parameters' spaces");
+		check(space(k, "tex") == -1 && space(k, "smp") == -1 && space(k, "gid") == -1,
+		      "k_11: its texture, sampler and built-in of no address space");
+		const RgfxAirEntry v = entry11("v_11");
+		check(space(v, "mvp") == 2 && space(v, "pos") == -1, "v_11: a constant matrix; its stage input of none");
+		const RgfxAirEntry f = entry11("f_11");
+		check(space(f, "tint") == 2 && space(f, "color") == -1, "f_11: a constant colour; its texture of none");
 	}
 
 	// Bytes that are not such a module: none answers, and none crashes the reader.
