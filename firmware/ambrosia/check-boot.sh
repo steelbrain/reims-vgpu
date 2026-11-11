@@ -516,17 +516,26 @@ if [[ -n $ssh_s ]]; then
   # The guest's log is read with /usr/bin/log by its path: the guest user's shell is zsh, whose
   # `log` builtin takes the name over ssh and fails on these arguments, so a bare `log show`
   # read no line and the checks below counted 0 of everything.
-  denied=$(G 120 "/usr/bin/log show --last boot --style compact --predicate 'eventMessage CONTAINS \"reims-graphics\"' 2>/dev/null | grep -c -i -E 'amfi|library validation|not valid|code signature'")
-  denied=$(echo "$denied" | tail -1)
-  [[ $denied =~ ^[0-9]+$ ]] || denied=
+  # A denial, not AMFI's notes on the bundle's signature: every boot logs that the bundle is ad hoc
+  # signed and amfid's "not valid" for it, and WindowServer maps it all the same (measured on
+  # arm64 27.0.1). The lines themselves come back, into guest.log, then a line that says the
+  # log was read.
+  denied=$(G 120 "/usr/bin/log show --last boot --style compact --predicate 'eventMessage CONTAINS \"reims-graphics\"' 2>/dev/null | grep -i -E 'library validation failed|rejecting|denying|denied'; echo check-boot-read")
+  denied_first=
+  if [[ $denied == *check-boot-read ]]; then
+    denied_first=$(echo "$denied" | grep -v '^check-boot-read$' | head -1)
+    denied=$(echo "$denied" | grep -c -v '^check-boot-read$')
+  else
+    denied=
+  fi
   if [[ -z $ws_now ]]; then
     verdict amfi-map FAIL "not run: no WindowServer"
   elif [[ -z $denied ]]; then
     verdict amfi-map FAIL "WindowServer (pid $ws_now$ws_was) maps the bundle ${mapped:-0} times; this boot's log unread, so AMFI's denials are not known"
   elif [[ ${mapped:-0} -gt 0 && $denied -eq 0 ]]; then
-    verdict amfi-map PASS "WindowServer (pid $ws_now$ws_was) maps the bundle ($mapped mappings); no AMFI denial naming it"
+    verdict amfi-map PASS "WindowServer (pid $ws_now$ws_was) maps the bundle ($mapped mappings); no AMFI or library-validation denial naming it"
   else
-    verdict amfi-map FAIL "WindowServer (pid $ws_now$ws_was) maps the bundle ${mapped:-0} times; ${denied:-unread} AMFI or library-validation lines name reims-graphics"
+    verdict amfi-map FAIL "WindowServer (pid $ws_now$ws_was) maps the bundle ${mapped:-0} times; ${denied:-unread} AMFI or library-validation denials name reims-graphics${denied_first:+, the first: ${denied_first:0:200}}"
   fi
 
   # The page count's path, after the Metal work: the guest's boot unchanged, the panic reports
@@ -539,10 +548,12 @@ if [[ -n $ssh_s ]]; then
   # The count lines, then a line that says the log was read: grep's status is 1 for no lines.
   # The kext's IOLog lines reach the kernel's message buffer but not the unified log, so they are
   # read with dmesg (128 KiB: a long boot can wrap its first lines out).
-  kc=$(G 120 "echo '$GUEST_PASS' | sudo -S -p '' dmesg 2>/dev/null | grep -E 'RgfxAccelerator: .*(counting an IOSurface|not a buffer the kernel allocated|could not be mapped to count)'; echo check-boot-read")
+  # The read counts as read only where the buffer holds some line of our kexts, its control.
+  kc=$(G 120 "echo '$GUEST_PASS' | sudo -S -p '' dmesg 2>/dev/null > /tmp/check-boot-dmesg; grep -E 'RgfxAccelerator: .*(counting an IOSurface|not a buffer the kernel allocated|could not be mapped to count)' /tmp/check-boot-dmesg; echo \"check-boot-read \$(grep -c -E 'ReimsGraphics: |RgfxAccelerator: ' /tmp/check-boot-dmesg)\"")
   kc_read=0
-  [[ $kc == *check-boot-read ]] && kc_read=1
-  kc=$(echo "$kc" | grep -v '^check-boot-read$')
+  kc_ours=$(echo "$kc" | sed -n 's/^check-boot-read \([0-9]*\)$/\1/p' | tail -1)
+  [[ ${kc_ours:-0} -gt 0 ]] && kc_read=1
+  kc=$(echo "$kc" | grep -v '^check-boot-read')
   ws_end=$(G 20 'pgrep -x WindowServer | head -1') || ws_end="unread: $(echo "$ws_end" | tail -1)"
 
   # The accessibility matrix, read while this boot is still the last one: WindowServer logs each
@@ -703,8 +714,8 @@ if [[ -n $ssh_s ]]; then
     pc+=("host: ${cc[0]} device caches made, ${cc[1]} deferred (${cc[2]} carrying pages), ${cc[3]} refused (${cc[4]} as they might lie in place)")
   elif [[ -n $caches ]]; then pc+=("host: a device caches line in an unknown form: ${caches:0:160}")
   else pc+=("host: no device cache made"); fi
-  if ((kc_read)); then pc+=("kext: $n_counted counts counted, $n_not not counted${notes:+; $notes}")
-  else pc+=("kext: its count lines unread, the log not read in time"); fi
+  if ((kc_read)); then pc+=("kext: $n_counted counts counted, $n_not not counted${notes:+; $notes} ($kc_ours lines of our kexts in dmesg)")
+  else pc+=("kext: its count lines unread, the kernel's message buffer gave no line of our kexts"); fi
   verdict page-count "$( ((pok)) && echo PASS || echo FAIL)" "$(IFS='|'; echo "${pc[*]}" | sed 's/|/; /g')"
   ((made > 0 && deferred == 0)) && findings+=("page-count: zero deferred while the host made $made device caches")
   ((kc_read && n_counted + n_not == 0)) && findings+=("page-count: the kext logged no count of an IOSurface's pages this boot: the count's path did not run")
