@@ -16,14 +16,15 @@
 // The descriptors (`_vnop_*_desc`) are exported on every release and name the
 // index themselves, so the index is never a carried constant. The op vector's
 // byte offset in `struct vnode` is the one private layout fact (kRgfxVOpOffset,
-// 0xd0, measured on the config-2 Boot KCs from 13.6 to 27.0.1). The install does
-// not gate on a release allow-list for it -- Apple's version numbering makes one
-// brittle, and a release outside the list would refuse an offset that is in fact
-// correct (27.0.1's VMAPPLE kernel reports version_major 27, not the 26 the list
-// expected). Instead it proves the offset on the live kernel with data reads
-// alone (rgfxVnopProveOffset), never calling or authenticating through a
-// candidate pointer, so a wrong offset can only refuse, never fault. Only a
-// proven offset is used for the absent operations' op-vector calls.
+// 0xd0, measured on the config-2 Boot KCs from 13.6 to 27.0.1 and on 27.2.1's).
+// The install does not gate on a release allow-list for it -- Apple's version
+// numbering makes one brittle, and a release outside the list would refuse an
+// offset that is in fact correct (27.0.1's VMAPPLE kernel reports version_major
+// 27, not the 26 the list expected). Instead it proves the offset on the live
+// kernel with data reads alone (rgfxVnopProveOffset), never calling or
+// authenticating through a candidate pointer, so a wrong offset can only
+// refuse, never fault. Only a proven offset is used for the absent operations'
+// op-vector calls.
 #pragma once
 #include <sys/vnode.h>
 #include <sys/vnode_if.h>
@@ -62,7 +63,8 @@ struct rgfx_vnodeop_desc_head {
 // The op vector (VOPFUNC *v_op) in struct vnode. Byte-identical 0xd0 on the
 // config-2 Boot KCs 13.6..27.0.1 (Ambrosia's survey; on 27.0.1's VMAPPLE kernel,
 // build 26A434, the exported _VNOP_GETXATTR's only x0-relative load is
-// [x0, #0xd0] before it indexes the op vector). Carried as the measured fact;
+// [x0, #0xd0] before it indexes the op vector, and so it is on 27.2.1's, build
+// 26B131). Carried as the measured fact;
 // rgfxVnopProveOffset confirms it on the live kernel, by data reads alone,
 // before the install trusts it.
 static constexpr size_t kRgfxVOpOffset = 0xd0;

@@ -19,7 +19,7 @@
 // IOAVFamily's IOAVVideoTimingData, the 0x50 bytes IOAVVideoTimingElement's withData copies into the
 // element it makes. Each field is named by the key IOAVVideoTimingElement's copyProperties, or
 // IOAVVideoTimingAxisCopy for an axis, publishes it under, at the same offsets on every release
-// from 14 to 27.0.1 (read from each release's IOAVFamily).
+// from 14 to 27.2.1 (read from each release's IOAVFamily).
 struct RgfxIOAVTimingAxis {
 	uint32_t total;
 	uint32_t active;
@@ -54,7 +54,7 @@ static_assert(offsetof(RgfxIOAVTimingData, scanInformation) == 0x4c, "ScanInform
 static_assert(sizeof(RgfxIOAVTimingData) == 0x50, "withData copies 0x50 bytes");
 
 // IOAVElement's ID (64 bits) and Score (32 bits), which its copyProperties publishes, on every
-// release from 14 to 27.0.1. IOAVFamily declares no setter for either: the paravirtual display
+// release from 14 to 27.2.1. IOAVFamily declares no setter for either: the paravirtual display
 // writes both at these offsets once withData or withCapabilities has made the element.
 constexpr size_t kRgfxIOAVElementId = 0x10;
 constexpr size_t kRgfxIOAVElementScore = 0x18;

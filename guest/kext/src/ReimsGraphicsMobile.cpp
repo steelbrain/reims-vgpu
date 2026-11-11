@@ -13,7 +13,7 @@
  * configuration and no CRC answers.
  *
  * None of the class's methods a subclass overrides is forwarded to the class: what the class
- * implements there is for no display at all, on every arm64 release from 13 to 27.0.1 (read from
+ * implements there is for no display at all, on every arm64 release from 13 to 27.2.1 (read from
  * each release's IOMobileGraphicsFamily). Its start_hardware answers false, which fails its start
  * ("start_hardware failed"); its stop_hardware_gated and swap_begin_gated do nothing; its
  * verify_swap answers false, which fails every swap ("verify_swap failed for swap id"); and its
@@ -70,7 +70,7 @@ extern "C" uint32_t rgfxIOSurfaceSurfaceID(const OSObject *surface)
 
 // IOMobileFramebufferLegacy's own methods for its swap queue, which the paravirtual display's
 // swap_begin_gated and clean_queue_gated call and ReimsGraphics overrides none of: called directly,
-// as the SDK stand-in's note_vbl_ISR is, under the names every release from 14 to 27.0.1 exports.
+// as the SDK stand-in's note_vbl_ISR is, under the names every release from 14 to 27.2.1 exports.
 // Each runs in the class's gate. dropAbortedSwaps_gated takes a bool from macOS 15 on and none
 // on 14; Graft binds this import to either (graft-arm64e.json), and 14's ignores the bool.
 extern "C" void rgfxLegacySwapComplete(IOMobileFramebufferLegacy *self)
@@ -90,13 +90,13 @@ extern "C" void rgfxLegacyDropDummySwaps(IOMobileFramebufferLegacy *self)
     __asm__("__ZN25IOMobileFramebufferLegacy20dropDummySwaps_gatedEv");
 // The class's own dispatch of a swap-info record to each notify request it holds, through the
 // display's do_swap_info_notify_gated (RgfxLegacySwapInfo.hpp), which the paravirtual display's
-// notify_swap_done_gated calls: called directly, under the name every release from 14 to 27.0.1
+// notify_swap_done_gated calls: called directly, under the name every release from 14 to 27.2.1
 // exports, in the class's gate.
 extern "C" void rgfxLegacySwapInfoNotifyDispatch(IOMobileFramebufferLegacy *self,
                                                  RgfxSwapInfoRecord *record)
     __asm__("__ZN25IOMobileFramebufferLegacy31swap_info_notify_dispatch_gatedEPNS_12SwapInfoBlobE");
 // The class's own set_parameter, which the display's override hands each parameter it does not
-// take (set_parameter): called directly, under the name every release from 14 to 27.0.1 exports,
+// take (set_parameter): called directly, under the name every release from 14 to 27.2.1 exports,
 // as the paravirtual display's override hands the class those it does not take.
 extern "C" RgfxIOMFBWord rgfxLegacySetParameter(IOMobileFramebufferLegacy *self,
                                                 IOMFBParameterName name, const uint64_t *values,
@@ -105,14 +105,14 @@ extern "C" RgfxIOMFBWord rgfxLegacySetParameter(IOMobileFramebufferLegacy *self,
 
 // IOMobileFramebufferUserClient's enqueue of `bytes` bytes at `words` in its shared data queue,
 // which IOMobileFramebuffer.framework reads a frame info record from (RgfxLegacySwapInfo.hpp):
-// called directly, under the name every release from 14 to 27.0.1 exports, on the user client a
+// called directly, under the name every release from 14 to 27.2.1 exports, on the user client a
 // notify request is for. Answers kIOReturnSuccess, or an error where the queue holds no room.
 extern "C" IOReturn rgfxUserClientEnqueueFrameInfo(void *client, uint64_t *words, uint32_t bytes)
     __asm__("__ZN29IOMobileFramebufferUserClient26enqueueInIOSharedDataQueueEPyj");
 
 // IOAVFamily's constructors of a timing element and of a colour element, and a timing's colour
 // elements, which the paravirtual display calls to make the elements it publishes
-// (RgfxMobileModes.hpp): called directly, under the names every release from 14 to 27.0.1 exports.
+// (RgfxMobileModes.hpp): called directly, under the names every release from 14 to 27.2.1 exports.
 // IOAVFamily is a library of IOMobileGraphicsFamily's on each of them, so it is loaded before the
 // kext, and Graft binds each (graft-arm64e.json). Each constructor answers a retained element, or
 // null. setColorElements retains the array it is given.
@@ -929,8 +929,8 @@ RgfxIOMFBWord ReimsGraphics::surface_layer_unmap(IOMFB::AP::DisplayedData *data,
 // do not fault: the thread find_swap_function_gated starts hands the provider to
 // AppleARMFunction::withProvider, which answers none for a NULL provider, and allocate_carveout
 // reads it only under a flag the family never sets (read from the IOMobileGraphicsFamily of
-// macOS 14.6.1, 15.6.1, 26.6.2 and 27.0.1; tests/legacy_overrides_test.cpp). The display's dot
-// pitch is its pixels per inch, as the paravirtual display answers from its own size.
+// macOS 14.6.1, 15.6.1, 26.6.2, 27.0.1 and 27.2.1; tests/legacy_overrides_test.cpp). The display's
+// dot pitch is its pixels per inch, as the paravirtual display answers from its own size.
 RgfxIOMFBWord ReimsGraphics::get_dot_pitch(uint32_t *pitch)
 {
 	if (!pitch)

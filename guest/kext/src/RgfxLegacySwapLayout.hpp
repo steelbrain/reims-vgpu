@@ -57,13 +57,16 @@ struct RgfxLegacySwapLayout {
 	uint32_t notifyHeld;
 };
 
-// macOS 14.6 (Darwin 23.6), 15.6 (24.6), 26.6 (25.6), and 27.0 and 27.0.1 (27.0): the arm64
-// releases Ambrosia boots from 14 on, where the arm64e kext loads (its MinKernel is 23).
+// macOS 14.6 (Darwin 23.6), 15.6 (24.6), 26.6 (25.6), 27.0 and 27.0.1 (27.0), and 27.2.1
+// (27.2): the arm64 releases Ambrosia boots from 14 on, where the arm64e kext loads (its MinKernel
+// is 23). 27.2's class is 8 bytes longer than 27.0's: its fields from 0x1ce8 on lie 8 bytes further
+// in, and of the offsets here only the held halfword is one of them.
 constexpr RgfxLegacySwapLayout kRgfxLegacySwapLayouts[] = {
     {"14", 0x18a0, 0x1560, 0xb90, 0x32c, 0x318, 0xa40, 0x16b0, 0x108, 0x2d0, 0x310, 0x189e},
     {"15", 0x19c0, 0x1668, 0xc00, 0x32c, 0x318, 0xa48, 0x17c8, 0x108, 0x2d0, 0x310, 0x19be},
     {"26", 0x1af8, 0x1790, 0xc78, 0x34c, 0x338, 0xac0, 0x1900, 0x108, 0x2f0, 0x330, 0x1af6},
     {"27", 0x1dd8, 0x1a40, 0xd38, 0x3ec, 0x3d8, 0xb80, 0x1bf0, 0x108, 0x390, 0x3d0, 0x1dd2},
+    {"27.2", 0x1de0, 0x1a40, 0xd38, 0x3ec, 0x3d8, 0xb80, 0x1bf0, 0x108, 0x390, 0x3d0, 0x1dda},
 };
 
 // The layout of the release whose IOMobileFramebufferLegacy is `classSize` bytes, or null for a

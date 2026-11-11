@@ -13,7 +13,9 @@
 //     each replacement's type against it at compile time.
 // Both are uniform across the five config-2 Boot KCs (13.6, 14.6.1, 15.6.1,
 // 26.6.2, 27.0.1); Ambrosia's AMFI survey measured the discriminators and Graft
-// carries the same values in its own route probe (2026-11-08).
+// carries the same values in its own route probe (2026-11-08). 27.2.1's AMFI
+// signs the three operations' slots with the same discriminators, key IA and no
+// address diversity (read from its code, 2026-11-11).
 #pragma once
 #include <stdint.h>
 

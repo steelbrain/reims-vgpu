@@ -84,6 +84,7 @@ constexpr Release kReleases[] = {
 	{"15.6.1", 0x19c0, 0x1758, {292, 289, 334, 335}},
 	{"26.6.2", 0x1af8, 0x1890, {293, 290, 335, 336}},
 	{"27.0.1", 0x1dd8, 0x1b80, {294, 291, 343, 344}},
+	{"27.2.1", 0x1de0, 0x1b80, {294, 291, 343, 344}},
 };
 
 // The SDK stand-in's virtual slots past its own: GRAFT_IOMFB_VTABLE_RESERVE.
@@ -125,7 +126,7 @@ void releases()
 	for (size_t i = 1; i < sizeof(kReleases) / sizeof(kReleases[0]); i++) {
 		const Release &a = kReleases[i - 1], &b = kReleases[i];
 		check(a.classSize < b.classSize, "each release's class is larger than the last's", b.name);
-		check(a.armIODevice < b.armIODevice, "the provider field moves up with the class", b.name);
+		check(a.armIODevice <= b.armIODevice, "the provider field never moves down", b.name);
 		for (size_t m = 0; m < kMethodCount; m++)
 			check(a.slots[m] <= b.slots[m], "a method's slot never moves down", b.name);
 	}

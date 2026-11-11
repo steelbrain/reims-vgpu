@@ -1,7 +1,7 @@
 // RgfxLegacySwapInfo: the frame info an arm64 WindowServer learns its swaps' presentation times
 // from, sent as Apple's paravirtual display (AppleParavirtDisplay) sends its swap-info
 // notifications on each arm64 release the arm64e kext runs on (read from 14.6.1's, 15.6.1's,
-// 26.6.2's and 27.0.1's AppleParavirtGPU and IOMobileGraphicsFamily):
+// 26.6.2's, 27.0.1's and 27.2.1's AppleParavirtGPU and IOMobileGraphicsFamily):
 // - IOMobileFramebufferLegacy's swap_complete_gated calls the display's notify_swap_done_gated with
 //   the completed swap's ID. The paravirtual display makes the swap's record (RgfxSwapInfoRecord)
 //   and hands it to the class's swap_info_notify_dispatch_gated, which calls the display's

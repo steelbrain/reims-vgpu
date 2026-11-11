@@ -36,7 +36,7 @@ void check(bool ok, const char *what, const char *about)
 // copies from its record and the word abort_swap_gated sets bit 0 of, both of which
 // notify_swap_done_gated reads, with the state word it tests; and in a notify request, the user
 // client add_notification_gated stores, and the tag mask and last time do_swap_info_notify_gated
-// and set_notify_tag_mask_gated use. Read from 14.6.1, 15.6.1, 26.6.2 and 27.0.1.
+// and set_notify_tag_mask_gated use. Read from 14.6.1, 15.6.1, 26.6.2, 27.0.1 and 27.2.1.
 struct Release {
 	const char *name;
 	uint32_t classSize, vblankTime, notifyHeld;
@@ -49,6 +49,7 @@ constexpr Release kReleases[] = {
     {"15", 0x19c0, 0x108, 0x19be, 0x32c, 0x2d0, 0x310, 0x10, 0x78, 0x80},
     {"26", 0x1af8, 0x108, 0x1af6, 0x34c, 0x2f0, 0x330, 0x10, 0x78, 0x80},
     {"27", 0x1dd8, 0x108, 0x1dd2, 0x3ec, 0x390, 0x3d0, 0x10, 0x78, 0x80},
+    {"27.2", 0x1de0, 0x108, 0x1dda, 0x3ec, 0x390, 0x3d0, 0x10, 0x78, 0x80},
 };
 
 void layouts()

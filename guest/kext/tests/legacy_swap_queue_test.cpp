@@ -154,9 +154,13 @@ int main()
 	check(rgfxLegacySwapLayoutOf(0x1dd0) == nullptr && rgfxLegacySwapLayoutOf(0) == nullptr,
 	      "a size no release has tells none", "-");
 	// Where each release's get_display_size reads the width and the height, as its paravirtual
-	// display's set_digital_out_mode writes them (read from 14.6.1, 15.6.1, 26.6.2 and 27.0.1).
-	const uint32_t sizes[] = {0x16b0, 0x17c8, 0x1900, 0x1bf0};
-	for (size_t i = 0; i < 4; i++)
+	// display's set_digital_out_mode writes them (read from 14.6.1, 15.6.1, 26.6.2, 27.0.1 and
+	// 27.2.1).
+	const uint32_t sizes[] = {0x16b0, 0x17c8, 0x1900, 0x1bf0, 0x1bf0};
+	static_assert(sizeof(sizes) / sizeof(sizes[0]) ==
+	                  sizeof(kRgfxLegacySwapLayouts) / sizeof(kRgfxLegacySwapLayouts[0]),
+	              "a size for each release");
+	for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++)
 		check(kRgfxLegacySwapLayouts[i].displaySize == sizes[i],
 		      "the display's size is where the release keeps it", kRgfxLegacySwapLayouts[i].release);
 	std::printf("legacy_swap_queue_test: %d checks passed over %zu releases\n", checks,
