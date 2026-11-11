@@ -1,5 +1,6 @@
 //! The reims-graphics device's hardware encode on VA-API: H.264 and HEVC on the VA crate's
-//! `VideoEncoder` (`EncSlice`, else `EncSliceLP`), in a [`HostEncodeSession`] whose event the host
+//! `VideoEncoder` (`EncSlice`, else `EncSliceLP`), in a
+//! [`HostEncodeSession`](crate::graphics::video_host::HostEncodeSession) whose event the host
 //! signals.
 //!
 //! - **What it answers** ([`encode_caps_of`]) is the driver's: an entry for each codec of which

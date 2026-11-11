@@ -2,7 +2,7 @@
 //! (architecture D1): the library's only platform, natively on Linux, and over MoltenVK on macOS,
 //! a build for development and tests.
 //!
-//! - **Core** ([`core`](crate::core)): what the reims-graphics device and its platform share,
+//! - **Core** ([`core`]): what the reims-graphics device and its platform share,
 //!   generic over one `P: Platform`: the platform traits, the runtime, raises and deaths, the
 //!   guest's RAM and the testkit. It uses nothing else of this crate; the rest of the crate is
 //!   the platform it is generic over.

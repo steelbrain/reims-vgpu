@@ -17,7 +17,7 @@
 //! the UUIDs; `time` lines hold each GPU's workload in microseconds, for the record. A file that
 //! is missing, unreadable, of another header or another key, or whose pick is not among the key's
 //! GPUs answers nothing ([`read`]), and the choice times the GPUs again and writes the file anew
-//! ([`write`]), through a file beside it renamed over it, so a reader never meets half a file.
+//! ([`write()`]), through a file beside it renamed over it, so a reader never meets half a file.
 
 use std::fmt::Write as _;
 use std::path::Path;

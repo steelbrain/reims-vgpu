@@ -6,7 +6,7 @@
 //! its answers, added RGBX32Float's).
 //!
 //! A test checks its answer against Metal's under a key unique in the test ([`check`],
-//! [`check_bytes`], [`matches`], [`matches_bytes`], [`near`], [`answer`]), through the macros
+//! [`check_bytes`], [`matches()`], [`matches_bytes`], [`near`], [`answer`]), through the macros
 //! ([`crate::metal_check`] and the rest), which name the test's source file. A macro given no key
 //! keys the answer by its place among the test's answers given none, `#0` first. A test's answers
 //! are a text file next to that source, `metal_answers/<source file stem>.<test>.txt`: a header
@@ -235,7 +235,7 @@ pub fn matches_bytes(source: &str, manifest: &str, key: &dyn Display, ours: &[u8
     recorded(file_of(source, manifest), &key_text(key)) == bytes_value(ours)
 }
 
-/// Panics unless `ours` is Metal's answer under `key` ([`matches`]).
+/// Panics unless `ours` is Metal's answer under `key` ([`matches()`]).
 pub fn check(source: &str, manifest: &str, key: &dyn Display, ours: &dyn Debug) {
     let (theirs, ours) = (
         recorded(file_of(source, manifest), &key_text(key)),
@@ -556,7 +556,7 @@ macro_rules! metal_check_bytes {
     };
 }
 
-/// [`matches`] from a test's source file.
+/// [`matches()`] from a test's source file.
 #[macro_export]
 macro_rules! metal_matches {
     ($ours:expr $(,)?) => {

@@ -35,7 +35,7 @@
 //!     cache it wrote is said written by another API (`Buffer::external_write_done`), for the
 //!     device's later reads of it to see the picture.
 //!   - **In the output's pages**, where both planes lie in pages a device reaches in place
-//!     ([`PlanePages`](super::PlanePages)): their view registered with CUDA, once a mapping, and
+//!     ([`PlanePages`]): their view registered with CUDA, once a mapping, and
 //!     written by DMA.
 //!
 //!   Elsewhere, and where CUDA refuses the import or the view (logged once a session with why),

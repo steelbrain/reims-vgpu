@@ -1824,7 +1824,7 @@ pub(crate) struct Run<'a> {
     heard: NonNull<Vec<rt::Degradation>>,
 }
 
-/// Runs `run`, whose runtime calls go through [`Run::at`]: each as [`unstopped_at`] runs it, and
+/// Runs `run`, whose runtime calls go through [`Run::at`]: each as [`inside`] runs it, and
 /// what the runtime announces inside each heard as by a [`hearing`] around them all, for the run
 /// to read between them ([`Run::heard`], [`Run::heard_since`]). A hearing inside the run hears
 /// what is announced inside it, as one inside another does.
@@ -1843,7 +1843,7 @@ pub(crate) fn run<T>(run: impl FnOnce(&Run<'_>) -> T) -> T {
 }
 
 impl Run<'_> {
-    /// Runs `call`, the runtime's form of `sel`, as [`unstopped_at`] does.
+    /// Runs `call`, the runtime's form of `sel`, as [`inside`] does.
     #[inline]
     pub(crate) fn at<T>(&self, sel: &'static str, call: impl FnOnce() -> T) -> T {
         inside_of(self.calls, Some(sel), call)

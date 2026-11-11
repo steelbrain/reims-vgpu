@@ -28,6 +28,8 @@
 //! The guest stores `consumer` as it drains the ring, then sets `armed`, issues a full fence and
 //! reads `producer` again.
 
+#[cfg(doc)]
+use crate::ops::video::RgfxVideoOpDecodeH264;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// The device's PCI vendor ID: a placeholder until the owner picks the device's own.

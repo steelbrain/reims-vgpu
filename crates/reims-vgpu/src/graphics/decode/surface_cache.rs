@@ -3737,10 +3737,11 @@ impl<P: Platform> Caches<P> {
     /// before.
     ///
     /// A block that has a cache keeps it where its pages are the same, filled again from them as
-    /// of `generation` ([`Self::fill_named_again`]), as the kext's generations of the surface may
-    /// count anew; any other goes as at a release ([`SurfaceCaches::released`]). Either way what a buffer wrote of the cache is
-    /// copied into the pages first. (The kext names a block's pages once, before any process
-    /// holds it, and a block's offset is given out again only once its release is answered.)
+    /// of `generation` ([`SurfaceCaches::fill_named_again`]), as the kext's generations of the
+    /// surface may count anew; any other goes as at a release ([`SurfaceCaches::released`]).
+    /// Either way what a buffer wrote of the cache is copied into the pages first. (The kext names
+    /// a block's pages once, before any process holds it, and a block's offset is given out again
+    /// only once its release is answered.)
     ///
     /// It follows every command buffer begun and not finished that may write the cache the block
     /// had, and the copies of it asked. The cache's buffer, and the buffer over `view` its copies

@@ -1,6 +1,6 @@
 //! The reims-graphics device's hardware encode on NVENC: H.264 and HEVC on the NVIDIA crate's
-//! `NvencEncoder`, in a [`HostEncodeSession`] whose event the host signals, as the VA-API arm
-//! encodes.
+//! `NvencEncoder`, in a [`HostEncodeSession`](crate::graphics::video_host::HostEncodeSession)
+//! whose event the host signals, as the VA-API arm encodes.
 //!
 //! - **What it answers** ([`encode_caps_of`]) is NVENC's: an entry for each codec of which it
 //!   encodes a profile (the NVIDIA crate's `encode_profiles`), with those profiles, NV12 sources

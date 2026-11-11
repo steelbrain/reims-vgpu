@@ -1,5 +1,5 @@
-//! Values held to a named point: [`Held`], [`Held::raising`], [`Hold`], [`Deferred`], a core
-//! thread's last-resort holder and [`release_off_thread`].
+//! Values held to a named point: [`Held`], [`Held::raising`], [`Hold`], [`Deferred`] and a core
+//! thread's last-resort holder.
 //!
 //! Some values' last release reaches the host or the guest: a task's `destroyTask` and root-page
 //! unmap, a guest display's page unmap, a mapper surface's retain count, a display's end. Such a
