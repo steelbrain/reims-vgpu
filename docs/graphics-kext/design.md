@@ -1280,6 +1280,18 @@ only where no negotiation can carry it.
   0 while no window has drawn the display), and a change of the scale alone
   is a change of the display's mode, told with `DISPLAY_CHANGED` ("Display",
   below). Every host offers it, and the kext takes it.
+- Bit 36, `FEATURES_HI`'s bit 4, is `TEXTURE_DID_MODIFY_DATA`: ring 0 carries
+  `TEXTURE_DID_MODIFY_DATA` (0x232, `RgfxTextureDidModifyData`, the texture's
+  `ObjId`), the bundle's post of a mipmapped texture over a buffer's
+  `didModifyData` (SPI). Such a texture (`TEXTURE_FROM_BUFFER` of more than
+  one level) is a copy of the buffer's bytes with every level made from them,
+  taken at its first use, as the x86 Macs' (dgpu-oracle.md, Q11), and the
+  platform's `didModifyData` makes it take them again at its next use. The
+  host carries it out as a range message ("Range messages", below), so a
+  command buffer of the process begun after it takes the bytes, a CPU write
+  made after the call among them. Every host offers it, and the kext takes
+  it; a guest that did not take it posts nothing, and the copy keeps what it
+  took.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -2280,6 +2292,7 @@ that waits for its answer would close it, at the cost the known creates remove.
 |---|---|---|
 | memory | `HEAP_OVER_HOST_MEMORY`, `HEAP_CREATE`, `BUFFER_CREATE`, `BUFFER_OVER_HOST_MEMORY`, `BUFFER_AT_OFFSET`, `BUFFER_MANAGED_AT_OFFSET`, `HEAP_OVER_PAGES`, `TEXTURE_CREATE`, `TEXTURE_FROM_BUFFER`, `TEXTURE_FROM_IOSURFACE`, `MANAGED_TEXTURE_CREATE`, `MANAGED_BUFFER_CREATE`, `*_DESTROY` | `new_heap_over_host_memory`, `new_heap`, `new_buffer`, `Heap::new_buffer_at_offset`, `new_texture`, `Buffer::new_texture`, drop |
 | Managed ranges | `BUFFER_DID_MODIFY_RANGE`, `TEXTURE_REPLACE_REGION` | `Buffer::did_modify_range`, `Texture::replace_region` |
+| a texture's bytes changed | `TEXTURE_DID_MODIFY_DATA` (not answered; carried out as a range message) | `Texture::did_modify_data` |
 | heap sizes | `HEAP_TEXTURE_SIZE_AND_ALIGN` (answered `SIZE_AND_ALIGN` on the control completion ring; makes nothing) | `heap_texture_size_and_align` |
 | state | `SAMPLER_CREATE`, `DEPTH_STENCIL_CREATE`, `*_DESTROY` | `new_sampler_state`, `new_depth_stencil_state` |
 | shaders | `LIBRARY_LOOKUP` (the content key of the `.metallib`'s AIR slice: a hit binds the library the device made for any process, and no bytes cross), `LIBRARY_CREATE` and `LIBRARY_FROM_REGION` (the slice's bytes forwarded unchanged on a miss, answered once made), `RENDER_PIPELINE_CREATE`, `MESH_RENDER_PIPELINE_CREATE`, `COMPUTE_PIPELINE_CREATE`, `*_DESTROY` | the device's library cache, `new_library_with_data`, `new_render_pipeline_state_full`, `new_mesh_render_pipeline_state_full` and `new_compute_pipeline_state_full` (the whole descriptor the guest set: vertex or stage-input descriptor, every colour attachment, each stage's linked functions, those made with options or a specialized name by `Library::new_function_with_options`; the Vulkan platform refuses a specialized name, which its runtime's function descriptor lacks) |
@@ -3067,8 +3080,8 @@ commit. Each outcome the new design allows is one of those two:
   `a_commit_waits_only_for_the_tickets_issued_before_its_begin`,
   `a_commit_waits_for_its_own_context_s_tickets_alone` and
   `tickets_given_back_out_of_order_hold_through_the_oldest`.
-- **Range messages.** `BUFFER_DID_MODIFY_RANGE` and `TEXTURE_REPLACE_REGION`
-  reach the platform's next submission. One is carried out once every ticket
+- **Range messages.** `BUFFER_DID_MODIFY_RANGE`, `TEXTURE_REPLACE_REGION`
+  and `TEXTURE_DID_MODIFY_DATA` reach the platform's next submission. One is carried out once every ticket
   its context held when it came is given back, so a buffer answered before the
   message was sent does not see its bytes, as under the lock, where the message
   waited for that buffer's commit. Another context's tickets are not waited
@@ -3087,7 +3100,8 @@ commit. Each outcome the new design allows is one of those two:
   CPU write made after the message and before the next commit may reach the
   GPU with it, as Metal's copy of a `Managed` resource is made at the next
   submission. Tested by `a_buffer_sent_after_an_answer_is_committed_after_it`
-  (its range messages) and the sequencer's
+  (its range messages), `a_texture_s_modified_data_is_carried_out_before_a_later_command_buffer`
+  (`graphics/tests.rs`) and the sequencer's
   `a_range_message_is_carried_out_once_its_context_s_tickets_are_given_back`.
 - **Device caches.** A command buffer counts among the users of each cached
   block it uses from its begin to its commit, each use under a number of its own

@@ -1247,6 +1247,20 @@ void test_tiled_texture_over_backing()
 	[levels getBytes:out bytesPerRow:12 fromRegion:MTLRegionMake2D(0, 0, 3, 2) mipmapLevel:0];
 	CHECK(std::memcmp(&out[0], &memory[tileOffset], 12) == 0);
 	CHECK(std::memcmp(&out[12], &memory[tileOffset + pitch], 12) == 0);
+	// Its didModifyData tells the host where the host carries the message
+	// (TEXTURE_DID_MODIFY_DATA), so the host's copy of the bytes takes them again at its next use,
+	// as Metal's does (dgpu-oracle.md, Q11); where the host does not carry it it posts nothing, and
+	// so does the didModifyData of the one of one level, which reads the Shared buffer's bytes in
+	// place.
+	[(id<RgfxMetalTextureInternals>)levels didModifyData];
+	CHECK(ringEmpty(fx.ring));
+	fx.ser.setCarriesTextureDidModifyData(true);
+	[(id<RgfxMetalTextureInternals>)levels didModifyData];
+	CHECK(expectMessage<RgfxTextureDidModifyData>(fx.ring, RGFX_CMD_TEXTURE_DID_MODIFY_DATA)
+	          .obj_id == [(RgfxTexture *)levels rgfxObjId]);
+	[(id<RgfxMetalTextureInternals>)tex didModifyData];
+	CHECK(ringEmpty(fx.ring));
+	fx.ser.setCarriesTextureDidModifyData(false);
 	desc.mipmapLevelCount = 1;
 	// So does a type other than 2D, which the AMD and the Intel GPU make and the host does not
 	// carry over a buffer.

@@ -1532,6 +1532,14 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         plain(|| self.raw.depth())
     }
 
+    /// The runtime's `Texture::did_modify_data`: a mipmapped tiled texture over a buffer
+    /// ([`Buffer::new_tiled_texture`]) takes its copy of the bytes again at its next use in a
+    /// command buffer, as an x86 Mac's does (docs/graphics-kext/dgpu-oracle.md, Q11); any other
+    /// texture is left as it is.
+    fn did_modify_data(&self) {
+        plain(|| self.raw.did_modify_data())
+    }
+
     fn gpu_resource_id(&self) -> u64 {
         plain(|| self.raw.gpu_resource_id()).0
     }

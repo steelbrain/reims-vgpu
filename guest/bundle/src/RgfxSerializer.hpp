@@ -286,6 +286,10 @@ public:
 	/// RGFX_FEATURE_PRIVATE_RENDER_STATE. Set once, before the first create; off by default.
 	void setCarriesPrivateRenderState(bool carries) { m_privateRenderState = carries; }
 	bool carriesPrivateRenderState() const { return m_privateRenderState; }
+	/// Whether a texture's didModifyData reaches the host (textureDidModifyData): the host took
+	/// RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA. Set once, before the first texture; off by default.
+	void setCarriesTextureDidModifyData(bool carries) { m_textureDidModifyData = carries; }
+	bool carriesTextureDidModifyData() const { return m_textureDidModifyData; }
 	/// Names shared event `event` for other processes: its port, 0 where none was given.
 	uint32_t shareEvent(RgfxObjId event);
 	/// The process's new shared event made of the one `port` names: its id in `obj_id` and the
@@ -385,6 +389,12 @@ public:
 	/// (`didModifyRange:`): every command buffer committed after it sees them. False where the
 	/// message was not posted.
 	bool bufferDidModifyRange(RgfxObjId buffer, uint64_t location, uint64_t length);
+
+	/// The process changed the bytes texture `texture` lies over (`didModifyData`, SPI): a
+	/// mipmapped texture over a buffer takes them again at its next use in a command buffer
+	/// committed after it. False where the message was not posted, and where the host does not
+	/// carry it (carriesTextureDidModifyData), which posts nothing.
+	bool textureDidModifyData(RgfxObjId texture);
 
 	// --- textures -------------------------------------------------------------
 
@@ -617,6 +627,7 @@ private:
 	EventShareFn m_eventShare = nullptr;
 	EventTakeFn m_eventTake = nullptr;
 	bool m_privateRenderState = false;
+	bool m_textureDidModifyData = false;
 	void *m_eventContext = nullptr;
 
 	// heapTextureSizeAndAlign's answers, by the shape's bytes, under m_sizesLock.

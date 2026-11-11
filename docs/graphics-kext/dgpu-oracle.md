@@ -549,8 +549,8 @@ host's platform makes the texture as the x86 Macs do (metal2vulkan's
 its first use in a command buffer, which no later CPU write reaches and from which no GPU write
 reaches the buffer. A platform that kept level 0 in step with the bytes and left levels 1 and up
 zero drew such a picture black or dark (26.7.2 walks 15511, 15613 and 15614 on a Radeon 780M
-and an RTX 3090, 11-11). The bundle sends the host nothing at a `didModifyData` of a texture over
-a Shared buffer, so the copy is never taken again.
+and an RTX 3090, 11-11). The bundle tells the host a mipmapped texture's `didModifyData`
+(`TEXTURE_DID_MODIFY_DATA`), and the copy is taken again at its next use, as on the x86 Macs.
 
 *(class 2: the tiled forms are x86's alone.)* WindowServer's tiled backings use the buffer's SPI
 (RgfxBuffer.mm). Our stack: the public form ends the process at more than one level with

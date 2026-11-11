@@ -510,6 +510,16 @@ bool RgfxSerializer::bufferDidModifyRange(RgfxObjId buffer, uint64_t location, u
 	return m_control.tryPost(RGFX_CMD_BUFFER_DID_MODIFY_RANGE, &msg, sizeof(msg), &seqno);
 }
 
+bool RgfxSerializer::textureDidModifyData(RgfxObjId texture)
+{
+	if (!m_textureDidModifyData)
+		return false;
+	RgfxTextureDidModifyData msg = {};
+	msg.obj_id = texture;
+	uint64_t seqno = 0;
+	return m_control.tryPost(RGFX_CMD_TEXTURE_DID_MODIFY_DATA, &msg, sizeof(msg), &seqno);
+}
+
 RgfxCreated RgfxSerializer::createManagedTexture(const RgfxTextureDescriptor &desc,
                                                  RgfxObjId cpu_buffer, uint32_t bytes_per_block,
                                                  uint32_t block_width, uint32_t block_height,

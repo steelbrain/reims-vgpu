@@ -72,7 +72,8 @@ pub const RGFX_REG_VERSION: u32 = 0x004;
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63, the ones the host offers, which the guest takes
 /// through [`RGFX_REG_DRIVER_FEATURES_HI`]: [`RGFX_FEATURE_SURFACE_DEFERRED_CARRY`],
-/// [`RGFX_FEATURE_SCHEDULED_ASK`], [`RGFX_FEATURE_PAGES_16K`] and [`RGFX_FEATURE_DISPLAY_SCALE`].
+/// [`RGFX_FEATURE_SCHEDULED_ASK`], [`RGFX_FEATURE_PAGES_16K`], [`RGFX_FEATURE_DISPLAY_SCALE`] and
+/// [`RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA`].
 /// On a host that offers `PAGES_16K`, `FEATURES_LO` and `_HI` read the guest RAM features only
 /// once the guest took it.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
@@ -314,6 +315,12 @@ pub const RGFX_FEATURE_PAGES_16K: u64 = 0x4_0000_0000;
 /// by an [`RgfxDisplayScale`], then by its modes: the scale of the host screen that shows the
 /// display, from which the guest states the display's pixels per inch. Every host offers it.
 pub const RGFX_FEATURE_DISPLAY_SCALE: u64 = 0x8_0000_0000;
+
+/// `FEATURES_HI` bit 4, feature bit 36, `TEXTURE_DID_MODIFY_DATA`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_HI`]: ring 0 carries [`RGFX_CMD_TEXTURE_DID_MODIFY_DATA`], a
+/// texture's `didModifyData` (SPI), which a mipmapped texture over a buffer's bytes needs to take
+/// them again. Every host offers it.
+pub const RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA: u64 = 0x10_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -761,6 +768,15 @@ pub const RGFX_CMD_SHARED_EVENT_IMPORT: u32 = 0x230;
 /// its last name and its last holder are gone. Context 0's, which no process is. Not answered. A
 /// host without the feature refuses the message as one it does not know.
 pub const RGFX_CMD_SHARED_EVENT_UNNAME: u32 = 0x231;
+/// Command `TEXTURE_DID_MODIFY_DATA` ([`RgfxTextureDidModifyData`]), where the guest took
+/// [`RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA`]: the CPU changed the bytes a texture over a buffer lies
+/// over (`didModifyData`, SPI). A mipmapped one (`TEXTURE_FROM_BUFFER` of more than one level)
+/// holds a copy of them, every level made from them, taken at its first use; it takes them again
+/// at its first use in a command buffer of the context begun after this, on any queue, and a CPU
+/// write before that use is in the copy. Any other texture reads the bytes as they lie, and the
+/// message changes nothing for it. Not answered; a texture the host does not hold is refused. A
+/// host without the feature refuses the message as one it does not know.
+pub const RGFX_CMD_TEXTURE_DID_MODIFY_DATA: u32 = 0x232;
 
 /// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 /// held context `context` closed the device or died. The host ends the context's command queues
@@ -2472,6 +2488,19 @@ pub struct RgfxBufferDidModifyRange {
     pub length: u64,
 }
 
+/// `TEXTURE_DID_MODIFY_DATA`: the CPU changed the bytes texture `obj_id` lies over
+/// (`didModifyData`, SPI).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxTextureDidModifyData {
+    /// [`RGFX_CMD_TEXTURE_DID_MODIFY_DATA`].
+    pub header: RgfxMsgHeader,
+    /// The texture.
+    pub obj_id: u64,
+}
+
 /// The rows of a level of a `Managed` texture's CPU copy start at multiples of this, in bytes
 /// ([`RgfxManagedTextureCreate`]).
 pub const RGFX_MANAGED_ROW_ALIGN: u64 = 256;
@@ -2784,8 +2813,9 @@ pub struct RgfxTextureCreate {
 /// `TEXTURE_FROM_BUFFER`: a texture of shape `desc` over the buffer
 /// `buffer_obj_id` from `offset`, each row `bytes_per_row` apart, with the
 /// guest-picked `resource_id`. A `desc` of more than one level, a 2D texture
-/// of Metal's `newTiledTextureWithDescriptor:offset:bytesPerRow:`, lays its
-/// first level there and its other levels in the texture's own memory.
+/// of Metal's `newTiledTextureWithDescriptor:offset:bytesPerRow:`, holds a
+/// copy of those bytes, every level made from them, taken at its first use
+/// and again after [`RGFX_CMD_TEXTURE_DID_MODIFY_DATA`].
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
@@ -4118,6 +4148,7 @@ const _: () = {
     assert!(size_of::<RgfxLibraryFromRegion>() == 112);
     assert!(size_of::<RgfxLibraryLookup>() == 64);
     assert!(size_of::<RgfxBufferDidModifyRange>() == 40);
+    assert!(size_of::<RgfxTextureDidModifyData>() == 24);
     assert!(size_of::<RgfxManagedTextureCreate>() == 112);
     assert!(size_of::<RgfxManagedBufferCreate>() == 56);
     assert!(size_of::<RgfxTextureReplaceRegion>() == 56);

@@ -5906,6 +5906,62 @@ fn a_texture_of_more_levels_over_a_buffer_is_made_by_the_platform_s_tiled_form()
     assert_eq!(public[0].args[1..], [Arg::U64(0), Arg::U64(256)]);
 }
 
+/// A texture's `TEXTURE_DID_MODIFY_DATA` on ring 0 reaches the platform before a command buffer
+/// its process commits after it on a queue's own ring, as a `Managed` range does: the texture's
+/// `didModifyData` comes before the buffer's commit, so a mipmapped texture over a buffer takes
+/// the bytes again at its first use there; one naming no texture reaches no platform call
+#[test]
+fn a_texture_s_modified_data_is_carried_out_before_a_later_command_buffer() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    let mut guest = Guest::new(&device);
+    assert_eq!(
+        create_queue(&device, &mut guest, 1, 1, (SUBMIT, COMPLETE), RING_DATA, 0),
+        RGFX_STATUS_OK
+    );
+    guest.send(&device, block_grant(1, BLOCK, 0x1_0000));
+    guest.send(&device, resource_id_chunk(1, 0));
+    guest.send(&device, buffer_over_host_memory(obj(1, 2), BLOCK, 0x8000));
+    let (mut tiled, _) =
+        RgfxTextureFromBuffer::read_from_prefix(&texture_from_buffer(obj(1, 3), 1, obj(1, 2)))
+            .unwrap();
+    tiled.desc = RgfxTextureDescriptor {
+        width: 54,
+        height: 54,
+        mipmap_level_count: 6,
+        usage: 1,
+        ..tiled.desc
+    };
+    guest.send(&device, tiled.as_bytes().to_vec());
+    let modified = |obj_id: u64| RgfxTextureDidModifyData {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_TEXTURE_DID_MODIFY_DATA,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+    };
+    guest.send(&device, modified(obj(1, 2)).as_bytes().to_vec());
+    guest.send(&device, modified(obj(1, 3)).as_bytes().to_vec());
+    let mut ring = QueueRing::new(&device, SUBMIT, COMPLETE, u64::from(RING_DATA));
+    ring.send(&device, command_buffer(obj(1, 1), 100));
+    committed(&platform, 1);
+    let calls = platform.call_log().calls();
+    let at = |sel: &str| calls.iter().position(|c| c.sel == sel);
+    let did = at("didModifyData").expect("no didModifyData");
+    assert!(did < at("commit").expect("no commit"));
+    assert_eq!(
+        platform.call_log().calls_to("didModifyData").len(),
+        1,
+        "the buffer's is no texture's"
+    );
+}
+
 /// Whether ring 0's completion ring stays without a new event for about 100 ms.
 fn quiet(guest: &Guest) -> bool {
     std::thread::sleep(Duration::from_millis(100));
@@ -8021,6 +8077,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
         u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32,
         RGFX_FEATURE_SCHEDULED_ASK
             | RGFX_FEATURE_DISPLAY_SCALE
+            | RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA
             | sixteen_bit
             | if carries {
                 RGFX_FEATURE_SURFACE_DEFERRED_CARRY
@@ -8068,6 +8125,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32,
             RGFX_FEATURE_SCHEDULED_ASK
                 | RGFX_FEATURE_DISPLAY_SCALE
+                | RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA
                 | RGFX_FEATURE_PAGES_16K
                 | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
         );
@@ -8100,7 +8158,9 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     );
     assert_eq!(
         u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32,
-        RGFX_FEATURE_SCHEDULED_ASK | RGFX_FEATURE_DISPLAY_SCALE
+        RGFX_FEATURE_SCHEDULED_ASK
+            | RGFX_FEATURE_DISPLAY_SCALE
+            | RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA
     );
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);

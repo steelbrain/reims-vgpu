@@ -89,12 +89,15 @@
 //    once the guest took it (design.md, "Negotiated features"), so the framebuffer first writes
 //    DRIVER_FEATURES_HI with it where offered (rgfxDriverFeaturesFirst), reads the offer again,
 //    and then writes both halves from that offer. The x86-64 kext never takes it, and reads the
-//    offer once, as before the bit.
+//    offer once, as before the bit;
 //  - DISPLAY_SCALE (bit 35): the device's DISPLAYS answer carries, after each display's record,
 //    the scale of the host screen that shows it (RgfxDisplayScale), which the framebuffer gives
 //    the OS as the display's density (RgfxDisplayIdentity.hpp: the x86-64 framebuffer's EDID and
 //    HiDPI modes, the arm64e framebuffer's DisplayAttributes and dot pitch), which needs nothing
-//    of the bundle.
+//    of the bundle;
+//  - TEXTURE_DID_MODIFY_DATA (bit 36): the bundle tells the host a texture's didModifyData
+//    (RGFX_CMD_TEXTURE_DID_MODIFY_DATA), whose message the kext admits as it does a Managed
+//    range's (RgfxSubmitGate.hpp), so a mipmapped texture over a buffer takes the bytes again.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -131,6 +134,7 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_PRIVATE_RENDER_STATE | RGFX_FEATURE_SURFACE_CACHE_REFUSED |
     RGFX_FEATURE_SURFACE_DEFERRED_ASK | RGFX_FEATURE_SURFACE_DEFERRED_CARRY |
     RGFX_FEATURE_SCHEDULED_ASK | RGFX_FEATURE_DISPLAY_SCALE |
+    RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA |
     (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K : 0);
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.

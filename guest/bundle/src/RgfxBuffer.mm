@@ -846,12 +846,14 @@ RGFX_RESOURCE_SPI
 // measured: what the driver of a GPU with Managed storage answers, as no such GPU is on hand, nor
 // how Metal refuses what its validation asserts at: the bundle answers nil, logged once for each
 // rule, as it does for the linear form's. A descriptor of more than one level the AMD and the
-// Intel GPU make, level 0 over the buffer's bytes and levels 1 and up in the GPU's own memory
+// Intel GPU make as a copy of the buffer's bytes with every level made from them, taken at its
+// first use and again at the first use after its didModifyData (RgfxTexture.mm), which no other
+// CPU write reaches and from which no GPU write reaches the buffer
 // (docs/graphics-kext/dgpu-oracle.md, Q11), as WindowServer asks under their feature profile (54 x
 // 54 and 64 x 60 BGRA8Unorm of 6 and 7 levels, over a 16384-byte Shared buffer at 256 bytes a
-// row), and so does the device: TEXTURE_FROM_BUFFER carries the levels, and the host's platform
-// makes them by its tiled form, level 0 kept in step with the buffer's bytes and levels 1 and up
-// its own (logged once a process, with the levels). A type other than 2D the bundle answers nil,
+// row) and Safari's CoreGraphics for its pictures, and so does the device: TEXTURE_FROM_BUFFER
+// carries the levels, and the host's platform makes the same copy by its tiled form (logged once
+// a process, with the levels). A type other than 2D the bundle answers nil,
 // logged once, and sends nothing, which those GPUs make of every type their descriptor validation
 // passes (`oracle_storage DEVICE lintypes tiled:TYPE`, Q11) and whose refusal by the host's
 // platform ends the host's process (resource.rs, new_texture).

@@ -2367,14 +2367,18 @@ RGFX_RESOURCE_SPI
 	return 0;
 }
 
-// The CPU wrote the texture's memory. Over a Managed buffer, Metal's uploads the whole buffer to
-// the GPU's copy (measured on the AMD 5300M under macOS 26.7.1, whose Managed buffers are two
-// copies: `oracle_storage AMD didmodify length` and `nocopy`; the Intel 630's are one), as the
-// buffer's didModifyRange: of all of it tells the host (BUFFER_DID_MODIFY_RANGE, a no-copy one's
-// block first taking the app's bytes); a view's is its texture's. Any other texture has nothing to
-// tell: one over a Shared buffer is the buffer's bytes, which the host reads in place, one over an
-// IOSurface takes the surface's bytes at a commit once a CPU has written them under a lock
-// (RgfxIOSurface.h), and no other texture's memory is the CPU's to write.
+// The CPU wrote the texture's memory. A mipmapped texture over a buffer (a tiled one, RgfxBuffer.mm)
+// is a copy of the buffer's bytes with every level made from them, taken at its first use, and
+// Metal's takes the bytes again at its next use after the call (measured on the AMD 5300M and the
+// Intel 630 under macOS 26.7.1, docs/graphics-kext/dgpu-oracle.md, Q11), which the host does where
+// it carries the message (TEXTURE_DID_MODIFY_DATA). Over a Managed buffer, Metal's uploads the
+// whole buffer to the GPU's copy (measured on the AMD 5300M under macOS 26.7.1, whose Managed
+// buffers are two copies: `oracle_storage AMD didmodify length` and `nocopy`; the Intel 630's are
+// one), as the buffer's didModifyRange: of all of it tells the host (BUFFER_DID_MODIFY_RANGE, a
+// no-copy one's block first taking the app's bytes); a view's is its texture's. Any other texture
+// has nothing to tell: one over a Shared buffer is the buffer's bytes, which the host reads in
+// place, one over an IOSurface takes the surface's bytes at a commit once a CPU has written them
+// under a lock (RgfxIOSurface.h), and no other texture's memory is the CPU's to write.
 - (void)didModifyData
 {
 	if (_parent != nil) {
@@ -2382,8 +2386,14 @@ RGFX_RESOURCE_SPI
 		return;
 	}
 	id<MTLBuffer> buffer = _buffer;
-	if (buffer != nil)
-		[buffer didModifyRange:NSMakeRange(0, buffer.length)];
+	if (buffer == nil)
+		return;
+	if (_desc.mipmap_level_count > 1) {
+		if (_serializer != nullptr)
+			_serializer->textureDidModifyData([self rgfxObjId]);
+		return;
+	}
+	[buffer didModifyRange:NSMakeRange(0, buffer.length)];
 }
 
 // Whether the GPU keeps the texture's contents losslessly compressed, by the rule Metal's follows

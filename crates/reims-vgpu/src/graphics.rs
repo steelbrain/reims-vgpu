@@ -63,14 +63,14 @@ use reims_vgpu_graphics::wire::{
     RGFX_FEATURE_SHARED_EVENT_NAMES, RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM,
     RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
     RGFX_FEATURE_SURFACE_DEFERRED_ASK, RGFX_FEATURE_SURFACE_DEFERRED_CARRY,
-    RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_UNSHARED_QUEUES,
-    RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
-    RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET,
-    RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant, RgfxBlockRelease,
-    RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry,
-    RgfxDisplayColor, RgfxEventSignalled, RgfxHeapOverPages, RgfxIcbState, RgfxLibraryLookup,
-    RgfxMsgHeader, RgfxPageRun, RgfxSamplerState, RgfxScheduledAsk, RgfxSharedEventName,
-    RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
+    RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA,
+    RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
+    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS,
+    RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant,
+    RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted,
+    RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled, RgfxHeapOverPages, RgfxIcbState,
+    RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxSamplerState, RgfxScheduledAsk,
+    RgfxSharedEventName, RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
 use reims_vgpu_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim, Scanout,
@@ -349,7 +349,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // and draws them (`MESH_PIPELINES`). A host whose device makes compute pipelines of
             // OpenCL mode links an OpenCL kernel's function the bundle names so (`OPENCL_MODE`). A
             // host whose device takes the private render state Apple's OpenGL renderer sets makes
-            // the guest's render pipelines with it (`PRIVATE_RENDER_STATE`).
+            // the guest's render pipelines with it (`PRIVATE_RENDER_STATE`). Every host carries a
+            // texture's `didModifyData` to its platform (`TEXTURE_DID_MODIFY_DATA`).
             let in_place = u64::from(RGFX_FEATURE_SURFACE_PAGES)
                 | u64::from(RGFX_FEATURE_PAGES_BUFFERS)
                 | u64::from(RGFX_FEATURE_HEAP_OVER_PAGES);
@@ -368,6 +369,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 | u64::from(RGFX_FEATURE_SHARED_EVENT_NAMES)
                 | RGFX_FEATURE_SCHEDULED_ASK
                 | RGFX_FEATURE_DISPLAY_SCALE
+                | RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA
                 | if gpu_device.makes_opencl_mode_pipelines() {
                     u64::from(RGFX_FEATURE_OPENCL_MODE)
                 } else {

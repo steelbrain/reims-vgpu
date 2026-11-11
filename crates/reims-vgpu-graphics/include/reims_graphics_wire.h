@@ -1043,7 +1043,8 @@
 
 // `FEATURES_HI`, RO: feature bits 32 to 63, the ones the host offers, which the guest takes
 // through [`RGFX_REG_DRIVER_FEATURES_HI`]: [`RGFX_FEATURE_SURFACE_DEFERRED_CARRY`],
-// [`RGFX_FEATURE_SCHEDULED_ASK`], [`RGFX_FEATURE_PAGES_16K`] and [`RGFX_FEATURE_DISPLAY_SCALE`].
+// [`RGFX_FEATURE_SCHEDULED_ASK`], [`RGFX_FEATURE_PAGES_16K`], [`RGFX_FEATURE_DISPLAY_SCALE`] and
+// [`RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA`].
 // On a host that offers `PAGES_16K`, `FEATURES_LO` and `_HI` read the guest RAM features only
 // once the guest took it.
 #define RGFX_REG_FEATURES_HI 12
@@ -1318,6 +1319,12 @@
 // by an [`RgfxDisplayScale`], then by its modes: the scale of the host screen that shows the
 // display, from which the guest states the display's pixels per inch. Every host offers it.
 #define RGFX_FEATURE_DISPLAY_SCALE 34359738368
+
+// `FEATURES_HI` bit 4, feature bit 36, `TEXTURE_DID_MODIFY_DATA`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_HI`]: ring 0 carries [`RGFX_CMD_TEXTURE_DID_MODIFY_DATA`], a
+// texture's `didModifyData` (SPI), which a mipmapped texture over a buffer's bytes needs to take
+// them again. Every host offers it.
+#define RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA 68719476736
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -1805,6 +1812,16 @@
 // its last name and its last holder are gone. Context 0's, which no process is. Not answered. A
 // host without the feature refuses the message as one it does not know.
 #define RGFX_CMD_SHARED_EVENT_UNNAME 561
+
+// Command `TEXTURE_DID_MODIFY_DATA` ([`RgfxTextureDidModifyData`]), where the guest took
+// [`RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA`]: the CPU changed the bytes a texture over a buffer lies
+// over (`didModifyData`, SPI). A mipmapped one (`TEXTURE_FROM_BUFFER` of more than one level)
+// holds a copy of them, every level made from them, taken at its first use; it takes them again
+// at its first use in a command buffer of the context begun after this, on any queue, and a CPU
+// write before that use is in the copy. Any other texture reads the bytes as they lie, and the
+// message changes nothing for it. Not answered; a texture the host does not hold is refused. A
+// host without the feature refuses the message as one it does not know.
+#define RGFX_CMD_TEXTURE_DID_MODIFY_DATA 562
 
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
@@ -6699,11 +6716,21 @@ typedef struct {
   RgfxTextureDescriptor desc;
 } RgfxTextureCreate;
 
+// `TEXTURE_DID_MODIFY_DATA`: the CPU changed the bytes texture `obj_id` lies over
+// (`didModifyData`, SPI).
+typedef struct {
+  // [`RGFX_CMD_TEXTURE_DID_MODIFY_DATA`].
+  RgfxMsgHeader header;
+  // The texture.
+  uint64_t obj_id;
+} RgfxTextureDidModifyData;
+
 // `TEXTURE_FROM_BUFFER`: a texture of shape `desc` over the buffer
 // `buffer_obj_id` from `offset`, each row `bytes_per_row` apart, with the
 // guest-picked `resource_id`. A `desc` of more than one level, a 2D texture
-// of Metal's `newTiledTextureWithDescriptor:offset:bytesPerRow:`, lays its
-// first level there and its other levels in the texture's own memory.
+// of Metal's `newTiledTextureWithDescriptor:offset:bytesPerRow:`, holds a
+// copy of those bytes, every level made from them, taken at its first use
+// and again after [`RGFX_CMD_TEXTURE_DID_MODIFY_DATA`].
 typedef struct {
   // [`RGFX_CMD_TEXTURE_FROM_BUFFER`].
   RgfxMsgHeader header;

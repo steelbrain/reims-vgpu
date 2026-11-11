@@ -67,8 +67,9 @@ inline bool rgfxSubmitIsPipelineCreate(uint32_t type)
 
 // Whether a message of an accepted `type` makes a host object under its obj_id, which an
 // OBJECT_DESTROY of that id drops. The destroy, the queries (a heap texture's size, an argument
-// layout) and the writes into an object already made (a Managed range or region, a shared
-// event's value, an indirect command buffer's commands) make none. A type the wire does not name makes none: the device refuses it.
+// layout) and the writes into an object already made (a Managed range or region, a texture's
+// didModifyData, a shared event's value, an indirect command buffer's commands) make none. A
+// type the wire does not name makes none: the device refuses it.
 inline bool rgfxSubmitMakes(uint32_t type)
 {
 	switch (type) {

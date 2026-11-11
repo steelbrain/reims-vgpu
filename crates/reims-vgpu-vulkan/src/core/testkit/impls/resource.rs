@@ -7,7 +7,7 @@
 use super::super::calllog::Arg;
 use super::super::objects::{Fk, Model, ResourceCommon, TexDesc, TextureModel, kind};
 use super::super::platform::FakePlatform;
-use super::{Backing, new_buffer, new_texture};
+use super::{Backing, fatal, new_buffer, new_texture};
 use crate::core::host::HostPtr;
 use crate::core::platform::resource::*;
 use crate::core::platform::types::{MtlRegion, MtlSize, NsRange, Swizzle};
@@ -258,6 +258,10 @@ impl Texture<FakePlatform> for Fk<kind::Texture> {
 
     fn depth(&self) -> u64 {
         self.texture(|m| m.desc.depth)
+    }
+
+    fn did_modify_data(&self) {
+        fatal(self.act(Policy::Fatal, "didModifyData", vec![]));
     }
 
     fn gpu_resource_id(&self) -> u64 {

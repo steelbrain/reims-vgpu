@@ -160,6 +160,9 @@ pub trait Texture<P: Platform>: GpuResource<P> {
     fn array_length(&self) -> u64;
     /// sel: depth
     fn depth(&self) -> u64;
+    /// sel: didModifyData SPI
+    /// The bytes a texture over a buffer lies over changed; side effect only, raising nothing.
+    fn did_modify_data(&self);
     /// sel: gpuResourceID
     /// `MTLResourceID._impl` (runtime `{MTLResourceID=Q}`).
     fn gpu_resource_id(&self) -> u64;

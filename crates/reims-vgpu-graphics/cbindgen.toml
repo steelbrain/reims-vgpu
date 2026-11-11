@@ -311,6 +311,7 @@ include = [
     "RgfxTextureBinding",
     "RgfxTextureCreate",
     "RgfxTextureDescriptor",
+    "RgfxTextureDidModifyData",
     "RgfxTextureFromBuffer",
     "RgfxTextureFromIOSurface",
     "RgfxTextureReplaceRegion",
