@@ -575,6 +575,44 @@ const PAGES_COPY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// lock of the surface in the guest waits for it.
 const SLOW_ANSWER: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// What a slow answer's line says of its block's device cache ([`GraphicsDecoder::timed`]): its
+/// planes, where its surface's layout named them, and its bytes.
+fn slow_cache(split: &surface_cache::CopySplit) -> String {
+    match split.cache {
+        Some((0, bytes)) => format!(" (a device cache of {bytes} bytes)"),
+        Some((planes, bytes)) => format!(" (a device cache of {planes} planes, {bytes} bytes)"),
+        None => " (no device cache)".to_owned(),
+    }
+}
+
+/// What a slow answer's line says of its copy phase ([`surface_cache::CopySplit`]): the copy it
+/// came with, its own or one in flight, how it reaches the pages, and the phase split into the
+/// time before the GPU had run it, the GPU's run of it, and a staging buffer's copy after it.
+fn slow_copy(split: &surface_cache::CopySplit) -> String {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+    let which = match (split.copies, split.users) {
+        (0, _) => return String::new(),
+        (_, Some(users)) => format!(
+            "its own copy, by {}, after the command buffers of {users} queues that used the cache",
+            split.into
+        ),
+        (copies, None) => format!("{copies} copies already in flight, by {}", split.into),
+    };
+    let times = match (split.wait, split.transfer) {
+        (Some(wait), Some(transfer)) => format!(
+            "{:.1} ms before the GPU had run it (the GPU's wait for those command buffers, and the \
+             transfer queue's work before it), {:.1} ms on the GPU",
+            ms(wait),
+            ms(transfer)
+        ),
+        _ => "the platform gave no GPU times".to_owned(),
+    };
+    format!(
+        " ({which}: {times}, {:.1} ms copying a staging buffer into the pages)",
+        ms(split.staged)
+    )
+}
+
 /// What `layout`, the layout a cached or deferred block's `SURFACE_PAGES` carries, gives the
 /// block's device cache ([`surface_cache::CacheLayout::Carried`]): its surface's planes, and its
 /// first plane's byte ([`surface_cache::aligned_byte`]), which places the cache, `None` where that
@@ -680,6 +718,8 @@ pub(crate) struct Shared<P: Platform> {
     /// The `SURFACE_DOWNLOAD`s and `BLOCK_RELEASE`s answered [`SLOW_ANSWER`] or more after they
     /// were asked ([`GraphicsDecoder::timed`]; diagnostics only).
     slow_answers: Arc<AtomicU64>,
+    /// The copy phase of the last of them, as its line split it ([`surface_cache::CopySplit`]).
+    last_slow_copy: Arc<Mutex<Option<surface_cache::CopySplit>>>,
     /// The blocks whose `SURFACE_PAGES` is not yet carried out ([`worker::Unsettled`]).
     unsettled: Arc<worker::Unsettled>,
     /// The threads the views are made and let go of on, a block's jobs in their order
@@ -931,6 +971,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             block_lives: Mutex::new(HashMap::new()),
             views_logged_at: AtomicU64::new(made_at.as_nanos()),
             slow_answers: Arc::default(),
+            last_slow_copy: Arc::default(),
             unsettled: Arc::default(),
             surface_worker: Arc::new(worker::Worker::new("reims-vgpu.graphics-surfaces")),
             close_worker: worker::Worker::new("reims-vgpu.graphics-closes"),
@@ -1900,9 +1941,9 @@ impl<P: Platform> GraphicsDecoder<P> {
     ) {
         let asked = self.platform.clock().now_mono();
         self.settle_surface(block);
-        let (ran, done) = self.timed("SURFACE_DOWNLOAD", block, asked, done);
+        let (ran, trace, done) = self.timed("SURFACE_DOWNLOAD", block, asked, done);
         let region = Arc::clone(&self.shared.region);
-        (self.surface_caches).download(device, block, region, ran, done, failed);
+        (self.surface_caches).download(device, block, region, ran, trace, done, failed);
     }
 
     /// [`Self::surface_download`] where it waits for nothing and commits no copy now
@@ -1920,26 +1961,33 @@ impl<P: Platform> GraphicsDecoder<P> {
             return false;
         }
         let asked = self.platform.clock().now_mono();
-        let (ran, done) = self.timed("SURFACE_DOWNLOAD", block, asked, done);
+        let (ran, trace, done) = self.timed("SURFACE_DOWNLOAD", block, asked, done);
         let region = Arc::clone(&self.shared.region);
-        (self.surface_caches).try_download(device, block, region, ran, done, failed)
+        (self.surface_caches).try_download(device, block, region, ran, trace, done, failed)
     }
 
     /// `done`, the answer of a `what` (`SURFACE_DOWNLOAD` or `BLOCK_RELEASE`) of the block at
-    /// `block` asked at `asked` and now let past the block's `SURFACE_PAGES`, timed; and what its
+    /// `block` asked at `asked` and now let past the block's `SURFACE_PAGES`, timed; what its
     /// copy out of the block's device cache runs as it is carried out, once the command buffers
-    /// that may write the cache have finished ([`surface_cache::Caches::download`]). An answer
-    /// that comes [`SLOW_ANSWER`] or more after it was asked is counted and logged, with how long
-    /// it waited for the `SURFACE_PAGES`, for those buffers, and then for its copy into the pages
-    /// (the transfer queue, and the GPU's wait for the buffers that used the cache). Diagnostics
-    /// only.
+    /// that may write the cache have finished ([`surface_cache::Caches::download`]); and the
+    /// trace the copy keeps of what it then waited for. An answer that comes [`SLOW_ANSWER`] or
+    /// more after it was asked is counted and logged, with the cache's planes and bytes, how
+    /// long it waited for the `SURFACE_PAGES`, for those buffers, and then for its copy into the
+    /// pages, that copy phase split as [`surface_cache::CopySplit`] gives it: before the GPU had
+    /// run the copy (the GPU's wait for the command buffers that used the cache, and the
+    /// transfer queue's work before it), the GPU's run of the copy, and the CPU's copy of a
+    /// staging buffer after it. Diagnostics only.
     fn timed(
         &self,
         what: &'static str,
         block: u64,
         asked: MonoTime,
         done: surface_cache::Answer,
-    ) -> (surface_cache::Answer, surface_cache::Answer) {
+    ) -> (
+        surface_cache::Answer,
+        Arc<surface_cache::CopyTrace>,
+        surface_cache::Answer,
+    ) {
         let settled = self.platform.clock().now_mono();
         let ran_at = Arc::new(AtomicU64::new(settled.as_nanos()));
         let platform = Arc::clone(&self.platform);
@@ -1949,27 +1997,38 @@ impl<P: Platform> GraphicsDecoder<P> {
                 ran_at.store(platform.clock().now_mono().as_nanos(), Ordering::Relaxed);
             })
         };
+        let trace = Arc::new(surface_cache::CopyTrace::new({
+            let platform = Arc::clone(&platform);
+            Arc::new(move || platform.clock().now_mono())
+        }));
+        let traced = Arc::clone(&trace);
         let slow = Arc::clone(&self.shared.slow_answers);
+        let last = Arc::clone(&self.shared.last_slow_copy);
         let done = Box::new(move || {
             let answered = platform.clock().now_mono();
             let took = answered.saturating_duration_since(asked);
             if took >= SLOW_ANSWER {
                 slow.fetch_add(1, Ordering::Relaxed);
                 let ran = MonoTime::from_nanos(ran_at.load(Ordering::Relaxed));
+                let copy = answered.saturating_duration_since(ran);
+                let split = traced.split(copy);
                 log::warn!(
                     target: "reims_vgpu::graphics", kind:% = what;
-                    "the IOSurface block at {block:#x}: a {what} answered {} ms after it was \
+                    "the IOSurface block at {block:#x}{}: a {what} answered {} ms after it was \
                      asked: {} ms for its SURFACE_PAGES, {} ms behind the command buffers that \
-                     may write its device cache, then {} ms for its copy into the pages",
+                     may write its device cache, then {} ms for its copy into the pages{}",
+                    slow_cache(&split),
                     took.as_millis(),
                     settled.saturating_duration_since(asked).as_millis(),
                     ran.saturating_duration_since(settled).as_millis(),
-                    answered.saturating_duration_since(ran).as_millis()
+                    copy.as_millis(),
+                    slow_copy(&split),
                 );
+                *last.lock() = Some(split);
             }
             done();
         });
-        (ran, done)
+        (ran, trace, done)
     }
 
     /// The `SURFACE_DOWNLOAD`s and `BLOCK_RELEASE`s answered [`SLOW_ANSWER`] or more after they
@@ -1977,6 +2036,12 @@ impl<P: Platform> GraphicsDecoder<P> {
     #[cfg(test)]
     pub(crate) fn slow_answers(&self) -> u64 {
         self.shared.slow_answers.load(Ordering::Relaxed)
+    }
+
+    /// The copy phase of the last of [`Self::slow_answers`], split.
+    #[cfg(test)]
+    pub(crate) fn last_slow_copy(&self) -> Option<surface_cache::CopySplit> {
+        *self.shared.last_slow_copy.lock()
     }
 
     /// The block at `offset` was released, its `RGFX_BLOCK_RELEASE_*` `flags`: its surface view,
@@ -1998,7 +2063,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     ) {
         let asked = self.platform.clock().now_mono();
         self.settle_surface(offset);
-        let (ran, done) = self.timed("BLOCK_RELEASE", offset, asked, done);
+        let (ran, trace, done) = self.timed("BLOCK_RELEASE", offset, asked, done);
         let gone = self.shared.surface_views.lock().released(offset);
         if let Some(gone) = gone {
             self.shared.surface_worker.drop_later(offset, offset, gone);
@@ -2008,7 +2073,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         let worker = Arc::clone(&self.shared.surface_worker);
         let let_go = Box::new(move |cache| worker.drop_later(offset, offset, cache));
         let region = Arc::clone(&self.shared.region);
-        (self.surface_caches).release(device, offset, flags, region, ran, done, failed, let_go);
+        (self.surface_caches).release(
+            device, offset, flags, region, ran, trace, done, failed, let_go,
+        );
     }
 
     /// Fills the device cache of the block the texture a present of IOSurface `iosurface_id`
@@ -5546,6 +5613,58 @@ fn stencil(s: &RgfxStencilDescriptor) -> StencilDesc {
 
 #[cfg(test)]
 mod tests {
+
+    /// A slow answer's line names the cache's planes and bytes, the copy it came with (its own,
+    /// after the queues it waited for, or copies already in flight) and how it reaches the pages,
+    /// and splits the copy phase into the time before the GPU had run it, the GPU's run and a
+    /// staging buffer's copy; it says so where the platform gave no GPU times, and says nothing
+    /// of a copy where the answer waited for none
+    #[test]
+    fn a_slow_answer_s_line_names_its_cache_and_splits_its_copy() {
+        use super::surface_cache::CopySplit;
+        let ms = std::time::Duration::from_millis;
+        let own = CopySplit {
+            cache: Some((2, 12_441_600)),
+            into: "runs",
+            users: Some(2),
+            copies: 1,
+            wait: Some(ms(560)),
+            transfer: Some(ms(33)),
+            staged: ms(0),
+        };
+        assert_eq!(
+            super::slow_cache(&own),
+            " (a device cache of 2 planes, 12441600 bytes)"
+        );
+        assert_eq!(
+            super::slow_copy(&own),
+            " (its own copy, by runs, after the command buffers of 2 queues that used the cache: \
+             560.0 ms before the GPU had run it (the GPU's wait for those command buffers, and \
+             the transfer queue's work before it), 33.0 ms on the GPU, 0.0 ms copying a staging \
+             buffer into the pages)"
+        );
+        let behind = CopySplit {
+            cache: Some((0, 4096)),
+            into: "a staging buffer",
+            users: None,
+            copies: 2,
+            wait: None,
+            transfer: None,
+            staged: ms(4),
+        };
+        assert_eq!(
+            super::slow_cache(&behind),
+            " (a device cache of 4096 bytes)"
+        );
+        assert_eq!(
+            super::slow_copy(&behind),
+            " (2 copies already in flight, by a staging buffer: the platform gave no GPU times, \
+             4.0 ms copying a staging buffer into the pages)"
+        );
+        let none = CopySplit::default();
+        assert_eq!(super::slow_cache(&none), " (no device cache)");
+        assert_eq!(super::slow_copy(&none), "");
+    }
     use std::sync::Arc;
 
     use reims_vgpu_graphics::wire::{

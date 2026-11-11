@@ -205,6 +205,7 @@ use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder};
 use reims_vgpu_vulkan::core::platform::command::{CommandBuffer, CommandQueue, CompletedInfo};
 use reims_vgpu_vulkan::core::platform::device::GpuDevice;
 use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent as _};
+use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
 use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
 use reims_vgpu_vulkan::core::platform::types::NsRange;
 use reims_vgpu_vulkan::core::platform::values::PagesPlane;
@@ -270,6 +271,9 @@ pub(crate) struct SurfaceCache<P: Platform> {
     carried: Option<Arc<CarriedPages>>,
     /// The surface's bytes.
     length: u64,
+    /// The surface's planes, as the kext's ask laid it out or a decode wrote it whole; 0 where
+    /// neither named them. Diagnostics only ([`CopyTrace`]).
+    planes: usize,
     /// The bytes of the surface's texels, where the kext's ask laid the surface out (its
     /// planes' rows, [`texel_spans`]): a copy out of the cache copies those alone, so the bytes
     /// of the pages beside them, between rows or outside the planes, stay as the guest's CPU
@@ -373,6 +377,132 @@ struct Landing {
     /// The answers waiting; `None` once it landed.
     waiting: Mutex<Option<Vec<Answer>>>,
     landed: Condvar,
+    /// What its command buffer's completion gave of the copy, for a slow answer's line.
+    times: Mutex<CopyTimes>,
+}
+
+/// What a copy into a cache's pages took, as its command buffer completed, for the line of an
+/// answer that waited for it ([`CopyTrace`]): diagnostics only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CopyTimes {
+    /// Its command buffer's `GPUStartTime` and `GPUEndTime` ([`CompletedInfo::gpu_times_ns`]),
+    /// in nanoseconds of the platform's host clock: `None` where the platform gave none.
+    pub(crate) gpu: Option<(u64, u64)>,
+    /// How long the host's CPU took to copy a staging buffer's bytes into the pages after it
+    /// (a copied cache's, [`CachePages::Copied`]); zero where the copy wrote the pages itself.
+    pub(crate) staged: std::time::Duration,
+}
+
+/// What a `SURFACE_DOWNLOAD`'s or a `BLOCK_RELEASE`'s answer waited for once it was carried out:
+/// the cache, how its pages took it, and the copy the answer came with, for the line of an
+/// answer that came late ([`super::Decoder::timed`]). Diagnostics only: nothing reads it to
+/// decide anything.
+#[derive(Default)]
+pub(crate) struct CopyTrace {
+    traced: Mutex<Traced>,
+    /// The platform's monotonic clock, which times a staging buffer's copy into the pages;
+    /// `None` times none.
+    now: Option<Now>,
+}
+
+/// A read of the platform's monotonic clock.
+pub(crate) type Now = Arc<dyn Fn() -> MonoTime + Send + Sync>;
+
+/// [`CopyTrace`]'s record.
+#[derive(Default)]
+struct Traced {
+    /// The cache's planes, as the kext's ask or a decode laid its surface out (0 where neither
+    /// did), and its bytes; `None` where the block had no cache.
+    cache: Option<(usize, u64)>,
+    /// How the copy reaches the pages ([`CachePages`]): "a view", "runs" or "a staging buffer".
+    into: &'static str,
+    /// `Some` with the queues whose command buffers that used the cache the copy waited for on
+    /// the GPU, where the answer made a copy; `None` where it waited for one in flight, or for
+    /// nothing.
+    users: Option<usize>,
+    /// The copies the answer waited for: its own, or those in flight; it came with the last of
+    /// them to end on the GPU.
+    landings: Vec<Arc<Landing>>,
+}
+
+/// What a late answer's copy phase was ([`CopyTrace::split`]), as its line says it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CopySplit {
+    /// The cache's planes and bytes; `None` where the block had no cache.
+    pub(crate) cache: Option<(usize, u64)>,
+    /// [`Traced::into`].
+    pub(crate) into: &'static str,
+    /// [`Traced::users`].
+    pub(crate) users: Option<usize>,
+    /// The copies the answer waited for: 0 where it waited for none.
+    pub(crate) copies: usize,
+    /// Of the copy phase: before the GPU had run the copy (the GPU's wait for the command
+    /// buffers that used the cache, the transfer queue's work ahead of it, and the platform's
+    /// sight of its end), the GPU's run of it, and the CPU's copy of a staging buffer after it.
+    /// `wait` and `transfer` are `None` where the platform gave no GPU times.
+    pub(crate) wait: Option<std::time::Duration>,
+    pub(crate) transfer: Option<std::time::Duration>,
+    pub(crate) staged: std::time::Duration,
+}
+
+impl CopyTrace {
+    /// A trace whose copies time a staging buffer's copy into the pages by `now`.
+    pub(crate) fn new(now: Now) -> Self {
+        CopyTrace {
+            traced: Mutex::default(),
+            now: Some(now),
+        }
+    }
+
+    /// The cache of the block at `block` in `caches`, and how its pages take a copy.
+    fn cache<P: Platform>(&self, caches: &HashMap<u64, SurfaceCache<P>>, block: u64) {
+        let mut traced = self.traced.lock();
+        let Some(cache) = caches.get(&block) else {
+            return;
+        };
+        traced.cache = Some((cache.planes, cache.length));
+        traced.into = match &cache.pages {
+            Some(CachePages::View(_)) => "a view",
+            Some(CachePages::Runs { .. }) => "runs",
+            Some(CachePages::Copied(_)) => "a staging buffer",
+            None => "no pages",
+        };
+    }
+
+    /// The answer made a copy, after the command buffers of `users` queues on the GPU.
+    fn made(&self, users: usize, landing: &Arc<Landing>) {
+        let mut traced = self.traced.lock();
+        traced.users = Some(users);
+        traced.landings = vec![Arc::clone(landing)];
+    }
+
+    /// The answer waits for `landings`, copies in flight.
+    fn behind(&self, landings: &[Arc<Landing>]) {
+        self.traced.lock().landings = landings.to_vec();
+    }
+
+    /// The copy phase of the answer, `copy` long, split ([`CopySplit`]).
+    pub(crate) fn split(&self, copy: std::time::Duration) -> CopySplit {
+        let traced = self.traced.lock();
+        let times = (traced.landings.iter())
+            .map(|landing| *landing.times.lock())
+            .max_by_key(|times| times.gpu.map(|(_, end)| end))
+            .unwrap_or_default();
+        let transfer = times
+            .gpu
+            .map(|(start, end)| std::time::Duration::from_nanos(end.saturating_sub(start)));
+        let wait =
+            transfer.map(|transfer| copy.saturating_sub(transfer).saturating_sub(times.staged));
+        CopySplit {
+            cache: traced.cache,
+            into: traced.into,
+            users: traced.users,
+            copies: traced.landings.len(),
+            wait,
+            transfer,
+            staged: times.staged,
+        }
+    }
 }
 
 /// What runs once, as what it waits for is done: an answer waiting for a copy to land, or what a
@@ -385,7 +515,15 @@ impl Landing {
         Arc::new(Landing {
             waiting: Mutex::new(Some(Vec::new())),
             landed: Condvar::new(),
+            times: Mutex::new(CopyTimes::default()),
         })
+    }
+
+    /// [`Self::land`], its copy's command buffer having completed with `gpu`, its GPU times, and
+    /// its staging buffer copied into the pages in `staged`.
+    fn land_timed(&self, gpu: Option<(u64, u64)>, staged: std::time::Duration) {
+        *self.times.lock() = CopyTimes { gpu, staged };
+        self.land();
     }
 
     /// Whether the copy landed.
@@ -1060,7 +1198,7 @@ impl<P: Platform> SurfaceCaches<P> {
         generation: u64,
     ) -> RaiseResult<bool> {
         if self.written_since_host(block) {
-            self.write_back(device, block, Box::new(|| {}))?;
+            self.write_back(device, block, Box::new(|| {}), None)?;
         }
         self.fill_named_again(device, block, generation)?;
         Ok(true)
@@ -1088,7 +1226,7 @@ impl<P: Platform> SurfaceCaches<P> {
             return self.named_again(device, block, generation);
         }
         if self.by_block.contains_key(&block) {
-            self.released(device, block, 0, None, None, Box::new(|| {}))?;
+            self.released(device, block, 0, None, None, Box::new(|| {}), None)?;
         }
         let Some(made) = made.take() else {
             return Ok(false);
@@ -1113,6 +1251,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 pages: Some(pages),
                 carried: None,
                 length,
+                planes: layout.as_ref().map_or(0, Vec::len),
                 texels: layout.as_deref().map(texel_spans),
                 generation: None,
                 host_read: 0,
@@ -1306,7 +1445,7 @@ impl<P: Platform> SurfaceCaches<P> {
         made: &mut Option<RaiseResult<NewCache<P>>>,
     ) -> RaiseResult<bool> {
         if self.by_block.contains_key(&block) {
-            self.released(device, block, 0, None, None, Box::new(|| {}))?;
+            self.released(device, block, 0, None, None, Box::new(|| {}), None)?;
         }
         let room = self.deferred_budget.saturating_sub(self.deferred_bytes);
         let made = match made.take_if(|_| length <= room) {
@@ -1329,6 +1468,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 pages: None,
                 carried: carried.map(Arc::new),
                 length,
+                planes: layout.as_ref().map_or(0, Vec::len),
                 texels: layout.as_deref().map(texel_spans),
                 // A carrying block holds no generation until its first fill, as a new cache.
                 generation: (!carries).then_some(0),
@@ -1537,6 +1677,12 @@ impl<P: Platform> SurfaceCaches<P> {
         self.by_block.get(&block).map(|c| &c.device)
     }
 
+    /// The bytes of the cache of the block at `block`.
+    #[cfg(test)]
+    pub(crate) fn length(&self, block: u64) -> Option<u64> {
+        self.by_block.get(&block).map(|c| c.length)
+    }
+
     /// The identity of the cache of the block at `block`, which lives as long as the cache: the
     /// host's video keeps what it makes of the cache's memory by it ([`SurfaceCache::life`]).
     /// `None` where the block has no cache, or one whose memory was not made for the host's
@@ -1690,6 +1836,7 @@ impl<P: Platform> SurfaceCaches<P> {
         cache.zeros = true;
         if cache.texels.is_none() {
             cache.texels = Some(texel_spans(planes));
+            cache.planes = planes.len();
         }
         self.owed.remove(&block);
         self.counts.decode_firsts += 1;
@@ -2289,7 +2436,12 @@ impl<P: Platform> SurfaceCaches<P> {
             // wake of a handler thread between; the buffers live until its completed handler,
             // past the cache's own end at a release.
             let lands = Arc::clone(&landing);
-            cb.add_completion_seen_handler(ON, Box::new(move |_: CompletedInfo| lands.land()))?;
+            cb.add_completion_seen_handler(
+                ON,
+                Box::new(move |info: CompletedInfo| {
+                    lands.land_timed(info.gpu_times_ns, std::time::Duration::ZERO);
+                }),
+            )?;
             let held = (
                 cache.device.clone_ref(),
                 view.map(|pages| pages.clone_ref()),
@@ -2465,7 +2617,11 @@ impl<P: Platform> SurfaceCaches<P> {
         block: u64,
         cpu: Option<u64>,
         done: Box<dyn FnOnce() + Send>,
+        trace: Option<&CopyTrace>,
     ) -> RaiseResult<()> {
+        if let Some(trace) = trace {
+            trace.cache(&self.by_block, block);
+        }
         let written = self.written_since_host(block);
         if !written || self.behind_the_cpu(block, cpu, "SURFACE_DOWNLOAD") {
             // An early copy, landed or not, holds the cache's last write: answered as it lands.
@@ -2484,6 +2640,9 @@ impl<P: Platform> SurfaceCaches<P> {
             if landings.is_empty() && !written && self.by_block.contains_key(&block) {
                 self.counts.clean += 1;
             }
+            if let Some(trace) = trace {
+                trace.behind(&landings);
+            }
             after_landings(landings, done);
             return Ok(());
         }
@@ -2501,7 +2660,7 @@ impl<P: Platform> SurfaceCaches<P> {
                  pages are not named; nothing is copied"
             );
         }
-        self.write_back(device, block, done)
+        self.write_back(device, block, done, trace)
     }
 
     /// The block at `block` went (its `BLOCK_RELEASE`, of `RGFX_BLOCK_RELEASE_*` `flags`): its
@@ -2517,6 +2676,7 @@ impl<P: Platform> SurfaceCaches<P> {
     /// copy is made, is still 0; past 0, a process took the surface again before the answer
     /// (the kext marks it so), and the cache is copied. The cache is returned, for the caller to
     /// let go of.
+    #[allow(clippy::too_many_arguments)] // the release's, and its trace
     pub(crate) fn released(
         &mut self,
         device: &P::Device,
@@ -2525,7 +2685,11 @@ impl<P: Platform> SurfaceCaches<P> {
         cpu: Option<u64>,
         clients: Option<u32>,
         done: Box<dyn FnOnce() + Send>,
+        trace: Option<&CopyTrace>,
     ) -> RaiseResult<Option<SurfaceCache<P>>> {
+        if let Some(trace) = trace {
+            trace.cache(&self.by_block, block);
+        }
         let written = self.written_since_host(block);
         let flagged = flags & RGFX_BLOCK_RELEASE_UNHELD != 0;
         let unheld = written && flagged && clients == Some(0);
@@ -2543,10 +2707,12 @@ impl<P: Platform> SurfaceCaches<P> {
             let early = (self.by_block.get(&block))
                 .and_then(|cache| cache.read_back.copy.as_ref())
                 .map(|copy| Arc::clone(&copy.landing));
-            after_landings(
-                early.into_iter().chain(self.out_copy(block)).collect(),
-                done,
-            );
+            let landings: Vec<Arc<Landing>> =
+                early.into_iter().chain(self.out_copy(block)).collect();
+            if let Some(trace) = trace {
+                trace.behind(&landings);
+            }
+            after_landings(landings, done);
         } else {
             if flags & RGFX_BLOCK_RELEASE_NO_CLIENT != 0 {
                 self.counts.unread += 1;
@@ -2554,7 +2720,7 @@ impl<P: Platform> SurfaceCaches<P> {
             if flagged {
                 self.counts.retaken += 1;
             }
-            self.write_back(device, block, done)?;
+            self.write_back(device, block, done, trace)?;
         }
         let gone = self.by_block.remove(&block);
         self.owed.remove(&block);
@@ -2648,6 +2814,7 @@ impl<P: Platform> SurfaceCaches<P> {
         device: &P::Device,
         block: u64,
         done: Box<dyn FnOnce() + Send>,
+        trace: Option<&CopyTrace>,
     ) -> RaiseResult<()> {
         // A deferred block whose pages are not named has nowhere to copy to.
         if self.unattached(block).is_some() || !self.make_transfer(device)? {
@@ -2670,7 +2837,7 @@ impl<P: Platform> SurfaceCaches<P> {
             return Ok(());
         };
         wait_before::<P>(&cb, signal.as_ref())?;
-        wait_for_users::<P>(&cb, &self.ends, cache)?;
+        let users = wait_for_users::<P>(&cb, &self.ends, cache)?;
         let staged = copy::<P>(device, &cb, cache, Way::Out, block, &mut self.counts)?;
         signal_after::<P>(&cb, signal.as_ref())?;
         // The buffers live until the copy is done, past the cache's own end at a release.
@@ -2680,6 +2847,7 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         let length = cache.length;
         let held = (cache.device.clone_ref(), view);
+        let now = trace.and_then(|trace| trace.now.clone());
         transfer.signalled += 1;
         let value = transfer.signalled;
         cb.encode_signal(Some(EventRef::Event(&transfer.event)), value)?;
@@ -2690,10 +2858,15 @@ impl<P: Platform> SurfaceCaches<P> {
             // `done`: a copy too long for the platform's thread that sees the completion.
             Some(staged) => cb.add_completed_handler(
                 ON,
-                Box::new(move |_: CompletedInfo| {
+                Box::new(move |info: CompletedInfo| {
+                    let at = now.as_ref().map(|now| now());
                     staged.done(length);
                     drop(held);
-                    lands.land();
+                    let took = (now.as_ref().zip(at))
+                        .map_or(std::time::Duration::ZERO, |(now, at)| {
+                            now().saturating_duration_since(at)
+                        });
+                    lands.land_timed(info.gpu_times_ns, took);
                     done();
                 }),
             )?,
@@ -2702,8 +2875,8 @@ impl<P: Platform> SurfaceCaches<P> {
             None => {
                 cb.add_completion_seen_handler(
                     ON,
-                    Box::new(move |_: CompletedInfo| {
-                        lands.land();
+                    Box::new(move |info: CompletedInfo| {
+                        lands.land_timed(info.gpu_times_ns, std::time::Duration::ZERO);
                         done();
                     }),
                 )?;
@@ -2711,6 +2884,9 @@ impl<P: Platform> SurfaceCaches<P> {
             }
         }
         cb.commit(ON)?;
+        if let Some(trace) = trace {
+            trace.made(users, &landing);
+        }
         if signal.is_some() {
             self.signal_with = None;
         }
@@ -3601,21 +3777,24 @@ impl<P: Platform> Caches<P> {
 
     /// `SURFACE_DOWNLOAD` of the block at `block` ([`SurfaceCaches::download`]), after every
     /// command buffer begun and not finished that may write it, waiting for none
-    /// ([`Self::after_writers`]), `ran` as it is carried out then: `done` once the pages hold the
-    /// cache, or `failed` where the platform raised at the copy.
+    /// ([`Self::after_writers`]), `ran` as it is carried out then, and what it waited for then in
+    /// `trace`: `done` once the pages hold the cache, or `failed` where the platform raised at
+    /// the copy.
+    #[allow(clippy::too_many_arguments)] // the download's, and its trace
     pub(crate) fn download(
         &self,
         device: &P::Device,
         block: u64,
         region: Arc<Region>,
         ran: Answer,
+        trace: Arc<CopyTrace>,
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) {
         self.after_writers(
             device,
             block,
-            download_op(device, block, region, ran, done, failed),
+            download_op(device, block, region, ran, trace, done, failed),
         );
     }
 
@@ -3625,12 +3804,14 @@ impl<P: Platform> Caches<P> {
     /// copy, landed or not, holds the write), or a command buffer still walked may write it, in
     /// whose finish it is made. Whether it was asked; where not, `done` and `failed` are dropped
     /// ungiven.
+    #[allow(clippy::too_many_arguments)] // the download's, and its trace
     pub(crate) fn try_download(
         &self,
         device: &P::Device,
         block: u64,
         region: Arc<Region>,
         ran: Answer,
+        trace: Arc<CopyTrace>,
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) -> bool {
@@ -3643,7 +3824,7 @@ impl<P: Platform> Caches<P> {
         state.after_writers(
             device,
             block,
-            download_op(device, block, region, ran, done, failed),
+            download_op(device, block, region, ran, trace, done, failed),
         );
         drop(state);
         self.moved.notify_all();
@@ -3680,6 +3861,7 @@ impl<P: Platform> Caches<P> {
         flags: u32,
         region: Arc<Region>,
         ran: Answer,
+        trace: Arc<CopyTrace>,
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
         let_go: Box<dyn FnOnce(SurfaceCache<P>) + Send>,
@@ -3718,7 +3900,9 @@ impl<P: Platform> Caches<P> {
                 let device = on;
                 let cpu = cpu_generation(&region, block);
                 let clients = surface_clients(&region, block);
-                match refusing(|| state.released(&device, block, flags, cpu, clients, done)) {
+                match refusing(|| {
+                    state.released(&device, block, flags, cpu, clients, done, Some(&trace))
+                }) {
                     Ok(Some(cache)) => let_go(cache),
                     Ok(None) => {}
                     Err(raise) => failed(raise),
@@ -3753,7 +3937,7 @@ impl<P: Platform> Caches<P> {
     ) -> RaiseResult<Option<SurfaceCache<P>>> {
         let mut state = self.state.lock();
         self.wait_copies(&mut state, block);
-        state.released(device, block, 0, None, None, done)
+        state.released(device, block, 0, None, None, done, None)
     }
 
     /// A cache for the block at `block`, whose surface's pages `view` maps: `Ok(false)` where
@@ -3994,6 +4178,7 @@ fn download_op<P: Platform>(
     block: u64,
     region: Arc<Region>,
     ran: Answer,
+    trace: Arc<CopyTrace>,
     done: Box<dyn FnOnce() + Send>,
     failed: Box<dyn FnOnce(Raise) + Send>,
 ) -> CopyOut<P> {
@@ -4001,24 +4186,27 @@ fn download_op<P: Platform>(
     Box::new(move |state| {
         ran();
         let cpu = cpu_generation(&region, block);
-        if let Err(raise) = refusing(|| state.download(&device, block, cpu, done)) {
+        if let Err(raise) = refusing(|| state.download(&device, block, cpu, done, Some(&trace))) {
             failed(raise);
         }
     })
 }
 
-/// Makes `cb` wait for the latest command buffer of each queue that used `cache`.
+/// Makes `cb` wait for the latest command buffer of each queue that used `cache`; how many it
+/// waits for.
 fn wait_for_users<P: Platform>(
     cb: &P::CommandBuffer,
     ends: &HashMap<u64, (P::Event, u64)>,
     cache: &SurfaceCache<P>,
-) -> RaiseResult<()> {
+) -> RaiseResult<usize> {
+    let mut waits = 0;
     for (queue, &value) in &cache.users {
         if let Some((event, _)) = ends.get(queue) {
             cb.encode_wait(Some(EventRef::Event(event)), value)?;
+            waits += 1;
         }
     }
-    Ok(())
+    Ok(waits)
 }
 
 /// Has `cb`, the command buffer of a deferred copy being made ([`SurfaceCaches::carry_out`]),
@@ -5328,6 +5516,50 @@ mod tests {
                 n as u64 + 1,
                 "{second}: answered late"
             );
+        }
+    }
+
+    /// A slow answer's copy phase is split by its copy's GPU times: the GPU's run of the copy,
+    /// and the rest before it (the GPU's wait for the command buffers that used the cache, and the
+    /// transfer queue's work before it), with the cache's planes and bytes, how the copy reaches
+    /// the pages, and the queues it waited for; with no GPU times from the platform, the phase
+    /// stays whole
+    #[test]
+    fn a_slow_answer_s_copy_phase_is_split_by_its_copy_s_gpu_times() {
+        let late = super::super::SLOW_ANSWER;
+        let transfer = std::time::Duration::from_millis(30);
+        for timed in [true, false] {
+            let mut r = cached();
+            let length = r.dec.caches().length(BLOCK).unwrap();
+            use_surfaces(&mut r, 1, 0x200, &[(BLOCK, 0, true)]);
+            let mark = r.p.call_log().mark();
+            let answered = download(&r, BLOCK);
+            let calls = r.p.call_log().since(mark);
+            let commits: Vec<&Call> = calls.iter().filter(|c| c.sel == "commit").collect();
+            assert_eq!(commits.len(), 1, "its own copy, on the transfer queue");
+            if timed {
+                let start = 7_000_000_000;
+                let end = start + transfer.as_nanos() as u64;
+                assert!(r.p.world().set_gpu_times(commits[0].obj, start, end));
+            }
+            r.p.virtual_clock().advance(late);
+            r.p.world().complete_all(CompleteOn::Caller);
+            assert!(answered.load(Ordering::SeqCst));
+            let split = r.dec.last_slow_copy().expect("answered late");
+            assert_eq!(split.cache, Some((0, length)), "no layout named its planes");
+            assert_eq!(
+                (split.users, split.copies),
+                (Some(1), 1),
+                "after queue 1's buffer"
+            );
+            assert_eq!(split.staged, std::time::Duration::ZERO, "its pages a view");
+            match timed {
+                true => {
+                    assert_eq!(split.transfer, Some(transfer));
+                    assert_eq!(split.wait, Some(late - transfer));
+                }
+                false => assert_eq!((split.transfer, split.wait), (None, None)),
+            }
         }
     }
 
@@ -8811,6 +9043,7 @@ mod tests {
                 BLOCK,
                 region,
                 Box::new(|| {}),
+                Arc::default(),
                 answer,
                 no_raise(),
             );
