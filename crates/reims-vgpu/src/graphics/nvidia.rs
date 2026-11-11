@@ -471,10 +471,14 @@ struct NvdecPicture {
 }
 
 impl NvdecPicture {
-    /// Logs, once a session, why its pictures are copied by the CPU.
+    /// Logs, once a session, and at info once per process (`kind`), why its pictures are copied
+    /// by the CPU.
     fn decline(&self, why: &str) {
         if !self.declined.swap(true, Ordering::Relaxed) {
-            log::info!("hardware video: {NAME}: a session's pictures are copied by the CPU: {why}");
+            log::info!(
+                kind = why;
+                "hardware video: {NAME}: a session's pictures are copied by the CPU: {why}"
+            );
         }
     }
 

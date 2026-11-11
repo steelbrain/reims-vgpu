@@ -747,8 +747,11 @@ impl PoolInner {
             Some(ReadbackWay::GetImage) => self.image_readback(),
             // The staged surface's planes are whole rows from its first byte at rows of 256
             // bytes, which a driver that writes rows of whole alignments alone takes too.
+            // Each surface's first read-back says why it is not staged, at info once per
+            // process (`kind`).
             None if let Err(why) = self.display.writes_imports(self.format) => {
                 log::info!(
+                    kind:% = why;
                     "no staged copy back for {} {}x{} frames, so they come back through \
                      vaGetImage: {why}",
                     self.format.name(),
@@ -762,6 +765,7 @@ impl PoolInner {
                     Ok(staging) => Readback::Staged(staging),
                     Err(error) => {
                         log::info!(
+                            kind:% = error;
                             "no staged copy back for {} {}x{} frames, so they come back \
                              through vaGetImage: {error}",
                             self.format.name(),
