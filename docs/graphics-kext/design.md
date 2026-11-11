@@ -1279,7 +1279,7 @@ only where no negotiation can carry it.
   screen's pixels a point in 120ths (120 at 1x, 240 at 2x, 252 at KDE's 2.1;
   0 while no window has drawn the display), and a change of the scale alone
   is a change of the display's mode, told with `DISPLAY_CHANGED` ("Display",
-  below). Every host offers it.
+  below). Every host offers it, and the kext takes it.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -1791,6 +1791,22 @@ pages under the scanout are imported at its first draw, and again only when
 the guest moves the scanout or changes its size, so no copy is made on the way
 to the window, and no other page of the region is pinned for it. While vblank is
 enabled, the host sends `VBLANK` at each refresh of the window's screen.
+
+**The display's density.** Where the guest took `DISPLAY_SCALE`, the host
+tells it the scale of the screen its window was last drawn on, and the kext
+gives the OS the display's density from it, 110 pixels per inch a point
+(`guest/kext/src/RgfxDisplayIdentity.hpp`): 110 at 1x, 220 at 2x, 231 at
+2.1, and 110 before the window first draws. The x86-64 kext puts it in the
+EDID's size and each mode's size in millimetres, and the arm64 kext in
+`DisplayAttributes`' size and the dot pitch. The modes are valid for HiDPI
+(`kDisplayModeValidForHiResFlag`, on x86-64) only on a screen above 1x, at
+any size whose pixels halve exactly. The guests decide their default scale
+differently (measured): arm64's WindowServer follows the published size, so
+it runs at 1x on a 1x screen and HiDPI above 1x at every size, while x86-64
+macOS 26.7.2 decides by width alone: it starts HiDPI on a mode at least 3840
+pixels wide and at 1x below that, whatever the EDID's density and the flag
+(at 330 ppi, modes 2400 to 3648 pixels wide still started at 1x, and on a 1x
+screen, with no mode valid for HiDPI, a 3888 pixels wide one started HiDPI).
 
 **Refresh times.** The host stamps each `VBLANK` with its refresh's time on
 the display's grid, a period after the one before, on its monotonic clock. It

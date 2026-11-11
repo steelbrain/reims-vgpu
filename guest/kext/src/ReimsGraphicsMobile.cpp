@@ -435,6 +435,7 @@ void ReimsGraphics::publishMobileDisplay()
 	IOLockLock(stateLock);
 	const Mode native = nativeMode(Mode{});
 	const UInt32 id = displayId;
+	const UInt32 scale = displayScale;
 	IOLockUnlock(stateLock);
 	const uint32_t serial = rgfxDisplaySerial(id);
 
@@ -467,9 +468,9 @@ void ReimsGraphics::publishMobileDisplay()
 		attributes->setObject("SupportsPQEOTF", kOSBooleanFalse);
 		if (native.width && native.height) {
 			putNumber(attributes, "MaxHorizontalImageSize",
-			          (rgfxDisplayMillimetres(native.width, native.width) + 9) / 10);
+			          (rgfxDisplayMillimetres(native.width, scale) + 9) / 10);
 			putNumber(attributes, "MaxVerticalImageSize",
-			          (rgfxDisplayMillimetres(native.height, native.width) + 9) / 10);
+			          (rgfxDisplayMillimetres(native.height, scale) + 9) / 10);
 			putNumber(attributes, "NativeFormatHorizontalPixels", native.width);
 			putNumber(attributes, "NativeFormatVerticalPixels", native.height);
 			putNumber(attributes, "PreciseAspectRatio",
@@ -1169,9 +1170,9 @@ RgfxIOMFBWord ReimsGraphics::get_dot_pitch(uint32_t *pitch)
 	if (!pitch)
 		return word(kIOReturnBadArgument);
 	IOLockLock(stateLock);
-	const Mode native = nativeMode(Mode{});
+	const UInt32 scale = displayScale;
 	IOLockUnlock(stateLock);
-	*pitch = rgfxDisplayPixelsPerInch(native.width);
+	*pitch = rgfxDisplayPixelsPerInch(scale);
 	if (logged(kGetDotPitch))
 		IOLog("ReimsGraphics: get_dot_pitch() = %u\n", *pitch);
 	return word(kIOReturnSuccess);

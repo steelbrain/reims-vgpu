@@ -22,6 +22,8 @@ static_assert(RGFX_FEATURE_SURFACE_DEFERRED_CARRY == (1ull << 32),
               "SURFACE_DEFERRED_CARRY is bit 32");
 static_assert(RGFX_FEATURE_SCHEDULED_ASK == (1ull << 33), "SCHEDULED_ASK is bit 33");
 static_assert(RGFX_FEATURE_PAGES_16K == (1ull << 34), "PAGES_16K is bit 34");
+static_assert(RGFX_FEATURE_DISPLAY_SCALE == (1ull << 35), "DISPLAY_SCALE is bit 35");
+static_assert(sizeof(RgfxDisplayScale) == 8, "the display's scale record");
 static_assert(RGFX_STATUS_CACHE == 7, "STATUS_CACHE");
 static_assert(RGFX_SURFACE_PAGES_LAYOUT_OFFSET ==
                   RGFX_SURFACE_PAGES_CACHE_OFFSET + sizeof(RgfxSurfacePagesCache),
@@ -96,11 +98,13 @@ constexpr uint64_t kDeferredAsk = RGFX_FEATURE_SURFACE_DEFERRED_ASK;
 constexpr uint64_t kDeferredCarry = RGFX_FEATURE_SURFACE_DEFERRED_CARRY;
 // Its bundle asks for a waited-for command buffer's scheduling.
 constexpr uint64_t kScheduledAsk = RGFX_FEATURE_SCHEDULED_ASK;
+// It gives the OS the display's density from its host screen's scale.
+constexpr uint64_t kDisplayScale = RGFX_FEATURE_DISPLAY_SCALE;
 constexpr uint64_t kCarried = kPages | kOrder | kIcb | kUnshared | kManaged | kHeaps | kRoom |
                               kSlots | kCommits | kDeferred | kTime | kTextureSlabs |
                               kBufferSlabs | kSmallIds | kColor | kMesh | kShares | kOpenCL |
                               kPrivate | kCacheRefused | kDeferredAsk | kDeferredCarry |
-                              kScheduledAsk | k16KCarried;
+                              kScheduledAsk | kDisplayScale | k16KCarried;
 // Every bit the wire names from bit 3.
 constexpr uint64_t kNew = kNotCarried | kCarried;
 } // namespace
@@ -112,15 +116,15 @@ int main()
 	// ICB_SLOTS, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, MANAGED_TEXTURE_SLABS,
 	// MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS, DISPLAY_COLOR, MESH_PIPELINES,
 	// SHARED_EVENT_NAMES, OPENCL_MODE, PRIVATE_RENDER_STATE, SURFACE_CACHE_REFUSED,
-	// SURFACE_DEFERRED_ASK, SURFACE_DEFERRED_CARRY and SCHEDULED_ASK, and writes each only where
-	// offered.
+	// SURFACE_DEFERRED_ASK, SURFACE_DEFERRED_CARRY, SCHEDULED_ASK and DISPLAY_SCALE, and writes
+	// each only where offered.
 	check(kRgfxCarriedFeatures == kCarried,
 	      "the kext takes PAGES_BUFFERS, SURFACE_ORDER, ICBs, UNSHARED_QUEUES, MANAGED_AT_OFFSET, "
 	      "HEAP_OVER_PAGES, SUBMIT_ROOM, ICB slots, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, "
 	      "MANAGED_TEXTURE_SLABS, MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS, DISPLAY_COLOR, "
 	      "MESH_PIPELINES, SHARED_EVENT_NAMES, OPENCL_MODE, PRIVATE_RENDER_STATE, "
-	      "SURFACE_CACHE_REFUSED, SURFACE_DEFERRED_ASK, SURFACE_DEFERRED_CARRY and SCHEDULED_ASK "
-	      "from bit 3");
+	      "SURFACE_CACHE_REFUSED, SURFACE_DEFERRED_ASK, SURFACE_DEFERRED_CARRY, SCHEDULED_ASK and "
+	      "DISPLAY_SCALE from bit 3");
 	check(RGFX_FEATURE_PAGES_BUFFERS == (1u << 7), "PAGES_BUFFERS is bit 7");
 	check(RGFX_FEATURE_SURFACE_ORDER == (1u << 11), "SURFACE_ORDER is bit 11");
 	check(RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS == (1u << 12), "INDIRECT_COMMAND_BUFFERS is bit 12");
@@ -223,6 +227,10 @@ int main()
 	check(rgfxFeatureWord(kRgfxOfferedFeatures | kScheduledAsk, kScheduledAsk) ==
 	          (kRgfxOfferedFeatures | kScheduledAsk),
 	      "SCHEDULED_ASK taken is in the word");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kDisplayScale) == kDisplayScale,
+	      "DISPLAY_SCALE offered, written");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried) == 0,
+	      "DISPLAY_SCALE not offered, not written");
 	// PAGES_16K: the arm64e kext writes it first where offered, and then with the rest; the
 	// x86-64 kext never writes it, and writes nothing first.
 	check(rgfxDriverFeaturesFirst(~0ull) == k16KCarried, "PAGES_16K first where carried");

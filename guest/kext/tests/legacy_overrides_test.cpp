@@ -149,19 +149,29 @@ void declarations()
 	}
 }
 
-// get_dot_pitch answers the display's pixels per inch, the density its published size is at.
+// get_dot_pitch answers the display's pixels per inch, the density its published size is at: 110
+// a point of the host screen that shows it, whatever the display's width.
 void dotPitch()
 {
-	check(rgfxDisplayPixelsPerInch(1920) == 110, "a 1920-wide display is at 110 ppi", "pitch");
-	check(rgfxDisplayPixelsPerInch(2879) == 110, "below 2880 wide is at 110 ppi", "pitch");
-	check(rgfxDisplayPixelsPerInch(2880) == 220, "2880 wide is at 220 ppi", "pitch");
-	check(rgfxDisplayPixelsPerInch(5120) == 220, "a 5120-wide display is at 220 ppi", "pitch");
-	for (uint32_t width : {1024u, 1280u, 1920u, 2560u, 2880u, 3840u, 5120u, 7680u}) {
-		const uint32_t ppi = rgfxDisplayPixelsPerInch(width);
-		const uint32_t mm = rgfxDisplayMillimetres(width, width);
-		// The size, rounded to the millimetre, is the width at the pitch: within half a millimetre.
-		const long twice = static_cast<long>(width) * 254 * 2 / ppi - static_cast<long>(mm) * 20;
-		check(twice >= -10 && twice <= 10, "the published size is the width at the pitch", "pitch");
+	check(rgfxDisplayPixelsPerInch(0) == 110, "no scale from the host: 110 ppi", "pitch");
+	check(rgfxDisplayPixelsPerInch(120) == 110, "a screen at 1x: 110 ppi", "pitch");
+	check(rgfxDisplayPixelsPerInch(180) == 165, "a screen at 1.5x: 165 ppi", "pitch");
+	check(rgfxDisplayPixelsPerInch(240) == 220, "a screen at 2x: 220 ppi", "pitch");
+	check(rgfxDisplayPixelsPerInch(252) == 231, "KDE's 2.1x: 231 ppi", "pitch");
+	check(rgfxDisplayPixelsPerInch(150) == 138, "1.25x: 137.5 ppi rounds up", "pitch");
+	check(!rgfxDisplayHighDensity(0) && !rgfxDisplayHighDensity(120), "1x is not high-density",
+	      "pitch");
+	check(rgfxDisplayHighDensity(150) && rgfxDisplayHighDensity(240), "above 1x is", "pitch");
+	for (uint32_t scale : {0u, 120u, 150u, 180u, 240u, 252u, 360u}) {
+		const uint32_t ppi = rgfxDisplayPixelsPerInch(scale);
+		for (uint32_t width : {1024u, 1280u, 1920u, 2560u, 2880u, 3840u, 5120u, 7680u, 16384u}) {
+			const uint32_t mm = rgfxDisplayMillimetres(width, scale);
+			// The size, rounded to the millimetre, is the width at the pitch: within half a
+			// millimetre.
+			const long twice = static_cast<long>(width) * 254 * 2 / ppi - static_cast<long>(mm) * 20;
+			check(twice >= -10 && twice <= 10, "the published size is the width at the pitch",
+			      "pitch");
+		}
 	}
 }
 

@@ -833,12 +833,14 @@ void ReimsGraphics::answer(UInt64 seqno, UInt32 status)
 	IOLockUnlock(stateLock);
 }
 
-// Takes the display's modes from a DISPLAYS answer. The driver's display is
-// the first listed when it starts, and the display of that id after; a list
-// without it leaves the display disconnected with its modes. Modes the
-// scanout space cannot hold are left out. A list that changes the modes makes
-// the next server connection drop the mode configuration the last one left
-// (newUserClient). Returns the answer's status.
+// Takes the display's modes from a DISPLAYS answer, and where the host took
+// DISPLAY_SCALE its screen's scale, the record after the display's. The
+// driver's display is the first listed when it starts, and the display of
+// that id after; a list without it leaves the display disconnected with its
+// modes. Modes the scanout space cannot hold are left out. A list that
+// changes the modes or the scale makes the next server connection drop the
+// mode configuration the last one left (newUserClient), and on arm64 the
+// display published again, its density with it. Returns the answer's status.
 UInt32 ReimsGraphics::parseDisplays(const volatile UInt8 *payload, UInt32 size)
 {
 	if (size < sizeof(uint32_t))
@@ -849,15 +851,16 @@ UInt32 ReimsGraphics::parseDisplays(const volatile UInt8 *payload, UInt32 size)
 
 	IOLockLock(stateLock);
 	bool found = false;
-	UInt32 id = 0, isConnected = 0, preferred = 0, listed = 0, listAt = 0;
+	UInt32 id = 0, isConnected = 0, preferred = 0, listed = 0, listAt = 0, scale = 0;
+	const UInt32 scaleBytes = displayScaleTaken ? sizeof(RgfxDisplayScale) : 0;
 	for (UInt32 i = 0; i < count; i++) {
-		if (size - offset < sizeof(RgfxDisplayEntry)) {
+		if (size - offset < sizeof(RgfxDisplayEntry) + scaleBytes) {
 			IOLockUnlock(stateLock);
 			return kStatusUnreadable;
 		}
 		UInt32 did = field32(payload, offset);
 		UInt32 n = field32(payload, offset + 12);
-		UInt32 at = offset + sizeof(RgfxDisplayEntry);
+		UInt32 at = offset + sizeof(RgfxDisplayEntry) + scaleBytes;
 		if (static_cast<UInt64>(n) * sizeof(RgfxModeEntry) > size - at) {
 			IOLockUnlock(stateLock);
 			return kStatusUnreadable;
@@ -869,6 +872,8 @@ UInt32 ReimsGraphics::parseDisplays(const volatile UInt8 *payload, UInt32 size)
 			preferred = field32(payload, offset + 8);
 			listed = n;
 			listAt = at;
+			if (scaleBytes)
+				scale = field32(payload, offset + sizeof(RgfxDisplayEntry));
 		}
 		offset = at + n * sizeof(RgfxModeEntry);
 	}
@@ -897,7 +902,9 @@ UInt32 ReimsGraphics::parseDisplays(const volatile UInt8 *payload, UInt32 size)
 	haveDisplay = true;
 	displayId = id;
 	connected = isConnected != 0;
-	const bool changed = modeSet.take(fresh, freshCount, freshPreferred);
+	const bool rescaled = scale != displayScale;
+	displayScale = scale;
+	const bool changed = modeSet.take(fresh, freshCount, freshPreferred) || rescaled;
 	if (changed)
 		modeConfig.listChanged();
 #if defined(__arm64e__)
@@ -930,26 +937,29 @@ void ReimsGraphics::imageSize(const Mode &m, UInt16 *width, UInt16 *height) cons
 {
 	// The EDID's size, from the preferred mode.
 	Mode native = nativeMode(m);
-	*width = static_cast<UInt16>(rgfxDisplayMillimetres(native.width, native.width));
-	*height = static_cast<UInt16>(rgfxDisplayMillimetres(native.height, native.width));
+	*width = static_cast<UInt16>(rgfxDisplayMillimetres(native.width, displayScale));
+	*height = static_cast<UInt16>(rgfxDisplayMillimetres(native.height, displayScale));
 }
 
-// A mode's information flags: valid and safe; the preferred mode is the default and the
-// display's native one; and a mode RgfxMode::hiDpi takes is valid for HiDPI
-// (kDisplayModeValidForHiResFlag). WindowServer then lists the mode at half its points each
-// way as well, drawn at all its pixels, and without the flag it lists no HiDPI mode at all.
-// Measured on the x86-64 guest, macOS 26.7.2: a native 3840x2160 started HiDPI, looking like
-// 1920x1080; a native 3200x1800 started at 1x and offered 1600x900 HiDPI, which kept to the
-// next boot once chosen. A mode whose pixels do not halve exactly has no HiDPI one; the host
-// offers this framebuffer even modes, since with a native 3841x2161 the guest never brought
-// its display up, with the flag or without it (CoreGraphics listed no mode, and the
-// framebuffer's mode was set again every 10 seconds).
-UInt32 ReimsGraphics::modeFlags(const Mode &m, bool preferred)
+// A mode's information flags: valid and safe; the preferred mode is the default and the display's
+// native one; and a mode RgfxMode::hiDpi takes on the display's host screen, `scale120ths`, is
+// valid for HiDPI (kDisplayModeValidForHiResFlag). WindowServer then lists the mode at half its
+// points each way as well, drawn at all its pixels. Measured on the x86-64 guest, macOS 26.7.2: a
+// native 3840x2160 started HiDPI, looking like 1920x1080; a native 3200x1800 started at 1x and
+// offered 1600x900 HiDPI, which kept to the next boot once chosen. The EDID's density does not move
+// that choice: with every mode at 330 pixels per inch, natives from 2400 to 3648 pixels wide still
+// started at 1x, and 3840 HiDPI. On a host screen at 1x no mode has the flag, and the guest still
+// started HiDPI on a native 3888x2122, so from 3840 pixels wide it starts HiDPI whatever the flag
+// and the density. A mode whose pixels do not halve exactly has no HiDPI one; the host offers this
+// framebuffer even modes, since with a native 3841x2161 the guest never brought its display up,
+// with the flag or without it (CoreGraphics listed no mode, and the framebuffer's mode was set
+// again every 10 seconds).
+UInt32 ReimsGraphics::modeFlags(const Mode &m, bool preferred, UInt32 scale120ths)
 {
 	UInt32 flags = kDisplayModeValidFlag | kDisplayModeSafeFlag;
 	if (preferred)
 		flags |= kDisplayModeDefaultFlag | kDisplayModeNativeFlag;
-	if (m.hiDpi())
+	if (m.hiDpi(scale120ths))
 		flags |= kDisplayModeValidForHiResFlag;
 	return flags;
 }
@@ -1173,6 +1183,8 @@ bool ReimsGraphics::start(IOService *provider)
 	taken = false;
 	submitRoom = false;
 	displayColorTaken = false;
+	displayScaleTaken = false;
+	displayScale = 0;
 	hostTime = false;
 	roomStats = {};
 	roomRecords = 0;
@@ -1299,6 +1311,7 @@ bool ReimsGraphics::start(IOService *provider)
 		setProperty("RgfxFeaturesTaken", took, 64);
 		submitRoom = (took & RGFX_FEATURE_SUBMIT_ROOM) != 0;
 		displayColorTaken = (took & RGFX_FEATURE_DISPLAY_COLOR) != 0;
+		displayScaleTaken = (took & RGFX_FEATURE_DISPLAY_SCALE) != 0;
 		hostTime = (took & RGFX_FEATURE_HOST_TIME) != 0;
 	}
 	produced = load64(ring(RGFX_CONTROL_SUBMIT_OFFSET) + kRingProducer);
@@ -1670,6 +1683,7 @@ IOReturn ReimsGraphics::getInformationForDisplayMode(IODisplayModeID displayMode
 	IOLockLock(stateLock);
 	bool ok = modeSet.modeFor(displayMode, &m);
 	bool preferred = ok && modeSet.isPreferred(m);
+	const UInt32 scale = displayScale;
 	UInt16 mmWide = 0, mmHigh = 0;
 	if (ok)
 		imageSize(m, &mmWide, &mmHigh);
@@ -1685,7 +1699,7 @@ IOReturn ReimsGraphics::getInformationForDisplayMode(IODisplayModeID displayMode
 	info->nominalHeight = m.height;
 	info->refreshRate = static_cast<IOFixed1616>((static_cast<UInt64>(m.refreshMhz) << 16) / 1000);
 	info->maxDepthIndex = 0;
-	info->flags = modeFlags(m, preferred);
+	info->flags = modeFlags(m, preferred, scale);
 	info->imageWidth = mmWide;
 	info->imageHeight = mmHigh;
 	return kIOReturnSuccess;
@@ -1843,12 +1857,13 @@ IOReturn ReimsGraphics::connectFlags(IOIndex connectIndex, IODisplayModeID displ
 	IOLockLock(stateLock);
 	bool ok = modeSet.modeFor(displayMode, &m);
 	bool preferred = ok && modeSet.isPreferred(m);
+	const UInt32 scale = displayScale;
 	IOLockUnlock(stateLock);
 	IOReturn r = kIOReturnUnsupported;
 	if (connectIndex != 0 || !flags)
 		r = kIOReturnBadArgument;
 	else if (ok) {
-		*flags = modeFlags(m, preferred) & kDisplayModeSafetyFlags;
+		*flags = modeFlags(m, preferred, scale) & kDisplayModeSafetyFlags;
 		r = kIOReturnSuccess;
 	}
 	FBTRACE(48, "connectFlags conn %d mode %d -> 0x%x flags 0x%x", static_cast<int>(connectIndex),
@@ -1882,6 +1897,7 @@ IOReturn ReimsGraphics::validateDetailedTiming(void *description, IOByteCount de
 	bool ok = !scaled && !(t->signalConfig & kIOInterlacedCEATiming) &&
 	          modeSet.deviceMode(t->horizontalActive, t->verticalActive, refresh, &host);
 	bool preferred = ok && host.id == modeSet.preferredId;
+	const UInt32 scale = displayScale;
 	UInt16 mmWide = 0, mmHigh = 0;
 	if (ok)
 		imageSize(host, &mmWide, &mmHigh);
@@ -1898,7 +1914,7 @@ IOReturn ReimsGraphics::validateDetailedTiming(void *description, IOByteCount de
 		info.nominalHeight = t->verticalActive;
 		info.refreshRate = static_cast<IOFixed1616>((static_cast<UInt64>(refresh) << 16) / 1000);
 		info.maxDepthIndex = 0;
-		info.flags = modeFlags(host, preferred);
+		info.flags = modeFlags(host, preferred, scale);
 		info.imageWidth = mmWide;
 		info.imageHeight = mmHigh;
 	}
@@ -2141,8 +2157,8 @@ bool ReimsGraphics::makeEdid(UInt32 index, UInt8 *b) const
 	b[18] = 1;    // EDID 1.4
 	b[19] = 4;
 	b[20] = 0xa5; // digital, 8 bits a component, DisplayPort
-	b[21] = static_cast<UInt8>((rgfxDisplayMillimetres(native.width, native.width) + 5) / 10);
-	b[22] = static_cast<UInt8>((rgfxDisplayMillimetres(native.height, native.width) + 5) / 10);
+	b[21] = static_cast<UInt8>((rgfxDisplayMillimetres(native.width, displayScale) + 5) / 10);
+	b[22] = static_cast<UInt8>((rgfxDisplayMillimetres(native.height, displayScale) + 5) / 10);
 	b[23] = 120;  // gamma 2.2
 	b[24] = 0x04; // RGB 4:4:4, sRGB the default colour space
 

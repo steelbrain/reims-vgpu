@@ -185,19 +185,24 @@ void idsStayWithTheirModes()
 	check(m.modes[1].id == window, "the mode set's mode takes back its ID");
 }
 
-// HiDPI is for modes at least 2880 pixels wide whose pixels halve exactly: the window's on a
-// host screen at twice its points, and never one of an odd size, which WindowServer would run
+// The HiDPI flag is for the modes of a display on a host screen above 1x whose pixels halve
+// exactly, at any width: the window's on a screen at twice its points keeps it as it shrinks, one
+// on a screen at 1x never has it, and one of an odd size never does, which WindowServer would run
 // at half pixels.
 void hiDpiModesHalveExactly()
 {
-	check(RgfxMode{0, 2880, 1800, 60000}.hiDpi(), "2880x1800");
-	check(RgfxMode{0, 3840, 2160, 60000}.hiDpi(), "3840x2160");
-	check(kWindow.hiDpi(), "the window's 3840x2400");
-	check(!RgfxMode{0, 2878, 1800, 60000}.hiDpi(), "not below 2880 pixels wide");
-	check(!kOffered.hiDpi(), "not the 1920x1080 offered before the window draws");
-	check(!RgfxMode{0, 3841, 2161, 60000}.hiDpi(), "not an odd width and height");
-	check(!RgfxMode{0, 3662, 2039, 60000}.hiDpi(), "not an odd height");
-	check(!RgfxMode{0, 3663, 2040, 60000}.hiDpi(), "not an odd width");
+	constexpr uint32_t k1x = 120, k2x = 240, kKde = 252;
+	check(RgfxMode{0, 2880, 1800, 60000}.hiDpi(k2x), "2880x1800 at 2x");
+	check(RgfxMode{0, 3840, 2160, 60000}.hiDpi(k2x), "3840x2160 at 2x");
+	check(kWindow.hiDpi(kKde), "the window's 3840x2400 at 2.1x");
+	check(RgfxMode{0, 2878, 1800, 60000}.hiDpi(k2x), "below 2880 pixels wide at 2x");
+	check(RgfxMode{0, 2720, 1536, 60000}.hiDpi(kKde), "2720x1536 at 2.1x");
+	check(!RgfxMode{0, 3840, 2160, 60000}.hiDpi(k1x), "not 3840x2160 at 1x");
+	check(!kWindow.hiDpi(0), "not with no scale from the host");
+	check(!kOffered.hiDpi(0), "not the 1920x1080 offered before the window draws");
+	check(!RgfxMode{0, 3841, 2161, 60000}.hiDpi(k2x), "not an odd width and height");
+	check(!RgfxMode{0, 3662, 2039, 60000}.hiDpi(k2x), "not an odd height");
+	check(!RgfxMode{0, 3663, 2040, 60000}.hiDpi(k2x), "not an odd width");
 }
 
 // A mode or depth the framebuffer does not hold is answered as Apple's paravirtual framebuffer

@@ -30,19 +30,30 @@ constexpr uint32_t rgfxDisplaySerial(uint32_t displayId)
 	return (static_cast<uint32_t>(kRgfxDisplayProduct) << 16) | ((displayId + 1) & 0xffff);
 }
 
-// The pixels per inch of a display whose native mode is `width` pixels wide: 220 for a native mode
-// at least 2880 pixels wide, as a high-density panel, and 110 otherwise.
-constexpr uint32_t rgfxDisplayPixelsPerInch(uint32_t width)
+// The pixels per inch of a display shown on a host screen of `scale120ths` pixels a point, in
+// 120ths (the device's RgfxDisplayScale): 110 a point, as a Mac's 1x display has, so 110 on a
+// screen at 1x, 220 on one at 2x and 231 at 2.1, rounded to nearest; 110 where the host gives no
+// scale (0: no screen shows the display yet, or a host without DISPLAY_SCALE).
+constexpr uint32_t kRgfxDisplayPointsPerInch = 110;
+constexpr uint32_t rgfxDisplayPixelsPerInch(uint32_t scale120ths)
 {
-	return width >= 2880 ? 220 : 110;
+	return scale120ths ? (kRgfxDisplayPointsPerInch * scale120ths + 60) / 120
+	                   : kRgfxDisplayPointsPerInch;
 }
 
-// The size, in millimetres, of `pixels` of a display whose native mode is `width` pixels wide, at
-// its pixels per inch.
-constexpr uint32_t rgfxDisplayMillimetres(uint32_t pixels, uint32_t width)
+// Whether a display on a host screen of `scale120ths` is high-density: its pixels per inch above
+// a point's, so the OS may run it HiDPI.
+constexpr bool rgfxDisplayHighDensity(uint32_t scale120ths)
 {
-	return (pixels * 254 + rgfxDisplayPixelsPerInch(width) * 5) /
-	       (rgfxDisplayPixelsPerInch(width) * 10);
+	return rgfxDisplayPixelsPerInch(scale120ths) > kRgfxDisplayPointsPerInch;
+}
+
+// The size, in millimetres, of `pixels` of a display on a host screen of `scale120ths`, at its
+// pixels per inch, rounded to nearest.
+constexpr uint32_t rgfxDisplayMillimetres(uint32_t pixels, uint32_t scale120ths)
+{
+	return (pixels * 254 + rgfxDisplayPixelsPerInch(scale120ths) * 5) /
+	       (rgfxDisplayPixelsPerInch(scale120ths) * 10);
 }
 
 // sRGB's primaries and D65 white, the display's colours, in thousandths of CIE 1931 x and y.

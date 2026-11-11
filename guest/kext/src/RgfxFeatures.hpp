@@ -90,6 +90,11 @@
 //    DRIVER_FEATURES_HI with it where offered (rgfxDriverFeaturesFirst), reads the offer again,
 //    and then writes both halves from that offer. The x86-64 kext never takes it, and reads the
 //    offer once, as before the bit.
+//  - DISPLAY_SCALE (bit 35): the device's DISPLAYS answer carries, after each display's record,
+//    the scale of the host screen that shows it (RgfxDisplayScale), which the framebuffer gives
+//    the OS as the display's density (RgfxDisplayIdentity.hpp: the x86-64 framebuffer's EDID and
+//    HiDPI modes, the arm64e framebuffer's DisplayAttributes and dot pitch), which needs nothing
+//    of the bundle.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -125,7 +130,8 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_MESH_PIPELINES | RGFX_FEATURE_SHARED_EVENT_NAMES | RGFX_FEATURE_OPENCL_MODE |
     RGFX_FEATURE_PRIVATE_RENDER_STATE | RGFX_FEATURE_SURFACE_CACHE_REFUSED |
     RGFX_FEATURE_SURFACE_DEFERRED_ASK | RGFX_FEATURE_SURFACE_DEFERRED_CARRY |
-    RGFX_FEATURE_SCHEDULED_ASK | (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K : 0);
+    RGFX_FEATURE_SCHEDULED_ASK | RGFX_FEATURE_DISPLAY_SCALE |
+    (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K : 0);
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
 inline uint64_t rgfxDriverFeatures(uint64_t offered)

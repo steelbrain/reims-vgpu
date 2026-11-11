@@ -25,6 +25,8 @@
 
 #include <stdint.h>
 
+#include "RgfxDisplayIdentity.hpp"
+
 // A display mode: its ID, pixels each way and refresh rate in thousandths of a hertz.
 struct RgfxMode {
 	int32_t id;
@@ -33,9 +35,13 @@ struct RgfxMode {
 	uint32_t refreshMhz;
 
 	// Whether WindowServer may run the mode HiDPI, at half its points each way
-	// (kDisplayModeValidForHiResFlag, ReimsGraphics::modeFlags): a mode at least 2880 pixels
-	// wide, which the EDID gives at 220 pixels per inch, whose pixels halve exactly.
-	bool hiDpi() const { return width >= 2880 && width % 2 == 0 && height % 2 == 0; }
+	// (kDisplayModeValidForHiResFlag, ReimsGraphics::modeFlags), on a host screen of
+	// `scale120ths` (RgfxDisplayScale): a mode of a high-density display, which the EDID gives
+	// at the screen's pixels per inch (RgfxDisplayIdentity.hpp), whose pixels halve exactly.
+	bool hiDpi(uint32_t scale120ths) const
+	{
+		return rgfxDisplayHighDensity(scale120ths) && width % 2 == 0 && height % 2 == 0;
+	}
 };
 
 template <typename Timing, uint32_t Max> struct RgfxDisplayModes {

@@ -370,7 +370,7 @@ private:
 	// The physical size of a mode's display, in millimetres, as the EDID gives it.
 	void imageSize(const Mode &mode, UInt16 *width, UInt16 *height) const;
 	// The IODisplayModeInformation flags of a mode, the preferred one or not.
-	static UInt32 modeFlags(const Mode &mode, bool preferred);
+	static UInt32 modeFlags(const Mode &mode, bool preferred, UInt32 scale120ths);
 
 	// One of IOFramebuffer's interrupt registrations.
 	struct Interrupt {
@@ -493,6 +493,9 @@ private:
 	bool submitRoom;
 	// The host took DISPLAY_COLOR (displayColor), set before `ready`.
 	bool displayColorTaken;
+	// The host took DISPLAY_SCALE: its DISPLAYS answers carry each display's scale
+	// (parseDisplays), set before `ready`.
+	bool displayScaleTaken;
 	// The host took HOST_TIME: each VBLANK reads the host's clock for the refreshes' times
 	// (vblankClock), set before `ready`.
 	bool hostTime;
@@ -518,6 +521,9 @@ private:
 	bool haveDisplay;
 	UInt32 displayId;
 	bool connected;
+	// The scale of the host screen that shows the display, in 120ths (RgfxDisplayScale): 0 where
+	// the host gives none.
+	UInt32 displayScale;
 	Modes modeSet;
 	RgfxModeConfig modeConfig;
 	UInt32 reportedCount;
