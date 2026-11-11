@@ -77,7 +77,7 @@
 //!   shadow, which each command buffer copies in before its use and back after its write).
 //!   Where the kext gives the surface's layout (its ask, or on a GPU of its own memory the cached
 //!   or deferred block's own `SURFACE_PAGES`), the platform places the surface's first plane's
-//!   first byte on a multiple of 256 bytes of the cache's memory ([`aligned_byte`],
+//!   first byte where its textures over the cache's memory may start in place ([`aligned_byte`],
 //!   [`CacheLayout`]), whichever way the cache is made, its exportable one among them: CoreVideo
 //!   lays a frame's planes 32 bytes into their surface, off every linear image's alignment
 //!   measured, and the textures over a decoder's planes are then images of the cache's memory,
@@ -766,8 +766,8 @@ pub(crate) struct CacheCounts {
     /// ([`CacheMaker::make`]), and those the platform made none for, made as before.
     pub(crate) dma_buf: u64,
     pub(crate) no_dma_buf: u64,
-    /// Caches made with their surface's first plane on a multiple of 256 bytes of their memory
-    /// ([`CacheMaker::make`]).
+    /// Caches made with their surface's first plane's byte placed for textures in place
+    /// ([`CacheMaker::make`], [`aligned_byte`]).
     pub(crate) aligned: u64,
 }
 
@@ -2903,9 +2903,9 @@ impl CacheMaker {
     /// (the kext's ask gave the surface's planes, so the cache's copies into the pages take its
     /// texels alone: [`SurfaceCache::texels`]), one that declares the bytes between a
     /// texture's rows unobserved, which a texture over the cache whose rows lie with bytes
-    /// between them may hold and change in place, with its byte `aligned` on a multiple of 256
-    /// bytes of its memory where given ([`aligned_byte`]), so that textures over its surface's
-    /// planes lie in it rather than in copies of their own
+    /// between them may hold and change in place, with its byte `aligned` placed where the
+    /// platform's textures over its memory may start in place where given ([`aligned_byte`]), so
+    /// that textures over its surface's planes lie in it rather than in copies of their own
     /// ([`GpuDevice::new_buffer_of_length_padding_unobserved`]); else as any other buffer, its
     /// byte `aligned` placed alike where given and nothing else declared
     /// ([`GpuDevice::new_buffer_of_length_aligned`]). An exportable cache places its byte
@@ -4052,8 +4052,8 @@ pub(crate) enum CacheLayout {
     Unknown,
     /// The surface's first plane's first byte ([`aligned_byte`]), from the layout a cached or
     /// deferred block's own `SURFACE_PAGES` carries on a device that asks nothing (its GPU keeps
-    /// its own memory): the cache places that byte on a multiple of 256 bytes of its memory, and
-    /// its copies into the pages still move the surface's bytes whole.
+    /// its own memory): the cache places that byte where the platform's textures over its memory
+    /// may start in place, and its copies into the pages still move the surface's bytes whole.
     FirstPlaneAt(u64),
     /// The planes the kext's ask gave (on a GPU that shares the CPU's memory): the cache places
     /// its first plane's byte as [`Self::FirstPlaneAt`] does, and its copies into the pages take
@@ -4062,7 +4062,7 @@ pub(crate) enum CacheLayout {
 }
 
 impl CacheLayout {
-    /// The byte the cache places on a multiple of 256 bytes of its memory, where it places one.
+    /// The byte the cache places for textures in place ([`aligned_byte`]), where it places one.
     fn aligned_byte(&self) -> Option<u64> {
         match self {
             CacheLayout::Unknown => None,
@@ -4103,19 +4103,20 @@ pub(crate) fn texel_spans(planes: &[PagesPlane]) -> Vec<Range<u64>> {
     spans
 }
 
-/// The byte of a cache of a surface laid out as `planes` to lay on a multiple of 256 bytes of its
-/// memory: its first plane's first byte, where that is off such a multiple (CoreVideo lays a
-/// frame's planes 32 bytes into their surface), for a texture over the plane, and over each plane
-/// that follows it a multiple of 256 bytes on, to lie in the cache's memory rather than in a copy
-/// of its own; `None` where the plane starts on one, or the surface has no plane.
+/// The byte of a cache of a surface laid out as `planes` that the platform places where its
+/// textures over the cache's memory may start in place: its first plane's first byte, where that
+/// is past the surface's first (CoreVideo lays a frame's planes 32 bytes into their surface), for
+/// a texture over the plane, and over each plane that follows it a multiple of the platform's
+/// boundary on, to lie in the cache's memory rather than in a copy of its own; `None` where the
+/// plane starts at the surface's first byte, which lies on the boundary in any buffer, or the
+/// surface has no plane. The platform decides the boundary: on the Vulkan platform the runtime's
+/// (`BufferDescriptor::with_aligned_byte`), a multiple of 256 bytes, the largest linear image's
+/// alignment measured (RADV's 256 on an RX 550; 128 on an RTX 5080 Laptop GPU, whose 4K NV12
+/// plane textures over its caches 32 bytes in were the runtime's shadows).
 pub(crate) fn aligned_byte(planes: &[PagesPlane]) -> Option<u64> {
     let first = planes.first()?.offset;
-    (!first.is_multiple_of(ALIGNED_BYTE_MULTIPLE)).then_some(first)
+    (first != 0).then_some(first)
 }
-
-/// The multiple of bytes of a buffer's memory [`aligned_byte`] lays a byte on: the runtime's
-/// (`BufferDescriptor::with_aligned_byte`).
-const ALIGNED_BYTE_MULTIPLE: u64 = 256;
 
 /// The runs of `runs`, host addresses of a surface's bytes in its order, that its bytes `spans`
 /// lie in, cut to them, each with its first byte of the surface: in one pass, `spans` ascending
@@ -6714,13 +6715,14 @@ mod tests {
         );
     }
 
-    /// A cache made for a block that asked with its surface's layout lays the first plane's first
-    /// byte on a multiple of 256 bytes of its memory where the plane starts off one, as CoreVideo's
-    /// planes start 32 bytes into their surface, so textures over the planes lie in the cache
-    /// rather than in copies of their own; a surface whose first plane starts on one, and a cache
-    /// made with no layout, are made as any other buffer
+    /// A cache made for a block that asked with its surface's layout has the platform place its
+    /// first plane's first byte where its textures may start in place, where the plane starts
+    /// past the surface's first byte, as CoreVideo's planes start 32 bytes into their surface (or
+    /// 256 bytes in, which the platform places alike), so textures over the planes lie in the
+    /// cache rather than in copies of their own; a cache made with no layout is made as any other
+    /// buffer
     #[test]
-    fn a_cache_lays_its_first_plane_on_256_bytes() {
+    fn an_asked_cache_places_its_first_planes_byte() {
         use reims_vgpu_graphics::wire::{
             RGFX_STATUS_CACHE, RgfxSurfacePagesLayout, RgfxSurfacePlaneLayout,
         };
@@ -6782,8 +6784,8 @@ mod tests {
         assert_eq!(sel, PADDING_UNOBSERVED_BUFFER, "a laid-out cache");
         assert_eq!(
             args.get(2),
-            Some(&Arg::U64(0)),
-            "a plane on 256 bytes: no aligned byte"
+            Some(&Arg::U64(0x100)),
+            "a plane 256 bytes in: the platform's to place"
         );
         let (sel, args) = made(&mut r, BLOCK + 0x20000, 9, None);
         assert_eq!(
@@ -6791,17 +6793,17 @@ mod tests {
             (NEW_BUFFER, 2),
             "no layout: as any other buffer"
         );
-        assert_eq!(r.dec.caches().counts().aligned, 1);
+        assert_eq!(r.dec.caches().counts().aligned, 2);
     }
 
     /// A cached block's own `SURFACE_PAGES` that carries its surface's layout, on a device that
     /// asks nothing (its GPU keeps its own memory), places the block's cache by it alone: the
-    /// cache's buffer has its first plane's byte placed on a multiple of 256 bytes of its memory
-    /// where the plane starts off one (CoreVideo's 32 bytes in), with nothing else declared, and
-    /// its copies still move the surface's bytes whole, a fill and a download copying every byte;
-    /// a deferred block's message places its cache alike. A first plane at the surface's first
-    /// byte, a layout that does not lie in the surface's bytes, and a message with none place
-    /// nothing, and every one is answered as with none
+    /// cache's buffer has its first plane's byte placed where the platform's textures may start
+    /// in place, where the plane starts past the surface's first byte (CoreVideo's 32), with
+    /// nothing else declared, and its copies still move the surface's bytes whole, a fill and a
+    /// download copying every byte; a deferred block's message places its cache alike. A first
+    /// plane at the surface's first byte, a layout that does not lie in the surface's bytes, and
+    /// a message with none place nothing, and every one is answered as with none
     #[test]
     fn a_cached_blocks_layout_places_its_cache_alone() {
         use reims_vgpu_graphics::wire::{RgfxSurfacePagesLayout, RgfxSurfacePlaneLayout};

@@ -43,12 +43,13 @@ the device info (`GraphicsDevice::with_platform`, in `graphics.rs`):
   The guest's video driver then asks its output surfaces cached
   (`guest/bundle/src/RgfxMetalDevice+Video.mm`), with their layout, as for any other surface,
   and on a GPU that shares the CPU's memory the device keeps a cache of those it answers so;
-  elsewhere it asks them uncached. A cache made for a surface whose first plane starts off a
-  multiple of 256 bytes, as CoreVideo's 32 bytes into their surface, lays that byte on a multiple
-  of 256 bytes of its memory (`BufferDescriptor::with_aligned_byte`), so textures over the planes
-  lie in the cache rather than in the runtime's shadows (`surface_cache::aligned_byte`): from the
-  layout the kext's ask gives, or on a GPU of its own memory the layout a cached or deferred
-  block's `SURFACE_PAGES` carries, the exportable caches NVDEC lands its pictures in among them.
+  elsewhere it asks them uncached. A cache made for a surface whose first plane starts past its
+  first byte, as CoreVideo's 32 bytes into their surface, has the platform place that byte where
+  its textures over the cache's memory may start in place (on the Vulkan platform a multiple of
+  256 bytes, `BufferDescriptor::with_aligned_byte`), so textures over the planes lie in the cache
+  rather than in the runtime's shadows (`surface_cache::aligned_byte`): from the layout the
+  kext's ask gives, or on a GPU of its own memory the layout a cached or deferred block's
+  `SURFACE_PAGES` carries, the exportable caches NVDEC lands its pictures in among them.
 - **The layouts**: an `RgfxVideoOutputLayout` per entry, which says how a surface is laid out
   to take a picture's whole coded rows and columns in place. An arm that lands every picture by
   a copy of its crop answers zero, and every entry's is zero where the flag is set, since a
