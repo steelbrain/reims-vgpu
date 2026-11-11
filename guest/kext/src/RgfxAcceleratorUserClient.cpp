@@ -270,13 +270,17 @@ IOReturn RgfxAcceleratorUserClient::externalMethod(uint32_t selector,
 IOExternalMethod *RgfxAcceleratorUserClient::getTargetAndMethodForIndex(IOService **targetP,
                                                                         UInt32 index)
 {
-	IOLog("RGFX: getTargetAndMethodForIndex index=%u\n", index);
+	static char site; // once a boot per index
+	if (rgfxFirstCalls(&site, index, 1))
+		IOLog("RGFX: getTargetAndMethodForIndex index=%u\n", index);
 	return super::getTargetAndMethodForIndex(targetP, index);
 }
 
 IOExternalTrap *RgfxAcceleratorUserClient::getTargetAndTrapForIndex(IOService **targetP,
                                                                     UInt32 index)
 {
-	IOLog("RGFX: getTargetAndTrapForIndex index=%u\n", index);
+	static char site; // once a boot per index
+	if (rgfxFirstCalls(&site, index, 1))
+		IOLog("RGFX: getTargetAndTrapForIndex index=%u\n", index);
 	return super::getTargetAndTrapForIndex(targetP, index);
 }

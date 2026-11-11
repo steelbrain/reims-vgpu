@@ -1,8 +1,9 @@
-// RgfxSwapRate: what an arm64 display's swaps did over each second they ran, for one log line a
-// second while swaps happen and none while the display is idle: the swaps begun, completed and
-// dropped, those with no present, the distinct layer-0 surfaces shown with their counts, and the
-// swaps with a layer-1 surface, which is not shown. It tells a log reader the swap rate while an
-// app runs and whether the app's own surface reaches a swap. Header-only and free of the
+// RgfxSwapRate: what an arm64 display's swaps did over each window they ran (the caller's
+// length, a minute), for one log line a window while swaps happen and none while the display is
+// idle: the swaps begun, completed and dropped, those with no present, the distinct layer-0
+// surfaces shown with their counts, and the swaps with a layer-1 surface, which is not shown. It
+// tells a log reader the swap rate while an app runs and whether the app's own surface reaches a
+// swap. Header-only and free of the
 // kernel's headers, so its native test (tests/swap_rate_test.cpp) builds it as the kext does.
 // The caller holds the display's gate around every call.
 //
@@ -66,9 +67,9 @@ struct RgfxSwapRate {
 		touch(now);
 		dropped++;
 	}
-	// Whether the window is a second old or more at `now`, a second being `second` ticks: its
-	// line is then due, and the caller logs it and clears the window.
-	bool due(uint64_t now, uint64_t second) const { return start && now - start >= second; }
+	// Whether the window is `length` ticks old or more at `now`: its line is then due, and the
+	// caller logs it and clears the window.
+	bool due(uint64_t now, uint64_t length) const { return start && now - start >= length; }
 	void clear() { *this = RgfxSwapRate(); }
 };
 

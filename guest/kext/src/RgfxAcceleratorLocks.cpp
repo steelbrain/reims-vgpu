@@ -73,6 +73,7 @@
 #include "RgfxIOSurfaceKPI.hpp"
 #include "RgfxSurfaceCaches.hpp"
 #include "RgfxSurfaceLocks.hpp"
+#include "RgfxTrace.hpp"
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
@@ -101,10 +102,10 @@ constexpr UInt32 kMaxCached = kRgfxCachedMaxSurfaces;
 // How many device caches made are logged, with what IOSurface answered, and how many writes
 // named of surfaces the kext cannot follow.
 constexpr UInt32 kCachesLogged = 4;
-constexpr UInt32 kSkipsLogged = 8;
-// How many surfaces left uncached for want of room are logged one by one; the dormancy line
-// counts them all.
-constexpr UInt32 kNoRoomLogged = 4;
+constexpr UInt32 kSkipsLogged = 1;
+// How many surfaces left uncached for want of room are logged one by one: one a boot, as for
+// every degradation (docs/conventions.md); the dormancy line counts them all.
+constexpr UInt32 kNoRoomLogged = 1;
 
 // One initialised object (it lands in __DATA,__data, as the contexts' state does), made at the
 // first write named and kept for the kernel's life.
@@ -130,7 +131,7 @@ struct LockState {
 	// sleep on `table` for these too.
 	RgfxCacheTable caches;
 	// Under `lock`: surfaces left uncached as the table had no room, the first kNoRoomLogged
-	// logged.
+	// logged one by one.
 	uint64_t noRoom;
 	// Under `lock`: the releases posted unheld (RGFX_BLOCK_RELEASE_UNHELD) whose surface a
 	// process took again before their answer (rgfxCacheRetaken), counted at the answer.
@@ -509,8 +510,10 @@ void surfaceControl(void *accelerator, RgfxDeviceCache *cache, uint32_t op, uint
 		}
 	}
 	IOLockUnlock(state.lock);
-	if (waitedFor) {
-		// How long the lock waited, whatever it waited for.
+	// How long the lock waited, whatever it waited for: once a boot per what it waited for
+	// (docs/conventions.md).
+	static char wentOn;
+	if (waitedFor && rgfxFirstCalls(&wentOn, rgfxKeyOf(waitedFor), 1)) {
 		const uint64_t waitedMs = msSince(start);
 		char name[64] = {};
 		proc_selfname(name, sizeof(name));
@@ -533,24 +536,29 @@ bool rgfxSurfaceLocksAttach(RgfxAccelerator *accel, task_t task, uint32_t surfac
 	if (!startRoot(accel))
 		return false;
 	OSObject *surface = rgfxIOSurfaceRootLookupSurface(state.root, surfaceId, task);
+	// Each refusal below is logged once a boot (docs/conventions.md).
+	static char refused;
 	if (!surface) {
-		IOLog("RgfxAccelerator: IOSurface %u is not the naming process's: its locks wait for no "
-		      "GPU write\n",
-		      surfaceId);
+		if (rgfxFirstCalls(&refused, 0, 1))
+			IOLog("RgfxAccelerator: IOSurface %u is not the naming process's: its locks wait for "
+			      "no GPU write\n",
+			      surfaceId);
 		return false;
 	}
 	if (!isSurface(surface) || !surfaceHolds(surface, phys)) {
-		IOLog("RgfxAccelerator: IOSurface %u is not its shared block's surface: its locks wait "
-		      "for no GPU write\n",
-		      surfaceId);
+		if (rgfxFirstCalls(&refused, 1, 1))
+			IOLog("RgfxAccelerator: IOSurface %u is not its shared block's surface: its locks "
+			      "wait for no GPU write\n",
+			      surfaceId);
 		surface->release();
 		return false;
 	}
 	RgfxDeviceCache *cache = rgfxIOSurfaceDeviceCache(surface, accel, state.acceleratorId, 0);
 	if (!cache) {
-		IOLog("RgfxAccelerator: IOSurface %u gave no device cache: its locks wait for no GPU "
-		      "write\n",
-		      surfaceId);
+		if (rgfxFirstCalls(&refused, 2, 1))
+			IOLog("RgfxAccelerator: IOSurface %u gave no device cache: its locks wait for no "
+			      "GPU write\n",
+			      surfaceId);
 		surface->release();
 		return false;
 	}
@@ -837,10 +845,12 @@ RgfxDeferAnswer rgfxSurfaceLocksDefer(RgfxAccelerator *accel, OSObject *surface,
 	if (!memory || !startLocks())
 		return kRgfxDeferNoCache;
 	RgfxDeviceCache *cache = rgfxIOSurfaceDeviceCache(surface, accel, state.acceleratorId, 0);
+	static char notDeferred;
 	if (!cache) {
-		IOLog("RgfxAccelerator: IOSurface %u gave no device cache: its block is not deferred, "
-		      "nor cached\n",
-		      surfaceId);
+		if (rgfxFirstCalls(&notDeferred, 0, 1))
+			IOLog("RgfxAccelerator: IOSurface %u gave no device cache: its block is not "
+			      "deferred, nor cached\n",
+			      surfaceId);
 		return kRgfxDeferNoCache;
 	}
 	// The surface's memory, retained, not wired: its pages are named only where a lock needs them.
@@ -880,10 +890,11 @@ RgfxDeferAnswer rgfxSurfaceLocksDefer(RgfxAccelerator *accel, OSObject *surface,
 	}
 	IOLockUnlock(state.lock);
 	if (!c) {
-		IOLog("RgfxAccelerator: IOSurface %u: %s: its block is not deferred, nor cached\n",
-		      surfaceId,
-		      previous ? "its previous block is cached still, its release unanswered"
-		               : "no room for its device cache's state");
+		if (rgfxFirstCalls(&notDeferred, previous ? 1 : 2, 1))
+			IOLog("RgfxAccelerator: IOSurface %u: %s: its block is not deferred, nor cached\n",
+			      surfaceId,
+			      previous ? "its previous block is cached still, its release unanswered"
+			               : "no room for its device cache's state");
 		memory->release();
 		reinterpret_cast<OSObject *>(cache)->release();
 		return kRgfxDeferNoCache;
@@ -1024,7 +1035,8 @@ RgfxReleaseAttach rgfxSurfaceCacheReleaseAttach(RgfxAccelerator *accel, UInt64 o
 			if (!named && !hostPages && c != nullptr && attachBackoff(++tries, deadline))
 				continue;
 			did = hostPages ? kRgfxReleaseAttached : kRgfxReleaseUnattached;
-			if (!named && !hostPages)
+			static char unnamed;
+			if (!named && !hostPages && rgfxFirstCalls(&unnamed, 0, 1))
 				IOLog("RGFX: WARN: the release of IOSurface %u's deferred block 0x%llx goes on "
 				      "after %u ms with its pages not named: what the GPU wrote is not copied "
 				      "into them\n",
@@ -1061,9 +1073,11 @@ IOMemoryDescriptor *rgfxSurfaceCacheHostPages(void *cache, UInt64 offset)
 		memory->retain();
 	IOLockUnlock(state.lock);
 	if (memory && memory->prepare(kIODirectionOutIn) != kIOReturnSuccess) {
-		IOLog("RgfxAccelerator: the deferred block 0x%llx's pages could not be wired for its "
-		      "block\n",
-		      offset);
+		static char unwired;
+		if (rgfxFirstCalls(&unwired, 0, 1))
+			IOLog("RgfxAccelerator: the deferred block 0x%llx's pages could not be wired for "
+			      "its block\n",
+			      offset);
 		OSSafeReleaseNULL(memory);
 	}
 	return memory;
@@ -1133,8 +1147,11 @@ bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t sur
 	IOMemoryDescriptor *wire =
 	    OSDynamicCast(IOMemoryDescriptor, rgfxIOSurfaceMemory(static_cast<OSObject *>(surface)));
 	if (!wire || wire->prepare(kIODirectionOutIn) != kIOReturnSuccess) {
-		IOLog("RgfxAccelerator: IOSurface %u: its memory could not be wired: it is not cached\n",
-		      surfaceId);
+		static char unwired;
+		if (rgfxFirstCalls(&unwired, 0, 1))
+			IOLog("RgfxAccelerator: IOSurface %u: its memory could not be wired: it is not "
+			      "cached\n",
+			      surfaceId);
 		return false;
 	}
 	wire->retain();
@@ -1155,8 +1172,10 @@ bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t sur
 	const char *why = nullptr;
 	RgfxCachedSurface *c = nullptr;
 	bool logged = true;
+	static char previousCached;
 	if (rgfxCacheFind(state.caches, key)) {
 		why = "its previous block is cached still, its release unanswered";
+		logged = rgfxFirstCalls(&previousCached, 0, 1);
 	} else if (!(c = rgfxCacheAdd(state.caches, key, offset, surfaceId))) {
 		why = "no room for its device cache's state";
 		logged = ++state.noRoom <= kNoRoomLogged;

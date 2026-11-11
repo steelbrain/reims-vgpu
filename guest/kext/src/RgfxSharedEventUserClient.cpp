@@ -7,6 +7,7 @@
 
 #include "RgfxAccelerator.hpp"
 #include "RgfxAcceleratorUserClient.hpp"
+#include "RgfxTrace.hpp"
 #include "RgfxUserClientABI.hpp"
 
 #include <IOKit/IOLib.h>
@@ -216,6 +217,8 @@ void RgfxAccelerator::unnameSharedEvent(UInt64 name)
 	RgfxSharedEventUnname m = rgfxSharedEventUnnameMessage(name);
 	IOReturn r = postLifecycle(RGFX_CMD_SHARED_EVENT_UNNAME, &m, sizeof(m), 0, nullptr, 0, nullptr,
 	                           nullptr, 0);
-	if (r != kIOReturnSuccess)
+	// Once a boot per status (docs/conventions.md).
+	static char site;
+	if (r != kIOReturnSuccess && rgfxFirstCalls(&site, static_cast<UInt32>(r), 1))
 		IOLog("RGFX: shared event name %llu: its unname was not posted (0x%x)\n", name, r);
 }

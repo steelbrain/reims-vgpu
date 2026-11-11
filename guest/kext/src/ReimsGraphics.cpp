@@ -68,8 +68,9 @@ constexpr UInt32 kMaxDimension = kRgfxDisplayMaxDimension;
 // How long a command waits for ring space, and then for its answer.
 constexpr UInt32 kPostTimeoutMs = 5000;
 constexpr UInt32 kAnswerTimeoutMs = 5000;
-// How often the control ring's room line is logged at most, while posts sleep for room.
-constexpr UInt32 kRoomLogMs = 1000;
+// How often the control ring's room line is logged at most, while posts sleep for room: a summary,
+// at most once a minute (docs/conventions.md).
+constexpr UInt32 kRoomLogMs = 60000;
 
 // Answers carry the device's status; a payload the driver cannot read is
 // answered with this one.
@@ -289,7 +290,10 @@ IOReturn ReimsGraphics::post(UInt32 type, const void *message, UInt32 size, UInt
 		if (askForRoom() && tryPost(type, message, size, seqno, waiterSeqno))
 			return kIOReturnSuccess;
 		if (!waitForRoom(mark, deadline)) {
-			IOLog("ReimsGraphics: command %u: the control ring stayed full\n", type);
+			// Once per command type a boot: every post meets a ring that stays full.
+			static char site;
+			if (rgfxFirstCalls(&site, type, 1))
+				IOLog("ReimsGraphics: command %u: the control ring stayed full\n", type);
 			return ready ? kIOReturnTimeout : kIOReturnNotReady;
 		}
 	}
@@ -385,14 +389,19 @@ IOReturn ReimsGraphics::command(UInt32 type, const void *message, UInt32 size)
 	IOLockWakeup(stateLock, controlWaiters, false);
 	IOLockUnlock(stateLock);
 
+	// Once per command type, and status, a boot.
 	if (r == kIOReturnTimeout) {
-		IOLog("ReimsGraphics: command %u (seqno %llu): no answer\n", type, s);
+		static char unanswered;
+		if (rgfxFirstCalls(&unanswered, type, 1))
+			IOLog("ReimsGraphics: command %u (seqno %llu): no answer\n", type, s);
 		return kIOReturnTimeout;
 	}
 	if (r != kIOReturnSuccess)
 		return r;
 	if (status != 0) {
-		IOLog("ReimsGraphics: command %u (seqno %llu): status %u\n", type, s, status);
+		static char refused;
+		if (rgfxFirstCalls(&refused, (static_cast<UInt64>(type) << 32) | status, 1))
+			IOLog("ReimsGraphics: command %u (seqno %llu): status %u\n", type, s, status);
 		return kIOReturnError;
 	}
 	return kIOReturnSuccess;
@@ -453,7 +462,8 @@ IOReturn ReimsGraphics::postLifecycle(UInt32 type, const void *message, UInt32 s
 	w->seqno = 0;
 	IOLockWakeup(stateLock, lifecycleWaiters, false);
 	IOLockUnlock(stateLock);
-	if (r == kIOReturnTimeout)
+	static char unanswered;
+	if (r == kIOReturnTimeout && rgfxFirstCalls(&unanswered, type, 1))
 		IOLog("ReimsGraphics: lifecycle %u (seqno %llu): no answer\n", type, s);
 	if (seqno)
 		*seqno = s;
@@ -601,8 +611,11 @@ bool ReimsGraphics::drainEvents()
 	UInt64 end = load64(header + kRingProducer);
 	bool any = consumed != end;
 	while (consumed != end) {
+		static char outOfRange;
 		if (end - consumed > kRingBytes) {
-			IOLog("ReimsGraphics: the completion ring's producer is out of range; skipping to it\n");
+			if (rgfxFirstCalls(&outOfRange, 0, 1))
+				IOLog("ReimsGraphics: the completion ring's producer is out of range; skipping to "
+				      "it\n");
 			consumed = end;
 			break;
 		}
@@ -622,8 +635,11 @@ bool ReimsGraphics::drainEvents()
 			continue;
 		}
 		if (size < kHeaderBytes || size % kMsgAlign || size > tail || size > end - consumed) {
-			IOLog("ReimsGraphics: malformed event (type %u, size %u); skipping the ring's contents\n",
-			      type, size);
+			static char malformed;
+			if (rgfxFirstCalls(&malformed, type, 1))
+				IOLog("ReimsGraphics: malformed event (type %u, size %u); skipping the ring's "
+				      "contents\n",
+				      type, size);
 			consumed = end;
 			break;
 		}
@@ -2460,8 +2476,10 @@ IOReturn ReimsGraphics::postReleases(const RgfxBlockRelease *releases, UInt32 co
 		if (look() || (askForRoom() && look()))
 			break;
 		if (!waitForRoom(mark, deadline)) {
-			IOLog("ReimsGraphics: command %u: the control ring stayed full\n",
-			      RGFX_CMD_BLOCK_RELEASE);
+			static char site;
+			if (rgfxFirstCalls(&site, 0, 1))
+				IOLog("ReimsGraphics: command %u: the control ring stayed full\n",
+				      RGFX_CMD_BLOCK_RELEASE);
 			return ready ? kIOReturnTimeout : kIOReturnNotReady;
 		}
 	}

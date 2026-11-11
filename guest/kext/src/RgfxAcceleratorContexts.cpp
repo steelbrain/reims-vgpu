@@ -58,6 +58,7 @@
 #include "RgfxLatency.hpp"
 #include "RgfxPagesBlock.hpp"
 #include "RgfxIdChunks.hpp"
+#include "RgfxTrace.hpp"
 #include "RgfxReleaseTable.hpp"
 
 #include <IOKit/IOLib.h>
@@ -93,14 +94,15 @@ constexpr UInt32 kReleaseAnswerMs = 10000;
 constexpr UInt64 kPage = 0x1000;
 // The guest's memory where hw.memsize gives none, for the dormant blocks' cap of bytes.
 constexpr UInt64 kDormantMemoryUnknown = 2ull << 30;
-// How often the dormant blocks' line is logged at most, and how long a new block waits for
-// dormant blocks' releases to give the region room for it.
-constexpr UInt32 kDormantLogMs = 10000;
+// How often the dormant blocks' line is logged at most, a summary, once a minute
+// (docs/conventions.md), and how long a new block waits for dormant blocks' releases to give the
+// region room for it.
+constexpr UInt32 kDormantLogMs = 60000;
 constexpr UInt32 kDormantRoomMs = 100;
 // How many dormant blocks a new block that finds no room in the region lets go.
 constexpr UInt32 kDormantRoomBlocks = 16;
-// How often the releases' line is logged at most.
-constexpr UInt32 kReleaseLogMs = 10000;
+// How often the releases' line is logged at most: a summary, once a minute.
+constexpr UInt32 kReleaseLogMs = 60000;
 // The most BLOCK_RELEASEs in flight at once (RgfxReleaseTable.hpp): 40 bytes each on ring 0,
 // under a third of its 32 KiB.
 constexpr UInt32 kMaxReleases = 256;
@@ -1414,7 +1416,9 @@ bool letGoBlock(RgfxSurfaceEntry &e, UInt32 context, bool keep, void *wired = nu
 		*kept = ownedWire;
 	// Never given back to the guest while the host may map it: kept for good where the block
 	// cannot hold it.
-	if (hostPages && !rgfxBlockSetWired(blockTable, e.offset, hostPages))
+	static char wiredForGood;
+	if (hostPages && !rgfxBlockSetWired(blockTable, e.offset, hostPages) &&
+	    rgfxFirstCalls(&wiredForGood, 0, 1))
 		IOLog("RgfxAccelerator: the deferred block 0x%llx's pages stay wired for good: its block "
 		      "is gone\n",
 		      e.offset);
@@ -2312,7 +2316,10 @@ bool RgfxAccelerator::deferSurfaceBlock(RgfxSurfaceEntry &e, UInt32 context, uin
 			dormantStats.deferred += r == kIOReturnSuccess;
 			dormantStats.changes++;
 			IOLockUnlock(contextLock);
-			if (r != kIOReturnSuccess)
+			// Once per kind a boot: a surface's every block meets the same cause.
+			static char unanswered;
+			if (r != kIOReturnSuccess &&
+			    rgfxFirstCalls(&unanswered, (static_cast<UInt64>(r) << 32) | status, 1))
 				IOLog("RgfxAccelerator: the deferred block 0x%llx was not answered (0x%x, status "
 				      "%u): it goes\n",
 				      offset, r, status);
@@ -2361,7 +2368,8 @@ bool RgfxAccelerator::deferSurfaceBlock(RgfxSurfaceEntry &e, UInt32 context, uin
 			e.holds[0].pages = memory;
 		const bool held = e.holdCount != 0;
 		IOLockUnlock(contextLock);
-		if (!held)
+		static char unheld;
+		if (!held && rgfxFirstCalls(&unheld, 0, 1))
 			IOLog("RgfxAccelerator: the block 0x%llx's pages stay wired for good: no hold to "
 			      "keep them\n",
 			      offset);
@@ -2433,8 +2441,10 @@ RgfxPagesNaming RgfxAccelerator::attachSurfacePages(UInt32 context, UInt64 offse
 			why = "they were not answered, and stay wired until the block's release is answered";
 	}
 	if (naming != kRgfxPagesNamed) {
-		IOLog("RgfxAccelerator: the block 0x%llx's pages (flags 0x%x) were not named: %s\n",
-		      offset, flags, why);
+		static char unnamed;
+		if (rgfxFirstCalls(&unnamed, rgfxKeyOf(why), 1))
+			IOLog("RgfxAccelerator: the block 0x%llx's pages (flags 0x%x) were not named: %s\n",
+			      offset, flags, why);
 		freeRuns(runs, count);
 		// The host may yet take pages it did not answer for: those stay wired.
 		if (!rgfxPagesNamingWired(naming))
@@ -2471,9 +2481,11 @@ bool RgfxAccelerator::postSurfacePages(UInt32 context, UInt64 offset, UInt64 tot
                                        UInt32 *status)
 {
 	if (!writeRuns(region, offset + rgfxSurfaceRunsFrom(size), runs, count)) {
-		IOLog("RgfxAccelerator: the block 0x%llx's runs could not be written: its surface is "
-		      "copied\n",
-		      offset);
+		static char unwritten;
+		if (rgfxFirstCalls(&unwritten, 0, 1))
+			IOLog("RgfxAccelerator: the block 0x%llx's runs could not be written: its surface is "
+			      "copied\n",
+			      offset);
 		return false;
 	}
 	const UInt32 flags = cached ? RGFX_SURFACE_PAGES_CACHED
@@ -2481,7 +2493,9 @@ bool RgfxAccelerator::postSurfacePages(UInt32 context, UInt64 offset, UInt64 tot
 	                              : 0;
 	IOReturn r = postPages(context, offset, total, offset + rgfxSurfaceRunsFrom(size), length,
 	                       count, flags, status, layout);
-	if (r != kIOReturnSuccess && r != kIOReturnUnsupported)
+	static char unanswered;
+	if (r != kIOReturnSuccess && r != kIOReturnUnsupported &&
+	    rgfxFirstCalls(&unanswered, static_cast<UInt32>(r), 1))
 		IOLog("RgfxAccelerator: the block 0x%llx's pages were not answered (0x%x): its surface "
 		      "is copied\n",
 		      offset, r);

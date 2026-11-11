@@ -3,13 +3,14 @@
  * drives (ReimsGraphics.hpp). The device, its rings, its display and its pipe clients are
  * ReimsGraphics.cpp's, as on x86-64; this file is what the class asks of a subclass.
  *
- * Each override logs its calls (the first ones and then one in kLogEvery). The class queues the
- * swaps a process submits, and swap_begin_gated takes them off its queue as Apple's paravirtual
- * display does: the device presents a swap's layer-0 surface, and the swap completes once the host
- * answers the present. The device's refreshes reach the class as its vblank note. Each completed
- * swap's presentation time reaches WindowServer as frame info, which the paravirtual display has
- * none of: supported_frame_info answers the tags the device fills, and a record of the swap goes to
- * each notify request's client, through its shared data queue (RgfxLegacySwapInfo.hpp). The class's other pure methods answer what a display with no factory
+ * Each override logs its first calls (kLogFirst a boot), and the swaps a line a minute. The class
+ * queues the swaps a process submits, and swap_begin_gated takes them off its queue as Apple's
+ * paravirtual display does: the device presents a swap's layer-0 surface, and the swap completes
+ * once the host answers the present. The device's refreshes reach the class as its vblank note.
+ * Each completed swap's presentation time reaches WindowServer as frame info, which the paravirtual
+ * display has none of: supported_frame_info answers the tags the device fills, and a record of the
+ * swap goes to each notify request's client, through its shared data queue
+ * (RgfxLegacySwapInfo.hpp). The class's other pure methods answer what a display with no factory
  * configuration and no CRC answers.
  *
  * None of the class's methods a subclass overrides is forwarded to the class: what the class
@@ -181,14 +182,14 @@ enum MobileCall : unsigned {
 };
 
 constexpr UInt32 kLogFirst = 16;
-constexpr UInt32 kLogEvery = 1024;
 UInt32 callCounts[kMobileCalls];
 
-// Whether this call of `call` is one to log: the first kLogFirst, then one in kLogEvery.
+// Whether this call of `call` is one to log: the first kLogFirst a boot, the bring-up's trace. A
+// call that comes at every swap or vblank logs nothing after them (docs/conventions.md).
 bool logged(MobileCall call)
 {
 	const UInt32 n = __atomic_fetch_add(&callCounts[call], 1, __ATOMIC_RELAXED);
-	return n < kLogFirst || n % kLogEvery == 0;
+	return n < kLogFirst;
 }
 
 } // namespace
@@ -199,7 +200,7 @@ bool ReimsGraphics::startMobile()
 	mobileTransaction = 0;
 	mobileSwapShowing = nullptr;
 	mobileSwapRate.clear();
-	mobileSecond = 0;
+	mobileSwapRateWindow = 0;
 	mobileShownAt = 0;
 	mobileShownPeriod = 0;
 	mobilePresentedAt = 0;
@@ -758,14 +759,14 @@ bool ReimsGraphics::postMobileCursorMove(int32_t x, int32_t y, bool visible)
 	return true;
 }
 
-// The line of the second of swaps just over, once a swap comes after it: none while the display
-// is idle.
+// The line of the minute of swaps just over, once a swap comes after it: none while the display
+// is idle. A summary, at most once a minute (docs/conventions.md).
 void ReimsGraphics::noteMobileSwapRate(UInt64 now)
 {
-	if (!mobileSecond)
-		nanoseconds_to_absolutetime(1000000000ull, &mobileSecond);
+	if (!mobileSwapRateWindow)
+		nanoseconds_to_absolutetime(60000000000ull, &mobileSwapRateWindow);
 	const RgfxSwapRate &r = mobileSwapRate;
-	if (!r.due(now, mobileSecond))
+	if (!r.due(now, mobileSwapRateWindow))
 		return;
 	uint64_t ns = 0;
 	absolutetime_to_nanoseconds(now - r.start, &ns);

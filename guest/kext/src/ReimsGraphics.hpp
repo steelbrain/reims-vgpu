@@ -608,10 +608,10 @@ private:
 	void *mobileSwapShowing;
 	IOInterruptEventSource *mobileSwapAnswer;
 	IOWorkLoop *mobileSwapLoop;
-	// What the swaps did over the second now running, logged once it is over (RgfxSwapRate.hpp),
-	// and a second in mach_absolute_time's ticks.
+	// What the swaps did over the minute now running, logged once it is over (RgfxSwapRate.hpp),
+	// and a minute in mach_absolute_time's ticks.
 	RgfxSwapRate mobileSwapRate;
-	UInt64 mobileSecond;
+	UInt64 mobileSwapRateWindow;
 	void noteMobileSwapRate(UInt64 now);
 	// The swap-info records notify_swap_done_gated keeps while the class holds them
 	// (RgfxLegacySwapInfo.hpp), in the class's gate.
