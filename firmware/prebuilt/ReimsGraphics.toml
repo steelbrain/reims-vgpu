@@ -6,7 +6,7 @@
 rom = "749434f87f562895548f60681cd4cd8bf6cc0d0e967ac2fea297674426709161"
 
 [sources]
-"crates/reims-vgpu-graphics/include/reims_graphics_wire.h" = "e2bd26a2a63115eca4e5fa43c1de8a2a37df1861037c37399cf11482ada0e26e"
+"crates/reims-vgpu-graphics/include/reims_graphics_wire.h" = "20dbed1fb5240dcbcf5390786fa833c8e01b30d38b9dd30442dd872ae76de039"
 "firmware/Makefile" = "d85b14a3b40cc59b7c07a9e3a3a273c257e81c5674963c70c3c45eb386e653d0"
 "firmware/src/OptionRom.S" = "b910fe61a880580996a81134fba75900d3a9f48ca266e76fe2d6b8eb5a011eb9"
 "firmware/src/ReimsGraphics.c" = "554751ff15edbdf69a038d5b2aefd8315b9c54610c090c0890d9c72b13dacdef"
