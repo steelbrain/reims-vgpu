@@ -177,6 +177,10 @@ struct InputLogic {
     iso: bool,
     /// The keys the guest was told are down.
     keys: KeyState,
+    /// The usage each key the guest was told is down went down as, by its `keyCode`: its up
+    /// names the same usage though `iso` changed between them (another keyboard typed on), so
+    /// the guest is never left holding the down.
+    downs: Vec<(u16, u16)>,
     /// Who gets the keyboard.
     capture: Capture,
     /// Precise scrolling's points not yet a notch.
@@ -245,6 +249,7 @@ impl InputLogic {
     /// Ups for every key held.
     fn lift_keys(&mut self) {
         let events = self.keys.release_all();
+        self.downs.clear();
         self.send_keys(events);
     }
 
@@ -375,15 +380,23 @@ impl InputLogic {
         }
         if let Some(usage) = keymap::usb_usage(key.keycode, self.iso) {
             let event = self.keys.key_down(usage, false);
+            if event.is_some() {
+                self.downs.retain(|&(keycode, _)| keycode != key.keycode);
+                self.downs.push((key.keycode, usage));
+            }
             self.out.extend(event.map(ToHost::Key));
         }
         Reaction::default()
     }
 
-    /// A key went up (`keyUp:`): sent for a key the guest was told is down.
+    /// A key went up (`keyUp:`): sent for a key the guest was told is down, as the usage it went
+    /// down as ([`Self::downs`]).
     fn key_up(&mut self, key: KeyInput) -> Reaction {
         self.sync_modifiers(key.flags);
-        if let Some(usage) = keymap::usb_usage(key.keycode, self.iso) {
+        let went_down = (self.downs.iter())
+            .position(|&(keycode, _)| keycode == key.keycode)
+            .map(|at| self.downs.remove(at).1);
+        if let Some(usage) = went_down.or_else(|| keymap::usb_usage(key.keycode, self.iso)) {
             let event = self.keys.key_up(usage);
             self.out.extend(event.map(ToHost::Key));
         }
@@ -704,9 +717,10 @@ mod tests {
     const L_OPTION: u64 = FLAG_OPTION | 0x20;
     const L_COMMAND: u64 = FLAG_COMMAND | 0x08;
 
-    /// Key codes: A, Q, Fn and the left modifiers.
+    /// Key codes: A, Q, the ISO section key, Fn and the left modifiers.
     const KVK_A: u16 = 0x00;
     const KVK_Q: u16 = 0x0C;
+    const KVK_ISO_SECTION: u16 = 0x0A;
     const KVK_FN: u16 = 0x3F;
     const KVK_COMMAND: u16 = 0x37;
     const KVK_CONTROL: u16 = 0x3B;
@@ -776,6 +790,31 @@ mod tests {
         sent(&mut logic);
         assert!(logic.capture.is_captured());
         logic
+    }
+
+    /// A key goes up as the usage it went down as, though the keyboard's ISO answer changed
+    /// between its down and its up (another keyboard typed on meanwhile): the guest is left
+    /// holding no key
+    #[test]
+    fn a_key_goes_up_as_it_went_down_across_a_keyboard_change() {
+        let on_iso = keymap::usb_usage(KVK_ISO_SECTION, true).unwrap();
+        let on_ansi = keymap::usb_usage(KVK_ISO_SECTION, false).unwrap();
+        assert_ne!(on_iso, on_ansi, "the ISO answer moves the key");
+        for (at_down, at_up, usage) in [(true, false, on_iso), (false, true, on_ansi)] {
+            let mut logic = captured();
+            logic.iso = at_down;
+            logic.key_down(key(KVK_ISO_SECTION, 0));
+            logic.iso = at_up;
+            logic.key_up(key(KVK_ISO_SECTION, 0));
+            assert_eq!(sent(&mut logic), vec![down(usage), up(usage)]);
+            logic.lift_keys();
+            assert_eq!(sent(&mut logic), vec![], "a key left held");
+            // A key down and up on one keyboard maps as that keyboard does.
+            logic.key_down(key(KVK_ISO_SECTION, 0));
+            logic.key_up(key(KVK_ISO_SECTION, 0));
+            let now = keymap::usb_usage(KVK_ISO_SECTION, at_up).unwrap();
+            assert_eq!(sent(&mut logic), vec![down(now), up(now)]);
+        }
     }
 
     /// The click that makes the window key captures the keyboard, and is not sent, nor is its

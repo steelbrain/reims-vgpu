@@ -163,7 +163,9 @@ Unset or unparsable values give the defaults below.
   `test: keymap::keys_map_by_position`,
   `test: keymap::fn_and_unknown_codes_have_no_usage`
 - On ISO keyboards, the key left of 1 and the key right of left Shift arrive
-  as on a real ISO keyboard. `test: keymap::iso_swaps_section_and_grave`
+  as on a real ISO keyboard, and a key goes up as it went down though
+  another keyboard was typed on between. `test: keymap::iso_swaps_section_and_grave`,
+  `test: native::macos::input::a_key_goes_up_as_it_went_down_across_a_keyboard_change`
 - Left and right Shift, Control, Option and Command are told apart.
   `test: keys::left_and_right_modifiers_are_told_apart`,
   `test: keys::a_synthesized_modifier_takes_its_side_from_the_key`
