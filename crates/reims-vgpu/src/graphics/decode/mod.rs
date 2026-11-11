@@ -558,15 +558,12 @@ pub enum DecodeError {
     ContextClosed,
 }
 
-/// How many `SURFACE_PAGES` pass between the logs of what the surface views did, at most
-/// ([`views_log_due`]).
-const VIEWS_LOGGED_EVERY: u64 = 256;
-/// The longest the logs of what the surface views did wait for [`VIEWS_LOGGED_EVERY`]
-/// `SURFACE_PAGES`: the first after it logs them too. Where dormant blocks keep most device
-/// caches, a desktop makes a few new ones a second, and 256 `SURFACE_PAGES` took minutes, so the
-/// lines bounded the caches' rates and never gave them. The kext logs its dormant blocks on the
+/// How long the logs of what the surface views did wait after the last: the first
+/// `SURFACE_PAGES` after it logs them ([`views_log_due`]). A summary at info comes at most once a
+/// minute, however many `SURFACE_PAGES` a desktop's churn sends (docs/conventions.md); a run
+/// that reads the counts reads lines up to a minute old. The kext logs its dormant blocks on the
 /// same interval.
-const VIEWS_LOGGED_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+const VIEWS_LOGGED_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long a `SURFACE_PAGES` waits for a copy of a device cache into its pages still in flight
 /// ([`GraphicsDecoder::wait_copies_into`]): as long as the kext's new block over a surface's
@@ -598,12 +595,11 @@ fn first_plane_of(block: u64, layout: &RgfxSurfacePagesLayout, length: u64) -> O
         }
     }
 }
-/// Whether a `SURFACE_PAGES`, the `counted`th the views' counts hold, logs what the surface
-/// views did at `now`, the last log having been at `last`: every [`VIEWS_LOGGED_EVERY`]th, and
-/// the first [`VIEWS_LOGGED_AFTER`] or more after the last log.
-fn views_log_due(counted: u64, now: MonoTime, last: MonoTime) -> bool {
-    counted.is_multiple_of(VIEWS_LOGGED_EVERY)
-        || now.saturating_duration_since(last) >= VIEWS_LOGGED_AFTER
+
+/// Whether a `SURFACE_PAGES` logs what the surface views did at `now`, the last log having been
+/// at `last`: the first [`VIEWS_LOGGED_AFTER`] or more after the last log.
+fn views_log_due(now: MonoTime, last: MonoTime) -> bool {
+    now.saturating_duration_since(last) >= VIEWS_LOGGED_AFTER
 }
 
 /// What a present of an IOSurface shows ([`GraphicsDecoder::surface_present`]).
@@ -1176,9 +1172,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// marked [`RGFX_SURFACE_PAGES_DEFERRED`] or [`RGFX_SURFACE_PAGES_ATTACH`] is a deferred
     /// block or its pages ([`Self::deferred_surface_pages`]); and one marked
     /// [`RGFX_SURFACE_PAGES_ASK_CACHE`], with its surface's `layout`, asks whether it needs one
-    /// ([`Self::asks_cache`]). A summary of what the views did is logged every
-    /// [`VIEWS_LOGGED_EVERY`], and at the first [`VIEWS_LOGGED_AFTER`] after the last
-    /// ([`views_log_due`]).
+    /// ([`Self::asks_cache`]). A summary of what the views did is logged at the first
+    /// [`VIEWS_LOGGED_AFTER`] after the last ([`views_log_due`]).
     pub(crate) fn carry_out_surface_pages(
         &self,
         device: &P::Device,
@@ -1220,21 +1215,17 @@ impl<P: Platform> GraphicsDecoder<P> {
             clock.now_mono().saturating_duration_since(start).as_micros(),
             start.saturating_duration_since(settle.begun).as_micros()
         );
-        let c = views.lock().counts();
-        let d = self.surface_caches.lock().counts();
-        // A deferred block, and a block named by its runs, make no view, so they are counted
-        // here too.
-        let counted = (c.made + c.reused + c.bad_runs + c.not_mapped + c.private + c.by_runs)
-            .saturating_add(d.deferred + d.deferred_refused + d.deferred_in_place);
         let now = clock.now_mono();
         let logged_at = &self.shared.views_logged_at;
         let last = logged_at.load(Ordering::Relaxed);
         // One message logs for each time due, where two blocks' lanes find it due at once.
-        if views_log_due(counted, now, MonoTime::from_nanos(last))
+        if views_log_due(now, MonoTime::from_nanos(last))
             && logged_at
                 .compare_exchange(last, now.as_nanos(), Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         {
+            let c = views.lock().counts();
+            let d = self.surface_caches.lock().counts();
             log::info!(
                 target: "reims_vgpu::graphics",
                 "IOSurface pages in place: {} views made, {} taken from the cache, {} let go of \
@@ -2985,8 +2976,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                     device.new_command_queue()
                 };
                 if unshared && made.is_some() {
-                    log::info!(
-                        target: "reims_vgpu::graphics",
+                    // A debug line of its own target, which a run that counts the guest's
+                    // unshared queues names (`reims_vgpu::graphics::queues=debug`).
+                    log::debug!(
+                        target: "reims_vgpu::graphics::queues",
                         "queue {:#x}: made unshared (RGFX_QUEUE_UNSHARED)", m.obj_id
                     );
                 }
@@ -5719,23 +5712,18 @@ mod tests {
         assert_eq!(check(fields(81, 0)), None);
     }
 
-    /// What the surface views did is logged at every 256th `SURFACE_PAGES`, and at the first one
-    /// ten seconds or more after the last log, however few came between.
+    /// What the surface views did is logged at the first `SURFACE_PAGES` a minute or more after
+    /// the last log, however many came between, and at no other
     #[test]
-    fn the_views_counts_are_logged_by_count_and_by_time() {
+    fn the_views_counts_are_logged_at_most_once_a_minute() {
         let last = MonoTime::from_nanos(5_000_000_000);
         let after = |d: std::time::Duration| last.saturating_add(d);
         let ms = std::time::Duration::from_millis;
-        // The 256th logs at once, and so do its multiples.
-        assert!(views_log_due(256, after(ms(1)), last));
-        assert!(views_log_due(512, last, last));
-        // Others wait for the interval.
-        assert!(!views_log_due(255, after(ms(1)), last));
-        assert!(!views_log_due(3, after(ms(9_999)), last));
-        assert!(views_log_due(3, after(ms(10_000)), last));
-        assert!(views_log_due(257, after(ms(60_000)), last));
+        assert!(!views_log_due(after(ms(1)), last));
+        assert!(!views_log_due(after(ms(59_999)), last));
+        assert!(views_log_due(after(ms(60_000)), last));
         // A clock that reads earlier than the last log waits as if no time had passed.
-        assert!(!views_log_due(3, MonoTime::from_nanos(1), last));
+        assert!(!views_log_due(MonoTime::from_nanos(1), last));
     }
 
     /// The closed contexts' runs hold each number inserted, joined with the runs it is next to,

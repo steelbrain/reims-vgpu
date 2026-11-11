@@ -23,7 +23,8 @@
 #   -e ECID  the guest's ECID, in decimal or 0x hex
 #
 # The guest runs with 8 GiB and 4 CPUs, as Ambrosia's tested boots do, with QEMU's
-# REIMS_VGPU_WINDOW=0 (no window on the host) and REIMS_VGPU_LOG=info, as the lane gate runs it.
+# REIMS_VGPU_WINDOW=0 (no window on the host) and REIMS_VGPU_LOG=info with the display's flips
+# (reims_vgpu::graphics::shown at debug), as the lane gate runs it.
 # Under TCG, for a Linux member, its RAM is a shared memfd, as reims-ctl's VMs on Linux have it. The
 # device maps the memfd-backed main RAM in place and leaves out vmapple's firmware and configuration
 # regions, which have no file behind them and hold no IOSurface, so every surface still maps in place
@@ -264,7 +265,7 @@ fi
 # --- the boot -----------------------------------------------------------------------------------
 
 t0=$(now)
-REIMS_VGPU_WINDOW=0 REIMS_VGPU_LOG=info "$qemu" "${accel[@]}" \
+REIMS_VGPU_WINDOW=0 REIMS_VGPU_LOG=info,reims_vgpu::graphics::shown=debug "$qemu" "${accel[@]}" \
   -M "vmapple,uuid=$ecid$machine" "${mem[@]}" -smp 4 -bios "$firmware" \
   -drive "file=$clone/aux.img.trimmed,if=pflash,format=raw" \
   -drive "file=$clone/disk.img,if=pflash,format=raw" \
@@ -441,7 +442,8 @@ if [[ -n $ssh_s ]]; then
     else
       cover_say=
     fi
-    # The host logs each display flip; those during the probe's call are WindowServer's own
+    # The host logs each display flip (reims_vgpu::graphics::shown, which this run names at
+    # debug); those during the probe's call are WindowServer's own
     # presents, the rate the probe's frames can reach the display at.
     q0=$(wc -l < "$out/qemu.log") t0=$SECONDS
     probe=$(G 60 "echo '$GUEST_PASS' | sudo -S -p '' launchctl asuser \$(id -u) sudo -u \$(id -un) perl -e 'alarm shift @ARGV; exec @ARGV' $((40 * slow)) \$HOME/ambrosia-check/present_probe -t 10" |
@@ -589,7 +591,8 @@ if [[ -n $ssh_s ]]; then
   verdict windowserver-metal "$( ((ok)) && echo PASS || echo FAIL)" "$(IFS=';'; echo "${ws[*]}" | sed 's/;/; /g')"
 
   # The page count: the host's last count of its IOSurface device caches (logged only once one
-  # is made), and the kext's count lines, read in the guest after its Metal work.
+  # is made, at most once a minute, so up to a minute behind the boot's end), and the kext's count
+  # lines, read in the guest after its Metal work.
   caches=$(grep -o 'IOSurface device caches: .*' "$out/qemu.log" | tail -1)
   cc=($(echo "$caches" | perl -ne 'my ($m) = /device caches: (\d+) made;/;
     print "$m $1 $2 $3 $4\n" if defined $m && /; (\d+) deferred \((\d+) carrying pages\), (\d+) refused, (\d+) refused as they might lie in place/'))

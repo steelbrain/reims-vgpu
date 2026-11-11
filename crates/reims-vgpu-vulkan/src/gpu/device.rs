@@ -1390,8 +1390,8 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                             e @ rt::Error::Compile(metal2vulkan::error::Error::InvalidInput(_)),
                         ) => {
                             // Metal's NSError names no cause; the runtime's names its check and
-                            // the offset in the file.
-                            log::info!(
+                            // the offset in the file. At debug: a guest call Metal refuses too.
+                            log::debug!(
                                 target: "reims_vgpu_vulkan::gpu",
                                 "{sel} refused {} bytes as no metallib: {e}",
                                 data.len()

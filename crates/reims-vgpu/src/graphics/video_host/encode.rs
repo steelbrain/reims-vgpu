@@ -540,8 +540,10 @@ fn finish_frames<P: Platform>(
         {
             let mut counts = counts.lock();
             if let Some(i) = Outcome::ALL.iter().position(|o| *o == outcome) {
+                // A session's first of each outcome; once per process at info (`kind`).
                 if counts.frames[i] == 0 && outcome != Outcome::Failed {
                     log::info!(
+                        kind = outcome.says();
                         "hardware video: {name}: a frame encoded, {}",
                         outcome.says()
                     );

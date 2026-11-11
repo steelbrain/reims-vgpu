@@ -207,8 +207,9 @@ fn fold_within(within: std::ops::Range<u64>) -> u64 {
     AT_LIMIT.with(|a| a.set(outer));
     let freed = before.saturating_sub(files::mappings());
     if freed > 0 {
+        // A fallback a guest's load reaches: at info once per process (`kind`), later at debug.
         log::info!(
-            target: "reims_vgpu_vulkan::os",
+            target: "reims_vgpu_vulkan::os", kind = "fold";
             "at the views' budget (vm.max_map_count): {freed} of the views' {before} mappings \
              freed by mapping the pages no import holds through dma-bufs"
         );

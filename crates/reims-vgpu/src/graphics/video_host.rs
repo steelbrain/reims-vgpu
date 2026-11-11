@@ -846,8 +846,12 @@ fn land_pictures<P: Platform>(
             Some(Ok(way)) => {
                 let mut counts = counts.lock();
                 if let Some(i) = Way::ALL.iter().position(|w| *w == way) {
+                    // A session's first of each way; once per process at info (`kind`).
                     if counts.landed[i] == 0 {
-                        log::info!("hardware video: {name}: a picture landed {}", way.says());
+                        log::info!(
+                            kind = way.says();
+                            "hardware video: {name}: a picture landed {}", way.says()
+                        );
                     }
                     counts.landed[i] += 1;
                 }

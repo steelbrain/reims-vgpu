@@ -1601,7 +1601,14 @@ impl<P: Platform> GraphicsDecoder<P> {
         // off it (`surface_order`).
         let order_waits = match &take.order {
             Some(waits) => {
-                (self.shared.surface_order.lock()).before(device, m.queue_obj_id, &cb, waits)?
+                let now = self.shared.platform.clock().now_mono();
+                (self.shared.surface_order.lock()).before(
+                    device,
+                    m.queue_obj_id,
+                    &cb,
+                    waits,
+                    now,
+                )?
             }
             None => Vec::new(),
         };

@@ -877,9 +877,18 @@ impl<P: Platform> Presented<P> {
     /// the texture shown before, for [`Self::show`]'s caller.
     fn swap(&self, id: u32, texture: Option<ShownTexture<P>>) -> Option<Arc<DisplayHold>> {
         let previous = self.surface_id.swap(id, Ordering::AcqRel);
-        if previous != id {
+        // A guest that draws into a few IOSurfaces in turn (WindowServer's three) changes the
+        // surface shown at every present, so each change is a debug line of its own target, which
+        // a run that counts the display's flips names (`reims_vgpu::graphics::shown=debug`); only
+        // a change between the scanout and a surface is an info line too.
+        if previous != id && (previous == 0 || id == 0) {
             log::info!(
                 target: "reims_vgpu::graphics",
+                "the display shows IOSurface {id} (was {previous}; 0 is the scanout)"
+            );
+        } else if previous != id {
+            log::debug!(
+                target: "reims_vgpu::graphics::shown",
                 "the display shows IOSurface {id} (was {previous}; 0 is the scanout)"
             );
         }
@@ -1761,8 +1770,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         });
         let (obj_id, size) = RgfxLibraryLookup::read_from_prefix(message)
             .map_or((0, 0), |(m, _)| (m.obj_id, m.slice_size));
-        log::info!(
-            target: "reims_vgpu::graphics",
+        // Each guest process's library lookups: a debug line of its own target, which a run that
+        // times the guest's launches names (`reims_vgpu::graphics::library=debug`).
+        log::debug!(
+            target: "reims_vgpu::graphics::library",
             "library lookup (object {obj_id:#x}, {size} bytes): {}",
             if status == RGFX_STATUS_OK { "hit" } else { "miss" }
         );
@@ -1806,7 +1817,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             (self.decoders).sender(Some(sender_context(poster, message)), Sinks::default());
         if ty == RGFX_CMD_SHARED_EVENT_NAME {
             let (seqno, status) = entry::run(|_| decoder.name_shared_event(message, listen));
-            log::info!(
+            log::debug!(
                 target: "reims_vgpu::graphics",
                 "shared event {obj_id:#x} named for other processes: status {status}"
             );
@@ -1816,7 +1827,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         } else {
             let answer = entry::run(|_| decoder.import_shared_event(message, listen));
             if let Some(answer) = answer {
-                log::info!(
+                log::debug!(
                     target: "reims_vgpu::graphics",
                     "shared event {obj_id:#x} made from another process's: status {}, value {}",
                     answer.status,

@@ -48,10 +48,11 @@ pub(crate) struct WaitingBuffer {
 }
 
 impl WaitingBuffer {
-    /// The buffer finished (its completed handler ran): the log says so where it named the wait.
+    /// The buffer finished (its completed handler ran): the log says so at debug where it named
+    /// the wait.
     pub(crate) fn finished(&self) {
         if self.state.swap(FINISHED, Ordering::SeqCst) == LOGGED {
-            log::info!(
+            log::debug!(
                 target: "reims_vgpu::graphics",
                 "{} finished after waiting for {}",
                 self.named(),

@@ -633,11 +633,15 @@ impl<P: Platform> CacheTargets<P> {
     }
 }
 
-/// Logs `why` once in `said`'s session: why a picture was not decoded into its cache.
+/// Logs `why` once in `said`'s session, and at info once per process (`kind`): why a picture was
+/// not decoded into its cache.
 fn say(said: &Mutex<Vec<String>>, why: String) {
     let mut said = said.lock();
     if !said.contains(&why) {
-        log::info!("hardware video: {NAME}: a picture not decoded into its device cache: {why}");
+        log::info!(
+            kind:% = why;
+            "hardware video: {NAME}: a picture not decoded into its device cache: {why}"
+        );
         said.push(why);
     }
 }
@@ -738,11 +742,12 @@ struct VaPicture<P: Platform> {
 type SessionCopier<P> = Result<Arc<Mutex<Box<dyn GpuCopier<P>>>>, String>;
 
 impl<P: Platform> VaPicture<P> {
-    /// Logs, once a session, why a picture was copied by the CPU.
+    /// Logs, once a session, and at info once per process (`kind`), why a picture was copied by
+    /// the CPU.
     fn copied_because(&self, why: String) {
         let mut said = self.said.lock();
         if !said.contains(&why) {
-            log::info!("hardware video: {NAME}: a picture copied by the CPU: {why}");
+            log::info!(kind:% = why; "hardware video: {NAME}: a picture copied by the CPU: {why}");
             said.push(why);
         }
     }

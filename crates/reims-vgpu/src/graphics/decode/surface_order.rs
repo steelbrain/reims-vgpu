@@ -60,6 +60,7 @@ use reims_vgpu_graphics::wire::RGFX_CONTEXT_OBJ_ID_SHIFT;
 use reims_vgpu_vulkan::core::platform::command::{CommandBuffer, CommandQueue, CompletedInfo};
 use reims_vgpu_vulkan::core::platform::device::GpuDevice;
 use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent};
+use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
 use reims_vgpu_vulkan::core::platform::{Handle, Platform};
 use reims_vgpu_vulkan::core::raise::{OnFault, RaiseResult, refusals};
 
@@ -68,8 +69,10 @@ use super::commit_order;
 /// The waits and signals run under a live raise handler (the ring loop's).
 const ON: OnFault = OnFault::Return;
 
-/// How many command buffers that hold the op pass between the logs of what the order did.
-const LOGGED_EVERY: u64 = 4096;
+/// How long the logs of what the order did wait after the last: the first command buffer that
+/// holds the op after it logs them. A summary at info comes at most once a minute, however many
+/// command buffers a guest sends (docs/conventions.md).
+const LOGGED_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// What a queue's submission ring has published: the highest seqno of a message on it, taken or
 /// not; `None` where the queue has ended at the device. Given by the host as the queue is made.
@@ -281,6 +284,8 @@ impl<P: Platform> Queue<P> {
 pub(crate) struct SurfaceOrder<P: Platform> {
     queues: HashMap<u64, Queue<P>>,
     counts: OrderCounts,
+    /// When the counts were last logged ([`LOGGED_AFTER`]); `None` before the first buffer.
+    logged_at: Option<MonoTime>,
 }
 
 impl<P: Platform> SurfaceOrder<P> {
@@ -288,6 +293,7 @@ impl<P: Platform> SurfaceOrder<P> {
         SurfaceOrder {
             queues: HashMap::new(),
             counts: OrderCounts::default(),
+            logged_at: None,
         }
     }
 
@@ -427,16 +433,20 @@ impl<P: Platform> SurfaceOrder<P> {
     }
 
     /// Makes `cb`, a command buffer of queue `queue` that holds the op, wait on the GPU for each
-    /// buffer of `waits` not yet finished (the module doc); the waits it made, one a queue.
+    /// buffer of `waits` not yet finished (the module doc); the waits it made, one a queue. Logs
+    /// the counts where it comes [`LOGGED_AFTER`] or more after their last log, at `now`.
     pub(crate) fn before(
         &mut self,
         device: &P::Device,
         queue: u64,
         cb: &P::CommandBuffer,
         waits: &[RgfxSurfaceOrderWait],
+        now: MonoTime,
     ) -> RaiseResult<Vec<OrderWait<P>>> {
         self.counts.buffers += 1;
-        if self.counts.buffers.is_multiple_of(LOGGED_EVERY) {
+        let last = *self.logged_at.get_or_insert(now);
+        if now.saturating_duration_since(last) >= LOGGED_AFTER {
+            self.logged_at = Some(now);
             let c = self.counts;
             log::info!(
                 target: "reims_vgpu::graphics",
@@ -683,9 +693,10 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             let mut waited = 0;
             while !w.wait(CPU_WAIT_SLICE_MS) {
                 if cancel.cut_since(begun) {
-                    log::info!(
+                    log::debug!(
                         target: "reims_vgpu::graphics",
-                        "surface order: a reset of the device ended the CPU wait of work started                          off a command buffer for a buffer of another queue at {}",
+                        "surface order: a reset of the device ended the CPU wait of work started \
+                         off a command buffer for a buffer of another queue at {}",
                         w.value
                     );
                     return;
@@ -694,15 +705,18 @@ impl<P: Platform> super::GraphicsDecoder<P> {
                 if waited == CPU_WAIT_LOGGED_MS {
                     log::warn!(
                         target: "reims_vgpu::graphics",
-                        "surface order: work started off a command buffer has waited                          {CPU_WAIT_LOGGED_MS} ms on the CPU for a buffer of another queue at {},                          which has not finished; it waits on",
+                        "surface order: work started off a command buffer has waited \
+                         {CPU_WAIT_LOGGED_MS} ms on the CPU for a buffer of another queue at {}, \
+                         which has not finished; it waits on",
                         w.value
                     );
                 }
             }
             if waited >= CPU_WAIT_LOGGED_MS {
-                log::info!(
+                log::debug!(
                     target: "reims_vgpu::graphics",
-                    "surface order: the buffer of another queue at {} finished after about {waited}                      ms of a CPU wait",
+                    "surface order: the buffer of another queue at {} finished after about \
+                     {waited} ms of a CPU wait",
                     w.value
                 );
             }

@@ -55,7 +55,8 @@
 # EXCLUSIVE, HOLD_S, LOCK_WAIT_S (unused: potluck's lease is the lock), PHASES and
 # PRESENT_S (guest-run.sh's phases and GATE_PRESENT_S), and LOAD (a duty, 0 to 1: a fixed GPU
 # load, gpuload -d LOAD, from the guest's run to the drags' end; unset for none), and HOST_LOG
-# (the host's REIMS_VGPU_LOG filter, default info), CAPTURE (1: the boot capture, below), and
+# (the host's REIMS_VGPU_LOG filter, default info with the per-event lines this script counts at
+# debug: lane-gate.sh's HOST_LOG_DEFAULT), CAPTURE (1: the boot capture, below), and
 # APPLOAD (1: the app load after the measurements, msi-appload.sh, with the tools lane-gate.sh
 # copies into this script's appload-tools/), and POST_PROBES and POST_PROBE_TIP (a gate boot's
 # probes after everything else, msi-probes.sh's PROBES and PROBE_TIP, into post-probes/; at the
@@ -223,9 +224,10 @@ finish() {
   rm -f "$R/watchdog.pid"
   if [[ -f $B/launch.log ]]; then
     kv fatal_lines "$(grep -c 'reims-vgpu: fatal' "$B/launch.log")"
-    # The host's records of paths a tip adds: queues made unshared (RGFX_QUEUE_UNSHARED),
-    # SUBMIT_ROOM records posted (reims_vgpu_graphics::room at debug, HOST_LOG), and ICB_SLOTS messages
-    # whose runs were not all carried out.
+    # The host's records of paths a tip adds: queues made unshared (RGFX_QUEUE_UNSHARED,
+    # reims_vgpu::graphics::queues at debug, HOST_LOG), SUBMIT_ROOM records posted
+    # (reims_vgpu_graphics::room at debug, HOST_LOG), and ICB_SLOTS messages whose runs were not
+    # all carried out (a warning, written once per kind: warned).
     kv queues_unshared "$(grep -c 'made unshared' "$B/launch.log")"
     kv submit_room_posted "$(grep -c 'SUBMIT_ROOM posted' "$B/launch.log")"
     kv icb_slots_refused "$(warned 'ICB_SLOTS of' "$B/launch.log")"
@@ -412,7 +414,7 @@ fi
 TIMES=$!
 # msi-launch.sh picks the SSH port (PORT unset): "PORT n".
 out=$(env -u PORT "${excl[@]}" RGK_RUN="$RGK_RUN" QEMU="$QEMU" ROM="$ROM" \
-  REIMS_VGPU_LOG="${HOST_LOG:-info}" bash "$(dirname "$0")/msi-launch.sh" "$TAG" "$OC" "$DISK" 2>&1)
+  REIMS_VGPU_LOG="${HOST_LOG:-info,reims_vgpu::graphics::shown=debug,reims_vgpu::graphics::library=debug,reims_vgpu::graphics::queues=debug}" bash "$(dirname "$0")/msi-launch.sh" "$TAG" "$OC" "$DISK" 2>&1)
 T_SSH=$(date +%s.%N | cut -c1-14)
 kill "$TIMES" 2> /dev/null
 echo "$out" >> "$R/boot.log"

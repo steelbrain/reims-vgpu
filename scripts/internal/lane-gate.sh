@@ -33,9 +33,10 @@
 #                 webgl present final)
 #   --bench-phases  the bench boot's (default: info webgl present idle bench decodefps final)
 #   --boot-tag TAG  the correctness boot's tag on the lane host (default gate-RUNID-boot)
-#   --host-log FILTER  the correctness boot's host log filter (REIMS_VGPU_LOG, default info), as
+#   --host-log FILTER  the correctness boot's host log filter (REIMS_VGPU_LOG, default info with
+#                 the per-event lines the boot counts at debug: HOST_LOG_DEFAULT below), as
 #                 info,reims_vgpu_graphics::room=debug to count a path's debug records
-#   --bench-host-log FILTER  the bench boot's host log filter (default info), as
+#   --bench-host-log FILTER  the bench boot's host log filter (default HOST_LOG_DEFAULT), as
 #                 info,reims_vgpu::work=debug for the runtime's work counts each second, which
 #                 report.py rates the drags and WebGL by; their logger costs the numbers it rates
 #                 (car 9: draws.10k 2.54M a second without it, 0.80M with it), so another filter
@@ -688,9 +689,13 @@ LOCK_WAIT_S=${LOCK_WAIT_S:-3600}
 PHASES="$ph"
 PRESENT_S=$pres
 LOAD=$([[ $mode == bench ]] && echo "$load")
-# The bench's host log is info: the work counts' logger (reims_vgpu::work at debug) slows what it
-# rates, and runs only where --bench-host-log asks for it.
-HOST_LOG=$([[ $mode == boot ]] && echo "${host_log:-info}" || echo "${bench_host_log:-info}")
+# The host log is info, with the per-event lines the boot counts at debug (docs/conventions.md:
+# none at info): the display's flips (reims_vgpu::graphics::shown, which msi-drag.py times the
+# composites by), the guest's library lookups (::library, msi-boot.sh's launch gaps) and its
+# unshared queues (::queues). The bench's: the work counts' logger (reims_vgpu::work at debug)
+# slows what it rates, and runs only where --bench-host-log asks for it.
+HOST_LOG_DEFAULT=info,reims_vgpu::graphics::shown=debug,reims_vgpu::graphics::library=debug,reims_vgpu::graphics::queues=debug
+HOST_LOG=$([[ $mode == boot ]] && echo "${host_log:-$HOST_LOG_DEFAULT}" || echo "${bench_host_log:-$HOST_LOG_DEFAULT}")
 CAPTURE=$([[ $mode == boot ]] && echo "$capture" || echo 0)
 APPLOAD=$([[ $mode == boot ]] && echo "$appload" || echo 0)
 FINAL_CMD_B64=$([[ $mode == boot && -n ${final_cmd:-} ]] && printf '%s' "$final_cmd" | base64 | tr -d '\n')

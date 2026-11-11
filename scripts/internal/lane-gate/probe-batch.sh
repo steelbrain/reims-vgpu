@@ -133,8 +133,9 @@ WAIT_N=3 WAIT_S=2700
 # The host's log filter in a probe boot: info, and the display's presents ("PRESENT_SURFACE of
 # transaction", reims_vgpu_graphics at trace, about 23 lines a second at 120 Hz), so a probe's host.log
 # counts composites. reims_vgpu_graphics has no other trace lines; at debug it logs SUBMIT_ROOM posts
-# (reims_vgpu_graphics::room). Gate and bench boots log at info.
-PROBE_HOST_LOG=${host_log:-info,reims_vgpu_graphics=trace}
+# (reims_vgpu_graphics::room). Gate and bench boots log at info, with the per-event lines they count
+# at debug (lane-gate.sh's HOST_LOG_DEFAULT), as here.
+PROBE_HOST_LOG=${host_log:-info,reims_vgpu_graphics=trace,reims_vgpu::graphics::shown=debug,reims_vgpu::graphics::library=debug,reims_vgpu::graphics::queues=debug}
 # The hold the probes get: the boot's own time to the desktop and the device check (about 90 s),
 # the longest load settle (180 s) and a margin come first.
 FIT_S=$(( HOLD_S - 90 - 180 - 60 ))

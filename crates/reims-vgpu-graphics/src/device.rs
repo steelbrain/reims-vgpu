@@ -1452,7 +1452,8 @@ impl Shared {
             // message in flight comes before it.
             self.lanes.wait_begun(self.epoch.load(Ordering::Acquire));
             self.host.device_reset();
-            log::info!(target: "reims_vgpu_graphics", "the device was reset");
+            // At debug: reims-vgpu's own line of the reset, at info, carries its counts.
+            log::debug!(target: "reims_vgpu_graphics", "the device was reset");
         }
     }
 
@@ -1760,7 +1761,8 @@ impl Shared {
             });
         }
         self.host.context_closed(context, answer);
-        log::info!(target: "reims_vgpu_graphics", "context {context} closed");
+        // At debug: reims-vgpu's own line of the close, at info, says what it let go of.
+        log::debug!(target: "reims_vgpu_graphics", "context {context} closed");
     }
 
     /// `BLOCK_GRANT`: the region keeps the block as its context's, where it lies in the
@@ -2814,8 +2816,9 @@ impl Shared {
 
     /// Posts the records handed over on `queue`'s ring, oldest first, until none is left, with
     /// no lock held across a post; one posted after a reset since it was handed over is dropped
-    /// as a post drops it. At most once a second, says at info how many were handed over in all,
-    /// and the longest one waited for a thread to take it since the last line.
+    /// as a post drops it. At most once a second, says how many were handed over in all, and the
+    /// longest one waited for a thread to take it since the last line: the process's first such
+    /// line at info, a path a guest's load takes, and the later ones at debug.
     fn post_handed(&self, queue: &QueueShared) {
         loop {
             let (message, epoch, at) = {
@@ -2844,8 +2847,14 @@ impl Shared {
                 .is_ok()
         {
             let waited = self.handed_wait_ns.swap(0, Ordering::Relaxed);
-            log::info!(
+            let level = if last == 0 {
+                log::Level::Info
+            } else {
+                log::Level::Debug
+            };
+            log::log!(
                 target: "reims_vgpu_graphics::handed",
+                level,
                 "{} completion records handed over to the queues' threads in all, from threads \
                  that may not post them; the longest wait for a thread to post one since the \
                  last line: {} us",
