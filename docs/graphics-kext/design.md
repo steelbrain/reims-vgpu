@@ -1219,6 +1219,42 @@ only where no negotiation can carry it.
   stencil. It does alpha test, two-sided colour and the point sprite origin
   in its shaders. A host offers it where its platform takes that state. The
   Vulkan platform always does, filling metal2vulkan's `PrivateRenderState`.
+
+  The guest's renderer sets the same properties on our device. This was
+  measured over gl_cases' 48 cases in arm64 macOS 27.0.1 (the M3 Max under
+  HVF, job m3-max-17093) and in x86-64 macOS 26.7.2 (ms01's Iris Xe, job
+  m3-max-17106). Each case ran in a process of its own, with every setter the
+  renderer sends a render pipeline descriptor, its colour attachments and our
+  render encoder traced. At each create, the descriptor's properties that
+  differ from a new descriptor's were logged.
+  - On both architectures, every pipeline gets `openGLModeEnabled` 1,
+    `sampleMask` `0xffffffff`, `sampleCoverage` 1, `sampleCoverageInvert` 0,
+    `logicOperationEnabled` 0 with `logicOperation` 2, and
+    `depthStencilWriteDisabled` (1 where the pipeline writes no depth or
+    stencil).
+  - GL's XOR gives `logicOperationEnabled` 1 and `logicOperation` 10. GL's
+    sample coverage of 0.5 and sample mask of 3 give `sampleCoverage` 0.5 and
+    `sampleMask` 3.
+  - The renderer also sets `twoSideEnabled`, `pointCoordLowerLeft`,
+    `pointSizeOutputVS` and `needsCustomBorderColorSamplers`, always to 0,
+    including in the two-sided colour and lower-left point sprite cases. The
+    record does not carry these four. metal2vulkan measured that they change
+    nothing Metal draws, at any value it tried.
+  - The renderer never sets `alphaTestEnabled`, `alphaTestFunction`,
+    `clipDistanceEnableMask`, either depth-compare clamp mask,
+    `pointSmoothEnabled`, `vertexAmplificationMode` or
+    `explicitVisibilityGroupID`. It never calls `setAlphaTestReferenceValue:`
+    or `setPointSize:` on the encoder.
+  - So every property the renderer sets to something other than Metal's
+    default is in the record.
+
+  On a host whose Vulkan device lacks `logicOp`, such as MoltenVK on a Mac,
+  metal2vulkan refuses a pipeline of any logic operation other than copy or
+  no-op. The renderer then asks for the same pipeline for its software vertex
+  and fragment fallbacks, each create answers nil, and the draw is lost
+  (gl_cases' logicop case in arm64 27.0.1 on the M3 Max). x86 guests draw the
+  case right on the 780M (RADV), the 3090 (NVIDIA) and the Iris Xe (ANV),
+  whose devices have `logicOp`.
 - Bit 29 is `SURFACE_CACHE_REFUSED`: the host's GPU shares the CPU's memory,
   and it keeps a device cache only of the surfaces whose pages its textures
   cannot use in place, which it answers surface by surface (Decided 14,
