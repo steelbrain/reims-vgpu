@@ -793,12 +793,17 @@ Stages:
       an Intel GPU and gives up without one. RgfxGate's install thread keeps
       the key set at every boot, after the bundle step
       (`guest/rgfxgate/src/RgfxGatePrefs.cpp`), in two files:
-      `/Library/Preferences/com.apple.AppleGVA.plist`, and the global domain's
-      for every user, `/Library/Preferences/.GlobalPreferences.plist`. An
-      absent file gets a fresh XML plist, an XML plist gets the key with every
-      other byte kept, a binary one, as cfprefsd writes it (`defaults delete`
-      leaves an empty one), gets the key with every object kept, and an
-      unreadable one is left and logged.
+      `/Library/Preferences/com.apple.AppleGVA.plist`, and on x86-64 the
+      global domain's for every user,
+      `/Library/Preferences/.GlobalPreferences.plist`. In each, a key already
+      true leaves the file untouched, an absent file gets a fresh XML plist
+      of the key alone, an XML plist gets the key with every other byte kept,
+      a binary one, as cfprefsd writes it (`defaults delete` leaves an empty
+      one), gets the key with every other object's bytes kept, and an
+      unreadable one is left and logged. An arm64 guest keeps the key in the
+      AppleGVA file alone, as before: AppleGVA's AMD flow, the key's one
+      reader, is x86-64's, and the arm64e shared cache of macOS 27.0.1 holds
+      no image with the key's name.
       AppleGVA reads it from the next service start (measured on the guest,
       macOS 26.6.1). The global domain is for the processes that run AppleGVA
       in a sandbox of their own: Safari's H.264 decodes in WebKit's GPU

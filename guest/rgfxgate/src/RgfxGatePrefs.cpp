@@ -9,9 +9,10 @@
 // never saw the key, found no Intel GPU, and its sessions decoded in software;
 // with the key in the global domain the same process's sessions reached the
 // driver (measured on the guest, macOS 26.6.1, Safari's 4K60 H.264 on the RTX
-// 5080). So the key is kept in both: com.apple.AppleGVA's file and the global
-// domain's for every user, /Library/Preferences/.GlobalPreferences.plist, which
-// CFPreferences searches after an application's own. On every normal boot the
+// 5080). So on x86-64 the key is kept in both: com.apple.AppleGVA's file and
+// the global domain's for every user, /Library/Preferences/.GlobalPreferences.plist,
+// which CFPreferences searches after an application's own (an arm64 guest keeps
+// it in the AppleGVA file alone, as before). On every normal boot the
 // install thread checks each file and sets the key where it is not true,
 // keeping the file's other keys (rgfx_gva_pref.h): an absent file is made, an
 // XML plist edited in place, a binary one (cfprefsd's, as `defaults delete`
@@ -38,7 +39,6 @@
 namespace rgfxgate {
 
 static const char kGvaPrefPath[] = "/Library/Preferences/com.apple.AppleGVA.plist";
-static const char kGlobalPrefPath[] = "/Library/Preferences/.GlobalPreferences.plist";
 static const char kGvaKey[] = "gvaForceAMDKE";
 // A larger file is no preferences file of these: left as it is.
 static constexpr size_t kMaxPrefBytes = 64 * 1024;
@@ -182,7 +182,12 @@ void keepVideoPreference() {
 	if (installer)
 		return;
 	keepKeyIn(kGvaPrefPath, "AppleGVA");
-	keepKeyIn(kGlobalPrefPath, "Global");
+#if defined(__x86_64__)
+	// The global domain only where AppleGVA's AMD flow, the key's one reader,
+	// runs: x86-64. The arm64e shared cache of macOS 27.0.1 holds no image
+	// with the key's name, so an arm64 guest's global domain is left as it was.
+	keepKeyIn("/Library/Preferences/.GlobalPreferences.plist", "Global");
+#endif
 }
 
 } // namespace rgfxgate

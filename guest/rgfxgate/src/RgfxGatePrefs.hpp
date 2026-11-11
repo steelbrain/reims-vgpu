@@ -1,8 +1,8 @@
 // RgfxGate's AppleGVA preference (RgfxGatePrefs.cpp): gvaForceAMDKE kept true
-// in /Library/Preferences/com.apple.AppleGVA.plist and in the global domain's
-// /Library/Preferences/.GlobalPreferences.plist, so VideoToolbox's hardware
-// sessions reach our bundle's video driver in every process, a sandboxed one's
-// too.
+// in /Library/Preferences/com.apple.AppleGVA.plist and, on x86-64, in the global
+// domain's /Library/Preferences/.GlobalPreferences.plist, so VideoToolbox's
+// hardware sessions reach our bundle's video driver in every process, a
+// sandboxed one's too.
 #pragma once
 
 namespace rgfxgate {
