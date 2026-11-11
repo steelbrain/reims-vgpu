@@ -523,6 +523,31 @@ offset:bytesPerRow:`, which asks the buffer it makes for the second.
 | the buffer's tiled SPI | made, with the levels asked, storage Shared; level 0 over the buffer's bytes; levels 1 and up rendered to and read by a blit and a kernel, their pixels nowhere in the buffer | the same | the buffer does not answer the selector |
 | the device's tiled SPI | as the buffer's | the same | an unrecognized-selector exception (the device asks its buffer for the buffer's SPI) |
 
+What such a texture holds was measured later (11-11, a scratch probe written from scratch, not
+kept). The probe made a 256 x 256 texture of 9 levels over rows 1024 bytes apart, RGBA8 and
+BGRA8, with Shared and Managed descriptors, by both tiled forms. Each level was read by a blit:
+
+| step | AMD and Intel 630 |
+|---|---|
+| the texture made over the rows (x, y, 0x80, 0xff), then read | level 0 the rows, (128, 128, 128, 255) on average; levels 1 to 8 generated from them, (127, 127, 128, 255) |
+| made over zero bytes, the rows written by the CPU right after the make or 100 ms after, then the first read | the same: the bytes are taken at the first GPU use, not at the make |
+| after a read, the CPU rewrites every byte to 0x40 | no level changes |
+| then `didModifyData` (SPI) | every level 0x40: level 0 copied again and every level generated again |
+| after a read, the CPU writes the rows, calls `didModifyData`, then writes 0x20 with no call, then a read | every level 0x20: `didModifyData` takes the bytes at the next GPU use, not at the call |
+| a blit writes level 0 | level 0 changes; levels 1 and up and the buffer's bytes do not |
+| `storageMode` | 0 (Shared), from a Managed descriptor too |
+
+So the texture is a copy of the buffer's bytes with every level generated from level 0. The copy
+is taken at the first GPU use after the make, and again after each `didModifyData`, and a GPU
+write stays in the texture *(class 3: both x86 GPUs agree)*. Safari 26's CoreGraphics makes such
+textures for the pictures it draws: 1600 x 1600 of 11 levels and 600 x 400 of 10, RGBA8Unorm,
+packed rows at offset 0. It never writes levels 1 and up, and it samples a picture drawn below
+its size with linear mipmap filtering. The host's platform keeps level 0 in step with the bytes
+and leaves levels 1 and up zero, so such a picture draws black or dark (26.7.2 walks 15511,
+15613 and 15614 on a Radeon 780M and an RTX 3090, 11-11). The fix is metal2vulkan's
+(`Buffer::new_tiled_texture`). The bundle sends the host nothing at a `didModifyData` of a
+texture over a Shared buffer, which the fix will also need.
+
 *(class 2: the tiled forms are x86's alone.)* WindowServer's tiled backings use the buffer's SPI
 (RgfxBuffer.mm). Our stack: the public form ends the process at more than one level with
 Metal's words *(class 3)*, sending the host nothing; the tiled forms make one *(class 3)*:
