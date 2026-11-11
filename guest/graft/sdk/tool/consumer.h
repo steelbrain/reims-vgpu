@@ -18,7 +18,9 @@
 // into __DATA,__graft and leaves the consumer dormant: each import from a
 // declared library becomes a local placeholder in the section, the declared
 // libraries leave the Info.plist, and the personalities stay but gain an
-// IOPropertyMatch gate Graft opens when it binds the consumer.
+// IOPropertyMatch gate Graft opens when it binds the consumer. The manifest
+// carries the gate key and each personality's provider matching, by which Graft
+// finds the nubs to open the gate on.
 #pragma once
 #include "base.h"
 #include "macho.h"
@@ -154,6 +156,16 @@ struct Census {
     std::vector<SynthClassRecord> synth;
 };
 
+// How Graft activates the consumer once it has bound it (docs/manifest.md).
+// gate is the property key the staged personalities require in IOPropertyMatch.
+// matching is an XML property list mapping each personality's name to the
+// dictionary that matches its provider: the personality as its author wrote it,
+// less the keys that name the driver. Graft sets the gate key on each nub one of
+// them matches.
+struct Activation {
+    std::string gate, matching;
+};
+
 // Read the imports, sites and vtables a linked consumer's manifest records,
 // throwing Error where Graft could not bind the consumer.
 Census census(const Image &image, const Declaration &declaration, const Layouts &layouts);
@@ -161,20 +173,23 @@ Census census(const Image &image, const Declaration &declaration, const Layouts 
 // image offset; without them every site's placeholder is 0, which gives the
 // manifest its final size.
 Bytes packManifest(const Declaration &declaration, const Layouts &layouts, const Census &found,
-                   const std::string &gate, const std::map<std::string, uint64_t> &placeholders,
-                   uint32_t version);
+                   const Activation &activation,
+                   const std::map<std::string, uint64_t> &placeholders, uint32_t version);
 // The parent slots whose methods Graft must find unchanged, in order.
 std::vector<uint32_t> requiredSlots(const ClassDeclaration &declaration, const ClassLayout &layout,
                                     const std::vector<const VtableRecord *> &vtables);
 
-// The activation property key gating the consumer's personalities.
-std::string gateKey(const Plist &info);
+// The consumer's activation, from its Info.plist. Refuses a personality that is
+// not a dictionary, names no IOProviderClass, has an IOPropertyMatch that is
+// neither a dictionary nor a list of them, or already carries the gate key in
+// its IOPropertyMatch.
+Activation consumerActivation(const Plist &info);
 // The __DATA,__graft size the consumer linked as image needs.
 uint64_t reservationSize(const Image &image, const Declaration &declaration, const Layouts &layouts,
-                         const std::string &gate);
+                         const Activation &activation);
 // image with its manifest written and its imports turned into placeholders.
 Image stageImage(const Image &image, const Declaration &declaration, const Layouts &layouts,
-                 const std::string &gate);
+                 const Activation &activation);
 // Copy the bundle kext to out with its binary staged and its Info.plist gated.
 void stageBundle(const std::string &kext, const Declaration &declaration, const Layouts &layouts,
                  const std::string &out);

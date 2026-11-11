@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: GPL-2.0-or-later OR LGPL-3.0-or-later
-# Every kernel symbol Graft and its owned client RgfxGate use, and how each is
-# reached. tools/internal/hook-symbols.py checks a release's kernel and kernel
+# Every kernel symbol Graft uses, and how each is reached.
+# tools/internal/hook-symbols.py checks a release's kernel and kernel
 # collections for each, with no download and no Apple bytes kept: it prints
-# only the symbol name and where it is defined.
+# only the symbol name and where it is defined. A client project keeps a list
+# of its own symbols in the same form and passes it with --symbols.
 #
 # Columns: symbol  how  role. The script reads only the symbol; how and role
 # are for the reader.
@@ -15,32 +16,6 @@
 _IOLog                                          solve  calibrate the kernel's symbol table against Graft's own IOLog import
 _mp_rendezvous_no_intrs                         solve  stop the other CPUs around a kernel write
 
-# RgfxGate: the code-directory-hash accessors (non-KPI).
-_csfg_get_cdhash                                solve  cdhash of a running file
-_csblob_get_cdhash                              solve  cdhash of a code-sign blob
-
-# RgfxGate: the six MAC dispatchers it routes, each returning early only for
-# the cdhash of the Metal bundle it installs, or for its install thread
-# writing under the bundle's path.
-_mac_file_check_library_validation              route  admit the bundle for library validation
-_mac_file_check_mmap                            route  admit the bundle's executable mapping
-_mac_vnode_check_signature                      route  admit the bundle's ad-hoc signature
-_mac_vnode_check_create                         route  the install thread's writes
-_mac_vnode_check_open                           route  the install thread's writes
-_mac_vnode_check_truncate                       route  the install thread's writes
-
-# RgfxGate: the VFS operations the install calls from kernel context to write
-# the bundle and tag it with the rootless storage class.
-_VNOP_MKDIR                                     link   make the bundle's directories
-_VNOP_REMOVE                                    link   replace a stale file
-_VNOP_RMDIR                                     link   replace a stale directory
-_VNOP_RENAME                                    link   place a file atomically
-_VNOP_RENAMEX                                   link   place a file atomically (swap)
-_VNOP_REMOVEXATTR                               link   clear an xattr
-_VNOP_READDIR                                   link   walk the install tree
-_VNOP_SETXATTR                                  link   set the rootless storage class
-_VNOP_GETXATTR                                  link   read the rootless storage class
-
 # Graft: the OSKext entry points it uses to bind a consumer at the catalogue send.
 __ZN6OSKext24lookupKextWithIdentifierEPKc       solve  find a registered kext by id
 __ZN6OSKext18copyLoadedKextInfoEP7OSArrayS1_    solve  read whether a kext has started
@@ -48,3 +23,7 @@ __ZN6OSKext24copyAllKextPersonalitiesEb         route  one catalogue-send entry
 __ZN6OSKext33sendAllKextPersonalitiesToCatalogEb route  the other catalogue-send entry
 _OSKextLoadKextWithIdentifier                   link   load a System-KC library
 _gOSKextUnresolved                              solve  where an absent weak import binds
+
+# Graft: what it reads a consumer's provider matching with, from its manifest.
+__Z16OSUnserializeXMLPKcPP8OSString             link   parse the matching dictionary
+__ZN12OSDictionary14iterateObjectsEPvPFbS0_PK8OSSymbolP8OSObjectE link   visit each personality

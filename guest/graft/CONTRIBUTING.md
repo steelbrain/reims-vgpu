@@ -30,7 +30,7 @@ Nothing is fetched at build time, and no third-party code goes into the kext.
 | `make kernel-check-arm64e` | compiles the architecture-neutral core and the arm64e layer for arm64e |
 | `make examples` | builds both [examples](examples/README.md) for x86-64 and arm64e, through their own Makefiles |
 | `make core-probe`, `make route-probe` | build the test-only owned clients ([tests/kexts/](tests/kexts/README.md)) |
-| `make lint` | checks formatting, SPDX license lines, text hygiene and Markdown links |
+| `make lint` | checks formatting, SPDX license lines, text hygiene, Markdown links, and that `src/` and `sdk/` name no kext but Graft and Apple's |
 | `make format` | applies clang-format and ruff |
 | `make release` | builds both kexts from the committed sources, with the Xcode `.xcode-version` names, into `dist/graft-<version>/` and `dist/graft-<version>.zip` |
 | `make clean` | removes `build/` |
@@ -77,6 +77,10 @@ guest.
 - What differs between x86-64 and arm64e lives in `src/x86_64/` and
   `src/arm64e/`, behind the interfaces in `src/`
   ([src/README.md](src/README.md#the-architecture-boundary)).
+- Graft serves any kext: a consumer because it carries a manifest, a client
+  because the identifier it passes names a placed kext. `src/` and `sdk/` name
+  no bundle identifier but Graft's own, `ai.aneesiqbal.graft`, and Apple's,
+  and `make lint` checks it.
 - Graft decides from what the running system has. Add no macOS version check,
   no per-release table and no boot-arg.
 - Graft runs with SIP on. A change may not need SIP off, an AMFI-relaxing

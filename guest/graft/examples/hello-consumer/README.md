@@ -24,10 +24,18 @@ sites the compiler emits for the class's constructors, destructor and metaclass,
 `src/Hello.cpp` holds one site of each form, a data pointer and a direct call,
 and its start routine calls through both and records the result.
 
-Graft binds exactly one consumer, the one named in `src/Policy.h`
-(`ai.aneesiqbal.ReimsGraphics`). This example carries that bundle identifier so
-the shipped Graft binds it; its class and executable are named Hello, but the
-identifier must stay `ai.aneesiqbal.ReimsGraphics` to be bound.
+Graft binds every placed kext that carries a manifest, whatever its bundle
+identifier, so this example has its own, `ai.aneesiqbal.graft.HelloConsumer`.
+
+Its personality matches `IOResources`, which every guest registers on both
+architectures, so the example runs without any particular device. It names an
+`IOMatchCategory` of its own, `GraftHelloConsumer`, so it does not compete with
+the other drivers that match `IOResources`. Graft opens the gate on whatever
+provider a personality matches. On `IOResources` that means setting the gate
+property and registering `IOResources` again, which is what
+`IOService::publishResource` does for every resource a driver publishes. Its
+`probe` then declines, so nothing attaches. A real driver's personalities match
+its own device, and Graft opens the gate on that device's nub.
 
 ## Build
 
@@ -56,7 +64,7 @@ ioreg -l -d 1 | grep Graft
 ```
 
 Once Graft has bound the consumer you see `GraftState = active`,
-`GraftClient.ai.aneesiqbal.ReimsGraphics` beginning `bound:`, and this example's
+`GraftClient.ai.aneesiqbal.graft.HelloConsumer` beginning `bound:`, and this example's
 own `GraftHelloConsumerState = passed`. If a provider is not yet registered,
 the consumer's line reads `waiting`. If a layout check fails, it reads
 `refused` with the reason

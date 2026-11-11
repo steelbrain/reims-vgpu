@@ -25,7 +25,7 @@ struct Built {
     graft::tool::Declaration declaration;
     graft::tool::Layouts layouts;
     graft::tool::Plist info;
-    std::string gate;
+    graft::tool::Activation activation;
     graft::tool::Bytes census, unbound, staged;
 
     Built(const std::string &declaration, const std::string &directory, const std::string &name)
@@ -33,7 +33,8 @@ struct Built {
           layouts(graft::tool::readLayouts(work + "/layouts.json")),
           info(graft::tool::parsePlist(
                   graft::tool::readFile(work + "/Unbound.kext/Contents/Info.plist"), "Info.plist")),
-          gate(graft::tool::gateKey(info)), census(graft::tool::readFile(work + "/census")),
+          activation(graft::tool::consumerActivation(info)),
+          census(graft::tool::readFile(work + "/census")),
           unbound(graft::tool::readFile(work + "/Unbound.kext/Contents/MacOS/" + name)),
           staged(graft::tool::readFile(directory + "/" + name + ".kext/Contents/MacOS/" + name)) {}
 };

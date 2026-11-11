@@ -14,7 +14,7 @@ Graft's code applies the lesson, the lesson names the file.
 
 The framework Graft replaces gated each plugin by a minimum and maximum Darwin
 version, and the boot loader's configuration added kernel ranges of its own.
-The loader that bound ReimsGraphics before Graft also checked each parent
+The loader that bound a display driver before Graft also checked each parent
 class against a layout table taken from one release. Every new macOS release
 was refused until someone widened a range or added a table.
 
@@ -152,9 +152,9 @@ and run its constructors, which called through import slots Graft had not yet
 bound.
 
 Hold the consumer back at a stage before it is constructed. A bound
-consumer's personalities carry a passive `IOPropertyMatch` on the device nub,
+consumer's personalities carry a passive `IOPropertyMatch` on the provider nub,
 which IOKit evaluates before it allocates anything. After the bind, Graft
-sets the property on each nub that matches the device and re-registers it, so
+sets the property on each nub a personality matches and re-registers it, so
 matching runs only once the imports and vtables are in place. It watches for
 the nubs with a matching notification rather than looking them up once, so a
 nub published after the bind opens the gate too (`src/KernelBinding.cpp`,
@@ -184,10 +184,10 @@ lookup returned nothing, and Graft refused the consumer at its anchor check.
 A kext that is placed in a collection is not started until a driver matches in
 it or a started kext depends on it.
 
-Make the family a dependency of a kext that always starts. Graft starts on
-every boot, so the arm64e Graft lists that family in its `OSBundleLibraries`,
-and the kernel loads and starts it before Graft. The x86-64 Graft has no such
-family and does not list it (`Makefile`, the `graft-arm64e` rule).
+Start the provider before binding against it. Graft asks the kernel to start
+each library a consumer's manifest names (`OSKextLoadKextWithIdentifier`), on
+arm64e as on x86-64, so Graft itself depends on no consumer's family
+(`src/arm64e/BindingPlacement.cpp`, `locate`).
 
 ## Reading kernel collections
 

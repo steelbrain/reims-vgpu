@@ -54,6 +54,10 @@ private:
     size_t symbolStorageSize = 0;
 };
 
+// Open the running kernel's image from the primary (Boot) kernel collection.
+// collection is that collection once its load commands validate, else null, and
+// is set whether or not the kernel's image then opens, so Graft's start can keep
+// it to tell placed kexts apart even when it refuses.
 bool openKernel(RuntimeImage &kernel, const mach_header_64 *&collection);
 
 // Start-path points that differ by architecture, defined in src/<arch>/Kernel.cpp:

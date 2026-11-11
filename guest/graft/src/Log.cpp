@@ -4,6 +4,8 @@
 // dormant (docs/design.md, "What it reports"). It publishes GraftState,
 // GraftReason, a bounded GraftLog and a GraftClient.<identifier> property per
 // client. No boot-arg turns it on. The bounded buffer drops oldest lines first.
+// On x86-64 the kernel keeps the IOLog lines of a kext OpenCore injected out of
+// the unified log, so there GraftLog is the only record of the steps.
 #include "Log.h"
 #include <IOKit/IOLib.h>
 #include <IOKit/IORegistryEntry.h>

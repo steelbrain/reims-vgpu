@@ -3,9 +3,12 @@
 #include <IOKit/graphics/IOAccelerator.h>
 
 // Several gated personalities, one per IOMatchCategory, all naming this class on
-// the test GPU. Each defers on the manifest gate until Graft binds the consumer
-// and publishes the key; then every category's start() runs. The class binds a
-// real System-KC superclass, so a started personality also proves the bind.
+// the PCI host bridge, matched by its class code (Info.plist). QEMU's q35 and
+// vmapple machines both present a host bridge with no driver attached, so the
+// probe needs no device of its own on either architecture. Each defers on the
+// manifest gate until Graft binds the consumer and publishes the key; then every
+// category's start() runs. The class binds a real System-KC superclass, so a
+// started personality also proves the bind.
 class GraftGateProbe : public IOAccelerator {
     OSDeclareDefaultStructors(GraftGateProbe);
 

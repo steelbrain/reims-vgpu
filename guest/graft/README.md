@@ -1,8 +1,8 @@
 # Graft
 
-Graft is a macOS kernel extension that binds and routes for a fixed set of
-kexts inside macOS virtual machines, with System Integrity Protection on. It
-builds for x86-64 and arm64e guests, and does two jobs:
+Graft is a macOS kernel extension that binds and routes for other kexts
+inside macOS virtual machines, with System Integrity Protection on. Any kext
+can use it. It builds for x86-64 and arm64e guests, and does two jobs:
 
 - It binds a **bound consumer**: a kext injected dormant, which derives from
   classes or calls functions in Apple's System kernel collection. Its build
@@ -20,24 +20,36 @@ IORegistry, and the guest keeps booting.
 
 ## Who Graft serves
 
-Graft serves two kexts, named in [src/Policy.h](src/Policy.h): the bound
-consumer `ai.aneesiqbal.ReimsGraphics` and the owned client
-`ai.aneesiqbal.RgfxGate`. The SDK also requires the consumer's personalities
-to match the PCI device `1234:5247`. These are the guest drivers of
-reims-vgpu, a paravirtual GPU for macOS virtual machines: ReimsGraphics is its
-display and Metal driver, and RgfxGate installs its Metal bundle. Graft
-replaces Lilu for them.
+Graft serves any kext placed in the boot image beside it, as a bound consumer
+or as an owned client. It names none of the kexts it serves, and serving a new
+one needs no change to Graft.
 
-Graft has no plugin interface. Serving another kext means changing
-`src/Policy.h` and rebuilding Graft, and serving another device also means
-changing the device match in the SDK's build tool. The
-[examples](examples/README.md) carry the two pinned identities for that
-reason.
+- **A bound consumer** builds with the SDK's `consumer.mk`
+  ([guide](docs/guides/bound-consumer.md)). At start, Graft looks through every
+  kext placed at boot: the Boot collection's fileset entries on x86-64, and the
+  boot firmware's device-tree nodes on arm64e. It binds each one whose
+  `__DATA,__graft` section starts with the manifest's magic, any number of
+  them. The consumer's personalities match their providers as any driver's do,
+  and Graft opens the consumer's gate on every nub they match.
+- **An owned client** calls the functions in
+  [Graft.h](sdk/include/graft/Graft.h), passing its own bundle identifier
+  ([guide](docs/guides/owned-client.md)). Graft serves a call when that
+  identifier names a kext placed at boot, and several clients can route in one
+  boot.
+
+The [examples](examples/README.md) are one of each, under identifiers of their
+own.
 
 ## Status
 
-This is release 0.1.0. Every boot below ran with SIP on (`csr-active-config`
-0) and no boot-arg for Graft or the kexts it serves.
+This is release 0.2.0. It passes the host tests and the build checks
+([CONTRIBUTING.md](CONTRIBUTING.md#checks)), and its boots are pending: every
+boot below ran release 0.1.0, with SIP on (`csr-active-config` 0) and no
+boot-arg for Graft or the kexts it serves.
+
+Several boots used the guest kexts of reims-vgpu, a paravirtual GPU for macOS
+virtual machines: its display and Metal driver is a bound consumer, and the
+kext that installs its Metal bundle is an owned client.
 
 **x86-64, on macOS 11.7.11 and 26.7.2.**
 

@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later OR LGPL-3.0-or-later
-"""Report which kernel symbols Graft and its owned client use each macOS release defines.
+"""Report which of a list of kernel symbols each macOS release defines.
 
   python3 hook-symbols.py <release-dir> [<release-dir> ...]
   python3 hook-symbols.py --all CACHE        # every release directory under CACHE
   python3 hook-symbols.py --all CACHE --json # the same as JSON
+  python3 hook-symbols.py --symbols FILE ... # the symbols FILE lists, not Graft's
 
 A release is a directory holding an x86-64 `kernel`, `BootKernelExtensions.kc` and
 `SystemKernelExtensions.kc`. Under a cache, each release's directory is named
 `<version>-<build>`, such as `26.7.2-25J55`.
 
-The symbols are in hook-symbols.txt next to this file, the first word of each line; the
-rest of the line says, for a reader, how the symbol is reached and why. For each release
-and each symbol, this prints whether the symbol is a defined global ("def"), an undefined
-reference ("und") or absent ("--") in the kernel, the Boot KC and the System KC. It reads
-Mach-O symbol tables directly and keeps nothing from the binaries but the names it was
-asked about and a yes or no: no Apple bytes are copied, printed or written.
+The symbols are the first word of each line of a list: by default hook-symbols.txt next
+to this file, which holds the symbols Graft uses, or the file --symbols names, such as a
+client's own list in the same form. The rest of the line says, for a reader, how the
+symbol is reached and why. For each release and each symbol, this prints whether the
+symbol is a defined global ("def"), an undefined reference ("und") or absent ("--") in the
+kernel, the Boot KC and the System KC. It reads Mach-O symbol tables directly and keeps
+nothing from the binaries but the names it was asked about and a yes or no: no Apple bytes
+are copied, printed or written.
 
-Exit status is 1 for incomplete or unreadable inputs, 2 when a wanted symbol is a defined
-global in no image of a complete release, else 0.
+Exit status is 1 for incomplete or unreadable inputs or a list that names no symbol, 2
+when a wanted symbol is a defined global in no image of a complete release, else 0.
 """
 
 from __future__ import annotations
@@ -43,11 +46,13 @@ LC_FILESET_ENTRY = 0x80000035
 N_STAB, N_TYPE, N_EXT = 0xE0, 0x0E, 0x01
 N_UNDF, N_ABS, N_SECT = 0x0, 0x2, 0x0E
 
+# The symbols Graft uses.
+GRAFT_SYMBOLS = Path(__file__).with_name("hook-symbols.txt")
 
-def read_wanted() -> list[str]:
-    """The symbols hook-symbols.txt lists, in order: the first word of each line that is
+
+def read_wanted(path: Path) -> list[str]:
+    """The symbols the list at path names, in order: the first word of each line that is
     neither blank nor a comment."""
-    path = Path(__file__).with_name("hook-symbols.txt")
     lines = (line.strip() for line in path.read_text().splitlines())
     return [line.split()[0] for line in lines if line and not line.startswith("#")]
 
@@ -178,6 +183,13 @@ def main() -> int:
         "--all", type=Path, metavar="CACHE", help="every release directory under CACHE"
     )
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--symbols",
+        type=Path,
+        default=GRAFT_SYMBOLS,
+        metavar="FILE",
+        help="the list of symbols to check (default: Graft's, hook-symbols.txt)",
+    )
     args = parser.parse_args()
 
     releases = list(args.releases)
@@ -186,7 +198,14 @@ def main() -> int:
     if not releases:
         parser.error("name at least one release directory, or pass --all CACHE")
 
-    names = read_wanted()
+    try:
+        names = read_wanted(args.symbols)
+    except (ValueError, OSError) as error:
+        sys.stderr.write(f"{args.symbols}: {error}\n")
+        return 1
+    if not names:
+        sys.stderr.write(f"{args.symbols}: names no symbol\n")
+        return 1
     report = {}
     missing = []
     incomplete = False

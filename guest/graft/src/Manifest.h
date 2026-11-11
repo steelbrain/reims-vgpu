@@ -25,5 +25,17 @@ inline const char *libraryAnchor(const View &view, uint32_t library) {
     return nullptr;
 }
 
+// The version of the manifest at bytes when open() refused it for that alone: a
+// sound header whose version this release does not read, as a consumer built
+// with another release's SDK carries. 0 for any other failure, among them a
+// version this release reads whose tables are another architecture's.
+inline uint32_t unsupportedVersion(const void *bytes, Failure failure) {
+    if (failure.error != Error::Version || !bytes)
+        return 0;
+    Header h;
+    memcpy(&h, bytes, sizeof(h));
+    return h.version != Version && h.version != VersionArm64e ? h.version : 0;
+}
+
 } // namespace manifest
 } // namespace graft

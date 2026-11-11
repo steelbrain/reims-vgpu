@@ -15,7 +15,7 @@ using graft::fixup::Error;
 
 namespace {
 
-// A version-3 auth byte: bit 0 signed, bits 1-2 key, bit 3 address diversity.
+// A version-5 auth byte: bit 0 signed, bits 1-2 key, bit 3 address diversity.
 uint8_t opcodeFor(uint8_t key, bool addrDiv) {
     return 0x1 | static_cast<uint8_t>((key & 0x3) << 1) | (addrDiv ? 0x8 : 0x0);
 }

@@ -5,10 +5,9 @@
 // kmod from GRAFT_CLIENT_ID and calls graft_client_initialize() once, from the
 // kext's start routine.
 //
-// Graft serves API calls only for the one owned client src/Policy.h names,
-// ai.aneesiqbal.RgfxGate. Every call here passes that identifier, whatever this
-// kext's own bundle identifier is (here ai.aneesiqbal.graft.HelloClient). A call
-// that passes any other identifier is ignored.
+// Graft serves a call when its identifier names a placed kext, so a client
+// passes its own bundle identifier (here ai.aneesiqbal.graft.HelloClient). A
+// call whose identifier names no placed kext is ignored.
 //
 // This example does the smallest useful thing: it confirms Graft is active, asks
 // for one kernel symbol by name, logs the address, and publishes its state. It
@@ -27,13 +26,14 @@ class GraftHelloClient final : public IOService {
 OSDefineMetaClassAndStructors(GraftHelloClient, IOService);
 
 namespace {
-// The identifier Graft serves (src/Policy.h). It is not this kext's bundle id.
-constexpr const char *Client = "ai.aneesiqbal.RgfxGate";
+// This kext's own bundle identifier, which GRAFT_CLIENT_ID also sets. Graft
+// serves the call because this identifier names a placed kext.
+constexpr const char *Client = "ai.aneesiqbal.graft.HelloClient";
 } // namespace
 
 void graft_client_initialize() {
-    // graft_client_ready is true only when Graft is active and the identifier is
-    // the owned client's. Graft initializes in its own start routine, before a
+    // graft_client_ready is true only when Graft is active and the identifier
+    // names a placed kext. Graft initializes in its own start routine, before a
     // client runs, so this is the ordinary case; a false here means Graft
     // refused to start and its own GraftState says why.
     if (!graft_client_ready(Client)) {

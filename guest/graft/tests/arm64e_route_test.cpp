@@ -53,7 +53,7 @@ void shadowBuilt() {
     stage(ops, originals);
 
     // Route all three, in an order different from the table's, to a set of
-    // replacement targets (raw addresses, as RgfxGate's stripped pointers).
+    // replacement targets (raw addresses, as a client's stripped pointers).
     const char *names[] = {"vnode_check_signature", "file_check_mmap",
                            "file_check_library_validation"};
     uint64_t targets[] = {0xFFFFFE0008000000ULL, 0xFFFFFE0008001000ULL, 0xFFFFFE0008002000ULL};
@@ -156,6 +156,65 @@ void guards() {
     }
     puts("arm64e route: pass (unknown op, slot outside text, slot signature, duplicate, "
          "inputs)");
+}
+
+void chainedShadows() {
+    // Several clients route one after another: each request copies the current
+    // ops (AMFI's first, the last shadow after) and routes into the copy, so a
+    // later client's shadow carries the earlier clients' routed slots unchanged.
+    // The live chaining -- the swap from the current conf, the routed-operation
+    // bookkeeping -- is in src/arm64e/Route.cpp and proven by booting the route
+    // probe; here the ops-carrying property and the re-route guard are checked.
+    uint64_t originals[arm64::OperationCount] = {TextLo + 0x1000, TextLo + 0x2000, TextLo + 0x3000};
+    uint8_t ops[arm64::OpsSize];
+    stage(ops, originals);
+
+    // Client 1 routes file_check_mmap into a fresh copy of AMFI's ops.
+    const char *first[] = {"file_check_mmap"};
+    uint64_t firstTarget[] = {0xFFFFFE0008000000ULL};
+    arm64::Slot firstSlot[1]{};
+    CHECK(arm64::buildShadowOps(ops, sizeof(ops), first, firstTarget, 1, TextLo, TextHi, firstSlot)
+                  .error == Error::None);
+    const arm64::Operation *mmap = arm64::operationFor("file_check_mmap");
+    uint64_t firstValue;
+    memcpy(&firstValue, ops + mmap->offset, sizeof(firstValue));
+
+    // Client 2 copies client 1's shadow and routes vnode_check_signature into it.
+    uint8_t ops2[arm64::OpsSize];
+    memcpy(ops2, ops, sizeof(ops2));
+    const char *second[] = {"vnode_check_signature"};
+    uint64_t secondTarget[] = {0xFFFFFE0008002000ULL};
+    arm64::Slot secondSlot[1]{};
+    CHECK(arm64::buildShadowOps(ops2, sizeof(ops2), second, secondTarget, 1, TextLo, TextHi,
+                                secondSlot)
+                  .error == Error::None);
+
+    // Client 1's routed slot is carried into client 2's shadow unchanged.
+    uint64_t carried;
+    memcpy(&carried, ops2 + mmap->offset, sizeof(carried));
+    CHECK(carried == firstValue);
+    CHECK(refAuthIA(carried, mmap->discriminator) == firstTarget[0]);
+    // Client 2's own slot is routed to its replacement.
+    const arm64::Operation *sig = arm64::operationFor("vnode_check_signature");
+    uint64_t sigValue;
+    memcpy(&sigValue, ops2 + sig->offset, sizeof(sigValue));
+    CHECK(sigValue == refSignIA(secondTarget[0], sig->discriminator));
+    // Each captured original authenticates to AMFI's own function (index 0 is
+    // file_check_mmap, index 2 is vnode_check_signature).
+    CHECK(refAuthIA(firstSlot[0].original, 0) == originals[0]);
+    CHECK(refAuthIA(secondSlot[0].original, 0) == originals[2]);
+
+    // A third client that re-routes client 1's operation is refused: the live
+    // slot now holds client 1's replacement, outside AMFI text, which is exactly
+    // the guard that lets the installer hand back only AMFI's own originals. (The
+    // installer also refuses it by name before reaching here; src/arm64e/Route.cpp.)
+    uint8_t ops3[arm64::OpsSize];
+    memcpy(ops3, ops2, sizeof(ops3));
+    arm64::Slot dupSlot[1]{};
+    auto dup = arm64::buildShadowOps(ops3, sizeof(ops3), first, firstTarget, 1, TextLo, TextHi,
+                                     dupSlot);
+    CHECK(dup.error == Error::SlotOutsideText && dup.index == 0);
+    puts("arm64e route: pass (chained shadows carry prior routes; re-route of a held op refused)");
 }
 
 void confBuilt() {
@@ -336,6 +395,7 @@ int main() {
     constants();
     shadowBuilt();
     guards();
+    chainedShadows();
     confBuilt();
     policyListResolved();
     scanCount();

@@ -24,6 +24,5 @@
         <key>com.apple.kpi.libkern</key><string>8.0.0</string>
         <key>com.apple.kpi.mach</key><string>8.0.0</string>
         <key>com.apple.kpi.unsupported</key><string>8.0.0</string>
-        @GRAFT_ARM64E_LIBS@
     </dict>
 </dict></plist>

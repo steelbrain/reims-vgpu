@@ -5,8 +5,8 @@
     <key>CFBundleIdentifier</key><string>ai.aneesiqbal.graft</string>
     <key>CFBundleName</key><string>Graft</string>
     <key>CFBundlePackageType</key><string>KEXT</string>
-    <key>CFBundleVersion</key><string>0.1.0</string>
-    <key>CFBundleShortVersionString</key><string>0.1.0</string>
+    <key>CFBundleVersion</key><string>0.2.0</string>
+    <key>CFBundleShortVersionString</key><string>0.2.0</string>
     <key>OSBundleCompatibleVersion</key><string>0.1.0</string>
     <key>OSBundleRequired</key><string>Root</string>
     <key>IOKitPersonalities</key><dict>
@@ -24,6 +24,5 @@
         <key>com.apple.kpi.libkern</key><string>8.0.0</string>
         <key>com.apple.kpi.mach</key><string>8.0.0</string>
         <key>com.apple.kpi.unsupported</key><string>8.0.0</string>
-        <key>com.apple.iokit.IOMobileGraphicsFamily</key><string>1.0.0</string>
     </dict>
 </dict></plist>

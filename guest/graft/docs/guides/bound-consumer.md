@@ -7,12 +7,10 @@ it by symbol name at boot. This guide builds one, using
 [examples/hello-consumer](../../examples/hello-consumer/README.md) as the
 running example.
 
-Graft binds one consumer, the bundle identifier `src/Policy.h` names:
-`ai.aneesiqbal.ReimsGraphics`. The example carries that identifier so the
-released Graft binds it. To bind a kext with another identifier, change
-`ConsumerIdentifier` in `src/Policy.h` and build Graft yourself. The SDK
-also requires each of the consumer's personalities to match the PCI device
-`1234:5247` (`IOPCIPrimaryMatch` `0x52471234`).
+Any kext can be a bound consumer. Graft binds every kext placed at boot that
+carries the manifest its build writes, whatever its bundle identifier, and
+opens its gate on whatever provider its personalities match. The example's
+identifier is its own, `ai.aneesiqbal.graft.HelloConsumer`.
 
 ## What you need
 
@@ -74,19 +72,28 @@ running release does not define it, Graft binds it so that
 
 Write `src/Info.plist` as an ordinary kext's:
 
-- `CFBundleIdentifier` is the identifier Graft binds;
-- each personality has `IOProviderClass` `IOPCIDevice` and
-  `IOPCIPrimaryMatch` `0x52471234`;
+- `CFBundleIdentifier` is the kext's own, under which Graft reports its bind;
+- each personality names its provider's class in `IOProviderClass` and
+  matches the provider as any personality does. A driver matches its own
+  device, such as an `IOPCIDevice` by `IOPCIPrimaryMatch`. The example matches
+  `IOResources`, with an `IOMatchCategory` of its own, so that it runs in any
+  guest;
 - `OSBundleLibraries` lists the System-collection libraries from
   `graft.json`, beside your other dependencies;
 - `CFBundleVersion` may be `@VERSION@`, which the build replaces.
 
-The build checks the personalities, removes the System-collection libraries from
-`OSBundleLibraries` (and from any per-architecture list, such as
-`OSBundleLibraries_x86_64`), and gates every personality with a passive
-`IOPropertyMatch`, added to the one a personality already has. The kernel then
-registers the kext but does not construct it until Graft opens the gate. A bound
-consumer calls nothing in Graft, so it needs no dependency on it.
+The build checks that each personality names an `IOProviderClass`, records
+each personality's provider matching in the manifest, removes the
+System-collection libraries from `OSBundleLibraries` (and from any
+per-architecture list, such as `OSBundleLibraries_x86_64`), and gates every
+personality with a passive `IOPropertyMatch`, added to the one a personality
+already has. The kernel then registers the kext but does not construct it
+until Graft opens the gate on a nub the personality's provider matching
+matches. A bound
+consumer calls nothing in Graft, so it needs no dependency on it. The build
+refuses a personality whose `IOPropertyMatch` already holds the gate's key, as
+a staged Info.plist's do, since Graft would then watch only for nubs whose gate
+is already open. Give it the Info.plist you wrote.
 
 ## 4. Link through consumer.mk
 
@@ -144,8 +151,8 @@ make -C examples/hello-consumer ARCH='-arch arm64e'  # arm64e
 Its output is `build/GraftHelloConsumer.kext`, or
 `build/GraftHelloConsumer-arm64e.kext`. A build that cannot produce a
 consumer Graft could bind stops with `consumer:` and the reason, such as a
-provider with no class or anchor, or a personality that does not name the
-device.
+provider with no class or anchor, or a personality that names no
+`IOProviderClass`.
 
 ## 6. Put it in the boot image
 
@@ -165,18 +172,17 @@ In the guest:
 ioreg -l -d 1 | grep Graft
 ```
 
-A bound consumer whose device is present reads:
+A bound consumer whose provider is present reads:
 
 ```
-"GraftClient.ai.aneesiqbal.ReimsGraphics" = "bound: imports and vtables committed; activation gate open on the device nub"
+"GraftClient.ai.aneesiqbal.graft.HelloConsumer" = "bound: imports and vtables committed; activation gate open on a provider of personality GraftHelloConsumer"
 ```
 
-The kernel then constructs and starts it. Until a PCI nub that matches the
-consumer's `IOPCIPrimaryMatch` is published, the reason ends
-`waiting for device 0x52471234 to open the gate` instead. The example also
-publishes its own
-`GraftHelloConsumerState`, `passed` when both of its bound calls into
-IOGraphicsFamily returned success.
+The kernel then constructs and starts it. Until a nub that one of the
+consumer's personalities matches is published, the reason ends
+`waiting for a provider of personality GraftHelloConsumer to open the gate`
+instead. The example also publishes its own `GraftHelloConsumerState`,
+`passed` when both of its bound calls into IOGraphicsFamily returned success.
 
 The consumer's state may also read:
 
@@ -185,3 +191,7 @@ The consumer's state may also read:
   in boot.
 - `refused`, with the reason: Graft will not bind this consumer on this
   boot. [debugging-refusals.md](debugging-refusals.md) explains each reason.
+
+A consumer with no `GraftClient` entry at all was not found at start: Graft's
+log names each consumer it found
+([debugging-refusals.md](debugging-refusals.md#a-bound-consumer)).

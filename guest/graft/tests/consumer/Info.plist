@@ -10,7 +10,7 @@
         <key>Fixture</key><dict>
             <key>IOClass</key><string>Consumer</string>
             <key>IOProviderClass</key><string>IOPCIDevice</string>
-            <key>IOPCIPrimaryMatch</key><string>0x52471234</string>
+            <key>IOPCIClassMatch</key><string>0x0c050000&amp;0xffff0000</string>
         </dict>
     </dict>
     <key>OSBundleLibraries</key><dict>

@@ -7,6 +7,8 @@ tests/consumer/ from its source, for x86-64 and for arm64e. They check that:
 
 - build stages a dormant bundle with a gated Info.plist, and leaves each step's output in
   its work directory;
+- the staged manifest carries each personality's provider matching, as its author wrote
+  it, for any provider, without the gate key or the keys that name the driver;
 - build writes what probe, the two links consumer.mk documents, reserve and stage write when
   run one at a time;
 - each refusal exits 1 with its reason, and a malformed command line exits 2.
@@ -18,6 +20,7 @@ import copy
 import json
 import os
 import plistlib
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -117,6 +120,21 @@ def fixture_declaration():
     return json.loads((FIXTURE / "graft.json").read_text())
 
 
+def provider_matching(binary):
+    """The provider matching the manifest in a staged binary carries, parsed.
+
+    The manifest starts with its magic, "GRFT"; its header is 34 little-endian u32s, of
+    which the fifth is the string table's offset and the last the matching string's offset
+    in it (docs/manifest.md).
+    """
+    data = binary.read_bytes()
+    start = data.index(b"GRFT")
+    header = struct.unpack_from("<34I", data, start)
+    assert header[3] == 136, "not a manifest header"
+    at = start + header[4] + header[33]
+    return plistlib.loads(data[at : data.index(b"\0", at)])
+
+
 class Inputs:
     """The fixture consumer's object, declaration and Info.plist for arch, under root."""
 
@@ -186,6 +204,11 @@ class BuildChecks:
         staged = plistlib.loads((self.output / "Contents/Info.plist").read_bytes())
         self.assertEqual(staged, expected)
 
+    def test_build_writes_the_provider_matching(self):
+        personality = fixture_info()["IOKitPersonalities"]["Fixture"]
+        del personality["IOClass"]
+        self.assertEqual(provider_matching(self.output / BINARY), {"Fixture": personality})
+
     def test_build_leaves_each_steps_output(self):
         self.assertEqual(
             (self.work / "layouts.json").read_text(), json.dumps(LAYOUTS, indent=2) + "\n"
@@ -245,6 +268,55 @@ class BuildArm64eTest(BuildChecks, unittest.TestCase):
         self.assertEqual((process.returncode, process.stderr), (0, ""))
         built = self.inputs.root / "no-arch-flag/Fixture.kext"
         self.assertEqual(files(built), files(self.output))
+
+
+class ProviderMatchingTest(unittest.TestCase):
+    """A consumer's personalities may match any provider. The manifest carries each one's
+    matching as written, its own IOPropertyMatch included, without the gate key, IOClass,
+    CFBundleIdentifier, IOProbeScore or IOMatchCategory."""
+
+    def test_any_provider(self):
+        with tempfile.TemporaryDirectory(prefix="graft-kext-matching-") as temp:
+            inputs = Inputs(Path(temp) / "inputs", "x86_64")
+            info = fixture_info()
+            device = {
+                "IOClass": "Consumer",
+                "IOProviderClass": "IOPCIDevice",
+                "IOPCIClassMatch": "0x03000000&0xff000000",
+                "IOPropertyMatch": [{"model": "one"}, {"model": "two"}],
+                "IOProbeScore": 5000,
+                "IOMatchCategory": "FixtureCategory",
+            }
+            resource = {
+                "IOClass": "Consumer",
+                "IOProviderClass": "IOResources",
+                "IOResourceMatch": "IOKit",
+                "IOPropertyMatch": {"model": "three"},
+                "CFBundleIdentifier": IDENTIFIER,
+            }
+            info["IOKitPersonalities"] = {"Device": device, "Resource": resource}
+            path = inputs.write("any-provider.plist", plistlib.dumps(info))
+            process = inputs.build("any-provider", info_plist=path)
+            self.assertEqual((process.returncode, process.stdout, process.stderr), (0, "", ""))
+            output = inputs.root / "any-provider/Fixture.kext"
+            driver = ("IOClass", "CFBundleIdentifier", "IOProbeScore", "IOMatchCategory")
+            self.assertEqual(
+                provider_matching(output / BINARY),
+                {
+                    name: {k: v for k, v in personality.items() if k not in driver}
+                    for name, personality in info["IOKitPersonalities"].items()
+                },
+            )
+            staged = plistlib.loads((output / "Contents/Info.plist").read_bytes())
+            gate = {f"{IDENTIFIER}.graft-bound": True}
+            self.assertEqual(
+                staged["IOKitPersonalities"]["Device"]["IOPropertyMatch"],
+                [{"model": "one", **gate}, {"model": "two", **gate}],
+            )
+            self.assertEqual(
+                staged["IOKitPersonalities"]["Resource"]["IOPropertyMatch"],
+                {"model": "three", **gate},
+            )
 
 
 class RefusalTest(unittest.TestCase):
@@ -368,17 +440,30 @@ class RefusalTest(unittest.TestCase):
             process = run("probe", path, self.root / f"{name}-layouts.json")
             self.assertRefused(process, "duplicate consumer class")
 
-    def test_a_personality_for_another_device(self):
+    def test_a_personality_that_names_no_provider_class(self):
         info = fixture_info()
-        info["IOKitPersonalities"]["Fixture"]["IOPCIPrimaryMatch"] = "0x12345678"
-        path = self.inputs.write("other-device.plist", plistlib.dumps(info))
-        process = self.inputs.build("other-device", info_plist=path)
-        self.assertRefused(
-            process,
-            "consumer personality Fixture does not match IOPCIPrimaryMatch 0x52471234,"
-            " the device Graft serves",
+        del info["IOKitPersonalities"]["Fixture"]["IOProviderClass"]
+        path = self.inputs.write("no-provider-class.plist", plistlib.dumps(info))
+        process = self.inputs.build("no-provider-class", info_plist=path)
+        self.assertRefused(process, "consumer personality Fixture names no IOProviderClass")
+        self.assertFalse((self.inputs.root / "no-provider-class/Fixture.kext").exists())
+
+    def test_a_personality_that_already_carries_the_gate(self):
+        # As a staged Info.plist's do: its provider matching would then match only nubs
+        # whose gate is already open, so Graft would never open one.
+        key = f"{IDENTIFIER}.graft-bound"
+        reason = (
+            f"consumer personality Fixture already carries the activation key {key} in its "
+            "IOPropertyMatch; give the Info.plist as written, not a staged one"
         )
-        self.assertFalse((self.inputs.root / "other-device/Fixture.kext").exists())
+        cases = (("gated", {key: True}), ("gated-list", [{"model": "one"}, {key: False}]))
+        for name, match in cases:
+            info = fixture_info()
+            info["IOKitPersonalities"]["Fixture"]["IOPropertyMatch"] = match
+            path = self.inputs.write(f"{name}.plist", plistlib.dumps(info))
+            process = self.inputs.build(name, info_plist=path)
+            self.assertRefused(process, reason)
+            self.assertFalse((self.inputs.root / f"{name}/Fixture.kext").exists())
 
     def test_compiler_flags_for_another_architecture(self):
         process = self.inputs.build("other-arch", flags=["-arch", "arm64e", f"-I{FIXTURE}"])

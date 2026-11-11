@@ -24,15 +24,15 @@ namespace {
 void identity() {
     // A method and a subclass override of it share the identity, class aside.
     Identity parent = synth::methodIdentity("__ZN19IOMobileFramebuffer6enableEv");
-    Identity child = synth::methodIdentity("__ZN16ReimsFramebuffer6enableEv");
+    Identity child = synth::methodIdentity("__ZN16SynthFramebuffer6enableEv");
     CHECK(parent.valid() && child.valid());
     CHECK(!strcmp(parent.tail, "6enableEv") && parent.quals == 0 && parent.refqual == 0);
     CHECK(!strcmp(child.tail, "6enableEv"));
 
     // const-ness (the `K` before the class) is part of the identity.
-    Identity constGet = synth::methodIdentity("__ZNK19IOMobileFramebuffer9getStateEv");
+    Identity constGet = synth::methodIdentity("__ZNK19IOMobileFramebuffer8getStateEv");
     CHECK(constGet.valid() && constGet.quals == 1);
-    CHECK(!strcmp(constGet.tail, "9getStateEv"));
+    CHECK(!strcmp(constGet.tail, "8getStateEv"));
 
     // A ref-qualifier is captured too, after the cv-qualifiers.
     Identity refGet = synth::methodIdentity("__ZNO3Foo3barEv");
@@ -56,18 +56,18 @@ void composing() {
 
     // From a subclass override, rebuild the parent's symbol for the same method:
     // the class component changes, everything else is byte-identical.
-    Identity enable = synth::methodIdentity("__ZN16ReimsFramebuffer6enableEv");
+    Identity enable = synth::methodIdentity("__ZN16SynthFramebuffer6enableEv");
     CHECK(synth::composeMemberSymbol(enable, "IOMobileFramebuffer", out, sizeof(out)) > 0);
     CHECK(!strcmp(out, "__ZN19IOMobileFramebuffer6enableEv"));
 
     // const-ness is re-emitted (the `K` before the class).
-    Identity getState = synth::methodIdentity("__ZNK16ReimsFramebuffer9getStateEv");
+    Identity getState = synth::methodIdentity("__ZNK16SynthFramebuffer8getStateEv");
     CHECK(synth::composeMemberSymbol(getState, "IOMobileFramebuffer", out, sizeof(out)) > 0);
-    CHECK(!strcmp(out, "__ZNK19IOMobileFramebuffer9getStateEv"));
+    CHECK(!strcmp(out, "__ZNK19IOMobileFramebuffer8getStateEv"));
 
     // A pure slot sources its symbol from the concrete sibling, not the parent:
     // compose under the sibling class.
-    Identity swap = synth::methodIdentity("__ZN13ReimsGraphics10swap_beginEv");
+    Identity swap = synth::methodIdentity("__ZN12SynthDisplay10swap_beginEv");
     CHECK(synth::composeMemberSymbol(swap, "AppleParavirtDisplay", out, sizeof(out)) > 0);
     CHECK(!strcmp(out, "__ZN20AppleParavirtDisplay10swap_beginEv"));
 
@@ -126,8 +126,8 @@ void fallbackNames() {
     CHECK(!synth::sameMethodName("__ZN3Foo3setEv", "__ZN3Foo8setStateEv"));
     CHECK(!synth::sameMethodName("___cxa_pure_virtual", "___cxa_pure_virtual"));
 
-    // The override is ReimsGraphics::setState in either parameter form.
-    const char *selectors[] = {"__ZN13ReimsGraphics8setStateEb", "__ZN13ReimsGraphics8setStateEj"};
+    // The override is SynthDisplay::setState in either parameter form.
+    const char *selectors[] = {"__ZN12SynthDisplay8setStateEb", "__ZN12SynthDisplay8setStateEj"};
     auto selector = [&](uint32_t s) { return selectors[s]; };
     auto fits = [&](std::initializer_list<const char *> names) {
         return synth::fallbackTargetFits(selector, 2, [&](auto visit) {

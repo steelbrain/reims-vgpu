@@ -13,7 +13,7 @@
 namespace graft {
 namespace fixup {
 
-// The version-3 auth byte (manifest::Site::opcode, ManifestFormat.h): bit 0 signed, bits 1-2
+// The version-5 auth byte (manifest::Site::opcode, ManifestFormat.h): bit 0 signed, bits 1-2
 // the key (0=IA 1=IB 2=DA 3=DB), bit 3 address diversity. Literals here keep this
 // arithmetic header independent of the manifest layer.
 inline uint64_t signPointer(uint64_t pointer, uint8_t key, uint64_t discriminator) {
@@ -60,7 +60,7 @@ inline Error replacement(uint8_t width, uint8_t opcode, uint8_t /*actualOpcode*/
                          uint64_t &value, uint16_t diversity = 0) {
     if (width != 8)
         return Error::Width;
-    if ((opcode & 0xf0) != 0) // only the four v3 auth bits are defined
+    if ((opcode & 0xf0) != 0) // only the four version-5 auth bits are defined
         return Error::Opcode;
     // rebindToPlaceholders (sdk/tool/consumer.cpp) rewrites each provider import to a
     // rebase at the bare placeholder, with no addend, so the kernel signed the

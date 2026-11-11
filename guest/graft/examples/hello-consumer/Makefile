@@ -8,8 +8,8 @@ VERSION = 1.0.0
 SDK = $(shell xcrun --sdk macosx --show-sdk-path)
 ARCH ?= -arch x86_64
 ARCHNAME = $(lastword $(ARCH))
-# x86-64 keeps the plain name tools/internal/boot-core.py expects; other arches
-# suffix so the two builds do not overwrite each other.
+# x86-64 keeps the plain name; other arches suffix so the two builds do not
+# overwrite each other.
 SUFFIX = $(if $(filter x86_64,$(ARCHNAME)),,-$(ARCHNAME))
 BUILD = $(CURDIR)/../../build/hello-consumer$(SUFFIX)
 KEXT = $(CURDIR)/../../build/GraftHelloConsumer$(SUFFIX).kext

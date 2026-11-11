@@ -152,9 +152,11 @@ static void writableSegments() {
     puts("macho writable segments: pass (writable __DATA only, __TEXT and read-only refused)");
 }
 
-// A fileset collection: eachFilesetEntry visits each entry's vmaddr in command
-// order until one is accepted, skipping other commands, and filesetEntry still
-// finds an entry by its bundle identifier.
+// A fileset collection: eachFilesetEntry visits each entry's vmaddr and
+// identifier in command order until one is accepted, skipping other commands and
+// an entry whose identifier is out of bounds or unterminated, and filesetEntry
+// finds an entry by its bundle identifier. Graft finds the bound consumers on
+// x86-64 by this walk.
 static void filesetEntries() {
     struct Entry {
         fileset_entry_command command;
@@ -162,15 +164,15 @@ static void filesetEntries() {
     };
     struct Collection {
         mach_header_64 mh;
-        Entry entries[3];
+        Entry entries[4];
         load_command other;
     } image{};
     image.mh.magic = MH_MAGIC_64;
     image.mh.filetype = MH_FILESET;
-    image.mh.ncmds = 4;
+    image.mh.ncmds = 5;
     image.mh.sizeofcmds = sizeof(image) - sizeof(image.mh);
-    const char *ids[] = {"com.example.a", "com.example.b", "com.example.c"};
-    for (uint32_t i = 0; i < 3; ++i) {
+    const char *ids[] = {"com.example.a", "com.example.b", "com.example.c", "com.example.d"};
+    for (uint32_t i = 0; i < 4; ++i) {
         auto &entry = image.entries[i];
         entry.command.cmd = LC_FILESET_ENTRY;
         entry.command.cmdsize = sizeof(Entry);
@@ -178,30 +180,42 @@ static void filesetEntries() {
         entry.command.entry_id.offset = sizeof(entry.command);
         strlcpy(entry.id, ids[i], sizeof(entry.id));
     }
+    // The fourth entry's identifier fills its command with no terminator.
+    memset(image.entries[3].id, 'd', sizeof(image.entries[3].id));
     image.other.cmd = LC_UUID;
     image.other.cmdsize = sizeof(image.other);
     CHECK(commandsValid(&image.mh));
 
     uint64_t seen[4] = {};
+    const char *named[4] = {};
     size_t count = 0;
-    CHECK(eachFilesetEntry(&image.mh, [&](uint64_t vmaddr) {
-              seen[count++] = vmaddr;
+    CHECK(eachFilesetEntry(&image.mh, [&](uint64_t vmaddr, const char *id) {
+              seen[count] = vmaddr;
+              named[count++] = id;
               return false;
           }) == 0);
     CHECK(count == 3 && seen[0] == 0x1000 && seen[1] == 0x2000 && seen[2] == 0x3000);
+    CHECK(!strcmp(named[0], "com.example.a") && !strcmp(named[2], "com.example.c"));
     count = 0;
-    CHECK(eachFilesetEntry(&image.mh, [&](uint64_t vmaddr) {
+    CHECK(eachFilesetEntry(&image.mh, [&](uint64_t vmaddr, const char *) {
               ++count;
               return vmaddr == 0x2000;
           }) == 0x2000);
     CHECK(count == 2);
     CHECK(filesetEntry(&image.mh, "com.example.c") == 0x3000);
     CHECK(filesetEntry(&image.mh, "com.example.d") == 0);
+    CHECK(filesetEntry(&image.mh, "com.example.e") == 0);
+    image.entries[1].command.entry_id.offset = sizeof(Entry); // past its command
+    count = 0;
+    eachFilesetEntry(&image.mh, [&](uint64_t, const char *) { return ++count, false; });
+    CHECK(count == 2 && filesetEntry(&image.mh, "com.example.b") == 0);
 
     image.mh.filetype = MH_KEXT_BUNDLE; // not a collection: nothing is visited
     count = 0;
-    CHECK(eachFilesetEntry(&image.mh, [&](uint64_t) { return ++count, true; }) == 0 && !count);
-    puts("macho fileset: pass (entries in order, stop on accept, lookup by identifier)");
+    CHECK(eachFilesetEntry(&image.mh, [&](uint64_t, const char *) { return ++count, true; }) == 0 &&
+          !count);
+    puts("macho fileset: pass (entries and identifiers in order, stop on accept, malformed "
+         "identifiers skipped, lookup by identifier)");
 }
 
 // Symbol and string tables must lie inside __LINKEDIT's file-backed bytes,

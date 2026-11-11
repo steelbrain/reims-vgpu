@@ -3,6 +3,7 @@
 // (src/x86_64/X86Route.h). It runs on x86-64 code, so it is built for x86-64
 // and runs under Rosetta on Apple silicon.
 #include "Check.h"
+#include "Policy.h"
 #include "x86_64/X86Route.h"
 #include <initializer_list>
 #include <stdio.h>
@@ -331,12 +332,29 @@ static void execution() {
 }
 #endif
 
+// The route pool and the per-request cap (src/Policy.h), and the invariant that
+// ties the executable storage src/x86_64/Route.cpp reserves to the pool size.
+// The transaction behaviour that spends the pool -- several clients sharing it
+// first come first served, and a function one client holds refused to the next
+// -- lives in the kernel-only installer and is proven by booting the core probe.
+static void capacity() {
+    CHECK(graft::policy::RouteCapacity == 32);
+    CHECK(graft::policy::MaxRequestRoutes == 16);
+    // Graft's own two catalogue routes are part of the shared pool, and a single
+    // request can never ask for more than the pool can hold beyond them.
+    CHECK(graft::policy::MaxRequestRoutes <= graft::policy::RouteCapacity - 2);
+    // src/x86_64/Route.cpp static-asserts this same product for its __TEXT fill.
+    CHECK(graft::policy::RouteCapacity * MaxTrampoline == 8192);
+    puts("x86 capacity: pass (32-slot shared pool, 16-route request cap, 8 KiB storage)");
+}
+
 int main() {
     decoding();
     plainAndRip();
     branches();
     failures();
     boundedInputs();
+    capacity();
 #if defined(__x86_64__)
     execution();
 #endif

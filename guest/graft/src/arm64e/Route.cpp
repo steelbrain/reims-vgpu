@@ -2,14 +2,17 @@
 // The arm64e route installer (src/Route.h's interface). On x86-64 Graft routes a
 // client's kernel entries through trampolines it writes into kernel text. On
 // arm64 the collection's text and AMFI's policy ops table are read-only when
-// Graft runs (its kmod start is after machine lockdown), so an owned client's
-// admission hooks are routed by shadowing AMFI's MAC policy: Graft copies AMFI's
-// mac_policy_ops and mac_policy_conf into its own writable memory, re-signs the
-// routed op slots in the shadow ops for the client's replacements, points the
-// shadow conf's mpc_ops at the shadow ops, and repoints the one writable
-// mac_policy_list element whose mpc is AMFI's conf at the shadow conf. That
-// single element store is the only live kernel write; both pointers it touches
-// are stored raw, so only the op function pointers are re-signed. The plan
+// Graft runs (its kmod start is after machine lockdown), so a client's admission
+// hooks are routed by shadowing AMFI's MAC policy: Graft copies the current
+// mac_policy_ops and mac_policy_conf into fresh writable memory, re-signs the
+// routed op slots in the copy for the client's replacements, points the copy's
+// mpc_ops at the copy's ops, and repoints the one writable mac_policy_list
+// element from the conf it currently holds to the copy. That single element
+// store is the only live kernel write; both pointers it touches are stored raw,
+// so only the op function pointers are re-signed. The "current" conf and ops are
+// AMFI's own before any client routes and the newest shadow afterwards, so each
+// client's request builds on the last and several clients route one after
+// another; an operation one client holds is refused to the next. The plan
 // arithmetic and the ABI constants are the pure, host-tested Arm64Route.h; this
 // file owns resolution, the live reads and the fail-safe transaction. The x86-64
 // installer is src/x86_64/Route.cpp.
@@ -33,18 +36,37 @@ namespace graft {
 namespace {
 const RuntimeImage *kernel;
 IOLock *routeLock;
-bool used; // the owned client's shadow is installed at most once
-char refusal[192];
 
-// 8-aligned writable backing for the shadow ops and conf, in Graft's own __DATA
-// (the Auxiliary collection maps Graft read-write). Because AMFI signs every ops
-// slot with no address diversity, the wholesale copy keeps the untouched slots'
-// signatures valid at this new address, and the shadow lives for the routes'
-// lifetime.
+// The shared state of the arm64e shadow mechanism, guarded by routeLock. AMFI's
+// policy-list element is located once (established), and the conf and ops it
+// currently points at are kept: AMFI's own before any client routes, the newest
+// shadow afterwards. Each client request copies the current ops and conf, routes
+// its operations into the copy, and swaps the element from the current conf to
+// the copy, so several clients route one after another. routedOp marks each
+// operation one client already holds, so the next finds AMFI's own function in
+// the current ops rather than a prior client's replacement.
+bool established;
+uint64_t policyElement;
+uint64_t currentConf;
+uint64_t currentOps;
+bool routedOp[arm64::OperationCount];
+
 static_assert(arm64::OpsSize % sizeof(uint64_t) == 0, "shadow ops alignment");
 static_assert(arm64::ConfSize % sizeof(uint64_t) == 0, "shadow conf alignment");
-uint64_t shadowOps[arm64::OpsSize / sizeof(uint64_t)];
-uint64_t shadowConf[arm64::ConfSize / sizeof(uint64_t)];
+
+// Allocate 8-aligned, zeroed, boot-lifetime backing for a shadow ops table or
+// conf. Because AMFI signs every ops slot with no address diversity, the
+// wholesale copy keeps the untouched slots' signatures valid at this new
+// address, so any 8-aligned block serves. A superseded shadow is never freed:
+// a concurrent MAC check may still read it for the rest of the boot.
+uint64_t *shadowAlloc(size_t size) {
+    auto block = static_cast<uint64_t *>(IOMalloc(size));
+    if (block)
+        memset(block, 0, size);
+    return block;
+}
+
+char refusal[192];
 
 void refuse(const char *format, ...) __attribute__((format(printf, 1, 2)));
 void refuse(const char *format, ...) {
@@ -262,10 +284,7 @@ bool routeKernel(const char *client, const RouteRequest *requests, size_t count)
     bool ok = true;
     const char *names[arm64::OperationCount] = {};
     uint64_t targets[arm64::OperationCount] = {};
-    if (used) {
-        refuse("the owned client's routes are already installed");
-        ok = false;
-    } else if (count > arm64::OperationCount) {
+    if (count > arm64::OperationCount) {
         refuse("transaction: %zu requests exceed the %zu routable operations", count,
                arm64::OperationCount);
         ok = false;
@@ -291,6 +310,16 @@ bool routeKernel(const char *client, const RouteRequest *requests, size_t count)
                 ok = false;
                 break;
             }
+        // Refuse an operation a prior client already routed. Its slot in the
+        // current ops points at that client's replacement, not AMFI's own
+        // function, so routing it again would hand this client a non-AMFI
+        // original. One operation belongs to one client for the boot.
+        const arm64::Operation *op = arm64::operationFor(request.symbol);
+        if (op && routedOp[static_cast<size_t>(op - &arm64::Operations[0])]) {
+            refuse("%s: already routed by an earlier client", request.symbol);
+            ok = false;
+            break;
+        }
         names[i] = request.symbol;
         targets[i] = reinterpret_cast<uint64_t>(request.replacement);
     }
@@ -301,17 +330,23 @@ bool routeKernel(const char *client, const RouteRequest *requests, size_t count)
         refuse("AMFI image or its executable range not found");
         ok = false;
     }
-    // Require each replacement to lie in one of the owned client's executable
+    // Require each replacement to lie in one of the client's own executable
     // segments, so a client that passes a data pointer refuses here rather than
     // panicking when AMFI's dispatch first branches to the shadow slot. The
     // firmware places the client in the Auxiliary collection and names its image
-    // by bundle identifier, as it names the consumer's (placedBase). A
+    // by bundle identifier, as it names each kext it places (placedBase); a
+    // client it names no image for is refused, not skipped, so a route's
+    // replacement is always tied to the client's real placed code. A
     // replacement is a signed function pointer, so its stripped address is
-    // compared. A client the firmware names no image for is left unchecked, as
-    // on x86-64.
+    // compared. Graft's own routing never reaches here with a null client.
     uint64_t clientBase = ok && client ? placedBase(collection, client) : 0;
+    if (ok && client && !clientBase) {
+        refuse("the client %s names no placed image", client);
+        ok = false;
+    }
     RuntimeImage clientImage;
-    if (clientBase && !clientImage.map(reinterpret_cast<const mach_header_64 *>(clientBase))) {
+    if (ok && clientBase &&
+        !clientImage.map(reinterpret_cast<const mach_header_64 *>(clientBase))) {
         refuse("the client's placed image cannot be read (%s)", clientImage.error());
         ok = false;
     }
@@ -320,17 +355,40 @@ bool routeKernel(const char *client, const RouteRequest *requests, size_t count)
             refuse("request %zu: replacement is not in the client's executable text", i);
             ok = false;
         }
-    uint64_t elementMpc = 0, amfiConf = 0, amfiOps = 0;
-    if (ok && !findAmfiPolicy(collection, textLow, textHigh, elementMpc, amfiConf, amfiOps))
-        ok = false;
 
+    // Locate AMFI's policy-list element the first time any client routes. After
+    // that the element holds a shadow conf, so AMFI's own signature no longer
+    // finds it: the remembered element and the current conf/ops are reused. The
+    // element's alignment and writability are checked once, when it is adopted.
+    if (ok && !established) {
+        uint64_t mpc = 0, amfiConf = 0, amfiOps = 0;
+        if (!findAmfiPolicy(collection, textLow, textHigh, mpc, amfiConf, amfiOps)) {
+            ok = false;
+        } else if (mpc % sizeof(uint64_t) || elementWritability(mpc) == Writability::ReadOnly) {
+            refuse("policy-list element is not in writable memory");
+            ok = false;
+        } else {
+            policyElement = mpc;
+            currentConf = amfiConf;
+            currentOps = amfiOps;
+        }
+    }
+
+    // Build a fresh shadow from the current ops and conf, route into the copy,
+    // and keep it for the boot. The copies are freed only on a failure that never
+    // published them (below); a superseded live shadow is never freed.
     arm64::Slot slots[arm64::OperationCount] = {};
-    auto *ops = reinterpret_cast<uint8_t *>(shadowOps);
-    auto *conf = reinterpret_cast<uint8_t *>(shadowConf);
+    uint64_t *ops = ok ? shadowAlloc(arm64::OpsSize) : nullptr;
+    uint64_t *conf = ok ? shadowAlloc(arm64::ConfSize) : nullptr;
+    if (ok && (!ops || !conf || reinterpret_cast<uintptr_t>(ops) % sizeof(uint64_t) ||
+               reinterpret_cast<uintptr_t>(conf) % sizeof(uint64_t))) {
+        refuse("shadow allocation unavailable or misaligned");
+        ok = false;
+    }
     if (ok) {
-        memcpy(ops, reinterpret_cast<const void *>(amfiOps), arm64::OpsSize);
-        auto failure = arm64::buildShadowOps(ops, arm64::OpsSize, names, targets, count, textLow,
-                                             textHigh, slots);
+        memcpy(ops, reinterpret_cast<const void *>(currentOps), arm64::OpsSize);
+        auto failure = arm64::buildShadowOps(reinterpret_cast<uint8_t *>(ops), arm64::OpsSize,
+                                             names, targets, count, textLow, textHigh, slots);
         if (failure.error != arm64::Error::None) {
             refuse("%s: %s", names[failure.index] ? names[failure.index] : "(unnamed)",
                    arm64::describe(failure.error));
@@ -338,20 +396,13 @@ bool routeKernel(const char *client, const RouteRequest *requests, size_t count)
         }
     }
     if (ok) {
-        memcpy(conf, reinterpret_cast<const void *>(amfiConf), arm64::ConfSize);
-        auto error = arm64::buildShadowConf(conf, arm64::ConfSize, reinterpret_cast<uint64_t>(ops));
+        memcpy(conf, reinterpret_cast<const void *>(currentConf), arm64::ConfSize);
+        auto error = arm64::buildShadowConf(reinterpret_cast<uint8_t *>(conf), arm64::ConfSize,
+                                            reinterpret_cast<uint64_t>(ops));
         if (error != arm64::Error::None) {
             refuse("shadow conf: %s", arm64::describe(error));
             ok = false;
         }
-    }
-    if (ok && (elementMpc % sizeof(uint64_t) ||
-               elementWritability(elementMpc) == Writability::ReadOnly)) {
-        // The one live write is the policy-list element's mpc. Require it
-        // 8-aligned and in writable memory, since a store to read-only memory
-        // would fault rather than refuse.
-        refuse("policy-list element is not in writable memory");
-        ok = false;
     }
     if (ok) {
         // Publish each callable original before the swap makes the shadow live, so
@@ -360,27 +411,40 @@ bool routeKernel(const char *client, const RouteRequest *requests, size_t count)
             __atomic_store_n(requests[i].original, reinterpret_cast<void *>(slots[i].original),
                              __ATOMIC_RELEASE);
         __asm__ volatile("dsb ish" ::: "memory");
-        // One atomic 8-byte compare-and-exchange repoints the element from AMFI's
-        // conf to the shadow conf: a concurrent MAC hook reads one whole pointer
-        // or the other, never a torn value. It swaps only when the element still
-        // holds AMFI's conf, so a shifted or already-swapped list refuses rather
-        // than trampling an unexpected value, and a failed swap has written
-        // nothing.
-        auto *element = reinterpret_cast<uint64_t *>(elementMpc);
-        uint64_t expected = amfiConf;
-        uint64_t shadowConfAddress = reinterpret_cast<uint64_t>(conf);
-        if (__atomic_compare_exchange_n(element, &expected, shadowConfAddress, false,
-                                        __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
-            used = true;
-            for (size_t i = 0; i < count; ++i)
+        // One atomic 8-byte compare-and-exchange repoints the element from the
+        // conf it currently holds to the new shadow conf: a concurrent MAC hook
+        // reads one whole pointer or the other, never a torn value. It swaps only
+        // when the element still holds the current conf, so a shifted or
+        // externally changed list refuses rather than trampling an unexpected
+        // value, and a failed swap has written nothing.
+        auto *element = reinterpret_cast<uint64_t *>(policyElement);
+        uint64_t expected = currentConf;
+        uint64_t newConf = reinterpret_cast<uint64_t>(conf);
+        if (__atomic_compare_exchange_n(element, &expected, newConf, false, __ATOMIC_RELEASE,
+                                        __ATOMIC_RELAXED)) {
+            established = true;
+            currentConf = newConf;
+            currentOps = reinterpret_cast<uint64_t>(ops);
+            for (size_t i = 0; i < count; ++i) {
+                const arm64::Operation *op = arm64::operationFor(names[i]);
+                if (op)
+                    routedOp[static_cast<size_t>(op - &arm64::Operations[0])] = true;
                 note("route: %s installed (AMFI ops +0x%x via shadow)", names[i],
                      static_cast<unsigned>(slots[i].offset));
+            }
         } else {
             for (size_t i = 0; i < count; ++i)
                 __atomic_store_n(requests[i].original, nullptr, __ATOMIC_RELEASE);
-            refuse("policy-list element did not hold AMFI's conf");
+            refuse("policy-list element did not hold the current conf");
             ok = false;
         }
+    }
+    if (!ok) {
+        // The shadow was never installed, so no MAC check can reach it; free it.
+        if (conf)
+            IOFree(conf, arm64::ConfSize);
+        if (ops)
+            IOFree(ops, arm64::OpsSize);
     }
 
     char reason[sizeof(refusal)];

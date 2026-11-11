@@ -84,6 +84,31 @@ class LintTest(unittest.TestCase):
             ],
         )
 
+    def test_identifiers(self):
+        self.write(
+            "src/Policy.h",
+            HEADER
+            + 'const char *own = "ai.aneesiqbal.graft", *amfi = "com.apple.driver.AMFI";\n'
+            + 'const char *pinned = "com.vendor.Driver"; // also org.vendor.Other\n'
+            + "/* GraftClient.ai.vendor.Client */ size_t n = it.first.second;\n"
+            + "char quote = '\"'; // e.g. Graft.kext 0.1.0, src/x86_64/Route.cpp\n",
+        )
+        self.write(
+            "sdk/README.md",
+            "`consumer.mk` 1.2.3, com.example.Family and uk.co.vendor.Driver.\n",
+        )
+        self.write("tests/Fixture.cpp", HEADER + 'const char *id = "com.vendor.Driver";\n')
+        found = "names a kext other than Graft or Apple's"
+        self.assertEqual(
+            lint.lint(self.root),
+            [
+                f"sdk/README.md:1: {found}: uk.co.vendor.Driver",
+                f"src/Policy.h:3: {found}: com.vendor.Driver",
+                f"src/Policy.h:3: {found}: org.vendor.Other",
+                f"src/Policy.h:4: {found}: ai.vendor.Client",
+            ],
+        )
+
     def test_slugs(self):
         self.assertEqual(lint.slug("`make lint`, explained!"), "make-lint-explained")
         self.assertEqual(lint.slug("3. Graft's x86-64 core"), "3-grafts-x86-64-core")

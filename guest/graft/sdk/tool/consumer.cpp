@@ -3,7 +3,6 @@
 
 #include "json.h"
 #include "manifest.h"
-#include "policy.h"
 #include "process.h"
 
 #include <algorithm>
@@ -30,7 +29,7 @@ constexpr uint64_t PlaceholderSize = 32;
 const std::string ProbeClass = "GraftLayoutProbe";
 
 // The suffix that forms a consumer's activation property key from its bundle
-// identifier. Graft sets the key on the device nub once it has bound the
+// identifier. Graft sets the key on each provider nub once it has bound the
 // consumer; the staged personalities carry it as an IOPropertyMatch, so none of
 // them matches, or is even constructed, until then.
 const std::string GateSuffix = ".graft-bound";
@@ -945,15 +944,19 @@ const std::string &plistString(const Plist &info, const std::string &key) {
     return value->text;
 }
 
-// The consumer's personalities, gated on the activation key. Each keeps its own
-// keys, must name the device, and gains the bundle's CFBundleIdentifier and an
-// IOPropertyMatch requiring the key on the device nub it attaches to. The kernel
-// registers the personalities when the consumer loads, but none matches until
-// Graft sets the key on the nub after binding, so the consumer is not even
-// constructed until then. A personality's own IOPropertyMatch, a dictionary or
-// a list of them any one of which matches, keeps its properties and gains the
-// key, in each dictionary of a list.
-Plist gatedPersonalities(const Plist &info) {
+std::string gateKey(const Plist &info) {
+    return plistString(info, "CFBundleIdentifier") + GateSuffix;
+}
+
+// The consumer's personalities, as its author wrote them. IOKit matches a
+// personality only against a provider of the class its IOProviderClass names, so
+// each must name one; Graft watches for providers by the same dictionaries. A
+// personality's own IOPropertyMatch, where it has one, is a dictionary or a list
+// of them any one of which matches, and none may hold the gate key already, as a
+// staged Info.plist's do: Graft would then watch only for nubs whose gate is
+// already open, and never open one.
+const Plist &personalities(const Plist &info) {
+    std::string key = gateKey(info);
     const Plist *personalities = info.find("IOKitPersonalities");
     bool none = !personalities ||
                 (personalities->kind == Plist::Kind::Dict && personalities->dict.empty());
@@ -961,15 +964,43 @@ Plist gatedPersonalities(const Plist &info) {
         throw Error("consumer has no personalities to gate");
     if (personalities->kind != Plist::Kind::Dict)
         throw Error("Info.plist IOKitPersonalities is not a dictionary");
-    std::string key = gateKey(info);
-    Plist gated = Plist::makeDict();
     for (const auto &[name, value] : personalities->dict) {
         if (value.kind != Plist::Kind::Dict)
             throw Error("consumer personality " + name + " is not a dictionary");
-        const Plist *match = value.find("IOPCIPrimaryMatch");
-        if (!match || match->kind != Plist::Kind::String || match->text != DeviceMatch)
-            throw Error("consumer personality " + name + " does not match IOPCIPrimaryMatch " +
-                        DeviceMatch + ", the device Graft serves");
+        const Plist *provider = value.find("IOProviderClass");
+        if (!provider || provider->kind != Plist::Kind::String || provider->text.empty())
+            throw Error("consumer personality " + name + " names no IOProviderClass");
+        const Plist *properties = value.find("IOPropertyMatch");
+        auto dictionary = [](const Plist &one) { return one.kind == Plist::Kind::Dict; };
+        if (properties && !dictionary(*properties) &&
+            (properties->kind != Plist::Kind::Array || properties->array.empty() ||
+             !std::all_of(properties->array.begin(), properties->array.end(), dictionary)))
+            throw Error("consumer personality " + name +
+                        " has an IOPropertyMatch that is not a dictionary or a list of them");
+        auto gated = [&key](const Plist &one) { return one.find(key) != nullptr; };
+        if (properties &&
+            (properties->kind == Plist::Kind::Dict
+                     ? gated(*properties)
+                     : std::any_of(properties->array.begin(), properties->array.end(), gated)))
+            throw Error("consumer personality " + name + " already carries the activation key " +
+                        key +
+                        " in its IOPropertyMatch; give the Info.plist as written, not a "
+                        "staged one");
+    }
+    return *personalities;
+}
+
+// The consumer's personalities, gated on the activation key. Each keeps its own
+// keys and gains the bundle's CFBundleIdentifier and an IOPropertyMatch requiring
+// the key on the provider nub it attaches to: in its own IOPropertyMatch
+// dictionary, or in each dictionary of its list. The kernel registers the
+// personalities when the consumer loads, but none matches until Graft sets the
+// key on the nub after binding, so the consumer is not even constructed until
+// then.
+Plist gatedPersonalities(const Plist &info) {
+    std::string key = gateKey(info);
+    Plist gated = Plist::makeDict();
+    for (const auto &[name, value] : personalities(info).dict) {
         Plist personality = value;
         personality.set("CFBundleIdentifier",
                         Plist::makeString(plistString(info, "CFBundleIdentifier")));
@@ -978,23 +1009,20 @@ Plist gatedPersonalities(const Plist &info) {
             personality.set("IOPropertyMatch", Plist::makeDict());
             properties = personality.find("IOPropertyMatch");
         }
-        std::vector<Plist *> gates;
         if (properties->kind == Plist::Kind::Dict)
-            gates.push_back(properties);
-        else if (properties->kind == Plist::Kind::Array)
+            properties->set(key, Plist::makeBoolean(true));
+        else
             for (Plist &each : properties->array)
-                gates.push_back(&each);
-        if (gates.empty() || std::any_of(gates.begin(), gates.end(), [](const Plist *each) {
-                return each->kind != Plist::Kind::Dict;
-            }))
-            throw Error("consumer personality " + name +
-                        " has an IOPropertyMatch that is not a dictionary or a list of them");
-        for (Plist *each : gates)
-            each->set(key, Plist::makeBoolean(true));
+                each.set(key, Plist::makeBoolean(true));
         gated.set(name, std::move(personality));
     }
     return gated;
 }
+
+// The keys of a personality that name the driver it starts rather than the
+// provider it matches.
+const char *const DriverKeys[] = {"IOClass", "CFBundleIdentifier", "IOProbeScore",
+                                  "IOMatchCategory"};
 
 } // namespace
 
@@ -1220,11 +1248,11 @@ std::vector<uint32_t> requiredSlots(const ClassDeclaration &declaration, const C
 }
 
 Bytes packManifest(const Declaration &config, const Layouts &layouts, const Census &found,
-                   const std::string &gate, const std::map<std::string, uint64_t> &placeholders,
-                   uint32_t version) {
+                   const Activation &activation,
+                   const std::map<std::string, uint64_t> &placeholders, uint32_t version) {
     StringTable strings;
-    uint32_t gateOffset = strings.add(gate);
-    uint32_t deviceOffset = strings.add(DeviceMatch);
+    uint32_t gateOffset = strings.add(activation.gate);
+    uint32_t matchingOffset = strings.add(activation.matching);
     Rows libraries, imports, candidates, sites, classes, slots, vtables, overrides, segments, fills,
             selectors, synthOverrides, synthClasses;
     for (const LibraryDeclaration &library : config.libraries) {
@@ -1327,7 +1355,7 @@ Bytes packManifest(const Declaration &config, const Layouts &layouts, const Cens
     header.size = headerSize + static_cast<uint32_t>(body.size());
     header.headerSize = headerSize;
     header.gate = gateOffset;
-    header.device = deviceOffset;
+    header.matching = matchingOffset;
     Bytes out;
     encode(out, header);
     out.insert(out.end(), body.begin(), body.end());
@@ -1341,19 +1369,28 @@ Bytes packManifest(const Declaration &config, const Layouts &layouts, const Cens
     return out;
 }
 
-std::string gateKey(const Plist &info) {
-    return plistString(info, "CFBundleIdentifier") + GateSuffix;
+Activation consumerActivation(const Plist &info) {
+    std::string key = gateKey(info);
+    Plist matching = Plist::makeDict();
+    for (const auto &[name, value] : personalities(info).dict) {
+        Plist provider = value;
+        for (const char *driver : DriverKeys)
+            provider.erase(driver);
+        matching.set(name, std::move(provider));
+    }
+    Bytes xml = dumpPlist(matching);
+    return {key, std::string(xml.begin(), xml.end())};
 }
 
 uint64_t reservationSize(const Image &image, const Declaration &config, const Layouts &layouts,
-                         const std::string &gate) {
+                         const Activation &activation) {
     Census found = census(image, config, layouts);
-    Bytes manifest = packManifest(config, layouts, found, gate, {}, manifestVersion(image));
+    Bytes manifest = packManifest(config, layouts, found, activation, {}, manifestVersion(image));
     return manifest.size() + PlaceholderAlignment - 1 + PlaceholderSize * found.imports.size();
 }
 
 Image stageImage(const Image &image, const Declaration &config, const Layouts &layouts,
-                 const std::string &gate) {
+                 const Activation &activation) {
     const Section &section = image.section("__DATA", "__graft");
     // Staging writes the manifest over the reservation's bytes in the file. A
     // zerofill section has none, and its offset and size name no file range.
@@ -1363,7 +1400,7 @@ Image stageImage(const Image &image, const Declaration &config, const Layouts &l
     image.bounds(section.offset, section.size);
     uint32_t version = manifestVersion(image);
     Census found = census(image, config, layouts);
-    Bytes sized = packManifest(config, layouts, found, gate, {}, version);
+    Bytes sized = packManifest(config, layouts, found, activation, {}, version);
     uint64_t first = align(section.address + sized.size(), PlaceholderAlignment) - section.address;
     if (first + PlaceholderSize * found.imports.size() > section.size)
         throw Error("manifest reservation is too small; regenerate and relink");
@@ -1373,7 +1410,7 @@ Image stageImage(const Image &image, const Declaration &config, const Layouts &l
         placeholders[import.first] = next;
         next += PlaceholderSize;
     }
-    Bytes manifest = packManifest(config, layouts, found, gate, placeholders, version);
+    Bytes manifest = packManifest(config, layouts, found, activation, placeholders, version);
     Image staged = image;
     std::fill_n(staged.data.begin() + section.offset, section.size, 0);
     std::copy(manifest.begin(), manifest.end(), staged.data.begin() + section.offset);
@@ -1397,8 +1434,11 @@ void stageBundle(const std::string &kext, const Declaration &config, const Layou
         throw Error("Info.plist is not a dictionary");
     std::string executable = plistString(info, "CFBundleExecutable");
     fs::path binary = source / "Contents/MacOS" / executable;
+    // The provider matching is the personalities as the author wrote them, so it
+    // is read before they are gated.
+    Activation activation = consumerActivation(info);
     info.set("IOKitPersonalities", gatedPersonalities(info));
-    Image image = stageImage(Image(readFile(binary.string())), config, layouts, gateKey(info));
+    Image image = stageImage(Image(readFile(binary.string())), config, layouts, activation);
     Plist *dependencies = info.find("OSBundleLibraries");
     for (const LibraryDeclaration &library : config.libraries) {
         if (!dependencies || dependencies->kind != Plist::Kind::Dict ||

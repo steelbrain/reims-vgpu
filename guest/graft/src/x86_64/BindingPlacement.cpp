@@ -2,9 +2,10 @@
 // The x86-64 binding placement (src/BindingPlacement.h). A consumer and its
 // providers register as kexts, so Graft finds a provider through OSKext (it must
 // be registered and started) and the live kernel collection's fileset, with the
-// pageable collection as a fallback, and retries the bind on each catalogue
+// pageable collection as a fallback, and retries the binds on each catalogue
 // personality send by routing the two catalogue entry points. The dormant
-// consumer is found by its fileset entry in the Boot collection (placedBase).
+// consumers are found among the Boot collection's fileset entries
+// (eachPlacedKext).
 #include "BindingPlacement.h"
 #include "Log.h"
 #include "MachO.h"
@@ -123,9 +124,21 @@ bool kextStarted(const char *identifier) {
     return active;
 }
 
+void eachPlacedKext(const mach_header_64 *collection,
+                    void (*visit)(void *context, const char *identifier, uint64_t base),
+                    void *context) {
+    // OpenCore injects the kexts Graft serves into the Boot collection, so each is
+    // a fileset entry there, beside the kernel and the boot kexts.
+    macho::eachFilesetEntry(collection, [&](uint64_t vmaddr, const char *id) {
+        visit(context, id, vmaddr);
+        return false;
+    });
+}
+
 uint64_t placedBase(const mach_header_64 *collection, const char *identifier) {
-    // OpenCore injects the consumer into the Boot collection, so it is a fileset
-    // entry there.
+    // OpenCore injects every kext Graft serves into the Boot collection, so it is
+    // a fileset entry there. The identity gate (src/Start.cpp) accepts a client by
+    // this, and the route layer ties its replacements to the client's own code.
     return macho::filesetEntry(collection, identifier);
 }
 

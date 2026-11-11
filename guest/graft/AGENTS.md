@@ -1,7 +1,7 @@
 # Agents working on Graft
 
-Graft is a macOS kext that binds and routes for a fixed set of kexts inside
-macOS virtual machines, with System Integrity Protection on. Read
+Graft is a macOS kext that binds and routes for any kext placed beside it
+inside macOS virtual machines, with System Integrity Protection on. Read
 [README.md](README.md) for what it does, [CONTRIBUTING.md](CONTRIBUTING.md)
 for how to build, test and change it, and [docs/](docs/README.md) for how it
 works. Everything in CONTRIBUTING.md applies to agents; this file adds what an
@@ -24,6 +24,9 @@ the code, or fix the expectation and say why in the commit.
   from what the running system has (symbols, class sizes, vtable slots, IOKit
   answers) and never from a macOS version. When something is missing, it
   refuses by name and the guest keeps booting.
+- **No kext's identity.** Graft serves any kext, and names none it serves.
+  `src/` and `sdk/` name no bundle identifier but Graft's own and Apple's;
+  `make lint` checks it. A test or example kext uses an identifier of its own.
 - **Provenance.** Nothing taken from Apple's binaries or from a guest enters
   the repository: no disassembly, dumps, excerpts, logs, or per-release
   offsets, sizes, slot counts or discriminators. A constant Graft needs is

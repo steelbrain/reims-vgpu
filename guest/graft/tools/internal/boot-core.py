@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later OR LGPL-3.0-or-later
-"""Cold-boot Graft as this checkout builds it, and optional test fixtures, on a Linux clone.
+"""Cold-boot Graft as this checkout builds it, and test kexts, on a Linux clone.
 
     python3 -I -B tools/internal/boot-core.py BASE --env DIR --gpu NAME --account FILE
-                                              [--probe KEXT] [--hello-consumer KEXT]
+                                              [--consumer KEXT STATE]... [--client KEXT STATE]...
 
 Run on a Linux host with reims-vgpu's VM tool, reims-ctl, and its QEMU installed under DIR
 (DIR/cargo/bin/reims-ctl and DIR/data/reims-ctl). BASE is an installed x86-64 base
 directory (disk.qcow2, opencore.qcow2 and its OVMF files), never booted in place. FILE
 holds the base's admin account: its name on the first line, its password on the second.
-The script:
+Each --consumer and --client names a kext to inject and what Graft's report on it,
+GraftClient.<bundle id>, must begin with, such as bound, refused, routed or ready; the
+bundle identifier is read from the kext's Info.plist. The script:
 1. refuses a source another process can write, and copies it with reims-ctl create;
-2. replaces the copy's injected kexts with build/Graft.kext and the optional fixtures,
-   clears its boot-args and csr-active-config, and checks that the injected Graft is
-   the one built here;
+2. replaces the copy's injected kexts with build/Graft.kext and the given kexts, clears
+   its boot-args and csr-active-config, and checks that the injected Graft is the one
+   built here;
 3. boots it on reims-vgpu's device, headless, logs in if the base stops at loginwindow,
    and waits for the desktop;
-4. requires Graft active, each fixture passed, SIP enabled, csr-active-config 0, no
-   boot-args, and no `reims-vgpu: fatal` line on the host.
+4. requires Graft active, each kext's report to begin with its STATE, a consumer given
+   bound to have its gate open, each test kext's own state passed unless it is to be
+   refused, SIP enabled, csr-active-config 0, no boot-args, and no `reims-vgpu: fatal`
+   line on the host.
 The copy is stopped and deleted even on a failed check. Results, screenshots and logs
-stay in build/boot-core; the final screenshot needs inspecting.
+stay in build/boot-core; the final screenshot needs inspecting. Graft's steps are in GraftLog
+in registry.json, and kernel-log.txt keeps the kernel's own lines that name an injected kext.
 """
 
 from __future__ import annotations
@@ -44,8 +49,22 @@ from typing import Any, NamedTuple
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "build/boot-core"
 GRAFT = ROOT / "build/Graft.kext"
+GRAFT_ID = "ai.aneesiqbal.graft"
 # Apple's NVRAM variable GUID, which holds boot-args and csr-active-config.
 APPLE_NVRAM_GUID = "7C436110-AB2A-4BBB-A880-FE41995C9F82"
+# The test kexts that publish states of their own on the registry root, by bundle
+# identifier: each key must read "passed" once the kext has checked its work in the guest
+# (tests/kexts/README.md, examples/README.md). gate-probe sets one per personality,
+# GraftGateProbe.<category>, named by the personality's GraftGateCategory.
+OWN_STATES = {
+    "ai.aneesiqbal.graft.CoreProbe": ("GraftProbeState",),
+    "ai.aneesiqbal.graft.HelloConsumer": ("GraftHelloConsumerState",),
+    "ai.aneesiqbal.graft.GateProbe": (
+        "GraftGateProbe.Display",
+        "GraftGateProbe.Accelerator",
+        "GraftGateProbe.Control",
+    ),
+}
 SSH_UP_TIMEOUT = 480
 
 
@@ -57,10 +76,20 @@ def parse_args() -> argparse.Namespace:
         "base", type=Path, help="installed x86-64 base directory; never booted in place"
     )
     parser.add_argument(
-        "--probe", type=Path, help="test-only GraftCoreProbe.kext, built on the Mac"
+        "--consumer",
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("KEXT", "STATE"),
+        help="a bound consumer built on the Mac, and what its report must begin with",
     )
     parser.add_argument(
-        "--hello-consumer", type=Path, help="test-only dormant GraftHelloConsumer.kext"
+        "--client",
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("KEXT", "STATE"),
+        help="a client kext built on the Mac, and what its report must begin with",
     )
     parser.add_argument(
         "--env", type=Path, required=True, help="directory holding reims-ctl and its QEMU"
@@ -90,15 +119,61 @@ def read_account(path: Path) -> Account:
     return Account(lines[0], lines[1])
 
 
-def fixture(path: Path | None, identifier: str, name: str, refusal: str) -> Path | None:
-    """The resolved fixture bundle, which must be name and carry identifier, if given."""
-    if path is None:
-        return None
-    path = path.resolve()
-    info = plistlib.loads((path / "Contents/Info.plist").read_bytes())
-    if info.get("CFBundleIdentifier") != identifier or path.name != name:
-        raise SystemExit(refusal)
-    return path
+class Kext(NamedTuple):
+    """A test kext to inject, and what Graft's report on it must begin with."""
+
+    path: Path
+    identifier: str
+    executable: str
+    consumer: bool
+    expected: str
+
+
+def read_kext(path: str, expected: str, consumer: bool) -> Kext:
+    """The bundle at path, with the identifier and executable its Info.plist names."""
+    bundle = Path(path).resolve()
+    try:
+        info = plistlib.loads((bundle / "Contents/Info.plist").read_bytes())
+    except (OSError, plistlib.InvalidFileException):
+        raise SystemExit(f"{path} has no readable Contents/Info.plist") from None
+    identifier = info.get("CFBundleIdentifier")
+    executable = info.get("CFBundleExecutable")
+    # The identifier also goes into a shell command in the guest (Clone.kernel_log).
+    if not (
+        isinstance(identifier, str)
+        and re.fullmatch(r"[A-Za-z0-9.-]+", identifier)
+        and isinstance(executable, str)
+        and (bundle / "Contents/MacOS" / executable).is_file()
+    ):
+        raise SystemExit(f"{path} names no bundle identifier or no executable it holds")
+    return Kext(bundle, identifier, executable, consumer, expected)
+
+
+def own_states(kext: Kext) -> tuple[str, ...]:
+    """The registry keys a test kext must set to passed; a refused kext never runs."""
+    return () if kext.expected.startswith("refused") else OWN_STATES.get(kext.identifier, ())
+
+
+def failure(kext: Kext, state: dict[str, Any]) -> str | None:
+    """Why the registry state does not show kext as expected, or None when it does."""
+    report = state.get(f"GraftClient.{kext.identifier}", "")
+    if not report.startswith(kext.expected):
+        return f"{kext.identifier} reports {report or 'nothing'!r}, not {kext.expected!r}"
+    if kext.consumer and kext.expected == "bound" and "activation gate open" not in report:
+        return f"{kext.identifier} is bound but its activation gate is not open"
+    for key in own_states(kext):
+        if state.get(key) != "passed":
+            return f"{kext.identifier}'s {key} is {state.get(key)!r}, not 'passed'"
+    return None
+
+
+def settled(kext: Kext, state: dict[str, Any]) -> bool:
+    """Whether kext is as expected, or refused by Graft or by its own check, which is final."""
+    return (
+        failure(kext, state) is None
+        or state.get(f"GraftClient.{kext.identifier}", "").startswith("refused")
+        or any(str(state.get(key, "")).startswith("refused") for key in own_states(kext))
+    )
 
 
 def refuse_writers(sources: set[Path]) -> None:
@@ -249,9 +324,13 @@ class Clone:
             raise RuntimeError("registry archive does not contain one root dictionary")
         return properties
 
-    def graft_properties(self) -> dict[str, Any]:
+    def graft_properties(self, own: set[str]) -> dict[str, Any]:
+        """Graft's and the test kexts' properties on the registry root: every key that
+        starts with Graft, and the test kexts' own keys in own."""
         return {
-            key: value for key, value in self.registry_root().items() if key.startswith("Graft")
+            key: value
+            for key, value in self.registry_root().items()
+            if key.startswith("Graft") or key in own
         }
 
     def create(self, disk: Path, opencore: Path, gpu: str) -> None:
@@ -264,28 +343,26 @@ class Clone:
             *("--ssh-port", self.port, "--logs", "true", "--audio", "false"),
         )
 
-    def inject(self, probe: Path | None, consumer: Path | None) -> None:
-        """Make Graft and the given fixtures the copy's only injected kexts, with SIP's
-        NVRAM defaults, and check that the injected Graft is build/Graft.kext."""
+    def inject(self, kexts: list[Kext]) -> None:
+        """Make Graft and the given kexts the copy's only injected kexts, with SIP's NVRAM
+        defaults, and check that the injected Graft is build/Graft.kext."""
         raw = OUT / "oc.raw"
         self.run([self.qemu_img, "convert", "-O", "raw", self.vm / "opencore.qcow2", raw])
         image = str(raw) + "@@" + str(first_partition_offset(raw))
         config_path = OUT / "config.plist"
         self.run(["mcopy", "-n", "-i", image, "::/EFI/OC/config.plist", config_path])
         config = plistlib.loads(config_path.read_bytes())
+        # OpenCore injects the kexts in this order, a kext after those it links against, so
+        # Graft, which every test kext links against, comes first.
         config["Kernel"]["Add"] = [
-            kernel_add_entry("Graft.kext", "Contents/MacOS/Graft", "Graft core boot check")
-        ]
-        if probe:
-            config["Kernel"]["Add"].append(
-                kernel_add_entry(probe.name, "Contents/MacOS/GraftCoreProbe", "Graft core probe")
-            )
-        if consumer:
-            config["Kernel"]["Add"].append(
+            kernel_add_entry("Graft.kext", "Contents/MacOS/Graft", "Graft core boot check"),
+            *(
                 kernel_add_entry(
-                    consumer.name, "Contents/MacOS/GraftHelloConsumer", "Graft hello consumer"
+                    kext.path.name, f"Contents/MacOS/{kext.executable}", kext.identifier
                 )
-            )
+                for kext in kexts
+            ),
+        ]
         nvram = config["NVRAM"]["Add"].setdefault(APPLE_NVRAM_GUID, {})
         nvram.update({"boot-args": "", "csr-active-config": bytes(4)})
         delete = config["NVRAM"]["Delete"].setdefault(APPLE_NVRAM_GUID, [])
@@ -296,11 +373,8 @@ class Clone:
         self.run(["mcopy", "-o", "-n", "-i", image, config_path, "::/EFI/OC/config.plist"])
         self.run(["mdeltree", "-i", image, "::/EFI/OC/Kexts"])
         self.run(["mmd", "-i", image, "::/EFI/OC/Kexts"])
-        self.run(["mcopy", "-s", "-i", image, GRAFT, "::/EFI/OC/Kexts/"])
-        if probe:
-            self.run(["mcopy", "-s", "-i", image, probe, "::/EFI/OC/Kexts/"])
-        if consumer:
-            self.run(["mcopy", "-s", "-i", image, consumer, "::/EFI/OC/Kexts/"])
+        for bundle in (GRAFT, *(kext.path for kext in kexts)):
+            self.run(["mcopy", "-s", "-i", image, bundle, "::/EFI/OC/Kexts/"])
         # Check the exact bytes that will be injected before booting.
         readback = OUT / "Graft-readback"
         executable = "::/EFI/OC/Kexts/Graft.kext/Contents/MacOS/Graft"
@@ -373,25 +447,40 @@ class Clone:
             time.sleep(2)
         raise RuntimeError("guest has not logged in to the desktop")
 
-    def wait_for_fixtures(self, probe: Path | None, consumer: Path | None) -> dict[str, Any]:
-        """Graft's registry state, once each given fixture has passed or been refused."""
-        state = self.graft_properties()
-        if not (probe or consumer):
-            return state
+    def kernel_log(self, identifiers: list[str]) -> str:
+        """The kernel's lines this boot that name one of identifiers, such as a failed load.
+
+        Graft's own `graft:` lines are not among them: the x86-64 kernel keeps every line a kext
+        OpenCore injected writes with IOLog, printf or os_log out of the unified log, so
+        GraftLog, in registry.json, holds Graft's steps. The guest's login shell, zsh, has a log
+        builtin of its own, so this runs /usr/bin/log, and a failed read raises.
+        """
+        named = " OR ".join(f'eventMessage CONTAINS "{identifier}"' for identifier in identifiers)
+        result = self.ssh(
+            "/usr/bin/log show --last boot --style compact "
+            f"--predicate 'process == \"kernel\" AND ({named})'"
+        )
+        if result.returncode:
+            why = result.stdout.strip()[-300:]
+            raise RuntimeError(f"cannot read the guest's kernel log: {why}")
+        return result.stdout
+
+    def wait_for_kexts(self, kexts: list[Kext]) -> dict[str, Any]:
+        """The registry state, once each given kext is as expected or has been refused.
+
+        A consumer's report changes as its providers load and its gate opens, and a test
+        kext's own check can run late in boot, so each is read until it settles.
+        """
+        own = {key for kext in kexts for key in own_states(kext)}
+        state = self.graft_properties(own)
         deadline = time.monotonic() + 145
-        while time.monotonic() < deadline and state.get("GraftState") != "refused":
-            routes_done = not probe or state.get("GraftProbeState", "").startswith(
-                ("passed", "refused")
-            )
-            consumer_done = (
-                not consumer
-                or state.get("GraftHelloConsumerState", "").startswith(("passed", "refused"))
-                or state.get("GraftClient.ai.aneesiqbal.ReimsGraphics", "").startswith("refused")
-            )
-            if routes_done and consumer_done:
-                break
+        while (
+            time.monotonic() < deadline
+            and state.get("GraftState") != "refused"
+            and not all(settled(kext, state) for kext in kexts)
+        ):
             time.sleep(2)
-            state = self.graft_properties()
+            state = self.graft_properties(own)
         return state
 
     def tear_down(self) -> None:
@@ -413,18 +502,15 @@ def interrupted(signum: int, _frame: object) -> None:
 def main() -> None:
     args = parse_args()
     base = args.base.resolve()
-    probe = fixture(
-        args.probe,
-        "ai.aneesiqbal.graft.CoreProbe",
-        "GraftCoreProbe.kext",
-        "the optional probe must be GraftCoreProbe.kext",
-    )
-    consumer = fixture(
-        args.hello_consumer,
-        "ai.aneesiqbal.ReimsGraphics",
-        "GraftHelloConsumer.kext",
-        "the hello consumer must be GraftHelloConsumer.kext",
-    )
+    kexts = [
+        *(read_kext(path, expected, True) for path, expected in args.consumer),
+        *(read_kext(path, expected, False) for path, expected in args.client),
+    ]
+    # OpenCore finds each kext by its folder name, and Graft reports each by its identifier.
+    names = [GRAFT.name, *(kext.path.name for kext in kexts)]
+    identifiers = [kext.identifier for kext in kexts]
+    if len(set(names)) < len(names) or len(set(identifiers)) < len(identifiers):
+        raise SystemExit("each kext needs a folder name and a bundle identifier of its own")
     if sys.platform != "linux":
         raise SystemExit("VM boots run on Linux")
     account = read_account(args.account)
@@ -449,7 +535,7 @@ def main() -> None:
         clone.create(disk, base / "opencore.qcow2", args.gpu)
         created = True
         clone.ctl("set", clone.name, "--env", "REIMS_VGPU_WINDOW=0")
-        clone.inject(probe, consumer)
+        clone.inject(kexts)
         with (OUT / "command.sh").open("w") as command:
             clone.ctl("command", clone.name, stdout=command)
         clone.ctl("start", clone.name)
@@ -457,10 +543,7 @@ def main() -> None:
         guest = clone.ssh(
             "sw_vers; uptime; csrutil status; nvram csr-active-config; nvram boot-args; "
             f"printf '{account.password}\\n' | sudo -S -p '' kmutil showloaded --list-only 2>&1 "
-            "| grep -Ei 'graft|lilu|reims|rgfx'; "
-            "log show --last boot --style compact --predicate "
-            '\'process == "kernel" AND eventMessage CONTAINS[c] "ai.aneesiqbal.graft"\' '
-            "2>/dev/null | tail -30; stat -f %Su /dev/console"
+            "| grep -Ei 'graft|lilu|reims|rgfx'; stat -f %Su /dev/console"
         )
         (OUT / "probe.txt").write_text(guest.stdout)
         print(guest.stdout, flush=True)
@@ -474,19 +557,18 @@ def main() -> None:
         (OUT / "desktop-processes.txt").write_text(desktop.stdout)
         (OUT / "desktop-session.json").write_text(json.dumps(session, indent=2) + "\n")
         print("Graft desktop console:", console.stdout.strip(), flush=True)
-        state = clone.wait_for_fixtures(probe, consumer)
+        state = clone.wait_for_kexts(kexts)
         (OUT / "registry.json").write_text(json.dumps(state, indent=2) + "\n")
         print(json.dumps(state, indent=2), flush=True)
+        kernel_log = clone.kernel_log([GRAFT_ID, *identifiers])
+        (OUT / "kernel-log.txt").write_text(kernel_log)
+        print(kernel_log, flush=True)
         clone.screendump("desktop.ppm")
         if state.get("GraftState") != "active":
             raise RuntimeError("Graft did not report active")
-        if probe and state.get("GraftProbeState") != "passed":
-            raise RuntimeError("core probe did not pass")
-        if consumer and (
-            state.get("GraftHelloConsumerState") != "passed"
-            or not state.get("GraftClient.ai.aneesiqbal.ReimsGraphics", "").startswith("bound:")
-        ):
-            raise RuntimeError("hello consumer did not pass")
+        failures = [why for why in (failure(kext, state) for kext in kexts) if why]
+        if failures:
+            raise RuntimeError("; ".join(failures))
         if "System Integrity Protection status: enabled." not in guest.stdout:
             raise RuntimeError("guest did not confirm SIP enabled")
         qemu_log = (clone.vm / "logs/qemu.log").read_text(errors="replace")

@@ -68,7 +68,7 @@ void encode(Bytes &out, const Header &record) {
             .FIELD(Header, record, size)
             .FIELD(Header, record, headerSize)
             .FIELD(Header, record, gate)
-            .FIELD(Header, record, device);
+            .FIELD(Header, record, matching);
     for (size_t i = 0; i < 14; ++i) {
         size_t offset = tableOffset(i);
         fields.set(offset, (record.*ManifestTables[i]).offset)
@@ -193,7 +193,7 @@ Header decodeHeader(const uint8_t *at) {
     header.size = load32(at + offsetof(Header, size));
     header.headerSize = load32(at + offsetof(Header, headerSize));
     header.gate = load32(at + offsetof(Header, gate));
-    header.device = load32(at + offsetof(Header, device));
+    header.matching = load32(at + offsetof(Header, matching));
     for (size_t i = 0; i < 14; ++i) {
         size_t offset = tableOffset(i);
         (header.*ManifestTables[i]).offset = load32(at + offset);

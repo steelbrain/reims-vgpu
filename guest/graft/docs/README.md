@@ -1,5 +1,10 @@
 # docs
 
+Graft binds and routes for any kext placed beside it in a macOS guest's boot
+image: a bound consumer, which it finds by the manifest the SDK writes, and an
+owned client, which calls its C interface. The first table explains how Graft
+works, and each guide walks through one task.
+
 ## How Graft works
 
 | document | covers |

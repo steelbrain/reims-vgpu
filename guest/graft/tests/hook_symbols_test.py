@@ -2,7 +2,9 @@
 """Measurement input errors must never become compatibility conclusions."""
 
 import importlib.util
+import io
 import struct
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -69,11 +71,31 @@ class SymbolsTest(unittest.TestCase):
             symbols.classify_release(Path("fixture"), ["_method"])
 
     def test_wanted_symbols_are_the_first_column(self):
-        names = symbols.read_wanted()
+        names = symbols.read_wanted(symbols.GRAFT_SYMBOLS)
         self.assertEqual(len(names), len(set(names)))
         self.assertTrue(all(name.startswith("_") for name in names), names)
         self.assertIn("_IOLog", names)
         self.assertIn("__ZN6OSKext24lookupKextWithIdentifierEPKc", names)
+
+    def test_a_client_list(self):
+        with tempfile.TemporaryDirectory(prefix="graft-hook-list-") as directory:
+            path = Path(directory) / "symbols.txt"
+            path.write_text("# a client's list\n\n_first  solve  why\n  _second route\n")
+            self.assertEqual(symbols.read_wanted(path), ["_first", "_second"])
+
+    def test_unusable_list(self):
+        """A list that cannot be read, or names no symbol, is an input error."""
+        with tempfile.TemporaryDirectory(prefix="graft-hook-list-") as directory:
+            empty = Path(directory) / "empty.txt"
+            empty.write_text("# no symbols\n")
+            for path in (Path(directory) / "absent.txt", empty):
+                argv = ["hook-symbols.py", "--symbols", str(path), directory]
+                with (
+                    patch.object(sys, "argv", argv),
+                    patch.object(sys, "stderr", io.StringIO()) as stderr,
+                ):
+                    self.assertEqual(symbols.main(), 1)
+                self.assertIn(str(path), stderr.getvalue())
 
     def test_cached_releases_skip_work_and_kdk(self):
         with tempfile.TemporaryDirectory(prefix="graft-hook-cache-") as cache:

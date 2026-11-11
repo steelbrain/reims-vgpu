@@ -11,8 +11,8 @@ macOS's own `/usr/bin/python3`, and is run with `python3 -I -B`.
 |---|---|---|
 | `vendor.py` | checks a release zip against its `SHA256SUMS` and copies the release, Graft's source tree and both kexts, into another repository, with a record of every file | `python3 -I -B tools/vendor.py graft-<version>.zip DEST` |
 | `internal/release.py` | builds a release folder and zip into `dist/` | `make release` |
-| `internal/lint.py` | checks SPDX license lines, text hygiene and Markdown links | `make lint` |
-| `internal/hook-symbols.py` | reports which kernel symbols Graft and its owned client use are defined in a macOS release | `python3 -I -B tools/internal/hook-symbols.py RELEASE...` |
+| `internal/lint.py` | checks SPDX license lines, text hygiene, Markdown links, and that `src/` and `sdk/` name no kext but Graft and Apple's | `make lint` |
+| `internal/hook-symbols.py` | reports which kernel symbols Graft uses, or those another list names, are defined in a macOS release | `python3 -I -B tools/internal/hook-symbols.py RELEASE...` |
 | `internal/boot-core.py` | boots Graft and the test kexts in a disposable x86-64 guest, and checks the result | `python3 -I -B tools/internal/boot-core.py BASE --env DIR --gpu NAME --account FILE` |
 
 ## vendor.py
@@ -81,21 +81,32 @@ plus new files git would track:
 - every text file ends in exactly one newline, with no trailing whitespace,
   carriage returns or tab indentation (make files may use tabs);
 - every relative Markdown link names a file or directory that exists, and
-  every `#fragment` a heading in its target.
+  every `#fragment` a heading in its target;
+- no file under `src/` or `sdk/` names a bundle identifier other than Graft's
+  own, `ai.aneesiqbal.graft`, Apple's, `com.apple.*`, or one under a domain
+  reserved for examples, such as `com.example.*`. An identifier is a top-level
+  domain followed by two or more labels, so a file name, a version or other
+  dotted text is not one. In a C, C++ or Objective-C file the check reads only
+  comments and string and character literals, since a member access in code can
+  look like an identifier; it reads any other file whole.
 
 The license texts in `LICENSES/` are exempt from the text checks, since they
 are kept exactly as published.
 
 ## internal/hook-symbols.py
 
-`hook-symbols.txt`, next to the script, lists every kernel symbol Graft and
-its owned client use, how each is reached, and why. `hook-symbols.py` checks a
-macOS release for each of them:
+`hook-symbols.txt`, next to the script, lists every kernel symbol Graft uses,
+how each is reached, and why. `hook-symbols.py` checks a macOS release for each
+of them:
 
 ```sh
 python3 -I -B tools/internal/hook-symbols.py RELEASE...
 python3 -I -B tools/internal/hook-symbols.py --all CACHE [--json]
 ```
+
+A client project checks the kernel symbols it uses with `--symbols FILE`, where
+`FILE` lists them in the same form: each symbol is the first word of its line,
+and a line that starts with `#` is a comment.
 
 A release is a directory that holds that release's x86-64 `kernel`,
 `BootKernelExtensions.kc` and `SystemKernelExtensions.kc`. With `--all`, it
@@ -104,8 +115,9 @@ symbol it prints whether the kernel and each collection defines it, references
 it, or lacks it. It reads the symbol tables in place and keeps nothing from
 them but the names it was asked about and that answer.
 
-It exits 1 when an input is incomplete or unreadable, 2 when a release defines
-a wanted symbol in none of its images, and 0 otherwise.
+It exits 1 when an input is incomplete or unreadable or the list names no
+symbol, 2 when a release defines a wanted symbol in none of its images, and 0
+otherwise.
 
 ## internal/boot-core.py
 
@@ -116,23 +128,57 @@ reims-vgpu's paravirtual GPU, which renders on the host GPU `NAME`.
 
 ```sh
 python3 -I -B tools/internal/boot-core.py BASE --env DIR --gpu NAME --account FILE \
-    [--probe build/GraftCoreProbe.kext] [--hello-consumer build/GraftHelloConsumer.kext]
+    [--consumer KEXT STATE]... [--client KEXT STATE]...
 ```
 
 `BASE` is an installed x86-64 macOS guest, with its OpenCore disk, which the
 script never boots in place. `FILE` holds the guest's admin account name on its
-first line and its password on the second. The script:
+first line and its password on the second.
+
+Each `--consumer` names a bound consumer to inject and each `--client` a
+client, with any number of each. `STATE` is what Graft's report on that kext,
+`GraftClient.<bundle id>`, must begin with: a state such as `bound`, `refused`,
+`routed` or `ready`, or more of the report, such as a refusal's reason. The
+script reads each kext's bundle identifier and executable from its
+`Info.plist`, and refuses two kexts with one folder name or one bundle
+identifier. One boot of both consumers and both clients:
+
+```sh
+python3 -I -B tools/internal/boot-core.py BASE --env DIR --gpu NAME --account FILE \
+    --consumer build/GraftHelloConsumer.kext bound \
+    --consumer build/GraftGateProbe.kext bound \
+    --client build/GraftCoreProbe.kext routed \
+    --client build/GraftHelloClient.kext ready
+```
+
+The script:
 
 1. copies `BASE`, refusing a source another process can write;
-2. replaces the copy's injected kexts with `build/Graft.kext` and the test kexts
+2. replaces the copy's injected kexts with `build/Graft.kext` and the kexts
    given, clears its boot-args and `csr-active-config`, and checks that the
    injected Graft is the one built here;
 3. boots the copy headless, logs in if it stops at the login window, and waits
    for the desktop;
-4. requires `GraftState` `active`, each test kext's state `passed`, SIP on,
+4. reads the registry until each kext's report is as expected or refused, for
+   up to 145 seconds, since a consumer's report changes as its providers load
+   and its gate opens;
+5. requires `GraftState` `active`, each kext's report to begin with its
+   `STATE`, a consumer given `bound` to have its activation gate open, each
+   test kext's own state `passed` unless its `STATE` is a refusal, SIP on,
    `csr-active-config` 0, no boot-args, and no `reims-vgpu: fatal` line in
    QEMU's log on the host.
 
+The test kexts' own states are core-probe's `GraftProbeState`,
+hello-consumer's `GraftHelloConsumerState`, and the key each of gate-probe's
+personalities sets, named by its `GraftGateCategory`.
+
 It stops and deletes the copy even when a check fails. Results, screenshots and
-logs stay in `build/boot-core`. [tests/kexts/](../tests/kexts/README.md)
-describes the test kexts.
+logs stay in `build/boot-core`. Graft's steps are in `GraftLog`, in
+`registry.json`: the unified log of an x86-64 guest keeps no line an injected
+kext writes ([debugging-refusals.md](../docs/guides/debugging-refusals.md#where-to-look)).
+`kernel-log.txt` keeps the kernel's own lines that name Graft or a given kext,
+such as a failed load. The script reads them with `/usr/bin/log`, since the
+guest's login shell, zsh, has a `log` builtin of its own, and fails the run when
+it cannot read them.
+
+[tests/kexts/](../tests/kexts/README.md) describes the test kexts.

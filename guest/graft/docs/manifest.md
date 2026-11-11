@@ -5,12 +5,14 @@ A bound consumer tells Graft what it needs in a manifest: a Mach-O section,
 Graft holds no consumer's offsets or personalities, so changing a consumer
 only rebuilds the consumer.
 
-This document specifies format version 2, for an x86-64 consumer, and version 3,
+This document specifies format version 4, for an x86-64 consumer, and version 5,
 for an arm64e consumer. The two share the header and every table. They differ in
 a site's two trailing bytes: an x86-64 site is a pointer or a branch
 displacement, an arm64e site a signed pointer that carries its signing context.
-Only version 3 fills the segment, fill and synthesis tables; version 2 leaves
-them empty. The definitions, and the validator below, are in
+Only version 5 fills the segment, fill and synthesis tables; version 4 leaves
+them empty. Graft reads no other version, and refuses a consumer whose manifest
+has another by naming that version, since its fix is a rebuild with the SDK of
+the Graft release it boots with. The definitions, and the validator below, are in
 [sdk/include/graft/ManifestFormat.h](../sdk/include/graft/ManifestFormat.h),
 which Graft and the SDK's `graft-kext` share.
 
@@ -40,12 +42,12 @@ still points at its placeholder plus its addend.
 | field | type | value |
 |---|---|---|
 | `magic` | u32 | `0x54465247`, "GRFT" |
-| `version` | u32 | 2 for an x86-64 consumer, 3 for arm64e |
+| `version` | u32 | 4 for an x86-64 consumer, 5 for arm64e |
 | `size` | u32 | the manifest's length in bytes |
 | `headerSize` | u32 | 136 |
 | `strings`, `libraries`, `imports`, `candidates`, `sites`, `classes`, `slots`, `vtables`, `overrides`, `segments`, `fills`, `selectors`, `synthOverrides`, `synthClasses` | table each | the tables below, in this order |
-| `gate` | u32 | string: the consumer's activation property key, an `IOPropertyMatch` its personalities carry, which Graft sets on the device nub once it binds |
-| `device` | u32 | string: the personalities' `IOPCIPrimaryMatch`, by which Graft finds the nub to open the gate on |
+| `gate` | u32 | string: the consumer's activation property key, an `IOPropertyMatch` its personalities carry, which Graft sets on each provider nub once it binds |
+| `matching` | u32 | string: the personalities' provider matching, an XML property list ([Provider matching](#provider-matching)), by which Graft finds the nubs to open the gate on |
 
 ## Tables
 
@@ -91,12 +93,12 @@ import.
 | `addend` | i64 | the addend of the original reference |
 | `import` | u32 | index into imports |
 | `width` | u8 | 8 for a pointer, 4 for a call's displacement |
-| `opcode` | u8 | version 2: 0 for a pointer, `0xe8` (call) or `0xe9` (jump) for a call. version 3: the auth byte |
-| `reserved` | u16 | version 2: 0. version 3: the diversity |
+| `opcode` | u8 | version 4: 0 for a pointer, `0xe8` (call) or `0xe9` (jump) for a call. version 5: the auth byte |
+| `reserved` | u16 | version 4: 0. version 5: the diversity |
 
-The last two bytes differ by version. A version-2 (x86-64) site is a pointer
+The last two bytes differ by version. A version-4 (x86-64) site is a pointer
 (`width` 8, `opcode` 0) or a branch displacement (`width` 4, `opcode` `0xe8` or
-`0xe9`), and `reserved` is 0. A version-3 (arm64e) site is always a pointer
+`0xe9`), and `reserved` is 0. A version-5 (arm64e) site is always a pointer
 (`width` 8). Its `opcode` is an auth byte, and its `reserved` is the 16-bit
 diversity. In the auth byte, bit 0 is set when the pointer is signed, bits 1-2
 are the key (0=IA, 1=IB, 2=DA, 3=DB), and bit 3 blends the slot's address into
@@ -138,10 +140,10 @@ pointer points, is the first slot after them.
 method stays.
 
 **segments**, 24 bytes each. The consumer's own segments, present only on a
-version-3 (arm64e) manifest. Graft relocates each image offset through the
+version-5 (arm64e) manifest. Graft relocates each image offset through the
 placed segment of the same name, because the arm64e loader coalesces segments
 by name and a segment is not placed at its origin plus a single slide. A
-version-2 manifest has none: its segments are contiguous, so an offset is the
+version-4 manifest has none: its segments are contiguous, so an offset is the
 load address plus the offset.
 
 | field | type | meaning |
@@ -152,10 +154,10 @@ load address plus the offset.
 | `reserved` | u32 | 0 |
 
 **fills**, 8 bytes each. The inherited vtable slots Graft re-signs, present
-only on a version-3 (arm64e) manifest, one per parent slot a vtable does not
+only on a version-5 (arm64e) manifest, one per parent slot a vtable does not
 override, in slot order. Each carries the slot's own signing context, so Graft
 signs the live parent method for this slot exactly as the consumer
-authenticates it. A version-2 manifest has none: it copies each inherited slot
+authenticates it. A version-4 manifest has none: it copies each inherited slot
 verbatim.
 
 | field | type | meaning |
@@ -166,7 +168,7 @@ verbatim.
 | `reserved` | u8 | 0 |
 
 The last three tables describe synthesized classes, and are present only on a
-version-3 (arm64e) manifest. A synthesized class derives from a parent that no
+version-5 (arm64e) manifest. A synthesized class derives from a parent that no
 Apple SDK header declares and whose vtable changes between releases, so the
 consumer cannot record the parent's slots. Its overrides name methods instead of
 slot indices, and Graft lays out the vtable when it binds
@@ -237,13 +239,13 @@ manifest it builds, and refuses a build whose manifest breaks one:
   tables overlap.
 - The string table is not empty and starts with a 0 byte. Every string
   offset names a non-empty, NUL-terminated string inside it, and the
-  `gate` and `device` strings exist. The `gate` key is at most 159 bytes
+  `gate` and `matching` strings exist. The `gate` key is at most 159 bytes
   long, so that Graft keeps it whole for the nubs published after the bind.
 - Every index fits its table, and every range of candidates, slots,
   overrides, fills, selectors or synthesized overrides fits too.
 - An import has at least one candidate and no flag but the weak bit.
-- A version-2 site's `reserved` field is 0, and its width is 8 with opcode 0
-  or 4 with opcode `0xe8` or `0xe9` and an offset above 0. A version-3 site's
+- A version-4 site's `reserved` field is 0, and its width is 8 with opcode 0
+  or 4 with opcode `0xe8` or `0xe9` and an offset above 0. A version-5 site's
   width is 8, its opcode sets no bit outside the auth byte, and an unsigned one
   carries no auth bits and no diversity.
 - Sites are sorted by offset and do not overlap. For a call, the overlap
@@ -257,15 +259,15 @@ manifest it builds, and refuses a build whose manifest breaks one:
   its parent. Its overrides are sorted and within the parent's slots. A
   vtable, from 16 bytes before its address point, overlaps no site and not
   the vtable before it. Together the vtables use every override.
-- The segment and fill tables are empty on a version-2 manifest. On a
-  version-3 one, segments are sorted by origin, each named, nonzero in size,
+- The segment and fill tables are empty on a version-4 manifest. On a
+  version-5 one, segments are sorted by origin, each named, nonzero in size,
   bounded and disjoint. A vtable's fills are the parent slots it does not
   override: their count is the parent slot count minus the overrides, and the
   fills and overrides together name each parent slot once, in slot order. A
   plain (unsigned) fill carries no auth bits and no diversity. Together the
   vtables use every fill.
 - The selector, synthesized override and synthesized class tables are empty
-  on a version-2 manifest. On a version-3 one, every selector names a string.
+  on a version-4 manifest. On a version-5 one, every selector names a string.
   A synthesized override has a nonzero `impl`, at least one selector, no flag
   but the required bit and a `reserved` of 0. Its opcode sets no bit outside
   the auth byte, and an unsigned one carries no auth bits and no diversity.
@@ -278,7 +280,8 @@ manifest it builds, and refuses a build whose manifest breaks one:
   with no gaps, and together the classes use every synthesized override.
 
 Graft reports a manifest that breaks any of these rules only as `invalid
-consumer manifest`, without naming the rule.
+consumer manifest`, without naming the rule. It then checks the provider
+matching ([below](#provider-matching)), and names what is wrong with it.
 
 A valid manifest does not prove its image offsets are mapped. Graft checks
 each site, placeholder, fallback, vtable and synthesized class against the
@@ -288,6 +291,51 @@ manifest's own section, or, on arm64e, outside a writable data segment. A
 segment such as `__DATA_CONST` is locked read-only before Graft starts, so the
 SDK links an arm64e consumer with `-no_data_const`, which keeps its bound
 pointers in `__DATA`.
+
+## Provider matching
+
+The `matching` string is an XML property list, as an Info.plist is written: a
+dictionary with one entry per personality of the consumer, keyed by the
+personality's name. Each value is the dictionary that matches the
+personality's provider: the personality as its author wrote it, its own
+`IOPropertyMatch` included, less the keys that name the driver rather than the
+provider, `IOClass`, `CFBundleIdentifier`, `IOProbeScore` and
+`IOMatchCategory`. It never holds the gate key, which only the staged
+personalities carry: `graft-kext` refuses a personality whose own
+`IOPropertyMatch` already holds it. For a personality written
+
+```xml
+<key>Display</key>
+<dict>
+    <key>IOClass</key>
+    <string>ExampleDisplay</string>
+    <key>IOProviderClass</key>
+    <string>IOPCIDevice</string>
+    <key>IOPCIPrimaryMatch</key>
+    <string>0x11111234</string>
+</dict>
+```
+
+the matching is
+
+```xml
+<dict>
+    <key>Display</key>
+    <dict>
+        <key>IOPCIPrimaryMatch</key>
+        <string>0x11111234</string>
+        <key>IOProviderClass</key>
+        <string>IOPCIDevice</string>
+    </dict>
+</dict>
+```
+
+inside the property list's `<plist>` element. Graft parses it with
+`OSUnserializeXML` before it writes anything, and refuses the consumer when it
+does not parse, names no personality, or holds a personality that is not a
+dictionary naming an `IOProviderClass` string. Once it has bound the consumer,
+it watches for the nubs each dictionary matches, with one `IOFirstPublish`
+matching notification per personality, and sets the gate key on each.
 
 ## Resolving an import
 

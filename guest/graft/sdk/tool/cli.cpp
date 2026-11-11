@@ -134,8 +134,8 @@ void reserve(const std::string &binary, const std::string &declaration, const st
              const std::string &infoPlist, const std::string &reservation) {
     Declaration config = readDeclaration(declaration);
     Layouts measured = readLayouts(layouts);
-    std::string gate = gateKey(parsePlist(readFile(infoPlist), infoPlist));
-    uint64_t size = reservationSize(Image(readFile(binary)), config, measured, gate);
+    Activation activation = consumerActivation(parsePlist(readFile(infoPlist), infoPlist));
+    uint64_t size = reservationSize(Image(readFile(binary)), config, measured, activation);
     writeFile(reservation, Bytes(size, 0));
 }
 

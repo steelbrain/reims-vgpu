@@ -17,7 +17,8 @@
 #   make route-probe  build/GraftRouteProbe.kext, the arm64e test-only owned
 #               client that exercises the AMFI route layer
 #   make examples  build both examples (examples/README.md) for x86-64 and arm64e
-#   make lint   check formatting, license lines, text hygiene and doc links
+#   make lint   check formatting, license lines, text hygiene, doc links, and
+#               that src/ and sdk/ name no kext but Graft and Apple's
 #   make format apply clang-format and ruff's formatting
 #   make clean  remove build/
 #   make release  build both kexts from the committed sources, with the Xcode
@@ -27,7 +28,7 @@
 # Build intermediates stay in build/, and releases in dist/.
 
 BUILD   ?= build
-VERSION  = 0.1.0
+VERSION  = 0.2.0
 HOSTCXX  = xcrun --sdk macosx clang++ -std=c++17 -Wall -Wextra -Werror
 HOSTCC   = xcrun --sdk macosx clang -Wall -Wextra -Werror
 SDK      = $(shell xcrun --sdk macosx --show-sdk-path)
@@ -68,7 +69,7 @@ TOOL_LIBRARY = $(filter-out $(BUILD)/tool/cli.o,$(TOOL_OBJECTS))
 TOOL_HEADERS = $(wildcard sdk/tool/*.h) sdk/include/graft/ManifestFormat.h
 TOOL_FIXTURES = $(BUILD)/consumer/x86_64/Fixture.kext/Contents/MacOS/Fixture \
 	$(BUILD)/consumer/arm64e/Fixture.kext/Contents/MacOS/Fixture \
-	$(BUILD)/synthesized/ReimsDisplay.kext/Contents/MacOS/ReimsDisplay
+	$(BUILD)/synthesized/SynthDisplay.kext/Contents/MacOS/SynthDisplay
 
 .PHONY: all test kernel-check kernel-check-arm64e graft-arm64e core-probe route-probe examples lint format clean release
 all: $(BINARY)
@@ -102,8 +103,7 @@ release:
 $(BINARY): $(CORE) src/Info.plist Makefile
 	@mkdir -p $(@D)
 	xcrun --sdk macosx ld -arch x86_64 -kext -undefined dynamic_lookup $(CORE) -o $@
-	sed -e 's/@VERSION@/$(VERSION)/g' -e '/@GRAFT_ARM64E_LIBS@/d' src/Info.plist \
-		> $(BUNDLE)/Contents/Info.plist
+	sed -e 's/@VERSION@/$(VERSION)/g' src/Info.plist > $(BUNDLE)/Contents/Info.plist
 	plutil -lint $(BUNDLE)/Contents/Info.plist
 
 test: $(BUILD)/macho_test $(BUILD)/binding_test $(BUILD)/manifest_test $(BUILD)/x86_route_test $(BUILD)/arm64e_fixup_test $(BUILD)/arm64e_route_test $(BUILD)/arm64e_synthesize_test $(BUILD)/arm64e_vtable_disc_test $(BUILD)/arm64e_synthesize_vtable_test $(BUILD)/write_plan_test $(BUILD)/fixture.dylib $(BUILD)/kernel/Fixture $(BUILD)/graft-kext $(BUILD)/staging_test $(BUILD)/synth_emit_test $(BUILD)/prelink_test $(TOOL_FIXTURES)
@@ -133,7 +133,7 @@ $(BUILD)/binding_test: tests/binding_test.cpp src/Binding.h src/Fixup.h src/x86_
 	@mkdir -p $(BUILD)
 	$(HOSTCXX) -arch x86_64 -Isrc tests/binding_test.cpp -o $@
 
-$(BUILD)/x86_route_test: tests/x86_route_test.cpp src/x86_64/X86Route.h src/x86_64/Fixup.h src/FixupShared.h
+$(BUILD)/x86_route_test: tests/x86_route_test.cpp src/x86_64/X86Route.h src/x86_64/Fixup.h src/FixupShared.h src/Policy.h
 	@mkdir -p $(BUILD)
 	$(HOSTCXX) -arch x86_64 -Isrc $< -o $@
 
@@ -188,16 +188,15 @@ kernel-check-arm64e: $(ARM_CORE)
 	@echo "arm64e: the neutral core and the arm64e layer compile"
 
 # The arm64e Graft kext. It links with its undefined symbols unresolved, and
-# the boot firmware's placement binds each to a vmapple kernel export; the
-# arm64e layer uses no OSKext and no PE_get_kc_header, which it could not bind.
+# the boot firmware's placement binds each to a vmapple kernel export. The
+# arm64e layer reaches OSKext only through OSKextLoadKextWithIdentifier, an
+# export, and uses no PE_get_kc_header, which it could not bind.
 graft-arm64e: $(ARM_BINARY)
 
 $(ARM_BINARY): $(ARM_CORE) src/Info.plist Makefile
 	@mkdir -p $(@D)
 	xcrun --sdk macosx ld -arch arm64e -kext -undefined dynamic_lookup $(ARM_CORE) -o $@
-	sed -e 's/@VERSION@/$(VERSION)/g' \
-		-e 's|@GRAFT_ARM64E_LIBS@|<key>com.apple.iokit.IOMobileGraphicsFamily</key><string>1.0.0</string>|' \
-		src/Info.plist > $(ARM_BUNDLE)/Contents/Info.plist
+	sed -e 's/@VERSION@/$(VERSION)/g' src/Info.plist > $(ARM_BUNDLE)/Contents/Info.plist
 	plutil -lint $(ARM_BUNDLE)/Contents/Info.plist
 
 core-probe: $(BUILD)/GraftCoreProbe.kext/Contents/MacOS/GraftCoreProbe
@@ -292,14 +291,14 @@ $(BUILD)/consumer/%/Fixture.kext/Contents/MacOS/Fixture: $(BUILD)/consumer/%/Fix
 		--work=$(BUILD)/consumer/$*/graft --output=$(BUILD)/consumer/$*/Fixture.kext \
 		$< -- -arch $* -Itests/consumer
 
-$(BUILD)/synthesized/ReimsDisplay.o: tests/synthesized/ReimsDisplay.cpp tests/synthesized/ReimsDisplay.h sdk/include/graft/IOMobileFramebufferLegacy.h Makefile
+$(BUILD)/synthesized/SynthDisplay.o: tests/synthesized/SynthDisplay.cpp tests/synthesized/SynthDisplay.h sdk/include/graft/IOMobileFramebufferLegacy.h Makefile
 	@mkdir -p $(@D)
 	xcrun --sdk macosx clang++ $(ARMFLAGS) -Itests/synthesized -c $< -o $@
 
-$(BUILD)/synthesized/ReimsDisplay.kext/Contents/MacOS/ReimsDisplay: $(BUILD)/synthesized/ReimsDisplay.o tests/synthesized/graft.json tests/synthesized/Info.plist $(BUILD)/graft-kext
-	$(BUILD)/graft-kext build --name=ReimsDisplay --version=1.0.0 --arch='-arch arm64e' \
+$(BUILD)/synthesized/SynthDisplay.kext/Contents/MacOS/SynthDisplay: $(BUILD)/synthesized/SynthDisplay.o tests/synthesized/graft.json tests/synthesized/Info.plist $(BUILD)/graft-kext
+	$(BUILD)/graft-kext build --name=SynthDisplay --version=1.0.0 --arch='-arch arm64e' \
 		--declaration=tests/synthesized/graft.json --info-plist=tests/synthesized/Info.plist \
-		--work=$(BUILD)/synthesized/graft --output=$(BUILD)/synthesized/ReimsDisplay.kext \
+		--work=$(BUILD)/synthesized/graft --output=$(BUILD)/synthesized/SynthDisplay.kext \
 		$< -- -arch arm64e -Isdk/include -Itests/synthesized
 
 $(BUILD)/macho_test: tests/macho_test.cpp src/MachO.h

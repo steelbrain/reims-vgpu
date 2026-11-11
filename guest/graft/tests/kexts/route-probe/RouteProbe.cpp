@@ -51,7 +51,9 @@ ROUTE_WRAPPER(2) // vnode_check_signature
 #undef ROUTE_WRAPPER
 
 namespace {
-constexpr const char *Client = "ai.aneesiqbal.RgfxGate";
+// This probe's own bundle identifier (also GRAFT_CLIENT_ID), which Graft serves
+// because it names a placed kext.
+constexpr const char *Client = "ai.aneesiqbal.graft.RouteProbe";
 const char *const operations[] = {"file_check_mmap", "file_check_library_validation",
                                   "vnode_check_signature"};
 

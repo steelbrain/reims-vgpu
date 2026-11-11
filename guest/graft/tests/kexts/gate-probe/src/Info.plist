@@ -2,7 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
     <key>CFBundleExecutable</key><string>GraftGateProbe</string>
-    <key>CFBundleIdentifier</key><string>ai.aneesiqbal.ReimsGraphics</string>
+    <key>CFBundleIdentifier</key><string>ai.aneesiqbal.graft.GateProbe</string>
     <key>CFBundleName</key><string>GraftGateProbe</string>
     <key>CFBundlePackageType</key><string>KEXT</string>
     <key>CFBundleVersion</key><string>@VERSION@</string>
@@ -11,21 +11,21 @@
         <key>Display</key><dict>
             <key>IOClass</key><string>GraftGateProbe</string>
             <key>IOProviderClass</key><string>IOPCIDevice</string>
-            <key>IOPCIPrimaryMatch</key><string>0x52471234</string>
+            <key>IOPCIClassMatch</key><string>0x06000000&amp;0xffff0000</string>
             <key>IOMatchCategory</key><string>GraftGateProbe.Display</string>
             <key>GraftGateCategory</key><string>Display</string>
         </dict>
         <key>Accelerator</key><dict>
             <key>IOClass</key><string>GraftGateProbe</string>
             <key>IOProviderClass</key><string>IOPCIDevice</string>
-            <key>IOPCIPrimaryMatch</key><string>0x52471234</string>
+            <key>IOPCIClassMatch</key><string>0x06000000&amp;0xffff0000</string>
             <key>IOMatchCategory</key><string>GraftGateProbe.Accelerator</string>
             <key>GraftGateCategory</key><string>Accelerator</string>
         </dict>
         <key>Control</key><dict>
             <key>IOClass</key><string>GraftGateProbe</string>
             <key>IOProviderClass</key><string>IOPCIDevice</string>
-            <key>IOPCIPrimaryMatch</key><string>0x52471234</string>
+            <key>IOPCIClassMatch</key><string>0x06000000&amp;0xffff0000</string>
             <key>IOMatchCategory</key><string>GraftGateProbe.Control</string>
             <key>GraftGateCategory</key><string>Control</string>
         </dict>

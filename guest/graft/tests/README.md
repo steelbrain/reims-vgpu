@@ -39,9 +39,9 @@ later with only its standard library.
 
 | test | covers |
 |---|---|
-| `macho_test.cpp` | the Mach-O reader: duplicate-aware symbol lookup, malformed and truncated load commands, `__LINKEDIT` bounds, symbol-table snapshots, and a real dylib built from `fixture.c` |
+| `macho_test.cpp` | the Mach-O reader: duplicate-aware symbol lookup, malformed and truncated load commands, fileset entries and their identifiers, which Graft finds the x86-64 consumers by, `__LINKEDIT` bounds, symbol-table snapshots, and a real dylib built from `fixture.c` |
 | `binding_test.cpp` | pointer and branch fixup arithmetic, the whole-plan checks on import sites (bounds, order, missing and ambiguous symbols), and the class size and vtable length comparison |
-| `manifest_test.cpp` | manifest validation, import resolution with candidates and fallbacks, weak imports through the plan and the target check, provider anchors, vtable planning, and a manifest section read back from a linked kext |
+| `manifest_test.cpp` | manifest validation, including the versions it reads, the version it names when it refuses another, and the provider matching string, import resolution with candidates and fallbacks, weak imports through the plan and the target check, provider anchors, vtable planning, and a manifest section read back from a linked kext |
 | `x86_route_test.cpp` | x86-64 instruction decoding and route building, with 20,000 generated instruction streams, refusal of unsupported forms, and routes run on the host |
 | `write_plan_test.cpp` | the write transaction: every old value checked before any store, read-back, rollback, and refusal of overlapping or malformed declarations |
 | `arm64e_fixup_test.cpp` | the arm64e import fixup: a signed placeholder is re-signed for the real target under the same key and discriminator, checked against an independent signer, and a tampered slot or discriminator is refused |
@@ -54,16 +54,16 @@ later with only its standard library.
 
 | test | covers |
 |---|---|
-| `staging_test.cpp` | staging the consumer fixture: class probes, the import census, the staged image, weak imports, provider anchors and the dormant bundle, and refusing a short or zerofill reservation; for arm64e, its chained fixups and a version-3 manifest whose signed sites carry their signing context |
+| `staging_test.cpp` | staging the consumer fixture: class probes, the import census, the staged image, weak imports, provider anchors, the dormant bundle and its provider matching, and refusing a short or zerofill reservation; for arm64e, its chained fixups and a version-5 manifest whose signed sites carry their signing context |
 | `sdk_standin_test.py` | a subclass of the SDK's `IOMobileFramebufferLegacy` stand-in, compiled for both architectures: its reserved slots and the symbols its overrides produce |
 | `synth_emit_test.cpp` | staging an arm64e synthesized consumer: the synthesized-class and override records |
 | `prelink_test.cpp` | the prelinked-collection check, on synthetic x86-64 collections built from the staged consumer, intact and corrupted, and what `graft-kext check-prelinked` prints and exits with |
-| `graft_kext_test.py` | `graft-kext` as a consumer's build runs it, for x86-64 and arm64e: what `build` stages and leaves in its work directory, `build` against its steps run one at a time, and each refusal's exit status and text |
+| `graft_kext_test.py` | `graft-kext` as a consumer's build runs it, for x86-64 and arm64e: what `build` stages and leaves in its work directory, the provider matching it records for personalities of any provider, `build` against its steps run one at a time, and each refusal's exit status and text |
 | `consumer_mk_test.py` | `sdk/consumer.mk` under make, included from a makefile of another name: the staged bundle current after a build, and not after an SDK header changes or a build fails |
-| `hook_symbols_test.py` | `tools/internal/hook-symbols.py`: an unreadable input is an error, never a missing symbol, and the symbols it reads from `hook-symbols.txt` |
+| `hook_symbols_test.py` | `tools/internal/hook-symbols.py`: an unreadable input or symbol list is an error, never a missing symbol, and the symbols it reads from `hook-symbols.txt` or a client's list |
 | `release_test.py` | `tools/internal/release.py`: the release's folder and zip, the tracked tree and both kexts, the same zip bytes from another checkout, umask and file modes, the tracked files it builds from and carries, refusing a tree that differs from `HEAD`, a tracked link, a tracked name the release adds, another Xcode, bundles of two versions and a malformed bundle; and every link in this repository's release resolving inside it |
 | `vendor_test.py` | `tools/vendor.py`: taking a zip that `release.py` wrote, with its record; refusing a file that differs from `SHA256SUMS`, a file missing from either, a link, a directory entry, a name outside the zip's one folder, a name twice, a malformed `SHA256SUMS` or `COMMIT`, and a release that holds a `source.toml`; keeping the earlier copy when a copy fails; and never replacing a directory it did not write |
-| `lint_test.py` | `tools/internal/lint.py`: license lines, text hygiene and Markdown links |
+| `lint_test.py` | `tools/internal/lint.py`: license lines, text hygiene, Markdown links, and the bundle identifiers `src/` and `sdk/` may name, in a C file's comments and literals and anywhere in another file |
 
 ## Fixtures
 

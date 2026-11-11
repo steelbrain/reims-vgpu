@@ -367,12 +367,23 @@ Staging checks its inputs before it creates the output bundle.
   against a parent it cannot see. The manifest records each vtable and its
   overridden slots; the inherited slots are not sites.
 - **The Info.plist goes dormant.** Its personalities stay but gain an
-  `IOPropertyMatch` gate on the device nub that Graft opens when it binds, each
-  naming the consumer's bundle identifier. A personality that has its own
-  `IOPropertyMatch`, a dictionary or a list of them, keeps it, and the gate's
-  key joins the dictionary, or each one of the list. The declared libraries
-  leave `OSBundleLibraries`, and any per-architecture list such as
+  `IOPropertyMatch` gate on the provider nub that Graft opens when it binds,
+  each naming the consumer's bundle identifier. A personality may match any
+  provider, and must name one in `IOProviderClass`. A personality that has its
+  own `IOPropertyMatch`, a dictionary or a list of them, keeps it, and the
+  gate's key joins the dictionary, or each one of the list. A personality
+  whose `IOPropertyMatch` already holds the gate's key, as a staged
+  Info.plist's do, is refused, since Graft would then watch only for nubs
+  whose gate is already open. The declared libraries leave
+  `OSBundleLibraries`, and any per-architecture list such as
   `OSBundleLibraries_x86_64`. Its other dependencies stay.
+- **The manifest carries the provider matching.** It records each personality
+  as the author wrote it, without the gate and without `IOClass`,
+  `CFBundleIdentifier`, `IOProbeScore` and `IOMatchCategory`, so Graft can
+  find the nubs to open the gate on
+  ([docs/manifest.md](../docs/manifest.md#provider-matching)). The
+  personalities size the manifest, so `reserve` reads the same Info.plist the
+  bundle `stage` copies holds.
 
 ## Commands
 
@@ -411,7 +422,8 @@ graft-kext stage KEXT DECLARATION LAYOUTS OUTPUT
   compiles in a directory of its own under `TMPDIR`, or `/tmp` when that is
   unset, and removes it.
 - `reserve` reads BINARY, the consumer linked without a manifest, and the
-  versioned INFO_PLIST, and writes RESERVATION.
+  versioned INFO_PLIST, whose personalities the manifest records, and writes
+  RESERVATION.
 - `stage` copies the bundle KEXT, linked with the reservation, to OUTPUT. It
   stages the copy beside OUTPUT and moves it into place once it is whole, so a
   staging that fails leaves no OUTPUT.
@@ -478,11 +490,11 @@ for arm64e. The C++ tests link every source in `tool/` but its command line,
 - `tests/staging_test.cpp` checks, on the fixture, probing, the import census,
   weak imports, anchors, required methods, placeholders, the renumbered symbol
   table, the renamed markers, a short reservation, truncated Mach-O files and
-  the dormant bundle. On the arm64e build it checks the chained fixups the
-  tool reads (each import bind by name, the weak ones flagged, every rebase
-  inside the image) and the version-3 manifest: signed sites carry their
-  signing context, and each provider import becomes a rebase at its
-  placeholder.
+  the dormant bundle with its provider matching. On the arm64e build it checks
+  the chained fixups the tool reads (each import bind by name, the weak ones
+  flagged, every rebase inside the image) and the version-5 manifest: signed
+  sites carry their signing context, and each provider import becomes a
+  rebase at its placeholder.
 - `tests/synth_emit_test.cpp` checks the synthesized-class and override
   records staging writes for the display.
 - `tests/prelink_test.cpp` links the staged x86-64 fixture into synthetic
@@ -491,9 +503,10 @@ for arm64e. The C++ tests link every source in `tool/` but its command line,
   `graft-kext check-prelinked` prints and exits with.
 - `tests/graft_kext_test.py` runs `graft-kext` as a consumer's build does, on
   the fixture for x86-64 and arm64e, and checks only what that build sees:
-  the staged bundle, the files under the work directory, that `build` writes
-  what its steps run one at a time write, and each refusal's exit status and
-  text.
+  the staged bundle, the provider matching its manifest carries for
+  personalities of any provider, the files under the work directory, that
+  `build` writes what its steps run one at a time write, and each refusal's
+  exit status and text.
 - `tests/consumer_mk_test.py` runs `consumer.mk` under make, from a makefile
   of another name, and checks that the staged bundle is current after a
   build, and not after an SDK header changes or a build fails.

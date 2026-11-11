@@ -64,7 +64,8 @@ struct Fixture {
             return offset;
         };
         h.gate = string(gate);
-        h.device = string("0x52471234");
+        h.matching = string("<dict><key>Fixture</key><dict><key>IOProviderClass</key>"
+                            "<string>IOResources</string></dict></dict>");
         library = string("ai.aneesiqbal.graft.test.Fixture.library");
         method = string("_method");
         renamed = string("_renamed");
@@ -99,16 +100,31 @@ static void validation() {
     Fixture f;
     View v;
     CHECK(f.open(v).error == Error::None && v.valid());
+    CHECK(!unsupportedVersion(f.bytes.data(), f.open(v)));
     CHECK(!strcmp(v.string(f.library), "ai.aneesiqbal.graft.test.Fixture.library"));
     CHECK(!v.string(0) && !v.string(UINT32_MAX));
-    // Every byte-truncated blob must fail and clear a previously valid view.
+    // Every byte-truncated blob must fail and clear a previously valid view. No
+    // such failure is a version Graft names in its refusal.
     for (size_t length = 0; length < f.bytes.size(); ++length) {
-        CHECK(manifest::open(f.bytes.data(), length, v).error != Error::None && !v.valid());
+        auto failure = manifest::open(f.bytes.data(), length, v);
+        CHECK(failure.error != Error::None && !v.valid());
+        CHECK(!unsupportedVersion(f.bytes.data(), failure));
     }
-    f.h.version = VersionArm64e + 1;
+    // Only the current versions are read: the earlier ones, which named a device
+    // rather than carrying provider matching, and any later one are refused, and
+    // the refusal names the version, so its consumer's author knows to rebuild.
+    for (uint32_t version : {2u, 3u, VersionArm64e + 1}) {
+        f.h.version = version;
+        f.save();
+        auto failure = f.open(v);
+        CHECK(failure.error == Error::Version);
+        CHECK(unsupportedVersion(f.bytes.data(), failure) == version);
+    }
+    f.h.magic = Magic + 1; // another version under a wrong magic is not a manifest
     f.save();
-    CHECK(f.open(v).error == Error::Version);
-    // A version-3 (arm64e) manifest: the base site is a valid plain pointer,
+    CHECK(!unsupportedVersion(f.bytes.data(), f.open(v)));
+    f.h.magic = Magic;
+    // A version-5 (arm64e) manifest: the base site is a valid plain pointer,
     // and an authenticated site carries key, addrDiv and diversity.
     f.h.version = VersionArm64e;
     f.save();
@@ -126,6 +142,11 @@ static void validation() {
     CHECK(Fixture(gate.c_str()).open(v).error == Error::None);
     gate += 'g';
     CHECK(Fixture(gate.c_str()).open(v).error == Error::String);
+    // The provider matching is a string the table holds.
+    f = Fixture{};
+    f.h.matching = 0;
+    f.save();
+    CHECK(f.open(v).error == Error::String);
     f = Fixture{};
     f.h.candidates.offset = f.h.imports.offset;
     f.save();
@@ -503,7 +524,7 @@ static void vtables() {
     puts("vtables: pass (live inherited slots, preserved overrides/appended methods, refusal)");
 }
 
-// A version-3 (arm64e) manifest's segment table and vtable fills: the segments
+// A version-5 (arm64e) manifest's segment table and vtable fills: the segments
 // are sorted, bounded, disjoint and named; the fills partition [0, parentSlots)
 // with the overrides, in slot order, each a valid signing context. x86-64
 // carries neither. The real staged forms are cross-checked at build time; this
@@ -554,10 +575,11 @@ static void segmentsAndFills() {
     f.h.version = Version; // x86-64 carries no segment or fill table
     f.save();
     CHECK(f.open(v).error == Error::Version);
+    CHECK(!unsupportedVersion(f.bytes.data(), f.open(v))); // a version Graft reads
     puts("segments and fills: pass (sorted/bounded segments, fill partition, version gate)");
 }
 
-// A version-3 (arm64e) manifest's synthesis tables: selector strings, overrides
+// A version-5 (arm64e) manifest's synthesis tables: selector strings, overrides
 // that partition the selectors in order with a valid signing context, and classes
 // that partition the overrides. x86-64 carries none. The real staged form is
 // cross-checked at build time; this exercises the refusals open() must make on a
@@ -693,6 +715,7 @@ static void linkedImage(const char *path) {
     View view;
     CHECK(manifest::open(image.data() + section->offset, section->size, view).error == Error::None);
     CHECK(!strcmp(view.string(view.header().gate), "graft-bound"));
+    CHECK(!strcmp(view.string(view.header().matching), "<dict/>"));
     puts("kernel fixture: pass (x86-64 kext link, embedded manifest section)");
 }
 

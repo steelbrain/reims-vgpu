@@ -23,8 +23,9 @@ It is built by the top Makefile:
 make core-probe   # build/GraftCoreProbe.kext
 ```
 
-[tools/internal/boot-core.py](../../tools/internal/boot-core.py) injects it with
-`--probe` and requires `GraftProbeState` to reach `passed`.
+[tools/internal/boot-core.py](../../tools/internal/boot-core.py) injects it as a
+client, `--client build/GraftCoreProbe.kext routed`, and requires
+`GraftProbeState` to reach `passed`.
 
 ## route-probe
 
@@ -50,8 +51,16 @@ It runs on an arm64e boot, not under boot-core.py, which boots x86-64.
 several `IOMatchCategory` values on one device nub. Graft sets one gate property
 on the nub, and every gated personality matches together; each started
 personality also exercises a bound import, so a started category proves the bind
-landed, not just that the personality matched. Its bundle identifier is
-`ai.aneesiqbal.ReimsGraphics`, the one Graft binds (`src/Policy.h`).
+landed, not just that the personality matched. Its bundle identifier is its own,
+`ai.aneesiqbal.graft.GateProbe`: Graft binds every placed kext that carries a
+manifest.
+
+Its three personalities match the PCI host bridge by its class code,
+`IOPCIClassMatch` `0x06000000&0xffff0000`, each with its own `IOMatchCategory`.
+QEMU's q35 machine, the x86-64 test guest, and vmapple, the arm64e one, both
+present a host bridge of class `0x060000` with no driver attached, so the probe
+needs no device of its own on either architecture. Each started category
+declines to attach, so the bridge stays as it was.
 
 It is a consumer, so it is built through the SDK with its own Makefile:
 
@@ -64,4 +73,11 @@ make -C tests/kexts/gate-probe REFUSE=1             # the forced-refuse variant
 The `REFUSE=1` variant declares an absent provider anchor
 (`src/graft-refuse.json`), so Graft refuses the bind and never opens the gate;
 it shows that a refused consumer stays dormant with no category started.
-boot-core.py does not inject gate-probe.
+
+boot-core.py injects it as a consumer, `--consumer build/GraftGateProbe.kext
+bound`, and requires the key each started personality sets on the registry
+root, `GraftGateProbe.<category>` named by its `GraftGateCategory`, to read
+`passed`. The `REFUSE=1`
+variant goes in as `--consumer build/GraftGateProbe-refuse.kext refused`, or
+with more of the refusal as its state, beside other kexts to show that one
+consumer's refusal leaves the others bound.

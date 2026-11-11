@@ -35,7 +35,9 @@ PROBE_ENTRY(5, 40)
 #undef PROBE_ENTRY
 
 namespace {
-constexpr const char *Client = "ai.aneesiqbal.RgfxGate";
+// This probe's own bundle identifier (also GRAFT_CLIENT_ID), which Graft serves
+// because it names a placed kext.
+constexpr const char *Client = "ai.aneesiqbal.graft.CoreProbe";
 const char *const symbols[] = {"_mac_file_check_library_validation",
                                "_mac_file_check_mmap",
                                "_mac_vnode_check_signature",

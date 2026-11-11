@@ -23,34 +23,37 @@ static const char *probeCategory(IOService *self) {
 // so reaching probe() at all means the gate deferred matching until the bind;
 // the serial line times it against Graft's property-set line.
 IOService *GraftGateProbe::probe(IOService *, SInt32 *) {
-    IOLog("reims-graft-gate: probe %s\n", probeCategory(this));
+    IOLog("graft-gate-probe: probe %s\n", probeCategory(this));
     return this;
 }
 
 bool GraftGateProbe::start(IOService *) {
     // The personality the gate deferred now starts. Exercise the bound import to
-    // confirm the bind, then record the outcome on the registry root keyed by
-    // category, so one property opening every category at once is visible in
-    // ioreg. Decline to attach (return false): the test needs only that start()
-    // was reached with the import bound, not a live accelerator on the test GPU,
-    // and IOAccelerator's own start is heavy; the recorded property is the signal.
+    // confirm the bind, then record the outcome on the registry root as
+    // GraftGateProbe.<category>, so one property opening every category at once
+    // is visible in ioreg. Decline to attach (return false): the test needs only that start()
+    // was reached with the import bound, not a live accelerator on the host
+    // bridge, and IOAccelerator's own start is heavy; the recorded property is
+    // the signal.
     const char *category = probeCategory(this);
-    IOLog("reims-graft-gate: start %s\n", category);
+    IOLog("graft-gate-probe: start %s\n", category);
     IOAccelID identifier = 0;
     IOReturn result = graft_gate_create(0, &identifier);
     if (result == kIOReturnSuccess)
         result = IOAccelerator::releaseAccelID(0, identifier);
+    char key[64];
+    snprintf(key, sizeof(key), "GraftGateProbe.%s", category);
     auto root = IORegistryEntry::getRegistryRoot();
     if (root)
-        root->setProperty(category,
-                          result == kIOReturnSuccess ? "passed" : "refused: imported call");
+        root->setProperty(key, result == kIOReturnSuccess ? "passed" : "refused: imported call");
     return false;
 }
 
 extern "C" kern_return_t probe_start(kmod_info_t *, void *) {
-    // Runs when the kext loads, before Graft opens the gate. Mark that the kext
-    // loaded, so the forced-refuse arm (gate never opened) reads as loaded with
-    // no category started, distinct from the kext being absent.
+    // The kernel starts the kext only once one of its personalities matches, so
+    // this runs only after Graft opens the gate. GraftGateProbeLoaded therefore
+    // marks a kext the gate let start: the forced-refuse build never starts, and
+    // leaves the key absent.
     auto root = IORegistryEntry::getRegistryRoot();
     if (root)
         root->setProperty("GraftGateProbeLoaded", "yes");
@@ -60,5 +63,5 @@ extern "C" kern_return_t probe_stop(kmod_info_t *, void *) {
     return KERN_FAILURE;
 }
 extern "C" {
-KMOD_EXPLICIT_DECL(ai.aneesiqbal.ReimsGraphics, "1.0.0", probe_start, probe_stop)
+KMOD_EXPLICIT_DECL(ai.aneesiqbal.graft.GateProbe, "1.0.0", probe_start, probe_stop)
 }

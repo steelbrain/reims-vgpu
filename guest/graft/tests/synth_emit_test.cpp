@@ -45,19 +45,19 @@ const std::set<std::string> Optional = {"start_hardware",
                                         "free"};
 // supported_frame_info's three-argument form, which the declaration names as a
 // selector alternative under the consumer class.
-const std::string SupportedFrameInfoThree = "__ZN12ReimsDisplay20supported_frame_infoEjPjPA64_c";
+const std::string SupportedFrameInfoThree = "__ZN12SynthDisplay20supported_frame_infoEjPjPA64_c";
 // The consumer's own methods its declaration does not name: the destructors and
 // getMetaClass OSDefineMetaClassAndStructors defines. They are carried as
 // required overrides, so the bind places them or refuses, never leaving the
 // parent's in their slots.
-const std::set<std::string> Carried = {"__ZN12ReimsDisplayD1Ev", "__ZN12ReimsDisplayD0Ev",
-                                       "__ZNK12ReimsDisplay12getMetaClassEv"};
+const std::set<std::string> Carried = {"__ZN12SynthDisplayD1Ev", "__ZN12SynthDisplayD0Ev",
+                                       "__ZNK12SynthDisplay12getMetaClassEv"};
 const size_t OverrideCount = Required.size() + Optional.size() + Carried.size();
 
 void oneSynthesizedClass(const Built &built, const Census &found) {
     CHECK(found.synth.size() == 1);
     const SynthClassRecord &record = found.synth[0];
-    CHECK(record.name == "ReimsDisplay");
+    CHECK(record.name == "SynthDisplay");
     CHECK(record.parentClass == "IOMobileFramebufferLegacy");
     CHECK(record.siblingClass == "AppleParavirtDisplay");
     CHECK(record.library == 0);
@@ -77,7 +77,7 @@ void oneSynthesizedClass(const Built &built, const Census &found) {
 // shift every synthesized word two slots late.
 void vtableOffsetIsWordZero(const Built &built, const Census &found) {
     Image image(built.census);
-    const Symbol &vtable = image.symbol(vtableName("ReimsDisplay"));
+    const Symbol &vtable = image.symbol(vtableName("SynthDisplay"));
     CHECK(found.synth[0].vtableOffset == vtable.value - image.base);
     CHECK(image.read(vtable.value, 16) == Bytes(16));
     puts("vtable offset: pass (the vtable's first word)");
@@ -94,7 +94,7 @@ void overridesResolveByMethodName(const Census &found) {
         // The primary selector is the consumer's own method (a const method
         // carries the __ZNK form), pointing at its own code, signed as an
         // arm64e vtable slot is.
-        CHECK(primary.find("12ReimsDisplay") != std::string::npos);
+        CHECK(primary.find("12SynthDisplay") != std::string::npos);
         CHECK(override.impl != 0);
         CHECK(override.opcode & manifest::SiteSigned);
     }
@@ -118,7 +118,7 @@ void overridesResolveByMethodName(const Census &found) {
 }
 
 void packPartitionsTheRecords(const Built &built, const Census &found) {
-    Bytes bytes = packManifest(built.declaration, built.layouts, found, built.gate, {},
+    Bytes bytes = packManifest(built.declaration, built.layouts, found, built.activation, {},
                                manifest::VersionArm64e);
     manifest::View view = manifestOf(bytes);
     const manifest::Header &header = view.header();
@@ -156,7 +156,7 @@ void staleLayoutsAreRefused(const Built &built) {
     std::vector<std::string> &slots = stale.synthesized.at(0).slots;
     auto slotOf = [&](const std::string &name) {
         auto found = std::find_if(slots.begin(), slots.end(), [&](const std::string &slot) {
-            return slot.find("12ReimsDisplay") != std::string::npos && memberName(slot) == name;
+            return slot.find("12SynthDisplay") != std::string::npos && memberName(slot) == name;
         });
         CHECK(found != slots.end());
         return found;
@@ -176,7 +176,7 @@ void sharedParentIsRefused(const Built &built, const Census &found) {
     shared.vtables.push_back({found.synth[0].vtableOffset + 16, 0, parentSlots, {}, {}});
     CHECK(refuses(
             [&] {
-                packManifest(built.declaration, built.layouts, shared, built.gate, {},
+                packManifest(built.declaration, built.layouts, shared, built.activation, {},
                              manifest::VersionArm64e);
             },
             "Graft would refuse this manifest: invalid vtables record 0"));
@@ -187,7 +187,7 @@ void sharedParentIsRefused(const Built &built, const Census &found) {
 
 int main(int argc, char **argv) {
     CHECK(argc == 3);
-    Built built(argv[1], argv[2], "ReimsDisplay");
+    Built built(argv[1], argv[2], "SynthDisplay");
     Census found = census(Image(built.census), built.declaration, built.layouts);
     oneSynthesizedClass(built, found);
     vtableOffsetIsWordZero(built, found);

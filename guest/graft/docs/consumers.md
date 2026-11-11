@@ -1,6 +1,7 @@
 # Building a kext for Graft
 
-Graft serves two kinds of kexts, and a kext is built differently for each.
+Graft serves two kinds of kexts, and a kext is built differently for each. Any
+kext placed in the boot image beside Graft can be either.
 
 - An **owned client** calls Graft's interface to look up kernel symbols and
   route kernel functions.
@@ -11,11 +12,19 @@ This page says what sets the two apart and how each goes into a boot image.
 The guides take you through the steps, and [design.md](design.md) explains
 what Graft does with each kext at boot.
 
-Graft serves one kext of each kind, named in `src/Policy.h`. It serves calls
-that pass the owned client's identifier, `ai.aneesiqbal.RgfxGate`, and binds
-the consumer `ai.aneesiqbal.ReimsGraphics`, whose personalities must match the
-PCI device `1234:5247`. Serving another kext means changing `src/Policy.h` and
-rebuilding Graft.
+Graft finds each kind without being told its name:
+
+- **A bound consumer** by its manifest. At start Graft looks through every
+  kext placed at boot, the Boot collection's fileset entries on x86-64 and the
+  boot firmware's device-tree nodes on arm64e, and keeps each one whose
+  `__DATA,__graft` section starts with the manifest's magic. Its personalities
+  match their providers as any driver's do, and once it is bound, Graft opens
+  its gate on every nub they match.
+- **An owned client** by the bundle identifier each call passes. Graft serves
+  the call when that identifier names a kext placed at boot, so a client
+  passes its own.
+
+So serving a new kext of either kind needs no change to Graft.
 
 Everything a kext builds with is in [sdk/](../sdk/README.md). Another
 repository takes a release, the SDK included, with `tools/vendor.py`
@@ -29,8 +38,8 @@ An owned client is an ordinary kext with four additions:
 2. The SDK's start glue, `sdk/Start.cpp`, which declares the kmod and calls
    the client's `graft_client_initialize()` from its start routine.
 3. A dependency on Graft: `ai.aneesiqbal.graft` at version `0.1.0` in
-   `OSBundleLibraries`. Release 0.1.0 declares `OSBundleCompatibleVersion`
-   `0.1.0`.
+   `OSBundleLibraries`. Release 0.2.0 declares `OSBundleCompatibleVersion`
+   `0.1.0`, so a client that lists `0.1.0` loads with it.
 4. An `IOService` subclass and one personality that matches `IOResources`,
    because an injected kext is not started for `OSBundleRequired` Root alone.
 
@@ -96,8 +105,14 @@ Graft publishes its state on the IORegistry root. In the guest,
 ioreg -l -d 1 | grep Graft
 ```
 
-shows `GraftState`, `GraftReason`, the recent `GraftLog`, and a
-`GraftClient.<bundle id>` entry for each kext Graft serves, as
-`<state>: <reason>`. The same lines go to the kernel log with the prefix
-`graft:`. [guides/debugging-refusals.md](guides/debugging-refusals.md) explains
-each state and reason.
+shows `GraftState`, `GraftReason`, and a `GraftClient.<bundle id>` entry for
+each kext Graft serves, as `<state>: <reason>`. It shows only the start of
+`GraftLog`, Graft's recent steps, one a line. This prints all of it:
+
+```sh
+ioreg -l -d 1 | sed -n '/"GraftLog" = /,/^"$/p'
+```
+
+On arm64e the steps are also in the unified log, prefixed `graft: `; on x86-64
+they are not. [guides/debugging-refusals.md](guides/debugging-refusals.md)
+explains each state and reason, and how to read the log.

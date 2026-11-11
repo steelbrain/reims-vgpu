@@ -11,6 +11,10 @@ hygiene and the links between the docs.
   carriage returns or tab indentation (make files may indent with tabs).
 - Every relative link in a Markdown file names a file or directory in the
   repository, and every #fragment names a heading in its target.
+- No file under src/ or sdk/ names a kext's bundle identifier other than
+  Graft's own and Apple's, in a C-family file's comments and literals or
+  anywhere in another file. Graft serves any kext, so neither Graft nor its
+  SDK names one it serves.
 
 It checks the files git tracks or would track, so a new file is checked
 before it is committed.
@@ -31,6 +35,21 @@ CODE = {".c", ".cpp", ".h", ".m", ".py", ".mk", ".sh"}
 VERBATIM = ("LICENSES/",)
 LINK = re.compile(r"!?\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 FENCE = re.compile(r"^(```|~~~)")
+# The trees that name no kext but Graft and Apple's. In their C-family files only comments and
+# literals are checked, since a member access in code can look like a bundle identifier.
+NEUTRAL = ("src/", "sdk/")
+C_FAMILY = {".c", ".cpp", ".h", ".m"}
+# A reverse-DNS bundle identifier: a top-level domain, then two or more labels. Ordinary dotted
+# text, such as a file name, a version or a member access, does not start with a top-level
+# domain.
+IDENTIFIER = re.compile(
+    r"(?<![\w-])(?:[a-z]{2}|com|org|net|edu|gov|info|biz|dev|app)(?:\.[A-Za-z0-9-]+){2,}"
+)
+# Graft's own identifier, Apple's, and those under the domains RFC 2606 reserves for examples,
+# which name no vendor.
+ALLOWED = re.compile(r"ai\.aneesiqbal\.graft|com\.apple\..+|(?:com|net|org)\.example\..+")
+# A C-family comment, string literal or character literal.
+LITERAL = re.compile(r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'", re.DOTALL)
 
 
 def tracked(root: Path) -> list[str]:
@@ -80,6 +99,23 @@ def check_text(name: str, text: str) -> list[str]:
             problems.append(f"{name}:{number}: carriage return")
         if not tabs_allowed and line.startswith("\t"):
             problems.append(f"{name}:{number}: tab indentation")
+    return problems
+
+
+def check_identifiers(name: str, text: str) -> list[str]:
+    """The bundle identifiers of kexts other than Graft and Apple's that a file names: in a
+    C-family file, in its comments and literals; in any other file, anywhere."""
+    if Path(name).suffix in C_FAMILY:
+        spans = [match.span() for match in LITERAL.finditer(text)]
+    else:
+        spans = [(0, len(text))]
+    problems = []
+    for start, end in spans:
+        for match in IDENTIFIER.finditer(text, start, end):
+            if not ALLOWED.fullmatch(match[0]):
+                number = text.count("\n", 0, match.start()) + 1
+                found = f"names a kext other than Graft or Apple's: {match[0]}"
+                problems.append(f"{name}:{number}: {found}")
     return problems
 
 
@@ -152,6 +188,8 @@ def lint(root: Path) -> list[str]:
         if text is None:
             continue
         problems += check_text(name, text)
+        if name.startswith(NEUTRAL):
+            problems += check_identifiers(name, text)
         if name.endswith(".md") and not name.startswith(VERBATIM):
             problems += check_links(root, name, text, set(files))
     return problems

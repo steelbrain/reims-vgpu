@@ -19,11 +19,11 @@ namespace graft {
 namespace manifest {
 
 constexpr uint32_t Magic = 0x54465247; // "GRFT"
-// Version 2 is an x86-64 consumer, version 3 an arm64e one. They share the
+// Version 4 is an x86-64 consumer, version 5 an arm64e one. They share the
 // header and every table, but a site's two trailing bytes differ (Site), and
-// only version 3 carries segments, fills and synthesized classes.
-constexpr uint32_t Version = 2;
-constexpr uint32_t VersionArm64e = 3;
+// only version 5 carries segments, fills and synthesized classes.
+constexpr uint32_t Version = 4;
+constexpr uint32_t VersionArm64e = 5;
 // An import's fallback when the consumer gives none.
 constexpr uint64_t NoFallback = UINT64_MAX;
 
@@ -32,19 +32,22 @@ struct Table {
 };
 
 // gate is the string offset of the consumer's activation property key, the
-// IOPropertyMatch its personalities carry. device is the string offset of their
-// IOPCIPrimaryMatch, which names the PCI nub Graft sets the gate property on
-// once it has bound the consumer.
+// IOPropertyMatch its staged personalities carry. matching is the string offset
+// of an XML property list: a dictionary from each personality's name to the
+// matching dictionary of its provider, which is the personality as its author
+// wrote it less the keys that name the driver (IOClass, CFBundleIdentifier,
+// IOProbeScore and IOMatchCategory). Once Graft has bound the consumer, it sets
+// the gate key on each nub one of them matches.
 //
 // The longest gate key, in bytes without its NUL. Graft keeps a copy of the key
-// to open the gate on device nubs published after the bind, so open() refuses a
-// longer one rather than let the copy cut it short.
+// to open the gate on provider nubs published after the bind, so open() refuses
+// a longer one rather than let the copy cut it short.
 constexpr size_t MaxGateLength = 159;
 struct Header {
     uint32_t magic, version, size, headerSize;
     Table strings, libraries, imports, candidates, sites, classes, slots, vtables, overrides,
             segments, fills, selectors, synthOverrides, synthClasses;
-    uint32_t gate, device;
+    uint32_t gate, matching;
 };
 
 // anchor names a class of the library whose registered metaclass confirms the
@@ -63,9 +66,9 @@ struct Import {
     uint64_t fallback;
 };
 
-// A reference to an import at an image offset. On a version-2 manifest width is
+// A reference to an import at an image offset. On a version-4 manifest width is
 // 8 for a pointer, with opcode OpcodePointer, or 4 for a branch displacement,
-// with the branch's opcode; reserved is 0. On a version-3 manifest every site is
+// with the branch's opcode; reserved is 0. On a version-5 manifest every site is
 // an 8-byte pointer, opcode is its auth byte (SiteSigned, SiteKeyMask,
 // SiteAddrDiv) and reserved its 16-bit diversity; a plain pointer has both 0.
 struct Site {
@@ -75,12 +78,12 @@ struct Site {
     uint8_t width, opcode;
     uint16_t reserved;
 };
-// A version-2 site's opcode: a pointer, or the instruction before a branch's
+// A version-4 site's opcode: a pointer, or the instruction before a branch's
 // 32-bit displacement.
 constexpr uint8_t OpcodePointer = 0;
 constexpr uint8_t OpcodeCall = 0xe8;
 constexpr uint8_t OpcodeJump = 0xe9;
-// A version-3 site's auth byte.
+// A version-5 site's auth byte.
 constexpr uint8_t SiteSigned = 0x1;  // bit 0: the pointer is signed
 constexpr uint8_t SiteKeyMask = 0x6; // bits 1-2: key, 0=IA 1=IB 2=DA 3=DB
 constexpr uint8_t SiteAddrDiv = 0x8; // bit 3: blend the slot address into the diversity
@@ -101,14 +104,14 @@ struct Vtable {
     uint32_t classIndex, slotCount, firstOverride, overrideCount, firstFill, fillCount;
 };
 
-// One of the consumer's own segments (version 3 only): its first byte as an
+// One of the consumer's own segments (version 5 only): its first byte as an
 // image offset and its size. The arm64e loader places segments by name, so
 // Graft maps an image offset through the placed segment that holds it.
 struct Segment {
     uint64_t origin, size;
     uint32_t name, reserved;
 };
-// An inherited vtable slot Graft fills from the live parent (version 3 only),
+// An inherited vtable slot Graft fills from the live parent (version 5 only),
 // with the signing context the consumer's build gave the slot: opcode is an auth
 // byte, as a site's, and diversity its constant discriminator.
 struct Fill {
@@ -117,7 +120,7 @@ struct Fill {
     uint8_t opcode, reserved;
 };
 
-// A synthesized class (version 3 only) derives from a parent whose vtable
+// A synthesized class (version 5 only) derives from a parent whose vtable
 // changes between releases, so Graft lays out its vtable when it binds, placing
 // each override on the live slot that holds the same method.
 constexpr uint8_t SynthRequired = 1; // the bind must place the override
@@ -256,7 +259,7 @@ inline Failure open(const void *bytes, size_t size, View &out) {
         }
     }
     if (!h.strings.count || v.bytes_[h.strings.offset] != 0 || !v.string(h.gate) ||
-        strlen(v.string(h.gate)) > MaxGateLength || !v.string(h.device))
+        strlen(v.string(h.gate)) > MaxGateLength || !v.string(h.matching))
         return {Error::String};
     for (uint32_t i = 0; i < h.libraries.count; ++i) {
         auto r = v.row<Library>(h.libraries, i);

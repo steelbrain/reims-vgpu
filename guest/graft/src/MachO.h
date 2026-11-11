@@ -262,38 +262,34 @@ inline bool definesAt(const SymbolTable &t, const char *name, uint64_t address) 
     return false;
 }
 
-// The vmaddr of fileset entry `id` in the collection `mh`, else 0. xnu slides
-// the entries and their segments with the collection, so this finds an entry
+// Each fileset entry of the collection `mh`, in load-command order, until
+// visit(vmaddr, id) returns true; returns that entry's vmaddr, or 0 when none
+// did. id is the entry's identifier, a kext's bundle identifier, NUL-terminated
+// inside its command; an entry whose identifier is not is skipped. xnu slides
+// the entries and their segments with the collection, so this visits an entry
 // whether or not the kernel has loaded or started it, such as a dormant
 // consumer.
-inline uint64_t filesetEntry(const mach_header_64 *mh, const char *id) {
-    if (!commandsValid(mh) || mh->filetype != MH_FILESET)
-        return 0;
-    auto lc = eachCommand(mh, [id](const load_command *lc) {
-        if (lc->cmd != LC_FILESET_ENTRY || lc->cmdsize < sizeof(fileset_entry_command))
-            return false;
-        auto offset = reinterpret_cast<const fileset_entry_command *>(lc)->entry_id.offset;
-        if (offset < sizeof(fileset_entry_command) || offset >= lc->cmdsize)
-            return false;
-        auto name = reinterpret_cast<const char *>(lc) + offset;
-        uint32_t room = lc->cmdsize - offset;
-        return strnlen(name, room) < room && !strcmp(name, id);
-    });
-    return lc ? reinterpret_cast<const fileset_entry_command *>(lc)->vmaddr : 0;
-}
-
-// Each fileset entry's vmaddr in the collection `mh`, in load-command order,
-// until visit(vmaddr) returns true; returns that vmaddr, or 0 when none did. For
-// finding an entry by what it holds when its bundle identifier is not known.
 template <typename Visit>
 inline uint64_t eachFilesetEntry(const mach_header_64 *mh, Visit visit) {
     if (!commandsValid(mh) || mh->filetype != MH_FILESET)
         return 0;
     auto lc = eachCommand(mh, [&visit](const load_command *lc) {
-        return lc->cmd == LC_FILESET_ENTRY && lc->cmdsize >= sizeof(fileset_entry_command) &&
-               visit(reinterpret_cast<const fileset_entry_command *>(lc)->vmaddr);
+        if (lc->cmd != LC_FILESET_ENTRY || lc->cmdsize < sizeof(fileset_entry_command))
+            return false;
+        auto entry = reinterpret_cast<const fileset_entry_command *>(lc);
+        uint32_t offset = entry->entry_id.offset;
+        if (offset < sizeof(fileset_entry_command) || offset >= lc->cmdsize)
+            return false;
+        auto id = reinterpret_cast<const char *>(lc) + offset;
+        uint32_t room = lc->cmdsize - offset;
+        return strnlen(id, room) < room && visit(entry->vmaddr, id);
     });
     return lc ? reinterpret_cast<const fileset_entry_command *>(lc)->vmaddr : 0;
+}
+
+// The vmaddr of fileset entry `id` in the collection `mh`, else 0.
+inline uint64_t filesetEntry(const mach_header_64 *mh, const char *id) {
+    return eachFilesetEntry(mh, [id](uint64_t, const char *name) { return !strcmp(name, id); });
 }
 
 } // namespace macho

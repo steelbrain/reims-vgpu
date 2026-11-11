@@ -6,18 +6,16 @@
 // through sdk/consumer.mk turns those declarations into a __DATA,__graft
 // manifest and leaves the kext dormant.
 //
-// Graft binds exactly one consumer: the one whose bundle identifier is
-// src/Policy.h's ConsumerIdentifier, ai.aneesiqbal.ReimsGraphics. This example
-// carries that identifier (Info.plist and the kmod declaration below) so the
-// shipped Graft binds it; a different identifier would never be bound. Your own
-// consumer would be named in Policy.h in its place.
+// Graft binds every placed kext that carries a manifest, whatever its bundle
+// identifier, so this example has its own, ai.aneesiqbal.graft.HelloConsumer
+// (Info.plist and the kmod declaration below).
 //
 // At boot Graft resolves this class's inherited vtable slots and its imported
 // calls into IOGraphicsFamily by symbol name, checks IOAccelerator's live size
 // and vtable against what this kext was compiled with, writes the manifest's
 // sites in one transaction, and opens the activation gate so the kernel starts
 // the kext. In ioreg (ioreg -l -d 1 | grep Graft) a reader then sees
-// GraftState = active, GraftClient.ai.aneesiqbal.ReimsGraphics beginning
+// GraftState = active, GraftClient.ai.aneesiqbal.graft.HelloConsumer beginning
 // "bound:", and this example's own GraftHelloConsumerState = passed.
 #include "Hello.h"
 #include <IOKit/IORegistryEntry.h>
@@ -52,5 +50,5 @@ extern "C" kern_return_t hello_stop(kmod_info_t *, void *) {
     return KERN_FAILURE;
 }
 extern "C" {
-KMOD_EXPLICIT_DECL(ai.aneesiqbal.ReimsGraphics, "1.0.0", hello_start, hello_stop)
+KMOD_EXPLICIT_DECL(ai.aneesiqbal.graft.HelloConsumer, "1.0.0", hello_start, hello_stop)
 }

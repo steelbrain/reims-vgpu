@@ -9,7 +9,7 @@ namespace {
 using namespace graft::manifest;
 struct Fixture {
     Header header;
-    char strings[24];
+    char strings[21];
 };
 constexpr Table Empty{sizeof(Fixture), 0};
 __attribute__((section("__DATA,__graft"), used))
@@ -34,7 +34,7 @@ const Fixture manifest{{Magic,
                         1,
                         13},
                        "\0graft-bound\0"
-                       "0x52471234"};
+                       "<dict/>"};
 } // namespace
 
 extern "C" kern_return_t fixture_start(kmod_info_t *, void *) {

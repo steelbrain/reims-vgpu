@@ -6,8 +6,8 @@
     "library": 0
   }],
   "synthesized": [{
-    "name": "ReimsDisplay",
-    "header": "ReimsDisplay.h",
+    "name": "SynthDisplay",
+    "header": "SynthDisplay.h",
     "parent": 0,
     "sibling": "AppleParavirtDisplay",
     "overrides": {
@@ -17,7 +17,7 @@
       "set_notify_tag_mask_gated": {"required": true},
       "supported_frame_info": {
         "required": true,
-        "selectors": ["__ZN12ReimsDisplay20supported_frame_infoEjPjPA64_c"]
+        "selectors": ["__ZN12SynthDisplay20supported_frame_infoEjPjPA64_c"]
       },
       "factory_portal": {"required": true},
       "executeFactoryConfigurations_gated": {"required": true},

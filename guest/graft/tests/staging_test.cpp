@@ -67,7 +67,7 @@ void stageRemapsSymbolsAndRelocations(const Built &x86) {
     CHECK(found.vtables.size() == 1);
     CHECK(!found.vtables[0].overrides.empty());
     CHECK(found.vtables[0].count == x86.layouts.consumers.at(0).slots.size());
-    Image staged = stageImage(original, x86.declaration, x86.layouts, x86.gate);
+    Image staged = stageImage(original, x86.declaration, x86.layouts, x86.activation);
     for (const Symbol &symbol : staged.symbols)
         CHECK(!(symbol.undefined() && found.imports.count(symbol.name)));
     // Every external relocation still names exactly its original symbol after the
@@ -111,7 +111,7 @@ void weakReferencesMarkTheirImports(const Built &x86) {
     std::map<std::string, Import> imports = census(original, x86.declaration, x86.layouts).imports;
     CHECK(imports.at("_weak_present").weak && imports.at("_weak_absent").weak);
     CHECK(!imports.at("_parent_global").weak);
-    Bytes bytes = graftSection(stageImage(original, x86.declaration, x86.layouts, x86.gate));
+    Bytes bytes = graftSection(stageImage(original, x86.declaration, x86.layouts, x86.activation));
     manifest::View view = manifestOf(bytes);
     std::map<std::string, uint32_t> flags;
     for (uint32_t i = 0; i < view.header().imports.count; ++i) {
@@ -136,7 +136,7 @@ void providerAnchor(const Built &x86, const std::string &scratch) {
     config.libraries.push_back(
             {"ai.aneesiqbal.graft.test.ImportsOnly", std::string("ImportsClass"), {}});
     Census found = census(Image(x86.unbound), x86.declaration, x86.layouts);
-    Bytes bytes = packManifest(config, x86.layouts, found, x86.gate, {}, manifest::Version);
+    Bytes bytes = packManifest(config, x86.layouts, found, x86.activation, {}, manifest::Version);
     manifest::View view = manifestOf(bytes);
     CHECK(view.header().libraries.count == 2);
     auto first = view.row<manifest::Library>(view.header().libraries, 0);
@@ -175,7 +175,7 @@ void stagingGatesPersonalities(const Built &x86, const std::string &scratch) {
     for (const auto &entry : personalities->dict) {
         const Plist *match = entry.second.find("IOPropertyMatch");
         CHECK(match && match->kind == Plist::Kind::Dict && match->dict.size() == 1);
-        CHECK(match->dict[0].first == x86.gate && match->dict[0].second.boolean);
+        CHECK(match->dict[0].first == x86.activation.gate && match->dict[0].second.boolean);
         const Plist *identifier = entry.second.find("CFBundleIdentifier");
         CHECK(identifier && identifier->text == x86.info.find("CFBundleIdentifier")->text);
     }
@@ -184,7 +184,18 @@ void stagingGatesPersonalities(const Built &x86, const std::string &scratch) {
     CHECK(readFile(unbound + "/Contents/MacOS/Fixture") == x86.unbound);
     CHECK(refuses([&] { stageBundle(unbound, x86.declaration, x86.layouts, output); },
                   "already exists"));
-    puts("staged bundle: pass (gated personalities, no provider dependency, input untouched)");
+    // The manifest's provider matching is each personality as written, without the
+    // gate it gained or the class it names.
+    Bytes bytes = graftSection(Image(readFile(output + "/Contents/MacOS/Fixture")));
+    manifest::View view = manifestOf(bytes);
+    const char *staged = view.string(view.header().matching);
+    Plist provider = *x86.info.find("IOKitPersonalities")->find("Fixture");
+    provider.erase("IOClass");
+    Plist matching = Plist::makeDict();
+    matching.set("Fixture", provider);
+    CHECK(staged && Bytes(staged, staged + strlen(staged)) == dumpPlist(matching));
+    puts("staged bundle: pass (gated personalities, provider matching, no provider dependency, "
+         "input untouched)");
 }
 
 // A copy of the fixture's unbound bundle in scratch as name, with its Info.plist
@@ -201,37 +212,18 @@ std::string unboundCopy(const Built &x86, const std::string &scratch, const std:
     return bundle;
 }
 
-// Staging adds the gate to the IOPropertyMatch a personality already has, a
-// dictionary or each dictionary of a list, and takes the declared libraries out
-// of the per-architecture dependency lists as well.
-void stagingKeepsTheConsumersOwnKeys(const Built &x86, const std::string &scratch) {
-    Plist one = Plist::makeDict(), two = Plist::makeDict();
-    one.set("model", Plist::makeString("one"));
-    two.set("model", Plist::makeString("two"));
-    std::string bundle = unboundCopy(x86, scratch, "Matching.kext", [&](Plist &info) {
-        Plist &personalities = *info.find("IOKitPersonalities");
-        Plist single = *personalities.find("Fixture"), listed = single;
-        single.set("IOPropertyMatch", one);
-        Plist list;
-        list.kind = Plist::Kind::Array;
-        list.array = {one, two};
-        listed.set("IOPropertyMatch", list);
-        personalities.set("Fixture", single);
-        personalities.set("Listed", listed);
+// Staging takes the declared libraries out of the per-architecture dependency
+// lists as well. A personality's own IOPropertyMatch, which gains the gate, and
+// other personalities change the manifest's provider matching and so its size,
+// which the fixture's reservation does not leave room for: graft_kext_test.py
+// checks them through a whole build.
+void stagingLibrariesAndRefusals(const Built &x86, const std::string &scratch) {
+    std::string bundle = unboundCopy(x86, scratch, "Libraries.kext", [&](Plist &info) {
         info.set("OSBundleLibraries_x86_64", *info.find("OSBundleLibraries"));
     });
-    std::string output = scratch + "/Matching-staged.kext";
+    std::string output = scratch + "/Libraries-staged.kext";
     stageBundle(bundle, x86.declaration, x86.layouts, output);
     Plist info = parsePlist(readFile(output + "/Contents/Info.plist"), "Info.plist");
-    const Plist &personalities = *info.find("IOKitPersonalities");
-    auto gated = [&](const Plist &match, const std::string &model) {
-        return match.kind == Plist::Kind::Dict && match.dict.size() == 2 &&
-               match.find("model")->text == model && match.find(x86.gate)->boolean;
-    };
-    CHECK(gated(*personalities.find("Fixture")->find("IOPropertyMatch"), "one"));
-    const Plist &list = *personalities.find("Listed")->find("IOPropertyMatch");
-    CHECK(list.kind == Plist::Kind::Array && list.array.size() == 2);
-    CHECK(gated(list.array[0], "one") && gated(list.array[1], "two"));
     const Plist *libraries = info.find("OSBundleLibraries_x86_64");
     CHECK(libraries && !libraries->find(Provider) && libraries->find("com.apple.kpi.libkern"));
 
@@ -246,7 +238,17 @@ void stagingKeepsTheConsumersOwnKeys(const Built &x86, const std::string &scratc
                             scratch + "/Unmatchable-staged.kext");
             },
             "has an IOPropertyMatch that is not a dictionary or a list of them"));
-    puts("staged Info.plist: pass (the gate joins IOPropertyMatch, per-architecture libraries)");
+    std::string providerless = unboundCopy(x86, scratch, "Providerless.kext", [](Plist &info) {
+        info.find("IOKitPersonalities")->find("Fixture")->erase("IOProviderClass");
+    });
+    CHECK(refuses(
+            [&] {
+                stageBundle(providerless, x86.declaration, x86.layouts,
+                            scratch + "/Providerless-staged.kext");
+            },
+            "consumer personality Fixture names no IOProviderClass"));
+    puts("staged Info.plist: pass (per-architecture libraries, a personality IOKit cannot "
+         "match refused)");
 }
 
 // A staging that fails part way leaves neither its output nor its partial copy.
@@ -270,8 +272,9 @@ void refusesShortReservationAndWrongLayout(const Built &x86) {
     uint64_t header =
             headers(x86.unbound).sections.at(image.section("__DATA", "__graft").index - 1);
     store64(&shortened[header + SectionSizeField], 1);
-    CHECK(refuses([&] { stageImage(Image(shortened), x86.declaration, x86.layouts, x86.gate); },
-                  "reservation is too small"));
+    CHECK(refuses(
+            [&] { stageImage(Image(shortened), x86.declaration, x86.layouts, x86.activation); },
+            "reservation is too small"));
     Layouts layouts = x86.layouts;
     layouts.classes.at(0).name = "Other";
     CHECK(refuses([&] { census(image, x86.declaration, layouts); }, "another declaration"));
@@ -290,8 +293,9 @@ void refusesZerofillReservation(const Built &x86) {
         Bytes data = x86.unbound;
         store32(&data[header + SectionFlagsField], type);
         store32(&data[header + SectionOffsetField], static_cast<uint32_t>(data.size()));
-        CHECK(refuses([&] { stageImage(Image(data), x86.declaration, x86.layouts, x86.gate); },
-                      "__DATA,__graft is a zerofill section"));
+        CHECK(refuses(
+                [&] { stageImage(Image(data), x86.declaration, x86.layouts, x86.activation); },
+                "__DATA,__graft is a zerofill section"));
     }
     puts("zerofill reservation: pass (refused, nothing written past the file)");
 }
@@ -336,7 +340,7 @@ void truncatedMachO(const Built &x86) {
 void requiredMethodSubsetKeepsOverrides(const Built &x86) {
     Declaration config = x86.declaration;
     config.classes.at(0).required = std::vector<std::string>{"__ZN6Parent9inheritedEi"};
-    Image staged = stageImage(Image(x86.unbound), config, x86.layouts, x86.gate);
+    Image staged = stageImage(Image(x86.unbound), config, x86.layouts, x86.activation);
     Bytes bytes = graftSection(staged);
     manifest::View view = manifestOf(bytes);
     auto parent = view.row<manifest::Class>(view.header().classes, 0);
@@ -345,7 +349,7 @@ void requiredMethodSubsetKeepsOverrides(const Built &x86) {
     CHECK(parent.slotCount == 4); // the destructor pair, the override, the named call
     CHECK(parent.slotCount < parent.parentSlots); // the unused method is not required
     config.classes.at(0).required = std::vector<std::string>{"_not_a_method"};
-    CHECK(refuses([&] { stageImage(Image(x86.unbound), config, x86.layouts, x86.gate); },
+    CHECK(refuses([&] { stageImage(Image(x86.unbound), config, x86.layouts, x86.activation); },
                   "no unique compiler slot"));
     puts("required methods: pass (a named subset keeps the overridden slots)");
 }
@@ -508,7 +512,7 @@ void arm64eCensusMatchesX86(const Census &arm64e, const Built &x86) {
     puts("arm64e census: pass (the imports, vtables and sited symbols of the x86-64 build)");
 }
 
-// Staging writes a version-3 manifest whose authenticated sites carry their
+// Staging writes a version-5 manifest whose authenticated sites carry their
 // signing context, and rewrites each provider-import bind into a rebase at its
 // placeholder, so the dormant consumer carries nothing the boot linker cannot
 // resolve.
@@ -545,7 +549,7 @@ void arm64eStaging(const Built &arm64e, const Census &found) {
         CHECK(slot->auth->key == site.auth->key && slot->auth->diversity == site.auth->diversity &&
               slot->auth->addrDiv == site.auth->addrDiv);
     }
-    puts("arm64e staging: pass (a version-3 manifest, signed sites keep their context)");
+    puts("arm64e staging: pass (a version-5 manifest, signed sites keep their context)");
 }
 
 // Graft fills each inherited slot of an arm64e consumer's vtable with the live
@@ -587,7 +591,7 @@ int main(int argc, char **argv) {
     weakReferencesMarkTheirImports(x86);
     providerAnchor(x86, scratch.path().string());
     stagingGatesPersonalities(x86, scratch.path().string());
-    stagingKeepsTheConsumersOwnKeys(x86, scratch.path().string());
+    stagingLibrariesAndRefusals(x86, scratch.path().string());
     failedStagingLeavesNoOutput(x86, scratch.path().string());
     refusesShortReservationAndWrongLayout(x86);
     refusesZerofillReservation(x86);

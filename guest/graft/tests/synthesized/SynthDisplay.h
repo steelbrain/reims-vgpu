@@ -4,8 +4,8 @@
 // ten of the others.
 #pragma once
 #include <graft/IOMobileFramebufferLegacy.h>
-class ReimsDisplay : public IOMobileFramebufferLegacy {
-    OSDeclareDefaultStructors(ReimsDisplay);
+class SynthDisplay : public IOMobileFramebufferLegacy {
+    OSDeclareDefaultStructors(SynthDisplay);
 
 public:
     bool start(IOService *p) override;
