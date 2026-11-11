@@ -52,6 +52,7 @@ impl Holds {
     }
 
     /// A keep on `pages` ([`super::ImportKeep`]): its number, from the holds' numbering.
+    #[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
     pub(super) fn keep(&mut self, pages: Range<u64>) -> u64 {
         let id = self.next;
         self.next = self.next.wrapping_add(1);
@@ -60,6 +61,7 @@ impl Holds {
     }
 
     /// The keep `id` on the pages from `first` goes.
+    #[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
     pub(super) fn unkeep(&mut self, first: u64, id: u64) {
         self.kept.remove(&(first, id));
     }

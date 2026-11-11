@@ -358,6 +358,8 @@ impl Drop for UnmapHold {
 /// which the runtime imports whole, `os/linux/host_ram.rs`), which the runtime is given in the
 /// import's keep-alive: while it lives, [`wait_unimported`] waits for it, and it defers no unmap,
 /// as the library makes none of those pages (module docs, "Memory the library does not unmap").
+// Made on Linux alone, where the runtime imports the guest's RAM whole.
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct ImportKeep {
     /// The first byte of its pages.
@@ -366,6 +368,8 @@ pub(crate) struct ImportKeep {
     id: u64,
 }
 
+// Made on Linux alone, where the runtime imports the guest's RAM whole.
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
 impl ImportKeep {
     /// A keep of the pages the `length` bytes at `bytes` lie in (one page for a length of 0).
     pub(crate) fn new(bytes: NonNull<u8>, length: u64) -> ImportKeep {
