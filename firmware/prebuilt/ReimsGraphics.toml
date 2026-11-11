@@ -2,11 +2,11 @@
 # and the sha256 of each file it was built from: make -C firmware prebuilt writes both on a
 # Mac, and make -C firmware prebuilt-check checks them against the tree. Built with:
 #   Apple clang version 21.0.0 (clang-2100.4.1.1)
-#   Homebrew LLD 23.1.4 (compatible with GNU linkers)
+#   Homebrew LLD 23.1.5 (compatible with GNU linkers)
 rom = "749434f87f562895548f60681cd4cd8bf6cc0d0e967ac2fea297674426709161"
 
 [sources]
-"crates/reims-vgpu-graphics/include/reims_graphics_wire.h" = "0fe1efa0ed67442e76d520bb24f89bea1aca96255f74546e2cb594ba088744ac"
+"crates/reims-vgpu-graphics/include/reims_graphics_wire.h" = "8a2ecaf9acb11573e7891ff5cc8d94292f61948d2eab5cccc776f6c6cf9479de"
 "firmware/Makefile" = "d85b14a3b40cc59b7c07a9e3a3a273c257e81c5674963c70c3c45eb386e653d0"
 "firmware/src/OptionRom.S" = "b910fe61a880580996a81134fba75900d3a9f48ca266e76fe2d6b8eb5a011eb9"
 "firmware/src/ReimsGraphics.c" = "554751ff15edbdf69a038d5b2aefd8315b9c54610c090c0890d9c72b13dacdef"
