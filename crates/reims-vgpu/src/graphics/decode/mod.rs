@@ -575,23 +575,31 @@ const PAGES_COPY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// lock of the surface in the guest waits for it.
 const SLOW_ANSWER: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// The first plane's byte of the surface that `layout`, the layout a cached or deferred block's
-/// `SURFACE_PAGES` carries, gives ([`surface_cache::aligned_byte`]), which places the block's
-/// device cache ([`surface_cache::CacheLayout::FirstPlaneAt`]): `None` where its first plane starts
-/// at the surface's first byte, or the layout does not lie in the surface's `length` bytes
-/// ([`surface_pages::layout_planes`]), which is logged and changes nothing else: the message is
-/// answered as with no layout, the layout only placing the cache.
-fn first_plane_of(block: u64, layout: &RgfxSurfacePagesLayout, length: u64) -> Option<u64> {
+/// What `layout`, the layout a cached or deferred block's `SURFACE_PAGES` carries, gives the
+/// block's device cache ([`surface_cache::CacheLayout::Carried`]): its surface's planes, and its
+/// first plane's byte ([`surface_cache::aligned_byte`]), which places the cache, `None` where that
+/// plane starts at the surface's first byte. A layout that does not lie in the surface's `length`
+/// bytes ([`surface_pages::layout_planes`]) gives nothing
+/// ([`surface_cache::CacheLayout::Unknown`]), which is logged and changes nothing else: the
+/// message is answered as with no layout, the layout only placing and making the cache.
+fn carried_layout(
+    block: u64,
+    layout: &RgfxSurfacePagesLayout,
+    length: u64,
+) -> surface_cache::CacheLayout {
     match surface_pages::layout_planes(layout, length) {
-        Some(planes) => surface_cache::aligned_byte(&planes),
+        Some(planes) => surface_cache::CacheLayout::Carried {
+            planes: planes.len(),
+            first_plane: surface_cache::aligned_byte(&planes),
+        },
         None => {
             log::warn!(
                 target: "reims_vgpu::graphics",
                 "the IOSurface block at {block:#x}: named cached with a layout of {} planes that \
-                 does not lie in its {length:#x} bytes: its device cache is placed as with none",
+                 does not lie in its {length:#x} bytes: its device cache is made as with none",
                 layout.plane_count
             );
-            None
+            surface_cache::CacheLayout::Unknown
         }
     }
 }
@@ -1317,10 +1325,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                 return Some(RGFX_STATUS_INVALID_ARGUMENT);
             }
         };
-        // A cached block's own layout, on a host that answers no asks, places its cache alone.
-        let first_plane = match (cached && !ask && !private, layout) {
-            (true, Some(layout)) => first_plane_of(pages.block_offset, layout, pages.length),
-            _ => None,
+        // A cached block's own layout, on a host that answers no asks, lays out its cache alone.
+        let carried = match (cached && !ask && !private, layout) {
+            (true, Some(layout)) => carried_layout(pages.block_offset, layout, pages.length),
+            _ => surface_cache::CacheLayout::Unknown,
         };
         let views = &self.shared.surface_views;
         // An ask whose textures would lie in place over no buffer of its pages the device makes
@@ -1401,7 +1409,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     RGFX_STATUS_CACHE
                 }
                 _ => {
-                    self.cache_surface(device, pages.block_offset, runs, cached, first_plane);
+                    self.cache_surface(device, pages.block_offset, runs, cached, carried);
                     RGFX_STATUS_OK
                 }
             },
@@ -1433,16 +1441,16 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// of its pages ([`RGFX_SURFACE_PAGES_ATTACH`]), each marked [`RGFX_SURFACE_PAGES_CACHED`] too
     /// ([`surface_cache`]):
     /// - a deferred block, with no runs, gets a device cache of zeros and no view, any view it had
-    ///   going, its surface's first plane placed as the `layout` the message carries gives it
-    ///   ([`first_plane_of`]): [`RGFX_STATUS_OK`], else [`RGFX_STATUS_REFUSED`] with no cache and
-    ///   no view, where the deferred caches' budget has no room or the platform made none, and
-    ///   the kext then names the block's pages as any block's. On a device that offers `SURFACE_DEFERRED_ASK`
-    ///   (its GPU shares the CPU's memory) the block asks ([`RGFX_SURFACE_PAGES_ASK_CACHE`]) with
-    ///   its surface's `layout`, and is deferred only where textures over the pages it comes to
-    ///   have would lie in place over none the device makes
-    ///   ([`GpuDevice::fresh_surface_never_in_place`]), so its pages, once named, would take a
-    ///   device cache all the same; any other is [`RGFX_STATUS_REFUSED`], counted, with nothing
-    ///   made, and the kext then names its pages asking, as any block's;
+    ///   going, made and its surface's first plane placed as the `layout` the message carries
+    ///   gives it ([`carried_layout`]): [`RGFX_STATUS_OK`], else [`RGFX_STATUS_REFUSED`] with no
+    ///   cache and no view, where the deferred caches' budget has no room or the platform made
+    ///   none, and the kext then names the block's pages as any block's. On a device that offers
+    ///   `SURFACE_DEFERRED_ASK` (its GPU shares the CPU's memory) the block asks
+    ///   ([`RGFX_SURFACE_PAGES_ASK_CACHE`]) with its surface's `layout`, and is deferred only
+    ///   where textures over the pages it comes to have would lie in place over none the device
+    ///   makes ([`GpuDevice::fresh_surface_never_in_place`]), so its pages, once named, would
+    ///   take a device cache all the same; any other is [`RGFX_STATUS_REFUSED`], counted, with
+    ///   nothing made, and the kext then names its pages asking, as any block's;
     /// - its pages, found by the block whatever context sends them (the maker's may have closed),
     ///   get a view, which the cache takes, keeping its bytes: [`RGFX_STATUS_OK`]. Where the host
     ///   makes no view of them, or no buffer over it, the cache takes them copied, through the
@@ -1558,10 +1566,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             // An ask's planes lay out its cache; else the layout the block carries places it.
             let layout = match (planes, layout) {
                 (Some(planes), _) => surface_cache::CacheLayout::Asked(planes),
-                (None, Some(layout)) => match first_plane_of(block, layout, pages.length) {
-                    Some(byte) => surface_cache::CacheLayout::FirstPlaneAt(byte),
-                    None => surface_cache::CacheLayout::Unknown,
-                },
+                (None, Some(layout)) => carried_layout(block, layout, pages.length),
                 (None, None) => surface_cache::CacheLayout::Unknown,
             };
             let made = self.surface_caches.make_deferred(
@@ -1732,16 +1737,16 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// Gives the block at `block`, whose view of `runs` was just made, or which is named by its
     /// runs, a device cache where the kext marked it `cached` ([`surface_cache`]); else the block
     /// keeps its view alone, and its buffers lie over the pages. A block named by its runs that gets no cache takes its view now.
-    /// The cache is laid out as the kext's ask gave its surface, where it asked; else its
-    /// surface's first plane's byte `first_plane`, where its message's layout gave one
-    /// ([`first_plane_of`]), is placed ([`surface_cache::CacheLayout`]).
+    /// The cache is laid out as the kext's ask gave its surface, where it asked; else as
+    /// `carried`, what its message's layout gave ([`carried_layout`],
+    /// [`surface_cache::CacheLayout`]).
     fn cache_surface(
         &self,
         device: &P::Device,
         block: u64,
         runs: &[RgfxPageRun],
         cached: bool,
-        first_plane: Option<u64>,
+        carried: surface_cache::CacheLayout,
     ) {
         if !cached {
             self.uncache_surface(device, block);
@@ -1756,10 +1761,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                 views.take_layout(block),
             )
         };
-        let layout = match (layout, first_plane) {
-            (Some(planes), _) => surface_cache::CacheLayout::Asked(planes),
-            (None, Some(byte)) => surface_cache::CacheLayout::FirstPlaneAt(byte),
-            (None, None) => surface_cache::CacheLayout::Unknown,
+        let layout = match layout {
+            Some(planes) => surface_cache::CacheLayout::Asked(planes),
+            None => carried,
         };
         // The CPU's generation the kext wrote into the block's header as it cached the block, or
         // since, which the cache's first fill is of.

@@ -86,8 +86,8 @@ pub trait GraphicsVideo<P: Platform>: Send + Sync {
         false
     }
     /// Whether it writes a picture into a device cache by its own GPU work, through an import of
-    /// the cache's memory, where the cache was made exportable: the device's caches are then made
-    /// so ([`VideoPlane::cache`]).
+    /// the cache's memory, where the cache was made exportable: the device's laid-out caches of
+    /// two planes, the decodes' output, are then made so ([`VideoPlane::cache`]).
     fn imports_device_caches(&self) -> bool {
         false
     }
@@ -677,8 +677,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         let _ = self.shared.video.set(video);
     }
 
-    /// Makes the device's caches exportable from now on, for the host's video to import
-    /// ([`GraphicsVideo::imports_device_caches`]): once, at the device's make, before any cache.
+    /// Makes the device's laid-out caches of two planes exportable from now on, for the host's
+    /// video to import ([`GraphicsVideo::imports_device_caches`]): once, at the device's make,
+    /// before any cache.
     pub(crate) fn set_exportable_caches(&self) {
         self.shared.surface_caches.set_exportable();
     }

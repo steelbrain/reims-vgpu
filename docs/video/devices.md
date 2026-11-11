@@ -38,7 +38,9 @@ the device info (`GraphicsDevice::with_platform`, in `graphics.rs`):
   whose textures would not lie in place in their pages (`RGFX_FEATURE_SURFACE_CACHE_REFUSED`, a
   GPU that shares the CPU's memory), and the arm lands pictures in them: NVDEC by its own GPU
   work, where CUDA imports the device's exportable buffers ([nvidia.md](nvidia.md)), the
-  device's caches then made exportable as they are made; VA-API by the runtime device's copy
+  device's caches of surfaces of two planes (the outputs' NV12 and P010, as the layout a cached
+  block's `SURFACE_PAGES` carries gives them) then made exportable as they are made, and every
+  other cache made as any buffer; VA-API by the runtime device's copy
   of the decode surface, or the CPU's through the session's staging ([vaapi.md](vaapi.md)).
   The guest's video driver then asks its output surfaces cached
   (`guest/bundle/src/RgfxMetalDevice+Video.mm`), with their layout, as for any other surface,

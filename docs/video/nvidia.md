@@ -124,8 +124,9 @@ where it is NVIDIA's and CUDA opens it (`graphics/video_choice.rs`).
     device's exportable buffers, which the arm learns once as the video opens
     (a buffer of a 4K picture's bytes made exportable and imported, logged
     with the make's time). The caps then ask the guest for cached outputs
-    (`RGFX_VIDEO_CAPS_OUTPUT_CACHED`), the device makes each cache exportable
-    as it makes it, and the picture is copied within the GPU into the cache's
+    (`RGFX_VIDEO_CAPS_OUTPUT_CACHED`), the device makes each cache of a surface
+    of two planes (NV12, P010) exportable as it makes it, the others as any
+    buffer, and the picture is copied within the GPU into the cache's
     memory, imported once a cache (`src/nvidia/external.rs`) and let go of as the
     cache goes.
   - **Into the output's pages**, where its planes lie in pages a device

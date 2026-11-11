@@ -28,10 +28,11 @@
 //!   - **In the output's device caches**, where CUDA imports the device's exportable buffers:
 //!     learned once as the video opens, by a buffer of a 4K picture's bytes made exportable and
 //!     imported, logged at info with the make's time ([`imports_caches`]). The video then lands
-//!     in device caches (`RGFX_VIDEO_CAPS_OUTPUT_CACHED`) and has the device's caches made
-//!     exportable as they are made, so the guest asks its outputs cached, and a picture is copied
-//!     within the GPU into the cache's memory, imported once a cache and let go of as the cache
-//!     goes ([`VideoPlane::cache`](super::decode::VideoPlane::cache)). Once the copy is done, each
+//!     in device caches (`RGFX_VIDEO_CAPS_OUTPUT_CACHED`) and has the device's laid-out caches of
+//!     two planes, the outputs' NV12 and P010, made exportable as they are made, so the guest
+//!     asks its outputs cached, and a picture is copied within the GPU into the cache's memory,
+//!     imported once a cache and let go of as the cache goes
+//!     ([`VideoPlane::cache`](super::decode::VideoPlane::cache)). Once the copy is done, each
 //!     cache it wrote is said written by another API (`Buffer::external_write_done`), for the
 //!     device's later reads of it to see the picture.
 //!   - **In the output's pages**, where both planes lie in pages a device reaches in place

@@ -45,6 +45,10 @@ pub const PADDING_UNOBSERVED_BUFFER: &str = "newBufferWithLength:options: (paddi
 /// under: no selector of Metal's names it.
 pub const DMA_BUF_BUFFER: &str = "newBufferWithLength:options: (dma-buf, padding unobserved)";
 
+/// The name the fake logs and scripts [`GpuDevice::new_exportable_buffer_of_length`] under: no
+/// selector of Metal's names it.
+pub const EXPORTABLE_BUFFER: &str = "newBufferWithLength:options: (exportable)";
+
 /// The name the fake logs and scripts [`GpuDevice::new_buffer_of_length_aligned`] under: no
 /// selector of Metal's names it.
 pub const ALIGNED_BUFFER: &str = "newBufferWithLength:options: (aligned byte)";
@@ -197,6 +201,29 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
         self.make(
             Policy::On(on),
             PADDING_UNOBSERVED_BUFFER,
+            vec![
+                Arg::U64(length),
+                Arg::U64(options),
+                Arg::U64(aligned_byte.unwrap_or(0)),
+            ],
+            |w| new_buffer(w, length, options, Backing::Fresh, None),
+        )
+    }
+
+    /// Logged and scripted under [`EXPORTABLE_BUFFER`], as no selector of Metal's names it, with
+    /// the aligned byte after the length and options (0 for none); its buffer is
+    /// `newBufferWithLength:options:`'s, which exports nothing.
+    #[cfg(unix)]
+    fn new_exportable_buffer_of_length(
+        &self,
+        on: OnFault,
+        length: u64,
+        options: u64,
+        aligned_byte: Option<u64>,
+    ) -> RaiseResult<Option<<FakePlatform as Platform>::Buffer>> {
+        self.make(
+            Policy::On(on),
+            EXPORTABLE_BUFFER,
             vec![
                 Arg::U64(length),
                 Arg::U64(options),
