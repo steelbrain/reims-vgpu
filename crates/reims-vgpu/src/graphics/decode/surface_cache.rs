@@ -4477,9 +4477,16 @@ fn copy<P: Platform>(
             && let Some(buffer) = device.new_buffer_of_length(ON, cache.length, STORAGE_SHARED)?
         {
             if way == Way::In {
+                let all = 0..cache.length;
                 // SAFETY: the new buffer's `length` Shared bytes, which no GPU work uses yet;
                 // the pages are named, so wired.
-                unsafe { copied.copy(buffer.contents().as_ptr::<u8>(), &[0..cache.length], false) };
+                unsafe {
+                    copied.copy(
+                        buffer.contents().as_ptr::<u8>(),
+                        std::slice::from_ref(&all),
+                        false,
+                    )
+                };
             }
             let (from, to) = match way {
                 Way::In => (&buffer, &cache.device),
