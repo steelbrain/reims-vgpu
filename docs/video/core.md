@@ -32,8 +32,8 @@ overview.
   - `MemoryIdentity` names one mapping of the pages: the same for every hold on it, and never
     the same for another mapping, so that an import kept by it is never used for pages mapped
     since. `MemoryLife` goes with the mapping, and tells what kept something by its identity.
-  - `DeviceImports` keeps an arm's imports by identity, made once per mapping and dropped on a
-    thread of the runtime's as soon as the mapping goes.
+  - `DeviceImports` keeps an arm's imports by identity and a variant of the arm's own, made
+    once for each and dropped on a thread of the runtime's as soon as the mapping goes.
   - `GuestTarget` is a surface's layout checked against its memory, so that a device told to
     write its planes writes nowhere else.
 

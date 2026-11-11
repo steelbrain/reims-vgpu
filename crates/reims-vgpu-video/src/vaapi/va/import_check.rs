@@ -956,4 +956,109 @@ mod tests {
             lent_wrong.join("\n")
         );
     }
+
+    /// Two buffers of one size in one memory, each written through zero copy with the same
+    /// imports, as a HEIC grid image's tiles are (zero_copy.rs's `Variant`): stacked, each its
+    /// planes from a page's start, and side by side in rows of both, the second's planes a row
+    /// of samples into the memory's rows. Each buffer's frame lands at its own planes or is
+    /// declined to the CPU's copy, and nothing else of the memory is written; where the display
+    /// lends the format's imports, the stacked buffers are both written.
+    #[test]
+    #[ignore = "needs a VA-API GPU: run on the VA-API host"]
+    fn buffers_in_one_memory_are_each_written_at_their_own_planes() {
+        use std::sync::Arc;
+
+        use super::super::frame::{Frame, GuestWrites};
+        use super::super::surface::Rect;
+        use super::super::wait::Deadline;
+        use crate::core::backend::DeviceWrite;
+        use crate::core::runtime::StdRuntime;
+
+        let node = std::env::var("RVG_VAAPI_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
+        let display = Display::open(&node, Arc::new(StdRuntime)).expect("a display");
+        let mut failed = Vec::new();
+        for format in FORMATS {
+            let lent = display.writes_imports(format);
+            eprintln!("{node} {}: the check answered {lent:?}", format.name());
+            let alignment = lent.as_ref().map_or(ALIGNMENTS[0], |write| write.alignment);
+            let picture = Picture {
+                format,
+                width: 512,
+                height: 512,
+            };
+            let Source { surface } = Source::new(&display, picture).expect("a source");
+            let frame = Frame {
+                surface: Arc::new(surface),
+                id: 0,
+                poc: 0,
+                idr: true,
+                reference: false,
+                rect: Rect {
+                    x: 0,
+                    y: 0,
+                    width: picture.width,
+                    height: picture.height,
+                },
+                coded_size: (picture.width, picture.height),
+                full_range: false,
+                deadline: Deadline::default(),
+            };
+            let pitch = picture.row_bytes().next_multiple_of(alignment);
+            let (stacked, tile) = picture.guest_layout(pitch);
+            let wide = 2 * pitch;
+            let chroma = wide * picture.rows(0);
+            let side_by_side = [0, pitch].map(|at| [(at, wide), (chroma + at, wide)]);
+            // A target's planes span whole rows: the second's last chroma row ends a row of
+            // samples past the rows of both.
+            let size = (chroma + wide * picture.rows(1) + pitch).next_multiple_of(PAGE);
+            for (name, buffers, size) in [
+                (
+                    "stacked",
+                    [stacked, stacked.map(|(at, pitch)| (at + tile, pitch))],
+                    2 * tile,
+                ),
+                ("side by side", side_by_side, size),
+            ] {
+                let memory = TrialMemory::new(size).expect("memory");
+                let writes = GuestWrites::new(&display);
+                let mut expected = vec![UNTOUCHED; size];
+                let mut answers = Vec::new();
+                for planes in buffers {
+                    let plane = |n: usize| PlaneLayout {
+                        offset: planes[n].0,
+                        bytes_per_row: planes[n].1,
+                        width: if n == 0 { 512 } else { 256 },
+                        height: u32::try_from(picture.rows(n)).unwrap_or(u32::MAX),
+                    };
+                    let layout = SurfaceLayout {
+                        pixel_format: match format {
+                            SurfaceFormat::Nv12 => FourCc::new(*b"420v"),
+                            SurfaceFormat::P010 => FourCc::new(*b"x420"),
+                        },
+                        width: picture.width,
+                        height: picture.height,
+                        planes: vec![plane(0), plane(1)],
+                        bytes_per_row: 0,
+                    };
+                    let target = GuestTarget::new(&layout, &memory).expect("a target");
+                    let answer = frame.write_to_guest(&target, &writes).expect("a write");
+                    if matches!(answer, DeviceWrite::Written) {
+                        fill(picture, &mut expected, planes).expect("the planes in the memory");
+                    }
+                    answers.push(answer);
+                }
+                let shape = format!("{} {name}", format.name());
+                eprintln!("  {shape}: {answers:?}");
+                let held = memory.memory.lock();
+                if let Some(wrong) = compare(picture, held.bytes(), &expected, buffers[1]) {
+                    failed.push(format!("{shape}: {answers:?}: {wrong}"));
+                }
+                let both = answers.iter().all(|a| matches!(a, DeviceWrite::Written));
+                if name == "stacked" && lent.is_ok() && !both {
+                    failed.push(format!("{shape}: lent, yet {answers:?}"));
+                }
+            }
+        }
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
+    }
 }

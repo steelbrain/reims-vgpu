@@ -295,7 +295,9 @@ pages in the order the bytes lie in (reims-vgpu's
 `crates/reims-vgpu-vulkan/src/os/linux/device_lend.rs`,
 `dma_buf_of_host`).
 
-The crate imports the pages once per mapping, frame size and format, in
+The crate imports the pages once per mapping, frame size and format, and
+place of the buffer's planes in the mapping (one mapping may hold several
+buffers: the tiles of a HEIC grid image, side by side in one surface), in
 strips of the frame's rows ("What udmabuf takes", below): each strip an
 even number of rows, a linear VA surface over one dma-buf of its luma and
 chroma rows, at the caller's own offsets and pitches (`DRM_PRIME_2`, one

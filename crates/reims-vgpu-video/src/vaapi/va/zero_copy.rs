@@ -2,7 +2,8 @@
 //! video-processing runs, with nothing for the CPU to copy
 //! (`Frame::write_to_guest`).
 //!
-//! The buffer is imported once per mapping and size of frame, in strips:
+//! The buffer is imported once per mapping, place of its planes in it and
+//! size of frame ([`Variant`]), in strips:
 //! each strip an even number of the frame's rows, a dma-buf the host makes
 //! of their luma rows' pages and their chroma rows' pages (core's
 //! `DeviceMemory::dma_buf_of`; reims-vgpu's `os/linux/device_lend.rs`, a
@@ -93,7 +94,35 @@ const MOST_STRIPS: usize = 64;
 
 /// A backend's imports of guest buffers, shared by its sessions.
 pub(crate) struct GuestImports {
-    imports: DeviceImports<GuestImport>,
+    imports: DeviceImports<GuestImport, Variant>,
+}
+
+/// What a buffer's import is made for besides its mapping: the frame's size
+/// and format, and where the buffer's planes lie in the mapping, with their
+/// pitches. One mapping may hold more than one buffer of a size, each with an
+/// import of its own: macOS 26.7.2's HEIC decodes in Preview and Freeform
+/// write the tiles of a grid image side by side into one surface, a buffer a
+/// tile at the tile's offset (measured 2026-11-11, on the Iris Xe).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Variant {
+    size: (u32, u32),
+    format: SurfaceFormat,
+    /// Each plane's offset in the mapping and its bytes from one row to the
+    /// next: luma's, then chroma's.
+    planes: [(usize, usize); 2],
+}
+
+impl Variant {
+    /// The import `target` takes for `format` frames of `size`.
+    fn of(target: &GuestTarget<'_>, format: SurfaceFormat, size: (u32, u32)) -> Self {
+        Self {
+            size,
+            format,
+            planes: target
+                .planes()
+                .map(|plane| (plane.offset, plane.bytes_per_row)),
+        }
+    }
 }
 
 /// No imports yet, for a new backend on `display`.
@@ -211,14 +240,13 @@ pub(crate) fn write(
     ) else {
         return Ok(declined("a frame too large for a video-processing region"));
     };
-    // The import is of the frame's size and the buffer's format: one buffer
-    // given frames of another size gets another.
-    let variant =
-        u64::from(width) << 32 | u64::from(height) << 1 | u64::from(format == SurfaceFormat::P010);
+    // The import is of the frame's size and format and the buffer's planes:
+    // one buffer given frames of another size gets another, and so does
+    // another buffer in the same mapping.
     let memory = target.memory();
     let import = match imports.imports.get_or_make(
         &memory.identity(),
-        variant,
+        Variant::of(target, format, (width, height)),
         || GuestImport::new(display, target, format, (width, height), write, None),
         || "the buffer's mapping went while it was held".to_owned(),
     ) {
@@ -304,10 +332,12 @@ impl GuestImport {
         };
         let [luma, chroma] = target.planes();
         log::debug!(
-            "a guest buffer imported for {} frames of {width}x{height} in {} strips, rows of {} \
-             and {}",
+            "a guest buffer imported for {} frames of {width}x{height} in {} strips, planes at \
+             {} and {} of its mapping, rows of {} and {}",
             format.name(),
             strips.len(),
+            luma.offset,
+            chroma.offset,
             luma.bytes_per_row,
             chroma.bytes_per_row
         );

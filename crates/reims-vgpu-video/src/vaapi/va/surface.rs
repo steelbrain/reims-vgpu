@@ -34,7 +34,7 @@ const MAX_SURFACES: usize = 48;
 
 /// What a pool's surfaces hold: 4:2:0 in two planes, luma then
 /// interleaved Cb/Cr.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum SurfaceFormat {
     /// 8-bit samples (`VA_FOURCC_NV12`).
     Nv12,

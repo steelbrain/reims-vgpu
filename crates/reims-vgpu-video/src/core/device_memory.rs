@@ -13,8 +13,9 @@
 //!   surface the guest has mapped over other pages since. The host makes a
 //!   [`MemoryLife`] with each mapping and drops it with the mapping, which
 //!   tells everything that kept something by its identity.
-//! - [`DeviceImports`] keeps a backend's imports by identity, made once per
-//!   mapping and dropped, on a thread of its own, the runtime's
+//! - [`DeviceImports`] keeps a backend's imports by identity and a variant of
+//!   the backend's own, made once for each and dropped, on a thread of its
+//!   own, the runtime's
 //!   ([`crate::core::runtime`]), as soon as that mapping is gone: never kept past
 //!   it, and never dropped on the host's thread, which may hold the host's
 //!   locks.
@@ -27,6 +28,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::Hash;
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
 use std::ptr::NonNull;
@@ -413,18 +415,25 @@ impl<'a> GuestTarget<'a> {
 }
 
 /// What [`DeviceImports`] keeps an import by: the mapping's key, and a
-/// variant of the backend's own, such as the size of frame it was made for.
-type ImportKey = (u64, u64);
+/// variant of the backend's own, such as the size of frame and the place of
+/// the planes in the mapping it was made for.
+type ImportKey<V> = (u64, V);
+
+/// A backend's variant of an import ([`DeviceImports`]): what besides its
+/// mapping an import is made for, compared whole.
+pub trait ImportVariant: Copy + Eq + Hash + Send + 'static {}
+
+impl<V: Copy + Eq + Hash + Send + 'static> ImportVariant for V {}
 
 /// What a backend made of guest surfaces' memory, by identity (module
 /// docs): made once for each mapping and variant, at most `capacity` at
 /// once, and dropped on a thread of its own once the mapping is gone, or
 /// when the most imports are kept and another is made, the one used
 /// longest ago.
-pub struct DeviceImports<T: Send + Sync + 'static> {
+pub struct DeviceImports<T: Send + Sync + 'static, V: ImportVariant = u64> {
     name: &'static str,
     capacity: usize,
-    shared: Arc<Shared<T>>,
+    shared: Arc<Shared<T, V>>,
     /// Where the reaper's thread comes from.
     runtime: Arc<dyn Runtime>,
 }
@@ -432,12 +441,12 @@ pub struct DeviceImports<T: Send + Sync + 'static> {
 /// The name of the thread that drops imports whose mapping went (ours).
 const REAPER_THREAD_NAME: &str = "reims-vgpu-video.imports";
 
-struct Shared<T> {
-    state: Mutex<State<T>>,
+struct Shared<T, V> {
+    state: Mutex<State<T, V>>,
 }
 
-struct State<T> {
-    entries: HashMap<ImportKey, (Arc<T>, u64)>,
+struct State<T, V> {
+    entries: HashMap<ImportKey<V>, (Arc<T>, u64)>,
     /// The mappings told to say when they go.
     watched: HashSet<u64>,
     /// The order of use: each use's count.
@@ -454,7 +463,7 @@ enum Reap {
     Stop,
 }
 
-impl<T: Send + Sync + 'static> DeviceImports<T> {
+impl<T: Send + Sync + 'static, V: ImportVariant> DeviceImports<T, V> {
     /// No imports yet, at most `capacity` at once, dropped on a thread
     /// `runtime` starts; `name` names its log lines.
     pub fn new(runtime: &Arc<dyn Runtime>, name: &'static str, capacity: usize) -> Self {
@@ -482,7 +491,7 @@ impl<T: Send + Sync + 'static> DeviceImports<T> {
     pub fn get_or_make<E>(
         &self,
         identity: &MemoryIdentity,
-        variant: u64,
+        variant: V,
         make: impl FnOnce() -> Result<T, E>,
         gone: impl FnOnce() -> E,
     ) -> Result<Arc<T>, E> {
@@ -543,7 +552,7 @@ impl<T: Send + Sync + 'static> DeviceImports<T> {
 
     /// The reaper's sender, starting it if it has not started; `None` where
     /// no thread starts, and imports are then dropped as others are made.
-    fn reaper(&self, state: &mut State<T>) -> Option<Sender<Reap>> {
+    fn reaper(&self, state: &mut State<T, V>) -> Option<Sender<Reap>> {
         if let Some(reaper) = &state.reaper {
             return Some(reaper.clone());
         }
@@ -565,7 +574,7 @@ impl<T: Send + Sync + 'static> DeviceImports<T> {
                     let dropped: Vec<Arc<T>> = {
                         let mut state = shared.state.lock();
                         state.watched.remove(&key);
-                        let keys: Vec<ImportKey> = (state.entries.keys())
+                        let keys: Vec<ImportKey<V>> = (state.entries.keys())
                             .filter(|(mapping, _)| *mapping == key)
                             .copied()
                             .collect();
@@ -609,7 +618,7 @@ impl<T: Send + Sync + 'static> DeviceImports<T> {
     }
 }
 
-impl<T: Send + Sync + 'static> Drop for DeviceImports<T> {
+impl<T: Send + Sync + 'static, V: ImportVariant> Drop for DeviceImports<T, V> {
     /// Drops every import kept, on this thread, and stops the reaper.
     fn drop(&mut self) {
         let (entries, reaper) = {
@@ -623,7 +632,7 @@ impl<T: Send + Sync + 'static> Drop for DeviceImports<T> {
     }
 }
 
-impl<T: Send + Sync + 'static> fmt::Debug for DeviceImports<T> {
+impl<T: Send + Sync + 'static, V: ImportVariant> fmt::Debug for DeviceImports<T, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeviceImports")
             .field("name", &self.name)
