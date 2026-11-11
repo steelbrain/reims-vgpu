@@ -47,6 +47,9 @@ static_assert(kRgfxIOReturnError == static_cast<uint32_t>(kIOReturnError) &&
                   kRgfxIOReturnUnsupportedMode == static_cast<uint32_t>(kIOReturnUnsupportedMode),
               "RgfxDisplayModes.hpp's statuses are IOReturn's");
 #if defined(__x86_64__)
+// The display's connection is built in (RgfxDisplayIdentity.hpp).
+static_assert(kRgfxDisplayConnectionFlags == kIOConnectionBuiltIn,
+              "RgfxDisplayIdentity.hpp's connection flags are IOGraphicsTypes.h's built-in one");
 IOReturn noSuchMode(RgfxModeCall call)
 {
 	return static_cast<IOReturn>(rgfxNoSuchModeStatus(call));
@@ -944,13 +947,10 @@ void ReimsGraphics::imageSize(const Mode &m, UInt16 *width, UInt16 *height) cons
 // A mode's information flags: valid and safe; the preferred mode is the default and the display's
 // native one; and a mode RgfxMode::hiDpi takes on the display's host screen, `scale120ths`, is
 // valid for HiDPI (kDisplayModeValidForHiResFlag). WindowServer then lists the mode at half its
-// points each way as well, drawn at all its pixels. Measured on the x86-64 guest, macOS 26.7.2: a
-// native 3840x2160 started HiDPI, looking like 1920x1080; a native 3200x1800 started at 1x and
-// offered 1600x900 HiDPI, which kept to the next boot once chosen. The EDID's density does not move
-// that choice: with every mode at 330 pixels per inch, natives from 2400 to 3648 pixels wide still
-// started at 1x, and 3840 HiDPI. On a host screen at 1x no mode has the flag, and the guest still
-// started HiDPI on a native 3888x2122, so from 3840 pixels wide it starts HiDPI whatever the flag
-// and the density. A mode whose pixels do not halve exactly has no HiDPI one; the host offers this
+// points each way as well, drawn at all its pixels, and starts on that one where the display's
+// density says so (kRgfxDisplayConnectionFlags, RgfxDisplayIdentity.hpp). Measured on the x86-64
+// guest, macOS 26.7.2: a 1600x900 HiDPI mode, once chosen, kept to the next boot. A mode whose
+// pixels do not halve exactly has no HiDPI one; the host offers this
 // framebuffer even modes, since with a native 3841x2161 the guest never brought its display up,
 // with the flag or without it (CoreGraphics listed no mode, and the framebuffer's mode was set
 // again every 10 seconds).
@@ -2031,9 +2031,10 @@ IOReturn ReimsGraphics::connectionAttribute(IOIndex connectIndex, IOSelect attri
 		IOLockUnlock(stateLock);
 		return kIOReturnSuccess;
 	case kConnectionFlags:
+		// Built in, so the display's density picks its default scale (RgfxDisplayIdentity.hpp).
 		if (!value)
 			return kIOReturnBadArgument;
-		*value = 0;
+		*value = kRgfxDisplayConnectionFlags;
 		return kIOReturnSuccess;
 	case kConnectionSupportsHLDDCSense:
 		// The driver's own EDID, block by block (getDDCBlock); value may be null.

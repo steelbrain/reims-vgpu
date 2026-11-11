@@ -65,4 +65,15 @@ constexpr RgfxDisplayChromaticity kRgfxDisplayGreen = {300, 600};
 constexpr RgfxDisplayChromaticity kRgfxDisplayBlue = {150, 60};
 constexpr RgfxDisplayChromaticity kRgfxDisplayWhite = {313, 329};
 
+// The x86-64 framebuffer's connection flags (IOFramebuffer's kConnectionFlags): built in
+// (IOGraphicsTypes.h's kIOConnectionBuiltIn), as a Mac's own panel is; the VM's window is the
+// machine's one screen. x86-64 macOS picks the default scale of a built-in display by its
+// density, and of any other by its width (read from macOS 26.7.2's CoreDisplay): a built-in
+// display starts HiDPI where its default mode is at least 2048 x 1536 pixels at more than 160
+// pixels per inch across its diagonal, at 1x otherwise, so on a host screen at 1.5x or more it
+// runs HiDPI at every window size from 2048 x 1536 and on one at 1x it runs at 1x; any other starts
+// at 1x below 3800 pixels wide whatever its density. Either starts HiDPI on a default mode of at
+// least 3840 x 2160 pixels.
+constexpr uint32_t kRgfxDisplayConnectionFlags = 0x800;
+
 #endif // RGFX_DISPLAY_IDENTITY_HPP_
