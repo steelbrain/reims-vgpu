@@ -4,8 +4,8 @@
 # that holds the most of its memory run first, each with nothing else in flight; the longest
 # tests start next, so the run does not end on one that began late. Why, and what these tests
 # did to the others before, is in docs/lessons.md ("Tools and worktrees", and "The platform and
-# the runtime" for Metal's compiles). Every override but the last two is the Mac's alone; on
-# Linux only the last two apply, and nextest runs the other tests in its own order. A filter that
+# the runtime" for Metal's compiles). Every override but the last three is the Mac's alone; on
+# Linux only the last three apply, and nextest runs the other tests in its own order. A filter that
 # names a package or binary the workspace no longer has fails every nextest run, so a rename
 # updates this file too.
 
@@ -75,3 +75,12 @@ priority = 50
 platform = 'cfg(target_os = "linux")'
 filter = 'binary_id(reims-vgpu-video) & test(/^vaapi::va::(spin|wait::(gpu|held))::/)'
 threads-required = "num-test-threads"
+
+# A device cache's planes over its exported memory: where the device's verdict for that memory
+# did not pass (a record of its driver's check, or this process's check), the test checks that
+# the planes lie on the device's lines alone, and says so; its output shows on a pass too, so a
+# run shows a pass that skipped the check of the planes in place.
+[[profile.default.overrides]]
+platform = 'cfg(target_os = "linux")'
+filter = 'binary_id(reims-vgpu-vulkan) & test(=gpu::resource::tests::a_device_cache_lays_its_planes_on_the_devices_lines_from_its_first_planes_byte)'
+success-output = "final"

@@ -2849,17 +2849,21 @@ pub(crate) mod tests {
             placed.iter().all(on_lines),
             "both planes' texels on the device's lines: {placed:?}\n{report:#?}"
         );
-        if report
-            .iter()
-            .any(|line| line == "ExportedFd, rows on lines: Passed")
-        {
-            assert_eq!(
+        // In the cache's memory is checked only where the verdict the answers took passed; a pass
+        // without that check says so, and its output shows on a pass (`.config/nextest.toml`).
+        let verdict = (report.iter()).find(|line| line.starts_with("ExportedFd, rows on lines: "));
+        match verdict.map(String::as_str) {
+            Some("ExportedFd, rows on lines: Passed") => assert_eq!(
                 placed,
                 [rt::TexturePlacement::NotHostPages; 2],
                 "both planes' textures in the cache's memory\n{report:#?}"
-            );
+            ),
+            other => eprintln!(
+                "the planes' textures in the cache's memory NOT CHECKED: the device's verdict for \
+                 its exported memory's reads of texels on lines is {other:?}, so both are the \
+                 shadows it names, on the device's lines: {placed:?}\n{report:#?}"
+            ),
         }
-        eprintln!("the planes' textures over a cache made with it: {placed:?}\n{report:#?}");
     }
 
     /// The bytes a runtime call reads in place are the range itself, at its pointer and of its
