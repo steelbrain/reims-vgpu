@@ -60,11 +60,6 @@ constexpr UInt32 kRingConsumerIdle = __builtin_offsetof(RgfxRingHeader, consumer
 constexpr UInt32 kRingProducerWaiting = __builtin_offsetof(RgfxRingHeader, producer_waiting);
 constexpr UInt32 kRingArmed = __builtin_offsetof(RgfxRingHeader, armed);
 
-// The cursor image's slot, at the region's end: 256 x 256 BGRA8, the largest
-// image the hardware cursor takes. A larger one is IOFramebuffer's to draw.
-constexpr UInt32 kCursorMax = 256;
-constexpr UInt64 kCursorSlot = kCursorMax * kCursorMax * 4;
-
 // Scanout rows start on 256-byte boundaries, as the option ROM's do, so the
 // boot frame keeps its layout when the driver takes the display over.
 constexpr UInt32 kStrideAlign = 256;

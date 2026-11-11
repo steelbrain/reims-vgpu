@@ -144,6 +144,19 @@ void testLayout(const RgfxLegacySwapLayout &layout)
 	check(q.surface(a, 0) == s0 && q.surface(a, 1) == nullptr, "bit 0 gives layer 0's", r);
 	f.setWord(a, layout.layers, 0x80000002u);
 	check(q.surface(a, 0) == nullptr && q.surface(a, 1) == s1, "bit 1 gives layer 1's", r);
+	*f.at(a, layout.surfaces + 8) = nullptr;
+	check(q.hasLayer(a, 1) && q.surface(a, 1) == nullptr && !q.hasLayer(a, 0),
+	      "a layer's bit with no surface is a layer with none, which hides the cursor", r);
+
+	// The cursor's place: two words, unaligned, apart from what the queue reads of a swap.
+	check(layout.cursorPosition + 8 <= layout.state && layout.cursorPosition + 8 <= layout.layers &&
+	          layout.cursorPosition + 8 <= layout.link,
+	      "the cursor's place lies before the swap's state, layers and link", r);
+	f.setWord(a, layout.cursorPosition, static_cast<uint32_t>(-12));
+	f.setWord(a, layout.cursorPosition + 4, 345);
+	int32_t x = 0, y = 0;
+	q.cursorPosition(a, &x, &y);
+	check(x == -12 && y == 345, "the cursor's place is its two words, signed", r);
 }
 } // namespace
 
@@ -163,6 +176,15 @@ int main()
 	for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++)
 		check(kRgfxLegacySwapLayouts[i].displaySize == sizes[i],
 		      "the display's size is where the release keeps it", kRgfxLegacySwapLayouts[i].release);
+	// Where each release's paravirtual display's program_hardware_gated reads the place it hands
+	// program_hardware_cursor_gated (read from 14.6.1, 15.6.1, 26.6.2, 27.0.1 and 27.2.1).
+	const uint32_t cursors[] = {0x61, 0x61, 0x61, 0x61, 0x61};
+	static_assert(sizeof(cursors) / sizeof(cursors[0]) ==
+	                  sizeof(kRgfxLegacySwapLayouts) / sizeof(kRgfxLegacySwapLayouts[0]),
+	              "a cursor's place for each release");
+	for (size_t i = 0; i < sizeof(cursors) / sizeof(cursors[0]); i++)
+		check(kRgfxLegacySwapLayouts[i].cursorPosition == cursors[i],
+		      "the cursor's place is where the release keeps it", kRgfxLegacySwapLayouts[i].release);
 	std::printf("legacy_swap_queue_test: %d checks passed over %zu releases\n", checks,
 	            sizeof(kRgfxLegacySwapLayouts) / sizeof(kRgfxLegacySwapLayouts[0]));
 	return 0;

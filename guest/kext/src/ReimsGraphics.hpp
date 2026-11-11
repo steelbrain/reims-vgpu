@@ -38,6 +38,7 @@
 typedef graft_iomfb_word RgfxIOMFBWord;
 #include "RgfxLegacySwapInfo.hpp"
 #include "RgfxLegacySwapLayout.hpp"
+#include "RgfxMobileCursor.hpp"
 #include "RgfxSwapRate.hpp"
 #endif
 
@@ -459,6 +460,11 @@ private:
 	UInt64 regionSize;
 	IOMemoryMap *ringMap;
 	volatile UInt8 *rings;
+	// The cursor image's slot, at the region's end: kCursorMax x kCursorMax BGRA8, the largest
+	// image the hardware cursor takes (RGFX_CURSOR_MAX_SIZE). A larger one is IOFramebuffer's to
+	// draw on x86-64; on arm64 the display shows its top left corner.
+	static constexpr UInt32 kCursorMax = RGFX_CURSOR_MAX_SIZE;
+	static constexpr UInt64 kCursorSlot = static_cast<UInt64>(kCursorMax) * kCursorMax * 4;
 	IOMemoryMap *cursorMap;
 	UInt8 *cursorPixels;
 	IOWorkLoop *workLoop;
@@ -610,6 +616,13 @@ private:
 	// The swap-info records notify_swap_done_gated keeps while the class holds them
 	// (RgfxLegacySwapInfo.hpp), in the class's gate.
 	RgfxSwapInfoKept mobileSwapInfoKept;
+	// The cursor a swap's layer 1 gives (RgfxMobileCursor.hpp): shown, moved or hidden in the
+	// class's gate, as the swap begins (beginMobileSwaps). True where layer 1's surface has no
+	// image, which the swap then shows in place of layer 0's.
+	bool showMobileCursor(OSObject *surface, int32_t x, int32_t y);
+	IOReturn setMobileCursorImage(OSObject *surface, const RgfxMobileCursorImage &image);
+	bool postMobileCursorMove(int32_t x, int32_t y, bool visible);
+	RgfxMobileCursor mobileCursor;
 #endif
 
 	bool ready;

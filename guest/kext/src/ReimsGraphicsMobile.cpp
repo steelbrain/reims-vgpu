@@ -50,6 +50,7 @@
 #include <libkern/libkern.h>
 
 #include "RgfxDisplayIdentity.hpp"
+#include "RgfxIOSurfaceKPI.hpp"
 #include "RgfxMobileColor.hpp"
 #include "RgfxMobileModes.hpp"
 
@@ -67,6 +68,21 @@ static constexpr RgfxIOMFBWord word(IOReturn r)
 // others): the ID PRESENT_SURFACE names a surface by.
 extern "C" uint32_t rgfxIOSurfaceSurfaceID(const OSObject *surface)
     __asm__("__ZNK9IOSurface12getSurfaceIDEv");
+// And what the cursor reads of layer 1's surface (RgfxMobileCursor.hpp), as the paravirtual
+// display's program_hardware_cursor_gated reads it: its size in pixels, bytes per row, pixel format
+// and bytes per element, each read as a word, and its image origin and extents, 24 bytes returned
+// through x8.
+extern "C" uint32_t rgfxIOSurfaceWidth(const OSObject *surface) __asm__("__ZNK9IOSurface8getWidthEv");
+extern "C" uint32_t rgfxIOSurfaceHeight(const OSObject *surface)
+    __asm__("__ZNK9IOSurface9getHeightEv");
+extern "C" uint32_t rgfxIOSurfaceBytesPerRow(const OSObject *surface)
+    __asm__("__ZNK9IOSurface14getBytesPerRowEv");
+extern "C" uint32_t rgfxIOSurfacePixelFormat(const OSObject *surface)
+    __asm__("__ZNK9IOSurface14getPixelFormatEv");
+extern "C" uint32_t rgfxIOSurfaceBytesPerElement(const OSObject *surface)
+    __asm__("__ZNK9IOSurface18getBytesPerElementEv");
+extern "C" RgfxSurfaceImageExtents rgfxIOSurfaceImageExtents(OSObject *surface)
+    __asm__("__ZN9IOSurface24getImageOriginAndExtentsEv");
 
 // IOMobileFramebufferLegacy's own methods for its swap queue, which the paravirtual display's
 // swap_begin_gated and clean_queue_gated call and ReimsGraphics overrides none of: called directly,
@@ -160,6 +176,7 @@ enum MobileCall : unsigned {
 	kSwapShown,
 	kSwapDropped,
 	kSwapCursor,
+	kCursorRefused,
 	kMobileCalls,
 };
 
@@ -189,6 +206,7 @@ bool ReimsGraphics::startMobile()
 	mobileFrameClock = RgfxFrameInfoClock();
 	mobileSwapInfoKept.head = 0;
 	mobileSwapInfoKept.tail = 0;
+	mobileCursor = RgfxMobileCursor();
 	// The release, by the size of the class this one derives from as the kernel has it.
 	const uint32_t legacySize = IOMobileFramebufferLegacy::gMetaClass.getClassSize();
 	mobileSwapLayout = rgfxLegacySwapLayoutOf(legacySize);
@@ -205,6 +223,9 @@ bool ReimsGraphics::startMobile()
 	}
 	mobilePowerJoined = false;
 	IOLog("ReimsGraphics: mobile framebuffer, display %u\n", displayId);
+	// The display has a cursor plane, layer 1, as the paravirtual display's start says of its own
+	// (beginMobileSwaps, RgfxMobileCursor.hpp).
+	setProperty("CursorPlane", 1ull, 32);
 	publishMobileDisplay();
 	attachMobileNode();
 	return true;
@@ -212,6 +233,7 @@ bool ReimsGraphics::startMobile()
 
 void ReimsGraphics::stopMobile()
 {
+	removeProperty("CursorPlane");
 	detachMobileNode();
 	if (mobilePipe)
 		removePipe(this);
@@ -365,9 +387,9 @@ void ReimsGraphics::detachMobileNode()
 //   (RGBLayer_MinScaleFraction 1), where the paravirtual display gives 4 each way: the device shows
 //   layer 0's whole surface, whatever rectangles the swap gives it;
 // - TimingElements and ColorElements: the device's modes (publishMobileModes).
-// Of the rest the paravirtual display publishes, CursorPlane is not, since no swap's cursor layer
-// is shown; nor are its own ParavirtDisplayPrefs and ParavirtBrightnessCaps, nor the
-// DisplayContainerID its host may give it.
+// Of the rest the paravirtual display publishes, CursorPlane is the framebuffer's from its start
+// (startMobile); its own ParavirtDisplayPrefs and ParavirtBrightnessCaps are not published, nor
+// the DisplayContainerID its host may give it.
 void ReimsGraphics::publishMobileDisplay()
 {
 	IOLockLock(stateLock);
@@ -587,12 +609,20 @@ void ReimsGraphics::beginMobileSwaps()
 		queue.setCurrent(swap);
 		rgfxLegacyUpdateSwapInfoState(this, swap, kSwapStateAtBegin);
 		queue.removeFirst();
-		if (queue.surface(swap, 1) && logged(kSwapCursor))
-			IOLog("ReimsGraphics: swap %p has a layer-1 surface, which is not shown\n", swap);
 		// Layer 0's surface, by its IOSurface ID. The swap completes when the host answers its
 		// present (mobilePresented), or here where nothing is presented or no answer can reach
-		// the gate. The present's seqno is written before the host can answer it.
+		// the gate. The present's seqno is written before the host can answer it. Layer 1, where
+		// the swap gives it, is the display's cursor; a layer-1 surface with no image is shown in
+		// place of layer 0's, as the paravirtual display's program_hardware_gated has it
+		// (RgfxMobileCursor.hpp).
 		OSObject *surface = static_cast<OSObject *>(queue.surface(swap, 0));
+		if (queue.hasLayer(swap, 1)) {
+			OSObject *cursor = static_cast<OSObject *>(queue.surface(swap, 1));
+			int32_t x = 0, y = 0;
+			queue.cursorPosition(swap, &x, &y);
+			if (showMobileCursor(cursor, x, y))
+				surface = cursor;
+		}
 		const uint32_t id = surface ? rgfxIOSurfaceSurfaceID(surface) : 0;
 		IOReturn presented = kIOReturnNotReady;
 		if (id) {
@@ -616,6 +646,116 @@ void ReimsGraphics::beginMobileSwaps()
 		rgfxLegacySwapComplete(this);
 		mobileSwapRate.complete(now);
 	}
+}
+
+// A swap's layer 1 as the display's cursor (RgfxMobileCursor.hpp), in the class's gate: no surface
+// hides the cursor; the surface and seed taken last move it; another is taken, and its image set
+// on the device's cursor (SET_CURSOR, from the cursor's slot, whose answer frees the slot) before
+// the cursor moves to it. True where the surface has no image, which the swap shows in place of
+// layer 0's.
+bool ReimsGraphics::showMobileCursor(OSObject *surface, int32_t x, int32_t y)
+{
+	if (!surface) {
+		postMobileCursorMove(x, y, false);
+		return false;
+	}
+	const uint32_t id = rgfxIOSurfaceSurfaceID(surface);
+	const uint32_t seed = rgfxIOSurfaceLockSeed(surface);
+	if (!mobileCursor.same(id, seed)) {
+		const RgfxSurfaceImageExtents extents = rgfxIOSurfaceImageExtents(surface);
+		const uint32_t width = rgfxIOSurfaceWidth(surface);
+		const uint32_t height = rgfxIOSurfaceHeight(surface);
+		const uint32_t format = rgfxIOSurfacePixelFormat(surface);
+		RgfxMobileCursorImage image = {};
+		const RgfxCursorTake take =
+		    rgfxMobileCursorImage(width, height, format, rgfxIOSurfaceBytesPerElement(surface),
+		                          extents, kCursorMax, &image);
+		mobileCursor.record(id, seed, take, image);
+		IOReturn set = kIOReturnSuccess;
+		if (take == RgfxCursorTake::Image) {
+			set = setMobileCursorImage(surface, image);
+			if (set != kIOReturnSuccess)
+				mobileCursor.forget();
+		}
+		if ((take != RgfxCursorTake::Image || set != kIOReturnSuccess) && logged(kCursorRefused))
+			IOLog("ReimsGraphics: cursor surface %u (%ux%u, format 0x%08x): image %ux%u from "
+			      "(%u, %u), hot spot (%u, %u): %s, set 0x%x\n",
+			      id, width, height, format, extents.width, extents.height, extents.originX,
+			      extents.originY, extents.hotX, extents.hotY,
+			      take == RgfxCursorTake::None     ? "no image, shown as the swap's surface"
+			      : take == RgfxCursorTake::Format ? "refused: not BGRA of 4 bytes an element"
+			      : take == RgfxCursorTake::Origin ? "refused: the origin is past the surface"
+			      : take == RgfxCursorTake::HotSpot ? "refused: the hot spot is outside the image"
+			                                         : "not set",
+			      set);
+		else if (logged(kSwapCursor))
+			IOLog("ReimsGraphics: cursor surface %u seed %u: %ux%u from (%u, %u), hot spot (%u, "
+			      "%u)\n",
+			      id, seed, image.width, image.height, image.x, image.y, image.hotX, image.hotY);
+		if (set != kIOReturnSuccess)
+			return false;
+	}
+	switch (mobileCursor.take) {
+	case RgfxCursorTake::Image:
+		postMobileCursorMove(x, y, true);
+		return false;
+	case RgfxCursorTake::None:
+		return true;
+	default:
+		// Refused: the cursor stays as it was.
+		return false;
+	}
+}
+
+// The cursor surface's image into the cursor's slot, its rows read through a read-only mapping of
+// the surface's memory as the paravirtual display reads them, and set on the device's cursor.
+IOReturn ReimsGraphics::setMobileCursorImage(OSObject *surface, const RgfxMobileCursorImage &image)
+{
+	IOMemoryDescriptor *memory = rgfxIOSurfaceMemory(surface);
+	const uint64_t bytesPerRow = rgfxIOSurfaceBytesPerRow(surface);
+	uint64_t offset = 0, length = 0;
+	if (!memory || !cursorPixels ||
+	    !rgfxMobileCursorSpan(image, bytesPerRow, memory->getLength(), &offset, &length))
+		return kIOReturnBadArgument;
+	IOMemoryMap *map =
+	    memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly);
+	if (!map)
+		return kIOReturnNoMemory;
+	if (map->getLength() < offset + length) {
+		map->release();
+		return kIOReturnBadArgument;
+	}
+	rgfxMobileCursorCopy(image, bytesPerRow,
+	                     reinterpret_cast<const uint8_t *>(map->getVirtualAddress()) + offset,
+	                     cursorPixels);
+	map->release();
+	RgfxSetCursor c = {};
+	c.display = displayId;
+	c.width = image.width;
+	c.height = image.height;
+	c.hot_x = image.hotX;
+	c.hot_y = image.hotY;
+	c.offset = regionSize - kCursorSlot;
+	return command(RGFX_CMD_SET_CURSOR, &c, sizeof(c));
+}
+
+// MOVE_CURSOR where the cursor's place or visibility changes: the hot spot at the swap's position
+// plus the image's hot spot in its surface. Never waits: a post the ring has no room for is
+// left, and the next swap's layer 1 posts it again.
+bool ReimsGraphics::postMobileCursorMove(int32_t x, int32_t y, bool visible)
+{
+	int32_t mx = 0, my = 0;
+	if (!mobileCursor.move(x, y, visible, &mx, &my))
+		return true;
+	RgfxMoveCursor m = {};
+	m.display = displayId;
+	m.x = mx;
+	m.y = my;
+	m.visible = visible ? 1u : 0u;
+	if (!tryPost(RGFX_CMD_MOVE_CURSOR, &m, sizeof(m), nullptr))
+		return false;
+	mobileCursor.posted(mx, my, visible);
+	return true;
 }
 
 // The line of the second of swaps just over, once a swap comes after it: none while the display

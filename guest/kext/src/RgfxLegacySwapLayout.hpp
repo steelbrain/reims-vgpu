@@ -16,6 +16,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 // Byte offsets in the class and in a swap (IOMFBSwapIORequest).
 struct RgfxLegacySwapLayout {
@@ -55,6 +56,11 @@ struct RgfxLegacySwapLayout {
 	uint32_t swapRecordField00;
 	uint32_t swapFlags;
 	uint32_t notifyHeld;
+	// In a swap: two words, unaligned, that the paravirtual display's program_hardware_gated hands
+	// its program_hardware_cursor_gated with layer 1's surface, where the swap's layer bit 1 is set:
+	// the place the cursor's surface is drawn at, to which the cursor's hot spot is added
+	// (RgfxMobileCursor.hpp).
+	uint32_t cursorPosition;
 };
 
 // macOS 14.6 (Darwin 23.6), 15.6 (24.6), 26.6 (25.6), 27.0 and 27.0.1 (27.0), and 27.2.1
@@ -62,11 +68,11 @@ struct RgfxLegacySwapLayout {
 // is 23). 27.2's class is 8 bytes longer than 27.0's: its fields from 0x1ce8 on lie 8 bytes further
 // in, and of the offsets here only the held halfword is one of them.
 constexpr RgfxLegacySwapLayout kRgfxLegacySwapLayouts[] = {
-    {"14", 0x18a0, 0x1560, 0xb90, 0x32c, 0x318, 0xa40, 0x16b0, 0x108, 0x2d0, 0x310, 0x189e},
-    {"15", 0x19c0, 0x1668, 0xc00, 0x32c, 0x318, 0xa48, 0x17c8, 0x108, 0x2d0, 0x310, 0x19be},
-    {"26", 0x1af8, 0x1790, 0xc78, 0x34c, 0x338, 0xac0, 0x1900, 0x108, 0x2f0, 0x330, 0x1af6},
-    {"27", 0x1dd8, 0x1a40, 0xd38, 0x3ec, 0x3d8, 0xb80, 0x1bf0, 0x108, 0x390, 0x3d0, 0x1dd2},
-    {"27.2", 0x1de0, 0x1a40, 0xd38, 0x3ec, 0x3d8, 0xb80, 0x1bf0, 0x108, 0x390, 0x3d0, 0x1dda},
+    {"14", 0x18a0, 0x1560, 0xb90, 0x32c, 0x318, 0xa40, 0x16b0, 0x108, 0x2d0, 0x310, 0x189e, 0x61},
+    {"15", 0x19c0, 0x1668, 0xc00, 0x32c, 0x318, 0xa48, 0x17c8, 0x108, 0x2d0, 0x310, 0x19be, 0x61},
+    {"26", 0x1af8, 0x1790, 0xc78, 0x34c, 0x338, 0xac0, 0x1900, 0x108, 0x2f0, 0x330, 0x1af6, 0x61},
+    {"27", 0x1dd8, 0x1a40, 0xd38, 0x3ec, 0x3d8, 0xb80, 0x1bf0, 0x108, 0x390, 0x3d0, 0x1dd2, 0x61},
+    {"27.2", 0x1de0, 0x1a40, 0xd38, 0x3ec, 0x3d8, 0xb80, 0x1bf0, 0x108, 0x390, 0x3d0, 0x1dda, 0x61},
 };
 
 // The layout of the release whose IOMobileFramebufferLegacy is `classSize` bytes, or null for a
@@ -132,12 +138,28 @@ public:
 	// Whether the paravirtual display would begin `swap` rather than drop it.
 	bool begins(const void *swap) const { return (word(swap, l.state) & ~8u) == 0; }
 
+	// Whether `swap` gives layer `layer`, its bit in the layers word set; its surface may still be
+	// null, which for layer 1 hides the cursor.
+	bool hasLayer(const void *swap, unsigned layer) const
+	{
+		return (word(swap, l.layers) & (1u << layer)) != 0;
+	}
+
 	// Layer `layer`'s surface in `swap`, or null where the swap gives the layer none.
 	void *surface(const void *swap, unsigned layer) const
 	{
-		if ((word(swap, l.layers) & (1u << layer)) == 0)
+		if (!hasLayer(swap, layer))
 			return nullptr;
 		return *pointer(static_cast<const uint8_t *>(swap) + l.surfaces + 8 * layer);
+	}
+
+	// The place `swap` gives its layer-1 cursor (RgfxLegacySwapLayout::cursorPosition): its two
+	// words, read as the paravirtual display reads them, unaligned.
+	void cursorPosition(const void *swap, int32_t *x, int32_t *y) const
+	{
+		const uint8_t *at = static_cast<const uint8_t *>(swap) + l.cursorPosition;
+		memcpy(x, at, 4);
+		memcpy(y, at + 4, 4);
 	}
 
 private:
