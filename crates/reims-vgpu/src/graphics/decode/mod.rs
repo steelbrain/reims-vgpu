@@ -701,8 +701,8 @@ pub(crate) struct Shared<P: Platform> {
     waits: waits::WaitWatch<P>,
     /// The contexts closed since the device's reset, and the resets ([`ClosedContexts`]).
     closed: ClosedContexts,
-    /// Whether a `Managed` resource is one copy, over its block
-    /// ([`GraphicsDecoder::set_unified_memory`]).
+    /// Whether the device's GPU shares the CPU's memory, where a `Managed` texture is one copy
+    /// over its CPU copy ([`GraphicsDecoder::set_unified_memory`]).
     unified_memory: AtomicBool,
     /// The views of the IOSurfaces whose blocks name their own guest pages ([`surface_pages`]).
     surface_views: Mutex<surface_pages::SurfaceViews<P>>,

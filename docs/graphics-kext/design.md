@@ -1001,9 +1001,9 @@ Stages:
 
 ## What metal2vulkan adds in stage 3
 
-- No-copy Managed buffers and heaps over our host blocks, whose VRAM copy
-  syncs at `didModifyRange:` and `synchronizeResource:`. Today a no-copy
-  buffer has no device copy.
+- No-copy Managed heaps over our host blocks, whose VRAM copy syncs at
+  `didModifyRange:` and `synchronizeResource:`, as a no-copy Managed buffer's
+  does on a GPU of its own memory since metal2vulkan's runtime 2050.
 - Two-copy Managed textures, whose host copy is one of our blocks.
 - Per-context address and texture-ID tables. Today one device has one
   address space and one texture table of up to 2^16 entries.
@@ -2497,40 +2497,47 @@ range of a slab ("Shared and Managed buffers lie in slabs") or a region block;
 a texture's a Shared buffer of the slabs where the device takes
 `RGFX_FEATURE_MANAGED_TEXTURE_SLABS`, else a region block. The slabs are the
 process's own pages where the device takes them, so no app-sized copy
-lies in the region. The host decides the form from the platform's answer of whether the GPU
-shares the CPU's memory:
-- **Shared memory:** one copy. The buffer is a no-copy buffer over its block,
-  and a one-level 2D texture or 2D array of a linear format a texture over its
-  block's Shared buffer (an array by the linear SPI, whose slices lie as the
-  layout's); the range messages are checked and do nothing more. A texture of
-  any other shape (more levels, a cube, a 3D texture, a block-compressed
-  format) is two copies, as below: no texture over a buffer has its shape, and
-  without the CPU copy an upload would be a staging blit the call waits for,
-  hundreds of times a Managed one's (dgpu-oracle.md Q17). The guest's
-  `getBytes:` of it reads its GPU copy, copied on the device: on a GPU that
-  shares the CPU's memory Metal's CPU reads of a Managed texture see the GPU's
-  writes with no synchronize (the Intel UHD 630 and the M3, dgpu-oracle.md
-  Q2).
-- **Otherwise:** two copies. The object the command buffers name is the
-  platform's own Managed buffer (at the guest's address) or texture, and the
-  block sits beside it as a Shared buffer.
-  - `BUFFER_DID_MODIFY_RANGE` copies the named range from the block to the
-    platform buffer's host copy, and the platform's `didModifyRange:` copies it
-    to the GPU's before any command of its next submission.
-  - `TEXTURE_REPLACE_REGION` is the platform's `replaceRegion:` from the block,
-    done before the call returns.
-  - Ring 0 is carried out before any later command buffer of the process, on
-    any queue, so a range is ordered before every command buffer committed after
-    it, as Metal promises.
-  - A blit encoder's `synchronizeResource:` and `synchronizeTexture:` become
-    copies of the GPU's copy into the block at that point of the encoder.
-  - Where the platform refuses the GPU's copy, the create is refused, as
-    Metal's answers nil. Metal makes Managed resources past a discrete GPU's
-    memory (measured on the AMD 5300M: 12 GiB of Managed buffers, three times
-    its 4 GiB, made, used by one command buffer and read back as written), and
-    the platform does too (the Vulkan platform's runtime places them in system
-    memory past a full device-local heap), so it refuses one only where that
-    memory is gone as well.
+lies in the region.
+- **A buffer**, on any host: a no-copy Managed buffer over its CPU copy's bytes
+  at the guest's address, whose copies the platform keeps as Metal does. Where
+  the GPU shares the CPU's memory that is one copy. Otherwise the Vulkan
+  platform's runtime keeps a GPU copy in the GPU's memory, with the guest's
+  bytes its CPU copy: copied in whole at the create, a range at each
+  `didModifyRange:` before the next submission, and out whole at each
+  `synchronizeResource:` where the blit encoder runs it. Where the GPU's memory
+  has no room for that copy, the buffer lies in its bytes, as a Shared one does,
+  which the runtime announces. `BUFFER_DID_MODIFY_RANGE` is the platform's
+  `didModifyRange:` of the range, and a blit's synchronize of the buffer the
+  platform's own.
+- **A texture** takes its form from the platform's answer of whether the GPU
+  shares the CPU's memory:
+  - **Shared memory:** one copy. A one-level 2D texture or 2D array of a
+    linear format is a texture over its block's Shared buffer (an array by the
+    linear SPI, whose slices lie as the layout's); the range messages are
+    checked and do nothing more. A texture of any other shape (more levels, a
+    cube, a 3D texture, a block-compressed format) is two copies, as below: no
+    texture over a buffer has its shape, and without the CPU copy an upload
+    would be a staging blit the call waits for, hundreds of times a Managed
+    one's (dgpu-oracle.md Q17). The guest's `getBytes:` of it reads its GPU
+    copy, copied on the device: on a GPU that shares the CPU's memory Metal's
+    CPU reads of a Managed texture see the GPU's writes with no synchronize
+    (the Intel UHD 630 and the M3, dgpu-oracle.md Q2).
+  - **Otherwise:** two copies. The object the command buffers name is the
+    platform's own Managed texture, and the block sits beside it as a Shared
+    buffer. `TEXTURE_REPLACE_REGION` is the platform's `replaceRegion:` from
+    the block, done before the call returns, and a blit encoder's
+    `synchronizeResource:` and `synchronizeTexture:` become copies of the GPU's
+    copy into the block at that point of the encoder.
+- Ring 0 is carried out before any later command buffer of the process, on any
+  queue, so a range message is ordered before every command buffer committed
+  after it, as Metal promises.
+- Where the platform refuses a buffer, or a texture's GPU copy, the create is
+  refused, as Metal's answers nil. Metal makes Managed resources past a
+  discrete GPU's memory (measured on the AMD 5300M: 12 GiB of Managed buffers,
+  three times its 4 GiB, made, used by one command buffer and read back as
+  written), and the platform does too (the Vulkan platform's runtime places a
+  texture in system memory past a full device-local heap, and lays a buffer in
+  its bytes), so it refuses one only where that memory is gone as well.
 - A buffer comes from `BUFFER_OVER_HOST_MEMORY` with Managed options; a texture
   from `MANAGED_TEXTURE_CREATE`, which names the copy's Shared buffer and the
   texel block of its format (bytes, width, height). The host reads the copy
@@ -2549,7 +2556,8 @@ shares the CPU's memory:
   (dgpu-oracle.md Q2). A depth or stencil texture in Managed storage ends the
   process first, as on both x86 oracles.
 - Until the device's identity answers carry `hasUnifiedMemory`, the host takes
-  the two copies on every GPU, which hold Metal's contract on any of them.
+  a texture's two copies on every GPU, which hold Metal's contract on any of
+  them.
 
 **Command buffers** (per-queue submission ring). A `COMMAND_BUFFER` message is
 one command buffer: its `ObjId`, then a byte stream of encoder ops. The decoder
@@ -3168,7 +3176,7 @@ commit. Each outcome the new design allows is one of those two:
   could have come before its take, and the buffer may see the bytes, as it may
   on Metal. Ring 0 does not wait for those tickets: the message is checked
   there (a bad reference or a range past its object is found at once), and its
-  copy and its platform call are made where the last ticket is given back,
+  platform call is made where the last ticket is given back,
   after that buffer's commit, a context's range messages one at a time in the
   order they came. Every command buffer of the context begun after it came is
   committed after it, as one begun after ring 0 carried it out was, and it
