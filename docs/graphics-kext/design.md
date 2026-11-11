@@ -343,13 +343,19 @@ Stages:
       WindowServer sets none and reads the display's size from the class
       (QuartzCore's IOMFBDisplay), so the display starts in its preferred
       mode (start_hardware).
-    - The arm64 display's cursor, as the paravirtual display has it: a
-      swap's layer 1 is the display's cursor (RgfxMobileCursor.hpp), and
-      the display publishes `CursorPlane`. A swap that gives layer 1 sets
-      the device's cursor from its surface's image (`SET_CURSOR`, through
-      the cursor's slot) and moves it (`MOVE_CURSOR`, the swap's place plus
-      the hot spot), or hides it where the layer has no surface; a surface
-      with no image is shown as the swap's in place of layer 0's.
+    - The arm64 display's cursor and mode changes, as the paravirtual
+      display has them: a swap's layer 1 is the display's cursor
+      (RgfxMobileCursor.hpp), and the display publishes `CursorPlane`. A
+      swap that gives layer 1 sets the device's cursor from its surface's
+      image (`SET_CURSOR`, through the cursor's slot) and moves it
+      (`MOVE_CURSOR`, the swap's place plus the hot spot), or hides it
+      where the layer has no surface; a surface with no image is shown as
+      the swap's in place of layer 0's. A change of the device's modes
+      (`DISPLAY_CHANGED`, as a resize of the host's window makes one)
+      publishes the display's attributes and modes again, shows the new
+      preferred mode where the device no longer lists the one shown, and
+      tells WindowServer through the class's hot-plug notice
+      (`hotPlug_notify`) and `kIOMessageServicePropertyChange`.
 14. **IOSurfaces follow the discrete model.** IOSurface.kext allocates
     surfaces in guest RAM, CAMetalLayer drawables and window backing stores
     included. The accelerator gets a per-surface device cache with a sync

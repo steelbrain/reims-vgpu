@@ -119,6 +119,14 @@ extern "C" RgfxIOMFBWord rgfxLegacySetParameter(IOMobileFramebufferLegacy *self,
                                                 IOMFBParameterName name, const uint64_t *values,
                                                 uint32_t count)
     __asm__("__ZN25IOMobileFramebufferLegacy13set_parameterE18IOMFBParameterNamePKyj");
+// The class's hot-plug notice: records the display's state (1 plugged in, 0 not) where the
+// class's get_digital_out_state_gated answers it, and sends it to each of the class's hot-plug
+// clients, both in the class's gate. The paravirtual display calls it, as its own class's, once
+// it has published a display's attributes (1) and as it removes them (0) (read from 26.6.2's and
+// 27.0.1's AppleParavirtGPU and IOMobileGraphicsFamily): called directly, under the name every
+// release from 14 to 27.0.1 exports.
+extern "C" void rgfxLegacyHotPlugNotify(IOMobileFramebufferLegacy *self, uint64_t state)
+    __asm__("__ZN25IOMobileFramebufferLegacy14hotPlug_notifyEy");
 
 // IOMobileFramebufferUserClient's enqueue of `bytes` bytes at `words` in its shared data queue,
 // which IOMobileFramebuffer.framework reads a frame info record from (RgfxLegacySwapInfo.hpp):
@@ -178,6 +186,7 @@ enum MobileCall : unsigned {
 	kSwapDropped,
 	kSwapCursor,
 	kCursorRefused,
+	kDisplayChanged,
 	kMobileCalls,
 };
 
@@ -208,6 +217,14 @@ bool ReimsGraphics::startMobile()
 	mobileSwapInfoKept.head = 0;
 	mobileSwapInfoKept.tail = 0;
 	mobileCursor = RgfxMobileCursor();
+	mobileListChanged = false;
+	mobileHotPlugged = false;
+	mobileTimingId = 0;
+	mobileChangeCall = thread_call_allocate(mobileDisplayChanged, this);
+	if (!mobileChangeCall) {
+		IOLog("ReimsGraphics: no thread call for the display's changes\n");
+		return false;
+	}
 	// The release, by the size of the class this one derives from as the kernel has it.
 	const uint32_t legacySize = IOMobileFramebufferLegacy::gMetaClass.getClassSize();
 	mobileSwapLayout = rgfxLegacySwapLayoutOf(legacySize);
@@ -234,6 +251,10 @@ bool ReimsGraphics::startMobile()
 
 void ReimsGraphics::stopMobile()
 {
+	// No change of the display's is taken from here: one under way ends first, and one the
+	// device's work loop asks for until quiesce finds the framebuffer stopped (mobileDisplayChanged).
+	if (mobileChangeCall)
+		thread_call_cancel_wait(mobileChangeCall);
 	removeProperty("CursorPlane");
 	detachMobileNode();
 	if (mobilePipe)
@@ -246,6 +267,18 @@ void ReimsGraphics::stopMobile()
 		if (mobileSwapLoop)
 			mobileSwapLoop->removeEventSource(answer);
 	}
+}
+
+// The thread call of the display's changes, once the device's work loop can ask for none: after
+// quiesce, in stop and where start fails.
+void ReimsGraphics::freeMobileChanges()
+{
+	thread_call_t call = mobileChangeCall;
+	mobileChangeCall = nullptr;
+	if (!call)
+		return;
+	thread_call_cancel_wait(call);
+	thread_call_free(call);
 }
 
 // MARK: - The display as a process finds it
@@ -390,7 +423,8 @@ void ReimsGraphics::detachMobileNode()
 // - TimingElements and ColorElements: the device's modes (publishMobileModes).
 // Of the rest the paravirtual display publishes, CursorPlane is the framebuffer's from its start
 // (startMobile); its own ParavirtDisplayPrefs and ParavirtBrightnessCaps are not published, nor
-// the DisplayContainerID its host may give it.
+// the DisplayContainerID its host may give it. A change of the device's modes publishes them all
+// again (republishMobileDisplay).
 void ReimsGraphics::publishMobileDisplay()
 {
 	IOLockLock(stateLock);
@@ -543,6 +577,57 @@ void ReimsGraphics::publishMobileModes()
 	timingElements->release();
 	colors->release();
 	color->release();
+}
+
+// A change of the device's modes for the display, as a resize of the host's window makes one
+// (the device's DISPLAY_CHANGED, whose refresh parseDisplays takes): the display publishes its
+// attributes and modes again and tells the processes, as the paravirtual display takes its host's
+// change of a display (its handleHostInterrupt, read from 26.6.2's and 27.0.1's AppleParavirtGPU
+// and IOMobileGraphicsFamily). That removes the display's attributes and tells the class's
+// hot-plug clients it is unplugged (hotPlug_notify 0) where it told them it was plugged in, makes
+// them again from its host's modes and tells them it is plugged in (hotPlug_notify 1), and on 27.0.1
+// sends its own clients kIOMessageServicePropertyChange. The display here does the same, in that
+// order, but keeps its attributes published while it makes them again; a display that has told no
+// hot-plug client it is plugged in, as none has from its start, tells them only that. And as
+// WindowServer sets no mode of a display that publishes one colour mode and one timing
+// (start_hardware), a display whose timing the device no longer lists shows the new start timing,
+// as start_hardware does, before it tells anyone. On a thread call: the mode's set waits for the
+// device's answers, which the device's work loop, where the change is found, takes.
+void ReimsGraphics::mobileDisplayChanged(thread_call_param_t self, thread_call_param_t)
+{
+	static_cast<ReimsGraphics *>(self)->republishMobileDisplay();
+}
+
+void ReimsGraphics::republishMobileDisplay()
+{
+	if (!hasStarted())
+		return;
+	const bool wasPlugged = mobileHotPlugged;
+	if (wasPlugged)
+		rgfxLegacyHotPlugNotify(this, 0);
+	publishMobileDisplay();
+	IOLockLock(stateLock);
+	Mode kept{};
+	const uint32_t shownTiming = __atomic_load_n(&mobileTimingId, __ATOMIC_RELAXED);
+	const bool listed = shownTiming && rgfxMobileModeFor(kRgfxColorElementId, shownTiming,
+	                                                     modeSet.modes, modeSet.modeCount, &kept);
+	const uint32_t startTiming =
+	    rgfxMobileStartTimingId(modeSet.modes, modeSet.modeCount, modeSet.preferredId);
+	IOLockUnlock(stateLock);
+	Mode shown = kept;
+	IOReturn set = kIOReturnSuccess;
+	if (!listed)
+		set = startTiming ? setMobileMode(kRgfxColorElementId, startTiming, &shown)
+		                  : kIOReturnNotReady;
+	rgfxLegacyHotPlugNotify(this, 1);
+	mobileHotPlugged = true;
+	messageClients(kIOMessageServicePropertyChange);
+	if (logged(kDisplayChanged))
+		IOLog("ReimsGraphics: display %u changed: %s timing %u, %ux%u at %u.%03u Hz (0x%x); "
+		      "hot-plug clients told %s\n",
+		      displayId, listed ? "keeps" : "shows", listed ? shownTiming : startTiming,
+		      shown.width, shown.height, shown.refreshMhz / 1000, shown.refreshMhz % 1000, set,
+		      wasPlugged ? "0, then 1" : "1");
 }
 
 void ReimsGraphics::mobileVblank(OSObject *client, UInt64 count, UInt64 time, UInt64 next)
@@ -1186,6 +1271,7 @@ IOReturn ReimsGraphics::setMobileMode(uint32_t colorId, uint32_t timingId, Mode 
 			setProperty("DisplayWidth", mode.width, 32);
 			setProperty("DisplayHeight", mode.height, 32);
 			setProperty("DPTimingModeId", timingId, 64);
+			__atomic_store_n(&mobileTimingId, timingId, __ATOMIC_RELAXED);
 		}
 	}
 	return r;

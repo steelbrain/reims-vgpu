@@ -703,6 +703,13 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		// senses the connection again, or once it has its connect interrupt
 		// registered and on (RgfxDisplayModes.hpp, RgfxConnectChange).
 		refreshSeqno = 0;
+#if defined(__arm64e__)
+		// On arm64 a list that changed the modes is republished, off this work loop, and the
+		// processes told (republishMobileDisplay).
+		if (__atomic_exchange_n(&mobileListChanged, false, __ATOMIC_RELAXED) && mobileChangeCall &&
+		    hasStarted())
+			thread_call_enter(mobileChangeCall);
+#endif
 		IOSimpleLockLock(interruptLock);
 		if (displayChange.changed(connect.enabled && connect.proc))
 			fire = connect;
@@ -890,8 +897,12 @@ UInt32 ReimsGraphics::parseDisplays(const volatile UInt8 *payload, UInt32 size)
 	haveDisplay = true;
 	displayId = id;
 	connected = isConnected != 0;
-	if (modeSet.take(fresh, freshCount, freshPreferred))
+	const bool changed = modeSet.take(fresh, freshCount, freshPreferred);
+	if (changed)
 		modeConfig.listChanged();
+#if defined(__arm64e__)
+	mobileListChanged = changed;
+#endif
 	IOLockUnlock(stateLock);
 	return 0;
 }
@@ -1409,6 +1420,9 @@ fail:
 	stopMobile();
 #endif
 	quiesce();
+#if defined(__arm64e__)
+	freeMobileChanges();
+#endif
 	teardown();
 	return false;
 }
@@ -1420,6 +1434,9 @@ void ReimsGraphics::stop(IOService *provider)
 	stopMobile();
 #endif
 	quiesce();
+#if defined(__arm64e__)
+	freeMobileChanges();
+#endif
 	super::stop(provider);
 	teardown();
 }

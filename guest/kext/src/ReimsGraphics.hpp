@@ -40,6 +40,7 @@ typedef graft_iomfb_word RgfxIOMFBWord;
 #include "RgfxLegacySwapLayout.hpp"
 #include "RgfxMobileCursor.hpp"
 #include "RgfxSwapRate.hpp"
+#include <kern/thread_call.h>
 #endif
 
 #include "RgfxBootConsole.hpp"
@@ -623,6 +624,21 @@ private:
 	IOReturn setMobileCursorImage(OSObject *surface, const RgfxMobileCursorImage &image);
 	bool postMobileCursorMove(int32_t x, int32_t y, bool visible);
 	RgfxMobileCursor mobileCursor;
+	// A change of the device's modes for the display (parseDisplays), taken to the processes as
+	// the paravirtual display takes its host's (mobileDisplayChanged): set where the last list
+	// taken changed them, read and cleared at a refresh's answer, the device's work loop's alone.
+	bool mobileListChanged;
+	// The thread call that republishes the display and tells the processes, off the device's work
+	// loop, whose answers its mode set waits for: made in startMobile, waited for in stopMobile,
+	// and let go once the work loop can ask for it no more (freeMobileChanges).
+	thread_call_t mobileChangeCall;
+	static void mobileDisplayChanged(thread_call_param_t self, thread_call_param_t);
+	void freeMobileChanges();
+	void republishMobileDisplay();
+	// Whether the display last told the class's hot-plug clients it is plugged in (hotPlug_notify),
+	// as the paravirtual display records it; and the timing the display shows (setMobileMode).
+	bool mobileHotPlugged;
+	uint32_t mobileTimingId;
 #endif
 
 	bool ready;
