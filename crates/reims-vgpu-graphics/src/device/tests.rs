@@ -129,6 +129,7 @@ const MODE: Mode = Mode {
     width: 1280,
     height: 800,
     refresh_mhz: NEVER_MHZ,
+    scale_120ths: 240,
 };
 
 impl Rig {
@@ -600,6 +601,37 @@ fn get_displays_answers_the_screen_s_mode() {
     assert_eq!(armed, 0);
 }
 
+/// A guest that took `DISPLAY_SCALE` is told the screen's scale between the display's record and
+/// its mode; one that did not gets the answer without it (`get_displays_answers_the_screen_s_mode`)
+#[test]
+fn a_guest_that_took_display_scale_is_told_the_screen_s_scale() {
+    struct Scales;
+    impl Host for Scales {
+        fn raise_interrupt(&self, _vector: u32) {}
+        fn features(&self) -> u64 {
+            RGFX_FEATURE_DISPLAY_SCALE
+        }
+    }
+    let mut rig = Rig::with_host(Box::new(Scales));
+    rig.device.mmio_write(
+        RGFX_REG_DRIVER_FEATURES_HI.into(),
+        (RGFX_FEATURE_DISPLAY_SCALE >> 32) as u32,
+    );
+    rig.start();
+    let seqno = rig.send(get_displays());
+    let bytes = rig.event().unwrap();
+    let header = RgfxMsgHeader::read_from_prefix(&bytes).unwrap().0;
+    assert_eq!(
+        (header.r#type, header.size, header.seqno),
+        (RGFX_EVT_DISPLAYS, 56, seqno)
+    );
+    let words: Vec<u32> = bytes[16..56]
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(words, [1, 0, 1, 0, 1, 240, 0, 1280, 800, NEVER_MHZ]);
+}
+
 /// A post whose guest took the record and armed the ring again before the post cleared `armed`
 /// (a consumer already awake) raises nothing and leaves the ring armed; with the record not taken
 /// the arm is cleared and the vector raised
@@ -885,6 +917,26 @@ fn a_new_mode_is_told_with_display_changed() {
     rig.send(get_displays());
     let bytes = rig.event().unwrap();
     assert_eq!(u32::from_le_bytes(bytes[36..40].try_into().unwrap()), 1280);
+}
+
+/// A change of the screen's scale alone, the window moved to a screen of another scale, is a new
+/// mode: told once with `DISPLAY_CHANGED`
+#[test]
+fn a_new_scale_is_told_with_display_changed() {
+    let mut rig = Rig::new();
+    rig.start();
+    rig.send(get_displays());
+    rig.event().unwrap();
+    *rig.mode.lock() = Mode {
+        scale_120ths: 120,
+        ..MODE
+    };
+    rig.refresh();
+    let bytes = rig.event().unwrap();
+    let c = RgfxDisplayChanged::read_from_bytes(&bytes).unwrap();
+    assert_eq!((c.header.r#type, c.display), (RGFX_EVT_DISPLAY_CHANGED, 0));
+    rig.refresh();
+    assert!(rig.event().is_none(), "told once");
 }
 
 /// A reset stops the device, puts both rings back as new and the display with no cursor or

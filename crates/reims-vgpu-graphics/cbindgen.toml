@@ -122,6 +122,7 @@ include = [
     "RgfxDisplayChanged",
     "RgfxDisplayColor",
     "RgfxDisplayEntry",
+    "RgfxDisplayScale",
     "RgfxDisplays",
     "RgfxEventSignalled",
     "RgfxFunctionConstant",

@@ -278,7 +278,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_DEFERRED_ASK) as u64
     | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
     | RGFX_FEATURE_SCHEDULED_ASK
-    | RGFX_FEATURE_PAGES_16K;
+    | RGFX_FEATURE_PAGES_16K
+    | RGFX_FEATURE_DISPLAY_SCALE;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
@@ -1399,6 +1400,11 @@ impl Shared {
     /// took them so far ([`Self::offered_to`]).
     fn offered(&self) -> u64 {
         self.offered_to(self.driver_features.load(Ordering::Acquire))
+    }
+
+    /// Whether the guest's driver took `feature`.
+    pub(crate) fn driver_took(&self, feature: u64) -> bool {
+        self.driver_features.load(Ordering::Acquire) & feature != 0
     }
 
     /// What `DEFERRED_BUDGET_LO` and `_HI` read: the host's budget where the device offers a

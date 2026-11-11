@@ -99,7 +99,7 @@ use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
 use reims_vgpu_vulkan::core::platform::types::MtlViewport;
 
 use super::color::DisplayColor;
-use super::{DisplayHold, DrawnPresents, Presented, Shown};
+use super::{DisplayHold, Drawable, DrawnPresents, Presented, Shown};
 use crate::entry::no_catch;
 use crate::platform::ApiPlatform;
 use reims_vgpu_graphics::wire::{
@@ -549,10 +549,14 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         buffer
     }
 
-    /// The window's render thread draws into a drawable of `size` pixels: the window's size,
-    /// which the display offers the guest.
-    pub(crate) fn drawn(&self, size: (u64, u64)) {
-        *self.shown.drawable.lock() = Some(size);
+    /// The window's render thread draws into a drawable of `size` pixels, `scale` of them a
+    /// point: the window's size, which the display offers the guest, and its screen's scale,
+    /// which it tells the guest.
+    pub(crate) fn drawn(&self, size: (u64, u64), scale: f64) {
+        *self.shown.drawable.lock() = Some(Drawable {
+            pixels: size,
+            scale,
+        });
     }
 
     /// A command buffer of the sink's queue with the scanout blitted into `texture` at `region`

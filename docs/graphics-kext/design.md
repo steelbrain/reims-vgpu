@@ -1274,6 +1274,12 @@ only where no negotiation can carry it.
   that maps no guest RAM writes them, as the info is written before any
   guest takes the bit. A host whose page is 4 KiB never offers `PAGES_16K`:
   every guest's runs are whole pages of its own there.
+- Bit 35, `FEATURES_HI`'s bit 3, is `DISPLAY_SCALE`: each display's record in
+  `DISPLAYS` is followed by the scale of the host screen that shows it, the
+  screen's pixels a point in 120ths (120 at 1x, 240 at 2x, 252 at KDE's 2.1;
+  0 while no window has drawn the display), and a change of the scale alone
+  is a change of the display's mode, told with `DISPLAY_CHANGED` ("Display",
+  below). Every host offers it.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -1766,7 +1772,7 @@ stage 2.
 | type | name | payload |
 |---|---|---|
 | 0x100 | `COMPLETE` | status u32 |
-| 0x101 | `DISPLAYS` | count u32, then per display: id u32, connected u32, preferred mode index u32, mode count u32, then per mode: width u32, height u32, refresh in mHz u32 |
+| 0x101 | `DISPLAYS` | count u32, then per display: id u32, connected u32, preferred mode index u32, mode count u32, where the guest took `DISPLAY_SCALE` its host screen's scale in 120ths u32 and a reserved u32, then per mode: width u32, height u32, refresh in mHz u32 |
 | 0x102 | `DISPLAY_CHANGED` | display u32; the guest asks `GET_DISPLAYS` again |
 | 0x103 | `VBLANK` | display u32, count u64, host time in ns u64 |
 

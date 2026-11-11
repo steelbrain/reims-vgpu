@@ -78,11 +78,12 @@ impl Presenter for ScanoutPresenter {
     fn draw(
         &mut self,
         drawable: (u64, u64),
+        scale: f64,
         region: PixelRect,
         _cursor: Option<&DrawnCursor>,
     ) -> Drawn {
         entry::run(|_| {
-            self.draw.drawn(drawable);
+            self.draw.drawn(drawable, scale);
             let frame = match self.swapchain.acquire(drawable) {
                 Acquired::Image(frame) => frame,
                 Acquired::Retry => return Drawn::Retry,

@@ -54,22 +54,23 @@ use reims_vgpu_graphics::wire::{
     RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_IMPORT,
     RGFX_CMD_SHARED_EVENT_NAME, RGFX_CMD_SHARED_EVENT_UNNAME, RGFX_CONTEXT_OBJ_ID_SHIFT,
     RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_ICB_STATE, RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED,
-    RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_DISPLAY_COLOR, RGFX_FEATURE_HEAP_OVER_PAGES,
-    RGFX_FEATURE_HOST_TIME, RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
-    RGFX_FEATURE_MANAGED_AT_OFFSET, RGFX_FEATURE_MANAGED_BUFFER_SLABS,
-    RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE,
-    RGFX_FEATURE_PAGES_16K, RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PRIVATE_RENDER_STATE,
-    RGFX_FEATURE_SCHEDULED_ASK, RGFX_FEATURE_SHARED_EVENT_NAMES, RGFX_FEATURE_SMALL_ID_CHUNKS,
-    RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_CACHE_REFUSED,
-    RGFX_FEATURE_SURFACE_DEFERRED, RGFX_FEATURE_SURFACE_DEFERRED_ASK,
-    RGFX_FEATURE_SURFACE_DEFERRED_CARRY, RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES,
-    RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
-    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS,
-    RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant,
-    RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted,
-    RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled, RgfxHeapOverPages, RgfxIcbState,
-    RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxSamplerState, RgfxScheduledAsk,
-    RgfxSharedEventName, RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
+    RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_DISPLAY_COLOR, RGFX_FEATURE_DISPLAY_SCALE,
+    RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_HOST_TIME, RGFX_FEATURE_ICB_SLOTS,
+    RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_MANAGED_AT_OFFSET,
+    RGFX_FEATURE_MANAGED_BUFFER_SLABS, RGFX_FEATURE_MANAGED_TEXTURE_SLABS,
+    RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE, RGFX_FEATURE_PAGES_16K,
+    RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_SCHEDULED_ASK,
+    RGFX_FEATURE_SHARED_EVENT_NAMES, RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM,
+    RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
+    RGFX_FEATURE_SURFACE_DEFERRED_ASK, RGFX_FEATURE_SURFACE_DEFERRED_CARRY,
+    RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_UNSHARED_QUEUES,
+    RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
+    RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET,
+    RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant, RgfxBlockRelease,
+    RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry,
+    RgfxDisplayColor, RgfxEventSignalled, RgfxHeapOverPages, RgfxIcbState, RgfxLibraryLookup,
+    RgfxMsgHeader, RgfxPageRun, RgfxSamplerState, RgfxScheduledAsk, RgfxSharedEventName,
+    RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
 use reims_vgpu_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim, Scanout,
@@ -219,11 +220,13 @@ fn deferred_budget(features: u64, own_memory: u64) -> u64 {
     own_memory / 4
 }
 
-/// The mode a display offers before its window has a size, and without a window.
+/// The mode a display offers before its window has a size, and without a window: no screen
+/// shows it, so it has no scale.
 const FALLBACK_MODE: Mode = Mode {
     width: 1920,
     height: 1080,
     refresh_mhz: 60_000,
+    scale_120ths: 0,
 };
 
 /// The reims-graphics device.
@@ -325,8 +328,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // the guest's pages maps a process's own pages too, for its no-copy buffers
             // (`BUFFER_OVER_PAGES`) and the heaps of its buffers' slabs (`HEAP_OVER_PAGES`). Every
             // host carries the display pipe's colour out (`DISPLAY_COLOR`), its window drawing
-            // through it, and names the shared events one process hands another
-            // (`SHARED_EVENT_NAMES`). A host whose GPU answers Metal3 makes mesh render pipelines
+            // through it, names the shared events one process hands another
+            // (`SHARED_EVENT_NAMES`), and tells the guest its window's screen's scale
+            // (`DISPLAY_SCALE`). A host whose GPU answers Metal3 makes mesh render pipelines
             // and draws them (`MESH_PIPELINES`). A host whose device makes compute pipelines of
             // OpenCL mode links an OpenCL kernel's function the bundle names so (`OPENCL_MODE`). A
             // host whose device takes the private render state Apple's OpenGL renderer sets makes
@@ -348,6 +352,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 | u64::from(RGFX_FEATURE_DISPLAY_COLOR)
                 | u64::from(RGFX_FEATURE_SHARED_EVENT_NAMES)
                 | RGFX_FEATURE_SCHEDULED_ASK
+                | RGFX_FEATURE_DISPLAY_SCALE
                 | if gpu_device.makes_opencl_mode_pipelines() {
                     u64::from(RGFX_FEATURE_OPENCL_MODE)
                 } else {
@@ -2383,14 +2388,37 @@ const RAISE_THREADS: [&str; 11] = [
     "reims-vgpu.graphics-closes-",
 ];
 
-/// What the window and its sink share: the scanout the guest set, and the size of the drawable
-/// the window's render thread last drew into, its size in pixels.
+/// What the window and its sink share: the scanout the guest set, and the drawable the window's
+/// render thread last drew into: its size in pixels, and its pixels a point.
 #[derive(Debug, Default)]
 pub(crate) struct Shown {
     /// The guest's scanout; `None` shows black.
     pub(crate) scanout: Mutex<Option<Scanout>>,
-    /// The window's size in pixels, once drawn into.
-    pub(crate) drawable: Mutex<Option<(u64, u64)>>,
+    /// The window's drawable, once drawn into.
+    pub(crate) drawable: Mutex<Option<Drawable>>,
+}
+
+/// A drawable the window's render thread drew into.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Drawable {
+    /// Its size in pixels, width then height: the window's size.
+    pub(crate) pixels: (u64, u64),
+    /// Its pixels a point: the backing scale of the screen the window is on.
+    pub(crate) scale: f64,
+}
+
+/// `scale` pixels a point in 120ths, as `RgfxDisplayScale` carries it: rounded to nearest, and 0
+/// where it is not a positive number.
+fn scale_in_120ths(scale: f64) -> u32 {
+    if !(scale.is_finite() && scale > 0.0) {
+        return 0;
+    }
+    #[expect(
+        clippy::as_conversions,
+        reason = "a backing scale of a few units, rounded to nearest; a cast saturates"
+    )]
+    let scale = (scale * 120.0).round() as u32;
+    scale
 }
 
 /// The display's window as the device's [`Screen`] (the module doc).
@@ -2711,18 +2739,23 @@ fn hz_to_mhz(hz: f64) -> u32 {
 impl Screen for WindowScreen {
     /// The window's size in pixels as last drawn into, else the mode it opened for, its width
     /// rounded down to a multiple of 16 and its height to even ([`geometry::offered_mode`]), at
-    /// its host screen's rate.
+    /// its host screen's rate, with the backing scale it was last drawn at (none before its first
+    /// draw).
     fn mode(&self) -> Mode {
         let drawn = *self.shown.drawable.lock();
-        let (width, height) = geometry::offered_mode(drawn.unwrap_or_else(|| {
-            let (w, h) = self.window.offered().unwrap_or((1920, 1080));
-            (u64::from(w), u64::from(h))
-        }));
+        let (width, height) = geometry::offered_mode(drawn.map_or_else(
+            || {
+                let (w, h) = self.window.offered().unwrap_or((1920, 1080));
+                (u64::from(w), u64::from(h))
+            },
+            |d| d.pixels,
+        ));
         let clamp = |v: u64| u32::try_from(v.max(1)).unwrap_or(u32::MAX);
         Mode {
             width: clamp(width),
             height: clamp(height),
             refresh_mhz: self.refresh_mhz,
+            scale_120ths: drawn.map_or(0, |d| scale_in_120ths(d.scale)),
         }
     }
 

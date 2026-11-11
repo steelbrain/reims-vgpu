@@ -294,7 +294,12 @@ fn run(window: &Window) {
         if presenting.needs_presenter() {
             presenting.make(|| sink.presenter(&LayerTarget(layer)));
         }
-        if presenting.draw(work.layout.drawable, work.layout.pixels, cursor.as_ref()) {
+        if presenting.draw(
+            work.layout.drawable,
+            work.layout.scale,
+            work.layout.pixels,
+            cursor.as_ref(),
+        ) {
             retry = Some(work.layout);
         }
     }

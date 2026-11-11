@@ -7942,6 +7942,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     assert_eq!(
         u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32,
         RGFX_FEATURE_SCHEDULED_ASK
+            | RGFX_FEATURE_DISPLAY_SCALE
             | sixteen_bit
             | if carries {
                 RGFX_FEATURE_SURFACE_DEFERRED_CARRY
@@ -7988,6 +7989,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
         assert_eq!(
             u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32,
             RGFX_FEATURE_SCHEDULED_ASK
+                | RGFX_FEATURE_DISPLAY_SCALE
                 | RGFX_FEATURE_PAGES_16K
                 | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
         );
@@ -8020,7 +8022,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     );
     assert_eq!(
         u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32,
-        RGFX_FEATURE_SCHEDULED_ASK
+        RGFX_FEATURE_SCHEDULED_ASK | RGFX_FEATURE_DISPLAY_SCALE
     );
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);
@@ -10116,6 +10118,7 @@ fn on_vulkan_a_read_at_an_odd_width_gives_the_scanout_row_for_row() {
             width: width as u32,
             height: height as u32,
             refresh_mhz: 60_000,
+            scale_120ths: 0,
         };
         let read = device
             .read
@@ -10247,6 +10250,7 @@ fn on_vulkan_a_presented_surface_at_an_odd_width_reads_row_for_row() {
             width: width as u32,
             height: height as u32,
             refresh_mhz: 60_000,
+            scale_120ths: 0,
         };
         let read = device
             .read
@@ -10739,5 +10743,25 @@ fn outputs_are_cached_where_the_kext_makes_caches_and_the_video_lands_in_them() 
             assert_eq!(caps.flags, 0, "{what}");
             assert_eq!(caps.layouts[0].alignment, 256, "{what}");
         }
+    }
+}
+
+/// The display's scale goes to the guest in 120ths of a pixel a point, rounded to nearest, and as
+/// 0 where the window's backing scale is not a positive number
+#[test]
+fn a_backing_scale_is_told_in_120ths() {
+    for (scale, told) in [
+        (1.0, 120),
+        (1.25, 150),
+        (1.5, 180),
+        (2.0, 240),
+        (2.1, 252),
+        (3.0, 360),
+        (0.0, 0),
+        (-2.0, 0),
+        (f64::NAN, 0),
+        (f64::INFINITY, 0),
+    ] {
+        assert_eq!(scale_in_120ths(scale), told, "{scale}");
     }
 }

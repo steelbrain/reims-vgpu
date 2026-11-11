@@ -2,9 +2,11 @@
 //! window of `reims-vgpu`'s glue, or a fixed mode with nothing shown ([`FixedScreen`]).
 //!
 //! **Modes.** The display offers one mode: the screen's size and refresh rate ([`Screen::mode`]),
-//! which for a window is its size in pixels at its host screen's rate. The guest runs at the host
-//! screen's rate. When the screen's mode changes (the window resized), the device tells the guest
-//! with `DISPLAY_CHANGED`, and the guest asks `GET_DISPLAYS` again (`refresh`).
+//! which for a window is its size in pixels at its host screen's rate, with the host screen's
+//! scale, which a guest that took `DISPLAY_SCALE` is told after the display's record
+//! (`RgfxDisplayScale`). The guest runs at the host screen's rate. When the screen's mode changes
+//! (the window resized, or moved to a screen of another scale), the device tells the guest with
+//! `DISPLAY_CHANGED`, and the guest asks `GET_DISPLAYS` again (`refresh`).
 //!
 //! **Scanout.** `SET_SCANOUT` names the pixels the display shows, in the scanout's room of the
 //! region (`RGFX_SCANOUT_SPAN` bytes at `RGFX_ALLOCATIONS_OFFSET`, before the processes' blocks,
@@ -17,7 +19,8 @@
 //! and hands the screen straight-alpha RGBA ([`straight_rgba`]); `MOVE_CURSOR` tells it where the
 //! cursor is and whether it shows.
 
-/// A display mode: pixels each way and a refresh rate.
+/// A display mode: pixels each way and a refresh rate, and the scale of the host screen that
+/// shows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mode {
     /// Pixels a row.
@@ -26,6 +29,9 @@ pub struct Mode {
     pub height: u32,
     /// The refresh rate, in thousandths of a hertz.
     pub refresh_mhz: u32,
+    /// The host screen's pixels a point, in 120ths (`RgfxDisplayScale`'s `scale_120ths`): 120 at
+    /// 1x, 240 at 2x; 0 where no screen shows the display.
+    pub scale_120ths: u32,
 }
 
 impl Mode {
@@ -81,8 +87,8 @@ pub struct CursorImage {
 /// wait for the device.
 pub trait Screen: Send + Sync + 'static {
     /// The one mode the display offers now: for a window, its size in pixels at its host
-    /// screen's refresh rate. Asked at `GET_DISPLAYS`, and at each refresh, where a change is
-    /// told to the guest.
+    /// screen's refresh rate, with that screen's scale. Asked at `GET_DISPLAYS`, and at each
+    /// refresh, where a change is told to the guest.
     fn mode(&self) -> Mode;
 
     /// The guest set the pixels the display shows, or blanked it (`None`). The screen shows
@@ -167,6 +173,7 @@ mod tests {
             width: 1,
             height: 1,
             refresh_mhz,
+            scale_120ths: 120,
         };
         assert_eq!(mode(120_000).period_ns(), 8_333_333);
         assert_eq!(mode(0).period_ns(), 16_666_666);

@@ -216,7 +216,9 @@ pub(crate) fn complete(seqno: u64, status: u32) -> Vec<u8> {
 }
 
 /// `GET_DISPLAYS`' answer: display 0, connected, with the screen's mode as its one mode, which
-/// it prefers. The guest is told that mode from now on (`device`'s refresh).
+/// it prefers, and, where the guest took [`RGFX_FEATURE_DISPLAY_SCALE`], the screen's scale
+/// between the display's record and its mode. The guest is told that mode from now on
+/// (`device`'s refresh).
 fn displays(shared: &Shared, seqno: u64) -> Vec<u8> {
     let mode = shared.screen.mode();
     shared.display.lock().told = Some(mode);
@@ -235,6 +237,13 @@ fn displays(shared: &Shared, seqno: u64) -> Vec<u8> {
         mode_count: 1,
     };
     bytes.extend_from_slice(entry.as_bytes());
+    if shared.driver_took(RGFX_FEATURE_DISPLAY_SCALE) {
+        let scale = RgfxDisplayScale {
+            scale_120ths: mode.scale_120ths,
+            reserved_4: 0,
+        };
+        bytes.extend_from_slice(scale.as_bytes());
+    }
     let mode = RgfxModeEntry {
         width: mode.width,
         height: mode.height,

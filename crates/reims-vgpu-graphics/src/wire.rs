@@ -72,8 +72,9 @@ pub const RGFX_REG_VERSION: u32 = 0x004;
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63, the ones the host offers, which the guest takes
 /// through [`RGFX_REG_DRIVER_FEATURES_HI`]: [`RGFX_FEATURE_SURFACE_DEFERRED_CARRY`],
-/// [`RGFX_FEATURE_SCHEDULED_ASK`] and [`RGFX_FEATURE_PAGES_16K`]. On a host that offers
-/// `PAGES_16K`, `FEATURES_LO` and `_HI` read the guest RAM features only once the guest took it.
+/// [`RGFX_FEATURE_SCHEDULED_ASK`], [`RGFX_FEATURE_PAGES_16K`] and [`RGFX_FEATURE_DISPLAY_SCALE`].
+/// On a host that offers `PAGES_16K`, `FEATURES_LO` and `_HI` read the guest RAM features only
+/// once the guest took it.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
 /// `FEATURES_LO` bit 0, `SURFACE_PAGES`: the host maps an IOSurface's own guest pages for its GPU
 /// to use in place (`SURFACE_PAGES`, `BUFFER_OVER_SURFACE_PAGES`); without it a surface's GPU
@@ -308,6 +309,11 @@ pub const RGFX_FEATURE_SCHEDULED_ASK: u64 = 0x2_0000_0000;
 /// that maps no guest RAM. A host whose page is 4 KiB never offers it: any guest's runs are whole
 /// pages of its own there.
 pub const RGFX_FEATURE_PAGES_16K: u64 = 0x4_0000_0000;
+/// `FEATURES_HI` bit 3, feature bit 35, `DISPLAY_SCALE`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_HI`]: each [`RgfxDisplayEntry`] of a `DISPLAYS` answer is followed
+/// by an [`RgfxDisplayScale`], then by its modes: the scale of the host screen that shows the
+/// display, from which the guest states the display's pixels per inch. Every host offers it.
+pub const RGFX_FEATURE_DISPLAY_SCALE: u64 = 0x8_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -1190,9 +1196,10 @@ pub struct RgfxComplete {
 }
 
 /// `DISPLAYS`: `GET_DISPLAYS`'s answer. `count` [`RgfxDisplayEntry`] records follow it, at
-/// [`RGFX_DISPLAYS_ENTRIES_OFFSET`], each followed by its `mode_count` [`RgfxModeEntry`] records;
-/// the message's `size` is rounded up to a multiple of 8 after the last. The struct is the
-/// message's start: C's `sizeof` pads it past `count`, where the first record already is.
+/// [`RGFX_DISPLAYS_ENTRIES_OFFSET`], each followed by its [`RgfxDisplayScale`] where the guest
+/// took [`RGFX_FEATURE_DISPLAY_SCALE`], then by its `mode_count` [`RgfxModeEntry`] records; the
+/// message's `size` is rounded up to a multiple of 8 after the last. The struct is the message's
+/// start: C's `sizeof` pads it past `count`, where the first record already is.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RgfxDisplays {
@@ -1219,6 +1226,22 @@ pub struct RgfxDisplayEntry {
     pub preferred_mode: u32,
     /// The modes that follow this record.
     pub mode_count: u32,
+}
+
+/// The scale of the host screen that shows a display, after its [`RgfxDisplayEntry`] in a
+/// `DISPLAYS` message where the guest took [`RGFX_FEATURE_DISPLAY_SCALE`]: how many of the
+/// screen's pixels show one of its points, which is what the person at the host sees the
+/// guest's pixels at.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxDisplayScale {
+    /// The screen's pixels a point, in 120ths: 120 on a screen at 1x, 240 at 2x, 252 at 2.1; 0
+    /// where no screen shows the display (a display with no window).
+    pub scale_120ths: u32,
+    /// Zero.
+    pub reserved_4: u32,
 }
 
 /// One mode of a display in a `DISPLAYS` message.
@@ -1288,6 +1311,7 @@ const _: () = {
     assert!(size_of::<RgfxComplete>() == 24);
     assert!(offset_of!(RgfxDisplays, count) + 4 == RGFX_DISPLAYS_ENTRIES_OFFSET as usize);
     assert!(size_of::<RgfxDisplayEntry>() == 16);
+    assert!(size_of::<RgfxDisplayScale>() == 8);
     assert!(size_of::<RgfxModeEntry>() == 12);
     assert!(size_of::<RgfxDisplayChanged>() == 24);
     assert!(size_of::<RgfxVblank>() == 40);

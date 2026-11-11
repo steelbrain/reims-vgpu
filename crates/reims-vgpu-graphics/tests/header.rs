@@ -35,6 +35,7 @@ CHECK(sizeof(RgfxSetVblank) == 24);
 CHECK(sizeof(RgfxComplete) == 24);
 CHECK(offsetof(RgfxDisplays, count) + 4 == RGFX_DISPLAYS_ENTRIES_OFFSET);
 CHECK(sizeof(RgfxDisplayEntry) == 16);
+CHECK(sizeof(RgfxDisplayScale) == 8);
 CHECK(sizeof(RgfxModeEntry) == 12);
 CHECK(sizeof(RgfxDisplayChanged) == 24);
 CHECK(sizeof(RgfxVblank) == 40);

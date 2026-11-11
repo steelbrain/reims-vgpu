@@ -47,12 +47,13 @@ pub enum Drawn {
 /// What a window's render thread presents through: the sink's, over the window's swapchain.
 pub trait Presenter: Send {
     /// Draws the display's current frame into the next image of `drawable` pixels (width,
-    /// height), over `region` of it, clearing the rest, with `cursor` over it where the window
-    /// draws the guest's cursor, and presents it. Blocks only for the next image, up to a few
-    /// frames.
+    /// height), `scale` of them a point of the window's screen, over `region` of it, clearing the
+    /// rest, with `cursor` over it where the window draws the guest's cursor, and presents it.
+    /// Blocks only for the next image, up to a few frames.
     fn draw(
         &mut self,
         drawable: (u64, u64),
+        scale: f64,
         region: PixelRect,
         cursor: Option<&DrawnCursor>,
     ) -> Drawn;
@@ -117,12 +118,13 @@ impl Presenting {
         self.ended |= self.presenter.is_none();
     }
 
-    /// Has the presenter draw the current frame into an image of `drawable` pixels over
-    /// `region`, with `cursor` over it: whether to draw again after [`RETRY`] (no image came in
-    /// time). Nothing without a presenter.
+    /// Has the presenter draw the current frame into an image of `drawable` pixels, `scale` of
+    /// them a point, over `region`, with `cursor` over it: whether to draw again after [`RETRY`]
+    /// (no image came in time). Nothing without a presenter.
     pub(crate) fn draw(
         &mut self,
         drawable: (u64, u64),
+        scale: f64,
         region: PixelRect,
         cursor: Option<&DrawnCursor>,
     ) -> bool {
@@ -132,7 +134,7 @@ impl Presenting {
         let Some(presenter) = self.presenter.as_mut() else {
             return false;
         };
-        let drawn = presenter.draw(drawable, region, cursor);
+        let drawn = presenter.draw(drawable, scale, region, cursor);
         if drawn == Drawn::Ended {
             self.presenter = None;
         }
@@ -177,6 +179,7 @@ mod tests {
         fn draw(
             &mut self,
             _drawable: (u64, u64),
+            _scale: f64,
             _region: PixelRect,
             _cursor: Option<&DrawnCursor>,
         ) -> Drawn {
@@ -222,16 +225,16 @@ mod tests {
         assert!(p.needs_presenter());
         p.make(|| scripted(&[Drawn::Retry, Drawn::Presented, Drawn::Ended]));
         assert!(!p.needs_presenter());
-        assert!(p.draw((4, 4), REGION, None), "no image: a retry");
-        assert!(!p.draw((4, 4), REGION, None));
-        assert!(!p.draw((4, 4), REGION, None));
+        assert!(p.draw((4, 4), 1.0, REGION, None), "no image: a retry");
+        assert!(!p.draw((4, 4), 1.0, REGION, None));
+        assert!(!p.draw((4, 4), 1.0, REGION, None));
         assert!(p.needs_presenter(), "an ended presenter is made again");
         p.make(|| None);
         assert!(
             !p.needs_presenter(),
             "no presenter: the window stays as it is"
         );
-        assert!(!p.draw((4, 4), REGION, None));
+        assert!(!p.draw((4, 4), 1.0, REGION, None));
     }
 
     /// Presenters that end too many times in a row leave the window as it is
@@ -241,7 +244,7 @@ mod tests {
         for _ in 0..=RENEWALS {
             assert!(p.needs_presenter());
             p.make(|| scripted(&[Drawn::Ended]));
-            p.draw((4, 4), REGION, None);
+            p.draw((4, 4), 1.0, REGION, None);
         }
         assert!(!p.needs_presenter());
     }

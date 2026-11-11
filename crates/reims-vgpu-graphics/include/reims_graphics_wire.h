@@ -1043,8 +1043,9 @@
 
 // `FEATURES_HI`, RO: feature bits 32 to 63, the ones the host offers, which the guest takes
 // through [`RGFX_REG_DRIVER_FEATURES_HI`]: [`RGFX_FEATURE_SURFACE_DEFERRED_CARRY`],
-// [`RGFX_FEATURE_SCHEDULED_ASK`] and [`RGFX_FEATURE_PAGES_16K`]. On a host that offers
-// `PAGES_16K`, `FEATURES_LO` and `_HI` read the guest RAM features only once the guest took it.
+// [`RGFX_FEATURE_SCHEDULED_ASK`], [`RGFX_FEATURE_PAGES_16K`] and [`RGFX_FEATURE_DISPLAY_SCALE`].
+// On a host that offers `PAGES_16K`, `FEATURES_LO` and `_HI` read the guest RAM features only
+// once the guest took it.
 #define RGFX_REG_FEATURES_HI 12
 
 // `FEATURES_LO` bit 0, `SURFACE_PAGES`: the host maps an IOSurface's own guest pages for its GPU
@@ -1311,6 +1312,12 @@
 // that maps no guest RAM. A host whose page is 4 KiB never offers it: any guest's runs are whole
 // pages of its own there.
 #define RGFX_FEATURE_PAGES_16K 17179869184
+
+// `FEATURES_HI` bit 3, feature bit 35, `DISPLAY_SCALE`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_HI`]: each [`RgfxDisplayEntry`] of a `DISPLAYS` answer is followed
+// by an [`RgfxDisplayScale`], then by its modes: the scale of the host screen that shows the
+// display, from which the guest states the display's pixels per inch. Every host offers it.
+#define RGFX_FEATURE_DISPLAY_SCALE 34359738368
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -4027,10 +4034,23 @@ typedef struct {
   uint32_t mode_count;
 } RgfxDisplayEntry;
 
+// The scale of the host screen that shows a display, after its [`RgfxDisplayEntry`] in a
+// `DISPLAYS` message where the guest took [`RGFX_FEATURE_DISPLAY_SCALE`]: how many of the
+// screen's pixels show one of its points, which is what the person at the host sees the
+// guest's pixels at.
+typedef struct {
+  // The screen's pixels a point, in 120ths: 120 on a screen at 1x, 240 at 2x, 252 at 2.1; 0
+  // where no screen shows the display (a display with no window).
+  uint32_t scale_120ths;
+  // Zero.
+  uint32_t reserved_4;
+} RgfxDisplayScale;
+
 // `DISPLAYS`: `GET_DISPLAYS`'s answer. `count` [`RgfxDisplayEntry`] records follow it, at
-// [`RGFX_DISPLAYS_ENTRIES_OFFSET`], each followed by its `mode_count` [`RgfxModeEntry`] records;
-// the message's `size` is rounded up to a multiple of 8 after the last. The struct is the
-// message's start: C's `sizeof` pads it past `count`, where the first record already is.
+// [`RGFX_DISPLAYS_ENTRIES_OFFSET`], each followed by its [`RgfxDisplayScale`] where the guest
+// took [`RGFX_FEATURE_DISPLAY_SCALE`], then by its `mode_count` [`RgfxModeEntry`] records; the
+// message's `size` is rounded up to a multiple of 8 after the last. The struct is the message's
+// start: C's `sizeof` pads it past `count`, where the first record already is.
 typedef struct {
   // [`RGFX_EVT_DISPLAYS`], with `GET_DISPLAYS`' `seqno`.
   RgfxMsgHeader header;

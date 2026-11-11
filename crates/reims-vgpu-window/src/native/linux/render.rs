@@ -235,7 +235,12 @@ fn run(window: &Window) {
             presenting.make(|| sink.presenter(&work.target));
         }
         let cursor = window.drawn_cursor();
-        if presenting.draw(work.layout.drawable, work.layout.pixels, cursor.as_ref()) {
+        if presenting.draw(
+            work.layout.drawable,
+            work.layout.scale,
+            work.layout.pixels,
+            cursor.as_ref(),
+        ) {
             retry = Some(work);
         }
     }

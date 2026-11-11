@@ -62,6 +62,9 @@ pub struct Layout {
     /// The image, in the drawable's pixels: inside the drawable, and inside the insets unless
     /// they leave no room.
     pub pixels: PixelRect,
+    /// The drawable's pixels a point: the view's backing scale, 1 where it is not a positive
+    /// number.
+    pub scale: f64,
 }
 
 /// `value` where it is finite and not below 0, else 0.
@@ -141,6 +144,7 @@ pub fn layout(bounds: (f64, f64), scale: f64, insets: Insets, guest: Option<(u16
             height: as_f64(pixels.height) / scale,
         },
         pixels,
+        scale,
     }
 }
 
@@ -461,6 +465,19 @@ mod tests {
         assert_eq!(l.drawable, (1, 1));
         let l = layout((f64::NAN, f64::INFINITY), f64::NAN, NO_INSETS, None);
         assert_eq!(l.drawable, (1, 1));
+    }
+
+    /// The layout carries the scale of the screen the window is on, which the reims-graphics
+    /// display tells its guest, so the guest's density follows the screen at any window size
+    #[test]
+    fn the_layout_carries_the_screen_s_scale() {
+        for scale in [1.0, 1.25, 2.0, 2.1] {
+            for bounds in [(800.0, 600.0), (1371.0, 800.0), (1829.0, 1000.0)] {
+                assert_eq!(layout(bounds, scale, NO_INSETS, None).scale, scale);
+            }
+        }
+        assert_eq!(layout((800.0, 600.0), f64::NAN, NO_INSETS, None).scale, 1.0);
+        assert_eq!(layout((800.0, 600.0), 0.0, NO_INSETS, None).scale, 1.0);
     }
 
     /// The mode offered for a drawable is its width rounded down to a multiple of 16 pixels and
