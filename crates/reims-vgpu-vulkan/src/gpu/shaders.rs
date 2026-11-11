@@ -25,8 +25,27 @@ pub const METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders.me
 /// The selector core names the shader library's creation by.
 const SELECTOR: &str = "newLibraryWithSource:options:error:";
 
-/// The libraries loaded so far, each with its device's registry ID.
+/// The libraries loaded so far, each with its device's registry ID, kept until the platform lets
+/// go of its devices ([`crate::let_go`]).
 static LOADED: Mutex<Vec<(u64, VulkanLibrary)>> = Mutex::new(Vec::new());
+
+/// How many of the libraries loaded so far are of `device` (the device object itself, by its
+/// handle's identity), and whether a handle beyond [`LOADED`]'s holds any of those: what the
+/// platform's let-go of its devices counts as its own ([`crate::let_go`]).
+pub(crate) fn kept_of(device: &VulkanDevice) -> (usize, bool) {
+    use crate::core::platform::Handle as _;
+    let loaded = LOADED.lock();
+    let of = (loaded.iter()).filter(|(_, library)| library.device.id() == device.id());
+    of.fold((0, false), |(n, held), (_, library)| {
+        (n + 1, held || library.strong_count() > 1)
+    })
+}
+
+/// Takes the libraries loaded so far, for the platform's let-go of its devices
+/// ([`crate::let_go`]): a device of the same registry ID made after it loads its own.
+pub(crate) fn take_loaded() -> Vec<(u64, VulkanLibrary)> {
+    std::mem::take(&mut *LOADED.lock())
+}
 
 /// The shader library of `device` (a new reference), loaded on the first call for its registry
 /// ID. `Err` is the runtime's refusal of the metallib's contents (`Compile`), which stands where

@@ -74,7 +74,7 @@ mod gaps;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 
 use crate::core::platform::types::SizeAndAlign;
 use crate::core::sync::{Mutex, MutexGuard};
@@ -1184,21 +1184,30 @@ impl MetalSpace {
 static PROCESS: Mutex<MetalSpace> = Mutex::new(MetalSpace::new());
 
 /// The device whose sampler ID pool Metal's sampler mempool follows ([`Samplers`]): the
-/// process's first, the one Metal's device is.
-static SAMPLER_IDS: OnceLock<rt::Device> = OnceLock::new();
+/// process's first, the one Metal's device is, until the platform lets go of its devices
+/// ([`crate::let_go`]). A leaf lock, taken under [`PROCESS`]'s.
+static SAMPLER_IDS: Mutex<Option<rt::Device>> = Mutex::new(None);
 
 /// `device` made: the process's sampler mempool follows its sampler ID pool, if it is the
-/// process's first ([`Samplers`]). Another runtime device of the process (a test's, with a shader
-/// cache of its own) has a pool of its own, which the space does not follow.
+/// process's first, or the first since the platform let go of its devices ([`Samplers`]). Another
+/// runtime device of the process (a test's, with a shader cache of its own) has a pool of its
+/// own, which the space does not follow.
 pub fn count_sampler_ids(device: &rt::Device) {
-    let _ = SAMPLER_IDS.set(device.clone());
+    SAMPLER_IDS.lock().get_or_insert_with(|| device.clone());
+}
+
+/// Takes the device whose sampler ID pool the space follows, for the platform's let-go of its
+/// devices ([`crate::let_go`]): the mempool keeps what it grew to, and follows the next device
+/// adopted.
+pub(crate) fn take_sampler_ids() -> Option<rt::Device> {
+    SAMPLER_IDS.lock().take()
 }
 
 /// The process's space, locked, after its sampler mempool grew to the process's device's
 /// sampler ID pool ([`Samplers`]).
 pub fn process() -> MutexGuard<'static, MetalSpace> {
     let mut space = PROCESS.lock();
-    if let Some(device) = SAMPLER_IDS.get() {
+    if let Some(device) = SAMPLER_IDS.lock().as_ref() {
         space.sampler_pool(device.sampler_id_pool_size());
     }
     space

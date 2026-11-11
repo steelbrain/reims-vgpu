@@ -35,6 +35,10 @@ use crate::core::platform::os::vm::{HostAddr, HostVm as _};
 /// (`os/linux/import.rs`).
 #[cfg(target_os = "linux")]
 pub(crate) use host_os::learn_view_imports;
+/// Takes the devices handed the guest's RAM, on Linux (`os/linux/host_ram.rs`), for the
+/// platform's let-go of its devices ([`crate::let_go`]).
+#[cfg(target_os = "linux")]
+pub(crate) use host_os::take_ram_devices;
 /// Whether a view of several runs of pages made now is mapped through dma-bufs, on Linux
 /// (`os/linux/import.rs`).
 #[cfg(all(test, target_os = "linux"))]

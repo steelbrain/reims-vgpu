@@ -481,9 +481,15 @@ impl RateMapObject {
 /// The metallib `build.rs` compiled `no_draw.metal` into: [`no_draw`]'s vertex function.
 const NO_DRAW_LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/no_draw.metallib"));
 
-/// The no-draw pipelines made so far, each with its device's registry ID. Each stays for the life
-/// of the process.
+/// The no-draw pipelines made so far, each with its device's registry ID. Each stays until the
+/// platform lets go of its devices ([`crate::let_go`]).
 static NO_DRAW: Mutex<Vec<(u64, rt::RenderPipelineState)>> = Mutex::new(Vec::new());
+
+/// Takes the no-draw pipelines made so far, for the platform's let-go of its devices
+/// ([`crate::let_go`]): a device of the same registry ID made after it makes its own.
+pub(crate) fn take_no_draws() -> Vec<(u64, rt::RenderPipelineState)> {
+    std::mem::take(&mut *NO_DRAW.lock())
+}
 
 /// The pipeline a pass over a mutable map ends with a draw of no vertices through, as the Metal
 /// platform's does (its `gpu::rate_map`), made on the first call for `device`'s registry ID. The

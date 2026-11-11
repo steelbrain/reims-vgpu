@@ -194,6 +194,18 @@ pub struct DeviceObject {
     caps: OnceLock<Arc<DeviceCaps>>,
     /// Its keeping awake while the guest draws ([`crate::awake`]).
     pub(crate) awake: crate::awake::Awake,
+    /// Its other threads of the library's that hold its runtime device ([`crate::let_go`]).
+    pub(crate) threads: crate::let_go::DeviceThreads,
+}
+
+impl Drop for DeviceObject {
+    /// Ends the device's threads of the library's and waits for them, before its runtime device's
+    /// handle goes: none holds that device past it, so where this holds its last handle, the
+    /// runtime's teardown runs here ([`crate::let_go`]).
+    fn drop(&mut self) {
+        self.awake.stop();
+        self.threads.end();
+    }
 }
 
 /// How many uncompleted command buffers a queue of `newCommandQueue` holds at most, as Metal's
@@ -269,7 +281,9 @@ fn compile_error(
 /// last handle dropped would tear down, and one opened again would number from a fresh pool where
 /// Metal's and [`crate::gpu::icb`]'s go on. A device the runtime lost stays lost, kept, where one
 /// made again would not be; a call the runtime refuses as lost dies at the send anyway
-/// ([`crate::answer`]).
+/// ([`crate::answer`]). The platform's let-go of its devices ([`crate::let_go`]), once nothing
+/// else holds one (the C API's release of the process's last graphics device), takes them all:
+/// a device adopted after it is a new runtime device.
 static DEVICES: Mutex<Vec<(u64, VulkanDevice)>> = Mutex::new(Vec::new());
 
 /// The buffers over each surface at its range's address ([`metal_space::surface_buffer`]), by
@@ -290,6 +304,38 @@ static SURFACE_BUFFER_MAKES: Mutex<()> = Mutex::new(());
 pub(crate) fn first_adopted() -> Option<rt::Device> {
     let devices = DEVICES.lock();
     devices.first().map(|(_, device)| device.raw.clone())
+}
+
+/// Takes every device adopted ([`DEVICES`]) and the libraries of the platform's own shaders loaded
+/// of them (`gpu::shaders`), for the platform's let-go of its devices ([`crate::let_go`]), where no
+/// handle beyond those holds one: `Err` naming each device a handle beyond them holds, and how
+/// many, nothing taken. Under [`DEVICES`]' lock, so no handle is made from it meanwhile.
+#[allow(clippy::type_complexity)]
+pub(crate) fn take_if_only_kept()
+-> Result<(Vec<(u64, VulkanDevice)>, Vec<(u64, VulkanLibrary)>), String> {
+    let mut devices = DEVICES.lock();
+    let held: Vec<String> = (devices.iter())
+        .filter_map(|(id, device)| {
+            let (libraries, library_held) = crate::gpu::shaders::kept_of(device);
+            let beyond = device.strong_count().saturating_sub(1 + libraries);
+            (beyond > 0 || library_held).then(|| {
+                let library = if library_held {
+                    ", and a library of the platform's shaders of it"
+                } else {
+                    ""
+                };
+                format!(
+                    "{} (registry ID {id:#x}) by {beyond} handles beyond the platform's{library}",
+                    device.raw.properties().name
+                )
+            })
+        })
+        .collect();
+    if !held.is_empty() {
+        return Err(held.join("; "));
+    }
+    let libraries = crate::gpu::shaders::take_loaded();
+    Ok((std::mem::take(&mut *devices), libraries))
 }
 
 /// The handle of `raw`, a device the runtime made: the object of the same device made before, or
@@ -314,17 +360,20 @@ pub fn adopt(raw: rt::Device) -> VulkanDevice {
     crate::answer::native::device_made(raw.properties());
     #[cfg(target_os = "linux")]
     crate::os::learn_view_imports(&raw);
+    let mut threads = crate::let_go::DeviceThreads::default();
     #[cfg(not(test))]
     if let Some(home) = std::env::var_os("HOME") {
-        crate::records::warm(&raw, crate::records::path_in(home.as_ref()));
+        let path = crate::records::path_in(home.as_ref());
+        threads.keep(crate::records::warm(&raw, path, &threads.stop));
     }
-    crate::work_log::start(&raw);
+    threads.keep(crate::work_log::start(&raw, &threads.stop));
     start_in_place_checks(&raw);
     let made = Obj::new(DeviceObject {
         awake: crate::awake::Awake::start(&raw),
         raw,
         registry_id: id,
         caps: OnceLock::new(),
+        threads,
     });
     devices.push((id, made.clone_ref()));
     made
@@ -2409,7 +2458,9 @@ pub(crate) mod tests {
     /// A device the platform adopts starts the runtime's check of textures over host pages, with
     /// no texture made ([`start_in_place_checks`]): a device of a shader cache of its own, empty,
     /// so no record holds the verdicts, adopted as the first of its process (nextest's, one a
-    /// test), ends the check.
+    /// test), ends the check. The platform then lets go of it before the process exits: kept to
+    /// the exit right after its check ended, it ended the exit with `SIGSEGV` in NVIDIA's driver
+    /// in 6 of 80 runs on an RTX 3090 ([`crate::let_go`]).
     #[test]
     fn an_adopted_device_starts_its_in_place_check() {
         let (options, _cache) = options_with_own_cache();
@@ -2432,6 +2483,61 @@ pub(crate) mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        drop(device);
+        let bound = std::time::Duration::from_secs(30);
+        assert_eq!(crate::let_go::let_go_of_devices(bound), Ok(1));
+    }
+
+    /// The platform lets go of its devices once nothing beyond its own keeps holds one
+    /// ([`crate::let_go`]). While a buffer of the device lives, the let-go waits out its bound,
+    /// names the device, and lets go of nothing. With the buffer gone it lets go of the device,
+    /// the library of its shaders and the no-draw pipeline the platform made of it, and the device
+    /// whose answers describe formats, and ends the device's threads: the device object goes. The
+    /// next adopt of the same GPU makes a new device, and that one is let go of in turn.
+    #[test]
+    fn the_platform_lets_go_of_its_devices_once_nothing_else_holds_one() {
+        use crate::core::platform::values::OptionSet;
+        use std::time::Duration;
+
+        let (options, _cache) = options_with_own_cache();
+        let raw = rt::Device::system_default_with(&options).unwrap();
+        let id = registry_id(&raw);
+        assert!(
+            kept(id).is_none(),
+            "the test's process adopted a device before"
+        );
+        let device = adopt(raw);
+        let object = device.downgrade();
+        drop(crate::gpu::shaders::library(&device).unwrap());
+        drop(crate::gpu::rate_map::no_draw("a test's no-draw", &device));
+        crate::gpu::format_info::described("a test's format", 70);
+        let buffer = (device.new_buffer(BufferDesc {
+            length: 0x1000,
+            options: vec![OptionSet::StorageMode(0)],
+            pinned_gpu_address: None,
+            contents: None,
+            no_copy: false,
+            deallocator: None,
+        }))
+        .unwrap()
+        .unwrap();
+        drop(device);
+        let held = crate::let_go::let_go_of_devices(Duration::from_millis(50)).unwrap_err();
+        assert!(held.contains(&format!("registry ID {id:#x}")), "{held}");
+        assert!(kept(id).is_some(), "nothing let go");
+        drop(buffer);
+        let bound = Duration::from_secs(30);
+        assert_eq!(crate::let_go::let_go_of_devices(bound), Ok(1));
+        assert!(object.upgrade().is_none(), "the device object went");
+        assert!(kept(id).is_none());
+        assert!(crate::gpu::shaders::take_loaded().is_empty());
+        assert!(crate::gpu::rate_map::take_no_draws().is_empty());
+        assert!(crate::platform::take_answering_device().is_none());
+        assert!(crate::gpu::metal_space::take_sampler_ids().is_none());
+        let again = adopt(rt::Device::system_default_with(&options).unwrap());
+        assert!(kept(id).is_some());
+        drop(again);
+        assert_eq!(crate::let_go::let_go_of_devices(bound), Ok(1));
     }
 
     /// Descriptors and a function's argument buffer are laid out as Metal's own encoder lays them
@@ -2537,6 +2643,7 @@ pub(crate) mod tests {
             raw,
             caps: OnceLock::new(),
             awake: Default::default(),
+            threads: Default::default(),
         })
     }
 

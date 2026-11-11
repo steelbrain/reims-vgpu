@@ -117,6 +117,12 @@ pub(crate) fn lease(ranges: &[(u64, u64)]) -> Arc<LeasedRam> {
     ram
 }
 
+/// Takes the devices that take the RAM, for the platform's let-go of its devices
+/// ([`crate::let_go`]): a device adopted after it is handed the RAM as it learns its imports.
+pub(crate) fn take_devices() -> Vec<rt::Device> {
+    std::mem::take(&mut REGISTRY.lock().devices)
+}
+
 /// Hands `device`, whose imports of views were learned (`super::import`'s `learn_view_imports`),
 /// every lease's RAM alive now, and every one made after.
 pub(crate) fn hand_ram_to(device: &rt::Device) {

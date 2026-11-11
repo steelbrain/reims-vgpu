@@ -64,13 +64,17 @@
 //!   calls.
 //! - **Devices the process adopts** ([`crate::gpu::device::adopt`]) have the thread. A device
 //!   made for a test alone has [`Awake::default`], which counts and keeps nothing.
+//! - **The device's end** ([`Awake::stop`], as the platform lets go of its devices,
+//!   [`crate::let_go`]) stops the thread at its next look or at once where it waits, its toucher
+//!   destroyed in a step of its own, and waits for it: the thread holds a handle of the runtime
+//!   device, which then goes before the device's own.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::Thread;
 use std::time::Duration;
 
-use crate::core::platform::os::clock::{Clock as _, Deadline, MonoTime};
+use crate::core::platform::os::clock::{Clock as _, MonoTime};
 use crate::generation::Generation;
 use ash::vk;
 use metal2vulkan_runtime as rt;
@@ -98,7 +102,12 @@ fn stay(toucher: Option<Toucher>) -> ! {
 
 /// A device's keeping awake (the module docs): what its commits count, and its thread.
 #[derive(Debug, Default)]
-pub struct Awake(Option<Arc<Shared>>);
+pub struct Awake {
+    /// What the commits and the thread share; `None` where the thread did not start.
+    shared: Option<Arc<Shared>>,
+    /// The thread, until [`Awake::stop`] joined it.
+    thread: Option<std::thread::JoinHandle<()>>,
+}
 
 /// What the device's commits and its thread share.
 #[derive(Debug, Default)]
@@ -109,6 +118,8 @@ struct Shared {
     parked: AtomicBool,
     /// The thread, as it set itself.
     thread: OnceLock<Thread>,
+    /// Whether the thread is to end ([`Awake::stop`]).
+    stop: AtomicBool,
 }
 
 impl Awake {
@@ -126,17 +137,37 @@ impl Awake {
             .name("reims-vgpu.gpu-awake".into())
             .spawn(move || keep(&device, &kept, look));
         match spawned {
-            Ok(_) => Awake(Some(shared)),
+            Ok(thread) => Awake {
+                shared: Some(shared),
+                thread: Some(thread),
+            },
             Err(e) => {
                 log::warn!(target: TARGET, "the GPU is not kept awake: no thread ({e})");
-                Awake(None)
+                Awake::default()
             }
+        }
+    }
+
+    /// Ends the thread and waits for it (the module docs): once this returns, it holds nothing of
+    /// the device. Once the process's exit closed the gate, the thread may be parked for good, and
+    /// nothing waits for it.
+    pub(crate) fn stop(&mut self) {
+        let Some(shared) = &self.shared else {
+            return;
+        };
+        shared.stop.store(true, Ordering::SeqCst);
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        thread.thread().unpark();
+        if !crate::exit_gate::closed() {
+            let _ = thread.join();
         }
     }
 
     /// The device committed a command buffer: counted, and the thread woken where it is parked.
     pub(crate) fn touch(&self) {
-        let Some(shared) = &self.0 else {
+        let Some(shared) = &self.shared else {
             return;
         };
         // Sequentially consistent with the thread's store of `parked` and its read of the count
@@ -213,7 +244,8 @@ impl Keep {
     }
 }
 
-/// The thread: looks every `look` (the module docs) until a submission fails.
+/// The thread: looks every `look` (the module docs) until a submission fails or the device ends
+/// ([`Awake::stop`]).
 fn keep(device: &rt::Device, shared: &Shared, look: Duration) {
     let _ = shared.thread.set(std::thread::current());
     log::debug!(
@@ -225,6 +257,14 @@ fn keep(device: &rt::Device, shared: &Shared, look: Duration) {
     let mut toucher: Option<Toucher> = None;
     let mut touches = 0_u32;
     loop {
+        if shared.stop.load(Ordering::SeqCst) {
+            let Some(held) = crate::exit_gate::step() else {
+                stay(toucher);
+            };
+            drop(toucher.take());
+            drop(held);
+            return;
+        }
         let now = clock.now_mono();
         match keep.look(shared.work.load(Ordering::SeqCst), now) {
             Look::Busy => {}
@@ -250,14 +290,24 @@ fn keep(device: &rt::Device, shared: &Shared, look: Duration) {
             }
             Look::Rest => {
                 shared.parked.store(true, Ordering::SeqCst);
-                while shared.work.load(Ordering::SeqCst) == keep.seen() {
+                while shared.work.load(Ordering::SeqCst) == keep.seen()
+                    && !shared.stop.load(Ordering::SeqCst)
+                {
                     std::thread::park();
                 }
                 shared.parked.store(false, Ordering::SeqCst);
                 continue;
             }
         }
-        clock.sleep_until(Deadline::Mono(now.saturating_add(look)));
+        // Until the next look, or the device's end, which unparks the thread.
+        let next = now.saturating_add(look);
+        while !shared.stop.load(Ordering::SeqCst) {
+            let left = next.saturating_duration_since(clock.now_mono());
+            if left.is_zero() {
+                break;
+            }
+            std::thread::park_timeout(left);
+        }
     }
 }
 
@@ -604,8 +654,41 @@ mod tests {
     /// A device's `Awake` of a test counts nothing and wakes nothing.
     #[test]
     fn a_default_awake_keeps_nothing() {
-        let awake = Awake::default();
+        let mut awake = Awake::default();
         awake.touch();
-        assert!(awake.0.is_none());
+        assert!(awake.shared.is_none());
+        awake.stop();
+    }
+
+    /// The device's end stops its thread and waits for it, at once wherever the thread is: parked
+    /// for the first commit, waiting an hour for its next look after one, or touching every
+    /// millisecond with a toucher made, which it destroys as it ends (the module docs).
+    #[test]
+    fn a_stop_ends_the_thread_and_waits_for_it() {
+        let device = crate::gpu::device::tests::dev();
+        let hour = Duration::from_secs(3600);
+        for (look, touched) in [
+            (hour, false),
+            (hour, true),
+            (Duration::from_millis(1), true),
+        ] {
+            let mut awake = Awake::looking(&device.raw, look);
+            if touched {
+                awake.touch();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let (done, stopped) = std::sync::mpsc::channel();
+            let stopping = std::thread::Builder::new().spawn(move || {
+                awake.stop();
+                done.send(awake.thread.is_none()).unwrap();
+            });
+            stopping.unwrap();
+            let ended = stopped.recv_timeout(Duration::from_secs(10));
+            assert_eq!(
+                ended,
+                Ok(true),
+                "looking every {look:?}, touched: {touched}"
+            );
+        }
     }
 }

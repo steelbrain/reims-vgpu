@@ -1111,8 +1111,15 @@ struct Gpu {
     checked: bool,
 }
 
-/// The step kernel's pipeline of each device, by registry ID: made once.
+/// The step kernel's pipeline of each device, by registry ID: made once, and kept until the
+/// platform lets go of its devices ([`crate::let_go`]).
 static PIPELINES: Mutex<Vec<(u64, rt::ComputePipelineState)>> = Mutex::new(Vec::new());
+
+/// Takes the step kernel's pipelines made so far, for the platform's let-go of its devices
+/// ([`crate::let_go`]): a device of the same registry ID made after it makes its own.
+pub(crate) fn take_pipelines() -> Vec<(u64, rt::ComputePipelineState)> {
+    std::mem::take(&mut *PIPELINES.lock())
+}
 
 /// The step kernel's pipeline of `device`; for `sel`, whose step it is first made for.
 fn pipeline(device: &VulkanDevice, sel: &'static str) -> rt::ComputePipelineState {

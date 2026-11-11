@@ -26,9 +26,10 @@
 //!   RTX 5080, the effort's tip 14656f4d6, lane-gate's bench boots, 2026-11-04).
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 use std::time::Duration;
 
-use crate::core::platform::os::clock::{Clock as _, Deadline, MonoTime};
+use crate::core::platform::os::clock::{Clock as _, MonoTime};
 use metal2vulkan_runtime as rt;
 
 /// The log target of the lines, at debug, which the filter names to start them ([`start`]).
@@ -41,15 +42,19 @@ pub(crate) const PERIOD: Duration = Duration::from_secs(1);
 type Flat = Vec<(String, u64)>;
 
 /// Starts the thread that logs `device`'s counts (the module docs), where the filter names the
-/// target at debug and its lines are written.
-pub(crate) fn start(device: &rt::Device) {
+/// target at debug and its lines are written; it ends at `stop`, as the device goes
+/// ([`crate::let_go`]).
+pub(crate) fn start(
+    device: &rt::Device,
+    stop: &Arc<crate::let_go::Stop>,
+) -> Option<std::thread::JoinHandle<()>> {
     if !(crate::core::logging::names(TARGET, log::Level::Debug)
         && log::log_enabled!(target: TARGET, log::Level::Debug))
     {
-        return;
+        return None;
     }
-    let device = device.clone();
-    let _ = std::thread::Builder::new()
+    let (device, stop) = (device.clone(), Arc::clone(stop));
+    let spawned = std::thread::Builder::new()
         .name("reims-vgpu-work".into())
         .spawn(move || {
             let clock = crate::os::OsClock::new();
@@ -57,7 +62,9 @@ pub(crate) fn start(device: &rt::Device) {
             let mut tick = clock.now_mono();
             loop {
                 tick = tick.saturating_add(PERIOD);
-                clock.sleep_until(Deadline::Mono(tick));
+                if stop.wait_until(tick) {
+                    return;
+                }
                 if !log::log_enabled!(target: TARGET, log::Level::Debug) {
                     continue;
                 }
@@ -67,6 +74,7 @@ pub(crate) fn start(device: &rt::Device) {
                 }
             }
         });
+    spawned.ok()
 }
 
 /// The line before's counts and when they were read.

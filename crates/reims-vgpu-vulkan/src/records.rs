@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+use crate::core::platform::os::clock::Clock as _;
 use crate::core::sync::Mutex;
 use metal2vulkan_runtime as rt;
 
@@ -207,14 +208,18 @@ pub(crate) fn read(path: &Path) -> Vec<rt::PipelineRecord> {
 
 /// Hands `device` the records of the file at `path`, from a thread of its own that reads the
 /// file, so the caller waits for nothing; the runtime's pass then runs on the device's own thread
-/// (the module docs).
-pub(crate) fn warm(device: &rt::Device, path: PathBuf) {
-    let device = device.clone();
-    let _ = std::thread::Builder::new()
+/// (the module docs). The thread ends at `stop`, as the device goes ([`crate::let_go`]).
+pub(crate) fn warm(
+    device: &rt::Device,
+    path: PathBuf,
+    stop: &Arc<crate::let_go::Stop>,
+) -> Option<std::thread::JoinHandle<()>> {
+    let (device, stop) = (device.clone(), Arc::clone(stop));
+    let spawned = std::thread::Builder::new()
         .name("reims-vgpu-warm".into())
         .spawn(move || {
             let records = read(&path);
-            if records.is_empty() {
+            if records.is_empty() || stop.stopped() {
                 return;
             }
             log::info!(
@@ -226,8 +231,9 @@ pub(crate) fn warm(device: &rt::Device, path: PathBuf) {
             let handed = records.len() as u64;
             device.warm(records, WARM_BUDGET);
             // The pass runs on the runtime's thread and says nothing when it ends: its counts
-            // reach the records handed then. The device lives as long as the process
-            // (`gpu::device::adopt` keeps it), so holding it here holds nothing longer.
+            // reach the records handed then. The device's end stops the polls, which hold its
+            // runtime device.
+            let clock = crate::os::OsClock::new();
             let mut polls = 0u64;
             loop {
                 let statistics = device.warm_statistics();
@@ -240,9 +246,12 @@ pub(crate) fn warm(device: &rt::Device, path: PathBuf) {
                     return;
                 }
                 polls += 1;
-                std::thread::sleep(WARM_POLL);
+                if stop.wait_until(clock.now_mono().saturating_add(WARM_POLL)) {
+                    return;
+                }
             }
         });
+    spawned.ok()
 }
 
 /// What a warm pass of `handed` records made of them, once its counts add up to them (each record
@@ -408,7 +417,8 @@ mod tests {
         }
         assert_eq!(read(&path).len(), 1);
         let device = rt::Device::system_default_with(&options()).unwrap();
-        warm(&device, path);
+        let stop = Arc::new(crate::let_go::Stop::default());
+        let _polls = warm(&device, path, &stop);
         // The pass ends within 120 s.
         let mut s = device.warm_statistics();
         for _ in 0..12000 {

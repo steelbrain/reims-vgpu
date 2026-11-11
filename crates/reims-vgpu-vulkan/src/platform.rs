@@ -66,6 +66,11 @@ impl<T: Send + Sync + 'static> Obj<T> {
     pub fn upgrade(weak: &Weak<T>) -> Option<Obj<T>> {
         weak.upgrade().map(|arc| Obj(ManuallyDrop::new(arc)))
     }
+
+    /// How many references to the object live, this one among them.
+    pub(crate) fn strong_count(&self) -> usize {
+        Arc::strong_count(&self.0)
+    }
 }
 
 impl<T: Send + Sync + 'static> Drop for Obj<T> {
@@ -236,11 +241,11 @@ fn opened(
 /// texture level's layout ([`crate::gpu::format_info`]). The first device the platform adopted;
 /// asked before any is, the process's default device ([`default_device`]), made for it, which
 /// dies as [`made_devices`] does where the runtime makes none, at `sel`, the call that asks. Kept
-/// once found, as the platform keeps every device it adopts.
-pub(crate) fn answering_device(sel: &'static str) -> &'static rt::Device {
-    static DEVICE: OnceLock<rt::Device> = OnceLock::new();
-    if let Some(kept) = DEVICE.get() {
-        return kept;
+/// once found, as the platform keeps every device it adopts, until the platform lets go of its
+/// devices ([`crate::let_go`]).
+pub(crate) fn answering_device(sel: &'static str) -> rt::Device {
+    if let Some(kept) = ANSWERING.lock().as_ref() {
+        return kept.clone();
     }
     let device = device::first_adopted().unwrap_or_else(|| {
         let made = made_devices(sel, || default_device().map(|d| vec![d]));
@@ -248,7 +253,17 @@ pub(crate) fn answering_device(sel: &'static str) -> &'static rt::Device {
             .next()
             .unwrap_or_else(|| refused(sel, &rt::Error::NoDevice))
     });
-    DEVICE.get_or_init(|| device)
+    ANSWERING.lock().get_or_insert(device).clone()
+}
+
+/// The device [`answering_device`] answers with, once found.
+static ANSWERING: crate::core::sync::Mutex<Option<rt::Device>> =
+    crate::core::sync::Mutex::new(None);
+
+/// Takes the device [`answering_device`] kept, for the platform's let-go of its devices
+/// ([`crate::let_go`]): the next answer finds one again.
+pub(crate) fn take_answering_device() -> Option<rt::Device> {
+    ANSWERING.lock().take()
 }
 
 /// The options every device is made with: the runtime's defaults, whose loader search finds

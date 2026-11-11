@@ -35,6 +35,7 @@ pub(crate) mod generation;
 pub mod gpu;
 #[cfg(target_os = "linux")]
 pub mod host_gpus;
+pub mod let_go;
 pub mod os;
 pub mod platform;
 pub(crate) mod records;
