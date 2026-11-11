@@ -1125,6 +1125,24 @@ ReimsGraphics, its display and accelerator together; the display is an
 IOMobileFramebuffer ([graphics-kext/design.md](graphics-kext/design.md),
 "Decided", item 13).
 
+**Beside a build** (measured 2026-11-11 on the M3 Max under HVF, 27.0.1
+(26A434), each probe's 10 s beside N spinning processes started 2 s before
+it, jobs `m3-max-14119`, `14149` and `14347`): at the default QoS, before
+`5658f96c`, `metal-app` held 59.8 to 60.0 frames a second beside 16
+processes, one per core, and fell to 22.5 and 24.4 beside 64 (CVDisplayLink
+at 29.9 and 36.2 Hz) and to 13.4 beside 128 (21.4 Hz), with few drops. A
+loop in the guest sleeping 5 ms at a time woke up to 1.9 s late, while a host
+thread sleeping to a 60 Hz grid, as the device's refresh thread does, ran
+every tick, at most 12.7 ms late: the guest's vCPUs, CPU-bound threads at the
+default QoS, got a share like each spinning process. With `5658f96c`'s
+user-initiated vCPUs beside 64 the probe ran at 59.9 frames a second with
+CVDisplayLink at 60.0 Hz, gaps of at most 33 ms and the guest's sleeps at
+most 9.4 ms late; its commit-to-`presentedTime` latency was 48.7 ms at the
+median, against 32.5 ms on an idle host, a frame later, as the host's own
+threads stay at the default QoS. A gate's 27.0.1 probe ran at 39.1 frames a
+second (CVDisplayLink 45.4 Hz) beside a full-core `cargo xtask dist` on the
+same Mac for this reason.
+
 **A TCG run** (`-t`) runs on a Linux member. What it needs:
 - **A node** with the arm64 guests: `homelab-um870-1` holds reflink copies of
   all five in `~/.cache/rvg-vms` (`macos-13-arm64` to `macos-27-0-arm64`,
