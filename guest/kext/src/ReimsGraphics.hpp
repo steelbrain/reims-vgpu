@@ -110,8 +110,8 @@ public:
 	IOReturn setAttributeForConnection(IOIndex connectIndex, IOSelect attribute,
 	                                   uintptr_t value) override;
 
-	// IOFramebuffer: the display's EDID, made by the driver from the display's native mode
-	// (makeEdid), which IODisplay reads for the display's identity and size.
+	// IOFramebuffer: the display's EDID, made by the driver from the display's id, host screen's
+	// scale and native mode (makeEdid), which IODisplay reads for the display's identity and size.
 	bool hasDDCConnect(IOIndex connectIndex) override;
 	IOReturn getDDCBlock(IOIndex connectIndex, UInt32 blockNumber, IOSelect blockType,
 	                     IOOptionBits options, UInt8 *data, IOByteCount *length) override;
@@ -358,16 +358,17 @@ private:
 	};
 	static void timingFor(const Mode &mode, Timing *timing);
 
-	// The display's EDID: one base block, with no timings. makeEdid fills block `index` (0,
-	// the base) and returns false past it. Call with stateLock held.
-	static constexpr UInt32 kEdidBlockBytes = 128;
+	// The display's EDID: one base block, with no timings (rgfxDisplayEdid). makeEdid fills
+	// block `index` (0, the base) and returns false past it. Call with stateLock held.
+	static constexpr UInt32 kEdidBlockBytes = kRgfxDisplayEdidBytes;
 	bool makeEdid(UInt32 index, UInt8 *block) const;
 
 	static UInt32 refreshMhzOf(const IODetailedTimingInformationV2 &timing);
 	// The device's preferred mode, the display's native one; `mode` where the device lists
 	// none. Call with stateLock held.
 	Mode nativeMode(const Mode &mode) const;
-	// The physical size of a mode's display, in millimetres, as the EDID gives it.
+	// The physical size of a mode's display, in millimetres: its native mode's at the display's
+	// density (RgfxDisplayIdentity.hpp).
 	void imageSize(const Mode &mode, UInt16 *width, UInt16 *height) const;
 	// The IODisplayModeInformation flags of a mode, the preferred one or not.
 	static UInt32 modeFlags(const Mode &mode, bool preferred, UInt32 scale120ths);

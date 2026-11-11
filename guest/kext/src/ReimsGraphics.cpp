@@ -938,7 +938,7 @@ ReimsGraphics::Mode ReimsGraphics::nativeMode(const Mode &m) const
 
 void ReimsGraphics::imageSize(const Mode &m, UInt16 *width, UInt16 *height) const
 {
-	// The EDID's size, from the preferred mode.
+	// The preferred mode's size at the display's density; the EDID's is a reference display's.
 	Mode native = nativeMode(m);
 	*width = static_cast<UInt16>(rgfxDisplayMillimetres(native.width, displayScale));
 	*height = static_cast<UInt16>(rgfxDisplayMillimetres(native.height, displayScale));
@@ -2111,93 +2111,14 @@ void ReimsGraphics::timingFor(const Mode &mode, Timing *t)
 	t->pixelClock = (clock + 5000) / 10000 * 10000;
 }
 #if defined(__x86_64__)
-namespace {
-
-void edidChecksum(UInt8 *block)
-{
-	UInt8 sum = 0;
-	for (UInt32 i = 0; i < 127; i++)
-		sum = static_cast<UInt8>(sum + block[i]);
-	block[127] = static_cast<UInt8>(-sum);
-}
-
-// One 10-bit chromaticity coordinate, from thousandths.
-constexpr UInt32 chroma(UInt32 thousandths)
-{
-	return (thousandths * 1024 + 500) / 1000;
-}
-
-} // namespace
-
-// The EDID is one base block: the identity, sRGB colour, the display's size and the product
-// name, with no timings. The display's modes are the driver's own (getDisplayModes), whose
-// flags give the default and native mode and the HiDPI ones (modeFlags). For a timing an EDID
-// lists, the OS programs a mode of its own, which lacked the HiDPI flag the driver gave it, and
-// WindowServer started on that mode, at 1x (measured on the x86-64 guest, macOS 26.7.2).
+// The EDID is one base block, made from the display's id, its host screen's scale and its native
+// mode's size (RgfxDisplayIdentity.hpp).
 bool ReimsGraphics::makeEdid(UInt32 index, UInt8 *b) const
 {
 	if (index > 0)
 		return false;
-	bzero(b, kEdidBlockBytes);
 	const Mode native = nativeMode(modeSet.current);
-
-	static const UInt8 header[8] = {0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00};
-	memcpy(b, header, sizeof(header));
-	// The identity (RgfxDisplayIdentity.hpp).
-	b[8] = static_cast<UInt8>(kRgfxDisplayManufacturerPacked >> 8);
-	b[9] = static_cast<UInt8>(kRgfxDisplayManufacturerPacked);
-	b[10] = static_cast<UInt8>(kRgfxDisplayProduct);
-	b[11] = static_cast<UInt8>(kRgfxDisplayProduct >> 8);
-	UInt32 serial = rgfxDisplaySerial(displayId);
-	b[12] = static_cast<UInt8>(serial);
-	b[13] = static_cast<UInt8>(serial >> 8);
-	b[14] = static_cast<UInt8>(serial >> 16);
-	b[15] = static_cast<UInt8>(serial >> 24);
-	b[16] = 0;    // week unspecified
-	b[17] = static_cast<UInt8>(kRgfxDisplayYear - 1990); // the year, counted from 1990
-	b[18] = 1;    // EDID 1.4
-	b[19] = 4;
-	b[20] = 0xa5; // digital, 8 bits a component, DisplayPort
-	b[21] = static_cast<UInt8>((rgfxDisplayMillimetres(native.width, displayScale) + 5) / 10);
-	b[22] = static_cast<UInt8>((rgfxDisplayMillimetres(native.height, displayScale) + 5) / 10);
-	b[23] = 120;  // gamma 2.2
-	b[24] = 0x04; // RGB 4:4:4, sRGB the default colour space
-
-	// sRGB's primaries and D65 white, 10 bits each.
-	const UInt32 rx = chroma(kRgfxDisplayRed.x), ry = chroma(kRgfxDisplayRed.y);
-	const UInt32 gx = chroma(kRgfxDisplayGreen.x), gy = chroma(kRgfxDisplayGreen.y);
-	const UInt32 bx = chroma(kRgfxDisplayBlue.x), by = chroma(kRgfxDisplayBlue.y);
-	const UInt32 wx = chroma(kRgfxDisplayWhite.x), wy = chroma(kRgfxDisplayWhite.y);
-	b[25] = static_cast<UInt8>(((rx & 3) << 6) | ((ry & 3) << 4) | ((gx & 3) << 2) | (gy & 3));
-	b[26] = static_cast<UInt8>(((bx & 3) << 6) | ((by & 3) << 4) | ((wx & 3) << 2) | (wy & 3));
-	b[27] = static_cast<UInt8>(rx >> 2);
-	b[28] = static_cast<UInt8>(ry >> 2);
-	b[29] = static_cast<UInt8>(gx >> 2);
-	b[30] = static_cast<UInt8>(gy >> 2);
-	b[31] = static_cast<UInt8>(bx >> 2);
-	b[32] = static_cast<UInt8>(by >> 2);
-	b[33] = static_cast<UInt8>(wx >> 2);
-	b[34] = static_cast<UInt8>(wy >> 2);
-	// No established timings; no standard timings (01 01 each).
-	for (UInt32 i = 38; i < 54; i++)
-		b[i] = 0x01;
-
-	// The descriptors: a dummy, the product name, padded as the descriptor asks, and two
-	// dummies.
-	UInt8 *d = b + 54;
-	d[3] = 0x10;
-	d += 18;
-	d[3] = 0xfc;
-	UInt32 len = sizeof(kRgfxDisplayName) - 1;
-	for (UInt32 i = 0; i < 13; i++)
-		d[5 + i] = i < len ? static_cast<UInt8>(kRgfxDisplayName[i]) : (i == len ? 0x0a : 0x20);
-	d += 18;
-	d[3] = 0x10;
-	d += 18;
-	d[3] = 0x10;
-
-	b[126] = 0; // no extensions
-	edidChecksum(b);
+	rgfxDisplayEdid(b, displayId, displayScale, native.width, native.height);
 	return true;
 }
 
