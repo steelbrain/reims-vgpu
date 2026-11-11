@@ -778,7 +778,9 @@ static NSString *onscreen(void)
 	[win orderFrontRegardless];
 
 	id<MTLRenderPipelineState> p = renderPipeline(@"v_full", @"f_heavy", MTLPixelFormatBGRA8Unorm, NO);
-	const NSInteger maxFps = screen.maximumFramesPerSecond;
+	// -[NSScreen maximumFramesPerSecond] is macOS 12's: before it, 60.
+	const NSInteger maxFps =
+	    [screen respondsToSelector:@selector(maximumFramesPerSecond)] ? screen.maximumFramesPerSecond : 60;
 	__block NSString *result = nil;
 	NSThread *render = [[NSThread alloc] initWithBlock:^{
 		NSMutableArray *presented = [NSMutableArray array], *gpu = [NSMutableArray array];
