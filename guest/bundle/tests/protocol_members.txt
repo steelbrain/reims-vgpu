@@ -1713,8 +1713,8 @@ setObjectVisibleFunctionTable:atBufferIndex: partial function pointers
 setObjectVisibleFunctionTables:withBufferRange: partial function pointers
 setPointSize: absent %spi-neither
 setPrimitiveRestartEnabled: absent %spi-neither
-setPrimitiveRestartEnabled:index: absent %spi-differ (the Intel 630 answers it)
-setProvokingVertexMode: absent %spi-differ (the Intel 630 answers it)
+setPrimitiveRestartEnabled:index: implemented
+setProvokingVertexMode: implemented
 setStencilCleared gap what Metal's encoder does with it is not established; this does nothing
 setStencilResolveTexture:slice:depthPlane:level: absent %spi-neither
 setStencilResolveTexture:slice:depthPlane:level:yInvert: absent %spi-neither

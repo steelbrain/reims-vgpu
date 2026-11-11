@@ -757,6 +757,47 @@ void test_framework_members()
 	}
 	CHECK(findOp(together, RGFX_OP_RENDER_SET_LINE_WIDTH, 2) == nullptr);
 
+	// The GL renderer's two encoder SPIs, as the Intel 630 answers them. A restart that is not
+	// enabled posts nothing until an enabled one came before it, then the all-ones index once; an
+	// enabled one posts its index, once while it stays. Every provoking vertex mode is posted.
+	{
+		id<MTLCommandBuffer> rcb = [fx.queue commandBuffer];
+		id<MTLRenderCommandEncoder> renc = [rcb renderCommandEncoderWithDescriptor:onePass(target)];
+		const SEL restartSel = @selector(setPrimitiveRestartEnabled:index:);
+		const SEL provokingSel = @selector(setProvokingVertexMode:);
+		CHECK([renc respondsToSelector:restartSel] && [renc respondsToSelector:provokingSel]);
+		auto restart = [&](BOOL enabled, NSUInteger index) {
+			((void (*)(id, SEL, BOOL, NSUInteger))objc_msgSend)(renc, restartSel, enabled, index);
+		};
+		restart(NO, 0);
+		restart(YES, 3);
+		restart(YES, 3);
+		restart(NO, 7);
+		restart(NO, 7);
+		restart(YES, 0xffff);
+		((void (*)(id, SEL, NSUInteger))objc_msgSend)(renc, provokingSel, 1);
+		((void (*)(id, SEL, NSUInteger))objc_msgSend)(renc, provokingSel, 0);
+		[renc endEncoding];
+		[rcb commit];
+		uint64_t seqno = 0;
+		const std::vector<Op> ops = fx.nextOps(&seqno);
+		fx.complete(rcb, seqno);
+		// The second carries the all-ones index (kRgfxRestartAtAllOnes).
+		const uint64_t restarts[][2] = {{3, 1}, {0xffffffffu, 0}, {0xffff, 1}};
+		for (size_t n = 0; n < 3; n++) {
+			const Op *r = findOp(ops, RGFX_OP_RENDER_SET_PRIMITIVE_RESTART_ENABLED, n);
+			CHECK(r != nullptr && r->body.size() == sizeof(RgfxOpSetPrimitiveRestartEnabled));
+			const RgfxOpSetPrimitiveRestartEnabled b = r->as<RgfxOpSetPrimitiveRestartEnabled>();
+			CHECK(b.index == restarts[n][0] && b.enabled == restarts[n][1] && b.reserved_0c == 0);
+		}
+		CHECK(findOp(ops, RGFX_OP_RENDER_SET_PRIMITIVE_RESTART_ENABLED, 3) == nullptr);
+		for (uint64_t mode = 0; mode < 2; mode++) {
+			const Op *p = findOp(ops, RGFX_OP_RENDER_SET_PROVOKING_VERTEX_MODE, mode);
+			CHECK(p != nullptr && p->as<RgfxOpSetProvokingVertexMode>().mode == 1 - mode);
+		}
+		CHECK(findOp(ops, RGFX_OP_RENDER_SET_PROVOKING_VERTEX_MODE, 2) == nullptr);
+	}
+
 	// The command buffer: its dictionary, its agent-masked signal, statistics, validate.
 	id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
 	auto userDictionary = [cb] {

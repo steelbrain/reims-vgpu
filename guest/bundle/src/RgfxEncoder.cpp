@@ -752,6 +752,7 @@ void RgfxEncoder::renderSetDepthClipModeSpi(uint64_t mode)
 
 void RgfxEncoder::renderSetProvokingVertexMode(uint64_t mode)
 {
+	m_renderStateSet |= kRgfxRenderStateProvokingVertex;
 	RgfxOpSetProvokingVertexMode b = {};
 	b.mode = mode;
 	appendOp(RGFX_OP_RENDER_SET_PROVOKING_VERTEX_MODE, &b, sizeof(b));
@@ -921,6 +922,7 @@ void RgfxEncoder::renderSetViewportTransformEnabled(bool enabled)
 
 void RgfxEncoder::renderSetPrimitiveRestartEnabled(uint64_t index, bool enabled)
 {
+	m_renderStateSet |= kRgfxRenderStatePrimitiveRestart;
 	RgfxOpSetPrimitiveRestartEnabled b = {};
 	b.index = index;
 	b.enabled = enabled ? 1u : 0u;
@@ -2058,6 +2060,10 @@ void RgfxEncoder::appendSegment(RgfxEncoder &segment, uint32_t reset,
 		renderSetVisibilityResultMode(0, 0); // MTLVisibilityResultModeDisabled
 	if (reset & kRgfxRenderStateTessellationScale)
 		renderSetTessellationFactorScale(1.0f);
+	if (reset & kRgfxRenderStatePrimitiveRestart)
+		renderSetPrimitiveRestartEnabled(kRgfxRestartAtAllOnes, false);
+	if (reset & kRgfxRenderStateProvokingVertex)
+		renderSetProvokingVertexMode(0);
 	const size_t n = static_cast<size_t>(segment.m_cur - segment.m_ops);
 	if (n != 0)
 		std::memcpy(reserve(n), segment.m_ops, n);

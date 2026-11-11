@@ -73,9 +73,10 @@ protected:
 };
 
 /// The kinds of render state an encoder sets that Metal gives a defined default at each
-/// encoder's start (MTLRenderCommandEncoder.h), each with the op that sets it: what a parallel
-/// pass sets back between its sub-encoders (RgfxEncoder::appendSegment). Bindings are not among
-/// them: a function that reads an index nothing was bound at is outside Metal's contract.
+/// encoder's start (MTLRenderCommandEncoder.h; for the two SPI setters, what an encoder draws
+/// before any call), each with the op that sets it: what a parallel pass sets back between its
+/// sub-encoders (RgfxEncoder::appendSegment). Bindings are not among them: a function that reads
+/// an index nothing was bound at is outside Metal's contract.
 enum : uint32_t {
 	kRgfxRenderStateCullMode = 1u << 0,          // None
 	kRgfxRenderStateFrontFacing = 1u << 1,       // Clockwise
@@ -88,8 +89,16 @@ enum : uint32_t {
 	kRgfxRenderStateScissor = 1u << 8,           // the target's size
 	kRgfxRenderStateDepthStencil = 1u << 9,      // nil: the default depth-stencil state
 	kRgfxRenderStateVisibility = 1u << 10,       // Disabled, offset 0
-	kRgfxRenderStateTessellationScale = 1u << 11 // 1.0
+	kRgfxRenderStateTessellationScale = 1u << 11, // 1.0
+	kRgfxRenderStatePrimitiveRestart = 1u << 12,  // strips restart at their index type's all-ones index
+	kRgfxRenderStateProvokingVertex = 1u << 13    // mode 0: the first vertex
 };
+
+/// The index of a setPrimitiveRestartEnabled:index: op that sets an encoder's indexed strips back
+/// to restarting at their index type's all-ones index, as before any call: a 16-bit strip
+/// restarts at the lesser of the index and 0xffff, a 32-bit one at the index (measured on an
+/// Intel UHD 630, macOS 26.7.1, and the host's runtime's on an M4).
+constexpr uint64_t kRgfxRestartAtAllOnes = 0xffffffffu;
 
 /// The size of a render pass's target, which Metal's default viewport and scissor rectangle
 /// cover: what a parallel pass's sub-encoder starts from (RgfxEncoder::appendSegment).

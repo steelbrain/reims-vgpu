@@ -3338,6 +3338,10 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	std::shared_ptr<const RgfxAirFunction> _meshAir;
 	// Whether the host makes mesh pipelines, so the object and mesh stages' commands are sent.
 	BOOL _meshes;
+	// The index the encoder's indexed strips restart at since setPrimitiveRestartEnabled:YES
+	// index:, where `_restartSet` (else their index type's all-ones index, as before any call).
+	BOOL _restartSet;
+	NSUInteger _restartIndex;
 }
 
 - (void)rgfxNoteDrawWrites
@@ -4885,6 +4889,39 @@ RGFX_LOG_UNRECOGNIZED
 - (void)setLineWidth:(float)width
 {
 	_enc->renderSetLineWidth(width);
+}
+
+// --- what the GL renderer (AppleMetalOpenGLRenderer) sends a render encoder beyond its protocol
+
+// The index the encoder's indexed line and triangle strips restart at, as the Intel UHD 630's
+// encoder answers it (measured, macOS 26.7.1; the AMD Radeon Pro 5300M's answers neither this nor
+// setProvokingVertexMode:). Enabled, a strip drawn after it restarts at `index` alone, 16- and
+// 32-bit alike, and draws its index type's all-ones index as a vertex; not enabled, at that
+// all-ones index again, as with no call, whatever `index` is. The host draws the index the op
+// carries in either case, so a call that is not enabled carries the all-ones index, and only where
+// an enabled one came before it. The GL renderer sends this before its draws, not enabled on the
+// 630 whatever GL's restart state, and restarts GL's strips itself; where an encoder answers
+// neither, it writes "setPrimitiveRestartEnabled:index: unsupported!" to stderr once a process.
+- (void)setPrimitiveRestartEnabled:(BOOL)enabled index:(NSUInteger)index
+{
+	if (enabled) {
+		if (_restartSet && _restartIndex == index)
+			return;
+		_enc->renderSetPrimitiveRestartEnabled(index, true);
+		_restartSet = YES;
+		_restartIndex = index;
+	} else if (_restartSet) {
+		_enc->renderSetPrimitiveRestartEnabled(kRgfxRestartAtAllOnes, false);
+		_restartSet = NO;
+	}
+}
+
+// The vertex a primitive's flat inputs come from, which the host's encoder draws: mode 0 the
+// first, as without a call, 1 the last (a triangle's third, strip triangle i's vertex i + 2, a
+// line's second), as the Intel UHD 630's encoder answers it (measured, macOS 26.7.1).
+- (void)setProvokingVertexMode:(NSUInteger)mode
+{
+	_enc->renderSetProvokingVertexMode(mode);
 }
 
 // A tile dispatch over part of the tiles: none on the wire (nor any tile pipeline to run).

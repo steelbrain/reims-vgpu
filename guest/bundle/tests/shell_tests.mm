@@ -8711,6 +8711,8 @@ void test_parallel_sub_encoders_start_from_defaults()
 		[a setDepthStencilState:handle(8)];
 		[a setVisibilityResultMode:MTLVisibilityResultModeBoolean offset:64];
 		[a setTessellationFactorScale:2];
+		((void (*)(id, SEL, BOOL, NSUInteger))objc_msgSend)(a, @selector(setPrimitiveRestartEnabled:index:), YES, 3);
+		((void (*)(id, SEL, NSUInteger))objc_msgSend)(a, @selector(setProvokingVertexMode:), 1);
 		[a drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 		[a endEncoding];
 		[b setRenderPipelineState:handle(7)];
@@ -8752,6 +8754,9 @@ void test_parallel_sub_encoders_start_from_defaults()
 		RgfxOpSetTessellationFactorScale scale = {};
 		const float fone = 1;
 		std::memcpy(&scale, &fone, 4);
+		RgfxOpSetPrimitiveRestartEnabled restart = {};
+		restart.index = 0xffffffffu; // kRgfxRestartAtAllOnes: as before any call
+		RgfxOpSetProvokingVertexMode provoking = {};
 		const std::vector<std::pair<uint16_t, std::vector<uint8_t>>> defaults = {
 		    {RGFX_OP_RENDER_SET_CULL_MODE, bytesOf(cull)},
 		    {RGFX_OP_RENDER_SET_FRONT_FACING_WINDING, bytesOf(winding)},
@@ -8765,6 +8770,8 @@ void test_parallel_sub_encoders_start_from_defaults()
 		    {RGFX_OP_RENDER_SET_DEPTH_STENCIL_STATE, bytesOf(depthStencil)},
 		    {RGFX_OP_RENDER_SET_VISIBILITY_RESULT_MODE, bytesOf(visibility)},
 		    {RGFX_OP_RENDER_SET_TESSELLATION_FACTOR_SCALE, bytesOf(scale)},
+		    {RGFX_OP_RENDER_SET_PRIMITIVE_RESTART_ENABLED, bytesOf(restart)},
+		    {RGFX_OP_RENDER_SET_PROVOKING_VERTEX_MODE, bytesOf(provoking)},
 		};
 		CHECK(ops.size() >= at + 1 + defaults.size() + 4);
 		bool same = true;
