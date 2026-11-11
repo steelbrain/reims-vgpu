@@ -1322,9 +1322,8 @@ crates/reims-vgpu-video/tools/hevc-check.sh /dev/dri/renderD128
 
 Streams, references and logs go to `build/h264-check/` and
 `build/hevc-check/` (or `RVGV_H264_OUT` and `RVGV_HEVC_OUT`), which are
-reused between runs and never committed. Each script takes its GPU's locks
-(`scripts/internal/gpu-locks.sh`), and none where the caller holds them
-already (`RVG_GPU_LOCKS_HELD=1`).
+reused between runs and never committed. Each script runs in a potluck job
+that holds the render node's GPU (`--gpu`).
 
 **x264, x265, kvazaar and ffmpeg are test oracles.** x264 0.165.3222
 writes the H.264 streams, from ffmpeg n9.0.2's `testsrc2` with noise.

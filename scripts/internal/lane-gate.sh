@@ -32,8 +32,7 @@
 #   --phases      the correctness boot's guest-run.sh phases (default: info sweep decode icb
 #                 webgl present final)
 #   --bench-phases  the bench boot's (default: info webgl present idle bench decodefps final)
-#   --boot-tag TAG  the correctness boot's tag on the lane host (default gate-RUNID-boot): a tag the
-#                 host's gpu-urgent file names passes its turnstile ahead of the exclusive waiters
+#   --boot-tag TAG  the correctness boot's tag on the lane host (default gate-RUNID-boot)
 #   --host-log FILTER  the correctness boot's host log filter (REIMS_VGPU_LOG, default info), as
 #                 info,reims_vgpu_graphics::room=debug to count a path's debug records
 #   --bench-host-log FILTER  the bench boot's host log filter (default info), as
@@ -368,12 +367,12 @@ do_cargo() {
   # nextest keeps its store under the workspace's target/, whatever CARGO_TARGET_DIR says.
   local junit=$TREE/target/nextest/default/junit.xml
   rm -f "$junit"
-  # The GPU's tests under the Mac's GPU lock, built before it is taken.
+  # The GPU's tests, built above; the gate's potluck job holds the GPU (--gpu).
   set +e
-  "$SRC/scripts/internal/gpu-locks.sh" -- cargo nextest run "${pkgs[@]}" --features "$feats" --no-fail-fast \
+  cargo nextest run "${pkgs[@]}" --features "$feats" --no-fail-fast \
     --tool-config-file "lane-gate:$GH/nextest-tool.toml" -E "$expr" 2>&1 | tail -40
   set -e
-  # A run that ended before its report (stopped, or killed with its lock's ticket) wrote no junit:
+  # A run that ended before its report (stopped, or cancelled with its job) wrote no junit:
   # the step fails (errexit does not reach inside a step's function).
   [[ -s $junit ]] || { echo "cargo: nextest wrote no $junit: the run did not finish"; return 1; }
   python3 -I - "$junit" "$RES" << 'EOF' || return 1
@@ -407,7 +406,7 @@ for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
       rest+=("$bin $name")
       continue
     fi
-    if "$SRC/scripts/internal/gpu-locks.sh" -- cargo nextest run "${pkgs[@]}" --features "$feats" \
+    if cargo nextest run "${pkgs[@]}" --features "$feats" \
       -E "binary_id($bin) & test(=$name)" > "$RES/cargo-alone.log" 2>&1; then
       echo "$bin $name" >> "$RES/cargo-alone.txt"
       echo "passes alone: $bin $name"

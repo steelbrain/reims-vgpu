@@ -2,8 +2,8 @@
 //! commands, each a full slot (its pipeline state, two vertex buffers, a fragment buffer and a
 //! draw), through the decoder as ring 0 hands it the message, against the same setters sent
 //! through the platform's core traits and, on the Vulkan platform, through the runtime alone: a
-//! measurement, run by hand in a release build, holding the host's GPU
-//! (`scripts/internal/gpu-locks.sh -- cargo nextest run -p reims-vgpu --release
+//! measurement, run by hand in a release build, in a potluck job holding the host's GPU
+//! (`--gpu`: `cargo nextest run -p reims-vgpu --release
 //! --no-default-features --features reims-vgpu/vulkan --run-ignored only -E
 //! 'test(icb_slots_cost)' --no-capture`).
 //!

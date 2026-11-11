@@ -109,7 +109,6 @@ reference() {
   fi
 }
 
-lock_gpu --node "$node"
 echo "h264-check on $node, $(date -Is), $(hostname)"
 for entry in "${streams[@]}"; do
   IFS='|' read -r name size frames qp opts <<<"$entry"

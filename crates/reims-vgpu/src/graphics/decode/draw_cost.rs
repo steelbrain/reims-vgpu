@@ -1,7 +1,7 @@
 //! What a draw costs the thread that decodes it, through the decoder as a queue's ring hands it a
 //! `COMMAND_BUFFER`, against the same commands sent through the platform's core traits and
-//! through what the platform drives alone, metal2vulkan's runtime. A measurement, run by hand in a release build, holding the host's
-//! GPU (`scripts/internal/gpu-locks.sh -- cargo nextest run -p reims-vgpu --release
+//! through what the platform drives alone, metal2vulkan's runtime. A measurement, run by hand in a release build, in a potluck job
+//! holding the host's GPU (`--gpu`: `cargo nextest run -p reims-vgpu --release
 //! --no-default-features --features reims-vgpu/vulkan --run-ignored only -E 'test(draw_cost)'
 //! --no-capture`).
 //!

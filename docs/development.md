@@ -29,8 +29,6 @@ scripts/                    what a person installing reims-ctl runs
   install-ctl.sh            builds and installs reims-ctl and its QEMU (and
                             reims-util, on Linux)
 scripts/internal/           what developing the project runs
-  gpu-locks.sh              the GPU locks a run takes on a host whose GPUs
-                            other projects' runs share
   dev-env.sh                the environment a developer's builds run in,
                             through kache where it is installed (below)
   new-worktree.sh           a new worktree on a new branch

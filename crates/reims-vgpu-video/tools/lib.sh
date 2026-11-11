@@ -12,20 +12,6 @@ export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$root/target}
 export PATH=$HOME/.cargo/bin:$PATH
 failed=0
 
-# lock_gpu ARG...: takes the GPU locks `scripts/internal/gpu-locks.sh ARG...`
-# prints (--node NODE, or none for every GPU), in its order, held until the
-# script ends. A list that cannot be made ends the script, so that no check
-# runs unlocked.
-lock_gpu() {
-  local locks lock
-  locks=$(bash "$root/scripts/internal/gpu-locks.sh" "$@")
-  while read -r lock; do
-    [[ -n $lock ]] || continue
-    exec {fd}<"$lock"
-    flock -x "$fd"
-  done <<<"$locks"
-}
-
 # build PACKAGE EXAMPLE...: builds the package's examples, release.
 build() {
   local package=$1 example args=()

@@ -438,7 +438,6 @@ for entry in "${kvazaar_refusals[@]}" "${kvazaar_partial[@]}"; do
   fi
 done
 
-lock_gpu --node "$node"
 for entry in "${made[@]}"; do
   IFS='|' read -r name bits <<<"$entry"
   echo "---- $name: $("$info" "$out/$name.265")"

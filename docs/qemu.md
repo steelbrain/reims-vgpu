@@ -862,11 +862,11 @@ A boot checks what no test can: QEMU's side of the API, and what guests do
 with the device's answers (AGENTS.md, "Checking a change"). It is run so
 that what it shows is the change's:
 
-- **GPU work holds first.** Before the boot starts, everyone who may run
-  GPU work is told to hold it until the boot ends: any test that opens a
-  Metal or Vulkan device, and, when the boot's timings are compared with
-  another's, local builds too, since a cold boot compiles its pipelines on
-  the CPU.
+- **The boot's job holds its GPU.** A boot runs as a potluck job holding
+  the GPU it boots on (`--gpu`), so no test that opens a Metal or Vulkan
+  device shares it. A boot whose timings are compared with another's takes
+  the whole machine (`--exclusive --hold-line`), since a cold boot compiles
+  its pipelines on the CPU and a build beside it would skew them.
 - **Copies only.** A boot runs on an APFS clone, a copy or a `snapshot=on`
   overlay of the guest's disk, and a step that changes the guest's state (a
   `defaults write`, an app relaunched with new settings, a file written)

@@ -143,16 +143,16 @@ boots no guest. When a rule here seems to ask for a check the change cannot
 affect, say why it is skipped.
 
 The video crates' checks:
-- **The Linux tests**, on a host with libva (radeonsi) and on one with an
-  NVIDIA GPU, from a copy of the tree, holding the host's GPU locks
-  (`scripts/internal/gpu-locks.sh`) and with no core dumps, since the death
-  tests crash on purpose and systemd-coredump keeps each crash:
+- **The Linux tests**, in a potluck job on a host with libva (radeonsi) and
+  in one on a host with an NVIDIA GPU, each holding the GPU it tests
+  (`--gpu`; "GPU and VM discipline", below), and with no core dumps, since
+  the death tests crash on purpose and systemd-coredump keeps each crash:
   ```sh
   ulimit -c 0
-  scripts/internal/gpu-locks.sh --all -- cargo nextest run --workspace --no-fail-fast \
+  cargo nextest run --workspace --no-fail-fast \
     --features reims-vgpu-vulkan/testkit,reims-vgpu/testkit,reims-vgpu/vulkan,reims-vgpu-c/vulkan
-  scripts/internal/gpu-locks.sh --all -- cargo nextest run -p reims-vgpu-video --run-ignored only -E 'test(/^vaapi::/)'   # the VA-API host
-  scripts/internal/gpu-locks.sh --all -- cargo nextest run -p reims-vgpu-video --run-ignored only -E 'test(/^nvidia::/)'  # the NVIDIA host
+  cargo nextest run -p reims-vgpu-video --run-ignored only -E 'test(/^vaapi::/)'   # the VA-API host
+  cargo nextest run -p reims-vgpu-video --run-ignored only -E 'test(/^nvidia::/)'  # the NVIDIA host
   ```
   The features are `cargo xtask check`'s on Linux. The ignored tests check
   the bindings against libva's and NVIDIA's headers, and the hardware's own
@@ -161,7 +161,7 @@ The video crates' checks:
   `crates/reims-vgpu-video/tools/h264-check.sh NODE` and
   `hevc-check.sh NODE` on each render node
   ([docs/video/backends.md](docs/video/backends.md), "The conformance
-  suite"). Each script takes its GPU's locks itself.
+  suite"), each in a potluck job holding that node's GPU.
 
 
 Three tiers:
@@ -400,10 +400,10 @@ Three tiers:
 Some tests fault the GPU and crash processes on purpose, and the GPU
 watchdog corrupts concurrent work.
 
-- **A VM boot never overlaps GPU work.** No test boots a VM. Before a boot,
-  whoever may run GPU work holds it ([docs/qemu.md](docs/qemu.md), "Booting
-  a guest to check a change", which also says how a boot checks its screen
-  and which crashes are out of scope).
+- **A VM boot never overlaps GPU work.** No test boots a VM. A boot's
+  potluck job holds the GPU it boots on ([docs/qemu.md](docs/qemu.md),
+  "Booting a guest to check a change", which also says how a boot checks its
+  screen and which crashes are out of scope).
 - **A boot writes only a copy** of a guest's disk (a clone, or a
   `snapshot=on` overlay), and a step that changes the guest's state runs
   only there. A damaged disk is copied again from its source.
@@ -413,10 +413,13 @@ watchdog corrupts concurrent work.
   itself adds. Contention under such a policy is the code's to fix.
 - **Run a GPU test that failed under load again alone** before counting a
   failure.
-- **A GPU shared with other projects' runs is locked.** A run on it holds
-  the locks `scripts/internal/gpu-locks.sh` names for its GPUs for as long
-  as it runs: `scripts/internal/gpu-locks.sh [--node PATH] -- CMD` runs CMD
-  holding them, under metal2vulkan's `maclock` on a Mac.
+- **Shared machines run potluck jobs alone.** Every build, test, boot and
+  copy on a machine shared with other projects is a potluck job, and its
+  lease is the only lock: `--gpu` holds a GPU for the job, `--exclusive`
+  gives a timing run the whole machine (`--hold-line` keeps later jobs from
+  starting beside it), and `--ram` reserves and caps its memory. A build
+  holds no GPU: it runs in a job without `--gpu`, and the tests then run in
+  the same workspace (`--workspace`) holding one.
 - **Stop only the processes you started**, by their pids.
 
 ## Conventions

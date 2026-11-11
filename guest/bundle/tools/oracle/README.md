@@ -49,17 +49,17 @@ Each probe that runs shaders loads `oracle.metallib` from its own directory, so 
 
 ## Run
 
-On the oracle (`ssh macbook-pro-2019`), from `~/oracle/bin/rgk-oracle`, holding the shared GPU
-lock and keeping the machine awake:
+On the oracle, in a potluck job that holds the GPU it measures (`--ram 1 --gpu 5300m`, or
+`--gpu 630` for the Intel GPU), keeping the machine awake:
 
 ```sh
-/usr/bin/lockf -k ~/oracle/gpu.lock caffeinate -s ./oracle_iosurface AMD single
-/usr/bin/lockf -k ~/oracle/gpu.lock caffeinate -s ./oracle_iosurface Intel timing 3840 2400
-/usr/bin/lockf -k ~/oracle/gpu.lock caffeinate -s ./oracle_storage AMD
+caffeinate -s ./oracle_iosurface AMD single
+caffeinate -s ./oracle_iosurface Intel timing 3840 2400
+caffeinate -s ./oracle_storage AMD
 ```
 
-On an Apple-silicon Mac of this repository, hold the GPU lock:
-`scripts/internal/gpu-locks.sh -- /tmp/rgk-oracle/arm/oracle_passes Apple`.
+On an Apple-silicon Mac of this repository, in a potluck job holding its GPU (`--gpu apple`):
+`/tmp/rgk-oracle/arm/oracle_passes Apple`.
 
 `oracle_iosurface` also takes a script of its own steps in place of a scenario name (the steps
 are listed in its header). `oracle_errors DEVICE timeout SECONDS` runs one long kernel to meet

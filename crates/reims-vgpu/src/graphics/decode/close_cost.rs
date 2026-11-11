@@ -5,8 +5,8 @@
 //! between. On the fake platform, whose objects cost next to nothing to let go of, the figures are
 //! the decoder's own an object; on the Vulkan platform they add the platform's release
 //! and its driver's. Each kind runs once to warm up, then [`REPS`] times, and the median of each
-//! figure is printed. A measurement, run by hand in a release build holding the host's GPU
-//! (`scripts/internal/gpu-locks.sh -- cargo nextest run -p reims-vgpu --release
+//! figure is printed. A measurement, run by hand in a release build, in a potluck job holding the
+//! host's GPU (`--gpu`: `cargo nextest run -p reims-vgpu --release
 //! --no-default-features --features reims-vgpu/vulkan --run-ignored only -E 'test(close_cost)'
 //! --no-capture`); `CLOSE_COST_KINDS` names the kinds to run, a comma-separated list of
 //! [`KINDS`]' names, every one by default.

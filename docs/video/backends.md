@@ -79,5 +79,5 @@ decode, MD5 by MD5, and the streams the decoder must refuse refused ([vaapi.md](
 ignored hardware tests ([nvidia.md](nvidia.md)).
 
 x264, x265, kvazaar and ffmpeg are test oracles alone: they write the test streams and the
-reference MD5s under `build/`, and nothing they write is committed. Each script takes its GPU's
-locks itself, and none where its caller holds them already (`RVG_GPU_LOCKS_HELD=1`).
+reference MD5s under `build/`, and nothing they write is committed. Each script runs in a potluck
+job that holds the render node's GPU (`--gpu`).

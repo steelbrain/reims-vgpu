@@ -454,8 +454,8 @@ esac
 log "QEMU $P up, SSH answers"
 display_state display_start
 
-# This run's background helpers close every descriptor above 2 first: none may hold the GPU
-# locks' descriptors, which gpu-locks.sh hands down, past this script's end.
+# This run's background helpers close every descriptor above 2 first: none may hold a
+# descriptor this script was handed past its end.
 closefds() { local f; for f in /proc/$BASHPID/fd/*; do f=${f##*/}; (( f > 2 )) && eval "exec $f>&-"; done; }
 # Nor may they hold its stdout and stderr, the SSH session's, which would keep the session open
 # after this script ends.

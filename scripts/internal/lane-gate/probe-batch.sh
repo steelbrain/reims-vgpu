@@ -56,8 +56,8 @@
 # it, else the oldest probe's that is still published. It takes the probes for that tip oldest
 # first while their budgets fit the hold (those for other published tips wait for their own round;
 # --tip SHA picks the round's tip, a published one), boots the tip once through msi-boot.sh (an
-# exclusive request: the GPU alone, in the
-# host's turnstile, the host quiet; the gate's one request on the host while it runs), waits for
+# exclusive potluck job: the GPU alone, the host quiet; the gate's one request on the host while
+# it runs), waits for
 # the host's load to settle under 4, runs them back to back and powers the guest off. --capture
 # also captures the boot as the gate's --capture-boot does (msi-boot.sh's CAPTURE: its scanout,
 # the guest's screenshots and the kext's log of the boot, in the round's capture/), the host's log
