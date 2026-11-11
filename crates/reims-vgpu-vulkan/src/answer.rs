@@ -716,6 +716,13 @@ pub fn created_or_decided<T>(
 ///   other blends are Metal's, exact).
 ///   Announced at each draw that binds the pipeline's variant, inside its call, which dies at its
 ///   selector;
+/// - the note `UnorderedFetchWithinDraw`: on a device with neither rasterization-order colour
+///   attachment access nor the pixel interlock (the runtime names Honeykrisp on Apple's M2 Pro),
+///   a fragment function's read of a colour attachment, through its input attachment ordered
+///   after the draws before by a barrier between them but not after an overlapping earlier
+///   fragment of its own draw, which Metal orders in primitive order: such a fragment may read
+///   the texel from before that fragment wrote it. Announced at the state's creation, which dies
+///   at its selector;
 /// - the note `LinkedSamplerNumbering`: the constexpr sampler IDs of a stage that links visible
 ///   functions, where the runtime does not number them as Metal does. It notes a stage that
 ///   links two or more with constexpr samplers, whose order Metal itself does not decide (two
@@ -1304,7 +1311,16 @@ pub fn created_or_decided<T>(
 ///   mipmapped or 3D texture, laid apart from the heap's bytes where Metal lays its texels at
 ///   bytes that differ by path: its size answers are Metal's and its copies read what they
 ///   wrote, but a buffer over the heap meets its texels at other bytes than on Metal. Announced
-///   inside the heap's creator of the texture, which dies at its selector.
+///   inside the heap's creator of the texture, which dies at its selector;
+/// - `InterlockedBufferOrder`: a render pipeline state whose fragment function writes a storage
+///   buffer of set 0 inside its interlock (a raster order group's buffer, or one a function that
+///   reads its colour attachment writes), on a driver that orders such a buffer between
+///   overlapping fragments only where set 0 is pushed (MoltenVK, the runtime's
+///   `InterlockedBoundBuffersUnordered`), where its set 0 is bound instead (the device has no
+///   push command, set 0 is no push layout's, or a stage reads a buffer's length): a fragment may
+///   read the buffer as it was before an earlier overlapping fragment of the draw wrote it, where
+///   Metal orders it after every earlier fragment of the pixel. Announced at each draw that binds
+///   the pipeline's variant, inside its call, which dies at its selector.
 ///
 /// Every kind not listed here or in [`HEARD`] is relayed, those the guest sees included, each for
 /// one of the reasons the module's docs give: logged once per device and not dying. Each relayed
@@ -1313,7 +1329,7 @@ pub fn created_or_decided<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 145] = [
+pub const DIES: [rt::Degradation; 147] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1459,6 +1475,8 @@ pub const DIES: [rt::Degradation; 145] = [
     rt::Degradation::HeapOnePlaneLayout,
     rt::Degradation::CoverageReadsRoundedAlpha,
     rt::Degradation::UnmeasuredFetchBlend,
+    rt::Degradation::UnorderedFetchWithinDraw,
+    rt::Degradation::InterlockedBufferOrder,
 ];
 
 /// The degradations a creator here learns of, announced at every occurrence too, which do not

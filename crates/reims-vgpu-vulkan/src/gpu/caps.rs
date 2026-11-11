@@ -586,10 +586,14 @@ mod tests {
             };
             let answer = private.count(property);
             assert_eq!(Some(ours), answer.value(), "{}", property.selector());
-            // A linear alignment is the device's images' (256 on RADV), past Metal's 16.
+            // A texture's row alignment, linear or an IOSurface's, is the device's images' (256 on
+            // RADV), past Metal's 16.
             if matches!(
                 property,
-                C::DeviceLinearTextureAlignmentBytes | C::LinearTextureAlignmentBytes
+                C::DeviceLinearTextureAlignmentBytes
+                    | C::LinearTextureAlignmentBytes
+                    | C::IosurfaceTextureAlignmentBytes
+                    | C::IosurfaceReadOnlyTextureAlignmentBytes
             ) {
                 assert!(
                     ours >= answer.metal(),

@@ -1184,10 +1184,11 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
     }
 
     /// The runtime's tiled texture (`Buffer::new_tiled_texture`): one level is the texture
-    /// [`Buffer::new_texture`] makes; a 2D texture of more levels is one image of every level,
-    /// whose first level the runtime keeps in step with the buffer's bytes from `offset`, rows
-    /// `bytes_per_row` apart, and whose other levels are the image's own, as an x86 Mac's GPU
-    /// keeps them in its own memory (docs/graphics-kext/dgpu-oracle.md, Q11). Refused as
+    /// [`Buffer::new_texture`] makes; a 2D texture of more levels is one image of every level, a
+    /// copy of the buffer's bytes from `offset`, rows `bytes_per_row` apart, with every later
+    /// level made from the first, taken at its first use in a command buffer, as an x86 Mac's
+    /// (docs/graphics-kext/dgpu-oracle.md, Q11): no later CPU write reaches it, and no GPU write
+    /// of it reaches the buffer. Refused as
     /// `new_texture`'s arguments are, and for more levels than the extent's full chain; nil for a
     /// format Metal makes no texture of from a descriptor alone, as `new_texture`'s.
     fn new_tiled_texture(

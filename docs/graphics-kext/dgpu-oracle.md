@@ -542,19 +542,22 @@ is taken at the first GPU use after the make, and again after each `didModifyDat
 write stays in the texture *(class 3: both x86 GPUs agree)*. Safari 26's CoreGraphics makes such
 textures for the pictures it draws: 1600 x 1600 of 11 levels and 600 x 400 of 10, RGBA8Unorm,
 packed rows at offset 0. It never writes levels 1 and up, and it samples a picture drawn below
-its size with linear mipmap filtering. The host's platform keeps level 0 in step with the bytes
-and leaves levels 1 and up zero, so such a picture draws black or dark (26.7.2 walks 15511,
-15613 and 15614 on a Radeon 780M and an RTX 3090, 11-11). The fix is metal2vulkan's
-(`Buffer::new_tiled_texture`). The bundle sends the host nothing at a `didModifyData` of a
-texture over a Shared buffer, which the fix will also need.
+its size with linear mipmap filtering. It writes the bytes before it makes the texture, and calls
+no `didModifyData` on it (26.7.2 walks 15718 and 15720, 11-11, a probe of the bundle's). The
+host's platform makes the texture as the x86 Macs do (metal2vulkan's
+`Buffer::new_tiled_texture`): a copy of the bytes with every level made from level 0, taken at
+its first use in a command buffer, which no later CPU write reaches and from which no GPU write
+reaches the buffer. A platform that kept level 0 in step with the bytes and left levels 1 and up
+zero drew such a picture black or dark (26.7.2 walks 15511, 15613 and 15614 on a Radeon 780M
+and an RTX 3090, 11-11). The bundle sends the host nothing at a `didModifyData` of a texture over
+a Shared buffer, so the copy is never taken again.
 
 *(class 2: the tiled forms are x86's alone.)* WindowServer's tiled backings use the buffer's SPI
 (RgfxBuffer.mm). Our stack: the public form ends the process at more than one level with
 Metal's words *(class 3)*, sending the host nothing; the tiled forms make one *(class 3)*:
 `TEXTURE_FROM_BUFFER` carries the levels, and the host's platform makes one image of every
-level, level 0 a copy of the buffer's bytes kept in step at command boundaries and levels 1 and
-up its own (metal2vulkan's `Buffer::new_tiled_texture`), the bundle logging the first of each
-process with its levels. Before the host made them, with the lane answering `featureProfile`
+level, the copy above (metal2vulkan's `Buffer::new_tiled_texture`), the bundle logging the first
+of each process with its levels. Before the host made them, with the lane answering `featureProfile`
 10002, an x86 Mac's, WindowServer asked the lane for a 7-level texture over a buffer, which the
 host's platform refused, and every later command buffer naming it faulted, so its composition
 stopped (boot ro1-p2, 11-02); answering 10 it asked for none (ro1-p1 and its control). Core Image made no texture over a buffer by any of the three forms, under 10 or 10002,

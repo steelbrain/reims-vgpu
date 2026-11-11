@@ -74,8 +74,8 @@ pub trait Buffer<P: Platform>: GpuResource<P> {
     ) -> RaiseResult<Option<P::Texture>>;
     /// sel: newTiledTextureWithDescriptor:offset:bytesPerRow: SPI
     /// As `newTextureWithDescriptor:offset:bytesPerRow:`, and also a 2D texture of more than one
-    /// level: its first level's texels the buffer's bytes from `offset`, rows `bytes_per_row`
-    /// apart, and its other levels the texture's own memory.
+    /// level: a copy of the buffer's bytes from `offset`, rows `bytes_per_row` apart, its other
+    /// levels made from them, taken at its first use.
     fn new_tiled_texture(
         &self,
         descriptor: &P::TextureDescriptor,

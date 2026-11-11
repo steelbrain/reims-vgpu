@@ -10813,7 +10813,9 @@ lacks {part}"
         /// Level 0 read by a blit after the CPU wrote [`tiled_texel`]'s into the buffer's rows,
         /// the texture made: packed rows.
         first: Vec<u8>,
-        /// The buffer's bytes after a blit wrote one colour into the whole of level 0.
+        /// Level 0 read by a blit after a blit wrote one colour into the whole of it: packed rows.
+        first_written: Vec<u8>,
+        /// The buffer's bytes after that write.
         after_first_written: Vec<u8>,
         /// Levels 1 to 5 read after `generateMipmapsForTexture:`, each packed rows.
         generated: Vec<Vec<u8>>,
@@ -10840,7 +10842,8 @@ lacks {part}"
     /// [`TILED_LEVELS`] levels, as the bundle sends it from
     /// `newTiledTextureWithDescriptor:offset:bytesPerRow:`) over a buffer whose bytes past each
     /// row's texels are [`TILED_PAD`], then, in order: the CPU writes a pattern into the rows and a
-    /// blit reads level 0; a blit writes [`TILED_COLOUR`] into level 0 and the buffer is read;
+    /// blit reads level 0; a blit writes [`TILED_COLOUR`] into level 0, which a blit reads, and the
+    /// buffer is read;
     /// `generateMipmapsForTexture:` fills the other levels, which blits read; a blit writes a
     /// pattern into level 3, which a blit reads back, and the buffer is read again.
     fn tiled_texture_levels<P: crate::platform::ApiPlatform>() -> TiledLevels {
@@ -10967,6 +10970,7 @@ lacks {part}"
             .flat_map(|_| TILED_COLOUR)
             .collect();
         write_level(0, &colour);
+        let first_written = read_level(0);
         let after_first_written = buffer_bytes();
         run(vec![BlitCmd::GenerateMipmaps { texture: Some(t) }]);
         let generated = (1..u64::from(TILED_LEVELS)).map(read_level).collect();
@@ -10976,6 +10980,7 @@ lacks {part}"
         TiledLevels {
             levels,
             first,
+            first_written,
             after_first_written,
             generated,
             third,
@@ -11013,14 +11018,19 @@ lacks {part}"
         }
     }
 
-    /// On the Vulkan platform, a blit's write of a tiled texture's first level reaches the
-    /// buffer's rows, and the bytes between the rows stay as they were; a write of its level 3
-    /// reaches none of the buffer's bytes
+    /// On the Vulkan platform, a blit's write of a tiled texture's first level stays in the
+    /// texture, which a blit reads back, and reaches none of the buffer's bytes, which keep the
+    /// rows the CPU wrote and the bytes between them, as the x86 Macs' (docs/graphics-kext/
+    /// dgpu-oracle.md, Q11: the texture is a copy of the bytes); nor does a write of its level 3
     #[test]
-    fn on_vulkan_a_tiled_texture_s_first_level_writes_the_buffer_s_rows_and_not_its_padding() {
+    fn on_vulkan_a_blit_write_of_a_tiled_texture_s_first_level_stays_in_the_texture() {
         let r = tiled_texture_levels::<reims_vgpu_vulkan::VulkanPlatform>();
-        tiled_buffer_holds(&r.after_first_written, |_, _| TILED_COLOUR).unwrap();
-        tiled_buffer_holds(&r.after_third_written, |_, _| TILED_COLOUR).unwrap();
+        for (i, texel) in r.first_written.chunks(4).enumerate() {
+            assert_eq!(texel, TILED_COLOUR, "texel {i}");
+        }
+        let written = |x, y| tiled_texel(x, y, 0x5a);
+        tiled_buffer_holds(&r.after_first_written, written).unwrap();
+        tiled_buffer_holds(&r.after_third_written, written).unwrap();
     }
 
     /// On the Vulkan platform, a tiled texture's levels 1 and up are its own: generating its
