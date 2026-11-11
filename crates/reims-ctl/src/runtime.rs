@@ -6,6 +6,10 @@
 //! while that process runs and its command line names the pid file, so a stale file or a reused
 //! pid is never taken for the VM. A VM started from a printed script is found the same way.
 //!
+//! On Linux, QEMU runs in a systemd user scope of its own, `reims-ctl-NAME.scope`, where the
+//! user's manager answers and outlasts the start ([`launch`]); elsewhere, and where none does, in
+//! the cgroup of the process that starts it, with a warning on Linux.
+//!
 //! QEMU's stdout and stderr go to `logs/qemu.log`, kept for the last five starts
 //! (`qemu.1.log`, ...), the serial console's likewise.
 
@@ -582,8 +586,165 @@ pub fn prepare(vm: &mut Vm, progress: &mut dyn FnMut(&str)) -> Vec<String> {
     w
 }
 
+/// The systemd user unit a start runs a VM's QEMU in ([`launch`]): one per VM, so a start of a
+/// VM whose QEMU still runs in it finds the name taken.
+pub fn scope_unit(name: &str) -> String {
+    format!("reims-ctl-{name}.scope")
+}
+
+/// What a start reads of the user's systemd service manager ([`launch`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UserManager {
+    /// `systemd-run` is on the PATH and the user's manager answers on its bus.
+    pub answers: bool,
+    /// The caller runs under that manager (its cgroup is below `user@UID.service`), as a
+    /// desktop's terminal does: a scope there lasts as long as the caller's own processes.
+    pub caller_inside: bool,
+    /// The manager stays after the user's last session ends (`loginctl enable-linger`).
+    pub lingers: bool,
+}
+
+impl UserManager {
+    /// This host's, read now: on Linux by `systemctl --user` and `loginctl`, and none
+    /// elsewhere.
+    pub fn current() -> UserManager {
+        if !cfg!(target_os = "linux") {
+            return UserManager::default();
+        }
+        let ok = |program: &str, args: &[&str]| {
+            std::process::Command::new(program)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        };
+        let answers = ok("systemd-run", &["--version"]).is_some()
+            && ok(
+                "systemctl",
+                &["--user", "show", "--property=Version", "--value"],
+            )
+            .is_some_and(|v| !v.is_empty());
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        let caller_inside = std::fs::read_to_string("/proc/self/cgroup")
+            .is_ok_and(|c| c.contains(&format!("/user@{uid}.service/")));
+        let lingers = ok(
+            "loginctl",
+            &[
+                "show-user",
+                &uid.to_string(),
+                "--property=Linger",
+                "--value",
+            ],
+        )
+        .is_some_and(|v| v == "yes");
+        UserManager {
+            answers,
+            caller_inside,
+            lingers,
+        }
+    }
+}
+
+/// How a start runs a VM's QEMU ([`launch`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Launch {
+    /// In a systemd user scope of its own, the unit named.
+    Scope(String),
+    /// In the cgroup of the process that starts it, as its descendant; on Linux with why no
+    /// scope of its own was taken.
+    Plain(Option<&'static str>),
+}
+
+/// How a start runs `name`'s QEMU on a host whose user manager is `m`. On Linux, in a systemd
+/// user scope of its own ([`scope_unit`]), so the cgroup v2 CPU controller weighs the VM against
+/// other cgroups, not against the processes of the cgroup that started it: there, a build at
+/// nice 0 beside a QEMU that ananicy-cpp gives nice 9 (its `Heavy_CPU` type, as CachyOS has it)
+/// takes nine shares of the CPU for each of QEMU's, and starved an x86-64 macOS guest until it
+/// could not answer an SSH login (docs/qemu.md, "Beside a build"). The scope's weight is the
+/// manager's default, and QEMU keeps its nice and policy, so no host policy changes.
+///
+/// No scope where no user manager answers, nor where the caller runs outside it (an SSH or
+/// console login) and the manager does not linger: that manager stops its units when the user's
+/// last session ends, which would end a VM the login started.
+pub fn launch(name: &str, m: UserManager) -> Launch {
+    if !cfg!(target_os = "linux") {
+        Launch::Plain(None)
+    } else if !m.answers {
+        Launch::Plain(Some("no systemd user manager answers"))
+    } else if !m.caller_inside && !m.lingers {
+        Launch::Plain(Some(
+            "this login runs outside the user's systemd manager, which stops a scope at the \
+             user's last logout unless it lingers (loginctl enable-linger)",
+        ))
+    } else {
+        Launch::Scope(scope_unit(name))
+    }
+}
+
+/// The warning a start under `launch` gives, where QEMU runs in the cgroup that started it on
+/// Linux.
+pub fn launch_note(name: &str, launch: &Launch) -> Option<String> {
+    match launch {
+        Launch::Plain(Some(why)) => Some(format!(
+            "{name}'s QEMU runs in the cgroup of the process that started it, not in a systemd \
+             user scope of its own ({why}): CPU-heavy work in that cgroup, a build among it, \
+             takes the guest's share of the CPU"
+        )),
+        _ => None,
+    }
+}
+
+/// `inv` run as `launch` says: in a scope, through `systemd-run --user --scope`, which moves
+/// itself into the new unit and then executes QEMU in its own process, with the environment it
+/// was given, so QEMU keeps its pid, its environment and its detachment.
+pub fn launched(inv: Invocation, name: &str, launch: &Launch) -> Invocation {
+    let Launch::Scope(unit) = launch else {
+        return inv;
+    };
+    let mut args = vec![
+        "--user".to_owned(),
+        "--scope".to_owned(),
+        "--quiet".to_owned(),
+        "--collect".to_owned(),
+        format!("--unit={unit}"),
+        format!("--description=reims-ctl: {name}'s QEMU"),
+        "--".to_owned(),
+        inv.program.to_string_lossy().into_owned(),
+    ];
+    args.extend(inv.args);
+    Invocation {
+        program: "systemd-run".into(),
+        args,
+        env: inv.env,
+        unset: inv.unset,
+    }
+}
+
+/// Whether the user's systemd unit `unit` is active.
+fn unit_active(unit: &str) -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", unit])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// What [`start`] started.
+#[derive(Debug)]
+pub struct Started {
+    /// QEMU's pid.
+    pub pid: i32,
+    /// A warning about how QEMU runs ([`launch_note`]), for the start's output.
+    pub note: Option<String>,
+}
+
 /// Starts the VM, and returns QEMU's pid once QMP answers.
-pub fn start(vm: &Vm, host: Host) -> Result<i32> {
+pub fn start(vm: &Vm, host: Host) -> Result<Started> {
     if let Some(p) = pid(vm) {
         bail!("{} already runs (pid {p})", vm.name());
     }
@@ -597,6 +758,17 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
     preflight(vm, host)?;
     let ctx = context(vm, host)?;
     let inv = qemu::invocation(vm, &ctx)?;
+    let launch = launch(vm.name(), UserManager::current());
+    if let Launch::Scope(unit) = &launch
+        && unit_active(unit)
+    {
+        bail!(
+            "{}'s QEMU still runs in its systemd user scope {unit}, though its pid file names no \
+             running QEMU: systemctl --user stop {unit} ends it",
+            vm.name()
+        );
+    }
+    let note = launch_note(vm.name(), &launch);
     let sock = prepare_run(vm)?;
 
     let mut log = std::fs::OpenOptions::new()
@@ -610,11 +782,17 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
         vm.name(),
         now_stamp("%Y-%m-%d %H:%M:%S %z")
     )?;
+    match (&launch, &note) {
+        (Launch::Scope(unit), _) => writeln!(log, "in the systemd user scope {unit}")?,
+        (_, Some(n)) => writeln!(log, "warning: {n}")?,
+        _ => {}
+    }
     log.write_all(inv.shell_script("the command").as_bytes())?;
     writeln!(log, "----")?;
     let err = log.try_clone()?;
 
-    let mut cmd = inv.command();
+    let run = launched(inv, vm.name(), &launch);
+    let mut cmd = run.command();
     cmd.current_dir(&vm.dir)
         .stdin(std::process::Stdio::null())
         .stdout(log)
@@ -634,8 +812,12 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
     }
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("run {}", inv.program.display()))?;
+        .with_context(|| format!("run {}", run.program.display()))?;
     let _ = child.wait();
+    let started = |pid| Started {
+        pid,
+        note: note.clone(),
+    };
 
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut seen = false;
@@ -643,7 +825,7 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
         if let Some(p) = pid(vm) {
             seen = true;
             if qmp::Qmp::connect(&sock, Duration::from_secs(2)).is_ok() {
-                return Ok(p);
+                return Ok(started(p));
             }
         } else if seen || Instant::now() > deadline - Duration::from_secs(50) {
             // QEMU wrote its pid file and exited, or never wrote it.
@@ -662,7 +844,7 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
         }
         if Instant::now() > deadline {
             match pid(vm) {
-                Some(p) => return Ok(p),
+                Some(p) => return Ok(started(p)),
                 None => bail!("QEMU did not start:\n{}", tail(&vm.qemu_log(), 15)),
             }
         }
@@ -952,6 +1134,113 @@ mod tests {
         assert_eq!(group_in(groups, 992).as_deref(), Some("kvm"));
         assert_eq!(group_in(groups, 0).as_deref(), Some("root"));
         assert_eq!(group_in(groups, 5), None);
+    }
+
+    /// QEMU's invocation for the launch tests: a program, its arguments and what it sets and
+    /// removes of the environment.
+    fn qemu_invocation() -> Invocation {
+        Invocation {
+            program: "/opt/qemu/bin/qemu-system-x86_64".into(),
+            args: ["-name", "kv-26", "-pidfile", "/vms/kv-26/qemu.pid"]
+                .map(String::from)
+                .to_vec(),
+            env: vec![("REIMS_VGPU_LOG".to_owned(), "info".to_owned())],
+            unset: vec!["REIMS_VGPU_WINDOW".to_owned()],
+        }
+    }
+
+    /// The program, arguments and environment changes `inv`'s command runs with.
+    fn command_of(inv: &Invocation) -> (String, Vec<String>, Vec<(String, Option<String>)>) {
+        let cmd = inv.command();
+        let s = |o: &std::ffi::OsStr| o.to_string_lossy().into_owned();
+        let mut envs: Vec<_> = cmd.get_envs().map(|(k, v)| (s(k), v.map(s))).collect();
+        envs.sort();
+        (s(cmd.get_program()), cmd.get_args().map(s).collect(), envs)
+    }
+
+    /// In a scope, the command is `systemd-run --user --scope` with the VM's own unit, then
+    /// QEMU's program and arguments as they were, and QEMU's environment changes on it, which
+    /// systemd-run's own process carries into QEMU; without one, it is QEMU's command as it was.
+    #[test]
+    fn a_scope_runs_qemu_through_systemd_run_under_the_vms_unit() {
+        let plain = command_of(&qemu_invocation());
+        let env = vec![
+            ("REIMS_VGPU_LOG".to_owned(), Some("info".to_owned())),
+            ("REIMS_VGPU_WINDOW".to_owned(), None),
+        ];
+        assert_eq!(plain.0, "/opt/qemu/bin/qemu-system-x86_64");
+        assert_eq!(plain.2, env);
+        let scope = Launch::Scope(scope_unit("kv-26"));
+        let (program, args, envs) = command_of(&launched(qemu_invocation(), "kv-26", &scope));
+        assert_eq!(program, "systemd-run");
+        let mut want: Vec<String> = [
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            "--unit=reims-ctl-kv-26.scope",
+            "--description=reims-ctl: kv-26's QEMU",
+            "--",
+            "/opt/qemu/bin/qemu-system-x86_64",
+        ]
+        .map(String::from)
+        .to_vec();
+        want.extend(plain.1.iter().cloned());
+        assert_eq!(args, want);
+        assert_eq!(envs, env);
+        for no_scope in [Launch::Plain(None), Launch::Plain(Some("why"))] {
+            assert_eq!(
+                command_of(&launched(qemu_invocation(), "kv-26", &no_scope)),
+                plain
+            );
+        }
+    }
+
+    /// On Linux a start takes a scope of its own where the user's manager answers and outlasts
+    /// the VM's start: the caller runs under it, or it lingers. Otherwise QEMU runs as before,
+    /// with a warning that says why; elsewhere as before, with none.
+    #[test]
+    fn a_start_takes_a_scope_where_a_user_manager_keeps_it() {
+        let m = |answers, caller_inside, lingers| UserManager {
+            answers,
+            caller_inside,
+            lingers,
+        };
+        let cases = [
+            (m(true, true, false), true),
+            (m(true, false, true), true),
+            (m(true, true, true), true),
+            (m(true, false, false), false),
+            (m(false, true, true), false),
+            (m(false, false, false), false),
+        ];
+        for (manager, scoped) in cases {
+            let launch = launch("kv-26", manager);
+            let note = launch_note("kv-26", &launch);
+            if !cfg!(target_os = "linux") {
+                assert_eq!(launch, Launch::Plain(None), "{manager:?}");
+                assert_eq!(note, None);
+            } else if scoped {
+                assert_eq!(launch, Launch::Scope("reims-ctl-kv-26.scope".to_owned()));
+                assert_eq!(note, None);
+            } else {
+                assert!(matches!(launch, Launch::Plain(Some(_))), "{manager:?}");
+                let note = note.unwrap();
+                assert!(
+                    note.starts_with(
+                        "kv-26's QEMU runs in the cgroup of the process that started it, not in a \
+                         systemd user scope of its own ("
+                    ),
+                    "{note}"
+                );
+                let why = if manager.answers {
+                    "this login runs outside the user's systemd manager"
+                } else {
+                    "no systemd user manager answers"
+                };
+                assert!(note.contains(why), "{note}");
+            }
+        }
     }
 
     /// A VM does not start on a disk another VM, using it in place too, runs on.

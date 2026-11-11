@@ -47,6 +47,7 @@ pub enum Cmd {
         yes: bool,
     },
     /// Start a VM: a window opens for its display
+    #[command(after_help = START_HELP)]
     Start { name: String },
     /// Shut a VM down; if the guest has not shut down when the timeout ends, power it off
     Stop {
@@ -145,6 +146,13 @@ pub enum Cmd {
         commit: String,
     },
 }
+
+const START_HELP: &str = "\
+On Linux, the VM's QEMU runs in a systemd user unit of its own, reims-ctl-NAME.scope, so it gets \
+a share of the CPU of its own beside other work, a build in the terminal that started it among \
+it; systemctl --user status reims-ctl-NAME.scope shows it. Where no systemd user manager \
+answers, or from an SSH login whose manager does not linger (loginctl enable-linger), QEMU runs \
+as part of the terminal's work instead, and the start warns so.";
 
 const VIEW_HELP: &str = "\
 For a VM on a host with no screen, to set macOS up before it has screen sharing or remote \
@@ -428,8 +436,11 @@ pub fn main(cli: Cli) -> Result<i32> {
             {
                 eprintln!("warning: {w}");
             }
-            let pid = runtime::start(&vm, host)?;
-            println!("{name}: running, pid {pid}");
+            let started = runtime::start(&vm, host)?;
+            if let Some(n) = &started.note {
+                eprintln!("warning: {n}");
+            }
+            println!("{name}: running, pid {}", started.pid);
         }
         Cmd::Stop {
             name,
@@ -708,8 +719,11 @@ fn create_cmd(a: CreateArgs, host: Host) -> Result<()> {
         for w in runtime::prepare(&mut vm, &mut |p| println!("{name}: {p}")) {
             eprintln!("warning: {w}");
         }
-        let pid = runtime::start(&vm, host)?;
-        println!("{name}: running, pid {pid}");
+        let started = runtime::start(&vm, host)?;
+        if let Some(n) = &started.note {
+            eprintln!("warning: {n}");
+        }
+        println!("{name}: running, pid {}", started.pid);
     }
     Ok(())
 }

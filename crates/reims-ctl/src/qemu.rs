@@ -1,5 +1,6 @@
 //! The QEMU command line a VM runs: one [`Invocation`], which `start` runs and `command`
-//! prints as a shell script, so a printed script runs the VM exactly as reims-ctl does.
+//! prints as a shell script, so a printed script runs the VM as reims-ctl does, which on Linux
+//! runs it in a systemd user scope of its own ([`crate::runtime::launch`]).
 //!
 //! Every VM gets:
 //! - on reims-vgpu's own device, the library's window for its display: `-display none` with

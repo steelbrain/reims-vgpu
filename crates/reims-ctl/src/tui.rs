@@ -994,9 +994,13 @@ impl App {
             let mut vm = vm;
             let mut said = Vec::new();
             let warned = runtime::prepare(&mut vm, &mut |s| said.push(s.to_string()));
-            let pid = runtime::start(&vm, host)?;
-            let mut s = format!("{}: running (pid {pid}); its window is open", vm.name());
-            for n in said.iter().chain(&warned) {
+            let started = runtime::start(&vm, host)?;
+            let mut s = format!(
+                "{}: running (pid {}); its window is open",
+                vm.name(),
+                started.pid
+            );
+            for n in said.iter().chain(&warned).chain(&started.note) {
                 s.push_str("; ");
                 s.push_str(n);
             }
