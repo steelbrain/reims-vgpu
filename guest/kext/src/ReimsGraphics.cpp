@@ -47,6 +47,9 @@ static_assert(kRgfxIOReturnError == static_cast<uint32_t>(kIOReturnError) &&
                   kRgfxIOReturnUnsupportedMode == static_cast<uint32_t>(kIOReturnUnsupportedMode),
               "RgfxDisplayModes.hpp's statuses are IOReturn's");
 #if defined(__x86_64__)
+// A mode the device no longer shows (RgfxDisplayModes.hpp).
+static_assert(kRgfxModeNeverShowFlag == kDisplayModeNeverShowFlag,
+              "RgfxDisplayModes.hpp's never-show flag is IOGraphicsTypes.h's");
 // The display's connection is built in (RgfxDisplayIdentity.hpp).
 static_assert(kRgfxDisplayConnectionFlags == kIOConnectionBuiltIn,
               "RgfxDisplayIdentity.hpp's connection flags are IOGraphicsTypes.h's built-in one");
@@ -953,7 +956,8 @@ void ReimsGraphics::imageSize(const Mode &m, UInt16 *width, UInt16 *height) cons
 // pixels do not halve exactly has no HiDPI one; the host offers this
 // framebuffer even modes, since with a native 3841x2161 the guest never brought its display up,
 // with the flag or without it (CoreGraphics listed no mode, and the framebuffer's mode was set
-// again every 10 seconds).
+// again every 10 seconds). A mode the device no longer shows is answered never shown
+// (rgfxListedModeFlags).
 UInt32 ReimsGraphics::modeFlags(const Mode &m, bool preferred, UInt32 scale120ths)
 {
 	UInt32 flags = kDisplayModeValidFlag | kDisplayModeSafeFlag;
@@ -1683,6 +1687,7 @@ IOReturn ReimsGraphics::getInformationForDisplayMode(IODisplayModeID displayMode
 	IOLockLock(stateLock);
 	bool ok = modeSet.modeFor(displayMode, &m);
 	bool preferred = ok && modeSet.isPreferred(m);
+	const bool stale = ok && modeSet.stale(m.id);
 	const UInt32 scale = displayScale;
 	UInt16 mmWide = 0, mmHigh = 0;
 	if (ok)
@@ -1699,7 +1704,7 @@ IOReturn ReimsGraphics::getInformationForDisplayMode(IODisplayModeID displayMode
 	info->nominalHeight = m.height;
 	info->refreshRate = static_cast<IOFixed1616>((static_cast<UInt64>(m.refreshMhz) << 16) / 1000);
 	info->maxDepthIndex = 0;
-	info->flags = modeFlags(m, preferred, scale);
+	info->flags = rgfxListedModeFlags(modeFlags(m, preferred, scale), stale);
 	info->imageWidth = mmWide;
 	info->imageHeight = mmHigh;
 	return kIOReturnSuccess;
@@ -1857,13 +1862,15 @@ IOReturn ReimsGraphics::connectFlags(IOIndex connectIndex, IODisplayModeID displ
 	IOLockLock(stateLock);
 	bool ok = modeSet.modeFor(displayMode, &m);
 	bool preferred = ok && modeSet.isPreferred(m);
+	const bool stale = ok && modeSet.stale(m.id);
 	const UInt32 scale = displayScale;
 	IOLockUnlock(stateLock);
 	IOReturn r = kIOReturnUnsupported;
 	if (connectIndex != 0 || !flags)
 		r = kIOReturnBadArgument;
 	else if (ok) {
-		*flags = modeFlags(m, preferred, scale) & kDisplayModeSafetyFlags;
+		*flags = rgfxListedModeFlags(modeFlags(m, preferred, scale), stale) &
+		         kDisplayModeSafetyFlags;
 		r = kIOReturnSuccess;
 	}
 	FBTRACE(48, "connectFlags conn %d mode %d -> 0x%x flags 0x%x", static_cast<int>(connectIndex),

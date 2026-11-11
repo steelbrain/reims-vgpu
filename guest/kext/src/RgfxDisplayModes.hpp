@@ -166,6 +166,10 @@ template <typename Timing, uint32_t Max> struct RgfxDisplayModes {
 		       host.id == preferredId;
 	}
 
+	// Whether the framebuffer lists the mode of an ID only as the mode set, which the device no
+	// longer shows (rgfxModeFlags): false before the device's first list.
+	bool stale(int32_t id) const { return modeCount && !shows(id); }
+
 	// Whether the device shows the mode of an ID: one it lists, or a programmed timing of one.
 	bool shows(int32_t id) const
 	{
@@ -323,6 +327,22 @@ struct RgfxConnectChange {
 		return true;
 	}
 };
+
+// IOGraphicsTypes.h's kDisplayModeNeverShowFlag, which the kext checks against it.
+constexpr uint32_t kRgfxModeNeverShowFlag = 0x00000080;
+
+// The IODisplayModeInformation flags the framebuffer answers for a mode whose own flags are
+// `flags` (ReimsGraphics::modeFlags): those, where the device shows the mode; where it no longer
+// does, and the framebuffer lists the mode only as the mode set (RgfxDisplayModes::stale), never
+// shown and not valid. Its information is still there for a WindowServer that reads it mid-change,
+// but no WindowServer can take it again. Listed valid, WindowServer restored a mode the person had
+// chosen at another window size to a display the device had resized, and drew it scaled into the
+// window (measured on macOS 11.7.11 to 15.8.2: chosen at 3360 x 1956, kept on a 2304 x 1410
+// window, WindowServer's log setting the old mode on the new display).
+constexpr uint32_t rgfxListedModeFlags(uint32_t flags, bool stale)
+{
+	return stale ? kRgfxModeNeverShowFlag : flags;
+}
 
 // The framebuffer's calls that name a mode and a depth.
 enum class RgfxModeCall {

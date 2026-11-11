@@ -205,6 +205,47 @@ void hiDpiModesHalveExactly()
 	check(!RgfxMode{0, 3663, 2040, 60000}.hiDpi(k2x), "not an odd width");
 }
 
+// A mode the device no longer shows, which the framebuffer lists while it is the mode set, is
+// answered never shown and not valid, so no WindowServer restores it to a resized display; the
+// device's modes, and the mode set while the device shows it, keep their own flags.
+void aModeTheDeviceNoLongerShowsIsNeverShown()
+{
+	constexpr uint32_t kShownFlags = 0x02800007; // valid, safe, default, valid for HiDPI, native
+	check(rgfxListedModeFlags(kShownFlags, false) == kShownFlags, "a shown mode keeps its flags");
+	check(rgfxListedModeFlags(kShownFlags, true) == 0x80, "a stale one: never shown, no other flag");
+	check((rgfxListedModeFlags(0x00000003, true) & 0x7) == 0, "not valid, not safe, not default");
+
+	Modes none;
+	none.reset();
+	check(!none.stale(1), "before the device's first list nothing is stale");
+
+	Modes m = started(kWindow);
+	int32_t window = m.current.id;
+	check(!m.stale(window), "the mode set the device shows is not stale");
+	check(m.take(&kResized, 1, 0), "the resize is a change");
+	check(lists(m, window) && m.stale(window), "the old mode set is listed, and stale");
+	check(!m.stale(m.preferredId), "the device's new mode is not");
+	RgfxMode shown;
+	check(m.modeFor(m.preferredId, &shown), "the new mode has its information");
+	m.set(shown);
+	check(!lists(m, window) && !m.stale(m.current.id), "once set, the old one goes");
+	RgfxMode both[2] = {kResized, kWindow};
+	RgfxMode again;
+	check(m.take(both, 2, 0) && m.deviceMode(kWindow.width, kWindow.height, kWindow.refreshMhz,
+	                                          &again),
+	      "the device shows the window's size again");
+	check(!m.stale(again.id) && !m.stale(m.current.id), "neither is stale");
+
+	// A programmed timing of a size the device no longer shows is stale; one it shows is not.
+	Modes p = started(kWindow);
+	Timing timing = {3};
+	p.clearProgrammed();
+	check(p.addProgrammed(kProgrammed, kWindow, timing, kReservedBase), "the timing is programmed");
+	p.followProgrammed();
+	check(!p.stale(kProgrammed), "the programmed timing of the device's size is not stale");
+	check(p.take(&kResized, 1, 0) && p.stale(kProgrammed), "after the resize it is");
+}
+
 // A mode or depth the framebuffer does not hold is answered as Apple's paravirtual framebuffer
 // answers it: kIOReturnUnsupportedMode for the pixel information, kIOReturnError elsewhere.
 void anUnknownModeIsAnsweredAsApplesFramebufferDoes()
@@ -232,6 +273,7 @@ int main()
 	aChangeAfterTheStartupModeIsSet();
 	idsStayWithTheirModes();
 	hiDpiModesHalveExactly();
+	aModeTheDeviceNoLongerShowsIsNeverShown();
 	anUnknownModeIsAnsweredAsApplesFramebufferDoes();
 	std::printf("display_modes_test: OK (%d checks)\n", checks);
 	return 0;
