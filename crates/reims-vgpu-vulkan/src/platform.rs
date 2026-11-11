@@ -382,12 +382,16 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
 /// texels it held before the pass, as Apple's GPU leaves them, rendered through a backing its
 /// command queue keeps, where the default stores it as the driver stores it, announcing
 /// `dont-care-store` where that is not Metal's own (`dont_care_colors`,
-/// `DontCareColorPolicy::Kept`). [`EXACT_ALL`] names every one. The
-/// policy's `completion` and `heap_compression` are no names of these: every device takes their
-/// exact forms ([`exact_policy`]). The rest of Metal's values the runtime answers with the
-/// device's own arithmetic, sampling and conversions, each difference a precision note it
-/// records, with no exact form to name.
-pub const EXACT_FORMS: [&str; 8] = [
+/// `DontCareColorPolicy::Kept`), and an attachment a pass loads `DontCare` and does not store
+/// cleared wherever the pass's draws reach it, so they read zero or the clear value, as Metal's
+/// draws read, where the default leaves it to the driver's `DONT_CARE` load on a driver not
+/// measured to clear it no slower, announcing `dont-care-unstored-load`
+/// (`unstored_dont_care_loads`, `UnstoredDontCarePolicy::Cleared`). [`EXACT_ALL`] names every
+/// one. The policy's `completion` and `heap_compression` are no names of these: every device
+/// takes their exact forms ([`exact_policy`]). The rest of Metal's values the runtime answers
+/// with the device's own arithmetic, sampling and conversions, each difference a precision note
+/// it records, with no exact form to name.
+pub const EXACT_FORMS: [&str; 9] = [
     "batch_order",
     "host_page_textures",
     "half_chains",
@@ -396,6 +400,7 @@ pub const EXACT_FORMS: [&str; 8] = [
     "extended_range_blits",
     "queue_sharing",
     "dont_care_colors",
+    "unstored_dont_care_loads",
 ];
 
 /// The name `REIMS_VGPU_EXACT` takes for the runtime's `DevicePolicy::exact_answers()`: every
@@ -438,7 +443,8 @@ fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
     use metal2vulkan::device::{
         BatchOrderPolicy, CompletionPolicy, DevicePolicy, DontCareColorPolicy,
         ExtendedRangeBlitPolicy, HalfChainPolicy, HeapCompressionPolicy, HostPageTexturePolicy,
-        PipelineWaitPolicy, QueueSharingPolicy, WideLinePolicy, YCbCrInPlacePolicy,
+        PipelineWaitPolicy, QueueSharingPolicy, UnstoredDontCarePolicy, WideLinePolicy,
+        YCbCrInPlacePolicy,
     };
     let mut policy = DevicePolicy::default();
     policy.completion = CompletionPolicy::Exact;
@@ -457,6 +463,9 @@ fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
             }
             "queue_sharing" => policy.queue_sharing = QueueSharingPolicy::PerQueue,
             "dont_care_colors" => policy.dont_care_colors = DontCareColorPolicy::Kept,
+            "unstored_dont_care_loads" => {
+                policy.unstored_dont_care_loads = UnstoredDontCarePolicy::Cleared;
+            }
             other => {
                 let line = format!(
                     "reims-vgpu: REIMS_VGPU_EXACT names {other:?}, none of {EXACT_ALL}, {}: \
@@ -753,7 +762,8 @@ pub(crate) mod tests {
         use metal2vulkan::device::{
             BatchOrderPolicy, CompletionPolicy, DevicePolicy, DontCareColorPolicy,
             ExtendedRangeBlitPolicy, HalfChainPolicy, HeapCompressionPolicy, HostPageTexturePolicy,
-            PipelineWaitPolicy, QueueSharingPolicy, WideLinePolicy, YCbCrInPlacePolicy,
+            PipelineWaitPolicy, QueueSharingPolicy, UnstoredDontCarePolicy, WideLinePolicy,
+            YCbCrInPlacePolicy,
         };
         let runtimes = DevicePolicy::default();
         assert_eq!(runtimes.completion, CompletionPolicy::Grouped);
@@ -771,6 +781,7 @@ pub(crate) mod tests {
         assert_eq!(fast.extended_range_blits, ExtendedRangeBlitPolicy::Kept);
         assert_eq!(fast.queue_sharing, QueueSharingPolicy::Adaptive);
         assert_eq!(fast.dont_care_colors, DontCareColorPolicy::Driver);
+        assert_eq!(fast.unstored_dont_care_loads, UnstoredDontCarePolicy::Driver);
         for unchanged in [
             None,
             Some(""),
@@ -786,7 +797,7 @@ pub(crate) mod tests {
         }
         let one = |name| exact_policy(Some(name));
         type Set = fn(&mut DevicePolicy);
-        let alone: [(&str, Set); 8] = [
+        let alone: [(&str, Set); 9] = [
             ("batch_order", |p| p.batch_order = BatchOrderPolicy::Exact),
             ("host_page_textures", |p| {
                 p.host_page_textures = HostPageTexturePolicy::Shadow;
@@ -807,6 +818,9 @@ pub(crate) mod tests {
             ("dont_care_colors", |p| {
                 p.dont_care_colors = DontCareColorPolicy::Kept;
             }),
+            ("unstored_dont_care_loads", |p| {
+                p.unstored_dont_care_loads = UnstoredDontCarePolicy::Cleared;
+            }),
         ];
         assert_eq!(alone.map(|(name, _)| name), EXACT_FORMS);
         let mut every = fast;
@@ -818,7 +832,7 @@ pub(crate) mod tests {
             set(&mut every);
         }
         let named = " half_chains,wide_lines,pipeline_waits,host_page_textures , batch_order,\
-                     queue_sharing,extended_range_blits,dont_care_colors";
+                     queue_sharing,extended_range_blits,dont_care_colors,unstored_dont_care_loads";
         assert_eq!(exact_policy(Some(named)), every);
         assert_eq!(exact_policy(Some(&EXACT_FORMS.join(","))), every);
         assert_eq!(one(EXACT_ALL), fast.exact_answers());

@@ -101,10 +101,10 @@
 //!   which the dma-buf pinned (RADV's, for any page with a file behind it):
 //!   `tests/no_copy_remap_linux.rs` measures a remap under each, on an RTX 5080 Laptop GPU and
 //!   on RADV's Radeon 780M and RX 7900 XTX. On those devices the GPU still reads the pages it
-//!   imported, as Metal's reads those it wired. Other drivers' host-pointer imports follow their
-//!   address (the runtime's `Device::pointer_imports_follow_their_address`, which it checks once
-//!   per driver, release and kernel: ANV, RADV and lavapipe answer yes), and one that validates
-//!   the pages again at each submission fails a submission that lists the import in that window.
+//!   imported, as Metal's reads those it wired. What other drivers' host-pointer imports read
+//!   after such a remap is unspecified (`VK_EXT_external_memory_host` leaves it to the driver),
+//!   and one that validates the pages again at each submission fails a submission that lists the
+//!   import in that window.
 //!   RADV's pointer imports take only pages with no file behind them (amdgpu's userptr), and it
 //!   lists every import in every submission: once a file's pages are mapped under one, every
 //!   submission of the device fails, the runtime answering

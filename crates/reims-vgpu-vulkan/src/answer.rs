@@ -3006,6 +3006,11 @@ mod tests {
         //   leave unused made canonical and a bfloat code moved through `half`: each draw
         //   announces `ExtendedRangeBitsKept`. A bfloat attachment's codes are values, so a draw in
         //   a pass that loads and stores one dies first (`encode_render`'s `bfloat_loaded`).
+        // - `DontCareUnstoredLoad`: the texels a pass's draws read of an attachment it loads
+        //   `DontCare` and does not store, left to the driver's `DONT_CARE` load where the driver
+        //   is not measured to clear it no slower, where an M3's draws read zero or the clear
+        //   value. Metal leaves a `DontCare` load's contents undefined, and the pass keeps none of
+        //   the attachment's texels, as it stores none.
         // - `DrawnDepthCopy`: a copy into a multisampled depth texture, or a pass's copies of a
         //   separate depth texture through its scratch image, which a fragment-depth draw writes
         //   where Metal copies the bytes: no copy of the device keeps a multisampled depth's
@@ -3090,11 +3095,12 @@ mod tests {
         //   writes 1, the AMD Radeon Pro 5300M and the Intel UHD Graphics 630 the samples that
         //   passed, as the runtime records), so no one nonzero value is Metal's; 0 where none
         //   passed, as Metal's.
-        const PRECISION: [D; 12] = [
+        const PRECISION: [D; 13] = [
             D::UncalibratedGpuTimes,
             D::UntimedCommandBuffer,
             D::GpuTimesFromHost,
             D::DontCareLoadTiles,
+            D::DontCareUnstoredLoad,
             D::ExtendedRangeBitsKept,
             D::DrawnDepthCopy,
             D::UnnamedShadowedTexture,
