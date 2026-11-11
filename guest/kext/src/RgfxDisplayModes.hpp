@@ -167,7 +167,7 @@ template <typename Timing, uint32_t Max> struct RgfxDisplayModes {
 	}
 
 	// Whether the framebuffer lists the mode of an ID only as the mode set, which the device no
-	// longer shows (rgfxModeFlags): false before the device's first list.
+	// longer shows (rgfxListedModeFlags): false before the device's first list.
 	bool stale(int32_t id) const { return modeCount && !shows(id); }
 
 	// Whether the device shows the mode of an ID: one it lists, or a programmed timing of one.
