@@ -14,7 +14,7 @@ Arch = "arm64e"
 MinKernel = "23.0.0"
 MaxKernel = ""
 Comment = "Binds and routes the owned guest kexts"
-sha256 = "ba6b3664a9243881d0a33d054c0dd5804ce3f3f31e7c9fbc13948c12d9acd389"
+sha256 = "b69f6f5f68153631759e320c2621427a1fb4257306e6af89214adad1d41991c9"
 
 [[kext]]
 BundlePath = "ReimsGraphics.kext"
