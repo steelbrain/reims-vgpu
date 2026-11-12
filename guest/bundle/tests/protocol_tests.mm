@@ -1363,8 +1363,8 @@ void test_queue_barriers()
 
 // --- the command buffer and the queue ---------------------------------------------
 
-// The encoders of features the device does not support are nil, logged; residency sets
-// (which the device does not make) change nothing; a capture boundary marks nothing.
+// The encoders of features the device does not support are nil, logged; no residency sets
+// change nothing; a capture boundary marks nothing.
 void test_command_buffer_and_queue_members()
 {
 	QueueFixture fx;

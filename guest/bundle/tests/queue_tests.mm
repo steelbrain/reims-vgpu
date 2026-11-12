@@ -9,6 +9,7 @@
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
+#import <objc/message.h>
 
 #include <algorithm>
 #include <atomic>
@@ -32,6 +33,7 @@
 #import "RgfxFunction.h"
 #import "RgfxIOSurface.h"
 #import "RgfxMetalPrivate.h"
+#import "RgfxResidencySet.h"
 #import "RgfxResource.h"
 #import "RgfxSharedEvent.h"
 #import "RgfxUnsupported.h"
@@ -2012,6 +2014,20 @@ void test_async_waits_run_after_their_handlers()
 	}
 }
 
+// Whether `body` raises the NSInvalidArgumentException of a counted set given nil to insert, as
+// Metal's queue and command buffer raise at a nil residency set (measured: the M3 Max, macOS
+// 27.0.1, oracle_residency).
+bool raisesInsertingNil(void (^body)(void))
+{
+	@try {
+		body();
+	} @catch (NSException *e) {
+		return [e.name isEqualToString:NSInvalidArgumentException] &&
+		       [e.reason isEqualToString:@"*** -[NSCountedSet addObject:]: attempt to insert nil"];
+	}
+	return false;
+}
+
 // The SPI's state a buffer keeps, as Metal's base buffer keeps it, and the answers a fresh buffer
 // of the AMD 5300M's and the Intel 630's gives; profilingResults times each stage the buffer
 // reached while profiling was enabled, under Metal's keys.
@@ -2042,10 +2058,18 @@ void test_command_buffer_spi_state()
 		[spi configWithCommandBufferDescriptor:[MTLCommandBufferDescriptor new]];
 		const int tasks[] = {1, 2};
 		[spi setResponsibleTaskIDs:tasks count:2];
-		// Metal's own residency sets are used as the caller's: none, and nothing logged.
-		[spi useInternalResidencySet:nil];
+		// Metal's own residency sets are used as the caller's: none, and nothing logged; nil
+		// raises where the device makes sets, as on the M3 Max (oracle_residency's
+		// cb-use-internal-nil).
 		id noSets[1] = {nil};
 		[spi useInternalResidencySets:noSets count:0];
+#if RgfxMakesResidencySets
+		CHECK(raisesInsertingNil(^{
+			[spi useInternalResidencySet:nil];
+		}));
+#else
+		[spi useInternalResidencySet:nil];
+#endif
 		CHECK(!RgfxUnsupportedWasLogged([RgfxCmdBuffer class], @selector(useResidencySet:)) &&
 		      !RgfxUnsupportedWasLogged([RgfxCmdBuffer class], @selector(useResidencySets:count:)));
 		[spi setProfilingEnabled:YES];
@@ -2202,6 +2226,93 @@ void test_finish_waits_for_committed_buffers()
 	}
 }
 
+#if RgfxMakesResidencySets
+// The arm64 device's queue holds a residency set as many times as it was added, and its command
+// buffer holds the sets it uses, and those its render and compute encoders are given, until it
+// completes, as Metal's do on the M3 Max (oracle_residency's queue, retain, hold, cb and
+// render-use and compute-use cases). A nil set raises the counted set's
+// NSInvalidArgumentException at the queue and the buffer, and the encoders pass over it.
+void test_residency_sets_are_held_until_let_go()
+{
+	Queue q(true);
+	__weak id held = nil;
+	@autoreleasepool {
+		RgfxResidencySet *set = [[RgfxResidencySet alloc] initWithDevice:nil descriptor:nil];
+		held = set;
+		[q.queue addResidencySet:set];
+		[q.queue addResidencySet:set];
+	}
+	CHECK(held != nil);
+	@autoreleasepool {
+		[q.queue removeResidencySet:held];
+	}
+	CHECK(held != nil);
+	@autoreleasepool {
+		[q.queue removeResidencySet:held];
+	}
+	CHECK(held == nil);
+	@autoreleasepool {
+		RgfxResidencySet *a = [[RgfxResidencySet alloc] initWithDevice:nil descriptor:nil];
+		RgfxResidencySet *b = [[RgfxResidencySet alloc] initWithDevice:nil descriptor:nil];
+		held = a;
+		id<MTLResidencySet> both[] = {a, b};
+		[q.queue removeResidencySet:a]; // never added: nothing
+		[q.queue addResidencySets:both count:2];
+		[q.queue addResidencySets:both count:0];
+		[q.queue removeResidencySets:both count:0];
+		[q.queue removeResidencySets:both count:2];
+		[q.queue removeResidencySets:both count:2];
+	}
+	CHECK(held == nil);
+	CHECK(raisesInsertingNil(^{
+		[q.queue addResidencySet:(id<MTLResidencySet> _Nonnull)nil];
+	}));
+	@try {
+		[q.queue removeResidencySet:(id<MTLResidencySet> _Nonnull)nil];
+		CHECK(false);
+	} @catch (NSException *e) {
+		CHECK([e.name isEqualToString:NSInvalidArgumentException] &&
+		      [e.reason isEqualToString:@"*** -[NSCountedSet removeObject:]: attempt to remove nil"]);
+	}
+
+	__weak id used = nil, viaRender = nil, viaCompute = nil;
+	id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+	@autoreleasepool {
+		RgfxResidencySet *u = [[RgfxResidencySet alloc] initWithDevice:nil descriptor:nil];
+		RgfxResidencySet *r = [[RgfxResidencySet alloc] initWithDevice:nil descriptor:nil];
+		RgfxResidencySet *c = [[RgfxResidencySet alloc] initWithDevice:nil descriptor:nil];
+		used = u;
+		viaRender = r;
+		viaCompute = c;
+		[cb useResidencySet:u];
+		id<MTLResidencySet> twice[] = {u, u};
+		[cb useResidencySets:twice count:2];
+		id<MTLRenderCommandEncoder> renc = [cb renderCommandEncoderWithDescriptor:pass()];
+		id renderSPI = renc;
+		((void (*)(id, SEL, id))objc_msgSend)(renderSPI, @selector(useResidencySet:), nil);
+		((void (*)(id, SEL, id))objc_msgSend)(renderSPI, @selector(useResidencySet:), r);
+		[renc endEncoding];
+		id<MTLComputeCommandEncoder> cenc = [cb computeCommandEncoder];
+		id<MTLResidencySet> withNil[] = {c, nil};
+		((void (*)(id, SEL, const id *, NSUInteger))objc_msgSend)(
+		    cenc, @selector(useResidencySets:count:), withNil, 2);
+		[cenc endEncoding];
+	}
+	CHECK(used != nil && viaRender != nil && viaCompute != nil);
+	CHECK(raisesInsertingNil(^{
+		[cb useResidencySet:(id<MTLResidencySet> _Nonnull)nil];
+	}));
+	@autoreleasepool {
+		[cb commit];
+	}
+	CHECK(used != nil && viaRender != nil && viaCompute != nil);
+	complete(q, cb);
+	CHECK(used == nil && viaRender == nil && viaCompute == nil);
+	CHECK(!RgfxUnsupportedWasLogged([RgfxCmdBuffer class], @selector(useResidencySet:)) &&
+	      !RgfxUnsupportedWasLogged([RgfxCommandQueue class], @selector(addResidencySet:)));
+}
+#endif
+
 } // namespace
 
 void rgfxQueueTests(const char *self)
@@ -2230,4 +2341,7 @@ void rgfxQueueTests(const char *self)
 	test_command_queue_spi_state();
 	test_queue_takes_its_descriptor();
 	test_finish_waits_for_committed_buffers();
+#if RgfxMakesResidencySets
+	test_residency_sets_are_held_until_let_go();
+#endif
 }

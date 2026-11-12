@@ -15,6 +15,7 @@
 #import "RgfxIndirectCommandBuffer.h"
 #import "RgfxMetalPrivate.h"
 #import "RgfxRasterizationRateMap.h"
+#import "RgfxResidencySet.h"
 #import "RgfxStateCache.h"
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
@@ -395,6 +396,39 @@ const char *bufferCause(NSUInteger length, MTLResourceOptions options, NSUIntege
 	                                      layerCount:layerCount
 	                                          layers:(MTLRasterizationRateLayerDescriptor *const *)layers];
 	return [self newRasterizationRateMapWithDescriptor:descriptor];
+}
+
+// --- residency sets --------------------------------------------------------------------------
+
+// The arm64 device makes a set, as Apple silicon's Metal does, and sets the error out to nil,
+// whatever it held (measured: macOS 27.0.1, the M3 Max, AGXG15XFamilyResidencySet, a nil
+// descriptor's among them; RgfxResidencySet.h). The x86 device answers nil and sets the error out
+// to nil, as the x86 Macs do (measured: macOS 26.7.1, the AMD Radeon Pro 5300M and the Intel UHD
+// 630: an error out holding an error before the call holds nil after it).
+- (id<MTLResidencySet>)newResidencySetWithDescriptor:(MTLResidencySetDescriptor *)desc
+                                               error:(NSError **)error
+{
+	if (error != nullptr)
+		*error = nil;
+#if RgfxMakesResidencySets
+	return [[RgfxResidencySet alloc] initWithDevice:self descriptor:desc];
+#else
+	RGFX_UNSUPPORTED("residency sets on the x86 device, as the x86 Macs make none");
+	return nil;
+#endif
+}
+
+// The object Metal's base device inits a residency set of (`@16@0:8`; initWithDevice:descriptor:,
+// as the M3 Max's AGXResidencySet answers it): the arm64 device's set, and nil on the x86 device,
+// as its public form above.
+- (id)allocResidencySet
+{
+#if RgfxMakesResidencySets
+	return [RgfxResidencySet alloc];
+#else
+	RGFX_UNSUPPORTED("residency sets on the x86 device, as the x86 Macs make none");
+	return nil;
+#endif
 }
 
 // --- heaps -------------------------------------------------------------------

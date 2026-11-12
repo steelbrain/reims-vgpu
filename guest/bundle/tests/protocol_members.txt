@@ -45,6 +45,9 @@
 %spi-answers what a fresh object of the kind of the AMD 5300M's and of the Intel 630's answers, for a member that takes no argument (measured: macOS 26.7.1, tools/oracle/oracle_spi_members.m answers)
 %in-flight NO while a command buffer that names the resource's memory is submitted and its completion is yet to be taken, for any use, and YES before and after, as the Intel 630 answers (measured: macOS 26.7.1, tools/oracle/oracle_complete.m; docs/graphics-kext/dgpu-oracle.md, Q26; RGFX_RESOURCE_SPI)
 %old-only a member only older guest releases' protocols carry (tests/protocol_members_releases.txt), with no public counterpart; no app pass on the releases that carry it showed a guest framework sending it to the bundle's objects (the bundle logs each selector it does not recognize, RGFX: unrecognized), so a call raises an unrecognized selector, as it did before
+%x86-residency residency sets on the x86 device, which makes none, as the x86 Macs make none (measured: macOS 26.7.1, the AMD 5300M and the Intel 630; RgfxMakesResidencySets, src/RgfxResidencySet.h): this register's bundle is the x86 one; the arm64 device makes them and its queue, command buffer and encoders hold them
+%residency-held the device keeps every allocation resident, so a residency set's request of residency, and its end, have nothing to do, and neither changes what the set answers, as on the M3 Max (measured: macOS 27.0.1, tools/oracle/oracle_residency)
+%residency-spi Metal's IOGPU queue and command buffer send it to their own sets (measured: the M3 Max, macOS 27.0.1, tools/oracle/oracle_residency layer-spy, which saw setCurrentGeneration: and setExpiredGeneration: of these, from IOGPU alone); the device's queue and command buffer are its own and send none, and QuartzCore, which changes a CAMetalLayer's set, sends none of them
 %old-only-device a member only macOS 11's or 12's MTLDeviceSPI carries (tests/protocol_members_releases.txt): on those releases the device's IOGPU base answers it, the guest's own class (measured: macOS 11.7.11, the device answers it); on the Mac the base lacks it
 
 [RgfxArgumentEncoder]
@@ -176,21 +179,21 @@ resourceStateCommandEncoderWithDescriptor: unsupported sparse textures
 retainedReferences implemented
 setLabel: implemented
 status implemented
-useResidencySet: partial residency sets
-useResidencySets:count: partial residency sets
+useResidencySet: partial %x86-residency
+useResidencySets:count: partial %x86-residency
 waitUntilCompleted implemented
 waitUntilScheduled implemented
 
 [RgfxCommandQueue]
-addResidencySet: partial residency sets
-addResidencySets:count: partial residency sets
+addResidencySet: partial %x86-residency
+addResidencySets:count: partial %x86-residency
 commandBuffer implemented
 commandBufferWithDescriptor: implemented
 commandBufferWithUnretainedReferences implemented
 insertDebugCaptureBoundary metal %debug
 label implemented
-removeResidencySet: partial residency sets
-removeResidencySets:count: partial residency sets
+removeResidencySet: partial %x86-residency
+removeResidencySets:count: partial %x86-residency
 setLabel: implemented
 
 [RgfxComputeCommandEncoder]
@@ -707,7 +710,7 @@ newRenderPipelineStateWithTileDescriptor:completionHandler: implemented
 newRenderPipelineStateWithTileDescriptor:error: implemented
 newRenderPipelineStateWithTileDescriptor:options:completionHandler: partial tile pipelines (no tile pipeline create on the wire)
 newRenderPipelineStateWithTileDescriptor:options:reflection:error: partial tile pipelines (no tile pipeline create on the wire)
-newResidencySetWithDescriptor:error: unsupported residency sets (none on the wire)
+newResidencySetWithDescriptor:error: partial %x86-residency
 newResourceGroupFromResources:count: unsupported resource groups
 newSamplerStateWithDescriptor: implemented
 newSharedEvent implemented
@@ -1241,6 +1244,22 @@ shaderValidation metal %no-validation
 supportIndirectCommandBuffers implemented
 threadgroupSizeMatchesTileSize implemented
 
+[RgfxResidencySet]
+addAllocation: implemented
+addAllocations:count: implemented
+allAllocations implemented
+allocatedSize implemented
+allocationCount implemented
+commit implemented
+containsAllocation: implemented
+device implemented
+endResidency metal %residency-held
+label implemented
+removeAllAllocations implemented
+removeAllocation: implemented
+removeAllocations:count: implemented
+requestResidency metal %residency-held
+
 [RgfxResource]
 device implemented
 heap implemented
@@ -1512,8 +1531,8 @@ setThreadgroupDistributionModeWithClusterGroupIndex: metal does nothing, as Meta
 setThreadgroupPackingDisabled: metal raises an unrecognized selector, as Metal's base encoder does: it sends itself doesNotRecognizeSelector: (read from code, %enc-base)
 setToolsDispatchBufferSPI:atIndex: metal raises an unrecognized selector, as Metal's IOAccel compute encoder does: it sends itself doesNotRecognizeSelector: (read from code, %enc-base)
 signalProgress: absent %spi-neither
-useResidencySet: partial  residency sets
-useResidencySets:count: partial  residency sets
+useResidencySet: partial %x86-residency
+useResidencySets:count: partial %x86-residency
 useResourceGroup:usage: absent %spi-neither
 waitForProgress: absent %spi-neither
 waitForVirtualSubstream: absent %spi-neither
@@ -1784,8 +1803,8 @@ setTriangleFrontFillMode:backFillMode: absent %spi-neither
 setVertexAmplificationMode:value: unsupported a vertex amplification mode
 setVertexSamplerState:lodMinClamp:lodMaxClamp:lodBias:atIndex: absent %spi-neither
 setViewportTransformEnabled: absent %spi-neither
-useResidencySet: partial  residency sets
-useResidencySets:count: partial  residency sets
+useResidencySet: partial %x86-residency
+useResidencySets:count: partial %x86-residency
 useResourceGroup:usage:stages: absent %spi-neither
 [RgfxRenderPipelineState]
 emulationMeshMaxPrimitiveCount metal 0, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
@@ -1861,6 +1880,13 @@ vertexDebugInstrumentationData metal nil, as Metal's base pipeline answers for o
 vertexFunctionHandleWithFunction: unsupported function pointers
 vertexGlobalConstantsBase metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
 vertexGlobalConstantsSize metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+[RgfxResidencySet]
+allCommittedAllocations absent %residency-spi
+currentGeneration absent %residency-spi
+expiredGeneration absent %residency-spi
+generationForAllocation: absent %residency-spi
+setCurrentGeneration: absent %residency-spi
+setExpiredGeneration: absent %residency-spi
 [RgfxResource]
 protectionOptions metal the content protection the resource was made with: the device protects no content and no call sets it, so none
 responsibleProcess implemented

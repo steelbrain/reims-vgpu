@@ -17758,6 +17758,8 @@ void rgfxArchiveTests();
 void rgfxResourceTests();
 void rgfxQueueTests(const char *self);
 int rgfxQueueDiesCase(const char *name);
+void rgfxResidencyTests(const char *self);
+int rgfxResidencyDiesCase(const char *name);
 int rgfxQueueTimings(int rounds);
 void rgfxCreateTests();
 void rgfxKnownPipelineTests();
@@ -17821,6 +17823,8 @@ int main(int argc, char **argv)
 		return dies_case(argv[2]);
 	if (argc == 3 && std::strcmp(argv[1], "--queue-dies") == 0)
 		return rgfxQueueDiesCase(argv[2]);
+	if (argc == 3 && std::strcmp(argv[1], "--residency-dies") == 0)
+		return rgfxResidencyDiesCase(argv[2]);
 	// A measurement, run by hand: the guest's share of a buffer's scheduling and completion
 	// (tests/queue_tests.mm).
 	if (argc >= 2 && std::strcmp(argv[1], "--queue-timing") == 0)
@@ -17994,6 +17998,7 @@ int main(int argc, char **argv)
 		rgfxArchiveTests();  // tests/archive_tests.mm
 		rgfxResourceTests(); // tests/resource_tests.mm
 		rgfxQueueTests(argv[0]); // tests/queue_tests.mm
+		rgfxResidencyTests(argv[0]); // tests/residency_tests.mm
 		rgfxCreateTests();        // tests/create_tests.mm
 		rgfxKnownPipelineTests(); // tests/known_pipeline_tests.mm
 		rgfxIcbTests();           // tests/icb_tests.mm

@@ -52,6 +52,7 @@
 #import "RgfxMetalError.h"
 #import "RgfxMetalPrivate.h"
 #import "RgfxRenderPipelineState.h"
+#import "RgfxResidencySet.h"
 #import "RgfxUnsupported.h"
 #import "RgfxUploads.h"
 
@@ -775,6 +776,9 @@ struct RgfxBarrierSlot {
 	// finish's: each command buffer committed to it with a reader is in it until it has
 	// completed (RgfxCmdBuffer's commit and rgfxDeliverCompletion:).
 	dispatch_group_t _committedGroup;
+	// The residency sets it is given, each as many times as it was added (RESIDENCY SETS, below),
+	// under @synchronized(self): made with the queue on the arm64 device, none on the x86 one.
+	NSCountedSet *_residencySets;
 }
 
 + (instancetype)queueWithSubmitRing:(RgfxRingWriter *)submitRing
@@ -814,6 +818,9 @@ struct RgfxBarrierSlot {
 		// completion queue is set: Metal's has this label and user-interactive QoS, one queue's
 		// handlers run one at a time and two queues' at once (measured on the M3 Max, an AMD
 		// 5300M and an Intel 630).
+#if RgfxMakesResidencySets
+		q->_residencySets = [NSCountedSet set];
+#endif
 		q->_ownCompletionQueue = dispatch_queue_create(
 		    "com.Metal.CompletionQueueDispatch",
 		    dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE,
@@ -1118,29 +1125,62 @@ struct RgfxBarrierSlot {
 {
 }
 
-// --- unsupported: the device makes no residency set (newResidencySetWithDescriptor:error:) ---
+// --- RESIDENCY SETS ---------------------------------------------------------------------------
+// The arm64 device's queue holds the sets it is given, each as many times as it was added, and
+// lets one go once it is removed as many times, as Metal's queue counts them in an NSCountedSet
+// (measured: the M3 Max, macOS 27.0.1, tools/oracle/oracle_residency's queue and retain cases):
+// the device keeps every allocation resident, so holding them is all a queue does. A nil set
+// raises the counted set's NSInvalidArgumentException, as Metal's queue does; a set never added
+// is removed with nothing done. The x86 device makes no set (RgfxMakesResidencySets), and its
+// queue logs one it is given.
 
 - (void)addResidencySet:(id<MTLResidencySet>)residencySet
 {
+#if RgfxMakesResidencySets
+	@synchronized(self) {
+		[_residencySets addObject:residencySet];
+	}
+#else
 	if (residencySet != nil)
 		RGFX_UNSUPPORTED("residency sets");
+#endif
 }
 - (void)addResidencySets:(const id<MTLResidencySet> _Nonnull[_Nonnull])residencySets
                    count:(NSUInteger)count
 {
+#if RgfxMakesResidencySets
+	@synchronized(self) {
+		for (NSUInteger i = 0; i < count; i++)
+			[_residencySets addObject:residencySets[i]];
+	}
+#else
 	if (count != 0)
 		RGFX_UNSUPPORTED("residency sets");
+#endif
 }
 - (void)removeResidencySet:(id<MTLResidencySet>)residencySet
 {
+#if RgfxMakesResidencySets
+	@synchronized(self) {
+		[_residencySets removeObject:residencySet];
+	}
+#else
 	if (residencySet != nil)
 		RGFX_UNSUPPORTED("residency sets");
+#endif
 }
 - (void)removeResidencySets:(const id<MTLResidencySet> _Nonnull[_Nonnull])residencySets
                       count:(NSUInteger)count
 {
+#if RgfxMakesResidencySets
+	@synchronized(self) {
+		for (NSUInteger i = 0; i < count; i++)
+			[_residencySets removeObject:residencySets[i]];
+	}
+#else
 	if (count != 0)
 		RGFX_UNSUPPORTED("residency sets");
+#endif
 }
 
 // --- dispatch queues and priority (MTLCommandQueue SPI WindowServer sets) -----------
@@ -1634,6 +1674,9 @@ enum RgfxStage : unsigned {
 	std::atomic<MTLCommandBufferStatus> _status;
 	NSString *_cbLabel;
 	NSMutableDictionary *_userDictionary; // userDictionary, made when first asked
+	// The residency sets it uses, each as many times as it was used, under @synchronized(self):
+	// made at the first use, let go once it completes (useResidencySet:).
+	NSCountedSet *_residencySets;
 	// What the client asked of the buffer's content protection (setProtectionOptions:).
 	uint64_t _protectionOptions;
 	// The error options its descriptor asked for (commandBufferWithDescriptor:).
@@ -2552,6 +2595,7 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	// wake, as Metal's buffer lets its retained references go; the blocks
 	// __waitUntilCompletedAsync: was given run between the two, as Metal's do.
 	_kept.clear();
+	[self rgfxLetResidencySetsGo];
 	[self rgfxRunWaiters:_completedWaiters done:&_completedWaitersDone];
 	if (_done != nil && !_left.exchange(true)) {
 		dispatch_group_leave(_done);
@@ -2943,17 +2987,50 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	RGFX_UNSUPPORTED("sparse textures");
 	return nil;
 }
-// The device makes no residency set (newResidencySetWithDescriptor:error:).
+// The arm64 device's buffer holds the residency sets it uses, each as many times as it was used,
+// from the use until it completes, as Metal's buffer counts them in an NSCountedSet and lets
+// them go at its completion (measured: the M3 Max, macOS 27.0.1, tools/oracle/oracle_residency's
+// cb, retain and hold cases): the device keeps every allocation resident, so holding them is all
+// a buffer does. A nil set raises the counted set's NSInvalidArgumentException, as Metal's
+// buffer does, and a use after the commit is taken. The x86 device makes no set
+// (RgfxMakesResidencySets), and its buffer logs one it is given.
 - (void)useResidencySet:(id<MTLResidencySet>)residencySet
 {
+#if RgfxMakesResidencySets
+	@synchronized(self) {
+		if (_residencySets == nil)
+			_residencySets = [NSCountedSet set];
+		[_residencySets addObject:residencySet];
+	}
+#else
 	if (residencySet != nil)
 		RGFX_UNSUPPORTED("residency sets");
+#endif
 }
 - (void)useResidencySets:(const id<MTLResidencySet> _Nonnull[_Nonnull])residencySets
                    count:(NSUInteger)count
 {
+#if RgfxMakesResidencySets
+	@synchronized(self) {
+		if (_residencySets == nil)
+			_residencySets = [NSCountedSet set];
+		for (NSUInteger i = 0; i < count; i++)
+			[_residencySets addObject:residencySets[i]];
+	}
+#else
 	if (count != 0)
 		RGFX_UNSUPPORTED("residency sets");
+#endif
+}
+
+// At its completion: the residency sets it used go, after the lock.
+- (void)rgfxLetResidencySetsGo
+{
+	NS_VALID_UNTIL_END_OF_SCOPE NSCountedSet *used = nil;
+	@synchronized(self) {
+		used = _residencySets;
+		_residencySets = nil;
+	}
 }
 
 // --- what Core Image and MPS send a command buffer beyond MTLCommandBuffer ------------
@@ -4998,18 +5075,33 @@ RGFX_LOG_UNRECOGNIZED
 	RGFX_UNSUPPORTED("tile dispatches over a region");
 }
 
-// Metal takes nil and its own sets; the device makes no residency set
-// (newResidencySetWithDescriptor:error:), so nil is the only one this can be sent.
+// Metal's render and compute encoders take a residency set and nil (measured: the M3 Max, macOS
+// 27.0.1, tools/oracle/oracle_residency's render-use and compute-use cases). The arm64 device's
+// encoder has its command buffer hold a set it is given until the buffer completes (useResidencySet:
+// there), which is all the device needs, as it keeps every allocation resident, and passes over
+// nil. The x86 device makes no set (RgfxMakesResidencySets), and its encoder logs one it is given.
 - (void)useResidencySet:(id<MTLResidencySet>)residencySet
 {
+#if RgfxMakesResidencySets
+	if (residencySet != nil)
+		[_commandBuffer useResidencySet:residencySet];
+#else
 	if (residencySet != nil)
 		RGFX_UNSUPPORTED("residency sets");
+#endif
 }
 - (void)useResidencySets:(const id<MTLResidencySet> _Nonnull[_Nonnull])residencySets
                    count:(NSUInteger)count
 {
+#if RgfxMakesResidencySets
+	for (NSUInteger i = 0; i < count; i++) {
+		if (residencySets[i] != nil)
+			[_commandBuffer useResidencySet:residencySets[i]];
+	}
+#else
 	if (count != 0)
 		RGFX_UNSUPPORTED("residency sets");
+#endif
 }
 
 @end
@@ -5447,18 +5539,29 @@ RGFX_LOG_UNRECOGNIZED
 
 // --- what MPS sends a compute encoder beyond its protocol ----------------------------
 
-// Metal takes nil (and its own sets); the device makes no residency set, as the render
-// encoder's.
+// As the render encoder's.
 - (void)useResidencySet:(id<MTLResidencySet>)residencySet
 {
+#if RgfxMakesResidencySets
+	if (residencySet != nil)
+		[_commandBuffer useResidencySet:residencySet];
+#else
 	if (residencySet != nil)
 		RGFX_UNSUPPORTED("residency sets");
+#endif
 }
 - (void)useResidencySets:(const id<MTLResidencySet> _Nonnull[_Nonnull])residencySets
                    count:(NSUInteger)count
 {
+#if RgfxMakesResidencySets
+	for (NSUInteger i = 0; i < count; i++) {
+		if (residencySets[i] != nil)
+			[_commandBuffer useResidencySet:residencySets[i]];
+	}
+#else
 	if (count != 0)
 		RGFX_UNSUPPORTED("residency sets");
+#endif
 }
 
 // A loop the GPU runs while a value in `buffer` compares true: none on the wire, so it is

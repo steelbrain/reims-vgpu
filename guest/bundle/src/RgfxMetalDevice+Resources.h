@@ -5,7 +5,8 @@
  * depth/stencil states and heaps — each a thin forwarder to the matching wrapper
  * factory (RgfxBuffer/RgfxTexture/RgfxHeap), routing through the device's
  * `-serializer`, or, for samplers and depth/stencil states, to the device's
- * RgfxStateCache, which answers equal descriptors with one object.
+ * RgfxStateCache, which answers equal descriptors with one object. It also makes
+ * the arm64 device's residency sets (RgfxResidencySet), which the host never sees.
  *
  * Like the device class itself, this category is COMPILED into the bundle but not
  * linked into the user-space unit test: it names RgfxMetalDevice, which subclasses

@@ -125,24 +125,6 @@ NSError *metal4Refusal()
 	return nil;
 }
 
-// The x86 Macs answer nil and set the error out to nil, whatever it held (measured: macOS 26.7.1,
-// the AMD Radeon Pro 5300M and the Intel UHD 630: an error out holding an error before the call
-// holds nil after it), and so does the x86 device. An M3 makes a set (measured: macOS 27.0.1, the
-// M3 Max, AGXG15XFamilyResidencySet, with no error), which the device cannot: the arm64 device
-// answers nil and an error, as a use the device does not support.
-- (id<MTLResidencySet>)newResidencySetWithDescriptor:(MTLResidencySetDescriptor *)desc
-                                               error:(NSError **)error
-{
-#if defined(__arm64__)
-	RGFX_UNSUPPORTED_ERROR(error, "residency sets (none on the wire)");
-#else
-	RGFX_UNSUPPORTED("residency sets (none on the wire)");
-	if (error != nullptr)
-		*error = nil;
-#endif
-	return nil;
-}
-
 // --- counters and shader logging ------------------------------------------------------
 
 - (id<MTLCounterSampleBuffer>)newCounterSampleBufferWithDescriptor:
@@ -437,14 +419,8 @@ NSError *metal4Refusal()
 	return nil;
 }
 
-// Residency sets (`@16@0:8`), counters' resolve (`@40@0:8@16{_NSRange=QQ}24`) and textures
-// shared by handle at a resource index (`@32@0:8@16Q24`), as their public forms above.
-- (id)allocResidencySet
-{
-	RGFX_UNSUPPORTED("residency sets (none on the wire)");
-	return nil;
-}
-
+// Counters' resolve (`@40@0:8@16{_NSRange=QQ}24`) and textures shared by handle at a resource
+// index (`@32@0:8@16Q24`), as their public forms above.
 - (NSData *)resolveCounters:(id<MTLCounterSampleBuffer>)buffer withRange:(NSRange)range
 {
 	RGFX_UNSUPPORTED("counter sampling");
