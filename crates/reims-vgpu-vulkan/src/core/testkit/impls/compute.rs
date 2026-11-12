@@ -217,6 +217,22 @@ impl ComputeEncoder<FakePlatform> for Fk<kind::ComputeEncoder> {
             ComputeCmd::SetThreadgroupMemoryLength { length, index } => {
                 self.act(Policy::Caught, sel, vec![Arg::U64(length), Arg::U64(index)])
             }
+            ComputeCmd::SetVisibleFunctionTable {
+                function_table,
+                buffer_index,
+            } => self.act(
+                Policy::Caught,
+                sel,
+                vec![Arg::opt(function_table), Arg::U64(buffer_index)],
+            ),
+            ComputeCmd::SetVisibleFunctionTables {
+                function_tables,
+                range,
+            } => self.act(
+                Policy::Caught,
+                sel,
+                vec![Arg::objs(function_tables), Arg::val(&range)],
+            ),
             ComputeCmd::UpdateFence { fence } => {
                 self.act(Policy::Caught, "updateFence:", vec![Arg::obj(fence)])
             }

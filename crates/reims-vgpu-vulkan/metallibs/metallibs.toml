@@ -24,6 +24,7 @@
 "linked_callee.metallib" = "12e554dcb8248e43489597dd8e013b07dcfc61719c2ff567c44088676df109a3"
 "mesh.metallib" = "a4f408406cf4201e2eb244bb0d2e90ce6bf543a454866ec31aee2ad888e059d6"
 "optional_constant.metallib" = "7d4cb5e3a6fd887205add821821245423e460038a0c870994fab9bec715c2e39"
+"visible_tables.metallib" = "d731c94b34f9d54c7ee3096f16c30db05c5e002d9579e96522020c286846e062"
 "rounding_safe.metallib" = "b272a5e4e790f013a6fc42a1a821cfc1c6a140b32ebb8a9444b72584d3c137dc"
 "ci_kernel.metallib" = "d50192b91cff2f1163026c3dfcaf3e2d0a06216da5261480815baf39e60a819e"
 "stitchable.metallib" = "9fcb57e471dc781b5aa51d59ee0d67d910242524eeb63cd114b50cfe50e5736c"

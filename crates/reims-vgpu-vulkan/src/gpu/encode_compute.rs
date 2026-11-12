@@ -435,6 +435,24 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                 let (length, index) = (small(sel, length), small(sel, index));
                 caught(&mut |e| e.set_threadgroup_memory_length(length, index))
             }
+            ComputeCmd::SetVisibleFunctionTable {
+                function_table,
+                buffer_index,
+            } => {
+                let index = small(sel, buffer_index);
+                caught(&mut |e| e.set_visible_function_table(function_table.map(|t| &**t), index))
+            }
+            ComputeCmd::SetVisibleFunctionTables {
+                function_tables,
+                range,
+            } => {
+                let at = first(sel, range, &[function_tables.len()]);
+                listed(
+                    function_tables,
+                    |t| t.map(|t| &**t),
+                    |tables| caught(&mut |e| e.set_visible_function_tables(tables, at)),
+                )
+            }
             ComputeCmd::UpdateFence { fence } => caught(&mut |e| e.update_fence(fence)),
             ComputeCmd::UseHeaps { heaps } => {
                 let heaps: Vec<&rt::Heap> = heaps.iter().flatten().map(|h| &h.raw).collect();

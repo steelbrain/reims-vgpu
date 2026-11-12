@@ -165,6 +165,18 @@ pub enum ComputeCmd<'a, P: Platform> {
     },
     /// `setThreadgroupMemoryLength:atIndex:`
     SetThreadgroupMemoryLength { length: u64, index: u64 },
+    /// `setVisibleFunctionTable:atBufferIndex:`
+    /// nil: kept `Option`; nil unbinds the index, as Metal's does.
+    SetVisibleFunctionTable {
+        function_table: Option<&'a P::VisibleFunctionTable>,
+        buffer_index: u64,
+    },
+    /// `setVisibleFunctionTables:withBufferRange:`
+    /// `function_tables`: its length is `range.length`.
+    SetVisibleFunctionTables {
+        function_tables: &'a [Option<&'a P::VisibleFunctionTable>],
+        range: NsRange,
+    },
     /// `updateFence:`
     /// nil: `fence` — never nil: it comes from `getFenceForReferenceNonNull:`, which
     /// throws on nil.
@@ -230,6 +242,8 @@ impl<P: Platform> ComputeCmd<'_, P> {
             Self::SetTexture { .. } => "setTexture:atIndex:",
             Self::SetTextures { .. } => "setTextures:withRange:",
             Self::SetThreadgroupMemoryLength { .. } => "setThreadgroupMemoryLength:atIndex:",
+            Self::SetVisibleFunctionTable { .. } => "setVisibleFunctionTable:atBufferIndex:",
+            Self::SetVisibleFunctionTables { .. } => "setVisibleFunctionTables:withBufferRange:",
             Self::UpdateFence { .. } => "updateFence:",
             Self::UseHeaps { .. } => "useHeaps:count:",
             Self::UseResources { .. } => "useResources:count:usage:",

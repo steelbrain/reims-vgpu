@@ -36,6 +36,7 @@ use crate::gpu::encode_blit::VulkanBlitEncoder;
 use crate::gpu::encode_compute::VulkanComputeEncoder;
 use crate::gpu::encode_render::VulkanRenderEncoder;
 use crate::gpu::event::{VulkanEvent, VulkanSharedEvent, VulkanSharedEventListener};
+use crate::gpu::function_table::{VulkanFunctionHandle, VulkanVisibleFunctionTable};
 use crate::gpu::icb::{VulkanIcb, VulkanIndirectComputeCommand, VulkanIndirectRenderCommand};
 use crate::gpu::rate_map::{VulkanRateMap, VulkanRateMapDescriptor, VulkanRateMapLayerDescriptor};
 use crate::gpu::resource::{
@@ -621,6 +622,8 @@ impl Platform for VulkanPlatform {
     type Library = VulkanLibrary;
     type Function = VulkanFunction;
     type ComputePipeline = VulkanComputePipeline;
+    type FunctionHandle = VulkanFunctionHandle;
+    type VisibleFunctionTable = VulkanVisibleFunctionTable;
     type RenderPipeline = VulkanRenderPipeline;
     type RateMap = VulkanRateMap;
     type Icb = VulkanIcb;

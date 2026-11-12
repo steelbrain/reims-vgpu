@@ -137,6 +137,7 @@ use crate::gpu::command::{CommandBufferObject, VulkanCommandBuffer};
 use crate::gpu::device::VulkanDevice;
 use crate::gpu::encode_blit::EncoderObject;
 use crate::gpu::encode_compute::VulkanComputeEncoder;
+use crate::gpu::function_table::VulkanVisibleFunctionTable;
 use crate::gpu::icb::{Inherits, VulkanIcb};
 use crate::gpu::resource::{
     VulkanBuffer, VulkanComputePipeline, VulkanHeap, VulkanSamplerState, VulkanTexture,
@@ -348,6 +349,8 @@ struct Bindings {
     pipeline: Option<VulkanComputePipeline>,
     /// Each buffer with its offset and attribute stride.
     buffers: BTreeMap<u32, (VulkanBuffer, u64, u64)>,
+    /// Each visible function table, at a buffer index no buffer holds.
+    tables: BTreeMap<u32, VulkanVisibleFunctionTable>,
     textures: BTreeMap<u32, VulkanTexture>,
     /// Each sampler state with the LOD clamps its bind set.
     samplers: BTreeMap<u32, (VulkanSamplerState, Option<(f32, f32)>)>,
@@ -376,6 +379,11 @@ impl Bindings {
                 .iter()
                 .map(|(i, (b, o, s))| (*i, (b.clone_ref(), *o, *s)))
                 .collect(),
+            tables: self
+                .tables
+                .iter()
+                .map(|(i, t)| (*i, t.clone_ref()))
+                .collect(),
             textures: self
                 .textures
                 .iter()
@@ -397,6 +405,7 @@ impl Bindings {
     }
 
     fn bind_buffer(&mut self, at: u32, buffer: Option<&VulkanBuffer>, offset: u64, stride: u64) {
+        self.tables.remove(&at);
         match buffer {
             Some(b) => {
                 self.buffers.insert(at, (b.clone_ref(), offset, stride));
@@ -419,6 +428,19 @@ impl Bindings {
             }
             None => {
                 self.samplers.remove(&at);
+            }
+        }
+    }
+
+    /// A table at buffer index `at`, in place of any buffer there; nil unbinds the index.
+    fn bind_table(&mut self, at: u32, table: Option<&VulkanVisibleFunctionTable>) {
+        self.buffers.remove(&at);
+        match table {
+            Some(t) => {
+                self.tables.insert(at, t.clone_ref());
+            }
+            None => {
+                self.tables.remove(&at);
             }
         }
     }
@@ -529,6 +551,22 @@ impl Bindings {
                     self.threadgroup_lengths.insert(at, length);
                 }
             }
+            ComputeCmd::SetVisibleFunctionTable {
+                function_table,
+                buffer_index: at,
+            } => {
+                if let Some(at) = index(at) {
+                    self.bind_table(at, function_table);
+                }
+            }
+            ComputeCmd::SetVisibleFunctionTables {
+                function_tables,
+                range,
+            } => {
+                for (at, t) in indices(range).zip(function_tables) {
+                    self.bind_table(at, *t);
+                }
+            }
             _ => {}
         }
     }
@@ -576,6 +614,24 @@ fn restore(
                 }
                 None => e.set_buffer(None, 0, at)?,
             }
+        }
+    }
+    // A table where `to` holds one, after the buffers: a step's buffer at its index, or a buffer
+    // `from` held there, is replaced; one `from` held where `to` holds nothing is unbound.
+    let step_slots = if stepped { 0..STEP_SLOTS } else { 0..0 };
+    let slots: BTreeSet<u32> = from
+        .tables
+        .keys()
+        .chain(to.tables.keys())
+        .copied()
+        .chain(step_slots)
+        .collect();
+    for at in slots {
+        let (was, now) = (from.tables.get(&at), to.tables.get(&at));
+        let stepped_over = stepped && at < STEP_SLOTS && now.is_some();
+        let moved_off = was.is_some() && now.is_none() && !to.buffers.contains_key(&at);
+        if stepped_over || moved_off || (now.is_some() && !same(was, now)) {
+            e.set_visible_function_table(now.map(|t| &**t), at)?;
         }
     }
     let slots: BTreeSet<u32> = from
@@ -726,6 +782,8 @@ enum Owned {
     SetTexture(Option<VulkanTexture>, u64),
     SetTextures(Vec<Option<VulkanTexture>>, NsRange),
     SetThreadgroupMemoryLength(u64, u64),
+    SetTable(Option<VulkanVisibleFunctionTable>, u64),
+    SetTables(Vec<Option<VulkanVisibleFunctionTable>>, NsRange),
     UseHeaps(Vec<Option<VulkanHeap>>),
     UseResources(Vec<Option<Resource>>, u64),
 }
@@ -875,6 +933,14 @@ impl Owned {
             ComputeCmd::SetThreadgroupMemoryLength { length, index } => {
                 Owned::SetThreadgroupMemoryLength(length, index)
             }
+            ComputeCmd::SetVisibleFunctionTable {
+                function_table,
+                buffer_index,
+            } => Owned::SetTable(function_table.map(Handle::clone_ref), buffer_index),
+            ComputeCmd::SetVisibleFunctionTables {
+                function_tables,
+                range,
+            } => Owned::SetTables(held(function_tables), range),
             ComputeCmd::UseHeaps { heaps } => Owned::UseHeaps(held(heaps)),
             ComputeCmd::UseResources {
                 resources: list,
@@ -1069,6 +1135,23 @@ impl Owned {
                     index: *index,
                 },
             ),
+            Owned::SetTable(table, index) => enc.encode(
+                on,
+                ComputeCmd::SetVisibleFunctionTable {
+                    function_table: table.as_ref(),
+                    buffer_index: *index,
+                },
+            ),
+            Owned::SetTables(tables, range) => {
+                let tables = lent(tables);
+                enc.encode(
+                    on,
+                    ComputeCmd::SetVisibleFunctionTables {
+                        function_tables: &tables,
+                        range: *range,
+                    },
+                )
+            }
             Owned::UseHeaps(heaps) => {
                 let heaps = lent(heaps);
                 enc.encode(on, ComputeCmd::UseHeaps { heaps: &heaps })

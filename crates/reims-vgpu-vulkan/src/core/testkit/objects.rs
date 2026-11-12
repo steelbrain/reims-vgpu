@@ -41,6 +41,7 @@ use super::clock::VirtualClock;
 use super::guest_ram::{PAGE_SIZE, RawRegion};
 use super::impls::descriptor::{PassModel, TextureDescriptorModel};
 use super::impls::device::DeviceModel;
+use super::impls::function_table::FunctionTableModel;
 use super::impls::icb::{IcbCommandModel, IcbModel};
 use super::impls::rate_map::{RateMapDescriptorModel, RateMapModel};
 use super::impls::resource::PipelineModel;
@@ -103,6 +104,8 @@ pub mod kind {
         Library => "MTLLibrary",
         Function => "MTLFunction",
         ComputePipeline => "MTLComputePipelineState",
+        FunctionHandle => "MTLFunctionHandle",
+        VisibleFunctionTable => "MTLVisibleFunctionTable",
         RenderPipeline => "MTLRenderPipelineState",
         RateMap => "MTLRasterizationRateMap",
         Icb => "MTLIndirectCommandBuffer",
@@ -454,6 +457,8 @@ pub enum Model {
     Pipeline(PipelineModel),
     /// A rasterization rate map.
     RateMap(RateMapModel),
+    /// A visible function table.
+    FunctionTable(FunctionTableModel),
     /// An indirect command buffer.
     Icb(IcbModel),
     /// An ICB's render or compute command.
@@ -509,6 +514,7 @@ model_of! {
     TextureModel => Texture,
     PipelineModel => Pipeline,
     RateMapModel => RateMap,
+    FunctionTableModel => FunctionTable,
     IcbModel => Icb,
     IcbCommandModel => IcbCommand,
     LayerModel => Layer,
@@ -549,6 +555,7 @@ impl State {
             Model::State(c) => Some(c),
             Model::Pipeline(p) => Some(&mut p.common),
             Model::RateMap(r) => Some(&mut r.common),
+            Model::FunctionTable(t) => Some(&mut t.common),
             Model::Icb(i) => Some(&mut i.common),
             _ => None,
         }
@@ -563,6 +570,7 @@ impl State {
             Model::State(c) => Some(c),
             Model::Pipeline(p) => Some(&p.common),
             Model::RateMap(r) => Some(&r.common),
+            Model::FunctionTable(t) => Some(&t.common),
             Model::Icb(i) => Some(&i.common),
             _ => None,
         }

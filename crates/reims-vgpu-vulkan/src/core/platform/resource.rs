@@ -1,6 +1,7 @@
 //! Platform traits for Metal resources and state objects: `GpuResource`, `Buffer`, `Texture`,
 //! `Heap`, `SamplerState` (architecture 4.1's `StateObject`), `DepthStencilState`,
-//! `ComputePipeline`, `RenderPipeline`, `Library`.
+//! `ComputePipeline`, `RenderPipeline`, `Library`. The tables a compute pipeline state makes are
+//! `function_table`'s.
 //!
 //! Conventions (architecture 4.2): one method per selector core sends; each doc line is
 //! `sel: <selector> [SPI]`. Integer widths
@@ -310,10 +311,22 @@ pub trait DepthStencilState: Handle {
 }
 
 /// `MTLComputePipelineState` (with `MTLComputePipelineStateSPI`).
-pub trait ComputePipeline: Handle {
+pub trait ComputePipeline<P: Platform>: Handle {
     /// sel: gpuResourceID
     /// `MTLResourceID._impl` (runtime `{MTLResourceID=Q}`).
     fn gpu_resource_id(&self) -> u64;
+    /// sel: functionHandleWithFunction:
+    /// The handle of `function` among the functions the state's kernel links
+    /// (`linkedFunctions.functions` and `binaryFunctions`), or `None` where Metal answers nil: a
+    /// function it does not link, a private one, the kernel itself.
+    fn function_handle(&self, function: &P::Function) -> RaiseResult<Option<P::FunctionHandle>>;
+    /// sel: newVisibleFunctionTableWithDescriptor:
+    /// A table of `function_count` null entries (the descriptor's `functionCount`), which takes the
+    /// state's handles; `None` where the platform makes none.
+    fn new_visible_function_table(
+        &self,
+        function_count: u64,
+    ) -> RaiseResult<Option<P::VisibleFunctionTable>>;
     /// sel: imageblockMemoryLengthForDimensions:
     fn imageblock_memory_length(&self, imageblock_dimensions: MtlSize) -> RaiseResult<u64>;
     /// sel: maxTotalThreadsPerThreadgroup

@@ -12,6 +12,7 @@ pub mod compute;
 pub mod descriptor;
 pub mod device;
 pub mod event;
+pub mod function_table;
 pub mod host_range;
 pub mod icb;
 pub mod os;
@@ -51,8 +52,9 @@ pub trait Handle: Send + Sync + 'static {
 
 /// The Metal object families plus the non-handle services (architecture 4.1).
 ///
-/// Associated types without a selector core sends to them (`Event`, `Fence`, `Function`, the two
-/// shared handles, the address-range array, the event listener) are bounded by `Handle` alone.
+/// Associated types without a selector core sends to them (`Event`, `Fence`, `Function`,
+/// `FunctionHandle`, the two shared handles, the address-range array, the event listener) are
+/// bounded by `Handle` alone.
 pub trait Platform: Sized + Send + Sync + 'static {
     // Metal objects.
     /// `id<MTLDevice>`.
@@ -93,7 +95,11 @@ pub trait Platform: Sized + Send + Sync + 'static {
     /// `id<MTLFunction>`.
     type Function: Handle;
     /// `id<MTLComputePipelineState>`.
-    type ComputePipeline: resource::ComputePipeline;
+    type ComputePipeline: resource::ComputePipeline<Self>;
+    /// `id<MTLFunctionHandle>`: what a compute pipeline state gives of a function it links.
+    type FunctionHandle: Handle;
+    /// `id<MTLVisibleFunctionTable>`.
+    type VisibleFunctionTable: function_table::VisibleFunctionTable<Self>;
     /// `id<MTLRenderPipelineState>`.
     type RenderPipeline: resource::RenderPipeline;
     /// `id<MTLRasterizationRateMap>`.

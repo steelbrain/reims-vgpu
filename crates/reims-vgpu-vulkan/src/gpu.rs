@@ -32,6 +32,7 @@ pub mod fill;
 pub mod format_info;
 #[cfg(test)]
 mod frame_cost;
+pub mod function_table;
 pub mod icb;
 pub mod identity;
 pub mod metal_space;

@@ -98,7 +98,7 @@ const STITCH_TOOL: [&str; 6] = [
 ];
 
 /// The tests' metallibs of one source each, `src/gpu/<name>.metal`.
-const TEST_LIBRARIES: [&str; 23] = [
+const TEST_LIBRARIES: [&str; 24] = [
     "predication",
     "no_draw",
     "icb_encode",
@@ -122,6 +122,7 @@ const TEST_LIBRARIES: [&str; 23] = [
     "linked_callee",
     "mesh",
     "optional_constant",
+    "visible_tables",
 ];
 
 /// The files [`imports`] makes.

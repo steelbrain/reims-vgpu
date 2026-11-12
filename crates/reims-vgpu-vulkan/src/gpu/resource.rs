@@ -2185,9 +2185,25 @@ impl DepthStencilState for VulkanDepthStencilState {
 /// command buffer support, as Metal's is (`compute_pipeline_placement`), and the state's
 /// `gpuResourceID` for one with it, as Metal's is (measured: compute and render states with
 /// support answer the ID for both, 1 and 2 in a fresh process).
-impl ComputePipeline for VulkanComputePipeline {
+impl ComputePipeline<VulkanPlatform> for VulkanComputePipeline {
     fn gpu_resource_id(&self) -> u64 {
         plain(|| rt::ComputePipelineState::gpu_resource_id(self)).0
+    }
+
+    /// The runtime's handle ([`crate::gpu::function_table`]).
+    fn function_handle(
+        &self,
+        function: &VulkanFunction,
+    ) -> RaiseResult<Option<crate::gpu::function_table::VulkanFunctionHandle>> {
+        crate::gpu::function_table::compute_handle(&self.raw, function)
+    }
+
+    /// The runtime's table ([`crate::gpu::function_table`]).
+    fn new_visible_function_table(
+        &self,
+        function_count: u64,
+    ) -> RaiseResult<Option<crate::gpu::function_table::VulkanVisibleFunctionTable>> {
+        crate::gpu::function_table::compute_table(&self.raw, function_count)
     }
 
     fn imageblock_memory_length(&self, imageblock_dimensions: MtlSize) -> RaiseResult<u64> {

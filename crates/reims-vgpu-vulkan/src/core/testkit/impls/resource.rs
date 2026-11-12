@@ -631,9 +631,42 @@ impl DepthStencilState for Fk<kind::DepthStencilState> {
     }
 }
 
-impl ComputePipeline for Fk<kind::ComputePipeline> {
+impl ComputePipeline<FakePlatform> for Fk<kind::ComputePipeline> {
     fn gpu_resource_id(&self) -> u64 {
         self.gpu_resource_id_value()
+    }
+
+    /// A new handle each ask; a script answers nil for a function the state does not link.
+    fn function_handle(
+        &self,
+        function: &<FakePlatform as Platform>::Function,
+    ) -> RaiseResult<Option<<FakePlatform as Platform>::FunctionHandle>> {
+        self.make(
+            Policy::Caught,
+            "functionHandleWithFunction:",
+            vec![Arg::obj(function)],
+            |w| Some(w.new_obj(Model::None)),
+        )
+    }
+
+    /// A table of `function_count` null entries, with a fresh `gpuResourceID`.
+    fn new_visible_function_table(
+        &self,
+        function_count: u64,
+    ) -> RaiseResult<Option<<FakePlatform as Platform>::VisibleFunctionTable>> {
+        self.make(
+            Policy::Caught,
+            "newVisibleFunctionTableWithDescriptor:",
+            vec![Arg::U64(function_count)],
+            |w| {
+                Some(w.new_obj(Model::FunctionTable(
+                    super::function_table::FunctionTableModel {
+                        common: super::common(w, None),
+                        entries: vec![None; usize::try_from(function_count).unwrap_or(0)],
+                    },
+                )))
+            },
+        )
     }
 
     fn imageblock_memory_length(&self, imageblock_dimensions: MtlSize) -> RaiseResult<u64> {

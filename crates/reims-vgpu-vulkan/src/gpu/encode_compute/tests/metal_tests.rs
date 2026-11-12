@@ -1,6 +1,7 @@
 //! The tests of `encode_compute` that compare with Metal on this host: macOS only.
 
 use crate::core::platform::resource::ComputePipeline;
+use crate::platform::VulkanPlatform;
 
 use super::*;
 
@@ -13,7 +14,7 @@ const TRUNCATED: &[u8] = include_bytes!("../../../../../../tests/shaders/kernel_
 /// A pipeline's answers, in the trait's order but the ID: ID, imageblock length of 8×8,
 /// largest threadgroup, resource index, static threadgroup memory, ICB support, execution
 /// width.
-fn answers<P: ComputePipeline>(p: &P) -> (u64, u64, u64, u64, u64, bool, u64) {
+fn answers<P: ComputePipeline<VulkanPlatform>>(p: &P) -> (u64, u64, u64, u64, u64, bool, u64) {
     (
         p.gpu_resource_id(),
         p.imageblock_memory_length(MtlSize::new(8, 8, 1)).unwrap(),

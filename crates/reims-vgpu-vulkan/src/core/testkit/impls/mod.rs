@@ -19,6 +19,7 @@ pub mod compute;
 pub mod descriptor;
 pub mod device;
 pub mod event;
+pub mod function_table;
 pub mod icb;
 pub mod rate_map;
 pub mod render;
