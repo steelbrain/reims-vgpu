@@ -1232,9 +1232,9 @@ refresh thread does, kept every tick in every run, at most 5.9 ms late.
   guest to check a change", above). Under TCG the emulated guest gets
   through its work at the pace of the CPU its vCPUs get. Beside a build that
   used 34 minutes of CPU in 4 min 18 s (job `m3-max-17260`), 14.6.1's probe
-  window was not shown within the probe's 10 s, before `metal-app` waited
-  for it (job `m3-max-17111`). The probe's line gives the host's pressure
-  over its run, so a run beside other work shows it.
+  showed no frame in its 10 s, before `metal-app` waited for its window (job
+  `m3-max-17111`). The probe's line gives the host's pressure over its run,
+  so a run beside other work shows it.
 - **The device's library and our QEMU, built on the node**, in one potluck
   workspace that the boots then reuse (`--workspace`): `cargo xtask dist`
   (the library on Vulkan, `target/dist-vulkan`), then our QEMU at
