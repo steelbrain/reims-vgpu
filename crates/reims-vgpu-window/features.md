@@ -125,6 +125,10 @@ Unset or unparsable values give the defaults below.
 - Nothing is drawn while the window is fully hidden; it redraws when it
   shows again. `test: native::macos::render::a_hidden_window_is_drawn_when_it_shows`,
   `manual` (occlusion)
+- While an x86-64 guest's display sleeps (`pmset displaysleepnow`, Energy
+  Saver's timer), the image is black and the guest's cursor does not show,
+  as on a monitor whose panel is off; at the guest's wake, the image shows
+  the guest's desktop again, with its cursor. `manual`
 
 ## Matching the host's screen
 
