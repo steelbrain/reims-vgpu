@@ -11,7 +11,9 @@
 //     CASE         runs only the cases whose name holds one of these; -CASE skips the cases whose
 //                  name holds CASE. With none, every case.
 // Each repetition encodes every command of the same buffer again, as a renderer encodes its
-// buffer each frame; each case prints the median and the least of its repetitions:
+// buffer each frame; each case prints the median and the least of its repetitions. The buffers
+// are Shared, as a CPU encode needs on the Intel UHD 630, whose Private buffer's commands encode
+// nothing:
 //   render      an ICB of draws, each command its render pipeline state, a vertex buffer, a
 //               fragment buffer and a draw (4 calls): encode_ns (a command, its lookup
 //               indirectRenderCommandAtIndex: included), call_ns (a call), mcmd_s (millions of
@@ -236,7 +238,7 @@ static id<MTLIndirectCommandBuffer> drawBuffer(BOOL inherit, NSUInteger count, N
 	id<MTLIndirectCommandBuffer> b =
 	    [gDevice newIndirectCommandBufferWithDescriptor:d
 	                                    maxCommandCount:count
-	                                            options:MTLResourceStorageModePrivate];
+	                                            options:MTLResourceStorageModeShared];
 	if (b == nil)
 		[NSException raise:@"icb" format:@"no ICB of %lu draws", (unsigned long)count];
 	return b;
@@ -395,7 +397,7 @@ static NSString *caseCompute(void)
 	id<MTLIndirectCommandBuffer> b =
 	    [gDevice newIndirectCommandBufferWithDescriptor:d
 	                                    maxCommandCount:gCommands
-	                                            options:MTLResourceStorageModePrivate];
+	                                            options:MTLResourceStorageModeShared];
 	if (b == nil)
 		return [NSString stringWithFormat:@"FAIL no ICB of %lu dispatches", (unsigned long)gCommands];
 	id<MTLBuffer> out = sharedBuffer(gCommands * 4);
