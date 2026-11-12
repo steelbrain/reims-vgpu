@@ -797,11 +797,15 @@ Stages:
       in place: where the host's GPU aligns a linear image's rows to more
       than IOSurface's 64 bytes (256 on RADV), the host says so in the
       device info's `linear_row_alignment`, and the kext has IOSurface align
-      the bytes per row it works out for a surface to it, at the
-      accelerator's start, as a GPU's accelerator does
-      (`IOSurfaceRoot::updateLimits`; `guest/kext/src/RgfxSurfaceRows.hpp`).
-      IOSurfaceGetPropertyAlignment answers it to the processes that work
-      out their own. Macs answer 64 bytes there (Intel) and 128 (the M3),
+      the bytes per row and the plane offsets it works out for a surface to
+      it, at the accelerator's start, as a GPU's accelerator does
+      (`IOSurfaceRoot::updateLimits`; `guest/kext/src/RgfxSurfaceRows.hpp`),
+      since the GPU's linear image of a plane starts at such an offset too.
+      IOSurfaceGetPropertyAlignment answers both to the processes that work
+      out their own. A plane a client places itself off the alignment
+      (CoreVideo's first plane, 32 bytes into its surface) takes a device
+      cache at its ask, as any surface whose textures would not lie in
+      place. Macs answer 64 bytes there (Intel) and 128 (the M3),
       and an Intel Mac's GPUs answer 256 for
       `minimumLinearTextureAlignmentForPixelFormat:`, so rows at 256 bytes
       lie inside what Macs do. A host whose GPU has memory of its own

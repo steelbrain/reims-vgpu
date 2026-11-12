@@ -1,8 +1,12 @@
-// RgfxSurfaceRows: the alignment the kext has IOSurface give the bytes per row it works out for a
-// surface, from the host's answer in the device info (RgfxDeviceInfo's linear_row_alignment,
-// written at RGFX_DEVICE_INFO_OFFSET when the device is made): the bytes the host's GPU aligns a
-// linear BGRA8 image's rows to, to make one over a surface's bytes in place there. The host
-// answers it where it offers the surfaces' pages, on a GPU of any memory, else 0.
+// RgfxSurfaceRows: the alignment the kext has IOSurface give the bytes per row and the plane
+// offsets it works out for a surface, from the host's answer in the device info
+// (RgfxDeviceInfo's linear_row_alignment, written at RGFX_DEVICE_INFO_OFFSET when the device is
+// made): the bytes the host's GPU aligns a linear BGRA8 image's offset and rows to, to make one
+// over a surface's bytes in place there. The host answers it where it offers the surfaces' pages,
+// on a GPU of any memory, else 0. A plane IOSurface places at an offset off that alignment, or a
+// client that names its planes' offsets itself (CoreVideo puts a pixel buffer's first plane 32
+// bytes in), leaves a texture over the plane off the GPU's linear images, and the host keeps a
+// device cache of the surface instead.
 //
 // IOSurface aligns the bytes per row it works out for a surface, and answers
 // IOSurfaceGetPropertyAlignment(kIOSurfaceBytesPerRow), to the cache line where no accelerator

@@ -236,10 +236,10 @@ pub trait GpuDevice<P: Platform>: Handle {
         let _ = planes;
         None
     }
-    /// No Metal counterpart: the bytes the device aligns the rows of a linear BGRA8 image to, to
-    /// make one over host pages in place there, as the platform answers; 0 where it does not. On
-    /// a device whose GPU shares the CPU's memory the graphics lane has the guest align its
-    /// surfaces' rows to it. The default is 0.
+    /// No Metal counterpart: the bytes the device aligns the offset and rows of a linear BGRA8
+    /// image to, to make one over host pages in place there, as the platform answers; 0 where it
+    /// does not. The graphics lane has the guest align its surfaces' rows and plane offsets to
+    /// it, on a GPU of any memory. The default is 0.
     fn linear_row_alignment(&self) -> u64 {
         0
     }

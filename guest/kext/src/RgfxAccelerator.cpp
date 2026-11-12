@@ -803,13 +803,16 @@ void RgfxAccelerator::setSurfaceLimits()
 		      align);
 		return;
 	}
-	// A row mask of 0 ORs nothing in: IOSurface's own alignment where the host asks no more.
-	rgfxIOSurfaceRootUpdateLimits(root, 0, align > kRgfxSurfaceRowsLeast ? align - 1 : 0,
-	                              limits.bytesPerRow, limits.width, limits.height);
+	// The plane offsets IOSurface works out take the host's alignment as the rows do, as the
+	// GPU's linear images start there; a mask of 0 ORs nothing in: IOSurface's own alignment
+	// where the host asks no more.
+	const uint32_t mask = align > kRgfxSurfaceRowsLeast ? align - 1 : 0;
+	rgfxIOSurfaceRootUpdateLimits(root, mask, mask, limits.bytesPerRow, limits.width,
+	                              limits.height);
 	root->release();
 	if (align > kRgfxSurfaceRowsLeast)
-		IOLog("RgfxAccelerator: IOSurface aligns the bytes per row it works out to %u, as the "
-		      "host's GPU takes rows in place\n",
+		IOLog("RgfxAccelerator: IOSurface aligns the bytes per row and plane offsets it works out "
+		      "to %u, as the host's GPU takes linear images in place\n",
 		      align);
 	IOLog("RgfxAccelerator: IOSurface answers surfaces of at most %u x %u and %u bytes a row, as "
 	      "the device's textures take them\n",
