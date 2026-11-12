@@ -342,12 +342,12 @@ pub(crate) fn take_if_only_kept()
 /// a new one, kept. The process's first device's sampler ID pool is the one Metal's sampler mempool
 /// follows ([`metal_space::count_sampler_ids`]). A new device's class joins the process's
 /// placement of degradations ([`crate::answer::native::device_made`]), and its warm pass runs
-/// over the pipeline records earlier processes kept ([`crate::records`]), in the background. Its
-/// work counts go to the log where its filter names their target ([`crate::work_log`]), its
-/// GPU is kept awake while the guest draws ([`crate::awake`]), and the runtime's check of
-/// textures over host pages starts ([`start_in_place_checks`]). The exit gate's hook is
-/// registered, after the device's driver was loaded ([`crate::exit_gate`]): every process that
-/// holds a device of the process's, a test's or a host's, waits at its exit for the library's
+/// over the pipeline records earlier processes kept ([`crate::records`]), in the background, but
+/// in a test build. Its work counts go to the log where its filter names their target
+/// ([`crate::work_log`]), its GPU is kept awake while the guest draws ([`crate::awake`]), and the
+/// runtime's check of textures over host pages starts ([`start_in_place_checks`]). The exit gate's
+/// hook is registered, after the device's driver was loaded ([`crate::exit_gate`]): every process
+/// that holds a device of the process's, a test's or a host's, waits at its exit for the library's
 /// GPU work in progress.
 pub fn adopt(raw: rt::Device) -> VulkanDevice {
     let id = registry_id(&raw);
@@ -361,8 +361,9 @@ pub fn adopt(raw: rt::Device) -> VulkanDevice {
     #[cfg(target_os = "linux")]
     crate::os::learn_view_imports(&raw);
     let mut threads = crate::let_go::DeviceThreads::default();
-    #[cfg(not(test))]
-    if let Some(home) = std::env::var_os("HOME") {
+    if crate::records::KEPT
+        && let Some(home) = std::env::var_os("HOME")
+    {
         let path = crate::records::path_in(home.as_ref());
         threads.keep(crate::records::warm(&raw, path, &threads.stop));
     }

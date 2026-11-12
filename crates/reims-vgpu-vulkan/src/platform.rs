@@ -273,7 +273,7 @@ pub(crate) fn take_answering_device() -> Option<rt::Device> {
 /// `~/.cache/reims-vgpu-vulkan` ([`SHADER_CACHE`]; the runtime's default directory when `HOME` is
 /// not set), which every process shares, holding [`SHADER_CACHE_CAPACITY`], each pipeline state's
 /// record kept in the file beside it for later processes' warm passes ([`crate::records`]; none
-/// in the unit tests), a command buffer's
+/// in a test build), a command buffer's
 /// GPU times answered from the host's clock (`gpu_times_from_host`), the runtime's device policy,
 /// its fast native forms but its exact completion and heap textures and those `REIMS_VGPU_EXACT`
 /// names ([`exact_policy`]), and in a strict process ([`crate::answer::strict_process`]) its
@@ -344,8 +344,7 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
         if let Some(home) = std::env::var_os("HOME") {
             options.shader_cache =
                 rt::ShaderCacheOptions::in_directory(PathBuf::from(&home).join(SHADER_CACHE));
-            #[cfg(not(test))]
-            {
+            if crate::records::KEPT {
                 options.pipeline_records =
                     crate::records::hook(crate::records::path_in(home.as_ref()));
             }

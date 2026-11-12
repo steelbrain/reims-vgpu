@@ -24,8 +24,11 @@
 //!   once), and goes on at the next [`MAGIC`] after its start; a record of another format the
 //!   runtime reads as none (`PipelineRecord::from_bytes`) and the pass drops.
 //!
-//! The unit tests' devices keep and warm no records (`device_options`): a test of what a device
-//! compiles runs as it would on a host that never ran a guest.
+//! A test build's devices keep and warm no records ([`KEPT`]): this crate's unit tests', and every
+//! crate's tests', which turn on its `testkit` feature (only dev-dependencies do, `cargo xtask
+//! testkit`). So a test of what a device compiles runs as it would on a host that never ran a
+//! guest, no test's pipelines join the records a host's next process warms, and no test process
+//! makes the host's guests' pipelines beside the run's other tests.
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -38,6 +41,11 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use crate::core::platform::os::clock::Clock as _;
 use crate::core::sync::Mutex;
 use metal2vulkan_runtime as rt;
+
+/// Whether this build's devices keep records and warm from them: all but a test build's (the
+/// module docs), whose `device_options` sets no hook and whose `gpu::device::adopt` starts no warm
+/// pass.
+pub(crate) const KEPT: bool = !cfg!(any(test, feature = "testkit"));
 
 /// The records file under `HOME`, beside the shader cache's directory.
 pub(crate) const RECORDS: &str = ".cache/reims-vgpu-vulkan-pipelines";

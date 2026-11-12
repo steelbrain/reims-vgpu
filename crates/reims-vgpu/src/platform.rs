@@ -260,6 +260,43 @@ mod tests {
         assert!(p.metal_device(Some(u64::MAX)).is_none());
     }
 
+    /// A test build's Vulkan device keeps no pipeline records: this crate's tests turn on the
+    /// Vulkan crate's `testkit` feature, which makes them a test build there too
+    /// (`reims_vgpu_vulkan::records`), so a test process neither adds its pipelines to the
+    /// records the host's next QEMU warms nor warms them itself
+    #[test]
+    fn a_test_build_keeps_no_pipeline_records() {
+        use reims_vgpu_vulkan::VulkanPlatform;
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+        use reims_vgpu_vulkan::core::platform::resource::Library as _;
+        use reims_vgpu_vulkan::core::raise::OnFault;
+
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
+        let p = VulkanPlatform::new();
+        let d = p.metal_device(None).expect("a Vulkan device (MoltenVK)");
+        let library = d
+            .new_library(include_bytes!(
+                "../../../tests/shaders/compute_add.metallib"
+            ))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let f = library
+            .new_function(OnFault::Die, "add_one")
+            .unwrap()
+            .unwrap();
+        let _state = d
+            .new_compute_pipeline_state_for_function(Some(&f))
+            .unwrap()
+            .unwrap();
+        let w = d.raw.warm_statistics();
+        assert_eq!(
+            (w.records_made, w.records_unmade),
+            (0, 0),
+            "a creation's record handed to a hook"
+        );
+    }
+
     /// The Vulkan platform's lease of the guest's RAM lets views be made of the pages the host
     /// names a file behind, showing the file from its offset, while it lives; never of a range
     /// without a file
