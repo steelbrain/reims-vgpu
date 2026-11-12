@@ -72,8 +72,13 @@ use reims_vgpu_vulkan::core::platform::os::Threads;
 use reims_vgpu_vulkan::core::sync::{Condvar, Mutex, MutexGuard};
 
 /// The most of a lane's jobs that walk at once, on its own thread and the budget's: those that
-/// wait for what is committed before them ([`Lane::waiting`]) are not counted.
-pub(crate) const LANE_THREADS: usize = 4;
+/// wait for what is committed before them ([`Lane::waiting`]) are not counted. Eight: at four, a
+/// buffer of Valley's GL queue waited 8.6 ms for a walker at the median and 36 ms at the 90th
+/// percentile, three walked as it came at the median and four at the 90th; at eight it waited
+/// 0.03 and 0.05 ms, three walked at the median and five at the 90th, and Valley ran at 24.5
+/// frames a second where four ran at 22.6 (1920 x 1080, RX 7900 XTX host, the device's trace on;
+/// measured).
+pub(crate) const LANE_THREADS: usize = 8;
 
 /// The most threads a lane has, those whose jobs wait among them; a job past it waits to start,
 /// as one past [`LANE_THREADS`] does. 64, as many command buffers as the host's queue holds not

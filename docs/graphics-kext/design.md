@@ -3427,7 +3427,7 @@ commit. Each outcome the new design allows is one of those two:
   one, and the lane gets no job while it runs. A
   job that comes while every thread of the lane is busy gets another, only
   where the device-wide budget has one free, which a lane never waits for. At
-  most four of a lane's jobs walk at once; a job that waits for what is
+  most eight of a lane's jobs walk at once; a job that waits for what is
   committed before its buffer (its turn, its tickets, the buffers its
   `COMMIT_ORDER` names, a split of its context) is not among them while it
   waits, so the lane starts its next job meanwhile, up to 64 threads a lane,
@@ -3436,7 +3436,7 @@ commit. Each outcome the new design allows is one of those two:
   of their turns. So 2048 busy queues hold one thread each and the budget's at
   most. The waits are the same and where they were, so the commits, records
   and interrupts are too; only how far the walks run ahead changed. A job
-  held back by the four is later than every job started, so it holds none of
+  held back by the eight is later than every job started, so it holds none of
   their waits. A job goes to the thread that went idle last,
   and a thread goes after 10 s with no job, the budget's before the lane's
   own: the threads a burst made go 10 s after it, while a steady load's stay
