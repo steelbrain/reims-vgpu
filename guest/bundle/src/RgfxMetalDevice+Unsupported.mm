@@ -57,20 +57,6 @@ NSError *metal4Refusal()
 	return nil;
 }
 
-- (id<MTLDynamicLibrary>)newDynamicLibrary:(id<MTLLibrary>)library error:(NSError **)error
-{
-	RGFX_UNSUPPORTED_ERROR_IN(error, "dynamic libraries", MTLDynamicLibraryDomain,
-	                          MTLDynamicLibraryErrorUnsupported);
-	return nil;
-}
-
-- (id<MTLDynamicLibrary>)newDynamicLibraryWithURL:(NSURL *)url error:(NSError **)error
-{
-	RGFX_UNSUPPORTED_ERROR_IN(error, "dynamic libraries", MTLDynamicLibraryDomain,
-	                          MTLDynamicLibraryErrorUnsupported);
-	return nil;
-}
-
 // --- pipelines the wire does not create -----------------------------------------------
 
 - (id<MTLRenderPipelineState>)

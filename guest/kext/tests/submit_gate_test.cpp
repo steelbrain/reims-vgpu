@@ -75,6 +75,7 @@ int main()
 	    RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_MANAGED_BUFFER_CREATE,
 	    RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, RGFX_CMD_RATE_MAP_CREATE,
 	    RGFX_CMD_FUNCTION_HANDLE_CREATE, RGFX_CMD_FUNCTION_TABLE_CREATE,
+	    RGFX_CMD_DYNAMIC_LIBRARY_CREATE,
 	};
 	const uint32_t makesNone[] = {
 	    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_BUFFER_DID_MODIFY_RANGE, RGFX_CMD_TEXTURE_REPLACE_REGION,
@@ -96,7 +97,7 @@ int main()
 		if (type <= RGFX_CMD_BUFFER_OVER_PAGES || type == RGFX_CMD_BUFFER_MANAGED_AT_OFFSET ||
 		    type == RGFX_CMD_HEAP_OVER_PAGES || type == RGFX_CMD_MANAGED_BUFFER_CREATE ||
 		    type == RGFX_CMD_MESH_RENDER_PIPELINE_CREATE || type == RGFX_CMD_TEXTURE_DID_MODIFY_DATA ||
-		    (type >= RGFX_CMD_RATE_MAP_CREATE && type <= RGFX_CMD_FUNCTION_TABLE_SET))
+		    (type >= RGFX_CMD_RATE_MAP_CREATE && type <= RGFX_CMD_DYNAMIC_LIBRARY_CREATE))
 			check(listed, "every wire type of the accepted range is placed");
 		else if (!listed)
 			check(!rgfxSubmitMakes(type), "a type the wire does not name makes none");

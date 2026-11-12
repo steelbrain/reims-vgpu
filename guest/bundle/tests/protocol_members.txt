@@ -27,12 +27,13 @@
 %spi-no-ray-tracing the IOGPU base answers NO, the lane's answer: it makes no acceleration structures (ray tracing is RGFX_UNSUPPORTED, and supportsRaytracing answers the host's NO), where Metal's devices answer YES
 %icb-render-states the macOS 26 render states of an indirect command: the AMD 5300M and the Intel 630 raise an unrecognized selector for each, answering respondsToSelector: YES (measured, tools/oracle/oracle_icb.m), and so does the command (the M3 Max raises an API-not-supported exception)
 %spi-no-counters the IOGPU base answers NO, the lane's answer: it samples no counters (counter sampling is RGFX_UNSUPPORTED, and counterSets is nil), where Metal's devices answer YES
-%spi-no-dylibs the IOGPU base answers NO, the lane's answer: it makes no dynamic libraries (RGFX_UNSUPPORTED, and supportsDynamicLibraries answers NO), where Metal's devices answer YES
+%spi-no-dylibs the IOGPU base answers NO, as the lane's supportsDynamicLibraries does: it makes a compute pipeline's dynamic libraries and no render pipeline's, and what these queries gate of them is not established, where Metal's devices answer YES
 %spi-no-pipeline-libraries the IOGPU base answers NO, the lane's answer: it makes no pipeline libraries (newPipelineLibraryWithFilePath:error: is RGFX_UNSUPPORTED), where Metal's devices answer YES
 %spi-no-shared-textures the IOGPU base answers NO, the lane's answer: it makes no shared textures or handles (RGFX_UNSUPPORTED), where Metal's devices answer YES
 %gl-function Metal's own function of GL IR answers it, the same for every shader (measured: macOS 26.7.1, the Intel 630's device: the name __main, MTLPatchTypeNone, a control point count of 0, no vertex or stage input attributes, no function constants, no options)
 %gl-spi Metal's function of GL IR answers it, the same for both shaders asked (measured: macOS 26.7.1, the Intel 630's device, tools/gl_probe.m -s, the functions of a vertex and a fragment shader; each is a function of a library, _MTLFunctionInternal)
 %fnptr-spi the x86 Macs' answer is not measured: oracle_spi_members makes no function handle or visible function table, and no class of ours answers it
+%dylib-spi the x86 Macs' answer is not measured: oracle_spi_members makes no dynamic library, and no class of ours answers it
 %spi-neither an SPI member neither the AMD 5300M's nor the Intel 630's objects of the kind answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m), so a caller that sends it to an x86 Mac's object asks first
 %spi-differ an SPI member one of the AMD 5300M's and the Intel 630's objects of the kind answers and the other does not (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m), so a caller that sends it to an x86 Mac's object asks first
 %cb-base Metal's base command buffer, _MTLCommandBuffer, and its IOAccel subclass, MTLIOAccelCommandBuffer (read from code: macOS 27.0.1's Metal on the M3 Max; src/RgfxCommandObjects.mm, MTLCommandBufferSPI); that the AMD 5300M's and the Intel 630's buffers answer from these classes, not from their own, is to be measured with oracle_spi_members' answering class
@@ -265,6 +266,10 @@ threadExecutionWidth implemented
 [RgfxDepthStencilState]
 gpuResourceID metal no x86 Mac's depth/stencil state has a resource id: the AMD 5300M's and the Intel 630's answer respondsToSelector: YES and raise an unrecognized selector (measured, tools/oracle/oracle_bundle.m argbuf.ds.id), as this does
 
+[RgfxDynamicLibrary]
+installName implemented
+serializeToURL:error: implemented
+
 [RgfxFunction]
 functionConstantsDictionary implemented
 functionType implemented
@@ -391,7 +396,7 @@ setVertexBuffer:offset:attributeStride:atIndex: implemented
 
 [RgfxLibrary]
 functionNames implemented
-installName metal every library the device makes is executable (it makes no dynamic library: supportsDynamicLibraries answers NO), and an executable library has no install name (nil, as Metal answers)
+installName implemented
 newFunctionWithDescriptor:completionHandler: implemented
 newFunctionWithDescriptor:error: implemented
 newFunctionWithName: implemented
@@ -400,7 +405,7 @@ newFunctionWithName:constantValues:error: partial function constants set by name
 newIntersectionFunctionWithDescriptor:completionHandler: implemented
 newIntersectionFunctionWithDescriptor:error: unsupported ray tracing
 reflectionForFunctionWithName: partial function reflection (the host sends no argument bindings)
-type metal every library the device makes is executable: it makes no dynamic library (supportsDynamicLibraries answers NO)
+type implemented
 
 [RgfxMetalDevice]
 GPUBVHBuilder base %base-spi
@@ -630,10 +635,10 @@ newDefaultLibrary implemented
 newDefaultLibraryWithBundle:error: implemented
 newDepthStencilStateWithDescriptor: implemented
 newDynamicLibrary:computeDescriptor:error: unsupported dynamic libraries
-newDynamicLibrary:error: unsupported dynamic libraries
+newDynamicLibrary:error: partial dynamic libraries on a host that makes none
 newDynamicLibraryFromURL:error: unsupported dynamic libraries
 newDynamicLibraryWithDescriptor:error: unsupported dynamic libraries
-newDynamicLibraryWithURL:error: unsupported dynamic libraries
+newDynamicLibraryWithURL:error: partial dynamic libraries on a host that makes none
 newDynamicLibraryWithURL:options:error: unsupported dynamic libraries
 newEvent implemented
 newEventWithOptions: implemented
@@ -1533,6 +1538,24 @@ resourceIndex metal raises an unrecognized selector, as Metal's base state does 
 uniqueIdentifier metal raises an unrecognized selector, as Metal's base state does (read from code, _MTLDepthStencilState, macOS 27.0.1), which ends the process on both x86 Macs (%spi-answers); as gpuResourceID
 writesDepth metal YES for every descriptor, as the AMD 5300M's and the Intel 630's states answer (measured: macOS 26.7.1)
 writesStencil metal YES for every descriptor, as the AMD 5300M's and the Intel 630's states answer (measured: macOS 26.7.1)
+[RgfxDynamicLibrary]
+binaryData pending %dylib-spi
+debugInstrumentationData pending %dylib-spi
+exportedFunctions pending %dylib-spi
+exportedVariables pending %dylib-spi
+formattedDescription: pending %dylib-spi
+globalConstantsBase pending %dylib-spi
+globalConstantsSize pending %dylib-spi
+importedLibraries pending %dylib-spi
+importedSymbols pending %dylib-spi
+libraryPath pending %dylib-spi
+libraryUUID pending %dylib-spi
+reflectionData pending %dylib-spi
+relocations pending %dylib-spi
+serializeToURL:options:error: pending %dylib-spi
+setDebugInstrumentationData: pending %dylib-spi
+setRelocations: pending %dylib-spi
+shaderValidationEnabled pending %dylib-spi
 [RgfxEvent]
 enableBarrier implemented
 setEnableBarrier: implemented

@@ -110,7 +110,11 @@
 //    visible function tables (RGFX_CMD_FUNCTION_HANDLE_CREATE and _TABLE_CREATE), waiting for
 //    their FUNCTION_POINTER_STATE, and sets a table's entries (RGFX_CMD_FUNCTION_TABLE_SET,
 //    unanswered), which the kext admits as any create or write of the client's own objects
-//    (RgfxSubmitGate.hpp), and binds tables in a compute pass's ops.
+//    (RgfxSubmitGate.hpp), and binds tables in a compute pass's ops;
+//  - DYNAMIC_LIBRARIES (bit 40): the bundle makes dynamic libraries of its libraries
+//    (RGFX_CMD_DYNAMIC_LIBRARY_CREATE), which the kext admits as any create of the client's own
+//    objects (RgfxSubmitGate.hpp), waiting for its COMPLETE, and names them at the end of a
+//    compute pipeline's create.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -148,7 +152,7 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_SURFACE_DEFERRED_ASK | RGFX_FEATURE_SURFACE_DEFERRED_CARRY |
     RGFX_FEATURE_SCHEDULED_ASK | RGFX_FEATURE_DISPLAY_SCALE |
     RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA | RGFX_FEATURE_RATE_MAPS |
-    RGFX_FEATURE_FUNCTION_POINTERS |
+    RGFX_FEATURE_FUNCTION_POINTERS | RGFX_FEATURE_DYNAMIC_LIBRARIES |
     (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K : RGFX_FEATURE_DISPLAY_POWER);
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.

@@ -8,11 +8,18 @@
 
 #import <objc/message.h>
 
+#include <mach-o/dyld.h>
+#include <deque>
+#include <limits.h>
 #include <mutex>
+#include <set>
+#include <stdlib.h>
 #include <string>
 #include <vector>
 
+#import "RgfxDynamicLibrary.h"
 #import "RgfxFunction.h"
+#import "RgfxLibrary.h"
 #import "RgfxFunctionTable.h"
 #import "RgfxMetalError.h"
 #import "RgfxUnsupported.h"
@@ -71,6 +78,153 @@ NSError *foreignFunctionError(NSString *what, id<MTLFunction> fn)
 	return RgfxMakeError(RgfxMetalErrorInvalidDescriptor, msg);
 }
 
+/// The path of the file install name `name` names, read as dyld reads one: an absolute path as
+/// it is, `@executable_path/` from the process's executable's directory, and `@loader_path/` from
+/// the directory of the file the library naming it was read from (`loader`). Empty for any other
+/// name (relative, `@rpath/`), and for `@loader_path/` of a URL that is no file URL: they name no
+/// file here.
+std::string installNamePath(const std::string &name, NSURL *loader)
+{
+	auto under = [&](const std::string &directory, size_t prefix) {
+		return directory.empty() ? std::string() : directory + "/" + name.substr(prefix);
+	};
+	if (!name.empty() && name[0] == '/')
+		return name;
+	static const std::string executable = "@executable_path/";
+	static const std::string loaderPath = "@loader_path/";
+	if (name.compare(0, executable.size(), executable) == 0) {
+		char path[PATH_MAX];
+		uint32_t size = sizeof(path);
+		char real[PATH_MAX];
+		if (_NSGetExecutablePath(path, &size) != 0 || realpath(path, real) == nullptr)
+			return std::string();
+		std::string directory(real);
+		directory.erase(directory.find_last_of('/'));
+		return under(directory, executable.size());
+	}
+	if (name.compare(0, loaderPath.size(), loaderPath) == 0 && loader.fileURL) {
+		NSString *directory = loader.URLByDeletingLastPathComponent.path;
+		return under(directory.fileSystemRepresentation, loaderPath.size());
+	}
+	return std::string();
+}
+
+/// The x86 Macs' refusal of a kernel whose libraries name an install name no file loads, or that
+/// a library made of no file names (measured: the AMD Radeon Pro 5300M and the Intel UHD Graphics
+/// 630, macOS 26.7.1, oracle_fnptr's "unresolved bare", "linked data bare" and "source"; beside a
+/// preloaded library that exports the symbol, "unresolved preloaded", "linked data preloaded" and
+/// "source preloaded", the 5300M refuses it too and the 630 makes the pipeline: the bundle answers
+/// the 5300M's).
+NSError *unresolvedLibraryError(const std::string &name)
+{
+	static char site;
+	if (rgfxLogFirst(&site))
+		NSLog(@"RGFX: compute pipeline: the dynamic library %s loads from no file", name.c_str());
+	return [NSError errorWithDomain:@"CompilerError"
+	                           code:2
+	                       userInfo:@{NSLocalizedDescriptionKey : @"Error creating compute variant"}];
+}
+
+/// The array `object` answers to the first of `names` it responds to, nil where none: members a
+/// guest's Metal may not have (preloadedLibraries is insertLibraries before macOS 13, and
+/// MTLLinkedFunctions' privateFunctions is macOS 12's).
+NSArray *arrayOf(id object, std::initializer_list<const char *> names)
+{
+	for (const char *name : names) {
+		SEL sel = sel_registerName(name);
+		if ([object respondsToSelector:sel])
+			return reinterpret_cast<NSArray *(*)(id, SEL)>(objc_msgSend)(object, sel);
+	}
+	return nil;
+}
+
+/// The dynamic libraries a compute pipeline's kernel links into `refs` (their install names kept
+/// in `names`, the objects in `held`): the descriptor's preloadedLibraries in order, then for each
+/// install name the kernel's library, its linked functions' libraries and these dynamic libraries
+/// name, in turn and once each, the library of the file it names (installNamePath), read here as
+/// Metal reads it when it creates the pipeline (at each creation, so a replaced file links its new
+/// code), and its own install names after. A name loads from its file whether or not a preloaded
+/// library exports what it is linked for, as Metal's creation needs it to (the runtime's
+/// DynamicLibraries, read from code: measured on an M3 Max and an M4; the AMD Radeon Pro 5300M
+/// refuses a kernel whose name loads nothing beside a preloaded library that exports its symbol,
+/// oracle_fnptr's "unresolved preloaded"). Metal loads the names of a library made from a file
+/// alone: a name that a library made of bytes or of source names refuses the pipeline, where its
+/// file is there too (measured: the 5300M and the Intel UHD Graphics 630, macOS 26.7.1,
+/// oracle_fnptr's "linked data bare" and "source", where "by install name", the same bytes read
+/// from their file, makes it). False and the error where a preloaded library is not one of ours, a library of no file
+/// names an install name, or a name loads no dynamic library, as none does where the host makes
+/// none: the host is never left to load one from a file of its own.
+bool pipelineLibraries(MTLComputePipelineDescriptor *descriptor, RgfxFunction *kernel,
+                       id<MTLDevice> device, NSMutableArray *held,
+                       std::vector<RgfxPipelineLibraryRef> &refs, std::deque<std::string> &names,
+                       NSError *__autoreleasing *error)
+{
+	std::set<std::string> loadedNames;
+	std::deque<std::pair<std::string, NSURL *>> pending;
+	auto dependenciesOf = [&](RgfxResource *resource) {
+		if (![resource isKindOfClass:[RgfxLibrary class]])
+			return;
+		RgfxLibrary *library = (RgfxLibrary *)resource;
+		for (std::string &name : [library rgfxDependencies])
+			pending.emplace_back(std::move(name), [library rgfxURL]);
+	};
+	for (id<MTLDynamicLibrary> preloaded in
+	     arrayOf(descriptor, {"preloadedLibraries", "insertLibraries"})) {
+		if (![(id)preloaded isKindOfClass:[RgfxDynamicLibrary class]]) {
+			if (error)
+				*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor,
+				                       @"compute pipeline: a preloaded library is not of this "
+				                       @"device");
+			return false;
+		}
+		RgfxDynamicLibrary *library = (RgfxDynamicLibrary *)preloaded;
+		refs.push_back({library.rgfxObjId, nullptr});
+		[held addObject:library];
+	}
+	dependenciesOf([kernel rgfxLibrary]);
+	MTLLinkedFunctions *linked = descriptor.linkedFunctions;
+	for (NSArray<id<MTLFunction>> *list in @[
+		     linked.functions ?: @[], linked.binaryFunctions ?: @[],
+		     arrayOf(linked, {"privateFunctions"}) ?: @[]
+	     ])
+		for (id<MTLFunction> f in list)
+			if ([(id)f isKindOfClass:[RgfxFunction class]])
+				dependenciesOf([(RgfxFunction *)f rgfxLibrary]);
+	for (NSArray<id<MTLFunction>> *group in linked.groups.allValues)
+		for (id<MTLFunction> f in group)
+			if ([(id)f isKindOfClass:[RgfxFunction class]])
+				dependenciesOf([(RgfxFunction *)f rgfxLibrary]);
+	for (RgfxDynamicLibrary *preloaded in [held copy])
+		dependenciesOf(preloaded.rgfxLibrary);
+	while (!pending.empty()) {
+		auto [name, loader] = std::move(pending.front());
+		pending.pop_front();
+		if (loader == nil) {
+			if (error)
+				*error = unresolvedLibraryError(name);
+			return false;
+		}
+		if (!loadedNames.insert(name).second)
+			continue;
+		const std::string path = installNamePath(name, loader);
+		NSURL *url = path.empty() ? nil
+		                          : [NSURL fileURLWithPath:[NSString stringWithUTF8String:path.c_str()]];
+		id<MTLDynamicLibrary> loaded =
+		    url != nil && device != nil ? [device newDynamicLibraryWithURL:url error:nil] : nil;
+		if (![(id)loaded isKindOfClass:[RgfxDynamicLibrary class]]) {
+			if (error)
+				*error = unresolvedLibraryError(name);
+			return false;
+		}
+		RgfxDynamicLibrary *library = (RgfxDynamicLibrary *)loaded;
+		names.push_back(name);
+		refs.push_back({library.rgfxObjId, names.back().c_str()});
+		[held addObject:library];
+		dependenciesOf(library.rgfxLibrary);
+	}
+	return true;
+}
+
 } // namespace
 
 // Defined in the main implementation; declared here so the lambda in
@@ -108,6 +262,8 @@ NSError *foreignFunctionError(NSString *what, id<MTLFunction> fn)
 	// functionHandleWithFunction:'s answers, by function (NSNull for nil), under _handlesLock.
 	std::mutex _handlesLock;
 	NSMapTable *_handles;
+	// The dynamic libraries its create named, kept with it.
+	NSArray *_libraries;
 }
 
 // The host drops the pipeline as the app lets it go, after any command buffer that names it (each
@@ -235,6 +391,13 @@ NSError *foreignFunctionError(NSString *what, id<MTLFunction> fn)
 	}
 	p.linked = linked.refs.empty() ? nullptr : linked.refs.data();
 	p.linked_count = static_cast<uint32_t>(linked.refs.size());
+	std::vector<RgfxPipelineLibraryRef> libraries;
+	std::deque<std::string> installNames;
+	NSMutableArray *heldLibraries = [NSMutableArray array];
+	if (!pipelineLibraries(descriptor, rf, device, heldLibraries, libraries, installNames, error))
+		return nil;
+	p.libraries = libraries.empty() ? nullptr : libraries.data();
+	p.library_count = static_cast<uint32_t>(libraries.size());
 
 	RgfxPipelinePost post;
 	post.known = known.get();
@@ -256,6 +419,7 @@ NSError *foreignFunctionError(NSString *what, id<MTLFunction> fn)
 	[state rgfxTakeDescriptor:descriptor flags:p.flags];
 	if (state != nil) {
 		state->_air = [rf rgfxAirFunction];
+		state->_libraries = [heldLibraries copy];
 		if (post.deferred) {
 			[state rgfxTakeKnown:post.reflection];
 		} else if (post.keyed) {

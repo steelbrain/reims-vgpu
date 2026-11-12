@@ -235,7 +235,8 @@ const APPLE_PIECES: [(i64, &[Piece]); 11] = {
 /// other records, `RGFX_PASS_FLAG_RATE_MAP`), whose layer counts are the platform's. Function
 /// pointers (`FUNCTION_HANDLE_CREATE`, `FUNCTION_TABLE_CREATE` and `FUNCTION_TABLE_SET`, and a
 /// compute pass's table bindings) are carried in compute pipelines alone, so their piece stays out
-/// of this list until a render pipeline's are carried too.
+/// of this list until a render pipeline's are carried too, and so are dynamic libraries
+/// (`DYNAMIC_LIBRARY_CREATE`, and the run of libraries that ends a compute create).
 /// A piece joins this list when its wire messages, its decoding and its bundle members land, and
 /// the Apple families it holds back rise with it once every piece up to Apple7's is here
 /// ([`cap_apple_families`]).
@@ -301,7 +302,8 @@ fn cap_apple_families(identity: &mut IdentityCaps, wired: &[Piece]) {
 /// | `supportsFamily:` of Metal4 | no | the `MTL4` API: its command queues and buffers, argument tables, compiler and allocators |
 /// | `supportsRaytracing`, `supportsRaytracingFromRender`, `supportsPrimitiveMotionBlur` | no | acceleration structures, their builds, and intersection function tables |
 /// | `supportsFunctionPointersFromRender` | no, as the AMD Radeon Pro 5300M answers | a render pipeline's visible function tables and function handles: the lane carries a compute pipeline's alone |
-/// | `supportsDynamicLibraries`, `supportsRenderDynamicLibraries` | no | `newDynamicLibrary:` and linked functions |
+/// | `supportsDynamicLibraries` | no | nothing of the lane's: it carries a compute pipeline's dynamic libraries, each install name read in the guest's process; the answer waits on the platform's switch that loads no dynamic library from a file of the host's, which a name the guest did not send would be read from |
+/// | `supportsRenderDynamicLibraries` | no, as the AMD Radeon Pro 5300M answers | a render pipeline's preloaded and linked dynamic libraries: the lane carries a compute pipeline's alone |
 /// | `supportsPlacementSparse` | no | placement sparse buffers and textures |
 /// | `supportsCounterSampling:` | no, at every point | counter sample buffers |
 /// | `maximumConcurrentCompilationTaskCount` | the device's compile threads, which run its pipeline compiles | nothing: the device's own answer |

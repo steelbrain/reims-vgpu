@@ -1040,6 +1040,21 @@ RgfxCreated RgfxSerializer::createLibrary(const void *bytes, uint64_t byte_lengt
 	return out;
 }
 
+RgfxCreated RgfxSerializer::createDynamicLibrary(RgfxObjId library)
+{
+	RgfxCreated out = {};
+	out.status = kRgfxNoAnswer;
+	if (!m_dynamicLibraries)
+		return out;
+	out.obj_id = m_ids.allocObjId();
+	RgfxDynamicLibraryCreate m = {};
+	m.obj_id = out.obj_id;
+	m.library_obj_id = library;
+	out.posted = m_control.tryPost(RGFX_CMD_DYNAMIC_LIBRARY_CREATE, &m, sizeof(m), &out.seqno,
+	                               &out.status);
+	return out;
+}
+
 RgfxCreated RgfxSerializer::lookupLibrary(const uint8_t *key, uint64_t slice_size)
 {
 	RgfxCreated out = {};
@@ -1348,6 +1363,22 @@ RgfxCreated RgfxSerializer::createComputePipeline(const RgfxComputePipelineParam
 	msg.stage_input_index_buffer_index = p.stage_input_index_buffer_index;
 	msg.linked_offset = appendLinkedFunctions(append, p.linked, p.linked_count);
 	msg.linked_count = p.linked_count;
+	// The dynamic libraries end the message: their install names first, then, from a multiple of
+	// 8, the run of records the host reads from the message's end.
+	if (p.library_count > 0) {
+		std::vector<RgfxPipelineLibrary> records(p.library_count);
+		for (uint32_t i = 0; i < p.library_count; i++) {
+			records[i].obj_id = p.libraries[i].library;
+			if (const char *name = p.libraries[i].install_name) {
+				const uint32_t n = static_cast<uint32_t>(std::strlen(name));
+				records[i].name_offset = append(name, n);
+				records[i].name_len = n;
+			}
+		}
+		tail.resize(roundUp8(head + tail.size()) - head, 0);
+		append(records.data(), records.size() * sizeof(RgfxPipelineLibrary));
+		msg.library_count = p.library_count;
+	}
 
 	uint64_t total = roundUp8(head + tail.size());
 	if (total > m_control.dataSize() || total > UINT32_MAX) {

@@ -74,7 +74,8 @@ pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// through [`RGFX_REG_DRIVER_FEATURES_HI`]: [`RGFX_FEATURE_SURFACE_DEFERRED_CARRY`],
 /// [`RGFX_FEATURE_SCHEDULED_ASK`], [`RGFX_FEATURE_PAGES_16K`], [`RGFX_FEATURE_DISPLAY_SCALE`],
 /// [`RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA`], [`RGFX_FEATURE_DISPLAY_POWER`],
-/// [`RGFX_FEATURE_RATE_MAPS`] and [`RGFX_FEATURE_FUNCTION_POINTERS`].
+/// [`RGFX_FEATURE_RATE_MAPS`], [`RGFX_FEATURE_FUNCTION_POINTERS`] and
+/// [`RGFX_FEATURE_DYNAMIC_LIBRARIES`].
 /// On a host that offers `PAGES_16K`, `FEATURES_LO` and `_HI` read the guest RAM features only
 /// once the guest took it.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
@@ -347,6 +348,13 @@ pub const RGFX_FEATURE_RATE_MAPS: u64 = 0x40_0000_0000;
 /// Every host offers it; whether the device's kernels call through tables is the device info's
 /// (`supports_function_pointers`).
 pub const RGFX_FEATURE_FUNCTION_POINTERS: u64 = 0x80_0000_0000;
+/// `FEATURES_HI` bit 8, feature bit 40, `DYNAMIC_LIBRARIES`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_HI`]: ring 0 carries [`RGFX_CMD_DYNAMIC_LIBRARY_CREATE`], a
+/// dynamic library of a library the guest made, and a [`RgfxComputePipelineCreate`] names the
+/// dynamic libraries its kernel links, preloaded or loaded under an install name
+/// ([`RgfxPipelineLibrary`]). Every host offers it; whether the device's kernels link dynamic
+/// libraries is the device info's (`supports_dynamic_libraries`).
+pub const RGFX_FEATURE_DYNAMIC_LIBRARIES: u64 = 0x100_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -845,6 +853,16 @@ pub const RGFX_CMD_FUNCTION_TABLE_CREATE: u32 = 0x237;
 /// Metal's does. Not answered: a set the host cannot carry out (a table or handle it does not
 /// hold, a range past the table, a handle the platform refuses) sets none of its entries.
 pub const RGFX_CMD_FUNCTION_TABLE_SET: u32 = 0x238;
+/// Command `DYNAMIC_LIBRARY_CREATE` ([`RgfxDynamicLibraryCreate`]), where the guest took
+/// [`RGFX_FEATURE_DYNAMIC_LIBRARIES`]: library `library_obj_id` as a dynamic library
+/// (`newDynamicLibrary:error:`), made under `obj_id`, answered by [`RGFX_EVT_COMPLETE`]:
+/// [`RGFX_STATUS_OK`] where it was made; [`RGFX_STATUS_NOT_FOUND`] for a library the sender does
+/// not hold; [`RGFX_STATUS_REFUSED`] where the library was refused or the platform refuses it as
+/// a dynamic library (one of another type, of no install name, or whose code reads a function
+/// constant); [`RGFX_STATUS_INVALID_ARGUMENT`] for a message too short or an id not the
+/// sender's. Nothing is made but on success. A library still being made is waited for.
+/// `OBJECT_DESTROY` drops it; a pipeline state made with it keeps what it linked.
+pub const RGFX_CMD_DYNAMIC_LIBRARY_CREATE: u32 = 0x239;
 
 /// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 /// held context `context` closed the device or died. The host ends the context's command queues
@@ -2809,6 +2827,20 @@ pub struct RgfxFunctionTableSet {
     pub count: u64,
 }
 
+/// `DYNAMIC_LIBRARY_CREATE`: library `library_obj_id` as a dynamic library, made under `obj_id`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxDynamicLibraryCreate {
+    /// [`RGFX_CMD_DYNAMIC_LIBRARY_CREATE`].
+    pub header: RgfxMsgHeader,
+    /// The dynamic library's id.
+    pub obj_id: u64,
+    /// The library: one of the sender's.
+    pub library_obj_id: u64,
+}
+
 /// `FUNCTION_POINTER_STATE`: a `FUNCTION_HANDLE_CREATE`'s or `FUNCTION_TABLE_CREATE`'s answer.
 /// `status` is [`RGFX_STATUS_OK`] where the object was made: for a table, with its
 /// `gpu_resource_id`, `allocated_size` and `resource_options`, and 0 in each for a handle.
@@ -4233,8 +4265,11 @@ pub struct RgfxRenderPipelinePrivateState {
 /// runs of [`RgfxVertexBufferLayout`] and [`RgfxVertexAttribute`] in the tail,
 /// their `step_function` an `MTLStepFunction` and their `format` an
 /// `MTLAttributeFormat`; the kernel's linked functions (`linkedFunctions`) are a
-/// run of [`RgfxLinkedFunction`]. The message's `size` is the fixed head plus the
-/// tail, rounded up to a multiple of 8.
+/// run of [`RgfxLinkedFunction`]. The dynamic libraries it links, where the guest
+/// took [`RGFX_FEATURE_DYNAMIC_LIBRARIES`], are the run of `library_count`
+/// [`RgfxPipelineLibrary`] that ends the message: its last `16 * library_count`
+/// bytes. The message's `size` is the fixed head plus the tail, rounded up to a
+/// multiple of 8.
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
@@ -4276,8 +4311,29 @@ pub struct RgfxComputePipelineCreate {
     pub linked_offset: u32,
     /// The number of [`RgfxLinkedFunction`] the kernel links.
     pub linked_count: u32,
-    /// Pads to a multiple of 8; 0.
-    pub reserved_5c: u32,
+    /// The number of [`RgfxPipelineLibrary`] that end the message: the dynamic libraries the
+    /// kernel links; 0 for none, and from a guest that did not take
+    /// [`RGFX_FEATURE_DYNAMIC_LIBRARIES`].
+    pub library_count: u32,
+}
+
+/// One dynamic library a compute pipeline's kernel links, of the run that ends its
+/// [`RgfxComputePipelineCreate`]: dynamic library `obj_id`, one of the sender's, preloaded
+/// (`preloadedLibraries`, searched first, in the run's order) where `name_len` is 0, or else the
+/// library the install name at `name_offset` (from the message start) loads, which Metal reads
+/// from the file the name names: the guest reads it, and names every install name the kernel's
+/// libraries and the dynamic libraries depend on, so the host loads none from a file of its own.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxPipelineLibrary {
+    /// The dynamic library: one of the sender's.
+    pub obj_id: u64,
+    /// The install name's byte offset from the message start; 0 for a preloaded library.
+    pub name_offset: u32,
+    /// The install name's length in bytes; 0 for a preloaded library.
+    pub name_len: u32,
 }
 
 /// `MESH_RENDER_PIPELINE_CREATE`: a mesh render pipeline from a descriptor
@@ -4553,6 +4609,8 @@ const _: () = {
     assert!(size_of::<RgfxRenderPipelineCreate>() == 464);
     assert!(core::mem::offset_of!(RgfxRenderPipelineCreate, colors) == 128);
     assert!(size_of::<RgfxComputePipelineCreate>() == 96);
+    assert!(size_of::<RgfxPipelineLibrary>() == 16);
+    assert!(size_of::<RgfxDynamicLibraryCreate>() == 32);
     assert!(size_of::<RgfxPipelineReflection>() == 80);
     assert!(size_of::<RgfxMeshRenderPipelineCreate>() == 512);
     assert!(core::mem::offset_of!(RgfxMeshRenderPipelineCreate, colors) == 192);

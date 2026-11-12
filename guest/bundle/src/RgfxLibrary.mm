@@ -79,6 +79,66 @@ uint64_t rd64(const uint8_t *p)
 	return v;
 }
 
+// Reads the tags of a tag list from `q` up to ENDT or `end`, each to `tag`; false where one runs
+// past `end`.
+template <typename Tag>
+static bool readTags(const uint8_t *p, uint64_t q, uint64_t end, Tag tag)
+{
+	while (end - q >= 4 && std::memcmp(p + q, "ENDT", 4) != 0) {
+		if (end - q < 6)
+			return false;
+		const uint16_t size = rd16(p + q + 4);
+		if (size > end - q - 6)
+			return false;
+		tag(p + q, p + q + 6, size);
+		q += 6 + static_cast<uint64_t>(size);
+	}
+	return true;
+}
+
+} // namespace
+
+bool rgfxReadMetallibLinkage(const uint8_t *p, size_t n, RgfxMetallibLinkage &out)
+{
+	out = {};
+	if (p == nullptr || n < 0x28 || std::memcmp(p, "MTLB", 4) != 0)
+		return false;
+	const uint64_t list = rd64(p + 0x18), listSize = rd64(p + 0x20);
+	if (list > n || n - list < 4 || listSize > n - list - 4)
+		return false;
+	uint64_t region = 0, regionSize = 0;
+	bool haveRegion = false;
+	if (!readTags(p, list + 4 + listSize, n, [&](const uint8_t *name, const uint8_t *data,
+	                                               uint16_t size) {
+		    if (std::memcmp(name, "HDYN", 4) == 0 && size == 16) {
+			    region = rd64(data);
+			    regionSize = rd64(data + 8);
+			    haveRegion = true;
+		    }
+	    }))
+		return false;
+	if (!haveRegion)
+		return true;
+	if (region > n || regionSize > n - region)
+		return false;
+	auto text = [](const uint8_t *data, uint16_t size) {
+		const char *c = reinterpret_cast<const char *>(data);
+		return std::string(c, strnlen(c, size));
+	};
+	const bool read = readTags(p, region, region + regionSize,
+	                           [&](const uint8_t *name, const uint8_t *data, uint16_t size) {
+		                           if (std::memcmp(name, "NAME", 4) == 0)
+			                           out.installName = text(data, size);
+		                           else if (std::memcmp(name, "DYNL", 4) == 0)
+			                           out.dependencies.push_back(text(data, size));
+	                           });
+	if (!read)
+		out = {};
+	return read;
+}
+
+namespace {
+
 // A .metallib's TYPE tag byte, as MTLFunctionType. measured: macOS 27 Metal, on
 // CoreDisplay's default.metallib (0 vertex, 1 fragment, 2 kernel), and on a Core Image
 // kernel library on macOS 27 and 26.6.1 (5, its kernels: functionType 4, which
@@ -378,6 +438,10 @@ struct LibraryToolState {
 	BOOL _shadowTried;
 	BOOL _madeFromURL; // newLibraryWithURL:'s, which Metal does not serialize
 	NSString *_fileName; // the last part of newLibraryWithURL:'s URL, nil for any other
+	NSURL *_url;         // newLibraryWithURL:'s URL, nil for any other
+	// Its install name and those of the libraries it was linked against, read once from _source.
+	std::once_flag _linkageRead;
+	RgfxMetallibLinkage _linkage;
 	BOOL _dynamic;       // a dynamic library's bytes (rgfxMetallibIsDynamic)
 	std::mutex _airLock; // guards the four below
 	// The module `_source` holds for each function a read below asked for, by name, as the process
@@ -1093,6 +1157,43 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 	std::lock_guard<std::mutex> hold(_shadowLock);
 	_madeFromURL = YES;
 	_fileName = [url.lastPathComponent copy];
+	_url = [url copy];
+}
+
+- (NSURL *)rgfxURL
+{
+	std::lock_guard<std::mutex> hold(_shadowLock);
+	return _url;
+}
+
+- (dispatch_data_t)rgfxSource
+{
+	std::lock_guard<std::mutex> hold(_shadowLock);
+	return _source;
+}
+
+// The library's linkage (rgfxReadMetallibLinkage of its bytes), read once: empty where it kept no
+// bytes or they hold none.
+- (const RgfxMetallibLinkage &)rgfxLinkage
+{
+	std::call_once(_linkageRead, [&] {
+		dispatch_data_t source = [self rgfxSource];
+		if (source == nil)
+			return;
+		const void *bytes = nullptr;
+		size_t size = 0;
+		dispatch_data_t map = dispatch_data_create_map(source, &bytes, &size);
+		RgfxMetallibLinkage linkage;
+		if (rgfxReadMetallibLinkage(static_cast<const uint8_t *>(bytes), size, linkage))
+			_linkage = std::move(linkage);
+		(void)map;
+	});
+	return _linkage;
+}
+
+- (std::vector<std::string>)rgfxDependencies
+{
+	return [self rgfxLinkage].dependencies;
 }
 
 // Metal answers nil for a library made from bytes, of data or of a URL (measured: macOS 27), as
@@ -1140,9 +1241,10 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 // The library's type and install name as Metal answers them on the AMD 5300M and the Intel 630
 // under macOS 26.7.1 (oracle_bundle libtype and functypes): a dynamic library's bytes answer
 // Dynamic and the install name they hold (@executable_path/liboracle_bundle_dyn.metallib), made
-// from a URL or from data, which the shadow, Metal's own library over them, answers; any other
-// answers Executable, and as its install name the last part of the URL it was made from
-// (oracle_bundle.metallib), or default.metallib for one made from data or source.
+// from a URL or from data, read from their HDYN's NAME (rgfxReadMetallibLinkage), else answered by
+// the shadow, Metal's own library over them; any other answers Executable, and as its install
+// name the last part of the URL it was made from (oracle_bundle.metallib), or default.metallib for
+// one made from data or source.
 - (MTLLibraryType)type
 {
 	return _dynamic ? MTLLibraryTypeDynamic : MTLLibraryTypeExecutable;
@@ -1151,6 +1253,9 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 - (NSString *)installName
 {
 	if (_dynamic) {
+		const std::string &installName = [self rgfxLinkage].installName;
+		if (!installName.empty())
+			return [NSString stringWithUTF8String:installName.c_str()];
 		id<MTLLibrary> shadow = [self rgfxShadow];
 		return [shadow respondsToSelector:_cmd] ? shadow.installName : nil;
 	}

@@ -10,6 +10,7 @@
 #import "RgfxBinaryArchive.h"
 #import "RgfxBlockCall.h"
 #import "RgfxComputePipelineState.h"
+#import "RgfxDynamicLibrary.h"
 #import "RgfxLibrary.h"
 #import "RgfxLibraryFile.h"
 #import "RgfxMetalError.h"
@@ -568,6 +569,119 @@ bool fileIdentity(const char *path, RgfxFileIdentity &out)
                                            error:(__autoreleasing NSError **)error
 {
 	return [super newLibraryWithMPSGraphPackageURL:url name:name error:error];
+}
+
+// --- dynamic libraries -------------------------------------------------------
+
+// The x86 Macs' refusal of a library that is not of type dynamic (measured: the AMD Radeon Pro
+// 5300M and the Intel UHD Graphics 630, macOS 26.7.1, oracle_fnptr: newDynamicLibrary: of an
+// executable library and newDynamicLibraryWithURL: of its file alike).
+static NSError *rgfxNotDynamicError()
+{
+	return [NSError errorWithDomain:MTLBinaryArchiveDomain
+	                           code:5
+	                       userInfo:@{
+		                       NSLocalizedDescriptionKey :
+		                           @"Expected a library with type MTLLibraryTypeDynamic, found "
+		                           @"invalid type: null"
+	                       }];
+}
+
+// The dynamic library of `library`: nil and the x86 Macs' error for a library that is not one of
+// ours of type dynamic (nil among them, which no measurement covers), or nil and an error naming
+// the host's refusal of it (a library whose code reads a function constant, which Metal refuses
+// too; its words on an x86 Mac are not measured). Where the host makes no dynamic libraries, nil
+// and the unsupported error.
+- (id<MTLDynamicLibrary>)newDynamicLibrary:(id<MTLLibrary>)library error:(NSError **)error
+{
+	RgfxSerializer *ser = [self serializer];
+	if (ser == nullptr || !ser->carriesDynamicLibraries()) {
+		RGFX_UNSUPPORTED_ERROR_IN(error, "dynamic libraries", MTLDynamicLibraryDomain,
+		                          MTLDynamicLibraryErrorUnsupported);
+		return nil;
+	}
+	if (![(id)library isKindOfClass:[RgfxLibrary class]] ||
+	    library.type != MTLLibraryTypeDynamic) {
+		if (error)
+			*error = rgfxNotDynamicError();
+		return nil;
+	}
+	uint32_t status = kRgfxNoAnswer;
+	RgfxDynamicLibrary *made = [RgfxDynamicLibrary dynamicLibraryOfLibrary:(RgfxLibrary *)library
+	                                                                device:self
+	                                                            serializer:ser
+	                                                                status:&status];
+	if (made == nil && error) {
+		if (status == kRgfxNoAnswer)
+			*error = RgfxMakeError(RgfxMetalErrorRingFull,
+			                       @"dynamic library: the device ring stayed full");
+		else
+			*error = [NSError
+			    errorWithDomain:MTLDynamicLibraryDomain
+			               code:MTLDynamicLibraryErrorCompilationFailure
+			           userInfo:@{
+				           NSLocalizedDescriptionKey : [NSString
+				               stringWithFormat:@"the device refused the library as a dynamic "
+				                                @"library (status %u)",
+				                                status]
+			           }];
+	}
+	return made;
+}
+
+// The dynamic library in the file at `url`, read in this process as Metal reads it, with the
+// x86 Macs' answers (measured: the AMD Radeon Pro 5300M and the Intel UHD Graphics 630, macOS
+// 26.7.1, oracle_urls and oracle_fnptr): a nil URL is MTLBinaryArchiveDomain 1, "URL for dynamic
+// library is nil"; a file that cannot be read is NSData's error (NSCocoaErrorDomain 260 for a
+// missing file, 256 for a URL of no scheme or of another); bytes that are no .metallib are
+// MTLDynamicLibraryDomain 1, "MTLDynamicLibrary could not be loaded as its AIR slice is missing";
+// a .metallib not of type dynamic is newDynamicLibrary:'s error. Metal's universal file, which a
+// Mac's serializeToURL: writes, is read as no .metallib: its AIR slice is not looked for.
+- (id<MTLDynamicLibrary>)newDynamicLibraryWithURL:(NSURL *)url error:(NSError **)error
+{
+	RgfxSerializer *ser = [self serializer];
+	if (ser == nullptr || !ser->carriesDynamicLibraries()) {
+		RGFX_UNSUPPORTED_ERROR_IN(error, "dynamic libraries", MTLDynamicLibraryDomain,
+		                          MTLDynamicLibraryErrorUnsupported);
+		return nil;
+	}
+	if (url == nil) {
+		if (error)
+			*error = [NSError
+			    errorWithDomain:MTLBinaryArchiveDomain
+			               code:1
+			           userInfo:@{NSLocalizedDescriptionKey : @"URL for dynamic library is nil"}];
+		return nil;
+	}
+	NSData *data = [NSData dataWithContentsOfURL:url options:0 error:error];
+	if (data == nil)
+		return nil;
+	const uint8_t *bytes = static_cast<const uint8_t *>(data.bytes);
+	if (data.length < 0x58 || std::memcmp(bytes, "MTLB", 4) != 0) {
+		if (error)
+			*error = [NSError errorWithDomain:MTLDynamicLibraryDomain
+			                             code:MTLDynamicLibraryErrorInvalidFile
+			                         userInfo:@{
+				                         NSLocalizedDescriptionKey :
+				                             @"MTLDynamicLibrary could not be loaded as its AIR "
+				                             @"slice is missing"
+			                         }];
+		return nil;
+	}
+	if (bytes[0x0a] != 2) {
+		if (error)
+			*error = rgfxNotDynamicError();
+		return nil;
+	}
+	dispatch_data_t source = dispatch_data_create(data.bytes, data.length, nil, ^{
+		(void)data;
+	});
+	id<MTLLibrary> library = [self newLibraryWithData:source error:error];
+	if (library == nil)
+		return nil;
+	if ([(id)library isKindOfClass:[RgfxLibrary class]])
+		[(RgfxLibrary *)library rgfxSetMadeFromURL:url];
+	return [self newDynamicLibrary:library error:error];
 }
 
 // --- render pipelines --------------------------------------------------------

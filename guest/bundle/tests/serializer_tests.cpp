@@ -2482,6 +2482,68 @@ void test_keyed_library_messages()
 	CHECK(std::memcmp(chunk.key, key, 32) == 0);
 }
 
+// Dynamic libraries: none is asked for until the host takes RGFX_FEATURE_DYNAMIC_LIBRARIES;
+// then DYNAMIC_LIBRARY_CREATE names the library and hands back the host's answer, and a compute
+// create that links dynamic libraries ends with their run, each loaded one's install name in the
+// tail before it.
+void test_dynamic_library_messages()
+{
+	ForwardLog log;
+	RgfxRingWriter writer(&forwardTo, &log, 4096);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	log.answer = RGFX_STATUS_OK;
+	RgfxCreated none = ser.createDynamicLibrary(0x21);
+	CHECK(!none.posted && none.status == kRgfxNoAnswer && log.messages.empty());
+
+	ser.setCarriesDynamicLibraries(true);
+	RgfxCreated made = ser.createDynamicLibrary(0x21);
+	CHECK(made.posted && made.status == RGFX_STATUS_OK && made.obj_id != 0);
+	CHECK(log.messages.size() == 1);
+	RgfxDynamicLibraryCreate create = {};
+	CHECK(log.messages[0].size() == sizeof(create));
+	std::memcpy(&create, log.messages[0].data(), sizeof(create));
+	CHECK(create.header.type == RGFX_CMD_DYNAMIC_LIBRARY_CREATE);
+	CHECK(create.header.size == sizeof(RgfxDynamicLibraryCreate));
+	CHECK(create.obj_id == made.obj_id && create.library_obj_id == 0x21);
+	log.answer = RGFX_STATUS_REFUSED;
+	CHECK(ser.createDynamicLibrary(0x22).status == RGFX_STATUS_REFUSED);
+
+	const char *name = "@executable_path/libx.metallib";
+	const RgfxPipelineLibraryRef libraries[2] = {{0x31, nullptr}, {0x32, name}};
+	RgfxComputePipelineParams cp = {};
+	cp.function.library = 10;
+	cp.function.entry_point = "k";
+	cp.libraries = libraries;
+	cp.library_count = 2;
+	RgfxCreated c = ser.createComputePipeline(cp);
+	CHECK(c.posted);
+	CHECK(log.messages.size() == 3);
+	const std::vector<uint8_t> &bytes = log.messages[2];
+	RgfxComputePipelineCreate cc = {};
+	std::memcpy(&cc, bytes.data(), sizeof(cc));
+	CHECK(cc.header.type == RGFX_CMD_COMPUTE_PIPELINE_CREATE);
+	CHECK(cc.header.size == bytes.size() && bytes.size() % 8 == 0);
+	CHECK(cc.library_count == 2);
+	CHECK(bytes.size() >= sizeof(cc) + 2 * sizeof(RgfxPipelineLibrary));
+	RgfxPipelineLibrary run[2] = {};
+	std::memcpy(run, bytes.data() + bytes.size() - sizeof(run), sizeof(run));
+	CHECK(run[0].obj_id == 0x31 && run[0].name_len == 0);
+	CHECK(run[1].obj_id == 0x32 && run[1].name_len == std::strlen(name));
+	CHECK(run[1].name_offset >= sizeof(cc));
+	CHECK(run[1].name_offset + run[1].name_len <= bytes.size() - sizeof(run));
+	CHECK(std::memcmp(bytes.data() + run[1].name_offset, name, std::strlen(name)) == 0);
+
+	// A pipeline that links none leaves the count 0 and nothing after its tail.
+	cp.libraries = nullptr;
+	cp.library_count = 0;
+	CHECK(ser.createComputePipeline(cp).posted);
+	RgfxComputePipelineCreate plain = {};
+	std::memcpy(&plain, log.messages[3].data(), sizeof(plain));
+	CHECK(plain.library_count == 0);
+	CHECK(log.messages[3].size() < bytes.size());
+}
+
 // The archive file: its sections round-trip, whatever does not parse whole is no archive, and a
 // Metal archive is told by its fat header, every slice inside the file.
 void test_archive_file()
@@ -3580,6 +3642,7 @@ int main()
 	test_library_key();
 	test_library_key_of_file();
 	test_keyed_library_messages();
+	test_dynamic_library_messages();
 	test_heap_ranges();
 	test_heap_texture_size_query();
 	test_rate_map_messages();

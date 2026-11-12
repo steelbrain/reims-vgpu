@@ -42,6 +42,7 @@
 #import "RgfxBinaryArchive.h"
 #import "RgfxBlockCall.h"
 #import "RgfxComputePipelineState.h"
+#import "RgfxDynamicLibrary.h"
 #import "RgfxFunction.h"
 #import "RgfxFunctionTable.h"
 #import "RgfxGLFunction.h"
@@ -69,6 +70,7 @@
 #include <IOSurface/IOSurface.h>
 
 #include <crt_externs.h>
+#include <mach-o/dyld.h>
 #include <mach/mach.h>
 #include <pthread.h>
 #include <signal.h>
@@ -207,6 +209,29 @@ void syncAsCommitted(std::initializer_list<id> textures);
 - (BOOL)rgfxAppleRules
 {
 	return YES;
+}
+@end
+
+// A device whose newDynamicLibraryWithURL: answers a URL whose last part names one of `made` with
+// that dynamic library (made by `make`, which the test sets), keeping each path it was asked for,
+// as the pipeline's loads ask the device for the libraries their install names name.
+@interface RgfxTestDylibDevice : NSObject
+@property(nonatomic, copy) id<MTLDynamicLibrary> _Nullable (^make)(NSURL *url);
+@property(nonatomic, strong) NSMutableArray<NSString *> *asked;
+- (id<MTLDynamicLibrary>)newDynamicLibraryWithURL:(NSURL *)url error:(NSError **)error;
+@end
+@implementation RgfxTestDylibDevice
+- (instancetype)init
+{
+	self = [super init];
+	_asked = [NSMutableArray array];
+	return self;
+}
+- (id<MTLDynamicLibrary>)newDynamicLibraryWithURL:(NSURL *)url error:(NSError **)error
+{
+	(void)error;
+	[_asked addObject:url.path];
+	return _make ? _make(url) : nil;
 }
 @end
 
@@ -4032,6 +4057,375 @@ void test_compute_pipeline_routing()
 	                                                        error:&err3];
 	CHECK(noFn == nil);
 	CHECK(err3 != nil);
+}
+
+// A device that answers each message it takes with `answer`, keeping each in order: a
+// serialiser over a control ring that forwards each message. Never freed: objects a test lets go
+// post their destroys through it after the test.
+struct Answering {
+	uint32_t answer = RGFX_STATUS_OK;
+	uint64_t seqno = 0;
+	std::vector<std::vector<uint8_t>> messages;
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	RgfxRingWriter &control = *new RgfxRingWriter(&Answering::forward, this, 0x8000);
+	RgfxSerializer &ser = *new RgfxSerializer(control, ids);
+
+	static bool forward(void *context, const void *message, uint32_t size, uint64_t *seqno,
+	                    uint32_t *status)
+	{
+		Answering *a = static_cast<Answering *>(context);
+		const uint8_t *b = static_cast<const uint8_t *>(message);
+		a->messages.emplace_back(b, b + size);
+		*seqno = ++a->seqno;
+		if (status)
+			*status = a->answer;
+		return true;
+	}
+	// The messages of `type` it took, in order.
+	std::vector<std::vector<uint8_t>> of(uint32_t type) const
+	{
+		std::vector<std::vector<uint8_t>> out;
+		for (const std::vector<uint8_t> &m : messages) {
+			RgfxMsgHeader h = {};
+			std::memcpy(&h, m.data(), sizeof(h));
+			if (h.type == type)
+				out.push_back(m);
+		}
+		return out;
+	}
+};
+
+// A .metallib's bytes with no functions whose HDYN region names `installName` and `dependencies`,
+// as Apple's `metal -dynamiclib` and `-l` write them (rgfxReadMetallibLinkage): of type dynamic
+// where `dynamic`, else executable. `hdyn` false leaves the extended header without HDYN.
+std::vector<uint8_t> linkedMetallib(const std::string &installName,
+                                    const std::vector<std::string> &dependencies,
+                                    bool dynamic = true, bool hdyn = true)
+{
+	std::vector<uint8_t> b(0x40, 0);
+	std::memcpy(b.data(), "MTLB", 4);
+	b[0x0a] = dynamic ? 2 : 0;
+	b[0x18] = 0x40; // the function list: its count, 0, at 0x40, and no entries after it
+	b.resize(0x44, 0);
+	auto tag = [&](const char *name, const void *data, uint16_t size) {
+		const size_t at = b.size();
+		b.resize(at + 6 + size, 0);
+		std::memcpy(b.data() + at, name, 4);
+		std::memcpy(b.data() + at + 4, &size, 2);
+		std::memcpy(b.data() + at + 6, data, size);
+	};
+	auto text = [&](const char *name, const std::string &value) {
+		tag(name, value.c_str(), static_cast<uint16_t>(value.size() + 1));
+	};
+	const size_t hdynAt = b.size() + 6;
+	if (hdyn) {
+		const uint64_t placeholder[2] = {};
+		tag("HDYN", placeholder, sizeof(placeholder));
+	}
+	b.insert(b.end(), {'E', 'N', 'D', 'T'});
+	const uint64_t region = b.size();
+	text("NAME", installName);
+	for (const std::string &d : dependencies)
+		text("DYNL", d);
+	b.insert(b.end(), {'E', 'N', 'D', 'T'});
+	if (hdyn) {
+		const uint64_t span[2] = {region, b.size() - region};
+		std::memcpy(b.data() + hdynAt, span, sizeof(span));
+	}
+	return b;
+}
+
+// A shadow maker that makes none: the tests' libraries have no Metal of their own behind them.
+RgfxShadowMaker noShadow()
+{
+	return ^id<MTLLibrary>(dispatch_data_t) {
+		return nil;
+	};
+}
+
+// The library of `bytes` on `ser`, keeping them as the device keeps a library's source.
+RgfxLibrary *linkedLibrary(RgfxSerializer &ser, const std::vector<uint8_t> &bytes)
+{
+	uint32_t status = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.data()
+	                                        length:bytes.size()
+	                                           key:nullptr
+	                                        device:nil
+	                                    serializer:&ser
+	                                        status:&status];
+	CHECK(lib != nil);
+	dispatch_data_t source =
+	    dispatch_data_create(bytes.data(), bytes.size(), nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+	[lib rgfxSetSource:source shadowMaker:noShadow()];
+	return lib;
+}
+
+// A .metallib's linkage reads from its HDYN region: its install name and its dependencies in
+// order; one with no HDYN reads as none, and bytes that are no .metallib, or a region past them,
+// do not read.
+void test_metallib_linkage()
+{
+	const std::vector<std::string> deps = {"@loader_path/libb.metallib", "/abs/libc.metallib"};
+	std::vector<uint8_t> bytes = linkedMetallib("@executable_path/liba.metallib", deps);
+	RgfxMetallibLinkage linkage;
+	CHECK(rgfxReadMetallibLinkage(bytes.data(), bytes.size(), linkage));
+	CHECK(linkage.installName == "@executable_path/liba.metallib");
+	CHECK(linkage.dependencies == deps);
+	std::vector<uint8_t> none = linkedMetallib("x", {}, false, false);
+	CHECK(rgfxReadMetallibLinkage(none.data(), none.size(), linkage));
+	CHECK(linkage.installName.empty() && linkage.dependencies.empty());
+	CHECK(!rgfxReadMetallibLinkage(bytes.data(), bytes.size() - 8, linkage));
+	CHECK(linkage.installName.empty() && linkage.dependencies.empty());
+	std::vector<uint8_t> other = bytes;
+	other[0] = 'X';
+	CHECK(!rgfxReadMetallibLinkage(other.data(), other.size(), linkage));
+	CHECK(!rgfxReadMetallibLinkage(bytes.data(), 0x20, linkage));
+}
+
+// A dynamic library is made only where the host makes them, of the library a
+// DYNAMIC_LIBRARY_CREATE names, nil where the host refuses it; it answers its library's install
+// name and, as airData, its library's bytes, and writes them to a file URL in a directory that is
+// there, and nothing to any other URL, with Metal's "Invalid URL".
+void test_dynamic_library_routing()
+{
+	Answering &a = *new Answering();
+	std::vector<uint8_t> bytes = linkedMetallib("@executable_path/liba.metallib", {});
+	RgfxLibrary *lib = linkedLibrary(a.ser, bytes);
+	CHECK(lib.type == MTLLibraryTypeDynamic);
+	CHECK([lib.installName isEqualToString:@"@executable_path/liba.metallib"]);
+	uint32_t status = 0;
+	const size_t before = a.messages.size();
+	CHECK([RgfxDynamicLibrary dynamicLibraryOfLibrary:lib device:nil serializer:&a.ser
+	                                           status:&status] == nil);
+	CHECK(status == kRgfxNoAnswer && a.messages.size() == before);
+
+	a.ser.setCarriesDynamicLibraries(true);
+	RgfxDynamicLibrary *dylib = [RgfxDynamicLibrary dynamicLibraryOfLibrary:lib
+	                                                                 device:nil
+	                                                             serializer:&a.ser
+	                                                                 status:&status];
+	CHECK(dylib != nil && status == RGFX_STATUS_OK);
+	CHECK(dylib.rgfxLibrary == lib);
+	CHECK([dylib.installName isEqualToString:@"@executable_path/liba.metallib"]);
+	const void *airBytes = nullptr;
+	size_t airSize = 0;
+	dispatch_data_t air = [dylib airData];
+	dispatch_data_t airMap = air ? dispatch_data_create_map(air, &airBytes, &airSize) : nil;
+	CHECK(airMap != nil && airSize == bytes.size());
+	CHECK(std::memcmp(airBytes, bytes.data(), bytes.size()) == 0);
+	// The caller owns what airData answers, as Metal's compile of source takes it: one reference
+	// more than the library's, past the pool the call ran in.
+	void *base = nullptr;
+	@autoreleasepool {
+		base = (__bridge void *)[lib rgfxSource];
+	}
+	const long baseline = CFGetRetainCount(base);
+	void *owned = nullptr;
+	@autoreleasepool {
+		owned = reinterpret_cast<void *(*)(id, SEL)>(objc_msgSend)(dylib, sel_registerName("airData"));
+	}
+	CHECK(owned == base && CFGetRetainCount(owned) == baseline + 1);
+	CFRelease(owned);
+	CHECK(CFGetRetainCount(base) == baseline);
+	std::vector<std::vector<uint8_t>> creates = a.of(RGFX_CMD_DYNAMIC_LIBRARY_CREATE);
+	CHECK(creates.size() == 1);
+	RgfxDynamicLibraryCreate create = {};
+	std::memcpy(&create, creates[0].data(), sizeof(create));
+	CHECK(create.obj_id == dylib.rgfxObjId && create.library_obj_id == lib.rgfxObjId);
+	a.answer = RGFX_STATUS_REFUSED;
+	CHECK([RgfxDynamicLibrary dynamicLibraryOfLibrary:lib device:nil serializer:&a.ser
+	                                           status:&status] == nil);
+	CHECK(status == RGFX_STATUS_REFUSED);
+	a.answer = RGFX_STATUS_OK;
+
+	NSString *dir = [NSTemporaryDirectory()
+	    stringByAppendingPathComponent:[NSString stringWithFormat:@"rgfx-dylib-%d", getpid()]];
+	CHECK([[NSFileManager defaultManager] createDirectoryAtPath:dir
+	                                withIntermediateDirectories:YES
+	                                                 attributes:nil
+	                                                      error:nil]);
+	for (NSURL *url in @[
+		     [NSURL fileURLWithPath:[dir stringByAppendingPathComponent:@"gone/lib.metallib"]],
+		     [NSURL URLWithString:@"https://example.invalid/lib.metallib"]
+	     ]) {
+		NSError *error = nil;
+		CHECK(![dylib serializeToURL:url error:&error]);
+		CHECK([error.domain isEqualToString:MTLDynamicLibraryDomain]);
+		CHECK(error.code == MTLDynamicLibraryErrorInvalidFile);
+		CHECK([error.localizedDescription isEqualToString:@"Invalid URL"]);
+	}
+	CHECK(![[NSFileManager defaultManager]
+	    fileExistsAtPath:[dir stringByAppendingPathComponent:@"gone"]]);
+	NSURL *file = [NSURL fileURLWithPath:[dir stringByAppendingPathComponent:@"lib.metallib"]];
+	NSError *error = nil;
+	CHECK([dylib serializeToURL:file error:&error] && error == nil);
+	NSData *written = [NSData dataWithContentsOfURL:file];
+	CHECK(written.length == bytes.size());
+	CHECK(std::memcmp(written.bytes, bytes.data(), bytes.size()) == 0);
+	[[NSFileManager defaultManager] removeItemAtPath:dir error:nil];
+}
+
+// A compute pipeline names the dynamic libraries its kernel links: the descriptor's preloaded
+// ones first, then the library each install name its libraries name loads, which the device reads
+// from the file it names (from the executable's directory, or the directory of the file of the
+// library naming it), each once, and those libraries' own after. A name no file loads refuses the
+// pipeline as the AMD 5300M does, beside a preloaded library or not; so does a name a library made
+// of no file names, its file there or not, the kernel's or a preloaded library's, and a preloaded
+// library of no device of ours; none posts a create.
+void test_compute_pipeline_libraries()
+{
+	Answering &a = *new Answering();
+	a.ser.setCarriesDynamicLibraries(true);
+	const std::vector<uint8_t> kernelBytes = {9, 9, 9};
+	uint32_t status = 0;
+	RgfxLibrary *kernelLib = [RgfxLibrary libraryWithData:kernelBytes.data()
+	                                              length:kernelBytes.size()
+	                                                 key:nullptr
+	                                              device:nil
+	                                          serializer:&a.ser
+	                                              status:&status];
+	// The kernel's library keeps bytes that name liba (its function table reads none of them).
+	std::vector<uint8_t> kernelSource =
+	    linkedMetallib("", {"@executable_path/liba.metallib"}, false);
+	[kernelLib rgfxSetSource:dispatch_data_create(kernelSource.data(), kernelSource.size(), nullptr,
+	                                              DISPATCH_DATA_DESTRUCTOR_DEFAULT)
+	             shadowMaker:noShadow()];
+	[kernelLib rgfxSetMadeFromURL:[NSURL fileURLWithPath:@"/app/k.metallib"]];
+	id<MTLFunction> kernel = [kernelLib newFunctionWithName:@"k"];
+	MTLComputePipelineDescriptor *desc = [[MTLComputePipelineDescriptor alloc] init];
+	desc.computeFunction = kernel;
+	auto lastRun = [&](size_t count) {
+		std::vector<std::vector<uint8_t>> creates = a.of(RGFX_CMD_COMPUTE_PIPELINE_CREATE);
+		CHECK(!creates.empty());
+		const std::vector<uint8_t> &m = creates.back();
+		RgfxComputePipelineCreate head = {};
+		std::memcpy(&head, m.data(), sizeof(head));
+		CHECK(head.library_count == count);
+		std::vector<std::pair<uint64_t, std::string>> run;
+		for (size_t i = 0; i < count; i++) {
+			RgfxPipelineLibrary r = {};
+			std::memcpy(&r, m.data() + m.size() - (count - i) * sizeof(r), sizeof(r));
+			run.emplace_back(r.obj_id, std::string(reinterpret_cast<const char *>(m.data()) +
+			                                           r.name_offset,
+			                                       r.name_len));
+		}
+		return run;
+	};
+
+	// Unresolved: no preloaded library answers liba, and the device loads none.
+	size_t creates = a.of(RGFX_CMD_COMPUTE_PIPELINE_CREATE).size();
+	NSError *error = nil;
+	CHECK([RgfxComputePipelineState computePipelineStateWithDescriptor:desc
+	                                                            device:nil
+	                                                        serializer:&a.ser
+	                                                             error:&error] == nil);
+	CHECK([error.domain isEqualToString:@"CompilerError"] && error.code == 2);
+	CHECK([error.localizedDescription isEqualToString:@"Error creating compute variant"]);
+	CHECK(a.of(RGFX_CMD_COMPUTE_PIPELINE_CREATE).size() == creates);
+
+	// Preloaded beside a name that loads nothing: refused as well.
+	RgfxLibrary *libA = linkedLibrary(a.ser, linkedMetallib("@executable_path/liba.metallib", {}));
+	RgfxDynamicLibrary *dylibA = [RgfxDynamicLibrary dynamicLibraryOfLibrary:libA
+	                                                                  device:nil
+	                                                              serializer:&a.ser
+	                                                                  status:&status];
+	CHECK(dylibA != nil);
+	desc.preloadedLibraries = @[ dylibA ];
+	RgfxTestDylibDevice *device = [[RgfxTestDylibDevice alloc] init];
+	error = nil;
+	CHECK([RgfxComputePipelineState computePipelineStateWithDescriptor:desc
+	                                                            device:(id<MTLDevice>)device
+	                                                        serializer:&a.ser
+	                                                             error:&error] == nil);
+	CHECK([error.domain isEqualToString:@"CompilerError"] && error.code == 2);
+	CHECK(a.of(RGFX_CMD_COMPUTE_PIPELINE_CREATE).size() == creates);
+
+	// Loaded: liba from the executable's directory, and the libb it names from liba's, after the
+	// preloaded library.
+	char path[PATH_MAX];
+	uint32_t size = sizeof(path);
+	char real[PATH_MAX];
+	CHECK(_NSGetExecutablePath(path, &size) == 0 && realpath(path, real) != nullptr);
+	NSString *exeDir = [@(real) stringByDeletingLastPathComponent];
+	[device.asked removeAllObjects];
+	device.make = ^id<MTLDynamicLibrary>(NSURL *url) {
+		NSString *name = url.lastPathComponent;
+		std::vector<std::string> deps;
+		if ([name isEqualToString:@"liba.metallib"])
+			deps = {"@loader_path/libb.metallib"};
+		else if (![name isEqualToString:@"libb.metallib"])
+			return nil;
+		RgfxLibrary *lib = linkedLibrary(a.ser, linkedMetallib("", deps));
+		[lib rgfxSetMadeFromURL:[NSURL
+		                            fileURLWithPath:[@"/loaded/here" stringByAppendingPathComponent:name]]];
+		uint32_t s = 0;
+		return [RgfxDynamicLibrary dynamicLibraryOfLibrary:lib device:nil serializer:&a.ser status:&s];
+	};
+	CHECK([RgfxComputePipelineState computePipelineStateWithDescriptor:desc
+	                                                            device:(id<MTLDevice>)device
+	                                                        serializer:&a.ser
+	                                                             error:nil] != nil);
+	CHECK(device.asked.count == 2);
+	CHECK([device.asked[0] isEqualToString:[exeDir stringByAppendingPathComponent:@"liba.metallib"]]);
+	CHECK([device.asked[1] isEqualToString:@"/loaded/here/libb.metallib"]);
+	auto run = lastRun(3);
+	CHECK(run[0].first == dylibA.rgfxObjId && run[0].second.empty());
+	CHECK(run[1].second == "@executable_path/liba.metallib");
+	CHECK(run[2].second == "@loader_path/libb.metallib");
+	CHECK(run[1].first != 0 && run[2].first != 0 && run[1].first != run[2].first);
+	CHECK(run[1].first != dylibA.rgfxObjId);
+
+	// The kernel's library made of the same bytes, of no file: liba's file is there, and the
+	// device is asked for nothing, beside dylibA preloaded or not.
+	RgfxLibrary *bytesLib = [RgfxLibrary libraryWithData:kernelBytes.data()
+	                                              length:kernelBytes.size()
+	                                                 key:nullptr
+	                                              device:nil
+	                                          serializer:&a.ser
+	                                              status:&status];
+	[bytesLib rgfxSetSource:dispatch_data_create(kernelSource.data(), kernelSource.size(), nullptr,
+	                                             DISPATCH_DATA_DESTRUCTOR_DEFAULT)
+	            shadowMaker:noShadow()];
+	MTLComputePipelineDescriptor *ofBytes = [[MTLComputePipelineDescriptor alloc] init];
+	ofBytes.computeFunction = [bytesLib newFunctionWithName:@"k"];
+	creates = a.of(RGFX_CMD_COMPUTE_PIPELINE_CREATE).size();
+	for (NSArray *preloaded in @[ @[], @[ dylibA ] ]) {
+		ofBytes.preloadedLibraries = preloaded;
+		[device.asked removeAllObjects];
+		error = nil;
+		CHECK([RgfxComputePipelineState computePipelineStateWithDescriptor:ofBytes
+		                                                            device:(id<MTLDevice>)device
+		                                                        serializer:&a.ser
+		                                                             error:&error] == nil);
+		CHECK([error.domain isEqualToString:@"CompilerError"] && error.code == 2);
+		CHECK(device.asked.count == 0);
+	}
+	// A preloaded dynamic library of no file that names liba refuses the kernel of a file too.
+	RgfxDynamicLibrary *dylibC = [RgfxDynamicLibrary
+	    dynamicLibraryOfLibrary:linkedLibrary(a.ser, linkedMetallib("@executable_path/libc.metallib",
+	                                                                {"@executable_path/liba.metallib"}))
+	                     device:nil
+	                 serializer:&a.ser
+	                     status:&status];
+	CHECK(dylibC != nil);
+	desc.preloadedLibraries = @[ dylibC ];
+	error = nil;
+	CHECK([RgfxComputePipelineState computePipelineStateWithDescriptor:desc
+	                                                            device:(id<MTLDevice>)device
+	                                                        serializer:&a.ser
+	                                                             error:&error] == nil);
+	CHECK([error.domain isEqualToString:@"CompilerError"] && error.code == 2);
+	CHECK(a.of(RGFX_CMD_COMPUTE_PIPELINE_CREATE).size() == creates);
+
+	// A preloaded library not of this device.
+	desc.preloadedLibraries = @[ (id<MTLDynamicLibrary>)[[NSObject alloc] init] ];
+	creates = a.of(RGFX_CMD_COMPUTE_PIPELINE_CREATE).size();
+	error = nil;
+	CHECK([RgfxComputePipelineState computePipelineStateWithDescriptor:desc
+	                                                            device:(id<MTLDevice>)device
+	                                                        serializer:&a.ser
+	                                                             error:&error] == nil);
+	CHECK(error != nil && a.of(RGFX_CMD_COMPUTE_PIPELINE_CREATE).size() == creates);
 }
 
 // One function of a test .metallib: its entry point, its stage (the TYPE tag's byte: 0
@@ -17478,6 +17872,9 @@ int main(int argc, char **argv)
 		test_mesh_pipeline_refusals();
 		test_invalid_mesh_descriptors_end_the_process();
 		test_compute_pipeline_routing();
+		test_metallib_linkage();
+		test_dynamic_library_routing();
+		test_compute_pipeline_libraries();
 		test_function_constants_resolve_as_metal();
 		test_async_creators_return_before_their_handlers();
 		test_async_creates_keep_what_they_use();

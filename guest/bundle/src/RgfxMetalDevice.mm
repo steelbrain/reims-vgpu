@@ -885,6 +885,8 @@ RGFX_LOG_UNRECOGNIZED
 	_serializer->setCarriesRateMaps((_caps.features() & RGFX_FEATURE_RATE_MAPS) != 0);
 	_serializer->setCarriesFunctionPointers((_caps.features() & RGFX_FEATURE_FUNCTION_POINTERS) !=
 	                                        0);
+	_serializer->setCarriesDynamicLibraries((_caps.features() & RGFX_FEATURE_DYNAMIC_LIBRARIES) !=
+	                                        0);
 	// Shared events cross processes through the kext's ports where the kext makes them and the
 	// host took the feature that names their events (RgfxUserClientABI.hpp,
 	// kRgfxSharedEventUserClientType).

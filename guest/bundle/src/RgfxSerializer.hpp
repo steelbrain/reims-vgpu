@@ -110,6 +110,13 @@ struct RgfxLinkedFunctionRef {
 	const char *specialized_name;
 };
 
+/// One dynamic library a compute pipeline's kernel links (RgfxPipelineLibrary): dynamic library
+/// `library`, preloaded where `install_name` is null, else the library that install name loads.
+struct RgfxPipelineLibraryRef {
+	RgfxObjId library;
+	const char *install_name;
+};
+
 /// A render pipeline's descriptor, as MTLRenderPipelineDescriptor gives it, in
 /// plain fields the serialiser packs into RgfxRenderPipelineCreate. `colors[0..
 /// color_attachment_count)` are in use; the vertex descriptor's `layouts` and
@@ -174,7 +181,8 @@ struct RgfxMeshRenderPipelineParams {
 /// A compute pipeline's descriptor in plain fields the serialiser packs into
 /// RgfxComputePipelineCreate. The stage-input descriptor's `layouts` and
 /// `attributes` (their step functions MTLStepFunction, their formats
-/// MTLAttributeFormat) and the linked functions may be null when their counts are 0.
+/// MTLAttributeFormat), the linked functions and the dynamic libraries may be null when their
+/// counts are 0.
 struct RgfxComputePipelineParams {
 	RgfxFunctionRef function;
 	uint32_t flags; // RGFX_COMPUTE_PIPELINE_*
@@ -188,6 +196,8 @@ struct RgfxComputePipelineParams {
 	uint32_t stage_input_index_buffer_index;
 	const RgfxLinkedFunctionRef *linked;
 	uint32_t linked_count;
+	const RgfxPipelineLibraryRef *libraries; // where the host makes dynamic libraries alone
+	uint32_t library_count;
 };
 
 /// What a create did. `obj_id`, `gpu_address` and `resource_id` are the values
@@ -330,6 +340,11 @@ public:
 	/// RGFX_FEATURE_FUNCTION_POINTERS. Set once, before the first pipeline; off by default.
 	void setCarriesFunctionPointers(bool carries) { m_functionPointers = carries; }
 	bool carriesFunctionPointers() const { return m_functionPointers; }
+	/// Whether the host makes dynamic libraries (createDynamicLibrary) and links them into a
+	/// compute pipeline (RgfxComputePipelineParams::libraries): it took
+	/// RGFX_FEATURE_DYNAMIC_LIBRARIES. Set once, before the first library; off by default.
+	void setCarriesDynamicLibraries(bool carries) { m_dynamicLibraries = carries; }
+	bool carriesDynamicLibraries() const { return m_dynamicLibraries; }
 	/// Names shared event `event` for other processes: its port, 0 where none was given.
 	uint32_t shareEvent(RgfxObjId event);
 	/// The process's new shared event made of the one `port` names: its id in `obj_id` and the
@@ -569,6 +584,12 @@ public:
 	RgfxCreated createLibrary(const void *bytes, uint64_t byte_length,
 	                          const uint8_t *key = nullptr);
 
+	/// A dynamic library of library `library` (DYNAMIC_LIBRARY_CREATE): `status` is the
+	/// device's answer (RGFX_STATUS_OK where it made it), `posted` false where the ring had no
+	/// room. No message goes where the host makes no dynamic libraries
+	/// (carriesDynamicLibraries): `status` is then kRgfxNoAnswer.
+	RgfxCreated createDynamicLibrary(RgfxObjId library);
+
 	/// A LIBRARY_LOOKUP of the library whose `slice_size` bytes have the content
 	/// key `key` (32 bytes), under a new id: `status` RGFX_STATUS_OK where the device
 	/// holds it, and the id names it; any other where it does not, and the caller
@@ -716,6 +737,7 @@ private:
 	bool m_textureDidModifyData = false;
 	bool m_rateMaps = false;
 	bool m_functionPointers = false;
+	bool m_dynamicLibraries = false;
 	void *m_eventContext = nullptr;
 
 	// heapTextureSizeAndAlign's answers, by the shape's bytes, under m_sizesLock.

@@ -106,6 +106,7 @@ inline bool rgfxSubmitMakes(uint32_t type)
 	case RGFX_CMD_RATE_MAP_CREATE:
 	case RGFX_CMD_FUNCTION_HANDLE_CREATE:
 	case RGFX_CMD_FUNCTION_TABLE_CREATE:
+	case RGFX_CMD_DYNAMIC_LIBRARY_CREATE:
 		return true;
 	default:
 		return false;

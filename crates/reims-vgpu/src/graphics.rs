@@ -47,19 +47,20 @@ use reims_vgpu_graphics::ops::RgfxCommandBuffer;
 use reims_vgpu_graphics::region::Region;
 use reims_vgpu_graphics::wire::{
     RGFX_CMD_ARGUMENT_LAYOUT, RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_COMMAND_BUFFER,
-    RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_FUNCTION_HANDLE_CREATE,
-    RGFX_CMD_FUNCTION_TABLE_CREATE, RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN,
-    RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_SLOTS, RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE,
-    RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE,
-    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_RATE_MAP_CREATE, RGFX_CMD_RATE_MAP_QUERY,
-    RGFX_CMD_RATE_MAP_RESET, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE,
-    RGFX_CMD_SHARED_EVENT_IMPORT, RGFX_CMD_SHARED_EVENT_NAME, RGFX_CMD_SHARED_EVENT_UNNAME,
-    RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_FUNCTION_POINTER_STATE,
-    RGFX_EVT_ICB_STATE, RGFX_EVT_RATE_MAP_ANSWER, RGFX_EVT_RATE_MAP_STATE, RGFX_EVT_SAMPLER_STATE,
+    RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_DYNAMIC_LIBRARY_CREATE,
+    RGFX_CMD_FUNCTION_HANDLE_CREATE, RGFX_CMD_FUNCTION_TABLE_CREATE, RGFX_CMD_HEAP_OVER_PAGES,
+    RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_SLOTS,
+    RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
+    RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, RGFX_CMD_OBJECT_DESTROY,
+    RGFX_CMD_RATE_MAP_CREATE, RGFX_CMD_RATE_MAP_QUERY, RGFX_CMD_RATE_MAP_RESET,
+    RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_IMPORT,
+    RGFX_CMD_SHARED_EVENT_NAME, RGFX_CMD_SHARED_EVENT_UNNAME, RGFX_CONTEXT_OBJ_ID_SHIFT,
+    RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_FUNCTION_POINTER_STATE, RGFX_EVT_ICB_STATE,
+    RGFX_EVT_RATE_MAP_ANSWER, RGFX_EVT_RATE_MAP_STATE, RGFX_EVT_SAMPLER_STATE,
     RGFX_FEATURE_CB_SUBMITTED, RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_DISPLAY_COLOR,
-    RGFX_FEATURE_DISPLAY_POWER, RGFX_FEATURE_DISPLAY_SCALE, RGFX_FEATURE_FUNCTION_POINTERS,
-    RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_HOST_TIME, RGFX_FEATURE_ICB_SLOTS,
-    RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_MANAGED_AT_OFFSET,
+    RGFX_FEATURE_DISPLAY_POWER, RGFX_FEATURE_DISPLAY_SCALE, RGFX_FEATURE_DYNAMIC_LIBRARIES,
+    RGFX_FEATURE_FUNCTION_POINTERS, RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_HOST_TIME,
+    RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_MANAGED_AT_OFFSET,
     RGFX_FEATURE_MANAGED_BUFFER_SLABS, RGFX_FEATURE_MANAGED_TEXTURE_SLABS,
     RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE, RGFX_FEATURE_PAGES_16K,
     RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_RATE_MAPS,
@@ -413,6 +414,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 | RGFX_FEATURE_DISPLAY_POWER
                 | RGFX_FEATURE_RATE_MAPS
                 | RGFX_FEATURE_FUNCTION_POINTERS
+                | RGFX_FEATURE_DYNAMIC_LIBRARIES
                 | if gpu_device.makes_opencl_mode_pipelines() {
                     u64::from(RGFX_FEATURE_OPENCL_MODE)
                 } else {
@@ -1465,6 +1467,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 self.function_pointer_state(poster, message);
                 return;
             }
+            RGFX_CMD_DYNAMIC_LIBRARY_CREATE => {
+                self.dynamic_library_create(poster, message);
+                return;
+            }
             RGFX_CMD_SAMPLER_CREATE => {
                 self.create_sampler(poster, message);
                 return;
@@ -2060,6 +2066,38 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             );
         }
         poster.post(answer.as_bytes());
+    }
+
+    /// A dynamic library's create from ring 0, answered through `poster` (`COMPLETE`,
+    /// `decode::dynamic_library`) once the library it names is made. A create the platform raises
+    /// at is answered refused.
+    fn dynamic_library_create(&self, poster: &CompletionPoster, message: &[u8]) {
+        let (ty, seqno, obj_id) = message_identity(message);
+        let decoder =
+            (self.decoders).sender(Some(sender_context(poster, message)), Sinks::default());
+        let answer =
+            entry::run(|_| refusing(|| decoder.dynamic_library_create(&self.device, message)));
+        let answer = answer.unwrap_or_else(|raise| {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = raise;
+                "a dynamic library create (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) \
+                 faulted: {raise}"
+            );
+            RgfxMsgHeader::read_from_prefix(message)
+                .ok()
+                .map(|(header, _)| (header.seqno, RGFX_STATUS_REFUSED))
+        });
+        let Some((seqno, status)) = answer else {
+            return;
+        };
+        if status != RGFX_STATUS_OK {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "a dynamic library create (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) was \
+                 answered status {status}"
+            );
+        }
+        poster.post(complete(seqno, status).as_bytes());
     }
 
     /// A rasterization rate map's query from ring 0, answered at once through `poster`

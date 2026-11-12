@@ -20,11 +20,27 @@
 #ifdef __cplusplus
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "RgfxAirArguments.hpp"
 
 class RgfxRegion;
 class RgfxSerializer;
+
+/// A .metallib's install name and the install names of the dynamic libraries it was linked
+/// against, in link order: its extended header's HDYN region, a tag list of NAME and one DYNL per
+/// library (read from Apple's `metal -dynamiclib` and `-l` output, oracle_fnptr's libraries).
+struct RgfxMetallibLinkage {
+	std::string installName;
+	std::vector<std::string> dependencies;
+};
+
+/// Reads `n` bytes at `p` as a .metallib's linkage into `out`: the extended header follows the
+/// function list (the header's u64 offset at 0x18 and size at 0x20, which counts the entries and
+/// not the count before them), each tag a 4-byte name, a u16 size and the data, up to ENDT; its
+/// HDYN holds the u64 offset and size of the region. False, `out` empty, where the bytes are no
+/// .metallib or a span runs past them; true with `out` empty for a library with no HDYN.
+bool rgfxReadMetallibLinkage(const uint8_t *_Nullable p, size_t n, RgfxMetallibLinkage &out);
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
@@ -59,9 +75,16 @@ static const MTLFunctionType kRgfxFunctionTypeExtern = (MTLFunctionType)4;
 - (nullable id<MTLFunction>)newExternFunctionWithName:(NSString *)name;
 
 /// Marks the library as made from `url` (newLibraryWithURL:, and the calls that make theirs so),
-/// which Metal does not serialize, and whose last part an executable library answers as its
-/// install name.
+/// which Metal does not serialize, whose last part an executable library answers as its install
+/// name, and whose install names a pipeline loads (none of a library of no file).
 - (void)rgfxSetMadeFromURL:(NSURL *)url;
+
+/// The URL the library was made from (rgfxSetMadeFromURL:), nil for any other.
+- (nullable NSURL *)rgfxURL;
+
+/// The bytes the library was made from, nil where it kept none (one Metal's link or stitching
+/// made).
+- (nullable dispatch_data_t)rgfxSource;
 
 /// The function table the library reads its functions from: one object for every library of the
 /// process made from bytes of one content key (tests).
@@ -75,6 +98,10 @@ static const MTLFunctionType kRgfxFunctionTypeExtern = (MTLFunctionType)4;
 - (BOOL)serializeToURL:(NSURL *)url error:(NSError *_Nullable __autoreleasing *_Nullable)error;
 
 #ifdef __cplusplus
+/// The install names of the dynamic libraries the library was linked against
+/// (rgfxReadMetallibLinkage of its bytes), read once: empty where it kept no bytes.
+- (std::vector<std::string>)rgfxDependencies;
+
 /// The entry point `name`'s nodes whole, with its module's function constants (rgfxReadAirEntries;
 /// `entries` then holds that one entry), read once from the bitcode the library's bytes hold for
 /// it: null where the library kept no bytes (one Metal's link or stitching made), or its module or

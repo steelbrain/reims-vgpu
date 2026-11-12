@@ -147,10 +147,10 @@ use reims_vgpu_vulkan::core::platform::resource::{
 use reims_vgpu_vulkan::core::platform::types::{MtlSize, Swizzle};
 use reims_vgpu_vulkan::core::platform::values::{
     AttributeDesc, BufferDesc, BufferLayoutDesc, ColorAttachmentDesc, DepthStencilDesc,
-    FullComputePipelineDesc, FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc,
-    LinkedFunctionsDesc, OptionSet, PagesInPlace, PagesPlane, PrivateRenderDesc, SamplerDesc,
-    StageInputDesc, StencilDesc, SurfaceFacts, SurfaceMatrix, SurfacePlane, TextureDesc,
-    VertexDesc,
+    DynamicLibrariesDesc, FullComputePipelineDesc, FullMeshRenderPipelineDesc,
+    FullRenderPipelineDesc, HeapDesc, LinkedFunctionsDesc, OptionSet, PagesInPlace, PagesPlane,
+    PrivateRenderDesc, SamplerDesc, StageInputDesc, StencilDesc, SurfaceFacts, SurfaceMatrix,
+    SurfacePlane, TextureDesc, VertexDesc,
 };
 use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_vulkan::core::raise::{OnFault, Raise, RaiseResult, refusals};
@@ -175,6 +175,7 @@ mod composite_cost;
 mod compute;
 #[cfg(test)]
 pub(super) mod draw_cost;
+mod dynamic_library;
 mod function_table;
 #[cfg(test)]
 mod fuzz;
@@ -554,6 +555,10 @@ enum ObjHandle<P: Platform> {
     /// ([`RGFX_CMD_FUNCTION_TABLE_CREATE`](reims_vgpu_graphics::wire::RGFX_CMD_FUNCTION_TABLE_CREATE)),
     /// which compute encoders bind ([`function_table`]).
     FunctionTable(P::VisibleFunctionTable),
+    /// A dynamic library
+    /// ([`RGFX_CMD_DYNAMIC_LIBRARY_CREATE`](reims_vgpu_graphics::wire::RGFX_CMD_DYNAMIC_LIBRARY_CREATE)),
+    /// which compute pipeline creates name ([`dynamic_library`]).
+    DynamicLibrary(P::DynamicLibrary),
     /// What an id stands for whose posted create the host refused ([`refused`]): what names it
     /// is dropped, not the command buffer that names it.
     Refused(refused::Refused),
@@ -3980,6 +3985,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             let constants = constants_tail(message, m.constants_offset, m.constant_count)
                 .ok_or(DecodeError::Malformed)?;
             let linked = self.linked_tail(message, m.linked_offset, m.linked_count)?;
+            let libraries = self.pipeline_libraries(message, &m)?;
             let stage_input = stage_input(message, &m)?;
             return Ok(PipelineJob {
                 obj_id: m.obj_id,
@@ -3989,6 +3995,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     name: name.to_owned(),
                     constants,
                     linked,
+                    libraries,
                     fields: ComputeFields {
                         threadgroup_size_is_multiple_of_execution_width: m.flags
                             & RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH
@@ -4301,6 +4308,8 @@ enum PipelineShape<P: Platform> {
         name: String,
         constants: Vec<FunctionConstant>,
         linked: Vec<LinkedRef<P>>,
+        /// The dynamic libraries the kernel links.
+        libraries: DynamicLibrariesDesc<P>,
         fields: ComputeFields,
     },
 }
@@ -5027,6 +5036,7 @@ pub(crate) fn compile_pipeline<P: Platform>(
             name,
             constants,
             linked,
+            libraries,
             fields,
         } => {
             let Some(library) = library.resolve() else {
@@ -5049,6 +5059,7 @@ pub(crate) fn compile_pipeline<P: Platform>(
                 support_indirect_command_buffers: fields.support_indirect_command_buffers,
                 stage_input: fields.stage_input,
                 linked,
+                libraries,
                 open_cl_mode: fields.open_cl_mode,
             };
             Ok(match device.new_compute_pipeline_state_full(&desc) {
