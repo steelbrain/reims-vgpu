@@ -30,7 +30,8 @@ use reims_vgpu_graphics::ops::compute::{
     RGFX_OP_COMPUTE_SET_SAMPLER_STATES, RGFX_OP_COMPUTE_SET_SAMPLER_STATES_LOD_CLAMPS,
     RGFX_OP_COMPUTE_SET_STAGE_IN_REGION, RGFX_OP_COMPUTE_SET_STAGE_IN_REGION_INDIRECT,
     RGFX_OP_COMPUTE_SET_TEXTURE, RGFX_OP_COMPUTE_SET_TEXTURES,
-    RGFX_OP_COMPUTE_SET_THREADGROUP_MEMORY_LENGTH, RGFX_OP_COMPUTE_UPDATE_FENCE,
+    RGFX_OP_COMPUTE_SET_THREADGROUP_MEMORY_LENGTH, RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLE,
+    RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLES, RGFX_OP_COMPUTE_UPDATE_FENCE,
     RGFX_OP_COMPUTE_USE_HEAPS, RGFX_OP_COMPUTE_USE_RESOURCES, RGFX_OP_COMPUTE_WAIT_FOR_FENCE,
     RGFX_RESOURCE_KIND_BUFFER, RGFX_RESOURCE_KIND_ICB, RGFX_RESOURCE_KIND_NONE,
     RGFX_RESOURCE_KIND_TEXTURE, RgfxComputeBufferBinding, RgfxComputeBufferStrideBinding,
@@ -45,9 +46,11 @@ use reims_vgpu_graphics::ops::compute::{
     RgfxComputeOpSetImageblockWidth, RgfxComputeOpSetSamplerStates,
     RgfxComputeOpSetSamplerStatesLodClamps, RgfxComputeOpSetStageInRegion,
     RgfxComputeOpSetStageInRegionIndirect, RgfxComputeOpSetTexture, RgfxComputeOpSetTextures,
-    RgfxComputeOpSetThreadgroupMemoryLength, RgfxComputeOpUpdateFence, RgfxComputeOpUseHeaps,
+    RgfxComputeOpSetThreadgroupMemoryLength, RgfxComputeOpSetVisibleFunctionTable,
+    RgfxComputeOpSetVisibleFunctionTables, RgfxComputeOpUpdateFence, RgfxComputeOpUseHeaps,
     RgfxComputeOpUseResources, RgfxComputeOpWaitForFence, RgfxComputeResourceRef,
     RgfxComputeSamplerBinding, RgfxComputeSamplerLodBinding, RgfxComputeTextureBinding,
+    RgfxComputeVisibleFunctionTableBinding,
 };
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::blit::ResourceRef;
@@ -283,6 +286,41 @@ pub(crate) fn decode_op<P: Platform>(
                 ComputeCmd::SetTexture {
                     texture,
                     index: m.index,
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLE => {
+            let m: RgfxComputeOpSetVisibleFunctionTable = body(tag, payload)?;
+            let function_table = refused::bind!(
+                marks,
+                Slot::new(Stage::Kernel, Bound::Buffer, m.index),
+                objs.get_function_table(m.table_obj_id)
+            );
+            enc.encode(
+                on,
+                ComputeCmd::SetVisibleFunctionTable {
+                    function_table,
+                    buffer_index: m.index,
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLES => {
+            let m: RgfxComputeOpSetVisibleFunctionTables = body(tag, payload)?;
+            let recs: Vec<RgfxComputeVisibleFunctionTableBinding> = tail(
+                tag,
+                payload,
+                size_of::<RgfxComputeOpSetVisibleFunctionTables>(),
+                m.length as usize,
+            )?;
+            let function_tables: Vec<Option<&P::VisibleFunctionTable>> =
+                bind_each(&recs, (marks, Bound::Buffer, m.location), |r| {
+                    objs.get_function_table(r.table_obj_id)
+                })?;
+            enc.encode(
+                on,
+                ComputeCmd::SetVisibleFunctionTables {
+                    function_tables: &function_tables,
+                    range: NsRange::new(m.location, m.length),
                 },
             )?;
         }

@@ -399,6 +399,10 @@ public:
 	void computeSetSamplerStatesLodClamps(
 	    uint64_t location, const RgfxComputeSamplerLodBinding *samplers,
 	    uint32_t count);
+	void computeSetVisibleFunctionTable(RgfxObjId table, uint64_t index);
+	void computeSetVisibleFunctionTables(uint64_t location,
+	                                     const RgfxComputeVisibleFunctionTableBinding *tables,
+	                                     uint32_t count);
 	void computeSetThreadgroupMemoryLength(uint64_t length, uint64_t index);
 	void computeSetStageInRegion(uint64_t origin_x, uint64_t origin_y, uint64_t origin_z,
 	                             uint64_t width, uint64_t height, uint64_t depth);

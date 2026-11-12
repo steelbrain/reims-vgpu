@@ -357,7 +357,9 @@ void rgfxNoteIcbFlush(const RgfxIcbFlush &flush)
 	}
 }
 
-/// The RGFX_RESOURCE_KIND_* of a Metal resource, for the resource-reference ops.
+/// The RGFX_RESOURCE_KIND_* of a Metal resource, for the resource-reference ops. A visible
+/// function table is none: the host makes nothing resident, and its table is read through its
+/// gpuResourceID, so a useResource: of one only keeps it while the command buffer runs.
 uint32_t rgfxResourceKind(id<MTLResource> res)
 {
 	if ([res conformsToProtocol:@protocol(MTLBuffer)])
@@ -5385,7 +5387,8 @@ RGFX_LOG_UNRECOGNIZED
 }
 
 // --- unsupported: the device answers NO for these features -----------------------
-// The device makes no acceleration structure or function table, so only nil reaches these.
+// The device makes no acceleration structure or intersection function table, so only nil
+// reaches these.
 
 - (void)setAccelerationStructure:(nullable id<MTLAccelerationStructure>)accelerationStructure
                    atBufferIndex:(NSUInteger)bufferIndex
@@ -5406,17 +5409,26 @@ RGFX_LOG_UNRECOGNIZED
 	if (range.length != 0)
 		RGFX_UNSUPPORTED("ray tracing");
 }
+
+// --- function pointers ---------------------------------------------------------------
+// A table of the pipeline's (RgfxVisibleFunctionTable) at a buffer index, which the command
+// buffer keeps while it runs; nil unbinds the index. The host's table is read as the dispatch
+// runs, so its entries are those set before the command buffer's commit.
 - (void)setVisibleFunctionTable:(nullable id<MTLVisibleFunctionTable>)visibleFunctionTable
                   atBufferIndex:(NSUInteger)bufferIndex
 {
-	if (visibleFunctionTable != nil)
-		RGFX_UNSUPPORTED("function pointers");
+	_enc->computeSetVisibleFunctionTable(rgfxNamed(_enc, visibleFunctionTable), bufferIndex);
 }
 - (void)setVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __nullable[__nonnull])visibleFunctionTables
                  withBufferRange:(NSRange)range
 {
-	if (range.length != 0)
-		RGFX_UNSUPPORTED("function pointers");
+	if (range.length == 0)
+		return;
+	std::vector<RgfxComputeVisibleFunctionTableBinding> t(range.length);
+	for (NSUInteger i = 0; i < range.length; i++)
+		t[i].table_obj_id = rgfxNamed(_enc, visibleFunctionTables[i]);
+	_enc->computeSetVisibleFunctionTables(range.location, t.data(),
+	                                      static_cast<uint32_t>(range.length));
 }
 - (void)sampleCountersInBuffer:(id<MTLCounterSampleBuffer>)sampleBuffer
                  atSampleIndex:(NSUInteger)sampleIndex

@@ -110,6 +110,15 @@ pub const RGFX_OP_COMPUTE_ENCODE_START_DO_WHILE: u16 = 0x201c;
 /// Op `COMPRESSED_TEXTURE_REINTERPRETATION_FLUSH`:
 /// `insertCompressedTextureReinterpretationFlush` (SPI). No body.
 pub const RGFX_OP_COMPUTE_COMPRESSED_TEXTURE_REINTERPRETATION_FLUSH: u16 = 0x201d;
+/// Op `SET_VISIBLE_FUNCTION_TABLE` ([`RgfxComputeOpSetVisibleFunctionTable`]):
+/// `setVisibleFunctionTable:atBufferIndex:`, where the guest took
+/// [`RGFX_FEATURE_FUNCTION_POINTERS`](crate::wire::RGFX_FEATURE_FUNCTION_POINTERS).
+pub const RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLE: u16 = 0x201e;
+/// Op `SET_VISIBLE_FUNCTION_TABLES` ([`RgfxComputeOpSetVisibleFunctionTables`] then
+/// [`RgfxComputeVisibleFunctionTableBinding`] records): `setVisibleFunctionTables:withBufferRange:`,
+/// where the guest took
+/// [`RGFX_FEATURE_FUNCTION_POINTERS`](crate::wire::RGFX_FEATURE_FUNCTION_POINTERS).
+pub const RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLES: u16 = 0x201f;
 
 // A resource reference's kind, for the records of `useResources:` and
 // `memoryBarrierWithResources:`: the host resolves `obj_id` through the resolver
@@ -587,6 +596,41 @@ pub struct RgfxComputeOpEncodeStartWhile {
 }
 
 // The compute ops' layout.
+/// `setVisibleFunctionTable:atBufferIndex:`. The table may be nil (`0`), which unbinds the index.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpSetVisibleFunctionTable {
+    /// The table (`FUNCTION_TABLE_CREATE`), or 0 for nil.
+    pub table_obj_id: u64,
+    /// The buffer binding index.
+    pub index: u64,
+}
+
+/// `setVisibleFunctionTables:withBufferRange:` head. `length`
+/// [`RgfxComputeVisibleFunctionTableBinding`] records follow.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpSetVisibleFunctionTables {
+    /// The first buffer binding index (the range's `location`).
+    pub location: u64,
+    /// How many bindings follow (the range's `length`).
+    pub length: u64,
+}
+
+/// One `setVisibleFunctionTables:withBufferRange:` binding.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeVisibleFunctionTableBinding {
+    /// The table, or 0 for nil.
+    pub table_obj_id: u64,
+}
+
 const _: () = {
     use core::mem::size_of;
     assert!(size_of::<RgfxComputeOpSetComputePipelineState>() == 8);
@@ -623,12 +667,15 @@ const _: () = {
     assert!(size_of::<RgfxComputeOpExecuteCommandsInBuffer>() == 24);
     assert!(size_of::<RgfxComputeOpEncodeStartIf>() == 32);
     assert!(size_of::<RgfxComputeOpEncodeStartWhile>() == 32);
+    assert!(size_of::<RgfxComputeOpSetVisibleFunctionTable>() == 16);
+    assert!(size_of::<RgfxComputeOpSetVisibleFunctionTables>() == 16);
+    assert!(size_of::<RgfxComputeVisibleFunctionTableBinding>() == 8);
     // The compute tags stay in the compute group.
     assert!(
         super::op_group(RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE) == super::RGFX_OP_GROUP_COMPUTE
     );
     assert!(
-        super::op_group(RGFX_OP_COMPUTE_COMPRESSED_TEXTURE_REINTERPRETATION_FLUSH)
+        super::op_group(RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLES)
             == super::RGFX_OP_GROUP_COMPUTE
     );
 };

@@ -27,6 +27,7 @@ static_assert(RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA == (1ull << 36),
               "TEXTURE_DID_MODIFY_DATA is bit 36");
 static_assert(RGFX_FEATURE_DISPLAY_POWER == (1ull << 37), "DISPLAY_POWER is bit 37");
 static_assert(RGFX_FEATURE_RATE_MAPS == (1ull << 38), "RATE_MAPS is bit 38");
+static_assert(RGFX_FEATURE_FUNCTION_POINTERS == (1ull << 39), "FUNCTION_POINTERS is bit 39");
 static_assert(sizeof(RgfxDisplayScale) == 8, "the display's scale record");
 static_assert(RGFX_STATUS_CACHE == 7, "STATUS_CACHE");
 static_assert(RGFX_SURFACE_PAGES_LAYOUT_OFFSET ==
@@ -113,12 +114,14 @@ constexpr uint64_t kDisplayScale = RGFX_FEATURE_DISPLAY_SCALE;
 constexpr uint64_t kDidModify = RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA;
 // Its bundle makes, resets and asks rasterization rate maps.
 constexpr uint64_t kRateMaps = RGFX_FEATURE_RATE_MAPS;
+// Its bundle makes a compute pipeline's function handles and visible function tables.
+constexpr uint64_t kFunctionPointers = RGFX_FEATURE_FUNCTION_POINTERS;
 constexpr uint64_t kCarried = kPages | kOrder | kIcb | kUnshared | kManaged | kHeaps | kRoom |
                               kSlots | kCommits | kDeferred | kTime | kTextureSlabs |
                               kBufferSlabs | kSmallIds | kColor | kMesh | kShares | kOpenCL |
                               kPrivate | kCacheRefused | kDeferredAsk | kDeferredCarry |
                               kScheduledAsk | kDisplayScale | kDidModify | kRateMaps |
-                              kDisplayPowerCarried | k16KCarried;
+                              kFunctionPointers | kDisplayPowerCarried | k16KCarried;
 // Every bit the wire names from bit 3.
 constexpr uint64_t kNew = kNotCarried | kCarried;
 } // namespace
@@ -131,16 +134,16 @@ int main()
 	// MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS, DISPLAY_COLOR, MESH_PIPELINES,
 	// SHARED_EVENT_NAMES, OPENCL_MODE, PRIVATE_RENDER_STATE, SURFACE_CACHE_REFUSED,
 	// SURFACE_DEFERRED_ASK, SURFACE_DEFERRED_CARRY, SCHEDULED_ASK, DISPLAY_SCALE,
-	// TEXTURE_DID_MODIFY_DATA, RATE_MAPS and, the x86-64 kext, DISPLAY_POWER, and writes each only
-	// where offered.
+	// TEXTURE_DID_MODIFY_DATA, RATE_MAPS, FUNCTION_POINTERS and, the x86-64 kext, DISPLAY_POWER,
+	// and writes each only where offered.
 	check(kRgfxCarriedFeatures == kCarried,
 	      "the kext takes PAGES_BUFFERS, SURFACE_ORDER, ICBs, UNSHARED_QUEUES, MANAGED_AT_OFFSET, "
 	      "HEAP_OVER_PAGES, SUBMIT_ROOM, ICB slots, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, "
 	      "MANAGED_TEXTURE_SLABS, MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS, DISPLAY_COLOR, "
 	      "MESH_PIPELINES, SHARED_EVENT_NAMES, OPENCL_MODE, PRIVATE_RENDER_STATE, "
 	      "SURFACE_CACHE_REFUSED, SURFACE_DEFERRED_ASK, SURFACE_DEFERRED_CARRY, SCHEDULED_ASK, "
-	      "DISPLAY_SCALE, TEXTURE_DID_MODIFY_DATA, RATE_MAPS and, on x86-64, DISPLAY_POWER from "
-	      "bit 3");
+	      "DISPLAY_SCALE, TEXTURE_DID_MODIFY_DATA, RATE_MAPS, FUNCTION_POINTERS and, on x86-64, "
+	      "DISPLAY_POWER from bit 3");
 	check(RGFX_FEATURE_PAGES_BUFFERS == (1u << 7), "PAGES_BUFFERS is bit 7");
 	check(RGFX_FEATURE_SURFACE_ORDER == (1u << 11), "SURFACE_ORDER is bit 11");
 	check(RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS == (1u << 12), "INDIRECT_COMMAND_BUFFERS is bit 12");
@@ -261,6 +264,14 @@ int main()
 	check(rgfxFeatureWord(kRgfxOfferedFeatures | kRateMaps, kRateMaps) ==
 	          (kRgfxOfferedFeatures | kRateMaps),
 	      "RATE_MAPS taken is in the word");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kFunctionPointers) ==
+	          kFunctionPointers,
+	      "FUNCTION_POINTERS offered, written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kFunctionPointers, 0) == kRgfxOfferedFeatures,
+	      "FUNCTION_POINTERS offered but not taken is not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kFunctionPointers, kFunctionPointers) ==
+	          (kRgfxOfferedFeatures | kFunctionPointers),
+	      "FUNCTION_POINTERS taken is in the word");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kDisplayPower) ==
 	          kDisplayPowerCarried,
 	      "DISPLAY_POWER offered, written by the x86-64 kext alone");

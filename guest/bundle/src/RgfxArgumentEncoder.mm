@@ -457,8 +457,8 @@ NSArray<MTLArgumentDescriptor *> *RgfxDescriptorsOfArguments(MTLStructType *type
 		[self setIndirectCommandBuffer:buffers[i] atIndex:range.location + i];
 }
 
-// The device makes no acceleration structure or function table: only nil reaches these, which
-// writes 0.
+// The device makes no acceleration structure or intersection function table: only nil reaches
+// these, which writes 0.
 - (void)setAccelerationStructure:(id<MTLAccelerationStructure>)accelerationStructure
                          atIndex:(NSUInteger)index
 {
@@ -484,12 +484,15 @@ NSArray<MTLArgumentDescriptor *> *RgfxDescriptorsOfArguments(MTLStructType *type
 		                           atIndex:range.location + i];
 }
 
+// The table's gpuResourceID, the id the host's device numbered it by, as a pipeline's; 0 for nil
+// (the AMD Radeon Pro 5300M writes its table's resource id, 8 bytes: macOS 26.7.1, oracle_fnptr).
+// A kernel reads the table through it with no useResource:, as on the 5300M's with one.
 - (void)setVisibleFunctionTable:(id<MTLVisibleFunctionTable>)visibleFunctionTable
                         atIndex:(NSUInteger)index
 {
-	if (visibleFunctionTable != nil)
-		RGFX_UNSUPPORTED("function pointers");
-	[self rgfxWord:0 atIndex:index cmd:_cmd];
+	[self rgfxWord:visibleFunctionTable != nil ? resourceId(visibleFunctionTable.gpuResourceID) : 0
+	       atIndex:index
+	           cmd:_cmd];
 }
 
 - (void)setVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __nullable[__nonnull])visibleFunctionTables

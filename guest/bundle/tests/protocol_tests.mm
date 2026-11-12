@@ -28,6 +28,7 @@
 #import "RgfxEvent.h"
 #import "RgfxFence.h"
 #import "RgfxFunction.h"
+#import "RgfxFunctionTable.h"
 #import "RgfxHeap.h"
 #import "RgfxIndirectCommandBuffer.h"
 #import "RgfxInterop.h"
@@ -461,6 +462,56 @@ void test_compute_dispatch_type()
 	CHECK(p1.dispatch_type == MTLDispatchTypeConcurrent);
 	auto p2 = findOp(ops, RGFX_OP_ENCODER_BEGIN_COMPUTE, 2)->as<RgfxComputePassDesc>();
 	CHECK(p2.dispatch_type == MTLDispatchTypeConcurrent);
+	fx.complete(cb, seqno);
+	} // @autoreleasepool
+}
+
+// A compute encoder binds a visible function table by its id at a buffer index (nil as 0), and a
+// range of them by theirs, nil among them; an empty range binds nothing.
+void test_compute_function_table_bindings()
+{
+	QueueFixture fx;
+	// Drained while fx lives: what the test lets go (a command buffer, the queue it holds)
+	// posts its destroy through fx.
+	@autoreleasepool {
+	RgfxVisibleFunctionTable *t = [[RgfxVisibleFunctionTable alloc] initWithObjId:0x77
+	                                                                         device:nil
+	                                                                     serializer:nullptr];
+	RgfxVisibleFunctionTable *u = [[RgfxVisibleFunctionTable alloc] initWithObjId:0x78
+	                                                                         device:nil
+	                                                                     serializer:nullptr];
+	id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
+	id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+	[e setVisibleFunctionTable:t atBufferIndex:3];
+	id<MTLVisibleFunctionTable> tables[3] = {u, nil, t};
+	[e setVisibleFunctionTables:tables withBufferRange:NSMakeRange(4, 3)];
+	[e setVisibleFunctionTables:tables withBufferRange:NSMakeRange(9, 0)];
+	[e setVisibleFunctionTable:nil atBufferIndex:3];
+	[e endEncoding];
+	[cb commit];
+	uint64_t seqno = 0;
+	std::vector<Op> ops = fx.nextOps(&seqno);
+	std::vector<RgfxComputeOpSetVisibleFunctionTable> ones;
+	std::vector<const Op *> ranges;
+	for (const Op &op : ops) {
+		if (op.tag == RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLE)
+			ones.push_back(op.as<RgfxComputeOpSetVisibleFunctionTable>());
+		else if (op.tag == RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLES)
+			ranges.push_back(&op);
+	}
+	CHECK(ones.size() == 2 && ranges.size() == 1);
+	if (ones.size() == 2 && ranges.size() == 1) {
+		CHECK(ones[0].table_obj_id == 0x77 && ones[0].index == 3);
+		CHECK(ones[1].table_obj_id == 0 && ones[1].index == 3);
+		auto head = ranges[0]->as<RgfxComputeOpSetVisibleFunctionTables>();
+		CHECK(head.location == 4 && head.length == 3);
+		auto tableAt = [&](size_t i) {
+			return ranges[0]
+			    ->elem<RgfxComputeOpSetVisibleFunctionTables, RgfxComputeVisibleFunctionTableBinding>(i)
+			    .table_obj_id;
+		};
+		CHECK(tableAt(0) == 0x78 && tableAt(1) == 0 && tableAt(2) == 0x77);
+	}
 	fx.complete(cb, seqno);
 	} // @autoreleasepool
 }
@@ -1552,7 +1603,14 @@ void test_pipeline_state_members()
 	CHECK([cs imageblockMemoryLengthForDimensions:MTLSizeMake(8, 8, 1)] == 0);
 	CHECK(RgfxUnsupportedWasLogged([RgfxComputePipelineState class], @selector(allocatedSize)));
 	CHECK([cs functionHandleWithFunction:kfn] == nil);
-	CHECK([cs functionHandleWithName:@"kmain"] == nil);
+	// The AMD 5300M's pipeline raises an unrecognized selector at a handle by name.
+	bool raisedByName = false;
+	@try {
+		(void)[cs functionHandleWithName:@"kmain"];
+	} @catch (NSException *e) {
+		raisedByName = [e.name isEqualToString:NSInvalidArgumentException];
+	}
+	CHECK(raisedByName);
 	CHECK([cs newVisibleFunctionTableWithDescriptor:[MTLVisibleFunctionTableDescriptor
 	                                                    visibleFunctionTableDescriptor]] == nil);
 	CHECK([cs newIntersectionFunctionTableWithDescriptor:
@@ -2036,7 +2094,35 @@ void test_argument_encoder_members()
 	[enc setIndirectCommandBuffer:nil atIndex:0];
 	CHECK(wordAt(args, 0) == 0);
 	CHECK(!RgfxUnsupportedWasLogged(c, @selector(setIndirectCommandBuffer:atIndex:)));
-	// What the device makes no object of: nil writes 0, unlogged.
+	// A visible function table writes its gpuResourceID, the host's id, as a pipeline; nil 0.
+	{
+		RgfxFunctionPointerState state = {};
+		state.header = {RGFX_EVT_FUNCTION_POINTER_STATE, sizeof(state), 1};
+		state.status = RGFX_STATUS_OK;
+		state.gpu_resource_id = 0x3d;
+		static RgfxFunctionPointerState answer;
+		answer = state;
+		ser.setAsker(
+		    [](void *, const void *, uint32_t, void *reply, uint32_t, uint32_t *size) {
+			    std::memcpy(reply, &answer, sizeof(answer));
+			    *size = sizeof(answer);
+			    return true;
+		    },
+		    nullptr);
+		ser.setCarriesFunctionPointers(true);
+		RgfxVisibleFunctionTable *table = [RgfxVisibleFunctionTable tableOfPipeline:0x21
+		                                                                      count:2
+		                                                                     device:nil
+		                                                                 serializer:&ser];
+		ser.setCarriesFunctionPointers(false);
+		ser.setAsker(nullptr, nullptr);
+		CHECK(table != nil);
+		std::memset(args.contents, 0x5c, 8);
+		[enc setVisibleFunctionTable:table atIndex:0];
+		CHECK(wordAt(args, 0) == 0x3d);
+		CHECK(!RgfxUnsupportedWasLogged(c, @selector(setVisibleFunctionTable:atIndex:)));
+	}
+	// What the device makes no object of, and a nil table: nil writes 0, unlogged.
 	std::memset(args.contents, 0x5c, 8);
 	[enc setAccelerationStructure:nil atIndex:0];
 	[enc setVisibleFunctionTable:nil atIndex:0];
@@ -2551,6 +2637,7 @@ void rgfxProtocolTests()
 	test_inline_bytes_without_region();
 	test_render_barriers();
 	test_compute_dispatch_type();
+	test_compute_function_table_bindings();
 	test_blit_copy_texture_to_texture();
 	test_render_tile_size();
 	test_trace_ids();

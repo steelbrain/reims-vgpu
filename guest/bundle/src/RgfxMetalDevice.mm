@@ -883,6 +883,8 @@ RGFX_LOG_UNRECOGNIZED
 	_serializer->setCarriesTextureDidModifyData(
 	    (_caps.features() & RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA) != 0);
 	_serializer->setCarriesRateMaps((_caps.features() & RGFX_FEATURE_RATE_MAPS) != 0);
+	_serializer->setCarriesFunctionPointers((_caps.features() & RGFX_FEATURE_FUNCTION_POINTERS) !=
+	                                        0);
 	// Shared events cross processes through the kext's ports where the kext makes them and the
 	// host took the feature that names their events (RgfxUserClientABI.hpp,
 	// kRgfxSharedEventUserClientType).
@@ -1436,14 +1438,19 @@ RGFX_LOG_UNRECOGNIZED
 	return _caps.identityFlag(kRgfxIdentitySupportsRaytracing);
 }
 
+// The host's answer, where it makes a compute pipeline's handles and tables (its
+// FUNCTION_POINTERS feature taken).
 - (BOOL)supportsFunctionPointers
 {
-	return _caps.identityFlag(kRgfxIdentitySupportsFunctionPointers);
+	return (_caps.features() & RGFX_FEATURE_FUNCTION_POINTERS) != 0 &&
+	       _caps.identityFlag(kRgfxIdentitySupportsFunctionPointers);
 }
 
+// NO: the bundle carries no render stage's handles or tables (a render pipeline's are
+// RGFX_UNSUPPORTED), as the AMD Radeon Pro 5300M answers (measured: macOS 26.7.1, oracle_fnptr).
 - (BOOL)supportsFunctionPointersFromRender
 {
-	return _caps.identityFlag(kRgfxIdentitySupportsFunctionPointersFromRender);
+	return NO;
 }
 
 - (BOOL)supportsRaytracingFromRender

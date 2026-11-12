@@ -309,7 +309,7 @@ fn mutated(rng: &mut Rng, from: &[u8]) -> Vec<u8> {
 }
 
 /// The highest tag each op group decodes: framing, render, compute, blit, video.
-const LAST_TAG: [u16; 5] = [0x0009, 0x104f, 0x201d, 0x3019, 0x4000];
+const LAST_TAG: [u16; 5] = [0x0009, 0x104f, 0x201f, 0x3019, 0x4000];
 
 /// One op: its header (its `len` the op's, one in sixteen another) and `body`.
 fn op(rng: &mut Rng, tag: u16, body: &[u8]) -> Vec<u8> {

@@ -206,6 +206,12 @@ struct RgfxLinkedFunctionList {
 	std::deque<std::string> groups;
 };
 
+/// `function` as a pipeline's linked function names it, in list `list` (an RGFX_LINKED_*) and,
+/// for RGFX_LINKED_GROUP, group `group`: its library, name, constants, options and
+/// specializedName, each pointing into `function`, which outlives the reference.
+RgfxLinkedFunctionRef RgfxLinkedFunctionRefOf(RgfxFunction *function, uint32_t list,
+                                              const char *_Nullable group);
+
 /// Appends `linked`'s functions to `out` in the wire's order: its functions, its
 /// binary functions, each group's in the order of their names, then its private
 /// functions, each with the options it was made with. Answers the first that is not

@@ -32,6 +32,7 @@
 %spi-no-shared-textures the IOGPU base answers NO, the lane's answer: it makes no shared textures or handles (RGFX_UNSUPPORTED), where Metal's devices answer YES
 %gl-function Metal's own function of GL IR answers it, the same for every shader (measured: macOS 26.7.1, the Intel 630's device: the name __main, MTLPatchTypeNone, a control point count of 0, no vertex or stage input attributes, no function constants, no options)
 %gl-spi Metal's function of GL IR answers it, the same for both shaders asked (measured: macOS 26.7.1, the Intel 630's device, tools/gl_probe.m -s, the functions of a vertex and a fragment shader; each is a function of a library, _MTLFunctionInternal)
+%fnptr-spi the x86 Macs' answer is not measured: oracle_spi_members makes no function handle or visible function table, and no class of ours answers it
 %spi-neither an SPI member neither the AMD 5300M's nor the Intel 630's objects of the kind answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m), so a caller that sends it to an x86 Mac's object asks first
 %spi-differ an SPI member one of the AMD 5300M's and the Intel 630's objects of the kind answers and the other does not (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m), so a caller that sends it to an x86 Mac's object asks first
 %cb-base Metal's base command buffer, _MTLCommandBuffer, and its IOAccel subclass, MTLIOAccelCommandBuffer (read from code: macOS 27.0.1's Metal on the M3 Max; src/RgfxCommandObjects.mm, MTLCommandBufferSPI); that the AMD 5300M's and the Intel 630's buffers answer from these classes, not from their own, is to be measured with oracle_spi_members' answering class
@@ -69,7 +70,7 @@ setSamplerState:atIndex: implemented
 setSamplerStates:withRange: implemented
 setTexture:atIndex: implemented
 setTextures:withRange: implemented
-setVisibleFunctionTable:atIndex: partial function pointers
+setVisibleFunctionTable:atIndex: implemented
 setVisibleFunctionTables:withRange: implemented
 
 [RgfxBinaryArchive]
@@ -231,8 +232,8 @@ setStageInRegionWithIndirectBuffer:indirectBufferOffset: implemented
 setTexture:atIndex: implemented
 setTextures:withRange: implemented
 setThreadgroupMemoryLength:atIndex: implemented
-setVisibleFunctionTable:atBufferIndex: partial function pointers
-setVisibleFunctionTables:withBufferRange: partial function pointers
+setVisibleFunctionTable:atBufferIndex: implemented
+setVisibleFunctionTables:withBufferRange: implemented
 updateFence: implemented
 useHeap: implemented
 useHeaps:count: implemented
@@ -244,15 +245,15 @@ waitForFence: implemented
 allocatedSize unsupported a pipeline's allocated size (not in the host's reflection)
 forwardProgressUsage implemented
 functionHandleWithBinaryFunction: unsupported function pointers
-functionHandleWithFunction: unsupported function pointers
-functionHandleWithName: unsupported function pointers
+functionHandleWithFunction: partial function pointers, where the host makes none
+functionHandleWithName: metal raises an unrecognized selector, as the AMD 5300M's pipeline does, though it answers respondsToSelector: YES (measured: macOS 26.7.1, tools/oracle/oracle_fnptr.m)
 gpuResourceID implemented
 imageblockMemoryLengthForDimensions: unsupported imageblock memory queries (not in the host's reflection)
 maxTotalThreadsPerThreadgroup implemented
 newComputePipelineStateWithAdditionalBinaryFunctions:error: unsupported binary functions
 newComputePipelineStateWithBinaryFunctions:error: unsupported binary functions
 newIntersectionFunctionTableWithDescriptor: unsupported ray tracing
-newVisibleFunctionTableWithDescriptor: unsupported function pointers
+newVisibleFunctionTableWithDescriptor: partial function pointers, where the host makes none
 recommendedPersistentThreadgroupsPerGridForThreadsPerThreadgroup: unsupported persistent threadgroup queries (not in the host's reflection)
 reflection metal %pipeline-reflection
 requiredThreadsPerThreadgroup implemented
@@ -288,6 +289,11 @@ newIntersectionFunctionWithDescriptor:completionHandler: implemented
 newIntersectionFunctionWithDescriptor:error: unsupported ray tracing
 reflectionForFunctionWithName: metal a function array's library reflects no function: both x86 Macs answer nil (measured, tools/oracle/oracle_bundle.m libforms3)
 type metal a function array's library is executable: both x86 Macs answer MTLLibraryTypeExecutable (measured, tools/oracle/oracle_bundle.m libforms2)
+
+[RgfxFunctionHandle]
+functionType implemented
+gpuResourceID metal raises an unrecognized selector, as the AMD 5300M's handle does (measured: macOS 26.7.1, tools/oracle/oracle_fnptr.m): a handle reaches a shader through a table
+name implemented
 
 [RgfxGLFunction]
 device implemented
@@ -849,7 +855,7 @@ supportsFragmentBufferWrites implemented
 supportsFragmentOnlyEncoders base %base-spi
 supportsFunctionPointers implemented
 supportsFunctionPointersFromMesh base %base-spi
-supportsFunctionPointersFromRender implemented
+supportsFunctionPointersFromRender metal NO, as the AMD 5300M answers (measured: macOS 26.7.1, tools/oracle/oracle_fnptr.m): the bundle carries no render stage's handles or tables
 supportsGFXIndirectCommandBuffers implemented
 supportsGPUStatistics base %spi-no-counters
 supportsGlobalVariableBindingInDylibs base %spi-no-dylibs
@@ -1303,6 +1309,16 @@ textureType implemented
 usage implemented
 width implemented
 
+[RgfxVisibleFunctionTable]
+allocatedSize implemented
+cpuCacheMode implemented
+gpuResourceID implemented
+hazardTrackingMode implemented
+resourceOptions implemented
+setFunction:atIndex: implemented
+setFunctions:withRange: implemented
+storageMode implemented
+
 # --- the SPI counterparts' members (MTLFooSPI for each MTLFoo a class adopts) --------------------
 # Metal's own objects adopt them, and the guest's frameworks send their members without asking:
 # macOS 13's Maps sends MTLLibrarySPI's newFunctionWithName:constantValues:pipelineLibrary:error:
@@ -1559,6 +1575,9 @@ serializeToURL:error: implemented
 setOverrideTriple: implemented
 setShaderValidationEnabled: implemented
 shaderValidationEnabled implemented
+[RgfxFunctionHandle]
+resourceIndex pending %fnptr-spi
+
 [RgfxGLFunction]
 arguments metal nil (%gl-spi)
 bindings metal nil (%gl-spi)
@@ -1866,6 +1885,32 @@ unfilteredResourceOptions implemented
 uniqueIdentifier implemented
 waitUntilComplete implemented waits while isComplete answers NO, as the Intel 630's and the M3 Max's do (measured, %in-flight)
 writeAccessPattern absent %spi-neither
+
+[RgfxVisibleFunctionTable]
+allocationID implemented
+bufferAddressAtIndex: pending %fnptr-spi
+doesAliasAllResources:count: implemented
+doesAliasAnyResources:count: implemented
+doesAliasResource: implemented
+globalBuffer pending %fnptr-spi
+globalBufferOffset pending %fnptr-spi
+gpuAddress pending %fnptr-spi
+gpuHandle pending %fnptr-spi
+isComplete implemented %in-flight (the M3 Max answers the same, macOS 27)
+isPurgeable implemented
+isWriteComplete gap %in-flight (the M3 Max answers YES for a buffer that only reads it, macOS 27, which arm64 guests do not get: they see NO, as isComplete answers)
+resourceIndex pending %fnptr-spi
+setBuffer:offset:atIndex: pending %fnptr-spi
+setBuffers:offsets:withRange: pending %fnptr-spi
+setGlobalBuffer: pending %fnptr-spi
+setGlobalBufferOffset: pending %fnptr-spi
+setValue:atIndex: pending %fnptr-spi
+setValue:withRange: pending %fnptr-spi
+setVisibleFunctionTable:atBufferIndex: pending %fnptr-spi
+setVisibleFunctionTables:withBufferRange: pending %fnptr-spi
+unfilteredResourceOptions pending %fnptr-spi
+uniqueIdentifier pending %fnptr-spi
+waitUntilComplete implemented waits while isComplete answers NO, as the Intel 630's and the M3 Max's do (measured, %in-flight)
 
 # The members only older guest releases' protocols carry (tests/protocol_members_releases.txt).
 [RgfxArgumentEncoder]

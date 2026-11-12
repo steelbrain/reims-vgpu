@@ -8,10 +8,12 @@
 
 #import <objc/message.h>
 
+#include <mutex>
 #include <string>
 #include <vector>
 
 #import "RgfxFunction.h"
+#import "RgfxFunctionTable.h"
 #import "RgfxMetalError.h"
 #import "RgfxUnsupported.h"
 
@@ -103,6 +105,9 @@ NSError *foreignFunctionError(NSString *what, id<MTLFunction> fn)
 	BOOL _deferred;
 	RgfxPipelineAnswer _answer;
 	NSInteger _textureWriteRoundingMode; // the descriptor's (MTLComputePipelineDescriptorSPI)
+	// functionHandleWithFunction:'s answers, by function (NSNull for nil), under _handlesLock.
+	std::mutex _handlesLock;
+	NSMapTable *_handles;
 }
 
 // The host drops the pipeline as the app lets it go, after any command buffer that names it (each
@@ -550,19 +555,60 @@ NSError *foreignFunctionError(NSString *what, id<MTLFunction> fn)
 	return 0;
 }
 
-// --- unsupported: function pointers, binary functions and function tables ---------------
+// --- function pointers ---------------------------------------------------------------
+// Where the host makes them (RgfxSerializer::carriesFunctionPointers): the handle of a function
+// the kernel links and a table of the pipeline's, the host's (RgfxFunctionTable.h). Else nil,
+// logged, as before the host made any.
 
+// One handle object for a function each time it is asked, as the AMD Radeon Pro 5300M answers
+// (measured: macOS 26.7.1, oracle_fnptr); nil, also kept, for a function the kernel does not link.
 - (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function
 {
-	RGFX_UNSUPPORTED("function pointers");
+	if (_serializer == nullptr || !_serializer->carriesFunctionPointers()) {
+		RGFX_UNSUPPORTED("function pointers");
+		return nil;
+	}
+	if (function == nil)
+		return nil;
+	std::lock_guard<std::mutex> hold(_handlesLock);
+	if (_handles == nil)
+		_handles = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsStrongMemory |
+		                                              NSPointerFunctionsObjectPointerPersonality
+		                                 valueOptions:NSPointerFunctionsStrongMemory];
+	id known = [_handles objectForKey:function];
+	if (known != nil)
+		return known == [NSNull null] ? nil : known;
+	RgfxFunctionHandle *handle = [RgfxFunctionHandle handleOfFunction:function
+	                                                         pipeline:_objId
+	                                                           device:self.device
+	                                                       serializer:_serializer];
+	[_handles setObject:handle != nil ? (id)handle : [NSNull null] forKey:function];
+	return handle;
+}
+
+// The AMD Radeon Pro 5300M's pipeline raises an unrecognized selector here, answering
+// respondsToSelector: YES (measured: macOS 26.7.1, oracle_fnptr), and so does this.
+- (id<MTLFunctionHandle>)functionHandleWithName:(NSString *)name
+{
+	(void)name;
+	[self doesNotRecognizeSelector:_cmd];
 	return nil;
 }
 
-- (id<MTLFunctionHandle>)functionHandleWithName:(NSString *)name
+- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableWithDescriptor:
+    (MTLVisibleFunctionTableDescriptor *)descriptor
 {
-	RGFX_UNSUPPORTED("function pointers");
-	return nil;
+	if (_serializer == nullptr || !_serializer->carriesFunctionPointers()) {
+		RGFX_UNSUPPORTED("function pointers");
+		return nil;
+	}
+	return [RgfxVisibleFunctionTable tableOfPipeline:_objId
+	                                           count:descriptor.functionCount
+	                                          device:self.device
+	                                      serializer:_serializer];
 }
+
+// --- unsupported: binary functions --------------------------------------------------
 
 - (id<MTLFunctionHandle>)functionHandleWithBinaryFunction:(id<MTL4BinaryFunction>)function
 {
@@ -583,13 +629,6 @@ NSError *foreignFunctionError(NSString *what, id<MTLFunction> fn)
                                          error:(NSError **)error
 {
 	RGFX_UNSUPPORTED_ERROR(error, "binary functions");
-	return nil;
-}
-
-- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableWithDescriptor:
-    (MTLVisibleFunctionTableDescriptor *)descriptor
-{
-	RGFX_UNSUPPORTED("function pointers");
 	return nil;
 }
 

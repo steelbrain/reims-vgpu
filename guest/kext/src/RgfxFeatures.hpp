@@ -105,7 +105,12 @@
 //  - RATE_MAPS (bit 38): the bundle makes, resets and asks rasterization rate maps
 //    (RGFX_CMD_RATE_MAP_CREATE, _RESET and _QUERY), whose messages the kext admits as any create
 //    or query of the client's own objects (RgfxSubmitGate.hpp), waiting for their RATE_MAP_STATE
-//    or RATE_MAP_ANSWER, and names a map in a render pass's begin.
+//    or RATE_MAP_ANSWER, and names a map in a render pass's begin;
+//  - FUNCTION_POINTERS (bit 39): the bundle makes a compute pipeline's function handles and
+//    visible function tables (RGFX_CMD_FUNCTION_HANDLE_CREATE and _TABLE_CREATE), waiting for
+//    their FUNCTION_POINTER_STATE, and sets a table's entries (RGFX_CMD_FUNCTION_TABLE_SET,
+//    unanswered), which the kext admits as any create or write of the client's own objects
+//    (RgfxSubmitGate.hpp), and binds tables in a compute pass's ops.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -143,6 +148,7 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_SURFACE_DEFERRED_ASK | RGFX_FEATURE_SURFACE_DEFERRED_CARRY |
     RGFX_FEATURE_SCHEDULED_ASK | RGFX_FEATURE_DISPLAY_SCALE |
     RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA | RGFX_FEATURE_RATE_MAPS |
+    RGFX_FEATURE_FUNCTION_POINTERS |
     (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K : RGFX_FEATURE_DISPLAY_POWER);
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.

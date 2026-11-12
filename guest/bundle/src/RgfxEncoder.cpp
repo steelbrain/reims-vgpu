@@ -1438,6 +1438,24 @@ void RgfxEncoder::computeSetSamplerStates(uint64_t location,
 	              sizeof(RgfxComputeSamplerBinding));
 }
 
+void RgfxEncoder::computeSetVisibleFunctionTable(RgfxObjId table, uint64_t index)
+{
+	RgfxComputeOpSetVisibleFunctionTable b = {};
+	b.table_obj_id = table;
+	b.index = index;
+	appendOp(RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLE, &b, sizeof(b));
+}
+
+void RgfxEncoder::computeSetVisibleFunctionTables(
+    uint64_t location, const RgfxComputeVisibleFunctionTableBinding *tables, uint32_t count)
+{
+	RgfxComputeOpSetVisibleFunctionTables h = {};
+	h.location = location;
+	h.length = count;
+	appendArrayOp(RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLES, &h, sizeof(h), tables, count,
+	              sizeof(RgfxComputeVisibleFunctionTableBinding));
+}
+
 void RgfxEncoder::computeSetSamplerStatesLodClamps(
     uint64_t location, const RgfxComputeSamplerLodBinding *samplers, uint32_t count)
 {

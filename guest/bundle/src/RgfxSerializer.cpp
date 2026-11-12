@@ -1085,33 +1085,38 @@ namespace {
 /// one's name, constants, group name and specialized name, then their
 /// RgfxLinkedFunction records, whose offset it answers.
 template <typename Append>
+RgfxLinkedFunction linkedFunctionRecord(Append &append, const RgfxLinkedFunctionRef &r)
+{
+	RgfxLinkedFunction m = {};
+	m.library_obj_id = r.function.library;
+	const uint32_t len =
+	    r.function.entry_point ? static_cast<uint32_t>(std::strlen(r.function.entry_point)) : 0;
+	m.name_offset = append(r.function.entry_point, len);
+	m.name_len = len;
+	m.constants_offset =
+	    append(r.function.constants, r.function.constant_count * sizeof(RgfxFunctionConstant));
+	m.constant_count = r.function.constant_count;
+	m.list = r.list;
+	m.options = r.options;
+	if (r.list == RGFX_LINKED_GROUP && r.group != nullptr) {
+		const uint32_t glen = static_cast<uint32_t>(std::strlen(r.group));
+		m.group_offset = append(r.group, glen);
+		m.group_len = glen;
+	}
+	if (r.specialized_name != nullptr) {
+		const uint32_t slen = static_cast<uint32_t>(std::strlen(r.specialized_name));
+		m.specialized_name_offset = append(r.specialized_name, slen);
+		m.specialized_name_len = slen;
+	}
+	return m;
+}
+
+template <typename Append>
 uint32_t appendLinkedFunctions(Append &append, const RgfxLinkedFunctionRef *refs, uint32_t count)
 {
 	std::vector<RgfxLinkedFunction> records(count);
-	for (uint32_t i = 0; i < count; i++) {
-		const RgfxLinkedFunctionRef &r = refs[i];
-		RgfxLinkedFunction &m = records[i];
-		m.library_obj_id = r.function.library;
-		const uint32_t len =
-		    r.function.entry_point ? static_cast<uint32_t>(std::strlen(r.function.entry_point)) : 0;
-		m.name_offset = append(r.function.entry_point, len);
-		m.name_len = len;
-		m.constants_offset =
-		    append(r.function.constants, r.function.constant_count * sizeof(RgfxFunctionConstant));
-		m.constant_count = r.function.constant_count;
-		m.list = r.list;
-		m.options = r.options;
-		if (r.list == RGFX_LINKED_GROUP && r.group != nullptr) {
-			const uint32_t glen = static_cast<uint32_t>(std::strlen(r.group));
-			m.group_offset = append(r.group, glen);
-			m.group_len = glen;
-		}
-		if (r.specialized_name != nullptr) {
-			const uint32_t slen = static_cast<uint32_t>(std::strlen(r.specialized_name));
-			m.specialized_name_offset = append(r.specialized_name, slen);
-			m.specialized_name_len = slen;
-		}
-	}
+	for (uint32_t i = 0; i < count; i++)
+		records[i] = linkedFunctionRecord(append, refs[i]);
 	return append(records.data(), count * sizeof(RgfxLinkedFunction));
 }
 
@@ -1356,6 +1361,110 @@ RgfxCreated RgfxSerializer::createComputePipeline(const RgfxComputePipelineParam
 	postPipeline(m_control, RGFX_CMD_COMPUTE_PIPELINE_CREATE, buf.data(),
 	             static_cast<uint32_t>(total), out, post);
 	return out;
+}
+
+// Asks `ask` the `size` bytes at `message`, a FUNCTION_HANDLE_CREATE or FUNCTION_TABLE_CREATE
+// whose header is stamped, into `out` and `*state`: the answer's status, or kRgfxNoAnswer.
+static void askFunctionPointer(RgfxSerializer::AskFn ask, void *askContext, const uint8_t *message,
+                               uint32_t size, RgfxCreated &out, RgfxFunctionPointerState *state)
+{
+	RgfxFunctionPointerState answer = {};
+	uint32_t length = 0;
+	out.posted = ask(askContext, message, size, &answer, sizeof(answer), &length) &&
+	             length >= sizeof(answer) &&
+	             answer.header.type == RGFX_EVT_FUNCTION_POINTER_STATE;
+	out.status = out.posted ? answer.status : kRgfxNoAnswer;
+	out.seqno = out.posted ? answer.header.seqno : 0;
+	if (out.posted) {
+		*state = answer;
+		out.resource_id = answer.status == RGFX_STATUS_OK ? answer.gpu_resource_id : 0;
+	}
+}
+
+RgfxCreated RgfxSerializer::createFunctionHandle(RgfxObjId pipeline,
+                                                 const RgfxLinkedFunctionRef &function,
+                                                 RgfxFunctionPointerState *state)
+{
+	RgfxCreated out = {};
+	*state = {};
+	out.status = kRgfxNoAnswer;
+	if (!m_functionPointers || m_ask == nullptr)
+		return out;
+	out.obj_id = m_ids.allocObjId();
+	const uint32_t head = sizeof(RgfxFunctionHandleCreate);
+	std::vector<uint8_t> tail;
+	auto append = [&](const void *data, size_t n) -> uint32_t {
+		uint32_t off = static_cast<uint32_t>(head + tail.size());
+		if (n) {
+			const uint8_t *b = static_cast<const uint8_t *>(data);
+			tail.insert(tail.end(), b, b + n);
+		}
+		return off;
+	};
+	RgfxFunctionHandleCreate msg = {};
+	msg.obj_id = out.obj_id;
+	msg.pipeline_obj_id = pipeline;
+	msg.function = linkedFunctionRecord(append, function);
+	const uint64_t total = roundUp8(head + tail.size());
+	if (total > m_control.dataSize() / 2)
+		return out;
+	msg.header.type = RGFX_CMD_FUNCTION_HANDLE_CREATE;
+	msg.header.size = static_cast<uint32_t>(total);
+	std::vector<uint8_t> buf(static_cast<size_t>(total), 0);
+	std::memcpy(buf.data(), &msg, sizeof(msg));
+	if (!tail.empty())
+		std::memcpy(buf.data() + head, tail.data(), tail.size());
+	askFunctionPointer(m_ask, m_askContext, buf.data(), static_cast<uint32_t>(total), out, state);
+	return out;
+}
+
+RgfxCreated RgfxSerializer::createFunctionTable(RgfxObjId pipeline, uint64_t count,
+                                                RgfxFunctionPointerState *state)
+{
+	RgfxCreated out = {};
+	*state = {};
+	out.status = kRgfxNoAnswer;
+	if (!m_functionPointers || m_ask == nullptr)
+		return out;
+	out.obj_id = m_ids.allocObjId();
+	RgfxFunctionTableCreate msg = {};
+	msg.header.type = RGFX_CMD_FUNCTION_TABLE_CREATE;
+	msg.header.size = sizeof(msg);
+	msg.obj_id = out.obj_id;
+	msg.pipeline_obj_id = pipeline;
+	msg.function_count = count;
+	askFunctionPointer(m_ask, m_askContext, reinterpret_cast<const uint8_t *>(&msg), sizeof(msg),
+	                   out, state);
+	return out;
+}
+
+bool RgfxSerializer::setFunctionTable(RgfxObjId table, uint64_t first, const RgfxObjId *handles,
+                                      uint64_t count)
+{
+	if (!m_functionPointers)
+		return false;
+	const uint64_t head = sizeof(RgfxFunctionTableSet);
+	const uint64_t room = m_control.dataSize() / 2;
+	const uint64_t run = room > head ? (room - head) / sizeof(RgfxObjId) : 0;
+	if (run == 0)
+		return false;
+	uint64_t done = 0;
+	do {
+		const uint64_t n = std::min(count - done, run);
+		std::vector<uint8_t> buf(static_cast<size_t>(head + n * sizeof(RgfxObjId)), 0);
+		RgfxFunctionTableSet msg = {};
+		msg.obj_id = table;
+		msg.first = first + done;
+		msg.count = n;
+		std::memcpy(buf.data(), &msg, sizeof(msg));
+		if (n)
+			std::memcpy(buf.data() + head, handles + done, n * sizeof(RgfxObjId));
+		if (!m_control.tryPost(RGFX_CMD_FUNCTION_TABLE_SET, buf.data(),
+		                       static_cast<uint32_t>(buf.size()), nullptr))
+			return false;
+		done += n;
+	} while (done < count);
+	return true;
 }
 
 RgfxCreated RgfxSerializer::createEvent()

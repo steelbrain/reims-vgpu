@@ -325,6 +325,11 @@ public:
 	/// default.
 	void setCarriesRateMaps(bool carries) { m_rateMaps = carries; }
 	bool carriesRateMaps() const { return m_rateMaps; }
+	/// Whether the host makes a compute pipeline's function handles and visible function tables
+	/// (createFunctionHandle, createFunctionTable and setFunctionTable): it took
+	/// RGFX_FEATURE_FUNCTION_POINTERS. Set once, before the first pipeline; off by default.
+	void setCarriesFunctionPointers(bool carries) { m_functionPointers = carries; }
+	bool carriesFunctionPointers() const { return m_functionPointers; }
 	/// Names shared event `event` for other processes: its port, 0 where none was given.
 	uint32_t shareEvent(RgfxObjId event);
 	/// The process's new shared event made of the one `port` names: its id in `obj_id` and the
@@ -525,6 +530,31 @@ public:
 	uint32_t queryRateMap(RgfxObjId map, uint32_t query, uint64_t at, RgfxObjId buffer, float x,
 	                      float y, uint64_t values[3]);
 
+	/// The handle of `function` (FUNCTION_HANDLE_CREATE), one of the functions compute pipeline
+	/// `pipeline` links, asked of the device, whose answer (FUNCTION_POINTER_STATE) lands in
+	/// `*state`: `status` is its status (RGFX_STATUS_NOT_FOUND where the pipeline links no such
+	/// function, Metal's nil), `posted` false where no answer came back. No message goes where the
+	/// host makes no function pointers (carriesFunctionPointers), where no asker is set, or where
+	/// the message is past what the kext takes of a lifecycle message: `status` is then
+	/// kRgfxNoAnswer.
+	RgfxCreated createFunctionHandle(RgfxObjId pipeline, const RgfxLinkedFunctionRef &function,
+	                                 RgfxFunctionPointerState *state);
+
+	/// A visible function table of `count` entries of compute pipeline `pipeline`
+	/// (FUNCTION_TABLE_CREATE), asked as createFunctionHandle: the state holds the table's
+	/// gpuResourceID, allocatedSize and resourceOptions.
+	RgfxCreated createFunctionTable(RgfxObjId pipeline, uint64_t count,
+	                                RgfxFunctionPointerState *state);
+
+	/// Sets `count` of table `table`'s entries from `first` to the handles `handles` names (0 a
+	/// nil entry) through FUNCTION_TABLE_SET messages, which the device does not answer and
+	/// carries out before any command buffer the process posts after them: as many as the kext's
+	/// lifecycle messages take, each of a run of the entries. False where one did not go (the
+	/// entries of the runs after it are not set either), or where the host makes no function
+	/// pointers.
+	bool setFunctionTable(RgfxObjId table, uint64_t first, const RgfxObjId *handles,
+	                      uint64_t count);
+
 	/// A depth/stencil state.
 	RgfxCreated createDepthStencil(uint32_t depth_compare, bool depth_write_enabled,
 	                               const RgfxStencilDescriptor &front,
@@ -685,6 +715,7 @@ private:
 	bool m_privateRenderState = false;
 	bool m_textureDidModifyData = false;
 	bool m_rateMaps = false;
+	bool m_functionPointers = false;
 	void *m_eventContext = nullptr;
 
 	// heapTextureSizeAndAlign's answers, by the shape's bytes, under m_sizesLock.

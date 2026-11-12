@@ -508,6 +508,17 @@
 // `insertCompressedTextureReinterpretationFlush` (SPI). No body.
 #define RGFX_OP_COMPUTE_COMPRESSED_TEXTURE_REINTERPRETATION_FLUSH 8221
 
+// Op `SET_VISIBLE_FUNCTION_TABLE` ([`RgfxComputeOpSetVisibleFunctionTable`]):
+// `setVisibleFunctionTable:atBufferIndex:`, where the guest took
+// [`RGFX_FEATURE_FUNCTION_POINTERS`](crate::wire::RGFX_FEATURE_FUNCTION_POINTERS).
+#define RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLE 8222
+
+// Op `SET_VISIBLE_FUNCTION_TABLES` ([`RgfxComputeOpSetVisibleFunctionTables`] then
+// [`RgfxComputeVisibleFunctionTableBinding`] records): `setVisibleFunctionTables:withBufferRange:`,
+// where the guest took
+// [`RGFX_FEATURE_FUNCTION_POINTERS`](crate::wire::RGFX_FEATURE_FUNCTION_POINTERS).
+#define RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLES 8223
+
 // Op `SET_RENDER_PIPELINE_STATE` ([`RgfxOpSetRenderPipelineState`]):
 // `setRenderPipelineState:`.
 #define RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE 4096
@@ -1051,8 +1062,8 @@
 // `FEATURES_HI`, RO: feature bits 32 to 63, the ones the host offers, which the guest takes
 // through [`RGFX_REG_DRIVER_FEATURES_HI`]: [`RGFX_FEATURE_SURFACE_DEFERRED_CARRY`],
 // [`RGFX_FEATURE_SCHEDULED_ASK`], [`RGFX_FEATURE_PAGES_16K`], [`RGFX_FEATURE_DISPLAY_SCALE`],
-// [`RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA`], [`RGFX_FEATURE_DISPLAY_POWER`] and
-// [`RGFX_FEATURE_RATE_MAPS`].
+// [`RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA`], [`RGFX_FEATURE_DISPLAY_POWER`],
+// [`RGFX_FEATURE_RATE_MAPS`] and [`RGFX_FEATURE_FUNCTION_POINTERS`].
 // On a host that offers `PAGES_16K`, `FEATURES_LO` and `_HI` read the guest RAM features only
 // once the guest took it.
 #define RGFX_REG_FEATURES_HI 12
@@ -1348,6 +1359,17 @@
 // layer counts the device makes maps of are the device info's
 // (`largest_rasterization_rate_map_layer_count`).
 #define RGFX_FEATURE_RATE_MAPS 274877906944
+
+// `FEATURES_HI` bit 7, feature bit 39, `FUNCTION_POINTERS`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_HI`]: ring 0 carries [`RGFX_CMD_FUNCTION_HANDLE_CREATE`],
+// [`RGFX_CMD_FUNCTION_TABLE_CREATE`] and [`RGFX_CMD_FUNCTION_TABLE_SET`], a compute pipeline
+// state's function handles and visible function tables, and a compute encoder binds a table
+// ([`RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLE`](crate::ops::compute::RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLE)
+// and
+// [`RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLES`](crate::ops::compute::RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLES)).
+// Every host offers it; whether the device's kernels call through tables is the device info's
+// (`supports_function_pointers`).
+#define RGFX_FEATURE_FUNCTION_POINTERS 549755813888
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -1869,6 +1891,32 @@
 // (`RGFX_RATE_MAP_QUERY_*`), answered by [`RGFX_EVT_RATE_MAP_ANSWER`]. Makes nothing.
 #define RGFX_CMD_RATE_MAP_QUERY 565
 
+// Command `FUNCTION_HANDLE_CREATE` ([`RgfxFunctionHandleCreate`]), where the guest took
+// [`RGFX_FEATURE_FUNCTION_POINTERS`]: compute pipeline state `pipeline_obj_id`'s handle of the
+// function the message names (`functionHandleWithFunction:`), made under `obj_id`, answered by
+// [`RGFX_EVT_FUNCTION_POINTER_STATE`]: [`RGFX_STATUS_NOT_FOUND`] where Metal answers nil (a
+// function the state's kernel does not link), and nothing is made. A pipeline still being
+// compiled is waited for. A host without the feature refuses the message as one it does not
+// know.
+#define RGFX_CMD_FUNCTION_HANDLE_CREATE 566
+
+// Command `FUNCTION_TABLE_CREATE` ([`RgfxFunctionTableCreate`]), where the guest took
+// [`RGFX_FEATURE_FUNCTION_POINTERS`]: a visible function table of `function_count` null entries
+// of compute pipeline state `pipeline_obj_id` (`newVisibleFunctionTableWithDescriptor:`), made
+// under `obj_id`, answered by [`RGFX_EVT_FUNCTION_POINTER_STATE`] with the table's
+// `gpuResourceID`, which the guest's argument buffers hold, its `allocatedSize` and its
+// `resourceOptions`. A pipeline still being compiled is waited for. `OBJECT_DESTROY` drops it.
+#define RGFX_CMD_FUNCTION_TABLE_CREATE 567
+
+// Command `FUNCTION_TABLE_SET` ([`RgfxFunctionTableSet`], then `count` handle ids), where the
+// guest took [`RGFX_FEATURE_FUNCTION_POINTERS`]: entries `first` to `first + count - 1` of table
+// `obj_id` call the handles the message names, in order, 0 for a null entry
+// (`setFunction:atIndex:`, `setFunctions:withRange:`). Ring 0 is carried out before any command
+// buffer the process posts after it, so a dispatch sees every entry set before its commit, as
+// Metal's does. Not answered: a set the host cannot carry out (a table or handle it does not
+// hold, a range past the table, a handle the platform refuses) sets none of its entries.
+#define RGFX_CMD_FUNCTION_TABLE_SET 568
+
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
 // and drops every object whose id lies in its range ([`RGFX_CONTEXT_OBJ_ID_SHIFT`]), then answers
@@ -2079,6 +2127,10 @@
 // Event `RATE_MAP_ANSWER` ([`RgfxRateMapAnswer`], on the control completion ring): a
 // `RATE_MAP_QUERY`'s answer.
 #define RGFX_EVT_RATE_MAP_ANSWER 1035
+
+// Event `FUNCTION_POINTER_STATE` ([`RgfxFunctionPointerState`], on the control completion
+// ring): a `FUNCTION_HANDLE_CREATE`'s or `FUNCTION_TABLE_CREATE`'s answer.
+#define RGFX_EVT_FUNCTION_POINTER_STATE 1036
 
 // A command buffer's status in [`RgfxCbComplete`]: finished with no error.
 #define RGFX_CB_OK 0
@@ -3800,6 +3852,23 @@ typedef struct {
   uint64_t index;
 } RgfxComputeOpSetThreadgroupMemoryLength;
 
+// `setVisibleFunctionTable:atBufferIndex:`. The table may be nil (`0`), which unbinds the index.
+typedef struct {
+  // The table (`FUNCTION_TABLE_CREATE`), or 0 for nil.
+  uint64_t table_obj_id;
+  // The buffer binding index.
+  uint64_t index;
+} RgfxComputeOpSetVisibleFunctionTable;
+
+// `setVisibleFunctionTables:withBufferRange:` head. `length`
+// [`RgfxComputeVisibleFunctionTableBinding`] records follow.
+typedef struct {
+  // The first buffer binding index (the range's `location`).
+  uint64_t location;
+  // How many bindings follow (the range's `length`).
+  uint64_t length;
+} RgfxComputeOpSetVisibleFunctionTables;
+
 // `updateFence:`. The fence must name an object (nil faults the stream).
 typedef struct {
   // The fence (must not be nil).
@@ -3922,6 +3991,12 @@ typedef struct {
   // The texture, or 0 for nil.
   uint64_t texture_obj_id;
 } RgfxComputeTextureBinding;
+
+// One `setVisibleFunctionTables:withBufferRange:` binding.
+typedef struct {
+  // The table, or 0 for nil.
+  uint64_t table_obj_id;
+} RgfxComputeVisibleFunctionTableBinding;
 
 // `CONTEXT_CLOSE`: context `context`'s process is gone.
 typedef struct {
@@ -4184,6 +4259,104 @@ typedef struct {
   // first; the rest are zero.
   uint8_t value[RGFX_FUNCTION_CONSTANT_VALUE_BYTES];
 } RgfxFunctionConstant;
+
+// One function a pipeline stage links (`MTLLinkedFunctions`), named as a stage's
+// function is: a library `obj_id`, an entry-point name in the message tail and a run
+// of [`RgfxFunctionConstant`] in the tail, with the `MTLFunctionOptions` the guest
+// made it with and, where it gave one, the descriptor's `specializedName`, the name
+// the function answers and a pipeline's visible-function references resolve against.
+// A stage's linked functions are a run of these in the tail, each list's in its
+// order; a group's functions carry the group's name.
+typedef struct {
+  // The library the function comes from.
+  uint64_t library_obj_id;
+  // The entry-point name's byte offset from the message start.
+  uint32_t name_offset;
+  // The entry-point name's length in bytes.
+  uint32_t name_len;
+  // The function constants' byte offset from the message start.
+  uint32_t constants_offset;
+  // The number of [`RgfxFunctionConstant`] for the function; 0 for a function made
+  // with none.
+  uint32_t constant_count;
+  // The list the function is in: an `RGFX_LINKED_*`.
+  uint32_t list;
+  // The `MTLFunctionOptions` the function was made with
+  // (`newFunctionWithDescriptor:`); 0 for the other forms.
+  uint32_t options;
+  // For [`RGFX_LINKED_GROUP`], the group name's byte offset from the message
+  // start; 0 otherwise.
+  uint32_t group_offset;
+  // For [`RGFX_LINKED_GROUP`], the group name's length in bytes; 0 otherwise.
+  uint32_t group_len;
+  // The `specializedName`'s byte offset from the message start; 0 for none.
+  uint32_t specialized_name_offset;
+  // The `specializedName`'s length in bytes; 0 for none.
+  uint32_t specialized_name_len;
+} RgfxLinkedFunction;
+
+// `FUNCTION_HANDLE_CREATE`: compute pipeline state `pipeline_obj_id`'s handle of `function`, a
+// function named as a linked function is (its library, its entry point's name, its constants,
+// options and `specializedName`, offsets from the message start; its `list` is
+// [`RGFX_LINKED_FUNCTIONS`]), made under `obj_id`.
+typedef struct {
+  // [`RGFX_CMD_FUNCTION_HANDLE_CREATE`].
+  RgfxMsgHeader header;
+  // The handle's id.
+  uint64_t obj_id;
+  // The compute pipeline state: one of the sender's.
+  uint64_t pipeline_obj_id;
+  // The function.
+  RgfxLinkedFunction function;
+} RgfxFunctionHandleCreate;
+
+// `FUNCTION_POINTER_STATE`: a `FUNCTION_HANDLE_CREATE`'s or `FUNCTION_TABLE_CREATE`'s answer.
+// `status` is [`RGFX_STATUS_OK`] where the object was made: for a table, with its
+// `gpu_resource_id`, `allocated_size` and `resource_options`, and 0 in each for a handle.
+// [`RGFX_STATUS_NOT_FOUND`] for a handle Metal answers nil (a function the state's kernel does
+// not link) and for a pipeline state or library the sender does not hold,
+// [`RGFX_STATUS_INVALID_ARGUMENT`] for a message too short, and [`RGFX_STATUS_REFUSED`] where
+// the platform made none, each with the values 0 and nothing made.
+typedef struct {
+  // [`RGFX_EVT_FUNCTION_POINTER_STATE`], with the create's `seqno`.
+  RgfxMsgHeader header;
+  // An `RGFX_STATUS_*`.
+  uint32_t status;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_14;
+  // A table's `gpuResourceID`: what an argument buffer holds of it.
+  uint64_t gpu_resource_id;
+  // A table's `allocatedSize`.
+  uint64_t allocated_size;
+  // A table's `resourceOptions`.
+  uint64_t resource_options;
+} RgfxFunctionPointerState;
+
+// `FUNCTION_TABLE_CREATE`: a visible function table of `function_count` null entries of compute
+// pipeline state `pipeline_obj_id`, made under `obj_id`.
+typedef struct {
+  // [`RGFX_CMD_FUNCTION_TABLE_CREATE`].
+  RgfxMsgHeader header;
+  // The table's id.
+  uint64_t obj_id;
+  // The compute pipeline state: one of the sender's.
+  uint64_t pipeline_obj_id;
+  // `MTLVisibleFunctionTableDescriptor.functionCount`.
+  uint64_t function_count;
+} RgfxFunctionTableCreate;
+
+// `FUNCTION_TABLE_SET`: entries `first` to `first + count - 1` of table `obj_id` call the
+// `count` handles whose ids (`u64`, 0 for a null entry) follow this head, in order.
+typedef struct {
+  // [`RGFX_CMD_FUNCTION_TABLE_SET`].
+  RgfxMsgHeader header;
+  // The table: one of the sender's.
+  uint64_t obj_id;
+  // The first entry set.
+  uint64_t first;
+  // How many entries are set: how many handle ids follow.
+  uint64_t count;
+} RgfxFunctionTableSet;
 
 // `GET_DISPLAYS`: no payload.
 typedef struct {
@@ -4722,41 +4895,6 @@ typedef struct {
   // The texture's shape.
   RgfxTextureDescriptor desc;
 } RgfxLinearTextureFromBuffer;
-
-// One function a pipeline stage links (`MTLLinkedFunctions`), named as a stage's
-// function is: a library `obj_id`, an entry-point name in the message tail and a run
-// of [`RgfxFunctionConstant`] in the tail, with the `MTLFunctionOptions` the guest
-// made it with and, where it gave one, the descriptor's `specializedName`, the name
-// the function answers and a pipeline's visible-function references resolve against.
-// A stage's linked functions are a run of these in the tail, each list's in its
-// order; a group's functions carry the group's name.
-typedef struct {
-  // The library the function comes from.
-  uint64_t library_obj_id;
-  // The entry-point name's byte offset from the message start.
-  uint32_t name_offset;
-  // The entry-point name's length in bytes.
-  uint32_t name_len;
-  // The function constants' byte offset from the message start.
-  uint32_t constants_offset;
-  // The number of [`RgfxFunctionConstant`] for the function; 0 for a function made
-  // with none.
-  uint32_t constant_count;
-  // The list the function is in: an `RGFX_LINKED_*`.
-  uint32_t list;
-  // The `MTLFunctionOptions` the function was made with
-  // (`newFunctionWithDescriptor:`); 0 for the other forms.
-  uint32_t options;
-  // For [`RGFX_LINKED_GROUP`], the group name's byte offset from the message
-  // start; 0 otherwise.
-  uint32_t group_offset;
-  // For [`RGFX_LINKED_GROUP`], the group name's length in bytes; 0 otherwise.
-  uint32_t group_len;
-  // The `specializedName`'s byte offset from the message start; 0 for none.
-  uint32_t specialized_name_offset;
-  // The `specializedName`'s length in bytes; 0 for none.
-  uint32_t specialized_name_len;
-} RgfxLinkedFunction;
 
 // `MANAGED_BUFFER_CREATE`: a `Managed` buffer of `length` bytes at the guest-picked
 // `gpu_address`, its CPU copy the first `length` bytes of the `Shared` buffer

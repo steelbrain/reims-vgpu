@@ -736,6 +736,21 @@ bool isRendererPluginData(NSData *data)
 
 @end
 
+RgfxLinkedFunctionRef RgfxLinkedFunctionRefOf(RgfxFunction *function, uint32_t list,
+                                              const char *group)
+{
+	RgfxLinkedFunctionRef r = {};
+	r.function.library = function.rgfxLibraryObjId;
+	r.function.entry_point = [function rgfxEntryPointUTF8];
+	r.function.constants = [function rgfxConstants];
+	r.function.constant_count = [function rgfxConstantCount];
+	r.list = list;
+	r.options = static_cast<uint32_t>(function.options);
+	r.group = group;
+	r.specialized_name = [function rgfxSpecializedNameUTF8];
+	return r;
+}
+
 id<MTLFunction> RgfxCollectLinkedFunctions(MTLLinkedFunctions *linked, RgfxLinkedFunctionList &out)
 {
 	if (linked == nil)
@@ -745,17 +760,7 @@ id<MTLFunction> RgfxCollectLinkedFunctions(MTLLinkedFunctions *linked, RgfxLinke
 		for (id<MTLFunction> fn in functions) {
 			if (![(id)fn isKindOfClass:[RgfxFunction class]])
 				return fn;
-			RgfxFunction *rf = (RgfxFunction *)fn;
-			RgfxLinkedFunctionRef r = {};
-			r.function.library = rf.rgfxLibraryObjId;
-			r.function.entry_point = [rf rgfxEntryPointUTF8];
-			r.function.constants = [rf rgfxConstants];
-			r.function.constant_count = [rf rgfxConstantCount];
-			r.list = list;
-			r.options = static_cast<uint32_t>(rf.options);
-			r.group = group;
-			r.specialized_name = [rf rgfxSpecializedNameUTF8];
-			out.refs.push_back(r);
+			out.refs.push_back(RgfxLinkedFunctionRefOf((RgfxFunction *)fn, list, group));
 		}
 		return nil;
 	};

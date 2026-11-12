@@ -530,8 +530,9 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	}
 	// The answers the client waits for: a pipeline create's reflection, a heap texture size
 	// query's SIZE_AND_ALIGN, a sampler create's SAMPLER_STATE and an indirect command buffer
-	// create's ICB_STATE (each its resource id), a rate map create's or reset's RATE_MAP_STATE
-	// and a rate map query's RATE_MAP_ANSWER, and the
+	// create's ICB_STATE (each its resource id), a rate map create's or reset's RATE_MAP_STATE,
+	// a rate map query's RATE_MAP_ANSWER, a function handle or table create's
+	// FUNCTION_POINTER_STATE, and the
 	// COMPLETE of a library create or lookup (a library's last region chunk is its create) or of
 	// an argument layout, whose layout the device writes into the client's block before it.
 	UInt32 replyType = 0;
@@ -547,6 +548,8 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 		replyType = RGFX_EVT_RATE_MAP_STATE;
 	else if (type == RGFX_CMD_RATE_MAP_QUERY)
 		replyType = RGFX_EVT_RATE_MAP_ANSWER;
+	else if (type == RGFX_CMD_FUNCTION_HANDLE_CREATE || type == RGFX_CMD_FUNCTION_TABLE_CREATE)
+		replyType = RGFX_EVT_FUNCTION_POINTER_STATE;
 	else if (type == RGFX_CMD_LIBRARY_CREATE || type == RGFX_CMD_LIBRARY_LOOKUP ||
 	         type == RGFX_CMD_ARGUMENT_LAYOUT ||
 	         (type == RGFX_CMD_LIBRARY_FROM_REGION && lastLibraryChunk(message, size)))

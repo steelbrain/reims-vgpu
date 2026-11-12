@@ -2845,6 +2845,138 @@ void test_rate_map_messages()
 	CHECK(!ring.next(&h, &bytes));
 }
 
+// The device's answers to the function pointer creates, and what it was last asked.
+struct FunctionPointerAsker {
+	uint32_t calls = 0;
+	uint32_t status = RGFX_STATUS_OK;
+	std::vector<uint8_t> asked;
+	static bool ask(void *context, const void *message, uint32_t size, void *reply,
+	                uint32_t capacity, uint32_t *reply_size)
+	{
+		auto *self = static_cast<FunctionPointerAsker *>(context);
+		self->calls++;
+		const auto *bytes = static_cast<const uint8_t *>(message);
+		self->asked.assign(bytes, bytes + size);
+		RgfxFunctionPointerState answer = {};
+		answer.header = {RGFX_EVT_FUNCTION_POINTER_STATE, sizeof(answer), 12};
+		answer.status = self->status;
+		answer.gpu_resource_id = 3;
+		answer.allocated_size = 4096;
+		answer.resource_options = 528;
+		CHECK(capacity >= sizeof(answer));
+		std::memcpy(reply, &answer, sizeof(answer));
+		*reply_size = sizeof(answer);
+		return true;
+	}
+};
+
+// A function handle's and a visible function table's creates ask the device and post nothing on
+// the ring: the handle under a new id of the context, naming its pipeline and carrying its
+// function as a linked function's record, with the strings and constants after the head; the
+// table naming its pipeline and its entry count. A table's set is posted on the ring unanswered,
+// in runs of entries each message holds at most half the control ring of. Nothing is asked or
+// posted where the host makes no function pointers.
+void test_function_pointer_messages()
+{
+	TestRing ring(0x8000);
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	ids.setBases(3ull << RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxIdSpace::kDefaultAddressBase);
+	RgfxSerializer ser(writer, ids);
+	FunctionPointerAsker asker;
+	ser.setAsker(&FunctionPointerAsker::ask, &asker);
+	RgfxFunctionConstant constant = {};
+	constant.index = 7;
+	constant.data_type = 29;
+	constant.value[0] = 0x5a;
+	RgfxLinkedFunctionRef fn = {};
+	fn.function.library = 0x55;
+	fn.function.entry_point = "fp_add1";
+	fn.function.constants = &constant;
+	fn.function.constant_count = 1;
+	fn.list = RGFX_LINKED_FUNCTIONS;
+	fn.options = 4;
+	fn.specialized_name = "add1_7";
+	RgfxFunctionPointerState state = {};
+	const RgfxObjId handles[3] = {0x31, 0, 0x32};
+	CHECK(ser.createFunctionHandle(0x44, fn, &state).status == kRgfxNoAnswer);
+	CHECK(ser.createFunctionTable(0x44, 3, &state).status == kRgfxNoAnswer);
+	CHECK(!ser.setFunctionTable(0x66, 0, handles, 3) && asker.calls == 0);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(!ring.next(&h, &bytes));
+
+	ser.setCarriesFunctionPointers(true);
+	RgfxCreated handle = ser.createFunctionHandle(0x44, fn, &state);
+	CHECK(handle.posted && handle.status == RGFX_STATUS_OK && asker.calls == 1);
+	CHECK(handle.obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT == 3 && handle.seqno == 12);
+	const size_t head = sizeof(RgfxFunctionHandleCreate);
+	CHECK(asker.asked.size() == ((head + 7 + sizeof(constant) + 6 + 7) & ~size_t(7)));
+	RgfxFunctionHandleCreate create = {};
+	std::memcpy(&create, asker.asked.data(), sizeof(create));
+	CHECK(create.header.type == RGFX_CMD_FUNCTION_HANDLE_CREATE &&
+	      create.header.size == asker.asked.size());
+	CHECK(create.obj_id == handle.obj_id && create.pipeline_obj_id == 0x44);
+	const RgfxLinkedFunction &f = create.function;
+	CHECK(f.library_obj_id == 0x55 && f.list == RGFX_LINKED_FUNCTIONS && f.options == 4);
+	CHECK(f.name_offset == head && f.name_len == 7 &&
+	      std::memcmp(asker.asked.data() + f.name_offset, "fp_add1", 7) == 0);
+	RgfxFunctionConstant c = {};
+	std::memcpy(&c, asker.asked.data() + f.constants_offset, sizeof(c));
+	CHECK(f.constant_count == 1 && c.index == 7 && c.data_type == 29 && c.value[0] == 0x5a);
+	CHECK(f.group_len == 0 && f.specialized_name_len == 6 &&
+	      std::memcmp(asker.asked.data() + f.specialized_name_offset, "add1_7", 6) == 0);
+
+	// Not found (a function the pipeline does not link) answers its status, no resource id.
+	asker.status = RGFX_STATUS_NOT_FOUND;
+	RgfxCreated none = ser.createFunctionHandle(0x44, fn, &state);
+	CHECK(none.posted && none.status == RGFX_STATUS_NOT_FOUND && none.resource_id == 0);
+
+	asker.status = RGFX_STATUS_OK;
+	RgfxCreated table = ser.createFunctionTable(0x44, 3, &state);
+	CHECK(table.posted && table.status == RGFX_STATUS_OK && table.resource_id == 3);
+	CHECK(state.gpu_resource_id == 3 && state.allocated_size == 4096 &&
+	      state.resource_options == 528);
+	RgfxFunctionTableCreate tc = {};
+	CHECK(asker.asked.size() == sizeof(tc));
+	std::memcpy(&tc, asker.asked.data(), sizeof(tc));
+	CHECK(tc.header.type == RGFX_CMD_FUNCTION_TABLE_CREATE && tc.header.size == sizeof(tc));
+	CHECK(tc.obj_id == table.obj_id && tc.obj_id != handle.obj_id && tc.pipeline_obj_id == 0x44);
+	CHECK(tc.function_count == 3);
+	CHECK(!ring.next(&h, &bytes));
+
+	// A set goes on the ring, unanswered, its handles after the head.
+	const uint32_t calls = asker.calls;
+	CHECK(ser.setFunctionTable(table.obj_id, 1, handles, 3) && asker.calls == calls);
+	CHECK(ring.next(&h, &bytes) && h.type == RGFX_CMD_FUNCTION_TABLE_SET);
+	RgfxFunctionTableSet set = {};
+	CHECK(bytes.size() == sizeof(set) + 3 * 8);
+	std::memcpy(&set, bytes.data(), sizeof(set));
+	CHECK(set.obj_id == table.obj_id && set.first == 1 && set.count == 3);
+	RgfxObjId sent[3] = {};
+	std::memcpy(sent, bytes.data() + sizeof(set), sizeof(sent));
+	CHECK(sent[0] == 0x31 && sent[1] == 0 && sent[2] == 0x32);
+
+	// Entries past what one message holds go in runs, each from where the last ended.
+	const uint64_t run = (writer.dataSize() / 2 - sizeof(set)) / 8;
+	std::vector<RgfxObjId> many(run + 5);
+	for (size_t i = 0; i < many.size(); i++)
+		many[i] = 0x100 + i;
+	CHECK(ser.setFunctionTable(table.obj_id, 2, many.data(), many.size()));
+	CHECK(ring.next(&h, &bytes) && h.type == RGFX_CMD_FUNCTION_TABLE_SET);
+	std::memcpy(&set, bytes.data(), sizeof(set));
+	CHECK(set.first == 2 && set.count == run && bytes.size() == sizeof(set) + run * 8);
+	CHECK(ring.next(&h, &bytes) && h.type == RGFX_CMD_FUNCTION_TABLE_SET);
+	std::memcpy(&set, bytes.data(), sizeof(set));
+	CHECK(set.first == 2 + run && set.count == 5);
+	RgfxObjId last = 0;
+	std::memcpy(&last, bytes.data() + sizeof(set) + 4 * 8, 8);
+	CHECK(last == 0x100 + run + 4);
+	CHECK(!ring.next(&h, &bytes));
+}
+
 // A no-copy buffer's block and the app's memory (RgfxMemoryShadow): the block starts as the
 // memory; each sync moves the bytes one side changed since the two last agreed, byte by byte,
 // so a CPU write and a GPU write beside it in one word both stand; memory mapped read-only is
@@ -3439,6 +3571,7 @@ int main()
 	test_heap_ranges();
 	test_heap_texture_size_query();
 	test_rate_map_messages();
+	test_function_pointer_messages();
 	test_memory_shadow();
 	test_argument_layout_queries();
 	test_argument_layout_parse();

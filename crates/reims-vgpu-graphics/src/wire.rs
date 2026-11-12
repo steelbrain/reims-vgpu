@@ -73,8 +73,8 @@ pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63, the ones the host offers, which the guest takes
 /// through [`RGFX_REG_DRIVER_FEATURES_HI`]: [`RGFX_FEATURE_SURFACE_DEFERRED_CARRY`],
 /// [`RGFX_FEATURE_SCHEDULED_ASK`], [`RGFX_FEATURE_PAGES_16K`], [`RGFX_FEATURE_DISPLAY_SCALE`],
-/// [`RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA`], [`RGFX_FEATURE_DISPLAY_POWER`] and
-/// [`RGFX_FEATURE_RATE_MAPS`].
+/// [`RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA`], [`RGFX_FEATURE_DISPLAY_POWER`],
+/// [`RGFX_FEATURE_RATE_MAPS`] and [`RGFX_FEATURE_FUNCTION_POINTERS`].
 /// On a host that offers `PAGES_16K`, `FEATURES_LO` and `_HI` read the guest RAM features only
 /// once the guest took it.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
@@ -337,6 +337,16 @@ pub const RGFX_FEATURE_DISPLAY_POWER: u64 = 0x20_0000_0000;
 /// layer counts the device makes maps of are the device info's
 /// (`largest_rasterization_rate_map_layer_count`).
 pub const RGFX_FEATURE_RATE_MAPS: u64 = 0x40_0000_0000;
+/// `FEATURES_HI` bit 7, feature bit 39, `FUNCTION_POINTERS`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_HI`]: ring 0 carries [`RGFX_CMD_FUNCTION_HANDLE_CREATE`],
+/// [`RGFX_CMD_FUNCTION_TABLE_CREATE`] and [`RGFX_CMD_FUNCTION_TABLE_SET`], a compute pipeline
+/// state's function handles and visible function tables, and a compute encoder binds a table
+/// ([`RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLE`](crate::ops::compute::RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLE)
+/// and
+/// [`RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLES`](crate::ops::compute::RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLES)).
+/// Every host offers it; whether the device's kernels call through tables is the device info's
+/// (`supports_function_pointers`).
+pub const RGFX_FEATURE_FUNCTION_POINTERS: u64 = 0x80_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -812,6 +822,29 @@ pub const RGFX_CMD_RATE_MAP_RESET: u32 = 0x234;
 /// [`RGFX_FEATURE_RATE_MAPS`]: one of a map's answers that takes an argument
 /// (`RGFX_RATE_MAP_QUERY_*`), answered by [`RGFX_EVT_RATE_MAP_ANSWER`]. Makes nothing.
 pub const RGFX_CMD_RATE_MAP_QUERY: u32 = 0x235;
+/// Command `FUNCTION_HANDLE_CREATE` ([`RgfxFunctionHandleCreate`]), where the guest took
+/// [`RGFX_FEATURE_FUNCTION_POINTERS`]: compute pipeline state `pipeline_obj_id`'s handle of the
+/// function the message names (`functionHandleWithFunction:`), made under `obj_id`, answered by
+/// [`RGFX_EVT_FUNCTION_POINTER_STATE`]: [`RGFX_STATUS_NOT_FOUND`] where Metal answers nil (a
+/// function the state's kernel does not link), and nothing is made. A pipeline still being
+/// compiled is waited for. A host without the feature refuses the message as one it does not
+/// know.
+pub const RGFX_CMD_FUNCTION_HANDLE_CREATE: u32 = 0x236;
+/// Command `FUNCTION_TABLE_CREATE` ([`RgfxFunctionTableCreate`]), where the guest took
+/// [`RGFX_FEATURE_FUNCTION_POINTERS`]: a visible function table of `function_count` null entries
+/// of compute pipeline state `pipeline_obj_id` (`newVisibleFunctionTableWithDescriptor:`), made
+/// under `obj_id`, answered by [`RGFX_EVT_FUNCTION_POINTER_STATE`] with the table's
+/// `gpuResourceID`, which the guest's argument buffers hold, its `allocatedSize` and its
+/// `resourceOptions`. A pipeline still being compiled is waited for. `OBJECT_DESTROY` drops it.
+pub const RGFX_CMD_FUNCTION_TABLE_CREATE: u32 = 0x237;
+/// Command `FUNCTION_TABLE_SET` ([`RgfxFunctionTableSet`], then `count` handle ids), where the
+/// guest took [`RGFX_FEATURE_FUNCTION_POINTERS`]: entries `first` to `first + count - 1` of table
+/// `obj_id` call the handles the message names, in order, 0 for a null entry
+/// (`setFunction:atIndex:`, `setFunctions:withRange:`). Ring 0 is carried out before any command
+/// buffer the process posts after it, so a dispatch sees every entry set before its commit, as
+/// Metal's does. Not answered: a set the host cannot carry out (a table or handle it does not
+/// hold, a range past the table, a handle the platform refuses) sets none of its entries.
+pub const RGFX_CMD_FUNCTION_TABLE_SET: u32 = 0x238;
 
 /// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 /// held context `context` closed the device or died. The host ends the context's command queues
@@ -1000,6 +1033,9 @@ pub const RGFX_EVT_RATE_MAP_STATE: u32 = 0x40a;
 /// Event `RATE_MAP_ANSWER` ([`RgfxRateMapAnswer`], on the control completion ring): a
 /// `RATE_MAP_QUERY`'s answer.
 pub const RGFX_EVT_RATE_MAP_ANSWER: u32 = 0x40b;
+/// Event `FUNCTION_POINTER_STATE` ([`RgfxFunctionPointerState`], on the control completion
+/// ring): a `FUNCTION_HANDLE_CREATE`'s or `FUNCTION_TABLE_CREATE`'s answer.
+pub const RGFX_EVT_FUNCTION_POINTER_STATE: u32 = 0x40c;
 
 /// A command buffer's status in [`RgfxCbComplete`]: finished with no error.
 pub const RGFX_CB_OK: u32 = 0;
@@ -2718,6 +2754,85 @@ pub struct RgfxRateMapAnswer {
     pub reserved_14: u32,
     /// The answer.
     pub values: [u64; 3],
+}
+
+/// `FUNCTION_HANDLE_CREATE`: compute pipeline state `pipeline_obj_id`'s handle of `function`, a
+/// function named as a linked function is (its library, its entry point's name, its constants,
+/// options and `specializedName`, offsets from the message start; its `list` is
+/// [`RGFX_LINKED_FUNCTIONS`]), made under `obj_id`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxFunctionHandleCreate {
+    /// [`RGFX_CMD_FUNCTION_HANDLE_CREATE`].
+    pub header: RgfxMsgHeader,
+    /// The handle's id.
+    pub obj_id: u64,
+    /// The compute pipeline state: one of the sender's.
+    pub pipeline_obj_id: u64,
+    /// The function.
+    pub function: RgfxLinkedFunction,
+}
+
+/// `FUNCTION_TABLE_CREATE`: a visible function table of `function_count` null entries of compute
+/// pipeline state `pipeline_obj_id`, made under `obj_id`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxFunctionTableCreate {
+    /// [`RGFX_CMD_FUNCTION_TABLE_CREATE`].
+    pub header: RgfxMsgHeader,
+    /// The table's id.
+    pub obj_id: u64,
+    /// The compute pipeline state: one of the sender's.
+    pub pipeline_obj_id: u64,
+    /// `MTLVisibleFunctionTableDescriptor.functionCount`.
+    pub function_count: u64,
+}
+
+/// `FUNCTION_TABLE_SET`: entries `first` to `first + count - 1` of table `obj_id` call the
+/// `count` handles whose ids (`u64`, 0 for a null entry) follow this head, in order.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxFunctionTableSet {
+    /// [`RGFX_CMD_FUNCTION_TABLE_SET`].
+    pub header: RgfxMsgHeader,
+    /// The table: one of the sender's.
+    pub obj_id: u64,
+    /// The first entry set.
+    pub first: u64,
+    /// How many entries are set: how many handle ids follow.
+    pub count: u64,
+}
+
+/// `FUNCTION_POINTER_STATE`: a `FUNCTION_HANDLE_CREATE`'s or `FUNCTION_TABLE_CREATE`'s answer.
+/// `status` is [`RGFX_STATUS_OK`] where the object was made: for a table, with its
+/// `gpu_resource_id`, `allocated_size` and `resource_options`, and 0 in each for a handle.
+/// [`RGFX_STATUS_NOT_FOUND`] for a handle Metal answers nil (a function the state's kernel does
+/// not link) and for a pipeline state or library the sender does not hold,
+/// [`RGFX_STATUS_INVALID_ARGUMENT`] for a message too short, and [`RGFX_STATUS_REFUSED`] where
+/// the platform made none, each with the values 0 and nothing made.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxFunctionPointerState {
+    /// [`RGFX_EVT_FUNCTION_POINTER_STATE`], with the create's `seqno`.
+    pub header: RgfxMsgHeader,
+    /// An `RGFX_STATUS_*`.
+    pub status: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_14: u32,
+    /// A table's `gpuResourceID`: what an argument buffer holds of it.
+    pub gpu_resource_id: u64,
+    /// A table's `allocatedSize`.
+    pub allocated_size: u64,
+    /// A table's `resourceOptions`.
+    pub resource_options: u64,
 }
 
 /// The rows of a level of a `Managed` texture's CPU copy start at multiples of this, in bytes

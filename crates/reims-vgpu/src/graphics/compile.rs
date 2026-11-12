@@ -553,6 +553,14 @@ impl Pending {
 }
 
 impl Pending {
+    /// Waits until none of the pipelines `named` is pending.
+    pub(crate) fn wait_for_ids(&self, named: &[u64]) {
+        let mut ids = self.ids.lock();
+        while named.iter().any(|id| ids.contains_key(id)) {
+            self.done.wait(&mut ids);
+        }
+    }
+
     /// Waits until no pipeline the `ICB_WRITE` `message`'s records set is pending.
     pub(crate) fn wait_for_icb_write(&self, message: &[u8]) {
         let mut ids = self.ids.lock();

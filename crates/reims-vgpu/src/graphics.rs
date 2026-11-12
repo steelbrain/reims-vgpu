@@ -47,16 +47,17 @@ use reims_vgpu_graphics::ops::RgfxCommandBuffer;
 use reims_vgpu_graphics::region::Region;
 use reims_vgpu_graphics::wire::{
     RGFX_CMD_ARGUMENT_LAYOUT, RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_COMMAND_BUFFER,
-    RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_HEAP_OVER_PAGES,
-    RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_SLOTS,
-    RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
-    RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, RGFX_CMD_OBJECT_DESTROY,
-    RGFX_CMD_RATE_MAP_CREATE, RGFX_CMD_RATE_MAP_QUERY, RGFX_CMD_RATE_MAP_RESET,
-    RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_IMPORT,
-    RGFX_CMD_SHARED_EVENT_NAME, RGFX_CMD_SHARED_EVENT_UNNAME, RGFX_CONTEXT_OBJ_ID_SHIFT,
-    RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_ICB_STATE, RGFX_EVT_RATE_MAP_ANSWER, RGFX_EVT_RATE_MAP_STATE,
-    RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED, RGFX_FEATURE_COMMIT_ORDER,
-    RGFX_FEATURE_DISPLAY_COLOR, RGFX_FEATURE_DISPLAY_POWER, RGFX_FEATURE_DISPLAY_SCALE,
+    RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_FUNCTION_HANDLE_CREATE,
+    RGFX_CMD_FUNCTION_TABLE_CREATE, RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN,
+    RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_SLOTS, RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE,
+    RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE,
+    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_RATE_MAP_CREATE, RGFX_CMD_RATE_MAP_QUERY,
+    RGFX_CMD_RATE_MAP_RESET, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE,
+    RGFX_CMD_SHARED_EVENT_IMPORT, RGFX_CMD_SHARED_EVENT_NAME, RGFX_CMD_SHARED_EVENT_UNNAME,
+    RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_FUNCTION_POINTER_STATE,
+    RGFX_EVT_ICB_STATE, RGFX_EVT_RATE_MAP_ANSWER, RGFX_EVT_RATE_MAP_STATE, RGFX_EVT_SAMPLER_STATE,
+    RGFX_FEATURE_CB_SUBMITTED, RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_DISPLAY_COLOR,
+    RGFX_FEATURE_DISPLAY_POWER, RGFX_FEATURE_DISPLAY_SCALE, RGFX_FEATURE_FUNCTION_POINTERS,
     RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_HOST_TIME, RGFX_FEATURE_ICB_SLOTS,
     RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_MANAGED_AT_OFFSET,
     RGFX_FEATURE_MANAGED_BUFFER_SLABS, RGFX_FEATURE_MANAGED_TEXTURE_SLABS,
@@ -67,13 +68,14 @@ use reims_vgpu_graphics::wire::{
     RGFX_FEATURE_SURFACE_DEFERRED, RGFX_FEATURE_SURFACE_DEFERRED_ASK,
     RGFX_FEATURE_SURFACE_DEFERRED_CARRY, RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES,
     RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA, RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK,
-    RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
-    RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED,
-    RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant, RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete,
-    RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled,
-    RgfxHeapOverPages, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun,
-    RgfxRateMapAnswer, RgfxRateMapState, RgfxSamplerState, RgfxScheduledAsk, RgfxSharedEventName,
-    RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
+    RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_NOT_FOUND, RGFX_STATUS_OK,
+    RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET,
+    RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant, RgfxBlockRelease,
+    RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry,
+    RgfxDisplayColor, RgfxEventSignalled, RgfxFunctionPointerState, RgfxHeapOverPages,
+    RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxRateMapAnswer,
+    RgfxRateMapState, RgfxSamplerState, RgfxScheduledAsk, RgfxSharedEventName, RgfxSurfacePages,
+    RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
 use reims_vgpu_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim, Scanout,
@@ -387,7 +389,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // texture's `didModifyData` to its platform (`TEXTURE_DID_MODIFY_DATA`), shows black
             // while the guest's display sleeps (`DISPLAY_POWER`), and makes the guest's
             // rasterization rate maps on its platform (`RATE_MAPS`), of the layer counts the device
-            // info answers.
+            // info answers, and its compute pipeline states' function handles and visible function
+            // tables (`FUNCTION_POINTERS`).
             let in_place = u64::from(RGFX_FEATURE_SURFACE_PAGES)
                 | u64::from(RGFX_FEATURE_PAGES_BUFFERS)
                 | u64::from(RGFX_FEATURE_HEAP_OVER_PAGES);
@@ -409,6 +412,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 | RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA
                 | RGFX_FEATURE_DISPLAY_POWER
                 | RGFX_FEATURE_RATE_MAPS
+                | RGFX_FEATURE_FUNCTION_POINTERS
                 | if gpu_device.makes_opencl_mode_pipelines() {
                     u64::from(RGFX_FEATURE_OPENCL_MODE)
                 } else {
@@ -1457,6 +1461,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 self.rate_map_query(poster, message);
                 return;
             }
+            RGFX_CMD_FUNCTION_HANDLE_CREATE | RGFX_CMD_FUNCTION_TABLE_CREATE => {
+                self.function_pointer_state(poster, message);
+                return;
+            }
             RGFX_CMD_SAMPLER_CREATE => {
                 self.create_sampler(poster, message);
                 return;
@@ -1999,6 +2007,55 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 target: "reims_vgpu::graphics", kind:% = answer.status;
                 "a rate map's create or reset (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) \
                  was answered status {}",
+                answer.status
+            );
+        }
+        poster.post(answer.as_bytes());
+    }
+
+    /// A compute pipeline state's function handle or visible function table from ring 0
+    /// (`FUNCTION_HANDLE_CREATE`, `FUNCTION_TABLE_CREATE`), made and answered at once through
+    /// `poster` (`FUNCTION_POINTER_STATE`, `decode::function_table`), after the compile of the
+    /// state it names where that is still under way. A create the platform raises at is answered
+    /// refused.
+    fn function_pointer_state(&self, poster: &CompletionPoster, message: &[u8]) {
+        if let Some(pipeline) = decode::function_table_pipeline(message) {
+            self.pending.wait_for_ids(&[pipeline]);
+        }
+        let (ty, seqno, obj_id) = message_identity(message);
+        let decoder =
+            (self.decoders).sender(Some(sender_context(poster, message)), Sinks::default());
+        let answer = entry::run(|_| refusing(|| decoder.function_pointer_state(message)));
+        let answer = answer.unwrap_or_else(|raise| {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = raise;
+                "a function handle's or table's create (type {ty:#x}, seqno {seqno}, object \
+                 {obj_id:#x}) faulted: {raise}"
+            );
+            RgfxMsgHeader::read_from_prefix(message)
+                .ok()
+                .map(|(header, _)| RgfxFunctionPointerState {
+                    header: RgfxMsgHeader {
+                        r#type: RGFX_EVT_FUNCTION_POINTER_STATE,
+                        size: size_of::<RgfxFunctionPointerState>() as u32,
+                        seqno: header.seqno,
+                    },
+                    status: RGFX_STATUS_REFUSED,
+                    ..RgfxFunctionPointerState::default()
+                })
+        });
+        let Some(answer) = answer else {
+            return;
+        };
+        // A handle Metal answers nil for (a function the state does not link) is not found, as
+        // asked; the rest are logged.
+        if answer.status != RGFX_STATUS_OK
+            && !(ty == RGFX_CMD_FUNCTION_HANDLE_CREATE && answer.status == RGFX_STATUS_NOT_FOUND)
+        {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "a function handle's or table's create (type {ty:#x}, seqno {seqno}, object \
+                 {obj_id:#x}) was answered status {}",
                 answer.status
             );
         }

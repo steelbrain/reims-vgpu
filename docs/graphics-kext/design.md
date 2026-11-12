@@ -1379,6 +1379,30 @@ only where no negotiation can carry it.
   (`largest_rasterization_rate_map_layer_count`). Every host offers it, and
   the kext takes it; a bundle on a host that did not offer it makes no map and
   supports no layer count.
+- Bit 39, `FEATURES_HI`'s bit 7, is `FUNCTION_POINTERS`: a compute pipeline
+  state's function handles and visible function tables. Ring 0 carries
+  `FUNCTION_HANDLE_CREATE` (0x236, `RgfxFunctionHandleCreate`: the handle's
+  `ObjId`, the pipeline state's, and its function as an `RgfxLinkedFunction`
+  record of `RGFX_LINKED_FUNCTIONS`, its strings and constants after the
+  head) and `FUNCTION_TABLE_CREATE` (0x237, `RgfxFunctionTableCreate`: the
+  table's `ObjId`, the pipeline state's and its entry count), each answered
+  by `FUNCTION_POINTER_STATE` (0x40c, `RgfxFunctionPointerState`: the status,
+  and for a table its `gpuResourceID`, `allocatedSize` and `resourceOptions`),
+  and `FUNCTION_TABLE_SET` (0x238, `RgfxFunctionTableSet`: the table's
+  `ObjId`, the first entry and the count, then that many handle `ObjId`s, 0 a
+  nil entry), which the device does not answer. The platform makes the handle
+  of the function among those the state's kernel links, and a function it
+  does not link is `RGFX_STATUS_NOT_FOUND`, Metal's nil; a message naming a
+  state still being compiled waits for it. A set is carried out before any
+  command buffer the process posts after it, so a dispatch encoded before a
+  set and committed after it calls the entry set. A compute pass binds a table
+  at a buffer index (`RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLE`, 0x201e) or
+  a range of them (`RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLES`, 0x201f), and
+  an argument buffer holds a table by its `gpuResourceID`, which the kernel
+  reads with or without `useResource:`. Render stages carry no function
+  pointers. Every host offers it, and the kext takes it; a bundle on a host
+  that did not offer it makes no handle or table, and answers NO to
+  `supportsFunctionPointers`.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -2422,6 +2446,7 @@ that waits for its answer would close it, at the cost the known creates remove.
 | a texture's bytes changed | `TEXTURE_DID_MODIFY_DATA` (not answered; carried out as a range message) | `Texture::did_modify_data` |
 | heap sizes | `HEAP_TEXTURE_SIZE_AND_ALIGN` (answered `SIZE_AND_ALIGN` on the control completion ring; makes nothing) | `heap_texture_size_and_align` |
 | rasterization rate maps | `RATE_MAP_CREATE`, `RATE_MAP_RESET` (answered `RATE_MAP_STATE`), `RATE_MAP_QUERY` (answered `RATE_MAP_ANSWER`; makes nothing), `*_DESTROY` | `new_rate_map`, `RateMap::reset`, `RateMap::physical_size`, `screen_to_physical` and `physical_to_screen`, `RateMap::copy_parameter_data` |
+| function pointers | `FUNCTION_HANDLE_CREATE`, `FUNCTION_TABLE_CREATE` (answered `FUNCTION_POINTER_STATE`), `FUNCTION_TABLE_SET` (not answered; makes nothing), `*_DESTROY` | `ComputePipeline::function_handle`, `ComputePipeline::new_visible_function_table`, `VisibleFunctionTable::set_functions` |
 | state | `SAMPLER_CREATE`, `DEPTH_STENCIL_CREATE`, `*_DESTROY` | `new_sampler_state`, `new_depth_stencil_state` |
 | shaders | `LIBRARY_LOOKUP` (the content key of the `.metallib`'s AIR slice: a hit binds the library the device made for any process, and no bytes cross), `LIBRARY_CREATE` and `LIBRARY_FROM_REGION` (the slice's bytes forwarded unchanged on a miss, answered once made), `RENDER_PIPELINE_CREATE`, `MESH_RENDER_PIPELINE_CREATE`, `COMPUTE_PIPELINE_CREATE`, `*_DESTROY` | the device's library cache, `new_library_with_data`, `new_render_pipeline_state_full`, `new_mesh_render_pipeline_state_full` and `new_compute_pipeline_state_full` (the whole descriptor the guest set: vertex or stage-input descriptor, every colour attachment, each stage's linked functions, those made with options or a specialized name by `Library::new_function_with_options`; the Vulkan platform refuses a specialized name, which its runtime's function descriptor lacks) |
 | sync | `EVENT_CREATE`, `SHARED_EVENT_CREATE`, `FENCE_CREATE`, `*_DESTROY`; the kext's `SHARED_EVENT_NAME` (answered `COMPLETE`), `SHARED_EVENT_IMPORT` (answered `SHARED_EVENT_VALUE`) and `SHARED_EVENT_UNNAME` (not answered) | `new_event`, `new_shared_event`, `new_fence`; an import's value `SharedEvent::signaled_value` |

@@ -43,6 +43,7 @@
 #import "RgfxBlockCall.h"
 #import "RgfxComputePipelineState.h"
 #import "RgfxFunction.h"
+#import "RgfxFunctionTable.h"
 #import "RgfxGLFunction.h"
 #import "RgfxLibrary.h"
 #import "RgfxLibraryFile.h"
@@ -12366,6 +12367,152 @@ bool askTextureSize(void *, const void *, uint32_t, void *reply, uint32_t capaci
 	return true;
 }
 
+// The device's answers to the function pointer creates, and what it was last asked.
+struct FunctionPointerDevice {
+	uint32_t calls = 0;
+	uint32_t status = RGFX_STATUS_OK;
+	std::vector<uint8_t> asked;
+	static bool ask(void *context, const void *message, uint32_t size, void *reply,
+	                uint32_t capacity, uint32_t *reply_size)
+	{
+		auto *self = static_cast<FunctionPointerDevice *>(context);
+		self->calls++;
+		const auto *bytes = static_cast<const uint8_t *>(message);
+		self->asked.assign(bytes, bytes + size);
+		RgfxFunctionPointerState answer = {};
+		answer.header = {RGFX_EVT_FUNCTION_POINTER_STATE, sizeof(answer), 9};
+		answer.status = self->status;
+		answer.gpu_resource_id = 3;
+		answer.allocated_size = 4096;
+		answer.resource_options = MTLResourceStorageModeManaged |
+		                          MTLResourceHazardTrackingModeTracked;
+		CHECK(capacity >= sizeof(answer));
+		std::memcpy(reply, &answer, sizeof(answer));
+		*reply_size = sizeof(answer);
+		return true;
+	}
+};
+
+// A compute pipeline's handles and tables are the host's, where the host makes them: a handle of
+// a function asks the host once and is the same object each time after; a function the kernel
+// does not link (the host's not found) is nil, asked once too. A table answers the host's
+// resource id, size and options; its sets go on the ring (FUNCTION_TABLE_SET), a nil handle as
+// 0, and a range past its entries sets none. A handle's gpuResourceID and the pipeline's
+// functionHandleWithName: raise an unrecognized selector, as the AMD 5300M's do. Where the host
+// makes none, each is nil and asks nothing.
+void test_function_pointers()
+{
+	Fixture fx;
+	FunctionPointerDevice device;
+	fx.ser.setAsker(&FunctionPointerDevice::ask, &device);
+	@autoreleasepool {
+	const uint8_t libBytes[] = {9, 9, 9};
+	uint32_t libStatus = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:libBytes
+	                                        length:sizeof(libBytes)
+	                                           key:nullptr
+	                                        device:nil
+	                                    serializer:&fx.ser
+	                                        status:&libStatus];
+	(void)nextMessage(fx.ring, RGFX_CMD_LIBRARY_CREATE);
+	id<MTLFunction> add1 = [lib newFunctionWithName:@"fp_add1"];
+	id<MTLFunction> neg = [lib newFunctionWithName:@"fp_neg"];
+	NSError *err = nil;
+	RgfxComputePipelineState *cs =
+	    [RgfxComputePipelineState computePipelineStateWithFunction:[lib newFunctionWithName:@"fp_kernel"]
+	                                                       device:nil
+	                                                   serializer:&fx.ser
+	                                                        error:&err];
+	CHECK(cs != nil);
+	if (cs == nil)
+		return;
+	(void)nextMessage(fx.ring, RGFX_CMD_COMPUTE_PIPELINE_CREATE);
+	MTLVisibleFunctionTableDescriptor *td = [MTLVisibleFunctionTableDescriptor new];
+	td.functionCount = 3;
+	CHECK([cs functionHandleWithFunction:add1] == nil);
+	CHECK([cs newVisibleFunctionTableWithDescriptor:td] == nil && device.calls == 0);
+
+	fx.ser.setCarriesFunctionPointers(true);
+	id<MTLFunctionHandle> h = [cs functionHandleWithFunction:add1];
+	CHECK(h != nil && device.calls == 1);
+	if (h == nil)
+		return;
+	CHECK([h.name isEqualToString:@"fp_add1"] && h.functionType == add1.functionType);
+	RgfxFunctionHandleCreate create = {};
+	std::memcpy(&create, device.asked.data(), sizeof(create));
+	CHECK(create.header.type == RGFX_CMD_FUNCTION_HANDLE_CREATE);
+	CHECK(create.obj_id == ((RgfxFunctionHandle *)h).rgfxObjId &&
+	      create.pipeline_obj_id == cs.rgfxObjId);
+	CHECK(create.function.library_obj_id == lib.rgfxObjId &&
+	      create.function.list == RGFX_LINKED_FUNCTIONS && create.function.name_len == 7);
+	CHECK([cs functionHandleWithFunction:add1] == h && device.calls == 1);
+	device.status = RGFX_STATUS_NOT_FOUND;
+	CHECK([cs functionHandleWithFunction:neg] == nil && device.calls == 2);
+	CHECK([cs functionHandleWithFunction:neg] == nil && device.calls == 2);
+	id<MTLFunction> noFunction = nil;
+	CHECK([cs functionHandleWithFunction:noFunction] == nil && device.calls == 2);
+	bool raised = false;
+	@try {
+		(void)h.gpuResourceID;
+	} @catch (NSException *e) {
+		raised = [e.name isEqualToString:NSInvalidArgumentException];
+	}
+	CHECK(raised);
+	raised = false;
+	CHECK([cs respondsToSelector:@selector(functionHandleWithName:)]);
+	@try {
+		(void)[cs functionHandleWithName:@"fp_add1"];
+	} @catch (NSException *e) {
+		raised = [e.name isEqualToString:NSInvalidArgumentException];
+	}
+	CHECK(raised && device.calls == 2);
+
+	device.status = RGFX_STATUS_OK;
+	id<MTLVisibleFunctionTable> t = [cs newVisibleFunctionTableWithDescriptor:td];
+	CHECK(t != nil && device.calls == 3);
+	if (t == nil)
+		return;
+	RgfxFunctionTableCreate tc = {};
+	std::memcpy(&tc, device.asked.data(), sizeof(tc));
+	CHECK(tc.header.type == RGFX_CMD_FUNCTION_TABLE_CREATE && tc.pipeline_obj_id == cs.rgfxObjId);
+	CHECK(tc.obj_id == ((RgfxVisibleFunctionTable *)t).rgfxObjId && tc.function_count == 3);
+	CHECK(t.gpuResourceID._impl == 3 && t.allocatedSize == 4096);
+	CHECK(t.resourceOptions == (MTLResourceStorageModeManaged | MTLResourceHazardTrackingModeTracked));
+	CHECK(t.storageMode == MTLStorageModeManaged && t.cpuCacheMode == MTLCPUCacheModeDefaultCache &&
+	      t.hazardTrackingMode == MTLHazardTrackingModeTracked);
+	CHECK(t.heap == nil && !t.isAliasable && t.label == nil);
+	CHECK([t setPurgeableState:MTLPurgeableStateVolatile] == MTLPurgeableStateNonVolatile);
+	CHECK([t setPurgeableState:MTLPurgeableStateKeepCurrent] == MTLPurgeableStateVolatile);
+
+	[t setFunction:h atIndex:2];
+	auto bytes = nextMessage(fx.ring, RGFX_CMD_FUNCTION_TABLE_SET);
+	RgfxFunctionTableSet set = {};
+	std::memcpy(&set, bytes.data(), sizeof(set));
+	CHECK(set.obj_id == tc.obj_id && set.first == 2 && set.count == 1);
+	CHECK(bytes.size() == sizeof(set) + 8);
+	RgfxObjId ids[2] = {};
+	std::memcpy(ids, bytes.data() + sizeof(set), 8);
+	CHECK(ids[0] == create.obj_id);
+	const id<MTLFunctionHandle> two[2] = {nil, h};
+	[t setFunctions:two withRange:NSMakeRange(0, 2)];
+	bytes = nextMessage(fx.ring, RGFX_CMD_FUNCTION_TABLE_SET);
+	std::memcpy(&set, bytes.data(), sizeof(set));
+	CHECK(set.first == 0 && set.count == 2 && bytes.size() == sizeof(set) + 16);
+	std::memcpy(ids, bytes.data() + sizeof(set), 16);
+	CHECK(ids[0] == 0 && ids[1] == create.obj_id);
+	[t setFunction:h atIndex:3];
+	[t setFunctions:two withRange:NSMakeRange(2, 2)];
+	[t setFunctions:two withRange:NSMakeRange(1, 0)];
+	RgfxMsgHeader none = {};
+	std::vector<uint8_t> noneBytes;
+	CHECK(!fx.ring.next(&none, &noneBytes));
+
+	// A refused table is nil.
+	device.status = RGFX_STATUS_REFUSED;
+	CHECK([cs newVisibleFunctionTableWithDescriptor:td] == nil && device.calls == 4);
+	} // @autoreleasepool
+}
+
 // A rate map is the host's: made where the host makes maps, from the state the host answers its
 // create with (its screen size, granularity, layers and parameter size), labelled with its
 // descriptor's label; each answer that takes an argument asks the host, and a copy into a Shared
@@ -17435,6 +17582,7 @@ int main(int argc, char **argv)
 		test_shared_heap_buffers_alias_its_bytes();
 		test_automatic_heap_places_as_metal();
 		test_rasterization_rate_map();
+		test_function_pointers();
 		test_rasterization_rate_map_deaths();
 		test_automatic_shared_heap_buffers_are_its_bytes();
 		test_managed_texture_copy_block_after_destroys();

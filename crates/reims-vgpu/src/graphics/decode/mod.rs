@@ -88,16 +88,16 @@ use reims_vgpu_graphics::wire::{
     RGFX_CMD_BUFFER_MANAGED_AT_OFFSET, RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
     RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_COMMAND_BUFFER,
     RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE,
-    RGFX_CMD_FENCE_CREATE, RGFX_CMD_HEAP_CREATE, RGFX_CMD_HEAP_OVER_HOST_MEMORY,
-    RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_SLOTS, RGFX_CMD_ICB_WRITE,
-    RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER,
-    RGFX_CMD_MANAGED_BUFFER_CREATE, RGFX_CMD_MANAGED_TEXTURE_CREATE,
-    RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
-    RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_RESOURCE_ID_CHUNK, RGFX_CMD_RESOURCE_ID_SMALL_CHUNK,
-    RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_SHARED_EVENT_SET_VALUE,
-    RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_DID_MODIFY_DATA, RGFX_CMD_TEXTURE_FROM_BUFFER,
-    RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_CMD_TEXTURE_REPLACE_REGION, RGFX_CMD_TEXTURE_VIEW,
-    RGFX_CMD_VIDEO_SESSION_CREATE, RGFX_COMPUTE_PIPELINE_OPENCL_MODE,
+    RGFX_CMD_FENCE_CREATE, RGFX_CMD_FUNCTION_TABLE_SET, RGFX_CMD_HEAP_CREATE,
+    RGFX_CMD_HEAP_OVER_HOST_MEMORY, RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_ICB_CREATE,
+    RGFX_CMD_ICB_SLOTS, RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
+    RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER, RGFX_CMD_MANAGED_BUFFER_CREATE,
+    RGFX_CMD_MANAGED_TEXTURE_CREATE, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, RGFX_CMD_OBJECT_DESTROY,
+    RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_RESOURCE_ID_CHUNK,
+    RGFX_CMD_RESOURCE_ID_SMALL_CHUNK, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE,
+    RGFX_CMD_SHARED_EVENT_SET_VALUE, RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_DID_MODIFY_DATA,
+    RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_CMD_TEXTURE_REPLACE_REGION,
+    RGFX_CMD_TEXTURE_VIEW, RGFX_CMD_VIDEO_SESSION_CREATE, RGFX_COMPUTE_PIPELINE_OPENCL_MODE,
     RGFX_COMPUTE_PIPELINE_SUPPORT_ICB, RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH,
     RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN,
     RGFX_EVT_PIPELINE_REFLECTION, RGFX_EVT_SAMPLER_STATE, RGFX_EVT_SIZE_AND_ALIGN,
@@ -175,6 +175,7 @@ mod composite_cost;
 mod compute;
 #[cfg(test)]
 pub(super) mod draw_cost;
+mod function_table;
 #[cfg(test)]
 mod fuzz;
 #[cfg(test)]
@@ -207,6 +208,7 @@ pub use video::{
 };
 
 pub(crate) use cmdbuf::Begun;
+pub(crate) use function_table::named_pipeline as function_table_pipeline;
 #[cfg(test)]
 pub(crate) use lane::{LANE_MOST, LANE_THREADS};
 use lane::{Lane, Turn};
@@ -544,6 +546,14 @@ enum ObjHandle<P: Platform> {
     /// ([`RGFX_CMD_RATE_MAP_CREATE`](reims_vgpu_graphics::wire::RGFX_CMD_RATE_MAP_CREATE)), which
     /// render passes name ([`rate_map`]).
     RateMap(P::RateMap),
+    /// A compute pipeline state's handle of a function it links
+    /// ([`RGFX_CMD_FUNCTION_HANDLE_CREATE`](reims_vgpu_graphics::wire::RGFX_CMD_FUNCTION_HANDLE_CREATE)),
+    /// which its tables' entries name ([`function_table`]).
+    FunctionHandle(P::FunctionHandle),
+    /// A visible function table
+    /// ([`RGFX_CMD_FUNCTION_TABLE_CREATE`](reims_vgpu_graphics::wire::RGFX_CMD_FUNCTION_TABLE_CREATE)),
+    /// which compute encoders bind ([`function_table`]).
+    FunctionTable(P::VisibleFunctionTable),
     /// What an id stands for whose posted create the host refused ([`refused`]): what names it
     /// is dropped, not the command buffer that names it.
     Refused(refused::Refused),
@@ -3099,6 +3109,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             RGFX_CMD_SAMPLER_CREATE => self.make_sampler(device, message),
             RGFX_CMD_ICB_CREATE => Ok(self.new_icb(device, message, false)?.map(|_| ())),
             RGFX_CMD_ICB_WRITE => self.icb_write(message),
+            RGFX_CMD_FUNCTION_TABLE_SET => self.function_table_set(message),
             RGFX_CMD_ICB_SLOTS => self.icb_slots(message),
             RGFX_CMD_DEPTH_STENCIL_CREATE => {
                 let Some(m) = read::<RgfxDepthStencilCreate>(message) else {
@@ -5454,6 +5465,8 @@ resolvers! {
     (require_library, get_library, Library, Library, "library"),
     (require_indirect_command_buffer, get_indirect_command_buffer, Icb, Icb, "indirect command buffer"),
     (require_rate_map, get_rate_map, RateMap, RateMap, "rasterization rate map"),
+    (require_function_table, get_function_table, FunctionTable, VisibleFunctionTable, "visible function table"),
+    (require_function_handle, get_function_handle, FunctionHandle, FunctionHandle, "function handle"),
 }
 
 /// The line of a heap create the platform answered nil for (a size of 0, memory the device
@@ -8907,7 +8920,7 @@ lacks {part}"
 
     /// A linked function [`append_linked`] appends: its name, list, `MTLFunctionOptions`, group
     /// name (empty for none), constants and specialized name (empty for none).
-    type LinkedSpec<'a> = (
+    pub(super) type LinkedSpec<'a> = (
         &'a str,
         u32,
         u32,
@@ -8919,7 +8932,11 @@ lacks {part}"
     /// Appends to `bytes` the linked functions `specs` name ([`LinkedSpec`]), each of library
     /// `library`, then their records, and answers the records' offset and count; the message's
     /// size is set again, a multiple of 8.
-    fn append_linked(bytes: &mut Vec<u8>, library: u64, specs: &[LinkedSpec<'_>]) -> (u32, u32) {
+    pub(super) fn append_linked(
+        bytes: &mut Vec<u8>,
+        library: u64,
+        specs: &[LinkedSpec<'_>],
+    ) -> (u32, u32) {
         let mut records = Vec::new();
         for &(name, list, options, group, constants, specialized) in specs {
             let name_offset = bytes.len() as u32;
@@ -8957,7 +8974,7 @@ lacks {part}"
     }
 
     /// `message` with its fixed head of `T` edited by `f`.
-    fn edit_head<T: FromBytes + IntoBytes + KnownLayout + Immutable>(
+    pub(super) fn edit_head<T: FromBytes + IntoBytes + KnownLayout + Immutable>(
         message: &mut [u8],
         f: impl FnOnce(&mut T),
     ) {
