@@ -40,8 +40,9 @@
 //             query a device answers with no compile (on a guest, its round trip to the host).
 //   cp.lib, cp.const, cp.warm, cp.async.8   the same for k_blur's compute pipeline (its weights
 //             a function constant).
-//   mps.fn           kernels of MPSCore's default.metallib, the ones Vision's person segmentation
-//             makes first (those the library holds): each one's newFunctionWithName: (fn, its
+//   mps.fn           the kernels Vision's person segmentation makes first, from the libraries it
+//             loads them from (MPSNeuralNetwork's, Espresso's and MPSCore's default.metallib,
+//             each kernel from the first that holds it): each one's newFunctionWithName: (fn, its
 //             first in this process, then again: fn2), newFunctionWithName:constantValues:error:
 //             with each of its function constants 0 (spec), its compute pipeline (cp, then again:
 //             cp2). A second process shows what outlives the first (the host's caches).
@@ -578,30 +579,47 @@ static MTLFunctionConstantValues *zeroConstants(id<MTLFunction> function)
 	return v;
 }
 
+// The libraries Vision's person segmentation loads its kernels from, in its order.
+static NSString *const kMpsLibraries[] = {
+	@"/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/"
+	@"MPSNeuralNetwork.framework/Resources/default.metallib",
+	@"/System/Library/PrivateFrameworks/Espresso.framework/Versions/Current/Resources/default.metallib",
+	@"/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/"
+	@"MPSCore.framework/Resources/default.metallib",
+};
+
 static NSString *mpsFunctions(void)
 {
-	NSString *path = @"/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/"
-	                 @"Frameworks/MPSCore.framework/Resources/default.metallib";
-	if (![[NSFileManager defaultManager] fileExistsAtPath:path])
-		return @"SKIP no MPSCore default.metallib";
-	NSError *err = nil;
-	double t0 = now();
-	id<MTLLibrary> lib = [gDevice newLibraryWithURL:[NSURL fileURLWithPath:path] error:&err];
-	const double libMs = ms(t0);
-	if (lib == nil)
-		return [@"FAIL library: " stringByAppendingString:err.localizedDescription ?: @"nil"];
-	NSSet *names = [NSSet setWithArray:lib.functionNames];
+	NSMutableArray<id<MTLLibrary>> *libs = [NSMutableArray array];
+	NSMutableArray *libMs = [NSMutableArray array];
+	for (size_t i = 0; i < sizeof kMpsLibraries / sizeof kMpsLibraries[0]; i++) {
+		if (![[NSFileManager defaultManager] fileExistsAtPath:kMpsLibraries[i]])
+			continue;
+		NSError *err = nil;
+		const double t0 = now();
+		id<MTLLibrary> lib = [gDevice newLibraryWithURL:[NSURL fileURLWithPath:kMpsLibraries[i]] error:&err];
+		[libMs addObject:@(ms(t0))];
+		if (lib != nil)
+			[libs addObject:lib];
+	}
+	if (libs.count == 0)
+		return @"SKIP none of the MPS and Espresso libraries loads";
 	NSMutableArray *fn = [NSMutableArray array], *fn2 = [NSMutableArray array],
 	               *spec = [NSMutableArray array], *cp = [NSMutableArray array],
 	               *cp2 = [NSMutableArray array];
 	int absent = 0, refused = 0, constants = 0;
 	for (size_t i = 0; i < sizeof kMpsKernels / sizeof kMpsKernels[0]; i++) {
 		NSString *name = kMpsKernels[i];
-		if (![names containsObject:name]) {
+		id<MTLLibrary> lib = nil;
+		for (id<MTLLibrary> l in libs)
+			if (lib == nil && [l.functionNames containsObject:name])
+				lib = l;
+		if (lib == nil) {
 			absent++;
 			continue;
 		}
-		t0 = now();
+		NSError *err = nil;
+		double t0 = now();
 		id<MTLFunction> f = [lib newFunctionWithName:name];
 		[fn addObject:@(ms(t0))];
 		t0 = now();
@@ -625,10 +643,13 @@ static NSString *mpsFunctions(void)
 		if (p == nil || again == nil)
 			refused++;
 	}
-	return [NSString stringWithFormat:@"lib_ms=%.2f kernels=%lu absent=%d refused=%d constants=%d %@ %@ %@ %@ %@",
-	                                  libMs, (unsigned long)fn.count, absent, refused, constants,
-	                                  stat(@"fn", fn), stat(@"fn2", fn2), stat(@"spec", spec),
-	                                  stat(@"cp", cp), stat(@"cp2", cp2)];
+	NSMutableArray *libText = [NSMutableArray array];
+	for (NSNumber *m in libMs)
+		[libText addObject:[NSString stringWithFormat:@"%.2f", m.doubleValue]];
+	return [NSString stringWithFormat:@"lib_ms=%@ kernels=%lu absent=%d refused=%d constants=%d %@ %@ %@ %@ %@",
+	                                  [libText componentsJoinedByString:@","], (unsigned long)fn.count,
+	                                  absent, refused, constants, stat(@"fn", fn), stat(@"fn2", fn2),
+	                                  stat(@"spec", spec), stat(@"cp", cp), stat(@"cp2", cp2)];
 }
 
 // heapTextureSizeAndAlignWithDescriptor: of a private RGBA8 texture of a fresh width each
