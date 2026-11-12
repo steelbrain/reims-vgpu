@@ -15,6 +15,7 @@ use crate::vaapi::va::caps::{self, Config, Context, Entrypoint};
 use crate::vaapi::va::display::{Display, Error};
 use crate::vaapi::va::encoder::VideoEncoder;
 use crate::vaapi::va::frame::Frame;
+use crate::vaapi::va::gated::GatedRuntime;
 use crate::vaapi::va::h264::H264Decoder;
 use crate::vaapi::va::readback::copy;
 use crate::vaapi::va::surface::{Surface, SurfaceFormat, SurfacePool};
@@ -34,7 +35,7 @@ const ENCODE_WAIT: Duration = Duration::from_millis(4);
 
 pub(super) fn display() -> Display {
     let node = std::env::var("RVG_VAAPI_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
-    Display::open(node, StdRuntime::shared()).expect("a VA display")
+    Display::open(node, std::sync::Arc::new(GatedRuntime)).expect("a VA display")
 }
 
 /// Frame `n` of noise at [`SIZE`], NV12.

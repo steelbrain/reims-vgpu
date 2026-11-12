@@ -465,9 +465,9 @@ fn check_kind(display: &Display, codec: TargetCodec, format: TargetFormat) -> Re
 mod tests {
     use super::*;
     use crate::codec::encode::{EncoderSettings, InputFrame, Plane, Profile as Encoded};
-    use crate::core::runtime::StdRuntime;
     use crate::vaapi::va::encoder::VideoEncoder;
     use crate::vaapi::va::frame::PlaneRows;
+    use crate::vaapi::va::gated::GatedRuntime;
 
     /// The encoded streams' size: rows of a multiple of 256 bytes.
     const SIZE: (u32, u32) = (1280, 720);
@@ -475,7 +475,7 @@ mod tests {
 
     fn display() -> Display {
         let node = std::env::var("RVG_VAAPI_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
-        Display::open(node, StdRuntime::shared()).expect("a VA display")
+        Display::open(node, std::sync::Arc::new(GatedRuntime)).expect("a VA display")
     }
 
     /// `PICTURES` pictures of a gradient moving a few samples a picture, by the driver's encoder

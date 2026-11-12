@@ -290,9 +290,9 @@ fn run(display: &Display, stream: &std::path::Path, laid: Option<Laid>, scribble
 /// same, and the first stream each way refused or came out other at. Prints its answers; asserts
 /// only that it decoded something.
 pub(crate) fn probe(node: &str, dirs: &str) {
-    use crate::core::runtime::StdRuntime;
+    use crate::vaapi::va::gated::GatedRuntime;
 
-    let display = Display::open(node, std::sync::Arc::new(StdRuntime)).expect("a display");
+    let display = Display::open(node, std::sync::Arc::new(GatedRuntime)).expect("a display");
     let mut streams: Vec<std::path::PathBuf> = (dirs.split(':'))
         .flat_map(|dir| std::fs::read_dir(dir).expect("a streams directory"))
         .map(|entry| entry.expect("a directory entry").path())

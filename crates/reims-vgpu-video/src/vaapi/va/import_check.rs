@@ -875,9 +875,9 @@ mod tests {
     #[test]
     #[ignore = "needs a VA-API GPU: run on the VA-API host"]
     fn the_check_lends_no_way_a_decoder_shape_comes_out_wrong_through() {
-        use crate::core::runtime::StdRuntime;
+        use crate::vaapi::va::gated::GatedRuntime;
         let node = std::env::var("RVG_VAAPI_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
-        let display = Display::open(&node, std::sync::Arc::new(StdRuntime)).expect("a display");
+        let display = Display::open(&node, std::sync::Arc::new(GatedRuntime)).expect("a display");
         let writes = display.import_writes();
         let mut lent_wrong = Vec::new();
         for format in FORMATS {
@@ -972,10 +972,10 @@ mod tests {
         use super::super::surface::Rect;
         use super::super::wait::Deadline;
         use crate::core::backend::DeviceWrite;
-        use crate::core::runtime::StdRuntime;
+        use crate::vaapi::va::gated::GatedRuntime;
 
         let node = std::env::var("RVG_VAAPI_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
-        let display = Display::open(&node, Arc::new(StdRuntime)).expect("a display");
+        let display = Display::open(&node, Arc::new(GatedRuntime)).expect("a display");
         let mut failed = Vec::new();
         for format in FORMATS {
             let lent = display.writes_imports(format);

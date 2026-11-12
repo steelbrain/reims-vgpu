@@ -312,10 +312,9 @@ impl VideoEncoder {
 
 #[cfg(test)]
 mod tests {
-    use crate::core::runtime::StdRuntime;
-
     use super::*;
     use crate::codec::encode::Plane;
+    use crate::vaapi::va::gated::GatedRuntime;
 
     /// On the driver, 24 encoders made from one display one after another, each dropped before
     /// the next, the profiles the driver encodes in turn, code each of their 4 frames: a dropped
@@ -324,7 +323,7 @@ mod tests {
     #[ignore = "needs a VA-API GPU: run on the VA-API host"]
     fn encoders_made_one_after_another_from_one_display_code_every_frame() {
         let node = std::env::var("RVG_VAAPI_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
-        let display = Display::open(&node, Arc::new(StdRuntime)).expect("a VA display");
+        let display = Display::open(&node, Arc::new(GatedRuntime)).expect("a VA display");
         let profiles: Vec<encode::Profile> = (encoder_support(&display).into_iter())
             .map(|s| s.profile)
             .collect();

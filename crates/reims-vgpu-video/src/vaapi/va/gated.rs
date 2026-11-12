@@ -3,6 +3,13 @@
 //! registered by [`Runtime::arm_exit`], closes the gate and waits out the steps in progress, at
 //! most 2 s; a step after that is refused. One gate a process, so a test that closes it runs in
 //! a child process of its own.
+//!
+//! Every test of the hardware opens its display on it, as the host opens its own on its gate:
+//! the display's call thread and the work kept past its deadline (`super::wait`'s `keep`, whose
+//! thread lets a kept session go after the count a test waits on drops to 0) call the driver on
+//! threads of their own, and a test returns while they still may. With no gate the test's
+//! process then exits beside them: the driver's exit-time destructors, which `vaInitialize`
+//! registered, run while a thread is still in the driver.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
