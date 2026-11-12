@@ -153,12 +153,11 @@ impl Graphics {
 #[serde(rename_all = "kebab-case")]
 pub enum DiskController {
     /// A SATA disk on ICH9's AHCI controller, at [`Q35::disk_port`]: the disk of every VM
-    /// reims-ctl makes, whose settings name no controller. macOS 26's installer, as reims-ctl
-    /// downloads it, may find no disk on NVMe.
+    /// reims-ctl makes, whose settings name no controller.
     #[default]
     Ahci,
-    /// An NVMe controller of its own, for a VM with macOS installed: macOS finds its APFS
-    /// container on either controller.
+    /// An NVMe controller of its own, at slot 10. macOS's Recovery and installer find a new disk
+    /// on it as on SATA, and an installed macOS finds its APFS container on either controller.
     Nvme,
 }
 
@@ -360,8 +359,9 @@ pub struct Q35 {
     #[serde(default = "default_cpu_flags")]
     pub cpu_flags: String,
     /// The system disk's controller: SATA for every VM reims-ctl makes, which its settings may
-    /// move to NVMe once macOS is installed. OpenCore's saved boot entry names the controller
-    /// and the port, so after a move an attached installer may boot instead.
+    /// move to NVMe, before macOS is installed or after. OpenCore's saved boot entry names the
+    /// controller and the port, so after an installed VM's move an attached installer may boot
+    /// instead.
     #[serde(default, skip_serializing_if = "DiskController::is_ahci")]
     pub disk_controller: DiskController,
     /// The system disk's AHCI port, on [`DiskController::Ahci`]: 3, after OpenCore's 2.

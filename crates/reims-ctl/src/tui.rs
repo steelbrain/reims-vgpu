@@ -1635,9 +1635,9 @@ impl App {
                 "Disk controller",
                 options.to_vec(),
                 q.disk_controller.id(),
-                "SATA, which macOS's installers see, or NVMe, for macOS once installed: an \
-                 installer may find no disk on NVMe. macOS finds its disk on either; once it is \
-                 installed, eject the installer before a move, or OpenCore may start it instead.",
+                "SATA or NVMe: macOS's installers and macOS find the disk on either. Once macOS \
+                 is installed, eject the installer before a move, or OpenCore may start it \
+                 instead.",
             ));
             fields.push(
                 Field::path(
@@ -2490,8 +2490,8 @@ its own. A VM runs reims-vgpu's own GPU device unless its settings choose anothe
   K           kill it: power it off at once
   e           edit its settings: CPUs, memory, resolution, borderless, GPU, audio,
               network, logs, extra QEMU arguments (they apply at its next start), its disk
-              controller (SATA, or NVMe once macOS is installed), its installer image, its
-              boot selection (OpenCore's picker, which makes it a new OpenCore image) and
+              controller (SATA or NVMe), its installer image, its boot selection
+              (OpenCore's picker, which makes it a new OpenCore image) and
               graphics: reims-vgpu, its own GPU device, on one display in a window whose
               size the guest follows, with the macOS drivers reims-ctl puts in its OpenCore
               image (made again on a change); or QEMU's VMware SVGA, one display with no GPU

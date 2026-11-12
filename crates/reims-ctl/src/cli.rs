@@ -362,9 +362,8 @@ pub struct SetArgs {
     /// acceleration, in QEMU's own window
     #[arg(long)]
     pub graphics: Option<String>,
-    /// The system disk's controller: ahci (SATA), or nvme once macOS is installed (an installer
-    /// may find no disk on NVMe). Once it is installed, eject the installer before a
-    /// move, or OpenCore may start it
+    /// The system disk's controller: ahci (SATA) or nvme. Once macOS is installed, eject the
+    /// installer before a move, or OpenCore may start it
     #[arg(long)]
     pub disk_controller: Option<String>,
     /// The size reims-vgpu's window opens at, WIDTHxHEIGHT in the desktop's points

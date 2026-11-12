@@ -318,10 +318,10 @@ pub fn map_count_note(n: u64, memory_mib: u64) -> Option<String> {
 /// How to install macOS in an x86-64 VM that has an installer, for the CLI and the interface's
 /// details; None for other VMs. An offline installer, which reims-util names
 /// `…-offline-installer.img`, installs from its script; any other installer boots Recovery,
-/// whose Reinstall macOS installs it. For a disk on NVMe, they first say to move it to SATA
-/// ([`DiskController`]). An offline installer holds its release whole, so its steps say to
-/// install with the VM's network off, which keeps macOS's installer from downloading an update
-/// as it installs, and to turn the network back on afterwards.
+/// whose Reinstall macOS installs it. They name the disk to erase as Disk Utility names it on the
+/// disk's controller ([`DiskController`]). An offline installer holds its release whole, so its
+/// steps say to install with the VM's network off, which keeps macOS's installer from
+/// downloading an update as it installs, and to turn the network back on afterwards.
 pub fn install_steps(vm: &Vm) -> Option<String> {
     let q = vm.config.q35.as_ref()?;
     let installer = q.installer.as_ref()?;
@@ -334,13 +334,11 @@ pub fn install_steps(vm: &Vm) -> Option<String> {
         "pick Reinstall macOS"
     };
     let name = vm.name();
-    let first = match q.disk_controller {
-        DiskController::Ahci => String::new(),
-        DiskController::Nvme => format!(
-            "Its disk is on NVMe, where macOS's installer may find no disk: first move it to \
-             SATA (reims-ctl set {name} --disk-controller ahci, or Disk controller in its edit \
-             form). "
-        ),
+    // Disk Utility names a disk by its model and "Media": ide-hd's model is QEMU HARDDISK, and
+    // QEMU's NVMe controller's QEMU NVMe Ctrl.
+    let media = match q.disk_controller {
+        DiskController::Ahci => "QEMU HARDDISK Media",
+        DiskController::Nvme => "QEMU NVMe Ctrl Media",
     };
     let network_off = if offline && vm.config.network.enabled {
         format!(
@@ -358,10 +356,10 @@ pub fn install_steps(vm: &Vm) -> Option<String> {
         String::new()
     };
     Some(format!(
-        "{first}{network_off}To install macOS, start {name}: OpenCore boots its installer into \
-         macOS Recovery. If the VM's disk is new, open Disk Utility, erase it (QEMU HARDDISK \
-         Media) as APFS and quit Disk Utility. Then {last}. Once macOS is installed, eject the \
-         installer (reims-ctl eject {name}){network_on}."
+        "{network_off}To install macOS, start {name}: OpenCore boots its installer into macOS \
+         Recovery. If the VM's disk is new, open Disk Utility, erase it ({media}) as APFS and \
+         quit Disk Utility. Then {last}. Once macOS is installed, eject the installer \
+         (reims-ctl eject {name}){network_on}."
     ))
 }
 
@@ -1433,10 +1431,10 @@ mod tests {
         assert!(e.ends_with("a forced stop powers it off"), "{e}");
     }
 
-    /// An x86-64 VM with an installer has install steps, which for a disk on NVMe first say to
-    /// move it to SATA.
+    /// An x86-64 VM with an installer has install steps, which name the disk to erase as Disk
+    /// Utility names it on the disk's controller, and on NVMe install there as on SATA.
     #[test]
-    fn install_steps_move_a_disk_on_nvme_to_sata_first() {
+    fn install_steps_name_the_disk_on_its_controller() {
         let config = r#"
             name = "t"
             profile = "q35-x86_64"
@@ -1455,14 +1453,13 @@ mod tests {
         };
         let steps = install_steps(&vm).unwrap();
         assert!(steps.starts_with("To install macOS, start t:"), "{steps}");
+        assert!(steps.contains("erase it (QEMU HARDDISK Media) as APFS"), "{steps}");
         let q = vm.config.q35.as_mut().unwrap();
         q.disk_controller = DiskController::Nvme;
         let steps = install_steps(&vm).unwrap();
-        assert!(
-            steps.starts_with("Its disk is on NVMe")
-                && steps.contains("reims-ctl set t --disk-controller ahci"),
-            "{steps}"
-        );
+        assert!(steps.starts_with("To install macOS, start t:"), "{steps}");
+        assert!(steps.contains("erase it (QEMU NVMe Ctrl Media) as APFS"), "{steps}");
+        assert!(!steps.contains("--disk-controller"), "{steps}");
         vm.config.q35.as_mut().unwrap().installer = None;
         assert_eq!(install_steps(&vm), None);
     }
