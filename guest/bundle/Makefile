@@ -234,6 +234,10 @@ $(STITCH_CONSTANTS): tests/stitch_constants.metal Makefile
 		-o $(BUILD)/stitch_constants.air
 	xcrun -sdk macosx metallib $(BUILD)/stitch_constants.air -o $@
 
+# A committed .metallib of our own (tests/shaders), which the shell tests read at URLs of each form
+# as the device's newLibraryWithURL:error: reads them.
+LIBRARY_FILE = ../../tests/shaders/compute_add.metallib
+
 # The post-tessellation vertex functions of tests/patch.metal, for the shell tests' patch answers.
 PATCH_LIB = $(BUILD)/patch.metallib
 
@@ -373,7 +377,7 @@ test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(AIR_OLD_LIB) $(AIR_11_LIB) $(AI
 		RGFX_AIR_ARGUMENTS_11=$(AIR_11_LIB) RGFX_ORACLE_REFLECTION=$(ORACLE_REFLECTION_LIB) \
 		RGFX_COMMITTED_METALLIBS=$(COMMITTED_METALLIBS) arch -$(ARCH) $(AIR_TESTBIN)
 	RGFX_CI_KERNEL=$(CI_KERNEL) RGFX_STITCHABLE=$(STITCHABLE) RGFX_STITCH_CONSTANTS=$(STITCH_CONSTANTS) \
-		RGFX_AIR_ARGUMENTS=$(AIR_LIB) RGFX_AIR_ARGUMENTS_11=$(AIR_11_LIB) \
+		RGFX_AIR_ARGUMENTS=$(AIR_LIB) RGFX_AIR_ARGUMENTS_11=$(AIR_11_LIB) RGFX_LIBRARY_FILE=$(LIBRARY_FILE) \
 		RGFX_AIR_REFLECTED=$(AIR_REFLECTED) RGFX_ORACLE_REFLECTION=$(ORACLE_REFLECTION_LIB) \
 		RGFX_PATCH=$(PATCH_LIB) $(SHELL_TESTBIN)
 	arch -$(ARCH) $(INHERIT_TESTBIN) $(BUNDLEBIN)

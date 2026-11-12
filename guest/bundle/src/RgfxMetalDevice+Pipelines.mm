@@ -11,6 +11,7 @@
 #import "RgfxBlockCall.h"
 #import "RgfxComputePipelineState.h"
 #import "RgfxLibrary.h"
+#import "RgfxLibraryFile.h"
 #import "RgfxMetalError.h"
 #import "RgfxPipelineReflection.h"
 #import "RgfxRenderPipelineState.h"
@@ -370,23 +371,25 @@ bool fileIdentity(const char *path, RgfxFileIdentity &out)
 	return [super newLibraryWithDAG:dag functions:shadows error:error];
 }
 
-// A file's library is keyed by the file's identity where it is the same before and after the
-// read (rgfxLibraryKeyOfFile), so a framework's library loaded again is not hashed again.
+// The library of the file at the URL's path, whatever its scheme, as Metal reads it, with Metal's
+// errors for a file it cannot read (RgfxLibraryFile.h): Espresso names its kernels' libraries by
+// URLs of no scheme. A file's library is keyed by the file's identity where it is the same before
+// and after the read (rgfxLibraryKeyOfFile), so a framework's library loaded again is not hashed
+// again.
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(__autoreleasing NSError **)error
 {
-	const char *path = url.isFileURL ? url.fileSystemRepresentation : nullptr;
-	RgfxFileIdentity before = {}, after = {};
-	const bool identified = fileIdentity(path, before);
-	NSError *readError = nil;
-	NSData *data = url ? [NSData dataWithContentsOfURL:url options:NSDataReadingMappedIfSafe
-	                                             error:&readError]
-	                   : nil;
-	if (data == nil) {
+	if (url == nil) {
 		if (error)
-			*error = readError ?: RgfxMakeError(RgfxMetalErrorInvalidDescriptor,
-			                                    @"newLibraryWithURL: could not read URL");
+			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor, @"newLibraryWithURL: nil URL");
 		return nil;
 	}
+	NSString *filePath = RgfxLibraryFilePath(url);
+	const char *path = filePath.fileSystemRepresentation;
+	RgfxFileIdentity before = {}, after = {};
+	const bool identified = fileIdentity(path, before);
+	NSData *data = RgfxLibraryFileData(filePath, error);
+	if (data == nil)
+		return nil;
 	const bool same = identified && fileIdentity(path, after) && after == before &&
 	                  after.size == data.length;
 	id<MTLLibrary> lib = [self rgfxLibraryWithBytes:data.bytes

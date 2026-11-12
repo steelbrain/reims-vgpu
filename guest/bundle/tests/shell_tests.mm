@@ -45,6 +45,7 @@
 #import "RgfxFunction.h"
 #import "RgfxGLFunction.h"
 #import "RgfxLibrary.h"
+#import "RgfxLibraryFile.h"
 #import "RgfxMetalError.h"
 #import "RgfxPipelineReflection.h"
 #import "RgfxRenderPipelineState.h"
@@ -70,6 +71,9 @@
 #include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -4462,6 +4466,96 @@ void test_function_array_library_holds_the_functions()
 // through as Metal gave it, the public device's words and code (both x86 Macs: MTLLibraryErrorDomain
 // 1 "Invalid metal package", and 6 "failed to open MPSGraph package"), and nothing reaches the
 // maker or the ring.
+// A library file's URL, read as Metal's newLibraryWithURL:error: reads it (RgfxLibraryFile.h), over
+// a .metallib of our own (RGFX_LIBRARY_FILE): the file at the URL's path, whatever its scheme, a
+// URL of no scheme among them (as Espresso names its kernels' libraries), and Metal's errors for a
+// file it cannot read. Each form's answer is also this Mac's Metal's, which the x86 Macs give alike
+// (measured: macOS 26.7.1, the AMD 5300M and the Intel 630, and macOS 27.0.1, the M3 Max).
+void test_library_file_urls_as_metal()
+{
+	Fixture fx;
+	const char *given = getenv("RGFX_LIBRARY_FILE");
+	char resolved[PATH_MAX];
+	CHECK(given != nullptr && realpath(given, resolved) != nullptr);
+	if (given == nullptr || realpath(given, resolved) == nullptr)
+		return;
+	NSString *lib = @(resolved), *dir = lib.stringByDeletingLastPathComponent, *name = lib.lastPathComponent;
+	NSData *bytes = [NSData dataWithContentsOfFile:lib];
+	NSString *scratch = [NSTemporaryDirectory() stringByAppendingPathComponent:
+	                                                [NSString stringWithFormat:@"rgfx-library-file-%d", getpid()]];
+	NSFileManager *fm = [NSFileManager defaultManager];
+	NSString *spaced = [scratch stringByAppendingPathComponent:@"with space"];
+	CHECK([fm createDirectoryAtPath:spaced withIntermediateDirectories:YES attributes:nil error:nil]);
+	NSString *copy = [spaced stringByAppendingPathComponent:@"lib.metallib"];
+	NSString *empty = [scratch stringByAppendingPathComponent:@"empty.metallib"];
+	NSString *locked = [scratch stringByAppendingPathComponent:@"locked.metallib"];
+	CHECK([bytes writeToFile:copy atomically:NO] && [[NSData data] writeToFile:empty atomically:NO] &&
+	      [bytes writeToFile:locked atomically:NO] && chmod(locked.fileSystemRepresentation, 0) == 0);
+	char cwd[PATH_MAX];
+	CHECK(getcwd(cwd, sizeof cwd) != nullptr && chdir(dir.fileSystemRepresentation) == 0);
+	NSString *escaped = [copy stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLPathAllowedCharacterSet];
+	const struct {
+		const char *what;
+		NSURL *url;
+		bool reads;
+	} cases[] = {
+	    {"no scheme, absolute", [NSURL URLWithString:lib], true},
+	    {"a file URL", [NSURL fileURLWithPath:lib], true},
+	    {"relative to a file URL", [NSURL URLWithString:name relativeToURL:[NSURL fileURLWithPath:dir isDirectory:YES]], true},
+	    {"no scheme, relative to the current directory", [NSURL URLWithString:name], true},
+	    {"no scheme, escaped", [NSURL URLWithString:escaped], true},
+	    {"another scheme", [NSURL URLWithString:[@"rgfxtest://" stringByAppendingString:lib]], true},
+	    {"no scheme, missing", [NSURL URLWithString:[dir stringByAppendingPathComponent:@"no-such.metallib"]], false},
+	    {"no scheme, missing, relative", [NSURL URLWithString:@"no-such.metallib"], false},
+	    {"a file URL, missing", [NSURL fileURLWithPath:[dir stringByAppendingPathComponent:@"no-such.metallib"]], false},
+	    {"another scheme, missing", [NSURL URLWithString:@"rgfxtest:///no/such/lib.metallib"], false},
+	    {"of no path", [NSURL URLWithString:@"data:application/octet-stream;base64,AAAA"], false},
+	    {"a directory", [NSURL fileURLWithPath:dir isDirectory:YES], false},
+	    {"an empty file", [NSURL fileURLWithPath:empty], false},
+	    {"a file it may not open", [NSURL URLWithString:locked], false},
+	};
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	for (const auto &c : cases) {
+		NSError *err = nil;
+		NSData *read = RgfxLibraryFileData(RgfxLibraryFilePath(c.url), &err);
+		NSError *metalError = nil;
+		id<MTLLibrary> metals = [metal newLibraryWithURL:c.url error:&metalError];
+		const bool sameError = err == nil ? metalError == nil
+		                                  : metalError != nil && [err.domain isEqual:metalError.domain] &&
+		                                        err.code == metalError.code &&
+		                                        [err.localizedDescription isEqualToString:metalError.localizedDescription] &&
+		                                        [err.userInfo.allKeys isEqualToArray:metalError.userInfo.allKeys];
+		const bool same = (read != nil) == (metals != nil) && sameError;
+		if ((read != nil) != c.reads || !same)
+			fprintf(stderr, "shell_tests: a library file URL, %s (%s): read %d, error %s; Metal's library %d, error %s\n",
+			        c.what, c.url.absoluteString.UTF8String, read != nil, err.description.UTF8String, metals != nil,
+			        metalError.description.UTF8String);
+		CHECK((read != nil) == c.reads && same);
+		if (c.reads)
+			CHECK([read isEqualToData:bytes]);
+	}
+	// The bytes read from a URL of no scheme make the library, as the file's own do.
+	NSData *read = RgfxLibraryFileData(RgfxLibraryFilePath([NSURL URLWithString:lib]), nullptr);
+	uint32_t status = 0;
+	RgfxLibrary *made = [RgfxLibrary libraryWithData:read.bytes
+	                                          length:read.length
+	                                             key:nullptr
+	                                          device:nil
+	                                      serializer:&fx.ser
+	                                          status:&status];
+	CHECK(made != nil && [made.functionNames containsObject:@"add_one"]);
+	// A missing file of no scheme: MTLLibraryErrorDomain 6, as Espresso's absent libraries answer.
+	NSError *err = nil;
+	CHECK(RgfxLibraryFileData(RgfxLibraryFilePath([NSURL URLWithString:@"/no/such/dir/espresso.metallib"]), &err) ==
+	          nil &&
+	      [err.domain isEqualToString:MTLLibraryErrorDomain] && err.code == MTLLibraryErrorFileNotFound &&
+	      [err.localizedDescription isEqualToString:@"library not found"]);
+	CHECK(chdir(cwd) == 0);
+	chmod(locked.fileSystemRepresentation, 0644);
+	[fm removeItemAtPath:scratch error:nil];
+	drainRing(fx.ring);
+}
+
 void test_package_libraries_answer_metals_refusals()
 {
 	Fixture fx;
@@ -16878,6 +16972,7 @@ int main(int argc, char **argv)
 		test_libraries_over_equal_bytes_share_their_air_reads();
 		test_source_compiles_through_metals_frontend();
 		test_function_array_library_holds_the_functions();
+		test_library_file_urls_as_metal();
 		test_package_libraries_answer_metals_refusals();
 		test_stitched_libraries_in_archives();
 		test_function_members_from_shadow();
