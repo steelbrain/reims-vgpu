@@ -15,12 +15,12 @@
 
 namespace {
 
-// Whether `d`'s class answers the private mutability (MTLRasterizationRateMapDescriptor's SPI).
+// Whether `d` answers the private mutability (MTLRasterizationRateMapDescriptor's SPI): Metal's
+// descriptors are of its private subclass, MTLRasterizationRateMapDescriptorInternal, which
+// alone declares it (macOS 26.7.1 and 26.7.2, guest/bundle/tools/oracle/oracle_ratemap).
 bool answersMutability(MTLRasterizationRateMapDescriptor *d)
 {
-	static const bool answers =
-	    [MTLRasterizationRateMapDescriptor instancesRespondToSelector:@selector(mutability)];
-	return answers && [d respondsToSelector:@selector(mutability)];
+	return [d respondsToSelector:@selector(mutability)];
 }
 
 MTLSize sizeOf(uint64_t width, uint64_t height, uint64_t depth)

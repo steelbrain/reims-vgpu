@@ -12392,6 +12392,19 @@ void test_rasterization_rate_map()
 	std::memcpy(&create, device.asked.data(), sizeof(create));
 	CHECK(create.header.type == RGFX_CMD_RATE_MAP_CREATE && create.obj_id == [map rgfxObjId]);
 	CHECK(create.layer_count == 1 && create.screen_width == 256 && create.screen_height == 128);
+	// The descriptor's private mutability, which Metal's descriptor (of its private subclass)
+	// answers, Immutable until set.
+	CHECK((create.flags & RGFX_RATE_MAP_MUTABILITY_SET) != 0 && create.mutability == 2);
+	MTLRasterizationRateMapDescriptor *mutableOne = rateMapDescriptor();
+	CHECK([mutableOne respondsToSelector:@selector(setMutability:)]);
+	((void (*)(id, SEL, NSUInteger))objc_msgSend)(mutableOne, @selector(setMutability:),
+	                                             (NSUInteger)MTLMutabilityMutable);
+	// Held to the end: its release posts its destroy on the ring.
+	RgfxRasterizationRateMap *mutableMap =
+	    [RgfxRasterizationRateMap rateMapWithDescriptor:mutableOne device:nil serializer:&fx.ser];
+	CHECK(mutableMap != nil);
+	std::memcpy(&create, device.asked.data(), sizeof(create));
+	CHECK((create.flags & RGFX_RATE_MAP_MUTABILITY_SET) != 0 && create.mutability == 1);
 	CHECK(map.screenSize.width == 256 && map.screenSize.height == 128 && map.screenSize.depth == 0);
 	CHECK(map.physicalGranularity.width == 32 && map.physicalGranularity.depth == 1);
 	CHECK(map.layerCount == 1 && map.parameterBufferSizeAndAlign.size == 24624);
@@ -12433,6 +12446,7 @@ void test_rasterization_rate_map()
 	                                               device:nil
 	                                           serializer:&fx.ser] == nil);
 	CHECK(ringEmpty(fx.ring));
+	CHECK([mutableMap rgfxObjId] != 0);
 	} // @autoreleasepool
 }
 
