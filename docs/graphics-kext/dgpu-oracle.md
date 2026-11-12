@@ -1549,6 +1549,78 @@ into a Private buffer, and where the M3's map does and the AMD's answers nothing
 give: a coordinate map of a map of no layers or of an empty screen, and the physical-to-screen
 map of a `Mutable` map not yet reset.
 
+## Q29: function pointers
+
+Probe: `oracle_fnptr DEVICE`, 11-12 (m3-max-21084 the AMD, m3-max-21086 the Intel, with
+`ORACLE_FNPTR_NO_RENDER`): three compute pipelines linking `fp_add1`, `fp_mul2` and `fp_neg` of
+one library, their handles, visible function tables of 0 to 4096 entries, dispatches calling
+through a table bound at a buffer index, a range, and an argument buffer, and a render
+pipeline's handles and tables.
+
+| asked | AMD | Intel |
+|---|---|---|
+| `supportsFunctionPointers`, `supportsFunctionPointersFromRender` | YES, NO | YES, NO |
+| a handle of a linked function | its name and type 5; `gpuResourceID` raises an unrecognized selector | the same |
+| a handle of an unlinked function, of the kernel | nil, nil | nil, nil |
+| `functionHandleWithName:` | raises an unrecognized selector | the same |
+| a table's `gpuResourceID` | 1 for each, 3 for another pipeline's | 1 to 9, one each |
+| a table's `allocatedSize` for 0, 1, 3, 2016, 2017 and 4096 entries | 4096, 4096, 4096, 16384, 16384, 36864 | 4096, 4096, 4096, 16384, 20480, 36864 |
+| a table's `resourceOptions`, storage mode, `isAliasable` | 528, Managed, NO | 512, Shared, YES |
+| `setPurgeableState:` Volatile, then asked | 2, then 3 | 2, then 2 |
+| dispatches through a table set before and after encoding, bound alone or in a range | each entry's function: 11 22 13 26 15 16, 20 12 13 26 | the same |
+| an argument encoder of a table, its length, alignment and bytes | 8, 8, the table's id | 8, 32, the table's id |
+| a dispatch reading a table through an argument buffer without `useResource:` | the command buffer times out (status 5) | not run |
+| the same with `useResource:` | 20 12 24 14 28 30 | the same |
+| a render pipeline's handle | not measured (the AMD's compiler service failed the pipeline) | ends the process: Metal's base asserts "Driver needs to override this" |
+
+What our stack does (m3-max-21123, a macOS 26.7.2 guest on an Iris Xe, and m3-max-21327 on a
+Radeon 780M): every compute answer above as the two Macs give it, but the tables'
+`allocatedSize` and `resourceOptions`, which are the host's table's (256 bytes and 8 an entry,
+past 16 KiB rounded up to a multiple of it: 256, 264, 280, 16384, 32768 and 49152 for the counts
+above; and 512, Shared), and their `isAliasable`, NO. A render pipeline's handles and tables are
+nil, with Metal's unsupported error, as `supportsFunctionPointersFromRender` answers NO. A table
+read through an argument buffer without `useResource:` is read, where the AMD's command buffer
+times out: inside the envelope, as no Mac's correct use depends on it.
+
+## Q30: dynamic libraries
+
+Probe: `oracle_fnptr DEVICE`, 11-12 (m3-max-21413 the AMD, m3-max-21414 the Intel, with
+`ORACLE_FNPTR_NO_RENDER`): a dynamic library (`metal -dynamiclib`, install name
+`@executable_path/liboracle_fnptr_dyn.metallib`, exporting `fpd_triple`) made of its library and
+read from its file; a kernel linked against it (`-l`) whose library is read from its file, or made
+of the same bytes with `newLibraryWithData:`, its pipeline preloaded with the dynamic library or
+bare; a kernel linked against a library whose install name names no file; a compile of source with
+the dynamic library in `MTLCompileOptions.libraries`, through a proxy that keeps the messages sent
+to it; and the refusals.
+
+| asked | AMD | Intel |
+|---|---|---|
+| `supportsDynamicLibraries`, `supportsRenderDynamicLibraries` | YES, NO | YES, NO |
+| a dynamic library of the library, of its file | `_MTLDynamicLibrary`, its install name, label nil until set | the same |
+| the linked kernel of the file: preloaded, by install name alone | made, 30 33 36 39; made, 30 33 36 39 | the same |
+| the same bytes of no file: bare, preloaded | CompilerError 2, "Error creating compute variant"; the same | CompilerError 2; made, 30 33 36 39 |
+| a kernel whose install name names no file: bare, preloaded | CompilerError 2; CompilerError 2 | CompilerError 2; made, 30 33 36 39 |
+| the compile of source | made; it sends the dynamic library `airData` alone | the same |
+| that kernel: bare, preloaded | CompilerError 2; CompilerError 2 | CompilerError 2; made, 60 63 66 69 |
+| `airData`, asked twice | the file's 3,364 bytes, a new `dispatch_data_t` at each call that the caller owns (one reference past its pool) | the same |
+| `newDynamicLibrary:` of an executable library, `newDynamicLibraryWithURL:` of its file | MTLBinaryArchiveDomain 5, "Expected a library with type MTLLibraryTypeDynamic, found invalid type: null" | the same |
+| `newDynamicLibraryWithURL:` of a missing file | NSCocoaErrorDomain 260 | the same |
+| `serializeToURL:` a new file; a file in a missing directory | YES, 10,080 bytes, read back as the same library; NO, MTLDynamicLibraryDomain 1, "Invalid URL", no file | YES, 24,480 bytes; the same |
+
+So both Macs load the install names of a library read from a file, and of no other: the same
+bytes made into a library, or a compile of source whose library records the same name, link
+nothing by it *(class 3, of the two x86 Macs; the M3 is not measured)*. A preloaded library links
+a kernel on the Intel, and on the AMD only where its install name loads it from a file anyway
+*(class 2)*.
+
+What our stack does (m3-max-21422 on a Radeon 780M and m3-max-21423 on an Iris Xe, macOS 26.7.2
+guests): every answer above as the AMD gives it, but `serializeToURL:`, which writes the library's
+.metallib (3,364 bytes, the offline `metal -dynamiclib` output's bytes, which both Macs read back),
+and `airData`, which answers the same object at each call, with a reference for the caller. A
+preloaded library links only where an install name loads it, as on the AMD, so a kernel links
+only what its install names load from files: the bundle reads each file an install name names in
+the guest's process and sends its library to the host under that name.
+
 ## Not measured
 
 - Cross-process lock waits for pending GPU work: rgk-lock's `lock_probe` (x86 matches the M3,
