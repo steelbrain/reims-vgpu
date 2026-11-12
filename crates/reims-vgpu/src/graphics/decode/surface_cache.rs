@@ -3241,9 +3241,10 @@ impl CacheMaker {
     /// A new cache's buffer of `length` bytes, Private: where `layout` gives the surface's
     /// planes and they are two, as the host's video's output (NV12, P010) has, exportable where
     /// the host's video imports caches ([`Caches::set_exportable`]) and the platform makes one;
-    /// else, where the kext's ask gave them (`asked`) and they are two and the host's video
-    /// decodes into caches ([`Caches::set_dma_buf`]), one whose memory is also a dma-buf, laid as
-    /// the next is, where the platform makes one; else, where `layout` is given (the kext's ask,
+    /// else, where they are two and the host's video decodes into caches
+    /// ([`Caches::set_dma_buf`]), whether the kext's ask gave them or a GPU of its own memory's
+    /// block carried them, one whose memory is also a dma-buf, laid as the next is, where the
+    /// platform makes one; else, where `layout` is given (the kext's ask,
     /// or on a GPU of its own memory a cached or deferred block's own `SURFACE_PAGES`, gave the
     /// surface's planes, so the cache's copies into the pages take its texels alone:
     /// [`SurfaceCache::texels`]), one that declares the bytes between a texture's rows
@@ -3261,14 +3262,13 @@ impl CacheMaker {
         device: &P::Device,
         length: u64,
         layout: Option<&[PagesPlane]>,
-        asked: bool,
     ) -> RaiseResult<NewCache<P>> {
         let repitched = layout.and_then(|planes| {
             Repitched::of(planes, |row_bytes, rows| {
                 device.linear_rows_pitch(row_bytes, rows)
             })
         });
-        let made = self.make_laid::<P>(device, length, layout, asked, repitched.as_ref())?;
+        let made = self.make_laid::<P>(device, length, layout, repitched.as_ref())?;
         Ok(NewCache {
             repitched: made
                 .made
@@ -3288,7 +3288,6 @@ impl CacheMaker {
         device: &P::Device,
         length: u64,
         layout: Option<&[PagesPlane]>,
-        asked: bool,
         repitched: Option<&Repitched>,
     ) -> RaiseResult<NewCache<P>> {
         let aligned = match repitched {
@@ -3311,7 +3310,7 @@ impl CacheMaker {
             counts.unexportable = true;
         }
         #[cfg(unix)]
-        if self.dma_buf && asked && two_planes {
+        if self.dma_buf && two_planes {
             let made = device.new_dma_buf_buffer_of_length_padding_unobserved(
                 ON,
                 length,
@@ -4204,9 +4203,8 @@ impl<P: Platform> Caches<P> {
         }
         let maker = state.maker();
         drop(state);
-        let asked = layout.asked();
         let layout = layout.into_planes();
-        let made = maker.make::<P>(device, length, layout.as_deref(), asked);
+        let made = maker.make::<P>(device, length, layout.as_deref());
         let made = made.and_then(|cache| {
             let pages = match cache.made.is_some() {
                 true => pages()?,
@@ -4247,10 +4245,8 @@ impl<P: Platform> Caches<P> {
             let state = self.state.lock();
             (state.deferred_room(block), state.maker())
         };
-        let asked = layout.asked();
         let layout = layout.into_planes();
-        let mut made =
-            (length <= room).then(|| maker.make::<P>(device, length, layout.as_deref(), asked));
+        let mut made = (length <= room).then(|| maker.make::<P>(device, length, layout.as_deref()));
         let mut state = self.state.lock();
         self.wait_copies(&mut state, block);
         let taken = state.make_deferred(
@@ -4468,11 +4464,6 @@ pub(crate) enum CacheLayout {
 }
 
 impl CacheLayout {
-    /// The kext's ask gave the layout.
-    fn asked(&self) -> bool {
-        matches!(self, CacheLayout::Asked(_))
-    }
-
     /// The surface's planes, where a layout gave them.
     fn into_planes(self) -> Option<Vec<PagesPlane>> {
         match self {
@@ -7802,6 +7793,78 @@ mod tests {
             made(Some(two_planes(2))),
             (1, true),
             "P010: exportable, given"
+        );
+        assert_eq!(
+            made(Some(one_plane(1024, 960, 16))),
+            (0, false),
+            "one plane: as any other cache, none"
+        );
+        assert_eq!(
+            made(None),
+            (0, false),
+            "no layout: as any other cache, none"
+        );
+    }
+
+    /// Where the host's video decodes into caches (VA-API) on a GPU of its own memory, where the
+    /// kext caches the blocks and a cached block's pages carry its surface's layout, the cache of
+    /// a surface whose layout gives two planes, as the video's NV12 and P010 output has, is made
+    /// a dma-buf and gives the video its identity, as an asked layout's is on a GPU that shares
+    /// the CPU's memory; a cache of a surface of one plane, or of one whose pages carry no
+    /// layout, is made as any other cache and gives none
+    #[cfg(unix)]
+    #[test]
+    fn a_carried_two_plane_layouts_cache_is_made_a_dma_buf_for_the_hosts_video() {
+        use super::super::surface_pages::tests::one_plane;
+        use reims_vgpu_graphics::wire::RgfxSurfacePlaneLayout;
+        use reims_vgpu_vulkan::core::testkit::impls::device::DMA_BUF_BUFFER;
+        // Two planes as CoreVideo lays them from 0x20: `sample` bytes a texel, the chroma
+        // plane's rows after the luma's, interleaved and half as many.
+        let two_planes = |sample: u64| {
+            let mut layout = RgfxSurfacePagesLayout {
+                plane_count: 2,
+                ..Default::default()
+            };
+            layout.planes[0] = RgfxSurfacePlaneLayout {
+                offset: 0x20,
+                bytes_per_row: 256 * sample,
+                row_bytes: 240 * sample,
+                rows: 16,
+            };
+            layout.planes[1] = RgfxSurfacePlaneLayout {
+                offset: 0x20 + 16 * 256 * sample,
+                bytes_per_row: 256 * sample,
+                row_bytes: 240 * sample,
+                rows: 8,
+            };
+            layout
+        };
+        // How many dma-buf buffers a cached block's pages made, and whether its cache gives
+        // its identity.
+        let made = |layout: Option<RgfxSurfacePagesLayout>| {
+            let mut r = rig(16);
+            let page = r.page;
+            r.dec.set_dma_buf_caches();
+            let mark = r.p.call_log().mark();
+            let flags = RGFX_SURFACE_PAGES_CACHED;
+            assert_eq!(
+                r.pages_laid_out(BLOCK, 0, &[(1, 4)], 4 * page, flags, layout),
+                RGFX_STATUS_OK
+            );
+            let sels = r.p.call_log().sels_since(mark);
+            let dma_bufs = sels.iter().filter(|&&sel| sel == DMA_BUF_BUFFER).count();
+            assert_eq!(r.dec.caches().len(), 1);
+            (dma_bufs, r.dec.caches().identity(BLOCK).is_some())
+        };
+        assert_eq!(
+            made(Some(two_planes(1))),
+            (1, true),
+            "NV12: a dma-buf, given"
+        );
+        assert_eq!(
+            made(Some(two_planes(2))),
+            (1, true),
+            "P010: a dma-buf, given"
         );
         assert_eq!(
             made(Some(one_plane(1024, 960, 16))),
