@@ -168,7 +168,8 @@ x86.
 
 ## Q2: Managed storage
 
-Probe: `oracle_storage DEVICE mbuf 4096|67108864` and `mtex`.
+Probe: `oracle_storage DEVICE mbuf 4096|67108864`, `mtex` and `capture` (11-12, m3-max-22553 on
+the AMD, 22554 on the Intel; not run on the M3).
 
 | | AMD | Intel 630 and M3 |
 |---|---|---|
@@ -177,6 +178,8 @@ Probe: `oracle_storage DEVICE mbuf 4096|67108864` and `mtex`.
 | buffer: GPU write pending (no sync), then CPU [0,256) + `didModifyRange:` of it | only [0,256) uploaded; the GPU's bytes stay elsewhere | (one copy) |
 | buffer: GPU write without `synchronizeResource:` (completion, 200 ms) | never seen by the CPU | seen at once |
 | buffer: `didModifyRange:` after the reading command buffer was encoded, before its commit | seen: the upload happens at commit | seen |
+| buffer: CPU bytes written again after `didModifyRange:`, before the commit (`capture`) | seen, the command buffer encoded before the write or after it | seen |
+| buffer: CPU bytes written again after the commit, 30 ms in, while the command buffer's first kernel holds the GPU (1.27 s on AMD, 637 ms on Intel) | not seen: the kernel reads the bytes of the commit | seen |
 | texture: GPU write without `synchronizeTexture:`, then `getBytes:` | old bytes, also 200 ms later | new |
 | texture: unsynchronized GPU write, then `replaceRegion:` of a 16 x 1 corner | the whole CPU copy is uploaded: the GPU's write is lost outside the corner | corner new, GPU's write kept |
 
