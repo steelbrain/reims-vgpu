@@ -83,7 +83,9 @@
 //   add-freed             an allocation added and committed, then freed (where the set does not
 //                         hold it), then a commit and the set's answers
 //   queue-add-nil, queue-remove-nil, queue-adds-nil, queue-add-foreign (an NSObject adopting
-//   MTLResidencySet), cb-use-nil, cb-uses-nil, cb-use-foreign, cb-use-after-commit
+//   MTLResidencySet), cb-use-nil, cb-uses-nil, cb-use-foreign, cb-use-after-commit,
+//   cb-use-internal and cb-use-internal-nil (the command buffer's useInternalResidencySet: of a
+//   set and of nil, where it answers it)
 // Build: see README.md.
 #import "oracle_common.h"
 #import <QuartzCore/QuartzCore.h>
@@ -990,6 +992,19 @@ static int bad_input(const char *name)
 		  id f = [[OracleForeignSet alloc] init];
 		  [cb useResidencySet:f];
 		});
+	} else if (!strcmp(name, "cb-use-internal") || !strcmp(name, "cb-use-internal-nil")) {
+		const BOOL none = !strcmp(name, "cb-use-internal-nil");
+		char what[64];
+		snprintf(what, sizeof(what), "%s run", name);
+		run_fill(what, none ? 0x5b : 0x5a, ^(id<MTLCommandBuffer> cb) {
+		  SEL internal = sel_registerName("useInternalResidencySet:");
+		  if (![(id)cb respondsToSelector:internal]) {
+			  printf("%s => not answered\n", name);
+			  return;
+		  }
+		  ((void (*)(id, SEL, id))objc_msgSend)(cb, internal, none ? nil : s);
+		  printf("%s => done\n", name);
+		});
 	} else if (!strcmp(name, "cb-use-after-commit")) {
 		id<MTLCommandBuffer> cb = [g_queue commandBuffer];
 		[cb commit];
@@ -1167,7 +1182,8 @@ int main(int argc, char **argv)
 		                       "removes-nil",    "add-foreign",      "add-freed",
 		                       "queue-add-nil",  "queue-remove-nil", "queue-adds-nil",
 		                       "queue-add-foreign", "cb-use-nil",    "cb-uses-nil",
-		                       "cb-use-foreign", "cb-use-after-commit"};
+		                       "cb-use-foreign", "cb-use-after-commit",
+		                       "cb-use-internal", "cb-use-internal-nil"};
 		for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
 			const char *name = cases[k];
 			int fds[2];
