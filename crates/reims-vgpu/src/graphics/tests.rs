@@ -3841,16 +3841,17 @@ fn a_close_during_a_walk_is_answered_after_the_buffer() {
     assert!(gate.reached(), "the walk did not start");
     guest.send(&device, context_close(2));
     let close = guest.seqno;
-    let commits = platform.call_log().count("commit");
+    let held = platform.world().committed().len();
     gate.open();
-    eventually(|| platform.call_log().count("commit") > commits);
-    assert!(
-        platform.call_log().count("commit") > commits,
-        "not committed"
-    );
+    // The fake logs a commit before it holds the buffer as committed: wait for the buffer itself.
+    committed(&platform, held + 1);
     // The buffer's completion is its ended queue's, which posts nothing more; the close is
     // answered once its completion handler has run.
-    platform.world().complete_all(CompleteOn::Caller);
+    assert_eq!(
+        platform.world().complete_all(CompleteOn::Caller),
+        held + 1,
+        "the walked buffer completes"
+    );
     let bytes = guest.event().expect("the close's COMPLETE");
     let complete = RgfxComplete::read_from_bytes(&bytes).unwrap();
     assert_eq!(
@@ -3895,10 +3896,15 @@ fn a_close_during_a_walk_holds_up_nothing_on_ring_0() {
         1,
         "the close was not carried out: only context 3's sampler is left"
     );
-    let commits = platform.call_log().count("commit");
+    let held = platform.world().committed().len();
     gate.open();
-    eventually(|| platform.call_log().count("commit") > commits);
-    platform.world().complete_all(CompleteOn::Caller);
+    // The fake logs a commit before it holds the buffer as committed: wait for the buffer itself.
+    committed(&platform, held + 1);
+    assert_eq!(
+        platform.world().complete_all(CompleteOn::Caller),
+        held + 1,
+        "the walked buffer completes"
+    );
     let bytes = guest.event().expect("the close's COMPLETE");
     let complete = RgfxComplete::read_from_bytes(&bytes).unwrap();
     assert_eq!(complete.status, RGFX_STATUS_OK);
@@ -3930,6 +3936,7 @@ fn a_reset_during_a_walk_comes_after_it() {
     ring.send(&device, sampler_command_buffer(obj(1, 1), 100, obj(1, 4)));
     assert!(gate.reached(), "the walk did not start");
     let commits = platform.call_log().count("commit");
+    let held = platform.world().committed().len();
     device.reset();
     // The decoder's reset, on the control thread, waits for the walk.
     std::thread::sleep(Duration::from_millis(100));
@@ -3945,7 +3952,14 @@ fn a_reset_during_a_walk_comes_after_it() {
         platform.call_log().count("commit") > commits,
         "the walk was not committed before the reset"
     );
-    platform.world().complete_all(CompleteOn::Caller);
+    // The fake logs a commit before it holds the buffer as committed: wait for the buffer itself,
+    // so that its completion runs before the ring is read.
+    committed(&platform, held + 1);
+    assert_eq!(
+        platform.world().complete_all(CompleteOn::Caller),
+        held + 1,
+        "the walked buffer completes"
+    );
     assert!(!ring.has_event(), "the buffer posted after the reset");
 }
 
