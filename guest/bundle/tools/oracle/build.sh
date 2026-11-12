@@ -8,7 +8,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 out=${1:-/tmp/rgk-oracle/x86}
 arch=${2:-x86_64}
 mkdir -p "$out"
-for p in oracle_iosurface oracle_storage oracle_passes oracle_cmdbuf oracle_caps oracle_errors oracle_source oracle_ycbcr oracle_ca_ycbcr oracle_sampler oracle_icb oracle_order oracle_names oracle_surftex oracle_texdesc oracle_nilbind oracle_reflection oracle_mesh oracle_spi_members oracle_complete oracle_urls oracle_rows oracle_ratemap; do
+for p in oracle_iosurface oracle_storage oracle_passes oracle_cmdbuf oracle_caps oracle_errors oracle_source oracle_ycbcr oracle_ca_ycbcr oracle_sampler oracle_icb oracle_order oracle_names oracle_surftex oracle_texdesc oracle_nilbind oracle_reflection oracle_mesh oracle_spi_members oracle_complete oracle_urls oracle_rows oracle_ratemap oracle_fnptr; do
 	xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall \
 		-framework Metal -framework IOSurface -framework CoreVideo -framework QuartzCore \
 		-framework VideoToolbox -framework CoreGraphics -framework Foundation \
@@ -25,7 +25,23 @@ xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 -c "$here/oracle
 xcrun -sdk macosx metallib "$air" -o "$out/oracle_nilbind.metallib"
 xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 -c "$here/oracle_ratemap.metal" -o "$air"
 xcrun -sdk macosx metallib "$air" -o "$out/oracle_ratemap.metallib"
+xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 -c "$here/oracle_fnptr.metal" -o "$air"
+xcrun -sdk macosx metallib "$air" -o "$out/oracle_fnptr.metallib"
 rm -f "$air"
+# oracle_fnptr's dynamic library, and its kernel linked against it.
+xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 -dynamiclib \
+	-install_name @executable_path/liboracle_fnptr_dyn.metallib "$here/oracle_fnptr_dyn.metal" \
+	-o "$out/liboracle_fnptr_dyn.metallib"
+xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 "$here/oracle_fnptr_link.metal" \
+	-L "$out" -loracle_fnptr_dyn -o "$out/oracle_fnptr_link.metallib"
+# The same kernel linked against a library of an install name that names no file.
+gone=$(mktemp -d)
+xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 -dynamiclib \
+	-install_name @executable_path/liboracle_fnptr_gone.metallib "$here/oracle_fnptr_dyn.metal" \
+	-o "$gone/liboracle_fnptr_gone.metallib"
+xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 "$here/oracle_fnptr_link.metal" \
+	-L "$gone" -loracle_fnptr_gone -o "$out/oracle_fnptr_link_missing.metallib"
+rm -r "$gone"
 # oracle_bundle and its libraries; a library this toolchain does not build is left out, and its
 # case says so.
 xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal \
