@@ -914,16 +914,11 @@ mod tests {
             } else {
                 event.set_signaled_value(4).unwrap();
             }
-            let mut finished = false;
-            for _ in 0..2000 {
+            let finished = crate::graphics::tests::eventually(|| {
                 p.virtual_clock()
                     .advance(Duration::from_millis(CPU_WAIT_SLICE_MS));
-                if waiting.is_finished() {
-                    finished = true;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
+                waiting.is_finished()
+            });
             assert!(finished, "the wait did not end (reset {reset})");
             let dec = waiting.join().unwrap();
             assert!(dec.order_waits.borrow().is_empty());
