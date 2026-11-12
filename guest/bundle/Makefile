@@ -46,6 +46,8 @@
 #   make upload-probe
 #                   what the CPU's uploads into Managed resources cost at WindowServer's shapes
 #                   (tools/upload_probe.m), build/upload_probe-x86_64; ARCH=arm64 likewise.
+#   make icb-probe  what the CPU's encodes into indirect command buffers and its writes into
+#                   IOSurfaces cost (tools/icb_probe.m), build/icb_probe-x86_64; ARCH=arm64 likewise.
 #   make reflection-check
 #                   the stitchable functions' reflection the bundle builds against Metal's own,
 #                   build/reflection_check-x86_64 (ARCH=arm64 likewise) over
@@ -558,6 +560,18 @@ $(UPLOADBIN): tools/upload_probe.m Makefile
 		-Wall -Wextra -Werror -Wno-unused-parameter tools/upload_probe.m -framework Foundation \
 		-framework Metal -o $@
 
+# --- the CPU's encodes into indirect command buffers and writes into IOSurfaces (tools/icb_probe.m
+# says what each case measures). One binary for ARCH, run on a real device, never in `make test`.
+ICBBIN = $(BUILD)/icb_probe-$(ARCH)
+
+icb-probe: $(ICBBIN)
+
+$(ICBBIN): tools/icb_probe.m Makefile
+	@mkdir -p $(@D)
+	xcrun clang -arch $(ARCH) -isysroot $(SDK) -mmacosx-version-min=14.0 -fobjc-arc -O2 \
+		-Wall -Wextra -Werror -Wno-unused-parameter tools/icb_probe.m -framework Foundation \
+		-framework Metal -framework IOSurface -o $@
+
 # --- the shader and pipeline costs (tools/pipelines; pipelines.m says what each case measures) --
 # One binary for ARCH (x86_64, a guest's or an Intel Mac's; ARCH=arm64 for an Apple-silicon Mac),
 # run on a real device, never in `make test`. Its source compiles in (pipelines_source.h, from
@@ -625,6 +639,6 @@ $(PIPEREFLECTBIN): tools/pipeline_reflection_check.mm tools/oracle/oracle_walk.h
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all test bundle package sweep bench pipelines res submit-probe upload-probe reflection-check \
+.PHONY: all test bundle package sweep bench pipelines res submit-probe upload-probe icb-probe reflection-check \
 	pipeline-reflection-check peer-test peer-test-build clean
 
