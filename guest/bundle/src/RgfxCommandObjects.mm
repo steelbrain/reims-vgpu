@@ -5464,8 +5464,12 @@ RGFX_LOG_UNRECOGNIZED
 {
 	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
-	if (rgfxPutBytes(_uploads.get(), _uploadCursor, bytes, length, &buffer, &offset))
-		[self setBuffer:buffer offset:offset atIndex:index];
+	if (rgfxPutBytes(_uploads.get(), _uploadCursor, bytes, length, &buffer, &offset)) {
+		RgfxComputeBufferBinding e = {};
+		e.buffer_obj_id = rgfxBinds(_enc, buffer);
+		e.offset = offset;
+		_enc->computeSetBuffers(index, &e, 1);
+	}
 }
 - (void)setBytes:(const void *)bytes
              length:(NSUInteger)length
