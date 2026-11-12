@@ -271,7 +271,8 @@ pub(crate) fn take_answering_device() -> Option<rt::Device> {
 /// a display's window presents through Vulkan (on Linux, [`crate::os::add_window_extensions`]), the
 /// shader cache in
 /// `~/.cache/reims-vgpu-vulkan` ([`SHADER_CACHE`]; the runtime's default directory when `HOME` is
-/// not set), which every process shares, holding [`SHADER_CACHE_CAPACITY`], each pipeline state's
+/// not set; a test build's own beside it), which every process shares, holding
+/// [`SHADER_CACHE_CAPACITY`], each pipeline state's
 /// record kept in the file beside it for later processes' warm passes ([`crate::records`]; none
 /// in a test build), a command buffer's
 /// GPU times answered from the host's clock (`gpu_times_from_host`), the runtime's device policy,
@@ -488,7 +489,7 @@ fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
 /// holds the runtime's translations of the guest's functions and each pipeline's driver record
 /// (MoltenVK's included: about 1.7 MB for a macOS 26 guest's `Xgc` pipeline
 /// on NVIDIA), within [`SHADER_CACHE_CAPACITY`], the least recently used going first.
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "testkit")))]
 const SHADER_CACHE: &str = ".cache/reims-vgpu-vulkan";
 
 /// The most bytes [`SHADER_CACHE`] holds: the runtime's default, 25 GiB (a test keeps it so). A
@@ -498,18 +499,20 @@ const SHADER_CACHE: &str = ".cache/reims-vgpu-vulkan";
 /// hold the pipeline too. An entry this cache drops past its capacity is compiled again at the
 /// next boot that draws with it, unless the driver's cache still holds it: a freeze of 13 to 26 s
 /// there.
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "testkit")))]
 const SHADER_CACHE_CAPACITY: u64 = rt::DEFAULT_CAPACITY;
 
-/// The unit tests' capacity, 1 GiB: their directory holds what the tests compile and nothing a
+/// A test build's capacity, 1 GiB: its directory holds what the tests compile and nothing a
 /// guest's boot reuses, so it is kept small on disk.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 const SHADER_CACHE_CAPACITY: u64 = 1 << 30;
 
-/// The unit tests' shader cache directory under `HOME`, their own: a test of what a device
-/// compiles runs on an empty one as on a full one, and the tests write nothing into the one the
-/// library's hosts share.
-#[cfg(test)]
+/// A test build's shader cache directory under `HOME`, the tests' own: this crate's unit tests',
+/// and every crate's tests', which turn on its `testkit` feature (only dev-dependencies do, `cargo
+/// xtask testkit`). A test of what a device compiles runs on an empty one as on a full one, and
+/// the tests write nothing into the one the library's hosts share, nor read the device checks
+/// kept there.
+#[cfg(any(test, feature = "testkit"))]
 const SHADER_CACHE: &str = ".cache/reims-vgpu-vulkan-tests";
 
 /// The library's cache directory, [`SHADER_CACHE`] under `HOME`: the shader cache's, whose sweep
