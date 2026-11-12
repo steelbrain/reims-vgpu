@@ -503,8 +503,8 @@ pub(crate) fn learn_view_imports(device: &rt::Device) {
         learn_folds(device);
         budget::warn_if_imports_short();
     }
-    // Either way the device copies by runs of the guest's RAM: one whose views are mapped from
-    // their files takes objects over the RAM too (`super::host_ram`).
+    // Either way the device copies by runs of the guest's RAM, and binds objects over it in the
+    // RAM's chunks it imported (`super::host_ram`).
     super::host_ram::hand_ram_to(device);
 }
 
@@ -1165,12 +1165,11 @@ unsafe fn host_memory_noting(
     // SAFETY: the caller's.
     let memory =
         unsafe { rt::HostMemory::with_dma_buf(at, source) }.with_import_gate(Arc::clone(&GATE));
-    // Where the devices take the guest's RAM whole (`super::host_ram`), the runs of it the pages
-    // are, which the runtime asks of the import's window.
-    match imports_need_files() {
-        true => memory.with_runs(Arc::clone(&RUNS)),
-        false => memory,
-    }
+    // The runs of the guest's RAM the pages are (`super::host_ram`), which the runtime asks of the
+    // import's window, on every device: where the device imports the RAM's chunks for its objects,
+    // the object lies in its chunk; where it lists its imports in every submission, in a chunk a
+    // copy imported, and else in an import of its own, as with no runs.
+    memory.with_runs(Arc::clone(&RUNS))
 }
 
 thread_local! {

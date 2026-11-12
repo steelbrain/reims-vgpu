@@ -1,9 +1,12 @@
-//! The guest's RAM handed to a device whole. Where the device takes no view of the guest's pages
-//! through dma-bufs (`super::import`'s `imports_need_files`, NVIDIA's 615 driver), the runtime
-//! imports it itself, in chunks, as objects over it are made, and takes each no-copy object's
-//! pages as runs of that RAM ([`runs`]) instead of an import of the object's own view, so such an
-//! object takes no kernel mapping a page. Where it takes views through dma-bufs (RADV), the RAM
-//! serves copies by runs alone: objects keep the imports of their own views.
+//! The guest's RAM handed to a device whole. The runtime takes each no-copy object's pages as runs
+//! of that RAM ([`runs`], which `super::import` gives every import) and binds the object in the
+//! RAM's chunk that holds them, where the chunk is imported, instead of an import of the object's
+//! own view, so such an object takes no import or kernel mapping of its own. Where the imports
+//! the device holds cost a submission nothing (NVIDIA's 615 driver), the runtime imports the RAM
+//! itself, in chunks, ahead of the objects over it. Where each costs every submission and the RAM
+//! has a source of dma-bufs (RADV's, the Iris Xe's: the runtime's listed plan), the RAM's chunks
+//! are imported for copies alone (below): an object lies in a chunk a copy imported, and over any
+//! other takes the import of its own view, so that no object pins a chunk's pages.
 //!
 //! - **By pointer or as dma-bufs.** Where `/dev/udmabuf` opens, the RAM has a source of dma-bufs
 //!   of its pages ([`dma_bufs`]): udmabuf's, through the backing table, as a no-copy import's
@@ -20,9 +23,11 @@
 //! - **Lists of runs.** With it, the RAM has a source of one dma-buf of a list of runs of its
 //!   pages ([`dma_bufs_of_runs`], `rt::HostRam::with_dma_buf_of_runs`), as many runs a list as
 //!   udmabuf's `list_limit` takes. The runtime calls it only for a copy by runs on a device whose
-//!   held imports cost every submission (RADV): the copy imports its own pages, in lists, held
-//!   until its command buffer completes, and the RAM's chunks are never imported. A chunk's
-//!   import would pin its pages, which then stay resident: before the lists, a Radeon 780M
+//!   held imports cost every submission (RADV's, the Iris Xe's): the copy imports its own pages,
+//!   in lists, held until its command buffer completes, and a chunk of the RAM is imported only
+//!   for a copy the lists do not take (one of whose runs is the whole chunk, or one whose list's
+//!   import failed), the one import objects over that chunk then lie in. A chunk's import pins
+//!   its pages, which then stay resident: before the lists, a Radeon 780M
 //!   (RADV, 7.3.1) handed the RAM took a 16 GiB guest's RAM in chunks of about 2.5 to 3 GiB for
 //!   its copies, and 12.3 GiB of it was resident by the desktop and at the end, where views alone
 //!   kept 7.9 to 8.0 GiB by the desktop and 10.4 to 10.8 GiB at the end.
@@ -389,11 +394,11 @@ mod tests {
 
     const MIB: u64 = 1 << 20;
 
-    /// Where the device needs imported pages mapped from their files (NVIDIA's), it uses the
-    /// guest's RAM whole: a no-copy buffer over one run of it is bound in the RAM's chunk, which
-    /// the device imports once, a second buffer in the chunk importing nothing more, and the GPU's
-    /// fill through each reaches the RAM. A device that takes views through dma-bufs is handed the
-    /// RAM for its copies by runs alone, and its buffers import their pages as before. Either way
+    /// Where the device imports the guest's RAM ahead of its objects (NVIDIA's), a no-copy buffer
+    /// over one run of it is bound in the RAM's chunk, which the device imports once, a second
+    /// buffer in the chunk importing nothing more, and the GPU's fill through each reaches the
+    /// RAM. Where its plan is listed, no copy imported the chunk here, so its buffers import their
+    /// pages as before ([`a_buffer_over_a_chunk_a_copy_imported_lies_in_it`] has one). Either way
     /// the bytes are the GPU's. The flag is the process's, which nextest runs this test alone in.
     ///
     /// The runtime imports the chunk as the first object over it asks, where the RAM has a source
@@ -452,7 +457,7 @@ mod tests {
         let listed = super::super::dma_buf::opens() && device.raw.releases_idle_pointer_imports();
         let a = over(MIB, 2 * PAGE);
         let after_a = counts();
-        if imports_need_files() && !listed {
+        if !listed {
             // The RAM is one chunk (8 MiB): its import is given 20 s to end.
             let imported = (0..4000).any(|_| {
                 let done = counts().0 > before.0;
@@ -468,19 +473,15 @@ mod tests {
         let now = counts();
         let first = after_a.1 - before.1;
         let second = (now.0 - imported.0, now.1 - imported.1);
-        match (imports_need_files(), listed) {
-            (true, false) => {
+        match listed {
+            false => {
                 assert_eq!(now.0 - before.0, 1, "the chunk imported once");
                 assert_eq!(first, 1, "the first bound in the chunk");
                 assert_eq!(second, (0, 1), "the second bound in the chunk");
             }
-            (true, true) => {
+            true => {
                 let made = (now.0 - before.0, first, second.1);
                 assert_eq!(made, (0, 0, 0), "no chunk imported, no buffer in the RAM");
-            }
-            (false, _) => {
-                let made = (now.0 - before.0, now.1 - before.1);
-                assert_eq!(made, (0, 0), "the RAM serves copies alone");
             }
         }
         let q = device.new_command_queue().unwrap();
@@ -516,6 +517,125 @@ mod tests {
         ];
         assert_eq!(b_bytes, [0, 0xa5, 0xa5]);
         drop((cb, e, q, a, b, lease));
+        // Once the runtime freed its imports of the RAM's chunks (the RAM's keep-alive), through
+        // the platform's VM, which leaves pages a buffer's import still holds mapped until the
+        // runtime has freed it: the device lives on past the lease.
+        let start_at = HostPtr::from_ptr(start.cast::<u8>());
+        crate::remap::free_unimported(start.cast(), length, || {
+            assert!(VulkanVm::new().deallocate(start_at, length).is_success());
+        });
+    }
+    /// A no-copy buffer over a chunk of the RAM a copy imported lies in that chunk, on every device
+    /// that uses the RAM: `super::import` gives each import the RAM's runs, so the buffer takes no
+    /// import of its own, and the GPU's fill through it reaches the RAM. A copy whose run is the
+    /// whole chunk (the RAM's 8 MiB here) imports it where the device's plan is listed (RADV's,
+    /// the Iris Xe's), whose objects never ask for a chunk; elsewhere the runtime's thread imports
+    /// it ahead. A device that does not use the RAM refuses the copy and takes no buffer
+    /// into a chunk. The flag is the process's, which nextest runs this test alone in.
+    #[test]
+    fn a_buffer_over_a_chunk_a_copy_imported_lies_in_it() {
+        let device = dev();
+        // The device's own checks end first: the chunk's import and the counts wait for none.
+        settle_device_checks(&device);
+        let length = 8 * MIB;
+        let fd = memfd(length).unwrap();
+        // SAFETY: a fresh shared mapping of the file, which the test unmaps after the lease and
+        // every buffer over it.
+        let start = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length.to_usize(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(start, libc::MAP_FAILED);
+        let at = start.addr().to_u64();
+        let counts = || {
+            let c = device.raw.work_counts();
+            (c.host_ram_chunks_imported, c.chunk_bound_buffers_made)
+        };
+        let before = counts();
+        let lease = lease_guest_memory([GuestRamFile {
+            host: at,
+            guest: 0,
+            length,
+            fd,
+            offset: 0,
+        }]);
+        let q = device.new_command_queue().unwrap();
+        let whole = (device.new_buffer_of_length(OnFault::Die, length, 0))
+            .unwrap()
+            .unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        let gathered = e
+            .copy_from_guest_ram(
+                OnFault::Die,
+                std::slice::from_ref(&(at..at + length)),
+                &whole,
+                0,
+            )
+            .unwrap();
+        e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert!(cb.error().is_none(), "{:?}", cb.error());
+        assert_eq!(gathered, super::copies(&device.raw));
+        let mut kept = None;
+        if gathered {
+            // The RAM is one chunk: its import is given 20 s to end.
+            let imported = (0..4000).any(|_| {
+                let done = counts().0 > before.0;
+                if !done {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                done
+            });
+            assert!(imported, "no chunk of the RAM imported for the copy");
+            let imported = counts();
+            // SAFETY: a page of the test's RAM, mapped until after the buffer is dropped.
+            let bytes =
+                unsafe { HostRange::new(HostPtr::from_addr((at + 2 * MIB).to_usize()), PAGE) };
+            let over = (device.new_buffer_over_host_memory(OnFault::Die, bytes, 0, None))
+                .unwrap()
+                .unwrap();
+            let now = counts();
+            assert_eq!(
+                (now.0 - imported.0, now.1 - imported.1),
+                (0, 1),
+                "the buffer bound in the chunk, importing nothing more"
+            );
+            let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+            let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+            let fill = BlitCmd::FillBuffer {
+                buffer: &over,
+                range: NsRange::new(0x10, PAGE - 0x20),
+                value: 0x3c,
+            };
+            e.encode(OnFault::Die, fill).unwrap();
+            e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+            cb.commit(OnFault::Die).unwrap();
+            cb.wait_until_completed(OnFault::Die).unwrap();
+            assert!(cb.error().is_none(), "{:?}", cb.error());
+            // SAFETY: the RAM, mapped readable, which no GPU work uses now.
+            let read = |offset: u64| unsafe {
+                std::ptr::with_exposed_provenance::<u8>((at + offset).to_usize()).read_volatile()
+            };
+            let bytes = [
+                read(2 * MIB + 0xf),
+                read(2 * MIB + 0x10),
+                read(2 * MIB + PAGE - 0x11),
+                read(2 * MIB + PAGE - 0x10),
+            ];
+            assert_eq!(bytes, [0, 0x3c, 0x3c, 0]);
+            kept = Some((cb, e, over));
+        } else {
+            assert_eq!(counts(), before, "no chunk imported, no buffer in one");
+        }
+        drop((kept, cb, e, whole, q, lease));
         // Once the runtime freed its imports of the RAM's chunks (the RAM's keep-alive), through
         // the platform's VM, which leaves pages a buffer's import still holds mapped until the
         // runtime has freed it: the device lives on past the lease.
