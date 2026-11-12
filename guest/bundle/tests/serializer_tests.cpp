@@ -3397,7 +3397,18 @@ void test_region_pages_join_over_remapped_memory()
 	CHECK(region.pagesRejoinsRefused() == 0);
 
 	// Other memory at the same address, other contents: a block of its own, the first still
-	// held twice and never asked to join again.
+	// held twice and never asked to join again. The kext wires a pages block's memory (its
+	// IOMemoryDescriptor's prepare), which keeps the first memory's object alive while the block
+	// is held, so the new memory's object cannot reuse its identity (measured: a macOS 26.7.2
+	// guest's no-copy buffer kept it in 200 of 200 overwrites, where with no buffer the new
+	// object took the old one's identity in 198 of 200). The fake source wires nothing: a memory
+	// entry of the first memory, held to the end, keeps it alive as the kext does (measured on
+	// macOS 27.0.1: the identity was the old one's in 0 of 5000 overwrites with the entry held,
+	// and in 717 of 5000 without it).
+	mach_port_t firstMemory = MACH_PORT_NULL;
+	memory_object_size_t firstSize = length;
+	CHECK(mach_make_memory_entry_64(mach_task_self(), &firstSize, at, VM_PROT_READ | VM_PROT_WRITE,
+	                                &firstMemory, MACH_PORT_NULL) == KERN_SUCCESS);
 	mach_vm_address_t again = at;
 	CHECK(mach_vm_allocate(mach_task_self(), &again, length, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) ==
 	      KERN_SUCCESS);
@@ -3451,6 +3462,7 @@ void test_region_pages_join_over_remapped_memory()
 	RgfxRegion::Block g = region.acquirePages(bytes, 0x4000, true, join);
 	CHECK(f.ok && g.ok && f.offset != e.offset && g.offset != f.offset && src.asked == 5);
 	CHECK(region.pagesRejoinsRefused() == 3);
+	mach_port_deallocate(mach_task_self(), firstMemory);
 	mach_vm_deallocate(mach_task_self(), at, length);
 }
 
