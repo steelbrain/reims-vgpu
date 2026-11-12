@@ -802,10 +802,13 @@ Stages:
       (`IOSurfaceRoot::updateLimits`; `guest/kext/src/RgfxSurfaceRows.hpp`),
       since the GPU's linear image of a plane starts at such an offset too.
       IOSurfaceGetPropertyAlignment answers both to the processes that work
-      out their own. A plane a client places itself off the alignment
-      (CoreVideo's first plane, 32 bytes into its surface) takes a device
-      cache at its ask, as any surface whose textures would not lie in
-      place. Macs answer 64 bytes there (Intel) and 128 (the M3),
+      out their own. A client that places its planes or rows itself keeps
+      them (CoreVideo's first plane 32 bytes into its surface, its rows at
+      its own alignment, measured in a macOS 26.7.2 guest whose IOSurface
+      answered 256): a device cache of the surface places that plane where
+      the GPU's images may start (above), and a texture over it in the
+      pages that the GPU's linear images cannot hold is the runtime's
+      shadow. Macs answer 64 bytes there (Intel) and 128 (the M3),
       and an Intel Mac's GPUs answer 256 for
       `minimumLinearTextureAlignmentForPixelFormat:`, so rows at 256 bytes
       lie inside what Macs do. A host whose GPU has memory of its own
