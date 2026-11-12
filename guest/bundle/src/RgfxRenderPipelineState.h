@@ -32,12 +32,12 @@ class RgfxReplyReader;
 class RgfxKnownPipelines;
 
 /// A render pipeline's four stages' function arguments (RgfxRenderPipelineState's
-/// rgfxStageArguments), borrowed from the pipeline state.
+/// rgfxStageArguments), borrowed from the pipeline state: each null where they are unknown.
 struct RgfxStageArguments {
-	const RgfxAirFunction *vertex;
-	const RgfxAirFunction *fragment;
-	const RgfxAirFunction *object;
-	const RgfxAirFunction *mesh;
+	const RgfxAirFunction *_Nullable vertex;
+	const RgfxAirFunction *_Nullable fragment;
+	const RgfxAirFunction *_Nullable object;
+	const RgfxAirFunction *_Nullable mesh;
 };
 #endif
 
