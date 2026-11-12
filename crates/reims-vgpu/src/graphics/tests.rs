@@ -174,7 +174,15 @@ fn a_screen_s_rate_is_kept_in_millihertz() {
 
 /// A headless graphics device and the platform its decoder drives, raising through `raised`.
 fn headless_on(raised: &Arc<AtomicU32>) -> (GraphicsDevice<FakePlatform>, Arc<FakePlatform>) {
-    let platform = Arc::new(FakePlatform::new());
+    headless_over(raised, Arc::new(FakePlatform::new()))
+}
+
+/// A headless device on `platform`, as [`headless_on`] makes one, for a test that sets the
+/// platform's answers before the device takes them
+fn headless_over(
+    raised: &Arc<AtomicU32>,
+    platform: Arc<FakePlatform>,
+) -> (GraphicsDevice<FakePlatform>, Arc<FakePlatform>) {
     let raised = Arc::clone(raised);
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
@@ -6752,8 +6760,10 @@ fn a_managed_range_comes_before_a_later_buffer_of_another_queue() {
 #[test]
 fn a_managed_texture_s_replaced_region_comes_before_a_later_buffer() {
     let raised = Arc::new(AtomicU32::new(0));
-    let (device, platform) = headless_on(&raised);
+    // The device takes the GPU's memory as it is made.
+    let platform = Arc::new(FakePlatform::new());
     platform.device().set_unified_memory(false);
+    let (device, platform) = headless_over(&raised, platform);
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
     const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
     const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
@@ -6762,7 +6772,7 @@ fn a_managed_texture_s_replaced_region_comes_before_a_later_buffer() {
     let mut ring = managed_order_queue(&device, &mut guest, 1, (SUBMIT, COMPLETE));
     guest.send(&device, block_grant(1, BLOCK, 0x1_0000));
     guest.send(&device, resource_id_chunk(1, 0));
-    // 16x16 RGBA8, one level: 1024 bytes of CPU copy.
+    // 16x16 RGBA8, one level, its rows of 256 bytes: 4096 bytes of CPU copy.
     guest.send(&device, buffer_over_host_memory(obj(1, 2), BLOCK, 0x1000));
     let texture = RgfxManagedTextureCreate {
         header: RgfxMsgHeader {
