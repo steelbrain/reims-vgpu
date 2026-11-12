@@ -22,6 +22,7 @@ enum Told {
     Present,
     Cursor(Option<CursorImage>),
     Moved(i32, i32, bool),
+    Power(bool),
 }
 
 /// A screen with a mode the test sets, recording what it is told.
@@ -45,6 +46,9 @@ impl Screen for TestScreen {
     }
     fn cursor_moved(&self, x: i32, y: i32, visible: bool) {
         self.told.lock().push(Told::Moved(x, y, visible));
+    }
+    fn power(&self, on: bool) {
+        self.told.lock().push(Told::Power(on));
     }
 }
 
@@ -351,6 +355,18 @@ fn vblank(enabled: u32) -> Vec<u8> {
         },
         display: 0,
         enabled,
+    };
+    c.as_bytes().to_vec()
+}
+
+fn display_power(display: u32, on: u32) -> Vec<u8> {
+    let c = RgfxSetDisplayPower {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SET_DISPLAY_POWER,
+            ..Default::default()
+        },
+        display,
+        on,
     };
     c.as_bytes().to_vec()
 }
@@ -987,6 +1003,76 @@ fn a_reset_puts_the_device_back_as_new() {
         RGFX_EVT_DISPLAYS
     );
     assert!(rig.event().is_none(), "no VBLANK after the reset");
+}
+
+/// `SET_DISPLAY_POWER` turns the panel off and on: the screen is told each change, once, and
+/// the scanout, its refreshes and `VBLANK` go on while it is off; a display other than 0 is
+/// refused with nothing told
+#[test]
+fn set_display_power_turns_the_panel_off_and_on() {
+    let mut rig = Rig::new();
+    rig.start();
+    rig.send(scanout(16, 4, 64, RGFX_ALLOCATIONS_OFFSET));
+    rig.complete();
+    rig.send(vblank(1));
+    rig.complete();
+    rig.told();
+    let s = rig.send(display_power(0, 0));
+    assert_eq!(rig.complete(), (s, RGFX_STATUS_OK));
+    assert_eq!(rig.told(), [Told::Power(false)]);
+    assert!(rig.device.shared.display.lock().asleep);
+    let s = rig.send(display_power(0, 0));
+    assert_eq!(rig.complete(), (s, RGFX_STATUS_OK));
+    assert_eq!(
+        rig.told(),
+        [],
+        "an off panel turned off again tells nothing"
+    );
+    rig.refresh();
+    assert_eq!(
+        rig.told(),
+        [Told::Present],
+        "the scanout refreshes while the panel is off"
+    );
+    let bytes = rig.event().expect("a VBLANK while the panel is off");
+    assert_eq!(
+        RgfxMsgHeader::read_from_prefix(&bytes).unwrap().0.r#type,
+        RGFX_EVT_VBLANK
+    );
+    let s = rig.send(display_power(1, 1));
+    assert_eq!(rig.complete(), (s, RGFX_STATUS_NO_DISPLAY));
+    assert_eq!(rig.told(), []);
+    let s = rig.send(display_power(0, 1));
+    assert_eq!(rig.complete(), (s, RGFX_STATUS_OK));
+    assert_eq!(rig.told(), [Told::Power(true)]);
+    assert!(!rig.device.shared.display.lock().asleep);
+}
+
+/// A reset turns an off panel on, telling the screen after the cursor's removal; a reset of a
+/// device whose panel is on tells it nothing of the panel
+#[test]
+fn a_reset_turns_an_off_panel_on() {
+    let mut rig = Rig::new();
+    rig.start();
+    rig.send(display_power(0, 0));
+    rig.complete();
+    rig.told();
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    assert_eq!(
+        rig.told(),
+        [
+            Told::Cursor(None),
+            Told::Moved(0, 0, true),
+            Told::Power(true)
+        ]
+    );
+    assert!(!rig.device.shared.display.lock().asleep);
+    (rig.produced, rig.consumed, rig.seqno) = (0, 0, 0);
+    rig.start();
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    assert_eq!(rig.told(), [Told::Cursor(None), Told::Moved(0, 0, true)]);
 }
 
 /// A reset keeps the display's scanout, as a display engine goes on scanning out across its

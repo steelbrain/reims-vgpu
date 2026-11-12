@@ -6,6 +6,8 @@
 //! texture of the display's mode, the size the guest is told (the window's size in pixels, or
 //! 1920 × 1080 without a window), placed and clipped as in a drawable of that size. Where the
 //! guest has no scanout and presents no surface the display shows black, and so does the read.
+//! While the display's panel is off (the guest's display asleep) the draw clears the texture to
+//! black, and the read is black whatever the guest shows.
 //! The texture is BGRA8, shared, a render target, and is read
 //! once the draw has finished on the GPU: rows of `width * 4` bytes, B, G, R and A in memory.
 //!

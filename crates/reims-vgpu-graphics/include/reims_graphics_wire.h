@@ -1043,8 +1043,8 @@
 
 // `FEATURES_HI`, RO: feature bits 32 to 63, the ones the host offers, which the guest takes
 // through [`RGFX_REG_DRIVER_FEATURES_HI`]: [`RGFX_FEATURE_SURFACE_DEFERRED_CARRY`],
-// [`RGFX_FEATURE_SCHEDULED_ASK`], [`RGFX_FEATURE_PAGES_16K`], [`RGFX_FEATURE_DISPLAY_SCALE`] and
-// [`RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA`].
+// [`RGFX_FEATURE_SCHEDULED_ASK`], [`RGFX_FEATURE_PAGES_16K`], [`RGFX_FEATURE_DISPLAY_SCALE`],
+// [`RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA`] and [`RGFX_FEATURE_DISPLAY_POWER`].
 // On a host that offers `PAGES_16K`, `FEATURES_LO` and `_HI` read the guest RAM features only
 // once the guest took it.
 #define RGFX_REG_FEATURES_HI 12
@@ -1326,6 +1326,12 @@
 // them again. Every host offers it.
 #define RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA 68719476736
 
+// `FEATURES_HI` bit 5, feature bit 37, `DISPLAY_POWER`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_HI`]: ring 0 carries [`RGFX_CMD_SET_DISPLAY_POWER`], which turns
+// the display's panel off while the guest's display sleeps and on again at its wake, so the host
+// shows black while it sleeps. Every host offers it.
+#define RGFX_FEATURE_DISPLAY_POWER 137438953472
+
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 #define RGFX_REG_STATUS 16
@@ -1523,6 +1529,10 @@
 // Command `DISPLAY_COLOR` ([`RgfxDisplayColor`]), where the guest took
 // [`RGFX_FEATURE_DISPLAY_COLOR`]: not answered.
 #define RGFX_CMD_DISPLAY_COLOR 7
+
+// Command `SET_DISPLAY_POWER` ([`RgfxSetDisplayPower`]), where the guest took
+// [`RGFX_FEATURE_DISPLAY_POWER`]: answered by [`RGFX_EVT_COMPLETE`].
+#define RGFX_CMD_SET_DISPLAY_POWER 8
 
 // Event `COMPLETE` ([`RgfxComplete`]): a command's answer, with its `seqno`.
 #define RGFX_EVT_COMPLETE 256
@@ -6434,6 +6444,21 @@ typedef struct {
   // Where the image starts in the region: a multiple of 4, in the guest's allocations.
   uint64_t offset;
 } RgfxSetCursor;
+
+// `SET_DISPLAY_POWER`: the display's panel is off (`on` 0) or on, as a display's power state
+// turns a monitor's panel off and on (DPMS). While it is off, the display shows black, with no
+// cursor, whatever its scanout or presented surface; everything else goes on as while it is on:
+// the guest's `SET_SCANOUT`, `PRESENT_SURFACE` (answered as the display shows the surface, only
+// not lit), cursor commands and `VBLANK`s. Turned on, it shows its scanout or presented surface,
+// and the cursor, again. A reset turns it on.
+typedef struct {
+  // [`RGFX_CMD_SET_DISPLAY_POWER`].
+  RgfxMsgHeader header;
+  // The display's id.
+  uint32_t display;
+  // Whether the panel is on: 0 turns it off.
+  uint32_t on;
+} RgfxSetDisplayPower;
 
 // `SET_SCANOUT`: the display shows `height` rows of `width` BGRA8 pixels, each row `stride`
 // bytes after the one before, from `offset` in the region. A `width` of 0 blanks the display.

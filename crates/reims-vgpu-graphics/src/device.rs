@@ -142,7 +142,9 @@
 //! and then fails leaves the host's window showing what the guest draws next: the kext's start
 //! resets the device to take it, and where it fails after that (the device lists no usable
 //! display, `IOFramebuffer`'s start fails) it resets it again, and the OS falls back to the
-//! firmware's framebuffer, which the firmware's scanout, kept through both resets, shows.
+//! firmware's framebuffer, which the firmware's scanout, kept through both resets, shows. The
+//! display's panel is on after a reset, whatever `SET_DISPLAY_POWER` last set: the screen is told
+//! where it was off.
 //!
 //! **A broken ring.** A count or a message size the protocol refuses (`ring::Broken`) is logged,
 //! and the device takes nothing more from the ring until it is reset; the guest's driver sees its
@@ -280,7 +282,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SCHEDULED_ASK
     | RGFX_FEATURE_PAGES_16K
     | RGFX_FEATURE_DISPLAY_SCALE
-    | RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA;
+    | RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA
+    | RGFX_FEATURE_DISPLAY_POWER;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
@@ -885,6 +888,8 @@ pub(crate) struct DisplayState {
     pub(crate) scanout: Option<Scanout>,
     /// `VBLANK` is on.
     pub(crate) vblank: bool,
+    /// The panel is off (`SET_DISPLAY_POWER`): the screen shows black.
+    pub(crate) asleep: bool,
     /// Refreshes since the last reset.
     refreshes: u64,
     /// The mode the guest was last told, in a `DISPLAYS` or a `DISPLAY_CHANGED`'s wake.
@@ -1353,7 +1358,8 @@ impl Shared {
         submit.backlog.clear();
         self.control_done.store(0, Ordering::Release);
         completion.reset(&self.region);
-        // The scanout stays (the module doc): the screen is told nothing of it.
+        // The scanout stays (the module doc): the screen is told nothing of it. The panel is on.
+        let woken = display.asleep;
         *display = DisplayState {
             scanout: display.scanout,
             ..DisplayState::default()
@@ -1383,6 +1389,9 @@ impl Shared {
         self.wake.wake();
         self.screen.cursor_image(None);
         self.screen.cursor_moved(0, 0, true);
+        if woken {
+            self.screen.power(true);
+        }
     }
 
     /// The feature bits the device offers a guest whose driver took `taken`: the host's

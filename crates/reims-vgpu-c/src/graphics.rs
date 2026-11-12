@@ -108,8 +108,8 @@ pub type RvgGraphicsRaiseFn = Option<unsafe extern "C-unwind" fn(ctx: *mut c_voi
 /// draws it (QEMU's console, for its SPICE, VNC, GTK and D-Bus displays); the device's window
 /// shows it either way. Thread, and what they may call: as RvgCursorGlyphFn's, on the display
 /// thread, one at a time with every display callback of the process, in the order the device
-/// took the guest's cursor commands and resets. The guest sees nothing of whether the host gives
-/// them.
+/// took the guest's cursor and display power commands and resets. The guest sees nothing of
+/// whether the host gives them.
 #[repr(C)]
 #[derive(Clone, Copy)]
 #[expect(
@@ -129,8 +129,8 @@ pub struct RvgGraphicsCallbacks {
     /// Followed by `cursor_show` where whether the cursor shows changed.
     pub cursor_glyph: RvgCursorGlyphFn,
     /// Whether the cursor shows, where that changed: 1 once the guest has an image while it
-    /// shows its cursor; 0 once it hides it or removes its image, which a reset removes. It is
-    /// hidden until the first call.
+    /// shows its cursor and its display is awake; 0 once it hides it, removes its image, which a
+    /// reset removes, or its display sleeps (the panel off). It is hidden until the first call.
     pub cursor_show: RvgCursorShowFn,
     /// The guest moved its cursor, or a reset put it at (0, 0):
     /// rvg_graphics_device_cursor_position reads where its hot spot is.
@@ -469,9 +469,10 @@ pub unsafe extern "C" fn rvg_graphics_device_set_doorbell(
 
 /// The guest's bus reset: as a write of 0 to STATUS, the device is as one just made. It takes no
 /// command until the guest writes 1, its rings are as new, the display keeps its scanout but has
-/// no cursor image or VBLANK, and the device drops every object the guest's processes made, on
-/// its control thread before it takes the guest's next command. Waits for the command the device
-/// is taking, and for a take of a queue's ring or a post onto one under way. Calls back: never.
+/// no cursor image or VBLANK, its panel is on, and the device drops every object the guest's
+/// processes made, on its control thread before it takes the guest's next command. Waits for the
+/// command the device is taking, and for a take of a queue's ring or a post onto one under way.
+/// Calls back: never.
 ///
 /// # Safety
 /// `device` is a live graphics device handle.
@@ -488,7 +489,8 @@ pub unsafe extern "C" fn rvg_graphics_device_reset(device: *mut RvgGraphicsDevic
 /// What the device's display shows now, read back into `dst`: the guest's scanout, or the
 /// IOSurface its display pipe presents, through the display's colour, drawn as the device's
 /// window draws it into a drawable of the display's mode, the size the guest is told (the
-/// window's size in pixels, or 1920 x 1080 with no window); black where the guest shows nothing.
+/// window's size in pixels, or 1920 x 1080 with no window); black where the guest shows nothing,
+/// and while the guest's display sleeps (the panel off).
 /// `*height` rows of `*width * 4` bytes each, BGRA8: B, G, R and A in memory, pixman's
 /// x8r8g8b8 on a little-endian host. `width` and `height` (each NULL or writable) get the mode's
 /// size whatever the result, so a call with a NULL `dst` asks the size. RVG_ERR_INVALID_ARGUMENT,

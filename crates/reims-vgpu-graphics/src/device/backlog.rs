@@ -20,7 +20,7 @@
 //! carries ring 0 out in order, so a buffer that waits for its context's share waits for those
 //! too. Shared events and textures do not cross processes.
 //!
-//! No buffer waits for a display command (`GET_DISPLAYS` to `DISPLAY_COLOR`) or a
+//! No buffer waits for a display command (`GET_DISPLAYS` to `SET_DISPLAY_POWER`) or a
 //! `SURFACE_DOWNLOAD`: a buffer reads nothing they make. A present waits for the writers the
 //! guest's record of its surface names (`RgfxSurfaceWriters`), whatever the host has taken. A
 //! download waits for the buffers that used the surface's device cache before it was taken, so a
@@ -66,7 +66,7 @@ pub(super) enum Whose {
 /// Whose a message of `type` is, its 8 bytes at offset 16 `field`, where it holds them.
 pub(super) fn whose(r#type: u32, field: Option<u64>) -> Whose {
     match (r#type, field) {
-        (RGFX_CMD_GET_DISPLAYS..=RGFX_CMD_DISPLAY_COLOR | RGFX_CMD_SURFACE_DOWNLOAD, _) => {
+        (RGFX_CMD_GET_DISPLAYS..=RGFX_CMD_SET_DISPLAY_POWER | RGFX_CMD_SURFACE_DOWNLOAD, _) => {
             Whose::NoOne
         }
         (RGFX_CMD_QUEUE_CREATE..RGFX_CMD_CONTEXT_CLOSE, Some(obj_id)) => {
@@ -240,12 +240,13 @@ mod tests {
             RGFX_CMD_GET_DISPLAYS,
             RGFX_CMD_PRESENT_SURFACE,
             RGFX_CMD_DISPLAY_COLOR,
+            RGFX_CMD_SET_DISPLAY_POWER,
             RGFX_CMD_SURFACE_DOWNLOAD,
         ] {
             assert_eq!(whose(r#type, field), Whose::NoOne);
         }
         assert_eq!(whose(RGFX_CMD_BUFFER_CREATE, None), Whose::Every);
-        assert_eq!(whose(RGFX_CMD_DISPLAY_COLOR + 1, obj(5)), Whose::Every);
+        assert_eq!(whose(RGFX_CMD_SET_DISPLAY_POWER + 1, obj(5)), Whose::Every);
         assert_eq!(
             whose(RGFX_CMD_RESOURCE_ID_SMALL_CHUNK + 1, obj(5)),
             Whose::Every

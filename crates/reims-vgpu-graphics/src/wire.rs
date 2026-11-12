@@ -72,8 +72,8 @@ pub const RGFX_REG_VERSION: u32 = 0x004;
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63, the ones the host offers, which the guest takes
 /// through [`RGFX_REG_DRIVER_FEATURES_HI`]: [`RGFX_FEATURE_SURFACE_DEFERRED_CARRY`],
-/// [`RGFX_FEATURE_SCHEDULED_ASK`], [`RGFX_FEATURE_PAGES_16K`], [`RGFX_FEATURE_DISPLAY_SCALE`] and
-/// [`RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA`].
+/// [`RGFX_FEATURE_SCHEDULED_ASK`], [`RGFX_FEATURE_PAGES_16K`], [`RGFX_FEATURE_DISPLAY_SCALE`],
+/// [`RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA`] and [`RGFX_FEATURE_DISPLAY_POWER`].
 /// On a host that offers `PAGES_16K`, `FEATURES_LO` and `_HI` read the guest RAM features only
 /// once the guest took it.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
@@ -321,6 +321,12 @@ pub const RGFX_FEATURE_DISPLAY_SCALE: u64 = 0x8_0000_0000;
 /// texture's `didModifyData` (SPI), which a mipmapped texture over a buffer's bytes needs to take
 /// them again. Every host offers it.
 pub const RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA: u64 = 0x10_0000_0000;
+
+/// `FEATURES_HI` bit 5, feature bit 37, `DISPLAY_POWER`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_HI`]: ring 0 carries [`RGFX_CMD_SET_DISPLAY_POWER`], which turns
+/// the display's panel off while the guest's display sleeps and on again at its wake, so the host
+/// shows black while it sleeps. Every host offers it.
+pub const RGFX_FEATURE_DISPLAY_POWER: u64 = 0x20_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -522,6 +528,9 @@ pub const RGFX_CMD_PRESENT_SURFACE: u32 = 6;
 /// Command `DISPLAY_COLOR` ([`RgfxDisplayColor`]), where the guest took
 /// [`RGFX_FEATURE_DISPLAY_COLOR`]: not answered.
 pub const RGFX_CMD_DISPLAY_COLOR: u32 = 7;
+/// Command `SET_DISPLAY_POWER` ([`RgfxSetDisplayPower`]), where the guest took
+/// [`RGFX_FEATURE_DISPLAY_POWER`]: answered by [`RGFX_EVT_COMPLETE`].
+pub const RGFX_CMD_SET_DISPLAY_POWER: u32 = 8;
 /// Event `COMPLETE` ([`RgfxComplete`]): a command's answer, with its `seqno`.
 pub const RGFX_EVT_COMPLETE: u32 = 0x100;
 /// Event `DISPLAYS` ([`RgfxDisplays`]): `GET_DISPLAYS`'s answer, with its `seqno`.
@@ -1082,6 +1091,25 @@ pub struct RgfxSetVblank {
     pub enabled: u32,
 }
 
+/// `SET_DISPLAY_POWER`: the display's panel is off (`on` 0) or on, as a display's power state
+/// turns a monitor's panel off and on (DPMS). While it is off, the display shows black, with no
+/// cursor, whatever its scanout or presented surface; everything else goes on as while it is on:
+/// the guest's `SET_SCANOUT`, `PRESENT_SURFACE` (answered as the display shows the surface, only
+/// not lit), cursor commands and `VBLANK`s. Turned on, it shows its scanout or presented surface,
+/// and the cursor, again. A reset turns it on.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxSetDisplayPower {
+    /// [`RGFX_CMD_SET_DISPLAY_POWER`].
+    pub header: RgfxMsgHeader,
+    /// The display's id.
+    pub display: u32,
+    /// Whether the panel is on: 0 turns it off.
+    pub on: u32,
+}
+
 /// `PRESENT_SURFACE`: the display shows the IOSurface of global ID `iosurface_id` (plane 0), the
 /// display pipe's swap, in place of the scanout, until the next `PRESENT_SURFACE`; 0 shows the
 /// scanout again. The host shows the texture the device's decoder made over that surface
@@ -1323,6 +1351,7 @@ const _: () = {
     assert!(size_of::<RgfxSetCursor>() == 48);
     assert!(size_of::<RgfxMoveCursor>() == 32);
     assert!(size_of::<RgfxSetVblank>() == 24);
+    assert!(size_of::<RgfxSetDisplayPower>() == 24);
     assert!(size_of::<RgfxPresentSurface>() == 32);
     assert!(size_of::<RgfxDisplayColor>() == 40);
     assert!(size_of::<RgfxColorEntry>() == 16);

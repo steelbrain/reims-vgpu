@@ -2080,19 +2080,30 @@ fn a_raise_may_call_the_device_at_once() {
     reset(&device);
 }
 
-/// The window shows the guest's cursor once it has an image and while the guest shows it,
-/// telling the window only of a change
+/// The window shows the guest's cursor once it has an image, while the guest shows it and the
+/// display's panel is on, telling the window only of a change
 #[test]
 fn the_cursor_shows_with_an_image_while_the_guest_shows_it() {
     let window = Window::new(WindowConfig::default(), 0, "test".to_owned());
     let mut cursor = CursorState {
         image: false,
         visible: true,
+        asleep: false,
         shown: None,
     };
     cursor.update(&window);
     assert_eq!(cursor.shown, Some(false));
     cursor.image = true;
+    cursor.update(&window);
+    assert_eq!(cursor.shown, Some(true));
+    cursor.asleep = true;
+    cursor.update(&window);
+    assert_eq!(
+        cursor.shown,
+        Some(false),
+        "a cursor shows while the panel is off"
+    );
+    cursor.asleep = false;
     cursor.update(&window);
     assert_eq!(cursor.shown, Some(true));
     cursor.visible = false;
@@ -2209,6 +2220,100 @@ fn the_guest_s_cursor_reaches_the_host() {
     assert_eq!(device.cursor_position(), (0, 0));
     let here = std::thread::current().id();
     assert!(told.lock().iter().all(|(_, on)| *on != here));
+}
+
+/// `SET_DISPLAY_POWER`'s message, display 0's panel `on` or off.
+fn display_power(on: u32) -> Vec<u8> {
+    RgfxSetDisplayPower {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SET_DISPLAY_POWER,
+            size: 0,
+            seqno: 0,
+        },
+        display: 0,
+        on,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// While the display's panel is off the host is told the cursor does not show, and once it is on
+/// that it shows again, where the guest shows it; a reset of a device whose panel is off turns it
+/// on, the cursor still hidden with no image
+#[test]
+fn the_host_is_told_no_cursor_while_the_display_s_panel_is_off() {
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let config = GraphicsConfig {
+        callbacks: telling(&told),
+        window: None,
+        memory_map: None,
+        guest_arch: GuestArch::X86_64,
+    };
+    let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
+    let wait = |count: usize| {
+        for _ in 0..2000 {
+            if told.lock().len() >= count {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let told = told.lock();
+        assert_eq!(told.len(), count, "{told:?}");
+        told.iter()
+            .map(|(t, _)| format!("{t:?}"))
+            .collect::<Vec<_>>()
+    };
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let slot = device.region_size() - RGFX_CURSOR_SPAN;
+    // SAFETY: the slot lies in the device's region, mapped while the device lives.
+    unsafe {
+        guest.write(slot as usize, &[10, 20, 30, 255]);
+    }
+    let set = RgfxSetCursor {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SET_CURSOR,
+            size: 0,
+            seqno: 0,
+        },
+        display: 0,
+        width: 1,
+        height: 1,
+        hot_x: 0,
+        hot_y: 0,
+        reserved_24: 0,
+        offset: slot,
+    };
+    assert_eq!(
+        answered(&device, &mut guest, set.as_bytes().to_vec()),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(wait(2)[1..], ["Show(1)"]);
+    assert_eq!(
+        answered(&device, &mut guest, display_power(0)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(wait(3)[2..], ["Show(0)"]);
+    assert_eq!(
+        answered(&device, &mut guest, display_power(1)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(wait(4)[3..], ["Show(1)"]);
+    assert_eq!(
+        answered(&device, &mut guest, display_power(0)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(wait(5)[4..], ["Show(0)"]);
+    device.reset();
+    // The reset removes the image, so the panel's turning on shows no cursor yet.
+    assert_eq!(wait(6)[5..], ["Move"]);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    assert_eq!(
+        answered(&device, &mut guest, set.as_bytes().to_vec()),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(wait(8)[7..], ["Show(1)"], "a reset left the panel off");
 }
 
 /// The window's sink makes its queue unshared and imports nothing at its making, then only the
@@ -8125,6 +8230,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
         RGFX_FEATURE_SCHEDULED_ASK
             | RGFX_FEATURE_DISPLAY_SCALE
             | RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA
+            | RGFX_FEATURE_DISPLAY_POWER
             | sixteen_bit
             | if carries {
                 RGFX_FEATURE_SURFACE_DEFERRED_CARRY
@@ -8173,6 +8279,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             RGFX_FEATURE_SCHEDULED_ASK
                 | RGFX_FEATURE_DISPLAY_SCALE
                 | RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA
+                | RGFX_FEATURE_DISPLAY_POWER
                 | RGFX_FEATURE_PAGES_16K
                 | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
         );
@@ -8208,6 +8315,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
         RGFX_FEATURE_SCHEDULED_ASK
             | RGFX_FEATURE_DISPLAY_SCALE
             | RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA
+            | RGFX_FEATURE_DISPLAY_POWER
     );
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);
@@ -10211,8 +10319,69 @@ fn a_read_of_the_display_draws_what_it_shows() {
     assert!(quiet(&guest), "a read told the guest something");
 }
 
+/// While the display's panel is off (`SET_DISPLAY_POWER`), a read of the display clears its
+/// texture to black and reads neither the scanout nor the presented surface; the guest's presents
+/// are answered as with the panel on. Once the panel is on, the read copies the presented
+/// surface again. The guest is told nothing of any read
+#[test]
+fn a_read_of_the_display_is_black_while_its_panel_is_off() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    platform.world().set_auto_complete(Some(CompleteOn::Thread));
+    let log = platform.call_log();
+    let mut dst = vec![7u8; 1920 * 1080 * 4];
+    let (mut guest, _ring) = surface_and_queue(&device);
+    assert_eq!(
+        answered(&device, &mut guest, set_scanout(64, 32, 256)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        answered(&device, &mut guest, present_surface(0x77)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        answered(&device, &mut guest, display_power(0)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        answered(&device, &mut guest, present_surface(0x77)),
+        RGFX_STATUS_OK,
+        "a present while the panel is off"
+    );
+    let mark = log.mark();
+    assert_eq!(device.read_display(&mut dst), ((1920, 1080), Ok(())));
+    let sels = log.sels_since(mark);
+    let count = |sel: &str| sels.iter().filter(|s| **s == sel).count();
+    assert_eq!(
+        count(SCANOUT_BLIT),
+        0,
+        "a read while the panel is off blitted"
+    );
+    assert_eq!(
+        count(SURFACE_COPY),
+        0,
+        "a read while the panel is off copied"
+    );
+    assert_eq!(count("renderCommandEncoderWithDescriptor:"), 1, "the clear");
+    assert_eq!(count("commit"), 1);
+    assert_eq!(count("waitUntilCompleted"), 1);
+    assert!(quiet(&guest), "a read told the guest something");
+
+    assert_eq!(
+        answered(&device, &mut guest, display_power(1)),
+        RGFX_STATUS_OK
+    );
+    let mark = log.mark();
+    assert_eq!(device.read_display(&mut dst), ((1920, 1080), Ok(())));
+    let sels = log.sels_since(mark);
+    assert_eq!(sels.iter().filter(|s| **s == SURFACE_COPY).count(), 1);
+    assert!(quiet(&guest), "a read told the guest something");
+}
+
 /// On the Vulkan platform, the read gives the guest's pixels: a scanout smaller than the mode
-/// shows at its top left, B, G, R and A as the guest wrote them, and the rest of the mode is black
+/// shows at its top left, B, G, R and A as the guest wrote them, and the rest of the mode is black.
+/// While the display's panel is off the read is black all over, and once it is on the scanout's
+/// pixels show again
 #[test]
 fn on_vulkan_a_read_of_the_display_gives_the_scanout_s_pixels() {
     let platform = crate::singleton::platform();
@@ -10254,6 +10423,28 @@ fn on_vulkan_a_read_of_the_display_gives_the_scanout_s_pixels() {
     }
     for (x, y) in [(64, 0), (0, 32), (1919, 1079), (100, 100)] {
         assert_eq!(at(x, y), [0, 0, 0, 0xff], "({x}, {y}) is not black");
+    }
+
+    assert_eq!(
+        answered(&device, &mut guest, display_power(0)),
+        RGFX_STATUS_OK
+    );
+    dst.fill(7);
+    assert_eq!(device.read_display(&mut dst), ((1920, 1080), Ok(())));
+    assert!(
+        dst.chunks(4).all(|p| p == [0, 0, 0, 0xff]),
+        "a read while the panel is off is not black"
+    );
+    assert_eq!(
+        answered(&device, &mut guest, display_power(1)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(device.read_display(&mut dst), ((1920, 1080), Ok(())));
+    let at = |x: usize, y: usize| &dst[(y * 1920 + x) * 4..][..4];
+    for y in 0..height {
+        for x in 0..width {
+            assert_eq!(at(x, y), pixel(x, y), "({x}, {y}) once the panel is on");
+        }
     }
 }
 

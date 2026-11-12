@@ -54,9 +54,9 @@ use reims_vgpu_graphics::wire::{
     RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_IMPORT,
     RGFX_CMD_SHARED_EVENT_NAME, RGFX_CMD_SHARED_EVENT_UNNAME, RGFX_CONTEXT_OBJ_ID_SHIFT,
     RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_ICB_STATE, RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED,
-    RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_DISPLAY_COLOR, RGFX_FEATURE_DISPLAY_SCALE,
-    RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_HOST_TIME, RGFX_FEATURE_ICB_SLOTS,
-    RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_MANAGED_AT_OFFSET,
+    RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_DISPLAY_COLOR, RGFX_FEATURE_DISPLAY_POWER,
+    RGFX_FEATURE_DISPLAY_SCALE, RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_HOST_TIME,
+    RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_MANAGED_AT_OFFSET,
     RGFX_FEATURE_MANAGED_BUFFER_SLABS, RGFX_FEATURE_MANAGED_TEXTURE_SLABS,
     RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE, RGFX_FEATURE_PAGES_16K,
     RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_SCHEDULED_ASK,
@@ -358,7 +358,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // OpenCL mode links an OpenCL kernel's function the bundle names so (`OPENCL_MODE`). A
             // host whose device takes the private render state Apple's OpenGL renderer sets makes
             // the guest's render pipelines with it (`PRIVATE_RENDER_STATE`). Every host carries a
-            // texture's `didModifyData` to its platform (`TEXTURE_DID_MODIFY_DATA`).
+            // texture's `didModifyData` to its platform (`TEXTURE_DID_MODIFY_DATA`), and shows black
+            // while the guest's display sleeps (`DISPLAY_POWER`).
             let in_place = u64::from(RGFX_FEATURE_SURFACE_PAGES)
                 | u64::from(RGFX_FEATURE_PAGES_BUFFERS)
                 | u64::from(RGFX_FEATURE_HEAP_OVER_PAGES);
@@ -378,6 +379,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 | RGFX_FEATURE_SCHEDULED_ASK
                 | RGFX_FEATURE_DISPLAY_SCALE
                 | RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA
+                | RGFX_FEATURE_DISPLAY_POWER
                 | if gpu_device.makes_opencl_mode_pipelines() {
                     u64::from(RGFX_FEATURE_OPENCL_MODE)
                 } else {
@@ -2465,14 +2467,25 @@ const RAISE_THREADS: [&str; 11] = [
     "reims-vgpu.graphics-closes-",
 ];
 
-/// What the window and its sink share: the scanout the guest set, and the drawable the window's
-/// render thread last drew into: its size in pixels, and its pixels a point.
+/// What the window and its sink share: the scanout the guest set, whether the display's panel is
+/// off, and the drawable the window's render thread last drew into: its size in pixels, and its
+/// pixels a point.
 #[derive(Debug, Default)]
 pub(crate) struct Shown {
     /// The guest's scanout; `None` shows black.
     pub(crate) scanout: Mutex<Option<Scanout>>,
+    /// The display's panel is off (`SET_DISPLAY_POWER`, the guest's display asleep): the window
+    /// and the host's reads show black, whatever the scanout or the presented surface.
+    pub(crate) asleep: AtomicBool,
     /// The window's drawable, once drawn into.
     pub(crate) drawable: Mutex<Option<Drawable>>,
+}
+
+impl Shown {
+    /// Whether the display's panel is off.
+    pub(crate) fn asleep(&self) -> bool {
+        self.asleep.load(Ordering::Acquire)
+    }
 }
 
 /// A drawable the window's render thread drew into.
@@ -2513,13 +2526,15 @@ pub(crate) struct WindowScreen {
 }
 
 /// The guest's cursor, as the window shows it: over the image while the guest has an image and
-/// shows it.
+/// shows it, and the display's panel is on.
 #[derive(Debug)]
 struct CursorState {
     /// The guest has an image.
     image: bool,
     /// The guest shows its cursor: until it says otherwise, it does.
     visible: bool,
+    /// The display's panel is off: no cursor shows.
+    asleep: bool,
     /// What the window was last told, once told.
     shown: Option<bool>,
 }
@@ -2527,7 +2542,7 @@ struct CursorState {
 impl CursorState {
     /// Whether the cursor shows, where that changed since it was last told.
     fn changed(&mut self) -> Option<bool> {
-        let show = self.image && self.visible;
+        let show = self.image && self.visible && !self.asleep;
         if self.shown == Some(show) {
             return None;
         }
@@ -2579,6 +2594,7 @@ impl HostCursor {
             state: Mutex::new(CursorState {
                 image: false,
                 visible: true,
+                asleep: false,
                 shown: Some(false),
             }),
             position: AtomicU32::new(0),
@@ -2592,9 +2608,19 @@ impl HostCursor {
         }
     }
 
-    /// Tells the host whether the cursor shows, where that changed.
+    /// Tells the host whether the cursor shows, where that changed: each change a debug line of
+    /// its own target (`reims_vgpu::graphics::cursor`), which a boot's check of the display's
+    /// sleep reads.
     fn tell_shown(&self, state: &mut CursorState) {
-        if let Some(show) = state.changed()
+        let show = state.changed();
+        if let Some(show) = show {
+            log::debug!(
+                target: "reims_vgpu::graphics::cursor",
+                "the host is told the guest's cursor {}",
+                if show { "shows" } else { "is hidden" }
+            );
+        }
+        if let Some(show) = show
             && let Some(f) = &self.show
         {
             let f = Arc::clone(f);
@@ -2635,6 +2661,14 @@ impl HostCursor {
         self.tell_shown(&mut state);
     }
 
+    /// The display's panel went off (`on` false) or on: while it is off, the host is told the
+    /// cursor does not show.
+    fn power(&self, on: bool) {
+        let mut state = self.state.lock();
+        state.asleep = !on;
+        self.tell_shown(&mut state);
+    }
+
     /// Where the guest last put its cursor's hot spot.
     fn position(&self) -> (u16, u16) {
         let p = self.position.load(Ordering::Acquire);
@@ -2664,6 +2698,11 @@ impl Screen for HeadlessScreen {
     fn cursor_image(&self, _image: Option<CursorImage>) {}
 
     fn cursor_moved(&self, _x: i32, _y: i32, _visible: bool) {}
+
+    /// The host's reads of the display show black while the panel is off.
+    fn power(&self, on: bool) {
+        self.shown.asleep.store(!on, Ordering::Release);
+    }
 }
 
 /// The device's [`Screen`]: each call goes to the screen it holds, which the host's reads of
@@ -2696,6 +2735,11 @@ impl Screen for SharedScreen {
     fn cursor_moved(&self, x: i32, y: i32, visible: bool) {
         self.cursor.moved(x, y, visible);
         self.screen.cursor_moved(x, y, visible);
+    }
+
+    fn power(&self, on: bool) {
+        self.cursor.power(on);
+        self.screen.power(on);
     }
 }
 
@@ -2735,6 +2779,7 @@ impl WindowScreen {
             cursor: Mutex::new(CursorState {
                 image: false,
                 visible: true,
+                asleep: false,
                 shown: None,
             }),
         };
@@ -2847,9 +2892,10 @@ impl Screen for WindowScreen {
     }
 
     /// The window draws the scanout again where it shows it; while it shows a presented surface,
-    /// a refresh draws nothing, and the guest's presents draw it ([`Presented`]).
+    /// or black while the display's panel is off, a refresh draws nothing, and the guest's
+    /// presents draw (`Presented`).
     fn present(&self) {
-        if !(self.shows_surface)() {
+        if !self.shown.asleep() && !(self.shows_surface)() {
             self.window.new_frame();
         }
     }
@@ -2877,6 +2923,17 @@ impl Screen for WindowScreen {
         let mut cursor = self.cursor.lock();
         cursor.visible = visible;
         cursor.update(&self.window);
+    }
+
+    /// The window shows black, and no guest cursor, while the panel is off, and what the guest
+    /// shows again once it is on: a frame is drawn at each change.
+    fn power(&self, on: bool) {
+        self.shown.asleep.store(!on, Ordering::Release);
+        let mut cursor = self.cursor.lock();
+        cursor.asleep = !on;
+        cursor.update(&self.window);
+        drop(cursor);
+        self.window.new_frame();
     }
 }
 

@@ -1328,6 +1328,11 @@ only where no negotiation can carry it.
   made after the call among them. Every host offers it, and the kext takes
   it; a guest that did not take it posts nothing, and the copy keeps what it
   took.
+- Bit 37, `FEATURES_HI`'s bit 5, is `DISPLAY_POWER`: ring 0 carries
+  `SET_DISPLAY_POWER` (8, `RgfxSetDisplayPower`: display u32, on u32),
+  answered by `COMPLETE`, which turns the display's panel off while the
+  guest's display sleeps and on at its wake ("The display's sleep", below).
+  Every host offers it, and the x86-64 kext takes it.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -1429,7 +1434,7 @@ only by its name ("Shared events across processes"): the process that makes an
 event of another's posts its own `SHARED_EVENT_IMPORT`, an object message of
 its context's, which its buffers that name the event wait for, and the kext's
 `SHARED_EVENT_UNNAME` is context 0's, which no buffer is. A
-display command (`GET_DISPLAYS` to `DISPLAY_COLOR`) or a `SURFACE_DOWNLOAD`
+display command (`GET_DISPLAYS` to `SET_DISPLAY_POWER`) or a `SURFACE_DOWNLOAD`
 holds up no buffer: none reads what they make. A present waits for the writers
 the guest's record of its surface names, whatever the host has taken, those of
 a queue created just before among them: the device tells the host of a queue
@@ -1811,6 +1816,7 @@ named.
 | 3 | `SET_CURSOR` | display u32, width u32, height u32, hot_x u32, hot_y u32, offset u64 of a BGRA8 premultiplied image; width 0 removes the image | `COMPLETE` |
 | 4 | `MOVE_CURSOR` | display u32, x i32, y i32, visible u32 | none |
 | 5 | `SET_VBLANK` | display u32, enabled u32 | `COMPLETE` |
+| 8 | `SET_DISPLAY_POWER` | display u32, on u32; 0 turns the display's panel off (`DISPLAY_POWER`) | `COMPLETE` |
 
 Scanout pixels are 32-bit BGRA8 (`kIO32BGRAPixelFormat`), the one format in
 stage 2.
@@ -1935,6 +1941,27 @@ IOPresentment's configuration format), 12 (a surface copy) and 13 (triage) stay
 refused: no WindowServer seen calls them, and IOPresentment sends 11 only for a
 gamma entry of the configuration type (1), which the AMD adds as a second entry
 where its display path has it and the device control does not answer.
+
+**The display's sleep.** A Mac's display goes dark when the OS puts it to
+sleep (Energy Saver's timer, `pmset displaysleepnow`), and lights with the
+desktop at its wake. Where the guest took `DISPLAY_POWER`, the kext sends
+`SET_DISPLAY_POWER` with `on` 0 as the guest's display sleeps and 1 as it
+wakes (`guest/kext/src/RgfxDisplayPower.hpp`). The x86-64 framebuffer stays
+out of power management, so it hears of the sleep from the OS's display
+wrangler (`IODisplayWrangler`), whose power messages its general interest
+takes: the panel goes dark as the wrangler goes below its dimmed state (3),
+and lights as it is dimmed or on again. An arm64 guest has no display
+wrangler, and the arm64e framebuffer does not take `DISPLAY_POWER`, so its
+panel stays lit through the display's sleep. The host's panel follows, as a
+monitor's does: while it is off, the display's window and the host's reads of
+the display (`rvg_graphics_device_read_display`, QEMU's console) show black,
+and the host is told the guest's cursor does not show (`cursor_show`). Nothing
+else changes: the guest's scanout and presents are taken and answered as with
+the panel on, `VBLANK`s go on, and modes and the cursor's image stay, so the
+guest's compositor runs as before and the first frame after the wake shows
+what the guest shows then. The device's reset turns the panel on. The host
+code is `reims_vgpu_graphics`'s `control.rs` (the command) and
+`crates/reims-vgpu/src/graphics/sink.rs` ("The panel").
 
 **The display pipe's notification words.** The kext answers a pipe client with
 asynchronous results whose words IOAccelerator's notification callbacks read

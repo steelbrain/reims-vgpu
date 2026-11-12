@@ -27,6 +27,11 @@
 //! the pass took 0.78 ms of the GPU's time with its clear and 0.80 ms without (measured
 //! 2026-11-08, the median of about 330 draws each): the clear there costs nothing measurable.
 //!
+//! **The panel.** While the display's panel is off (`SET_DISPLAY_POWER`, the guest's display
+//! asleep), a draw clears the drawable to black and draws nothing of the guest's: the presents it
+//! takes are answered as any draw's, so the guest's compositor runs on as with a lit panel, and
+//! its first draw once the panel is on shows what the guest shows then.
+//!
 //! **The display's colour.** While any stage of the display pipe's colour is on (`color`: gamma
 //! tables and a colour matrix a transaction set), the draw puts what the display shows through it:
 //! a presented surface is drawn into the drawable by the colour's fragment function
@@ -588,14 +593,21 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
     /// A command buffer of the sink's queue with what the display shows drawn into `texture` at
     /// `region`, as [`Self::encode`] draws it, not committed, and the hold of the block of the
     /// presented surface it reads, where it draws one: the caller keeps it until the buffer has
-    /// finished. `None`, with nothing encoded, where the guest has no scanout or the queue gives
-    /// no command buffer. It answers no present, so the host's reads of the display
+    /// finished; all of `texture` cleared to black while the display's panel is off (the module
+    /// doc, "The panel"). `None`, with nothing encoded, where the guest has no scanout or the queue
+    /// gives no command buffer. It answers no present, so the host's reads of the display
     /// (`graphics::read`) draw with it.
     pub(crate) fn encode_shown(
         &self,
         texture: &P::Texture,
         region: PixelRect,
     ) -> Option<(P::CommandBuffer, Option<Arc<DisplayHold>>)> {
+        if self.shown.asleep() {
+            // The display's panel is off: black, whatever the guest shows.
+            let command_buffer = no_catch(self.queue.command_buffer(OnFault::Die))?;
+            self.clear(&command_buffer, texture);
+            return Some((command_buffer, None));
+        }
         let (changes, color) = self.presented.color();
         let color = (!color.is_identity()).then_some((changes, color));
         if let Some((surface, hold)) = self.presented.shown() {

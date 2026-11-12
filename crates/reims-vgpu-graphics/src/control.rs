@@ -37,6 +37,10 @@ pub(crate) fn answer(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
         RGFX_CMD_SET_VBLANK => read(message).map_or(RGFX_STATUS_INVALID_ARGUMENT, |command| {
             set_vblank(shared, &command)
         }),
+        RGFX_CMD_SET_DISPLAY_POWER => read(message)
+            .map_or(RGFX_STATUS_INVALID_ARGUMENT, |command| {
+                set_display_power(shared, &command)
+            }),
         // A command buffer rides a command queue's own ring, never the control ring.
         _ => RGFX_STATUS_UNKNOWN_COMMAND,
     };
@@ -443,5 +447,28 @@ fn set_vblank(shared: &Shared, command: &RgfxSetVblank) -> u32 {
         return RGFX_STATUS_NO_DISPLAY;
     }
     shared.display.lock().vblank = command.enabled != 0;
+    RGFX_STATUS_OK
+}
+
+/// `SET_DISPLAY_POWER`: the screen is told where the panel's state changes. The display's
+/// scanout, presents and `VBLANK`s go on either way (`display`'s module doc).
+fn set_display_power(shared: &Shared, command: &RgfxSetDisplayPower) -> u32 {
+    if command.display != 0 {
+        return RGFX_STATUS_NO_DISPLAY;
+    }
+    let asleep = command.on == 0;
+    let changed = {
+        let mut display = shared.display.lock();
+        std::mem::replace(&mut display.asleep, asleep) != asleep
+    };
+    if changed {
+        log::info!(
+            target: "reims_vgpu_graphics",
+            "the display's panel is {}: the guest's display {}",
+            if asleep { "off" } else { "on" },
+            if asleep { "sleeps" } else { "woke" }
+        );
+        shared.screen.power(!asleep);
+    }
     RGFX_STATUS_OK
 }

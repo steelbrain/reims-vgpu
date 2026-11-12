@@ -289,6 +289,7 @@ include = [
     "RgfxScheduledAsk",
     "RgfxScissorRectElem",
     "RgfxSetCursor",
+    "RgfxSetDisplayPower",
     "RgfxSetScanout",
     "RgfxSetVblank",
     "RgfxSharedEventCreate",

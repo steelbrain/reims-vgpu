@@ -18,6 +18,12 @@
 //! **Cursor.** `SET_CURSOR` copies the guest's image, premultiplied BGRA8, out of the region,
 //! and hands the screen straight-alpha RGBA ([`straight_rgba`]); `MOVE_CURSOR` tells it where the
 //! cursor is and whether it shows.
+//!
+//! **The panel.** `SET_DISPLAY_POWER` turns the display's panel off while the guest's display
+//! sleeps and on at its wake ([`Screen::power`]): while it is off, the screen shows black and no
+//! cursor, and everything else goes on (the scanout, presents and their answers, the cursor's
+//! commands, `VBLANK`), so the screen shows what the guest set meanwhile once it is on. A reset
+//! turns it on.
 
 /// A display mode: pixels each way and a refresh rate, and the scale of the host screen that
 /// shows it.
@@ -107,6 +113,12 @@ pub trait Screen: Send + Sync + 'static {
     /// The guest moved its cursor's hot spot to (`x`, `y`) in the display's pixels, and shows it
     /// where `visible`.
     fn cursor_moved(&self, x: i32, y: i32, visible: bool);
+
+    /// The display's panel went off (`on` false: the guest's display sleeps) or on again
+    /// (`SET_DISPLAY_POWER`, or a reset of a device whose panel was off). While it is off the
+    /// screen shows black, with no cursor, whatever the guest sets; on, it shows what the guest
+    /// set, and its cursor, again.
+    fn power(&self, on: bool);
 }
 
 /// A screen that shows nothing, with a fixed mode: a display with no window.
@@ -125,6 +137,8 @@ impl Screen for FixedScreen {
     fn cursor_image(&self, _image: Option<CursorImage>) {}
 
     fn cursor_moved(&self, _x: i32, _y: i32, _visible: bool) {}
+
+    fn power(&self, _on: bool) {}
 }
 
 /// The guest's premultiplied BGRA8 pixels as straight-alpha RGBA: each colour divided by the
