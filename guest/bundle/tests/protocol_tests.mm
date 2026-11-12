@@ -1703,13 +1703,13 @@ struct SamplerAsker {
 	uint64_t id = 1;
 	uint32_t status = RGFX_STATUS_OK;
 	bool answers = true;
-	std::vector<RgfxSamplerCreate> asked;
+	std::vector<RgfxSamplerCreateWhole> asked;
 
 	static bool ask(void *context, const void *message, uint32_t size, void *reply,
 	                uint32_t capacity, uint32_t *reply_size)
 	{
 		SamplerAsker *self = static_cast<SamplerAsker *>(context);
-		RgfxSamplerCreate m = {};
+		RgfxSamplerCreateWhole m = {};
 		CHECK(size == sizeof(m));
 		std::memcpy(&m, message, sizeof(m));
 		self->asked.push_back(m);
@@ -1727,7 +1727,9 @@ struct SamplerAsker {
 };
 
 // A sampler takes the resource id its create was answered with, and is nil where the device
-// refused it or no answer came back; with no asker its create goes on the ring unanswered.
+// refused it or no answer came back; with no asker its create goes on the ring unanswered. The
+// create carries the descriptor's lodBias and reductionMode in its extension, Metal's defaults
+// where the descriptor has neither.
 void test_sampler_resource_ids()
 {
 	TestRing control(0x8000);
@@ -1745,18 +1747,28 @@ void test_sampler_resource_ids()
 	d.minFilter = MTLSamplerMinMagFilterLinear;
 	d.supportArgumentBuffers = YES;
 	d.lodMaxClamp = 4.0f;
+	const BOOL extended = [d respondsToSelector:@selector(setLodBias:)] &&
+	                      [d respondsToSelector:@selector(setReductionMode:)];
+	if (extended) {
+		d.lodBias = 1.5f;
+		d.reductionMode = MTLSamplerReductionModeMinimum;
+	}
 	RgfxSampler *a = [RgfxSampler samplerWithDescriptor:d device:nil serializer:&ser];
 	RgfxSampler *b = [RgfxSampler samplerWithDescriptor:d device:nil serializer:&ser];
 	CHECK(a != nil && b != nil);
 	CHECK(a.gpuResourceID._impl == 7 && b.gpuResourceID._impl == 8);
 	CHECK(asker.asked.size() == 2);
-	const RgfxSamplerCreate &m = asker.asked[0];
-	CHECK(m.header.type == RGFX_CMD_SAMPLER_CREATE && m.header.size == sizeof(m));
-	CHECK(m.obj_id == a.rgfxObjId && asker.asked[1].obj_id == b.rgfxObjId);
-	CHECK(m.min_filter == MTLSamplerMinMagFilterLinear && (m.flags & 0x4) != 0);
+	const RgfxSamplerCreateWhole &m = asker.asked[0];
+	CHECK(m.create.header.type == RGFX_CMD_SAMPLER_CREATE && m.create.header.size == sizeof(m));
+	CHECK(m.create.obj_id == a.rgfxObjId && asker.asked[1].create.obj_id == b.rgfxObjId);
+	CHECK(m.create.min_filter == MTLSamplerMinMagFilterLinear && (m.create.flags & 0x4) != 0);
 	float lod = 0;
-	std::memcpy(&lod, &m.lod_max_clamp_bits, sizeof(lod));
+	std::memcpy(&lod, &m.create.lod_max_clamp_bits, sizeof(lod));
 	CHECK(lod == 4.0f);
+	float bias = -1.0f;
+	std::memcpy(&bias, &m.ext.lod_bias_bits, sizeof(bias));
+	CHECK(extended ? bias == 1.5f && m.ext.reduction_mode == MTLSamplerReductionModeMinimum
+	               : bias == 0.0f && m.ext.reduction_mode == 0);
 	RgfxMsgHeader h = {};
 	std::vector<uint8_t> bytes;
 	CHECK(!control.next(&h, &bytes)); // asked, not posted
@@ -1770,7 +1782,7 @@ void test_sampler_resource_ids()
 	ser.setAsker(nullptr, nullptr);
 	RgfxSampler *plain = [RgfxSampler samplerWithDescriptor:d device:nil serializer:&ser];
 	CHECK(plain != nil && plain.gpuResourceID._impl == 0);
-	(void)expectMessage<RgfxSamplerCreate>(control, RGFX_CMD_SAMPLER_CREATE);
+	(void)expectMessage<RgfxSamplerCreateWhole>(control, RGFX_CMD_SAMPLER_CREATE);
 	} // @autoreleasepool
 }
 

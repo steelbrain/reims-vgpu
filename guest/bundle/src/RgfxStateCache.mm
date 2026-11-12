@@ -144,14 +144,12 @@ private:
 	size_t m_pruneAt = 4 * kKept;
 };
 
-/// A sampler descriptor's state: what SAMPLER_CREATE carries, and the two properties it does
-/// not (lodBias and reductionMode, macOS 26), which Metal compares too.
+/// A sampler descriptor's state: what SAMPLER_CREATE carries, its extension's lodBias and
+/// reductionMode (macOS 26) among it.
 struct RgfxSamplerKeyState {
 	RgfxSamplerParams params;
-	float lod_bias;
-	uint32_t reduction_mode;
 };
-static_assert(sizeof(RgfxSamplerKeyState) == sizeof(RgfxSamplerParams) + 8, "no padding");
+static_assert(sizeof(RgfxSamplerKeyState) == sizeof(RgfxSamplerParams), "no padding");
 
 /// A depth/stencil descriptor's state, as DEPTH_STENCIL_CREATE carries it.
 struct RgfxDepthStencilKeyState {
@@ -203,14 +201,11 @@ NSString *rgfxStateLabel(NSString *label)
 {
 	if (_serializer == nullptr || descriptor == nil)
 		return nil;
-	static const BOOL hasLodBias = [descriptor respondsToSelector:@selector(lodBias)];
-	static const BOOL hasReduction = [descriptor respondsToSelector:@selector(reductionMode)];
 	RgfxStateKey<RgfxSamplerKeyState> key = {};
 	key.state.params = RgfxSamplerParamsOf(descriptor);
 	key.state.params.lod_min_clamp = rgfxCanonicalFloat(key.state.params.lod_min_clamp);
 	key.state.params.lod_max_clamp = rgfxCanonicalFloat(key.state.params.lod_max_clamp);
-	key.state.lod_bias = hasLodBias ? rgfxCanonicalFloat(descriptor.lodBias) : 0.0f;
-	key.state.reduction_mode = hasReduction ? static_cast<uint32_t>(descriptor.reductionMode) : 0;
+	key.state.params.lod_bias = rgfxCanonicalFloat(key.state.params.lod_bias);
 	key.label = rgfxStateLabel(descriptor.label);
 	id<MTLDevice> device = _device;
 	RgfxSerializer *serializer = _serializer;

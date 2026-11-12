@@ -127,8 +127,8 @@ pub struct HeapMade<P: Platform> {
 
 /// `MTLSamplerDescriptor`, as a value: each field is sent when set. Order: min filter, mag filter,
 /// LOD average, compare function, S, T and R address modes, mip filter, max anisotropy,
-/// normalized coordinates, argument buffer support, reduction mode, LOD min and max clamps,
-/// border colour, resource index.
+/// normalized coordinates, argument buffer support, reduction mode, LOD min and max clamps, LOD
+/// bias, border colour, resource index.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 #[allow(missing_docs)] // each field is its setter's argument, named after it
 pub struct SamplerDesc {
@@ -146,6 +146,8 @@ pub struct SamplerDesc {
     pub reduction_mode: Option<u64>,
     pub lod_min_clamp: Option<f32>,
     pub lod_max_clamp: Option<f32>,
+    /// `setLodBias:` (macOS 26).
+    pub lod_bias: Option<f32>,
     pub border_color: Option<u64>,
     /// `setResourceIndex:` (SPI).
     pub resource_index: Option<u64>,

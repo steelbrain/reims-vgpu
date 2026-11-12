@@ -665,26 +665,28 @@ RgfxCreated RgfxSerializer::createSampler(const RgfxSamplerParams &params)
 	RgfxCreated out = {};
 	out.obj_id = m_ids.allocObjId();
 
-	RgfxSamplerCreate msg = {};
-	msg.obj_id = out.obj_id;
-	msg.min_filter = params.min_filter;
-	msg.mag_filter = params.mag_filter;
-	msg.mip_filter = params.mip_filter;
-	msg.s_address_mode = params.s_address_mode;
-	msg.t_address_mode = params.t_address_mode;
-	msg.r_address_mode = params.r_address_mode;
-	msg.border_color = params.border_color;
-	msg.compare_function = params.compare_function;
-	msg.max_anisotropy = params.max_anisotropy;
-	msg.lod_min_clamp_bits = floatBits(params.lod_min_clamp);
-	msg.lod_max_clamp_bits = floatBits(params.lod_max_clamp);
-	msg.flags = params.flags;
+	RgfxSamplerCreateWhole msg = {};
+	msg.create.obj_id = out.obj_id;
+	msg.create.min_filter = params.min_filter;
+	msg.create.mag_filter = params.mag_filter;
+	msg.create.mip_filter = params.mip_filter;
+	msg.create.s_address_mode = params.s_address_mode;
+	msg.create.t_address_mode = params.t_address_mode;
+	msg.create.r_address_mode = params.r_address_mode;
+	msg.create.border_color = params.border_color;
+	msg.create.compare_function = params.compare_function;
+	msg.create.max_anisotropy = params.max_anisotropy;
+	msg.create.lod_min_clamp_bits = floatBits(params.lod_min_clamp);
+	msg.create.lod_max_clamp_bits = floatBits(params.lod_max_clamp);
+	msg.create.flags = params.flags;
+	msg.ext.reduction_mode = params.reduction_mode;
+	msg.ext.lod_bias_bits = floatBits(params.lod_bias);
 	if (m_ask == nullptr) {
 		out.posted = m_control.tryPost(RGFX_CMD_SAMPLER_CREATE, &msg, sizeof(msg), &out.seqno);
 		return out;
 	}
-	msg.header.type = RGFX_CMD_SAMPLER_CREATE;
-	msg.header.size = sizeof(msg);
+	msg.create.header.type = RGFX_CMD_SAMPLER_CREATE;
+	msg.create.header.size = sizeof(msg);
 	RgfxSamplerState answer = {};
 	uint32_t length = 0;
 	out.posted = m_ask(m_askContext, &msg, sizeof(msg), &answer, sizeof(answer), &length) &&

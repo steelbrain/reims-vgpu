@@ -72,7 +72,20 @@ struct RgfxSamplerParams {
 	float lod_min_clamp;
 	float lod_max_clamp;
 	uint32_t flags; // bit 0 normalized coords, bit 1 LOD average, bit 2 argument-buffer usable
+	uint32_t reduction_mode; // MTLSamplerReductionMode, SAMPLER_CREATE's extension
+	float lod_bias;          // lodBias, SAMPLER_CREATE's extension
 };
+
+/// SAMPLER_CREATE as the serialiser sends it: the create and its extension
+/// (RGFX_SAMPLER_CREATE_EXT_OFFSET), the reduction mode and the LOD bias.
+struct RgfxSamplerCreateWhole {
+	RgfxSamplerCreate create;
+	RgfxSamplerCreateExt ext;
+};
+static_assert(offsetof(RgfxSamplerCreateWhole, ext) == RGFX_SAMPLER_CREATE_EXT_OFFSET &&
+                  sizeof(RgfxSamplerCreateWhole) ==
+                      RGFX_SAMPLER_CREATE_EXT_OFFSET + sizeof(RgfxSamplerCreateExt),
+              "SAMPLER_CREATE and its extension");
 
 /// A function reference a pipeline draws from: the library it lives in, its
 /// entry-point name, and the function constants that specialise it (`constants`

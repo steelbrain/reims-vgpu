@@ -2370,7 +2370,7 @@
 // [`RgfxSamplerCreate`]. A message whose `size` is at least
 // `RGFX_SAMPLER_CREATE_EXT_OFFSET + size_of::<RgfxSamplerCreateExt>()` carries it; one of
 // `RGFX_SAMPLER_CREATE_EXT_OFFSET` none, and its sampler has Metal's defaults for both fields.
-// The host does not read it yet.
+// The bundle sends it with every create, and the host makes the sampler with both fields.
 #define RGFX_SAMPLER_CREATE_EXT_OFFSET 72
 
 // Where a `LIBRARY_CREATE` message's bytes start: right after its header.

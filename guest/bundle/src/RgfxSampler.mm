@@ -9,10 +9,13 @@
 
 #include "RgfxSerializer.hpp" // RgfxSerializer, RgfxSamplerParams
 
-// Each enum is carried as its Metal raw value; the LOD clamps travel as floats (the serialiser
-// stores their bits); the three booleans pack into `flags`.
+// Each enum is carried as its Metal raw value; the LOD clamps and bias travel as floats (the
+// serialiser stores their bits); the three booleans pack into `flags`. lodBias and reductionMode
+// are Metal's defaults, 0 and weighted average, where the descriptor has neither (before macOS 26).
 RgfxSamplerParams RgfxSamplerParamsOf(MTLSamplerDescriptor *d)
 {
+	static const BOOL hasLodBias = [d respondsToSelector:@selector(lodBias)];
+	static const BOOL hasReduction = [d respondsToSelector:@selector(reductionMode)];
 	RgfxSamplerParams out = {};
 	out.min_filter = static_cast<uint32_t>(d.minFilter);
 	out.mag_filter = static_cast<uint32_t>(d.magFilter);
@@ -27,6 +30,8 @@ RgfxSamplerParams RgfxSamplerParamsOf(MTLSamplerDescriptor *d)
 	out.lod_max_clamp = d.lodMaxClamp;
 	out.flags = (d.normalizedCoordinates ? 0x1u : 0u) | (d.lodAverage ? 0x2u : 0u) |
 	            (d.supportArgumentBuffers ? 0x4u : 0u);
+	out.reduction_mode = hasReduction ? static_cast<uint32_t>(d.reductionMode) : 0;
+	out.lod_bias = hasLodBias ? d.lodBias : 0.0f;
 	return out;
 }
 

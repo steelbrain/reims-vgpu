@@ -922,7 +922,7 @@ struct SamplerAnswer {
 		answer.header = {RGFX_EVT_SAMPLER_STATE, sizeof(answer), 0};
 		answer.status = RGFX_STATUS_OK;
 		answer.gpu_resource_id = static_cast<SamplerAnswer *>(context)->id;
-		CHECK(size == sizeof(RgfxSamplerCreate) && message != nullptr);
+		CHECK(size == sizeof(RgfxSamplerCreateWhole) && message != nullptr);
 		CHECK(capacity >= sizeof(answer));
 		std::memcpy(reply, &answer, sizeof(answer));
 		*reply_size = sizeof(answer);
@@ -1093,7 +1093,7 @@ struct CountingSamplerAnswer {
 		answer.header = {RGFX_EVT_SAMPLER_STATE, sizeof(answer), 0};
 		answer.status = self->status.load();
 		answer.gpu_resource_id = answer.status == RGFX_STATUS_OK ? self->next++ : 0;
-		CHECK(size == sizeof(RgfxSamplerCreate) && message != nullptr);
+		CHECK(size == sizeof(RgfxSamplerCreateWhole) && message != nullptr);
 		CHECK(capacity >= sizeof(answer));
 		std::memcpy(reply, &answer, sizeof(answer));
 		*reply_size = sizeof(answer);

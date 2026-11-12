@@ -230,9 +230,9 @@ fn placement(resource_index: Option<(u64, bool)>) -> rt::IdPlacement {
 
 /// A sampler descriptor's debug line ([the module docs](self)): the selector, then each property
 /// of `SamplerDesc` raw, `unset` for one the value does not set: the min, mag and mip filters,
-/// the address modes, the border colour, normalized coordinates, the LOD clamps and average, the
-/// maximum anisotropy, the compare function, the reduction mode, `supportArgumentBuffers` and the
-/// resource index.
+/// the address modes, the border colour, normalized coordinates, the LOD clamps, bias and
+/// average, the maximum anisotropy, the compare function, the reduction mode,
+/// `supportArgumentBuffers` and the resource index.
 pub struct Sampler<'a>(pub &'a SamplerDesc);
 
 /// A property of a [`Sampler`] line: its value, or `unset`.
@@ -254,7 +254,7 @@ impl std::fmt::Display for Sampler<'_> {
             f,
             "newSamplerStateWithDescriptor: min filter {}, mag filter {}, mip filter {}, address \
              modes s {} t {} r {}, border colour {}, normalized coordinates {}, lod min {} max {} \
-             average {}, max anisotropy {}, compare function {}, reduction mode {}, \
+             bias {} average {}, max anisotropy {}, compare function {}, reduction mode {}, \
              supportArgumentBuffers {}, resource index {}",
             Set(d.min_filter),
             Set(d.mag_filter),
@@ -266,6 +266,7 @@ impl std::fmt::Display for Sampler<'_> {
             Set(d.normalized_coordinates),
             Set(d.lod_min_clamp),
             Set(d.lod_max_clamp),
+            Set(d.lod_bias),
             Set(d.lod_average),
             Set(d.max_anisotropy),
             Set(d.compare_function),
@@ -323,6 +324,16 @@ fn sampler_descriptor(d: &SamplerDesc) -> (SamplerDescriptor, rt::SamplerStateOp
     }
     if let Some(v) = d.lod_max_clamp {
         s.lod_max_clamp = v;
+    }
+    // The runtime's descriptor holds no LOD bias: a sampler of one samples at bias 0, relayed.
+    if let Some(bias) = d.lod_bias
+        && bias != 0.0
+    {
+        crate::answer::inexact(
+            "setLodBias:",
+            crate::answer::Inexact::SamplerLodBias,
+            || format!("a sampler's LOD bias ({bias})"),
+        );
     }
     if let Some(v) = d.border_color {
         s.border_color = rt::sampler_border_color(v);
@@ -1250,6 +1261,7 @@ mod tests {
             reduction_mode: Some(0),
             lod_min_clamp: Some(0.0),
             lod_max_clamp: Some(f32::MAX),
+            lod_bias: Some(-0.5),
             border_color: Some(1),
             resource_index: None,
         };
@@ -1257,15 +1269,17 @@ mod tests {
             Sampler(&d).to_string(),
             "newSamplerStateWithDescriptor: min filter 2, mag filter 1, mip filter 0, address \
              modes s 0 t 2 r 5, border colour 1, normalized coordinates true, lod min 0 max \
-             340282350000000000000000000000000000000 average false, max anisotropy 16, compare \
-             function 7, reduction mode 0, supportArgumentBuffers true, resource index unset"
+             340282350000000000000000000000000000000 bias -0.5 average false, max anisotropy 16, \
+             compare function 7, reduction mode 0, supportArgumentBuffers true, resource index \
+             unset"
         );
         assert_eq!(
             Sampler(&SamplerDesc::default()).to_string(),
             "newSamplerStateWithDescriptor: min filter unset, mag filter unset, mip filter unset, \
              address modes s unset t unset r unset, border colour unset, normalized coordinates \
-             unset, lod min unset max unset average unset, max anisotropy unset, compare function \
-             unset, reduction mode unset, supportArgumentBuffers unset, resource index unset"
+             unset, lod min unset max unset bias unset average unset, max anisotropy unset, \
+             compare function unset, reduction mode unset, supportArgumentBuffers unset, resource \
+             index unset"
         );
     }
 

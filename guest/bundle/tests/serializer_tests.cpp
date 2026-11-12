@@ -963,7 +963,8 @@ void test_lifecycle_messages()
 	CHECK(tvm.texture_type == 2 && tvm.level_count == 1 && tvm.slice_count == 1);
 	CHECK(tvm.swizzle == 0x05020202);
 
-	// Sampler: the float clamps are stored as bits.
+	// Sampler: the float clamps and bias are stored as bits, the reduction mode and the bias in
+	// the create's extension.
 	RgfxSamplerParams sp = {};
 	sp.min_filter = 1;
 	sp.mag_filter = 1;
@@ -972,13 +973,18 @@ void test_lifecycle_messages()
 	sp.lod_min_clamp = 0.0f;
 	sp.lod_max_clamp = 7.5f;
 	sp.flags = 0x1;
+	sp.reduction_mode = 2;
+	sp.lod_bias = -1.25f;
 	RgfxCreated s = ser.createSampler(sp);
 	CHECK(s.posted);
-	auto sm = expectMessage<RgfxSamplerCreate>(ring, RGFX_CMD_SAMPLER_CREATE);
-	CHECK(sm.obj_id == s.obj_id && sm.max_anisotropy == 4 && sm.flags == 0x1);
+	auto sm = expectMessage<RgfxSamplerCreateWhole>(ring, RGFX_CMD_SAMPLER_CREATE);
+	CHECK(sm.create.obj_id == s.obj_id && sm.create.max_anisotropy == 4 && sm.create.flags == 0x1);
 	float lodMax;
-	std::memcpy(&lodMax, &sm.lod_max_clamp_bits, 4);
+	std::memcpy(&lodMax, &sm.create.lod_max_clamp_bits, 4);
 	CHECK(lodMax == 7.5f);
+	float bias;
+	std::memcpy(&bias, &sm.ext.lod_bias_bits, 4);
+	CHECK(sm.ext.reduction_mode == 2 && bias == -1.25f);
 
 	// Depth/stencil.
 	RgfxStencilDescriptor front = {};

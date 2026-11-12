@@ -112,26 +112,26 @@ use reims_vgpu_graphics::wire::{
     RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE, RGFX_RENDER_PIPELINE_ALPHA_TO_ONE,
     RGFX_RENDER_PIPELINE_PRIVATE_STATE, RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED,
     RGFX_RENDER_PIPELINE_SUPPORT_ICB, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_LIMIT,
-    RGFX_RESOURCE_ID_SMALL_CHUNK, RGFX_RESOURCE_ID_SMALL_CHUNKS, RGFX_STATUS_CACHE,
-    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_SURFACE_FACTS_OFFSET,
-    RGFX_SURFACE_NO_WRITERS, RGFX_SURFACE_PAGES_ASK_CACHE, RGFX_SURFACE_PAGES_ATTACH,
-    RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_DEFERRED, RGFX_SURFACE_PAGES_PRIVATE,
-    RGFX_YCBCR_MATRIX_DCI_P3, RGFX_YCBCR_MATRIX_ITU_R_601_4, RGFX_YCBCR_MATRIX_ITU_R_709_2,
-    RGFX_YCBCR_MATRIX_ITU_R_2020, RGFX_YCBCR_MATRIX_NONE, RGFX_YCBCR_MATRIX_OTHER,
-    RGFX_YCBCR_MATRIX_P3_D65, RGFX_YCBCR_MATRIX_SMPTE_240M_1995, RgfxBufferAtOffset,
-    RgfxBufferCreate, RgfxBufferOverHostMemory, RgfxBufferOverPages, RgfxCbComplete,
-    RgfxCbScheduled, RgfxCbSubmitted, RgfxColorAttachmentDesc, RgfxComputePipelineCreate,
-    RgfxDepthStencilCreate, RgfxEventSignalled, RgfxFunctionConstant, RgfxHeapCreate,
-    RgfxHeapOverHostMemory, RgfxHeapOverPages, RgfxHeapTextureSizeAndAlign,
+    RGFX_RESOURCE_ID_SMALL_CHUNK, RGFX_RESOURCE_ID_SMALL_CHUNKS, RGFX_SAMPLER_CREATE_EXT_OFFSET,
+    RGFX_STATUS_CACHE, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
+    RGFX_SURFACE_FACTS_OFFSET, RGFX_SURFACE_NO_WRITERS, RGFX_SURFACE_PAGES_ASK_CACHE,
+    RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_DEFERRED,
+    RGFX_SURFACE_PAGES_PRIVATE, RGFX_YCBCR_MATRIX_DCI_P3, RGFX_YCBCR_MATRIX_ITU_R_601_4,
+    RGFX_YCBCR_MATRIX_ITU_R_709_2, RGFX_YCBCR_MATRIX_ITU_R_2020, RGFX_YCBCR_MATRIX_NONE,
+    RGFX_YCBCR_MATRIX_OTHER, RGFX_YCBCR_MATRIX_P3_D65, RGFX_YCBCR_MATRIX_SMPTE_240M_1995,
+    RgfxBufferAtOffset, RgfxBufferCreate, RgfxBufferOverHostMemory, RgfxBufferOverPages,
+    RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorAttachmentDesc,
+    RgfxComputePipelineCreate, RgfxDepthStencilCreate, RgfxEventSignalled, RgfxFunctionConstant,
+    RgfxHeapCreate, RgfxHeapOverHostMemory, RgfxHeapOverPages, RgfxHeapTextureSizeAndAlign,
     RgfxLinearTextureFromBuffer, RgfxLinkedFunction, RgfxMeshPipelineReflection,
     RgfxMeshRenderPipelineCreate, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxPageRun,
     RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate,
-    RgfxRenderPipelinePrivateState, RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSamplerState,
-    RgfxSharedEventCreate, RgfxSharedEventSetValue, RgfxSizeAndAlign, RgfxStencilDescriptor,
-    RgfxSurfaceFacts, RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxSurfaceWriter,
-    RgfxSurfaceWriters, RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureDidModifyData,
-    RgfxTextureFromBuffer, RgfxTextureFromIOSurface, RgfxVertexAttribute, RgfxVertexBufferLayout,
-    RgfxVideoSessionCreate,
+    RgfxRenderPipelinePrivateState, RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSamplerCreateExt,
+    RgfxSamplerState, RgfxSharedEventCreate, RgfxSharedEventSetValue, RgfxSizeAndAlign,
+    RgfxStencilDescriptor, RgfxSurfaceFacts, RgfxSurfacePages, RgfxSurfacePagesLayout,
+    RgfxSurfaceWriter, RgfxSurfaceWriters, RgfxTextureCreate, RgfxTextureDescriptor,
+    RgfxTextureDidModifyData, RgfxTextureFromBuffer, RgfxTextureFromIOSurface, RgfxVertexAttribute,
+    RgfxVertexBufferLayout, RgfxVideoSessionCreate,
 };
 use reims_vgpu_video::core::device_memory::MemoryLife;
 use reims_vgpu_vulkan::core::host::HostPtr;
@@ -483,10 +483,13 @@ fn new_sampler<P: Platform>(
     let Some(m) = read::<RgfxSamplerCreate>(message) else {
         return Ok(Err(DecodeError::Malformed));
     };
-    // Our wire sends the whole descriptor, so every field is set;
-    // the LOD clamps travel as `f32` bits, and `flags` packs the
-    // booleans. `reduction_mode` is not on the wire yet (the Metal
-    // default stands).
+    // Our wire sends the whole descriptor, so every field is set; the LOD clamps and bias travel
+    // as `f32` bits, and `flags` packs the booleans. The reduction mode and the bias are the
+    // create's extension ([`RGFX_SAMPLER_CREATE_EXT_OFFSET`]); a create without one leaves both
+    // unset, Metal's defaults.
+    let ext = message
+        .get(RGFX_SAMPLER_CREATE_EXT_OFFSET as usize..)
+        .and_then(read::<RgfxSamplerCreateExt>);
     let desc = SamplerDesc {
         min_filter: Some(m.min_filter.into()),
         mag_filter: Some(m.mag_filter.into()),
@@ -502,7 +505,8 @@ fn new_sampler<P: Platform>(
         normalized_coordinates: Some((m.flags & 1) != 0),
         lod_average: Some((m.flags & 2) != 0),
         support_argument_buffers: Some((m.flags & 4) != 0),
-        reduction_mode: None,
+        reduction_mode: ext.map(|e| e.reduction_mode.into()),
+        lod_bias: ext.map(|e| f32::from_bits(e.lod_bias_bits)),
         resource_index: None,
     };
     Ok(match device.new_sampler_state(&desc)? {
@@ -6403,6 +6407,108 @@ mod tests {
             (7, RGFX_STATUS_INVALID_ARGUMENT)
         );
         assert!(dec.sampler_state(&device, &[0u8; 8]).unwrap().is_none());
+    }
+
+    /// A sampler create's extension reaches the platform's sampler: its reduction mode and LOD
+    /// bias are the descriptor's, on both the posted and the asked route; a create without the
+    /// extension leaves both unset, Metal's defaults.
+    #[test]
+    fn a_sampler_creates_extension_sets_its_reduction_and_bias() {
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let region = Arc::new(reims_vgpu_graphics::region::Region::new(0x1_0000).unwrap());
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
+        let create = |obj_id, size: usize| RgfxSamplerCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_SAMPLER_CREATE,
+                size: size as u32,
+                seqno: 3,
+            },
+            obj_id,
+            min_filter: 1,
+            mag_filter: 1,
+            mip_filter: 1,
+            max_anisotropy: 8,
+            flags: 0b001,
+            lod_max_clamp_bits: f32::MAX.to_bits(),
+            ..RgfxSamplerCreate::default()
+        };
+        let whole = |obj_id| {
+            let mut bytes = create(obj_id, RGFX_SAMPLER_CREATE_EXT_OFFSET as usize + 8)
+                .as_bytes()
+                .to_vec();
+            let ext = RgfxSamplerCreateExt {
+                reduction_mode: 1,
+                lod_bias_bits: (-1.5f32).to_bits(),
+            };
+            bytes.extend_from_slice(ext.as_bytes());
+            bytes
+        };
+        let made = |mark| -> SamplerDesc {
+            let calls = p.call_log().since(mark);
+            let calls: Vec<_> = calls
+                .iter()
+                .filter(|c| c.sel == "newSamplerStateWithDescriptor:")
+                .collect();
+            assert_eq!(calls.len(), 1);
+            let Some(Arg::Val(logged)) = calls[0].args.first() else {
+                panic!("no descriptor in {:?}", calls[0]);
+            };
+            let expected = |reduction_mode, lod_bias| SamplerDesc {
+                min_filter: Some(1),
+                mag_filter: Some(1),
+                mip_filter: Some(1),
+                s_address_mode: Some(0),
+                t_address_mode: Some(0),
+                r_address_mode: Some(0),
+                border_color: Some(0),
+                compare_function: Some(0),
+                max_anisotropy: Some(8),
+                lod_min_clamp: Some(0.0),
+                lod_max_clamp: Some(f32::MAX),
+                normalized_coordinates: Some(true),
+                lod_average: Some(false),
+                support_argument_buffers: Some(false),
+                reduction_mode,
+                lod_bias,
+                resource_index: None,
+            };
+            let with = expected(Some(1), Some(-1.5));
+            let without = expected(None, None);
+            if *logged == format!("{with:?}") {
+                with
+            } else {
+                assert_eq!(*logged, format!("{without:?}"));
+                without
+            }
+        };
+
+        let mark = p.call_log().mark();
+        dec.make_sampler(&device, &whole(31)).unwrap().unwrap();
+        let posted = made(mark);
+        assert_eq!(
+            (posted.reduction_mode, posted.lod_bias),
+            (Some(1), Some(-1.5))
+        );
+
+        dec.end_message();
+        let mark = p.call_log().mark();
+        let answer = dec.sampler_state(&device, &whole(32)).unwrap().unwrap();
+        assert_eq!(answer.status, RGFX_STATUS_OK);
+        let asked = made(mark);
+        assert_eq!(
+            (asked.reduction_mode, asked.lod_bias),
+            (Some(1), Some(-1.5))
+        );
+
+        dec.end_message();
+        let mark = p.call_log().mark();
+        let plain = create(33, size_of::<RgfxSamplerCreate>());
+        dec.make_sampler(&device, plain.as_bytes())
+            .unwrap()
+            .unwrap();
+        let bare = made(mark);
+        assert_eq!((bare.reduction_mode, bare.lod_bias), (None, None));
     }
 
     /// A heap texture size query is answered at its seqno with the device's size and alignment

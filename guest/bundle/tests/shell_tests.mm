@@ -2968,7 +2968,8 @@ void test_texture_resource_ids()
 }
 
 // A sampler wrapper's create routes an RGFX_CMD_SAMPLER_CREATE, mapping every
-// descriptor field (the LOD clamps as f32 bits, the booleans packed into flags).
+// descriptor field (the LOD clamps and bias as f32 bits, the booleans packed into flags, the
+// reduction mode and the bias in the extension).
 void test_sampler_routing()
 {
 	Fixture fx;
@@ -2986,12 +2987,17 @@ void test_sampler_routing()
 	desc.lodMaxClamp = 7.5f;
 	desc.normalizedCoordinates = YES;
 	desc.supportArgumentBuffers = YES;
+	if ([desc respondsToSelector:@selector(setLodBias:)]) {
+		desc.lodBias = -0.5f;
+		desc.reductionMode = MTLSamplerReductionModeMaximum;
+	}
 
 	RgfxSampler *smp = [RgfxSampler samplerWithDescriptor:desc device:nil serializer:&fx.ser];
 	CHECK(smp != nil && smp.rgfxObjId == 1);
 	CHECK([smp conformsToProtocol:@protocol(MTLSamplerState)]);
 
-	auto msg = expectMessage<RgfxSamplerCreate>(fx.ring, RGFX_CMD_SAMPLER_CREATE);
+	auto whole = expectMessage<RgfxSamplerCreateWhole>(fx.ring, RGFX_CMD_SAMPLER_CREATE);
+	const RgfxSamplerCreate &msg = whole.create;
 	CHECK(msg.obj_id == smp.rgfxObjId);
 	CHECK(msg.min_filter == (uint32_t)MTLSamplerMinMagFilterLinear);
 	CHECK(msg.mag_filter == (uint32_t)MTLSamplerMinMagFilterLinear);
@@ -3005,6 +3011,14 @@ void test_sampler_routing()
 	std::memcpy(&lodMax, &msg.lod_max_clamp_bits, 4);
 	CHECK(lodMax == 7.5f);
 	CHECK(msg.flags == (0x1u | 0x4u)); // normalized coords + argument-buffer usable
+	// lodBias and reductionMode, in the extension: Metal's defaults where the descriptor has
+	// neither.
+	float bias = -1.0f;
+	std::memcpy(&bias, &whole.ext.lod_bias_bits, 4);
+	if ([desc respondsToSelector:@selector(lodBias)])
+		CHECK(bias == desc.lodBias && whole.ext.reduction_mode == (uint32_t)desc.reductionMode);
+	else
+		CHECK(bias == 0.0f && whole.ext.reduction_mode == 0);
 }
 
 // A depth/stencil wrapper's create routes an RGFX_CMD_DEPTH_STENCIL_CREATE,
