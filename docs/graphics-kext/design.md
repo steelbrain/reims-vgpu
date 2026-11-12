@@ -488,9 +488,9 @@ Stages:
     - **The device cache:** where the host's GPU does not share the CPU's
       memory, the device has `RGFX_FEATURE_SURFACE_CACHE`, and a block the
       kext marks cached (`RGFX_SURFACE_PAGES_CACHED`) gets a device cache on
-      the host: a Private buffer of the surface's bytes in the pages' layout,
-      which every buffer over the block is, so every texture over the
-      surface, of any shape, plane or format, lies over the same bytes. The
+      the host: a Private buffer of the surface's bytes, which every buffer
+      over the block is, so every texture over the surface, of any shape,
+      plane or format, lies over the same bytes. The
       block's `SURFACE_PAGES` carries the surface's `RgfxSurfacePagesLayout`
       where the bundle gave it, a deferred block's too, and the host lays
       the cache out by it as by an ask's layout (below, *Device caches on a
@@ -505,7 +505,14 @@ Stages:
       declares the bytes between a texture's rows unobserved, and a texture
       whose rows lie with bytes between them may be an image over the
       cache's memory too, where the runtime makes one (on an RTX 2080 it
-      makes none, for reasons of its own: `decode::surface_cache`). The
+      makes none, for reasons of its own: `decode::surface_cache`). Where a
+      plane's rows lie at another pitch than the GPU's own linear images lay
+      them (CoreAnimation names its backing stores' rows at multiples of 64
+      bytes, and RADV lays its images' at 256), the host lays the cache's
+      planes out at the GPU's pitch instead, each texture over a plane at
+      the same byte of the same row there, and the cache's copies move each
+      row between its place in the pages and its place in the cache
+      (`decode::surface_cache`, "Laid out at the GPU's pitch"). The
       answer is that of a message with no layout. Each
       command buffer names the cached surfaces it uses
       (`RGFX_OP_SURFACE_USE`) with the kext's count of the surface's
@@ -815,9 +822,12 @@ Stages:
       answers its GPU's alignment as well (the runtime's
       `minimumLinearTextureAlignmentForPixelFormat:` of BGRA8: 256 on RADV,
       discrete or not, and 128 on the RTX 3090 and RTX 2080, docs/lessons.md):
-      a texture over a surface's pages, or over its device cache, which keeps
-      the pages' layout, takes the GPU's own linear image there only where its
-      rows lie at the GPU's pitch, and otherwise is the runtime's shadow.
+      a texture over a surface's pages takes the GPU's own linear image
+      there only where its rows lie at the GPU's pitch, and otherwise is the
+      runtime's shadow; a device cache of a surface whose layout the kext
+      gives lays the planes' rows at the GPU's pitch (*The device cache*,
+      above), so a texture over it takes the GPU's image whatever the
+      surface's pitch.
       At the same start the kext lowers the largest surface IOSurface
       answers to `IOSurfaceGetPropertyMaximum`, as a Mac's GPU accelerators
       do: as wide and as tall as the device's 2D textures (the device

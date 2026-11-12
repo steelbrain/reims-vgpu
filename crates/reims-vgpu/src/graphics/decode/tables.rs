@@ -45,6 +45,7 @@ use reims_vgpu_vulkan::core::sync::Mutex;
 
 use super::lane::Lane;
 use super::managed::ManagedCopy;
+use super::surface_cache::Repitched;
 use super::video::PlanePlace;
 use super::{Drain, ObjHandle, drop_refused};
 
@@ -143,6 +144,10 @@ pub(crate) struct Entry<P: Platform> {
     /// An indirect command buffer's commands whose draws and dispatches are dropped
     /// ([`super::icb::Dropped`]); `None` for any other object.
     pub(crate) icb_dropped: Option<Box<super::icb::Dropped>>,
+    /// A buffer over a block's device cache that lays its surface's planes out at the GPU's
+    /// pitch: that layout, by which each texture over the buffer is placed in it
+    /// ([`Repitched`]); `None` for any other object.
+    pub(crate) laid_out: Option<Arc<Repitched>>,
     /// The table's clock at its make.
     made: u64,
     /// The first clock of a view that names it: its make's, or the making message's view's where
@@ -163,6 +168,7 @@ impl<P: Platform> Entry<P> {
             bytes: None,
             over_view: false,
             icb_dropped: None,
+            laid_out: None,
             made: 0,
             seen: 0,
         }
@@ -177,6 +183,13 @@ impl<P: Platform> Entry<P> {
     /// The entry, a buffer over a block's surface view (the field `over_view`).
     pub(crate) fn over_view(mut self) -> Self {
         self.over_view = true;
+        self
+    }
+
+    /// The entry, a buffer over a device cache laid out as `laid_out` says (the field
+    /// `laid_out`).
+    pub(crate) fn laid_out(mut self, laid_out: Option<Arc<Repitched>>) -> Self {
+        self.laid_out = laid_out;
         self
     }
 

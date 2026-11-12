@@ -1605,31 +1605,34 @@ impl<P: Platform> super::GraphicsDecoder<P> {
         // A block with a device cache: the buffer is the cache, over the surface's bytes in the
         // pages' layout (`surface_cache`); a block named by its runs has one, or took its view. A
         // deferred block whose pages are not named has its cache, and neither.
+        // The buffer keeps the cache's layout, by which the textures over it are placed.
         let cache = {
             let caches = self.surface_caches.lock();
             match names {
                 true => caches.buffer(m.block_offset),
                 false => caches.deferred_buffer(&m),
             }
-            .map(|c| c.clone_ref())
+            .map(|c| (c.clone_ref(), caches.repitched(m.block_offset)))
         };
-        let buffer = match (cache, view) {
-            (Some(cache), _) => {
+        let (buffer, laid_out) = match (cache, view) {
+            (Some((cache, laid_out)), _) => {
                 // The first buffer over a new cache names the context that owns its first fill;
                 // another context's makes it (`SurfaceCaches::buffer_made`).
                 (self.surface_caches).buffer_made(device, m.block_offset, self.context)?;
-                cache
+                (cache, laid_out)
             }
             (None, Some(view)) => {
                 match buffer_over(device, &view, 0, m.length, m.options.into(), None)? {
-                    Some(buffer) => buffer,
+                    Some(buffer) => (buffer, None),
                     None => return Ok(Err(super::DecodeError::Refused)),
                 }
             }
             (None, None) => return Ok(Err(super::DecodeError::Refused)),
         };
         let span = Some((m.block_offset, m.block_size));
-        let entry = super::tables::Entry::of(super::ObjHandle::Buffer(buffer)).over(span);
+        let entry = (super::tables::Entry::of(super::ObjHandle::Buffer(buffer)))
+            .over(span)
+            .laid_out(laid_out);
         self.store(m.obj_id, entry.over_view());
         Ok(Ok(()))
     }

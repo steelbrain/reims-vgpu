@@ -232,6 +232,10 @@ pub(crate) struct PlanePlace {
     pub(crate) offset: u64,
     /// Bytes from one of its rows to the next.
     pub(crate) bytes_per_row: u64,
+    /// The texture's first byte in its surface and its rows' pitch there, as its message gave
+    /// them: `offset` and `bytes_per_row`, but over a device cache laid out at the GPU's pitch
+    /// ([`super::surface_cache::Repitched`]).
+    pub(crate) in_surface: (u64, u64),
     /// The bytes of one of its rows ([`row_bytes`]): its width in its format's texels, or in its
     /// blocks for a format of blocks, at most `bytes_per_row`, which it is where the format's size
     /// is unknown.
@@ -282,6 +286,16 @@ pub(crate) fn row_bytes(info: &PixelFormatInfo, width: u32, bytes_per_row: u64) 
         return bytes_per_row;
     }
     across.saturating_mul(info.block_bytes).min(bytes_per_row)
+}
+
+/// The rows of a texture `height` pixels high of the format `info` describes: its texels down,
+/// or its blocks down for a format of blocks ([`BLOCKS`]), `height` where the block's height is
+/// unknown.
+pub(crate) fn texel_rows(info: &PixelFormatInfo, height: u32) -> u64 {
+    match (info.flags & BLOCKS != 0, info.block_height) {
+        (true, 0) | (false, _) => u64::from(height),
+        (true, block_height) => u64::from(height).div_ceil(block_height),
+    }
 }
 
 /// One plane of a picture's output: `height` rows of `width` pixels, `row_bytes` each,
@@ -816,8 +830,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             _ => None,
         };
         let plane = |p: PlanePlace| PagesPlane {
-            offset: p.offset,
-            bytes_per_row: p.bytes_per_row,
+            offset: p.in_surface.0,
+            bytes_per_row: p.in_surface.1,
             row_bytes: p.row_bytes,
             rows: p.height,
         };

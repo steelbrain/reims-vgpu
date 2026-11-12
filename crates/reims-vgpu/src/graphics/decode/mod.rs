@@ -1329,7 +1329,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                      cache waited for no copy of it, {} for one; {} made exportable for the \
                      host's video, {} not; {} made a dma-buf for the host's video to decode \
                      into, {} not; {} made with their surface's first plane on 256 bytes of \
-                     their memory",
+                     their memory; {} laid out at the GPU's pitch",
                     d.made, d.fills, d.filled_bytes >> 20, d.made_fills, d.decode_firsts,
                     d.downloads,
                     d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread,
@@ -1340,7 +1340,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                     d.by_runs, d.runs_refused,
                     self.shared.slow_answers.load(Ordering::Relaxed), SLOW_ANSWER.as_millis(),
                     d.fills_deferred, d.cpu_waits, d.doorbell_free, d.doorbell_waits,
-                    d.exportable, d.unexportable, d.dma_buf, d.no_dma_buf, d.aligned
+                    d.exportable, d.unexportable, d.dma_buf, d.no_dma_buf, d.aligned,
+                    d.repitched
                 );
             }
         }
@@ -3513,6 +3514,20 @@ impl<P: Platform> GraphicsDecoder<P> {
                         _ => return Ok(Err(DecodeError::Malformed)),
                     }
                 };
+                let info = device.pixel_format_info(u64::from(m.desc.pixel_format));
+                let row_bytes = video::row_bytes(&info, m.desc.width, m.bytes_per_row);
+                // Over a device cache laid out at the GPU's pitch the texture lies at the same
+                // byte of the same row of its plane in the cache, its rows at the cache's pitch
+                // (`surface_cache::Repitched`).
+                let laid_out = self.entry(m.buffer_obj_id).and_then(|e| e.laid_out.clone());
+                let plane = match &laid_out {
+                    Some(laid) => {
+                        let rows = video::texel_rows(&info, m.desc.height);
+                        laid_plane(laid, plane, row_bytes, rows, &m)
+                    }
+                    None => plane,
+                };
+                let at = (plane.offset, plane.bytes_per_row);
                 let made = {
                     let Some(ObjHandle::Buffer(buffer)) = self.named(m.buffer_obj_id) else {
                         return Ok(Err(DecodeError::BadReference));
@@ -3541,12 +3556,12 @@ impl<P: Platform> GraphicsDecoder<P> {
                         // An id made again names only its new texture's surface.
                         self.forget_surface_texture(m.obj_id);
                         let mut entry = Entry::of(ObjHandle::Texture(texture)).over(span);
-                        let info = device.pixel_format_info(u64::from(m.desc.pixel_format));
                         entry.place = Some(video::PlanePlace {
                             buffer_obj_id: m.buffer_obj_id,
-                            offset: m.offset,
-                            bytes_per_row: m.bytes_per_row,
-                            row_bytes: video::row_bytes(&info, m.desc.width, m.bytes_per_row),
+                            offset: at.0,
+                            bytes_per_row: at.1,
+                            in_surface: (m.offset, m.bytes_per_row),
+                            row_bytes,
                             width: u64::from(m.desc.width),
                             height: u64::from(m.desc.height),
                             whole: video::whole_plane(
@@ -5721,6 +5736,64 @@ fn surface_plane(
         planar: facts.is_some_and(|f| f.plane_count > 0),
         facts,
     })
+}
+
+/// The plane `plane` of the texture `m` makes over a buffer of a device cache laid out at the
+/// GPU's pitch, `laid`: its first byte, and its chroma plane's where its facts name a second
+/// plane, at the same byte of the same row of the same plane of the cache, its rows at the
+/// cache's pitch ([`surface_cache::Repitched::place`]). A texture whose texels, `row_bytes` by
+/// `rows` from its first, pass its plane's, made over its plane all the same, reads the cache's
+/// bytes past them, not the guest's beside the plane; one whose first byte lies in no plane of
+/// the cache keeps the surface's place, over bytes of the cache that are not its own. Each says
+/// so. The bundle places each texture over a plane of the surface where the layout the cache's
+/// comes from places the plane, at the plane's pitch (`RgfxIOSurface.mm`), so its first byte lies
+/// in the plane's texels, and checks that one made at an origin inside the plane fits it; one at
+/// the plane's first byte it does not check.
+fn laid_plane(
+    laid: &surface_cache::Repitched,
+    plane: SurfacePlane,
+    row_bytes: u64,
+    rows: u64,
+    m: &RgfxTextureFromIOSurface,
+) -> SurfacePlane {
+    let chroma = (plane.facts)
+        .filter(|f| f.plane_count >= 2)
+        .map(|f| laid.place(f.chroma_offset, f.chroma_bytes_per_row));
+    let (Some(placed), None | Some(Some(_))) =
+        (laid.place(plane.offset, plane.bytes_per_row), chroma)
+    else {
+        log::warn!(
+            target: "reims_vgpu::graphics",
+            "the texture {:#x} over plane {} of the IOSurface {} at {} with rows {} apart lies in \
+             no plane of its device cache laid out at the GPU's pitch: made at the surface's place, \
+             over bytes of the cache that are not its texels",
+            m.obj_id, m.plane, m.iosurface_id, m.offset, m.bytes_per_row
+        );
+        return plane;
+    };
+    if row_bytes > placed.room.0 || rows > placed.room.1 {
+        log::warn!(
+            target: "reims_vgpu::graphics",
+            "the texture {:#x} over plane {} of the IOSurface {} ({} bytes by {} rows from {}) \
+             passes its plane: over its device cache laid out at the GPU's pitch it reads the \
+             cache's bytes past the plane's texels",
+            m.obj_id, m.plane, m.iosurface_id, row_bytes, rows, m.offset
+        );
+    }
+    let facts = plane.facts.map(|f| match chroma {
+        Some(Some(c)) => SurfaceFacts {
+            chroma_offset: c.offset,
+            chroma_bytes_per_row: c.bytes_per_row,
+            ..f
+        },
+        _ => f,
+    });
+    SurfacePlane {
+        offset: placed.offset,
+        bytes_per_row: placed.bytes_per_row,
+        facts,
+        ..plane
+    }
 }
 
 /// An OSType as its four characters, quoted, where each is printable ASCII; else its value in hex.
