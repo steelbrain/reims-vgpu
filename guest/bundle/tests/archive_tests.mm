@@ -375,10 +375,18 @@ void test_archive_keys_and_options()
 	CHECK(walked == 0);
 	CHECK(!((BOOL (*)(id, SEL, id))objc_msgSend)(a, NSSelectorFromString(@"storeRenderPipelineDescriptor:"), render(nil)));
 	CHECK(a.keys.count == 4);
-	NSError *recompiled = nil;
-	CHECK(!((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(
-	          a, NSSelectorFromString(@"recompileToArchiveWithURL:error:"), at(@"recompiled.bin"), &recompiled) &&
-	      recompiled != nil);
+	// Recompiled for another target: Metal's refusal of an archive of its own device's pipelines, at
+	// every URL, nil and one of no scheme among them, and nothing written.
+	NSURL *recompileTo[] = {at(@"recompiled.bin"), nil, [NSURL URLWithString:at(@"recompiled.bin").path]};
+	for (NSURL *to : recompileTo) {
+		NSError *recompiled = nil;
+		CHECK(!((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(
+		          a, NSSelectorFromString(@"recompileToArchiveWithURL:error:"), to, &recompiled) &&
+		      [recompiled.domain isEqualToString:MTLBinaryArchiveDomain] &&
+		      recompiled.code == MTLBinaryArchiveErrorInvalidFile &&
+		      [recompiled.localizedDescription isEqualToString:@"No recompilable artifacts found"]);
+	}
+	CHECK(![[NSFileManager defaultManager] fileExistsAtPath:at(@"recompiled.bin").path]);
 
 	// Loaded back, it answers the same keys; another architecture's archive answers none of them.
 	CHECK([a serializeToURL:at(@"keys.bin") error:&e]);

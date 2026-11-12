@@ -833,11 +833,17 @@ static BOOL rgfxAnyHolds(NSArray *archives, const RgfxArchiveEntry &entry)
 	return NO;
 }
 
-// A copy of the archive recompiled for another target: the host compiles for its own GPU alone.
+// A copy of the archive recompiled for another target. Metal refuses an archive of its own
+// device's pipelines at every URL, nil among them, with "No recompilable artifacts found"
+// (MTLBinaryArchiveDomain 1, measured: macOS 26.7.1, the AMD Radeon Pro 5300M and the Intel UHD
+// 630, and macOS 27.0.1, the M3 Max, alike, tools/oracle/oracle_urls.m); the host compiles for its
+// own GPU alone and keeps nothing to recompile, so every archive answers so.
 - (BOOL)recompileToArchiveWithURL:(NSURL *)url error:(__autoreleasing NSError **)error
 {
 	(void)url;
-	RGFX_UNSUPPORTED_ERROR(error, "recompiling an archive for another target");
+	RGFX_UNSUPPORTED("recompiling an archive for another target");
+	if (error)
+		*error = archiveError(MTLBinaryArchiveErrorInvalidFile, @"No recompilable artifacts found");
 	return NO;
 }
 

@@ -19,10 +19,12 @@ Class rgfxMetalIOClass(const char *name, SEL init)
 	return c != Nil && [c instancesRespondToSelector:init] ? c : Nil;
 }
 
-/// What Metal's device checks of a handle's URL before it opens the file (measured on the M3 Max):
-/// a URL that is not a file's is MTLIOErrorDomain's 1, "URL is not a file"; a file that is not
-/// there is the error checkResourceIsReachableAndReturnError: gives (NSCocoaErrorDomain 260, with
-/// the URL, the path and the POSIX error). Every other answer is the handle's own.
+/// What Metal's device checks of a handle's URL before it opens the file (measured: macOS 27.0.1,
+/// the M3 Max, and macOS 26.7.1, the AMD Radeon Pro 5300M and the Intel UHD 630, alike, at each of
+/// the nine members below, tools/oracle/oracle_urls.m): a URL that is not a file's (nil, one of no
+/// scheme, of another scheme or of no path) is MTLIOErrorDomain's 1, "URL is not a file"; a file
+/// that is not there is the error checkResourceIsReachableAndReturnError: gives (NSCocoaErrorDomain
+/// 260, with the URL, the path and the POSIX error). Every other answer is the handle's own.
 BOOL rgfxMetalIOFileIsThere(NSURL *url, NSError **error)
 {
 	if (url == nil || !url.isFileURL) {

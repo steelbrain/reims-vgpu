@@ -12,6 +12,18 @@ constexpr const char *kRayTracing = "ray tracing";
 constexpr const char *kFunctionPointers = "function pointers";
 constexpr const char *kMetal4 = "the Metal 4 API";
 constexpr const char *kArgumentLayouts = "argument buffers of a layout object";
+
+// Metal's refusal of a Metal 4 member on a device that answers NO to supportsFamily: of
+// MTLGPUFamilyMetal4, as this one does: MTLDeviceErrorDomain's MTLDeviceErrorNotSupported (measured:
+// newArchiveWithURL:error: at every URL, nil among them, macOS 26.7.1, the AMD Radeon Pro 5300M and
+// the Intel UHD 630, tools/oracle/oracle_urls.m). The domain is named by its string: its symbol is
+// macOS 26.4's, and the bundle loads from macOS 11 on.
+NSError *metal4Refusal()
+{
+	return [NSError errorWithDomain:@"MTLDeviceErrorDomain"
+	                           code:1 // MTLDeviceErrorNotSupported
+	                       userInfo:@{NSLocalizedDescriptionKey : @"Device does not support Metal 4."}];
+}
 } // namespace
 
 @implementation RgfxMetalDevice (Unsupported)
@@ -218,9 +230,13 @@ constexpr const char *kArgumentLayouts = "argument buffers of a layout object";
 	return nil;
 }
 
+// Metal's refusal of a device without Metal 4, at every URL (metal4Refusal).
 - (id<MTL4Archive>)newArchiveWithURL:(NSURL *)url error:(NSError **)error
 {
-	RGFX_UNSUPPORTED_ERROR(error, kMetal4);
+	(void)url;
+	RGFX_UNSUPPORTED(kMetal4);
+	if (error)
+		*error = metal4Refusal();
 	return nil;
 }
 
@@ -363,9 +379,21 @@ constexpr const char *kArgumentLayouts = "argument buffers of a layout object";
 	return nil;
 }
 
+// No options is refused before the URL is looked at, at every URL, nil among them, with "At least
+// one option must be set." (MTLBinaryArchiveDomain 2, measured: macOS 26.7.1, the AMD Radeon Pro
+// 5300M and the Intel UHD 630, and macOS 27.0.1, the M3 Max, alike, tools/oracle/oracle_urls.m).
 - (id)newBinaryLibraryWithOptions:(NSUInteger)options url:(NSURL *)url error:(NSError **)error
 {
-	RGFX_UNSUPPORTED_ERROR(error, "binary libraries");
+	(void)url;
+	if (options != 0) {
+		RGFX_UNSUPPORTED_ERROR(error, "binary libraries");
+		return nil;
+	}
+	RgfxLogUnsupported([self class], _cmd, "binary libraries");
+	if (error)
+		*error = [NSError errorWithDomain:MTLBinaryArchiveDomain
+		                             code:MTLBinaryArchiveErrorUnexpectedElement
+		                         userInfo:@{NSLocalizedDescriptionKey : @"At least one option must be set."}];
 	return nil;
 }
 

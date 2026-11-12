@@ -15,7 +15,8 @@
 // differ.
 // It also checks the x86 device's answer to newResidencySetWithDescriptor:error:: nil, its error
 // out left as it was, as the x86 Macs answer (measured: macOS 26.7.1, the AMD Radeon Pro 5300M
-// and the Intel UHD 630); and that each call Metal's device ends the process at for its argument
+// and the Intel UHD 630); the refusals Metal answers at a URL before it reads it (checkUrlRefusals);
+// and that each call Metal's device ends the process at for its argument
 // ends it, in a process of its own (`inherited_tests --dies CASE BUNDLE`), with SIGABRT and
 // Metal's words on stderr.
 #import <Foundation/Foundation.h>
@@ -199,6 +200,41 @@ void checkResidencySetAnswer(Class device)
 		                                set, error == sentinel ? @"untouched" : error]);
 }
 
+// The device's refusals at a URL that Metal answers before it reads the URL: newArchiveWithURL:error:
+// a device without Metal 4's, and newBinaryLibraryWithOptions:url:error: of no option, "At least one
+// option must be set.", each at every URL, nil among them (measured: macOS 26.7.1, the AMD Radeon
+// Pro 5300M and the Intel UHD 630, and, of the binary library, macOS 27.0.1, the M3 Max). Neither
+// member reads the device's state, so each is called with the class as `self`.
+void checkUrlRefusals(Class device)
+{
+	NSURL *urls[] = {nil, [NSURL fileURLWithPath:@"/no/such/archive.bin"], [NSURL URLWithString:@"/no/such/archive.bin"],
+	                 [NSURL URLWithString:@"http://127.0.0.1:9/archive.bin"]};
+	SEL archive = sel_registerName("newArchiveWithURL:error:"),
+	    binary = sel_registerName("newBinaryLibraryWithOptions:url:error:");
+	Method am = class_getInstanceMethod(device, archive), bm = class_getInstanceMethod(device, binary);
+	if (am == nullptr || bm == nullptr) {
+		fail(@"the device does not answer newArchiveWithURL:error: or newBinaryLibraryWithOptions:url:error:");
+		return;
+	}
+	for (NSURL *url : urls) {
+		NSError *error = nil;
+		id made = ((id(*)(id, SEL, NSURL *, NSError **))method_getImplementation(am))((id)device, archive, url, &error);
+		if (made != nil || ![error.domain isEqualToString:@"MTLDeviceErrorDomain"] || error.code != 1 ||
+		    ![error.localizedDescription isEqualToString:@"Device does not support Metal 4."])
+			fail([NSString stringWithFormat:@"newArchiveWithURL:%@ answers %@, error %@ (want nil, "
+			                                @"MTLDeviceErrorDomain 1, \"Device does not support Metal 4.\")",
+			                                url, made, error]);
+		error = nil;
+		made = ((id(*)(id, SEL, NSUInteger, NSURL *, NSError **))method_getImplementation(bm))((id)device, binary, 0,
+		                                                                                         url, &error);
+		if (made != nil || ![error.domain isEqualToString:@"MTLBinaryArchiveDomain"] || error.code != 2 ||
+		    ![error.localizedDescription isEqualToString:@"At least one option must be set."])
+			fail([NSString stringWithFormat:@"newBinaryLibraryWithOptions:0 url:%@ answers %@, error %@ (want nil, "
+			                                @"MTLBinaryArchiveDomain 2, \"At least one option must be set.\")",
+			                                url, made, error]);
+	}
+}
+
 // The exit status of a death case that raised SIGABRT: its handler exits with it, so the death
 // writes no crash report.
 constexpr int kAborted = 128 + SIGABRT;
@@ -300,6 +336,7 @@ int main(int argc, char **argv)
 			return 1;
 		}
 		checkResidencySetAnswer(device);
+		checkUrlRefusals(device);
 		for (const Death &d : kDeaths)
 			checkDies(d, argv[1]);
 		NSDictionary<NSString *, NSValue *> *ours = ownMethods(device);
