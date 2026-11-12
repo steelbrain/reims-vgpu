@@ -1429,6 +1429,14 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// A metallib only, as Metal and the runtime take: other bytes, raw AIR and a bitcode wrapper
     /// among them, are Metal's `NSError` (measured). A gap of the runtime's or the
     /// device's is its refusal as the `NSError`, relayed by default ([`relay_gap`]).
+    fn new_dynamic_library(
+        &self,
+        library: &VulkanLibrary,
+    ) -> RaiseResult<Result<Option<crate::gpu::dynamic_library::VulkanDynamicLibrary>, NsErrorText>>
+    {
+        crate::gpu::dynamic_library::new_dynamic_library(&self.raw, library)
+    }
+
     fn new_library(&self, data: &[u8]) -> RaiseResult<Result<Option<VulkanLibrary>, NsErrorText>> {
         let sel = "newLibraryWithData:error:";
         let made = timing::creation(

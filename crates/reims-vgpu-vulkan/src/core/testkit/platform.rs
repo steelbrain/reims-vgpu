@@ -190,6 +190,7 @@ impl Platform for FakePlatform {
     type ComputePipeline = Fk<kind::ComputePipeline>;
     type FunctionHandle = Fk<kind::FunctionHandle>;
     type VisibleFunctionTable = Fk<kind::VisibleFunctionTable>;
+    type DynamicLibrary = Fk<kind::DynamicLibrary>;
     type RenderPipeline = Fk<kind::RenderPipeline>;
     type RateMap = Fk<kind::RateMap>;
     type Icb = Fk<kind::Icb>;

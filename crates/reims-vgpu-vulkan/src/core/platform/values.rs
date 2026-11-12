@@ -389,6 +389,51 @@ impl<P: Platform> fmt::Debug for LinkedFunctionsDesc<P> {
     }
 }
 
+/// The dynamic libraries a compute pipeline's kernel links (`MTLDynamicLibrary`): its preloaded
+/// libraries (`preloadedLibraries`), searched first in their order, and by install name the
+/// library each install name loads, which Metal reads from the file the name names and the guest
+/// read: each install name the kernel's libraries and these libraries depend on, so the platform
+/// loads none from a file of its own. [`Default`] links none.
+pub struct DynamicLibrariesDesc<P: Platform> {
+    /// `setPreloadedLibraries:`.
+    pub preloaded: Vec<P::DynamicLibrary>,
+    /// Each install name with the library it loads.
+    pub loaded: Vec<(String, P::DynamicLibrary)>,
+}
+
+impl<P: Platform> DynamicLibrariesDesc<P> {
+    /// Whether no library is linked.
+    pub fn is_empty(&self) -> bool {
+        self.preloaded.is_empty() && self.loaded.is_empty()
+    }
+}
+
+impl<P: Platform> Default for DynamicLibrariesDesc<P> {
+    fn default() -> Self {
+        DynamicLibrariesDesc {
+            preloaded: Vec::new(),
+            loaded: Vec::new(),
+        }
+    }
+}
+
+impl<P: Platform> fmt::Debug for DynamicLibrariesDesc<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let loaded: Vec<_> = self
+            .loaded
+            .iter()
+            .map(|(name, library)| (name.as_str(), library.id()))
+            .collect();
+        f.debug_struct("DynamicLibrariesDesc")
+            .field(
+                "preloaded",
+                &self.preloaded.iter().map(Handle::id).collect::<Vec<_>>(),
+            )
+            .field("loaded", &loaded)
+            .finish()
+    }
+}
+
 /// A whole `MTLRenderPipelineDescriptor`, as a value: what the graphics lane carries of a guest's
 /// descriptor. The display's own pipelines take [`RenderPipelineDesc`]. Each enum is its Metal raw
 /// value. Order: label, the vertex and fragment functions, the vertex descriptor, the colour
@@ -663,6 +708,8 @@ pub struct FullComputePipelineDesc<'a, P: Platform> {
     pub stage_input: Option<StageInputDesc>,
     /// `setLinkedFunctions:`, where the kernel links any.
     pub linked: LinkedFunctionsDesc<P>,
+    /// The dynamic libraries the kernel links, where it links any.
+    pub libraries: DynamicLibrariesDesc<P>,
     /// OpenCL mode: the function made of its plugin data first
     /// (`newFunctionWithPluginData:bitcodeType:`, SPI), then `setOpenCLModeEnabled:` (SPI), which
     /// links the kernel behind three buffers of its own and its arguments at their indices plus
@@ -675,7 +722,8 @@ pub struct FullComputePipelineDesc<'a, P: Platform> {
 impl<'a, P: Platform> FullComputePipelineDesc<'a, P> {
     /// The value of `function` with Metal's defaults elsewhere: no label, no execution-width
     /// promise, Metal's maximum threads per threadgroup, a call stack depth of one, no indirect
-    /// command buffer support, no stage-input descriptor, no linked functions and no OpenCL mode.
+    /// command buffer support, no stage-input descriptor, no linked functions or dynamic
+    /// libraries and no OpenCL mode.
     pub fn new(function: &'a P::Function) -> Self {
         FullComputePipelineDesc {
             label: None,
@@ -686,6 +734,7 @@ impl<'a, P: Platform> FullComputePipelineDesc<'a, P> {
             support_indirect_command_buffers: false,
             stage_input: None,
             linked: LinkedFunctionsDesc::default(),
+            libraries: DynamicLibrariesDesc::default(),
             open_cl_mode: false,
         }
     }
@@ -711,6 +760,7 @@ impl<P: Platform> fmt::Debug for FullComputePipelineDesc<'_, P> {
             )
             .field("stage_input", &self.stage_input)
             .field("linked", &self.linked)
+            .field("libraries", &self.libraries)
             .field("open_cl_mode", &self.open_cl_mode)
             .finish()
     }

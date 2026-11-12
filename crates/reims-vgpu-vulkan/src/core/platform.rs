@@ -53,8 +53,8 @@ pub trait Handle: Send + Sync + 'static {
 /// The Metal object families plus the non-handle services (architecture 4.1).
 ///
 /// Associated types without a selector core sends to them (`Event`, `Fence`, `Function`,
-/// `FunctionHandle`, the two shared handles, the address-range array, the event listener) are
-/// bounded by `Handle` alone.
+/// `FunctionHandle`, `DynamicLibrary`, the two shared handles, the address-range array, the event
+/// listener) are bounded by `Handle` alone.
 pub trait Platform: Sized + Send + Sync + 'static {
     // Metal objects.
     /// `id<MTLDevice>`.
@@ -100,6 +100,9 @@ pub trait Platform: Sized + Send + Sync + 'static {
     type FunctionHandle: Handle;
     /// `id<MTLVisibleFunctionTable>`.
     type VisibleFunctionTable: function_table::VisibleFunctionTable<Self>;
+    /// `id<MTLDynamicLibrary>`: what a compute pipeline's kernel links
+    /// ([`values::DynamicLibrariesDesc`]).
+    type DynamicLibrary: Handle;
     /// `id<MTLRenderPipelineState>`.
     type RenderPipeline: resource::RenderPipeline;
     /// `id<MTLRasterizationRateMap>`.

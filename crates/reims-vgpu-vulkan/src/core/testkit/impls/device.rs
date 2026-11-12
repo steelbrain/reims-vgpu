@@ -348,6 +348,19 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
         )
     }
 
+    /// A new dynamic library each call, of any library: the fake checks nothing of Metal's.
+    fn new_dynamic_library(
+        &self,
+        library: &<FakePlatform as Platform>::Library,
+    ) -> RaiseResult<Result<Option<<FakePlatform as Platform>::DynamicLibrary>, NsErrorText>> {
+        self.make_or_error(
+            Policy::Caught,
+            "newDynamicLibrary:error:",
+            vec![Arg::obj(library)],
+            |w| Some(w.new_obj::<kind::DynamicLibrary>(Model::None)),
+        )
+    }
+
     /// A new library each call, holding the world's function names; the Vulkan platform's loads
     /// once per device, which no core behaviour depends on.
     fn new_shader_library(

@@ -24,6 +24,7 @@ pub mod command;
 mod depth_denormals;
 pub mod desc;
 pub mod device;
+pub mod dynamic_library;
 pub mod encode_blit;
 pub mod encode_compute;
 pub mod encode_render;

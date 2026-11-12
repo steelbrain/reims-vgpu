@@ -106,6 +106,7 @@ pub mod kind {
         ComputePipeline => "MTLComputePipelineState",
         FunctionHandle => "MTLFunctionHandle",
         VisibleFunctionTable => "MTLVisibleFunctionTable",
+        DynamicLibrary => "MTLDynamicLibrary",
         RenderPipeline => "MTLRenderPipelineState",
         RateMap => "MTLRasterizationRateMap",
         Icb => "MTLIndirectCommandBuffer",

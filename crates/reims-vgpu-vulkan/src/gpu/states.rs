@@ -1016,7 +1016,8 @@ pub(crate) fn full_compute_descriptor(
     let mut d = ComputePipelineDescriptor::new(StageSource::Function(
         desc.function
             .function_descriptor()
-            .with_linked(linked_functions(&desc.linked)),
+            .with_linked(linked_functions(&desc.linked))
+            .with_libraries(crate::gpu::dynamic_library::libraries(&desc.libraries)),
     ));
     d.threadgroup_size_is_multiple_of_execution_width =
         desc.threadgroup_size_is_multiple_of_execution_width;
@@ -1228,6 +1229,7 @@ mod tests {
     use crate::core::platform::device::GpuDevice;
     use crate::core::platform::resource::{DepthStencilState, SamplerState};
     use crate::core::platform::resource::{Library, RenderPipeline};
+    use crate::core::platform::values::DynamicLibrariesDesc;
     use crate::core::raise::OnFault;
     use crate::core::testkit::capture::catch_death;
     use metal2vulkan::metal::PixelFormat;
@@ -1498,6 +1500,7 @@ mod tests {
             support_indirect_command_buffers: false,
             stage_input: None,
             linked: LinkedFunctionsDesc::default(),
+            libraries: DynamicLibrariesDesc::default(),
             open_cl_mode: false,
         };
         let site = catch_death(|| dev().new_compute_pipeline_state_full(&desc)).unwrap_err();
@@ -1579,6 +1582,7 @@ mod tests {
             support_indirect_command_buffers: false,
             stage_input: None,
             linked: LinkedFunctionsDesc::default(),
+            libraries: DynamicLibrariesDesc::default(),
             open_cl_mode,
         };
         assert!(full_compute_descriptor(sel, &desc(true)).open_cl_mode_enabled);
@@ -1605,6 +1609,7 @@ mod tests {
             support_indirect_command_buffers: false,
             stage_input: None,
             linked,
+            libraries: DynamicLibrariesDesc::default(),
             open_cl_mode: false,
         };
         let one = |f: &VulkanFunction| vec![f.clone_ref()];

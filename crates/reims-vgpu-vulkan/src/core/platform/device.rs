@@ -264,6 +264,13 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// sel: newLibraryWithData:error: — `data` becomes a
     /// `dispatch_data_t`; `Err` is the `NSError`, whose description core logs.
     fn new_library(&self, data: &[u8]) -> RaiseResult<Result<Option<P::Library>, NsErrorText>>;
+    /// sel: newDynamicLibrary:error:
+    /// `library` as a dynamic library; `Err` is the `NSError` of a library Metal refuses as one
+    /// (one of another type, of no install name, or whose code reads a function constant).
+    fn new_dynamic_library(
+        &self,
+        library: &P::Library,
+    ) -> RaiseResult<Result<Option<P::DynamicLibrary>, NsErrorText>>;
     /// sel: newRasterizationRateMapWithDescriptor:
     /// aborts: the third layer on the suite's host (render_ratemap_three_layers).
     fn new_rate_map(&self, descriptor: &P::RateMapDescriptor) -> RaiseResult<Option<P::RateMap>>;

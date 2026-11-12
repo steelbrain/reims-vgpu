@@ -870,6 +870,46 @@ fn refusals_metal_answers_are_its_nserror_codes() {
     }
 }
 
+/// A kernel whose import a dynamic library exports is made where that library is handed in under
+/// the install name the kernel's library records, as Metal makes it from the library at that
+/// name's file, with no file opened: the guest's bundle reads the file in its own process and
+/// hands its library in (`DynamicLibrariesDesc::loaded`), here the library made of the exporting
+/// dynamic library's bytes. With none handed in it is code 2
+/// (`refusals_metal_answers_are_its_nserror_codes`).
+#[test]
+fn a_kernel_links_the_dynamic_library_handed_in_under_its_install_name() {
+    use crate::core::platform::values::FullComputePipelineDesc;
+
+    let d = dev();
+    let dir = crate::gpu::device::tests::out_dir();
+    let read = |name: &str| std::fs::read(dir.join(format!("{name}.metallib"))).unwrap();
+    let export = d
+        .new_library(&read("librefused_link_ext"))
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let dynamic = d.new_dynamic_library(&export).unwrap().unwrap().unwrap();
+    let importer = d
+        .new_library(&read("refused_import_ext"))
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let kernel = importer
+        .new_function(OnFault::Return, "k_import")
+        .unwrap()
+        .unwrap();
+    let install_name = dir.join("librefused_link_ext.metallib");
+    let mut desc = FullComputePipelineDesc::new(&kernel);
+    desc.libraries
+        .loaded
+        .push((install_name.to_str().unwrap().to_owned(), dynamic));
+    let made = d.new_compute_pipeline_state_full(&desc);
+    assert_eq!(
+        made.map(|s| s.is_some()).map_err(|e| e.description),
+        Ok(true)
+    );
+}
+
 /// Metal's `localizedDescription` for a state that supports indirect command buffers whose
 /// function of each stage uses a direct texture or sampler argument.
 const DIRECT_ARGUMENT: [&str; 3] = [
@@ -1375,6 +1415,7 @@ fn linked_answers<P: crate::core::platform::Platform>(
                     groups,
                     private_functions,
                 },
+                libraries: Default::default(),
                 open_cl_mode: false,
             })
             .map(|state| state.map(drop))

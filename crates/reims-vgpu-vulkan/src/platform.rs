@@ -32,6 +32,7 @@ use crate::gpu::desc::{
     VulkanTextureDescriptor,
 };
 use crate::gpu::device::{self, VulkanDevice};
+use crate::gpu::dynamic_library::VulkanDynamicLibrary;
 use crate::gpu::encode_blit::VulkanBlitEncoder;
 use crate::gpu::encode_compute::VulkanComputeEncoder;
 use crate::gpu::encode_render::VulkanRenderEncoder;
@@ -624,6 +625,7 @@ impl Platform for VulkanPlatform {
     type ComputePipeline = VulkanComputePipeline;
     type FunctionHandle = VulkanFunctionHandle;
     type VisibleFunctionTable = VulkanVisibleFunctionTable;
+    type DynamicLibrary = VulkanDynamicLibrary;
     type RenderPipeline = VulkanRenderPipeline;
     type RateMap = VulkanRateMap;
     type Icb = VulkanIcb;
