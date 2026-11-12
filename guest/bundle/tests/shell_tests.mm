@@ -6538,6 +6538,106 @@ void test_constants_without_cnst_resolve_from_air()
 	}
 }
 
+// A function whose metadata names no constants (no CNST tag) and whose module's constants do not
+// read (here every_constant's, its CNST tag renamed and its kSteps constant's type spoilt to one no
+// reader knows) carries every value it is given, none dropped: those set by index as set, and one
+// set by name at the index its module's `air.function_constants` gives the name. A compute
+// pipeline of it that links private functions of its library (visible functions, as MPS's
+// convolution kernels link their prefix and postfix functions) carries the kernel's values, and
+// its linked functions none.
+void test_constants_carried_where_air_constants_do_not_read()
+{
+	Fixture fx(0x80000); // the library's bytes fit
+	const char *path = getenv("RGFX_AIR_ARGUMENTS");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSMutableData *bytes = [[NSData dataWithContentsOfFile:@(path)] mutableCopy];
+	uint8_t *p = static_cast<uint8_t *>(bytes.mutableBytes);
+	size_t renamed = 0, spoilt = 0;
+	for (size_t i = 0; i + 15 <= bytes.length; i++) {
+		// every_constant's CNST tag, the one that lists kTint first of its five constants (tinted's
+		// lists kTint alone): a 4-byte name, a u16 size, a u16 count, then the first constant's name.
+		if (std::memcmp(p + i, "CNST", 4) == 0 && p[i + 6] == 5 && p[i + 7] == 0 &&
+		    std::memcmp(p + i + 8, "kTint", 6) == 0) {
+			std::memcpy(p + i, "XNST", 4);
+			renamed++;
+		}
+		// The type of kSteps (`ushort2`), a string of its module's metadata.
+		if (std::memcmp(p + i, "ushort2", 7) == 0) {
+			p[i + 5] = 'Z';
+			spoilt++;
+		}
+	}
+	CHECK(renamed == 1 && spoilt > 0);
+	uint32_t status = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.bytes
+	                                         length:bytes.length
+	                                            key:nullptr
+	                                         device:nil
+	                                     serializer:&fx.ser
+	                                         status:&status];
+	CHECK(lib != nil);
+	[lib rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		     (void)bytes;
+	     })
+	       shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+		       return nil;
+	       }];
+	const float tint[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+	const uint16_t steps[2] = {7, 9};
+	const bool mask[3] = {true, false, true};
+	const uint16_t gain = 0x3c00; // 1.0 as a half
+	MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+	[values setConstantValue:tint type:MTLDataTypeFloat4 atIndex:20];
+	[values setConstantValue:steps type:MTLDataTypeUShort2 withName:@"kSteps"];
+	[values setConstantValue:mask type:MTLDataTypeBool3 atIndex:22];
+	[values setConstantValue:&gain type:MTLDataTypeHalf atIndex:23];
+	NSError *err = nil;
+	id<MTLFunction> kernel = [lib newFunctionWithName:@"every_constant" constantValues:values error:&err];
+	CHECK(kernel != nil && err == nil && [(RgfxFunction *)kernel rgfxConstantCount] == 4);
+	const RgfxFunctionConstant *t = constantAt(kernel, 20), *st = constantAt(kernel, 21), *m = constantAt(kernel, 22),
+	                           *g = constantAt(kernel, 23);
+	CHECK(t != nullptr && t->data_type == MTLDataTypeFloat4 && std::memcmp(t->value, tint, sizeof tint) == 0);
+	CHECK(st != nullptr && st->data_type == MTLDataTypeUShort2 && std::memcmp(st->value, steps, sizeof steps) == 0);
+	CHECK(m != nullptr && m->data_type == MTLDataTypeBool3 && std::memcmp(m->value, mask, sizeof mask) == 0);
+	CHECK(g != nullptr && g->data_type == MTLDataTypeHalf && std::memcmp(g->value, &gain, sizeof gain) == 0);
+	CHECK(constantAt(kernel, 24) == nullptr); // kOptional: given no value
+
+	std::vector<uint8_t> drain;
+	RgfxMsgHeader h;
+	while (fx.ring.next(&h, &drain)) {
+	}
+	MTLComputePipelineDescriptor *desc = [[MTLComputePipelineDescriptor alloc] init];
+	desc.computeFunction = kernel;
+	MTLLinkedFunctions *linked = [MTLLinkedFunctions linkedFunctions];
+	linked.privateFunctions = @[ [lib newFunctionWithName:@"doubled"], [lib newFunctionWithName:@"sig_void"] ];
+	desc.linkedFunctions = linked;
+	RgfxComputePipelineState *cs = [RgfxComputePipelineState computePipelineStateWithDescriptor:desc
+	                                                                                     device:nil
+	                                                                                 serializer:&fx.ser
+	                                                                                      error:&err];
+	CHECK(cs != nil);
+	auto create = nextMessage(fx.ring, RGFX_CMD_COMPUTE_PIPELINE_CREATE);
+	RgfxComputePipelineCreate head;
+	std::memcpy(&head, create.data(), sizeof(head));
+	CHECK(head.constant_count == 4 && head.linked_count == 2);
+	for (uint32_t i = 0; i < head.constant_count && i < 4; i++) {
+		RgfxFunctionConstant c;
+		std::memcpy(&c, create.data() + head.constants_offset + i * sizeof(c), sizeof(c));
+		const RgfxFunctionConstant *given = constantAt(kernel, c.index);
+		CHECK(given != nullptr && c.data_type == given->data_type &&
+		      std::memcmp(c.value, given->value, sizeof(c.value)) == 0);
+	}
+	for (uint32_t i = 0; i < head.linked_count && i < 2; i++) {
+		RgfxLinkedFunction r;
+		std::memcpy(&r, create.data() + head.linked_offset + i * sizeof(r), sizeof(r));
+		CHECK(r.list == RGFX_LINKED_PRIVATE_FUNCTIONS && r.constant_count == 0);
+	}
+	while (fx.ring.next(&h, &drain)) {
+	}
+}
+
 // A library made from bytes answers nil for its bitcode, as Metal's, and is written by its shadow
 // as the bytes it was made from, with Foundation's error for a URL it cannot write; one made from
 // a URL is refused with Metal's error, and one with no shadow is refused, logged. (Metal's answers
@@ -17058,6 +17158,7 @@ int main(int argc, char **argv)
 		test_function_members_from_shadow();
 		test_unread_function_list_answers_from_shadow();
 		test_constants_without_cnst_resolve_from_air();
+		test_constants_carried_where_air_constants_do_not_read();
 		test_stitchable_reflection_from_air();
 		test_pipeline_reflection_from_air();
 		test_pipeline_reflection_before_macos13();

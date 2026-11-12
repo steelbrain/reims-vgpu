@@ -777,28 +777,61 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 	return declared;
 }
 
+// The index of each constant the module of the function `name` names in its
+// `air.function_constants`, by name, each node that reads (RgfxAirEntries::constants): none where
+// the library holds no bitcode for it or its module did not read.
+- (std::map<std::string, uint32_t>)rgfxAirConstantIndicesOf:(const std::string &)name
+{
+	std::shared_ptr<const RgfxAirModule> module;
+	{
+		std::lock_guard<std::mutex> hold(_airLock);
+		const char *why = nullptr;
+		module = [self rgfxModuleOf:name why:&why];
+	}
+	std::map<std::string, uint32_t> out;
+	if (module != nullptr && module->entriesRead)
+		for (const auto &[constantName, index] : module->entries.constants)
+			out.emplace(constantName, index);
+	return out;
+}
+
 // The constants of `entry`, a function of a table that read whose metadata gives none (no CNST
 // tag, or one that did not read), as its AIR module declares them (RgfxAirConstant), in index
-// order: false where the module declares none or they did not read, or the function is of no
-// stage the AIR reader follows. Apple's compiler writes a CNST tag for every function its module
-// declares constants for (RgfxAirArguments.hpp), so this answers for metadata of another writer.
+// order: true where they are known, `out` then empty where the module declares none; false where
+// they are not (the library holds no bitcode for the function, its module or its constants did
+// not read, or it is of no stage the AIR reader follows), whatever else of the function read.
+// Apple's compiler writes a CNST tag for every function its module declares constants for
+// (RgfxAirArguments.hpp), so this answers for metadata of another writer.
 - (bool)rgfxAirConstantsOf:(const MetallibFunction &)entry into:(std::vector<RgfxConstantDecl> &)out
 {
 	out.clear();
-	std::shared_ptr<const RgfxAirFunction> fn;
-	std::shared_ptr<const RgfxAirVisible> visible;
+	const bool stage = entry.type == MTLFunctionTypeVertex || entry.type == MTLFunctionTypeFragment ||
+	                   entry.type == MTLFunctionTypeKernel;
+	if (!stage && entry.type != MTLFunctionTypeVisible)
+		return false;
 	const std::vector<RgfxAirConstant> *air = nullptr;
-	if (entry.type == MTLFunctionTypeVertex || entry.type == MTLFunctionTypeFragment ||
-	    entry.type == MTLFunctionTypeKernel) {
-		fn = [self rgfxAirFunctionNamed:entry.name];
-		if (fn != nullptr && fn->constantsRead)
-			air = &fn->constants;
-	} else if (entry.type == MTLFunctionTypeVisible) {
-		visible = [self rgfxAirVisibleNamed:entry.name];
-		if (visible != nullptr && visible->constantsRead)
-			air = &visible->constants;
+	std::shared_ptr<const RgfxAirModule> module;
+	{
+		std::lock_guard<std::mutex> hold(_airLock);
+		const char *why = nullptr;
+		module = [self rgfxModuleOf:entry.name why:&why];
 	}
-	if (air == nullptr || air->empty())
+	if (module != nullptr && stage && module->functionsRead) {
+		for (const RgfxAirFunction &f : module->functions) {
+			if (f.name == entry.name) {
+				air = f.constantsRead ? &f.constants : nullptr;
+				break;
+			}
+		}
+	} else if (module != nullptr && !stage && module->visibleRead) {
+		for (const RgfxAirVisible &v : module->visible) {
+			if (v.name == entry.name) {
+				air = v.constantsRead ? &v.constants : nullptr;
+				break;
+			}
+		}
+	}
+	if (air == nullptr)
 		return false;
 	for (const RgfxAirConstant &c : *air)
 		out.push_back(RgfxConstantDecl{c.name, c.type, c.index, c.required});
@@ -815,7 +848,8 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 	std::vector<RgfxConstantDecl> declaredByAir;
 	if (entry != nullptr && entry->haveConstants && !entry->constants.empty()) {
 		[fn rgfxSetUnspecialisedConstants:rgfxDeclaredConstants(entry->constants)];
-	} else if (entry != nullptr && [self rgfxAirConstantsOf:*entry into:declaredByAir]) {
+	} else if (entry != nullptr && [self rgfxAirConstantsOf:*entry into:declaredByAir] &&
+	           !declaredByAir.empty()) {
 		// Metadata that names no constants: its module's.
 		[fn rgfxSetUnspecialisedConstants:rgfxDeclaredConstants(declaredByAir)];
 	} else if (fn != nil && !_table->readable) {
@@ -844,14 +878,14 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 	readConstantValues(constantValues, byIndex, byName);
 	std::vector<RgfxFunctionConstant> constants;
 	// The function's constants: its table entry's; where its entry names none, those its module
-	// declares (rgfxAirConstantsOf:into:); where the table did not read, those its shadow's
-	// function declares (Metal's own over the same bytes), in index order.
+	// declares (rgfxAirConstantsOf:into:, none where it declares none), and unknown where they did
+	// not read; where the table did not read, those its shadow's function declares (Metal's own
+	// over the same bytes), in index order.
 	const std::vector<RgfxConstantDecl> *decls =
 	    entry != nullptr && entry->haveConstants ? &entry->constants : nullptr;
 	std::vector<RgfxConstantDecl> declaredByAir;
-	if (entry != nullptr && (decls == nullptr || decls->empty()) &&
-	    [self rgfxAirConstantsOf:*entry into:declaredByAir])
-		decls = &declaredByAir;
+	if (entry != nullptr && (decls == nullptr || decls->empty()))
+		decls = [self rgfxAirConstantsOf:*entry into:declaredByAir] ? &declaredByAir : nullptr;
 	std::vector<RgfxConstantDecl> declaredByShadow;
 	if (!_table->readable) {
 		BOOL haveShadow = NO;
@@ -890,20 +924,34 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 			return nil;
 		}
 	} else {
-		// Nothing to resolve against (a table that did not read and no shadow, or an entry
-		// whose metadata did not read): the values set by index, as set; the host checks them
-		// against the function. Values set by name need the constants' names, and are not
-		// carried, which is logged.
-		if (!byName.empty())
-			RGFX_UNSUPPORTED("function constants set by name, in a library whose table did not read");
-		for (const auto &[index, v] : byIndex) {
-			if (v.bytes.empty())
+		// Nothing to resolve against (a table that did not read and no shadow, or an entry whose
+		// metadata names none and whose module's constants did not read): every value set, by
+		// index as set, the host checking them against the function; a value set by name at the
+		// index its module's `air.function_constants` gives the name (rgfxAirConstantIndicesOf:),
+		// where a value set by index is not there, as Metal takes the index's first. One whose
+		// name no node of the module names is not carried, which is logged.
+		std::map<uint32_t, const RgfxConstantValue *> carried;
+		for (const auto &[index, v] : byIndex)
+			carried.emplace(index, &v);
+		if (!byName.empty()) {
+			const std::map<std::string, uint32_t> indices = [self rgfxAirConstantIndicesOf:name.UTF8String];
+			for (const auto &[constantName, v] : byName) {
+				auto at = indices.find(constantName);
+				if (at == indices.end())
+					RGFX_UNSUPPORTED("function constants set by name, of a name the function's module does not "
+					                 "name where its constants did not read");
+				else
+					carried.emplace(at->second, &v);
+			}
+		}
+		for (const auto &[index, v] : carried) {
+			if (v->bytes.empty())
 				continue;
 			RgfxFunctionConstant k = {};
 			k.index = index;
-			k.data_type = v.type;
-			std::memcpy(k.value, v.bytes.data(),
-			            v.bytes.size() < sizeof(k.value) ? v.bytes.size() : sizeof(k.value));
+			k.data_type = v->type;
+			std::memcpy(k.value, v->bytes.data(),
+			            v->bytes.size() < sizeof(k.value) ? v->bytes.size() : sizeof(k.value));
 			constants.push_back(k);
 		}
 	}
