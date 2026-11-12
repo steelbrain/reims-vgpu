@@ -1129,13 +1129,10 @@ mod tests {
         });
         // The set, or a wait before it, comes: a set first came before A's buffer 1 finished.
         let mut seen = Vec::new();
-        for _ in 0..3000 {
+        crate::graphics::tests::eventually(|| {
             seen = p.call_log().sels_since(begun);
-            if seen.contains(&SET) || seen.contains(&"waitUntilSignaledValue:timeoutMS:") {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+            seen.contains(&SET) || seen.contains(&"waitUntilSignaledValue:timeoutMS:")
+        });
         assert!(
             !seen.contains(&SET),
             "the timeline was set before A's buffer 1 finished: {seen:?}"

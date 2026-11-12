@@ -68,12 +68,7 @@ fn a_headless_device_answers_its_guest() {
         std::sync::atomic::AtomicU64::from_ptr(producer.cast()).store(16, Ordering::SeqCst);
     }
     device.mmio_write(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
-    for _ in 0..2000 {
-        if raised.load(Ordering::SeqCst) > 0 {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
+    eventually(|| raised.load(Ordering::SeqCst) > 0);
     assert_eq!(raised.load(Ordering::SeqCst), 1);
     // The answer: DISPLAYS, its one mode 1920 × 1080 at 60 Hz.
     // SAFETY: as above; the device published the answer before it raised.
@@ -548,11 +543,25 @@ impl Guest {
         self.event()
     }
 
-    /// The next completion-ring event, waiting about 2 s; `None` where none came.
+    /// Whether no completion-ring event comes for `window`: what a check that a message is not
+    /// answered waits, a span of its own, as the device's threads may take that long to post one.
+    fn quiet_for(&mut self, window: Duration) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < window {
+            if self.event_now().is_some() {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.event_now().is_none()
+    }
+
+    /// The next completion-ring event, waiting for it [`PATIENCE`] polls at most; `None` where
+    /// none came.
     fn event(&mut self) -> Option<Vec<u8>> {
         let at =
             |count: u64| RGFX_CONTROL_COMPLETE_OFFSET as usize + 256 + (count % RING_DATA) as usize;
-        for _ in 0..2000 {
+        for _ in 0..PATIENCE {
             // SAFETY: as the helpers above.
             let produced = unsafe { self.load_u64(RGFX_CONTROL_COMPLETE_OFFSET as usize) };
             if produced != self.consumed {
@@ -760,14 +769,7 @@ fn an_object_create_reaches_the_decoder() {
     assert_eq!(device.decoder_object_count(), 0);
     let mut guest = Guest::new(&device);
     guest.send(&device, event_create(obj(1, 10)));
-    let mut grew = false;
-    for _ in 0..2000 {
-        if device.decoder_object_count() == 1 {
-            grew = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    let grew = eventually(|| device.decoder_object_count() == 1);
     assert!(grew, "the create never reached the decoder");
 }
 
@@ -938,13 +940,10 @@ fn a_command_buffer_submission_completes_on_the_ring() {
     ring.send(&device, command_buffer(obj(context, 1), 100));
     // The host decodes and commits asynchronously; complete the committed buffer on the GPU once
     // it is there (a no-op before it is), until the handler posts onto the completion ring.
-    for _ in 0..3000 {
+    eventually(|| {
         platform.world().complete_all(CompleteOn::Caller);
-        if ring.has_event() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+        ring.has_event()
+    });
     let bytes = ring.event().expect("a CB_COMPLETE");
     let done = RgfxCbComplete::read_from_bytes(&bytes).unwrap();
     assert_eq!(done.header.r#type, RGFX_EVT_CB_COMPLETE);
@@ -1238,12 +1237,12 @@ impl QueueRing {
         false
     }
 
-    /// The next completion-ring event other than a `CB_SCHEDULED` (see `has_event`), waiting
-    /// about 2 s; `None` where none came.
+    /// The next completion-ring event other than a `CB_SCHEDULED` (see `has_event`), waiting for
+    /// it [`PATIENCE`] polls at most; `None` where none came.
     fn event(&mut self) -> Option<Vec<u8>> {
         let (complete_off, data) = (self.complete_off, self.data);
         let at = |count: u64| complete_off as usize + 256 + (count % data) as usize;
-        for _ in 0..2000 {
+        for _ in 0..PATIENCE {
             if self.has_event() {
                 // SAFETY: as the helpers above; `has_event` stopped at a published message.
                 let header = unsafe { self.read(at(self.consumed), 8) };
@@ -1313,13 +1312,10 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
 
     // The host decodes and commits asynchronously; complete the committed buffer on the GPU once it
     // is there until the handler posts onto the queue's completion ring.
-    for _ in 0..3000 {
+    eventually(|| {
         platform.world().complete_all(CompleteOn::Caller);
-        if ring.has_event() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+        ring.has_event()
+    });
     let bytes = ring.event().expect("a CB_COMPLETE on the queue ring");
     let done = RgfxCbComplete::read_from_bytes(&bytes).unwrap();
     assert_eq!(done.header.r#type, RGFX_EVT_CB_COMPLETE);
@@ -1333,14 +1329,8 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
 
     // Destroying the queue ends its per-queue service, and its handle goes.
     guest.send(&device, object_destroy(queue));
-    let mut gone = false;
-    for _ in 0..2000 {
-        if device.graphics_queue_count() == 0 && device.decoder_object_count() == 0 {
-            gone = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    let gone =
+        eventually(|| device.graphics_queue_count() == 0 && device.decoder_object_count() == 0);
     assert!(gone, "the queue's destroy never ended it");
 }
 
@@ -1474,17 +1464,7 @@ fn a_doorbell_write_answers_a_command_buffer_on_its_thread() {
     );
     let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
     // The queue's thread sleeps with the ring idle, as the guest rings for a buffer.
-    for _ in 0..2000 {
-        // SAFETY: as `QueueRing`'s helpers; `consumer_idle` is at 0x80 of the submission ring.
-        let idle = unsafe {
-            AtomicU32::from_ptr(device.region_base().add(SUBMIT_OFF as usize + 0x80).cast())
-                .load(Ordering::SeqCst)
-        };
-        if idle == 1 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    wait_idle(&device, SUBMIT_OFF);
     ring.arm();
 
     ring.publish(asking(queue, 100));
@@ -1503,13 +1483,10 @@ fn a_doorbell_write_answers_a_command_buffer_on_its_thread() {
     assert_eq!(raised.lock().first(), Some(&(1, here)));
 
     let complete = |ring: &mut QueueRing| {
-        for _ in 0..3000 {
+        eventually(|| {
             platform.world().complete_all(CompleteOn::Caller);
-            if ring.has_event() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+            ring.has_event()
+        });
         RgfxCbComplete::read_from_bytes(&ring.event().expect("a CB_COMPLETE")).unwrap()
     };
     let done = complete(&mut ring);
@@ -1608,13 +1585,10 @@ fn a_doorbell_s_answer_allocates_nothing() {
             (posted.header.r#type, posted.cb_obj_id),
             (RGFX_EVT_CB_SUBMITTED, cb)
         );
-        for _ in 0..3000 {
+        eventually(|| {
             platform.world().complete_all(CompleteOn::Caller);
-            if ring.has_event() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+            ring.has_event()
+        });
         let done = RgfxCbComplete::read_from_bytes(&ring.event().expect("a CB_COMPLETE")).unwrap();
         assert_eq!((done.cb_obj_id, done.status), (cb, RGFX_CB_OK));
     }
@@ -1631,13 +1605,10 @@ fn a_doorbell_s_answer_allocates_nothing() {
         (0, 0),
         "a write that only woke the queue's thread called the allocator (allocations, frees)"
     );
-    for _ in 0..3000 {
+    eventually(|| {
         platform.world().complete_all(CompleteOn::Caller);
-        if ring.has_event() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+        ring.has_event()
+    });
     let done = RgfxCbComplete::read_from_bytes(&ring.event().expect("a CB_COMPLETE")).unwrap();
     assert_eq!((done.cb_obj_id, done.status), (164, RGFX_CB_OK));
 }
@@ -1786,13 +1757,10 @@ fn a_lone_buffer_s_doorbell_to_its_cb_submitted() {
         );
     };
     let finish = |ring: &mut QueueRing, cb: u64| {
-        for _ in 0..3000 {
+        eventually(|| {
             platform.world().complete_all(CompleteOn::Caller);
-            if ring.has_event() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+            ring.has_event()
+        });
         let done = RgfxCbComplete::read_from_bytes(&ring.event().expect("a CB_COMPLETE")).unwrap();
         assert_eq!((done.cb_obj_id, done.status), (cb, RGFX_CB_OK));
         ring.scheduled.clear();
@@ -2071,22 +2039,22 @@ fn a_lone_buffer_s_doorbell_to_its_cb_scheduled() {
     );
 }
 
-/// Waits about 2 s at most for the service thread of the queue whose submission ring is at region
+/// Waits, [`PATIENCE`] polls at most, for the service thread of the queue whose submission ring is at region
 /// offset `submit_off` to sleep with its ring idle (its `consumer_idle` 1), as the guest finds it
 /// when it rings for a buffer.
 fn wait_idle(device: &GraphicsDevice<FakePlatform>, submit_off: u64) {
-    for _ in 0..2000 {
-        // SAFETY: the region is the device's, mapped while it lives; `consumer_idle` is at 0x80
-        // of the submission ring's header, which the host writes atomically.
-        let idle = unsafe {
-            AtomicU32::from_ptr(device.region_base().add(submit_off as usize + 0x80).cast())
-                .load(Ordering::SeqCst)
-        };
-        if idle == 1 {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| ring_idle(device, submit_off));
+}
+
+/// Whether the queue's thread of the submission ring at `submit_off` sleeps with it idle.
+fn ring_idle(device: &GraphicsDevice<FakePlatform>, submit_off: u64) -> bool {
+    // SAFETY: the region is the device's, mapped while it lives; `consumer_idle` is at 0x80 of
+    // the submission ring's header, which the host writes atomically.
+    let idle = unsafe {
+        AtomicU32::from_ptr(device.region_base().add(submit_off as usize + 0x80).cast())
+            .load(Ordering::SeqCst)
+    };
+    idle == 1
 }
 
 /// The name of the thread each raise that called the device ran on, once its calls returned.
@@ -2161,28 +2129,17 @@ fn a_raise_may_call_the_device_at_once() {
         );
         assert_eq!(created, RGFX_STATUS_OK);
         let ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
-        for _ in 0..2000 {
-            // SAFETY: as `QueueRing`'s helpers; `consumer_idle` is at 0x80 of the submission ring.
-            let idle = unsafe {
-                AtomicU32::from_ptr(device.region_base().add(SUBMIT_OFF as usize + 0x80).cast())
-                    .load(Ordering::SeqCst)
-            };
-            if idle == 1 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        wait_idle(&device, SUBMIT_OFF);
         ring.arm();
         (device, returned, guest, ring)
     };
     let returned_on = |returned: &Returned| {
-        for _ in 0..3000 {
-            if let Some(name) = returned.lock().first() {
-                return name.clone();
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        panic!("the raise's calls never returned");
+        let mut name = None;
+        eventually(|| {
+            name = returned.lock().first().cloned();
+            name.is_some()
+        });
+        name.expect("the raise's calls never returned")
     };
     let reset = |device: &GraphicsDevice<FakePlatform>| {
         assert_eq!(device.mmio_read(RGFX_REG_STATUS.into()), RGFX_STATUS_RESET);
@@ -2300,12 +2257,7 @@ fn the_guest_s_cursor_reaches_the_host() {
     };
     let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
     let wait = |count: usize| {
-        for _ in 0..2000 {
-            if told.lock().len() >= count {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        eventually(|| told.lock().len() >= count);
         let told = told.lock();
         assert_eq!(told.len(), count, "{told:?}");
         told.iter()
@@ -2401,12 +2353,7 @@ fn the_host_is_told_no_cursor_while_the_display_s_panel_is_off() {
     };
     let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
     let wait = |count: usize| {
-        for _ in 0..2000 {
-            if told.lock().len() >= count {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        eventually(|| told.lock().len() >= count);
         let told = told.lock();
         assert_eq!(told.len(), count, "{told:?}");
         told.iter()
@@ -2740,12 +2687,7 @@ fn a_reset_shows_the_scanout_in_place_of_the_surface_shown() {
 
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
     reset_done(&device);
-    for _ in 0..2000 {
-        if device.control.presented.shown().is_none() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| device.control.presented.shown().is_none());
     assert!(
         device.control.presented.shown().is_none(),
         "the surface stayed"
@@ -2973,12 +2915,7 @@ fn display_colors_take_effect_with_the_next_accepted_present() {
 
     // The reset, which the control thread tells the host: every stage off.
     device.reset();
-    for _ in 0..3000 {
-        if device.control.presented.color().1.is_identity() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| device.control.presented.color().1.is_identity());
     assert!(device.control.presented.color().1.is_identity());
 }
 
@@ -3310,16 +3247,13 @@ fn next_event(guest: &mut Guest, r#type: u32) -> Vec<u8> {
     bytes
 }
 
-/// Completes the platform's committed command buffers until `ring` has an event, about 3 s.
+/// Completes the platform's committed command buffers until `ring` has an event, [`PATIENCE`]
+/// polls at most.
 fn complete_until_event(platform: &FakePlatform, ring: &mut QueueRing) -> bool {
-    for _ in 0..3000 {
+    eventually(|| {
         platform.world().complete_all(CompleteOn::Caller);
-        if ring.has_event() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    false
+        ring.has_event()
+    })
 }
 
 /// One process's pipeline compile holds nothing of another's: while context 1's render pipeline
@@ -3709,29 +3643,23 @@ impl WalkGate {
         self.taken_on.lock().clone()
     }
 
-    /// Waits, about 3 s at most, for `n` ops to be walked past the gate once a walk took it;
+    /// Waits, [`PATIENCE`] polls at most, for `n` ops to be walked past the gate once a walk took it;
     /// whether they were.
     fn passed(&self, n: u32) -> bool {
-        for _ in 0..3000 {
-            if self.passed.load(Ordering::SeqCst) >= n {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        false
+        eventually(|| self.passed.load(Ordering::SeqCst) >= n)
     }
 
-    /// Waits, about 3 s at most, for a walk to stop at the gate; whether one did.
+    /// Waits, [`PATIENCE`] polls at most, for a walk to stop at the gate; whether one did.
     fn reached(&self) -> bool {
         let (lock, moved) = &*self.state;
         let mut s = lock.lock();
-        for _ in 0..3000 {
+        for _ in 0..PATIENCE {
             if s.1 {
                 return true;
             }
             moved.wait_for(&mut s, Duration::from_millis(1));
         }
-        false
+        s.1
     }
 
     /// Lets the walk stopped at the gate go on.
@@ -3764,8 +3692,9 @@ fn create_queue_flagged(
     answered(device, guest, create)
 }
 
-/// The platform's queue creators' calls, newest last, once `count` of them were made (about 2 s):
-/// each queue's handle is made on its service thread, after its create is answered.
+/// The platform's queue creators' calls, newest last, once `count` of them were made
+/// ([`PATIENCE`] polls at most): each queue's handle is made on its service thread, after its
+/// create is answered.
 fn queue_calls(platform: &FakePlatform, count: usize) -> Vec<&'static str> {
     use reims_vgpu_vulkan::core::testkit::impls::device::UNSHARED_QUEUE;
     let made = || -> Vec<&'static str> {
@@ -3775,12 +3704,7 @@ fn queue_calls(platform: &FakePlatform, count: usize) -> Vec<&'static str> {
             .filter(|&sel| sel == "newCommandQueue" || sel == UNSHARED_QUEUE)
             .collect()
     };
-    for _ in 0..2000 {
-        if made().len() >= count {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| made().len() >= count);
     made()
 }
 
@@ -3919,12 +3843,7 @@ fn a_close_during_a_walk_is_answered_after_the_buffer() {
     let close = guest.seqno;
     let commits = platform.call_log().count("commit");
     gate.open();
-    for _ in 0..3000 {
-        if platform.call_log().count("commit") > commits {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| platform.call_log().count("commit") > commits);
     assert!(
         platform.call_log().count("commit") > commits,
         "not committed"
@@ -3978,12 +3897,7 @@ fn a_close_during_a_walk_holds_up_nothing_on_ring_0() {
     );
     let commits = platform.call_log().count("commit");
     gate.open();
-    for _ in 0..3000 {
-        if platform.call_log().count("commit") > commits {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| platform.call_log().count("commit") > commits);
     platform.world().complete_all(CompleteOn::Caller);
     let bytes = guest.event().expect("the close's COMPLETE");
     let complete = RgfxComplete::read_from_bytes(&bytes).unwrap();
@@ -4025,12 +3939,7 @@ fn a_reset_during_a_walk_comes_after_it() {
         "the reset dropped the walk's objects before the walk ended"
     );
     gate.open();
-    for _ in 0..3000 {
-        if device.decoder_object_count() == 0 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| device.decoder_object_count() == 0);
     assert_eq!(device.decoder_object_count(), 0, "the reset left objects");
     assert!(
         platform.call_log().count("commit") > commits,
@@ -4406,17 +4315,13 @@ fn at_seqno(mut message: Vec<u8>, seqno: u64) -> Vec<u8> {
     message
 }
 
-/// Whether `ring` takes the `CB_SCHEDULED` `(seqno, cb_obj_id)` within about 3 s, completing
-/// nothing on the platform meanwhile.
+/// Whether `ring` takes the `CB_SCHEDULED` `(seqno, cb_obj_id)` within [`PATIENCE`] polls,
+/// completing nothing on the platform meanwhile.
 fn scheduled_comes(ring: &mut QueueRing, record: (u64, u64)) -> bool {
-    for _ in 0..3000 {
+    eventually(|| {
         ring.has_event();
-        if ring.scheduled.contains(&record) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    false
+        ring.scheduled.contains(&record)
+    })
 }
 
 /// A command buffer that waits for nothing and does not ask for its `CB_SUBMITTED` gets its
@@ -5126,18 +5031,10 @@ fn a_drain_s_first_doorbell_to_its_last_cb_complete() {
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform, _guest, mut ring) = one_queue(&raised);
     let idle = || {
-        for _ in 0..2000 {
-            // SAFETY: as `QueueRing`'s helpers; `consumer_idle` is at 0x80 of the submission ring.
-            let idle = unsafe {
-                AtomicU32::from_ptr(device.region_base().add(SUBMIT_OFF as usize + 0x80).cast())
-                    .load(Ordering::SeqCst)
-            };
-            if idle == 1 {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        panic!("the queue's thread did not go idle");
+        assert!(
+            eventually(|| ring_idle(&device, SUBMIT_OFF)),
+            "the queue's thread did not go idle"
+        );
     };
     let mut cb = 1000;
     for buffers in [1, 8] {
@@ -5522,12 +5419,7 @@ fn a_short_buffer_that_waits_for_nothing_is_walked_on_its_queue_s_service_thread
     );
     let threads = walk_threads(&device);
     beside.send(&device, sampler_command_buffer(obj(1, 2), 300, obj(1, 4)));
-    for _ in 0..3000 {
-        if !threads.lock().is_empty() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| !threads.lock().is_empty());
     draw.open();
     assert_eq!(
         ring_events(&platform, &mut beside, 1),
@@ -6031,7 +5923,7 @@ fn a_destroy_of_a_pending_library_keeps_the_pipeline_before_it() {
         .expect("the pipeline's reflection");
     assert_eq!(reflection.obj_id, obj(1, 11));
     assert_eq!(reflection.status, RGFX_PIPELINE_OK);
-    assert!(guest.event().is_none());
+    assert!(guest.quiet_for(Duration::from_secs(2)), "a third event");
     assert_eq!(device.decoder_object_count(), 1);
 }
 
@@ -6423,10 +6315,11 @@ fn answer_of(guest: &mut Guest, seqno: u64) -> u32 {
 /// (a present's wait was not seen within 2,000 polls, 2.2 s and 3.3 s, on msi beside other
 /// lanes' builds, where the test passes in under 0.4 s alone). A test that passes polls only
 /// until the state holds.
-const PATIENCE: u32 = 60_000;
+pub(crate) const PATIENCE: u32 = 60_000;
 
-/// Polls `done` until it holds, [`PATIENCE`] times at most: whether it held.
-fn eventually(mut done: impl FnMut() -> bool) -> bool {
+/// Polls `done` until it holds, [`PATIENCE`] times at most: whether it held. The decoder's tests
+/// wait with it too.
+pub(crate) fn eventually(mut done: impl FnMut() -> bool) -> bool {
     for _ in 0..PATIENCE {
         if done() {
             return true;
@@ -9033,12 +8926,7 @@ fn a_reset_drops_every_object_the_guest_made() {
             RGFX_STATUS_OK
         );
         guest.send(&device, event_create(obj(2, 1)));
-        for _ in 0..2000 {
-            if device.decoder_object_count() == 5 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        eventually(|| device.decoder_object_count() == 5);
         assert_eq!(device.decoder_object_count(), 5);
         assert_eq!(device.graphics_queue_count(), 1);
     };
@@ -9049,12 +8937,7 @@ fn a_reset_drops_every_object_the_guest_made() {
     assert_eq!(texture.len(), 1);
 
     device.reset();
-    for _ in 0..2000 {
-        if device.decoder_object_count() == 0 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| device.decoder_object_count() == 0);
     assert_eq!(
         device.decoder_object_count(),
         0,
@@ -9073,28 +8956,19 @@ fn a_reset_drops_every_object_the_guest_made() {
     assert_ne!(again, texture, "a texture of its own");
 }
 
-/// Waits about 2 s for the decoder to hold `n` objects; whether it came to. A queue's handle is
+/// Waits, [`PATIENCE`] polls at most, for the decoder to hold `n` objects; whether it came to. A queue's handle is
 /// made on its service thread, which may start after the queue's create is answered.
 fn holds_objects(device: &GraphicsDevice<FakePlatform>, n: usize) -> bool {
-    for _ in 0..2000 {
-        if device.decoder_object_count() == n {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    false
+    eventually(|| device.decoder_object_count() == n)
 }
 
-/// Waits about 2 s for the decoder's reset, on the control thread, to have dropped every object
+/// Waits, [`PATIENCE`] polls at most, for the decoder's reset, on the control thread, to have dropped every object
 /// of the guest's.
 fn reset_done(device: &GraphicsDevice<FakePlatform>) {
-    for _ in 0..2000 {
-        if device.decoder_object_count() == 0 {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    panic!("the reset left the guest's objects");
+    assert!(
+        eventually(|| device.decoder_object_count() == 0),
+        "the reset left the guest's objects"
+    );
 }
 
 /// Zeroes a queue's ring headers, as the guest's bundle does before its `QUEUE_CREATE`.
@@ -9221,12 +9095,7 @@ fn a_library_made_across_a_reset_is_not_in_the_new_device_s_cache() {
     device.reset();
     reset_done(&device);
     device.control.pool.release();
-    for _ in 0..2000 {
-        if library_makes(&platform) == 1 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| library_makes(&platform) == 1);
     assert_eq!(library_makes(&platform), 1, "the held make never ran");
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(
@@ -9782,15 +9651,9 @@ fn buffer_over_surface_pages(obj_id: u64, length: u64) -> Vec<u8> {
     .to_vec()
 }
 
-/// Waits, about 2 s at most, for the decoder to hold `n` objects; whether it did.
+/// Waits, [`PATIENCE`] polls at most, for the decoder to hold `n` objects; whether it did.
 fn objects_become(device: &GraphicsDevice<FakePlatform>, n: usize) -> bool {
-    for _ in 0..2000 {
-        if device.decoder_object_count() == n {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    false
+    eventually(|| device.decoder_object_count() == n)
 }
 
 /// The `COMPLETE` `bytes` is: its seqno and status.
@@ -9869,14 +9732,7 @@ fn a_reset_drops_a_surface_pages_not_yet_carried_out() {
     guest.send(&device, surface_pages(&device, page, &[(1, 1)]));
     std::thread::sleep(Duration::from_millis(20));
     device.reset();
-    let mut reset = false;
-    for _ in 0..2000 {
-        if worker.views_of_surfaces().resets() == 1 {
-            reset = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    let reset = eventually(|| worker.views_of_surfaces().resets() == 1);
     assert!(reset, "the reset waited for the worker");
     worker.surface_worker().release();
     worker.surface_worker().flush();
@@ -10138,17 +9994,7 @@ fn a_buffer_of_a_context_making_a_pages_buffer_is_not_answered_at_its_doorbell()
         RGFX_STATUS_OK
     );
     let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
-    for _ in 0..2000 {
-        // SAFETY: as `QueueRing`'s helpers; `consumer_idle` is at 0x80 of the submission ring.
-        let idle = unsafe {
-            AtomicU32::from_ptr(device.region_base().add(SUBMIT_OFF as usize + 0x80).cast())
-                .load(Ordering::SeqCst)
-        };
-        if idle == 1 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    wait_idle(&device, SUBMIT_OFF);
     ring.arm();
     guest.send(&device, block_grant(1, SURFACE_BLOCK, SURFACE_BLOCK_SIZE));
     let mut pages = surface_pages(&device, page, &[(5, 2), (1, 1)]);
@@ -10169,18 +10015,12 @@ fn a_buffer_of_a_context_making_a_pages_buffer_is_not_answered_at_its_doorbell()
     let mark = platform.call_log().mark();
 
     guest.send(&device, buffer_over_pages(obj(1, 11), 3 * page));
-    let mut handed = false;
-    for _ in 0..2000 {
-        if device
+    let handed = eventually(|| {
+        device
             .control
             .pages_buffers
             .any(std::iter::once(pages_context(context)))
-        {
-            handed = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    });
     assert!(handed, "ring 0 handed the buffer to the worker");
     ring.publish(asking(queue, 100));
     device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
@@ -10195,14 +10035,7 @@ fn a_buffer_of_a_context_making_a_pages_buffer_is_not_answered_at_its_doorbell()
     assert_eq!(buffers(&platform.call_log().sels_since(mark)), 0);
 
     worker.surface_worker().release();
-    let mut submitted = None;
-    for _ in 0..2000 {
-        if ring.has_event() {
-            submitted = ring.event();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    let submitted = ring.event();
     let posted = RgfxCbSubmitted::read_from_bytes(&submitted.expect("a CB_SUBMITTED")).unwrap();
     assert_eq!(
         (posted.header.r#type, posted.cb_obj_id),
@@ -10214,15 +10047,11 @@ fn a_buffer_of_a_context_making_a_pages_buffer_is_not_answered_at_its_doorbell()
         2,
         "the view's import and the buffer over it, before the command buffer: {made:?}"
     );
-    let mut done = None;
-    for _ in 0..3000 {
+    eventually(|| {
         platform.world().complete_all(CompleteOn::Caller);
-        if ring.has_event() {
-            done = ring.event();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+        ring.has_event()
+    });
+    let done = ring.event();
     let done = RgfxCbComplete::read_from_bytes(&done.expect("a CB_COMPLETE")).unwrap();
     assert_eq!((done.cb_obj_id, done.status), (100, RGFX_CB_OK));
 }
@@ -10301,13 +10130,10 @@ fn a_close_s_slow_release_of_a_pages_view_holds_up_no_other_context_s_pages() {
     let world = platform.world();
     // The buffer over the view goes once the walks and workers that saw it let it go.
     let mut imports = world.live("MTLBuffer");
-    for _ in 0..2000 {
-        if imports.len() == 1 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
+    eventually(|| {
         imports = world.live("MTLBuffer");
-    }
+        imports.len() == 1
+    });
     assert_eq!(imports.len(), 1, "the view's import alone: {imports:?}");
     let release = HeldCall::new();
     world.hold_at_release(imports[0], release.clone());
@@ -10446,12 +10272,7 @@ fn a_reset_waits_for_a_close_s_slow_release() {
         "the reset went on before the close let go of its sampler"
     );
     release.open();
-    for _ in 0..2000 {
-        if device.decoder_object_count() == 0 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| device.decoder_object_count() == 0);
     assert_eq!(
         device.decoder_object_count(),
         0,

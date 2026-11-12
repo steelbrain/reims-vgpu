@@ -770,27 +770,25 @@ mod tests {
 
     /// Waits until `n` compiles have started.
     fn started(starts: &Starts, n: usize) -> Vec<String> {
-        for _ in 0..5000 {
-            let now = starts.lock().clone();
-            if now.len() >= n {
-                return now;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        panic!("{n} compiles did not start");
+        let mut now = Vec::new();
+        let came = crate::graphics::tests::eventually(|| {
+            now = starts.lock().clone();
+            now.len() >= n
+        });
+        assert!(came, "{n} compiles did not start");
+        now
     }
 
     /// Waits until `pool`'s threads have taken `n` compiles; the contexts of those taken, in
     /// order.
     fn took(pool: &CompilePool, n: usize) -> Vec<u32> {
-        for _ in 0..5000 {
-            let now = pool.taken();
-            if now.len() >= n {
-                return now;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        panic!("the threads did not take {n} compiles");
+        let mut now = Vec::new();
+        let came = crate::graphics::tests::eventually(|| {
+            now = pool.taken();
+            now.len() >= n
+        });
+        assert!(came, "the threads did not take {n} compiles");
+        now
     }
 
     /// The process's exit waits for a compile in progress, and the pool starts no compile once

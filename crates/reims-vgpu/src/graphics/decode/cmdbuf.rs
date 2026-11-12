@@ -7301,7 +7301,7 @@ mod tests {
         fn reached(&self) {
             let (lock, moved) = &*self.0;
             let mut s = lock.lock();
-            for _ in 0..3000 {
+            for _ in 0..crate::graphics::tests::PATIENCE {
                 if s.1 {
                     return;
                 }
@@ -7851,13 +7851,10 @@ mod tests {
                 out_tx.lock().take();
             }
             if index == last {
-                for _ in 0..1000 {
-                    if gate.waiting(0) == 1 {
-                        return;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                panic!("the other queue's buffer never waited at its commit");
+                assert!(
+                    crate::graphics::tests::eventually(|| gate.waiting(0) == 1),
+                    "the other queue's buffer never waited at its commit"
+                );
             }
         })));
         let mut other = dec.sender(Some(0), super::super::Sinks::default());

@@ -5145,12 +5145,7 @@ mod tests {
         let caches = Arc::clone(&r.dec.surface_caches);
         let wait = std::thread::scope(|scope| {
             let asked = scope.spawn(|| caches.fill_now(&r.device, BLOCK, 2).unwrap());
-            for _ in 0..1000 {
-                if asked.is_finished() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
+            crate::graphics::tests::eventually(|| asked.is_finished());
             assert!(
                 asked.is_finished(),
                 "the present's fill was waited for where it was asked"
@@ -6051,14 +6046,7 @@ mod tests {
                     let taken = caches.before(&r.device, &taking, &reading(BLOCK, 2), &NO_REACH);
                     (asked.map_err(|_| ()), taken.map_err(|_| ()))
                 });
-                let mut at_once = false;
-                for _ in 0..1000 {
-                    if begin.is_finished() {
-                        at_once = true;
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
+                let at_once = crate::graphics::tests::eventually(|| begin.is_finished());
                 // The long walk ends: its commit, then its finish.
                 (r.dec.surface_caches)
                     .finish(&r.device, 1, None, &long, walking.unwrap(), || {

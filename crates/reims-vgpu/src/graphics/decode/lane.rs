@@ -636,15 +636,10 @@ mod tests {
         }
     }
 
-    /// Waits about 2 s for `done`; whether it came.
+    /// Waits for `done` as the graphics tests wait ([`crate::graphics::tests::eventually`]: a
+    /// loaded host starves the lane's threads for seconds); whether it came.
     fn until(done: impl Fn() -> bool) -> bool {
-        for _ in 0..2000 {
-            if done() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        false
+        crate::graphics::tests::eventually(done)
     }
 
     /// A lane runs its jobs at once on up to [`LANE_THREADS`] threads, its own and the budget's,
@@ -1115,13 +1110,7 @@ mod tests {
                 *on.lock() = Some(std::thread::current().id());
             }));
             let done = || ran.lock().is_some() && lane.counts().0 == idle;
-            for _ in 0..10_000 {
-                if done() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            assert!(done(), "the job ran with {:?}", lane.counts());
+            assert!(until(done), "the job ran with {:?}", lane.counts());
             ran.lock().unwrap()
         }
 

@@ -238,15 +238,10 @@ mod tests {
 
     use super::*;
 
-    /// Polls `done` for up to two seconds of real time: the watcher runs on a thread of its own.
+    /// Polls `done` in real time as the graphics tests do
+    /// ([`crate::graphics::tests::eventually`]): the watcher runs on a thread of its own.
     fn eventually(done: impl Fn() -> bool) -> bool {
-        for _ in 0..2000 {
-            if done() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        done()
+        crate::graphics::tests::eventually(done)
     }
 
     /// A buffer still waiting at its deadline is logged; one that finished first is not, and
