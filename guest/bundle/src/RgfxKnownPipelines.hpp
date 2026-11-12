@@ -32,6 +32,23 @@
 /// zeroed.
 typedef std::array<uint8_t, 32> RgfxPipelineKey;
 
+/// A library's content key (RgfxLibraryKey.hpp).
+typedef std::array<uint8_t, 32> RgfxLibraryContentKey;
+
+/// The pipeline key of the render or compute create of `type` whose whole message is the `size`
+/// bytes at `message`, its header as the ring stamps it (`type`, `size` and a seqno of 0, whatever
+/// the bytes hold), as the device computes it (RGFX_PIPELINE_REFLECT_KEYED in the wire header):
+/// the SHA-256 of "rgfx-pipeline-v1", the message with its header's seqno, its obj_id and every
+/// library id it names zeroed, then each named library's content key in the order their ids
+/// lie (a compute create's function library, then its linked functions'; a render create's
+/// vertex and fragment libraries, then its vertex and its fragment linked functions'), 32 zero
+/// bytes for an id of 0. False where the create does not ask for its key (the flags'
+/// RGFX_*_PIPELINE_ANSWER_KEY), links dynamic libraries, is of another type or does not read, or
+/// `libraryKey` gives a library it names no key.
+bool rgfxSharedPipelineKey(uint32_t type, const uint8_t *message, uint32_t size,
+                           const std::function<bool(uint64_t, RgfxLibraryContentKey *)> &libraryKey,
+                           RgfxPipelineKey *out);
+
 class RgfxKnownPipelines {
 public:
 	/// The most messages kept; past it a new message is not kept, and its later equal creates wait

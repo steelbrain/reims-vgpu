@@ -142,6 +142,29 @@ bool RgfxRingWriter::tryPostKnown(uint32_t type, const void *message, uint32_t s
 	return true;
 }
 
+bool RgfxRingWriter::tryPostShared(uint32_t type, const void *message, uint32_t size,
+                                   const std::array<uint8_t, 32> &key, uint64_t *out_seqno,
+                                   bool *out_deferred, RgfxPipelineReflection *out_reflection)
+{
+	*out_deferred = false;
+	if (!shares())
+		return tryPost(type, message, size, out_seqno);
+	if (size < kHeaderBytes || size % kMsgAlign != 0 || size > m_dataSize)
+		return false;
+	std::unique_ptr<uint8_t[]> buf(new uint8_t[size]);
+	std::memcpy(buf.get(), message, size);
+	RgfxMsgHeader header = { type, size, 0 };
+	std::memcpy(buf.get(), &header, sizeof(header));
+	storeFence();
+	uint64_t seqno = 0;
+	if (!m_sharedPost(m_deferredContext, buf.get(), size, key.data(), &seqno, out_deferred,
+	                  out_reflection))
+		return false;
+	if (out_seqno)
+		*out_seqno = seqno;
+	return true;
+}
+
 bool RgfxRingWriter::awaitAnswer(uint64_t seqno)
 {
 	return m_await != nullptr && m_await(m_deferredContext, seqno);

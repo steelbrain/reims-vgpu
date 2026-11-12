@@ -88,12 +88,13 @@ enum {
 
 // The kext's own features (kRgfxKextFeature*, RgfxUserClientABI.hpp) this kext carries out, the
 // second word kRgfxAccelMethodFeatures answers: PagesBlock and PagesChunked, Submit's deferred
-// flag and TakeAnswers, OpenContext's span, shared events' ports and Alloc's write-combined part,
+// and shared flags and TakeAnswers, OpenContext's span, shared events' ports and Alloc's write-combined part,
 // where the region's write-combined mappings are ordinary memory (RgfxRegionMapping.hpp). Each
 // bit is set by the change that lands its call.
 constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeaturePagesChunked |
                                           kRgfxKextFeatureDeferredAnswers |
+                                          kRgfxKextFeatureSharedPipelines |
                                           kRgfxKextFeatureContextSpan |
                                           kRgfxKextFeatureSharedEvents |
                                           kRgfxKextFeatureRegionWriteCombined;
@@ -527,6 +528,10 @@ public:
 	                      UInt32 capacity, UInt32 *length, UInt32 *count);
 	void dropDeferred(UInt32 context);
 	void forgetDeferred(UInt64 seqno);
+	// The answers kept by pipeline key (ReimsGraphics::findSharedPipeline, learnSharedPipeline).
+	bool findSharedPipeline(const UInt8 *key, UInt64 seqno, UInt64 objId,
+	                        RgfxPipelineReflection *out);
+	void learnSharedPipeline(const UInt8 *reply, UInt32 length);
 	// `flags` (RGFX_QUEUE_*, granted by rgfxQueueFlagsGranted) go in the QUEUE_CREATE's tail;
 	// with none, the message has no tail.
 	UInt32 openQueue(const RgfxQueueCreate &create, UInt32 flags);

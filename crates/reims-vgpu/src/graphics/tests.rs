@@ -5750,6 +5750,79 @@ fn a_library_lookup_misses_then_hits_across_two_contexts() {
     assert_eq!(reflection.status, RGFX_PIPELINE_OK);
 }
 
+/// A pipeline create that asks for its pipeline key gets it after its reflection where the device
+/// made the pipeline and holds every library it names under a key it checked: two processes'
+/// equal creates, over their own ids of one keyed library, get one key, which the kext keeps their
+/// answer by; a render create is keyed too. A create naming a library held under no key, and one
+/// that does not ask, get the plain reflection.
+#[test]
+fn a_keyed_pipeline_create_answers_its_pipeline_key() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let (bytes, key) = keyed_metallib();
+    let made = keyed_library_create(obj(1, 10), &bytes, Some(key));
+    assert_eq!(answered(&device, &mut guest, made), RGFX_STATUS_OK);
+    let found = library_lookup(obj(2, 10), bytes.len(), key);
+    assert_eq!(answered(&device, &mut guest, found), RGFX_STATUS_OK);
+    let unkeyed = keyed_library_create(obj(1, 11), &bytes, None);
+    assert_eq!(answered(&device, &mut guest, unkeyed), RGFX_STATUS_OK);
+
+    let flagged = |mut message: Vec<u8>, at: usize, flag: u32| {
+        let flags = u32::from_le_bytes(message[at..at + 4].try_into().unwrap()) | flag;
+        message[at..at + 4].copy_from_slice(&flags.to_le_bytes());
+        message
+    };
+    let compute = |obj_id, library| {
+        let at = std::mem::offset_of!(RgfxComputePipelineCreate, flags);
+        flagged(
+            compute_pipeline_create(obj_id, library),
+            at,
+            RGFX_COMPUTE_PIPELINE_ANSWER_KEY,
+        )
+    };
+    let render = |obj_id, library| {
+        let at = std::mem::offset_of!(RgfxRenderPipelineCreate, flags);
+        flagged(
+            render_pipeline_create(obj_id, library),
+            at,
+            RGFX_RENDER_PIPELINE_ANSWER_KEY,
+        )
+    };
+    // The reply to `message`: its reflection, and the key after it where it carries one.
+    let mut reply = |message: Vec<u8>| {
+        guest.send(&device, message);
+        let bytes = next_event(&mut guest, RGFX_EVT_PIPELINE_REFLECTION);
+        let (r, _) = RgfxPipelineReflection::read_from_prefix(&bytes).unwrap();
+        assert_eq!(r.status, RGFX_PIPELINE_OK);
+        let at = RGFX_PIPELINE_REFLECTION_KEY_OFFSET as usize;
+        let keyed = r.flags & RGFX_PIPELINE_REFLECT_KEYED != 0;
+        assert_eq!(r.header.size as usize, if keyed { at + 32 } else { at });
+        keyed.then(|| <[u8; 32]>::try_from(&bytes[at..at + 32]).unwrap())
+    };
+
+    let first = reply(compute(obj(1, 12), obj(1, 10))).expect("a keyed library's create is keyed");
+    let second = reply(compute(obj(2, 12), obj(2, 10)));
+    assert_eq!(
+        second,
+        Some(first),
+        "two processes' equal creates have one key"
+    );
+    let drawn = reply(render(obj(1, 13), obj(1, 10))).expect("a render create is keyed");
+    assert_ne!(drawn, first);
+    assert_eq!(
+        reply(compute(obj(1, 14), obj(1, 11))),
+        None,
+        "a library held under no key"
+    );
+    assert_eq!(
+        reply(compute_pipeline_create(obj(1, 15), obj(1, 10))),
+        None,
+        "not asked"
+    );
+}
+
 /// A create whose key is not the one the host computes from its bytes makes the library for its
 /// request, and keeps it under no key: neither key finds it
 #[test]
@@ -8431,6 +8504,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_RATE_MAPS
             | RGFX_FEATURE_FUNCTION_POINTERS
             | RGFX_FEATURE_DYNAMIC_LIBRARIES
+            | RGFX_FEATURE_PIPELINE_KEYS
             | sixteen_bit
             | if carries {
                 RGFX_FEATURE_SURFACE_DEFERRED_CARRY
@@ -8483,6 +8557,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
                 | RGFX_FEATURE_RATE_MAPS
                 | RGFX_FEATURE_FUNCTION_POINTERS
                 | RGFX_FEATURE_DYNAMIC_LIBRARIES
+                | RGFX_FEATURE_PIPELINE_KEYS
                 | RGFX_FEATURE_PAGES_16K
                 | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
         );
@@ -8522,6 +8597,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_RATE_MAPS
             | RGFX_FEATURE_FUNCTION_POINTERS
             | RGFX_FEATURE_DYNAMIC_LIBRARIES
+            | RGFX_FEATURE_PIPELINE_KEYS
     );
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);

@@ -74,8 +74,8 @@ pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// through [`RGFX_REG_DRIVER_FEATURES_HI`]: [`RGFX_FEATURE_SURFACE_DEFERRED_CARRY`],
 /// [`RGFX_FEATURE_SCHEDULED_ASK`], [`RGFX_FEATURE_PAGES_16K`], [`RGFX_FEATURE_DISPLAY_SCALE`],
 /// [`RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA`], [`RGFX_FEATURE_DISPLAY_POWER`],
-/// [`RGFX_FEATURE_RATE_MAPS`], [`RGFX_FEATURE_FUNCTION_POINTERS`] and
-/// [`RGFX_FEATURE_DYNAMIC_LIBRARIES`].
+/// [`RGFX_FEATURE_RATE_MAPS`], [`RGFX_FEATURE_FUNCTION_POINTERS`],
+/// [`RGFX_FEATURE_DYNAMIC_LIBRARIES`] and [`RGFX_FEATURE_PIPELINE_KEYS`].
 /// On a host that offers `PAGES_16K`, `FEATURES_LO` and `_HI` read the guest RAM features only
 /// once the guest took it.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
@@ -355,6 +355,13 @@ pub const RGFX_FEATURE_FUNCTION_POINTERS: u64 = 0x80_0000_0000;
 /// ([`RgfxPipelineLibrary`]). Every host offers it; whether the device's kernels link dynamic
 /// libraries is the device info's (`supports_dynamic_libraries`).
 pub const RGFX_FEATURE_DYNAMIC_LIBRARIES: u64 = 0x100_0000_0000;
+/// `FEATURES_HI` bit 9, feature bit 41, `PIPELINE_KEYS`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_HI`]: a render or compute pipeline create whose flags carry
+/// [`RGFX_RENDER_PIPELINE_ANSWER_KEY`] or [`RGFX_COMPUTE_PIPELINE_ANSWER_KEY`] is answered, where
+/// the device made it and can key it, with its pipeline key after its reflection
+/// ([`RGFX_PIPELINE_REFLECT_KEYED`], [`RGFX_PIPELINE_REFLECTION_KEY_OFFSET`]). Every host offers
+/// it.
+pub const RGFX_FEATURE_PIPELINE_KEYS: u64 = 0x200_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -3970,6 +3977,22 @@ pub const RGFX_PIPELINE_REFLECT_SUPPORT_ICB: u32 = 1 << 0;
 /// [`RgfxPipelineReflection`] `flags`: a render pipeline's threadgroup size
 /// matches its tile size (`threadgroupSizeMatchesTileSize`).
 pub const RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE: u32 = 1 << 1;
+/// [`RgfxPipelineReflection`] `flags`: the reply carries the create's pipeline key, 32 bytes at
+/// [`RGFX_PIPELINE_REFLECTION_KEY_OFFSET`], and its header's `size` counts them. Set only on a
+/// made pipeline's reply to a create that asked for it ([`RGFX_RENDER_PIPELINE_ANSWER_KEY`],
+/// [`RGFX_COMPUTE_PIPELINE_ANSWER_KEY`]) whose libraries the device holds under their content
+/// keys.
+///
+/// The key is the SHA-256 of the 16 bytes `rgfx-pipeline-v1`; then the create's whole message,
+/// its header's `size` bytes, with its header's `seqno`, its `obj_id` and each library id it names
+/// zeroed; then the content key ([`RgfxLibraryLookup`]) of each library it names, in the same
+/// order: a compute create's `function_library_obj_id`, then each of its linked functions'
+/// `library_obj_id` in their run's order; a render create's `vertex_library_obj_id`,
+/// `fragment_library_obj_id`, each of its vertex linked functions' and then each of its fragment
+/// linked functions'. A library id of 0, a render create's with no fragment function, adds 32
+/// zero bytes. So equal creates of any processes, whose libraries hold equal bytes, have one key.
+/// A mesh create, and a compute create that links dynamic libraries, has none.
+pub const RGFX_PIPELINE_REFLECT_KEYED: u32 = 1 << 2;
 
 /// [`RgfxRenderPipelineCreate`] `flags`: `alphaToCoverageEnabled`.
 pub const RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE: u32 = 1 << 0;
@@ -3984,6 +4007,9 @@ pub const RGFX_RENDER_PIPELINE_SUPPORT_ICB: u32 = 1 << 3;
 /// create's head, where the guest took [`RGFX_FEATURE_PRIVATE_RENDER_STATE`]. Bits 4 and 5 are
 /// the mesh create's.
 pub const RGFX_RENDER_PIPELINE_PRIVATE_STATE: u32 = 1 << 6;
+/// [`RgfxRenderPipelineCreate`] `flags`: answer the create with its pipeline key
+/// ([`RGFX_PIPELINE_REFLECT_KEYED`]), where the guest took [`RGFX_FEATURE_PIPELINE_KEYS`].
+pub const RGFX_RENDER_PIPELINE_ANSWER_KEY: u32 = 1 << 7;
 
 /// [`RgfxRenderPipelinePrivateState`] `flags`: `openGLModeEnabled`.
 pub const RGFX_PRIVATE_RENDER_OPENGL_MODE: u32 = 1 << 0;
@@ -4009,6 +4035,9 @@ pub const RGFX_COMPUTE_PIPELINE_SUPPORT_ICB: u32 = 1 << 1;
 /// [`RgfxComputePipelineCreate`] `flags`: `openCLModeEnabled` (Apple SPI), where the guest took
 /// [`RGFX_FEATURE_OPENCL_MODE`].
 pub const RGFX_COMPUTE_PIPELINE_OPENCL_MODE: u32 = 1 << 2;
+/// [`RgfxComputePipelineCreate`] `flags`: answer the create with its pipeline key
+/// ([`RGFX_PIPELINE_REFLECT_KEYED`]), where the guest took [`RGFX_FEATURE_PIPELINE_KEYS`].
+pub const RGFX_COMPUTE_PIPELINE_ANSWER_KEY: u32 = 1 << 3;
 
 /// The bytes of [`RgfxFunctionConstant::value`]: the widest constant's, a `long4` or `ulong4`.
 pub const RGFX_FUNCTION_CONSTANT_VALUE_BYTES: usize = 32;
@@ -4438,6 +4467,10 @@ pub struct RgfxMeshRenderPipelineCreate {
 /// Where a [`RGFX_PIPELINE_KIND_MESH`] reply's [`RgfxMeshPipelineReflection`] starts: right after
 /// its [`RgfxPipelineReflection`].
 pub const RGFX_PIPELINE_REFLECTION_MESH_OFFSET: u32 = 80;
+
+/// Where a [`RGFX_PIPELINE_REFLECT_KEYED`] reply's pipeline key starts: right after its
+/// [`RgfxPipelineReflection`]. No mesh reply is keyed.
+pub const RGFX_PIPELINE_REFLECTION_KEY_OFFSET: u32 = 80;
 
 /// The mesh stages' answers a made mesh render pipeline's reply carries after its
 /// [`RgfxPipelineReflection`], at [`RGFX_PIPELINE_REFLECTION_MESH_OFFSET`]: the state's own

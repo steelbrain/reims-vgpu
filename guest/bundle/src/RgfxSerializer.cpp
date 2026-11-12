@@ -1135,22 +1135,50 @@ uint32_t appendLinkedFunctions(Append &append, const RgfxLinkedFunctionRef *refs
 	return append(records.data(), count * sizeof(RgfxLinkedFunction));
 }
 
-// Posts the pipeline create of `type`, the `size` bytes at `message`, on `control` into `out`,
-// against `post`'s known pipelines where it has some and the route defers answers.
-void postPipeline(RgfxRingWriter &control, uint32_t type, const uint8_t *message, uint32_t size,
-                  RgfxCreated &out, RgfxPipelinePost *post)
+} // namespace
+
+void RgfxSerializer::setLibraryKey(RgfxObjId obj_id, const uint8_t *key)
 {
-	if (post != nullptr && post->known != nullptr && control.defers()) {
+	RgfxLibraryContentKey k;
+	std::memcpy(k.data(), key, k.size());
+	std::lock_guard<std::mutex> hold(m_libraryKeysLock);
+	m_libraryKeys[obj_id] = k;
+}
+
+void RgfxSerializer::postPipeline(uint32_t type, const uint8_t *message, uint32_t size,
+                                  RgfxCreated &out, RgfxPipelinePost *post)
+{
+	if (post != nullptr && post->known != nullptr && m_control.defers()) {
 		post->key = RgfxKnownPipelines::keyOf(type, message, size);
 		post->keyed = true;
 		if (post->known->find(post->key, &post->reflection)) {
-			out.posted = control.tryPostKnown(type, message, size, &out.seqno, &post->deferred);
+			out.posted = m_control.tryPostKnown(type, message, size, &out.seqno, &post->deferred);
 			return;
 		}
 	}
-	out.posted = control.tryPost(type, message, size, &out.seqno);
+	// A create another process's equal create was answered for, where the kext keeps the answer:
+	// posted without waiting, and known to this process from then on.
+	RgfxPipelineKey shared;
+	if (post != nullptr && m_sharesPipelines && m_control.shares() &&
+	    rgfxSharedPipelineKey(
+	        type, message, size,
+	        [this](uint64_t id, RgfxLibraryContentKey *key) {
+		        std::lock_guard<std::mutex> hold(m_libraryKeysLock);
+		        auto found = m_libraryKeys.find(id);
+		        if (found == m_libraryKeys.end())
+			        return false;
+		        *key = found->second;
+		        return true;
+	        },
+	        &shared)) {
+		out.posted = m_control.tryPostShared(type, message, size, shared, &out.seqno,
+		                                     &post->deferred, &post->reflection);
+		if (out.posted && post->deferred && post->keyed)
+			post->known->learn(post->key, post->reflection);
+		return;
+	}
+	out.posted = m_control.tryPost(type, message, size, &out.seqno);
 }
-} // namespace
 
 RgfxCreated RgfxSerializer::createRenderPipeline(const RgfxRenderPipelineParams &p,
                                                  RgfxPipelinePost *post)
@@ -1217,7 +1245,8 @@ RgfxCreated RgfxSerializer::createRenderPipeline(const RgfxRenderPipelineParams 
 		msg.colors[i] = p.colors[i];
 	msg.depth_pixel_format = p.depth_pixel_format;
 	msg.stencil_pixel_format = p.stencil_pixel_format;
-	msg.flags = p.flags | (p.private_state != nullptr ? RGFX_RENDER_PIPELINE_PRIVATE_STATE : 0);
+	msg.flags = p.flags | (p.private_state != nullptr ? RGFX_RENDER_PIPELINE_PRIVATE_STATE : 0) |
+	            (m_sharesPipelines ? RGFX_RENDER_PIPELINE_ANSWER_KEY : 0);
 	msg.input_primitive_topology = p.input_primitive_topology;
 	msg.max_vertex_amplification_count = p.max_vertex_amplification_count;
 
@@ -1230,7 +1259,7 @@ RgfxCreated RgfxSerializer::createRenderPipeline(const RgfxRenderPipelineParams 
 	std::memcpy(buf.data(), &msg, sizeof(msg));
 	if (!tail.empty())
 		std::memcpy(buf.data() + head, tail.data(), tail.size());
-	postPipeline(m_control, RGFX_CMD_RENDER_PIPELINE_CREATE, buf.data(),
+	postPipeline(RGFX_CMD_RENDER_PIPELINE_CREATE, buf.data(),
 	             static_cast<uint32_t>(total), out, post);
 	return out;
 }
@@ -1317,7 +1346,7 @@ RgfxCreated RgfxSerializer::createMeshRenderPipeline(const RgfxMeshRenderPipelin
 	std::memcpy(buf.data(), &msg, sizeof(msg));
 	if (!tail.empty())
 		std::memcpy(buf.data() + head, tail.data(), tail.size());
-	postPipeline(m_control, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, buf.data(),
+	postPipeline(RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, buf.data(),
 	             static_cast<uint32_t>(total), out, nullptr);
 	return out;
 }
@@ -1350,7 +1379,7 @@ RgfxCreated RgfxSerializer::createComputePipeline(const RgfxComputePipelineParam
 	msg.constants_offset =
 	    append(p.function.constants, p.function.constant_count * sizeof(RgfxFunctionConstant));
 	msg.constant_count = p.function.constant_count;
-	msg.flags = p.flags;
+	msg.flags = p.flags | (m_sharesPipelines ? RGFX_COMPUTE_PIPELINE_ANSWER_KEY : 0);
 	msg.max_total_threads_per_threadgroup = p.max_total_threads_per_threadgroup;
 	msg.max_call_stack_depth = p.max_call_stack_depth;
 	msg.stage_input_layouts_offset = append(
@@ -1389,7 +1418,7 @@ RgfxCreated RgfxSerializer::createComputePipeline(const RgfxComputePipelineParam
 	std::memcpy(buf.data(), &msg, sizeof(msg));
 	if (!tail.empty())
 		std::memcpy(buf.data() + head, tail.data(), tail.size());
-	postPipeline(m_control, RGFX_CMD_COMPUTE_PIPELINE_CREATE, buf.data(),
+	postPipeline(RGFX_CMD_COMPUTE_PIPELINE_CREATE, buf.data(),
 	             static_cast<uint32_t>(total), out, post);
 	return out;
 }
@@ -1565,6 +1594,10 @@ bool RgfxSerializer::postDestroy(RgfxObjId obj_id)
 
 bool RgfxSerializer::destroy(RgfxObjId obj_id, std::function<void()> after)
 {
+	{
+		std::lock_guard<std::mutex> hold(m_libraryKeysLock);
+		m_libraryKeys.erase(obj_id);
+	}
 	// A waiting record may name the object (a pipeline or a buffer the app lets go after
 	// encoding it), so the records go first.
 	flushIcbWrites();

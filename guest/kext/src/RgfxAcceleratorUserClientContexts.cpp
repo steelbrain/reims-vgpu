@@ -457,7 +457,10 @@ static bool lastLibraryChunk(const UInt8 *message, UInt64 size)
 // a sampler's or an indirect command buffer's state, a library create's or lookup's COMPLETE, an
 // argument layout's COMPLETE. A pipeline create with kRgfxSubmitDeferred is posted without
 // waiting where a deferred slot is free (postDeferred), its answer then taken through
-// kRgfxAccelMethodTakeAnswers.
+// kRgfxAccelMethodTakeAnswers; one with kRgfxSubmitShared is so posted where the kext keeps an
+// equal create's answer by its pipeline key (RgfxSharedPipelines.hpp), which it answers at once.
+// Every answer to a pipeline create the kext waited for that carries a made pipeline's key is
+// kept so.
 IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 {
 	// The context as it is now, read under the list lock that releaseContext closes it under,
@@ -466,10 +469,18 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	const bool open = hasContext;
 	const UInt32 ctx = context;
 	IOLockUnlock(listLock);
-	if (!open || a->scalarOutputCount != 1 || a->scalarInputCount > 1 ||
-	    (a->scalarInputCount == 1 && (a->scalarInput[0] & ~uint64_t{kRgfxSubmitDeferred}) != 0))
+	const uint64_t flags = a->scalarInputCount >= 1 ? a->scalarInput[0] : 0;
+	const bool sharedAsked = (flags & kRgfxSubmitShared) != 0;
+	const bool deferAsked = (flags & kRgfxSubmitDeferred) != 0;
+	// One output, and the flags alone, or a shared create's: its key after the flags and two
+	// outputs, not deferred besides.
+	const bool shaped =
+	    sharedAsked ? a->scalarInputCount == 1 + kRgfxSubmitKeyWords && a->scalarOutputCount == 2 &&
+	                      !deferAsked
+	                : a->scalarInputCount <= 1 && a->scalarOutputCount == 1;
+	if (!open || !shaped ||
+	    (flags & ~uint64_t{kRgfxSubmitDeferred | kRgfxSubmitShared}) != 0)
 		return kIOReturnBadArgument;
-	const bool deferAsked = a->scalarInputCount == 1 && (a->scalarInput[0] & kRgfxSubmitDeferred);
 	IOMemoryDescriptor *desc = a->structureInputDescriptor;
 	UInt64 size = desc ? desc->getLength() : a->structureInputSize;
 	if (size < kObjIdOffset + sizeof(UInt64) || size % 8 ||
@@ -498,7 +509,7 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	const bool pipeline = rgfxSubmitIsPipelineCreate(type);
 	if (r == kIOReturnSuccess &&
 	    (!rgfxSubmitAdmitted(type) || (objId >> RGFX_CONTEXT_OBJ_ID_SHIFT) != ctx ||
-	     (deferAsked && !pipeline)))
+	     ((deferAsked || sharedAsked) && !pipeline)))
 		r = kIOReturnBadArgument;
 	// An OBJECT_DESTROY of one of the client's command queues is the one accepted message that
 	// changes the kext's own tracking: the kext watches the queue's completion ring and lists it.
@@ -559,17 +570,31 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	UInt32 replyLength = 0;
 	UInt64 seqno = 0;
 	const bool checked = r == kIOReturnSuccess;
-	// A deferred create, where a slot is free; with none it is posted and waited for as any.
-	bool deferred = false;
-	if (checked && deferAsked) {
+	// A deferred create, where a slot is free; with none it is posted and waited for as any. A
+	// shared create is deferred where an equal create's answer is kept, which answers it.
+	bool deferred = false, sharedHit = false;
+	RgfxPipelineReflection kept;
+	UInt8 key[kRgfxSubmitKeyWords * sizeof(uint64_t)];
+	if (sharedAsked)
+		memcpy(key, &a->scalarInput[1], sizeof(key));
+	if (checked && (deferAsked || (sharedAsked && owner->findSharedPipeline(key, 0, objId, &kept)))) {
 		r = owner->postDeferred(ctx, type, message, static_cast<UInt32>(size), &seqno);
 		deferred = r == kIOReturnSuccess;
 		if (r == kIOReturnNoResources)
 			r = kIOReturnSuccess;
+		if (deferred && sharedAsked) {
+			sharedHit = true;
+			kept.header.seqno = seqno;
+			memcpy(reply, &kept, sizeof(kept));
+			replyLength = sizeof(kept);
+		}
 	}
-	if (checked && !deferred && r == kIOReturnSuccess)
+	if (checked && !deferred && r == kIOReturnSuccess) {
 		r = owner->postLifecycle(type, message, static_cast<UInt32>(size), replyType, reply,
 		                         sizeof(reply), &replyLength, &seqno, kReflectionMs);
+		if (r == kIOReturnSuccess && pipeline)
+			owner->learnSharedPipeline(reply, replyLength);
+	}
 	IOFree(message, size);
 	// Posted where postLifecycle answered or timed out waiting for the answer. Whether the context
 	// closed since the check: its CONTEXT_CLOSE may then have gone before this create, which the
@@ -600,6 +625,8 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	if (r != kIOReturnSuccess)
 		return r;
 	a->scalarOutput[0] = seqno;
+	if (sharedAsked)
+		a->scalarOutput[1] = sharedHit ? 1 : 0;
 	UInt32 n = replyLength < a->structureOutputSize ? replyLength : a->structureOutputSize;
 	if (n && a->structureOutput)
 		memcpy(a->structureOutput, reply, n);

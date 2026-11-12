@@ -27,6 +27,7 @@
 #define RGFX_RING_WRITER_HPP_
 
 #include <cstdint>
+#include <array>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -57,6 +58,17 @@ typedef bool (*RgfxForward)(void *context, const void *message, uint32_t size,
 /// handed on as RgfxForward hands its answers, and `*out_deferred` is false.
 typedef bool (*RgfxForwardDeferred)(void *context, const void *message, uint32_t size,
                                     uint64_t *out_seqno, bool *out_deferred);
+
+/// Hands a pipeline create of pipeline key `key` (32 bytes, rgfxSharedPipelineKey) to the kext as
+/// RgfxForward does, asking it not to wait for the answer where it keeps the answer to an equal
+/// create of any process (the accelerator's shared submit). True once posted, `*out_seqno` its
+/// seqno. Where it kept one, `*out_deferred` is true and `*out_reflection` that answer, stamped
+/// for this create, and the create's own answer comes later (RgfxAwaitAnswer); else it was
+/// answered as any create, the answer handed on as RgfxForward hands its answers, and
+/// `*out_deferred` is false.
+typedef bool (*RgfxForwardShared)(void *context, const void *message, uint32_t size,
+                                  const uint8_t *key, uint64_t *out_seqno, bool *out_deferred,
+                                  RgfxPipelineReflection *out_reflection);
 
 /// Takes the answers the kext keeps for the process's deferred creates, waiting first for the one
 /// at `seqno`, and hands each on (to the process's lifecycle reader): false where none came.
@@ -112,6 +124,22 @@ public:
 	/// not wait.
 	bool defers() const { return m_forward != nullptr && m_deferredPost != nullptr; }
 
+	/// Where a forwarding writer that defers posts a pipeline create against the answers the kext
+	/// keeps for every process (RgfxForwardShared), called with setDeferred's context.
+	void setShared(RgfxForwardShared post) { m_sharedPost = post; }
+
+	/// Whether the route answers a pipeline create from the kext's answers of every process
+	/// (setShared).
+	bool shares() const { return defers() && m_sharedPost != nullptr; }
+
+	/// Posts a pipeline create of pipeline key `key` (32 bytes), as tryPost does, without waiting
+	/// for its answer where the kext keeps an equal create's: `*out_deferred` whether its answer
+	/// comes later (RgfxAwaitAnswer), `*out_reflection` then the kept answer. Without a shared
+	/// post (setShared), it is posted and answered as tryPost's.
+	bool tryPostShared(uint32_t type, const void *message, uint32_t size,
+	                   const std::array<uint8_t, 32> &key, uint64_t *out_seqno, bool *out_deferred,
+	                   RgfxPipelineReflection *out_reflection);
+
 	/// Whether post() places a message of `size` bytes: a valid size of at most half the
 	/// byte ring, so the pad to the ring's end before it never keeps it out of an empty ring.
 	/// A larger message goes out of line (COMMAND_BUFFER_IN_REGION). A forwarding writer
@@ -153,6 +181,7 @@ private:
 	RgfxForward m_forward;
 	void *m_forwardContext;
 	RgfxForwardDeferred m_deferredPost = nullptr;
+	RgfxForwardShared m_sharedPost = nullptr;
 	RgfxAwaitAnswer m_await = nullptr;
 	void *m_deferredContext = nullptr;
 

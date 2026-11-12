@@ -132,7 +132,8 @@ TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surf
 	$(BUILD)/tests/device_name_test \
 	$(BUILD)/tests/queue_limits_test $(BUILD)/tests/user_client_words_test \
 	$(BUILD)/tests/features_test $(BUILD)/tests/latency_test $(BUILD)/tests/release_table_test \
-	$(BUILD)/tests/deferred_answers_test $(BUILD)/tests/video_codecs_test \
+	$(BUILD)/tests/deferred_answers_test $(BUILD)/tests/shared_pipelines_test \
+	$(BUILD)/tests/video_codecs_test \
 	$(BUILD)/tests/ring_room_test $(BUILD)/tests/context_slots_test $(BUILD)/tests/pages_block_test \
 	$(BUILD)/tests/close_table_test $(BUILD)/tests/ask_gate_test \
 	$(BUILD)/tests/pipe_color_test $(BUILD)/tests/id_chunks_test $(BUILD)/tests/boot_console_test \

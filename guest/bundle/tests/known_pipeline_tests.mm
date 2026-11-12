@@ -6,14 +6,19 @@
  * without waiting, its state taking the kept reflection at once and its gpuResourceID, its own,
  * waiting at the first read. Each create is a new object with its own resource ID, as Metal's
  * are. A refusal is never kept; where the kext keeps no slot, or no known pipelines are given, a
- * create waits as before.
+ * create waits as before. Where the route shares answers (RgfxRingWriter::setShared), a create of
+ * another process's equal create is posted without waiting too, by its pipeline key
+ * (rgfxSharedPipelineKey), which the host's computes alike.
  */
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -35,9 +40,14 @@ namespace {
 
 // A kext stand-in: the control ring forwards each message, answering a pipeline create at once
 // (rgfxKextSubmit's route) or, posted deferred, keeping its answer until a take (the
-// accelerator's TakeAnswers). Each answer gives the next resource ID. Never freed: states a test
-// lets go post their destroys through it after the test.
+// accelerator's TakeAnswers). Each answer gives the next resource ID. Where it shares answers, a
+// create posted by its key (rgfxKextSubmitShared's route) finds the answer kept for that key by
+// any process's stand-in, and is posted deferred, or is answered at once and its answer kept.
+// Never freed: states a test lets go post their destroys through it after the test.
 struct Kext {
+	// The answers kept by pipeline key, as the kext keeps them (RgfxSharedPipelines.hpp).
+	typedef std::map<RgfxPipelineKey, RgfxPipelineReflection> Kept;
+
 	RgfxReplyReader &reader = *new RgfxReplyReader();
 	uint64_t seqno = 0;
 	uint64_t nextResourceId = 100;
@@ -52,11 +62,33 @@ struct Kext {
 	RgfxRingWriter &control = *new RgfxRingWriter(&Kext::forward, this, 0x1000);
 	RgfxSerializer &ser = *new RgfxSerializer(control, ids);
 	std::shared_ptr<RgfxKnownPipelines> known = std::make_shared<RgfxKnownPipelines>();
+	std::shared_ptr<Kept> kept;              // where it shares answers, every process's
+	std::vector<RgfxPipelineKey> sharedKeys; // the keys creates were posted by
+	std::vector<uint8_t> lastShared;         // the last create posted by its key
+	std::vector<uint32_t> createFlags;       // each pipeline create's flags, in order
 
-	explicit Kext(bool defers = true)
+	explicit Kext(bool defers = true, std::shared_ptr<Kept> sharing = nullptr)
 	{
 		if (defers)
 			control.setDeferred(&Kext::post, &Kext::take, this);
+		if (sharing) {
+			kept = std::move(sharing);
+			control.setShared(&Kext::shared);
+			ser.setSharesPipelines(control.shares());
+		}
+	}
+
+	// Notes a pipeline create's flags.
+	void noteFlags(const void *message)
+	{
+		RgfxMsgHeader h = {};
+		std::memcpy(&h, message, sizeof(h));
+		const size_t at = h.type == RGFX_CMD_COMPUTE_PIPELINE_CREATE
+		                      ? offsetof(RgfxComputePipelineCreate, flags)
+		                      : offsetof(RgfxRenderPipelineCreate, flags);
+		uint32_t flags = 0;
+		std::memcpy(&flags, static_cast<const uint8_t *>(message) + at, sizeof(flags));
+		createFlags.push_back(flags);
 	}
 
 	static bool isPipeline(uint32_t type)
@@ -93,6 +125,7 @@ struct Kext {
 		std::memcpy(&h, message, sizeof(h));
 		*out_seqno = ++k->seqno;
 		if (isPipeline(h.type)) {
+			k->noteFlags(message);
 			k->waited.push_back(h.type);
 			RgfxPipelineReflection r = k->answerOf(message);
 			k->reader.deliver(&r, sizeof(r));
@@ -110,6 +143,7 @@ struct Kext {
 		RgfxMsgHeader h = {};
 		std::memcpy(&h, message, sizeof(h));
 		CHECK(isPipeline(h.type)); // only a pipeline create is posted so
+		k->noteFlags(message);
 		*out_seqno = ++k->seqno;
 		RgfxPipelineReflection r = k->answerOf(message);
 		if (k->slotsFull) {
@@ -121,6 +155,47 @@ struct Kext {
 		*out_deferred = true;
 		k->deferred.push_back(k->seqno);
 		k->held.push_back(r);
+		return true;
+	}
+
+	static bool shared(void *context, const void *message, uint32_t size, const uint8_t *key,
+	                   uint64_t *out_seqno, bool *out_deferred,
+	                   RgfxPipelineReflection *out_reflection)
+	{
+		Kext *k = static_cast<Kext *>(context);
+		RgfxPipelineKey named;
+		std::memcpy(named.data(), key, named.size());
+		k->sharedKeys.push_back(named);
+		k->lastShared.assign(static_cast<const uint8_t *>(message),
+		                     static_cast<const uint8_t *>(message) + size);
+		auto found = k->kept->find(named);
+		if (found != k->kept->end()) {
+			if (!post(context, message, size, out_seqno, out_deferred))
+				return false;
+			if (*out_deferred) {
+				*out_reflection = found->second;
+				out_reflection->header.seqno = *out_seqno;
+				std::memcpy(&out_reflection->obj_id,
+				            static_cast<const uint8_t *>(message) + sizeof(RgfxMsgHeader),
+				            sizeof(uint64_t));
+			}
+			return true;
+		}
+		// Answered at once, and kept where the device made the pipeline.
+		RgfxMsgHeader h = {};
+		std::memcpy(&h, message, sizeof(h));
+		k->noteFlags(message);
+		*out_seqno = ++k->seqno;
+		*out_deferred = false;
+		k->waited.push_back(h.type);
+		RgfxPipelineReflection r = k->answerOf(message);
+		k->reader.deliver(&r, sizeof(r));
+		if (r.status == RGFX_PIPELINE_OK) {
+			r.header.seqno = 0;
+			r.obj_id = 0;
+			r.gpu_resource_id = 0;
+			(*k->kept)[named] = r;
+		}
 		return true;
 	}
 
@@ -145,6 +220,21 @@ struct Kext {
 		return [RgfxLibrary libraryWithData:bytes
 		                             length:sizeof(bytes)
 		                                key:nullptr
+		                             device:nil
+		                         serializer:&ser
+		                             status:&libStatus];
+	}
+
+	// A library of content key `k` (32 bytes of it) over the same bytes as library()'s.
+	RgfxLibrary *keyedLibrary(uint8_t k)
+	{
+		const uint8_t bytes[] = {7, 7, 7, 7};
+		uint8_t key[32];
+		std::memset(key, k, sizeof(key));
+		uint32_t libStatus = 0;
+		return [RgfxLibrary libraryWithData:bytes
+		                             length:sizeof(bytes)
+		                                key:key
 		                             device:nil
 		                         serializer:&ser
 		                             status:&libStatus];
@@ -333,6 +423,176 @@ void test_the_key()
 	CHECK(ka != RgfxKnownPipelines::keyOf(RGFX_CMD_RENDER_PIPELINE_CREATE, a.data(), 56));
 }
 
+// The shared vector of the pipeline key, the host's (pipeline_key.rs,
+// pipeline_key_of_the_shared_vector): the two sides key a create alike. Kernel `k` of library
+// (1 << 40) | 2, whose content key's bytes are 0x10, 0x11, ..., asking for its key, as object
+// (1 << 40) | 7 at seqno 41.
+void test_the_shared_key_vector()
+{
+	RgfxComputePipelineCreate c = {};
+	std::vector<uint8_t> m(sizeof(c) + 8, 0);
+	c.header.type = RGFX_CMD_COMPUTE_PIPELINE_CREATE;
+	c.header.size = static_cast<uint32_t>(m.size());
+	c.header.seqno = 41;
+	c.obj_id = (1ull << 40) | 7;
+	c.function_library_obj_id = (1ull << 40) | 2;
+	c.name_offset = sizeof(c);
+	c.name_len = 1;
+	c.constants_offset = sizeof(c) + 1;
+	c.linked_offset = sizeof(c) + 1;
+	c.flags = RGFX_COMPUTE_PIPELINE_ANSWER_KEY;
+	std::memcpy(m.data(), &c, sizeof(c));
+	m[sizeof(c)] = 'k';
+	auto keys = [](uint64_t id, RgfxLibraryContentKey *k) {
+		if (id != ((1ull << 40) | 2))
+			return false;
+		for (size_t i = 0; i < k->size(); i++)
+			(*k)[i] = static_cast<uint8_t>(0x10 + i);
+		return true;
+	};
+	RgfxPipelineKey key;
+	const uint32_t compute = RGFX_CMD_COMPUTE_PIPELINE_CREATE;
+	CHECK(rgfxSharedPipelineKey(compute, m.data(), static_cast<uint32_t>(m.size()), keys, &key));
+	char hex[65] = {};
+	for (size_t i = 0; i < key.size(); i++)
+		std::snprintf(hex + 2 * i, 3, "%02x", key[i]);
+	CHECK(std::strcmp(hex, "2be3bb91e78f55b505082cb4c42a647817694dcb5cf47b9974d643f958e991f7") == 0);
+
+	// Another process's equal create (other ids and seqno) has the same key.
+	RgfxComputePipelineCreate other = c;
+	other.header.seqno = 900;
+	other.obj_id = (3ull << 40) | 9;
+	other.function_library_obj_id = (3ull << 40) | 5;
+	std::vector<uint8_t> o = m;
+	std::memcpy(o.data(), &other, sizeof(other));
+	RgfxPipelineKey same;
+	auto sameKeys = [](uint64_t, RgfxLibraryContentKey *k) {
+		for (size_t i = 0; i < k->size(); i++)
+			(*k)[i] = static_cast<uint8_t>(0x10 + i);
+		return true;
+	};
+	CHECK(rgfxSharedPipelineKey(compute, o.data(), static_cast<uint32_t>(o.size()), sameKeys, &same));
+	CHECK(same == key);
+	// The header is the ring's, whatever the bytes hold before it is stamped.
+	std::vector<uint8_t> unstamped = m;
+	std::memset(unstamped.data(), 0, sizeof(RgfxMsgHeader));
+	CHECK(rgfxSharedPipelineKey(compute, unstamped.data(), static_cast<uint32_t>(unstamped.size()), keys, &same));
+	CHECK(same == key);
+
+	// None where the create does not ask for one, a library has no key, it links dynamic
+	// libraries, it is shorter than its create, or it is of another type.
+	RgfxPipelineKey none;
+	auto noKeys = [](uint64_t, RgfxLibraryContentKey *) { return false; };
+	CHECK(!rgfxSharedPipelineKey(compute, m.data(), static_cast<uint32_t>(m.size()), noKeys, &none));
+	RgfxComputePipelineCreate unasked = c;
+	unasked.flags = 0;
+	std::vector<uint8_t> u = m;
+	std::memcpy(u.data(), &unasked, sizeof(unasked));
+	CHECK(!rgfxSharedPipelineKey(compute, u.data(), static_cast<uint32_t>(u.size()), keys, &none));
+	RgfxComputePipelineCreate dynamic = c;
+	dynamic.library_count = 1;
+	std::vector<uint8_t> d = m;
+	std::memcpy(d.data(), &dynamic, sizeof(dynamic));
+	CHECK(!rgfxSharedPipelineKey(compute, d.data(), static_cast<uint32_t>(d.size()), keys, &none));
+	CHECK(!rgfxSharedPipelineKey(compute, m.data(), 64, keys, &none));
+	CHECK(!rgfxSharedPipelineKey(RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, m.data(),
+	                             static_cast<uint32_t>(m.size()), keys, &none));
+}
+
+// A create another process's equal create was answered for: the first create of a key waits and
+// its answer is kept; the equal create of another process, over another library object of the
+// same content, is posted without waiting, its reflection the kept one at once and its
+// gpuResourceID its own, taken at the first read; that process knows the pipeline from then on.
+// A library of other content keys another pipeline, which waits.
+void test_a_create_another_process_made_does_not_wait()
+{
+	auto kept = std::make_shared<Kext::Kept>();
+	Kext a(true, kept);
+	RgfxComputePipelineState *first = a.compute([a.keyedLibrary(1) newFunctionWithName:@"k_blur"]);
+	CHECK(!first.rgfxDeferred && a.waited.size() == 1 && a.sharedKeys.size() == 1);
+	CHECK(kept->size() == 1 && first.gpuResourceID._impl == 100);
+	CHECK((a.createFlags.back() & RGFX_COMPUTE_PIPELINE_ANSWER_KEY) != 0);
+
+	Kext b(true, kept);
+	b.nextResourceId = 200;
+	(void)b.keyedLibrary(9); // so b's library has another id than a's
+	RgfxLibrary *lib = b.keyedLibrary(1);
+	id<MTLFunction> fn = [lib newFunctionWithName:@"k_blur"];
+	RgfxComputePipelineState *second = b.compute(fn);
+	CHECK(b.sharedKeys.size() == 1 && b.sharedKeys[0] == a.sharedKeys[0]);
+	CHECK(second.rgfxDeferred && b.waited.empty() && b.deferred.size() == 1);
+	CHECK(!second.rgfxRefused);
+	CHECK(second.threadExecutionWidth == 32 && b.takes == 0); // the kept reflection, at once
+	CHECK(second.gpuResourceID._impl == 200 && b.takes == 1); // its own ID, from its own answer
+	// Known to b from then on: its next equal create is posted without asking by key.
+	RgfxComputePipelineState *third = b.compute(fn);
+	CHECK(third.rgfxDeferred && b.sharedKeys.size() == 1 && b.deferred.size() == 2);
+
+	// A library of another content key: another pipeline key, which waits and is kept.
+	RgfxComputePipelineState *other = b.compute([b.keyedLibrary(2) newFunctionWithName:@"k_blur"]);
+	CHECK(!other.rgfxDeferred && b.waited.size() == 1 && b.sharedKeys.size() == 2);
+	CHECK(b.sharedKeys[1] != a.sharedKeys[0] && kept->size() == 2);
+}
+
+// A render create is shared as a compute create is, and the key the kext is asked by is the
+// create's own: rgfxSharedPipelineKey of the message, naming its libraries by their content keys.
+// Where the kext keeps no slot, a create it keeps the answer for is answered at once.
+void test_a_shared_render_create()
+{
+	auto kept = std::make_shared<Kext::Kept>();
+	Kext a(true, kept);
+	RgfxRenderPipelineState *first = a.render(quad(a.keyedLibrary(3), @"quad"));
+	CHECK(!first.rgfxDeferred && a.sharedKeys.size() == 1 && kept->size() == 1);
+	CHECK((a.createFlags.back() & RGFX_RENDER_PIPELINE_ANSWER_KEY) != 0);
+	RgfxPipelineKey key;
+	auto keys = [](uint64_t, RgfxLibraryContentKey *k) {
+		k->fill(3);
+		return true;
+	};
+	CHECK(rgfxSharedPipelineKey(RGFX_CMD_RENDER_PIPELINE_CREATE, a.lastShared.data(),
+	                            static_cast<uint32_t>(a.lastShared.size()), keys, &key));
+	CHECK(key == a.sharedKeys.back());
+
+	Kext b(true, kept);
+	RgfxRenderPipelineState *second = b.render(quad(b.keyedLibrary(3), @"quad"));
+	CHECK(second.rgfxDeferred && b.waited.empty() && b.sharedKeys.back() == key);
+	CHECK([second maxTotalThreadsPerThreadgroup] == 512);
+
+	Kext c(true, kept);
+	c.slotsFull = true;
+	RgfxRenderPipelineState *third = c.render(quad(c.keyedLibrary(3), @"quad"));
+	CHECK(!third.rgfxDeferred && c.waited.size() == 1 && c.sharedKeys.back() == key);
+	CHECK(third.gpuResourceID._impl == 100 && c.takes == 0);
+}
+
+// Creates asked by no key: one naming a library with no content key, which the device keys no
+// pipeline of (it still asks the device for its key, which the device gives only where it holds
+// every library by key); and any where the route shares nothing, which do not ask the device.
+void test_creates_not_shared()
+{
+	{
+		auto kept = std::make_shared<Kext::Kept>();
+		Kext k(true, kept);
+		RgfxComputePipelineState *s = k.compute([k.library() newFunctionWithName:@"k_blur"]);
+		CHECK(!s.rgfxDeferred && k.sharedKeys.empty() && k.waited.size() == 1 && kept->empty());
+		CHECK((k.createFlags.back() & RGFX_COMPUTE_PIPELINE_ANSWER_KEY) != 0);
+	}
+	{
+		Kext k; // a route that shares nothing
+		RgfxLibrary *lib = k.keyedLibrary(1);
+		(void)k.compute([lib newFunctionWithName:@"k_blur"]);
+		CHECK(k.sharedKeys.empty() && (k.createFlags.back() & RGFX_COMPUTE_PIPELINE_ANSWER_KEY) == 0);
+		(void)k.render(quad(lib, @"quad"));
+		CHECK(k.sharedKeys.empty() && (k.createFlags.back() & RGFX_RENDER_PIPELINE_ANSWER_KEY) == 0);
+	}
+	{
+		Kext k(false, std::make_shared<Kext::Kept>()); // no deferred posts: nothing shared
+		CHECK(!k.ser.sharesPipelines());
+		(void)k.compute([k.keyedLibrary(1) newFunctionWithName:@"k_blur"]);
+		CHECK(k.sharedKeys.empty() && (k.createFlags.back() & RGFX_COMPUTE_PIPELINE_ANSWER_KEY) == 0);
+	}
+}
+
 } // namespace
 
 void rgfxKnownPipelineTests()
@@ -346,5 +606,9 @@ void rgfxKnownPipelineTests()
 		test_no_slot_answers_at_once();
 		test_a_deferred_create_with_no_pipeline();
 		test_an_equal_compute_create_does_not_wait();
+		test_the_shared_key_vector();
+		test_a_create_another_process_made_does_not_wait();
+		test_a_shared_render_create();
+		test_creates_not_shared();
 	}
 }

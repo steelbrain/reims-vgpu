@@ -49,6 +49,7 @@ typedef graft_iomfb_word RgfxIOMFBWord;
 #include "RgfxPipeClients.hpp"
 #include "RgfxRingRoom.hpp"
 #include "RgfxScanoutOwner.hpp"
+#include "RgfxSharedPipelines.hpp"
 #include "RgfxVblankClock.hpp"
 #include "reims_graphics_wire.h"
 
@@ -329,6 +330,13 @@ public:
 	                      UInt32 capacity, UInt32 *length, UInt32 *count);
 	// Frees context `context`'s deferred slots, at its close, and lets its waiters go.
 	void dropDeferred(UInt32 context);
+	// The answer the kext keeps for the pipeline create of `key` (32 bytes), stamped with
+	// `seqno` and `objId` (RgfxSharedPipelines.hpp), into `*out`: false where none is kept.
+	bool findSharedPipeline(const UInt8 *key, UInt64 seqno, UInt64 objId,
+	                        RgfxPipelineReflection *out);
+	// Keeps the device's answer to a pipeline create, the `length` bytes of `reply`, where it
+	// carries a made pipeline's key, for every process's equal creates.
+	void learnSharedPipeline(const UInt8 *reply, UInt32 length);
 	// Frees the deferred slot of the create at `seqno`, posted after its context closed.
 	void forgetDeferred(UInt64 seqno);
 
@@ -411,6 +419,8 @@ private:
 	static constexpr UInt32 kDeferredPerContext = 64;
 	typedef RgfxDeferredAnswers<kDeferredAnswers, kDeferredPerContext, kLifecycleReplyMax>
 	    DeferredAnswers;
+	// The answers kept by pipeline key (findSharedPipeline): 256 sets of 8, 2,048 answers.
+	typedef RgfxSharedPipelines<256, 8> SharedPipelines;
 
 	// Registers and the control rings.
 	UInt32 readRegister(UInt32 offset) const;
@@ -522,6 +532,9 @@ private:
 	// The deferred creates' answers; its waiters (takeDeferred) sleep on it, and each answer or
 	// drop wakes them all.
 	DeferredAnswers deferredAnswers;
+	// The answers kept by pipeline key, allocated at start (null where it could not be: none is
+	// kept, and every create waits), under stateLock.
+	SharedPipelines *sharedPipelines;
 	bool haveDisplay;
 	UInt32 displayId;
 	bool connected;

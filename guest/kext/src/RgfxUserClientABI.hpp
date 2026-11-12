@@ -147,6 +147,12 @@ enum {
 	// kRgfxSubmit* flags, may follow: kRgfxSubmitDeferred posts a pipeline create without
 	// waiting, its answer kept for kRgfxAccelMethodTakeAnswers, and answers no struct out; where
 	// the kext has no slot left for the answer, the create is posted and answered as without it.
+	// kRgfxSubmitShared, with the create's pipeline key after the flags (kRgfxSubmitKeyWords
+	// scalars, its bytes in order) and two outputs: where the kext keeps the device's answer to an
+	// equal create of any process (RgfxSharedPipelines.hpp) and has a slot left, the create is
+	// posted as with kRgfxSubmitDeferred and the kept answer is the struct out, stamped with this
+	// create's seqno and obj_id, the second output 1; else it is posted and answered as without it,
+	// the second output 0.
 	kRgfxAccelMethodSubmit = 0x105,
 	// Gives the client's context a chunk of texture resource ids from the guest's one pool:
 	// RGFX_RESOURCE_ID_SMALL_CHUNK of them where the kext's feature word holds
@@ -276,6 +282,11 @@ enum {
 	// Post a pipeline create without waiting for its answer (kRgfxAccelMethodTakeAnswers;
 	// kRgfxKextFeatureDeferredAnswers).
 	kRgfxSubmitDeferred = 1 << 0,
+	// Post a pipeline create without waiting where an equal create's answer is kept, by its
+	// pipeline key (kRgfxKextFeatureSharedPipelines).
+	kRgfxSubmitShared = 1 << 1,
+	// The scalars a kRgfxSubmitShared key takes: 32 bytes.
+	kRgfxSubmitKeyWords = 4,
 };
 
 // The kext's own features, the second word kRgfxAccelMethodFeatures answers: the user-client
@@ -301,6 +312,9 @@ enum {
 	kRgfxKextFeatureWriteCombined = 1 << 7,
 	// PagesChunked, 12.
 	kRgfxKextFeaturePagesChunked = 1 << 8,
+	// Submit's (0x105) shared flag, kRgfxSubmitShared, which keeps answers only where the feature
+	// word also holds RGFX_FEATURE_PIPELINE_KEYS.
+	kRgfxKextFeatureSharedPipelines = 1 << 9,
 };
 
 // Where a cached block's header holds its surface's CPU generation, a 64-bit count the kext

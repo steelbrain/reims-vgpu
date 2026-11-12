@@ -1435,6 +1435,26 @@ only where no negotiation can carry it.
   no dynamic libraries. Every host offers it, and the kext takes it; a bundle
   on a host that did not offer it makes no dynamic library, and refuses a
   pipeline whose kernel's libraries name an install name.
+- Bit 41, `FEATURES_HI`'s bit 9, is `PIPELINE_KEYS`: a render or compute
+  pipeline create may ask for its pipeline key
+  (`RGFX_RENDER_PIPELINE_ANSWER_KEY`, 1 << 7 of its flags;
+  `RGFX_COMPUTE_PIPELINE_ANSWER_KEY`, 1 << 3). Where it asks, the device made
+  the pipeline, and the device holds every library the create names under a
+  content key it checked against the library's bytes (one bound by
+  `LIBRARY_LOOKUP`, or made of bytes sent with their key and kept in the
+  library cache), the `PIPELINE_REFLECTION` sets `RGFX_PIPELINE_REFLECT_KEYED`
+  (1 << 2) and carries the key, 32 bytes, after the reflection
+  (`RGFX_PIPELINE_REFLECTION_KEY_OFFSET`, 80; its `size` 112). The key is the
+  SHA-256 of `rgfx-pipeline-v1`, then the create's message with its `seqno`,
+  its `obj_id` and every library id it names zeroed, then each named
+  library's content key in the order the ids lie (a compute create's function
+  library, then each linked function's; a render create's vertex and fragment
+  libraries, then each vertex and each fragment linked function's), 32 zero
+  bytes for an id of 0. A mesh create, and a compute create that links
+  dynamic libraries, is never keyed. The kext keeps keyed answers for every
+  process's equal creates ("Known pipeline creates"). Every host offers it,
+  and the kext takes it; a bundle on a host that did not offer it asks for no
+  key.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -2445,6 +2465,28 @@ still known at the create. A refusal is never kept, so its equal create waits
 again. Where the kext has no slot left (64 per process, 256 in all), the create
 waits as any. The bundle posts this way only where the kext's feature word
 has `kRgfxKextFeatureDeferredAnswers`.
+
+Across processes, the key is the create's pipeline key (`PIPELINE_KEYS`,
+above), which names its libraries by their content, not by the process's
+ids. The kext keeps the device's answer to every create it waited for that
+carries a key (`RgfxSharedPipelines.hpp`): the reflection with its header,
+object id, `gpuResourceID`, unique identifier and resource index zeroed, in a
+table of 2,048 answers (256 sets of 8, a full set replacing the answer found
+or learnt longest ago), empty at each start of the kext. The bundle computes
+the key of each create whose libraries all have content keys, and posts it
+with Submit's `kRgfxSubmitShared` flag and the key: where the kext keeps an
+answer of that key and has a slot left, it posts the create as a deferred one
+and hands back the kept answer, stamped with the create's seqno and object id,
+which the state takes as it takes a known create's; the process then knows the
+create too. Else the create is posted and waits as any, and its answer is kept.
+A process sees the same answers as with its own equal create before: the
+reflection at once, its own `gpuResourceID` at the first read, and a refusal
+at the create only where no process's equal create was accepted. The kext
+learns only answers the device gave, whose key the host computed, so no
+process can place an answer for another's key; a process naming a key that is
+not its create's only takes a wrong reflection for its own pipeline. The
+bundle posts so only where the kext's feature word has
+`kRgfxKextFeatureSharedPipelines` and the device's has `PIPELINE_KEYS`.
 
 Every reason the host refuses a pipeline create is either impossible for an
 equal create or known to the process when it posts:
@@ -3887,7 +3929,7 @@ Map 1:
 | 0x102 | `Free` | | frees a block |
 | 0x103 | `QueueCreate` | | a command queue; 6 inputs, or 7 with the flags wanted |
 | 0x104 | `QueueDestroy` | | closes a queue |
-| 0x105 | `Submit` | 1 << 4 `DeferredAnswers` (its deferred flag) | one lifecycle message onto ring 0 |
+| 0x105 | `Submit` | 1 << 4 `DeferredAnswers` (its deferred flag), 1 << 9 `SharedPipelines` (its shared flag: the pipeline key in four more inputs, and a second output) | one lifecycle message onto ring 0 |
 | 0x106 | `ResourceIds` | | a chunk of texture resource ids, and with a second output its size |
 | 0x107 | `WaitCompletions` | | waits for the client's completions |
 | 0x108 | `SurfaceScanout` | | the scanout an IOAccel surface is drawn into |
@@ -3900,7 +3942,7 @@ the accelerator, which the bundle opens for each event it hands out: 10 and 11
 are its own selectors, numbered apart from the accelerator's own so that a call
 on a connection of another kind finds none of that number there.
 
-The kext sets 1 << 0 `PagesBlock`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined` and 1 << 8 `PagesChunked`; no other bit yet.
+The kext sets 1 << 0 `PagesBlock`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked` and 1 << 9 `SharedPipelines`; no other bit yet.
 
 **A GL window: the drawable (type 7) and the window surface (type 0x20).**
 These are IOGPU's types, not ours. The bundle leaves `newGLDrawable` to its

@@ -105,7 +105,7 @@ use reims_vgpu_graphics::wire::{
     RGFX_LINKED_PRIVATE_FUNCTIONS, RGFX_MESH_PIPELINE_MESH_TG_MULTIPLE_OF_EXEC_WIDTH,
     RGFX_MESH_PIPELINE_OBJECT_TG_MULTIPLE_OF_EXEC_WIDTH, RGFX_PAGE_RUN_ZEROS,
     RGFX_PIPELINE_KIND_COMPUTE, RGFX_PIPELINE_KIND_MESH, RGFX_PIPELINE_KIND_RENDER,
-    RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
+    RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_KEYED, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
     RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE, RGFX_PIPELINE_REFUSED,
     RGFX_PRIVATE_RENDER_DEPTH_STENCIL_WRITE_DISABLED, RGFX_PRIVATE_RENDER_LOGIC_OPERATION,
     RGFX_PRIVATE_RENDER_OPENGL_MODE, RGFX_PRIVATE_RENDER_SAMPLE_COVERAGE_INVERT,
@@ -187,6 +187,7 @@ mod icb_slots_cost;
 mod lane;
 mod library;
 mod managed;
+mod pipeline_key;
 mod rate_map;
 mod refused;
 mod render;
@@ -220,6 +221,7 @@ pub(crate) use library::verified_key as test_key;
 use library::{Libraries, LibraryRef};
 pub(crate) use library::{LibraryJob, LibraryStart, MadeLibrary, complete, make_library};
 use managed::{STORAGE_MODE_MANAGED, storage_mode};
+use pipeline_key::PipelineKey;
 use sequencer::Sequencer;
 pub(crate) use sequencer::Ticket;
 use surface_cache::Caches;
@@ -258,15 +260,20 @@ pub(crate) type ReflectionSink = Arc<dyn Fn(PipelineReply) + Send + Sync>;
 
 /// A `PIPELINE_REFLECTION` reply: its record, and, after it, a made mesh render pipeline's
 /// limits ([`RgfxMeshPipelineReflection`], at [`RGFX_PIPELINE_REFLECTION_MESH_OFFSET`]), which
-/// no other reply carries.
+/// no other reply carries, or a keyed create's pipeline key (at
+/// [`RGFX_PIPELINE_REFLECTION_KEY_OFFSET`]).
 ///
 /// [`RGFX_PIPELINE_REFLECTION_MESH_OFFSET`]: reims_vgpu_graphics::wire::RGFX_PIPELINE_REFLECTION_MESH_OFFSET
+/// [`RGFX_PIPELINE_REFLECTION_KEY_OFFSET`]: reims_vgpu_graphics::wire::RGFX_PIPELINE_REFLECTION_KEY_OFFSET
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PipelineReply {
     /// The record.
     pub(crate) reflection: RgfxPipelineReflection,
     /// A made mesh render pipeline's limits.
     pub(crate) mesh: Option<RgfxMeshPipelineReflection>,
+    /// A made pipeline's key, where its create asked for one and could be keyed
+    /// ([`RGFX_PIPELINE_REFLECT_KEYED`] is then set in the record's flags).
+    pub(crate) key: Option<PipelineKey>,
 }
 
 impl PipelineReply {
@@ -275,22 +282,26 @@ impl PipelineReply {
         PipelineReply {
             reflection,
             mesh: None,
+            key: None,
         }
     }
 
-    /// The reply's bytes: the record, its header's size counting the mesh limits after it where
-    /// it carries them.
+    /// The reply's bytes: the record, its header's size counting the mesh limits or the key
+    /// after it where it carries them.
     pub(crate) fn bytes(&self) -> Vec<u8> {
         let mut reflection = self.reflection;
-        let mut out = Vec::with_capacity(
-            size_of::<RgfxPipelineReflection>() + size_of::<RgfxMeshPipelineReflection>(),
-        );
+        let mut out = Vec::with_capacity(size_of::<RgfxPipelineReflection>() + 32);
         if let Some(mesh) = &self.mesh {
             reflection.header.size = (size_of::<RgfxPipelineReflection>()
                 + size_of::<RgfxMeshPipelineReflection>())
                 as u32;
             out.extend_from_slice(reflection.as_bytes());
             out.extend_from_slice(mesh.as_bytes());
+        } else if let Some(key) = &self.key {
+            reflection.header.size = (size_of::<RgfxPipelineReflection>() + key.len()) as u32;
+            reflection.flags |= RGFX_PIPELINE_REFLECT_KEYED;
+            out.extend_from_slice(reflection.as_bytes());
+            out.extend_from_slice(key);
         } else {
             out.extend_from_slice(reflection.as_bytes());
         }
@@ -3990,6 +4001,13 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// maximum call stack depth, indirect command buffer support, stage-input descriptor, linked
     /// functions and OpenCL mode. Each function is specialised by the index-keyed constants the wire
     /// carries for it, and each linked function made with the options the guest made it with.
+    /// The key of pipeline create `message` ([`pipeline_key::pipeline_key`]): of the libraries it
+    /// names, each by the content key the device holds it under, where it holds every one so.
+    fn pipeline_key(&self, message: &[u8]) -> Option<PipelineKey> {
+        let libraries = self.shared.libraries.lock();
+        pipeline_key::pipeline_key(message, |id| libraries.key_of(id))
+    }
+
     pub(crate) fn prepare_pipeline(&self, message: &[u8]) -> Result<PipelineJob<P>, DecodeError> {
         let library = |obj_id: u64| self.library_ref(obj_id);
         let header = read::<RgfxMsgHeader>(message).ok_or(DecodeError::Malformed)?;
@@ -4006,6 +4024,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             return Ok(PipelineJob {
                 obj_id: m.obj_id,
                 seqno: m.header.seqno,
+                key: self.pipeline_key(message),
                 shape: PipelineShape::Compute {
                     library,
                     name: name.to_owned(),
@@ -4072,6 +4091,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         Ok(PipelineJob {
             obj_id: m.obj_id,
             seqno: m.header.seqno,
+            key: self.pipeline_key(message),
             shape: PipelineShape::Render {
                 vertex_library,
                 vertex_name: vertex_name.to_owned(),
@@ -4145,6 +4165,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         Ok(PipelineJob {
             obj_id: m.obj_id,
             seqno: m.header.seqno,
+            key: None,
             shape: PipelineShape::Mesh(Box::new(MeshShape {
                 object,
                 mesh,
@@ -4289,6 +4310,8 @@ pub(crate) struct PipelineJob<P: Platform> {
     pub(crate) obj_id: u64,
     /// The create's seqno, which its reply carries.
     pub(crate) seqno: u64,
+    /// The create's key, which a made pipeline's reply carries ([`pipeline_key::pipeline_key`]).
+    key: Option<PipelineKey>,
     /// The pipeline's functions and descriptor.
     shape: PipelineShape<P>,
 }
@@ -4618,6 +4641,8 @@ pub(crate) struct CompiledPipeline<P: Platform> {
     pub(crate) reflection: RgfxPipelineReflection,
     /// A made mesh render pipeline's limits, which its reply carries after the reflection.
     mesh: Option<RgfxMeshPipelineReflection>,
+    /// A made pipeline's key, which its reply carries after the reflection.
+    key: Option<PipelineKey>,
     /// Why it was refused, for the host's log; `None` for a made pipeline.
     refusal: Option<String>,
 }
@@ -4631,6 +4656,7 @@ impl<P: Platform> CompiledPipeline<P> {
             handle: None,
             reflection: refused_reflection(obj_id, seqno, kind),
             mesh: None,
+            key: None,
             refusal: Some(reason.into()),
         }
     }
@@ -4642,15 +4668,18 @@ impl<P: Platform> CompiledPipeline<P> {
             handle: Some(handle),
             reflection,
             mesh: None,
+            key: None,
             refusal: None,
         }
     }
 
-    /// The reply the create owes: its reflection, with a made mesh pipeline's limits after it.
+    /// The reply the create owes: its reflection, with a made mesh pipeline's limits or a made
+    /// pipeline's key after it.
     pub(crate) fn reply(&self) -> PipelineReply {
         PipelineReply {
             reflection: self.reflection,
             mesh: self.mesh,
+            key: self.key,
         }
     }
 
@@ -4672,12 +4701,16 @@ pub(crate) fn compile_refusing<P: Platform>(
     device: &P::Device,
     job: PipelineJob<P>,
 ) -> CompiledPipeline<P> {
-    let (obj_id, seqno, kind) = (job.obj_id, job.seqno, job.kind());
+    let (obj_id, seqno, kind, key) = (job.obj_id, job.seqno, job.kind(), job.key);
     let functions = job.functions();
     let mut compiled = match refusing(|| compile_pipeline::<P>(device, job)) {
         Ok(compiled) => compiled,
         Err(raise) => CompiledPipeline::refused(obj_id, seqno, kind, raise.to_string()),
     };
+    // A made pipeline's reply carries its key; a refusal's never does.
+    if !compiled.is_refused() {
+        compiled.key = key;
+    }
     if let Some(reason) = compiled.refusal.as_mut() {
         reason.push_str(&format!("; its functions: {functions}"));
     }

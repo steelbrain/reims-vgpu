@@ -140,6 +140,40 @@ bool rgfxKextSubmitDeferred(void *context, const void *message, uint32_t size,
 	return true;
 }
 
+// The control ring's shared post (RgfxRingWriter::setShared): a pipeline create posted with
+// kRgfxSubmitShared and its pipeline key, which returns at once with the answer the kext keeps for
+// an equal create of any process, its own answer then kept as a deferred create's. Where the kext
+// keeps none, or no slot for the answer, it posted and answered it as any create, and the answer
+// goes to the reader as rgfxKextSubmit's.
+bool rgfxKextSubmitShared(void *context, const void *message, uint32_t size, const uint8_t *key,
+                          uint64_t *out_seqno, bool *out_deferred,
+                          RgfxPipelineReflection *out_reflection)
+{
+	RgfxKextLink *link = static_cast<RgfxKextLink *>(context);
+	uint64_t in[1 + kRgfxSubmitKeyWords] = {kRgfxSubmitShared};
+	std::memcpy(&in[1], key, kRgfxSubmitKeyWords * sizeof(uint64_t));
+	uint64_t out[2] = {};
+	uint32_t outCount = 2;
+	uint8_t reply[128];
+	size_t replySize = sizeof(reply);
+	kern_return_t kr = IOConnectCallMethod(link->conn, kRgfxAccelMethodSubmit, in,
+	                                       1 + kRgfxSubmitKeyWords, message, size, out, &outCount,
+	                                       reply, &replySize);
+	if (kr != KERN_SUCCESS)
+		return false;
+	*out_seqno = out[0];
+	*out_deferred = outCount == 2 && out[1] == 1 && replySize >= sizeof(RgfxPipelineReflection);
+	if (*out_deferred) {
+		std::memcpy(out_reflection, reply, sizeof(*out_reflection));
+		if (link->deferredPosts.fetch_add(1, std::memory_order_relaxed) % kDrainEvery ==
+		    kDrainEvery - 1)
+			rgfxKextDrainAnswers(link);
+	} else if (replySize >= sizeof(RgfxMsgHeader) && link->reader) {
+		link->reader->deliver(reply, static_cast<uint32_t>(replySize));
+	}
+	return true;
+}
+
 // The control ring's answer wait (RgfxRingWriter::setDeferred): every answer the kext keeps for
 // the process, after the one at `seqno`, handed to the reader. True once taken; whether the one
 // at `seqno` came is its state's to see.
@@ -873,6 +907,11 @@ RGFX_LOG_UNRECOGNIZED
 	if (rgfxKextDefersAnswers(_caps)) {
 		_controlRing->setDeferred(&rgfxKextSubmitDeferred, &rgfxKextAwaitAnswer, &_link);
 		_knownPipelines = std::make_shared<RgfxKnownPipelines>();
+		// An equal create of another process is posted without waiting too, where the kext keeps
+		// the answers by pipeline key and the host gives them (RgfxSharedPipelines.hpp).
+		if ((_caps.kextFeatures() & kRgfxKextFeatureSharedPipelines) != 0 &&
+		    (_caps.features() & RGFX_FEATURE_PIPELINE_KEYS) != 0)
+			_controlRing->setShared(&rgfxKextSubmitShared);
 	}
 	_serializer = new RgfxSerializer(*_controlRing, _ids);
 	_serializer->setQueueOpener(&rgfxKextQueueOpener, connContext);
@@ -883,6 +922,7 @@ RGFX_LOG_UNRECOGNIZED
 	_serializer->setCarriesTextureDidModifyData(
 	    (_caps.features() & RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA) != 0);
 	_serializer->setCarriesRateMaps((_caps.features() & RGFX_FEATURE_RATE_MAPS) != 0);
+	_serializer->setSharesPipelines(_controlRing->shares());
 	_serializer->setCarriesFunctionPointers((_caps.features() & RGFX_FEATURE_FUNCTION_POINTERS) !=
 	                                        0);
 	_serializer->setCarriesDynamicLibraries((_caps.features() & RGFX_FEATURE_DYNAMIC_LIBRARIES) !=

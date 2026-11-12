@@ -335,6 +335,15 @@ public:
 	/// default.
 	void setCarriesRateMaps(bool carries) { m_rateMaps = carries; }
 	bool carriesRateMaps() const { return m_rateMaps; }
+	/// Whether render and compute pipeline creates ask for their pipeline keys
+	/// (RGFX_*_PIPELINE_ANSWER_KEY) and are posted against the answers the kext keeps for every
+	/// process (RgfxRingWriter::tryPostShared): the host took RGFX_FEATURE_PIPELINE_KEYS and the
+	/// route shares answers. Set once, before the first create; off by default.
+	void setSharesPipelines(bool shares) { m_sharesPipelines = shares; }
+	bool sharesPipelines() const { return m_sharesPipelines; }
+	/// Keeps library `obj_id`'s content key (32 bytes, RgfxLibraryKey.hpp), which the keys of the
+	/// pipelines made of it name (rgfxSharedPipelineKey), until its destroy.
+	void setLibraryKey(RgfxObjId obj_id, const uint8_t *key);
 	/// Whether the host makes a compute pipeline's function handles and visible function tables
 	/// (createFunctionHandle, createFunctionTable and setFunctionTable): it took
 	/// RGFX_FEATURE_FUNCTION_POINTERS. Set once, before the first pipeline; off by default.
@@ -738,7 +747,16 @@ private:
 	bool m_rateMaps = false;
 	bool m_functionPointers = false;
 	bool m_dynamicLibraries = false;
+	bool m_sharesPipelines = false;
 	void *m_eventContext = nullptr;
+
+	// Each keyed library's content key (setLibraryKey), by its id, under m_libraryKeysLock.
+	std::mutex m_libraryKeysLock;
+	std::unordered_map<RgfxObjId, RgfxLibraryContentKey> m_libraryKeys;
+	// Posts the pipeline create of `type`, the `size` bytes at `message`, into `out`: against
+	// `post`'s known pipelines, then the kext's answers of every process, where it can.
+	void postPipeline(uint32_t type, const uint8_t *message, uint32_t size, RgfxCreated &out,
+	                  RgfxPipelinePost *post);
 
 	// heapTextureSizeAndAlign's answers, by the shape's bytes, under m_sizesLock.
 	typedef std::array<uint8_t, sizeof(RgfxTextureDescriptor)> SizeKey;

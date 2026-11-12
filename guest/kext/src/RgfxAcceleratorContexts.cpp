@@ -3108,6 +3108,26 @@ void RgfxAccelerator::forgetDeferred(UInt64 seqno)
 	fb->release();
 }
 
+bool RgfxAccelerator::findSharedPipeline(const UInt8 *key, UInt64 seqno, UInt64 objId,
+                                         RgfxPipelineReflection *out)
+{
+	ReimsGraphics *fb = copyFramebuffer();
+	if (!fb)
+		return false;
+	const bool found = fb->findSharedPipeline(key, seqno, objId, out);
+	fb->release();
+	return found;
+}
+
+void RgfxAccelerator::learnSharedPipeline(const UInt8 *reply, UInt32 length)
+{
+	ReimsGraphics *fb = copyFramebuffer();
+	if (!fb)
+		return;
+	fb->learnSharedPipeline(reply, length);
+	fb->release();
+}
+
 UInt32 RgfxAccelerator::openQueue(const RgfxQueueCreate &create, UInt32 flags)
 {
 	struct {

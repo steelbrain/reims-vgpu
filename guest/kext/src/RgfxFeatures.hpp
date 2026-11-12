@@ -114,7 +114,10 @@
 //  - DYNAMIC_LIBRARIES (bit 40): the bundle makes dynamic libraries of its libraries
 //    (RGFX_CMD_DYNAMIC_LIBRARY_CREATE), which the kext admits as any create of the client's own
 //    objects (RgfxSubmitGate.hpp), waiting for its COMPLETE, and names them at the end of a
-//    compute pipeline's create.
+//    compute pipeline's create;
+//  - PIPELINE_KEYS (bit 41): the bundle asks each render and compute pipeline create's answer
+//    with its pipeline key, and the kext keeps the answers that carry one for every process
+//    (RgfxSharedPipelines.hpp), so an equal create of another process need not wait.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -152,7 +155,7 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_SURFACE_DEFERRED_ASK | RGFX_FEATURE_SURFACE_DEFERRED_CARRY |
     RGFX_FEATURE_SCHEDULED_ASK | RGFX_FEATURE_DISPLAY_SCALE |
     RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA | RGFX_FEATURE_RATE_MAPS |
-    RGFX_FEATURE_FUNCTION_POINTERS | RGFX_FEATURE_DYNAMIC_LIBRARIES |
+    RGFX_FEATURE_FUNCTION_POINTERS | RGFX_FEATURE_DYNAMIC_LIBRARIES | RGFX_FEATURE_PIPELINE_KEYS |
     (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K : RGFX_FEATURE_DISPLAY_POWER);
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.

@@ -491,6 +491,9 @@ static bool rgfxMetallibIsDynamic(const uint8_t *bytes, size_t length)
                           serializer:(RgfxSerializer *)serializer
 {
 	RgfxLibrary *lib = [[RgfxLibrary alloc] initWithObjId:objId device:device serializer:serializer];
+	// Its pipelines' keys name it by its content key (RgfxSerializer::setLibraryKey).
+	if (lib != nil && key != nullptr && serializer != nullptr)
+		serializer->setLibraryKey(objId, key);
 	if (lib != nil) {
 		lib->_table = functionTableOf(static_cast<const uint8_t *>(bytes), length, key);
 		lib->_dynamic = rgfxMetallibIsDynamic(static_cast<const uint8_t *>(bytes), length);

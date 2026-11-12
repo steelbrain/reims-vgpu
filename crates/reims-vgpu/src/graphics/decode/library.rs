@@ -504,6 +504,12 @@ impl<P: Platform> Libraries<P> {
         std::mem::replace(&mut self.cache, LibraryCache::new(RELEASED_BUDGET))
     }
 
+    /// The content key of the cache entry library `obj_id` names: `None` for a library the device
+    /// keeps under no key it vouches for, and for an id that names none.
+    pub(super) fn key_of(&self, obj_id: u64) -> Option<LibraryKey> {
+        self.cached.get(&obj_id).copied()
+    }
+
     /// Forgets what these keep of library `obj_id`: its make, which is cancelled, its chunks, and
     /// the cache entry it named.
     fn forget(&mut self, obj_id: u64) {

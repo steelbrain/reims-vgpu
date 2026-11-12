@@ -538,6 +538,26 @@ void ReimsGraphics::forgetDeferred(UInt64 seqno)
 	IOLockUnlock(stateLock);
 }
 
+bool ReimsGraphics::findSharedPipeline(const UInt8 *key, UInt64 seqno, UInt64 objId,
+                                       RgfxPipelineReflection *out)
+{
+	if (!sharedPipelines)
+		return false;
+	IOLockLock(stateLock);
+	const bool found = sharedPipelines->find(key, seqno, objId, out);
+	IOLockUnlock(stateLock);
+	return found;
+}
+
+void ReimsGraphics::learnSharedPipeline(const UInt8 *reply, UInt32 length)
+{
+	if (!sharedPipelines)
+		return;
+	IOLockLock(stateLock);
+	sharedPipelines->learn(reply, length);
+	IOLockUnlock(stateLock);
+}
+
 void ReimsGraphics::kickWorkLoop()
 {
 	if (kick)
@@ -1297,6 +1317,12 @@ bool ReimsGraphics::start(IOService *provider)
 	presentsLock = IOLockAlloc();
 	if (!submitLock || !interruptLock || !stateLock || !presentsLock)
 		return false;
+	// The answers kept by pipeline key, empty at each start. Without the table, none is kept and
+	// every create waits.
+	if (!sharedPipelines)
+		sharedPipelines = static_cast<SharedPipelines *>(IOMalloc(sizeof(SharedPipelines)));
+	if (sharedPipelines)
+		sharedPipelines->clear();
 	started = false;
 	nextSeqno = 1;
 	largestScanout = 0;
@@ -1674,6 +1700,9 @@ void ReimsGraphics::free()
 		IOLockFree(presentsLock);
 	submitLock = interruptLock = nullptr;
 	stateLock = presentsLock = nullptr;
+	if (sharedPipelines)
+		IOFree(sharedPipelines, sizeof(SharedPipelines));
+	sharedPipelines = nullptr;
 	const void *oldTask = nullptr, *oldClient = nullptr;
 	scanoutOwner.clear(&oldTask, &oldClient);
 	if (oldTask)

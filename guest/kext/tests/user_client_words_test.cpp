@@ -304,12 +304,16 @@ static void features()
 		kRgfxKextFeatureSharedEvents,
 		kRgfxKextFeatureWriteCombined,
 		kRgfxKextFeaturePagesChunked,
+		kRgfxKextFeatureSharedPipelines,
 	};
 	for (unsigned i = 0; i < sizeof(bits) / sizeof(bits[0]); i++)
 		CHECK(bits[i] == uint64_t(1) << i);
-	// TakeAnswers past the numbers SubmitBatch and WakeCompletions keep, and Submit's one flag.
+	// TakeAnswers past the numbers SubmitBatch and WakeCompletions keep, and Submit's flags: a
+	// shared create's key takes four scalars after them.
 	CHECK(kRgfxAccelMethodTakeAnswers == 7);
 	CHECK(kRgfxSubmitDeferred == 1);
+	CHECK(kRgfxSubmitShared == 2);
+	CHECK(kRgfxSubmitKeyWords * sizeof(uint64_t) == 32);
 	CHECK(kRgfxAccelMethodSurfaceBlockRelease == 8);
 	CHECK(kRgfxAccelMethodSurfaceRetire == 9);
 	// A shared event's port: 'RGSE', its two selectors past the accelerator's low ones, so a call
