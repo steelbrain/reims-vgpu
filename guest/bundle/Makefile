@@ -48,6 +48,9 @@
 #                   (tools/upload_probe.m), build/upload_probe-x86_64; ARCH=arm64 likewise.
 #   make icb-probe  what the CPU's encodes into indirect command buffers and its writes into
 #                   IOSurfaces cost (tools/icb_probe.m), build/icb_probe-x86_64; ARCH=arm64 likewise.
+#   make encode-probe
+#                   what the hot encoder calls cost the calling thread, in ns a call
+#                   (tools/encode_probe.m), build/encode_probe-x86_64; ARCH=arm64 likewise.
 #   make reflection-check
 #                   the stitchable functions' reflection the bundle builds against Metal's own,
 #                   build/reflection_check-x86_64 (ARCH=arm64 likewise) over
@@ -572,6 +575,19 @@ $(ICBBIN): tools/icb_probe.m Makefile
 		-Wall -Wextra -Werror -Wno-unused-parameter tools/icb_probe.m -framework Foundation \
 		-framework Metal -framework IOSurface -o $@
 
+# --- the hot encoder calls' cost (tools/encode_probe.m says what each case measures) -------------
+# One binary for ARCH (x86_64, a guest's or an Intel Mac's; ARCH=arm64 for an Apple-silicon Mac),
+# run on a real device, never in `make test`.
+ENCODEBIN = $(BUILD)/encode_probe-$(ARCH)
+
+encode-probe: $(ENCODEBIN)
+
+$(ENCODEBIN): tools/encode_probe.m Makefile
+	@mkdir -p $(@D)
+	xcrun clang -arch $(ARCH) -isysroot $(SDK) -mmacosx-version-min=14.0 -fobjc-arc -O2 \
+		-Wall -Wextra -Werror -Wno-unused-parameter tools/encode_probe.m -framework Foundation \
+		-framework Metal -o $@
+
 # --- the shader and pipeline costs (tools/pipelines; pipelines.m says what each case measures) --
 # One binary for ARCH (x86_64, a guest's or an Intel Mac's; ARCH=arm64 for an Apple-silicon Mac),
 # run on a real device, never in `make test`. Its source compiles in (pipelines_source.h, from
@@ -639,6 +655,6 @@ $(PIPEREFLECTBIN): tools/pipeline_reflection_check.mm tools/oracle/oracle_walk.h
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all test bundle package sweep bench pipelines res submit-probe upload-probe icb-probe reflection-check \
-	pipeline-reflection-check peer-test peer-test-build clean
+.PHONY: all test bundle package sweep bench pipelines res submit-probe upload-probe icb-probe \
+	encode-probe reflection-check pipeline-reflection-check peer-test peer-test-build clean
 
