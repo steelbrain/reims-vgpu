@@ -3819,7 +3819,9 @@ mod tests {
             ),
             (
                 "newDepthStencilStateWithDescriptor:",
-                Error::NotImplemented(RuntimeGap::IndirectRenderCommands),
+                Error::NotImplemented(RuntimeGap::IndirectRenderCommands(
+                    metal2vulkan_runtime::IndirectRule::CommandRenderStates,
+                )),
             ),
             (
                 "newTextureWithDescriptor:",

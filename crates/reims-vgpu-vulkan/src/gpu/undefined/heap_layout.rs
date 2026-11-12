@@ -32,13 +32,16 @@
 //! compressed alike, not recorded here), mipmapped, array and multisample textures, levels past
 //! the first; offsets other than 0; other Apple GPU generations.
 //!
-//! **This platform today**: the runtime lays an uncompressed texture's texels out in Metal's
-//! tiles, Metal's bytes, and a compressed one's in a layout of its own, leaving the metadata's
-//! bytes as the heap held them, announcing `heap-texture-lossless-layout`, relayed for a
-//! single-sample texture ([`crate::answer::HEARD`]): its bytes are Metal's for no write probed,
-//! not even where Metal holds the texels in its tiles (a CPU write, texels that do not compress).
-//! The tests hold the uncompressed shapes' bytes to Metal's, and require the compressed shape's
-//! difference to come with the relayed kind.
+//! **This platform today**: a texture in a heap over host pages lies in the device's linear image
+//! bound to the pages wherever one serves, in the driver's rows with no copy, announcing
+//! `heap-texture-untiled-layout`: its bytes are its texels row by row at the driver's pitch, not
+//! Metal's tiles, compressed or not. Where no such image serves, an uncompressed texture is a
+//! shadow of its texels in Metal's tiles, Metal's bytes, and a compressed one's bytes are in a
+//! layout of the runtime's own, the metadata's bytes left as the heap held them, announcing
+//! `heap-texture-lossless-layout`. Both kinds are relayed for a single-sample texture
+//! ([`crate::answer::HEARD`]). The tests hold each shape's bytes to Metal's, or require the
+//! difference to come with a relayed kind: `heap-texture-untiled-layout`, with the texels in
+//! rows where the probe knows them, or, for the compressed shape, `heap-texture-lossless-layout`.
 //!
 //! **To answer as Metal**: in part, a compressed texture's texels laid out in Metal's tiles with
 //! each block's metadata marked as held as texels (`0x7f`, measured for `RGBA8Unorm` alone) is
@@ -174,14 +177,27 @@ fn shapes() -> [(&'static str, Shape, bool); 4] {
     ]
 }
 
+/// The pitch at which `held` holds `texels`, `rows` rows of `row` bytes each, row by row from its
+/// start: the least multiple of 16 bytes, from `row` to 16 times it, at which every row's bytes
+/// are the texels' own; `None` where none is.
+fn pitch_of_rows(held: &[u8], texels: &[u8], row: usize, rows: usize) -> Option<usize> {
+    (row..=16 * row).step_by(16).find(|&pitch| {
+        (0..rows).all(|y| {
+            let at = y * pitch;
+            held.get(at..at + row) == Some(&texels[y * row..(y + 1) * row])
+        })
+    })
+}
+
 /// A texture placed in a `Shared` heap over host pages leaves bytes there that are one value for
 /// the same writes, on this host's Metal in every run: an uncompressed texture's texels in
 /// Metal's tiles; a compressed one's, after a GPU blit or a stored clear of texels that compress,
 /// no permutation of them, each 16 by 16 block's bytes past its encoding keeping the heap's
 /// earlier bytes, and after a blit of texels that do not compress, or a CPU `replaceRegion`, the
-/// texels in Metal's tiles, the uncompressed texture's bytes. This platform's bytes are Metal's
-/// for the uncompressed shapes; for the compressed one they differ, and the runtime announced
-/// `heap-texture-lossless-layout`
+/// texels in Metal's tiles, the uncompressed texture's bytes. This platform's bytes are Metal's,
+/// or they differ and the runtime announced why: `heap-texture-untiled-layout`, the texture in the
+/// device's image over the pages, where the probe knows the texels, every row of them at one
+/// pitch; or, for the compressed shape, `heap-texture-lossless-layout`
 #[test]
 fn heap_texture_bytes_are_metals_tiles_or_its_compressed_form() {
     let (p, d) = (platform(), dev());
@@ -200,11 +216,32 @@ fn heap_texture_bytes_are_metals_tiles_or_its_compressed_form() {
             // The texture's size in the heap, Metal's.
             crate::metal_check!(format!("{case}: size"), ours_size);
             if !crate::metal_matches_bytes!(&case, &o[..usize::try_from(ours_size).unwrap()]) {
-                let kind = rt::Degradation::HeapTextureLosslessLayout;
-                assert!(compresses && heard(kind), "{case}: off Metal's");
-                differ.push(case);
+                let untiled = heard(rt::Degradation::HeapTextureUntiledLayout);
+                let lossless = compresses && heard(rt::Degradation::HeapTextureLosslessLayout);
+                assert!(untiled || lossless, "{case}: off Metal's, no kind heard");
+                // The texels the probe wrote, where it knows them: a blit's or a CPU write's.
+                let known = !matches!(write, Write::Cleared);
+                if untiled && !lossless && known {
+                    let texels = texels(write, shape.length());
+                    let row = shape.length() / usize::try_from(shape.size.1).unwrap();
+                    let rows = usize::try_from(shape.size.1).unwrap();
+                    let pitch = pitch_of_rows(&o, &texels, row, rows);
+                    assert!(
+                        pitch.is_some(),
+                        "{case}: off Metal's, not its texels in rows"
+                    );
+                    differ.push(format!(
+                        "{case}: untiled, rows {} bytes apart",
+                        pitch.unwrap()
+                    ));
+                } else {
+                    differ.push(format!(
+                        "{case}: {}",
+                        if lossless { "lossless" } else { "untiled" }
+                    ));
+                }
             }
         }
     }
-    eprintln!("off Metal's, heap-texture-lossless-layout heard: {differ:#?}");
+    eprintln!("off Metal's, with the kind heard: {differ:#?}");
 }
