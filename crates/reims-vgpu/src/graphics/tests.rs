@@ -543,11 +543,11 @@ impl Guest {
         self.event()
     }
 
-    /// Whether no completion-ring event comes for `window`: what a check that a message is not
-    /// answered waits, a span of its own, as the device's threads may take that long to post one.
-    fn quiet_for(&mut self, window: Duration) -> bool {
-        let start = std::time::Instant::now();
-        while start.elapsed() < window {
+    /// Whether no completion-ring event comes over `polls` polls a millisecond's sleep apart:
+    /// what a check that a message is not answered waits, a span of its own, as the device's
+    /// threads may take that long to post one.
+    fn quiet_for(&mut self, polls: u32) -> bool {
+        for _ in 0..polls {
             if self.event_now().is_some() {
                 return false;
             }
@@ -5923,7 +5923,7 @@ fn a_destroy_of_a_pending_library_keeps_the_pipeline_before_it() {
         .expect("the pipeline's reflection");
     assert_eq!(reflection.obj_id, obj(1, 11));
     assert_eq!(reflection.status, RGFX_PIPELINE_OK);
-    assert!(guest.quiet_for(Duration::from_secs(2)), "a third event");
+    assert!(guest.quiet_for(2000), "a third event");
     assert_eq!(device.decoder_object_count(), 1);
 }
 

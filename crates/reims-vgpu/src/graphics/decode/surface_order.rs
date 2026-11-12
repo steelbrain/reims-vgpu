@@ -1106,7 +1106,6 @@ mod tests {
     #[test]
     #[allow(clippy::disallowed_methods)] // test scaffolding: a thread carries the buffer out
     fn a_cpu_set_for_a_buffer_not_carried_out_waits_for_its_queue_s_earlier_work() {
-        use std::time::Duration;
         let mut r = rig();
         // A's buffer 1 signals its timeline at 1, committed and not finished.
         let (outcome, calls) = r.commit(A, 1, &ops(Some(&[]), &[]));
