@@ -142,6 +142,11 @@ const struct {
     {"air.thread_index_in_simdgroup", 18},
     {"air.threads_per_simdgroup", 20},
     {"air.mesh_grid_properties", 23},
+    // A post-tessellation vertex function's (measured: tools/pipeline_reflection_check's r_patch and
+    // r_patch_points on the AMD Radeon Pro 5300M and the Intel UHD Graphics 630 under macOS 26.7.1,
+    // and the M3 Max under macOS 27.0.1).
+    {"air.patch_id", 13},
+    {"air.position_in_patch", 14},
     {"air.simdgroup_index_in_threadgroup", 0},
     {"air.simdgroups_per_threadgroup", 0},
     {"air.quadgroup_index_in_threadgroup", 0},
@@ -150,8 +155,20 @@ const struct {
 };
 
 // A stage's nodes that are no binding and no built-in: a kernel's and a vertex function's stage
-// input attributes.
+// input attributes, and a post-tessellation vertex function's patch input attributes and its
+// control points.
 bool isStageInput(const std::string &kind)
+{
+	return kind == "air.stage_in" || kind == "air.vertex_input" || kind == "air.patch_input" ||
+	       kind == "air.patch_control_point_input";
+}
+
+// A stage input whose reads use the descriptor's buffer that holds its attribute: a kernel's and a
+// vertex function's. A post-tessellation vertex function's patch inputs and control points use
+// none: Metal answers each of its descriptor's buffers unused, isUsed and isActive 0, though the
+// function reads attributes they hold (measured: r_patch and r_patch_points, as kBuiltIns'
+// post-tessellation ones).
+bool usesDescriptorBuffer(const std::string &kind)
 {
 	return kind == "air.stage_in" || kind == "air.vertex_input";
 }
@@ -1248,10 +1265,11 @@ bool RgfxStageReflectionOfEntry(const RgfxAirEntries &module, const RgfxAirEntry
 		if (kept)
 			nodes.push_back(std::move(s));
 	}
-	// The descriptor's buffers, each used where the function reads an attribute it holds.
+	// The descriptor's buffers, each used where the function reads an attribute it holds through a
+	// stage input that uses it (usesDescriptorBuffer).
 	std::set<uint32_t> read;
 	for (const RgfxAirNode &n : nodes)
-		if (isStageInput(n.kind) && n.hasLocation && !n.unused)
+		if (usesDescriptorBuffer(n.kind) && n.hasLocation && !n.unused)
 			read.insert(n.index);
 	for (size_t i = 0; i < buffers.size(); i++) {
 		const RgfxDescriptorBuffer &d = buffers[i];
@@ -1304,6 +1322,13 @@ bool RgfxStageReflectionOfEntry(const RgfxAirEntries &module, const RgfxAirEntry
 		*why = @"a vertex output of a type not measured";
 		return false;
 	}
+	// A post-tessellation vertex function's position in its patch is dumped beside its outputs,
+	// whether or not the function takes it: Metal's postVertexDumpStride adds 12 for a triangle
+	// patch's (a float3) and 8 for a quad's (a float2) (measured: r_patch, r_patch_points,
+	// r_patch_buffers, r_patch_plain and r_patch_unused, as kBuiltIns' post-tessellation ones, and
+	// on the M3 Max under macOS 27.0.1).
+	if (entry.stage == RgfxAirEntryStage::Vertex)
+		bytes += entry.patch == RgfxAirPatch::Triangle ? 12 : entry.patch == RgfxAirPatch::Quad ? 8 : 0;
 	out.bindings = listOf(bindings);
 	out.builtIns = listOf(builtIns);
 	out.outputBytes = bytes;

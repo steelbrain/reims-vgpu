@@ -255,6 +255,14 @@ bool rgfxReadAirVisible(const uint8_t *bitcode, size_t size, std::vector<RgfxAir
 //   `air.arg_unused`: the function never references it;
 //   `air.render_target` n, as its kind: a fragment function's input of colour attachment n's value
 //   (`[[color(n)]]`);
+//   `air.patch_control_point_input`, as its kind: a post-tessellation vertex function's control
+//   points (its `patch_control_point<T>` stage input, alone or a member of its stage input's
+//   struct), then a node of its control point function (`air.patch_control_point_function` and
+//   the function), then a node of each attribute of the control point, of the keys above
+//   (`air.location_index` the attribute's index), under `air.function_constant` and its
+//   predicate's node where it is declared under one (read: Metal's compiler on macOS 27.0.1, the
+//   M3 Max, tools/oracle/oracle_reflection.metal's v_patch and v_patch_points and
+//   tests/air_arguments.metal's reads_patch, as LLVM's text form prints them);
 //   `air.mesh` !info: a mesh function's mesh, its `air.mesh_type_info` node of its vertex and
 //   primitive data (each a node of outputs, below), its vertex and primitive counts and its
 //   topology (`air.triangle`, ...).
@@ -321,9 +329,15 @@ struct RgfxAirNode {
 	std::vector<RgfxAirOutput> meshVertexData, meshPrimitiveData;
 	uint32_t meshVertices = 0, meshPrimitives = 0;
 	std::string meshTopology;
+	// `air.patch_control_point_input`, its kind: the control point's attributes, each a node of no
+	// kind and no position, its `index` the attribute's.
+	std::vector<RgfxAirNode> controlPoints;
 };
 
 enum class RgfxAirEntryStage : uint8_t { Kernel, Vertex, Fragment, Object, Mesh };
+
+// A post-tessellation vertex function's patch type, its [[patch(type)]].
+enum class RgfxAirPatch { None, Triangle, Quad };
 
 struct RgfxAirEntry {
 	std::string name;
@@ -342,6 +356,12 @@ struct RgfxAirEntry {
 	// GL renderer's programs; measured: macOS 26.7.1 and macOS 27).
 	bool hasWorkGroupSize = false;
 	uint32_t workGroupSize[3] = {1, 1, 1};
+	// A post-tessellation vertex function's patch type, from its node of `air.patch` after its
+	// arguments' (`!{!"air.patch", !"quad", !"air.patch_control_point", i32 4}` as LLVM's text form
+	// prints it; read: tools/oracle/oracle_reflection.metal's v_patch functions and
+	// tests/air_arguments.metal's reads_patch, as Apple's Metal compiler builds them); None for any
+	// other function.
+	RgfxAirPatch patch = RgfxAirPatch::None;
 };
 
 // The code of a module that declares function constants: its functions' bodies, as the reader

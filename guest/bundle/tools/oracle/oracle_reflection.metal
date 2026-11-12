@@ -610,3 +610,20 @@ struct PatchIn {
 	o.uv = uv;
 	return o;
 }
+
+[[patch(triangle, 3)]] vertex VertexOut v_patch_plain(patch_control_point<PatchPoint> points [[stage_in]])
+{
+	VertexOut o;
+	o.position = points[0].position + points[2].position;
+	o.uv = points[1].uv;
+	return o;
+}
+
+[[patch(quad, 4)]] vertex VertexOut v_patch_unused(patch_control_point<PatchPoint> points [[stage_in]],
+                                                   float2 uv [[position_in_patch]])
+{
+	VertexOut o;
+	o.position = points[0].position;
+	o.uv = points[3].uv;
+	return o;
+}

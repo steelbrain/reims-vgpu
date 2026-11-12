@@ -120,14 +120,15 @@ static bool operator==(const RgfxAirNode &a, const RgfxAirNode &b)
 	       a.renderTarget == b.renderTarget &&
 	       a.hasMesh == b.hasMesh && a.meshVertexData == b.meshVertexData &&
 	       a.meshPrimitiveData == b.meshPrimitiveData && a.meshVertices == b.meshVertices &&
-	       a.meshPrimitives == b.meshPrimitives && a.meshTopology == b.meshTopology;
+	       a.meshPrimitives == b.meshPrimitives && a.meshTopology == b.meshTopology &&
+	       a.controlPoints == b.controlPoints;
 }
 
 static bool operator==(const RgfxAirEntry &a, const RgfxAirEntry &b)
 {
 	return a.name == b.name && a.function == b.function && a.stage == b.stage && a.nodesRead == b.nodesRead &&
 	       a.outputs == b.outputs && a.arguments == b.arguments && a.hasWorkGroupSize == b.hasWorkGroupSize &&
-	       std::equal(a.workGroupSize, a.workGroupSize + 3, b.workGroupSize);
+	       std::equal(a.workGroupSize, a.workGroupSize + 3, b.workGroupSize) && a.patch == b.patch;
 }
 
 // Two modules' code, which is opaque, compared by what it answers: each entry point's
@@ -976,22 +977,54 @@ int main()
 		}
 
 		// The same of the nodes whole (rgfxReadAirEntries). The whole module's nodes read, each entry
-		// point's but reads_patch's: a post-tessellation vertex function's control point input
-		// (`air.patch_control_point_input`) takes two nodes, its control point function's and its
-		// attributes', operands no key the reader follows takes, so that entry point is listed with
-		// no nodes and the others' read. Then, the key ahead of the kind of each argument declared
-		// under a function constant spoilt (`air.function_constant`, so the constant's node is an
-		// operand no key takes), the entry points of such an argument are listed with no nodes, and
-		// every other entry point's nodes are as they were.
+		// point's: reads_patch's control point input (`air.patch_control_point_input`) among them, its
+		// control point function's node and its one attribute's after it, then its patch input (its
+		// attribute 1), its position in the patch and its texture. Then, the key ahead of the kind of
+		// each argument declared under a function constant spoilt (`air.function_constant`, so the
+		// constant's node is an operand no key takes), the entry points of such an argument are
+		// listed with no nodes, and every other entry point's nodes are as they were.
 		RgfxAirEntries entriesAll, entriesLeft;
 		check(rgfxReadAirEntries(whole.data(), whole.size(), entriesAll), "the whole module's nodes read");
 		for (const RgfxAirEntry &e : entriesAll.entries)
-			check(e.nodesRead == (e.name != "reads_patch"),
-			      e.name + (e.name == "reads_patch" ? ": listed, its control point input's nodes unread"
-			                                        : ": its nodes read"));
-		check(std::any_of(entriesAll.entries.begin(), entriesAll.entries.end(),
-		                  [](const RgfxAirEntry &e) { return e.name == "reads_patch"; }),
-		      "the whole module lists reads_patch");
+			check(e.nodesRead, e.name + ": its nodes read");
+		auto patchEntry = std::find_if(entriesAll.entries.begin(), entriesAll.entries.end(),
+		                               [](const RgfxAirEntry &e) { return e.name == "reads_patch"; });
+		check(patchEntry != entriesAll.entries.end() && patchEntry->arguments.size() == 4 &&
+		          patchEntry->patch == RgfxAirPatch::Quad,
+		      "the whole module lists reads_patch, of 4 nodes, a quad's");
+		for (const RgfxAirEntry &e : entriesAll.entries)
+			check(e.name == "reads_patch" || e.patch == RgfxAirPatch::None, e.name + ": of no patch");
+		if (patchEntry != entriesAll.entries.end() && patchEntry->arguments.size() == 4) {
+			const RgfxAirNode &points = patchEntry->arguments[0];
+			check(points.kind == "air.patch_control_point_input" && points.controlPoints.size() == 1 &&
+			          points.controlPoints[0].index == 0 && points.controlPoints[0].typeName == "float4" &&
+			          points.controlPoints[0].name == "p" && points.controlPoints[0].kind.empty() && !points.hasLocation,
+			      "reads_patch: its control points, of attribute 0, a float4 p");
+			check(patchEntry->arguments[1].kind == "air.patch_input" && patchEntry->arguments[1].hasLocation &&
+			          patchEntry->arguments[1].index == 1 && patchEntry->arguments[1].name == "color",
+			      "reads_patch: its patch input, attribute 1");
+			check(patchEntry->arguments[2].kind == "air.position_in_patch" &&
+			          patchEntry->arguments[2].typeName == "float2" && patchEntry->arguments[3].kind == "air.texture",
+			      "reads_patch: its position in the patch, then its texture");
+		}
+		// A control point input whose control point function's node is spoilt (its tag no longer
+		// `air.patch_control_point_function`) is one the reader does not follow: reads_patch is listed
+		// with no nodes, and the others' read.
+		{
+			std::vector<uint8_t> spoiltFunction = whole;
+			const char tag[] = "air.patch_control_point_function";
+			auto at = std::search(spoiltFunction.begin(), spoiltFunction.end(), tag, tag + sizeof(tag) - 1);
+			check(at != spoiltFunction.end(), "the whole module names the control point function's tag");
+			if (at != spoiltFunction.end())
+				*(at + sizeof(tag) - 2) = '_';
+			RgfxAirEntries spoiltEntries;
+			check(rgfxReadAirEntries(spoiltFunction.data(), spoiltFunction.size(), spoiltEntries),
+			      "the module of the control point function's tag spoilt reads");
+			for (const RgfxAirEntry &e : spoiltEntries.entries)
+				check(e.nodesRead == (e.name != "reads_patch"),
+				      e.name + (e.name == "reads_patch" ? ": listed, its control point input unread"
+				                                        : ": its nodes read beside it"));
+		}
 		std::vector<uint8_t> unkeyed = whole;
 		const char fcKey[] = "air.function_constant";
 		const size_t fcLength = sizeof(fcKey) - 1;
@@ -1633,6 +1666,21 @@ int main()
 			          members.layout->at(3).indirect->kind == "air.indirect_constant",
 			      "k_argument_buffer: a constant member");
 		}
+		// A post-tessellation vertex function's control points (3 attributes, the third never read)
+		// and its patch's attribute, its built-ins, then its bindings.
+		const RgfxAirEntry vp = entriesOf("v_patch").entries.at(0);
+		check(vp.arguments.size() == 7 && vp.arguments[0].kind == "air.patch_control_point_input" &&
+		          vp.arguments[0].controlPoints.size() == 3 && !vp.arguments[0].controlPoints[1].unused &&
+		          vp.arguments[0].controlPoints[1].index == 1 && vp.arguments[0].controlPoints[1].typeName == "float2" &&
+		          vp.arguments[0].controlPoints[2].unused && vp.arguments[1].kind == "air.patch_input" &&
+		          vp.arguments[1].index == 3 && vp.arguments[2].kind == "air.position_in_patch" &&
+		          vp.arguments[3].kind == "air.patch_id" && vp.arguments[4].name == "mvp",
+		      "v_patch: its control points, its patch's attribute, its built-ins and its bindings");
+		check(vp.patch == RgfxAirPatch::Quad && entriesOf("v_patch_points").entries.at(0).patch == RgfxAirPatch::Triangle &&
+		          entriesOf("v_patch_plain").entries.at(0).patch == RgfxAirPatch::Triangle &&
+		          entriesOf("v_patch_buffers").entries.at(0).patch == RgfxAirPatch::Quad &&
+		          entriesOf("v_buffers").entries.at(0).patch == RgfxAirPatch::None,
+		      "the post-tessellation vertex functions' patch types, quad or triangle, and none elsewhere");
 		const RgfxAirEntry vb = entriesOf("v_buffers").entries.at(0);
 		check(vb.stage == RgfxAirEntryStage::Vertex && vb.outputs.size() == 2 && vb.outputs[0].kind == "air.position" &&
 		          vb.outputs[0].typeName == "float4" && vb.outputs[1].kind == "air.vertex_output" &&

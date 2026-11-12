@@ -5861,6 +5861,46 @@ void test_pipeline_reflection_from_air()
 		CHECK(number(vertexBuiltIns[1], @"builtInType") == 3 && number(vertexBuiltIns[2], @"builtInType") == 4);
 	CHECK(number(moreOut, @"postVertexDumpStride") == 68 && ask(moreOut, @"fragmentArguments") == nil);
 
+	// Post-tessellation vertex functions, of a descriptor of their control points' attributes 0 to 2
+	// in buffer 0, stepping per control point, and their patch's attribute 3 in buffer 1, stepping
+	// per patch (pipeline_reflection_check's r_patch, r_patch_points, r_patch_plain and
+	// r_patch_unused, measured on the 5300M, the 630 and the M3 Max): the control points and the
+	// patch's attribute are no bindings, the descriptor's buffers are unused though the function
+	// reads them, the position in the patch and the patch's id are built-ins 14 and 13, and the
+	// stride adds a triangle patch's position's 12 bytes or a quad's 8, taken or not.
+	MTLVertexDescriptor *patchVd = [MTLVertexDescriptor vertexDescriptor];
+	const NSUInteger kPatch[][3] = {{0, 0, 0}, {1, 16, 0}, {2, 32, 0}, {3, 0, 1}}; // attribute, offset, buffer
+	for (const auto &a : kPatch) {
+		patchVd.attributes[a[0]].format = a[0] == 1 ? MTLVertexFormatFloat2 : MTLVertexFormatFloat4;
+		patchVd.attributes[a[0]].offset = a[1];
+		patchVd.attributes[a[0]].bufferIndex = a[2];
+	}
+	patchVd.layouts[0].stride = 48;
+	patchVd.layouts[0].stepFunction = MTLVertexStepFunctionPerPatchControlPoint;
+	patchVd.layouts[1].stride = 16;
+	patchVd.layouts[1].stepFunction = MTLVertexStepFunctionPerPatch;
+	id patch = RgfxRenderPipelineReflectionOf(fn(@"v_patch"), patchVd, fn(@"f_plain"), both);
+	CHECK(shape(ask(patch, @"vertexBindings")) == "vertexBuffer.0:0- vertexBuffer.1:0- mvp:0 heights:2 unusedBuffer:0- ");
+	CHECK(shape(ask(patch, @"vertexBuiltInArguments")) == "uv:15 patch:15 ");
+	NSArray *patchBuiltIns = ask(patch, @"vertexBuiltInArguments");
+	if (patchBuiltIns.count == 2)
+		CHECK(number(patchBuiltIns[0], @"builtInType") == 14 &&
+		      number(patchBuiltIns[0], @"builtInDataType") == MTLDataTypeFloat2 &&
+		      number(patchBuiltIns[1], @"builtInType") == 13 &&
+		      number(patchBuiltIns[1], @"builtInDataType") == MTLDataTypeUInt);
+	CHECK(number(patch, @"postVertexDumpStride") == 44);
+	id points = RgfxRenderPipelineReflectionOf(fn(@"v_patch_points"), patchVd, fn(@"f_plain"), both);
+	CHECK(shape(ask(points, @"vertexBindings")) == "vertexBuffer.0:0- vertexBuffer.1:0- ");
+	CHECK(shape(ask(points, @"vertexBuiltInArguments")) == "bc:15 iid:15 ");
+	CHECK(number(points, @"postVertexDumpStride") == 48);
+	id plain = RgfxRenderPipelineReflectionOf(fn(@"v_patch_plain"), patchVd, fn(@"f_plain"), both);
+	CHECK(shape(ask(plain, @"vertexBindings")) == "vertexBuffer.0:0- vertexBuffer.1:0- ");
+	CHECK(ask(plain, @"vertexBuiltInArguments") == nil);
+	CHECK(number(plain, @"postVertexDumpStride") == 48);
+	id unread = RgfxRenderPipelineReflectionOf(fn(@"v_patch_unused"), patchVd, fn(@"f_plain"), both);
+	CHECK(shape(ask(unread, @"vertexBuiltInArguments")) == "uv:15- "); // unread
+	CHECK(number(unread, @"postVertexDumpStride") == 44);
+
 	// A mesh pipeline: each stage's payload, the mesh and the object's grid.
 	id mesh = RgfxMeshPipelineReflectionOf(fn(@"o_payload"), fn(@"m_payload"), fn(@"f_mesh"), both);
 	CHECK(shape(ask(mesh, @"objectBindings")) == "payload:34 scale:0 unused:0- ");

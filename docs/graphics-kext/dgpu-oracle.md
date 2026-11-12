@@ -1125,6 +1125,18 @@ alike. AMD and Intel agree on every value but one (below) *(class 3)*:
 - the private `postVertexDumpStride` is the vertex function's outputs' size and 12 on AMD and on
   the M3, and its outputs' size and 8 on Intel *(class 2)*; a mesh pipeline's is 0.
 
+**Post-tessellation vertex functions** (11-12, `pipeline_reflection_check`'s r_patch,
+r_patch_points, r_patch_buffers, r_patch_plain and r_patch_unused, of a descriptor of the control
+points' attributes in buffer 0, stepping per control point, and the patch's attribute in buffer 1,
+stepping per patch; m3-max-22312 on the AMD, 22313 on the Intel, 22314 on the M3): AMD, Intel and
+the M3 agree *(class 3)* that the control points (`patch_control_point<T>`) and the patch's
+attributes are no binding, that the descriptor's buffers are unused (`isUsed` and `isActive` 0)
+though the function reads them, and that `position_in_patch` and `patch_id` are built-ins 14 and
+13 (unused where the function never reads them). `postVertexDumpStride` adds the patch's position
+to the outputs and the GPU's 12 (Intel 8): 12 bytes for a triangle patch and 8 for a quad, whether
+or not the function takes its position. The AMD compiler dies making r_patch_buffers (a quad
+patch of no control points, reading its points from a buffer), which the Intel GPU and the M3 make.
+
 **Ours** (`RgfxPipelineReflection.mm`): the bundle builds the same objects, of Metal's own classes,
 from each function's AIR nodes, and answers them in every creator that takes options, with AMD's
 stride. It answers nil, as before, for a pipeline of a function whose binding index function
@@ -1134,7 +1146,10 @@ constants remove is answered used *(class 4: Metal reflects the specialised code
 `pipeline_reflection_check` (11-05, 80 cases of 433490 values) finds no difference on the AMD
 GPU, and on the Intel GPU only `postVertexDumpStride`, 4 less than ours on each vertex pipeline;
 on both, the one case ours does not make is `c_constants` (`k_constants`), whose binding index
-function constants compute.
+function constants compute. Since 11-12 the reader follows a post-tessellation vertex function's
+control points (`air.patch_control_point_input`), and the patch cases answer as above: no
+difference on the AMD GPU, the Intel GPU's stride 4 less, and on the M3 only its constant buffer
+alignment and `_flags`, as everywhere.
 
 ## Q22: mesh render pipelines and their draws
 

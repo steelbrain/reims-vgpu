@@ -39,6 +39,10 @@
 //                attribute 3 in buffer 1, stepping per patch
 //   r_patch_points  v_patch_points, of its control points alone, and f_plain, r_patch's descriptor
 //   r_patch_buffers v_patch_buffers, of no stage input, and f_plain
+//   r_patch_plain   v_patch_plain, of its control points alone and no position in the patch, and
+//                f_plain, r_patch's descriptor
+//   r_patch_unused  v_patch_unused, of its control points and a position in the patch it does not
+//                read, and f_plain, r_patch's descriptor
 // Prints each difference (with -v, every line both walks agree on), a case ours makes no reflection
 // of with its reason and Metal's getters' answers (with -v its instance variables' too, to measure
 // them), a case Metal makes no pipeline of with its error, and
@@ -66,7 +70,8 @@ std::vector<uint8_t> Bytes; // LIB's bytes
 bool Verbose;
 unsigned Cases, Values, Differ, NotMade, Unmade;
 
-// The nodes of LIB's entry point `name`.
+// The nodes of LIB's entry point `name`: false where a node of it does not read, as the bundle's
+// libraries answer (RgfxLibrary's rgfxAirEntryNamed:).
 bool entryOf(const std::string &name, RgfxAirEntries &module)
 {
 	const uint8_t *p = Bytes.data();
@@ -78,7 +83,7 @@ bool entryOf(const std::string &name, RgfxAirEntries &module)
 	if (!rgfxMetallibBitcode(p, n, name, &bitcode, &size) || !rgfxReadAirEntries(bitcode, size, all))
 		return false;
 	for (RgfxAirEntry &e : all.entries) {
-		if (e.name == name) {
+		if (e.name == name && e.nodesRead) {
 			module.entries = {e};
 			module.constants = all.constants;
 			module.code = all.code;
@@ -471,6 +476,12 @@ int main(int argc, char **argv)
 			           MTLPixelFormatInvalid);
 		if (CASE("r_patch_buffers"))
 			renderCase("r_patch_buffers", Fn{"v_patch_buffers", {}}, &plain, nil, MTLPixelFormatBGRA8Unorm,
+			           MTLPixelFormatInvalid);
+		if (CASE("r_patch_plain"))
+			renderCase("r_patch_plain", Fn{"v_patch_plain", {}}, &plain, patchDescriptor(), MTLPixelFormatBGRA8Unorm,
+			           MTLPixelFormatInvalid);
+		if (CASE("r_patch_unused"))
+			renderCase("r_patch_unused", Fn{"v_patch_unused", {}}, &plain, patchDescriptor(), MTLPixelFormatBGRA8Unorm,
 			           MTLPixelFormatInvalid);
 		printf("pipeline_reflection_check: %u cases, %u values, %u differ, %u not made, %u Metal made none\n", Cases,
 		       Values, Differ, NotMade, Unmade);

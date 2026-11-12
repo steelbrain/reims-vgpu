@@ -36,8 +36,13 @@
 //     alignment 4 and data type struct,
 //     of no struct type, used where the function reads an attribute it holds, and no argument
 //     (isArgument 0) where every other binding is one;
+//   - a post-tessellation vertex function's control points and patch inputs are no binding, its
+//     descriptor's buffers are unused whatever it reads of them, and its position in the patch
+//     and its patch's id are built-ins (types 14 and 13);
 //   - a vertex function's `postVertexDumpStride` is its outputs' size and 12 (the AMD GPU's; the
-//     Intel GPU's is 8 more than the outputs), a mesh pipeline's 0.
+//     Intel GPU's is 8 more than the outputs), and a post-tessellation vertex function's 12 more
+//     for a triangle patch and 8 for a quad, whether or not it takes its position in the patch; a
+//     mesh pipeline's 0.
 // The objects are Metal's own reflection classes, made through their initialisers, with the
 // instance variables those leave unset set by name, each class, initialiser and instance variable
 // looked up at run time: what is missing makes no reflection.
@@ -104,7 +109,7 @@ std::vector<RgfxDescriptorBuffer> RgfxStageInputBuffers(MTLStageInputOutputDescr
 struct RgfxStageReflection {
 	NSArray *_Nullable bindings = nil; // nil where there are none
 	NSArray *_Nullable builtIns = nil; // nil where there are none
-	uint64_t outputBytes = 0;          // a vertex function's outputs' size
+	uint64_t outputBytes = 0;          // a vertex function's outputs' size, its patch's position's
 	NSData *_Nullable pluginReturnData = nil; // a GL shader variant's (RgfxGLPluginReturnData)
 };
 

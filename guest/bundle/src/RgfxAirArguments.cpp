@@ -1905,10 +1905,41 @@ bool outputsOf(const Module &m, uint64_t id, std::vector<RgfxAirOutput> &out)
 	return true;
 }
 
+bool nodeKeys(const Module &m, uint64_t id, unsigned depth,
+              std::map<uint64_t, std::shared_ptr<const std::vector<RgfxAirMember>>> &layouts, RgfxAirNode &out);
+
 // The node `id` whole (RgfxAirArguments.hpp, "An entry point's nodes, whole"): false where an
-// operand is not of the form its key takes.
+// operand is not of the form its key takes, or it names no kind.
 bool wholeNode(const Module &m, uint64_t id, unsigned depth,
                std::map<uint64_t, std::shared_ptr<const std::vector<RgfxAirMember>>> &layouts, RgfxAirNode &out)
+{
+	return nodeKeys(m, id, depth, layouts, out) && !out.kind.empty();
+}
+
+// A post-tessellation vertex function's control points (`air.patch_control_point_input`, the
+// kind of `node`, whose operands from `at` are its control point function's node and its
+// attributes' nodes) into `out.controlPoints`: false where one is not of that form.
+bool controlPointsOf(const Module &m, const Module::Md &node, size_t at, unsigned depth,
+                     std::map<uint64_t, std::shared_ptr<const std::vector<RgfxAirMember>>> &layouts, RgfxAirNode &out)
+{
+	const Module::Md *function = at < node.ops.size() ? mdNode(m, node.ops[at]) : nullptr;
+	std::string tag;
+	if (function == nullptr || !mdText(m, *function, 0, tag) || tag != "air.patch_control_point_function")
+		return false;
+	for (size_t i = at + 1; i < node.ops.size(); i++) {
+		RgfxAirNode attribute;
+		if (!nodeKeys(m, node.ops[i], depth + 1, layouts, attribute) || !attribute.kind.empty() ||
+		    attribute.hasPosition || !attribute.hasLocation)
+			return false;
+		out.controlPoints.push_back(std::move(attribute));
+	}
+	return true;
+}
+
+// The keys of the node `id` into `out` (wholeNode), which may name no kind: false where an operand
+// is not of the form its key takes.
+bool nodeKeys(const Module &m, uint64_t id, unsigned depth,
+              std::map<uint64_t, std::shared_ptr<const std::vector<RgfxAirMember>>> &layouts, RgfxAirNode &out)
 {
 	const Module::Md *node = mdNode(m, id);
 	if (node == nullptr || depth > 8)
@@ -1999,6 +2030,10 @@ bool wholeNode(const Module &m, uint64_t id, unsigned depth,
 				return false;
 			out.hasRenderTarget = true;
 			i += 1;
+		} else if (k == "air.patch_control_point_input" && out.kind.empty()) {
+			// Its control point function's node and its attributes' nodes, every operand left.
+			out.kind = k;
+			return controlPointsOf(m, *node, i + 1, depth, layouts, out);
 		} else if (out.kind.empty()) {
 			out.kind = k;
 		} else {
@@ -2007,7 +2042,7 @@ bool wholeNode(const Module &m, uint64_t id, unsigned depth,
 			continue;
 		}
 	}
-	return !out.kind.empty();
+	return true;
 }
 
 bool readLayout(const Module &m, uint64_t id, unsigned depth,
@@ -2921,6 +2956,13 @@ bool entryOf(const Module &m, uint64_t id,
 	for (size_t k = 3; k < entry->ops.size(); k++) {
 		const Module::Md *extra = mdNode(m, entry->ops[k]);
 		std::string key;
+		if (extra != nullptr && mdText(m, *extra, 0, key) && key == "air.patch") {
+			std::string type;
+			if (extra->ops.size() < 2 || !mdText(m, *extra, 1, type) || (type != "triangle" && type != "quad"))
+				return false;
+			out.patch = type == "quad" ? RgfxAirPatch::Quad : RgfxAirPatch::Triangle;
+			continue;
+		}
 		if (extra == nullptr || !mdText(m, *extra, 0, key) || key != "air.work_group_size")
 			continue;
 		if (extra->ops.size() != 4 || !mdUnsigned(m, *extra, 1, out.workGroupSize[0]) ||
