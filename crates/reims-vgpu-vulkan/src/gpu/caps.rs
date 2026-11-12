@@ -408,8 +408,11 @@ fn gpu_core_count(name: &str, reported: Option<u32>, registry_id: u64) -> Option
 }
 
 /// Metal's `minimumLinearTextureAlignmentForPixelFormat:` on an Apple GPU, the M3 Max's and the
-/// M4's, for every pixel format a buffer backs: a stand-in (the module's table).
-const METAL_LINEAR_ALIGNMENT: u64 = 16;
+/// M4's, for every pixel format a buffer backs: a stand-in (the module's table). It is also the
+/// alignment the runtime holds a texture's rows over a buffer or a plane of an IOSurface without
+/// planes to, as Metal does (`BufferTextureProblem::RowPitchAlignment`), which a device cache laid
+/// out at the GPU's pitch has its rows meet (`GpuDevice::linear_rows_pitch`).
+pub(crate) const METAL_LINEAR_ALIGNMENT: u64 = 16;
 
 /// `minimumLinearTextureAlignmentForPixelFormat:` of `pf` as this platform answers it, a stand-in
 /// (the module's table): [`METAL_LINEAR_ALIGNMENT`] for each format the runtime's query answers,

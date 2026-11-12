@@ -1388,8 +1388,15 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// samples (`rt::Device::linear_texture_bytes_per_row`, the driver's `rowPitch` of its linear
     /// image), asked of one format of each texel size a buffer backs that divides `row_bytes`
     /// (`R8Unorm`, `RG8Unorm`, `BGRA8Unorm`, `RGBA16Float` and `RGBA32Float`), `row_bytes` over
-    /// it wide and `rows` high: the answer where those that answer agree. Each pair is asked once
-    /// a device: a new answer makes and releases an image of each such format.
+    /// it wide and `rows` high: the answer where those that answer agree and it is a multiple of
+    /// Metal's 16-byte linear alignment ([`caps::METAL_LINEAR_ALIGNMENT`]), at which alone the
+    /// runtime makes a texture over a buffer or over a plane of an IOSurface without planes, as
+    /// Metal does (`BufferTextureProblem::RowPitchAlignment`). ANV's linear images lay rows of
+    /// 280 bytes (70 `BGRA8Unorm` texels) side by side (**measured** 2026-11-12, Iris Xe, Mesa
+    /// 26.2.6), and textures over device caches laid out at such pitches (292 and 280 bytes) were
+    /// refused, hundreds a boot, where the surfaces' own rows, at multiples of 64, were made
+    /// (macOS 14.8.9 and 26.7.2 guests on Iris Xe). Each pair is asked once a device: a new
+    /// answer makes and releases an image of each such format.
     fn linear_rows_pitch(&self, row_bytes: u64, rows: u64) -> Option<u64> {
         use metal2vulkan::metal::PixelFormat as Pf;
         /// The answers a device keeps; past them they are asked again.
@@ -1418,7 +1425,9 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                     .flatten()
             });
         let first = answers.next();
-        let answer = first.filter(|&pitch| answers.all(|other| other == pitch));
+        let answer = first
+            .filter(|&pitch| answers.all(|other| other == pitch))
+            .filter(|pitch| pitch.is_multiple_of(caps::METAL_LINEAR_ALIGNMENT));
         let mut kept = self.rows_pitches.lock();
         if kept.len() >= KEPT {
             kept.clear();
@@ -2962,7 +2971,11 @@ pub(crate) mod tests {
     /// do. It lies over the padding as unobserved only where the pitch passes the row: a device
     /// whose images lay such rows side by side (MoltenVK's on an M3 Max and ANV's on Iris Xe lay
     /// the 704-byte rows so, measured) lays the texture over the buffer as it is. Asked again it answers the same. A device whose
-    /// formats' images lay such rows apart otherwise answers none, and promises nothing
+    /// formats' images lay such rows apart otherwise answers none, and promises nothing. Nor does
+    /// one whose images lay them at a pitch off Metal's 16-byte linear alignment, at which the
+    /// runtime makes no texture over a buffer: ANV's lay the rows of 70 `BGRA8Unorm` texels (280
+    /// bytes) side by side (measured), and 73 (292 bytes) was the pitch of the device caches whose
+    /// textures a macOS 14.8.9 guest's login had refused on Iris Xe
     #[test]
     fn a_texture_at_the_device_s_pitch_of_a_plane_s_rows_lies_over_its_memory() {
         use crate::core::platform::Platform as _;
@@ -2980,13 +2993,19 @@ pub(crate) mod tests {
             let counts = d.raw.work_counts();
             (counts.unobserved_padding_aliases, counts.shadowed_textures)
         };
-        for (pixel_format, texel) in [(115u64, 8u64), (80, 4)] {
-            let (width, height) = (88, 8);
+        for (pixel_format, texel, width) in
+            [(115u64, 8u64, 88u64), (80, 4, 88), (80, 4, 70), (80, 4, 73)]
+        {
+            let height = 8;
             let row = width * texel;
             let Some(pitch) = d.linear_rows_pitch(row, height) else {
                 continue;
             };
             assert!(pitch >= row, "{pitch} for {row}");
+            assert!(
+                pitch.is_multiple_of(caps::METAL_LINEAR_ALIGNMENT),
+                "{pitch} for {row}: off Metal's linear alignment"
+            );
             assert_eq!(d.linear_rows_pitch(row, height), Some(pitch), "asked again");
             for (size, pf) in [
                 (1, Pf::R8Unorm),

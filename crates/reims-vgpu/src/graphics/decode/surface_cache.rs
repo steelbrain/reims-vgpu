@@ -112,10 +112,12 @@
 //! - **Laid out at the GPU's pitch.** Where the kext gives the surface's layout ([`CacheLayout`])
 //!   and a plane's rows lie at another pitch than the device's own linear images lay rows of
 //!   their bytes ([`GpuDevice::linear_rows_pitch`]: RADV's at multiples of 256 bytes, where
-//!   CoreAnimation names its backing stores' rows at multiples of 64), the cache lays each
-//!   plane's rows out at the device's pitch ([`Repitched`]): the first plane from the cache's
-//!   first byte, each next on a 4 KiB boundary past the last's rows. A texture over a plane lies
-//!   at the same byte of the same row of the plane in the cache, at the cache's pitch
+//!   CoreAnimation names its backing stores' rows at multiples of 64; the device answers no
+//!   pitch off Metal's 16-byte linear alignment, at which no texture over a buffer is made, as
+//!   ANV's for rows of 70 `BGRA8` texels), the cache lays each plane's rows out at the device's
+//!   pitch ([`Repitched`]): the first plane from the cache's first byte, each next on a 4 KiB
+//!   boundary past the last's rows. A texture over a plane lies at the same byte of the same row
+//!   of the plane in the cache, at the cache's pitch
 //!   (`decode::laid_plane`), so it is the device's image over the cache's memory, not the
 //!   runtime's copy of its own (metal2vulkan's shadow, which each command buffer copies in before
 //!   its use: a texture over a cache in the pages' layout at another pitch than the GPU's is
