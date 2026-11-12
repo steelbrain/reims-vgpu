@@ -13,6 +13,7 @@
 #import <Metal/Metal.h>
 #import <objc/message.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -337,6 +338,109 @@ void test_inline_bytes()
 	CHECK(std::memcmp(fx.regionAt(chunk4.region_offset, 0), big.data(), big.size()) == 0);
 	fx.complete(cb2, seqno2);
 	fx.complete(cb3, seqno3);
+	} // @autoreleasepool
+}
+
+// A parallel pass's sub-encoders put inline bytes from threads of their own at once, each into a
+// run of a chunk of its own: every binding holds its own bytes, at a place no other binding has,
+// in its sub-encoder's order; and the encoder after the pass fills on in a run one of them
+// handed back as it ended.
+void test_inline_bytes_parallel()
+{
+	QueueFixture fx;
+	// Drained while fx lives: what the test lets go (a command buffer, the queue it holds)
+	// posts its destroy through fx.
+	@autoreleasepool {
+	RgfxTexture *target = shapeTexture(
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:64
+	                                                      height:64
+	                                                   mipmapped:NO],
+	    0x42);
+	constexpr uint32_t kSubs = 4, kPuts = 40;
+	auto put = [](id<MTLRenderCommandEncoder> sub, uint32_t i, uint32_t j) {
+		const uint32_t v[4] = {i, j, 0x5eed0000u + i, ~j};
+		[sub setVertexBytes:v length:sizeof(v) atIndex:0];
+	};
+	id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
+	id<MTLParallelRenderCommandEncoder> par =
+	    [cb parallelRenderCommandEncoderWithDescriptor:onePass(target)];
+	std::vector<id<MTLRenderCommandEncoder>> subs;
+	// Each sub-encoder's first put here, so each holds a run before any hands one back.
+	for (uint32_t i = 0; i < kSubs; i++) {
+		subs.push_back([par renderCommandEncoder]);
+		put(subs[i], i, 0);
+	}
+	std::vector<std::thread> threads;
+	for (uint32_t i = 0; i < kSubs; i++) {
+		id<MTLRenderCommandEncoder> sub = subs[i];
+		threads.emplace_back([sub, i, put] {
+			@autoreleasepool {
+				for (uint32_t j = 1; j < kPuts; j++)
+					put(sub, i, j);
+				[sub endEncoding];
+			}
+		});
+	}
+	for (std::thread &t : threads)
+		t.join();
+	[par endEncoding];
+	id<MTLComputeCommandEncoder> cenc = [cb computeCommandEncoder];
+	const uint32_t last[4] = {9, 8, 7, 6};
+	[cenc setBytes:last length:sizeof(last) atIndex:0];
+	[cenc endEncoding];
+
+	// One chunk a sub-encoder, and none for the compute encoder.
+	std::vector<RgfxBufferOverHostMemory> chunks;
+	for (uint32_t i = 0; i < kSubs; i++)
+		chunks.push_back(
+		    expectMessage<RgfxBufferOverHostMemory>(fx.control, RGFX_CMD_BUFFER_OVER_HOST_MEMORY));
+	RgfxMsgHeader none = {};
+	std::vector<uint8_t> noneBytes;
+	CHECK(!fx.control.next(&none, &noneBytes));
+	auto chunkOf = [&](uint64_t objId) -> const RgfxBufferOverHostMemory * {
+		for (const RgfxBufferOverHostMemory &c : chunks) {
+			if (c.obj_id == objId)
+				return &c;
+		}
+		return nullptr;
+	};
+
+	[cb commit];
+	uint64_t seqno = 0;
+	std::vector<Op> ops = fx.nextOps(&seqno);
+	std::vector<std::pair<uint64_t, uint64_t>> places;
+	std::vector<uint32_t> next(kSubs, 0);
+	for (const Op &op : ops) {
+		if (op.tag != RGFX_OP_RENDER_SET_VERTEX_BUFFER)
+			continue;
+		auto vb = op.as<RgfxOpSetVertexBuffer>();
+		const RgfxBufferOverHostMemory *c = chunkOf(vb.buffer_obj_id);
+		CHECK(c != nullptr && vb.index == 0 && vb.offset % 256 == 0);
+		if (c == nullptr)
+			continue;
+		const std::pair<uint64_t, uint64_t> place(vb.buffer_obj_id, vb.offset);
+		CHECK(std::find(places.begin(), places.end(), place) == places.end());
+		places.push_back(place);
+		uint32_t v[4];
+		std::memcpy(v, fx.regionAt(c->region_offset, vb.offset), sizeof(v));
+		CHECK(v[0] < kSubs);
+		if (v[0] >= kSubs)
+			continue;
+		CHECK(v[1] == next[v[0]] && v[2] == 0x5eed0000u + v[0] && v[3] == ~v[1]);
+		next[v[0]]++;
+	}
+	for (uint32_t i = 0; i < kSubs; i++)
+		CHECK(next[i] == kPuts);
+	// The compute encoder's bytes follow a sub-encoder's last, in its chunk.
+	const Op *cs = findOp(ops, RGFX_OP_COMPUTE_SET_BUFFERS);
+	CHECK(cs != nullptr);
+	auto cse = cs->elem<RgfxComputeOpSetBuffers, RgfxComputeBufferBinding>(0);
+	const RgfxBufferOverHostMemory *cc = chunkOf(cse.buffer_obj_id);
+	CHECK(cc != nullptr && cse.offset == kPuts * 256);
+	if (cc != nullptr)
+		CHECK(std::memcmp(fx.regionAt(cc->region_offset, cse.offset), last, sizeof(last)) == 0);
+	fx.complete(cb, seqno);
 	} // @autoreleasepool
 }
 
@@ -2636,6 +2740,7 @@ void test_surface_texture_alloc_sizes()
 void rgfxProtocolTests()
 {
 	test_inline_bytes();
+	test_inline_bytes_parallel();
 	test_inline_bytes_without_region();
 	test_render_barriers();
 	test_compute_dispatch_type();

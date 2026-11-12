@@ -186,35 +186,62 @@ RgfxUploadArena::~RgfxUploadArena()
 	giveBack();
 }
 
-bool RgfxUploadArena::put(const void *bytes, uint64_t length,
-                          __unsafe_unretained id<MTLBuffer> *buffer, uint64_t *offset)
+bool RgfxUploadArena::refill(RgfxUploadCursor &cursor, const void *bytes, uint64_t length,
+                             __unsafe_unretained id<MTLBuffer> *buffer, uint64_t *offset)
 {
 	if (m_pool == nullptr) {
 		m_failed.store(true, std::memory_order_release);
 		return false;
 	}
 	os_unfair_lock_lock(&m_lock);
-	uint64_t at = alignUp(m_cursor, kUploadAlign);
-	if (m_chunks.empty() || at + length > m_chunks.back().size) {
+	const uint64_t generation = m_generation.load(std::memory_order_relaxed);
+	// An encoder's first put, or one whose run went with a giveBack, fills on in the spare run;
+	// a run that is full is left, as a chunk too full for the bytes always was.
+	if (cursor.bytes == nullptr || cursor.generation != generation) {
+		cursor = m_spare;
+		m_spare = {};
+	}
+	uint64_t at = alignUp(cursor.at);
+	if (cursor.bytes == nullptr || at > cursor.size || length > cursor.size - at) {
 		RgfxUploadChunk chunk = {};
 		// Rare: a chunk a 64 KiB of bytes, from the pool, which may make one.
 		if (!m_pool->take(length == 0 ? 1 : length, &chunk)) {
+			cursor = {};
 			os_unfair_lock_unlock(&m_lock);
 			m_failed.store(true, std::memory_order_release);
 			return false;
 		}
 		m_chunks.push_back(chunk);
+		cursor.buffer = chunk.buffer;
+		cursor.bytes = chunk.bytes;
+		cursor.size = chunk.size;
+		cursor.generation = generation;
 		at = 0;
 	}
-	RgfxUploadChunk &c = m_chunks.back();
-	if (length > 0 && bytes != nullptr) {
-		std::memcpy(c.bytes + at, bytes, static_cast<size_t>(length));
-	}
-	m_cursor = at + length;
-	*buffer = c.buffer;
-	*offset = at;
 	os_unfair_lock_unlock(&m_lock);
+	if (length > 0 && bytes != nullptr) {
+		std::memcpy(cursor.bytes + at, bytes, static_cast<size_t>(length));
+	}
+	cursor.at = at + length;
+	*buffer = cursor.buffer;
+	*offset = at;
 	return true;
+}
+
+void RgfxUploadArena::release(RgfxUploadCursor &cursor)
+{
+	if (cursor.bytes == nullptr)
+		return;
+	auto room = [](const RgfxUploadCursor &c) {
+		const uint64_t at = alignUp(c.at);
+		return at < c.size ? c.size - at : 0;
+	};
+	os_unfair_lock_lock(&m_lock);
+	if (cursor.generation == m_generation.load(std::memory_order_relaxed) &&
+	    (m_spare.bytes == nullptr || room(cursor) > room(m_spare)))
+		m_spare = cursor;
+	os_unfair_lock_unlock(&m_lock);
+	cursor = {};
 }
 
 void RgfxUploadArena::giveBack()
@@ -222,7 +249,8 @@ void RgfxUploadArena::giveBack()
 	std::vector<RgfxUploadChunk> chunks;
 	os_unfair_lock_lock(&m_lock);
 	chunks.swap(m_chunks);
-	m_cursor = 0;
+	m_spare = {};
+	m_generation.fetch_add(1, std::memory_order_relaxed);
 	os_unfair_lock_unlock(&m_lock);
 	if (m_pool != nullptr && !chunks.empty()) {
 		m_pool->giveBack(chunks);

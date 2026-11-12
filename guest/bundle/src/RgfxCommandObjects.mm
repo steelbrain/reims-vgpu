@@ -128,10 +128,10 @@ std::atomic<uint64_t> g_bytesDropped{0};
 /// chunks (RgfxUploads.h), answering the buffer and offset they lie at to bind; false, said in
 /// the log, where no chunk could be had (the region has no room): the binding is not made, and
 /// the command buffer fails with MTLCommandBufferErrorOutOfMemory when it completes.
-bool rgfxPutBytes(RgfxUploadArena *uploads, const void *bytes, NSUInteger length,
-                  __unsafe_unretained id<MTLBuffer> *buffer, uint64_t *offset)
+bool rgfxPutBytes(RgfxUploadArena *uploads, RgfxUploadCursor &cursor, const void *bytes,
+                  NSUInteger length, __unsafe_unretained id<MTLBuffer> *buffer, uint64_t *offset)
 {
-	if (uploads != nullptr && uploads->put(bytes, length, buffer, offset)) {
+	if (uploads != nullptr && uploads->put(cursor, bytes, length, buffer, offset)) {
 		return true;
 	}
 	uint64_t n = 0;
@@ -3470,6 +3470,7 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	uint64_t _traceId;
 	NSString *_encLabel;
 	std::shared_ptr<RgfxUploadArena> _uploads; // the command buffer's, for inline bytes
+	RgfxUploadCursor _uploadCursor;              // the run of it this encoder fills
 	NSUInteger _tileWidth, _tileHeight;          // the pass descriptor's tile size
 	RgfxBarrierSlot _barrier;                    // its queue barrier fence (QUEUE BARRIERS)
 	BOOL _barrierWaited;                         // a barrier has waited for the earlier encoders
@@ -3600,6 +3601,9 @@ RGFX_LOG_UNRECOGNIZED
 	_fragmentSurfaces.clear();
 	_objectSurfaces.clear();
 	_meshSurfaces.clear();
+	// What is left of its run of the inline bytes' chunk, for the buffer's next encoder.
+	if (_uploads != nullptr)
+		_uploads->release(_uploadCursor);
 	// Last: the buffer may go with it, and its RgfxEncoder with it.
 	_commandBufferHold = nil;
 }
@@ -4329,7 +4333,7 @@ RGFX_LOG_UNRECOGNIZED
 {
 	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
-	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+	if (rgfxPutBytes(_uploads.get(), _uploadCursor, bytes, length, &buffer, &offset))
 		_enc->renderSetVertexBuffer(rgfxBinds(_enc, buffer), offset, index);
 }
 - (void)setVertexBytes:(const void *)bytes
@@ -4339,21 +4343,21 @@ RGFX_LOG_UNRECOGNIZED
 {
 	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
-	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+	if (rgfxPutBytes(_uploads.get(), _uploadCursor, bytes, length, &buffer, &offset))
 		[self setVertexBuffer:buffer offset:offset attributeStride:stride atIndex:index];
 }
 - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
 	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
-	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+	if (rgfxPutBytes(_uploads.get(), _uploadCursor, bytes, length, &buffer, &offset))
 		_enc->renderSetFragmentBuffer(rgfxBinds(_enc, buffer), offset, index);
 }
 - (void)setTileBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
 	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
-	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+	if (rgfxPutBytes(_uploads.get(), _uploadCursor, bytes, length, &buffer, &offset))
 		[self setTileBuffer:buffer offset:offset atIndex:index];
 }
 
@@ -4548,7 +4552,7 @@ RGFX_LOG_UNRECOGNIZED
 	}
 	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
-	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+	if (rgfxPutBytes(_uploads.get(), _uploadCursor, bytes, length, &buffer, &offset))
 		[self setObjectBuffer:buffer offset:offset atIndex:index];
 }
 - (void)setObjectSamplerState:(nullable id<MTLSamplerState>)sampler atIndex:(NSUInteger)index
@@ -4685,7 +4689,7 @@ RGFX_LOG_UNRECOGNIZED
 	}
 	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
-	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+	if (rgfxPutBytes(_uploads.get(), _uploadCursor, bytes, length, &buffer, &offset))
 		[self setMeshBuffer:buffer offset:offset atIndex:index];
 }
 - (void)setMeshSamplerState:(nullable id<MTLSamplerState>)sampler atIndex:(NSUInteger)index
@@ -5124,6 +5128,7 @@ RGFX_LOG_UNRECOGNIZED
 	uint64_t _traceId;
 	NSString *_encLabel;
 	std::shared_ptr<RgfxUploadArena> _uploads; // the command buffer's, for inline bytes
+	RgfxUploadCursor _uploadCursor;             // the run of it this encoder fills
 	MTLDispatchType _dispatchType;              // the pass's; Serial, Metal's default, unless set
 	RgfxBarrierSlot _barrier;                   // its queue barrier fence (QUEUE BARRIERS)
 	BOOL _barrierWaited;
@@ -5216,6 +5221,9 @@ RGFX_LOG_UNRECOGNIZED
 		_enc->computeUpdateFence(_barrier.fences[_barrier.slot]);
 	_enc->endEncoder();
 	_surfaces.clear();
+	// What is left of its run of the inline bytes' chunk, for the buffer's next encoder.
+	if (_uploads != nullptr)
+		_uploads->release(_uploadCursor);
 	// Last: the buffer may go with it, and its RgfxEncoder with it.
 	_commandBufferHold = nil;
 }
@@ -5467,7 +5475,7 @@ RGFX_LOG_UNRECOGNIZED
 {
 	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
-	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+	if (rgfxPutBytes(_uploads.get(), _uploadCursor, bytes, length, &buffer, &offset))
 		[self setBuffer:buffer offset:offset atIndex:index];
 }
 - (void)setBytes:(const void *)bytes
@@ -5477,7 +5485,7 @@ RGFX_LOG_UNRECOGNIZED
 {
 	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
-	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+	if (rgfxPutBytes(_uploads.get(), _uploadCursor, bytes, length, &buffer, &offset))
 		[self setBuffer:buffer offset:offset attributeStride:stride atIndex:index];
 }
 
