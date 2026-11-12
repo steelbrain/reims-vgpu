@@ -245,6 +245,19 @@ impl ImportView {
         false
     }
 
+    /// The word that the runtime's import was made: nothing on macOS, where no view of the bytes
+    /// is folded.
+    pub(crate) fn made(&self) -> ImportMade {
+        ImportMade
+    }
+
+    /// Another import of the same memory while the view lives: nothing on macOS ([`made`]).
+    ///
+    /// [`made`]: ImportView::made
+    pub(crate) fn again(&self) -> ImportMade {
+        ImportMade
+    }
+
     /// The runtime's deallocator of the import, and what keeps the import's memory mapped beside
     /// the bytes themselves: `inner`, as it is, and nothing, as the runtime imports the bytes.
     pub(crate) fn release(
@@ -254,6 +267,15 @@ impl ImportView {
     ) -> (Option<rt::Deallocator>, Option<rt::KeepAlive>) {
         (inner, None)
     }
+}
+
+/// The word that an import was made ([`ImportView::made`]): nothing on macOS.
+#[derive(Debug)]
+pub(crate) struct ImportMade;
+
+impl ImportMade {
+    /// The runtime's call that imports the bytes on `device` returned: nothing on macOS.
+    pub(crate) fn made(self, _device: &rt::Device) {}
 }
 
 /// The memory the runtime imports for `length` bytes at `at`: those bytes ([`ImportView`]),

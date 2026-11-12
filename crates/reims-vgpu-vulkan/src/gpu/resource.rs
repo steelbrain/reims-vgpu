@@ -1303,8 +1303,12 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
         read_only: bool,
     ) -> RaiseResult<bool> {
         let length = plain(|| self.raw.length());
-        self.backing
-            .replace(&ranges.ranges, read_only, length, length, |first, keep| {
+        self.backing.replace(
+            &ranges.ranges,
+            read_only,
+            length,
+            length,
+            |first, keep, made| {
                 send(REPLACE, Policy::Dies, || {
                     // SAFETY: the alias is mapped and readable; a read-only one only the GPU
                     // writes, whose writes this host's GPU drops (`backing`'s docs), and any
@@ -1317,8 +1321,11 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
                             Some(keep),
                         )
                     }
-                })
-            })
+                })?;
+                made.made(self.raw.device());
+                Ok(())
+            },
+        )
     }
 
     /// The runtime's export of the buffer's memory (`export_memory_fd`): a buffer the runtime
@@ -2112,7 +2119,7 @@ impl Heap<VulkanPlatform> for VulkanHeap {
             read_only,
             self.descriptor_size,
             size,
-            |first, keep| {
+            |first, keep, made| {
                 send(REPLACE, Policy::Dies, || {
                     // SAFETY: as a buffer's, for the heap's size; the alias starts on a page,
                     // which is the runtime's import unit on this host.
@@ -2123,7 +2130,9 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                             Some(keep),
                         )
                     }
-                })
+                })?;
+                made.made(self.raw.device());
+                Ok(())
             },
         )
     }

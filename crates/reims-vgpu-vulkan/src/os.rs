@@ -44,9 +44,9 @@ pub(crate) use host_os::take_ram_devices;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use host_os::views_through_dma_bufs;
 pub(crate) use host_os::{
-    COPIES_READ_ONLY, Drawables, ImportView, TWINS_READ_ONLY, allocate_aliasable, allocate_zeros,
-    dma_buf_refusal, host_memory, host_memory_vouched, import_view, plane_shape, shown_at,
-    surface_memory_hold,
+    COPIES_READ_ONLY, Drawables, ImportMade, ImportView, TWINS_READ_ONLY, allocate_aliasable,
+    allocate_zeros, dma_buf_refusal, host_memory, host_memory_vouched, import_view, plane_shape,
+    shown_at, surface_memory_hold,
 };
 /// Copies by the GPU of planes another driver wrote into dma-bufs into a runtime buffer, on Linux
 /// (`os/linux/plane_copy.rs`).

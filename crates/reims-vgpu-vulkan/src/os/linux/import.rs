@@ -167,9 +167,19 @@ pub(crate) struct ImportView {
 /// The pages a device of the process may pin now: each live import's, of pages it takes as they
 /// are mapped from their files (a pointer's, NVIDIA's and i915's), by first byte and number, to
 /// their end, from before the import maps them from their files until the import is freed
-/// ([`Pinned`]). A fold of the views maps none of them through dma-bufs
-/// (`super::vm::fold_idle`): a device took them by their mappings.
-static PINNED: Mutex<BTreeMap<(u64, u64), u64>> = Mutex::new(BTreeMap::new());
+/// ([`Pinned`]), with how many of its imports are still being made. A fold of the views maps
+/// none of them through dma-bufs (`super::vm::fold_idle`): a device took them by their mappings.
+/// Where the devices keep what they pinned as the import was made ([`folds_after_import`]), a
+/// record none of whose imports is still being made is left out ([`pinned`]).
+static PINNED: Mutex<BTreeMap<(u64, u64), Record>> = Mutex::new(BTreeMap::new());
+
+/// One import's pages in [`PINNED`]: their end, and how many of its imports the runtime is still
+/// making ([`ImportMade`]).
+#[derive(Debug, Clone, Copy)]
+struct Record {
+    end: u64,
+    making: u32,
+}
 
 /// One import's pages in [`PINNED`], until it drops.
 #[derive(Debug)]
@@ -177,16 +187,17 @@ pub(crate) struct Pinned((u64, u64));
 
 impl Pinned {
     /// The pages of `first..end`, where a device of the process takes imported pages as they are
-    /// mapped from their files ([`imports_need_files`]); `None` where none does.
+    /// mapped from their files ([`imports_need_files`]); `None` where none does. Its import is
+    /// being made until its [`ImportMade`] says otherwise.
     fn new(first: u64, end: u64) -> Option<Pinned> {
         imports_need_files().then(|| Pinned::of(first, end))
     }
 
-    /// The pages of `first..end`, whatever the devices.
+    /// The pages of `first..end`, whatever the devices, being made.
     pub(super) fn of(first: u64, end: u64) -> Pinned {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let key = (first, NEXT.fetch_add(1, Ordering::Relaxed));
-        PINNED.lock().insert(key, end);
+        PINNED.lock().insert(key, Record { end, making: 1 });
         Pinned(key)
     }
 }
@@ -198,19 +209,64 @@ impl Drop for Pinned {
     }
 }
 
-/// How many records of [`PINNED`] have dropped, each freeing pages a fold may map through dma-bufs
-/// (`super::vm`'s `fold_short`).
+/// The word that an import of the pages a [`Pinned`] records was made, which a device that keeps
+/// what it pinned at the import lets a fold map through dma-bufs ([`folds_after_import`]): told
+/// by the caller once the runtime's call that imports them returned ([`ImportMade::made`]).
+/// Dropped untold, the record stays as one being made, which no fold maps.
+#[derive(Debug)]
+#[must_use = "an import never told made stays out of every fold"]
+pub(crate) struct ImportMade(Option<(u64, u64)>);
+
+impl ImportMade {
+    /// The runtime's call that imports the pages on `device` returned: where the device keeps an
+    /// import of a pointer it made until it frees it, rather than releasing it while idle and
+    /// importing the pointer again at the next use (`rt::Device::releases_idle_pointer_imports`,
+    /// which answers `false` for an import made before its check answered), the import is made,
+    /// and once none of the record's imports is being made, its pages may be folded.
+    pub(crate) fn made(self, device: &rt::Device) {
+        let Some(key) = self.0 else {
+            return;
+        };
+        if !folds_after_import(device) || device.releases_idle_pointer_imports() {
+            return;
+        }
+        made_now(key);
+    }
+
+    /// [`ImportMade::made`], as on a device that keeps what it pinned at the import.
+    #[cfg(test)]
+    fn made_here(self) {
+        if let Some(key) = self.0 {
+            made_now(key);
+        }
+    }
+}
+
+/// One import of the record `key` of [`PINNED`] made.
+fn made_now(key: (u64, u64)) {
+    if let Some(record) = PINNED.lock().get_mut(&key) {
+        record.making = record.making.saturating_sub(1);
+    }
+    // A fold may free more now ([`unpinned`]).
+    UNPINNED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// How many records of [`PINNED`] have dropped, or had an import made, each freeing pages a fold
+/// may map through dma-bufs (`super::vm`'s `fold_short`).
 static UNPINNED: AtomicU64 = AtomicU64::new(0);
 
-/// How many records of [`PINNED`] have dropped ([`UNPINNED`]).
+/// How many records of [`PINNED`] have dropped or had an import made ([`UNPINNED`]).
 pub(super) fn unpinned() -> u64 {
     UNPINNED.load(Ordering::Relaxed)
 }
 
-/// The pages devices may pin now ([`PINNED`]), in order, those that meet joined.
+/// The pages devices may pin now ([`PINNED`]), in order, those that meet joined: those of each
+/// record with an import still being made, or made on a device that does not keep what it pinned
+/// at the import ([`ImportMade::made`]).
 pub(super) fn pinned() -> Vec<std::ops::Range<u64>> {
     let mut ranges: Vec<std::ops::Range<u64>> = (PINNED.lock().iter())
-        .map(|(&(first, _), &end)| first..end)
+        .filter(|(_, record)| record.making > 0)
+        .map(|(&(first, _), record)| first..record.end)
         .collect();
     ranges.sort_by_key(|r| r.start);
     let mut joined: Vec<std::ops::Range<u64>> = Vec::with_capacity(ranges.len());
@@ -221,6 +277,27 @@ pub(super) fn pinned() -> Vec<std::ops::Range<u64>> {
         }
     }
     joined
+}
+
+/// The GPUs, by registry ID, whose imports of a pointer's pages a fold may map through dma-bufs
+/// once made ([`ImportMade::made`]), and those it may not: learned of the first device of each
+/// that is made once a device of the process needs imported pages mapped from their files
+/// ([`probe_fold`]). NVIDIA's driver pins the pages as it imports them and keeps those pages,
+/// whatever is mapped over their range later (measured, `tests/no_copy_remap_linux.rs`), so the
+/// view's own mappings, a mapping a run of scattered pages, may go once the import is made; a
+/// driver that gets the pages again from their mapping at a later use (i915's userptr, through
+/// its notifier) fails the probe, and its imports keep their views' mappings.
+static FOLDS: Mutex<Vec<(u64, bool)>> = Mutex::new(Vec::new());
+
+/// Whether a GPU of the process passed [`probe_fold`] ([`FOLDS`]).
+pub(super) fn folds_any() -> bool {
+    FOLDS.lock().iter().any(|&(_, folds)| folds)
+}
+
+/// Whether `device`'s GPU passed [`probe_fold`] ([`FOLDS`]).
+fn folds_after_import(device: &rt::Device) -> bool {
+    let id = device.registry_id();
+    FOLDS.lock().iter().any(|&(at, folds)| at == id && folds)
 }
 
 /// Whether a device of the process imports by pointer only pages mapped from their files: learned
@@ -337,100 +414,491 @@ fn addr_of(at: NonNull<u8>) -> u64 {
 }
 
 /// Learns whether `device` imports a view mapped through dma-bufs as it is mapped, as the
-/// platform's imports hand the runtime a view ([`host_memory`]): a no-copy buffer over a view of
-/// pages backwards, one more than udmabuf takes in one dma-buf, so two, made as an import is,
-/// placed outside the guest's numbering and released at once, its pages unmapped once the runtime
-/// freed its import ([`ProbePages`]). Where the device does not take it
-/// through the dma-bufs its source makes, views are mapped from their files from then on
-/// ([`IMPORTS_NEED_FILES`]): where it refuses it, or makes a copy of the view in its place as
-/// its import failed (the runtime's `copied-host-pages`, which the probe's call hears unheard,
-/// `crate::answer::unheard`), and where it takes the view's pointer, as no
-/// driver pins a `VM_PFNMAP` mapping's pages and one that pins them at the GPU's first use of
-/// them, not at the import (as i915's userptr does without `I915_USERPTR_PROBE`, not measured
-/// here), would fail there. A device
-/// imports such a view by its dma-bufs where it imports none by pointer (RADV), and refuses it
-/// where it pins the pointer's pages and imports no foreign dma-buf (NVIDIA's 615 driver, measured
-/// 2026-10-27, `super::vm`'s module docs, "Imports of views"). Either way the device is handed
-/// the guest's RAM then (`super::host_ram`). Nothing is learned where the view is not mapped
-/// through dma-bufs (udmabuf not the process's): no import then needs it, and the device takes no
-/// RAM.
+/// platform's imports hand the runtime a view ([`host_memory`]): a probe of a view of one page
+/// more than udmabuf takes in one dma-buf, so two ([`probe_view`]). Where the device does not take
+/// it through the dma-bufs its source makes, views are mapped from their files from then on
+/// ([`IMPORTS_NEED_FILES`]): where it refuses it, or makes a copy of the view in its place as its
+/// import failed, and where it takes the view's pointer, as no driver pins a `VM_PFNMAP`
+/// mapping's pages and one that pins them at the GPU's first use of them, not at the import (as
+/// i915's userptr does without `I915_USERPTR_PROBE`, not measured here), would fail there. A
+/// device imports such a view by its dma-bufs where it imports none by pointer (RADV), and
+/// refuses it where it pins the pointer's pages and imports no foreign dma-buf under a sparse
+/// buffer (NVIDIA's 615 driver, measured 2026-10-27, `super::vm`'s module docs, "Imports of
+/// views"). Either way the device is handed the guest's RAM then
+/// (`super::host_ram`). Nothing is learned where the view is not mapped through dma-bufs (udmabuf
+/// not the process's): no import then needs it, and the device takes no RAM.
 pub(crate) fn learn_view_imports(device: &rt::Device) {
-    use crate::core::platform::os::vm::HostVm as _;
     if IMPORTS_NEED_FILES.load(Ordering::Relaxed) {
+        learn_folds(device);
         return;
     }
-    let vm = super::LinuxVm::new();
-    let page = vm::page_size();
-    let count = super::dma_buf::limits()
-        .pieces
-        .saturating_add(1)
-        .min(1 << 16);
-    let length = count * page;
-    let (Ok(src), Ok(view)) = (vm::allocate_aliasable(length), vm.allocate_anywhere(length)) else {
+    let limits = super::dma_buf::limits();
+    let Some((refused, through_dma_bufs)) =
+        probe_view(device, limits.pieces.saturating_add(1).min(1 << 16))
+    else {
         return;
     };
-    // Unmapped as they drop: once the runtime freed the probe's import, where it makes one.
-    let probe = ProbePages {
+    let why = dma_buf_refusal();
+    let name = &device.properties().name;
+    log::info!(
+        target: "reims_vgpu_vulkan::os",
+        "{name}: an import of a view of guest pages mapped through dma-bufs {}",
+        match (refused, through_dma_bufs) {
+            (true, _) => {
+                "is refused, or copied as its import failed, so views are mapped from their files"
+            }
+            (false, false) => {
+                "is taken by its pointer, which a driver pinning the pages at the GPU's first use \
+                 of them would fail then, so views are mapped from their files"
+            }
+            (false, true) => "is taken through its dma-bufs",
+        }
+    );
+    if let Some(why) = why {
+        log::debug!(target: "reims_vgpu_vulkan::os", "the view's dma-buf source: {why}");
+    }
+    if !through_dma_bufs {
+        IMPORTS_NEED_FILES.store(true, Ordering::Relaxed);
+        learn_folds(device);
+        budget::warn_if_imports_short();
+    }
+    // Either way the device copies by runs of the guest's RAM: one whose views are mapped from
+    // their files takes objects over the RAM too (`super::host_ram`).
+    super::host_ram::hand_ram_to(device);
+}
+
+/// How long the last of [`learn_folds`]' answers took, a kept verdict's read or the probe, in
+/// nanoseconds: what it added to its device's making.
+static PROBE_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// Learns of `device`'s GPU, once, whether a fold may map the pages of its imports of a pointer
+/// through dma-bufs once they are made ([`FOLDS`]), where a device of the process needs imported
+/// pages mapped from their files: from the verdict kept for the GPU's driver and the kernel
+/// ([`kept_fold`]), else by the probe ([`probe_fold`]), about 20 ms of the device's making
+/// (measured on the Iris Xe of RPL-P, 2026-11-11, 17 to 26 ms over ten makings, against 2 to 3
+/// ms for the probe made again once the device is), whose answer is kept where it is the GPU's
+/// own ([`lasting`]).
+fn learn_folds(device: &rt::Device) {
+    if !imports_need_files() {
+        return;
+    }
+    let id = device.registry_id();
+    if FOLDS.lock().iter().any(|&(at, _)| at == id) {
+        return;
+    }
+    use crate::core::platform::os::Clock as _;
+    let clock = crate::os::OsClock::new();
+    let start = clock.now_mono();
+    let kept = fold_key(device).and_then(|(file, key)| {
+        let kept = kept_fold(&file, &key);
+        Some((file, key, kept))
+    });
+    let (answer, how) = match kept {
+        Some((_, _, Some(answer))) => (answer, "the verdict kept for its driver"),
+        kept => {
+            let answer = probe_fold(device).map_err(str::to_owned);
+            if let Some((file, key, _)) = kept
+                && answer.as_ref().err().is_none_or(|why| lasting(why))
+                && let Err(error) = keep_fold(&file, &key, &answer)
+            {
+                log::debug!(
+                    target: "reims_vgpu_vulkan::os",
+                    "the fold probe's verdict was not kept in {}: {error}",
+                    file.display()
+                );
+            }
+            (answer, "the probe")
+        }
+    };
+    let nanos = clock.now_mono().as_nanos().saturating_sub(start.as_nanos());
+    PROBE_NANOS.store(nanos, Ordering::Relaxed);
+    let took = nanos as f64 / 1e6;
+    let name = &device.properties().name;
+    match &answer {
+        Ok(()) => log::info!(
+            target: "reims_vgpu_vulkan::os",
+            "{name}: an import of a view of guest pages mapped from their files keeps its pages \
+             once the view is mapped through a dma-buf, so a made import's view is folded at the \
+             views' budget ({how}, {took:.1} ms)"
+        ),
+        Err(why) => log::info!(
+            target: "reims_vgpu_vulkan::os",
+            "{name}: a made import's view stays mapped from its files: {why} ({how}, {took:.1} \
+             ms)"
+        ),
+    }
+    let mut folds = FOLDS.lock();
+    if !folds.iter().any(|&(at, _)| at == id) {
+        folds.push((id, answer.is_ok()));
+    }
+}
+
+/// The first line of a kept fold verdict ([`keep_fold`]): its format, which a change to what
+/// [`probe_fold`] asks moves on.
+const FOLD_HEADER: &str = "reims-vgpu fold after import 1";
+
+/// Where `device`'s GPU's fold verdict is kept, `device-checks/fold-after-import-UUID` under the
+/// library's cache directory, and the key it is kept under: the GPU's UUID, its driver's version
+/// as the loader's probe read it (`crate::os`'s `seen_devices`), and the kernel's release, whose
+/// udmabuf and memory map the probe goes through. `None` where the cache directory, the GPU's
+/// driver version or the release is not known: the probe runs, and nothing is kept.
+fn fold_key(device: &rt::Device) -> Option<(std::path::PathBuf, String)> {
+    let uuid = device.properties().device_uuid;
+    let seen = (crate::os::seen_devices().iter()).find(|seen| seen.uuid == Some(uuid))?;
+    let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").ok()?;
+    let hex: String = uuid.iter().map(|b| format!("{b:02x}")).collect();
+    let file = crate::platform::cache_directory()?
+        .join("device-checks")
+        .join(format!("fold-after-import-{hex}"));
+    let key = format!(
+        "{hex} | driver {} | kernel {}",
+        seen.driver_version,
+        kernel.trim()
+    );
+    Some((file, key))
+}
+
+/// The fold verdict `file` keeps under `key` ([`keep_fold`]): `None` where it is missing,
+/// unreadable, of another format or another key.
+fn kept_fold(file: &std::path::Path, key: &str) -> Option<Result<(), String>> {
+    let text = std::fs::read_to_string(file).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != FOLD_HEADER || lines.next()?.strip_prefix("key ")? != key {
+        return None;
+    }
+    match lines.next()? {
+        "passed" => Some(Ok(())),
+        line => Some(Err(line.strip_prefix("failed ")?.to_owned())),
+    }
+}
+
+/// Keeps `answer` in `file` under `key`, through a file beside it renamed over it: three lines,
+/// [`FOLD_HEADER`], the key, and `passed` or `failed` and why.
+fn keep_fold(
+    file: &std::path::Path,
+    key: &str,
+    answer: &Result<(), String>,
+) -> std::io::Result<()> {
+    let verdict = match answer {
+        Ok(()) => "passed".to_owned(),
+        Err(why) => format!("failed {}", why.replace(['\n', '\r'], " ")),
+    };
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut beside = file.as_os_str().to_owned();
+    beside.push(format!(".{}", std::process::id()));
+    std::fs::write(&beside, format!("{FOLD_HEADER}\nkey {key}\n{verdict}\n"))?;
+    std::fs::rename(&beside, file)
+}
+
+/// Whether [`probe_fold`]'s refusal `why` is the GPU's own answer, which is kept for its driver
+/// ([`keep_fold`]): what the GPU read or wrote, or that its command buffer failed or did not
+/// complete, or that the runtime did not import the pages by their pointer; not the probe's want
+/// of memory, of a queue or of udmabuf, which the next device's making asks again.
+fn lasting(why: &str) -> bool {
+    why.starts_with("its GPU")
+        || why.starts_with("its command buffer")
+        || why == "its pages were not imported by their pointer"
+}
+
+/// [`learn_folds`]' probe of `device`: a no-copy buffer over a view of [`FOLD_PROBE_PAGES`] pages
+/// backwards, mapped from their files and made as an import is ([`import_view`]), placed outside
+/// the guest's numbering. First other pages of a file of their own are mapped over the view and
+/// the GPU copies the buffer out: a driver that pinned the pages at the import reads the old ones
+/// (NVIDIA's, `tests/no_copy_remap_linux.rs`), and one that gets them again from their mapping
+/// at a later use reads the new ones, which fails the probe there, before any fold, as its next
+/// use of a view folded into a dma-buf would fail where nothing pins a `VM_PFNMAP` mapping's
+/// pages (measured: on the Iris Xe of RPL-P, ANV over i915, Linux 7.3.1,
+/// 2026-11-11, lost the device on the probe's command buffer when the probe folded first). Then
+/// the view is mapped from its files again and folded into a dma-buf of its pages
+/// (`super::vm::fold_held`), as a fold maps it; bytes are written through the pages' own
+/// mapping, as QEMU writes the guest's RAM; and one command buffer copies the buffer out and
+/// fills its first half ([`FoldCheck`]). `Ok` where the runtime imported the pages by their
+/// pointer, the GPU read the old pages through the remap and the bytes written after the fold,
+/// and its fill shows through the pages' own mapping and through the folded view; else what
+/// failed. The buffer is released at once, its pages unmapped once the runtime freed its import
+/// ([`ProbePages`]).
+fn probe_fold(device: &rt::Device) -> Result<(), &'static str> {
+    use crate::core::platform::os::vm::HostVm as _;
+    let vm = super::LinuxVm::new();
+    let page = vm::page_size();
+    let length = FOLD_PROBE_PAGES * page;
+    let (Ok(src), Ok(view)) = (vm::allocate_aliasable(length), vm.allocate_anywhere(length)) else {
+        return Err("no memory for its pages");
+    };
+    let check = FoldCheck {
+        own: src.addr().to_u64(),
         view: view.addr().to_u64(),
-        src: src.addr().to_u64(),
+        pages: FOLD_PROBE_PAGES,
+        round: 0,
+    };
+    let end = check.view + length;
+    // Unmapped as they drop: once the runtime freed the probe's import, where it makes one.
+    let pages = ProbePages::new(check.view, check.own, length);
+    if vm.remap_runs_shared_overwrite(view, &check.runs()).is_err()
+        || !files::through_pieces(check.view, end).is_empty()
+    {
+        return Err("its view was not mapped from its files");
+    }
+    check.write();
+    let at = address(check.view).ok_or("its view has no address")?;
+    let import = import_view(at, length, false);
+    let imported_at = import.at();
+    let (_, kept) = import.release(at, None);
+    let imports = || device.work_counts().host_pointer_imports_made;
+    let before = imports();
+    // SAFETY: the view is mapped, read and write, until the runtime drops the keep-alive, which
+    // owns it and its pages' file, once it freed the import; the remap and the fold map other
+    // mappings over it in one call each, never leaving it unmapped.
+    let memory = unsafe { host_memory(imported_at) };
+    let contents = rt::BufferContents::NoCopy {
+        memory,
+        deallocator: None,
+        keep_alive: Some(crate::gpu::backing::keep_alive((pages, kept))),
+    };
+    let descriptor = rt::BufferDescriptor::new(length, rt::ResourceOptions::shared(), contents)
+        .with_placement(rt::AddressPlacement::Outside);
+    let buffer = crate::answer::unheard(|| device.new_buffer_with_descriptor(descriptor))
+        .map_err(|_| "its buffer was refused")?;
+    if imports() == before {
+        return Err("its pages were not imported by their pointer");
+    }
+    // First the one question no driver can fault on: other pages over the view, which have a
+    // file behind them and can be pinned as the old ones were. A driver that kept the pages it
+    // pinned at the import reads the old ones; one that gets them again from their mapping reads
+    // these, and is refused here, before the fold below, whose `VM_PFNMAP` mapping such a driver
+    // cannot get pages from (i915's userptr lost the device there when the fold came first).
+    let other = vm::allocate_aliasable(length).map_err(|_| "no memory for other pages")?;
+    let other = Unmapped {
+        at: other.addr().to_u64(),
         length,
     };
+    // SAFETY: the other pages' own mapping, read and write.
+    unsafe { std::ptr::write_bytes(vm::ptr(other.at).cast::<u8>(), 0xe5, length.to_usize()) };
+    let other_at = HostAddr::from_addr(other.at.to_usize());
+    if vm.remap_shared_overwrite(view, other_at, length).is_err() {
+        return Err("other pages were not mapped over its view");
+    }
+    let (out, copied) = check.run(device, &buffer, false)?;
+    if (0..FOLD_PROBE_PAGES).any(|j| FoldCheck::ends(copied, j) == [0xe5; 2]) {
+        return Err("its GPU read the pages mapped over the view since the import");
+    }
+    check.copied_in_view_order(copied)?;
+    drop((out, other));
+    if vm.remap_runs_shared_overwrite(view, &check.runs()).is_err() {
+        return Err("its view was not mapped from its files again");
+    }
+    if !vm::fold_held(check.view..end) {
+        return Err("its view was not mapped through a dma-buf");
+    }
+    let check = FoldCheck { round: 1, ..check };
+    check.write();
+    check.gpu(device, &buffer)
+}
+
+/// A mapping of the library's own, `length` bytes from `at`, unmapped as it drops.
+#[derive(Debug)]
+struct Unmapped {
+    at: u64,
+    length: u64,
+}
+
+impl Drop for Unmapped {
+    fn drop(&mut self) {
+        use crate::core::platform::os::vm::HostVm as _;
+        let at = HostAddr::from_addr(self.at.to_usize());
+        let _ = super::LinuxVm::new().deallocate(at, self.length);
+    }
+}
+
+/// The pages of [`probe_fold`]'s view.
+const FOLD_PROBE_PAGES: u64 = 64;
+
+/// What [`probe_fold`] checks of an import of a view whose pages were mapped through a dma-buf
+/// once it was made: a view at `view` of `pages` pages of the mapping at `own`, backwards (its
+/// `j`th page is the mapping's `pages - 1 - j`th), the probe's `round`.
+#[derive(Debug, Clone, Copy)]
+struct FoldCheck {
+    own: u64,
+    view: u64,
+    pages: u64,
+    round: u64,
+}
+
+impl FoldCheck {
+    /// The byte the GPU fills the first half of the view's pages with.
+    const FILL: u8 = 0xc3;
+
+    /// The byte written through the pages' own mapping into its `i`th page.
+    fn written(&self, i: u64) -> u8 {
+        ((i ^ self.round.wrapping_mul(31)) as u8) ^ 0x5a
+    }
+
+    /// The view's runs: the mapping's pages, backwards.
+    fn runs(&self) -> Vec<(HostAddr, u64)> {
+        let page = vm::page_size();
+        (0..self.pages)
+            .map(|i| {
+                let at = self.own + (self.pages - 1 - i) * page;
+                (HostAddr::from_addr(at.to_usize()), page)
+            })
+            .collect()
+    }
+
+    /// Writes [`FoldCheck::written`] through the pages' own mapping.
+    fn write(&self) {
+        let page = vm::page_size();
+        for i in 0..self.pages {
+            // SAFETY: the pages' own mapping, read and write while the check's buffer lives.
+            unsafe {
+                std::ptr::write_bytes(
+                    vm::ptr(self.own + i * page).cast::<u8>(),
+                    self.written(i),
+                    page.to_usize(),
+                );
+            }
+        }
+    }
+
+    /// The first and last bytes of the `j`th page at `first`.
+    fn ends(first: u64, j: u64) -> [u8; 2] {
+        let page = vm::page_size();
+        let at = first + j * page;
+        // SAFETY: the caller's pages, mapped while the check's buffer lives.
+        unsafe { [0, page - 1].map(|o| vm::ptr(at + o).cast::<u8>().read_volatile()) }
+    }
+
+    /// One command buffer on `device` that copies `buffer`, over the view, into a buffer of the
+    /// device's own, then fills the first half of `buffer` with [`FoldCheck::FILL`]; then whether
+    /// the copy holds what was written through the pages' own mapping, in the view's order, and
+    /// the fill shows through the pages' own mapping and through the view.
+    fn gpu(&self, device: &rt::Device, buffer: &rt::Buffer) -> Result<(), &'static str> {
+        self.gpu_seen(device, buffer, Some(self.view))
+    }
+
+    /// [`FoldCheck::gpu`], the view's bytes checked at `view_shows` where `Some`: other pages may
+    /// be mapped over the view since.
+    fn gpu_seen(
+        &self,
+        device: &rt::Device,
+        buffer: &rt::Buffer,
+        view_shows: Option<u64>,
+    ) -> Result<(), &'static str> {
+        let (_out, copied) = self.run(device, buffer, true)?;
+        self.copied_in_view_order(copied)?;
+        for j in 0..self.pages {
+            let source = self.pages - 1 - j;
+            let now = match j < self.pages / 2 {
+                true => Self::FILL,
+                false => self.written(source),
+            };
+            if Self::ends(self.own, source) != [now; 2]
+                || view_shows.is_some_and(|view| Self::ends(view, j) != [now; 2])
+            {
+                return Err("its GPU's fill did not show through the pages' mappings");
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the copy at `copied` holds what was written through the pages' own mapping, in
+    /// the view's order.
+    fn copied_in_view_order(&self, copied: u64) -> Result<(), &'static str> {
+        for j in 0..self.pages {
+            if Self::ends(copied, j) != [self.written(self.pages - 1 - j); 2] {
+                return Err(
+                    "its GPU did not read the bytes written through the pages' own mapping",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// One command buffer on `device` that copies `buffer` into a buffer of the device's own, and
+    /// where `fill`, then fills the first half of `buffer` with [`FoldCheck::FILL`], completed:
+    /// the device's buffer, and the address of its contents.
+    fn run(
+        &self,
+        device: &rt::Device,
+        buffer: &rt::Buffer,
+        fill: bool,
+    ) -> Result<(rt::Buffer, u64), &'static str> {
+        let length = self.pages * vm::page_size();
+        let descriptor = rt::BufferDescriptor::new(
+            length,
+            rt::ResourceOptions::shared(),
+            rt::BufferContents::Zero,
+        )
+        .with_placement(rt::AddressPlacement::Outside);
+        let out = crate::answer::unheard(|| device.new_buffer_with_descriptor(descriptor))
+            .map_err(|_| "no buffer of the device's own for its copy")?;
+        let queue = device.new_command_queue().map_err(|_| "no command queue")?;
+        let cb = queue.command_buffer().map_err(|_| "no command buffer")?;
+        let mut blit = cb.blit_command_encoder().map_err(|_| "no blit encoder")?;
+        blit.copy_from_buffer_to_buffer(buffer, 0, &out, 0, length)
+            .and_then(|()| match fill {
+                true => blit.fill_buffer(buffer, 0..length / 2, Self::FILL),
+                false => Ok(()),
+            })
+            .and_then(|()| blit.end_encoding())
+            .and_then(|()| cb.commit())
+            .map_err(|_| "its commands were refused")?;
+        if (cb.wait_until_completed_for(std::time::Duration::from_secs(10))).is_err() {
+            return Err("its command buffer did not complete within 10 s");
+        }
+        if cb.status() != rt::CommandBufferStatus::Completed {
+            return Err("its command buffer failed");
+        }
+        let copied = out.contents().ok_or("its copy has no contents")?;
+        let copied = copied.as_ptr().addr().to_u64();
+        Ok((out, copied))
+    }
+}
+
+/// [`learn_view_imports`]' probe of `device`: a no-copy buffer over a view of `count` pages
+/// backwards, mapped through dma-bufs, made as an import is, placed outside the guest's numbering
+/// and released at once, its pages unmapped once the runtime freed its import ([`ProbePages`]).
+/// Whether the device refused it, or made a copy of the view in its place as its import failed
+/// (the runtime's `copied-host-pages`, which the probe's call hears unheard,
+/// `crate::answer::unheard`), and whether it took it through the dma-bufs its source makes;
+/// `None` where the view is not mapped through dma-bufs.
+fn probe_view(device: &rt::Device, count: u64) -> Option<(bool, bool)> {
+    use crate::core::platform::os::vm::HostVm as _;
+    let vm = super::LinuxVm::new();
+    let page = vm::page_size();
+    let length = count * page;
+    let (Ok(src), Ok(view)) = (vm::allocate_aliasable(length), vm.allocate_anywhere(length)) else {
+        return None;
+    };
+    // Unmapped as they drop: once the runtime freed the probe's import, where it makes one.
+    let probe = ProbePages::new(view.addr().to_u64(), src.addr().to_u64(), length);
     let runs: Vec<_> = (0..count)
         .map(|i| (src.wrapping_add((count - 1 - i) * page), page))
         .collect();
     let first = view.addr().to_u64();
     let through = vm.remap_runs_shared_overwrite(view, &runs).is_ok()
         && !files::through_pieces(first, first + length).is_empty();
-    if through && let Some(at) = address(first) {
-        let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // SAFETY: the view is mapped, read and write, and stays so until the runtime drops the
-        // keep-alive, which owns it and its pages' file, once it freed the import.
-        let memory = unsafe { host_memory_noting(at, Some(Arc::clone(&asked))) };
-        let contents = rt::BufferContents::NoCopy {
-            memory,
-            deallocator: None,
-            keep_alive: Some(crate::gpu::backing::keep_alive(probe)),
-        };
-        let descriptor = rt::BufferDescriptor::new(length, rt::ResourceOptions::shared(), contents)
-            .with_placement(rt::AddressPlacement::Outside);
-        // A copy of the view in the import's place (`copied-host-pages`), as its import failed,
-        // is the device's refusal too: the probe's own, which no one hears of.
-        let copies = || device.work_counts().copied_host_buffers_made;
-        let before = copies();
-        let made = crate::answer::unheard(|| device.new_buffer_with_descriptor(descriptor));
-        let refused = made.is_err() || copies() > before;
-        drop(made);
-        let through_dma_bufs = !refused && asked.load(Ordering::Relaxed);
-        let why = dma_buf_refusal();
-        log::info!(
-            target: "reims_vgpu_vulkan::os",
-            "{}: an import of a view of guest pages mapped through dma-bufs {}",
-            device.properties().name,
-            match (refused, through_dma_bufs) {
-                (true, _) => {
-                    "is refused, or copied as its import failed, so views are mapped from their \
-                     files"
-                }
-                (false, false) => {
-                    "is taken by its pointer, which a driver pinning the pages at the GPU's first \
-                     use of them would fail then, so views are mapped from their files"
-                }
-                (false, true) => "is taken through its dma-bufs",
-            }
-        );
-        if let Some(why) = why {
-            log::debug!(target: "reims_vgpu_vulkan::os", "the view's dma-buf source: {why}");
-        }
-        if !through_dma_bufs {
-            IMPORTS_NEED_FILES.store(true, Ordering::Relaxed);
-            budget::warn_if_imports_short();
-        }
-        // Either way the device copies by runs of the guest's RAM: one whose views are mapped
-        // from their files takes objects over the RAM too (`super::host_ram`).
-        super::host_ram::hand_ram_to(device);
-    } else {
-        drop(probe);
-    }
+    let at = address(first).filter(|_| through)?;
+    let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // SAFETY: the view is mapped, read and write, and stays so until the runtime drops the
+    // keep-alive, which owns it and its pages' file, once it freed the import.
+    let memory = unsafe { host_memory_noting(at, Some(Arc::clone(&asked))) };
+    let contents = rt::BufferContents::NoCopy {
+        memory,
+        deallocator: None,
+        keep_alive: Some(crate::gpu::backing::keep_alive(probe)),
+    };
+    let descriptor = rt::BufferDescriptor::new(length, rt::ResourceOptions::shared(), contents)
+        .with_placement(rt::AddressPlacement::Outside);
+    // A copy of the view in the import's place (`copied-host-pages`), as its import failed, is
+    // the device's refusal too: the probe's own, which no one hears of.
+    let copies = || device.work_counts().copied_host_buffers_made;
+    let before = copies();
+    let made = crate::answer::unheard(|| device.new_buffer_with_descriptor(descriptor));
+    let refused = made.is_err() || copies() > before;
+    drop(made);
+    Some((refused, !refused && asked.load(Ordering::Relaxed)))
 }
 
 /// The pages of [`learn_view_imports`]' probe, its view and the file pages it shows, each
@@ -446,6 +914,14 @@ struct ProbePages {
     length: u64,
 }
 
+impl ProbePages {
+    fn new(view: u64, src: u64, length: u64) -> Self {
+        #[cfg(test)]
+        tests::PROBE_PAGES_LIVE.fetch_add(1, Ordering::Relaxed);
+        Self { view, src, length }
+    }
+}
+
 impl Drop for ProbePages {
     fn drop(&mut self) {
         use crate::core::platform::os::vm::HostVm as _;
@@ -453,6 +929,8 @@ impl Drop for ProbePages {
         for first in [self.view, self.src] {
             let _ = vm.deallocate(HostAddr::from_addr(first.to_usize()), self.length);
         }
+        #[cfg(test)]
+        tests::PROBE_PAGES_LIVE.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -509,6 +987,32 @@ impl ImportView {
     /// read-only, the runtime asks the kernel as before.
     pub(crate) fn vouched(&self) -> bool {
         self.vouched
+    }
+
+    /// The word that the runtime's import of the memory was made ([`ImportMade`]), which the
+    /// caller gives once the runtime's call that imports it returned.
+    pub(crate) fn made(&self) -> ImportMade {
+        ImportMade(self.pinned.as_ref().map(|p| p.0))
+    }
+
+    /// Another import of the same memory while the view lives (`crate::gpu::backing`'s aliases,
+    /// whose imports share one view): its pages counted as being made again, so no fold maps
+    /// them through dma-bufs meanwhile, and what of them a fold mapped so mapped from their files
+    /// again, as for the first ([`import_view`]); the word that it was made.
+    pub(crate) fn again(&self) -> ImportMade {
+        let Some(pinned) = &self.pinned else {
+            return ImportMade(None);
+        };
+        let end = match PINNED.lock().get_mut(&pinned.0) {
+            Some(record) => {
+                record.making = record.making.saturating_add(1);
+                record.end
+            }
+            None => return ImportMade(None),
+        };
+        // Pages left in views through dma-bufs for want of room are refused at the gate.
+        let _ = vm::unfold(pinned.0.0, end);
+        ImportMade(Some(pinned.0))
     }
 
     /// The runtime's deallocator of the import, and what keeps the import's memory mapped beside
@@ -832,6 +1336,27 @@ mod tests {
     use super::*;
 
     const PAGE: u64 = 0x1000;
+
+    /// The device-making probes' pages not yet unmapped ([`ProbePages`]): the runtime frees a
+    /// probe's import, and so drops its pages, on a thread of its own, after the device is made.
+    pub(super) static PROBE_PAGES_LIVE: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// Waits up to 10 s for the probes' pages to go, so a test that counts the views' mappings
+    /// counts its own alone: on the RTX 2080 two of the probes' mappings were still there as the
+    /// test began, and gone by its end. Says how many are left where any are.
+    fn probes_gone() {
+        for _ in 0..10_000 {
+            if PROBE_PAGES_LIVE.load(Ordering::Relaxed) == 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        eprintln!(
+            "{} of the probes' pages still mapped after 10 s",
+            PROBE_PAGES_LIVE.load(Ordering::Relaxed)
+        );
+    }
 
     fn read(at: u64) -> u8 {
         // SAFETY: test memory this test mapped readable.
@@ -1167,6 +1692,353 @@ mod tests {
         budget::set_test_limit(None);
         assert!(vm.deallocate(view, n * PAGE).is_success());
         assert!(vm.deallocate(src, n * PAGE).is_success());
+    }
+
+    /// A view of `n` pages of a fresh range a view can be made of, backwards, mapped from their
+    /// files where a device of the process needs imported pages so: the range and the view.
+    fn backwards(vm: &LinuxVm, n: u64) -> (HostAddr, HostAddr) {
+        let src = vm::allocate_aliasable(n * PAGE).unwrap();
+        let view = vm.allocate_anywhere(n * PAGE).unwrap();
+        let runs: Vec<_> = (0..n)
+            .map(|i| (src.wrapping_add((n - 1 - i) * PAGE), PAGE))
+            .collect();
+        vm.remap_runs_shared_overwrite(view, &runs).unwrap();
+        (src, view)
+    }
+
+    /// An import's view is folded into a dma-buf as a view no import holds is once the import is
+    /// made on a device that keeps what it pinned at the import, and not while it is being made;
+    /// another import of the same view (an alias's, `crate::gpu::backing`) maps it from its files
+    /// again and keeps it so until that import is made too. The flag is the process's, which
+    /// nextest runs this test alone in.
+    #[test]
+    fn a_made_import_s_view_folds_and_another_maps_it_from_its_files_again() {
+        if !super::super::dma_buf::opens() {
+            return;
+        }
+        IMPORTS_NEED_FILES.store(true, Ordering::Relaxed);
+        let vm = LinuxVm::new();
+        let n = 32;
+        let (src, view) = backwards(&vm, n);
+        let p = NonNull::new(view.as_ptr::<u8>()).unwrap();
+        let (first, end) = (addr(p), addr(p) + n * PAGE);
+        let maps = || vm::tests::kernel_mappings(first, end);
+        // Folded: its pages lie in a dma-buf, a mapping or two (as `super::vm`'s fold test
+        // counts them); else a mapping a page from their files.
+        let folded = || !files::through_pieces(first, end).is_empty() && maps() <= 2;
+        let from_files = || files::through_pieces(first, end).is_empty() && maps() == n;
+        assert!(from_files(), "mapped from its files");
+        let import = import_view(p, n * PAGE, false);
+        vm::fold_idle();
+        assert!(from_files(), "being made: not folded");
+        import.made().made_here();
+        vm::fold_idle();
+        assert!(folded(), "made: folded ({} mappings)", maps());
+        let again = import.again();
+        assert!(from_files(), "another import: mapped from its files again");
+        vm::fold_idle();
+        assert!(from_files(), "the other being made: not folded");
+        again.made_here();
+        vm::fold_idle();
+        assert!(folded(), "both made: folded ({} mappings)", maps());
+        drop(import);
+        IMPORTS_NEED_FILES.store(false, Ordering::Relaxed);
+        assert!(vm.deallocate(view, n * PAGE).is_success());
+        assert!(vm.deallocate(src, n * PAGE).is_success());
+    }
+
+    /// The test device, its checks settled, where its GPU's imports of a pointer are folded once
+    /// made: it passed the probe ([`learn_folds`]) and does not release idle pointer imports.
+    /// Where they are not, said on stderr, the fold is checked off: a made import's view mapped
+    /// from its files stays so through a fold ([`fold_stays_off`]), and `None`.
+    fn folding_device(test: &str) -> Option<crate::gpu::device::VulkanDevice> {
+        let d = crate::gpu::device::tests::dev();
+        crate::gpu::device::tests::settle_device_checks(&d);
+        probes_gone();
+        let (passed, releases) = (
+            folds_after_import(&d.raw),
+            d.raw.releases_idle_pointer_imports(),
+        );
+        if imports_need_files() && passed && !releases {
+            return Some(d);
+        }
+        eprintln!(
+            "{test}: {}: its imports' views are not folded once made (needs files {}, probe \
+             passed {passed}, releases idle pointer imports {releases}): the fold checked off",
+            d.raw.properties().name,
+            imports_need_files(),
+        );
+        fold_stays_off(&d);
+        None
+    }
+
+    /// On a device whose imports' views are not folded once made, a no-copy buffer's view mapped
+    /// from its files, made, stays so through a fold, where the device needs imported pages so;
+    /// elsewhere views are mapped through dma-bufs, and nothing is folded or unfolded for an
+    /// import.
+    fn fold_stays_off(d: &crate::gpu::device::VulkanDevice) {
+        if !imports_need_files() {
+            return;
+        }
+        let vm = LinuxVm::new();
+        let n = 64;
+        let (src, view) = backwards(&vm, n);
+        let (first, end) = (view.addr().to_u64(), view.addr().to_u64() + n * PAGE);
+        let (buffer, gone) = no_copy(d, view, n);
+        vm::fold_idle();
+        assert_eq!(
+            vm::tests::kernel_mappings(first, end),
+            n,
+            "a made import's view stays mapped from its files"
+        );
+        released(buffer, &gone, first, end);
+        for range in [view, src] {
+            assert!(vm.deallocate(range, n * PAGE).is_success());
+        }
+    }
+
+    /// A kept fold verdict answers under its own key alone, whatever it says, and nothing where
+    /// the file is missing or of another format; a refusal's reason comes back on its line.
+    #[test]
+    fn a_kept_fold_verdict_answers_under_its_key_alone() {
+        let dir = std::env::temp_dir().join(format!("fold-verdict-{}", std::process::id()));
+        let file = dir.join("device-checks").join("fold-after-import-00");
+        assert_eq!(kept_fold(&file, "k"), None, "missing");
+        for answer in [Ok(()), Err("its GPU read the old\npages".to_owned())] {
+            keep_fold(&file, "k", &answer).unwrap();
+            let back = answer.map_err(|why| why.replace('\n', " "));
+            assert_eq!(kept_fold(&file, "k"), Some(back));
+            assert_eq!(kept_fold(&file, "other"), None, "another key");
+        }
+        std::fs::write(&file, "reims-vgpu fold after import 0\nkey k\npassed\n").unwrap();
+        assert_eq!(kept_fold(&file, "k"), None, "another format");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// What of the probe's refusals is the GPU's own answer, kept for its driver.
+    #[test]
+    fn only_the_gpus_own_answers_are_kept() {
+        assert!(lasting(
+            "its GPU read the pages mapped over the view since the import"
+        ));
+        assert!(lasting("its command buffer failed"));
+        assert!(lasting("its pages were not imported by their pointer"));
+        assert!(!lasting("no memory for its pages"));
+        assert!(!lasting("its view was not mapped through a dma-buf"));
+        assert!(!lasting("no command queue"));
+    }
+
+    /// The fold probe answers alike ten times over on the test device, as the GPU's verdict
+    /// ([`learn_folds`]) the adopted device holds, and says on stderr what it answered and what
+    /// it cost; not run where views are mapped through dma-bufs, where nothing calls it.
+    #[test]
+    fn the_fold_probe_answers_alike_ten_times() {
+        use crate::core::platform::os::Clock as _;
+        let d = crate::gpu::device::tests::dev();
+        let name = &d.raw.properties().name;
+        if !imports_need_files() {
+            eprintln!("the fold probe on {name}: not run, views are mapped through dma-bufs");
+            return;
+        }
+        let clock = crate::os::OsClock::new();
+        let mut took = Vec::new();
+        let mut answers = Vec::new();
+        for _ in 0..10 {
+            let start = clock.now_mono();
+            answers.push(probe_fold(&d.raw));
+            took.push(clock.now_mono().as_nanos() - start.as_nanos());
+        }
+        took.sort_unstable();
+        eprintln!(
+            "the fold probe on {name}: {:?}, at the device's making {:.2} ms, then median {:.2} \
+             ms, longest {:.2} ms",
+            answers[0],
+            PROBE_NANOS.load(Ordering::Relaxed) as f64 / 1e6,
+            took[5] as f64 / 1e6,
+            took[9] as f64 / 1e6
+        );
+        assert!(answers.iter().all(|a| *a == answers[0]), "{answers:?}");
+        assert_eq!(
+            answers[0].is_ok(),
+            folds_after_import(&d.raw),
+            "the adopted device's verdict"
+        );
+    }
+
+    /// A no-copy buffer of the platform's over the `n` pages of the view at `view`, and the
+    /// receiver its deallocator answers on.
+    fn no_copy(
+        d: &crate::gpu::device::VulkanDevice,
+        view: HostAddr,
+        n: u64,
+    ) -> (
+        crate::gpu::resource::VulkanBuffer,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        use crate::core::platform::device::GpuDevice as _;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let deallocator: crate::core::platform::device::NoCopyDeallocator = Box::new(move || {
+            let _ = tx.send(());
+        });
+        // SAFETY: the view stays mapped until the buffer's deallocator ran and its import was
+        // freed (its record gone, [`released`]); a fold or remap maps other mappings over it in
+        // one call, never leaving it unmapped.
+        let range = unsafe { crate::core::platform::HostRange::new(view, n * PAGE) };
+        let buffer = d
+            .new_buffer_over_host_memory(
+                crate::core::raise::OnFault::Return,
+                range,
+                0,
+                Some(deallocator),
+            )
+            .unwrap()
+            .unwrap();
+        (buffer, rx)
+    }
+
+    /// `buffer` released: its deallocator ran, and its import was freed, which drops its record
+    /// of [`PINNED`], within 10 s.
+    fn released(
+        buffer: crate::gpu::resource::VulkanBuffer,
+        gone: &std::sync::mpsc::Receiver<()>,
+        first: u64,
+        end: u64,
+    ) {
+        drop(buffer);
+        let wait = std::time::Duration::from_secs(10);
+        assert_eq!(gone.recv_timeout(wait), Ok(()), "the deallocator ran");
+        let held =
+            || (PINNED.lock().iter()).any(|(&(at, _), record)| at < end && first < record.end);
+        for _ in 0..wait.as_millis() {
+            if !held() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!held(), "the import was freed");
+    }
+
+    /// The process's mappings, as the kernel lists them.
+    fn process_mappings() -> usize {
+        std::fs::read_to_string("/proc/self/maps")
+            .unwrap()
+            .lines()
+            .count()
+    }
+
+    /// On a device whose imports' views are folded once made ([`folding_device`], NVIDIA's; on
+    /// others the fold is checked off), a no-copy buffer's view made 100 times over pages of a
+    /// file of their own, folded into a dma-buf once made: the GPU
+    /// reads the bytes written through the pages' own mapping after the fold and its fill shows
+    /// through both mappings, and the buffer's release gives everything back: the views' mappings,
+    /// their records, the process's mappings, and the pages, which the kernel then lets the file
+    /// be sealed against writes, as it refuses while a page of it is pinned
+    /// (`memfd_wait_for_pins`).
+    #[test]
+    fn a_folded_import_gives_back_its_pages_and_mappings() {
+        let Some(d) = folding_device("a_folded_import_gives_back_its_pages_and_mappings") else {
+            return;
+        };
+        let vm = LinuxVm::new();
+        let n = 256;
+        let before = (files::mappings(), PINNED.lock().len(), process_mappings());
+        for round in 0..100 {
+            let (src, view) = backwards(&vm, n);
+            let check = FoldCheck {
+                own: src.addr().to_u64(),
+                view: view.addr().to_u64(),
+                pages: n,
+                round,
+            };
+            let (first, end) = (check.view, check.view + n * PAGE);
+            let file = Arc::clone(&files::pieces(check.own, n * PAGE).unwrap()[0].backing.fd);
+            assert!(
+                files::through_pieces(first, end).is_empty(),
+                "mapped from its files"
+            );
+            let (buffer, gone) = no_copy(&d, view, n);
+            vm::fold_idle();
+            assert!(
+                !files::through_pieces(first, end).is_empty()
+                    && vm::tests::kernel_mappings(first, end) <= 2,
+                "round {round}: folded"
+            );
+            check.write();
+            assert_eq!(check.gpu(&d.raw, &buffer.raw), Ok(()), "round {round}");
+            released(buffer, &gone, first, end);
+            assert!(vm.deallocate(view, n * PAGE).is_success());
+            assert!(vm.deallocate(src, n * PAGE).is_success());
+            use std::os::fd::AsRawFd as _;
+            // SAFETY: a seal of a file of the test's own.
+            let sealed =
+                unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, libc::F_SEAL_WRITE) };
+            assert_eq!(
+                sealed,
+                0,
+                "round {round}: no page of the file pinned ({})",
+                std::io::Error::last_os_error()
+            );
+        }
+        assert_eq!(files::mappings(), before.0, "the views' mappings");
+        assert_eq!(PINNED.lock().len(), before.1, "the records");
+        let now = process_mappings();
+        assert!(
+            now <= before.2 + 16,
+            "the process's mappings: {} then {now}",
+            before.2
+        );
+    }
+
+    /// On a device whose imports' views are folded once made ([`folding_device`], NVIDIA's; on
+    /// others the fold is checked off), a no-copy buffer whose view was folded into a dma-buf once
+    /// made keeps the pages it was made over when other pages are
+    /// mapped over its range, untold, as an import of a view mapped from its files keeps them
+    /// (`tests/no_copy_remap_linux.rs`): the GPU reads the old pages and fills them, and the range
+    /// shows the new pages, untouched.
+    #[test]
+    fn a_folded_import_keeps_its_pages_through_a_remap() {
+        let Some(d) = folding_device("a_folded_import_keeps_its_pages_through_a_remap") else {
+            return;
+        };
+        let vm = LinuxVm::new();
+        let n = 64;
+        let (src, view) = backwards(&vm, n);
+        let check = FoldCheck {
+            own: src.addr().to_u64(),
+            view: view.addr().to_u64(),
+            pages: n,
+            round: 7,
+        };
+        let (first, end) = (check.view, check.view + n * PAGE);
+        let (buffer, gone) = no_copy(&d, view, n);
+        vm::fold_idle();
+        assert!(
+            !files::through_pieces(first, end).is_empty()
+                && vm::tests::kernel_mappings(first, end) <= 2,
+            "folded"
+        );
+        check.write();
+        let new = vm::allocate_aliasable(n * PAGE).unwrap();
+        // SAFETY: the test's own fresh mapping, read and write.
+        unsafe { std::ptr::write_bytes(new.as_ptr::<u8>(), 0xe5, (n * PAGE).to_usize()) };
+        vm.remap_shared_overwrite(view, new, n * PAGE).unwrap();
+        assert_eq!(read(first), 0xe5, "the CPU sees the new pages");
+        assert_eq!(
+            check.gpu_seen(&d.raw, &buffer.raw, None),
+            Ok(()),
+            "the old pages"
+        );
+        for at in [
+            first,
+            end - 1,
+            addr(NonNull::new(new.as_ptr::<u8>()).unwrap()),
+        ] {
+            assert_eq!(read(at), 0xe5, "the new pages untouched");
+        }
+        released(buffer, &gone, first, end);
+        for range in [view, src, new] {
+            assert!(vm.deallocate(range, n * PAGE).is_success());
+        }
     }
 
     /// Where a device of the process needs imported pages mapped from their files, a gated

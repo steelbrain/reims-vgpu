@@ -417,10 +417,21 @@ through dma-bufs"). How the GPU then takes those pages depends on its driver:
 - **Before anything would die or be refused at the whole budget**, the
   library folds back into dma-bufs the views' pages mapped from their files
   that no live import a device may pin holds, and weighs again (`vm.rs`,
-  "Folding back"). Only where that frees too little is a view or an import
-  refused. A buffer's or heap's import short of the headroom folds the same
-  way before it is copied, where the views grew or an import was freed since
-  the last such fold. A map the kernel itself refuses at `vm.max_map_count`,
+  "Folding back"). A live import holds its pages only while it is being
+  made where the GPU keeps the pages it pinned as it imported them, which
+  another probe finds as the device is made (`import.rs`, `probe_fold`),
+  once for each GPU, driver and kernel, its verdict kept in the library's
+  cache (`device-checks/fold-after-import-UUID`). It maps other pages over
+  an import's view and checks that the GPU still reads the imported ones,
+  then folds the view, writes the pages through their own mapping, and
+  checks that the GPU reads them and that its writes show through both. A
+  driver that reads the new pages fails it before the fold: ANV on i915
+  does, and lost its device when the fold came first (docs/lessons.md).
+  NVIDIA's driver passes, so its made imports' views are folded too. Only
+  where that frees too little is a view or an import refused. A buffer's or
+  heap's import short of the headroom folds the same way before it is
+  copied, where the views grew or an import was freed since the last such
+  fold. A map the kernel itself refuses at `vm.max_map_count`,
   when the rest of the process holds more than the 16,384 kept for it, folds
   the same way and is tried once more.
 - **What is refused for want of mappings** answers as the same call does on

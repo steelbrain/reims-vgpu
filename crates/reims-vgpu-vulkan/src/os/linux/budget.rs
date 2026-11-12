@@ -307,14 +307,23 @@ pub(super) fn warn_if_short(guest_ram: u64) {
 /// (`super::import`'s `learn_view_imports`) and imports of all of the guest's RAM, in 4 KiB pieces,
 /// would come within the headroom of the budget: past that much of it, buffers and heaps over
 /// guest memory are copied rather than imported (`super::import`'s `import_gate`), which works and
-/// costs the copies, so it is information, not a warning: the setting is a speed-up. Nothing
-/// before the guest's RAM is leased ([`warn_if_short`] warns then).
+/// costs the copies, so it is information, not a warning: the setting is a speed-up. Where a GPU
+/// of the process folds its imports' views once made (`super::import`'s `folds_any`), only a
+/// buffer or heap past that much on its own is. Nothing before the guest's RAM is leased
+/// ([`warn_if_short`] warns then).
 pub(super) fn warn_if_imports_short() {
-    short(
-        "buffers and heaps over guest memory are copied rather than imported, which is slower,",
-        HEADROOM,
-        log::Level::Info,
-    );
+    // Where a GPU's made imports are folded, their views give their mappings back, so only an
+    // object of more pieces than the line on its own is copied.
+    let what = match super::import::folds_any() {
+        true => {
+            "a buffer or heap over guest memory, each on its own as its view is folded once \
+             imported, is copied rather than imported, which is slower,"
+        }
+        false => {
+            "buffers and heaps over guest memory are copied rather than imported, which is slower,"
+        }
+    };
+    short(what, HEADROOM, log::Level::Info);
 }
 
 /// The line of [`warn_if_short`] and [`warn_if_imports_short`], once for the process at

@@ -86,7 +86,8 @@
 //! pins none. So where a device of the process refuses such a view (`super::import`'s
 //! `learn_view_imports`, as the device is made), views are mapped from their files from then on,
 //! a mapping a run, and an import of a view made through dma-bufs before maps what of its pages
-//! lies in them from their files for as long as the view lives ([`unfold`]). Where those
+//! lies in them from their files ([`unfold`]), until the import is made where the device keeps
+//! what it pinned (below, "Folding back"), else for as long as the view lives. Where those
 //! mappings would come within the headroom of the views' budget (`super::budget`'s `claim`), a
 //! view is mapped through dma-bufs there too, and no view ends the process. A no-copy buffer's or
 //! heap's import of pages left in dma-bufs for want of mappings, which the runtime asks the
@@ -99,7 +100,13 @@
 //! **Folding back.** At the views' budget, before anything is refused, the views' runs mapped
 //! from their files that no import a device may pin holds (`super::import`'s `Pinned`) are mapped
 //! through dma-bufs of their pages instead, a mapping per 4 MiB ([`fold_idle`]), where udmabuf is
-//! the process's. The same pages are mapped over them, so nothing reading or writing them sees a
+//! the process's. An import holds its pages so only while it is being made where the device that
+//! makes it keeps what it pinned at the import (`super::import`'s `ImportMade`, learned of each
+//! GPU by a probe, `super::import`'s `probe_fold`): NVIDIA's driver pins the pages as it imports
+//! them and keeps those pages, whatever is mapped over their range later, so a made import's view
+//! of scattered pages, a mapping a run, is folded as an idle one is, and the mappings it held go
+//! to the next import; another import of the same view maps it from its files again until that
+//! one is made too. The same pages are mapped over them, so nothing reading or writing them sees a
 //! change; every change the library makes to its views' mappings (a view, an unfold, a protect,
 //! an overwrite, an unmap) holds the views' lock to read ([`views`]), and a fold holds it to
 //! write, so none of them runs while a fold maps, and a fold never maps over a range another
@@ -215,6 +222,24 @@ fn fold_within(within: std::ops::Range<u64>) -> u64 {
         );
     }
     freed
+}
+
+/// Maps the runs of `range` mapped from their files through dma-bufs of their pages, whatever
+/// import holds them, as [`fold_idle`] maps those no import holds: `super::import`'s probe of
+/// whether a device keeps the pages of its import of a pointer once its view is so folded
+/// (`super::import`'s `probe_fold`). Whether the range then lies in views through dma-bufs;
+/// `false` where udmabuf is not the process's, or the thread holds the views' lock.
+pub(super) fn fold_held(range: std::ops::Range<u64>) -> bool {
+    if IN_VIEWS.with(std::cell::Cell::get) > 0 || !super::dma_buf::opens() {
+        return false;
+    }
+    {
+        let _all = VIEWS.write();
+        let outer = AT_LIMIT.with(|a| a.replace(Some(false)));
+        fold(range.clone());
+        AT_LIMIT.with(|a| a.set(outer));
+    }
+    !files::through_pieces(range.start, range.end).is_empty()
 }
 
 /// The views' mappings and the imports freed (`super::import`'s `unpinned`) as the last fold for

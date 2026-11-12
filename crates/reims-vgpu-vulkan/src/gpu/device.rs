@@ -458,8 +458,9 @@ fn keep_unrun<D, T>(made: &RaiseResult<Option<T>>, slot: Option<Slot<D>>) {
 /// ([`crate::os::ImportView::release`]), and an unmap hold on the bytes' pages, so that core's
 /// unmap of its mapping of them through the platform's VM, which its deallocator may make, waits
 /// for the free ([`crate::remap::UnmapHold`]); whether the pages are mapped read-only
-/// ([`Backing::imported`]); and whether the runtime may be told the pages are writable
-/// ([`crate::os::ImportView::vouched`]).
+/// ([`Backing::imported`]); whether the runtime may be told the pages are writable
+/// ([`crate::os::ImportView::vouched`]); and the word that the import was made, which the caller
+/// gives once the runtime's call returned ([`crate::os::ImportMade`]).
 fn no_copy_release(
     start: NonNull<u8>,
     length: u64,
@@ -469,6 +470,7 @@ fn no_copy_release(
     let view = crate::os::import_view(start, length, site.twins());
     let imported = view.at();
     let (read_only, vouched) = (view.read_only(), view.vouched());
+    let made = view.made();
     let (run, kept) = view.release(start, run);
     let hold = crate::remap::UnmapHold::new(start, length);
     let traced = backing::ImportTrace::new(site, start, length, imported);
@@ -478,6 +480,7 @@ fn no_copy_release(
         keep: backing::keep_alive((kept, hold, traced)),
         read_only,
         vouched,
+        made,
     }
 }
 
@@ -493,6 +496,9 @@ struct NoCopyImport {
     read_only: bool,
     /// The runtime may be told the pages are writable.
     vouched: bool,
+    /// The word that the runtime's import was made, given once its call returned
+    /// ([`crate::os::ImportMade`]).
+    made: crate::os::ImportMade,
 }
 
 /// [`create`] of a buffer, its nil answer logged with its reason, once ([`no_buffer`]): `pinned`
@@ -857,7 +863,7 @@ impl VulkanDevice {
         let (base, length) = (pointer(sel, surface.base_address()), surface.alloc_size());
         let offset = crate::os::surface_offset(surface);
         let read_only = crate::os::gpu_read_only(surface);
-        let (base, keep) = if offset == 0 && !read_only {
+        let (base, keep, import_made) = if offset == 0 && !read_only {
             log::debug!(
                 "{sel}: a buffer of {length:#x} bytes over a surface in {}, imported at its base \
                  address",
@@ -871,7 +877,8 @@ impl VulkanDevice {
             let site = backing::ImportSite::SurfaceBase;
             let view = crate::os::import_view(base, length, site.twins());
             let traced = backing::ImportTrace::new(site, base, length, view.at());
-            (base, backing::keep_alive((hold, view, traced)))
+            let made = view.made();
+            (base, backing::keep_alive((hold, view, traced)), made)
         } else {
             let first = u64::try_from(base.as_ptr().addr())
                 .unwrap_or(u64::MAX)
@@ -904,12 +911,12 @@ impl VulkanDevice {
             let Some(alias) = alias else {
                 return Ok(None);
             };
-            let (at, keep) = alias.into_runtime(backing::ImportSite::Surface);
+            let (at, keep, made) = alias.into_runtime(backing::ImportSite::Surface);
             // The alias holds `offset` bytes more than the buffer, past its end.
             let from = at
                 .as_ptr()
                 .wrapping_add(usize::try_from(offset).unwrap_or(usize::MAX));
-            (pointer(sel, HostPtr::from_ptr(from)), keep)
+            (pointer(sel, HostPtr::from_ptr(from)), keep, made)
         };
         // SAFETY: an alias of the surface's allocation stays mapped until the runtime freed its
         // import, which the keep-alive holds, and so does the surface's own memory on Linux
@@ -932,10 +939,14 @@ impl VulkanDevice {
             Some(other) => descriptor.with_range_of(other),
             None => descriptor,
         };
-        create_buffer(sel, nil, None, || {
+        let made = create_buffer(sel, nil, None, || {
             self.raw
                 .new_buffer_with_descriptor(with_token(descriptor, token))
-        })
+        });
+        if matches!(made, Ok(Some(_))) {
+            import_made.made(&self.raw);
+        }
+        made
     }
 
     /// A live buffer of this device over the surface `key` at its range's address
@@ -1132,6 +1143,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             keep,
             read_only,
             vouched,
+            made: import_made,
         } = no_copy_release(start, bytes.len(), run, backing::ImportSite::NoCopyBytes);
         let made = create_buffer(sel, placed_nil(&placing, Nil::BufferLength), None, || {
             // SAFETY: `HostRange::new`'s contract keeps the bytes mapped until the deallocator
@@ -1161,6 +1173,9 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         })
         .map(Option::flatten);
         keep_unrun(&made, slot);
+        if matches!(made, Ok(Some(_))) {
+            import_made.made(&self.raw);
+        }
         made.map(|b| {
             b.map(|raw| {
                 let buffer = self.buffer(raw, None);
@@ -1815,6 +1830,8 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let mut own = None;
         // Whether a no-copy buffer's pages are mapped read-only.
         let mut read_only = false;
+        // The word that a no-copy buffer's import was made ([`crate::os::ImportMade`]).
+        let mut import_made = None;
         let contents = match (desc.contents, desc.no_copy, &slot) {
             (None, false, None) => rt::BufferContents::Zero,
             (Some(bytes), false, None) if bytes.len() == desc.length => {
@@ -1843,6 +1860,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                     keep,
                     read_only: mapped_read_only,
                     vouched,
+                    made,
                 } = no_copy_release(
                     start,
                     bytes.len(),
@@ -1850,6 +1868,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                     backing::ImportSite::NoCopyDescriptor,
                 );
                 read_only = mapped_read_only;
+                import_made = Some(made);
                 rt::BufferContents::NoCopy {
                     // SAFETY: `HostRange::new`'s contract keeps the bytes mapped until the
                     // deallocator runs, or for the buffer's life with none, and an unmap of
@@ -1875,6 +1894,9 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         );
         metal_space::let_go(pool);
         keep_unrun(&made, slot);
+        if let (Ok(Some(_)), Some(import_made)) = (&made, import_made) {
+            import_made.made(&self.raw);
+        }
         made.map(|b| {
             b.map(|raw| {
                 let backing = Backing::new(held & READ_ONLY_OPTION != 0, raw.object_id());
@@ -1988,31 +2010,37 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                     .map(|alias| Arc::clone(alias).into_runtime(backing::ImportSite::Heap))
                 {
                     None => None,
-                    Some((first, keep)) => create(sel, Policy::Dies, nil, || {
-                        // SAFETY: the alias covers the heap's size, the descriptor's rounded up
-                        // to the runtime's granule, and starts on a page, the runtime's import
-                        // unit on this host. It is as a replace's alias is otherwise
-                        // (`VulkanBuffer::replace_backing`).
-                        storage(unsafe {
-                            match token {
-                                Some(token) => {
-                                    self.raw.new_heap_with_bytes_no_copy_and_range_token(
+                    Some((first, keep, import_made)) => {
+                        let heap = create(sel, Policy::Dies, nil, || {
+                            // SAFETY: the alias covers the heap's size, the descriptor's rounded up
+                            // to the runtime's granule, and starts on a page, the runtime's import
+                            // unit on this host. It is as a replace's alias is otherwise
+                            // (`VulkanBuffer::replace_backing`).
+                            storage(unsafe {
+                                match token {
+                                    Some(token) => {
+                                        self.raw.new_heap_with_bytes_no_copy_and_range_token(
+                                            crate::os::host_memory(first),
+                                            &descriptor,
+                                            None,
+                                            Some(keep),
+                                            token,
+                                        )
+                                    }
+                                    None => self.raw.new_heap_with_bytes_no_copy(
                                         crate::os::host_memory(first),
                                         &descriptor,
                                         None,
                                         Some(keep),
-                                        token,
-                                    )
+                                    ),
                                 }
-                                None => self.raw.new_heap_with_bytes_no_copy(
-                                    crate::os::host_memory(first),
-                                    &descriptor,
-                                    None,
-                                    Some(keep),
-                                ),
-                            }
-                        })
-                    })?,
+                            })
+                        })?;
+                        if heap.is_some() {
+                            import_made.made(&self.raw);
+                        }
+                        heap
+                    }
                 }
             }
         };
@@ -2082,6 +2110,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             keep,
             read_only,
             vouched,
+            made: import_made,
             ..
         } = no_copy_release(start, bytes.len(), None, backing::ImportSite::Heap);
         let heap = create(sel, Policy::Dies, nil, || {
@@ -2114,6 +2143,9 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                 made => made,
             }
         })?;
+        if heap.is_some() {
+            import_made.made(&self.raw);
+        }
         Ok(HeapMade {
             heap: heap.map(|raw| {
                 let backing = Backing::fixed();

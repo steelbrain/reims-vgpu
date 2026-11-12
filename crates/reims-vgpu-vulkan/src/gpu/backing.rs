@@ -656,7 +656,7 @@ impl Backing {
         read_only: bool,
         length: u64,
         size: u64,
-        rebind: impl FnOnce(NonNull<u8>, rt::KeepAlive) -> RaiseResult<()>,
+        rebind: impl FnOnce(NonNull<u8>, rt::KeepAlive, crate::os::ImportMade) -> RaiseResult<()>,
     ) -> RaiseResult<bool> {
         if !self.is_detached() || total(ranges) != Some(length) {
             return Ok(false);
@@ -665,8 +665,8 @@ impl Backing {
             return Ok(false);
         };
         let alias = Arc::new(alias);
-        let (first, keep) = Arc::clone(&alias).into_runtime(ImportSite::Replace);
-        rebind(first, keep)?;
+        let (first, keep, made) = Arc::clone(&alias).into_runtime(ImportSite::Replace);
+        rebind(first, keep, made)?;
         let own = {
             let mut aliased = self.alias.lock();
             let kept = crate::os::COPIES_READ_ONLY && (read_only || self.read_only);
@@ -1187,23 +1187,32 @@ impl Alias {
     /// while another lives is given the same memory, its twin included, so the buffers over one
     /// surface's alias lie at one first byte, in one import of the runtime's (its
     /// `host_aliases.rs`), with one twin's mappings, where each would take a twin of its own.
-    pub(crate) fn into_runtime(self: Arc<Self>, site: ImportSite) -> (NonNull<u8>, rt::KeepAlive) {
+    /// And the word that the import was made, which the caller gives once the runtime's call
+    /// returned ([`crate::os::ImportMade`]).
+    pub(crate) fn into_runtime(
+        self: Arc<Self>,
+        site: ImportSite,
+    ) -> (NonNull<u8>, rt::KeepAlive, crate::os::ImportMade) {
         let first = self.at;
-        let view = {
+        let (view, made) = {
             let mut import = self.import.lock();
             match import.upgrade() {
-                Some(view) => view,
+                Some(view) => {
+                    let made = view.again();
+                    (view, made)
+                }
                 None => {
                     let view = crate::os::import_view(first, self.length, site.twins());
+                    let made = view.made();
                     let view = Arc::new(view);
                     *import = Arc::downgrade(&view);
-                    view
+                    (view, made)
                 }
             }
         };
         let imported = view.at();
         let traced = ImportTrace::new(site, first, self.length, imported);
-        (imported, keep_alive((view, self, traced)))
+        (imported, keep_alive((view, self, traced)), made)
     }
 
     /// The first byte.
@@ -2036,7 +2045,7 @@ mod tests {
             Box::new(move || ran.store(true, Ordering::Release)) as Box<dyn FnOnce() + Send>
         };
         let rebinds = std::cell::Cell::new(0);
-        let rebind = |_: NonNull<u8>, _: rt::KeepAlive| {
+        let rebind = |_: NonNull<u8>, _: rt::KeepAlive, _: crate::os::ImportMade| {
             rebinds.set(rebinds.get() + 1);
             Ok(())
         };
