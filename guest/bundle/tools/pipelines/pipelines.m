@@ -36,6 +36,8 @@
 //   rp.warm          one descriptor made again.
 //   rp.async.8       8 pipelines of fresh libraries asked at once through the completion-handler
 //             form: the wall time until the last handler, and the median handler latency.
+//   rt.query         heapTextureSizeAndAlignWithDescriptor: of a fresh width each repetition: a
+//             query a device answers with no compile (on a guest, its round trip to the host).
 //   cp.lib, cp.const, cp.warm, cp.async.8   the same for k_blur's compute pipeline (its weights
 //             a function constant).
 //   draw.first       a pipeline of a fresh library, then a command buffer of one draw into a
@@ -543,6 +545,27 @@ static NSString *computeCase(int kind)
 	return stat(@"ms", times);
 }
 
+// heapTextureSizeAndAlignWithDescriptor: of a private RGBA8 texture of a fresh width each
+// repetition, which no cache answers.
+static NSString *queryCase(void)
+{
+	NSMutableArray *times = [NSMutableArray array];
+	for (int r = 0; r < gReps; r++) {
+		MTLTextureDescriptor *d =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:64 + (gNext++ & 4095u)
+		                                                      height:64
+		                                                   mipmapped:NO];
+		d.storageMode = MTLStorageModePrivate;
+		const double t0 = now();
+		const MTLSizeAndAlign sa = [gDevice heapTextureSizeAndAlignWithDescriptor:d];
+		[times addObject:@(ms(t0))];
+		if (sa.size == 0)
+			return @"FAIL a size of 0";
+	}
+	return stat(@"ms", times);
+}
+
 // `count` pipelines of fresh libraries asked at once: the wall time to the last handler, and each
 // handler's latency.
 static NSString *asyncCase(BOOL compute, int count)
@@ -785,6 +808,7 @@ int main(int argc, char **argv)
 		runCase(@"rp.state", ^{ return renderCase(2, @"f_tex"); });
 		runCase(@"rp.warm", ^{ return renderCase(3, @"f_tex"); });
 		runCase(@"rp.async.8", ^{ return asyncCase(NO, 8); });
+		runCase(@"rt.query", ^{ return queryCase(); });
 		runCase(@"cp.lib", ^{ return computeCase(0); });
 		runCase(@"cp.const", ^{ return computeCase(1); });
 		runCase(@"cp.warm", ^{ return computeCase(3); });
