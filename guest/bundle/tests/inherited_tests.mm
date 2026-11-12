@@ -13,6 +13,9 @@
 //     or an argument or return value of another size.
 // A listed selector this macOS's base classes lack is reported, not failed: the guest's macOS can
 // differ.
+// It also checks the x86 device's answer to newResidencySetWithDescriptor:error:: nil, its error
+// out left as it was, as the x86 Macs answer (measured: macOS 26.7.1, the AMD Radeon Pro 5300M
+// and the Intel UHD 630).
 #import <Foundation/Foundation.h>
 
 #include <dlfcn.h>
@@ -165,6 +168,26 @@ NSString *signatureDifference(Method ours, Method base)
 	return nil;
 }
 
+// The device's newResidencySetWithDescriptor:error: answers nil and leaves its error out as it
+// was. The member reads none of the device's state, so it is called with the class as `self`,
+// with no device made.
+void checkResidencySetAnswer(Class device)
+{
+	SEL sel = sel_registerName("newResidencySetWithDescriptor:error:");
+	Method m = class_getInstanceMethod(device, sel);
+	if (m == nullptr) {
+		fail(@"the device does not answer newResidencySetWithDescriptor:error:");
+		return;
+	}
+	NSError *sentinel = [NSError errorWithDomain:@"inherited_tests" code:1 userInfo:nil];
+	NSError *error = sentinel;
+	id set = ((id(*)(id, SEL, id, NSError **))method_getImplementation(m))((id)device, sel, nil, &error);
+	if (set != nil || error != sentinel)
+		fail([NSString stringWithFormat:@"newResidencySetWithDescriptor:error: answers %@, error %@ (want nil, "
+		                                @"the error out untouched)",
+		                                set, error == sentinel ? @"untouched" : error]);
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -185,6 +208,7 @@ int main(int argc, char **argv)
 			printf("FAIL: RgfxMetalDevice is not a subclass of IOGPUMetalDevice, of _MTLDevice\n");
 			return 1;
 		}
+		checkResidencySetAnswer(device);
 		NSDictionary<NSString *, NSValue *> *ours = ownMethods(device);
 		NSMutableSet<NSString *> *inBase = [NSMutableSet set];
 		NSUInteger creators = 0, answered = 0, left = 0;
