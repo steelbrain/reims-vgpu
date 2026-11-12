@@ -3099,15 +3099,16 @@ bool rgfxAirSpecialise(const RgfxAirEntries &module, const RgfxAirEntry &entry, 
 	return true;
 }
 
-void rgfxReadAirModule(const uint8_t *bitcode, size_t size, RgfxAirModule &out)
+void rgfxReadAirModule(const uint8_t *bitcode, size_t size, RgfxAirModule &out, bool entries)
 {
 	out = {};
+	out.withEntries = entries;
 	// One read with the module's code, which the entry points' specialisation takes. A module
 	// whose code does not read answers no entry points, as rgfxReadAirEntries does, and its
 	// functions and visible functions are read again without its code.
 	Module m;
 	m.wantCode = true;
-	if (readModule(bitcode, size, m)) {
+	if (entries && readModule(bitcode, size, m)) {
 		out.functionsRead = functionsOf(m, out.functions);
 		out.visibleRead = visibleOf(m, out.visible);
 		out.entriesRead = entriesOf(m, out.entries);
@@ -3152,32 +3153,51 @@ size_t rgfxAirModuleCost(const RgfxAirModule &module, size_t size)
 	return n;
 }
 
-std::shared_ptr<const RgfxAirModule> RgfxAirModuleCache::moduleOf(const uint8_t *bitcode, size_t size)
+std::shared_ptr<const RgfxAirModule> RgfxAirModuleCache::moduleOf(const uint8_t *bitcode, size_t size, bool entries)
 {
 	const std::string_view key(reinterpret_cast<const char *>(bitcode), bitcode != nullptr ? size : 0);
+	// The kept read of the kind asked, where there is one; a read with the entry points answers
+	// for one without them that is not read yet, and is that one from then on.
+	auto keptOf = [&](Kept &k) -> std::shared_ptr<const RgfxAirModule> {
+		if (entries)
+			return k.full;
+		if (k.plain == nullptr)
+			k.plain = k.full;
+		return k.plain;
+	};
 	{
 		std::lock_guard<std::mutex> hold(lock_);
 		auto found = byBytes_.find(key);
 		if (found != byBytes_.end()) {
-			order_.splice(order_.begin(), order_, found->second);
-			return found->second->module;
+			if (auto module = keptOf(*found->second)) {
+				order_.splice(order_.begin(), order_, found->second);
+				return module;
+			}
 		}
 	}
 	auto read = std::make_shared<RgfxAirModule>();
-	rgfxReadAirModule(bitcode, size, *read);
+	rgfxReadAirModule(bitcode, size, *read, entries);
 	std::shared_ptr<const RgfxAirModule> module = std::move(read);
-	const size_t cost = rgfxAirModuleCost(*module, key.size());
+	const size_t code = rgfxAirModuleCost(*module, key.size()) - key.size();
 	std::lock_guard<std::mutex> hold(lock_);
 	reads_++;
 	auto found = byBytes_.find(key);
 	if (found != byBytes_.end()) {
-		// Another thread read the same bytes meanwhile: its read is the one kept.
+		Kept &k = *found->second;
 		order_.splice(order_.begin(), order_, found->second);
-		return found->second->module;
+		// Another thread read the same bytes meanwhile: its read is the one kept.
+		if (auto kept = keptOf(k))
+			return kept;
+		(entries ? k.full : k.plain) = module;
+		k.cost += code;
+		keptBytes_ += code;
+	} else {
+		Kept k{std::string(key), nullptr, nullptr, key.size() + code};
+		(entries ? k.full : k.plain) = module;
+		order_.push_front(std::move(k));
+		byBytes_.emplace(std::string_view(order_.front().bytes), order_.begin());
+		keptBytes_ += order_.front().cost;
 	}
-	order_.push_front(Kept{std::string(key), module, cost});
-	byBytes_.emplace(std::string_view(order_.front().bytes), order_.begin());
-	keptBytes_ += cost;
 	while (keptBytes_ > budget_ && !order_.empty()) {
 		const Kept &last = order_.back();
 		keptBytes_ -= last.cost;

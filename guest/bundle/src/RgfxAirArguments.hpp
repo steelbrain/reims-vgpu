@@ -392,18 +392,28 @@ bool rgfxReadAirEntries(const uint8_t *bitcode, size_t size, RgfxAirEntries &out
 // --- One read of a module, kept for the process -----------------------------------------------
 
 // What the three readers above answer for one module, from one read of its bitstream: each
-// `...Read` and its value are what that reader returns and puts in `out` for the same bytes.
+// `...Read` and its value are what that reader returns and puts in `out` for the same bytes. The
+// entry points' are there only where the read asked for them (`withEntries`).
 struct RgfxAirModule {
 	bool functionsRead = false;
 	std::vector<RgfxAirFunction> functions; // rgfxReadAirFunctions
 	bool visibleRead = false;
 	std::vector<RgfxAirVisible> visible; // rgfxReadAirVisible
+	// Whether the read took the entry points (rgfxReadAirModule's `entries`); where it did not,
+	// `entriesRead` is false and `entries` empty, whatever the module holds.
+	bool withEntries = false;
 	bool entriesRead = false;
 	RgfxAirEntries entries; // rgfxReadAirEntries
 };
 
-// Reads the AIR module at `bitcode` (as rgfxReadAirFunctions takes it) once, into `out`.
-void rgfxReadAirModule(const uint8_t *bitcode, size_t size, RgfxAirModule &out);
+// Reads the AIR module at `bitcode` (as rgfxReadAirFunctions takes it) once, into `out`: its
+// entry points too where `entries`, else its arguments and visible functions alone, without
+// decoding its function bodies. A module that declares function constants keeps its bodies, which
+// the entry points' specialisation takes; decoding them costs several times the rest of the read
+// (MPSNeuralNetwork's cnnConvArray: 391 us against 40 us; Espresso's dequantizeGeneric: 54 against
+// 17, measured on the M3 Max under macOS 27), and only a pipeline's reflection, a function of
+// OpenCL mode and constants set by name that no function list resolves need the entry points.
+void rgfxReadAirModule(const uint8_t *bitcode, size_t size, RgfxAirModule &out, bool entries = true);
 
 // What a module of `size` bytes read as `module` costs a cache's budget: its bytes, and the bytes
 // its decoded code holds (RgfxAirEntries::code: its containers' elements, for a module that
@@ -415,17 +425,20 @@ size_t rgfxAirModuleCost(const RgfxAirModule &module, size_t size);
 // so every lookup of equal bytes, from any library over them, shares one read. It keeps the most
 // recently looked-up modules, a copy of each one's bytes (its key, compared whole) with its
 // reads, while their costs (rgfxAirModuleCost) total at most `budget`; a module it let go is read
-// again at its next lookup. The reads it hands out stay valid while a holder keeps them. Safe on
-// any thread; two threads that look up one module at once may each read it, and both are answered
-// the first read kept.
+// again at its next lookup. A module has two reads, one without its entry points and one with
+// them (rgfxReadAirModule's `entries`), each made at the first lookup of its kind, so every
+// lookup of a kind is answered one object; where the read with them came first, it answers both.
+// The reads it hands out stay valid while a holder keeps them. Safe on any thread; two threads
+// that look up one module at once may each read it, and both are answered the first read kept.
 class RgfxAirModuleCache {
 public:
 	explicit RgfxAirModuleCache(size_t budget) : budget_(budget) {}
 	RgfxAirModuleCache(const RgfxAirModuleCache &) = delete;
 	RgfxAirModuleCache &operator=(const RgfxAirModuleCache &) = delete;
 
-	// The reads of the module at `bitcode`: those kept for equal bytes, else read now (and kept).
-	std::shared_ptr<const RgfxAirModule> moduleOf(const uint8_t *bitcode, size_t size);
+	// The reads of the module at `bitcode`, its entry points among them where `entries`
+	// (rgfxReadAirModule): those kept for equal bytes, else read now (and kept).
+	std::shared_ptr<const RgfxAirModule> moduleOf(const uint8_t *bitcode, size_t size, bool entries = true);
 
 	// How many modules it read, how many it keeps, and their costs (tests).
 	uint64_t reads() const;
@@ -435,8 +448,10 @@ public:
 private:
 	struct Kept {
 		std::string bytes;
-		std::shared_ptr<const RgfxAirModule> module;
-		size_t cost;
+		// The read without the entry points and the one with them, either null until asked; the
+		// first where the second came first is the second.
+		std::shared_ptr<const RgfxAirModule> plain, full;
+		size_t cost; // the bytes', and each distinct read's code's
 	};
 	using Order = std::list<Kept>;
 	mutable std::mutex lock_;

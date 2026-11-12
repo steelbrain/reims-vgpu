@@ -316,8 +316,17 @@ size_t moduleReadsAsReaders(const std::vector<uint8_t> &lib, const std::string &
 		      what + " " + f.name + ": one read's arguments are rgfxReadAirFunctions'");
 		check(once.visibleRead == visRead && once.visible == vis,
 		      what + " " + f.name + ": one read's visible functions are rgfxReadAirVisible's");
-		check(once.entriesRead == entriesRead && once.entries == entries,
+		check(once.withEntries && once.entriesRead == entriesRead && once.entries == entries,
 		      what + " " + f.name + ": one read's nodes are rgfxReadAirEntries'");
+		RgfxAirModule plain;
+		rgfxReadAirModule(bc.data(), bc.size(), plain, false);
+		check(plain.functionsRead == fnsRead && plain.functions == fns && plain.visibleRead == visRead &&
+		          plain.visible == vis,
+		      what + " " + f.name + ": a read without the entry points answers the arguments and visible "
+		                            "functions alike");
+		check(!plain.withEntries && !plain.entriesRead && plain.entries == RgfxAirEntries{} &&
+		          rgfxAirModuleCost(plain, bc.size()) == bc.size(),
+		      what + " " + f.name + ": and holds no entry points and no code");
 		const std::shared_ptr<const RgfxAirModule> kept = rgfxAirModules().moduleOf(bc.data(), bc.size());
 		check(kept != nullptr && kept->functionsRead == fnsRead && kept->functions == fns &&
 		          kept->visibleRead == visRead && kept->visible == vis && kept->entriesRead == entriesRead &&
@@ -1968,6 +1977,29 @@ int main()
 		          shared.reads() >= 1 && shared.reads() <= got.size() && shared.kept() == 1 &&
 		          shared.moduleOf(a2.data(), a2.size()) == got[0],
 		      "threads looking up one module at once share one read");
+		// A module's two reads: one without its entry points, kept at its bytes' cost and taken by
+		// every ask without them; one with them, read at the first ask with them, kept beside it at
+		// its code's cost and taken by every ask with them. Where the read with them comes first,
+		// it answers both kinds.
+		RgfxAirModuleCache lazy(1u << 20);
+		const auto plainA = lazy.moduleOf(a.data(), a.size(), false);
+		check(plainA != nullptr && !plainA->withEntries && plainA->functions == pa->functions &&
+		          plainA->visible == pa->visible && lazy.reads() == 1 && lazy.keptBytes() == a.size(),
+		      "a read without the entry points is kept at its bytes' cost");
+		check(lazy.moduleOf(a2.data(), a2.size(), false) == plainA && lazy.reads() == 1,
+		      "and taken by the next ask without them");
+		const auto fullA = lazy.moduleOf(a.data(), a.size(), true);
+		check(fullA != plainA && fullA->withEntries && fullA->entriesRead == pa->entriesRead &&
+		          fullA->entries == pa->entries && lazy.reads() == 2 && lazy.kept() == 1 &&
+		          lazy.keptBytes() == ca,
+		      "an ask with the entry points reads them, kept beside the first at its code's cost");
+		check(lazy.moduleOf(a.data(), a.size(), false) == plainA && lazy.moduleOf(a2.data(), a2.size()) == fullA &&
+		          lazy.reads() == 2,
+		      "each kind of ask then takes its own read");
+		const auto fullB = lazy.moduleOf(b.data(), b.size(), true);
+		check(fullB != nullptr && fullB->withEntries && lazy.moduleOf(b.data(), b.size(), false) == fullB &&
+		          lazy.reads() == 3 && lazy.keptBytes() == ca + cb,
+		      "a read with the entry points that came first answers an ask without them too");
 		// The process's own, which every library reads through.
 		const uint64_t before = rgfxAirModules().reads();
 		const auto p1 = rgfxAirModules().moduleOf(a.data(), a.size());

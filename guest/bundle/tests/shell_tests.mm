@@ -5754,8 +5754,8 @@ void test_libraries_over_equal_bytes_share_their_air_reads()
 	const uint64_t afterSecond = rgfxAirModules().reads();
 	CHECK(entryPoints >= 8 && visibles >= 8);
 	// Earlier tests read some of these modules: the first library's lookups read at most one
-	// module per function.
-	CHECK(afterFirst - before <= entryPoints + visibles);
+	// module per function, and once more with its entry points for an entry point's nodes.
+	CHECK(afterFirst - before <= 2 * entryPoints + visibles);
 	CHECK(afterSecond == afterFirst); // the second library reads nothing
 	NSLog(@"RGFX test: %zu functions over two libraries: %zu lookups, each a read for its library "
 	      @"alone; %llu modules read",
