@@ -1453,12 +1453,18 @@ mod tests {
         };
         let steps = install_steps(&vm).unwrap();
         assert!(steps.starts_with("To install macOS, start t:"), "{steps}");
-        assert!(steps.contains("erase it (QEMU HARDDISK Media) as APFS"), "{steps}");
+        assert!(
+            steps.contains("erase it (QEMU HARDDISK Media) as APFS"),
+            "{steps}"
+        );
         let q = vm.config.q35.as_mut().unwrap();
         q.disk_controller = DiskController::Nvme;
         let steps = install_steps(&vm).unwrap();
         assert!(steps.starts_with("To install macOS, start t:"), "{steps}");
-        assert!(steps.contains("erase it (QEMU NVMe Ctrl Media) as APFS"), "{steps}");
+        assert!(
+            steps.contains("erase it (QEMU NVMe Ctrl Media) as APFS"),
+            "{steps}"
+        );
         assert!(!steps.contains("--disk-controller"), "{steps}");
         vm.config.q35.as_mut().unwrap().installer = None;
         assert_eq!(install_steps(&vm), None);
