@@ -705,6 +705,21 @@ at `b8c465b8` (after), one boot each:
   No call was in flight then and QEMU's main loop shows no stall; one boot of
   each does not tell whether these changes have a part in it.
 
+A second boot of each, with every event QEMU posted to the guest traced
+(`usb_xhci_queue_event`; m3-max-22668, the same host and guest):
+- The first stream restarted with both QEMUs: the IOProc ran 457 times and
+  the guest logged 22 IsoTooOld lines at `8b804b45`, 460 times and 31 lines
+  at `b8c465b8`. The restart is not these changes'.
+- After, the main loop stalled 5.6, 5.5 and 11.3 ms while the worker set the
+  output interface's alternate setting 0 (calls of 5.0 to 7.9 ms), each
+  stall the length of the call it overlapped. The main loop was meanwhile
+  taking the input stream's transfers from the same device, which still ran;
+  that waits for the call, as usbfs takes a lock of the device for both
+  (inferred from the timing, not traced in the kernel). Before, the same
+  calls took at most 4.1 ms, and no round trip passed 5 ms. So the worker
+  frees the main loop only where no other endpoint of the device completes
+  during the call.
+
 **Unknown**: a guest's view of a device on a USB 3 port; whether macOS
 guests before 26 drive the controller with 14 ports as with 8.
 
