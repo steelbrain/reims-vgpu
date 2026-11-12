@@ -3478,11 +3478,8 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	RgfxSurfaceBindings _fragmentSurfaces;
 	RgfxSurfaceBindings _objectSurfaces;
 	RgfxSurfaceBindings _meshSurfaces;
-	// The pipeline's functions' arguments, by stage.
-	std::shared_ptr<const RgfxAirFunction> _vertexAir;
-	std::shared_ptr<const RgfxAirFunction> _fragmentAir;
-	std::shared_ptr<const RgfxAirFunction> _objectAir;
-	std::shared_ptr<const RgfxAirFunction> _meshAir;
+	// The pipeline's functions' arguments, by stage, borrowed from `_pipeline`, which holds them.
+	RgfxStageArguments _air;
 	// Whether the host makes mesh pipelines, so the object and mesh stages' commands are sent.
 	BOOL _meshes;
 	// The index the encoder's indexed strips restart at since setPrimitiveRestartEnabled:YES
@@ -3493,10 +3490,10 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 
 - (void)rgfxNoteDrawWrites
 {
-	_vertexSurfaces.noteWrites(_enc, _vertexAir.get());
-	_fragmentSurfaces.noteWrites(_enc, _fragmentAir.get());
-	_objectSurfaces.noteWrites(_enc, _objectAir.get());
-	_meshSurfaces.noteWrites(_enc, _meshAir.get());
+	_vertexSurfaces.noteWrites(_enc, _air.vertex);
+	_fragmentSurfaces.noteWrites(_enc, _air.fragment);
+	_objectSurfaces.noteWrites(_enc, _air.object);
+	_meshSurfaces.noteWrites(_enc, _air.mesh);
 }
 
 - (void)rgfxSetUploads:(std::shared_ptr<RgfxUploadArena>)uploads
@@ -3614,18 +3611,10 @@ RGFX_LOG_UNRECOGNIZED
 {
 	if (pipelineState != _pipeline) {
 		_pipeline = pipelineState;
-		if ([(id)pipelineState isKindOfClass:[RgfxRenderPipelineState class]]) {
-			RgfxRenderPipelineState *state = (RgfxRenderPipelineState *)pipelineState;
-			_vertexAir = [state rgfxVertexAirFunction];
-			_fragmentAir = [state rgfxFragmentAirFunction];
-			_objectAir = [state rgfxObjectAirFunction];
-			_meshAir = [state rgfxMeshAirFunction];
-		} else {
-			_vertexAir = nullptr;
-			_fragmentAir = nullptr;
-			_objectAir = nullptr;
-			_meshAir = nullptr;
-		}
+		if ([(id)pipelineState isKindOfClass:[RgfxRenderPipelineState class]])
+			_air = [(RgfxRenderPipelineState *)pipelineState rgfxStageArguments];
+		else
+			_air = {};
 		_vertexSurfaces.pipelineChanged();
 		_fragmentSurfaces.pipelineChanged();
 		_objectSurfaces.pipelineChanged();

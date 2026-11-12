@@ -30,6 +30,15 @@
 class RgfxSerializer;
 class RgfxReplyReader;
 class RgfxKnownPipelines;
+
+/// A render pipeline's four stages' function arguments (RgfxRenderPipelineState's
+/// rgfxStageArguments), borrowed from the pipeline state.
+struct RgfxStageArguments {
+	const RgfxAirFunction *vertex;
+	const RgfxAirFunction *fragment;
+	const RgfxAirFunction *object;
+	const RgfxAirFunction *mesh;
+};
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
@@ -124,6 +133,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// fragment pipeline, which has neither stage.
 - (std::shared_ptr<const RgfxAirFunction>)rgfxObjectAirFunction;
 - (std::shared_ptr<const RgfxAirFunction>)rgfxMeshAirFunction;
+/// The four stages' arguments as the four getters above answer them, borrowed: the pipeline
+/// state holds them for as long as it lives, so an encoder that holds the state reads them
+/// without a reference count's two atomic operations each, at every setRenderPipelineState:.
+- (RgfxStageArguments)rgfxStageArguments;
 #endif
 
 @end

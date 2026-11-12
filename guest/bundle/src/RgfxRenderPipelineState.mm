@@ -60,12 +60,20 @@ bool fillFunctionRef(RgfxFunctionRef &fr, id<MTLFunction> fn)
 	return true;
 }
 
+/// The arguments of a stage with no function, which binds nothing: one for every pipeline.
+const std::shared_ptr<const RgfxAirFunction> &noStageArguments()
+{
+	static const std::shared_ptr<const RgfxAirFunction> none =
+	    std::make_shared<const RgfxAirFunction>();
+	return none;
+}
+
 /// The arguments of a stage's function `fn`, an RgfxFunction or nil: none for no function, which
 /// binds nothing; null where they are unknown.
 std::shared_ptr<const RgfxAirFunction> stageArguments(id<MTLFunction> fn)
 {
 	if (fn == nil)
-		return std::make_shared<const RgfxAirFunction>();
+		return noStageArguments();
 	return [(RgfxFunction *)fn rgfxAirFunction];
 }
 
@@ -690,12 +698,22 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 
 - (std::shared_ptr<const RgfxAirFunction>)rgfxObjectAirFunction
 {
-	return _mesh ? _objectAir : stageArguments(nil);
+	return _mesh ? _objectAir : noStageArguments();
 }
 
 - (std::shared_ptr<const RgfxAirFunction>)rgfxMeshAirFunction
 {
-	return _mesh ? _meshAir : stageArguments(nil);
+	return _mesh ? _meshAir : noStageArguments();
+}
+
+- (RgfxStageArguments)rgfxStageArguments
+{
+	RgfxStageArguments a;
+	a.vertex = _vertexAir.get();
+	a.fragment = _fragmentAir.get();
+	a.object = _mesh ? _objectAir.get() : noStageArguments().get();
+	a.mesh = _mesh ? _meshAir.get() : noStageArguments().get();
+	return a;
 }
 
 - (instancetype)initWithObjId:(uint64_t)objId
