@@ -431,8 +431,15 @@ pub struct HeapObject {
 /// (`heap-two-plane-texture`, [`crate::answer::HEARD`]): only those are [`Alone::TwoPlane`] here,
 /// the kind the creation heard, not one the format and shape would predict. So is a depth or
 /// stencil texture without `allowGPUOptimizedContents` whose creation heard
-/// `optimized-depth-stencil-texture` [`Alone::Optimized`], and a texture of a heap over the guest's
-/// pages whose creation heard `heap-texture-untiled-layout` [`Alone::Untiled`].
+/// `optimized-depth-stencil-texture` [`Alone::Optimized`].
+///
+/// A texture of a heap over the guest's pages whose creation heard `heap-texture-untiled-layout`
+/// is kept among the others, as Metal's: the runtime lays it out in the device's image bound to
+/// the pages, its texels in the driver's rows where this host's Metal tiles them
+/// (`crate::gpu::undefined::heap_layout`, measured), and a buffer or texture over its bytes, the
+/// heap's cover and the guest's pages under it included, meets those rows. Metal documents no
+/// layout of a texture's bytes in a heap, and its creation relays the kind, the first time alone
+/// ([`crate::answer::HEARD`]).
 ///
 /// Core makes a buffer over all of the bytes the heap's descriptor asked for with each heap, at
 /// its creation, before anything else is asked of it: a detached heap's cover buffer, which a
@@ -447,8 +454,7 @@ pub struct HeapObject {
 /// ([`Alone::dies_beside_the_cover`]): the cover, and the guest's pages under a heap over them,
 /// which the guest reads with no call to die at, would show the bytes the runtime leaves in the
 /// heap for it, which nothing shows are Metal's: none of a two-plane texture's texels, which lie
-/// apart; an untiled one's in the runtime's layout, where Metal's are its tiles; an optimized
-/// one's laid out and sized by the runtime, larger than Metal's.
+/// apart; an optimized one's laid out and sized by the runtime, larger than Metal's.
 ///
 /// In a legacy heap, core's copies through the heap's private buffer carry the bytes of its
 /// textures to and from the guest's pages: the runtime lays a texture out there in Metal's tiles
@@ -488,10 +494,6 @@ pub enum Alone {
     /// (`optimized-depth-stencil-texture`): the other's bytes may lie past Metal's texture, which
     /// shares none of them, and the placement does not tell them from Metal's.
     Optimized,
-    /// A texture of a heap over the guest's pages that the runtime does not lay out in Metal's
-    /// tiles (`heap-texture-untiled-layout`): its bytes in the heap are the runtime's layout,
-    /// where Metal's are its tiles, so the other would meet other bytes than on Metal.
-    Untiled,
 }
 
 impl Alone {
@@ -508,11 +510,6 @@ impl Alone {
                  runtime sizes the texture as Metal's with the property on, larger than Metal's \
                  with it off (optimized-depth-stencil-texture), so the bytes they share may lie \
                  past Metal's texture"
-            }
-            Alone::Untiled => {
-                "a texture of its heap over the guest's pages that the runtime does not lay out \
-                 in Metal's tiles: its bytes in the heap are the runtime's layout, where Metal's \
-                 are its tiles (heap-texture-untiled-layout)"
             }
         }
     }
@@ -2001,11 +1998,12 @@ impl Heap<VulkanPlatform> for VulkanHeap {
     /// another's, and a nil inside the heap of such a texture, whose size the runtime answers
     /// larger than Metal's (`optimized-depth-stencil-texture`), where Metal's own size fits there
     /// or is not modelled; where it does not fit either, the nil is Metal's
-    /// ([`HeapObject::optimized_nil`]); and one over a
-    /// byte of a texture over the guest's pages that the runtime does not lay out in Metal's
-    /// tiles, and such a texture over another's (`heap-texture-untiled-layout`,
-    /// [`Alone::Untiled`]). Each of the three kinds dies, too, where the heap's cover lives, so in
-    /// every heap core makes ([`Placements`]). A 2- or 4-sample texture that Metal keeps losslessly
+    /// ([`HeapObject::optimized_nil`]). Each of the two kinds dies, too, where the heap's cover
+    /// lives, so in every heap core makes ([`Placements`]). A texture over the guest's pages that
+    /// the runtime lays out in the device's rows there, not Metal's tiles
+    /// (`heap-texture-untiled-layout`), is placed as any other, beside the cover and over or under
+    /// any buffer or texture, and its creation relays the kind ([`Placements`]). A 2- or 4-sample
+    /// texture that Metal keeps losslessly
     /// compressed, whose image the runtime keeps apart from the heap's bytes over the guest's
     /// pages (`heap-texture-lossless-layout`), dies as it is made ([`crate::answer::HEARD`]). So
     /// does, as it is placed or answered nil, a texture whose layout in Metal's heaps the runtime
@@ -2060,7 +2058,8 @@ impl Heap<VulkanPlatform> for VulkanHeap {
         }
         made.map(|t| {
             t.map(|raw| {
-                // Over the guest's pages alone, as an untiled one is (below).
+                // Over the guest's pages alone: in a legacy heap, over the device's memory, what
+                // the runtime announces of the texture's layout there is relayed alone.
                 let lossless = heard.contains(&rt::Degradation::HeapTextureLosslessLayout)
                     && self.backing.detaches();
                 if lossless && desc.sample_count > 1 {
@@ -2085,17 +2084,12 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                 let bytes = offset.min(heap_size)..end.min(heap_size);
                 let under = Under::Heap(self.clone_ref(), bytes.clone());
                 let texture = self.device.texture_in(raw, under, 0);
-                // Over the guest's pages alone: in a legacy heap, over the device's memory, what
-                // the runtime announces of the texture's layout there (untiled, or lossless where
-                // Metal compresses it) is relayed alone.
-                let untiled = heard.contains(&rt::Degradation::HeapTextureUntiledLayout)
-                    && self.backing.detaches();
+                // An untiled one, its bytes the device's rows, is kept among the others
+                // ([`Placements`]).
                 let alone = if heard.contains(&rt::Degradation::HeapTwoPlaneTexture) {
                     Some(Alone::TwoPlane)
-                } else if optimized {
-                    Some(Alone::Optimized)
                 } else {
-                    untiled.then_some(Alone::Untiled)
+                    optimized.then_some(Alone::Optimized)
                 };
                 let object = texture.life();
                 plain(|| self.placed.lock().place(sel, bytes, object, alone));
@@ -4992,7 +4986,6 @@ pub(crate) mod tests {
         let kinds = [
             (Alone::TwoPlane, "heap-two-plane-texture"),
             (Alone::Optimized, "optimized-depth-stencil-texture"),
-            (Alone::Untiled, "heap-texture-untiled-layout"),
         ];
         for (why, named) in kinds {
             let mut p = Placements::default();

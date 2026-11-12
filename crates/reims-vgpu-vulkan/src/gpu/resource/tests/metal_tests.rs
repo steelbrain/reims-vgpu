@@ -3661,6 +3661,44 @@ fn depth_stencil_targets_beside_the_heaps_cover_are_made_as_metals() {
     uploading_depth(&d, PLACED, || beside_the_cover(&p, &d, "Vulkan"));
 }
 
+/// A `BGRA8Unorm` texture of 16x16 placed in a heap over the guest's pages, which the runtime
+/// lays out in the device's image bound to the pages, its texels in the driver's rows where this
+/// host's Metal tiles them (`heap-texture-untiled-layout`, relayed; MoltenVK too), is made
+/// beside the heap's cover, core's buffer over all of it, made first; and so are a buffer over
+/// its bytes and a second such texture over them while it lives, as Metal makes each: the cover,
+/// the buffer and the guest's pages meet the device's rows where Metal's tiles would lie
+/// ([`Placements`]). Each of them died up to metal2vulkan's RUNTIME_VERSION 2105, which made
+/// that image the first layout of such a texture
+#[test]
+fn untiled_heap_textures_share_their_bytes_as_metals() {
+    let (p, d) = (platform(), dev());
+    let (heap, ..) = heap_over_pages(&p, &d);
+    let options = heap.resource_options();
+    let cover = heap.new_buffer_of_length(over_pages(), options, 0).unwrap();
+    assert!(cover.is_some(), "the cover");
+    let colour = p.texture_descriptor(&TextureDesc {
+        pixel_format: 80,
+        width: 16,
+        height: 16,
+        usage: 0x13,
+        resource_options: Some(options),
+        ..TextureDesc::default()
+    });
+    let before = crate::answer::RELAYED.lock().len();
+    let t = heap.new_texture(&colour, 0).unwrap();
+    assert!(t.is_some(), "the texture beside the cover");
+    let relayed = crate::answer::RELAYED.lock()[before..].to_vec();
+    assert!(
+        relayed.contains(&rt::Degradation::HeapTextureUntiledLayout),
+        "the texture's layout: {relayed:?}"
+    );
+    let over = heap.new_buffer_of_length(0x100, options, 0).unwrap();
+    assert!(over.is_some(), "a buffer over its bytes");
+    let second = heap.new_texture(&colour, 0).unwrap();
+    assert!(second.is_some(), "a texture over its bytes");
+    drop((second, over, t, cover));
+}
+
 /// A view of a texture of a heap over the guest's pages, a 4-sample `Depth16Unorm` render target
 /// without `allowGPUOptimizedContents`, which the runtime lays out in the heap's bytes as Metal's
 /// tiles, a shadow of them (`shadowed-texture`), at Metal's size, shares the texture's bytes as a
@@ -3798,8 +3836,9 @@ fn multisampled_textures_in_a_heap_over_guest_pages_die_where_metal_compresses_t
 /// one past the heap's end, as Metal answers in a heap of its own. A buffer over
 /// all of the heap, as core makes with each heap, is made first. In a `Shared` heap over the
 /// guest's pages, as core's detach heap is, with no such buffer, a `Depth32Float` one is made,
-/// and so are a buffer and a texture over a byte of it while it lives, and such a texture over a
-/// byte of a buffer that lives. Metal makes each made here or dying here. On a device that clamps
+/// and so are a buffer and a texture over a byte of it while it lives (a `BGRA8Unorm` one, which
+/// the runtime lays out in the device's rows there, `heap-texture-untiled-layout`, relayed), and
+/// such a texture over a byte of a buffer that lives. Metal makes each made here or dying here. On a device that clamps
 /// a depth outside `[0, 1]` (MoltenVK), the first texture's making dies of
 /// `restricted-depth-upload` in strict mode, and by default each placement is answered so
 #[test]
