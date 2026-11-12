@@ -29,7 +29,6 @@
  */
 
 #include <IOSurface/IOSurfaceRef.h>
-#include <os/log.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -43,6 +42,7 @@
 #include <mutex>
 #include <vector>
 
+#include "RgfxLog.hpp"
 #include "RgfxVideoChannel.hpp"
 #include "RgfxVideoH264.hpp"
 #include "RgfxVideoH265.hpp"
@@ -639,7 +639,7 @@ const Command *decodeCommand(const Command *c)
 void notSent(std::atomic<bool> &said, const char *why)
 {
 	if (!said.exchange(true))
-		os_log_error(OS_LOG_DEFAULT, "RGFX: video: a picture not sent: %{public}s", why);
+		os_log_error(rgfxLog(), "RGFX: video: a picture not sent: %{public}s", why);
 }
 
 // Logs, once a process, that a schedule failed for a decode (RgfxVideoStatus.hpp), `why`.
@@ -647,7 +647,7 @@ void scheduleFailed(const char *why)
 {
 	static std::atomic<bool> said;
 	if (!said.exchange(true))
-		os_log_error(OS_LOG_DEFAULT, "RGFX: video: a decode reported to AppleGVA as failed: %{public}s",
+		os_log_error(rgfxLog(), "RGFX: video: a decode reported to AppleGVA as failed: %{public}s",
 		             why);
 }
 
@@ -1123,7 +1123,7 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 				                            fi->width, fi->height)) {
 					static std::atomic<bool> said;
 					if (!said.exchange(true))
-						os_log_error(OS_LOG_DEFAULT,
+						os_log_error(rgfxLog(),
 						             "RGFX: video: an H.264 decode of %ux%u refused at its create: "
 						             "the host decodes no picture of its coded size",
 						             fi->width, fi->height);

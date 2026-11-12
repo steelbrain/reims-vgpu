@@ -3,6 +3,7 @@
  */
 
 #import "RgfxIOSurface.h"
+#include "RgfxLog.hpp"
 #include "RgfxLogOnce.hpp"
 
 #import "RgfxBuffer.h"
@@ -14,7 +15,6 @@
 #include <dispatch/dispatch.h>
 #include <map>
 #include <mutex>
-#include <os/log.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -452,7 +452,7 @@ void reportCopies(uint64_t now)
 	uint64_t ip = gInPlace, cc = gCached, ca = gCopiedAlignment, cu = gCopiedUnsupported,
 	         cr = gCopiedRefused, cs = gCopyShared, co = gCopyOwn;
 	// The process's id and name are the log's own.
-	os_log_info(OS_LOG_DEFAULT,
+	os_log_info(rgfxLog(),
 	            "RGFX: surface copies, %.1f s: %llu uploads %.1f MiB %.2f ms, %llu write-backs "
 	            "%.1f MiB %.2f ms; views made: %llu in place (%llu cached), copies %llu for "
 	            "alignment, %llu unsupported, %llu refused by the kext; copy blocks: %llu shared, "

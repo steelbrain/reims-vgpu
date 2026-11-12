@@ -15,9 +15,9 @@
 #include <condition_variable>
 #include <mach/mach_time.h>
 #include <mutex>
-#include <os/log.h>
 #include <unistd.h>
 
+#include "RgfxLog.hpp"
 #include "RgfxSerializer.hpp"
 
 namespace {
@@ -62,7 +62,7 @@ void reportWaits(uint64_t now)
 	if (now - last < kWaitsReportNs ||
 	    !g_waitsReported.compare_exchange_strong(last, now, std::memory_order_relaxed))
 		return;
-	os_log_debug(OS_LOG_DEFAULT,
+	os_log_debug(rgfxLog(),
 	             "RGFX: resource waits so far: %llu waitUntilComplete calls, %llu waited, %.2f ms "
 	             "in all, longest %.2f ms; %llu isComplete or isWriteComplete answered NO",
 	             (unsigned long long)g_waitCalls.load(), (unsigned long long)g_waited.load(),

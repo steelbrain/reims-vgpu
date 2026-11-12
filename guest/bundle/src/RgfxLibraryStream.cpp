@@ -9,9 +9,9 @@
 #include <chrono>
 #include <cstring>
 #include <mutex>
-#include <os/log.h>
 #include <unistd.h>
 
+#include "RgfxLog.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
 
@@ -87,7 +87,7 @@ bool makeWindow(RgfxRegion &region, uint64_t length, Window *w)
 		if (s.chunk < rgfxStagingShape(length, kRgfxStagingChunkMax).chunk) {
 			static std::atomic<bool> logged{false};
 			if (!logged.exchange(true))
-				os_log(OS_LOG_DEFAULT,
+				os_log(rgfxLog(),
 				       "RGFX: a library of %llu bytes streams in chunks of %llu bytes: the region "
 				       "had no room for a larger window (logged once)",
 				       (unsigned long long)length, (unsigned long long)s.chunk);
@@ -96,7 +96,7 @@ bool makeWindow(RgfxRegion &region, uint64_t length, Window *w)
 	} while (rgfxStagingSmaller(&chunkMax));
 	static std::atomic<bool> logged{false};
 	if (!logged.exchange(true))
-		os_log_error(OS_LOG_DEFAULT,
+		os_log_error(rgfxLog(),
 		             "RGFX: no room in the region for a library's staging window, even of %llu "
 		             "bytes: the library of %llu bytes is not made (logged once)",
 		             (unsigned long long)rgfxStagingShape(length, kRgfxStagingPage).bytes,
@@ -163,7 +163,7 @@ bool rgfxStreamLibrary(RgfxRegion &region, RgfxSerializer &ser, const uint8_t *b
 	} else {
 		static std::atomic<bool> logged{false};
 		if (!logged.exchange(true))
-			os_log_error(OS_LOG_DEFAULT,
+			os_log_error(rgfxLog(),
 			             "RGFX: the host did not copy a library's chunk out of its staging window "
 			             "in time: the window's %llu bytes are kept (logged once)",
 			             (unsigned long long)w.shape.bytes);

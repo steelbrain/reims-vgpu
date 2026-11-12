@@ -5,13 +5,13 @@
  */
 
 #include "RgfxRingWriter.hpp"
+#include "RgfxLog.hpp"
 #include "RgfxLogOnce.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <memory>
-#include <os/log.h>
 #include <thread>
 
 namespace {
@@ -210,7 +210,7 @@ void RgfxRingWriter::noteSleep(std::chrono::steady_clock::time_point from, bool 
 
 void RgfxRingWriter::logSleeps(const RgfxRingRoomSleeps &seen) const
 {
-	os_log(OS_LOG_DEFAULT,
+	os_log(rgfxLog(),
 	       "RGFX: ring %u room: %llu sleeps (%llu ended by a SUBMIT_ROOM record), %llu us asleep "
 	       "in all, %llu us at most",
 	       m_ringId, seen.sleeps, seen.woken, seen.sleptNs / 1000, seen.mostNs / 1000);

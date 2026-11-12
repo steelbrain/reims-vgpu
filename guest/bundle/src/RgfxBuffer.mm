@@ -10,12 +10,12 @@
 
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
-#include <os/log.h>
 
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
 
+#include "RgfxLog.hpp"
 #include "RgfxManagedLayout.hpp"
 #include "RgfxMemoryShadow.hpp"
 #include "RgfxRegion.hpp"
@@ -737,7 +737,7 @@ RGFX_RESOURCE_SPI
 	        : [device minimumLinearTextureAlignmentForPixelFormat:descriptor.pixelFormat];
 	if (alignment <= 1 || (offset % alignment == 0 && bytesPerRow % alignment == 0))
 		return YES;
-	os_log_debug(OS_LOG_DEFAULT,
+	os_log_debug(rgfxLog(),
 	             "RGFX: a texture over buffer 0x%llx at offset %lu, %lu bytes a row (format %lu): "
 	             "not at the device's linear texture alignment, %lu: answered nil",
 	             (unsigned long long)[self rgfxObjId], (unsigned long)offset,

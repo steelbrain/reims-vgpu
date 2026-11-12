@@ -128,7 +128,7 @@ CORE_SRCS = src/RgfxObjectModel.cpp src/RgfxCaps.cpp src/RgfxRingWriter.cpp \
 	src/RgfxBinaryArchiveFile.cpp src/RgfxAirArguments.cpp src/RgfxKnownPipelines.cpp \
 	src/RgfxSlabs.cpp src/RgfxIcbSlotTable.cpp \
 	src/RgfxLibraryStream.cpp src/RgfxMetallibWriter.cpp src/RgfxGLLowering.cpp \
-	src/RgfxClMode.cpp
+	src/RgfxClMode.cpp src/RgfxLog.cpp
 
 # The video driver AppleGVA loads from this bundle (C++, src/RgfxVideoDriver.cpp): bundle only.
 VIDEO_SRCS = src/RgfxVideoDriver.cpp src/RgfxVideoH264.cpp src/RgfxVideoH265.cpp
@@ -353,10 +353,13 @@ $(VIDEO_H265_TESTBIN): $(BUILD)/obj/$(ARCH)/core/RgfxVideoH265.o tests/video_h26
 		tests/video_h265_tests.cpp -o $@
 
 # --- the video driver's entry points over a stand-in for the host's sessions (x86_64, Rosetta) ----
+# The driver logs through the bundle's log object (src/RgfxLog.cpp).
 
-$(VIDEO_DRIVER_TESTBIN): $(VIDEO_OBJ_ARCH) tests/video_driver_tests.cpp $(HEADERS) Makefile
+VIDEO_DRIVER_TESTOBJS = $(VIDEO_OBJ_ARCH) $(BUILD)/obj/$(ARCH)/core/RgfxLog.o
+
+$(VIDEO_DRIVER_TESTBIN): $(VIDEO_DRIVER_TESTOBJS) tests/video_driver_tests.cpp $(HEADERS) Makefile
 	@mkdir -p $(@D)
-	$(CXX) -arch $(ARCH) $(CXXFLAGS) -I tests $(VIDEO_OBJ_ARCH) tests/video_driver_tests.cpp \
+	$(CXX) -arch $(ARCH) $(CXXFLAGS) -I tests $(VIDEO_DRIVER_TESTOBJS) tests/video_driver_tests.cpp \
 		-framework IOSurface -framework CoreFoundation -o $@
 
 test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(AIR_OLD_LIB) $(AIR_11_LIB) $(AIR_REFLECTED) $(ORACLE_REFLECTION_LIB) \
@@ -377,6 +380,7 @@ test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(AIR_OLD_LIB) $(AIR_11_LIB) $(AI
 	arch -$(ARCH) $(VIDEO_H265_TESTBIN)
 	arch -$(ARCH) $(VIDEO_DRIVER_TESTBIN)
 	bash tests/bundle_files_check.sh $(BUNDLEBIN)
+	bash tests/bundle_log_check.sh $(BUNDLEBIN) Info.plist src/RgfxLog.hpp
 
 # --- the wire round trip against the host's library (native arch, this Mac's GPU) ----------
 # The bundle's own ring code (the serialiser, a queue's rings, reader and completion thread, a

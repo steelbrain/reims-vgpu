@@ -8,7 +8,7 @@
 #include <algorithm>
 #include <iterator>
 
-#include <os/log.h>
+#include "RgfxLog.hpp"
 
 namespace {
 uint64_t alignUp(uint64_t value, uint64_t align)
@@ -59,7 +59,7 @@ uint64_t RgfxIdSpace::allocResourceId()
 		// (measured: Safari's WebContent on macOS 12.7.6, BadResourceId at the host).
 		if (granted != 0) {
 			if (granted % RGFX_RESOURCE_ID_SMALL_CHUNK != 0 || granted > RGFX_RESOURCE_ID_CHUNK) {
-				os_log_error(OS_LOG_DEFAULT,
+				os_log_error(rgfxLog(),
 				             "RGFX: a resource-id chunk of %llu ids from the kext is no chunk; "
 				             "no texture",
 				             (unsigned long long)granted);
@@ -173,7 +173,7 @@ uint64_t RgfxIdSpace::allocAddress(uint64_t size, uint64_t align)
 		uint64_t live = 0;
 		for (const auto &pick : m_livePicks)
 			live += pick.second;
-		os_log_error(OS_LOG_DEFAULT,
+		os_log_error(rgfxLog(),
 		             "RGFX: no GPU address left for %llu bytes: %llu MiB of the context's range "
 		             "in %llu picks",
 		             (unsigned long long)size, (unsigned long long)(live >> 20),

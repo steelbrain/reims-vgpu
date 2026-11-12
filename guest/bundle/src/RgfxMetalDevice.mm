@@ -9,6 +9,7 @@
  */
 
 #import "RgfxMetalDevice.h"
+#include "RgfxLog.hpp"
 #include "RgfxLogOnce.hpp"
 
 #import "RgfxBuffer.h"
@@ -29,7 +30,6 @@
 #include <mach/mach_vm.h>
 #include <memory>
 #include <mutex>
-#include <os/log.h>
 #include <vector>
 
 #include "RgfxCommitOrder.hpp"
@@ -269,7 +269,7 @@ RgfxCompletionThread::WaitResult rgfxKextWaitCompletions(void *context, uint64_t
 		return RgfxCompletionThread::kWoke;
 	if (kr == kIOReturnAborted)
 		return RgfxCompletionThread::kRetry; // a signal broke the sleep
-	os_log_error(OS_LOG_DEFAULT, "RGFX: the completion wait ended kr=0x%x; waiters take the rings",
+	os_log_error(rgfxLog(), "RGFX: the completion wait ended kr=0x%x; waiters take the rings",
 	             kr);
 	// A resource's wait has no ring to take: it waits no more.
 	RgfxResourceWaitsStop();
@@ -588,7 +588,7 @@ uint32_t rgfxKextShareEvent(void *context, RgfxObjId event)
 	if (kr != KERN_SUCCESS || outCount != 1 || status != RGFX_STATUS_OK) {
 		static char site;
 		if (rgfxLogFirst(&site, (static_cast<uint64_t>(kr) << 32) ^ status))
-			os_log_error(OS_LOG_DEFAULT, "RGFX: shared event 0x%llx: no port (kr=0x%x status %llu)",
+			os_log_error(rgfxLog(), "RGFX: shared event 0x%llx: no port (kr=0x%x status %llu)",
 			             (unsigned long long)event, kr, (unsigned long long)status);
 		IOServiceClose(port);
 		return MACH_PORT_NULL;
@@ -698,7 +698,7 @@ RGFX_LOG_UNRECOGNIZED
 	if (self == nil) {
 		// Apple's IOGPU base declined the accelerator: its own device calls (RgfxIOGPUReplies.hpp)
 		// failed in this process, or its sandbox refused them.
-		os_log_error(OS_LOG_DEFAULT,
+		os_log_error(rgfxLog(),
 		             "RGFX: the IOGPU base declined the accelerator; no Metal device in this "
 		             "process");
 		return nil;
@@ -722,7 +722,7 @@ RGFX_LOG_UNRECOGNIZED
 	// otherwise).
 	kern_return_t kr = IOServiceOpen(port, mach_task_self(), kRgfxAccelUserClientType, &_conn);
 	if (kr != KERN_SUCCESS) {
-		os_log_error(OS_LOG_DEFAULT,
+		os_log_error(rgfxLog(),
 		             "RGFX: IOServiceOpen(type=%u) failed kr=0x%x; no Metal device in this "
 		             "process",
 		             kRgfxAccelUserClientType, kr);
@@ -738,7 +738,7 @@ RGFX_LOG_UNRECOGNIZED
 	kr = IOConnectCallScalarMethod(_conn, kRgfxAccelMethodFeatures, nullptr, 0, features,
 	                               &featuresCount);
 	if (!_caps.takeFeatures(kr, featuresCount, features)) {
-		os_log_error(OS_LOG_DEFAULT,
+		os_log_error(rgfxLog(),
 		             "RGFX: the features call (selector %u) answered kr=0x%x, %u words, selector "
 		             "map %llu, where this bundle's map is %u: a kext of another selector map, or "
 		             "a sandbox that refuses the call; no Metal device in this process",
@@ -761,7 +761,7 @@ RGFX_LOG_UNRECOGNIZED
 	kr = IOConnectCallStructMethod(_conn, kRgfxAccelMethodDeviceInfo, nullptr, 0, &blob,
 	                               &infoSize);
 	if (kr != KERN_SUCCESS || infoSize != sizeof(blob) || !_caps.load(blob.info)) {
-		os_log_error(OS_LOG_DEFAULT,
+		os_log_error(rgfxLog(),
 		             "RGFX: the device info was not read (kr=0x%x, %zu of %zu bytes) or is of "
 		             "version %u, where this bundle reads %u; no Metal device in this process",
 		             kr, infoSize, sizeof(blob), (unsigned)blob.info.version,
@@ -777,10 +777,10 @@ RGFX_LOG_UNRECOGNIZED
 	} else if (blob.video.version == 0) {
 		// A host with no hardware video writes no caps: a macOS host, whose library has no
 		// video arm, or a Linux host where neither NVDEC nor VA-API opens on the GPU.
-		os_log(OS_LOG_DEFAULT,
+		os_log(rgfxLog(),
 		       "RGFX: the host has no hardware video; this process's device has no video codec");
 	} else {
-		os_log_error(OS_LOG_DEFAULT,
+		os_log_error(rgfxLog(),
 		             "RGFX: the host's video caps are of version %u, where this bundle reads %u; "
 		             "this process's device has no video codec",
 		             (unsigned)blob.video.version, (unsigned)RGFX_VIDEO_CAPS_VERSION);
@@ -805,7 +805,7 @@ RGFX_LOG_UNRECOGNIZED
 		// The kext has no range of GPU addresses left for another process: no device here, the
 		// answer every Metal client handles, where a device whose every create answers nil
 		// stops the frameworks that make their first objects at its open.
-		os_log_error(OS_LOG_DEFAULT,
+		os_log_error(rgfxLog(),
 		             "RGFX: OPEN_CONTEXT refused: the device holds as many processes as it "
 		             "can; no Metal device in this one");
 		IOServiceClose(_conn);
@@ -814,7 +814,7 @@ RGFX_LOG_UNRECOGNIZED
 	}
 	if (kr != KERN_SUCCESS || ctxCount != ctxWanted || ctx[3] == 0 ||
 	    ctx[4] < RGFX_ALLOCATIONS_OFFSET || ctx[5] == 0) {
-		os_log_error(OS_LOG_DEFAULT,
+		os_log_error(rgfxLog(),
 		             "RGFX: OPEN_CONTEXT failed kr=0x%x (window 0x%llx, %llu bytes); no Metal "
 		             "device in this process",
 		             kr, (unsigned long long)ctx[3], (unsigned long long)ctx[4]);
@@ -916,14 +916,14 @@ RGFX_LOG_UNRECOGNIZED
 		_slabs->setFirst(_pagesSource.get());
 	}
 	if (!_slabs->start())
-		os_log_error(OS_LOG_DEFAULT,
+		os_log_error(rgfxLog(),
 		             "RGFX: no slab thread; creates zero and frees let slabs go themselves");
 	// A block the kext has no room for is asked again once the slabs the process keeps went.
 	_region->setReclaim(&rgfxRegionReclaim, _slabs.get());
 	// The queues' completions, taken as the kext wakes the thread for them.
 	_completions = std::make_unique<RgfxCompletionThread>(&rgfxKextWaitCompletions, connContext);
 	if (!_completions->start()) {
-		os_log_error(OS_LOG_DEFAULT, "RGFX: no completion thread; waiters take the rings");
+		os_log_error(rgfxLog(), "RGFX: no completion thread; waiters take the rings");
 		RgfxResourceWaitsStop();
 		_completions.reset();
 	}

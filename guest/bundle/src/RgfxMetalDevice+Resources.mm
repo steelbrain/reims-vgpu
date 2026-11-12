@@ -5,6 +5,7 @@
  */
 
 #import "RgfxMetalDevice+Resources.h"
+#include "RgfxLog.hpp"
 #include "RgfxLogOnce.hpp"
 
 #import "RgfxBlockCall.h"
@@ -22,7 +23,6 @@
 #include "RgfxSerializer.hpp"
 
 #import <objc/message.h>
-#include <os/log.h>
 
 #include <cstdio>
 #include <mutex>
@@ -41,7 +41,7 @@ void noteNil(const char *creator, const char *cause, const std::string &asked)
 	static char site;
 	if (!rgfxLogFirst(&site, rgfxLogKindOf(creator) ^ (rgfxLogKindOf(cause) * 31)))
 		return;
-	os_log_info(OS_LOG_DEFAULT,
+	os_log_info(rgfxLog(),
 	            "RGFX: the device answers nil at %{public}s (%{public}s): %{public}s", creator,
 	            cause, asked.c_str());
 }
