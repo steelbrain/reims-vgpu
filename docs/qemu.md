@@ -908,6 +908,33 @@ reached the menu in 40 s and listed the NVMe disk in Disk Utility (job
 20143). No boot with that set was watched past 13 minutes, so whether its
 Recovery came up at last, and without the disk, as reported, was not seen.
 
+**Measured** on 2026-11-12, six cold boots of macOS 26.7.2 (25G332) on
+`homelab-um790-xtx-1`, three with the disk on NVMe and three on AHCI, in
+turn, each from a reflink clone of the same disk, with reims-ctl's two disk
+lines above, on the Radeon 780M and 8 GiB of guest RAM (jobs m3-max-21073,
+21194, 21195 and 21196; the host's disk as in "Linux hosts: the guest's
+disk"):
+- The guest booted sooner on NVMe. It answered SSH 9.9 s after QEMU
+  started on NVMe and 12.9 to 13.0 s on AHCI. loginwindow started at 5.6 to
+  5.9 s on NVMe and 8.9 to 9.0 s on AHCI, and Finder at 14.4 to 14.7 s and
+  18.1 to 18.2 s.
+- Two of the three NVMe boots had waits in their first 150 s (a wait as in
+  "Linux hosts: the guest's disk", here of 300 ms or more): 3, 7.76 s in
+  all, and 7, 13.67 s in all. The third had none, and no AHCI boot had one.
+  Each NVMe wait began with a guest flush or write outstanding and 28 to 192
+  commands behind it, while the host's SSD had a single request in flight.
+  Most came within 2 s of the guest's TRIMs (300 to 390 a boot), which
+  reach the image only on NVMe, through `discard=unmap`.
+- A 2 GiB file written from `/dev/urandom` (about 500 MB/s in the guest)
+  reached QEMU in 8.3 to 12.0 s on NVMe, with 1 to 4 waits, and in 4.8 s on
+  AHCI, with none. Read back after a `purge`, it took 0.56 to 0.60 s on NVMe
+  and 0.83 to 0.87 s on AHCI. The first GiB of a `tar` of
+  `/System/Library/Frameworks` took 7.4 to 8.5 s on either.
+
+**Unknown**: whether NVMe without `discard=unmap` waits as it does with it
+there, and how NVMe and AHCI compare on a host whose SSD shows no waits
+(`homelab-um870-1`'s, above).
+
 ### x86-64 macOS guests: VMware SVGA
 
 reims-ctl runs an x86-64 VM with `graphics = "vmware-svga"` on QEMU's VMware
