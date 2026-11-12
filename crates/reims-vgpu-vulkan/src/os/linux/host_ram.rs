@@ -398,12 +398,15 @@ mod tests {
     ///
     /// The runtime imports the chunk as the first object over it asks, where the RAM has a source
     /// of dma-bufs (`/dev/udmabuf` opens), or on its own thread ahead of every object, where it has
-    /// none. An object made before the chunk's import ends is bound in an import of its own run,
-    /// waiting for none, but where the device's barriers do not order blits through two imports
-    /// of the same pages (ANV's, MoltenVK's), where it is bound in the chunk (metal2vulkan's
-    /// `host_ram.rs`, "No object waits for a chunk"). So the test makes the first buffer, waits
-    /// for the chunk's import, and makes the second, which lies in the chunk; the first is bound
-    /// once, in one of the two.
+    /// none. An object made before the chunk's import ends imports the chunk or waits for the
+    /// import under way, and lies in it: no object is bound in an import of its own run
+    /// (metal2vulkan's `host_ram.rs`, "An object over a chunk not imported yet"). The test makes
+    /// the first buffer, waits for the chunk's import, and makes the second; both lie in the chunk,
+    /// which is imported once. Where the plan is listed instead (the RAM has a source of dma-bufs
+    /// and each held import costs every submission, the device's submission check measured:
+    /// `releases_idle_pointer_imports`), a chunk is imported only for a copy over it, and an
+    /// object over a chunk not imported takes its own import and asks for none: neither buffer
+    /// lies in the RAM, and no chunk is imported.
     #[test]
     fn a_buffer_over_one_run_of_the_ram_is_bound_in_its_chunk() {
         let device = dev();
@@ -427,11 +430,7 @@ mod tests {
         let at = start.addr().to_u64();
         let counts = || {
             let c = device.raw.work_counts();
-            (
-                c.host_ram_chunks_imported,
-                c.chunk_bound_buffers_made,
-                c.run_bound_buffers_made,
-            )
+            (c.host_ram_chunks_imported, c.chunk_bound_buffers_made)
         };
         let before = counts();
         let lease = lease_guest_memory([GuestRamFile {
@@ -449,9 +448,11 @@ mod tests {
                 .unwrap()
                 .unwrap()
         };
+        // The plan is fixed as the RAM's use begins, after the device's checks answered.
+        let listed = super::super::dma_buf::opens() && device.raw.releases_idle_pointer_imports();
         let a = over(MIB, 2 * PAGE);
         let after_a = counts();
-        if imports_need_files() {
+        if imports_need_files() && !listed {
             // The RAM is one chunk (8 MiB): its import is given 20 s to end.
             let imported = (0..4000).any(|_| {
                 let done = counts().0 > before.0;
@@ -465,20 +466,21 @@ mod tests {
         let imported = counts();
         let b = over(3 * MIB, PAGE);
         let now = counts();
-        let first = (after_a.1 - before.1, after_a.2 - before.2);
-        let second = (now.0 - imported.0, now.1 - imported.1, now.2 - imported.2);
-        match imports_need_files() {
-            true => {
+        let first = after_a.1 - before.1;
+        let second = (now.0 - imported.0, now.1 - imported.1);
+        match (imports_need_files(), listed) {
+            (true, false) => {
                 assert_eq!(now.0 - before.0, 1, "the chunk imported once");
-                assert!(
-                    first == (1, 0) || first == (0, 1),
-                    "the first buffer bound once, in the chunk or its run: {first:?}"
-                );
-                assert_eq!(second, (0, 1, 0), "the second bound in the chunk");
+                assert_eq!(first, 1, "the first bound in the chunk");
+                assert_eq!(second, (0, 1), "the second bound in the chunk");
             }
-            false => {
-                let made = (now.0 - before.0, now.1 - before.1, now.2 - before.2);
-                assert_eq!(made, (0, 0, 0), "the RAM serves copies alone");
+            (true, true) => {
+                let made = (now.0 - before.0, first, second.1);
+                assert_eq!(made, (0, 0, 0), "no chunk imported, no buffer in the RAM");
+            }
+            (false, _) => {
+                let made = (now.0 - before.0, now.1 - before.1);
+                assert_eq!(made, (0, 0), "the RAM serves copies alone");
             }
         }
         let q = device.new_command_queue().unwrap();
