@@ -14,9 +14,9 @@
 // A listed selector this macOS's base classes lack is reported, not failed: the guest's macOS can
 // differ.
 // It also checks the x86 device's answer to newResidencySetWithDescriptor:error:: nil, its error
-// out left as it was, as the x86 Macs answer (measured: macOS 26.7.1, the AMD Radeon Pro 5300M
-// and the Intel UHD 630); the refusals Metal answers at a URL before it reads it (checkUrlRefusals);
-// and that each call Metal's device ends the process at for its argument
+// out set to nil from an error it held, as the x86 Macs answer (measured: macOS 26.7.1, the AMD
+// Radeon Pro 5300M and the Intel UHD 630); the refusals Metal answers at a URL before it reads it
+// (checkUrlRefusals); and that each call Metal's device ends the process at for its argument
 // ends it, in a process of its own (`inherited_tests --dies CASE BUNDLE`), with SIGABRT and
 // Metal's words on stderr.
 #import <Foundation/Foundation.h>
@@ -180,9 +180,9 @@ NSString *signatureDifference(Method ours, Method base)
 	return nil;
 }
 
-// The device's newResidencySetWithDescriptor:error: answers nil and leaves its error out as it
-// was. The member reads none of the device's state, so it is called with the class as `self`,
-// with no device made.
+// The device's newResidencySetWithDescriptor:error: answers nil and sets its error out to nil,
+// though it held an error. The member reads none of the device's state, so it is called with the
+// class as `self`, with no device made.
 void checkResidencySetAnswer(Class device)
 {
 	SEL sel = sel_registerName("newResidencySetWithDescriptor:error:");
@@ -194,9 +194,9 @@ void checkResidencySetAnswer(Class device)
 	NSError *sentinel = [NSError errorWithDomain:@"inherited_tests" code:1 userInfo:nil];
 	NSError *error = sentinel;
 	id set = ((id(*)(id, SEL, id, NSError **))method_getImplementation(m))((id)device, sel, nil, &error);
-	if (set != nil || error != sentinel)
+	if (set != nil || error != nil)
 		fail([NSString stringWithFormat:@"newResidencySetWithDescriptor:error: answers %@, error %@ (want nil, "
-		                                @"the error out untouched)",
+		                                @"the error out set to nil)",
 		                                set, error == sentinel ? @"untouched" : error]);
 }
 

@@ -139,11 +139,11 @@ NSError *metal4Refusal()
 	return nil;
 }
 
-// The x86 Macs answer nil and set no error (measured: macOS 26.7.1, the AMD Radeon Pro 5300M and
-// the Intel UHD 630, the error out nil before and after), so the x86 device leaves `*error` as it
-// is. An M3 makes a set (measured: macOS 27.0.1, the M3 Max, AGXG15XFamilyResidencySet, with no
-// error), which the device cannot: the arm64 device answers nil and an error, as a use the device
-// does not support.
+// The x86 Macs answer nil and set the error out to nil, whatever it held (measured: macOS 26.7.1,
+// the AMD Radeon Pro 5300M and the Intel UHD 630: an error out holding an error before the call
+// holds nil after it), and so does the x86 device. An M3 makes a set (measured: macOS 27.0.1, the
+// M3 Max, AGXG15XFamilyResidencySet, with no error), which the device cannot: the arm64 device
+// answers nil and an error, as a use the device does not support.
 - (id<MTLResidencySet>)newResidencySetWithDescriptor:(MTLResidencySetDescriptor *)desc
                                                error:(NSError **)error
 {
@@ -151,6 +151,8 @@ NSError *metal4Refusal()
 	RGFX_UNSUPPORTED_ERROR(error, "residency sets (none on the wire)");
 #else
 	RGFX_UNSUPPORTED("residency sets (none on the wire)");
+	if (error != nullptr)
+		*error = nil;
 #endif
 	return nil;
 }
