@@ -410,10 +410,15 @@ through dma-bufs"). How the GPU then takes those pages depends on its driver:
     needs. Past that line the library's import gate refuses the pages, and
     the runtime makes the object over a copy of them, which takes no mapping
     (metal2vulkan's `HostMemory::with_import_gate`, announced
-    `copied-host-pages`; with `REIMS_VGPU_STRICT=1` it ends the process). The
-    copy lies in host-cached system memory, compared whole on the CPU at each
-    commit and each completion, and it reads the pages with the CPU, which
-    reads pages left in views through dma-bufs too.
+    `copied-host-pages`; with `REIMS_VGPU_STRICT=1` it ends the process),
+    but pages one dma-buf holds (at udmabuf's defaults 1,024 runs and
+    64 MiB), where the probe found the device takes such a dma-buf in the
+    pointer's place: NVIDIA's driver imports it dedicated to the buffer, so
+    the gate lets them through and they take no mapping (`import.rs`,
+    `ONE_DMA_BUF`). The copy lies in host-cached system memory, compared
+    whole on the CPU at each commit and each completion, and it reads the
+    pages with the CPU, which reads pages left in views through dma-bufs
+    too.
 - **Before anything would die or be refused at the whole budget**, the
   library folds back into dma-bufs the views' pages mapped from their files
   that no live import a device may pin holds, and weighs again (`vm.rs`,

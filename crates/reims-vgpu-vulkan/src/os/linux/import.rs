@@ -313,6 +313,22 @@ pub(crate) fn imports_need_files() -> bool {
     IMPORTS_NEED_FILES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether the device that needs imported pages mapped from their files ([`IMPORTS_NEED_FILES`])
+/// takes a view of pages one dma-buf holds through that dma-buf, which its pointer's refusal
+/// leaves the runtime to import ([`learn_view_imports`]): so the gate lets such pages through
+/// though they lie in views through dma-bufs ([`import_gate`]), and they take no mapping of their
+/// own. NVIDIA's driver imports a dma-buf of scattered guest pages as an allocation dedicated to
+/// its buffer, one dma-buf a buffer (the runtime's `DmaBufFor::Buffer`), and refuses several
+/// under one buffer (no type its dma-bufs import as takes a sparse buffer): so it imports one
+/// udmabuf's pages, at most `list_limit` runs (1,024 by default, 4 MiB of scattered 4 KiB pages)
+/// and `size_limit_mb` MiB, and no more.
+static ONE_DMA_BUF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`ONE_DMA_BUF`].
+fn one_dma_buf_imports() -> bool {
+    ONE_DMA_BUF.load(Ordering::Relaxed)
+}
+
 /// Whether a view of several runs of pages made now is mapped through dma-bufs: udmabuf is the
 /// process's, and no device of it needs imported pages mapped from their files (`super::vm`'s
 /// module docs, "Views through dma-bufs").
@@ -392,6 +408,11 @@ fn gate(first: u64, end: u64) -> bool {
     if pieces.is_empty() {
         return true;
     }
+    // Pages one dma-buf holds, on devices that take such a dma-buf in place of the pointer: the
+    // runtime imports them through it, which takes no mapping ([`ONE_DMA_BUF`]).
+    if one_dma_buf_imports() && super::dma_buf::fits_one(first, end - first).is_ok() {
+        return true;
+    }
     let adding = vm::mappings_added(&pieces);
     if let Some((count, bytes)) = COPIED.count(first, end, adding) {
         log::warn!(
@@ -424,7 +445,9 @@ fn addr_of(at: NonNull<u8>) -> u64 {
 /// device imports such a view by its dma-bufs where it imports none by pointer (RADV), and
 /// refuses it where it pins the pointer's pages and imports no foreign dma-buf under a sparse
 /// buffer (NVIDIA's 615 driver, measured 2026-10-27, `super::vm`'s module docs, "Imports of
-/// views"). Either way the device is handed the guest's RAM then
+/// views"). There a second probe, of a view of as many pages as one dma-buf takes, learns whether
+/// the device takes the pages one dma-buf holds through it ([`ONE_DMA_BUF`]), as NVIDIA's driver
+/// does, dedicated to the buffer. Either way the device is handed the guest's RAM then
 /// (`super::host_ram`). Nothing is learned where the view is not mapped through dma-bufs (udmabuf
 /// not the process's): no import then needs it, and the device takes no RAM.
 pub(crate) fn learn_view_imports(device: &rt::Device) {
@@ -458,6 +481,24 @@ pub(crate) fn learn_view_imports(device: &rt::Device) {
         log::debug!(target: "reims_vgpu_vulkan::os", "the view's dma-buf source: {why}");
     }
     if !through_dma_bufs {
+        // The pages one dma-buf holds, as many runs as it takes, within its bytes.
+        let one = (limits.pieces)
+            .min(limits.bytes / vm::page_size())
+            .min(1 << 16);
+        let taken = matches!(probe_view(device, one), Some((false, true)));
+        let why = dma_buf_refusal();
+        log::info!(
+            target: "reims_vgpu_vulkan::os",
+            "{name}: an import of a view of guest pages one dma-buf holds {}",
+            match taken {
+                true => "is taken through it, so such imports take no mapping",
+                false => "is refused too, so their pages are mapped from their files as well",
+            }
+        );
+        if let Some(why) = why {
+            log::debug!(target: "reims_vgpu_vulkan::os", "the view's dma-buf source: {why}");
+        }
+        ONE_DMA_BUF.store(taken, Ordering::Relaxed);
         IMPORTS_NEED_FILES.store(true, Ordering::Relaxed);
         learn_folds(device);
         budget::warn_if_imports_short();
@@ -1692,6 +1733,69 @@ mod tests {
         budget::set_test_limit(None);
         assert!(vm.deallocate(view, n * PAGE).is_success());
         assert!(vm.deallocate(src, n * PAGE).is_success());
+    }
+
+    /// Where the device that needs imported pages mapped from their files takes the pages one
+    /// dma-buf holds through it, an import of a view left in a dma-buf past the headroom of the
+    /// views' budget is let through the gate, uncounted, and maps nothing; one of more runs than
+    /// one dma-buf takes is still refused, counted. The flags are the process's, which nextest
+    /// runs this test alone in.
+    #[test]
+    fn past_the_headroom_one_dma_buf_s_pages_pass_the_gate() {
+        let through = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/udmabuf")
+            .is_ok();
+        if !through {
+            return;
+        }
+        IMPORTS_NEED_FILES.store(true, Ordering::Relaxed);
+        ONE_DMA_BUF.store(true, Ordering::Relaxed);
+        let vm = LinuxVm::new();
+        // A view of `n` runs backwards, past the headroom: through dma-bufs.
+        let view_of = |n: u64| {
+            let src = vm::allocate_aliasable(n * PAGE).unwrap();
+            let view = vm.allocate_anywhere(n * PAGE).unwrap();
+            let runs: Vec<_> = (0..n)
+                .map(|i| (src.wrapping_add((n - 1 - i) * PAGE), PAGE))
+                .collect();
+            vm.remap_runs_shared_overwrite(view, &runs).unwrap();
+            (src, view)
+        };
+        budget::set_test_limit(Some(
+            budget::held() + budget::RESERVE + budget::HEADROOM + 8,
+        ));
+        let copied = || COPIED.count.load(Ordering::Relaxed);
+        let before = copied();
+        let one = super::super::dma_buf::limits().pieces.min(32);
+        let (src, view) = view_of(one);
+        let p = NonNull::new(view.as_ptr::<u8>()).unwrap();
+        let (first, end) = (addr(p), addr(p) + one * PAGE);
+        let import = import_view(p, one * PAGE, true);
+        assert_eq!(import.at(), p, "no twin");
+        assert_eq!(
+            vm::tests::kernel_mappings(first, end),
+            1,
+            "left in its dma-buf"
+        );
+        assert!(gate(first, end), "let through");
+        assert_eq!(copied(), before, "uncounted");
+        drop(import);
+        assert!(vm.deallocate(view, one * PAGE).is_success());
+        assert!(vm.deallocate(src, one * PAGE).is_success());
+        let more = super::super::dma_buf::limits().pieces + 1;
+        let (src, view) = view_of(more);
+        let p = NonNull::new(view.as_ptr::<u8>()).unwrap();
+        let (first, end) = (addr(p), addr(p) + more * PAGE);
+        let import = import_view(p, more * PAGE, true);
+        assert!(!gate(first, end), "more than one dma-buf takes: refused");
+        assert_eq!(copied(), before + 1, "counted");
+        drop(import);
+        budget::set_test_limit(None);
+        ONE_DMA_BUF.store(false, Ordering::Relaxed);
+        assert!(vm.deallocate(view, more * PAGE).is_success());
+        assert!(vm.deallocate(src, more * PAGE).is_success());
     }
 
     /// A view of `n` pages of a fresh range a view can be made of, backwards, mapped from their

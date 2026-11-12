@@ -95,7 +95,10 @@
 //! holds folded back first where that may free some ([`fold_short_due`]); past it the gate
 //! refuses them, and the runtime makes the buffer or heap over a copy of them, which takes no
 //! mapping (`super::import`'s `import_gate`); a rebind's alike, which the runtime then makes over
-//! a copy too.
+//! a copy too. Pages one dma-buf holds are let through instead where the device takes such a
+//! dma-buf in place of the pointer it refuses (NVIDIA's driver, as an allocation dedicated to the
+//! buffer: `super::import`'s `ONE_DMA_BUF`): the runtime imports them through it, with no mapping
+//! of their own.
 //!
 //! **Folding back.** At the views' budget, before anything is refused, the views' runs mapped
 //! from their files that no import a device may pin holds (`super::import`'s `Pinned`) are mapped
