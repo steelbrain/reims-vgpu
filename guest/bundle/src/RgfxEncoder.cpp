@@ -164,17 +164,6 @@ void RgfxEncoder::grow(size_t n)
 	moveToHeap(doubled);
 }
 
-void RgfxEncoder::appendArrayOp(uint16_t tag, const void *head, size_t head_n, const void *elems,
-                                uint32_t count, size_t stride)
-{
-	const size_t tail = static_cast<size_t>(count) * stride;
-	uint8_t *at = reserve(RGFX_OP_BODY_OFFSET + head_n + tail);
-	putHeader(at, tag, RGFX_OP_BODY_OFFSET + head_n + tail);
-	std::memcpy(at + RGFX_OP_BODY_OFFSET, head, head_n);
-	if (tail != 0)
-		std::memcpy(at + RGFX_OP_BODY_OFFSET + head_n, elems, tail);
-}
-
 void RgfxEncoder::prependSurfaceUses(const RgfxOpSurfaceUse *uses, size_t count)
 {
 	const size_t len = RGFX_OP_BODY_OFFSET + sizeof(RgfxOpSurfaceUse);

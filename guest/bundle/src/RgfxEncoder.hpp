@@ -714,9 +714,22 @@ private:
 		appendOp(tag, &body, sizeof(T));
 	}
 	// Appends an array-tailed op: `head` (`head_n` bytes) then `count` elements of
-	// `stride` bytes at `elems`; len = 8 + head_n + count*stride.
-	void appendArrayOp(uint16_t tag, const void *head, size_t head_n, const void *elems,
-	                   uint32_t count, size_t stride);
+	// `stride` bytes at `elems`; len = 8 + head_n + count*stride. Inline, so a caller's
+	// constant sizes make its copies plain stores: a bind of one element (setBuffer:,
+	// setSamplerState:) is one of these.
+	__attribute__((always_inline)) void appendArrayOp(uint16_t tag, const void *head,
+	                                                  size_t head_n, const void *elems,
+	                                                  uint32_t count, size_t stride)
+	{
+		const size_t tail = static_cast<size_t>(count) * stride;
+		uint8_t *at = reserve(RGFX_OP_BODY_OFFSET + head_n + tail);
+		putHeader(at, tag, RGFX_OP_BODY_OFFSET + head_n + tail);
+		std::memcpy(at + RGFX_OP_BODY_OFFSET, head, head_n);
+		if (count == 1)
+			std::memcpy(at + RGFX_OP_BODY_OFFSET + head_n, elems, stride);
+		else if (tail != 0)
+			std::memcpy(at + RGFX_OP_BODY_OFFSET + head_n, elems, tail);
+	}
 	// Makes room for `n` more bytes: a larger buffer of the builder's own, or a block of the
 	// region pool once the message outgrows the ring, its bytes so far copied there once.
 	void grow(size_t n);
