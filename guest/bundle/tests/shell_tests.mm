@@ -12659,6 +12659,14 @@ void test_no_copy_buffer_over_remapped_memory_takes_its_own_block()
 		CHECK(old != nil && pages.asked == 1);
 		auto one = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
 		CHECK(one.block_offset == first);
+		// The old memory's VM object lives on, as the kext's wiring of a live buffer's pages
+		// keeps it in the guest: freed, its id can come back as the new memory's object's, which
+		// tells the new memory for the old (this check failed in one of two runs of the same
+		// tree on the M3 Max, 2026-11-12, without it).
+		mach_port_t oldMemory = MACH_PORT_NULL;
+		memory_object_size_t oldSize = 0x10000;
+		CHECK(mach_make_memory_entry_64(mach_task_self(), &oldSize, app, VM_PROT_READ, &oldMemory,
+		                                MACH_PORT_NULL) == KERN_SUCCESS);
 		// Other memory at the same address, with other contents, while the buffer lives.
 		vm_address_t again = app;
 		CHECK(vm_allocate(mach_task_self(), &again, 0x10000,
@@ -12674,6 +12682,7 @@ void test_no_copy_buffer_over_remapped_memory_takes_its_own_block()
 		CHECK(third != nil && pages.asked == 2);
 		auto three = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
 		CHECK(three.block_offset == two.block_offset && region.pagesRejoinsRefused() == 1);
+		mach_port_deallocate(mach_task_self(), oldMemory);
 	}
 	CHECK(eventually([&] { return blocks.released.size() == 2; }));
 	CHECK(std::find(blocks.released.begin(), blocks.released.end(), first) !=
