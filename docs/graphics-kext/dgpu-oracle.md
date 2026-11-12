@@ -11,8 +11,8 @@ The probes are in `guest/bundle/tools/oracle` ([README](../../guest/bundle/tools
 `oracle_iosurface`, `oracle_storage`, `oracle_passes`, `oracle_cmdbuf`, `oracle_caps`,
 `oracle_errors`, `oracle_source`, `oracle_ycbcr`, `oracle_ca_ycbcr`, `oracle_sampler`,
 `oracle_icb`, `oracle_order`, `oracle_names`, `oracle_surftex`, `oracle_reflection`,
-`oracle_mesh`, `oracle_events`, `oracle_texdesc`, `oracle_nilbind` and `oracle_complete`; the upload costs (Q17)
-are `guest/bundle/tools/upload_probe.m`'s.
+`oracle_mesh`, `oracle_events`, `oracle_texdesc`, `oracle_nilbind`, `oracle_complete` and
+`oracle_residency`; the upload costs (Q17) are `guest/bundle/tools/upload_probe.m`'s.
 
 **Machines.** Every claim below is measured, on:
 - **AMD**: AMD Radeon Pro 5300M (Navi 14, `amdgpu_gfx1012`, 4 GB; AMDRadeonX6000 on
@@ -1622,6 +1622,71 @@ and `airData`, which answers the same object at each call, with a reference for 
 preloaded library links only where an install name loads it, as on the AMD, so a kernel links
 only what its install names load from files: the bundle reads each file an install name names in
 the guest's process and sends its library to the host under that name.
+
+## Q31: residency sets
+
+Probe: `oracle_residency DEVICE`, 11-12, the M3 Max alone (m3-max-21721, m3-max-21768 with the
+internal use, and m3-max-21882 with when a queue lets a removed set go; m3-max-21701 stopped at the
+huge capacity): sets of a default descriptor, of one with
+a label and an initial capacity of 16, and of one of 1,048,576; a 4 KiB Shared buffer, a 64 x 64
+texture, a 1 MiB heap, a buffer of the heap and a view of the texture added, removed and committed
+in turn; the sizes of more shapes; residency requests; what holds what; the residency calls of a
+queue, a command buffer and its encoders; a `CAMetalLayer`'s set, with the members a set is sent by
+caller; and the bad inputs, each case in a child process. The x86 Macs make no set:
+`newResidencySetWithDescriptor:error:` answers nil and sets the error out to nil (m3-max-21028 and
+m3-max-21029, the AMD and the Intel, macOS 26.7.1).
+
+| asked | M3 |
+|---|---|
+| a set of each descriptor, and of nil | `AGXG15XFamilyResidencySet`, below `AGXResidencySet`, `IOGPUMetalResidencySet` and `_MTLObjectWithLabel`; the error out set to nil |
+| a query that names the support | none: `supportsFamily:` answers Apple7 to 9, Mac2, Common3, Metal3 and Metal4 YES, and the device's members that name residency sets are its creators (`newResidencySetWithDescriptor:error:`, `allocResidencySet`) and its shader log buffer's set |
+| a fresh set's `device`, `label`, `allocatedSize`, `allocationCount`, `allAllocations` | the device; nil, whatever the descriptor's label; 0; 0; an empty array, the same object at each ask |
+| `setLabel:` | answered: the label is then the one set |
+| an add | in `allocationCount`, `containsAllocation:` and `allAllocations` at once, before any commit; a second add of one held does nothing |
+| a remove | out of `containsAllocation:` and `allAllocations` at once, but counted in `allocationCount` until the commit drops it; an add before that commit keeps it; a remove of an uncommitted add takes the add back; a remove of one never added does nothing |
+| `removeAllAllocations` | a remove of each committed allocation and of each add |
+| the order of `allAllocations` | another in each run |
+| `allocatedSize` | 0 until a commit; then the memory the committed allocations lie in, each block once: a heap's buffer or texture, with the heap or without, the heap's 1,048,576; a view, its texture's 32,768; a texture over a 64 KiB buffer, the buffer's 65,536; a 4 KiB buffer, Shared or Private, 131,072, and two Shared ones together the same (a Shared and a Private one, 262,144); a buffer of 64 KiB, 1 MiB or 1 MiB + 4 KiB, its own size |
+| `requestResidency`, `endResidency` | nothing the set answers changes, in any order, twice, or an end before a request |
+| what holds what | the set holds each allocation it is given until the commit after its remove, and lets it go at that commit; a queue holds a set added until a moment after its last remove (held right after it, gone 100 ms later with no buffer made, as on a thread of the queue's own); a command buffer holds a set it uses until it completes |
+| a queue's add and remove of sets, twice, of one never added, of none, then its command buffers | taken; they complete |
+| a command buffer's use of sets, twice, of an empty set, of a set of uncommitted adds, after its commit | taken; it completes |
+| `useResidencySet:`, `useResidencySets:count:` on a render, compute and blit encoder | answered; a set and nil taken on the render and compute encoders, which complete |
+| a `CAMetalLayer`'s `residencySet` | a set of the device, empty, then holding the texture of each drawable `nextDrawable` answers; QuartzCore sends it `addAllocation:`, `removeAllocation:` and `commit` alone (its commits send `allocatedSize`, `setCurrentGeneration:` and `setExpiredGeneration:`, from IOGPU). QuartzCore makes it when the layer's device is set, labelled "CAMetalLayer.residencySet", and only for a device that answers `supportsFamily:` of Apple6 YES *(read from code: QuartzCore, macOS 27.0.1)* |
+| a nil allocation added or removed, alone or in a list | ends the process (SIGSEGV) |
+| `containsAllocation:` of nil | NO |
+| an allocation of no device (an NSObject adopting `MTLAllocation`) | taken, counted and listed, 0 bytes; the commit ends the process (SIGSEGV) in one run of two |
+| nil to a queue's add or remove, or a command buffer's use (`useInternalResidencySet:` among them) | raises NSInvalidArgumentException, the counted set's "*** -[NSCountedSet addObject:]: attempt to insert nil" (a remove: "removeObject:]: attempt to remove nil") |
+| an object of no device as a set: a queue's add; a command buffer's use | taken, and its buffers complete; the buffer fails, status 5, MTLCommandBufferErrorDomain 1, "Invalid Input (0000000a:kIOGPUCommandBufferCallbackErrorInvalidInput)" |
+| an initial capacity of NSUIntegerMax | the creator spins without end (stopped at 30 s) |
+
+So Apple silicon's set is bookkeeping a commit applies, its size counts memory, not allocations, and
+its queue and command buffer hold sets as counted sets *(class 3, of the one Apple GPU measured;
+the x86 Macs make none)*.
+
+What our stack does: the arm64 device makes a set of its own (`RgfxResidencySet`), which sends
+nothing to the host, as the device keeps every allocation resident, and answers every answer above,
+but: the label is the descriptor's, as Metal's documentation gives it ("The label specified at
+creation", class 1); `allAllocations` lists the committed allocations in the order they were
+committed, then the adds; a small buffer counts its own pages, its range of a slab, not a block it
+shares; an allocation of no device is held and counts nothing, and a command buffer that uses an
+object of no device as a set completes, inside the envelope, as no correct use depends on either;
+and a capacity of NSUIntegerMax makes a set, as the capacity is a hint the set does not need. Its
+queue and command buffer hold sets as the M3's do, but that the queue lets a set go at its last
+remove, not a moment after, as no correct use can depend on what a moment decides; its render and
+compute encoders give theirs to their command buffer, and its blit encoder answers no residency
+member, as no Metal protocol gives a blit encoder one. A layer's `residencySet` stays nil on the
+arm64 guest, as its device answers `supportsFamily:` of Apple6 NO: the device's family answers
+decide it, not the set. The x86 device answers nil, as before.
+The guest run, `oracle_residency` in the arm64 macOS 27.0.1 guest on the M3 Max under HVF
+(m3-max-21942 at b15191aed, 11-12), answers what the M3 answered, case by case: every
+count, `containsAllocation:` and hold, every queue and command buffer run, and every death. It
+differs only where the paragraph above says it does, and in what only diagnostics show: the
+classes are ours; `retainCount` counts other holds (the set's count of the memory it lies in
+holds a plain buffer once more, and the queue holds a set once, however often it was added); and
+a nil allocation ends the process with SIGABRT and a log line, not SIGSEGV. A first run
+(m3-max-21874) showed a commit keeping the allocations it dropped alive until the caller's pool
+drained, as it listed them in an autoreleased array; the set now lets them go at the commit.
 
 ## Not measured
 
