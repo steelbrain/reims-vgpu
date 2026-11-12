@@ -266,6 +266,28 @@ pub(crate) fn take_answering_device() -> Option<rt::Device> {
     ANSWERING.lock().take()
 }
 
+/// The kinds the runtime announces at every occurrence (`DeviceOptions::announce_each`): those a
+/// call here hears ([`crate::answer::HEARD`]) and those that die by default
+/// ([`crate::answer::DIES_BY_DEFAULT`]), `CopiedHostPages`, which the device's probe of its imports
+/// may meet unheard as it is made ([`crate::answer`]'s `unheard`, on Linux), and every other kind
+/// of [`crate::answer::DIES`] where `every_dies`, in strict and census mode, which die at or record
+/// each occurrence. Elsewhere the
+/// runtime announces such a kind once per device, its first occurrence, the only one the default
+/// writes: asked for each, a pipeline variant's notices reach the sink again at every draw's bind,
+/// a cost on the encoding thread (in a Finder drag on ms01's Iris Xe, 2026-10-18, the sink
+/// itself took 0.09 ms per frame of that thread's 16.3, measured).
+fn announced_each(every_dies: bool) -> std::collections::BTreeSet<rt::Degradation> {
+    let dies: &[rt::Degradation] = if every_dies {
+        &crate::answer::DIES
+    } else {
+        &crate::answer::DIES_BY_DEFAULT
+    };
+    (dies.iter().copied())
+        .chain(crate::answer::HEARD)
+        .chain([rt::Degradation::CopiedHostPages])
+        .collect()
+}
+
 /// The options every device is made with: the runtime's defaults, whose loader search finds
 /// Homebrew's (`vulkan-loader`, beside its `molten-vk`), with the window system's extensions where
 /// a display's window presents through Vulkan (on Linux, [`crate::os::add_window_extensions`]), the
@@ -298,28 +320,6 @@ pub(crate) fn take_answering_device() -> Option<rt::Device> {
 /// measured on the M3 Max (a release build, under a load average of 34), a command buffer of one
 /// blit fill completed a median of 283 to 309 us after its commit, against 356 to 399 us with
 /// them (`timing`'s `gpu_times_from_host_latency`).
-/// The kinds the runtime announces at every occurrence (`DeviceOptions::announce_each`): those a
-/// call here hears ([`crate::answer::HEARD`]) and those that die by default
-/// ([`crate::answer::DIES_BY_DEFAULT`]), `CopiedHostPages`, which the device's probe of its imports
-/// may meet unheard as it is made ([`crate::answer`]'s `unheard`, on Linux), and every other kind
-/// of [`crate::answer::DIES`] where `every_dies`, in strict and census mode, which die at or record
-/// each occurrence. Elsewhere the
-/// runtime announces such a kind once per device, its first occurrence, the only one the default
-/// writes: asked for each, a pipeline variant's notices reach the sink again at every draw's bind,
-/// a cost on the encoding thread (in a Finder drag on ms01's Iris Xe, 2026-10-18, the sink
-/// itself took 0.09 ms per frame of that thread's 16.3, measured).
-fn announced_each(every_dies: bool) -> std::collections::BTreeSet<rt::Degradation> {
-    let dies: &[rt::Degradation] = if every_dies {
-        &crate::answer::DIES
-    } else {
-        &crate::answer::DIES_BY_DEFAULT
-    };
-    (dies.iter().copied())
-        .chain(crate::answer::HEARD)
-        .chain([rt::Degradation::CopiedHostPages])
-        .collect()
-}
-
 pub(crate) fn device_options() -> &'static rt::DeviceOptions {
     static OPTIONS: LazyLock<rt::DeviceOptions> = LazyLock::new(|| {
         let mut options = rt::DeviceOptions::default();
