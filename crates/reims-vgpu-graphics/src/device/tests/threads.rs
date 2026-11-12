@@ -76,15 +76,10 @@ fn rig_on(clock: &Arc<TestClock>, host: GateHost) -> Rig {
     rig
 }
 
-/// Waits about 10 s for `done`.
+/// Waits for `done` as the device tests wait ([`super::eventually`]), failing with `what` where it
+/// never came.
 fn until(what: &str, done: impl Fn() -> bool) {
-    for _ in 0..10_000 {
-        if done() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    panic!("{what}");
+    assert!(super::eventually(done), "{what}");
 }
 
 /// Object `n` of `context`.

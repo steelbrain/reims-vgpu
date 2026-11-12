@@ -598,18 +598,13 @@ fn run_case(seed: u64, index: u64) -> Result<(), String> {
         events.extend(events_now(&mut rig));
     }
     let recorded = sent.iter().filter(|m| m.recorded).count();
-    let mut done = false;
-    for _ in 0..5000 {
+    let done = super::eventually(|| {
         events.extend(events_now(&mut rig));
         let ended = (seen.lock().marks.iter())
             .filter(|(_, began)| !began)
             .count();
-        if ended == recorded && rig.device.shared.lanes.idle() {
-            done = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+        ended == recorded && rig.device.shared.lanes.idle()
+    });
     events.extend(events_now(&mut rig));
     let marks = seen.lock().marks.clone();
     let messages = || {

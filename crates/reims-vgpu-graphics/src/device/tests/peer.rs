@@ -32,8 +32,9 @@ use crate::ops::{RGFX_COMMAND_BUFFER_OPS_OFFSET, RgfxCommandBuffer};
 const PEER_FEATURES: u64 =
     (RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_SURFACE_CACHE | RGFX_FEATURE_CB_SUBMITTED) as u64;
 
-/// How many 1 ms looks the guest takes for what the host owes it: about 2 s.
-const PATIENCE_MS: u32 = 2000;
+/// How many 1 ms looks the guest takes for what the host owes it: the device tests'
+/// [`super::PATIENCE`], a guard against a hang alone.
+const PATIENCE_MS: u32 = super::PATIENCE;
 
 /// The interrupts the host raised and the guest has not yet taken, in order.
 #[derive(Default)]
@@ -255,7 +256,8 @@ impl FakeGuest {
         self.rig.device.mmio_write_taking(offset.into(), value);
     }
 
-    /// Waits about [`PATIENCE_MS`] ms for `done`, panicking with `what` where it never holds.
+    /// Waits, [`PATIENCE_MS`] looks at most, for `done`, panicking with `what` where it never
+    /// holds.
     fn wait_for(&self, what: &str, done: impl Fn(&FakeGuest) -> bool) {
         for _ in 0..PATIENCE_MS {
             if done(self) {

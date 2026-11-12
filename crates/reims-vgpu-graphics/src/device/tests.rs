@@ -11,6 +11,22 @@ use zerocopy::{FromBytes, FromZeros, IntoBytes};
 use super::*;
 use crate::display::CursorImage;
 
+/// How many times [`eventually`] polls, a millisecond's sleep apart, for a state the device's own
+/// threads reach: a minute at least, as a loaded host starves those threads for seconds. A test
+/// that passes polls only until the state holds; the bound guards against a hang alone.
+pub(super) const PATIENCE: u32 = 60_000;
+
+/// Polls `done` until it holds, [`PATIENCE`] times at most: whether it held.
+pub(super) fn eventually(mut done: impl FnMut() -> bool) -> bool {
+    for _ in 0..PATIENCE {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    done()
+}
+
 /// A refresh rate at which the refresh thread never runs during a test: a period of 1000 s. The
 /// tests run each refresh themselves ([`Shared::refresh`]).
 const NEVER_MHZ: u32 = 1;
@@ -253,32 +269,56 @@ impl Rig {
         self.seqno
     }
 
-    /// The next event of the completion ring, waiting about 2 s; `None` where none came.
-    fn event(&mut self) -> Option<Vec<u8>> {
+    /// The next event of the completion ring where one is there now, past its padding; `None`
+    /// otherwise, waiting for none.
+    fn event_now(&mut self) -> Option<Vec<u8>> {
         let data = RGFX_CONTROL_RING_DATA_SIZE as u64;
         let at = |count: u64| RGFX_CONTROL_COMPLETE_OFFSET + 256 + (count % data);
-        for _ in 0..2000 {
+        loop {
             let produced = self
                 .region()
                 .atomic_u64(RGFX_CONTROL_COMPLETE_OFFSET)
                 .load(Ordering::SeqCst);
-            if produced != self.consumed {
-                let start = self.region().read(at(self.consumed), 8).unwrap();
-                let size = u32::from_le_bytes(start[4..8].try_into().unwrap()) as usize;
-                let r#type = u32::from_le_bytes(start[0..4].try_into().unwrap());
-                let bytes = self.region().read(at(self.consumed), size).unwrap();
-                self.consumed += size as u64;
-                self.region()
-                    .atomic_u64(RGFX_CONTROL_COMPLETE_OFFSET + 0x40)
-                    .store(self.consumed, Ordering::SeqCst);
-                if r#type == RGFX_MSG_PAD {
-                    continue;
-                }
+            if produced == self.consumed {
+                return None;
+            }
+            let start = self.region().read(at(self.consumed), 8).unwrap();
+            let size = u32::from_le_bytes(start[4..8].try_into().unwrap()) as usize;
+            let r#type = u32::from_le_bytes(start[0..4].try_into().unwrap());
+            let bytes = self.region().read(at(self.consumed), size).unwrap();
+            self.consumed += size as u64;
+            self.region()
+                .atomic_u64(RGFX_CONTROL_COMPLETE_OFFSET + 0x40)
+                .store(self.consumed, Ordering::SeqCst);
+            if r#type != RGFX_MSG_PAD {
+                return Some(bytes);
+            }
+        }
+    }
+
+    /// The next event of the completion ring, waiting for it [`PATIENCE`] polls at most; `None`
+    /// where none came.
+    fn event(&mut self) -> Option<Vec<u8>> {
+        for _ in 0..PATIENCE {
+            if let Some(bytes) = self.event_now() {
                 return Some(bytes);
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        None
+        self.event_now()
+    }
+
+    /// Whether no event comes over `polls` polls a millisecond's sleep apart: what a check that
+    /// the host posts nothing waits, a span of its own, as the device's threads may take that
+    /// long to post one.
+    fn quiet_for(&mut self, polls: u32) -> bool {
+        for _ in 0..polls {
+            if self.event_now().is_some() {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.event_now().is_none()
     }
 
     /// The next event, as a `COMPLETE`: its seqno and status.
@@ -290,16 +330,13 @@ impl Rig {
         (c.header.seqno, c.status)
     }
 
-    /// Waits about 2 s for the lanes to have carried out every message handed to them: a message
-    /// of one context's answered says nothing of another's.
+    /// Waits, [`PATIENCE`] polls at most, for the lanes to have carried out every message handed
+    /// to them: a message of one context's answered says nothing of another's.
     fn lanes_done(&self) {
-        for _ in 0..2000 {
-            if self.device.shared.lanes.idle() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        panic!("the lanes never carried out what they were handed");
+        assert!(
+            eventually(|| self.device.shared.lanes.idle()),
+            "the lanes never carried out what they were handed"
+        );
     }
 
     fn arm(&self) {
@@ -541,12 +578,7 @@ fn a_present_answered_at_once_raises_with_no_lock_held() {
     rig.start();
     rig.arm();
     rig.send(present_surface(0, HELD_SURFACE));
-    for _ in 0..2000 {
-        if resets.load(Ordering::SeqCst) != 0 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| resets.load(Ordering::SeqCst) != 0);
     assert_eq!(
         resets.load(Ordering::SeqCst),
         1,
@@ -696,7 +728,7 @@ fn a_record_taken_before_the_clear_leaves_the_ring_armed() {
 fn commands_wait_for_the_driver_s_start() {
     let mut rig = Rig::new();
     rig.send(get_displays());
-    assert!(rig.event().is_none());
+    assert!(rig.quiet_for(2000));
     rig.start();
     assert!(rig.event().is_some());
 }
@@ -905,7 +937,7 @@ fn a_refresh_presents_the_scanout_and_sends_vblank() {
     rig.send(vblank(0));
     rig.complete();
     rig.refresh();
-    assert!(rig.event().is_none());
+    assert!(rig.quiet_for(2000));
     assert_eq!(rig.refreshes.load(Ordering::SeqCst), 4);
 }
 
@@ -917,7 +949,7 @@ fn a_new_mode_is_told_with_display_changed() {
     rig.start();
     *rig.mode.lock() = Mode { width: 800, ..MODE };
     rig.refresh();
-    assert!(rig.event().is_none(), "the guest was told no mode yet");
+    assert!(rig.quiet_for(2000), "the guest was told no mode yet");
     rig.send(get_displays());
     rig.event().unwrap();
     *rig.mode.lock() = MODE;
@@ -929,7 +961,7 @@ fn a_new_mode_is_told_with_display_changed() {
         (RGFX_EVT_DISPLAY_CHANGED, 24, 0)
     );
     rig.refresh();
-    assert!(rig.event().is_none(), "told once");
+    assert!(rig.quiet_for(2000), "told once");
     rig.send(get_displays());
     let bytes = rig.event().unwrap();
     assert_eq!(u32::from_le_bytes(bytes[36..40].try_into().unwrap()), 1280);
@@ -952,7 +984,7 @@ fn a_new_scale_is_told_with_display_changed() {
     let c = RgfxDisplayChanged::read_from_bytes(&bytes).unwrap();
     assert_eq!((c.header.r#type, c.display), (RGFX_EVT_DISPLAY_CHANGED, 0));
     rig.refresh();
-    assert!(rig.event().is_none(), "told once");
+    assert!(rig.quiet_for(2000), "told once");
 }
 
 /// A reset stops the device, puts both rings back as new and the display with no cursor or
@@ -1002,7 +1034,7 @@ fn a_reset_puts_the_device_back_as_new() {
         RgfxMsgHeader::read_from_prefix(&bytes).unwrap().0.r#type,
         RGFX_EVT_DISPLAYS
     );
-    assert!(rig.event().is_none(), "no VBLANK after the reset");
+    assert!(rig.quiet_for(2000), "no VBLANK after the reset");
 }
 
 /// `SET_DISPLAY_POWER` turns the panel off and on: the screen is told each change, once, and
@@ -1183,9 +1215,9 @@ fn a_broken_ring_is_left_until_a_reset() {
     rig.publish(&bytes);
     rig.device
         .mmio_write(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
-    assert!(rig.event().is_none());
+    assert!(rig.quiet_for(2000));
     rig.send(get_displays());
-    assert!(rig.event().is_none(), "still broken");
+    assert!(rig.quiet_for(2000), "still broken");
     rig.device
         .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
     (rig.produced, rig.consumed, rig.seqno) = (0, 0, 0);
@@ -1312,15 +1344,9 @@ impl QueueTestSeen {
         })
     }
 
-    /// Waits about 2 s for `done` to hold.
+    /// Waits, [`PATIENCE`] polls at most, for `done` to hold.
     fn wait(&self, what: &str, done: impl Fn(&QueueTestSeen) -> bool) {
-        for _ in 0..2000 {
-            if done(self) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        panic!("{what}");
+        assert!(eventually(|| done(self)), "{what}");
     }
 }
 
@@ -1496,9 +1522,10 @@ fn publish_command_buffer(rig: &Rig, queue: u64, cb_obj_id: u64, seqno: u64, doo
     }
 }
 
-/// The first message of the tests' queue completion ring, waiting about 2 s.
+/// The first message of the tests' queue completion ring, waiting for it [`PATIENCE`] polls at
+/// most.
 fn first_queue_completion(rig: &Rig) -> Option<RgfxCbComplete> {
-    for _ in 0..2000 {
+    for _ in 0..PATIENCE {
         if rig
             .region()
             .atomic_u64(QUEUE_COMPLETE)
@@ -1547,10 +1574,10 @@ fn publish_queue_message(rig: &Rig, at: u64, seqno: u64, mut message: Vec<u8>) -
     end
 }
 
-/// Waits about 2 s for the tests' queue submission ring to go idle: its thread sleeps, so the
-/// guest rings for its next message.
+/// Waits, [`PATIENCE`] polls at most, for the tests' queue submission ring to go idle: its
+/// thread sleeps, so the guest rings for its next message.
 fn wait_queue_idle(rig: &Rig) {
-    for _ in 0..2000 {
+    for _ in 0..PATIENCE {
         if rig
             .region()
             .atomic_u32(QUEUE_SUBMIT + 0x80)
@@ -1994,13 +2021,10 @@ impl HoldsHost {
             RGFX_CMD_BUFFER_CREATE,
             (u64::from(context) << RGFX_CONTEXT_OBJ_ID_SHIFT) | 0xfff,
         ));
-        for _ in 0..2000 {
-            if self.holding.load(Ordering::SeqCst) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        panic!("the create was not carried out");
+        assert!(
+            eventually(|| self.holding.load(Ordering::SeqCst)),
+            "the create was not carried out"
+        );
     }
 }
 
@@ -2478,12 +2502,7 @@ fn a_reset_wakes_a_command_buffer_waiting_for_the_creates_before_it() {
         .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
     // The queue's thread holds the device's shared state while it lives; the device, its control
     // thread, its refresh thread and the context's lane, in the create, hold the rest.
-    for _ in 0..2000 {
-        if Arc::strong_count(&rig.device.shared) == 4 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| Arc::strong_count(&rig.device.shared) == 4);
     assert_eq!(
         Arc::strong_count(&rig.device.shared),
         4,
@@ -2548,23 +2567,13 @@ fn a_reset_is_told_to_the_host_before_the_messages_after_it() {
     assert_eq!(rig.device.queue_count(), 0);
     assert!(!rig.region().held_by(4, QUEUE_SUBMIT, 0x1000));
     assert!(!rig.region().held_by(4, SCANOUT, 0x1000));
-    for _ in 0..2000 {
-        if seen.lock().iter().any(|&(t, _)| t == RESET_TOLD) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| seen.lock().iter().any(|&(t, _)| t == RESET_TOLD));
 
     // The guest starts again, from its first command.
     (rig.produced, rig.consumed, rig.seqno) = (0, 0, 0);
     rig.start();
     rig.send(object_message(RGFX_CMD_EVENT_CREATE, QUEUE + 1));
-    for _ in 0..2000 {
-        if seen.lock().iter().any(|&(t, _)| t == RGFX_CMD_EVENT_CREATE) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| seen.lock().iter().any(|&(t, _)| t == RGFX_CMD_EVENT_CREATE));
     std::thread::sleep(Duration::from_millis(50));
     let control = Some("reims-vgpu.graphics-control".to_owned());
     let queue = Some(format!("reims-vgpu.graphics-queue-{QUEUE:#x}"));
@@ -3220,11 +3229,11 @@ fn publish_unrung(rig: &Rig, mut at: u64, messages: &[Vec<u8>]) -> u64 {
 }
 
 /// The events on the tests' queue completion ring, each one's type, seqno and the command buffer
-/// it names, once `count` of them are there or about 2 s have passed.
+/// it names, once `count` of them are there or [`PATIENCE`] polls have passed.
 fn queue_events(rig: &Rig, count: usize) -> Vec<(u32, u64, u64)> {
     let mut events = Vec::new();
     let mut at = 0;
-    for _ in 0..2000 {
+    for _ in 0..PATIENCE {
         let produced = rig
             .region()
             .atomic_u64(QUEUE_COMPLETE)
@@ -3350,12 +3359,7 @@ fn an_answered_command_buffer_waits_for_no_later_ring_0_message() {
     rig.device
         .mmio_write(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
     let created = |taking: &Taking| taking.handed.lock().contains(&RGFX_CMD_BUFFER_CREATE);
-    for _ in 0..2000 {
-        if created(&taking) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| created(&taking));
     assert!(created(&taking), "the create never reached the host");
     assert_eq!(
         queue_events(&rig, 2),
@@ -3414,12 +3418,7 @@ fn a_doorbell_write_leaves_a_command_buffer_to_its_queue_s_thread() {
     rig.device
         .mmio_write(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
     let handed = |taking: &Taking| taking.handed.lock().len() == 2;
-    for _ in 0..2000 {
-        if handed(&taking) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| handed(&taking));
     assert!(handed(&taking), "the first buffer never reached the host");
     publish_unrung(&rig, at, &[command_buffer(QUEUE, 101, 2)]);
     rig.device
@@ -3445,12 +3444,7 @@ fn a_doorbell_write_leaves_a_command_buffer_to_its_queue_s_thread() {
     taking.shut.store(true, Ordering::SeqCst);
     rig.send(object_message(RGFX_CMD_BUFFER_CREATE, QUEUE + 1));
     let created = |taking: &Taking| taking.handed.lock().last() == Some(&RGFX_CMD_BUFFER_CREATE);
-    for _ in 0..2000 {
-        if created(&taking) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| created(&taking));
     assert!(created(&taking), "the create never reached the host");
     publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
     rig.device
@@ -3481,12 +3475,7 @@ fn a_doorbell_write_answers_a_command_buffer_behind_another_process_s_create() {
     taking.hold_creates.store(true, Ordering::SeqCst);
     rig.send(object_message(RGFX_CMD_BUFFER_CREATE, OTHER));
     let created = |taking: &Taking| taking.handed.lock().last() == Some(&RGFX_CMD_BUFFER_CREATE);
-    for _ in 0..2000 {
-        if created(&taking) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| created(&taking));
     assert!(created(&taking), "the create never reached the host");
     publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
     rig.device
@@ -3514,24 +3503,14 @@ fn a_buffer_behind_its_process_s_create_is_answered_on_the_lane_s_thread() {
     taking.hold_creates.store(true, Ordering::SeqCst);
     rig.send(object_message(RGFX_CMD_BUFFER_CREATE, QUEUE + 1));
     let created = |taking: &Taking| taking.handed.lock().last() == Some(&RGFX_CMD_BUFFER_CREATE);
-    for _ in 0..2000 {
-        if created(&taking) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| created(&taking));
     assert!(created(&taking), "the create never reached the host");
     publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
     rig.device
         .mmio_write_taking(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
     assert!(queue_events(&rig, 0).is_empty(), "answered at the doorbell");
     // The queue's thread took it and waits at the gate for the create.
-    for _ in 0..2000 {
-        if rig.device.shared.gate.counts().1 == 1 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| rig.device.shared.gate.counts().1 == 1);
     assert_eq!(
         rig.device.shared.gate.counts().1,
         1,
@@ -3654,13 +3633,10 @@ impl OrderSeen {
             .collect()
     }
 
-    /// Waits about 2 s for `type` to be carried out `n` times.
+    /// Waits, [`PATIENCE`] polls at most, for `type` to be carried out `n` times.
     fn wait_for(&self, r#type: u32, n: usize) {
-        for _ in 0..2000 {
-            if self.types().iter().filter(|&&t| t == r#type).count() >= n {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(1));
+        if eventually(|| self.types().iter().filter(|&&t| t == r#type).count() >= n) {
+            return;
         }
         panic!(
             "type {:#x} was not carried out {n} times: {:x?}",
@@ -3678,13 +3654,10 @@ impl OrderSeen {
             RGFX_CMD_BUFFER_CREATE,
             (u64::from(context) << RGFX_CONTEXT_OBJ_ID_SHIFT) | 0xfff,
         ));
-        for _ in 0..2000 {
-            if self.types().len() > held {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        panic!("the create was not carried out");
+        assert!(
+            eventually(|| self.types().len() > held),
+            "the create was not carried out"
+        );
     }
 
     /// Opens the gate.
@@ -4306,16 +4279,14 @@ fn a_closed_maker_s_pages_then_a_download_go_in_order_past_its_held_lane() {
     assert_eq!(seen.count(RGFX_CMD_CONTEXT_CLOSE), 1);
 }
 
-/// Waits about 2 s for the lane of the block at `block` to have nothing left to carry out: a
-/// message answered inside the host's call is still running there until the call returns.
+/// Waits, [`PATIENCE`] polls at most, for the lane of the block at `block` to have nothing left to
+/// carry out: a message answered inside the host's call is still running there until the call
+/// returns.
 fn wait_block_lane_idle(rig: &Rig, block: u64) {
-    for _ in 0..2000 {
-        if rig.device.shared.lanes.lane_idle(Key::Block(block)) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    panic!("the block's lane did not go idle");
+    assert!(
+        eventually(|| rig.device.shared.lanes.lane_idle(Key::Block(block))),
+        "the block's lane did not go idle"
+    );
 }
 
 /// A download of a block whose lane has nothing left to carry out is offered to the host on the
@@ -4388,15 +4359,13 @@ fn a_download_behind_its_block_s_pages_on_the_lane_is_carried_out_after_them_the
     );
 }
 
-/// Waits about 2 s for the control thread to sleep with nothing in flight (`Submit::asleep`).
+/// Waits, [`PATIENCE`] polls at most, for the control thread to sleep with nothing in flight
+/// (`Submit::asleep`).
 fn wait_control_asleep(rig: &Rig) {
-    for _ in 0..2000 {
-        if rig.device.shared.submit.lock().asleep {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    panic!("the control thread did not go to sleep");
+    assert!(
+        eventually(|| rig.device.shared.submit.lock().asleep),
+        "the control thread did not go to sleep"
+    );
 }
 
 /// Publishes `command` on the control ring, its seqno the next, without a doorbell: the seqno.
@@ -4492,12 +4461,7 @@ fn a_doorbell_s_thread_leaves_a_download_the_control_thread_must_take() {
     seen.hold_here.store(true, Ordering::SeqCst);
     wait_control_asleep(&rig);
     let held = rig.send(download_message(BLOCK));
-    for _ in 0..2000 {
-        if !rig.device.shared.submit.lock().asleep {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| !rig.device.shared.submit.lock().asleep);
     settle();
     seen.at_doorbell.store(true, Ordering::SeqCst);
     let next = publish_next(&mut rig, download_message(BLOCK));
@@ -4633,12 +4597,7 @@ fn a_lane_behind_a_block_s_pages_is_woken_only_by_their_carrying_out() {
     rig.send(object_message(RGFX_CMD_SAMPLER_CREATE, obj(MAKER, 1)));
     let lanes = Arc::clone(&rig.device.shared.lanes);
     let blocked = || lanes.blocked(Key::Context(MAKER));
-    for _ in 0..2000 {
-        if blocked().0 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| blocked().0);
     let (waits, before) = blocked();
     assert!(waits, "the maker's lane never waited for its pages");
     for n in 0..OTHERS as u64 {
