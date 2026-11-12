@@ -114,6 +114,11 @@ impl RateMap<FakePlatform> for Fk<kind::RateMap> {
         )
     }
 
+    /// Its descriptor's screen size.
+    fn screen_size(&self) -> MtlSize {
+        self.with_model(|m: &RateMapModel| m.screen_size)
+    }
+
     fn reset(&self, descriptor: &<FakePlatform as Platform>::RateMapDescriptor) {
         fatal(self.act(
             Policy::Fatal,

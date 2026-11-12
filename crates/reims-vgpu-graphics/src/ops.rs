@@ -68,8 +68,9 @@ pub const RGFX_OP_GROUP_VIDEO: u16 = 0x4;
 
 /// Op `ENCODER_BEGIN_RENDER`: open a render encoder for the pass the op's body
 /// describes (an [`RgfxRenderPassDesc`] then its `color_count`
-/// [`RgfxRenderPassColorAttachment`] records, then the [`RgfxRenderPassSamplePositions`] and
-/// the [`RgfxRenderPassVisibility`] its flags name, in that order). Holds the encoder until
+/// [`RgfxRenderPassColorAttachment`] records, then the [`RgfxRenderPassSamplePositions`], the
+/// [`RgfxRenderPassVisibility`] and the [`RgfxRenderPassRateMap`] its flags name, in that order).
+/// Holds the encoder until
 /// [`RGFX_OP_ENCODER_END`].
 pub const RGFX_OP_ENCODER_BEGIN_RENDER: u16 = 0x0001;
 /// Op `ENCODER_BEGIN_COMPUTE`: open a compute encoder for the pass the op's body
@@ -279,6 +280,11 @@ pub const RGFX_PASS_MAX_SAMPLE_POSITIONS: u32 = 16;
 /// buffer, so its `setVisibilityResultMode:offset:` of a mode fails the command buffer, as
 /// before the flag.
 pub const RGFX_PASS_FLAG_VISIBILITY_RESULT: u32 = 1 << 4;
+/// A pass's rasterization rate map (`rasterizationRateMap`) follows its colour attachment
+/// records, its sample positions and its visibility result buffer, as one
+/// [`RgfxRenderPassRateMap`], where the guest took
+/// [`RGFX_FEATURE_RATE_MAPS`](crate::wire::RGFX_FEATURE_RATE_MAPS).
+pub const RGFX_PASS_FLAG_RATE_MAP: u32 = 1 << 5;
 
 /// One colour attachment of a render pass (`colorAttachments[i]`). Absent (sets
 /// nothing) when `texture_obj_id` is 0.
@@ -452,6 +458,17 @@ pub struct RgfxRenderPassVisibility {
     pub reserved_0c: u32,
 }
 
+/// A pass's rasterization rate map, after its colour attachment records, its sample positions
+/// and its visibility result buffer where the pass's flags hold [`RGFX_PASS_FLAG_RATE_MAP`].
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxRenderPassRateMap {
+    /// The map (`RATE_MAP_CREATE`): one of the sender's.
+    pub map_obj_id: u64,
+}
+
 /// The body of an `ENCODER_BEGIN_COMPUTE` op: the compute pass's properties.
 #[repr(C)]
 #[derive(
@@ -494,6 +511,7 @@ const _: () = {
     assert!(RGFX_RENDER_PASS_COLOR_OFFSET as usize == size_of::<RgfxRenderPassDesc>());
     assert!(size_of::<RgfxRenderPassSamplePositions>() == 136);
     assert!(size_of::<RgfxRenderPassVisibility>() == 16);
+    assert!(size_of::<RgfxRenderPassRateMap>() == 8);
     assert!(size_of::<RgfxComputePassDesc>() == 8);
     assert!(size_of::<RgfxOpEvent>() == 16);
     assert!(size_of::<RgfxOpSurfaceUse>() == 24);

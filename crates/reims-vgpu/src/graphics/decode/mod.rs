@@ -185,6 +185,7 @@ mod icb_slots_cost;
 mod lane;
 mod library;
 mod managed;
+mod rate_map;
 mod refused;
 mod render;
 mod sequencer;
@@ -539,6 +540,10 @@ enum ObjHandle<P: Platform> {
     /// A video session ([`RGFX_CMD_VIDEO_SESSION_CREATE`]), which its command buffers' video
     /// encoders name, let go of on the video worker ([`video::SessionHold`]).
     VideoSession(video::SessionHold<P>),
+    /// A rasterization rate map
+    /// ([`RGFX_CMD_RATE_MAP_CREATE`](reims_vgpu_graphics::wire::RGFX_CMD_RATE_MAP_CREATE)), which
+    /// render passes name ([`rate_map`]).
+    RateMap(P::RateMap),
     /// What an id stands for whose posted create the host refused ([`refused`]): what names it
     /// is dropped, not the command buffer that names it.
     Refused(refused::Refused),
@@ -5448,6 +5453,7 @@ resolvers! {
     (require_heap, get_heap, Heap, Heap, "heap"),
     (require_library, get_library, Library, Library, "library"),
     (require_indirect_command_buffer, get_indirect_command_buffer, Icb, Icb, "indirect command buffer"),
+    (require_rate_map, get_rate_map, RateMap, RateMap, "rasterization rate map"),
 }
 
 /// The line of a heap create the platform answered nil for (a size of 0, memory the device

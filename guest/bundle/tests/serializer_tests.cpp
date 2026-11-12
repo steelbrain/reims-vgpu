@@ -2712,6 +2712,139 @@ void test_heap_texture_size_query()
 	CHECK(ser.heapTextureSizeAndAlign(other, &size, &align) && asker.calls == 5);
 }
 
+// The device's answers to the rate map messages, and what it was last asked.
+struct RateMapAsker {
+	uint32_t calls = 0;
+	uint32_t status = RGFX_STATUS_OK;
+	std::vector<uint8_t> asked;
+	static bool ask(void *context, const void *message, uint32_t size, void *reply,
+	                uint32_t capacity, uint32_t *reply_size)
+	{
+		auto *self = static_cast<RateMapAsker *>(context);
+		self->calls++;
+		const auto *bytes = static_cast<const uint8_t *>(message);
+		self->asked.assign(bytes, bytes + size);
+		RgfxMsgHeader h = {};
+		std::memcpy(&h, message, sizeof(h));
+		if (h.type == RGFX_CMD_RATE_MAP_QUERY) {
+			RgfxRateMapAnswer answer = {};
+			answer.header = {RGFX_EVT_RATE_MAP_ANSWER, sizeof(answer), 11};
+			answer.status = self->status;
+			answer.values[0] = 0x3f800000; // 1.0f
+			answer.values[1] = 0x40000000; // 2.0f
+			answer.values[2] = 7;
+			CHECK(capacity >= sizeof(answer));
+			std::memcpy(reply, &answer, sizeof(answer));
+			*reply_size = sizeof(answer);
+			return true;
+		}
+		RgfxRateMapState answer = {};
+		answer.header = {RGFX_EVT_RATE_MAP_STATE, sizeof(answer), 10};
+		answer.status = self->status;
+		answer.screen_width = 256;
+		answer.screen_height = 128;
+		answer.granularity_width = answer.granularity_height = 32;
+		answer.granularity_depth = 1;
+		answer.layer_count = 1;
+		answer.mutability = 2;
+		answer.parameter_size = 24624;
+		answer.parameter_align = 4;
+		CHECK(capacity >= sizeof(answer));
+		std::memcpy(reply, &answer, sizeof(answer));
+		*reply_size = sizeof(answer);
+		return true;
+	}
+};
+
+// A rate map's create, reset and queries ask the device and post nothing on the ring: the create
+// under a new id of the context, carrying the descriptor's screen size, its mutability where set
+// and each layer's record with its samples after the layers, each the bits of its float; a reset
+// the same under the map's id. Nothing is asked where the host makes no maps, or where the
+// message is past half the control ring, which the kext takes no lifecycle message past.
+void test_rate_map_messages()
+{
+	TestRing ring(0x8000);
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	ids.setBases(3ull << RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxIdSpace::kDefaultAddressBase);
+	RgfxSerializer ser(writer, ids);
+	RateMapAsker asker;
+	ser.setAsker(&RateMapAsker::ask, &asker);
+	RgfxRateMapShape shape;
+	shape.screen_width = 256;
+	shape.screen_height = 128;
+	shape.mutability_set = true;
+	shape.mutability = 1;
+	shape.layers.push_back({3, 2, {1.0f, 0.25f, 1.0f, 1.0f, 0.5f}});
+	RgfxRateMapState state = {};
+	RgfxCreated none = ser.createRateMap(shape, &state);
+	CHECK(!none.posted && none.status == kRgfxNoAnswer && asker.calls == 0);
+
+	ser.setCarriesRateMaps(true);
+	RgfxCreated made = ser.createRateMap(shape, &state);
+	CHECK(made.posted && made.status == RGFX_STATUS_OK && asker.calls == 1);
+	CHECK(made.obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT == 3 && made.seqno == 10);
+	CHECK(state.screen_width == 256 && state.parameter_size == 24624 && state.layer_count == 1);
+	const size_t head = sizeof(RgfxRateMapCreate), layer = sizeof(RgfxRateMapLayer);
+	CHECK(asker.asked.size() == ((head + layer + 5 * 4 + 7) & ~size_t(7)));
+	RgfxRateMapCreate create = {};
+	std::memcpy(&create, asker.asked.data(), sizeof(create));
+	CHECK(create.header.type == RGFX_CMD_RATE_MAP_CREATE && create.header.size == asker.asked.size());
+	CHECK(create.obj_id == made.obj_id && create.screen_width == 256 && create.screen_height == 128);
+	CHECK(create.screen_depth == 0 && create.flags == RGFX_RATE_MAP_MUTABILITY_SET);
+	CHECK(create.mutability == 1 && create.layer_count == 1 && create.layers_offset == head);
+	RgfxRateMapLayer l = {};
+	std::memcpy(&l, asker.asked.data() + head, sizeof(l));
+	CHECK(l.horizontal_count == 3 && l.vertical_count == 2 && l.samples_offset == head + layer);
+	float samples[5] = {};
+	std::memcpy(samples, asker.asked.data() + l.samples_offset, sizeof(samples));
+	CHECK(samples[0] == 1.0f && samples[1] == 0.25f && samples[2] == 1.0f && samples[3] == 1.0f &&
+	      samples[4] == 0.5f);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(!ring.next(&h, &bytes));
+
+	// A reset names the map; a refusal answers its status.
+	shape.mutability_set = false;
+	asker.status = RGFX_STATUS_REFUSED;
+	CHECK(ser.resetRateMap(made.obj_id, shape, &state) == RGFX_STATUS_REFUSED);
+	std::memcpy(&create, asker.asked.data(), sizeof(create));
+	CHECK(create.header.type == RGFX_CMD_RATE_MAP_RESET && create.obj_id == made.obj_id);
+	CHECK(create.flags == 0 && create.mutability == 0);
+
+	// A query carries its kind, its argument and its coordinate's bits, and answers the values
+	// where the device answers OK, zeros where it does not.
+	uint64_t values[3] = {9, 9, 9};
+	asker.status = RGFX_STATUS_OK;
+	CHECK(ser.queryRateMap(made.obj_id, RGFX_RATE_MAP_QUERY_SCREEN_TO_PHYSICAL, 1, RGFX_OBJ_NONE,
+	                       10.5f, 3.25f, values) == RGFX_STATUS_OK);
+	CHECK(values[0] == 0x3f800000 && values[1] == 0x40000000 && values[2] == 7);
+	RgfxRateMapQuery q = {};
+	CHECK(asker.asked.size() == sizeof(q));
+	std::memcpy(&q, asker.asked.data(), sizeof(q));
+	float x = 0, y = 0;
+	std::memcpy(&x, &q.x_bits, 4);
+	std::memcpy(&y, &q.y_bits, 4);
+	CHECK(q.header.type == RGFX_CMD_RATE_MAP_QUERY && q.obj_id == made.obj_id && q.at == 1);
+	CHECK(q.query == RGFX_RATE_MAP_QUERY_SCREEN_TO_PHYSICAL && x == 10.5f && y == 3.25f);
+	asker.status = RGFX_STATUS_REFUSED;
+	CHECK(ser.queryRateMap(made.obj_id, RGFX_RATE_MAP_QUERY_COPY_PARAMETER_DATA, 4, 0x77, 0, 0,
+	                       values) == RGFX_STATUS_REFUSED);
+	CHECK(values[0] == 0 && values[1] == 0 && values[2] == 0);
+	std::memcpy(&q, asker.asked.data(), sizeof(q));
+	CHECK(q.buffer_obj_id == 0x77 && q.at == 4);
+
+	// A descriptor past half the control ring is asked nothing.
+	const uint32_t calls = asker.calls;
+	shape.layers[0].horizontal_count = 4096;
+	shape.layers[0].vertical_count = 2;
+	shape.layers[0].samples.assign(4098, 1.0f);
+	CHECK(ser.createRateMap(shape, &state).status == kRgfxNoAnswer && asker.calls == calls);
+	CHECK(!ring.next(&h, &bytes));
+}
+
 // A no-copy buffer's block and the app's memory (RgfxMemoryShadow): the block starts as the
 // memory; each sync moves the bytes one side changed since the two last agreed, byte by byte,
 // so a CPU write and a GPU write beside it in one word both stand; memory mapped read-only is
@@ -3305,6 +3438,7 @@ int main()
 	test_keyed_library_messages();
 	test_heap_ranges();
 	test_heap_texture_size_query();
+	test_rate_map_messages();
 	test_memory_shadow();
 	test_argument_layout_queries();
 	test_argument_layout_parse();

@@ -14,6 +14,7 @@
 #import "RgfxIOSurface.h"
 #import "RgfxIndirectCommandBuffer.h"
 #import "RgfxMetalPrivate.h"
+#import "RgfxRasterizationRateMap.h"
 #import "RgfxStateCache.h"
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
@@ -356,6 +357,44 @@ const char *bufferCause(NSUInteger length, MTLResourceOptions options, NSUIntege
 	if (icb == nil)
 		noteNil(creator, "the factory made none", asked);
 	return icb;
+}
+
+// --- rasterization rate maps -------------------------------------------------
+
+// Made on the host where it makes them (RATE_MAPS, which the kext takes for the bundle); nil
+// where it does not, as a device that supports no layer count answers.
+- (id<MTLRasterizationRateMap>)newRasterizationRateMapWithDescriptor:
+    (MTLRasterizationRateMapDescriptor *)descriptor
+{
+	const char *creator = "newRasterizationRateMapWithDescriptor:";
+	char asked[96];
+	snprintf(asked, sizeof(asked), "a map of %lu layers over %lux%lu",
+	         (unsigned long)descriptor.layerCount, (unsigned long)descriptor.screenSize.width,
+	         (unsigned long)descriptor.screenSize.height);
+	if (([self caps]->features() & RGFX_FEATURE_RATE_MAPS) == 0) {
+		noteNil(creator, "the host makes none", asked);
+		return nil;
+	}
+	id<MTLRasterizationRateMap> map = [RgfxRasterizationRateMap rateMapWithDescriptor:descriptor
+	                                                                          device:self
+	                                                                      serializer:[self serializer]];
+	if (map == nil)
+		noteNil(creator, "the factory made none", asked);
+	return map;
+}
+
+// The base device's form of a screen size and its layers (`@56@0:8{?=QQQ}16Q40r^@48`), which
+// Metal's public descriptor of the same arguments makes.
+- (id<MTLRasterizationRateMap>)
+    newRasterizationRateMapWithScreenSize:(MTLSize)screenSize
+                               layerCount:(NSUInteger)layerCount
+                                   layers:(const __unsafe_unretained id *)layers
+{
+	MTLRasterizationRateMapDescriptor *descriptor = [MTLRasterizationRateMapDescriptor
+	    rasterizationRateMapDescriptorWithScreenSize:screenSize
+	                                      layerCount:layerCount
+	                                          layers:(MTLRasterizationRateLayerDescriptor *const *)layers];
+	return [self newRasterizationRateMapWithDescriptor:descriptor];
 }
 
 // --- heaps -------------------------------------------------------------------

@@ -8521,6 +8521,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_DISPLAY_SCALE
             | RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA
             | RGFX_FEATURE_DISPLAY_POWER
+            | RGFX_FEATURE_RATE_MAPS
             | sixteen_bit
             | if carries {
                 RGFX_FEATURE_SURFACE_DEFERRED_CARRY
@@ -8570,6 +8571,8 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
                 | RGFX_FEATURE_DISPLAY_SCALE
                 | RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA
                 | RGFX_FEATURE_DISPLAY_POWER
+                | RGFX_FEATURE_RATE_MAPS
+                | RGFX_FEATURE_RATE_MAPS
                 | RGFX_FEATURE_PAGES_16K
                 | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
         );
@@ -8606,6 +8609,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_DISPLAY_SCALE
             | RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA
             | RGFX_FEATURE_DISPLAY_POWER
+            | RGFX_FEATURE_RATE_MAPS
     );
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);

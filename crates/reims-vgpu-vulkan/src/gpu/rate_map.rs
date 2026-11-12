@@ -647,6 +647,12 @@ impl RateMap<VulkanPlatform> for VulkanRateMap {
         })))
     }
 
+    /// The runtime's: the descriptor's width and height, depth 1, as Metal answers on an M3 Max
+    /// and an M4.
+    fn screen_size(&self) -> MtlSize {
+        mtl_size(plain(|| self.raw.screen_size()))
+    }
+
     /// The runtime's reset, which compiles the descriptor over the map's tables, keeps its
     /// mutability, and encodes again each pass that took the map whose command buffer is not yet
     /// submitted (the module docs); a refusal dies. So does a reset while a pass that took the

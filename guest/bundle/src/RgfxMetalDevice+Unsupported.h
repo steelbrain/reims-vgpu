@@ -6,8 +6,8 @@
  * logs its first use (RgfxUnsupported.h).
  *
  * What each waits on is listed in the effort's protocol-gaps-wire.md. Ray tracing, function
- * pointers, dynamic libraries, Metal 4, placement sparse, counters and rasterization rate maps
- * are what the device answers no for (RgfxCaps); indirect command buffers, argument encoders,
+ * pointers, dynamic libraries, Metal 4, placement sparse and counters are what the device answers
+ * no for (RgfxCaps); indirect command buffers, argument encoders,
  * binary archives, tile pipelines, residency sets, shared textures, log states and
  * tensors are what the wire does not carry yet.
  *

@@ -33,6 +33,7 @@
 #import "RgfxInterop.h"
 #import "RgfxBlockCall.h"
 #import "RgfxLibrary.h"
+#import "RgfxRasterizationRateMap.h"
 #import "RgfxRenderPipelineState.h"
 #import "RgfxResource.h"
 #import "RgfxSampler.h"
@@ -955,6 +956,76 @@ void test_sample_positions()
 		CHECK(o1->as<RgfxOpSetDepthStoreActionOptions>().store_action_options ==
 		      MTLStoreActionOptionNone);
 	}
+	fx.complete(cb, seqno);
+	} // @autoreleasepool
+}
+
+// A pass's rasterization rate map travels after its colour records and its visibility result
+// buffer, in render and parallel passes, and the command buffer keeps it; a pass with none
+// carries none.
+void test_rasterization_rate_map_pass()
+{
+	QueueFixture fx;
+	@autoreleasepool {
+	RgfxTexture *target = shapeTexture(
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:8
+	                                                      height:8
+	                                                   mipmapped:NO],
+	    0x42);
+	RgfxBuffer *results = [[RgfxBuffer alloc] initWithObjId:0x50
+	                                             gpuAddress:0
+	                                                 length:16
+	                                                options:0
+	                                                 device:nil
+	                                             serializer:nullptr];
+	RgfxRasterizationRateMap *map = [[RgfxRasterizationRateMap alloc] initWithObjId:0x60
+	                                                                         device:nil
+	                                                                     serializer:nullptr];
+	__weak RgfxRasterizationRateMap *weakMap = map;
+	id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
+	MTLRenderPassDescriptor *rp = onePass(target);
+	rp.visibilityResultBuffer = results;
+	rp.rasterizationRateMap = map;
+	[[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+	rp.visibilityResultBuffer = nil;
+	[[cb parallelRenderCommandEncoderWithDescriptor:rp] endEncoding];
+	[[cb renderCommandEncoderWithDescriptor:onePass(target)] endEncoding];
+	rp = nil;
+	map = nil;
+	// The command buffer keeps the map it names until it completes.
+	CHECK(weakMap != nil);
+	[cb commit];
+
+	uint64_t seqno = 0;
+	std::vector<Op> ops = fx.nextOps(&seqno);
+	const size_t at = RGFX_RENDER_PASS_COLOR_OFFSET + sizeof(RgfxRenderPassColorAttachment);
+	const Op *both = findOp(ops, RGFX_OP_ENCODER_BEGIN_RENDER, 0);
+	CHECK(both != nullptr);
+	if (both != nullptr) {
+		CHECK(both->as<RgfxRenderPassDesc>().flags ==
+		      (RGFX_PASS_FLAG_VISIBILITY_RESULT | RGFX_PASS_FLAG_RATE_MAP));
+		const size_t mapAt = at + sizeof(RgfxRenderPassVisibility);
+		CHECK(both->body.size() == mapAt + sizeof(RgfxRenderPassRateMap));
+		if (both->body.size() == mapAt + sizeof(RgfxRenderPassRateMap)) {
+			RgfxRenderPassRateMap m = {};
+			std::memcpy(&m, both->body.data() + mapAt, sizeof(m));
+			CHECK(m.map_obj_id == 0x60);
+		}
+	}
+	const Op *parallel = findOp(ops, RGFX_OP_ENCODER_BEGIN_RENDER, 1);
+	CHECK(parallel != nullptr);
+	if (parallel != nullptr) {
+		CHECK(parallel->as<RgfxRenderPassDesc>().flags == RGFX_PASS_FLAG_RATE_MAP);
+		CHECK(parallel->body.size() == at + sizeof(RgfxRenderPassRateMap));
+		if (parallel->body.size() == at + sizeof(RgfxRenderPassRateMap)) {
+			RgfxRenderPassRateMap m = {};
+			std::memcpy(&m, parallel->body.data() + at, sizeof(m));
+			CHECK(m.map_obj_id == 0x60);
+		}
+	}
+	const Op *plain = findOp(ops, RGFX_OP_ENCODER_BEGIN_RENDER, 2);
+	CHECK(plain != nullptr && plain->body.size() == at && plain->as<RgfxRenderPassDesc>().flags == 0);
 	fx.complete(cb, seqno);
 	} // @autoreleasepool
 }
@@ -2487,6 +2558,7 @@ void rgfxProtocolTests()
 	test_framework_members();
 	test_sample_positions();
 	test_visibility_result_buffer();
+	test_rasterization_rate_map_pass();
 	test_color_attachment_mapping_pass();
 	test_encoders_unsupported();
 	test_command_buffer_and_queue_members();

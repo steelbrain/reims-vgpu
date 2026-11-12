@@ -682,7 +682,7 @@ newPipelineLibraryWithFilePath:error: unsupported pipeline libraries
 newPrecompiledComputePipelineStateWithDescriptor:options:pipelineCache:completionHandler: partial precompiled compute pipelines of another descriptor
 newPrecompiledRenderPipelineStateWithDescriptor:options:pipelineCache:completionHandler: partial precompiled render pipelines of another descriptor
 newProfileWithExecutionSize: unsupported profiles
-newRasterizationRateMapWithDescriptor: unsupported rasterization rate maps
+newRasterizationRateMapWithDescriptor: implemented
 newRenderPipelineDescriptorWithSerializedData:deserializationContext: base %base-creator
 newRenderPipelineStateWithDescriptor:completionHandler: implemented
 newRenderPipelineStateWithDescriptor:error: implemented
@@ -1051,6 +1051,16 @@ setDepthStoreActionOptions: implemented
 setLabel: implemented
 setStencilStoreAction: implemented
 setStencilStoreActionOptions: implemented
+
+[RgfxRasterizationRateMap]
+copyParameterDataToBuffer:offset: implemented
+layerCount implemented
+mapPhysicalToScreenCoordinates:forLayer: implemented
+mapScreenToPhysicalCoordinates:forLayer: implemented
+parameterBufferSizeAndAlign implemented
+physicalGranularity implemented
+physicalSizeForLayer: implemented
+screenSize implemented
 
 [RgfxRenderCommandEncoder]
 barrierAfterQueueStages:beforeStages: implemented
@@ -1680,6 +1690,12 @@ insertSplit metal raises an unrecognized selector, as Metal's base parallel enco
 sampledRenderCommandEncoderWithProgramInfoBuffer:capacity: metal nil, as the buffer's sampledRenderCommandEncoderWithDescriptor:programInfoBuffer:capacity: answers: Metal's base parallel encoder makes its sampled sub-encoder with that (read from code, %enc-base); the device samples no counters
 separateCommits metal NO, as Metal's IOAccel parallel encoder answers (read from code, MTLIOAccelParallelRenderCommandEncoder, macOS 27.0.1)
 setSeparateCommits: metal does nothing, as Metal's IOAccel parallel encoder does (read from code, MTLIOAccelParallelRenderCommandEncoder, macOS 27.0.1)
+[RgfxRasterizationRateMap]
+formattedDescription: implemented
+minFactor implemented
+mutability implemented
+resetUsingDescriptor: implemented
+
 [RgfxRenderCommandEncoder]
 addSplitHandler: metal nothing to carry out: the device sends a pass to the host whole, so it reports no split and calls no handler
 dispatchThreadsPerTile:inRegion: unsupported  tile dispatches over a region

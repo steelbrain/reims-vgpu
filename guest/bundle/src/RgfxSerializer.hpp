@@ -228,6 +228,23 @@ struct RgfxCreated {
 	uint32_t status;
 };
 
+/// A rasterization rate map's descriptor (MTLRasterizationRateMapDescriptor) as RATE_MAP_CREATE
+/// and RATE_MAP_RESET carry it: its screen size, its private mutability where set, and its layers
+/// from index 0, each its sample counts and its samples, horizontal then vertical.
+struct RgfxRateMapShape {
+	struct Layer {
+		uint32_t horizontal_count = 0;
+		uint32_t vertical_count = 0;
+		std::vector<float> samples; // horizontal_count horizontal ones, then the vertical ones
+	};
+	uint64_t screen_width = 0;
+	uint64_t screen_height = 0;
+	uint64_t screen_depth = 0;
+	bool mutability_set = false;
+	uint32_t mutability = 0;
+	std::vector<Layer> layers;
+};
+
 /// A pipeline create's post against the process's known pipelines (RgfxKnownPipelines): where
 /// the route defers answers (RgfxRingWriter::defers), the create is keyed, and one whose key is
 /// known is posted without waiting for its answer.
@@ -303,6 +320,11 @@ public:
 	/// RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA. Set once, before the first texture; off by default.
 	void setCarriesTextureDidModifyData(bool carries) { m_textureDidModifyData = carries; }
 	bool carriesTextureDidModifyData() const { return m_textureDidModifyData; }
+	/// Whether the host makes rasterization rate maps (createRateMap, resetRateMap and
+	/// queryRateMap): it took RGFX_FEATURE_RATE_MAPS. Set once, before the first map; off by
+	/// default.
+	void setCarriesRateMaps(bool carries) { m_rateMaps = carries; }
+	bool carriesRateMaps() const { return m_rateMaps; }
 	/// Names shared event `event` for other processes: its port, 0 where none was given.
 	uint32_t shareEvent(RgfxObjId event);
 	/// The process's new shared event made of the one `port` names: its id in `obj_id` and the
@@ -485,6 +507,24 @@ public:
 	/// goes on the ring unanswered, with no resource id.
 	RgfxCreated createSampler(const RgfxSamplerParams &params);
 
+	/// A rasterization rate map of `shape` (RATE_MAP_CREATE), asked of the device, whose answer,
+	/// the map's state (RATE_MAP_STATE), lands in `*state`: `status` is its status, `posted`
+	/// false where no answer came back. No message goes where the host makes no maps
+	/// (carriesRateMaps), where no asker is set, or where the message is past what the kext takes
+	/// of a lifecycle message (half the control ring): `status` is then kRgfxNoAnswer.
+	RgfxCreated createRateMap(const RgfxRateMapShape &shape, RgfxRateMapState *state);
+
+	/// Compiles map `map` again from `shape` (RATE_MAP_RESET, `resetUsingDescriptor:`), its new
+	/// state in `*state`. The device's status, or kRgfxNoAnswer, as createRateMap.
+	uint32_t resetRateMap(RgfxObjId map, const RgfxRateMapShape &shape, RgfxRateMapState *state);
+
+	/// One of map `map`'s answers that takes an argument (RATE_MAP_QUERY, `query` an
+	/// RGFX_RATE_MAP_QUERY_*, `at` its layer or offset, `buffer` a copy's buffer, `x` and `y` a
+	/// coordinate), its values in `values`. The device's status, or kRgfxNoAnswer, as
+	/// createRateMap; `values` is zeroed where it is not RGFX_STATUS_OK.
+	uint32_t queryRateMap(RgfxObjId map, uint32_t query, uint64_t at, RgfxObjId buffer, float x,
+	                      float y, uint64_t values[3]);
+
 	/// A depth/stencil state.
 	RgfxCreated createDepthStencil(uint32_t depth_compare, bool depth_write_enabled,
 	                               const RgfxStencilDescriptor &front,
@@ -644,6 +684,7 @@ private:
 	EventTakeFn m_eventTake = nullptr;
 	bool m_privateRenderState = false;
 	bool m_textureDidModifyData = false;
+	bool m_rateMaps = false;
 	void *m_eventContext = nullptr;
 
 	// heapTextureSizeAndAlign's answers, by the shape's bytes, under m_sizesLock.

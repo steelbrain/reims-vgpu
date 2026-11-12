@@ -41,6 +41,8 @@ pub trait RateMap<P: Platform>: Handle {
     fn physical_granularity(&self) -> MtlSize;
     /// sel: physicalSizeForLayer:
     fn physical_size(&self, layer_index: u64) -> RaiseResult<MtlSize>;
+    /// sel: screenSize
+    fn screen_size(&self) -> MtlSize;
     /// sel: resetUsingDescriptor: SPI
     /// No path reaches it under a handler: a raise inside it dies at the send.
     fn reset(&self, descriptor: &P::RateMapDescriptor);

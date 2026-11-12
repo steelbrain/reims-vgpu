@@ -139,13 +139,6 @@ NSError *metal4Refusal()
 	return nil;
 }
 
-- (id<MTLRasterizationRateMap>)newRasterizationRateMapWithDescriptor:
-    (MTLRasterizationRateMapDescriptor *)descriptor
-{
-	RGFX_UNSUPPORTED("rasterization rate maps");
-	return nil;
-}
-
 // The x86 Macs answer nil and set no error (measured: macOS 26.7.1, the AMD Radeon Pro 5300M and
 // the Intel UHD 630, the error out nil before and after), so the x86 device leaves `*error` as it
 // is. An M3 makes a set (measured: macOS 27.0.1, the M3 Max, AGXG15XFamilyResidencySet, with no
@@ -456,9 +449,8 @@ NSError *metal4Refusal()
 	return nil;
 }
 
-// Residency sets (`@16@0:8`), counters' resolve (`@40@0:8@16{_NSRange=QQ}24`), rasterization
-// rate maps of a screen size (`@56@0:8{?=QQQ}16Q40r^@48`) and textures shared by handle at a
-// resource index (`@32@0:8@16Q24`), as their public forms above.
+// Residency sets (`@16@0:8`), counters' resolve (`@40@0:8@16{_NSRange=QQ}24`) and textures
+// shared by handle at a resource index (`@32@0:8@16Q24`), as their public forms above.
 - (id)allocResidencySet
 {
 	RGFX_UNSUPPORTED("residency sets (none on the wire)");
@@ -468,15 +460,6 @@ NSError *metal4Refusal()
 - (NSData *)resolveCounters:(id<MTLCounterSampleBuffer>)buffer withRange:(NSRange)range
 {
 	RGFX_UNSUPPORTED("counter sampling");
-	return nil;
-}
-
-- (id<MTLRasterizationRateMap>)
-    newRasterizationRateMapWithScreenSize:(MTLSize)screenSize
-                               layerCount:(NSUInteger)layerCount
-                                   layers:(const __unsafe_unretained id *)layers
-{
-	RGFX_UNSUPPORTED("rasterization rate maps");
 	return nil;
 }
 

@@ -161,14 +161,16 @@ public:
 
 	/// Opens a render encoder for `desc` and its `color_count`
 	/// [`RgfxRenderPassColorAttachment`] records, then the pass's sample positions where
-	/// `positions` is not null, then its visibility result buffer where `visibility` is not null.
-	/// `desc.color_count` is set from `color_count`, `RGFX_PASS_FLAG_SAMPLE_POSITIONS` from
-	/// `positions` and `RGFX_PASS_FLAG_VISIBILITY_RESULT` from `visibility`, so each always agrees
-	/// with what follows.
+	/// `positions` is not null, then its visibility result buffer where `visibility` is not null,
+	/// then its rasterization rate map where `rate_map` is not null. `desc.color_count` is set
+	/// from `color_count`, `RGFX_PASS_FLAG_SAMPLE_POSITIONS` from `positions`,
+	/// `RGFX_PASS_FLAG_VISIBILITY_RESULT` from `visibility` and `RGFX_PASS_FLAG_RATE_MAP` from
+	/// `rate_map`, so each always agrees with what follows.
 	void beginRenderPass(RgfxRenderPassDesc desc, const RgfxRenderPassColorAttachment *colors,
 	                     uint32_t color_count,
 	                     const RgfxRenderPassSamplePositions *positions = nullptr,
-	                     const RgfxRenderPassVisibility *visibility = nullptr);
+	                     const RgfxRenderPassVisibility *visibility = nullptr,
+	                     const RgfxRenderPassRateMap *rate_map = nullptr);
 	/// Opens a compute encoder for Metal's default pass (empty body).
 	void beginComputePass();
 	/// Opens a compute encoder whose pass sets `MTLDispatchType` `dispatch_type`.

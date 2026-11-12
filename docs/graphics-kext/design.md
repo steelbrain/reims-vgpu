@@ -1361,6 +1361,24 @@ only where no negotiation can carry it.
   answered by `COMPLETE`, which turns the display's panel off while the
   guest's display sleeps and on at its wake ("The display's sleep", below).
   Every host offers it, and the x86-64 kext takes it.
+- Bit 38, `FEATURES_HI`'s bit 6, is `RATE_MAPS`: ring 0 carries
+  `RATE_MAP_CREATE` (0x233) and `RATE_MAP_RESET` (0x234), both
+  `RgfxRateMapCreate` (the map's `ObjId`, the descriptor's screen size, its
+  private mutability where set, and its layers' `RgfxRateMapLayer` records
+  with their samples after them), answered by `RATE_MAP_STATE` (0x40a,
+  `RgfxRateMapState`: the status, and the map's screen size, granularity,
+  layer count, mutability and parameter data's size and alignment), and
+  `RATE_MAP_QUERY` (0x235, `RgfxRateMapQuery`), answered by `RATE_MAP_ANSWER`
+  (0x40b, `RgfxRateMapAnswer`): a layer's physical size, a coordinate mapped
+  either way, or a copy of the parameter data into a buffer of the sender's,
+  which the platform writes where the buffer's contents lie before it
+  answers. A render pass names its map after its other records
+  (`RGFX_PASS_FLAG_RATE_MAP`, `RgfxRenderPassRateMap`). The platform compiles
+  each map, so its answers and its parameter data are the platform's, and the
+  layer counts it makes maps of are the device info's
+  (`largest_rasterization_rate_map_layer_count`). Every host offers it, and
+  the kext takes it; a bundle on a host that did not offer it makes no map and
+  supports no layer count.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -2403,6 +2421,7 @@ that waits for its answer would close it, at the cost the known creates remove.
 | Managed ranges | `BUFFER_DID_MODIFY_RANGE`, `TEXTURE_REPLACE_REGION` | `Buffer::did_modify_range`, `Texture::replace_region` |
 | a texture's bytes changed | `TEXTURE_DID_MODIFY_DATA` (not answered; carried out as a range message) | `Texture::did_modify_data` |
 | heap sizes | `HEAP_TEXTURE_SIZE_AND_ALIGN` (answered `SIZE_AND_ALIGN` on the control completion ring; makes nothing) | `heap_texture_size_and_align` |
+| rasterization rate maps | `RATE_MAP_CREATE`, `RATE_MAP_RESET` (answered `RATE_MAP_STATE`), `RATE_MAP_QUERY` (answered `RATE_MAP_ANSWER`; makes nothing), `*_DESTROY` | `new_rate_map`, `RateMap::reset`, `RateMap::physical_size`, `screen_to_physical` and `physical_to_screen`, `RateMap::copy_parameter_data` |
 | state | `SAMPLER_CREATE`, `DEPTH_STENCIL_CREATE`, `*_DESTROY` | `new_sampler_state`, `new_depth_stencil_state` |
 | shaders | `LIBRARY_LOOKUP` (the content key of the `.metallib`'s AIR slice: a hit binds the library the device made for any process, and no bytes cross), `LIBRARY_CREATE` and `LIBRARY_FROM_REGION` (the slice's bytes forwarded unchanged on a miss, answered once made), `RENDER_PIPELINE_CREATE`, `MESH_RENDER_PIPELINE_CREATE`, `COMPUTE_PIPELINE_CREATE`, `*_DESTROY` | the device's library cache, `new_library_with_data`, `new_render_pipeline_state_full`, `new_mesh_render_pipeline_state_full` and `new_compute_pipeline_state_full` (the whole descriptor the guest set: vertex or stage-input descriptor, every colour attachment, each stage's linked functions, those made with options or a specialized name by `Library::new_function_with_options`; the Vulkan platform refuses a specialized name, which its runtime's function descriptor lacks) |
 | sync | `EVENT_CREATE`, `SHARED_EVENT_CREATE`, `FENCE_CREATE`, `*_DESTROY`; the kext's `SHARED_EVENT_NAME` (answered `COMPLETE`), `SHARED_EVENT_IMPORT` (answered `SHARED_EVENT_VALUE`) and `SHARED_EVENT_UNNAME` (not answered) | `new_event`, `new_shared_event`, `new_fence`; an import's value `SharedEvent::signaled_value` |

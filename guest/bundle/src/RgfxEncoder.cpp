@@ -279,11 +279,13 @@ bool RgfxEncoder::finish(uint64_t *out_seqno, const std::function<void()> &while
 void RgfxEncoder::beginRenderPass(RgfxRenderPassDesc desc,
                                   const RgfxRenderPassColorAttachment *colors, uint32_t color_count,
                                   const RgfxRenderPassSamplePositions *positions,
-                                  const RgfxRenderPassVisibility *visibility)
+                                  const RgfxRenderPassVisibility *visibility,
+                                  const RgfxRenderPassRateMap *rate_map)
 {
 	desc.color_count = color_count;
-	desc.flags &= ~(RGFX_PASS_FLAG_SAMPLE_POSITIONS | RGFX_PASS_FLAG_VISIBILITY_RESULT);
-	if (positions == nullptr && visibility == nullptr) {
+	desc.flags &= ~(RGFX_PASS_FLAG_SAMPLE_POSITIONS | RGFX_PASS_FLAG_VISIBILITY_RESULT |
+	                RGFX_PASS_FLAG_RATE_MAP);
+	if (positions == nullptr && visibility == nullptr && rate_map == nullptr) {
 		appendArrayOp(RGFX_OP_ENCODER_BEGIN_RENDER, &desc, sizeof(desc), colors, color_count,
 		              sizeof(RgfxRenderPassColorAttachment));
 		return;
@@ -292,11 +294,14 @@ void RgfxEncoder::beginRenderPass(RgfxRenderPassDesc desc,
 		desc.flags |= RGFX_PASS_FLAG_SAMPLE_POSITIONS;
 	if (visibility != nullptr)
 		desc.flags |= RGFX_PASS_FLAG_VISIBILITY_RESULT;
+	if (rate_map != nullptr)
+		desc.flags |= RGFX_PASS_FLAG_RATE_MAP;
 	const size_t colorBytes = static_cast<size_t>(color_count) * sizeof(RgfxRenderPassColorAttachment);
 	const size_t positionBytes = positions != nullptr ? sizeof(*positions) : 0;
 	const size_t visibilityBytes = visibility != nullptr ? sizeof(*visibility) : 0;
-	const size_t len =
-	    RGFX_OP_BODY_OFFSET + sizeof(desc) + colorBytes + positionBytes + visibilityBytes;
+	const size_t rateMapBytes = rate_map != nullptr ? sizeof(*rate_map) : 0;
+	const size_t len = RGFX_OP_BODY_OFFSET + sizeof(desc) + colorBytes + positionBytes +
+	                   visibilityBytes + rateMapBytes;
 	uint8_t *at = reserve(len);
 	putHeader(at, RGFX_OP_ENCODER_BEGIN_RENDER, len);
 	at += RGFX_OP_BODY_OFFSET;
@@ -310,6 +315,9 @@ void RgfxEncoder::beginRenderPass(RgfxRenderPassDesc desc,
 	at += positionBytes;
 	if (visibilityBytes)
 		std::memcpy(at, visibility, visibilityBytes);
+	at += visibilityBytes;
+	if (rateMapBytes)
+		std::memcpy(at, rate_map, rateMapBytes);
 }
 
 void RgfxEncoder::beginComputePass()

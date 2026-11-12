@@ -882,6 +882,7 @@ RGFX_LOG_UNRECOGNIZED
 	                                          0);
 	_serializer->setCarriesTextureDidModifyData(
 	    (_caps.features() & RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA) != 0);
+	_serializer->setCarriesRateMaps((_caps.features() & RGFX_FEATURE_RATE_MAPS) != 0);
 	// Shared events cross processes through the kext's ports where the kext makes them and the
 	// host took the feature that names their events (RgfxUserClientABI.hpp,
 	// kRgfxSharedEventUserClientType).
@@ -1492,8 +1493,11 @@ RGFX_LOG_UNRECOGNIZED
 	return count <= largest;
 }
 
+// The layer counts the host makes maps of, where it makes them (its RATE_MAPS feature taken).
 - (BOOL)supportsRasterizationRateMapWithLayerCount:(NSUInteger)layerCount
 {
+	if ((_caps.features() & RGFX_FEATURE_RATE_MAPS) == 0)
+		return NO;
 	return layerCount >= 1 && layerCount <= _caps.size(kRgfxSizeLargestRasterizationRateMapLayerCount);
 }
 

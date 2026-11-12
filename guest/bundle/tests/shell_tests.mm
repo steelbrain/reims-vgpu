@@ -48,6 +48,7 @@
 #import "RgfxLibraryFile.h"
 #import "RgfxMetalError.h"
 #import "RgfxPipelineReflection.h"
+#import "RgfxRasterizationRateMap.h"
 #import "RgfxRenderPipelineState.h"
 #include <set>
 #include <vector>
@@ -2035,6 +2036,77 @@ static RgfxRenderPipelineState *meshState(Fixture &fx, MTLMeshRenderPipelineDesc
 	                                                                error:error];
 }
 
+// The device's answers to the rate map messages: a map of a 256 x 128 screen, of `layers` layers,
+// and a query's answer of (1.5, 2.5), or `status` for each; what it was last asked.
+struct RateMapDevice {
+	uint32_t status = RGFX_STATUS_OK;
+	uint64_t layers = 1;
+	uint32_t calls = 0;
+	std::vector<uint8_t> asked;
+	static bool ask(void *context, const void *message, uint32_t size, void *reply,
+	                uint32_t capacity, uint32_t *reply_size)
+	{
+		auto *self = static_cast<RateMapDevice *>(context);
+		self->calls++;
+		const auto *bytes = static_cast<const uint8_t *>(message);
+		self->asked.assign(bytes, bytes + size);
+		RgfxMsgHeader h = {};
+		std::memcpy(&h, message, sizeof(h));
+		if (h.type == RGFX_CMD_RATE_MAP_QUERY) {
+			RgfxRateMapAnswer answer = {};
+			answer.header = {RGFX_EVT_RATE_MAP_ANSWER, sizeof(answer), 2};
+			answer.status = self->status;
+			const float x = 1.5f, y = 2.5f;
+			std::memcpy(&answer.values[0], &x, 4);
+			std::memcpy(&answer.values[1], &y, 4);
+			CHECK(capacity >= sizeof(answer));
+			std::memcpy(reply, &answer, sizeof(answer));
+			*reply_size = sizeof(answer);
+			return true;
+		}
+		RgfxRateMapState answer = {};
+		answer.header = {RGFX_EVT_RATE_MAP_STATE, sizeof(answer), 1};
+		answer.status = self->status;
+		answer.screen_width = 256;
+		answer.screen_height = 128;
+		answer.granularity_width = answer.granularity_height = 32;
+		answer.granularity_depth = 1;
+		answer.layer_count = self->layers;
+		answer.mutability = 2;
+		answer.parameter_size = 24624;
+		answer.parameter_align = 4;
+		CHECK(capacity >= sizeof(answer));
+		std::memcpy(reply, &answer, sizeof(answer));
+		*reply_size = sizeof(answer);
+		return true;
+	}
+	RgfxRateMapQuery query() const
+	{
+		RgfxRateMapQuery q = {};
+		if (asked.size() >= sizeof(q))
+			std::memcpy(&q, asked.data(), sizeof(q));
+		return q;
+	}
+};
+
+// A rate map of one layer over 256 x 128, labelled.
+static MTLRasterizationRateMapDescriptor *rateMapDescriptor()
+{
+	const float h[] = {1.0f, 0.25f, 1.0f};
+	const float v[] = {1.0f, 0.5f};
+	MTLRasterizationRateLayerDescriptor *layer =
+	    [[MTLRasterizationRateLayerDescriptor alloc] initWithSampleCount:MTLSizeMake(3, 2, 0)
+	                                                          horizontal:h
+	                                                            vertical:v];
+	MTLRasterizationRateMapDescriptor *d =
+	    [MTLRasterizationRateMapDescriptor rasterizationRateMapDescriptorWithScreenSize:MTLSizeMake(256, 128, 0)
+	                                                                              layer:layer];
+	d.label = @"probe";
+	return d;
+}
+
+static void rateMapDiesCase(Fixture &fx, const char *name);
+
 // The cases checkDies runs, each in a process of its own: each ends the process where it should,
 // else it answers 0, which its check fails.
 static int dies_case(const char *name)
@@ -2388,8 +2460,44 @@ static int dies_case(const char *name)
 		if ([fn rgfxAirFunction] != nullptr)
 			(void)[fn newArgumentEncoderWithBufferIndex:5];
 	}
+	if (std::strncmp(name, "ratemap-", 8) == 0)
+		rateMapDiesCase(fx, name + 8);
 	}
 	return 0;
+}
+
+// A rate map's calls that end the process, as Metal's map does: a copy into a Private buffer,
+// and a coordinate map the host refuses.
+static void rateMapDiesCase(Fixture &fx, const char *name)
+{
+	static RateMapDevice device;
+	fx.ser.setAsker(&RateMapDevice::ask, &device);
+	fx.ser.setCarriesRateMaps(true);
+	RgfxRasterizationRateMap *map = [RgfxRasterizationRateMap rateMapWithDescriptor:rateMapDescriptor()
+	                                                                         device:nil
+	                                                                     serializer:&fx.ser];
+	if (std::strcmp(name, "private-copy") == 0) {
+		RgfxBuffer *buffer = [[RgfxBuffer alloc] initWithObjId:0x91
+		                                            gpuAddress:0
+		                                                length:0x8000
+		                                               options:MTLResourceStorageModePrivate
+		                                                device:nil
+		                                            serializer:nullptr];
+		[map copyParameterDataToBuffer:buffer offset:0];
+	}
+	if (std::strcmp(name, "refused-coordinate") == 0) {
+		device.status = RGFX_STATUS_REFUSED;
+		(void)[map mapScreenToPhysicalCoordinates:MTLCoordinate2DMake(1, 1) forLayer:0];
+	}
+}
+
+// A copy into a Private buffer and a coordinate map the host refuses end the process.
+void test_rasterization_rate_map_deaths()
+{
+	checkDies("ratemap-private-copy",
+	          "-[RgfxRasterizationRateMap copyParameterDataToBuffer:offset:] ends the process");
+	checkDies("ratemap-refused-coordinate",
+	          "-[RgfxRasterizationRateMap mapScreenToPhysicalCoordinates:forLayer:] ends the process");
 }
 
 // A view ends the process with Metal's words, before the host is asked, where Metal ends it on the
@@ -12258,6 +12366,76 @@ bool askTextureSize(void *, const void *, uint32_t, void *reply, uint32_t capaci
 	return true;
 }
 
+// A rate map is the host's: made where the host makes maps, from the state the host answers its
+// create with (its screen size, granularity, layers and parameter size), labelled with its
+// descriptor's label; each answer that takes an argument asks the host, and a copy into a Shared
+// buffer of ours names the buffer, where the host writes the bytes in place; a reset asks again
+// and the map answers its new state. Where the host makes none, or refuses, no map.
+void test_rasterization_rate_map()
+{
+	Fixture fx;
+	RateMapDevice device;
+	fx.ser.setAsker(&RateMapDevice::ask, &device);
+	@autoreleasepool {
+	CHECK([RgfxRasterizationRateMap rateMapWithDescriptor:rateMapDescriptor()
+	                                               device:nil
+	                                           serializer:&fx.ser] == nil);
+	CHECK(device.calls == 0);
+	fx.ser.setCarriesRateMaps(true);
+	RgfxRasterizationRateMap *map = [RgfxRasterizationRateMap rateMapWithDescriptor:rateMapDescriptor()
+	                                                                         device:nil
+	                                                                     serializer:&fx.ser];
+	CHECK(map != nil && device.calls == 1);
+	if (map == nil)
+		return;
+	RgfxRateMapCreate create = {};
+	std::memcpy(&create, device.asked.data(), sizeof(create));
+	CHECK(create.header.type == RGFX_CMD_RATE_MAP_CREATE && create.obj_id == [map rgfxObjId]);
+	CHECK(create.layer_count == 1 && create.screen_width == 256 && create.screen_height == 128);
+	CHECK(map.screenSize.width == 256 && map.screenSize.height == 128 && map.screenSize.depth == 0);
+	CHECK(map.physicalGranularity.width == 32 && map.physicalGranularity.depth == 1);
+	CHECK(map.layerCount == 1 && map.parameterBufferSizeAndAlign.size == 24624);
+	CHECK(map.parameterBufferSizeAndAlign.align == 4 && map.mutability == MTLMutabilityImmutable);
+	CHECK([map.label isEqualToString:@"probe"] && map.minFactor == 0.0f);
+	CHECK([[map formattedDescription:0] containsString:@"\n    layerCount = 1 \n"]);
+
+	(void)[map physicalSizeForLayer:1];
+	CHECK(device.query().query == RGFX_RATE_MAP_QUERY_PHYSICAL_SIZE && device.query().at == 1);
+	MTLCoordinate2D p = [map mapScreenToPhysicalCoordinates:MTLCoordinate2DMake(10.5f, 3.25f)
+	                                               forLayer:0];
+	CHECK(p.x == 1.5f && p.y == 2.5f);
+	RgfxRateMapQuery q = device.query();
+	float x = 0;
+	std::memcpy(&x, &q.x_bits, 4);
+	CHECK(q.query == RGFX_RATE_MAP_QUERY_SCREEN_TO_PHYSICAL && q.obj_id == [map rgfxObjId] && x == 10.5f);
+	p = [map mapPhysicalToScreenCoordinates:MTLCoordinate2DMake(1, 1) forLayer:0];
+	CHECK(device.query().query == RGFX_RATE_MAP_QUERY_PHYSICAL_TO_SCREEN && p.y == 2.5f);
+
+	RgfxBuffer *shared = [[RgfxBuffer alloc] initWithObjId:0x90
+	                                            gpuAddress:0
+	                                                length:0x8000
+	                                               options:MTLResourceStorageModeShared
+	                                                device:nil
+	                                            serializer:nullptr];
+	[map copyParameterDataToBuffer:shared offset:4];
+	q = device.query();
+	CHECK(q.query == RGFX_RATE_MAP_QUERY_COPY_PARAMETER_DATA && q.buffer_obj_id == 0x90 && q.at == 4);
+
+	device.layers = 2;
+	const uint32_t calls = device.calls;
+	[map resetUsingDescriptor:rateMapDescriptor()];
+	std::memcpy(&create, device.asked.data(), sizeof(create));
+	CHECK(device.calls == calls + 1 && create.header.type == RGFX_CMD_RATE_MAP_RESET);
+	CHECK(create.obj_id == [map rgfxObjId] && map.layerCount == 2);
+
+	device.status = RGFX_STATUS_REFUSED;
+	CHECK([RgfxRasterizationRateMap rateMapWithDescriptor:rateMapDescriptor()
+	                                               device:nil
+	                                           serializer:&fx.ser] == nil);
+	CHECK(ringEmpty(fx.ring));
+	} // @autoreleasepool
+}
+
 // An Automatic heap places what it makes as Metal's does, in the sequence measured on the M3
 // Max under macOS 27 (RgfxHeapRanges.hpp): its size rounded up to the 16 KiB page, buffers at
 // their length and textures at the device's size, each at the lowest free offset at its
@@ -17242,6 +17420,8 @@ int main(int argc, char **argv)
 		test_queue_ring_carries_only_command_buffers();
 		test_shared_heap_buffers_alias_its_bytes();
 		test_automatic_heap_places_as_metal();
+		test_rasterization_rate_map();
+		test_rasterization_rate_map_deaths();
 		test_automatic_shared_heap_buffers_are_its_bytes();
 		test_managed_texture_copy_block_after_destroys();
 		test_no_copy_buffers();

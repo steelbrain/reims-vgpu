@@ -138,8 +138,9 @@
 
 // Op `ENCODER_BEGIN_RENDER`: open a render encoder for the pass the op's body
 // describes (an [`RgfxRenderPassDesc`] then its `color_count`
-// [`RgfxRenderPassColorAttachment`] records, then the [`RgfxRenderPassSamplePositions`] and
-// the [`RgfxRenderPassVisibility`] its flags name, in that order). Holds the encoder until
+// [`RgfxRenderPassColorAttachment`] records, then the [`RgfxRenderPassSamplePositions`], the
+// [`RgfxRenderPassVisibility`] and the [`RgfxRenderPassRateMap`] its flags name, in that order).
+// Holds the encoder until
 // [`RGFX_OP_ENCODER_END`].
 #define RGFX_OP_ENCODER_BEGIN_RENDER 1
 
@@ -255,6 +256,12 @@
 // buffer, so its `setVisibilityResultMode:offset:` of a mode fails the command buffer, as
 // before the flag.
 #define RGFX_PASS_FLAG_VISIBILITY_RESULT (1 << 4)
+
+// A pass's rasterization rate map (`rasterizationRateMap`) follows its colour attachment
+// records, its sample positions and its visibility result buffer, as one
+// [`RgfxRenderPassRateMap`], where the guest took
+// [`RGFX_FEATURE_RATE_MAPS`](crate::wire::RGFX_FEATURE_RATE_MAPS).
+#define RGFX_PASS_FLAG_RATE_MAP (1 << 5)
 
 // Where the colour attachment array starts in an `ENCODER_BEGIN_RENDER` op's
 // body: right after the fixed [`RgfxRenderPassDesc`].
@@ -1044,7 +1051,8 @@
 // `FEATURES_HI`, RO: feature bits 32 to 63, the ones the host offers, which the guest takes
 // through [`RGFX_REG_DRIVER_FEATURES_HI`]: [`RGFX_FEATURE_SURFACE_DEFERRED_CARRY`],
 // [`RGFX_FEATURE_SCHEDULED_ASK`], [`RGFX_FEATURE_PAGES_16K`], [`RGFX_FEATURE_DISPLAY_SCALE`],
-// [`RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA`] and [`RGFX_FEATURE_DISPLAY_POWER`].
+// [`RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA`], [`RGFX_FEATURE_DISPLAY_POWER`] and
+// [`RGFX_FEATURE_RATE_MAPS`].
 // On a host that offers `PAGES_16K`, `FEATURES_LO` and `_HI` read the guest RAM features only
 // once the guest took it.
 #define RGFX_REG_FEATURES_HI 12
@@ -1331,6 +1339,15 @@
 // the display's panel off while the guest's display sleeps and on again at its wake, so the host
 // shows black while it sleeps. Every host offers it.
 #define RGFX_FEATURE_DISPLAY_POWER 137438953472
+
+// `FEATURES_HI` bit 6, feature bit 38, `RATE_MAPS`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_HI`]: ring 0 carries [`RGFX_CMD_RATE_MAP_CREATE`],
+// [`RGFX_CMD_RATE_MAP_RESET`] and [`RGFX_CMD_RATE_MAP_QUERY`], the device's rasterization rate
+// maps, and a render pass may name one
+// ([`RGFX_PASS_FLAG_RATE_MAP`](crate::ops::RGFX_PASS_FLAG_RATE_MAP)). Every host offers it; the
+// layer counts the device makes maps of are the device info's
+// (`largest_rasterization_rate_map_layer_count`).
+#define RGFX_FEATURE_RATE_MAPS 274877906944
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -1833,6 +1850,25 @@
 // host without the feature refuses the message as one it does not know.
 #define RGFX_CMD_TEXTURE_DID_MODIFY_DATA 562
 
+// Command `RATE_MAP_CREATE` ([`RgfxRateMapCreate`]), where the guest took
+// [`RGFX_FEATURE_RATE_MAPS`]: a rasterization rate map of the descriptor the message carries
+// (`newRasterizationRateMapWithDescriptor:`), made under `obj_id`, answered by
+// [`RGFX_EVT_RATE_MAP_STATE`]. A host without the feature refuses the message as one it does
+// not know.
+#define RGFX_CMD_RATE_MAP_CREATE 563
+
+// Command `RATE_MAP_RESET` ([`RgfxRateMapCreate`], its `obj_id` the map), where the guest took
+// [`RGFX_FEATURE_RATE_MAPS`]: the map compiled again from the descriptor the message carries
+// (`resetUsingDescriptor:`, SPI), its mutability kept, answered by [`RGFX_EVT_RATE_MAP_STATE`]
+// with the map's new state. A pass that took the map and whose command buffer the host has not
+// yet submitted draws by the map as reset. Makes nothing.
+#define RGFX_CMD_RATE_MAP_RESET 564
+
+// Command `RATE_MAP_QUERY` ([`RgfxRateMapQuery`]), where the guest took
+// [`RGFX_FEATURE_RATE_MAPS`]: one of a map's answers that takes an argument
+// (`RGFX_RATE_MAP_QUERY_*`), answered by [`RGFX_EVT_RATE_MAP_ANSWER`]. Makes nothing.
+#define RGFX_CMD_RATE_MAP_QUERY 565
+
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
 // and drops every object whose id lies in its range ([`RGFX_CONTEXT_OBJ_ID_SHIFT`]), then answers
@@ -2035,6 +2071,14 @@
 // Event `SHARED_EVENT_VALUE` ([`RgfxSharedEventValue`], on the control completion ring): a
 // `SHARED_EVENT_IMPORT`'s answer.
 #define RGFX_EVT_SHARED_EVENT_VALUE 1033
+
+// Event `RATE_MAP_STATE` ([`RgfxRateMapState`], on the control completion ring): a
+// `RATE_MAP_CREATE`'s or `RATE_MAP_RESET`'s answer.
+#define RGFX_EVT_RATE_MAP_STATE 1034
+
+// Event `RATE_MAP_ANSWER` ([`RgfxRateMapAnswer`], on the control completion ring): a
+// `RATE_MAP_QUERY`'s answer.
+#define RGFX_EVT_RATE_MAP_ANSWER 1035
 
 // A command buffer's status in [`RgfxCbComplete`]: finished with no error.
 #define RGFX_CB_OK 0
@@ -2261,6 +2305,28 @@
 
 // [`RgfxIcbSlotRun`] `kind`: compute slots ([`crate::icb::RgfxIcbComputeSlot`]).
 #define RGFX_ICB_SLOTS_COMPUTE 2
+
+// [`RgfxRateMapCreate::flags`]: the descriptor's `mutability` (SPI) was set, and
+// [`RgfxRateMapCreate::mutability`] holds it; without the flag the map is of Metal's default
+// mutability, immutable.
+#define RGFX_RATE_MAP_MUTABILITY_SET (1 << 0)
+
+// [`RgfxRateMapQuery::query`]: `physicalSizeForLayer:` of layer `at`, answered as the width,
+// height and depth.
+#define RGFX_RATE_MAP_QUERY_PHYSICAL_SIZE 0
+
+// [`RgfxRateMapQuery::query`]: `mapScreenToPhysicalCoordinates:forLayer:` of (`x`, `y`) in
+// layer `at`, answered as the coordinate's `x` and `y`.
+#define RGFX_RATE_MAP_QUERY_SCREEN_TO_PHYSICAL 1
+
+// [`RgfxRateMapQuery::query`]: `mapPhysicalToScreenCoordinates:forLayer:` of (`x`, `y`) in
+// layer `at`, answered as the coordinate's `x` and `y`.
+#define RGFX_RATE_MAP_QUERY_PHYSICAL_TO_SCREEN 2
+
+// [`RgfxRateMapQuery::query`]: `copyParameterDataToBuffer:offset:` into buffer
+// `buffer_obj_id` at offset `at`: the platform writes the map's parameter data where the
+// buffer's contents lie, before the answer, which carries no values.
+#define RGFX_RATE_MAP_QUERY_COPY_PARAMETER_DATA 3
 
 // The rows of a level of a `Managed` texture's CPU copy start at multiples of this, in bytes
 // ([`RgfxManagedTextureCreate`]).
@@ -6007,6 +6073,123 @@ typedef struct {
   uint32_t reserved_04;
 } RgfxQueueCreateFlags;
 
+// `RATE_MAP_ANSWER`: a `RATE_MAP_QUERY`'s answer. `status` is [`RGFX_STATUS_OK`] with the
+// answer in `values`: a physical size's width, height and depth, or a coordinate's `x` and `y`
+// as the bits of their `f32` in `values[0]` and `values[1]`, or nothing for a copy.
+// [`RGFX_STATUS_NOT_FOUND`] for a map or buffer the sender does not hold,
+// [`RGFX_STATUS_INVALID_ARGUMENT`] for a query the wire does not define or a message too short,
+// and [`RGFX_STATUS_REFUSED`] where the platform refused the query, where Metal's process ends (a
+// coordinate of a map of no layers or of an empty screen, physical to screen of a mutable map
+// not yet reset, a copy into a `Private` buffer or past a buffer's end), each with `values` 0.
+typedef struct {
+  // [`RGFX_EVT_RATE_MAP_ANSWER`], with the query's `seqno`.
+  RgfxMsgHeader header;
+  // An `RGFX_STATUS_*`.
+  uint32_t status;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_14;
+  // The answer.
+  uint64_t values[3];
+} RgfxRateMapAnswer;
+
+// `RATE_MAP_CREATE` and `RATE_MAP_RESET`: a rasterization rate map's descriptor
+// (`MTLRasterizationRateMapDescriptor`). `layer_count` [`RgfxRateMapLayer`]s lie at
+// `layers_offset`, the descriptor's layers from index 0, each naming its samples. Offsets are
+// bytes from the message start; the message's `size` is the head plus the tail, rounded up to a
+// multiple of 8. The descriptor's minimum factor (SPI) is not carried: it changes nothing a map
+// answers or draws (`reims-vgpu-vulkan`'s `gpu/rate_map.rs`), and neither is its label, which
+// the guest's map answers itself.
+typedef struct {
+  // [`RGFX_CMD_RATE_MAP_CREATE`] or [`RGFX_CMD_RATE_MAP_RESET`].
+  RgfxMsgHeader header;
+  // The map: the new one's guest-picked id, or the one a reset compiles again.
+  uint64_t obj_id;
+  // `screenSize.width`.
+  uint64_t screen_width;
+  // `screenSize.height`.
+  uint64_t screen_height;
+  // `screenSize.depth`.
+  uint64_t screen_depth;
+  // The `RGFX_RATE_MAP_*` flags.
+  uint32_t flags;
+  // `mutability` (`MTLMutability`, SPI), with [`RGFX_RATE_MAP_MUTABILITY_SET`]; 0 without it.
+  // A reset keeps the map's own, and ignores it.
+  uint32_t mutability;
+  // The [`RgfxRateMapLayer`]s at `layers_offset`.
+  uint32_t layer_count;
+  // The layers' byte offset from the message start.
+  uint32_t layers_offset;
+} RgfxRateMapCreate;
+
+// One layer of an [`RgfxRateMapCreate`] (`MTLRasterizationRateLayerDescriptor`): its
+// `sampleCount`'s width and height, and its samples at `samples_offset`, `horizontal_count`
+// horizontal ones then `vertical_count` vertical ones, each the bits of its `f32`.
+typedef struct {
+  // `sampleCount.width`: the horizontal samples.
+  uint32_t horizontal_count;
+  // `sampleCount.height`: the vertical samples.
+  uint32_t vertical_count;
+  // The samples' byte offset from the message start.
+  uint32_t samples_offset;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_0c;
+} RgfxRateMapLayer;
+
+// `RATE_MAP_QUERY`: map `obj_id`'s answer `query` (`RGFX_RATE_MAP_QUERY_*`).
+typedef struct {
+  // [`RGFX_CMD_RATE_MAP_QUERY`].
+  RgfxMsgHeader header;
+  // The map.
+  uint64_t obj_id;
+  // The layer, or for [`RGFX_RATE_MAP_QUERY_COPY_PARAMETER_DATA`] the buffer's offset.
+  uint64_t at;
+  // The buffer, for [`RGFX_RATE_MAP_QUERY_COPY_PARAMETER_DATA`]: one of the sender's; 0
+  // otherwise.
+  uint64_t buffer_obj_id;
+  // The `RGFX_RATE_MAP_QUERY_*` asked.
+  uint32_t query;
+  // The coordinate's `x`, as the bits of its `f32`; 0 for any other query.
+  uint32_t x_bits;
+  // The coordinate's `y`, as the bits of its `f32`; 0 for any other query.
+  uint32_t y_bits;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_34;
+} RgfxRateMapQuery;
+
+// `RATE_MAP_STATE`: a `RATE_MAP_CREATE`'s or `RATE_MAP_RESET`'s answer. `status` is
+// [`RGFX_STATUS_OK`] with the map's answers that take no argument; else every other field is 0:
+// [`RGFX_STATUS_REFUSED`] where the platform made no map, or refused the reset, which leaves the
+// map as it was; [`RGFX_STATUS_NOT_FOUND`] for a reset of a map the sender does not hold; and
+// [`RGFX_STATUS_INVALID_ARGUMENT`] for a message whose layers or samples it does not hold.
+typedef struct {
+  // [`RGFX_EVT_RATE_MAP_STATE`], with the message's `seqno`.
+  RgfxMsgHeader header;
+  // An `RGFX_STATUS_*`.
+  uint32_t status;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_14;
+  // `screenSize.width`.
+  uint64_t screen_width;
+  // `screenSize.height`.
+  uint64_t screen_height;
+  // `screenSize.depth`.
+  uint64_t screen_depth;
+  // `physicalGranularity.width`.
+  uint64_t granularity_width;
+  // `physicalGranularity.height`.
+  uint64_t granularity_height;
+  // `physicalGranularity.depth`.
+  uint64_t granularity_depth;
+  // `layerCount`.
+  uint64_t layer_count;
+  // `mutability` (`MTLMutability`, SPI).
+  uint64_t mutability;
+  // `parameterBufferSizeAndAlign.size`.
+  uint64_t parameter_size;
+  // `parameterBufferSizeAndAlign.align`.
+  uint64_t parameter_align;
+} RgfxRateMapState;
+
 // One colour attachment of a render pass (`colorAttachments[i]`). Absent (sets
 // nothing) when `texture_obj_id` is 0.
 typedef struct {
@@ -6125,6 +6308,13 @@ typedef struct {
   // The stencil attachment (absent when its `texture_obj_id` is 0).
   RgfxRenderPassStencilAttachment stencil;
 } RgfxRenderPassDesc;
+
+// A pass's rasterization rate map, after its colour attachment records, its sample positions
+// and its visibility result buffer where the pass's flags hold [`RGFX_PASS_FLAG_RATE_MAP`].
+typedef struct {
+  // The map (`RATE_MAP_CREATE`): one of the sender's.
+  uint64_t map_obj_id;
+} RgfxRenderPassRateMap;
 
 // A pass's sample positions, after its colour attachment records where the pass's flags hold
 // [`RGFX_PASS_FLAG_SAMPLE_POSITIONS`]: the `count` positions the pass descriptor holds

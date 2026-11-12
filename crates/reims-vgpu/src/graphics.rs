@@ -51,26 +51,29 @@ use reims_vgpu_graphics::wire::{
     RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_SLOTS,
     RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
     RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, RGFX_CMD_OBJECT_DESTROY,
+    RGFX_CMD_RATE_MAP_CREATE, RGFX_CMD_RATE_MAP_QUERY, RGFX_CMD_RATE_MAP_RESET,
     RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_IMPORT,
     RGFX_CMD_SHARED_EVENT_NAME, RGFX_CMD_SHARED_EVENT_UNNAME, RGFX_CONTEXT_OBJ_ID_SHIFT,
-    RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_ICB_STATE, RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED,
-    RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_DISPLAY_COLOR, RGFX_FEATURE_DISPLAY_POWER,
-    RGFX_FEATURE_DISPLAY_SCALE, RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_HOST_TIME,
-    RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_MANAGED_AT_OFFSET,
+    RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_ICB_STATE, RGFX_EVT_RATE_MAP_ANSWER, RGFX_EVT_RATE_MAP_STATE,
+    RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED, RGFX_FEATURE_COMMIT_ORDER,
+    RGFX_FEATURE_DISPLAY_COLOR, RGFX_FEATURE_DISPLAY_POWER, RGFX_FEATURE_DISPLAY_SCALE,
+    RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_HOST_TIME, RGFX_FEATURE_ICB_SLOTS,
+    RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_MANAGED_AT_OFFSET,
     RGFX_FEATURE_MANAGED_BUFFER_SLABS, RGFX_FEATURE_MANAGED_TEXTURE_SLABS,
     RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE, RGFX_FEATURE_PAGES_16K,
-    RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_SCHEDULED_ASK,
-    RGFX_FEATURE_SHARED_EVENT_NAMES, RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM,
-    RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
-    RGFX_FEATURE_SURFACE_DEFERRED_ASK, RGFX_FEATURE_SURFACE_DEFERRED_CARRY,
-    RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA,
-    RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
-    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS,
-    RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant,
-    RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted,
-    RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled, RgfxHeapOverPages, RgfxIcbState,
-    RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxSamplerState, RgfxScheduledAsk,
-    RgfxSharedEventName, RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
+    RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_RATE_MAPS,
+    RGFX_FEATURE_SCHEDULED_ASK, RGFX_FEATURE_SHARED_EVENT_NAMES, RGFX_FEATURE_SMALL_ID_CHUNKS,
+    RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_CACHE_REFUSED,
+    RGFX_FEATURE_SURFACE_DEFERRED, RGFX_FEATURE_SURFACE_DEFERRED_ASK,
+    RGFX_FEATURE_SURFACE_DEFERRED_CARRY, RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES,
+    RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA, RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK,
+    RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
+    RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED,
+    RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant, RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete,
+    RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled,
+    RgfxHeapOverPages, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun,
+    RgfxRateMapAnswer, RgfxRateMapState, RgfxSamplerState, RgfxScheduledAsk, RgfxSharedEventName,
+    RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
 use reims_vgpu_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim, Scanout,
@@ -381,8 +384,10 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // OpenCL mode links an OpenCL kernel's function the bundle names so (`OPENCL_MODE`). A
             // host whose device takes the private render state Apple's OpenGL renderer sets makes
             // the guest's render pipelines with it (`PRIVATE_RENDER_STATE`). Every host carries a
-            // texture's `didModifyData` to its platform (`TEXTURE_DID_MODIFY_DATA`), and shows black
-            // while the guest's display sleeps (`DISPLAY_POWER`).
+            // texture's `didModifyData` to its platform (`TEXTURE_DID_MODIFY_DATA`), shows black
+            // while the guest's display sleeps (`DISPLAY_POWER`), and makes the guest's
+            // rasterization rate maps on its platform (`RATE_MAPS`), of the layer counts the device
+            // info answers.
             let in_place = u64::from(RGFX_FEATURE_SURFACE_PAGES)
                 | u64::from(RGFX_FEATURE_PAGES_BUFFERS)
                 | u64::from(RGFX_FEATURE_HEAP_OVER_PAGES);
@@ -403,6 +408,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 | RGFX_FEATURE_DISPLAY_SCALE
                 | RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA
                 | RGFX_FEATURE_DISPLAY_POWER
+                | RGFX_FEATURE_RATE_MAPS
                 | if gpu_device.makes_opencl_mode_pipelines() {
                     u64::from(RGFX_FEATURE_OPENCL_MODE)
                 } else {
@@ -1443,6 +1449,14 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 self.argument_layout(poster, message);
                 return;
             }
+            RGFX_CMD_RATE_MAP_CREATE | RGFX_CMD_RATE_MAP_RESET => {
+                self.rate_map_state(poster, message);
+                return;
+            }
+            RGFX_CMD_RATE_MAP_QUERY => {
+                self.rate_map_query(poster, message);
+                return;
+            }
             RGFX_CMD_SAMPLER_CREATE => {
                 self.create_sampler(poster, message);
                 return;
@@ -1945,6 +1959,80 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 );
                 poster.post(answer.as_bytes());
             }
+        }
+    }
+
+    /// A rasterization rate map's create or reset from ring 0, answered at once through `poster`
+    /// with the map's state (`RATE_MAP_STATE`), the map stored under its id before the answer
+    /// (`decode::rate_map`). A create or reset the platform raises or dies at is answered refused,
+    /// as one it refuses, and makes nothing.
+    fn rate_map_state(&self, poster: &CompletionPoster, message: &[u8]) {
+        let (ty, seqno, obj_id) = message_identity(message);
+        let decoder =
+            (self.decoders).sender(Some(sender_context(poster, message)), Sinks::default());
+        let reset = ty == RGFX_CMD_RATE_MAP_RESET;
+        let answer =
+            entry::run(|_| refusing(|| decoder.rate_map_state(&self.device, message, reset)));
+        let answer = answer.unwrap_or_else(|raise| {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = raise;
+                "a rate map's create or reset (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) \
+                 faulted: {raise}"
+            );
+            RgfxMsgHeader::read_from_prefix(message)
+                .ok()
+                .map(|(header, _)| RgfxRateMapState {
+                    header: RgfxMsgHeader {
+                        r#type: RGFX_EVT_RATE_MAP_STATE,
+                        size: size_of::<RgfxRateMapState>() as u32,
+                        seqno: header.seqno,
+                    },
+                    status: RGFX_STATUS_REFUSED,
+                    ..RgfxRateMapState::default()
+                })
+        });
+        let Some(answer) = answer else {
+            return;
+        };
+        if answer.status != RGFX_STATUS_OK {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = answer.status;
+                "a rate map's create or reset (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) \
+                 was answered status {}",
+                answer.status
+            );
+        }
+        poster.post(answer.as_bytes());
+    }
+
+    /// A rasterization rate map's query from ring 0, answered at once through `poster`
+    /// (`RATE_MAP_ANSWER`, `decode::rate_map`). A query the platform raises or dies at, where
+    /// Metal ends the process, is answered refused.
+    fn rate_map_query(&self, poster: &CompletionPoster, message: &[u8]) {
+        let (ty, seqno, obj_id) = message_identity(message);
+        let decoder =
+            (self.decoders).sender(Some(sender_context(poster, message)), Sinks::default());
+        let answer = entry::run(|_| refusing(|| decoder.rate_map_answer(message)));
+        let answer = answer.unwrap_or_else(|raise| {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = raise;
+                "a rate map's query (type {ty:#x}, seqno {seqno}, map {obj_id:#x}) faulted: \
+                 {raise}"
+            );
+            RgfxMsgHeader::read_from_prefix(message)
+                .ok()
+                .map(|(header, _)| RgfxRateMapAnswer {
+                    header: RgfxMsgHeader {
+                        r#type: RGFX_EVT_RATE_MAP_ANSWER,
+                        size: size_of::<RgfxRateMapAnswer>() as u32,
+                        seqno: header.seqno,
+                    },
+                    status: RGFX_STATUS_REFUSED,
+                    ..RgfxRateMapAnswer::default()
+                })
+        });
+        if let Some(answer) = answer {
+            poster.post(answer.as_bytes());
         }
     }
 

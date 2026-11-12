@@ -110,12 +110,12 @@ use reims_vgpu_graphics::ops::{
     RGFX_OP_GROUP_BLIT, RGFX_OP_GROUP_COMPUTE, RGFX_OP_GROUP_FRAMING, RGFX_OP_GROUP_RENDER,
     RGFX_OP_GROUP_VIDEO, RGFX_OP_SIGNAL_EVENT, RGFX_OP_SUBMITTED, RGFX_OP_SURFACE_ORDER,
     RGFX_OP_SURFACE_USE, RGFX_OP_WAIT_EVENT, RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT,
-    RGFX_PASS_FLAG_RT_ARRAY_LENGTH, RGFX_PASS_FLAG_RT_SIZE, RGFX_PASS_FLAG_SAMPLE_POSITIONS,
-    RGFX_PASS_FLAG_VISIBILITY_RESULT, RGFX_PASS_MAX_SAMPLE_POSITIONS,
-    RGFX_RENDER_PASS_COLOR_OFFSET, RgfxCommandBuffer, RgfxComputePassDesc, RgfxOpEvent,
-    RgfxOpHeader, RgfxOpSurfaceUse, RgfxOpVideoPass, RgfxRenderPassColorAttachment,
-    RgfxRenderPassDesc, RgfxRenderPassSamplePositions, RgfxRenderPassVisibility,
-    RgfxSurfaceOrderWait, op_group,
+    RGFX_PASS_FLAG_RATE_MAP, RGFX_PASS_FLAG_RT_ARRAY_LENGTH, RGFX_PASS_FLAG_RT_SIZE,
+    RGFX_PASS_FLAG_SAMPLE_POSITIONS, RGFX_PASS_FLAG_VISIBILITY_RESULT,
+    RGFX_PASS_MAX_SAMPLE_POSITIONS, RGFX_RENDER_PASS_COLOR_OFFSET, RgfxCommandBuffer,
+    RgfxComputePassDesc, RgfxOpEvent, RgfxOpHeader, RgfxOpSurfaceUse, RgfxOpVideoPass,
+    RgfxRenderPassColorAttachment, RgfxRenderPassDesc, RgfxRenderPassRateMap,
+    RgfxRenderPassSamplePositions, RgfxRenderPassVisibility, RgfxSurfaceOrderWait, op_group,
 };
 use reims_vgpu_graphics::wire::{
     RGFX_EVT_CB_SCHEDULED, RGFX_EVT_CB_SUBMITTED, RGFX_EVT_EVENT_SIGNALLED, RgfxCbScheduled,
@@ -2578,9 +2578,9 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// Builds a `P::RenderPassDescriptor` from an `ENCODER_BEGIN_RENDER` op's body
     /// (an [`RgfxRenderPassDesc`] then its `color_count`
-    /// [`RgfxRenderPassColorAttachment`] records, then its sample positions and its visibility
-    /// result buffer where its flags say so), with what the pass's render ops' checks read of
-    /// it. A body too short faults; a reference to a texture or a buffer the host does not
+    /// [`RgfxRenderPassColorAttachment`] records, then its sample positions, its visibility
+    /// result buffer and its rasterization rate map where its flags say so), with what the pass's
+    /// render ops' checks read of it. A body too short faults; a reference to a texture or a buffer the host does not
     /// hold faults through the resolution API; and so do sample positions Metal does not take
     /// ([`sample_positions_taken`]), of which `makes` answers whether the device makes textures
     /// of their count, and so does a visibility result type Metal does not define.
@@ -2685,6 +2685,20 @@ impl<P: Platform> GraphicsDecoder<P> {
             pass.set_pass(&PassSet {
                 visibility_result_buffer: Some(Some(buffer)),
                 visibility_result_type: Some(u64::from(v.result_type)),
+                ..PassSet::default()
+            });
+            off += size_of::<RgfxRenderPassVisibility>();
+        }
+        if desc.flags & RGFX_PASS_FLAG_RATE_MAP != 0 {
+            let r = body
+                .get(off..off + size_of::<RgfxRenderPassRateMap>())
+                .and_then(|s| RgfxRenderPassRateMap::read_from_bytes(s).ok())
+                .ok_or_else(|| {
+                    op_fault("ENCODER_BEGIN_RENDER: no whole rasterization rate map record")
+                })?;
+            let map = self.require_rate_map(r.map_obj_id)?;
+            pass.set_pass(&PassSet {
+                rasterization_rate_map: Some(Some(map)),
                 ..PassSet::default()
             });
         }
@@ -6470,6 +6484,58 @@ mod tests {
         assert!(dec.build_render_pass(&texture, |_| true).is_err());
         let undefined = begin_render_with_visibility(2, 2, None);
         assert!(dec.build_render_pass(&undefined, |_| true).is_err());
+    }
+
+    /// A pass's rasterization rate map, after its colour records, its sample positions and its
+    /// visibility result buffer, is set on the platform's pass; a pass whose flag says so but
+    /// carries no whole record faults, and so does one naming no map the host holds.
+    #[test]
+    fn a_render_pass_takes_its_rasterization_rate_map() {
+        use reims_vgpu_vulkan::core::platform::values::RateMapDesc;
+        use reims_vgpu_vulkan::core::testkit::impls::descriptor::PassModel;
+        let (p, dec) = setup();
+        let map = p
+            .device()
+            .new_rate_map(&p.rate_map_descriptor(&RateMapDesc::default()))
+            .unwrap()
+            .unwrap();
+        let id = map.id();
+        dec.insert(0x40, ObjHandle::RateMap(map)).unwrap().unwrap();
+        let with = |map_obj_id, visibility: bool| {
+            let mut body = if visibility {
+                begin_render_with_visibility(2, 0, None)
+            } else {
+                begin_render_body()
+            };
+            let mut head = RgfxRenderPassDesc::read_from_prefix(&body).unwrap().0;
+            head.flags |= RGFX_PASS_FLAG_RATE_MAP;
+            body[..size_of::<RgfxRenderPassDesc>()].copy_from_slice(head.as_bytes());
+            body.extend_from_slice(RgfxRenderPassRateMap { map_obj_id }.as_bytes());
+            body
+        };
+        for visibility in [false, true] {
+            let (pass, _) = dec
+                .build_render_pass(&with(0x40, visibility), |_| true)
+                .unwrap();
+            assert_eq!(
+                pass.with_model(|m: &PassModel| m.rasterization_rate_map_id()),
+                Some(id)
+            );
+        }
+        let (plain, _) = dec
+            .build_render_pass(&begin_render_body(), |_| true)
+            .unwrap();
+        assert_eq!(
+            plain.with_model(|m: &PassModel| m.rasterization_rate_map_id()),
+            None
+        );
+        let whole = with(0x40, false);
+        assert!(
+            dec.build_render_pass(&whole[..whole.len() - 4], |_| true)
+                .is_err()
+        );
+        assert!(dec.build_render_pass(&with(0x41, false), |_| true).is_err());
+        assert!(dec.build_render_pass(&with(2, false), |_| true).is_err());
     }
 
     /// A `BUFFER_CREATE` of buffer `obj_id`, `length` bytes.

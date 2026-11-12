@@ -697,6 +697,111 @@ RgfxCreated RgfxSerializer::createSampler(const RgfxSamplerParams &params)
 	return out;
 }
 
+// One RATE_MAP_CREATE or RATE_MAP_RESET of `shape` under `obj_id` through `ask`: the head, the
+// layers' records, then their samples, each the bits of its float. Answers the RATE_MAP_STATE's
+// status, with the state in `*state`, or kRgfxNoAnswer (nothing posted where the message is past
+// `max_size`).
+static uint32_t askRateMap(RgfxSerializer::AskFn ask, void *askContext, uint32_t type,
+                           RgfxObjId obj_id, const RgfxRateMapShape &shape, uint32_t max_size,
+                           RgfxRateMapState *state)
+{
+	*state = {};
+	if (ask == nullptr)
+		return kRgfxNoAnswer;
+	const uint64_t layersOffset = sizeof(RgfxRateMapCreate);
+	uint64_t samplesOffset = layersOffset + shape.layers.size() * sizeof(RgfxRateMapLayer);
+	uint64_t total = samplesOffset;
+	for (const RgfxRateMapShape::Layer &layer : shape.layers)
+		total += layer.samples.size() * sizeof(uint32_t);
+	total = (total + 7) & ~uint64_t(7);
+	if (total > max_size)
+		return kRgfxNoAnswer;
+	std::vector<uint8_t> buf(static_cast<size_t>(total), 0);
+	RgfxRateMapCreate msg = {};
+	msg.header.type = type;
+	msg.header.size = static_cast<uint32_t>(total);
+	msg.obj_id = obj_id;
+	msg.screen_width = shape.screen_width;
+	msg.screen_height = shape.screen_height;
+	msg.screen_depth = shape.screen_depth;
+	msg.flags = shape.mutability_set ? RGFX_RATE_MAP_MUTABILITY_SET : 0;
+	msg.mutability = shape.mutability_set ? shape.mutability : 0;
+	msg.layer_count = static_cast<uint32_t>(shape.layers.size());
+	msg.layers_offset = static_cast<uint32_t>(layersOffset);
+	std::memcpy(buf.data(), &msg, sizeof(msg));
+	for (size_t i = 0; i < shape.layers.size(); i++) {
+		const RgfxRateMapShape::Layer &layer = shape.layers[i];
+		RgfxRateMapLayer record = {};
+		record.horizontal_count = layer.horizontal_count;
+		record.vertical_count = layer.vertical_count;
+		record.samples_offset = static_cast<uint32_t>(samplesOffset);
+		std::memcpy(buf.data() + layersOffset + i * sizeof(record), &record, sizeof(record));
+		for (float sample : layer.samples) {
+			const uint32_t bits = floatBits(sample);
+			std::memcpy(buf.data() + samplesOffset, &bits, sizeof(bits));
+			samplesOffset += sizeof(bits);
+		}
+	}
+	RgfxRateMapState answer = {};
+	uint32_t length = 0;
+	if (!ask(askContext, buf.data(), static_cast<uint32_t>(total), &answer, sizeof(answer),
+	         &length) ||
+	    length < sizeof(answer) || answer.header.type != RGFX_EVT_RATE_MAP_STATE)
+		return kRgfxNoAnswer;
+	*state = answer;
+	return answer.status;
+}
+
+RgfxCreated RgfxSerializer::createRateMap(const RgfxRateMapShape &shape, RgfxRateMapState *state)
+{
+	RgfxCreated out = {};
+	*state = {};
+	out.status = kRgfxNoAnswer;
+	if (!m_rateMaps)
+		return out;
+	out.obj_id = m_ids.allocObjId();
+	out.status = askRateMap(m_ask, m_askContext, RGFX_CMD_RATE_MAP_CREATE, out.obj_id, shape,
+	                        m_control.dataSize() / 2, state);
+	out.posted = out.status != kRgfxNoAnswer;
+	out.seqno = out.posted ? state->header.seqno : 0;
+	return out;
+}
+
+uint32_t RgfxSerializer::resetRateMap(RgfxObjId map, const RgfxRateMapShape &shape,
+                                      RgfxRateMapState *state)
+{
+	*state = {};
+	if (!m_rateMaps)
+		return kRgfxNoAnswer;
+	return askRateMap(m_ask, m_askContext, RGFX_CMD_RATE_MAP_RESET, map, shape,
+	                  m_control.dataSize() / 2, state);
+}
+
+uint32_t RgfxSerializer::queryRateMap(RgfxObjId map, uint32_t query, uint64_t at,
+                                      RgfxObjId buffer, float x, float y, uint64_t values[3])
+{
+	values[0] = values[1] = values[2] = 0;
+	if (!m_rateMaps || m_ask == nullptr)
+		return kRgfxNoAnswer;
+	RgfxRateMapQuery msg = {};
+	msg.header.type = RGFX_CMD_RATE_MAP_QUERY;
+	msg.header.size = sizeof(msg);
+	msg.obj_id = map;
+	msg.at = at;
+	msg.buffer_obj_id = buffer;
+	msg.query = query;
+	msg.x_bits = floatBits(x);
+	msg.y_bits = floatBits(y);
+	RgfxRateMapAnswer answer = {};
+	uint32_t length = 0;
+	if (!m_ask(m_askContext, &msg, sizeof(msg), &answer, sizeof(answer), &length) ||
+	    length < sizeof(answer) || answer.header.type != RGFX_EVT_RATE_MAP_ANSWER)
+		return kRgfxNoAnswer;
+	if (answer.status == RGFX_STATUS_OK)
+		std::memcpy(values, answer.values, sizeof(answer.values));
+	return answer.status;
+}
+
 RgfxCreated RgfxSerializer::createIcb(const RgfxIcbCreate &desc)
 {
 	RgfxCreated out = {};

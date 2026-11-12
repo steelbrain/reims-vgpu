@@ -506,6 +506,18 @@ bool fillVisibility(RgfxEncoder *enc, MTLRenderPassDescriptor *d, RgfxRenderPass
 	return true;
 }
 
+/// The rasterization rate map of pass `d` (rasterizationRateMap), named on `enc` so the command
+/// buffer keeps it until it completes; false where the pass has none of ours, so it carries none.
+bool fillRateMap(RgfxEncoder *enc, MTLRenderPassDescriptor *d, RgfxRenderPassRateMap *out)
+{
+	*out = {};
+	id<MTLRasterizationRateMap> map = d.rasterizationRateMap;
+	if (map == nil)
+		return false;
+	out->map_obj_id = rgfxNamed(enc, map);
+	return out->map_obj_id != 0;
+}
+
 /// The size of the target of pass `d`, which Metal's default viewport and scissor rectangle
 /// cover: the smallest of its attachments (ours, RgfxTexture) at their levels, else its
 /// renderTargetWidth and renderTargetHeight where it has none.
@@ -1845,8 +1857,11 @@ enum RgfxStage : unsigned {
 	noteRenderPassWrites(_encoder, renderPassDescriptor);
 	RgfxRenderPassVisibility visibility;
 	const bool visible = fillVisibility(_encoder, renderPassDescriptor, &visibility);
+	RgfxRenderPassRateMap rateMap;
+	const bool mapped = fillRateMap(_encoder, renderPassDescriptor, &rateMap);
 	_encoder->beginRenderPass(desc, colors.empty() ? nullptr : colors.data(), count,
-	                          programmed ? &positions : nullptr, visible ? &visibility : nullptr);
+	                          programmed ? &positions : nullptr, visible ? &visibility : nullptr,
+	                          mapped ? &rateMap : nullptr);
 	RgfxRenderCommandEncoder *enc = [[RgfxRenderCommandEncoder alloc] initWithEncoder:_encoder
 	                                                                          emitEnd:YES
 	                                                                           device:self.device];
@@ -1955,8 +1970,11 @@ enum RgfxStage : unsigned {
 	noteRenderPassWrites(_encoder, renderPassDescriptor);
 	RgfxRenderPassVisibility visibility;
 	const bool visible = fillVisibility(_encoder, renderPassDescriptor, &visibility);
+	RgfxRenderPassRateMap rateMap;
+	const bool mapped = fillRateMap(_encoder, renderPassDescriptor, &rateMap);
 	_encoder->beginRenderPass(desc, colors.empty() ? nullptr : colors.data(), count,
-	                          programmed ? &positions : nullptr, visible ? &visibility : nullptr);
+	                          programmed ? &positions : nullptr, visible ? &visibility : nullptr,
+	                          mapped ? &rateMap : nullptr);
 	RgfxParallelRenderCommandEncoder *enc =
 	    [[RgfxParallelRenderCommandEncoder alloc] initWithEncoder:_encoder device:self.device];
 	[enc rgfxSetCommandBuffer:self];
