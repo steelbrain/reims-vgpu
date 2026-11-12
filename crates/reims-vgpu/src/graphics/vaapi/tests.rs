@@ -288,7 +288,9 @@ fn the_gpu_copy_takes_the_crop_the_cpu_copy_writes() {
 /// `RVG_VA_STREAMS` names the directories, `:`-separated, whose Annex B streams (`*.264`,
 /// `*.265`, but `*.part.*`) are decoded: the conformance scripts' `build/h264-check` and
 /// `build/hevc-check`. A stream the decoder refuses (as the suite has it refuse some) is decoded up
-/// to its refusal; a leading picture random access skips is skipped.
+/// to its refusal; a leading picture random access skips is skipped. A device with no GPU copier
+/// (one that lists no extension the copier takes, [`copier_of`]) copies nothing: the test says so
+/// and ends.
 #[test]
 #[ignore = "needs a VA-API GPU and the conformance suite's streams: run on the VA-API host"]
 fn a_picture_copied_by_the_gpu_is_the_cpus_copy_byte_for_byte() {
@@ -320,7 +322,9 @@ fn a_picture_copied_by_the_gpu_is_the_cpus_copy_byte_for_byte() {
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
         let display = Display::open(&node, runtime).expect("a VA display on the device's GPU");
         let copies = gpu_copy::RuntimeCopies::new(&device);
-        let mut copier = copies.copier().expect("a GPU copier on the device");
+        let Some(mut copier) = copier_of(&copies) else {
+            return;
+        };
         let (mut pictures, mut refused) = (0usize, Vec::new());
         for stream in &streams {
             let file = std::fs::read(stream).expect("a stream");
@@ -371,11 +375,29 @@ fn a_picture_copied_by_the_gpu_is_the_cpus_copy_byte_for_byte() {
     });
 }
 
+/// The GPU copier of `copies`' device; `None`, said on stderr, where the device lists no extension
+/// the copier takes (`VK_EXT_image_drm_format_modifier` among them, which an RX 550's RADV does
+/// not list): the device's own answer, as the arm takes it. Any other refusal fails the test.
+fn copier_of(copies: &gpu_copy::RuntimeCopies) -> Option<Box<dyn GpuCopier<VulkanPlatform>>> {
+    match copies.copier() {
+        Ok(copier) => Some(copier),
+        Err(why) => {
+            assert!(
+                why.starts_with("the device lists no "),
+                "a GPU copier on the device: {why}"
+            );
+            eprintln!("no GPU copier on the device, so no copy to compare: {why}");
+            None
+        }
+    }
+}
+
 /// A copy after the runtime made its device's `VkDevice` again lands as the CPU's copy, byte for
 /// byte: the copier made before the recovery makes its objects again on the new `VkDevice`
 /// (`reims_vgpu_vulkan::os::PlaneCopier`), and copies into buffers made there. Six pictures of
 /// the first H.264 stream in `RVG_VA_STREAMS`'s first directory, three each side of the recovery,
-/// each landed as [`land_both_ways`] lands it.
+/// each landed as [`land_both_ways`] lands it. A device with no GPU copier ([`copier_of`]) copies
+/// nothing: the test says so and ends.
 #[test]
 #[ignore = "needs a VA-API GPU and the conformance suite's streams: run on the VA-API host"]
 fn a_copy_after_the_devices_recovery_is_the_cpus_copy_byte_for_byte() {
@@ -399,7 +421,9 @@ fn a_copy_after_the_devices_recovery_is_the_cpus_copy_byte_for_byte() {
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
         let display = Display::open(&node, runtime).expect("a VA display on the device's GPU");
         let copies = gpu_copy::RuntimeCopies::new(&device);
-        let mut copier = copies.copier().expect("a GPU copier on the device");
+        let Some(mut copier) = copier_of(&copies) else {
+            return;
+        };
         let mut n = 0;
         'streams: for stream in &streams {
             let file = std::fs::read(stream).expect("a stream");
@@ -441,11 +465,14 @@ fn a_copy_after_the_devices_recovery_is_the_cpus_copy_byte_for_byte() {
 /// texture is read once before the decode writes its cache, as a guest's texture over a pool's
 /// surface is used before a decode lands in it, so a shadow the runtime keeps of a texture over
 /// the cache's bytes was copied in from the cache's zeros, and only a copy in again after the
-/// driver's write reads the picture. The planes lie as CoreVideo lays a frame's in the guest's
-/// caches, 32 bytes into their pages, the first on 256 bytes of the cache's memory, so the chroma
-/// plane lies past a gap (`docs/video/bugs.md`, U28). A stream the decoder refuses is left at its
-/// refusal. Where the driver's check refuses H.264 into NV12 targets the arm decodes into no
-/// cache, and the test says so and ends.
+/// driver's write reads the picture. A plane's texture lies over the cache's memory where its twin
+/// over a cache made as any other does and the device's check of images over memory exported as
+/// dma-bufs passed for it ([`exported_dma_buf_reads`]), and is a shadow elsewhere (on an RX 550's
+/// RADV, whose check made no such image), reading as the CPU's copy either way. The planes lie as
+/// CoreVideo lays a frame's in the guest's caches, 32 bytes into their pages, the first on 256
+/// bytes of the cache's memory, so the chroma plane lies past a gap (`docs/video/bugs.md`, U28).
+/// A stream the decoder refuses is left at its refusal. Where the driver's check refuses H.264
+/// into NV12 targets the arm decodes into no cache, and the test says so and ends.
 #[test]
 #[ignore = "needs a VA-API GPU and the conformance suite's streams: run on the VA-API host"]
 fn a_picture_decoded_into_a_dma_buf_cache_reads_through_its_textures_as_the_cpus_copy() {
@@ -528,10 +555,16 @@ fn a_picture_decoded_into_a_dma_buf_cache_reads_through_its_textures_as_the_cpus
                 }
             }
         }
+        let verdicts: Vec<String> = (device.raw.in_place_check_report().into_iter())
+            .filter(|line| {
+                line.starts_with("ExportedDmaBuf: ") || line.starts_with("ExportedDmaBuf, rows")
+            })
+            .collect();
         eprintln!(
             "{pictures} pictures of {} streams decoded into dma-buf caches read through textures \
              as by the CPU, the planes' textures {in_place} over the caches' memory and {shadows} \
-             shadows, as over caches made as any other; refused: {refused:?}",
+             shadows, as over caches made as any other where the device's check of images over \
+             memory exported as dma-bufs passed ({verdicts:?}); refused: {refused:?}",
             streams.len()
         );
         assert!(pictures > 0);
@@ -604,7 +637,8 @@ fn cache_target(
         // A twin of the cache made as any other laid-out cache, its memory exported nowhere: a
         // plane's texture over it takes the route the runtime is to take for the cache's, a shadow
         // of the bytes or an image over the memory, which the runtime announces in its count of
-        // shadows, as an export changes no texture's route.
+        // shadows, where the device's check of images over memory it exports as dma-bufs passed
+        // for the texture ([`exported_dma_buf_reads`]); elsewhere the cache's is a shadow.
         let twin = (reader.device)
             .new_buffer_of_length_padding_unobserved(
                 OnFault::Return,
@@ -632,13 +666,16 @@ fn cache_target(
                     .expect("a texture over the cache's plane");
                 (texture, shadows() > before)
             };
+            let row_bytes = extents[n].0 * [1, 2][n] * sample;
+            let verdict = exported_dma_buf_reads(&reader.device, at - luma_at, row_bytes);
             let (_, twin_shadowed) = over(&twin);
             let (texture, shadowed) = over(&buffer);
             assert_eq!(
                 shadowed,
-                twin_shadowed,
+                twin_shadowed || verdict != "Passed",
                 "plane {n} of a {width}x{height} picture: its texture is {} over the dma-buf \
-                 cache, {} over a cache made as any other",
+                 cache, {} over a cache made as any other, the device's check of images over \
+                 memory exported as dma-bufs {verdict}",
                 route(shadowed),
                 route(twin_shadowed)
             );
@@ -667,6 +704,39 @@ fn cache_target(
         });
         Some(target)
     })
+}
+
+/// The verdict of `device`'s check of images over memory the runtime exports as dma-bufs, for a
+/// texture that reads (its report's `ExportedDmaBuf` lines, `rt::Device::in_place_check_report`),
+/// of texels whose rows of `row_bytes` start `offset` bytes past a byte that lies on 256 bytes of
+/// the memory, at a pitch of a multiple of 256 bytes, as [`cache_target`]'s planes do: the verdict
+/// for texels on the device's lines of memory where those rows start and end on them, else for
+/// texels in them (the runtime's `RowEnds`). A verdict the report does not hold is `Pending`.
+fn exported_dma_buf_reads(device: &VulkanDevice, offset: u64, row_bytes: u64) -> String {
+    let report = device.raw.in_place_check_report();
+    let verdict = |key: &str| {
+        (report.iter())
+            .find_map(|line| line.strip_prefix(key))
+            .unwrap_or("Pending")
+            .to_owned()
+    };
+    let (in_lines, on_lines) = (
+        verdict("ExportedDmaBuf: "),
+        verdict("ExportedDmaBuf, rows on lines: "),
+    );
+    if in_lines == on_lines {
+        return in_lines;
+    }
+    let line = device.raw.in_place_check_line();
+    assert!(
+        line > 0 && 256_u64.is_multiple_of(line),
+        "the device's line of {line} bytes divides the 256 bytes a plane's rows lie on"
+    );
+    if offset.is_multiple_of(line) && row_bytes.is_multiple_of(line) {
+        on_lines
+    } else {
+        in_lines
+    }
 }
 
 /// What reads a texture's texels in a kernel, as a guest's shader reads a texture over a cache's
@@ -1057,10 +1127,10 @@ fn land_in_a_cache(
 }
 
 /// A picture the driver decoded into a surface of its own, written by its video processing into a
-/// buffer the platform made as a dma-buf device cache (`new_dma_buf_buffer_of_length_padding_unobserved`),
-/// through the cache's memory as the arm hands it ([`CacheBytes`], [`in_place_layout`]), as a
-/// picture lands in its output's cache where the driver's check refused to decode it there, is
-/// the CPU's copy of the same picture, read back by a blit once the platform was told what the
+/// buffer the platform made as a dma-buf device cache
+/// (`new_dma_buf_buffer_of_length_padding_unobserved`), through the cache's memory as the arm
+/// hands it ([`CacheBytes`], [`in_place_layout`]), as a picture lands in its output's cache where
+/// the driver's check refused to decode it there, is the CPU's copy of the same picture, read back by a blit once the platform was told what the
 /// driver wrote (`Buffer::external_write_done`): each plane's rows of the crop byte for byte, and
 /// every byte before the planes, past each row's even width and past the planes' even rows as the
 /// runtime's fill left it. The first [`PICTURES`] pictures of each H.264 and HEVC stream in
