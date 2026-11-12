@@ -195,6 +195,18 @@ looser than Metal in one way that costs us nothing: it uploads more than the nam
 GPU copy is clean, so an app with a short `didModifyRange:` works on AMD, where ours uploads the
 range alone.
 
+Ours, by `capture` in an x86-64 macOS 26.7.2 guest on two-copy hosts, 11-12: on the RX 7900 XTX
+(m3-max-22650, metal2vulkan 38ab829481) the five steps read A, B, B, A, B, the 5300M's answers;
+on the RX 550 (m3-max-22791, metal2vulkan 86d01646ae, which takes the range's bytes at the commit)
+the first four read A, B, B, A, and the fifth has no answer: the fourth step's spin held the GPU
+for 2 s there, until the driver recovered the context (`radv/amdgpu: ... guilty of a soft
+recovery`), and the fifth step's command buffer was discarded as its victim. A CPU write
+after the commit, while the command buffer's first kernel runs, is not seen on either, as on the
+5300M; no step writes after the commit while the command buffer waits behind other work, where
+taking the bytes at the commit and at the submission's start would differ. On the XTX the spin
+saw the CPU's write to its Shared flag 140 ms in, which the 5300M's never did (Q3: ours is in
+place).
+
 ## Q3: Shared storage
 
 Probes: `oracle_storage DEVICE shtex`, `lintex shared|managed`, `argenc shared|managed`,
