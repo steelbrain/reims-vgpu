@@ -1337,6 +1337,11 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         Some(Obj::new(QueueObject::new(raw, self.clone_ref())))
     }
 
+    /// The recoveries the runtime announced in the process ([`crate::answer::recoveries`]).
+    fn recoveries(&self) -> u64 {
+        crate::answer::recoveries()
+    }
+
     /// On Linux, where the device uses the guest's RAM whole and the runtime copies by its runs
     /// (`os/linux/host_ram.rs`); never on macOS, whose devices are handed no RAM.
     fn copies_guest_ram(&self) -> bool {

@@ -1976,6 +1976,20 @@ pub fn trace_degradations() -> bool {
     *ON
 }
 
+/// The recoveries of a device the runtime announced in this process (`DeviceRecovered`, each of
+/// its announcements, whichever device's and whoever hears it), which [`recoveries`] answers.
+static RECOVERIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many recoveries of a device the runtime announced in this process so far ([`notice`]): a
+/// device whose `VkDevice` was lost made a new one, and the objects made before it that it does
+/// not carry are refused there (`MadeBeforeRecovery`) or read zero (a `Private` buffer's
+/// contents). The host's own kept objects are made again once it changes
+/// (`GpuDevice::recoveries`). Process-wide: the announcement names no device, so a recovery of
+/// any device of the process counts for each.
+pub(crate) fn recoveries() -> u64 {
+    RECOVERIES.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// The kinds the trace saw, which the runtime announces once without it.
 static TRACED_KINDS: crate::core::sync::Mutex<Vec<rt::Degradation>> =
     crate::core::sync::Mutex::new(Vec::new());
@@ -1994,6 +2008,9 @@ pub fn notice(message: &rt::DebugMessage) {
         relay(message);
         return;
     };
+    if notice.degradation == rt::Degradation::DeviceRecovered {
+        RECOVERIES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
     if UNHEARD.with(Cell::get) {
         return;
     }

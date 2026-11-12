@@ -50,8 +50,10 @@ const READ_RESOURCE_OPTIONS: u64 = 0;
 /// A pixel the display shows where it shows nothing: opaque black, B, G, R, A.
 const BLACK: [u8; 4] = [0, 0, 0, 0xff];
 
-/// A read's texture, with its size.
-type ReadTexture<P> = ((u32, u32), <P as Platform>::Texture);
+/// A read's texture, with its size and the device's recoveries when it was made
+/// (`GpuDevice::recoveries`): a texture made before a recovery is made again, as the draws' kept
+/// objects are (`sink`'s module doc, "A recovered device").
+type ReadTexture<P> = ((u32, u32, u64), <P as Platform>::Texture);
 
 /// Reads of what a graphics device's display shows (the module doc).
 pub(crate) struct DisplayRead<P: ApiPlatform> {
@@ -143,9 +145,10 @@ impl<P: ApiPlatform> DisplayRead<P> {
             .as_ref()
             .ok_or(Error::Metal)?;
         let mut kept = self.texture.lock();
-        if !kept.as_ref().is_some_and(|(at, _)| *at == (width, height)) {
+        let made_for = (width, height, draw.device.recoveries());
+        if !kept.as_ref().is_some_and(|(at, _)| *at == made_for) {
             *kept = None;
-            *kept = Some(((width, height), self.texture_of(draw, width, height)?));
+            *kept = Some((made_for, self.texture_of(draw, width, height)?));
         }
         let Some((_, texture)) = kept.as_ref() else {
             return Err(Error::Metal);

@@ -68,6 +68,16 @@
 //! mapped while a command buffer still reads it: Metal (or the runtime) runs it once the buffer
 //! has gone, after the sink, a later import and every command buffer that used it.
 //!
+//! **A recovered device.** Where the platform recovers the device's GPU (on the Vulkan platform,
+//! its lost `VkDevice` made again, `device-recovered`), the textures, pipelines and pooled
+//! buffers made before it do not carry the draws' work on: the runtime refuses them on the new
+//! device, or reads a `Private` one's contents as zero. So a draw that finds the device's count
+//! of recoveries changed since the draws made what they keep lets go of it all (the converter, the
+//! colour's functions, pipelines, buffers and table, and the ramps), and makes each again as it
+//! needs it ([`ScanoutDraw::forget_if_recovered`]): the window shows the guest's frames through
+//! the display's colour as before the recovery, where the kept objects would otherwise refuse
+//! every draw, or draw the colour's table from a zero ramp.
+//!
 //! **A refused draw.** What a draw reads is the guest's (its scanout's pages, the surface it
 //! presented and its format, the display's colour), so a draw runs in a refusal scope of its
 //! own ([`ScanoutDraw::scoped`]): a death in it, the platform refusing an encode or a create
@@ -79,7 +89,7 @@
 //! any is. The first refusal is logged at WARN, later ones at debug.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use reims_vgpu_graphics::Scanout;
 use reims_vgpu_graphics::region::Region;
@@ -161,12 +171,17 @@ pub(crate) struct ScanoutDraw<P: Platform> {
     shown: Arc<Shown>,
     /// The surface the display pipe shows, if any, in place of the scanout.
     presented: Arc<Presented<P>>,
+    /// The device's recoveries ([`GpuDevice::recoveries`]) when the objects below were made: a
+    /// draw that finds the count changed makes them again ([`Self::forget_if_recovered`]).
+    ///
+    /// [`GpuDevice::recoveries`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::recoveries
+    made_at: AtomicU64,
     /// The present shaders' pipelines and the strip's two buffers, made at the first surface
     /// whose format a copy cannot carry; `None` inside where the platform refused them.
-    converter: std::sync::OnceLock<Option<Converter<P>>>,
+    converter: Kept<Converter<P>>,
     /// The colour's fragment functions ([`COLOR_FRAGMENTS`]), made at the first draw through a
     /// colour; `None` inside where the platform's library holds them not.
-    color_functions: std::sync::OnceLock<Option<[P::Function; 4]>>,
+    color_functions: Kept<[P::Function; 4]>,
     /// The colour's pipelines, by what they draw and the drawable's pixel format.
     color_pipelines: Mutex<ColorPipelines<P>>,
     /// The colour's buffers, made for the colour of that count of changes.
@@ -176,7 +191,7 @@ pub(crate) struct ScanoutDraw<P: Platform> {
     /// The ramps the tables of surfaces are drawn from, by pixel format, made at their first use.
     ramps: Mutex<Vec<(u64, P::Texture)>>,
     /// The scanout's ramp, made at its first use; `None` inside where the platform refused it.
-    scanout_ramp: std::sync::OnceLock<Option<ScanoutRead<P>>>,
+    scanout_ramp: Kept<ScanoutRead<P>>,
     /// For the tests: every colour takes the pass, with no table.
     #[cfg(test)]
     tables_off: AtomicBool,
@@ -267,6 +282,30 @@ impl ColorSource {
             ColorSource::SurfaceTable => 2,
             ColorSource::ScanoutTable => 3,
         }
+    }
+}
+
+/// An object a draw makes at its first use and keeps for the next draws, made again after the
+/// device's recovery ([`ScanoutDraw::forget_if_recovered`]): `None` inside where the platform
+/// refused it, not asked again until then.
+struct Kept<T>(Mutex<Option<Option<Arc<T>>>>);
+
+impl<T> Kept<T> {
+    /// Nothing made yet.
+    fn new() -> Kept<T> {
+        Kept(Mutex::new(None))
+    }
+
+    /// The object, made by `make` at the first call since the last [`Kept::forget`]; `None`
+    /// where `make` answered none.
+    fn get_or_make(&self, make: impl FnOnce() -> Option<T>) -> Option<Arc<T>> {
+        let mut kept = self.0.lock();
+        kept.get_or_insert_with(|| make().map(Arc::new)).clone()
+    }
+
+    /// Lets go of the object, or of the refusal: the next [`Kept::get_or_make`] makes it again.
+    fn forget(&self) {
+        *self.0.lock() = None;
     }
 }
 
@@ -448,6 +487,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             .ok()
             .filter(|p| p.is_power_of_two())
             .unwrap_or(0x4000);
+        let made_at = AtomicU64::new(device.recoveries());
         Some(ScanoutDraw {
             platform,
             device,
@@ -457,13 +497,14 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             import: Mutex::new(None),
             shown: Arc::clone(shown),
             presented: Arc::clone(presented),
-            converter: std::sync::OnceLock::new(),
-            color_functions: std::sync::OnceLock::new(),
+            made_at,
+            converter: Kept::new(),
+            color_functions: Kept::new(),
             color_pipelines: Mutex::default(),
             color_buffers: Mutex::default(),
             color_table: Mutex::new(None),
             ramps: Mutex::default(),
-            scanout_ramp: std::sync::OnceLock::new(),
+            scanout_ramp: Kept::new(),
             #[cfg(test)]
             tables_off: AtomicBool::new(false),
         })
@@ -473,6 +514,32 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
     #[cfg(test)]
     pub(crate) fn without_tables(&self) {
         self.tables_off.store(true, Ordering::Relaxed);
+    }
+
+    /// Lets go of the objects the draws made and keep (the converter, the colour's functions,
+    /// pipelines, buffers and table, and the ramps) where the device recovered since they were
+    /// made ([`GpuDevice::recoveries`], the module doc, "A recovered device"): the next draw
+    /// that needs one makes it again on the device's new GPU device. The scanout's import is a
+    /// no-copy buffer over the region's pages, which a recovery carries.
+    ///
+    /// [`GpuDevice::recoveries`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::recoveries
+    fn forget_if_recovered(&self) {
+        let recoveries = self.device.recoveries();
+        if self.made_at.swap(recoveries, Ordering::AcqRel) == recoveries {
+            return;
+        }
+        log::info!(
+            target: "reims_vgpu::graphics",
+            "the device recovered: the display's draws make their pipelines, buffers, tables and \
+             ramps again"
+        );
+        self.converter.forget();
+        self.color_functions.forget();
+        self.color_pipelines.lock().clear();
+        *self.color_buffers.lock() = None;
+        *self.color_table.lock() = None;
+        self.ramps.lock().clear();
+        self.scanout_ramp.forget();
     }
 
     /// Runs `draw`, a draw of the display, in a refusal scope (the module doc, "A refused draw"):
@@ -602,6 +669,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         texture: &P::Texture,
         region: PixelRect,
     ) -> Option<(P::CommandBuffer, Option<Arc<DisplayHold>>)> {
+        self.forget_if_recovered();
         if self.shown.asleep() {
             // The display's panel is off: black, whatever the guest shows.
             let command_buffer = no_catch(self.queue.command_buffer(OnFault::Die))?;
@@ -722,19 +790,16 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         source: ColorSource,
         format: u64,
     ) -> Option<P::RenderPipeline> {
-        let functions = self
-            .color_functions
-            .get_or_init(|| {
-                let library = self.device.new_shader_library().ok().flatten()?;
-                let function = |name| no_catch(library.new_function(OnFault::Die, name));
-                Some([
-                    function(COLOR_FRAGMENTS[0])?,
-                    function(COLOR_FRAGMENTS[1])?,
-                    function(COLOR_FRAGMENTS[2])?,
-                    function(COLOR_FRAGMENTS[3])?,
-                ])
-            })
-            .as_ref()?;
+        let functions = self.color_functions.get_or_make(|| {
+            let library = self.device.new_shader_library().ok().flatten()?;
+            let function = |name| no_catch(library.new_function(OnFault::Die, name));
+            Some([
+                function(COLOR_FRAGMENTS[0])?,
+                function(COLOR_FRAGMENTS[1])?,
+                function(COLOR_FRAGMENTS[2])?,
+                function(COLOR_FRAGMENTS[3])?,
+            ])
+        })?;
         let mut pipelines = self.color_pipelines.lock();
         if let Some((_, pipeline)) = pipelines.iter().find(|(key, _)| *key == (source, format)) {
             return Some(pipeline.clone_ref());
@@ -911,7 +976,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
                     command_buffer,
                     changes,
                     color,
-                    Read::Scanout(ramp),
+                    Read::Scanout(&*ramp),
                     None,
                     &texture,
                     whole,
@@ -994,18 +1059,16 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
     /// The scanout's ramp: 256 pixels whose pixel k holds byte k in every channel, read from the
     /// top left of a table as the scanout's colour function reads the scanout; made at its first
     /// use, `None` where the platform refuses its buffer.
-    fn scanout_ramp(&self) -> Option<&ScanoutRead<P>> {
-        self.scanout_ramp
-            .get_or_init(|| {
-                let bytes: Vec<u8> = (0..=u8::MAX).flat_map(|k| [k; 4]).collect();
-                Some(ScanoutRead {
-                    buffer: self.buffer_of(&bytes)?,
-                    origin: (0, 0),
-                    stride_words: u32::try_from(SCANOUT_VALUES).ok()?,
-                    first_word: 0,
-                })
+    fn scanout_ramp(&self) -> Option<Arc<ScanoutRead<P>>> {
+        self.scanout_ramp.get_or_make(|| {
+            let bytes: Vec<u8> = (0..=u8::MAX).flat_map(|k| [k; 4]).collect();
+            Some(ScanoutRead {
+                buffer: self.buffer_of(&bytes)?,
+                origin: (0, 0),
+                stride_words: u32::try_from(SCANOUT_VALUES).ok()?,
+                first_word: 0,
             })
-            .as_ref()
+        })
     }
 
     /// Encodes into `command_buffer` a render pass that clears `texture` to black where `at` does
@@ -1033,7 +1096,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             (Read::Surface(_), Some(_)) => ColorSource::SurfaceTable,
             (Read::Scanout(_), Some(_)) => ColorSource::ScanoutTable,
         };
-        let pipeline = self.color_pipeline(converter, source, texture.pixel_format())?;
+        let pipeline = self.color_pipeline(&converter, source, texture.pixel_format())?;
         let buffers = match table {
             None => Some(self.color_buffers(changes, color)?),
             Some(_) => None,
@@ -1232,31 +1295,28 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
 
     /// The converter, made at its first use; `None` where the platform refuses its library, a
     /// pipeline or a buffer.
-    fn converter(&self) -> Option<&Converter<P>> {
-        self.converter
-            .get_or_init(|| {
-                let pipelines = DisplayPipelineCache::new(self.device.clone_ref())?;
-                let buffer = |floats: &[f32]| -> Option<P::Buffer> {
-                    let bytes: Vec<u8> = floats.iter().flat_map(|f| f.to_le_bytes()).collect();
-                    let length = u64::try_from(bytes.len()).ok()?;
-                    let buffer =
-                        no_catch(self.device.new_buffer_of_length(OnFault::Die, length, 0))?;
-                    let contents: *mut u8 = buffer.contents().as_ptr();
-                    if contents.is_null() {
-                        return None;
-                    }
-                    // SAFETY: the buffer is `length` bytes of shared memory, its contents mapped
-                    // while it lives, and nothing else writes it yet.
-                    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), contents, bytes.len()) };
-                    Some(buffer)
-                };
-                Some(Converter {
-                    positions: buffer(&STRIP_POSITIONS)?,
-                    coordinates: buffer(&STRIP_COORDINATES)?,
-                    pipelines,
-                })
+    fn converter(&self) -> Option<Arc<Converter<P>>> {
+        self.converter.get_or_make(|| {
+            let pipelines = DisplayPipelineCache::new(self.device.clone_ref())?;
+            let buffer = |floats: &[f32]| -> Option<P::Buffer> {
+                let bytes: Vec<u8> = floats.iter().flat_map(|f| f.to_le_bytes()).collect();
+                let length = u64::try_from(bytes.len()).ok()?;
+                let buffer = no_catch(self.device.new_buffer_of_length(OnFault::Die, length, 0))?;
+                let contents: *mut u8 = buffer.contents().as_ptr();
+                if contents.is_null() {
+                    return None;
+                }
+                // SAFETY: the buffer is `length` bytes of shared memory, its contents mapped
+                // while it lives, and nothing else writes it yet.
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), contents, bytes.len()) };
+                Some(buffer)
+            };
+            Some(Converter {
+                positions: buffer(&STRIP_POSITIONS)?,
+                coordinates: buffer(&STRIP_COORDINATES)?,
+                pipelines,
             })
-            .as_ref()
+        })
     }
 
     /// A command buffer of the sink's queue with the presented `surface` drawn into `texture` at
@@ -2238,6 +2298,119 @@ mod tests {
                     "{name}, colour {i}: the pass changed nothing"
                 );
             }
+        }
+    }
+
+    /// After the device's recovery (its `VkDevice` lost and made again), a draw of the scanout
+    /// through a colour draws what it drew before the recovery, through the colour's table and
+    /// through its pass: the draws make again what they kept (the module doc, "A recovered
+    /// device"), where the kept pipelines, buffers, ramp and table would be refused on the new
+    /// `VkDevice`, or read zero
+    #[test]
+    #[ignore = "the pinned runtime (metal2vulkan 1125fb62d2) refuses a new buffer in an address \
+                pool reserved before the recovery (MadeBeforeRecovery, the pool check of \
+                new_buffer_with_descriptor_now), so the draws' pooled buffers are nil after it; \
+                metal2vulkan 8bead88369 (RUNTIME_VERSION 2159) places them, and the pin that \
+                carries it runs this again"]
+    fn on_vulkan_a_recovered_device_draws_through_the_colour_as_before() {
+        let platform = Arc::new(reims_vgpu_vulkan::VulkanPlatform::new());
+        crate::entry::run(|_| recovered_device_draws_as_before(&platform));
+    }
+
+    /// [`on_vulkan_a_recovered_device_draws_through_the_colour_as_before`]'s body, inside the
+    /// library's entry.
+    fn recovered_device_draws_as_before(platform: &Arc<reims_vgpu_vulkan::VulkanPlatform>) {
+        use reims_vgpu_graphics::wire::RGFX_ALLOCATIONS_OFFSET;
+        type P = reims_vgpu_vulkan::VulkanPlatform;
+
+        const W: u32 = 512;
+        const H: u32 = 4;
+        let region = Arc::new(crate::platform::test_region(
+            &**platform,
+            reims_vgpu_graphics::REGION_SIZE as usize,
+        ));
+        // BGRA bytes, every value in each channel along a row.
+        let scanout: Vec<u8> = (0..H)
+            .flat_map(|y| (0..W).map(move |x| (x, y)))
+            .flat_map(|(x, y)| {
+                [x % 256, (x * 3 + y * 7) % 256, 255 - (x + y) % 256, 255]
+                    .map(|v| u8::try_from(v).unwrap())
+            })
+            .collect();
+        // SAFETY: the scanout lies inside the region, mapped while it lives.
+        unsafe {
+            let at = region.base().add(RGFX_ALLOCATIONS_OFFSET as usize);
+            std::ptr::copy_nonoverlapping(scanout.as_ptr(), at, scanout.len());
+        }
+        let shown = Arc::new(Shown::default());
+        *shown.scanout.lock() = Some(Scanout {
+            width: W,
+            height: H,
+            stride: W * 4,
+            offset: RGFX_ALLOCATIONS_OFFSET,
+        });
+        let presented = Arc::new(Presented::<P>::default());
+        let tabled = ScanoutDraw::new(Arc::clone(platform), &region, &shown, &presented).unwrap();
+        let passed = ScanoutDraw::new(Arc::clone(platform), &region, &shown, &presented).unwrap();
+        passed.without_tables();
+        let entries: Table = Arc::from(
+            (0..256)
+                .map(|k| {
+                    #[expect(clippy::as_conversions, reason = "a small count")]
+                    let x = k as f32 / 255.0;
+                    [x.powf(1.0 / 2.2), x.powf(1.8), 1.0 - x, 0.0]
+                })
+                .collect::<Vec<_>>(),
+        );
+        *presented.color.lock() = (
+            1,
+            Arc::new(DisplayColor {
+                stages: [Some(entries), None, None, None],
+            }),
+        );
+        let whole = PixelRect {
+            x: 0,
+            y: 0,
+            width: u64::from(W),
+            height: u64::from(H),
+        };
+        let device = platform.metal_device(None).unwrap();
+        let read = |draw: &ScanoutDraw<P>| -> Vec<u8> {
+            let descriptor = platform.texture_descriptor(&TextureDesc {
+                pixel_format: 80,
+                width: u64::from(W),
+                height: u64::from(H),
+                usage: 0x1 | 0x4,
+                resource_options: Some(0),
+                ..TextureDesc::default()
+            });
+            let target = (device.new_texture(OnFault::Die, &descriptor))
+                .unwrap()
+                .unwrap();
+            let (command_buffer, hold) = draw.encode_shown(&target, whole).unwrap();
+            command_buffer.commit(OnFault::Die).unwrap();
+            command_buffer.wait_until_completed(OnFault::Die).unwrap();
+            assert_eq!(command_buffer.status(), CommandBufferStatus::COMPLETED);
+            drop(hold);
+            let mut bytes = vec![0; (W * H * 4) as usize];
+            platform.read_pixels(&target, &mut bytes, (W * 4) as usize);
+            bytes
+        };
+        // Twice before: the first draws the table, the second draws through it.
+        let before = [read(&tabled), read(&tabled), read(&passed)];
+        assert!(tabled.color_table.lock().is_some(), "no table drawn");
+        assert_eq!(before[0], before[2], "the table draws what the pass draws");
+        assert_eq!(before[1], before[2]);
+        assert_ne!(before[2], scanout, "the colour changed the bytes");
+
+        let recoveries = device.recoveries();
+        device.raw.recover_for_test().expect("the recovery");
+        assert!(device.recoveries() > recoveries, "the recovery was counted");
+
+        for (i, draw) in [&tabled, &tabled, &passed].into_iter().enumerate() {
+            let after = read(draw);
+            let differ = (after.iter().zip(&before[i])).position(|(a, b)| a != b);
+            assert_eq!(differ, None, "draw {i} after the recovery: byte {differ:?}");
         }
     }
 

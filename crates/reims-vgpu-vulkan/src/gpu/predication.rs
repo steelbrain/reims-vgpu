@@ -1194,20 +1194,24 @@ struct Gpu {
     checked: bool,
 }
 
-/// The step kernel's pipeline of each device, by registry ID: made once, and kept until the
-/// platform lets go of its devices ([`crate::let_go`]).
-static PIPELINES: Mutex<Vec<(u64, rt::ComputePipelineState)>> = Mutex::new(Vec::new());
+/// The step kernel's pipeline of each device, by registry ID, with the process's device
+/// recoveries when it was made ([`crate::answer::recoveries`]): made once, made again after a
+/// recovery, whose new `VkDevice` refuses a pipeline made before it (the runtime's
+/// `MadeBeforeRecovery`), and kept until the platform lets go of its devices ([`crate::let_go`]).
+static PIPELINES: Mutex<Vec<(u64, u64, rt::ComputePipelineState)>> = Mutex::new(Vec::new());
 
 /// Takes the step kernel's pipelines made so far, for the platform's let-go of its devices
 /// ([`crate::let_go`]): a device of the same registry ID made after it makes its own.
-pub(crate) fn take_pipelines() -> Vec<(u64, rt::ComputePipelineState)> {
+pub(crate) fn take_pipelines() -> Vec<(u64, u64, rt::ComputePipelineState)> {
     std::mem::take(&mut *PIPELINES.lock())
 }
 
 /// The step kernel's pipeline of `device`; for `sel`, whose step it is first made for.
 fn pipeline(device: &VulkanDevice, sel: &'static str) -> rt::ComputePipelineState {
+    let recoveries = crate::answer::recoveries();
     let mut pipelines = PIPELINES.lock();
-    if let Some((_, p)) = pipelines.iter().find(|(id, _)| *id == device.registry_id) {
+    pipelines.retain(|(id, at, _)| *id != device.registry_id || *at == recoveries);
+    if let Some((.., p)) = pipelines.iter().find(|(id, ..)| *id == device.registry_id) {
         return p.clone();
     }
     let p = made(sel, || {
@@ -1229,7 +1233,7 @@ fn pipeline(device: &VulkanDevice, sel: &'static str) -> rt::ComputePipelineStat
             },
         )
     });
-    pipelines.push((device.registry_id, p.clone()));
+    pipelines.push((device.registry_id, recoveries, p.clone()));
     p
 }
 

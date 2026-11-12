@@ -188,6 +188,15 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// answers `new_command_queue`'s queue. Never nil-checked; a raise inside it dies at the
     /// call, as one inside `newCommandQueue` does.
     fn new_command_queue_unshared(&self) -> Option<P::CommandQueue>;
+    /// No Metal counterpart: how many times the platform recovered the device's GPU so far, its
+    /// lost device made again behind the same device object (the Vulkan platform's runtime makes
+    /// a new `VkDevice`, `device-recovered`). The textures, pipelines and pooled buffers made
+    /// before a recovery do not carry the host's own work on: the host makes those it keeps for
+    /// its own draws (a display's ramps, tables and pipelines) again once this changes. 0, never
+    /// changing, on a platform whose device is not recovered (the default).
+    fn recoveries(&self) -> u64 {
+        0
+    }
     /// No Metal counterpart: whether the device copies between its buffers and the guest's RAM
     /// by the RAM's host addresses ([`BlitEncoder::copy_from_guest_ram`],
     /// [`BlitEncoder::copy_to_guest_ram`]), so a copy of guest pages needs no view of them.
