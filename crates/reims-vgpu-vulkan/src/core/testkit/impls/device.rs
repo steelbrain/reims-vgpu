@@ -940,9 +940,7 @@ pub fn fake_identity_caps() -> IdentityCaps {
                 texture_buffer_alignment: caps::TEXTURE_BUFFER_FORMATS
                     .contains(&format)
                     .then_some(16),
-                linear_alignment: caps::TEXTURE_BUFFER_FORMATS
-                    .contains(&format)
-                    .then_some(16),
+                linear_alignment: caps::TEXTURE_BUFFER_FORMATS.contains(&format).then_some(16),
                 sparse_tiles: Some([
                     [64, 64, 1],
                     [128, 128, 1],

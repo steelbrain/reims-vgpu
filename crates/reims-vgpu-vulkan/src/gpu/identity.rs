@@ -540,8 +540,16 @@ mod tests {
             let Some(alignment) = answers.linear_alignment else {
                 continue;
             };
-            assert!(alignment.is_power_of_two(), "{}: {alignment}", answers.format);
-            assert!((16..=largest).contains(&alignment), "{}: {alignment}", answers.format);
+            assert!(
+                alignment.is_power_of_two(),
+                "{}: {alignment}",
+                answers.format
+            );
+            assert!(
+                (16..=largest).contains(&alignment),
+                "{}: {alignment}",
+                answers.format
+            );
             by_answer.entry(alignment).or_default().push(answers.format);
         }
         assert!(by_answer.contains_key(&bgra8.linear_alignment.unwrap()));
