@@ -75,9 +75,11 @@ use reims_vgpu_vulkan::core::sync::{Condvar, Mutex, MutexGuard};
 /// wait for what is committed before them ([`Lane::waiting`]) are not counted. Eight: at four, a
 /// buffer of Valley's GL queue waited 8.6 ms for a walker at the median and 36 ms at the 90th
 /// percentile, three walked as it came at the median and four at the 90th; at eight it waited
-/// 0.03 and 0.05 ms, three walked at the median and five at the 90th, and Valley ran at 24.5
-/// frames a second where four ran at 22.6 (1920 x 1080, RX 7900 XTX host, the device's trace on;
-/// measured).
+/// 0.03 and 0.05 ms, three walked at the median and five at the 90th (1920 x 1080, RX 7900 XTX
+/// host, the device's trace on; measured). Valley's rate is the same at both: with the trace off,
+/// on metal2vulkan 30a5a88ef6's runtime, one run each (potluck jobs m3-max-21602 at eight and
+/// m3-max-21604 at four), the device presented 15.5 and 15.6 frames a second over Valley's run,
+/// with 127 and 140 gaps of 100 ms or more between frames, 9% fewer at eight (measured).
 pub(crate) const LANE_THREADS: usize = 8;
 
 /// The most threads a lane has, those whose jobs wait among them; a job past it waits to start,
