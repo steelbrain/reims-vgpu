@@ -1494,12 +1494,14 @@ fn doctor(host: Host) -> Result<i32> {
         match reims_util::binary() {
             Ok(b) => {
                 let v = reims_util::version(&b);
+                let stale = reims_util::stale(&b);
                 line(
-                    v.is_some(),
+                    v.is_some() && stale.is_none(),
                     "reims-util",
-                    match v {
-                        Some(v) => format!("{} ({v})", b.display()),
-                        None => format!(
+                    match (v, stale) {
+                        (Some(_), Some(stale)) => stale,
+                        (Some(v), None) => format!("{} ({v})", b.display()),
+                        (None, _) => format!(
                             "{} does not run: reinstall it with reims-ctl update",
                             b.display()
                         ),

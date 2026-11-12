@@ -14,6 +14,11 @@
 //! installs it too, though that update runs the script it started with, which predates
 //! reims-util. `REIMS_CTL_UTIL` names a binary to use instead.
 //!
+//! A reims-ctl installed some other way (`cargo install --path`) runs whatever reims-util is
+//! beside it or on PATH, which can be from an older commit than [`REV`]: one that makes OpenCore
+//! images with what an earlier reims-ctl wanted. reims-ctl says so where cargo's records show it
+//! ([`stale`]): `doctor` fails on it, and the first run of it in a process says it.
+//!
 //! An install builds it in an empty target directory: cargo 1.98.1 judges a git package's binary
 //! up to date across commits (measured 2026-10-13): from a target directory an earlier commit was
 //! built in, `cargo install --rev` of a later one installs the earlier commit's binary and records
@@ -69,6 +74,48 @@ pub fn beside() -> Option<PathBuf> {
         .ok()
         .and_then(|e| e.parent().map(|d| d.join("reims-util")))
         .filter(|p| p.is_file())
+}
+
+/// The commit cargo installed the reims-util at `bin` from, where it installed it from reims-util's
+/// repository: the install root holding `bin/` keeps cargo's record of each package it installed,
+/// `.crates2.json`, keyed "reims-util 0.1.0 (git+<repository>?rev=<rev>#<commit>)".
+pub fn installed_commit(bin: &Path) -> Option<String> {
+    let root = bin.parent()?.parent()?;
+    let text = std::fs::read_to_string(root.join(".crates2.json")).ok()?;
+    let record: serde_json::Value = serde_json::from_str(&text).ok()?;
+    record
+        .get("installs")?
+        .as_object()?
+        .iter()
+        .find_map(|(key, install)| {
+            let bins = install.get("bins")?.as_array()?;
+            if !bins.iter().any(|b| b.as_str() == Some("reims-util")) {
+                return None;
+            }
+            let source = key.split_once(" (")?.1.strip_suffix(')')?;
+            let git = source.strip_prefix("git+")?;
+            let (url, commit) = git.rsplit_once('#')?;
+            url.starts_with(REPO).then(|| commit.to_string())
+        })
+}
+
+/// Where the reims-util at `bin` is from a commit of reims-util's repository other than [`REV`],
+/// what to say: it may make what an earlier reims-ctl wanted. None where it is at [`REV`], or
+/// where cargo keeps no record of its commit (a build from a path, `REIMS_CTL_UTIL`'s binary).
+pub fn stale(bin: &Path) -> Option<String> {
+    if std::env::var_os("REIMS_CTL_UTIL").is_some() {
+        return None;
+    }
+    let commit = installed_commit(bin)?;
+    (commit != REV).then(|| {
+        format!(
+            "{} is reims-util's commit {}, not {}, the one this reims-ctl runs: reims-ctl update \
+             installs it (or scripts/install-ctl.sh, where reims-ctl was installed without it)",
+            bin.display(),
+            &commit[..commit.len().min(7)],
+            &REV[..7]
+        )
+    })
 }
 
 /// `reims-util --version`: "reims-util 0.1.0".
@@ -377,6 +424,13 @@ enum Event {
 /// last; returns its result.
 fn run(args: &[&OsStr], progress: &mut dyn FnMut(&str)) -> Result<serde_json::Value> {
     let bin = binary()?;
+    // A stale reims-util is said once a process, at the first run.
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if let Some(note) = stale(&bin)
+        && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        progress(&note);
+    }
     let mut cmd = Command::new(&bin);
     cmd.arg("--json")
         .args(args)
@@ -523,6 +577,41 @@ fn lock(dir: &Path, progress: &mut dyn FnMut(&str)) -> Result<Lock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// cargo's record of what it installed, beside `bin/`, gives the commit of a reims-util
+    /// installed from its repository; one at another commit than [`REV`] is stale, and one from
+    /// a path, or with no record, is not judged.
+    #[test]
+    fn a_reims_util_from_another_commit_is_stale() {
+        let env = crate::testenv::Env::new("util-stale");
+        let root = env.root.join("cargo");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        let bin = root.join("bin/reims-util");
+        std::fs::write(&bin, "").unwrap();
+        let record = |source: &str| {
+            let key = format!("reims-util 0.1.0 ({source})");
+            let json = serde_json::json!({"installs": {
+                "reims-ctl 0.1.0 (path+file:///src/reims-ctl)": {"bins": ["reims-ctl"]},
+                key: {"bins": ["reims-util"]},
+            }});
+            std::fs::write(root.join(".crates2.json"), json.to_string()).unwrap();
+        };
+        assert_eq!(installed_commit(&bin), None);
+        assert_eq!(stale(&bin), None);
+        let old = "fe9bfe1a622ae1be8d254effa74b5354bd098e43";
+        record(&format!("git+{REPO}?rev={old}#{old}"));
+        assert_eq!(installed_commit(&bin).as_deref(), Some(old));
+        let note = stale(&bin).expect("stale");
+        assert!(
+            note.contains("fe9bfe1") && note.contains(&REV[..7]),
+            "{note}"
+        );
+        record(&format!("git+{REPO}?rev={REV}#{REV}"));
+        assert_eq!(stale(&bin), None);
+        record("path+file:///src/reims-util");
+        assert_eq!(installed_commit(&bin), None);
+        assert_eq!(stale(&bin), None);
+    }
 
     #[test]
     fn old_macos_gets_a_model_that_runs_it() {
