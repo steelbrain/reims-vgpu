@@ -995,6 +995,10 @@ pub(crate) struct CacheCounts {
     pub(crate) aligned: u64,
     /// Caches made laid out at the GPU's pitch ([`Repitched`]).
     pub(crate) repitched: u64,
+    /// The GPU's time in the fills' command buffers, and in the copies' into the pages, in
+    /// nanoseconds, where the platform gave it ([`CopyGpu`]).
+    pub(crate) fill_gpu_ns: u64,
+    pub(crate) out_gpu_ns: u64,
 }
 
 /// One cache's pages, host addresses in the guest's RAM, and how many times a device of the host
@@ -1027,6 +1031,25 @@ impl Watcher for Watched {
             if device_writes::overlap(&pages.runs, runs) {
                 pages.writes += 1;
             }
+        }
+    }
+}
+
+/// The GPU's time in the caches' copies, summed as each copy's command buffer completes
+/// ([`CompletedInfo::gpu_times_ns`]): the fills', and the copies' into the pages (downloads,
+/// releases and early copies). Diagnostics only ([`CacheCounts`]'s `fill_gpu_ns` and
+/// `out_gpu_ns`).
+#[derive(Debug, Default)]
+struct CopyGpu {
+    fills: AtomicU64,
+    out: AtomicU64,
+}
+
+impl CopyGpu {
+    /// Adds a command buffer's GPU times, where the platform gave them, to `to`.
+    fn add(to: &AtomicU64, gpu: Option<(u64, u64)>) {
+        if let Some((start, end)) = gpu {
+            to.fetch_add(end.saturating_sub(start), Ordering::Relaxed);
         }
     }
 }
@@ -1097,6 +1120,8 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// The blocks of the begins answered before the fills they make ([`Caches::before_answering`]),
     /// from the answer until those fills are made: no other begin counts a use of one meanwhile.
     answering: HashSet<u64>,
+    /// The GPU's time in the caches' copies so far ([`CopyGpu`]).
+    copy_gpu: Arc<CopyGpu>,
     /// Whether laid-out caches of two planes are made with their memory a dma-buf, for the host's
     /// video to decode into ([`Caches::set_dma_buf`]).
     dma_buf: bool,
@@ -1253,13 +1278,18 @@ impl<P: Platform> SurfaceCaches<P> {
             exportable: false,
             owed: HashSet::new(),
             answering: HashSet::new(),
+            copy_gpu: Arc::default(),
             dma_buf: false,
         }
     }
 
     /// What the caches did so far.
     pub(crate) fn counts(&self) -> CacheCounts {
-        self.counts
+        CacheCounts {
+            fill_gpu_ns: self.copy_gpu.fills.load(Ordering::Relaxed),
+            out_gpu_ns: self.copy_gpu.out.load(Ordering::Relaxed),
+            ..self.counts
+        }
     }
 
     /// Whether the block at `block` keeps the cache it has as its pages are named again: one of
@@ -2534,9 +2564,11 @@ impl<P: Platform> SurfaceCaches<P> {
             // wake of a handler thread between; the buffers live until its completed handler,
             // past the cache's own end at a release.
             let lands = Arc::clone(&landing);
+            let gpu = Arc::clone(&self.copy_gpu);
             cb.add_completion_seen_handler(
                 ON,
                 Box::new(move |info: CompletedInfo| {
+                    CopyGpu::add(&gpu.out, info.gpu_times_ns);
                     lands.land_timed(info.gpu_times_ns, std::time::Duration::ZERO);
                 }),
             )?;
@@ -2614,11 +2646,15 @@ impl<P: Platform> SurfaceCaches<P> {
         cb.encode_signal(Some(EventRef::Event(&transfer.event)), value)?;
         signal_after::<P>(&cb, signal.as_ref())?;
         let fills = Arc::clone(&transfer.fills);
+        let gpu = Arc::clone(&self.copy_gpu);
         // Told as the platform sees the fill done, with no handler thread woken between: the
         // presents and decodes waiting for it go on then.
         cb.add_completion_seen_handler(
             ON,
-            Box::new(move |_: CompletedInfo| fills.finished(value)),
+            Box::new(move |info: CompletedInfo| {
+                CopyGpu::add(&gpu.fills, info.gpu_times_ns);
+                fills.finished(value)
+            }),
         )?;
         cb.commit(ON)?;
         if signal.is_some() {
@@ -2950,12 +2986,14 @@ impl<P: Platform> SurfaceCaches<P> {
         cb.encode_signal(Some(EventRef::Event(&transfer.event)), value)?;
         let landing = Landing::new();
         let lands = Arc::clone(&landing);
+        let gpu = Arc::clone(&self.copy_gpu);
         match staged {
             // A copied cache's pages take the staging buffer's bytes on the host's CPU, before
             // `done`: a copy too long for the platform's thread that sees the completion.
             Some(staged) => cb.add_completed_handler(
                 ON,
                 Box::new(move |info: CompletedInfo| {
+                    CopyGpu::add(&gpu.out, info.gpu_times_ns);
                     let at = now.as_ref().map(|now| now());
                     staged.done();
                     drop(held);
@@ -2973,6 +3011,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 cb.add_completion_seen_handler(
                     ON,
                     Box::new(move |info: CompletedInfo| {
+                        CopyGpu::add(&gpu.out, info.gpu_times_ns);
                         lands.land_timed(info.gpu_times_ns, std::time::Duration::ZERO);
                         done();
                     }),
@@ -5888,6 +5927,37 @@ mod tests {
                 false => assert_eq!((split.transfer, split.wait), (None, None)),
             }
         }
+    }
+
+    /// The caches sum the GPU's time in their fills, and in their copies into the pages, as each
+    /// copy's command buffer completes with its times: the log's measure of what they cost. The
+    /// guest's own buffers count for neither.
+    #[test]
+    fn the_gpu_s_time_in_the_caches_fills_and_copies_out_is_summed() {
+        let ms = 1_000_000;
+        // Every buffer committed and not completed takes `took` of the GPU's time.
+        let time_all = |r: &Rig, took: u64| {
+            for (at, id) in r.p.world().committed().into_iter().enumerate() {
+                let start = 1_000 * ms * (at as u64 + 1);
+                assert!(r.p.world().set_gpu_times(id, start, start + took));
+            }
+        };
+        let mut r = cached();
+        use_surfaces(&mut r, 1, 0x200, &[(BLOCK, 1, true)]);
+        time_all(&r, 3 * ms);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let counts = r.dec.caches().counts();
+        assert_eq!(
+            (counts.fills, counts.fill_gpu_ns, counts.out_gpu_ns),
+            (1, 3 * ms, 0),
+            "the fill's alone"
+        );
+        let answered = download(&r, BLOCK);
+        time_all(&r, 5 * ms);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(answered.load(Ordering::SeqCst));
+        let counts = r.dec.caches().counts();
+        assert_eq!((counts.fill_gpu_ns, counts.out_gpu_ns), (3 * ms, 5 * ms));
     }
 
     /// A `SURFACE_PAGES` of a new block over the pages of a released block whose cache is still

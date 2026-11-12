@@ -1329,7 +1329,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                      cache waited for no copy of it, {} for one; {} made exportable for the \
                      host's video, {} not; {} made a dma-buf for the host's video to decode \
                      into, {} not; {} made with their surface's first plane on 256 bytes of \
-                     their memory; {} laid out at the GPU's pitch",
+                     their memory; {} laid out at the GPU's pitch; the GPU's time in the \
+                     fills {} ms, in the copies out {} ms",
                     d.made, d.fills, d.filled_bytes >> 20, d.made_fills, d.decode_firsts,
                     d.downloads,
                     d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread,
@@ -1341,7 +1342,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     self.shared.slow_answers.load(Ordering::Relaxed), SLOW_ANSWER.as_millis(),
                     d.fills_deferred, d.cpu_waits, d.doorbell_free, d.doorbell_waits,
                     d.exportable, d.unexportable, d.dma_buf, d.no_dma_buf, d.aligned,
-                    d.repitched
+                    d.repitched, d.fill_gpu_ns / 1_000_000, d.out_gpu_ns / 1_000_000
                 );
             }
         }
