@@ -30,6 +30,13 @@ int main() {
 	assert(strcmp(RGFX_OP_LIBRARY_VALIDATION, "file_check_library_validation") == 0);
 	assert(strcmp(RGFX_OP_VNODE_CHECK_SIGNATURE, "vnode_check_signature") == 0);
 
+	// The Sandbox policy's file_check_mmap: its registered name ("Sandbox", the
+	// mpc_name Graft finds it by), a colon, and the bare operation AMFI's route
+	// names, so the two routes name one operation on two policies.
+	assert(strcmp(RGFX_OP_SANDBOX_FILE_CHECK_MMAP, "Sandbox:file_check_mmap") == 0);
+	assert(strcmp(&RGFX_OP_SANDBOX_FILE_CHECK_MMAP[strlen("Sandbox:")], RGFX_OP_FILE_CHECK_MMAP) ==
+	       0);
+
 	printf("amfi_test: ok\n");
 	return 0;
 }

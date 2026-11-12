@@ -24,6 +24,15 @@
 #define RGFX_OP_LIBRARY_VALIDATION "file_check_library_validation"
 #define RGFX_OP_VNODE_CHECK_SIGNATURE "vnode_check_signature"
 
+// The Sandbox policy's file_check_mmap, which RgfxGate routes beside AMFI's: a
+// policy's registered name and a colon before the operation names that policy's
+// (Graft.h); a bare name is AMFI's. A sandboxed process whose profile allows
+// reading /Library/GPUBundles but not mapping it executable (WebKit's GPU
+// process, replayd) is refused our bundle by Sandbox's op alone, which AMFI's
+// route does not reach: on arm64e each policy's op is called on its own. Its slot
+// holds the same mpo type as AMFI's, so the same discriminator.
+#define RGFX_OP_SANDBOX_FILE_CHECK_MMAP "Sandbox:file_check_mmap"
+
 // The ptrauth discriminator (key IA, addrDiv 0) each operation's mpo pointer is
 // signed with, which each replacement's type must have.
 static const uint16_t kRgfxAmfiDiscFileCheckMmap = 0x438d;

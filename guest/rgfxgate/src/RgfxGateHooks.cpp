@@ -100,18 +100,31 @@ static int wrapLibVal(void *proc, void *fg, off_t slice_offset, uint64_t error_m
 
 // file-map-executable (wall C): mpo_file_check_mmap_t, the label at arg3 (NULL
 // from the dispatcher; never dereferenced). The *maxprot clamp is the x86
-// wrapper's, for the same reason.
+// wrapper's, for the same reason. The dispatcher asks every policy's op on its
+// own, so the mapping needs both AMFI's and the Sandbox policy's: a sandboxed
+// process whose profile reads /Library/GPUBundles but maps nothing executable
+// there (WebKit's GPU process, replayd) is refused by Sandbox's op alone. Each
+// policy's op gets the same rule and calls that policy's own original.
 using MpoMmap = int(void *cred, void *fg, void *label, int prot, int flags, uint64_t file_pos,
                     int *maxprot);
-static void *orgMmap;
-static int wrapMmap(void *cred, void *fg, void *label, int prot, int flags, uint64_t file_pos,
-                    int *maxprot) {
+static int admitMmap(void *original, void *cred, void *fg, void *label, int prot, int flags,
+                     uint64_t file_pos, int *maxprot) {
 	if ((prot & kVmProtExecute) && cdhashIsOurs(fg, file_pos)) {
 		if (maxprot != nullptr)
 			*maxprot &= prot;
 		return 0; // the GPU process may map our driver executable
 	}
-	return reinterpret_cast<MpoMmap *>(orgMmap)(cred, fg, label, prot, flags, file_pos, maxprot);
+	return reinterpret_cast<MpoMmap *>(original)(cred, fg, label, prot, flags, file_pos, maxprot);
+}
+static void *orgMmap;
+static int wrapMmap(void *cred, void *fg, void *label, int prot, int flags, uint64_t file_pos,
+                    int *maxprot) {
+	return admitMmap(orgMmap, cred, fg, label, prot, flags, file_pos, maxprot);
+}
+static void *orgSandboxMmap;
+static int wrapSandboxMmap(void *cred, void *fg, void *label, int prot, int flags,
+                           uint64_t file_pos, int *maxprot) {
+	return admitMmap(orgSandboxMmap, cred, fg, label, prot, flags, file_pos, maxprot);
 }
 
 // code-signature trust (wall B, before library validation):
@@ -150,6 +163,9 @@ static_assert(__builtin_ptrauth_type_discriminator(decltype(wrapLibVal)) ==
 static_assert(__builtin_ptrauth_type_discriminator(decltype(wrapMmap)) ==
                   kRgfxAmfiDiscFileCheckMmap,
               "wrapMmap has file_check_mmap's mpo shape");
+static_assert(__builtin_ptrauth_type_discriminator(decltype(wrapSandboxMmap)) ==
+                  kRgfxAmfiDiscFileCheckMmap,
+              "wrapSandboxMmap has file_check_mmap's mpo shape");
 static_assert(__builtin_ptrauth_type_discriminator(decltype(wrapVSig)) ==
                   kRgfxAmfiDiscVnodeCheckSignature,
               "wrapVSig has vnode_check_signature's mpo shape");
@@ -178,7 +194,21 @@ bool installHooks() {
 	};
 	if (!graft_route_kernel(kClientID, requests, sizeof(requests) / sizeof(requests[0])))
 		return false;
-	graft_client_log(kClientID, "hooks installed (3 AMFI ops; writes below MAC)");
+	// The Sandbox policy's op goes in a call of its own: one call names one policy (Graft.h).
+	// Without it, everything but sandboxed processes still maps the bundle, so a refusal (a
+	// Graft that shadows AMFI alone) is logged and the gate goes on.
+	const graft_route_request sandbox[] = {
+	    {RGFX_OP_SANDBOX_FILE_CHECK_MMAP, reinterpret_cast<void *>(wrapSandboxMmap),
+	     &orgSandboxMmap},
+	};
+	if (!graft_route_kernel(kClientID, sandbox, sizeof(sandbox) / sizeof(sandbox[0]))) {
+		graft_client_log(kClientID, "hooks installed (3 AMFI ops; writes below MAC); Sandbox's "
+		                            "file_check_mmap not routed: sandboxed processes (WebKit's GPU "
+		                            "process) cannot map the bundle");
+		return true;
+	}
+	graft_client_log(kClientID,
+	                 "hooks installed (3 AMFI ops, Sandbox's file_check_mmap; writes below MAC)");
 	return true;
 }
 
