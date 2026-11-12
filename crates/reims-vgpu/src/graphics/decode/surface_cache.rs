@@ -341,6 +341,17 @@ pub(crate) struct SurfaceCache<P: Platform> {
     life: Option<MemoryLife>,
 }
 
+impl<P: Platform> SurfaceCache<P> {
+    /// The bytes a copy `way` moves between the cache and its pages: a fill's, all of the
+    /// surface's; a copy out's, its texels where its layout is known, else all of the surface's.
+    fn moved(&self, way: Way) -> u64 {
+        match (way, &self.texels) {
+            (Way::Out, Some(spans)) => spans.iter().map(|span| span.end - span.start).sum(),
+            _ => self.length,
+        }
+    }
+}
+
 /// A copy of a cache into its pages on the transfer queue ([`SurfaceCaches::write_back`]): the
 /// transfer event's value it signals as it ends, and its landing.
 struct OutCopy {
@@ -860,10 +871,10 @@ pub(crate) struct CacheCounts {
     /// First fills a decode took as met, its picture landing over the cache's zeros
     /// ([`SurfaceCaches::before_one`]).
     pub(crate) decode_firsts: u64,
-    /// Fills, and their bytes.
+    /// Fills, and the bytes they moved.
     pub(crate) fills: u64,
     pub(crate) filled_bytes: u64,
-    /// Downloads, and their bytes.
+    /// Downloads, and the bytes they moved.
     pub(crate) downloads: u64,
     pub(crate) downloaded_bytes: u64,
     /// Downloads answered at once: of a cache nothing wrote since its last copy, or one whose
@@ -904,7 +915,7 @@ pub(crate) struct CacheCounts {
     pub(crate) carried: u64,
     pub(crate) unattached: u64,
     /// Early copies of caches into their pages, behind a writer of a surface that reads back
-    /// ([`SurfaceCaches::early_copies`]), and their bytes.
+    /// ([`SurfaceCaches::early_copies`]), and the bytes they moved.
     pub(crate) early: u64,
     pub(crate) early_bytes: u64,
     /// Of them, copies behind a writer that held no video encoder, on the host's read-back queue.
@@ -2477,7 +2488,7 @@ impl<P: Platform> SurfaceCaches<P> {
             let next = value + 1;
             cb.encode_signal(Some(EventRef::Event(event)), next)?;
             cb.commit(ON)?;
-            let length = cache.length;
+            let length = cache.moved(Way::Out);
             if let Some((_, value)) = self.ends.get_mut(&signals) {
                 *value = next;
             }
@@ -2552,7 +2563,7 @@ impl<P: Platform> SurfaceCaches<P> {
         if signal.is_some() {
             self.signal_with = None;
         }
-        let length = cache.length;
+        let length = cache.moved(Way::In);
         if let Some(cache) = self.by_block.get_mut(&block) {
             cache.generation = Some(cache.generation.map_or(generation, |g| g.max(generation)));
             cache.host_read = host;
@@ -2915,7 +2926,7 @@ impl<P: Platform> SurfaceCaches<P> {
         if signal.is_some() {
             self.signal_with = None;
         }
-        let length = cache.length;
+        let length = cache.moved(Way::Out);
         if let Some(cache) = self.by_block.get_mut(&block) {
             cache.written = false;
             cache.users.clear();
