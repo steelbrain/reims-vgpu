@@ -2874,6 +2874,24 @@ bool visibleOf(const Module &m, std::vector<RgfxAirVisible> &out)
 	return true;
 }
 
+// The `[[max_total_threads_per_threadgroup(n)]]` of the entry point node `id`: n, from its node of
+// `air.max_work_group_size` and n among those after its arguments' node; 0 where it has none, or
+// one not of that form (read: the modules Apple's Metal compiler builds from
+// tests/air_arguments.metal's kernels of the attribute, `!{!"air.max_work_group_size", i32 64}` as
+// LLVM's text form prints it).
+uint32_t maxWorkGroupSize(const Module &m, uint64_t id)
+{
+	const Module::Md *entry = mdNode(m, id);
+	for (size_t k = 3; entry != nullptr && k < entry->ops.size(); k++) {
+		const Module::Md *extra = mdNode(m, entry->ops[k]);
+		std::string key;
+		uint32_t n = 0;
+		if (extra != nullptr && mdText(m, *extra, 0, key) && key == "air.max_work_group_size")
+			return extra->ops.size() == 2 && mdUnsigned(m, *extra, 1, n) ? n : 0;
+	}
+	return 0;
+}
+
 // The entry points' arguments of the module `m` (rgfxReadAirFunctions): each entry point's own
 // answer, one whose arguments do not read listed with none, one that names no function left out.
 bool functionsOf(const Module &m, std::vector<RgfxAirFunction> &out)
@@ -2899,6 +2917,8 @@ bool functionsOf(const Module &m, std::vector<RgfxAirFunction> &out)
 				f.argumentsRead = false;
 				f.arguments.clear();
 			}
+			if (s.stage == RgfxAirStage::Kernel)
+				f.maxTotalThreads = maxWorkGroupSize(m, id);
 			f.constants = constants;
 			f.constantsRead = constantsRead;
 			out.push_back(std::move(f));

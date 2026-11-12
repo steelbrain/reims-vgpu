@@ -225,7 +225,167 @@ bool pipelineLibraries(MTLComputePipelineDescriptor *descriptor, RgfxFunction *k
 	return true;
 }
 
+// RgfxComputeProgressError of the descriptor's forwardProgressUsage and contentionRelief, where its
+// Metal (macOS 27) has them.
+NSError *progressErrorOf(MTLComputePipelineDescriptor *descriptor)
+{
+	SEL progress = sel_registerName("forwardProgressUsage"), relief = sel_registerName("contentionRelief");
+	const BOOL hasProgress = [descriptor respondsToSelector:progress];
+	const BOOL hasRelief = [descriptor respondsToSelector:relief];
+	return RgfxComputeProgressError(
+	    hasProgress, hasProgress ? ((NSInteger (*)(id, SEL))objc_msgSend)(descriptor, progress) : 0, hasRelief,
+	    hasRelief ? ((NSInteger (*)(id, SEL))objc_msgSend)(descriptor, relief) : 0);
+}
+
+// What Metal's compiler answers a refusal of a pipeline's threadgroup fields with: the x86 Macs'
+// CompilerError 2, the M3 Max's AGXMetalG15X_M1 3 (oracle_threads, below).
+NSError *threadsError(RgfxThreadsRules rules, NSString *text)
+{
+	const bool apple = rules == RgfxThreadsRulesApple;
+	return [NSError errorWithDomain:apple ? @"AGXMetalG15X_M1" : @"CompilerError"
+	                           code:apple ? 3 : 2
+	                       userInfo:@{NSLocalizedDescriptionKey : text}];
+}
+
 } // namespace
+
+@implementation RgfxThreadsVerdict {
+@public
+	NSString *_assertion;
+	const char *_assertionFunction;
+	NSError *_error;
+	NSUInteger _maxTotalThreads;
+}
+
+- (NSString *)assertion
+{
+	return _assertion;
+}
+
+- (const char *)assertionFunction
+{
+	return _assertionFunction;
+}
+
+- (NSError *)error
+{
+	return _error;
+}
+
+- (NSUInteger)maxTotalThreads
+{
+	return _maxTotalThreads;
+}
+
+@end
+
+// A compute pipeline's threadgroup fields as Metal checks them (measured: oracle_threads, each step
+// a first compile of its kernel, plain and with MTL_DEBUG_LAYER=1 alike, on the AMD Radeon Pro
+// 5300M and the Intel UHD Graphics 630 under macOS 26.7.1 (25G241), and the M3 Max under macOS
+// 27.0.1 (26A434)). On all three, a required size (`requiredThreadsPerThreadgroup`, not {0, 0, 0})
+// with an axis of 0, of more threads than the device's limit, or of more than the descriptor's
+// `maxTotalThreadsPerThreadgroup` ends the process at its validation's failed assertion
+// (validateWithDevice:1530 on the x86 Macs, :1623 on the M3 Max), each failed check a line of its
+// words. Then, in the x86 Macs' order (the 5300M's words; the 630's below) or the M3 Max's:
+// - a `maxTotalThreadsPerThreadgroup` past the device's limit is refused (x86 first; the M3 Max
+//   last, as a kernel's attribute it differs from is refused first; the 630 makes the pipeline);
+// - a required size of more threads than the kernel's [[max_total_threads_per_threadgroup(n)]] is
+//   refused, in the same words on all three;
+// - a `maxTotalThreadsPerThreadgroup` other than what the kernel specifies, the required size's
+//   threads where it has one, else its attribute's n, is refused (the 630: "[[max_total_threads_per_
+//   threadgroup]] declared in Metal doesn't match [MTLComputePipelineDescriptor
+//   maxTotalThreadsPerThreadgroup]").
+// A pipeline made of a required size answers its threads as its maxTotalThreadsPerThreadgroup on
+// the 5300M and the M3 Max (the 630 answers 1024 throughout, and 448 for one thread). A kernel
+// compiled before is made of a required size past its attribute on all three, answering the
+// attribute (oracle_threads' -warm steps): Metal's compile cache, which this does not follow, as
+// the runtime does not (its RequiredThreadsProblem::OverKernelMax).
+RgfxThreadsVerdict *RgfxComputeThreadsVerdictOf(RgfxThreadsRules rules, MTLSize required, NSUInteger maxTotal,
+                                                NSUInteger kernelMax, NSString *kernelName, NSUInteger deviceLimit)
+{
+	RgfxThreadsVerdict *v = [RgfxThreadsVerdict new];
+	const bool apple = rules == RgfxThreadsRulesApple;
+	const bool hasRequired = required.width != 0 || required.height != 0 || required.depth != 0;
+	const NSUInteger threads = required.width * required.height * required.depth;
+	if (hasRequired) {
+		NSString *size = [NSString
+		    stringWithFormat:@"(requiredThreadsPerThreadgroup.width(%lu) * requiredThreadsPerThreadgroup.height(%lu) * "
+		                     @"requiredThreadsPerThreadgroup.depth(%lu))(%lu)",
+		                     static_cast<unsigned long>(required.width), static_cast<unsigned long>(required.height),
+		                     static_cast<unsigned long>(required.depth), static_cast<unsigned long>(threads)];
+		NSMutableString *failed = [NSMutableString string];
+		if (threads == 0)
+			[failed appendFormat:@"%@ must not be 0.\n", size];
+		if (deviceLimit != 0 && threads > deviceLimit)
+			[failed appendFormat:@"%@ must be <= %lu (device limit)\n", size, static_cast<unsigned long>(deviceLimit)];
+		if (maxTotal != 0 && threads > maxTotal)
+			[failed appendFormat:@"%@ must be <= maxTotalThreadsPerThreadgroup (%lu)\n", size,
+			                     static_cast<unsigned long>(maxTotal)];
+		if (failed.length != 0) {
+			v->_assertion = [@"Compute Pipeline Descriptor Validation\n" stringByAppendingString:failed];
+			v->_assertionFunction = apple ? "validateWithDevice:1623" : "validateWithDevice:1530";
+			return v;
+		}
+	}
+	NSString *pastLimit =
+	    deviceLimit != 0 && maxTotal > deviceLimit
+	        ? [NSString stringWithFormat:apple ? @": Specified total max threads per threadgroup (%lu) exceeds the "
+	                                             @"maximum total threads per threadgroup supported (%lu)"
+	                                           : @"maxThreadsPerThreadgroup pipeline descriptor value (%lu) exceeds "
+	                                             @"maximum supported (%lu)\n",
+	                                     static_cast<unsigned long>(maxTotal), static_cast<unsigned long>(deviceLimit)]
+	        : nil;
+	if (!apple && pastLimit != nil) {
+		v->_error = threadsError(rules, pastLimit);
+		return v;
+	}
+	if (hasRequired && kernelMax != 0 && threads > kernelMax) {
+		v->_error = threadsError(
+		    rules, [NSString stringWithFormat:@"error: requested required threads per threadgroup %lu,%lu,%lu but '%@' "
+		                                      @"expects max threads per threadgroup %lu\n",
+		                                      static_cast<unsigned long>(required.width),
+		                                      static_cast<unsigned long>(required.height),
+		                                      static_cast<unsigned long>(required.depth), kernelName,
+		                                      static_cast<unsigned long>(kernelMax)]);
+		return v;
+	}
+	const NSUInteger specified = hasRequired ? threads : kernelMax;
+	if (maxTotal != 0 && specified != 0 && specified != maxTotal) {
+		v->_error = threadsError(
+		    rules, [NSString stringWithFormat:apple ? @": Kernel specified max total threads per threadgroup (%lu) must "
+		                                              @"match compute pipeline specified max total threads per "
+		                                              @"threadgroup (%lu)"
+		                                            : @"max_total_threads_per_threadgroup shader attribute(Metadata) "
+		                                              @"value (%lu) does not match maxThreadsPerThreadgroup pipeline "
+		                                              @"descriptor value (%lu)\n",
+		                                      static_cast<unsigned long>(specified),
+		                                      static_cast<unsigned long>(maxTotal)]);
+		return v;
+	}
+	if (pastLimit != nil) {
+		v->_error = threadsError(rules, pastLimit);
+		return v;
+	}
+	v->_maxTotalThreads = hasRequired ? threads : 0;
+	return v;
+}
+
+// The M3 Max under macOS 27.0.1 makes a pipeline of each forwardProgressUsage Metal names
+// (Automatic 0, Weak 1, SIMDGroupParallel 2) and contentionRelief (Automatic 0, None 1); of any
+// other value its compiler service ends and the pipeline is refused (oracle_threads' -fp and -cr
+// steps). The x86 Macs' Metal has neither field (macOS 26).
+NSError *RgfxComputeProgressError(BOOL hasProgress, NSInteger progress, BOOL hasRelief, NSInteger relief)
+{
+	if ((hasProgress && (progress < 0 || progress > 2)) || (hasRelief && (relief < 0 || relief > 1)))
+		return [NSError errorWithDomain:@"AGXMetalG15X_M1"
+		                           code:2
+		                       userInfo:@{
+			                       NSLocalizedDescriptionKey :
+			                           @"Compilation failed due to an interrupted connection: "
+			                           @"XPC_ERROR_CONNECTION_INTERRUPTED. This error occurred after multiple retries."
+		                       }];
+	return nil;
+}
 
 // Defined in the main implementation; declared here so the lambda in
 // rgfxRegisterWithReplyReader: sees its signature.
@@ -247,6 +407,8 @@ bool pipelineLibraries(MTLComputePipelineDescriptor *descriptor, RgfxFunction *k
 	uint32_t _createFlags;
 	MTLSize _requiredThreadsPerThreadgroup;
 	NSInteger _forwardProgressUsage;
+	// The required size's threads, which maxTotalThreadsPerThreadgroup answers (0: none required).
+	NSUInteger _requiredThreads;
 	// The host's reflection, filled once RGFX_EVT_PIPELINE_REFLECTION for `_seqno`
 	// arrives; until then `_haveReflection` is NO and the getters answer placeholders.
 	RgfxPipelineReflection _reflection;
@@ -359,6 +521,29 @@ bool pipelineLibraries(MTLComputePipelineDescriptor *descriptor, RgfxFunction *k
 	}
 
 	RgfxFunction *rf = (RgfxFunction *)function;
+	// Its threadgroup fields and macOS 27's progress fields, as Metal checks them before it compiles
+	// (RgfxComputeThreadsVerdictOf, RgfxComputeProgressError): the host is sent none of them.
+	MTLSize required = MTLSizeMake(0, 0, 0);
+	if ([descriptor respondsToSelector:@selector(requiredThreadsPerThreadgroup)])
+		required = descriptor.requiredThreadsPerThreadgroup;
+	std::shared_ptr<const RgfxAirFunction> kernelAir = [rf rgfxAirFunction];
+	const char *entryName = [rf rgfxEntryPointUTF8];
+	RgfxThreadsVerdict *threads = RgfxComputeThreadsVerdictOf(
+	    RgfxGuestThreadsRules(), required, descriptor.maxTotalThreadsPerThreadgroup,
+	    kernelAir != nullptr ? kernelAir->maxTotalThreads : 0, entryName != nullptr ? @(entryName) : @"",
+	    [device respondsToSelector:@selector(maxThreadsPerThreadgroup)] ? device.maxThreadsPerThreadgroup.width : 0);
+	if (threads.assertion != nil)
+		RgfxMetalAssertionFailed(threads.assertionFunction, threads.assertion);
+	NSError *refusal = threads.error ?: progressErrorOf(descriptor);
+	if (refusal != nil) {
+		static char site;
+		if (rgfxLogFirst(&site))
+			NSLog(@"RGFX: compute pipeline of %s refused, as Metal refuses it: %@", entryName ?: "",
+			      refusal.localizedDescription);
+		if (error)
+			*error = refusal;
+		return nil;
+	}
 	RgfxComputePipelineParams p = {};
 	p.function.library = rf.rgfxLibraryObjId;
 	p.function.entry_point = [rf rgfxEntryPointUTF8] ? [rf rgfxEntryPointUTF8] : "";
@@ -418,6 +603,7 @@ bool pipelineLibraries(MTLComputePipelineDescriptor *descriptor, RgfxFunction *k
 	                                         serializer:serializer];
 	[state rgfxTakeDescriptor:descriptor flags:p.flags];
 	if (state != nil) {
+		state->_requiredThreads = threads.maxTotalThreads;
 		state->_air = [rf rgfxAirFunction];
 		state->_libraries = [heldLibraries copy];
 		if (post.deferred) {
@@ -456,8 +642,13 @@ bool pipelineLibraries(MTLComputePipelineDescriptor *descriptor, RgfxFunction *k
 	// Both are newer than some guests' Metal (macOS 26 and 27): absent, Metal's defaults stand.
 	if ([descriptor respondsToSelector:@selector(requiredThreadsPerThreadgroup)])
 		_requiredThreadsPerThreadgroup = descriptor.requiredThreadsPerThreadgroup;
-	if ([descriptor respondsToSelector:@selector(forwardProgressUsage)])
+	// Automatic (0) is answered Weak (1), as the M3 Max under macOS 27.0.1 answers it, made from a
+	// function alone too (oracle_threads' plain-fn and -fp steps).
+	if ([descriptor respondsToSelector:@selector(forwardProgressUsage)]) {
 		_forwardProgressUsage = static_cast<NSInteger>(descriptor.forwardProgressUsage);
+		if (_forwardProgressUsage == 0)
+			_forwardProgressUsage = 1;
+	}
 	// How the pipeline's texture writes round floats, which Metal's descriptor keeps (0, its
 	// default, where the guest's Metal has no such member) and its pipeline answers. The host
 	// rounds as its default.
@@ -545,6 +736,9 @@ bool pipelineLibraries(MTLComputePipelineDescriptor *descriptor, RgfxFunction *k
 
 - (NSUInteger)maxTotalThreadsPerThreadgroup
 {
+	// A required size's threads, as Metal's pipelines of one answer (RgfxComputeThreadsVerdictOf).
+	if (_requiredThreads != 0)
+		return _requiredThreads;
 	if (_haveReflection) {
 		return static_cast<NSUInteger>(_reflection.max_total_threads_per_threadgroup);
 	}

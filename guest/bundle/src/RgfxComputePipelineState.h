@@ -31,6 +31,49 @@ class RgfxKnownPipelines;
 
 NS_ASSUME_NONNULL_BEGIN
 
+/// Whose words and order a compute pipeline's threadgroup fields are checked in
+/// (RgfxComputeThreadsVerdictOf): the x86 Macs' (the AMD Radeon Pro 5300M's, where the Intel UHD
+/// Graphics 630's differ), which the x86-64 guest's device answers, or Apple silicon's (the M3
+/// Max's), which the arm64 guest's does.
+typedef NS_ENUM(NSInteger, RgfxThreadsRules) {
+	RgfxThreadsRulesX86,
+	RgfxThreadsRulesApple,
+};
+
+/// The rules of this build's guest: Apple silicon's in an arm64 guest, else the x86 Macs'.
+static inline RgfxThreadsRules RgfxGuestThreadsRules(void)
+{
+#if defined(__arm64__)
+	return RgfxThreadsRulesApple;
+#else
+	return RgfxThreadsRulesX86;
+#endif
+}
+
+/// What Metal makes of a compute pipeline's threadgroup fields: the process ended at a failed
+/// assertion of its validation (`assertion` its words, from `assertionFunction`), the pipeline
+/// refused (`error`), or made (both nil), then of `maxTotalThreads` threads per threadgroup where its
+/// required size sets them, 0 where the made pipeline answers the device's own limit.
+@interface RgfxThreadsVerdict : NSObject
+@property(nonatomic, readonly, nullable) NSString *assertion;
+@property(nonatomic, readonly, nullable) const char *assertionFunction;
+@property(nonatomic, readonly, nullable) NSError *error;
+@property(nonatomic, readonly) NSUInteger maxTotalThreads;
+@end
+
+/// The verdict on a compute pipeline of the kernel `kernelName`, whose
+/// [[max_total_threads_per_threadgroup(n)]] is `kernelMax` (0: none, or not read), made with
+/// `required` threads per threadgroup ({0, 0, 0}: none) and `maxTotal` (0: none), on a device of
+/// `deviceLimit` threads per threadgroup (0: not known), as `rules`' Metal answers it
+/// (RgfxComputePipelineState.mm).
+RgfxThreadsVerdict *RgfxComputeThreadsVerdictOf(RgfxThreadsRules rules, MTLSize required, NSUInteger maxTotal,
+                                                NSUInteger kernelMax, NSString *kernelName, NSUInteger deviceLimit);
+
+/// Metal's refusal of a compute pipeline of macOS 27's `forwardProgressUsage` `progress` and
+/// `contentionRelief` `relief` (`hasProgress`, `hasRelief` where the descriptor has them), nil
+/// where it makes it (RgfxComputePipelineState.mm).
+NSError *_Nullable RgfxComputeProgressError(BOOL hasProgress, NSInteger progress, BOOL hasRelief, NSInteger relief);
+
 @interface RgfxComputePipelineState : RgfxResource <MTLComputePipelineState>
 
 /// Creates a compute pipeline state from the compute `function`, serialising an

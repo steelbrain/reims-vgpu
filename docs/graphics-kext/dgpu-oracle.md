@@ -11,8 +11,8 @@ The probes are in `guest/bundle/tools/oracle` ([README](../../guest/bundle/tools
 `oracle_iosurface`, `oracle_storage`, `oracle_passes`, `oracle_cmdbuf`, `oracle_caps`,
 `oracle_errors`, `oracle_source`, `oracle_ycbcr`, `oracle_ca_ycbcr`, `oracle_sampler`,
 `oracle_icb`, `oracle_order`, `oracle_names`, `oracle_surftex`, `oracle_reflection`,
-`oracle_mesh`, `oracle_events`, `oracle_texdesc`, `oracle_nilbind`, `oracle_complete` and
-`oracle_residency`; the upload costs (Q17) are `guest/bundle/tools/upload_probe.m`'s.
+`oracle_mesh`, `oracle_events`, `oracle_texdesc`, `oracle_nilbind`, `oracle_complete`,
+`oracle_residency` and `oracle_threads`; the upload costs (Q17) are `guest/bundle/tools/upload_probe.m`'s.
 
 **Machines.** Every claim below is measured, on:
 - **AMD**: AMD Radeon Pro 5300M (Navi 14, `amdgpu_gfx1012`, 4 GB; AMDRadeonX6000 on
@@ -1702,6 +1702,36 @@ holds a plain buffer once more, and the queue holds a set once, however often it
 a nil allocation ends the process with SIGABRT and a log line, not SIGSEGV. A first run
 (m3-max-21874) showed a commit keeping the allocations it dropped alive until the caller's pool
 drained, as it listed them in an autoreleased array; the set now lets them go at the commit.
+
+## Q32: compute pipelines' threadgroup fields
+
+Probe: `oracle_threads DEVICE`, 11-12 (m3-max-22216 on the AMD, 22217 on the Intel, 22214 on the
+M3; the same with `MTL_DEBUG_LAYER=1` answers the same), each step a first compile of a salted
+kernel in a child process: `plain`, `max64` of `[[max_total_threads_per_threadgroup(64)]]` and
+`max256`, made of required sizes (`requiredThreadsPerThreadgroup`) and descriptor maxima
+(`maxTotalThreadsPerThreadgroup`) within, at and past the kernel's and the device's 1024, through
+the synchronous creators, the completion handlers and with reflection.
+
+| asked | AMD | Intel | M3 |
+|---|---|---|---|
+| a required size with an axis of 0, of more threads than 1024, or more than the descriptor's maximum | ends the process: `validateWithDevice:1530: failed assertion` "Compute Pipeline Descriptor Validation", a line a failed check | as AMD | as AMD, at `validateWithDevice:1623` |
+| a required size of more threads than the kernel's attribute | refused, CompilerError 2, "error: requested required threads per threadgroup W,H,D but 'NAME' expects max threads per threadgroup N" | as AMD | as AMD, AGXMetalG15X_M1 3 |
+| a descriptor maximum other than what the kernel specifies (the required size's threads, else its attribute) | refused, "max_total_threads_per_threadgroup shader attribute(Metadata) value (S) does not match maxThreadsPerThreadgroup pipeline descriptor value (M)" | refused, "[[max_total_threads_per_threadgroup]] declared in Metal doesn't match [MTLComputePipelineDescriptor maxTotalThreadsPerThreadgroup]" | refused, ": Kernel specified max total threads per threadgroup (S) must match compute pipeline specified max total threads per threadgroup (M)" |
+| a descriptor maximum past 1024 | refused before the kernel's check, "maxThreadsPerThreadgroup pipeline descriptor value (M) exceeds maximum supported (1024)" | made | refused after the kernel's check, ": Specified total max threads per threadgroup (M) exceeds the maximum total threads per threadgroup supported (1024)" |
+| a pipeline made of a required size | answers its threads as `maxTotalThreadsPerThreadgroup` | answers 1024 (448 for one thread) | as AMD |
+| the kernel compiled once before, then a required size past its attribute | made, answering the attribute | made, answering 1024 | as AMD |
+| `forwardProgressUsage` 0, 1, 2; `contentionRelief` 0, 1; `optimizeForPersistentKernel` | no such fields (macOS 26) | as AMD | made; Automatic (0) answers Weak (1), as a pipeline of a function alone does |
+| `forwardProgressUsage` 3 or -1; `contentionRelief` 2 or 3 | none | none | refused, AGXMetalG15X_M1 2, "Compilation failed due to an interrupted connection: XPC_ERROR_CONNECTION_INTERRUPTED. This error occurred after multiple retries." |
+
+The assertions agree *(class 3)*; the refusals' words and order differ *(class 2)*.
+
+What our stack does: the bundle checks the fields before it posts the create
+(`RgfxComputeThreadsVerdictOf`, `RgfxComputeProgressError`), against the kernel's attribute, which
+its AIR reader reads (`air.max_work_group_size`), and answers each case as above, the x86 guest as
+the AMD GPU and the arm64 guest as the M3, the host sent none of it. A kernel compiled before is
+refused all the same, as a first compile is and as the runtime refuses it. A pipeline of a required
+size answers its threads as its maximum, and the arm64 guest's pipelines answer
+`forwardProgressUsage` Automatic as Weak.
 
 ## Not measured
 

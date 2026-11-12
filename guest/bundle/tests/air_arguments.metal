@@ -184,6 +184,9 @@ kernel void reads_stage_in(Attributes in [[stage_in]], device float4 *out [[buff
 		w.write(in.position, uint2(g, 0));
 }
 
+// Its [[max_total_threads_per_threadgroup(32)]] is its entry point's node's, after its arguments'
+// node: read whether or not they read.
+[[max_total_threads_per_threadgroup(32)]]
 kernel void calls_through_table(device float *out [[buffer(0)]],
                                 visible_function_table<float(float)> table [[buffer(1)]],
                                 instance_acceleration_structure scene [[buffer(2)]],

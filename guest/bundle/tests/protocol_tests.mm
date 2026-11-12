@@ -1596,7 +1596,9 @@ void test_pipeline_state_members()
 	CHECK(cs.supportIndirectCommandBuffers == YES);
 	MTLSize req = cs.requiredThreadsPerThreadgroup;
 	CHECK(req.width == 8 && req.height == 4 && req.depth == 1);
-	CHECK(cs.forwardProgressUsage == MTLForwardProgressUsageAutomatic);
+	CHECK(cs.maxTotalThreadsPerThreadgroup == 32); // the required size's threads, as Metal answers
+	// Automatic answers Weak, as the M3 Max under macOS 27.0.1 answers it (oracle_threads).
+	CHECK(cs.forwardProgressUsage == MTLForwardProgressUsageWeak);
 	CHECK(cs.shaderValidation == MTLShaderValidationDisabled);
 	CHECK(cs.reflection == nil);
 	CHECK(cs.allocatedSize == 0);

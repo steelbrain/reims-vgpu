@@ -114,6 +114,10 @@ struct RgfxAirFunction {
 	std::vector<RgfxAirArgument> arguments;
 	std::vector<RgfxAirConstant> constants;
 	bool constantsRead = false;
+	// A kernel's `[[max_total_threads_per_threadgroup(n)]]`: n, which its entry point's node states
+	// in a node of its own after its arguments' (`air.max_work_group_size` and n), read whether or
+	// not its arguments read; 0 where it states none, or one not of that form.
+	uint32_t maxTotalThreads = 0;
 };
 
 // The entry points of the AIR module at `bitcode` (raw bitcode, or in LLVM's wrapper header),

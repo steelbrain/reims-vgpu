@@ -2147,6 +2147,30 @@ static int dies_case(const char *name)
 		rgfxEndAtInvalidSurfaceTexture(descriptorOf(c), surface, c.plane);
 		CFRelease(surface);
 	}
+	// test_compute_threadgroup_fields_end_the_process: a compute pipeline of a required size with
+	// an axis of 0, or of 64 threads over a maxTotalThreadsPerThreadgroup of 32.
+	if (std::strncmp(name, "compute-required-", 17) == 0) {
+		const uint8_t libBytes[] = {9, 9, 9};
+		uint32_t libStatus = 0;
+		RgfxLibrary *lib = [RgfxLibrary libraryWithData:libBytes
+		                                        length:sizeof(libBytes)
+		                                           key:nullptr
+		                                        device:nil
+		                                    serializer:&fx.ser
+		                                        status:&libStatus];
+		MTLComputePipelineDescriptor *d = [[MTLComputePipelineDescriptor alloc] init];
+		d.computeFunction = [lib newFunctionWithName:@"kmain"];
+		if (std::strcmp(name, "compute-required-0x1x1") == 0) {
+			d.requiredThreadsPerThreadgroup = MTLSizeMake(0, 1, 1);
+		} else {
+			d.requiredThreadsPerThreadgroup = MTLSizeMake(64, 1, 1);
+			d.maxTotalThreadsPerThreadgroup = 32;
+		}
+		(void)[RgfxComputePipelineState computePipelineStateWithDescriptor:d
+		                                                           device:nil
+		                                                       serializer:&fx.ser
+		                                                            error:nil];
+	}
 	if (std::strncmp(name, "texdesc-", 8) == 0) {
 		for (const DescriptorCase &c : kDescriptorCases)
 			if (std::strcmp(name + 8, c.name) == 0)
@@ -3863,6 +3887,366 @@ void test_invalid_mesh_descriptors_end_the_process()
 	                          .c_str());
 	checkDies("mesh-no-mesh", (kWhere + "meshFunction must not be nil.\n'").c_str());
 	checkDies("mesh-no-fragment", (kWhere + "fragmentFunction must not be nil.\n'").c_str());
+}
+
+// What oracle_threads' steps answered, each a first compile of its kernel on a device of 1024
+// threads a threadgroup: `plain`, `max64` of [[max_total_threads_per_threadgroup(64)]] and `max256`,
+// with the required size and maxTotalThreadsPerThreadgroup its name gives (none where it names none):
+// the 5300M's under macOS 26.7.1, the x86 guest's rules, and the M3 Max's under macOS 27.0.1, the
+// arm64 guest's (RgfxComputeThreadsVerdictOf). A pipeline made answers the required size's threads.
+enum ThreadsAnswerKind { kThreadsMade, kThreadsRefused, kThreadsDies };
+struct ThreadsAnswer {
+	ThreadsAnswerKind kind;
+	NSUInteger threads; // made: its maxTotalThreadsPerThreadgroup, 0 where none is required
+	const char *words;  // refused: the error's description; dies: the failed assertion's message
+};
+struct ThreadsCase {
+	const char *step;
+	NSUInteger kernelMax;
+	MTLSize required;
+	NSUInteger maxTotal;
+	ThreadsAnswer x86, apple;
+};
+static const ThreadsCase kThreadsCases[] = {
+	{"plain", 0, {0, 0, 0}, 0,
+	 {kThreadsMade, 0, nullptr},
+	 {kThreadsMade, 0, nullptr}},
+	{"max64", 64, {0, 0, 0}, 0,
+	 {kThreadsMade, 0, nullptr},
+	 {kThreadsMade, 0, nullptr}},
+	{"max256", 256, {0, 0, 0}, 0,
+	 {kThreadsMade, 0, nullptr},
+	 {kThreadsMade, 0, nullptr}},
+	{"plain-mt32", 0, {0, 0, 0}, 32,
+	 {kThreadsMade, 0, nullptr},
+	 {kThreadsMade, 0, nullptr}},
+	{"plain-mt96", 0, {0, 0, 0}, 96,
+	 {kThreadsMade, 0, nullptr},
+	 {kThreadsMade, 0, nullptr}},
+	{"plain-mt1024", 0, {0, 0, 0}, 1024,
+	 {kThreadsMade, 0, nullptr},
+	 {kThreadsMade, 0, nullptr}},
+	{"plain-mt1025", 0, {0, 0, 0}, 1025,
+	 {kThreadsRefused, 0, "maxThreadsPerThreadgroup pipeline descriptor value (1025) exceeds maximum supported "
+	   "(1024)\n"},
+	 {kThreadsRefused, 0, ": Specified total max threads per threadgroup (1025) exceeds the maximum total threads "
+	   "per threadgroup supported (1024)"}},
+	{"plain-mt2048", 0, {0, 0, 0}, 2048,
+	 {kThreadsRefused, 0, "maxThreadsPerThreadgroup pipeline descriptor value (2048) exceeds maximum supported "
+	   "(1024)\n"},
+	 {kThreadsRefused, 0, ": Specified total max threads per threadgroup (2048) exceeds the maximum total threads "
+	   "per threadgroup supported (1024)"}},
+	{"max64-mt32", 64, {0, 0, 0}, 32,
+	 {kThreadsRefused, 0, "max_total_threads_per_threadgroup shader attribute(Metadata) value (64) does not match "
+	   "maxThreadsPerThreadgroup pipeline descriptor value (32)\n"},
+	 {kThreadsRefused, 0, ": Kernel specified max total threads per threadgroup (64) must match compute pipeline "
+	   "specified max total threads per threadgroup (32)"}},
+	{"max64-mt64", 64, {0, 0, 0}, 64,
+	 {kThreadsMade, 0, nullptr},
+	 {kThreadsMade, 0, nullptr}},
+	{"max64-mt128", 64, {0, 0, 0}, 128,
+	 {kThreadsRefused, 0, "max_total_threads_per_threadgroup shader attribute(Metadata) value (64) does not match "
+	   "maxThreadsPerThreadgroup pipeline descriptor value (128)\n"},
+	 {kThreadsRefused, 0, ": Kernel specified max total threads per threadgroup (64) must match compute pipeline "
+	   "specified max total threads per threadgroup (128)"}},
+	{"max64-mt1024", 64, {0, 0, 0}, 1024,
+	 {kThreadsRefused, 0, "max_total_threads_per_threadgroup shader attribute(Metadata) value (64) does not match "
+	   "maxThreadsPerThreadgroup pipeline descriptor value (1024)\n"},
+	 {kThreadsRefused, 0, ": Kernel specified max total threads per threadgroup (64) must match compute pipeline "
+	   "specified max total threads per threadgroup (1024)"}},
+	{"max64-mt2048", 64, {0, 0, 0}, 2048,
+	 {kThreadsRefused, 0, "maxThreadsPerThreadgroup pipeline descriptor value (2048) exceeds maximum supported "
+	   "(1024)\n"},
+	 {kThreadsRefused, 0, ": Kernel specified max total threads per threadgroup (64) must match compute pipeline "
+	   "specified max total threads per threadgroup (2048)"}},
+	{"plain-req1x1x1", 0, {1, 1, 1}, 0,
+	 {kThreadsMade, 1, nullptr},
+	 {kThreadsMade, 1, nullptr}},
+	{"plain-req7x3x1", 0, {7, 3, 1}, 0,
+	 {kThreadsMade, 21, nullptr},
+	 {kThreadsMade, 21, nullptr}},
+	{"plain-req8x8x2", 0, {8, 8, 2}, 0,
+	 {kThreadsMade, 128, nullptr},
+	 {kThreadsMade, 128, nullptr}},
+	{"plain-req1x1x64", 0, {1, 1, 64}, 0,
+	 {kThreadsMade, 64, nullptr},
+	 {kThreadsMade, 64, nullptr}},
+	{"plain-req32x32x1", 0, {32, 32, 1}, 0,
+	 {kThreadsMade, 1024, nullptr},
+	 {kThreadsMade, 1024, nullptr}},
+	{"plain-req33x32x1", 0, {33, 32, 1}, 0,
+	 {kThreadsDies, 0, "Compute Pipeline Descriptor Validation\n"
+	   "(requiredThreadsPerThreadgroup.width(33) * requiredThreadsPerThreadgroup.height(32) * "
+	   "requiredThreadsPerThreadgroup.depth(1))(1056) must be <= 1024 (device limit)\n"},
+	 {kThreadsDies, 0, "Compute Pipeline Descriptor Validation\n"
+	   "(requiredThreadsPerThreadgroup.width(33) * requiredThreadsPerThreadgroup.height(32) * "
+	   "requiredThreadsPerThreadgroup.depth(1))(1056) must be <= 1024 (device limit)\n"}},
+	{"plain-req64x32x1", 0, {64, 32, 1}, 0,
+	 {kThreadsDies, 0, "Compute Pipeline Descriptor Validation\n"
+	   "(requiredThreadsPerThreadgroup.width(64) * requiredThreadsPerThreadgroup.height(32) * "
+	   "requiredThreadsPerThreadgroup.depth(1))(2048) must be <= 1024 (device limit)\n"},
+	 {kThreadsDies, 0, "Compute Pipeline Descriptor Validation\n"
+	   "(requiredThreadsPerThreadgroup.width(64) * requiredThreadsPerThreadgroup.height(32) * "
+	   "requiredThreadsPerThreadgroup.depth(1))(2048) must be <= 1024 (device limit)\n"}},
+	{"plain-req0x1x1", 0, {0, 1, 1}, 0,
+	 {kThreadsDies, 0, "Compute Pipeline Descriptor Validation\n"
+	   "(requiredThreadsPerThreadgroup.width(0) * requiredThreadsPerThreadgroup.height(1) * "
+	   "requiredThreadsPerThreadgroup.depth(1))(0) must not be 0.\n"},
+	 {kThreadsDies, 0, "Compute Pipeline Descriptor Validation\n"
+	   "(requiredThreadsPerThreadgroup.width(0) * requiredThreadsPerThreadgroup.height(1) * "
+	   "requiredThreadsPerThreadgroup.depth(1))(0) must not be 0.\n"}},
+	{"plain-req8x0x1", 0, {8, 0, 1}, 0,
+	 {kThreadsDies, 0, "Compute Pipeline Descriptor Validation\n"
+	   "(requiredThreadsPerThreadgroup.width(8) * requiredThreadsPerThreadgroup.height(0) * "
+	   "requiredThreadsPerThreadgroup.depth(1))(0) must not be 0.\n"},
+	 {kThreadsDies, 0, "Compute Pipeline Descriptor Validation\n"
+	   "(requiredThreadsPerThreadgroup.width(8) * requiredThreadsPerThreadgroup.height(0) * "
+	   "requiredThreadsPerThreadgroup.depth(1))(0) must not be 0.\n"}},
+	{"plain-req0x0x0", 0, {0, 0, 0}, 0,
+	 {kThreadsMade, 0, nullptr},
+	 {kThreadsMade, 0, nullptr}},
+	{"max64-req32x1x1", 64, {32, 1, 1}, 0,
+	 {kThreadsMade, 32, nullptr},
+	 {kThreadsMade, 32, nullptr}},
+	{"max64-req64x1x1", 64, {64, 1, 1}, 0,
+	 {kThreadsMade, 64, nullptr},
+	 {kThreadsMade, 64, nullptr}},
+	{"max64-req8x8x1", 64, {8, 8, 1}, 0,
+	 {kThreadsMade, 64, nullptr},
+	 {kThreadsMade, 64, nullptr}},
+	{"max64-req65x1x1", 64, {65, 1, 1}, 0,
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 65,1,1 but 'max64' expects max "
+	   "threads per threadgroup 64\n"},
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 65,1,1 but 'max64' expects max "
+	   "threads per threadgroup 64\n"}},
+	{"max64-req128x1x1", 64, {128, 1, 1}, 0,
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 128,1,1 but 'max64' expects max "
+	   "threads per threadgroup 64\n"},
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 128,1,1 but 'max64' expects max "
+	   "threads per threadgroup 64\n"}},
+	{"max64-req16x8x1", 64, {16, 8, 1}, 0,
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 16,8,1 but 'max64' expects max "
+	   "threads per threadgroup 64\n"},
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 16,8,1 but 'max64' expects max "
+	   "threads per threadgroup 64\n"}},
+	{"max64-req1024x1x1", 64, {1024, 1, 1}, 0,
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 1024,1,1 but 'max64' expects max "
+	   "threads per threadgroup 64\n"},
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 1024,1,1 but 'max64' expects max "
+	   "threads per threadgroup 64\n"}},
+	{"max256-req16x16x1", 256, {16, 16, 1}, 0,
+	 {kThreadsMade, 256, nullptr},
+	 {kThreadsMade, 256, nullptr}},
+	{"max256-req512x1x1", 256, {512, 1, 1}, 0,
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 512,1,1 but 'max256' expects max "
+	   "threads per threadgroup 256\n"},
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 512,1,1 but 'max256' expects max "
+	   "threads per threadgroup 256\n"}},
+	{"plain-req64x1x1-mt32", 0, {64, 1, 1}, 32,
+	 {kThreadsDies, 0, "Compute Pipeline Descriptor Validation\n"
+	   "(requiredThreadsPerThreadgroup.width(64) * requiredThreadsPerThreadgroup.height(1) * "
+	   "requiredThreadsPerThreadgroup.depth(1))(64) must be <= maxTotalThreadsPerThreadgroup "
+	   "(32)\n"},
+	 {kThreadsDies, 0, "Compute Pipeline Descriptor Validation\n"
+	   "(requiredThreadsPerThreadgroup.width(64) * requiredThreadsPerThreadgroup.height(1) * "
+	   "requiredThreadsPerThreadgroup.depth(1))(64) must be <= maxTotalThreadsPerThreadgroup "
+	   "(32)\n"}},
+	{"plain-req64x1x1-mt64", 0, {64, 1, 1}, 64,
+	 {kThreadsMade, 64, nullptr},
+	 {kThreadsMade, 64, nullptr}},
+	{"plain-req64x1x1-mt128", 0, {64, 1, 1}, 128,
+	 {kThreadsRefused, 0, "max_total_threads_per_threadgroup shader attribute(Metadata) value (64) does not match "
+	   "maxThreadsPerThreadgroup pipeline descriptor value (128)\n"},
+	 {kThreadsRefused, 0, ": Kernel specified max total threads per threadgroup (64) must match compute pipeline "
+	   "specified max total threads per threadgroup (128)"}},
+	{"max64-req64x1x1-mt64", 64, {64, 1, 1}, 64,
+	 {kThreadsMade, 64, nullptr},
+	 {kThreadsMade, 64, nullptr}},
+	{"max64-req32x1x1-mt64", 64, {32, 1, 1}, 64,
+	 {kThreadsRefused, 0, "max_total_threads_per_threadgroup shader attribute(Metadata) value (32) does not match "
+	   "maxThreadsPerThreadgroup pipeline descriptor value (64)\n"},
+	 {kThreadsRefused, 0, ": Kernel specified max total threads per threadgroup (32) must match compute pipeline "
+	   "specified max total threads per threadgroup (64)"}},
+	{"max64-req32x1x1-mt32", 64, {32, 1, 1}, 32,
+	 {kThreadsMade, 32, nullptr},
+	 {kThreadsMade, 32, nullptr}},
+	{"max64-req128x1x1-mt128", 64, {128, 1, 1}, 128,
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 128,1,1 but 'max64' expects max "
+	   "threads per threadgroup 64\n"},
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 128,1,1 but 'max64' expects max "
+	   "threads per threadgroup 64\n"}},
+
+};
+
+// Each measured answer of a compute pipeline's threadgroup fields (kThreadsCases), under each
+// guest arch's rules: Metal's assertion, which ends the process at the create, its compiler's
+// refusal, or the pipeline, which answers a required size's threads as its maximum. And macOS 27's
+// forward progress and contention relief fields, which the M3 Max's compiler refuses outside the
+// values Metal names.
+void test_compute_threadgroup_fields_as_metal()
+{
+	for (const ThreadsCase &c : kThreadsCases) {
+		NSString *step = @(c.step);
+		NSString *kernel = [step componentsSeparatedByString:@"-"][0];
+		for (RgfxThreadsRules rules : {RgfxThreadsRulesX86, RgfxThreadsRulesApple}) {
+			const bool x86 = rules == RgfxThreadsRulesX86;
+			const ThreadsAnswer &want = x86 ? c.x86 : c.apple;
+			RgfxThreadsVerdict *v =
+			    RgfxComputeThreadsVerdictOf(rules, c.required, c.maxTotal, c.kernelMax, kernel, 1024);
+			bool ok = false;
+			switch (want.kind) {
+			case kThreadsMade:
+				ok = v.assertion == nil && v.error == nil && v.maxTotalThreads == want.threads;
+				break;
+			case kThreadsRefused:
+				ok = v.assertion == nil && v.error != nil &&
+				     [v.error.domain isEqualToString:x86 ? @"CompilerError" : @"AGXMetalG15X_M1"] &&
+				     v.error.code == (x86 ? 2 : 3) &&
+				     [v.error.localizedDescription isEqualToString:@(want.words)];
+				break;
+			case kThreadsDies:
+				ok = [v.assertion isEqualToString:@(want.words)] && v.error == nil &&
+				     std::strcmp(v.assertionFunction,
+				                 x86 ? "validateWithDevice:1530" : "validateWithDevice:1623") == 0;
+				break;
+			}
+			if (!ok)
+				std::fprintf(stderr, "%s (%s rules): assertion %s, error %s, threads %lu\n", c.step,
+				             x86 ? "x86" : "Apple", v.assertion.UTF8String ?: "none",
+				             v.error.localizedDescription.UTF8String ?: "none",
+				             static_cast<unsigned long>(v.maxTotalThreads));
+			CHECK(ok);
+		}
+	}
+	// A device limit it does not know (0) is not checked.
+	RgfxThreadsVerdict *unknown = RgfxComputeThreadsVerdictOf(RgfxThreadsRulesApple, MTLSizeMake(64, 32, 1),
+	                                                          0, 0, @"plain", 0);
+	CHECK(unknown.assertion == nil && unknown.error == nil && unknown.maxTotalThreads == 2048);
+
+	// Forward progress usage (Automatic 0, Weak 1, SIMDGroupParallel 2) and contention relief
+	// (Automatic 0, None 1), where the guest's Metal has them (oracle_threads' -fp and -cr steps).
+	CHECK(RgfxComputeProgressError(NO, 3, NO, 2) == nil);
+	for (NSInteger fp : {0, 1, 2})
+		CHECK(RgfxComputeProgressError(YES, fp, YES, 0) == nil);
+	for (NSInteger cr : {0, 1})
+		CHECK(RgfxComputeProgressError(YES, 0, YES, cr) == nil);
+	const std::pair<NSInteger, NSInteger> refused[] = {{3, 0}, {-1, 0}, {0, 2}, {0, 3}};
+	for (const auto &[fp, cr] : refused) {
+		NSError *e = RgfxComputeProgressError(YES, fp, YES, cr);
+		CHECK(e != nil && [e.domain isEqualToString:@"AGXMetalG15X_M1"] && e.code == 2);
+		CHECK([e.localizedDescription
+		    isEqualToString:@"Compilation failed due to an interrupted connection: "
+		                    @"XPC_ERROR_CONNECTION_INTERRUPTED. This error occurred after multiple retries."]);
+	}
+}
+
+// A compute pipeline's threadgroup fields end the process with Metal's words where its validation
+// ends it (kThreadsCases), checked before the create posts: a required size with an axis of 0, and
+// one of more threads than maxTotalThreadsPerThreadgroup, in this Mac's arch's words.
+void test_compute_threadgroup_fields_end_the_process()
+{
+	const std::string kWhere =
+	    std::string(RgfxGuestThreadsRules() == RgfxThreadsRulesApple ? "validateWithDevice:1623"
+	                                                                 : "validateWithDevice:1530") +
+	    ": failed assertion `Compute Pipeline Descriptor Validation\n";
+	checkDies("compute-required-0x1x1",
+	          (kWhere + "(requiredThreadsPerThreadgroup.width(0) * requiredThreadsPerThreadgroup.height(1) * "
+	                    "requiredThreadsPerThreadgroup.depth(1))(0) must not be 0.\n'")
+	              .c_str());
+	checkDies("compute-required-64-max-32",
+	          (kWhere + "(requiredThreadsPerThreadgroup.width(64) * requiredThreadsPerThreadgroup.height(1) * "
+	                    "requiredThreadsPerThreadgroup.depth(1))(64) must be <= maxTotalThreadsPerThreadgroup "
+	                    "(32)\n'")
+	              .c_str());
+}
+
+// Over a kernel's own [[max_total_threads_per_threadgroup(32)]] (tests/air_arguments.metal's
+// calls_through_table, read from its AIR): a required size past it, and a
+// maxTotalThreadsPerThreadgroup other than it, are refused before the create posts, in this Mac's
+// arch's words (kThreadsCases); a required size within it makes a pipeline that answers its threads
+// before the host's answer. Its forward progress usage of Automatic answers Weak, and one Metal
+// does not name is refused (where this Mac's Metal has the field).
+void test_compute_threadgroup_fields_over_air()
+{
+	Fixture fx(0x40000); // the library's bytes fit
+	const char *path = getenv("RGFX_AIR_ARGUMENTS");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	uint32_t status = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.bytes
+	                                         length:bytes.length
+	                                            key:nullptr
+	                                         device:nil
+	                                     serializer:&fx.ser
+	                                         status:&status];
+	CHECK(lib != nil);
+	[lib rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		     (void)bytes;
+	     })
+	       shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+		       return nil;
+	       }];
+	drainRing(fx.ring);
+	RgfxFunction *kernel = (RgfxFunction *)[lib newFunctionWithName:@"calls_through_table"];
+	CHECK([kernel rgfxAirFunction] != nullptr && [kernel rgfxAirFunction]->maxTotalThreads == 32);
+	const bool apple = RgfxGuestThreadsRules() == RgfxThreadsRulesApple;
+	MTLComputePipelineDescriptor *d = [[MTLComputePipelineDescriptor alloc] init];
+	d.computeFunction = kernel;
+	NSError *err = nil;
+	auto create = [&] {
+		err = nil;
+		return [RgfxComputePipelineState computePipelineStateWithDescriptor:d
+		                                                             device:nil
+		                                                         serializer:&fx.ser
+		                                                              error:&err];
+	};
+	auto refusedWith = [&](NSString *words) {
+		return err != nil && [err.domain isEqualToString:apple ? @"AGXMetalG15X_M1" : @"CompilerError"] &&
+		       err.code == (apple ? 3 : 2) && [err.localizedDescription isEqualToString:words];
+	};
+	d.requiredThreadsPerThreadgroup = MTLSizeMake(64, 1, 1);
+	CHECK(create() == nil);
+	CHECK(refusedWith(@"error: requested required threads per threadgroup 64,1,1 but 'calls_through_table' "
+	                  @"expects max threads per threadgroup 32\n"));
+	d.requiredThreadsPerThreadgroup = MTLSizeMake(0, 0, 0);
+	d.maxTotalThreadsPerThreadgroup = 64;
+	CHECK(create() == nil);
+	CHECK(refusedWith(apple ? @": Kernel specified max total threads per threadgroup (32) must match compute "
+	                          @"pipeline specified max total threads per threadgroup (64)"
+	                        : @"max_total_threads_per_threadgroup shader attribute(Metadata) value (32) does not "
+	                          @"match maxThreadsPerThreadgroup pipeline descriptor value (64)\n"));
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> none;
+	CHECK(!fx.ring.next(&h, &none)); // neither posted
+
+	d.maxTotalThreadsPerThreadgroup = 0;
+	d.requiredThreadsPerThreadgroup = MTLSizeMake(8, 2, 1);
+	RgfxComputePipelineState *cs = create();
+	CHECK(cs != nil && err == nil);
+	(void)nextMessage(fx.ring, RGFX_CMD_COMPUTE_PIPELINE_CREATE);
+	CHECK(cs.maxTotalThreadsPerThreadgroup == 16);
+	CHECK(sizeIs(cs.requiredThreadsPerThreadgroup, 8, 2, 1));
+
+	if (![d respondsToSelector:@selector(forwardProgressUsage)])
+		return;
+	CHECK(cs.forwardProgressUsage == MTLForwardProgressUsageWeak); // of Automatic
+	d.requiredThreadsPerThreadgroup = MTLSizeMake(0, 0, 0);
+	d.forwardProgressUsage = MTLForwardProgressUsageSIMDGroupParallel;
+	cs = create();
+	CHECK(cs != nil && cs.forwardProgressUsage == MTLForwardProgressUsageSIMDGroupParallel);
+	(void)nextMessage(fx.ring, RGFX_CMD_COMPUTE_PIPELINE_CREATE);
+	d.forwardProgressUsage = static_cast<MTLForwardProgressUsage>(3);
+	CHECK(create() == nil);
+	CHECK(err != nil && [err.domain isEqualToString:@"AGXMetalG15X_M1"] && err.code == 2);
+	d.forwardProgressUsage = MTLForwardProgressUsageAutomatic;
+	d.contentionRelief = static_cast<MTLContentionRelief>(2);
+	CHECK(create() == nil);
+	CHECK(err != nil && [err.domain isEqualToString:@"AGXMetalG15X_M1"] && err.code == 2);
+	// Neither posted a create (a state let go above posts its destroy).
+	while (fx.ring.next(&h, &none))
+		CHECK(h.type != RGFX_CMD_COMPUTE_PIPELINE_CREATE);
 }
 
 // A compute pipeline create maps the function (and the descriptor knobs) into the
@@ -17915,6 +18299,9 @@ int main(int argc, char **argv)
 		test_mesh_pipeline_routing();
 		test_mesh_pipeline_refusals();
 		test_invalid_mesh_descriptors_end_the_process();
+		test_compute_threadgroup_fields_as_metal();
+		test_compute_threadgroup_fields_end_the_process();
+		test_compute_threadgroup_fields_over_air();
 		test_compute_pipeline_routing();
 		test_metallib_linkage();
 		test_dynamic_library_routing();

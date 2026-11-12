@@ -69,7 +69,7 @@ static bool operator==(const RgfxAirConstant &a, const RgfxAirConstant &b)
 static bool operator==(const RgfxAirFunction &a, const RgfxAirFunction &b)
 {
 	return a.name == b.name && a.stage == b.stage && a.argumentsRead == b.argumentsRead && a.arguments == b.arguments &&
-	       a.constants == b.constants && a.constantsRead == b.constantsRead;
+	       a.constants == b.constants && a.constantsRead == b.constantsRead && a.maxTotalThreads == b.maxTotalThreads;
 }
 
 static bool operator==(const RgfxAirType &a, const RgfxAirType &b)
@@ -914,6 +914,10 @@ int main()
 	expect(patch, RgfxAirKind::Texture, 3, 1, RgfxAirAccess::Sample, "a sampled texture at 3");
 	const RgfxAirFunction table = entry(lib, "calls_through_table");
 	check(table.arguments.size() == 2, "calls_through_table: its buffer and texture alone");
+	// A kernel's [[max_total_threads_per_threadgroup(n)]]: n; 0 for one of none and for any other
+	// stage.
+	check(table.maxTotalThreads == 32, "calls_through_table: [[max_total_threads_per_threadgroup(32)]]");
+	check(stageIn.maxTotalThreads == 0 && patch.maxTotalThreads == 0, "a kernel of no attribute, and a vertex function: 0");
 	expect(table, RgfxAirKind::Buffer, 0, 1, RgfxAirAccess::ReadWrite, "a device buffer at 0");
 	expect(table, RgfxAirKind::Texture, 3, 1, RgfxAirAccess::Write, "access::write at 3");
 
@@ -930,8 +934,8 @@ int main()
 		std::vector<RgfxAirFunction> fns;
 		check(rgfxMetallibBitcode(other.data(), other.size(), "calls_through_table", &bc, &n) &&
 		          rgfxReadAirFunctions(bc, n, fns) && fns.size() == 1 && fns[0].name == "calls_through_table" &&
-		          !fns[0].argumentsRead && fns[0].arguments.empty(),
-		      "calls_through_table, its table's kind unknown: listed, its arguments unread");
+		          !fns[0].argumentsRead && fns[0].arguments.empty() && fns[0].maxTotalThreads == 32,
+		      "calls_through_table, its table's kind unknown: listed, its arguments unread, its attribute read");
 		check(rgfxMetallibBitcode(other.data(), other.size(), "conditional_planes", &bc, &n) &&
 		          rgfxReadAirFunctions(bc, n, fns) && fns.size() == 1 && fns[0].argumentsRead,
 		      "conditional_planes is still read beside it");
