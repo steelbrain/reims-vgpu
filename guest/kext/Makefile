@@ -144,7 +144,7 @@ TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surf
 	$(BUILD)/tests/legacy_overrides_test $(BUILD)/tests/legacy_swap_queue_test \
 	$(BUILD)/tests/mobile_modes_test $(BUILD)/tests/swap_rate_test \
 	$(BUILD)/tests/legacy_swap_info_test $(BUILD)/tests/mobile_color_test \
-	$(BUILD)/tests/mobile_cursor_test
+	$(BUILD)/tests/mobile_cursor_test $(BUILD)/tests/display_power_test
 
 $(BUILD)/tests/%: tests/%.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)

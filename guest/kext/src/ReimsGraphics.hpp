@@ -500,6 +500,9 @@ private:
 	// The host took HOST_TIME: each VBLANK reads the host's clock for the refreshes' times
 	// (vblankClock), set before `ready`.
 	bool hostTime;
+	// The host took DISPLAY_POWER: the work loop tells it the display's panel (panelWanted), set
+	// before `ready`.
+	bool displayPowerTaken;
 	// The sleeps for room (waitForRoom), under stateLock, and the SUBMIT_ROOM records the work
 	// loop took (atomic), for the log line waitForRoom writes at most every kRoomLogMs.
 	RgfxRingRoomStats roomStats;
@@ -551,9 +554,27 @@ private:
 	OSObject *releaseTarget;
 	ReleaseAnswerHook releaseHook;
 
-	// The work loop's alone: what SET_VBLANK last asked, the refreshes' times, and a display
-	// refresh after DISPLAY_CHANGED, waiting to be sent or answered.
+	// The display's panel (RgfxDisplayPower.hpp): on x86-64, the notification of the display
+	// wrangler's publication and the general interest in it the framebuffer registers, under
+	// stateLock; and the panel the framebuffer wants lit, under interruptLock.
+	IONotifier *wranglerNotifier;
+	IONotifier *wranglerInterest;
+	bool panelWanted;
+	// Sets the panel the framebuffer wants lit, and has the work loop tell the host where it
+	// changed: whether it changed.
+	bool wantPanel(bool lit);
+	void startDisplayPower();
+	void stopDisplayPower();
+	static bool wranglerPublished(void *target, void *refCon, IOService *wrangler,
+	                              IONotifier *notifier);
+	static IOReturn wranglerMessage(void *target, void *refCon, UInt32 type, IOService *wrangler,
+	                                void *argument, vm_size_t size);
+
+	// The work loop's alone: what SET_VBLANK last asked, what SET_DISPLAY_POWER last told, the
+	// refreshes' times, and a display refresh after DISPLAY_CHANGED, waiting to be sent or
+	// answered.
 	bool vblankSent;
+	bool panelTold;
 	RgfxVblankClock vblankClock;
 	bool refreshWanted;
 	UInt64 refreshSeqno;

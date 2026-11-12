@@ -6,11 +6,13 @@
 #include "ReimsGraphics.hpp"
 #include "RgfxAccelerator.hpp"
 #include "RgfxBootConsole.hpp"
+#include "RgfxDisplayPower.hpp"
 #include "RgfxFeatures.hpp"
 #include "RgfxPipeColor.hpp"
 #include "RgfxRegionMapping.hpp"
 
 #include <IOKit/IOLib.h>
+#include <IOKit/IOMessage.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOUserClient.h>
 #include <kern/clock.h>
@@ -542,6 +544,112 @@ void ReimsGraphics::kickWorkLoop()
 		kick->interruptOccurred(nullptr, nullptr, 0);
 }
 
+// MARK: - The display's panel
+
+static_assert(kRgfxMessageDeviceWillPowerOff == kIOMessageDeviceWillPowerOff,
+              "RgfxDisplayPower.hpp's WillPowerOff is the kernel's");
+static_assert(kRgfxMessageDeviceHasPoweredOn == kIOMessageDeviceHasPoweredOn,
+              "RgfxDisplayPower.hpp's HasPoweredOn is the kernel's");
+
+// Where the host took DISPLAY_POWER, the x86-64 framebuffer follows the display wrangler's power:
+// its handler registers the framebuffer's general interest in the wrangler once it is published,
+// or at once where it is already. An arm64 guest has none, and the arm64e framebuffer does not
+// take DISPLAY_POWER (RgfxFeatures.hpp).
+void ReimsGraphics::startDisplayPower()
+{
+#if defined(__x86_64__)
+	if (!displayPowerTaken)
+		return;
+	OSDictionary *matching = serviceMatching("IODisplayWrangler");
+	IONotifier *notifier = matching ? addMatchingNotification(gIOFirstPublishNotification, matching,
+	                                                          wranglerPublished, this)
+	                                : nullptr;
+	OSSafeReleaseNULL(matching);
+	if (!notifier) {
+		IOLog("ReimsGraphics: no notification of the display wrangler: the display stays lit "
+		      "through its sleep\n");
+		return;
+	}
+	IOLockLock(stateLock);
+	wranglerNotifier = notifier;
+	IOLockUnlock(stateLock);
+#endif
+}
+
+// Each notifier's remove waits for its handler where one runs: the publication's first, which
+// may register the interest, then the interest's.
+void ReimsGraphics::stopDisplayPower()
+{
+	IOLockLock(stateLock);
+	IONotifier *notifier = wranglerNotifier;
+	wranglerNotifier = nullptr;
+	IOLockUnlock(stateLock);
+	if (notifier)
+		notifier->remove();
+	IOLockLock(stateLock);
+	IONotifier *interest = wranglerInterest;
+	wranglerInterest = nullptr;
+	IOLockUnlock(stateLock);
+	if (interest)
+		interest->remove();
+}
+
+bool ReimsGraphics::wranglerPublished(void *target, void *, IOService *wrangler, IONotifier *)
+{
+	ReimsGraphics *self = static_cast<ReimsGraphics *>(target);
+	IOLockLock(self->stateLock);
+	const bool registered = self->wranglerInterest != nullptr;
+	IOLockUnlock(self->stateLock);
+	if (registered)
+		return true;
+	IONotifier *interest =
+	    wrangler->registerInterest(gIOGeneralInterest, wranglerMessage, self, nullptr);
+	IOLockLock(self->stateLock);
+	if (!self->wranglerInterest) {
+		self->wranglerInterest = interest;
+		interest = nullptr;
+	}
+	IOLockUnlock(self->stateLock);
+	if (interest)
+		interest->remove();
+	IOLog("ReimsGraphics: the display's panel %s the display wrangler's power\n",
+	      self->wranglerInterest ? "follows" : "cannot follow");
+	return true;
+}
+
+// The wrangler's power messages: the panel each leaves (RgfxDisplayPower.hpp), which the work loop
+// tells the host. Every message is answered at once: the framebuffer holds up no power change.
+IOReturn ReimsGraphics::wranglerMessage(void *target, void *, UInt32 type, IOService *,
+                                        void *argument, vm_size_t size)
+{
+	ReimsGraphics *self = static_cast<ReimsGraphics *>(target);
+	const IOPowerStateChangeNotification *change =
+	    argument && size >= sizeof(IOPowerStateChangeNotification)
+	        ? static_cast<const IOPowerStateChangeNotification *>(argument)
+	        : nullptr;
+	const RgfxPanel panel =
+	    rgfxPanelAfter(type, change != nullptr, change ? change->stateNumber : 0);
+	if (panel == RgfxPanel::Unchanged)
+		return kIOReturnSuccess;
+	const bool lit = panel == RgfxPanel::On;
+	if (self->wantPanel(lit))
+		IOLog("ReimsGraphics: the display wrangler goes to power state %lu: the display's panel "
+		      "%s\n",
+		      change->stateNumber, lit ? "lights" : "goes dark");
+	return kIOReturnSuccess;
+}
+
+bool ReimsGraphics::wantPanel(bool lit)
+{
+	IOSimpleLockLock(interruptLock);
+	const bool changed = panelWanted != lit;
+	panelWanted = lit;
+	IOSimpleLockUnlock(interruptLock);
+	if (changed)
+		kickWorkLoop();
+	return changed;
+}
+
 // MARK: - The work loop
 
 void ReimsGraphics::serviceAction(OSObject *owner, IOInterruptEventSource *, int)
@@ -590,6 +698,7 @@ void ReimsGraphics::service()
 	if (displayChange.armed(connect.enabled && connect.proc))
 		late = connect;
 	bool want = vblankWanted || pipes.anyVblank();
+	const bool panel = panelWanted;
 	IOSimpleLockUnlock(interruptLock);
 	if (late.proc)
 		late.proc(late.target, late.ref);
@@ -599,6 +708,13 @@ void ReimsGraphics::service()
 		v.enabled = want ? 1u : 0u;
 		if (tryPost(RGFX_CMD_SET_VBLANK, &v, sizeof(v), nullptr))
 			vblankSent = want;
+	}
+	if (rgfxPanelToSend(displayPowerTaken, panel, panelTold)) {
+		RgfxSetDisplayPower p = {};
+		p.display = displayId;
+		p.on = panel ? 1u : 0u;
+		if (tryPost(RGFX_CMD_SET_DISPLAY_POWER, &p, sizeof(p), nullptr))
+			panelTold = panel;
 	}
 	if (refreshWanted) {
 		UInt64 seqno = 0;
@@ -1190,6 +1306,12 @@ bool ReimsGraphics::start(IOService *provider)
 	displayScaleTaken = false;
 	displayScale = 0;
 	hostTime = false;
+	displayPowerTaken = false;
+	wranglerNotifier = nullptr;
+	wranglerInterest = nullptr;
+	// The device is lit from its reset (design.md, "The display's sleep").
+	panelWanted = true;
+	panelTold = true;
 	roomStats = {};
 	roomRecords = 0;
 #if defined(__x86_64__)
@@ -1317,6 +1439,7 @@ bool ReimsGraphics::start(IOService *provider)
 		displayColorTaken = (took & RGFX_FEATURE_DISPLAY_COLOR) != 0;
 		displayScaleTaken = (took & RGFX_FEATURE_DISPLAY_SCALE) != 0;
 		hostTime = (took & RGFX_FEATURE_HOST_TIME) != 0;
+		displayPowerTaken = (took & RGFX_FEATURE_DISPLAY_POWER) != 0;
 	}
 	produced = load64(ring(RGFX_CONTROL_SUBMIT_OFFSET) + kRingProducer);
 	consumed = load64(ring(RGFX_CONTROL_COMPLETE_OFFSET) + kRingConsumer);
@@ -1426,6 +1549,7 @@ bool ReimsGraphics::start(IOService *provider)
 		goto fail;
 #endif
 
+	startDisplayPower();
 	// The device is ours and its rings are up: contexts may open from here, as the class's start
 	// can register the framebuffer and WindowServer open it before it returns.
 	__atomic_store_n(&started, true, __ATOMIC_RELEASE);
@@ -1433,6 +1557,7 @@ bool ReimsGraphics::start(IOService *provider)
 		return true;
 fail:
 	__atomic_store_n(&started, false, __ATOMIC_RELEASE);
+	stopDisplayPower();
 #if defined(__arm64e__)
 	stopMobile();
 #endif
@@ -1447,6 +1572,7 @@ fail:
 void ReimsGraphics::stop(IOService *provider)
 {
 	__atomic_store_n(&started, false, __ATOMIC_RELEASE);
+	stopDisplayPower();
 #if defined(__arm64e__)
 	stopMobile();
 #endif
@@ -2157,12 +2283,13 @@ IOReturn ReimsGraphics::getDDCBlock(IOIndex connectIndex, UInt32 blockNumber, IO
 
 // MARK: - Power
 
-// The framebuffer stays out of power management, as the stock framebuffer does: it registers
-// no power states, so it and its AppleDisplay stay at power state 0 while the display wrangler
-// idles and wakes. IOFramebuffer then never turns the display's sleep into one of the
-// framebuffer's: WindowServer hears of no display sleep and takes no sleep image, and the
-// scanout goes on showing what it shows. With IOFBDependentID published, IOFramebuffer counts
-// the framebuffer usable from its start without a power driver.
+// The framebuffer stays out of power management, as the stock framebuffer does: it registers no
+// power states, so it and its AppleDisplay stay at power state 0 while the display wrangler idles
+// and wakes. IOFramebuffer then never turns the display's sleep into one of the framebuffer's:
+// WindowServer hears of no display sleep and takes no sleep image, and goes on presenting. The
+// framebuffer hears of the display's sleep from the wrangler's own power messages instead, and the
+// host's panel goes dark with it ("The display's panel", above). With IOFBDependentID published,
+// IOFramebuffer counts the framebuffer usable from its start without a power driver.
 
 // MARK: - IOFramebuffer: the hardware cursor
 

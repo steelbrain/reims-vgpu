@@ -97,7 +97,11 @@
 //    of the bundle;
 //  - TEXTURE_DID_MODIFY_DATA (bit 36): the bundle tells the host a texture's didModifyData
 //    (RGFX_CMD_TEXTURE_DID_MODIFY_DATA), whose message the kext admits as it does a Managed
-//    range's (RgfxSubmitGate.hpp), so a mipmapped texture over a buffer takes the bytes again.
+//    range's (RgfxSubmitGate.hpp), so a mipmapped texture over a buffer takes the bytes again;
+//  - DISPLAY_POWER (bit 37), the x86-64 kext alone: the framebuffer tells the host, with
+//    SET_DISPLAY_POWER, as the display's panel goes dark at the display's sleep and lights at its
+//    wake, from the display wrangler's power messages (RgfxDisplayPower.hpp), which needs nothing
+//    of the bundle; an arm64 guest has no display wrangler.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -135,7 +139,7 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_SURFACE_DEFERRED_ASK | RGFX_FEATURE_SURFACE_DEFERRED_CARRY |
     RGFX_FEATURE_SCHEDULED_ASK | RGFX_FEATURE_DISPLAY_SCALE |
     RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA |
-    (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K : 0);
+    (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K : RGFX_FEATURE_DISPLAY_POWER);
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
 inline uint64_t rgfxDriverFeatures(uint64_t offered)
