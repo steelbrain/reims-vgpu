@@ -77,8 +77,8 @@ static const MTLFunctionType kRgfxFunctionTypeExtern = (MTLFunctionType)4;
 #ifdef __cplusplus
 /// The entry point `name`'s nodes whole, with its module's function constants (rgfxReadAirEntries;
 /// `entries` then holds that one entry), read once from the bitcode the library's bytes hold for
-/// it: null where the library kept no bytes (one Metal's link or stitching made), or they do not
-/// read. A pipeline's reflection is made from it.
+/// it: null where the library kept no bytes (one Metal's link or stitching made), or its module or
+/// a node of the entry point does not read. A pipeline's reflection is made from it.
 - (std::shared_ptr<const RgfxAirEntries>)rgfxAirEntryNamed:(const std::string &)name;
 #endif
 

@@ -4,7 +4,10 @@
 // them, those under function constants among them; which texture bindings each may write; no
 // answer for an entry point with a binding of a kind the reader does not know, beside the answers
 // of the others of its module, over the compiler's module of every entry point of the same source
-// (RGFX_AIR_MODULE, its .air); each stitchable function's signature,
+// (RGFX_AIR_MODULE, its .air), and the same of every node whole, an entry point of a node the reader
+// does not follow listed beside the others; each reader's answer its own for each entry point,
+// visible function and function constant of a module written here of malformed nodes beside
+// well-formed ones; each stitchable function's signature,
 // type by type, and an unknown one where it has a type the reader does not know; each module's
 // function constants, as its function's CNST tag lists them; the same over the .metallib built
 // from tests/air_arguments_old.metal for macOS 10.12 (RGFX_AIR_ARGUMENTS_OLD); each buffer's
@@ -27,6 +30,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -121,8 +125,9 @@ static bool operator==(const RgfxAirNode &a, const RgfxAirNode &b)
 
 static bool operator==(const RgfxAirEntry &a, const RgfxAirEntry &b)
 {
-	return a.name == b.name && a.function == b.function && a.stage == b.stage && a.outputs == b.outputs &&
-	       a.arguments == b.arguments;
+	return a.name == b.name && a.function == b.function && a.stage == b.stage && a.nodesRead == b.nodesRead &&
+	       a.outputs == b.outputs && a.arguments == b.arguments && a.hasWorkGroupSize == b.hasWorkGroupSize &&
+	       std::equal(a.workGroupSize, a.workGroupSize + 3, b.workGroupSize);
 }
 
 // Two modules' code, which is opaque, compared by what it answers: each entry point's
@@ -424,6 +429,312 @@ void expect(const RgfxAirFunction &fn, RgfxAirKind kind, uint32_t index, uint32_
 	const RgfxAirArgument *a = at(fn, kind, index);
 	check(a != nullptr && a->count == count && a->access == access, fn.name + ": " + what);
 }
+
+// LLVM's bitstream (its documented container), written: unabbreviated records only, each block's
+// abbreviations 4 bits wide.
+class Bitstream {
+public:
+	Bitstream() : bytes_{'B', 'C', 0xC0, 0xDE}, bit_(32) {}
+	void enter(unsigned block)
+	{
+		put(1, width_); // ENTER_SUBBLOCK
+		vbr(block, 8);
+		vbr(4, 4);
+		align();
+		open_.push_back(Open{width_, bit_});
+		put(0, 32); // the block's length in words, set at leave()
+		width_ = 4;
+	}
+	void leave()
+	{
+		put(0, width_); // END_BLOCK
+		align();
+		const Open o = open_.back();
+		open_.pop_back();
+		const uint32_t words = static_cast<uint32_t>((bit_ - o.at - 32) / 32);
+		for (size_t i = 0; i < 4; i++)
+			bytes_[o.at / 8 + i] = static_cast<uint8_t>(words >> (8 * i));
+		width_ = o.width;
+	}
+	void record(unsigned code, const std::vector<uint64_t> &ops)
+	{
+		put(3, width_); // UNABBREV_RECORD
+		vbr(code, 6);
+		vbr(ops.size(), 6);
+		for (uint64_t op : ops)
+			vbr(op, 6);
+	}
+	const std::vector<uint8_t> &bytes() const { return bytes_; }
+
+private:
+	struct Open {
+		unsigned width;
+		size_t at;
+	};
+	void put(uint64_t v, unsigned n)
+	{
+		for (unsigned i = 0; i < n; i++, bit_++) {
+			if (bit_ / 8 >= bytes_.size())
+				bytes_.push_back(0);
+			if ((v >> i) & 1)
+				bytes_[bit_ / 8] |= static_cast<uint8_t>(1u << (bit_ % 8));
+		}
+	}
+	void vbr(uint64_t v, unsigned n)
+	{
+		const uint64_t more = 1ull << (n - 1);
+		do {
+			const uint64_t piece = v & (more - 1);
+			v >>= n - 1;
+			put(piece | (v != 0 ? more : 0), n);
+		} while (v != 0);
+	}
+	void align()
+	{
+		while (bit_ % 32 != 0)
+			put(0, 1);
+	}
+	std::vector<uint8_t> bytes_;
+	size_t bit_;
+	unsigned width_ = 2;
+	std::vector<Open> open_;
+};
+
+// A module of our own, written as LLVM writes a module of version 1 (its functions' names in its
+// value symbol table): its global variables (constants of `i32 addrspace(2)*`, value numbers from
+// 0), its functions (declarations of `void ()`, after them), its i32 constants (after those), and
+// its metadata, each string, value and node a metadata of its own, in its order (METADATA_STRING_OLD,
+// METADATA_VALUE and METADATA_NODE records), and its named metadata.
+struct WrittenModule {
+	size_t globals = 0;
+	std::vector<std::string> functions; // set before any metadata
+	std::vector<int64_t> integers;
+	struct Md {
+		int kind; // 0 a string, 1 a value, 2 a node
+		std::string string;
+		uint64_t value;
+		std::vector<uint64_t> ops; // a node's metadata, UINT64_MAX for none
+	};
+	std::vector<Md> md;
+	std::vector<std::pair<std::string, std::vector<uint64_t>>> named;
+
+	uint64_t str(const std::string &s)
+	{
+		md.push_back(Md{0, s, 0, {}});
+		return md.size() - 1;
+	}
+	uint64_t value(uint64_t v)
+	{
+		md.push_back(Md{1, {}, v, {}});
+		return md.size() - 1;
+	}
+	uint64_t i32(int64_t x)
+	{
+		integers.push_back(x);
+		return value(globals + functions.size() + integers.size() - 1);
+	}
+	uint64_t global(size_t k) { return value(k); }
+	uint64_t fn(const std::string &name)
+	{
+		const size_t k = static_cast<size_t>(std::find(functions.begin(), functions.end(), name) - functions.begin());
+		return value(globals + k);
+	}
+	uint64_t node(const std::vector<uint64_t> &ops)
+	{
+		md.push_back(Md{2, {}, 0, ops});
+		return md.size() - 1;
+	}
+	std::vector<uint8_t> write() const
+	{
+		auto chars = [](uint64_t first, const std::string &s) {
+			std::vector<uint64_t> ops;
+			if (first != UINT64_MAX)
+				ops.push_back(first);
+			for (char c : s)
+				ops.push_back(static_cast<uint8_t>(c));
+			return ops;
+		};
+		Bitstream b;
+		b.enter(8);       // MODULE_BLOCK
+		b.record(1, {1}); // VERSION
+		b.enter(17);      // TYPE_BLOCK_NEW: void, void (), i32, i32 addrspace(2)*, metadata
+		b.record(1, {5});
+		b.record(2, {});
+		b.record(21, {0, 0});
+		b.record(7, {32});
+		b.record(8, {2, 2});
+		b.record(16, {});
+		b.leave();
+		for (size_t k = 0; k < globals; k++)
+			b.record(7, {3, 1, 0, 0, 0, 0}); // GLOBALVAR: a constant, of no initialiser
+		for (size_t k = 0; k < functions.size(); k++)
+			b.record(8, {1, 0, 1, 0, 0, 0, 0, 0, 0}); // FUNCTION: a declaration
+		b.enter(11); // CONSTANTS_BLOCK
+		b.record(1, {2});
+		for (int64_t x : integers)
+			b.record(4, {x >= 0 ? static_cast<uint64_t>(x) << 1 : (static_cast<uint64_t>(-x) << 1) | 1});
+		b.leave();
+		b.enter(14); // VALUE_SYMTAB_BLOCK
+		for (size_t k = 0; k < functions.size(); k++)
+			b.record(1, chars(globals + k, functions[k]));
+		b.leave();
+		b.enter(15); // METADATA_BLOCK
+		for (const Md &d : md) {
+			if (d.kind == 0) {
+				b.record(1, chars(UINT64_MAX, d.string));
+			} else if (d.kind == 1) {
+				b.record(2, {2, d.value});
+			} else {
+				std::vector<uint64_t> ops;
+				for (uint64_t op : d.ops)
+					ops.push_back(op == UINT64_MAX ? 0 : op + 1);
+				b.record(3, ops);
+			}
+		}
+		for (const auto &[name, ids] : named) {
+			b.record(4, chars(UINT64_MAX, name));
+			b.record(10, ids);
+		}
+		b.leave();
+		b.leave();
+		return b.bytes();
+	}
+};
+
+// Each reader's answers over a module written here, of malformed nodes beside well-formed ones:
+// the entry points' arguments (rgfxReadAirFunctions), their nodes whole (rgfxReadAirEntries) and
+// the visible functions' signatures (rgfxReadAirVisible) are each one's own, one whose node names
+// no function of the module left out; a layout read past the reader's depth from one entry point
+// reads from another's nearer node; and a function constant whose node does not read is left out
+// of the module's constants and of its code's, the others kept. readConstants reads the module's
+// constants whole, so its answer is unread for every function where one does not read.
+void checkWrittenModule()
+{
+	WrittenModule w;
+	w.globals = 3;
+	w.functions = {"k_good",       "k_bad_arg", "k_bad_wgs", "k_deep", "k_shallow", "k_after",
+	               "v_bad_outputs", "v_good",    "f_one",     "f_short", "f_two"};
+	const uint64_t none = w.node({});
+	auto buffer = [&](int64_t position, int64_t index) {
+		return std::vector<uint64_t>{w.i32(position), w.str("air.buffer"), w.str("air.location_index"), w.i32(index),
+		                             w.i32(1), w.str("air.read")};
+	};
+	auto entryOf = [&](const std::string &name, uint64_t outputs, const std::vector<uint64_t> &args,
+	                   std::vector<uint64_t> extra = {}) {
+		std::vector<uint64_t> ops = {w.fn(name), outputs, w.node(args)};
+		ops.insert(ops.end(), extra.begin(), extra.end());
+		return w.node(ops);
+	};
+	// A chain of nine layouts, each a member of the next's type: the ninth past the depth the reader
+	// follows from an argument of the first, one deep from an argument of its own.
+	uint64_t layout = w.node({w.i32(0), w.i32(4), w.i32(0), w.str("T"), w.str("m")});
+	const uint64_t ninth = layout;
+	for (int k = 0; k < 8; k++)
+		layout = w.node({w.str("air.struct_type_info"), layout, w.i32(0), w.i32(4), w.i32(0), w.str("T"), w.str("m")});
+	std::vector<uint64_t> deep = buffer(0, 1), shallow = buffer(0, 2);
+	deep.insert(deep.end(), {w.str("air.struct_type_info"), layout});
+	shallow.insert(shallow.end(), {w.str("air.struct_type_info"), ninth});
+	std::vector<uint64_t> underBad = {w.i32(1), w.str("air.function_constant"),
+	                                  w.node({w.global(1), w.str("uint"), w.str("kBad")}), w.str("air.buffer"),
+	                                  w.str("air.location_index"), w.i32(5), w.i32(1)};
+	w.named.push_back({"air.kernel",
+	                   {entryOf("k_good", none, {w.node(buffer(0, 0))}),
+	                    entryOf("k_bad_arg", none, {w.node({w.i32(0), w.str("air.buffer"), w.i32(7)})}),
+	                    w.node({w.str("k_none"), none, none}),
+	                    entryOf("k_bad_wgs", none, {}, {w.node({w.str("air.work_group_size"), w.i32(1), w.i32(2)})}),
+	                    entryOf("k_deep", none, {w.node(deep)}), entryOf("k_shallow", none, {w.node(shallow)}),
+	                    entryOf("k_after", none, {w.node(underBad)},
+	                            {w.node({w.str("air.work_group_size"), w.i32(8), w.i32(4), w.i32(1)})})}});
+	w.named.push_back(
+	    {"air.vertex",
+	     {entryOf("v_bad_outputs", w.node({w.node({w.i32(5)})}), {}),
+	      entryOf("v_good",
+	              w.node({w.node({w.str("air.position"), w.str("air.arg_type_name"), w.str("float4"),
+	                              w.str("air.arg_name"), w.str("p")})}),
+	              {})}});
+	w.named.push_back({"air.visible",
+	                   {w.node({w.fn("f_one"), none, none}), w.node({w.str("f_none"), none, none}),
+	                    w.node({w.fn("f_short")}), w.node({w.fn("f_two"), none, none})}});
+	// kBad's index is a string; kOdd's type is one readConstants does not know, and rgfxReadAirEntries
+	// does not read.
+	w.named.push_back({"air.function_constants",
+	                   {w.node({w.global(0), w.str("uint"), w.str("kGood"), w.i32(3)}),
+	                    w.node({w.global(1), w.str("uint"), w.str("kBad"), w.str("three")}),
+	                    w.node({w.global(2), w.str("bfloat"), w.str("kOdd"), w.i32(4)})}});
+	const std::vector<uint8_t> bytes = w.write();
+
+	std::vector<RgfxAirFunction> fns;
+	check(rgfxReadAirFunctions(bytes.data(), bytes.size(), fns), "the written module's functions read");
+	std::vector<std::string> names;
+	for (const RgfxAirFunction &f : fns)
+		names.push_back(f.name);
+	check(names == std::vector<std::string>{"k_good", "k_bad_arg", "k_bad_wgs", "k_deep", "k_shallow", "k_after",
+	                                        "v_bad_outputs", "v_good"},
+	      "the written module's functions: each entry point that names a function");
+	for (const RgfxAirFunction &f : fns) {
+		check(!f.constantsRead && f.constants.empty(), f.name + ": its module's constants, one unread, are unread");
+		check(f.argumentsRead == (f.name != "k_bad_arg"), f.name + ": its own arguments' answer");
+	}
+	check(fns.size() == 8 && fns[0].arguments.size() == 1 && fns[0].arguments[0].kind == RgfxAirKind::Buffer &&
+	          fns[0].arguments[0].index == 0 && fns[0].arguments[0].access == RgfxAirAccess::Read,
+	      "k_good: its buffer");
+	check(fns.size() == 8 && fns[5].arguments.size() == 1 && fns[5].arguments[0].index == 5,
+	      "k_after: its buffer under kBad, read whatever the constant's value");
+
+	RgfxAirEntries e;
+	check(rgfxReadAirEntries(bytes.data(), bytes.size(), e) && e.entries.size() == 8,
+	      "the written module's nodes read, each entry point that names a function listed");
+	const struct {
+		const char *name;
+		bool read;
+	} kEntries[] = {{"k_good", true},    {"k_bad_arg", false},    {"k_bad_wgs", false}, {"k_deep", false},
+	                {"k_shallow", true}, {"k_after", true}, {"v_bad_outputs", false}, {"v_good", true}};
+	for (size_t i = 0; i < e.entries.size() && i < 8; i++) {
+		const RgfxAirEntry &x = e.entries[i];
+		check(x.name == kEntries[i].name && x.nodesRead == kEntries[i].read && x.function == w.globals + i,
+		      x.name + ": its own nodes' answer");
+		if (!x.nodesRead)
+			check(x.arguments.empty() && x.outputs.empty() && !x.hasWorkGroupSize, x.name + ": no nodes");
+	}
+	if (e.entries.size() == 8) {
+		const RgfxAirEntry &good = e.entries[0], &shallowEntry = e.entries[4], &after = e.entries[5],
+		                   &vertex = e.entries[7];
+		check(good.arguments.size() == 1 && good.arguments[0].kind == "air.buffer" && good.arguments[0].index == 0,
+		      "k_good: its buffer's node");
+		check(shallowEntry.arguments.size() == 1 && shallowEntry.arguments[0].layout != nullptr &&
+		          shallowEntry.arguments[0].layout->size() == 1 &&
+		          (*shallowEntry.arguments[0].layout)[0].typeName == "T" &&
+		          (*shallowEntry.arguments[0].layout)[0].size == 4,
+		      "k_shallow: the ninth layout, read from its own node after k_deep did not read it");
+		check(after.hasWorkGroupSize && after.workGroupSize[0] == 8 && after.workGroupSize[1] == 4 &&
+		          after.workGroupSize[2] == 1 && after.arguments.size() == 1 && after.arguments[0].predicated &&
+		          after.arguments[0].predicate == "kBad" && after.arguments[0].predicateGlobal == 1,
+		      "k_after: its work group size and its buffer under kBad");
+		check(vertex.outputs.size() == 1 && vertex.outputs[0].kind == "air.position" &&
+		          vertex.outputs[0].typeName == "float4" && vertex.outputs[0].name == "p",
+		      "v_good: its output");
+	}
+	check(e.constants == std::vector<std::pair<std::string, uint32_t>>{{"kGood", 3}, {"kOdd", 4}},
+	      "the written module's constants: each whose node reads");
+	RgfxAirSpecialisation spec;
+	check(e.code != nullptr && !e.entries.empty() && rgfxAirSpecialise(e, e.entries[0], nullptr, 0, spec),
+	      "the written module's code, beside the constant whose node does not read");
+
+	std::vector<RgfxAirVisible> vis;
+	check(rgfxReadAirVisible(bytes.data(), bytes.size(), vis) && vis.size() == 3, "the written module's visible functions");
+	if (vis.size() == 3)
+		check(vis[0].name == "f_one" && vis[0].signature == RgfxAirVisible::Signature::None && vis[1].name == "f_short" &&
+		          vis[1].signature == RgfxAirVisible::Signature::Unknown && vis[2].name == "f_two" &&
+		          vis[2].signature == RgfxAirVisible::Signature::None && !vis[0].constantsRead,
+		      "the visible functions: each one's own signature, f_none left out");
+
+	// One read of it answers what the three readers answer.
+	RgfxAirModule once;
+	rgfxReadAirModule(bytes.data(), bytes.size(), once);
+	check(once.functionsRead && once.functions == fns && once.visibleRead && once.visible == vis && once.entriesRead &&
+	          once.entries == e,
+	      "one read of the written module answers what the readers answer");
+}
 } // namespace
 
 int main()
@@ -663,9 +974,73 @@ int main()
 			else
 				check(left[i] == all[i], left[i].name + ": its answer beside it is as it was");
 		}
+
+		// The same of the nodes whole (rgfxReadAirEntries). The whole module's nodes read, each entry
+		// point's but reads_patch's: a post-tessellation vertex function's control point input
+		// (`air.patch_control_point_input`) takes two nodes, its control point function's and its
+		// attributes', operands no key the reader follows takes, so that entry point is listed with
+		// no nodes and the others' read. Then, the key ahead of the kind of each argument declared
+		// under a function constant spoilt (`air.function_constant`, so the constant's node is an
+		// operand no key takes), the entry points of such an argument are listed with no nodes, and
+		// every other entry point's nodes are as they were.
+		RgfxAirEntries entriesAll, entriesLeft;
+		check(rgfxReadAirEntries(whole.data(), whole.size(), entriesAll), "the whole module's nodes read");
+		for (const RgfxAirEntry &e : entriesAll.entries)
+			check(e.nodesRead == (e.name != "reads_patch"),
+			      e.name + (e.name == "reads_patch" ? ": listed, its control point input's nodes unread"
+			                                        : ": its nodes read"));
+		check(std::any_of(entriesAll.entries.begin(), entriesAll.entries.end(),
+		                  [](const RgfxAirEntry &e) { return e.name == "reads_patch"; }),
+		      "the whole module lists reads_patch");
+		std::vector<uint8_t> unkeyed = whole;
+		const char fcKey[] = "air.function_constant";
+		const size_t fcLength = sizeof(fcKey) - 1;
+		size_t unkeyedCount = 0;
+		for (auto it = unkeyed.begin(); (it = std::search(it, unkeyed.end(), fcKey, fcKey + fcLength)) != unkeyed.end();
+		     it += fcLength) {
+			*(it + fcLength - 1) = '_';
+			unkeyedCount++;
+		}
+		check(unkeyedCount > 0, "the whole module names the function constants' key");
+		check(rgfxReadAirEntries(unkeyed.data(), unkeyed.size(), entriesLeft) &&
+		          entriesLeft.entries.size() == entriesAll.entries.size(),
+		      "the module of the key spoilt reads, every entry point listed");
+		std::vector<RgfxAirFunction> functionsLeft;
+		check(rgfxReadAirFunctions(unkeyed.data(), unkeyed.size(), functionsLeft) && functionsLeft.size() == all.size(),
+		      "the module of the key spoilt reads its functions, every entry point listed");
+		std::set<std::string> predicated;
+		for (size_t i = 0; i < entriesLeft.entries.size() && i < entriesAll.entries.size(); i++) {
+			const RgfxAirEntry &was = entriesAll.entries[i], &now = entriesLeft.entries[i];
+			const bool under = std::any_of(was.arguments.begin(), was.arguments.end(),
+			                               [](const RgfxAirNode &n) { return n.predicated; });
+			if (under) {
+				predicated.insert(was.name);
+				check(now.name == was.name && now.function == was.function && now.stage == was.stage &&
+				          !now.nodesRead && now.arguments.empty() && now.outputs.empty() && !now.hasWorkGroupSize,
+				      was.name + ", its function constant's key unknown: listed, its nodes unread");
+			} else {
+				check(now == was, was.name + ": its nodes beside it are as they were");
+			}
+		}
+		check(predicated.size() >= 3 && predicated.size() < entriesAll.entries.size(),
+		      "some entry points declare an argument under a function constant (" +
+		          std::to_string(predicated.size()) + ")");
+		for (size_t i = 0; i < functionsLeft.size() && i < all.size(); i++) {
+			if (predicated.count(all[i].name) != 0)
+				check(!functionsLeft[i].argumentsRead && functionsLeft[i].arguments.empty(),
+				      all[i].name + ", its function constant's key unknown: its arguments unread");
+			else
+				check(functionsLeft[i].argumentsRead && functionsLeft[i].arguments == all[i].arguments,
+				      all[i].name + ": its arguments beside it are as they were");
+		}
 	} else {
 		std::printf("air_arguments_test: RGFX_AIR_MODULE unset: no module of several entry points\n");
 	}
+
+	// Malformed nodes of a module written here (LLVM's bitstream of a module of our own, of the
+	// nodes Apple's compiler never writes so): each entry point's, visible function's and function
+	// constant's answer its own.
+	checkWrittenModule();
 
 	const uint8_t *bitcode = nullptr;
 	size_t size = 0;
@@ -1121,8 +1496,10 @@ int main()
 			          text.find("air.arg_type_size") != std::string::npos,
 			      name + ": its module names no address space, and names its pointees' sizes");
 			for (const RgfxAirEntry &x : e.entries)
-				if (x.name == name)
+				if (x.name == name) {
+					check(x.nodesRead, name + ": its own nodes are read");
 					return x;
+				}
 			check(false, name + ": its module declares it");
 			return RgfxAirEntry{};
 		};
@@ -1198,6 +1575,7 @@ int main()
 		one.constants = e.constants;
 		one.code = e.code;
 		check(one.entries.size() == 1, name + ": its module declares it");
+		check(one.entries.size() == 1 && one.entries[0].nodesRead, name + ": its own nodes are read");
 		return one;
 	};
 	{
@@ -1552,8 +1930,8 @@ int main()
 	// kernels (TYPE 5) and intersection functions get no read. kernel_trunc.metallib, which the
 	// suite's build.sh cuts to 1000 bytes on purpose, has no bitcode for its function. The nodes
 	// of the entry points below do not read: each has an explicit imageblock, an argument of a
-	// kind the node reader does not follow, so their pipelines answer no reflection
-	// (RgfxPipelineReflectionOf.mm). A fragment function's framebuffer-fetch input (`[[color(0)]]`,
+	// kind the node reader does not follow, so each is listed with no nodes and their pipelines
+	// answer no reflection (RgfxPipelineReflectionOf.mm). A fragment function's framebuffer-fetch input (`[[color(0)]]`,
 	// `air.render_target`) reads, so rounding's fetch fragments are not listed.
 	{
 		const std::vector<std::string> nodesUnread = {
@@ -1593,8 +1971,13 @@ int main()
 						continue;
 					}
 					check(!bc.empty(), what + ": its bitcode");
-					auto named = [&](const auto &v) {
-						return std::any_of(v.begin(), v.end(), [&](const auto &x) { return x.name == f.name; });
+					// The function's entry point in its module's nodes, where they read and list it.
+					auto entryIn = [&](RgfxAirEntries &e) -> const RgfxAirEntry * {
+						if (!rgfxReadAirEntries(bc.data(), bc.size(), e))
+							return nullptr;
+						auto it = std::find_if(e.entries.begin(), e.entries.end(),
+						                       [&](const RgfxAirEntry &x) { return x.name == f.name; });
+						return it != e.entries.end() ? &*it : nullptr;
 					};
 					std::vector<RgfxAirFunction> args;
 					std::vector<RgfxAirVisible> vis;
@@ -1610,8 +1993,9 @@ int main()
 						const std::string listedAs = file.substr(file.rfind('/') + 1) + " " + f.name;
 						const bool unread =
 						    std::find(nodesUnread.begin(), nodesUnread.end(), listedAs) != nodesUnread.end();
-						const bool read = rgfxReadAirEntries(bc.data(), bc.size(), nodes) && named(nodes.entries);
-						check(read != unread, what + (unread ? ": its nodes do not read" : ": its nodes"));
+						const RgfxAirEntry *e = entryIn(nodes);
+						check(e != nullptr && e->nodesRead != unread,
+						      what + (unread ? ": listed, its nodes unread" : ": its nodes"));
 						unreadNodes += unread ? 1 : 0;
 						break;
 					}
@@ -1622,9 +2006,11 @@ int main()
 						break;
 					}
 					case 7:
-					case 8:
-						check(rgfxReadAirEntries(bc.data(), bc.size(), nodes) && named(nodes.entries), what + ": its nodes");
+					case 8: {
+						const RgfxAirEntry *e = entryIn(nodes);
+						check(e != nullptr && e->nodesRead, what + ": its nodes");
 						break;
+					}
 					default:
 						notAsked++;
 						break;

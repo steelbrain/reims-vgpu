@@ -1760,11 +1760,12 @@ bool stitchingType(const Module &m, uint64_t id, RgfxAirType &out)
 }
 
 // One `air.visible` node: the function, its outputs, its inputs and, for a stitchable function,
-// its `air.stitching_info`.
+// its `air.stitching_info`. False where it names no function of the module; a node of the function
+// that is not of that form is its signature's, unknown.
 bool visibleFunction(const Module &m, uint64_t id, RgfxAirVisible &out)
 {
 	const Module::Md *entry = mdNode(m, id);
-	if (entry == nullptr || entry->ops.size() < 3)
+	if (entry == nullptr || entry->ops.empty())
 		return false;
 	const Module::Md *fn = mdAt(m, entry->ops[0]);
 	if (fn == nullptr || fn->kind != Module::Md::kValue || fn->value >= m.globals.size() ||
@@ -1773,6 +1774,10 @@ bool visibleFunction(const Module &m, uint64_t id, RgfxAirVisible &out)
 	out.name = globalName(m, fn->value);
 	if (out.name.empty())
 		return false;
+	if (entry->ops.size() < 3) {
+		out.signature = RgfxAirVisible::Signature::Unknown;
+		return true;
+	}
 	const Module::Md *info = nullptr;
 	for (size_t i = 3; i < entry->ops.size() && info == nullptr; i++) {
 		const Module::Md *n = mdNode(m, entry->ops[i]);
@@ -2005,7 +2010,14 @@ bool wholeNode(const Module &m, uint64_t id, unsigned depth,
 	return !out.kind.empty();
 }
 
-// The layout node `id`: its members, each read once a module (`layouts`).
+bool readLayout(const Module &m, uint64_t id, unsigned depth,
+                std::map<uint64_t, std::shared_ptr<const std::vector<RgfxAirMember>>> &layouts,
+                std::shared_ptr<const std::vector<RgfxAirMember>> &out);
+
+// The layout node `id`: its members, each read once a module (`layouts`), wherever an entry point
+// reaches it. One that does not read is not kept: it reads as none only from where it was reached
+// (past the depth the reader follows, or inside itself), and another entry point's node nearer it
+// reads it again.
 bool layoutOf(const Module &m, uint64_t id, unsigned depth,
               std::map<uint64_t, std::shared_ptr<const std::vector<RgfxAirMember>>> &layouts,
               std::shared_ptr<const std::vector<RgfxAirMember>> &out)
@@ -2015,7 +2027,22 @@ bool layoutOf(const Module &m, uint64_t id, unsigned depth,
 		out = known->second;
 		return out != nullptr;
 	}
-	layouts[id] = nullptr; // a layout that holds itself reads as none
+	layouts[id] = nullptr; // while it is read: a layout that holds itself reads as none
+	std::shared_ptr<const std::vector<RgfxAirMember>> read;
+	if (!readLayout(m, id, depth, layouts, read)) {
+		layouts.erase(id);
+		return false;
+	}
+	layouts[id] = read;
+	out = std::move(read);
+	return true;
+}
+
+// The members of the layout node `id` (layoutOf).
+bool readLayout(const Module &m, uint64_t id, unsigned depth,
+                std::map<uint64_t, std::shared_ptr<const std::vector<RgfxAirMember>>> &layouts,
+                std::shared_ptr<const std::vector<RgfxAirMember>> &out)
+{
 	const Module::Md *node = mdNode(m, id);
 	if (node == nullptr || depth > 8)
 		return false;
@@ -2064,7 +2091,6 @@ bool layoutOf(const Module &m, uint64_t id, unsigned depth,
 		members->push_back(std::move(member));
 	}
 	out = members;
-	layouts[id] = out;
 	return true;
 }
 
@@ -2746,7 +2772,11 @@ private:
 
 // The module's code once read (Module::code), where it is one rgfxAirSpecialise can follow: its
 // function constants' globals and the intrinsics it calls found, and every initialiser's body
-// read. Null where it is not.
+// read. Null where it is not. A function constant whose node does not read is left out of its
+// globals: its own global, `externally_initialized constant ... undef` of section
+// `air.fc_initializer` (read: the compiler's modules as LLVM's text form prints them), holds no
+// scalar the reader folds, so a load of it reads any value, as one of a constant of no value does,
+// and the other constants' values stand.
 std::shared_ptr<const RgfxAirCode> finishCode(const Module &m)
 {
 	if (m.code == nullptr || m.codeBad || m.code->globals.size() != m.globals.size())
@@ -2760,7 +2790,7 @@ std::shared_ptr<const RgfxAirCode> finishCode(const Module &m)
 		uint32_t index = 0;
 		if (node == nullptr || node->ops.size() < 4 || !mdGlobalVariable(m, node->ops[0]) ||
 		    !mdUnsigned(m, *node, 3, index))
-			return nullptr;
+			continue;
 		c.fcGlobals[mdAt(m, node->ops[0])->value] = index;
 	}
 	std::set<uint32_t> bodies;
@@ -2782,7 +2812,8 @@ std::shared_ptr<const RgfxAirCode> finishCode(const Module &m)
 	return m.code;
 }
 
-// The visible functions of the module `m` (rgfxReadAirVisible).
+// The visible functions of the module `m` (rgfxReadAirVisible): each one's own answer, one whose
+// node names no function left out.
 bool visibleOf(const Module &m, std::vector<RgfxAirVisible> &out)
 {
 	out.clear();
@@ -2793,10 +2824,8 @@ bool visibleOf(const Module &m, std::vector<RgfxAirVisible> &out)
 	const bool constantsRead = readConstants(m, constants);
 	for (uint64_t id : it->second) {
 		RgfxAirVisible v;
-		if (!visibleFunction(m, id, v)) {
-			out.clear();
-			return false;
-		}
+		if (!visibleFunction(m, id, v))
+			continue;
 		v.constants = constants;
 		v.constantsRead = constantsRead;
 		if (v.signature != RgfxAirVisible::Signature::Read) {
@@ -2866,7 +2895,45 @@ void addressSpaceFromParameter(const Module &m, uint64_t function, RgfxAirNode &
 	n.addressSpace = c.types[param].width;
 }
 
-// The entry points' nodes whole of the module `m` (rgfxReadAirEntries).
+// One entry point's node whole (entriesOf), its function's name and value number first, the rest
+// after: false where a node of it is not one the reader follows. `out.name` is then the function's
+// name, or empty where the node names no function of the module.
+bool entryOf(const Module &m, uint64_t id,
+             std::map<uint64_t, std::shared_ptr<const std::vector<RgfxAirMember>>> &layouts, RgfxAirEntry &out)
+{
+	const Module::Md *entry = mdNode(m, id);
+	const Module::Md *fn = entry != nullptr && !entry->ops.empty() ? mdAt(m, entry->ops[0]) : nullptr;
+	if (fn == nullptr || fn->kind != Module::Md::kValue || fn->value >= m.globals.size() ||
+	    !m.globals[static_cast<size_t>(fn->value)].function)
+		return false;
+	out.name = globalName(m, fn->value);
+	out.function = fn->value;
+	const Module::Md *args = entry->ops.size() >= 3 ? mdNode(m, entry->ops[2]) : nullptr;
+	if (out.name.empty() || args == nullptr || !outputsOf(m, entry->ops[1], out.outputs))
+		return false;
+	for (uint64_t a : args->ops) {
+		RgfxAirNode n;
+		if (!wholeNode(m, a, 0, layouts, n))
+			return false;
+		addressSpaceFromParameter(m, fn->value, n);
+		out.arguments.push_back(std::move(n));
+	}
+	for (size_t k = 3; k < entry->ops.size(); k++) {
+		const Module::Md *extra = mdNode(m, entry->ops[k]);
+		std::string key;
+		if (extra == nullptr || !mdText(m, *extra, 0, key) || key != "air.work_group_size")
+			continue;
+		if (extra->ops.size() != 4 || !mdUnsigned(m, *extra, 1, out.workGroupSize[0]) ||
+		    !mdUnsigned(m, *extra, 2, out.workGroupSize[1]) || !mdUnsigned(m, *extra, 3, out.workGroupSize[2]))
+			return false;
+		out.hasWorkGroupSize = true;
+	}
+	return true;
+}
+
+// The entry points' nodes whole of the module `m` (rgfxReadAirEntries): each entry point's own
+// answer, one a node of which does not read listed with none, one that names no function left out;
+// each function constant whose node reads.
 bool entriesOf(const Module &m, RgfxAirEntries &out)
 {
 	out = {};
@@ -2882,48 +2949,17 @@ bool entriesOf(const Module &m, RgfxAirEntries &out)
 		if (it == m.named.end())
 			continue;
 		for (uint64_t id : it->second) {
-			const Module::Md *entry = mdAt(m, id);
-			const Module::Md *fn = entry != nullptr && entry->kind == Module::Md::kNode && entry->ops.size() >= 3
-			                           ? mdAt(m, entry->ops[0])
-			                           : nullptr;
-			const Module::Md *args = fn != nullptr ? mdNode(m, entry->ops[2]) : nullptr;
-			if (fn == nullptr || fn->kind != Module::Md::kValue || args == nullptr ||
-			    fn->value >= m.globals.size() || !m.globals[static_cast<size_t>(fn->value)].function) {
-				out = {};
-				return false;
-			}
 			RgfxAirEntry e;
-			e.name = globalName(m, fn->value);
-			e.function = fn->value;
 			e.stage = s.stage;
-			if (!outputsOf(m, entry->ops[1], e.outputs)) {
-				out = {};
-				return false;
-			}
-			for (uint64_t a : args->ops) {
-				RgfxAirNode n;
-				if (!wholeNode(m, a, 0, layouts, n)) {
-					out = {};
-					return false;
-				}
-				addressSpaceFromParameter(m, fn->value, n);
-				e.arguments.push_back(std::move(n));
-			}
-			for (size_t k = 3; k < entry->ops.size(); k++) {
-				const Module::Md *extra = mdNode(m, entry->ops[k]);
-				std::string key;
-				if (extra == nullptr || !mdText(m, *extra, 0, key) || key != "air.work_group_size")
+			if (!entryOf(m, id, layouts, e)) {
+				if (e.name.empty())
 					continue;
-				if (extra->ops.size() != 4 || !mdUnsigned(m, *extra, 1, e.workGroupSize[0]) ||
-				    !mdUnsigned(m, *extra, 2, e.workGroupSize[1]) || !mdUnsigned(m, *extra, 3, e.workGroupSize[2])) {
-					out = {};
-					return false;
-				}
-				e.hasWorkGroupSize = true;
-			}
-			if (e.name.empty()) {
-				out = {};
-				return false;
+				RgfxAirEntry unread;
+				unread.name = std::move(e.name);
+				unread.function = e.function;
+				unread.stage = s.stage;
+				unread.nodesRead = false;
+				e = std::move(unread);
 			}
 			out.entries.push_back(std::move(e));
 		}
@@ -2934,10 +2970,8 @@ bool entriesOf(const Module &m, RgfxAirEntries &out)
 			const Module::Md *c = mdNode(m, id);
 			std::string name;
 			uint32_t index = 0;
-			if (c == nullptr || !mdText(m, *c, 2, name) || !mdUnsigned(m, *c, 3, index)) {
-				out = {};
-				return false;
-			}
+			if (c == nullptr || !mdText(m, *c, 2, name) || !mdUnsigned(m, *c, 3, index))
+				continue;
 			out.constants.emplace_back(name, index);
 		}
 	}

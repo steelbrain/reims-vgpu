@@ -216,7 +216,7 @@ struct RgfxAirVisible {
 	enum class Signature : uint8_t {
 		None,    // no `air.stitching_info`: a visible function that is not stitchable
 		Read,    // the signature below
-		Unknown, // a signature with a type the reader does not know
+		Unknown, // a signature with a type or a node the reader does not know
 	};
 	std::string name;
 	Signature signature = Signature::None;
@@ -232,7 +232,9 @@ struct RgfxAirVisible {
 };
 
 // The visible functions of the AIR module at `bitcode` (as rgfxReadAirFunctions takes it), in
-// `air.visible`'s order. False where it is not one the reader can follow; `out` then holds nothing.
+// `air.visible`'s order, each with its own answer: one whose node is not of the form above has a
+// signature Unknown, and one whose node names no function of the module is left out. False where
+// the bytes are not a module the reader can follow; `out` then holds nothing.
 bool rgfxReadAirVisible(const uint8_t *bitcode, size_t size, std::vector<RgfxAirVisible> &out);
 
 // --- An entry point's nodes, whole, for its pipeline's reflection -----------------------------
@@ -328,6 +330,10 @@ struct RgfxAirEntry {
 	// Its function's value number in the module.
 	uint64_t function = 0;
 	RgfxAirEntryStage stage = RgfxAirEntryStage::Kernel;
+	// False where a node of it (its entry's, an output's, an argument's or a layout's, its work
+	// group size's) is not of a form the reader knows: its outputs, arguments and work group size
+	// are then unknown, and empty here.
+	bool nodesRead = true;
 	// Its outputs (the entry's second node), in order: none for a kernel or a void function.
 	std::vector<RgfxAirOutput> outputs;
 	std::vector<RgfxAirNode> arguments;
@@ -343,7 +349,8 @@ struct RgfxAirEntry {
 struct RgfxAirCode;
 
 // A module's entry points, its function constants' indices by name (`air.function_constants`:
-// each the constant's global, its type, its name and its index), and, where it declares function
+// each the constant's global, its type, its name and its index; one whose node does not read is
+// left out, so a predicate that names it has no value), and, where it declares function
 // constants, its code (null where the reader does not follow it).
 struct RgfxAirEntries {
 	std::vector<RgfxAirEntry> entries;
@@ -352,8 +359,10 @@ struct RgfxAirEntries {
 };
 
 // The entry points of the AIR module at `bitcode` (as rgfxReadAirFunctions takes it), every node
-// of each whole. False where it is not one the reader can follow, or a node or layout is not one
-// it knows the form of; `out` then holds nothing.
+// of each whole, each entry point with its own answer: one a node or layout of which is not of a
+// form the reader knows is listed, `nodesRead` false, beside the others, and one whose node names
+// no function of the module is left out. False where the bytes are not a module the reader can
+// follow; `out` then holds nothing.
 bool rgfxReadAirEntries(const uint8_t *bitcode, size_t size, RgfxAirEntries &out);
 
 // --- One read of a module, kept for the process -----------------------------------------------
@@ -443,8 +452,9 @@ RgfxAirModuleCache &rgfxAirModules();
 // The reader decodes a module's function bodies (FUNCTION_BLOCK, of LLVM's documented records,
 // as a module of typed pointers writes them) where it declares function constants. It runs the
 // initialisers over integers and floating-point scalars: a load of a constant's global gives the
-// constant's value (none where the function has no value for it), `air.is_function_constant_
-// defined` whether it has one, `air.normalize_function_constant_predicate` 1 for a value other
+// constant's value (none where the function has no value for it, any value where the constant's
+// node in `air.function_constants` does not read), `air.is_function_constant_defined` whether it
+// has one, `air.normalize_function_constant_predicate` 1 for a value other
 // than 0. In the entry point's body it propagates the values those globals then hold through the
 // branches, switches, selects and phis they decide (sparse conditional constant propagation), and
 // counts as used each argument a live instruction of a reachable block reads: an instruction is

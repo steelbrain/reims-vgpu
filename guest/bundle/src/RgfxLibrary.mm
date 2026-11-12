@@ -692,18 +692,24 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 	if (module != nullptr && !module->entriesRead) {
 		why = "its module did not read";
 	} else if (module != nullptr) {
+		const RgfxAirEntry *named = nullptr;
 		for (const RgfxAirEntry &e : module->entries.entries) {
 			if (e.name == name) {
-				auto one = std::make_shared<RgfxAirEntries>();
-				one->entries.push_back(e);
-				one->constants = module->entries.constants;
-				one->code = module->entries.code;
-				entries = std::move(one);
+				named = &e;
 				break;
 			}
 		}
-		if (entries == nullptr)
+		if (named == nullptr) {
 			why = "its module declares no such entry point";
+		} else if (!named->nodesRead) {
+			why = "a node of it is not one the reader follows";
+		} else {
+			auto one = std::make_shared<RgfxAirEntries>();
+			one->entries.push_back(*named);
+			one->constants = module->entries.constants;
+			one->code = module->entries.code;
+			entries = std::move(one);
+		}
 	}
 	static char site;
 	if (entries == nullptr && why != nullptr && rgfxLogFirst(&site, rgfxLogKindOf(why)))
