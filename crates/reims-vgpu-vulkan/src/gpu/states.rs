@@ -333,7 +333,7 @@ fn sampler_descriptor(d: &SamplerDesc) -> (SamplerDescriptor, rt::SamplerStateOp
             crate::answer::inexact(
                 "setLodBias:",
                 crate::answer::Inexact::SamplerLodBias,
-                || format!("a sampler's LOD bias ({bias})"),
+                || format!("a sampler's LOD bias ({bias}) in its level of detail"),
             );
         }
     }
@@ -1287,7 +1287,7 @@ mod tests {
 
     /// A sampler's LOD bias reaches the runtime's descriptor, so two samplers that differ only in
     /// their bias are two states, as Metal makes them (an M3 Max), and a bias of -0 is the state of
-    /// 0
+    /// 0; a bias other than 0 is relayed, as the runtime samples it at 0 (outside strict mode)
     #[test]
     fn on_vulkan_a_samplers_lod_bias_decides_its_state() {
         let d = dev();
@@ -1296,7 +1296,9 @@ mod tests {
                 lod_bias,
                 ..SamplerDesc::default()
             };
-            new_sampler_state(&d, &desc).unwrap().unwrap()
+            crate::answer::relaxed(|| new_sampler_state(&d, &desc))
+                .unwrap()
+                .unwrap()
         };
         let (none, zero, minus_zero, one) = (
             state(None),
@@ -1304,13 +1306,14 @@ mod tests {
             state(Some(-0.0)),
             state(Some(1.0)),
         );
+        let biased = SamplerDesc {
+            lod_bias: Some(1.0),
+            ..SamplerDesc::default()
+        };
         assert_eq!(
-            sampler_descriptor(&SamplerDesc {
-                lod_bias: Some(1.0),
-                ..SamplerDesc::default()
-            })
-            .0
-            .lod_bias,
+            crate::answer::relaxed(|| sampler_descriptor(&biased))
+                .0
+                .lod_bias,
             1.0
         );
         assert!(*none == *zero);
