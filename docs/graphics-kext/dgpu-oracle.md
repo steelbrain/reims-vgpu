@@ -1512,6 +1512,43 @@ and IOSurface keeps them. Our kext raises IOSurface's alignment to the host GPU'
 256 on RADV (`RgfxSurfaceRows.hpp`); the rows a client names, CoreAnimation's and CoreVideo's
 among them, stay as it names them, as on these Macs.
 
+## Q28: rasterization rate maps
+
+Probe: `oracle_ratemap DEVICE`, 11-12 (m3-max-20796), the AMD alone: a map of a 256 x 128 screen
+of one layer (horizontal samples 1, 0.25, 1, vertical 1, 0.5) and of two (a second layer of
+0.5, 1 and 0.25, 1, 0.75), their answers, their parameter data, a full-target triangle drawn
+through each, and the calls that may end the process, each in a child process.
+
+| asked | AMD |
+|---|---|
+| `supportsRasterizationRateMapWithLayerCount:` 0, 1, 2, 3 | YES, YES, YES, NO |
+| a map's class | `GFX10_MtlRasterizationRateMap`, below `AMD_MtlRasterizationRateMap` and Metal's `_MTLRasterizationRateMap` |
+| `physicalGranularity`, `parameterBufferSizeAndAlign` | 32 x 32 x 1; 16,472 bytes aligned to 256, of which the copy changes 144, at offset 0 or 4 |
+| `physicalSizeForLayer:` of each layer, and both coordinate maps | the screen's 256 x 128 x 1, and every coordinate as it was: the map is the identity, whatever its samples |
+| `physicalSizeForLayer:` past the layers | 0 x 0 x 1 at layer 1 of a one-layer map, 256 x 128 x 1 at layer 2 |
+| `mapScreenToPhysicalCoordinates:forLayer:` past the layers | (-1, -1) |
+| `mapPhysicalToScreenCoordinates:forLayer:` past the layers | ends the process (SIGSEGV) |
+| the pass, with and without a viewport of the screen's size | 32,768 fragments, each at its pixel, decoded to the same pixel |
+| a fresh descriptor's `mutability` and `minFactor` (SPI); a map's | 2 (Immutable) and 0; the descriptor's |
+| a `Mutable` map not reset (`setMutability:` on its descriptor) | compiled at its creation: 256 x 128, and its coordinate maps answer |
+| a map of no layers | its creator ends the process (SIGSEGV) |
+| `copyParameterDataToBuffer:offset:` into a Private buffer | ends the process (SIGSEGV) |
+| `formattedDescription:` (SPI) | Metal's base map's: the description, then the label, the screen's width and height, the layer count, the granularity's width and height and the parameter data's size and alignment, a line each |
+
+So the AMD's maps do not vary the rate: a pass over one draws every pixel. The M3 Max and the M4
+compile Apple's map (metal2vulkan's runtime, `rate_map.rs`, measured there): a physical size
+below the screen's where the samples are below 1, 24,624 bytes of parameter data aligned to 4,
+the coordinate maps past the layers reading the last layer, and supporting 1 or 2 layers, not
+0. Both answer what a correct app reads back, so the two families' answers bound the contract
+*(class 1)*.
+
+What our stack does: the host's map, the platform's compile (`RATE_MAP_CREATE`, design.md); the
+layer counts the platform supports, 1 and 2 (the M3's answer, as before, for 0); a map of no
+layers made, as the M3 makes it. The bundle ends the process where every Mac does, at a copy
+into a Private buffer, and where the M3's map does and the AMD's answers nothing the host can
+give: a coordinate map of a map of no layers or of an empty screen, and the physical-to-screen
+map of a `Mutable` map not yet reset.
+
 ## Not measured
 
 - Cross-process lock waits for pending GPU work: rgk-lock's `lock_probe` (x86 matches the M3,
