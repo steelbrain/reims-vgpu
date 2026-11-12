@@ -862,6 +862,52 @@ sends no length byte after GET_KEY_BY_INDEX's index, nor after
 GET_KEY_TYPE's key: a device that waits for one leaves AppleSMC reading the
 status port about 33,000 times a second until its timeout.
 
+### x86-64 macOS guests: the disk on NVMe
+
+A VM whose settings choose NVMe has its system disk on QEMU's `nvme`
+device of its own at slot 10, with `discard=unmap` on its drive; every
+other VM has it on ICH9's AHCI controller (`crates/reims-ctl/src/qemu.rs`):
+
+```sh
+-drive id=disk,if=none,format=qcow2,file=disk.qcow2,discard=unmap \
+-device nvme,drive=disk,serial=reims-ctl,addr=0xa
+```
+
+macOS's IONVMeFamily drives it in Recovery and once installed. Disk Utility
+names the disk `QEMU NVMe Ctrl Media` there, and `QEMU HARDDISK Media` on
+AHCI.
+
+**Measured** on 2026-11-12, with the guest set and option ROM of
+`a379a5a45`, each guest given 6 GiB:
+- Recovery 26.6.2 (25G83), the image `reims-ctl create --macos tahoe`
+  downloads, reached its menu 20 to 32 s after QEMU started with a new disk
+  on NVMe, and in 30 s on AHCI (jobs m3-max-19896 on `homelab-um870-1`,
+  20026 and 20013 on `homelab-gem10-1`, each on a Radeon 780M). On NVMe,
+  Disk Utility erased the disk as APFS, and macOS 26.7.3 installed onto it
+  and reached its desktop through Setup Assistant (jobs 20026 and 20047).
+- Recovery 11.6 (20G165), 12.5.1 (21G83), 13.4.1 (22F82), 14.6.1 (23G93)
+  and 15.4.1 (24E263), the images `--macos 11` to `15` download, each
+  reached its menu with a new disk on NVMe, and Disk Utility listed the disk
+  (137.44 GB, PCI-Express, `disk0`) and erased it as APFS (jobs m3-max-20246
+  and 20278, the Radeon 780M on `homelab-um870-1`).
+- Installed 11.7.11, 12.7.6, 13.7.8, 14.8.9, 15.8.2 and 26.7.2, each booted
+  from overlays of its disks with the disk on NVMe, answered SSH 12 to 23 s
+  after QEMU started and presented their desktops, with `disk0` on
+  `QEMU NVMe Ctrl` (job m3-max-20061, the RTX 3090 on `homelab-um870-1`;
+  not timing runs).
+
+On 2026-10-27 a new macOS 26 VM on NVMe booted Recovery slowly and listed
+no disk, and NVMe was not the cause. Two video drivers of that day's guest
+set (reims-util `cbde8611`, for the paravirtualized GPU since deleted)
+waited in their start, with no timeout, for an IOSurface mapper that
+macOS 26's Recovery leaves unbound. With that set, Recovery 26.6.2 stopped
+at the Apple logo's progress bar on NVMe (44% at 8 min, job m3-max-20142)
+and on AHCI (46% at 13 min, job 20158), on `homelab-ms01-1`'s Iris Xe; the
+set of its next commit, `8a8a852`, which bounds only those two waits,
+reached the menu in 40 s and listed the NVMe disk in Disk Utility (job
+20143). No boot with that set was watched past 13 minutes, so whether its
+Recovery came up at last, and without the disk, as reported, was not seen.
+
 ### x86-64 macOS guests: VMware SVGA
 
 reims-ctl runs an x86-64 VM with `graphics = "vmware-svga"` on QEMU's VMware
