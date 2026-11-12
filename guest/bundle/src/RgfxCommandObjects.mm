@@ -1128,8 +1128,11 @@ struct RgfxBarrierSlot {
 // --- RESIDENCY SETS ---------------------------------------------------------------------------
 // The arm64 device's queue holds the sets it is given, each as many times as it was added, and
 // lets one go once it is removed as many times, as Metal's queue counts them in an NSCountedSet
-// (measured: the M3 Max, macOS 27.0.1, tools/oracle/oracle_residency's queue and retain cases):
-// the device keeps every allocation resident, so holding them is all a queue does. A nil set
+// (measured: the M3 Max, macOS 27.0.1, tools/oracle/oracle_residency's queue, retain and hold
+// cases): the device keeps every allocation resident, so holding them is all a queue does. The
+// M3's queue lets a set go a moment after its last removal, on a thread of its own (held right
+// after it, gone 100 ms later, with no buffer made); this one lets it go at that removal, as no
+// correct use can depend on what a moment decides. A nil set
 // raises the counted set's NSInvalidArgumentException, as Metal's queue does; a set never added
 // is removed with nothing done. The x86 device makes no set (RgfxMakesResidencySets), and its
 // queue logs one it is given.

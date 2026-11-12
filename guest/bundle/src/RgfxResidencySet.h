@@ -16,7 +16,8 @@
  *  - allocationCount counts the committed allocations and the adds, the marked ones among them
  *    until the commit drops them; containsAllocation: and allAllocations answer the adds and the
  *    committed ones not marked (allAllocations in the order they were committed, then added).
- *  - The set retains each allocation it holds, a marked one until the commit drops it.
+ *  - The set retains each allocation it holds, a marked one until the commit drops it, and lets
+ *    the dropped ones go at that commit, not when the caller's autorelease pool drains.
  *  - allocatedSize is what the last commit left: 0 before one, then the bytes of the memory the
  *    committed allocations lie in, each piece of memory once however many of them lie there: a
  *    heap's resources count their heap, a view its texture, a texture over a buffer its buffer,

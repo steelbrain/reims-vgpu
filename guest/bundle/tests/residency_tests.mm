@@ -360,8 +360,9 @@ void test_residency_set_sizes()
 	drainRing(fx.ring);
 }
 
-// The set holds each allocation it holds, a removed one until the commit drops it, as the M3
-// Max's set does (oracle_residency's hold case).
+// The set holds each allocation it holds, a removed one until the commit drops it, and lets it
+// go at that commit, before the caller's pool drains, as the M3 Max's set does (oracle_residency's
+// hold case, whose commits run in no pool of their own).
 void test_residency_set_holds_its_allocations()
 {
 	Fixture fx;
@@ -373,17 +374,13 @@ void test_residency_set_holds_its_allocations()
 		[s addAllocation:r];
 	}
 	CHECK(w != nil && s.allocationCount == 1);
-	@autoreleasepool {
-		[s commit];
-	}
+	[s commit];
 	CHECK(w != nil);
 	@autoreleasepool {
 		[s removeAllocation:w];
 	}
 	CHECK(w != nil && s.allocationCount == 1);
-	@autoreleasepool {
-		[s commit];
-	}
+	[s commit];
 	CHECK(w == nil && s.allocationCount == 0);
 	@autoreleasepool {
 		id<MTLBuffer> r = [RgfxBuffer bufferWithLength:4096 options:0 device:nil serializer:&fx.ser];
@@ -393,10 +390,34 @@ void test_residency_set_holds_its_allocations()
 		[s removeAllAllocations];
 	}
 	CHECK(w != nil);
-	@autoreleasepool {
-		[s commit];
-	}
+	[s commit];
 	CHECK(w == nil && s.allocationCount == 0);
+	// A view and its texture, both dropped at one commit, both let go at it.
+	__weak id wt = nil;
+	@autoreleasepool {
+		MTLTextureDescriptor *d =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:64
+		                                                      height:64
+		                                                   mipmapped:NO];
+		d.storageMode = MTLStorageModePrivate;
+		id<MTLTexture> t = [RgfxTexture textureWithDescriptor:d
+		                                                 heap:RGFX_OBJ_NONE
+		                                           heapOffset:0
+		                                               device:nil
+		                                           serializer:&fx.ser];
+		id<MTLTexture> v = [t newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm];
+		wt = t;
+		w = v;
+		[s addAllocation:t];
+		[s addAllocation:v];
+		[s commit];
+		[s removeAllocation:v];
+		[s removeAllocation:t];
+	}
+	CHECK(w != nil && wt != nil);
+	[s commit];
+	CHECK(w == nil && wt == nil && s.allocationCount == 0);
 	// An add taken back lets the allocation go.
 	@autoreleasepool {
 		id<MTLBuffer> r = [RgfxBuffer bufferWithLength:4096 options:0 device:nil serializer:&fx.ser];

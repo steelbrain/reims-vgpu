@@ -174,7 +174,7 @@ id memoryOf(id allocation)
 		if (allocations[i] == nil)
 			endsTheProcess("removeAllocations:count:");
 	}
-	NS_VALID_UNTIL_END_OF_SCOPE NSArray *held = [NSArray arrayWithObjects:allocations count:count];
+	NS_VALID_UNTIL_END_OF_SCOPE NSArray *held = [[NSArray alloc] initWithObjects:allocations count:count];
 	os_unfair_lock_lock(&_lock);
 	for (id allocation in held)
 		[self rgfxRemove:allocation];
@@ -184,9 +184,10 @@ id memoryOf(id allocation)
 - (void)removeAllAllocations
 {
 	os_unfair_lock_lock(&_lock);
-	NS_VALID_UNTIL_END_OF_SCOPE NSArray *takenBack = [_added.array copy]; // let go after the lock
+	NS_VALID_UNTIL_END_OF_SCOPE NSOrderedSet *takenBack = [_added copy]; // let go after the lock
 	[_added removeAllObjects];
-	[_removed addObjectsFromArray:_committed.array];
+	for (id allocation in _committed)
+		[_removed addObject:allocation];
 	os_unfair_lock_unlock(&_lock);
 }
 
@@ -204,7 +205,7 @@ id memoryOf(id allocation)
 - (NSArray<id<MTLAllocation>> *)allAllocations
 {
 	os_unfair_lock_lock(&_lock);
-	NSMutableArray *all = [NSMutableArray arrayWithCapacity:_committed.count + _added.count];
+	NSMutableArray *all = [[NSMutableArray alloc] initWithCapacity:_committed.count + _added.count];
 	for (id allocation in _committed) {
 		if (![_removed containsObject:allocation])
 			[all addObject:allocation];
@@ -225,8 +226,13 @@ id memoryOf(id allocation)
 - (void)commit
 {
 	os_unfair_lock_lock(&_lock);
-	NS_VALID_UNTIL_END_OF_SCOPE NSArray *dropped =
-	    _removed.count != 0 ? _removed.allObjects : nil; // let go after the lock
+	// The allocations the commit drops, let go after the lock, and as it returns: an autoreleased
+	// list (NSSet's allObjects) would keep them until the caller's pool drains, where the M3 Max's
+	// set lets them go at its commit (oracle_residency's hold case).
+	NS_VALID_UNTIL_END_OF_SCOPE NSMutableArray *dropped =
+	    [[NSMutableArray alloc] initWithCapacity:_removed.count];
+	for (id allocation in _removed)
+		[dropped addObject:allocation];
 	for (id allocation in dropped) {
 		[_committed removeObject:allocation];
 		id memory = memoryOf(allocation);
