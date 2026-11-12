@@ -6594,6 +6594,230 @@ fn a_managed_range_behind_an_answered_walk_holds_up_nothing_on_ring_0() {
     );
 }
 
+/// A process's queue rings at `submit`, `complete` (data `RING_DATA`), queue `n` of context 1,
+/// on `device`, after the guest granted their blocks.
+fn managed_order_queue(
+    device: &GraphicsDevice<FakePlatform>,
+    guest: &mut Guest,
+    n: u64,
+    (submit, complete): (u64, u64),
+) -> QueueRing {
+    const RING_DATA: u32 = 0x1_0000;
+    assert_eq!(
+        create_queue(device, guest, 1, n, (submit, complete), RING_DATA, 0),
+        RGFX_STATUS_OK
+    );
+    QueueRing::new(device, submit, complete, u64::from(RING_DATA))
+}
+
+/// `BUFFER_DID_MODIFY_RANGE` of `obj_id`'s 0x10 bytes at `location`.
+fn modified_range(obj_id: u64, location: u64) -> Vec<u8> {
+    RgfxBufferDidModifyRange {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_BUFFER_DID_MODIFY_RANGE,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+        location,
+        length: 0x10,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// Where in `calls` the `didModifyRange:` of the 0x10 bytes at `location` was made.
+fn modified_at(calls: &[reims_vgpu_vulkan::core::testkit::calllog::Call], location: u64) -> usize {
+    let range = Arg::val(&reims_vgpu_vulkan::core::platform::types::NsRange::new(
+        location, 0x10,
+    ));
+    (calls.iter())
+        .position(|c| c.sel == "didModifyRange:" && c.args.first() == Some(&range))
+        .unwrap_or_else(|| panic!("no didModifyRange: at {location:#x}"))
+}
+
+/// Where in `calls` the last `commit` was made.
+fn last_commit(calls: &[reims_vgpu_vulkan::core::testkit::calllog::Call]) -> usize {
+    (calls.iter().rposition(|c| c.sel == "commit")).expect("no commit")
+}
+
+/// A `Managed` buffer's range on ring 0 reaches the platform before the commit of a command
+/// buffer its process sends after it that asks for its `CB_SUBMITTED`, Metal's encode,
+/// `didModifyRange:` and commit, whose doorbell write may answer it on the guest's vCPU. While the
+/// range's `didModifyRange:` is still being made, ring 0 is not carried out through it: the write
+/// answers nothing and nothing is committed, and the buffer is answered and committed after it.
+/// Once ring 0 is carried out through the next range, the write of a buffer that asks answers it
+/// at once, its ticket issued after the range, and its commit still comes after the range
+#[test]
+fn a_managed_range_comes_before_a_later_buffer_answered_at_its_doorbell() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    let mut guest = Guest::new(&device);
+    let mut ring = managed_order_queue(&device, &mut guest, 1, (SUBMIT, COMPLETE));
+    guest.send(&device, block_grant(1, BLOCK, 0x1_0000));
+    let mut managed = buffer_over_host_memory(obj(1, 2), BLOCK, 0x1000);
+    let options = std::mem::offset_of!(RgfxBufferOverHostMemory, options);
+    managed[options..options + 4].copy_from_slice(&(1u32 << 4).to_le_bytes());
+    guest.send(&device, managed);
+    let held = HeldCall::new();
+    platform
+        .faults()
+        .at("MTLBuffer", "didModifyRange:", 0, Fault::Hold(held.clone()));
+    guest.send(&device, modified_range(obj(1, 2), 0x40));
+    assert!(
+        held.reached(Duration::from_secs(60)),
+        "the range's didModifyRange: was not made"
+    );
+    wait_idle(&device, SUBMIT);
+    assert!(
+        ring.send_as_guest(&device, asking(obj(1, 1), 100)),
+        "the guest rang no doorbell for an idle ring"
+    );
+    assert!(
+        !ring.has_event(),
+        "answered before ring 0 carried out the range"
+    );
+    assert!(
+        platform.world().committed().is_empty(),
+        "committed before the range"
+    );
+    held.open();
+    assert_eq!(
+        ring_events(&platform, &mut ring, 2),
+        [
+            (RGFX_EVT_CB_SUBMITTED, 100, 0),
+            (RGFX_EVT_CB_COMPLETE, 100, u64::from(RGFX_CB_OK))
+        ]
+    );
+    let calls = platform.call_log().calls();
+    assert!(modified_at(&calls, 0x40) < last_commit(&calls));
+
+    guest.send(&device, modified_range(obj(1, 2), 0x80));
+    assert_eq!(
+        sampler_answered(&device, &mut guest, obj(1, 4)),
+        RGFX_STATUS_OK,
+        "ring 0 carried out through the range"
+    );
+    wait_idle(&device, SUBMIT);
+    assert!(
+        ring.send_as_guest(&device, asking(obj(1, 1), 101)),
+        "the guest rang no doorbell for an idle ring"
+    );
+    assert!(ring.has_event(), "the write did not answer the buffer");
+    committed(&platform, 1);
+    let calls = platform.call_log().calls();
+    assert!(modified_at(&calls, 0x80) < last_commit(&calls));
+}
+
+/// A `Managed` buffer's range on ring 0 reaches the platform before the commit of a command
+/// buffer its process sends after it on another of its queues, as on the queue that used it last
+#[test]
+fn a_managed_range_comes_before_a_later_buffer_of_another_queue() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    let mut guest = Guest::new(&device);
+    let first = (
+        RGFX_CONTEXT_ALLOCATIONS_OFFSET,
+        RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000,
+    );
+    let second = (
+        RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x4_0000,
+        RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x6_0000,
+    );
+    let mut ring = managed_order_queue(&device, &mut guest, 1, first);
+    let mut other = managed_order_queue(&device, &mut guest, 5, second);
+    guest.send(&device, block_grant(1, BLOCK, 0x1_0000));
+    let mut managed = buffer_over_host_memory(obj(1, 2), BLOCK, 0x1000);
+    let options = std::mem::offset_of!(RgfxBufferOverHostMemory, options);
+    managed[options..options + 4].copy_from_slice(&(1u32 << 4).to_le_bytes());
+    guest.send(&device, managed);
+    ring.send(&device, command_buffer(obj(1, 1), 100));
+    committed(&platform, 1);
+    guest.send(&device, modified_range(obj(1, 2), 0x40));
+    other.send(&device, asking(obj(1, 5), 101));
+    committed(&platform, 2);
+    let calls = platform.call_log().calls();
+    assert!(modified_at(&calls, 0x40) < last_commit(&calls));
+}
+
+/// A `Managed` texture's `TEXTURE_REPLACE_REGION` on ring 0 reaches the platform's texture, the
+/// GPU copy of a discrete GPU, before the commit of a command buffer its process sends after it
+/// that asks for its `CB_SUBMITTED`, as a `Managed` buffer's range does
+#[test]
+fn a_managed_texture_s_replaced_region_comes_before_a_later_buffer() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    platform.device().set_unified_memory(false);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    let mut guest = Guest::new(&device);
+    let mut ring = managed_order_queue(&device, &mut guest, 1, (SUBMIT, COMPLETE));
+    guest.send(&device, block_grant(1, BLOCK, 0x1_0000));
+    guest.send(&device, resource_id_chunk(1, 0));
+    // 16x16 RGBA8, one level: 1024 bytes of CPU copy.
+    guest.send(&device, buffer_over_host_memory(obj(1, 2), BLOCK, 0x1000));
+    let texture = RgfxManagedTextureCreate {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_MANAGED_TEXTURE_CREATE,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id: obj(1, 3),
+        gpu_address: 0,
+        resource_id: 1,
+        cpu_buffer_obj_id: obj(1, 2),
+        bytes_per_block: 4,
+        block_width: 1,
+        block_height: 1,
+        flags: RGFX_MANAGED_TEXTURE_LINEAR,
+        desc: RgfxTextureDescriptor {
+            pixel_format: 70,
+            texture_type: 2,
+            width: 16,
+            height: 16,
+            depth: 1,
+            mipmap_level_count: 1,
+            array_length: 1,
+            sample_count: 1,
+            usage: 1,
+            options: 1 << 4,
+            ..RgfxTextureDescriptor::default()
+        },
+    };
+    guest.send(&device, texture.as_bytes().to_vec());
+    let replace = RgfxTextureReplaceRegion {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_TEXTURE_REPLACE_REGION,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id: obj(1, 3),
+        level: 0,
+        slice: 0,
+        origin: [2, 1, 0],
+        size: [4, 3, 1],
+    };
+    guest.send(&device, replace.as_bytes().to_vec());
+    wait_idle(&device, SUBMIT);
+    ring.send_as_guest(&device, asking(obj(1, 1), 100));
+    committed(&platform, 1);
+    let calls = platform.call_log().calls();
+    let replaced = (calls.iter())
+        .position(|c| {
+            c.sel == "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:"
+        })
+        .expect("no replaceRegion:");
+    assert!(replaced < last_commit(&calls));
+}
+
 /// A library from region chunks is checked against its own process's blocks, whichever process
 /// sent the message before it: process 1's chunk over its block, sent after process 2's create,
 /// is made; process 2's chunk over process 1's block is refused
