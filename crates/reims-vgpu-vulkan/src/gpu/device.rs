@@ -2813,8 +2813,12 @@ pub(crate) mod tests {
     /// device caches), is an image over the buffer's memory that holds them, where the device's
     /// own linear images lay their rows at the texture's pitch: the runtime counts it among the
     /// images that do (`unobserved_padding_aliases`) and shadows nothing. Over a buffer made as
-    /// any other the same texture is a shadow (`BytesBetweenRows`), counted among the shadowed
-    /// textures. The rows lie as the guest's surfaces' do on a host that answers its linear row
+    /// any other the same texture, which renders, is an image over the buffer's memory that keeps
+    /// the padding (`kept_padding_aliases`) where the device's check of renders over its pooled
+    /// memory passed for rows that end as these do (its report's `Pooled renders` line, read
+    /// before the textures are made, as a verdict still pending makes a shadow), and a shadow
+    /// (`BytesBetweenRows`, counted among the shadowed textures) where it did not. The rows
+    /// lie as the guest's surfaces' do on a host that answers its linear row
     /// alignment (`linear_row_alignment`): one texel past the alignment, a row of `BGRA8Unorm`
     /// texels 4 bytes past it, in rows twice it apart. Where it is past Metal's 16 bytes the
     /// device's images lay their rows at its multiples (the runtime's probe of them: 256 on
@@ -2848,15 +2852,35 @@ pub(crate) mod tests {
         });
         let counts = || {
             let counts = d.raw.work_counts();
-            (counts.unobserved_padding_aliases, counts.shadowed_textures)
+            (
+                counts.unobserved_padding_aliases,
+                counts.shadowed_textures,
+                counts.kept_padding_aliases,
+            )
         };
         let texture_over = |buffer: Option<VulkanBuffer>| {
             let before = counts();
             let texture = (buffer.expect("a buffer")).new_texture(OnFault::Return, &desc, 0, pitch);
             assert!(matches!(texture, Ok(Some(_))), "a texture");
             let after = counts();
-            (after.0 - before.0, after.1 - before.1)
+            (after.0 - before.0, after.1 - before.1, after.2 - before.2)
         };
+        // The check's verdict for renders over pooled memory whose rows end as these do: in the
+        // lines of the device's line size, or on them.
+        let line = d.raw.in_place_check_line();
+        let row = width * 4;
+        let rows_on_lines = line > 0
+            && (0..height).all(|k| (k * pitch) % line == 0 && (k * pitch + row) % line == 0);
+        let verdict = if rows_on_lines {
+            "Pooled renders, rows on lines: "
+        } else {
+            "Pooled renders: "
+        };
+        let renders_kept = d
+            .raw
+            .in_place_check_report()
+            .iter()
+            .any(|l| l.strip_prefix(verdict) == Some("Passed"));
         let length = pitch * height;
         let declared =
             d.new_buffer_of_length_padding_unobserved(OnFault::Return, length, PRIVATE, None);
@@ -2865,12 +2889,17 @@ pub(crate) mod tests {
             d.new_buffer_of_length(OnFault::Return, length, PRIVATE)
                 .unwrap(),
         );
-        assert_eq!(plain, (0, 1), "a shadow over a buffer made as any other");
+        let kept_or_shadow = if renders_kept { (0, 0, 1) } else { (0, 1, 0) };
+        assert_eq!(
+            plain, kept_or_shadow,
+            "over a buffer made as any other: its memory where the check of pooled renders \
+             passed ({verdict}{renders_kept}), else a shadow"
+        );
         if align > 16 {
-            assert_eq!(declared, (1, 0), "over the buffer's memory, at {align}");
+            assert_eq!(declared, (1, 0, 0), "over the buffer's memory, at {align}");
         } else {
             assert!(
-                declared == (1, 0) || declared == (0, 1),
+                declared == (1, 0, 0) || declared == (0, 1, 0),
                 "over its memory or a shadow: {declared:?}"
             );
         }
