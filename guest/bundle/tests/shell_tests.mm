@@ -11505,6 +11505,8 @@ void test_no_copy_buffers_over_the_same_bytes_share_a_block()
 	vm_address_t app = 0;
 	CHECK(vm_allocate(mach_task_self(), &app, 0x10000, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
 	uint8_t *p = reinterpret_cast<uint8_t *>(app);
+	// Written, so its pages are there, as the kext's wire of a block faults them in.
+	std::memset(p, 0x5a, 0x10000);
 	auto noCopy = [&](void *ptr, NSUInteger length, MTLResourceOptions options) {
 		return [RgfxBuffer bufferWithBytesNoCopy:ptr
 		                                  length:length
@@ -11571,6 +11573,84 @@ void test_no_copy_buffers_over_the_same_bytes_share_a_block()
 		CHECK(six.block_offset != joined);
 	}
 	CHECK(eventually([&] { return blocks.released.size() == 4; }));
+	drainRing(f.control);
+	vm_deallocate(mach_task_self(), app, 0x10000);
+	}
+	CHECK(!RgfxMemoryShadow::anyLive());
+}
+
+
+// A no-copy buffer over other memory the app mapped at the address and length a live one's lies
+// over takes a pages block of its own (RgfxRegion::acquirePages): WindowServer maps one layer's
+// image where another's was while a buffer over the other still lives, and a buffer joined to the
+// other's block would have the GPU read the other's pages, its old contents, where the app wrote
+// the new (System Settings' labels showed the pane before's strings). The kext is asked again,
+// BUFFER_OVER_PAGES names the new block, a third buffer over the new memory joins it, and each
+// block goes back once the host has dropped the buffers over it.
+void test_no_copy_buffer_over_remapped_memory_takes_its_own_block()
+{
+	@autoreleasepool {
+	QueueFixture f;
+	(void)expectQueueCreate(f.control);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x200000, 0xff);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	RgfxRegionSlabSource slabSource(region, f.ser, false, true);
+	RgfxSlabs slabs(slabSource);
+	struct Pages {
+		int asked = 0;
+		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x100000;
+		static bool block(void *c, const void *, uint64_t, bool, uint64_t *offset, uint64_t *size)
+		{
+			Pages *p = static_cast<Pages *>(c);
+			p->asked++;
+			*offset = p->next;
+			*size = 0x5000;
+			p->next += 0x10000;
+			return true;
+		}
+	} pages;
+	region.setPagesBlockSource(&Pages::block, &pages);
+	vm_address_t app = 0;
+	CHECK(vm_allocate(mach_task_self(), &app, 0x10000, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
+	uint8_t *p = reinterpret_cast<uint8_t *>(app);
+	std::memset(p, 0x11, 0x10000);
+	auto noCopy = [&](void *ptr, NSUInteger length) {
+		return [RgfxBuffer bufferWithBytesNoCopy:ptr
+		                                  length:length
+		                                 options:MTLResourceStorageModeShared
+		                             deallocator:nil
+		                                  region:&region
+		                                   slabs:&slabs
+		                                  device:nil
+		                              serializer:&f.ser];
+	};
+	const uint64_t first = pages.next;
+	@autoreleasepool {
+		RgfxBuffer *old = noCopy(p, 0x4000);
+		CHECK(old != nil && pages.asked == 1);
+		auto one = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+		CHECK(one.block_offset == first);
+		// Other memory at the same address, with other contents, while the buffer lives.
+		vm_address_t again = app;
+		CHECK(vm_allocate(mach_task_self(), &again, 0x10000,
+		                  VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) == KERN_SUCCESS);
+		CHECK(again == app);
+		std::memset(p, 0x22, 0x10000);
+		RgfxBuffer *fresh = noCopy(p, 0x4000);
+		CHECK(fresh != nil && [fresh contents] == p && pages.asked == 2);
+		auto two = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+		CHECK(two.block_offset != first && two.obj_id == fresh.rgfxObjId);
+		CHECK(region.pagesRejoinsRefused() == 1);
+		RgfxBuffer *third = noCopy(p, 0x4000);
+		CHECK(third != nil && pages.asked == 2);
+		auto three = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+		CHECK(three.block_offset == two.block_offset && region.pagesRejoinsRefused() == 1);
+	}
+	CHECK(eventually([&] { return blocks.released.size() == 2; }));
+	CHECK(std::find(blocks.released.begin(), blocks.released.end(), first) !=
+	      blocks.released.end());
 	drainRing(f.control);
 	vm_deallocate(mach_task_self(), app, 0x10000);
 	}
@@ -17066,6 +17146,7 @@ int main(int argc, char **argv)
 		test_no_copy_buffers();
 		test_no_copy_buffers_in_place();
 		test_no_copy_buffers_over_the_same_bytes_share_a_block();
+		test_no_copy_buffer_over_remapped_memory_takes_its_own_block();
 		test_no_copy_shadows_lie_in_slabs();
 		test_binds_note_shadow_writes();
 		test_block_call();

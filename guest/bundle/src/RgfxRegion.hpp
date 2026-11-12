@@ -49,6 +49,7 @@
 #include <map>
 #include <mutex>
 #include <tuple>
+#include <vector>
 
 #include "reims_graphics_wire.h"
 
@@ -280,11 +281,28 @@ public:
 	/// view of the pages, and one copy of them where it copies them: two no-copy buffers over the
 	/// same memory lie in one host memory, as on a Mac they lie in the same pages. A block stays
 	/// joinable until leavePages() was called for each time it was given: the caller calls it as
-	/// the object over the block goes for the app, while the app still keeps the memory, so a
-	/// block is never joined over memory the app freed and took again at the same address. It goes
-	/// back through the block source at the release() for the last time it was given.
+	/// the object over the block goes for the app. It goes back through the block source at the
+	/// release() for the last time it was given.
+	///
+	/// The same bytes are the same memory only where the process still maps it there: an object
+	/// can outlive the app's hold of the memory under it (a texture over the buffer, a command
+	/// buffer that holds it), and the app may unmap the memory and map other memory at the same
+	/// address meanwhile, as WindowServer maps one layer's image where another's was. So a block
+	/// is joined only where the memory at the bytes is what it was when the block was given: the
+	/// same VM object at the same offset in each VM region the bytes span
+	/// (rgfxPagesIdentity, read once the block's pages are wired, which may give a
+	/// copy-on-write mapping an object of its own). A block whose bytes hold other memory now is
+	/// joinable no longer, and the bytes take a block of their own; so do bytes whose memory
+	/// cannot be told (no object yet, a hole). Joined over other memory, a buffer's GPU reads
+	/// and writes would reach the old memory's pages, wired under the old block, while the app
+	/// writes the new: in a macOS 26.7.2 guest, System Settings' labels drew the strings of
+	/// labels on the pane before.
 	Block acquirePages(const void *address, uint64_t length, bool writable,
 	                   uint32_t join = kPagesOwn);
+
+	/// How many times acquirePages found a joinable block for the bytes asked whose memory is
+	/// other memory now, which it then joined no longer (a diagnostic).
+	uint64_t pagesRejoinsRefused() const;
 
 	/// acquirePages' `join` for a block of its own, given to no one else.
 	static const uint32_t kPagesOwn = 0;
@@ -361,15 +379,25 @@ private:
 		uint64_t size;
 		uint32_t joinable; // the times given whose leavePages has not come
 		uint32_t held;     // the times given whose release has not come
+		// The memory the bytes were when the block was given (rgfxPagesIdentity).
+		std::vector<uint64_t> identity;
 	};
 	std::map<PagesRange, uint64_t> m_joinablePages;
 	std::map<uint64_t, JoinedPages> m_joinedPages;
-	std::mutex m_pagesLock;
+	uint64_t m_rejoinsRefused = 0; // pagesRejoinsRefused(), under m_pagesLock
+	mutable std::mutex m_pagesLock;
 	SurfaceWritesFn m_writesNote = nullptr; // the surface write source, where set (the kext)
 	SurfaceRetireFn m_writesRetire = nullptr;
 	void *m_writesContext = nullptr;
 
 	std::mutex m_lock;
 };
+
+/// The memory the `length` bytes at `address` lie in, in this process, now: for each VM region
+/// they span, in order, its VM object (mach_vm_region_recurse's `object_id_full`, which no other
+/// live object of the kernel's has), the offset in that object of the first of the bytes the
+/// region holds, and how many of them it holds. False where a byte is not mapped, a region has
+/// no object yet, or the kernel answers no `object_id_full`.
+bool rgfxPagesIdentity(const void *address, uint64_t length, std::vector<uint64_t> *identity);
 
 #endif // RGFX_REGION_HPP_

@@ -443,9 +443,10 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 // didModifyRange: after a map for writing (measured: a macOS 26.6.1 guest on the RTX 5080 host,
 // 2026-11-11). The Managed buffer's address keeps the pointer's offset in its page too.
 //
-// Buffers over the same bytes share their pages block (RgfxRegion::acquirePages), so the host
-// makes one view of the pages, and one copy where it copies them rather than importing them, as on
-// a Mac they lie in the same pages. Apple's OpenCL makes such buffers: a Shared no-copy one over
+// Buffers over the same bytes share their pages block (RgfxRegion::acquirePages) while those bytes
+// are the same memory, so the host makes one view of the pages, and one copy where it copies them
+// rather than importing them, as on a Mac they lie in the same pages; over other memory the app
+// mapped at the same address since, a buffer takes a block of its own. Apple's OpenCL makes such buffers: a Shared no-copy one over
 // its staging pages at each clEnqueueWriteBuffer, the same pages each time, while the one before
 // still lives (measured: a macOS 26.6.1 guest on the RTX 5080 host, 2026-11-11). One with Metal's
 // private bit 24, which the host's runtime takes as read-only memory, joins only its own kind,

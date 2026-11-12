@@ -5,7 +5,14 @@
 
 #include "RgfxRegion.hpp"
 
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <os/log.h>
+
 #include <cstring>
+
+#include "RgfxLog.hpp"
+#include "RgfxLogOnce.hpp"
 
 RgfxRegion::RgfxRegion(volatile uint8_t *base, uint64_t size)
     : m_base(base), m_size(size), m_floor(RGFX_ALLOCATIONS_OFFSET), m_cursor(RGFX_ALLOCATIONS_OFFSET)
@@ -185,6 +192,42 @@ RgfxRegion::Block RgfxRegion::acquireChunkedPages(uint64_t length)
 	return out;
 }
 
+bool rgfxPagesIdentity(const void *address, uint64_t length, std::vector<uint64_t> *identity)
+{
+	identity->clear();
+	mach_vm_address_t at = reinterpret_cast<uintptr_t>(address);
+	const mach_vm_address_t end = at + length;
+	if (length == 0 || end < at)
+		return false;
+	natural_t depth = 0;
+	while (at < end) {
+		mach_vm_address_t base = at;
+		mach_vm_size_t size = 0;
+		vm_region_submap_info_data_64_t info = {};
+		mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_V2_COUNT_64;
+		if (mach_vm_region_recurse(mach_task_self(), &base, &size, &depth,
+		                           reinterpret_cast<vm_region_recurse_info_t>(&info),
+		                           &count) != KERN_SUCCESS)
+			return false;
+		// The region found is the one holding `at`, or the next one past a hole.
+		if (base > at)
+			return false;
+		if (info.is_submap) {
+			depth++;
+			continue;
+		}
+		if (count < VM_REGION_SUBMAP_INFO_V2_COUNT_64 || info.object_id_full == 0)
+			return false;
+		const mach_vm_address_t stop = base + size < end ? base + size : end;
+		identity->push_back(info.object_id_full);
+		identity->push_back(info.offset + (at - base));
+		identity->push_back(stop - at);
+		at = stop;
+		depth = 0;
+	}
+	return true;
+}
+
 RgfxRegion::Block RgfxRegion::acquirePages(const void *address, uint64_t length, bool writable,
                                            uint32_t join)
 {
@@ -193,16 +236,36 @@ RgfxRegion::Block RgfxRegion::acquirePages(const void *address, uint64_t length,
 		return out; // ok == false
 	const PagesRange range = {reinterpret_cast<uintptr_t>(address), length, writable, join};
 	if (join != kPagesOwn) {
+		std::vector<uint64_t> now;
+		const bool known = rgfxPagesIdentity(address, length, &now);
 		std::lock_guard<std::mutex> guard(m_pagesLock);
 		auto it = m_joinablePages.find(range);
 		if (it != m_joinablePages.end()) {
 			JoinedPages &joined = m_joinedPages.at(it->second);
-			joined.joinable++;
-			joined.held++;
-			out.offset = it->second;
-			out.size = joined.size;
-			out.ok = true;
-			return out;
+			if (known && now == joined.identity) {
+				joined.joinable++;
+				joined.held++;
+				out.offset = it->second;
+				out.size = joined.size;
+				out.ok = true;
+				return out;
+			}
+			// Other memory at the bytes now: the block is joinable no longer, and stays held
+			// by the objects over it until their releases.
+			static char site;
+			if (rgfxLogFirst(&site))
+				os_log_info(rgfxLog(),
+				            "RGFX: a no-copy buffer over %llu bytes takes a pages block of its own: "
+				            "a live one over the same address and length lies over the memory the "
+				            "process mapped there before",
+				            (unsigned long long)length);
+			os_log_debug(rgfxLog(),
+			             "RGFX: no join of the pages block at 0x%llx for %llu bytes at %p: the "
+			             "memory there is other memory now",
+			             (unsigned long long)it->second, (unsigned long long)length, address);
+			joined.joinable = 0;
+			m_joinablePages.erase(it);
+			m_rejoinsRefused++;
 		}
 	}
 	uint64_t offset = 0, size = 0;
@@ -212,17 +275,25 @@ RgfxRegion::Block RgfxRegion::acquirePages(const void *address, uint64_t length,
 		release(offset);
 		return out;
 	}
-	// A block the kext gave for the same bytes on another thread meanwhile stays the one joined;
-	// this one is its own.
-	if (join != kPagesOwn) {
+	// Joinable where the memory can be told, as it is now its pages are wired; a block the kext
+	// gave for the same bytes on another thread meanwhile stays the one joined, and this one is
+	// its own.
+	std::vector<uint64_t> identity;
+	if (join != kPagesOwn && rgfxPagesIdentity(address, length, &identity)) {
 		std::lock_guard<std::mutex> guard(m_pagesLock);
 		if (m_joinablePages.emplace(range, offset).second)
-			m_joinedPages[offset] = JoinedPages{range, size, 1, 1};
+			m_joinedPages[offset] = JoinedPages{range, size, 1, 1, std::move(identity)};
 	}
 	out.offset = offset;
 	out.size = size;
 	out.ok = true;
 	return out;
+}
+
+uint64_t RgfxRegion::pagesRejoinsRefused() const
+{
+	std::lock_guard<std::mutex> guard(m_pagesLock);
+	return m_rejoinsRefused;
 }
 
 void RgfxRegion::leavePages(uint64_t offset)

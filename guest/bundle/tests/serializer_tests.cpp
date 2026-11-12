@@ -11,6 +11,8 @@
  */
 
 #include <IOKit/IOReturn.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -3034,7 +3036,9 @@ void test_region_pages_joins()
 	} src;
 	region.setBlockSource(&Source::alloc, &Source::release, &src);
 	region.setPagesBlockSource(&Source::block, &src);
+	// Written, so every page has its object, as the kext's wire of a block faults them in.
 	static uint8_t bytes[0x8000];
+	std::memset(bytes, 0x5a, sizeof(bytes));
 	const uint32_t join = 1;
 
 	RgfxRegion::Block a = region.acquirePages(bytes, 0x4000, true, join);
@@ -3080,6 +3084,109 @@ void test_region_pages_joins()
 	region.leavePages(others[4].offset);
 	region.release(others[4].offset);
 	CHECK(src.released.size() == 3 && src.released[2] == others[4].offset);
+}
+
+// A joinable pages block is joined only while the memory at its bytes is the memory it was given
+// for (RgfxRegion::acquirePages, rgfxPagesIdentity): new memory mapped at the same address and
+// length, with other contents, takes a block of its own while the first is still held and
+// joinable, and the first is joinable no longer, its leaves and releases still its own; the same
+// memory mapped again at the same address and offset joins; the same memory at another offset,
+// and memory with no pages yet, do not.
+void test_region_pages_join_over_remapped_memory()
+{
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	struct Source {
+		int asked = 0;
+		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x10000;
+		std::vector<uint64_t> released;
+		static bool block(void *c, const void *, uint64_t, bool, uint64_t *offset, uint64_t *size)
+		{
+			Source *s = static_cast<Source *>(c);
+			s->asked++;
+			*offset = s->next;
+			*size = 0x4000;
+			s->next += 0x4000;
+			return true;
+		}
+		static bool alloc(void *, uint64_t, uint64_t, uint64_t *) { return false; }
+		static void release(void *c, uint64_t offset)
+		{
+			static_cast<Source *>(c)->released.push_back(offset);
+		}
+	} src;
+	region.setBlockSource(&Source::alloc, &Source::release, &src);
+	region.setPagesBlockSource(&Source::block, &src);
+	const uint32_t join = 1;
+	const mach_vm_size_t length = 0x8000;
+	mach_vm_address_t at = 0;
+	CHECK(mach_vm_allocate(mach_task_self(), &at, length, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
+	uint8_t *bytes = reinterpret_cast<uint8_t *>(at);
+	std::memset(bytes, 0xaa, length);
+	std::vector<uint64_t> first;
+	CHECK(rgfxPagesIdentity(bytes, 0x4000, &first) && first.size() == 3);
+
+	RgfxRegion::Block a = region.acquirePages(bytes, 0x4000, true, join);
+	RgfxRegion::Block b = region.acquirePages(bytes, 0x4000, true, join);
+	CHECK(a.ok && b.ok && a.offset == b.offset && src.asked == 1);
+	CHECK(region.pagesRejoinsRefused() == 0);
+
+	// Other memory at the same address, other contents: a block of its own, the first still
+	// held twice and never asked to join again.
+	mach_vm_address_t again = at;
+	CHECK(mach_vm_allocate(mach_task_self(), &again, length, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) ==
+	      KERN_SUCCESS);
+	CHECK(again == at);
+	std::memset(bytes, 0x55, length);
+	std::vector<uint64_t> second;
+	CHECK(rgfxPagesIdentity(bytes, 0x4000, &second) && second != first);
+	RgfxRegion::Block c = region.acquirePages(bytes, 0x4000, true, join);
+	CHECK(c.ok && c.offset != a.offset && src.asked == 2);
+	CHECK(region.pagesRejoinsRefused() == 1);
+	RgfxRegion::Block d = region.acquirePages(bytes, 0x4000, true, join);
+	CHECK(d.ok && d.offset == c.offset && src.asked == 2 && region.pagesRejoinsRefused() == 1);
+	// The first block's leaves and releases are its own: it goes back at its last release, and
+	// the second stays joinable.
+	region.leavePages(a.offset);
+	region.leavePages(a.offset);
+	region.release(a.offset);
+	CHECK(src.released.empty());
+	region.release(a.offset);
+	CHECK(src.released.size() == 1 && src.released[0] == a.offset);
+	CHECK(region.acquirePages(bytes, 0x4000, true, join).offset == c.offset && src.asked == 2);
+
+	// The same memory mapped again at the same address and offset: joined.
+	mach_vm_size_t entrySize = length;
+	mach_port_t entry = MACH_PORT_NULL;
+	CHECK(mach_make_memory_entry_64(mach_task_self(), &entrySize, at,
+	                                VM_PROT_READ | VM_PROT_WRITE, &entry,
+	                                MACH_PORT_NULL) == KERN_SUCCESS);
+	mach_vm_address_t mapped = at;
+	CHECK(mach_vm_map(mach_task_self(), &mapped, length, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+	                  entry, 0, false, VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE,
+	                  VM_INHERIT_NONE) == KERN_SUCCESS);
+	CHECK(mapped == at && bytes[0] == 0x55);
+	CHECK(region.acquirePages(bytes, 0x4000, true, join).offset == c.offset && src.asked == 2);
+	CHECK(region.pagesRejoinsRefused() == 1);
+	// The same memory at another offset: other memory for these bytes.
+	CHECK(mach_vm_map(mach_task_self(), &mapped, length - 0x1000, 0,
+	                  VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, entry, 0x1000, false,
+	                  VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE,
+	                  VM_INHERIT_NONE) == KERN_SUCCESS);
+	RgfxRegion::Block e = region.acquirePages(bytes, 0x4000, true, join);
+	CHECK(e.ok && e.offset != c.offset && src.asked == 3 && region.pagesRejoinsRefused() == 2);
+	mach_port_deallocate(mach_task_self(), entry);
+
+	// Memory with no pages yet: no identity, so neither joined nor joinable.
+	CHECK(mach_vm_allocate(mach_task_self(), &again, length, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) ==
+	      KERN_SUCCESS);
+	std::vector<uint64_t> none;
+	CHECK(!rgfxPagesIdentity(bytes, 0x4000, &none));
+	RgfxRegion::Block f = region.acquirePages(bytes, 0x4000, true, join);
+	RgfxRegion::Block g = region.acquirePages(bytes, 0x4000, true, join);
+	CHECK(f.ok && g.ok && f.offset != e.offset && g.offset != f.offset && src.asked == 5);
+	CHECK(region.pagesRejoinsRefused() == 3);
+	mach_vm_deallocate(mach_task_self(), at, length);
 }
 
 // Where the kext maps parts of blocks write-combined, a block asked with a write-combined part
@@ -3162,6 +3269,7 @@ int main()
 	test_obj_ids_are_given_once();
 	test_region_pages_blocks();
 	test_region_pages_joins();
+	test_region_pages_join_over_remapped_memory();
 	test_region_write_combined_parts();
 	test_address_picks();
 	test_resource_id_chunks();
