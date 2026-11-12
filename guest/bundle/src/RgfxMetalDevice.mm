@@ -1277,8 +1277,9 @@ RGFX_LOG_UNRECOGNIZED
 	return _caps.textureBufferAlignment(static_cast<uint64_t>(format));
 }
 
-// The device's linear alignment (256) for the formats the x86-64 Macs answer, as both answer it;
-// Metal ends the process at every other (rgfxEndAtUnalignableLinearFormat). The bundle's own callers ask
+// The format's own linear alignment, the host GPU's (RgfxCaps::minimumLinearTextureAlignment),
+// for the formats the x86-64 Macs answer (both answer 256 for each); Metal ends the process at
+// every other (rgfxEndAtUnalignableLinearFormat). The bundle's own callers ask
 // rgfxLinearTextureAlignmentForPixelFormat:, which ends nothing, as Metal's own texture creators
 // over a buffer do not end it there.
 - (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format

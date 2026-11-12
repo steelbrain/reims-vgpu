@@ -931,12 +931,16 @@ pub fn fake_identity_caps() -> IdentityCaps {
         feature_sets,
         counter_sampling: caps::COUNTER_SAMPLING_POINTS.map(|p| Some(p == 0)),
         architecture_name: Some(String::from("fake_gpu")),
-        // 16 for each texture-buffer format; a 4-byte texel's tiles for every format.
+        // 16 for each texture-buffer format's texture buffers and linear textures, as the
+        // fake's device-wide linear alignments; a 4-byte texel's tiles for every format.
         formats: caps::SDK_PIXEL_FORMATS
             .iter()
             .map(|&format| FormatAnswers {
                 format,
                 texture_buffer_alignment: caps::TEXTURE_BUFFER_FORMATS
+                    .contains(&format)
+                    .then_some(16),
+                linear_alignment: caps::TEXTURE_BUFFER_FORMATS
                     .contains(&format)
                     .then_some(16),
                 sparse_tiles: Some([

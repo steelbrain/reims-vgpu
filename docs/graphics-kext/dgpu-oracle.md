@@ -479,10 +479,12 @@ choice inside the envelope *(class 2)*: `maxBufferLength` at most three quarters
 `recommendedMaxWorkingSetSize`, the rule the 5300M and the M3 answer by (4ee4bcaf0).
 `minimumLinearTextureAlignmentForPixelFormat:` and the SPI linear alignments describe the GPU,
 each Mac answering its own, so the device answers the host GPU's: the platform's, 256 on RADV
-and 128 on NVIDIA's driver (`device_info.rs`). The lane answered 256 for every format from
-4ee4bcaf0 and 4a329e614, as both x86 GPUs answer, while the platform answered Metal's 16 on
-every host; on NVIDIA's driver, which takes a linear image in place only at its own pitch, rows
-at 256 bytes were shadows wherever that pitch is not one.
+and 128 on NVIDIA's driver (`device_info.rs`). Both x86 GPUs answer one value for every format;
+a host GPU that asks more of larger texels answers each format its own, and the SPI ones the
+largest (a Radeon RX 550: 256 bytes for texels of 1 to 4 bytes, 512 for 8, 1024 for 16). The
+lane answered 256 for every format from 4ee4bcaf0 and 4a329e614, as both x86 GPUs answer, while
+the platform answered Metal's 16 on every host; on NVIDIA's driver, which takes a linear image
+in place only at its own pitch, rows at 256 bytes were shadows wherever that pitch is not one.
 
 ## Q10: runtime source compile
 

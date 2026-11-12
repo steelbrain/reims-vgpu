@@ -4,7 +4,8 @@
 //! Each answer comes from one of these sources, and is `None` where none gives it:
 //! - **the runtime's answer**: `name`'s companions in `DeviceProperties` (`hasUnifiedMemory`,
 //!   `maxBufferLength`, the argument-buffer and read-write texture tiers,
-//!   `supports32BitFloatFiltering`), `sparseTileSizeInBytes`, each format's sparse tiles,
+//!   `supports32BitFloatFiltering`), `sparseTileSizeInBytes`, each format's sparse tiles and
+//!   `minimumLinearTextureAlignmentForPixelFormat:`,
 //!   `supportsFamily:`, `supportsVertexAmplificationCount:` and
 //!   `supportsRasterizationRateMapWithLayerCount:`;
 //! - **a stand-in**, [`crate::gpu::caps`]' (its table), for
@@ -166,8 +167,13 @@ fn sparse_page(page: i64) -> Option<rt::SparsePageSize> {
     .find_map(|(p, raw)| (raw == page).then_some(p))
 }
 
-/// The answers of `format` [`FormatAnswers`] holds: the runtime's sparse tiles, and, of a format
-/// Metal answers it of ([`TEXTURE_BUFFER_FORMATS`]), the alignment of its texture buffers:
+/// The answers of `format` [`FormatAnswers`] holds: the runtime's sparse tiles; the runtime's
+/// `minimumLinearTextureAlignmentForPixelFormat:` of a format a buffer backs, the device's own
+/// answer for that format (`rt::Device::minimum_linear_texture_alignment_for_pixel_format`, which
+/// differs between formats on some GPUs: on a Radeon RX 550, 256 bytes for texels of 1 to 4
+/// bytes, 512 for 8 and 1024 for 16, read on 2026-11-12, where the device's
+/// `linearTextureAlignmentBytes` is the largest of every format's); and, of a format Metal
+/// answers it of ([`TEXTURE_BUFFER_FORMATS`]), the alignment of its texture buffers:
 /// `minimumLinearTextureAlignmentForPixelFormat:` as this platform answers it, a stand-in
 /// ([`crate::gpu::caps::linear_alignment`]), which Metal answers alike for every format of the
 /// SDK (measured, an M3 Max under macOS 27.2). `None` for a format the runtime has no enumerator
@@ -183,6 +189,9 @@ fn format_answers(device: &rt::Device, format: u64) -> FormatAnswers {
         .contains(&format)
         .then(|| crate::gpu::caps::linear_alignment(device, pf).ok())
         .flatten();
+    let linear_alignment = device
+        .minimum_linear_texture_alignment_for_pixel_format(pf)
+        .ok();
     let mut tiles = [[0; 3]; 9];
     let pairs = SPARSE_SAMPLE_COUNTS
         .iter()
@@ -196,6 +205,7 @@ fn format_answers(device: &rt::Device, format: u64) -> FormatAnswers {
     FormatAnswers {
         format,
         texture_buffer_alignment,
+        linear_alignment,
         sparse_tiles: Some(tiles),
     }
 }
@@ -520,6 +530,22 @@ mod tests {
         assert_eq!(bgra8.sparse_tiles.unwrap()[0], [64, 64, 1]);
         let bc1 = identity.formats.iter().find(|f| f.format == 130).unwrap();
         assert_eq!(bc1.texture_buffer_alignment, None);
+        // Each format a buffer backs answers its own linear alignment, the runtime's, at least
+        // Metal's 16 and at most the device's `linearTextureAlignmentBytes`, the largest of
+        // every format's; a format no buffer backs (BC1_RGBA) answers none. Printed, by answer.
+        assert_eq!(bc1.linear_alignment, None);
+        let largest = caps.limits.linear_texture_alignment_bytes;
+        let mut by_answer = std::collections::BTreeMap::<u64, Vec<u64>>::new();
+        for answers in &identity.formats {
+            let Some(alignment) = answers.linear_alignment else {
+                continue;
+            };
+            assert!(alignment.is_power_of_two(), "{}: {alignment}", answers.format);
+            assert!((16..=largest).contains(&alignment), "{}: {alignment}", answers.format);
+            by_answer.entry(alignment).or_default().push(answers.format);
+        }
+        assert!(by_answer.contains_key(&bgra8.linear_alignment.unwrap()));
+        eprintln!("linear alignments (largest {largest}), by answer: {by_answer:?}");
     }
 
     /// The budget of the device's own memory is some of it, no more than its device-local heaps

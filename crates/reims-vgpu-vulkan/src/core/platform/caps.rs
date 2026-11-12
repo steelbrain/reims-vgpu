@@ -216,6 +216,11 @@ pub struct FormatAnswers {
     /// `minimumTextureBufferAlignmentForPixelFormat:`; `None` for a format Metal does not answer
     /// (it asserts) or where the platform has no answer.
     pub texture_buffer_alignment: Option<u64>,
+    /// `minimumLinearTextureAlignmentForPixelFormat:` as the platform answers it: the alignment of
+    /// a texture's offset and rows in a buffer at which the host GPU's images hold a texture of
+    /// the format in place; `None` for a format no buffer backs (a compressed, depth or stencil
+    /// one, at which Metal's query asserts) or where the platform has no answer.
+    pub linear_alignment: Option<u64>,
     /// `sparseTileSizeWithTextureType:pixelFormat:sampleCount:sparsePageSize:` of a 2D texture,
     /// width, height and depth, at each of [`SPARSE_SAMPLE_COUNTS`] (major) and each of
     /// [`SPARSE_PAGE_SIZES`]: the same for every texture type (measured on the M3 Max); `None`

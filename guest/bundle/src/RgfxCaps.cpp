@@ -135,7 +135,9 @@ uint64_t RgfxCaps::linearTextureAlignment() const
 
 uint64_t RgfxCaps::minimumLinearTextureAlignment(uint64_t format) const
 {
-	(void)format;
+	const RgfxFormatAnswers *a = formatAnswers(m_info, format);
+	if (a != nullptr && a->linear_alignment != 0)
+		return a->linear_alignment;
 	return limit(kRgfxLimitLinearTextureAlignmentBytes);
 }
 

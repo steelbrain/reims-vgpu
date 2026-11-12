@@ -551,17 +551,25 @@ void test_caps()
 	info.identity_flags[kRgfxIdentityIsLowPower] = 1;              // first by position
 	info.identity_flags[kRgfxIdentitySupportsPlacementSparse] = 1; // last by position
 	info.counter_sampling[0] = 1; // at stage boundaries
-	info.format_count = 1;
+	info.format_count = 3;
 	info.formats[0].format = 80; // BGRA8Unorm
 	info.formats[0].texture_buffer_alignment = 16;
+	info.formats[0].linear_alignment = 256;
 	info.formats[0].sparse_tiles[0][0] = 64; // 1 sample, 16 KiB pages
 	info.formats[0].sparse_tiles[0][1] = 64;
 	info.formats[0].sparse_tiles[0][2] = 1;
 	info.formats[0].sparse_tiles[8][0] = 128; // 4 samples, 256 KiB pages
 	info.formats[0].sparse_tiles[8][1] = 128;
 	info.formats[0].sparse_tiles[8][2] = 1;
-	info.formats[1].format = 70; // past format_count: not read
-	info.formats[1].texture_buffer_alignment = 16;
+	// A host GPU whose linear images ask more of larger texels: a 16-byte texel's 1024 bytes
+	// beside a 4-byte texel's 256, the largest the device's linearTextureAlignmentBytes.
+	info.formats[1].format = 125; // RGBA32Float
+	info.formats[1].linear_alignment = 1024;
+	info.formats[2].format = 70; // RGBA8Unorm
+	info.formats[2].linear_alignment = 256;
+	info.formats[3].format = 115; // RGBA16Float, past format_count: not read
+	info.formats[3].texture_buffer_alignment = 16;
+	info.formats[3].linear_alignment = 512;
 	const char *arch = "test_arch";
 	info.architecture_name_len = static_cast<uint32_t>(std::strlen(arch));
 	std::memcpy(info.architecture_name, arch, info.architecture_name_len);
@@ -570,7 +578,7 @@ void test_caps()
 	info.primitive_types[3] = 1;
 	info.write_rounding_modes[1] = 1; // mode 2
 	info.limits[kRgfxLimitDeviceLinearTextureAlignmentBytes] = 64;
-	info.limits[kRgfxLimitLinearTextureAlignmentBytes] = 256;
+	info.limits[kRgfxLimitLinearTextureAlignmentBytes] = 1024;
 	info.limits[kRgfxLimitIOSurfaceReadOnlyTextureAlignmentBytes] = 32;
 	info.limits[kRgfxLimitIOSurfaceTextureAlignmentBytes] = 128;
 	info.limits[kRgfxLimitMaxViewportCount] = 16; // last by position
@@ -607,14 +615,17 @@ void test_caps()
 	CHECK(!caps.supportsCounterSampling(5));
 	CHECK(std::strcmp(caps.architectureName(), "test_arch") == 0);
 	CHECK(caps.textureBufferAlignment(80) == 16);
-	CHECK(caps.textureBufferAlignment(70) == 0); // listed past the count
+	CHECK(caps.textureBufferAlignment(115) == 0); // listed past the count
 	CHECK(caps.textureBufferAlignment(130) == 0); // not listed
-	// The linear alignment is the one limit for every format, never 0: those with a
-	// texture-buffer answer, and those without, where Metal ends the process.
+	// The linear alignment is each format's own where the blob answers it, and the device's
+	// largest, never 0, where it does not: a format listed without one, listed past the count,
+	// or not listed, where Metal ends the process.
 	CHECK(caps.minimumLinearTextureAlignment(80) == 256);
-	CHECK(caps.minimumLinearTextureAlignment(70) == 256);  // listed past the count
-	CHECK(caps.minimumLinearTextureAlignment(130) == 256); // not listed (ASTC)
-	CHECK(caps.minimumLinearTextureAlignment(0) == 256);   // Invalid
+	CHECK(caps.minimumLinearTextureAlignment(70) == 256);
+	CHECK(caps.minimumLinearTextureAlignment(125) == 1024);
+	CHECK(caps.minimumLinearTextureAlignment(115) == 1024); // listed past the count
+	CHECK(caps.minimumLinearTextureAlignment(130) == 1024); // not listed (ASTC)
+	CHECK(caps.minimumLinearTextureAlignment(0) == 1024);   // Invalid
 	uint64_t tile[3];
 	CHECK(caps.sparseTile(80, 1, 101, tile) && tile[0] == 64 && tile[1] == 64 && tile[2] == 1);
 	CHECK(caps.sparseTile(80, 4, 103, tile) && tile[0] == 128 && tile[2] == 1);
@@ -635,7 +646,7 @@ void test_caps()
 	// The IOSurface alignments the device answers, at their places between the linear ones.
 	CHECK(caps.limit(kRgfxLimitIOSurfaceReadOnlyTextureAlignmentBytes) == 32);
 	CHECK(caps.limit(kRgfxLimitIOSurfaceTextureAlignmentBytes) == 128);
-	CHECK(caps.limit(kRgfxLimitLinearTextureAlignmentBytes) == 256);
+	CHECK(caps.limit(kRgfxLimitLinearTextureAlignmentBytes) == 1024);
 	CHECK(caps.limit(kRgfxLimitMaxViewportCount) == 16);
 	CHECK(caps.flag(kRgfxFlagAreRasterOrderGroupsSupported));
 	CHECK(caps.flag(kRgfxFlagSupportsTileShaders));

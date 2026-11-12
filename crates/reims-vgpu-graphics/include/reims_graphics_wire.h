@@ -4077,8 +4077,11 @@ typedef struct {
   // every texture type: width, height and depth, at sample counts 1, 2 and 4 (major) and
   // pages of 16, 64 and 256 KiB; all 0 where the host has no answer.
   uint16_t sparse_tiles[RGFX_DEVICE_INFO_SPARSE_TILES][3];
-  // Zero.
-  uint8_t reserved_3e[2];
+  // `minimumLinearTextureAlignmentForPixelFormat:`, in bytes: the host GPU's alignment of a
+  // texture's offset and rows in a buffer for this format; 0 where the host has no answer of
+  // the format (one no buffer backs, among them) or one past 65535, where the guest answers
+  // the device's `linearTextureAlignmentBytes`, the largest of every format's.
+  uint16_t linear_alignment;
 } RgfxFormatAnswers;
 
 // The device-info caps blob the host writes once at device init, read by the

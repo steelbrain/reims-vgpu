@@ -72,6 +72,11 @@ fn format_answers(answers: &FormatAnswers) -> RgfxFormatAnswers {
             .texture_buffer_alignment
             .and_then(|a| u32::try_from(a).ok())
             .unwrap_or(0),
+        // Past 65535 none, where the guest answers the device's largest, which is at least it.
+        linear_alignment: answers
+            .linear_alignment
+            .and_then(|a| u16::try_from(a).ok())
+            .unwrap_or(0),
         ..RgfxFormatAnswers::default()
     };
     if let Some(tiles) = answers.sparse_tiles {
@@ -321,15 +326,21 @@ fn cap_apple_families(identity: &mut IdentityCaps, wired: &[Piece]) {
 /// `deviceLinearTextureAlignmentBytes` are the platform's too, as each Mac answers its own GPU's
 /// (256 bytes on an AMD Radeon Pro 5300M and an Intel UHD 630, 16 on an Apple M3 Max, macOS
 /// 26.7.1): the alignment of a texture's offset and rows in a buffer at which the host GPU's
-/// linear images hold it in place, the largest of the formats a buffer backs
-/// (`Device::minimum_linear_texture_alignment_for_pixel_format` of the runtime, which asks the
-/// driver whether its images take a texture's reads, renders and shader writes in place, and
-/// answers at least the device's `nonCoherentAtomSize`: 256 on RADV and 128 on NVIDIA's driver,
-/// read from its records on the hosts, 2026-11-12; 64 on ANV, whose stores write back a row's
-/// last 64-byte line whole, and on lavapipe; 16 on MoltenVK). The guest's frameworks lay the
-/// rows of a texture over a buffer out at a multiple of it, and its device answers nil to one off
-/// it, as the 5300M's does (`RgfxBuffer.mm`): over a cold boot and a 15 s Safari scroll of a
-/// macOS 11.7.11 guest on a Radeon 780M, 1399 textures were shadows for their pitch with the
+/// linear images hold it in place (`Device::minimum_linear_texture_alignment_for_pixel_format` of
+/// the runtime, which asks the driver whether its images take a texture's reads, renders and
+/// shader writes in place, and answers at least the device's `nonCoherentAtomSize`: 256 on RADV
+/// and 128 on NVIDIA's driver, read from its records on the hosts, 2026-11-12; 64 on ANV, whose
+/// stores write back a row's last 64-byte line whole, and on lavapipe; 16 on MoltenVK). The
+/// selector answers each format's own, as the format answers carry it
+/// ([`RgfxFormatAnswers::linear_alignment`]), and the SPI ones the largest of the formats a
+/// buffer backs. The Macs measured answer one value for every format, but a host GPU may ask more
+/// of larger texels: a Radeon RX 550 answers 256 bytes for texels of 1 to 4 bytes, 512 for 8 and
+/// 1024 for 16 (read on 2026-11-12). With the largest for every format, a texture of smaller
+/// texels at its own alignment was nil: Geekbench's `MPSImageGaussianBlur` source on the RX 550,
+/// `RGBA8Unorm` rows of 7680 bytes over a buffer, against 1024. The guest's frameworks lay the
+/// rows of a texture over a buffer out at a multiple of the answer, and its device answers nil to
+/// one off it, as the 5300M's does (`RgfxBuffer.mm`): over a cold boot and a 15 s Safari scroll
+/// of a macOS 11.7.11 guest on a Radeon 780M, 1399 textures were shadows for their pitch with the
 /// device answering 16 (A8 rows of 64 and 128 bytes, a BGRA8 surface 463 pixels wide at 1856),
 /// and 11 with it answering 512. A layout at the GPU's own pitch is one the runtime takes in
 /// place: on NVIDIA's driver only that pitch is (the tight row rounded up to 128), so rows at
@@ -928,13 +939,16 @@ mod tests {
         assert_eq!(info.sizes[14], 2);
         assert_eq!(info.sizes[15..], [10, 0xe, 0x54, 0]);
         // Every SDK format, each the platform's: BGRA8Unorm (80) 16-byte texture buffers and
-        // 64x64 tiles; BC1_RGBA (130) no texture buffers.
+        // linear textures and 64x64 tiles; BC1_RGBA (130) neither texture buffers nor linear
+        // textures.
         assert_eq!(info.format_count as usize, SDK_PIXEL_FORMATS.len());
         let at = |f: u32| info.formats.iter().find(|a| a.format == f).unwrap();
         assert_eq!(at(80).texture_buffer_alignment, 16);
+        assert_eq!(at(80).linear_alignment, 16);
         assert_eq!(at(80).sparse_tiles[0], [64, 64, 1]);
         assert_eq!(at(80).sparse_tiles[8], [128, 128, 1]);
         assert_eq!(at(130).texture_buffer_alignment, 0);
+        assert_eq!(at(130).linear_alignment, 0);
     }
 
     /// `maxBufferLength` is three quarters of the working set rounded down to 16 KiB where that is
@@ -997,6 +1011,34 @@ mod tests {
         let info = device_info(&caps, identity, 4, GuestArch::X86_64, None);
         assert_eq!(info.limits[0], 1024);
         assert_eq!(info.limits[3], 512);
+    }
+
+    /// `minimumLinearTextureAlignmentForPixelFormat:` is each format's own, the platform's: a
+    /// 16-byte texel's 1024 bytes beside a 4-byte texel's 256, while the SPI linear alignments
+    /// stay the largest of every format's; an answer past the blob's 65535 is none, where the
+    /// guest answers the largest.
+    #[test]
+    fn each_format_carries_its_own_linear_alignment() {
+        let p = Arc::new(FakePlatform::new());
+        let mut caps = (*p.device().caps()).clone();
+        caps.limits.linear_texture_alignment_bytes = 1024;
+        caps.limits.device_linear_texture_alignment_bytes = 1024;
+        let mut identity = p.device().identity_caps();
+        let mut set = |format: u64, alignment: Option<u64>| {
+            let answers = identity.formats.iter_mut().find(|f| f.format == format);
+            answers.unwrap().linear_alignment = alignment;
+        };
+        set(70, Some(256)); // RGBA8Unorm
+        set(125, Some(1024)); // RGBA32Float
+        set(80, Some(1 << 16)); // BGRA8Unorm, past the blob's field
+        let info = device_info(&caps, identity, 4, GuestArch::X86_64, None);
+        let at = |f: u32| info.formats.iter().find(|a| a.format == f).unwrap();
+        assert_eq!(at(70).linear_alignment, 256);
+        assert_eq!(at(125).linear_alignment, 1024);
+        assert_eq!(at(80).linear_alignment, 0);
+        assert_eq!(at(130).linear_alignment, 0); // BC1_RGBA: no buffer backs it
+        assert_eq!(info.limits[0], 1024);
+        assert_eq!(info.limits[3], 1024);
     }
 
     /// On a GPU that shares the CPU's memory the working set is three quarters of the guest's RAM

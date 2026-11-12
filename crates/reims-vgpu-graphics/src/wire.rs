@@ -3640,8 +3640,11 @@ pub struct RgfxFormatAnswers {
     /// every texture type: width, height and depth, at sample counts 1, 2 and 4 (major) and
     /// pages of 16, 64 and 256 KiB; all 0 where the host has no answer.
     pub sparse_tiles: [[u16; 3]; RGFX_DEVICE_INFO_SPARSE_TILES],
-    /// Zero.
-    pub reserved_3e: [u8; 2],
+    /// `minimumLinearTextureAlignmentForPixelFormat:`, in bytes: the host GPU's alignment of a
+    /// texture's offset and rows in a buffer for this format; 0 where the host has no answer of
+    /// the format (one no buffer backs, among them) or one past 65535, where the guest answers
+    /// the device's `linearTextureAlignmentBytes`, the largest of every format's.
+    pub linear_alignment: u16,
 }
 
 /// The device-info caps blob the host writes once at device init, read by the
@@ -4559,6 +4562,7 @@ const _: () = {
     assert!(size_of::<RgfxIcbSlotRun>() == 32);
     assert!(RGFX_LIBRARY_BYTES_OFFSET as usize == size_of::<RgfxLibraryCreate>());
     assert!(size_of::<RgfxFormatAnswers>() == 64);
+    assert!(core::mem::offset_of!(RgfxFormatAnswers, linear_alignment) == 0x3e);
     assert!(size_of::<RgfxDeviceInfo>() == 1432 + 64 * RGFX_DEVICE_INFO_FORMATS);
     assert!(core::mem::offset_of!(RgfxDeviceInfo, formats) == 1432);
     assert!(core::mem::offset_of!(RgfxDeviceInfo, family_answers) == 976);
