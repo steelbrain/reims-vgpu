@@ -2959,8 +2959,10 @@ pub(crate) mod tests {
     /// memory, not a shadow: rows of 88 texels of `RGBA16Float` (704 bytes, CoreAnimation's
     /// rows of such a surface) and of `BGRA8Unorm` (352), 8 high, that only sample, as the
     /// textures over macOS 26.7.2's caches the runtime shadowed for their pitch on an RX 7900 XTX
-    /// do. Asked again it answers the same. A device whose formats' images lay such rows apart
-    /// otherwise answers none, and promises nothing
+    /// do. It lies over the padding as unobserved only where the pitch passes the row: a device
+    /// whose images lay such rows side by side (MoltenVK's on an M3 Max and ANV's on Iris Xe lay
+    /// the 704-byte rows so, measured) lays the texture over the buffer as it is. Asked again it answers the same. A device whose
+    /// formats' images lay such rows apart otherwise answers none, and promises nothing
     #[test]
     fn a_texture_at_the_device_s_pitch_of_a_plane_s_rows_lies_over_its_memory() {
         use crate::core::platform::Platform as _;
@@ -3030,8 +3032,8 @@ pub(crate) mod tests {
             let after = counts();
             assert_eq!(
                 (after.0 - before.0, after.1 - before.1),
-                (1, 0),
-                "{pixel_format}: over the buffer's memory at {pitch}"
+                (u64::from(pitch > row), 0),
+                "{pixel_format}: over the buffer's memory at {pitch}, its rows {row}"
             );
         }
     }
