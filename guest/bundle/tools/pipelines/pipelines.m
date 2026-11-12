@@ -40,6 +40,11 @@
 //             query a device answers with no compile (on a guest, its round trip to the host).
 //   cp.lib, cp.const, cp.warm, cp.async.8   the same for k_blur's compute pipeline (its weights
 //             a function constant).
+//   mps.fn           kernels of MPSCore's default.metallib, the ones Vision's person segmentation
+//             makes first (those the library holds): each one's newFunctionWithName: (fn, its
+//             first in this process, then again: fn2), newFunctionWithName:constantValues:error:
+//             with each of its function constants 0 (spec), its compute pipeline (cp, then again:
+//             cp2). A second process shows what outlives the first (the host's caches).
 //   draw.first       a pipeline of a fresh library, then a command buffer of one draw into a
 //             256 x 256 target, commit to completed (first), then the same buffer again (next):
 //             the first draw's stall is first - next.
@@ -545,6 +550,87 @@ static NSString *computeCase(int kind)
 	return stat(@"ms", times);
 }
 
+// The kernels Vision's person segmentation makes first, in its order (macOS 26.7.2 guest).
+static NSString *const kMpsKernels[] = {
+	@"cnnConvArray_32x32_128",
+	@"depthwise_convolution_3x3_no_stride_no_dilation_no_multiplier",
+	@"dequantizeGeneric",
+	@"depthwise_convolution_3x3_2stridex_no_dilation_no_multiplier",
+	@"TARR_elementwise_add_f16_pack4",
+	@"depthwise_convolution_3x3_no_multiplier",
+	@"MPSCNNPooling_new_tex2darray_tex2darray_max_2x2_2",
+	@"TARR_concat_kernel_f16",
+	@"TARR_activation_step_f16_pack4",
+	@"TARR_read_tex2darray_4h_unpacked",
+	@"TARR_write_tex2darray_4h_unpacked",
+	@"TARR_image_scale_bias",
+};
+
+// Each of `function`'s constants 0.
+static MTLFunctionConstantValues *zeroConstants(id<MTLFunction> function)
+{
+	MTLFunctionConstantValues *v = [MTLFunctionConstantValues new];
+	static const uint8_t zeros[64] = {0};
+	[function.functionConstantsDictionary
+	    enumerateKeysAndObjectsUsingBlock:^(NSString *name, MTLFunctionConstant *c, BOOL *stop) {
+		    [v setConstantValue:zeros type:c.type withName:name];
+	    }];
+	return v;
+}
+
+static NSString *mpsFunctions(void)
+{
+	NSString *path = @"/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/"
+	                 @"Frameworks/MPSCore.framework/Resources/default.metallib";
+	if (![[NSFileManager defaultManager] fileExistsAtPath:path])
+		return @"SKIP no MPSCore default.metallib";
+	NSError *err = nil;
+	double t0 = now();
+	id<MTLLibrary> lib = [gDevice newLibraryWithURL:[NSURL fileURLWithPath:path] error:&err];
+	const double libMs = ms(t0);
+	if (lib == nil)
+		return [@"FAIL library: " stringByAppendingString:err.localizedDescription ?: @"nil"];
+	NSSet *names = [NSSet setWithArray:lib.functionNames];
+	NSMutableArray *fn = [NSMutableArray array], *fn2 = [NSMutableArray array],
+	               *spec = [NSMutableArray array], *cp = [NSMutableArray array],
+	               *cp2 = [NSMutableArray array];
+	int absent = 0, refused = 0, constants = 0;
+	for (size_t i = 0; i < sizeof kMpsKernels / sizeof kMpsKernels[0]; i++) {
+		NSString *name = kMpsKernels[i];
+		if (![names containsObject:name]) {
+			absent++;
+			continue;
+		}
+		t0 = now();
+		id<MTLFunction> f = [lib newFunctionWithName:name];
+		[fn addObject:@(ms(t0))];
+		t0 = now();
+		f = [lib newFunctionWithName:name];
+		[fn2 addObject:@(ms(t0))];
+		MTLFunctionConstantValues *values = zeroConstants(f);
+		constants += (int)f.functionConstantsDictionary.count;
+		t0 = now();
+		id<MTLFunction> s = [lib newFunctionWithName:name constantValues:values error:&err];
+		[spec addObject:@(ms(t0))];
+		if (s == nil) {
+			refused++;
+			continue;
+		}
+		t0 = now();
+		id<MTLComputePipelineState> p = [gDevice newComputePipelineStateWithFunction:s error:&err];
+		[cp addObject:@(ms(t0))];
+		t0 = now();
+		id<MTLComputePipelineState> again = [gDevice newComputePipelineStateWithFunction:s error:&err];
+		[cp2 addObject:@(ms(t0))];
+		if (p == nil || again == nil)
+			refused++;
+	}
+	return [NSString stringWithFormat:@"lib_ms=%.2f kernels=%lu absent=%d refused=%d constants=%d %@ %@ %@ %@ %@",
+	                                  libMs, (unsigned long)fn.count, absent, refused, constants,
+	                                  stat(@"fn", fn), stat(@"fn2", fn2), stat(@"spec", spec),
+	                                  stat(@"cp", cp), stat(@"cp2", cp2)];
+}
+
 // heapTextureSizeAndAlignWithDescriptor: of a private RGBA8 texture of a fresh width each
 // repetition, which no cache answers.
 static NSString *queryCase(void)
@@ -813,6 +899,7 @@ int main(int argc, char **argv)
 		runCase(@"cp.const", ^{ return computeCase(1); });
 		runCase(@"cp.warm", ^{ return computeCase(3); });
 		runCase(@"cp.async.8", ^{ return asyncCase(YES, 8); });
+		runCase(@"mps.fn", ^{ return mpsFunctions(); });
 		runCase(@"draw.first", ^{ return drawFirst(); });
 		runCase(@"draw.topology", ^{ return drawTopology(); });
 		runCase(@"dispatch.first", ^{ return dispatchFirst(); });
