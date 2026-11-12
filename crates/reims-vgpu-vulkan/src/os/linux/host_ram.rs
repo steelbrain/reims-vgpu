@@ -323,6 +323,18 @@ pub(crate) fn copy_from_host_ram(
     (encoder.copy_from_host_ram(ram, runs, destination, destination_offset)).map_err(refused)
 }
 
+/// The runtime's copy of `runs` of `ram`, each a byte of `destination` and a run of host
+/// addresses whose bytes land from that byte on, on `encoder`: one call however many runs, as
+/// [`copy_to_host_ram`] copies the other way; one it refuses encodes nothing.
+pub(crate) fn copy_runs_from_host_ram(
+    encoder: &mut rt::BlitCommandEncoder,
+    ram: &rt::HostRam,
+    runs: &[(u64, Range<u64>)],
+    destination: &rt::Buffer,
+) -> Result<(), RunsCopyRefused> {
+    (encoder.copy_runs_from_host_ram(ram, runs, destination)).map_err(refused)
+}
+
 /// A refusal of a copy by runs, logged.
 fn refused(error: rt::Error) -> RunsCopyRefused {
     log::warn!(

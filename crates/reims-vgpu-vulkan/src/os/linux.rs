@@ -37,8 +37,8 @@ pub(crate) use dma_buf::{
     fits_pieces as one_dma_buf_of_pieces_fits,
 };
 pub(crate) use host_ram::{
-    copies as copies_guest_ram, copy_from_host_ram, copy_to_host_ram, ram_over,
-    take_devices as take_ram_devices,
+    copies as copies_guest_ram, copy_from_host_ram, copy_runs_from_host_ram, copy_to_host_ram,
+    ram_over, take_devices as take_ram_devices,
 };
 #[cfg(test)]
 pub(crate) use import::views_through_dma_bufs;

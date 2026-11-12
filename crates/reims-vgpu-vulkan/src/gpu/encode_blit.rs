@@ -299,6 +299,10 @@ pub type VulkanBlitEncoder = Obj<EncoderObject<Box<rt::BlitCommandEncoder>>>;
 #[cfg(target_os = "linux")]
 const GUEST_RAM_TO_BUFFER: &str = "copyFromGuestRam:toBuffer:destinationOffset: (no Metal)";
 
+/// What they name [`BlitEncoder::copy_from_guest_ram_at`] by.
+#[cfg(target_os = "linux")]
+const GUEST_RAM_RUNS_TO_BUFFER: &str = "copyFromGuestRamRuns:toBuffer: (no Metal)";
+
 /// What they name [`BlitEncoder::copy_to_guest_ram`] by.
 #[cfg(target_os = "linux")]
 const BUFFER_TO_GUEST_RAM: &str = "copyFromBuffer:toGuestRamRuns: (no Metal)";
@@ -672,6 +676,36 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (runs, destination, destination_offset);
+            Ok(false)
+        }
+    }
+
+    /// As [`Self::copy_from_guest_ram`], each run to its own byte of `destination` (the runtime's
+    /// `copy_runs_from_host_ram`).
+    fn copy_from_guest_ram_at(
+        &self,
+        _on: OnFault,
+        runs: &[(u64, std::ops::Range<u64>)],
+        destination: &VulkanBuffer,
+    ) -> RaiseResult<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            let device = &destination.device.raw;
+            let Some(ram) = (crate::os::copies_guest_ram(device))
+                .then(|| crate::os::ram_over(device, runs.iter().map(|(_, run)| run)))
+                .flatten()
+            else {
+                return Ok(false);
+            };
+            metal_space::first_use(FirstUse::BlitCommand);
+            let copied = self.with(GUEST_RAM_RUNS_TO_BUFFER, |e| {
+                crate::os::copy_runs_from_host_ram(e, &ram, runs, &destination.raw)
+            });
+            Ok(copied.is_ok())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (runs, destination);
             Ok(false)
         }
     }

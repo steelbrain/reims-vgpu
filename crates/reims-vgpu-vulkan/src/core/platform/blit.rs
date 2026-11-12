@@ -362,6 +362,17 @@ pub trait BlitEncoder<P: Platform>: Handle {
         destination: &P::Buffer,
         destination_offset: u64,
     ) -> RaiseResult<bool>;
+    /// No Metal counterpart: copies the guest's RAM at `runs`, each a byte of `destination` and a
+    /// run, a host address range as [`Self::copy_from_guest_ram`] takes, whose bytes land from
+    /// that byte on, in the order given: so a buffer that lays a surface's rows out otherwise
+    /// than its pages takes them in one call. Ordered and refused as
+    /// [`Self::copy_from_guest_ram`] is; false, with nothing encoded, where it does not copy.
+    fn copy_from_guest_ram_at(
+        &self,
+        on: OnFault,
+        runs: &[(u64, Range<u64>)],
+        destination: &P::Buffer,
+    ) -> RaiseResult<bool>;
     /// No Metal counterpart: copies `source` into the guest's RAM at `runs`, each a byte of
     /// `source` and a run, a host address range as [`Self::copy_from_guest_ram`] takes, that
     /// takes the bytes from that byte on, in the order given: so a buffer that keeps a surface's

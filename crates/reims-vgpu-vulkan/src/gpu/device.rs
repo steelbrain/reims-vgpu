@@ -196,6 +196,8 @@ pub struct DeviceObject {
     pub(crate) awake: crate::awake::Awake,
     /// Its other threads of the library's that hold its runtime device ([`crate::let_go`]).
     pub(crate) threads: crate::let_go::DeviceThreads,
+    /// Its answers of [`GpuDevice::linear_rows_pitch`] so far, by row bytes and rows.
+    pub(crate) rows_pitches: Mutex<BTreeMap<(u64, u64), Option<u64>>>,
 }
 
 impl Drop for DeviceObject {
@@ -375,6 +377,7 @@ pub fn adopt(raw: rt::Device) -> VulkanDevice {
         registry_id: id,
         caps: OnceLock::new(),
         threads,
+        rows_pitches: Mutex::default(),
     });
     devices.push((id, made.clone_ref()));
     made
@@ -1379,6 +1382,49 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                 .minimum_linear_texture_alignment_for_pixel_format(pf)
         })
         .unwrap_or(0)
+    }
+
+    /// The runtime's pitch of a `Private` 2D texture over a buffer of its own memory that only
+    /// samples (`rt::Device::linear_texture_bytes_per_row`, the driver's `rowPitch` of its linear
+    /// image), asked of one format of each texel size a buffer backs that divides `row_bytes`
+    /// (`R8Unorm`, `RG8Unorm`, `BGRA8Unorm`, `RGBA16Float` and `RGBA32Float`), `row_bytes` over
+    /// it wide and `rows` high: the answer where those that answer agree. Each pair is asked once
+    /// a device: a new answer makes and releases an image of each such format.
+    fn linear_rows_pitch(&self, row_bytes: u64, rows: u64) -> Option<u64> {
+        use metal2vulkan::metal::PixelFormat as Pf;
+        /// The answers a device keeps; past them they are asked again.
+        const KEPT: usize = 4096;
+        if let Some(&answer) = self.rows_pitches.lock().get(&(row_bytes, rows)) {
+            return answer;
+        }
+        let formats = [
+            (1, Pf::R8Unorm),
+            (2, Pf::RG8Unorm),
+            (4, Pf::BGRA8Unorm),
+            (8, Pf::RGBA16Float),
+            (16, Pf::RGBA32Float),
+        ];
+        let mut answers = formats
+            .into_iter()
+            .filter(|&(size, _)| row_bytes != 0 && rows != 0 && row_bytes.is_multiple_of(size))
+            .filter_map(|(size, pixel_format)| {
+                let mut descriptor = rt::TextureDescriptor::default();
+                descriptor.pixel_format = pixel_format;
+                descriptor.width = row_bytes / size;
+                descriptor.height = rows;
+                descriptor.resource_options = rt::ResourceOptions::private();
+                plain(|| self.raw.linear_texture_bytes_per_row(&descriptor))
+                    .ok()
+                    .flatten()
+            });
+        let first = answers.next();
+        let answer = first.filter(|&pitch| answers.all(|other| other == pitch));
+        let mut kept = self.rows_pitches.lock();
+        if kept.len() >= KEPT {
+            kept.clear();
+        }
+        kept.insert((row_bytes, rows), answer);
+        answer
     }
 
     /// Every refusal dies but the compile's of a function or descriptor it finds wrong, which is
@@ -2685,6 +2731,7 @@ pub(crate) mod tests {
             caps: OnceLock::new(),
             awake: Default::default(),
             threads: Default::default(),
+            rows_pitches: Mutex::default(),
         })
     }
 
@@ -2901,6 +2948,90 @@ pub(crate) mod tests {
             assert!(
                 declared == (1, 0, 0) || declared == (0, 1, 0),
                 "over its memory or a shadow: {declared:?}"
+            );
+        }
+    }
+
+    /// The device's pitch of a surface plane's rows (`linear_rows_pitch`) is the runtime's pitch
+    /// of its linear image of a texture of each texel size that divides the row, and a texture
+    /// whose rows lie that far apart over a Private buffer that declares the bytes between them
+    /// unobserved (a device cache laid out at the GPU's pitch) is an image over the buffer's
+    /// memory, not a shadow: rows of 88 texels of `RGBA16Float` (704 bytes, CoreAnimation's
+    /// rows of such a surface) and of `BGRA8Unorm` (352), 8 high, that only sample, as the
+    /// textures over macOS 26.7.2's caches the runtime shadowed for their pitch on an RX 7900 XTX
+    /// do. Asked again it answers the same. A device whose formats' images lay such rows apart
+    /// otherwise answers none, and promises nothing
+    #[test]
+    fn a_texture_at_the_device_s_pitch_of_a_plane_s_rows_lies_over_its_memory() {
+        use crate::core::platform::Platform as _;
+        use crate::core::platform::resource::Buffer as _;
+        use crate::core::platform::values::TextureDesc;
+        use metal2vulkan::metal::PixelFormat as Pf;
+
+        use crate::platform::tests::platform;
+
+        const PRIVATE: u64 = 0x20;
+        let d = dev();
+        #[cfg(target_os = "linux")]
+        settle_device_checks(&d);
+        let counts = || {
+            let counts = d.raw.work_counts();
+            (counts.unobserved_padding_aliases, counts.shadowed_textures)
+        };
+        for (pixel_format, texel) in [(115u64, 8u64), (80, 4)] {
+            let (width, height) = (88, 8);
+            let row = width * texel;
+            let Some(pitch) = d.linear_rows_pitch(row, height) else {
+                continue;
+            };
+            assert!(pitch >= row, "{pitch} for {row}");
+            assert_eq!(d.linear_rows_pitch(row, height), Some(pitch), "asked again");
+            for (size, pf) in [
+                (1, Pf::R8Unorm),
+                (2, Pf::RG8Unorm),
+                (4, Pf::BGRA8Unorm),
+                (8, Pf::RGBA16Float),
+                (16, Pf::RGBA32Float),
+            ] {
+                if !row.is_multiple_of(size) {
+                    continue;
+                }
+                let mut descriptor = rt::TextureDescriptor::default();
+                descriptor.pixel_format = pf;
+                descriptor.width = row / size;
+                descriptor.height = height;
+                descriptor.resource_options = rt::ResourceOptions::private();
+                let runtime = d.raw.linear_texture_bytes_per_row(&descriptor).unwrap();
+                assert!(
+                    runtime.is_none_or(|p| p == pitch),
+                    "{pf:?}: {runtime:?}, not {pitch}"
+                );
+            }
+            let desc = platform().texture_descriptor(&TextureDesc {
+                pixel_format,
+                width,
+                height,
+                usage: 0x1,
+                resource_options: Some(PRIVATE),
+                ..TextureDesc::default()
+            });
+            let buffer = d
+                .new_buffer_of_length_padding_unobserved(
+                    OnFault::Return,
+                    pitch * height,
+                    PRIVATE,
+                    None,
+                )
+                .unwrap()
+                .expect("a buffer");
+            let before = counts();
+            let texture = buffer.new_texture(OnFault::Return, &desc, 0, pitch);
+            assert!(matches!(texture, Ok(Some(_))), "a texture");
+            let after = counts();
+            assert_eq!(
+                (after.0 - before.0, after.1 - before.1),
+                (1, 0),
+                "{pixel_format}: over the buffer's memory at {pitch}"
             );
         }
     }

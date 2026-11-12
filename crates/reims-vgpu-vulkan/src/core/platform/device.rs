@@ -243,6 +243,17 @@ pub trait GpuDevice<P: Platform>: Handle {
     fn linear_row_alignment(&self) -> u64 {
         0
     }
+    /// No Metal counterpart: the bytes apart the device's own linear 2D images of one level lay
+    /// `rows` rows of `row_bytes` bytes of texels each, as the platform answers, where it lays
+    /// them alike for every format a buffer backs whose texel size divides `row_bytes`: a texture
+    /// over a buffer of the device's own memory whose rows lie that far apart is the device's
+    /// image over the buffer, not a copy of its own. `None` where two such formats' images lay
+    /// them apart otherwise, the device makes no linear image of any of them, or the platform
+    /// does not know. The default is `None`.
+    fn linear_rows_pitch(&self, row_bytes: u64, rows: u64) -> Option<u64> {
+        let _ = (row_bytes, rows);
+        None
+    }
     /// sel: newComputePipelineStateWithFunction:error:
     /// The function may be nil (a library with no such function); core asserts on nil in the
     /// service. No path reaches it under a handler: a raise inside it dies at the send.

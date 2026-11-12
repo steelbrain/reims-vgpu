@@ -948,6 +948,11 @@ pub struct World {
     ///
     /// [`GpuDevice::copies_guest_ram`]: crate::core::platform::device::GpuDevice::copies_guest_ram
     guest_ram_copies: AtomicBool,
+    /// The alignment the devices' [`GpuDevice::linear_rows_pitch`] rounds rows up to, 0 for
+    /// none ([`World::lay_linear_rows`]).
+    ///
+    /// [`GpuDevice::linear_rows_pitch`]: crate::core::platform::device::GpuDevice::linear_rows_pitch
+    linear_rows: AtomicU64,
     /// What the devices' [`GpuDevice::surface_pages_in_place`] answers
     /// ([`World::answer_surface_pages`]), and the planes each call was asked of, in order.
     ///
@@ -1004,6 +1009,7 @@ impl World {
             notifications: Mutex::new(Vec::new()),
             splits: AtomicBool::new(false),
             guest_ram_copies: AtomicBool::new(false),
+            linear_rows: AtomicU64::new(0),
             surface_pages: Mutex::new((PagesInPlace::Yes, Vec::new())),
             never_in_place: Mutex::new((None, Vec::new())),
             fresh_never_in_place: Mutex::new((None, Vec::new())),
@@ -1123,6 +1129,20 @@ impl World {
     /// [`GpuDevice::copies_guest_ram`]: crate::core::platform::device::GpuDevice::copies_guest_ram
     pub fn copies_guest_ram(&self) -> bool {
         self.guest_ram_copies.load(Ordering::SeqCst)
+    }
+
+    /// Has the devices answer [`GpuDevice::linear_rows_pitch`] with a row's bytes rounded up to
+    /// `align`, where given, as a device whose linear images lay rows at that alignment whatever
+    /// their format; `None` (at first) answers no pitch.
+    ///
+    /// [`GpuDevice::linear_rows_pitch`]: crate::core::platform::device::GpuDevice::linear_rows_pitch
+    pub fn lay_linear_rows(&self, align: Option<u64>) {
+        self.linear_rows.store(align.unwrap_or(0), Ordering::SeqCst);
+    }
+
+    /// The alignment [`Self::lay_linear_rows`] set, where it set one.
+    pub fn linear_rows(&self) -> Option<u64> {
+        Some(self.linear_rows.load(Ordering::SeqCst)).filter(|&a| a != 0)
     }
 
     fn arc(&self) -> Arc<World> {

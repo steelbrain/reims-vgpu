@@ -20,6 +20,11 @@ use crate::core::testkit::script::Policy;
 /// value says otherwise.
 pub const GUEST_RAM_TO_BUFFER: &str = "copyFromGuestRam:toBuffer:destinationOffset: (no Metal)";
 
+/// The name the fake logs and scripts [`BlitEncoder::copy_from_guest_ram_at`] under, with the
+/// destination, each run's byte of it, in order, and the runs, as [`GUEST_RAM_TO_BUFFER`] logs
+/// them.
+pub const GUEST_RAM_RUNS_TO_BUFFER: &str = "copyFromGuestRamRuns:toBuffer: (no Metal)";
+
 /// The name the fake logs and scripts [`BlitEncoder::copy_to_guest_ram`] under, with the source,
 /// each run's byte of it, in order, and the runs, as [`GUEST_RAM_TO_BUFFER`] logs them.
 pub const BUFFER_TO_GUEST_RAM: &str = "copyFromBuffer:toGuestRamRuns: (no Metal)";
@@ -44,6 +49,18 @@ impl BlitEncoder<FakePlatform> for Fk<kind::BlitEncoder> {
             Arg::U64(destination_offset),
         ];
         self.thr(Policy::On(on), GUEST_RAM_TO_BUFFER, args, || copies)
+    }
+
+    fn copy_from_guest_ram_at(
+        &self,
+        on: OnFault,
+        runs: &[(u64, Range<u64>)],
+        destination: &<FakePlatform as crate::core::platform::Platform>::Buffer,
+    ) -> RaiseResult<bool> {
+        let copies = self.world().copies_guest_ram();
+        let (at, runs): (Vec<u64>, Vec<Range<u64>>) = runs.iter().cloned().unzip();
+        let args = vec![Arg::obj(destination), Arg::U64s(at), runs_arg(&runs)];
+        self.thr(Policy::On(on), GUEST_RAM_RUNS_TO_BUFFER, args, || copies)
     }
 
     fn copy_to_guest_ram(

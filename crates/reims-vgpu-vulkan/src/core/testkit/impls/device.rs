@@ -541,6 +541,14 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
         FAKE_LINEAR_ROW_ALIGNMENT
     }
 
+    /// `row_bytes` rounded up to the world's linear rows' alignment where it has one
+    /// ([`World::lay_linear_rows`](super::super::objects::World::lay_linear_rows)), else `None`;
+    /// unlogged.
+    fn linear_rows_pitch(&self, row_bytes: u64, rows: u64) -> Option<u64> {
+        let align = self.world().linear_rows()?;
+        (row_bytes != 0 && rows != 0).then(|| row_bytes.next_multiple_of(align))
+    }
+
     /// No: the fake device makes no pipeline of OpenCL mode, unlogged.
     fn makes_opencl_mode_pipelines(&self) -> bool {
         false

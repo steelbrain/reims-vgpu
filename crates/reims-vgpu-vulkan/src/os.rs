@@ -65,7 +65,9 @@ pub use host_os::{LendRefusal, LentDmaBuf, dma_buf_of_host};
 pub(crate) use host_os::{PAGE, mapped, writable};
 /// The guest's RAM a device copies by runs of it, on Linux (`os/linux/host_ram.rs`).
 #[cfg(target_os = "linux")]
-pub(crate) use host_os::{copies_guest_ram, copy_from_host_ram, copy_to_host_ram, ram_over};
+pub(crate) use host_os::{
+    copies_guest_ram, copy_from_host_ram, copy_runs_from_host_ram, copy_to_host_ram, ram_over,
+};
 /// Whether one dma-buf takes the pages of a range, as the runtime asks for a texture's own, of a
 /// list of ranges, before a view of them is made, or of pieces of pages not made yet, on Linux
 /// (`os/linux/dma_buf.rs`).
