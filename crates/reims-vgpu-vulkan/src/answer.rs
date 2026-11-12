@@ -2491,17 +2491,11 @@ pub enum Inexact {
     /// the runtime's refusal as its `NSError` ([`relay_gap`]). The guest's creation fails, as
     /// where Metal answers nil, and the work that names the object faults.
     RefusedCreate,
-    /// A sampler's LOD bias other than 0 (`lodBias`, macOS 26): the runtime keys the sampler's
-    /// state by the bias but samples it as an Apple9 GPU does, at bias 0, where the x86 Macs'
-    /// GPUs this device imitates add it to each sample's level of detail
-    /// (docs/graphics-kext/dgpu-oracle.md, Q14). Relayed at each such sampler's making
-    /// ([`crate::gpu::states`]).
-    SamplerLodBias,
 }
 
 impl Inexact {
     /// Every kind, once.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 12] = [
         Self::HalfOutputBlend,
         Self::BfloatLoaded,
         Self::HeapLayout,
@@ -2514,7 +2508,6 @@ impl Inexact {
         Self::IcbLengthPastTheLastCommand,
         Self::IcbCopiedLength,
         Self::RefusedCreate,
-        Self::SamplerLodBias,
     ];
 
     /// The kind's code, which its line names.
@@ -2532,7 +2525,6 @@ impl Inexact {
             Self::IcbLengthPastTheLastCommand => "inexact-icb-length-past-last-command",
             Self::IcbCopiedLength => "inexact-icb-copied-length",
             Self::RefusedCreate => "inexact-refused-create",
-            Self::SamplerLodBias => "inexact-sampler-lod-bias",
         }
     }
 }
@@ -3395,8 +3387,7 @@ mod tests {
                 | Inexact::IcbIdentifierAfterEncoder
                 | Inexact::IcbLengthPastTheLastCommand
                 | Inexact::IcbCopiedLength
-                | Inexact::RefusedCreate
-                | Inexact::SamplerLodBias => {}
+                | Inexact::RefusedCreate => {}
             }
         }
     }
