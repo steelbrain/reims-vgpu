@@ -527,6 +527,60 @@ with the driver's own cache on or off, in one cache or twelve, and destroying
 a cache gives none of it back. Only fewer bytes help: smaller shaders, fewer
 pipelines per state.
 
+### Linux hosts: the guest's disk
+
+`reims-ctl` gives a VM its system disk as an image file in the VM's
+directory (qcow2 for a new disk), on QEMU's defaults (`cache=writeback`,
+`aio=threads`), on AHCI unless the VM's settings choose NVMe, which adds
+`discard=unmap`. On AHCI
+the guest's flush (FLUSH CACHE EXT) is not queued: an x86-64 macOS 26.7.2
+guest started no other disk command while one ran, over 1,069 to 1,368
+flushes a boot. On NVMe it went on reading and writing during its flushes
+(4,870 to 17,485 commands a boot).
+
+**Measured** on two CachyOS hosts (Linux 7.3.3; `/home` on btrfs,
+`compress=zstd:1,ssd,discard=async`), each cold-booting macOS 26.7.2 on the
+Radeon 780M from a reflink clone of the same disk, through a Safari page
+load, a window resize and a scroll (2026-11-11 and 12; on um790 jobs
+m3-max-19441, 19474, 19602, 19604 and 19714, on um870 19679 and 19697). A
+wait below is a span of 300 ms or more in which none of the guest's
+outstanding disk commands completed, given per boot as a count and the
+total time:
+- On `homelab-um790-xtx-1`'s Lexar NM620 (DRAM-less), a single read, of the
+  image's data or of btrfs's metadata, took 0.3 to 2.0 s now and then, and
+  once every request on the device took 1.66 s at the same time. A guest
+  command waits behind such a read, and a guest flush also waits behind
+  btrfs's transaction commit, which comes every 30 s and took up to 2.5 s
+  there. On QEMU's defaults six boots had 0, 0, 1 (0.44 s), 2 (0.94 s),
+  2 (2.76 s) and 6 waits (3.91 s).
+- On `homelab-um870-1`'s Samsung 970 EVO Plus, the SSD took at most 9 ms
+  over a read, and no guest write took over 69 ms nor a flush over 177 ms.
+  Six boots on AHCI, two of them on qcow2 overlays, had no wait but one
+  0.33 s read 2 s into a boot, in the firmware; two on NVMe had none.
+
+None of the other choices did better on the Lexar than the defaults in the
+same jobs:
+- `aio=io_uring`: no wait, and one of 1.01 s, within the defaults' spread;
+  that one was a flush writing back about 1 GB the guest had just written
+  into the host's page cache.
+- A nodatacow image (made in a `chattr +C` directory): 3 waits (2.66 s) and
+  6 (6.16 s). Before writing in place, btrfs checks that no other file
+  shares the extent, reading the extent tree, and the flushes' fsyncs
+  waited on those reads, up to 1.95 s.
+- `cache=none`: 6 waits (5.92 s) and 6 (3.64 s). Btrfs writes a direct
+  write to a checksummed file through the page cache, under the inode's
+  lock, which held every other read and write of the image for up to
+  729 ms; and the guest's reads
+  no longer hit the host's page cache, so more of them met the SSD's slow
+  reads: 29 and 16 of the guest's reads took over 500 ms in a boot, against
+  0 or 1 on the defaults.
+- NVMe: 4 waits (2.51 s) and 7 (7.72 s). The guest's TRIMs reach btrfs as
+  punched holes, one of which waited 831 ms for the image's inode lock.
+
+What NVMe does gain is the boot: the guest answered SSH 9 to 10 s after
+QEMU started in three NVMe boots of four, on both hosts, against 17 to
+19 s in every AHCI boot; the fourth, on the Lexar, took 22 s.
+
 ## x86-64 macOS guests
 
 What `reims-ctl`'s q35 command gives an x86-64 macOS guest, and why
