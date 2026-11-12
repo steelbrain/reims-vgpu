@@ -2491,9 +2491,10 @@ pub enum Inexact {
     /// the runtime's refusal as its `NSError` ([`relay_gap`]). The guest's creation fails, as
     /// where Metal answers nil, and the work that names the object faults.
     RefusedCreate,
-    /// A sampler's LOD bias other than 0 (`lodBias`, macOS 26): the runtime's sampler
-    /// descriptor holds none, so the sampler samples at bias 0, where Metal's adds the bias to
-    /// each sample's level of detail. Relayed at each such sampler's making
+    /// A sampler's LOD bias other than 0 (`lodBias`, macOS 26): the runtime keys the sampler's
+    /// state by the bias but samples it as an Apple9 GPU does, at bias 0, where the x86 Macs'
+    /// GPUs this device imitates add it to each sample's level of detail
+    /// (docs/graphics-kext/dgpu-oracle.md, Q14). Relayed at each such sampler's making
     /// ([`crate::gpu::states`]).
     SamplerLodBias,
 }

@@ -325,15 +325,17 @@ fn sampler_descriptor(d: &SamplerDesc) -> (SamplerDescriptor, rt::SamplerStateOp
     if let Some(v) = d.lod_max_clamp {
         s.lod_max_clamp = v;
     }
-    // The runtime's descriptor holds no LOD bias: a sampler of one samples at bias 0, relayed.
-    if let Some(bias) = d.lod_bias
-        && bias != 0.0
-    {
-        crate::answer::inexact(
-            "setLodBias:",
-            crate::answer::Inexact::SamplerLodBias,
-            || format!("a sampler's LOD bias ({bias})"),
-        );
+    // The runtime keys its states by the bias, as Metal does, and samples every bias as an Apple9
+    // GPU does, at 0, where the x86 Macs' GPUs add it to each sample's LOD: relayed.
+    if let Some(bias) = d.lod_bias {
+        s.lod_bias = bias;
+        if bias != 0.0 {
+            crate::answer::inexact(
+                "setLodBias:",
+                crate::answer::Inexact::SamplerLodBias,
+                || format!("a sampler's LOD bias ({bias})"),
+            );
+        }
     }
     if let Some(v) = d.border_color {
         s.border_color = rt::sampler_border_color(v);
@@ -1281,6 +1283,39 @@ mod tests {
              compare function unset, reduction mode unset, supportArgumentBuffers unset, resource \
              index unset"
         );
+    }
+
+    /// A sampler's LOD bias reaches the runtime's descriptor, so two samplers that differ only in
+    /// their bias are two states, as Metal makes them (an M3 Max), and a bias of -0 is the state of
+    /// 0
+    #[test]
+    fn on_vulkan_a_samplers_lod_bias_decides_its_state() {
+        let d = dev();
+        let state = |lod_bias| {
+            let desc = SamplerDesc {
+                lod_bias,
+                ..SamplerDesc::default()
+            };
+            new_sampler_state(&d, &desc).unwrap().unwrap()
+        };
+        let (none, zero, minus_zero, one) = (
+            state(None),
+            state(Some(0.0)),
+            state(Some(-0.0)),
+            state(Some(1.0)),
+        );
+        assert_eq!(
+            sampler_descriptor(&SamplerDesc {
+                lod_bias: Some(1.0),
+                ..SamplerDesc::default()
+            })
+            .0
+            .lod_bias,
+            1.0
+        );
+        assert!(*none == *zero);
+        assert!(*zero == *minus_zero);
+        assert!(*zero != *one);
     }
 
     /// The suite's vertex function fed through a vertex descriptor (attribute 0 a `float2`,
