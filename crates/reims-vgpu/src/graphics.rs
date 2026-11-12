@@ -469,11 +469,13 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // The processes read the features from the device info, as no register is theirs:
             // those every guest reads, written before any takes `PAGES_16K`.
             info.features_lo = u8::try_from(features & 0xff).unwrap_or_default();
-            // A host whose surfaces lie in place in their pages has the guest align their rows as
-            // its GPU's images take them in place; one that keeps them in device caches leaves the
-            // guest's rows as they were, as does one that offers its pages only once a guest takes
-            // `PAGES_16K`, as the device info is written before it does.
-            if decoder.surface_pages_available() && unified_memory && features_16k == 0 {
+            // A host that offers the surfaces' pages has the guest align their rows as its GPU's
+            // linear images take them in place, on any GPU: a texture over a surface lies over its
+            // pages, or over a device cache in the pages' layout, and the GPU's own linear image
+            // holds it there only at the GPU's pitch (on RADV exactly `round_up(row, 256)`). One
+            // that offers its pages only once a guest takes `PAGES_16K` leaves the guest's rows as
+            // they were, as the device info is written before it does.
+            if decoder.surface_pages_available() && features_16k == 0 {
                 info.linear_row_alignment =
                     u32::try_from(gpu_device.linear_row_alignment()).unwrap_or_default();
             }

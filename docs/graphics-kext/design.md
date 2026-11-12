@@ -805,7 +805,12 @@ Stages:
       and an Intel Mac's GPUs answer 256 for
       `minimumLinearTextureAlignmentForPixelFormat:`, so rows at 256 bytes
       lie inside what Macs do. A host whose GPU has memory of its own
-      answers 0, its guest's rows as they were.
+      answers its GPU's alignment as well (the runtime's
+      `minimumLinearTextureAlignmentForPixelFormat:` of BGRA8: 256 on RADV,
+      discrete or not, and 128 on the RTX 3090 and RTX 2080, docs/lessons.md):
+      a texture over a surface's pages, or over its device cache, which keeps
+      the pages' layout, takes the GPU's own linear image there only where its
+      rows lie at the GPU's pitch, and otherwise is the runtime's shadow.
       At the same start the kext lowers the largest surface IOSurface
       answers to `IOSurfaceGetPropertyMaximum`, as a Mac's GPU accelerators
       do: as wide and as tall as the device's 2D textures (the device

@@ -54,13 +54,17 @@ pub const EXPORTABLE_BUFFER: &str = "newBufferWithLength:options: (exportable)";
 pub struct DeviceModel {
     /// What `caps` answers.
     pub caps: Arc<DeviceCaps>,
+    /// What `identity_caps` answers for `hasUnifiedMemory`
+    /// ([`set_unified_memory`](Fk::set_unified_memory)).
+    pub unified_memory: bool,
 }
 
 impl Default for DeviceModel {
-    /// The fake's default capabilities ([`fake_caps`]).
+    /// The fake's default capabilities ([`fake_caps`]), of a GPU that shares the CPU's memory.
     fn default() -> DeviceModel {
         DeviceModel {
             caps: Arc::new(fake_caps()),
+            unified_memory: true,
         }
     }
 }
@@ -500,9 +504,13 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
         self.with_model(|m: &DeviceModel| m.caps.clone())
     }
 
-    /// [`fake_identity_caps`], neither logged nor scripted.
+    /// [`fake_identity_caps`], with `hasUnifiedMemory` as
+    /// [`set_unified_memory`](Fk::set_unified_memory) set it (yes by default), neither logged
+    /// nor scripted.
     fn identity_caps(&self) -> IdentityCaps {
-        fake_identity_caps()
+        let mut caps = fake_identity_caps();
+        caps.flags.has_unified_memory = Some(self.with_model(|m: &DeviceModel| m.unified_memory));
+        caps
     }
 
     /// No: the fake device takes no private render state, unlogged.
@@ -784,6 +792,13 @@ impl Fk<kind::Device> {
     /// Sets the device's capabilities, which [`caps`](GpuDevice::caps) answers from then on.
     pub fn set_caps(&self, caps: DeviceCaps) {
         self.with_model_mut(|m: &mut DeviceModel| m.caps = Arc::new(caps));
+    }
+
+    /// Sets whether the device's GPU shares the CPU's memory, which
+    /// [`identity_caps`](GpuDevice::identity_caps) answers for `hasUnifiedMemory` from then on:
+    /// `false` makes the fake a GPU of its own memory.
+    pub fn set_unified_memory(&self, unified: bool) {
+        self.with_model_mut(|m: &mut DeviceModel| m.unified_memory = unified);
     }
 }
 

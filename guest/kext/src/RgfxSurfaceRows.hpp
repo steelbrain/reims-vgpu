@@ -1,8 +1,8 @@
 // RgfxSurfaceRows: the alignment the kext has IOSurface give the bytes per row it works out for a
 // surface, from the host's answer in the device info (RgfxDeviceInfo's linear_row_alignment,
 // written at RGFX_DEVICE_INFO_OFFSET when the device is made): the bytes the host's GPU aligns a
-// linear BGRA8 image's rows to, to make one over host pages in place there. The host answers it
-// where its surfaces lie in place in their pages (its GPU shares the CPU's memory), else 0.
+// linear BGRA8 image's rows to, to make one over a surface's bytes in place there. The host
+// answers it where it offers the surfaces' pages, on a GPU of any memory, else 0.
 //
 // IOSurface aligns the bytes per row it works out for a surface, and answers
 // IOSurfaceGetPropertyAlignment(kIOSurfaceBytesPerRow), to the cache line where no accelerator

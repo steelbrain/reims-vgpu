@@ -8471,6 +8471,69 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);
 }
 
+/// A device on a GPU of its own memory with a memory map on a guest-sized page offers the
+/// surfaces' pages with a device cache of each (`SURFACE_CACHE`), deferring fresh ones
+/// (`SURFACE_DEFERRED`, `SURFACE_DEFERRED_CARRY`), and has the guest align the surfaces' rows as
+/// its GPU's linear images take them in place (the device info's `linear_row_alignment`), as a
+/// device on a GPU that shares the CPU's memory does: a texture over a cache in the pages' layout
+/// lies at the guest's rows too. On a host of 16 KiB pages it offers neither to a guest that
+/// takes no `PAGES_16K`, and leaves the rows as they were.
+#[test]
+fn a_gpu_of_its_own_memory_has_the_guest_align_its_surfaces_rows_too() {
+    use reims_vgpu_vulkan::core::testkit::GuestRam;
+
+    let platform = Arc::new(FakePlatform::new());
+    platform.device().set_unified_memory(false);
+    let ram = GuestRam::with_range(0x10_0000, 0x10_0000).unwrap();
+    platform.fake_vm().adopt(&ram);
+    let mut map = crate::MemoryMap::new();
+    for r in ram.ranges() {
+        // SAFETY: the fake RAM stays mapped while the test, which holds it, runs.
+        unsafe {
+            map.push(
+                r.physical_address,
+                r.physical().physical_length,
+                r.host().as_ptr(),
+            );
+        }
+    }
+    let config = GraphicsConfig {
+        memory_map: Some(map),
+        guest_arch: GuestArch::X86_64,
+        ..GraphicsConfig::default()
+    };
+    let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
+    let sixteen = platform.vm().page_size() == 16384;
+    let low = device.mmio_read(RGFX_REG_FEATURES_LO.into());
+    let high = u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32;
+    let pages = RGFX_FEATURE_SURFACE_PAGES
+        | RGFX_FEATURE_PAGES_BUFFERS
+        | RGFX_FEATURE_HEAP_OVER_PAGES
+        | RGFX_FEATURE_SURFACE_CACHE
+        | RGFX_FEATURE_SURFACE_DEFERRED;
+    let asking = RGFX_FEATURE_SURFACE_CACHE_REFUSED | RGFX_FEATURE_SURFACE_DEFERRED_ASK;
+    assert_eq!(low & (pages | asking), if sixteen { 0 } else { pages });
+    assert_eq!(
+        low & RGFX_FEATURE_MANAGED_AT_OFFSET,
+        RGFX_FEATURE_MANAGED_AT_OFFSET,
+        "two copies of a Managed resource on a GPU of its own memory"
+    );
+    assert_eq!(
+        high & RGFX_FEATURE_SURFACE_DEFERRED_CARRY != 0,
+        !sixteen,
+        "a deferral's carried pages"
+    );
+    assert_eq!(
+        u64::from(device_info_of(&device).linear_row_alignment),
+        if sixteen {
+            0
+        } else {
+            FAKE_LINEAR_ROW_ALIGNMENT
+        },
+        "the surfaces' rows at the GPU's linear row alignment"
+    );
+}
+
 /// The deferred blocks' budget is a quarter of the GPU's own memory's where the device offers
 /// `SURFACE_DEFERRED`, or `SURFACE_DEFERRED_ASK` on a GPU that shares the CPU's memory, and 0
 /// where it offers neither
