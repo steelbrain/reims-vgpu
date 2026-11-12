@@ -5,7 +5,9 @@
 // arguments under function constants, a vertex function's and a kernel's stage input, and an
 // object and a mesh function that share a payload; and the kinds tools/pipeline_reflection_check.mm
 // adds (nested argument buffers and their arrays, function and intersection tables, acceleration
-// structures, imageblocks, framebuffer fetch, and functions function constants specialise).
+// structures, imageblocks, framebuffer fetch, functions function constants specialise, and
+// post-tessellation vertex functions: their control points' and patch's attributes, in a struct of
+// both or as the control points alone, beside built-ins and bindings of their own).
 #include <metal_stdlib>
 #include <metal_raytracing>
 using namespace metal;
@@ -559,5 +561,52 @@ vertex SpecialisedOut v_specialised(VertexIn in [[stage_in]], constant float4x4 
 	SpecialisedOut o;
 	o.position = mvp * in.position;
 	o.uv = kMode == 1 ? in.uv : (kMode == 2 ? uvs[vid] : float2(0));
+	return o;
+}
+
+// Post-tessellation vertex functions. A patch's control points are the attributes of a buffer whose
+// layout steps per control point (0 and 1, one unread), and a patch's own attributes those of a
+// buffer whose layout steps per patch (3): pipeline_reflection_check's r_patch_* cases.
+struct PatchPoint {
+	float4 position [[attribute(0)]];
+	float2 uv [[attribute(1)]];
+	float4 unread [[attribute(2)]];
+};
+
+struct PatchIn {
+	patch_control_point<PatchPoint> points;
+	float4 tint [[attribute(3)]];
+};
+
+[[patch(quad, 4)]] vertex VertexOut v_patch(PatchIn in [[stage_in]], float2 uv [[position_in_patch]],
+                                            uint patch [[patch_id]], constant float4x4 &mvp [[buffer(4)]],
+                                            texture2d<float> heights [[texture(1)]],
+                                            device const float *unusedBuffer [[buffer(5)]])
+{
+	VertexOut o;
+	float4 p = mix(mix(in.points[0].position, in.points[1].position, uv.x),
+	               mix(in.points[3].position, in.points[2].position, uv.x), uv.y);
+	o.position = mvp * (p + in.tint + heights.read(uint2(patch, 0)));
+	o.uv = in.points[0].uv;
+	return o;
+}
+
+[[patch(triangle, 3)]] vertex VertexOut v_patch_points(patch_control_point<PatchPoint> points [[stage_in]],
+                                                       float3 bc [[position_in_patch]],
+                                                       uint iid [[instance_id]])
+{
+	VertexOut o;
+	o.position = points[0].position * bc.x + points[1].position * bc.y + points[2].position * bc.z +
+	             float4(float(iid));
+	o.uv = points[1].uv;
+	return o;
+}
+
+[[patch(quad)]] vertex VertexOut v_patch_buffers(float2 uv [[position_in_patch]], uint patch [[patch_id]],
+                                                 device const float4 *points [[buffer(0)]])
+{
+	VertexOut o;
+	o.position = points[patch * 4] + float4(uv, 0, 0);
+	o.uv = uv;
 	return o;
 }

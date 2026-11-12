@@ -33,6 +33,12 @@
 //                and with both false, kIndex 7, kMode 2 and kOpt true
 //   r_specialised_one, r_specialised_two
 //                v_specialised and f_plain, a vertex descriptor as r_stage_in's, kMode 1 and 2
+//   r_patch      v_patch, a post-tessellation vertex function of a struct of its control points and
+//                its patch's attribute, and f_plain; a vertex descriptor of the control points'
+//                attributes 0, 1 and 2 in buffer 0, stepping per control point, and the patch's
+//                attribute 3 in buffer 1, stepping per patch
+//   r_patch_points  v_patch_points, of its control points alone, and f_plain, r_patch's descriptor
+//   r_patch_buffers v_patch_buffers, of no stage input, and f_plain
 // Prints each difference (with -v, every line both walks agree on), a case ours makes no reflection
 // of with its reason and Metal's getters' answers (with -v its instance variables' too, to measure
 // them), a case Metal makes no pipeline of with its error, and
@@ -331,6 +337,32 @@ MTLVertexDescriptor *vertexDescriptor(bool spread)
 	return v;
 }
 
+// A post-tessellation vertex function's vertex descriptor: its control points' attributes 0
+// (float4), 1 (float2, at 16) and 2 (float4, at 32) in buffer 0 of stride 48, stepping per control
+// point, and its patch's attribute 3 (float4) in buffer 1 of stride 16, stepping per patch.
+MTLVertexDescriptor *patchDescriptor()
+{
+	MTLVertexDescriptor *v = [MTLVertexDescriptor vertexDescriptor];
+	const struct {
+		NSUInteger attribute;
+		MTLVertexFormat format;
+		NSUInteger offset, buffer;
+	} kAttributes[] = {{0, MTLVertexFormatFloat4, 0, 0},
+	                   {1, MTLVertexFormatFloat2, 16, 0},
+	                   {2, MTLVertexFormatFloat4, 32, 0},
+	                   {3, MTLVertexFormatFloat4, 0, 1}};
+	for (const auto &a : kAttributes) {
+		v.attributes[a.attribute].format = a.format;
+		v.attributes[a.attribute].offset = a.offset;
+		v.attributes[a.attribute].bufferIndex = a.buffer;
+	}
+	v.layouts[0].stride = 48;
+	v.layouts[0].stepFunction = MTLVertexStepFunctionPerPatchControlPoint;
+	v.layouts[1].stride = 16;
+	v.layouts[1].stepFunction = MTLVertexStepFunctionPerPatch;
+	return v;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -431,6 +463,15 @@ int main(int argc, char **argv)
 			           MTLPixelFormatBGRA8Unorm, MTLPixelFormatInvalid);
 		if (CASE("r_mesh"))
 			meshCase("r_mesh", Fn{"o_payload", {}}, Fn{"m_payload", {}}, Fn{"f_mesh", {}});
+		if (CASE("r_patch"))
+			renderCase("r_patch", Fn{"v_patch", {}}, &plain, patchDescriptor(), MTLPixelFormatBGRA8Unorm,
+			           MTLPixelFormatInvalid);
+		if (CASE("r_patch_points"))
+			renderCase("r_patch_points", Fn{"v_patch_points", {}}, &plain, patchDescriptor(), MTLPixelFormatBGRA8Unorm,
+			           MTLPixelFormatInvalid);
+		if (CASE("r_patch_buffers"))
+			renderCase("r_patch_buffers", Fn{"v_patch_buffers", {}}, &plain, nil, MTLPixelFormatBGRA8Unorm,
+			           MTLPixelFormatInvalid);
 		printf("pipeline_reflection_check: %u cases, %u values, %u differ, %u not made, %u Metal made none\n", Cases,
 		       Values, Differ, NotMade, Unmade);
 		return Differ != 0 ? 1 : 0;
