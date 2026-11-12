@@ -123,6 +123,12 @@ repeats the ones code cites.
     rings' room, the releases, the dormant blocks, the swaps, the surface
     copies) come at most once a minute, and a bring-up trace logs its first
     calls alone.
+    The bundle's os_log lines go to its own subsystem,
+    `ai.aneesiqbal.reims-graphics`, category `bundle` (`RgfxLog.hpp`), so
+    `log config --subsystem ai.aneesiqbal.reims-graphics` sets the level
+    they are kept and persisted at; its NSLog lines are at the default
+    level, which the log store keeps, and carry no subsystem. Both start
+    `RGFX:`.
 - Tests sit in `mod tests` beside the code and are named by behaviour.
 - **Integers**: std spells wrapping, overflowing, widening and sign
   reinterpretation (`wrapping_add`, `overflowing_mul`, `u64::from`,
