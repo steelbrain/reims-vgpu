@@ -429,8 +429,14 @@ typedef struct {
   // The guest's architecture, RVG_GUEST_ARCH_*, which the device's answers to the guest's Metal
   // follow where an Apple silicon Mac's GPU and an Intel or AMD Mac's answer apart: an arm64
   // guest's device answers `isFramebufferReadSupported` as the host's GPU can, an x86-64
-  // guest's no. Refused (RVG_ERR_INVALID_ARGUMENT): any other value. A host built before this
-  // field, whose `struct_size` ends before it, serves an x86-64 guest.
+  // guest's no; and the GPU's results that Metal leaves to the Mac's GPU (what a new Private
+  // texture reads before anything writes it, the encoding a blit through a compressed texture
+  // writes, a half NaN clear's sign, how far a Clear load reaches past the render area) are an
+  // Apple silicon Mac's for an arm64 guest and an Intel or AMD Mac's for an x86-64 guest,
+  // whatever the host's GPU. Those results are the process's: the guest of its first graphics
+  // device decides them for every device it makes. Refused (RVG_ERR_INVALID_ARGUMENT): any
+  // other value. A host built before this field, whose `struct_size` ends before it, serves an
+  // x86-64 guest.
   RvgGuestArch guest_arch;
 } RvgGraphicsDeviceConfig;
 

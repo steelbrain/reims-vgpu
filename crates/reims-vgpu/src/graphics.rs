@@ -194,7 +194,8 @@ pub struct GraphicsConfig {
     /// discards guest RAM (a balloon, hot-unplug) gives none.
     pub memory_map: Option<MemoryMap>,
     /// The guest's architecture, which the device's answer of `isFramebufferReadSupported` follows
-    /// (`device_info`'s `lane_flags`).
+    /// (`device_info`'s `lane_flags`), and the class of Mac whose answers the platform's devices
+    /// give where a Mac's GPU decides them ([`GuestArch::mac_class`]).
     pub guest_arch: GuestArch,
 }
 
@@ -206,6 +207,25 @@ pub enum GuestArch {
     X86_64,
     /// An arm64 guest, whose frameworks were written against Apple silicon's GPUs.
     Arm64,
+}
+
+impl GuestArch {
+    /// The class of Mac this guest's frameworks were written against, which the Vulkan platform's
+    /// devices present to the runtime ([`ApiPlatform::present_guest`],
+    /// `reims_vgpu_vulkan::platform::present_mac_class`), whatever GPU the host has: a Mac with an
+    /// Intel or AMD GPU for an x86-64 guest, as every x86-64 Mac's GPU is (the x86 oracles, an AMD
+    /// Radeon Pro 5300M and an Intel UHD 630, read zero in a new `Private` texture), and an Apple
+    /// silicon Mac for an arm64 guest, as every arm64 Mac's GPU is Apple's (an Apple M3 Max reads
+    /// Metal's fixed pattern there). The runtime gives that Mac's answers where a Mac's GPU decides
+    /// them: a new `Private` texture's contents, a blit's encodings through a compressed texture, a
+    /// `half` NaN clear's sign, and a `Clear` load's reach past the render area of a pass without
+    /// a draw call.
+    pub fn mac_class(self) -> metal2vulkan_runtime::MacClass {
+        match self {
+            GuestArch::X86_64 => metal2vulkan_runtime::MacClass::IntelOrAmd,
+            GuestArch::Arm64 => metal2vulkan_runtime::MacClass::AppleSilicon,
+        }
+    }
 }
 
 /// The bytes of the host GPU's memory deferred blocks' device caches may hold, which
@@ -297,7 +317,10 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 .ok_or(Error::HostResources)?;
             let region = Arc::new(region);
             // The device the decoder drives, and its caps blob, which the guest bundle reads
-            // before it makes any queue. A host with no GPU device cannot run the lane.
+            // before it makes any queue. A host with no GPU device cannot run the lane. The
+            // platform learns the guest's architecture first, so the device gives the answers of
+            // the Macs the guest's frameworks were written against (`GuestArch::mac_class`).
+            platform.present_guest(config.guest_arch);
             let gpu_device = platform.metal_device(None).ok_or(Error::HostResources)?;
             // Before anything else makes a queue or a texture on it.
             reserve_guest_texture_ids(platform.as_ref(), &gpu_device);

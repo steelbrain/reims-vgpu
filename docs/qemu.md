@@ -78,7 +78,7 @@ merge into staging of 2026-06-19), and upstream master is merged into it
 |---|---|
 | the reims-graphics device's transport, for the library's own guest driver: `reims-graphics-pci` (1234:5247, class 0x0380), on the library's graphics device (`rvg_graphics_device_*`); BAR 0 its registers with MSI-X from 0x800, the doorbell an ioeventfd, BAR 2 the library's region as RAM; built for every target where the library is found (`CONFIG_REIMS_GRAPHICS`), x86-64 under TCG on a Mac among them ("The reims-graphics device", below) | `77ee6c6b`, `bf69f959` |
 | the device gives the library the guest RAM's map and the files behind it | `abb94a98` |
-| the device tells the library the guest's architecture (`guest_arch`: arm64 where `target_aarch64()`, else x86-64), which the device's `isFramebufferReadSupported` answer follows | `c2fb9b92` |
+| the device tells the library the guest's architecture (`guest_arch`: arm64 where `target_aarch64()`, else x86-64), which the device's `isFramebufferReadSupported` answer follows, and the class of Mac whose GPU results the library's devices give (`GuestArch::mac_class`) | `c2fb9b92` |
 | the device raises its interrupt through an irqfd where KVM's in-kernel irqchip takes MSI-X through one | `36deb281` |
 | a command buffer is taken, and answered, on the vCPU that rings its queue's doorbell, with the plain register write | `f2c7e2a5`, `67cc08ad`, `5f459785` |
 | the console shows the display (`rvg_graphics_device_read_display`), so QMP's `screendump` saves the guest's frame, and has the guest's cursor | `70a9a466`, `c119b802` |

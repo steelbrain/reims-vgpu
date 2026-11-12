@@ -245,6 +245,22 @@ Stages:
      guest blends its generic shader against a destination it reads by
      framebuffer fetch, which it compiles in by this answer: with no, the
      menu bar drew black (2026-11-09).
+   - It also decides the class of Mac the host's GPU device presents to
+     metal2vulkan's runtime (`GuestArch::mac_class`), whose GPU results
+     Metal leaves to the Mac's GPU: an Apple silicon Mac's for an arm64
+     guest, an Intel or AMD Mac's for an x86-64 guest, whatever GPU the
+     host has. On Apple silicon a new `Private` texture reads Metal's
+     fixed pattern where Metal keeps it compressed (an `RGBA8Unorm` one
+     opaque magenta), blits through such a texture write three formats'
+     canonical encodings, a `half` NaN clear keeps its sign, and a `Clear`
+     load in a pass without a draw call reaches the whole level of a
+     compressed texture and the render area's 32x32 tiles of another; on
+     an Intel or AMD Mac a new `Private` texture holds what its memory held
+     (zero, filled so, on an Apple GPU), blits keep their bytes, the NaN
+     clear goes through `half`, and the `Clear` load reaches the whole
+     level. The runtime fixes the class of a device as it makes it, so it
+     is the process's, taken from its first graphics device; QEMU makes
+     every device of a process for its own target's guests.
 11. **Stage 2 lays the final transport.** The rings, doorbells, interrupts,
     contexts and the display path are the final ones from stage 2 on, and
     stage 3 adds commands to them. The stage 2 display scans out host memory

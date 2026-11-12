@@ -18,6 +18,7 @@ use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::rt::{Executor, Job, SerialQueue};
 use reims_vgpu_vulkan::core::sync::Mutex;
 
+use crate::GuestArch;
 use crate::memory::MemoryMap;
 
 /// What the API asks of a platform beyond core's: the process's instance, its GPU device, a
@@ -29,6 +30,14 @@ pub trait ApiPlatform: Platform {
     /// The Metal device a config names: `None` is the system's default device, `Some(id)` the
     /// device whose registry ID is `id`. `None` when there is no such device.
     fn metal_device(&self, registry_id: Option<u64>) -> Option<Self::Device>;
+
+    /// Tells the platform the architecture of the guest a graphics device serves, before the
+    /// device asks for its Metal device ([`ApiPlatform::metal_device`]), so the platform's devices
+    /// give the answers of the Macs that guest's frameworks were written against where a Mac's GPU
+    /// decides them ([`GuestArch`]). Nothing by default.
+    fn present_guest(&self, guest: GuestArch) {
+        let _ = guest;
+    }
 
     /// Copies the whole of `texture` into `dst`: `height` rows of `width * 4` bytes, each
     /// `bytes_per_row` after the last. The caller has checked that `dst` holds them.

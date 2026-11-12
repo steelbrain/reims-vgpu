@@ -285,6 +285,156 @@ fn on_vulkan_guest_texture_ids_are_kept_from_the_host_s() {
     }
 }
 
+/// The variable naming the guest architecture of [`the_guest_s_class_decides_the_answers`]'s
+/// child, `x86_64` or `arm64`.
+const GUEST_CLASS_CHILD: &str = "RVG_GUEST_CLASS_CHILD";
+
+/// The guest's class decides the answers whatever the host GPU: on the Vulkan platform, a graphics
+/// device for an arm64 guest makes its GPU device present an Apple silicon Mac to the runtime, and
+/// one for an x86-64 guest a Mac with an Intel or AMD GPU (`GuestArch::mac_class`), on an Apple
+/// GPU (MoltenVK) as on any other. A new `Private` 64 by 64 `RGBA8Unorm` render target, blitted
+/// into a buffer before anything writes it, reads Metal's fixed pattern for the arm64 guest, opaque
+/// magenta in every texel, as an Apple M3 Max reads it; for the x86-64 guest the runtime writes no
+/// pattern into it, and on an Apple GPU, whose own image of it would read the pattern, fills it
+/// with zeros, as the Intel UHD 630 and the AMD Radeon Pro 5300M read zero. The class is the
+/// process's, fixed at its first device, so each architecture runs in a child process of its own,
+/// in which the graphics device is the process's first
+#[test]
+fn on_vulkan_the_guest_s_class_decides_the_answers_whatever_the_host_gpu() {
+    the_guest_s_class_decides_the_answers();
+}
+
+/// [`on_vulkan_the_guest_s_class_decides_the_answers_whatever_the_host_gpu`]: in the child, the
+/// device and the texture of [`GUEST_CLASS_CHILD`]'s architecture; else a child for each.
+fn the_guest_s_class_decides_the_answers() {
+    use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
+    use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+    use reims_vgpu_vulkan::core::platform::types::{MtlOrigin, MtlSize};
+    use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+
+    const SIDE: u64 = 64;
+    let Ok(arch) = std::env::var(GUEST_CLASS_CHILD) else {
+        for arch in ["x86_64", "arm64"] {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "graphics::tests::on_vulkan_the_guest_s_class_decides_the_answers_whatever_the_host_gpu",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(GUEST_CLASS_CHILD, arch)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{arch}: {stdout}{stderr}");
+            // The child's line follows libtest's own `test NAME ... ` on its line.
+            let line = format!("GUEST-CLASS {arch}: ");
+            let ran = stdout
+                .lines()
+                .find_map(|l| l.find(&line).map(|at| &l[at..]));
+            let Some(ran) = ran else {
+                panic!("{arch}: the child ran no device: {stdout}{stderr}");
+            };
+            println!("{ran}");
+        }
+        return;
+    };
+    let guest = match arch.as_str() {
+        "x86_64" => GuestArch::X86_64,
+        "arm64" => GuestArch::Arm64,
+        other => panic!("{GUEST_CLASS_CHILD}={other}"),
+    };
+    let platform = crate::singleton::platform();
+    let config = GraphicsConfig {
+        guest_arch: guest,
+        ..GraphicsConfig::default()
+    };
+    let _device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
+    let gpu = platform.metal_device(None).unwrap();
+    let properties = gpu.raw.properties();
+    let apple_gpu = metal2vulkan_runtime::MacClass::of_vendor(properties.vendor_id)
+        == metal2vulkan_runtime::MacClass::AppleSilicon;
+    assert_eq!(
+        properties.lossless_compression,
+        guest == GuestArch::Arm64,
+        "{guest:?} on {}",
+        properties.name
+    );
+    // RGBA8Unorm, RenderTarget | ShaderRead, Private.
+    let desc = platform.texture_descriptor(&TextureDesc {
+        pixel_format: 70,
+        width: SIDE,
+        height: SIDE,
+        usage: 5,
+        resource_options: Some(0x20),
+        ..TextureDesc::default()
+    });
+    let before = gpu.raw.work_counts();
+    let texture = gpu.new_texture(OnFault::Die, &desc).unwrap().unwrap();
+    let after = gpu.raw.work_counts();
+    let length = SIDE * SIDE * 4;
+    let out = gpu
+        .new_buffer_of_length(OnFault::Die, length, 0)
+        .unwrap()
+        .unwrap();
+    let queue = gpu.new_command_queue().unwrap();
+    let cb = queue.command_buffer(OnFault::Die).unwrap().unwrap();
+    let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+    blit.encode(
+        OnFault::Die,
+        BlitCmd::CopyTextureToBuffer {
+            source_texture: &texture,
+            source_slice: 0,
+            source_level: 0,
+            source_origin: MtlOrigin::new(0, 0, 0),
+            source_size: MtlSize::new(SIDE, SIDE, 1),
+            destination_buffer: &out,
+            destination_offset: 0,
+            destination_bytes_per_row: SIDE * 4,
+            destination_bytes_per_image: length,
+        },
+    )
+    .unwrap();
+    blit.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+    cb.commit(OnFault::Die).unwrap();
+    cb.wait_until_completed(OnFault::Die).unwrap();
+    assert_eq!(cb.error(), None);
+    // SAFETY: a Shared buffer of `length` bytes, read after the blit that wrote it completed.
+    let read = unsafe {
+        std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), length as usize).to_vec()
+    };
+    let unfilled = after.private_textures_unfilled - before.private_textures_unfilled;
+    let zero_filled = after.private_textures_zero_filled - before.private_textures_zero_filled;
+    match guest {
+        GuestArch::Arm64 => {
+            assert!(
+                read.chunks(4).all(|t| t == [0xff, 0x00, 0xff, 0xff]),
+                "{guest:?} on {}: a new texture reads Metal's pattern: {:02x?}",
+                properties.name,
+                &read[..16]
+            );
+            assert_eq!((unfilled, zero_filled), (0, 0));
+        }
+        GuestArch::X86_64 if apple_gpu => {
+            assert!(
+                read.iter().all(|&b| b == 0),
+                "{guest:?} on {}: a new texture reads zero: {:02x?}",
+                properties.name,
+                &read[..16]
+            );
+            assert_eq!((unfilled, zero_filled), (0, 1));
+        }
+        GuestArch::X86_64 => assert_eq!((unfilled, zero_filled), (1, 0)),
+    }
+    println!(
+        "GUEST-CLASS {arch}: {:?} on {}, Apple GPU {apple_gpu}",
+        guest.mac_class(),
+        properties.name
+    );
+}
+
 /// The control ring's data-ring size.
 const RING_DATA: u64 = RGFX_CONTROL_RING_DATA_SIZE as u64;
 

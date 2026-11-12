@@ -31,6 +31,29 @@ impl ApiPlatform for VulkanPlatform {
         }
     }
 
+    /// The guest's class of Mac ([`GuestArch::mac_class`]) declared for every device of the
+    /// process (`reims_vgpu_vulkan::platform::present_mac_class`), which takes before the process's
+    /// first device. QEMU's `reims-graphics-pci` makes every graphics device of a process for one
+    /// architecture, its binary's target, and makes the first before any other call into the
+    /// library, so its guests get their own class. A process whose devices present another class
+    /// already (one made a device before its first graphics device, or makes graphics devices for
+    /// both architectures) keeps that class, and a warning names both.
+    fn present_guest(&self, guest: GuestArch) {
+        let class = guest.mac_class();
+        let presented = reims_vgpu_vulkan::platform::present_mac_class(class);
+        if presented != Some(class) {
+            let presented = match presented {
+                Some(other) => format!("{other:?}"),
+                None => "each GPU's own class".to_owned(),
+            };
+            log::warn!(
+                "the process's GPU devices present {presented}, fixed before this graphics device: \
+                 its {guest:?} guest gets those answers, not {class:?}'s, where a Mac's GPU decides \
+                 them"
+            );
+        }
+    }
+
     /// Memory of the library's own, which it frees through the platform's VM as the region
     /// drops, so the unmap waits until the runtime has freed every import of its pages: the
     /// region's last reference can go in a no-copy buffer's deallocator, which the runtime runs

@@ -288,6 +288,35 @@ fn announced_each(every_dies: bool) -> std::collections::BTreeSet<rt::Degradatio
         .collect()
 }
 
+/// The class of Mac every device of the process presents to the runtime
+/// (`DeviceOptions::mac_class`), fixed once for the process by whichever comes first: the first
+/// [`present_mac_class`], which fixes the class it names, or the first read of [`device_options`],
+/// which fixes none, so each device presents its own GPU's class (the runtime's
+/// `MacClass::of_vendor`: an Apple silicon Mac on an Apple GPU, a Mac with an Intel or AMD GPU on
+/// any other).
+static MAC_CLASS: OnceLock<Option<rt::MacClass>> = OnceLock::new();
+
+/// Declares the class of Mac every device of the process presents: the runtime then gives that
+/// Mac's answers where a Mac's GPU decides them, on whatever GPU the host has. The runtime lists
+/// them (its `MacClass`, and docs/API.md, "The Mac a device presents"): what a new `Private`
+/// texture reads before anything writes it (on an Apple silicon Mac Metal's fixed pattern, opaque
+/// magenta in an `RGBA8Unorm` texture, wherever Metal keeps the texture losslessly compressed and
+/// zero elsewhere; on a Mac with an Intel or AMD GPU what its memory held, zero on an Apple GPU),
+/// the encoding a GPU blit through a compressed texture writes (`BGRA10_XR`, `RG11B10Float` and
+/// `RGB9E5Float` canonicalized on Apple silicon, the bytes kept on Intel or AMD), a `half` NaN
+/// clear's sign (kept on Apple silicon in a pass without a draw call, through `half` on Intel or
+/// AMD), and how far a `Clear` load reaches past the render area in a pass of one layer without
+/// a draw call (on Apple silicon the whole level of a compressed texture and the render area's
+/// 32x32 tiles of any other, on Intel or AMD the whole level). The runtime fixes the class of a
+/// device as it makes it, and keeps one device per physical device and options, so the class is
+/// the process's: the declaration takes only before the process's first read of
+/// [`device_options`] (its first device, or the device choice's look at the host's devices).
+/// Answers the class the process's devices present: `Some(class)` where this declaration fixed
+/// it, or another class or `None` (each device's GPU's) fixed before it.
+pub fn present_mac_class(class: rt::MacClass) -> Option<rt::MacClass> {
+    *MAC_CLASS.get_or_init(|| Some(class))
+}
+
 /// The options every device is made with: the runtime's defaults, whose loader search finds
 /// Homebrew's (`vulkan-loader`, beside its `molten-vk`), with the window system's extensions where
 /// a display's window presents through Vulkan (on Linux, [`crate::os::add_window_extensions`]), the
@@ -306,8 +335,9 @@ fn announced_each(every_dies: bool) -> std::collections::BTreeSet<rt::Degradatio
 /// runtime announces sent to the answer layer ([`crate::answer::notice`]), where those that reach
 /// what the guest sees are counted, and die in strict mode ([`crate::answer::strict`]), with the
 /// kinds announced at every occurrence ([`announced_each`]), its other messages there too but
-/// those below the least severity the log takes ([`crate::answer::least_severity`]). One set, so
-/// the runtime keeps one device per physical device across `open_device` and every other open.
+/// those below the least severity the log takes ([`crate::answer::least_severity`]), and the class
+/// of Mac the process's devices present ([`present_mac_class`]). One set, so the runtime keeps one
+/// device per physical device across `open_device` and every other open.
 ///
 /// **GPU times from the host.** No command buffer writes GPU timestamps: its `GPUStartTime` is the
 /// host time its submission ended (`kernelEndTime`, or its queue's latest GPU end before it,
@@ -325,6 +355,7 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
         let mut options = rt::DeviceOptions::default();
         crate::os::add_window_extensions(&mut options);
         options.gpu_times_from_host = true;
+        options.mac_class = *MAC_CLASS.get_or_init(|| None);
         options.policy = exact_policy(std::env::var("REIMS_VGPU_EXACT").ok().as_deref());
         if crate::answer::strict_process() {
             options.policy.pipeline_waits = metal2vulkan::device::PipelineWaitPolicy::Exact;
@@ -960,6 +991,56 @@ pub(crate) mod tests {
     fn the_shader_cache_holds_25_gib() {
         assert_eq!(rt::DEFAULT_CAPACITY, 25 << 30);
         assert_eq!(device_options().shader_cache.capacity, 1 << 30);
+    }
+
+    /// The variable naming what [`the_process_s_mac_class_is_fixed_by_its_first_declaration`]'s
+    /// child does first: `declare` or `read`.
+    const MAC_CLASS_CHILD: &str = "RVG_MAC_CLASS_CHILD";
+
+    /// The class of Mac the process's devices present is fixed once: a declaration before the
+    /// options are read fixes its class, which the options carry and a later declaration of
+    /// another class leaves; a read of the options before any declaration fixes none (each GPU's
+    /// own), which a later declaration leaves too, answering it. Each order in a child process of
+    /// its own, as the class is the process's
+    #[test]
+    fn the_process_s_mac_class_is_fixed_by_its_first_declaration() {
+        let (apple, intel) = (rt::MacClass::AppleSilicon, rt::MacClass::IntelOrAmd);
+        match std::env::var(MAC_CLASS_CHILD).as_deref() {
+            Ok("declare") => {
+                assert_eq!(present_mac_class(apple), Some(apple));
+                assert_eq!(device_options().mac_class, Some(apple));
+                assert_eq!(present_mac_class(intel), Some(apple));
+                assert_eq!(device_options().mac_class, Some(apple));
+                println!("MAC-CLASS-CHILD declare");
+            }
+            Ok("read") => {
+                assert_eq!(device_options().mac_class, None);
+                assert_eq!(present_mac_class(intel), None);
+                assert_eq!(device_options().mac_class, None);
+                println!("MAC-CLASS-CHILD read");
+            }
+            Ok(other) => panic!("{MAC_CLASS_CHILD}={other}"),
+            Err(_) => {
+                for first in ["declare", "read"] {
+                    let out = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "platform::tests::the_process_s_mac_class_is_fixed_by_its_first_declaration",
+                            "--nocapture",
+                            "--test-threads=1",
+                        ])
+                        .env(MAC_CLASS_CHILD, first)
+                        .output()
+                        .unwrap();
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    assert!(out.status.success(), "{first}: {out:?}");
+                    assert!(
+                        stdout.contains(&format!("MAC-CLASS-CHILD {first}")),
+                        "{first}: {stdout}"
+                    );
+                }
+            }
+        }
     }
 
     /// A strict process, as every test of this crate is, waits for each pipeline until it is
