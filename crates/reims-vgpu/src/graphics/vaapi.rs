@@ -29,13 +29,17 @@
 //!   pictures are not, of a cache made so, is logged once.
 //! - **Otherwise a picture lands** in the output's planes one of three ways, each the fallback at
 //!   the last's refusal, the session counting each:
-//!   1. **In the surface's pages, by the driver's video processing** (the VA crate's
-//!      `Frame::write_to_guest`): a run from the decode surface into a linear VA surface
-//!      imported over a dma-buf of the planes' pages, at their own pitches. It is taken where
-//!      both planes lie in one memory a dma-buf is made of ([`PlanePages`]), and where the
-//!      driver's import check (the VA crate's `import_check`) found it writes imports of the
-//!      frame's format right, at the alignment the planes' rows and starts are a multiple of,
-//!      and in whole rows where it writes them so. The run writes the planes' whole even width
+//!   1. **In the surface's pages or its device cache, by the driver's video processing** (the VA
+//!      crate's `Frame::write_to_guest`): a run from the decode surface into a linear VA surface
+//!      imported over a dma-buf of the planes' pages, or of the cache's memory, at their own
+//!      pitches. It is taken where both planes lie in one memory a dma-buf is made of
+//!      ([`PlanePages`]), or in one device cache made a dma-buf for the video
+//!      ([`CacheTargets`]), whose pictures the driver's check refused to decode there or whose
+//!      planes do not lie as a target's must, and where the driver's import check (the VA
+//!      crate's `import_check`) found it writes imports of the frame's format right, at the
+//!      alignment the planes' rows and starts are a multiple of, and in whole rows where it
+//!      writes them so. A picture written into a cache is acquired as a decode into it is
+//!      (`Buffer::external_write_done`). The run writes the planes' whole even width
 //!      and height within the coded picture, which [`layout`] tells the guest to make room for.
 //!      CoreVideo's planes, 32 bytes into their pages, are written so by no driver: radeonsi
 //!      imports planes 256 bytes apart alone, iHD writes a plane only at its dma-buf's first byte
@@ -67,7 +71,9 @@ use reims_vgpu_graphics::wire::{
     RgfxVideoEncodeCaps, RgfxVideoOutputLayout,
 };
 use reims_vgpu_video::core::backend::DeviceWrite;
-use reims_vgpu_video::core::device_memory::{DeviceImports, GuestTarget, MemoryIdentity};
+use reims_vgpu_video::core::device_memory::{
+    DeviceImports, DeviceMemory, DmaBufError, GuestTarget, MemoryIdentity, SurfaceDmaBuf,
+};
 use reims_vgpu_video::core::fourcc::FourCc;
 use reims_vgpu_video::core::runtime::Runtime;
 use reims_vgpu_video::core::surfaces::{PlaneLayout, SurfaceLayout};
@@ -77,6 +83,7 @@ use reims_vgpu_video::vaapi::{
     TARGET_ALIGNMENT, Target, TargetChecks, TargetCodec, TargetFor, TargetFormat, TargetPlane,
     TargetShape, encoder_support,
 };
+use reims_vgpu_vulkan::core::num::ToU64 as _;
 use reims_vgpu_vulkan::core::platform::Handle as _;
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
@@ -584,21 +591,7 @@ impl<P: Platform> CacheTargets<P> {
                 ));
             }
         }
-        let memory = self.memories.get_or_make(
-            cache,
-            0,
-            || {
-                let exported = buffer.export_dma_buf()?;
-                Ok(CacheMemory {
-                    dma_buf: exported.fd,
-                    size: exported.allocation_size,
-                    offset: exported.offset,
-                    buffer: buffer.clone_ref(),
-                    last: Mutex::new(None),
-                })
-            },
-            || "the cache went".to_owned(),
-        )?;
+        let memory = self.memory(cache, buffer)?;
         let laid = planes.map(|(room, offset, _)| TargetPlane {
             offset: memory.offset + offset,
             bytes_per_row: room.bytes_per_row,
@@ -630,6 +623,90 @@ impl<P: Platform> CacheTargets<P> {
         .map_err(|e| format!("the import of the cache's memory: {e}"))?;
         *last = Some((target.clone(), laid));
         Ok(target)
+    }
+
+    /// The memory of the cache `cache` (`buffer`), exported as a dma-buf once while the cache
+    /// lives; `Err` says why not.
+    fn memory(
+        &self,
+        cache: &MemoryIdentity,
+        buffer: &P::Buffer,
+    ) -> Result<Arc<CacheMemory<P>>, String> {
+        self.memories.get_or_make(
+            cache,
+            0,
+            || {
+                let exported = buffer.export_dma_buf()?;
+                Ok(CacheMemory {
+                    dma_buf: exported.fd,
+                    size: exported.allocation_size,
+                    offset: exported.offset,
+                    buffer: buffer.clone_ref(),
+                    last: Mutex::new(None),
+                })
+            },
+            || "the cache went".to_owned(),
+        )
+    }
+
+    /// Where the driver's video processing writes a picture of `bit_depth` in its output's device
+    /// cache (the module doc's first way a picture lands): the layout of the output's planes in the
+    /// cache, and the cache's memory as a dma-buf, where both planes lie in one cache made a
+    /// dma-buf for the video; `Err` with why not.
+    fn in_cache(
+        &self,
+        luma: &OutputPlane<P>,
+        chroma: &OutputPlane<P>,
+        bit_depth: u32,
+    ) -> Result<(SurfaceLayout, CacheBytes<P>), String> {
+        let (Some(cache), Some(other)) = (&luma.cache, &chroma.cache) else {
+            return Err("an output in a device cache not made a dma-buf".to_owned());
+        };
+        if cache.key() != other.key() {
+            return Err("an output whose planes lie in two device caches".to_owned());
+        }
+        let layout = in_place_layout(Place::of(luma), Place::of(chroma), bit_depth)?;
+        let memory = self.memory(cache, &luma.buffer)?;
+        Ok((
+            layout,
+            CacheBytes {
+                memory,
+                identity: cache.clone(),
+            },
+        ))
+    }
+}
+
+/// A device cache's bytes as the driver's video processing writes them
+/// ([`CacheTargets::in_cache`]): its memory's dma-buf, from the cache's first byte, by the cache's
+/// identity, so that an import of it goes as the cache does.
+struct CacheBytes<P: Platform> {
+    memory: Arc<CacheMemory<P>>,
+    identity: MemoryIdentity,
+}
+
+impl<P: Platform> DeviceMemory for CacheBytes<P> {
+    fn identity(&self) -> MemoryIdentity {
+        self.identity.clone()
+    }
+
+    fn length(&self) -> usize {
+        let bytes = self.memory.size.saturating_sub(self.memory.offset);
+        usize::try_from(bytes).unwrap_or(usize::MAX)
+    }
+
+    /// The cache's whole memory, every range at its own byte of it: one dma-buf holds the cache.
+    fn dma_buf_of(&self, ranges: &[(usize, usize)]) -> Result<SurfaceDmaBuf, DmaBufError> {
+        let fd = (self.memory.dma_buf.try_clone())
+            .map_err(|e| DmaBufError::Refused(format!("the cache's dma-buf: {e}")))?;
+        let offsets = (ranges.iter())
+            .map(|&(start, _)| self.memory.offset.saturating_add(start.to_u64()))
+            .collect();
+        Ok(SurfaceDmaBuf {
+            fd,
+            size: self.memory.size,
+            offsets,
+        })
     }
 }
 
@@ -716,6 +793,7 @@ impl<P: Platform> HostDecoder<P> for VaDecoder<P> {
             imports: Arc::clone(&self.imports),
             copier: self.copier.clone(),
             said: Arc::clone(&self.said),
+            targets: self.targets.clone(),
         })))
     }
 
@@ -736,12 +814,34 @@ struct VaPicture<P: Platform> {
     imports: Arc<GuestWrites>,
     copier: SessionCopier<P>,
     said: Arc<Mutex<Vec<String>>>,
+    /// The caches the video decodes into, where it does: the driver's video processing writes a
+    /// picture decoded elsewhere into its output's cache through their memory.
+    targets: Option<Arc<CacheTargets<P>>>,
 }
 
 /// A session's GPU copier, its pictures' to share, or why it has none.
 type SessionCopier<P> = Result<Arc<Mutex<Box<dyn GpuCopier<P>>>>, String>;
 
 impl<P: Platform> VaPicture<P> {
+    /// Writes the picture by the driver's video processing into `memory`, laid out as `layout`
+    /// (the VA crate's `Frame::write_to_guest`): `None` once it is there, or why it was not
+    /// written, nothing written. `Err` where the decode or a run failed or ran past its deadline:
+    /// no copy may race the GPU's write, so the picture fails.
+    fn write_in_place(
+        &self,
+        layout: &SurfaceLayout,
+        memory: &dyn DeviceMemory,
+    ) -> Result<Option<String>, BackendError> {
+        let target = match GuestTarget::new(layout, memory) {
+            Ok(target) => target,
+            Err(why) => return Ok(Some(why)),
+        };
+        match self.frame.write_to_guest(&target, &self.imports)? {
+            DeviceWrite::Written => Ok(None),
+            DeviceWrite::Declined(why) => Ok(Some(why)),
+        }
+    }
+
     /// Logs, once a session, and at info once per process (`kind`), why a picture was copied by
     /// the CPU.
     fn copied_because(&self, why: String) {
@@ -763,19 +863,30 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
             to.decoded_there();
             return Ok(());
         }
-        let declined = match in_place(to.luma, to.chroma, self.frame.bit_depth()) {
-            Ok((layout, pages)) => {
-                let target = GuestTarget::new(&layout, &*pages.memory);
-                match target.map(|target| self.frame.write_to_guest(&target, &self.imports)) {
-                    Ok(Ok(DeviceWrite::Written)) => return Ok(()),
-                    Ok(Ok(DeviceWrite::Declined(why))) => why,
-                    // The decode or a run failed or ran past its deadline: no copy may race the
-                    // GPU's write, so the picture fails.
-                    Ok(Err(error)) => return Err(error.into()),
+        let bit_depth = self.frame.bit_depth();
+        let declined = match &self.targets {
+            // In its device cache, through the cache's memory as a dma-buf, where the video
+            // decodes into caches: the driver's check refused the picture's codec and format, or
+            // its planes do not lie as a decode's target must.
+            Some(targets) if to.luma.cached || to.chroma.cached => {
+                match targets.in_cache(to.luma, to.chroma, bit_depth) {
+                    Ok((layout, bytes)) => match self.write_in_place(&layout, &bytes)? {
+                        None => {
+                            to.luma.buffer.external_write_done()?;
+                            return Ok(());
+                        }
+                        Some(why) => format!("in its device cache: {why}"),
+                    },
                     Err(why) => why,
                 }
             }
-            Err(why) => why,
+            _ => match in_place(to.luma, to.chroma, bit_depth) {
+                Ok((layout, pages)) => match self.write_in_place(&layout, &*pages.memory)? {
+                    None => return Ok(()),
+                    Some(why) => why,
+                },
+                Err(why) => why,
+            },
         };
         let declined = match &self.copier {
             Ok(copier) => match copier.lock().copy(&self.frame, to.luma, to.chroma)? {
@@ -923,6 +1034,21 @@ struct Place {
     width: u64,
     height: u64,
     rows_held: u64,
+}
+
+impl Place {
+    /// Where `plane` lies in its buffer, from the buffer's first byte: a device cache's plane as
+    /// the cache's memory holds it ([`CacheTargets::in_cache`]).
+    fn of<P: Platform>(plane: &OutputPlane<P>) -> Self {
+        Place {
+            offset: plane.offset,
+            bytes_per_row: plane.bytes_per_row,
+            row_bytes: plane.row_bytes,
+            width: plane.width,
+            height: plane.height,
+            rows_held: plane.rows_held,
+        }
+    }
 }
 
 /// The layout of a frame of `bit_depth` written in place at `luma` and `chroma` ([`in_place`]):

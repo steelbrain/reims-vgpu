@@ -422,7 +422,12 @@ the render node of the runtime device's own GPU, whatever its vendor
   1. by the driver's video processing, in place, into the planes' pages
      ("Zero copy"): where both planes lie in one memory a dma-buf is made
      of, and the import check's answer for the frame's format takes their
-     layout;
+     layout; or into the output's device cache, through the cache's memory
+     as a dma-buf, where the arm decodes into caches (the driver's check of
+     decodes into targets passed a codec) and this picture was not decoded
+     there: its codec and format failed the check, as HEVC Main 10 into
+     P010 does on an RX 550's radeonsi (a picture whose reference's target
+     was overwritten), or its planes do not lie as a target's must;
   2. by the runtime device's GPU, into the buffer each plane lies in, the
      surface's pages or its device cache, at the plane's offset and rows:
      the decode surface's export as dma-bufs (`Frame::export`,
