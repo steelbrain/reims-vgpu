@@ -230,7 +230,9 @@ const APPLE_PIECES: [(i64, &[Piece]); 11] = {
 /// mesh shading
 /// (`MESH_RENDER_PIPELINE_CREATE` and the object and mesh stages' render ops, where the platform
 /// makes mesh pipelines: [`makes_mesh_pipelines`]). Mesh draws in an indirect command buffer are
-/// not: no mesh pipeline the bundle makes supports them, as on the x86 Macs.
+/// not: no mesh pipeline the bundle makes supports them, as on the x86 Macs. And rasterization
+/// rate maps (`RATE_MAP_CREATE`, `RATE_MAP_RESET` and `RATE_MAP_QUERY`, and a pass's map after its
+/// other records, `RGFX_PASS_FLAG_RATE_MAP`), whose layer counts are the platform's.
 /// A piece joins this list when its wire messages, its decoding and its bundle members land, and
 /// the Apple families it holds back rise with it once every piece up to Apple7's is here
 /// ([`cap_apple_families`]).
@@ -244,6 +246,7 @@ const WIRED: &[Piece] = &[
     Piece::BinaryArchives,
     Piece::IoCommandQueues,
     Piece::MeshShading,
+    Piece::RasterizationRateMaps,
 ];
 
 /// `MTLGPUFamilyApple7`, the M1's: the first Apple family a Mac's GPU answers. A Mac's GPU
@@ -298,7 +301,6 @@ fn cap_apple_families(identity: &mut IdentityCaps, wired: &[Piece]) {
 /// | `supportsDynamicLibraries`, `supportsRenderDynamicLibraries` | no | `newDynamicLibrary:` and linked functions |
 /// | `supportsPlacementSparse` | no | placement sparse buffers and textures |
 /// | `supportsCounterSampling:` | no, at every point | counter sample buffers |
-/// | `supportsRasterizationRateMapWithLayerCount:` | no, of every count | rasterization rate maps |
 /// | `maximumConcurrentCompilationTaskCount` | the device's compile threads, which run its pipeline compiles | nothing: the device's own answer |
 /// | `recommendedMaxWorkingSetSize` | on a GPU that shares the CPU's memory, three quarters of the guest's RAM rounded down to 16 KiB, or the platform's where that is less or the host maps no RAM; on a GPU of its own memory the platform's ([`lane_working_set`]) | nothing: a choice |
 /// | `maxBufferLength` | the platform's, but at most three quarters of `recommendedMaxWorkingSetSize`, rounded down to 16 KiB ([`lane_max_buffer_length`]) | nothing: a choice |
@@ -361,7 +363,6 @@ fn lane(mut identity: IdentityCaps, compile_threads: u64, guest_ram: Option<u64>
         *no = Some(false);
     }
     identity.counter_sampling = [Some(false); 5];
-    identity.sizes.largest_rasterization_rate_map_layer_count = Some(0);
     identity.sizes.maximum_concurrent_compilation_task_count = Some(compile_threads);
     let unified = identity.flags.has_unified_memory == Some(true);
     let z = &mut identity.sizes;
@@ -838,9 +839,9 @@ mod tests {
         }
 
         // The lane's own pieces: argument encoders, texture views, Automatic heaps, sample
-        // positions and IO queues, Apple1's and Apple2's, and indirect command buffers, compute
-        // indirect barriers and binary archives, Apple3's. They fall short of Apple7, so no Apple
-        // family stands; Mac2 does.
+        // positions and IO queues, Apple1's and Apple2's, indirect command buffers, compute
+        // indirect barriers and binary archives, Apple3's, and rasterization rate maps, Apple6's.
+        // They fall short of Apple7, so no Apple family stands; Mac2 does.
         for piece in [
             Piece::ArgumentEncoders,
             Piece::TextureViews,
@@ -850,6 +851,7 @@ mod tests {
             Piece::IndirectCommandBuffers,
             Piece::ComputeIndirectBarriers,
             Piece::BinaryArchives,
+            Piece::RasterizationRateMaps,
         ] {
             assert!(WIRED.contains(&piece), "{piece:?}");
         }
@@ -901,8 +903,8 @@ mod tests {
         assert_eq!(info.identity_flags[13], 0);
         assert_eq!(info.identity_flags[18], 0);
         assert_eq!(info.counter_sampling, [0; 5]);
-        // recommended_max_working_set_size first, the rate maps' layers at 14 (the lane's 0), the
-        // driver's feature profile and FP configs last, the platform's.
+        // recommended_max_working_set_size first, the rate maps' layers at 14 (the platform's 2),
+        // the driver's feature profile and FP configs last, the platform's.
         assert_eq!(
             info.sizes[0],
             identity.sizes.recommended_max_working_set_size.unwrap()
@@ -914,7 +916,7 @@ mod tests {
         // maximum_concurrent_compilation_task_count is the device's compile threads.
         assert_eq!(info.sizes[12], 4);
         assert_eq!(info.sizes[13], 8);
-        assert_eq!(info.sizes[14], 0);
+        assert_eq!(info.sizes[14], 2);
         assert_eq!(info.sizes[15..], [10, 0xe, 0x54, 0]);
         // Every SDK format, each the platform's: BGRA8Unorm (80) 16-byte texture buffers and
         // 64x64 tiles; BC1_RGBA (130) no texture buffers.
