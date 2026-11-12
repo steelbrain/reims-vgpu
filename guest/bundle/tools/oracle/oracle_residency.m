@@ -26,6 +26,7 @@
 //               same|other                 a made set's answers; `again` compares the
 //                                          allAllocations of a second ask with the first's
 //   set NAME label => same|copy|nil, after the descriptor's label changed L
+//   set NAME setLabel: => answered, label then L | not answered
 //   chain => CLASS < SUPER < ...           the set's classes, up to NSObject
 //   members CLASS: SEL=TYPES ...           each one's instance methods, sorted, with their types
 //   alloc NAME => CLASS allocatedSize S    the allocations of the cases: B, a Shared buffer of
@@ -38,6 +39,11 @@
 //                after each OP in turn: count is allocationCount, size allocatedSize, has
 //                containsAllocation: of each allocation (1 or 0), all the names of allAllocations
 //                in its order (?CLASS for one of none of them)
+//   sizes        size WHAT => S (allocatedSize of each: S ...)   a set's allocatedSize once the
+//                allocations WHAT are added and committed: buffers alone and together, Shared
+//                and Private, of 4 KiB, 64 KiB, 1 MiB and 1 MiB + 4 KiB (L2), a heap's buffer
+//                and texture (HT) without the heap and with it, a texture and its view, a
+//                texture over a buffer (BT over LB) without the buffer and with it
 //   residency    residency OP => count N size S     requestResidency and endResidency, on an
 //                empty set and on one holding allocations, before and after a commit, twice
 //   retain       retain WHAT => N   an object's retainCount after each step: an allocation added to
@@ -61,6 +67,14 @@
 //   layer        layer => residencySet CLASS|nil count N; layer drawable => made|nil texture in
 //                set YES|NO count N     a CAMetalLayer of the device: its residencySet (macOS 26)
 //                and that set after nextDrawable
+//   layer-spy    spy SEL from IMAGE => N    the messages a residency set's class and its bases
+//                (below NSObject) receive while a CAMetalLayer of the device makes its set, five
+//                drawables are drawn and presented on a queue the set is added to, the layer's
+//                drawable size changes, the set is removed from the queue and the layer lets the
+//                device go: each member, by the image of its caller (QuartzCore, Metal, ...),
+//                with how many times; `spy skipped SEL TYPES` for a member of a type it does not
+//                wrap
+// Each case's child ends itself after 30 s (SIGALRM, signal 14): a call that does not return.
 //   the bad inputs, each printing what the call answered (or how the child ended):
 //   nil-descriptor        newResidencySetWithDescriptor: of nil
 //   huge-capacity         a descriptor of initialCapacity NSUIntegerMax
@@ -73,6 +87,8 @@
 // Build: see README.md.
 #import "oracle_common.h"
 #import <QuartzCore/QuartzCore.h>
+#include <ctype.h>
+#include <dlfcn.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <spawn.h>
@@ -655,6 +671,210 @@ static void case_layer(void)
 		       d && a == (id)d.texture ? " (the drawable's texture)" : "");
 }
 
+static void size_line(const char *what, NSArray *objs)
+{
+	id<MTLResidencySet> s = make_set();
+	for (id a in objs)
+		[s addAllocation:a];
+	[s commit];
+	printf("size %s => %llu (allocatedSize of each:", what, (unsigned long long)s.allocatedSize);
+	for (id a in objs)
+		printf(" %lu", (unsigned long)[a allocatedSize]);
+	printf(")\n");
+}
+
+static void case_sizes(void)
+{
+	id<MTLBuffer> p = [g_dev newBufferWithLength:4096 options:MTLResourceStorageModePrivate];
+	id<MTLBuffer> lb = [g_dev newBufferWithLength:65536 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> l = [g_dev newBufferWithLength:1 << 20 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> l2 = [g_dev newBufferWithLength:(1 << 20) + 4096 options:MTLResourceStorageModeShared];
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                                                                               width:64
+	                                                                              height:64
+	                                                                           mipmapped:NO];
+	td.storageMode = MTLStorageModeShared;
+	td.usage = MTLTextureUsageShaderRead;
+	id<MTLTexture> bt = [lb newTextureWithDescriptor:td offset:0 bytesPerRow:256];
+	td.storageMode = MTLStorageModePrivate;
+	id<MTLTexture> ht = [(id<MTLHeap>)A(@"H") newTextureWithDescriptor:td];
+	size_line("B", @[ A(@"B") ]);
+	size_line("B X", @[ A(@"B"), A(@"X") ]);
+	size_line("P (Private 4 KiB)", @[ p ]);
+	size_line("B P", @[ A(@"B"), p ]);
+	size_line("LB (Shared 64 KiB)", @[ lb ]);
+	size_line("L (Shared 1 MiB)", @[ l ]);
+	size_line("L2 (Shared 1 MiB + 4 KiB)", @[ l2 ]);
+	size_line("L B", @[ l, A(@"B") ]);
+	size_line("HB", @[ A(@"HB") ]);
+	size_line("HT", @[ ht ]);
+	size_line("HB HT", @[ A(@"HB"), ht ]);
+	size_line("H HB HT", @[ A(@"H"), A(@"HB"), ht ]);
+	size_line("T", @[ A(@"T") ]);
+	size_line("TV", @[ A(@"TV") ]);
+	size_line("T TV", @[ A(@"T"), A(@"TV") ]);
+	size_line("BT", @[ bt ]);
+	size_line("LB BT", @[ lb, bt ]);
+}
+
+// The spy: each member of the set's classes, wrapped to count its calls by its caller's image.
+static NSMutableDictionary<NSString *, NSNumber *> *g_spy;
+static volatile BOOL g_spying;
+static Class g_spyClass;
+
+static void spy_note(id self, SEL sel, void *ra)
+{
+	if (!g_spying || ![self isKindOfClass:g_spyClass])
+		return;
+	Dl_info info;
+	const char *img = "?";
+	if (dladdr(ra, &info) && info.dli_fname) {
+		const char *slash = strrchr(info.dli_fname, '/');
+		img = slash ? slash + 1 : info.dli_fname;
+	}
+	NSString *k = [NSString stringWithFormat:@"%s from %s", sel_getName(sel), img];
+	@synchronized(g_spy) {
+		g_spy[k] = @(g_spy[k].unsignedLongValue + 1);
+	}
+}
+
+// The type encoding without its offsets and qualifiers: "v@:@" for "v24@0:8@16".
+static NSString *bare_types(const char *t)
+{
+	NSMutableString *b = [NSMutableString string];
+	for (const char *p = t; *p; p++)
+		if (!isdigit((unsigned char)*p) && *p != 'r')
+			[b appendFormat:@"%c", *p];
+	return b;
+}
+
+static void spy_wrap(Method m)
+{
+	SEL sel = method_getName(m);
+	IMP orig = method_getImplementation(m);
+	NSString *t = bare_types(method_getTypeEncoding(m));
+	id block = nil;
+	if ([t isEqualToString:@"v@:"])
+		block = ^(id self) {
+		  spy_note(self, sel, __builtin_return_address(0));
+		  ((void (*)(id, SEL))orig)(self, sel);
+		};
+	else if ([t isEqualToString:@"@@:"])
+		block = ^id(id self) {
+		  spy_note(self, sel, __builtin_return_address(0));
+		  return ((id(*)(id, SEL))orig)(self, sel);
+		};
+	else if ([t isEqualToString:@"Q@:"])
+		block = ^uint64_t(id self) {
+		  spy_note(self, sel, __builtin_return_address(0));
+		  return ((uint64_t(*)(id, SEL))orig)(self, sel);
+		};
+	else if ([t isEqualToString:@"v@:@"])
+		block = ^(id self, id a) {
+		  spy_note(self, sel, __builtin_return_address(0));
+		  ((void (*)(id, SEL, id))orig)(self, sel, a);
+		};
+	else if ([t isEqualToString:@"v@:^@Q"])
+		block = ^(id self, const void *a, uint64_t n) {
+		  spy_note(self, sel, __builtin_return_address(0));
+		  ((void (*)(id, SEL, const void *, uint64_t))orig)(self, sel, a, n);
+		};
+	else if ([t isEqualToString:@"B@:@"])
+		block = ^BOOL(id self, id a) {
+		  spy_note(self, sel, __builtin_return_address(0));
+		  return ((BOOL(*)(id, SEL, id))orig)(self, sel, a);
+		};
+	else if ([t isEqualToString:@"Q@:@"])
+		block = ^uint64_t(id self, id a) {
+		  spy_note(self, sel, __builtin_return_address(0));
+		  return ((uint64_t(*)(id, SEL, id))orig)(self, sel, a);
+		};
+	else if ([t isEqualToString:@"v@:Q"])
+		block = ^(id self, uint64_t a) {
+		  spy_note(self, sel, __builtin_return_address(0));
+		  ((void (*)(id, SEL, uint64_t))orig)(self, sel, a);
+		};
+	else if ([t isEqualToString:@"B@:^@Q^@Q"])
+		block = ^BOOL(id self, const void *a, uint64_t n, const void *b, uint64_t k) {
+		  spy_note(self, sel, __builtin_return_address(0));
+		  return ((BOOL(*)(id, SEL, const void *, uint64_t, const void *, uint64_t))orig)(self, sel, a,
+		                                                                                    n, b, k);
+		};
+	if (!block) {
+		printf("spy skipped %s %s\n", sel_getName(sel), method_getTypeEncoding(m));
+		return;
+	}
+	method_setImplementation(m, imp_implementationWithBlock(block));
+}
+
+static void present_one(CAMetalLayer *l)
+{
+	@autoreleasepool {
+		id<CAMetalDrawable> d = [l nextDrawable];
+		if (!d)
+			return;
+		id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+		rp.colorAttachments[0].texture = d.texture;
+		rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+		rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+		id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+		[enc endEncoding];
+		[cb presentDrawable:d];
+		[cb commit];
+		[cb waitUntilCompleted];
+	}
+}
+
+static void case_layer_spy(void)
+{
+	id<MTLResidencySet> probe = make_set();
+	if (!probe) {
+		printf("layer-spy => no set\n");
+		return;
+	}
+	g_spy = [NSMutableDictionary dictionary];
+	g_spyClass = object_getClass(probe);
+	for (Class c = g_spyClass; c != Nil && c != [NSObject class]; c = class_getSuperclass(c)) {
+		unsigned n = 0;
+		Method *list = class_copyMethodList(c, &n);
+		for (unsigned i = 0; i < n; i++) {
+			const char *name = sel_getName(method_getName(list[i]));
+			if (name[0] == '.' || !strcmp(name, "dealloc") || !strncmp(name, "init", 4))
+				continue;
+			spy_wrap(list[i]);
+		}
+		free(list);
+	}
+	probe = nil;
+	CAMetalLayer *l = [CAMetalLayer layer];
+	g_spying = YES;
+	l.device = g_dev;
+	l.pixelFormat = MTLPixelFormatBGRA8Unorm;
+	l.drawableSize = CGSizeMake(64, 64);
+	id<MTLResidencySet> s = [l respondsToSelector:@selector(residencySet)] ? l.residencySet : nil;
+	if (s)
+		[g_queue addResidencySet:s];
+	for (int i = 0; i < 5; i++)
+		present_one(l);
+	l.drawableSize = CGSizeMake(128, 128);
+	present_one(l);
+	present_one(l);
+	g_spying = NO;
+	printf("layer-spy => set %s count %lu\n", cls(s), (unsigned long)s.allocationCount);
+	g_spying = YES;
+	if (s)
+		[g_queue removeResidencySet:s];
+	l.device = nil;
+	l = nil;
+	s = nil;
+	usleep(200000);
+	g_spying = NO;
+	NSArray<NSString *> *keys = [g_spy.allKeys sortedArrayUsingSelector:@selector(compare:)];
+	for (NSString *k in keys)
+		printf("spy %s => %lu\n", k.UTF8String, g_spy[k].unsignedLongValue);
+}
+
 // --- the bad inputs -----------------------------------------------------------------------------
 
 static int bad_input(const char *name)
@@ -807,6 +1027,18 @@ static int run_case(const char *name)
 		case_layer();
 		return 0;
 	}
+	if (!strcmp(name, "layer-spy")) {
+		case_layer_spy();
+		return 0;
+	}
+	if (!strcmp(name, "sizes")) {
+		if (!make_set()) {
+			printf("sizes => no set\n");
+			return 0;
+		}
+		case_sizes();
+		return 0;
+	}
 	if (!strcmp(name, "queue") || !strcmp(name, "cb") || !strcmp(name, "steps") ||
 	    !strcmp(name, "residency") || !strcmp(name, "compute-use") || !strcmp(name, "render-use")) {
 		id<MTLResidencySet> s = make_set();
@@ -841,6 +1073,13 @@ static void set_line(const char *name, id<MTLResidencySet> s, MTLResidencySetDes
 	d.label = @"changed";
 	printf("set %s label => %s, after the descriptor's label changed %s\n", name, kind,
 	       s.label ? s.label.UTF8String : "(nil)");
+	if ([(id)s respondsToSelector:@selector(setLabel:)]) {
+		((void (*)(id, SEL, id))objc_msgSend)(s, @selector(setLabel:), @"set-later");
+		printf("set %s setLabel: => answered, label then %s\n", name,
+		       s.label ? s.label.UTF8String : "(nil)");
+	} else {
+		printf("set %s setLabel: => not answered\n", name);
+	}
 }
 
 int main(int argc, char **argv)
@@ -853,8 +1092,10 @@ int main(int argc, char **argv)
 		}
 		g_dev = oracle_device(argv[1]);
 		g_queue = [g_dev newCommandQueue];
-		if (argc >= 4 && strcmp(argv[2], "--case") == 0)
+		if (argc >= 4 && strcmp(argv[2], "--case") == 0) {
+			alarm(30);
 			return run_case(argv[3]);
+		}
 		oracle_header("oracle_residency", g_dev);
 		struct {
 			const char *name;
@@ -920,7 +1161,7 @@ int main(int argc, char **argv)
 		fflush(stdout);
 		const char *cases[] = {"steps",          "residency",        "retain",          "hold",
 		                       "queue",          "cb",               "encoders",
-		                       "compute-use",    "render-use",       "layer",
+		                       "compute-use",    "render-use",       "layer",            "layer-spy",       "sizes",
 		                       "nil-descriptor", "huge-capacity",    "add-nil",
 		                       "remove-nil",     "contains-nil",     "adds-nil",
 		                       "removes-nil",    "add-foreign",      "add-freed",
