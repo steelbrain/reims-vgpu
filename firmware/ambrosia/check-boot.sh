@@ -15,9 +15,9 @@
 #            the device on Ambrosia"); default $QEMU
 #   -t       TCG, for a Linux member, in place of HVF (docs/qemu.md, "arm64 guests: the boot
 #            check of our configuration", says what such a run needs). The device runs on the GPU
-#            the run is given: the one a potluck job holds (POTLUCK_GPUS, its first), else the one
-#            MESA_VK_DEVICE_SELECT names; with neither the script stops, as on a host with several
-#            GPUs the library would take its own pick (docs/lessons.md).
+#            MESA_VK_DEVICE_SELECT names, else on the one GPU a potluck job holds (POTLUCK_GPUS);
+#            the script stops where neither names one GPU, as an --exclusive job holds every GPU
+#            of its node and the library would take its own pick among them (docs/lessons.md).
 #   -b FILE  the configuration bundle; default build/Config.cpio (make config-bundle)
 #   -T DIR   the guest probes, bench and present_probe; default build/guest-tools (make
 #            guest-tools, on a Mac)
@@ -146,13 +146,15 @@ GUEST_USER=${GUEST_USER:-aneesiqbal} GUEST_PASS=${GUEST_PASS:-aneesiqbal}
 
 ram=8G
 if ((tcg)); then
-  # The GPU the run is given (the header's -t): a potluck job's lease names it as vendor:device@bus.
-  gpu=${POTLUCK_GPUS:-}
-  gpu=${gpu%%,*} gpu=${gpu%%@*}
-  if [[ $gpu == *:* ]]; then
-    export MESA_VK_DEVICE_SELECT="$gpu!"
-  elif [[ -z ${MESA_VK_DEVICE_SELECT:-} ]]; then
-    die "no GPU given: run in a job that holds one (POTLUCK_GPUS) or name it in MESA_VK_DEVICE_SELECT"
+  # The GPU the run is given (the header's -t). A potluck job's lease lists each GPU it holds as
+  # vendor:device@bus, and an --exclusive job's lists every GPU of its node.
+  if [[ -z ${MESA_VK_DEVICE_SELECT:-} ]]; then
+    gpu=${POTLUCK_GPUS:-}
+    [[ $gpu == *:* ]] ||
+      die "no GPU given: run in a job that holds one (POTLUCK_GPUS) or name it in MESA_VK_DEVICE_SELECT"
+    [[ $gpu != *,* ]] ||
+      die "the job holds several GPUs ($gpu), as an --exclusive job does: name one in MESA_VK_DEVICE_SELECT (vendor:device!)"
+    export MESA_VK_DEVICE_SELECT="${gpu%%@*}!"
   fi
   accel=(-accel tcg,thread=multi) limit=300 desktop_wait=300 slow=5
   machine=",memory-backend=ram,dump-guest-core=off"

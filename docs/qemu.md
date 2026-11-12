@@ -1222,11 +1222,15 @@ refresh thread does, kept every tick in every run, at most 5.9 ms late.
 - **A GPU** for the device: the library runs the guest's Metal calls on the
   host's GPU over Vulkan, so the potluck job holds one, `--gpu 780m` on
   `homelab-um870-1` (its Radeon 780M, on RADV). The script runs the device
-  on that GPU: it names the lease's first GPU (`POTLUCK_GPUS`) in
-  `MESA_VK_DEVICE_SELECT`, and stops where neither is given, since on a host
-  with several GPUs the library takes its own pick
-  ([lessons.md](lessons.md)). `homelab-um870-1` also has an RTX 3090, and a
-  run with no lease (job `m3-max-17037`) put the device on it.
+  on the GPU `MESA_VK_DEVICE_SELECT` names, else on the one GPU the job
+  holds (`POTLUCK_GPUS`), which it then names there; it stops where neither
+  names one GPU, since on a host with several GPUs the library takes its
+  own pick ([lessons.md](lessons.md)). `homelab-um870-1` also has an RTX
+  3090: a run with no lease (job `m3-max-17037`) put the device on it, and
+  so did three `--exclusive` runs that took the first GPU of their lease,
+  which lists every GPU of the node, the 3090 first (`m3-max-17679`, `17862`,
+  `17863`). An `--exclusive` run names its card: `--env
+  MESA_VK_DEVICE_SELECT=1002:1900!` for the 780M.
 - **The whole machine**, for a run that gates a change: `--exclusive
   --hold-line`, as for any boot whose timings decide its verdict ("Booting a
   guest to check a change", above). Under TCG the emulated guest gets
