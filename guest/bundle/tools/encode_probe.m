@@ -18,6 +18,9 @@
 // The cases, each in a command buffer from [queue commandBuffer] (retained references):
 //   render.setVertexBuffer       setVertexBuffer:offset:atIndex: of 8 Shared buffers in turn, at
 //                                64 offsets 256 bytes apart, index 0.
+//   render.setVertexBuffer.retained  the same, each call between a CFRetain and a CFRelease of
+//                                its buffer, as an app's reference counting may wrap a call:
+//                                what two locked instructions a call add on the encoding thread.
 //   render.setVertexBytes.16     setVertexBytes:length:atIndex: of 16 bytes, index 1.
 //   render.setVertexBytes.4k     the same of 4096 bytes.
 //   render.setFragmentTexture    setFragmentTexture:atIndex: of 8 Private 64 x 64 RGBA8 textures
@@ -194,6 +197,7 @@ typedef struct {
 
 typedef enum {
 	kRenderSetVertexBuffer,
+	kRenderSetVertexBufferRetained,
 	kRenderSetVertexBytes16,
 	kRenderSetVertexBytes4k,
 	kRenderSetFragmentTexture,
@@ -245,6 +249,13 @@ static Rep renderRep(Case c, int n)
 		case kRenderSetVertexBuffer:
 			for (int i = 0; i < n; i++)
 				[e setVertexBuffer:gBuffers[i & 7] offset:(NSUInteger)(i & 63) * 256 atIndex:0];
+			break;
+		case kRenderSetVertexBufferRetained:
+			for (int i = 0; i < n; i++) {
+				CFTypeRef b = CFRetain((__bridge CFTypeRef)gBuffers[i & 7]);
+				[e setVertexBuffer:gBuffers[i & 7] offset:(NSUInteger)(i & 63) * 256 atIndex:0];
+				CFRelease(b);
+			}
 			break;
 		case kRenderSetVertexBytes16:
 			for (int i = 0; i < n; i++)
@@ -613,6 +624,7 @@ int main(int argc, char **argv)
 		if (!setUp())
 			return 1;
 		runCase("render.setVertexBuffer", kRenderSetVertexBuffer);
+		runCase("render.setVertexBuffer.retained", kRenderSetVertexBufferRetained);
 		runCase("render.setVertexBytes.16", kRenderSetVertexBytes16);
 		runCase("render.setVertexBytes.4k", kRenderSetVertexBytes4k);
 		runCase("render.setFragmentTexture", kRenderSetFragmentTexture);
