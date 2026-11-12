@@ -20,6 +20,15 @@
 // and original have the operation's prototype: the mpo_*_t type from XNU's
 // security/mac_policy.h, not the mac_* dispatcher's.
 //
+// On arm64e the operation belongs to AMFI's policy by default. To route another
+// policy's operation, prefix the operation with the policy's registered name and
+// a colon, as in "Sandbox:file_check_mmap"; a bare operation name, or an "AMFI:"
+// prefix, is AMFI's. A client that routes the same operation on two policies
+// gives each route its own `original`, each the matching policy's own handler.
+// Graft refuses a policy it does not shadow, naming it, and a call whose routes do
+// not all name one policy. The separator never appears in an x86-64 kernel symbol,
+// so x86-64 is unaffected.
+//
 // Graft writes the original as a void *. Keep it in a void * and convert it to
 // the prototype where you call it, on both architectures. Do not point
 // `original` at a typed function-pointer variable: an arm64e kext built with
@@ -53,8 +62,9 @@ bool graft_kernel_symbol(const char *identifier, const char *symbol, uint64_t *a
 // refused; Graft does not check which kext makes the call. Graft publishes the
 // outcome as the client's state: "routed", or "refused" naming the route and
 // the reason. It returns false and records nothing when Graft is not active, or
-// count is 0 or more than sixteen. A kernel function another client already
-// routes is refused, so routes across clients never collide.
+// count is 0 or more than sixteen. A route another client already holds is
+// refused -- on x86-64 a kernel function, on arm64e an operation on a given
+// policy -- so routes across clients never collide.
 // Routes live for the boot. Keep replacement code, wrapper state and original
 // storage resident even on failure: an unverified rollback can retain a route.
 bool graft_route_kernel(const char *identifier, const graft_route_request *requests, size_t count);

@@ -5,8 +5,8 @@
     <key>CFBundleIdentifier</key><string>ai.aneesiqbal.graft</string>
     <key>CFBundleName</key><string>Graft</string>
     <key>CFBundlePackageType</key><string>KEXT</string>
-    <key>CFBundleVersion</key><string>0.2.0</string>
-    <key>CFBundleShortVersionString</key><string>0.2.0</string>
+    <key>CFBundleVersion</key><string>0.3.0</string>
+    <key>CFBundleShortVersionString</key><string>0.3.0</string>
     <key>OSBundleCompatibleVersion</key><string>0.1.0</string>
     <key>OSBundleRequired</key><string>Root</string>
     <key>IOKitPersonalities</key><dict>

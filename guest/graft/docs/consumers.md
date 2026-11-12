@@ -38,7 +38,7 @@ An owned client is an ordinary kext with four additions:
 2. The SDK's start glue, `sdk/Start.cpp`, which declares the kmod and calls
    the client's `graft_client_initialize()` from its start routine.
 3. A dependency on Graft: `ai.aneesiqbal.graft` at version `0.1.0` in
-   `OSBundleLibraries`. Release 0.2.0 declares `OSBundleCompatibleVersion`
+   `OSBundleLibraries`. Release 0.3.0 declares `OSBundleCompatibleVersion`
    `0.1.0`, so a client that lists `0.1.0` loads with it.
 4. An `IOService` subclass and one personality that matches `IOResources`,
    because an injected kext is not started for `OSBundleRequired` Root alone.

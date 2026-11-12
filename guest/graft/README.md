@@ -42,13 +42,23 @@ own.
 
 ## Status
 
-This is release 0.2.0. It passes the host tests and the build checks
-([CONTRIBUTING.md](CONTRIBUTING.md#checks)), and the boots below ran its
-kexts, with SIP on (`csr-active-config` 0) and no boot-arg for Graft or the
-kexts it serves.
+This is release 0.3.0. It passes the host tests and the build checks
+([CONTRIBUTING.md](CONTRIBUTING.md#checks)). It adds, on arm64e, routing a named
+MAC policy's operation beside AMFI's: an owned client names the policy in the
+route symbol, such as `Sandbox:file_check_mmap`. AMFI's own routing, the binding
+and the x86-64 path are unchanged from 0.2.0.
 
-Several boots used the guest kexts of reims-vgpu, a paravirtual GPU for macOS
-virtual machines: its display and Metal driver is a bound consumer, and the
+reims-vgpu, a paravirtual GPU for macOS virtual machines, verified the new path
+in its guests: with its arm64 kexts on macOS 27.0.1 and 26.6.2, SIP on and no
+boot-arg, its client routed the Sandbox policy's `file_check_mmap` as well as
+AMFI's operations, neither route refused. A Metal bundle the Sandbox profile
+otherwise refuses to map executable then loaded, so Safari's WebGL ran where it
+had been dead, and a control mapping the profile denies stayed denied.
+
+Release 0.2.0's kexts, which 0.3.0 leaves unchanged but for the route layer and
+the version they carry, passed the boots below, with SIP on (`csr-active-config`
+0) and no boot-arg for Graft or the kexts it serves. Several used the guest
+kexts of reims-vgpu: its display and Metal driver is a bound consumer, and the
 kext that installs its Metal bundle is an owned client.
 
 **x86-64, on macOS 11.7.11 and 26.7.2.**

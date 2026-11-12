@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later OR LGPL-3.0-or-later
-// arm64e route planning: the AMFI mac_policy_ops shadow. On x86-64 Graft
-// inline-hooks each MAC dispatcher's entry; on arm64 the collection's text and
-// AMFI's ops table are read-only when Graft runs, so a client's admission hooks
-// are routed by shadowing AMFI's policy table instead. This header is pure
-// logic: it derives AMFI's ABI constants from XNU's public security/mac_policy.h,
+// arm64e route planning: a MAC policy's mac_policy_ops shadow. On x86-64 Graft
+// inline-hooks each MAC dispatcher's entry; on arm64 the collection's text and a
+// policy's ops table are read-only when Graft runs, so a client's admission hooks
+// are routed by shadowing that policy's table instead -- AMFI's by default, or
+// another the client names (src/arm64e/Route.cpp). This header is pure logic: it
+// derives the mac_policy ABI constants from XNU's public security/mac_policy.h,
 // maps a route request's operation to its mpo field, and builds the shadow ops
-// table from a copy of AMFI's live table, re-signing each routed slot. The
-// kernel layer (src/arm64e/Route.cpp) owns resolving AMFI's symbols, reading the
-// live bytes, allocating the shadow, repointing the policy list and the write
+// table from a copy of the policy's live table, re-signing each routed slot. The
+// kernel layer (src/arm64e/Route.cpp) owns resolving the kernel symbols, reading
+// the live bytes, allocating the shadow, repointing the policy list and the write
 // transaction. Re-signing uses real pointer authentication, so the host test
 // (tests/arm64e_route_test.cpp) runs native arm64e, as the fixup test does.
 #pragma once
@@ -15,7 +16,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// The route layer signs pointers and derives the AMFI ABI from the public
+// The route layer signs pointers and derives the mac_policy ABI from the public
 // function-pointer type discriminators, both of which need an arm64e
 // (pointer-authentication) target. Keep this header to the arm64e build.
 #if !__has_feature(ptrauth_calls)
@@ -26,10 +27,11 @@ namespace graft {
 namespace arm64 {
 
 // The three mac_policy_ops entries an owned client may route on arm64, named by
-// operation (not by AMFI's local, unstable op symbols). AMFI signs each ops slot
-// with key IA, the slot type's function-pointer discriminator and no address
-// diversity; the signatures do not blend the storage address, which is what lets
-// a relocated shadow table keep valid signatures. The discriminator for a slot
+// operation (not by a policy's local, unstable op symbols). The arm64e ABI signs
+// each ops slot with key IA, the slot type's function-pointer discriminator and
+// no address diversity -- AMFI's table and any other policy's alike; the
+// signatures do not blend the storage address, which is what lets a relocated
+// shadow table keep valid signatures. The discriminator for a slot
 // is the type discriminator of its mpo_*_t prototype, so Graft derives it from
 // that prototype rather than carrying a literal, and buildShadowOps checks it
 // against the live slot's signature before routing. The prototypes are written
@@ -68,21 +70,23 @@ inline constexpr size_t OperationCount = sizeof(Operations) / sizeof(Operations[
 // struct mac_policy_ops and struct mac_policy_conf are not in the Kernel
 // framework SDK, so their sizes follow from the layout of XNU's public
 // security/mac_policy.h: mac_policy_ops is a table of 335 function pointers, and
-// mac_policy_conf carries mpc_ops at offset 0x20. The shadow copies the whole
-// structs, so only mpc_ops, the pointer repointed at the shadow ops, needs a
-// named offset.
+// mac_policy_conf carries mpc_name at offset 0 and mpc_ops at offset 0x20. The
+// shadow copies the whole structs, so of the conf only mpc_ops, the pointer
+// repointed at the shadow ops, is rewritten; mpc_name is named too, since the
+// kernel layer reads it to confirm a policy a client names, other than AMFI.
 inline constexpr size_t OpsSize = 335 * 8;    // sizeof(struct mac_policy_ops)
 inline constexpr size_t ConfSize = 0x50;      // sizeof(struct mac_policy_conf)
+inline constexpr size_t ConfNameOffset = 0x0; // offsetof(struct mac_policy_conf, mpc_name)
 inline constexpr size_t ConfOpsOffset = 0x20; // offsetof(struct mac_policy_conf, mpc_ops)
 
 // The MAC framework dispatches through a global list of registered policies,
 // struct mac_policy_list in security/mac_internal.h. mac_policy_list has no symbol
 // (Graft resolves it at runtime, below); its u_int max is at +0x04, its u_int
 // maxindex at +0x08 and its entries pointer at +0x18, and each element is a bare
-// pointer to a mac_policy_conf (stride 8, mpc at offset 0). Repointing AMFI's
+// pointer to a mac_policy_conf (stride 8, mpc at offset 0). Repointing a policy's
 // element at a shadow conf is the one writable store. Both pointers Graft writes
 // -- the element's mpc and the shadow conf's mpc_ops -- are stored raw (no
-// pointer authentication), so only the three op function pointers in the shadow
+// pointer authentication), so only the routed op function pointers in the shadow
 // ops are re-signed.
 inline constexpr size_t PolicyListMaxOffset = 0x04;      // u_int max, the allocated entry count
 inline constexpr size_t PolicyListMaxIndexOffset = 0x08; // u_int maxindex, highest populated index
@@ -114,7 +118,7 @@ inline const char *describe(Error error) {
     case Error::Bounds: return "staged copy too small for the structure";
     case Error::UnknownOperation: return "operation not routable on arm64";
     case Error::DuplicateOperation: return "operation routed twice in one request";
-    case Error::SlotOutsideText: return "live ops slot does not point into AMFI text";
+    case Error::SlotOutsideText: return "live ops slot does not point into the policy's text";
     case Error::SlotSignature:
         return "live ops slot is not signed with the operation's discriminator";
     }
@@ -138,7 +142,7 @@ inline const Operation *operationFor(const char *name) {
 }
 
 // One routed slot: the byte offset in the ops table it occupies, a callable
-// original (AMFI's original op pointer, stripped and re-signed as a plain C
+// original (the policy's original op pointer, stripped and re-signed as a plain C
 // function pointer, which the kernel layer hands back as the route's
 // `original`), and the re-signed replacement the shadow carries.
 struct Slot {
@@ -147,12 +151,13 @@ struct Slot {
     uint64_t replacement;
 };
 
-// Build the shadow ops table in place. `ops` is a writable copy of AMFI's live
-// mac_policy_ops, `size` its length (OpsSize). For each request i, the routed
+// Build the shadow ops table in place. `ops` is a writable copy of the policy's
+// live mac_policy_ops, `size` its length (OpsSize). For each request i, the routed
 // slot's live value is read from the copy, its signature stripped (never faults
-// under FPAC) and range-checked into AMFI's __TEXT [textLo, textHi) -- a guard
-// that the carried offset constant truly names an AMFI op pointer, refusing by
-// index rather than mis-swapping on any mismatch. The stripped pointer, signed
+// under FPAC) and range-checked into the policy's __TEXT [textLo, textHi) -- a
+// guard that the carried offset constant truly names one of the policy's op
+// pointers, refusing by index rather than mis-swapping on any mismatch. The
+// stripped pointer, signed
 // again with the operation's (key, discriminator), must then reproduce the live
 // value: the slot carries no address diversity, so the signature depends only
 // on the pointer and the discriminator. A release whose mpo_*_t prototype, and
@@ -160,7 +165,7 @@ struct Slot {
 // than routing a slot that the MAC framework's first call through it would fail
 // to authenticate. The replacement target is stripped of whatever signature the
 // caller's pointer carries and re-signed for the slot's own (key,
-// discriminator), exactly as AMFI signed the original, so the MAC framework
+// discriminator), exactly as the policy signed the original, so the MAC framework
 // authenticates the shadow slot identically. The captured
 // original is that stripped live pointer re-signed as a plain C function pointer
 // (key IA, discriminator 0), so the client calls it directly. `names[i]` is the
@@ -200,12 +205,12 @@ inline Failure buildShadowOps(uint8_t *ops, size_t size, const char *const *name
     return {};
 }
 
-// Build the shadow mac_policy_conf in place. `conf` is a writable copy of AMFI's
-// live conf (ConfSize bytes); `shadowOps` is the raw runtime address of the
-// shadow ops table. AMFI stores conf.mpc_ops unsigned, so the shadow's mpc_ops
-// is written raw. Every other field is AMFI's verbatim, so
-// the MAC framework reads the same policy name, flags, load-time handle and
-// label slot through the shadow.
+// Build the shadow mac_policy_conf in place. `conf` is a writable copy of the
+// policy's live conf (ConfSize bytes); `shadowOps` is the raw runtime address of
+// the shadow ops table. The conf stores mpc_ops unsigned, so the shadow's mpc_ops
+// is written raw. Every other field is the policy's verbatim, so the MAC
+// framework reads the same policy name, flags, load-time handle and label slot
+// through the shadow.
 inline Error buildShadowConf(uint8_t *conf, size_t size, uint64_t shadowOps) {
     if (!conf || !shadowOps)
         return Error::Null;
@@ -215,12 +220,13 @@ inline Error buildShadowConf(uint8_t *conf, size_t size, uint64_t shadowOps) {
     return Error::None;
 }
 
-// The number of policy-list entries to scan for AMFI's conf, from the live
+// The number of policy-list entries to scan for a policy's conf, from the live
 // maxindex (highest populated index; entries[0..maxindex] inclusive) and max
 // (the allocated entry count). Floored at one chunk, never past the allocated
 // array (max), and ceilinged against an implausible count. Pure, so it is
 // host-tested; Route.cpp reads max, maxindex and the entries pointer from the
-// live struct and does the bounded scan for the element whose mpc is AMFI's conf.
+// live struct and does the bounded scan for the element whose mpc is the policy's
+// conf.
 inline size_t policyScanCount(uint32_t maxindex, uint32_t max) {
     uint64_t wanted = static_cast<uint64_t>(maxindex) + 1;
     if (wanted < PolicyScanFloor)
@@ -248,7 +254,7 @@ inline size_t policyScanCount(uint32_t maxindex, uint32_t max) {
 // length, `funcAddr` its runtime address. Returns 0 if no base meets the signature
 // (a changed shape on some future build), in which case Route.cpp refuses by name
 // rather than guess; the base is adopted only after scanning its entries finds
-// AMFI's own conf (Route.cpp), so a wrong match is refused downstream.
+// the policy's own conf (Route.cpp), so a wrong match is refused downstream.
 inline uint64_t resolvePolicyListBase(const uint8_t *code, size_t size, uint64_t funcAddr) {
     if (!code || size < sizeof(uint32_t))
         return 0;

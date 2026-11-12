@@ -5,6 +5,35 @@ Each release of Graft, newest first. A version is the kext's
 that lists `ai.aneesiqbal.graft` 0.1.0 in its `OSBundleLibraries` loads with
 each later release that keeps it.
 
+## 0.3.0
+
+**Upgrading**
+
+- An owned client needs no change to keep routing AMFI's operations, and no
+  rebuild. `Graft.h` is unchanged, and Graft still declares
+  `OSBundleCompatibleVersion` 0.1.0. To route a second policy, add a route whose
+  symbol names it, such as `Sandbox:file_check_mmap`.
+- The arm64 boot firmware hands over nothing new.
+
+**The kext**
+
+- On arm64e, a client can route another MAC policy's operation, not only AMFI's.
+  A route's symbol may carry a `<policy>:` prefix, as in
+  `Sandbox:file_check_mmap`; a bare operation name stays AMFI's. Graft shadows
+  AMFI, the default, and the Sandbox policy, and keeps a separate shadow per
+  policy, so a client routing the same operation on two policies holds each
+  policy's own original. It finds AMFI by its admission ops as before, and any
+  other policy by its registered name (`mpc_name`) within its kext's image.
+  Every route in one call names the same policy; a second policy is a second
+  call. x86-64 is unchanged.
+
+**The SDK**
+
+- `graft_route_request` keeps its three fields, so a client that already routes
+  AMFI's operations rebuilds unchanged. On arm64e the policy is named in the
+  route's symbol; on x86-64, where the symbol is a kernel function, the
+  separator never appears, so nothing changes.
+
 ## 0.2.0
 
 Graft serves any kext, and names none of the kexts it serves. Release 0.1.0

@@ -4,7 +4,10 @@
 // call and tail-branch the authenticated original, so the probe needs no MAC
 // argument types and proves two things on a real boot: that Graft resolves AMFI,
 // builds the shadow policy and repoints the list entry ("routed"), and that the
-// shadow sits in the live MAC dispatch path (every routed op is entered). arm64e
+// shadow sits in the live MAC dispatch path (every routed op is entered). It then
+// routes the Sandbox policy's own file_check_mmap the same way, naming the policy,
+// to exercise a second policy's shadow in one boot and hold its original apart
+// from AMFI's; that leg reports on its own GraftRouteProbeSandbox* keys. arm64e
 // only; the x86-64 owned-client probe is tests/kexts/core-probe/CoreProbe.cpp.
 #include <IOKit/IOLib.h>
 #include <IOKit/IORegistryEntry.h>
@@ -19,8 +22,8 @@ class GraftRouteProbe final : public IOService {
 OSDefineMetaClassAndStructors(GraftRouteProbe, IOService);
 
 extern "C" {
-void *graft_route_probe_originals[3]{};
-alignas(8) uint64_t graft_route_probe_calls[3]{};
+void *graft_route_probe_originals[4]{};
+alignas(8) uint64_t graft_route_probe_calls[4]{};
 }
 
 // Each wrapper increments its call counter, then tail-branches to the original
@@ -45,9 +48,10 @@ alignas(8) uint64_t graft_route_probe_calls[3]{};
             "    add  x16, x16, _graft_route_probe_originals@PAGEOFF\n"                            \
             "    ldr  x16, [x16, #(8*" #index ")]\n"                                               \
             "    braaz x16\n");
-ROUTE_WRAPPER(0) // file_check_mmap
-ROUTE_WRAPPER(1) // file_check_library_validation
-ROUTE_WRAPPER(2) // vnode_check_signature
+ROUTE_WRAPPER(0) // file_check_mmap (AMFI)
+ROUTE_WRAPPER(1) // file_check_library_validation (AMFI)
+ROUTE_WRAPPER(2) // vnode_check_signature (AMFI)
+ROUTE_WRAPPER(3) // file_check_mmap (Sandbox)
 #undef ROUTE_WRAPPER
 
 namespace {
@@ -62,6 +66,18 @@ void state(const char *value) {
     auto root = IORegistryEntry::getRegistryRoot();
     if (root)
         root->setProperty("GraftRouteProbeState", value);
+}
+
+// The Sandbox leg's own state, kept apart from the AMFI legs so its outcome does
+// not gate theirs. Set true when the Sandbox route installs, so lateCheck knows
+// to look for its call.
+bool sandboxRouted;
+
+void sandboxState(const char *value) {
+    IOLog("graft route probe (Sandbox): %s\n", value);
+    auto root = IORegistryEntry::getRegistryRoot();
+    if (root)
+        root->setProperty("GraftRouteProbeSandboxState", value);
 }
 
 void lateCheck(void *, wait_result_t) {
@@ -81,6 +97,14 @@ void lateCheck(void *, wait_result_t) {
             root->setProperty(key, count, 64);
     }
     state(observed ? "passed" : "refused: a routed op was never entered");
+    // The Sandbox leg, if it installed: file_check_mmap fires as soon as code is
+    // mapped, so its counter is non-zero on a live boot. Reported on its own key.
+    if (sandboxRouted) {
+        uint64_t count = __atomic_load_n(graft_route_probe_calls + 3, __ATOMIC_RELAXED);
+        if (root)
+            root->setProperty("GraftRouteProbeCalls.Sandbox.file_check_mmap", count, 64);
+        sandboxState(count ? "passed" : "refused: the Sandbox route was never entered");
+    }
     thread_terminate(current_thread());
 }
 } // namespace
@@ -99,6 +123,14 @@ void graft_client_initialize() {
         state("refused: routes");
         return;
     }
+    // Also route the Sandbox policy's own file_check_mmap, naming the policy in a
+    // second call. Its original is held apart from AMFI's, in its own slot. The
+    // leg reports on its own keys and does not gate the AMFI result.
+    graft_route_request sandbox{"Sandbox:file_check_mmap",
+                                reinterpret_cast<void *>(graft_route_probe_3),
+                                graft_route_probe_originals + 3};
+    sandboxRouted = graft_route_kernel(Client, &sandbox, 1);
+    sandboxState(sandboxRouted ? "waiting: route-entry check" : "refused: route");
     state("waiting: route-entry check");
     thread_t thread = THREAD_NULL;
     if (kernel_thread_start(lateCheck, nullptr, &thread) != KERN_SUCCESS) {

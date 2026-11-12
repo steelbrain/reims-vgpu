@@ -73,7 +73,7 @@ to catch a copy that drifted from its record.
 
 ## 3. Depend on the right version
 
-Graft's bundle identifier is `ai.aneesiqbal.graft`, and release 0.2.0 declares
+Graft's bundle identifier is `ai.aneesiqbal.graft`, and release 0.3.0 declares
 `OSBundleCompatibleVersion` `0.1.0`. An owned client lists
 `ai.aneesiqbal.graft` at `0.1.0` in its `OSBundleLibraries`, and then loads
 with this release and with any later one that keeps that compatible version. A

@@ -163,23 +163,31 @@ was preempted inside those bytes. Routes are installed early in boot, before
 such threads exist, and the functions a client routes are checked by booting
 the core probe ([tests/kexts/](../tests/kexts/README.md)).
 
-**On arm64e**, kernel text and AMFI's MAC policy table, `mac_policy_ops`, are
-read-only by the time Graft starts. Graft routes by shadowing AMFI's policy
+**On arm64e**, kernel text and a MAC policy's table, `mac_policy_ops`, are
+read-only by the time Graft starts. Graft routes by shadowing the policy
 instead of patching code. Each route names a MAC policy operation, such as
 `vnode_check_signature`, and the replacement and original have that
 operation's `mpo_*_t` prototype from XNU's `security/mac_policy.h`. Three
 operations are routable: `file_check_mmap`, `file_check_library_validation`
-and `vnode_check_signature`. To install the routes, Graft:
+and `vnode_check_signature`. The operation is AMFI's by default; to route
+another policy's operation, the symbol carries a `<policy>:` prefix, as in
+`Sandbox:file_check_mmap`. Every route in one call names the same policy,
+since the install swaps that policy's one list element. To install the
+routes, Graft:
 
 1. finds `mac_policy_list` through `mac_policy_register`, and the one element
-   of it that holds AMFI's policy. It does this the first time any client
-   routes; after that the element holds a shadow, so Graft reuses the element it
-   remembered and the conf and ops it currently points at;
+   of it that holds the named policy. It finds AMFI by its admission ops -- the
+   one policy that implements both library validation and code-signature
+   checking into its own text -- and any other policy, such as Sandbox, by its
+   registered name (`mpc_name`) within its kext's image. It does this the first
+   time any client routes that policy; after that the element holds a shadow, so
+   Graft reuses the element it remembered and the conf and ops it currently
+   points at;
 2. copies the current `mac_policy_ops` and `mac_policy_conf` into fresh memory,
    signs each routed operation's slot in the copy for the replacement, and
-   points the copied conf at the copied ops. The current policy is AMFI's own
-   before any client routes, and the newest shadow afterwards, so each client's
-   copy carries the operations earlier clients already routed;
+   points the copied conf at the copied ops. The current policy is its own
+   before any client routes it, and the newest shadow afterwards, so each
+   client's copy carries the operations earlier clients already routed;
 3. stores each callable original, then swaps the list element from the conf it
    currently holds to the copy with one atomic compare-and-exchange, which
    succeeds only if the element still holds that conf.
@@ -190,11 +198,13 @@ route one after another, each building on the last; a superseded copy stays in
 memory for the boot, since a MAC check may still be reading it. Requests are
 serialized. Graft refuses the routes when:
 
-- an operation is not one of the three, is named twice, or is already routed by
-  an earlier client, which the refusal names. One operation belongs to one client
-  for the boot, so every callable original Graft hands back is AMFI's own
-  function;
-- the slot in the current table does not point into AMFI's code, or is not
+- the named policy is not one Graft shadows, or one call's routes do not all
+  name the same policy;
+- an operation is not one of the three, is named twice, or is already routed on
+  that policy by an earlier client, which the refusal names. One operation of a
+  policy belongs to one client for the boot, so every callable original Graft
+  hands back is the policy's own function;
+- the slot in the current table does not point into the policy's code, or is not
   signed with the discriminator Graft derives from the operation's prototype, as
   on a release that changed that prototype;
 - a replacement lies outside the client's own executable segments, or the
@@ -206,7 +216,7 @@ serialized. Graft refuses the routes when:
 
 Graft reads `mac_policy_list` only once it finds the global in one of the
 kernel's writable data segments, and reads each conf and ops table it follows
-only inside AMFI's image. The list's array of entries is heap memory the kernel
+only inside the policy's image. The list's array of entries is heap memory the kernel
 allocated, which no image bounds, so Graft checks only that the pointer to it
 is a canonical, 8-byte aligned kernel address. A wrong pointer there would
 fault rather than refuse.

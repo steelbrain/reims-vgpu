@@ -10,8 +10,9 @@ and [docs/manifest.md](../docs/manifest.md) specifies what a consumer embeds.
 
 The code is C++17 for the kernel: no exceptions, no RTTI, no standard library.
 Types are PascalCase, functions and variables camelCase. The constants of the
-generic mechanism are in one place, [Policy.h](Policy.h): AMFI's identifier and
-the route limits. No kext Graft serves is named anywhere in the source: a
+generic mechanism are in one place, [Policy.h](Policy.h): the identifiers of the
+MAC policies the arm64e routes shadow, AMFI and Sandbox, and the route limits.
+No kext Graft serves is named anywhere in the source: a
 client is served because the identifier it passes names a placed kext, and a
 consumer is bound because it carries a manifest.
 
@@ -57,9 +58,10 @@ After that:
   `Graft` IOService, and the `extern "C"` functions clients call. Every call's
   identifier must name a placed kext (`placedBase`); the three that act on the
   kernel also require Graft to be active.
-- [Policy.h](Policy.h): AMFI's bundle identifier, whose policy the arm64e routes
-  shadow, and the route limits: at most sixteen routes in one call, and a shared
-  pool of thirty-two route slots on x86-64.
+- [Policy.h](Policy.h): the bundle identifiers of the MAC policies the arm64e
+  routes shadow -- AMFI, the default, and Sandbox -- and the route limits: at
+  most sixteen routes in one call, and a shared pool of thirty-two route slots
+  on x86-64.
 
 ### Diagnostics
 
@@ -156,18 +158,21 @@ After that:
   `__DATA`, which its collection maps writable. Graft runs after the kernel's
   lockdown and the consumer is dormant, so there is no window to open.
 - [arm64e/Arm64Route.h](arm64e/Arm64Route.h), [arm64e/Route.cpp](arm64e/Route.cpp):
-  routing by shadowing AMFI's MAC policy. Kernel text and AMFI's
-  `mac_policy_ops` are read-only when Graft runs, so each client's request
-  copies the current `mac_policy_ops` and `mac_policy_conf` (AMFI's own the
-  first time, the newest shadow after) into fresh memory, re-signs the routed
-  operations in the copy for the client's replacements, and repoints the
-  writable `mac_policy_list` element at the copy. The repoint is one atomic
+  routing by shadowing a MAC policy. Kernel text and a policy's `mac_policy_ops`
+  are read-only when Graft runs, so each client's request copies the current
+  `mac_policy_ops` and `mac_policy_conf` (the policy's own the first time, the
+  newest shadow after) into fresh memory, re-signs the routed operations in the
+  copy for the client's replacements, and repoints the writable
+  `mac_policy_list` element at the copy. The repoint is one atomic
   compare-and-exchange, which refuses if the element no longer holds the conf it
-  currently expects. Several clients route one after another, and an operation
-  one client holds is refused to the next. The client's image, which the
-  replacements must lie in, is found as the consumer's is (`placedBase`) and is
-  required. Arm64Route.h is the plan, which the host tests run; Route.cpp does
-  the live reads and the swap.
+  currently expects. The policy is AMFI by default, or another a route names
+  with a `<policy>:` prefix (such as `Sandbox:file_check_mmap`), found by its
+  `mpc_name` within its image; Graft keeps a separate shadow per policy. Several
+  clients route one after another, and an operation on a policy one client holds
+  is refused to the next. The client's image, which the replacements must lie
+  in, is found as the consumer's is (`placedBase`) and is required. Arm64Route.h
+  is the plan, which the host tests run; Route.cpp does the live reads and the
+  swap.
 - [arm64e/BindingPlacement.cpp](arm64e/BindingPlacement.cpp): no trigger to
   install. A provider is its fileset entry in the Boot collection, which Graft
   starts with `OSKextLoadKextWithIdentifier` before binding against it, and the

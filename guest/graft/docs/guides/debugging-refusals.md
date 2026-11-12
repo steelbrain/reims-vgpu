@@ -207,18 +207,20 @@ arm64e route refusals, in the order Graft checks:
 | `transaction: N requests exceed the 3 routable operations` | the call asks for more routes than there are operations |
 | `invalid request N` | request `N` has no operation, replacement or original, or its original is not pointer-aligned |
 | `request N: duplicate original storage` | two requests store their original in the same place |
-| `<operation>: already routed by <client>` | the named client already routed that operation this boot; one operation belongs to one client |
-| `AMFI image or its executable range not found` | Graft could not find AMFI's code in the Boot collection |
+| `policy not shadowable: <symbol>` | the symbol's `<policy>:` prefix names a policy Graft does not shadow; it shadows AMFI (the default) and `Sandbox` |
+| `one route call targets one policy, not both <A> and <B>` | the call's routes name two policies; route each policy in its own call |
+| `<operation>: already routed by <client>` | the named client already routed that operation on this policy this boot; one operation of a policy belongs to one client |
+| `<policy> image or its executable range not found` | Graft could not find the policy's code in the Boot collection |
 | `the client <id> names no placed image` | the firmware published no device-tree node for `<id>`, the identifier the call passes, so Graft cannot tie the replacement to that kext's code |
 | `the client's placed image cannot be read (<why>)` | the firmware names an image for the client's bundle identifier, but its load commands are malformed or its header lies outside its segments |
 | `request N: replacement is not in the client's executable text` | the replacement does not point into an executable segment of the kext the call's identifier names. Graft finds the image through the firmware's device-tree node for that identifier |
 | `mac_policy_register is not resolvable`, `mac_policy_list is not resolvable`, `mac_policy_list is not in the kernel's data segments`, `mac_policy_list entries pointer is invalid` | Graft could not find the kernel's list of MAC policies. The list must lie in a segment the kernel maps writable, and its entries pointer must be a canonical, 8-byte aligned kernel address |
-| `AMFI policy not found in the list`, `AMFI policy ambiguous in the list (N matches)` | Graft could not find AMFI's one registered policy |
+| `<policy> policy not found in the list`, `<policy> policy ambiguous in the list (N matches)` | Graft could not find the policy's one registered element: AMFI by its admission ops, any other by its `mpc_name` within its image |
 | `<name>: route input` | Graft could not build its copy of the current ops table |
 | `<name>: operation not routable on arm64` | the request names an operation other than `file_check_mmap`, `file_check_library_validation` or `vnode_check_signature` |
-| `<name>: staged copy too small for the structure` | the operation's slot lies past the end of Graft's copy of AMFI's ops table |
+| `<name>: staged copy too small for the structure` | the operation's slot lies past the end of Graft's copy of the policy's ops table |
 | `<name>: operation routed twice in one request` | two requests name the same operation |
-| `<name>: live ops slot does not point into AMFI text` | the slot Graft would replace in AMFI's table does not hold a pointer into AMFI's code, so Graft does not trust the table |
+| `<name>: live ops slot does not point into the policy's text` | the slot Graft would replace in the policy's table does not hold a pointer into the policy's code, so Graft does not trust the table |
 | `<name>: live ops slot is not signed with the operation's discriminator` | the slot's pointer is not signed with the discriminator Graft derives from the operation's `mpo_*_t` prototype in XNU's `security/mac_policy.h`, as when a release changed that prototype. Graft routes nothing, rather than a slot the kernel would fail to authenticate |
 | `shadow conf: <why>` | Graft could not build its copy of the current conf |
 | `shadow allocation unavailable or misaligned` | Graft could not obtain 8-aligned memory for the new shadow ops and conf |

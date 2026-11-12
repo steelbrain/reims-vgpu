@@ -129,13 +129,13 @@ kernel functions this way.
 
 ### On arm64e
 
-Kernel text and AMFI's MAC policy table are read-only when Graft starts, so
-Graft routes by shadowing AMFI's policy. A route names a MAC policy operation,
+Kernel text and a MAC policy's table are read-only when Graft starts, so
+Graft routes by shadowing the policy. A route names a MAC policy operation,
 one of `file_check_mmap`, `file_check_library_validation` and
 `vnode_check_signature`. The replacement and original have the operation's
 `mpo_*_t` prototype from XNU's `security/mac_policy.h`, and the original is
-AMFI's handler for the operation. The macOS SDK does not ship that header, so
-declare the prototype yourself:
+the policy's handler for the operation. The operation is AMFI's by default.
+The macOS SDK does not ship that header, so declare the prototype yourself:
 
 ```cpp
 #include <sys/kauth.h>
@@ -163,19 +163,48 @@ if (!graft_route_kernel(Client, routes, 1))
     return; // GraftClient.ai.aneesiqbal.graft.HelloClient says why
 ```
 
+To route another policy's operation, prefix the operation with the policy's
+registered name and a colon. Graft shadows AMFI, the default, and the Sandbox
+policy, `Sandbox`. The route is otherwise the same -- the same `mpo_*_t`
+prototype, its own `original`, and that policy's own handler for every other
+call:
+
+```cpp
+static void *sandboxOriginalMmap;
+
+static int sandboxReplacementMmap(kauth_cred_t cred, struct fileglob *fg, struct label *label,
+                                  int prot, int flags, uint64_t file_pos, int *maxprot) {
+    // Decide your own case, then pass every other call on to the Sandbox policy.
+    auto original = reinterpret_cast<FileCheckMmap *>(sandboxOriginalMmap);
+    return original(cred, fg, label, prot, flags, file_pos, maxprot);
+}
+
+graft_route_request sandboxRoutes[] = {
+    {"Sandbox:file_check_mmap", reinterpret_cast<void *>(sandboxReplacementMmap),
+     &sandboxOriginalMmap},
+};
+if (!graft_route_kernel(Client, sandboxRoutes, 1))
+    return;
+```
+
+A client that routes the same operation on two policies, as here, holds a
+separate original for each. Every route in one `graft_route_kernel` call names
+one policy; route a second policy in a second call.
+
 [tests/kexts/route-probe](../../tests/kexts/README.md#route-probe) routes all
-three operations.
+three AMFI operations, and the Sandbox policy's `file_check_mmap`.
 
 ## Limits
 
-- One call installs at most sixteen routes, all of them or none. On x86-64
-  Graft has room for 32 routes per boot, shared first come first served: two of
-  its own, and up to 30 more across every client. On arm64e each client routes
-  at most one of each of the three operations, and several clients route one
-  after another; an operation one client holds is refused to the next.
+- One call installs at most sixteen routes, all of them or none, and names one
+  policy. On x86-64 Graft has room for 32 routes per boot, shared first come
+  first served: two of its own, and up to 30 more across every client. On arm64e
+  each client routes at most one of each of the three operations per policy, and
+  several clients route one after another; an operation on a policy that one
+  client holds is refused to the next.
 - On x86-64, routes must be installed before BSD starts, so install them from
   `graft_client_initialize()`. The arm64e routes go live with one atomic swap
-  of AMFI's policy, and are safe to install after BSD has started.
+  of the policy's list element, and are safe to install after BSD has started.
 - On x86-64, Graft refuses a function that starts with `ENDBR64`, one that
   ends within the 14 bytes the jump needs, one whose first instructions it
   cannot decode or relocate, one with a displaced call that would return into

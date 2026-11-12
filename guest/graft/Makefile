@@ -28,7 +28,7 @@
 # Build intermediates stay in build/, and releases in dist/.
 
 BUILD   ?= build
-VERSION  = 0.2.0
+VERSION  = 0.3.0
 HOSTCXX  = xcrun --sdk macosx clang++ -std=c++17 -Wall -Wextra -Werror
 HOSTCC   = xcrun --sdk macosx clang -Wall -Wextra -Werror
 SDK      = $(shell xcrun --sdk macosx --show-sdk-path)

@@ -372,10 +372,11 @@ void scanCount() {
     puts("arm64e route: pass (scan count floor, exact, ceiling, max bound)");
 }
 
-// The AMFI ABI constants are derived from XNU's public security/mac_policy.h:
+// The mac_policy ABI constants are derived from XNU's public security/mac_policy.h:
 // the discriminator from each mpo_*_t prototype's function-pointer type
-// discriminator, the offsets from field indices, the sizes from the layout.
-// Pin them, so a toolchain change that moved any value fails here.
+// discriminator, the offsets from field indices, the sizes from the layout. They
+// are the same for any policy's table, AMFI's or another's. Pin them, so a
+// toolchain change that moved any value fails here.
 void constants() {
     CHECK(arm64::operationFor("file_check_mmap")->discriminator == 0x438d);
     CHECK(arm64::operationFor("file_check_library_validation")->discriminator == 0x9e37);
@@ -385,8 +386,9 @@ void constants() {
     CHECK(arm64::operationFor("vnode_check_signature")->offset == 0x980);
     CHECK(arm64::OpsSize == 0xa78);
     CHECK(arm64::ConfSize == 0x50);
+    CHECK(arm64::ConfNameOffset == 0x0);
     CHECK(arm64::ConfOpsOffset == 0x20);
-    puts("arm64e route: pass (AMFI constants from the public header)");
+    puts("arm64e route: pass (mac_policy constants from the public header)");
 }
 
 } // namespace
