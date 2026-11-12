@@ -1477,6 +1477,41 @@ before the draw, the read saw the texture as it was before the draw (Safari's We
 about 2.5% of them on a 780M). The M3's `isWriteComplete` YES for a read-only use is not kept:
 arm64 guests see NO, which only waits for readers too.
 
+## Q27: the rows IOSurface works out where none are named
+
+Probe: `oracle_rows DEVICE`, 11-12 (m3-max-21363, 21364 and 21365), the M3 Max on macOS 27.0.1
+among them. Surfaces made by `IOSurfaceCreate` with a width, a height, bytes an element and an
+OSType alone (`kIOSurfacePlaneInfo` with each plane's width, height and bytes an element for
+`420v`), and CVPixelBuffers made with an empty `kCVPixelBufferIOSurfacePropertiesKey`. Rows are
+`IOSurfaceGetBytesPerRow` (of each plane for `420v`), offsets each plane's base from the
+surface's.
+
+| asked | AMD | Intel 630 | M3 |
+|---|---|---|---|
+| `IOSurfaceGetPropertyAlignment` of `kIOSurfaceBytesPerRow` and `kIOSurfacePlaneBytesPerRow` | 64 | 64 | 128 |
+| the same of `kIOSurfaceOffset` and `kIOSurfacePlaneOffset`; of `kIOSurfaceAllocSize` and `kIOSurfacePlaneSize` | 64; 1 | 64; 1 | 16384; 1 |
+| `IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, N)` for N of 1, 8, 64, 144, 192, 384, 1336, 3840, 4004 | 64, 64, 64, 192, 192, 384, 1344, 3840, 4032 | the same | 128, 128, 128, 256, 256, 384, 1408, 3840, 4096 |
+| `'RGhA'` (8 bytes) 1 x 1, 18 x 28, 48 x 48, 85 x 162, 167 x 161, 170 x 134: rows | 64, 192, 384, 704, 1344, 1408 | the same | 128, 256, 384, 768, 1408, 1408 |
+| `'BGRA'` 96, 463, 1001 and 3662 wide: rows | 384, 1856, 4032, 14656 | the same | 384, 1920, 4096, 14720 |
+| `'L008'` 1920 x 1080 and 1001 x 1: rows; size | 1920, 1024; 2073600, 1024 | the same | 1920, 1024; 2080768, 16384 |
+| `420v` 1920 x 1080: each plane's rows; plane 1's offset | 1920, 1920; 2073600 | the same | 1920, 1920; 2080768 |
+| `420v` 18 x 28 | 64, 64; 1792 | the same | 128, 128; 16384 |
+| CVPixelBuffer `420v` 1920 x 1080: rows; the planes' offsets | 1920; 32, 2073632 | the same | 1920; 512, 2074112 |
+| CVPixelBuffer `420v` 18 x 28 | 32; 32, 928 | the same | 64; 512, 2560 |
+| CVPixelBuffer `32BGRA` 96 x 96, `64RGBAHalf` 18 x 28: rows | 384, 160 | the same | 384, 256 |
+| `minimumLinearTextureAlignmentForPixelFormat:` of RGBA16Float, BGRA8Unorm and R8Unorm; `linearTextureAlignmentBytes`, `deviceLinearTextureAlignmentBytes` | 256 | 256 | 16 |
+| `iosurfaceTextureAlignmentBytes`, `iosurfaceReadOnlyTextureAlignmentBytes` | 16 | 16 | 16 |
+
+The rows of a surface with none named are IOSurface's own, byte for byte the same in the
+AMD's process and the 630's: 64-byte rows and offsets, on a MacBook Pro whose AMD and Intel
+accelerators are both loaded and whose GPUs both align a linear texture's rows to 256. Neither
+accelerator raises IOSurface's alignment to its GPU's linear one *(class 2: 64 on x86, 128 and
+16 KiB offsets on the M3)*. CoreVideo names its rows and plane offsets itself (on x86 rows at a
+multiple of 32 bytes and the first plane 32 bytes in, on the M3 the first plane 512 bytes in),
+and IOSurface keeps them. Our kext raises IOSurface's alignment to the host GPU's linear one,
+256 on RADV (`RgfxSurfaceRows.hpp`); the rows a client names, CoreAnimation's and CoreVideo's
+among them, stay as it names them, as on these Macs.
+
 ## Not measured
 
 - Cross-process lock waits for pending GPU work: rgk-lock's `lock_probe` (x86 matches the M3,
