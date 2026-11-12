@@ -232,7 +232,10 @@ const APPLE_PIECES: [(i64, &[Piece]); 11] = {
 /// makes mesh pipelines: [`makes_mesh_pipelines`]). Mesh draws in an indirect command buffer are
 /// not: no mesh pipeline the bundle makes supports them, as on the x86 Macs. And rasterization
 /// rate maps (`RATE_MAP_CREATE`, `RATE_MAP_RESET` and `RATE_MAP_QUERY`, and a pass's map after its
-/// other records, `RGFX_PASS_FLAG_RATE_MAP`), whose layer counts are the platform's.
+/// other records, `RGFX_PASS_FLAG_RATE_MAP`), whose layer counts are the platform's. Function
+/// pointers (`FUNCTION_HANDLE_CREATE`, `FUNCTION_TABLE_CREATE` and `FUNCTION_TABLE_SET`, and a
+/// compute pass's table bindings) are carried in compute pipelines alone, so their piece stays out
+/// of this list until a render pipeline's are carried too.
 /// A piece joins this list when its wire messages, its decoding and its bundle members land, and
 /// the Apple families it holds back rise with it once every piece up to Apple7's is here
 /// ([`cap_apple_families`]).
@@ -297,7 +300,7 @@ fn cap_apple_families(identity: &mut IdentityCaps, wired: &[Piece]) {
 /// | `supportsFamily:` of Mac1, Mac2, Common1 to Common3 and Metal3 | the platform's | nothing [`APPLE_PIECES`] lists: it lists the Apple families' pieces alone, and the pieces of Apple1 and Apple2 these rows were held to (argument encoders, automatic heaps, sample positions and IO command queues) the lane carries |
 /// | `supportsFamily:` of Metal4 | no | the `MTL4` API: its command queues and buffers, argument tables, compiler and allocators |
 /// | `supportsRaytracing`, `supportsRaytracingFromRender`, `supportsPrimitiveMotionBlur` | no | acceleration structures, their builds, and intersection function tables |
-/// | `supportsFunctionPointers`, `supportsFunctionPointersFromRender` | no | visible function tables and function handles |
+/// | `supportsFunctionPointersFromRender` | no, as the AMD Radeon Pro 5300M answers | a render pipeline's visible function tables and function handles: the lane carries a compute pipeline's alone |
 /// | `supportsDynamicLibraries`, `supportsRenderDynamicLibraries` | no | `newDynamicLibrary:` and linked functions |
 /// | `supportsPlacementSparse` | no | placement sparse buffers and textures |
 /// | `supportsCounterSampling:` | no, at every point | counter sample buffers |
@@ -354,7 +357,6 @@ fn lane(mut identity: IdentityCaps, compile_threads: u64, guest_ram: Option<u64>
         &mut f.supports_raytracing,
         &mut f.supports_raytracing_from_render,
         &mut f.supports_primitive_motion_blur,
-        &mut f.supports_function_pointers,
         &mut f.supports_function_pointers_from_render,
         &mut f.supports_dynamic_libraries,
         &mut f.supports_render_dynamic_libraries,
@@ -898,9 +900,12 @@ mod tests {
         );
         // is_low_power, then is_headless, is_removable, has_unified_memory.
         assert_eq!(info.identity_flags[..4], [1, 0, 0, 0]);
-        // supports_bc_texture_compression is the platform's yes; raytracing (13) the lane's no.
+        // supports_bc_texture_compression is the platform's yes; raytracing (13) the lane's no;
+        // function pointers (14) the platform's yes, but from a render pipeline (15) the lane's no.
         assert_eq!(info.identity_flags[7], 1);
         assert_eq!(info.identity_flags[13], 0);
+        assert_eq!(info.identity_flags[14], 1);
+        assert_eq!(info.identity_flags[15], 0);
         assert_eq!(info.identity_flags[18], 0);
         assert_eq!(info.counter_sampling, [0; 5]);
         // recommended_max_working_set_size first, the rate maps' layers at 14 (the platform's 2),
