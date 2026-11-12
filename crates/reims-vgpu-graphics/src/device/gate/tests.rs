@@ -60,13 +60,11 @@ fn waiter(
         .unwrap()
 }
 
-/// Waits about 2 s for `n` threads to wait at `gate`.
+/// Waits for `n` threads to wait at `gate`, as the device's tests wait
+/// ([`crate::device::tests::eventually`]).
 fn waiting(gate: &Gate, n: usize) {
-    for _ in 0..2000 {
-        if gate.counts().1 == n {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(1));
+    if crate::device::tests::eventually(|| gate.counts().1 == n) {
+        return;
     }
     panic!("{n} threads never waited: {:?}", gate.counts());
 }
