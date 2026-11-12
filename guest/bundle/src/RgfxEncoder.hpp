@@ -115,15 +115,15 @@ struct RgfxRenderTargetSize {
 /// The message is built in a buffer of the builder's own, write-back memory, and posted from
 /// there on its queue's ring where it fits, else copied once, whole, into a block of the queue's
 /// region pool (setMessageBlocks), which the ring names. It is not built in the block: the
-/// block is write-combined where the kext maps it so, and on an AMD host, which applies the
-/// guest's memory type, a write-combined store still pending stalls the thread's next locked
-/// instruction until it drains, about 90 ns: measured with encode_probe on a 26.7.2 guest of a
-/// Ryzen host (RTX 3090), a message built in its block cost setRenderPipelineState 108 ns a call
-/// and a setVertexBuffer between a CFRetain and a CFRelease 103 ns, against 21.6 and 17.1 ns
-/// built in the builder's buffer; and a block is read back as it grows, uncached. Each op takes
-/// its whole length at once (a pointer bump) and is stored with fixed-size copies. Room before
-/// the header takes the SURFACE_USE ops a commit puts first (prependSurfaceUses), so they move
-/// nothing.
+/// block is write-combined where the kext maps it so, loads there are uncached, and on an AMD
+/// host, which applies the guest's memory type, a write-combined store still pending stalls the
+/// thread's next locked instruction until it drains. Measured with encode_probe on a 26.7.2
+/// guest of a Ryzen host (RTX 3090): setRenderPipelineState took 108 ns a call in a 10000-call
+/// buffer built in its block, and 21.6 ns in a 400-call one on the ring; a setVertexBuffer
+/// between a CFRetain and a CFRelease, 103 and 17.1 ns. Each op takes its whole length at once
+/// (a pointer bump) and is stored with fixed-size copies. Room before the header takes the
+/// SURFACE_USE ops a commit puts first (prependSurfaceUses), so they move nothing, and the
+/// commit's copy into a block starts at the message, not at that room.
 ///
 /// A segment (SegmentOf) is a stream of ops alone, with no header: a parallel render pass's
 /// sub-encoder writes one of its own, on its own thread, and the pass joins them into its
