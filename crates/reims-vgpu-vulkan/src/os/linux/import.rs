@@ -489,9 +489,9 @@ fn learn_folds(device: &rt::Device) {
     use crate::core::platform::os::Clock as _;
     let clock = crate::os::OsClock::new();
     let start = clock.now_mono();
-    let kept = fold_key(device).and_then(|(file, key)| {
+    let kept = fold_key(device).map(|(file, key)| {
         let kept = kept_fold(&file, &key);
-        Some((file, key, kept))
+        (file, key, kept)
     });
     let (answer, how) = match kept {
         Some((_, _, Some(answer))) => (answer, "the verdict kept for its driver"),
