@@ -20,7 +20,7 @@ use reims_vgpu_graphics::wire::{
 };
 use reims_vgpu_vulkan::core::platform::caps::{
     COUNTER_SAMPLING_POINTS, DeviceCaps, FAMILIES, FEATURE_SETS, Flags, FormatAnswers,
-    IdentityCaps, Limits, SDK_FAMILIES, SDK_PIXEL_FORMATS, SPARSE_PAGE_SIZES, SPARSE_SAMPLE_COUNTS,
+    IdentityCaps, SDK_FAMILIES, SDK_PIXEL_FORMATS, SPARSE_PAGE_SIZES, SPARSE_SAMPLE_COUNTS,
     feature_set_family,
 };
 use reims_vgpu_vulkan::core::raise::RaiseResult;
@@ -302,7 +302,6 @@ fn cap_apple_families(identity: &mut IdentityCaps, wired: &[Piece]) {
 /// | `maximumConcurrentCompilationTaskCount` | the device's compile threads, which run its pipeline compiles | nothing: the device's own answer |
 /// | `recommendedMaxWorkingSetSize` | on a GPU that shares the CPU's memory, three quarters of the guest's RAM rounded down to 16 KiB, or the platform's where that is less or the host maps no RAM; on a GPU of its own memory the platform's ([`lane_working_set`]) | nothing: a choice |
 /// | `maxBufferLength` | the platform's, but at most three quarters of `recommendedMaxWorkingSetSize`, rounded down to 16 KiB ([`lane_max_buffer_length`]) | nothing: a choice |
-/// | `minimumLinearTextureAlignmentForPixelFormat:` and the SPI `linearTextureAlignmentBytes` and `deviceLinearTextureAlignmentBytes` | 256 bytes, or the platform's where larger ([`LANE_LINEAR_TEXTURE_ALIGNMENT`]) | nothing: a choice |
 /// | `isFramebufferReadSupported` (SPI) | no for an x86-64 guest; the platform's for an arm64 guest ([`lane_flags`]) | nothing: a choice |
 /// | `supportsTileShaders`, `supportsNonSquareTileShaders`, `supportsImageBlocks` (SPI) | no ([`lane_flags`]) | tile pipelines, their non-square dispatch and imageblocks, Apple4's and Apple5's pieces |
 ///
@@ -311,6 +310,40 @@ fn cap_apple_families(identity: &mut IdentityCaps, wired: &[Piece]) {
 ///
 /// `hasUnifiedMemory` is the platform's: the decoder keeps `Managed` resources in one copy or two
 /// by the same answer (docs/graphics-kext/design.md, Decided 4).
+///
+/// `minimumLinearTextureAlignmentForPixelFormat:` and the SPI `linearTextureAlignmentBytes` and
+/// `deviceLinearTextureAlignmentBytes` are the platform's too, as each Mac answers its own GPU's
+/// (256 bytes on an AMD Radeon Pro 5300M and an Intel UHD 630, 16 on an Apple M3 Max, macOS
+/// 26.7.1): the alignment of a texture's offset and rows in a buffer at which the host GPU's
+/// linear images hold it in place, the largest of the formats a buffer backs
+/// (`Device::minimum_linear_texture_alignment_for_pixel_format` of the runtime, which asks the
+/// driver whether its images take a texture's reads, renders and shader writes in place, and
+/// answers at least the device's `nonCoherentAtomSize`: 256 on RADV and 128 on NVIDIA's driver,
+/// read from its records on the hosts, 2026-11-12; 64 on ANV, whose stores write back a row's
+/// last 64-byte line whole, and on lavapipe; 16 on MoltenVK). The guest's frameworks lay the
+/// rows of a texture over a buffer out at a multiple of it, and its device answers nil to one off
+/// it, as the 5300M's does (`RgfxBuffer.mm`): over a cold boot and a 15 s Safari scroll of a
+/// macOS 11.7.11 guest on a Radeon 780M, 1399 textures were shadows for their pitch with the
+/// device answering 16 (A8 rows of 64 and 128 bytes, a BGRA8 surface 463 pixels wide at 1856),
+/// and 11 with it answering 512. A layout at the GPU's own pitch is one the runtime takes in
+/// place: on NVIDIA's driver only that pitch is (the tight row rounded up to 128), so rows at
+/// another multiple of 128, such as the tight row rounded up to 256, are the runtime's shadow.
+///
+/// An IOSurface's rows follow two other answers. A surface made with no pitch named
+/// (`IOSurfaceCreate`, and CoreVideo's buffers and pools) takes rows at IOSurface's own
+/// alignment, `IOSurfaceGetPropertyAlignment(kIOSurfaceBytesPerRow)`: 64 bytes on the 5300M's Mac
+/// (macOS 26.7.1), and here the device info's `linear_row_alignment` where the guest's kext raises
+/// it to that. CoreAnimation names the rows of its backing stores' surfaces itself, rounded to the
+/// device's `iosurfaceTextureAlignmentBytes` and to no less than 64 bytes, and IOSurface keeps
+/// them. The guest's device answers Metal's 16 for `iosurfaceTextureAlignmentBytes` and
+/// `iosurfaceReadOnlyTextureAlignmentBytes` (the 5300M, the 630 and the M3 Max answer the first
+/// 16), not the platform's answers this info carries: CoreAnimation makes no texture of a surface
+/// whose rows are not at a multiple of the answer, and other code's surfaces keep IOSurface's own
+/// rows (the bundle's `kRgfxIOSurfaceTextureAlignmentBytes`; macOS 26.7.2 guests answering an
+/// RTX 3090's and an RTX 2080's 128 drew Safari's pages blank). So a texture over a backing store
+/// at a pitch that is not the GPU's is the runtime's shadow. metal2vulkan measured a macOS 26.7.2
+/// guest's surfaces on RADV at 4032 bytes for 1001 `BGRA` pixels, 7360 for 1831 and 14656 for
+/// 3662, IOSurface's 64-byte rows, before the kext raised them.
 fn lane(mut identity: IdentityCaps, compile_threads: u64, guest_ram: Option<u64>) -> IdentityCaps {
     cap_apple_families(&mut identity, WIRED);
     identity.families[at(MTL_GPU_FAMILY_METAL4)] = Some(false);
@@ -389,49 +422,6 @@ fn lane_max_buffer_length(platform: Option<u64>, working_set: Option<u64>) -> Op
     }
 }
 
-/// `minimumLinearTextureAlignmentForPixelFormat:` of every format a buffer can back, and the SPI
-/// `linearTextureAlignmentBytes` and `deviceLinearTextureAlignmentBytes`: 256 bytes, as an AMD
-/// Radeon Pro 5300M and an Intel UHD 630 answer (macOS 26.7.1; an Apple M3 Max answers 16), or
-/// the platform's where it needs more. A guest lays a texture's rows out in its buffer at a
-/// multiple of this alignment. The Vulkan platform on RADV takes a texture over a buffer's
-/// dma-buf pages in place only with its rows a multiple of 256 bytes apart (metal2vulkan's
-/// `dma_buf.rs`, measured on Mesa 26.0.8 and 26.2.4), and shadows one at any other pitch; how many
-/// of a guest's textures this moves in place is unmeasured. Any 256-byte layout is one the
-/// platform's 16 takes too. An IOSurface's rows follow two other answers. A surface made with no
-/// pitch named (`IOSurfaceCreate`, and CoreVideo's buffers and pools) takes rows at IOSurface's own
-/// alignment, `IOSurfaceGetPropertyAlignment(kIOSurfaceBytesPerRow)`: 64 bytes on the 5300M's Mac
-/// (macOS 26.7.1), and here the device info's `linear_row_alignment` where the guest's kext raises
-/// it to that (256 bytes in macOS 11.7.11 and 14.8.9 guests on a Radeon 780M). CoreAnimation names
-/// the rows of its backing stores' surfaces itself, rounded to the device's
-/// `iosurfaceTextureAlignmentBytes` and to no less than 64 bytes, and IOSurface keeps them. The
-/// guest's device answers Metal's 16 for `iosurfaceTextureAlignmentBytes` and
-/// `iosurfaceReadOnlyTextureAlignmentBytes` (the 5300M, the 630 and the M3 Max answer the first
-/// 16), not the platform's answers this info carries: CoreAnimation makes no texture of a surface whose rows
-/// are not at a multiple of the answer, and other code's surfaces keep IOSurface's own 64-byte
-/// rows (the bundle's `kRgfxIOSurfaceTextureAlignmentBytes`; macOS 26.7.2 guests answering an
-/// RTX 3090's and an RTX 2080's 128 drew Safari's pages blank). So on RADV a texture over a
-/// backing store at a pitch that is not a multiple of 256 is the runtime's shadow (its refused
-/// pitch): over a cold boot and a 15 s Safari scroll of a macOS 11.7.11 guest on a Radeon 780M,
-/// 1399 textures were shadows for their pitch answering 16 (A8 rows of 64 and 128 bytes, a BGRA8
-/// surface 463 pixels wide at 1856), and 11 with the guest's device answering 512 there instead.
-/// metal2vulkan measured a macOS 26.7.2 guest's surfaces on RADV at 4032 bytes for 1001 `BGRA`
-/// pixels, 7360 for 1831 and 14656 for 3662, and in two cold boots of that guest on a Radeon 780M
-/// 583 and 639 textures over the guest's pages were shadows for their pitch, against 532 and 503
-/// in place.
-pub const LANE_LINEAR_TEXTURE_ALIGNMENT: u64 = 256;
-
-/// The device's `NSUInteger` SPI answers where the lane's differ from the platform's: the linear
-/// texture alignments, at least [`LANE_LINEAR_TEXTURE_ALIGNMENT`].
-fn lane_limits(mut limits: Limits) -> Limits {
-    for align in [
-        &mut limits.linear_texture_alignment_bytes,
-        &mut limits.device_linear_texture_alignment_bytes,
-    ] {
-        *align = (*align).max(LANE_LINEAR_TEXTURE_ALIGNMENT);
-    }
-    limits
-}
-
 /// The device's `BOOL` SPI answers where the lane's differ from the platform's, for a guest of
 /// `guest`'s architecture:
 /// - `isFramebufferReadSupported`, for an x86-64 guest no, as an AMD Radeon Pro 5300M answers,
@@ -496,7 +486,7 @@ pub fn device_info(
     let t = caps.max_threads_per_threadgroup;
     info.max_threads_per_threadgroup = [t.width, t.height, t.depth];
 
-    let l = &lane_limits(caps.limits);
+    let l = &caps.limits;
     // In the host `Limits` field order; the bundle reads them in this order.
     info.limits = [
         l.device_linear_texture_alignment_bytes,
@@ -938,11 +928,11 @@ mod tests {
 
     /// `maxBufferLength` is three quarters of the working set rounded down to 16 KiB where that is
     /// below the platform's answer, as the 5300M's and the M3 Max's answers are of theirs, and the
-    /// platform's otherwise; the linear texture alignments are 256 bytes, or the platform's where
-    /// larger; for an x86-64 guest the framebuffer read, tile shader and imageblock answers are
+    /// platform's otherwise; the linear texture alignments are the platform's, below 256 bytes as
+    /// past it; for an x86-64 guest the framebuffer read, tile shader and imageblock answers are
     /// no, whatever the platform's, and the other SPI flags the platform's.
     #[test]
-    fn the_lanes_buffer_length_alignments_and_spi_flags() {
+    fn the_lanes_buffer_length_and_spi_flags_and_the_platforms_linear_alignments() {
         // An RTX 5080 on the Vulkan platform: a terabyte against 17094934528 bytes of VRAM.
         assert_eq!(
             lane_max_buffer_length(Some(1 << 40), Some(17_094_934_528)),
@@ -973,9 +963,10 @@ mod tests {
         // The fake answers 16 for both alignments, and yes for every SPI flag.
         let info = device_info(&caps, identity.clone(), 4, GuestArch::X86_64, None);
         assert_eq!(info.sizes[7], 12_821_200_896);
-        // device_linear_texture_alignment_bytes first, linear_texture_alignment_bytes fourth.
-        assert_eq!(info.limits[0], 256);
-        assert_eq!(info.limits[3], 256);
+        // device_linear_texture_alignment_bytes first, linear_texture_alignment_bytes fourth: the
+        // fake's 16, as an M3 Max answers.
+        assert_eq!(info.limits[0], 16);
+        assert_eq!(info.limits[3], 16);
         // is_framebuffer_read_supported (2), supports_image_blocks (14),
         // supports_non_square_tile_shaders (17) and supports_tile_shaders (24) no; the others
         // the platform's, all yes on the fake but is_depth24_stencil8_pixel_format_supported (1).
@@ -983,7 +974,13 @@ mod tests {
             let want = !matches!(k, 1 | 2 | 14 | 17 | 24);
             assert_eq!(flag, u8::from(want), "flag {k}");
         }
-        // A platform that needs more than 256 bytes keeps its own.
+        // NVIDIA's driver's 128 stays 128, not the 5300M's 256; a platform that needs more than
+        // 256 bytes keeps its own as well.
+        caps.limits.linear_texture_alignment_bytes = 128;
+        caps.limits.device_linear_texture_alignment_bytes = 128;
+        let info = device_info(&caps, identity.clone(), 4, GuestArch::X86_64, None);
+        assert_eq!(info.limits[0], 128);
+        assert_eq!(info.limits[3], 128);
         caps.limits.linear_texture_alignment_bytes = 512;
         caps.limits.device_linear_texture_alignment_bytes = 1024;
         let info = device_info(&caps, identity, 4, GuestArch::X86_64, None);

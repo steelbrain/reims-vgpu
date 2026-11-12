@@ -447,7 +447,7 @@ Probe: `oracle_caps DEVICE`. Where the x86 GPUs' answers differ from the M3's or
 | `maxThreadgroupMemoryLength` | 65536 | 65536 | 32768 | 32768 |
 | `maxArgumentBufferSamplerCount` | 2048 | 2048 | 500000 | 0 |
 | `readWriteTextureSupport` | 2 | 1 | 2 | 2 |
-| `minimumLinearTextureAlignmentForPixelFormat:`, `linearTextureAlignmentBytes` | 256 | 256 | 16 | 256 (4a329e614) |
+| `minimumLinearTextureAlignmentForPixelFormat:`, `linearTextureAlignmentBytes` | 256 | 256 | 16 | 128, the platform's on the 5080's driver (256 from 4a329e614 to 2026-11-12) |
 | `iosurfaceTextureAlignmentBytes` | 16 | 16 | 16 | |
 | `isDepth24Stencil8PixelFormatSupported` | 1 | 0 | 0 | 0 |
 | `supports32BitMSAA`, `supportsPullModelInterpolation` | 1, 1 | 1, 1 | 1, 1 | the runtime's: 1, 1 on the 5080 (metal2vulkan 7da81ee3d8; 0, 0 before) |
@@ -474,11 +474,15 @@ process at every other (compressed, depth and stencil, else MTLPixelFormatInvali
 are depth on AMD, Invalid on Intel); ours does the same, D24S8 as Intel. Our device makes ASTC and the packed formats (m2v),
 which no x86 Mac does; with no Apple family claimed, frameworks should not ask for them.
 
-**Relaxation: none** for performance. Two answers help the host, and the lane gives both, as
-choices inside the envelope *(class 2)*: `minimumLinearTextureAlignmentForPixelFormat:` and the
-SPI linear alignments 256 for every format they answer, as both x86 GPUs answer, which suits the Vulkan
-hosts' linear images (4ee4bcaf0, 4a329e614); and `maxBufferLength` at most three quarters of
+**Relaxation: none** for performance. One answer helps the host, and the lane gives it, as a
+choice inside the envelope *(class 2)*: `maxBufferLength` at most three quarters of
 `recommendedMaxWorkingSetSize`, the rule the 5300M and the M3 answer by (4ee4bcaf0).
+`minimumLinearTextureAlignmentForPixelFormat:` and the SPI linear alignments describe the GPU,
+each Mac answering its own, so the device answers the host GPU's: the platform's, 256 on RADV
+and 128 on NVIDIA's driver (`device_info.rs`). The lane answered 256 for every format from
+4ee4bcaf0 and 4a329e614, as both x86 GPUs answer, while the platform answered Metal's 16 on
+every host; on NVIDIA's driver, which takes a linear image in place only at its own pitch, rows
+at 256 bytes were shadows wherever that pitch is not one.
 
 ## Q10: runtime source compile
 
