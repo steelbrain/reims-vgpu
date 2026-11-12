@@ -20,10 +20,14 @@
 //!   [`Lane::waiting`], and is not among those meanwhile: the lane starts its next job on another
 //!   thread, so a long walk starts as its buffer comes, not once the buffers before it commit, up
 //!   to [`LANE_MOST`] threads a lane. Counted while they waited, the four threads of Valley's GL
-//!   queue held buffers walked and waiting for their turns 79% of the time, 23 buffers waited
-//!   behind them at the median, and a walk started 177 ms after the host took its buffer at the
-//!   median (Unigine Valley at 1920 x 1080, RX 7900 XTX host; measured). The waits, and so every
-//!   commit and record, are where they were: only the threads that run ahead changed.
+//!   queue each held a job 79% of the run, at 92% of its buffers' arrivals all four did and 23
+//!   buffers waited behind them (the median), 65.5% of its jobs ended within 1 ms of the job
+//!   before them, waiting for their turns, and a walk started 177 ms after the host took its
+//!   buffer at the median (Unigine Valley at 1920 x 1080, RX 7900 XTX host; measured). Counted
+//!   only while they walk, the walk started 12.4 ms after it at the median and 47.4 ms at the
+//!   90th percentile, where it had been 448 ms, and Valley ran at 23.9 frames a second where it
+//!   had run at 17.6 (the same host and settings; measured). The waits, and so every commit and
+//!   record, are where they were: only the threads that run ahead changed.
 //! - **Which thread takes a job.** A job goes to the lane's thread that went idle last, so the
 //!   jobs of a lane that needs one thread at a time stay on one thread, and a thread goes once it
 //!   has had no job for [`KEEP`](reims_vgpu_graphics::keep::KEEP), 10 s: the threads a steady load runs
