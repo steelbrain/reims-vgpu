@@ -1437,24 +1437,26 @@ std::string globalName(const Module &m, uint64_t v)
 	return {};
 }
 
-// One entry point's node: the function, then two nodes, the second its arguments.
+// One entry point's node: the function, then two nodes, the second its arguments. False where its
+// arguments do not read; `out.name` is then the function's name, or empty where the node names no
+// function of the module.
 bool entryPoint(const Module &m, uint64_t id, RgfxAirStage stage, RgfxAirFunction &out)
 {
+	out.name.clear();
+	out.stage = stage;
+	out.arguments.clear();
 	const Module::Md *entry = mdAt(m, id);
 	if (entry == nullptr || entry->kind != Module::Md::kNode || entry->ops.size() < 3)
 		return false;
 	const Module::Md *fn = mdAt(m, entry->ops[0]);
-	const Module::Md *args = mdAt(m, entry->ops[2]);
-	if (fn == nullptr || fn->kind != Module::Md::kValue || args == nullptr ||
-	    args->kind != Module::Md::kNode)
+	if (fn == nullptr || fn->kind != Module::Md::kValue)
 		return false;
 	const uint64_t v = fn->value;
 	if (v >= m.globals.size() || !m.globals[static_cast<size_t>(v)].function)
 		return false;
 	out.name = globalName(m, v);
-	out.stage = stage;
-	out.arguments.clear();
-	if (out.name.empty())
+	const Module::Md *args = mdAt(m, entry->ops[2]);
+	if (out.name.empty() || args == nullptr || args->kind != Module::Md::kNode)
 		return false;
 	for (uint64_t argId : args->ops) {
 		const Module::Md *arg = mdAt(m, argId);
@@ -1474,7 +1476,8 @@ bool entryPoint(const Module &m, uint64_t id, RgfxAirStage stage, RgfxAirFunctio
 			continue; // an output or a built-in, of no binding
 		RgfxAirArgument a = {};
 		a.access = RgfxAirAccess::Unknown;
-		if (*kind == "air.buffer")
+		// An OpenCL C kernel's argument passed by value is a buffer of the value at its index.
+		if (*kind == "air.buffer" || *kind == "air.constant")
 			a.kind = RgfxAirKind::Buffer;
 		else if (*kind == "air.indirect_buffer")
 			a.kind = RgfxAirKind::IndirectBuffer;
@@ -2807,7 +2810,8 @@ bool visibleOf(const Module &m, std::vector<RgfxAirVisible> &out)
 	return true;
 }
 
-// The entry points' arguments of the module `m` (rgfxReadAirFunctions).
+// The entry points' arguments of the module `m` (rgfxReadAirFunctions): each entry point's own
+// answer, one whose arguments do not read listed with none, one that names no function left out.
 bool functionsOf(const Module &m, std::vector<RgfxAirFunction> &out)
 {
 	out.clear();
@@ -2826,8 +2830,10 @@ bool functionsOf(const Module &m, std::vector<RgfxAirFunction> &out)
 		for (uint64_t id : it->second) {
 			RgfxAirFunction f;
 			if (!entryPoint(m, id, s.stage, f)) {
-				out.clear();
-				return false;
+				if (f.name.empty())
+					continue;
+				f.argumentsRead = false;
+				f.arguments.clear();
 			}
 			f.constants = constants;
 			f.constantsRead = constantsRead;

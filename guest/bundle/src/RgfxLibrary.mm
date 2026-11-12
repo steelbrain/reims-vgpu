@@ -644,7 +644,8 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 
 // The arguments of the entry point `name`, read from its bitcode in the bytes the library was
 // made from (rgfxModuleOf:why:), once: null where the library kept no bytes (one Metal's link or
-// stitching made), or they do not read, so which textures the function writes is unknown.
+// stitching made), or its module or its own arguments do not read, so which textures the function
+// writes is unknown.
 - (std::shared_ptr<const RgfxAirFunction>)rgfxAirFunctionNamed:(const std::string &)name
 {
 	std::lock_guard<std::mutex> hold(_airLock);
@@ -657,14 +658,19 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 	if (module != nullptr && !module->functionsRead) {
 		why = "its module did not read";
 	} else if (module != nullptr) {
+		const RgfxAirFunction *named = nullptr;
 		for (const RgfxAirFunction &f : module->functions) {
 			if (f.name == name) {
-				air = std::shared_ptr<const RgfxAirFunction>(module, &f);
+				named = &f;
 				break;
 			}
 		}
-		if (air == nullptr)
+		if (named == nullptr)
 			why = "its module declares no such entry point";
+		else if (!named->argumentsRead)
+			why = "an argument of it is not one the reader follows";
+		else
+			air = std::shared_ptr<const RgfxAirFunction>(module, named);
 	}
 	if (air == nullptr && why != nullptr && rgfxAirUnreadFirstLog(name))
 		NSLog(@"RGFX: %s: no arguments read (%s): the textures it binds are taken as written "

@@ -18,8 +18,8 @@
 #   make test       build + run the checks: the serialiser check (x86_64, under
 #                   Rosetta), the AIR argument reader's check (x86_64, under Rosetta,
 #                   over .metallibs built from tests/air_arguments.metal,
-#                   tests/air_arguments_old.metal and tests/air_arguments_11.metal, and the
-#                   repo's committed metallibs), the
+#                   tests/air_arguments_old.metal and tests/air_arguments_11.metal, the module
+#                   of every function of the first, and the repo's committed metallibs), the
 #                   Metal-shell wrapper/routing check (this Mac's native arch; the
 #                   device shell is not in its binary), and the device's base-class
 #                   check (x86_64, under Rosetta), which loads the bundle
@@ -246,8 +246,11 @@ $(PATCH_LIB): tests/patch.metal Makefile
 # --- the AIR argument reader's check (x86_64, Rosetta) ------------------------
 # The reader (src/RgfxAirArguments.*) over a .metallib Apple's Metal compiler builds here from
 # tests/air_arguments.metal, never committed; its function constants against the library's CNST
-# tags (src/RgfxFunctionConstants.*).
+# tags (src/RgfxFunctionConstants.*). AIR_MODULE is the compiler's module of every function of the
+# source, which `metallib` splits into the library's one module a function: the reader's answers
+# for a module of several entry points.
 AIR_LIB = $(BUILD)/air_arguments.metallib
+AIR_MODULE = $(BUILD)/air_arguments.air
 # The same library built for macOS 26, whose functions Metal's library reflection answers
 # (tests/protocol_tests.mm, test_argument_encoders_of_bindings).
 AIR_REFLECTED = $(BUILD)/air_arguments_reflected.metallib
@@ -259,8 +262,8 @@ $(AIR_REFLECTED): tests/air_arguments.metal Makefile
 $(AIR_LIB): tests/air_arguments.metal Makefile
 	@mkdir -p $(@D)
 	xcrun -sdk macosx metal -c -std=metal3.1 -mmacosx-version-min=14.0 tests/air_arguments.metal \
-		-o $(BUILD)/air_arguments.air
-	xcrun -sdk macosx metallib $(BUILD)/air_arguments.air -o $@
+		-o $(AIR_MODULE)
+	xcrun -sdk macosx metallib $(AIR_MODULE) -o $@
 
 # Pipelines' reflection (src/RgfxPipelineReflection.*) over the oracle probe's library
 # (tools/oracle/oracle_reflection.metal), built for macOS 26 and Metal 3.0 as build.sh builds it,
@@ -366,9 +369,9 @@ test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(AIR_OLD_LIB) $(AIR_11_LIB) $(AI
 	$(SHELL_TESTBIN) $(CI_KERNEL) $(STITCHABLE) $(STITCH_CONSTANTS) $(PATCH_LIB) $(INHERIT_TESTBIN) \
 	$(MEMBERS_TESTBIN) $(VIDEO_TESTBIN) $(VIDEO_H265_TESTBIN) $(VIDEO_DRIVER_TESTBIN) $(BUNDLEBIN)
 	arch -$(ARCH) $(SER_TESTBIN)
-	RGFX_AIR_ARGUMENTS=$(AIR_LIB) RGFX_AIR_ARGUMENTS_OLD=$(AIR_OLD_LIB) RGFX_AIR_ARGUMENTS_11=$(AIR_11_LIB) \
-		RGFX_ORACLE_REFLECTION=$(ORACLE_REFLECTION_LIB) RGFX_COMMITTED_METALLIBS=$(COMMITTED_METALLIBS) \
-		arch -$(ARCH) $(AIR_TESTBIN)
+	RGFX_AIR_ARGUMENTS=$(AIR_LIB) RGFX_AIR_MODULE=$(AIR_MODULE) RGFX_AIR_ARGUMENTS_OLD=$(AIR_OLD_LIB) \
+		RGFX_AIR_ARGUMENTS_11=$(AIR_11_LIB) RGFX_ORACLE_REFLECTION=$(ORACLE_REFLECTION_LIB) \
+		RGFX_COMMITTED_METALLIBS=$(COMMITTED_METALLIBS) arch -$(ARCH) $(AIR_TESTBIN)
 	RGFX_CI_KERNEL=$(CI_KERNEL) RGFX_STITCHABLE=$(STITCHABLE) RGFX_STITCH_CONSTANTS=$(STITCH_CONSTANTS) \
 		RGFX_AIR_ARGUMENTS=$(AIR_LIB) RGFX_AIR_ARGUMENTS_11=$(AIR_11_LIB) \
 		RGFX_AIR_REFLECTED=$(AIR_REFLECTED) RGFX_ORACLE_REFLECTION=$(ORACLE_REFLECTION_LIB) \

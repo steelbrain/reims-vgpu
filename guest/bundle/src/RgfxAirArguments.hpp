@@ -22,11 +22,17 @@
 // a post-tessellation vertex function's patch inputs, function tables and acceleration structures
 // are named, as bindings of no texture. Threadgroup memory is an `air.buffer` of
 // `air.address_space` 3, at an index of its own that no buffer is bound to: it is no argument
-// here. Read from modules that Apple's Metal compiler built from our own sources
-// (tests/air_arguments.metal), and as LLVM's text form of the same modules prints them; a count
-// set by function constants, which no source of ours declares, from macOS 27's frameworks'
-// modules on the M3 Max, where 709 entry points bind one (Metal Performance Shaders' kernels
-// among them).
+// here. An OpenCL C kernel's argument passed by value (a scalar, a vector, a struct or a union)
+// is an `air.constant`, bound at an `air.location_index` among the buffers, with no access key;
+// the kernel's function takes it as a pointer of address space 2 to the value. It is read as a
+// buffer at its index, of no access the reader knows (read: Metal's compiler on macOS 27.0.1, the
+// M3 Max, OpenCL C programs of our own compiled as the GL renderer compiles them, for each scalar
+// type, vectors of 2 to 16 components, half and half4, structs, a nested struct and a union, as
+// LLVM's text form prints the modules; tests/cl_mode_tests.mm). Read from modules that Apple's
+// Metal compiler built from our own sources (tests/air_arguments.metal), and as LLVM's text form
+// of the same modules prints them; a count set by function constants, which no source of ours
+// declares, from macOS 27's frameworks' modules on the M3 Max, where 709 entry points bind one
+// (Metal Performance Shaders' kernels among them).
 //
 // A module built for macOS 10.12 (-std=macos-metal1.2) holds LLVM 3.5's metadata nodes, each
 // operand a type and a value: a metadata where the type is metadata, else a value in place of a
@@ -97,17 +103,24 @@ struct RgfxAirConstant {
 };
 
 // One entry point: its name, stage and binding arguments, in the module's order, and the function
-// constants its module declares (`constantsRead` false where they did not read).
+// constants its module declares (`constantsRead` false where they did not read). `argumentsRead`
+// is false where an argument's node is not one the reader follows (a binding of a kind it does
+// not know, a texture of no access it knows, a binding it cannot read): which bindings the
+// function writes is then unknown, and `arguments` is empty.
 struct RgfxAirFunction {
 	std::string name;
 	RgfxAirStage stage;
+	bool argumentsRead = true;
 	std::vector<RgfxAirArgument> arguments;
 	std::vector<RgfxAirConstant> constants;
 	bool constantsRead = false;
 };
 
-// The entry points of the AIR module at `bitcode` (raw bitcode, or in LLVM's wrapper header).
-// False where it is not one the reader can follow; `out` then holds nothing.
+// The entry points of the AIR module at `bitcode` (raw bitcode, or in LLVM's wrapper header),
+// each with its own answer: an entry point whose arguments the reader does not follow is listed,
+// `argumentsRead` false, beside the others, and one whose node names no function of the module is
+// left out. False where the bytes are not a module the reader can follow; `out` then holds
+// nothing.
 bool rgfxReadAirFunctions(const uint8_t *bitcode, size_t size, std::vector<RgfxAirFunction> &out);
 
 // The signatures of a module's visible functions. The module lists them in the named metadata

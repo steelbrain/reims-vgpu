@@ -4657,8 +4657,9 @@ void test_library_air_arguments()
 	CHECK([(RgfxFunction *)[bare newFunctionWithName:@"every_access"] rgfxAirFunction] == nullptr);
 	drainRing(fx.ring);
 
-	// A function whose module does not read (its function table's kind spoilt), in two libraries
-	// of the same bytes: unknown in each, its line logged once a process.
+	// A function whose arguments do not read (its function table's kind spoilt), in two libraries
+	// of the same bytes: unknown in each, its line logged once a process, and the library's other
+	// functions read.
 	std::vector<uint8_t> spoilt(static_cast<const uint8_t *>(bytes.bytes),
 	                            static_cast<const uint8_t *>(bytes.bytes) + bytes.length);
 	const char kind[] = "air.visible_function_table";

@@ -11,7 +11,11 @@
 //     the host makes no pipeline of OpenCL mode, or of another plugin data or bitcodeType;
 //   - the same of kernels of images and samplers, over this Mac's compile of a program of them, as
 //     the x86 Macs answer them (measured: macOS 26.7.1, both Macs alike, Metal's OpenCL mode driven
-//     as the renderer drives it).
+//     as the renderer drives it);
+//   - the AIR reader's binding arguments (rgfxReadAirFunctions) of each kernel of those programs,
+//     and of kernels of values of every kind (scalars, vectors, half, structs, a union), over this
+//     Mac's compile: each value a buffer at its index, its function's and its OpenCL-mode
+//     variant's arguments read.
 // Nothing here runs on the GPU: tools/cl_probe.m runs the kernels on a device.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -274,6 +278,10 @@ void test_cl_function_of_opencl_mode()
 	for (const Expected &e : kExpected) {
 		RgfxFunction *kernel = (RgfxFunction *)[program newFunctionWithName:@(e.name)];
 		CHECK(kernel != nil && [kernel rgfxClBindings] == nullptr && [(id)kernel valueForKey:@"pluginData"] == nil);
+		// Its binding arguments are read: a buffer for each pointer and each value (its __local
+		// pointer, lsum's, is threadgroup memory, no argument).
+		std::shared_ptr<const RgfxAirFunction> air = [kernel rgfxAirFunction];
+		CHECK(air != nullptr && air->arguments.size() == e.buffers.size() + e.byValue.size());
 		id<MTLFunction> variant = [kernel newFunctionWithPluginData:plugin bitcodeType:2];
 		CHECK([(id)variant isKindOfClass:[RgfxFunction class]] && variant != kernel);
 		if (![(id)variant isKindOfClass:[RgfxFunction class]])
@@ -482,6 +490,13 @@ void checkImageKernels(id<MTLDevice> metal, NSString *source, const ImageKernel 
 	for (size_t k = 0; k < count; k++) {
 		const ImageKernel &want = kernels[k];
 		RgfxFunction *kernel = (RgfxFunction *)[program newFunctionWithName:@(want.name)];
+		// Its binding arguments are read (its values' among them), and it writes each texture its
+		// write-only images are bound to, and no other.
+		std::shared_ptr<const RgfxAirFunction> air = [kernel rgfxAirFunction];
+		CHECK(air != nullptr);
+		for (const Argument &a : want.arguments)
+			if (air != nullptr && a.type == MTLArgumentTypeTexture)
+				CHECK(rgfxAirWritesTexture(*air, static_cast<uint32_t>(a.index)) == (a.access != MTLArgumentAccessReadOnly));
 		id<MTLFunction> variant = [kernel newFunctionWithPluginData:plugin bitcodeType:2];
 		if (![(id)variant isKindOfClass:[RgfxFunction class]])
 			fprintf(stderr, "cl_mode_tests: %s: no function of OpenCL mode\n", want.name);
@@ -532,6 +547,167 @@ void test_cl_images_of_opencl_mode()
 	checkImageKernels(metal, kDepthSource, &kDepthKernel, 1);
 }
 
+// Kernels of values passed by value of every kind: a float beside global pointers and a struct
+// (k_buffers and k_struct of the audit's probe, which the reader read none of before), each
+// scalar type, vectors of 2 to 16 components, half and half4 (cl_khr_fp16), a nested struct beside
+// a __constant and a __local pointer to structs, a union, and an int beside a written image.
+NSString *const kValueSource =
+    @"#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n"
+    @"typedef struct { float m; float a; int n; } P;\n"
+    @"typedef struct { float4 v; int k[3]; } In;\n"
+    @"typedef struct { In in; float w; char c; } Out;\n"
+    @"typedef union { float f; uint u; } U;\n"
+    @"__kernel void v_float(__global const float *a, __global const float *b, __global float *o, float s) {\n"
+    @"  int i = get_global_id(0); o[i] = a[i] * s + b[i]; }\n"
+    @"__kernel void v_struct(__global const float *x, __global float *o, P p) {\n"
+    @"  int i = get_global_id(0); o[i] = (i < p.n) ? x[i] * p.m + p.a : -1.0f; }\n"
+    @"__kernel void v_scalars(__global float *o, char a, uchar b, short c, ushort d, int e, uint f, long g,\n"
+    @"                        ulong h, float k) {\n"
+    @"  o[get_global_id(0)] = a + b + c + d + e + f + g + h + k; }\n"
+    @"__kernel void v_vectors(__global float4 *o, float2 a, float3 b, float4 c, int4 d, uchar16 e, short8 f,\n"
+    @"                        long2 g) {\n"
+    @"  o[get_global_id(0)] = (float4)(a.x, b.y, c.z, d.w) + (float)e.s7 + (float)f.s3 + (float)g.y; }\n"
+    @"__kernel void v_half(__global float *o, half h, half4 v) { o[get_global_id(0)] = (float)h + (float)v.w; }\n"
+    @"__kernel void v_nested(__global float *o, Out s, __constant Out *cs, __local In *ls) {\n"
+    @"  int i = get_global_id(0); ls[0] = s.in; barrier(CLK_LOCAL_MEM_FENCE);\n"
+    @"  o[i] = s.in.v.x + s.in.k[2] + s.w + s.c + cs->w + ls[0].v.y; }\n"
+    @"__kernel void v_union(__global uint *o, U u) { o[get_global_id(0)] = u.u; }\n"
+    @"__kernel void v_image(__global float *o, __write_only image2d_t im, int n) {\n"
+    @"  int i = get_global_id(0); o[i] = n; write_imagef(im, (int2)(i, 0), (float4)(n)); }\n";
+
+// What the reader answers for one binding argument: its kind, index and access, of count 1 at a
+// fixed index.
+struct ReadArgument {
+	RgfxAirKind kind;
+	uint32_t index;
+	RgfxAirAccess access;
+};
+
+// Each kernel's binding arguments, as this Mac's compile of kValueSource declares them (read:
+// macOS 27.0.1, the M3 Max, its modules as LLVM's text form prints them): each value an
+// `air.constant` at its buffer index, of no access key, read as a buffer of no access; a __global
+// pointer `air.read` where it is const and `air.read_write` where it is not; v_nested's __local
+// pointer threadgroup memory, no argument.
+const struct {
+	const char *name;
+	std::vector<ReadArgument> arguments;
+} kValueKernels[] = {
+    {"__entry_v_float",
+     {{RgfxAirKind::Buffer, 0, RgfxAirAccess::Read}, {RgfxAirKind::Buffer, 1, RgfxAirAccess::Read},
+      {RgfxAirKind::Buffer, 2, RgfxAirAccess::ReadWrite}, {RgfxAirKind::Buffer, 3, RgfxAirAccess::Unknown}}},
+    {"__entry_v_struct",
+     {{RgfxAirKind::Buffer, 0, RgfxAirAccess::Read}, {RgfxAirKind::Buffer, 1, RgfxAirAccess::ReadWrite},
+      {RgfxAirKind::Buffer, 2, RgfxAirAccess::Unknown}}},
+    {"__entry_v_scalars",
+     {{RgfxAirKind::Buffer, 0, RgfxAirAccess::ReadWrite}, {RgfxAirKind::Buffer, 1, RgfxAirAccess::Unknown},
+      {RgfxAirKind::Buffer, 2, RgfxAirAccess::Unknown}, {RgfxAirKind::Buffer, 3, RgfxAirAccess::Unknown},
+      {RgfxAirKind::Buffer, 4, RgfxAirAccess::Unknown}, {RgfxAirKind::Buffer, 5, RgfxAirAccess::Unknown},
+      {RgfxAirKind::Buffer, 6, RgfxAirAccess::Unknown}, {RgfxAirKind::Buffer, 7, RgfxAirAccess::Unknown},
+      {RgfxAirKind::Buffer, 8, RgfxAirAccess::Unknown}, {RgfxAirKind::Buffer, 9, RgfxAirAccess::Unknown}}},
+    {"__entry_v_vectors",
+     {{RgfxAirKind::Buffer, 0, RgfxAirAccess::ReadWrite}, {RgfxAirKind::Buffer, 1, RgfxAirAccess::Unknown},
+      {RgfxAirKind::Buffer, 2, RgfxAirAccess::Unknown}, {RgfxAirKind::Buffer, 3, RgfxAirAccess::Unknown},
+      {RgfxAirKind::Buffer, 4, RgfxAirAccess::Unknown}, {RgfxAirKind::Buffer, 5, RgfxAirAccess::Unknown},
+      {RgfxAirKind::Buffer, 6, RgfxAirAccess::Unknown}, {RgfxAirKind::Buffer, 7, RgfxAirAccess::Unknown}}},
+    {"__entry_v_half",
+     {{RgfxAirKind::Buffer, 0, RgfxAirAccess::ReadWrite}, {RgfxAirKind::Buffer, 1, RgfxAirAccess::Unknown},
+      {RgfxAirKind::Buffer, 2, RgfxAirAccess::Unknown}}},
+    {"__entry_v_nested",
+     {{RgfxAirKind::Buffer, 0, RgfxAirAccess::ReadWrite}, {RgfxAirKind::Buffer, 1, RgfxAirAccess::Unknown},
+      {RgfxAirKind::Buffer, 2, RgfxAirAccess::Read}}},
+    {"__entry_v_union",
+     {{RgfxAirKind::Buffer, 0, RgfxAirAccess::ReadWrite}, {RgfxAirKind::Buffer, 1, RgfxAirAccess::Unknown}}},
+    {"__entry_v_image",
+     {{RgfxAirKind::Buffer, 0, RgfxAirAccess::ReadWrite}, {RgfxAirKind::Texture, 0, RgfxAirAccess::Write},
+      {RgfxAirKind::Buffer, 1, RgfxAirAccess::Unknown}}},
+};
+
+// Whether `air` binds `want`, in its order, each of count 1 at a fixed index.
+bool bindsAsRead(const RgfxAirFunction &air, const std::vector<ReadArgument> &want)
+{
+	if (!air.argumentsRead || air.arguments.size() != want.size())
+		return false;
+	for (size_t i = 0; i < want.size(); i++) {
+		const RgfxAirArgument &a = air.arguments[i];
+		if (a.kind != want[i].kind || a.index != want[i].index || a.access != want[i].access || a.count != 1 ||
+		    a.anyIndex || a.anyCount || a.writesTextures)
+			return false;
+	}
+	return true;
+}
+
+void test_cl_values_read()
+{
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	NSArray<NSString *> *names = nil;
+	NSData *container = clLibraryBytes(metal, kValueSource, &names);
+	std::vector<uint8_t> metallib;
+	if (container == nil || !RgfxMetallibOfClLibrary(static_cast<const uint8_t *>(container.bytes), container.length,
+	                                                 metallib)) {
+		fprintf(stderr, "cl_mode_tests: this Mac's Metal answers no OpenCL container: no value kernels checked\n");
+		return;
+	}
+	CHECK(names.count == std::size(kValueKernels));
+	// Each kernel's module, as the reader reads it.
+	for (const auto &want : kValueKernels) {
+		const uint8_t *bc = nullptr;
+		size_t n = 0;
+		std::vector<RgfxAirFunction> fns;
+		CHECK(rgfxMetallibBitcode(metallib.data(), metallib.size(), want.name, &bc, &n) &&
+		      rgfxReadAirFunctions(bc, n, fns));
+		const bool one = fns.size() == 1 && fns[0].name == want.name && fns[0].stage == RgfxAirStage::Kernel;
+		if (!one || !bindsAsRead(fns[0], want.arguments)) {
+			fprintf(stderr, "cl_mode_tests: %s: %zu functions read\n", want.name, fns.size());
+			for (const RgfxAirFunction &f : fns)
+				for (const RgfxAirArgument &a : f.arguments)
+					fprintf(stderr, "cl_mode_tests: %s: %s read %d: kind %d index %u count %u access %d\n", want.name,
+					        f.name.c_str(), f.argumentsRead, static_cast<int>(a.kind), a.index, a.count,
+					        static_cast<int>(a.access));
+		}
+		CHECK(one && bindsAsRead(fns[0], want.arguments));
+	}
+	// Through a library over the program, as the GL renderer makes its kernels: each function's
+	// arguments, and its OpenCL-mode variant's, are the module's, logged as unread for none.
+	TestRing &ring = *new TestRing(0x40000);
+	RgfxRingWriter &writer =
+	    *new RgfxRingWriter(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell, nullptr);
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	RgfxSerializer &ser = *new RgfxSerializer(writer, ids);
+	ring.setConsumerIdle(1);
+	static RgfxClModeTestsDevice *device = [RgfxClModeTestsDevice new];
+	device.openCLMode = YES;
+	uint32_t status = 0;
+	RgfxLibrary *program = [RgfxLibrary libraryWithData:metallib.data()
+	                                             length:metallib.size()
+	                                                key:nullptr
+	                                             device:(id<MTLDevice>)device
+	                                         serializer:&ser
+	                                             status:&status];
+	[program rgfxSetSource:dispatch_data_create(container.bytes, container.length, nil,
+	                                            ^{
+		                                            (void)container;
+	                                            })
+	           shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+		           return nil;
+	           }];
+	drainRing(ring);
+	CHECK(program != nil);
+	const uint8_t pluginBytes[32] = {2};
+	NSData *plugin = [NSData dataWithBytes:pluginBytes length:sizeof pluginBytes];
+	for (const auto &want : kValueKernels) {
+		RgfxFunction *kernel = (RgfxFunction *)[program newFunctionWithName:@(want.name)];
+		std::shared_ptr<const RgfxAirFunction> air = [kernel rgfxAirFunction];
+		CHECK(air != nullptr && bindsAsRead(*air, want.arguments));
+		id<MTLFunction> variant = [kernel newFunctionWithPluginData:plugin bitcodeType:2];
+		CHECK([(id)variant isKindOfClass:[RgfxFunction class]] && [(RgfxFunction *)variant rgfxAirFunction] == air);
+		CHECK(rgfxAirUnreadFirstLog(want.name)); // not logged as unread
+	}
+	RgfxFunction *image = (RgfxFunction *)[program newFunctionWithName:@"__entry_v_image"];
+	CHECK([image rgfxAirFunction] != nullptr && rgfxAirWritesTexture(*[image rgfxAirFunction], 0) &&
+	      !rgfxAirWritesTexture(*[image rgfxAirFunction], 1));
+	drainRing(ring);
+}
+
 } // namespace
 
 void rgfxClModeTests()
@@ -540,5 +716,6 @@ void rgfxClModeTests()
 		test_cl_bindings_of();
 		test_cl_function_of_opencl_mode();
 		test_cl_images_of_opencl_mode();
+		test_cl_values_read();
 	}
 }

@@ -2,7 +2,9 @@
 // compiler builds from tests/air_arguments.metal at test time (RGFX_AIR_ARGUMENTS names it):
 // every entry point's binding arguments, kind, index, count and access, as the source declares
 // them, those under function constants among them; which texture bindings each may write; no
-// answer for a binding of a kind the reader does not know; each stitchable function's signature,
+// answer for an entry point with a binding of a kind the reader does not know, beside the answers
+// of the others of its module, over the compiler's module of every entry point of the same source
+// (RGFX_AIR_MODULE, its .air); each stitchable function's signature,
 // type by type, and an unknown one where it has a type the reader does not know; each module's
 // function constants, as its function's CNST tag lists them; the same over the .metallib built
 // from tests/air_arguments_old.metal for macOS 10.12 (RGFX_AIR_ARGUMENTS_OLD); each buffer's
@@ -62,8 +64,8 @@ static bool operator==(const RgfxAirConstant &a, const RgfxAirConstant &b)
 
 static bool operator==(const RgfxAirFunction &a, const RgfxAirFunction &b)
 {
-	return a.name == b.name && a.stage == b.stage && a.arguments == b.arguments && a.constants == b.constants &&
-	       a.constantsRead == b.constantsRead;
+	return a.name == b.name && a.stage == b.stage && a.argumentsRead == b.argumentsRead && a.arguments == b.arguments &&
+	       a.constants == b.constants && a.constantsRead == b.constantsRead;
 }
 
 static bool operator==(const RgfxAirType &a, const RgfxAirType &b)
@@ -171,6 +173,7 @@ RgfxAirFunction entry(const std::vector<uint8_t> &lib, const std::string &name)
 	std::vector<RgfxAirFunction> fns;
 	check(rgfxReadAirFunctions(bitcode, size, fns), name + ": its module is read");
 	check(fns.size() == 1 && fns[0].name == name, name + ": its module's one entry point is it");
+	check(fns.empty() || fns[0].argumentsRead, name + ": its arguments are read");
 	return fns.empty() ? RgfxAirFunction{} : fns[0];
 }
 
@@ -556,9 +559,11 @@ int main()
 					unread++;
 					continue;
 				}
-				for (const RgfxAirFunction &fn : fns)
+				for (const RgfxAirFunction &fn : fns) {
+					unread += fn.argumentsRead ? 0 : 1;
 					for (const RgfxAirArgument &a : fn.arguments)
 						anyCount += a.anyCount ? 1 : 0;
+				}
 			}
 		}
 		std::printf("air_arguments_test: the OS's MPS libraries: %zu, %zu entry points, %zu unread, "
@@ -600,7 +605,8 @@ int main()
 	expect(table, RgfxAirKind::Buffer, 0, 1, RgfxAirAccess::ReadWrite, "a device buffer at 0");
 	expect(table, RgfxAirKind::Texture, 3, 1, RgfxAirAccess::Write, "access::write at 3");
 
-	// A binding of a kind the reader does not know may be a texture: the function has no answer.
+	// A binding of a kind the reader does not know may be a texture: the function has no answer,
+	// and its module still reads.
 	{
 		std::vector<uint8_t> other = lib;
 		const char kind[] = "air.visible_function_table";
@@ -611,11 +617,54 @@ int main()
 		size_t n = 0;
 		std::vector<RgfxAirFunction> fns;
 		check(rgfxMetallibBitcode(other.data(), other.size(), "calls_through_table", &bc, &n) &&
-		          !rgfxReadAirFunctions(bc, n, fns) && fns.empty(),
-		      "calls_through_table, its table's kind unknown: no answer");
+		          rgfxReadAirFunctions(bc, n, fns) && fns.size() == 1 && fns[0].name == "calls_through_table" &&
+		          !fns[0].argumentsRead && fns[0].arguments.empty(),
+		      "calls_through_table, its table's kind unknown: listed, its arguments unread");
 		check(rgfxMetallibBitcode(other.data(), other.size(), "conditional_planes", &bc, &n) &&
-		          rgfxReadAirFunctions(bc, n, fns),
+		          rgfxReadAirFunctions(bc, n, fns) && fns.size() == 1 && fns[0].argumentsRead,
 		      "conditional_planes is still read beside it");
+	}
+
+	// A module of every entry point of tests/air_arguments.metal (the compiler's .air, before
+	// `metallib` splits it into one module a function; RGFX_AIR_MODULE): each entry point's answer
+	// is the one its own module gives, and one whose arguments do not read (its function table's
+	// kind spoilt) leaves the others' answers as they were.
+	if (const char *modulePath = std::getenv("RGFX_AIR_MODULE")) {
+		const std::vector<uint8_t> whole = readFile(modulePath);
+		std::vector<RgfxAirFunction> all;
+		check(rgfxReadAirFunctions(whole.data(), whole.size(), all), "the whole module reads");
+		size_t compared = 0;
+		for (const RgfxAirFunction &f : all) {
+			const RgfxAirFunction own = entry(lib, f.name);
+			check(f.argumentsRead && own.stage == f.stage && own.arguments == f.arguments,
+			      f.name + ": the whole module's answer is its own module's");
+			compared++;
+		}
+		check(compared >= 12, "the whole module lists every entry point (" + std::to_string(compared) + ")");
+		// Each string that starts with the kind's spoilt: the kind's, and the stitching type's
+		// (`air.visible_function_table_type`), which only visible functions' signatures name.
+		std::vector<uint8_t> spoilt = whole;
+		const char tableKind[] = "air.visible_function_table";
+		const size_t length = sizeof(tableKind) - 1;
+		size_t spoiled = 0;
+		for (auto it = spoilt.begin(); (it = std::search(it, spoilt.end(), tableKind, tableKind + length)) != spoilt.end();
+		     it += length) {
+			*(it + length - 1) = '_';
+			spoiled++;
+		}
+		check(spoiled > 0, "the whole module names the function table's kind");
+		std::vector<RgfxAirFunction> left;
+		check(rgfxReadAirFunctions(spoilt.data(), spoilt.size(), left) && left.size() == all.size(),
+		      "the spoilt module reads, every entry point listed");
+		for (size_t i = 0; i < left.size() && i < all.size(); i++) {
+			if (left[i].name == "calls_through_table")
+				check(!left[i].argumentsRead && left[i].arguments.empty(),
+				      "calls_through_table, its table's kind unknown: its arguments unread");
+			else
+				check(left[i] == all[i], left[i].name + ": its answer beside it is as it was");
+		}
+	} else {
+		std::printf("air_arguments_test: RGFX_AIR_MODULE unset: no module of several entry points\n");
 	}
 
 	const uint8_t *bitcode = nullptr;
@@ -1554,7 +1603,10 @@ int main()
 					case 0:
 					case 1:
 					case 2: {
-						check(rgfxReadAirFunctions(bc.data(), bc.size(), args) && named(args), what + ": its arguments");
+						check(rgfxReadAirFunctions(bc.data(), bc.size(), args) &&
+						          std::any_of(args.begin(), args.end(),
+						                      [&](const RgfxAirFunction &x) { return x.name == f.name && x.argumentsRead; }),
+						      what + ": its arguments");
 						const std::string listedAs = file.substr(file.rfind('/') + 1) + " " + f.name;
 						const bool unread =
 						    std::find(nodesUnread.begin(), nodesUnread.end(), listedAs) != nodesUnread.end();
