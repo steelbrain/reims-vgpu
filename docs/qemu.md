@@ -913,6 +913,22 @@ that what it shows is the change's:
   icons, and its Dock never came back. A damaged disk is copied again from
   its source. Before blaming the guest or the platform for a broken disk,
   read what our own steps did on it.
+- **A timing boot runs on a clone.** A boot whose timings are read (a
+  frame's gaps, a page load, a stall) runs on a clone of the guest's disk, a
+  reflink on Linux (`cp --reflink=always`, the copy `reims-ctl` makes) or an
+  APFS clone on a Mac, not on a qcow2 overlay (`qemu-img create -b`, or
+  `snapshot=on`). The guest's first write to each 64 KiB cluster of an
+  overlay reads the rest of the cluster from the base image, and on a Linux
+  host's btrfs `/home` (CachyOS's `compress=zstd:1`) that read is of cold,
+  compressed and checksummed data. Measured on `homelab-um790-xtx-1`, two
+  cold boots of macOS 26.7.2 on each layout of the same disk (2026-11-11,
+  jobs m3-max-19441 and m3-max-19474): the overlay's guest writes took up to
+  1.90 and 1.96 s, and the guest's commands waited with none completing for
+  100 ms or more 19 and 18 times (8.5 and 4.8 s in all); on the reflink
+  clone no write took over 28 ms, and such waits came 6 and 3 times (1.6
+  and 0.5 s). The host's SSD took 1.8 to 2.0 s over a single read now and
+  then on both layouts; only the overlay put a guest write behind one
+  ([lessons.md](lessons.md)).
 - **The screen is checked.** Each boot checks a screendump of its desktop:
   the Dock shown, the wallpaper not flat, the menu bar there, and a fixed
   alert's corners and background against a known-good one. A boot can pass
