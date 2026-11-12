@@ -159,6 +159,32 @@ void RgfxRegion::setPagesBlockSource(PagesBlockFn acquire, void *context)
 	m_pagesBlockContext = context;
 }
 
+void RgfxRegion::setChunkedPagesSource(ChunkedPagesFn make, void *context)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	m_chunkedPages = make;
+	m_chunkedPagesContext = context;
+}
+
+RgfxRegion::Block RgfxRegion::acquireChunkedPages(uint64_t length)
+{
+	Block out = {};
+	uint8_t *bytes = nullptr;
+	uint64_t offset = 0, size = 0;
+	if (m_chunkedPages == nullptr ||
+	    !m_chunkedPages(m_chunkedPagesContext, length, &bytes, &offset, &size))
+		return out; // ok == false
+	if (offset < m_floor || offset > m_size || size > m_size - offset) {
+		release(offset);
+		return out;
+	}
+	out.offset = offset;
+	out.ptr = bytes;
+	out.size = size;
+	out.ok = true;
+	return out;
+}
+
 RgfxRegion::Block RgfxRegion::acquirePages(const void *address, uint64_t length, bool writable,
                                            uint32_t join)
 {

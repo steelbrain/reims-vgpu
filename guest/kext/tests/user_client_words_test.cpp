@@ -131,6 +131,7 @@ static const Selector kSelectors[] = {
 	{"kRgfxAccelMethodDoorbell", kRgfxAccelMethodDoorbell, false},
 	{"kRgfxAccelMethodFeatures", kRgfxAccelMethodFeatures, false},
 	{"kRgfxAccelMethodPagesBlock", kRgfxAccelMethodPagesBlock, false},
+	{"kRgfxAccelMethodPagesChunked", kRgfxAccelMethodPagesChunked, false},
 	{"kRgfxAccelMethodTakeAnswers", kRgfxAccelMethodTakeAnswers, false},
 	{"kRgfxAccelMethodSurfaceBlockRelease", kRgfxAccelMethodSurfaceBlockRelease, false},
 	{"kRgfxAccelMethodSurfaceRetire", kRgfxAccelMethodSurfaceRetire, false},
@@ -302,6 +303,7 @@ static void features()
 		kRgfxKextFeatureContextSpan,
 		kRgfxKextFeatureSharedEvents,
 		kRgfxKextFeatureWriteCombined,
+		kRgfxKextFeaturePagesChunked,
 	};
 	for (unsigned i = 0; i < sizeof(bits) / sizeof(bits[0]); i++)
 		CHECK(bits[i] == uint64_t(1) << i);
@@ -315,6 +317,9 @@ static void features()
 	CHECK(kRgfxSharedEventUserClientType == 0x52475345);
 	CHECK(kRgfxSharedEventMethodExport == 10);
 	CHECK(kRgfxSharedEventMethodImport == 11);
+	// The chunked pages block past the port's numbers, its chunk 64 KiB.
+	CHECK(kRgfxAccelMethodPagesChunked == 12);
+	CHECK(kRgfxPagesChunk == 0x10000 && kRgfxPagesChunkedMaxBytes % kRgfxPagesChunk == 0);
 }
 
 int main()

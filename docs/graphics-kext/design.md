@@ -2390,7 +2390,8 @@ the host's import, and the kext's block table holds one entry per slab:
   for a `BLOCK_RELEASE`.
 - Where the host maps a process's own pages (`PAGES_BUFFERS`, and the kext's
   `PagesBlock`) and makes heaps over them (`HEAP_OVER_PAGES`), a heaped slab
-  of 2 MiB is the process's own memory instead: 2 MiB of plain pages
+  of 2 MiB is the process's own memory instead: the kext's chunks where it
+  gives them (`PagesChunked`, below), else 2 MiB of plain pages
   (`mach_vm_allocate`, tagged `VM_MEMORY_IOACCELERATOR`), which the take asks
   for, wired into a pages block and made one `HEAP_OVER_PAGES`, its buffers
   placed in it as in a region slab's heap. The host makes the heap over the
@@ -2406,6 +2407,22 @@ the host's import, and the kext's block table holds one entry per slab:
   slabs too. A slab let go destroys its heap, releases its pages block (the
   kext answers once the host let go of it, and unwires the pages), then
   deallocates its pages.
+- The kext's chunks first (selector 12, `PagesChunked`, where the kext's word
+  holds `PagesChunked`): the kext takes the slab's bytes in physically
+  contiguous chunks of 64 KiB, zero-filled, maps them into the process in
+  order and makes the pages block of their runs, so a 2 MiB slab is 32 runs
+  of guest RAM at most, where plain pages are up to 512. The host maps each
+  run of a view apart, against a budget of mappings per process
+  (`vm.max_map_count` on Linux, 65530 by default): on NVIDIA, views of
+  scattered pages, slabs' among them, used it up, and the buffers made after
+  were copies (docs/qemu.md). The memory is the block's: the slab's release takes it, the
+  kext unmapping it from the process and freeing the chunks once the host has
+  let go of the block, and the process unmaps nothing. A 64 KiB run is one the
+  kernel finds at once however long the guest has run: on the guest and host
+  the superpages below were measured on, 4,096 chunks in a row each took
+  0.033 ms, and 0.036 ms once 978 MiB of 4 KiB pages had been taken, the
+  slowest 0.74 ms, none refused. A slab the kext gives no chunks for is plain
+  pages.
 - Plain pages, never superpages (`VM_FLAGS_SUPERPAGE_SIZE_2MB`, 2 MiB of RAM in
   one run): superpages run out, and asking for one stalls the process, on
   whatever thread asks. Measured on an x86-64 macOS 26.7.2 guest of 8 GiB on
@@ -3708,6 +3725,7 @@ Map 1:
 | 9 | `SurfaceRetire` | | a queue's writes up to a seqno retire |
 | 10 | `Export`, on a shared event's port ('RGSE') | 1 << 6 `SharedEvents` | names the caller's shared event for other processes ("Shared events across processes") |
 | 11 | `Import`, on a shared event's port ('RGSE') | 1 << 6 `SharedEvents` | makes the caller's new shared event of the one the port names |
+| 12 | `PagesChunked` | 1 << 8 `PagesChunked` | a block of the runs of 64 KiB chunks of the kext's own, mapped into the process, for its slabs |
 | 0x100 | `OpenContext` | 1 << 5 `ContextSpan` (its sixth output) | the context and its window; five outputs, or six with its GPU addresses' span |
 | 0x101 | `Alloc` | 1 << 7 `WriteCombined` (its third input) | a region block; 2 inputs, or 3 with the byte its write-combined part starts at |
 | 0x102 | `Free` | | frees a block |
@@ -3726,7 +3744,7 @@ the accelerator, which the bundle opens for each event it hands out: 10 and 11
 are its own selectors, numbered apart from the accelerator's own so that a call
 on a connection of another kind finds none of that number there.
 
-The kext sets 1 << 0 `PagesBlock`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents` and 1 << 7 `WriteCombined`; no other bit yet.
+The kext sets 1 << 0 `PagesBlock`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined` and 1 << 8 `PagesChunked`; no other bit yet.
 
 **A GL window: the drawable (type 7) and the window surface (type 0x20).**
 These are IOGPU's types, not ours. The bundle leaves `newGLDrawable` to its

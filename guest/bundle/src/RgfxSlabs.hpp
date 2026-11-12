@@ -98,6 +98,7 @@ public:
 		uint64_t regionOffset = 0;
 		bool zeroed = false;
 		uint64_t blockSize = 0; // a pages block's size, for a source of the process's own pages
+		bool chunked = false;   // the kext's chunks, which go with the pages block's release
 	};
 
 	/// The host's object over a slab of a class whose buffers are placed in it (heaped): its
@@ -224,7 +225,8 @@ struct RgfxPagesMemory {
 	void (*unmap)(void *context, uint8_t *bytes, uint64_t size) = nullptr;
 };
 
-/// Slabs of the process's own pages: plain pages, wired into a pages block of the kext's
+/// Slabs of the process's own pages: the kext's chunks of 64 KiB where it gives them
+/// (RgfxRegion::acquireChunkedPages), else plain pages, wired into a pages block of the kext's
 /// (RgfxRegion::acquirePages; RGFX_FEATURE_PAGES_BUFFERS), so their buffers' memory is the guest's
 /// RAM, not the device region's, for the classes whose buffers lie in heaps. A slab of 2 MiB is a
 /// heap the host makes over the block's view of its runs (HEAP_OVER_PAGES;
@@ -233,7 +235,7 @@ struct RgfxPagesMemory {
 /// buffer over such a Shared copy (MANAGED OVER A COPY); a larger Managed one of a class of its
 /// own, and a slab where the kernel has no pages to give or the kext no pages block, are the
 /// region's. A slab goes with its heap's destroy, then its block's release (the kext's Free, which
-/// waits for the device's answer), then its pages.
+/// waits for the device's answer), then its plain pages; chunks go with the release.
 ///
 /// Why the process's own pages: the region is no RAM of the guest's, which the kernel maps
 /// uncached, as an AMD host applies (13 MB/s for a process's stores there, against 56 to 123 GB/s
@@ -251,6 +253,13 @@ struct RgfxPagesMemory {
 /// searched, its main thread, making a texture over a layer's image as a window was resized,
 /// waited in vm_map_region for it, and Safari's page drew no frame for 179 ms. Plain pages are
 /// what every slab took once superpages ran out, minutes after a boot.
+///
+/// Why chunks first: a 2 MiB slab of plain pages is up to 512 runs of the guest's RAM, and the
+/// host maps each run of a view apart, against a budget of mappings per process (vm.max_map_count
+/// on Linux): at its stock 65530, views of scattered pages, slabs' among them, used up the budget on
+/// NVIDIA, and the buffers made after were copies. The kext's chunks are 64 KiB runs, so a 2 MiB slab is 32 runs at most,
+/// and a run of 64 KiB is one the kernel finds at once, however long the guest has run, where
+/// 2 MiB runs are as scarce as superpages (RgfxUserClientABI.hpp, kRgfxPagesChunk).
 class RgfxPagesSlabSource : public RgfxRegionSlabSource {
 public:
 	RgfxPagesSlabSource(RgfxRegion &region, RgfxSerializer &serializer,

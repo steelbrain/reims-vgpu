@@ -1,7 +1,9 @@
 // RgfxPagesBlock: the arithmetic of a pages block (kRgfxAccelMethodPagesBlock, 4): a block of
 // a process's own that holds nothing but the guest RAM runs of pages of that process's, wired by
 // the kext for as long as the block lives, which the device maps in place for the process's
-// buffers over them (RGFX_FEATURE_PAGES_BUFFERS, BUFFER_OVER_PAGES).
+// buffers over them (RGFX_FEATURE_PAGES_BUFFERS, BUFFER_OVER_PAGES). A chunked pages block
+// (kRgfxAccelMethodPagesChunked, 12) is one over the kext's own chunks of kRgfxPagesChunk bytes
+// instead, mapped into the process, its runs found the same way.
 //
 // The range a call names is rounded out to whole pages, as the wiring takes them; the device's
 // view starts at the first page, so a buffer over the call's first byte lies at its offset in that

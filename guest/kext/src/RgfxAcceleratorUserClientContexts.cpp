@@ -316,6 +316,23 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		out[1] = size;
 		return kIOReturnSuccess;
 	}
+	case kRgfxAccelMethodPagesChunked: {
+		if (a->scalarInputCount != 1 || a->scalarOutputCount != 3)
+			return kIOReturnBadArgument;
+		// An ask, as PagesBlock's.
+		UInt32 ctx = 0;
+		Ask ask = {this, beginAsk(&ctx)};
+		UInt64 address = 0, offset = 0, size = 0;
+		IOReturn r = ask.begun ? owner->pagesChunked(this, ctx, task, in[0], &address, &offset,
+		                                             &size)
+		                       : kIOReturnBadArgument;
+		if (r != kIOReturnSuccess)
+			return r;
+		out[0] = address;
+		out[1] = offset;
+		out[2] = size;
+		return kIOReturnSuccess;
+	}
 	case kRgfxAccelMethodSurfaceWrites:
 		return surfaceWritesMethod(a);
 	case kRgfxAccelMethodSurfaceRetire:

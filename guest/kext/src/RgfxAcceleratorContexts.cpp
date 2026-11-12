@@ -61,8 +61,10 @@
 #include "RgfxTrace.hpp"
 #include "RgfxReleaseTable.hpp"
 
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOMultiMemoryDescriptor.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
 #include <libkern/libkern.h>
@@ -1352,9 +1354,37 @@ IOReturn refuseCopy(RgfxCopyRefusal why, UInt64 length, UInt64 size, IOReturn r)
 	return r;
 }
 
+// A chunked pages block refused for `why`, with `made` of `count` chunks taken: logged the first
+// time, the process then taking plain pages. Answers kIOReturnNoMemory.
+IOReturn refuseChunks(const char *why, UInt32 made, UInt32 count)
+{
+	static char logged;
+	if (rgfxFirstCalls(&logged, 0, 1)) {
+		char name[32] = {};
+		proc_name(proc_selfpid(), name, sizeof(name));
+		IOLog("RgfxAccelerator: %s[%d] gets no chunked pages block of %u chunks (%u made): %s; "
+		      "it takes plain pages (the first refusal)\n",
+		      name, proc_selfpid(), count, made, why);
+	}
+	return kIOReturnNoMemory;
+}
+
 void unwire(void *pages)
 {
-	if (IOMemoryDescriptor *md = static_cast<IOMemoryDescriptor *>(pages)) {
+	OSObject *held = static_cast<OSObject *>(pages);
+	if (!held)
+		return;
+	// A chunked pages block's (pagesChunked) is the process's mapping of the kext's chunks, which
+	// holds them: out of the process, then the chunks freed with the mapping.
+	if (IOMemoryMap *map = OSDynamicCast(IOMemoryMap, held)) {
+		IOMemoryDescriptor *md = map->getMemoryDescriptor();
+		map->unmap();
+		if (md)
+			md->complete(kIODirectionOutIn);
+		map->release();
+		return;
+	}
+	if (IOMemoryDescriptor *md = OSDynamicCast(IOMemoryDescriptor, held)) {
 		md->complete(kIODirectionOutIn);
 		md->release();
 	}
@@ -2582,15 +2612,81 @@ IOReturn RgfxAccelerator::pagesBlock(RgfxAcceleratorUserClient *client, UInt32 c
 		md->release();
 		return kIOReturnBadArgument;
 	}
+	return pagesBlockOver(client, context, md, range.length, md, offset, size);
+}
+
+IOReturn RgfxAccelerator::pagesChunked(RgfxAcceleratorUserClient *client, UInt32 context,
+                                       task_t task, UInt64 length, UInt64 *address,
+                                       UInt64 *offset, UInt64 *size)
+{
+	if (!contextLock)
+		return kIOReturnNotReady;
+	if (!surfacePages || !region || !(featureWord() & RGFX_FEATURE_PAGES_BUFFERS))
+		return kIOReturnUnsupported;
+	if (length == 0 || length % kRgfxPagesChunk != 0 || length > kRgfxPagesChunkedMaxBytes)
+		return kIOReturnBadArgument;
+	// The chunks, each a run of RAM of its own, wired as the kernel's memory is, and zero-filled:
+	// the process sees them.
+	const UInt32 count = static_cast<UInt32>(length / kRgfxPagesChunk);
+	const vm_size_t listBytes = count * sizeof(IOMemoryDescriptor *);
+	IOMemoryDescriptor **chunks = static_cast<IOMemoryDescriptor **>(IOMalloc(listBytes));
+	if (!chunks)
+		return kIOReturnNoMemory;
+	UInt32 made = 0;
+	for (; made < count; made++) {
+		IOBufferMemoryDescriptor *chunk = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+		    kernel_task,
+		    kIODirectionOutIn | kIOMemoryPhysicallyContiguous | kIOMemoryKernelUserShared,
+		    kRgfxPagesChunk, 0x0000FFFFFFFFF000ULL);
+		if (!chunk)
+			break;
+		bzero(chunk->getBytesNoCopy(), kRgfxPagesChunk);
+		chunks[made] = chunk;
+	}
+	IOMultiMemoryDescriptor *md =
+	    made == count ? IOMultiMemoryDescriptor::withDescriptors(chunks, count, kIODirectionOutIn,
+	                                                             false)
+	                  : nullptr;
+	// The descriptor holds the chunks it was made of.
+	for (UInt32 i = 0; i < made; i++)
+		chunks[i]->release();
+	IOFree(chunks, listBytes);
+	if (!md)
+		return refuseChunks(made < count ? "the kernel gave too few chunks" : "no descriptor",
+		                    made, count);
+	if (md->prepare(kIODirectionOutIn) != kIOReturnSuccess) {
+		md->release();
+		return refuseChunks("the chunks were not prepared", count, count);
+	}
+	// The process's mapping of them, read and write, which holds them from here on: the block's,
+	// unmapped and let go of where it is unwired (unwire).
+	IOMemoryMap *map = md->createMappingInTask(task, 0, kIOMapAnywhere);
+	if (!map) {
+		md->complete(kIODirectionOutIn);
+		md->release();
+		return refuseChunks("the process got no mapping of them", count, count);
+	}
+	md->release();
+	const UInt64 at = map->getAddress();
+	const IOReturn r = pagesBlockOver(client, context, md, length, map, offset, size);
+	if (r == kIOReturnSuccess)
+		*address = at;
+	return r;
+}
+
+IOReturn RgfxAccelerator::pagesBlockOver(RgfxAcceleratorUserClient *client, UInt32 context,
+                                         IOMemoryDescriptor *md, UInt64 length, void *wired,
+                                         UInt64 *offset, UInt64 *size)
+{
 	auto segment = [md](uint64_t at, uint64_t *bytes) -> uint64_t {
 		IOByteCount n = 0;
 		const addr64_t phys = md->getPhysicalSegment(at, &n, kIOMemoryMapperNone);
 		*bytes = n;
 		return phys;
 	};
-	const uint32_t count = rgfxPagesRuns(range.length, segment, nullptr, 0);
+	const uint32_t count = rgfxPagesRuns(length, segment, nullptr, 0);
 	if (!count) {
-		unwire(md);
+		unwire(wired);
 		return kIOReturnBadArgument;
 	}
 	// The client's block, holding the wired pages from here on, and pinned until the device has
@@ -2603,10 +2699,10 @@ IOReturn RgfxAccelerator::pagesBlock(RgfxAcceleratorUserClient *client, UInt32 c
 	const RgfxBlockResult made = rgfxBlockAlloc(blockTable, client, context, bytes, kPage, &at,
 	                                            &pin, client->isWindowServer());
 	if (made == kRgfxBlockOk)
-		rgfxBlockSetWired(blockTable, at, md);
+		rgfxBlockSetWired(blockTable, at, wired);
 	IOLockUnlock(contextLock);
 	if (made != kRgfxBlockOk) {
-		unwire(md);
+		unwire(wired);
 		if (made == kRgfxBlockNoSpace)
 			return kIOReturnNoSpace;
 		return made == kRgfxBlockTableFull ? kIOReturnNoResources : kIOReturnBadArgument;
@@ -2617,24 +2713,24 @@ IOReturn RgfxAccelerator::pagesBlock(RgfxAcceleratorUserClient *client, UInt32 c
 	if (IOMemoryMap *map = region->createMappingInTask(
 	        kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache, at, bytes)) {
 		auto *runs = reinterpret_cast<RgfxPageRun *>(map->getVirtualAddress());
-		written = rgfxPagesRuns(range.length, segment, runs, count) == count;
+		written = rgfxPagesRuns(length, segment, runs, count) == count;
 		map->release();
 	}
-	IOReturn r = written ? postPages(context, at, bytes, at, range.length, count,
+	IOReturn r = written ? postPages(context, at, bytes, at, length, count,
 	                                 RGFX_SURFACE_PAGES_PRIVATE)
 	                     : kIOReturnUnsupported;
 	// The device has no view of a block it never heard of, or refused: the block goes back as if
 	// never made, and its pages are unwired.
 	if (!written || r == kIOReturnUnsupported) {
-		void *wired = nullptr;
+		void *dropped = nullptr;
 		IOLockLock(contextLock);
 		const int64_t i = rgfxBlockIndex(blockTable, at);
 		if (i >= 0 && blockTable.blocks[i].serial == pin.serial) {
-			wired = blockTable.blocks[i].wired;
+			dropped = blockTable.blocks[i].wired;
 			rgfxBlockDrop(blockTable, pin);
 		}
 		IOLockUnlock(contextLock);
-		unwire(wired);
+		unwire(dropped);
 		return kIOReturnUnsupported;
 	}
 	if (r == kIOReturnSuccess) {
@@ -2658,7 +2754,7 @@ IOReturn RgfxAccelerator::pagesBlock(RgfxAcceleratorUserClient *client, UInt32 c
 	if (r != kIOReturnSuccess) {
 		IOLog("RgfxAccelerator: context %u's pages block 0x%llx (%u runs of 0x%llx bytes) was "
 		      "not answered or granted (0x%x): it is released, and the memory copied\n",
-		      context, at, count, range.length, r);
+		      context, at, count, length, r);
 		return kIOReturnUnsupported;
 	}
 	*offset = at;

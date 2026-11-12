@@ -767,8 +767,10 @@ struct PagesKext {
 	RgfxHeapRanges free;
 	std::map<uint64_t, uint64_t> blocks; // region blocks, by offset
 	std::set<uint64_t> pages;            // pages blocks, by offset
+	std::map<uint64_t, std::vector<uint8_t>> chunks; // chunked pages blocks' memory, by offset
 	std::vector<std::string> *log;
 	bool refusePages = false;
+	bool refuseChunks = false;
 	const void *lastAddress = nullptr;
 	uint64_t lastLength = 0;
 	bool lastWritable = false;
@@ -797,9 +799,33 @@ struct PagesKext {
 		k->pages.insert(*offset);
 		return true;
 	}
+	// The kext's chunks and their pages block (PagesChunked): memory of its own, zero-filled,
+	// which goes with the block's release.
+	static bool chunked(void *context, uint64_t length, uint8_t **bytes, uint64_t *offset,
+	                    uint64_t *size)
+	{
+		PagesKext *k = static_cast<PagesKext *>(context);
+		const std::string what = "chunked " + std::to_string(length);
+		if (k->refuseChunks || !k->free.take(0x4000, 0x4000, offset)) {
+			k->log->push_back(what + " refused");
+			return false;
+		}
+		k->log->push_back(what);
+		*offset += RGFX_ALLOCATIONS_OFFSET;
+		*size = 0x4000;
+		std::vector<uint8_t> memory(length, 0);
+		*bytes = memory.data();
+		k->chunks[*offset] = std::move(memory);
+		return true;
+	}
 	static void release(void *context, uint64_t offset)
 	{
 		PagesKext *k = static_cast<PagesKext *>(context);
+		if (k->chunks.erase(offset) != 0) {
+			k->free.give(offset - RGFX_ALLOCATIONS_OFFSET, 0x4000);
+			k->log->push_back("release chunked");
+			return;
+		}
 		if (k->pages.erase(offset) != 0) {
 			k->free.give(offset - RGFX_ALLOCATIONS_OFFSET, 0x4000);
 			k->log->push_back("release pages");
@@ -989,6 +1015,81 @@ void test_pages_slab_source()
 	CHECK(both.reclaim() && kext.pages.empty() && vm.held.empty());
 }
 
+// Where the kext makes chunked pages blocks, a slab of the process's own pages is the kext's
+// chunks first: a heaped slab's heap and a large Shared slab's buffer are over the chunks' block
+// as over plain pages', and the kernel is asked for no pages. A slab the kext gives no chunks for
+// is plain pages. A chunked slab goes with its block's release alone, the process unmapping
+// nothing; a plain one's pages go after its release.
+void test_pages_slab_source_chunks()
+{
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 16 * kMiB, 0xee);
+	TestRing ring(0x10000);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	RgfxRegion region(mem.data(), mem.size());
+	std::vector<std::string> log;
+	PagesKext kext(16 * kMiB, &log);
+	region.setBlockSource(&PagesKext::alloc, &PagesKext::release, &kext);
+	region.setPagesBlockSource(&PagesKext::pagesBlock, &kext);
+	CHECK(!region.hasChunkedPages());
+	region.setChunkedPagesSource(&PagesKext::chunked, &kext);
+	CHECK(region.hasChunkedPages());
+	PagesVm vm(&log);
+	RgfxPagesMemory calls;
+	calls.context = &vm;
+	calls.pages = &PagesVm::pages;
+	calls.unmap = &PagesVm::unmap;
+	RgfxRegionSlabSource regionSource(region, ser);
+	RgfxPagesSlabSource pages(region, ser, calls, 16ull << 30);
+	RgfxSlabs slabs(regionSource);
+	slabs.setFirst(&pages);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+
+	// A heaped slab: the kext's chunks, the heap over their block, the kernel unasked.
+	RgfxSlabs::Range a;
+	CHECK(slabs.take(256, kShared, 0, &a) && a.offset == 0);
+	CHECK(log == std::vector<std::string>({"chunked 2097152"}) && kext.chunks.size() == 1);
+	const uint64_t block = kext.chunks.begin()->first;
+	CHECK(a.contents == kext.chunks.begin()->second.data() && allBytes(a.contents, a.size, 0));
+	auto heap = expectMessage<RgfxHeapOverPages>(ring, RGFX_CMD_HEAP_OVER_PAGES);
+	CHECK(heap.block_offset == block && heap.block_size == 0x4000);
+	CHECK(heap.size_bytes == 2 * kMiB && heap.options == kShared);
+	RgfxSlabSource::Made made;
+	CHECK(slabs.makeBuffer(a, 0x100, kShared, &made));
+	auto at = expectMessage<RgfxBufferAtOffset>(ring, RGFX_CMD_BUFFER_AT_OFFSET);
+	CHECK(at.heap_obj_id == heap.obj_id && at.offset == 0);
+	// A large Shared slab: chunks too, its buffer over their block's view.
+	RgfxSlabs::Range big;
+	CHECK(slabs.take(3 * kMiB, kShared, 0, &big) && big.offset == 0);
+	CHECK(endsWith(log, {"chunked 4194304"}) && kext.chunks.size() == 2 && vm.held.empty());
+	CHECK(slabs.makeBuffer(big, 3 * kMiB, kShared, &made));
+	auto over = expectMessage<RgfxBufferOverPages>(ring, RGFX_CMD_BUFFER_OVER_PAGES);
+	CHECK(over.block_offset == kext.chunks.rbegin()->first && over.length == 3 * kMiB);
+	CHECK(made.ownsAddress && made.objId == over.obj_id);
+	// No chunks from the kext: plain pages, wired into a pages block.
+	kext.refuseChunks = true;
+	RgfxSlabs::Range plain;
+	CHECK(slabs.take(0x1000, kSharedUntracked, 0, &plain));
+	CHECK(endsWith(log, {"chunked 2097152 refused", "pages 2097152"}) && kext.pages.size() == 1);
+	CHECK(vm.held.size() == 1);
+	kext.refuseChunks = false;
+	while (ring.next(&h, &bytes)) {
+	}
+	// Each slab let go: the chunked ones with their release alone, the plain one's pages after
+	// its release.
+	for (RgfxSlabs::Range *r : {&a, &big, &plain})
+		slabs.give(*r);
+	log.clear();
+	CHECK(slabs.reclaim() && slabs.stats().slabs == 0);
+	CHECK(kext.chunks.empty() && kext.pages.empty() && vm.held.empty());
+	CHECK(log.size() == 4 && std::count(log.begin(), log.end(), "release chunked") == 2);
+	const auto released = std::find(log.begin(), log.end(), "release pages");
+	CHECK(released != log.end() && released + 1 != log.end() && released[1] == "unmap 2097152");
+}
+
 // Where the device took MANAGED_BUFFER_SLABS, a Managed buffer lies in its Shared class: a range
 // of the Shared buffers' slabs, the process's own pages first, at any size, its CPU copy a Shared
 // buffer there (BUFFER_AT_OFFSET in a 2 MiB slab's heap, BUFFER_OVER_PAGES over a larger slab's
@@ -1107,5 +1208,6 @@ void rgfxSlabTests()
 	test_region_slab_source();
 	test_region_reclaims_slabs();
 	test_pages_slab_source();
+	test_pages_slab_source_chunks();
 	test_managed_buffers_over_shared_copies();
 }

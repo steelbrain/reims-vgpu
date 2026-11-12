@@ -1,7 +1,7 @@
 // RgfxAskGate: a process's asks of its context that the client's close must not overtake, and
 // that wait for the device: a surface's block (kRgfxAccelMethodSurfaceBlock), a pages block
-// (kRgfxAccelMethodPagesBlock), a chunk of resource ids (kRgfxAccelMethodResourceIds) and a
-// command queue (kRgfxAccelMethodQueueCreate).
+// (kRgfxAccelMethodPagesBlock, kRgfxAccelMethodPagesChunked), a chunk of resource ids
+// (kRgfxAccelMethodResourceIds) and a command queue (kRgfxAccelMethodQueueCreate).
 //
 // Each makes something the close lets go of (a hold of a shared block, a block, a chunk, a watched
 // queue), and an ask that began while the context was open must have made it, or given up, before

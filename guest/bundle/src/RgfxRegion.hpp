@@ -245,6 +245,24 @@ public:
 	/// Whether a pages block source is set.
 	bool hasPagesBlocks() const { return m_pagesBlock != nullptr; }
 
+	/// Where chunked pages blocks come from (the kext's PagesChunked,
+	/// kRgfxKextFeaturePagesChunked): `make` answers `length` bytes of the kext's own memory,
+	/// zero-filled, in runs of guest RAM of 64 KiB at least, mapped read and write in the process
+	/// at `*bytes`, and the pages block of those runs, its region offset and size, or false where
+	/// it gives none. The memory is the block's: the block's release (release()) takes it out of
+	/// the process too, and the process never unmaps it. Called with `context`, from any thread.
+	typedef bool (*ChunkedPagesFn)(void *context, uint64_t length, uint8_t **bytes,
+	                               uint64_t *offset, uint64_t *size);
+	void setChunkedPagesSource(ChunkedPagesFn make, void *context);
+
+	/// Whether a chunked pages block source is set.
+	bool hasChunkedPages() const { return m_chunkedPages != nullptr; }
+
+	/// A chunked pages block of `length` bytes (ChunkedPagesFn): `ok` false without a chunked
+	/// pages source, or where it gives none; its `ptr` the memory in the process, given back with
+	/// the block at its release(). Never joined: each is its own.
+	Block acquireChunkedPages(uint64_t length);
+
 #if defined(__arm64__)
 	/// The page the kext rounds a pages block's range out to, which the device's view of the block
 	/// starts at: 16 KiB where the kext took RGFX_FEATURE_PAGES_16K (its RgfxPagesBlock.hpp),
@@ -320,6 +338,8 @@ private:
 	void *m_pagesContext = nullptr;
 	PagesBlockFn m_pagesBlock = nullptr; // the pages block source, where set (the kext)
 	void *m_pagesBlockContext = nullptr;
+	ChunkedPagesFn m_chunkedPages = nullptr; // the chunked pages source, where set (the kext)
+	void *m_chunkedPagesContext = nullptr;
 #if defined(__arm64__)
 	uint64_t m_pagesPage = 0x1000; // pagesPage()
 #endif

@@ -195,10 +195,23 @@ bool RgfxPagesSlabSource::heapedSlab(const Memory &memory, uint32_t options) con
 
 bool RgfxPagesSlabSource::take(uint64_t size, Memory *out)
 {
-	// Plain pages, which the kext wires as it makes the block; where the kernel has none to give
-	// or the kext no pages block, the region's slab.
+	if (size == 0 || size % kUnit != 0)
+		return false;
+	// The kext's chunks, the block's own memory; where it gives none, plain pages, which the kext
+	// wires as it makes the block; where the kernel has none to give or the kext no pages block,
+	// the region's slab.
+	RgfxRegion::Block chunks = m_region.acquireChunkedPages(size);
+	if (chunks.ok) {
+		out->bytes = const_cast<uint8_t *>(chunks.ptr);
+		out->size = size;
+		out->regionOffset = chunks.offset;
+		out->blockSize = chunks.size;
+		out->zeroed = true; // the kext zero-fills its chunks
+		out->chunked = true;
+		return true;
+	}
 	uint8_t *bytes = nullptr;
-	if (size == 0 || size % kUnit != 0 || m_memory.pages == nullptr ||
+	if (m_memory.pages == nullptr ||
 	    m_memory.pages(m_memory.context, size, &bytes) != KERN_SUCCESS)
 		return false;
 	RgfxRegion::Block block = m_region.acquirePages(bytes, size, true);
@@ -217,9 +230,10 @@ bool RgfxPagesSlabSource::take(uint64_t size, Memory *out)
 void RgfxPagesSlabSource::give(const Memory &memory)
 {
 	// The block's release first: the kext answers once the device has let go of it, and unwires
-	// the pages.
+	// the pages, or unmaps and frees its chunks.
 	m_region.release(memory.regionOffset);
-	m_memory.unmap(m_memory.context, memory.bytes, memory.size);
+	if (!memory.chunked)
+		m_memory.unmap(m_memory.context, memory.bytes, memory.size);
 }
 
 bool RgfxPagesSlabSource::makeHeap(const Memory &memory, uint32_t options, Heap *out)

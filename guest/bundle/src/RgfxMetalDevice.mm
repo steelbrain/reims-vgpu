@@ -435,6 +435,25 @@ bool rgfxKextPagesBlock(void *context, const void *address, uint64_t length, boo
 	return true;
 }
 
+// The region's chunked pages source (RgfxRegion::setChunkedPagesSource): the kext's chunks and
+// their pages block (kRgfxAccelMethodPagesChunked), false where it makes none, for any reason,
+// and the slab then takes plain pages.
+bool rgfxKextPagesChunked(void *context, uint64_t length, uint8_t **bytes, uint64_t *offset,
+                          uint64_t *size)
+{
+	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	uint64_t out[3] = {};
+	uint32_t outCount = 3;
+	kern_return_t kr =
+	    IOConnectCallScalarMethod(conn, kRgfxAccelMethodPagesChunked, &length, 1, out, &outCount);
+	if (kr != KERN_SUCCESS || outCount != 3)
+		return false;
+	*bytes = reinterpret_cast<uint8_t *>(static_cast<uintptr_t>(out[0]));
+	*offset = out[1];
+	*size = out[2];
+	return true;
+}
+
 // The pages source's memory (RgfxPagesMemory::pages): plain pages, zero-filled, tagged
 // VM_MEMORY_IOACCELERATOR, which the kext's pages block wires.
 int rgfxPlainPages(void *, uint64_t size, uint8_t **bytes)
@@ -838,6 +857,9 @@ RGFX_LOG_UNRECOGNIZED
 		_region->setPagesPage((_caps.features() & RGFX_FEATURE_PAGES_16K) != 0 ? 0x4000 : 0x1000);
 #endif
 		_region->setPagesBlockSource(&rgfxKextPagesBlock, connContext);
+		// Slabs of the kext's chunks first, where it makes them.
+		if ((_caps.kextFeatures() & kRgfxKextFeaturePagesChunked) != 0)
+			_region->setChunkedPagesSource(&rgfxKextPagesChunked, connContext);
 	}
 
 	// The object lifecycle goes to the kext, which posts it on the control ring and hands back
@@ -880,9 +902,10 @@ RGFX_LOG_UNRECOGNIZED
 	_slabSource = std::make_unique<RgfxRegionSlabSource>(*_region, *_serializer, managedAtOffset,
 	                                                     managedOverCopy);
 	_slabs = std::make_unique<RgfxSlabs>(*_slabSource);
-	// The slabs whose buffers lie in heaps, and large Shared buffers, are the process's own plain
-	// pages, wired into pages blocks the host makes heaps or buffers over, where the region has a
-	// pages block source (above) and the device took HEAP_OVER_PAGES; else the region's.
+	// The slabs whose buffers lie in heaps, and large Shared buffers, are the kext's chunks, or
+	// the process's own plain pages, wired into pages blocks the host makes heaps or buffers over,
+	// where the region has a pages block source (above) and the device took HEAP_OVER_PAGES; else
+	// the region's.
 	if (_region->hasPagesBlocks() && (_caps.features() & RGFX_FEATURE_HEAP_OVER_PAGES) != 0) {
 		RgfxPagesMemory memory;
 		memory.pages = &rgfxPlainPages;

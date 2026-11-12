@@ -87,11 +87,12 @@ enum {
 };
 
 // The kext's own features (kRgfxKextFeature*, RgfxUserClientABI.hpp) this kext carries out, the
-// second word kRgfxAccelMethodFeatures answers: PagesBlock, Submit's deferred flag and
-// TakeAnswers, OpenContext's span, shared events' ports and Alloc's write-combined part, where the
-// region's write-combined mappings are ordinary memory (RgfxRegionMapping.hpp). Each bit is set
-// by the change that lands its call.
+// second word kRgfxAccelMethodFeatures answers: PagesBlock and PagesChunked, Submit's deferred
+// flag and TakeAnswers, OpenContext's span, shared events' ports and Alloc's write-combined part,
+// where the region's write-combined mappings are ordinary memory (RgfxRegionMapping.hpp). Each
+// bit is set by the change that lands its call.
 constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
+                                          kRgfxKextFeaturePagesChunked |
                                           kRgfxKextFeatureDeferredAnswers |
                                           kRgfxKextFeatureContextSpan |
                                           kRgfxKextFeatureSharedEvents |
@@ -434,6 +435,13 @@ public:
 	IOReturn pagesBlock(RgfxAcceleratorUserClient *owner, UInt32 context, task_t task,
 	                    UInt64 address, UInt64 length, bool writable, UInt64 *offset,
 	                    UInt64 *size);
+	// A chunked pages block (kRgfxAccelMethodPagesChunked) of `owner` of context `context`: the
+	// `length` bytes of the kext's own chunks, mapped into `task` at `*address`, and the block of
+	// their runs, its offset and size. The block holds the chunks and their mapping: freeBlock
+	// frees it, and the mapping goes from `task` and the chunks back to the kernel once its
+	// release is answered OK, or once freeBlocks frees it after the owner's close.
+	IOReturn pagesChunked(RgfxAcceleratorUserClient *owner, UInt32 context, task_t task,
+	                      UInt64 length, UInt64 *address, UInt64 *offset, UInt64 *size);
 	void freeBlocks(const void *owner);
 	// Before the owner's close is posted: none of its blocks is released from here on, a freed
 	// or a refused one included, so no release of its comes behind the close, which the device
@@ -648,6 +656,13 @@ private:
 	IOReturn postPages(UInt32 context, UInt64 offset, UInt64 total, UInt64 runsOffset,
 	                   UInt64 length, UInt32 count, UInt32 flags, UInt32 *status = nullptr,
 	                   const RgfxSurfacePagesLayout *layout = nullptr);
+	// A pages block's making past its memory's (pagesBlock, pagesChunked): the runs of the
+	// `length` bytes `md` describes, wired, in a block of `owner`'s that holds `wired` from here
+	// on (unwire), the device told of them (SURFACE_PAGES, RGFX_SURFACE_PAGES_PRIVATE) and the
+	// block granted: its offset and size. `wired` is unwired where no block is made.
+	IOReturn pagesBlockOver(RgfxAcceleratorUserClient *owner, UInt32 context,
+	                        IOMemoryDescriptor *md, UInt64 length, void *wired, UInt64 *offset,
+	                        UInt64 *size);
 	// The new deferred block of entry `e`, pending, held by its asker of context `context` alone,
 	// `total` bytes with its runs' room, its surface laid out as `layout`: makes its surface's
 	// device cache and reads the surface (rgfxSurfaceLocksDefer); fresh, asks the host to defer
