@@ -19,6 +19,9 @@
 //               after the encode, against base_us, one with no encode before it; then the buffer
 //               executed into an 8x1 target: command i draws pixel i % 8 in colour i % 15, so pixel
 //               k holds the last such draw's colour, checked.
+//   wide        as render, of an ICB that may bind 31 vertex and 31 fragment buffers: where the
+//               device keeps a command's encodes in a slot of its bindings, a buffer of this many
+//               commands passes a slot table's cap, and its encodes take the device's other route.
 //   inherit     an ICB of draws whose pipeline and buffers are inherited, each command a draw alone
 //               (1 call); executed under the encoder's pipeline and buffers, checked.
 //   compute     an ICB of dispatches, each command its compute pipeline state, two kernel buffers
@@ -222,14 +225,14 @@ static void setup(void)
 	gTarget = [gDevice newTextureWithDescriptor:td];
 }
 
-static id<MTLIndirectCommandBuffer> drawBuffer(BOOL inherit, NSUInteger count)
+static id<MTLIndirectCommandBuffer> drawBuffer(BOOL inherit, NSUInteger count, NSUInteger binds)
 {
 	MTLIndirectCommandBufferDescriptor *d = [MTLIndirectCommandBufferDescriptor new];
 	d.commandTypes = MTLIndirectCommandTypeDraw;
 	d.inheritPipelineState = inherit;
 	d.inheritBuffers = inherit;
-	d.maxVertexBufferBindCount = inherit ? 0 : 1;
-	d.maxFragmentBufferBindCount = inherit ? 0 : 1;
+	d.maxVertexBufferBindCount = inherit ? 0 : binds;
+	d.maxFragmentBufferBindCount = inherit ? 0 : binds;
 	id<MTLIndirectCommandBuffer> b =
 	    [gDevice newIndirectCommandBufferWithDescriptor:d
 	                                    maxCommandCount:count
@@ -357,9 +360,9 @@ static NSString *timeEncodes(NSUInteger calls, void (^encode)(void))
 
 // --- cases --------------------------------------------------------------------------------------
 
-static NSString *caseRender(void)
+static NSString *caseRender(NSUInteger binds)
 {
-	id<MTLIndirectCommandBuffer> b = drawBuffer(NO, gCommands);
+	id<MTLIndirectCommandBuffer> b = drawBuffer(NO, gCommands, binds);
 	NSString *t = timeEncodes(4, ^{
 	  encodeDraws(b, gCommands);
 	});
@@ -371,7 +374,7 @@ static NSString *caseRender(void)
 
 static NSString *caseInherit(void)
 {
-	id<MTLIndirectCommandBuffer> b = drawBuffer(YES, gCommands);
+	id<MTLIndirectCommandBuffer> b = drawBuffer(YES, gCommands, 0);
 	NSString *t = timeEncodes(1, ^{
 	  encodeInherited(b, gCommands);
 	});
@@ -432,7 +435,7 @@ static NSString *caseCompute(void)
 
 static NSString *caseReset(void)
 {
-	id<MTLIndirectCommandBuffer> b = drawBuffer(NO, gCommands);
+	id<MTLIndirectCommandBuffer> b = drawBuffer(NO, gCommands, 1);
 	double v[64];
 	const int reps = gReps < 64 ? gReps : 64;
 	for (int r = 0; r < reps; r++) {
@@ -593,7 +596,10 @@ int main(int argc, char **argv)
 			return 1;
 		}
 		runCase(@"render", ^{
-		  return caseRender();
+		  return caseRender(1);
+		});
+		runCase(@"wide", ^{
+		  return caseRender(31);
 		});
 		runCase(@"inherit", ^{
 		  return caseInherit();
