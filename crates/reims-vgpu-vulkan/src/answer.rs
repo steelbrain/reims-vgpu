@@ -611,6 +611,12 @@ pub fn created_or_decided<T>(
 ///   32, where the device filters with its largest (16), so a footprint more than 16 times as
 ///   long as it is wide reads a coarser level. Announced at the state's creation, which dies at
 ///   its selector;
+/// - `CappedLodBias`: a sampler state's `lodBias` on a device that presents an Intel or AMD Mac,
+///   past the device's `maxSamplerLodBias`, a NaN, or any bias on a device that withholds
+///   `samplerMipLodBias`, which the device samples with the bias within its limit (none for a NaN
+///   or where withheld), where the Mac's GPU adds the whole bias to each sample's level of detail
+///   (docs/graphics-kext/dgpu-oracle.md, Q14), so a sample can read another level. Announced at
+///   the state's creation, which dies at its selector;
 /// - `NotMipmappedAnisotropicSampler` and the note `NotMipmappedAnisotropicFilter`: on a device
 ///   that samples through Metal's own sampler (MoltenVK on Apple's GPU), a sampler state, or a
 ///   constexpr sampler a sample at an implicit level or with gradients goes through, with
@@ -1331,7 +1337,7 @@ pub fn created_or_decided<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 148] = [
+pub const DIES: [rt::Degradation; 149] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1388,6 +1394,7 @@ pub const DIES: [rt::Degradation; 148] = [
     rt::Degradation::SharedExponentKept,
     rt::Degradation::DeviceRoundedResolve,
     rt::Degradation::CappedAnisotropy,
+    rt::Degradation::CappedLodBias,
     rt::Degradation::NotMipmappedAnisotropicSampler,
     rt::Degradation::NotMipmappedAnisotropicFilter,
     rt::Degradation::CombinedArchiveStages,
