@@ -394,29 +394,92 @@ impl FunctionConstant {
     /// `bool`, `char`, `uchar`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`, `half` or
     /// `float` (Metal's compiler refuses the rest, `bfloat` among them).
     pub fn size_of(data_type: u32) -> Option<usize> {
+        Self::lanes(data_type).map(|(lane, lanes)| lane.size() * lanes)
+    }
+
+    /// The lanes of a function constant of `MTLDataType` `data_type`: their scalar type, and how
+    /// many (a `float3` has 3); `None` for a type no function constant takes ([`Self::size_of`]).
+    pub fn lanes(data_type: u32) -> Option<(ConstantLane, usize)> {
         // `MTLDataType` raw values (Metal's MTLDataType.h): each family's scalar, then its two-,
-        // three- and four-lane vectors, numbered in a row. The lane's size, and the scalar's value.
-        let (lane, scalar): (usize, u32) = match data_type {
-            3..=6 => (4, 3),    // Float
-            16..=19 => (2, 16), // Half
-            29..=32 => (4, 29), // Int
-            33..=36 => (4, 33), // UInt
-            37..=40 => (2, 37), // Short
-            41..=44 => (2, 41), // UShort
-            45..=48 => (1, 45), // Char
-            49..=52 => (1, 49), // UChar
-            53..=56 => (1, 53), // Bool
-            81..=84 => (8, 81), // Long
-            85..=88 => (8, 85), // ULong
+        // three- and four-lane vectors, numbered in a row. The lanes' type, and the scalar's value.
+        let (lane, scalar) = match data_type {
+            3..=6 => (ConstantLane::Float, 3),
+            16..=19 => (ConstantLane::Half, 16),
+            29..=32 => (ConstantLane::Int, 29),
+            33..=36 => (ConstantLane::UInt, 33),
+            37..=40 => (ConstantLane::Short, 37),
+            41..=44 => (ConstantLane::UShort, 41),
+            45..=48 => (ConstantLane::Char, 45),
+            49..=52 => (ConstantLane::UChar, 49),
+            53..=56 => (ConstantLane::Bool, 53),
+            81..=84 => (ConstantLane::Long, 81),
+            85..=88 => (ConstantLane::ULong, 85),
             _ => return None,
         };
-        Some(lane * usize::try_from(data_type - scalar + 1).ok()?)
+        Some((lane, usize::try_from(data_type - scalar + 1).ok()?))
     }
 
     /// The value's bytes, as many as `data_type` packs: `None` for a type no function constant
     /// takes ([`Self::size_of`]).
     pub fn bytes(&self) -> Option<&[u8]> {
         Self::size_of(self.data_type).and_then(|n| self.value.get(..n))
+    }
+}
+
+/// The scalar type of a function constant's lanes ([`FunctionConstant::lanes`]), each named as
+/// its `MTLDataType` is (`MTLDataTypeUInt`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConstantLane {
+    /// `float`, 32 bits.
+    Float,
+    /// `half`, 16 bits.
+    Half,
+    /// `int`, 32 bits.
+    Int,
+    /// `uint`, 32 bits.
+    UInt,
+    /// `short`, 16 bits.
+    Short,
+    /// `ushort`, 16 bits.
+    UShort,
+    /// `char`, 8 bits.
+    Char,
+    /// `uchar`, 8 bits.
+    UChar,
+    /// `bool`, a byte.
+    Bool,
+    /// `long`, 64 bits.
+    Long,
+    /// `ulong`, 64 bits.
+    ULong,
+}
+
+impl ConstantLane {
+    /// A lane's size in bytes.
+    pub fn size(self) -> usize {
+        match self {
+            ConstantLane::Char | ConstantLane::UChar | ConstantLane::Bool => 1,
+            ConstantLane::Half | ConstantLane::Short | ConstantLane::UShort => 2,
+            ConstantLane::Float | ConstantLane::Int | ConstantLane::UInt => 4,
+            ConstantLane::Long | ConstantLane::ULong => 8,
+        }
+    }
+
+    /// The name of its `MTLDataType` but the prefix (`UInt`); a vector's adds its lanes (`UInt2`).
+    pub fn name(self) -> &'static str {
+        match self {
+            ConstantLane::Float => "Float",
+            ConstantLane::Half => "Half",
+            ConstantLane::Int => "Int",
+            ConstantLane::UInt => "UInt",
+            ConstantLane::Short => "Short",
+            ConstantLane::UShort => "UShort",
+            ConstantLane::Char => "Char",
+            ConstantLane::UChar => "UChar",
+            ConstantLane::Bool => "Bool",
+            ConstantLane::Long => "Long",
+            ConstantLane::ULong => "ULong",
+        }
     }
 }
 

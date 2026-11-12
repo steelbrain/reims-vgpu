@@ -141,8 +141,8 @@ use reims_vgpu_vulkan::core::platform::device::GpuDevice;
 use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent};
 use reims_vgpu_vulkan::core::platform::os::clock::{Clock as _, MonoTime};
 use reims_vgpu_vulkan::core::platform::resource::{
-    Buffer, ComputePipeline, FunctionConstant, Heap, Library, RenderPipeline, SamplerState,
-    Texture as _,
+    Buffer, ComputePipeline, ConstantLane, FunctionConstant, Heap, Library, RenderPipeline,
+    SamplerState, Texture as _,
 };
 use reims_vgpu_vulkan::core::platform::types::{MtlSize, Swizzle};
 use reims_vgpu_vulkan::core::platform::values::{
@@ -4644,7 +4644,12 @@ pub(crate) fn compile_refusing<P: Platform>(
 }
 
 /// A pipeline create's functions, for the host's log: each stage's function name and the
-/// constants it is specialised with, then each linked function's.
+/// constants it is specialised with, then each linked function's. A constant reads
+/// `index:Type=value (bytes)`, its value as its lanes read it, little-endian (an integer's in hex,
+/// a float's in decimal in as few digits as read back to it, a bool's as `true` or `false`; a
+/// vector's lanes in parentheses), then its bytes in the order they come:
+/// `114:UInt=0x08000251 (51020008)`. One of a type no function constant takes reads
+/// `index:data_type=bytes`, its `MTLDataType`'s number and its bytes alone.
 pub(crate) struct PipelineFunctions(Vec<(&'static str, String, Vec<FunctionConstant>)>);
 
 impl std::fmt::Display for PipelineFunctions {
@@ -4658,15 +4663,78 @@ impl std::fmt::Display for PipelineFunctions {
                 if j > 0 {
                     f.write_str(" ")?;
                 }
-                write!(f, "{}:{}=", c.index, c.data_type)?;
-                for b in c.bytes().unwrap_or(&c.value) {
-                    write!(f, "{b:02x}")?;
-                }
+                write_constant(f, c)?;
             }
             f.write_str("]")?;
         }
         Ok(())
     }
+}
+
+/// A pipeline function's constant `c`, as [`PipelineFunctions`] reads it.
+fn write_constant(f: &mut std::fmt::Formatter<'_>, c: &FunctionConstant) -> std::fmt::Result {
+    let (Some((lane, lanes)), Some(bytes)) = (FunctionConstant::lanes(c.data_type), c.bytes())
+    else {
+        write!(f, "{}:{}=", c.index, c.data_type)?;
+        return write_hex(f, &c.value);
+    };
+    write!(f, "{}:{}", c.index, lane.name())?;
+    if lanes > 1 {
+        write!(f, "{lanes}")?;
+    }
+    f.write_str("=")?;
+    if lanes > 1 {
+        f.write_str("(")?;
+    }
+    for (at, bits) in bytes.chunks_exact(lane.size()).enumerate() {
+        if at > 0 {
+            f.write_str(", ")?;
+        }
+        write_lane(f, lane, bits)?;
+    }
+    if lanes > 1 {
+        f.write_str(")")?;
+    }
+    f.write_str(" (")?;
+    write_hex(f, bytes)?;
+    f.write_str(")")
+}
+
+/// `bytes` in hex, in the order they come.
+fn write_hex(f: &mut std::fmt::Formatter<'_>, bytes: &[u8]) -> std::fmt::Result {
+    bytes.iter().try_for_each(|b| write!(f, "{b:02x}"))
+}
+
+/// One lane of a function constant, `bits` its little-endian bytes, as [`PipelineFunctions`]
+/// reads it.
+fn write_lane(
+    f: &mut std::fmt::Formatter<'_>,
+    lane: ConstantLane,
+    bits: &[u8],
+) -> std::fmt::Result {
+    let mut le = [0u8; 8];
+    le[..bits.len()].copy_from_slice(bits);
+    let raw = u64::from_le_bytes(le);
+    match lane {
+        ConstantLane::Bool => write!(f, "{}", raw != 0),
+        ConstantLane::Float => write!(f, "{:?}", f32::from_bits(raw as u32)),
+        ConstantLane::Half => write!(f, "{:?}", half_to_f32(raw as u16)),
+        _ => write!(f, "{raw:#0width$x}", width = 2 + 2 * bits.len()),
+    }
+}
+
+/// The `float` an IEEE 754 binary16 `half` of bits `h` reads as, exactly.
+fn half_to_f32(h: u16) -> f32 {
+    let sign = u32::from(h & 0x8000) << 16;
+    let exponent = u32::from((h >> 10) & 0x1f);
+    let fraction = u32::from(h & 0x3ff);
+    let magnitude = match exponent {
+        // Zero or subnormal: the fraction times 2^-24.
+        0 => f32::from(h & 0x3ff) * f32::from_bits(0x3380_0000),
+        0x1f => f32::from_bits(0x7f80_0000 | (fraction << 13)),
+        _ => f32::from_bits(((exponent + 112) << 23) | (fraction << 13)),
+    };
+    f32::from_bits(magnitude.to_bits() | sign)
 }
 
 impl<P: Platform> PipelineJob<P> {
@@ -5651,6 +5719,59 @@ fn stencil(s: &RgfxStencilDescriptor) -> StencilDesc {
 
 #[cfg(test)]
 mod tests {
+
+    /// A pipeline's functions read each constant's value as its type's lanes read it,
+    /// little-endian, before its bytes in order: a `uint` in hex, a `float` in decimal, a vector's
+    /// lanes each (a `half2`, a `bool3`, a `short2`), and a type no constant takes by its number
+    /// and bytes alone
+    #[test]
+    fn a_pipeline_s_functions_read_each_constant_s_value_by_its_type() {
+        use reims_vgpu_vulkan::core::platform::resource::FunctionConstant;
+
+        let constant = |index: u32, data_type: u32, bytes: &[u8]| {
+            let mut value = [0; FunctionConstant::MAX_BYTES];
+            value[..bytes.len()].copy_from_slice(bytes);
+            FunctionConstant {
+                index,
+                data_type,
+                value,
+            }
+        };
+        let functions = super::PipelineFunctions(vec![
+            (
+                "vertex",
+                "vs".to_owned(),
+                vec![
+                    constant(114, 33, &[0x51, 0x02, 0x00, 0x08]), // UInt
+                    constant(2, 3, &1.5f32.to_le_bytes()),        // Float
+                ],
+            ),
+            (
+                "fragment",
+                "fs".to_owned(),
+                vec![
+                    constant(0, 17, &[0x00, 0x3c, 0x01, 0xc0]), // Half2: 1.0, -2.001953125 exactly
+                    constant(1, 55, &[1, 0, 1]),                // Bool3
+                    constant(3, 38, &[0xff, 0xff, 0x02, 0x00]), // Short2
+                    constant(4, 121, &[0x80, 0x3f]),            // BFloat
+                ],
+            ),
+        ]);
+        // A type no constant takes: all of the value's bytes, as before.
+        let bfloat = format!("803f{}", "00".repeat(FunctionConstant::MAX_BYTES - 2));
+        assert_eq!(
+            functions.to_string(),
+            format!(
+                "vertex \"vs\" [114:UInt=0x08000251 (51020008) 2:Float=1.5 (0000c03f)], \
+                 fragment \"fs\" [0:Half2=(1.0, -2.0019531) (003c01c0) \
+                 1:Bool3=(true, false, true) (010001) 3:Short2=(0xffff, 0x0002) (ffff0200) \
+                 4:121={bfloat}]"
+            )
+        );
+        assert_eq!(super::half_to_f32(0x0001), f32::from_bits(0x3380_0000));
+        assert_eq!(super::half_to_f32(0x7c00), f32::INFINITY);
+        assert!(super::half_to_f32(0x7e00).is_nan());
+    }
 
     /// A slow answer's line names the cache's planes and bytes, the copy it came with (its own,
     /// after the queues it waited for, or copies already in flight) and how it reaches the pages,
