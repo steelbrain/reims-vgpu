@@ -102,6 +102,9 @@ merge into staging of 2026-06-19), and upstream master is merged into it
 | `vmapple`'s AES engine resets as at power-on, its FIFO, keys, IVs and mode with its registers, and lowers its interrupt: the words a panicking macOS left in its FIFO otherwise led the next boot's first command, which failed as invalid ("AES Error: IntStatus 0x4") | `f9e5348a` |
 | the PL011's and the PL061's resets lower their interrupt lines: an in-kernel GIC (HVF's, KVM's) keeps a line's level across its own reset, so an interrupt raised in the last boot was otherwise pending again in the next, with nothing in the device behind it | `8b804b45` |
 | `vmapple` under KVM answers macOS's pointer authentication calls (SMCCC 0xC1000000 to 0xC10000FF) as HVF and TCG do: KVM passes them to QEMU, which writes NOT_SUPPORTED to x0 alone, where KVM's own answer also zeroes x1 to x3 and XNU keeps x3 of GET_DEFAULT_KEYS (launchd then died of a pointer authentication failure); and KVM's data aborts with no instruction syndrome (pair, writeback and SIMD&FP accesses, `KVM_EXIT_ARM_NISV`) are emulated by the ISV=0 emulator HVF used, now `target/arm/isv0-mmio.c`, in a strict mode that changes no register and leaves the external abort where QEMU has no device at the address (the first was our Ambrosia module's ECAM read `ldr w9, [x8, #16]!`, before `8e7e0aa71` wrote the module's and the arm64e kext's device accesses as plain loads and stores). HVF calls the moved emulator as before. Tested by the Asahi Linux experiment on an M2 Pro: macOS 27.2.1 under KVM passes check-boot's 14 checks with `84f164fff`'s module and kexts, and does so on a QEMU without the ISV=0 commits too, so neither they nor macOS's own code through the desktop and a Metal app took an ISV=0 abort | `bd5ac1ce`, `4dca14b4`, `89e32906`, `3892a92f` |
+| `usb-host` sets an interface's alternate setting (`libusb_set_interface_alt_setting`) on a thread-pool worker and completes the guest's SET_INTERFACE when the call returns, where it made the call holding the BQL; the device's other control requests, a reset, closing it and QEMU's exit wait for a call in flight ("x86-64 macOS guests: USB passthrough", below) | `e9e0fa81` |
+| `qemu-xhci` on a PCI Express bus sets HCCPARAMS1's LTC, with PCIe's LTR capability, and completes the Set Latency Tolerance Value command with Success, keeping its BELT; on conventional PCI it refuses the command with TRB Error as before. HCCPARAMS2 (offset 0x1c, xHCI 1.1) reads 0 | `b088ca98`, `ccbda5d6`, `926263c7` |
+| `qemu-xhci`'s interrupters moderate their interrupts as IMOD asks (xHCI 4.17.2): an interrupt asserts when a non-blocking event awaits, IMODC is 0 and the event handler is not busy, and loads IMODC with IMODI, 4000 (1 ms) from a reset | `2b08ac84`, `b8c465b8` |
 
 The branch's other commits are the apple-gfx work `eb36a099` removes, and
 `cbb749d421`, an HVF workaround that `481e881b5c` reverts, upstream having
@@ -670,6 +673,37 @@ high speed):
   another location and macOS mounts it again.
 - While the guest has it, QEMU takes it from the host's driver: its disk
   (`/dev/sda`) leaves the host, and comes back once the VM stops.
+
+**Measured** on a CachyOS host (kernel 7.3.3, Ryzen 7 7840HS) with the same
+guest, given a USB audio device served on the host's `vhci_hcd` (UAC2 at
+high speed, 1d6b:0101, two inputs and four outputs at 48 kHz, its output
+asynchronous with a feedback endpoint), on which a Core Audio IOProc ran
+three times for 5 s; QEMU at `8b804b45` (before the three rows above) and
+at `b8c465b8` (after), one boot each:
+- macOS sets the audio interfaces' alternate setting 1 as a stream starts
+  and 0 as it stops. Before, `usb-host` made each call holding the BQL: 0.2
+  to 2 ms for setting 1, and 0.2 to 6.9 ms for setting 0, the longest on
+  the output interface. QMP's round trip, sent 2 ms after each answer, took
+  5.5 ms while one of those calls ran, and 6.0 ms at most over 10,000 of
+  them. After, the calls take as long on a worker (0.2 to 4.5 ms), and the
+  longest of 10,000 round trips was 3.2 ms.
+- Between the two calls of each pair macOS sends Set Latency Tolerance
+  Value, with BELT 0x47a (about 125 µs) as a stream starts and 0x7d0 (about
+  1 ms) as it stops. Before, `qemu-xhci` refused each (an unimplemented command,
+  0x14, in its trace), and the guest's kernel logged
+  `AppleUSBXHCICommandRing::setLatencyTolerance: completed with result code
+  5`, TRB Error, six times; its read of HCCPARAMS2 was traced as
+  unimplemented too. After, every one completes with Success, and the guest
+  logs no such line.
+- macOS sets IMODI to 320 (80 µs) on interrupters 0, 1 and 3 to 7 and to
+  500 (125 µs) on interrupter 2, with IMODC 0, twice as its driver starts.
+- The IOProc ran 472, 471 and 471 times before, and 457, 472 and 470 times
+  after. 2.7 s into the after boot's first stream, the guest's `usbaudiod`
+  could not enqueue its feedback endpoint's transfers (0xe00002ee, a request
+  for a frame already past; `safeguardAgainstDelays timeDiff 43, threshold
+  64`) and restarted the stream, which stopped the IOProc for about 160 ms.
+  No call was in flight then and QEMU's main loop shows no stall; one boot of
+  each does not tell whether these changes have a part in it.
 
 **Unknown**: a guest's view of a device on a USB 3 port; whether macOS
 guests before 26 drive the controller with 14 ports as with 8.
