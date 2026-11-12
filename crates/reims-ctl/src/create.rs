@@ -9,8 +9,8 @@
 //! first: copy.rs) or used in place. A new disk needs an installer: one reims-util downloads from
 //! Apple (reims_util.rs), before the VM's directory is made, so a download stopped part way leaves
 //! no VM half made, or one given. An installer is used in place, except a DMG, which qemu-img
-//! converts to a raw image in the VM's directory ([`installer_media`]). A VM's settings name its
-//! graphics: reims-vgpu's own device unless the create chose another.
+//! converts to a raw image in the VM's directory, saying how far it is ([`installer_media`]). A
+//! VM's settings name its graphics: reims-vgpu's own device unless the create chose another.
 
 use crate::copy;
 use crate::host::{Host, Profile};
@@ -21,8 +21,10 @@ use crate::reims_util::{self, Download};
 use crate::vm::*;
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImportMode {
@@ -605,26 +607,16 @@ pub fn is_dmg(p: &Path) -> Result<bool> {
 /// The installed QEMU reads zlib DMGs (Apple's recovery images, as osrecovery.apple.com serves
 /// them, are); bzip2 and LZFSE ones only where it was built with their libraries, and LZMA and
 /// ADC ones never.
+///
+/// The conversion writes the whole raw image, which no reflink can make from a DMG, so it says so
+/// first with the image's size, then how far it is, as a long full copy does ([`copy`]).
 pub fn installer_media(src: &Path, dir: &Path, progress: &mut dyn FnMut(&str)) -> Result<PathBuf> {
     if !is_dmg(src)? {
         return Ok(src.to_path_buf());
     }
-    progress(&format!("converting {} to a raw image", file_name(src)));
     // Written beside the copy and renamed over it: a running VM may have it open.
     let part = dir.join(format!("{INSTALLER_COPY}.part"));
-    let converted = qemu_img(
-        Profile::Q35X86_64,
-        &[
-            "convert".as_ref(),
-            "-q".as_ref(),
-            "-f".as_ref(),
-            "dmg".as_ref(),
-            "-O".as_ref(),
-            "raw".as_ref(),
-            src.as_os_str(),
-            part.as_os_str(),
-        ],
-    );
+    let converted = convert_dmg(src, &part, progress);
     if let Err(e) = converted {
         let _ = std::fs::remove_file(&part);
         let e = format!("{e:#}");
@@ -643,6 +635,100 @@ pub fn installer_media(src: &Path, dir: &Path, progress: &mut dyn FnMut(&str)) -
     std::fs::rename(&part, dir.join(INSTALLER_COPY))
         .with_context(|| format!("rename {}", part.display()))?;
     Ok(PathBuf::from(INSTALLER_COPY))
+}
+
+/// Converts the DMG `src` to the raw image `dst` with qemu-img, telling `progress` the raw
+/// image's size and why it is written in full, then how far it is: each whole percent, at most
+/// once a second but for the first and the last.
+fn convert_dmg(src: &Path, dst: &Path, progress: &mut dyn FnMut(&str)) -> Result<()> {
+    let img = install::qemu_img(Profile::Q35X86_64)?;
+    let name = file_name(src);
+    let total = raw_size(&img, src);
+    let of = total
+        .map(|t| format!(" of {}", reims_util::size(t)))
+        .unwrap_or_default();
+    progress(&format!(
+        "converting {name} to a raw image{}, written in full: no reflink makes one from a DMG",
+        total
+            .map(|t| format!(", {}", reims_util::size(t)))
+            .unwrap_or_default()
+    ));
+    let mut child = Command::new(&img)
+        .args(["convert", "-p", "-f", "dmg", "-O", "raw"])
+        .arg(src)
+        .arg(dst)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("run {}", img.display()))?;
+    let stderr = child.stderr.take();
+    let err_thread = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(mut e) = stderr {
+            let _ = e.read_to_string(&mut s);
+        }
+        s
+    });
+    let mut shown: Option<(u64, Instant)> = None;
+    let mut out = child.stdout.take().context("qemu-img's output")?;
+    let (mut buf, mut line) = ([0u8; 256], Vec::new());
+    loop {
+        let n = match out.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        for &b in &buf[..n] {
+            if b != b'\r' && b != b'\n' {
+                line.push(b);
+                continue;
+            }
+            let Some(pct) = convert_percent(&String::from_utf8_lossy(&line)) else {
+                line.clear();
+                continue;
+            };
+            line.clear();
+            let due = match shown {
+                None => true,
+                Some((p, t)) => p != pct && (pct == 100 || t.elapsed() >= Duration::from_secs(1)),
+            };
+            if due {
+                shown = Some((pct, Instant::now()));
+                progress(&format!("converting {name} to a raw image: {pct}%{of}"));
+            }
+        }
+    }
+    let status = child.wait()?;
+    let err = err_thread.join().unwrap_or_default();
+    if !status.success() {
+        bail!("qemu-img failed: {}", err.trim());
+    }
+    Ok(())
+}
+
+/// The whole percent in a line of `qemu-img convert -p`'s progress, `    (12.50/100%)`.
+fn convert_percent(line: &str) -> Option<u64> {
+    let (done, rest) = line.trim().strip_prefix('(')?.split_once('/')?;
+    if rest != "100%)" {
+        return None;
+    }
+    let done: f64 = done.parse().ok()?;
+    Some(done.clamp(0.0, 100.0) as u64)
+}
+
+/// The size of the raw image of the DMG `src`, as qemu-img reads it, or None where it reads none.
+fn raw_size(img: &Path, src: &Path) -> Option<u64> {
+    let out = Command::new(img)
+        .args(["info", "--output=json", "-f", "dmg"])
+        .arg(src)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let info: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    info.get("virtual-size")?.as_u64()
 }
 
 /// OVMF's code and variables beside an OpenCore image of the user's, as reims-util writes them
@@ -701,6 +787,17 @@ mod tests {
         assert_eq!(config(&spec).network.ssh_port, None);
         spec.ssh_port = Some(2222);
         assert_eq!(config(&spec).network.ssh_port, Some(2222));
+    }
+
+    /// `qemu-img convert -p` prints its progress as `    (12.50/100%)`, each over the last.
+    #[test]
+    fn a_conversions_progress_is_read_as_whole_percents() {
+        assert_eq!(convert_percent("    (0.00/100%)"), Some(0));
+        assert_eq!(convert_percent("    (12.50/100%)"), Some(12));
+        assert_eq!(convert_percent("    (100.00/100%)"), Some(100));
+        assert_eq!(convert_percent(""), None);
+        assert_eq!(convert_percent("qemu-img: warning"), None);
+        assert_eq!(convert_percent("(5.00/50%)"), None);
     }
 
     #[test]
