@@ -9,7 +9,9 @@
 //! first byte, as many columns and rows as both the picture and the planes hold
 //! ([`super::crop_extent`]), and nothing past them, so a guest's planes hold the same bytes either
 //! way. It waits for the decode first, as the CPU's copy does, and the session signals the decode
-//! only once the copy is done on the GPU.
+//! only once the copy is done on the GPU, however long the GPU takes (the copier's wait has no
+//! bound of its own): a GPU slowed by other work slows the picture, as a Mac's does, and fails it
+//! only where the device is lost.
 //!
 //! Each session logs at its end how many pictures went this way, and their GPU time.
 
@@ -24,9 +26,6 @@ use reims_vgpu_vulkan::os::{CopyError, DmaBufPlane, PlaneCopier, PlaneCopy, Plan
 
 use super::super::video_host::{BackendError, OutputPlane};
 use super::{GpuCopier, GpuCopies, NAME, Room, crop_extent};
-
-/// How long a copy waits for the GPU: a picture's copy takes under a millisecond of it.
-const COPY_WAIT: Duration = Duration::from_secs(2);
 
 /// The copies of a runtime device's sessions.
 pub(super) struct RuntimeCopies {
@@ -134,7 +133,7 @@ impl GpuCopier<VulkanPlatform> for RuntimeCopier {
                 }
             })
             .collect();
-        match self.copier.copy(&copies, COPY_WAIT, Box::new(frame.hold())) {
+        match self.copier.copy(&copies, Box::new(frame.hold())) {
             Ok(gpu) => {
                 self.copied += 1;
                 if let Some(gpu) = gpu {

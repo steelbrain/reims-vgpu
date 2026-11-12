@@ -49,9 +49,11 @@ use zerocopy::FromBytes;
 use super::worker::Worker;
 use super::{GraphicsDecoder, ObjHandle, bad_reference, op_fault};
 
-/// How long a decode waits for its output's device cache to be filled: a copy of the surface's
-/// pages, a few milliseconds even across a slow bus.
-const FILL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a video op waits on the CPU for the host's own work on its surface's device cache
+/// before the log names the wait (diagnostics only): it waits on after
+/// ([`GraphicsDecoder::wait_for_cache`]). The work is a copy of the surface's pages, a few
+/// milliseconds even across a slow bus, unless the GPU stalls.
+const CACHE_WAIT_LOGGED: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The host's hardware video for a graphics device: the codecs it takes, which the device's video
 /// caps answer, and its sessions.
@@ -739,18 +741,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             cache_of(chroma_place.buffer_obj_id),
         );
         for block in luma_cache.into_iter().chain(chroma_cache) {
-            if !self.surface_caches.wait_filled(block, FILL_WAIT) {
-                return Err(op_fault(format_args!(
-                    "video op {tag:#06x}: its surface's device cache was not filled within \
-                     {FILL_WAIT:?}"
-                )));
-            }
-            if !self.surface_caches.wait_copied_out(block, FILL_WAIT) {
-                return Err(op_fault(format_args!(
-                    "video op {tag:#06x}: its surface's last picture was not copied into its \
-                     pages within {FILL_WAIT:?}"
-                )));
-            }
+            self.wait_for_cache(tag, block)?;
         }
         let plane = |place: PlanePlace, buffer, cache: Option<u64>| VideoPlane {
             buffer,
@@ -769,6 +760,57 @@ impl<P: Platform> GraphicsDecoder<P> {
             plane(luma_place, luma, luma_cache),
             plane(chroma_place, chroma, chroma_cache),
         ))
+    }
+
+    /// Waits on the calling thread, before the video op `tag` reads or writes the device cache of
+    /// the block at `block`, for the host's own work on it: the cache's last fill, then a copy of
+    /// its last picture into its pages still in flight. It waits as long as that takes, as a
+    /// Mac's video work waits for the GPU's earlier work on its surface, however slow: each ends
+    /// as the platform sees its command buffer complete, which it does on every path, failed
+    /// where the GPU faulted or its device was lost. A reset of the device ends the wait, as it
+    /// ends every wait of the decoder's ([`super::commit_order::Cancel`]), and the op faults. A
+    /// wait past [`CACHE_WAIT_LOGGED`] is named in the log, and again once it ends.
+    fn wait_for_cache(&self, tag: u16, block: u64) -> RaiseResult<()> {
+        use reims_vgpu_vulkan::core::platform::os::clock::Clock as _;
+
+        let cancel = &self.shared.commit_cancel;
+        let begun = cancel.now();
+        let clock = self.platform.clock();
+        let start = clock.now_mono();
+        let mut named = false;
+        let mut over = || {
+            if cancel.cut_since(begun) {
+                return true;
+            }
+            if !named && clock.now_mono().saturating_duration_since(start) >= CACHE_WAIT_LOGGED {
+                named = true;
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "video op {tag:#06x}: the host's work on its surface's device cache at \
+                     {block:#x} has not finished after {CACHE_WAIT_LOGGED:?}; it waits on"
+                );
+            }
+            false
+        };
+        let done = self.surface_caches.wait_filled(block, &mut over)
+            && self.surface_caches.wait_copied_out(block, &mut over);
+        if named {
+            log::info!(
+                target: "reims_vgpu::graphics",
+                "video op {tag:#06x}: the host's work on its surface's device cache at {block:#x} \
+                 {} after {:?}",
+                if done { "finished" } else { "was cut short by a reset" },
+                clock.now_mono().saturating_duration_since(start)
+            );
+        }
+        if done {
+            Ok(())
+        } else {
+            Err(op_fault(format_args!(
+                "video op {tag:#06x}: a reset of the device ended its wait for its surface's \
+                 device cache"
+            )))
+        }
     }
 
     /// The memory the buffer `obj_id`, `buffer`, lies in, as the host's video devices take it

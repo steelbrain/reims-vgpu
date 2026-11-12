@@ -102,7 +102,13 @@ command buffer of the session's process (`graphics/decode/video.rs`):
   takes the command buffer. It does not wait for the buffer's earlier encoders, since the
   guest's video driver encodes none before it. It does wait, on the CPU, for the buffers of
   other queues the command buffer runs after (its `SURFACE_ORDER`), so a decode whose output
-  another process still reads lands once that read is done.
+  another process still reads lands once that read is done. And it waits, on the CPU, for the
+  host's own work on an output's device cache, its last fill and a copy of its last picture into
+  the pages still in flight, as long as that takes, as a Mac's video work waits for the GPU's
+  earlier work on its surface: a GPU slowed by other work slows the picture and fails nothing.
+  Each ends as the platform sees its command buffer complete, failed where the device was lost;
+  only a reset of the device ends the wait sooner, faulting the op. A wait past 2 s is named in
+  the log.
 - **The access unit is read in place**, in the guest's buffer, where it starts and ends at the
   entry's `bitstream_alignment`; elsewhere the arm copies it. The parameter sets the op carries
   are handed to the decoder before the access unit.

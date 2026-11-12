@@ -23,8 +23,15 @@
 //!   waits for it on its fence before it returns, so the runtime's later work on the buffer,
 //!   which the caller orders after the return, reads the planes. Its GPU time is measured with two
 //!   timestamps where the queue's family writes them.
-//! - **A copy past its wait** is kept, with the caller's hold of the source (so the driver writes
-//!   nothing more into it), until its fence signals; the copier refuses copies meanwhile.
+//! - **The wait has no bound of its own**: a copy waits for the GPU however long it takes, as a
+//!   Mac's video work waits for its GPU, so a GPU slowed by other work slows the picture and does
+//!   not fail it. A GPU that hangs loses the device (an execution timeout, the Vulkan
+//!   specification's typical cause of a lost device), and a wait for a fence with the maximum
+//!   timeout returns in finite time once the device is lost, answering `VK_ERROR_DEVICE_LOST` or
+//!   success (the specification's "Lost Device").
+//! - **A copy whose fence answered an error** is kept, with the caller's hold of the source (so
+//!   the driver writes nothing more into it), until its fence signals; the copier refuses copies
+//!   meanwhile.
 //! - **Refusals** ([`CopyError::Refused`]) are made before anything is submitted, so the caller
 //!   lands the planes another way; a failure once submitted ([`CopyError::Failed`]) is not, since
 //!   the GPU may still write the buffer.
@@ -58,7 +65,7 @@ use crate::gpu::resource::VulkanBuffer;
 /// The most imports a copier keeps: the planes of the surfaces of a few pools of a decoder's.
 const MOST_IMPORTS: usize = 128;
 
-/// How long the copier's end waits for a copy kept past its wait.
+/// How long the copier's end waits for a copy kept after its fence answered an error.
 const LAST_WAIT: Duration = Duration::from_secs(1);
 
 /// A plane's format: its texels' components and bytes.
@@ -140,7 +147,7 @@ pub struct PlaneCopy<'a> {
 pub enum CopyError {
     /// Nothing was submitted: the planes are to land another way.
     Refused(String),
-    /// The copy was submitted and failed or ran past its wait: the GPU may write the buffers
+    /// The copy was submitted and its fence answered an error: the GPU may write the buffers
     /// still.
     Failed(String),
 }
@@ -164,8 +171,8 @@ struct Import {
     used: u64,
 }
 
-/// A copy past its wait, kept until its fence signals, with the caller's hold of its sources and
-/// the buffers it writes.
+/// A copy whose fence answered an error, kept until its fence signals, with the caller's hold of
+/// its sources and the buffers it writes.
 struct Pending {
     _hold: Box<dyn Any + Send>,
     _targets: Vec<VulkanBuffer>,
@@ -213,15 +220,15 @@ impl PlaneCopier {
         })
     }
 
-    /// Copies each of `copies` (module docs) and waits up to `wait` for the GPU: `Ok` with the
-    /// copies' GPU time where the queue measures it, once every plane is in its buffer. Past the
-    /// wait the copy is kept with `hold`, which keeps the sources unwritten, until its fence
-    /// signals ([`CopyError::Failed`]). Where the device recovered since the copier's objects
-    /// were made, they are destroyed and made again on its new `VkDevice` first.
+    /// Copies each of `copies` (module docs) and waits for the GPU as long as it takes: `Ok` with
+    /// the copies' GPU time where the queue measures it, once every plane is in its buffer. Where
+    /// the fence answers an error, the device lost, the copy is kept with `hold`, which keeps the
+    /// sources unwritten, until its fence signals ([`CopyError::Failed`]). Where the device
+    /// recovered since the copier's objects were made, they are destroyed and made again on its
+    /// new `VkDevice` first.
     pub fn copy(
         &mut self,
         copies: &[PlaneCopy<'_>],
-        wait: Duration,
         hold: Box<dyn Any + Send>,
     ) -> Result<Option<Duration>, CopyError> {
         if rt::process_exiting() {
@@ -245,7 +252,7 @@ impl PlaneCopier {
         let Some(objects) = self.objects.as_mut() else {
             return Err(CopyError::Refused("the copier has no objects".to_owned()));
         };
-        objects.copy(&self.queue, copies, wait, hold)
+        objects.copy(&self.queue, copies, hold)
     }
 
     /// The generations of the device the copier made its objects on: 1, and one more each time
@@ -350,7 +357,6 @@ impl Objects {
         &mut self,
         queue: &rt::CommandQueue,
         copies: &[PlaneCopy<'_>],
-        wait: Duration,
         hold: Box<dyn Any + Send>,
     ) -> Result<Option<Duration>, CopyError> {
         let device = self.generation.device().clone();
@@ -413,19 +419,12 @@ impl Objects {
             _hold: hold,
             _targets: copies.iter().map(|copy| copy.to.clone_ref()).collect(),
         };
-        let nanos = u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX);
+        // No bound of its own (module docs): the maximum timeout, `u64::MAX` nanoseconds.
         // SAFETY: the fence is this copier's.
-        let waited =
-            device.with_loader_word(|| unsafe { vk_device.wait_for_fences(&[fence], true, nanos) });
+        let waited = device
+            .with_loader_word(|| unsafe { vk_device.wait_for_fences(&[fence], true, u64::MAX) });
         match waited {
             Ok(()) => {}
-            Err(vk::Result::TIMEOUT) => {
-                self.pending = Some(pending(hold));
-                return Err(CopyError::Failed(format!(
-                    "the GPU had not copied the planes {:.0} ms on",
-                    wait.as_secs_f64() * 1e3
-                )));
-            }
             Err(e) => {
                 self.pending = Some(pending(hold));
                 return Err(CopyError::Failed(format!("its fence answered {e}")));
@@ -950,13 +949,12 @@ mod tests {
             }
             Err(why) => panic!("no copier: {why}"),
         };
-        let wait = Duration::from_secs(5);
-        assert!(copier.copy(&[], wait, Box::new(())).is_ok());
+        assert!(copier.copy(&[], Box::new(())).is_ok());
         let first = made_on(&copier);
         assert_eq!(copier.generations(), 1);
 
         device.raw.recover_for_test().expect("the recovery");
-        assert!(copier.copy(&[], wait, Box::new(())).is_ok());
+        assert!(copier.copy(&[], Box::new(())).is_ok());
         assert_eq!(copier.generations(), 2);
         assert_ne!(
             made_on(&copier),
@@ -966,7 +964,7 @@ mod tests {
         let objects = copier.objects.as_ref().expect("the copier's objects");
         assert!(objects.generation.serves(&copier.queue));
         assert!(objects.generation.is_of(device.raw.new_fence().device()));
-        assert!(copier.copy(&[], wait, Box::new(())).is_ok());
+        assert!(copier.copy(&[], Box::new(())).is_ok());
         assert_eq!(copier.generations(), 2, "made again once");
     }
 }

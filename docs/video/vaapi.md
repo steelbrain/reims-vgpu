@@ -433,7 +433,10 @@ the render node of the runtime device's own GPU, whatever its vendor
      (reims-vgpu's `src/graphics/vaapi/gpu_copy.rs`, the Vulkan
      platform's `PlaneCopier`). It writes the crop the CPU's copy writes,
      and nothing past it (`crop_extent`), once the decode is done, and the
-     session signals the decode once the copy is done on the GPU. A device
+     session signals the decode once the copy is done on the GPU, however
+     long the GPU takes: the copier's wait for its fence has no bound of its
+     own, so a GPU slowed by other work slows the picture, and only a lost
+     device fails it. A device
      that lists none of the dma-buf image extensions, an export not of a
      layer a plane, or a plane in a buffer whose GPU writes do not reach
      its memory, declines it;

@@ -623,19 +623,20 @@ impl Landing {
         }
     }
 
-    /// Waits for the copy to land, about `timeout` at most, in slices of at most
-    /// [`FILL_WAIT_SLICE`] each woken at once by its landing, as a fill's wait does
-    /// ([`Fills::wait`]); whether it landed.
-    fn wait(&self, timeout: std::time::Duration) -> bool {
-        let slice = FILL_WAIT_SLICE.min(timeout);
-        let mut slices = (timeout.as_micros() / slice.as_micros().max(1)).max(1);
+    /// Waits for the copy to land, in slices of [`FILL_WAIT_SLICE`] each woken at once by its
+    /// landing, until `over` answers true after a slice it did not land in ([`Over`]), as a
+    /// fill's wait does ([`Fills::wait`]); whether it landed.
+    fn wait(&self, over: Over<'_>) -> bool {
         let mut waiting = self.waiting.lock();
         while waiting.is_some() {
-            if slices == 0 {
+            if self
+                .landed
+                .wait_for(&mut waiting, FILL_WAIT_SLICE)
+                .timed_out()
+                && waiting.is_some()
+                && MutexGuard::unlocked(&mut waiting, &mut *over)
+            {
                 return false;
-            }
-            if self.landed.wait_for(&mut waiting, slice).timed_out() {
-                slices -= 1;
             }
         }
         true
@@ -815,9 +816,26 @@ impl<P: Platform> Transfer<P> {
     }
 }
 
-/// The longest a wait for a fill sleeps at once ([`Fills::wait`]): the slices count the wait's
-/// timeout with no clock read; a fill's end wakes it at once.
+/// The longest a wait for a fill or a copy sleeps at once ([`Fills::wait`], [`Landing::wait`]):
+/// the work's end wakes it at once, and after a slice the work did not end in the wait asks
+/// whether to go on ([`Over`]).
 const FILL_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// What ends a CPU wait for the host's own work on a cache before the work is done: asked, with
+/// no lock of the wait's held, after each slice of [`FILL_WAIT_SLICE`] the work did not end in,
+/// and true to end the wait. A video op's wait goes on until a reset of the device
+/// (`super::video`), a timed wait until its slices are spent ([`after`]).
+pub(crate) type Over<'a> = &'a mut dyn FnMut() -> bool;
+
+/// An end ([`Over`]) for a wait of about `timeout`, counted in slices of [`FILL_WAIT_SLICE`] with
+/// no clock read.
+fn after(timeout: std::time::Duration) -> impl FnMut() -> bool {
+    let mut left = (timeout.as_micros() / FILL_WAIT_SLICE.as_micros()).max(1);
+    move || {
+        left = left.saturating_sub(1);
+        left == 0
+    }
+}
 
 /// What is told as a fill finishes: the host's presents that wait for one ([`FillWait`]).
 pub(crate) type FillHook = Arc<dyn Fn() + Send + Sync>;
@@ -851,18 +869,17 @@ impl Fills {
         }
     }
 
-    /// Waits for the fill that signals `value`, about `timeout` at most, in slices of at most
-    /// [`FILL_WAIT_SLICE`] each woken at once by a fill's end; whether it finished.
-    fn wait(&self, value: u64, timeout: std::time::Duration) -> bool {
-        let slice = FILL_WAIT_SLICE.min(timeout);
-        let mut slices = (timeout.as_micros() / slice.as_micros().max(1)).max(1);
+    /// Waits for the fill that signals `value`, in slices of [`FILL_WAIT_SLICE`] each woken at
+    /// once by a fill's end, until `over` answers true after a slice it did not finish in
+    /// ([`Over`]); whether it finished.
+    fn wait(&self, value: u64, over: Over<'_>) -> bool {
         let mut guard = self.lock.lock();
         while !self.reached(value) {
-            if slices == 0 {
+            if self.moved.wait_for(&mut guard, FILL_WAIT_SLICE).timed_out()
+                && !self.reached(value)
+                && MutexGuard::unlocked(&mut guard, &mut *over)
+            {
                 return false;
-            }
-            if self.moved.wait_for(&mut guard, slice).timed_out() {
-                slices -= 1;
             }
         }
         true
@@ -889,15 +906,16 @@ impl FillWait {
         }
     }
 
-    /// Waits for the fill on the calling thread, with no lock of the caches' held: for its make
-    /// as long as it takes, as a begin waited for the command buffers it follows, then for its
-    /// work about `timeout` at most ([`Fills::wait`]); whether it finished.
-    fn wait(&self, timeout: std::time::Duration) -> bool {
+    /// Waits for the fill on the calling thread, with no lock of the caches' held: for its make,
+    /// as a begin waited for the command buffers it follows, then for its work
+    /// ([`Fills::wait`]), each until `over` answers true ([`Over`]); whether it finished.
+    fn wait(&self, over: Over<'_>) -> bool {
         match self {
-            FillWait::At { fills, value } => fills.wait(*value, timeout),
-            FillWait::Deferred(filled) => match filled.wait_made() {
-                Some((fills, value)) => fills.wait(value, timeout),
-                None => true,
+            FillWait::At { fills, value } => fills.wait(*value, over),
+            FillWait::Deferred(filled) => match filled.wait_made(over) {
+                Some(Some((fills, value))) => fills.wait(value, over),
+                Some(None) => true,
+                None => false,
             },
         }
     }
@@ -1237,14 +1255,21 @@ impl DeferredFill {
         }
     }
 
-    /// Waits, with no lock of the caches' held, until it is made: the wait for its fill.
-    fn wait_made(&self) -> Option<FillMade> {
+    /// Waits, with no lock of the caches' held, until it is made, in slices of
+    /// [`FILL_WAIT_SLICE`] each woken at once by its make, or `over` answers true after a slice
+    /// it was not made in ([`Over`]): the wait for its fill once made, `None` where it was not.
+    fn wait_made(&self, over: Over<'_>) -> Option<Option<FillMade>> {
         let mut made = self.made.lock();
         loop {
             if let Some(fill) = &*made {
-                return fill.clone();
+                return Some(fill.clone());
             }
-            self.moved.wait(&mut made);
+            if self.moved.wait_for(&mut made, FILL_WAIT_SLICE).timed_out()
+                && made.is_none()
+                && MutexGuard::unlocked(&mut made, &mut *over)
+            {
+                return None;
+            }
         }
     }
 }
@@ -4305,9 +4330,10 @@ impl<P: Platform> Caches<P> {
     /// with no lock held, woken as the platform sees the fill done: for work the host starts
     /// outside a command buffer that writes the cache, which a command buffer's wait does not
     /// order. A deferred fill is waited for until it is made, as a begin waited for the command
-    /// buffers before it (counted, [`CacheCounts::cpu_waits`]), and then `timeout` at most, as a
-    /// fill made is. True where it is done, or the block has no cache or no fill.
-    pub(crate) fn wait_filled(&self, block: u64, timeout: std::time::Duration) -> bool {
+    /// buffers before it (counted, [`CacheCounts::cpu_waits`]), and then as a fill made is; each
+    /// until `over` answers true ([`Over`]). True where it is done, or the block has no cache or
+    /// no fill.
+    pub(crate) fn wait_filled(&self, block: u64, over: Over<'_>) -> bool {
         let fill = {
             let mut state = self.state.lock();
             let fill = state.last_fill(block);
@@ -4318,19 +4344,20 @@ impl<P: Platform> Caches<P> {
             }
             fill
         };
-        fill.is_none_or(|fill| fill.wait(timeout))
+        fill.is_none_or(|fill| fill.wait(over))
     }
 
     /// Waits, on the calling thread, for an early copy of the block at `block`'s cache into its
-    /// pages still in flight to land ([`SurfaceCaches::early_copies`]), `timeout` at most, with
-    /// no lock held, woken as it lands: for work the host starts outside a command buffer that
-    /// writes the cache, which a command buffer's wait does not order, so the copy never reads
-    /// what it writes. True where it landed, or the block has no cache or no copy in flight.
-    pub(crate) fn wait_copied_out(&self, block: u64, timeout: std::time::Duration) -> bool {
+    /// pages still in flight to land ([`SurfaceCaches::early_copies`]), until `over` answers true
+    /// ([`Over`]), with no lock held, woken as it lands: for work the host starts outside a
+    /// command buffer that writes the cache, which a command buffer's wait does not order, so the
+    /// copy never reads what it writes. True where it landed, or the block has no cache or no
+    /// copy in flight.
+    pub(crate) fn wait_copied_out(&self, block: u64, over: Over<'_>) -> bool {
         let landing = (self.state.lock().by_block.get(&block))
             .and_then(|cache| cache.read_back.copy.as_ref())
             .map(|copy| Arc::clone(&copy.landing));
-        landing.is_none_or(|landing| landing.wait(timeout))
+        landing.is_none_or(|landing| landing.wait(over))
     }
 
     /// Waits, on the calling thread, for every copy of a cache into the pages of host addresses
@@ -4344,7 +4371,7 @@ impl<P: Platform> Caches<P> {
         timeout: std::time::Duration,
     ) -> bool {
         let landings = self.state.lock().copies_into(runs);
-        landings.iter().all(|landing| landing.wait(timeout))
+        (landings.iter()).all(|landing| landing.wait(&mut after(timeout)))
     }
 }
 
@@ -5464,28 +5491,29 @@ mod tests {
     #[test]
     fn a_wait_for_a_fill_ends_once_it_is_done() {
         let mut r = cached();
-        let short = std::time::Duration::from_millis(1);
+        // A slice's wait.
+        let mut short = || true;
         assert!(
-            !r.dec.surface_caches.wait_filled(BLOCK, short),
+            !r.dec.surface_caches.wait_filled(BLOCK, &mut short),
             "the make's fill runs"
         );
         assert!(
-            r.dec.surface_caches.wait_filled(BLOCK + 0x8000, short),
+            r.dec.surface_caches.wait_filled(BLOCK + 0x8000, &mut short),
             "no cache"
         );
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(
-            r.dec.surface_caches.wait_filled(BLOCK, short),
+            r.dec.surface_caches.wait_filled(BLOCK, &mut short),
             "the make's fill is done"
         );
         use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, false)]);
         assert!(
-            !r.dec.surface_caches.wait_filled(BLOCK, short),
+            !r.dec.surface_caches.wait_filled(BLOCK, &mut short),
             "the fill runs"
         );
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(
-            r.dec.surface_caches.wait_filled(BLOCK, short),
+            r.dec.surface_caches.wait_filled(BLOCK, &mut short),
             "the fill is done"
         );
     }
@@ -10117,9 +10145,9 @@ mod tests {
         let mark = r.p.call_log().mark();
         decode_into(&r, 7, &queue);
         let early = events(&r.p.call_log().since(mark), SIGNAL)[1];
-        let wait = std::time::Duration::from_millis(20);
+        let mut wait = after(std::time::Duration::from_millis(20));
         assert!(
-            !r.dec.surface_caches.wait_copied_out(BLOCK, wait),
+            !r.dec.surface_caches.wait_copied_out(BLOCK, &mut wait),
             "in flight"
         );
 
@@ -10129,7 +10157,10 @@ mod tests {
         assert_eq!(events(&calls, WAIT), [early], "after the copy, on the GPU");
         assert!(copies(&calls).is_empty());
         r.p.world().complete_all(CompleteOn::Caller);
-        assert!(r.dec.surface_caches.wait_copied_out(BLOCK, wait), "landed");
+        assert!(
+            r.dec.surface_caches.wait_copied_out(BLOCK, &mut || true),
+            "landed"
+        );
 
         // The lock after that write downloads it, the only one since the early copy: read back
         // again, and an early copy in flight at the release.

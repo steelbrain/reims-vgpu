@@ -4373,6 +4373,83 @@ mod tests {
         assert_eq!(r.dec.caches().counts().fills, 1);
     }
 
+    /// A decode whose output's device cache is still being filled waits for the fill as long as
+    /// it takes, as a Mac's video work waits for its GPU's earlier work on its surface: held past
+    /// 2 s on the platform's clock, the wait is named in the log and goes on, and once the fill is
+    /// done the picture lands in the cache and the command buffer is taken
+    #[test]
+    fn a_decode_waits_for_its_outputs_fill_however_long_it_takes() {
+        let (mut r, seen) = cached_video();
+        // The first use fills the cache, and the fill is held.
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &writes_cached_video(100, 1, false))
+                .unwrap(),
+            Ok(())
+        );
+        let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
+        let message = writes_cached_video(101, 2, true);
+        let p = Arc::clone(&r.p);
+        let mut walker = r.dec.sender(None, super::super::Sinks::default());
+        std::thread::scope(|scope| {
+            let walk = scope.spawn(|| walker.decode(&p.device(), &message).unwrap());
+            let mut lines = Vec::new();
+            let named = |lines: &[reims_vgpu_vulkan::core::testkit::logs::Line]| {
+                (lines.iter()).any(|(level, _, line)| {
+                    *level == log::Level::Warn && line.contains("has not finished after 2s")
+                })
+            };
+            // The platform's clock moves on, a second at a time, until the log names the wait.
+            for _ in 0..1000 {
+                lines.extend(logs.take());
+                if named(&lines) {
+                    break;
+                }
+                p.virtual_clock().advance(std::time::Duration::from_secs(1));
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(named(&lines), "the wait is named: {lines:?}");
+            p.virtual_clock()
+                .advance(std::time::Duration::from_secs(60));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(
+                !walk.is_finished() && seen.decodes.lock().is_empty(),
+                "the decode waits for the fill"
+            );
+            p.world().complete_all(CompleteOn::Caller);
+            assert_eq!(walk.join().unwrap(), Ok(()));
+        });
+        assert_eq!(*seen.cached.lock(), [[true, true]], "into the cache");
+    }
+
+    /// A reset of the device ends a decode's wait for its output's fill, as it ends every wait
+    /// of the decoder's, so none holds the reset up: the op faults its command buffer, and the
+    /// session is handed nothing
+    #[test]
+    fn a_reset_ends_a_decodes_wait_for_its_outputs_fill() {
+        let (mut r, seen) = cached_video();
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &writes_cached_video(100, 1, false))
+                .unwrap(),
+            Ok(())
+        );
+        let message = writes_cached_video(101, 2, true);
+        let p = Arc::clone(&r.p);
+        let decoders = r.dec.decoders();
+        let mut walker = r.dec.sender(None, super::super::Sinks::default());
+        std::thread::scope(|scope| {
+            let walk = scope.spawn(|| walker.decode(&p.device(), &message));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!walk.is_finished(), "the decode waits for the fill");
+            decoders.resetting();
+            assert!(walk.join().unwrap().is_err(), "the op faults");
+        });
+        decoders.reset_done();
+        assert!(seen.decodes.lock().is_empty());
+        p.world().complete_all(CompleteOn::Caller);
+    }
+
     /// A decoder's output that its client locks to read each picture is copied into its pages
     /// behind the next decode into it, by a command buffer of the host's committed on the
     /// decode's own queue right after it, and the lock's download that follows copies nothing
