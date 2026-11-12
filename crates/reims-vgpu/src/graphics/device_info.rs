@@ -302,7 +302,6 @@ fn cap_apple_families(identity: &mut IdentityCaps, wired: &[Piece]) {
 /// | `supportsFamily:` of Metal4 | no | the `MTL4` API: its command queues and buffers, argument tables, compiler and allocators |
 /// | `supportsRaytracing`, `supportsRaytracingFromRender`, `supportsPrimitiveMotionBlur` | no | acceleration structures, their builds, and intersection function tables |
 /// | `supportsFunctionPointersFromRender` | no, as the AMD Radeon Pro 5300M answers | a render pipeline's visible function tables and function handles: the lane carries a compute pipeline's alone |
-/// | `supportsDynamicLibraries` | no | nothing of the lane's: it carries a compute pipeline's dynamic libraries, each install name read in the guest's process; the answer waits on the platform's switch that loads no dynamic library from a file of the host's, which a name the guest did not send would be read from |
 /// | `supportsRenderDynamicLibraries` | no, as the AMD Radeon Pro 5300M answers | a render pipeline's preloaded and linked dynamic libraries: the lane carries a compute pipeline's alone |
 /// | `supportsPlacementSparse` | no | placement sparse buffers and textures |
 /// | `supportsCounterSampling:` | no, at every point | counter sample buffers |
@@ -360,7 +359,6 @@ fn lane(mut identity: IdentityCaps, compile_threads: u64, guest_ram: Option<u64>
         &mut f.supports_raytracing_from_render,
         &mut f.supports_primitive_motion_blur,
         &mut f.supports_function_pointers_from_render,
-        &mut f.supports_dynamic_libraries,
         &mut f.supports_render_dynamic_libraries,
         &mut f.supports_placement_sparse,
     ] {
@@ -902,9 +900,13 @@ mod tests {
         );
         // is_low_power, then is_headless, is_removable, has_unified_memory.
         assert_eq!(info.identity_flags[..4], [1, 0, 0, 0]);
-        // supports_bc_texture_compression is the platform's yes; raytracing (13) the lane's no;
-        // function pointers (14) the platform's yes, but from a render pipeline (15) the lane's no.
+        // supports_bc_texture_compression is the platform's yes; dynamic libraries (11) the
+        // platform's yes, but a render pipeline's (12) the lane's no; raytracing (13) the lane's
+        // no; function pointers (14) the platform's yes, but from a render pipeline (15) the
+        // lane's no.
         assert_eq!(info.identity_flags[7], 1);
+        assert_eq!(info.identity_flags[11], 1);
+        assert_eq!(info.identity_flags[12], 0);
         assert_eq!(info.identity_flags[13], 0);
         assert_eq!(info.identity_flags[14], 1);
         assert_eq!(info.identity_flags[15], 0);
