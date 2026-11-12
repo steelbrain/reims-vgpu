@@ -91,9 +91,9 @@ private:
 using RgfxBodyBlock = RgfxMessageBlock;
 
 /// A queue's blocks for the messages of its command buffers too large for its ring: one taken
-/// as the message outgrows the ring (RgfxEncoder::setMessageBlocks), or at the commit, given
-/// back at the completion (the host read the message out of it before it ran the buffer), or as
-/// a buffer no completion comes for goes, and reused by a later such buffer, so the block stays
+/// at the commit, the message copied into it (RgfxEncoder::finish), given back at the completion
+/// (the host read the message out of it before it ran the buffer), or as a buffer no completion
+/// comes for goes, and reused by a later such buffer, so the block stays
 /// the process's, and in its window, with no kext call per buffer. A block is a power of two of
 /// at least kGranule bytes. The pool keeps every block given back, as the upload pool keeps its
 /// chunks, and a take reuses the smallest free one that holds the message: so of each size it

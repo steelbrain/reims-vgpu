@@ -10853,9 +10853,9 @@ void test_command_buffer_out_of_line()
 	CHECK(h.size == sizeof(RgfxCommandBufferInRegion));
 	RgfxCommandBufferInRegion ref = {};
 	std::memcpy(&ref, bytes.data(), sizeof(ref));
-	// Built in the block once it outgrew the ring, after the room a commit's surface uses take.
-	CHECK(blocks.allocated.size() == 1 && ref.region_offset > blocks.allocated[0] &&
-	      ref.region_offset + ref.byte_length <= blocks.allocated[0] + RgfxBodyPool::kGranule);
+	// Copied into the block at the commit, from its start.
+	CHECK(blocks.allocated.size() == 1 && ref.region_offset == blocks.allocated[0] &&
+	      ref.byte_length <= RgfxBodyPool::kGranule);
 	CHECK(ref.byte_length > 2048 && ref.byte_length % 8 == 0 && ref.region_offset % 8 == 0);
 
 	// The block holds the whole message: a COMMAND_BUFFER of that length, seqno 0, its ops.

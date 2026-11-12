@@ -2780,11 +2780,17 @@ A command buffer too large for half its queue's submission ring goes out of
 line: the whole `COMMAND_BUFFER` message lies in a block of the process's own,
 from its queue's pool, and the ring carries a `COMMAND_BUFFER_IN_REGION`
 (region offset and length).
-- The bundle builds the message on its own heap while it fits half the ring.
-- When it outgrows that, the message moves once into a block as large as the
-  queue's recent largest message, and doubles from block to block after that.
+- The bundle builds the message on its own heap, write-back memory, whatever
+  its size. When it outgrows half the ring, its buffer grows at once to the
+  queue's recent largest message, and doubles after that.
 - The header and the commit's `SURFACE_USE` ops go into room kept before the
-  ops, so the commit posts the block with no copy.
+  ops, so they move nothing.
+- At the commit, the whole message is copied once into a block of the pool,
+  from the block's start. It is not built there: the block is write-combined
+  where the kext maps it so, and on an AMD host, which applies the guest's
+  memory type, a write-combined store still pending stalls the encoding
+  thread's next locked instruction (an app's retain or release among them) by
+  about 90 ns (`RgfxEncoder.hpp`).
 
 The queue's service thread copies the message out of the block once, as it
 does a ring's, with the reference's seqno, and the host walks and commits the

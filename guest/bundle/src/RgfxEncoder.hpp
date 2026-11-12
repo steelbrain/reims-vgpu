@@ -112,12 +112,18 @@ struct RgfxRenderTargetSize {
 /// at a time, between a `begin*` and `endEncoder`; the op methods are called while
 /// the matching encoder is open, as the host's walk expects (`decode::cmdbuf`).
 ///
-/// The message is written once, where it is posted from: a buffer of the builder's own while
-/// it fits its queue's ring, else, once it outgrows the ring, a block of the queue's region
-/// pool (setMessageBlocks), where it grows by doubling and from which the host reads it with no
-/// copy of the guest's. Each op takes its whole length at once (a pointer bump) and is stored
-/// with fixed-size copies. Room before the header takes the SURFACE_USE ops a commit puts
-/// first (prependSurfaceUses), so they move nothing.
+/// The message is built in a buffer of the builder's own, write-back memory, and posted from
+/// there on its queue's ring where it fits, else copied once, whole, into a block of the queue's
+/// region pool (setMessageBlocks), which the ring names. It is not built in the block: the
+/// block is write-combined where the kext maps it so, and on an AMD host, which applies the
+/// guest's memory type, a write-combined store still pending stalls the thread's next locked
+/// instruction until it drains, about 90 ns: measured with encode_probe on a 26.7.2 guest of a
+/// Ryzen host (RTX 3090), a message built in its block cost setRenderPipelineState 108 ns a call
+/// and a setVertexBuffer between a CFRetain and a CFRelease 103 ns, against 21.6 and 17.1 ns
+/// built in the builder's buffer; and a block is read back as it grows, uncached. Each op takes
+/// its whole length at once (a pointer bump) and is stored with fixed-size copies. Room before
+/// the header takes the SURFACE_USE ops a commit puts first (prependSurfaceUses), so they move
+/// nothing.
 ///
 /// A segment (SegmentOf) is a stream of ops alone, with no header: a parallel render pass's
 /// sub-encoder writes one of its own, on its own thread, and the pass joins them into its
@@ -147,14 +153,15 @@ public:
 	RgfxEncoder(const RgfxEncoder &) = delete;
 	RgfxEncoder &operator=(const RgfxEncoder &) = delete;
 
-	/// Where the message moves once it no longer fits the ring: `blocks`, taking a block of at
-	/// least `hint` bytes first (the queue's guess of the message's size). A message starts in
-	/// a buffer of the builder's own whatever the guess, so one that fits the ring rides it; it
-	/// is copied once, when it outgrows the ring, at most the ring's half.
+	/// Where the message is copied at the commit where it does not fit the ring: a block of
+	/// `blocks`. The builder's buffer grows to `hint` bytes (the queue's guess of the message's
+	/// size) as the message outgrows the ring, so a large one is not copied at each doubling; it
+	/// starts no larger than the ring's half whatever the guess, so one that fits the ring rides
+	/// it.
 	void setMessageBlocks(std::shared_ptr<RgfxMessageBlocks> blocks, uint64_t hint)
 	{
 		m_blocks = std::move(blocks);
-		m_blockHint = hint;
+		m_sizeHint = hint;
 	}
 
 	// --- framing --------------------------------------------------------------
@@ -526,8 +533,8 @@ public:
 
 	/// Sets `op_bytes` and posts the command buffer, waiting for room
 	/// (RgfxRingWriter::post, `whileWaiting` called as it waits): on the ring where the message
-	/// fits it (fitsRing()), else as a COMMAND_BUFFER_IN_REGION naming its block, the one it was
-	/// built in, or one taken now from setMessageBlocks's pool, into which it is copied. The
+	/// fits it (fitsRing()), else as a COMMAND_BUFFER_IN_REGION naming a block taken now from
+	/// setMessageBlocks's pool, into which it is copied, the message from the block's start. The
 	/// block must stay the process's until the buffer completes: it goes to `*held` (when not
 	/// null) before the message is posted, whether or not the post succeeds, and its holder
 	/// gives it back to the pool then; else the builder holds it until it goes. Returns whether the message was posted: false for one no block could be had for,
@@ -550,7 +557,8 @@ public:
 		return static_cast<size_t>(m_end - m_ops) + RGFX_COMMAND_BUFFER_OPS_OFFSET + m_prefix;
 	}
 
-	/// Whether the message is being built in a block of the region pool (setMessageBlocks).
+	/// Whether the builder holds the block of the region pool its finished message was copied
+	/// into (finish, with no holder given).
 	bool inBlock() const { return m_inBlock; }
 
 	/// The op-stream bytes appended so far (the message size less the header).
@@ -730,14 +738,9 @@ private:
 		else if (tail != 0)
 			std::memcpy(at + RGFX_OP_BODY_OFFSET + head_n, elems, tail);
 	}
-	// Makes room for `n` more bytes: a larger buffer of the builder's own, or a block of the
-	// region pool once the message outgrows the ring, its bytes so far copied there once.
+	// Makes room for `n` more bytes: a larger buffer of the builder's own, the bytes so far
+	// moved there.
 	void grow(size_t n);
-	// Moves the bytes so far to a block of at least `size` bytes; false, nothing moved, where
-	// none was had.
-	bool moveToBlock(size_t size);
-	// Moves the bytes so far to a buffer of the builder's own of `size` bytes.
-	void moveToHeap(size_t size);
 	// Gives back the block the builder holds, if any.
 	void giveBackBlock();
 	// A video decode op of `tag`: its header, the `n` bytes of its body at `body`, then the
@@ -758,10 +761,11 @@ private:
 
 	RgfxRingWriter *m_ring; // null for a segment
 	RgfxCommandBuffer m_head;
-	// The storage: a buffer of the builder's own (malloc) or a region block (m_inBlock), from
-	// m_store, m_end the end; the op stream from m_ops (kHeadroom and the header before it,
-	// none for a segment) to m_cur. The surface uses and the surface order put first lie in the
-	// m_prefix bytes before m_ops (prependRoom).
+	// The storage: a buffer of the builder's own (malloc), or after finish the region block the
+	// message was copied into (m_inBlock), from m_store, m_end the end; the op stream from m_ops
+	// (kHeadroom and the header before it in the builder's buffer, the header alone in the
+	// block, none for a segment) to m_cur. The surface uses and the surface order put first lie
+	// in the m_prefix bytes before m_ops (prependRoom).
 	uint8_t *m_store = nullptr;
 	uint8_t *m_ops = nullptr;
 	uint8_t *m_cur = nullptr;
@@ -770,7 +774,7 @@ private:
 	bool m_inBlock = false;
 	RgfxMessageBlock m_block = {};
 	std::shared_ptr<RgfxMessageBlocks> m_blocks;
-	uint64_t m_blockHint = 0;
+	uint64_t m_sizeHint = 0;
 	uint32_t m_renderStateSet = 0;
 	uint64_t m_keepStamp;
 	std::vector<std::shared_ptr<void>> m_surfaceWrites;

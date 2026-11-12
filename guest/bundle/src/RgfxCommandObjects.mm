@@ -1841,8 +1841,8 @@ enum RgfxStage : unsigned {
 		cb->_profilingEnabled.store([queue isProfilingEnabled]);
 		const uint32_t reserve = queue.rgfxMessageReserve;
 		cb->_encoder = new RgfxEncoder(*ring, queue.rgfxObjId, cbObjId, reserve);
-		// Past its ring, the message is built in a block of the queue's pool, the size of the
-		// queue's recent largest first.
+		// Past its ring, the message grows to the size of the queue's recent largest at once, and
+		// goes into a block of the queue's pool at the commit.
 		cb->_encoder->setMessageBlocks([queue rgfxBodyPool], reserve);
 		// One with unretained references keeps them too, though it answers retainedReferences
 		// NO: the host must not drop an object before a buffer that names it has run.

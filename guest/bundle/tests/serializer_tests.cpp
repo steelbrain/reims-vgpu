@@ -1682,11 +1682,12 @@ struct TestBlocks final : RgfxMessageBlocks {
 	void giveBack(const RgfxMessageBlock &block) override { given.push_back(block); }
 };
 
-// A command buffer's message is built where it is posted from: on the ring while it fits half of
-// it, else in a block, which it moves to once as it outgrows the ring and grows from by doubling,
-// and which the COMMAND_BUFFER_IN_REGION names, the whole COMMAND_BUFFER in it; the block goes to
-// whoever holds the posted message, the ones it outgrew back to the pool. The surface uses a
-// commit puts first lead the op stream, in the order put, before every op, however many.
+// A command buffer's message is built in the builder's own buffer and posted from it on the ring
+// while it fits half of it, else copied at the commit into one block, from its start, which the
+// COMMAND_BUFFER_IN_REGION names, the whole COMMAND_BUFFER in it; the block goes to whoever holds
+// the posted message. The buffer grows to the queue's guess as the message outgrows the ring.
+// The surface uses a commit puts first lead the op stream, in the order put, before every op,
+// however many.
 void test_command_buffer_storage()
 {
 	TestRing ring(0x1000); // up to 2 KiB a message on the ring
@@ -1748,35 +1749,43 @@ void test_command_buffer_storage()
 		CHECK(blocks->taken.empty());
 	}
 
-	// Past the ring: built in a block from the op that outgrows it, grown block to block, the
-	// outgrown ones back to the pool; more uses than the room before the header move the ops.
+	// Past the ring: built in the builder's buffer, which grows to the guess at the op that
+	// outgrows the ring and doubles past it, with no block taken; more uses than the room before
+	// the header move the ops; the commit copies the message into one block, from its start.
 	{
 		RgfxEncoder enc(writer, 1, 3, 0x100);
-		enc.setMessageBlocks(blocks, 0);
+		enc.setMessageBlocks(blocks, 0x10000);
 		enc.beginBlitPass();
 		int fills = 0;
-		while (!enc.inBlock()) {
+		auto fill = [&enc, &fills] {
 			enc.blitFillBuffer(static_cast<RgfxObjId>(fills), 0, 4, 1);
 			fills++;
-		}
-		CHECK(blocks->taken.size() == 1 && fills > 2048 / 48 && fills < 4096 / 32);
-		for (; fills < 5000; fills++) // 5000 fills of 40 bytes: 200 KB, past one 64 KiB block
-			enc.blitFillBuffer(static_cast<RgfxObjId>(fills), 0, 4, 1);
+		};
+		while (enc.fitsRing())
+			fill();
+		CHECK(fills > 2048 / 48 && fills < 4096 / 32);
+		// Its first growth past the ring takes the guess at once.
+		const size_t fitted = enc.capacity();
+		while (enc.capacity() == fitted)
+			fill();
+		CHECK(fitted < 0x10000 && enc.capacity() >= 0x10000);
+		while (fills < 5000) // 5000 fills of 40 bytes: 200 KB, past the 64 KiB guess
+			fill();
 		enc.endEncoder();
-		CHECK(blocks->taken.size() == 3 && blocks->given.size() == 2);
+		CHECK(blocks->taken.empty() && !enc.inBlock());
 		std::vector<RgfxOpSurfaceUse> u = uses(100, 1000);
 		enc.prependSurfaceUses(u.data(), u.size());
 		uint64_t seqno = 0;
 		RgfxMessageBlock held = {};
 		CHECK(enc.finish(&seqno, {}, {}, &held));
-		CHECK(held.ptr == blocks->taken.back().ptr && blocks->given.size() == 2);
+		CHECK(blocks->taken.size() == 1 && held.ptr == blocks->taken.back().ptr &&
+		      blocks->given.empty() && !enc.inBlock());
 		RgfxMsgHeader h = {};
 		std::vector<uint8_t> bytes;
 		CHECK(ring.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER_IN_REGION);
 		RgfxCommandBufferInRegion ref = {};
 		std::memcpy(&ref, bytes.data(), sizeof(ref));
-		CHECK(ref.region_offset >= held.offset && ref.region_offset % 8 == 0 &&
-		      ref.region_offset + ref.byte_length <= held.offset + held.size);
+		CHECK(ref.region_offset == held.offset && ref.byte_length <= held.size);
 		const uint8_t *message = blocks->mem.data() + ref.region_offset;
 		RgfxCommandBuffer cb = {};
 		std::memcpy(&cb, message, sizeof(cb));
@@ -1805,9 +1814,9 @@ void test_command_buffer_storage()
 		for (int i = 0; i < 200; i++)
 			enc.blitFillBuffer(9, 0, 4, 1);
 		enc.endEncoder();
-		CHECK(!enc.inBlock() && enc.messageSize() > 2048);
+		CHECK(!enc.fitsRing() && enc.messageSize() > 2048);
 		RgfxMessageBlock held = {};
-		CHECK(!enc.finish(nullptr, {}, {}, &held) && held.ptr == nullptr);
+		CHECK(!enc.finish(nullptr, {}, {}, &held) && held.ptr == nullptr && !enc.inBlock());
 		RgfxMsgHeader h = {};
 		std::vector<uint8_t> bytes;
 		CHECK(!ring.next(&h, &bytes));

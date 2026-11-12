@@ -1686,10 +1686,11 @@ void test_no_copy_write_backs_land_at_the_take()
 }
 
 // A command buffer let go with no completion gives back the region block its message lies in, as
-// its completion does: one encoded past what its queue's ring takes and never committed, and one
-// posted out of line on a queue whose completion ring nothing reads. Buffer after buffer reuse
-// one block, and the queue's going gives it back to the region. (A buffer let go so used to keep
-// its block, and the region lost one a buffer.)
+// its completion does: one posted out of line on a queue whose completion ring nothing reads.
+// Buffer after buffer reuse one block, and the queue's going gives it back to the region; one
+// encoded past what its queue's ring takes and never committed takes none, its message copied
+// into a block only at the commit. (A buffer let go so used to keep its block, and the region
+// lost one a buffer.)
 void test_buffers_let_go_give_their_blocks_back()
 {
 	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x400000, 0);
@@ -1719,7 +1720,7 @@ void test_buffers_let_go_give_their_blocks_back()
 				(void)encode();
 			}
 		}
-		CHECK(blocks.made <= 1);
+		CHECK(blocks.made == 0);
 		for (int i = 0; i < n; i++) {
 			@autoreleasepool {
 				id<MTLCommandBuffer> cb = encode();
