@@ -4968,6 +4968,146 @@ fn a_queue_s_buffers_are_walked_at_once_and_committed_in_order() {
     }
 }
 
+/// Sends `n` command buffers that bind process 1's sampler 4 on its queue `queue_obj_id` through
+/// `ring`, their `cb_obj_id`s from `first`, at seqnos from `seqno`.
+fn send_sampler_buffers(
+    device: &GraphicsDevice<FakePlatform>,
+    ring: &mut QueueRing,
+    queue_obj_id: u64,
+    (first, seqno): (u64, u64),
+    n: u64,
+) {
+    for at in 0..n {
+        let message = sampler_command_buffer(queue_obj_id, first + at, obj(1, 4));
+        ring.send(device, at_seqno(message, seqno + at));
+    }
+}
+
+/// The platform's command buffers committed and not completed, waited for until there are `n`,
+/// are in the order their buffers were begun: the fake platform numbers its objects as it makes
+/// them, and a buffer's command buffer is made at its begin.
+fn committed_in_begin_order(platform: &FakePlatform, n: usize) {
+    let ids = committed(platform, n);
+    let mut sorted = ids.clone();
+    sorted.sort_unstable_by_key(|id| id.0);
+    assert_eq!(ids, sorted, "committed out of the order they were begun");
+}
+
+/// Every command buffer of a queue sent behind one whose walk is held is walked beside it, more
+/// than a lane walks at once ([`decode::LANE_THREADS`]), as each walked waits for its turn and a
+/// walk waiting so is not among them (`decode`'s `lane`); and none of them is committed before
+/// the held one, nor out of the order they came. They complete in that order
+#[test]
+fn every_buffer_behind_a_held_walk_is_walked_beside_it_and_committed_in_turn() {
+    const BEHIND: u64 = 3 * decode::LANE_THREADS as u64;
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, mut ring) = one_queue(&raised);
+    let gate = WalkGate::on(&device);
+    send_sampler_buffers(&device, &mut ring, obj(1, 1), (100, 1), 1);
+    assert!(gate.reached(), "the first walk did not start");
+    send_sampler_buffers(&device, &mut ring, obj(1, 1), (101, 2), BEHIND);
+    assert!(
+        gate.passed(3 * BEHIND as u32),
+        "{} ops of the buffers behind the held walk were walked beside it",
+        gate.passed.load(Ordering::SeqCst)
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        platform.world().committed().is_empty(),
+        "a buffer walked beside the held one was committed before it"
+    );
+    gate.open();
+    committed_in_begin_order(&platform, 1 + BEHIND as usize);
+    for cb in 100..=100 + BEHIND {
+        assert!(complete_until_event(&platform, &mut ring), "no completion");
+        let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+        assert_eq!((done.cb_obj_id, done.status), (cb, RGFX_CB_OK));
+    }
+}
+
+/// A queue's lane holds [`decode::LANE_MOST`] threads at most, whatever count the guest's queue
+/// was made with (`QUEUE_CREATE` carries none): of the buffers sent behind a held walk, the
+/// first `LANE_MOST - 1` are walked beside it and the rest wait to start, and all are committed in
+/// the order they came, once the held one is
+#[test]
+fn a_queue_s_buffers_past_its_lane_s_most_threads_wait_to_start_and_commit_in_turn() {
+    const WALKED: u64 = decode::LANE_MOST as u64 - 1;
+    const BEHIND: u64 = WALKED + 8;
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, mut ring) = one_queue(&raised);
+    let gate = WalkGate::on(&device);
+    send_sampler_buffers(&device, &mut ring, obj(1, 1), (100, 1), 1);
+    assert!(gate.reached(), "the first walk did not start");
+    send_sampler_buffers(&device, &mut ring, obj(1, 1), (101, 2), BEHIND);
+    assert!(
+        gate.passed(3 * WALKED as u32),
+        "{} ops of the buffers behind the held walk were walked beside it",
+        gate.passed.load(Ordering::SeqCst)
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        gate.passed.load(Ordering::SeqCst),
+        3 * WALKED as u32,
+        "the lane walked past its most threads"
+    );
+    assert!(platform.world().committed().is_empty());
+    gate.open();
+    committed_in_begin_order(&platform, 1 + BEHIND as usize);
+    for cb in 100..=100 + BEHIND {
+        assert!(complete_until_event(&platform, &mut ring), "no completion");
+        let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+        assert_eq!((done.cb_obj_id, done.status), (cb, RGFX_CB_OK));
+    }
+}
+
+/// The buffers of a process's other queue sent after its answered buffer, whose walk is held,
+/// are all walked beside it, more than a lane walks at once, as each waits for the answered
+/// buffer's ticket and a walk waiting so is not among them (`decode`'s `lane`); and every one is
+/// committed after the answered buffer, in the order they came
+#[test]
+fn a_process_s_buffers_behind_its_held_answered_one_are_walked_and_committed_after_it() {
+    const BEHIND: u64 = 3 * decode::LANE_THREADS as u64;
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, [mut held, mut beside, _]) = two_processes(&raised);
+    let gate = WalkGate::on(&device);
+    held.send(
+        &device,
+        at_seqno(
+            with_ask(sampler_command_buffer(obj(1, 1), 100, obj(1, 4))),
+            1,
+        ),
+    );
+    assert!(gate.reached(), "the answered walk did not start");
+    assert_eq!(
+        ring_events(&platform, &mut held, 1),
+        [(RGFX_EVT_CB_SUBMITTED, 100, 0)]
+    );
+    send_sampler_buffers(&device, &mut beside, obj(1, 2), (300, 1), BEHIND);
+    assert!(
+        gate.passed(3 * BEHIND as u32),
+        "{} ops of the other queue's buffers were walked beside the held one",
+        gate.passed.load(Ordering::SeqCst)
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        platform.world().committed().is_empty(),
+        "a buffer sent after the answer was committed before the answered one"
+    );
+    gate.open();
+    committed_in_begin_order(&platform, 1 + BEHIND as usize);
+    assert_eq!(
+        ring_events(&platform, &mut held, 1),
+        [(RGFX_EVT_CB_COMPLETE, 100, u64::from(RGFX_CB_OK))]
+    );
+    let completes: Vec<_> = (300..300 + BEHIND)
+        .map(|cb| (RGFX_EVT_CB_COMPLETE, cb, u64::from(RGFX_CB_OK)))
+        .collect();
+    assert_eq!(
+        ring_events(&platform, &mut beside, BEHIND as usize),
+        completes
+    );
+}
+
 /// What a drain of small command buffers costs the device's own threads, from the first one's
 /// doorbell write to the last one's `CB_COMPLETE`, on the fake platform, whose commits and
 /// completions cost next to nothing, the queue's thread asleep before each drain: a lone buffer,

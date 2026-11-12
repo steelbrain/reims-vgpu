@@ -1441,10 +1441,21 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// Waits, with no lock held, for the turns in its queue's lane before the command buffer's
-    /// (one taken before it), where it has one ([`super::lane`]).
+    /// (one taken before it), where it has one ([`super::lane`]), as a wait of its lane's job
+    /// ([`Self::waiting`]).
     pub(crate) fn wait_turn(&self) {
         if let Some(turn) = self.turn.borrow().as_ref() {
-            turn.wait();
+            turn.lane().waiting(|| turn.wait());
+        }
+    }
+
+    /// Runs `wait`, a wait of the command buffer's for what is committed before it, where it has a
+    /// turn in its queue's lane as a wait of the lane's job ([`Lane::waiting`]): the lane starts
+    /// its next buffer's walk meanwhile.
+    fn waiting<R>(&self, wait: impl FnOnce() -> R) -> R {
+        match self.lane() {
+            Some(lane) => lane.waiting(wait),
+            None => wait(),
         }
     }
 
@@ -1769,7 +1780,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         // its context whose parts are out, where its own are not ([`super::split`]).
         self.wait_to_commit();
         let under_way = match (&split_hold, self.context) {
-            (None, Some(context)) => Some(self.shared.split_gate.commit(context)),
+            (None, Some(context)) => Some(self.waiting(|| self.shared.split_gate.commit(context))),
             _ => None,
         };
         match uses {
@@ -1982,22 +1993,25 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// its queue taken before it ([`super::lane`]), every buffer of its context answered
     /// `CB_SUBMITTED` before its begin, and its context's range messages that came before its begin
     /// ([`super::sequencer`]); then after the buffers of its process's other queues its
-    /// `COMMIT_ORDER` names ([`super::commit_order`]).
+    /// `COMMIT_ORDER` names ([`super::commit_order`]); as a wait of its lane's job
+    /// ([`Self::waiting`]).
     fn wait_to_commit(&self) {
-        self.wait_turn();
-        let sequencer = &self.shared.sequencer;
-        if let Some(mark) = self.mark.get() {
-            sequencer.wait_for(self.context, mark);
-        }
-        if let (Some(context), Some(Some(asked))) = (self.context, self.ranges.get()) {
-            sequencer.wait_for_ranges(context, asked);
-        }
-        let after = std::mem::take(&mut *self.commit_after.borrow_mut());
-        if !after.is_empty() {
-            let own = (self.committed.borrow().as_ref()).map(|(marks, _)| Arc::clone(marks));
-            let cancel = &self.shared.commit_cancel;
-            super::commit_order::wait(&after, own.as_deref(), cancel, Until::Committed);
-        }
+        self.waiting(|| {
+            self.wait_turn();
+            let sequencer = &self.shared.sequencer;
+            if let Some(mark) = self.mark.get() {
+                sequencer.wait_for(self.context, mark);
+            }
+            if let (Some(context), Some(Some(asked))) = (self.context, self.ranges.get()) {
+                sequencer.wait_for_ranges(context, asked);
+            }
+            let after = std::mem::take(&mut *self.commit_after.borrow_mut());
+            if !after.is_empty() {
+                let own = (self.committed.borrow().as_ref()).map(|(marks, _)| Arc::clone(marks));
+                let cancel = &self.shared.commit_cancel;
+                super::commit_order::wait(&after, own.as_deref(), cancel, Until::Committed);
+            }
+        });
     }
 
     /// The `CB_SCHEDULED` of command buffer `cb_obj_id`, at `seqno`, where there is a sink: posted

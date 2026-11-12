@@ -3358,10 +3358,19 @@ commit. Each outcome the new design allows is one of those two:
   oldest of the device: the waits end, by induction on the begin order. A
   buffer carried out on its service thread is its lane's oldest unfinished
   one, and the lane gets no job while it runs. A
-  job that comes while every thread of the lane is busy gets another, up to
-  four a lane, only where the device-wide budget of twice the host's cores has
-  one free, which a lane never waits for. So 2048 busy queues hold one thread
-  each and the budget's at most. A job goes to the thread that went idle last,
+  job that comes while every thread of the lane is busy gets another, only
+  where the device-wide budget has one free, which a lane never waits for. At
+  most four of a lane's jobs walk at once; a job that waits for what is
+  committed before its buffer (its turn, its tickets, the buffers its
+  `COMMIT_ORDER` names, a split of its context) is not among them while it
+  waits, so the lane starts its next job meanwhile, up to 64 threads a lane,
+  as many command buffers as the host's queue holds uncompleted. The budget is
+  twice the host's cores and 64 more, for a busy queue's buffers walked ahead
+  of their turns. So 2048 busy queues hold one thread each and the budget's at
+  most. The waits are the same and where they were, so the commits, records
+  and interrupts are too; only how far the walks run ahead changed. A job
+  held back by the four is later than every job started, so it holds none of
+  their waits. A job goes to the thread that went idle last,
   and a thread goes after 10 s with no job, the budget's before the lane's
   own: the threads a burst made go 10 s after it, while a steady load's stay
   through its pauses and jobs that come one at a time stay on one thread
@@ -3371,13 +3380,20 @@ commit. Each outcome the new design allows is one of those two:
   floor; no thread is bound to a CPU). Tested through the device
   by
   `a_queue_s_buffers_are_walked_at_once_and_committed_in_order`,
-  `a_buffer_behind_one_that_waits_and_is_still_walked_is_answered_at_its_scheduling`
+  `every_buffer_behind_a_held_walk_is_walked_beside_it_and_committed_in_turn`,
+  `a_queue_s_buffers_past_its_lane_s_most_threads_wait_to_start_and_commit_in_turn`,
+  `a_process_s_buffers_behind_its_held_answered_one_are_walked_and_committed_after_it`,
+  `a_buffer_behind_one_that_waits_and_is_still_walked_is_answered_at_its_scheduling`,
   `a_video_buffer_is_walked_in_its_turn` and
   `a_lone_video_buffer_is_walked_on_its_queue_s_service_thread`
   (`graphics/tests.rs`), and by the lane's
   `a_turn_waits_for_every_turn_before_it`,
   `a_turn_is_next_once_every_turn_before_it_has_passed`,
+  `many_waiting_turns_each_go_in_their_turn`,
   `a_lane_runs_its_jobs_at_once_on_the_budget_s_threads`,
+  `a_lane_starts_its_next_jobs_while_its_jobs_wait`,
+  `a_lane_of_waiting_jobs_holds_lane_most_threads_at_most`,
+  `a_wait_off_the_lane_s_threads_or_inside_another_is_the_wait_alone`,
   `a_lane_with_no_budget_left_runs_its_jobs_on_its_own_thread_in_order`,
   `busy_lanes_hold_one_thread_each_and_the_budget_s`,
   `a_burst_s_threads_go_while_jobs_come_one_at_a_time`,

@@ -206,6 +206,8 @@ pub use video::{
 };
 
 pub(crate) use cmdbuf::Begun;
+#[cfg(test)]
+pub(crate) use lane::{LANE_MOST, LANE_THREADS};
 use lane::{Lane, Turn};
 #[cfg(test)]
 pub(crate) use library::tests::{metallib as test_metallib, sha as test_sha};
