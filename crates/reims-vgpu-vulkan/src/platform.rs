@@ -339,6 +339,14 @@ pub fn present_mac_class(class: rt::MacClass) -> Option<rt::MacClass> {
 /// of Mac the process's devices present ([`present_mac_class`]). One set, so the runtime keeps one
 /// device per physical device across `open_device` and every other open.
 ///
+/// **No library file opened.** The device opens no file a library's install names name
+/// (`load_no_dynamic_library_file`). The install names come from the guest's library bytes, so
+/// without it a pipeline's creation would read whatever host path the guest named: `/dev/zero`
+/// until the process ran out of memory, a FIFO that blocks a compile for good, a device whose
+/// open has effects of its own. A function whose import no library the device was handed
+/// supplies fails to make its pipeline as Metal's undefined symbols (code 2 of
+/// [`crate::gpu::states`]'s refusals).
+///
 /// **GPU times from the host.** No command buffer writes GPU timestamps: its `GPUStartTime` is the
 /// host time its submission ended (`kernelEndTime`, or its queue's latest GPU end before it,
 /// where later, so a queue's command buffers do not overlap) and its `GPUEndTime` the host time
@@ -355,6 +363,7 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
         let mut options = rt::DeviceOptions::default();
         crate::os::add_window_extensions(&mut options);
         options.gpu_times_from_host = true;
+        options.load_no_dynamic_library_file = true;
         options.mac_class = *MAC_CLASS.get_or_init(|| None);
         options.policy = exact_policy(std::env::var("REIMS_VGPU_EXACT").ok().as_deref());
         if crate::answer::strict_process() {
@@ -999,6 +1008,15 @@ pub(crate) mod tests {
     fn the_shader_cache_holds_25_gib() {
         assert_eq!(rt::DEFAULT_CAPACITY, 25 << 30);
         assert_eq!(device_options().shader_cache.capacity, 1 << 30);
+    }
+
+    /// Every device opens no file a library's install names name, which come from the guest's
+    /// bytes ([`device_options`], "No library file opened"), where the runtime's default opens
+    /// them as Metal does.
+    #[test]
+    fn no_device_opens_a_file_a_library_names() {
+        assert!(!rt::DeviceOptions::default().load_no_dynamic_library_file);
+        assert!(device_options().load_no_dynamic_library_file);
     }
 
     /// The variable naming what [`the_process_s_mac_class_is_fixed_by_its_first_declaration`]'s

@@ -792,7 +792,9 @@ fn answers<P: crate::core::platform::Platform>(
 /// its install name exporting another symbol, or no file there) is the `NSError` at every
 /// creator, of Metal's code, the runtime's domain and its text; the functions beside them
 /// that Metal makes are made (a fragment's program-scope `threads_per_simdgroup` among them).
-/// Metal's answers are compared on the host
+/// Metal's answers are compared on the host, but one: an import the library at its install
+/// name's file exports, which Metal makes, is code 2 here, as the device opens no file a
+/// library names (`platform::device_options`, "No library file opened")
 #[test]
 fn refusals_metal_answers_are_its_nserror_codes() {
     let d = dev();
@@ -840,7 +842,8 @@ fn refusals_metal_answers_are_its_nserror_codes() {
             ]
             .as_slice(),
         ),
-        (&ext[..], imports, &[Ok(()); 3]),
+        // Metal loads the exporting library from its install name's file; the device opens none.
+        (&ext[..], imports, &[Err(2); 3]),
         (&other[..], imports, &[Err(2); 3]),
         (&absent[..], imports, &[Err(2); 3]),
     ];
