@@ -1765,6 +1765,75 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             }
         }
     }
+
+    /// The pages of the pages block at `block` of the sender's (the module doc), which a message
+    /// names with `block_size`, where the host reads and writes them in place
+    /// (`ICB_SLOTS_IN_PAGES`): in the guest's RAM for a block of one run, as a heap over the block
+    /// lies, else in the block's view, made here where it is not yet. A block the sender does not
+    /// hold is a guest protocol error; one that is no pages block of its context's, or whose view
+    /// is not made, is refused.
+    pub(super) fn own_pages(
+        &self,
+        device: &P::Device,
+        block: u64,
+        block_size: u64,
+    ) -> RaiseResult<Result<OwnPages<P>, super::DecodeError>> {
+        if !self.in_own_block(block, block_size) {
+            return Ok(Err(super::DecodeError::BadReference));
+        }
+        // Its block's `SURFACE_PAGES` is carried out on the surface worker.
+        self.settle_surface(block);
+        let ram = (self.shared.surface_views.lock()).private_ram(block, block_size, self.context);
+        if let Some((at, length)) = ram {
+            return Ok(Ok(OwnPages {
+                at,
+                length,
+                _view: None,
+            }));
+        }
+        let view = SurfaceViews::private_view(
+            &self.shared.surface_views,
+            &*self.platform,
+            device,
+            block,
+            block_size,
+            self.context,
+        )?;
+        Ok(match view {
+            Some(view) => Ok(OwnPages {
+                at: view.base(),
+                length: view.length(),
+                _view: Some(view),
+            }),
+            None => Err(super::DecodeError::Refused),
+        })
+    }
+}
+
+/// Where a pages block's pages lie in the host ([`GraphicsDecoder::own_pages`]): in the guest's
+/// RAM mapping, which stays mapped as long as the device, or in the block's view, which this
+/// holds, so it stays mapped while they are read.
+///
+/// [`GraphicsDecoder::own_pages`]: super::GraphicsDecoder::own_pages
+pub(super) struct OwnPages<P: Platform> {
+    at: HostPtr,
+    length: u64,
+    _view: Option<Arc<SurfaceView<P>>>,
+}
+
+impl<P: Platform> OwnPages<P> {
+    /// The pages' first byte.
+    pub(super) fn at(&self) -> HostPtr {
+        self.at
+    }
+
+    /// Whether `len` bytes from `offset` in the pages lie in them, `offset` 8-aligned.
+    pub(super) fn holds(&self, offset: u64, len: u64) -> bool {
+        offset.is_multiple_of(8)
+            && offset
+                .checked_add(len)
+                .is_some_and(|end| end <= self.length)
+    }
 }
 
 #[cfg(test)]

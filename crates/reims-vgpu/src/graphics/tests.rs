@@ -8638,8 +8638,9 @@ fn a_release_the_platform_dies_at_is_refused() {
     assert_eq!(device.decoder_object_count(), 1);
 }
 
-/// With a memory map the device carries out `SURFACE_PAGES`, and `PAGES_BUFFERS` and
-/// `HEAP_OVER_PAGES` over it, and says so in `FEATURES_LO`: to every guest where the host's page is
+/// With a memory map the device carries out `SURFACE_PAGES`, and `PAGES_BUFFERS`,
+/// `HEAP_OVER_PAGES` and `ICB_SLOTS_IN_PAGES` (`FEATURES_HI` bit 10) over it, and says so in
+/// `FEATURES_LO` and `_HI`: to every guest where the host's page is
 /// the guest's 4 KiB, and on a host of 16 KiB pages only to a guest that takes `PAGES_16K`
 /// (`FEATURES_HI` bit 2), every other reading the features and the device info of a device with
 /// no map; without one it never does.
@@ -8729,6 +8730,11 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_SHARED_EVENT_NAMES
     );
     let carries = want & RGFX_FEATURE_SURFACE_DEFERRED_ASK != 0;
+    let slots_in_pages = if want != 0 {
+        RGFX_FEATURE_ICB_SLOTS_IN_PAGES
+    } else {
+        0
+    };
     assert_eq!(
         u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32,
         RGFX_FEATURE_SCHEDULED_ASK
@@ -8739,6 +8745,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_FUNCTION_POINTERS
             | RGFX_FEATURE_DYNAMIC_LIBRARIES
             | RGFX_FEATURE_PIPELINE_KEYS
+            | slots_in_pages
             | sixteen_bit
             | if carries {
                 RGFX_FEATURE_SURFACE_DEFERRED_CARRY
@@ -8792,6 +8799,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
                 | RGFX_FEATURE_FUNCTION_POINTERS
                 | RGFX_FEATURE_DYNAMIC_LIBRARIES
                 | RGFX_FEATURE_PIPELINE_KEYS
+                | RGFX_FEATURE_ICB_SLOTS_IN_PAGES
                 | RGFX_FEATURE_PAGES_16K
                 | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
         );
@@ -8888,6 +8896,11 @@ fn a_gpu_of_its_own_memory_has_the_guest_align_its_surfaces_rows_too() {
         high & RGFX_FEATURE_SURFACE_DEFERRED_CARRY != 0,
         !sixteen,
         "a deferral's carried pages"
+    );
+    assert_eq!(
+        high & RGFX_FEATURE_ICB_SLOTS_IN_PAGES != 0,
+        !sixteen,
+        "indirect command buffers' slots in a process's own pages"
     );
     assert_eq!(
         u64::from(device_info_of(&device).linear_row_alignment),

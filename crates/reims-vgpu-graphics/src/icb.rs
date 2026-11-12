@@ -18,7 +18,13 @@
 //! **Slots** ([`RGFX_CMD_ICB_SLOTS`](crate::wire::RGFX_CMD_ICB_SLOTS), where the guest took
 //! [`RGFX_FEATURE_ICB_SLOTS`](crate::wire::RGFX_FEATURE_ICB_SLOTS)): in place of records, the
 //! guest writes each command's state into a slot of its own in a block of the process's region,
-//! as a GPU's driver writes a command's record, and posts nothing while it encodes. A slot is a
+//! as a GPU's driver writes a command's record, and posts nothing while it encodes. Where the
+//! guest also took
+//! [`RGFX_FEATURE_ICB_SLOTS_IN_PAGES`](crate::wire::RGFX_FEATURE_ICB_SLOTS_IN_PAGES), the slots
+//! lie in the pages of a pages block of the process's instead, its own memory, which its kernel
+//! maps cached where it maps the region uncached on an AMD host's guest, and
+//! [`RGFX_CMD_ICB_SLOTS_IN_PAGES`](crate::wire::RGFX_CMD_ICB_SLOTS_IN_PAGES) names them; the host
+//! reads and takes them in place, as it does in the region. A slot is a
 //! fixed part ([`RgfxIcbRenderSlot`], [`RgfxIcbComputeSlot`]), then its bindings
 //! ([`RgfxIcbSlotBuffer`]: a render slot's vertex buffers, then its fragment buffers; a compute
 //! slot's kernel buffers, then its threadgroup memory lengths, a `u32` each, padded to 8 bytes).

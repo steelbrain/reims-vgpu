@@ -82,6 +82,7 @@ int main()
 	    RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_ARGUMENT_LAYOUT,
 	    RGFX_CMD_SHARED_EVENT_SET_VALUE, RGFX_CMD_ICB_WRITE, RGFX_CMD_TEXTURE_DID_MODIFY_DATA,
 	    RGFX_CMD_RATE_MAP_RESET, RGFX_CMD_RATE_MAP_QUERY, RGFX_CMD_FUNCTION_TABLE_SET,
+	    RGFX_CMD_ICB_SLOTS_IN_PAGES,
 	};
 	for (uint32_t t : makes)
 		check(rgfxSubmitAdmitted(t) && rgfxSubmitMakes(t), "a create makes an object");
@@ -97,7 +98,7 @@ int main()
 		if (type <= RGFX_CMD_BUFFER_OVER_PAGES || type == RGFX_CMD_BUFFER_MANAGED_AT_OFFSET ||
 		    type == RGFX_CMD_HEAP_OVER_PAGES || type == RGFX_CMD_MANAGED_BUFFER_CREATE ||
 		    type == RGFX_CMD_MESH_RENDER_PIPELINE_CREATE || type == RGFX_CMD_TEXTURE_DID_MODIFY_DATA ||
-		    (type >= RGFX_CMD_RATE_MAP_CREATE && type <= RGFX_CMD_DYNAMIC_LIBRARY_CREATE))
+		    (type >= RGFX_CMD_RATE_MAP_CREATE && type <= RGFX_CMD_ICB_SLOTS_IN_PAGES))
 			check(listed, "every wire type of the accepted range is placed");
 		else if (!listed)
 			check(!rgfxSubmitMakes(type), "a type the wire does not name makes none");

@@ -675,8 +675,8 @@ public:
 	/// message would pass the largest the control ring takes, when that message goes at once.
 	void icbRecord(RgfxObjId icb, uint16_t op, uint32_t index, const void *body, uint16_t size);
 
-	/// Posts every waiting write: the slots written since the last flush (ICB_SLOTS, their runs,
-	/// RgfxIcbSlotTable.hpp), then the records (ICB_WRITE, one message for each buffer's run of
+	/// Posts every waiting write: the slots written since the last flush (ICB_SLOTS and
+	/// ICB_SLOTS_IN_PAGES, their runs, RgfxIcbSlotTable.hpp), then the records (ICB_WRITE, one message for each buffer's run of
 	/// records), so the device carries them out before any command buffer the process posts after
 	/// this returns. One load where none waits.
 	RgfxIcbFlush flushIcbWrites();
@@ -803,9 +803,14 @@ private:
 	uint32_t icbMessageCap() const;
 	// Posts `message` (under m_icbLock), adding to `*flush`.
 	void postIcbMessage(IcbMessage &message, RgfxIcbFlush *flush);
-	// Posts `runs` as ICB_SLOTS, as few as the ring's cap allows (under m_icbLock), adding to
-	// `*flush` where given.
-	void postIcbSlots(const std::vector<RgfxIcbSlotRun> &runs, RgfxIcbFlush *flush);
+	// Posts `runs` as messages of `type` (ICB_SLOTS of RgfxIcbSlotRun, ICB_SLOTS_IN_PAGES of
+	// RgfxIcbSlotPagesRun), as few as the ring's cap allows (under m_icbLock), adding to `*flush`
+	// where given.
+	template <typename Run>
+	void postIcbSlots(uint32_t type, const std::vector<Run> &runs, RgfxIcbFlush *flush);
+	// Posts the runs of both kinds (postIcbSlots), the region's first.
+	void postIcbSlots(const std::vector<RgfxIcbSlotRun> &runs,
+	                  const std::vector<RgfxIcbSlotPagesRun> &pagesRuns, RgfxIcbFlush *flush);
 };
 
 #endif // RGFX_SERIALIZER_HPP_

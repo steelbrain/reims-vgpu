@@ -19,6 +19,7 @@
 
 #include "RgfxIcbSlotTable.hpp"
 #include "RgfxRegion.hpp"
+#include "../../kext/src/RgfxUserClientABI.hpp" // kRgfxPagesChunk
 #include "RgfxSerializer.hpp"
 
 namespace {
@@ -134,10 +135,11 @@ NSRange RgfxIcbClamp(id icb, NSRange range)
 	MTLResourceOptions _options;
 	uint64_t _types;
 	uint64_t _resourceId; // the host's answer; 0 where none came (a create on a test's ring)
-	// Slots: the region they are placed in (null where the device took no ICB_SLOTS), their
-	// kind and bindings, and their stride, 0 where the buffer takes records; made at the first
-	// CPU encode (rgfxSlots), under _slotLock.
+	// Slots: the region they are placed in (null where the device took no ICB_SLOTS), whether
+	// in a chunked pages block of its first, their kind and bindings, and their stride, 0 where
+	// the buffer takes records; made at the first CPU encode (rgfxSlots), under _slotLock.
 	RgfxRegion *_slotRegion;
+	bool _slotPages;
 	uint16_t _slotKind;
 	uint32_t _slotA, _slotB;
 	std::atomic<uint32_t> _slotStride;
@@ -187,6 +189,23 @@ NSRange RgfxIcbClamp(id icb, NSRange range)
                        serializer:(RgfxSerializer *)serializer
                       slotsRegion:(RgfxRegion *)region
 {
+	return [self icbWithDescriptor:descriptor
+	               maxCommandCount:maxCount
+	                       options:options
+	                        device:device
+	                    serializer:serializer
+	                   slotsRegion:region
+	                  slotsInPages:NO];
+}
+
++ (instancetype)icbWithDescriptor:(MTLIndirectCommandBufferDescriptor *)descriptor
+                  maxCommandCount:(NSUInteger)maxCount
+                          options:(MTLResourceOptions)options
+                           device:(id<MTLDevice>)device
+                       serializer:(RgfxSerializer *)serializer
+                      slotsRegion:(RgfxRegion *)region
+                     slotsInPages:(BOOL)inPages
+{
 	// Every Mac ends the process here, before anything else of the call (measured: an assertion
 	// and SIGABRT on the AMD 5300M and the Intel 630, a trap on the M3 Max).
 	const NSUInteger storage = (options & MTLResourceStorageModeMask) >> MTLResourceStorageModeShift;
@@ -216,6 +235,7 @@ NSRange RgfxIcbClamp(id icb, NSRange range)
 		icb->_options = options;
 		icb->_types = descriptor.commandTypes;
 		icb->_resourceId = created.resource_id;
+		icb->_slotPages = inPages && region != nullptr && region->hasChunkedPages();
 		[icb rgfxPlanSlots:descriptor region:region];
 	}
 	return icb;
@@ -245,8 +265,10 @@ NSRange RgfxIcbClamp(id icb, NSRange range)
 		_slotStride.store(stride, std::memory_order_relaxed);
 }
 
-// The buffer's slots, made at the first call that may write them, zeroed: null where it takes
-// records (rgfxPlanSlots:, or where the process's slots or the region have no room for them).
+// The buffer's slots, made at the first call that may write them, zeroed: in a chunked pages
+// block where the buffer takes them (_slotPages) and the kext gives one, its whole chunks of
+// kRgfxPagesChunk, else in a block of the region; null where it takes records (rgfxPlanSlots:,
+// or where the process's slots or the region have no room for them).
 - (RgfxIcbSlotTable *)rgfxSlots
 {
 	RgfxIcbSlotTable *slots = _slots.load(std::memory_order_acquire);
@@ -262,15 +284,23 @@ NSRange RgfxIcbClamp(id icb, NSRange range)
 		_slotStride.store(0, std::memory_order_relaxed);
 		return nullptr;
 	}
-	const RgfxRegion::Block block = _slotRegion->allocate(bytes);
+	RgfxRegion::Block block = {};
+	if (_slotPages)
+		block = _slotRegion->acquireChunkedPages((bytes + kRgfxPagesChunk - 1) /
+		                                         kRgfxPagesChunk * kRgfxPagesChunk);
+	const bool inPages = block.ok;
+	if (!inPages)
+		block = _slotRegion->allocate(bytes);
 	if (!block.ok) {
 		_serializer->releaseIcbSlotBytes(bytes);
 		_slotStride.store(0, std::memory_order_relaxed);
 		return nullptr;
 	}
-	std::memset(const_cast<uint8_t *>(block.ptr), 0, bytes);
+	// The kext's chunks come zero-filled.
+	if (!inPages)
+		std::memset(const_cast<uint8_t *>(block.ptr), 0, bytes);
 	slots = new RgfxIcbSlotTable(_serializer, _objId, _slotKind, _slotA, _slotB, u32(_size), stride,
-	                         block.ptr, block.offset);
+	                         block.ptr, block.offset, inPages ? block.size : 0);
 	_slotBlock = block.offset;
 	_slots.store(slots, std::memory_order_release);
 	return slots;

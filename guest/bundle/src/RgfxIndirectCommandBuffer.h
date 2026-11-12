@@ -71,6 +71,17 @@ NS_ASSUME_NONNULL_BEGIN
                                 serializer:(nullable RgfxSerializer *)serializer
                                slotsRegion:(nullable RgfxRegion *)region;
 
+/// As icbWithDescriptor:maxCommandCount:options:device:serializer:slotsRegion:, the slots in a
+/// chunked pages block of `region`'s (RgfxRegion::acquireChunkedPages) where `inPages` (the
+/// device took ICB_SLOTS_IN_PAGES) and it gives one, else in a block of the region.
++ (nullable instancetype)icbWithDescriptor:(MTLIndirectCommandBufferDescriptor *)descriptor
+                           maxCommandCount:(NSUInteger)maxCount
+                                   options:(MTLResourceOptions)options
+                                    device:(nullable id<MTLDevice>)device
+                                serializer:(nullable RgfxSerializer *)serializer
+                               slotsRegion:(nullable RgfxRegion *)region
+                              slotsInPages:(BOOL)inPages;
+
 /// `range` within the buffer's commands: its location at most `size`, its length at most what
 /// is left from there. Executes, resets, copies and optimizes name only commands it has.
 - (NSRange)rgfxClampRange:(NSRange)range;

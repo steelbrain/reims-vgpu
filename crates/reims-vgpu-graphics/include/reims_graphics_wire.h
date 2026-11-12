@@ -1064,7 +1064,8 @@
 // [`RGFX_FEATURE_SCHEDULED_ASK`], [`RGFX_FEATURE_PAGES_16K`], [`RGFX_FEATURE_DISPLAY_SCALE`],
 // [`RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA`], [`RGFX_FEATURE_DISPLAY_POWER`],
 // [`RGFX_FEATURE_RATE_MAPS`], [`RGFX_FEATURE_FUNCTION_POINTERS`],
-// [`RGFX_FEATURE_DYNAMIC_LIBRARIES`] and [`RGFX_FEATURE_PIPELINE_KEYS`].
+// [`RGFX_FEATURE_DYNAMIC_LIBRARIES`], [`RGFX_FEATURE_PIPELINE_KEYS`] and
+// [`RGFX_FEATURE_ICB_SLOTS_IN_PAGES`].
 // On a host that offers `PAGES_16K`, `FEATURES_LO` and `_HI` read the guest RAM features only
 // once the guest took it.
 #define RGFX_REG_FEATURES_HI 12
@@ -1387,6 +1388,15 @@
 // ([`RGFX_PIPELINE_REFLECT_KEYED`], [`RGFX_PIPELINE_REFLECTION_KEY_OFFSET`]). Every host offers
 // it.
 #define RGFX_FEATURE_PIPELINE_KEYS 2199023255552
+
+// `FEATURES_HI` bit 10, feature bit 42, `ICB_SLOTS_IN_PAGES`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_HI`], and which means nothing without [`RGFX_FEATURE_ICB_SLOTS`] and
+// [`RGFX_FEATURE_PAGES_BUFFERS`]: ring 0 carries [`RGFX_CMD_ICB_SLOTS_IN_PAGES`], slots as
+// [`RGFX_CMD_ICB_SLOTS`]'s that lie in the pages of a pages block of the sender's, which the host
+// reads in place, in the guest's RAM: the process's own memory, which its kernel maps cached,
+// where it maps the region's blocks uncached on an AMD host's guest ([`crate::icb`], "Slots").
+// A host offers it where it offers [`RGFX_FEATURE_PAGES_BUFFERS`].
+#define RGFX_FEATURE_ICB_SLOTS_IN_PAGES 4398046511104
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -1944,6 +1954,17 @@
 // sender's. Nothing is made but on success. A library still being made is waited for.
 // `OBJECT_DESTROY` drops it; a pipeline state made with it keeps what it linked.
 #define RGFX_CMD_DYNAMIC_LIBRARY_CREATE 569
+
+// Command `ICB_SLOTS_IN_PAGES` ([`RgfxIcbSlots`], then its runs, [`RgfxIcbSlotPagesRun`]),
+// where the guest took [`RGFX_FEATURE_ICB_SLOTS_IN_PAGES`]: as [`RGFX_CMD_ICB_SLOTS`], each run's
+// slots `slot_bytes` apart from `pages_offset` in the pages of the pages block at `block_offset`,
+// a block of the sender's context described by a `SURFACE_PAGES` of
+// [`RGFX_SURFACE_PAGES_PRIVATE`] and holding at least `block_size` bytes, which the host reads in
+// place ([`crate::icb`], "Slots"). A run whose block is no such block of the sender's, or whose
+// slots pass its pages, is skipped alone, as a run of `ICB_SLOTS` the host cannot read is. Ring 0
+// is carried out before any command buffer the process posts after it, as `ICB_WRITE` is. Not
+// answered.
+#define RGFX_CMD_ICB_SLOTS_IN_PAGES 570
 
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
@@ -4785,6 +4806,32 @@ typedef struct {
   uint64_t stride;
 } RgfxIcbSlotBuffer;
 
+// One run of an `ICB_SLOTS_IN_PAGES`: as [`RgfxIcbSlotRun`], the first slot `pages_offset`
+// bytes into the pages of the pages block at `block_offset`.
+typedef struct {
+  // The indirect command buffer.
+  uint64_t icb_obj_id;
+  // The pages block's region offset.
+  uint64_t block_offset;
+  // The pages block's size in the region.
+  uint64_t block_size;
+  // The first slot's place in the block's pages: 8-aligned.
+  uint64_t pages_offset;
+  // The first slot's command.
+  uint32_t first_command;
+  // How many commands' slots.
+  uint32_t command_count;
+  // The bytes from one slot to the next: a multiple of 8, at least the slot's
+  // ([`crate::icb::slot_bytes`]).
+  uint32_t slot_bytes;
+  // [`RGFX_ICB_SLOTS_RENDER`] or [`RGFX_ICB_SLOTS_COMPUTE`].
+  uint16_t kind;
+  // The slot's bindings of the first kind, at most 32.
+  uint8_t bindings_a;
+  // The slot's bindings of the second kind, at most 32.
+  uint8_t bindings_b;
+} RgfxIcbSlotPagesRun;
+
 // One run of an `ICB_SLOTS`: the slots of commands `first_command` to `first_command +
 // command_count` of `icb_obj_id`, the first at `region_offset`, `slot_bytes` apart, each of
 // `kind` with `bindings_a` bindings of the first kind (vertex or kernel buffers) and `bindings_b`
@@ -4809,9 +4856,10 @@ typedef struct {
   uint8_t bindings_b;
 } RgfxIcbSlotRun;
 
-// `ICB_SLOTS`: `run_count` [`RgfxIcbSlotRun`]s follow, to the message's `size`.
+// `ICB_SLOTS`: `run_count` [`RgfxIcbSlotRun`]s follow, to the message's `size`; and
+// `ICB_SLOTS_IN_PAGES`: `run_count` [`RgfxIcbSlotPagesRun`]s.
 typedef struct {
-  // [`RGFX_CMD_ICB_SLOTS`].
+  // [`RGFX_CMD_ICB_SLOTS`] or [`RGFX_CMD_ICB_SLOTS_IN_PAGES`].
   RgfxMsgHeader header;
   // The first run's indirect command buffer, which places the message in its context.
   uint64_t obj_id;

@@ -117,7 +117,11 @@
 //    compute pipeline's create;
 //  - PIPELINE_KEYS (bit 41): the bundle asks each render and compute pipeline create's answer
 //    with its pipeline key, and the kext keeps the answers that carry one for every process
-//    (RgfxSharedPipelines.hpp), so an equal create of another process need not wait.
+//    (RgfxSharedPipelines.hpp), so an equal create of another process need not wait;
+//  - ICB_SLOTS_IN_PAGES (bit 42): the bundle writes an indirect command buffer's slots in a
+//    chunked pages block of the kext's (PagesChunked), cached memory of the process's own, and
+//    names them in RGFX_CMD_ICB_SLOTS_IN_PAGES, which the kext admits as it does ICB_SLOTS, a
+//    write into the client's own objects (RgfxSubmitGate.hpp).
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -156,6 +160,7 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_SCHEDULED_ASK | RGFX_FEATURE_DISPLAY_SCALE |
     RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA | RGFX_FEATURE_RATE_MAPS |
     RGFX_FEATURE_FUNCTION_POINTERS | RGFX_FEATURE_DYNAMIC_LIBRARIES | RGFX_FEATURE_PIPELINE_KEYS |
+    RGFX_FEATURE_ICB_SLOTS_IN_PAGES |
     (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K : RGFX_FEATURE_DISPLAY_POWER);
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.

@@ -29,8 +29,9 @@ use reims_vgpu_graphics::wire::{
     RGFX_ICB_INHERIT_TRIANGLE_FILL_MODE, RGFX_ICB_INHERIT_VIEWPORTS, RGFX_ICB_SLOTS_RENDER,
     RGFX_ICB_SUPPORT_DYNAMIC_ATTRIBUTE_STRIDE, RGFX_ICB_SUPPORT_RAY_TRACING,
     RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RgfxIcbCreate,
-    RgfxIcbSlotRun, RgfxIcbSlots, RgfxIcbState, RgfxIcbWrite, RgfxMsgHeader,
+    RgfxIcbSlotPagesRun, RgfxIcbSlotRun, RgfxIcbSlots, RgfxIcbState, RgfxIcbWrite, RgfxMsgHeader,
 };
+use reims_vgpu_vulkan::core::host::HostPtr;
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::device::GpuDevice;
 use reims_vgpu_vulkan::core::platform::icb::{
@@ -40,7 +41,7 @@ use reims_vgpu_vulkan::core::platform::icb::{
 use reims_vgpu_vulkan::core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
 use reims_vgpu_vulkan::core::platform::values::IcbDesc;
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use reims_vgpu_vulkan::core::raise::RaiseResult;
 use reims_vgpu_vulkan::core::sync::Mutex;
@@ -395,10 +396,160 @@ impl<P: Platform> GraphicsDecoder<P> {
         Ok(framing)
     }
 
+    /// An `ICB_SLOTS_IN_PAGES`: as [`Self::icb_slots`], each run's slots taken in place from the
+    /// pages of the pages block it names ([`Self::own_pages`]), where the process's CPU wrote them
+    /// through its own cached mapping. A run whose block is no pages block of the sender's, or
+    /// whose slots pass its pages, is skipped alone, taking nothing, as is one whose block's view
+    /// the platform could not make.
+    pub(super) fn icb_slots_in_pages(
+        &self,
+        device: &P::Device,
+        message: &[u8],
+    ) -> RaiseResult<Result<(), DecodeError>> {
+        let Some(m) = read::<RgfxIcbSlots>(message) else {
+            return Ok(Err(DecodeError::Malformed));
+        };
+        let end = (m.header.size as usize).min(message.len());
+        let mut tally = Tally::default();
+        let mut framing = Ok(());
+        let mut at = size_of::<RgfxIcbSlots>();
+        for _ in 0..m.run_count {
+            let Some(run) = message.get(at..end).and_then(read::<RgfxIcbSlotPagesRun>) else {
+                framing = Err(DecodeError::Malformed);
+                break;
+            };
+            at += size_of::<RgfxIcbSlotPagesRun>();
+            let done = self.pages_slot_run(device, &run, &mut tally);
+            tally.count(run.icb_obj_id, run.first_command.into(), done);
+        }
+        if let Some((icb, index, why)) = &tally.first {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = why;
+                "ICB_SLOTS_IN_PAGES of {} runs (the first on buffer {:#x}): {} of {} runs and \
+                 fields not carried out; the first, buffer {icb:#x} at command {index}: {why}",
+                m.run_count,
+                m.obj_id,
+                tally.skipped,
+                tally.tried
+            );
+        }
+        Ok(framing)
+    }
+
+    /// The pipelines the slots an `ICB_SLOTS_IN_PAGES` `message` names set (their pipeline bit
+    /// set), nil left out, read in place as they stand, as
+    /// [`crate::graphics::compile::icb_slots_pipelines`] reads an `ICB_SLOTS`'s: whom the message
+    /// waits for. A run whose block is no pages block of the sender's, whose view the platform
+    /// could not make, whose slots pass its pages, or of a shape the decoder does not take, names
+    /// none.
+    pub(crate) fn icb_slots_in_pages_pipelines(
+        &self,
+        device: &P::Device,
+        message: &[u8],
+    ) -> Vec<u64> {
+        let mut named = Vec::new();
+        let Some(m) = read::<RgfxIcbSlots>(message) else {
+            return named;
+        };
+        let end = (m.header.size as usize).min(message.len());
+        let mut at = size_of::<RgfxIcbSlots>();
+        for _ in 0..m.run_count {
+            let Some(run) = message.get(at..end).and_then(read::<RgfxIcbSlotPagesRun>) else {
+                break;
+            };
+            at += size_of::<RgfxIcbSlotPagesRun>();
+            let stride = u64::from(run.slot_bytes);
+            let (a, b) = (u32::from(run.bindings_a), u32::from(run.bindings_b));
+            let shaped = slot_bytes(run.kind, a, b)
+                .is_some_and(|least| stride >= least && stride.is_multiple_of(8));
+            let Ok(Ok(pages)) = self.own_pages(device, run.block_offset, run.block_size) else {
+                continue;
+            };
+            let Some(len) = (stride.checked_mul(u64::from(run.command_count)))
+                .filter(|&len| shaped && pages.holds(run.pages_offset, len))
+            else {
+                continue;
+            };
+            let first = pages.at().wrapping_add(run.pages_offset);
+            for slot in (0..len).step_by(stride as usize) {
+                // The mask and the pipeline, the slot's first and third words.
+                let word = |k: u64| {
+                    // SAFETY: an 8-aligned word of a slot in the block's pages (checked above),
+                    // which `pages` keeps mapped; the guest writes it only through atomics.
+                    unsafe { AtomicU64::from_ptr(first.wrapping_add(slot + k * 8).as_ptr()) }
+                        .load(Ordering::Acquire)
+                };
+                let (mask, pipeline) = (word(0), word(2));
+                if mask & RGFX_ICB_SLOT_PIPELINE != 0 && pipeline != 0 {
+                    named.push(pipeline);
+                }
+            }
+        }
+        named
+    }
+
+    /// One run of an `ICB_SLOTS_IN_PAGES`, as [`Self::slot_run`]: refused whole, taking nothing,
+    /// where its block is no pages block of the sender's, or its slots pass the block's pages.
+    fn pages_slot_run(
+        &self,
+        device: &P::Device,
+        run: &RgfxIcbSlotPagesRun,
+        tally: &mut Tally,
+    ) -> RaiseResult<Result<(), DecodeError>> {
+        let pages = match self.own_pages(device, run.block_offset, run.block_size)? {
+            Ok(pages) => pages,
+            Err(why) => return Ok(Err(why)),
+        };
+        let shape = RgfxIcbSlotRun {
+            icb_obj_id: run.icb_obj_id,
+            region_offset: run.pages_offset,
+            first_command: run.first_command,
+            command_count: run.command_count,
+            slot_bytes: run.slot_bytes,
+            kind: run.kind,
+            bindings_a: run.bindings_a,
+            bindings_b: run.bindings_b,
+        };
+        let (offset, stride) = (run.pages_offset, u64::from(run.slot_bytes));
+        let first = pages.at().wrapping_add(offset);
+        Ok(self.slots_of(
+            &shape,
+            |len| pages.holds(offset, len),
+            // SAFETY: the run's slots lie in the block's pages (`holds`, which `slots_of` checks
+            // first), which `pages` keeps mapped: the guest's RAM mapping, which stays mapped as
+            // long as the device, or the block's view, which it holds.
+            |start, n| unsafe { take_records_at(first.wrapping_add(start * stride), stride, n, 2) },
+            tally,
+        ))
+    }
+
     /// One run of an `ICB_SLOTS`, refused whole, taking nothing, where its span cannot be read.
-    /// Its slots are taken a chunk at a time, so the copy stays small; consecutive commands
-    /// whose slots hold a range reset alone are reset in one call.
     fn slot_run(&self, run: &RgfxIcbSlotRun, tally: &mut Tally) -> Result<(), DecodeError> {
+        let (at, stride) = (run.region_offset, u64::from(run.slot_bytes));
+        self.slots_of(
+            run,
+            |len| self.in_own_block(at, len),
+            |start, n| self.take_own(at + start * stride, stride, n, 2),
+            tally,
+        )
+    }
+
+    /// The slots of `run`'s commands, of its shape, carried out on its buffer: refused whole,
+    /// taking nothing, where its shape is not one the host knows, its commands pass the buffer's
+    /// size, or `readable` answers false for its slots' length. `take` takes `n` slots from the
+    /// run's `start`th, their masks swapped for 0 ([`Region::take_records`]), or none where they
+    /// can no longer be read, which refuses the rest of the run. Its slots are taken a chunk at a
+    /// time, so the copy stays small; consecutive commands whose slots hold a range reset alone
+    /// are reset in one call.
+    ///
+    /// [`Region::take_records`]: reims_vgpu_graphics::region::Region::take_records
+    fn slots_of(
+        &self,
+        run: &RgfxIcbSlotRun,
+        readable: impl Fn(u64) -> bool,
+        take: impl Fn(u64, u64) -> Option<Vec<u8>>,
+        tally: &mut Tally,
+    ) -> Result<(), DecodeError> {
         const CHUNK: u64 = 256;
         let Some((icb, dropped)) = self.icb_of(run.icb_obj_id) else {
             return Err(DecodeError::BadReference);
@@ -414,7 +565,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         let span = stride.checked_mul(count);
         if first.checked_add(count).is_none_or(|e| e > icb.size())
-            || span.is_none_or(|len| !self.in_own_block(run.region_offset, len))
+            || span.is_none_or(|len| !readable(len))
         {
             return Err(DecodeError::BadReference);
         }
@@ -425,8 +576,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             let n = CHUNK.min(count - start);
             // A block released since the check, by a guest racing its own post, refuses the
             // rest of the run.
-            let Some(bytes) = self.take_own(run.region_offset + start * stride, stride, n, 2)
-            else {
+            let Some(bytes) = take(start, n) else {
                 reset_run(icb, dropped, obj, resets.take(), tally);
                 return Err(DecodeError::BadReference);
             };
@@ -908,6 +1058,51 @@ fn contain(
     }
 }
 
+/// A copy of the `count` records of `stride` bytes from `first`, each with its first `taken` `u64`
+/// words swapped for 0 as it is copied, as [`Region::take_records`] takes them from the region:
+/// `None`, taking nothing, where `first` and `stride` are not 8-aligned, or `stride` holds fewer
+/// than `taken` words.
+///
+/// # Safety
+/// The `count * stride` bytes from `first` are host memory that stays mapped, readable and
+/// writable, while this runs: the guest's, which it may write meanwhile, and only through atomics
+/// where the swaps take words.
+///
+/// [`Region::take_records`]: reims_vgpu_graphics::region::Region::take_records
+unsafe fn take_records_at(
+    first: HostPtr,
+    stride: u64,
+    count: u64,
+    taken: usize,
+) -> Option<Vec<u8>> {
+    let len = stride.checked_mul(count)?;
+    let words = taken as u64 * 8;
+    if !first.addr().is_multiple_of(8) || !stride.is_multiple_of(8) || stride < words {
+        return None;
+    }
+    let mut out = vec![0u8; usize::try_from(len).ok()?];
+    for (i, record) in out.chunks_exact_mut(stride as usize).enumerate() {
+        let at = first.wrapping_add(i as u64 * stride);
+        for w in 0..taken {
+            // SAFETY: an 8-aligned word of the records (checked above), which the caller keeps
+            // mapped; the guest writes it only through atomics.
+            let word = unsafe { AtomicU64::from_ptr(at.wrapping_add(w as u64 * 8).as_ptr()) }
+                .swap(0, Ordering::AcqRel);
+            record[w * 8..w * 8 + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        // SAFETY: the record's bytes lie in the records, which the caller keeps mapped; the
+        // guest's concurrent writes change only what is copied.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                at.wrapping_add(words).as_ptr::<u8>(),
+                record[taken * 8..].as_mut_ptr(),
+                record.len() - taken * 8,
+            );
+        }
+    }
+    Some(out)
+}
+
 /// The `k`th `u64` of a slot (its masks are words 0 and 1).
 fn word(slot: &[u8], k: usize) -> u64 {
     u64::read_from_prefix(slot.get(k * 8..).unwrap_or_default()).map_or(0, |(w, _)| w)
@@ -1070,9 +1265,13 @@ mod tests {
 
     use reims_vgpu_graphics::region::Region;
     use reims_vgpu_graphics::wire::{
-        RGFX_CMD_ICB_SLOTS, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT,
-        RGFX_CURSOR_SPAN, RGFX_ICB_SLOTS_COMPUTE,
+        RGFX_CMD_ICB_SLOTS, RGFX_CMD_ICB_SLOTS_IN_PAGES, RGFX_CMD_SURFACE_PAGES,
+        RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN,
+        RGFX_ICB_SLOTS_COMPUTE, RGFX_SURFACE_PAGES_PRIVATE, RgfxPageRun, RgfxSurfacePages,
     };
+    use reims_vgpu_vulkan::core::memory::descriptor::{GuestPhysicalRange, MemoryMapDescriptor};
+    use reims_vgpu_vulkan::core::memory::map::MemoryMap;
+    use reims_vgpu_vulkan::core::testkit::GuestRam;
 
     use super::super::tests::{
         compute_create, pipeline_decoder, pipeline_decoder_over, whole_render_create,
@@ -1080,6 +1279,7 @@ mod tests {
     use super::*;
 
     type Dec = GraphicsDecoder<FakePlatform>;
+    type Device = <FakePlatform as Platform>::Device;
 
     /// `MTLIndirectCommandTypeDraw | DrawIndexed | DrawPatches | DrawIndexedPatches`.
     const RENDER_TYPES: u32 = 0xf;
@@ -2562,6 +2762,357 @@ mod tests {
         let c = icb.render_command(0).unwrap().unwrap();
         assert_eq!(c.draw_args().unwrap().vertex_count, 9);
         assert_ne!(c.pipeline_state_unique_identifier(), 0);
+    }
+
+    /// The guest RAM's first byte in the tests whose slots lie in a pages block.
+    const RAM: u64 = 0x10_0000;
+    /// Where those tests' pages blocks lie in the region: past [`SLOTS`]' render and compute
+    /// slots, each block's runs and holders' part in 0x2000 bytes.
+    const PAGES_BLOCK: u64 = SLOTS + 0x8_0000;
+
+    /// [`slot_setup`] with `pages` host pages of guest RAM from [`RAM`] behind the decoder's
+    /// memory map; and the guest RAM, and the host's page.
+    fn pages_slot_setup(pages: u64) -> (Arc<FakePlatform>, Dec, Arc<Region>, GuestRam, u64) {
+        let (p, mut dec, region) = slot_setup();
+        let page = p.vm().page_size();
+        let ram = GuestRam::with_range(RAM, pages * page).unwrap();
+        p.fake_vm().adopt(&ram);
+        let mut desc = MemoryMapDescriptor::new();
+        for r in ram.ranges() {
+            desc.add_range(GuestPhysicalRange {
+                physical_address: r.physical_address,
+                physical_length: r.physical().physical_length,
+                host_address: r.host(),
+            });
+        }
+        let map = MemoryMap::new(Arc::clone(&p), &desc).unwrap();
+        dec.set_guest_memory(map, Arc::new(()));
+        (p, dec, region, ram, page)
+    }
+
+    /// A `SURFACE_PAGES` of a pages block (`RGFX_SURFACE_PAGES_PRIVATE`) at `block`, of `runs`,
+    /// (page, pages) of the guest RAM, over their bytes; its answer.
+    fn describe_pages(
+        dec: &mut Dec,
+        device: &Device,
+        block: u64,
+        runs: &[(u64, u64)],
+        page: u64,
+    ) -> u32 {
+        let runs: Vec<RgfxPageRun> = runs
+            .iter()
+            .map(|&(at, n)| RgfxPageRun {
+                address: RAM + at * page,
+                length: n * page,
+            })
+            .collect();
+        let m = RgfxSurfacePages {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_SURFACE_PAGES,
+                size: 0,
+                seqno: 0,
+            },
+            context: 0,
+            run_count: runs.len() as u32,
+            block_offset: block,
+            block_size: 0x2000,
+            runs_offset: block + 0x1000,
+            length: runs.iter().map(|r| r.length).sum(),
+        };
+        dec.surface_pages_laid_out(device, &m, &runs, RGFX_SURFACE_PAGES_PRIVATE, None)
+    }
+
+    /// The guest physical spans of `len` bytes at `offset` in the pages of `runs` (as
+    /// [`describe_pages`]), in order.
+    fn scatter(runs: &[(u64, u64)], page: u64, offset: u64, len: u64) -> Vec<(u64, u64)> {
+        let mut spans = Vec::new();
+        let (mut at, end, mut start) = (offset, offset + len, 0);
+        for &(first, n) in runs {
+            let run_end = start + n * page;
+            if at < run_end && at < end {
+                let take = run_end.min(end) - at;
+                spans.push((RAM + first * page + (at - start), take));
+                at += take;
+            }
+            start = run_end;
+        }
+        assert_eq!(at, end, "the bytes lie in the runs");
+        spans
+    }
+
+    /// Writes `bytes` at `offset` in the pages of `runs`.
+    fn write_pages(ram: &GuestRam, runs: &[(u64, u64)], page: u64, offset: u64, bytes: &[u8]) {
+        let mut from = 0;
+        for (pa, n) in scatter(runs, page, offset, bytes.len() as u64) {
+            assert!(ram.write(pa, &bytes[from..from + n as usize]));
+            from += n as usize;
+        }
+    }
+
+    /// The masks of the slot at `offset` in the pages of `runs`.
+    fn pages_masks(ram: &GuestRam, runs: &[(u64, u64)], page: u64, offset: u64) -> (u64, u64) {
+        let mut b = Vec::new();
+        for (pa, n) in scatter(runs, page, offset, 16) {
+            b.extend(ram.read_vec(pa, n).unwrap());
+        }
+        (word(&b, 0), word(&b, 1))
+    }
+
+    /// A run of an `ICB_SLOTS_IN_PAGES`: [`run`]'s, its slots `offset` bytes into the pages of
+    /// the block at `block`.
+    fn pages_run(
+        icb: u64,
+        kind: u16,
+        block: u64,
+        offset: u64,
+        first: u32,
+        count: u32,
+    ) -> RgfxIcbSlotPagesRun {
+        let r = run(icb, kind, 0, first, count);
+        RgfxIcbSlotPagesRun {
+            icb_obj_id: r.icb_obj_id,
+            block_offset: block,
+            block_size: 0x2000,
+            pages_offset: offset,
+            first_command: r.first_command,
+            command_count: r.command_count,
+            slot_bytes: r.slot_bytes,
+            kind: r.kind,
+            bindings_a: r.bindings_a,
+            bindings_b: r.bindings_b,
+        }
+    }
+
+    /// An `ICB_SLOTS_IN_PAGES` of `runs`.
+    fn pages_slots(runs: &[RgfxIcbSlotPagesRun]) -> Vec<u8> {
+        let mut m = slots(&[]);
+        let len = m.len() + size_of_val(runs);
+        let head = RgfxIcbSlots {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_ICB_SLOTS_IN_PAGES,
+                size: len as u32,
+                seqno: 0,
+            },
+            obj_id: runs.first().map_or(0, |r| r.icb_obj_id),
+            run_count: runs.len() as u32,
+            reserved_1c: 0,
+        };
+        m.copy_from_slice(head.as_bytes());
+        for r in runs {
+            m.extend_from_slice(r.as_bytes());
+        }
+        m
+    }
+
+    /// The render and compute slots [`slots_in_pages_drive_what_slots_in_the_region_do`] writes:
+    /// a render command with every field of its kind, one reset then given a pipeline, and a
+    /// compute command with every field of its kind.
+    fn slot_bytes_of_each_kind() -> (Vec<u8>, Vec<u8>) {
+        let b0 = RGFX_ICB_SLOT_BUFFER_0;
+        let fixed = RgfxIcbRenderSlot {
+            mask: RGFX_ICB_SLOT_PIPELINE
+                | RGFX_ICB_SLOT_ACTION
+                | RGFX_ICB_SLOT_BARRIER
+                | b0
+                | b0 << 1,
+            mask_b: 1,
+            pipeline: RENDER_PIPELINE,
+            op: RGFX_ICB_OP_DRAW_INDEXED,
+            barrier: 1,
+            strided: 0b10,
+            action: action(&DRAW_INDEXED),
+        };
+        let mut render = render_slot(&fixed, [bound(2, 16, 0), bound(0, 8, 24), bound(3, 32, 0)]);
+        let reset_then_pipeline = RgfxIcbRenderSlot {
+            mask: RGFX_ICB_SLOT_RESET | RGFX_ICB_SLOT_PIPELINE,
+            pipeline: RENDER_PIPELINE,
+            ..RgfxIcbRenderSlot::default()
+        };
+        render.extend(render_slot(
+            &reset_then_pipeline,
+            [RgfxIcbSlotBuffer::default(); 3],
+        ));
+        let dispatch = RgfxIcbComputeSlot {
+            mask: RGFX_ICB_SLOT_PIPELINE
+                | RGFX_ICB_SLOT_ACTION
+                | RGFX_ICB_SLOT_STAGE_IN
+                | RGFX_ICB_SLOT_IMAGEBLOCK
+                | b0
+                | b0 << 2,
+            mask_b: 1 << 1 | 1 << 30,
+            pipeline: COMPUTE_PIPELINE,
+            op: RGFX_ICB_OP_DISPATCH_THREADS,
+            barrier: 0,
+            strided: 0b100,
+            dispatch: RgfxIcbDispatch {
+                grid: [64, 2, 1],
+                threadgroup: [32, 1, 1],
+            },
+            stage_in: RgfxIcbRegion {
+                origin: [1, 2, 3],
+                size: [4, 5, 6],
+            },
+            imageblock: RgfxIcbImageblock {
+                width: 16,
+                height: 8,
+            },
+        };
+        let kernels = [bound(2, 8, 0), bound(0, 0, 0), bound(3, 16, 12)];
+        let compute = compute_slot(&dispatch, kernels, &[(1, 256), (30, 64)]);
+        (render, compute)
+    }
+
+    /// Slots in a pages block's pages drive the setters the same slots in the region do, read
+    /// in place in the guest's RAM where the block is one run, and in its view where it is more,
+    /// a slot across two runs among them; the take leaves their masks 0, so the same message
+    /// again carries out nothing, and the pipelines they set are what the message waits for until
+    /// then.
+    #[test]
+    fn slots_in_pages_drive_what_slots_in_the_region_do() {
+        let (p, mut dec, region, ram, page) = pages_slot_setup(8);
+        let device = p.device();
+        let (render, compute) = slot_bytes_of_each_kind();
+        // One run of two pages, and two runs out of order, the second render slot across them.
+        let one = (PAGES_BLOCK, vec![(0, 2)]);
+        let two = (PAGES_BLOCK + 0x4000, vec![(5, 1), (3, 2)]);
+        let r = page - RENDER_STRIDE - 64;
+        let c = 2 * page;
+        for (block, runs) in [&one, &two] {
+            assert_eq!(
+                describe_pages(&mut dec, &device, *block, runs, page),
+                RGFX_STATUS_OK
+            );
+            let r_at = if runs.len() == 1 { 0 } else { r };
+            let region_message = {
+                assert!(region.write(SLOTS, &render));
+                assert!(region.write(SLOTS + 0x1_0000, &compute));
+                slots(&[
+                    run(RENDER_ICB_2, RGFX_ICB_SLOTS_RENDER, SLOTS, 0, 2),
+                    run(
+                        COMPUTE_ICB_2,
+                        RGFX_ICB_SLOTS_COMPUTE,
+                        SLOTS + 0x1_0000,
+                        0,
+                        1,
+                    ),
+                ])
+            };
+            let mark = p.call_log().mark();
+            assert_eq!(dec.decode(&device, &region_message).unwrap(), Ok(()));
+            let by_region = calls(&p, mark);
+            assert!(!by_region.is_empty());
+
+            write_pages(&ram, runs, page, r_at, &render);
+            let c_at = if runs.len() == 1 {
+                RENDER_STRIDE * 2
+            } else {
+                c
+            };
+            write_pages(&ram, runs, page, c_at, &compute);
+            let message = pages_slots(&[
+                pages_run(RENDER_ICB_2, RGFX_ICB_SLOTS_RENDER, *block, r_at, 0, 2),
+                pages_run(COMPUTE_ICB_2, RGFX_ICB_SLOTS_COMPUTE, *block, c_at, 0, 1),
+            ]);
+            assert_eq!(
+                dec.icb_slots_in_pages_pipelines(&device, &message),
+                vec![RENDER_PIPELINE, RENDER_PIPELINE, COMPUTE_PIPELINE]
+            );
+            let mark = p.call_log().mark();
+            assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+            assert_eq!(calls(&p, mark), by_region, "the block of {runs:?}");
+            // The fake platform's view of several runs reaches the guest's RAM at a sync, as a
+            // mapping of the same pages does at once.
+            p.fake_vm().sync();
+            for at in [r_at, r_at + RENDER_STRIDE, c_at] {
+                assert_eq!(
+                    pages_masks(&ram, runs, page, at),
+                    (0, 0),
+                    "the slot at {at:#x} taken"
+                );
+            }
+            let mark = p.call_log().mark();
+            assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+            assert_eq!(calls(&p, mark), vec![]);
+            assert_eq!(
+                dec.icb_slots_in_pages_pipelines(&device, &message),
+                Vec::<u64>::new()
+            );
+        }
+    }
+
+    /// A run of an `ICB_SLOTS_IN_PAGES` is refused whole, taking nothing, where its block is
+    /// another process's, no pages block (a block of the region the sender holds, or none), its
+    /// slots pass the block's pages, or lie unaligned; the runs around it are carried out.
+    #[test]
+    fn a_slot_run_outside_the_senders_pages_is_refused_taking_nothing() {
+        let (p, mut dec, region, ram, page) = pages_slot_setup(4);
+        let device = p.device();
+        let runs = [(0, 2)];
+        let other = PAGES_BLOCK + 0x4000;
+        assert_eq!(
+            describe_pages(&mut dec, &device, PAGES_BLOCK, &runs, page),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(
+            describe_pages(&mut dec, &device, other, &[(2, 1)], page),
+            RGFX_STATUS_OK
+        );
+        region.grant(0, PAGES_BLOCK, 0x2000);
+        region.grant(0, SLOTS, 0x1_0000);
+        region.grant(1, other, 0x2000);
+        dec.set_context(Some(0));
+        let pipeline = RgfxIcbRenderSlot {
+            mask: RGFX_ICB_SLOT_PIPELINE,
+            pipeline: RENDER_PIPELINE,
+            ..RgfxIcbRenderSlot::default()
+        };
+        let slot = render_slot(&pipeline, [RgfxIcbSlotBuffer::default(); 3]);
+        let last = 2 * page - RENDER_STRIDE;
+        for at in [0, 8 * RENDER_STRIDE, last] {
+            write_pages(&ram, &runs, page, at, &slot);
+        }
+        assert!(ram.write(RAM + 2 * page, &slot));
+        let message = pages_slots(&[
+            pages_run(RENDER_ICB, RGFX_ICB_SLOTS_RENDER, other, 0, 0, 1),
+            pages_run(RENDER_ICB, RGFX_ICB_SLOTS_RENDER, SLOTS, 0, 0, 1),
+            pages_run(RENDER_ICB, RGFX_ICB_SLOTS_RENDER, SLOTS + 0x4_0000, 0, 0, 1),
+            pages_run(RENDER_ICB, RGFX_ICB_SLOTS_RENDER, PAGES_BLOCK, last, 0, 2),
+            pages_run(
+                RENDER_ICB,
+                RGFX_ICB_SLOTS_RENDER,
+                PAGES_BLOCK,
+                8 * RENDER_STRIDE + 4,
+                0,
+                1,
+            ),
+            pages_run(RENDER_ICB, RGFX_ICB_SLOTS_RENDER, PAGES_BLOCK, 0, 0, 1),
+        ]);
+        let mark = p.call_log().mark();
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let at = |i| ("indirectRenderCommandAtIndex:", vec![Arg::U64(i)]);
+        let pipeline_arg = Arg::Obj(Some(
+            dec.require_render_pipeline(RENDER_PIPELINE).unwrap().id(),
+        ));
+        assert_eq!(
+            calls(&p, mark),
+            vec![at(0), ("setRenderPipelineState:", vec![pipeline_arg])]
+        );
+        assert_eq!(pages_masks(&ram, &runs, page, 0), (0, 0));
+        for (at, what) in [
+            (last, "past the block's pages"),
+            (8 * RENDER_STRIDE, "unaligned"),
+        ] {
+            assert_eq!(
+                pages_masks(&ram, &runs, page, at),
+                (RGFX_ICB_SLOT_PIPELINE, 0),
+                "the slot {what} left as it was"
+            );
+        }
+        assert_eq!(
+            pages_masks(&ram, &[(2, 1)], page, 0),
+            (RGFX_ICB_SLOT_PIPELINE, 0),
+            "the slot in another process's block left as it was"
+        );
     }
 
     /// A take carries out only what the guest set since the last: a GPU-side encode between two

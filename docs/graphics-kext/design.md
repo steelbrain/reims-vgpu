@@ -134,7 +134,8 @@ Stages:
      13 MB/s and its loads at 8 to 180 MB/s, against 5.6 to 123 GB/s in its
      own RAM. Uncached loads cost 79-138 ns against 2-4 ns cached. So what
      the CPU touches most lies in the process's own pages instead (its Shared
-     and Managed buffers' slabs and its upload chunks, "Managed storage"),
+     and Managed buffers' slabs and its upload chunks, "Managed storage", and
+     its indirect command buffers' slots, `ICB_SLOTS_IN_PAGES`),
      and what the process only writes takes a write-combined part of its
      block, which the kext maps so (a submission ring's data, command
      buffers' bodies and a library's staging chunks; the bundle's
@@ -1455,6 +1456,21 @@ only where no negotiation can carry it.
   process's equal creates ("Known pipeline creates"). Every host offers it,
   and the kext takes it; a bundle on a host that did not offer it asks for no
   key.
+- Bit 42, `FEATURES_HI`'s bit 10, is `ICB_SLOTS_IN_PAGES`, which means
+  nothing without `ICB_SLOTS` and `PAGES_BUFFERS`: an indirect command
+  buffer's slots may lie in the pages of a pages block of the process's, its
+  own memory, rather than in a block of the region, which the guest's kernel
+  maps uncached on an AMD host. Ring 0 carries `ICB_SLOTS_IN_PAGES` (0x23a,
+  `RgfxIcbSlots` then `RgfxIcbSlotPagesRun`s: an `ICB_SLOTS` run whose first
+  slot lies `pages_offset` bytes into the pages of the pages block at
+  `block_offset`), which the host reads and takes in place, in the guest's RAM
+  for a block of one run and in the block's view for one of more. The bundle
+  takes a chunked pages block of the kext's for each buffer's slots, its
+  table's bytes rounded up to whole 64 KiB chunks, and a block of the region
+  where the kext gives none; the block goes back after the buffer's destroy.
+  A host offers it where it offers `PAGES_BUFFERS`, and the kext takes it; a
+  bundle on a host that did not offer it lays every buffer's slots in the
+  region.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed

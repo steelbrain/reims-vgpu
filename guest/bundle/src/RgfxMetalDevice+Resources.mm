@@ -346,15 +346,18 @@ const char *bufferCause(NSUInteger length, MTLResourceOptions options, NSUIntege
 		noteNil(creator, "the host offers none", asked);
 		return nil;
 	}
-	// Slots where the host takes them, in blocks of the process's region.
-	const bool slots = ([self caps]->features() & RGFX_FEATURE_ICB_SLOTS) != 0;
+	// Slots where the host takes them: in chunked pages blocks of the process's where it takes
+	// those too, else in blocks of the process's region.
+	const uint64_t features = [self caps]->features();
+	const bool slots = (features & RGFX_FEATURE_ICB_SLOTS) != 0;
 	id<MTLIndirectCommandBuffer> icb =
 	    [RgfxIndirectCommandBuffer icbWithDescriptor:descriptor
 	                                 maxCommandCount:maxCount
 	                                         options:options
 	                                          device:self
 	                                      serializer:[self serializer]
-	                                     slotsRegion:slots ? [self region] : nullptr];
+	                                     slotsRegion:slots ? [self region] : nullptr
+	                                    slotsInPages:(features & RGFX_FEATURE_ICB_SLOTS_IN_PAGES) != 0];
 	if (icb == nil)
 		noteNil(creator, "the factory made none", asked);
 	return icb;

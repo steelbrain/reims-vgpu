@@ -891,26 +891,28 @@ void RgfxSerializer::postIcbMessage(IcbMessage &message, RgfxIcbFlush *flush)
 	}
 }
 
-void RgfxSerializer::postIcbSlots(const std::vector<RgfxIcbSlotRun> &runs, RgfxIcbFlush *flush)
+template <typename Run>
+void RgfxSerializer::postIcbSlots(uint32_t type, const std::vector<Run> &runs, RgfxIcbFlush *flush)
 {
 	const uint32_t cap = icbMessageCap();
-	const size_t most = (cap - sizeof(RgfxIcbSlots)) / sizeof(RgfxIcbSlotRun);
+	const size_t most = (cap - sizeof(RgfxIcbSlots)) / sizeof(Run);
 	std::vector<uint8_t> bytes;
 	for (size_t at = 0; at < runs.size(); at += most) {
 		const size_t n = std::min(most, runs.size() - at);
 		RgfxIcbSlots head = {};
 		head.obj_id = runs[at].icb_obj_id;
 		head.run_count = static_cast<uint32_t>(n);
-		const uint32_t size = static_cast<uint32_t>(sizeof(head) + n * sizeof(RgfxIcbSlotRun));
+		const uint32_t size = static_cast<uint32_t>(sizeof(head) + n * sizeof(Run));
 		bytes.resize(size);
 		std::memcpy(bytes.data(), &head, sizeof(head));
-		std::memcpy(bytes.data() + sizeof(head), &runs[at], n * sizeof(RgfxIcbSlotRun));
+		std::memcpy(bytes.data() + sizeof(head), &runs[at], n * sizeof(Run));
 		const auto start = std::chrono::steady_clock::now();
-		if (!m_control.tryPost(RGFX_CMD_ICB_SLOTS, bytes.data(), size, nullptr)) {
+		if (!m_control.tryPost(type, bytes.data(), size, nullptr)) {
 			// As a lost ICB_WRITE: the commands keep what they had.
 			static char site;
 			if (rgfxLogFirst(&site))
-				std::fprintf(stderr, "RGFX: ICB_SLOTS of %zu runs was not posted\n", n);
+				std::fprintf(stderr, "RGFX: %s of %zu runs was not posted\n",
+				             type == RGFX_CMD_ICB_SLOTS ? "ICB_SLOTS" : "ICB_SLOTS_IN_PAGES", n);
 		}
 		if (flush != nullptr) {
 			flush->messages++;
@@ -921,6 +923,14 @@ void RgfxSerializer::postIcbSlots(const std::vector<RgfxIcbSlotRun> &runs, RgfxI
 			        .count());
 		}
 	}
+}
+
+void RgfxSerializer::postIcbSlots(const std::vector<RgfxIcbSlotRun> &runs,
+                                  const std::vector<RgfxIcbSlotPagesRun> &pagesRuns,
+                                  RgfxIcbFlush *flush)
+{
+	postIcbSlots(RGFX_CMD_ICB_SLOTS, runs, flush);
+	postIcbSlots(RGFX_CMD_ICB_SLOTS_IN_PAGES, pagesRuns, flush);
 }
 
 RgfxIcbFlush RgfxSerializer::flushIcbWrites()
@@ -934,12 +944,13 @@ RgfxIcbFlush RgfxSerializer::flushIcbWrites()
 	std::lock_guard<std::mutex> lock(m_icbLock);
 	if (!m_icbSlots.empty()) {
 		std::vector<RgfxIcbSlotRun> runs;
+		std::vector<RgfxIcbSlotPagesRun> pagesRuns;
 		for (RgfxIcbSlotTable *slots : m_icbSlots) {
 			slots->pending.store(false, std::memory_order_seq_cst);
-			slots->takeRuns(runs);
+			slots->takeRuns(runs, pagesRuns);
 		}
 		m_icbSlots.clear();
-		postIcbSlots(runs, &flush);
+		postIcbSlots(runs, pagesRuns, &flush);
 	}
 	for (IcbMessage &message : m_icbMessages)
 		postIcbMessage(message, &flush);
@@ -961,8 +972,9 @@ void RgfxSerializer::flushIcbSlots(RgfxIcbSlotTable *slots)
 {
 	std::lock_guard<std::mutex> lock(m_icbLock);
 	std::vector<RgfxIcbSlotRun> runs;
-	slots->takeRuns(runs);
-	postIcbSlots(runs, nullptr);
+	std::vector<RgfxIcbSlotPagesRun> pagesRuns;
+	slots->takeRuns(runs, pagesRuns);
+	postIcbSlots(runs, pagesRuns, nullptr);
 }
 
 void RgfxSerializer::forgetIcbSlots(RgfxIcbSlotTable *slots)

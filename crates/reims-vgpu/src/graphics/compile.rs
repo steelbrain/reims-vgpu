@@ -561,6 +561,16 @@ impl Pending {
         }
     }
 
+    /// Waits until no pipeline of those `named` answers is pending, where any is: `named` is
+    /// asked only then, as it reads the guest's slots (an `ICB_SLOTS_IN_PAGES`'s, which the
+    /// decoder finds in their pages blocks).
+    pub(crate) fn wait_for_named(&self, named: impl FnOnce() -> Vec<u64>) {
+        if self.ids.lock().is_empty() {
+            return;
+        }
+        self.wait_for_ids(&named());
+    }
+
     /// Waits until no pipeline the `ICB_WRITE` `message`'s records set is pending.
     pub(crate) fn wait_for_icb_write(&self, message: &[u8]) {
         let mut ids = self.ids.lock();

@@ -50,23 +50,23 @@ use reims_vgpu_graphics::wire::{
     RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_DYNAMIC_LIBRARY_CREATE,
     RGFX_CMD_FUNCTION_HANDLE_CREATE, RGFX_CMD_FUNCTION_TABLE_CREATE, RGFX_CMD_HEAP_OVER_PAGES,
     RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_SLOTS,
-    RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
-    RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, RGFX_CMD_OBJECT_DESTROY,
-    RGFX_CMD_RATE_MAP_CREATE, RGFX_CMD_RATE_MAP_QUERY, RGFX_CMD_RATE_MAP_RESET,
-    RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_IMPORT,
-    RGFX_CMD_SHARED_EVENT_NAME, RGFX_CMD_SHARED_EVENT_UNNAME, RGFX_CONTEXT_OBJ_ID_SHIFT,
-    RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_FUNCTION_POINTER_STATE, RGFX_EVT_ICB_STATE,
-    RGFX_EVT_RATE_MAP_ANSWER, RGFX_EVT_RATE_MAP_STATE, RGFX_EVT_SAMPLER_STATE,
+    RGFX_CMD_ICB_SLOTS_IN_PAGES, RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE,
+    RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE,
+    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_RATE_MAP_CREATE, RGFX_CMD_RATE_MAP_QUERY,
+    RGFX_CMD_RATE_MAP_RESET, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE,
+    RGFX_CMD_SHARED_EVENT_IMPORT, RGFX_CMD_SHARED_EVENT_NAME, RGFX_CMD_SHARED_EVENT_UNNAME,
+    RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_FUNCTION_POINTER_STATE,
+    RGFX_EVT_ICB_STATE, RGFX_EVT_RATE_MAP_ANSWER, RGFX_EVT_RATE_MAP_STATE, RGFX_EVT_SAMPLER_STATE,
     RGFX_FEATURE_CB_SUBMITTED, RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_DISPLAY_COLOR,
     RGFX_FEATURE_DISPLAY_POWER, RGFX_FEATURE_DISPLAY_SCALE, RGFX_FEATURE_DYNAMIC_LIBRARIES,
     RGFX_FEATURE_FUNCTION_POINTERS, RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_HOST_TIME,
-    RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_MANAGED_AT_OFFSET,
-    RGFX_FEATURE_MANAGED_BUFFER_SLABS, RGFX_FEATURE_MANAGED_TEXTURE_SLABS,
-    RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE, RGFX_FEATURE_PAGES_16K,
-    RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PIPELINE_KEYS, RGFX_FEATURE_PRIVATE_RENDER_STATE,
-    RGFX_FEATURE_RATE_MAPS, RGFX_FEATURE_SCHEDULED_ASK, RGFX_FEATURE_SHARED_EVENT_NAMES,
-    RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE,
-    RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
+    RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_ICB_SLOTS_IN_PAGES, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
+    RGFX_FEATURE_MANAGED_AT_OFFSET, RGFX_FEATURE_MANAGED_BUFFER_SLABS,
+    RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE,
+    RGFX_FEATURE_PAGES_16K, RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PIPELINE_KEYS,
+    RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_RATE_MAPS, RGFX_FEATURE_SCHEDULED_ASK,
+    RGFX_FEATURE_SHARED_EVENT_NAMES, RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM,
+    RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
     RGFX_FEATURE_SURFACE_DEFERRED_ASK, RGFX_FEATURE_SURFACE_DEFERRED_CARRY,
     RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA,
     RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
@@ -378,7 +378,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // grants in small chunks (`RESOURCE_ID_SMALL_CHUNK`). Every host lets the guest read
             // the clock its VBLANKs are stamped on (the device answers HOST_TIME). A host that maps
             // the guest's pages maps a process's own pages too, for its no-copy buffers
-            // (`BUFFER_OVER_PAGES`) and the heaps of its buffers' slabs (`HEAP_OVER_PAGES`). Every
+            // (`BUFFER_OVER_PAGES`), the heaps of its buffers' slabs (`HEAP_OVER_PAGES`) and its
+            // indirect command buffers' slots (`ICB_SLOTS_IN_PAGES`). Every
             // host carries the display pipe's colour out (`DISPLAY_COLOR`), its window drawing
             // through it, names the shared events one process hands another
             // (`SHARED_EVENT_NAMES`), and tells the guest its window's screen's scale
@@ -394,7 +395,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // tables (`FUNCTION_POINTERS`).
             let in_place = u64::from(RGFX_FEATURE_SURFACE_PAGES)
                 | u64::from(RGFX_FEATURE_PAGES_BUFFERS)
-                | u64::from(RGFX_FEATURE_HEAP_OVER_PAGES);
+                | u64::from(RGFX_FEATURE_HEAP_OVER_PAGES)
+                | RGFX_FEATURE_ICB_SLOTS_IN_PAGES;
             let features = u64::from(RGFX_FEATURE_CB_SUBMITTED)
                 | u64::from(RGFX_FEATURE_SURFACE_ORDER)
                 | u64::from(RGFX_FEATURE_COMMIT_ORDER)
@@ -1495,6 +1497,17 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             }
             RGFX_CMD_ICB_WRITE => self.pending.wait_for_icb_write(message),
             RGFX_CMD_ICB_SLOTS => self.pending.wait_for_icb_slots(&self.region, message),
+            // Its slots lie in pages blocks, which the sender's decoder finds, as it would carry
+            // the message out.
+            RGFX_CMD_ICB_SLOTS_IN_PAGES => self.pending.wait_for_named(|| {
+                let _carried = self.reset_gate.read();
+                if poster.stale() {
+                    return Vec::new();
+                }
+                (self.decoders)
+                    .sender(Some(sender_context(poster, message)), Sinks::default())
+                    .icb_slots_in_pages_pipelines(&self.device, message)
+            }),
             // The destroy of an indirect command buffer still being made (the kext destroys
             // behind a create it stopped waiting for, after a minute, or one made for a context
             // that had closed) waits for its create, so it and everything after it keep their
@@ -1523,8 +1536,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 // An ICB_WRITE's records and an ICB_SLOTS's slots run on the control ring, ahead
                 // of the process's later command buffers: how long they take is logged
                 // (diagnostics).
-                let icb_start = (r#type == RGFX_CMD_ICB_WRITE || r#type == RGFX_CMD_ICB_SLOTS)
-                    .then(|| self.pool.now());
+                let icb_start = matches!(
+                    r#type,
+                    RGFX_CMD_ICB_WRITE | RGFX_CMD_ICB_SLOTS | RGFX_CMD_ICB_SLOTS_IN_PAGES
+                )
+                .then(|| self.pool.now());
                 let outcome = if foreign {
                     Ok(Err(DecodeError::BadReference))
                 } else {
@@ -1534,7 +1550,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     log::debug!(
                         target: "reims_vgpu::graphics::icb",
                         "{} of {} bytes applied in {} us",
-                        if r#type == RGFX_CMD_ICB_SLOTS { "ICB_SLOTS" } else { "ICB_WRITE" },
+                        match r#type {
+                            RGFX_CMD_ICB_SLOTS => "ICB_SLOTS",
+                            RGFX_CMD_ICB_SLOTS_IN_PAGES => "ICB_SLOTS_IN_PAGES",
+                            _ => "ICB_WRITE",
+                        },
                         message.len(),
                         self.pool.now().saturating_duration_since(start).as_micros()
                     );

@@ -86,6 +86,11 @@
 //!   `LIBRARY_FROM_REGION`, `ARGUMENT_LAYOUT` and `ICB_SLOTS` (their spans): spans of the
 //!   process's own blocks, checked against the region's grants and holds, which no block lane's
 //!   job changes; the host waits for no block's pages for them.
+//! - `ICB_SLOTS_IN_PAGES`: names pages blocks of its context's own, each described by a
+//!   `SURFACE_PAGES` for the context the kext posted before it, which the context's lane waits
+//!   for (above); it reads the block's pages, or the view the host makes of them where it has none
+//!   yet, which no other lane's job changes before the block's `BLOCK_RELEASE`, a message of the
+//!   same lane after it.
 //! - A command buffer's `RGFX_OP_SURFACE_USE`s: the buffer waits for its own context's messages on
 //!   every lane (above), and the host waits for a block's `SURFACE_PAGES` being carried out
 //!   before it uses the block. `RGFX_OP_SURFACE_ORDER` names queues and seqnos, no block.

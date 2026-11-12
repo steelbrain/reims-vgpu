@@ -36,11 +36,11 @@ uint32_t RgfxIcbSlotTable::strideFor(uint16_t kind, uint32_t a, uint32_t b)
 
 RgfxIcbSlotTable::RgfxIcbSlotTable(RgfxSerializer *serializer, uint64_t icb, uint16_t kind, uint32_t a,
                            uint32_t b, uint32_t count, uint32_t stride, volatile uint8_t *base,
-                           uint64_t offset)
+                           uint64_t offset, uint64_t pagesBlockSize)
     : m_serializer(serializer), m_icb(icb), m_kind(kind), m_a(a), m_b(b), m_count(count),
       m_stride(stride),
       m_fixed(kind == RGFX_ICB_SLOTS_RENDER ? sizeof(RgfxIcbRenderSlot) : sizeof(RgfxIcbComputeSlot)),
-      m_base(base), m_offset(offset)
+      m_base(base), m_offset(offset), m_blockSize(pagesBlockSize)
 {
 	const uint32_t chunks = (count + kChunk - 1) / kChunk;
 	m_dirtyWords = (chunks + 63) / 64;
@@ -86,7 +86,8 @@ void RgfxIcbSlotTable::enqueue()
 	m_serializer->icbSlotsPending(this);
 }
 
-void RgfxIcbSlotTable::takeRuns(std::vector<RgfxIcbSlotRun> &runs)
+void RgfxIcbSlotTable::takeRuns(std::vector<RgfxIcbSlotRun> &runs,
+                                std::vector<RgfxIcbSlotPagesRun> &pagesRuns)
 {
 	RgfxIcbSlotRun run = {};
 	run.icb_obj_id = m_icb;
@@ -95,11 +96,29 @@ void RgfxIcbSlotTable::takeRuns(std::vector<RgfxIcbSlotRun> &runs)
 	run.bindings_a = static_cast<uint8_t>(m_a);
 	run.bindings_b = static_cast<uint8_t>(m_b);
 	bool open = false;
-	// A run of chunks: closed at the first clear bit after a set one.
+	// A run of chunks: closed at the first clear bit after a set one. Its first slot lies at its
+	// region offset, or at its offset in the pages, which the slots start.
 	auto close = [&](uint32_t endChunk) {
 		const uint32_t end = std::min<uint64_t>(uint64_t(endChunk) * kChunk, m_count);
 		run.command_count = end - run.first_command;
-		runs.push_back(run);
+		const uint64_t at = uint64_t(run.first_command) * m_stride;
+		if (inPages()) {
+			RgfxIcbSlotPagesRun p = {};
+			p.icb_obj_id = run.icb_obj_id;
+			p.block_offset = m_offset;
+			p.block_size = m_blockSize;
+			p.pages_offset = at;
+			p.first_command = run.first_command;
+			p.command_count = run.command_count;
+			p.slot_bytes = run.slot_bytes;
+			p.kind = run.kind;
+			p.bindings_a = run.bindings_a;
+			p.bindings_b = run.bindings_b;
+			pagesRuns.push_back(p);
+		} else {
+			run.region_offset = m_offset + at;
+			runs.push_back(run);
+		}
 		open = false;
 	};
 	for (uint32_t w = 0; w < m_dirtyWords; w++) {
@@ -111,7 +130,6 @@ void RgfxIcbSlotTable::takeRuns(std::vector<RgfxIcbSlotRun> &runs)
 			const bool set = (bits >> bit) & 1;
 			if (set && !open) {
 				run.first_command = chunk * kChunk;
-				run.region_offset = m_offset + uint64_t(run.first_command) * m_stride;
 				open = true;
 			} else if (!set && open) {
 				close(chunk);

@@ -1,11 +1,17 @@
 /*
- * RgfxIcbSlotTable: an indirect command buffer's CPU encodes as slots in a block of the process's
- * region, where the host took ICB_SLOTS (crates/reims-vgpu-graphics/src/icb.rs, "Slots"). Each command
- * has a slot of its own, `stride` bytes from the next; a setter writes its field there and sets
- * the field's bit in the slot's mask with an atomic OR, as a GPU's driver writes a command's
- * record into memory the GPU reads, and posts nothing. The flush (RgfxSerializer::flushIcbWrites)
- * names the commands written since the last one, as runs of 64-command chunks, in one ICB_SLOTS;
- * the host swaps each mask for 0 as it takes a slot, and carries out the bits it took.
+ * RgfxIcbSlotTable: an indirect command buffer's CPU encodes as slots, where the host took
+ * ICB_SLOTS (crates/reims-vgpu-graphics/src/icb.rs, "Slots"): in a chunked pages block of the
+ * kext's (RgfxRegion::acquireChunkedPages) where the host also took ICB_SLOTS_IN_PAGES, memory of
+ * the process's own that its kernel maps cached and the host reads in place, else in a block of the
+ * process's region. The region is uncached in the guest of an AMD host
+ * (docs/graphics-kext/design.md, "The BAR is one host memory region"), so each of a setter's stores
+ * and atomic ORs into a region block is an uncached access there, and its slots are only the
+ * fallback where no chunked pages block is given. Each command has a slot of its own, `stride`
+ * bytes from the next; a setter writes its field there and sets the field's bit in the slot's mask
+ * with an atomic OR, as a GPU's driver writes a command's record into memory the GPU reads, and
+ * posts nothing. The flush (RgfxSerializer::flushIcbWrites) names the commands written since the
+ * last one, as runs of 64-command chunks, in one ICB_SLOTS or ICB_SLOTS_IN_PAGES; the host swaps
+ * each mask for 0 as it takes a slot, and carries out the bits it took.
  *
  * What is written since a flush is kept as one bit a chunk of 64 commands (`m_dirty`), set with an
  * atomic OR on a chunk's first write, and a `pending` flag that puts the table on the serialiser's
@@ -53,10 +59,12 @@ public:
 	static uint32_t strideFor(uint16_t kind, uint32_t a, uint32_t b);
 
 	/// The slots of indirect command buffer `icb`, of `count` commands of `kind` with bindings
-	/// (`a`, `b`), at `base`, region offset `offset`, `stride` apart, zeroed by the caller.
-	/// Flushes go through `serializer`.
+	/// (`a`, `b`), at `base`, `stride` apart, zeroed: at region offset `offset`, or, where
+	/// `pagesBlockSize` is not 0, from the first byte of the pages of the pages block at region
+	/// offset `offset`, of that size. Flushes go through `serializer`.
 	RgfxIcbSlotTable(RgfxSerializer *serializer, uint64_t icb, uint16_t kind, uint32_t a, uint32_t b,
-	             uint32_t count, uint32_t stride, volatile uint8_t *base, uint64_t offset);
+	             uint32_t count, uint32_t stride, volatile uint8_t *base, uint64_t offset,
+	             uint64_t pagesBlockSize = 0);
 
 	uint64_t icb() const { return m_icb; }
 	uint16_t kind() const { return m_kind; }
@@ -64,6 +72,9 @@ public:
 	uint32_t stride() const { return m_stride; }
 	uint64_t offset() const { return m_offset; }
 	uint64_t bytes() const { return uint64_t(m_count) * m_stride; }
+	/// Whether the slots lie in a pages block's pages (its size, 0 for a block of the region).
+	bool inPages() const { return m_blockSize != 0; }
+	uint64_t blockSize() const { return m_blockSize; }
 
 	/// Whether setters write slots: false once the buffer turned to records.
 	bool active() const { return m_active.load(std::memory_order_relaxed); }
@@ -193,8 +204,9 @@ public:
 	std::atomic<bool> pending{false};
 
 	/// The runs of the chunks written since the last take, each the commands of consecutive
-	/// chunks, appended to `runs`; the chunks' bits are swapped for 0.
-	void takeRuns(std::vector<RgfxIcbSlotRun> &runs);
+	/// chunks, appended to `runs` (ICB_SLOTS') for slots in the region, else to `pagesRuns`
+	/// (ICB_SLOTS_IN_PAGES'); the chunks' bits are swapped for 0.
+	void takeRuns(std::vector<RgfxIcbSlotRun> &runs, std::vector<RgfxIcbSlotPagesRun> &pagesRuns);
 
 private:
 	static void store64(uint8_t *at, uint64_t v)
@@ -238,6 +250,7 @@ private:
 	uint32_t m_fixed; // the fixed part's bytes, where the bindings start
 	volatile uint8_t *m_base;
 	uint64_t m_offset;
+	uint64_t m_blockSize; // the pages block's, 0 for slots in a block of the region
 	std::atomic<bool> m_active{true};
 	std::unique_ptr<std::atomic<uint64_t>[]> m_dirty; // a bit a chunk, 64 chunks a word
 	uint32_t m_dirtyWords;
