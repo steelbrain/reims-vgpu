@@ -53,7 +53,10 @@
 //   hold         hold WHAT => kept|freed [count N]  whether an object stays alive once the
 //                probe drops its own reference, held only by a set (an allocation added, before
 //                and after a commit, and after its removal is committed), a queue (a set added,
-//                then removed) or a command buffer (a set it uses, before and after it completes)
+//                then removed; then a moment later, once the queue made a command buffer, and
+//                once one of its buffers completed; the same for a set added and removed twice,
+//                and for a set of another queue) or a command buffer (a set it uses, before and
+//                after it completes)
 //   queue        queue OP => done; queue run => status S error E fill V
 //                addResidencySet:, addResidencySets:count:, removeResidencySet: and
 //                removeResidencySets:count:, twice, of a set never added, of none, then a command
@@ -417,6 +420,28 @@ static void case_retain(void)
 	printf("retain set used by a released command buffer => %lu\n", (unsigned long)rc(s));
 }
 
+// Whether the set `*ws` stays alive once `queue` makes a command buffer, and once one of its
+// buffers completes.
+static void hold_until_let_go(__weak id *ws, id<MTLCommandQueue> queue, const char *what)
+{
+	@autoreleasepool {
+		id<MTLCommandBuffer> b = [queue commandBuffer];
+		(void)b;
+	}
+	printf("hold set %s, once the queue made a command buffer => %s\n", what,
+	       *ws ? "kept" : "freed");
+	if (!*ws)
+		return;
+	@autoreleasepool {
+		id<MTLCommandBuffer> b = [queue commandBuffer];
+		[b commit];
+		[b waitUntilCompleted];
+	}
+	usleep(100000);
+	printf("hold set %s, once a command buffer of the queue completed => %s\n", what,
+	       *ws ? "kept" : "freed");
+}
+
 static void case_hold(void)
 {
 	__weak id w = nil;
@@ -470,6 +495,46 @@ static void case_hold(void)
 			[g_queue removeResidencySet:ws];
 		}
 		printf("hold set removed from the queue => %s\n", ws ? "kept" : "freed");
+		usleep(100000);
+		printf("hold set removed from the queue, a moment later => %s\n", ws ? "kept" : "freed");
+		hold_until_let_go(&ws, g_queue, "removed from the queue");
+	}
+	// Added twice and removed twice, before the queue makes a buffer.
+	@autoreleasepool {
+		id<MTLResidencySet> q = make_set();
+		ws = q;
+		[g_queue addResidencySet:q];
+		[g_queue addResidencySet:q];
+		[g_queue removeResidencySet:q];
+	}
+	printf("hold set added twice, removed once => %s\n", ws ? "kept" : "freed");
+	if (ws) {
+		@autoreleasepool {
+			id<MTLCommandBuffer> b = [g_queue commandBuffer];
+			(void)b;
+		}
+		printf("hold set added twice, removed once, once the queue made a command buffer => %s\n",
+		       ws ? "kept" : "freed");
+		@autoreleasepool {
+			[g_queue removeResidencySet:ws];
+		}
+		printf("hold set added twice, removed twice => %s\n", ws ? "kept" : "freed");
+		hold_until_let_go(&ws, g_queue, "added twice, removed twice");
+	}
+	// Added to and removed from a queue, then another queue makes and runs a buffer.
+	@autoreleasepool {
+		id<MTLResidencySet> q = make_set();
+		ws = q;
+		[g_queue addResidencySet:q];
+		[g_queue removeResidencySet:q];
+	}
+	printf("hold set removed, another queue => %s\n", ws ? "kept" : "freed");
+	if (ws) {
+		id<MTLCommandQueue> other = [g_dev newCommandQueue];
+		hold_until_let_go(&ws, other, "removed, another queue");
+		if (ws) {
+			hold_until_let_go(&ws, g_queue, "removed, another queue, then its own");
+		}
 	}
 
 	id<MTLCommandBuffer> cb = [g_queue commandBuffer];
