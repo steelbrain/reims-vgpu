@@ -8,6 +8,8 @@
 //! names the libraries' content. A create naming a library the device holds under no key, a
 //! mesh create and a compute create that links dynamic libraries are not keyed: their answers
 //! hang on objects the key cannot name.
+//!
+//! [`RGFX_PIPELINE_REFLECT_KEYED`]: reims_vgpu_graphics::wire::RGFX_PIPELINE_REFLECT_KEYED
 
 use std::mem::offset_of;
 
