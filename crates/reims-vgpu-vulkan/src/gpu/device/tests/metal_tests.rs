@@ -2637,6 +2637,7 @@ pub(crate) fn device_with_own_cache() -> (VulkanDevice, OwnCache) {
         awake: Default::default(),
         threads: Default::default(),
         rows_pitches: crate::core::sync::Mutex::default(),
+        guest_texture_ids: None,
     });
     (device, cache)
 }

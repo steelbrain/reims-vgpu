@@ -54,6 +54,27 @@ impl ApiPlatform for VulkanPlatform {
         }
     }
 
+    /// The guest's texture resource IDs, declared for every device the process makes from now on
+    /// (`reims_vgpu_vulkan::platform::present_guest_texture_ids`), which reserves them as its
+    /// first call: on Linux a device that needs imported pages mapped from their files makes a
+    /// command queue of its own as it is made where its driver's fold verdict is not kept yet (a
+    /// cold cache, a new driver or kernel), which would otherwise come before the graphics
+    /// device's reservation, and Metal, as the runtime imitates, then hands the pool's first
+    /// range out twice. The first declaration fixes the IDs; a later one of others is warned of.
+    fn present_guest_texture_ids(&self, ids: std::ops::RangeInclusive<u64>) {
+        let fixed = reims_vgpu_vulkan::platform::present_guest_texture_ids(ids.clone());
+        if fixed != ids {
+            log::warn!(
+                "the process's devices reserve texture ids {} to {} as they are made, fixed before \
+                 this graphics device's {} to {}",
+                fixed.start(),
+                fixed.end(),
+                ids.start(),
+                ids.end()
+            );
+        }
+    }
+
     /// Memory of the library's own, which it frees through the platform's VM as the region
     /// drops, so the unmap waits until the runtime has freed every import of its pages: the
     /// region's last reference can go in a no-copy buffer's deallocator, which the runtime runs

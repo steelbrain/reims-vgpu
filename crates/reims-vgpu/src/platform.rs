@@ -39,6 +39,15 @@ pub trait ApiPlatform: Platform {
         let _ = guest;
     }
 
+    /// Tells the platform the texture resource IDs a graphics device keeps for its guest
+    /// (`crate::graphics`'s `guest_texture_ids`), before the device asks for its Metal device
+    /// ([`ApiPlatform::metal_device`]): a platform whose devices make command queues or textures
+    /// of their own as they are made reserves them there first, before those, and answers the
+    /// graphics device's own reservation of them at once. Nothing by default.
+    fn present_guest_texture_ids(&self, ids: std::ops::RangeInclusive<u64>) {
+        let _ = ids;
+    }
+
     /// Copies the whole of `texture` into `dst`: `height` rows of `width * 4` bytes, each
     /// `bytes_per_row` after the last. The caller has checked that `dst` holds them.
     fn read_pixels(&self, texture: &Self::Texture, dst: &mut [u8], bytes_per_row: usize);

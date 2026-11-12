@@ -326,9 +326,12 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // before it makes any queue. A host with no GPU device cannot run the lane. The
             // platform learns the guest's architecture first, so the device gives the answers of
             // the Macs the guest's frameworks were written against (`GuestArch::mac_class`).
+            // It learns the guest's texture ids too, which a platform whose device makes queues
+            // or textures of its own as it is made reserves there first.
             platform.present_guest(config.guest_arch);
+            platform.present_guest_texture_ids(guest_texture_ids());
             let gpu_device = platform.metal_device(None).ok_or(Error::HostResources)?;
-            // Before anything else makes a queue or a texture on it.
+            // Before anything else of this device makes a queue or a texture on it.
             reserve_guest_texture_ids(platform.as_ref(), &gpu_device);
             let clock = Arc::clone(&platform);
             let pool = CompilePool::new(Box::new(move || clock.clock().now_mono()));
@@ -3037,7 +3040,10 @@ const RESERVATION_CHECKS: usize = 16;
 /// Metal takes a texture reservation only before the device's first texture (it ignores a later
 /// one, logging so), and one after the device's first command queue keeps the pool's first range
 /// beside the ids it leaves, which it hands out twice. So this is the first call on the device,
-/// and a few plain textures check it took: one inside the guest's ids is logged as an error.
+/// and a few plain textures check it took: one inside the guest's ids is logged as an error. A
+/// platform whose device makes a queue or texture of its own as it is made reserves the ids there
+/// first, told them before the device ([`ApiPlatform::present_guest_texture_ids`]), and answers
+/// this call at once.
 fn reserve_guest_texture_ids<P: Platform>(platform: &P, device: &P::Device) {
     let ids: Vec<u64> = guest_texture_ids().collect();
     if let Err(raise) = refusing(|| device.reserve_resource_indices(0, &ids)) {

@@ -288,6 +288,58 @@ fn on_vulkan_guest_texture_ids_are_kept_from_the_host_s() {
     }
 }
 
+/// On the Vulkan platform, a command queue made on the device after it is made but before the
+/// graphics device's reservation, as the device's fold probe makes one where a GPU's imports of
+/// views need their pages' files and its fold verdict is not kept yet (a cold cache, a new driver
+/// or kernel), leaves every guest texture id to the guest: the platform was told the ids first and
+/// reserved them as the device was made, so no plain texture of the host's takes one. Without that
+/// reservation Metal, as the runtime imitates, hands the pool's first range out twice past the
+/// queue. Each test runs in a process of its own, so the device is made here
+#[test]
+fn on_vulkan_a_queue_before_the_graphics_device_takes_no_guest_texture_id() {
+    use reims_vgpu_vulkan::core::platform::resource::Texture as _;
+    use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+    let platform = crate::singleton::platform();
+    platform.present_guest_texture_ids(guest_texture_ids());
+    let gpu = platform.metal_device(None).unwrap();
+    let queue = gpu.new_command_queue().expect("a command queue");
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks {
+            raise_interrupt: None,
+            ..GraphicsCallbacks::default()
+        },
+        window: None,
+        memory_map: None,
+        guest_arch: GuestArch::X86_64,
+    };
+    let _device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
+    let plain_desc = platform.texture_descriptor(&TextureDesc {
+        pixel_format: 80,
+        width: 4,
+        height: 4,
+        usage: 1,
+        resource_options: Some(0x20),
+        ..TextureDesc::default()
+    });
+    let plain: Vec<_> = (0..256)
+        .map(|_| {
+            gpu.new_texture(OnFault::Return, &plain_desc)
+                .unwrap()
+                .unwrap()
+        })
+        .collect();
+    let inside: Vec<u64> = plain
+        .iter()
+        .map(|t| t.gpu_resource_id())
+        .filter(|id| guest_texture_ids().contains(id))
+        .collect();
+    assert!(
+        inside.is_empty(),
+        "plain textures took the guest's ids {inside:?}"
+    );
+    drop(queue);
+}
+
 /// The variable naming the guest architecture of [`the_guest_s_class_decides_the_answers`]'s
 /// child, `x86_64` or `arm64`.
 const GUEST_CLASS_CHILD: &str = "RVG_GUEST_CLASS_CHILD";

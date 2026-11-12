@@ -198,6 +198,9 @@ pub struct DeviceObject {
     pub(crate) threads: crate::let_go::DeviceThreads,
     /// Its answers of [`GpuDevice::linear_rows_pitch`] so far, by row bytes and rows.
     pub(crate) rows_pitches: Mutex<BTreeMap<(u64, u64), Option<u64>>>,
+    /// The guest's texture resource IDs it reserved as it was adopted, where the process declared
+    /// them first (`crate::platform::present_guest_texture_ids`).
+    guest_texture_ids: Option<std::ops::RangeInclusive<u64>>,
 }
 
 impl Drop for DeviceObject {
@@ -340,23 +343,26 @@ pub(crate) fn take_if_only_kept()
     Ok((std::mem::take(&mut *devices), libraries))
 }
 
-/// The handle of `raw`, a device the runtime made: the object of the same device made before, or
-/// a new one, kept. The process's first device's sampler ID pool is the one Metal's sampler mempool
-/// follows ([`metal_space::count_sampler_ids`]). A new device's class joins the process's
-/// placement of degradations ([`crate::answer::native::device_made`]), and its warm pass runs
-/// over the pipeline records earlier processes kept ([`crate::records`]), in the background, but
-/// in a test build. Its work counts go to the log where its filter names their target
-/// ([`crate::work_log`]), its GPU is kept awake while the guest draws ([`crate::awake`]), and the
-/// runtime's check of textures over host pages starts ([`start_in_place_checks`]). The exit gate's
-/// hook is registered, after the device's driver was loaded ([`crate::exit_gate`]): every process
-/// that holds a device of the process's, a test's or a host's, waits at its exit for the library's
-/// GPU work in progress.
+/// The handle of `raw`, a device the runtime made: the object of the same device made before, or a
+/// new one, kept. A new device first reserves the guest's texture resource IDs where the process
+/// declared them ([`reserve_guest_texture_ids`]), before any work of the library's below makes a
+/// command queue or a texture on it. The process's first device's sampler ID pool is the one
+/// Metal's sampler mempool follows ([`metal_space::count_sampler_ids`]). A new device's class joins
+/// the process's placement of degradations ([`crate::answer::native::device_made`]), and its warm
+/// pass runs over the pipeline records earlier processes kept ([`crate::records`]), in the
+/// background, but in a test build. Its work counts go to the log where its filter names their
+/// target ([`crate::work_log`]), its GPU is kept awake while the guest draws ([`crate::awake`]),
+/// and the runtime's check of textures over host pages starts ([`start_in_place_checks`]). The exit
+/// gate's hook is registered, after the device's driver was loaded ([`crate::exit_gate`]): every
+/// process that holds a device of the process's, a test's or a host's, waits at its exit for the
+/// library's GPU work in progress.
 pub fn adopt(raw: rt::Device) -> VulkanDevice {
     let id = registry_id(&raw);
     let mut devices = DEVICES.lock();
     if let Some((_, kept)) = devices.iter().find(|(at, _)| *at == id) {
         return kept.clone_ref();
     }
+    let guest_texture_ids = reserve_guest_texture_ids(&raw);
     crate::exit_gate::arm();
     metal_space::count_sampler_ids(&raw);
     crate::answer::native::device_made(raw.properties());
@@ -378,9 +384,31 @@ pub fn adopt(raw: rt::Device) -> VulkanDevice {
         caps: OnceLock::new(),
         threads,
         rows_pitches: Mutex::default(),
+        guest_texture_ids,
     });
     devices.push((id, made.clone_ref()));
     made
+}
+
+/// Reserves the guest's texture resource IDs on `raw` where the process declared them
+/// (`crate::platform::present_guest_texture_ids`), the device's first call, before the library's
+/// own work on it makes a command queue or a texture ([`adopt`]): the IDs it reserved, or `None`
+/// where none were declared or the runtime refused them, which is logged at error.
+fn reserve_guest_texture_ids(raw: &rt::Device) -> Option<std::ops::RangeInclusive<u64>> {
+    let ids = crate::platform::guest_texture_ids()?;
+    let reserved: Vec<rt::ResourceId> = ids.clone().map(rt::ResourceId).collect();
+    match raw.reserve_resource_ids(rt::ResourceIdKind::Texture, &reserved) {
+        Ok(()) => Some(ids),
+        Err(error) => {
+            log::error!(
+                "the guest's texture resource ids {} to {} are not reserved as the device is \
+                 made ({error:?}): its textures may share ids with the host's",
+                ids.start(),
+                ids.end()
+            );
+            None
+        }
+    }
 }
 
 /// Starts `raw`'s check of textures over host pages on the runtime's thread for it, where its
@@ -1812,9 +1840,17 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// an ID of 2^32 or more it drops whole, leaving the reservation to a later call, as Metal
     /// does. An ID the runtime refuses dies: a texture or sampler state ID of 2^28 or more, which
     /// ended Metal's process, or a texture ID past what the device's texture arrays hold, which
-    /// Metal takes; so does any other type, which core never reserves.
+    /// Metal takes; so does any other type, which core never reserves. Textures of exactly the
+    /// guest's IDs the device reserved as it was adopted ([`adopt`]) are answered at once: they
+    /// are reserved, and the runtime would ignore the call as a late one.
     fn reserve_resource_indices(&self, resource_type: u64, indices: &[u64]) -> RaiseResult<()> {
         let sel = "reserveResourceIndicesForResourceType:indices:indexCount:";
+        if resource_type == 0
+            && let Some(ids) = &self.guest_texture_ids
+            && indices.iter().copied().eq(ids.clone())
+        {
+            return Ok(());
+        }
         let kind = match resource_type {
             0 => rt::ResourceIdKind::Texture,
             1 => rt::ResourceIdKind::SamplerState,
@@ -2746,6 +2782,7 @@ pub(crate) mod tests {
             awake: Default::default(),
             threads: Default::default(),
             rows_pitches: Mutex::default(),
+            guest_texture_ids: None,
         })
     }
 

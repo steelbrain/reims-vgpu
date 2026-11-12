@@ -319,6 +319,31 @@ pub fn present_mac_class(class: rt::MacClass) -> Option<rt::MacClass> {
     *MAC_CLASS.get_or_init(|| Some(class))
 }
 
+/// The texture resource IDs a guest places its textures at, which every device the process adopts
+/// after their declaration reserves first ([`present_guest_texture_ids`]).
+static GUEST_TEXTURE_IDS: OnceLock<std::ops::RangeInclusive<u64>> = OnceLock::new();
+
+/// Declares the texture resource IDs the process's guest places its textures at: every device the
+/// process adopts from now on reserves them as its first call (`gpu::device::adopt`), before the
+/// library's own work on it makes a command queue or a texture (on Linux, the fold probe's queue
+/// as the device learns its imports of views, `crate::os::learn_view_imports`). Metal takes a
+/// texture reservation only before the device's first texture, and one made after the device's
+/// first command queue keeps the pool's first range beside it, handing those IDs out twice; the
+/// runtime imitates both. A later call of the device's for exactly these IDs is then answered at
+/// once ([`crate::gpu::device::VulkanDevice`]'s `reserve_resource_indices`). A device adopted
+/// before the declaration reserves nothing as it is adopted. The first declaration fixes the IDs
+/// for the process; answers the IDs it fixed.
+pub fn present_guest_texture_ids(
+    ids: std::ops::RangeInclusive<u64>,
+) -> std::ops::RangeInclusive<u64> {
+    GUEST_TEXTURE_IDS.get_or_init(|| ids).clone()
+}
+
+/// The guest's texture resource IDs, where declared ([`present_guest_texture_ids`]).
+pub(crate) fn guest_texture_ids() -> Option<std::ops::RangeInclusive<u64>> {
+    GUEST_TEXTURE_IDS.get().cloned()
+}
+
 /// The options every device is made with: the runtime's defaults, whose loader search finds
 /// Homebrew's (`vulkan-loader`, beside its `molten-vk`), with the window system's extensions where
 /// a display's window presents through Vulkan (on Linux, [`crate::os::add_window_extensions`]), the

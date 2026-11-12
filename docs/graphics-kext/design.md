@@ -1840,10 +1840,15 @@ than the 1024 contexts the GPU addresses hold (a busy desktop held 74,
 "Contexts"), where small chunks let 1020; the pool's ids are as many either way.
 The host reserves the pool's ids on its device as it makes the graphics device,
 its first call on the device (`reserve_guest_texture_ids`,
-`crates/reims-vgpu/src/graphics.rs`). Metal hands the id of a texture placed at
-one out again to plain allocation, so without it the guest's textures would share
-ids with the host's own (the window's drawables, the cursor), and a texture placed
-past the table a fresh device has corrupts Metal's heap (placements from 10000 up
+`crates/reims-vgpu/src/graphics.rs`). The Vulkan platform is told the ids before
+the device is made and reserves them as the device's first call, before its own
+probes: on Linux, a GPU whose imports of views need their pages mapped from
+their files makes a command queue as its device is made, where its driver's
+fold verdict is not kept yet (a cold cache, a new driver or kernel). Metal hands
+the id of a texture placed at one out again to plain allocation, so without it
+the guest's textures would share ids with the host's own (the window's
+drawables, the cursor), and a texture placed past the table a fresh device has
+corrupts Metal's heap (placements from 10000 up
 crashed some runs). The reservation keeps the ids from plain allocation and grows
 the table to hold them (measured on an M3 Max, macOS 27; metal2vulkan imitates
 both). Metal takes one only before the device's first texture, and once the device
