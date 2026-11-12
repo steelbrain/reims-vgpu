@@ -376,13 +376,12 @@ bool fileIdentity(const char *path, RgfxFileIdentity &out)
 // URLs of no scheme. A file's library is keyed by the file's identity where it is the same before
 // and after the read (rgfxLibraryKeyOfFile), so a framework's library loaded again is not hashed
 // again.
+// A nil URL ends the process, as Metal's device does at its assertion (measured: macOS 26.7.1, the
+// AMD Radeon Pro 5300M and the Intel UHD 630, and macOS 27.0.1, the M3 Max, alike).
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(__autoreleasing NSError **)error
 {
-	if (url == nil) {
-		if (error)
-			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor, @"newLibraryWithURL: nil URL");
-		return nil;
-	}
+	if (url == nil)
+		RgfxMetalAssertionFailed("-[_MTLDevice newLibraryWithURL:error:]", @"url must not be nil.");
 	NSString *filePath = RgfxLibraryFilePath(url);
 	const char *path = filePath.fileSystemRepresentation;
 	RgfxFileIdentity before = {}, after = {};
@@ -405,13 +404,14 @@ bool fileIdentity(const char *path, RgfxFileIdentity &out)
 	return lib;
 }
 
+// The library of the file at `filepath`, as newLibraryWithURL:error: reads it. A nil path ends the
+// process, as Metal's device does at its assertion (measured: macOS 26.7.1, the AMD Radeon Pro
+// 5300M and the Intel UHD 630, and macOS 27.0.1, the M3 Max, alike: "newLibraryWithFile: failed
+// assertion `filepath must not be nil.'").
 - (id<MTLLibrary>)newLibraryWithFile:(NSString *)filepath error:(__autoreleasing NSError **)error
 {
-	if (filepath == nil) {
-		if (error)
-			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor, @"newLibraryWithFile: nil path");
-		return nil;
-	}
+	if (filepath == nil)
+		RgfxMetalAssertionFailed("newLibraryWithFile", @"filepath must not be nil.");
 	return [self newLibraryWithURL:[NSURL fileURLWithPath:filepath] error:error];
 }
 

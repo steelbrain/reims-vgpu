@@ -15,13 +15,24 @@
 // differ.
 // It also checks the x86 device's answer to newResidencySetWithDescriptor:error:: nil, its error
 // out left as it was, as the x86 Macs answer (measured: macOS 26.7.1, the AMD Radeon Pro 5300M
-// and the Intel UHD 630).
+// and the Intel UHD 630); and that each call Metal's device ends the process at for its argument
+// ends it, in a process of its own (`inherited_tests --dies CASE BUNDLE`), with SIGABRT and
+// Metal's words on stderr.
 #import <Foundation/Foundation.h>
 
 #include <dlfcn.h>
+#include <mach-o/dyld.h>
 #include <objc/runtime.h>
+#include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <string>
+
+extern char **environ;
 
 namespace {
 
@@ -188,11 +199,91 @@ void checkResidencySetAnswer(Class device)
 		                                set, error == sentinel ? @"untouched" : error]);
 }
 
+// The exit status of a death case that raised SIGABRT: its handler exits with it, so the death
+// writes no crash report.
+constexpr int kAborted = 128 + SIGABRT;
+
+// A call Metal's device ends the process at, with Metal's words on stderr: its name, and the
+// member called with the class as `self` (it ends the process before it reads any of the
+// device's state).
+struct Death {
+	const char *name;
+	const char *words;
+	void (*call)(Class device);
+};
+
+const Death kDeaths[] = {
+    // newLibraryWithURL:error: of nil (measured: macOS 26.7.1, the AMD Radeon Pro 5300M and the
+    // Intel UHD 630, and macOS 27.0.1, the M3 Max: "failed assertion `url must not be nil.'").
+    {"library-of-nil-url", "-[_MTLDevice newLibraryWithURL:error:]: failed assertion `url must not be nil.'",
+     [](Class device) {
+	     SEL sel = sel_registerName("newLibraryWithURL:error:");
+	     NSError *error = nil;
+	     ((id(*)(id, SEL, NSURL *, NSError **))method_getImplementation(class_getInstanceMethod(device, sel)))(
+	         (id)device, sel, nil, &error);
+     }},
+    // newLibraryWithFile:error: of nil (measured alike: "failed assertion `filepath must not be
+    // nil.'").
+    {"library-of-nil-path", "newLibraryWithFile: failed assertion `filepath must not be nil.'",
+     [](Class device) {
+	     SEL sel = sel_registerName("newLibraryWithFile:error:");
+	     NSError *error = nil;
+	     ((id(*)(id, SEL, NSString *, NSError **))method_getImplementation(class_getInstanceMethod(device, sel)))(
+	         (id)device, sel, nil, &error);
+     }},
+};
+
+// Runs the death case `d` in a process of its own; fails where it does not end with SIGABRT and
+// its words on stderr.
+void checkDies(const Death &d, const char *bundle)
+{
+	char self[4096];
+	uint32_t size = sizeof self;
+	int fds[2];
+	if (_NSGetExecutablePath(self, &size) != 0 || pipe(fds) != 0) {
+		fail(@"cannot run a death case");
+		return;
+	}
+	posix_spawn_file_actions_t fa;
+	posix_spawn_file_actions_init(&fa);
+	posix_spawn_file_actions_adddup2(&fa, fds[1], 2);
+	posix_spawn_file_actions_addclose(&fa, fds[0]);
+	char *args[] = {self, const_cast<char *>("--dies"), const_cast<char *>(d.name), const_cast<char *>(bundle),
+	                nullptr};
+	pid_t pid = 0;
+	const int spawned = posix_spawn(&pid, self, &fa, nullptr, args, environ);
+	posix_spawn_file_actions_destroy(&fa);
+	close(fds[1]);
+	std::string err;
+	char chunk[512];
+	ssize_t n;
+	while ((n = read(fds[0], chunk, sizeof chunk)) > 0)
+		err.append(chunk, static_cast<size_t>(n));
+	close(fds[0]);
+	int status = 0;
+	if (spawned != 0 || waitpid(pid, &status, 0) != pid) {
+		fail([NSString stringWithFormat:@"--dies %s did not run", d.name]);
+		return;
+	}
+	const bool aborted = WIFEXITED(status) && WEXITSTATUS(status) == kAborted;
+	if (!aborted || err.find(d.words) == std::string::npos)
+		fail([NSString stringWithFormat:@"--dies %s ended with status %d, not SIGABRT with \"%s\":\n%s", d.name,
+		                                status, d.words, err.c_str()]);
+}
+
 } // namespace
 
 int main(int argc, char **argv)
 {
 	@autoreleasepool {
+		if (argc == 4 && strcmp(argv[1], "--dies") == 0) {
+			signal(SIGABRT, [](int) { _exit(kAborted); });
+			Class device = dlopen(argv[3], RTLD_NOW) != nullptr ? objc_getClass("RgfxMetalDevice") : Nil;
+			for (const Death &d : kDeaths)
+				if (device != Nil && strcmp(argv[2], d.name) == 0)
+					d.call(device);
+			return 0; // it went on: the check fails
+		}
 		if (argc != 2) {
 			fprintf(stderr, "usage: inherited_tests BUNDLE\n");
 			return 2;
@@ -209,6 +300,8 @@ int main(int argc, char **argv)
 			return 1;
 		}
 		checkResidencySetAnswer(device);
+		for (const Death &d : kDeaths)
+			checkDies(d, argv[1]);
 		NSDictionary<NSString *, NSValue *> *ours = ownMethods(device);
 		NSMutableSet<NSString *> *inBase = [NSMutableSet set];
 		NSUInteger creators = 0, answered = 0, left = 0;
