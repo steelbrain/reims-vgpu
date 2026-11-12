@@ -31,6 +31,38 @@
 //! a device may pin holds back into dma-bufs (`super::vm::fold_idle`), a mapping per 4 MiB of
 //! their pages, and weighs again: only where that freed too little does it refuse.
 //!
+//! **No device imports such pages in pieces instead**, so past the headroom a buffer or heap whose
+//! pages a device would need mapped from their files is a copy at the stock limit: the copy is the
+//! fallback, not a choice. Each driver was asked by a probe (2026-11-12), which then bound
+//! host-pointer and udmabuf imports of a memfd's pages into a sparse buffer, read it with a GPU
+//! copy and filled it:
+//! - A view of a 256 MiB buffer of scattered 4 KiB pages is 65,537 mappings (measured, RTX 5080
+//!   Laptop host, Linux 7.2.8, potluck job m3-max-20500), more than the kernel's default
+//!   `vm.max_map_count` of 65,530 lets the whole process hold (read, the kernel's
+//!   `DEFAULT_MAX_MAP_COUNT`).
+//! - NVIDIA's sparse buffers take only its device-local memory type, memory type bits `0b10` with
+//!   or without external handle types, and its imports of host pointers and dma-bufs are of other
+//!   types (measured: 615.71.09 on the RTX 5080 Laptop, Linux 7.2.8, job m3-max-20601; 620.70.06
+//!   on an RTX 3090, Linux 7.3.3, job m3-max-20590, and an RTX 2080, job m3-max-20595).
+//! - ANV answers a sparse buffer's import of host pointers and of dma-bufs as not importable
+//!   (`vkGetPhysicalDeviceExternalBufferProperties`), though the probe's sparse buffer bound both
+//!   and read and wrote the pages right (measured, Mesa 26.2.6 on the Iris Xe of RPL-P, Linux
+//!   7.3.1, job m3-max-20594): the driver does not report that support, so the library does not
+//!   take that route.
+//! - One dma-buf holds at most udmabuf's `list_limit` of 1,024 runs, 4 MiB of scattered pages; a
+//!   list of 1,025 is refused with `EINVAL` (measured on each of those hosts).
+//!
+//! RADV, which imports no pointer to shared memory (its import of a memfd's pages answers
+//! `ERROR_INVALID_EXTERNAL_HANDLE`), binds a buffer's dma-bufs into a sparse buffer at a 64 KiB
+//! granule (the runtime's `dma_buf.rs`), so its buffers meet no such limit. Its linear images over
+//! dma-bufs each take one dedicated dma-buf: a `DRM_FORMAT_MOD_LINEAR` image answers
+//! `requiresDedicatedAllocation` and takes no sparse binding, and a plain `LINEAR` one takes no
+//! dma-buf (measured, Mesa 26.2.6 on the Radeon 780M and the RX 550, Linux 7.3.3, job
+//! m3-max-20590). So a texture over more than 1,024 runs of scattered pages is the runtime's
+//! shadow there. The guest's own buffers lie in the kext's 64 KiB chunks, a 256 MiB buffer 4,096
+//! runs (read, `guest/bundle/src/RgfxSlabs.hpp`): what passes the budget is an app's no-copy
+//! memory, laid out as the guest's kernel hands its pages out.
+//!
 //! The limit is read when the first view is weighed, and again when one would pass it, as it may
 //! have been raised since. A guest whose RAM, mapped from its files a mapping a 4 KiB page, would
 //! pass the budget is logged where the budget bites, with the setting that raises it: as its
