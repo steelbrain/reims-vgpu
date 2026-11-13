@@ -1209,6 +1209,13 @@ pub fn created_or_decided<T>(
 ///   own. Such draws died before the runtime drew triangles' edges as bands (`DeviceWideLines` or
 ///   `LinesAtNearestWidth`), so placing it here ends no run that went on. Announced at each such
 ///   draw, inside its call, which dies at its selector;
+/// - `TrianglePointSize`: a draw of triangles in fill mode `Points` (`setTriangleFillMode:` 2,
+///   which Apple's GL renderer sends for `glPolygonMode(GL_POINT)` on the Intel and Apple GPUs'
+///   settings) under a render pipeline state whose vertex function writes `[[point_size]]`, whose
+///   vertices the device draws as points of the size the function writes, where Metal draws one
+///   pixel whatever it writes (measured on an Apple M3 Max). A function that writes none draws
+///   points of one pixel and announces nothing. Announced at each such draw, inside its call,
+///   which dies at its selector, as the device's own wide lines (`DeviceWideLines`) do;
 /// - `DeviceLineTies`: a draw of lines, or of a triangle's edges in fill mode `Lines`, that the
 ///   device's own lines draw at width 1 (Metal's default width, or the nearest width a device
 ///   without `wideLines` draws), on a driver not measured to break a tie as Metal does (the
@@ -1311,7 +1318,7 @@ pub fn created_or_decided<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 147] = [
+pub const DIES: [rt::Degradation; 148] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1447,6 +1454,7 @@ pub const DIES: [rt::Degradation; 147] = [
     rt::Degradation::DeviceWideLines,
     rt::Degradation::LinesAtNearestWidth,
     rt::Degradation::WideEdgeDepthBias,
+    rt::Degradation::TrianglePointSize,
     rt::Degradation::DeviceLineTies,
     rt::Degradation::DeviceSubpixelSnap,
     rt::Degradation::PredicationWordPastBuffer,
