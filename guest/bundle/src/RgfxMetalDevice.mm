@@ -238,7 +238,8 @@ bool rgfxKextSubmit(void *context, const void *message, uint32_t size, uint64_t 
 	return true;
 }
 
-// The control ring's batch (RgfxRingWriter::setBatch): the destroys it held, posted in one call
+// The control ring's batch (RgfxRingWriter::setBatch): the messages it held (destroys, and the
+// creates and writes no one waits for that name no block), posted in one call
 // (kRgfxAccelMethodSubmitBatch), which they go before: how many the kext posted, from the first.
 uint32_t rgfxKextSubmitBatch(void *context, const void *messages, uint32_t bytes)
 {
@@ -937,8 +938,8 @@ RGFX_LOG_UNRECOGNIZED
 	_replyReader = new RgfxReplyReader();
 	_link.reader = _replyReader;
 	_controlRing = std::make_unique<RgfxRingWriter>(&rgfxKextSubmit, &_link, kLifecycleMessageMax);
-	// The process's destroys go together, where the kext takes them in one call
-	// (RgfxRingWriter::postLater).
+	// The process's destroys, and its creates and writes no one waits for that name no block, go
+	// together, where the kext takes them in one call (RgfxRingWriter::postLater).
 	if ((_caps.kextFeatures() & kRgfxKextFeatureSubmitBatch) != 0) {
 		_controlRing->setBatch(&rgfxKextSubmitBatch, kRgfxSubmitBatchBytes);
 		_link.control = _controlRing.get();
