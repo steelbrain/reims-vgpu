@@ -109,6 +109,12 @@
 //                tests Always, Never and Less with and without writes (mix.DC.W.SC.OPS)
 //   ds.resourceIndex, ds.uniqueIdentifier  whether a depth/stencil state answers that SPI member,
 //                and what it returns
+//   purgeable.kinds  setPurgeableState: answers of each kind of resource the device makes: asked
+//                Volatile, then KeepCurrent, Empty, KeepCurrent, NonVolatile and KeepCurrent, one
+//                line a kind "purgeable KIND => A B C D E F": a Shared and a Private buffer, a
+//                no-copy buffer, a Private texture, a view of it, a texture over a buffer, one
+//                over an IOSurface, a Private heap and a buffer and a texture in it, and an
+//                indirect command buffer
 //   tiled.bytes  the device's tiled texture SPI over bytes, both forms, of a one-level and a
 //                six-level 64 x 64 BGRA8Unorm descriptor (usage ShaderRead | RenderTarget) of
 //                each storage mode, 256 bytes a row; tiled.buffer, a Shared buffer's tiled SPI
@@ -244,6 +250,87 @@ static void case_heap_shared(id<MTLDevice> d)
 	td.storageMode = MTLStorageModeShared;
 	id<MTLTexture> t = [h newTextureWithDescriptor:td];
 	printf("heap.shared texture=%s\n", cls(t));
+}
+
+// The purgeable states a resource answers, asked in turn (purgeable.kinds).
+static void purgeable_line(const char *kind, id<MTLResource> r)
+{
+	if (r == nil) {
+		printf("purgeable %s => nil\n", kind);
+		return;
+	}
+	const MTLPurgeableState asks[] = {MTLPurgeableStateVolatile, MTLPurgeableStateKeepCurrent,
+	                                  MTLPurgeableStateEmpty, MTLPurgeableStateKeepCurrent,
+	                                  MTLPurgeableStateNonVolatile, MTLPurgeableStateKeepCurrent};
+	printf("purgeable %s =>", kind);
+	for (int i = 0; i < 6; i++)
+		printf(" %lu", (unsigned long)[r setPurgeableState:asks[i]]);
+	printf("\n");
+}
+
+static void case_purgeable_kinds(id<MTLDevice> d)
+{
+	purgeable_line("buffer.shared", [d newBufferWithLength:65536 options:MTLResourceStorageModeShared]);
+	purgeable_line("buffer.private", [d newBufferWithLength:65536 options:MTLResourceStorageModePrivate]);
+	const size_t page = (size_t)getpagesize();
+	void *mem = NULL;
+	posix_memalign(&mem, page, 4 * page);
+	purgeable_line("buffer.nocopy", [d newBufferWithBytesNoCopy:mem
+	                                                     length:4 * page
+	                                                    options:MTLResourceStorageModeShared
+	                                                deallocator:nil]);
+	MTLTextureDescriptor *td =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:64
+	                                                      height:64
+	                                                   mipmapped:NO];
+	td.storageMode = MTLStorageModePrivate;
+	td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+	id<MTLTexture> t = [d newTextureWithDescriptor:td];
+	purgeable_line("texture.private", t);
+	purgeable_line("texture.view", [t newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB]);
+	id<MTLBuffer> backing = [d newBufferWithLength:64 * 256 options:MTLResourceStorageModeShared];
+	MTLTextureDescriptor *bd = [td copy];
+	bd.storageMode = MTLStorageModeShared;
+	bd.usage = MTLTextureUsageShaderRead;
+	purgeable_line("texture.overbuffer", [backing newTextureWithDescriptor:bd offset:0 bytesPerRow:256]);
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth : @64,
+		(id)kIOSurfaceHeight : @64,
+		(id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfacePixelFormat : @((uint32_t)'BGRA')
+	};
+	IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	MTLTextureDescriptor *sd = [bd copy];
+	sd.storageMode = MTLStorageModeShared;
+	purgeable_line("texture.iosurface", surf ? [d newTextureWithDescriptor:sd iosurface:surf plane:0] : nil);
+	MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+	hd.size = 4u << 20;
+	hd.storageMode = MTLStorageModePrivate;
+	id<MTLHeap> h = [d newHeapWithDescriptor:hd];
+	id<MTLBuffer> hb = [h newBufferWithLength:65536 options:MTLResourceStorageModePrivate];
+	id<MTLTexture> ht = [h newTextureWithDescriptor:td];
+	purgeable_line("heap.buffer", hb);
+	purgeable_line("heap.texture", ht);
+	if (h == nil) {
+		printf("purgeable heap => nil\n");
+	} else {
+		const MTLPurgeableState asks[] = {MTLPurgeableStateVolatile, MTLPurgeableStateKeepCurrent,
+		                                  MTLPurgeableStateEmpty, MTLPurgeableStateKeepCurrent,
+		                                  MTLPurgeableStateNonVolatile, MTLPurgeableStateKeepCurrent};
+		printf("purgeable heap =>");
+		for (int i = 0; i < 6; i++)
+			printf(" %lu", (unsigned long)[h setPurgeableState:asks[i]]);
+		printf("\n");
+	}
+	MTLIndirectCommandBufferDescriptor *id_ = [MTLIndirectCommandBufferDescriptor new];
+	id_.commandTypes = MTLIndirectCommandTypeDraw;
+	id_.maxVertexBufferBindCount = 1;
+	purgeable_line("icb", [d newIndirectCommandBufferWithDescriptor:id_
+	                                                maxCommandCount:16
+	                                                        options:MTLResourceStorageModeShared]);
+	if (surf)
+		CFRelease(surf);
 }
 
 // Buffers and the device's textures of options holding bit `bit`.
@@ -2732,7 +2819,7 @@ static const char *const kCases[] = {
     "heap.shared",      "bit17",            "bit18",         "bit19",         "tiled.responds",
     "buftex.depth16",   "buftex.stencil8",  "buftex.d32s8",  "buftex.x32s8",  "linear.depth",
     "ds.queries",       "ds.resourceIndex", "ds.uniqueIdentifier", "tiled.bytes", "tiled.buffer",
-    "ds.grid",
+    "ds.grid",          "purgeable.kinds",
 };
 
 static int run_case(id<MTLDevice> d, const char *c)
@@ -2745,6 +2832,8 @@ static int run_case(id<MTLDevice> d, const char *c)
 		case_heapbuffers(d);
 	else if (!strcmp(c, "heap.shared"))
 		case_heap_shared(d);
+	else if (!strcmp(c, "purgeable.kinds"))
+		case_purgeable_kinds(d);
 	else if (!strcmp(c, "bit17") || !strcmp(c, "bit18") || !strcmp(c, "bit19"))
 		case_option_bit(d, c, atoi(c + 3));
 	else if (!strcmp(c, "tiled.responds"))
