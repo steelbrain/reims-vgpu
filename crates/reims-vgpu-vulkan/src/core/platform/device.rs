@@ -100,7 +100,9 @@ pub trait GpuDevice<P: Platform>: Handle {
         iosurface: Option<&P::Surface>,
     ) -> RaiseResult<Option<P::Buffer>>;
     /// sel: newBufferWithLength:options:
-    /// nil means the resource is refused.
+    /// nil means the resource is refused. Its bytes are zeros, as Metal's are, before any work
+    /// of the platform's reads them: the graphics lane's device caches take them as made
+    /// (`decode::surface_cache`, "Fill").
     /// Reached both under a handler and with none: `on` says which this call is.
     fn new_buffer_of_length(
         &self,

@@ -15,10 +15,15 @@
 //! GPU's pitch (Laid out at the GPU's pitch, below). The surface's pages are the other end of each
 //! copy, through their view ([`super::surface_pages`]) or by their runs (below).
 //!
-//! - **Fill.** A cache is made as zeros, on the transfer queue before any use, and owes its first
-//!   fill from the pages, as of the CPU's generation of the surface in the block's header as it
-//!   is made: the kext's count of the surface's read-write locks, which IOSurface marks at the
-//!   lock. The first thing that reads the cache makes the fill before it reads
+//! - **Fill.** A cache is made as zeros, and owes its first fill from the pages, as of the CPU's
+//!   generation of the surface in the block's header as it is made: the kext's count of the
+//!   surface's read-write locks, which IOSurface marks at the lock. Its buffer's bytes are zeros
+//!   as `newBufferWithLength:options:`'s are, the platform's own work zeroing them before any of
+//!   its work reads them, so the host records no zeros of its own; only a cache whose memory is
+//!   made for the host's video (exportable, or a dma-buf), which the video writes with no work of
+//!   the platform's, is zeroed on the transfer queue before any use, ahead of such a write
+//!   ([`SurfaceCaches::zeros_of_new`]). The first thing that reads the cache makes the fill
+//!   before it reads
 //!   ([`SurfaceCaches::fill_owed`]): a use a command buffer names, a present, a command buffer of
 //!   render, compute or blit work in the process that made the first buffer over the block, and
 //!   a buffer over the block made by any other. So a texture over the surface that a command
@@ -161,9 +166,9 @@
 //! - **Deferred blocks.** Where the guest took `RGFX_FEATURE_SURFACE_DEFERRED`, the kext names a
 //!   fresh surface only the GPU has touched with no pages
 //!   ([`RGFX_SURFACE_PAGES_DEFERRED`](reims_vgpu_graphics::wire::RGFX_SURFACE_PAGES_DEFERRED)), as a
-//!   GPU of its own memory keeps such a surface in that memory alone: its cache is made as zeros,
-//!   on the transfer queue before any use, at the CPU's generation 0, with no pages to fill from,
-//!   download into or watch. The kext names the pages at the first CPU lock that needs them
+//!   GPU of its own memory keeps such a surface in that memory alone: its cache is made as zeros
+//!   (Fill, above), at the CPU's generation 0, with no pages to fill from, download into or
+//!   watch. The kext names the pages at the first CPU lock that needs them
 //!   ([`RGFX_SURFACE_PAGES_ATTACH`](reims_vgpu_graphics::wire::RGFX_SURFACE_PAGES_ATTACH)), and the
 //!   cache takes them as they are, keeping its bytes, its generation and whether a buffer wrote
 //!   it, so the download that follows copies what the GPU wrote. A release of a block whose pages
@@ -1381,7 +1386,7 @@ impl<P: Platform> SurfaceCaches<P> {
             return Ok(false);
         };
         let bytes = repitched.as_deref().map_or(length, Repitched::length);
-        let Some(filled_at) = self.zero(device, &cache, bytes)? else {
+        let Some(filled_at) = self.zeros_of_new(device, &cache, life.is_some(), bytes)? else {
             return Ok(false);
         };
         if matches!(pages, CachePages::Runs { .. }) {
@@ -1569,14 +1574,13 @@ impl<P: Platform> SurfaceCaches<P> {
     /// at the CPU's generation 0, its block `block_size` bytes, its surface laid out as `layout`
     /// where its ask gave it (a device that shares the CPU's memory: [`Caches::make`]'s caches
     /// of a layout): the cache `made` with the caches' lock let go of ([`Caches::make_deferred`]),
-    /// zeroed on the transfer queue, whose fill every use of it waits for. Where it `carried`
-    /// pages (their host addresses in the guest's RAM `host_pages`), it owes a first fill of them
-    /// at generation 0, as a new cache owes one of its pages ([`Caches::make`]), which the
-    /// zeroing comes before on the same queue, and their pages are watched until the block's are
-    /// named. `Ok(false)`, with no cache, where the deferred caches' budget has no room for it
-    /// now (what was made then stays in `made`, for the caller to let go of with the lock let go
-    /// of), or the platform made no buffer or no transfer queue for it. A cache the block had
-    /// goes first, as at a release ([`SurfaceCaches::released`]).
+    /// as zeros ([`Self::zeros_of_new`]). Where it `carried` pages (their host addresses in the
+    /// guest's RAM `host_pages`), it owes a first fill of them at generation 0, as a new cache
+    /// owes one of its pages ([`Caches::make`]), which lands over the zeros, and their pages are
+    /// watched until the block's are named. `Ok(false)`, with no cache, where the deferred
+    /// caches' budget has no room for it now (what was made then stays in `made`, for the caller
+    /// to let go of with the lock let go of), or the platform made no buffer or no transfer queue
+    /// for it. A cache the block had goes first, as at a release ([`SurfaceCaches::released`]).
     #[allow(clippy::too_many_arguments)] // the deferral's, its carried pages, and what was made
     fn make_deferred(
         &mut self,
@@ -1602,7 +1606,7 @@ impl<P: Platform> SurfaceCaches<P> {
             .and_then(|(_, _, repitched)| repitched.as_deref())
             .map_or(length, Repitched::length);
         let zeroed = match &made {
-            Some((cache, _, _)) => self.zero(device, cache, bytes)?,
+            Some((cache, life, _)) => self.zeros_of_new(device, cache, life.is_some(), bytes)?,
             None => None,
         };
         let (Some((cache, life, repitched)), Some(filled_at)) = (made, zeroed) else {
@@ -1652,6 +1656,26 @@ impl<P: Platform> SurfaceCaches<P> {
         self.counts.made += 1;
         self.counts.deferred += 1;
         Ok(true)
+    }
+
+    /// The transfer event's value at which the new `cache`, of `length` bytes, is zeros, for its
+    /// uses to wait for (the module doc, "Fill"): 0, none to wait for, where its memory is the
+    /// platform's alone, as its bytes are `newBufferWithLength:options:`'s, zeros before any work
+    /// of the platform's reads them; where it was made for the host's `video` (exportable, or a
+    /// dma-buf), whose writes are no work of the platform's, the value at which [`Self::zero`]'s
+    /// fill is done. `None`, the cache refused, where the platform made no transfer queue for its
+    /// copies, or no command buffer or encoder for that fill.
+    fn zeros_of_new(
+        &mut self,
+        device: &P::Device,
+        cache: &P::Buffer,
+        video: bool,
+        length: u64,
+    ) -> RaiseResult<Option<u64>> {
+        if video {
+            return self.zero(device, cache, length);
+        }
+        Ok(self.make_transfer(device)?.then_some(0))
     }
 
     /// Fills `length` bytes of `cache` with zeros on the transfer queue: the transfer event's
@@ -4152,11 +4176,12 @@ impl<P: Platform> Caches<P> {
     /// A cache for the block at `block`, whose surface's pages `view` maps: `Ok(false)` where
     /// the platform made no buffer for it, and the block keeps its view. `host_pages` are the
     /// pages' host addresses in the guest's RAM, [`device_writes::sorted`], which the host's
-    /// devices' writes are watched over. A new cache is made as zeros on the transfer queue, and
-    /// owes its first fill from the pages as of `generation`, the CPU's generation of the surface
-    /// in the block's header (the module doc, "Fill"); `Ok(false)` too where the platform made no
-    /// command buffer for the zeros, as for no buffer: no cache holds what the GPU's memory held
-    /// before.
+    /// devices' writes are watched over. A new cache is made as zeros
+    /// ([`SurfaceCaches::zeros_of_new`]), and owes its first fill from the pages as of
+    /// `generation`, the CPU's generation of the surface in the block's header (the module doc,
+    /// "Fill"); `Ok(false)` too where the platform made no transfer queue for its copies, or no
+    /// command buffer for the zeros of a cache made for the host's video, as for no buffer: no
+    /// cache holds what the GPU's memory held before.
     ///
     /// A block that has a cache keeps it where its pages are the same, filled again from them as
     /// of `generation` ([`SurfaceCaches::fill_named_again`]), as the kext's generations of the
@@ -5107,11 +5132,11 @@ mod tests {
             .collect()
     }
 
-    /// A new cache is made as zeros, the whole of it, on the transfer queue, and copies nothing
-    /// from the pages at its make: its first fill, as of the CPU's generation in the block's
-    /// header, is owed. The first named use of that generation makes it, and waits for it on the
-    /// GPU; a use of that generation after it fills nothing more, and one of a newer generation
-    /// fills again, once
+    /// A new cache is the platform's new buffer, zeros as it is made, with no work of the host's
+    /// at its make: no zero fill and no copy from the pages. Its first fill, as of the CPU's
+    /// generation in the block's header, is owed. The first named use of that generation makes
+    /// it, and waits for it on the GPU; a use of that generation after it fills nothing more, and
+    /// one of a newer generation fills again, once
     #[test]
     fn a_new_cache_is_zeros_until_its_first_use_fills_it() {
         let mut r = rig(8);
@@ -5131,14 +5156,10 @@ mod tests {
         let cache = cache_id(&r);
         let calls = r.p.call_log().since(mark);
         assert!(copies(&calls).is_empty(), "no fill at the make");
-        assert_eq!(
-            zeroed(&calls),
-            [(cache, Arg::val(&NsRange::new(0, 2 * page)))],
-            "the whole cache made zeros"
-        );
+        assert!(zeroed(&calls).is_empty(), "no zeros of the host's");
         assert!(
-            calls.iter().any(|c| c.sel == "commit"),
-            "committed before the naming is answered"
+            !calls.iter().any(|c| c.sel == "commit"),
+            "no command buffer at the make"
         );
         let counts = r.dec.caches().counts();
         assert_eq!((counts.fills, counts.made_fills), (0, 0));
@@ -5166,10 +5187,158 @@ mod tests {
         assert_eq!(r.dec.caches().counts().fills, 2);
     }
 
-    /// The answer of a new cache's `SURFACE_PAGES` takes no fill, and the kext's wait for it only
-    /// the zeros' commit: a command buffer that uses the surface, issued right after the answer,
-    /// waits for the block to settle before it is decoded, then makes the first fill and waits
-    /// for it on the GPU, on the transfer event, so it reads the pages, not zeros
+    /// On the Vulkan platform a new cache whose memory is the platform's alone, which the host
+    /// does not zero (the module doc, "Fill"), reads zero before its first write: through a copy
+    /// of its bytes and through a texture over it, as the guest's first use of a fresh surface
+    /// reads it, both as a cache of no layout and as one laid out at the GPU's pitch. Each is
+    /// made right after one of its length whose bytes were set to 0xa5, read back so, and let go
+    /// of, so that it may lie in that memory: a runtime that left a new buffer's bytes as its
+    /// memory held them fails here, not in a guest.
+    #[test]
+    fn on_vulkan_a_fresh_cache_reads_zero_before_its_first_write() {
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+        use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+
+        use crate::platform::ApiPlatform as _;
+        type V = reims_vgpu_vulkan::VulkanPlatform;
+        // A WebGL canvas's surface, 2648 texels wide: rows of 10592 bytes, 10624 apart.
+        let plane = PagesPlane {
+            offset: 0,
+            bytes_per_row: 10624,
+            row_bytes: 2648 * 4,
+            rows: 64,
+        };
+        let length = plane.bytes_per_row * plane.rows;
+        let platform = V::process();
+        let device = platform.metal_device(None).unwrap();
+        let queue = device.new_command_queue().unwrap();
+        let maker = CacheMaker {
+            exportable: false,
+            dma_buf: false,
+        };
+        let desc = platform.texture_descriptor(&TextureDesc {
+            pixel_format: 80, // BGRA8Unorm
+            width: plane.row_bytes / 4,
+            height: plane.rows,
+            usage: 0x5, // shader read, render target
+            resource_options: Some(STORAGE_PRIVATE),
+            ..TextureDesc::default()
+        });
+        for layout in [None, Some(&[plane][..])] {
+            let make = || {
+                let mut counts = CacheCounts::default();
+                let made = maker.make::<V>(&device, length, layout).unwrap();
+                let (cache, life, repitched) = made.take(&mut counts).unwrap();
+                assert!(life.is_none(), "the platform's memory alone");
+                let bytes = repitched.as_deref().map_or(length, Repitched::length);
+                (cache, bytes)
+            };
+            let (dirty, bytes) = make();
+            let range = NsRange::new(0, bytes);
+            on_vulkan_blit::<V>(
+                &queue,
+                BlitCmd::FillBuffer {
+                    buffer: &dirty,
+                    range,
+                    value: 0xa5,
+                },
+            );
+            let read = on_vulkan_read_buffer::<V>(&device, &queue, &dirty, bytes);
+            assert!(
+                read.iter().all(|&b| b == 0xa5),
+                "{layout:?}: the fill read back"
+            );
+            drop(dirty);
+            let (cache, bytes) = make();
+            let read = on_vulkan_read_buffer::<V>(&device, &queue, &cache, bytes);
+            assert!(
+                read.iter().all(|&b| b == 0),
+                "{layout:?}: the buffer's bytes read zero"
+            );
+            let pitch = (device.linear_rows_pitch(plane.row_bytes, plane.rows))
+                .unwrap_or(plane.bytes_per_row);
+            let pitch = if layout.is_some() {
+                pitch
+            } else {
+                plane.bytes_per_row
+            };
+            let texture = cache.new_texture(ON, &desc, 0, pitch).unwrap().unwrap();
+            let out = device
+                .new_buffer_of_length(ON, plane.row_bytes * plane.rows, 0)
+                .unwrap();
+            let out = out.unwrap();
+            on_vulkan_blit::<V>(
+                &queue,
+                BlitCmd::CopyTextureToBuffer {
+                    source_texture: &texture,
+                    source_slice: 0,
+                    source_level: 0,
+                    source_origin: reims_vgpu_vulkan::core::platform::types::MtlOrigin::new(
+                        0, 0, 0,
+                    ),
+                    source_size: reims_vgpu_vulkan::core::platform::types::MtlSize::new(
+                        plane.row_bytes / 4,
+                        plane.rows,
+                        1,
+                    ),
+                    destination_buffer: &out,
+                    destination_offset: 0,
+                    destination_bytes_per_row: plane.row_bytes,
+                    destination_bytes_per_image: plane.row_bytes * plane.rows,
+                },
+            );
+            // SAFETY: the Shared buffer's bytes, which no command writes any more.
+            let texels = unsafe {
+                std::slice::from_raw_parts(
+                    out.contents().as_ptr::<u8>(),
+                    (plane.row_bytes * plane.rows).to_usize(),
+                )
+            };
+            assert!(
+                texels.iter().all(|&b| b == 0),
+                "{layout:?}: the texture's texels read zero"
+            );
+        }
+    }
+
+    /// `cmd` in a blit encoder of a command buffer of its own of `queue`, waited for.
+    fn on_vulkan_blit<P: Platform>(queue: &P::CommandQueue, cmd: BlitCmd<'_, P>) {
+        let cb = queue.command_buffer(ON).unwrap().unwrap();
+        let blit = cb.blit_encoder(ON).unwrap().unwrap();
+        blit.encode(ON, cmd).unwrap();
+        blit.encode(ON, BlitCmd::EndEncoding).unwrap();
+        cb.commit(ON).unwrap();
+        cb.wait_until_completed(ON).unwrap();
+    }
+
+    /// The first `length` bytes of `buffer`, copied on the GPU through `queue` into a Shared
+    /// buffer of `device`'s.
+    fn on_vulkan_read_buffer<P: Platform>(
+        device: &P::Device,
+        queue: &P::CommandQueue,
+        buffer: &P::Buffer,
+        length: u64,
+    ) -> Vec<u8> {
+        let out = device.new_buffer_of_length(ON, length, 0).unwrap().unwrap();
+        on_vulkan_blit::<P>(
+            queue,
+            BlitCmd::CopyBufferToBuffer {
+                source_buffer: Some(buffer),
+                source_offset: 0,
+                destination_buffer: Some(&out),
+                destination_offset: 0,
+                size: length,
+            },
+        );
+        // SAFETY: the Shared buffer's bytes, which no command writes any more.
+        unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), length.to_usize()) }
+            .to_vec()
+    }
+
+    /// The answer of a new cache's `SURFACE_PAGES` takes no fill and commits nothing: a command
+    /// buffer that uses the surface, issued right after the answer, waits for the block to settle
+    /// before it is decoded, then makes the first fill and waits for it on the GPU, on the
+    /// transfer event, so it reads the pages, not zeros
     #[test]
     fn a_use_right_after_the_answer_makes_the_first_fill() {
         let mut r = rig(8);
@@ -5227,10 +5396,10 @@ mod tests {
         let filled = copies(&calls);
         assert_eq!(filled.len(), 1, "the first fill alone");
         assert_eq!(filled[0].1, cache_id(&r), "into the cache");
-        // The transfer event's signals: the make's zeros, then the fill.
+        // The transfer event's signals: the fill alone, the make having signalled none.
         let signals = events(&calls, SIGNAL);
         let fill = *signals.iter().rfind(|s| s.0 == signals[0].0).unwrap();
-        assert_eq!(fill.1, 2, "the fill after the zeros");
+        assert_eq!(fill.1, 1, "the transfer queue's first work");
         assert!(
             events(&calls, WAIT).contains(&fill),
             "the use waits on the GPU for the first fill"
@@ -5341,7 +5510,10 @@ mod tests {
         assert_eq!(filled.len(), 1);
         assert_eq!(filled[0].1, cache, "into the cache");
         let transfer = events(&calls, SIGNAL)[0];
-        assert_eq!(transfer.1, 2, "after the make's zeros");
+        assert_eq!(
+            transfer.1, 1,
+            "the transfer queue's first work, the make having none"
+        );
         assert!(
             events(&calls, WAIT).contains(&transfer),
             "the buffer waits for its fill"
@@ -5481,25 +5653,20 @@ mod tests {
     }
 
     /// A wait for a cache's fill, as a decode that writes the cache outside a command buffer
-    /// takes, lasts while the fill runs (the make's, then a use's) and ends once it is done; a
-    /// block with no cache waits for nothing
+    /// takes, lasts while a use's fill runs and ends once it is done; a new cache, whose zeros
+    /// are the platform's, and a block with no cache wait for nothing
     #[test]
     fn a_wait_for_a_fill_ends_once_it_is_done() {
         let mut r = cached();
         // A slice's wait.
         let mut short = || true;
         assert!(
-            !r.dec.surface_caches.wait_filled(BLOCK, &mut short),
-            "the make's fill runs"
+            r.dec.surface_caches.wait_filled(BLOCK, &mut short),
+            "a new cache: no fill of the make's"
         );
         assert!(
             r.dec.surface_caches.wait_filled(BLOCK + 0x8000, &mut short),
             "no cache"
-        );
-        r.p.world().complete_all(CompleteOn::Caller);
-        assert!(
-            r.dec.surface_caches.wait_filled(BLOCK, &mut short),
-            "the make's fill is done"
         );
         use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, false)]);
         assert!(
@@ -8996,9 +9163,10 @@ mod tests {
         done
     }
 
-    /// A deferred block gets a device cache and no view: the cache is zeroed on the transfer
-    /// queue, which a use waits for, at the CPU's generation 0, so a use of generation 0 fills
-    /// nothing; its buffers are the cache. Its release, its pages never named, copies nothing
+    /// A deferred block gets a device cache and no view: the platform's new buffer, zeros as made,
+    /// with no zeroing of the host's for a use to wait for, at the CPU's generation 0, so a use of
+    /// generation 0 fills nothing; its buffers are the cache. Its release, its pages never named,
+    /// copies nothing
     #[test]
     fn a_deferred_block_is_a_cache_of_zeros_with_no_pages() {
         let mut r = deferring(8);
@@ -9006,14 +9174,10 @@ mod tests {
         let mark = r.p.call_log().mark();
         assert_eq!(defer(&mut r, BLOCK, 2 * page), RGFX_STATUS_OK);
         let calls = r.p.call_log().since(mark);
-        let cache = cache_id(&r);
-        let zeroed: Vec<&Call> = calls.iter().filter(|c| c.sel == FILL).collect();
-        assert_eq!(zeroed.len(), 1);
-        assert_eq!(zeroed[0].args[0].as_obj().map(|o| o.0), Some(cache));
-        assert_eq!(zeroed[0].args[1], Arg::val(&NsRange::new(0, 2 * page)));
-        assert_eq!(zeroed[0].args[2], Arg::U8(0));
-        let zero_done = events(&calls, SIGNAL);
-        assert_eq!(zero_done.len(), 1, "the zeroing signals the transfer event");
+        assert!(
+            !calls.iter().any(|c| c.sel == FILL || c.sel == "commit"),
+            "the platform's buffer, zeros as made: no work of the host's"
+        );
         assert_eq!(r.dec.views_of_surfaces().len(), (0, 0), "no view");
         assert_eq!(r.dec.caches().counts().deferred, 1);
         assert_eq!(r.dec.caches().unattached(BLOCK), Some(2 * page));
@@ -9033,7 +9197,7 @@ mod tests {
         use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
         let calls = r.p.call_log().since(mark);
         assert!(copies(&calls).is_empty(), "nothing to fill from");
-        assert_eq!(events(&calls, WAIT), zero_done, "after the zeroing");
+        assert!(events(&calls, WAIT).is_empty(), "no zeroing to wait for");
 
         let mark = r.p.call_log().mark();
         let released = release(&r, BLOCK);
@@ -9132,9 +9296,10 @@ mod tests {
 
     /// On a GPU that shares the CPU's memory, a fresh block that asks to be deferred is asked of
     /// the device with its planes alone, no page named: where textures over them would lie in
-    /// place over no import of any pages, it is a cache of zeros with no view, as a deferred
-    /// block of a GPU of its own memory is. Where they may lie in place, it is refused with
-    /// nothing made, counted, and its pages then ask whether it needs a cache as any block's do
+    /// place over no import of any pages, it is a cache of zeros with no view (the platform's new
+    /// buffer, which the host zeroes no further), as a deferred block of a GPU of its own memory
+    /// is. Where they may lie in place, it is refused with nothing made, counted, and its pages
+    /// then ask whether it needs a cache as any block's do
     #[test]
     fn a_fresh_block_asking_is_deferred_only_where_it_would_need_a_cache() {
         let mut r = deferring_asking(8);
@@ -9149,10 +9314,11 @@ mod tests {
         );
         assert_eq!(world.fresh_surfaces_asked(), [planes]);
         let calls = r.p.call_log().since(mark);
-        let cache = cache_id(&r);
-        let zeroed: Vec<&Call> = calls.iter().filter(|c| c.sel == FILL).collect();
-        assert_eq!(zeroed.len(), 1, "zeroed");
-        assert_eq!(zeroed[0].args[0].as_obj().map(|o| o.0), Some(cache));
+        assert_eq!(r.dec.caches().len(), 1, "a cache");
+        assert!(
+            !calls.iter().any(|c| c.sel == FILL),
+            "no zeros of the host's"
+        );
         assert_eq!(r.dec.views_of_surfaces().len(), (0, 0), "no view");
         assert!(world.surface_pages_asked().is_empty(), "no page asked of");
         assert_eq!(r.dec.caches().unattached(BLOCK), Some(2 * page));
@@ -9418,8 +9584,8 @@ mod tests {
     /// that owes a first fill of those pages alone: nothing is copied at the deferral, and the
     /// first use that reads the cache, at the CPU's generation 0, copies each carried page in at
     /// its own bytes of the cache, through a Shared buffer the host's CPU filled from the page as
-    /// the fill was made, the rest of the cache left as its zeroing left it. The cache then holds
-    /// generation 0, so a use after it fills nothing
+    /// the fill was made, the rest of the cache left as the platform made it, zeros. The cache
+    /// then holds generation 0, so a use after it fills nothing
     #[test]
     fn a_carrying_deferral_fills_its_pages_in_before_a_read() {
         let mut r = deferring_carrying(8);
@@ -9431,7 +9597,10 @@ mod tests {
         );
         let calls = r.p.call_log().since(mark);
         let cache = cache_id(&r);
-        assert_eq!(calls.iter().filter(|c| c.sel == FILL).count(), 1, "zeroed");
+        assert!(
+            !calls.iter().any(|c| c.sel == FILL),
+            "no zeros of the host's"
+        );
         assert!(copies(&calls).is_empty(), "nothing copied at the deferral");
         assert_eq!(r.dec.views_of_surfaces().len(), (0, 0), "no view");
         let counts = r.dec.caches().counts();

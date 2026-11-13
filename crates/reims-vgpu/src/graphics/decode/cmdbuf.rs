@@ -4259,33 +4259,22 @@ mod tests {
     }
 
     /// A decoder's new output whose picture fails to land holds the cache's zeros where the
-    /// picture did not write, and no byte of the pages or of any other memory: its cache was made
-    /// zeros, the whole of it, before the decode, and nothing was copied into it. The command
-    /// buffer completes failed, and the lock's download copies the planes' rows alone
+    /// picture did not write, and no byte of the pages or of any other memory: its cache is the
+    /// platform's new buffer, zeros as made, which the host fills no further, and nothing was
+    /// copied into it. The command buffer completes failed, and the lock's download copies the
+    /// planes' rows alone
     #[test]
     fn a_failed_landing_into_a_new_output_leaves_zeros_and_no_host_bytes() {
         use super::super::surface_pages::tests::BLOCK;
 
         let (mut r, seen) = cached_video_whole();
         let cache = video_cache(&r);
-        let page = r.page;
-        // The make's zeros, from the rig's start.
-        let zeroes: Vec<_> = (r.p.call_log().calls().iter())
+        // No fill of the cache from the rig's start: its zeros are the platform's.
+        let fills = (r.p.call_log().calls().iter())
             .filter(|c| c.sel == "fillBuffer:range:value:")
             .filter(|c| c.args[0].as_obj().map(|o| o.0) == Some(cache))
-            .map(|c| (c.args[1].clone(), c.args[2].clone()))
-            .collect();
-        assert_eq!(
-            zeroes,
-            [(
-                Arg::val(&reims_vgpu_vulkan::core::platform::types::NsRange::new(
-                    0,
-                    2 * page
-                )),
-                Arg::U8(0)
-            )],
-            "the whole cache made zeros"
-        );
+            .count();
+        assert_eq!(fills, 0, "the platform's zeros alone");
         seen.unlanded.store(true, Ordering::Relaxed);
         let mark = r.p.call_log().mark();
         assert_eq!(
