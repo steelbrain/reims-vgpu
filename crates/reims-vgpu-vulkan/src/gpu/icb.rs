@@ -1059,32 +1059,32 @@ impl IndirectCommandBuffer<VulkanPlatform> for VulkanIcb {
     fn compute_command(
         &self,
         command_index: u64,
-    ) -> RaiseResult<Option<VulkanIndirectComputeCommand>> {
+    ) -> RaiseResult<Option<VulkanIndirectComputeCommand<'_>>> {
         let sel = "indirectComputeCommandAtIndex:";
         let raw = send(sel, Policy::Dies, || {
             self.raw.indirect_compute_command_at(command_index)
         })?;
-        Ok(Some(Obj::new(CommandObject {
-            icb: self.clone_ref(),
+        Ok(Some(CommandObject {
+            icb: self,
             index: command_index.low_u32(),
             raw,
-        })))
+        }))
     }
 
     /// As [`compute_command`](Self::compute_command), for a render command.
     fn render_command(
         &self,
         command_index: u64,
-    ) -> RaiseResult<Option<VulkanIndirectRenderCommand>> {
+    ) -> RaiseResult<Option<VulkanIndirectRenderCommand<'_>>> {
         let sel = "indirectRenderCommandAtIndex:";
         let raw = send(sel, Policy::Dies, || {
             self.raw.indirect_render_command_at(command_index)
         })?;
-        Ok(Some(Obj::new(CommandObject {
-            icb: self.clone_ref(),
+        Ok(Some(CommandObject {
+            icb: self,
             index: command_index.low_u32(),
             raw,
-        })))
+        }))
     }
 
     /// The runtime's `reset_with_range`, one call for the range, which refuses a range past the
@@ -1130,11 +1130,13 @@ impl IndirectCommandBuffer<VulkanPlatform> for VulkanIcb {
 
 // ---- The commands.
 
-/// One command of an indirect command buffer: the runtime's setters, and the buffer.
+/// One command of an indirect command buffer: the runtime's setters, and the buffer, lent for
+/// the command's life. No object is made for it, nor a reference to the buffer taken: core takes
+/// one for each slot or run of records it carries out, 16384 a take of a large buffer.
 #[derive(Debug)]
-pub struct CommandObject<C> {
+pub struct CommandObject<'a, C> {
     /// The buffer it is a command of.
-    icb: VulkanIcb,
+    icb: &'a IcbObject,
     /// Its index there.
     index: u32,
     /// The runtime's setters.
@@ -1142,10 +1144,10 @@ pub struct CommandObject<C> {
 }
 
 /// `id<MTLIndirectRenderCommand>`.
-pub type VulkanIndirectRenderCommand = Obj<CommandObject<rt::IndirectRenderCommand>>;
+pub type VulkanIndirectRenderCommand<'a> = CommandObject<'a, rt::IndirectRenderCommand>;
 
 /// `id<MTLIndirectComputeCommand>`.
-pub type VulkanIndirectComputeCommand = Obj<CommandObject<rt::IndirectComputeCommand>>;
+pub type VulkanIndirectComputeCommand<'a> = CommandObject<'a, rt::IndirectComputeCommand>;
 
 /// A runtime setter's answer, for `sel`: every refusal dies (the module docs).
 fn set(sel: &'static str, call: impl FnOnce() -> Result<(), rt::Error>) -> RaiseResult<()> {
@@ -1179,7 +1181,7 @@ fn address_or_nil(address: Option<rt::GpuAddress>) -> u64 {
     address.map_or(NIL_BUFFER_ADDRESS, |a| a.0)
 }
 
-impl CommandObject<rt::IndirectRenderCommand> {
+impl CommandObject<'_, rt::IndirectRenderCommand> {
     /// The command's record, read back, for `sel`.
     fn record(&self, sel: &'static str) -> rt::EncodedRenderCommand {
         self.icb.intact(sel, self.index);
@@ -1202,7 +1204,7 @@ impl CommandObject<rt::IndirectRenderCommand> {
     }
 }
 
-impl CommandObject<rt::IndirectComputeCommand> {
+impl CommandObject<'_, rt::IndirectComputeCommand> {
     /// The place of the command's threadgroup memory length at `index`'s low 32 bits in the
     /// buffer's array of them ([`LENGTHS_A_COMMAND`]).
     fn flat(&self, index: u64) -> u64 {
@@ -1255,7 +1257,7 @@ const TYPE_9: &str = "a draw of primitive type 9 in an indirect command, which M
      a range given at the execution's call, as the records stand then, and runs nothing of one \
      written after the call or among a range a buffer holds";
 
-impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
+impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand<'_> {
     /// One runtime setter per command. A nil pipeline state, index buffer or tessellation factor
     /// buffer, which the runtime's setters take none of, dies. A nil buffer the runtime holds at
     /// its offset (the module docs).
@@ -1587,7 +1589,7 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
     }
 }
 
-impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
+impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand<'_> {
     /// One runtime setter per command. A nil pipeline state, which the runtime's setter takes
     /// none of, dies.
     fn encode(&self, cmd: IcbComputeCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
@@ -2712,7 +2714,9 @@ mod tests {
         e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
         cb.commit(OnFault::Return).unwrap();
         cb.wait_until_completed(OnFault::Return).unwrap();
-        let command = |icb: &VulkanIcb| icb.compute_command(1).unwrap().unwrap();
+        fn command(icb: &VulkanIcb) -> VulkanIndirectComputeCommand<'_> {
+            icb.compute_command(1).unwrap().unwrap()
+        }
         for icb in [&read, &written] {
             for index in [38, 58, 62] {
                 let length = IcbComputeCmd::SetThreadgroupMemoryLength { length: 16, index };
@@ -3184,7 +3188,9 @@ mod tests {
             make::<VulkanPlatform>(&d, &lengths_desc(), 2),
             make::<VulkanPlatform>(&d, &lengths_desc(), 2),
         );
-        let command = |icb: &VulkanIcb, i| icb.compute_command(i).unwrap().unwrap();
+        fn command(icb: &VulkanIcb, i: u64) -> VulkanIndirectComputeCommand<'_> {
+            icb.compute_command(i).unwrap().unwrap()
+        }
         let length = |length| IcbComputeCmd::SetThreadgroupMemoryLength { length, index: 33 };
         for i in [0, 1] {
             command(&a, i).encode(IcbComputeCmd::SetBarrier).unwrap();

@@ -194,8 +194,8 @@ impl Platform for FakePlatform {
     type RenderPipeline = Fk<kind::RenderPipeline>;
     type RateMap = Fk<kind::RateMap>;
     type Icb = Fk<kind::Icb>;
-    type IndirectRenderCommand = Fk<kind::IndirectRenderCommand>;
-    type IndirectComputeCommand = Fk<kind::IndirectComputeCommand>;
+    type IndirectRenderCommand<'a> = Fk<kind::IndirectRenderCommand>;
+    type IndirectComputeCommand<'a> = Fk<kind::IndirectComputeCommand>;
     type TextureDescriptor = Fk<kind::TextureDescriptor>;
     type RenderPassDescriptor = Fk<kind::RenderPassDescriptor>;
     type RateMapDescriptor = Fk<kind::RateMapDescriptor>;

@@ -989,6 +989,7 @@ fn provoked<P: Platform>(
             for cmd in cmds {
                 c.encode(cmd).unwrap();
             }
+            drop(c);
             Some(icb)
         }
         _ => None,

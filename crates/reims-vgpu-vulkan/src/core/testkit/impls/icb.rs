@@ -96,7 +96,7 @@ impl IndirectCommandBuffer<FakePlatform> for Fk<kind::Icb> {
     fn compute_command(
         &self,
         command_index: u64,
-    ) -> RaiseResult<Option<<FakePlatform as Platform>::IndirectComputeCommand>> {
+    ) -> RaiseResult<Option<<FakePlatform as Platform>::IndirectComputeCommand<'_>>> {
         self.index_child(
             Policy::Caught,
             "indirectComputeCommandAtIndex:",
@@ -108,7 +108,7 @@ impl IndirectCommandBuffer<FakePlatform> for Fk<kind::Icb> {
     fn render_command(
         &self,
         command_index: u64,
-    ) -> RaiseResult<Option<<FakePlatform as Platform>::IndirectRenderCommand>> {
+    ) -> RaiseResult<Option<<FakePlatform as Platform>::IndirectRenderCommand<'_>>> {
         self.index_child(
             Policy::Caught,
             "indirectRenderCommandAtIndex:",

@@ -109,10 +109,15 @@ pub trait Platform: Sized + Send + Sync + 'static {
     type RateMap: rate_map::RateMap<Self>;
     /// `id<MTLIndirectCommandBuffer>`.
     type Icb: icb::IndirectCommandBuffer<Self>;
-    /// `id<MTLIndirectRenderCommand>`.
-    type IndirectRenderCommand: icb::IndirectRenderCommand<Self>;
-    /// `id<MTLIndirectComputeCommand>`.
-    type IndirectComputeCommand: icb::IndirectComputeCommand<Self>;
+    /// `id<MTLIndirectRenderCommand>`: lent by its buffer for the encodes core sends it, which
+    /// keep no reference of their own to it ([`icb::IndirectCommandBuffer::render_command`]).
+    type IndirectRenderCommand<'a>: icb::IndirectRenderCommand<Self>
+    where
+        Self: 'a;
+    /// `id<MTLIndirectComputeCommand>`, lent as a render command is.
+    type IndirectComputeCommand<'a>: icb::IndirectComputeCommand<Self>
+    where
+        Self: 'a;
 
     // The descriptors core keeps as objects (D5): the others are values (`values`).
     /// `MTLTextureDescriptor *`.

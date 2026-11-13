@@ -666,8 +666,8 @@ impl Platform for VulkanPlatform {
     type RenderPipeline = VulkanRenderPipeline;
     type RateMap = VulkanRateMap;
     type Icb = VulkanIcb;
-    type IndirectRenderCommand = VulkanIndirectRenderCommand;
-    type IndirectComputeCommand = VulkanIndirectComputeCommand;
+    type IndirectRenderCommand<'a> = VulkanIndirectRenderCommand<'a>;
+    type IndirectComputeCommand<'a> = VulkanIndirectComputeCommand<'a>;
     type TextureDescriptor = VulkanTextureDescriptor;
     type RenderPassDescriptor = VulkanRenderPassDescriptor;
     type RateMapDescriptor = VulkanRateMapDescriptor;

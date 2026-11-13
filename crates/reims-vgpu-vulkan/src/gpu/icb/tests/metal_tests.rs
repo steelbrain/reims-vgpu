@@ -441,7 +441,7 @@ fn compute_commands_read_back_as_on_metal() {
         let icb = make::<P>(d, &compute_desc(), 2);
         let b = buffer::<P>(d);
         let base = b.gpu_address();
-        let read = |c: &P::IndirectComputeCommand| {
+        let read = |c: &P::IndirectComputeCommand<'_>| {
             let ty = c.command_type();
             let mut v = vec![
                 ty,
@@ -538,7 +538,7 @@ fn render_commands_read_back_as_on_metal() {
         let icb = make::<P>(d, &render_desc(), 2);
         let b = buffer::<P>(d);
         let base = b.gpu_address();
-        let read = |c: &P::IndirectRenderCommand| {
+        let read = |c: &P::IndirectRenderCommand<'_>| {
             let ty = c.command_type();
             let mut v = vec![
                 ty,
@@ -943,11 +943,13 @@ fn blits_move_lengths_past_the_record_as_metals() {
             ..compute_desc()
         };
         let (a, b) = (make::<P>(d, &desc, 2), make::<P>(d, &desc, 2));
-        let command = |icb: &P::Icb, i| icb.compute_command(i).unwrap().unwrap();
+        fn command<Q: Platform>(icb: &Q::Icb, i: u64) -> Q::IndirectComputeCommand<'_> {
+            icb.compute_command(i).unwrap().unwrap()
+        }
         for (i, base) in [(0, 16), (1, 48)] {
             for (index, add) in [(30, 0), (33, 4), (37, 8)] {
                 let length = base + add;
-                command(&a, i)
+                command::<P>(&a, i)
                     .encode(IcbComputeCmd::SetThreadgroupMemoryLength { length, index })
                     .unwrap();
             }
@@ -973,7 +975,11 @@ fn blits_move_lengths_past_the_record_as_metals() {
             for i in [0, 1] {
                 for index in [30, 33, 37] {
                     if !(second && i == 1 && index == 37) {
-                        lengths.push(command(icb, i).threadgroup_memory_length(index).unwrap());
+                        lengths.push(
+                            command::<P>(icb, i)
+                                .threadgroup_memory_length(index)
+                                .unwrap(),
+                        );
                     }
                 }
             }
@@ -1424,6 +1430,7 @@ fn a_command_core_set_reaches_a_later_state_holding_its_identifier_as_metals() {
         made.extend(made_by::<P>(&later));
         let taken = later.0.iter().any(|state| state.gpu_resource_id() == id);
         let answer = catch_death(|| command.pipeline_state_unique_identifier());
+        drop(command);
         (icb, answer.ok().map(|answer| reached(&made, answer)), taken)
     }
     let d = dev();

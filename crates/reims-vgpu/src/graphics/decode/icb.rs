@@ -116,10 +116,10 @@ fn computes(op: u16) -> bool {
 
 /// The command a run of records is carried out on: consecutive records of one command, a setter
 /// run and its draw, take it from the buffer once.
-enum Command<P: Platform> {
+enum Command<'a, P: Platform> {
     None,
-    Render(u64, P::IndirectRenderCommand),
-    Compute(u64, P::IndirectComputeCommand),
+    Render(u64, P::IndirectRenderCommand<'a>),
+    Compute(u64, P::IndirectComputeCommand<'a>),
 }
 
 /// Whether `op` is a draw or a dispatch: what a command whose encode named a refused object
@@ -658,7 +658,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// would send it, with no record made between, and the rest by its record.
     fn render_field(
         &self,
-        c: &P::IndirectRenderCommand,
+        c: &P::IndirectRenderCommand<'_>,
         field: Field<'_>,
     ) -> RaiseResult<Result<(), DecodeError>> {
         let cmd = match field {
@@ -696,7 +696,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// A compute slot's `field` on its command, as [`render_field`](Self::render_field) does.
     fn compute_field(
         &self,
-        c: &P::IndirectComputeCommand,
+        c: &P::IndirectComputeCommand<'_>,
         field: Field<'_>,
     ) -> RaiseResult<Result<(), DecodeError>> {
         let cmd = match field {
@@ -732,12 +732,12 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// One record of an `ICB_WRITE` on `icb` of `size` commands, its command taken from
     /// `command` where the record before it was of the same one.
-    fn icb_record(
+    fn icb_record<'i>(
         &self,
-        icb: &P::Icb,
+        icb: &'i P::Icb,
         dropped: &Dropped,
         size: u64,
-        command: &mut Command<P>,
+        command: &mut Command<'i, P>,
         rec: &RgfxIcbRecord,
         bytes: &[u8],
     ) -> RaiseResult<Result<(), DecodeError>> {
@@ -803,7 +803,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// A render command's record.
     fn render_record(
         &self,
-        c: &P::IndirectRenderCommand,
+        c: &P::IndirectRenderCommand<'_>,
         op: u16,
         bytes: &[u8],
     ) -> RaiseResult<Result<(), DecodeError>> {
@@ -910,7 +910,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// A compute command's record.
     fn compute_record(
         &self,
-        c: &P::IndirectComputeCommand,
+        c: &P::IndirectComputeCommand<'_>,
         op: u16,
         bytes: &[u8],
     ) -> RaiseResult<Result<(), DecodeError>> {

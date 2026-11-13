@@ -20,10 +20,19 @@ pub trait IndirectCommandBuffer<P: Platform>: Handle {
     /// `MTLResourceID._impl` (runtime `{MTLResourceID=Q}`).
     fn gpu_resource_id(&self) -> u64;
     /// sel: indirectComputeCommandAtIndex:
-    fn compute_command(&self, command_index: u64)
-    -> RaiseResult<Option<P::IndirectComputeCommand>>;
+    /// As [`render_command`](Self::render_command), a compute command.
+    fn compute_command(
+        &self,
+        command_index: u64,
+    ) -> RaiseResult<Option<P::IndirectComputeCommand<'_>>>;
     /// sel: indirectRenderCommandAtIndex:
-    fn render_command(&self, command_index: u64) -> RaiseResult<Option<P::IndirectRenderCommand>>;
+    /// The command, lent for as long as the buffer is: core takes one for the encodes it sends
+    /// it and lets it go, keeping no reference of its own, so the platform need make no object
+    /// that outlives them.
+    fn render_command(
+        &self,
+        command_index: u64,
+    ) -> RaiseResult<Option<P::IndirectRenderCommand<'_>>>;
     /// sel: resetWithRange:
     /// Commands `location..location + length`, inside the size, as a fresh buffer's: one call
     /// for the range, whose cost is the platform's for the commands it clears. Only the graphics
@@ -158,7 +167,7 @@ impl<P: Platform> IcbRenderCmd<'_, P> {
 /// `PGResourceManager::getRenderCommandBuffers`'s mangling gives).
 // One argument per keyword of the selectors core sends (D4, 4.2).
 #[allow(clippy::too_many_arguments)]
-pub trait IndirectRenderCommand<P: Platform>: Handle {
+pub trait IndirectRenderCommand<P: Platform> {
     /// Sends one [`IcbRenderCmd`].
     fn encode(&self, cmd: IcbRenderCmd<'_, P>) -> RaiseResult<()>;
     /// sel: getCommandType SPI
@@ -263,7 +272,7 @@ impl<P: Platform> IcbComputeCmd<'_, P> {
 }
 /// `MTLIndirectComputeCommand` (with `MTLIndirectComputeCommandSPI`, the name
 /// `PGResourceManager::getComputeCommandBuffers`'s mangling gives).
-pub trait IndirectComputeCommand<P: Platform>: Handle {
+pub trait IndirectComputeCommand<P: Platform> {
     /// Sends one [`IcbComputeCmd`].
     fn encode(&self, cmd: IcbComputeCmd<'_, P>) -> RaiseResult<()>;
     /// sel: getCommandType SPI
