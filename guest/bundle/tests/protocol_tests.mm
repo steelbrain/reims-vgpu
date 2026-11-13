@@ -516,7 +516,8 @@ struct RefusingKext {
 // holds it to go with others) fails the next command buffer committed, unposted, with
 // MTLCommandBufferErrorInternal, as the buffer may name it, and the next post is refused, as a
 // full control ring refuses it; once the kext takes them again, the buffer goes before the next
-// command buffer, which goes on its ring.
+// command buffer, which goes on its ring. A texture held so does the same (serializer_tests'
+// test_held_creates checks each kind held).
 void test_commit_behind_an_untaken_buffer_fails()
 {
 	TestRing control(0x8000);
@@ -599,6 +600,47 @@ void test_commit_behind_an_untaken_buffer_fails()
 		CHECK(completion.postFromHost(&done, sizeof(done)));
 		[next waitUntilCompleted];
 		CHECK(next.status == MTLCommandBufferStatusCompleted);
+
+		// A texture held so fails the next commit too, as it may name it, and goes before the
+		// command buffer after it once the kext takes it again.
+		kext.refuse = true;
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:4
+		                                                      height:4
+		                                                   mipmapped:NO];
+		td.storageMode = MTLStorageModePrivate;
+		RgfxTexture *texture = [RgfxTexture textureWithDescriptor:td
+		                                                     heap:RGFX_OBJ_NONE
+		                                               heapOffset:0
+		                                                   device:nil
+		                                               serializer:&ser];
+		CHECK(texture != nil);
+		id<MTLCommandBuffer> third = [queue commandBuffer];
+		id<MTLBlitCommandEncoder> blit3 = [third blitCommandEncoder];
+		[blit3 fillBuffer:buffer range:NSMakeRange(0, 256) value:2];
+		[blit3 endEncoding];
+		[third commit];
+		[third waitUntilCompleted];
+		CHECK(third.status == MTLCommandBufferStatusError);
+		CHECK(third.error != nil && third.error.code == MTLCommandBufferErrorInternal);
+		CHECK(!submit.next(&h, &bytes));
+		CHECK(!control.next(&h, &bytes));
+		kext.refuse = false;
+		id<MTLCommandBuffer> fourth = [queue commandBuffer];
+		id<MTLBlitCommandEncoder> blit4 = [fourth blitCommandEncoder];
+		[blit4 fillBuffer:buffer range:NSMakeRange(0, 256) value:3];
+		[blit4 endEncoding];
+		[fourth commit];
+		CHECK(control.next(&h, &bytes) && h.type == RGFX_CMD_TEXTURE_CREATE);
+		std::memcpy(&obj, bytes.data() + sizeof(h), sizeof(obj));
+		CHECK(obj == [texture rgfxObjId]);
+		CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER);
+		done.header.seqno = h.seqno;
+		done.cb_obj_id = ((RgfxResource *)fourth).rgfxObjId;
+		CHECK(completion.postFromHost(&done, sizeof(done)));
+		[fourth waitUntilCompleted];
+		CHECK(fourth.status == MTLCommandBufferStatusCompleted);
 	}
 }
 

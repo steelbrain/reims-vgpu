@@ -60,22 +60,38 @@ int main()
 	check(!rgfxSubmitRoutesQueueDestroy(RGFX_CMD_QUEUE_CREATE), "QUEUE_CREATE does not route");
 	check(!rgfxSubmitRoutesQueueDestroy(RGFX_CMD_BLOCK_RELEASE), "BLOCK_RELEASE does not route");
 
-	// SubmitBatch takes destroys and heap-placed buffers, each of its one size: messages no one
-	// waits for, which name no block (spans_test), so the batch needs neither answers nor pins;
-	// the buffer is a create, which a close since the check follows with its destroy. Every
-	// other type, accepted by Submit or not, goes one call at a time.
-	check(rgfxSubmitBatchSize(RGFX_CMD_OBJECT_DESTROY) == sizeof(RgfxObjectDestroy),
-	      "SubmitBatch takes OBJECT_DESTROY, of its size");
-	check(rgfxSubmitBatchSize(RGFX_CMD_BUFFER_AT_OFFSET) == sizeof(RgfxBufferAtOffset),
-	      "SubmitBatch takes BUFFER_AT_OFFSET, of its size");
-	check(rgfxSubmitAdmitted(RGFX_CMD_OBJECT_DESTROY) && !rgfxSubmitMakes(RGFX_CMD_OBJECT_DESTROY),
-	      "a batched destroy is one Submit takes, and makes nothing");
-	check(rgfxSubmitAdmitted(RGFX_CMD_BUFFER_AT_OFFSET) && rgfxSubmitMakes(RGFX_CMD_BUFFER_AT_OFFSET),
-	      "a batched heap-placed buffer is one Submit takes, and makes one");
+	// SubmitBatch takes destroys, the creates no one waits for that name no block, and a Managed
+	// buffer's modified range, each of its one size: messages no one waits for, which name no
+	// block (spans_test), so the batch needs neither answers nor pins; a create is followed by
+	// its destroy where a close came since the check. A texture over an IOSurface, which a
+	// present waits for, and every other type, accepted by Submit or not, go one call at a time.
+	struct Taken {
+		uint32_t type;
+		uint32_t size;
+		bool makes;
+	};
+	const Taken taken[] = {
+		{RGFX_CMD_OBJECT_DESTROY, sizeof(RgfxObjectDestroy), false},
+		{RGFX_CMD_BUFFER_AT_OFFSET, sizeof(RgfxBufferAtOffset), true},
+		{RGFX_CMD_TEXTURE_CREATE, sizeof(RgfxTextureCreate), true},
+		{RGFX_CMD_TEXTURE_VIEW, sizeof(RgfxTextureView), true},
+		{RGFX_CMD_MANAGED_TEXTURE_CREATE, sizeof(RgfxManagedTextureCreate), true},
+		{RGFX_CMD_MANAGED_BUFFER_CREATE, sizeof(RgfxManagedBufferCreate), true},
+		{RGFX_CMD_BUFFER_DID_MODIFY_RANGE, sizeof(RgfxBufferDidModifyRange), false},
+	};
+	for (const Taken &t : taken) {
+		check(rgfxSubmitBatchSize(t.type) == t.size, "SubmitBatch takes the type, of its size");
+		check(rgfxSubmitAdmitted(t.type) && rgfxSubmitMakes(t.type) == t.makes,
+		      "a batched message is one Submit takes, making an object where a create");
+	}
+	check(rgfxSubmitBatchSize(RGFX_CMD_TEXTURE_FROM_IOSURFACE) == 0,
+	      "SubmitBatch does not take a texture over an IOSurface");
 	for (uint32_t type = 0; type <= RGFX_CMD_CONTEXT_CLOSE + 64; type++) {
-		if (type == RGFX_CMD_OBJECT_DESTROY || type == RGFX_CMD_BUFFER_AT_OFFSET)
-			continue;
-		check(rgfxSubmitBatchSize(type) == 0, "SubmitBatch takes no other type");
+		bool listed = false;
+		for (const Taken &t : taken)
+			listed = listed || t.type == type;
+		if (!listed)
+			check(rgfxSubmitBatchSize(type) == 0, "SubmitBatch takes no other type");
 	}
 
 	// Which accepted types make an object a destroy then drops: every type of the accepted

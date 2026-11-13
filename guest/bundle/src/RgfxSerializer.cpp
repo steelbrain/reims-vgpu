@@ -404,7 +404,7 @@ RgfxCreated RgfxSerializer::createManagedBuffer(RgfxObjId cpu_buffer, uint64_t l
 	msg.cpu_buffer_obj_id = cpu_buffer;
 	msg.length = length;
 	msg.options = RgfxHostResourceOptions(options);
-	out.posted = m_control.tryPost(RGFX_CMD_MANAGED_BUFFER_CREATE, &msg, sizeof(msg), &out.seqno);
+	out.posted = postUnwaited(RGFX_CMD_MANAGED_BUFFER_CREATE, &msg, sizeof(msg), &out.seqno);
 	return out;
 }
 
@@ -448,10 +448,15 @@ RgfxCreated RgfxSerializer::createBufferAtOffset(RgfxObjId heap, uint64_t offset
 	msg.offset = offset;
 	msg.length = length;
 	msg.options = RgfxHostResourceOptions(options);
-	out.posted = m_control.batches()
-	                 ? m_control.postLater(RGFX_CMD_BUFFER_AT_OFFSET, &msg, sizeof(msg))
-	                 : m_control.tryPost(RGFX_CMD_BUFFER_AT_OFFSET, &msg, sizeof(msg), &out.seqno);
+	out.posted = postUnwaited(RGFX_CMD_BUFFER_AT_OFFSET, &msg, sizeof(msg), &out.seqno);
 	return out;
+}
+
+bool RgfxSerializer::postUnwaited(uint32_t type, const void *message, uint32_t size,
+                                  uint64_t *out_seqno)
+{
+	return m_control.batches() ? m_control.postLater(type, message, size)
+	                           : m_control.tryPost(type, message, size, out_seqno);
 }
 
 void RgfxSerializer::releaseResourceId(uint64_t resource_id)
@@ -500,7 +505,7 @@ RgfxCreated RgfxSerializer::createTexture(const RgfxTextureDescriptor &desc, Rgf
 		msg.heap_obj_id = heap;
 		msg.heap_offset = heap_offset;
 	}
-	out.posted = m_control.tryPost(RGFX_CMD_TEXTURE_CREATE, &msg, sizeof(msg), &out.seqno);
+	out.posted = postUnwaited(RGFX_CMD_TEXTURE_CREATE, &msg, sizeof(msg), &out.seqno);
 	return out;
 }
 
@@ -511,7 +516,7 @@ bool RgfxSerializer::bufferDidModifyRange(RgfxObjId buffer, uint64_t location, u
 	msg.location = location;
 	msg.length = length;
 	uint64_t seqno = 0;
-	return m_control.tryPost(RGFX_CMD_BUFFER_DID_MODIFY_RANGE, &msg, sizeof(msg), &seqno);
+	return postUnwaited(RGFX_CMD_BUFFER_DID_MODIFY_RANGE, &msg, sizeof(msg), &seqno);
 }
 
 bool RgfxSerializer::textureDidModifyData(RgfxObjId texture)
@@ -551,8 +556,7 @@ RgfxCreated RgfxSerializer::createManagedTexture(const RgfxTextureDescriptor &de
 	msg.block_height = block_height;
 	msg.flags = flags;
 	msg.desc = desc;
-	out.posted =
-	    m_control.tryPost(RGFX_CMD_MANAGED_TEXTURE_CREATE, &msg, sizeof(msg), &out.seqno);
+	out.posted = postUnwaited(RGFX_CMD_MANAGED_TEXTURE_CREATE, &msg, sizeof(msg), &out.seqno);
 	return out;
 }
 
@@ -629,7 +633,7 @@ RgfxCreated RgfxSerializer::createTextureView(const RgfxTextureView &view)
 	msg.header = {};
 	msg.obj_id = out.obj_id;
 	msg.resource_id = out.resource_id;
-	out.posted = m_control.tryPost(RGFX_CMD_TEXTURE_VIEW, &msg, sizeof(msg), &out.seqno);
+	out.posted = postUnwaited(RGFX_CMD_TEXTURE_VIEW, &msg, sizeof(msg), &out.seqno);
 	return out;
 }
 

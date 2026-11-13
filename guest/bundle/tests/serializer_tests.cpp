@@ -26,6 +26,7 @@
 #include "RgfxBinaryArchiveFile.hpp"
 #include "RgfxCaps.hpp"
 #include "../../kext/src/RgfxUserClientABI.hpp"
+#include "../../kext/src/RgfxSubmitGate.hpp"
 #include <utility>
 #include "RgfxEncoder.hpp"
 #include "RgfxFeatureProfile.hpp"
@@ -2458,9 +2459,8 @@ uint32_t kextSubmitBatch(void *context, const void *messages, uint32_t bytes)
 		RgfxMsgHeader header;
 		std::memcpy(&header, m + at, sizeof(header));
 		CHECK(header.seqno == 0);
-		CHECK(header.type == RGFX_CMD_OBJECT_DESTROY ? header.size == sizeof(RgfxObjectDestroy)
-		                                             : header.type == RGFX_CMD_BUFFER_AT_OFFSET &&
-		                                                   header.size == sizeof(RgfxBufferAtOffset));
+		// Each of a type and size the kext's SubmitBatch takes.
+		CHECK(header.size != 0 && header.size == rgfxSubmitBatchSize(header.type));
 		call.objs.push_back(KextLog::objOf(m + at));
 		call.types.push_back(header.type);
 		at += header.size;
@@ -2652,6 +2652,119 @@ void test_held_buffers()
 	CHECK(p.posted && p.seqno != 0);
 	CHECK(plain.calls.size() == 1 && !plain.calls[0].batch &&
 	      plain.calls[0].types[0] == RGFX_CMD_BUFFER_AT_OFFSET);
+	CHECK(pser.postHeldCreates());
+}
+
+// The other creates no one waits for that name no block, and a Managed buffer's modified range,
+// held as a heap-placed buffer is (RgfxSerializer::postUnwaited): each answered as made and held,
+// in their order with the destroys, before anything posted after them; a commit's
+// postHeldCreates() answers false while any of them stays held, each on its own; a texture over
+// an IOSurface, which a present waits for, goes at once, behind the held; a writer that does not
+// batch posts each at once, as before.
+void test_held_creates()
+{
+	constexpr uint64_t kNever = 600ull * 1000000000;
+	KextLog log;
+	RgfxRingWriter writer(&kextSubmit, &log, 4096);
+	writer.setBatch(&kextSubmitBatch, 4096, kNever);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	RgfxTextureDescriptor desc = {};
+	desc.texture_type = 2;
+	desc.pixel_format = 70;
+	desc.width = 4;
+	desc.height = 4;
+	desc.depth = 1;
+	desc.mipmap_level_count = 1;
+	desc.sample_count = 1;
+	desc.array_length = 1;
+	RgfxTextureView view = {};
+	view.parent_obj_id = 0x77;
+	view.pixel_format = 70;
+
+	// Each kind, made one at a time with the kext taking none: answered as made, held, and the
+	// commit's answer false until the kext takes it, which posts it alone.
+	auto heldAlone = [&](const char *what, uint32_t type, const std::function<RgfxObjId()> &make) {
+		log.calls.clear();
+		log.batchTakes = 0;
+		const RgfxObjId obj = make();
+		CHECK(log.calls.empty());
+		CHECK(!ser.postHeldCreates());
+		log.batchTakes = UINT32_MAX;
+		CHECK(ser.postHeldCreates());
+		const bool alone = log.calls.size() == 1 && log.calls[0].batch &&
+		                   log.calls[0].objs == std::vector<RgfxObjId>({obj}) &&
+		                   log.calls[0].types == std::vector<uint32_t>({type});
+		if (!alone)
+			std::fprintf(stderr, "held alone: %s\n", what);
+		CHECK(alone);
+	};
+	heldAlone("texture", RGFX_CMD_TEXTURE_CREATE, [&] {
+		RgfxCreated c = ser.createTexture(desc, RGFX_OBJ_NONE, 0, 256, 1024);
+		CHECK(c.posted && c.obj_id != 0 && c.resource_id != 0 && c.gpu_address != 0 && c.seqno == 0);
+		return c.obj_id;
+	});
+	heldAlone("view", RGFX_CMD_TEXTURE_VIEW, [&] {
+		RgfxCreated c = ser.createTextureView(view);
+		CHECK(c.posted && c.obj_id != 0 && c.resource_id != 0 && c.seqno == 0);
+		return c.obj_id;
+	});
+	heldAlone("managed texture", RGFX_CMD_MANAGED_TEXTURE_CREATE, [&] {
+		RgfxCreated c = ser.createManagedTexture(desc, 0x78, 4, 1, 1, 0, 256, 1024);
+		CHECK(c.posted && c.obj_id != 0 && c.resource_id != 0 && c.gpu_address != 0 && c.seqno == 0);
+		return c.obj_id;
+	});
+	heldAlone("managed buffer", RGFX_CMD_MANAGED_BUFFER_CREATE, [&] {
+		RgfxCreated c = ser.createManagedBuffer(0x79, 256, 0x10);
+		CHECK(c.posted && c.obj_id != 0 && c.gpu_address != 0 && c.seqno == 0);
+		return c.obj_id;
+	});
+	heldAlone("modified range", RGFX_CMD_BUFFER_DID_MODIFY_RANGE, [&] {
+		CHECK(ser.bufferDidModifyRange(0x7a, 16, 32));
+		return RgfxObjId{0x7a};
+	});
+
+	// Together with destroys and heap-placed buffers, in the order made, in one call.
+	log.calls.clear();
+	CHECK(ser.destroy(0x101));
+	RgfxCreated t = ser.createTexture(desc, 0x10, 4096);
+	RgfxCreated a = ser.createBufferAtOffset(0x10, 0, 256, 0);
+	RgfxCreated v = ser.createTextureView(view);
+	CHECK(ser.bufferDidModifyRange(0x7a, 0, 16));
+	RgfxCreated m = ser.createManagedBuffer(a.obj_id, 256, 0x10);
+	CHECK(t.posted && t.gpu_address == 0 && a.posted && v.posted && m.posted);
+	CHECK(log.calls.empty());
+	CHECK(ser.postHeldCreates());
+	CHECK(log.calls.size() == 1 && log.calls[0].batch);
+	CHECK(log.calls[0].objs ==
+	      std::vector<RgfxObjId>({0x101, t.obj_id, a.obj_id, v.obj_id, 0x7a, m.obj_id}));
+	CHECK(log.calls[0].types == std::vector<uint32_t>({RGFX_CMD_OBJECT_DESTROY,
+	                                                   RGFX_CMD_TEXTURE_CREATE,
+	                                                   RGFX_CMD_BUFFER_AT_OFFSET,
+	                                                   RGFX_CMD_TEXTURE_VIEW,
+	                                                   RGFX_CMD_BUFFER_DID_MODIFY_RANGE,
+	                                                   RGFX_CMD_MANAGED_BUFFER_CREATE}));
+
+	// A texture over an IOSurface goes at once, behind what is held.
+	log.calls.clear();
+	RgfxCreated before = ser.createTexture(desc);
+	RgfxCreated surface = ser.createTextureFromIOSurface(0x7b, 0, 16, 0x55, 0, desc, 0,
+	                                                     RgfxSurfaceFacts{});
+	CHECK(before.posted && surface.posted && surface.seqno != 0);
+	CHECK(log.calls.size() == 2 && log.calls[0].batch && !log.calls[1].batch);
+	CHECK(log.ring() == std::vector<RgfxObjId>({before.obj_id, surface.obj_id}));
+	CHECK(log.calls[1].types == std::vector<uint32_t>({RGFX_CMD_TEXTURE_FROM_IOSURFACE}));
+
+	// A writer that does not batch posts each at once.
+	KextLog plain;
+	RgfxRingWriter direct(&kextSubmit, &plain, 4096);
+	RgfxSerializer pser(direct, ids);
+	RgfxCreated pt = pser.createTexture(desc);
+	RgfxCreated pv = pser.createTextureView(view);
+	CHECK(pt.posted && pt.seqno != 0 && pv.posted && pv.seqno != 0);
+	CHECK(pser.bufferDidModifyRange(0x7a, 0, 16));
+	CHECK(plain.calls.size() == 3 && !plain.calls[0].batch && !plain.calls[1].batch &&
+	      !plain.calls[2].batch);
 	CHECK(pser.postHeldCreates());
 }
 
@@ -3999,6 +4112,7 @@ int main()
 	test_forwarded_lifecycle();
 	test_held_destroys();
 	test_held_buffers();
+	test_held_creates();
 	test_library_key();
 	test_library_key_pieces();
 	test_library_key_of_file();

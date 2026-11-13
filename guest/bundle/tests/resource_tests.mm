@@ -37,6 +37,7 @@
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
 #include "reims_graphics_wire.h"
+#include "../../kext/src/RgfxSubmitGate.hpp"
 #include "rgfx_test_ring.hpp" // CHECK, g_checks, TestRing, expectMessage
 
 void rgfxResourceTests();
@@ -1497,7 +1498,7 @@ struct KextRing {
 		for (uint32_t at = 0; at < bytes; posted++) {
 			RgfxMsgHeader header;
 			std::memcpy(&header, m + at, sizeof(header));
-			CHECK(header.type == RGFX_CMD_OBJECT_DESTROY || header.type == RGFX_CMD_BUFFER_AT_OFFSET);
+			CHECK(header.size != 0 && header.size == rgfxSubmitBatchSize(header.type));
 			if (!kext->direct.tryPost(header.type, m + at, header.size, nullptr))
 				break;
 			at += header.size;
@@ -1604,17 +1605,20 @@ HeldRun heldDestroysRun(bool batches)
 		heapAnswers();
 		run.answers.push_back(b.gpuAddress);
 		run.answers.push_back(u.gpuResourceID._impl);
+		// What is still held goes, as a commit posts it (the buffer and the texture are held
+		// too).
+		CHECK(fx.ser.postHeldCreates());
 		const auto made = wire(fx.ring);
 		run.sent.insert(run.sent.end(), made.begin(), made.end());
 	}
 	return run;
 }
 
-// Destroys held to go together (RgfxRingWriter::postLater) change nothing the guest reads or the
-// host is sent: a heap's usedSize, currentAllocatedSize and maxAvailableSize drop at the release,
-// and a buffer and a texture made after it take the same bytes and resource id, created after the
-// destroys on the ring, as where each destroy is posted at its release. A residency set keeps its
-// allocations, so no destroy is held while it counts them.
+// Destroys held to go together (RgfxRingWriter::postLater), with the buffers and textures held
+// too, change nothing the guest reads or the host is sent: a heap's usedSize, currentAllocatedSize
+// and maxAvailableSize drop at the release, and a buffer and a texture made after it take the
+// same bytes and resource id, created after the destroys on the ring, as where each is posted at
+// once. A residency set keeps its allocations, so no destroy is held while it counts them.
 void test_held_destroys_change_nothing_seen()
 {
 	const HeldRun posted = heldDestroysRun(false);

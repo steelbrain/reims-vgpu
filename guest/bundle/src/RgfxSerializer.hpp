@@ -451,13 +451,15 @@ public:
 	/// where the device took RGFX_FEATURE_MANAGED_BUFFER_SLABS). The pick holds `offset` bytes
 	/// more, and the buffer's address is the pick plus `offset`, as a no-copy buffer's over the
 	/// app's pages keeps its pointer's offset in its page (createBufferOverPages). The answer's
-	/// `gpu_address` is the address picked, given back through releaseAddress.
+	/// `gpu_address` is the address picked, given back through releaseAddress. No one waits for
+	/// it: held where the control ring batches, as createBufferAtOffset's buffer is.
 	RgfxCreated createManagedBuffer(RgfxObjId cpu_buffer, uint64_t length, uint32_t options,
 	                                uint64_t align = kDefaultAddressAlign, uint64_t offset = 0);
 
 	/// The process wrote `length` bytes at `location` of Managed buffer `buffer`'s CPU copy
-	/// (`didModifyRange:`): every command buffer committed after it sees them. False where the
-	/// message was not posted.
+	/// (`didModifyRange:`): every command buffer committed after it sees them. Held where the
+	/// control ring batches, as createBufferAtOffset's buffer is, so a commit posts it first.
+	/// False where the message was neither held nor posted.
 	bool bufferDidModifyRange(RgfxObjId buffer, uint64_t location, uint64_t length);
 
 	/// The process changed the bytes texture `texture` lies over (`didModifyData`, SPI): a
@@ -484,7 +486,8 @@ public:
 	/// A texture of shape `desc`. When `heap` is RGFX_OBJ_NONE the texture is
 	/// device-placed at a picked GPU address, whose range holds `span` bytes (its
 	/// allocatedSize), as a buffer's holds its length; otherwise it lies at
-	/// `heap_offset` in `heap`. A resource id is picked either way.
+	/// `heap_offset` in `heap`. A resource id is picked either way. No one waits for it: held
+	/// where the control ring batches, as createBufferAtOffset's buffer is.
 	RgfxCreated createTexture(const RgfxTextureDescriptor &desc, RgfxObjId heap = RGFX_OBJ_NONE,
 	                          uint64_t heap_offset = 0, uint64_t align = kDefaultAddressAlign,
 	                          uint64_t span = 1);
@@ -492,7 +495,8 @@ public:
 	/// A Managed texture of shape `desc` at a picked GPU address, whose CPU copy is the Shared
 	/// buffer `cpu_buffer` over a block, of blocks `bytes_per_block` bytes and `block_width` by
 	/// `block_height` texels (RgfxManagedLayout.hpp), `flags` RGFX_MANAGED_TEXTURE_LINEAR or 0,
-	/// the address's range `span` bytes (its allocatedSize). A resource id is picked.
+	/// the address's range `span` bytes (its allocatedSize). A resource id is picked. No one waits
+	/// for it: held where the control ring batches, as createBufferAtOffset's buffer is.
 	RgfxCreated createManagedTexture(const RgfxTextureDescriptor &desc, RgfxObjId cpu_buffer,
 	                                 uint32_t bytes_per_block, uint32_t block_width,
 	                                 uint32_t block_height, uint32_t flags,
@@ -505,7 +509,8 @@ public:
 	                          const uint32_t origin[3], const uint32_t size[3]);
 
 	/// A view of a texture (RGFX_CMD_TEXTURE_VIEW): `view`'s parent, format, flags, type, levels,
-	/// slices and swizzle, with its id and resource id picked; `view`'s own are not read.
+	/// slices and swizzle, with its id and resource id picked; `view`'s own are not read. No one
+	/// waits for it: held where the control ring batches, as createBufferAtOffset's buffer is.
 	RgfxCreated createTextureView(const RgfxTextureView &view);
 
 	/// A texture of shape `desc` over the buffer `buffer` from `offset`, each row
@@ -739,8 +744,9 @@ public:
 
 	/// Posts what the control ring holds to go together (RgfxRingWriter::postLater), as a command
 	/// buffer's commit does before the buffer goes on its ring, which the host reads after the
-	/// control ring's messages posted before it: whether no create stays held, which the buffer
-	/// may name. Destroys left held wait for a later post, as refused ones do.
+	/// control ring's messages posted before it: whether nothing but destroys stays held, so no
+	/// create the buffer may name, nor a Managed buffer's range it may read. Destroys left held
+	/// wait for a later post, as refused ones do.
 	bool postHeldCreates();
 
 	/// The default alignment for a picked GPU address when the caller names none.
@@ -799,6 +805,13 @@ private:
 	std::deque<WaitingDestroy> m_destroys;
 	// Posts OBJECT_DESTROY of `obj_id`: whether it reached the ring.
 	bool postDestroy(RgfxObjId obj_id);
+
+	// Posts a message no one waits for that names no block (a create of one, a Managed buffer's
+	// modified range): where the route batches (RgfxRingWriter::postLater), held to go with the
+	// messages around it, before anything posted after it and before any command buffer
+	// committed after it (postHeldCreates), `*out_seqno` left as it is; else at once, as tryPost
+	// posts it. Whether it is held or posted.
+	bool postUnwaited(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno);
 
 	// The ICB records waiting for flushIcbWrites(), under m_icbLock: one ICB_WRITE message for
 	// each buffer's run of records, in the order the runs began. m_icbPending is set as a record

@@ -78,7 +78,8 @@ typedef bool (*RgfxAwaitAnswer)(void *context, uint64_t seqno);
 
 /// Hands `bytes` bytes of whole messages back to back (each header's `type` and `size` stamped),
 /// which no one waits for, to the kext in one call (the accelerator's SubmitBatch, which takes
-/// destroys alone): how many of them it posted, from the first, in their order. Fewer than all
+/// the types the kext's rgfxSubmitBatchSize names): how many of them it posted, from the first,
+/// in their order. Fewer than all
 /// only where the kext refused them, as it does where its control ring stays full.
 typedef uint32_t (*RgfxForwardBatch)(void *context, const void *messages, uint32_t bytes);
 
@@ -147,9 +148,9 @@ public:
 	/// Whether postLater() holds messages to go together (setBatch).
 	bool batches() const { return m_later != nullptr; }
 
-	/// Posts a message no one waits for (a destroy, a heap-placed buffer) together with others
-	/// where the writer batches (setBatch): held, to go in the order held before anything the
-	/// writer posts after it (each tryPost, tryPostKnown and tryPostShared posts the held first),
+	/// Posts a message no one waits for (a destroy, a create that names no block) together with
+	/// others where the writer batches (setBatch): held, to go in the order held before anything
+	/// the writer posts after it (each tryPost, tryPostKnown and tryPostShared posts the held first),
 	/// at flushLater(), once the held reach the batch's bytes, or setBatch's time after the first
 	/// held. Else, or for a message larger than a batch, posted as tryPost() posts it. True once
 	/// held or posted; false, holding nothing more, where the held had to go first to make room

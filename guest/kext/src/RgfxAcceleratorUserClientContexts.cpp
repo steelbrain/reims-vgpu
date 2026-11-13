@@ -636,12 +636,13 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	return kIOReturnSuccess;
 }
 
-// kRgfxAccelMethodSubmitBatch (RgfxUserClientABI.hpp): the client's destroys and heap-placed
-// buffers of its own objects onto the control ring in one call, each checked as submitMethod
-// checks one, all before any is posted, then posted in their order: the runs between its queues'
-// destroys under one hold of the ring each (RgfxAccelerator::postRun), and each queue's destroy
-// routed as submitMethod routes it (destroyQueueIfTracked) after the run before it. A buffer
-// made for a context that closed since the check is destroyed behind it, as submitMethod does
+// kRgfxAccelMethodSubmitBatch (RgfxUserClientABI.hpp): the client's messages no one waits for
+// that name no block (rgfxSubmitBatchSize), of its own objects, onto the control ring in one
+// call, each checked as submitMethod checks one, all before any is posted, then posted in their
+// order: the runs between its queues' destroys under one hold of the ring each
+// (RgfxAccelerator::postRun), and each queue's destroy routed as submitMethod routes it
+// (destroyQueueIfTracked) after the run before it. An object made for a context that closed
+// since the check is destroyed behind it, as submitMethod does
 // (rgfxSubmitDestroysBehind). The count out says how many went: all of them, but where a run met
 // a ring that stayed full or a device that stopped.
 IOReturn RgfxAcceleratorUserClient::submitBatchMethod(IOExternalMethodArguments *a)
