@@ -7,6 +7,12 @@
 //                newBufferWithBytes:, of lengths 1 to 1 MiB + 1
 //   heapbuffers  allocatedSize of buffers in a 4 MiB Private heap, and the device's
 //                heapBufferSizeAndAlignWithLength:options:
+//   heap.shared  a 4 MiB Shared heap: whether the device makes one, its buffers' sizes and
+//                contents, and a texture in it
+//   bit17, bit18, bit19  buffers by length (each storage mode) and by bytes (Shared, Managed),
+//                and the device's textures (each storage mode), of options holding that bit
+//   tiled.responds  whether a buffer of each storage mode answers the tiled and linear texture
+//                SPI, and the device the tiled one over bytes
 //   nocopy.*     a no-copy buffer (newBufferWithBytesNoCopy:) over pages the probe maps: its
 //                allocatedSize, length, contents and gpuAddress; .page (one page), .3pages,
 //                .16k, .len100 (100 bytes), .off16 (16 bytes into a page), .managed (one page)
@@ -40,7 +46,9 @@
 //   buftex.*     a 2D texture over a Shared buffer by the public newTextureWithDescriptor:offset:
 //                bytesPerRow:: .bc1 and .depth (formats minimumLinearTextureAlignmentForPixelFormat:
 //                may end the process at), .shortrow (468 x 36 BGRA8 rows 1536 bytes apart, under
-//                the row's 1872); linear.shortrow, the same by the buffer's linear SPI
+//                the row's 1872); linear.shortrow, the same by the buffer's linear SPI;
+//                .depth16, .stencil8, .d32s8 and .x32s8, the other depth and stencil formats;
+//                linear.depth, Depth32Float by the linear SPI
 //   devtex.*     a 64 x 64 2D texture the device makes, usage RenderTarget: .depth.shared,
 //                .depth.managed, .stencil.managed and .depth.private, by format and storage mode
 //   texaddr      (a group) for a texture of each storage mode and shape (texaddr.MODE.SHAPE):
@@ -191,6 +199,80 @@ static void case_heapbuffers(id<MTLDevice> d)
 			       (unsigned long)b.allocatedSize);
 		}
 	}
+}
+
+static void case_heap_shared(id<MTLDevice> d)
+{
+	MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+	hd.size = 4u << 20;
+	hd.storageMode = MTLStorageModeShared;
+	printf("heap.shared asking for a 4 MiB Shared heap\n");
+	id<MTLHeap> h = [d newHeapWithDescriptor:hd];
+	printf("heap.shared heap=%s size=%lu storage=%lu\n", cls(h), (unsigned long)h.size,
+	       (unsigned long)h.storageMode);
+	if (h == nil)
+		return;
+	const MTLResourceOptions o = MTLResourceStorageModeShared;
+	const NSUInteger lens[] = {1, 100, 4097, 16385, 65537};
+	for (int i = 0; i < 5; i++) {
+		MTLSizeAndAlign sa = [d heapBufferSizeAndAlignWithLength:lens[i] options:o];
+		id<MTLBuffer> b = [h newBufferWithLength:lens[i] options:o];
+		printf("heap.shared length=%lu sizeAndAlign=%lu,%lu buffer=%s allocatedSize=%lu "
+		       "contents=%s\n",
+		       (unsigned long)lens[i], (unsigned long)sa.size, (unsigned long)sa.align, cls(b),
+		       (unsigned long)b.allocatedSize, b.contents ? "yes" : "NULL");
+	}
+	MTLTextureDescriptor *td =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:64
+	                                                      height:64
+	                                                   mipmapped:NO];
+	td.storageMode = MTLStorageModeShared;
+	id<MTLTexture> t = [h newTextureWithDescriptor:td];
+	printf("heap.shared texture=%s\n", cls(t));
+}
+
+// Buffers and the device's textures of options holding bit `bit`.
+static void case_option_bit(id<MTLDevice> d, const char *tag, int bit)
+{
+	const MTLResourceOptions modes[] = {MTLResourceStorageModeShared, MTLResourceStorageModeManaged,
+	                                    MTLResourceStorageModePrivate};
+	const char *names[] = {"shared", "managed", "private"};
+	const MTLResourceOptions b = (MTLResourceOptions)1 << bit;
+	uint8_t bytes[64] = {0};
+	for (int m = 0; m < 3; m++) {
+		printf("%s length %s buffer=%s\n", tag, names[m],
+		       cls([d newBufferWithLength:64 options:modes[m] | b]));
+		if (m < 2)
+			printf("%s bytes %s buffer=%s\n", tag, names[m],
+			       cls([d newBufferWithBytes:bytes length:64 options:modes[m] | b]));
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:64
+		                                                      height:64
+		                                                   mipmapped:NO];
+		td.resourceOptions = modes[m] | b;
+		printf("%s texture %s texture=%s\n", tag, names[m], cls([d newTextureWithDescriptor:td]));
+	}
+}
+
+static void case_tiled_responds(id<MTLDevice> d)
+{
+	const MTLResourceOptions modes[] = {MTLResourceStorageModeShared, MTLResourceStorageModeManaged,
+	                                    MTLResourceStorageModePrivate};
+	const char *names[] = {"shared", "managed", "private"};
+	SEL tiled = sel_registerName("newTiledTextureWithDescriptor:offset:bytesPerRow:");
+	SEL linear = sel_registerName("newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:");
+	for (int m = 0; m < 3; m++) {
+		id<MTLBuffer> b = [d newBufferWithLength:1 << 16 options:modes[m]];
+		printf("tiled.responds %s buffer=%s tiled=%d linear=%d\n", names[m], cls(b),
+		       (int)[(id)b respondsToSelector:tiled], (int)[(id)b respondsToSelector:linear]);
+	}
+	SEL bytes6 = sel_registerName(
+	    "newTiledTextureWithBytesNoCopy:length:deallocator:descriptor:offset:bytesPerRow:");
+	SEL bytes5 = sel_registerName("newTiledTextureWithBytesNoCopy:length:descriptor:offset:bytesPerRow:");
+	printf("tiled.responds device=%s bytes.deallocator=%d bytes=%d\n", cls(d),
+	       (int)[(id)d respondsToSelector:bytes6], (int)[(id)d respondsToSelector:bytes5]);
 }
 
 static void nocopy(id<MTLDevice> d, const char *tag, size_t offset, size_t length,
@@ -2356,6 +2438,8 @@ static const char *const kCases[] = {
     "archive.slices",   "libforms2",        "libforms.kernel", "libforms.vertex", "classes.spi",
     "props2",           "argbuf.index.1",   "argbuf.index.5", "argbuf.index.5.nilreflection",
     "argbuf.ds.tex",    "argbuf.ds.texnil", "argbuf.ds.nil", "libforms3",
+    "heap.shared",      "bit17",            "bit18",         "bit19",         "tiled.responds",
+    "buftex.depth16",   "buftex.stencil8",  "buftex.d32s8",  "buftex.x32s8",  "linear.depth",
 };
 
 static int run_case(id<MTLDevice> d, const char *c)
@@ -2366,6 +2450,12 @@ static int run_case(id<MTLDevice> d, const char *c)
 		case_buffers(d);
 	else if (!strcmp(c, "heapbuffers"))
 		case_heapbuffers(d);
+	else if (!strcmp(c, "heap.shared"))
+		case_heap_shared(d);
+	else if (!strcmp(c, "bit17") || !strcmp(c, "bit18") || !strcmp(c, "bit19"))
+		case_option_bit(d, c, atoi(c + 3));
+	else if (!strcmp(c, "tiled.responds"))
+		case_tiled_responds(d);
 	else if (!strcmp(c, "nocopy.page"))
 		nocopy(d, c, 0, page, shared);
 	else if (!strcmp(c, "nocopy.3pages"))
@@ -2433,6 +2523,16 @@ static int run_case(id<MTLDevice> d, const char *c)
 		buffer_texture(d, c, MTLPixelFormatBGRA8Unorm, 468, 36, 1536, NO);
 	else if (!strcmp(c, "linear.shortrow"))
 		buffer_texture(d, c, MTLPixelFormatBGRA8Unorm, 468, 36, 1536, YES);
+	else if (!strcmp(c, "buftex.depth16"))
+		buffer_texture(d, c, MTLPixelFormatDepth16Unorm, 64, 64, 256, NO);
+	else if (!strcmp(c, "buftex.stencil8"))
+		buffer_texture(d, c, MTLPixelFormatStencil8, 64, 64, 256, NO);
+	else if (!strcmp(c, "buftex.d32s8"))
+		buffer_texture(d, c, MTLPixelFormatDepth32Float_Stencil8, 64, 64, 512, NO);
+	else if (!strcmp(c, "buftex.x32s8"))
+		buffer_texture(d, c, MTLPixelFormatX32_Stencil8, 64, 64, 512, NO);
+	else if (!strcmp(c, "linear.depth"))
+		buffer_texture(d, c, MTLPixelFormatDepth32Float, 64, 64, 256, YES);
 	else if (!strcmp(c, "devtex.depth.shared"))
 		device_texture(d, c, MTLPixelFormatDepth32Float, MTLStorageModeShared);
 	else if (!strcmp(c, "devtex.depth.managed"))
