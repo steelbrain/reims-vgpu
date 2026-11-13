@@ -245,7 +245,13 @@ is its transport:
   the release began held the release up to its 5 s bound under a BQL the
   teardown held. Now it takes the BQL, finds the routes the teardown closed
   and returns. No other callback takes the BQL, and no BH of the device's
-  runs inside the release, which runs on the main loop's thread.
+  runs inside the release, which runs on the main loop's thread. A window
+  or cursor callback can still run after the release (one already running
+  on the window's thread as the release closes the window, or one of a
+  device thread its 5 s left running), so the BH those callbacks schedule
+  stays to the exit and drops their events once the console is closed;
+  until `baa655fe` the teardown deleted it, and such a callback ended QEMU
+  with SIGSEGV at its quit (read from the code; no run reached it).
 - **The machine:** macOS places every 64-bit prefetchable BAR below 4 GiB,
   where a 1 GiB BAR needs the window to start at or below 0x4000_0000. So a
   q35 machine with the device keeps at most 1 GiB of the guest's RAM below
