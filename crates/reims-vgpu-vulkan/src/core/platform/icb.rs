@@ -10,9 +10,11 @@
 //! property setters do not (a platform dies at their send on a raise). A handle argument core can
 //! pass as nil is `Option<&P::X>`; one it never passes as nil is `&P::X`.
 
+use std::cell::Cell;
+
 use super::types::{MtlRegion, MtlSize};
 use super::{Handle, Platform};
-use crate::core::raise::RaiseResult;
+use crate::core::raise::{Raise, RaiseResult};
 
 /// `MTLIndirectCommandBuffer` (with `MTLIndirectCommandBufferSPI`).
 pub trait IndirectCommandBuffer<P: Platform>: Handle {
@@ -170,6 +172,31 @@ impl<P: Platform> IcbRenderCmd<'_, P> {
 pub trait IndirectRenderCommand<P: Platform> {
     /// Sends one [`IcbRenderCmd`].
     fn encode(&self, cmd: IcbRenderCmd<'_, P>) -> RaiseResult<()>;
+    /// Sends `cmds` in turn, each as [`encode`](Self::encode) sends it: the setters core has of
+    /// one command, which a platform may send in one call. The first that raises stops them,
+    /// answered with its place among them; those before it stay sent, and those after it are
+    /// not taken. `at` holds the place of the one being taken or sent, so that a death in
+    /// either tells which, and their number once all are sent. Inlined always, so that a
+    /// command the caller makes as it is taken is built where `encode` takes it.
+    #[inline(always)]
+    fn encode_each<'c>(
+        &self,
+        mut cmds: impl Iterator<Item = IcbRenderCmd<'c, P>>,
+        at: &Cell<usize>,
+    ) -> Result<(), (usize, Raise)>
+    where
+        P: 'c,
+    {
+        let mut i = 0;
+        loop {
+            at.set(i);
+            let Some(cmd) = cmds.next() else {
+                return Ok(());
+            };
+            self.encode(cmd).map_err(|raise| (i, raise))?;
+            i += 1;
+        }
+    }
     /// sel: getCommandType SPI
     fn command_type(&self) -> u64;
     /// sel: getFragmentBufferAddressAtIndex: SPI
@@ -275,6 +302,27 @@ impl<P: Platform> IcbComputeCmd<'_, P> {
 pub trait IndirectComputeCommand<P: Platform> {
     /// Sends one [`IcbComputeCmd`].
     fn encode(&self, cmd: IcbComputeCmd<'_, P>) -> RaiseResult<()>;
+    /// Sends `cmds` in turn, as
+    /// [`IndirectRenderCommand::encode_each`] sends a render command's.
+    #[inline(always)]
+    fn encode_each<'c>(
+        &self,
+        mut cmds: impl Iterator<Item = IcbComputeCmd<'c, P>>,
+        at: &Cell<usize>,
+    ) -> Result<(), (usize, Raise)>
+    where
+        P: 'c,
+    {
+        let mut i = 0;
+        loop {
+            at.set(i);
+            let Some(cmd) = cmds.next() else {
+                return Ok(());
+            };
+            self.encode(cmd).map_err(|raise| (i, raise))?;
+            i += 1;
+        }
+    }
     /// sel: getCommandType SPI
     fn command_type(&self) -> u64;
     /// sel: getKernelAttributeStrideAtIndex: SPI
