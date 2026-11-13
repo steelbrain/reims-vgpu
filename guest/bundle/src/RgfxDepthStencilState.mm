@@ -4,6 +4,7 @@
  */
 
 #import "RgfxDepthStencilState.h"
+#import "RgfxTexture.h" // rgfxAppleGPU
 
 #include "RgfxSerializer.hpp" // RgfxSerializer, RgfxStencilDescriptor (wire)
 
@@ -82,12 +83,15 @@ RgfxStencilDescriptor RgfxStencilOf(MTLStencilDescriptor *s)
 // The state's id in an argument buffer or an indirect command buffer, which no x86 Mac's state
 // has: both the AMD 5300M's and the Intel 630's answer respondsToSelector: YES for it and raise an
 // unrecognized selector, an NSInvalidArgumentException that ends the process where nothing
-// catches it (macOS 26.7.1: oracle_bundle argbuf.ds.id), and so does this, sending nothing.
+// catches it (macOS 26.7.1: oracle_bundle argbuf.ds.id), and so does this, sending nothing. On an
+// Apple GPU (rgfxAppleGPU) it answers 0, as the M3 Max's state answers every time under macOS
+// 27.0.1 (oracle_bundle Apple argbuf.ds.id, 11-13).
 - (MTLResourceID)gpuResourceID
 {
-	[self doesNotRecognizeSelector:_cmd];
 	MTLResourceID rid;
 	rid._impl = 0;
+	if (!rgfxAppleGPU(self.device))
+		[self doesNotRecognizeSelector:_cmd];
 	return rid;
 }
 

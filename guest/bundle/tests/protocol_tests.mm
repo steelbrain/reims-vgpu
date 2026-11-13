@@ -1176,6 +1176,18 @@ void test_framework_members()
 }
 @end
 
+// A device that answers an Apple family (Apple7, as every Apple-silicon Mac's GPU), so the
+// objects made of it take an Apple GPU's rules (rgfxAppleGPU).
+@interface RgfxAppleRulesTestDevice : NSObject
+- (BOOL)supportsFamily:(MTLGPUFamily)family;
+@end
+@implementation RgfxAppleRulesTestDevice
+- (BOOL)supportsFamily:(MTLGPUFamily)family
+{
+	return family >= MTLGPUFamilyApple1 && family <= MTLGPUFamilyApple9;
+}
+@end
+
 namespace {
 
 // The sample positions record after the pass's colour records in a BEGIN_RENDER body; its count
@@ -2337,6 +2349,26 @@ void test_argument_encoder_members()
 	}));
 	CHECK(wordAt(args, 0) == 0x5c5c5c5c5c5c5c5cull);
 	CHECK(!RgfxUnsupportedWasLogged(c, @selector(setDepthStencilState:atIndex:)));
+	// On an Apple GPU, as the M3 Max under macOS 27.0.1 answers (oracle_bundle Apple argbuf.ds.id,
+	// .set, .mixed, .tex, .texnil and .nil): a state's gpuResourceID is 0, and setting a state or
+	// nil writes nothing and raises nothing.
+	{
+		id apple = [RgfxAppleRulesTestDevice new]; // held: objects keep their device weakly
+		RgfxDepthStencilState *appleDs = [RgfxDepthStencilState
+		    depthStencilStateWithDescriptor:[[MTLDepthStencilDescriptor alloc] init]
+		                             device:(id<MTLDevice>)apple
+		                         serializer:&ser];
+		CHECK(appleDs != nil && appleDs.gpuResourceID._impl == 0);
+		RgfxArgumentEncoder *appleEnc =
+		    [[RgfxArgumentEncoder alloc] initWithLayout:RgfxArgLayout::parse(probe.data(), probe.size())
+		                                         device:(id<MTLDevice>)apple
+		                                     serializer:&ser];
+		[appleEnc setArgumentBuffer:args offset:0];
+		std::memset(args.contents, 0x5c, 8);
+		[appleEnc setDepthStencilState:appleDs atIndex:0];
+		[appleEnc setDepthStencilState:nil atIndex:0];
+		CHECK(wordAt(args, 0) == 0x5c5c5c5c5c5c5c5cull);
+	}
 	// An indirect command buffer writes its gpuResourceID, the host's id, as a pipeline; nil 0.
 	{
 		RgfxIcbState state = {};

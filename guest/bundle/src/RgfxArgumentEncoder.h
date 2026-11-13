@@ -19,7 +19,8 @@
  * A sampler's word is the resource id the host's device numbered it by (RgfxSampler.h). What the
  * device makes no object of (acceleration structures, function tables) only nil reaches, which
  * writes 0. A depth/stencil state has no resource id, as on the x86 Macs: setting one raises an
- * unrecognized selector at its gpuResourceID (RgfxDepthStencilState.h).
+ * unrecognized selector at its gpuResourceID (RgfxDepthStencilState.h); on an Apple GPU setting
+ * one writes nothing, as on the M3 Max.
  *
  * An encoder of a buffer binding (newArgumentEncoderWithBufferBinding:) is laid out as Metal lays
  * one out, from the argument buffer the binding describes: the function's own encoder where the

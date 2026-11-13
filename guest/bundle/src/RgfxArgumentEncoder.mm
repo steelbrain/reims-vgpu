@@ -7,6 +7,7 @@
 
 #import "RgfxFunction.h"
 #import "RgfxMetalError.h"
+#import "RgfxTexture.h" // rgfxAppleGPU
 #import "RgfxUnsupported.h"
 
 #include <cstring>
@@ -426,12 +427,17 @@ NSArray<MTLArgumentDescriptor *> *RgfxDescriptorsOfArguments(MTLStructType *type
 // selector for every state, nil among them, and writes nothing, as the encoders of both x86
 // Macs do, though each answers that it responds (the AMD 5300M's and the Intel 630's under
 // macOS 26.7.1: oracle_bundle argbuf.ds.tex, .texnil and .nil; the Intel 630's encoder of a
-// depth/stencil descriptor raises at a state's gpuResourceID instead, argbuf.ds.set).
+// depth/stencil descriptor raises at a state's gpuResourceID instead, argbuf.ds.set). On an Apple
+// GPU (rgfxAppleGPU) it writes nothing and raises nothing, as the M3 Max's encoders under macOS
+// 27.0.1 do for a state and for nil, at a depth/stencil descriptor's index, beside a texture and a
+// pointer, and on an encoder of one texture (oracle_bundle Apple argbuf.ds.set, .mixed, .tex,
+// .texnil and .nil, 11-13).
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)depthStencilState atIndex:(NSUInteger)index
 {
 	(void)depthStencilState;
 	(void)index;
-	[self doesNotRecognizeSelector:_cmd];
+	if (!rgfxAppleGPU(self.device))
+		[self doesNotRecognizeSelector:_cmd];
 }
 
 - (void)setDepthStencilStates:(const id<MTLDepthStencilState> __nullable[__nonnull])depthStencilStates
