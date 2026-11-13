@@ -18,15 +18,10 @@ use super::types::{ClearColor, MtlOrigin, MtlRegion, MtlSize, NsRange};
 use super::{Handle, Platform};
 use crate::core::raise::{OnFault, RaiseResult};
 
-/// An `id<MTLResource>` core passes to `synchronizeResource:`, `useResources:count:usage:[stages:]`
-/// and `memoryBarrierWithResources:count:`.
-///
-/// Core gets it from `-[PGResourceManagerDelegate getResourceForReference:]`, which returns
-/// `-[PGResource getResource]`: a buffer (`PGSharedBufferResource`, `PGPrivateBufferResource`,
-/// `PGDetachBufferResource`, `PGHeapBufferResource`, `PGMapperRefBufferResource`), a texture (the
-/// texture resources) or an indirect command buffer (`PGIndirectCommandBufferResource`). Every
-/// other resource kind raises in `-[PGResource getResource]` before the send, so these three are
-/// every object core can pass. Nil is `None` around this type.
+/// An `id<MTLResource>` passed to `synchronizeResource:`, `useResources:count:usage:[stages:]`
+/// and `memoryBarrierWithResources:count:`: a buffer, a texture or an indirect command buffer, the
+/// kinds the graphics decoder resolves a guest's object ID to there. Nil is `None` around this
+/// type.
 ///
 /// A borrowed reference, not a handle: the send retains nothing (D6).
 #[derive(Debug)]

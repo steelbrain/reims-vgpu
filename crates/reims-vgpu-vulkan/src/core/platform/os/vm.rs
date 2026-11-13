@@ -63,10 +63,10 @@ pub trait HostVm: Send + Sync {
     fn page_shift(&self) -> u32;
     /// `mach_vm_allocate(task, &a, len, VM_FLAGS_ANYWHERE)`: a fresh zero-filled range.
     fn allocate_anywhere(&self, len: u64) -> Result<HostAddr, KernReturn>;
-    /// The same call, [`HostVm::allocate_anywhere`], for a range core then names in address
-    /// ranges, which the platform maps again as an alias of its pages (the detach heap's
-    /// temporary). On Mach any range can be aliased; a platform whose fresh ranges cannot be
-    /// (Linux's anonymous memory) gives one that can.
+    /// The same call, [`HostVm::allocate_anywhere`], for a range a view of its pages may be made
+    /// of: an alias whose zeros past the guest's pages are imported with them, and the tests'
+    /// stand-in for guest memory. On Mach any range can be aliased; a platform whose fresh
+    /// ranges cannot be (Linux's anonymous memory) gives one that can.
     fn allocate_aliasable(&self, len: u64) -> Result<HostAddr, KernReturn> {
         self.allocate_anywhere(len)
     }

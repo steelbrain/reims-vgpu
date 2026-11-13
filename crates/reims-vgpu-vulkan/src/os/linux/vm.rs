@@ -9,12 +9,11 @@
 //! do; runs whose file offsets follow on are one VMA to the kernel.
 //!
 //! - **`allocate_anywhere`** is private anonymous memory (`MAP_NORESERVE`), zero-filled and in no
-//!   file, so no view can be made of it: it serves core's reservations, the detach buffer's
-//!   temporary and the address space views are mapped over. A range a view must be made of comes
-//!   from [`allocate_aliasable`], a shared mapping of a file of its own: the detach heap's
-//!   temporary, which Metal's heap is made over, is one (core's `HostVm::allocate_aliasable`),
-//!   and so is an alias whose zeros past the guest's pages the runtime imports with them
-//!   (`crate::gpu::backing::gather_or_nil`), as a dma-buf takes file pages alone.
+//!   file, so no view can be made of it: it serves reservations and the address space views are
+//!   mapped over. A range a view must be made of comes from [`allocate_aliasable`], a shared
+//!   mapping of a file of its own (core's `HostVm::allocate_aliasable`): an alias whose zeros past
+//!   the guest's pages the runtime imports with them (`crate::gpu::backing::gather_or_nil`), as a
+//!   dma-buf takes file pages alone, is one, and so is the tests' stand-in for guest memory.
 //! - **`remap_shared_overwrite`** fails with `KERN_INVALID_ADDRESS` where a byte of the source
 //!   has no file behind it, as Mach fails for an unmapped source, before it maps anything. A
 //!   piece the kernel refuses fails the call with nothing changed, as Mach's remap is all or

@@ -15,7 +15,7 @@
 //! while a live buffer still lies in an import of the old pages there:
 //! - **Core's Mach VM calls** ([`VulkanVm`], the platform's `HostVm`): a memory map's mappings
 //!   (`remap_shared_overwrite`), fixed overwrites (`allocate_fixed_overwrite`), every
-//!   mapping's teardown, core's detach temporaries among them (`deallocate`, before the call:
+//!   mapping's teardown (`deallocate`, before the call:
 //!   one Mach refuses reports pages that did not change, which only has a later buffer over
 //!   them import them anew), and fresh ranges, which may lie where others were freed
 //!   (`allocate_anywhere`). Each reports the pages the call changes, as Mach takes them
@@ -27,10 +27,9 @@
 //! mapping (`gather_or_nil`), the block of zeros, and an alias's release; nor do those of Linux's
 //! surface stand-in (`os::linux::surface`), whose view of the guest's pages is the alias of a
 //! surface over several ranges of them. Each range is a fresh one of the platform's own, which
-//! backs a heap, or the no-copy buffers over a surface at an offset into its allocation or whose
-//! GPU writes never reach its memory (`buffer_over_surface_at` in [`crate::gpu::device`]). The
-//! runtime lets no buffer lie in the import of a heap's bytes, and a surface's alias is released
-//! by the keep-alive of the last buffer over it, which the runtime drops after it freed that
+//! backs the no-copy buffers over a surface at an offset into its allocation or whose GPU writes
+//! never reach its memory (`buffer_over_surface_at` in [`crate::gpu::device`]). A surface's alias
+//! is released by the keep-alive of the last buffer over it, which the runtime drops after it freed that
 //! buffer's import, or, where it is the surface's view, by the surface's last release where that
 //! comes later, so no buffer made later at the address could lie in one.
 //!
@@ -42,8 +41,7 @@
 //! a mapping of its own there, measured), at no offset into its allocation and with GPU writes that
 //! reach its memory (the others lie over an alias): one made after the host replaced the pages lies
 //! in a live one's import, over the old pages, and what Metal's texture on such a surface reads
-//! then is not measured. Heaps over address ranges lie in aliases of their own
-//! ([`crate::gpu::backing`]), never there.
+//! then is not measured.
 //!
 //! **Unmaps an import waits for** ([`UnmapHold`]). The runtime runs a no-copy buffer's
 //! deallocator, given with a keep-alive, as the buffer is released, Metal's moment, and then
@@ -56,7 +54,7 @@
 //! spinners and another process's kernels; never while the kernel ran).
 //! Vulkan requires imported pages to stay mapped while the import lives
 //! (`VK_EXT_external_memory_host`). A deallocator of core's unmaps core's mapping of the guest's
-//! pages through [`VulkanVm`] (a memory map's `Mapping`, core's detach temporaries), so each
+//! pages through [`VulkanVm`] (a memory map's `Mapping`), so each
 //! no-copy buffer this platform makes over memory it was given gives the runtime an
 //! [`UnmapHold`] on the pages in its keep-alive ([`crate::gpu::backing::keep_alive`]). While the
 //! hold lives, [`VulkanVm`]'s `deallocate` of pages it meets reports them, as every unmap does,
@@ -74,7 +72,7 @@
 //!   of the C API. The calls of `deallocate` are core's: a mapping's last release on the thread
 //!   that lets it go (a device thread, the host's thread inside a call, or the runtime's thread
 //!   that runs a buffer's deallocator, the releasing thread or one of its handler threads as a
-//!   command buffer completes), a detach temporary's and a failed map's. The holds go on the runtime's thread that frees
+//!   command buffer completes), and a failed map's. The holds go on the runtime's thread that frees
 //!   the import: the releasing thread, or a handler thread once the last command buffer that held
 //!   the import completed, or the creating thread where the runtime refused the call.
 //! - **What it keeps.** The pages stay mapped, at their address, until the hold goes: the kernel
@@ -679,7 +677,7 @@ mod tests {
         assert!(OsVm::new().deallocate(src, 2 * page).is_success());
     }
 
-    /// Core's aliasable range (the detach heap's temporary) reports its pages as a fresh range
+    /// An aliasable range ([`crate::os::allocate_aliasable`]) reports its pages as a fresh range
     /// does, and a view can be made of it, as Mach's remap of any allocation: on Linux a range
     /// of `allocate_anywhere`'s has no file behind it, and a view of it is refused
     #[test]
