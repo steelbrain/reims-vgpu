@@ -2323,15 +2323,27 @@ mod tests {
         (icb, pipeline)
     }
 
+    /// The commands of the longest buffer the device's records hold, to 2^20: the runtime keeps
+    /// a buffer's records, a header and then a record a command, in one buffer of the device's
+    /// `max_buffer_length`, and refuses one past it (`IndirectCommandBufferPastMaxBufferLength`).
+    /// lavapipe's 2 GiB holds 955,285 commands.
+    fn most_commands(d: &VulkanDevice) -> u64 {
+        use metal2vulkan::bind::indirect_commands::{COMMAND_BUFFER_HEADER_BYTES, COMMAND_BYTES};
+        let room = d.raw.properties().max_buffer_length - COMMAND_BUFFER_HEADER_BYTES as u64;
+        (room / COMMAND_BYTES as u64).min(1 << 20)
+    }
+
     /// A CPU reset of a range, one call however many commands it spans, leaves each command of it
-    /// fresh, as a command's reset leaves one: of 2^20 commands, command 0 dispatches nothing
-    /// after it, and its getters read a fresh command's
+    /// fresh, as a command's reset leaves one: of 2^20 commands, or as many as one buffer of the
+    /// device holds where that is fewer ([`most_commands`]), command 0 dispatches nothing after
+    /// it, and its getters read a fresh command's
     #[test]
     fn a_cpu_reset_of_a_range_leaves_its_commands_fresh() {
         let d = dev();
         let input = holding(&d, &[10, 20, 30, 40]);
         let out = holding(&d, &[0; 4]);
-        let (icb, _pipeline) = add_into(&d, 1 << 20, &out, &input);
+        let n = most_commands(&d);
+        let (icb, _pipeline) = add_into(&d, n, &out, &input);
         let resident = [
             Some(ResourceRef::Buffer(&input)),
             Some(ResourceRef::Buffer(&out)),
@@ -2339,7 +2351,7 @@ mod tests {
         ];
         execute_first(&d, &icb, &resident);
         assert_eq!(words(&out), [11, 21, 31, 41]);
-        icb.reset_with_range(0, 1 << 20).unwrap();
+        icb.reset_with_range(0, n).unwrap();
         let reset = icb.compute_command(0).unwrap().unwrap();
         assert_eq!(
             (
