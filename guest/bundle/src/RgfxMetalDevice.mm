@@ -1734,6 +1734,16 @@ RGFX_LOG_UNRECOGNIZED
 	return _caps.spiFeature(kRgfxSpiResourceHeaps);
 }
 
+// NO, as the AMD 5300M and the Intel 630 answer (measured: macOS 26.7.1, tools/base_answers_probe.m
+// and oracle_caps), where the IOGPU base answered YES here (measured: the x86-64 guest's device,
+// tools/base_answers_probe.m) and the M3 Max answers YES: the device's heaps neither detach nor
+// replace their backing (RgfxHeap's detachBacking and replaceBackingWithRanges:readOnly: raise an
+// unrecognized selector, as Metal's base heap), so a caller told YES that sends them would end.
+- (BOOL)supportsResourceDetachBacking
+{
+	return NO;
+}
+
 - (BOOL)supportsSamplerCompareFunction
 {
 	return _caps.spiFeature(kRgfxSpiSamplerCompareFunction);

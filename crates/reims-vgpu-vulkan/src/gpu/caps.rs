@@ -73,13 +73,14 @@
 //!   as Metal answers it, a constant one and a runtime one. A guest told yes where a row is not
 //!   exact picks work that Metal runs and the runtime refuses or runs otherwise; told no, it
 //!   never makes that pipeline;
-//! - buffers and heaps over address ranges and detach backing (key 33's 0x8 and 0x10, and key 42,
-//!   which core sets from detach backing, not from the argument buffer tier) are yes where the
-//!   runtime imports host memory (`VK_EXT_external_memory_host`), which every heap over address
-//!   ranges is made over ([`crate::gpu::backing`]), as on MoltenVK, where they are Metal's
-//!   answers. Nothing detaches or replaces a backing: the guest's heaps answer neither (the Metal
-//!   bundle's `RgfxHeap` raises an unrecognized selector, as Metal's base heap), and this
-//!   platform makes neither;
+//! - buffers and heaps over address ranges are yes where the runtime imports host memory
+//!   (`VK_EXT_external_memory_host`), which every heap over address ranges is made over
+//!   ([`crate::gpu::backing`]), as on MoltenVK, where they are Metal's answers;
+//! - `supportsResourceDetachBacking` is no, as the AMD Radeon Pro 5300M and the Intel UHD 630
+//!   answer (measured, macOS 26.7.1), where the M3 Max answers yes: nothing detaches or replaces
+//!   a backing. This platform does neither, and the guest's heaps answer neither (the Metal
+//!   bundle's `RgfxHeap` raises an unrecognized selector, as Metal's base heap), so the bundle
+//!   answers no as well;
 //! - `heapTextureSizeAndAlignWithDescriptor:` of a depth or stencil texture with
 //!   `allowGPUOptimizedContents` off answers Metal's size, the runtime's model of Metal's answer,
 //!   which answers an X32_Stencil8 texture as a Stencil8 one of its shape, as the runtime's own
@@ -364,7 +365,8 @@ fn computed(device: &rt::Device, private: &rt::PrivateProperties) -> (u64, Limit
             "areProgrammableSamplePositionsSupported",
             props.are_programmable_sample_positions_supported(),
         ),
-        supports_resource_detach_backing: imports_host_memory,
+        // Nothing detaches or replaces a backing (the module's docs).
+        supports_resource_detach_backing: false,
         // The runtime's shared texture handle, in this process.
         supports_shared_texture_handles: true,
         supports_simd_reduction: simd_reduction,

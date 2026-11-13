@@ -979,7 +979,7 @@ supportsRenderPassWithoutRenderTarget implemented
 supportsRenderTargetTextureRotation base %base-spi
 supportsRenderTextureWrites implemented
 supportsRenderToLinearTextures base %base-spi
-supportsResourceDetachBacking base %base-spi
+supportsResourceDetachBacking metal NO, as the AMD 5300M and the Intel 630 answer (measured: macOS 26.7.1, tools/base_answers_probe.m), where the IOGPU base answered YES: the device's heaps neither detach nor replace their backing (RgfxHeap's detachBacking and replaceBackingWithRanges:readOnly: raise an unrecognized selector)
 supportsResourceHeaps implemented
 supportsSIMDGroup implemented
 supportsSIMDGroupMatrix base %base-spi

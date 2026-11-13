@@ -53,10 +53,12 @@ fn caps_are_the_runtimes_and_the_documented_facts() {
     );
     let f = &caps.flags;
     assert!(
-        f.supports_buffer_with_address_ranges
-            && f.supports_heap_with_address_ranges
-            && f.supports_resource_detach_backing,
+        f.supports_buffer_with_address_ranges && f.supports_heap_with_address_ranges,
         "MoltenVK imports host memory"
+    );
+    assert!(
+        !f.supports_resource_detach_backing,
+        "nothing detaches or replaces a backing"
     );
     assert_eq!(caps.primitive_types[..5], [true; 5].map(Ok));
     assert_eq!(
@@ -134,9 +136,15 @@ fn answers(caps: &DeviceCaps) -> Vec<(String, String)> {
     out
 }
 
+/// The answers of the device's caps that are not Metal's on the M3 Max, each the device's truth
+/// where it lacks what Metal has (the module's docs), and the answer it gives: no backing is
+/// detached or replaced.
+const NOT_METALS: [(&str, &str); 1] = [("supports_resource_detach_backing", "false")];
+
 /// Every answer of the device's caps is Metal's on the M3 Max, field for field:
 /// every limit, flag, sample count, primitive type, family and rounding mode core asks, and the
-/// heap-buffer and linear-alignment queries
+/// heap-buffer and linear-alignment queries, but those of [`NOT_METALS`], each of which answers
+/// its own value where Metal's differs
 ///
 /// The registry ID, which names the device until the host restarts, is left out, and a GPU other
 /// than the one Metal's answers were recorded on answers otherwise, so there the test ends.
@@ -150,9 +158,15 @@ fn every_cap_is_metals() {
         );
         return;
     }
+    for (name, want) in NOT_METALS {
+        let o = &ours.iter().find(|(n, _)| n == name).unwrap().1;
+        assert_eq!(o, want, "{name}");
+        assert!(!crate::metal_matches!(name, o), "{name}: Metal's too");
+    }
     let differ: Vec<String> = ours
         .iter()
-        .filter(|(name, o)| name != "registryID" && !crate::metal_matches!(name, o))
+        .filter(|(name, _)| name != "registryID" && NOT_METALS.iter().all(|(n, _)| n != name))
+        .filter(|(name, o)| !crate::metal_matches!(name, o))
         .map(|(name, o)| format!("{name}: ours {o}, not Metal's"))
         .collect();
     assert!(
