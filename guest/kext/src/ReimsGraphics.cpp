@@ -5,6 +5,7 @@
 
 #include "ReimsGraphics.hpp"
 #include "RgfxAccelerator.hpp"
+#include "RgfxAnswerLook.hpp"
 #include "RgfxBootConsole.hpp"
 #include "RgfxDisplayPower.hpp"
 #include "RgfxFeatures.hpp"
@@ -451,6 +452,9 @@ IOReturn ReimsGraphics::postLifecycle(UInt32 type, const void *message, UInt32 s
 
 	UInt64 s = 0;
 	IOReturn r = post(type, message, size, &s, &w->seqno);
+	// Most answers come within tens of microseconds: looked for here first (RgfxAnswerLook.hpp).
+	if (r == kIOReturnSuccess)
+		lookForAnswer(w);
 	IOLockLock(stateLock);
 	// Each waiter sleeps on its own `done`, so an answer wakes only the thread it is for, not
 	// every waiter (which, with many in flight, would herd on stateLock and starve the work loop
@@ -686,14 +690,7 @@ void ReimsGraphics::service()
 {
 	if (!ready)
 		return;
-	volatile UInt8 *events = ring(RGFX_CONTROL_COMPLETE_OFFSET);
-	for (;;) {
-		drainEvents();
-		store32(events + kRingArmed, 1);
-		fullFence();
-		if (load64(events + kRingProducer) == consumed)
-			break;
-	}
+	takeCompletions();
 	// The host has moved on: a post waiting for room on the control ring looks again.
 	if (rgfxRingRoomPass(room)) {
 		IOLockLock(stateLock);
@@ -744,6 +741,59 @@ void ReimsGraphics::service()
 			refreshSeqno = seqno;
 		}
 	}
+}
+
+// The completion ring drained, then its interrupt armed and the ring looked at again, so an event
+// published meanwhile is never left without one: in the work loop's gate (service, takeAction).
+void ReimsGraphics::takeCompletions()
+{
+	volatile UInt8 *events = ring(RGFX_CONTROL_COMPLETE_OFFSET);
+	for (;;) {
+		drainEvents();
+		store32(events + kRingArmed, 1);
+		fullFence();
+		if (load64(events + kRingProducer) == consumed)
+			break;
+	}
+}
+
+// A waiter's take of the completion ring (lookForAnswer), in the work loop's gate as the work
+// loop's own; the rest of service() follows at the interrupt the record raised.
+IOReturn ReimsGraphics::takeAction(OSObject *owner, void *, void *, void *, void *)
+{
+	ReimsGraphics *self = static_cast<ReimsGraphics *>(owner);
+	if (self->ready)
+		self->takeCompletions();
+	return kIOReturnSuccess;
+}
+
+// Looks for `w`'s answer for at most kRgfxAnswerLookNs (RgfxAnswerLook.hpp), taking the
+// completion ring in the work loop's gate where it holds a record the work loop has not taken,
+// and the gate is free (lookGate's attemptAction): it never waits for it, as its holder may wait
+// for a lock this thread's caller holds (the event hooks take the release table's lock and the
+// pipe clients'), which only the sleep's deadline below bounds. A device that stops meanwhile ends
+// the look: its caller then waits as before.
+void ReimsGraphics::lookForAnswer(const LifecycleWaiter *w)
+{
+	IOCommandGate *gate = lookGate;
+	if (!ready || !gate)
+		return;
+	gate->retain();
+	volatile UInt8 *events = ring(RGFX_CONTROL_COMPLETE_OFFSET);
+	uint64_t span = 0;
+	nanoseconds_to_absolutetime(kRgfxAnswerLookNs, &span);
+	rgfxLookForAnswer(
+	    mach_absolute_time() + span, [] { return mach_absolute_time(); },
+	    [this, w] {
+		    return !__atomic_load_n(&ready, __ATOMIC_RELAXED) ||
+		           __atomic_load_n(&w->done, __ATOMIC_ACQUIRE);
+	    },
+	    [events] { return load64(events + kRingProducer) != load64(events + kRingConsumer); },
+	    [this, gate] {
+		    return gate->attemptAction(&ReimsGraphics::takeAction, this) == kIOReturnSuccess;
+	    },
+	    [] { rgfxAnswerLookPause(); });
+	gate->release();
 }
 
 bool ReimsGraphics::drainEvents()
@@ -1434,6 +1484,14 @@ bool ReimsGraphics::start(IOService *provider)
 		IOLog("ReimsGraphics: no work loop\n");
 		goto fail;
 	}
+	// The gate a waiter takes the completion ring in (lookForAnswer): without it, waiters sleep
+	// for their answers alone.
+	lookGate = IOCommandGate::commandGate(this);
+	if (lookGate && workLoop->addEventSource(lookGate) != kIOReturnSuccess)
+		OSSafeReleaseNULL(lookGate);
+	if (!lookGate)
+		IOLog("ReimsGraphics: no gate for waiters to look for their answers in: they sleep for "
+		      "them\n");
 
 	// The device from scratch: reset, then the features the kext takes of the host's offer
 	// (RgfxFeatures.hpp), then take the rings' counters as they stand and say the driver is
@@ -1628,6 +1686,8 @@ void ReimsGraphics::quiesce()
 		kick->disable();
 		workLoop->removeEventSource(kick);
 	}
+	if (lookGate)
+		workLoop->removeEventSource(lookGate);
 }
 
 // The boot framebuffer the platform expert's console info names now, before IOFramebuffer moves
@@ -1678,6 +1738,7 @@ void ReimsGraphics::teardown()
 	taken = false;
 	OSSafeReleaseNULL(msix);
 	OSSafeReleaseNULL(kick);
+	OSSafeReleaseNULL(lookGate);
 	OSSafeReleaseNULL(workLoop);
 	OSSafeReleaseNULL(cursorMap);
 	OSSafeReleaseNULL(ringMap);

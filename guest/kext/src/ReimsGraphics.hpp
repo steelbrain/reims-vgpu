@@ -26,6 +26,7 @@
 #ifndef REIMS_GRAPHICS_HPP_
 #define REIMS_GRAPHICS_HPP_
 
+#include <IOKit/IOCommandGate.h>
 #include <IOKit/IOInterruptEventSource.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOWorkLoop.h>
@@ -452,6 +453,9 @@ private:
 	// The work loop: the completion ring and what follows from it.
 	static void serviceAction(OSObject *owner, IOInterruptEventSource *sender, int count);
 	void service();
+	void takeCompletions();
+	static IOReturn takeAction(OSObject *owner, void *, void *, void *, void *);
+	void lookForAnswer(const LifecycleWaiter *w);
 	bool drainEvents();
 	void handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 *payload, UInt32 size);
 	UInt32 parseDisplays(const volatile UInt8 *payload, UInt32 size);
@@ -489,6 +493,9 @@ private:
 	IOWorkLoop *workLoop;
 	IOInterruptEventSource *msix;
 	IOInterruptEventSource *kick;
+	// The work loop's gate as a waiter takes it, never waiting for it (lookForAnswer); none where
+	// it was not made, and waiters then only sleep.
+	IOCommandGate *lookGate;
 
 	// The submission ring, under submitLock: the bytes produced and the
 	// next seqno.

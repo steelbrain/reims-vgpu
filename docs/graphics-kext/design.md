@@ -1951,6 +1951,21 @@ Tested by `serializer_tests`' `test_held_destroys` and
 `test_commit_behind_an_untaken_buffer_fails`, and the kext's by
 `submit_gate_test`, `spans_test` and `user_client_words_test`.
 
+**A waiter looks for its answer.** A lifecycle message the kext waits for
+(`postLifecycle`: a heap texture's size, a library's lookup, a surface's
+pages) is answered within tens of microseconds of its post, 60 to 110 us for a
+surface's pages on the RTX 3090 host; the answer then waited for the
+interrupt, the work loop's wake and the waiter's, about 25 us more. So the
+waiter looks for it for at most 150 us (`RgfxAnswerLook.hpp`) before it
+sleeps: where the control completion ring holds a record the work loop has
+not taken, it takes the ring in the work loop's gate, as the work loop does,
+and else pauses the CPU. It never waits for the gate: where another thread
+holds it, the waiter pauses and looks again, so a holder that waits for a lock
+the waiter's caller holds is bounded by the waiter's deadline, as before. The
+rest of the work loop's service follows at the interrupt the record raised. Only a thread whose call waits for an answer
+looks, and only that long; a later answer wakes it as before. Tested by the
+kext's `answer_look_test`.
+
 **Rings.** A 256-byte header, then a byte ring whose size is a power of two
 (64 KiB minus the header for the control rings). Each header field sits in its
 own 64-byte line:
