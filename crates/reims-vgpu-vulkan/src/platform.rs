@@ -586,12 +586,12 @@ const SHADER_CACHE: &str = ".cache/reims-vgpu-vulkan";
 /// next boot that draws with it, unless the driver's cache still holds it: a freeze of 13 to 26 s
 /// there.
 #[cfg(not(any(test, feature = "testkit")))]
-const SHADER_CACHE_CAPACITY: u64 = rt::DEFAULT_CAPACITY;
+pub(crate) const SHADER_CACHE_CAPACITY: u64 = rt::DEFAULT_CAPACITY;
 
 /// A test build's capacity, 1 GiB: its directory holds what the tests compile and nothing a
 /// guest's boot reuses, so it is kept small on disk.
 #[cfg(any(test, feature = "testkit"))]
-const SHADER_CACHE_CAPACITY: u64 = 1 << 30;
+pub(crate) const SHADER_CACHE_CAPACITY: u64 = 1 << 30;
 
 /// A test build's shader cache directory under `HOME`, the tests' own: this crate's unit tests',
 /// and every crate's tests', which turn on its `testkit` feature (only dev-dependencies do, `cargo

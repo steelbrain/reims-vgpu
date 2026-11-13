@@ -53,15 +53,23 @@ pub(crate) const RECORDS: &str = ".cache/reims-vgpu-vulkan-pipelines";
 /// The most bytes the records file holds: past them, no record is appended.
 pub(crate) const CAPACITY: u64 = 64 << 20;
 
-/// The driver's pipeline cache data one warm pass may add, in bytes (`Device::warm`'s budget): the
-/// pass stops before its next record once its makings added this much, and counts the records left
-/// as not run. A making whose data the shader cache holds already adds nothing, so the budget binds
-/// only where the records' data is made anew, as after a change of the translator or the driver.
-/// **Measured** 2026-11-12 on homelab-um790-xtx-1's RTX 2080 (NVIDIA 620.70.06), a macOS 26
-/// guest's walk after a translator change (job m3-max-23661): of 4,565 records, 2,573 were made,
-/// 130 translated only and 130 failed, 1 was unread, and 1,731 were not run, the budget spent by
-/// 4.30 GB of driver data within 50 s, about 1.7 MB a pipeline.
-pub(crate) const WARM_BUDGET: u64 = 4 << 30;
+/// The driver's pipeline cache data one warm pass may add, in bytes (`Device::warm`'s budget): a
+/// backstop, half the shader cache's cap ([`SHADER_CACHE_CAPACITY`], 25 GiB on a host). What
+/// bounds the pass is the records it is handed, every one the file holds, within [`CAPACITY`]: it
+/// stops before its next record only once its makings added this much, counting the records left
+/// as not run, as past it its writes would push out of the cache, the least recently used first,
+/// what the guest's boots read from it. A making whose data the shader cache holds already adds
+/// nothing, so the budget can bind only where the records' data is made anew, as after a change of
+/// the translator or the driver, and then only where a driver's data for each record is large; no
+/// driver's size is assumed. **Measured** 2026-11-12 on homelab-um790-xtx-1's RTX 2080 (NVIDIA
+/// 620.70.06), a macOS 26 guest's walk after a translator change (job m3-max-23661), the budget
+/// 4 GiB then: of 4,565 records, 2,573 were made, 130 translated only and 130 failed, 1 was unread,
+/// and 1,731 were not run, the budget spent by 4.30 GB of driver data within 50 s. That driver's
+/// records were about 1.85 MB each, nearly all of it one section the same in every record (as
+/// metal2vulkan read them), so the 4,565 add about 8.5 GB, within the half.
+///
+/// [`SHADER_CACHE_CAPACITY`]: crate::platform::SHADER_CACHE_CAPACITY
+pub(crate) const WARM_BUDGET: u64 = crate::platform::SHADER_CACHE_CAPACITY / 2;
 
 /// How often the warm thread looks whether the runtime's pass has ended.
 const WARM_POLL: std::time::Duration = std::time::Duration::from_millis(250);
@@ -340,6 +348,16 @@ mod tests {
              warmable, 4 not run (the budget spent or the process ending); 1048576 bytes of \
              driver pipeline data added"
         );
+    }
+
+    /// The warm pass's budget is a backstop, half the shader cache's cap, and on a host's cap it
+    /// holds the RTX 2080 walk's 4,565 records at that driver's 1.85 MB a record, which 4 GiB did
+    /// not (the budget's doc)
+    #[test]
+    fn the_warm_budget_is_half_the_cache_and_holds_a_walk_s_records() {
+        assert_eq!(WARM_BUDGET, crate::platform::SHADER_CACHE_CAPACITY / 2);
+        const { assert!(4_565u64 * 1_853_000 <= rt::DEFAULT_CAPACITY / 2) };
+        const { assert!(4_565u64 * 1_853_000 > 4 << 30) };
     }
 
     /// The records file lies beside the hosts' shader cache directory, under `HOME`, not in it:
