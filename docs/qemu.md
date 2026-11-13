@@ -91,6 +91,7 @@ merge into staging of 2026-06-19), and upstream master is merged into it
 | a command buffer is taken, and answered, on the vCPU that rings its queue's doorbell, with the plain register write | `f2c7e2a5`, `67cc08ad`, `5f459785` |
 | a command queue's plain doorbell, which the library routes where the guest took `DOORBELL_ASKS` (`route_doorbell`), is an ioeventfd matching the ring's id that signals the queue's eventfd, added and dropped under the BQL as the library asks, at most 128 at once | `d81bcaac` |
 | the console shows the display (`rvg_graphics_device_read_display`), so QMP's `screendump` saves the guest's frame, and has the guest's cursor | `70a9a466`, `c119b802` |
+| a screendump waits for the console's read of the display at most 3 s from the read's start, then is answered with what the console shows, so QMP goes on while the GPU never answers the read | `17098f76` |
 | the device's realize warns where BAR 2 would get no address: on a PC machine with RAM at 1 GiB ("The reims-graphics device", below) | `22ae1fd1` |
 | the window opens at the `resolution` property's size, 1920x1080 without it | `93fb0692` |
 | file-backed guest RAM (the memfd of `reims-ctl`'s VMs) mapped 2 MiB-aligned on Linux, as anonymous RAM is, so transparent huge pages can back it where the host allows them ("Linux hosts: huge pages for guest RAM", below) | `1b41f5f5db` |
@@ -197,10 +198,16 @@ is its transport:
   for its draw on the GPU, never under the BQL, and the guest sees nothing
   of it. A `screendump` answers once the read is done, and QMP runs its
   commands one at a time, on every monitor, so none answers meanwhile; HMP's
-  do. With a read waiting for a GPU that stopped answering (NVIDIA's Xid 109),
-  HMP's `info status` answered in under 1 ms throughout a 150 s wait, the
-  vCPUs ran and the guest answered ssh (**measured**, RTX 2080 and RTX 3090,
-  2026-11-12).
+  do. A read still under way 3 s after its start is late: a `screendump`
+  waiting for it is answered then with what the console shows, the frame of
+  the last read that ended, or QEMU's placeholder ("Guest has not initialized
+  the display (yet).") where none has, and so is every update until the read
+  ends, which starts no other read. The read's end updates the console. The
+  3 s leave `reims-ctl view`, which waits 5 s for a QMP answer, 2 s of
+  margin. Before that bound, a read waiting for a GPU that stopped answering
+  (NVIDIA's Xid 109) held every QMP monitor to the quit, while HMP's `info
+  status` answered in under 1 ms throughout a 150 s wait, the vCPUs ran and
+  the guest answered ssh (**measured**, RTX 2080 and RTX 3090, 2026-11-12).
 - **The cursor** is the console's too: the library tells the device the
   guest's cursor on its display thread (`cursor_glyph`, `cursor_show`,
   `cursor_move` of `RvgGraphicsCallbacks`), and the BH, in order with the
