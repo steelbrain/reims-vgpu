@@ -464,7 +464,11 @@ fn a_fresh_surface_needs_a_cache_where_its_pages_fit_no_dma_buf_or_its_rows_fail
 /// makes no image in place of, any other shadow), and the surface's answer is those makings'
 /// ([`of_surface`]): planes of rows with no bytes between, with bytes between that end inside the
 /// device's lines and on them, at a pitch off 256 bytes (CoreAnimation's multiples of 64, which
-/// RADV lays no linear image's rows at), and of rows past the pages
+/// RADV lays no linear image's rows at), and of rows to the pages' last byte. No plane past the
+/// pages is asked: the device refuses an ask whose layout lies past its block's pages
+/// (reims-vgpu's `layout_planes`), and on a device that imports the pages as dma-bufs the answer
+/// refuses such a plane before the runtime's placement, for the bytes past the pages that no
+/// dma-buf holds.
 #[test]
 fn the_answer_over_the_pages_is_what_the_runtimes_making_does() {
     use crate::core::platform::HostRange;
@@ -516,7 +520,7 @@ fn the_answer_over_the_pages_is_what_the_runtimes_making_does() {
         plane(0, 4096, 4000, 8),
         plane(0, 4096, 4032, 8),
         plane(0, 4032, 4000, 8),
-        plane(0, 4096, 4096, 20),
+        plane(0, 4096, 4096, 16),
     ] {
         let mut by_making = Vec::new();
         for (width, pixel_format) in widths(p.row_bytes) {
