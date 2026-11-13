@@ -36,13 +36,13 @@ use crate::answer::{
     unrepresentable,
 };
 use crate::gpu;
-use crate::gpu::backing::{Backing, REPLACE};
+use crate::gpu::backing::Backing;
 use crate::gpu::desc::{Maker, VulkanTextureDescriptor, created_format_refused};
 use crate::gpu::device::VulkanDevice;
 use crate::gpu::metal_space::Hold;
 use crate::gpu::writes::{Reflected, Reflection};
 use crate::os::OsSurface;
-use crate::platform::{Obj, VulkanAddressRangeArray, VulkanPlatform};
+use crate::platform::{Obj, VulkanPlatform};
 
 /// A runtime buffer, with the device that made it and the IOSurface it retains.
 #[derive(Debug)]
@@ -54,10 +54,10 @@ pub struct BufferObject {
     /// The IOSurface whose memory it is (`newBufferWithIOSurface:`): one reference, which the
     /// runtime's deallocator of the buffer shares.
     pub surface: Option<Arc<OsSurface>>,
-    /// Whether it is detached, and the read-only bit it was made with ([`crate::gpu::backing`]).
-    pub backing: Backing,
-    /// The heap it is placed in, which its detach detaches, held while it lives
+    /// The guest's pages it is over, and the read-only bit it was made with
     /// ([`crate::gpu::backing`]).
+    pub backing: Backing,
+    /// The heap it is placed in, held while it lives.
     pub heap: Option<VulkanHeap>,
     /// Whether the GPU's writes to its bytes never reach their memory: it was made on a surface
     /// of [`crate::os::gpu_read_only`] (`newBufferWithIOSurface:`). Read once, as it is made, as
@@ -126,9 +126,7 @@ pub(crate) fn writes_never_reach(surface: Option<&OsSurface>, under: Option<&Und
 pub type VulkanTexture = Obj<TextureObject>;
 
 /// The buffer a texture is over, or the heap it is placed in, which the texture holds as
-/// Metal's does: a detached one is released with the last texture in it, so a command buffer
-/// that uses such a texture fails as Metal's does ([`crate::gpu::backing`]). Each holds the
-/// bytes of the buffer or heap the texture's texels may lie in, a first byte and an end, which
+/// Metal's does. Each holds the bytes of the buffer or heap the texture's texels may lie in, a first byte and an end, which
 /// a write of the texture may change ([`crate::gpu::writes::texture_memory`]).
 #[derive(Debug)]
 pub enum Under {
@@ -405,9 +403,10 @@ pub struct HeapObject {
     pub raw: rt::Heap,
     /// The device that made it.
     pub device: VulkanDevice,
-    /// Its descriptor's size, which a replace's ranges total.
+    /// Its descriptor's size.
     pub descriptor_size: u64,
-    /// Whether it is detached, and the read-only bit it was made with ([`crate::gpu::backing`]).
+    /// The guest's pages it is over, and the read-only bit it was made with
+    /// ([`crate::gpu::backing`]).
     pub backing: Backing,
     /// Its buffers and textures, while they live, for the ranges of its textures nothing may
     /// share ([`Placements::place`]).
@@ -442,7 +441,7 @@ pub struct HeapObject {
 /// ([`crate::answer::HEARD`]).
 ///
 /// Core makes a buffer over all of the bytes the heap's descriptor asked for with each heap, at
-/// its creation, before anything else is asked of it: a detached heap's cover buffer, which a
+/// its creation, before anything else is asked of it: a heap's cover buffer, which a
 /// command that lists the heap where a buffer is expected uses, and a legacy heap's private
 /// buffer, through which core pages the heap's bytes to and from the guest's pages. It is told
 /// by that alone: the first buffer or texture asked of the heap, made or not
@@ -721,12 +720,6 @@ impl HeapObject {
                  than Metal's, of",
             );
         }
-    }
-
-    /// `detachBacking`: detached from now on by the runtime, in no memory until a replace, for a
-    /// heap made over address ranges ([`Backing::detach`]).
-    pub(crate) fn detach(&self) {
-        self.backing.detach(|| self.raw.detach_backing());
     }
 }
 
@@ -1058,36 +1051,13 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
     /// NULL for a `Private` buffer, as Metal's, and for one made on a surface
     /// (`newBufferWithIOSurface:`), as Metal's on every surface, of `Shared` storage all the same
     /// (measured on the M3 Max: a surface of its own memory, and ones over the guest's pages
-    /// without `kIOSurfaceClientDirection` and with 2 and 3). A detached buffer, or one placed in
-    /// a detached heap, which lies in no memory, answers where it did before
-    /// ([`Backing::kept_contents`]).
+    /// without `kIOSurfaceClientDirection` and with 2 and 3).
     fn contents(&self) -> HostPtr {
         if self.surface.is_some() {
             return HostPtr::NULL;
         }
         let at = |p: NonNull<u8>| HostPtr::from_ptr(p.as_ptr());
-        plain(|| {
-            let kept = match &self.heap {
-                Some(heap) => heap
-                    .backing
-                    .kept_contents()
-                    .map(|first| at(first).wrapping_add(self.raw.heap_offset())),
-                None => self.backing.kept_contents().map(at),
-            };
-            kept.or_else(|| self.raw.contents().map(crate::os::shown_at).map(at))
-        })
-        .unwrap_or(HostPtr::NULL)
-    }
-
-    /// The buffer is detached from now on: its `contents` and GPU address stay, and the GPU
-    /// reads zeros where it reached the guest's pages, as the runtime's detach leaves it in no
-    /// memory. One placed in a heap detaches the heap instead ([`crate::gpu::backing`]).
-    fn detach_backing(&self) -> RaiseResult<()> {
-        plain(|| match &self.heap {
-            Some(heap) => heap.detach(),
-            None => self.backing.detach(|| self.raw.detach_backing()),
-        });
-        Ok(())
+        plain(|| self.raw.contents().map(crate::os::shown_at).map(at)).unwrap_or(HostPtr::NULL)
     }
 
     /// Nothing for a buffer that is not `Managed`, as Metal; for a `Managed` one, refused for a
@@ -1288,41 +1258,6 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
         }
         let under = Under::Buffer(self.clone_ref(), bytes);
         Ok(Some(self.device.texture_in(raw, under, usage)))
-    }
-
-    /// A detached no-copy buffer over an alias of the ranges, which total its length, from now
-    /// on; NO as Metal answers ([`crate::gpu::backing`]). The runtime's refusal dies: core
-    /// replaces only its own no-copy buffers, and no command buffer it has not committed holds
-    /// a use of one then.
-    fn replace_backing(
-        &self,
-        ranges: &VulkanAddressRangeArray,
-        read_only: bool,
-    ) -> RaiseResult<bool> {
-        let length = plain(|| self.raw.length());
-        self.backing.replace(
-            &ranges.ranges,
-            read_only,
-            length,
-            length,
-            |first, keep, made| {
-                send(REPLACE, Policy::Dies, || {
-                    // SAFETY: the alias is mapped and readable; a read-only one only the GPU
-                    // writes, whose writes this host's GPU drops (`backing`'s docs), and any
-                    // other is writable. It stays mapped, with the same pages, until its
-                    // keep-alive is dropped, as nothing else frees or remaps it.
-                    unsafe {
-                        (self.raw).rebind_bytes_no_copy(
-                            crate::os::host_memory(first),
-                            None,
-                            Some(keep),
-                        )
-                    }
-                })?;
-                made.made(&self.raw.device());
-                Ok(())
-            },
-        )
     }
 
     /// The runtime's export of the buffer's memory (`export_memory_fd`): a buffer the runtime
@@ -1939,13 +1874,6 @@ fn placed<T>(sel: &'static str, made: Result<T, rt::Error>) -> Result<T, rt::Err
 }
 
 impl Heap<VulkanPlatform> for VulkanHeap {
-    /// The heap is detached from now on: its buffers' `contents` and its GPU address stay, and
-    /// the GPU reads zeros where it reached the guest's pages ([`crate::gpu::backing`]).
-    fn detach_backing(&self) -> RaiseResult<()> {
-        plain(|| self.detach());
-        Ok(())
-    }
-
     fn gpu_address(&self) -> u64 {
         plain(|| self.raw.gpu_address()).0
     }
@@ -2061,7 +1989,7 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                 // Over the guest's pages alone: in a legacy heap, over the device's memory, what
                 // the runtime announces of the texture's layout there is relayed alone.
                 let lossless = heard.contains(&rt::Degradation::HeapTextureLosslessLayout)
-                    && self.backing.detaches();
+                    && self.backing.over_guest_pages();
                 if lossless && desc.sample_count > 1 {
                     crate::answer::inexact(sel, crate::answer::Inexact::HeapLayout, || {
                         format!(
@@ -2096,39 +2024,6 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                 texture
             })
         })
-    }
-
-    /// A detached heap over an alias of the ranges, which total its descriptor's size, from now
-    /// on; NO as Metal answers ([`crate::gpu::backing`]). Every buffer and texture in it stays,
-    /// at its offset. The runtime's refusal dies: core replaces only heaps it made over address
-    /// ranges, and no command buffer it has not committed holds a use of one then.
-    fn replace_backing(
-        &self,
-        ranges: &VulkanAddressRangeArray,
-        read_only: bool,
-    ) -> RaiseResult<bool> {
-        let size = plain(|| self.raw.size());
-        self.backing.replace(
-            &ranges.ranges,
-            read_only,
-            self.descriptor_size,
-            size,
-            |first, keep, made| {
-                send(REPLACE, Policy::Dies, || {
-                    // SAFETY: as a buffer's, for the heap's size; the alias starts on a page,
-                    // which is the runtime's import unit on this host.
-                    unsafe {
-                        (self.raw).rebind_bytes_no_copy(
-                            crate::os::host_memory(first),
-                            None,
-                            Some(keep),
-                        )
-                    }
-                })?;
-                made.made(&self.raw.device());
-                Ok(())
-            },
-        )
     }
 
     /// The heap's modes, an untracked mode where its descriptor named the default, as Metal's.
@@ -2557,7 +2452,7 @@ pub(crate) mod tests {
         (b, guest)
     }
 
-    /// `MTLResourceOptions` bit 24, which core sets on a read-only detached buffer or heap.
+    /// `MTLResourceOptions` bit 24, which makes a buffer or heap read-only.
     pub(crate) const BIT_24: u64 = 0x100_0000;
 
     /// A no-copy buffer a descriptor names over `pages` pages of zeros of the platform's own,
@@ -4753,11 +4648,11 @@ pub(crate) mod tests {
         assert!(heap.new_texture(&desc(166, 0x1), 0xc000).unwrap().is_some());
     }
 
-    /// A writable heap of 4 KiB over a page of the guest's, as core's detach heap makes one of
-    /// an x86_64 guest's pages, is made on every host. The runtime's heap covers 16 KiB
+    /// A writable heap of 4 KiB over a page of the guest's, as of an x86_64 guest's pages, is
+    /// made on every host. The runtime's heap covers 16 KiB
     /// ([`crate::gpu::backing::HEAP_GRANULE`]), so on a host of 4 KiB pages its alias has zeros
     /// past the page: on Linux a file of their own, which the runtime imports with the guest's
-    /// page as dma-bufs (`crate::gpu::backing::gather`); anonymous zeros beside them would import
+    /// page as dma-bufs (`crate::gpu::backing::gather_or_nil`); anonymous zeros beside them would import
     /// neither as host memory nor as a dma-buf
     #[test]
     fn a_heap_over_less_than_its_granule_is_made() {
@@ -4822,40 +4717,20 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    /// A `Shared` heap of [`over_pages`] bytes as core's detach heap is made: over pages of its
-    /// own (core's temporary allocation), detached at once. Core gives it the guest's pages at
-    /// its first prepare ([`replace_heap`]), and makes a cover buffer over all of it, which the
-    /// tests that need one make.
-    fn detached_heap<P: Platform>(p: &P, d: &P::Device) -> P::Heap {
-        let ranges = ranges_at(p, guest_pages());
-        let heap = d
-            .new_heap(&HeapDesc {
-                size: over_pages(),
-                heap_type: 1,
-                options: vec![OptionSet::StorageMode(0), OptionSet::HazardTrackingMode(0)],
-                address_ranges: Some(&ranges),
-                pinned_gpu_address: None,
-            })
-            .unwrap()
-            .heap
-            .unwrap();
-        heap.detach_backing().unwrap();
-        heap
-    }
-
-    /// `heap`'s backing replaced with the pages at `address`, as core's first prepare gives a
-    /// detached heap the guest's pages.
-    fn replace_heap<P: Platform>(p: &P, heap: &P::Heap, address: u64) {
-        let replaced = heap.replace_backing(&ranges_at(p, address), false);
-        assert!(replaced.unwrap(), "the heap's backing replaced");
-    }
-
-    /// A heap over the pages at `address`, made as core makes its detach heap: a
-    /// [`detached_heap`], given the pages by [`replace_heap`].
+    /// A `Shared` heap of [`over_pages`] bytes over the pages at `address`, made over their
+    /// address range.
     pub(crate) fn heap_at<P: Platform>(p: &P, d: &P::Device, address: u64) -> P::Heap {
-        let heap = detached_heap(p, d);
-        replace_heap(p, &heap, address);
-        heap
+        let ranges = ranges_at(p, address);
+        d.new_heap(&HeapDesc {
+            size: over_pages(),
+            heap_type: 1,
+            options: vec![OptionSet::StorageMode(0), OptionSet::HazardTrackingMode(0)],
+            address_ranges: Some(&ranges),
+            pinned_gpu_address: None,
+        })
+        .unwrap()
+        .heap
+        .unwrap()
     }
 
     /// A `Shared` heap of [`over_pages`] bytes over pages of its own, a `Depth32Float_Stencil8`

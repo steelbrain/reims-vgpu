@@ -425,10 +425,10 @@ through dma-bufs"). How the GPU then takes those pages depends on its driver:
     log, and its objects take the ways below.
   - Views are mapped from their files while they fit 8,192 mappings short of
     the budget (`budget.rs`, `HEADROOM`), and through dma-bufs past that. Any
-    other import of a view's pages (a no-copy buffer's, a heap's or a
-    rebind's) maps them from their files while they fit short of those 8,192
-    mappings too, as does the writable twin an import of read-only pages
-    needs. Past that line the library's import gate refuses the pages, and
+    other import of a view's pages (a no-copy buffer's or a heap's) maps
+    them from their files while they fit short of those 8,192 mappings too,
+    as does the writable twin an import of read-only pages needs. Past that
+    line the library's import gate refuses the pages, and
     the runtime makes the object over a copy of them, which takes no mapping
     (metal2vulkan's `HostMemory::with_import_gate`, announced
     `copied-host-pages`; with `REIMS_VGPU_STRICT=1` it ends the process),
@@ -494,7 +494,7 @@ What gets logged:
   within the headroom of the budget, with the `sysctl -w
   vm.max_map_count=...` value that covers them (2^23, 8,388,608, for a 16 GiB
   guest): past that, buffers and heaps not bound in a chunk are copied.
-- Each buffer, heap or rebind copied for want of mappings is counted with
+- Each buffer or heap copied for want of mappings is counted with
   its bytes, logged at the first and at each power of two (after the first
   at debug), and written to
   the trace (`nrcopy` for pages left in dma-bufs, `notwin` for read-only

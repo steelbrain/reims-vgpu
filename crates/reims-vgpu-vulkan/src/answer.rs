@@ -367,27 +367,12 @@ pub fn created_or_decided<T>(
 ///   encoding thread, inside its call, which dies at its selector, as `YCbCrFilterNotExact` is.
 ///   It dies on every device, a native one included: Apple's blend arithmetic for those forms is
 ///   not measured, and the exact form is a measured one or the blend in the function;
-/// - `EncodedUseRebound`: a command buffer's command named a buffer or heap over the guest's
-///   pages that was rebound (a replace, `crate::gpu::backing`) after the command was encoded and
-///   before the command buffer's first submission, in an encoder the rebind could not encode again
-///   (a compute encoder of the runtime's command predication that shares its unit, holds a loop
-///   or leaves work out, which no record of ours reaches, a render pass that executes an indirect
-///   command buffer, which the runtime records later, or whose end captured its draws' tile
-///   reach, a call that answers otherwise than at its encoding; every other compute, blit and
-///   render encoder, one with a pipeline still being made at the commit among them, it encodes
-///   again over the new pages, as Metal runs it, a call refused at its
-///   encoding refused again and the calls after it running, and a resource state encoder takes no
-///   pages), and neither the submission check nor the failure the command buffer was committed with
-///   (`commit_failed`) failed the submission holding it: the runtime runs nothing of that
-///   submission and fails the command buffer, where Metal runs the command over the pages the
-///   object lies in as it submits. A command buffer an earlier submission failed already (a use
-///   detached behind an event wait, Metal's code 8) keeps that code. A submission the check fails
-///   keeps that code and announces nothing. Announced once per device, whatever `announce_each`
-///   says, as the submission is made, on the thread that makes it: the runtime's scheduler thread,
-///   outside every call here, or a thread inside a later command buffer's `commit`, in which the
-///   runtime submits every batch ready then. It dies there and ends the process. The failure it
-///   leaves dies where it is first read too (`crate::gpu::command`), so a later one, which the
-///   device does not announce again, dies;
+/// - `EncodedUseRebound`: a command buffer's command named a buffer or heap the runtime rebound
+///   to new pages after the command was encoded, in an encoder it could not encode again, where
+///   Metal runs the command over the pages the object lies in as it submits. No call of this
+///   platform rebinds a buffer or heap, so the runtime announces it for none; it stays placed for
+///   the runtime's kind, and a failure it left would die where it is first read, unanswered
+///   (`crate::gpu::command`);
 /// - `ZeroLayerMapAfterRelease`: a draw in a pass over a rasterization rate map of no layers made
 ///   after the device released a map of layers, which writes nothing where Metal draws rows of
 ///   the pass. Announced at the draw, inside its call, which dies at its selector. No draw over a
@@ -576,7 +561,8 @@ pub fn created_or_decided<T>(
 ///     commit;
 ///   - `DetachedStorageKeepsWrites`: a storage texture over detached bytes a committed command
 ///     buffer's heap set reaches, whose unnamed storage reads read what an earlier such write
-///     left, where Metal drops those writes and reads zero. Announced at `commit`;
+///     left, where Metal drops those writes and reads zero. Announced at `commit`; no call of
+///     this platform detaches bytes, so the runtime announces it for none;
 /// - what a pass or a copy leaves in its texture otherwise than Metal, each announced inside the
 ///   call that encodes it, which dies at its selector:
 ///   - `MixedDepthStencilResolve`: a pass that stores and resolves one texture's depth beside
@@ -837,7 +823,8 @@ pub fn created_or_decided<T>(
 ///   it reads zeros, where Metal's reads the pages the guest gave back. Those pages hold what
 ///   they held until the guest writes them again, so Metal's answer is one value, and no fact of
 ///   the hardware forces the difference, so it dies on every device. Announced once per device,
-///   at the first such submission, inside its call, which dies at its selector;
+///   at the first such submission, inside its call, which dies at its selector; no call of this
+///   platform detaches bytes, so the runtime announces it for none;
 /// - `CrossClassTextureNeutral`: a draw or dispatch binding, at a texture slot declared of
 ///   another numeric class (`float` or `half`, `int`, `uint`) than its texture's format, one the
 ///   runtime has no exact answer for (a storage slot, a texture buffer, a multisampled, sparse,
@@ -912,8 +899,8 @@ pub fn created_or_decided<T>(
 ///   keep-alive: with one, it runs the deallocator at the release, as Metal's, and the import
 ///   keeps the keep-alive, which keeps the pages mapped, until it is freed, wherever they are held
 ///   (an image over them holding their import, a live buffers' table that lists them, MoltenVK's
-///   freed memory waiting for the batches in flight), and announces nothing. Every no-copy buffer,
-///   heap and rebind this platform makes gives one ([`crate::gpu::backing::keep_alive`]), so the
+///   freed memory waiting for the batches in flight), and announces nothing. Every no-copy buffer
+///   and heap this platform makes gives one ([`crate::gpu::backing::keep_alive`]), so the
 ///   runtime announces it for none of them. Announced once per device, on the thread that lets go
 ///   of the buffer, inside its release here or on one of the runtime's as a command buffer
 ///   completes, outside every call here: it dies where it is announced;
@@ -1287,12 +1274,12 @@ pub fn created_or_decided<T>(
 ///   them, and whose later levels lie apart from the heap's bytes, a 1D array's GPU reads reading
 ///   each texel, where Metal's paths address those texels at bytes that differ by path. Announced
 ///   inside the heap's creator of the texture, which dies at its selector;
-/// - `CopiedHostPages`: a no-copy buffer, heap or rebind made over a copy of the guest's pages in
+/// - `CopiedHostPages`: a no-copy buffer or heap made over a copy of the guest's pages in
 ///   memory of the device's own, as their import failed (out of memory, or a driver out of the
 ///   mappings the host's kernel allows), or the views' gate refused it on Linux, where mapping the
 ///   pages from their files would have run the views of memory within the headroom of their
-///   budget of kernel mappings, or the pages are a guest's read-only object's (a replace
-///   `readOnly:YES`, a heap or no-copy buffer made with `MTLResourceOptions` bit 24, pages mapped
+///   budget of kernel mappings, or the pages are a guest's read-only object's (a heap or no-copy
+///   buffer made with `MTLResourceOptions` bit 24, pages mapped
 ///   read-only), whose copy drops the GPU's writes, as Metal's GPU drops them (`crate::os`'s
 ///   import gate, `crate::gpu::writes`), which each commit fills from the pages and each
 ///   completion writes back: a CPU write the GPU reads mid-command-buffer, or a GPU write the CPU

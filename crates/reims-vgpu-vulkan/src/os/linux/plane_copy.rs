@@ -14,8 +14,7 @@
 //!   family (`VK_QUEUE_FAMILY_FOREIGN_EXT`, in `GENERAL`) for the copy and handed back after it.
 //! - **The destination** is a runtime buffer whose bytes are its memory: one in the device's own
 //!   memory, or over host pages the device imported in place. A buffer whose pages are a copy the
-//!   runtime keeps (`copied-host-pages`), or that is detached, or whose GPU writes never reach its
-//!   memory, is refused: a write into its `VkBuffer` would never reach the pages.
+//!   runtime keeps (`copied-host-pages`), or whose GPU writes never reach its memory, is refused: a write into its `VkBuffer` would never reach the pages.
 //! - **The copy** is one command buffer of the copier's own on a runtime queue of its own, whose
 //!   `VkQueue` it borrows for the submission, as `crate::awake` does: `vkCmdCopyImageToBuffer` of
 //!   each plane's texels into the buffer at the plane's first byte, its rows `bytes_per_row` apart,
@@ -840,9 +839,6 @@ fn destination(
     if copy.to.gpu_read_only {
         return Err(refused("the buffer drops the GPU's writes".to_owned()));
     }
-    if copy.to.backing.is_detached() {
-        return Err(refused("the buffer is detached from its memory".to_owned()));
-    }
     match buffer.host_backing() {
         Some(rt::HostBacking::Copied) => {
             return Err(refused(
@@ -850,9 +846,6 @@ fn destination(
                  would not reach"
                     .to_owned(),
             ));
-        }
-        Some(rt::HostBacking::Detached) => {
-            return Err(refused("the buffer is detached from its pages".to_owned()));
         }
         _ => {}
     }

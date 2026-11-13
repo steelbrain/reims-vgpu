@@ -76,9 +76,10 @@
 //! - buffers and heaps over address ranges and detach backing (key 33's 0x8 and 0x10, and key 42,
 //!   which core sets from detach backing, not from the argument buffer tier) are yes where the
 //!   runtime imports host memory (`VK_EXT_external_memory_host`), which every heap over address
-//!   ranges and every replace of a detached backing is made over ([`crate::gpu::backing`]), as
-//!   on MoltenVK, where they are Metal's answers. A submission that uses a detached buffer or
-//!   heap fails as Metal's does; [`crate::gpu::command`]'s docs list where it differs;
+//!   ranges is made over ([`crate::gpu::backing`]), as on MoltenVK, where they are Metal's
+//!   answers. Nothing detaches or replaces a backing: the guest's heaps answer neither (the Metal
+//!   bundle's `RgfxHeap` raises an unrecognized selector, as Metal's base heap), and this
+//!   platform makes neither;
 //! - `heapTextureSizeAndAlignWithDescriptor:` of a depth or stencil texture with
 //!   `allowGPUOptimizedContents` off answers Metal's size, the runtime's model of Metal's answer,
 //!   which answers an X32_Stencil8 texture as a Stencil8 one of its shape, as the runtime's own
@@ -155,8 +156,7 @@
 //! import dies where it is encoded (`crate::gpu::writes::kept_write`; `encode_compute`'s
 //! `a_dispatch_through_a_read_only_surface_dies_on_linux`), but a function's write through an
 //! address it loads into one not made resident for writing, which names nothing. Other read-only
-//! memory (the guest's read-only objects, a read-only replace or a heap or no-copy buffer made
-//! with bit 24, and a no-copy buffer or heap over pages mapped read-only) the runtime makes over
+//! memory (the guest's read-only objects, a heap or no-copy buffer made with bit 24, and a no-copy buffer or heap over pages mapped read-only) the runtime makes over
 //! a copy whose GPU writes it drops, announced (`copied-host-pages`), and what Metal answers
 //! otherwise there is `crate::gpu::writes`'s.
 

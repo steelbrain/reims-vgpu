@@ -22,7 +22,7 @@
 //! [`HEADROOM`] below it ([`claim`], [`Reach::ShortOfHeadroom`]): a view a device would need from
 //! its files goes through dma-bufs instead, and a no-copy buffer's or heap's import of such a
 //! view's pages, or of read-only pages with no twin, is refused at the runtime's gate, the buffer
-//! or heap made over a copy (`super::vm`'s module docs, "Imports of views"), as a rebind's is.
+//! or heap made over a copy (`super::vm`'s module docs, "Imports of views").
 //! What has no other way has the headroom to itself: a view through dma-bufs, a range, a
 //! stand-in, and a twin where no device needs imported pages mapped from their files
 //! ([`Reach::Whole`]).

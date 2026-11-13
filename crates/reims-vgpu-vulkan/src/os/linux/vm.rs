@@ -14,7 +14,7 @@
 //!   from [`allocate_aliasable`], a shared mapping of a file of its own: the detach heap's
 //!   temporary, which Metal's heap is made over, is one (core's `HostVm::allocate_aliasable`),
 //!   and so is an alias whose zeros past the guest's pages the runtime imports with them
-//!   (`crate::gpu::backing::gather`), as a dma-buf takes file pages alone.
+//!   (`crate::gpu::backing::gather_or_nil`), as a dma-buf takes file pages alone.
 //! - **`remap_shared_overwrite`** fails with `KERN_INVALID_ADDRESS` where a byte of the source
 //!   has no file behind it, as Mach fails for an unmapped source, before it maps anything. A
 //!   piece the kernel refuses fails the call with nothing changed, as Mach's remap is all or
@@ -542,8 +542,7 @@ pub(super) fn file(
 
 /// A fresh range of `len` bytes, rounded up to whole pages, of zeros, that a view can be made of:
 /// a shared mapping of a file of its own, recorded in the backing table. Freed by `deallocate`,
-/// as any other range. The block of zeros a detached object reads, and the tests' stand-in for
-/// guest memory, are such ranges.
+/// as any other range. The tests' stand-in for guest memory is such a range.
 pub(crate) fn allocate_aliasable(len: u64) -> Result<HostAddr, KernReturn> {
     let Some((_, length)) = pages(HostAddr::NULL, len) else {
         return Err(NO_SPACE);
@@ -1996,11 +1995,11 @@ pub(crate) mod tests {
     /// An alias of a guest page with zeros past it, as a heap of less than the runtime's 16 KiB
     /// is made over, has a file behind every byte, writable or read-only, so a dma-buf can be
     /// made of all of it, as the runtime asks where the device refuses file pages as host memory
-    /// (`crate::gpu::backing::gather`, `super::dma_buf`)
+    /// (`crate::gpu::backing::gather_or_nil`, `super::dma_buf`)
     #[test]
     fn an_alias_with_zeros_past_its_pages_has_a_file_behind_every_byte() {
         use crate::core::platform::types::ResourceAddressRange;
-        use crate::gpu::backing::{REPLACE, gather};
+        use crate::gpu::backing::gather_or_nil;
         let p = page();
         for read_only in [false, true] {
             let guest = allocate_aliasable(p).unwrap();
@@ -2009,7 +2008,7 @@ pub(crate) mod tests {
                 address: guest.addr().to_u64(),
                 length: p,
             }];
-            let alias = gather(REPLACE, &ranges, 4 * p, read_only).unwrap();
+            let alias = gather_or_nil("test", &ranges, 4 * p, read_only).unwrap();
             let first = alias.first().as_ptr().addr().to_u64();
             assert!(
                 files::pieces(first, 4 * p).is_some(),

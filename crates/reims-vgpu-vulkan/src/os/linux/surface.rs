@@ -449,7 +449,7 @@ fn checked_ranges(ranges: &[PhysicalMemoryRange], alloc_size: u64) -> Option<()>
 ///
 /// The zeros are the tail the buffers over the surface at an offset read past its allocation,
 /// which lie over the view ([`own_alias`]), as an alias of the allocation would give them
-/// (`crate::gpu::backing::gather`): a writable view's are a file of its own, which the runtime
+/// (`crate::gpu::backing::gather_or_nil`): a writable view's are a file of its own, which the runtime
 /// imports with the guest's pages, as host memory or as dma-bufs (`super::dma_buf`), which
 /// udmabuf makes of files alone; a read-only view's map the block of zeros, whose twin, which the
 /// runtime imports, is zeros of its own (`super::import`).
@@ -507,7 +507,7 @@ fn view(runs: &[std::ops::Range<u64>], length: u64, zeros: u64, read_only: bool)
 /// of the guest's pages (`crate::os::surface_alias`), borrowed: the view holds the allocation's
 /// pages and the zeros a buffer at the surface's offset reads past them ([`view`]), read-only
 /// where the surface is read-only for the GPU, as an alias of the allocation would be
-/// (`crate::gpu::backing::gather`), and stays mapped while the alias holds the surface's memory
+/// (`crate::gpu::backing::gather_or_nil`), and stays mapped while the alias holds the surface's memory
 /// ([`surface_memory_hold`]). `None` for a surface with no view: its own memory, one range of the
 /// guest's pages, or none.
 pub(crate) fn own_alias(surface: &LinuxSurface) -> Option<Alias> {
@@ -1078,7 +1078,7 @@ mod tests {
     /// buffers lie over ([`own_alias`]): the allocation's whole pages, then zeros as far as a
     /// buffer at its offset reads, writable or read-only as the surface is for the GPU, the
     /// zeros of a writable one a file of their own and of a read-only one the block of zeros, as
-    /// an alias of the allocation's would be (`crate::gpu::backing::gather`). The alias keeps the
+    /// an alias of the allocation's would be (`crate::gpu::backing::gather_or_nil`). The alias keeps the
     /// view mapped past the surface's last reference, and frees nothing of its own. A surface of
     /// one range, or of its own memory, has no view to lend
     #[test]

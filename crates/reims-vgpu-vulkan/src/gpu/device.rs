@@ -640,8 +640,8 @@ const BUFFER_DESCRIPTOR_OPTIONS: u64 = 0;
 /// A heap descriptor's `resourceOptions` before any setter: `Private` (measured).
 const HEAP_DESCRIPTOR_OPTIONS: u64 = 0x20;
 
-/// `MTLResourceOptions` bit 24, which core sets on a read-only detached buffer or heap, and which
-/// the runtime takes and drops ([`crate::gpu::backing`] keeps it).
+/// `MTLResourceOptions` bit 24, which makes a buffer or heap read-only, and which the runtime
+/// takes and drops ([`crate::gpu::backing`] keeps it).
 const READ_ONLY_OPTION: u64 = 0x100_0000;
 
 /// The resource options a descriptor holds after core's storage properties, in order, from
@@ -810,26 +810,24 @@ impl VulkanDevice {
 
     /// The handle of a buffer this device made, over `surface` when it was made on one.
     pub(crate) fn buffer(&self, raw: rt::Buffer, surface: Option<Arc<OsSurface>>) -> VulkanBuffer {
-        let id = raw.object_id();
         let gpu_read_only = surface.as_deref().is_some_and(crate::os::gpu_read_only);
         Obj::new(BufferObject {
             raw,
             device: self.clone_ref(),
             surface,
-            backing: Backing::new(false, id),
+            backing: Backing::new(false),
             heap: None,
             gpu_read_only,
         })
     }
 
-    /// The handle of a buffer placed in `heap`, whose detach detaches the heap and whose replace
-    /// answers NO ([`crate::gpu::backing`]).
+    /// The handle of a buffer placed in `heap`.
     pub(crate) fn placed_buffer(&self, raw: rt::Buffer, heap: &VulkanHeap) -> VulkanBuffer {
         Obj::new(BufferObject {
             raw,
             device: self.clone_ref(),
             surface: None,
-            backing: Backing::fixed(),
+            backing: Backing::new(false),
             heap: Some(heap.clone_ref()),
             gpu_read_only: false,
         })
@@ -850,7 +848,7 @@ impl VulkanDevice {
     /// (`newBufferWithIOSurface:`) answers the allocation size too, its first byte the surface's at
     /// the base address, and reads 0 past the allocation's end (measured on the M3 Max at 0x40,
     /// 0x1000 and 0x4000, by a kernel's copy). So the buffer is over an alias of the allocation's
-    /// pages followed by zero-filled pages of the platform's own ([`backing::gather`]), from the
+    /// pages followed by zero-filled pages of the platform's own ([`backing::gather_or_nil`]), from the
     /// offset into it, where the pages past the allocation would be other memory or none; what a
     /// write past the allocation's end does on Metal is not measured, and here it reaches those
     /// pages alone. On Linux a surface over several ranges of the guest's pages lends its own
@@ -1922,8 +1920,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// with `no_copy`, the contents themselves with the deallocator, at the pinned address when
     /// there is one. Nil as `newBufferWithLength:options:` is, for a pinned address the space
     /// cannot honour, and for no-copy contents of length 0, whose deallocator never runs, as
-    /// Metal answers (measured: NULL contents of length 0, as core's detached buffer of length 0
-    /// is). What the runtime's descriptor has no form for (no-copy without contents, a
+    /// Metal answers (measured: NULL contents of length 0). What the runtime's descriptor has no form for (no-copy without contents, a
     /// deallocator of a buffer that is not no-copy, copied contents of another length) dies.
     fn new_buffer(&self, desc: BufferDesc<'_>) -> RaiseResult<Option<VulkanBuffer>> {
         let sel = "newBufferWithDescriptor:";
@@ -1944,9 +1941,6 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         };
         let (placement, mut placing) =
             metal_space::placing(desc.length, bytes, desc.pinned_gpu_address);
-        // A no-copy buffer's memory, whose deallocator's run a detach may hold
-        // ([`backing::Held`]).
-        let mut own = None;
         // Whether a no-copy buffer's pages are mapped read-only.
         let mut read_only = false;
         // The word that a no-copy buffer's import was made ([`crate::os::ImportMade`]).
@@ -1964,15 +1958,11 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                 let start = pointer(sel, bytes.ptr());
                 // The bytes, and what keeps them mapped until the runtime freed its import; the
                 // deallocator is given the bytes' own address, at Metal's moment.
-                let held = Arc::new(backing::Held::default());
                 let run = slot.as_ref().map(|slot| {
-                    let held = Arc::clone(&held);
                     runtime_deallocator(slot, move |d: BufferDeallocator, p, len| {
-                        let at = p.as_ptr().addr();
-                        held.run(Box::new(move || d(HostPtr::from_addr(at), len)));
+                        d(HostPtr::from_addr(p.as_ptr().addr()), len);
                     })
                 });
-                own = Some(backing::Own::new(start, held));
                 let NoCopyImport {
                     at: imported,
                     run,
@@ -2018,10 +2008,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         }
         made.map(|b| {
             b.map(|raw| {
-                let backing = Backing::new(held & READ_ONLY_OPTION != 0, raw.object_id());
-                if let Some(own) = own {
-                    backing.made_over_own(own);
-                }
+                let backing = Backing::new(held & READ_ONLY_OPTION != 0);
                 backing.imported(read_only);
                 Obj::new(BufferObject {
                     raw,
@@ -2108,8 +2095,6 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             })) => metal_aborts(sel, &format!("a heap of resource options {held:#x}")),
             made => made,
         };
-        // The alias a heap over address ranges is made over.
-        let mut made_over = None;
         let heap = match desc.address_ranges {
             None => create(sel, Policy::Dies, nil, || {
                 storage(match token {
@@ -2119,7 +2104,8 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             })?,
             Some(_) if desc.size == 0 => None,
             Some(ranges) => {
-                made_over = desc
+                // The alias the heap is made over, which the runtime's import keeps.
+                let made_over = desc
                     .size
                     .checked_next_multiple_of(HEAP_GRANULE)
                     .and_then(|size| backing::gather_or_nil(sel, &ranges.ranges, size, read_only))
@@ -2133,8 +2119,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                         let heap = create(sel, Policy::Dies, nil, || {
                             // SAFETY: the alias covers the heap's size, the descriptor's rounded up
                             // to the runtime's granule, and starts on a page, the runtime's import
-                            // unit on this host. It is as a replace's alias is otherwise
-                            // (`VulkanBuffer::replace_backing`).
+                            // unit on this host.
                             storage(unsafe {
                                 match token {
                                     Some(token) => {
@@ -2165,14 +2150,14 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         };
         Ok(HeapMade {
             heap: heap.map(|raw| {
-                // Only a heap over address ranges detaches ([`crate::gpu::backing`]).
+                // A heap over address ranges keeps their pages ([`crate::gpu::backing`]).
                 let backing = match &desc.address_ranges {
                     Some(ranges) => {
-                        let backing = Backing::heap(read_only, raw.object_id());
-                        backing.made_over(&ranges.ranges, made_over);
+                        let backing = Backing::new(read_only);
+                        backing.made_over(&ranges.ranges);
                         backing
                     }
-                    None => Backing::fixed(),
+                    None => Backing::new(false),
                 };
                 Obj::new(HeapObject {
                     raw,
@@ -2190,7 +2175,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// A heap whose memory is `bytes`, imported in place as a no-copy buffer's is
     /// ([`no_copy_release`]), at the address Metal's space gives it or the value's pin: its
     /// resources lie in `bytes` from their offsets, so the guest's writes there and the GPU's are
-    /// each other's, and it never detaches ([`Backing::fixed`]). Nil for a size of 0, for bytes
+    /// each other's. Nil for a size of 0, for bytes
     /// short of the size rounded up to the runtime's granule, and as [`Self::new_heap`] answers
     /// for its address; storage other than `Shared` dies, as there. A type the runtime lacks
     /// dies at `setType:`.
@@ -2267,7 +2252,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         }
         Ok(HeapMade {
             heap: heap.map(|raw| {
-                let backing = Backing::fixed();
+                let backing = Backing::new(false);
                 backing.imported(read_only || bit_24);
                 Obj::new(HeapObject {
                     raw,

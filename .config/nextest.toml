@@ -13,8 +13,8 @@
 # they test, with `--run-ignored only`. Each fault is a GPU recovery (84 GPU events in its
 # 1.8 s, measured on the M3 Max, macOS 27.0.1), and every command buffer of another process in
 # flight then fails as its victim ("Discarded (victim of GPU error/recovery)"): the YCbCr
-# sweeps, the extended-range blends (Metal's side then reads zeros), the in-flight detaches, the
-# textures made while a kernel runs.
+# sweeps, the extended-range blends (Metal's side then reads zeros), the textures made while a
+# kernel runs.
 [[profile.default.overrides]]
 platform = 'cfg(target_os = "macos")'
 filter = 'binary_id(reims-vgpu-vulkan::client_direction) & test(=metal_drops_small_blits_into_the_texture)'

@@ -3,8 +3,8 @@
 //!
 //! Linux drivers pin imported pages for writing, so the runtime imports no read-only memory
 //! (typed, `HostMemory`), where Metal reads it: the guest's ranges core maps read-only, aliases
-//! of a read-only replace or heap, and surfaces the GPU only reads. For aliases of a read-only
-//! replace or heap, and a no-copy buffer or heap over pages mapped read-only, the runtime is
+//! of a read-only heap, and surfaces the GPU only reads. For aliases of a read-only heap, and a
+//! no-copy buffer or heap over pages mapped read-only, the runtime is
 //! given the pages themselves: the views' gate refuses them ([`import_gate`]), and the runtime
 //! makes the buffer or heap over a copy of them whose GPU writes it drops, as Metal's GPU drops
 //! them (its `copied-host-pages`, a kind of `crate::answer::DIES`), so the GPU reads what Metal's
@@ -25,8 +25,7 @@
 //! The block of zeros a read-only alias maps past its ranges' pages is a file of zeros all such
 //! aliases share ([`allocate_zeros`]). Its twin is private memory of zeros instead, so the GPU's
 //! writes there stay in that twin and never reach the block, though they are kept for the
-//! alias's life, where Metal drops them, which the same deaths stop. A detached object lies in
-//! no memory (the runtime's detach, `crate::gpu::backing`), so nothing of it is imported.
+//! alias's life, where Metal drops them, which the same deaths stop.
 //!
 //! A buffer made over a twin answers the address it was made over as its contents
 //! ([`shown_at`]): the runtime's contents are the twin's. The twin goes once the runtime frees the
@@ -377,9 +376,9 @@ static COPIED: Refused = Refused::new("nrcopy");
 /// budget ([`twin`]), which the gate refuses, so the runtime copies them.
 static TWINLESS: Refused = Refused::new("notwin");
 
-/// The views' gate over the runtime's import of a no-copy buffer's or heap's pages, or a buffer's
-/// new pages, by their pointer (`rt::HostMemory::with_import_gate`), which every [`host_memory`]
-/// carries, asked on the thread that makes the buffer, heap or rebind, with no lock of the
+/// The views' gate over the runtime's import of a no-copy buffer's or heap's pages, by their
+/// pointer (`rt::HostMemory::with_import_gate`), which every [`host_memory`] carries, asked on
+/// the thread that makes the buffer or heap, with no lock of the
 /// runtime's held, after [`import_view`] made what it imports. It refuses read-only pages, which
 /// reach it where no twin was asked for them (all but a surface's read-only alias), or none was
 /// made short of the headroom of the views' budget ([`twin`], counted there), so the runtime
@@ -1204,8 +1203,8 @@ impl SendPtr {
 /// page (module docs). Where a device needs imported pages mapped from their files, what of the
 /// bytes lies in views through dma-bufs is mapped from them, and a twin made, short of the
 /// headroom of the views' budget, past which the gate refuses the pages and the runtime copies
-/// them ([`import_gate`]): the runtime asks the gate about every import, a no-copy buffer's,
-/// heap's or rebind's. Where none does, a twin may take the whole budget.
+/// them ([`import_gate`]): the runtime asks the gate about every import, a no-copy buffer's or
+/// heap's. Where none does, a twin may take the whole budget.
 pub(crate) fn import_view(at: NonNull<u8>, length: u64, twin: bool) -> ImportView {
     let mut plain = ImportView {
         at,
@@ -1600,7 +1599,7 @@ mod tests {
         assert!(vm.deallocate(at, PAGE).is_success());
     }
 
-    /// A read-only alias of guest pages shorter than its size, a heap's or a replace's, is
+    /// A read-only alias of guest pages shorter than its size, a heap's, is
     /// imported through a writable twin: the pages' bytes, then zeros of the twin's own past
     /// them, as its zeros map the block of zeros
     #[test]
@@ -1615,7 +1614,7 @@ mod tests {
             address: first,
             length: PAGE,
         }];
-        let alias = crate::gpu::backing::gather("test", &ranges, 3 * PAGE, true).unwrap();
+        let alias = crate::gpu::backing::gather_or_nil("test", &ranges, 3 * PAGE, true).unwrap();
         let at = alias.first();
         let view = import_view(at, 3 * PAGE, true);
         let twin = addr(view.at());
@@ -1633,9 +1632,9 @@ mod tests {
         assert!(vm.deallocate(guest, PAGE).is_success());
     }
 
-    /// Readable pages with no file behind them, which no view is made of, end the process at the
-    /// call that gathers them into an alias, where Metal takes them; a call whose refusal is nil
-    /// answers nil there by default, counted, as when memory runs out, and dies in strict mode
+    /// Readable pages with no file behind them, which no view is made of, are the host's refusal
+    /// of an alias of them, where Metal takes them: the call that gathers them, whose refusal is
+    /// nil, answers nil by default, counted, as when memory runs out, and dies in strict mode
     #[test]
     fn a_gather_of_pages_without_a_file_is_the_hosts_refusal() {
         use crate::core::platform::types::ResourceAddressRange;
@@ -1648,9 +1647,6 @@ mod tests {
             address: at.addr().to_u64(),
             length: PAGE,
         }];
-        let gathered = || crate::gpu::backing::gather("test", &ranges, PAGE, false).is_some();
-        let site = catch_death(gathered).unwrap_err();
-        assert_eq!((site.kind, site.file), (DeathKind::Abort, "test"));
         let or_nil = || crate::gpu::backing::gather_or_nil("test", &ranges, PAGE, false).is_some();
         let site = catch_death(or_nil).unwrap_err();
         assert_eq!((site.kind, site.file), (DeathKind::Abort, "test"), "strict");
@@ -1673,8 +1669,8 @@ mod tests {
 
     /// Where a device of the process needs imported pages mapped from their files, a view that
     /// from its files would come within the headroom of the views' budget is mapped through a
-    /// dma-buf, though the budget has room for it. An import of it (a buffer's, a heap's or a
-    /// rebind's) leaves it so, and the gate refuses its pages, counted with their bytes, in strict
+    /// dma-buf, though the budget has room for it. An import of it (a buffer's or a heap's)
+    /// leaves it so, and the gate refuses its pages, counted with their bytes, in strict
     /// mode too, as the runtime copies them; with room short of the headroom, an import maps the
     /// pages from their files, which the gate lets through. Where udmabuf does not open, the view
     /// is mapped from its files, and ends the process past the budget. The flag is the process's,

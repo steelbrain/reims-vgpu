@@ -307,7 +307,7 @@ thread_local! {
 }
 
 /// Runs `call` with every import [`host_memory`] makes on this thread refused at a gate of its
-/// own, so the runtime makes each buffer, heap or rebind over a copy of the pages, as Linux's
+/// own, so the runtime makes each buffer or heap over a copy of the pages, as Linux's
 /// views' gate has it past the headroom of their budget (`os/linux/import.rs`): the copies'
 /// coherence, on a host whose imports never fail.
 #[cfg(test)]

@@ -1112,7 +1112,7 @@ fn stores_out(store: rt::StoreAction) -> bool {
 }
 
 /// Whether `texture`, an attachment's, lies in read-only memory the runtime copies, dropping the
-/// GPU's writes: read-only and not a surface's twin ([`crate::gpu::writes::Kept::Until`]).
+/// GPU's writes: read-only and not a surface's twin ([`crate::gpu::writes::Kept::Copied`]).
 fn over_read_only_copy(texture: &Source) -> bool {
     texture.writes_kept() && !texture.twinned()
 }

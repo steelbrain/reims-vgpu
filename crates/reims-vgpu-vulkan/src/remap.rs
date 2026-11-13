@@ -24,16 +24,15 @@
 //!   bytes changes none. `protect_max` changes no pages.
 //!
 //! The platform's own Mach VM calls in [`crate::gpu::backing`] report nothing: an alias's
-//! mapping (`gather`), the block of zeros, and an alias's release; nor do those of Linux's
+//! mapping (`gather_or_nil`), the block of zeros, and an alias's release; nor do those of Linux's
 //! surface stand-in (`os::linux::surface`), whose view of the guest's pages is the alias of a
 //! surface over several ranges of them. Each range is a fresh one of the platform's own, which
-//! backs a heap, a rebind, or the no-copy buffers over a surface at an offset into its allocation
-//! or whose GPU writes never reach its memory (`buffer_over_surface_at` in
-//! [`crate::gpu::device`]). The runtime lets no buffer lie in the import of a heap's bytes or of
-//! the memory a rebound buffer takes, and a surface's alias is released by the keep-alive of the
-//! last buffer over it, which the runtime drops after it freed that buffer's import, or, where it
-//! is the surface's view, by the surface's last release where that comes later, so no buffer made
-//! later at the address could lie in one.
+//! backs a heap, or the no-copy buffers over a surface at an offset into its allocation or whose
+//! GPU writes never reach its memory (`buffer_over_surface_at` in [`crate::gpu::device`]). The
+//! runtime lets no buffer lie in the import of a heap's bytes, and a surface's alias is released
+//! by the keep-alive of the last buffer over it, which the runtime drops after it freed that
+//! buffer's import, or, where it is the surface's view, by the surface's last release where that
+//! comes later, so no buffer made later at the address could lie in one.
 //!
 //! **Not reported**: the pages of the host's own RAM a memory map names, which core reads at the
 //! host's addresses with no mapping of its own. The host changes those without the library: no call
@@ -43,8 +42,8 @@
 //! a mapping of its own there, measured), at no offset into its allocation and with GPU writes that
 //! reach its memory (the others lie over an alias): one made after the host replaced the pages lies
 //! in a live one's import, over the old pages, and what Metal's texture on such a surface reads
-//! then is not measured. Detached buffers and heaps lie in aliases of their own, fresh at each
-//! attach ([`crate::gpu::backing`]), never there.
+//! then is not measured. Heaps over address ranges lie in aliases of their own
+//! ([`crate::gpu::backing`]), never there.
 //!
 //! **Unmaps an import waits for** ([`UnmapHold`]). The runtime runs a no-copy buffer's
 //! deallocator, given with a keep-alive, as the buffer is released, Metal's moment, and then

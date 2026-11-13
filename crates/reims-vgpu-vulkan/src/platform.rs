@@ -783,7 +783,7 @@ impl Platform for VulkanPlatform {
 }
 
 /// The private `MTLResourceAddressRangeArray *`: the ranges, as the array copies them, which a
-/// heap is made over and a detached buffer or heap is replaced by ([`crate::gpu::backing`]).
+/// heap is made over ([`crate::gpu::backing`]).
 #[derive(Debug)]
 pub struct AddressRanges {
     /// The ranges, in order.

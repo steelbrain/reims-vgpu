@@ -42,9 +42,6 @@ pub trait Buffer<P: Platform>: GpuResource<P> {
     /// sel: contents
     /// The buffer's CPU address; core reads and writes through it (never NULL-checked).
     fn contents(&self) -> HostPtr;
-    /// sel: detachBacking SPI
-    /// The runtime returns `BOOL` (`B16@0:8`); core never reads it.
-    fn detach_backing(&self) -> RaiseResult<()>;
     /// sel: didModifyRange:
     /// Reached both under a handler and with none: `on` says which this call is.
     fn did_modify_range(&self, on: OnFault, range: NsRange) -> RaiseResult<()>;
@@ -97,9 +94,6 @@ pub trait Buffer<P: Platform>: GpuResource<P> {
         descriptor: &P::TextureDescriptor,
         plane: SurfacePlane,
     ) -> RaiseResult<Option<P::Texture>>;
-    /// sel: replaceBackingWithRanges:readOnly: SPI
-    /// `false` makes core throw "Failed to replace buffer backing".
-    fn replace_backing(&self, ranges: &P::AddressRangeArray, read_only: bool) -> RaiseResult<bool>;
     /// No Metal counterpart: the buffer's memory as a new file descriptor another API imports,
     /// with what the import names ([`ExportedMemory`]), where the buffer was made exportable
     /// ([`GpuDevice::new_exportable_buffer_of_length`](super::device::GpuDevice::new_exportable_buffer_of_length)).
@@ -258,9 +252,6 @@ pub trait Texture<P: Platform>: GpuResource<P> {
 /// `MTLHeap` (with `MTLHeapSPI`). Not an `MTLResource`: its purgeable state, storage mode and
 /// options are its own selectors.
 pub trait Heap<P: Platform>: Handle {
-    /// sel: detachBacking SPI
-    /// The runtime returns `BOOL` (`B16@0:8`); core never reads it.
-    fn detach_backing(&self) -> RaiseResult<()>;
     /// sel: gpuAddress SPI
     fn gpu_address(&self) -> u64;
     /// sel: newBufferWithLength:options:offset:
@@ -276,9 +267,6 @@ pub trait Heap<P: Platform>: Handle {
         descriptor: &P::TextureDescriptor,
         offset: u64,
     ) -> RaiseResult<Option<P::Texture>>;
-    /// sel: replaceBackingWithRanges:readOnly: SPI
-    /// `false` makes core throw "Failed to replace heap backing".
-    fn replace_backing(&self, ranges: &P::AddressRangeArray, read_only: bool) -> RaiseResult<bool>;
     /// sel: resourceOptions
     fn resource_options(&self) -> u64;
     /// sel: setPurgeableState:

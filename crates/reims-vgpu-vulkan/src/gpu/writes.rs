@@ -27,9 +27,9 @@
 //!   unmeasured for, which refuses the whole state's reflection, leaves every other slot answered.
 //!   A function's write through an address it loads (an argument buffer's, a pointer's) into such
 //!   an object not made resident for writing names nothing and is not seen: it reaches the pages.
-//! - **The guest's read-only objects** (a read-only replace, a heap made with `MTLResourceOptions`
-//!   bit 24 over address ranges, a no-copy buffer or heap made with it or over pages mapped
-//!   read-only; [`Kept::Until`]; [`crate::os::COPIES_READ_ONLY`]), which the runtime makes
+//! - **The guest's read-only objects** (a heap made with `MTLResourceOptions` bit 24 over address
+//!   ranges, a no-copy buffer or heap made with it or over pages mapped
+//!   read-only; [`Kept::Copied`]; [`crate::os::COPIES_READ_ONLY`]), which the runtime makes
 //!   over a copy of the pages whose GPU writes it drops, as Metal's GPU drops them: a write through
 //!   a buffer over it is sent (a shader's store through a slot or a loaded address, a blit's fill
 //!   or copy into the buffer, a pass's visibility results), and so is a pass whose attachment lies
@@ -101,14 +101,13 @@ pub enum Kept {
     /// writable twin of its pages, so the GPU's writes through the object reach them
     /// ([`surface_kept`]).
     Always,
-    /// Until a detach leaves the buffer or heap in no memory: for a texture over a buffer or
-    /// heap, read-only memory the runtime makes the buffer or heap over a copy of, dropping the
-    /// GPU's writes, where what Metal does with a texture's writes is unmeasured
-    /// ([`crate::gpu::backing::Backing::read_only_now`]); no replace gives it other memory while
-    /// work encoded holds it, as the runtime refuses the replace (`crate::gpu::backing`). A
-    /// buffer's own memory the runtime copies is never `Until`: the runtime drops its writes, as
-    /// Metal's GPU does.
-    Until(Arc<Pages>),
+    /// For the object's life: for a texture over a buffer or heap, read-only memory the runtime
+    /// makes the buffer or heap over a copy of, dropping the GPU's writes, where what Metal does
+    /// with a texture's writes is unmeasured ([`crate::gpu::backing::Backing::read_only_now`]),
+    /// with the buffer's or heap's pages, which tell one object's from another's. A buffer's own
+    /// memory the runtime copies is never `Copied`: the runtime drops its writes, as Metal's GPU
+    /// does.
+    Copied(Arc<Pages>),
 }
 
 impl Kept {
@@ -121,8 +120,7 @@ impl Kept {
     pub fn holds(&self) -> bool {
         match self {
             Kept::No => false,
-            Kept::Always => true,
-            Kept::Until(pages) => !pages.zeroed(),
+            Kept::Always | Kept::Copied(_) => true,
         }
     }
 }
@@ -131,7 +129,7 @@ impl PartialEq for Kept {
     fn eq(&self, other: &Kept) -> bool {
         match (self, other) {
             (Kept::No, Kept::No) | (Kept::Always, Kept::Always) => true,
-            (Kept::Until(a), Kept::Until(b)) => Arc::ptr_eq(a, b),
+            (Kept::Copied(a), Kept::Copied(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -319,8 +317,8 @@ impl Drop for Keeping {
 /// this platform does not answer as Metal's GPU does ([`Memory::kept`]): a surface the GPU only
 /// reads, which the runtime imports through a writable twin of its pages, where the write would
 /// land in those pages, and later reads see it; or, for a
-/// texture's write, a resolve into one or a CPU write, read-only guest pages (a read-only replace
-/// or heap, a resource made with `MTLResourceOptions` bit 24) the runtime copies, dropping the
+/// texture's write, a resolve into one or a CPU write, read-only guest pages (a read-only heap, a
+/// resource made with `MTLResourceOptions` bit 24) the runtime copies, dropping the
 /// write, where what Metal does is unmeasured. Metal's GPU drops a shader's store, a fill's or
 /// a visibility result's there and completes the command, and fails the command buffer of a
 /// pass that stores an attachment back to it (the module's measurements), and its CPU's write
@@ -332,7 +330,7 @@ pub(crate) fn kept_write(sel: &'static str, what: &str) -> ! {
         &format!(
             "{what} read-only memory (a surface the GPU only reads, which this host's runtime \
              imports through a writable twin, so the write would reach it; or, \
-             for a texture, a read-only replace, heap or resource, whose copy drops it), where \
+             for a texture, a read-only heap or resource, whose copy drops it), where \
              Metal's GPU drops the write or faults, or what it does is unmeasured, and its CPU's \
              write through the read-only mapping ends the process"
         ),
@@ -393,8 +391,7 @@ pub fn buffer_memory(b: &BufferObject) -> Memory {
 
 /// The host memory `b`'s bytes `bytes` (a first byte and an end) lie in now: in its surface's
 /// memory (`newBufferWithIOSurface:`, from the surface's base address), at its place in its
-/// heap's, in the guest's pages of its last replace, or in the memory it was made over; none
-/// where a detach left it in no memory, or for a `Private` one.
+/// heap's, or in the memory it was made over; none for a `Private` one.
 pub fn buffer_bytes_memory(b: &BufferObject, bytes: Range<u64>) -> Memory {
     if let Some(s) = &b.surface {
         return Memory::of_surface_bytes(s, bytes);
@@ -412,10 +409,6 @@ pub fn buffer_bytes_memory(b: &BufferObject, bytes: Range<u64>) -> Memory {
     }
     // Its writes into read-only memory the runtime copies are dropped, as Metal's GPU drops them:
     // nothing kept.
-    let paged = b.backing.in_pages(&bytes);
-    if paged.is_some() || b.backing.kept_contents().is_some() {
-        return Memory::over(paged.unwrap_or_default(), Kept::No);
-    }
     let contents = plain(|| b.raw.contents()).map(|first| {
         let first = first.as_ptr().addr().to_u64();
         std::iter::once(first.saturating_add(bytes.start)..first.saturating_add(bytes.end))
@@ -485,10 +478,6 @@ fn buffer_bytes_bound(b: &BufferObject, bytes: Range<u64>) -> Bound {
         };
     }
     // Nothing kept, as `buffer_bytes_memory`'s.
-    let paged = b.backing.meets_pages(&bytes);
-    if paged.is_some() || b.backing.kept_contents().is_some() {
-        return Bound::over(paged.unwrap_or(false), Kept::No);
-    }
     Bound::over(plain(|| b.raw.contents()).is_some(), Kept::No)
 }
 
@@ -534,8 +523,8 @@ pub fn texture_bound(t: &TextureObject) -> Bound {
 }
 
 /// The host memory of `h`'s bytes `bytes`, a first byte and an end: in the guest's pages it was
-/// made over or last replaced with; none for one of memory of its own. What it keeps is a
-/// texture's in it ([`Kept::Until`]); a buffer in it keeps nothing ([`buffer_bytes_memory`]).
+/// made over; none for one of memory of its own. What it keeps is a
+/// texture's in it ([`Kept::Copied`]); a buffer in it keeps nothing ([`buffer_bytes_memory`]).
 pub(crate) fn heap_bytes_memory(h: &HeapObject, bytes: Range<u64>) -> Memory {
     Memory::over(
         h.backing.in_pages(&bytes).unwrap_or_default(),
@@ -931,7 +920,7 @@ pub(crate) mod tests {
         use crate::gpu::backing::Backing;
         let count = || KEPT_NOW.load(Ordering::SeqCst);
         assert!(!any_kept());
-        let (a, b) = (Backing::fixed(), Backing::fixed());
+        let (a, b) = (Backing::new(false), Backing::new(false));
         a.imported(false);
         assert_eq!(count(), 0);
         a.imported(true);
@@ -954,7 +943,7 @@ pub(crate) mod tests {
     /// what the memory collected answers: for a buffer of the device's memory, one placed in a
     /// heap over the guest's pages (at its bytes and past the pages), one on a surface, textures
     /// placed in the heap, over a buffer, on surfaces over the guest's pages and over memory of
-    /// their own, and one of memory of its own; and once the heap is detached, in no memory
+    /// their own, and one of memory of its own
     #[test]
     fn bound_memory_is_the_memory_collected() {
         let (p, d) = (
@@ -1026,11 +1015,8 @@ pub(crate) mod tests {
                 );
             }
         };
-        agree("attached");
+        agree("made");
         assert!(buffer_bound(&placed).meets && texture_bound(&in_heap).meets);
-        heap.detach_backing().unwrap();
-        agree("detached");
-        assert!(!buffer_bound(&placed).meets && !texture_bound(&in_heap).meets);
         drop((on_pages, over));
         crate::os::tests::free(pages, length);
     }

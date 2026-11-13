@@ -115,14 +115,6 @@ impl Buffer<FakePlatform> for Fk<kind::Buffer> {
         self.buffer(|m| m.contents)
     }
 
-    fn detach_backing(&self) -> RaiseResult<()> {
-        self.act(Policy::Caught, "detachBacking", vec![])?;
-        if let Model::Buffer(m) = &mut self.state().model {
-            m.detached = true;
-        }
-        Ok(())
-    }
-
     fn did_modify_range(&self, on: OnFault, range: NsRange) -> RaiseResult<()> {
         self.act(Policy::On(on), "didModifyRange:", vec![Arg::val(&range)])
     }
@@ -230,24 +222,6 @@ impl Buffer<FakePlatform> for Fk<kind::Buffer> {
             ],
             |w| Some(new_texture(w, desc, None, 0, Some(parent), false)),
         )
-    }
-
-    fn replace_backing(
-        &self,
-        ranges: &<FakePlatform as Platform>::AddressRangeArray,
-        read_only: bool,
-    ) -> RaiseResult<bool> {
-        let r = ranges.erase();
-        let ok = self.thr(
-            Policy::Caught,
-            "replaceBackingWithRanges:readOnly:",
-            vec![Arg::obj(ranges), Arg::Bool(read_only)],
-            || true,
-        )?;
-        if ok && let Model::Buffer(m) = &mut self.state().model {
-            m.ranges = Some(r);
-        }
-        Ok(ok)
     }
 }
 
@@ -512,10 +486,6 @@ impl Texture<FakePlatform> for Fk<kind::Texture> {
 }
 
 impl Heap<FakePlatform> for Fk<kind::Heap> {
-    fn detach_backing(&self) -> RaiseResult<()> {
-        self.act(Policy::Caught, "detachBacking", vec![])
-    }
-
     fn gpu_address(&self) -> u64 {
         self.heap(|m| m.gpu_address)
     }
@@ -569,24 +539,6 @@ impl Heap<FakePlatform> for Fk<kind::Heap> {
             vec![Arg::obj(descriptor), Arg::U64(offset)],
             |w| Some(new_texture(w, desc, None, 0, Some(parent), false)),
         )
-    }
-
-    fn replace_backing(
-        &self,
-        ranges: &<FakePlatform as Platform>::AddressRangeArray,
-        read_only: bool,
-    ) -> RaiseResult<bool> {
-        let r = ranges.erase();
-        let ok = self.thr(
-            Policy::Caught,
-            "replaceBackingWithRanges:readOnly:",
-            vec![Arg::obj(ranges), Arg::Bool(read_only)],
-            || true,
-        )?;
-        if ok && let Model::Heap(m) = &mut self.state().model {
-            m.ranges = Some(r);
-        }
-        Ok(ok)
     }
 
     fn resource_options(&self) -> u64 {

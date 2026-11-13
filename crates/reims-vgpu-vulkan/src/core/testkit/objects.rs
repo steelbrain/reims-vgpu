@@ -213,10 +213,6 @@ pub struct BufferModel {
     pub deallocator: Option<NoCopyDeallocator>,
     /// A descriptor-made buffer's deallocator `(contents, length)`, run when the buffer dies.
     pub desc_deallocator: Option<DescDeallocator>,
-    /// `detachBacking` was sent.
-    pub detached: bool,
-    /// The address ranges it was re-backed with (retained).
-    pub ranges: Option<AnyHandle>,
     /// Common resource state.
     pub common: ResourceCommon,
 }
@@ -341,7 +337,7 @@ pub struct HeapModel {
     pub gpu_address: u64,
     /// Memory the fake owns for a CPU-visible heap.
     pub mem: Option<Arc<RawRegion>>,
-    /// The address ranges it was made over or re-backed with.
+    /// The address ranges it was made over.
     pub ranges: Option<AnyHandle>,
     /// Common resource state.
     pub common: ResourceCommon,

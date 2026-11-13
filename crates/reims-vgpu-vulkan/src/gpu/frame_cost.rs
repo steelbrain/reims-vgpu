@@ -21,9 +21,7 @@
 //!
 //! The environment picks what runs: `FRAME_COST_RUNS` the runs (5), `FRAME_COST_SHAPE` one shape
 //! (`wide` or `many`), `FRAME_COST_ONLY` one path, for a profile of it (`platform` or `runtime`),
-//! `FRAME_COST_OPTIONS` other device options ([`product_device`]), and
-//! `FRAME_COST_RUNTIME_CHECK=1` a submission check on each of the runtime's command buffers
-//! ([`runtime_checks`]).
+//! and `FRAME_COST_OPTIONS` other device options ([`product_device`]).
 
 use crate::core::platform::Platform;
 use crate::core::platform::blit::{BlitCmd, BlitEncoder as _, ResourceRef};
@@ -517,24 +515,9 @@ fn runtime_command_buffer(
     t.time(15, || {
         let handler = Box::new(move |_: &rt::CommandBuffer| tx.send(()).unwrap());
         cb.add_completed_handler(handler).unwrap();
-        if runtime_checks() {
-            cb.set_submission_check(std::sync::Arc::new(|_| None))
-                .unwrap();
-        }
         cb.commit().unwrap();
     });
     (cb, rx)
-}
-
-/// Whether the runtime alone commits each command buffer with a submission check that passes
-/// every submission (`FRAME_COST_RUNTIME_CHECK=1`), as the platform commits each with its own
-/// ([`crate::gpu::backing::submission_check`]): what the check costs the runtime, apart from what
-/// the platform's check does.
-fn runtime_checks() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FRAME_COST_RUNTIME_CHECK").is_some_and(|v| v == "1")
-    });
-    *ON
 }
 
 /// A device of the system default's physical device made with the product's options: the
