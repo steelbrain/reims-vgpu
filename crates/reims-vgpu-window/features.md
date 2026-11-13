@@ -60,9 +60,13 @@ Unset or unparsable values give the defaults below.
 ## The picture
 
 - One GPU pass from the guest's frame into the window's drawable, with the
-  display's gamma and colour matrix; no CPU copy and no GPU copy. On the
-  Vulkan platform the pass draws into the image of a swapchain over the
-  window's layer, which is the drawable, as on Linux. `manual`
+  display's gamma and colour matrix, and no CPU copy. With the colour at
+  identity the pass is a GPU copy into the drawable, of the guest's scanout
+  or of a presented surface in the drawable's format (BGRA8, with or without
+  sRGB); otherwise it is a draw of the display's present or colour shaders.
+  The window makes no other copy of the frame: on the Vulkan platform the
+  pass writes the image of a swapchain over the window's layer, which is the
+  drawable, as on Linux. `manual`
 - Each guest frame is drawn as it arrives, up to the screen's refresh rate
   (120 Hz on ProMotion). `manual`
 - Colours are sRGB, not stretched over a P3 screen's gamut. `manual`
@@ -346,8 +350,13 @@ runtime's own device. The switches above apply, and `resolution=` too.
   refresh rate it is set to (its current mode's, as above); a change of
   screens lays every window out again. `manual`
 - The picture: one GPU pass from the guest's frame into the swapchain's
-  image, no copy, with the display's gamma and colour matrix, in sRGB.
-  `manual`
+  image, with the display's gamma and colour matrix, in sRGB: a GPU copy
+  where the colour is at identity and the frame is the guest's scanout or a
+  surface in the image's format, else a draw, as above; the window makes no
+  other copy of it. The compositor cannot be handed the guest's surface in
+  place: it lies in guest RAM a page a run, and a dma-buf over a 3648 × 2038
+  surface's pages would take a udmabuf list of 7,261 entries, past the 1,024
+  the kernel takes by default. `manual`
 - It never tears and never makes the guest wait: MAILBOX with at least four
   images where the compositor offers it, else FIFO; the render thread alone
   waits for an image, and a window the compositor stops showing slows only
