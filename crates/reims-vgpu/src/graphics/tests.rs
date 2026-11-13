@@ -8908,7 +8908,6 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_FUNCTION_POINTERS
             | RGFX_FEATURE_DYNAMIC_LIBRARIES
             | RGFX_FEATURE_PIPELINE_KEYS
-            | RGFX_FEATURE_DOORBELL_ASKS
             | slots_in_pages
             | sixteen_bit
             | if carries {
@@ -8963,7 +8962,6 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
                 | RGFX_FEATURE_FUNCTION_POINTERS
                 | RGFX_FEATURE_DYNAMIC_LIBRARIES
                 | RGFX_FEATURE_PIPELINE_KEYS
-                | RGFX_FEATURE_DOORBELL_ASKS
                 | RGFX_FEATURE_ICB_SLOTS_IN_PAGES
                 | RGFX_FEATURE_PAGES_16K
                 | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
@@ -9005,10 +9003,38 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_FUNCTION_POINTERS
             | RGFX_FEATURE_DYNAMIC_LIBRARIES
             | RGFX_FEATURE_PIPELINE_KEYS
-            | RGFX_FEATURE_DOORBELL_ASKS
     );
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);
+}
+
+/// The device offers `DOORBELL_ASKS` only where it can route its queues' plain doorbells: on
+/// Linux, to a host that gives `route_doorbell`. On macOS (QEMU under HVF or TCG, which have no
+/// kernel `ioeventfd`), and to a host with no route function, the bit is not offered, so the
+/// guest rings every doorbell as before it and every write runs through the device's.
+#[test]
+fn doorbell_asks_is_offered_only_where_the_host_routes_doorbells_on_linux() {
+    let offered = |route_doorbell: Option<GraphicsRouteDoorbellFn>| {
+        let config = GraphicsConfig {
+            callbacks: GraphicsCallbacks {
+                route_doorbell,
+                ..GraphicsCallbacks::default()
+            },
+            window: None,
+            memory_map: None,
+            guest_arch: GuestArch::X86_64,
+        };
+        let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
+        let word = u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32;
+        word & RGFX_FEATURE_DOORBELL_ASKS != 0
+    };
+    assert!(!offered(None), "offered to a host with no route function");
+    let routes: GraphicsRouteDoorbellFn = Arc::new(|_, _, _| false);
+    assert_eq!(
+        offered(Some(routes)),
+        cfg!(target_os = "linux"),
+        "offered to a host that routes, on Linux alone"
+    );
 }
 
 /// A device on a GPU of its own memory with a memory map on a guest-sized page offers the

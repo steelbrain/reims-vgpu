@@ -151,15 +151,27 @@ pub type GraphicsRaiseFn = Arc<dyn Fn(u32) + Send + Sync>;
 /// returns no write reaches `bell`, as the ring may be a later queue's. A route of a `ring_id`
 /// another route holds replaces that one. The host takes a copy of `bell` and may take the
 /// route after the call; until then, and where it refuses it, the writes come through
-/// [`GraphicsDevice::mmio_write_taking`]. The device routes only where the guest's driver took
-/// `RGFX_FEATURE_DOORBELL_ASKS`, at most `reims_vgpu_graphics::device::MAX_DOORBELL_ROUTES` at
-/// once, and drops none at its end: those it holds then are the host's to drop. Called with no
-/// lock held that a function of the device's waits for: on one of ring 0's threads
-/// (`reims-vgpu.graphics-ring0-<i>`) as a queue is made, destroyed or its process closed, where
+/// [`GraphicsDevice::mmio_write_taking`]. The device offers `RGFX_FEATURE_DOORBELL_ASKS` only
+/// where the host gives this function, on Linux, and routes only where the guest's driver took
+/// it, at most `reims_vgpu_graphics::device::MAX_DOORBELL_ROUTES` at once, and drops none at its
+/// end: those it holds then are the host's to drop. Called with no lock held that a function of
+/// the device's waits for: on one of ring 0's threads (`reims-vgpu.graphics-ring0-<i>`) or the
+/// control thread (`reims-vgpu.graphics-control`) as a queue is made, destroyed or its process
+/// closed, where
 /// it may wait for a lock the host holds while it calls the device (QEMU's BQL); and with
 /// `None` also on the host's own inside a `STATUS` 0 write or [`GraphicsDevice::reset`], where
 /// it must not wait for a lock the host holds around that call.
 pub type GraphicsRouteDoorbellFn = Arc<dyn Fn(u64, u32, Option<RawFd>) -> bool + Send + Sync>;
+
+/// Whether the device offers `DOORBELL_ASKS`, on which it routes its queues' plain doorbells to
+/// the host ([`GraphicsCallbacks::route_doorbell`]): where the host gives the route function, on
+/// Linux, whose eventfds the queues' threads sleep on and KVM's `ioeventfd` writes. A host on
+/// macOS (QEMU under HVF or TCG, with no `ioeventfd` of the kernel's), and one with no route
+/// function, is not offered it: its guest rings every doorbell as before the bit, every write
+/// runs through [`GraphicsDevice::mmio_write_taking`], and nothing changes for the guest.
+fn offers_doorbell_asks(callbacks: &GraphicsCallbacks) -> bool {
+    cfg!(target_os = "linux") && callbacks.route_doorbell.is_some()
+}
 
 /// A graphics device's callbacks. `raise_interrupt` is called on the thread that posts the event
 /// it raises for: the device's control thread (`reims-vgpu.graphics-control`), one of ring 0's
@@ -417,9 +429,10 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // while the guest's display sleeps (`DISPLAY_POWER`), and makes the guest's
             // rasterization rate maps on its platform (`RATE_MAPS`), of the layer counts the device
             // info answers, and its compute pipeline states' function handles and visible function
-            // tables (`FUNCTION_POINTERS`). Every host takes the doorbell of a buffer that asks for
-            // its `CB_SUBMITTED` apart from the rest (`DOORBELL_ASKS`), so a host may take the rest
-            // where it runs nothing of the device's (`GraphicsCallbacks::route_doorbell`).
+            // tables (`FUNCTION_POINTERS`). A host that routes queues' doorbells takes the doorbell
+            // of a buffer that asks for its `CB_SUBMITTED` apart from the rest (`DOORBELL_ASKS`;
+            // [`offers_doorbell_asks`]), so it may take the rest where it runs nothing of the
+            // device's.
             let in_place = u64::from(RGFX_FEATURE_SURFACE_PAGES)
                 | u64::from(RGFX_FEATURE_PAGES_BUFFERS)
                 | u64::from(RGFX_FEATURE_HEAP_OVER_PAGES)
@@ -445,7 +458,11 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 | RGFX_FEATURE_FUNCTION_POINTERS
                 | RGFX_FEATURE_DYNAMIC_LIBRARIES
                 | RGFX_FEATURE_PIPELINE_KEYS
-                | RGFX_FEATURE_DOORBELL_ASKS
+                | if offers_doorbell_asks(&config.callbacks) {
+                    RGFX_FEATURE_DOORBELL_ASKS
+                } else {
+                    0
+                }
                 | if gpu_device.makes_opencl_mode_pipelines() {
                     u64::from(RGFX_FEATURE_OPENCL_MODE)
                 } else {
