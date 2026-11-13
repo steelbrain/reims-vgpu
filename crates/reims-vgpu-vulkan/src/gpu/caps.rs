@@ -73,9 +73,11 @@
 //!   as Metal answers it, a constant one and a runtime one. A guest told yes where a row is not
 //!   exact picks work that Metal runs and the runtime refuses or runs otherwise; told no, it
 //!   never makes that pipeline;
-//! - buffers and heaps over address ranges are yes where the runtime imports host memory
-//!   (`VK_EXT_external_memory_host`), which every heap over address ranges is made over
-//!   ([`crate::gpu::backing`]), as on MoltenVK, where they are Metal's answers;
+//! - buffers and heaps over address ranges are no, as the AMD Radeon Pro 5300M and the Intel UHD
+//!   630 answer (measured, macOS 26.7.1), where the M3 Max answers yes: this platform makes
+//!   neither, and the guest's bundle refuses a buffer descriptor with address ranges, its
+//!   answers to both selectors IOGPU's base device's (no on every guest measured), so nothing a
+//!   guest reads changes with these;
 //! - `supportsResourceDetachBacking` is no, as the AMD Radeon Pro 5300M and the Intel UHD 630
 //!   answer (measured, macOS 26.7.1), where the M3 Max answers yes: nothing detaches or replaces
 //!   a backing. This platform does neither, and the guest's heaps answer neither (the Metal
@@ -117,8 +119,7 @@
 //!   over a living one's does, the heap's cover, the buffer over all of it core makes with each
 //!   heap, included: such a texture dies in every heap core makes
 //!   ([`crate::gpu::resource::Placements`]); the heap's bytes there, read through the heap's
-//!   address, a replaced backing or the guest's pages under a heap over address ranges, are not its
-//!   texels either;
+//!   address or the guest's memory under a heap over it, are not its texels either;
 //! - a two-plane XR10 texture (550, 551) over plane 0 of a 'b3a8' surface is the runtime's, its
 //!   colour words in plane 0 and its alpha bytes in plane 1, read, sampled, cleared, filled and
 //!   copied to and from another texture of the format as Metal's (the tests compare them over the
@@ -170,7 +171,7 @@ use crate::core::platform::caps::{
 };
 use crate::core::platform::types::{MtlSize, SizeAndAlign};
 use crate::core::raise::RaiseResult;
-use metal2vulkan::device::{VkExtension, VkFeature};
+use metal2vulkan::device::VkFeature;
 use metal2vulkan::error::Feature;
 use metal2vulkan::metal::PixelFormat;
 use metal2vulkan_runtime as rt;
@@ -280,10 +281,6 @@ fn computed(device: &rt::Device, private: &rt::PrivateProperties) -> (u64, Limit
         props.supports_vertex_amplification_count(count)
     });
     let [simd_reduction, simd_shuffle_and_fill] = simd_rows_exact(device);
-    let imports_host_memory = device
-        .enabled()
-        .extensions
-        .contains(&VkExtension::ExtExternalMemoryHost);
     let refuses = |feature: Feature| {
         metal
             .unsupported_features
@@ -346,7 +343,7 @@ fn computed(device: &rt::Device, private: &rt::PrivateProperties) -> (u64, Limit
         is_framebuffer_read_supported: !refuses(Feature::FramebufferFetch),
         is_large_mrt_supported: flag(F::IsLargeMrtSupported),
         is_rgb10a2_gamma_supported: stand_in::RGB10A2_GAMMA,
-        supports_buffer_with_address_ranges: imports_host_memory,
+        supports_buffer_with_address_ranges: false,
         // This platform makes a buffer at an IOSurface's base (`new_buffer_on_surface`).
         supports_buffer_with_iosurface: true,
         // The adapter builds command predication (`predication`).
@@ -356,7 +353,7 @@ fn computed(device: &rt::Device, private: &rt::PrivateProperties) -> (u64, Limit
         supports_dynamic_attribute_stride: flag(F::SupportsDynamicAttributeStride),
         supports_extended_xr10_formats: stand_in::EXTENDED_XR10_FORMATS,
         supports_float16_bcubic_filtering: stand_in::FLOAT16_BCUBIC_FILTERING,
-        supports_heap_with_address_ranges: imports_host_memory,
+        supports_heap_with_address_ranges: false,
         supports_image_blocks: stand_in::IMAGE_BLOCKS,
         supports_memory_order_atomics: memory_order_atomics(private),
         supports_native_hardware_fp16: props.description.has(VkFeature::ShaderFloat16),

@@ -53,8 +53,8 @@ fn caps_are_the_runtimes_and_the_documented_facts() {
     );
     let f = &caps.flags;
     assert!(
-        f.supports_buffer_with_address_ranges && f.supports_heap_with_address_ranges,
-        "MoltenVK imports host memory"
+        !f.supports_buffer_with_address_ranges && !f.supports_heap_with_address_ranges,
+        "nothing makes a buffer or heap over address ranges"
     );
     assert!(
         !f.supports_resource_detach_backing,
@@ -137,9 +137,13 @@ fn answers(caps: &DeviceCaps) -> Vec<(String, String)> {
 }
 
 /// The answers of the device's caps that are not Metal's on the M3 Max, each the device's truth
-/// where it lacks what Metal has (the module's docs), and the answer it gives: no backing is
-/// detached or replaced.
-const NOT_METALS: [(&str, &str); 1] = [("supports_resource_detach_backing", "false")];
+/// where it lacks what Metal has (the module's docs), and the answer it gives: no buffer or heap
+/// is made over address ranges, and no backing is detached or replaced.
+const NOT_METALS: [(&str, &str); 3] = [
+    ("supports_buffer_with_address_ranges", "false"),
+    ("supports_heap_with_address_ranges", "false"),
+    ("supports_resource_detach_backing", "false"),
+];
 
 /// Every answer of the device's caps is Metal's on the M3 Max, field for field:
 /// every limit, flag, sample count, primitive type, family and rounding mode core asks, and the
