@@ -18,8 +18,7 @@ metal2vulkan's `docs/FAST-PATHS.md` at the pinned commit. Costs are the RTX 5080
 cold, from that file: the making of the big glass pipelines (A2X, Xgc14, Xgc15), then GPU time
 per draw.
 
-Three runtime defaults are not taken, and have no switch: completion, heap compression and
-in-place YCbCr reads. Every
+Two runtime defaults are not taken, and have no switch: completion and in-place YCbCr reads. Every
 device takes `CompletionPolicy::Exact`, each command buffer in a kernel submission of its own and
 seen complete at its own end, as Metal's, where the runtime's default (`Grouped`) on Mesa's drivers
 sends up to four ready together and sees each but the last complete only once the last completed.
@@ -29,26 +28,37 @@ timing as in order: the rows below trade values alone. The grouped form also bou
 a guest's drag on the Iris Xe (15.7-17.3 frames a second grouped, 16.4-17.6 exact), for 0.4-1.7 ms
 of the runtime's scheduler CPU a frame.
 
-Every device also takes `HeapCompressionPolicy::Uncompressed`: a heap's colour texture that Metal
-keeps losslessly compressed (`allowGPUOptimizedContents`, no `ShaderWrite`, `PixelFormatView` or
-`ShaderAtomic` usage, 16 texels or more a side) takes an image the driver keeps uncompressed in the
-heap's bytes, as one Metal keeps uncompressed does, where the runtime's default (`Compressed`) takes
-the driver's compressed image on a driver whose compressed images may keep their texels apart from
-their memory (ANV). That image changes what `heapTextureSizeAndAlignWithDescriptor:` answers the
-guest: on the Iris Xe 0x4100 bytes at 0x10000 for a 64x64 `BGRA8Unorm` texture, and 0x8100 at
-0x10000 for a 64x64 `R32Uint` one of seven levels, where the uncompressed images answer 0x4080 and
-0x8000 at 0x1000, as before this default came (Metal: 0x4080 and 0x5800 at 0x80). An answer stays as
-it was until the guests boot with the new one. A write through a buffer or texture over its bytes
-may also leave the compressed image's texels as they were (`HeapTextureCompressed`). The compressed
-image cleared a 2048x2048 `RGBA8Unorm` render target in a `Private` heap in 26.9 us against 676 us
-on the Iris Xe, and copied into another in 648-649 us against 674-693 us.
-
 Every device also takes `YCbCrInPlacePolicy::Exact`: a function that reads a `YCBCR8_420_2P`
 (500) or `YCBCR10_420_2P` (505) texture's planes in place, on a device whose memory is the host's
 (MoltenVK, the Iris Xe, the Radeon 780M), converts and filters every tap as Metal does. The
 runtime's default (`Model`) samples by Vulkan's Y'CbCr model in the device's arithmetic, which
 reads outside the bounds `gpu::ycbcr::sampling`'s tests hold to Metal's answers (constexpr
 samplers, the default filter, `YCBCR10_420_2P` under every mode).
+
+Heap compression is the runtime's default (`HeapCompressionPolicy::Compressed`), and only
+`REIMS_VGPU_EXACT=all` takes its exact form, which has no name of its own. On a driver whose
+compressed images may keep their texels apart from their memory (ANV, the Iris Xe's; no other driver
+here), a heap's colour texture that Metal keeps losslessly compressed (`allowGPUOptimizedContents`,
+no `ShaderWrite`, `PixelFormatView` or `ShaderAtomic` usage, 16 texels or more a side), in a heap of
+the device's own memory (a guest's `Private` heap), takes the driver's compressed image where that
+image's 64 KiB alignment fits the heap's answer for it (an image of 64 KiB or more), as Metal keeps
+the texture compressed. A smaller one, and every texture of a heap over the guest's pages, takes an
+image the driver keeps uncompressed under either form. The bound: a write through a buffer or
+texture over its bytes may leave the compressed image's texels as they were
+(`heap-texture-compressed`, relayed), where Metal's compressed texture reads opaque magenta in the
+drawn content such a write covered (an M3 Max): neither shows the write as written. The compressed
+image moves what `heapTextureSizeAndAlignWithDescriptor:` answers the guest on the Iris Xe from an
+alignment of 0x1000 to 0x10000, its size kept: 0x1020000 bytes for a 2048x2048 `RGBA8Unorm` render
+target, 0x1010000 for a 1920x1080 `RGBA16Float` one, 0x10200 for a 128x128 `RGBA8Unorm` texture only
+read. A smaller one keeps its answer (0x4080 bytes at 0x1000 for a 64x64 `BGRA8Unorm` texture,
+0x8000 at 0x1000 for a 64x64 `R32Uint` render target of seven levels), and so does one Metal keeps
+uncompressed (0x1000000 at 0x1000 for the 2048x2048 render target with `ShaderWrite`). An x86 Mac
+answers from 4096 (the UHD 630) to 65536 (the Radeon Pro 5300M). The exact form's image,
+uncompressed in the heap's bytes, loses the driver's fast clear: on the Iris Xe a guest's clear of
+the 2048x2048 render target in a `Private` heap took 146.9 us of GPU time (as the guest reads it)
+against 28.6 us compressed (25.8 to 28.7 us for one in memory of its own), a copy of it into another
+294.1 us against 148.2, and the two together 535.7 us against 166.5 (16 a command buffer, the median
+of 25).
 
 | Fast default | Accurate switch | Bound of the fast form | Cost of the accurate form (5080) |
 |---|---|---|---|

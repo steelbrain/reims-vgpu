@@ -476,8 +476,9 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
 /// Radeon Pro 5300M, where the default has the GPU copy the range from the host copy as the
 /// submission runs, so such a write may be read, as on the UHD 630 (`managed_copy_in`,
 /// `ManagedCopyInPolicy::AtCommit`). [`EXACT_ALL`] names every one. The
-/// policy's `completion` and `heap_compression` are no names of these: every device takes their
-/// exact forms ([`exact_policy`]). The rest of Metal's values the runtime answers with the
+/// policy's `completion` is no name of these: every device takes its exact form
+/// ([`exact_policy`]). Nor is its `heap_compression`, whose uncompressed form [`EXACT_ALL`]
+/// alone takes. The rest of Metal's values the runtime answers with the
 /// device's own arithmetic, sampling and conversions, each difference a precision note it
 /// records, with no exact form to name.
 pub const EXACT_FORMS: [&str; 13] = [
@@ -497,7 +498,9 @@ pub const EXACT_FORMS: [&str; 13] = [
 ];
 
 /// The name `REIMS_VGPU_EXACT` takes for the runtime's `DevicePolicy::exact_answers()`: every
-/// field of [`EXACT_FORMS`] in its exact form, as the runtime's validation sets them.
+/// field of [`EXACT_FORMS`] in its exact form, as the runtime's validation sets them, and a heap's
+/// colour texture uncompressed in the heap's bytes (`HeapCompressionPolicy::Uncompressed`), which
+/// no other name takes.
 pub const EXACT_ALL: &str = "all";
 
 /// The device policy every device is made with: the runtime's default, whose native forms are
@@ -510,21 +513,31 @@ pub const EXACT_ALL: &str = "all";
 /// buffer complete is the guest's to observe (the stamps and interrupts core writes as its work
 /// completes), and the grouped form bought no frame rate in a guest's drag on the Iris Xe (15.7
 /// to 17.3 frames a second, against 16.4 to 17.6 exact), so no switch takes it. Its heap
-/// compression is always the exact form too, with no switch either: a heap's colour texture Metal
-/// keeps losslessly compressed takes an image the driver keeps uncompressed in the heap's bytes
-/// (`HeapCompressionPolicy::Uncompressed`), as one Metal keeps uncompressed does, where the
-/// runtime's default would take the driver's compressed image on a driver whose compressed images
-/// may keep their texels apart from their bytes (ANV). That image changes what
-/// `heapTextureSizeAndAlignWithDescriptor:` answers the guest (on the Iris Xe, 0x4100 bytes at
-/// 0x10000 for a 64x64 `BGRA8Unorm` texture, where the uncompressed one answers 0x4080 at 0x1000,
-/// and Metal 0x4080 at 0x80), and a write through a buffer or texture over its bytes may not show
-/// in its texels. Its in-place YCbCr reads are always the exact form as well, with no switch: a
-/// function that reads a `YCBCR8_420_2P` or `YCBCR10_420_2P` texture's planes in place, on a
-/// device whose memory is the host's, converts and filters every tap as Metal does
-/// (`YCbCrInPlacePolicy::Exact`), where the runtime's default samples by Vulkan's Y'CbCr model in
-/// the device's arithmetic, outside the bound of Metal's answers `gpu::ycbcr::sampling`'s tests
-/// hold. Each field of [`EXACT_FORMS`] that `exact`, `REIMS_VGPU_EXACT`'s comma-separated
-/// list, names takes the runtime's exact form too, and [`EXACT_ALL`] every such form:
+/// compression is the runtime's default (`HeapCompressionPolicy::Compressed`), which no name of
+/// [`EXACT_FORMS`] changes: on a driver whose compressed images may keep their texels apart from
+/// their bytes (ANV), a heap's colour texture that Metal keeps losslessly compressed, in a heap
+/// of the device's own memory (a guest's `Private` heap), takes the driver's compressed image, its
+/// fast clears kept, where that image's 64 KiB alignment fits the heap's answer for the texture
+/// (the runtime's `HeapAnswerPolicy::Device`: an image of 64 KiB or more), as Metal keeps the
+/// texture compressed. A write through a buffer or texture over its bytes may then leave its
+/// texels as they were, where Metal's texture reads opaque magenta in the drawn content the write
+/// covered (an M3 Max): neither shows the write as written. That image moves what
+/// `heapTextureSizeAndAlignWithDescriptor:` answers the guest on the Iris Xe from a 4 KiB
+/// alignment to 64 KiB, its size kept (0x1020000 bytes for a 2048x2048 `RGBA8Unorm` render target,
+/// 0x10200 for a 128x128 `RGBA8Unorm` texture only read), and leaves a smaller one's (0x4080 bytes
+/// at 0x1000 for a 64x64 `BGRA8Unorm` one). A texture of a heap over the guest's pages takes an
+/// image over them under either form. [`EXACT_ALL`] takes the image the driver keeps uncompressed
+/// in the heap's bytes (`HeapCompressionPolicy::Uncompressed`), as for a texture Metal keeps
+/// uncompressed, which loses the driver's fast clear: a guest's clear of a 2048x2048 `RGBA8Unorm`
+/// render target in a `Private` heap took 146.9 us of GPU time on the Iris Xe against 28.6 us
+/// compressed, and a copy of it 294.1 us against 148.2. Its in-place YCbCr reads are always the
+/// exact form, with no switch: a function that reads a `YCBCR8_420_2P` or `YCBCR10_420_2P`
+/// texture's planes in place, on a device whose memory is the host's, converts and filters every
+/// tap as Metal does (`YCbCrInPlacePolicy::Exact`), where the runtime's default samples by
+/// Vulkan's Y'CbCr model in the device's arithmetic, outside the bound of Metal's answers
+/// `gpu::ycbcr::sampling`'s tests hold. Each field of [`EXACT_FORMS`] that `exact`,
+/// `REIMS_VGPU_EXACT`'s comma-separated list, names takes the runtime's exact form too, and
+/// [`EXACT_ALL`] every such form:
 /// `batch_order`'s barriers between batches, `host_page_textures`' copies of each sampled texture
 /// over the guest's pages at each command buffer's first use, and `half_chains`' rounding at
 /// each `half` operation on a device without `shaderFloat16`, `pipeline_waits`' wait for every
@@ -538,14 +551,12 @@ pub const EXACT_ALL: &str = "all";
 fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
     use metal2vulkan::device::{
         BatchOrderPolicy, CompletionPolicy, DevicePolicy, DontCareColorPolicy,
-        ExtendedRangeBlitPolicy, HalfChainPolicy, HeapAnswerPolicy, HeapCompressionPolicy,
-        HostPageTexturePolicy, ManagedCopyInPolicy, PipelineWaitPolicy, QueueSharingPolicy,
-        RateMapRegionPolicy, UnstoredDontCarePolicy, VertexReachPolicy, WideLinePolicy,
-        YCbCrInPlacePolicy,
+        ExtendedRangeBlitPolicy, HalfChainPolicy, HeapAnswerPolicy, HostPageTexturePolicy,
+        ManagedCopyInPolicy, PipelineWaitPolicy, QueueSharingPolicy, RateMapRegionPolicy,
+        UnstoredDontCarePolicy, VertexReachPolicy, WideLinePolicy, YCbCrInPlacePolicy,
     };
     let mut policy = DevicePolicy::default();
     policy.completion = CompletionPolicy::Exact;
-    policy.heap_compression = HeapCompressionPolicy::Uncompressed;
     policy.ycbcr_in_place_reads = YCbCrInPlacePolicy::Exact;
     for name in (exact.unwrap_or_default().split(',').map(str::trim)).filter(|n| !n.is_empty()) {
         match name {
@@ -836,11 +847,12 @@ pub(crate) mod tests {
     }
 
     /// Without `REIMS_VGPU_EXACT` the device policy is the runtime's default, its native forms,
-    /// but for its exact completion, uncompressed heap textures and exact in-place YCbCr reads,
-    /// which every device takes and no name selects; each name of `EXACT_FORMS` takes that
-    /// field's exact form alone, in any order, spaces around a name ignored; `all` takes the
-    /// runtime's `exact_answers()`, every one; another name, `completion`, `heap_compression`,
-    /// `ycbcr_in_place_reads` and `sampling` among them, changes nothing
+    /// its compressed heap textures among them, but for its exact completion and exact in-place
+    /// YCbCr reads, which every device takes and no name selects; each name of `EXACT_FORMS`
+    /// takes that field's exact form alone, in any order, spaces around a name ignored; `all`
+    /// takes the runtime's `exact_answers()`, every one and uncompressed heap textures, which no
+    /// other name takes; another name, `completion`, `heap_compression`, `ycbcr_in_place_reads`
+    /// and `sampling` among them, changes nothing
     #[test]
     fn reims_vgpu_exact_names_the_policys_exact_forms() {
         use metal2vulkan::device::{
@@ -856,8 +868,8 @@ pub(crate) mod tests {
         assert_eq!(runtimes.ycbcr_in_place_reads, YCbCrInPlacePolicy::Model);
         let mut fast = runtimes;
         fast.completion = CompletionPolicy::Exact;
-        fast.heap_compression = HeapCompressionPolicy::Uncompressed;
         fast.ycbcr_in_place_reads = YCbCrInPlacePolicy::Exact;
+        assert_eq!(fast.heap_compression, HeapCompressionPolicy::Compressed);
         assert_eq!(fast.batch_order, BatchOrderPolicy::Ends);
         assert_eq!(fast.host_page_textures, HostPageTexturePolicy::InPlace);
         assert_eq!(fast.half_chains, HalfChainPolicy::AtExits);
@@ -937,8 +949,11 @@ pub(crate) mod tests {
                      vertex_reach,heap_answers,rate_map_regions,managed_copy_in";
         assert_eq!(exact_policy(Some(named)), every);
         assert_eq!(exact_policy(Some(&EXACT_FORMS.join(","))), every);
+        assert_eq!(every.heap_compression, HeapCompressionPolicy::Compressed);
         assert_eq!(one(EXACT_ALL), fast.exact_answers());
-        assert_eq!(fast.exact_answers(), every);
+        let mut all = every;
+        all.heap_compression = HeapCompressionPolicy::Uncompressed;
+        assert_eq!(fast.exact_answers(), all);
     }
 
     /// Obj: clone_ref() is another reference to the same object, and the last drop releases it

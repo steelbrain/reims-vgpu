@@ -521,25 +521,12 @@ pub fn created_or_decided<T>(
 ///   do not alias the heap's bytes as Metal's do: a depth or stencil image a driver lays apart
 ///   from its memory (MoltenVK, the runtime's `DepthStencilImagesLieApart`), where the runtime
 ///   keeps no shadow of it in the heap's bytes, or a colour image a driver may compress (ANV's
-///   `CompressedImagesHideAliasedWrites`, which no device here has). A write through a buffer
+///   `CompressedImagesHideAliasedWrites`, the Iris Xe's), where the texture takes neither an image
+///   of host-transfer usage nor a linear one, and is not one the runtime keeps compressed as Metal
+///   does (`HeapTextureCompressed`, relayed). A write through a buffer
 ///   or texture over its bytes changes none of its texels, or not all, and its writes change
 ///   none of those resources' bytes. Announced inside the heap's creator of the texture, which
 ///   dies at its selector;
-/// - `HeapTextureCompressed`: on a driver whose compressed images may keep their texels apart
-///   from the memory they are bound to (ANV's `CompressedImagesHideAliasedWrites`), under the
-///   runtime's `HeapCompressionPolicy::Compressed`, a heap's colour texture that Metal keeps
-///   losslessly compressed too (`allowGPUOptimizedContents`, no `ShaderWrite`, `PixelFormatView`
-///   or `ShaderAtomic` usage, 16 texels or more a side), made as the driver's compressed image: a
-///   write through a buffer or texture over its bytes may leave its texels as they were, where
-///   Metal's texture reads opaque magenta (`0xffff00ff`) in every texel of drawn content the write
-///   covered and the written bytes where it held only a clear (an M3 Max), and its own writes may
-///   show in those bytes compressed otherwise than Metal's. Every device here takes
-///   `HeapCompressionPolicy::Uncompressed` ([`crate::platform`]'s `exact_policy`), which makes its
-///   image one the driver keeps uncompressed in the heap's bytes, where the device can (else
-///   `HeapTextureHidesAliasedWrites`), so the runtime announces it for none of them. No device on
-///   Metal announces it, and a native device does not relay it: a texture's layout is neither
-///   maths nor sampling. Announced inside the heap's creator of the texture, which would die at
-///   its selector;
 /// - a resource a function may reach through its ID or address without the command naming it,
 ///   which the read would find other than Metal's, each announced where the reach becomes
 ///   possible, not where a function reads it, inside the call that makes it possible, which
@@ -1324,7 +1311,7 @@ pub fn created_or_decided<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 148] = [
+pub const DIES: [rt::Degradation; 147] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1368,7 +1355,6 @@ pub const DIES: [rt::Degradation; 148] = [
     rt::Degradation::AttachmentReadInPlace,
     rt::Degradation::HeapDepthStencilApart,
     rt::Degradation::HeapTextureHidesAliasedWrites,
-    rt::Degradation::HeapTextureCompressed,
     rt::Degradation::UnlistedArgumentSampler,
     rt::Degradation::UnreadableHandleTexture,
     rt::Degradation::UnnamedTextureUnviewable,
@@ -3102,7 +3088,21 @@ mod tests {
         //   writes 1, the AMD Radeon Pro 5300M and the Intel UHD Graphics 630 the samples that
         //   passed, as the runtime records), so no one nonzero value is Metal's; 0 where none
         //   passed, as Metal's.
-        const PRECISION: [D; 14] = [
+        // - `HeapTextureCompressed`: a heap's colour texture that Metal keeps losslessly
+        //   compressed (`allowGPUOptimizedContents`, no `ShaderWrite`, `PixelFormatView` or
+        //   `ShaderAtomic` usage, 16 texels or more a side), in a heap of the device's own memory,
+        //   made as the driver's compressed image on a driver whose compressed images may keep
+        //   their texels apart from the memory they are bound to (ANV's
+        //   `CompressedImagesHideAliasedWrites`, the Iris Xe's), under the runtime's default
+        //   `HeapCompressionPolicy::Compressed`, which [`crate::platform`]'s `exact_policy` keeps.
+        //   A write through a buffer or texture over its bytes may leave its texels as they were,
+        //   and its own writes may show in those bytes compressed otherwise than Metal's. Metal's
+        //   own answer there is not one value: its compressed texture shows no such write as
+        //   written either, an M3 Max's reading opaque magenta (`0xffff00ff`) in every texel of
+        //   drawn content a buffer's fill over its bytes covered and the fill's bytes where it held
+        //   only a clear (the runtime's measurement), and Apple documents no layout of a texture's
+        //   bytes in a heap. Announced inside the heap's creator of the texture.
+        const PRECISION: [D; 15] = [
             D::UncalibratedGpuTimes,
             D::UntimedCommandBuffer,
             D::GpuTimesFromHost,
@@ -3117,6 +3117,7 @@ mod tests {
             D::DeviceFilteredMipmaps,
             D::FloatTininessAfterRounding,
             D::DeviceBooleanVisibility,
+            D::HeapTextureCompressed,
         ];
         // A pipeline stage's precision notes, each arithmetic, filtering or ordering of the device
         // that its documentation says can differ from Metal's: relayed, but those [`DIES`] and
@@ -3244,7 +3245,7 @@ mod tests {
         // class of the device's own maths and sampling covers them: two precision notes
         // are other values, not other bits, the next two are where Apple's compiler places or
         // speculates an operation, Metal's rule for tessellation factors is not read, blending,
-        // storage, an attachment's memory read in place, a heap texture's compressed image, a
+        // storage, an attachment's memory read in place, a
         // pass's tile store and when a command buffer is seen complete are neither maths nor
         // sampling, the anisotropic emulation is a fitted model, and the band's corners are the
         // runtime's own, whose snap to Metal's grid the hardware allows (`DeviceSubpixelSnap`).
@@ -3260,7 +3261,6 @@ mod tests {
             D::AnisotropicFilter,
             D::TessellationWinding,
             D::TessellationFactorEdgeCases,
-            D::HeapTextureCompressed,
             D::SnormMinimumKept,
             D::SharedExponentKept,
             D::GroupedCompletion,
