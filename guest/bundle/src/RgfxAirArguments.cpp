@@ -3,6 +3,7 @@
 #include "RgfxAirArguments.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -2332,6 +2333,10 @@ Val cmpOp(uint32_t pred, const Code::Scalar &a, const Code::Scalar &b)
 	return integer(1, r ? 1 : 0);
 }
 
+// How many times the process ran a module's initialisers, and followed an entry point's body
+// (rgfxAirInitialisersRun, rgfxAirBodiesFollowed).
+std::atomic<uint64_t> gInitialisersRun{0}, gBodiesFollowed{0};
+
 // The specialisation's evaluator over a module's code: by the `count` constant values at
 // `values`, or (`blind`) by none known, each constant any value, defined or not.
 class Specialiser {
@@ -2346,6 +2351,7 @@ public:
 	// or that a store of theirs may reach, holds any value.
 	void initialise()
 	{
+		gInitialisersRun.fetch_add(1, std::memory_order_relaxed);
 		for (const Code::Body &body : c_.bodies) {
 			const Code::Global &g = c_.globals[body.function];
 			if (g.section == 0 || g.section > c_.sections.size() || c_.sections[g.section - 1] != "air.static_init")
@@ -2360,6 +2366,7 @@ public:
 	// Which of `body`'s arguments the specialised code may use: false where it was not followed.
 	bool uses(const Code::Body &body, std::vector<bool> &used)
 	{
+		gBodiesFollowed.fetch_add(1, std::memory_order_relaxed);
 		if (!propagate(body))
 			return false;
 		used.assign(body.args, false);
@@ -3085,6 +3092,37 @@ bool rgfxReadAirEntries(const uint8_t *bitcode, size_t size, RgfxAirEntries &out
 	return readModule(bitcode, size, m) && entriesOf(m, out);
 }
 
+// The integer each global holds once `s` ran the initialisers, where it holds a known one.
+static void constantGlobalsOf(const Specialiser &s, std::map<uint64_t, int64_t> &out)
+{
+	for (const auto &[global, v] : s.memory()) {
+		if (v.kind == Val::Const && !v.s.isFloat)
+			out[global] = v.s.width == 1 ? static_cast<int64_t>(v.s.bits) : signedOf(v.s);
+	}
+}
+
+bool rgfxAirConstantGlobals(const RgfxAirEntries &module, const RgfxFunctionConstant *values, uint32_t count,
+                            std::map<uint64_t, int64_t> &out)
+{
+	out.clear();
+	if (module.code == nullptr)
+		return false;
+	Specialiser s(*module.code, values, count, false);
+	s.initialise();
+	constantGlobalsOf(s, out);
+	return true;
+}
+
+uint64_t rgfxAirInitialisersRun()
+{
+	return gInitialisersRun.load(std::memory_order_relaxed);
+}
+
+uint64_t rgfxAirBodiesFollowed()
+{
+	return gBodiesFollowed.load(std::memory_order_relaxed);
+}
+
 bool rgfxAirSpecialise(const RgfxAirEntries &module, const RgfxAirEntry &entry, const RgfxFunctionConstant *values,
                        uint32_t count, RgfxAirSpecialisation &out)
 {
@@ -3094,10 +3132,7 @@ bool rgfxAirSpecialise(const RgfxAirEntries &module, const RgfxAirEntry &entry, 
 	const RgfxAirCode &code = *module.code;
 	Specialiser s(code, values, count, false);
 	s.initialise();
-	for (const auto &[global, v] : s.memory()) {
-		if (v.kind == Val::Const && !v.s.isFloat)
-			out.globals[global] = v.s.width == 1 ? static_cast<int64_t>(v.s.bits) : signedOf(v.s);
-	}
+	constantGlobalsOf(s, out.globals);
 	// Which arguments the specialised code uses: of those the code uses whatever the constants'
 	// values (an argument the code reads none of, such as an implicit imageblock's, is the AIR's
 	// to answer), the ones it uses under these.

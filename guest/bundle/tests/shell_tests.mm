@@ -7880,6 +7880,60 @@ void test_overlapping_arguments_refused_as_metal()
 	CHECK(refused > 0);
 }
 
+// Making a function with constant values answers whether they put its arguments at overlapping
+// locations (RgfxOverlappingArgumentError) from its module's initialisers alone, and follows no
+// entry point's body, which costs many times them (rgfxAirConstantGlobals): sixteen makes each of
+// oracle_overlap's k_idx, made, and k_overlap, refused, with the same values follow none, and run
+// the initialisers at most twice a make.
+void test_function_constants_make_follows_no_body()
+{
+	Fixture fx(0x20000); // the library's bytes fit
+	const char *path = getenv("RGFX_ORACLE_OVERLAP");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	CHECK(bytes.length > 0);
+	uint32_t status = 0;
+	RgfxLibrary *ours = [RgfxLibrary libraryWithData:bytes.bytes
+	                                          length:bytes.length
+	                                             key:nullptr
+	                                          device:nil
+	                                      serializer:&fx.ser
+	                                          status:&status];
+	CHECK(ours != nil);
+	if (ours == nil)
+		return;
+	dispatch_data_t data = dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		(void)bytes;
+	});
+	[ours rgfxSetSource:data
+	        shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+		        return nil;
+	        }];
+	MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+	const bool a = true, b = true;
+	const short w = 3;
+	const uint32_t idx = 1;
+	[values setConstantValue:&a type:MTLDataTypeBool atIndex:0];
+	[values setConstantValue:&b type:MTLDataTypeBool atIndex:1];
+	[values setConstantValue:&w type:MTLDataTypeShort atIndex:2];
+	[values setConstantValue:&idx type:MTLDataTypeUInt atIndex:3];
+	const uint64_t initialisers = rgfxAirInitialisersRun(), bodies = rgfxAirBodiesFollowed();
+	constexpr uint64_t kMakes = 16;
+	uint64_t made = 0, refused = 0;
+	for (uint64_t k = 0; k < kMakes; k++) {
+		NSError *e = nil;
+		made += [ours newFunctionWithName:@"k_idx" constantValues:values error:&e] != nil && e == nil;
+		e = nil;
+		refused += [ours newFunctionWithName:@"k_overlap" constantValues:values error:&e] == nil && e != nil;
+	}
+	CHECK(made == kMakes && refused == kMakes);
+	CHECK(rgfxAirBodiesFollowed() == bodies);
+	const uint64_t ran = rgfxAirInitialisersRun() - initialisers;
+	CHECK(ran > 0 && ran <= 2 * 2 * kMakes);
+}
+
 // A post-tessellation vertex function answers its [[patch]]'s type and control point count, from
 // the library's function list, and every other function MTLPatchTypeNone and -1, as Metal's own
 // functions answer for the same bytes (RgfxLibrary.mm, rgfxPatchOf).
@@ -18730,6 +18784,7 @@ int main(int argc, char **argv)
 		test_core_image_extern_functions();
 		test_function_patch_answers();
 		test_overlapping_arguments_refused_as_metal();
+		test_function_constants_make_follows_no_body();
 		test_stitched_library_over_shadows();
 		test_stitch_over_specialised_functions();
 		test_stitched_dag_over_shadows();

@@ -1257,12 +1257,15 @@ NSError *RgfxOverlappingArgumentError(const RgfxAirEntries &module, const RgfxAi
 		return -2;
 	};
 	static const char *const kWords[] = {"buffer", "buffer", "texture", "sampler"};
-	RgfxAirSpecialisation spec;
-	if (!rgfxAirSpecialise(module, entry, values, count, spec))
+	// The globals the initialisers leave under the values, which the arguments' predicates,
+	// indices and counts read; which arguments the body uses changes nothing here, and following
+	// it costs many times them (rgfxAirConstantGlobals), at every make of the function.
+	std::map<uint64_t, int64_t> globals;
+	if (!rgfxAirConstantGlobals(module, values, count, globals))
 		return nil;
 	auto global = [&](uint64_t g, int64_t &v) {
-		auto it = spec.globals.find(g);
-		if (it == spec.globals.end())
+		auto it = globals.find(g);
+		if (it == globals.end())
 			return false;
 		v = it->second;
 		return true;

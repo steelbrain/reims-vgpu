@@ -523,6 +523,20 @@ struct RgfxAirSpecialisation {
 bool rgfxAirSpecialise(const RgfxAirEntries &module, const RgfxAirEntry &entry, const RgfxFunctionConstant *values,
                        uint32_t count, RgfxAirSpecialisation &out);
 
+// The globals of `module` under the `count` function constant values at `values`, as
+// rgfxAirSpecialise answers them (RgfxAirSpecialisation's `globals`), from its initialisers alone:
+// no entry point's body is followed, which costs many times them (VideoToolbox's
+// VTMTSComputeFunction: 35.6 ms a specialisation against 0.19 ms for its initialisers, measured on
+// the M3 Max under macOS 27). False where the module has no code the reader follows (`out` then
+// empty).
+bool rgfxAirConstantGlobals(const RgfxAirEntries &module, const RgfxFunctionConstant *values, uint32_t count,
+                            std::map<uint64_t, int64_t> &out);
+
+// How many times the process ran a module's initialisers and followed an entry point's body,
+// each specialisation's and each pass of rgfxAirSpecialise's (tests).
+uint64_t rgfxAirInitialisersRun();
+uint64_t rgfxAirBodiesFollowed();
+
 // Narrows a universal .metallib (a big-endian fat header: magic CA FE BA BE, or CA FE BA BF with
 // 64-bit offsets) to its slice of generic AIR bitcode, a .metallib itself; other bytes, and a
 // universal one with no such slice, are left as they are.

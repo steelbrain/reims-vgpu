@@ -1782,11 +1782,13 @@ pipeline later (`OverlappingArgument`).
 
 What our stack does: the bundle reads each argument's predicate, index and count. It reads them
 from the function's AIR, under the module's initialisers run with the values
-(`rgfxAirSpecialise`). It refuses as above in `newFunctionWithName:constantValues:error:`, which
-every other way reaches, with no call to the host (`RgfxOverlappingArgumentError`). Where the AIR
-does not tell, the host's compile refuses the pipeline, as before. That covers a predicate, index
-or count that the code does not compute from the values, and a function table or an acceleration
-structure among the arguments, whose words were not measured.
+(`rgfxAirConstantGlobals`). It does not follow the entry point's body, which costs many times the
+initialisers at every make of the function. It refuses as above in
+`newFunctionWithName:constantValues:error:`, which every other way reaches, with no call to the
+host (`RgfxOverlappingArgumentError`). Where the AIR does not tell, the host's compile refuses the
+pipeline, as before. That covers a predicate, index or count that the code does not compute from
+the values, and a function table or an acceleration structure among the arguments, whose words
+were not measured.
 
 ## Not measured
 
