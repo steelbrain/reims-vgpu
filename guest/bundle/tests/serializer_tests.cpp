@@ -1590,7 +1590,9 @@ void test_ring_post_waits_for_room()
 	uint64_t full = ring.producer();
 	int before = TestRing::doorbells.load();
 
-	// The host takes everything 20 ms from now.
+	// The host takes everything 20 ms from now. The post's time is counted from before the host's
+	// thread starts, so it is at least those 20 ms however late this thread gets to the post.
+	auto start = std::chrono::steady_clock::now();
 	std::thread host([&ring, full] {
 		std::this_thread::sleep_for(std::chrono::milliseconds(20));
 		__atomic_store_n(reinterpret_cast<uint64_t *>(ring.mem.data() +
@@ -1599,7 +1601,6 @@ void test_ring_post_waits_for_room()
 	});
 	std::atomic<int> waits{0};
 	uint64_t seen = 0, producerAtPublish = ~0ull, seqno = 0;
-	auto start = std::chrono::steady_clock::now();
 	CHECK(writer.post(RGFX_CMD_COMMAND_BUFFER, msg, sizeof(msg), &seqno, [&] { waits++; },
 	                  [&](uint64_t s) {
 		                  seen = s;
@@ -2576,20 +2577,37 @@ void test_held_destroys()
 	CHECK(pser.destroy(0x5001, [&afters] { afters++; }));
 	CHECK(afters == 1 && plain.calls.size() == 1 && !plain.calls[0].batch);
 
-	// The writer's end posts what it holds.
-	KextLog ending;
-	{
-		RgfxRingWriter going(&kextSubmit, &ending, 4096);
-		going.setBatch(&kextSubmitBatch, 4096, 1000000);
-		RgfxObjectDestroy d = {};
-		d.obj_id = 0x6001;
-		CHECK(going.postLater(RGFX_CMD_OBJECT_DESTROY, &d, sizeof(d)));
-		CHECK(ending.calls.empty());
+	// The writer's end posts what it holds. Its timer comes 1 ms after the post, and a busy host
+	// can keep this thread off a CPU that long, letting the timer post first: a run counts only
+	// where the look at the calls comes inside that 1 ms from before the post, so the end alone can
+	// have posted the destroy. Runs repeat until one counts. Each run's log outlives its timer's
+	// use of it: the timer posts only while the writer is there.
+	constexpr auto kTimer = std::chrono::nanoseconds(1000000);
+	bool counted = false;
+	for (int run = 0; run < 50 && !counted; run++) {
+		KextLog ending;
+		bool noneBeforeEnd = false;
+		std::chrono::steady_clock::duration took{};
+		{
+			RgfxRingWriter going(&kextSubmit, &ending, 4096);
+			going.setBatch(&kextSubmitBatch, 4096, kTimer.count());
+			RgfxObjectDestroy d = {};
+			d.obj_id = 0x6001;
+			const auto began = std::chrono::steady_clock::now();
+			CHECK(going.postLater(RGFX_CMD_OBJECT_DESTROY, &d, sizeof(d)));
+			noneBeforeEnd = ending.ring().empty();
+			took = std::chrono::steady_clock::now() - began;
+		}
+		CHECK(ending.ring() == std::vector<RgfxObjId>({0x6001}));
+		// Its timer, which outlives it, then finds it gone and posts nothing more.
+		std::this_thread::sleep_for(std::chrono::milliseconds(3));
+		CHECK(ending.ring().size() == 1);
+		if (took < kTimer) {
+			CHECK(noneBeforeEnd);
+			counted = true;
+		}
 	}
-	CHECK(ending.ring() == std::vector<RgfxObjId>({0x6001}));
-	// Its timer, which outlives it, then finds it gone and posts nothing more.
-	std::this_thread::sleep_for(std::chrono::milliseconds(3));
-	CHECK(ending.calls.size() == 1);
+	CHECK(counted);
 }
 
 // Heap-placed buffers held to go together with the destroys around them

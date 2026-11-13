@@ -1208,11 +1208,13 @@ void test_submitted_waits_for_the_buffers_before()
 				taken++;
 			}
 		});
+		// The wait is counted from before a's commit is scheduled, so it is at least the 50 ms
+		// before it however late this thread gets to the call.
+		const auto start = std::chrono::steady_clock::now();
 		std::thread late([a] {
 			std::this_thread::sleep_for(std::chrono::milliseconds(50));
 			[a commit];
 		});
-		const auto start = std::chrono::steady_clock::now();
 		CHECK([(id<MTLCommandBufferSPI>)b commitAndWaitUntilSubmitted]);
 		CHECK(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(40));
 		late.join();

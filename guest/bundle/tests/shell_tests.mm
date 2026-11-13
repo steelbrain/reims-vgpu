@@ -10689,13 +10689,16 @@ void test_waiting_asks_for_its_scheduling()
 // A host that answers on the doorbell's thread: the doorbell write takes the buffer off the
 // submission ring and posts its CB_SUBMITTED before it returns, as the host's post does (the
 // record published, `armed` read and cleared), but the vector's wake of the completion thread
-// comes only `lateMs` later, from a thread of its own, as an interrupt still on its way.
+// comes only once the test lets it go (`letGo`), from a thread of its own, as an interrupt still
+// on its way; `woke` says it came. A wake not let go comes after 5 s, so a call that waits for it
+// still returns.
 struct DoorbellAnswer {
 	TestRing *submit = nullptr;
 	TestRing *completion = nullptr;
 	FakeKext *kext = nullptr;
 	uint64_t cbObjId = 0;
-	int lateMs = 0;
+	dispatch_semaphore_t letGo = dispatch_semaphore_create(0);
+	std::atomic<bool> woke{false};
 	std::atomic<uint64_t> seqno{0};
 	std::atomic<int> answered{0};
 	std::thread late;
@@ -10719,9 +10722,11 @@ struct DoorbellAnswer {
 		const bool raise = __atomic_exchange_n(armed, 0u, __ATOMIC_SEQ_CST) == 1;
 		d->answered.fetch_add(1);
 		FakeKext *kext = d->kext;
-		const int ms = d->lateMs;
-		d->late = std::thread([kext, ms, raise] {
-			std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+		dispatch_semaphore_t letGo = d->letGo;
+		std::atomic<bool> *woke = &d->woke;
+		d->late = std::thread([kext, letGo, woke, raise] {
+			dispatch_semaphore_wait(letGo, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+			woke->store(true);
 			if (raise)
 				kext->wake();
 		});
@@ -10730,10 +10735,10 @@ struct DoorbellAnswer {
 
 // A buffer the host answered on its doorbell's thread: commitAndWaitUntilSubmitted finds its
 // CB_SUBMITTED on the ring after its post and returns, the buffer submitted and still Committed,
-// without waiting for the completion thread's wake, which comes 400 ms later; the record is
-// still on the ring at the return. The completion thread then takes it, and the buffer's
-// scheduling and completion run as before. A buffer the doorbell does not answer waits for the
-// thread as before.
+// without waiting for the completion thread's wake, which comes only once the test lets it go
+// after the return; the record is still on the ring at the return. The completion thread then
+// takes it, and the buffer's scheduling and completion run as before. A buffer the doorbell does
+// not answer waits for the thread as before.
 void test_submitted_at_the_doorbell_wakes_no_thread()
 {
 	@autoreleasepool {
@@ -10743,7 +10748,6 @@ void test_submitted_at_the_doorbell_wakes_no_thread()
 	FakeKext *kext = new FakeKext();
 	door->completion = &f.completion;
 	door->kext = kext;
-	door->lateMs = 400;
 	RgfxCompletionThread thread(&FakeKext::wait, kext);
 	CHECK(thread.start());
 	std::shared_ptr<RgfxReplyReader> reader = [f.queue sharedReplyReader];
@@ -10753,17 +10757,16 @@ void test_submitted_at_the_doorbell_wakes_no_thread()
 	id<MTLCommandBuffer> cb = [f.queue commandBuffer];
 	door->cbObjId = ((RgfxResource *)cb).rgfxObjId;
 	door->submit = &f.submit;
-	auto start = std::chrono::steady_clock::now();
 	CHECK([(id<MTLCommandBufferSPI>)cb commitAndWaitUntilSubmitted]);
-	auto took = std::chrono::steady_clock::now() - start;
 	const uint64_t seqno = door->seqno.load();
 	CHECK(door->answered.load() == 1);
 	CHECK(seqno != 0);
-	CHECK(took < std::chrono::milliseconds(200));
+	CHECK(!door->woke.load()); // returned before the wake, which waits for the test
 	// Returned with the record still on the ring, untaken: the completion thread is asleep.
 	CHECK(reader->awaitingSubmitted(seqno));
 	CHECK(cb.status == MTLCommandBufferStatusCommitted);
 	// The late wake: the thread takes the record, which finds the buffer submitted.
+	dispatch_semaphore_signal(door->letGo);
 	door->late.join();
 	CHECK(eventually([&] { return !reader->awaitingSubmitted(seqno); }));
 	RgfxCbScheduled scheduled = cbScheduled(seqno, door->cbObjId);
@@ -10784,7 +10787,7 @@ void test_submitted_at_the_doorbell_wakes_no_thread()
 	std::atomic<int> asked{-1};
 	std::thread host = hostAnswers(&f.submit, &f.completion, kext, secondId, RGFX_EVT_CB_SUBMITTED,
 	                               &taken, &asked);
-	start = std::chrono::steady_clock::now();
+	const auto start = std::chrono::steady_clock::now();
 	CHECK([(id<MTLCommandBufferSPI>)second commitAndWaitUntilSubmitted]);
 	CHECK(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(25));
 	host.join();
