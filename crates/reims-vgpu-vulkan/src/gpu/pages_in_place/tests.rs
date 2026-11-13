@@ -265,6 +265,32 @@ fn before_the_import_pages_take_a_cache_only_where_every_import_refuses_them() {
     );
 }
 
+/// What the report's verdicts never showed, the runtime answers before the import as the buffer's
+/// making would: the device's policy, a shader's writes of a width the check stores none of,
+/// texels past the pages, rows that share bytes, and a pitch or dma-buf the device's format and
+/// limit queries refuse. Each is a shadow a device cache holds in place, so where every import
+/// the view may take answers it, the pages take a cache before any view is made
+#[test]
+fn shadows_the_verdicts_never_showed_take_a_cache_before_the_import() {
+    use rt::TextureShadowReason as Why;
+    let planes = [plane(0, 4096, 4000, 8)];
+    let asked = std::cell::Cell::new(0);
+    for reason in [
+        Why::Policy,
+        Why::StoreWidth { texel_bytes: 2 },
+        Why::PastLength,
+        Why::Refused(rt::InPlaceRefusal::Rows),
+        Why::Refused(rt::InPlaceRefusal::Pitch),
+        Why::Refused(rt::InPlaceRefusal::DmaBuf),
+    ] {
+        let shadow = before(|_| Ok(rt::TexturePlacement::Shadow(reason)), &asked);
+        let why = never_over(&shadow, 64, &[POINTER, DMA_BUF], &planes);
+        assert!(why.is_some(), "{reason:?}");
+        let why = never_over(&shadow, 64, &[DMA_BUF], &planes);
+        assert!(why.is_some(), "{reason:?} as dma-bufs alone");
+    }
+}
+
 /// A texture the runtime answers in place before the pages' import may still be a shadow that
 /// only the image or the import decides (`InPlaceRefusal::Pitch`, `Placement`, `Source`,
 /// `DmaBuf`: the driver's linear image, the source's dma-bufs): the pages are left to the view's
