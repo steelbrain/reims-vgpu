@@ -101,6 +101,12 @@
 //                libforms.vertex, a function array of a kernel or a vertex function
 //   ds.queries   readsDepth, writesDepth, readsStencil and writesStencil (SPI; Apple's GL renderer
 //                asks them) of depth/stencil states of 15 descriptors (kDsQueryCases)
+//   ds.grid      the same four queries over a grid, one line a state "ds.grid TAG => rd wd rs ws":
+//                every depth compare with and without writes (depth.C.W); every stencil compare
+//                of the front face with each operation set and masks (front.C.OPS.RM.WM, the
+//                depth test Less without writes, the back face Always and Keep); the back face's
+//                compares and operations (back.C.OPS); and stencil operations under the depth
+//                tests Always, Never and Less with and without writes (mix.DC.W.SC.OPS)
 //   ds.resourceIndex, ds.uniqueIdentifier  whether a depth/stencil state answers that SPI member,
 //                and what it returns
 //   tiled.bytes  the device's tiled texture SPI over bytes, both forms, of a one-level and a
@@ -2522,6 +2528,83 @@ static void case_ds_queries(id<MTLDevice> d)
 	}
 }
 
+// ds.grid's stencil operation sets: a tag, then the stencil failure, depth failure and pass
+// operations.
+static const struct {
+	const char *tag;
+	MTLStencilOperation sf, df, p;
+} kDsGridOps[] = {
+    {"keep", MTLStencilOperationKeep, MTLStencilOperationKeep, MTLStencilOperationKeep},
+    {"sf.replace", MTLStencilOperationReplace, MTLStencilOperationKeep, MTLStencilOperationKeep},
+    {"df.replace", MTLStencilOperationKeep, MTLStencilOperationReplace, MTLStencilOperationKeep},
+    {"p.replace", MTLStencilOperationKeep, MTLStencilOperationKeep, MTLStencilOperationReplace},
+    {"p.incr", MTLStencilOperationKeep, MTLStencilOperationKeep, MTLStencilOperationIncrementClamp},
+    {"p.invert", MTLStencilOperationKeep, MTLStencilOperationKeep, MTLStencilOperationInvert},
+    {"all.zero", MTLStencilOperationZero, MTLStencilOperationZero, MTLStencilOperationZero},
+};
+
+static void ds_grid_line(id<MTLDevice> d, const char *tag, MTLCompareFunction dc, BOOL dw,
+                         MTLStencilDescriptor *front, MTLStencilDescriptor *back)
+{
+	@autoreleasepool {
+		MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+		dd.depthCompareFunction = dc;
+		dd.depthWriteEnabled = dw;
+		if (front != nil)
+			dd.frontFaceStencil = front;
+		if (back != nil)
+			dd.backFaceStencil = back;
+		id ds = [d newDepthStencilStateWithDescriptor:dd];
+		printf("ds.grid %s => %d %d %d %d\n", tag, ds_bool(ds, "readsDepth"), ds_bool(ds, "writesDepth"),
+		       ds_bool(ds, "readsStencil"), ds_bool(ds, "writesStencil"));
+	}
+}
+
+static void case_ds_grid(id<MTLDevice> d)
+{
+	char tag[96];
+	const size_t nops = sizeof kDsGridOps / sizeof kDsGridOps[0];
+	for (int c = 0; c < 8; c++)
+		for (int w = 0; w < 2; w++) {
+			snprintf(tag, sizeof tag, "depth.%d.%d", c, w);
+			ds_grid_line(d, tag, (MTLCompareFunction)c, (BOOL)w, nil, nil);
+		}
+	const uint32_t rms[] = {0, 0x01, 0xff}, wms[] = {0, 0x0f, 0xff};
+	MTLStencilDescriptor *plain = ds_face(MTLCompareFunctionAlways, 0, 0, 0, 0xff, 0xff);
+	for (int c = 0; c < 8; c++)
+		for (size_t o = 0; o < nops; o++)
+			for (int r = 0; r < 3; r++)
+				for (int w = 0; w < 3; w++) {
+					snprintf(tag, sizeof tag, "front.%d.%s.%x.%x", c, kDsGridOps[o].tag, rms[r], wms[w]);
+					ds_grid_line(d, tag, MTLCompareFunctionLess, NO,
+					             ds_face(c, (int)kDsGridOps[o].sf, (int)kDsGridOps[o].df,
+					                     (int)kDsGridOps[o].p, rms[r], wms[w]),
+					             plain);
+				}
+	for (int c = 0; c < 8; c++)
+		for (size_t o = 0; o < nops; o++) {
+			snprintf(tag, sizeof tag, "back.%d.%s", c, kDsGridOps[o].tag);
+			ds_grid_line(d, tag, MTLCompareFunctionLess, NO, plain,
+			             ds_face(c, (int)kDsGridOps[o].sf, (int)kDsGridOps[o].df, (int)kDsGridOps[o].p,
+			                     0xff, 0xff));
+		}
+	const MTLCompareFunction dcs[] = {MTLCompareFunctionAlways, MTLCompareFunctionNever,
+	                                  MTLCompareFunctionLess};
+	const MTLCompareFunction scs[] = {MTLCompareFunctionAlways, MTLCompareFunctionNever,
+	                                  MTLCompareFunctionEqual};
+	for (int dc = 0; dc < 3; dc++)
+		for (int w = 0; w < 2; w++)
+			for (int sc = 0; sc < 3; sc++)
+				for (size_t o = 0; o < nops; o++) {
+					snprintf(tag, sizeof tag, "mix.%d.%d.%d.%s", (int)dcs[dc], w, (int)scs[sc],
+					         kDsGridOps[o].tag);
+					MTLStencilDescriptor *s = ds_face(scs[sc], (int)kDsGridOps[o].sf,
+					                                  (int)kDsGridOps[o].df, (int)kDsGridOps[o].p,
+					                                  0xff, 0xff);
+					ds_grid_line(d, tag, dcs[dc], (BOOL)w, s, s);
+				}
+}
+
 static void case_ds_id(id<MTLDevice> d, const char *tag, const char *name)
 {
 	id<MTLDepthStencilState> ds = probe_ds(d);
@@ -2649,6 +2732,7 @@ static const char *const kCases[] = {
     "heap.shared",      "bit17",            "bit18",         "bit19",         "tiled.responds",
     "buftex.depth16",   "buftex.stencil8",  "buftex.d32s8",  "buftex.x32s8",  "linear.depth",
     "ds.queries",       "ds.resourceIndex", "ds.uniqueIdentifier", "tiled.bytes", "tiled.buffer",
+    "ds.grid",
 };
 
 static int run_case(id<MTLDevice> d, const char *c)
@@ -2849,6 +2933,8 @@ static int run_case(id<MTLDevice> d, const char *c)
 		case_libforms3(d);
 	else if (!strcmp(c, "ds.queries"))
 		case_ds_queries(d);
+	else if (!strcmp(c, "ds.grid"))
+		case_ds_grid(d);
 	else if (!strcmp(c, "ds.resourceIndex"))
 		case_ds_id(d, c, "resourceIndex");
 	else if (!strcmp(c, "ds.uniqueIdentifier"))
