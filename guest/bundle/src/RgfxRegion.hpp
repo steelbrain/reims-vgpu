@@ -221,6 +221,19 @@ public:
 	/// Queue `queue`'s buffers up to `seqno` have their results in the surfaces' pages.
 	void retireSurfaceWrites(uint64_t queue, uint64_t seqno);
 
+	/// Where a surface's two seeds come from (the kext's, kRgfxAccelMethodSurfaceSeeds): `seeds`
+	/// answers the lock seed (IOSurfaceGetSeed's) and the unlock seed of the surface of IOSurfaceID
+	/// `surfaceId` the process holds, false where it has none. IOSurface moves the lock seed at a
+	/// read-write lock and the unlock seed at its unlock, and both at a GPU write, so the two differ
+	/// while a CPU holds the surface locked for writing. Called with `context`, from any thread.
+	typedef bool (*SurfaceSeedsFn)(void *context, uint32_t surfaceId, uint32_t *lockSeed,
+	                               uint32_t *unlockSeed);
+	void setSurfaceSeedsSource(SurfaceSeedsFn seeds, void *context);
+
+	/// The surface `surfaceId`'s lock and unlock seeds (SurfaceSeedsFn); false without a seeds
+	/// source, or where it has none.
+	bool surfaceSeeds(uint32_t surfaceId, uint32_t *lockSeed, uint32_t *unlockSeed);
+
 	/// Whether a surface pages source is set, and the alignment it gave.
 	bool hasSurfacePages() const { return m_pagesAcquire != nullptr; }
 	uint64_t surfacePagesAlignment() const { return m_pagesAlignment; }
@@ -389,6 +402,8 @@ private:
 	SurfaceWritesFn m_writesNote = nullptr; // the surface write source, where set (the kext)
 	SurfaceRetireFn m_writesRetire = nullptr;
 	void *m_writesContext = nullptr;
+	SurfaceSeedsFn m_seeds = nullptr; // the surface seeds source, where set (the kext)
+	void *m_seedsContext = nullptr;
 
 	std::mutex m_lock;
 };

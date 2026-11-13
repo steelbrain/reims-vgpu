@@ -159,6 +159,18 @@ void RgfxRegion::retireSurfaceWrites(uint64_t queue, uint64_t seqno)
 	}
 }
 
+void RgfxRegion::setSurfaceSeedsSource(SurfaceSeedsFn seeds, void *context)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	m_seeds = seeds;
+	m_seedsContext = context;
+}
+
+bool RgfxRegion::surfaceSeeds(uint32_t surfaceId, uint32_t *lockSeed, uint32_t *unlockSeed)
+{
+	return m_seeds != nullptr && m_seeds(m_seedsContext, surfaceId, lockSeed, unlockSeed);
+}
+
 void RgfxRegion::setPagesBlockSource(PagesBlockFn acquire, void *context)
 {
 	std::lock_guard<std::mutex> guard(m_lock);

@@ -14665,6 +14665,186 @@ void test_iosurface_shared_block()
 		CFRelease(s);
 }
 
+// Two holders of one surface's copy, this process and another, which the test plays: its CPU
+// writes the surface under a read-write lock, and its GPU writes the shared block (RgfxIOSurface.h).
+// - A commit while the other holder's CPU holds its write lock copies the pages as they are, half
+//   written, and the next commit after the unlock copies them again: IOSurface moves the lock
+//   seed at the lock and the unlock seed at the unlock, and the copy waits for the two to meet.
+//   Once they have, a commit copies nothing and asks the kext nothing.
+// - The other holder's GPU write, named (the kext moves both seeds) and recorded in the header,
+//   is not copied over by this holder's commit before its write-back reaches the pages.
+// - A block of the process's own takes the same rules from its own record.
+// The kext's seeds are played as IOSurface keeps them: the unlock seed is the lock seed less the
+// write locks held.
+void test_iosurface_copy_waits_for_the_cpu_unlock()
+{
+	Fixture fx;
+	int calls = 0;
+	fx.ids.setResourceIdSource(&oneChunk, &calls);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	struct Source {
+		uint64_t offset = RGFX_ALLOCATIONS_OFFSET + 0x40000;
+		uint64_t serial = 0;
+		bool give = true;
+		static bool acquire(void *c, const void *, uint64_t, uint64_t, uint64_t *offset,
+		                    uint64_t *serial, bool *fresh)
+		{
+			Source *src = static_cast<Source *>(c);
+			*offset = src->offset;
+			*serial = src->serial;
+			*fresh = true;
+			return src->give;
+		}
+		static void release(void *, uint64_t) {}
+	} src;
+	region.setSurfaceSource(&Source::acquire, &Source::release, &src);
+	struct Seeds {
+		IOSurfaceRef surface = nullptr;
+		uint32_t held = 0; // the other holder's write locks
+		int asked = 0;
+		static bool seeds(void *c, uint32_t surfaceId, uint32_t *lockSeed, uint32_t *unlockSeed)
+		{
+			Seeds *k = static_cast<Seeds *>(c);
+			k->asked++;
+			if (k->surface == nullptr || IOSurfaceGetID(k->surface) != surfaceId)
+				return false;
+			*lockSeed = IOSurfaceGetSeed(k->surface);
+			*unlockSeed = *lockSeed - k->held;
+			return true;
+		}
+	} kext;
+	region.setSurfaceSeedsSource(&Seeds::seeds, &kext);
+	// 16 x 16 BGRA: rows 256 bytes apart in the block, its header at 4096.
+	const uint64_t kPitch = 256, kHeader = 4096;
+	auto rowsOf = [](IOSurfaceRef s, int from, int to, uint32_t v) {
+		auto *base = static_cast<uint8_t *>(IOSurfaceGetBaseAddress(s));
+		for (int y = from; y < to; y++)
+			for (int x = 0; x < 16; x++)
+				reinterpret_cast<uint32_t *>(base + y * IOSurfaceGetBytesPerRow(s))[x] = v;
+	};
+	// The other holder's CPU: its write lock, the rows it writes under it, and its unlock.
+	auto otherLock = [&](IOSurfaceRef s) {
+		CHECK(IOSurfaceLock(s, 0, nullptr) == kIOReturnSuccess);
+		kext.held++;
+	};
+	auto otherUnlock = [&](IOSurfaceRef s) {
+		IOSurfaceUnlock(s, 0, nullptr);
+		kext.held--;
+	};
+	auto made = [&](uint32_t v) {
+		NSDictionary *props = @{
+			(id)kIOSurfaceWidth : @16,
+			(id)kIOSurfaceHeight : @16,
+			(id)kIOSurfaceBytesPerElement : @4,
+			(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+		};
+		IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+		otherLock(s);
+		rowsOf(s, 0, 16, v);
+		otherUnlock(s);
+		kext.surface = s;
+		return s;
+	};
+	auto texture = [&](IOSurfaceRef s) {
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		return [RgfxIOSurfaceTexture textureWithDescriptor:td
+		                                        iosurface:s
+		                                            plane:0
+		                                           region:&region
+		                                           device:nil
+		                                       serializer:&fx.ser];
+	};
+	for (bool shared : {true, false}) {
+		src.give = shared;
+		src.serial++;
+		IOSurfaceRef s = made(0x11111111);
+		@autoreleasepool {
+			RgfxIOSurfaceTexture *t = texture(s);
+			CHECK(t != nil);
+			uint8_t *block = mem.data() + (shared ? src.offset : blocks.allocated.back());
+			auto rowsAre = [&](int from, int to, uint32_t v) {
+				for (int y = from; y < to; y++)
+					for (int x = 0; x < 16; x++)
+						if (reinterpret_cast<uint32_t *>(block + y * kPitch)[x] != v)
+							return false;
+				return true;
+			};
+			auto blockIs = [&](uint32_t v) { return rowsAre(0, 16, v); };
+			CHECK(blockIs(0x11111111));
+			// Made after the other holder's unlock: a commit copies nothing, and asks nothing.
+			kext.asked = 0;
+			std::memset(block, 0xaa, 16 * kPitch);
+			syncAsCommitted({t});
+			CHECK(blockIs(0xaaaaaaaa) && kext.asked == 0);
+			std::memset(block, 0x11, 16 * kPitch);
+
+			// The other holder writes half the rows under its lock, and this holder commits.
+			otherLock(s);
+			rowsOf(s, 0, 8, 0x22222222);
+			syncAsCommitted({t});
+			CHECK(rowsAre(0, 8, 0x22222222) && rowsAre(8, 16, 0x11111111));
+			// It writes the rest and unlocks: the next commit copies the whole write.
+			rowsOf(s, 8, 16, 0x22222222);
+			syncAsCommitted({t});
+			CHECK(rowsAre(0, 8, 0x22222222) && rowsAre(8, 16, 0x11111111));
+			otherUnlock(s);
+			syncAsCommitted({t});
+			CHECK(blockIs(0x22222222));
+			// Synced after the unlock: no commit copies again or asks the kext.
+			kext.asked = 0;
+			std::memset(block, 0xaa, 16 * kPitch);
+			syncAsCommitted({t});
+			syncAsCommitted({t});
+			CHECK(blockIs(0xaaaaaaaa) && kext.asked == 0);
+			std::memset(block, 0x22, 16 * kPitch);
+
+			if (shared) {
+				// The other holder's GPU writes the block, and its commit names the write: the
+				// kext moves both seeds (played as a lock and its unlock), and the holder records
+				// the new seed in the header. Its write-back has not reached the pages yet: this
+				// holder's commit leaves the GPU's write in the block.
+				std::memset(block, 0x33, 16 * kPitch);
+				otherLock(s);
+				otherUnlock(s);
+				*reinterpret_cast<uint32_t *>(block + kHeader + 8) = IOSurfaceGetSeed(s);
+				syncAsCommitted({t});
+				CHECK(blockIs(0x33333333));
+				// Its write-back, under no lock, moves no seed: still nothing is copied.
+				rowsOf(s, 0, 16, 0x33333333);
+				syncAsCommitted({t});
+				CHECK(blockIs(0x33333333));
+				// A GPU write named while the other holder's CPU holds its lock supersedes the
+				// write the lock is for, as the seed the write leaves does: no commit copies the
+				// pages over it, nor after the CPU's unlock.
+				otherLock(s);
+				rowsOf(s, 0, 16, 0x44444444);
+				std::memset(block, 0x55, 16 * kPitch);
+				otherLock(s);
+				otherUnlock(s);
+				*reinterpret_cast<uint32_t *>(block + kHeader + 8) = IOSurfaceGetSeed(s);
+				*reinterpret_cast<uint32_t *>(block + kHeader + 24) = 0;
+				*reinterpret_cast<uint32_t *>(block + kHeader + 28) = 0;
+				syncAsCommitted({t});
+				CHECK(blockIs(0x55555555));
+				otherUnlock(s);
+				syncAsCommitted({t});
+				CHECK(blockIs(0x55555555));
+			}
+			drainRing(fx.ring);
+		}
+		kext.surface = nullptr;
+		drainRing(fx.ring); // the texture's and buffer's destroys
+		CFRelease(s);
+	}
+}
+
 // A surface with planes has one copy holding every plane (RgfxIOSurface.h): each plane's rows in
 // plane order, 256 bytes apart, then the header and the writers, one shared block found by plane
 // 0's pages. A texture over any plane lies in that copy's one buffer at its plane's offset, and its
@@ -18618,6 +18798,7 @@ int main(int argc, char **argv)
 		test_region_memory_given_back_after_destroy();
 		test_iosurface_copy_block_after_destroys();
 		test_iosurface_shared_block();
+		test_iosurface_copy_waits_for_the_cpu_unlock();
 		test_iosurface_planes();
 		test_iosurface_texture_waits_for_a_view_being_made();
 		test_iosurface_cpu_access_in_the_texture_s_format();
