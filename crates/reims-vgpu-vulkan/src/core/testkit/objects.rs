@@ -961,11 +961,14 @@ pub struct World {
     /// order.
     ///
     /// [`GpuDevice::fresh_surface_never_in_place`]: crate::core::platform::device::GpuDevice::fresh_surface_never_in_place
-    fresh_never_in_place: Mutex<(Option<String>, Vec<(Vec<PagesPlane>, u64)>)>,
+    fresh_never_in_place: Mutex<(Option<String>, Vec<FreshAsked>)>,
 }
 
 /// A surface's pages as host addresses, as runs, in its order.
 type PagesRuns = Vec<std::ops::Range<u64>>;
+
+/// What a fresh surface was asked of: its planes and its length.
+type FreshAsked = (Vec<PagesPlane>, u64);
 
 /// A test's model setters for the next object of kind `K` ([`World::on_new`]).
 type OnNew<K> = Box<dyn FnOnce(&Fk<K>) + Send>;
