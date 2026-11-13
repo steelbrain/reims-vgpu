@@ -7,11 +7,13 @@ measured, read or inferred tags, are kept outside the repository.
 
 ## Goal
 
-A second lane beside the Apple paravirt lane, with our own guest kext and
-Metal GPU bundle, our own protocol, and our own QEMU device and host side.
-Resources are stored and rendered in host GPU memory. The guest names them by
-handle, and the guest CPU reaches GPU memory only where Metal gives it a
-pointer.
+Our own GPU device for macOS guests, with our own guest kext and Metal GPU
+bundle, our own protocol, and our own QEMU device and host side. It has its
+own PCI vendor:device ID, so Apple's paravirt kext never matches it, and it
+serves x86-64 guests through OpenCore and arm64 guests from macOS 14 on
+Ambrosia (Decided 13). Resources are stored and rendered in host GPU memory.
+The guest names them by handle, and the guest CPU reaches GPU memory only
+where Metal gives it a pointer.
 
 It is engineered for maximum performance from the first version, without
 cheating: every result a guest observes is Metal's, and no fast path trades
@@ -31,6 +33,9 @@ Stages:
    a VM is given. The lane serves x86-64 guests: Apple says third-party kexts
    are not supported in macOS VMs on Apple silicon, and vmapple guests boot
    the same way, so arm64 guests stay on the Apple lane.
+   Superseded 2026-11-08: one lane. Apple's paravirt lane is deleted
+   (2026-11-07), and arm64 guests from macOS 14 take this device's arm64e set
+   on Ambrosia (Decided 13).
 2. **The cut: Metal-level calls.** The guest bundle streams Metal's calls,
    and the host decodes them into the library's `Platform`, which has a Metal
    and a metal2vulkan implementation, so both arms come with it. A
