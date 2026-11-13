@@ -42,6 +42,15 @@
 //! pointer's hold and the size's hold with it ([`ended`]), and hides; SDL's window is
 //! destroyed once the OS lets it go ([`os::close`]): on Linux once its render thread has let its
 //! swapchain and Vulkan surface go too ([`released`]), whichever of the two comes last.
+//!
+//! **A parked window.** Where the window's presenter was parked (`crate::present`, "A parked
+//! presenter"), its SDL window is the old swapchain's for good: on Linux the render thread asks for
+//! a new one ([`park`]). The input lets go of the old window as at the display's end ([`ended`]),
+//! a new SDL window opens for the display as a window opens (on its screen, at the size for the
+//! guest's mode, borderless where the windows are), and the old one hides and is kept, never
+//! destroyed, since the Vulkan surface the old swapchain is made over is never destroyed either
+//! ([`PARKED`]). The display then goes on in the new window, which is the display's from then on,
+//! to its end.
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -108,6 +117,9 @@ pub(crate) struct Opened {
 thread_local! {
     /// The windows open, on SDL's thread.
     static OPEN: RefCell<Vec<Shell>> = const { RefCell::new(Vec::new()) };
+    /// SDL's windows whose presenters were parked, hidden and kept until the process ends (the
+    /// module doc, "A parked window").
+    static PARKED: RefCell<Vec<*mut SDL_Window>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Runs `f` on window `id`'s shell, if it is open.
@@ -207,6 +219,72 @@ pub(crate) fn released(id: u64) {
     if gone == Some(true) {
         destroy(id);
     }
+}
+
+/// Window `id`'s presenter was parked: its SDL window is the old swapchain's for good, and a new
+/// one opens for the display in its place (the module doc, "A parked window"). Where the display
+/// has ended, the old one is kept and the window forgotten; where SDL makes no new one, the old
+/// one stays as it is, drawn no more.
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(dead_code, reason = "only Linux's render thread holds SDL's window")
+)]
+pub(crate) fn park(id: u64) {
+    let Some((window, closed)) = with_shell(id, |s| (Arc::clone(&s.window), s.closed)) else {
+        return;
+    };
+    if closed {
+        let shell = OPEN.with(|open| {
+            let mut open = open.borrow_mut();
+            let at = open.iter().position(|s| s.window.id() == id)?;
+            Some(open.remove(at))
+        });
+        if let Some(shell) = shell {
+            let sdl = shell.sdl;
+            os::destroy(shell);
+            PARKED.with(|parked| parked.borrow_mut().push(sdl));
+        }
+        return;
+    }
+    with_shell(id, ended);
+    let borderless = crate::env::settings().borderless;
+    let taken = each_open(|s| (s.window.id() != id).then(|| os::frame_of(s)).flatten());
+    let Some(opened) = os::open(&window, borderless, &taken) else {
+        log::warn!(
+            target: "reims_vgpu_window",
+            "window {:?}: its GPU device stopped and no new window opened: it stays as it is",
+            window.title()
+        );
+        return;
+    };
+    // SAFETY: SDL's window, just made on this thread.
+    let sdl_id = unsafe { SDL_GetWindowID(opened.sdl).0 };
+    let old = with_shell(id, |shell| {
+        let old = std::mem::replace(&mut shell.sdl, opened.sdl);
+        shell.sdl_id = sdl_id;
+        shell.asked = opened.asked;
+        shell.input = opened.input;
+        shell.os = opened.state;
+        shell.follows_guest = !borderless && !shell.window.keeps_its_size();
+        shell.layout = Layout::default();
+        shell.density = 1.0;
+        shell.over_image = false;
+        shell.shown = None;
+        shell.relayout();
+        shell.refresh_title();
+        old
+    });
+    if let Some(old) = old {
+        // SAFETY: the window is SDL's, on this thread; it is kept, hidden, never destroyed.
+        unsafe { SDL_HideWindow(old) };
+        PARKED.with(|parked| parked.borrow_mut().push(old));
+    }
+    log::warn!(
+        target: "reims_vgpu_window",
+        "window {:?}: its GPU device stopped and recovered on a new one: the display goes on in a \
+         new window, the old one hidden and kept under the old device's swapchain",
+        window.title()
+    );
 }
 
 /// Destroys window `id`'s SDL window and forgets it.

@@ -121,10 +121,15 @@
 //! **A parked `VkDevice`.** Where the old `VkDevice` stopped with no loss from the driver and the
 //! runtime parked it (`crate::generation`, "A parked generation"), its queues never idle and its
 //! presents never complete: the swapchain, its images' semaphores and its fences stay in use by
-//! work that never ends. The swapchain's end then waits for nothing and destroys none of them, nor
-//! the surface they are made over (Vulkan destroys a surface only after its swapchains); it lets
-//! go only of the runtime's textures over its images and the command buffers of its frames, which
-//! the runtime leaves as they are on that device.
+//! work that never ends. The next take then answers [`Acquired::Parked`], and the swapchain's end
+//! waits for nothing and destroys none of them, nor the surface they are made over (Vulkan
+//! destroys a surface only after its swapchains); it lets go only of the runtime's textures over
+//! its images and the command buffers of its frames, which the runtime leaves as they are on
+//! that device. A new swapchain over the same window would fail
+//! (`VK_ERROR_NATIVE_WINDOW_IN_USE_KHR` while the old one lives, and an `oldSwapchain` of another
+//! `VkDevice` is no valid one), so the window opens a new window and makes its swapchain there,
+//! leaving the old window, hidden, to the old swapchain (reims-vgpu-window's `present`). A
+//! recovery from a loss the driver reported (`VK_ERROR_DEVICE_LOST`) keeps the path above.
 //!
 //! **What the runtime announces.** Each batch that uses an image moves it from
 //! `PRESENT_SRC_KHR`, its layout between batches, into `GENERAL` and back: two whole-image
@@ -337,6 +342,20 @@ pub enum Acquired {
     /// No image, nor will there be: the surface is lost, or the device, or the device recovered
     /// on a new `VkDevice` (the module doc).
     Failed,
+    /// No image, nor will there be: the device stopped and recovered on a new `VkDevice`, the old
+    /// one parked, so the swapchain is left as it is and holds the window's surface for good (the
+    /// module doc, "A parked `VkDevice`"). The swapchain's end leaves its objects; a new swapchain
+    /// needs a new window.
+    Parked,
+}
+
+/// What a take answers once the swapchain's generation no longer serves the device: the old
+/// `VkDevice` parked ([`Acquired::Parked`]) or lost ([`Acquired::Failed`]) (the module doc).
+fn after_recovery(parked: bool) -> Acquired {
+    match parked {
+        true => Acquired::Parked,
+        false => Acquired::Failed,
+    }
 }
 
 /// An image a draw took, until it is presented or kept for the next draw.
@@ -516,6 +535,8 @@ pub struct Swapchain {
     lost: bool,
     /// The last making of the swapchain was refused, which was logged: the next refusal is not.
     refusing: bool,
+    /// The swapchain's `VkDevice` stopped and is parked: its objects are left (the module doc).
+    parked: bool,
 }
 
 impl std::fmt::Debug for Swapchain {
@@ -739,6 +760,7 @@ impl Swapchain {
             held: None,
             lost: false,
             refusing: false,
+            parked: false,
         })
     }
 
@@ -794,12 +816,27 @@ impl Swapchain {
         if size.0 == 0 || size.1 == 0 {
             return Acquired::Retry;
         }
+        if self.parked {
+            return Acquired::Parked;
+        }
         if !self.generation.serves(&self.present) {
-            log::warn!(
-                target: "reims_vgpu_vulkan::swapchain",
-                "the device recovered: the window's swapchain is made again on its new VkDevice"
-            );
-            return Acquired::Failed;
+            let ended = after_recovery(self.generation.is_parked());
+            if let Acquired::Parked = ended {
+                self.parked = true;
+                log::warn!(
+                    target: "reims_vgpu_vulkan::swapchain",
+                    "the device stopped and recovered on a new VkDevice, the old one parked: the \
+                     window's swapchain is left on it, and the window opens again for one on the \
+                     new VkDevice"
+                );
+            } else {
+                log::warn!(
+                    target: "reims_vgpu_vulkan::swapchain",
+                    "the device recovered: the window's swapchain is made again on its new \
+                     VkDevice"
+                );
+            }
+            return ended;
         }
         let current = self.chain.as_ref().map(|c| c.size);
         if self.stale || current != Some(size) {
@@ -1456,7 +1493,7 @@ impl Drop for Swapchain {
     /// and destroys none of its own objects, letting go only of the runtime's (the module doc, "A
     /// parked `VkDevice`").
     fn drop(&mut self) {
-        if self.generation.is_parked() {
+        if self.parked || self.generation.is_parked() {
             log::debug!(
                 target: "reims_vgpu_vulkan::swapchain",
                 "a window's swapchain on a parked VkDevice ends: its swapchain, semaphores, fences \
@@ -1573,6 +1610,29 @@ mod tests {
     /// The pixels of an extent, for comparing.
     fn pixels(extent: Option<vk::Extent2D>) -> Option<(u32, u32)> {
         extent.map(|e| (e.width, e.height))
+    }
+
+    /// A take after the device recovered ends the swapchain's draws by how the old `VkDevice`
+    /// ended: parked, the swapchain is left and the window opens again (`Parked`); lost, the window
+    /// makes a new swapchain over its own surface (`Failed`). A recovery from a loss, on the
+    /// runtime, parks nothing, so its take keeps today's path; the runtime parks only a device
+    /// whose work stopped, which no test here can make
+    #[test]
+    fn a_take_after_a_recovery_answers_how_the_old_device_ended() {
+        assert!(matches!(after_recovery(true), Acquired::Parked));
+        assert!(matches!(after_recovery(false), Acquired::Failed));
+        // A device of its own, as the recovery moves every user of the device.
+        let device = rt::Device::system_default().expect("a runtime device");
+        let present = device
+            .new_command_queue_for_presenting()
+            .expect("a presenting queue");
+        let generation = Generation::serving(&present).expect("a generation");
+        device.recover_for_test().expect("the recovery");
+        assert!(!generation.serves(&present));
+        assert!(matches!(
+            after_recovery(generation.is_parked()),
+            Acquired::Failed
+        ));
     }
 
     /// MAILBOX where the surface offers it, else FIFO; never a mode that tears

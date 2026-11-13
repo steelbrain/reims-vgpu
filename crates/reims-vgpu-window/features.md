@@ -440,6 +440,19 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `manual` (a VM with two displays)
 - Leaving: closing a window asks the host to end the VM; the window closes
   at the display's release, once its swapchain is gone. `manual`
+- A GPU that stops answering with no loss from its driver (NVIDIA's Xid 109
+  CTX SWITCH TIMEOUT), which the library recovers from on a new device,
+  parking the old one: the window hides and a new one opens in its place,
+  as a window opens (on its screen, sized for the guest's mode, borderless
+  where the windows are), and the display goes on there. The old window's
+  swapchain stays held by work that never ends, so no new one can be made
+  over it; the old window is kept hidden, never destroyed. Keys and buttons
+  held lift and capture ends before it hides. A GPU the driver reports lost
+  keeps its window, its swapchain made again on the new device. On macOS the
+  window stays as it is after such a stop.
+  `test: present::a_parked_presenter_asks_for_a_new_window`,
+  `test: native::linux::render::a_parked_window_is_drawn_only_in_its_new_window`,
+  `manual` (a boot whose GPU stops: NVIDIA's Xid 109)
 
 Not on Linux: a menu bar, Dock icon or ⌘Tab entry (the compositor's task
 bar shows the window, as `reims-vgpu`), the camera-housing fit, and trackpad

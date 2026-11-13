@@ -88,6 +88,7 @@ impl Presenter for ScanoutPresenter {
                 Acquired::Image(frame) => frame,
                 Acquired::Retry => return Drawn::Retry,
                 Acquired::Failed => return Drawn::Ended,
+                Acquired::Parked => return Drawn::Parked,
             };
             let Some(texture) = self.swapchain.texture(frame) else {
                 return Drawn::Nothing;

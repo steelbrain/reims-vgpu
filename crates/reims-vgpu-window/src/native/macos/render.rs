@@ -11,7 +11,9 @@
 //!
 //! Each draw goes through the sink's presenter over a Vulkan surface of the layer
 //! ([`super::metal_surface::LayerTarget`]), as on Linux (`crate::present`): made at the first
-//! draw, tried again after [`RETRY`] where no image came in time, made again where one ends.
+//! draw, tried again after [`RETRY`] where no image came in time, made again where one ends. One
+//! parked, its GPU device stopped, leaves the window as it is: no new window opens on macOS
+//! (`crate::present`, "A parked presenter").
 //! Its swapchain sizes the layer's drawables (from the layer's bounds and scale, which the view
 //! keeps), and takes them. The presenter goes before the thread lets its reference to the layer
 //! go.
