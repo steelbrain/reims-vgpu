@@ -42,7 +42,9 @@
 //! - **Hints.** Each thread gives the scheduler the walk hints as it starts
 //!   ([`Threads::give_walk_hints`]): a walk's speed is the frame rate. On Linux that is a
 //!   utilization floor of the CPU's full capacity, which the kernel's capacity-aware scheduling
-//!   reads on a hybrid processor without SMT (the Vulkan platform's `os/linux/hints.rs`).
+//!   reads on a hybrid processor without SMT (the Vulkan platform's `os/linux/hints.rs`); on
+//!   macOS the user-initiated QoS class, QEMU's HVF vCPU threads' own, above the default class a
+//!   host build runs at (`os/macos/hints.rs`).
 //!   Started with nothing but its creator's settings, one walk thread of
 //!   game_6000's queue ran on the efficiency cores alone in 5 of 19 runs, the second of car 13's
 //!   base's two among them, whose walks then ran 45% of their instructions on those cores where

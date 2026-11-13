@@ -1,4 +1,5 @@
-//! The OS services on macOS: core's threads ([`threads`]), clocks ([`clock`]), Mach VM ([`vm`]),
+//! The OS services on macOS: core's threads ([`threads`]) and the scheduling hint of the
+//! graphics device's walk threads ([`hints`]), clocks ([`clock`]), Mach VM ([`vm`]),
 //! the Objective-C autorelease pool ([`autorelease`]) and IOSurface ([`iosurface`]), whose
 //! surface is one CF reference whose retain count the guest sees; and the message layer the
 //! Objective-C sends go through ([`msg`]), which the window's AppKit side uses too.
@@ -12,6 +13,7 @@
 mod autorelease;
 mod clock;
 mod drawables;
+mod hints;
 mod iosurface;
 pub mod msg;
 mod threads;

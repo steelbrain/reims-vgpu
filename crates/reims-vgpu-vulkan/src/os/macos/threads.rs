@@ -103,6 +103,12 @@ impl Threads for MacThreads {
         spawn_pthread(label, crate::core::rt::queue::WORKER_STACK, body)
     }
 
+    /// The walk hint ([`super::hints::hint_walk_thread`]), for a thread the platform did not
+    /// start.
+    fn give_walk_hints(&self) {
+        super::hints::hint_walk_thread();
+    }
+
     fn handle(&self) -> Arc<dyn Threads> {
         Arc::new(MacThreads)
     }
