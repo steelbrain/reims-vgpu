@@ -12,7 +12,7 @@ The probes are in `guest/bundle/tools/oracle` ([README](../../guest/bundle/tools
 `oracle_errors`, `oracle_source`, `oracle_ycbcr`, `oracle_ca_ycbcr`, `oracle_sampler`,
 `oracle_icb`, `oracle_order`, `oracle_names`, `oracle_surftex`, `oracle_reflection`,
 `oracle_mesh`, `oracle_events`, `oracle_texdesc`, `oracle_nilbind`, `oracle_complete`,
-`oracle_residency` and `oracle_threads`; the upload costs (Q17) are `guest/bundle/tools/upload_probe.m`'s.
+`oracle_residency`, `oracle_threads` and `oracle_overlap`; the upload costs (Q17) are `guest/bundle/tools/upload_probe.m`'s.
 
 **Machines.** Every claim below is measured, on:
 - **AMD**: AMD Radeon Pro 5300M (Navi 14, `amdgpu_gfx1012`, 4 GB; AMDRadeonX6000 on
@@ -1747,6 +1747,46 @@ the AMD GPU and the arm64 guest as the M3, the host sent none of it. A kernel co
 refused all the same, as a first compile is and as the runtime refuses it. A pipeline of a required
 size answers its threads as its maximum, and the arm64 guest's pipelines answer
 `forwardProgressUsage` Automatic as Weak.
+
+## Q33: function constants that put two arguments at one location
+
+Probe: `oracle_overlap DEVICE`, 11-13 (m3-max-25546 on the AMD, 25547 on the Intel, 25548 on the
+M3). It covers 14 functions of `oracle_overlap.metal`: kernels, a vertex function and a fragment
+function. Each has arguments of one argument table that may take overlapping locations, each
+present under function constants. Every value of the two bools that gate them was tried, by
+every way of making a specialised function: values set by index, by name and by range, a copy
+of the values, a descriptor, a copy of it, a descriptor that names a `specializedName`, and each
+completion-handler form.
+
+The three GPUs give the same answers, line for line:
+
+- Where the values put two present arguments of one table at overlapping locations, Metal
+  refuses the function where it makes it. It answers nil with MTLLibraryErrorDomain 3
+  (CompileFailure) and one line per such argument, for example "error: buffer argument b has
+  invalid location (<0,1>) in k_overlap\n".
+- A line names each argument, in parameter order, whose location overlaps the location of an
+  earlier present argument. The line gives that argument's own index and count, and the
+  entry point's name, not the specialized name.
+- The word is `buffer` for buffers, constant buffers, argument buffers and threadgroup memory,
+  `texture` for textures and arrays of them, and `sampler` for samplers.
+- Threadgroup memory's table is not the buffers' table.
+- An argument counts as present wherever its predicate is true. It counts whether the function
+  uses it or not, and whether its code is dead under the values or not.
+- An index set by a function constant (`[[buffer(kIdx)]]`) counts like a literal one.
+- With no overlap, the function and its pipeline are made.
+
+Where this showed: the guest's pipelines tool (`mps.fn`) gives
+`cnnConvArray_32x32_128` every constant 0. Metal refuses that at once with "texture argument
+src has invalid location (<0,1>)". The bundle accepted it, and the host's compile refused the
+pipeline later (`OverlappingArgument`).
+
+What our stack does: the bundle reads each argument's predicate, index and count. It reads them
+from the function's AIR, under the module's initialisers run with the values
+(`rgfxAirSpecialise`). It refuses as above in `newFunctionWithName:constantValues:error:`, which
+every other way reaches, with no call to the host (`RgfxOverlappingArgumentError`). Where the AIR
+does not tell, the host's compile refuses the pipeline, as before. That covers a predicate, index
+or count that the code does not compute from the values, and a function table or an acceleration
+structure among the arguments, whose words were not measured.
 
 ## Not measured
 
