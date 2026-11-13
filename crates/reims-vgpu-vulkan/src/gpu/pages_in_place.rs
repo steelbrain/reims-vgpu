@@ -32,10 +32,13 @@
 //!
 //! Before any buffer of the pages is made ([`surface_pages_never_in_place`],
 //! [`fresh_surface_never_in_place`]) there is no buffer to ask, and the verdicts are read from the
-//! runtime's report (`rt::Device::in_place_check_report`), in one place ([`verdict`]), for a
-//! read, a render and a shader's write. Those paths answer only where the verdicts refuse, which a
-//! buffer's answer would refuse too; what only the image's making refuses (a pitch, a place,
-//! texels past the pages) they leave to the answer over the buffer.
+//! runtime's report (`rt::Device::in_place_check_report`), in one place ([`verdict`]), in the
+//! forms the runtime's check takes for a texture over a plane: a read, a render, and a shader's
+//! writes of each width (the narrow writes' for 1 and 2 bytes); a plane's rows keep their padding,
+//! so neither the renders' nor the writes' forms that let it change. Those paths answer only
+//! where the verdicts refuse every width, which a buffer's answer would refuse too; what only the
+//! image's making refuses (a pitch, a place, texels past the pages) they leave to the answer over
+//! the buffer.
 
 #[cfg(target_os = "linux")]
 use crate::core::num::ToU64 as _;
@@ -237,16 +240,28 @@ impl Class {
     }
 }
 
-/// What a texture does with its image, as the runtime's check tells them apart.
+/// What a texture over a plane does with its image, in the forms the runtime's check tells apart
+/// for it: a plane's rows keep their padding, so a render and a shader's writes take the forms
+/// that keep it, the writes' by the width of the texels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Access {
     Reads,
     Renders,
+    /// A shader's writes of texels of 4, 8 or 16 bytes.
     Writes,
+    /// A shader's writes of texels of 1 or 2 bytes.
+    NarrowWrites,
 }
 
 impl Access {
-    const ALL: [Access; 3] = [Access::Reads, Access::Renders, Access::Writes];
+    /// The accesses a texture of texels `width` bytes wide over a plane may take.
+    fn of_width(width: u64) -> [Access; 3] {
+        let writes = match width {
+            1 | 2 => Access::NarrowWrites,
+            _ => Access::Writes,
+        };
+        [Access::Reads, Access::Renders, writes]
+    }
 
     /// Its words in the runtime's report, after the class.
     fn name(self) -> &'static str {
@@ -254,6 +269,7 @@ impl Access {
             Access::Reads => "",
             Access::Renders => " renders",
             Access::Writes => " writes",
+            Access::NarrowWrites => " narrow writes",
         }
     }
 
@@ -263,6 +279,7 @@ impl Access {
             Access::Reads => "a texture that is read",
             Access::Renders => "a texture that renders",
             Access::Writes => "a texture a shader writes",
+            Access::NarrowWrites => "a texture of 1- or 2-byte texels a shader writes",
         }
     }
 }
@@ -351,8 +368,8 @@ pub(crate) fn surface_pages_in_place(pages: &rt::Buffer, planes: &[PagesPlane]) 
 
 /// The verdicts `report` gives textures over pages of `class` whose first byte lies at `start`,
 /// laid out as `planes`, on a device whose lines of memory are `line` bytes: why they do not lie
-/// in place, for the first plane and access whose verdict failed or went unchecked; else whether
-/// one is pending.
+/// in place, for the first plane whose every width's textures the verdicts refuse for some
+/// access they may take ([`Access::of_width`]); else whether one is pending.
 fn verdicts(
     report: &[String],
     line: u64,
@@ -360,33 +377,37 @@ fn verdicts(
     class: Class,
     planes: &[PagesPlane],
 ) -> Result<bool, String> {
-    let mut pending = false;
-    for (i, plane) in planes.iter().enumerate() {
-        let on_lines = on_lines(start, plane, line);
-        for access in Access::ALL {
-            let refused = match verdict(report, class, access, on_lines) {
-                Verdict::Passed => continue,
-                Verdict::Pending => {
-                    pending = true;
-                    continue;
-                }
+    let of_access = |on_lines: bool, access: Access| match verdict(report, class, access, on_lines)
+    {
+        Verdict::Passed => Over::InPlace,
+        Verdict::Pending => Over::Pending,
+        refused => Over::Cache(format!(
+            "the device's check {} {} over {}, for rows that {} the device's lines of {line} \
+             bytes",
+            match refused {
                 Verdict::Failed => "found a byte beside the texels changed by",
-                Verdict::Unchecked => "made no image for",
-            };
-            return Err(format!(
-                "plane {i}: the device's check {refused} {} over {}, for rows that {} the device's \
-                 lines of {line} bytes",
-                access.words(),
-                class.words(),
-                if on_lines {
-                    "start and end on"
-                } else {
-                    "end inside"
-                }
-            ));
-        }
+                _ => "made no image for",
+            },
+            access.words(),
+            class.words(),
+            if on_lines {
+                "start and end on"
+            } else {
+                "end inside"
+            }
+        )),
+    };
+    let plane = |plane: &PagesPlane| {
+        let on_lines = on_lines(start, plane, line);
+        of_plane(widths(plane.row_bytes).map(|(width, _)| {
+            of_width(Access::of_width(width).map(|access| of_access(on_lines, access)))
+        }))
+    };
+    match of_surface(planes.iter().map(plane)) {
+        PagesInPlace::No(why) => Err(why),
+        PagesInPlace::Pending => Ok(true),
+        PagesInPlace::Yes => Ok(false),
     }
-    Ok(pending)
 }
 
 /// The bytes of a page of the guest's, from whose first byte a surface's pages, and the view
@@ -395,13 +416,14 @@ const GUEST_PAGE: u64 = 4096;
 
 /// Why textures over an IOSurface's own pages, laid out as `planes` from a page's first byte,
 /// would lie in place over no import of them `raw` makes, asked before any is made (module docs):
-/// whichever class the import takes, by their pointer or as dma-bufs, a plane's verdict for some
-/// access failed or went unchecked, and a copy of the pages holds no texture in place either. So
-/// [`surface_pages_in_place`] answers no over any buffer of them: it gives a buffer over pages of
-/// either class the verdicts of its class, after, for dma-bufs, a check that only adds refusals,
-/// and a view of the pages starts on a page's first byte, where the device's lines start too.
-/// `None` where some class's verdicts all passed or are pending, or the device's lines do not
-/// divide a page: the pages' import decides.
+/// whichever class the import takes, by their pointer or as dma-bufs, the verdicts refuse every
+/// width of some plane for some access ([`verdicts`]), and a copy of the pages holds no texture
+/// in place either. So [`surface_pages_in_place`] answers no over any buffer of them: the
+/// runtime's answer over a buffer of pages of either class refuses wherever its class's verdicts
+/// do, a dma-buf's adds the check that one dma-buf takes each plane, and a view of the pages
+/// starts on a page's first byte, where the device's lines start too. `None` where some class's
+/// verdicts pass or are pending for a width of every plane, or the device's lines do not divide a
+/// page: the pages' import decides.
 ///
 /// A device that imports no shared memory by its pointer (`rt::Device::imports_shared_host_pointers`
 /// false: RADV) imports a view, a shared mapping of the guest's pages, as dma-bufs or not at all,
@@ -454,8 +476,8 @@ fn dma_bufs_never_in_place(
 /// would lie in place over no import of them `raw` makes, whatever pages the surface comes to
 /// have, asked before it has any: as [`surface_pages_never_in_place`] answers, each page counted a
 /// piece of its own on a device whose views are dma-bufs ([`fresh_dma_bufs_never_in_place`]).
-/// `None` where some class's verdicts all passed or are pending, or the device's lines do not
-/// divide a page: textures over some such pages may lie in place.
+/// `None` where some class's verdicts pass or are pending for a width of every plane, or the
+/// device's lines do not divide a page: textures over some such pages may lie in place.
 pub(crate) fn fresh_surface_never_in_place(
     raw: &rt::Device,
     planes: &[PagesPlane],

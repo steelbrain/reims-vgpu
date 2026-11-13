@@ -195,6 +195,7 @@ fn the_verdicts_are_read_from_the_runtimes_report() {
         "DmaBuf: Unchecked",
         "Pointer renders: Failed",
         "Pointer writes, rows on lines: Passed",
+        "Pointer narrow writes: Failed",
         "Pointer renders, rows on lines: Pending",
         "Pointer: the pass's store changed byte 4095",
     ]
@@ -205,9 +206,66 @@ fn the_verdicts_are_read_from_the_runtimes_report() {
     assert_eq!(v(Class::DmaBuf, Access::Reads, false), Verdict::Unchecked);
     assert_eq!(v(Class::Pointer, Access::Renders, false), Verdict::Failed);
     assert_eq!(v(Class::Pointer, Access::Writes, true), Verdict::Passed);
+    assert_eq!(
+        v(Class::Pointer, Access::NarrowWrites, false),
+        Verdict::Failed
+    );
+    assert_eq!(
+        v(Class::Pointer, Access::NarrowWrites, true),
+        Verdict::Pending
+    );
     assert_eq!(v(Class::Pointer, Access::Renders, true), Verdict::Pending);
     assert_eq!(v(Class::Pointer, Access::Writes, false), Verdict::Pending);
     assert_eq!(v(Class::Pointer, Access::Reads, true), Verdict::Pending);
+}
+
+/// A shader's writes of a plane's texels are read in the form the runtime's check takes for
+/// their width: the narrow writes' verdict for a plane whose rows only 1- or 2-byte texels
+/// divide, the wide one's and the narrow one's for a plane whose rows texels of 4 bytes divide
+/// too, which is refused only where both are; a texture over a plane keeps its padding, so no
+/// form that lets it change is read
+#[test]
+fn a_shaders_writes_are_read_in_the_form_of_the_planes_widths() {
+    let report = |wide: &str, narrow: &str| -> Vec<String> {
+        vec![
+            "Pointer: Passed".to_owned(),
+            "Pointer renders: Passed".to_owned(),
+            format!("Pointer writes: {wide}"),
+            format!("Pointer narrow writes: {narrow}"),
+            "Pointer buffer writes: Failed".to_owned(),
+            "Pointer unobserved renders: Failed".to_owned(),
+        ]
+    };
+    let line = 64;
+    let refused = |report: &[String], plane: PagesPlane| {
+        verdicts(report, line, 0, Class::Pointer, &[plane]).is_err()
+    };
+    // Rows of 1,001 bytes, 1,024 apart: texels of 1 byte alone, which end inside the lines.
+    let narrow = plane(0, 1024, 1001, 4);
+    assert!(refused(&report("Passed", "Failed"), narrow));
+    assert!(!refused(&report("Failed", "Passed"), narrow));
+    // Rows of 1,000 bytes: texels of 1, 2, 4 or 8 bytes.
+    let any = plane(0, 1024, 1000, 4);
+    assert!(
+        !refused(&report("Failed", "Passed"), any),
+        "narrow texels in place"
+    );
+    assert!(
+        !refused(&report("Passed", "Failed"), any),
+        "wide texels in place"
+    );
+    assert!(refused(&report("Failed", "Failed"), any));
+    assert_eq!(
+        verdicts(
+            &report("Pending", "Failed"),
+            line,
+            0,
+            Class::Pointer,
+            &[any]
+        ),
+        Ok(true),
+        "the wide verdict pending"
+    );
 }
 
 /// Texels lie on the lines where they start and end on one and so does each row where bytes
@@ -237,21 +295,28 @@ fn row_ends_are_told_apart_as_the_runtime_tells_them() {
     );
 }
 
-/// Before any import, a surface's pages are answered as lying in place over none exactly
-/// where the verdicts of both classes an import of them takes refuse them: wherever a buffer
-/// over a view of them (which starts on a page's first byte) imported by their pointer, or as
-/// dma-bufs, would be answered in place or pending, the answer before the import leaves it to
-/// the import, so a surface kept in place before is kept in place still; and wherever both
-/// would be answered no, so is the answer before. Every verdict of every access of both
-/// classes, for rows that end inside the device's lines and for rows on them; and lines that
-/// do not divide a page, or none, leave it to the import whatever the verdicts
+/// Before any import, a surface's pages are answered as lying in place over no import of them
+/// exactly where the verdicts of both classes an import of them takes refuse them: wherever a
+/// buffer over a view of them (which starts on a page's first byte) imported by their pointer, or
+/// as dma-bufs, would be answered in place or pending, the answer before the import leaves it to
+/// the import, so a surface kept in place before is kept in place still; and wherever both would
+/// be answered no, so is the answer before. Every verdict of every access of both classes, a
+/// shader's writes of wide texels and of narrow ones, for rows that end inside the device's lines
+/// and for rows on them; and lines that do not divide a page, or none, leave it to the import
+/// whatever the verdicts
 #[test]
 fn pages_lie_in_place_over_no_import_exactly_where_both_classes_refuse_them() {
     let words = ["Pending", "Passed", "Failed", "Unchecked"];
     let classes = [Class::Pointer, Class::DmaBuf];
+    let accesses = [
+        Access::Reads,
+        Access::Renders,
+        Access::Writes,
+        Access::NarrowWrites,
+    ];
     let line = 64;
     let entries: Vec<(Class, Access)> = (classes.iter())
-        .flat_map(|&c| Access::ALL.map(move |a| (c, a)))
+        .flat_map(|&c| accesses.map(move |a| (c, a)))
         .collect();
     for plane in [plane(0, 4032, 4000, 600), plane(64, 4032, 4032, 600)] {
         let planes = std::slice::from_ref(&plane);
@@ -299,6 +364,16 @@ fn the_runs_of_a_span_are_cut_to_it() {
     assert_eq!(cut(&runs, 0x4000..0x5000), []);
 }
 
+/// The dma-bufs' report lines of every access a plane's textures may take, for rows on lines,
+/// with `verdict`.
+#[cfg(target_os = "linux")]
+fn dma_buf_lines(verdict: &str) -> Vec<String> {
+    ["", " renders", " writes", " narrow writes"]
+        .iter()
+        .map(|access| format!("DmaBuf{access}, rows on lines: {verdict}"))
+        .collect()
+}
+
 /// On a device whose views are dma-bufs, a surface's pages are answered as lying in place over
 /// no import before its view where the dma-bufs' verdicts refuse them, whatever those by
 /// pointer answer, or where a plane's pages, counted from the runs the view would map, are no
@@ -313,14 +388,11 @@ fn a_dma_buf_device_refuses_pages_before_their_view_by_the_dma_bufs_alone() {
     let page = GUEST_PAGE;
     let planes = [plane(0, 4096, 4096, 4)];
     let report = |dma_buf: &str| -> Vec<String> {
-        let mut lines = vec![
-            "Pointer, rows on lines: Passed".to_owned(),
-            "Pointer renders, rows on lines: Passed".to_owned(),
-            "Pointer writes, rows on lines: Passed".to_owned(),
-        ];
-        for access in ["", " renders", " writes"] {
-            lines.push(format!("DmaBuf{access}, rows on lines: {dma_buf}"));
-        }
+        let mut lines: Vec<String> = ["", " renders", " writes", " narrow writes"]
+            .iter()
+            .map(|access| format!("Pointer{access}, rows on lines: Passed"))
+            .collect();
+        lines.extend(dma_buf_lines(dma_buf));
         lines
     };
     let base = crate::os::allocate_aliasable(8 * page)
@@ -362,13 +434,7 @@ fn a_dma_buf_device_refuses_pages_before_their_view_by_the_dma_bufs_alone() {
 fn a_fresh_surface_needs_a_cache_where_its_pages_fit_no_dma_buf_or_its_rows_fail() {
     let line = 64;
     let page = GUEST_PAGE;
-    let report = |dma_buf: &str| -> Vec<String> {
-        ["", " renders", " writes"]
-            .iter()
-            .map(|access| format!("DmaBuf{access}, rows on lines: {dma_buf}"))
-            .collect()
-    };
-    let passed = report("Passed");
+    let passed = dma_buf_lines("Passed");
     let fits = [plane(0, page, page, 4)];
     assert_eq!(fresh_dma_bufs_never_in_place(&passed, line, &fits), None);
     assert_eq!(
@@ -387,7 +453,7 @@ fn a_fresh_surface_needs_a_cache_where_its_pages_fit_no_dma_buf_or_its_rows_fail
         why.contains("plane 0's pages, each a piece of its own"),
         "{why}"
     );
-    let failed = report("Failed");
+    let failed = dma_buf_lines("Failed");
     let why = fresh_dma_bufs_never_in_place(&failed, line, &fits).unwrap();
     assert!(why.contains("imported as dma-bufs"), "{why}");
 }
