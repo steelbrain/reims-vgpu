@@ -3083,6 +3083,18 @@ IOReturn RgfxAccelerator::postLifecycle(UInt32 type, const void *message, UInt32
 	return r;
 }
 
+IOReturn RgfxAccelerator::postRun(UInt32 type, const void *messages, UInt32 size, UInt32 count,
+                                  UInt32 *posted)
+{
+	*posted = 0;
+	ReimsGraphics *fb = copyFramebuffer();
+	if (!fb)
+		return kIOReturnNotReady;
+	IOReturn r = fb->postRun(type, messages, size, count, nullptr, posted);
+	fb->release();
+	return r;
+}
+
 IOReturn RgfxAccelerator::postDeferred(UInt32 context, UInt32 type, const void *message,
                                        UInt32 size, UInt64 *seqno)
 {

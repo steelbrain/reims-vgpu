@@ -71,8 +71,17 @@ enum {
 	// kIOReturnNoSpace or kIOReturnNoResources where the region or the kext's table has no room
 	// for the block.
 	kRgfxAccelMethodPagesBlock = 4,
-	// 5 is kept for SubmitBatch (kRgfxKextFeatureSubmitBatch), 6 for WakeCompletions
-	// (kRgfxKextFeatureWakeCompletions).
+	// Posts the client's destroys of its own objects on the control ring in one call
+	// (kRgfxKextFeatureSubmitBatch): struct in, inline, OBJECT_DESTROY messages back to back,
+	// each whole (its header's type set; the kext stamps its size and seqno) and of an object in
+	// the client's context, at most kRgfxSubmitBatchBytes in all; out: how many were posted, in
+	// their order, each as kRgfxAccelMethodSubmit posts it (a destroy of one of the client's
+	// command queues ends the queue as Submit's does, after the destroys before it). None is
+	// posted where any is not such a destroy (kIOReturnBadArgument). Succeeds with fewer than
+	// all only where the control ring stayed full or the device stopped: the rest were not
+	// posted, and go in a later call, before anything else of the client's.
+	kRgfxAccelMethodSubmitBatch = 5,
+	// 6 is kept for WakeCompletions (kRgfxKextFeatureWakeCompletions).
 	// The answers to the client's deferred pipeline creates (Submit's kRgfxSubmitDeferred) the
 	// device has given (kRgfxKextFeatureDeferredAnswers): in the seqno of one to wait for first
 	// (0: none), up to a minute; struct out, the answers taken, each a whole
@@ -225,6 +234,7 @@ static inline int rgfxAccelContextSelector(unsigned selector)
 	case kRgfxAccelMethodFeatures:
 	case kRgfxAccelMethodPagesBlock:
 	case kRgfxAccelMethodPagesChunked:
+	case kRgfxAccelMethodSubmitBatch:
 	case kRgfxAccelMethodTakeAnswers:
 	case kRgfxAccelMethodSurfaceBlockRelease:
 	case kRgfxAccelMethodSurfaceRetire:
@@ -275,6 +285,12 @@ enum {
 enum {
 	kRgfxPagesChunk = 0x10000,
 	kRgfxPagesChunkedMaxBytes = 0x40000000,
+};
+
+// The most bytes of messages one kRgfxAccelMethodSubmitBatch takes: an inline struct in, 170
+// destroys.
+enum {
+	kRgfxSubmitBatchBytes = 4096,
 };
 
 // kRgfxAccelMethodSubmit's flags, its optional scalar in.

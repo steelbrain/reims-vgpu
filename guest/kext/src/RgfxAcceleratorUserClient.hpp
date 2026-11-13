@@ -112,6 +112,7 @@ private:
 	// The IOGPU base's device calls on its type-5 client: its configuration and device info.
 	IOReturn deviceMethod(uint32_t selector, IOExternalMethodArguments *arguments);
 	IOReturn submitMethod(IOExternalMethodArguments *arguments);
+	IOReturn submitBatchMethod(IOExternalMethodArguments *arguments);
 	IOReturn takeAnswersMethod(IOExternalMethodArguments *arguments);
 	IOReturn waitCompletionsMethod(IOExternalMethodArguments *arguments);
 	void releaseContext();
@@ -145,6 +146,9 @@ private:
 	// queue's OBJECT_DESTROY posted through submit both go through it, so the kext never keeps
 	// watching a queue the host has torn down.
 	bool destroyQueueIfTracked(UInt64 objId);
+	// Whether `objId` is one of the client's queues, listed or in the making, read under
+	// listLock: destroyQueueIfTracked's first look.
+	bool queueListed(UInt64 objId);
 
 	// As many as the device watches for one process (RgfxQueueLimits.hpp).
 	static const UInt32 kMaxQueues = kRgfxMaxQueuesPerClient;

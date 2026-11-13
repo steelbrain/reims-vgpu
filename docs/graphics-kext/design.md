@@ -1909,6 +1909,35 @@ library the app let go names a library the host still holds. The host makes the
 pipeline from the library before the library's destroy, and the pipeline needs
 it no more.
 
+**Destroys go together.** Each call into the kext costs the guest its trip
+through the kernel, and a post that finds the host's control thread asleep a
+doorbell's exit too: 14 us a destroy in a Vision request on the RTX 3090 host
+(9 to 10 us without the doorbell), 3415 destroys and 68 to 70 ms a process,
+in runs of about 70 an app lets go back to back. So where the kext carries
+`SubmitBatch` (selector 5), the bundle holds each destroy
+(`RgfxRingWriter::postLater`) and posts what it holds in one call, at most
+4096 bytes (170 destroys), before anything else the process posts or asks
+of the kext (every `IOConnectCall` of the device's goes through
+`rgfxKextConn`, which posts the held first), once the held fill a call, or
+1 ms after the first held. The kext checks each as `Submit` checks one, all
+before it posts any, puts the runs on the ring under one hold of its lock with
+one doorbell at most, and ends a queue's as `Submit` does, after the destroys
+before it. What an object lay over goes back as its destroy is held, as it
+went back once its destroy was posted: whatever takes it again, a create over
+the bytes or with the id, or a block's free, is posted after the destroy, so
+the host has dropped the object first, and every answer the guest reads (a
+heap's `usedSize`, a new object's GPU address and resource id) is the one it
+read before. A texture over an IOSurface goes at once: a present of the surface
+shows the newest live texture the host names it by, and waits for its destroy.
+Where the kext stops taking them (its ring stayed full 5 s, or the device
+stopped), the rest stay held, first, and the process's next post is refused as
+the ring's full ring refuses it; what the held lay over has gone back by then,
+which a guest reading a heap's `usedSize` through a 5 s stall of the control
+ring sees lower than it did. Tested by `serializer_tests`' `test_held_destroys`
+and `shell_tests`' `test_held_destroys_change_nothing_seen` and
+`test_surface_texture_destroys_go_at_once`, and the kext's by
+`submit_gate_test` and `user_client_words_test`.
+
 **Rings.** A 256-byte header, then a byte ring whose size is a power of two
 (64 KiB minus the header for the control rings). Each header field sits in its
 own 64-byte line:
@@ -3958,7 +3987,7 @@ Map 1:
 | 2 | | | given to none: the IOGPU base's device-info call on its own client type, so a trace names one call per number |
 | 3 | `Features` | | the device's feature word, the kext's and the selector map; at 3 in every map |
 | 4 | `PagesBlock` | 1 << 0 `PagesBlock` | a block of the runs of a process's own pages, wired, for its no-copy buffers |
-| 5 | `SubmitBatch` | 1 << 1 `SubmitBatch` | reserved: lifecycle messages in one call |
+| 5 | `SubmitBatch` | 1 << 1 `SubmitBatch` | a process's destroys onto ring 0 in one call ("Destroys go together") |
 | 6 | `WakeCompletions` | 1 << 2 `WakeCompletions` | reserved: wakes the client's completion waiters |
 | 7 | `TakeAnswers` | 1 << 4 `DeferredAnswers` | hands a process its held pipeline-create answers ("Known pipeline creates") |
 | 8 | `SurfaceBlockRelease` | | lets go of a shared block |
@@ -3984,7 +4013,7 @@ the accelerator, which the bundle opens for each event it hands out: 10 and 11
 are its own selectors, numbered apart from the accelerator's own so that a call
 on a connection of another kind finds none of that number there.
 
-The kext sets 1 << 0 `PagesBlock`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked` and 1 << 9 `SharedPipelines`; no other bit yet.
+The kext sets 1 << 0 `PagesBlock`, 1 << 1 `SubmitBatch`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked` and 1 << 9 `SharedPipelines`; no other bit yet.
 
 **A GL window: the drawable (type 7) and the window surface (type 0x20).**
 These are IOGPU's types, not ours. The bundle leaves `newGLDrawable` to its

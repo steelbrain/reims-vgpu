@@ -87,12 +87,13 @@ enum {
 };
 
 // The kext's own features (kRgfxKextFeature*, RgfxUserClientABI.hpp) this kext carries out, the
-// second word kRgfxAccelMethodFeatures answers: PagesBlock and PagesChunked, Submit's deferred
-// and shared flags and TakeAnswers, OpenContext's span, shared events' ports and Alloc's write-combined part,
-// where the region's write-combined mappings are ordinary memory (RgfxRegionMapping.hpp). Each
-// bit is set by the change that lands its call.
+// second word kRgfxAccelMethodFeatures answers: PagesBlock and PagesChunked, SubmitBatch, Submit's
+// deferred and shared flags and TakeAnswers, OpenContext's span, shared events' ports and Alloc's
+// write-combined part, where the region's write-combined mappings are ordinary memory
+// (RgfxRegionMapping.hpp). Each bit is set by the change that lands its call.
 constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeaturePagesChunked |
+                                          kRgfxKextFeatureSubmitBatch |
                                           kRgfxKextFeatureDeferredAnswers |
                                           kRgfxKextFeatureSharedPipelines |
                                           kRgfxKextFeatureContextSpan |
@@ -520,6 +521,10 @@ public:
 	IOReturn postLifecycle(UInt32 type, const void *message, UInt32 size, UInt32 replyType,
 	                       void *reply, UInt32 replyCapacity, UInt32 *replyLength, UInt64 *seqno,
 	                       UInt32 timeoutMs);
+	// `count` lifecycle messages of `type` no thread waits for, `size` bytes each, in one hold of
+	// the control ring (ReimsGraphics::postRun): *posted those posted.
+	IOReturn postRun(UInt32 type, const void *messages, UInt32 size, UInt32 count,
+	                 UInt32 *posted);
 	// The deferred pipeline creates (ReimsGraphics::postDeferred, takeDeferred, dropDeferred,
 	// forgetDeferred).
 	IOReturn postDeferred(UInt32 context, UInt32 type, const void *message, UInt32 size,

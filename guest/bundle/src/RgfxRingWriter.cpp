@@ -8,11 +8,15 @@
 #include "RgfxLog.hpp"
 #include "RgfxLogOnce.hpp"
 
+#include <dispatch/dispatch.h>
+
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <memory>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -82,6 +86,79 @@ void writeBytes(volatile uint8_t *data, uint32_t at, const void *src, uint32_t l
 
 } // namespace
 
+// What a batching writer holds (RgfxRingWriter::postLater), whole messages back to back, under
+// `lock`, which each post of it to the route is made under, so they reach the ring in the order
+// held. Shared with the timer that posts them `laterNs` after the first held (laterFire),
+// which may outlive the writer: `open` is false once the writer went.
+struct RgfxRingLater {
+	std::mutex lock;
+	RgfxForwardBatch post = nullptr;
+	void *context = nullptr;
+	uint32_t maxBytes = 0;
+	uint64_t laterNs = kRgfxLaterNs;
+	std::vector<uint8_t> held;
+	// Whether any is held: set under `lock` as one is, cleared under it once none is.
+	std::atomic<bool> any{false};
+	// Whether a timer will post what is held.
+	bool armed = false;
+	bool open = true;
+
+	// Posts what is held, from the first, at most maxBytes a call: whether none is held now.
+	// With `lock` held.
+	bool flush();
+};
+
+bool RgfxRingLater::flush()
+{
+	size_t at = 0;
+	bool all = true;
+	while (at < held.size()) {
+		// The whole messages from `at` that one call takes (postLater holds none larger).
+		size_t end = at;
+		uint32_t count = 0;
+		while (end < held.size()) {
+			RgfxMsgHeader header;
+			std::memcpy(&header, held.data() + end, sizeof(header));
+			if (end - at + header.size > maxBytes)
+				break;
+			end += header.size;
+			count++;
+		}
+		const uint32_t posted = post(context, held.data() + at, static_cast<uint32_t>(end - at));
+		for (uint32_t i = 0; i < posted && i < count; i++) {
+			RgfxMsgHeader header;
+			std::memcpy(&header, held.data() + at, sizeof(header));
+			at += header.size;
+		}
+		if (posted < count) {
+			all = false;
+			break;
+		}
+	}
+	held.erase(held.begin(), held.begin() + static_cast<std::ptrdiff_t>(at));
+	if (held.empty())
+		any.store(false, std::memory_order_release);
+	return all;
+}
+
+namespace {
+
+// The timer of what a writer holds: posts it, where the writer is still there. A post the route
+// refuses waits for the writer's next post or flushLater(), as the timer is not armed again.
+void laterFire(void *context)
+{
+	auto *later = static_cast<std::shared_ptr<RgfxRingLater> *>(context);
+	{
+		std::lock_guard<std::mutex> hold((*later)->lock);
+		(*later)->armed = false;
+		if ((*later)->open)
+			(*later)->flush();
+	}
+	delete later;
+}
+
+} // namespace
+
 RgfxRingWriter::RgfxRingWriter(volatile uint8_t *ring_base, uint32_t data_size, uint32_t ring_id,
                                RgfxDoorbell doorbell, void *doorbell_context)
     : m_header(ring_base), m_data(ring_base + RGFX_RING_HEADER_SIZE), m_dataSize(data_size),
@@ -104,6 +181,11 @@ RgfxRingWriter::RgfxRingWriter(RgfxForward forward, void *forward_context, uint3
 
 RgfxRingWriter::~RgfxRingWriter()
 {
+	if (m_later) {
+		std::lock_guard<std::mutex> hold(m_later->lock);
+		m_later->flush();
+		m_later->open = false;
+	}
 	RgfxRingRoomSleeps seen;
 	{
 		std::lock_guard<std::mutex> hold(m_sleepsLock);
@@ -121,6 +203,54 @@ void RgfxRingWriter::setDeferred(RgfxForwardDeferred post, RgfxAwaitAnswer await
 	m_deferredContext = context;
 }
 
+void RgfxRingWriter::setBatch(RgfxForwardBatch post, uint32_t max_bytes, uint64_t later_ns)
+{
+	if (m_forward == nullptr || post == nullptr || max_bytes < kHeaderBytes)
+		return;
+	auto later = std::make_shared<RgfxRingLater>();
+	later->post = post;
+	later->context = m_forwardContext;
+	later->maxBytes = max_bytes;
+	later->laterNs = later_ns;
+	m_later = std::move(later);
+}
+
+bool RgfxRingWriter::postLater(uint32_t type, const void *message, uint32_t size)
+{
+	RgfxRingLater *later = m_later.get();
+	if (later == nullptr || size < kHeaderBytes || size % kMsgAlign != 0 || size > later->maxBytes)
+		return tryPost(type, message, size, nullptr);
+	bool arm = false;
+	{
+		std::lock_guard<std::mutex> hold(later->lock);
+		// A call takes at most maxBytes: the held go first where this one would not fit with them.
+		if (later->held.size() + size > later->maxBytes)
+			later->flush();
+		const size_t at = later->held.size();
+		later->held.resize(at + size);
+		std::memcpy(later->held.data() + at, message, size);
+		const RgfxMsgHeader header = { type, size, 0 };
+		std::memcpy(later->held.data() + at, &header, sizeof(header));
+		later->any.store(true, std::memory_order_release);
+		arm = !later->armed;
+		later->armed = true;
+	}
+	if (arm)
+		dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(later->laterNs)),
+		                 dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
+		                 new std::shared_ptr<RgfxRingLater>(m_later), &laterFire);
+	return true;
+}
+
+bool RgfxRingWriter::flushLater()
+{
+	RgfxRingLater *later = m_later.get();
+	if (later == nullptr || !later->any.load(std::memory_order_acquire))
+		return true;
+	std::lock_guard<std::mutex> hold(later->lock);
+	return later->flush();
+}
+
 bool RgfxRingWriter::tryPostKnown(uint32_t type, const void *message, uint32_t size,
                                   uint64_t *out_seqno, bool *out_deferred)
 {
@@ -128,6 +258,9 @@ bool RgfxRingWriter::tryPostKnown(uint32_t type, const void *message, uint32_t s
 	if (!defers())
 		return tryPost(type, message, size, out_seqno);
 	if (size < kHeaderBytes || size % kMsgAlign != 0 || size > m_dataSize)
+		return false;
+	// What postLater() holds goes first.
+	if (!flushLater())
 		return false;
 	std::unique_ptr<uint8_t[]> buf(new uint8_t[size]);
 	std::memcpy(buf.get(), message, size);
@@ -150,6 +283,8 @@ bool RgfxRingWriter::tryPostShared(uint32_t type, const void *message, uint32_t 
 	if (!shares())
 		return tryPost(type, message, size, out_seqno);
 	if (size < kHeaderBytes || size % kMsgAlign != 0 || size > m_dataSize)
+		return false;
+	if (!flushLater())
 		return false;
 	std::unique_ptr<uint8_t[]> buf(new uint8_t[size]);
 	std::memcpy(buf.get(), message, size);
@@ -249,6 +384,9 @@ bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, 
 		*out_status = kRgfxNoAnswer;
 
 	if (m_forward) {
+		// What postLater() holds goes first: refused where it does not.
+		if (!flushLater())
+			return false;
 		// The kext stamps the seqno; the type and size are the message's own.
 		uint8_t stack[256];
 		std::unique_ptr<uint8_t[]> heap;

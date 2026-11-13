@@ -1473,6 +1473,216 @@ void test_shared_event_answers()
 
 } // namespace
 
+// A stand-in for the kext over a ring: each Submit, and each SubmitBatch's messages in their
+// order, posted on the ring as the kext posts them.
+struct KextRing {
+	RgfxRingWriter &direct;
+
+	static bool submit(void *context, const void *message, uint32_t size, uint64_t *out_seqno,
+	                   uint32_t *out_status)
+	{
+		KextRing *kext = static_cast<KextRing *>(context);
+		RgfxMsgHeader header;
+		std::memcpy(&header, message, sizeof(header));
+		if (out_status)
+			*out_status = kRgfxNoAnswer;
+		return kext->direct.tryPost(header.type, message, size, out_seqno);
+	}
+
+	static uint32_t batch(void *context, const void *messages, uint32_t bytes)
+	{
+		KextRing *kext = static_cast<KextRing *>(context);
+		const uint8_t *m = static_cast<const uint8_t *>(messages);
+		uint32_t posted = 0;
+		for (uint32_t at = 0; at < bytes; posted++) {
+			RgfxMsgHeader header;
+			std::memcpy(&header, m + at, sizeof(header));
+			CHECK(header.type == RGFX_CMD_OBJECT_DESTROY);
+			if (!kext->direct.tryPost(header.type, m + at, header.size, nullptr))
+				break;
+			at += header.size;
+		}
+		return posted;
+	}
+};
+
+// A ring and a serialiser over the kext's route, holding the destroys where `batches`, its timer
+// far past the test. Never freed, as Fixture.
+struct KextFixture {
+	TestRing &ring;
+	RgfxRingWriter &direct;
+	KextRing &kext;
+	RgfxRingWriter &writer;
+	RgfxIdSpace &ids;
+	RgfxSerializer &ser;
+
+	explicit KextFixture(bool batches)
+	    : ring(*new TestRing(0x8000)),
+	      direct(*new RgfxRingWriter(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID,
+	                                 TestRing::doorbell, nullptr)),
+	      kext(*new KextRing{direct}),
+	      writer(*new RgfxRingWriter(&KextRing::submit, &kext, 0x4000)),
+	      ids(*new RgfxIdSpace()), ser(*new RgfxSerializer(writer, ids))
+	{
+		ring.setConsumerIdle(1);
+		if (batches)
+			writer.setBatch(&KextRing::batch, 4096, 600ull * 1000000000);
+	}
+};
+
+// The messages waiting on `ring`, each its type and obj_id, in order.
+std::vector<std::pair<uint32_t, uint64_t>> wire(TestRing &ring)
+{
+	std::vector<std::pair<uint32_t, uint64_t>> out;
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	while (ring.next(&h, &bytes)) {
+		uint64_t obj = 0;
+		if (bytes.size() >= sizeof(h) + sizeof(obj))
+			std::memcpy(&obj, bytes.data() + sizeof(h), sizeof(obj));
+		out.emplace_back(h.type, obj);
+	}
+	return out;
+}
+
+// What the guest reads around destroys and what the host is sent, through a route that holds
+// them or one that posts each.
+struct HeldRun {
+	std::vector<uint64_t> answers;
+	std::vector<std::pair<uint32_t, uint64_t>> sent;
+	bool heldUntilTheCreate = false;
+};
+
+HeldRun heldDestroysRun(bool batches)
+{
+	KextFixture fx(batches);
+	HeldRun run;
+	@autoreleasepool {
+		RgfxHeap *heap = [RgfxHeap heapWithDescriptor:heapDescriptor(MTLStorageModePrivate,
+		                                                             MTLHeapTypeAutomatic)
+		                                       device:nil
+		                                   serializer:&fx.ser];
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:64
+		                                                      height:64
+		                                                   mipmapped:NO];
+		td.storageMode = MTLStorageModePrivate;
+		auto heapAnswers = [&] {
+			run.answers.push_back(heap.usedSize);
+			run.answers.push_back(heap.currentAllocatedSize);
+			run.answers.push_back([heap maxAvailableSizeWithAlignment:256]);
+		};
+		heapAnswers();
+		@autoreleasepool {
+			id<MTLBuffer> a = [heap newBufferWithLength:0x10000
+			                                    options:MTLResourceStorageModePrivate];
+			id<MTLTexture> t = [RgfxTexture textureWithDescriptor:td
+			                                                 heap:RGFX_OBJ_NONE
+			                                           heapOffset:0
+			                                               device:nil
+			                                           serializer:&fx.ser];
+			CHECK(a != nil && t != nil);
+			heapAnswers();
+			run.answers.push_back(a.gpuAddress);
+			run.answers.push_back(t.gpuResourceID._impl);
+			run.sent = wire(fx.ring);
+		}
+		// Let go: what they lay over is back at once, whether their destroys are held or not.
+		heapAnswers();
+		const auto released = wire(fx.ring);
+		run.heldUntilTheCreate = released.empty();
+		run.sent.insert(run.sent.end(), released.begin(), released.end());
+		// Made again over the same bytes and id, created after the destroys.
+		id<MTLBuffer> b = [heap newBufferWithLength:0x10000 options:MTLResourceStorageModePrivate];
+		id<MTLTexture> u = [RgfxTexture textureWithDescriptor:td
+		                                                 heap:RGFX_OBJ_NONE
+		                                           heapOffset:0
+		                                               device:nil
+		                                           serializer:&fx.ser];
+		CHECK(b != nil && u != nil);
+		heapAnswers();
+		run.answers.push_back(b.gpuAddress);
+		run.answers.push_back(u.gpuResourceID._impl);
+		const auto made = wire(fx.ring);
+		run.sent.insert(run.sent.end(), made.begin(), made.end());
+	}
+	return run;
+}
+
+// Destroys held to go together (RgfxRingWriter::postLater) change nothing the guest reads or the
+// host is sent: a heap's usedSize, currentAllocatedSize and maxAvailableSize drop at the release,
+// and a buffer and a texture made after it take the same bytes and resource id, created after the
+// destroys on the ring, as where each destroy is posted at its release. A residency set keeps its
+// allocations, so no destroy is held while it counts them.
+void test_held_destroys_change_nothing_seen()
+{
+	const HeldRun posted = heldDestroysRun(false);
+	const HeldRun held = heldDestroysRun(true);
+	CHECK(!posted.heldUntilTheCreate && held.heldUntilTheCreate);
+	CHECK(held.answers == posted.answers);
+	// The ids differ by fixture (each its own id space): the order of types on the wire, and
+	// each destroy's place against the creates, are the same.
+	CHECK(held.sent.size() == posted.sent.size());
+	for (size_t i = 0; i < held.sent.size() && i < posted.sent.size(); i++)
+		CHECK(held.sent[i].first == posted.sent[i].first);
+	// The bytes and the id are taken again.
+	CHECK(posted.answers.size() == 16);
+	CHECK(posted.answers[6] == posted.answers[14] && posted.answers[7] == posted.answers[15]);
+	CHECK(posted.answers[0] == posted.answers[8] && posted.answers[3] == posted.answers[11]);
+}
+
+// A texture over an IOSurface goes from the host at once, behind the destroys held before it: a
+// present of the surface waits for its destroy (RgfxResource's rgfxDestroysAtOnce).
+void test_surface_texture_destroys_go_at_once()
+{
+	KextFixture fx(true);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x400000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	uint64_t held = 0, over = 0;
+	@autoreleasepool {
+		NSDictionary *props = @{
+			(id)kIOSurfaceWidth : @16,
+			(id)kIOSurfaceHeight : @16,
+			(id)kIOSurfaceBytesPerElement : @4,
+			(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+		};
+		IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+		CHECK(surface != nullptr);
+		MTLTextureDescriptor *d =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		d.storageMode = MTLStorageModeShared;
+		RgfxIOSurfaceTexture *t = [RgfxIOSurfaceTexture textureWithDescriptor:d
+		                                                           iosurface:surface
+		                                                               plane:0
+		                                                              region:&region
+		                                                              device:nil
+		                                                          serializer:&fx.ser];
+		CHECK(t != nil && [t rgfxDestroysAtOnce]);
+		over = [(RgfxResource *)t rgfxObjId];
+		@autoreleasepool {
+			id<MTLBuffer> b = [RgfxBuffer bufferWithLength:4096 options:0 device:nil
+			                                    serializer:&fx.ser];
+			CHECK(b != nil && ![(RgfxResource *)b rgfxDestroysAtOnce]);
+			held = [(RgfxResource *)b rgfxObjId];
+		}
+		drainRing(fx.ring);
+		t = nil;
+		CFRelease(surface);
+	}
+	const auto sent = wire(fx.ring);
+	const auto at = [&](uint64_t obj) {
+		for (size_t i = 0; i < sent.size(); i++)
+			if (sent[i] == std::make_pair(uint32_t{RGFX_CMD_OBJECT_DESTROY}, obj))
+				return static_cast<long>(i);
+		return -1L;
+	};
+	CHECK(at(held) >= 0 && at(over) > at(held));
+}
+
 void rgfxResourceTests()
 {
 	test_heap_answers();
@@ -1492,4 +1702,6 @@ void rgfxResourceTests()
 	test_state_cache_threads();
 	test_state_labels();
 	test_shared_event_answers();
+	test_held_destroys_change_nothing_seen();
+	test_surface_texture_destroys_go_at_once();
 }

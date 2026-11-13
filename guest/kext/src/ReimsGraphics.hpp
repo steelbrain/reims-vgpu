@@ -296,6 +296,12 @@ public:
 	void setReleaseAnswer(OSObject *target, ReleaseAnswerHook hook);
 	IOReturn postReleases(const RgfxBlockRelease *releases, UInt32 count,
 	                      UInt64 *const *waiterSeqnos, UInt32 *posted);
+	// `count` messages of `type`, each `size` bytes at `messages` back to back, which no thread
+	// waits for: on the control ring in order as postReleases puts its releases (each one's seqno
+	// into *waiterSeqnos[i] where `waiterSeqnos` is not null), *posted those posted. A process's
+	// destroys in one call (kRgfxAccelMethodSubmitBatch) and the block releases go so.
+	IOReturn postRun(UInt32 type, const void *messages, UInt32 size, UInt32 count,
+	                 UInt64 *const *waiterSeqnos, UInt32 *posted);
 	// A lifecycle message (a CONTEXT_CLOSE) no thread waits for here, its COMPLETE handed to the
 	// setReleaseAnswer hook: as postLifecycle with `replyType` 0, but it writes the seqno into
 	// *waiterSeqno before the message is published, so the answer, however soon it comes, finds

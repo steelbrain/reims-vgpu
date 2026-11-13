@@ -60,6 +60,18 @@ int main()
 	check(!rgfxSubmitRoutesQueueDestroy(RGFX_CMD_QUEUE_CREATE), "QUEUE_CREATE does not route");
 	check(!rgfxSubmitRoutesQueueDestroy(RGFX_CMD_BLOCK_RELEASE), "BLOCK_RELEASE does not route");
 
+	// SubmitBatch takes destroys alone: a message no one waits for, which names no block and
+	// makes nothing, so the batch needs neither answers, pins nor destroys behind it. Every
+	// other type, accepted by Submit or not, goes one call at a time.
+	check(rgfxSubmitBatchAdmitted(RGFX_CMD_OBJECT_DESTROY), "SubmitBatch takes OBJECT_DESTROY");
+	check(rgfxSubmitAdmitted(RGFX_CMD_OBJECT_DESTROY) && !rgfxSubmitMakes(RGFX_CMD_OBJECT_DESTROY),
+	      "a batched destroy is one Submit takes, and makes nothing");
+	for (uint32_t type = 0; type <= RGFX_CMD_CONTEXT_CLOSE + 64; type++) {
+		if (type == RGFX_CMD_OBJECT_DESTROY)
+			continue;
+		check(!rgfxSubmitBatchAdmitted(type), "SubmitBatch takes no other type");
+	}
+
 	// Which accepted types make an object a destroy then drops: every type of the accepted
 	// range is decided here, so a new wire type has to be placed.
 	const uint32_t makes[] = {

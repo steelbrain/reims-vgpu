@@ -1604,7 +1604,7 @@ bool RgfxSerializer::postDestroy(RgfxObjId obj_id)
 	return m_control.tryPost(RGFX_CMD_OBJECT_DESTROY, &msg, sizeof(msg), nullptr);
 }
 
-bool RgfxSerializer::destroy(RgfxObjId obj_id, std::function<void()> after)
+bool RgfxSerializer::destroy(RgfxObjId obj_id, std::function<void()> after, bool atOnce)
 {
 	{
 		std::lock_guard<std::mutex> hold(m_libraryKeysLock);
@@ -1613,6 +1613,21 @@ bool RgfxSerializer::destroy(RgfxObjId obj_id, std::function<void()> after)
 	// A waiting record may name the object (a pipeline or a buffer the app lets go after
 	// encoding it), so the records go first.
 	flushIcbWrites();
+	// Held to go with others, before anything the process posts after it: what it lay over goes
+	// back now, as anything that takes it again is posted after the destroy.
+	if (m_control.batches()) {
+		RgfxObjectDestroy msg = {};
+		msg.obj_id = obj_id;
+		const uint32_t type = RGFX_CMD_OBJECT_DESTROY;
+		const bool posted = atOnce ? m_control.tryPost(type, &msg, sizeof(msg), nullptr)
+		                           : m_control.postLater(type, &msg, sizeof(msg));
+		if (posted) {
+			if (after)
+				after();
+			return true;
+		}
+		// Refused at once (the held before it were too): it waits as below.
+	}
 	// With none waiting, it goes at once; else behind those waiting, which go first.
 	const bool behind = m_destroysWaiting.load(std::memory_order_acquire);
 	if (!behind && postDestroy(obj_id)) {

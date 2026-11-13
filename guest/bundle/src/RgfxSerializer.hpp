@@ -719,7 +719,14 @@ public:
 	/// destroy waiting before them, and go out at the next destroy() or postWaitingDestroys(), so
 	/// nothing reuses what the object lay over until the host has dropped it. Returns whether
 	/// this destroy reached the ring now.
-	bool destroy(RgfxObjId obj_id, std::function<void()> after = {});
+	///
+	/// Where the route batches (RgfxRingWriter::batches), the destroy is held to go with others in
+	/// one call instead (RgfxRingWriter::postLater), unless `atOnce`, and `after` runs at once:
+	/// whatever reuses what it gives back, a create or a block's free, is posted after the held
+	/// destroys, so the host still drops the object first. A destroy the host orders other
+	/// contexts' messages by goes `atOnce`: a texture over an IOSurface, which a present of the
+	/// surface waits for (docs/graphics-kext/design.md, "Destroys go together").
+	bool destroy(RgfxObjId obj_id, std::function<void()> after = {}, bool atOnce = false);
 
 	/// Posts the destroys waiting (destroy()), in the order they were made, each one's `after`
 	/// run once it is on the ring, until one is refused again. One load where none waits.

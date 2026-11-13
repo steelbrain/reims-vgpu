@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 #include "RgfxArgumentLayout.hpp"
@@ -2399,6 +2400,177 @@ void test_forwarded_lifecycle()
 	CHECK(!reader.awaitingReflection(8));
 }
 
+// The kext's two routes, one call log: each Submit (one message) and each SubmitBatch (its
+// messages), in the order made, with the batch's calls apart. `batchTakes` caps how many of a
+// batch's messages the "kext" posts (its ring stayed full past them).
+struct KextLog {
+	struct Call {
+		bool batch;
+		std::vector<RgfxObjId> objs; // each message's obj_id (the destroy's, the create's)
+		std::vector<uint32_t> types;
+	};
+	// A timer posts from a thread of its own: the calls are made and read under `lock`.
+	std::mutex lock;
+	std::vector<Call> calls;
+	uint32_t batchTakes = UINT32_MAX;
+	uint64_t nextSeqno = 1;
+
+	static RgfxObjId objOf(const uint8_t *m)
+	{
+		RgfxObjId obj = 0;
+		std::memcpy(&obj, m + sizeof(RgfxMsgHeader), sizeof(obj));
+		return obj;
+	}
+	// Every obj_id the "kext" posted, in ring order.
+	std::vector<RgfxObjId> ring()
+	{
+		std::lock_guard<std::mutex> hold(lock);
+		std::vector<RgfxObjId> out;
+		for (const Call &c : calls)
+			out.insert(out.end(), c.objs.begin(), c.objs.end());
+		return out;
+	}
+};
+
+bool kextSubmit(void *context, const void *message, uint32_t size, uint64_t *out_seqno,
+                uint32_t *out_status)
+{
+	KextLog *log = static_cast<KextLog *>(context);
+	std::lock_guard<std::mutex> hold(log->lock);
+	RgfxMsgHeader header;
+	std::memcpy(&header, message, sizeof(header));
+	log->calls.push_back({false, {KextLog::objOf(static_cast<const uint8_t *>(message))},
+	                      {header.type}});
+	*out_seqno = log->nextSeqno++;
+	if (out_status)
+		*out_status = kRgfxNoAnswer;
+	return true;
+}
+
+uint32_t kextSubmitBatch(void *context, const void *messages, uint32_t bytes)
+{
+	KextLog *log = static_cast<KextLog *>(context);
+	std::lock_guard<std::mutex> hold(log->lock);
+	const uint8_t *m = static_cast<const uint8_t *>(messages);
+	KextLog::Call call = {true, {}, {}};
+	uint32_t taken = 0;
+	for (uint32_t at = 0; at < bytes && taken < log->batchTakes; taken++) {
+		RgfxMsgHeader header;
+		std::memcpy(&header, m + at, sizeof(header));
+		CHECK(header.size == sizeof(RgfxObjectDestroy) && header.seqno == 0);
+		call.objs.push_back(KextLog::objOf(m + at));
+		call.types.push_back(header.type);
+		at += header.size;
+		log->nextSeqno++;
+	}
+	if (taken != 0)
+		log->calls.push_back(call);
+	return taken;
+}
+
+// Destroys held to go together (RgfxRingWriter::postLater): each `after` runs at the destroy, as
+// it did once the destroy was posted, and the destroys reach the "kext" in their order before
+// anything the process posts after them, at most a batch's bytes a call, or once the timer fires;
+// a destroy the host orders other contexts by goes at once; a batch the kext takes only in part
+// keeps the rest held, first, and the writer posts nothing past them until they go.
+void test_held_destroys()
+{
+	// A timer far past the test, so only the steps below post; the timer's own step has its own.
+	constexpr uint64_t kNever = 600ull * 1000000000;
+	KextLog log;
+	RgfxRingWriter writer(&kextSubmit, &log, 4096);
+	CHECK(!writer.batches());
+	writer.setBatch(&kextSubmitBatch, 4096, kNever);
+	CHECK(writer.batches());
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+
+	// Held, `after` run at once, nothing posted yet.
+	int afters = 0;
+	CHECK(ser.destroy(0x101, [&afters] { afters++; }));
+	CHECK(ser.destroy(0x102, [&afters] { afters++; }));
+	CHECK(afters == 2);
+	CHECK(log.calls.empty());
+	// A create goes after them: one batch of both, in order, then the create alone.
+	RgfxCreated ev = ser.createEvent();
+	CHECK(ev.posted);
+	CHECK(log.calls.size() == 2);
+	CHECK(log.calls[0].batch && log.calls[0].objs == std::vector<RgfxObjId>({0x101, 0x102}));
+	CHECK(log.calls[0].types == std::vector<uint32_t>(2, RGFX_CMD_OBJECT_DESTROY));
+	CHECK(!log.calls[1].batch && log.calls[1].objs[0] == ev.obj_id);
+	CHECK(writer.flushLater());
+	CHECK(log.calls.size() == 2);
+
+	// 170 destroys fill a 4096-byte call (24 bytes each): the 171st sends them, and waits.
+	log.calls.clear();
+	for (RgfxObjId i = 0; i < 171; i++)
+		CHECK(ser.destroy(0x1000 + i));
+	CHECK(log.calls.size() == 1 && log.calls[0].batch && log.calls[0].objs.size() == 170);
+	CHECK(log.calls[0].objs.front() == 0x1000 && log.calls[0].objs.back() == 0x1000 + 169);
+	CHECK(writer.flushLater());
+	CHECK(log.calls.size() == 2 && log.calls[1].objs == std::vector<RgfxObjId>({0x1000 + 170}));
+
+	// The timer posts what is held, with no post behind it: kRgfxLaterNs after the first held.
+	KextLog timed;
+	RgfxRingWriter timedWriter(&kextSubmit, &timed, 4096);
+	timedWriter.setBatch(&kextSubmitBatch, 4096);
+	RgfxSerializer tser(timedWriter, ids);
+	const auto from = std::chrono::steady_clock::now();
+	CHECK(tser.destroy(0x2001));
+	CHECK(tser.destroy(0x2002));
+	for (int i = 0; i < 20000 && timed.ring().size() < 2; i++)
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	CHECK(std::chrono::steady_clock::now() - from >= std::chrono::nanoseconds(kRgfxLaterNs));
+	CHECK(timed.ring() == std::vector<RgfxObjId>({0x2001, 0x2002}));
+
+	// At once: the held first, then the destroy alone, its `after` run.
+	log.calls.clear();
+	CHECK(ser.destroy(0x3001));
+	afters = 0;
+	CHECK(ser.destroy(0x3002, [&afters] { afters++; }, /*atOnce*/ true));
+	CHECK(afters == 1);
+	CHECK(log.calls.size() == 2 && log.calls[0].batch && log.calls[0].objs[0] == 0x3001);
+	CHECK(!log.calls[1].batch && log.calls[1].objs[0] == 0x3002);
+
+	// The kext takes one of three: the other two stay held, first, and the create behind them is
+	// refused, posting nothing; once the kext takes them, they go, then what follows.
+	log.calls.clear();
+	for (RgfxObjId i = 0; i < 3; i++)
+		CHECK(ser.destroy(0x4000 + i));
+	log.batchTakes = 1;
+	CHECK(!ser.createEvent().posted);
+	CHECK(log.ring() == std::vector<RgfxObjId>({0x4000}));
+	CHECK(!writer.flushLater());
+	CHECK(log.ring() == std::vector<RgfxObjId>({0x4000, 0x4001}));
+	log.batchTakes = UINT32_MAX;
+	RgfxCreated after = ser.createEvent();
+	CHECK(after.posted);
+	CHECK(log.ring() == std::vector<RgfxObjId>({0x4000, 0x4001, 0x4002, after.obj_id}));
+
+	// A writer that does not batch posts each destroy at once, as before.
+	KextLog plain;
+	RgfxRingWriter direct(&kextSubmit, &plain, 4096);
+	RgfxSerializer pser(direct, ids);
+	afters = 0;
+	CHECK(pser.destroy(0x5001, [&afters] { afters++; }));
+	CHECK(afters == 1 && plain.calls.size() == 1 && !plain.calls[0].batch);
+
+	// The writer's end posts what it holds.
+	KextLog ending;
+	{
+		RgfxRingWriter going(&kextSubmit, &ending, 4096);
+		going.setBatch(&kextSubmitBatch, 4096, 1000000);
+		RgfxObjectDestroy d = {};
+		d.obj_id = 0x6001;
+		CHECK(going.postLater(RGFX_CMD_OBJECT_DESTROY, &d, sizeof(d)));
+		CHECK(ending.calls.empty());
+	}
+	CHECK(ending.ring() == std::vector<RgfxObjId>({0x6001}));
+	// Its timer, which outlives it, then finds it gone and posts nothing more.
+	std::this_thread::sleep_for(std::chrono::milliseconds(3));
+	CHECK(ending.calls.size() == 1);
+}
+
 // A synthetic .metallib: its header (the bitcode section at 0x60, 16 bytes), a stand-in for the
 // function list, the bitcode, and a tail.
 std::vector<uint8_t> syntheticMetallib()
@@ -3691,6 +3863,7 @@ int main()
 	test_render_pass_sample_positions();
 	test_render_pass_visibility();
 	test_forwarded_lifecycle();
+	test_held_destroys();
 	test_library_key();
 	test_library_key_of_file();
 	test_keyed_library_messages();

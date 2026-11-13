@@ -58,11 +58,26 @@ constexpr uint32_t kLifecycleMessageMax = RGFX_CONTROL_RING_DATA_SIZE / 2;
 // kext until the process takes it (rgfxKextAwaitAnswer, rgfxKextDrainAnswers), one take at a
 // time (`takeLock`), so a thread that waits for an answer another is handing on waits for that.
 struct RgfxKextLink {
-	io_connect_t conn;
-	RgfxReplyReader *reader;
+	io_connect_t conn = IO_OBJECT_NULL;
+	RgfxReplyReader *reader = nullptr;
 	std::mutex takeLock;
 	std::atomic<uint32_t> deferredPosts{0};
+	// The control ring, whose held destroys (RgfxRingWriter::postLater) go before any other call
+	// of the process's into the kext (rgfxKextConn); null until it is made.
+	RgfxRingWriter *control = nullptr;
 };
+
+// The connection of the link at `context`, for a call into the kext, once the destroys the
+// control ring holds are posted: every call of the process's comes after them, as each of its
+// posts does (RgfxRingWriter::postLater). The kext's answer to a call may hang on what a held
+// destroy lets go of (a block's free, a queue's close), and the host's on the order of the ring.
+io_connect_t rgfxKextConn(void *context)
+{
+	RgfxKextLink *link = static_cast<RgfxKextLink *>(context);
+	if (link->control != nullptr)
+		link->control->flushLater();
+	return link->conn;
+}
 
 // The answers to deferred creates one take carries at most: an inline struct out (4 KiB).
 constexpr size_t kAnswersMax = 4096;
@@ -79,8 +94,8 @@ uint32_t rgfxKextTakeAnswers(RgfxKextLink *link, uint64_t waitFor)
 	size_t size = sizeof(answers);
 	uint64_t count = 0;
 	uint32_t outCount = 1;
-	if (IOConnectCallMethod(link->conn, kRgfxAccelMethodTakeAnswers, &waitFor, 1, nullptr, 0,
-	                        &count, &outCount, answers, &size) != KERN_SUCCESS)
+	if (IOConnectCallMethod(rgfxKextConn(link), kRgfxAccelMethodTakeAnswers, &waitFor, 1, nullptr,
+	                        0, &count, &outCount, answers, &size) != KERN_SUCCESS)
 		return 0;
 	for (size_t at = 0; at + sizeof(RgfxMsgHeader) <= size;) {
 		RgfxMsgHeader header = {};
@@ -223,12 +238,26 @@ bool rgfxKextSubmit(void *context, const void *message, uint32_t size, uint64_t 
 	return true;
 }
 
+// The control ring's batch (RgfxRingWriter::setBatch): the destroys it held, posted in one call
+// (kRgfxAccelMethodSubmitBatch), which they go before: how many the kext posted, from the first.
+uint32_t rgfxKextSubmitBatch(void *context, const void *messages, uint32_t bytes)
+{
+	RgfxKextLink *link = static_cast<RgfxKextLink *>(context);
+	uint64_t posted = 0;
+	uint32_t outCount = 1;
+	if (IOConnectCallMethod(link->conn, kRgfxAccelMethodSubmitBatch, nullptr, 0, messages, bytes,
+	                        &posted, &outCount, nullptr, nullptr) != KERN_SUCCESS ||
+	    outCount != 1)
+		return 0;
+	return static_cast<uint32_t>(posted);
+}
+
 // The serializer's queries: the kext posts the message on the control ring, stamping its seqno,
-// and hands back the device's answer, whole. `context` is the user client's connect.
+// and hands back the device's answer, whole. `context` is the kext link (rgfxKextConn).
 bool rgfxKextAsk(void *context, const void *message, uint32_t size, void *reply,
                  uint32_t capacity, uint32_t *reply_size)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	uint64_t seqno = 0;
 	uint32_t outCount = 1;
 	size_t replySize = capacity;
@@ -239,10 +268,10 @@ bool rgfxKextAsk(void *context, const void *message, uint32_t size, void *reply,
 	return true;
 }
 
-// The kext's blocks, as RgfxRegion's block source; `context` is the user client's connect.
+// The kext's blocks, as RgfxRegion's block source; `context` is the kext link (rgfxKextConn).
 bool rgfxKextAlloc(void *context, uint64_t size, uint64_t align, uint64_t *offset)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	uint64_t in[2] = {size, align};
 	uint32_t outCount = 1;
 	return IOConnectCallScalarMethod(conn, kRgfxAccelMethodAlloc, in, 2, offset, &outCount) ==
@@ -255,7 +284,7 @@ bool rgfxKextAlloc(void *context, uint64_t size, uint64_t align, uint64_t *offse
 bool rgfxKextAllocWriteCombined(void *context, uint64_t size, uint64_t align,
                                 uint64_t writeCombinedFrom, uint64_t *offset)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	uint64_t in[3] = {size, align, writeCombinedFrom};
 	uint32_t outCount = 1;
 	return IOConnectCallScalarMethod(conn, kRgfxAccelMethodAlloc, in, 3, offset, &outCount) ==
@@ -274,10 +303,10 @@ bool rgfxRegionReclaim(void *context)
 }
 
 // The kext's chunks of texture resource ids, as RgfxIdSpace's chunk source; `context` is the
-// user client's connect. False once every chunk of the guest's pool is held.
+// kext link (rgfxKextConn). False once every chunk of the guest's pool is held.
 bool rgfxKextResourceIds(void *context, uint64_t *first_id, uint64_t *ids)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	uint64_t out[2] = {};
 	uint32_t outCount = 2;
 	if (IOConnectCallScalarMethod(conn, kRgfxAccelMethodResourceIds, nullptr, 0, out,
@@ -291,11 +320,11 @@ bool rgfxKextResourceIds(void *context, uint64_t *first_id, uint64_t *ids)
 
 // The completion thread's wait: the kext returns once a completion ring of the process's holds
 // records its last pass did not see (the wake count differs from `last`), or at once where it
-// already does. `context` is the user client's connect.
+// already does. `context` is the kext link (rgfxKextConn).
 RgfxCompletionThread::WaitResult rgfxKextWaitCompletions(void *context, uint64_t last,
                                                          uint64_t *now)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	uint32_t outCount = 1;
 	kern_return_t kr =
 	    IOConnectCallScalarMethod(conn, kRgfxAccelMethodWaitCompletions, &last, 1, now, &outCount);
@@ -312,7 +341,7 @@ RgfxCompletionThread::WaitResult rgfxKextWaitCompletions(void *context, uint64_t
 
 void rgfxKextRelease(void *context, uint64_t offset)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	IOConnectCallScalarMethod(conn, kRgfxAccelMethodFree, &offset, 1, nullptr, nullptr);
 }
 
@@ -321,7 +350,7 @@ void rgfxKextRelease(void *context, uint64_t offset)
 bool rgfxKextSurfaceBlock(void *context, const void *plane, uint64_t length, uint64_t size,
                           uint64_t *offset, uint64_t *serial, bool *fresh)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	uint64_t in[3] = {reinterpret_cast<uintptr_t>(plane), length, size};
 	uint64_t out[4] = {};
 	uint32_t outCount = 4;
@@ -383,7 +412,7 @@ RgfxRegion::PagesAnswer rgfxKextSurfacePagesListing(void *context, const void *b
                                                     uint64_t *offset, uint64_t *serial,
                                                     bool *fresh, bool *cached)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	uint64_t in[6] = {reinterpret_cast<uintptr_t>(base), length, size, 1, surfaceId,
 	                  cacheable ? 1u : 0u};
 	uint64_t out[5] = {};
@@ -456,7 +485,7 @@ RgfxRegion::PagesAnswer rgfxKextSurfacePagesCarrying(void *context, const void *
 bool rgfxKextPagesBlock(void *context, const void *address, uint64_t length, bool writable,
                         uint64_t *offset, uint64_t *size)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	uint64_t in[3] = {reinterpret_cast<uintptr_t>(address), length, writable ? 1u : 0u};
 	uint64_t out[2] = {};
 	uint32_t outCount = 2;
@@ -475,7 +504,7 @@ bool rgfxKextPagesBlock(void *context, const void *address, uint64_t length, boo
 bool rgfxKextPagesChunked(void *context, uint64_t length, uint8_t **bytes, uint64_t *offset,
                           uint64_t *size)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	uint64_t out[3] = {};
 	uint32_t outCount = 3;
 	kern_return_t kr =
@@ -508,7 +537,7 @@ void rgfxUnmapPages(void *, uint8_t *bytes, uint64_t size)
 
 void rgfxKextSurfaceRelease(void *context, uint64_t offset)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	IOConnectCallScalarMethod(conn, kRgfxAccelMethodSurfaceBlockRelease, &offset, 1, nullptr,
 	                          nullptr);
 }
@@ -519,7 +548,7 @@ void rgfxKextSurfaceRelease(void *context, uint64_t offset)
 void rgfxKextSurfaceWrites(void *context, uint64_t queue, uint64_t seqno, const uint64_t *writes,
                            uint32_t count)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	std::vector<uint64_t> words;
 	words.reserve(3 + 2 * static_cast<size_t>(count));
 	words.push_back(queue);
@@ -538,7 +567,7 @@ void rgfxKextSurfaceWrites(void *context, uint64_t queue, uint64_t seqno, const 
 
 void rgfxKextSurfaceRetire(void *context, uint64_t queue, uint64_t seqno)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	const uint64_t in[2] = {queue, seqno};
 	IOConnectCallScalarMethod(conn, kRgfxAccelMethodSurfaceRetire, in, 2, nullptr, nullptr);
 }
@@ -547,7 +576,7 @@ void rgfxKextSurfaceRetire(void *context, uint64_t queue, uint64_t seqno)
 // its destroy on the control ring, behind the process's messages before it.
 void rgfxKextQueueCloser(void *context, RgfxObjId objId)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	uint64_t in = objId;
 	IOConnectCallScalarMethod(conn, kRgfxAccelMethodQueueDestroy, &in, 1, nullptr, nullptr);
 }
@@ -556,7 +585,7 @@ void rgfxKextQueueCloser(void *context, RgfxObjId objId)
 // returns once the device has its rings.
 bool rgfxKextQueueOpener(void *context, const RgfxQueueCreate &q)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	uint64_t in[6] = {q.obj_id, q.submit_offset, q.complete_offset, q.submit_data_size,
 	                  q.complete_data_size, q.priority};
 	uint64_t status = ~0ull;
@@ -595,6 +624,8 @@ struct RgfxEventShareLink {
 	// The device's own connection, which answers whether a port it is handed is a shared event's
 	// port of the kext's (rgfxKextTakeEvent).
 	io_connect_t connection = IO_OBJECT_NULL;
+	// The device's link, whose held destroys go before the port's calls (rgfxKextConn).
+	RgfxKextLink *kext = nullptr;
 	uint64_t context = 0;
 	__weak RgfxMetalDevice *device = nil;
 };
@@ -618,6 +649,7 @@ uint32_t rgfxKextShareEvent(void *context, RgfxObjId event)
 	const uint64_t in[3] = {link->context, event, listen};
 	uint64_t status = ~0ull;
 	uint32_t outCount = 1;
+	rgfxKextConn(link->kext);
 	kr = IOConnectCallScalarMethod(port, kRgfxSharedEventMethodExport, in, 3, &status, &outCount);
 	if (kr != KERN_SUCCESS || outCount != 1 || status != RGFX_STATUS_OK) {
 		static char site;
@@ -650,6 +682,7 @@ bool rgfxKextTakeEvent(void *context, uint32_t port, RgfxObjId event, uint64_t *
 	const uint64_t in[3] = {link->context, event, listen};
 	uint64_t out[2] = {~0ull, 0};
 	uint32_t outCount = 2;
+	rgfxKextConn(link->kext);
 	kern_return_t kr =
 	    IOConnectCallScalarMethod(port, kRgfxSharedEventMethodImport, in, 3, out, &outCount);
 	if (kr != KERN_SUCCESS || outCount != 2 || out[0] != RGFX_STATUS_OK)
@@ -862,7 +895,10 @@ RGFX_LOG_UNRECOGNIZED
 	_mapSize = mapSize;
 	volatile uint8_t *base = reinterpret_cast<volatile uint8_t *>(addr);
 	_ids.setBases(ctx[1], ctx[2], ctx[5]);
-	void *connContext = reinterpret_cast<void *>(static_cast<uintptr_t>(_conn));
+	// The kext's calls go through the link (rgfxKextConn), after the destroys the control ring
+	// holds once it is made.
+	_link.conn = _conn;
+	void *connContext = &_link;
 	// The kext's chunks are of RGFX_RESOURCE_ID_SMALL_CHUNK ids where it took
 	// RGFX_FEATURE_SMALL_ID_CHUNKS (RgfxUserClientABI.hpp, kRgfxAccelMethodResourceIds).
 	_ids.setResourceIdSource(&rgfxKextResourceIds, connContext,
@@ -899,9 +935,14 @@ RGFX_LOG_UNRECOGNIZED
 	// The object lifecycle goes to the kext, which posts it on the control ring and hands back
 	// the replies (a pipeline's reflection).
 	_replyReader = new RgfxReplyReader();
-	_link.conn = _conn;
 	_link.reader = _replyReader;
 	_controlRing = std::make_unique<RgfxRingWriter>(&rgfxKextSubmit, &_link, kLifecycleMessageMax);
+	// The process's destroys go together, where the kext takes them in one call
+	// (RgfxRingWriter::postLater).
+	if ((_caps.kextFeatures() & kRgfxKextFeatureSubmitBatch) != 0) {
+		_controlRing->setBatch(&rgfxKextSubmitBatch, kRgfxSubmitBatchBytes);
+		_link.control = _controlRing.get();
+	}
 	// A pipeline create equal to one the device accepted is posted without waiting, where the
 	// kext keeps its answer for later (RgfxKnownPipelines.hpp).
 	if (rgfxKextDefersAnswers(_caps)) {
@@ -934,6 +975,7 @@ RGFX_LOG_UNRECOGNIZED
 	    (_caps.features() & RGFX_FEATURE_SHARED_EVENT_NAMES) != 0) {
 		_shareLink.accelerator = port;
 		_shareLink.connection = _conn;
+		_shareLink.kext = &_link;
 		_shareLink.context = ctx[0];
 		_shareLink.device = self;
 		_serializer->setEventSharer(&rgfxKextShareEvent, &rgfxKextTakeEvent, &_shareLink);
@@ -1046,8 +1088,8 @@ RGFX_LOG_UNRECOGNIZED
 	uint64_t in[2] = {surfaceId, buffer};
 	uint64_t out[5] = {};
 	uint32_t outCount = 5;
-	kern_return_t kr =
-	    IOConnectCallScalarMethod(_conn, kRgfxAccelMethodSurfaceScanout, in, 2, out, &outCount);
+	kern_return_t kr = IOConnectCallScalarMethod(
+	    rgfxKextConn(&_link), kRgfxAccelMethodSurfaceScanout, in, 2, out, &outCount);
 	static std::atomic<int> logged{0};
 	if (logged.fetch_add(1) < 8) {
 		NSLog(@"RGFX: newTextureWithSurface:0x%lx buffer:%lu -> 0x%x: offset 0x%llx, %llu bytes, "
@@ -1140,7 +1182,8 @@ RGFX_LOG_UNRECOGNIZED
 	if (_conn == IO_OBJECT_NULL)
 		return;
 	uint64_t scalar = ringId;
-	IOConnectCallScalarMethod(_conn, kRgfxAccelMethodDoorbell, &scalar, 1, nullptr, nullptr);
+	IOConnectCallScalarMethod(rgfxKextConn(&_link), kRgfxAccelMethodDoorbell, &scalar, 1, nullptr,
+	                          nullptr);
 }
 
 // --- identity ----------------------------------------------------------------

@@ -218,6 +218,8 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 	}
 	case kRgfxAccelMethodSubmit:
 		return submitMethod(a);
+	case kRgfxAccelMethodSubmitBatch:
+		return submitBatchMethod(a);
 	case kRgfxAccelMethodTakeAnswers:
 		return takeAnswersMethod(a);
 	case kRgfxAccelMethodWaitCompletions:
@@ -634,6 +636,67 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	return kIOReturnSuccess;
 }
 
+// kRgfxAccelMethodSubmitBatch (RgfxUserClientABI.hpp): the client's destroys of its own objects
+// onto the control ring in one call, each checked as submitMethod checks one, all before any is
+// posted, then posted in their order: the runs between its queues' destroys under one hold of the
+// ring each (RgfxAccelerator::postRun), and each queue's destroy routed as submitMethod routes it
+// (destroyQueueIfTracked) after the run before it. The count out says how many went: all of them,
+// but where a run met a ring that stayed full or a device that stopped.
+IOReturn RgfxAcceleratorUserClient::submitBatchMethod(IOExternalMethodArguments *a)
+{
+	IOLockLock(listLock);
+	const bool open = hasContext;
+	const UInt32 ctx = context;
+	IOLockUnlock(listLock);
+	// An inline struct in, in kernel memory already: a whole number of destroys.
+	constexpr UInt32 kSize = sizeof(RgfxObjectDestroy);
+	const UInt64 size = a->structureInputSize;
+	if (!open || a->scalarInputCount != 0 || a->scalarOutputCount != 1 ||
+	    a->structureInputDescriptor || !a->structureInput || size == 0 || size % kSize ||
+	    size > kRgfxSubmitBatchBytes)
+		return kIOReturnBadArgument;
+	const UInt8 *messages = static_cast<const UInt8 *>(a->structureInput);
+	const UInt32 count = static_cast<UInt32>(size / kSize);
+	auto objIdAt = [&](UInt32 i) {
+		UInt64 objId = 0;
+		memcpy(&objId, messages + static_cast<size_t>(i) * kSize + kObjIdOffset, sizeof(objId));
+		return objId;
+	};
+	for (UInt32 i = 0; i < count; i++) {
+		UInt32 type = 0;
+		memcpy(&type, messages + static_cast<size_t>(i) * kSize, sizeof(type));
+		if (!rgfxSubmitBatchAdmitted(type) || (objIdAt(i) >> RGFX_CONTEXT_OBJ_ID_SHIFT) != ctx)
+			return kIOReturnBadArgument;
+	}
+	UInt32 done = 0, from = 0;
+	IOReturn r = kIOReturnSuccess;
+	for (UInt32 i = 0; i <= count && r == kIOReturnSuccess; i++) {
+		if (i < count && !queueListed(objIdAt(i)))
+			continue;
+		UInt32 posted = 0;
+		if (i > from)
+			r = owner->postRun(RGFX_CMD_OBJECT_DESTROY,
+			                   messages + static_cast<size_t>(from) * kSize, kSize, i - from,
+			                   &posted);
+		done += posted;
+		if (r == kIOReturnSuccess && i < count) {
+			// A queue's, ended as Submit ends it; where another thread ended the queue since the
+			// look, posted as it is, as Submit posts it then.
+			if (!destroyQueueIfTracked(objIdAt(i))) {
+				UInt32 one = 0;
+				r = owner->postRun(RGFX_CMD_OBJECT_DESTROY,
+				                   messages + static_cast<size_t>(i) * kSize, kSize, 1, &one);
+				done += one;
+			} else {
+				done++;
+			}
+		}
+		from = i + 1;
+	}
+	a->scalarOutput[0] = done;
+	return kIOReturnSuccess;
+}
+
 // kRgfxAccelMethodTakeAnswers (RgfxAccelerator.hpp): the answers to the client's deferred
 // pipeline creates the device has given, after waiting for the one asked for. Always succeeds with
 // what it took, the answers' count out, so none is lost on a wait that timed out: the caller finds
@@ -666,17 +729,22 @@ bool RgfxAcceleratorUserClient::ownsQueue(UInt64 queue)
 	return owns;
 }
 
-bool RgfxAcceleratorUserClient::destroyQueueIfTracked(UInt64 objId)
+bool RgfxAcceleratorUserClient::queueListed(UInt64 objId)
 {
-	// The destroy of any other object (most of them, posted through submit) is told at once from
-	// the list: an id neither listed nor in the making is none of the client's queues, and
-	// waits for no create under the queue lock.
 	IOLockLock(listLock);
 	bool tracked = objId != 0 && objId == creatingQueue;
 	for (UInt32 i = 0; i < queueCount && !tracked; i++)
 		tracked = queues[i] == objId;
 	IOLockUnlock(listLock);
-	if (!tracked)
+	return tracked;
+}
+
+bool RgfxAcceleratorUserClient::destroyQueueIfTracked(UInt64 objId)
+{
+	// The destroy of any other object (most of them, posted through submit) is told at once from
+	// the list: an id neither listed nor in the making is none of the client's queues, and
+	// waits for no create under the queue lock.
+	if (!queueListed(objId))
 		return false;
 	bool found = false;
 	// The whole find, remove, unwatch and close under the queue lock, which QUEUE_CREATE watches

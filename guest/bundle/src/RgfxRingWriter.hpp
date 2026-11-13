@@ -76,6 +76,18 @@ typedef bool (*RgfxForwardShared)(void *context, const void *message, uint32_t s
 /// at `seqno`, and hands each on (to the process's lifecycle reader): false where none came.
 typedef bool (*RgfxAwaitAnswer)(void *context, uint64_t seqno);
 
+/// Hands `bytes` bytes of whole messages back to back (each header's `type` and `size` stamped),
+/// which no one waits for, to the kext in one call (the accelerator's SubmitBatch, which takes
+/// destroys alone): how many of them it posted, from the first, in their order. Fewer than all
+/// only where the kext refused them, as it does where its control ring stays full.
+typedef uint32_t (*RgfxForwardBatch)(void *context, const void *messages, uint32_t bytes);
+
+/// How long a message RgfxRingWriter::postLater() holds waits at most for others to go with it:
+/// a run of destroys an app lets go back to back takes tens of microseconds.
+constexpr uint64_t kRgfxLaterNs = 1000000;
+
+struct RgfxRingLater;
+
 class RgfxRingWriter {
 public:
 	/// A writer over the ring whose header is at `ring_base`, with a byte ring
@@ -90,7 +102,8 @@ public:
 	/// the largest message it takes (dataSize()).
 	RgfxRingWriter(RgfxForward forward, void *forward_context, uint32_t max_size);
 
-	/// Logs the room line once more where its posts slept since the last one (noteSleep).
+	/// Logs the room line once more where its posts slept since the last one (noteSleep), and
+	/// posts what postLater() holds.
 	~RgfxRingWriter();
 
 	/// Writes a message of `size` bytes (its payload in `message`, a multiple of
@@ -125,6 +138,27 @@ public:
 	/// Takes the answers the route keeps for the process's deferred creates, waiting for the one
 	/// at `seqno` (RgfxAwaitAnswer): false where the route keeps none.
 	bool awaitAnswer(uint64_t seqno);
+
+	/// Where a forwarding writer posts what postLater() holds (RgfxForwardBatch), called with the
+	/// forward's context, at most `max_bytes` a call, `later_ns` after the first held at most
+	/// (kRgfxLaterNs; a test's own). Set once, before the first post.
+	void setBatch(RgfxForwardBatch post, uint32_t max_bytes, uint64_t later_ns = kRgfxLaterNs);
+
+	/// Whether postLater() holds messages to go together (setBatch).
+	bool batches() const { return m_later != nullptr; }
+
+	/// Posts a message no one waits for (a destroy) together with others where the writer
+	/// batches (setBatch): held, to go in the order held before anything the writer posts after
+	/// it (each tryPost, tryPostKnown and tryPostShared posts the held first), at flushLater(),
+	/// once the held reach the batch's bytes, or setBatch's time after the first held. Else, or for
+	/// a message larger than a batch, posted as tryPost() posts it. True once held or posted. A
+	/// held message the route refuses stays held, first, and the writer posts nothing else until
+	/// it goes.
+	bool postLater(uint32_t type, const void *message, uint32_t size);
+
+	/// Posts what postLater() holds, in its order: whether none is held now. One atomic load
+	/// where none is.
+	bool flushLater();
 
 	/// Whether the route keeps answers for later (setDeferred), so a known pipeline create need
 	/// not wait.
@@ -196,6 +230,10 @@ private:
 	void noteSleep(std::chrono::steady_clock::time_point from, bool byRecord);
 	// The room line, with the counts `seen`.
 	void logSleeps(const RgfxRingRoomSleeps &seen) const;
+
+	// What postLater() holds, shared with its timer (setBatch's; null where the writer does not
+	// batch).
+	std::shared_ptr<RgfxRingLater> m_later;
 
 	std::shared_ptr<RgfxRingRoomEvents> m_room; // setRoomEvents'
 	// The posts' sleeps for room, under m_sleepsLock, logged at the first, at most every second

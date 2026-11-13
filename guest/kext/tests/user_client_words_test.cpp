@@ -131,6 +131,7 @@ static const Selector kSelectors[] = {
 	{"kRgfxAccelMethodDoorbell", kRgfxAccelMethodDoorbell, false},
 	{"kRgfxAccelMethodFeatures", kRgfxAccelMethodFeatures, false},
 	{"kRgfxAccelMethodPagesBlock", kRgfxAccelMethodPagesBlock, false},
+	{"kRgfxAccelMethodSubmitBatch", kRgfxAccelMethodSubmitBatch, false},
 	{"kRgfxAccelMethodPagesChunked", kRgfxAccelMethodPagesChunked, false},
 	{"kRgfxAccelMethodTakeAnswers", kRgfxAccelMethodTakeAnswers, false},
 	{"kRgfxAccelMethodSurfaceBlockRelease", kRgfxAccelMethodSurfaceBlockRelease, false},
@@ -151,8 +152,8 @@ static const Selector kSelectors[] = {
 	{"kRgfxSharedEventMethodImport", kRgfxSharedEventMethodImport, true},
 };
 static const unsigned kSelectorCount = sizeof(kSelectors) / sizeof(kSelectors[0]);
-// The numbers kept for calls not yet carried out: Consumed, SubmitBatch and WakeCompletions.
-static const unsigned kKept[] = {1, 5, 6};
+// The numbers kept for calls not yet carried out: Consumed and WakeCompletions.
+static const unsigned kKept[] = {1, 6};
 
 // The external-method numbers every WebKit web-content sandbox lets its process call on an
 // IOAccelerator connection, on every release from macOS 11 to 26. WebKit's web-content profile
@@ -308,8 +309,11 @@ static void features()
 	};
 	for (unsigned i = 0; i < sizeof(bits) / sizeof(bits[0]); i++)
 		CHECK(bits[i] == uint64_t(1) << i);
-	// TakeAnswers past the numbers SubmitBatch and WakeCompletions keep, and Submit's flags: a
-	// shared create's key takes four scalars after them.
+	// SubmitBatch at the number design.md's registry kept for it, its struct in an inline one;
+	// TakeAnswers past it and the number WakeCompletions keeps, and Submit's flags: a shared
+	// create's key takes four scalars after them.
+	CHECK(kRgfxAccelMethodSubmitBatch == 5);
+	CHECK(kRgfxSubmitBatchBytes == 4096);
 	CHECK(kRgfxAccelMethodTakeAnswers == 7);
 	CHECK(kRgfxSubmitDeferred == 1);
 	CHECK(kRgfxSubmitShared == 2);

@@ -2572,7 +2572,17 @@ IOReturn ReimsGraphics::postReleases(const RgfxBlockRelease *releases, UInt32 co
 	static_assert(sizeof(RgfxBlockRelease) % kMsgAlign == 0 &&
 	                  sizeof(RgfxBlockRelease) <= kLifecycleMessageMax,
 	              "a release is not a whole message");
+	return postRun(RGFX_CMD_BLOCK_RELEASE, releases, sizeof(*releases), count, waiterSeqnos,
+	               posted);
+}
+
+IOReturn ReimsGraphics::postRun(UInt32 type, const void *messages, UInt32 size, UInt32 count,
+                                UInt64 *const *waiterSeqnos, UInt32 *posted)
+{
 	*posted = 0;
+	if (size < kHeaderBytes || size % kMsgAlign || size > kLifecycleMessageMax)
+		return kIOReturnBadArgument;
+	const UInt8 *bytes = static_cast<const UInt8 *>(messages);
 	uint64_t deadline = 0;
 	clock_interval_to_deadline(kPostTimeoutMs, kMillisecondScale, &deadline);
 	// As many as fit, under one hold of the ring's lock and with one doorbell at most: whether
@@ -2581,8 +2591,8 @@ IOReturn ReimsGraphics::postReleases(const RgfxBlockRelease *releases, UInt32 co
 		UInt32 n = 0;
 		IOSimpleLockLock(submitLock);
 		while (*posted + n < count &&
-		       writeLocked(RGFX_CMD_BLOCK_RELEASE, &releases[*posted + n], sizeof(*releases),
-		                   nullptr, waiterSeqnos[*posted + n]))
+		       writeLocked(type, bytes + static_cast<size_t>(*posted + n) * size, size, nullptr,
+		                   waiterSeqnos ? waiterSeqnos[*posted + n] : nullptr))
 			n++;
 		if (n)
 			publishLocked();
@@ -2598,9 +2608,8 @@ IOReturn ReimsGraphics::postReleases(const RgfxBlockRelease *releases, UInt32 co
 			break;
 		if (!waitForRoom(mark, deadline)) {
 			static char site;
-			if (rgfxFirstCalls(&site, 0, 1))
-				IOLog("ReimsGraphics: command %u: the control ring stayed full\n",
-				      RGFX_CMD_BLOCK_RELEASE);
+			if (rgfxFirstCalls(&site, type, 1))
+				IOLog("ReimsGraphics: command %u: the control ring stayed full\n", type);
 			return ready ? kIOReturnTimeout : kIOReturnNotReady;
 		}
 	}

@@ -2042,6 +2042,13 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	return _parent != nil ? _parent.iosurface : nullptr;
 }
 
+// A texture over an IOSurface, or a view of one, goes from the host at once: a present of the
+// surface shows the newest live texture the host names it by, waiting for its destroy.
+- (BOOL)rgfxDestroysAtOnce
+{
+	return self.iosurface != nullptr;
+}
+
 - (NSUInteger)iosurfacePlane
 {
 	return _parent != nil ? _parent.iosurfacePlane : 0;

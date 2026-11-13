@@ -56,6 +56,14 @@ inline bool rgfxSubmitRoutesQueueDestroy(uint32_t type)
 	return type == RGFX_CMD_OBJECT_DESTROY;
 }
 
+// Whether kRgfxAccelMethodSubmitBatch takes a message of `type`: an OBJECT_DESTROY alone, which no
+// one waits for, names no block and makes nothing (the caller also checks its obj_id lies in the
+// sender's context, and routes a queue's as rgfxSubmitRoutesQueueDestroy says).
+inline bool rgfxSubmitBatchAdmitted(uint32_t type)
+{
+	return type == RGFX_CMD_OBJECT_DESTROY;
+}
+
 // Whether an accepted `type` is a pipeline create: a render, mesh render or compute pipeline's,
 // which the device answers with a PIPELINE_REFLECTION, and which alone a client may post
 // deferred (kRgfxSubmitDeferred).

@@ -121,9 +121,15 @@ NS_ASSUME_NONNULL_BEGIN
 /// kext refused it), they go back once a later destroy or commit posts it
 /// (RgfxSerializer::destroy). A command buffer that names the object keeps its wrapper until it
 /// completes, so no buffer in flight names a dropped object. Without a serialiser there is no
-/// host object.
+/// host object. The destroy is held to go with others where the route batches, unless
+/// rgfxDestroysAtOnce (RgfxSerializer::destroy).
 - (void)rgfxRetireThen:(std::function<void()>)after;
 #endif
+
+/// Whether the resource's destroy goes on the ring at once rather than held with others
+/// (RgfxSerializer::destroy's `atOnce`): NO, but for a texture over an IOSurface, which a
+/// present of the surface waits for.
+- (BOOL)rgfxDestroysAtOnce;
 
 /// The MTLResource members every wrapper shares (RgfxResource.mm), declared so a subclass's
 /// protocol conformance sees them.
