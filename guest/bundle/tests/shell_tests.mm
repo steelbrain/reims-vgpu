@@ -12607,6 +12607,28 @@ void test_no_copy_buffers_over_the_same_bytes_share_a_block()
 }
 
 
+// The references the VM object under `address` has, mapping and memory entries alike
+// (vm_region_recurse_64's ref_count), or 0 where nothing is mapped there.
+static unsigned objectReferences(const void *address)
+{
+	const vm_address_t at = reinterpret_cast<vm_address_t>(address);
+	natural_t depth = 0;
+	for (;;) {
+		vm_address_t base = at;
+		vm_size_t size = 0;
+		vm_region_submap_info_data_64_t info = {};
+		mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+		if (vm_region_recurse_64(mach_task_self(), &base, &size, &depth,
+		                         reinterpret_cast<vm_region_recurse_info_t>(&info),
+		                         &count) != KERN_SUCCESS ||
+		    base > at)
+			return 0;
+		if (!info.is_submap)
+			return info.ref_count;
+		depth++;
+	}
+}
+
 // A no-copy buffer over other memory the app mapped at the address and length a live one's lies
 // over takes a pages block of its own (RgfxRegion::acquirePages): WindowServer maps one layer's
 // image where another's was while a buffer over the other still lives, and a buffer joined to the
@@ -12621,23 +12643,68 @@ void test_no_copy_buffer_over_remapped_memory_takes_its_own_block()
 	(void)expectQueueCreate(f.control);
 	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x200000, 0xff);
 	RgfxRegion region(mem.data(), mem.size());
-	BlockLog blocks;
-	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
-	RgfxRegionSlabSource slabSource(region, f.ser, false, true);
-	RgfxSlabs slabs(slabSource);
+	// The kext's pages blocks, each holding the memory under its bytes from its making to its
+	// release, as the kext's wiring does in the guest: its prepared IOMemoryDescriptor's UPL
+	// keeps the memory's VM object from being freed while the block lives
+	// (vm_object_iopl_request begins an activity on the object, and the object's termination
+	// waits for it to end). A memory entry of the bytes holds the object here. Freed, the
+	// object's id (object_id_full) can come back as a new object's, and the region would tell
+	// new memory at the same bytes for the old: the check below that the kext is asked again
+	// failed in one of two runs of the same tree on the M3 Max, 2026-11-12, with a fake that
+	// held nothing.
 	struct Pages {
+		BlockLog blocks;
 		int asked = 0;
 		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x100000;
-		static bool block(void *c, const void *, uint64_t, bool, uint64_t *offset, uint64_t *size)
+		std::mutex lock;
+		std::map<uint64_t, mach_port_t> held; // each live pages block's memory entry
+		static bool block(void *c, const void *address, uint64_t length, bool writable,
+		                  uint64_t *offset, uint64_t *size)
 		{
 			Pages *p = static_cast<Pages *>(c);
+			const vm_address_t at = reinterpret_cast<vm_address_t>(address);
+			const vm_address_t base = trunc_page(at);
+			memory_object_size_t bytes = round_page(at + length) - base;
+			mach_port_t entry = MACH_PORT_NULL;
+			if (mach_make_memory_entry_64(mach_task_self(), &bytes, base,
+			                              writable ? VM_PROT_READ | VM_PROT_WRITE
+			                                       : VM_PROT_READ,
+			                              &entry, MACH_PORT_NULL) != KERN_SUCCESS)
+				return false;
+			std::lock_guard<std::mutex> guard(p->lock);
 			p->asked++;
 			*offset = p->next;
 			*size = 0x5000;
 			p->next += 0x10000;
+			p->held[*offset] = entry;
 			return true;
 		}
+		static bool alloc(void *c, uint64_t size, uint64_t align, uint64_t *offset)
+		{
+			return BlockLog::alloc(&static_cast<Pages *>(c)->blocks, size, align, offset);
+		}
+		// A block back: its memory let go of, as the kext unwires it.
+		static void release(void *c, uint64_t offset)
+		{
+			Pages *p = static_cast<Pages *>(c);
+			std::lock_guard<std::mutex> guard(p->lock);
+			auto it = p->held.find(offset);
+			if (it != p->held.end()) {
+				mach_port_deallocate(mach_task_self(), it->second);
+				p->held.erase(it);
+			}
+			BlockLog::release(&p->blocks, offset);
+		}
+		size_t holding()
+		{
+			std::lock_guard<std::mutex> guard(lock);
+			return held.size();
+		}
 	} pages;
+	BlockLog &blocks = pages.blocks;
+	region.setBlockSource(&Pages::alloc, &Pages::release, &pages);
+	RgfxRegionSlabSource slabSource(region, f.ser, false, true);
+	RgfxSlabs slabs(slabSource);
 	region.setPagesBlockSource(&Pages::block, &pages);
 	vm_address_t app = 0;
 	CHECK(vm_allocate(mach_task_self(), &app, 0x10000, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
@@ -12659,20 +12726,22 @@ void test_no_copy_buffer_over_remapped_memory_takes_its_own_block()
 		CHECK(old != nil && pages.asked == 1);
 		auto one = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
 		CHECK(one.block_offset == first);
-		// The old memory's VM object lives on, as the kext's wiring of a live buffer's pages
-		// keeps it in the guest: freed, its id can come back as the new memory's object's, which
-		// tells the new memory for the old (this check failed in one of two runs of the same
-		// tree on the M3 Max, 2026-11-12, without it).
-		mach_port_t oldMemory = MACH_PORT_NULL;
-		memory_object_size_t oldSize = 0x10000;
-		CHECK(mach_make_memory_entry_64(mach_task_self(), &oldSize, app, VM_PROT_READ, &oldMemory,
-		                                MACH_PORT_NULL) == KERN_SUCCESS);
+		// The old memory's VM object has a reference past the app's mapping, its block's, so
+		// the overwrite below leaves it alive, and no new object can take its id: with a fake
+		// that holds nothing it has the mapping's alone, in every run, and the overwrite frees
+		// it.
+		std::vector<uint64_t> oldIdentity;
+		CHECK(rgfxPagesIdentity(p, 0x4000, &oldIdentity));
+		CHECK(objectReferences(p) >= 2);
+		CHECK(pages.holding() == 1);
 		// Other memory at the same address, with other contents, while the buffer lives.
 		vm_address_t again = app;
 		CHECK(vm_allocate(mach_task_self(), &again, 0x10000,
 		                  VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) == KERN_SUCCESS);
 		CHECK(again == app);
 		std::memset(p, 0x22, 0x10000);
+		std::vector<uint64_t> newIdentity;
+		CHECK(rgfxPagesIdentity(p, 0x4000, &newIdentity) && newIdentity[0] != oldIdentity[0]);
 		RgfxBuffer *fresh = noCopy(p, 0x4000);
 		CHECK(fresh != nil && [fresh contents] == p && pages.asked == 2);
 		auto two = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
@@ -12682,11 +12751,11 @@ void test_no_copy_buffer_over_remapped_memory_takes_its_own_block()
 		CHECK(third != nil && pages.asked == 2);
 		auto three = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
 		CHECK(three.block_offset == two.block_offset && region.pagesRejoinsRefused() == 1);
-		mach_port_deallocate(mach_task_self(), oldMemory);
 	}
 	CHECK(eventually([&] { return blocks.released.size() == 2; }));
 	CHECK(std::find(blocks.released.begin(), blocks.released.end(), first) !=
 	      blocks.released.end());
+	CHECK(pages.holding() == 0);
 	drainRing(f.control);
 	vm_deallocate(mach_task_self(), app, 0x10000);
 	}
