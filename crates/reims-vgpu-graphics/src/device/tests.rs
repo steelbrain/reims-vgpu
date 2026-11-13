@@ -3114,7 +3114,7 @@ struct Taking {
     unrouted: Mutex<Vec<u64>>,
     /// The host's own lock around its calls into the device, as QEMU's BQL is, which its route
     /// functions take where their thread does not hold it ([`Taking::host_locked`]).
-    host_lock: std::sync::Mutex<()>,
+    host_lock: Mutex<()>,
     /// The thread that holds `host_lock`, as QEMU's `bql_locked()` tells it.
     host_lock_owner: Mutex<Option<std::thread::ThreadId>>,
     /// The route calls waiting for `host_lock`.
@@ -3124,12 +3124,12 @@ struct Taking {
 impl Taking {
     /// Takes the host's lock where this thread does not hold it, as QEMU's `route_doorbell`
     /// takes the BQL: `None` where it holds it already.
-    fn host_locked(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+    fn host_locked(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
         if *self.host_lock_owner.lock() == Some(std::thread::current().id()) {
             return None;
         }
         self.waiting_for_host_lock.fetch_add(1, Ordering::SeqCst);
-        let held = (self.host_lock.lock()).unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held = self.host_lock.lock();
         self.waiting_for_host_lock.fetch_sub(1, Ordering::SeqCst);
         Some(held)
     }
@@ -3836,14 +3836,17 @@ fn the_host_s_lock_held_around_its_calls_while_a_route_waits_for_it_holds_up_not
     );
     rig.start();
     let (done, finished) = std::sync::mpsc::channel::<()>();
-    let watchdog = std::thread::spawn(move || {
-        if finished.recv_timeout(Duration::from_secs(20)).is_err() {
-            eprintln!("the calls under the host's lock never returned: a deadlock");
-            std::process::abort();
-        }
-    });
+    let watchdog = std::thread::Builder::new()
+        .name("watchdog".to_owned())
+        .spawn(move || {
+            if finished.recv_timeout(Duration::from_secs(20)).is_err() {
+                eprintln!("the calls under the host's lock never returned: a deadlock");
+                std::process::exit(1);
+            }
+        })
+        .expect("the watchdog starts");
 
-    let held = (taking.host_lock.lock()).unwrap_or_else(std::sync::PoisonError::into_inner);
+    let held = taking.host_lock.lock();
     *taking.host_lock_owner.lock() = Some(std::thread::current().id());
     send_queue_create(&mut rig, QUEUE);
     assert!(
