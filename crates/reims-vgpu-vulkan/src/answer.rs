@@ -1157,7 +1157,8 @@ pub fn created_or_decided<T>(
 ///   (`DeviceSampling` and `DeviceTexelConversion`), its vertex input's conversion of a normalized
 ///   attribute (`DeviceVertexConversion`), its alpha to coverage (`DeviceAlphaCoverage`) and its
 ///   logic operation on a 10-bit or signed normalized attachment's own codes
-///   (`NativeLogicOperation`). On a
+///   (`NativeLogicOperation`), and its own 8-bit float, which a tensor's 8-bit float element widens
+///   through (`NativeFloat8`). On a
 ///   device that runs on Metal (MoltenVK) the runtime answers most as Metal's own functions,
 ///   sampler and conversions, which announce nothing there, and one announced there dies (its
 ///   filter of a two-plane YCbCr texture announces `YCbCrFilterNotExact` instead). The runtime
@@ -1323,7 +1324,7 @@ pub fn created_or_decided<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 147] = [
+pub const DIES: [rt::Degradation; 148] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1454,6 +1455,7 @@ pub const DIES: [rt::Degradation; 147] = [
     rt::Degradation::DeviceVertexConversion,
     rt::Degradation::DeviceAlphaCoverage,
     rt::Degradation::NativeLogicOperation,
+    rt::Degradation::NativeFloat8,
     rt::Degradation::ProvokingVertexLines,
     rt::Degradation::ProvokingVertexUnmatched,
     rt::Degradation::DeviceWideLines,
@@ -3235,6 +3237,7 @@ mod tests {
                 D::DeviceVertexConversion,
                 D::DeviceAlphaCoverage,
                 D::NativeLogicOperation,
+                D::NativeFloat8,
             ]
         );
         // These stay deaths on native devices too, as neither a fact of the device nor the
