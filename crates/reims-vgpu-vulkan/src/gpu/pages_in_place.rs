@@ -18,8 +18,10 @@
 //!
 //! Over a buffer of the pages the answer is the runtime's own, plane by plane
 //! (`rt::Buffer::texture_placement_with_iosurface_plane`, the making's own decision, which counts
-//! and announces nothing): a texture over the plane's rows that only reads, and one that takes
-//! every access (read, render, a shader's write). A surface's layout gives no texel width, so each
+//! and announces nothing): a texture over the plane's rows that takes every access (read, render,
+//! a shader's write), and one that only reads, asked only where the first is no shadow a cache
+//! holds in place, which decides the width's textures whatever the other is ([`of_width`]).
+//! A surface's layout gives no texel width, so each
 //! plane is asked as each of Metal's widths that its rows' texels divide into ([`WIDTHS`]), as a
 //! texture of that width over it may be made (Metal makes a texture over a plane only of the
 //! plane's bytes per element). A plane needs a cache where no width's textures all lie in place
@@ -131,7 +133,9 @@ fn over_pages(placement: rt::TexturePlacement) -> Over {
 
 /// What the textures of one width over a plane are, from what each of them is: a shadow a cache
 /// holds in place where one is; else pending where one is; else in place where one is (one the
-/// device makes in place of no memory, [`Over::Neither`], stands aside); else none in place.
+/// device makes in place of no memory, [`Over::Neither`], stands aside); else none in place. The
+/// first shadow a cache holds in place decides it, whatever the textures after it are, so
+/// [`plane_over`] asks of no texture after it.
 fn of_width(textures: impl IntoIterator<Item = Over>) -> Over {
     let mut answer = Over::Neither;
     for over in textures {
@@ -178,12 +182,16 @@ fn of_surface(planes: impl IntoIterator<Item = Over>) -> PagesInPlace {
     }
 }
 
-/// The usages a plane's textures are asked of: one that only reads, and one that takes every
-/// access.
+/// The usages a plane's textures are asked of: one that takes every access, and one that only
+/// reads. Every access first: where the device's check refuses its renders or writes alone (the
+/// Iris Xe's renders of rows that end inside its lines, a shader's writes of a width the check
+/// stores none of), or the shadow's reason is the pages' or the rows' whatever the access (the
+/// device's policy, texels past the pages, a pitch no image takes), it is a shadow a cache holds
+/// in place, which decides the width with no second ask ([`of_width`]).
 fn usages() -> [TextureUsage; 2] {
     let every =
         TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE | TextureUsage::RENDER_TARGET;
-    [TextureUsage::SHADER_READ, every]
+    [every, TextureUsage::SHADER_READ]
 }
 
 /// The descriptor of a 2D texture of `pixel_format` over a plane's `rows` rows of `width` texels,
@@ -215,20 +223,29 @@ type AskBefore<'a> =
     dyn Fn(rt::HostBacking, &rt::TextureDescriptor, rt::IoSurfacePlane) -> Placement + 'a;
 
 /// What the textures over `plane` are (module docs), as `ask` answers: for each width the plane's
-/// rows allow, the runtime's placement of a texture of each of [`usages`], `planar` where the
-/// surface has planes. A width whose textures the runtime refuses to make (a size past its limits)
-/// is no width of the plane's.
+/// rows allow, the runtime's placement of a texture of each of [`usages`] in turn, to the first
+/// that is a shadow a cache holds in place, which decides the width ([`of_width`]), `planar`
+/// where the surface has planes. A width whose textures the runtime refuses to make (a size past
+/// its limits) is no width of the plane's. The answer is the one every usage's ask gives: the
+/// runtime's refusals of these textures (their shape and size, the pages' import and length, and
+/// of usages, a shader's atomics, a swizzle that writes and a chroma pair's odd extent, none of
+/// which these textures take) refuse a texture that only reads only where they refuse one that
+/// takes every access (read in its source at the pinned commit), so a refusal the first ask did
+/// not meet is not met after it.
 fn plane_over(ask: &Ask, plane: &PagesPlane, planar: bool) -> Over {
     let at = rt::IoSurfacePlane::new(plane.offset, plane.bytes_per_row, planar);
     let width = |(width, pixel_format): (u64, PixelFormat)| {
-        let placements: Result<Vec<Over>, rt::Error> = (usages().into_iter())
-            .map(|usage| {
-                let descriptor =
-                    plane_descriptor(pixel_format, plane.row_bytes / width, plane.rows, usage);
-                ask(&descriptor, at).map(over_pages)
-            })
-            .collect();
-        placements.ok().map(of_width)
+        let mut textures = Vec::new();
+        for usage in usages() {
+            let descriptor =
+                plane_descriptor(pixel_format, plane.row_bytes / width, plane.rows, usage);
+            let over = over_pages(ask(&descriptor, at).ok()?);
+            if matches!(over, Over::Cache(_)) {
+                return Some(over);
+            }
+            textures.push(over);
+        }
+        Some(of_width(textures))
     };
     let mut answers = Vec::new();
     for answer in widths(plane.row_bytes).filter_map(width) {

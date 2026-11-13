@@ -186,6 +186,134 @@ fn a_plane_is_asked_as_each_width_its_rows_divide_into() {
     assert_eq!(of(1002), [2, 1]);
 }
 
+/// The answer of pages laid out as `planes` with every texture asked, as `ask` answers: each
+/// width's textures of every one of [`usages`], a width any of whose asks the runtime refuses no
+/// width of the plane's ([`of_width`], [`of_plane`], [`of_surface`]). What [`pages_over`] answers,
+/// which asks of no texture of a width after its first shadow a cache holds in place.
+fn asked_whole(ask: &Ask, planes: &[PagesPlane]) -> PagesInPlace {
+    let planar = planes.len() > 1;
+    of_surface(planes.iter().map(|p| {
+        let at = rt::IoSurfacePlane::new(p.offset, p.bytes_per_row, planar);
+        of_plane(widths(p.row_bytes).filter_map(|(width, pixel_format)| {
+            let textures: Result<Vec<Over>, rt::Error> = (usages().into_iter())
+                .map(|usage| {
+                    let descriptor =
+                        plane_descriptor(pixel_format, p.row_bytes / width, p.rows, usage);
+                    ask(&descriptor, at).map(over_pages)
+                })
+                .collect();
+            textures.ok().map(of_width)
+        }))
+    }))
+}
+
+/// The verdict of `answer` and the plane it names: what the asks' answers are compared by, the
+/// words of a shadow's reason dropped.
+fn verdict(answer: &PagesInPlace) -> (std::mem::Discriminant<PagesInPlace>, Option<&str>) {
+    let plane = match answer {
+        PagesInPlace::No(why) => why.split(':').next(),
+        _ => None,
+    };
+    (std::mem::discriminant(answer), plane)
+}
+
+/// A width's asks stop at its first shadow a cache holds in place, which decides the width, and
+/// the texture that takes every access is asked first: the answer is the one every texture's ask
+/// gives ([`asked_whole`]) for each answer the tests here give, of each usage alike and of the two
+/// apart, each width alike and the narrowest refused, of a plane and of two; and a width whose
+/// texture that takes every access is such a shadow is answered with one ask, as the Iris Xe's
+/// renders of rows that end inside its lines are. A refusal of the texture that only reads where
+/// the one that takes every access is answered is none the runtime gives ([`plane_over`])
+#[test]
+fn a_width_s_first_shadow_a_cache_holds_decides_it_as_every_ask_would() {
+    use rt::InPlaceRefusal as Refusal;
+    use rt::TextureShadowReason as Why;
+    let refused = || {
+        Err(rt::Error::Invalid(rt::Invalid::new(
+            "host_pages_texture_placement",
+            rt::Problem::HostPagesBacking,
+        )))
+    };
+    let answers: Vec<fn() -> Placement> = vec![
+        || Ok(rt::TexturePlacement::InPlace),
+        || Ok(rt::TexturePlacement::NotHostPages),
+        || Ok(rt::TexturePlacement::Pending),
+        || Ok(rt::TexturePlacement::OtherShape),
+        failed,
+        || Ok(rt::TexturePlacement::Shadow(Why::Policy)),
+        || Ok(rt::TexturePlacement::Shadow(Why::StoreWidth { texel_bytes: 2 })),
+        || Ok(rt::TexturePlacement::Shadow(Why::PastLength)),
+        || Ok(rt::TexturePlacement::Shadow(Why::DeviceCopy)),
+        || Ok(rt::TexturePlacement::Shadow(Why::Mipmapped { levels: 2 })),
+        || Ok(rt::TexturePlacement::Shadow(Why::Refused(Refusal::Image))),
+        || Ok(rt::TexturePlacement::Shadow(Why::Refused(Refusal::Pitch))),
+        || Ok(rt::TexturePlacement::Shadow(Why::Refused(Refusal::Rows))),
+        || Ok(rt::TexturePlacement::Shadow(Why::Refused(Refusal::DmaBuf))),
+    ];
+    let every = usages()[0];
+    assert!(every.contains(TextureUsage::RENDER_TARGET | TextureUsage::SHADER_WRITE));
+    let one = [plane(0, 4096, 4000, 8)];
+    let two = [plane(0, 4096, 4000, 8), plane(32768, 2048, 2000, 8)];
+    let mut compared = 0;
+    // Each answer of the texture that takes every access, a refusal too, beside each of the one
+    // that only reads, which the runtime refuses only where it refuses the first.
+    let firsts = answers.iter().map(|a| Some(*a)).chain([None]);
+    for first in firsts {
+        let seconds = answers.iter().map(|a| Some(*a)).chain(first.is_none().then_some(None));
+        for second in seconds.collect::<Vec<_>>() {
+            // Each width alike, and the narrowest refused with the others alike.
+            for narrow_refused in [false, true] {
+                let ask = |d: &rt::TextureDescriptor, _: rt::IoSurfacePlane| -> Placement {
+                    if narrow_refused && d.pixel_format == PixelFormat::R8Unorm {
+                        return refused();
+                    }
+                    let answer = if d.usage == every { first } else { second };
+                    answer.map_or_else(refused, |a| a())
+                };
+                for planes in [&one[..], &two[..]] {
+                    let asks = std::cell::Cell::new(0);
+                    let counted = |d: &rt::TextureDescriptor, at| {
+                        asks.set(asks.get() + 1);
+                        ask(d, at)
+                    };
+                    let early = pages_over(&counted, planes);
+                    let early_asks = asks.replace(0);
+                    let whole = asked_whole(&counted, planes);
+                    let whole_asks = asks.get();
+                    assert_eq!(
+                        verdict(&early),
+                        verdict(&whole),
+                        "{:?} then {:?}, narrowest refused {narrow_refused}, {} planes: {early:?}, \
+                         every ask's {whole:?}",
+                        first.map(|a| a()),
+                        second.map(|a| a()),
+                        planes.len()
+                    );
+                    assert!(early_asks <= whole_asks, "{early_asks} > {whole_asks}");
+                    compared += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(compared, (answers.len() * answers.len() + answers.len() + 1) * 4);
+    // The Iris Xe's: a texture that only reads in place, and one that takes every access a shadow
+    // the check's refusal of its renders makes, at every width of a plane whose rows allow five:
+    // one ask a width, where every texture's asks are two.
+    let asks = std::cell::Cell::new(0);
+    let iris = |d: &rt::TextureDescriptor, _: rt::IoSurfacePlane| {
+        asks.set(asks.get() + 1);
+        match d.usage == every {
+            true => failed(),
+            false => Ok(rt::TexturePlacement::InPlace),
+        }
+    };
+    let answer = pages_over(&iris, &one);
+    assert!(matches!(&answer, PagesInPlace::No(why) if why.contains("Renders")), "{answer:?}");
+    assert_eq!(asks.replace(0), 5);
+    let _ = asked_whole(&iris, &one);
+    assert_eq!(asks.get(), 10);
+}
+
 /// The answer before an import for every texture, `answer` of each import: a fake of the
 /// runtime's `rt::Device::host_pages_texture_placement`, counting its asks in `asked`.
 fn before<'a>(
@@ -536,6 +664,11 @@ fn the_answer_over_the_pages_is_what_the_runtimes_making_does() {
             by_making.extend(made.map(of_width));
         }
         let answer = surface_pages_in_place(&buffer.raw, std::slice::from_ref(&p));
+        let over_buffer = |descriptor: &rt::TextureDescriptor, at| {
+            (buffer.raw).texture_placement_with_iosurface_plane(descriptor, at)
+        };
+        let whole = asked_whole(&over_buffer, std::slice::from_ref(&p));
+        assert_eq!(verdict(&answer), verdict(&whole), "{p:?}: every ask's {whole:?}");
         let expected = of_surface([of_plane(by_making)]);
         eprintln!("{p:?}: {answer:?}");
         assert_eq!(
@@ -651,6 +784,11 @@ fn the_answer_before_the_import_is_the_buffers_where_it_decides() {
             }
         }
         let never = never_over(&before_import(&d.raw, LENGTH), line, &[backing], &[p]);
+        let ask = before_import(&d.raw, LENGTH);
+        let import = |descriptor: &rt::TextureDescriptor, at| ask(backing, descriptor, at);
+        let whole = asked_whole(&import, &[p]);
+        let early = pages_over(&import, &[p]);
+        assert_eq!(verdict(&early), verdict(&whole), "{p:?}: every ask's {whole:?}");
         let answer = surface_pages_in_place(&buffer.raw, std::slice::from_ref(&p));
         eprintln!("{p:?}: before the import {never:?}, over the buffer {answer:?}");
         if let Some(why) = never {
