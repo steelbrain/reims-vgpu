@@ -1368,6 +1368,11 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand<'_> {
     /// One runtime setter per command. A nil pipeline state, index buffer or tessellation factor
     /// buffer, which the runtime's setters take none of, dies. A nil buffer the runtime holds at
     /// its offset (the module docs).
+    ///
+    /// Inlined always, so that a caller's command, which it makes of one kind, is matched where
+    /// it is made: handed over in a call, it went through memory, and the loads that read it back
+    /// waited for the stores that had just written it. A plain `#[inline]` left it out of line.
+    #[inline(always)]
     fn encode(&self, cmd: IcbRenderCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
         let c = &self.raw;
@@ -1698,7 +1703,8 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand<'_> {
 
 impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand<'_> {
     /// One runtime setter per command. A nil pipeline state, which the runtime's setter takes
-    /// none of, dies.
+    /// none of, dies. Inlined always, as [`IndirectRenderCommand::encode`] is.
+    #[inline(always)]
     fn encode(&self, cmd: IcbComputeCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
         let c = &self.raw;

@@ -1654,6 +1654,7 @@ fn keep_pending(notice: &rt::DegradeNotice) {
 }
 
 /// The notice this thread keeps for a call here to die at, taken: `None` where it keeps none.
+#[inline]
 fn take_pending(calls: &Calls) -> Option<rt::DegradeNotice> {
     if !calls.pending.replace(false) {
         return None;
@@ -1783,13 +1784,15 @@ fn inside<T>(sel: Option<&'static str>, call: impl FnOnce() -> T) -> T {
 /// [`inside`], of this thread's `calls`.
 #[inline]
 fn inside_of<T>(calls: &Calls, sel: Option<&'static str>, call: impl FnOnce() -> T) -> T {
-    /// Leaves the call on drop, an unwinding one included, whose notice it drops.
+    /// Leaves the call on drop, an unwinding one included, whose notice it drops. Inlined, as
+    /// every runtime call here leaves through it.
     struct Leave<'a> {
         calls: &'a Calls,
         /// Whether the call returned.
         returned: bool,
     }
     impl Drop for Leave<'_> {
+        #[inline]
         fn drop(&mut self) {
             self.calls.depth.set(self.calls.depth.get() - 1);
             if !self.returned {
