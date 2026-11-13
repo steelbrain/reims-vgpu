@@ -5467,9 +5467,12 @@ pub(crate) fn no_raise() -> Box<dyn FnOnce(Raise) + Send> {
 /// `COMPLETE` with its status, a failed command buffer) and the process goes on
 /// (docs/graphics-kext/design.md, "Guest input the host refuses").
 pub(crate) fn refusing<T>(op: impl FnOnce() -> RaiseResult<T>) -> RaiseResult<T> {
-    refusals::refusing(op).unwrap_or_else(|refusal| {
-        Err(Raise::foreign("rgfx.platform.refused").with_detail(format!("refused: {refusal}")))
-    })
+    refusals::refusing(op).unwrap_or_else(|refusal| Err(refused_raise(&refusal)))
+}
+
+/// The raise an op a death in its scope refused answers ([`refusing`]).
+pub(crate) fn refused_raise(refusal: &refusals::Refusal) -> Raise {
+    Raise::foreign("rgfx.platform.refused").with_detail(format!("refused: {refusal}"))
 }
 
 /// The object-resolution API: the contract the encoder-op decoders

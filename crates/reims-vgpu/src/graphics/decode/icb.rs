@@ -47,7 +47,11 @@ use reims_vgpu_vulkan::core::raise::RaiseResult;
 use reims_vgpu_vulkan::core::sync::Mutex;
 use zerocopy::{FromBytes, IntoBytes};
 
-use super::{DecodeError, Entry, GraphicsDecoder, ObjHandle, op_fault, read, refused, refusing};
+use super::{
+    DecodeError, Entry, GraphicsDecoder, ObjHandle, op_fault, read, refused, refused_raise,
+    refusing,
+};
+use reims_vgpu_vulkan::core::raise::refusals;
 
 /// The platform's descriptor of an `ICB_CREATE`: every field the guest's descriptor answered.
 pub(super) fn icb_desc(m: &RgfxIcbCreate) -> IcbDesc {
@@ -625,32 +629,43 @@ impl<P: Platform> GraphicsDecoder<P> {
         if mask == 0 && mask_b == 0 {
             return;
         }
+        let shape = (kind, slot, bindings, (mask, mask_b));
         if kind == RGFX_ICB_SLOTS_RENDER {
-            match refusing(|| icb.render_command(index)) {
-                Ok(Some(c)) => slot_fields(kind, slot, bindings, (mask, mask_b), |field| {
-                    let op = field.op();
-                    let reset = || c.encode(IcbRenderCmd::Reset);
-                    let done = refusing(|| {
-                        contain(dropped, index, op, || self.render_field(&c, field), reset)
-                    });
-                    tally.count(obj, index, done);
-                }),
-                Ok(None) => tally.count(obj, index, Ok(Err(DecodeError::Refused))),
-                Err(raise) => tally.count(obj, index, Err(raise)),
-            }
+            let carry = |c: &P::IndirectRenderCommand<'_>, field: Field<'_>| {
+                let reset = || c.encode(IcbRenderCmd::Reset);
+                contain(
+                    dropped,
+                    index,
+                    field.op(),
+                    || self.render_field(c, field),
+                    reset,
+                )
+            };
+            command_fields(
+                || icb.render_command(index),
+                shape,
+                carry,
+                (obj, index),
+                tally,
+            );
         } else {
-            match refusing(|| icb.compute_command(index)) {
-                Ok(Some(c)) => slot_fields(kind, slot, bindings, (mask, mask_b), |field| {
-                    let op = field.op();
-                    let reset = || c.encode(IcbComputeCmd::Reset);
-                    let done = refusing(|| {
-                        contain(dropped, index, op, || self.compute_field(&c, field), reset)
-                    });
-                    tally.count(obj, index, done);
-                }),
-                Ok(None) => tally.count(obj, index, Ok(Err(DecodeError::Refused))),
-                Err(raise) => tally.count(obj, index, Err(raise)),
-            }
+            let carry = |c: &P::IndirectComputeCommand<'_>, field: Field<'_>| {
+                let reset = || c.encode(IcbComputeCmd::Reset);
+                contain(
+                    dropped,
+                    index,
+                    field.op(),
+                    || self.compute_field(c, field),
+                    reset,
+                )
+            };
+            command_fields(
+                || icb.compute_command(index),
+                shape,
+                carry,
+                (obj, index),
+                tally,
+            );
         }
     }
 
@@ -1030,6 +1045,64 @@ fn reset_run<I: IndirectCommandBuffer<P>, P: Platform>(
     if let Some((at, len)) = run {
         tally.count(obj, at, refusing(|| icb.reset_with_range(at, len).map(Ok)));
         dropped.clear(at, len);
+    }
+}
+
+/// The command `command` takes (its buffer's command `index`, of buffer `obj`) and each field of
+/// its slot `shape` (its kind, bytes, bindings and masks, [`slot_fields`]) carried out on it by
+/// `carry`, each counted on `tally` and refused alone, as a scope of its own for the take and for
+/// each field would refuse them: all in one refusal scope, so a slot of a draw and its bindings
+/// enters one scope, not one a field. A death in the take refuses the slot; one in a field
+/// refuses that field, and the fields after it are carried out in a new scope, from the next. One
+/// between the fields, in the slot's own reading (a bug: [`slot_fields`] reads only what it
+/// checked), refuses the rest of the slot.
+fn command_fields<C>(
+    command: impl FnOnce() -> RaiseResult<Option<C>>,
+    (kind, slot, bindings, masks): (u16, &[u8], (u32, u32), (u64, u64)),
+    carry: impl Fn(&C, Field<'_>) -> RaiseResult<Result<(), DecodeError>>,
+    (obj, index): (u64, u64),
+    tally: &mut Tally,
+) {
+    let mut command = Some(command);
+    let mut made: Option<C> = None;
+    // The fields counted so far, which a scope after a death passes over, and whether one is
+    // being carried out.
+    let (mut counted, mut carrying) = (0usize, false);
+    loop {
+        let ran = refusals::refusing(|| {
+            if let Some(take) = command.take() {
+                match take() {
+                    Ok(Some(c)) => made = Some(c),
+                    Ok(None) => return tally.count(obj, index, Ok(Err(DecodeError::Refused))),
+                    Err(raise) => return tally.count(obj, index, Err(raise)),
+                }
+            }
+            let Some(c) = made.as_ref() else {
+                return;
+            };
+            let mut at = 0usize;
+            slot_fields(kind, slot, bindings, masks, |field| {
+                if at == counted {
+                    carrying = true;
+                    let done = carry(c, field);
+                    carrying = false;
+                    tally.count(obj, index, done);
+                    counted += 1;
+                }
+                at += 1;
+            });
+        });
+        match ran {
+            Ok(()) => return,
+            Err(refusal) => {
+                tally.count(obj, index, Err(refused_raise(&refusal)));
+                if made.is_none() || !carrying {
+                    return;
+                }
+                carrying = false;
+                counted += 1;
+            }
+        }
     }
 }
 
@@ -2122,6 +2195,56 @@ mod tests {
         let mark = p.call_log().mark();
         assert_eq!(dec.decode(&device, &once).unwrap(), Ok(()));
         assert_eq!(encodes(&p, mark), ["reset", pipeline, VB, DRAW]);
+    }
+
+    /// A slot's field the platform dies at (a refusal of the Vulkan platform's, which a death
+    /// is) is refused alone: the slot's fields before and after it are carried out, and so are
+    /// the next slot's. A death at the take of a slot's command refuses that slot alone.
+    #[test]
+    fn a_slot_field_the_platform_dies_at_is_refused_alone() {
+        let (p, mut dec, region) = slot_setup();
+        let device = p.device();
+        let fixed = RgfxIcbRenderSlot {
+            mask: RGFX_ICB_SLOT_ACTION | RGFX_ICB_SLOT_BUFFER_0,
+            mask_b: 1,
+            op: RGFX_ICB_OP_DRAW,
+            action: action(&draw(3)),
+            ..RgfxIcbRenderSlot::default()
+        };
+        let none = RgfxIcbSlotBuffer::default();
+        let bindings = [bound(2, 16, 0), none, bound(3, 64, 0)];
+        for i in 0..3 {
+            assert!(region.write(SLOTS + i * RENDER_STRIDE, &render_slot(&fixed, bindings)));
+        }
+        let message = slots(&[run(RENDER_ICB_2, RGFX_ICB_SLOTS_RENDER, SLOTS, 0, 3)]);
+        p.script().push(FB, Step::crash());
+        let mark = p.call_log().mark();
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(
+            encodes(&p, mark),
+            [VB, FB, DRAW, VB, FB, DRAW, VB, FB, DRAW]
+        );
+        let Some(ObjHandle::Icb(icb)) = dec.named(RENDER_ICB_2) else {
+            panic!("no indirect command buffer");
+        };
+        for i in 0..3 {
+            let c = icb.render_command(i).unwrap().unwrap();
+            assert_eq!(c.draw_args().unwrap().vertex_count, 3, "command {i}");
+            assert_ne!(c.vertex_buffer_address(0).unwrap(), 0, "command {i}");
+            let fragment = c.fragment_buffer_address(0).unwrap();
+            assert_eq!(fragment == 0, i == 0, "command {i}");
+        }
+        dec.end_message();
+
+        for i in 0..3 {
+            assert!(region.write(SLOTS + i * RENDER_STRIDE, &render_slot(&fixed, bindings)));
+        }
+        let at = "indirectRenderCommandAtIndex:";
+        p.script().after(at, 1, Step::crash());
+        let mark = p.call_log().mark();
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let taken: Vec<_> = calls(&p, mark).into_iter().map(|(sel, _)| sel).collect();
+        assert_eq!(taken, [at, VB, FB, DRAW, at, at, VB, FB, DRAW]);
     }
 
     /// A write naming no indirect command buffer of the sender's (none, or a buffer) is refused
