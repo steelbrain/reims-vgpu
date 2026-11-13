@@ -218,7 +218,15 @@ pub fn send<T>(
     policy: Policy,
     call: impl FnOnce() -> Result<T, Error>,
 ) -> RaiseResult<T> {
-    inside(Some(sel), call).or_else(|e| decide(sel, policy, e))
+    inside(Some(sel), boxed(call)).or_else(|e| decide(sel, policy, *e))
+}
+
+/// `call`, its refusal boxed for [`inside`]'s frames to carry: the runtime's `Result<(), Error>`
+/// is 112 bytes (measured at metal2vulkan 0c0cdf0b12), which each frame would move, where an
+/// answer with its refusal boxed is its value and one pointer. Only a refusal allocates.
+#[inline]
+fn boxed<T>(call: impl FnOnce() -> Result<T, Error>) -> impl FnOnce() -> Result<T, Box<Error>> {
+    move || call().map_err(Box::new)
 }
 
 /// [`send`], the line of a death or a raise also carrying what `describe` says of the call
@@ -229,7 +237,8 @@ pub fn send_describing<T>(
     describe: impl FnOnce() -> String,
     call: impl FnOnce() -> Result<T, Error>,
 ) -> RaiseResult<T> {
-    inside(Some(sel), call).or_else(|e| decide_describing(sel, policy, e, Some(&describe())))
+    inside(Some(sel), boxed(call))
+        .or_else(|e| decide_describing(sel, policy, *e, Some(&describe())))
 }
 
 /// Runs `call`, the runtime's form of `sel`, whose every refusal dies at the call.
@@ -252,8 +261,8 @@ fn got<T>(
     descriptor: Option<&str>,
     call: impl FnOnce() -> Result<T, Error>,
 ) -> T {
-    inside(Some(sel), call).unwrap_or_else(|e| {
-        match decide_describing::<T>(sel, Policy::Fatal, e, descriptor) {
+    inside(Some(sel), boxed(call)).unwrap_or_else(|e| {
+        match decide_describing::<T>(sel, Policy::Fatal, *e, descriptor) {
             Ok(v) => v,
             Err(r) => r.fatal(),
         }
@@ -282,7 +291,7 @@ pub fn create<T>(
     nil: Nil,
     call: impl FnOnce() -> Result<T, Error>,
 ) -> RaiseResult<Option<T>> {
-    match inside(Some(sel), call) {
+    match inside(Some(sel), boxed(call)).map_err(|e| *e) {
         Ok(v) => Ok(Some(v)),
         Err(Error::Nil(_)) => Ok(None),
         Err(e) if nil.covers(&e) => Ok(None),
