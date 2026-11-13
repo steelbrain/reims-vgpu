@@ -1620,45 +1620,63 @@ void test_ring_post_waits_for_room()
 // with no record leaves it waiting (its backstop is 20 ms), and the record, which the queue's
 // reader hands over as it reads RGFX_EVT_SUBMIT_ROOM, ends the wait at once. A post that finds
 // room touches no flag.
+//
+// The backstop also ends the wait, 20 ms after it began, wherever a busy host keeps this test's
+// threads off a CPU that long. So a run counts only where it ends inside the backstop from
+// before its post began: its post can then have been ended by the record alone, and was still
+// waiting when looked at. Runs repeat until one counts.
 void test_ring_post_waits_for_the_room_record()
 {
+	// RgfxRingWriter.cpp's kRoomBackstopUs.
+	constexpr auto kBackstop = std::chrono::milliseconds(20);
 	constexpr uint32_t kData = 0x1000;
 	TestRing ring(kData);
 	RgfxRingWriter writer(ring.base(), kData, 1, TestRing::doorbell, nullptr);
 	auto room = std::make_shared<RgfxRingRoomEvents>();
 	writer.setRoomEvents(room);
-	auto waiting = [&ring] {
-		return __atomic_load_n(reinterpret_cast<uint32_t *>(
-		                           ring.mem.data() +
-		                           __builtin_offsetof(RgfxRingHeader, producer_waiting)),
-		                       __ATOMIC_SEQ_CST);
-	};
+	auto *waitingFlag = reinterpret_cast<uint32_t *>(
+	    ring.mem.data() + __builtin_offsetof(RgfxRingHeader, producer_waiting));
+	auto waiting = [waitingFlag] { return __atomic_load_n(waitingFlag, __ATOMIC_SEQ_CST); };
 	uint8_t msg[256] = {};
 	CHECK(writer.post(RGFX_CMD_COMMAND_BUFFER, msg, sizeof(msg), nullptr));
 	CHECK(waiting() == 0);
 	while (writer.tryPost(RGFX_CMD_COMMAND_BUFFER, msg, sizeof(msg), nullptr)) {
 	}
-	std::atomic<bool> posted{false};
-	bool postedOK = false;
-	std::thread poster([&] {
-		postedOK = writer.post(RGFX_CMD_COMMAND_BUFFER, msg, sizeof(msg), nullptr);
-		posted = true;
-	});
-	for (int i = 0; i < 5000 && waiting() == 0; i++)
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
-	CHECK(waiting() == 1);
-	// The host takes one message and posts no record: the post still waits.
-	RgfxMsgHeader h = {};
-	std::vector<uint8_t> bytes;
-	CHECK(ring.next(&h, &bytes));
-	std::this_thread::sleep_for(std::chrono::milliseconds(3));
-	CHECK(!posted);
-	// Its record: the post looks again, and finds the room.
-	const auto start = std::chrono::steady_clock::now();
-	room->arrived();
-	poster.join();
-	CHECK(posted && postedOK);
-	CHECK(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(15));
+	// Each run starts with the ring full: it takes one message and its post puts one back.
+	bool counted = false;
+	for (int run = 0; run < 50 && !counted; run++) {
+		// The host clears the flag as it posts its record.
+		__atomic_store_n(waitingFlag, 0u, __ATOMIC_SEQ_CST);
+		const int rung = TestRing::doorbells.load();
+		std::atomic<bool> posted{false};
+		bool postedOK = false;
+		const auto began = std::chrono::steady_clock::now();
+		std::thread poster([&] {
+			postedOK = writer.post(RGFX_CMD_COMMAND_BUFFER, msg, sizeof(msg), nullptr);
+			posted = true;
+		});
+		// The post rings the doorbell once its look after storing the flag found no room: from
+		// then on only the record or the backstop ends its wait.
+		for (int i = 0; i < 5000 && TestRing::doorbells.load() == rung; i++)
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		CHECK(TestRing::doorbells.load() > rung);
+		CHECK(waiting() == 1);
+		// The host takes one message and posts no record: the post still waits.
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(ring.next(&h, &bytes));
+		std::this_thread::sleep_for(std::chrono::milliseconds(3));
+		const bool postedBeforeRecord = posted;
+		// Its record: the post looks again, and finds the room.
+		room->arrived();
+		poster.join();
+		CHECK(posted && postedOK);
+		if (std::chrono::steady_clock::now() - began < kBackstop) {
+			CHECK(!postedBeforeRecord);
+			counted = true;
+		}
+	}
+	CHECK(counted);
 
 	// A queue's reader hands each RGFX_EVT_SUBMIT_ROOM on its completion ring to the room.
 	TestRing completion(kData);
