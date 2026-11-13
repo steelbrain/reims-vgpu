@@ -846,6 +846,18 @@ impl IcbObject {
         plain(|| self.sides.lock().copied_lengths.remove(&flat));
     }
 
+    /// Core set command `command`'s threadgroup memory length at `index`, the low 32 bits of the
+    /// index it sent, which Metal keeps in the buffer's array of them ([`LENGTHS_A_COMMAND`]):
+    /// of a command's record ([`record_set`](Self::record_set)) or past the last command's
+    /// ([`tail_set`](Self::tail_set)).
+    fn length_set(&self, command: u32, index: u32) {
+        let flat = u64::from(command) * LENGTHS_A_COMMAND + u64::from(index);
+        match flat / LENGTHS_A_COMMAND < plain(|| self.raw.size()) {
+            true => self.record_set(flat),
+            false => self.tail_set(flat),
+        }
+    }
+
     /// `sel` reads the threadgroup memory length `flat` places into the buffer's array of them,
     /// of a command: relayed, a death in strict mode, where it is a length 36 or 37 a copy
     /// cleared, where Metal's carries it from a command that names no pipeline state
@@ -1218,6 +1230,88 @@ impl IndirectCommandBuffer<VulkanPlatform> for VulkanIcb {
         }))
     }
 
+    /// The runtime's `set_render_command`: the command's sets in one call, with no command
+    /// object, as [`render_command`](Self::render_command) and [`encode`] of each would make
+    /// them ([`Sets`]). The runtime's refusal of the take (a command past the size) dies at
+    /// `indirectRenderCommandAtIndex:`, and that of a set at the set's selector, naming the
+    /// runtime's error, as those calls die: the sets before it made, those after it not taken. A
+    /// command whose [`encode`] dies before the runtime is called (a nil object, a primitive
+    /// type 9) ends the call, and is sent alone, after it, through [`encode`], which dies there;
+    /// the sets after it go on in another call.
+    ///
+    /// [`encode`]: IndirectRenderCommand::encode
+    #[inline(always)]
+    fn encode_render_command<'c>(
+        &self,
+        command_index: u64,
+        mut cmds: impl Iterator<Item = IcbRenderCmd<'c, VulkanPlatform>>,
+    ) -> RaiseResult<bool> {
+        const TAKE: &str = "indirectRenderCommandAtIndex:";
+        let index = command_index.low_u32();
+        loop {
+            let mut sets = Sets {
+                icb: self,
+                index,
+                cmds: &mut cmds,
+                sel: TAKE,
+                after: After::Nothing,
+                alone: None,
+                set: render_set,
+            };
+            let done = plain_at(TAKE, || {
+                self.raw.set_render_command(command_index, &mut sets)
+            });
+            if let Err((_, e)) = done {
+                return decide(sets.sel, Policy::Dies, e);
+            }
+            sets.note();
+            let Some(cmd) = sets.alone else {
+                return Ok(true);
+            };
+            if let Some(c) = self.render_command(command_index)? {
+                c.encode(cmd)?;
+            }
+        }
+    }
+
+    /// The runtime's `set_compute_command`, as
+    /// [`encode_render_command`](Self::encode_render_command) sends a render command's: its
+    /// take's refusal (a command past the size, or a compute command of a buffer of render
+    /// commands) dies at `indirectComputeCommandAtIndex:`.
+    #[inline(always)]
+    fn encode_compute_command<'c>(
+        &self,
+        command_index: u64,
+        mut cmds: impl Iterator<Item = IcbComputeCmd<'c, VulkanPlatform>>,
+    ) -> RaiseResult<bool> {
+        const TAKE: &str = "indirectComputeCommandAtIndex:";
+        let index = command_index.low_u32();
+        loop {
+            let mut sets = Sets {
+                icb: self,
+                index,
+                cmds: &mut cmds,
+                sel: TAKE,
+                after: After::Nothing,
+                alone: None,
+                set: compute_set,
+            };
+            let done = plain_at(TAKE, || {
+                self.raw.set_compute_command(command_index, &mut sets)
+            });
+            if let Err((_, e)) = done {
+                return decide(sets.sel, Policy::Dies, e);
+            }
+            sets.note();
+            let Some(cmd) = sets.alone else {
+                return Ok(true);
+            };
+            if let Some(c) = self.compute_command(command_index)? {
+                c.encode(cmd)?;
+            }
+        }
+    }
+
     /// The runtime's `reset_with_range`, one call for the range, which refuses a range past the
     /// size as Metal's validation does (a death: core passes one inside it); then the commands'
     /// sides as a CPU reset leaves them ([`IcbObject::rewritten_range`]).
@@ -1364,6 +1458,385 @@ impl CommandObject<'_, rt::IndirectComputeCommand> {
             _ => unrepresentable(sel, "a compute command the runtime reads as none"),
         }
     }
+}
+
+/// What the platform notes of a command once the runtime made a set of it, as [`encode`] notes
+/// it after the set's call ([`Sets::note`]).
+///
+/// [`encode`]: IndirectRenderCommand::encode
+#[derive(Clone, Copy)]
+enum After {
+    Nothing,
+    /// A reset: [`IcbObject::rewritten`].
+    Rewritten,
+    /// A compute command's words `bits` set: [`IcbObject::words_set`].
+    Words(u16),
+    /// A compute command's threadgroup memory length at the index: [`IcbObject::length_set`].
+    Length(u32),
+}
+
+/// A command's sets, as the runtime's `set_render_command` or `set_compute_command` takes them:
+/// each of `cmds` made into the runtime's set by `set`, in turn, ending at the first `set` does
+/// not make, which is kept (`alone`) for [`encode`] to send alone. The runtime takes a set once
+/// it made the one before ([`rt::IndirectCommandBuffer::set_render_command`]), so each set's
+/// [`After`] is noted as the next is taken, and the last's once the call returns: what the
+/// runtime made alone is noted. `sel` is the selector of the last set handed out, which a
+/// refusal is the set's of; while none is, the take's.
+///
+/// [`encode`]: IndirectRenderCommand::encode
+struct Sets<'i, I, Cmd, F> {
+    icb: &'i IcbObject,
+    index: u32,
+    cmds: I,
+    sel: &'static str,
+    /// What the last set handed out notes once made.
+    after: After,
+    alone: Option<Cmd>,
+    set: F,
+}
+
+impl<I, Cmd, F> Sets<'_, I, Cmd, F> {
+    /// Note what the last set handed out set, which the runtime made.
+    #[inline(always)]
+    fn note(&mut self) {
+        let icb = self.icb;
+        match std::mem::replace(&mut self.after, After::Nothing) {
+            After::Nothing => {}
+            After::Rewritten => icb.rewritten(self.index),
+            After::Words(bits) => icb.words_set(self.index, bits),
+            After::Length(index) => icb.length_set(self.index, index),
+        }
+    }
+}
+
+impl<I, Cmd, Set, F> Iterator for Sets<'_, I, Cmd, F>
+where
+    I: Iterator<Item = Cmd>,
+    F: FnMut(Cmd) -> Result<(Set, &'static str, After), Cmd>,
+{
+    type Item = Set;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Set> {
+        self.note();
+        if self.alone.is_some() {
+            return None;
+        }
+        match (self.set)(self.cmds.next()?) {
+            Ok((set, sel, after)) => {
+                self.sel = sel;
+                self.after = after;
+                Some(set)
+            }
+            Err(cmd) => {
+                self.alone = Some(cmd);
+                None
+            }
+        }
+    }
+}
+
+/// A binding index core passes as `NSUInteger`, where [`slot`] would not die of it.
+#[inline(always)]
+fn try_slot(index: u64) -> Option<u32> {
+    u32::try_from(index).ok()
+}
+
+/// A draw's raw primitive type, where [`primitive`] would not die of it.
+#[inline(always)]
+fn try_primitive(raw: u64) -> Option<rt::DrawPrimitiveType> {
+    match raw {
+        5..=8 => rt::DrawPrimitiveType::from_raw(raw).ok(),
+        9 => None,
+        _ => Some(rt::DrawPrimitiveType::Public(
+            u32::try_from(raw).ok()?.try_into().ok()?,
+        )),
+    }
+}
+
+/// `cmd` as the runtime's set, its selector and what it notes once made, where [`encode`] would
+/// call the runtime's setter for it; else `cmd`, which [`encode`] dies at before any call.
+///
+/// [`encode`]: IndirectRenderCommand::encode
+#[inline(always)]
+fn render_set(
+    cmd: IcbRenderCmd<'_, VulkanPlatform>,
+) -> Result<(rt::IndirectRenderSet<'_>, &'static str, After), IcbRenderCmd<'_, VulkanPlatform>> {
+    use rt::IndirectRenderSet as S;
+    let sel = cmd.selector();
+    let mut after = After::Nothing;
+    let set = match cmd {
+        IcbRenderCmd::ClearBarrier => S::ClearBarrier,
+        IcbRenderCmd::SetBarrier => S::SetBarrier,
+        IcbRenderCmd::DrawIndexedPatches {
+            number_of_patch_control_points,
+            patch_start,
+            patch_count,
+            patch_index_buffer,
+            patch_index_buffer_offset,
+            control_point_index_buffer,
+            control_point_index_buffer_offset,
+            instance_count,
+            base_instance,
+            buffer: Some(factors),
+            offset,
+            instance_stride,
+        } => {
+            let patch_index_buffer = patch_index_buffer.map(|b| &b.raw);
+            match control_point_index_buffer {
+                Some(control_points) => S::DrawIndexedPatches {
+                    number_of_patch_control_points,
+                    patch_start,
+                    patch_count,
+                    patch_index_buffer,
+                    patch_index_buffer_offset,
+                    control_point_index_buffer: Some(&control_points.raw),
+                    control_point_index_buffer_offset,
+                    instance_count,
+                    base_instance,
+                    tessellation_factor_buffer: &factors.raw,
+                    tessellation_factor_buffer_offset: offset,
+                    tessellation_factor_buffer_instance_stride: instance_stride,
+                },
+                None => S::DrawPatches {
+                    number_of_patch_control_points,
+                    patch_start,
+                    patch_count,
+                    patch_index_buffer,
+                    patch_index_buffer_offset,
+                    instance_count,
+                    base_instance,
+                    tessellation_factor_buffer: &factors.raw,
+                    tessellation_factor_buffer_offset: offset,
+                    tessellation_factor_buffer_instance_stride: instance_stride,
+                },
+            }
+        }
+        IcbRenderCmd::DrawIndexedPrimitives {
+            primitive_type,
+            index_count,
+            index_type,
+            index_buffer: Some(indices),
+            index_buffer_offset,
+            instance_count,
+            base_vertex,
+            base_instance,
+        } => {
+            let typed: Option<IndexType> = u32::try_from(index_type)
+                .ok()
+                .and_then(|t| t.try_into().ok());
+            let (Some(primitive_type), Some(index_type)) = (try_primitive(primitive_type), typed)
+            else {
+                return Err(cmd);
+            };
+            S::DrawIndexedPrimitives {
+                primitive_type,
+                index_count,
+                index_type,
+                index_buffer: &indices.raw,
+                index_buffer_offset,
+                instance_count,
+                base_vertex,
+                base_instance,
+            }
+        }
+        IcbRenderCmd::DrawPatches {
+            number_of_patch_control_points,
+            patch_start,
+            patch_count,
+            patch_index_buffer,
+            patch_index_buffer_offset,
+            instance_count,
+            base_instance,
+            buffer: Some(factors),
+            offset,
+            instance_stride,
+        } => S::DrawPatches {
+            number_of_patch_control_points,
+            patch_start,
+            patch_count,
+            patch_index_buffer: patch_index_buffer.map(|b| &b.raw),
+            patch_index_buffer_offset,
+            instance_count,
+            base_instance,
+            tessellation_factor_buffer: &factors.raw,
+            tessellation_factor_buffer_offset: offset,
+            tessellation_factor_buffer_instance_stride: instance_stride,
+        },
+        IcbRenderCmd::DrawPrimitives {
+            primitive_type,
+            vertex_start,
+            vertex_count,
+            instance_count,
+            base_instance,
+        } => {
+            let Some(primitive_type) = try_primitive(primitive_type) else {
+                return Err(cmd);
+            };
+            S::DrawPrimitives {
+                primitive_type,
+                vertex_start,
+                vertex_count,
+                instance_count,
+                base_instance,
+            }
+        }
+        IcbRenderCmd::Reset => {
+            after = After::Rewritten;
+            S::Reset
+        }
+        IcbRenderCmd::SetFragmentBuffer {
+            buffer,
+            offset,
+            index,
+        } => {
+            let Some(index) = try_slot(index) else {
+                return Err(cmd);
+            };
+            S::SetFragmentBuffer {
+                buffer: buffer.map(|b| &b.raw),
+                offset,
+                index,
+            }
+        }
+        IcbRenderCmd::SetRenderPipelineState {
+            pipeline_state: Some(state),
+        } => S::SetRenderPipelineState(&state.raw),
+        IcbRenderCmd::SetVertexBuffer {
+            buffer,
+            offset,
+            index,
+        } => {
+            let Some(index) = try_slot(index) else {
+                return Err(cmd);
+            };
+            S::SetVertexBuffer {
+                buffer: buffer.map(|b| &b.raw),
+                offset,
+                index,
+            }
+        }
+        IcbRenderCmd::SetVertexBufferAttributeStride {
+            buffer,
+            offset,
+            stride,
+            index,
+        } => {
+            let Some(index) = try_slot(index) else {
+                return Err(cmd);
+            };
+            S::SetVertexBufferWithStride {
+                buffer: buffer.map(|b| &b.raw),
+                offset,
+                stride,
+                index,
+            }
+        }
+        IcbRenderCmd::DrawIndexedPatches { buffer: None, .. }
+        | IcbRenderCmd::DrawIndexedPrimitives {
+            index_buffer: None, ..
+        }
+        | IcbRenderCmd::DrawPatches { buffer: None, .. }
+        | IcbRenderCmd::SetRenderPipelineState {
+            pipeline_state: None,
+        } => return Err(cmd),
+    };
+    Ok((set, sel, after))
+}
+
+/// `cmd` as the runtime's set, as [`render_set`] makes a render command's.
+#[inline(always)]
+fn compute_set(
+    cmd: IcbComputeCmd<'_, VulkanPlatform>,
+) -> Result<(rt::IndirectComputeSet<'_>, &'static str, After), IcbComputeCmd<'_, VulkanPlatform>> {
+    use rt::IndirectComputeSet as S;
+    let sel = cmd.selector();
+    let mut after = After::Nothing;
+    let set = match cmd {
+        IcbComputeCmd::ClearBarrier => S::ClearBarrier,
+        IcbComputeCmd::ConcurrentDispatchThreadgroups {
+            threadgroups_per_grid,
+            threads_per_threadgroup,
+        } => {
+            after = After::Words(Tail::DISPATCH);
+            S::ConcurrentDispatchThreadgroups {
+                threadgroups: crate::gpu::size(threadgroups_per_grid),
+                threads_per_threadgroup: crate::gpu::size(threads_per_threadgroup),
+            }
+        }
+        IcbComputeCmd::ConcurrentDispatchThreads {
+            threads_per_grid,
+            threads_per_threadgroup,
+        } => {
+            after = After::Words(Tail::DISPATCH);
+            S::ConcurrentDispatchThreads {
+                threads: crate::gpu::size(threads_per_grid),
+                threads_per_threadgroup: crate::gpu::size(threads_per_threadgroup),
+            }
+        }
+        IcbComputeCmd::Reset => {
+            after = After::Rewritten;
+            S::Reset
+        }
+        IcbComputeCmd::SetBarrier => S::SetBarrier,
+        IcbComputeCmd::SetComputePipelineState {
+            pipeline_state: Some(state),
+        } => {
+            after = After::Words(Tail::PIPELINE);
+            S::SetComputePipelineState(&state.raw)
+        }
+        IcbComputeCmd::SetComputePipelineState {
+            pipeline_state: None,
+        } => return Err(cmd),
+        IcbComputeCmd::SetImageblockWidth { width, height } => {
+            after = After::Words(Tail::IMAGEBLOCK);
+            S::SetImageblockSize { width, height }
+        }
+        IcbComputeCmd::SetKernelBuffer {
+            buffer,
+            offset,
+            index,
+        } => {
+            let Some(index) = try_slot(index) else {
+                return Err(cmd);
+            };
+            S::SetKernelBuffer {
+                buffer: buffer.map(|b| &b.raw),
+                offset,
+                index,
+            }
+        }
+        IcbComputeCmd::SetKernelBufferAttributeStride {
+            buffer,
+            offset,
+            stride,
+            index,
+        } => {
+            let Some(index) = try_slot(index) else {
+                return Err(cmd);
+            };
+            S::SetKernelBufferWithStride {
+                buffer: buffer.map(|b| &b.raw),
+                offset,
+                stride,
+                index,
+            }
+        }
+        IcbComputeCmd::SetStageInRegion { region } => {
+            S::SetStageInRegion(crate::gpu::region(region))
+        }
+        IcbComputeCmd::SetThreadgroupMemoryLength { length, index } => {
+            let Ok(length) = u32::try_from(length) else {
+                return Err(cmd);
+            };
+            after = After::Length(index.low_u32());
+            S::SetThreadgroupMemoryLength {
+                length,
+                index: index.low_u32(),
+            }
+        }
+    };
+    Ok((set, sel, after))
 }
 
 /// A draw's raw primitive type, sent with `sel`: a public `MTLPrimitiveType`, or one of Metal's
@@ -1810,10 +2283,7 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand<'_>
                 set(sel, || {
                     c.set_threadgroup_memory_length(length, index.low_u32())
                 })?;
-                match self.length_place(index) {
-                    Ok(_) => self.icb.record_set(self.flat(index)),
-                    Err(flat) => self.icb.tail_set(flat),
-                }
+                self.icb.length_set(self.index, index.low_u32());
                 Ok(())
             }
         }
@@ -2815,6 +3285,237 @@ mod tests {
                 assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
             }
         }
+    }
+
+    /// A command's fields sent in one call ([`IndirectCommandBuffer::encode_compute_command`],
+    /// the runtime's `set_compute_command`) die where one call a field would, and leave the
+    /// command as it would: the runtime's refusal of a set dies at the set's selector, as the
+    /// first, a middle or the last set, the sets before it made and those after it not taken
+    /// (read back); a death of the platform's own before the runtime's call (a nil pipeline
+    /// state, a draw of primitive type 9) alike, the sets after it not taken; and the take of a
+    /// compute command of a buffer of render commands at `indirectComputeCommandAtIndex:`,
+    /// setting nothing. So the runtime is held to making the sets in turn, taking the next only
+    /// once it made the one before, and to leaving those after a refused one untaken, which the
+    /// decoder's refusal of a slot's field alone relies on.
+    #[test]
+    fn a_command_sent_in_one_call_dies_where_one_call_a_field_would() {
+        let d = dev();
+        let pipeline = icb_pipeline(&d);
+        let (a, b) = (holding(&d, &[1; 4]), holding(&d, &[2; 4]));
+        let kernel = |buffer, index| IcbComputeCmd::SetKernelBuffer {
+            buffer: Some(buffer),
+            offset: 0,
+            index,
+        };
+        let sets = |at: usize, state| {
+            let mut cmds = vec![kernel(&a, 0), kernel(&b, 1)];
+            let set = IcbComputeCmd::SetComputePipelineState {
+                pipeline_state: state,
+            };
+            cmds.insert(at, set);
+            cmds
+        };
+        let sel = "setComputePipelineState:";
+        // The runtime refuses a pipeline state of a buffer that inherits it.
+        let inherits = IcbDesc {
+            inherit_pipeline_state: true,
+            ..compute_desc()
+        };
+        let icb = make::<VulkanPlatform>(&d, &inherits, 3);
+        for at in 0..3 {
+            let index = at as u64;
+            let cmds = sets(at, Some(&pipeline));
+            let site =
+                catch_death(|| icb.encode_compute_command(index, cmds.into_iter())).unwrap_err();
+            assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "at {at}");
+            let c = icb.compute_command(index).unwrap().unwrap();
+            let standing = [
+                c.kernel_buffer_address(0).unwrap() != 0,
+                c.kernel_buffer_address(1).unwrap() != 0,
+            ];
+            assert_eq!(standing, [at > 0, at > 1], "the refused set at {at}");
+        }
+        // The platform dies at a nil pipeline state before the runtime's call.
+        let icb = make::<VulkanPlatform>(&d, &compute_desc(), 1);
+        let cmds = sets(1, None);
+        let site = catch_death(|| icb.encode_compute_command(0, cmds.into_iter())).unwrap_err();
+        assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
+        let c = icb.compute_command(0).unwrap().unwrap();
+        assert_ne!(c.kernel_buffer_address(0).unwrap(), 0);
+        assert_eq!(c.kernel_buffer_address(1).unwrap(), 0);
+        // And at a draw of primitive type 9, between two vertex buffers.
+        let render = make::<VulkanPlatform>(&d, &render_desc(), 1);
+        let vertex = |buffer, index| IcbRenderCmd::SetVertexBuffer {
+            buffer: Some(buffer),
+            offset: 0,
+            index,
+        };
+        let nine = IcbRenderCmd::DrawPrimitives {
+            primitive_type: 9,
+            vertex_start: 0,
+            vertex_count: 3,
+            instance_count: 1,
+            base_instance: 0,
+        };
+        let cmds = [vertex(&a, 0), nine, vertex(&b, 1)];
+        let site = catch_death(|| render.encode_render_command(0, cmds.into_iter())).unwrap_err();
+        let draw = "drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:";
+        assert_eq!((site.kind, site.file), (DeathKind::Abort, draw));
+        let c = render.render_command(0).unwrap().unwrap();
+        assert_ne!(c.vertex_buffer_address(0).unwrap(), 0);
+        assert_eq!(c.vertex_buffer_address(1).unwrap(), 0);
+        // A compute command of a buffer of render commands.
+        let take = "indirectComputeCommandAtIndex:";
+        let site = catch_death(|| render.encode_compute_command(0, std::iter::once(kernel(&a, 0))))
+            .unwrap_err();
+        assert_eq!((site.kind, site.file), (DeathKind::Abort, take));
+    }
+
+    /// A compute command's fields sent in one call note what one call a field notes ([`After`]):
+    /// a buffer whose command took them one call a field and one whose command took them in one
+    /// call hold the same sides (a reset, the pipeline's, the dispatch's and the imageblock's
+    /// words, and threadgroup memory lengths of the record and past the last command's), and
+    /// answer the same.
+    #[test]
+    fn a_command_sent_in_one_call_notes_what_one_call_a_field_notes() {
+        let d = dev();
+        let pipeline = icb_pipeline(&d);
+        let cmds = || {
+            [
+                IcbComputeCmd::Reset,
+                IcbComputeCmd::SetComputePipelineState {
+                    pipeline_state: Some(&pipeline),
+                },
+                IcbComputeCmd::SetThreadgroupMemoryLength {
+                    length: 64,
+                    index: 1,
+                },
+                IcbComputeCmd::SetThreadgroupMemoryLength {
+                    length: 128,
+                    index: 40,
+                },
+                IcbComputeCmd::SetImageblockWidth {
+                    width: 8,
+                    height: 8,
+                },
+                IcbComputeCmd::ConcurrentDispatchThreads {
+                    threads_per_grid: MtlSize::new(4, 1, 1),
+                    threads_per_threadgroup: MtlSize::new(4, 1, 1),
+                },
+            ]
+        };
+        let one = make::<VulkanPlatform>(&d, &compute_desc(), 1);
+        let c = one.compute_command(0).unwrap().unwrap();
+        for cmd in cmds() {
+            c.encode(cmd).unwrap();
+        }
+        let batched = make::<VulkanPlatform>(&d, &compute_desc(), 1);
+        assert!(
+            batched
+                .encode_compute_command(0, cmds().into_iter())
+                .unwrap()
+        );
+        let sides = |icb: &VulkanIcb| format!("{:?}", *icb.sides.lock());
+        assert_eq!(sides(&one), sides(&batched));
+        // The length past the last command's lies among the words the command's dispatch setter
+        // wrote after it, which its getter relays as inexact (a death in strict mode) on either
+        // buffer: the sides compared above hold it.
+        let read = |icb: &VulkanIcb| {
+            let c = icb.compute_command(0).unwrap().unwrap();
+            (
+                c.threadgroup_memory_length(1).unwrap(),
+                c.command_type(),
+                c.image_block_args(),
+            )
+        };
+        assert_eq!(read(&one), read(&batched));
+        assert_eq!(read(&batched).0, 64);
+    }
+
+    /// A command's fields sent in one call announce nothing between them: no degradation of the
+    /// runtime's, heard, counted or relayed, comes inside the call, so none moves from where one
+    /// call a field would meet it to the call's end. Of a compute command's every field and a
+    /// render command's every field but its pipeline state.
+    #[test]
+    fn a_command_sent_in_one_call_announces_nothing() {
+        let d = dev();
+        let pipeline = icb_pipeline(&d);
+        let (a, b) = (holding(&d, &[1; 4]), holding(&d, &[2; 4]));
+        let compute = make::<VulkanPlatform>(&d, &compute_desc(), 1);
+        let render = make::<VulkanPlatform>(&d, &render_desc(), 1);
+        let size = MtlSize::new(4, 1, 1);
+        let before = crate::answer::degradation_counts();
+        let (sent, heard) = crate::answer::hearing(|| {
+            let compute_cmds = [
+                IcbComputeCmd::Reset,
+                IcbComputeCmd::SetComputePipelineState {
+                    pipeline_state: Some(&pipeline),
+                },
+                IcbComputeCmd::SetKernelBuffer {
+                    buffer: Some(&a),
+                    offset: 0,
+                    index: 0,
+                },
+                IcbComputeCmd::SetKernelBufferAttributeStride {
+                    buffer: Some(&b),
+                    offset: 16,
+                    stride: 4,
+                    index: 1,
+                },
+                IcbComputeCmd::SetThreadgroupMemoryLength {
+                    length: 64,
+                    index: 0,
+                },
+                IcbComputeCmd::SetStageInRegion {
+                    region: MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(1, 1, 1)),
+                },
+                IcbComputeCmd::SetImageblockWidth {
+                    width: 8,
+                    height: 8,
+                },
+                IcbComputeCmd::ConcurrentDispatchThreadgroups {
+                    threadgroups_per_grid: size,
+                    threads_per_threadgroup: size,
+                },
+                IcbComputeCmd::SetBarrier,
+                IcbComputeCmd::ClearBarrier,
+            ];
+            let render_cmds = [
+                IcbRenderCmd::Reset,
+                IcbRenderCmd::SetVertexBuffer {
+                    buffer: Some(&a),
+                    offset: 0,
+                    index: 0,
+                },
+                IcbRenderCmd::SetVertexBufferAttributeStride {
+                    buffer: Some(&b),
+                    offset: 16,
+                    stride: 4,
+                    index: 1,
+                },
+                IcbRenderCmd::SetFragmentBuffer {
+                    buffer: Some(&a),
+                    offset: 0,
+                    index: 0,
+                },
+                IcbRenderCmd::DrawPrimitives {
+                    primitive_type: 3,
+                    vertex_start: 0,
+                    vertex_count: 3,
+                    instance_count: 1,
+                    base_instance: 0,
+                },
+                IcbRenderCmd::SetBarrier,
+                IcbRenderCmd::ClearBarrier,
+            ];
+            (
+                compute.encode_compute_command(0, compute_cmds.into_iter()),
+                render.encode_render_command(0, render_cmds.into_iter()),
+            )
+        });
+        assert_eq!((sent.0.unwrap(), sent.1.unwrap()), (true, true));
+        assert_eq!(heard, []);
+        assert_eq!(crate::answer::degradation_counts(), before);
     }
 
     /// An execution range past the buffer's size, which Metal runs without validation, dies at

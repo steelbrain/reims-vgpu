@@ -1,7 +1,9 @@
 //! What an `ICB_SLOTS` costs the thread that carries it out, a command at a time: 16384 render
 //! commands, each a full slot (its pipeline state, two vertex buffers, a fragment buffer and a
 //! draw), through the decoder as ring 0 hands it the message, against the same setters sent
-//! through the platform's core traits and, on the Vulkan platform, through the runtime alone: a
+//! through the platform's core traits, one call a command as the decoder sends them
+//! (`encode_render_command`), and, on the Vulkan platform, through the runtime alone, one call a
+//! command (`set_render_command`): a
 //! measurement, run by hand in a release build, in a potluck job holding the host's GPU
 //! (`--gpu`: `cargo nextest run -p reims-vgpu --release
 //! --no-default-features --features reims-vgpu/vulkan --run-ignored only -E
@@ -34,9 +36,7 @@ use reims_vgpu_vulkan::core::platform::blit::ResourceRef;
 use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
 use reims_vgpu_vulkan::core::platform::descriptor::RenderPassDescriptor as _;
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
-use reims_vgpu_vulkan::core::platform::icb::{
-    IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
-};
+use reims_vgpu_vulkan::core::platform::icb::{IcbRenderCmd, IndirectCommandBuffer as _};
 use reims_vgpu_vulkan::core::platform::render::{RenderCmd, RenderEncoder as _};
 use reims_vgpu_vulkan::core::platform::types::NsRange;
 use reims_vgpu_vulkan::core::platform::values::{
@@ -310,7 +310,8 @@ impl<P: ApiPlatform> Bench<P> {
         spent
     }
 
-    /// One repetition through the platform's core traits, on the decoder's objects.
+    /// One repetition through the platform's core traits, on the decoder's objects: one call a
+    /// command.
     fn through_platform(&self) -> Counts {
         let icb = self.icb();
         let (a, b, pipeline) = (
@@ -320,7 +321,6 @@ impl<P: ApiPlatform> Bench<P> {
         );
         let start = counts();
         for i in 0..COMMANDS {
-            let c = icb.render_command(i).unwrap().unwrap();
             let cmds = [
                 IcbRenderCmd::SetRenderPipelineState {
                     pipeline_state: Some(pipeline),
@@ -348,28 +348,47 @@ impl<P: ApiPlatform> Bench<P> {
                     base_instance: 0,
                 },
             ];
-            for cmd in cmds {
-                c.encode(cmd).unwrap();
-            }
+            assert!(icb.encode_render_command(i, cmds.into_iter()).unwrap());
         }
         counts() - start
     }
 }
 
-/// The runtime alone, on the Vulkan platform's objects of `bench`.
+/// The runtime alone, on the Vulkan platform's objects of `bench`: one call a command.
 fn through_runtime(bench: &Bench<reims_vgpu_vulkan::VulkanPlatform>) -> Counts {
+    use metal2vulkan_runtime::IndirectRenderSet as S;
     let triangle = metal2vulkan_runtime::DrawPrimitiveType::from_raw(TRIANGLE).unwrap();
     let icb = &bench.icb().raw;
     let (a, b) = (&bench.buffer(BUFFER_A).raw, &bench.buffer(BUFFER_B).raw);
     let pipeline = &bench.pipeline().raw;
     let start = counts();
     for i in 0..COMMANDS {
-        let c = icb.indirect_render_command_at(i).unwrap();
-        c.set_render_pipeline_state(pipeline).unwrap();
-        c.set_vertex_buffer(Some(a), (i % 16) * 16, 0).unwrap();
-        c.set_vertex_buffer(Some(b), 0, 1).unwrap();
-        c.set_fragment_buffer(Some(a), 256, 0).unwrap();
-        c.draw_primitives(triangle, 0, 3, 1, 0).unwrap();
+        let sets = [
+            S::SetRenderPipelineState(pipeline),
+            S::SetVertexBuffer {
+                buffer: Some(a),
+                offset: (i % 16) * 16,
+                index: 0,
+            },
+            S::SetVertexBuffer {
+                buffer: Some(b),
+                offset: 0,
+                index: 1,
+            },
+            S::SetFragmentBuffer {
+                buffer: Some(a),
+                offset: 256,
+                index: 0,
+            },
+            S::DrawPrimitives {
+                primitive_type: triangle,
+                vertex_start: 0,
+                vertex_count: 3,
+                instance_count: 1,
+                base_instance: 0,
+            },
+        ];
+        icb.set_render_command(i, sets).unwrap();
     }
     counts() - start
 }
