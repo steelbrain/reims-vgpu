@@ -3,8 +3,8 @@
 //! A profile is one QEMU machine for one guest architecture: its binary, accelerator, devices
 //! and what it can attach. Each host supports the profiles [`Profile::supported_on`] lists, and
 //! only Linux on x86-64 has one: [`Profile::Q35X86_64`], `q35` on KVM, booted through OpenCore,
-//! with reims-vgpu's own GPU device. A Mac host ran arm64 guests on vmapple, which went with
-//! apple-gfx, and runs none ([`UNSUPPORTED`]).
+//! with reims-vgpu's own GPU device. A Mac host runs none ([`UNSUPPORTED`]): reims-ctl makes no
+//! arm64 VMs, and an arm64 guest boots on Ambrosia without it (docs/qemu.md, "arm64 guests").
 //!
 //! Another host or guest architecture is another profile (x86-64 guests on an Intel Mac would be
 //! `q35` on HVF, without the memfd RAM only Linux has): add it here and in `qemu.rs`.
@@ -158,8 +158,7 @@ impl fmt::Display for Profile {
 mod tests {
     use super::*;
 
-    /// Linux on x86-64 runs x86-64 guests; a Mac, which ran arm64 guests on vmapple, and any
-    /// other host run none.
+    /// Linux on x86-64 runs x86-64 guests; a Mac and any other host run none.
     #[test]
     fn only_linux_on_x86_64_runs_vms() {
         let linux = Host {
