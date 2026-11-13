@@ -875,6 +875,45 @@ target, and the default source, an analog input, ran in its place):
 - A recording alone runs as on the one device: 94 receive buffers in 8 s,
   and the source's audio in each second.
 
+On one device of both streams, macOS 11's Core Audio daemon can die at any
+sound. **Measured** with the 11.7.11 (20G1443) guest booted with
+`vmware-svga` in place of the graphics device, on homelab-um870 (a host
+with no PipeWire source: the capture stream ends in `no target node
+available`), vendor/qemu 1422502b with the stream traces of 87729d88,
+2026-11-13, playing alert beeps (`osascript -e beep`) and system sounds
+(`afplay`) in rounds a few seconds apart:
+- On the one device, each sound sets up both streams (393,216-byte buffers
+  of 65,536-byte periods, stereo float at 48 kHz), posts four receive
+  buffers to the input, starts both, and at its end stops and releases
+  both. At each of the input's stops the four receive buffers were still
+  posted, and the RELEASE completed them, with no audio in them.
+- `coreaudiod` died at the 12th round (m3-max-25374), on its
+  `com.apple.AVIOStream.data` queue in AppleVirtIOSound's
+  `AVIOStreamRingBuffer::writeOutputFrames`, at the assertion `bytesToWrite
+  <= _bufferSize`. appwalk8's walk w-780m-11 died at the same place on the
+  same plug-in, its `memmove` of 0x1b280000 bytes faulting at an address in
+  a shared library's `__TEXT`.
+- On vendor/qemu e829b256, before the capture changes of 8abc8492 to
+  1422502b, the same rounds killed it at the 12th as well (m3-max-25417),
+  in the same function, dividing by a buffer size of 0.
+- On the two devices reims-ctl gives, the same harness's 60 rounds started
+  the output device alone, its stream with nothing posted at each stop, and
+  the daemon lived (m3-max-25414).
+
+Why, read from the code of 11.7.11's AppleVirtIOSound HAL plug-in (74.120.4)
+and of its `AppleVirtIO` kext (both disassembled for this and not
+committed): each receive buffer's completion block holds a pointer to the
+input stream's ring. The plug-in's `stopStream` frees an input ring at once,
+because the ring counts data in flight only for output, and then sends STOP
+and RELEASE. The kext completes every stream message as a success, passing
+the plug-in only `latency_bytes`, so each receive buffer the device completes
+at RELEASE, as virtio's sound device must, has its block write into the
+freed ring. It dies only where something has taken that memory meanwhile.
+macOS 27.0.1's plug-in keeps a stopped ring until its buffers come back, and
+sends STOP only then. No answer of the device's avoids it: the guest frees
+the ring before it stops the stream. On reims-ctl's two devices a sound
+never starts an input stream, so only a recording's end reaches it.
+
 
 `pa` in place of `pipewire` uses PulseAudio, and `none` gives the guest a
 working output whose samples QEMU drops. macOS 26 for x86-64 ships no
