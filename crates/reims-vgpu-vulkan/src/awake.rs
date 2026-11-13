@@ -49,7 +49,11 @@
 //! - **A recovered device.** The objects are of the generation of the device they were made on
 //!   (`crate::generation`): where the runtime has made its `VkDevice` again since, a touch first
 //!   destroys them on the old one and makes them, with a new queue, on the new one; a touch whose
-//!   queue a recovery moved as it was submitted submits nothing.
+//!   queue a recovery moved as it was submitted submits nothing. While the GPU is busy, so that
+//!   no touch comes, a look that finds the device recovered lets the old objects go, so the
+//!   toucher keeps the old generation no longer than a look. Where the old `VkDevice` stopped
+//!   and was parked (`crate::generation`, "A parked generation"), the objects are left there as
+//!   they are, never waited for nor destroyed, as the runtime leaves its own.
 //! - **At the process's exit** the threads make no Vulkan call. The driver's destructors run
 //!   then, on the exiting thread, while every other thread goes on, and a call into what they
 //!   freed ends the process. Measured on the RTX 5080 Laptop GPU (NVIDIA 615.71.09), before the
@@ -267,6 +271,20 @@ fn keep(device: &rt::Device, shared: &Shared, look: Duration) {
         }
         let now = clock.now_mono();
         match keep.look(shared.work.load(Ordering::SeqCst), now) {
+            // A toucher of a generation the device no longer serves goes at the next look, so it
+            // keeps the old `VkDevice` no longer than that while the GPU is busy.
+            Look::Busy if toucher.is_some() => {
+                let Some(held) = crate::exit_gate::step() else {
+                    stay(toucher);
+                };
+                if toucher
+                    .as_ref()
+                    .is_some_and(|t| !t.generation.serves(&t.queue))
+                {
+                    drop(toucher.take());
+                }
+                drop(held);
+            }
             Look::Busy => {}
             Look::Touch => {
                 let Some(held) = crate::exit_gate::step() else {
@@ -465,7 +483,16 @@ impl Toucher {
 }
 
 impl Drop for Toucher {
+    /// Waits up to [`LAST_WAIT`] for the last submission, then destroys the objects on the
+    /// generation they were made on; on a parked one, leaves them as they are (the module docs).
     fn drop(&mut self) {
+        if self.generation.is_parked() {
+            log::debug!(
+                target: TARGET,
+                "the toucher's objects are left on the device's parked VkDevice"
+            );
+            return;
+        }
         let made_on = self.generation.device().clone();
         // SAFETY: the handles are used while the generation, which `made_on` holds, lives: its
         // `VkDevice`, on which every object here was made, whether or not it still serves.

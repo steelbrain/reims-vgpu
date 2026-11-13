@@ -26,9 +26,13 @@
 //! - **The wait has no bound of its own**: a copy waits for the GPU however long it takes, as a
 //!   Mac's video work waits for its GPU, so a GPU slowed by other work slows the picture and does
 //!   not fail it. A GPU that hangs loses the device (an execution timeout, the Vulkan
-//!   specification's typical cause of a lost device), and a wait for a fence with the maximum
-//!   timeout returns in finite time once the device is lost, answering `VK_ERROR_DEVICE_LOST` or
-//!   success (the specification's "Lost Device").
+//!   specification's typical cause of a lost device), and a wait for a fence returns in finite
+//!   time once the device is lost, answering `VK_ERROR_DEVICE_LOST` or success (the
+//!   specification's "Lost Device"). A GPU whose work stops with no loss from the driver
+//!   (NVIDIA's `Xid 109`, after which a fence wait answers `VK_TIMEOUT` and never the loss) has
+//!   its `VkDevice` parked by the runtime (`crate::generation`, "A parked generation"), where no
+//!   fence ever signals: the wait looks every [`PARK_LOOK`] whether the copier's generation was
+//!   parked, and the copy fails there ([`CopyError::Failed`]).
 //! - **A copy whose fence answered an error** is kept, with the caller's hold of the source (so
 //!   the driver writes nothing more into it), until its fence signals; the copier refuses copies
 //!   meanwhile.
@@ -39,7 +43,8 @@
 //!   of the device they were made on (`crate::generation`). Where the runtime has made its
 //!   `VkDevice` again since, a copy first destroys them on the old one and makes them on the new
 //!   one. A buffer made before the recovery is refused, and so is a copy whose queue a recovery
-//!   moved as it was submitted, with nothing submitted.
+//!   moved as it was submitted, with nothing submitted. On a parked `VkDevice` the old objects and
+//!   imports are left as they are, never waited for nor destroyed, as the runtime leaves its own.
 //!
 //! **Measured** with a libva and Vulkan program written from scratch (2026-11-08), surfaces filled
 //! by `vaPutImage`, each plane copied into a buffer at 0x20 with rows of the frame's bytes, every
@@ -67,6 +72,10 @@ const MOST_IMPORTS: usize = 128;
 
 /// How long the copier's end waits for a copy kept after its fence answered an error.
 const LAST_WAIT: Duration = Duration::from_secs(1);
+
+/// How long each wait of a copy's for its fence runs before it looks whether the generation was
+/// parked (the module docs): its wait has no bound but that one.
+const PARK_LOOK: Duration = Duration::from_secs(1);
 
 /// A plane's format: its texels' components and bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,8 +231,9 @@ impl PlaneCopier {
 
     /// Copies each of `copies` (module docs) and waits for the GPU as long as it takes: `Ok` with
     /// the copies' GPU time where the queue measures it, once every plane is in its buffer. Where
-    /// the fence answers an error, the device lost, the copy is kept with `hold`, which keeps the
-    /// sources unwritten, until its fence signals ([`CopyError::Failed`]). Where the device
+    /// the fence answers an error, the device lost, or the device stopped and its `VkDevice` was
+    /// parked while the copy waited, the copy is kept with `hold`, which keeps the sources
+    /// unwritten, until its fence signals ([`CopyError::Failed`]). Where the device
     /// recovered since the copier's objects were made, they are destroyed and made again on its
     /// new `VkDevice` first.
     pub fn copy(
@@ -419,16 +429,24 @@ impl Objects {
             _hold: hold,
             _targets: copies.iter().map(|copy| copy.to.clone_ref()).collect(),
         };
-        // No bound of its own (module docs): the maximum timeout, `u64::MAX` nanoseconds.
-        // SAFETY: the fence is this copier's.
-        let waited = device
-            .with_loader_word(|| unsafe { vk_device.wait_for_fences(&[fence], true, u64::MAX) });
-        match waited {
-            Ok(()) => {}
-            Err(e) => {
-                self.pending = Some(pending(hold));
-                return Err(CopyError::Failed(format!("its fence answered {e}")));
+        // No bound of its own but the generation's park (module docs).
+        let look = u64::try_from(PARK_LOOK.as_nanos()).unwrap_or(u64::MAX);
+        let waited = loop {
+            // SAFETY: the fence is this copier's.
+            let waited = device
+                .with_loader_word(|| unsafe { vk_device.wait_for_fences(&[fence], true, look) });
+            match waited {
+                Err(vk::Result::TIMEOUT) if self.generation.is_parked() => {
+                    break Err("the device stopped and its VkDevice was parked".to_owned());
+                }
+                Err(vk::Result::TIMEOUT) => {}
+                Ok(()) => break Ok(()),
+                Err(e) => break Err(format!("its fence answered {e}")),
             }
+        };
+        if let Err(why) = waited {
+            self.pending = Some(pending(hold));
+            return Err(CopyError::Failed(why));
         }
         // SAFETY: the fence is this copier's, signalled.
         let reset = device.with_loader_word(|| unsafe { vk_device.reset_fences(&[fence]) });
@@ -883,7 +901,13 @@ fn destination(
 }
 
 impl Drop for Objects {
+    /// Waits up to [`LAST_WAIT`] for a copy kept, then destroys the objects and imports on the
+    /// generation they were made on; on a parked one, leaves them as they are (the module docs).
     fn drop(&mut self) {
+        if self.generation.is_parked() {
+            log::debug!("a plane copier's objects are left on the device's parked VkDevice");
+            return;
+        }
         let device = self.generation.device().clone();
         // SAFETY: the handles are used while the generation, which `device` holds, lives: its
         // `VkDevice`, on which every object here was made, whether or not it still serves.

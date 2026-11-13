@@ -25,6 +25,16 @@
 //! - **The objects it meets.** A runtime object's device is the generation it was made on: a
 //!   runtime buffer the user's commands write is checked to be of the user's generation
 //!   ([`Generation::is_of`]) before its handle is recorded.
+//! - **A parked generation.** A `VkDevice` whose work stopped with no loss from the driver (no
+//!   work of it advanced for 10 seconds with some pending, and a probe on another engine of the
+//!   GPU did not complete in 2 seconds: NVIDIA's `Xid 109 CTX SWITCH TIMEOUT`, after which every
+//!   fence wait answers `VK_TIMEOUT` and none answers `VK_ERROR_DEVICE_LOST`) is recovered from as
+//!   a lost one, and parked: the runtime never destroys it nor any object of it, and never waits
+//!   for its queues, since its work never completes (metal2vulkan's `rt::Device::is_parked`).
+//!   The user does the same with its own objects there ([`Generation::is_parked`]): it waits for
+//!   none of its fences and queues past what it has already bounded, and destroys none of them,
+//!   a window's swapchain among them; it lets go of the runtime's objects it holds there, and of
+//!   the generation handle, as after any recovery, which the runtime leaves as they are.
 
 use ash::vk;
 use metal2vulkan_runtime as rt;
@@ -121,6 +131,13 @@ impl Generation {
         handle_of(&generation_serving(queue.device())) == self.handle
     }
 
+    /// Whether this generation's `VkDevice` stopped and is parked (the module docs): its objects
+    /// are left as they are, never waited for nor destroyed. False while it serves, and for one
+    /// lost to the driver's `VK_ERROR_DEVICE_LOST`.
+    pub(crate) fn is_parked(&self) -> bool {
+        self.device.is_parked(self.handle)
+    }
+
     /// Whether `device`, the device of a runtime object (a generation handle), is this
     /// generation: the object's Vulkan handles are of this generation's `VkDevice`.
     pub(crate) fn is_of(&self, device: &rt::Device) -> bool {
@@ -200,5 +217,8 @@ mod tests {
         // The old generation's handles still answer its own `VkDevice` while it is held.
         // SAFETY: only the handle is read, while `first` lives.
         assert_eq!(unsafe { first.raw() }.device.handle(), first.handle);
+        // A recovery from a loss parks nothing: the old generation's objects are destroyed as
+        // before; only a stopped one is parked, which no test here can make.
+        assert!(!first.is_parked() && !second.is_parked());
     }
 }

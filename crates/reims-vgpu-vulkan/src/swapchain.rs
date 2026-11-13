@@ -118,6 +118,14 @@
 //! is taken as complete as after any wait for the queue to idle (metal2vulkan's `device/line.rs`,
 //! read from its code).
 //!
+//! **A parked `VkDevice`.** Where the old `VkDevice` stopped with no loss from the driver and the
+//! runtime parked it (`crate::generation`, "A parked generation"), its queues never idle and its
+//! presents never complete: the swapchain, its images' semaphores and its fences stay in use by
+//! work that never ends. The swapchain's end then waits for nothing and destroys none of them, nor
+//! the surface they are made over (Vulkan destroys a surface only after its swapchains); it lets
+//! go only of the runtime's textures over its images and the command buffers of its frames, which
+//! the runtime leaves as they are on that device.
+//!
 //! **What the runtime announces.** Each batch that uses an image moves it from
 //! `PRESENT_SRC_KHR`, its layout between batches, into `GENERAL` and back: two whole-image
 //! barriers per frame, which the runtime announces once as a degradation of its own.
@@ -1444,8 +1452,18 @@ impl Drop for Swapchain {
     /// The swapchain's end, on the render thread: its frames complete, and where a present is not
     /// known complete, the swapchain waits for its presents' fences, or for the presenting queue
     /// to idle (the module doc); then every swapchain's images' textures, its semaphores and the
-    /// swapchain go, then the fences and the surface.
+    /// swapchain go, then the fences and the surface. On a parked `VkDevice` it waits for nothing
+    /// and destroys none of its own objects, letting go only of the runtime's (the module doc, "A
+    /// parked `VkDevice`").
     fn drop(&mut self) {
+        if self.generation.is_parked() {
+            log::debug!(
+                target: "reims_vgpu_vulkan::swapchain",
+                "a window's swapchain on a parked VkDevice ends: its swapchain, semaphores, fences \
+                 and surface are left"
+            );
+            return;
+        }
         let last = self.retire();
         self.retired.extend(last);
         // An image pending with no swapchain left: its fence is settled before it goes.
