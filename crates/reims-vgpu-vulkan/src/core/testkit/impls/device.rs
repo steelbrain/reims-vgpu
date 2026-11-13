@@ -277,6 +277,13 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
         self.world().copies_guest_ram()
     }
 
+    /// Unlogged, as the world answers it: [`World::recover`].
+    ///
+    /// [`World::recover`]: crate::core::testkit::objects::World::recover
+    fn recoveries(&self) -> u64 {
+        self.world().recoveries()
+    }
+
     /// Unlogged, as the world answers it: [`World::answer_surface_pages`].
     ///
     /// [`World::answer_surface_pages`]: crate::core::testkit::objects::World::answer_surface_pages

@@ -948,6 +948,10 @@ pub struct World {
     ///
     /// [`GpuDevice::copies_guest_ram`]: crate::core::platform::device::GpuDevice::copies_guest_ram
     guest_ram_copies: AtomicBool,
+    /// What the devices' [`GpuDevice::recoveries`] answers ([`World::recover`]).
+    ///
+    /// [`GpuDevice::recoveries`]: crate::core::platform::device::GpuDevice::recoveries
+    recoveries: AtomicU64,
     /// The alignment the devices' [`GpuDevice::linear_rows_pitch`] rounds rows up to, 0 for
     /// none ([`World::lay_linear_rows`]).
     ///
@@ -1009,6 +1013,7 @@ impl World {
             notifications: Mutex::new(Vec::new()),
             splits: AtomicBool::new(false),
             guest_ram_copies: AtomicBool::new(false),
+            recoveries: AtomicU64::new(0),
             linear_rows: AtomicU64::new(0),
             surface_pages: Mutex::new((PagesInPlace::Yes, Vec::new())),
             never_in_place: Mutex::new((None, Vec::new())),
@@ -1129,6 +1134,23 @@ impl World {
     /// [`GpuDevice::copies_guest_ram`]: crate::core::platform::device::GpuDevice::copies_guest_ram
     pub fn copies_guest_ram(&self) -> bool {
         self.guest_ram_copies.load(Ordering::SeqCst)
+    }
+
+    /// Has the devices answer one recovery more ([`GpuDevice::recoveries`]), as a device whose
+    /// lost GPU the platform made again behind it does. Nothing else changes: the fake objects
+    /// made before it go on, their contents kept, so a test sees what the host does at the count
+    /// alone.
+    ///
+    /// [`GpuDevice::recoveries`]: crate::core::platform::device::GpuDevice::recoveries
+    pub fn recover(&self) {
+        self.recoveries.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// What the devices' [`GpuDevice::recoveries`] answers ([`World::recover`]).
+    ///
+    /// [`GpuDevice::recoveries`]: crate::core::platform::device::GpuDevice::recoveries
+    pub fn recoveries(&self) -> u64 {
+        self.recoveries.load(Ordering::SeqCst)
     }
 
     /// Has the devices answer [`GpuDevice::linear_rows_pitch`] with a row's bytes rounded up to

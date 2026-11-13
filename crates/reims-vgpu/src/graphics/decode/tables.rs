@@ -362,6 +362,10 @@ pub(crate) struct Context<P: Platform> {
     /// The command buffers committed since the context's last drain began: each holds a clone
     /// until its completion handler has run ([`super::GraphicsDecoder::drain_context`]).
     pub(crate) drain: Mutex<Arc<Drain>>,
+    /// The device's recoveries its two-copy `Managed` textures were last looked at for
+    /// (`GraphicsDecoder::refill_managed`): a command buffer's begin past one refills those made
+    /// before it, under this lock, so no command buffer of the context is begun between.
+    pub(crate) managed_recoveries: Mutex<u64>,
 }
 
 impl<P: Platform> Context<P> {
@@ -376,6 +380,7 @@ impl<P: Platform> Context<P> {
                 views: BTreeMap::new(),
             }),
             drain: Mutex::new(Arc::default()),
+            managed_recoveries: Mutex::new(0),
         }
     }
 

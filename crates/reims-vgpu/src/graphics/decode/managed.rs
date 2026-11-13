@@ -56,10 +56,21 @@
 //! texture past the GPU's memory as Metal does (the Vulkan platform's runtime in system memory,
 //! past a full device-local heap), and lays a buffer whose GPU copy has no room in its bytes, so
 //! its refusal comes only where that memory is gone too.
+//!
+//! **After a recovery of the device** (the platform made its lost GPU again,
+//! [`GpuDevice::recoveries`]), a texture of two copies keeps its CPU copy, the guest's bytes, but
+//! the platform carries its GPU copy with its contents lost. Metal documents no loss of a
+//! resource's contents at its GPU's recovery (a hang ends the command buffer it was in, the SDK's
+//! `MTLCommandBuffer.h`), and the CPU copy holds what every upload brought, so the first command
+//! buffer of the process begun past the recovery fills each such texture's GPU copy again from its
+//! CPU copy, whole, before it begins ([`GraphicsDecoder::refill_managed`]). A buffer's two copies
+//! are the platform's, and its runtime carries them with the host copy's bytes.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use reims_vgpu_graphics::managed::LinearLayout;
+use reims_vgpu_graphics::region::Region;
 use reims_vgpu_graphics::wire::{
     RGFX_MANAGED_TEXTURE_LINEAR, RgfxBufferDidModifyRange, RgfxBufferManagedAtOffset,
     RgfxBufferOverHostMemory, RgfxManagedBufferCreate, RgfxManagedTextureCreate,
@@ -75,7 +86,9 @@ use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_vulkan::core::raise::{OnFault, RaiseResult};
 
 use super::tables::{Entry, GuestBytes};
-use super::{DecodeError, Drain, GraphicsDecoder, ObjHandle, op_fault, read, texture_desc};
+use super::{
+    DecodeError, Drain, GraphicsDecoder, ObjHandle, op_fault, read, refusing, texture_desc,
+};
 
 /// `MTLStorageModeManaged`.
 pub(super) const STORAGE_MODE_MANAGED: u64 = 1;
@@ -118,6 +131,66 @@ pub(crate) struct ManagedCopy<P: Platform> {
     /// The first byte of the heap over a pages block's guest RAM the CPU copy lies in
     /// (`HEAP_OVER_PAGES`); `None` where it lies in the region.
     pub(super) ram: Option<HostPtr>,
+    /// A texture of two copies: the device's recoveries ([`GpuDevice::recoveries`]) as of which
+    /// its GPU copy holds what the uploads from its CPU copy brought, its make's, then each
+    /// refill's ([`GraphicsDecoder::refill_managed`]). Unread for any other.
+    pub(super) gpu_as_of: AtomicU64,
+}
+
+/// A two-copy `Managed` texture whose GPU copy a recovery lost, to fill again from its CPU copy
+/// ([`GraphicsDecoder::refill_managed`]).
+struct Refill<P: Platform> {
+    obj_id: u64,
+    texture: P::Texture,
+    /// The CPU copy's buffer, which keeps a pages block's view mapped where its bytes lie in one.
+    _cpu: P::Buffer,
+    layout: LinearLayout,
+    /// Where the CPU copy starts ([`ManagedCopy::at`], [`ManagedCopy::ram`]).
+    at: u64,
+    ram: Option<HostPtr>,
+}
+
+impl<P: Platform> Refill<P> {
+    /// Every level and slice of the GPU copy replaced from the CPU copy's bytes, in the guest's
+    /// RAM or in `region`, as a `TEXTURE_REPLACE_REGION` of each whole would.
+    fn upload(&self, region: &Region) -> RaiseResult<()> {
+        let three_d = self.texture.texture_type() == TEXTURE_TYPE_3D;
+        for (level, l) in (0u64..).zip(self.layout.levels()) {
+            for slice in 0..self.layout.slices() {
+                let Some((offset, span)) = self.layout.region(level, slice, [0; 3], l.size) else {
+                    continue;
+                };
+                let from = self.at + offset;
+                let first = match self.ram {
+                    Some(first) => first.wrapping_add(from),
+                    None => HostPtr::from_ptr(region.base().wrapping_add(from as usize)),
+                };
+                // SAFETY: the bytes lie inside the layout, which lies inside the CPU copy's bytes
+                // (checked at the create): in the guest's RAM mapping, which stays mapped as long
+                // as the device, in a view the CPU copy's buffer keeps mapped, or in the region,
+                // which the decoder keeps mapped.
+                let bytes = unsafe { HostRange::new(first, span) };
+                let whole = MtlRegion {
+                    origin: MtlOrigin { x: 0, y: 0, z: 0 },
+                    size: MtlSize {
+                        width: l.size[0],
+                        height: l.size[1],
+                        depth: l.size[2],
+                    },
+                };
+                let bytes_per_image = if three_d { l.bytes_per_image } else { 0 };
+                (self.texture).replace_region(
+                    whole,
+                    level,
+                    slice,
+                    bytes,
+                    l.bytes_per_row,
+                    bytes_per_image,
+                )?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Whether a texture over a buffer can have the shape `create` names: a one-level, one-sample 2D
@@ -288,6 +361,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             cpu: None,
             layout: None,
             ram,
+            gpu_as_of: AtomicU64::new(0),
         };
         self.store_managed(m.obj_id, buffer, span, copy);
         Ok(Ok(()))
@@ -341,6 +415,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             cpu: None,
             layout: None,
             ram: bytes.ram,
+            gpu_as_of: AtomicU64::new(0),
         };
         let mut entry = Entry::of(ObjHandle::Buffer(buffer)).over(span);
         entry.managed = Some(copy);
@@ -390,6 +465,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             cpu: None,
             layout: None,
             ram: None,
+            gpu_as_of: AtomicU64::new(0),
         };
         self.store_managed(obj_id, buffer, (at, length), copy);
     }
@@ -460,6 +536,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(m) = read::<RgfxManagedTextureCreate>(message) else {
             return Ok(Err(DecodeError::Malformed));
         };
+        // Read before the make, so a texture made as the device recovers counts as made before
+        // it, and is filled again ([`Self::refill_managed`]).
+        let made_at = device.recoveries();
         if !self.holds_resource_id(m.obj_id, m.resource_id) {
             return Ok(Err(DecodeError::BadResourceId));
         }
@@ -506,28 +585,30 @@ impl<P: Platform> GraphicsDecoder<P> {
         };
         if self.unified() && in_place_shape(&m) {
             if let Some(texture) = in_place(self)? {
-                return self.store_managed_texture(m.obj_id, texture, span, bytes, None, layout);
+                let copy = (bytes, None, layout, made_at);
+                return self.store_managed_texture(m.obj_id, texture, span, copy);
             }
             log_two_copies_on_unified_memory(&m);
         }
         let descriptor = self.platform.texture_descriptor(&desc);
         match device.new_texture(OnFault::Return, &descriptor)? {
             Some(texture) => {
-                self.store_managed_texture(m.obj_id, texture, span, bytes, Some(cpu), layout)
+                let copy = (bytes, Some(cpu), layout, made_at);
+                self.store_managed_texture(m.obj_id, texture, span, copy)
             }
             None => Ok(Err(DecodeError::Refused)),
         }
     }
 
-    /// Stores a `Managed` texture lying over `span`, and its CPU copy, the guest's `bytes`.
+    /// Stores a `Managed` texture lying over `span`, and its CPU copy: the guest's bytes, the
+    /// `Shared` buffer over them where the texture is a copy of its own, its layout, and the
+    /// device's recoveries as it was made.
     fn store_managed_texture(
         &self,
         obj_id: u64,
         texture: P::Texture,
         span: Option<(u64, u64)>,
-        bytes: GuestBytes,
-        cpu: Option<P::Buffer>,
-        layout: LinearLayout,
+        (bytes, cpu, layout, made_at): (GuestBytes, Option<P::Buffer>, LinearLayout, u64),
     ) -> RaiseResult<Result<(), DecodeError>> {
         let mut entry = Entry::of(ObjHandle::Texture(texture)).over(span);
         entry.managed = Some(ManagedCopy {
@@ -536,6 +617,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             cpu,
             layout: Some(layout),
             ram: bytes.ram,
+            gpu_as_of: AtomicU64::new(made_at),
         });
         self.store(obj_id, entry);
         Ok(Ok(()))
@@ -617,6 +699,82 @@ impl<P: Platform> GraphicsDecoder<P> {
             )
         });
         Ok(Ok(()))
+    }
+
+    /// After a recovery of the device ([`GpuDevice::recoveries`]), as the first command buffer of
+    /// `context` begun past it begins: each of the context's two-copy `Managed` textures made
+    /// before the recovery has its GPU copy filled again from its CPU copy, every level and slice
+    /// whole, before this call returns, as a `TEXTURE_REPLACE_REGION` of each would. The
+    /// recovery carries such a texture with its contents lost (the Vulkan platform's runtime
+    /// makes it again in new memory), where Metal documents no such loss. The CPU copy holds what
+    /// every upload brought and what each synchronize copied back; a GPU write no synchronize
+    /// copied back before the recovery is lost with it, as Metal promises the CPU a GPU write
+    /// only after a synchronize. A texture over its CPU copy, on a GPU that shares the CPU's
+    /// memory, lies in the guest's memory, which keeps its bytes.
+    ///
+    /// The context's lock of its count is held throughout, so no other command buffer of the
+    /// context begins before the refill is done; those of the lost device failed with it. A
+    /// command buffer the new device runs before the runtime announces the recovery (once the new
+    /// device serves) may meet a texture before its refill. A texture the platform raises at is
+    /// logged and left as the recovery left it. Nothing where the device has not recovered since
+    /// the context last looked: a lock of the context's own, which no other context takes.
+    pub(super) fn refill_managed(&self, device: &P::Device, context: u32) {
+        let now = device.recoveries();
+        if now == 0 {
+            return;
+        }
+        let Some(state) = self.context_state(context) else {
+            return;
+        };
+        let mut seen = state.managed_recoveries.lock();
+        if *seen == now {
+            return;
+        }
+        *seen = now;
+        let mut refills = Vec::new();
+        state.for_each_live(|obj_id, entry| {
+            let (ObjHandle::Texture(texture), Some(copy)) = (&entry.handle, &entry.managed) else {
+                return;
+            };
+            let (Some(cpu), Some(layout)) = (&copy.cpu, &copy.layout) else {
+                return;
+            };
+            if copy.gpu_as_of.swap(now, Ordering::AcqRel) == now {
+                return;
+            }
+            refills.push(Refill::<P> {
+                obj_id,
+                texture: texture.clone_ref(),
+                _cpu: cpu.clone_ref(),
+                layout: layout.clone(),
+                at: copy.at,
+                ram: copy.ram,
+            });
+        });
+        if refills.is_empty() {
+            return;
+        }
+        let bytes: u64 = refills.iter().map(|r| r.layout.size()).sum();
+        let mut refused = 0usize;
+        for refill in &refills {
+            if let Err(raise) = refusing(|| refill.upload(&self.region)) {
+                refused += 1;
+                log::warn!(
+                    target: "reims_vgpu::graphics", kind:% = raise;
+                    "the device recovered: the GPU copy of Managed texture {:#x} was not filled \
+                     again from its CPU copy, the platform raised ({raise:?})",
+                    refill.obj_id
+                );
+            }
+        }
+        log::info!(
+            target: "reims_vgpu::graphics",
+            "the device recovered: context {context}'s {} Managed textures of two copies had \
+             their GPU copies filled again from their CPU copies ({bytes} bytes), {refused} of \
+             them refused",
+            refills.len()
+        );
+        drop(seen);
     }
 
     /// `synchronizeResource:` (`which` `None`) or `synchronizeTexture:slice:level:` of the
@@ -1281,6 +1439,124 @@ mod tests {
             r.synchronize_texture(21, 0, 3).is_err(),
             "a level past the texture"
         );
+    }
+
+    /// After a recovery of the device, the first command buffer of the process fills each
+    /// two-copy texture made before it again from its CPU copy, every level whole, before the
+    /// buffer is begun on the platform; a texture made after the recovery, and every later buffer,
+    /// takes none, and a second recovery refills both textures again.
+    #[test]
+    fn a_recovery_fills_two_copy_textures_again_from_their_cpu_copies() {
+        use reims_vgpu_graphics::ops::{RGFX_COMMAND_BUFFER_OPS_OFFSET, RgfxCommandBuffer};
+        use reims_vgpu_graphics::wire::RgfxQueueCreate;
+        use reims_vgpu_graphics::wire::{RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_QUEUE_CREATE};
+        use reims_vgpu_vulkan::core::testkit::objects::CompleteOn;
+
+        let replace = "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:";
+        let mut r = rig(false);
+        let at = BLOCKS + 0x1_0000;
+        let later = at + 0x2_0000;
+        // 100x60 RGBA8, three levels: 42240 bytes, its levels at 0, 30720 and 38400.
+        assert_eq!(r.buffer(20, at, 42240, 0), Ok(()));
+        assert_eq!(r.buffer(22, later, 42240, 0), Ok(()));
+        assert_eq!(r.texture(21, 20, rgba(100, 60, 3)), Ok(()));
+        let queue = RgfxQueueCreate {
+            header: header(RGFX_CMD_QUEUE_CREATE),
+            obj_id: 1,
+            ..RgfxQueueCreate::default()
+        };
+        assert_eq!(r.send(&queue), Ok(()));
+        let mut seqno = 0;
+        let mut begin = |r: &mut Rig| -> Vec<(&'static str, Vec<Arg>)> {
+            seqno += 1;
+            let m = RgfxCommandBuffer {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_COMMAND_BUFFER,
+                    size: RGFX_COMMAND_BUFFER_OPS_OFFSET,
+                    seqno,
+                },
+                queue_obj_id: 1,
+                cb_obj_id: 100 + seqno,
+                op_bytes: 0,
+            };
+            let mark = r.p.call_log().mark();
+            assert_eq!(r.send(&m), Ok(()));
+            r.p.world().complete_all(CompleteOn::Caller);
+            let calls = r.p.call_log().since(mark).into_iter();
+            calls.map(|c| (c.sel, c.args)).collect()
+        };
+        let refills = |calls: &[(&'static str, Vec<Arg>)]| -> Vec<Vec<Arg>> {
+            (calls.iter())
+                .filter(|(sel, _)| *sel == replace)
+                .map(|(_, args)| args.clone())
+                .collect()
+        };
+        let whole = |r: &Rig, first: u64| -> Vec<Vec<Arg>> {
+            let levels = [
+                (0u64, 100u64, 60u64, 512u64),
+                (30720, 50, 30, 256),
+                (38400, 25, 15, 256),
+            ];
+            (0u64..)
+                .zip(levels)
+                .map(|(level, (offset, width, height, row))| {
+                    let region = MtlRegion {
+                        origin: MtlOrigin { x: 0, y: 0, z: 0 },
+                        size: MtlSize {
+                            width,
+                            height,
+                            depth: 1,
+                        },
+                    };
+                    let ptr = r.region.base() as usize + (first + offset) as usize;
+                    vec![
+                        Arg::val(&region),
+                        Arg::U64(level),
+                        Arg::U64(0),
+                        Arg::Ptr(ptr),
+                        Arg::U64(row),
+                        Arg::U64(0),
+                    ]
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            refills(&begin(&mut r)),
+            Vec::<Vec<Arg>>::new(),
+            "no recovery, no refill"
+        );
+        r.p.world().recover();
+        assert_eq!(r.texture(23, 22, rgba(100, 60, 3)), Ok(()));
+        let calls = begin(&mut r);
+        assert_eq!(
+            refills(&calls),
+            whole(&r, at),
+            "texture 21's levels, from its CPU copy"
+        );
+        let first_refill = calls.iter().position(|(sel, _)| *sel == replace).unwrap();
+        let opened = calls
+            .iter()
+            .position(|(sel, _)| *sel == "commandBuffer")
+            .unwrap();
+        assert!(
+            first_refill < opened,
+            "the refill comes before the buffer is begun: {calls:?}"
+        );
+        assert_eq!(
+            refills(&begin(&mut r)),
+            Vec::<Vec<Arg>>::new(),
+            "one refill a recovery"
+        );
+
+        r.p.world().recover();
+        let mut both = whole(&r, at);
+        both.extend(whole(&r, later));
+        let mut got = refills(&begin(&mut r));
+        let key = |args: &Vec<Arg>| format!("{args:?}");
+        got.sort_by_key(key);
+        both.sort_by_key(key);
+        assert_eq!(got, both, "a second recovery refills both textures");
     }
 
     /// A `Managed` texture's CPU copy is its buffer's contents wherever they lie in the guest's

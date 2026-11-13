@@ -1519,6 +1519,12 @@ impl<P: Platform> GraphicsDecoder<P> {
         // The op stream follows the message's fixed part; `op_bytes` must count all of it.
         let parsed = read::<RgfxCommandBuffer>(message)
             .and_then(|m| ops_of(message, &m).map(|ops| (m, ops, take(ops))));
+        // Past a recovery of the device, its process's two-copy `Managed` textures have their GPU
+        // copies filled again first, before anything of the buffer reaches the platform
+        // ([`GraphicsDecoder::refill_managed`]).
+        if let Some((m, _, _)) = &parsed {
+            self.refill_managed(device, context_of(m.queue_obj_id));
+        }
         // The buffers of its process's other queues it is committed after, as its `COMMIT_ORDER`
         // names them ([`super::commit_order`]).
         if let Some((m, _, take)) = &parsed
