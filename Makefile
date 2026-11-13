@@ -53,8 +53,9 @@ vendor/qemu/configure:
 #
 # ninja builds the binary, at its own default parallelism or a caller's -jN:
 # QEMU's Makefile hands ninja -j1 where make was given no -j, which took
-# about 7 minutes for a clean build. ninja has meson regenerate build.ninja
-# where a meson file changed, as install-ctl.sh's build relies on.
+# 310 s for a clean build where ninja's default took 59 s (docs/qemu.md).
+# ninja has meson regenerate build.ninja where a meson file changed, as
+# install-ctl.sh's build relies on.
 QEMU_PKG_CONFIG := $(RUST_DIST)/lib/pkgconfig
 QEMU_PC_READ := $(QEMU_BUILD)/reims-vgpu.pc.configured
 QEMU_CONFIGURE_INPUTS := configure scripts/meson-buildoptions.sh pythondeps.toml VERSION
