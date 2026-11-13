@@ -1616,7 +1616,8 @@ past 16 KiB rounded up to a multiple of it: 256, 264, 280, 16384, 32768 and 4915
 above; and 512, Shared), and their `isAliasable`, NO. A render pipeline's handles and tables are
 nil, with Metal's unsupported error, as `supportsFunctionPointersFromRender` answers NO. A table
 read through an argument buffer without `useResource:` is read, where the AMD's command buffer
-times out: inside the envelope, as no Mac's correct use depends on it.
+times out: inside the envelope, as no Mac's correct use depends on it. A table answers
+`setPurgeableState:` NonVolatile whatever it is told, as the Intel's and the M3 Max's do (Q35).
 
 ## Q30: dynamic libraries
 
@@ -1861,6 +1862,26 @@ are unchanged. The shell tests check both: `test_surface_textures_as_an_apple_gp
 `test_gl_renderer_spi`, `test_pipeline_reflection_from_air`, `test_function_pointers` and
 `test_compute_pipeline_libraries`, and the protocol tests' `test_argument_encoder_members`, beside
 the x86 Macs' tests they keep.
+
+## Q35: what each kind of resource answers to `setPurgeableState:`
+
+Probe: `oracle_bundle DEVICE purgeable.kinds`, 11-13 (m3-max-26711 the AMD and m3-max-26712 the
+Intel under macOS 26.7.1, m3-max-26713 the M3 Max under macOS 27.0.1): each resource is told
+Volatile, KeepCurrent, Empty, KeepCurrent, NonVolatile and KeepCurrent in turn, and each answer
+is printed (2 NonVolatile, 3 Volatile, 4 Empty).
+
+| resource | AMD, Intel and M3 Max alike |
+|---|---|
+| a Shared or Private buffer by length, a Private texture, a texture over an IOSurface, a heap, an indirect command buffer | the state told before: 2 3 3 4 4 2 |
+| a buffer by `newBufferWithBytesNoCopy:` over the process's pages, a texture view, a texture over a buffer, a heap's buffer or texture | NonVolatile to each: 2 2 2 2 2 2 |
+
+A visible function table (Q29) answers NonVolatile to each on the Intel and the M3 Max, and keeps
+the state told on the AMD.
+
+What our stack does: each answer above, on every guest. A no-copy buffer stays NonVolatile
+(`RgfxBuffer`), as a view, a texture over a buffer and a heap's resource do, and so does a
+visible function table, the Intel's and the M3's answer (`RgfxVisibleFunctionTable`); the rest
+keep the state told (`RgfxResource`). The device purges nothing, whatever the state.
 
 ## Not measured
 

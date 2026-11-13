@@ -167,6 +167,9 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 	// and the block's offset; null for any other.
 	RgfxRegion *_pagesRegion;
 	uint64_t _pagesBlock;
+	// YES for the buffer newBufferWithBytesNoCopy: makes (bufferWithBytesNoCopy), over the
+	// caller's bytes, which stays NonVolatile (setPurgeableState:).
+	BOOL _noCopy;
 }
 
 + (instancetype)bufferWithLength:(NSUInteger)length
@@ -322,8 +325,10 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 	                                           slabs:slabs
 	                                          device:device
 	                                      serializer:serializer];
-	if (buffer != nil)
+	if (buffer != nil) {
 		buffer->_allocatedSize = rgfxPagesSpanned(buffer->_contents, length);
+		buffer->_noCopy = YES;
+	}
 	return buffer;
 }
 
@@ -645,6 +650,19 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 // beside a storage mode without that bit, of a length or no-copy (0x200, 0x210 and 0x220 for
 // Shared, Managed and Private; measured: macOS 26.7.1), the GL renderer's bit 20 (0x100000, as
 // it makes its no-copy buffers) and Metal's private bit 24 among them.
+// A no-copy buffer stays NonVolatile whatever it is told: its bytes are the caller's, which no
+// purgeable allocation of the host backs. Metal's do so on the M3 Max, the AMD Radeon Pro 5300M
+// and the Intel UHD Graphics 630 alike (NonVolatile to Volatile, KeepCurrent, Empty, KeepCurrent
+// and NonVolatile; measured: macOS 27.0.1 and 26.7.1, oracle_bundle purgeable.kinds). Any other
+// keeps the state it is told (RgfxResource).
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state
+{
+	if (_noCopy) {
+		return MTLPurgeableStateNonVolatile;
+	}
+	return [super setPurgeableState:state];
+}
+
 - (MTLResourceOptions)resourceOptions
 {
 	id<MTLHeap> heap = self.heap;

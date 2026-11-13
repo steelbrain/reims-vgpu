@@ -12847,7 +12847,7 @@ void drainRing(TestRing &ring)
 // 0x100, 1920-byte rows) writes through it. The deallocator gets the pointer and length once the
 // host has dropped the buffer. Metal's refusals are nil: a length of 0, Private storage, a range
 // not wholly mapped. A null pointer is contents of the buffer's own; bytes in the region are
-// used in place.
+// used in place. The buffer stays NonVolatile whatever purgeable state it is told, as Metal's.
 void test_no_copy_buffers()
 {
 	@autoreleasepool {
@@ -12891,6 +12891,12 @@ void test_no_copy_buffers()
 		                                       serializer:&f.ser];
 		CHECK(b != nil && [b contents] == p && b.length == 0x14000 && [b rgfxShadow] != nullptr);
 		CHECK(b.allocatedSize == 0x14000); // the pages its bytes meet, as the x86 Macs answer
+		// It stays NonVolatile whatever it is told, as Metal's (oracle_bundle purgeable.kinds).
+		CHECK([b setPurgeableState:MTLPurgeableStateVolatile] == MTLPurgeableStateNonVolatile);
+		CHECK([b setPurgeableState:MTLPurgeableStateKeepCurrent] == MTLPurgeableStateNonVolatile);
+		CHECK([b setPurgeableState:MTLPurgeableStateEmpty] == MTLPurgeableStateNonVolatile);
+		CHECK([b setPurgeableState:MTLPurgeableStateKeepCurrent] == MTLPurgeableStateNonVolatile);
+		CHECK(!b.rgfxIsPurgeable);
 		// Its GPU copy is a range of a slab: a heap over a block, the buffer placed in it.
 		auto heap =
 		    expectMessage<RgfxHeapOverHostMemory>(f.control, RGFX_CMD_HEAP_OVER_HOST_MEMORY);
@@ -14115,8 +14121,9 @@ struct FunctionPointerDevice {
 // resource id, size and options; its sets go on the ring (FUNCTION_TABLE_SET), a nil handle as
 // 0, and a range past its entries sets none. A handle's gpuResourceID and the pipeline's
 // functionHandleWithName: raise an unrecognized selector, as the AMD 5300M's do, but on an Apple GPU
-// a handle's gpuResourceID is 0, as the M3 Max's. Where the host makes none, each is nil and asks
-// nothing.
+// a handle's gpuResourceID is 0, as the M3 Max's. A table stays NonVolatile whatever purgeable
+// state it is told, as the M3 Max's and the Intel 630's do. Where the host makes none, each is nil
+// and asks nothing.
 void test_function_pointers()
 {
 	Fixture fx;
@@ -14198,8 +14205,11 @@ void test_function_pointers()
 	CHECK(t.storageMode == MTLStorageModeManaged && t.cpuCacheMode == MTLCPUCacheModeDefaultCache &&
 	      t.hazardTrackingMode == MTLHazardTrackingModeTracked);
 	CHECK(t.heap == nil && !t.isAliasable && t.label == nil);
+	// NonVolatile whatever it is told, as the M3 Max's and the Intel 630's tables answer.
 	CHECK([t setPurgeableState:MTLPurgeableStateVolatile] == MTLPurgeableStateNonVolatile);
-	CHECK([t setPurgeableState:MTLPurgeableStateKeepCurrent] == MTLPurgeableStateVolatile);
+	CHECK([t setPurgeableState:MTLPurgeableStateKeepCurrent] == MTLPurgeableStateNonVolatile);
+	CHECK([t setPurgeableState:MTLPurgeableStateEmpty] == MTLPurgeableStateNonVolatile);
+	CHECK([t setPurgeableState:MTLPurgeableStateKeepCurrent] == MTLPurgeableStateNonVolatile);
 
 	[t setFunction:h atIndex:2];
 	auto bytes = nextMessage(fx.ring, RGFX_CMD_FUNCTION_TABLE_SET);

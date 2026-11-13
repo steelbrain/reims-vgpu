@@ -141,6 +141,7 @@ newTextureWithDescriptor:offset:bytesPerRow: implemented
 remoteStorageBuffer metal %no-peers
 removeAllDebugMarkers metal %debug
 resourceOptions implemented
+setPurgeableState: implemented
 sparseBufferTier metal %no-sparse
 storageMode implemented
 
@@ -1341,6 +1342,7 @@ hazardTrackingMode implemented
 resourceOptions implemented
 setFunction:atIndex: implemented
 setFunctions:withRange: implemented
+setPurgeableState: metal NonVolatile: the host backs the table with no purgeable allocation, and the M3 Max's and the Intel 630's tables answer NonVolatile whatever they are told, where the AMD 5300M's keep the state told (measured, tools/oracle/oracle_fnptr.m)
 storageMode implemented
 
 # --- the SPI counterparts' members (MTLFooSPI for each MTLFoo a class adopts) --------------------

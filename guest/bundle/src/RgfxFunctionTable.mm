@@ -143,6 +143,17 @@ void noteNoAnswer(const char *what, uint32_t status)
 	return rid;
 }
 
+// NonVolatile whatever it is told, and the state stays so: the host makes the table no purgeable
+// allocation of its own. The M3 Max's tables answer so, and the Intel UHD Graphics 630's
+// (Volatile, then KeepCurrent: NonVolatile both times; measured: macOS 27.0.1 and 26.7.1,
+// oracle_fnptr), where the AMD Radeon Pro 5300M's keep the state told; the bundle answers the
+// first two on every guest.
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state
+{
+	(void)state;
+	return MTLPurgeableStateNonVolatile;
+}
+
 - (void)setFunction:(id<MTLFunctionHandle>)function atIndex:(NSUInteger)index
 {
 	__unsafe_unretained id<MTLFunctionHandle> one[1] = {function};
