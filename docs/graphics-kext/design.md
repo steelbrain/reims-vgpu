@@ -113,7 +113,7 @@ Stages:
    - IOSurfaces are the one place the host reaches guest RAM: where the
      device has `RGFX_FEATURE_SURFACE_PAGES`, the host maps a surface's own
      guest pages for its GPU in place (Decided 14, "Today"), from the guest
-     RAM's map QEMU gives it, as the apple-gfx lane maps guest memory.
+     RAM's map QEMU gives it.
    - VRAM mapped into the guest was considered and dropped. It needed kernel
      6.13 or later and resizable BAR, and was good for guest writes only:
      measured on amdgpu, CPU reads from VRAM run at 15 MiB/s with memcpy,
