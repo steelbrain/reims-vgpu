@@ -46,9 +46,18 @@ vendor/qemu/configure:
 # aarch64-softmmu target an earlier make qemu built. It also runs again when
 # reims-vgpu.pc differs from the one it last read: meson keeps the package's
 # flags from configure, so a framework the library came to need (its
-# Libs.private) would otherwise be missing from QEMU's link.
+# Libs.private) would otherwise be missing from QEMU's link. And it runs again
+# where vendor/qemu's configure, the meson options it writes, its Python
+# dependencies or its VERSION are newer than config-host.mak, as QEMU's own
+# Makefile reruns it.
+#
+# ninja builds the binary, at its own default parallelism or a caller's -jN:
+# QEMU's Makefile hands ninja -j1 where make was given no -j, which took
+# about 7 minutes for a clean build. ninja has meson regenerate build.ninja
+# where a meson file changed, as install-ctl.sh's build relies on.
 QEMU_PKG_CONFIG := $(RUST_DIST)/lib/pkgconfig
 QEMU_PC_READ := $(QEMU_BUILD)/reims-vgpu.pc.configured
+QEMU_CONFIGURE_INPUTS := configure scripts/meson-buildoptions.sh pythondeps.toml VERSION
 
 qemu: all vendor/qemu/configure
 	@mkdir -p "$(QEMU_BUILD)"
@@ -56,13 +65,14 @@ qemu: all vendor/qemu/configure
 			|| ! grep -qF -- "exec '$(QEMU_SRC)/configure'" "$(QEMU_BUILD)/config.status" 2>/dev/null \
 			|| ! grep -qxF -- "PKG_CONFIG_PATH='$(QEMU_PKG_CONFIG)'" "$(QEMU_BUILD)/config.status" \
 			|| grep -qE -- "'--(enable-pvg|apple-gfx-backend=|pvg-framework=|target-list=aarch64-softmmu)" "$(QEMU_BUILD)/config.status" \
-			|| ! cmp -s "$(QEMU_PKG_CONFIG)/reims-vgpu.pc" "$(QEMU_PC_READ)"; then \
+			|| ! cmp -s "$(QEMU_PKG_CONFIG)/reims-vgpu.pc" "$(QEMU_PC_READ)" \
+			|| [ -n "$$(cd "$(QEMU_SRC)" && find $(QEMU_CONFIGURE_INPUTS) -newer "$(QEMU_BUILD)/config-host.mak" 2>/dev/null)" ]; then \
 		cd "$(QEMU_BUILD)" && PKG_CONFIG_PATH="$(QEMU_PKG_CONFIG)" "$(QEMU_SRC)/configure" \
 			--target-list=x86_64-softmmu --enable-reims-vgpu \
 			--disable-docs $(QEMU_CONFIGURE) \
 			&& cp "$(QEMU_PKG_CONFIG)/reims-vgpu.pc" "$(QEMU_PC_READ)"; \
 	fi
-	$(MAKE) -C "$(QEMU_BUILD)" qemu-system-x86_64
+	ninja -C "$(QEMU_BUILD)" $(filter-out -j,$(filter -j%,$(MAKEFLAGS))) qemu-system-x86_64
 
 clean:
 	rm -rf "$(BUILD_DIR)"

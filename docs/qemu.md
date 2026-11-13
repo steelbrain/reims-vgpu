@@ -40,8 +40,13 @@ options) is set, or `config.status` came from another source or another
 takes (`--enable-pvg`, `--apple-gfx-backend`, `--pvg-framework`) or the
 `aarch64-softmmu` target an earlier `make qemu` built, or the dist tree's
 `reims-vgpu.pc` differs from the copy it keeps of the one it configured
-with (`build/qemu/reims-vgpu.pc.configured`). Then it builds
-`qemu-system-x86_64`. configure fetches meson subprojects (`dtc`,
+with (`build/qemu/reims-vgpu.pc.configured`), or vendor/qemu's
+`configure`, `scripts/meson-buildoptions.sh`, `pythondeps.toml` or `VERSION`
+is newer than `build/qemu/config-host.mak`, as QEMU's own Makefile
+configures again. Then ninja builds `qemu-system-x86_64`, at its own default
+parallelism or a caller's `-jN` (QEMU's Makefile, called with no `-j`, hands
+ninja `-j1`), and has meson regenerate `build.ninja` where a meson file
+changed. configure fetches meson subprojects (`dtc`,
 `keycodemapdb`, ...) into the source's `subprojects/`, which its own
 `.gitignore` covers.
 
