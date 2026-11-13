@@ -3973,6 +3973,42 @@ and window surface ("A GL window", below). OpenCL lists a GPU for every
 accelerator that names an `IOGLBundleName`, and runs its kernels through the
 same renderer.
 
+**The renderer's settings.** The renderer picks a set of per-vendor settings
+for a device when it makes its first context, read from its code (macOS
+27.0.1, both slices): by the device's `vendorName`, "AMD" or "ATI" (AMD's
+settings only where the device's class is the one of AMD's older Metal driver,
+NVIDIA's otherwise), "NVIDIA" or "Intel"; for any other vendor by
+`supportsFamily:` of Apple7, then Apple5; and it ends the process on a device
+that answers none ("Unknown GPU!!"). Among what the settings decide:
+- Whether the renderer sends GL's provoking vertex to the encoder
+  (`setProvokingVertexMode:`, 1 for GL's default last-vertex convention, 0
+  for the first). The Apple and AMD settings do. Under NVIDIA's and Intel's,
+  the renderer reorders each triangle's vertices itself, and a line keeps its
+  first vertex's flat value: gl_cases' provoking-line-last fails. Measured:
+  the M3 Max sends 1 and 0 to its encoder and passes every provoking case
+  (macOS 27.0.1, job m3-max-26643); the Intel 630's Metal GL renderer fails
+  that one case (macOS 26.7.1, commit 17b468160's measurement). The AMD
+  Radeon Pro 5300M's Metal device is not of the older driver's class, so it
+  takes NVIDIA's settings (its class read on macOS 26.7.1, job m3-max-26630).
+- Whether GL's `GL_POINT` polygon mode goes to the encoder as
+  `setTriangleFillMode:` 2, which no public `MTLTriangleFillMode` names. The
+  Apple and Intel settings send it. Measured with a triangle at mode 2: the M3
+  Max and the Intel 630 draw its three vertices' pixels, the 5300M fills it
+  (jobs m3-max-26654 and m3-max-26650). The Vulkan platform holds no such
+  mode and dies on it (read from its code: `metal_value` of the runtime's
+  `TriangleFillMode`), which only a guest given Intel's settings reaches.
+
+Our device answers `vendorName` with the host GPU's vendor, and "AMD" for any
+other (`rgfxVendorNameOf` in `guest/bundle/src/RgfxCaps.hpp`), and no Apple
+family short of Apple7 (`crates/reims-vgpu/src/graphics/device_info.rs`). So
+its guests get NVIDIA's settings, or Intel's on an Intel host, as the x86
+Macs' GPUs measured above would. An arm64 guest on the M3 Max gets NVIDIA's
+settings where the M3 Max's own renderer takes the Apple ones: GL lines under
+the last-vertex convention take their first vertex's flat value there (arm64
+macOS 27.0.1, a64walk2's walks), whatever the bundle and the host do with the
+setter. The Apple settings would need the device to answer Apple7 and the
+vendor the M3 Max answers ("Apple").
+
 **Registration waits for the bundle.** Where the accelerator is registered and
 its bundle is not on disk, every WindowServer aborts in CoreDisplay as it
 brings the display up, and launchd starts another until it gives up: the
