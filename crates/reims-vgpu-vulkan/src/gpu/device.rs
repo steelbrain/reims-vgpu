@@ -1421,15 +1421,22 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// samples (`rt::Device::linear_texture_bytes_per_row`, the driver's `rowPitch` of its linear
     /// image), asked of one format of each texel size a buffer backs that divides `row_bytes`
     /// (`R8Unorm`, `RG8Unorm`, `BGRA8Unorm`, `RGBA16Float` and `RGBA32Float`), `row_bytes` over
-    /// it wide and `rows` high: the answer where those that answer agree and it is a multiple of
-    /// Metal's 16-byte linear alignment ([`caps::METAL_LINEAR_ALIGNMENT`]), at which alone the
+    /// it wide and `rows` high, where those that answer agree: their pitch where it is a multiple
+    /// of Metal's 16-byte linear alignment ([`caps::METAL_LINEAR_ALIGNMENT`]), at which alone the
     /// runtime makes a texture over a buffer or over a plane of an IOSurface without planes, as
-    /// Metal does (`BufferTextureProblem::RowPitchAlignment`). ANV's linear images lay rows of
-    /// 280 bytes (70 `BGRA8Unorm` texels) side by side (**measured** 2026-11-12, Iris Xe, Mesa
-    /// 26.2.6), and textures over device caches laid out at such pitches (292 and 280 bytes) were
-    /// refused, hundreds a boot, where the surfaces' own rows, at multiples of 64, were made
-    /// (macOS 14.8.9 and 26.7.2 guests on Iris Xe). Each pair is asked once a device: a new
-    /// answer makes and releases an image of each such format.
+    /// Metal does (`BufferTextureProblem::RowPitchAlignment`), and a texture at it is the
+    /// driver's own linear image; else that pitch rounded up to the device's line of memory and
+    /// to Metal's 16 (`rt::Device::in_place_check_line`, `nonCoherentAtomSize`), at which the
+    /// runtime makes a `DRM_FORMAT_MOD_LINEAR` image over the buffer's memory, and `rows` rows
+    /// to their pitch fill whole lines. A device whose stores write a row's last line back whole
+    /// (the Iris Xe) renders in place only into rows that share no line with bytes past them
+    /// (the runtime's `in_place::Padding::of`): rounded up to 16 alone, ANV's 1100 bytes for 275
+    /// `BGRA8Unorm` texels is 1104, and 54 rows of it end 32 bytes into a line. ANV's linear
+    /// images lay rows of 280 bytes (70 `BGRA8Unorm` texels) side by side (**measured**
+    /// 2026-11-12, Iris Xe, Mesa 26.2.6), and textures over device caches laid out at such
+    /// pitches (292 and 280 bytes) were refused, hundreds a boot (macOS 14.8.9 and 26.7.2 guests
+    /// on Iris Xe). Each pair is asked once a device: a new answer makes and releases an image of
+    /// each such format.
     fn linear_rows_pitch(&self, row_bytes: u64, rows: u64) -> Option<u64> {
         use metal2vulkan::metal::PixelFormat as Pf;
         /// The answers a device keeps; past them they are asked again.
@@ -1460,7 +1467,14 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let first = answers.next();
         let answer = first
             .filter(|&pitch| answers.all(|other| other == pitch))
-            .filter(|pitch| pitch.is_multiple_of(caps::METAL_LINEAR_ALIGNMENT));
+            .and_then(|pitch| {
+                if pitch.is_multiple_of(caps::METAL_LINEAR_ALIGNMENT) {
+                    return Some(pitch);
+                }
+                let line = plain(|| self.raw.in_place_check_line());
+                (line.is_power_of_two())
+                    .then(|| pitch.next_multiple_of(line.max(caps::METAL_LINEAR_ALIGNMENT)))
+            });
         let mut kept = self.rows_pitches.lock();
         if kept.len() >= KEPT {
             kept.clear();
@@ -3013,11 +3027,12 @@ pub(crate) mod tests {
     /// do. It lies over the padding as unobserved only where the pitch passes the row: a device
     /// whose images lay such rows side by side (MoltenVK's on an M3 Max and ANV's on Iris Xe lay
     /// the 704-byte rows so, measured) lays the texture over the buffer as it is. Asked again it answers the same. A device whose
-    /// formats' images lay such rows apart otherwise answers none, and promises nothing. Nor does
-    /// one whose images lay them at a pitch off Metal's 16-byte linear alignment, at which the
-    /// runtime makes no texture over a buffer: ANV's lay the rows of 70 `BGRA8Unorm` texels (280
-    /// bytes) side by side (measured), and 73 (292 bytes) was the pitch of the device caches whose
-    /// textures a macOS 14.8.9 guest's login had refused on Iris Xe
+    /// formats' images lay such rows apart otherwise answers none, and promises nothing. A pitch
+    /// off Metal's 16-byte linear alignment, at which the runtime makes no texture over a buffer,
+    /// it answers rounded up to the device's line of memory, at which the texture lies over the
+    /// buffer: ANV's images lay the rows of 70 `BGRA8Unorm` texels (280 bytes) side by side
+    /// (measured), and 73 (292 bytes) was the pitch of the device caches whose textures a macOS
+    /// 14.8.9 guest's login had refused on Iris Xe
     #[test]
     fn a_texture_at_the_device_s_pitch_of_a_plane_s_rows_lies_over_its_memory() {
         use crate::core::platform::Platform as _;
@@ -3035,6 +3050,10 @@ pub(crate) mod tests {
             let counts = d.raw.work_counts();
             (counts.unobserved_padding_aliases, counts.shadowed_textures)
         };
+        let unit = d
+            .raw
+            .in_place_check_line()
+            .max(caps::METAL_LINEAR_ALIGNMENT);
         for (pixel_format, texel, width) in
             [(115u64, 8u64, 88u64), (80, 4, 88), (80, 4, 70), (80, 4, 73)]
         {
@@ -3065,8 +3084,10 @@ pub(crate) mod tests {
                 descriptor.height = height;
                 descriptor.resource_options = rt::ResourceOptions::private();
                 let runtime = d.raw.linear_texture_bytes_per_row(&descriptor).unwrap();
+                let off = |p: u64| !p.is_multiple_of(caps::METAL_LINEAR_ALIGNMENT);
                 assert!(
-                    runtime.is_none_or(|p| p == pitch),
+                    runtime
+                        .is_none_or(|p| p == pitch || off(p) && p.next_multiple_of(unit) == pitch),
                     "{pf:?}: {runtime:?}, not {pitch}"
                 );
             }
@@ -3096,6 +3117,114 @@ pub(crate) mod tests {
                 (u64::from(pitch > row), 0),
                 "{pixel_format}: over the buffer's memory at {pitch}, its rows {row}"
             );
+        }
+    }
+
+    /// A surface tile that renders and samples (`BGRA8Unorm`, `ShaderRead | RenderTarget`) over
+    /// a Private buffer that declares the bytes between its rows unobserved, its rows at the
+    /// device's pitch of them (`linear_rows_pitch`), is an image over the buffer's memory: at the
+    /// driver's own pitch its linear image, at a pitch rounded up from one off Metal's 16 bytes
+    /// (ANV's) an image at that pitch whose rows to their pitch fill whole lines of the device's
+    /// memory, so share no line with bytes past them, where the device's check of renders over
+    /// such padding passed. The sizes are those of textures over a macOS 14.8.9 guest's caches
+    /// that were shadows on Iris Xe (275x54, 2618x1024, 73x59, 99x67, 87x55), whose rows of
+    /// 1100, 10472, 292, 396 and 348 bytes ANV lays side by side (measured, the runtime's shadow
+    /// log), and 70x59 (280 bytes): rounded up to 16 alone, 54 rows at 1104 bytes end 32 bytes
+    /// into a line. A device that answers no pitch promises nothing, and one whose images lie at
+    /// Metal's 16 bytes may make the tile a shadow at its own pitch
+    #[test]
+    fn a_surface_tile_at_the_device_s_pitch_renders_over_its_memory() {
+        use crate::core::platform::Platform as _;
+        use crate::core::platform::resource::Buffer as _;
+        use crate::core::platform::values::TextureDesc;
+        use metal2vulkan::metal::PixelFormat as Pf;
+
+        use crate::platform::tests::platform;
+
+        const PRIVATE: u64 = 0x20;
+        let d = dev();
+        #[cfg(target_os = "linux")]
+        settle_device_checks(&d);
+        let line = d.raw.in_place_check_line();
+        let align = d.linear_row_alignment();
+        let report = d.raw.in_place_check_report();
+        let passed = |verdict: &str| {
+            report
+                .iter()
+                .any(|l| l.strip_prefix(verdict) == Some("Passed"))
+        };
+        for (width, height) in [
+            (275u64, 54u64),
+            (2618, 1024),
+            (70, 59),
+            (73, 59),
+            (99, 67),
+            (87, 55),
+        ] {
+            let row = width * 4;
+            let Some(pitch) = d.linear_rows_pitch(row, height) else {
+                continue;
+            };
+            let mut descriptor = rt::TextureDescriptor::default();
+            descriptor.pixel_format = Pf::BGRA8Unorm;
+            descriptor.width = width;
+            descriptor.height = height;
+            descriptor.resource_options = rt::ResourceOptions::private();
+            let own = d.raw.linear_texture_bytes_per_row(&descriptor).unwrap() == Some(pitch);
+            if !own {
+                assert!(
+                    line.is_power_of_two(),
+                    "a pitch off the driver's needs the device's line"
+                );
+                assert!(
+                    (pitch * height).is_multiple_of(line) && pitch.is_multiple_of(16),
+                    "{width}x{height} at {pitch}: rows to their pitch end inside a {line}-byte line"
+                );
+            }
+            let desc = platform().texture_descriptor(&TextureDesc {
+                pixel_format: 80,
+                width,
+                height,
+                usage: 0x5,
+                resource_options: Some(PRIVATE),
+                ..TextureDesc::default()
+            });
+            let buffer = d
+                .new_buffer_of_length_padding_unobserved(
+                    OnFault::Return,
+                    pitch * height,
+                    PRIVATE,
+                    None,
+                )
+                .unwrap()
+                .expect("a buffer");
+            let before = d.raw.work_counts().shadowed_textures;
+            let texture = buffer.new_texture(OnFault::Return, &desc, 0, pitch);
+            assert!(
+                matches!(texture, Ok(Some(_))),
+                "{width}x{height}: a texture"
+            );
+            let shadows = d.raw.work_counts().shadowed_textures - before;
+            let rows_on_lines = line > 0 && pitch.is_multiple_of(line) && row.is_multiple_of(line);
+            let verdict = match rows_on_lines {
+                true => "Pooled unobserved renders, rows on lines: ",
+                false => "Pooled unobserved renders: ",
+            };
+            let in_place = match own {
+                true => align > caps::METAL_LINEAR_ALIGNMENT,
+                false => passed(verdict),
+            };
+            eprintln!(
+                "{width}x{height}: rows {row} at {pitch} (own {own}, line {line}, {verdict}{}): \
+                 {shadows} shadows",
+                passed(verdict)
+            );
+            if in_place {
+                assert_eq!(
+                    shadows, 0,
+                    "{width}x{height} at {pitch}: over the buffer's memory"
+                );
+            }
         }
     }
 

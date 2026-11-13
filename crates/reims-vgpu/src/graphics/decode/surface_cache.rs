@@ -112,9 +112,11 @@
 //! - **Laid out at the GPU's pitch.** Where the kext gives the surface's layout ([`CacheLayout`])
 //!   and a plane's rows lie at another pitch than the device's own linear images lay rows of
 //!   their bytes ([`GpuDevice::linear_rows_pitch`]: RADV's at multiples of 256 bytes, where
-//!   CoreAnimation names its backing stores' rows at multiples of 64; the device answers no
-//!   pitch off Metal's 16-byte linear alignment, at which no texture over a buffer is made, as
-//!   ANV's for rows of 70 `BGRA8` texels), the cache lays each plane's rows out at the device's
+//!   CoreAnimation names its backing stores' rows at multiples of 64; a pitch off Metal's
+//!   16-byte linear alignment, at which no texture over a buffer is made, the device rounds up
+//!   to its line of memory, as ANV's 280 bytes for rows of 70 `BGRA8` texels to 320, so that
+//!   the rows to their pitch share no line with bytes past them, which the Iris Xe's renders in
+//!   place need), the cache lays each plane's rows out at the device's
 //!   pitch ([`Repitched`]): the first plane from the cache's first byte, each next on a 4 KiB
 //!   boundary past the last's rows. A texture over a plane lies at the same byte of the same row
 //!   of the plane in the cache, at the cache's pitch

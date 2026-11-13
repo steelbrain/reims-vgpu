@@ -256,10 +256,12 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// `rows` rows of `row_bytes` bytes of texels each, as the platform answers, where it lays
     /// them alike for every format a buffer backs whose texel size divides `row_bytes`: a texture
     /// over a buffer of the device's own memory whose rows lie that far apart is the device's
-    /// image over the buffer, not a copy of its own. `None` where two such formats' images lay
-    /// them apart otherwise, the device makes no linear image of any of them, Metal makes no
-    /// texture over a buffer with rows that far apart (a pitch off its linear alignment), or the
-    /// platform does not know. The default is `None`.
+    /// image over the buffer, not a copy of its own. Where Metal makes no texture over a buffer
+    /// with rows that far apart (a pitch off its linear alignment), that pitch rounded up to the
+    /// device's line of memory and to Metal's alignment, at which rows to their pitch fill whole
+    /// lines and the texture lies over the buffer's memory at that pitch. `None` where two such
+    /// formats' images lay them apart otherwise, the device makes no linear image of any of them,
+    /// or the platform does not know. The default is `None`.
     fn linear_rows_pitch(&self, row_bytes: u64, rows: u64) -> Option<u64> {
         let _ = (row_bytes, rows);
         None
