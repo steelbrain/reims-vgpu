@@ -180,7 +180,12 @@ is its transport:
   QMP's `screendump` saves the guest's frame. One read runs at a time; an
   update that comes while one is under way is done with it. The read waits
   for its draw on the GPU, never under the BQL, and the guest sees nothing
-  of it.
+  of it. A `screendump` answers once the read is done, and QMP runs its
+  commands one at a time, on every monitor, so none answers meanwhile; HMP's
+  do. With a read waiting for a GPU that stopped answering (NVIDIA's Xid 109),
+  HMP's `info status` answered in under 1 ms throughout a 150 s wait, the
+  vCPUs ran and the guest answered ssh (**measured**, RTX 2080 and RTX 3090,
+  2026-11-12).
 - **The cursor** is the console's too: the library tells the device the
   guest's cursor on its display thread (`cursor_glyph`, `cursor_show`,
   `cursor_move` of `RvgGraphicsCallbacks`), and the BH, in order with the
@@ -200,7 +205,13 @@ is its transport:
   GPU device before the process exits (docs/api.md, "The process's exit").
   A shutdown whose action pauses the VM (`-action shutdown=pause`,
   `-no-shutdown`), and a quit of a VM stopped before it, keep the device to
-  the exit, as before.
+  the exit, as before. So does a quit while a read of the display (the
+  console's, above) still waits for its draw on the GPU: the teardown waits
+  for the read at most 5 s, under the BQL, as the read uses the device. A GPU
+  that stopped answering otherwise held the quit for good: after NVIDIA's
+  Xid 109 (a context switch timeout) a read never ended, and QMP's and HMP's
+  `quit` left QEMU in `thread_pool_free` until SIGKILL (**measured**, RTX
+  2080 and RTX 3090, macOS 26.7.2, 2026-11-12).
 - **The machine:** macOS places every 64-bit prefetchable BAR below 4 GiB,
   where a 1 GiB BAR needs the window to start at or below 0x4000_0000. So a
   q35 machine with the device keeps at most 1 GiB of the guest's RAM below

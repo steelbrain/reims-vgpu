@@ -152,7 +152,8 @@ keeps its GPU devices for the process, as it does while a device lives, and logs
 what still held them. A device created after the let-go runs on a new GPU device, whose numbering
 starts again. QEMU releases its device as it quits, once the VM stopped for good (its
 `vm_shutdown`), with the BQL held, which none of its callbacks takes; a VM whose shutdown action
-pauses it keeps its device to the exit.
+pauses it keeps its device to the exit, and so does a quit while a read of its display
+(`rvg_graphics_device_read_display`) still waits for its draw on the GPU 5 s into the teardown.
 
 ## 2. The C header
 
