@@ -4984,11 +4984,12 @@ typedef struct {
 // `LIBRARY_LOOKUP`: library `obj_id` from the libraries the device holds, by their content key.
 //
 // The bytes keyed are a `.metallib` (`MTLB`), the AIR slice of a fat file. `key` is the SHA-256
-// of the 15 bytes `rgfx-library-v1`, then the bytes before the bitcode section, then the bytes
-// after it; the section is the `u64` offset and size at 0x48 and 0x50 of the `.metallib`'s
-// header. Each function's bitcode is named by its `HASH` tag, its SHA-256, which lies outside
-// the section, so the key names every byte a function is built from. `slice_size` is the bytes'
-// length.
+// of the 15 bytes `rgfx-library-v2`, then of the SHA-256 of each 256 KiB piece, in order (the
+// last the rest), of the bytes before the bitcode section followed by the bytes after it; the
+// section is the `u64` offset and size at 0x48 and 0x50 of the `.metallib`'s header. Each
+// function's bitcode is named by its `HASH` tag, its SHA-256, which lies outside the section, so
+// the key names every byte a function is built from; the pieces are hashed each on its own, so
+// a guest hashes them on its cores at once. `slice_size` is the bytes' length.
 //
 // Answered by [`RGFX_EVT_COMPLETE`]: [`RGFX_STATUS_OK`] where the device holds a library of
 // `slice_size` bytes under `key`, which `obj_id` now names; [`RGFX_STATUS_NOT_FOUND`] where it

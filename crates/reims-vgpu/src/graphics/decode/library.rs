@@ -26,8 +26,11 @@
 //! bitcode by its `HASH` tag, a SHA-256 of it. The host vouches for a key only where it checked
 //! every `HASH` against its bitcode and the functions' bitcode covers the whole section, so a
 //! lookup can only ever bind content with that key; bytes whose tags lie are kept under the key
-//! of their whole bytes alone, or, past [`WHOLE_KEY_MOST`] bytes, uncached. Every AIR `.metallib` of macOS 27's system, 210 of them, covers its section
-//! (measured).
+//! of their whole bytes alone, or, past [`WHOLE_KEY_MOST`] bytes, uncached. Every AIR
+//! `.metallib` of macOS 27's system, 210 of them, covers its section (measured). Both keys hash
+//! their bytes in [`KEY_PIECE`] pieces, each on its own, which the guest hashes across its cores:
+//! the system frameworks' libraries are megabytes past their bitcode, which a guest core hashes
+//! at 567 MB/s (measured, the RTX 3090 host's guest).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -53,10 +56,14 @@ use super::{DecodeError, GraphicsDecoder, ObjHandle, read};
 pub(crate) type LibraryKey = [u8; 32];
 
 /// The bytes the key's digest starts with ([`RgfxLibraryLookup`]).
-const KEY_PREFIX: &[u8] = b"rgfx-library-v1";
+const KEY_PREFIX: &[u8] = b"rgfx-library-v2";
 
 /// The bytes the key of a library's whole bytes starts with ([`whole_key`]).
-const WHOLE_KEY_PREFIX: &[u8] = b"rgfx-library-whole-v1";
+const WHOLE_KEY_PREFIX: &[u8] = b"rgfx-library-whole-v2";
+
+/// The pieces a key hashes the bytes it names in ([`RgfxLibraryLookup`]), which the guest hashes
+/// across its cores: 256 KiB, the last the rest.
+const KEY_PIECE: usize = 256 << 10;
 
 /// The largest library kept under the key of its whole bytes ([`whole_key`]), as the guest asks
 /// for that key of no larger one (its `kRgfxWholeKeyMost`).
@@ -98,25 +105,47 @@ pub(crate) fn verified_key(bytes: &[u8]) -> Option<LibraryKey> {
 }
 
 /// The key of a library's whole bytes, the bitcode included: SHA-256 of [`WHOLE_KEY_PREFIX`] and
-/// `bytes`. It names them with nothing left to vouch for, so a library whose `HASH` tags the host
+/// of each [`KEY_PIECE`] piece's SHA-256 of `bytes` ([`key_of_pieces`]). It names them with nothing left to vouch for, so a library whose `HASH` tags the host
 /// cannot vouch for ([`verified_key`]: Core Image's, whose tags are no SHA-256 of their bitcode)
 /// is kept under it, where it is a `.metallib` of at most [`WHOLE_KEY_MOST`] bytes.
 pub(crate) fn whole_key(bytes: &[u8]) -> Option<LibraryKey> {
-    (bytes.len() <= WHOLE_KEY_MOST && bytes.get(..4)? == b"MTLB").then(|| {
-        let mut hasher = Sha256::new();
-        hasher.update(WHOLE_KEY_PREFIX);
-        hasher.update(bytes);
-        hasher.finalize().into()
-    })
+    (bytes.len() <= WHOLE_KEY_MOST && bytes.get(..4)? == b"MTLB")
+        .then(|| key_of_pieces(WHOLE_KEY_PREFIX, &[bytes]))
 }
 
-/// SHA-256 of [`KEY_PREFIX`] and `bytes` without `[bitcode_at, bitcode_at + bitcode_len)`.
+/// The key of `bytes` without `[bitcode_at, bitcode_at + bitcode_len)`, under [`KEY_PREFIX`]
+/// ([`key_of_pieces`]).
 fn content_key(bytes: &[u8], bitcode_at: usize, bitcode_len: usize) -> LibraryKey {
-    let mut hasher = Sha256::new();
-    hasher.update(KEY_PREFIX);
-    hasher.update(&bytes[..bitcode_at]);
-    hasher.update(&bytes[bitcode_at + bitcode_len..]);
-    hasher.finalize().into()
+    key_of_pieces(
+        KEY_PREFIX,
+        &[&bytes[..bitcode_at], &bytes[bitcode_at + bitcode_len..]],
+    )
+}
+
+/// SHA-256 of `prefix`, then of the SHA-256 of each [`KEY_PIECE`] piece, in order, of the bytes
+/// `runs` hold back to back, as the guest's `keyOfPieces` hashes them.
+fn key_of_pieces(prefix: &[u8], runs: &[&[u8]]) -> LibraryKey {
+    let mut key = Sha256::new();
+    key.update(prefix);
+    let mut piece = Sha256::new();
+    let mut filled = 0usize;
+    for run in runs {
+        let mut rest = *run;
+        while !rest.is_empty() {
+            let (take, after) = rest.split_at((KEY_PIECE - filled).min(rest.len()));
+            piece.update(take);
+            filled += take.len();
+            rest = after;
+            if filled == KEY_PIECE {
+                key.update(piece.finalize_reset());
+                filled = 0;
+            }
+        }
+    }
+    if filled > 0 {
+        key.update(piece.finalize());
+    }
+    key.finalize().into()
 }
 
 /// The bitcode section of `.metallib` bytes, as `(offset, size)` inside them.
@@ -806,10 +835,12 @@ pub(crate) mod tests {
             &[(0, 14, sha(&bitcode[..14])), (14, 6, sha(&bitcode[14..]))],
         );
         let at = lib.len() - 4 - bitcode.len();
+        let mut around = lib[..at].to_vec();
+        around.extend_from_slice(&lib[at + bitcode.len()..]);
+        assert!(around.len() <= KEY_PIECE);
         let mut expect = Sha256::new();
-        expect.update(b"rgfx-library-v1");
-        expect.update(&lib[..at]);
-        expect.update(&lib[at + bitcode.len()..]);
+        expect.update(b"rgfx-library-v2");
+        expect.update(sha(&around));
         let expect: [u8; 32] = expect.finalize().into();
         assert_eq!(verified_key(&lib), Some(expect));
     }
@@ -825,11 +856,36 @@ pub(crate) mod tests {
         lib.extend_from_slice(b"funclistBITCODE-BITCODE!tail-end");
         assert_eq!(bitcode_section(&lib), Some((0x60, 0x10)));
         let expect = [
-            0xc0, 0x99, 0x93, 0x08, 0x93, 0xa6, 0x91, 0xa1, 0xaa, 0xed, 0xfa, 0x6d, 0xee, 0xd4,
-            0x1a, 0x58, 0x09, 0x95, 0x3e, 0x36, 0xa8, 0xe6, 0x9e, 0xd9, 0x86, 0xe1, 0xb2, 0x11,
-            0xff, 0x4e, 0x21, 0x7d,
+            0xc2, 0x98, 0xaa, 0x26, 0x7e, 0x84, 0x06, 0x18, 0xa9, 0xde, 0x5c, 0xa5, 0x3b, 0x39,
+            0xf7, 0x12, 0xeb, 0x30, 0xb7, 0x16, 0xee, 0xc2, 0xbc, 0xe7, 0x1f, 0x1c, 0xd4, 0x72,
+            0xb6, 0xbd, 0x2b, 0x30,
         ];
         assert_eq!(content_key(&lib, 0x60, 0x10), expect);
+    }
+
+    /// The bundle's large synthetic `.metallib` (`test_library_key_pieces`): 640 KiB, its
+    /// bitcode section 128 KiB at 192 KiB, so the content key's first piece spans the section and
+    /// its second is a whole piece, the last; the whole bytes are three pieces. Both keys are the
+    /// digests the bundle's test pins.
+    #[test]
+    fn keys_in_pieces_as_the_bundle_does() {
+        let mut lib: Vec<u8> = (0..0xa0000usize).map(|i| (i % 251) as u8).collect();
+        lib[..MTLB_HEADER_LEN].fill(0);
+        lib[..4].copy_from_slice(b"MTLB");
+        lib[0x48..0x50].copy_from_slice(&0x30000u64.to_le_bytes());
+        lib[0x50..0x58].copy_from_slice(&0x20000u64.to_le_bytes());
+        let content = [
+            0x05, 0x34, 0x27, 0xb9, 0xa6, 0xd3, 0xe1, 0xdd, 0xba, 0x82, 0x49, 0x63, 0x1f, 0xd3,
+            0x9b, 0xa1, 0xeb, 0x6f, 0x16, 0x1c, 0x98, 0xd2, 0xe2, 0x4f, 0x56, 0xb0, 0x2f, 0x67,
+            0xe1, 0x74, 0x3c, 0x4a,
+        ];
+        assert_eq!(content_key(&lib, 0x30000, 0x20000), content);
+        let whole = [
+            0xe4, 0x9b, 0x7d, 0x62, 0x71, 0x76, 0xdb, 0x48, 0xe2, 0xd5, 0xd3, 0x5b, 0x03, 0xb2,
+            0x6b, 0x91, 0xf0, 0x02, 0x7a, 0x33, 0x0e, 0xc3, 0x25, 0xfd, 0x26, 0x20, 0xc9, 0x86,
+            0xc3, 0xa0, 0x72, 0x8b,
+        ];
+        assert_eq!(whole_key(&lib), Some(whole));
     }
 
     /// The key of the bundle's synthetic `.metallib`'s whole bytes is the digest the bundle's test
@@ -842,9 +898,9 @@ pub(crate) mod tests {
         lib[0x50..0x58].copy_from_slice(&0x10u64.to_le_bytes());
         lib.extend_from_slice(b"funclistBITCODE-BITCODE!tail-end");
         let expect = [
-            0x50, 0x02, 0x1a, 0x5e, 0x9a, 0x2c, 0xfc, 0x12, 0xb8, 0xac, 0x4e, 0x6e, 0x70, 0x0e,
-            0xa1, 0x32, 0xc3, 0x1d, 0xda, 0xf9, 0x48, 0xa1, 0x27, 0x63, 0x8c, 0xcc, 0xb3, 0xa1,
-            0xe6, 0x16, 0xb5, 0x19,
+            0x41, 0xa4, 0x8e, 0x77, 0x6f, 0xec, 0xa5, 0x8f, 0x52, 0x67, 0x0e, 0xd8, 0x93, 0x50,
+            0x17, 0x03, 0xdb, 0x0f, 0xf3, 0x4e, 0xd8, 0x4e, 0x59, 0x78, 0x35, 0x85, 0x96, 0x16,
+            0xff, 0x1b, 0xf6, 0xcb,
         ];
         assert_eq!(whole_key(&lib), Some(expect));
         lib.resize(WHOLE_KEY_MOST + 1, 0);
