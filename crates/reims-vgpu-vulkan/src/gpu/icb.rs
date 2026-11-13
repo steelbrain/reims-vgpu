@@ -480,6 +480,29 @@ impl Tail {
         }
     }
 
+    /// Of command `i`'s bits ([`Tail::words`](Tail#structfield.words)), its pipeline's words',
+    /// its dispatch's and its imageblock's: where [`Tail::pipeline`], [`Tail::dispatch`] and
+    /// [`Tail::imageblock`] place them for a command of the buffer.
+    const PIPELINE: u16 = 0b11;
+    const DISPATCH: u16 = 0b11_1111 << 2;
+    const IMAGEBLOCK: u16 = 0b11 << 8;
+
+    /// The words `bits` names ([`Tail::PIPELINE`], [`Tail::DISPATCH`], [`Tail::IMAGEBLOCK`]) of
+    /// command `i`, one of the buffer's, may not answer Metal's: as [`Tail::mark`] of their
+    /// places, the command's bits set at once.
+    fn mark_words(&mut self, i: u32, bits: u16) {
+        debug_assert!(
+            u64::from(i) < self.n,
+            "command {i} of a buffer of {}",
+            self.n
+        );
+        let i = i as usize;
+        if i >= self.words.len() {
+            self.words.resize(i + 1, 0);
+        }
+        self.words[i] |= bits;
+    }
+
     /// Of a buffer of `n` commands, the places of command `i`'s pipeline words.
     fn pipeline(n: u64, i: u64) -> Range<u64> {
         let at = n * LENGTHS_A_COMMAND + 2 * i;
@@ -802,11 +825,12 @@ impl IcbObject {
         });
     }
 
-    /// A setter of command `index` wrote the words `words` gives of a buffer of its size, as
-    /// Metal's does and the runtime's does not ([`Tail`]).
-    fn words_set(&self, index: u32, words: fn(u64, u64) -> Range<u64>) {
-        let n = plain(|| self.raw.size());
-        plain(|| (self.sides.lock().tail).mark(words(n, u64::from(index))));
+    /// A setter of command `index` wrote the words `bits` names ([`Tail::mark_words`]), as
+    /// Metal's does and the runtime's does not ([`Tail`]): a compute command's pipeline and
+    /// dispatch setters, which a CPU encode sends for each of its commands, set their bits under
+    /// one hold of the sides, with no call into the runtime.
+    fn words_set(&self, index: u32, bits: u16) {
+        self.sides.lock().tail.mark_words(index, bits);
     }
 
     /// Core set the threadgroup memory length `flat` places into the buffer's array of them,
@@ -1720,7 +1744,7 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand<'_>
                         crate::gpu::size(threads_per_threadgroup),
                     )
                 })?;
-                self.icb.words_set(self.index, Tail::dispatch);
+                self.icb.words_set(self.index, Tail::DISPATCH);
                 Ok(())
             }
             IcbComputeCmd::ConcurrentDispatchThreads {
@@ -1733,7 +1757,7 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand<'_>
                         crate::gpu::size(threads_per_threadgroup),
                     )
                 })?;
-                self.icb.words_set(self.index, Tail::dispatch);
+                self.icb.words_set(self.index, Tail::DISPATCH);
                 Ok(())
             }
             IcbComputeCmd::Reset => {
@@ -1745,12 +1769,12 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand<'_>
             IcbComputeCmd::SetComputePipelineState { pipeline_state } => {
                 let state = some(sel, pipeline_state, "pipeline state");
                 set(sel, || c.set_compute_pipeline_state(&state.raw))?;
-                self.icb.words_set(self.index, Tail::pipeline);
+                self.icb.words_set(self.index, Tail::PIPELINE);
                 Ok(())
             }
             IcbComputeCmd::SetImageblockWidth { width, height } => {
                 set(sel, || c.set_imageblock_size(width, height))?;
-                self.icb.words_set(self.index, Tail::imageblock);
+                self.icb.words_set(self.index, Tail::IMAGEBLOCK);
                 Ok(())
             }
             IcbComputeCmd::SetKernelBuffer {
@@ -2002,7 +2026,8 @@ mod tests {
 
     /// The tail answers as the set of its places would, every place of a buffer's array of
     /// lengths past the last command's: after each mark and clear of a command's words, of a
-    /// copy's, of every command's, and of places a copy past the buffer's end reaches.
+    /// copy's, of every command's, and of places a copy past the buffer's end reaches; a
+    /// command's words marked by their bits ([`Tail::mark_words`]) as by their places.
     #[test]
     fn the_tail_answers_as_a_set_of_its_places() {
         let n = 5u64;
@@ -2018,7 +2043,16 @@ mod tests {
         };
         for _ in 0..4000 {
             let i = next(3 * n);
-            let places: Vec<u64> = match next(8) {
+            let kind = next(8);
+            // A command of the buffer's words, which a setter marks by their bits.
+            let bits = match kind {
+                0 => Some(Tail::PIPELINE),
+                1 => Some(Tail::DISPATCH),
+                2 => Some(Tail::IMAGEBLOCK),
+                _ => None,
+            }
+            .filter(|_| i < n);
+            let places: Vec<u64> = match kind {
                 0 => Tail::pipeline(n, i).collect(),
                 1 => Tail::dispatch(n, i).collect(),
                 2 => Tail::imageblock(n, i).collect(),
@@ -2031,7 +2065,10 @@ mod tests {
             let range = places[0]..places[places.len() - 1] + 1;
             match next(5) {
                 0 | 1 => {
-                    tail.mark(places.iter().copied());
+                    match bits {
+                        Some(bits) if next(2) == 0 => tail.mark_words(i as u32, bits),
+                        _ => tail.mark(places.iter().copied()),
+                    }
                     set.extend(places.iter().copied());
                 }
                 2 | 3 => {
