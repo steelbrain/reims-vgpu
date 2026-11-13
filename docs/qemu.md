@@ -786,6 +786,26 @@ Radeon 780M host:
 - Safari's Media Source player plays H.264 with AAC (fragmented MP4) and
   VP9 with Opus (WebM) to the end, and their audio reaches QEMU.
 
+The guest starts its input stream with each output stream, and reads it
+only at first. **Measured** with the 26.7.2 guest on reims-ctl's audio
+devices, on a host whose PipeWire default source is an analog input and
+whose sink is the dummy `auto_null` (homelab-um790's Radeon 780M,
+2026-11-12, QEMU's `virtio_snd_*` traces):
+- Each `afplay` sets up and starts stream 1, the input, with stream 0,
+  and stops both at its end. The guest posts receive buffers for the
+  input's first 0.73 s, a queue kick every 90 ms, then none while the
+  output plays on.
+- QEMU's PipeWire capture stream runs for as long, linked to the default
+  source at a cycle every 5.3 ms (176 kB a second), so a play longer than
+  about 25 s fills its 4 MiB ring. QEMU then drops what does not fit,
+  says so once per stream (`pipewire: capture stream snd0: its
+  4194304-byte buffer is full of audio nothing has read`), and gives the
+  count as the stream closes. A 100 s play: the warning 24.9 s after the
+  start, then 13,375,572 bytes dropped in 14,218 cycles. Before vendor/qemu
+  8abc8492 each such cycle wrote an `overrun write` line, about 190 a
+  second, and wrote over the ring's unread bytes.
+- A host with no source (um870, ms01) runs no capture cycles.
+
 
 `pa` in place of `pipewire` uses PulseAudio, and `none` gives the guest a
 working output whose samples QEMU drops. macOS 26 for x86-64 ships no
