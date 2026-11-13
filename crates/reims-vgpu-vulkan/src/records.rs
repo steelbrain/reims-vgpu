@@ -18,15 +18,15 @@
 //!   guest's first creations of the states an earlier process made find them made, after a host
 //!   restart, and after an update of the runtime, whose translations of the earlier build's the
 //!   shader cache keeps apart (a record holds a descriptor, never a translation).
-//! - **Left out once it stood.** A record whose warm making stood [`RECORD_BOUND`] without ending
+//! - **Left out once it stood.** A record whose warm making worked [`RECORD_BOUND`] without ending
 //!   (a driver compile that never ends, or runs for minutes) is left out of every later pass: the
 //!   warm thread appends a tombstone of it ([`leave_out`]) as the bound passes, so a process
 //!   killed meanwhile leaves it too, and [`read`] hands no pass a record the file holds a
 //!   tombstone of. A host then pays for such a making in the start whose pass stands on it the
 //!   bound, not at every start: its driver memory, the records behind it the pass does not reach,
 //!   and the exit's wait for it. Only the pass leaves it out: the guest's own creation of its
-//!   state is made as ever, and the hook keeps its record as before. The record in making is read
-//!   from the pass's counts ([`Watch`]), and its time from this thread's polls.
+//!   state is made as ever, and the hook keeps its record as before. The record in making and how
+//!   long its making worked are the runtime's (`WarmStatistics::record_in_making`, [`Watch`]).
 //! - **The file's format**: frames, each [`MAGIC`], the payload's length and the FNV-1a hash of
 //!   its bytes (each a little-endian `u32`), then its bytes: a record's, or a tombstone's,
 //!   [`UNFINISHED`] followed by the bytes of the record it leaves out. A reader skips a frame
@@ -104,10 +104,9 @@ const WARM_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 /// each exit waited the bound for it; the log of such a boot (job m3-max-25012) names 1,520
 /// makings, and each of the 1,519 others took under 10 ms.
 ///
-/// The time is this thread's, from the poll where the pass's counts last moved: it counts the
-/// pass's waits behind the process's other makings (the runtime ranks the pass's makings below
-/// all of them), so a record the guest's makings starve that long is left out as well, and only
-/// warmed no more: the guest's creation of its state makes it as ever.
+/// The time is the runtime's (`WarmStatistics::record_in_making_nanos`): how long the making
+/// worked, its waits for a turn behind the process's other makings (which the runtime ranks above
+/// the pass's) left out, so a record the guest's makings starve is never left out for it.
 pub(crate) const RECORD_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The start of each frame of the records file.
@@ -296,41 +295,22 @@ pub(crate) fn leave_out(path: &Path, record: &[u8]) -> std::io::Result<()> {
         .write_all(&frame(&tombstone))
 }
 
-/// The warm thread's watch over the record the pass makes (the module docs): the pass makes its
-/// records one at a time, in the order handed, and counts each as it ends, so while it runs the
-/// sum of its record counts is the place of the record it makes, among the records handed.
+/// The warm thread's watch over the record the pass makes (the module docs): the runtime names
+/// it by its place among the records handed (`WarmStatistics::record_in_making`), with how long
+/// its making worked, and none on a generation a recovery left, whose pass ends.
+#[derive(Default)]
 struct Watch {
-    /// The records handed.
-    handed: u64,
-    /// The sum of the counts at the last poll that moved it.
-    at: u64,
-    /// When that poll was, on the monotonic clock in nanoseconds.
-    since: u64,
-    /// Whether the record at `at` overran already.
-    overran: bool,
+    /// The place of the record that overran last.
+    overran: Option<u64>,
 }
 
 impl Watch {
-    /// The watch over a pass of `handed` records, as it starts at `now`.
-    fn new(handed: u64, now: u64) -> Watch {
-        Watch {
-            handed,
-            at: 0,
-            since: now,
-            overran: false,
-        }
-    }
-
-    /// The place of the record the pass has stood on for [`RECORD_BOUND`] by `now`, by its counts
-    /// then (`statistics`), once a record; `None` while none has.
-    fn overran(&mut self, statistics: &rt::WarmStatistics, now: u64) -> Option<u64> {
-        let at = counted(statistics);
-        if at != self.at {
-            (self.at, self.since, self.overran) = (at, now, false);
-            return None;
-        }
-        let stood = now.saturating_sub(self.since) >= RECORD_BOUND.as_nanos() as u64;
-        (stood && at < self.handed && !std::mem::replace(&mut self.overran, true)).then_some(at)
+    /// The place of the record whose making worked [`RECORD_BOUND`], by the pass's `statistics`,
+    /// once a record; `None` while none has.
+    fn overran(&mut self, statistics: &rt::WarmStatistics) -> Option<u64> {
+        let at = statistics.record_in_making?;
+        let worked = statistics.record_in_making_nanos >= RECORD_BOUND.as_nanos() as u64;
+        (worked && self.overran.replace(at) != Some(at)).then_some(at)
     }
 }
 
@@ -364,21 +344,18 @@ pub(crate) fn warm(
             log::info!(
                 target: "reims_vgpu_vulkan::records",
                 "warming {} pipeline records from {} ({left_out} left out: their warm making \
-                 stood {} s in an earlier pass)",
+                 worked {} s in an earlier pass)",
                 records.len(),
                 path.display(),
                 RECORD_BOUND.as_secs()
             );
             let handed = records.len() as u64;
-            // A recovery starts the counts of the new generation's passes from none, and ends this
-            // one: past it, the counts name no record of this pass.
-            let recoveries = device.work_counts().device_recoveries;
             device.warm(records.clone(), WARM_BUDGET);
             // The pass runs on the runtime's thread and says nothing when it ends: its counts
             // reach the records handed then. The device's end stops the polls, which hold its
             // runtime device.
             let clock = crate::os::OsClock::new();
-            let mut watch = Watch::new(handed, clock.now_mono().as_nanos());
+            let mut watch = Watch::default();
             let mut polls = 0u64;
             loop {
                 let statistics = device.warm_statistics();
@@ -390,14 +367,13 @@ pub(crate) fn warm(
                     );
                     return;
                 }
-                if let Some(at) = watch.overran(&statistics, clock.now_mono().as_nanos())
-                    && device.work_counts().device_recoveries == recoveries
+                if let Some(at) = watch.overran(&statistics)
                     && let Some(record) = records.get(at as usize)
                 {
                     let left = leave_out(&path, &record.to_bytes());
                     log::warn!(
                         target: "reims_vgpu_vulkan::records",
-                        "the warm pass's making of pipeline record {at} of {handed} stood {} s \
+                        "the warm pass's making of pipeline record {at} of {handed} worked {} s \
                          without ending: {}; the guest's own creation of its state still makes it",
                         RECORD_BOUND.as_secs(),
                         match left {
@@ -520,19 +496,20 @@ mod tests {
         assert!(split(&frame(&a)[..FRAME_HEAD]).is_empty());
     }
 
-    /// The time [`RECORD_BOUND`] past `start`, in nanoseconds.
-    fn bound_past(start: u64) -> u64 {
-        start + RECORD_BOUND.as_nanos() as u64
-    }
+    /// The bound, in nanoseconds.
+    const BOUND: u64 = RECORD_BOUND.as_nanos() as u64;
 
-    /// The counts of a pass whose first `ended` records ended, each made.
-    fn ended(ended: u64) -> rt::WarmStatistics {
+    /// The counts of a pass making the record at `at`, whose making worked `nanos`; none between
+    /// records.
+    fn making(at: Option<u64>, nanos: u64) -> rt::WarmStatistics {
         let mut s = rt::WarmStatistics::default();
-        s.records_warmed = ended;
+        s.records_warmed = at.unwrap_or_default();
+        s.record_in_making = at;
+        s.record_in_making_nanos = nanos;
         s
     }
 
-    /// A record whose warm making stands the bound is named once, its tombstone appended, and the
+    /// A record whose warm making works the bound is named once, its tombstone appended, and the
     /// next pass is handed every record but it
     #[test]
     fn an_unfinished_record_is_not_handed_to_the_next_pass() {
@@ -543,13 +520,13 @@ mod tests {
         for record in records {
             keeper.keep(record);
         }
-        let mut watch = Watch::new(3, 1_000);
-        assert_eq!(watch.overran(&ended(0), 2_000), None);
-        assert_eq!(watch.overran(&ended(1), 3_000), None);
-        assert_eq!(watch.overran(&ended(1), bound_past(3_000) - 1), None);
-        assert_eq!(watch.overran(&ended(1), bound_past(3_000)), Some(1));
+        let mut watch = Watch::default();
+        assert_eq!(watch.overran(&making(Some(0), 1_000)), None);
+        assert_eq!(watch.overran(&making(None, 0)), None);
+        assert_eq!(watch.overran(&making(Some(1), BOUND - 1)), None);
+        assert_eq!(watch.overran(&making(Some(1), BOUND)), Some(1));
         assert_eq!(
-            watch.overran(&ended(1), bound_past(9_000)),
+            watch.overran(&making(Some(1), 2 * BOUND)),
             None,
             "named once"
         );
@@ -563,8 +540,7 @@ mod tests {
     }
 
     /// A record whose making ends within the bound is named by no poll, and the next pass is
-    /// handed it; the next record's time runs from the poll that saw its making start, and the
-    /// counts' end (the records handed) names none
+    /// handed it; so is one the runtime names no more (a recovery's new generation, a pass ended)
     #[test]
     fn a_finished_record_is_still_handed_to_the_next_pass() {
         let dir = Scratch::new("finished");
@@ -572,18 +548,10 @@ mod tests {
         let mut keeper = Keeper::open(path.clone());
         keeper.keep(b"one");
         keeper.keep(b"two");
-        let mut watch = Watch::new(2, 0);
-        assert_eq!(watch.overran(&ended(0), bound_past(0) - 1), None);
-        assert_eq!(watch.overran(&ended(1), bound_past(0)), None);
-        assert_eq!(
-            watch.overran(&ended(1), bound_past(bound_past(0)) - 1),
-            None
-        );
-        assert_eq!(watch.overran(&ended(2), bound_past(bound_past(0))), None);
-        assert_eq!(
-            watch.overran(&ended(2), bound_past(bound_past(bound_past(0)))),
-            None
-        );
+        let mut watch = Watch::default();
+        assert_eq!(watch.overran(&making(Some(0), BOUND - 1)), None);
+        assert_eq!(watch.overran(&making(Some(1), BOUND - 1)), None);
+        assert_eq!(watch.overran(&making(None, 0)), None);
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(
             warmable(&split(&bytes)),
