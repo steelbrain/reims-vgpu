@@ -207,11 +207,15 @@ is its transport:
   `-no-shutdown`), and a quit of a VM stopped before it, keep the device to
   the exit, as before. So does a quit while a read of the display (the
   console's, above) still waits for its draw on the GPU: the teardown waits
-  for the read at most 5 s, under the BQL, as the read uses the device. A GPU
-  that stopped answering otherwise held the quit for good: after NVIDIA's
-  Xid 109 (a context switch timeout) a read never ended, and QMP's and HMP's
-  `quit` left QEMU in `thread_pool_free` until SIGKILL (**measured**, RTX
-  2080 and RTX 3090, macOS 26.7.2, 2026-11-12).
+  for the read at most 5 s, under the BQL, as the read uses the device. A
+  screendump still waiting for the read is answered first, with what the
+  console last showed: QEMU's quit waits for QMP's dispatcher, which the
+  screendump holds (`monitor_cleanup`), and a read that ends after the
+  console closed updates nothing. A GPU that stopped answering otherwise held
+  the quit for good: after NVIDIA's Xid 109 (a context switch timeout) a read
+  never ended, and QMP's and HMP's `quit` left QEMU in `thread_pool_free`
+  until SIGKILL (**measured**, RTX 2080 and RTX 3090, macOS 26.7.2,
+  2026-11-12).
 - **The machine:** macOS places every 64-bit prefetchable BAR below 4 GiB,
   where a 1 GiB BAR needs the window to start at or below 0x4000_0000. So a
   q35 machine with the device keeps at most 1 GiB of the guest's RAM below
