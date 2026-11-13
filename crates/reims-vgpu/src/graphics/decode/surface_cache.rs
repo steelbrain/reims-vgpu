@@ -170,7 +170,10 @@
 //!   no copy waits for the cache's users of the lost device, and each cache with pages is filled
 //!   from them whole before what reads it next, as a block named again over the same pages is
 //!   ([`SurfaceCaches::after_recovery`]). A deferred block's cache whose pages are not named
-//!   loses its bytes, as a `Private` buffer's.
+//!   loses its bytes, as a `Private` buffer's. A cache made for the host's video (exportable, or
+//!   a dma-buf) is the exception: the platform carries it over its own memory, which the video's
+//!   imports reach still, so it keeps its bytes, and what a buffer or a decode wrote of it since
+//!   its last copy is copied out as before; only its users of the lost device go.
 //! - **Deferred blocks.** Where the guest took `RGFX_FEATURE_SURFACE_DEFERRED`, the kext names a
 //!   fresh surface only the GPU has touched with no pages
 //!   ([`RGFX_SURFACE_PAGES_DEFERRED`](reims_vgpu_graphics::wire::RGFX_SURFACE_PAGES_DEFERRED)), as a
@@ -1340,9 +1343,12 @@ impl<P: Platform> SurfaceCaches<P> {
     /// cache named again over the same pages is ([`Self::fill_whole`]), as of the generation it
     /// held. A cache whose first fill is still owed, or whose decode's picture is still to land
     /// ([`SurfaceCache::zeros`]), keeps those; a deferred block's cache whose pages are not named
-    /// keeps nothing, as a `Private` buffer's contents. A fill the platform raises at (a cache
-    /// the recovery left, as its runtime leaves exportable memory) is logged, and the cache is
-    /// filled at its next use that needs one. A deferred copy being made keeps its signal
+    /// keeps nothing, as a `Private` buffer's contents. A cache made for the host's video
+    /// ([`SurfaceCache::life`]) lies in exportable memory, which the platform carries over that
+    /// memory with what it holds ([`GpuDevice::recoveries`]): it is not filled from its pages, and
+    /// keeps what a buffer or a decode wrote of it for the next copy out; only its users go. A fill the
+    /// platform raises at (a cache the recovery left) is logged, and the cache is filled at its
+    /// next use that needs one. A deferred copy being made keeps its signal
     /// ([`Self::signal_with`]) for its own command buffer.
     ///
     /// Looked at wherever a cache is filled or copied into its pages: a command buffer's begin, a
@@ -1356,7 +1362,15 @@ impl<P: Platform> SurfaceCaches<P> {
             return;
         }
         self.recoveries = now;
+        // A cache made for the host's video keeps its bytes over its own memory: only its users,
+        // whose work went with the lost device, go.
+        let mut video = 0usize;
+        for cache in (self.by_block.values_mut()).filter(|c| c.life.is_some()) {
+            cache.users.clear();
+            video += 1;
+        }
         let blocks: Vec<(u64, u64)> = (self.by_block.iter())
+            .filter(|(_, c)| c.life.is_none())
             .filter(|(_, c)| c.pages.is_some() && c.first_fill.is_none() && !c.zeros)
             .map(|(&block, c)| (block, c.generation.unwrap_or(0)))
             .collect();
@@ -1381,10 +1395,10 @@ impl<P: Platform> SurfaceCaches<P> {
             log::info!(
                 target: "reims_vgpu::graphics",
                 "the device recovered: {} IOSurface device caches are filled again from their \
-                 pages, {refused} of them refused; {} more keep their owed first fill or hold \
-                 nothing",
+                 pages, {refused} of them refused; {video} made for the host's video keep their \
+                 bytes; {} more keep their owed first fill or hold nothing",
                 blocks.len(),
-                self.by_block.len() - blocks.len()
+                self.by_block.len() - blocks.len() - video
             );
         }
     }
@@ -6521,6 +6535,79 @@ mod tests {
         let copied = copies(&r.p.call_log().since(mark));
         assert_eq!(copied.len(), 1, "{copied:?}");
         assert_eq!(copied[0].1, cache, "filled from the pages");
+    }
+
+    /// A cache made for the host's video keeps its bytes across a recovery, as the platform
+    /// carries it over its own memory: a use past the recovery fills nothing into it, and a
+    /// download copies what a buffer wrote of it before the recovery out of it, not its pages
+    /// into it
+    #[cfg(unix)]
+    #[test]
+    fn a_recovery_keeps_a_video_caches_bytes_and_copies_its_write_out() {
+        use reims_vgpu_graphics::wire::{
+            RGFX_STATUS_CACHE, RgfxSurfacePagesLayout, RgfxSurfacePlaneLayout,
+        };
+        use reims_vgpu_vulkan::core::platform::values::PagesInPlace;
+        use reims_vgpu_vulkan::core::testkit::impls::device::DMA_BUF_BUFFER;
+        // NV12 as CoreVideo lays it in four pages: luma from 0x20, chroma after its rows.
+        let mut layout = RgfxSurfacePagesLayout {
+            plane_count: 2,
+            ..Default::default()
+        };
+        layout.planes[0] = RgfxSurfacePlaneLayout {
+            offset: 0x20,
+            bytes_per_row: 512,
+            row_bytes: 480,
+            rows: 16,
+        };
+        layout.planes[1] = RgfxSurfacePlaneLayout {
+            offset: 0x20 + 16 * 512,
+            bytes_per_row: 512,
+            row_bytes: 480,
+            rows: 8,
+        };
+        let mut r = rig(16);
+        let page = r.page;
+        r.dec.set_unified_memory(true);
+        r.dec.set_dma_buf_caches();
+        (r.p.world()).answer_surface_pages(PagesInPlace::No("off the device's alignment".into()));
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.pages_asking(BLOCK, &[(1, 4)], 4 * page, Some(layout)),
+            RGFX_STATUS_CACHE
+        );
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 4)], 4 * page, true),
+            RGFX_STATUS_OK
+        );
+        assert!(
+            r.p.call_log().sels_since(mark).contains(&DMA_BUF_BUFFER),
+            "a cache made for the host's video"
+        );
+        queues(&mut r);
+        let cache = cache_id(&r);
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        r.p.world().recover();
+
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 1, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let copied = copies(&r.p.call_log().since(mark));
+        assert!(copied.is_empty(), "nothing filled into it: {copied:?}");
+
+        let mark = r.p.call_log().mark();
+        let downloaded = download(&r, BLOCK);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(downloaded.load(Ordering::SeqCst));
+        let copied = copies(&r.p.call_log().since(mark));
+        assert!(!copied.is_empty(), "the write copied out");
+        assert!(
+            copied
+                .iter()
+                .all(|&(from, to)| from == cache && to != cache),
+            "out of the cache alone: {copied:?}"
+        );
     }
 
     /// A block named again over the same pages while a command buffer begun and not finished uses

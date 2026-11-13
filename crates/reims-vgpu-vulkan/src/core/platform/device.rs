@@ -194,8 +194,13 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// lost device made again behind the same device object (the Vulkan platform's runtime makes
     /// a new `VkDevice`, `device-recovered`). The textures, pipelines and pooled buffers made
     /// before a recovery do not carry the host's own work on: the host makes those it keeps for
-    /// its own draws (a display's ramps, tables and pipelines) again once this changes. 0, never
-    /// changing, on a platform whose device is not recovered (the default).
+    /// its own draws (a display's ramps, tables and pipelines) again once this changes. A
+    /// `Private` buffer's contents are lost (it reads zero), but a `Private` one made for
+    /// another API's import ([`Self::new_exportable_buffer_of_length`],
+    /// [`Self::new_dma_buf_buffer_of_length_padding_unobserved`]) is carried over its own memory,
+    /// which that API's imports reach still, and keeps what the memory holds; one the runtime
+    /// cannot carry so (an opaque descriptor's dedicated allocation) is refused where used. 0,
+    /// never changing, on a platform whose device is not recovered (the default).
     fn recoveries(&self) -> u64 {
         0
     }
