@@ -116,6 +116,8 @@ merge into staging of 2026-06-19), and upstream master is merged into it
 | `usb-host` sets an interface's alternate setting (`libusb_set_interface_alt_setting`) on a thread-pool worker and completes the guest's SET_INTERFACE when the call returns, where it made the call holding the BQL; the device's other control requests, a reset, closing it and QEMU's exit wait for a call in flight ("x86-64 macOS guests: USB passthrough", below) | `e9e0fa81` |
 | `qemu-xhci` on a PCI Express bus sets HCCPARAMS1's LTC, with PCIe's LTR capability, and completes the Set Latency Tolerance Value command with Success, keeping its BELT; on conventional PCI it refuses the command with TRB Error as before. HCCPARAMS2 (offset 0x1c, xHCI 1.1) reads 0 | `b088ca98`, `ccbda5d6`, `926263c7` |
 | `qemu-xhci`'s interrupters moderate their interrupts as IMOD asks (xHCI 4.17.2): an interrupt asserts when a non-blocking event awaits, IMODC is 0 and the event handler is not busy, and loads IMODC with IMODI, 4000 (1 ms) from a reset | `2b08ac84`, `b8c465b8` |
+| `qemu-xhci` completes each command with a Command Completion Event of its own (xHCI 6.4.2.2): No Op, Set LTV, Get Port Bandwidth, a command it does not support and an Enable Slot that finds no free slot complete with Slot ID 0, and a command for a slot completes with that Slot ID whether or not the slot is enabled. Upstream's kept the previous command's Slot ID across one doorbell's commands, gave an NEC firmware revision reply the previous command's completion code, and gave every command after an NEC reply the reply's type and fields; `tests/qtest/usb-hcd-xhci-test.c` queues both kinds at one doorbell | `3d04e62f`, `926fc8dc` |
+| while a `usb-host` device's SET_INTERFACE call runs on its worker, the main loop makes no usbfs call on the device, each of which would wait for the call: it handles no libusb events, so every usb-host device's completions wait for the call, and the device's submits and cancels wait in order in a queue of its own, made when the call returns ("x86-64 macOS guests: USB passthrough", below) | `78b3270c` |
 
 The branch's other commits are the apple-gfx work `eb36a099` removes, and
 `cbb749d421`, an HVF workaround that `481e881b5c` reverts, upstream having
@@ -769,6 +771,22 @@ A second boot of each, with every event QEMU posted to the guest traced
   calls took at most 4.1 ms, and no round trip passed 5 ms. So the worker
   frees the main loop only where no other endpoint of the device completes
   during the call.
+
+`78b3270c` keeps the main loop off the device while the call runs: it
+handles no libusb events, and the device's submits and cancels wait in
+order for the call to return. A boot at `104d7b18` and one with the change
+on it (m3-max-26476, the same guest and device, on a CachyOS host with
+kernel 7.3.1, a Core i9-13900H and Iris Xe graphics):
+- Before, each of the eight calls of 2.9 to 7.7 ms that set the output
+  interface's alternate setting 0 while the input stream ran overlapped a
+  QMP round trip about as long (2.3 to 7.3 ms), and six of the eight round
+  trips over 5 ms overlapped such a call.
+- After, the four such calls (4.9 to 6.9 ms) overlapped no round trip over
+  1 ms. Three round trips passed 5 ms (5.3, 9.0 and 19.7 ms), none during a
+  call, as two did before (7.8 and 12.3 ms): another stall of the main
+  loop, which this boot did not trace.
+- The IOProc ran 390, 472 and 471 times before, its first stream
+  restarting, and 458, 471 and 470 times after.
 
 **Unknown**: a guest's view of a device on a USB 3 port; whether macOS
 guests before 26 drive the controller with 14 ports as with 8.
