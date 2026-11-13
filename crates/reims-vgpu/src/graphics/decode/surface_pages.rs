@@ -84,12 +84,20 @@
 //! under a no-copy buffer. Its runs are checked as a surface's, and must lie in guest RAM, at its
 //! `SURFACE_PAGES`; its view is made at its first `BUFFER_OVER_PAGES`, so a pages block no buffer
 //! is laid over costs no mapping or import. The view is mapped as a surface's, with a buffer over
-//! the whole of it that holds the runtime's import of its pages, and is the block's alone: it stays
-//! out of the cache, as no other block names those pages and a view of a GiB would push every
-//! surface's out of it. A `BUFFER_OVER_PAGES` of the context the block was made for lies over a
-//! part of the view, at the guest's GPU address, which keeps the app pointer's place in its page.
-//! The view goes at the block's `BLOCK_RELEASE` or its context's close, once the buffers over it
-//! have let it go.
+//! the whole of it that holds the runtime's import of its pages. A `BUFFER_OVER_PAGES` of the
+//! context the block was made for lies over a part of the view, at the guest's GPU address, which
+//! keeps the app pointer's place in its page. At the block's `BLOCK_RELEASE` its view, where it
+//! maps at most [`CACHED_PAGES_BYTES`], goes into the cache by its runs, with its import, and a
+//! later pages block over the same runs takes it at its first `BUFFER_OVER_PAGES`, with no mapping
+//! or import made, as a surface's block takes a cached view: the guest makes pages blocks again
+//! over the same runs, and an import's free costs the driver more than its making. **Measured**
+//! 2026-11-12 on homelab-um870-1's RTX 3090 (Thunderbolt, NVIDIA 620.70.06), an x86-64 macOS
+//! 26.7.2 guest scrolling Safari (job m3-max-23749): six pages blocks of 2,500 pages came again
+//! over the same runs every 2 s or so, 30 views made of 12 lists of runs, and a view's import
+//! took 1.8 ms to make and 11.4 ms to free (medians, 10.2 ms of it the driver's DMA unmap of the
+//! scattered pages), a `vkQueueSubmit` beside it on another thread waiting as long. A larger view
+//! goes at the release, as one of a GiB would push every other out of the cache; so does a view at its
+//! context's close, its process gone. Either goes once the buffers over it have let it go.
 //!
 //! **Heaps over pages** (`RGFX_FEATURE_HEAP_OVER_PAGES`). A pages block, a slab of the guest's, can
 //! hold a `HEAP_OVER_PAGES`, the buffers placed in it costing what a heap over host memory's do. A
@@ -233,6 +241,11 @@ pub(crate) const CACHED_VIEWS: usize = 32;
 
 /// The most bytes of guest pages the cache's views map, past which the oldest go.
 pub(crate) const CACHED_BYTES: u64 = 1 << 30;
+
+/// The most bytes a pages block's view maps that the cache takes at the block's release (the
+/// module doc): a cached view's share of [`CACHED_BYTES`], 32 MiB, so no one view pushes the rest
+/// out.
+pub(crate) const CACHED_PAGES_BYTES: u64 = CACHED_BYTES / CACHED_VIEWS as u64;
 
 /// The surface worker's key of a view's teardown ([`SurfaceView`]'s drop): no block's offset,
 /// so a teardown never waits behind a block's jobs, nor they behind it, and the teardowns run
@@ -421,6 +434,9 @@ pub(crate) struct ViewCounts {
     /// Pages blocks' views made (`RGFX_SURFACE_PAGES_PRIVATE`), each at its block's first
     /// `BUFFER_OVER_PAGES`, which `made` does not count.
     pub(crate) private: u64,
+    /// Pages blocks given a cached view at their first `BUFFER_OVER_PAGES`, which `reused` does
+    /// not count.
+    pub(crate) private_reused: u64,
     /// Cached views no block held let go of as their mappings passed the platform's bound for
     /// them (the module doc).
     pub(crate) idle_returned: u64,
@@ -671,6 +687,8 @@ pub(crate) struct Released<P: Platform> {
     _view: Option<Arc<SurfaceView<P>>>,
     _private: Option<Private<P>>,
     _by_runs: Option<ByRuns<P>>,
+    /// What left the cache as the block's view went into it.
+    _evicted: Vec<Cached<P>>,
 }
 
 impl<P: Platform> SurfaceViews<P> {
@@ -850,7 +868,7 @@ impl<P: Platform> SurfaceViews<P> {
             if !in_ram {
                 return Some(false);
             }
-            let old = v.released(pages.block_offset);
+            let old = v.released(pages.block_offset, platform.vm().idle_view_mappings());
             v.asked(Asked::Cache);
             v.laid_out(pages.block_offset, planes.to_vec());
             old
@@ -1055,10 +1073,8 @@ impl<P: Platform> SurfaceViews<P> {
         }
     }
 
-    /// Caches `view`, just made of the runs `key` with `import` over it, at the back; what
-    /// leaves the cache past [`CACHED_VIEWS`] views or [`CACHED_BYTES`], the oldest first, and
-    /// the oldest views no block holds past `idle_mappings` mappings, a mapping a run (the module
-    /// doc), is returned, for the caller to let go of with no lock held.
+    /// Caches `view`, just made of the runs `key` with `import` over it, at the back
+    /// ([`Self::cache_view`]), counted as made.
     fn keep(
         &mut self,
         key: Vec<(u64, u64)>,
@@ -1067,9 +1083,23 @@ impl<P: Platform> SurfaceViews<P> {
         idle_mappings: Option<u64>,
     ) -> Vec<Cached<P>> {
         self.counts.made += 1;
+        self.cache_view(key, Arc::clone(view), import, idle_mappings)
+    }
+
+    /// Caches `view` of the runs `key`, with `import` over it, at the back; what leaves the cache
+    /// past [`CACHED_VIEWS`] views or [`CACHED_BYTES`], the oldest first, and the oldest views no
+    /// block holds past `idle_mappings` mappings, a mapping a run (the module doc), is returned,
+    /// for the caller to let go of with no lock held.
+    fn cache_view(
+        &mut self,
+        key: Vec<(u64, u64)>,
+        view: Arc<SurfaceView<P>>,
+        import: P::Buffer,
+        idle_mappings: Option<u64>,
+    ) -> Vec<Cached<P>> {
         self.cache.push_back(Cached {
             runs: key,
-            view: Arc::clone(view),
+            view,
             import,
         });
         let mut evicted = Vec::new();
@@ -1254,11 +1284,12 @@ impl<P: Platform> SurfaceViews<P> {
 
     /// The view of the pages block at `block`, where it was made for `context` (any context
     /// where `None`, the decoder's own tests) and holds the `block_size` bytes a message names:
-    /// made with its import on `device` the first time, the module doc, with `views` unlocked,
-    /// so a message that asks of the views meanwhile does not wait for the mapping or the
-    /// import, after room is made in `platform`'s mappings for it. `None` where the block is no
-    /// such pages block, or the view or its import is not made, which is counted, or the block
-    /// went while it was made.
+    /// the first time, the cache's view of its runs, taken to the back, with its import, else
+    /// made with its import on `device` (the module doc), with `views` unlocked, so a message
+    /// that asks of the views meanwhile does not wait for the mapping or the import, after room
+    /// is made in `platform`'s mappings for it. `None` where the block is no such pages block, or
+    /// the view or its import is not made, which is counted, or the block went while it was
+    /// made.
     pub(crate) fn private_view(
         views: &Mutex<SurfaceViews<P>>,
         platform: &P,
@@ -1278,6 +1309,17 @@ impl<P: Platform> SurfaceViews<P> {
                 return Ok(Some(Arc::clone(view)));
             }
             let (runs, length) = (p.runs.clone(), p.length);
+            let hit = v.cache.iter().position(|c| c.runs == runs);
+            if let Some(cached) = hit.and_then(|at| v.cache.remove(at)) {
+                let view = Arc::clone(&cached.view);
+                let import = cached.import.clone_ref();
+                v.cache.push_back(cached);
+                if let Some(p) = v.private.get_mut(&block) {
+                    p.view = Some((Arc::clone(&view), import));
+                }
+                v.counts.private_reused += 1;
+                return Ok(Some(view));
+            }
             let Some((memory, lease)) = v.memory.as_ref() else {
                 v.refused(PagesRefusal::NoMemoryMap);
                 return Ok(None);
@@ -1385,17 +1427,35 @@ impl<P: Platform> SurfaceViews<P> {
     }
 
     /// The block at `offset` went (its `BLOCK_RELEASE`): its view goes once the buffers over it
-    /// and the cache have let it go, and what the block held of it is returned, for the caller to
-    /// let go of with no lock held.
-    pub(crate) fn released(&mut self, offset: u64) -> Option<Released<P>> {
+    /// and the cache have let it go, a pages block's view of at most [`CACHED_PAGES_BYTES`] into
+    /// the cache where it is not there already (the module doc), its bounds kept with
+    /// `idle_mappings` as at a view's making ([`Self::cache_view`]); what the block held of its
+    /// view, and what left the cache, is returned, for the caller to let go of with no lock held.
+    pub(crate) fn released(
+        &mut self,
+        offset: u64,
+        idle_mappings: Option<u64>,
+    ) -> Option<Released<P>> {
         let view = self.by_block.remove(&offset).map(|(view, _)| view);
-        let private = self.private.remove(&offset);
+        let mut private = self.private.remove(&offset);
         let by_runs = self.by_runs.remove(&offset);
         self.laid_out.remove(&offset);
+        let mut evicted = Vec::new();
+        if let Some(p) = private.as_mut()
+            && let Some((made, import)) = p.view.take()
+        {
+            let cached = (self.cache.iter()).any(|c| Arc::ptr_eq(&c.view, &made));
+            if cached || made.length() > CACHED_PAGES_BYTES {
+                p.view = Some((made, import));
+            } else {
+                evicted = self.cache_view(p.runs.clone(), made, import, idle_mappings);
+            }
+        }
         (view.is_some() || private.is_some() || by_runs.is_some()).then_some(Released {
             _view: view,
             _private: private,
             _by_runs: by_runs,
+            _evicted: evicted,
         })
     }
 
@@ -3034,13 +3094,13 @@ pub(super) mod tests {
         assert_eq!(r.buffer(13, BLOCK, page), Ok(()));
     }
 
-    /// A pages block's runs are one view, its own, made at its first `BUFFER_OVER_PAGES` and kept
-    /// for the next: no cache entry is made or taken for it, and a `BUFFER_OVER_PAGES` lies over
-    /// the bytes at its offset in the view, at the guest's GPU
-    /// address, over the app's own page, and over the block, so the block is not released while
-    /// it lives. A range past the view, an empty one, and a `BUFFER_OVER_SURFACE_PAGES` of the
-    /// block are refused; after the block's release the buffer still holds the view, and the
-    /// block takes no new buffer
+    /// A pages block's runs are one view, made at its first `BUFFER_OVER_PAGES` and kept for the
+    /// next, not the cache's view of other runs, and a `BUFFER_OVER_PAGES` lies over the bytes at
+    /// its offset in the view, at the guest's GPU address, over the app's own page, and over the
+    /// block, so the block is not released while it lives. A range past the view, an empty one,
+    /// and a `BUFFER_OVER_SURFACE_PAGES` of the block are refused; after the block's release the
+    /// buffer still holds the view, the block takes no new buffer, and the cache keeps the view
+    /// once the buffers let it go
     #[test]
     fn a_pages_block_s_buffers_lie_over_its_view_at_their_offsets() {
         let mut r = rig(8);
@@ -3122,12 +3182,13 @@ pub(super) mod tests {
 
         r.dec
             .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
-        assert_eq!(r.dec.views_of_surfaces().private_len(), 0);
+        let views = r.dec.views_of_surfaces();
+        assert_eq!((views.len(), views.private_len()), ((1, 2), 0));
+        drop(views);
         assert_eq!(
             r.pages_buffer(13, 0, BLOCK, 0, page),
             Err(DecodeError::Refused)
         );
-        assert!(Arc::strong_count(&view) > 1, "the buffers hold it");
         for obj_id in [10, 11] {
             let destroy = RgfxObjectDestroy {
                 header: header(RGFX_CMD_OBJECT_DESTROY),
@@ -3138,7 +3199,94 @@ pub(super) mod tests {
         assert!(!r.dec.span_in_use(BLOCK, 0x2000));
         // The block's hold of it goes on the surface worker.
         r.dec.surface_worker().flush();
-        assert_eq!(Arc::strong_count(&view), 1, "only the test holds the view");
+        assert_eq!(
+            Arc::strong_count(&view),
+            3,
+            "the test, the cache and the import the cache keeps hold the view"
+        );
+    }
+
+    /// A pages block made again over the runs of one released, as the guest makes one again over
+    /// the same pages, takes the released block's view from the cache at its first
+    /// `BUFFER_OVER_PAGES`, with its import: no mapping or import is made. A block over the
+    /// same pages in another order makes a view of its own, and a released view past
+    /// [`CACHED_PAGES_BYTES`] leaves no entry in the cache
+    #[test]
+    fn a_pages_block_made_again_over_the_same_runs_takes_the_released_view() {
+        let page = FakePlatform::new().vm().page_size();
+        let large = CACHED_PAGES_BYTES / page + 1;
+        let mut r = rig(large + 8);
+        let private = RGFX_SURFACE_PAGES_PRIVATE;
+        let destroy = |r: &mut Rig, obj_id: u64| {
+            let m = RgfxObjectDestroy {
+                header: header(RGFX_CMD_OBJECT_DESTROY),
+                obj_id,
+            };
+            assert_eq!(r.dec.decode(&r.device, m.as_bytes()).unwrap(), Ok(()));
+        };
+        let runs = [(5, 2), (1, 1)];
+        assert_eq!(
+            r.pages_flagged(BLOCK, 0, &runs, 3 * page, private),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(r.pages_buffer(10, 0, BLOCK, 0, page), Ok(()));
+        let first = r.private_view(BLOCK);
+        destroy(&mut r, 10);
+        r.dec
+            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
+        r.dec.surface_worker().flush();
+        assert_eq!(
+            r.dec.views_of_surfaces().len(),
+            (0, 1),
+            "the cache keeps it"
+        );
+
+        let again = BLOCK + 0x8000;
+        assert_eq!(
+            r.pages_flagged(again, 0, &runs, 3 * page, private),
+            RGFX_STATUS_OK
+        );
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.pages_buffer(11, 0, again, page, page), Ok(()));
+        assert_eq!(
+            r.p.call_log().sels_since(mark),
+            ["newBufferWithDescriptor:"],
+            "the buffer alone: no mapping or import made"
+        );
+        assert!(Arc::ptr_eq(&first, &r.private_view(again)));
+        let c = r.dec.views_of_surfaces().counts();
+        assert_eq!((c.private, c.private_reused, c.reused), (1, 1, 0));
+
+        // The same pages in another order: a view of their own.
+        let other = BLOCK + 0x10000;
+        assert_eq!(
+            r.pages_flagged(other, 0, &[(1, 1), (5, 2)], 3 * page, private),
+            RGFX_STATUS_OK
+        );
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.pages_buffer(12, 0, other, 0, page), Ok(()));
+        assert!(
+            (r.p.call_log().sels_since(mark)).contains(&"mach_vm_allocate"),
+            "a view mapped"
+        );
+        assert!(!Arc::ptr_eq(&first, &r.private_view(other)));
+        let c = r.dec.views_of_surfaces().counts();
+        assert_eq!((c.private, c.private_reused), (2, 1));
+
+        // Past CACHED_PAGES_BYTES: let go of at the release, with no entry left.
+        let big = BLOCK + 0x18000;
+        assert_eq!(
+            r.pages_flagged(big, 0, &[(8, large)], large * page, private),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(r.pages_buffer(13, 0, big, 0, page), Ok(()));
+        let big_view = r.private_view(big);
+        destroy(&mut r, 13);
+        r.dec
+            .block_released(&r.device, big, 0, Box::new(|| ()), no_raise());
+        r.dec.surface_worker().flush();
+        assert_eq!(r.dec.views_of_surfaces().len().1, 1, "the first view alone");
+        assert_eq!(Arc::strong_count(&big_view), 1, "only the test holds it");
     }
 
     /// A `BUFFER_OVER_PAGES` is the sender's own pages block's alone: a block the sender does not

@@ -1314,12 +1314,14 @@ impl<P: Platform> GraphicsDecoder<P> {
             log::info!(
                 target: "reims_vgpu::graphics",
                 "IOSurface pages in place: {} views made, {} taken from the cache, {} let go of \
-                 from it unheld for their mappings; {} pages blocks' views made; {} named by \
-                 their runs; refused: {} for bad runs, {} not mapped; asked whether they need a \
-                 device cache: {} in place, {} in place while the device's verdict was pending, \
-                 {} answered a cache, {} of them for want of room for their views",
-                c.made, c.reused, c.idle_returned, c.private, c.by_runs, c.bad_runs, c.not_mapped,
-                c.asked_in_place, c.asked_pending, c.asked_cache, c.asked_room
+                 from it unheld for their mappings; {} pages blocks' views made, {} taken from \
+                 the cache; {} named by their runs; refused: {} for bad runs, {} not mapped; \
+                 asked whether they need a device cache: {} in place, {} in place while the \
+                 device's verdict was pending, {} answered a cache, {} of them for want of room \
+                 for their views",
+                c.made, c.reused, c.idle_returned, c.private, c.private_reused, c.by_runs,
+                c.bad_runs, c.not_mapped, c.asked_in_place, c.asked_pending, c.asked_cache,
+                c.asked_room
             );
             if d.made != 0 {
                 log::info!(
@@ -1913,7 +1915,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             PagesInPlace::No(why) => {
                 v.asked(surface_pages::Asked::Cache);
-                let released = v.released(block);
+                let released = v.released(block, self.platform.vm().idle_view_mappings());
                 // The cache the block's cached `SURFACE_PAGES` makes copies out the texels alone.
                 v.laid_out(block, planes.to_vec());
                 drop(v);
@@ -2102,7 +2104,8 @@ impl<P: Platform> GraphicsDecoder<P> {
         let asked = self.platform.clock().now_mono();
         self.settle_surface(offset);
         let (ran, trace, done) = self.timed("BLOCK_RELEASE", offset, asked, done);
-        let gone = self.shared.surface_views.lock().released(offset);
+        let idle_mappings = self.platform.vm().idle_view_mappings();
+        let gone = (self.shared.surface_views.lock()).released(offset, idle_mappings);
         if let Some(gone) = gone {
             self.shared.surface_worker.drop_later(offset, offset, gone);
         }
