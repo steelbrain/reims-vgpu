@@ -2531,6 +2531,10 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         }
     }
 
+    fn trace(&self, kind: &'static str, values: &[u64]) {
+        reims_vgpu_vulkan::core::trace::event(kind, values);
+    }
+
     fn present_surface(&self, iosurface_id: u32, generation: Option<u64>, answer: PresentAnswer) {
         stepped(|| {
             self.control

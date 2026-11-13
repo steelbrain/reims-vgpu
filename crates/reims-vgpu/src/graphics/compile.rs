@@ -21,7 +21,9 @@
 //! behind no other context's. Library makes go before every pipeline compile: a pipeline that
 //! names a library another context is still making waits for it on its thread, and that library
 //! has then always been taken by a thread already. Each compile's wait and run time is logged at
-//! debug (`reims_vgpu::graphics::compile`).
+//! debug (`reims_vgpu::graphics::compile`), and, in the profiling trace
+//! ([`reims_vgpu_vulkan::core::trace`]), its hand-over, start and end as `cmphand`, `cmpstart`
+//! and `cmpend` events, each with the object's id.
 //!
 //! **Order.** From its dispatch until it is stored, the pipeline is pending. A command buffer
 //! that names a pending pipeline (`SET_RENDER_PIPELINE_STATE`, `SET_COMPUTE_PIPELINE_STATE`: the
@@ -61,6 +63,7 @@ use reims_vgpu_graphics::wire::{
 };
 use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
 use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
+use reims_vgpu_vulkan::core::trace;
 use reims_vgpu_vulkan::exit_gate;
 use zerocopy::FromBytes;
 
@@ -330,6 +333,7 @@ impl CompilePool {
             state.turns.push_back(context);
         }
         drop(state);
+        trace::event("cmphand", &[of.obj_id]);
         self.shared.waiting.notify_one();
         Ok(())
     }
@@ -422,7 +426,9 @@ fn run(shared: &Shared, queued: Queued) {
         ahead,
     } = queued;
     let started = (shared.now)();
+    trace::event("cmpstart", &[of.obj_id]);
     job();
+    trace::event("cmpend", &[of.obj_id]);
     let ended = (shared.now)();
     let ms = |d: Duration| d.as_secs_f64() * 1e3;
     log::debug!(

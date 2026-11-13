@@ -18,23 +18,11 @@
 //!   guest's first creations of the states an earlier process made find them made, after a host
 //!   restart, and after an update of the runtime, whose translations of the earlier build's the
 //!   shader cache keeps apart (a record holds a descriptor, never a translation).
-//! - **Left out once it stood.** A record whose warm making worked [`RECORD_BOUND`] without ending
-//!   (a driver compile that never ends, or runs for minutes) is left out of every later pass: the
-//!   warm thread appends a tombstone of it ([`leave_out`]) as the bound passes, so a process
-//!   killed meanwhile leaves it too, and [`read`] hands no pass a record the file holds a
-//!   tombstone of. A host then pays for such a making in the start whose pass stands on it the
-//!   bound, not at every start: its driver memory, the records behind it the pass does not reach,
-//!   and the exit's wait for it. Only the pass leaves it out: the guest's own creation of its
-//!   state is made as ever, and the hook keeps its record as before. The record in making and how
-//!   long its making worked are the runtime's (`WarmStatistics::record_in_making`, [`Watch`]).
-//! - **The file's format**: frames, each [`MAGIC`], the payload's length and the FNV-1a hash of
-//!   its bytes (each a little-endian `u32`), then its bytes: a record's, or a tombstone's,
-//!   [`UNFINISHED`] followed by the bytes of the record it leaves out. A reader skips a frame
-//!   whose length runs past the file or whose hash does not match (a process that died
-//!   mid-write, or two writing at once), and goes on at the next [`MAGIC`] after its start; a
-//!   record of another format the runtime reads as none (`PipelineRecord::from_bytes`) and the
-//!   pass drops, and an earlier build, which knows no tombstone, hands the runtime a tombstone's
-//!   bytes, which it reads so.
+//! - **The file's format**: frames, each [`MAGIC`], the record's length and the FNV-1a hash of its
+//!   bytes (each a little-endian `u32`), then its bytes. A reader skips a frame whose length runs
+//!   past the file or whose hash does not match (a process that died mid-write, or two writing at
+//!   once), and goes on at the next [`MAGIC`] after its start; a record of another format the
+//!   runtime reads as none (`PipelineRecord::from_bytes`) and the pass drops.
 //!
 //! A test build's devices keep and warm no records ([`KEPT`]): this crate's unit tests', and every
 //! crate's tests', which turn on its `testkit` feature (only dev-dependencies do, `cargo xtask
@@ -95,26 +83,8 @@ pub(crate) const WARM_BUDGET: u64 = crate::platform::SHADER_CACHE_CAPACITY / 2;
 /// How often the warm thread looks whether the runtime's pass has ended.
 const WARM_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// How long the warm pass may stand on one record before later passes leave it out (the module
-/// docs, [`Watch`]): the bound the runtime's exit gives a pipeline making in the driver (its exit
-/// waits at most 60 s for one). **Measured** 2026-11-12 on homelab-ms01-1's Iris Xe (ANV, Xe-LP),
-/// macOS 26.7.2 guests' boots over 2,983 records: the making of one, a compute kernel whose
-/// driver compile does not end, held the pass at every start, the process's glibc heap in use going
-/// from 22 MB to 4.57 GB once the pass reached it and the boot's peak from 9.6 to 18-20 GiB, and
-/// each exit waited the bound for it; the log of such a boot (job m3-max-25012) names 1,520
-/// makings, and each of the 1,519 others took under 10 ms.
-///
-/// The time is the runtime's (`WarmStatistics::record_in_making_nanos`): how long the making
-/// worked, its waits for a turn behind the process's other makings (which the runtime ranks above
-/// the pass's) left out, so a record the guest's makings starve is never left out for it.
-pub(crate) const RECORD_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// The start of each frame of the records file.
 pub(crate) const MAGIC: u32 = u32::from_le_bytes(*b"RVGR");
-
-/// The start of a tombstone's payload, the bytes of the record it leaves out following (the
-/// module docs): never a record's start, which is the runtime's format name (`M2VPREC`).
-pub(crate) const UNFINISHED: &[u8] = b"reims-vgpu: unfinished warm making\0";
 
 /// The bytes of a frame before its record's.
 const FRAME_HEAD: usize = 12;
@@ -258,71 +228,13 @@ pub(crate) fn hook(path: PathBuf) -> Option<Arc<dyn Fn(rt::PipelineRecord) + Sen
     }))
 }
 
-/// The records of `frames`, a records file's ([`split`]), that a warm pass is handed, in their
-/// order: every one but those a tombstone leaves out (the module docs), and how many those are.
-fn warmable<'a>(frames: &[&'a [u8]]) -> (Vec<&'a [u8]>, usize) {
-    let unfinished: HashSet<&[u8]> = frames
-        .iter()
-        .filter_map(|frame| frame.strip_prefix(UNFINISHED))
-        .collect();
-    let records = frames.iter().filter(|frame| !frame.starts_with(UNFINISHED));
-    let (left_out, handed): (Vec<&[u8]>, Vec<&[u8]>) =
-        records.partition(|record| unfinished.contains(*record));
-    (handed, left_out.len())
-}
-
-/// The records of the file at `path` a warm pass is handed, in its order ([`warmable`]), and how
-/// many its tombstones leave out.
-pub(crate) fn read(path: &Path) -> (Vec<rt::PipelineRecord>, usize) {
+/// The records of the file at `path`, in its order.
+pub(crate) fn read(path: &Path) -> Vec<rt::PipelineRecord> {
     let bytes = std::fs::read(path).unwrap_or_default();
-    let (records, left_out) = warmable(&split(&bytes));
-    let records = records
+    split(&bytes)
         .into_iter()
         .filter_map(rt::PipelineRecord::from_bytes)
-        .collect();
-    (records, left_out)
-}
-
-/// Appends to the file at `path` the tombstone of `record` (the module docs): one write of its
-/// frame, as the keeper's ([`Keeper::keep`]), past [`CAPACITY`] too, since no later pass makes a
-/// record with a tombstone, so tombstones stay as few as the records whose makings stood.
-pub(crate) fn leave_out(path: &Path, record: &[u8]) -> std::io::Result<()> {
-    let mut tombstone = UNFINISHED.to_vec();
-    tombstone.extend_from_slice(record);
-    OpenOptions::new()
-        .append(true)
-        .open(path)?
-        .write_all(&frame(&tombstone))
-}
-
-/// The warm thread's watch over the record the pass makes (the module docs): the runtime names
-/// it by its place among the records handed (`WarmStatistics::record_in_making`), with how long
-/// its making worked, and none on a generation a recovery left, whose pass ends.
-#[derive(Default)]
-struct Watch {
-    /// The place of the record that overran last.
-    overran: Option<u64>,
-}
-
-impl Watch {
-    /// The place of the record whose making worked [`RECORD_BOUND`], by the pass's `statistics`,
-    /// once a record; `None` while none has.
-    fn overran(&mut self, statistics: &rt::WarmStatistics) -> Option<u64> {
-        let at = statistics.record_in_making?;
-        let worked = statistics.record_in_making_nanos >= RECORD_BOUND.as_nanos() as u64;
-        (worked && self.overran.replace(at) != Some(at)).then_some(at)
-    }
-}
-
-/// The records a warm pass's counts say ended, each warmed, translated only, failed, unread, not
-/// warmable or not run.
-fn counted(s: &rt::WarmStatistics) -> u64 {
-    s.records_warmed
-        + s.records_translated
-        + s.records_failed
-        + s.records_unread
-        + s.records_not_warmable
-        + s.records_not_run
+        .collect()
 }
 
 /// Hands `device` the records of the file at `path`, from a thread of its own that reads the
@@ -337,25 +249,22 @@ pub(crate) fn warm(
     let spawned = std::thread::Builder::new()
         .name("reims-vgpu-warm".into())
         .spawn(move || {
-            let (records, left_out) = read(&path);
+            let records = read(&path);
             if records.is_empty() || stop.stopped() {
                 return;
             }
             log::info!(
                 target: "reims_vgpu_vulkan::records",
-                "warming {} pipeline records from {} ({left_out} left out: their warm making \
-                 worked {} s in an earlier pass)",
+                "warming {} pipeline records from {}",
                 records.len(),
-                path.display(),
-                RECORD_BOUND.as_secs()
+                path.display()
             );
             let handed = records.len() as u64;
-            device.warm(records.clone(), WARM_BUDGET);
+            device.warm(records, WARM_BUDGET);
             // The pass runs on the runtime's thread and says nothing when it ends: its counts
             // reach the records handed then. The device's end stops the polls, which hold its
             // runtime device.
             let clock = crate::os::OsClock::new();
-            let mut watch = Watch::default();
             let mut polls = 0u64;
             loop {
                 let statistics = device.warm_statistics();
@@ -366,21 +275,6 @@ pub(crate) fn warm(
                         (polls * WARM_POLL.as_millis() as u64) as f64 / 1000.0
                     );
                     return;
-                }
-                if let Some(at) = watch.overran(&statistics)
-                    && let Some(record) = records.get(at as usize)
-                {
-                    let left = leave_out(&path, &record.to_bytes());
-                    log::warn!(
-                        target: "reims_vgpu_vulkan::records",
-                        "the warm pass's making of pipeline record {at} of {handed} worked {} s \
-                         without ending: {}; the guest's own creation of its state still makes it",
-                        RECORD_BOUND.as_secs(),
-                        match left {
-                            Ok(()) => "later passes leave it out".to_owned(),
-                            Err(e) => format!("its tombstone was not appended ({e})"),
-                        }
-                    );
                 }
                 polls += 1;
                 if stop.wait_until(clock.now_mono().saturating_add(WARM_POLL)) {
@@ -396,7 +290,13 @@ pub(crate) fn warm(
 /// while the pass runs.
 pub(crate) fn summary(statistics: &rt::WarmStatistics, handed: u64) -> Option<String> {
     let s = statistics;
-    (counted(s) >= handed).then(|| {
+    let ended = s.records_warmed
+        + s.records_translated
+        + s.records_failed
+        + s.records_unread
+        + s.records_not_warmable
+        + s.records_not_run;
+    (ended >= handed).then(|| {
         format!(
             "warmed {handed} pipeline records: {} made, {} translated only, {} failed, {} unread, \
              {} not warmable, {} not run (the budget spent or the process ending); {} bytes of \
@@ -496,92 +396,6 @@ mod tests {
         assert!(split(&frame(&a)[..FRAME_HEAD]).is_empty());
     }
 
-    /// The bound, in nanoseconds.
-    const BOUND: u64 = RECORD_BOUND.as_nanos() as u64;
-
-    /// The counts of a pass making the record at `at`, whose making worked `nanos`; none between
-    /// records.
-    fn making(at: Option<u64>, nanos: u64) -> rt::WarmStatistics {
-        let mut s = rt::WarmStatistics::default();
-        s.records_warmed = at.unwrap_or_default();
-        s.record_in_making = at;
-        s.record_in_making_nanos = nanos;
-        s
-    }
-
-    /// A record whose warm making works the bound is named once, its tombstone appended, and the
-    /// next pass is handed every record but it
-    #[test]
-    fn an_unfinished_record_is_not_handed_to_the_next_pass() {
-        let dir = Scratch::new("unfinished");
-        let path = dir.0.join("records");
-        let records = [b"one".as_slice(), b"two", b"three"];
-        let mut keeper = Keeper::open(path.clone());
-        for record in records {
-            keeper.keep(record);
-        }
-        let mut watch = Watch::default();
-        assert_eq!(watch.overran(&making(Some(0), 1_000)), None);
-        assert_eq!(watch.overran(&making(None, 0)), None);
-        assert_eq!(watch.overran(&making(Some(1), BOUND - 1)), None);
-        assert_eq!(watch.overran(&making(Some(1), BOUND)), Some(1));
-        assert_eq!(
-            watch.overran(&making(Some(1), 2 * BOUND)),
-            None,
-            "named once"
-        );
-        leave_out(&path, records[1]).unwrap();
-        let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(warmable(&split(&bytes)), (vec![records[0], records[2]], 1));
-        // The keeper, the guest's creations' end of the file, still holds it, and keeps it once.
-        let mut keeper = Keeper::open(path.clone());
-        keeper.keep(records[1]);
-        assert_eq!(std::fs::read(&path).unwrap(), bytes);
-    }
-
-    /// A record whose making ends within the bound is named by no poll, and the next pass is
-    /// handed it; so is one the runtime names no more (a recovery's new generation, a pass ended)
-    #[test]
-    fn a_finished_record_is_still_handed_to_the_next_pass() {
-        let dir = Scratch::new("finished");
-        let path = dir.0.join("records");
-        let mut keeper = Keeper::open(path.clone());
-        keeper.keep(b"one");
-        keeper.keep(b"two");
-        let mut watch = Watch::default();
-        assert_eq!(watch.overran(&making(Some(0), BOUND - 1)), None);
-        assert_eq!(watch.overran(&making(Some(1), BOUND - 1)), None);
-        assert_eq!(watch.overran(&making(None, 0)), None);
-        let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(
-            warmable(&split(&bytes)),
-            (vec![b"one".as_slice(), b"two"], 0)
-        );
-    }
-
-    /// A file of records alone, as every earlier build wrote it, hands a pass all of them in its
-    /// order; a tombstone of a record the file does not hold leaves out none; and a tombstone's
-    /// bytes, which an earlier build hands the runtime, are no record to it
-    #[test]
-    fn the_file_s_existing_frames_still_read() {
-        let (a, b) = (b"first".to_vec(), vec![7u8; 300]);
-        let mut file = frame(&a);
-        file.extend_from_slice(&frame(&b));
-        assert_eq!(
-            warmable(&split(&file)),
-            (vec![a.as_slice(), b.as_slice()], 0)
-        );
-        let mut tombstone = UNFINISHED.to_vec();
-        tombstone.extend_from_slice(b"absent");
-        file.extend_from_slice(&frame(&tombstone));
-        assert_eq!(split(&file).len(), 3);
-        assert_eq!(
-            warmable(&split(&file)),
-            (vec![a.as_slice(), b.as_slice()], 0)
-        );
-        assert!(rt::PipelineRecord::from_bytes(&tombstone).is_none());
-    }
-
     /// The keeper appends each record once, across reopenings of the file, and nothing past its
     /// capacity
     #[test]
@@ -636,12 +450,12 @@ mod tests {
         }
         // The writer appends on its own thread, within 30 s.
         for _ in 0..3000 {
-            if !read(&path).0.is_empty() {
+            if !read(&path).is_empty() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(read(&path).0.len(), 1);
+        assert_eq!(read(&path).len(), 1);
         let device = rt::Device::system_default_with(&options()).unwrap();
         let stop = Arc::new(crate::let_go::Stop::default());
         let _polls = warm(&device, path, &stop);

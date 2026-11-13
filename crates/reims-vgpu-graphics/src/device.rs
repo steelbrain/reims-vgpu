@@ -622,6 +622,22 @@ pub trait Host: Send + Sync + 'static {
     fn display_color(&self, color: &RgfxDisplayColor, entries: &[RgfxColorEntry]) {
         let _ = (color, entries);
     }
+
+    /// One event of ring 0's timeline for the host's profiling trace, `kind` and its `values`,
+    /// timed by the host as it is called, on the thread it happened on: a diagnostic, which
+    /// changes nothing the device does. Ring 0's events and their values:
+    /// - `r0wake`: the control thread woke from its sleep (a doorbell, a `STATUS` write or the
+    ///   device's end);
+    /// - `r0take type seqno obj_id`: the control thread took a message (`obj_id` the 8 bytes after
+    ///   its header, 0 for a message shorter);
+    /// - `r0job type seqno`, `r0jobdone seqno`: a lane's job began and was carried out;
+    /// - `r0post type seqno raise`: an answer or event went on the control completion ring,
+    ///   `raise` 1 where its interrupt is raised next.
+    ///
+    /// The default writes nothing.
+    fn trace(&self, kind: &'static str, values: &[u64]) {
+        let _ = (kind, values);
+    }
 }
 
 /// The largest `COMMAND_BUFFER` message a doorbell's thread offers the host
@@ -1502,6 +1518,7 @@ impl Shared {
                 break;
             }
             self.wake.sleep(self.doorbell.get().map(AsRawFd::as_raw_fd));
+            self.host.trace("r0wake", &[]);
             // A doorbell may follow the guest's take of completions.
             self.room.wake();
             // A reset while it slept set the ring up anew, its `consumer_idle` 1, so the guest
@@ -1544,6 +1561,19 @@ impl Shared {
                 if let Ok(Some(message)) = &next {
                     let through = submit.consumer.consumed();
                     submit.backlog.took(message, through);
+                    let obj_id = message
+                        .bytes
+                        .get(16..24)
+                        .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                        .map_or(0, u64::from_le_bytes);
+                    self.host.trace(
+                        "r0take",
+                        &[
+                            u64::from(message.header.r#type),
+                            message.header.seqno,
+                            obj_id,
+                        ],
+                    );
                 }
                 match next {
                     Ok(Some(message)) if control::is_unheld(&message) => {
@@ -1733,6 +1763,10 @@ impl Shared {
                 }
             }
         };
+        if let Ok((header, _)) = RgfxMsgHeader::read_from_prefix(message) {
+            let raised = u64::from(raise);
+            (self.host).trace("r0post", &[u64::from(header.r#type), header.seqno, raised]);
+        }
         if raise {
             self.host.raise_interrupt(RGFX_CONTROL_VECTOR);
         }
@@ -2781,11 +2815,14 @@ fn serve_lane(lanes: &Lanes, shared: &Weak<Shared>, key: Key, spare: Option<usiz
             lanes.finished(key);
             return;
         };
+        let seqno = job.message.header.seqno;
+        (shared.host).trace("r0job", &[u64::from(job.message.header.r#type), seqno]);
         let answer = if shared.epoch.load(Ordering::Acquire) == job.epoch {
             control::unheld(&shared, &job.message, job.epoch)
         } else {
             None
         };
+        (shared.host).trace("r0jobdone", &[seqno]);
         if let Some((context, done)) = lanes.finished(key) {
             (shared.gate).carried_out_offering(context, done, |offer| shared.answer_offered(offer));
         }
