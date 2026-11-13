@@ -694,6 +694,20 @@ fn asking(queue_obj_id: u64, cb_obj_id: u64) -> Vec<u8> {
     message
 }
 
+/// Whether the `COMMAND_BUFFER` `message` asks for its `CB_SUBMITTED`: its last op is the ask, as
+/// the bundle appends it.
+fn asks_submitted(message: &[u8]) -> bool {
+    use reims_vgpu_graphics::ops::{RGFX_OP_SUBMITTED, RgfxOpHeader};
+
+    let Some(at) = message.len().checked_sub(size_of::<RgfxOpHeader>()) else {
+        return false;
+    };
+    message[0..4] == RGFX_CMD_COMMAND_BUFFER.to_le_bytes()
+        && message.len() > RGFX_COMMAND_BUFFER_OPS_OFFSET as usize
+        && RgfxOpHeader::read_from_bytes(&message[at..])
+            .is_ok_and(|h| h.tag == RGFX_OP_SUBMITTED && h.len == 8)
+}
+
 /// The device-info caps blob `device` wrote into its region at [`RGFX_DEVICE_INFO_OFFSET`].
 fn device_info_of(device: &GraphicsDevice<FakePlatform>) -> RgfxDeviceInfo {
     // SAFETY: the region is the device's, mapped while it lives, and the blob lies in the
@@ -1224,27 +1238,29 @@ impl QueueRing {
     }
 
     /// Publishes `command` (its `size` its length) on the submission ring and rings the queue's
-    /// doorbell through `mmio_write_taking`, as QEMU rings, only where the host marked the ring
-    /// idle, as the guest's writer does (`RgfxRingWriter`): whether it rang.
+    /// doorbell through `mmio_write_taking`, as QEMU rings, as the guest's writer does
+    /// (`RgfxRingWriter`): where the host marked the ring asleep, or walking and `command` asks
+    /// for its `CB_SUBMITTED` (its last op the ask). Whether it rang.
     fn send_as_guest(&mut self, device: &GraphicsDevice<FakePlatform>, command: Vec<u8>) -> bool {
+        let asks = asks_submitted(&command);
         self.publish(command);
-        let idle = self.marked_idle();
-        if idle {
+        let idle = self.consumer_idle();
+        let rings = idle == RGFX_CONSUMER_ASLEEP || (idle == RGFX_CONSUMER_WALKING && asks);
+        if rings {
             device.mmio_write_taking(RGFX_REG_DOORBELL.into(), self.submit_off as u32);
         }
-        idle
+        rings
     }
 
-    /// Whether the host marked the submission ring idle (`consumer_idle` 1), so the guest's
-    /// writer rings the doorbell for what it has just published.
-    fn marked_idle(&self) -> bool {
+    /// The submission ring's `consumer_idle`, which the guest's writer reads for what it has
+    /// just published.
+    fn consumer_idle(&self) -> u32 {
         // SAFETY: as the helpers above; `consumer_idle` is at 0x80 of the submission ring header,
         // read after the publish's store, as the writer reads it after a full fence.
-        let idle = unsafe {
+        unsafe {
             AtomicU32::from_ptr(self.base.add(self.submit_off as usize + 0x80).cast())
                 .load(Ordering::SeqCst)
-        };
-        idle == 1
+        }
     }
 
     /// Publishes `command` (its `size` its length) on the submission ring, ringing no doorbell.
@@ -1938,7 +1954,11 @@ fn an_asking_buffer_s_doorbell_to_its_cb_submitted_behind_a_walk() {
         let start = Instant::now();
         if plain {
             device.mmio_write(RGFX_REG_DOORBELL.into(), submit_off as u32);
-        } else if ring.marked_idle() {
+        } else if matches!(
+            ring.consumer_idle(),
+            RGFX_CONSUMER_ASLEEP | RGFX_CONSUMER_WALKING
+        ) {
+            // The guest rings for an asking buffer where the ring is asleep or walking.
             taking();
         }
         let in_write = !plain && ring.has_event();
@@ -5510,8 +5530,9 @@ fn a_short_buffer_that_waits_for_nothing_is_walked_on_its_queue_s_service_thread
 
 /// A command buffer that asks for its `CB_SUBMITTED` behind a short buffer its queue's service
 /// thread walks is answered before that walk ends, as behind one a lane's thread walks:
-/// published during the walk, rung for, as the guest rings only for a ring the host marked idle,
-/// which the service thread marks it through the walk, and answered inside the write; and
+/// published during the walk, rung for, as the guest rings for an asking buffer on a ring the
+/// host marked walking, which the service thread marks it through the walk, and answered inside
+/// the write; and
 /// published before the service thread took the buffer before it, by that thread, before the
 /// walk. Each completes after the buffer before it. The service thread held its claim on the
 /// queue's messages through the walk, so the write answered nothing and the buffer was answered
@@ -5535,7 +5556,7 @@ fn a_buffer_that_asks_behind_a_walk_on_its_service_thread_is_answered_before_the
     );
     assert!(
         ring.send_as_guest(&device, asking(obj(1, 1), 101)),
-        "the ring was not marked idle during the walk: the guest rang no doorbell"
+        "the ring was not marked walking during the walk: the guest rang no doorbell"
     );
     assert!(
         ring.has_event(),
@@ -5587,6 +5608,36 @@ fn a_buffer_that_asks_behind_a_walk_on_its_service_thread_is_answered_before_the
         ]
     );
     assert_eq!(ring.scheduled, [(0, 200), (0, 201)]);
+}
+
+/// A command buffer that does not ask for its `CB_SUBMITTED`, published while its queue's service
+/// thread walks the buffer before it, rings no doorbell, as the ring is marked walking, not
+/// asleep, and is carried out once the walk is done, after that buffer, with no doorbell: the
+/// thread takes the ring again after the walk. The service thread marked its ring as it marks it
+/// before it sleeps, so the guest rang for each such buffer, a VM exit that answered nothing
+/// (26.7.2 guest, 780M host: 11.9 µs a doorbell, two in three commits of a back-to-back run)
+#[test]
+fn a_buffer_that_does_not_ask_rings_no_doorbell_behind_a_walk() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let ok = u64::from(RGFX_CB_OK);
+    let (device, platform, _guest, mut ring) = one_queue(&raised);
+    let gate = WalkGate::in_place(&device);
+    ring.send(&device, sampler_command_buffer(obj(1, 1), 100, obj(1, 4)));
+    assert!(gate.reached(), "the short buffer's walk did not start");
+    assert_eq!(ring.consumer_idle(), RGFX_CONSUMER_WALKING);
+    assert!(
+        !ring.send_as_guest(&device, sampler_command_buffer(obj(1, 1), 101, obj(1, 4))),
+        "the guest rang for a buffer that does not ask behind a walk"
+    );
+    assert!(!ring.has_event(), "the buffer behind the walk was answered");
+    gate.open();
+    assert_eq!(
+        ring_events(&platform, &mut ring, 2),
+        [
+            (RGFX_EVT_CB_COMPLETE, 100, ok),
+            (RGFX_EVT_CB_COMPLETE, 101, ok)
+        ]
+    );
 }
 
 /// A queue's buffers decide their signals of its surface timeline in their turns: a buffer of

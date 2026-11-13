@@ -179,7 +179,7 @@ bool RgfxRingWriter::fits(uint32_t size) const
 
 bool RgfxRingWriter::post(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,
                           const std::function<void()> &whileWaiting,
-                          const std::function<void(uint64_t)> &beforePublish)
+                          const std::function<void(uint64_t)> &beforePublish, bool answered)
 {
 	if (!fits(size))
 		return false;
@@ -187,7 +187,7 @@ bool RgfxRingWriter::post(uint32_t type, const void *message, uint32_t size, uin
 	for (;;) {
 		// The room records so far, read before the look: one that comes after it ends the wait.
 		const uint64_t seen = m_room ? m_room->seen() : 0;
-		if (tryPost(type, message, size, out_seqno, nullptr, beforePublish))
+		if (tryPost(type, message, size, out_seqno, nullptr, beforePublish, answered))
 			return true;
 		// Where the host posts room records, it is told a post waits, then the ring is looked
 		// at once more: either this look finds what the host took, or the host's next take finds
@@ -195,11 +195,11 @@ bool RgfxRingWriter::post(uint32_t type, const void *message, uint32_t size, uin
 		if (m_room) {
 			store32(m_header + kProducerWaiting, 1);
 			fullFence();
-			if (tryPost(type, message, size, out_seqno, nullptr, beforePublish))
+			if (tryPost(type, message, size, out_seqno, nullptr, beforePublish, answered))
 				return true;
 		}
 		// The host takes the ring on a thread of its own: make sure it is awake, then let it.
-		if (m_doorbell && (sleepUs == 0 || load32(m_header + kConsumerIdle) == 1))
+		if (m_doorbell && (sleepUs == 0 || load32(m_header + kConsumerIdle) == RGFX_CONSUMER_ASLEEP))
 			m_doorbell(m_doorbellContext, m_ringId);
 		if (whileWaiting)
 			whileWaiting();
@@ -241,7 +241,7 @@ void RgfxRingWriter::logSleeps(const RgfxRingRoomSleeps &seen) const
 
 bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,
                              uint32_t *out_status,
-                             const std::function<void(uint64_t)> &beforePublish)
+                             const std::function<void(uint64_t)> &beforePublish, bool answered)
 {
 	if (size < kHeaderBytes || size % kMsgAlign != 0 || size > m_dataSize)
 		return false;
@@ -304,7 +304,10 @@ bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, 
 	storeFence();
 	store64(m_header + kProducer, m_produced);
 	fullFence();
-	if (m_doorbell && load32(m_header + kConsumerIdle) == 1)
+	// A walking host comes back to the ring by itself: it is rung only for what it answers in
+	// the doorbell's write.
+	const uint32_t idle = load32(m_header + kConsumerIdle);
+	if (m_doorbell && (idle == RGFX_CONSUMER_ASLEEP || (idle == RGFX_CONSUMER_WALKING && answered)))
 		m_doorbell(m_doorbellContext, m_ringId);
 
 	if (out_seqno)

@@ -548,6 +548,17 @@ public:
 	/// Whether the finished message goes on the ring (RgfxRingWriter::fits), not in a block.
 	bool fitsRing() const;
 
+	/// Whether the op stream's last op is the buffer's ask for its submission (appendSubmitted),
+	/// which the host answers at the doorbell where it need wait for nothing.
+	bool endsInAsk() const
+	{
+		RgfxOpHeader last = {};
+		if (static_cast<size_t>(m_cur - m_ops) < sizeof(last))
+			return false;
+		std::memcpy(&last, m_cur - sizeof(last), sizeof(last));
+		return last.tag == RGFX_OP_SUBMITTED && last.len == sizeof(last);
+	}
+
 	/// The finished message's length: the header, the op stream and the surface uses before it.
 	uint64_t messageSize() const { return RGFX_COMMAND_BUFFER_OPS_OFFSET + opBytes(); }
 

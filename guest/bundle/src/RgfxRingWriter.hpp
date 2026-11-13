@@ -9,7 +9,9 @@
  * per-ring seqno. Posting a message: pad to the ring's end if it would not fit
  * before it (a message never wraps), copy the message, publish `producer` with a
  * release store, issue a full fence, and ring the doorbell only if the host
- * marked the ring idle (`consumer_idle` == 1). The message's 16-byte header has
+ * marked the ring asleep (`consumer_idle` RGFX_CONSUMER_ASLEEP), or walking
+ * (RGFX_CONSUMER_WALKING) for a command buffer it may answer at the doorbell (tryPost).
+ * The message's 16-byte header has
  * its `type`, `size` and `seqno` stamped by the writer; the caller fills the
  * payload.
  *
@@ -100,9 +102,13 @@ public:
 	/// forward handed back, or kRgfxNoAnswer. `beforePublish` (when set) is called with
 	/// the seqno before the host can see the message: under the ring's lock, before
 	/// `producer` moves (for a forwarding writer, once the kext has posted it).
+	/// The doorbell rings where the host marked the ring asleep (RGFX_CONSUMER_ASLEEP), and, with
+	/// `answered` (a command buffer that asks for its CB_SUBMITTED, which the host may answer
+	/// inside the doorbell's write), where it marked it walking (RGFX_CONSUMER_WALKING): a
+	/// walking host takes the ring again once its walk is done, with no doorbell.
 	bool tryPost(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,
 	             uint32_t *out_status = nullptr,
-	             const std::function<void(uint64_t)> &beforePublish = {});
+	             const std::function<void(uint64_t)> &beforePublish = {}, bool answered = false);
 
 	/// Where a forwarding writer posts a known pipeline create (RgfxForwardDeferred) and takes
 	/// its answer (RgfxAwaitAnswer), both called with `context`: the kext's deferred submit,
@@ -156,7 +162,7 @@ public:
 	/// False, writing nothing, only for a message that does not fit().
 	bool post(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,
 	          const std::function<void()> &whileWaiting = {},
-	          const std::function<void(uint64_t)> &beforePublish = {});
+	          const std::function<void(uint64_t)> &beforePublish = {}, bool answered = false);
 
 	/// The byte ring's size.
 	uint32_t dataSize() const { return m_dataSize; }

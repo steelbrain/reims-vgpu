@@ -21,7 +21,10 @@ use std::sync::atomic::{Ordering, fence};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::region::Region;
-use crate::wire::{RGFX_CB_OK, RGFX_EVT_CB_COMPLETE, RGFX_MSG_PAD, RgfxCbComplete, RgfxMsgHeader};
+use crate::wire::{
+    RGFX_CB_OK, RGFX_CONSUMER_ASLEEP, RGFX_CONSUMER_WALKING, RGFX_EVT_CB_COMPLETE, RGFX_MSG_PAD,
+    RgfxCbComplete, RgfxMsgHeader,
+};
 
 /// Where a ring is in the region: its header, and its byte ring of `data_size` bytes, a power of
 /// two, right after it.
@@ -82,7 +85,8 @@ impl std::fmt::Display for Broken {
 
 impl RingAt {
     /// Writes the header of a ring nothing has passed through: both counts 0, `armed` and
-    /// `producer_waiting` 0, and `consumer_idle` as given.
+    /// `producer_waiting` 0, and `consumer_idle` [`RGFX_CONSUMER_ASLEEP`] where `consumer_idle`,
+    /// else 0.
     pub(crate) fn initialize(&self, region: &Region, consumer_idle: bool) {
         region
             .atomic_u64(self.header + PRODUCER)
@@ -96,9 +100,14 @@ impl RingAt {
         region
             .atomic_u64(self.header + CONSUMER)
             .store(0, Ordering::Release);
-        region
-            .atomic_u32(self.header + CONSUMER_IDLE)
-            .store(u32::from(consumer_idle), Ordering::Release);
+        region.atomic_u32(self.header + CONSUMER_IDLE).store(
+            if consumer_idle {
+                RGFX_CONSUMER_ASLEEP
+            } else {
+                0
+            },
+            Ordering::Release,
+        );
         region
             .atomic_u32(self.header + ARMED)
             .store(0, Ordering::Release);
@@ -402,7 +411,7 @@ impl Consumer {
     /// again). A broken count answers true, so the host finds it.
     pub(crate) fn sleep_or_pending(&self, region: &Region) -> bool {
         let idle = region.atomic_u32(self.at.header + CONSUMER_IDLE);
-        idle.store(1, Ordering::SeqCst);
+        idle.store(RGFX_CONSUMER_ASLEEP, Ordering::SeqCst);
         fence(Ordering::SeqCst);
         let pending = self.has_pending(region).unwrap_or(true);
         if pending {
@@ -422,13 +431,16 @@ impl Consumer {
     }
 
     /// While the host works on something other than the ring's take (a walk the queue's service
-    /// thread carries out): sets `consumer_idle` and issues a full fence, so the guest rings its
-    /// doorbell for what it publishes from then on, and the host's look at the ring after the
-    /// fence finds what it published before ([`Self::awake`] clears it again).
-    pub(crate) fn mark_idle(&self, region: &Region) {
+    /// thread carries out), after which it takes the ring again: sets `consumer_idle` to
+    /// [`RGFX_CONSUMER_WALKING`] and issues a full fence, so the guest rings its doorbell for a
+    /// command buffer it publishes from then on that asks to be answered there, and the host's
+    /// look at the ring after the fence finds what it published before ([`Self::awake`] clears
+    /// it again). The guest rings for nothing else it publishes meanwhile: the host takes it once
+    /// the walk is done.
+    pub(crate) fn mark_walking(&self, region: &Region) {
         region
             .atomic_u32(self.at.header + CONSUMER_IDLE)
-            .store(1, Ordering::SeqCst);
+            .store(RGFX_CONSUMER_WALKING, Ordering::SeqCst);
         fence(Ordering::SeqCst);
     }
 
@@ -834,6 +846,28 @@ mod tests {
         Guest { count: 0 }.write(&region, &message(1, 1, 16));
         assert!(consumer.sleep_or_pending(&region));
         assert_eq!(region.atomic_u32(CONSUMER_IDLE).load(Ordering::Acquire), 0);
+    }
+
+    /// A walk marks the ring walking, not asleep, so the guest rings only for what asks to be
+    /// answered at the doorbell; the take after it clears the mark
+    #[test]
+    fn a_walk_marks_the_ring_walking_not_asleep() {
+        let region = Region::new(4096).unwrap();
+        let mut consumer = Consumer::new(AT);
+        consumer.reset(&region);
+        consumer.awake(&region);
+        consumer.mark_walking(&region);
+        assert_eq!(
+            region.atomic_u32(CONSUMER_IDLE).load(Ordering::Acquire),
+            RGFX_CONSUMER_WALKING
+        );
+        consumer.awake(&region);
+        assert_eq!(region.atomic_u32(CONSUMER_IDLE).load(Ordering::Acquire), 0);
+        assert!(!consumer.sleep_or_pending(&region));
+        assert_eq!(
+            region.atomic_u32(CONSUMER_IDLE).load(Ordering::Acquire),
+            RGFX_CONSUMER_ASLEEP
+        );
     }
 
     /// The producer pads to the end, waits for room, and raises only where the guest armed the

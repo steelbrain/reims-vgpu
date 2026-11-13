@@ -1552,6 +1552,18 @@
 // The control completion ring's MSI-X vector.
 #define RGFX_CONTROL_VECTOR 0
 
+// [`RgfxRingHeader::consumer_idle`] while the consumer sleeps until a doorbell: the producer
+// rings for each message it publishes.
+#define RGFX_CONSUMER_ASLEEP 1
+
+// [`RgfxRingHeader::consumer_idle`] while a queue's consumer carries out a command buffer on its
+// own thread, after which it takes the ring again with no doorbell: the producer rings only for
+// a [`RGFX_CMD_COMMAND_BUFFER`] whose last op asks for its [`RGFX_EVT_CB_SUBMITTED`]
+// ([`RGFX_OP_SUBMITTED`](crate::ops::RGFX_OP_SUBMITTED)), which the host may answer inside the
+// doorbell's write. A producer that rings only for [`RGFX_CONSUMER_ASLEEP`] rings for none,
+// and such a buffer is answered once the consumer takes it.
+#define RGFX_CONSUMER_WALKING 2
+
 // The size of a ring's header ([`RgfxRingHeader`]); its byte ring follows it.
 #define RGFX_RING_HEADER_SIZE 256
 
@@ -6770,7 +6782,9 @@ typedef struct {
   uint64_t consumer;
   // The rest of `consumer`'s line.
   uint8_t reserved_48[56];
-  // 1 while the consumer sleeps until a doorbell, written by the consumer.
+  // [`RGFX_CONSUMER_ASLEEP`] while the consumer sleeps until a doorbell,
+  // [`RGFX_CONSUMER_WALKING`] while a queue's consumer carries out a command buffer and comes
+  // back to the ring after it, 0 while it takes the ring; written by the consumer.
   uint32_t consumer_idle;
   // The rest of `consumer_idle`'s line.
   uint8_t reserved_84[60];

@@ -1913,7 +1913,7 @@ own 64-byte line:
 | 0x00 | `producer`: u64, free-running byte count | producer |
 | 0x08 | `completed_seqno`: u64, on a queue's completion ring the seqno of the last command buffer that finished OK, 0 before one has | host (queue completion rings) |
 | 0x40 | `consumer`: u64, free-running byte count | consumer |
-| 0x80 | `consumer_idle`: u32, 1 while the consumer sleeps | consumer |
+| 0x80 | `consumer_idle`: u32, 1 (`RGFX_CONSUMER_ASLEEP`) while the consumer sleeps, 2 (`RGFX_CONSUMER_WALKING`) while a queue's consumer walks a command buffer | consumer |
 | 0xc0 | `armed`: u32, 1 when the guest wants an interrupt | guest (completion rings) |
 
 - A message starts with `type: u32`, `size: u32` (bytes including this
@@ -1922,9 +1922,14 @@ own 64-byte line:
   ring's end.
 - Doorbell. The producer writes the message, publishes `producer` (release),
   then issues a full fence and reads `consumer_idle`. If it reads 1, it writes
-  the ring's id to `DOORBELL`. Before sleeping, the consumer sets
-  `consumer_idle`, issues a full fence and reads `producer` again, so no wake
-  is lost. It clears `consumer_idle` when it wakes.
+  the ring's id to `DOORBELL`; if it reads 2, it does so only for a command
+  buffer whose last op asks for its `CB_SUBMITTED`, which the host may answer
+  inside the write. Before sleeping, the consumer sets `consumer_idle` to 1,
+  issues a full fence and reads `producer` again, so no wake is lost. It
+  clears `consumer_idle` when it wakes. A queue's consumer sets it to 2 while
+  it walks a buffer on its own thread, after which it takes the ring again
+  with no doorbell. A producer that rings only on 1 rings for nothing on 2,
+  and its asking buffer is answered at that take.
 - Interrupts. The host publishes a completion, issues a full fence and reads
   `armed`. If it reads 1, it clears it and raises the ring's vector. The guest
   sets `armed` after draining, issues a full fence and checks `producer`
@@ -3477,11 +3482,16 @@ commit. Each outcome the new design allows is one of those two:
     thread offers the queue's next buffer to the host there, as a doorbell's
     thread does, so a buffer that asks for its `CB_SUBMITTED` behind it is
     answered before the walk, or at its own doorbell during it, as behind a
-    walk on a lane thread. Through the walk the thread marks the ring idle
-    (`consumer_idle` 1), as before it sleeps, since the guest rings a
-    queue's doorbell only for a ring marked so; it clears the mark when it
-    takes the claim back. Held through the walk, the claim kept the doorbell
-    from answering, and with the ring marked busy the guest rang none, so a
+    walk on a lane thread. Through the walk the thread marks the ring
+    walking (`consumer_idle` 2), for which the guest rings a queue's doorbell
+    only for a buffer that asks for its `CB_SUBMITTED`; it clears the mark
+    when it takes the claim back, and takes what the guest published meanwhile.
+    With the ring marked as before a sleep (1), the guest would ring for each
+    buffer it publishes during a walk, a VM exit that answers nothing for a
+    buffer that does not ask (measured on a 26.7.2 guest of a 780M host:
+    11.9 µs a doorbell, in two of three commits of a back-to-back run). Held
+    through the walk, the claim kept the doorbell from answering, and with
+    the ring marked busy the guest rang none, so a
     guest's `commitAndWaitUntilSubmitted` behind a buffer of fills waited for
     that walk and its commit (tested by
     `a_buffer_that_asks_behind_a_walk_on_its_service_thread_is_answered_before_the_walk_ends`);

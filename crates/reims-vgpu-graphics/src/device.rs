@@ -91,9 +91,10 @@
 //! among the queue's ([`QueueClaim`]): a host that then walks and commits the buffer on that
 //! thread lets the hold go first, and offers the queue's next buffer there, as a doorbell's
 //! thread does, so a buffer published meanwhile is answered before that walk, not after it.
-//! Until it takes the hold back the thread marks the ring idle, as before it sleeps: the guest
-//! rings for a buffer it publishes during the walk, which it does only for a ring marked idle,
-//! and the doorbell's write answers it there.
+//! Until it takes the hold back the thread marks the ring walking (`RGFX_CONSUMER_WALKING`): the
+//! guest rings for a buffer it publishes during the walk that asks for its `CB_SUBMITTED`, and the
+//! doorbell's write answers it there; it rings for nothing else, which the thread takes after the
+//! walk as it would with no doorbell.
 //!
 //! A `DOORBELL` write of ring 0 through [`Device::mmio_write_taking`] answers ring 0's next
 //! message on the writing thread where it is a `SURFACE_DOWNLOAD` the host has carried out
@@ -1153,37 +1154,38 @@ pub struct QueueClaim<'a> {
     queue: &'a Arc<QueueShared>,
     /// The queue's `consuming`, until the claim is let go.
     held: Option<MutexGuard<'a, Option<u64>>>,
-    /// Whether the let-go marked the queue's submission ring idle, which the retake clears.
-    idled: bool,
+    /// Whether the let-go marked the queue's submission ring walking, which the retake clears.
+    walking: bool,
 }
 
 impl<'a> QueueClaim<'a> {
-    /// Lets go of the claim, marks the queue's submission ring idle until the claim is taken
-    /// back, then offers the queue's next message to the host on this thread as a doorbell's
-    /// thread does ([`Host::answer_command_buffer`]): a buffer the guest published before the
-    /// claim was let go, and now waits for its `CB_SUBMITTED`, is answered here where it need
-    /// wait for nothing, not after the work this thread carries out next. The guest rings a
-    /// queue's doorbell only while its ring is marked idle, so it rings for a buffer it publishes
-    /// during that work, and the doorbell's thread offers it in the write. Once let go, it stays
-    /// so for the call.
+    /// Lets go of the claim, marks the queue's submission ring walking
+    /// ([`RGFX_CONSUMER_WALKING`]) until the claim is taken back, then offers the queue's next
+    /// message to the host on this thread as a doorbell's thread does
+    /// ([`Host::answer_command_buffer`]): a buffer the guest published before the claim was let
+    /// go, and now waits for its `CB_SUBMITTED`, is answered here where it need wait for nothing,
+    /// not after the work this thread carries out next. The guest rings a walking ring's doorbell
+    /// for a buffer that asks for its `CB_SUBMITTED` alone, which the doorbell's thread offers
+    /// the host in the write; the rest it publishes during that work this thread takes after it,
+    /// with no doorbell. Once let go, it stays so for the call.
     pub fn let_go(&mut self) {
         if self.held.take().is_some() {
-            self.idled = self.shared.mark_idle(self.queue);
+            self.walking = self.shared.mark_walking(self.queue);
             self.shared.answer_on_doorbell(self.queue);
         }
     }
 
     /// The queue's `consuming` again, taken where the claim was let go, with the queue's
-    /// submission ring no longer marked idle, as while this thread takes.
+    /// submission ring no longer marked walking, as while this thread takes.
     fn retake(self) -> MutexGuard<'a, Option<u64>> {
         let QueueClaim {
             shared,
             queue,
             held,
-            idled,
+            walking,
         } = self;
         let consuming = held.unwrap_or_else(|| queue.consuming.lock());
-        if idled {
+        if walking {
             shared.mark_awake(queue);
         }
         consuming
@@ -1923,19 +1925,19 @@ impl Shared {
         }
     }
 
-    /// Marks `queue`'s submission ring idle while its service thread works on something other
+    /// Marks `queue`'s submission ring walking while its service thread works on something other
     /// than its take ([`QueueClaim::let_go`]), where the device is started, the ring is not broken
     /// and the queue lives: whether it was marked.
-    fn mark_idle(&self, queue: &QueueShared) -> bool {
+    fn mark_walking(&self, queue: &QueueShared) -> bool {
         let submit = queue.submit.lock();
         if !self.started() || submit.broken || self.ending() || queue.ended() {
             return false;
         }
-        submit.consumer.mark_idle(&self.region);
+        submit.consumer.mark_walking(&self.region);
         true
     }
 
-    /// Clears the idle mark of [`Self::mark_idle`] where the queue still lives: an ended queue's
+    /// Clears the walking mark of [`Self::mark_walking`] where the queue still lives: an ended queue's
     /// rings may be another process's block by now ([`QueueShared::fence`]).
     fn mark_awake(&self, queue: &QueueShared) {
         let submit = queue.submit.lock();
@@ -2512,7 +2514,7 @@ impl Shared {
                 shared: self,
                 queue,
                 held: Some(consuming),
-                idled: false,
+                walking: false,
             };
             self.host.command_buffer(poster, message.bytes, &mut claim);
             consuming = claim.retake();

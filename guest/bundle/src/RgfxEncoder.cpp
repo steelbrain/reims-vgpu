@@ -185,8 +185,10 @@ bool RgfxEncoder::finish(uint64_t *out_seqno, const std::function<void()> &while
 	m_head.op_bytes = opBytes();
 	if (m_ring->fits(static_cast<uint32_t>(size))) {
 		std::memcpy(message, &m_head, sizeof(m_head));
+		// A buffer whose stream ends in its ask is one the host answers at the doorbell, behind
+		// a walk too (RgfxRingWriter::tryPost).
 		return m_ring->post(RGFX_CMD_COMMAND_BUFFER, message, static_cast<uint32_t>(size),
-		                    out_seqno, whileWaiting, beforePublish);
+		                    out_seqno, whileWaiting, beforePublish, endsInAsk());
 	}
 	// Out of line: the whole message copied once into a block of the pool, from its start. The
 	// host reads the block once the reference's `producer` is published, which the ring writer

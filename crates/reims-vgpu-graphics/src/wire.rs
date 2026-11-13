@@ -19,9 +19,10 @@
 //!
 //! **Doorbell and interrupts.** The producer of a submission ring (the guest) writes a message,
 //! publishes `producer` (a release store), issues a full fence and reads `consumer_idle`; if it
-//! reads 1 it writes the ring's id to [`RGFX_REG_DOORBELL`]. The consumer (the host) sets
-//! `consumer_idle` before it sleeps, issues a full fence and reads `producer` again, so no wake
-//! is lost, and clears it when it wakes. The producer of a completion ring (the host) publishes a
+//! reads [`RGFX_CONSUMER_ASLEEP`] it writes the ring's id to [`RGFX_REG_DOORBELL`], and so it does
+//! on reading [`RGFX_CONSUMER_WALKING`] for a command buffer that asks to be answered at the
+//! doorbell. The consumer (the host) sets `consumer_idle` before it sleeps, issues a full fence
+//! and reads `producer` again, so no wake is lost, and clears it when it wakes. The producer of a completion ring (the host) publishes a
 //! message, issues a full fence and reads `armed`; if it reads 1, it clears it, reads `consumer`,
 //! and raises the ring's MSI-X vector, or, where the guest has taken every message published, sets
 //! `armed` again and raises nothing: the 1 it cleared was an arm the guest made after its take.
@@ -492,6 +493,17 @@ pub const RGFX_CONTROL_RING_ID: u32 = 0;
 /// The control completion ring's MSI-X vector.
 pub const RGFX_CONTROL_VECTOR: u32 = 0;
 
+/// [`RgfxRingHeader::consumer_idle`] while the consumer sleeps until a doorbell: the producer
+/// rings for each message it publishes.
+pub const RGFX_CONSUMER_ASLEEP: u32 = 1;
+/// [`RgfxRingHeader::consumer_idle`] while a queue's consumer carries out a command buffer on its
+/// own thread, after which it takes the ring again with no doorbell: the producer rings only for
+/// a [`RGFX_CMD_COMMAND_BUFFER`] whose last op asks for its [`RGFX_EVT_CB_SUBMITTED`]
+/// ([`RGFX_OP_SUBMITTED`](crate::ops::RGFX_OP_SUBMITTED)), which the host may answer inside the
+/// doorbell's write. A producer that rings only for [`RGFX_CONSUMER_ASLEEP`] rings for none,
+/// and such a buffer is answered once the consumer takes it.
+pub const RGFX_CONSUMER_WALKING: u32 = 2;
+
 /// The size of a ring's header ([`RgfxRingHeader`]); its byte ring follows it.
 pub const RGFX_RING_HEADER_SIZE: u32 = 256;
 /// The size of a control ring's byte ring: the largest power of two that fits in its span after
@@ -539,7 +551,9 @@ pub struct RgfxRingHeader {
     pub consumer: u64,
     /// The rest of `consumer`'s line.
     pub reserved_48: [u8; 56],
-    /// 1 while the consumer sleeps until a doorbell, written by the consumer.
+    /// [`RGFX_CONSUMER_ASLEEP`] while the consumer sleeps until a doorbell,
+    /// [`RGFX_CONSUMER_WALKING`] while a queue's consumer carries out a command buffer and comes
+    /// back to the ring after it, 0 while it takes the ring; written by the consumer.
     pub consumer_idle: u32,
     /// The rest of `consumer_idle`'s line.
     pub reserved_84: [u8; 60],

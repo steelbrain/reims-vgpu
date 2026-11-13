@@ -1536,6 +1536,37 @@ void test_mesh_ops()
 // post() waits while the ring is full, ringing the doorbell and calling its hook, until the
 // host takes room; a message over half the ring does not fit() and is refused at once; and
 // beforePublish sees the seqno before `producer` moves.
+// The doorbell rings where the host marked the ring asleep, and where it marked it walking only
+// for a command buffer whose stream ends in its ask for its submission, which the host answers
+// inside the doorbell's write; a walking host takes the rest once its walk is done, and one that
+// takes the ring is rung for nothing.
+void test_ring_doorbell_follows_the_mark()
+{
+	TestRing ring(0x8000);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, 1, TestRing::doorbell, nullptr);
+	const auto rang = [&](uint32_t mark, bool asks) {
+		ring.setConsumerIdle(mark);
+		const int before = TestRing::doorbells.load();
+		RgfxEncoder enc(writer, /*queue*/ 1, /*cb*/ 100);
+		enc.beginComputePass();
+		enc.endEncoder();
+		if (asks)
+			enc.appendSubmitted();
+		CHECK(enc.endsInAsk() == asks);
+		CHECK(enc.finish());
+		RgfxMsgHeader header = {};
+		std::vector<uint8_t> body;
+		CHECK(ring.next(&header, &body) && header.type == RGFX_CMD_COMMAND_BUFFER);
+		return TestRing::doorbells.load() - before;
+	};
+	CHECK(rang(RGFX_CONSUMER_ASLEEP, false) == 1);
+	CHECK(rang(RGFX_CONSUMER_ASLEEP, true) == 1);
+	CHECK(rang(RGFX_CONSUMER_WALKING, false) == 0);
+	CHECK(rang(RGFX_CONSUMER_WALKING, true) == 1);
+	CHECK(rang(0, false) == 0);
+	CHECK(rang(0, true) == 0);
+}
+
 void test_ring_post_waits_for_room()
 {
 	constexpr uint32_t kData = 0x1000;
@@ -3650,6 +3681,7 @@ int main()
 	test_mesh_pipeline_messages();
 	test_mesh_ops();
 	test_ring_wrap_and_no_room();
+	test_ring_doorbell_follows_the_mark();
 	test_ring_post_waits_for_room();
 	test_ring_post_waits_for_the_room_record();
 	test_ring_room_sleeps_count_for_the_line();
