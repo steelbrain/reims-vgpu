@@ -795,15 +795,39 @@ whose sink is the dummy `auto_null` (homelab-um790's Radeon 780M,
   and stops both at its end. The guest posts receive buffers for the
   input's first 0.73 s, a queue kick every 90 ms, then none while the
   output plays on.
-- QEMU's PipeWire capture stream runs for as long, linked to the default
-  source at a cycle every 5.3 ms (176 kB a second), so a play longer than
-  about 25 s fills its 4 MiB ring. QEMU then drops what does not fit,
-  says so once per stream (`pipewire: capture stream snd0: its
-  4194304-byte buffer is full of audio nothing has read`), and gives the
-  count as the stream closes. A 100 s play: the warning 24.9 s after the
-  start, then 13,375,572 bytes dropped in 14,218 cycles. Before vendor/qemu
-  8abc8492 each such cycle wrote an `overrun write` line, about 190 a
-  second, and wrote over the ring's unread bytes.
+- QEMU captures only while the guest has receive buffers posted (vendor/qemu
+  9a03bc4c): virtio-snd turns the input voice on at the input's START when
+  buffers are posted, and at the first buffer posted after a time with
+  none, and off when audio comes with none posted. With each `afplay` the
+  voice ran 1.05 to 1.08 s, the PipeWire capture stream then paused, and
+  the host's default source stayed `SUSPENDED` through plays of 45 s and
+  75 s.
+- A recording alone (AVAudioRecorder through `osascript`, 8 s) starts
+  both streams, posts a receive buffer about every 88 ms throughout, and
+  stops both at its end: the voice ran from START to STOP, the default
+  source ran with it, and the first captured audio came 40 ms after START. A
+  restarted capture reads from then on (pwaudio drops what its ring held
+  as the voice turns on), so the largest backlog a read found in the boot
+  was 2,820 bytes.
+- A recording started while an output plays gets no audio from the
+  device: the guest posts no receive buffer for it, its input stream
+  having run since the output's START, though AVAudioRecorder reports 10 s
+  recorded. QEMU fills only buffers the guest posts, so it was so before
+  9a03bc4c too.
+- Before 9a03bc4c the capture ran from START to STOP, a cycle every
+  5.3 ms (176 kB a second), so a play longer than about 25 s filled the
+  4 MiB ring with audio nothing read. QEMU drops what does not fit, says
+  so once per stream (`pipewire: capture stream snd0: its 4194304-byte
+  buffer is full of audio nothing has read`), and gives the count as the
+  stream closes: a 100 s play dropped 13,375,572 bytes in 14,218 cycles
+  after the warning 24.9 s in. A reader that finds the ring full now reads
+  its newest audio, counting what it skipped (vendor/qemu 24753894; no
+  ring filled in these boots). Before 8abc8492 each such cycle wrote an
+  `overrun write` line, about 190 a second, and wrote over the ring's
+  unread bytes.
+- The first recording over ssh raises the guest's microphone prompt for
+  `sshd-keygen-wrapper`; a boot answers it over QMP (`input-send-event`
+  on the usb-tablet at its Allow button).
 - A host with no source (um870, ms01) runs no capture cycles.
 
 
