@@ -387,13 +387,99 @@ impl Sides {
 /// pipeline and dispatch words, in a buffer that does not inherit its pipeline state. A word that
 /// differs, or may, is relayed at its getter, a death in strict mode
 /// ([`Inexact::IcbLengthPastTheLastCommand`]), until core sets it again.
+///
+/// The places that may differ are kept as bits of their command ([`Tail::spot`]): a setter of a
+/// command's pipeline or dispatch, which a CPU encode of a compute command sends for each of its
+/// commands, sets bits of its command's word, where a set of places took an insertion a place.
 #[derive(Debug, Default)]
 struct Tail {
-    /// The places in the buffer's array of lengths whose answer may not be Metal's.
-    unknown: BTreeSet<u64>,
+    /// The buffer's size, which places its commands' words.
+    n: u64,
+    /// Of each command from the first, the bits of its words whose answer may not be Metal's:
+    /// bit `k` for word `k` of its pipeline's 2 (0 and 1), then of its dispatch's 6 and its
+    /// imageblock's 2 (2 to 9); as long as the last command marked.
+    words: Vec<u16>,
+    /// Whether the word a copy writes ([`Tail::copied`]) may not answer Metal's.
+    copied: bool,
+    /// The other places that may not: past the copy's word, which a copy whose commands land past
+    /// the buffer's end reaches.
+    others: BTreeSet<u64>,
+}
+
+/// Where a place of a buffer's array of lengths lies in its [`Tail`].
+enum Spot {
+    /// Bit `1 << k` of command `i`'s words, `(i, k)`.
+    Word(usize, u32),
+    /// The copy's word.
+    Copied,
+    /// Another place ([`Tail::others`]).
+    Other,
 }
 
 impl Tail {
+    /// The tail of a buffer of `n` commands, where every place answers Metal's.
+    fn of(n: u64) -> Tail {
+        Tail {
+            n,
+            ..Tail::default()
+        }
+    }
+
+    /// Where `place` lies ([`Spot`]).
+    fn spot(&self, place: u64) -> Spot {
+        let n = self.n;
+        let Some(at) = place.checked_sub(n * LENGTHS_A_COMMAND) else {
+            return Spot::Other;
+        };
+        let bit = |i: u64, k: u64| Spot::Word(usize::try_from(i).unwrap_or(usize::MAX), k as u32);
+        match at {
+            _ if at < 2 * n => bit(at / 2, at % 2),
+            _ if at < 10 * n => bit((at - 2 * n) / 8, 2 + (at - 2 * n) % 8),
+            _ if at == 10 * n => Spot::Copied,
+            _ => Spot::Other,
+        }
+    }
+
+    /// Whether `place` may not answer Metal's.
+    fn contains(&self, place: u64) -> bool {
+        match self.spot(place) {
+            Spot::Word(i, k) => self.words.get(i).is_some_and(|w| w & (1 << k) != 0),
+            Spot::Copied => self.copied,
+            Spot::Other => self.others.contains(&place),
+        }
+    }
+
+    /// `place` answers Metal's.
+    fn remove(&mut self, place: u64) {
+        match self.spot(place) {
+            Spot::Word(i, k) => {
+                if let Some(w) = self.words.get_mut(i) {
+                    *w &= !(1 << k);
+                }
+            }
+            Spot::Copied => self.copied = false,
+            Spot::Other => {
+                self.others.remove(&place);
+            }
+        }
+    }
+
+    /// `place` may not answer Metal's.
+    fn insert(&mut self, place: u64) {
+        match self.spot(place) {
+            Spot::Word(i, k) => {
+                if i >= self.words.len() {
+                    self.words.resize(i + 1, 0);
+                }
+                self.words[i] |= 1 << k;
+            }
+            Spot::Copied => self.copied = true,
+            Spot::Other => {
+                self.others.insert(place);
+            }
+        }
+    }
+
     /// Of a buffer of `n` commands, the places of command `i`'s pipeline words.
     fn pipeline(n: u64, i: u64) -> Range<u64> {
         let at = n * LENGTHS_A_COMMAND + 2 * i;
@@ -435,22 +521,39 @@ impl Tail {
     /// The places of `range` that may not answer Metal's, as offsets from its start.
     fn within(&self, range: Range<u64>) -> Vec<u64> {
         let start = range.start;
-        self.unknown
-            .range(range)
+        range
+            .filter(|&place| self.contains(place))
             .map(|place| place - start)
             .collect()
     }
 
     /// The places of `range` may not answer Metal's.
     fn mark(&mut self, range: impl IntoIterator<Item = u64>) {
-        self.unknown.extend(range);
+        for place in range {
+            self.insert(place);
+        }
     }
 
-    /// The places of `range` answer Metal's.
+    /// The places of `range` answer Metal's: only those of the commands marked so far are
+    /// visited, so a clear of a buffer's every command whose words no setter marked costs nothing
+    /// a command.
     fn clear(&mut self, range: Range<u64>) {
-        let gone: Vec<u64> = self.unknown.range(range).copied().collect();
-        for place in gone {
-            self.unknown.remove(&place);
+        let (base, n) = (self.n * LENGTHS_A_COMMAND, self.n);
+        let marked = self.words.len() as u64;
+        let segments = [
+            base..base + 2 * marked.min(n),
+            base + 2 * n..base + 2 * n + 8 * marked.min(n),
+        ];
+        for segment in segments {
+            for place in range.start.max(segment.start)..range.end.min(segment.end) {
+                self.remove(place);
+            }
+        }
+        if range.contains(&Self::copied(n)) {
+            self.copied = false;
+        }
+        if !self.others.is_empty() {
+            self.others.retain(|place| !range.contains(place));
         }
     }
 }
@@ -709,7 +812,7 @@ impl IcbObject {
     /// Core set the threadgroup memory length `flat` places into the buffer's array of them,
     /// past the last command's ([`Tail`]): it answers as set again.
     fn tail_set(&self, flat: u64) {
-        plain(|| self.sides.lock().tail.unknown.remove(&flat));
+        plain(|| self.sides.lock().tail.remove(flat));
     }
 
     /// Core set the threadgroup memory length `flat` places into the buffer's array of them, of a
@@ -743,7 +846,7 @@ impl IcbObject {
         let unknown = plain(|| {
             let sides = self.sides.lock();
             let written = sides.kernel_written && Tail::words(n).contains(&flat);
-            written || sides.tail.unknown.contains(&flat)
+            written || sides.tail.contains(flat)
         });
         if unknown {
             inexact(sel, Inexact::IcbLengthPastTheLastCommand, || {
@@ -1035,6 +1138,10 @@ pub(crate) fn new_indirect_command_buffer(
         Err(e) => return created_or_decided(sel, Policy::Dies, e),
     };
     drop(held);
+    let sides = Sides {
+        tail: Tail::of(plain(|| raw.size())),
+        ..Sides::default()
+    };
     Ok(Some(Obj::new(IcbObject {
         raw,
         strides: d.support_dynamic_attribute_stride,
@@ -1042,7 +1149,7 @@ pub(crate) fn new_indirect_command_buffer(
             pipeline: d.inherit_pipeline_state,
             buffers: d.inherit_buffers,
         },
-        sides: Arc::default(),
+        sides: Arc::new(Mutex::new(sides)),
         overrun_shape,
         readers: Arc::default(),
     })))
@@ -1885,6 +1992,57 @@ mod tests {
         let relayed = crate::answer::relaxed(|| after.unique_identifier());
         assert_eq!(relayed, plain(|| after.raw.unique_identifier()));
         assert_eq!(crate::answer::inexact_counts(), [(kind, 1)]);
+    }
+
+    /// The tail answers as the set of its places would, every place of a buffer's array of
+    /// lengths past the last command's: after each mark and clear of a command's words, of a
+    /// copy's, of every command's, and of places a copy past the buffer's end reaches.
+    #[test]
+    fn the_tail_answers_as_a_set_of_its_places() {
+        let n = 5u64;
+        let (mut tail, mut set) = (Tail::of(n), BTreeSet::new());
+        let low = n * LENGTHS_A_COMMAND - 3;
+        let high = Tail::copied(n) + 24;
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        for _ in 0..4000 {
+            let i = next(3 * n);
+            let places: Vec<u64> = match next(8) {
+                0 => Tail::pipeline(n, i).collect(),
+                1 => Tail::dispatch(n, i).collect(),
+                2 => Tail::imageblock(n, i).collect(),
+                3 => Tail::dispatch_and_imageblock(n, i).collect(),
+                4 => vec![Tail::copied(n)],
+                5 => Tail::words(n).collect(),
+                6 => Tail::commands(n).collect(),
+                _ => vec![low + next(high - low)],
+            };
+            let range = places[0]..places[places.len() - 1] + 1;
+            match next(5) {
+                0 | 1 => {
+                    tail.mark(places.iter().copied());
+                    set.extend(places.iter().copied());
+                }
+                2 | 3 => {
+                    tail.clear(range.clone());
+                    set.retain(|p| !range.contains(p));
+                }
+                _ => {
+                    tail.remove(places[0]);
+                    set.remove(&places[0]);
+                }
+            }
+            for place in low..high {
+                assert_eq!(tail.contains(place), set.contains(&place), "place {place}");
+            }
+            let within: Vec<u64> = set.range(range.clone()).map(|p| p - range.start).collect();
+            assert_eq!(tail.within(range), within);
+        }
     }
 
     /// A device the host releases and opens again is the one runtime device, whose IDs go on with
