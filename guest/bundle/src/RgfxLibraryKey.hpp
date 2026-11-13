@@ -21,6 +21,20 @@ constexpr char kRgfxLibraryKeyPrefix[] = "rgfx-library-v1";
 /// that are no .metallib (no "MTLB" magic) or whose section does not lie inside them.
 bool rgfxLibraryKey(const uint8_t *bytes, size_t length, uint8_t key[32]);
 
+/// The bytes the key of a library's whole bytes is the SHA-256 of first (rgfxLibraryWholeKey).
+constexpr char kRgfxLibraryWholeKeyPrefix[] = "rgfx-library-whole-v1";
+
+/// The largest library rgfxLibraryWholeKey's key is asked for (RgfxMetalDevice+Pipelines.mm):
+/// 4 MiB, hashed in about 9 ms on a guest's core with no SHA extensions (470 MB/s, measured).
+constexpr size_t kRgfxWholeKeyMost = 4u << 20;
+
+/// Writes the key of the whole `length` bytes at `bytes`, the bitcode included, to `key`: the
+/// SHA-256 of kRgfxLibraryWholeKeyPrefix, then the bytes. The host keeps a library whose functions'
+/// HASH tags it cannot vouch for (Core Image's libraries: their tags are no SHA-256 of their
+/// bitcode) under this key instead of rgfxLibraryKey's, as it names the bytes with nothing left
+/// to check. False, writing nothing, for bytes that are no .metallib.
+bool rgfxLibraryWholeKey(const uint8_t *bytes, size_t length, uint8_t key[32]);
+
 /// A file's identity, as stat(2) gives it: its device and inode, its size, and its modification
 /// and status-change times to the nanosecond, each of which a rewrite of the file changes.
 struct RgfxFileIdentity {
@@ -43,6 +57,11 @@ struct RgfxFileIdentity {
 /// hashed again, and a file rewritten since is.
 bool rgfxLibraryKeyOfFile(const RgfxFileIdentity &file, const uint8_t *bytes, size_t length,
                           uint8_t key[32]);
+
+/// rgfxLibraryWholeKey of bytes read from the file `file`, kept for it as rgfxLibraryKeyOfFile
+/// keeps its key.
+bool rgfxLibraryWholeKeyOfFile(const RgfxFileIdentity &file, const uint8_t *bytes, size_t length,
+                               uint8_t key[32]);
 
 /// The most file identities rgfxLibraryKeyOfFile keeps.
 constexpr size_t kRgfxKeptFileKeys = 1024;

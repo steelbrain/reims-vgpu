@@ -15,8 +15,9 @@
 //! through the slot, so ring order holds.
 //!
 //! **The cache.** A library made from keyed bytes is kept under its key ([`verified_key`]) where
-//! the key the host computes from the bytes is the key the guest sent; a `LIBRARY_LOOKUP` of that
-//! key binds a new id to the same platform library, and no bytes cross. Each id is a handle of its
+//! the key the host computes from the bytes is the key the guest sent, and, where the host cannot
+//! vouch for any key of that kind, under the key of its whole bytes ([`whole_key`]); a
+//! `LIBRARY_LOOKUP` of that key binds a new id to the same platform library, and no bytes cross. Each id is a handle of its
 //! own in the table. An entry no id names any more is released into a least-recently-released
 //! list bounded by [`RELEASED_BUDGET`] bytes of keyed bytes, so a process that loads the library
 //! again (WindowServer after a restart) still finds it.
@@ -24,8 +25,8 @@
 //! **What the key names.** The key leaves the bitcode section out, and names each function's
 //! bitcode by its `HASH` tag, a SHA-256 of it. The host vouches for a key only where it checked
 //! every `HASH` against its bitcode and the functions' bitcode covers the whole section, so a
-//! lookup can only ever bind content with that key; bytes whose tags lie are made for their
-//! request, uncached. Every AIR `.metallib` of macOS 27's system, 210 of them, covers its section
+//! lookup can only ever bind content with that key; bytes whose tags lie are kept under the key
+//! of their whole bytes alone, or, past [`WHOLE_KEY_MOST`] bytes, uncached. Every AIR `.metallib` of macOS 27's system, 210 of them, covers its section
 //! (measured).
 
 use std::collections::{BTreeMap, HashMap};
@@ -53,6 +54,13 @@ pub(crate) type LibraryKey = [u8; 32];
 
 /// The bytes the key's digest starts with ([`RgfxLibraryLookup`]).
 const KEY_PREFIX: &[u8] = b"rgfx-library-v1";
+
+/// The bytes the key of a library's whole bytes starts with ([`whole_key`]).
+const WHOLE_KEY_PREFIX: &[u8] = b"rgfx-library-whole-v1";
+
+/// The largest library kept under the key of its whole bytes ([`whole_key`]), as the guest asks
+/// for that key of no larger one (its `kRgfxWholeKeyMost`).
+const WHOLE_KEY_MOST: usize = 4 << 20;
 
 /// The most bytes of keyed libraries the cache keeps once no id names them.
 pub(crate) const RELEASED_BUDGET: u64 = 64 << 20;
@@ -87,6 +95,19 @@ pub(crate) fn verified_key(bytes: &[u8]) -> Option<LibraryKey> {
         at = end;
     }
     (at == section.len()).then(|| content_key(bytes, bitcode_at, bitcode_len))
+}
+
+/// The key of a library's whole bytes, the bitcode included: SHA-256 of [`WHOLE_KEY_PREFIX`] and
+/// `bytes`. It names them with nothing left to vouch for, so a library whose `HASH` tags the host
+/// cannot vouch for ([`verified_key`]: Core Image's, whose tags are no SHA-256 of their bitcode)
+/// is kept under it, where it is a `.metallib` of at most [`WHOLE_KEY_MOST`] bytes.
+pub(crate) fn whole_key(bytes: &[u8]) -> Option<LibraryKey> {
+    (bytes.len() <= WHOLE_KEY_MOST && bytes.get(..4)? == b"MTLB").then(|| {
+        let mut hasher = Sha256::new();
+        hasher.update(WHOLE_KEY_PREFIX);
+        hasher.update(bytes);
+        hasher.finalize().into()
+    })
 }
 
 /// SHA-256 of [`KEY_PREFIX`] and `bytes` without `[bitcode_at, bitcode_at + bitcode_len)`.
@@ -397,9 +418,14 @@ pub(crate) fn make_library<P: Platform>(
     device: &P::Device,
     job: &LibraryJob<P>,
 ) -> RaiseResult<MadeLibrary<P>> {
+    // Under the guest's key where the host vouches for it, else, where it cannot, under the key of
+    // the whole bytes.
     let key = job.guest_key.and_then(|guest| {
-        let host = verified_key(&job.bytes)?;
-        (host == guest).then_some((host, job.bytes.len() as u64))
+        let key = match verified_key(&job.bytes) {
+            Some(host) => (host == guest).then_some(host)?,
+            None => whole_key(&job.bytes)?,
+        };
+        Some((key, job.bytes.len() as u64))
     });
     // A nil library and a build failure both mean no usable library.
     let (library, refusal) = match device.new_library(&job.bytes)? {
@@ -804,6 +830,26 @@ pub(crate) mod tests {
             0xff, 0x4e, 0x21, 0x7d,
         ];
         assert_eq!(content_key(&lib, 0x60, 0x10), expect);
+    }
+
+    /// The key of the bundle's synthetic `.metallib`'s whole bytes is the digest the bundle's test
+    /// pins (`test_library_key`); none for bytes past [`WHOLE_KEY_MOST`] or no `.metallib`.
+    #[test]
+    fn whole_keys_as_the_bundle_does() {
+        let mut lib = vec![0u8; MTLB_HEADER_LEN];
+        lib[..4].copy_from_slice(b"MTLB");
+        lib[0x48..0x50].copy_from_slice(&0x60u64.to_le_bytes());
+        lib[0x50..0x58].copy_from_slice(&0x10u64.to_le_bytes());
+        lib.extend_from_slice(b"funclistBITCODE-BITCODE!tail-end");
+        let expect = [
+            0x50, 0x02, 0x1a, 0x5e, 0x9a, 0x2c, 0xfc, 0x12, 0xb8, 0xac, 0x4e, 0x6e, 0x70, 0x0e,
+            0xa1, 0x32, 0xc3, 0x1d, 0xda, 0xf9, 0x48, 0xa1, 0x27, 0x63, 0x8c, 0xcc, 0xb3, 0xa1,
+            0xe6, 0x16, 0xb5, 0x19,
+        ];
+        assert_eq!(whole_key(&lib), Some(expect));
+        lib.resize(WHOLE_KEY_MOST + 1, 0);
+        assert_eq!(whole_key(&lib), None);
+        assert_eq!(whole_key(b"not a metallib"), None);
     }
 
     /// A tag that lies, a gap in the section, an overlap, and bytes that are no `.metallib` get

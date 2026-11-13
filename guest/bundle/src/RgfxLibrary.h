@@ -122,11 +122,13 @@ static const MTLFunctionType kRgfxFunctionTypeExtern = (MTLFunctionType)4;
                                   device:(nullable id<MTLDevice>)device
                               serializer:(nullable RgfxSerializer *)serializer
                                   status:(uint32_t *)status;
-/// The library the device holds under the content key of the `length` bytes at
-/// `bytes` (`key`, 32 bytes), found by an RGFX_CMD_LIBRARY_LOOKUP, with no bytes sent;
-/// its function table is read from the bytes. Returns nil if `serializer` is null or
-/// the device holds no such library.
+/// The library the device holds under `lookup` (32 bytes) for the `length` bytes at `bytes`, found
+/// by an RGFX_CMD_LIBRARY_LOOKUP, with no bytes sent: their content key `key` (32 bytes), or the
+/// key of the whole bytes (rgfxLibraryWholeKey), which its pipelines' keys still name it by `key`;
+/// its function table is read from the bytes. Returns nil if `serializer` is null or the device
+/// holds no such library.
 + (nullable instancetype)libraryFoundWithKey:(const uint8_t *)key
+                                      lookup:(const uint8_t *)lookup
                                        bytes:(const void *)bytes
                                       length:(NSUInteger)length
                                       device:(nullable id<MTLDevice>)device

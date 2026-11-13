@@ -71,14 +71,13 @@ bool fileIdentity(const char *path, RgfxFileIdentity &out)
 
 // Every library-from-bytes entry point funnels through here. The bytes Metal's compiler answers for
 // OpenCL C source (and, on macOS 11, for Metal source), which are no .metallib, are taken as the
-// .metallib of their functions
-// (RgfxMetallibOfClLibrary). A .metallib (or a fat file's AIR slice) is first looked up by its
-// content key, which finds a library the device made for any
-// process with no bytes sent; otherwise the bytes go as one LIBRARY_CREATE (waiting for room
-// while the ring is momentarily full) or stream through region blocks, with the key, and the
-// device's answer is waited for, so a library it refuses is nil and an NSError here, as Metal's.
-// Bytes read from a file whose identity is `file` (null for none) take the key the process found
-// for that identity before, if any (rgfxLibraryKeyOfFile).
+// .metallib of their functions (RgfxMetallibOfClLibrary). A .metallib (or a fat file's AIR slice)
+// is first looked up by its content key, which finds a library the device made for any process
+// with no bytes sent, then, where it is small, by the key of its whole bytes; otherwise the bytes
+// go as one LIBRARY_CREATE (waiting for room while the ring is momentarily full) or stream through
+// region blocks, with the key, and the device's answer is waited for, so a library it refuses is
+// nil and an NSError here, as Metal's. Bytes read from a file whose identity is `file` (null for
+// none) take the keys the process found for that identity before, if any (rgfxLibraryKeyOfFile).
 - (nullable id<MTLLibrary>)rgfxLibraryWithBytes:(const void *)bytes
                                          length:(NSUInteger)length
                                            file:(const RgfxFileIdentity *)file
@@ -102,12 +101,29 @@ bool fileIdentity(const char *path, RgfxFileIdentity &out)
 	                                   : rgfxLibraryKey(p, length, key);
 	if (keyed) {
 		id<MTLLibrary> found = [RgfxLibrary libraryFoundWithKey:key
+		                                                 lookup:key
 		                                                  bytes:bytes
 		                                                 length:length
 		                                                 device:self
 		                                             serializer:ser];
 		if (found != nil)
 			return found;
+		// Not under its content key: a small library is asked for by the key of its whole bytes
+		// too, which the host keeps one under where it cannot vouch for the content key (Core
+		// Image's, made again in every process before; rgfxLibraryWholeKey).
+		uint8_t whole[32];
+		if (length <= kRgfxWholeKeyMost &&
+		    (file != nullptr ? rgfxLibraryWholeKeyOfFile(*file, p, length, whole)
+		                     : rgfxLibraryWholeKey(p, length, whole))) {
+			found = [RgfxLibrary libraryFoundWithKey:key
+			                                  lookup:whole
+			                                   bytes:bytes
+			                                  length:length
+			                                  device:self
+			                              serializer:ser];
+			if (found != nil)
+				return found;
+		}
 	}
 	// A small library travels inline in its create; a larger one streams through region
 	// blocks that its chunks name, so no library is bounded by the ring's or region's size.

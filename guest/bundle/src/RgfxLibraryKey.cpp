@@ -56,6 +56,19 @@ bool rgfxLibraryKey(const uint8_t *bytes, size_t length, uint8_t key[32])
 	return true;
 }
 
+bool rgfxLibraryWholeKey(const uint8_t *bytes, size_t length, uint8_t key[32])
+{
+	if (bytes == nullptr || length < kHeaderLength || std::memcmp(bytes, "MTLB", 4) != 0)
+		return false;
+	CC_SHA256_CTX ctx;
+	CC_SHA256_Init(&ctx);
+	update(ctx, reinterpret_cast<const uint8_t *>(kRgfxLibraryWholeKeyPrefix),
+	       sizeof(kRgfxLibraryWholeKeyPrefix) - 1);
+	update(ctx, bytes, length);
+	CC_SHA256_Final(key, &ctx);
+	return true;
+}
+
 namespace {
 
 std::tuple<uint64_t, uint64_t, uint64_t, int64_t, int64_t, int64_t, int64_t>
@@ -77,28 +90,50 @@ bool RgfxFileIdentity::operator==(const RgfxFileIdentity &o) const
 	return fields(*this) == fields(o);
 }
 
-bool rgfxLibraryKeyOfFile(const RgfxFileIdentity &file, const uint8_t *bytes, size_t length,
-                          uint8_t key[32])
+namespace {
+
+typedef std::array<uint8_t, 32> Key;
+
+// `make`'s key of the bytes read from `file`, kept in `kept` (under `lock`) for the first
+// kRgfxKeptFileKeys identities, for the process's life.
+bool keyOfFile(std::mutex &lock, std::map<RgfxFileIdentity, Key> &kept,
+               bool (*make)(const uint8_t *, size_t, uint8_t *), const RgfxFileIdentity &file,
+               const uint8_t *bytes, size_t length, uint8_t key[32])
 {
-	typedef std::array<uint8_t, 32> Key;
-	static std::mutex lock;
-	// Never destroyed: a library may be loaded on any thread while the process exits.
-	static auto *kept = new std::map<RgfxFileIdentity, Key>();
 	{
 		std::lock_guard<std::mutex> hold(lock);
-		auto found = kept->find(file);
-		if (found != kept->end()) {
+		auto found = kept.find(file);
+		if (found != kept.end()) {
 			std::memcpy(key, found->second.data(), 32);
 			return true;
 		}
 	}
-	if (!rgfxLibraryKey(bytes, length, key))
+	if (!make(bytes, length, key))
 		return false;
 	std::lock_guard<std::mutex> hold(lock);
-	if (kept->size() < kRgfxKeptFileKeys) {
+	if (kept.size() < kRgfxKeptFileKeys) {
 		Key k;
 		std::memcpy(k.data(), key, k.size());
-		kept->emplace(file, k);
+		kept.emplace(file, k);
 	}
 	return true;
+}
+
+} // namespace
+
+bool rgfxLibraryKeyOfFile(const RgfxFileIdentity &file, const uint8_t *bytes, size_t length,
+                          uint8_t key[32])
+{
+	static std::mutex lock;
+	// Never destroyed: a library may be loaded on any thread while the process exits.
+	static auto *kept = new std::map<RgfxFileIdentity, Key>();
+	return keyOfFile(lock, *kept, &rgfxLibraryKey, file, bytes, length, key);
+}
+
+bool rgfxLibraryWholeKeyOfFile(const RgfxFileIdentity &file, const uint8_t *bytes, size_t length,
+                               uint8_t key[32])
+{
+	static std::mutex lock;
+	static auto *kept = new std::map<RgfxFileIdentity, Key>();
+	return keyOfFile(lock, *kept, &rgfxLibraryWholeKey, file, bytes, length, key);
 }

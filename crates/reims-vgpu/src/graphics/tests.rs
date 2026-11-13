@@ -5983,6 +5983,67 @@ fn a_library_with_a_wrong_key_is_not_kept() {
     assert_eq!(library_makes(&platform), 2);
 }
 
+/// A library whose tags the host cannot vouch for (Core Image's: they are no SHA-256 of their
+/// bitcode) is kept under the key of its whole bytes instead of the guest's: a lookup of the
+/// guest's key misses, one of the whole bytes' key, from another process, finds it with nothing
+/// made again
+#[test]
+fn a_library_the_host_cannot_vouch_for_is_kept_under_its_whole_bytes() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let bitcode = b"one module for every function";
+    let len = u64::try_from(bitcode.len()).expect("its length");
+    let bytes = decode::test_metallib(
+        bitcode,
+        &[
+            (0, len, decode::test_sha(b"not its bitcode")),
+            (0, len, decode::test_sha(b"not its bitcode")),
+        ],
+    );
+    assert_eq!(decode::test_key(&bytes), None);
+    let whole = decode::test_whole_key(&bytes).expect("the whole bytes' key");
+    // The guest's key: the content key it computes, which the host cannot vouch for.
+    let mut guest_key = whole;
+    guest_key[0] ^= 1;
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            keyed_library_create(obj(1, 10), &bytes, Some(guest_key))
+        ),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            library_lookup(obj(2, 10), bytes.len(), guest_key)
+        ),
+        RGFX_STATUS_NOT_FOUND
+    );
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            library_lookup(obj(2, 11), bytes.len(), whole)
+        ),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(library_makes(&platform), 1);
+    // Unkeyed bytes are kept under no key, the whole bytes' neither.
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            keyed_library_create(obj(1, 12), &bytes, None)
+        ),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(library_makes(&platform), 2);
+}
+
 /// A library no id names any more stays in the cache: after its process closes, the next
 /// process's lookup still finds it
 #[test]

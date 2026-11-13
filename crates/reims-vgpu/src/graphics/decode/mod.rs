@@ -219,6 +219,8 @@ use lane::{Lane, Turn};
 pub(crate) use library::tests::{metallib as test_metallib, sha as test_sha};
 #[cfg(test)]
 pub(crate) use library::verified_key as test_key;
+#[cfg(test)]
+pub(crate) use library::whole_key as test_whole_key;
 use library::{Libraries, LibraryRef};
 pub(crate) use library::{LibraryJob, LibraryStart, MadeLibrary, complete, make_library};
 use managed::{STORAGE_MODE_MANAGED, storage_mode};

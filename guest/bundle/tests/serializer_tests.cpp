@@ -2699,6 +2699,22 @@ void test_library_key()
 	std::memcpy(other.data() + 0x50, &past, 8);
 	CHECK(!rgfxLibraryKey(other.data(), other.size(), key));
 	CHECK(!rgfxLibraryKey(other.data(), 0x40, key));
+
+	// The key of the whole bytes, the bitcode included, is the digest the host's
+	// `whole_keys_as_the_bundle_does` pins: Core Image's libraries are kept under it.
+	static const uint8_t whole[32] = {
+		0x50, 0x02, 0x1a, 0x5e, 0x9a, 0x2c, 0xfc, 0x12, 0xb8, 0xac, 0x4e, 0x6e, 0x70, 0x0e, 0xa1, 0x32,
+		0xc3, 0x1d, 0xda, 0xf9, 0x48, 0xa1, 0x27, 0x63, 0x8c, 0xcc, 0xb3, 0xa1, 0xe6, 0x16, 0xb5, 0x19,
+	};
+	lib = syntheticMetallib();
+	CHECK(rgfxLibraryWholeKey(lib.data(), lib.size(), key));
+	CHECK(std::memcmp(key, whole, sizeof(key)) == 0);
+	lib[0x65] ^= 0xff;
+	CHECK(rgfxLibraryWholeKey(lib.data(), lib.size(), key));
+	CHECK(std::memcmp(key, whole, sizeof(key)) != 0);
+	other = syntheticMetallib();
+	other[0] = 'X';
+	CHECK(!rgfxLibraryWholeKey(other.data(), other.size(), key));
 }
 
 // A file's library key is found once for the file's identity: a load of the same identity takes

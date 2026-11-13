@@ -535,6 +535,7 @@ static bool rgfxMetallibIsDynamic(const uint8_t *bytes, size_t length)
 }
 
 + (instancetype)libraryFoundWithKey:(const uint8_t *)key
+                             lookup:(const uint8_t *)lookup
                               bytes:(const void *)bytes
                              length:(NSUInteger)length
                              device:(id<MTLDevice>)device
@@ -542,7 +543,7 @@ static bool rgfxMetallibIsDynamic(const uint8_t *bytes, size_t length)
 {
 	if (serializer == nullptr)
 		return nil;
-	RgfxCreated found = serializer->lookupLibrary(key, length);
+	RgfxCreated found = serializer->lookupLibrary(lookup, length);
 	if (!found.posted || found.status != RGFX_STATUS_OK)
 		return nil;
 	return [self rgfxLibraryWithObjId:found.obj_id
