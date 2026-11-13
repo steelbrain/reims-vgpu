@@ -123,8 +123,9 @@
 //! device whose GPU shares the CPU's memory a surface's textures lie in its pages, but not every
 //! surface's can: the platform takes its own copy of the pages instead (a shadow) where the GPU
 //! cannot place a texture over them as the guest laid them out (rows that end inside the cache
-//! line the GPU writes back by, on an Intel GPU; more pieces than a dma-buf takes, on RADV), and
-//! that copy goes back and forth at every command buffer. Such a surface takes a device cache
+//! line the GPU writes back by, on an Intel GPU; rows at a pitch no linear image of the GPU's
+//! takes, or more pieces than a dma-buf takes, on RADV), and that copy goes back and forth at
+//! every command buffer. Such a surface takes a device cache
 //! instead, which is copied only at the CPU's locks and unlocks, as on a GPU of its own memory. A
 //! block in place asks for it at its `SURFACE_PAGES` (`RGFX_SURFACE_PAGES_ASK_CACHE`), with its
 //! surface's planes, which must lie in its bytes ([`layout_planes`]). Where the device answers

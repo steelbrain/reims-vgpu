@@ -1381,9 +1381,10 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         }
     }
 
-    /// The runtime's verdicts for textures over the buffer's pages (`crate::gpu::pages_in_place`).
+    /// The runtime's placements of textures over the buffer's pages, plane by plane
+    /// (`crate::gpu::pages_in_place`).
     fn surface_pages_in_place(&self, pages: &VulkanBuffer, planes: &[PagesPlane]) -> PagesInPlace {
-        crate::gpu::pages_in_place::surface_pages_in_place(&self.raw, &pages.raw, planes)
+        crate::gpu::pages_in_place::surface_pages_in_place(&pages.raw, planes)
     }
 
     /// The runtime's verdicts for textures over no import of the pages yet

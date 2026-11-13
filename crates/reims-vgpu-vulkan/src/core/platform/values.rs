@@ -912,13 +912,15 @@ impl PagesPlane {
 /// ([`crate::core::platform::device::GpuDevice::surface_pages_in_place`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PagesInPlace {
-    /// Every texture over them, for any access, lies in place in the pages.
+    /// Every texture over them, for any access, lies in place in the pages, or would be the
+    /// platform's copy over a device cache too.
     Yes,
     /// The device's verdict for an access over such pages is not known yet: a texture made now
     /// waits for nothing, is the platform's copy meanwhile, and lies in place once the verdict
     /// passes (staying the copy where it does not).
     Pending,
-    /// A texture over them would not lie in place for some access: why, in words.
+    /// A texture over them would not lie in place for some access, where one over a device cache
+    /// would: why, in words.
     No(String),
 }
 

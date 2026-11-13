@@ -1889,11 +1889,11 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// Whether the block at `block`, just given its view in place, stays in place, its surface's
     /// planes laid out as `planes` ([`RGFX_SURFACE_PAGES_ASK_CACHE`]): where the device answers
-    /// that a texture over the view would not lie in place for some access
-    /// ([`GpuDevice::surface_pages_in_place`]), the block's view is taken back, the cache of
-    /// views keeping it for the block's cached `SURFACE_PAGES` to come, and false is returned,
-    /// for the answer [`RGFX_STATUS_CACHE`]; the device's verdict not known yet keeps it in place,
-    /// counted apart.
+    /// that a texture over the view would not lie in place for some access, where one over a
+    /// device cache would ([`GpuDevice::surface_pages_in_place`]), the block's view is taken
+    /// back, the cache of views keeping it for the block's cached `SURFACE_PAGES` to come, and
+    /// false is returned, for the answer [`RGFX_STATUS_CACHE`]; the device's verdict not known
+    /// yet keeps it in place, counted apart.
     ///
     /// [`GpuDevice::surface_pages_in_place`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::surface_pages_in_place
     fn asks_cache(&self, device: &P::Device, block: u64, planes: &[PagesPlane]) -> bool {

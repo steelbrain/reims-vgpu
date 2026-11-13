@@ -1,32 +1,214 @@
 //! Whether textures over an IOSurface's own pages lie in place there
 //! (`GpuDevice::surface_pages_in_place`), asked of a device whose GPU shares the CPU's memory: the
-//! graphics lane gives such a surface a device cache only where they do not
+//! graphics lane gives such a surface a device cache only where a texture over its pages would be
+//! the runtime's copy of them (a shadow) that a texture over a cache would not be
 //! ([`surface_pages_in_place`]).
 //!
 //! The runtime makes a texture over a no-copy buffer of host pages an image in place where its
 //! check of the pages' class passed for each access the texture's usage takes, for texels that
-//! lie in the device's lines of memory as the texture's do; elsewhere a shadow, which each command
-//! buffer copies in before its first use and merges back after a write (the runtime's
-//! `in_place.rs`). A surface's textures may take any access, so its pages are in place where each
-//! plane's verdicts pass for all three: a read, a render and a shader's write. The class is the
-//! buffer's import (`rt::HostBacking`): by pointer (ANV, MoltenVK), or as dma-bufs (RADV), where
-//! the runtime binds each texture to a dma-buf of the texture's own pages, so those pages must fit
-//! in one (`crate::os::one_dma_buf_fits`, on Linux). A copy of the pages in the device's own
-//! memory (the runtime's `copied-host-pages`) holds no texture in place.
+//! lie in the device's lines of memory as the texture's do, and the device makes the image at the
+//! buffer's pitch and place; elsewhere a shadow, which each command buffer copies in before its
+//! first use and merges back after a write (the runtime's `in_place.rs`). A device cache is the
+//! device's own memory, laid out at the GPU's pitch, which the graphics lane copies only at the
+//! CPU's locks and unlocks: it holds in place a texture whose shadow over the pages stands for a
+//! check that failed or went unchecked for the pages' class, rows at a pitch or a place no image
+//! over the pages takes, or texels past the pages. No cache holds one the device makes no image
+//! in place of over any memory (its format and usage, a shape no image in place takes): such a
+//! texture is a shadow over a cache too ([`Over::Neither`]).
 //!
-//! Not asked: the pitch the device lays a linear image's rows at, which a texture over a device
-//! cache meets as one over the pages does; and the width of the texels a shader writes, which the
-//! runtime's check covers only for 4, 8 and 16 bytes, as the surface's pixel format is not in its
-//! layout: a surface of narrower texels a shader writes stays a shadow over its pages.
+//! Over a buffer of the pages the answer is the runtime's own, plane by plane
+//! (`rt::Buffer::texture_placement_with_iosurface_plane`, the making's own decision, which counts
+//! and announces nothing): a texture over the plane's rows that only reads, and one that takes
+//! every access (read, render, a shader's write). A surface's layout gives no texel width, so each
+//! plane is asked as each of Metal's widths that its rows' texels divide into ([`WIDTHS`]), as a
+//! texture of that width over it may be made (Metal makes a texture over a plane only of the
+//! plane's bytes per element). A plane needs a cache where no width's textures all lie in place
+//! over the pages, none is pending, and some width's is a shadow a cache holds in place: a width
+//! the rows allow whose textures lie in place may be the plane's own, and in place comes first.
+//! The verdicts of narrow and wide texels agree on every device measured (2026-11-12, the
+//! check's records on the Iris Xe of homelab-ms01-1 and the Radeon 780M of homelab-um870-1 and
+//! homelab-um790-xtx-1: `NarrowWrites` and `Writes` pass and fail alike for every class and row
+//! end of host pages), so no width decides a plane apart from the others there.
 //!
-//! The verdicts are read from the runtime's report (`rt::Device::in_place_check_report`), in one
-//! place ([`verdict`]), until the runtime answers a texture's placement itself.
+//! Before any buffer of the pages is made ([`surface_pages_never_in_place`],
+//! [`fresh_surface_never_in_place`]) there is no buffer to ask, and the verdicts are read from the
+//! runtime's report (`rt::Device::in_place_check_report`), in one place ([`verdict`]), for a
+//! read, a render and a shader's write. Those paths answer only where the verdicts refuse, which a
+//! buffer's answer would refuse too; what only the image's making refuses (a pitch, a place,
+//! texels past the pages) they leave to the answer over the buffer.
 
+#[cfg(target_os = "linux")]
 use crate::core::num::ToU64 as _;
 use crate::core::platform::values::{PagesInPlace, PagesPlane};
+use metal2vulkan::metal::{PixelFormat, TextureUsage};
 use metal2vulkan_runtime as rt;
 
 use crate::answer::plain;
+
+/// The texel widths a texture over a plane may have, with the format each is asked as: Metal's
+/// for a plane's elements (`MTLPixelFormat`'s uncompressed sizes), the most common first.
+const WIDTHS: [(u64, PixelFormat); 5] = [
+    (4, PixelFormat::BGRA8Unorm),
+    (8, PixelFormat::RGBA16Float),
+    (16, PixelFormat::RGBA32Float),
+    (2, PixelFormat::RG8Unorm),
+    (1, PixelFormat::R8Unorm),
+];
+
+/// The widths of [`WIDTHS`] a plane whose rows hold `row_bytes` bytes of texels may have: those
+/// that divide them.
+fn widths(row_bytes: u64) -> impl Iterator<Item = (u64, PixelFormat)> {
+    (WIDTHS.into_iter()).filter(move |&(width, _)| row_bytes.is_multiple_of(width))
+}
+
+/// What a texture over a surface's pages is, as a device cache would change it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Over {
+    /// An image in place in the pages.
+    InPlace,
+    /// A shadow while the device's check has not answered, which moves in place where its
+    /// verdicts pass.
+    Pending,
+    /// A shadow over the pages that a device cache holds in place: why, in words.
+    Cache(String),
+    /// A shadow over any memory, a cache's too: the device makes no image in place of it.
+    Neither,
+}
+
+/// What the runtime's `placement` of a texture over a surface's pages is, as a device cache would
+/// change it (module docs).
+fn over_pages(placement: rt::TexturePlacement) -> Over {
+    use rt::TextureShadowReason as Why;
+    let reason = match placement {
+        rt::TexturePlacement::InPlace | rt::TexturePlacement::NotHostPages => return Over::InPlace,
+        rt::TexturePlacement::Pending => return Over::Pending,
+        rt::TexturePlacement::Shadow(reason) => reason,
+        // No image in place takes a texture of its shape over any buffer; and an answer of the
+        // runtime's this does not know says nothing of the pages.
+        _ => return Over::Neither,
+    };
+    let words = match reason {
+        Why::Refused(rt::InPlaceRefusal::Image) | Why::Mipmapped { .. } => return Over::Neither,
+        Why::Policy => "the device's policy shadows every texture over host pages".to_owned(),
+        Why::StoreWidth { texel_bytes } => {
+            format!("the device's check stores no texels of {texel_bytes} bytes a shader writes")
+        }
+        Why::CheckFailed { access, row_ends } => {
+            format!("the device's check failed for {access:?} of texels {row_ends:?}")
+        }
+        Why::Unchecked { access, row_ends } => {
+            format!("the device's check made no image for {access:?} of texels {row_ends:?}")
+        }
+        Why::Refused(refusal) => {
+            format!("the device makes no image in place over them: {refusal:?}")
+        }
+        Why::PastLength => "its texels run past the pages".to_owned(),
+        Why::BytesBetweenRows => "bytes the buffer keeps lie between its rows".to_owned(),
+        Why::DeviceCopy => "it is the device's copy of the pages".to_owned(),
+        other => format!("a shadow: {other:?}"),
+    };
+    Over::Cache(words)
+}
+
+/// What the textures of one width over a plane are, from what each of them is: a shadow a cache
+/// holds in place where one is; else pending where one is; else in place where one is (one the
+/// device makes in place of no memory, [`Over::Neither`], stands aside); else none in place.
+fn of_width(textures: impl IntoIterator<Item = Over>) -> Over {
+    let mut answer = Over::Neither;
+    for over in textures {
+        answer = match (answer, over) {
+            (cache @ Over::Cache(_), _) | (_, cache @ Over::Cache(_)) => cache,
+            (Over::Pending, _) | (_, Over::Pending) => Over::Pending,
+            (Over::InPlace, _) | (_, Over::InPlace) => Over::InPlace,
+            (Over::Neither, Over::Neither) => Over::Neither,
+        };
+    }
+    answer
+}
+
+/// What a plane is, from what the textures of each width it may have are ([`of_width`]): in
+/// place where one width's are; else pending where one width's are; else a shadow a cache holds
+/// in place where one width's are; else none the device makes in place.
+fn of_plane(widths: impl IntoIterator<Item = Over>) -> Over {
+    let mut answer = Over::Neither;
+    for over in widths {
+        answer = match (answer, over) {
+            (Over::InPlace, _) | (_, Over::InPlace) => Over::InPlace,
+            (Over::Pending, _) | (_, Over::Pending) => Over::Pending,
+            (cache @ Over::Cache(_), _) | (_, cache @ Over::Cache(_)) => cache,
+            (Over::Neither, Over::Neither) => Over::Neither,
+        };
+    }
+    answer
+}
+
+/// The surface's answer from what each plane is ([`of_plane`]): a cache, naming the first plane
+/// whose textures a cache holds in place; else pending where a plane's is; else in place.
+fn of_surface(planes: impl IntoIterator<Item = Over>) -> PagesInPlace {
+    let mut pending = false;
+    for (i, over) in planes.into_iter().enumerate() {
+        match over {
+            Over::Cache(why) => return PagesInPlace::No(format!("plane {i}: {why}")),
+            Over::Pending => pending = true,
+            Over::InPlace | Over::Neither => {}
+        }
+    }
+    match pending {
+        true => PagesInPlace::Pending,
+        false => PagesInPlace::Yes,
+    }
+}
+
+/// The usages a plane's textures are asked of: one that only reads, and one that takes every
+/// access.
+fn usages() -> [TextureUsage; 2] {
+    let every =
+        TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE | TextureUsage::RENDER_TARGET;
+    [TextureUsage::SHADER_READ, every]
+}
+
+/// The descriptor of a 2D texture of `pixel_format` over a plane's `rows` rows of `width` texels,
+/// of `usage`.
+fn plane_descriptor(
+    pixel_format: PixelFormat,
+    width: u64,
+    rows: u64,
+    usage: TextureUsage,
+) -> rt::TextureDescriptor {
+    let mut descriptor = rt::TextureDescriptor::default();
+    descriptor.pixel_format = pixel_format;
+    descriptor.width = width;
+    descriptor.height = rows;
+    descriptor.usage = usage;
+    descriptor
+}
+
+/// What the textures over `plane` of `pages` are (module docs): for each width the plane's rows
+/// allow, the runtime's placement of a texture of each of [`usages`], `planar` where the surface
+/// has planes. A width whose textures the runtime refuses to make (a size past its limits) is no
+/// width of the plane's.
+fn plane_over(pages: &rt::Buffer, plane: &PagesPlane, planar: bool) -> Over {
+    let at = rt::IoSurfacePlane::new(plane.offset, plane.bytes_per_row, planar);
+    let width = |(width, pixel_format): (u64, PixelFormat)| {
+        let placements: Result<Vec<Over>, rt::Error> = (usages().into_iter())
+            .map(|usage| {
+                let descriptor =
+                    plane_descriptor(pixel_format, plane.row_bytes / width, plane.rows, usage);
+                plain(|| pages.texture_placement_with_iosurface_plane(&descriptor, at))
+                    .map(over_pages)
+            })
+            .collect();
+        placements.ok().map(of_width)
+    };
+    let mut answers = Vec::new();
+    for answer in widths(plane.row_bytes).filter_map(width) {
+        if answer == Over::InPlace {
+            return Over::InPlace;
+        }
+        answers.push(answer);
+    }
+    of_plane(answers)
+}
 
 /// The memory a texture over host pages lies in, as the runtime's check tells them apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,29 +311,26 @@ fn on_lines(start: u64, plane: &PagesPlane, line: u64) -> bool {
 }
 
 /// Whether textures over the pages `pages` lies over, laid out as `planes` gives, lie in place
-/// on `raw` for every access (module docs).
-pub(crate) fn surface_pages_in_place(
-    raw: &rt::Device,
-    pages: &rt::Buffer,
-    planes: &[PagesPlane],
-) -> PagesInPlace {
+/// on `raw` for every access, or would lie in place over no device cache either (module docs):
+/// the runtime's answer for each plane.
+pub(crate) fn surface_pages_in_place(pages: &rt::Buffer, planes: &[PagesPlane]) -> PagesInPlace {
     let class = match plain(|| pages.host_backing()) {
         Some(rt::HostBacking::ImportedByPointer | rt::HostBacking::InHostRam) => Class::Pointer,
         Some(rt::HostBacking::ImportedAsDmaBuf) => Class::DmaBuf,
         Some(rt::HostBacking::Copied) => {
             return PagesInPlace::No(
-                "its pages are a copy in the device's own memory, which holds no texture in place"
+                "its pages are a copy in the device's own memory, which each command buffer \
+                 compares"
                     .to_owned(),
             );
         }
         // No host pages under the buffer: nothing of them to place.
         _ => return PagesInPlace::Yes,
     };
-    let Some(start) = plain(|| pages.contents()).map(|at| at.as_ptr().addr().to_u64()) else {
-        return PagesInPlace::Yes;
-    };
     #[cfg(target_os = "linux")]
-    if class == Class::DmaBuf {
+    if class == Class::DmaBuf
+        && let Some(start) = plain(|| pages.contents()).map(|at| at.as_ptr().addr().to_u64())
+    {
         for (i, plane) in planes.iter().enumerate() {
             let Some(end) = plane.end() else { continue };
             let first = start.saturating_add(plane.offset);
@@ -164,13 +343,10 @@ pub(crate) fn surface_pages_in_place(
             }
         }
     }
-    let report = plain(|| raw.in_place_check_report());
-    let line = plain(|| raw.in_place_check_line());
-    match verdicts(&report, line, start, class, planes) {
-        Err(why) => PagesInPlace::No(why),
-        Ok(true) => PagesInPlace::Pending,
-        Ok(false) => PagesInPlace::Yes,
-    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = class;
+    let planar = planes.len() > 1;
+    of_surface(planes.iter().map(|plane| plane_over(pages, plane, planar)))
 }
 
 /// The verdicts `report` gives textures over pages of `class` whose first byte lies at `start`,
@@ -354,221 +530,4 @@ fn never_in_place(report: &[String], line: u64, planes: &[PagesPlane]) -> Option
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn plane(offset: u64, bytes_per_row: u64, row_bytes: u64, rows: u64) -> PagesPlane {
-        PagesPlane {
-            offset,
-            bytes_per_row,
-            row_bytes,
-            rows,
-        }
-    }
-
-    /// The report's lines name each class, access and row ends as the runtime writes them; one
-    /// it does not hold, or a note, is pending
-    #[test]
-    fn the_verdicts_are_read_from_the_runtimes_report() {
-        let report: Vec<String> = [
-            "Pointer: Passed",
-            "DmaBuf: Unchecked",
-            "Pointer renders: Failed",
-            "Pointer writes, rows on lines: Passed",
-            "Pointer renders, rows on lines: Pending",
-            "Pointer: the pass's store changed byte 4095",
-        ]
-        .map(str::to_owned)
-        .into();
-        let v = |class, access, on| verdict(&report, class, access, on);
-        assert_eq!(v(Class::Pointer, Access::Reads, false), Verdict::Passed);
-        assert_eq!(v(Class::DmaBuf, Access::Reads, false), Verdict::Unchecked);
-        assert_eq!(v(Class::Pointer, Access::Renders, false), Verdict::Failed);
-        assert_eq!(v(Class::Pointer, Access::Writes, true), Verdict::Passed);
-        assert_eq!(v(Class::Pointer, Access::Renders, true), Verdict::Pending);
-        assert_eq!(v(Class::Pointer, Access::Writes, false), Verdict::Pending);
-        assert_eq!(v(Class::Pointer, Access::Reads, true), Verdict::Pending);
-    }
-
-    /// Texels lie on the lines where they start and end on one and so does each row where bytes
-    /// lie between rows: a BGRA8 plane of 1,000 texels a row (4,000 bytes) at a 4,032-byte pitch
-    /// ends its rows inside a 64-byte line, one of 1,008 texels at a pitch of 4,032 bytes does
-    /// not, and rows that follow on with no bytes between need only the plane's ends on lines
-    #[test]
-    fn row_ends_are_told_apart_as_the_runtime_tells_them() {
-        assert!(!on_lines(0, &plane(0, 4032, 4000, 600), 64));
-        assert!(on_lines(0, &plane(0, 4032, 4032, 600), 64));
-        assert!(on_lines(0, &plane(0, 64, 64, 3), 64));
-        assert!(
-            !on_lines(0, &plane(0, 60, 60, 3), 64),
-            "the last row ends inside"
-        );
-        assert!(
-            on_lines(0, &plane(0, 60, 60, 16), 64),
-            "the plane's ends on lines"
-        );
-        assert!(
-            !on_lines(16, &plane(0, 4096, 4096, 2), 64),
-            "a start inside a line"
-        );
-        assert!(
-            on_lines(0, &plane(0, 4000, 4000, 1), 1),
-            "lines of one byte"
-        );
-    }
-
-    /// Before any import, a surface's pages are answered as lying in place over none exactly
-    /// where the verdicts of both classes an import of them takes refuse them: wherever a buffer
-    /// over a view of them (which starts on a page's first byte) imported by their pointer, or as
-    /// dma-bufs, would be answered in place or pending, the answer before the import leaves it to
-    /// the import, so a surface kept in place before is kept in place still; and wherever both
-    /// would be answered no, so is the answer before. Every verdict of every access of both
-    /// classes, for rows that end inside the device's lines and for rows on them; and lines that
-    /// do not divide a page, or none, leave it to the import whatever the verdicts
-    #[test]
-    fn pages_lie_in_place_over_no_import_exactly_where_both_classes_refuse_them() {
-        let words = ["Pending", "Passed", "Failed", "Unchecked"];
-        let classes = [Class::Pointer, Class::DmaBuf];
-        let line = 64;
-        let entries: Vec<(Class, Access)> = (classes.iter())
-            .flat_map(|&c| Access::ALL.map(move |a| (c, a)))
-            .collect();
-        for plane in [plane(0, 4032, 4000, 600), plane(64, 4032, 4032, 600)] {
-            let planes = std::slice::from_ref(&plane);
-            let lines = if on_lines(0, &plane, line) {
-                ", rows on lines"
-            } else {
-                ""
-            };
-            for combo in 0..4usize.pow(entries.len() as u32) {
-                let report: Vec<String> = (entries.iter().enumerate())
-                    .map(|(k, (class, access))| {
-                        let word = words[combo / 4usize.pow(k as u32) % 4];
-                        format!("{}{}{lines}: {word}", class.name(), access.name())
-                    })
-                    .collect();
-                let never = never_in_place(&report, line, planes);
-                for start in [0, 7 * GUEST_PAGE] {
-                    let kept = (classes.iter())
-                        .any(|&c| verdicts(&report, line, start, c, planes).is_ok());
-                    assert_eq!(never.is_none(), kept, "{report:?}, a view at {start:#x}");
-                }
-            }
-        }
-        let refused: Vec<String> = (entries.iter())
-            .map(|(class, access)| format!("{}{}: Failed", class.name(), access.name()))
-            .collect();
-        let planes = [plane(0, 4032, 4000, 600)];
-        assert!(never_in_place(&refused, line, &planes).is_some());
-        assert!(
-            never_in_place(&refused, 96, &planes).is_none(),
-            "lines across a page's end"
-        );
-        assert!(never_in_place(&refused, 0, &planes).is_none(), "no lines");
-    }
-
-    /// The runs a span of a surface's bytes lies in, cut to it
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[allow(clippy::single_range_in_vec_init)] // runs of one range
-    fn the_runs_of_a_span_are_cut_to_it() {
-        let runs = [0x1000..0x3000, 0x8000..0x9000, 0x4000..0x5000];
-        assert_eq!(cut(&runs, 0x1000..0x2800), [0x2000..0x3000, 0x8000..0x8800]);
-        assert_eq!(cut(&runs, 0..0x2000), [0x1000..0x3000]);
-        assert_eq!(cut(&runs, 0x3000..0x4000), [0x4000..0x5000]);
-        assert_eq!(cut(&runs, 0x4000..0x5000), []);
-    }
-
-    /// On a device whose views are dma-bufs, a surface's pages are answered as lying in place over
-    /// no import before its view where the dma-bufs' verdicts refuse them, whatever those by
-    /// pointer answer, or where a plane's pages, counted from the runs the view would map, are no
-    /// one dma-buf (here pages no file is behind, which the view's import refuses as well); and
-    /// left to the import where the dma-bufs' verdicts pass and each plane's pages fit one
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[allow(clippy::single_range_in_vec_init)] // pages of one run
-    fn a_dma_buf_device_refuses_pages_before_their_view_by_the_dma_bufs_alone() {
-        use crate::core::num::{ToU64 as _, ToUsize as _};
-        let line = 64;
-        let page = GUEST_PAGE;
-        let planes = [plane(0, 4096, 4096, 4)];
-        let report = |dma_buf: &str| -> Vec<String> {
-            let mut lines = vec![
-                "Pointer, rows on lines: Passed".to_owned(),
-                "Pointer renders, rows on lines: Passed".to_owned(),
-                "Pointer writes, rows on lines: Passed".to_owned(),
-            ];
-            for access in ["", " renders", " writes"] {
-                lines.push(format!("DmaBuf{access}, rows on lines: {dma_buf}"));
-            }
-            lines
-        };
-        let base = crate::os::allocate_aliasable(8 * page)
-            .unwrap()
-            .addr()
-            .to_u64();
-        let mapped = [base + 4 * page..base + 6 * page, base..base + 2 * page];
-        let passed = report("Passed");
-        assert!(never_in_place(&passed, line, &planes).is_none());
-        assert_eq!(
-            dma_bufs_never_in_place(&passed, line, &planes, &mapped),
-            None,
-            "the dma-bufs' verdicts pass and the pages fit one"
-        );
-        let failed = report("Failed");
-        assert!(
-            never_in_place(&failed, line, &planes).is_none(),
-            "those by pointer pass"
-        );
-        let why = dma_bufs_never_in_place(&failed, line, &planes, &mapped).unwrap();
-        assert!(why.contains("imported as dma-bufs"), "{why}");
-        let private = vec![0u8; (8 * page).to_usize()];
-        let at = (private.as_ptr().addr().to_u64()).next_multiple_of(page);
-        let unresolved = [at..at + 4 * page];
-        let why = dma_bufs_never_in_place(&passed, line, &planes, &unresolved).unwrap();
-        assert!(why.contains("plane 0's pages are no one dma-buf"), "{why}");
-        assert!(
-            dma_bufs_never_in_place(&passed, 0, &planes, &mapped).is_none(),
-            "no lines, pages that fit"
-        );
-    }
-
-    /// A fresh surface on a device whose views are dma-bufs needs a device cache whatever its
-    /// pages where a plane has more pages than one dma-buf takes pieces, each page counted a piece
-    /// of its own, or where the dma-bufs' verdicts refuse its rows; a plane within the pieces whose
-    /// verdicts pass, or a device with no lines, may lie in place
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_fresh_surface_needs_a_cache_where_its_pages_fit_no_dma_buf_or_its_rows_fail() {
-        let line = 64;
-        let page = GUEST_PAGE;
-        let report = |dma_buf: &str| -> Vec<String> {
-            ["", " renders", " writes"]
-                .iter()
-                .map(|access| format!("DmaBuf{access}, rows on lines: {dma_buf}"))
-                .collect()
-        };
-        let passed = report("Passed");
-        let fits = [plane(0, page, page, 4)];
-        assert_eq!(fresh_dma_bufs_never_in_place(&passed, line, &fits), None);
-        assert_eq!(
-            fresh_dma_bufs_never_in_place(&passed, 0, &fits),
-            None,
-            "no lines"
-        );
-        // The fewest pages, doubling from udmabuf's default list_limit, that one dma-buf of a
-        // piece apiece does not take on this host.
-        let pages = std::iter::successors(Some(1024u64), |n| n.checked_mul(2))
-            .find(|&n| crate::os::one_dma_buf_of_pieces_fits(n, n * page).is_err())
-            .unwrap();
-        let over = [plane(0, page, page, pages)];
-        let why = fresh_dma_bufs_never_in_place(&passed, line, &over).unwrap();
-        assert!(
-            why.contains("plane 0's pages, each a piece of its own"),
-            "{why}"
-        );
-        let failed = report("Failed");
-        let why = fresh_dma_bufs_never_in_place(&failed, line, &fits).unwrap();
-        assert!(why.contains("imported as dma-bufs"), "{why}");
-    }
-}
+mod tests;

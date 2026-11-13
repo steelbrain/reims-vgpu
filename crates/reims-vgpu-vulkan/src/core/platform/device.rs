@@ -218,9 +218,10 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// its planes laid out as `planes` gives, lie in place in those pages for every access a
     /// texture over the surface may take (sampled or read, rendered, written by a shader), as the
     /// platform makes a texture over such a buffer; where one would be the platform's copy of
-    /// them instead (a shadow), why. Asked only of a device whose GPU shares the CPU's memory,
-    /// where the graphics lane gives a surface a device cache only where its textures cannot lie
-    /// in place. The default is yes.
+    /// them instead (a shadow) that a texture over a device cache of the surface would not be,
+    /// why. Yes too where such a texture would be a shadow over any memory, a cache's included.
+    /// Asked only of a device whose GPU shares the CPU's memory, where the graphics lane gives a
+    /// surface a device cache only where its textures cannot lie in place. The default is yes.
     fn surface_pages_in_place(&self, pages: &P::Buffer, planes: &[PagesPlane]) -> PagesInPlace {
         let _ = (pages, planes);
         PagesInPlace::Yes

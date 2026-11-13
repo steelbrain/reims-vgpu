@@ -747,9 +747,13 @@ Stages:
       bytes of a row's texels), and the host maps the pages and asks its
       platform whether textures over them, for any access (a read, a render,
       a shader's write), lie in place (`GpuDevice::surface_pages_in_place`;
-      the Vulkan platform's `gpu/pages_in_place.rs`). Where they do, or where
-      the runtime's verdict is not known yet, it answers OK, the block in
-      place. Where they do not, it answers `RGFX_STATUS_CACHE`, its view of
+      the Vulkan platform's `gpu/pages_in_place.rs`, which asks the runtime
+      where a texture over each plane lies, as its making decides: the
+      device's check of the pages, the rows' pitch and place, the texels'
+      reach). Where they do, where the runtime's verdict is not known yet,
+      or where a texture over a cache would be the runtime's copy too, it
+      answers OK, the block in place. Where they do not, it answers
+      `RGFX_STATUS_CACHE`, its view of
       the pages left in its cache of views, and the kext makes the surface's
       device cache and posts the block again cached, which takes that view
       and the host's cache, kept from then on as above. It answers
