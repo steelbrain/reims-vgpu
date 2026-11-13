@@ -464,10 +464,9 @@ through dma-bufs"). How the GPU then takes those pages depends on its driver:
   Metal when memory runs out: a remap of guest pages, or a range
   a view is made of, answers `KERN_NO_SPACE` with nothing mapped, an
   IOSurface stand-in's memory is none, an import's twin is none, and a buffer
-  over a surface or a heap over address ranges is nil. Each is counted and
+  over a surface is nil. Each is counted and
   logged at the first and at each power of two, those after the first at
-  debug (docs/conventions.md). A replace whose alias is
-  refused still ends the process. With `REIMS_VGPU_STRICT=1` each ends the
+  debug (docs/conventions.md). With `REIMS_VGPU_STRICT=1` each ends the
   process at the call, naming the numbers.
 - **Where `/dev/udmabuf` is not the process's** (the device node is the `kvm`
   group's on Ubuntu), every view is mapped from its files, so views past the

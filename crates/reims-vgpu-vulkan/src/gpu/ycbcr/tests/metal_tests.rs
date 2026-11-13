@@ -75,7 +75,6 @@ fn heap<P: Platform>(d: &P::Device, storage: u64) -> P::Heap {
         size: 1 << 20,
         heap_type: 1,
         options: vec![OptionSet::StorageMode(storage)],
-        address_ranges: None,
         pinned_gpu_address: None,
     };
     d.new_heap(&desc).unwrap().heap.unwrap()

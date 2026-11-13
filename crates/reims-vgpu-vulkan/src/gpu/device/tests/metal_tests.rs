@@ -1352,7 +1352,6 @@ fn formats_the_runtime_lacks_die_where_textures_are_made() {
                 size: 1 << 20,
                 heap_type: 1,
                 options: vec![OptionSet::StorageMode(2)],
-                address_ranges: None,
                 pinned_gpu_address: None,
             });
             let heap = heap.unwrap().heap.unwrap();
@@ -1495,7 +1494,6 @@ fn packed_10_bit_textures_over_memory_die_named() {
                 size: 1 << 22,
                 heap_type: 1,
                 options: vec![OptionSet::StorageMode($storage)],
-                address_ranges: None,
                 pinned_gpu_address: None,
             }
         };
@@ -1732,7 +1730,6 @@ fn write_swizzles_are_made_where_read_alone() {
             size: 1 << 20,
             heap_type: 1,
             options: vec![OptionSet::StorageMode(2)],
-            address_ranges: None,
             pinned_gpu_address: None,
         });
         (buffer.unwrap().unwrap(), heap.unwrap().heap.unwrap())
@@ -1843,7 +1840,6 @@ fn texture_setters_act_where_metal_does() {
             size: 1 << 20,
             heap_type: 1,
             options: vec![OptionSet::StorageMode(2)],
-            address_ranges: None,
             pinned_gpu_address: None,
         });
         made.unwrap().heap.unwrap()

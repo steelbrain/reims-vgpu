@@ -90,31 +90,18 @@ fn id_of<H: Handle>(h: Option<&H>) -> Option<ObjId> {
     h.map(Handle::id)
 }
 
-/// `MTLHeapDescriptor`, as a value. Order: `setSize:`; `setType:`; the options up to the first
-/// hazard-tracking mode; `setAddressRanges:`; the rest of the options; `setPinnedGPUAddress:`.
-pub struct HeapDesc<'a, P: Platform> {
+/// `MTLHeapDescriptor`, as a value. Order: `setSize:`; `setType:`; the options;
+/// `setPinnedGPUAddress:`.
+#[derive(Debug)]
+pub struct HeapDesc {
     /// `setSize:`.
     pub size: u64,
     /// `setType:` (`MTLHeapType` is `NSInteger`).
     pub heap_type: i64,
     /// The storage properties, in order.
     pub options: Vec<OptionSet>,
-    /// `setAddressRanges:`, when set.
-    pub address_ranges: Option<&'a P::AddressRangeArray>,
     /// `setPinnedGPUAddress:`, when set.
     pub pinned_gpu_address: Option<u64>,
-}
-
-impl<P: Platform> fmt::Debug for HeapDesc<'_, P> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HeapDesc")
-            .field("size", &self.size)
-            .field("heap_type", &self.heap_type)
-            .field("options", &self.options)
-            .field("address_ranges", &id_of(self.address_ranges))
-            .field("pinned_gpu_address", &self.pinned_gpu_address)
-            .finish()
-    }
 }
 
 /// What `GpuDevice::new_heap` answers: the heap, and its descriptor's options.
@@ -1268,11 +1255,10 @@ mod tests {
         assert_eq!(b.contents(), HostRange::of_slice(&bytes).ptr());
 
         let made = d
-            .new_heap(&HeapDesc::<FakePlatform> {
+            .new_heap(&HeapDesc {
                 size: 0x4000,
                 heap_type: 1,
                 options: vec![OptionSet::StorageMode(2), OptionSet::HazardTrackingMode(2)],
-                address_ranges: None,
                 pinned_gpu_address: None,
             })
             .unwrap();

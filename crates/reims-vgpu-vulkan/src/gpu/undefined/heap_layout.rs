@@ -50,11 +50,10 @@
 //! every format and sample count, by every path that writes (blits, a pass's store, a clear),
 //! with the block's unused bytes kept. No public specification of the encoding is known.
 
-use crate::core::platform::Platform;
 use crate::core::platform::device::GpuDevice as _;
 use crate::core::platform::resource::Heap as _;
-use crate::core::platform::types::ResourceAddressRange;
 use crate::core::platform::values::{HeapDesc, OptionSet};
+use crate::core::platform::{HostRange, Platform};
 use metal2vulkan_runtime as rt;
 
 use super::{
@@ -100,22 +99,20 @@ fn heap_bytes<P: Platform>((p, d): (&P, &P::Device), shape: Shape, write: Write)
     let pages = p.vm().allocate_anywhere(HEAP).unwrap();
     let length = usize::try_from(HEAP).unwrap();
     // SAFETY: the new pages, `HEAP` bytes, which nothing else uses yet; left mapped until the
-    // process ends, as the heap's alias shares them.
+    // process ends, as the heap lies in them.
     unsafe { std::ptr::write_bytes(pages.as_ptr::<u8>(), 0xa5, length) };
-    let ranges = p
-        .new_address_range_array(&[ResourceAddressRange {
-            address: u64::try_from(pages.addr()).unwrap(),
-            length: HEAP,
-        }])
-        .unwrap();
+    // SAFETY: as above.
+    let over = unsafe { HostRange::new(pages, HEAP) };
     let heap = d
-        .new_heap(&HeapDesc {
-            size: HEAP,
-            heap_type: 1,
-            options: vec![OptionSet::StorageMode(0), OptionSet::HazardTrackingMode(0)],
-            address_ranges: Some(&ranges),
-            pinned_gpu_address: None,
-        })
+        .new_heap_over_host_memory(
+            over,
+            &HeapDesc {
+                size: HEAP,
+                heap_type: 1,
+                options: vec![OptionSet::StorageMode(0), OptionSet::HazardTrackingMode(0)],
+                pinned_gpu_address: None,
+            },
+        )
         .unwrap()
         .heap
         .unwrap();

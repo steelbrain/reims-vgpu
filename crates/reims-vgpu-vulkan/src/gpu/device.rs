@@ -51,7 +51,7 @@ use crate::answer::{
     Nil, Policy, create, created_or_decided, decide, error_text, get, get_describing, hearing,
     metal_aborts, plain, plain_at, relay_gap, send, unrepresentable,
 };
-use crate::gpu::backing::{self, Backing, HEAP_GRANULE};
+use crate::gpu::backing::{self, Backing};
 use crate::gpu::caps;
 use crate::gpu::command::{QueueObject, VulkanCommandQueue};
 use crate::gpu::desc::{
@@ -2030,17 +2030,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// for a pinned address the space cannot honour, as Metal answers; a `Managed` or
     /// `Memoryless` heap dies, as Metal asserts at it ("Heap Descriptor Validation"). A type the
     /// runtime lacks dies at `setType:`.
-    ///
-    /// Over address ranges (`setAddressRanges:`), the heap's memory is an alias of the ranges'
-    /// pages ([`crate::gpu::backing`]), read-only for options with bit 24. Nil, as Metal answers
-    /// (measured), for a size of 0 before the ranges are read, and for ranges Metal makes no heap
-    /// over: none, a NULL range, an unmapped one or one with a page mapped without access.
-    /// Storage other than `Shared` dies, as the runtime makes no heap of another storage over
-    /// host memory.
-    fn new_heap(
-        &self,
-        desc: &HeapDesc<'_, VulkanPlatform>,
-    ) -> RaiseResult<HeapMade<VulkanPlatform>> {
+    fn new_heap(&self, desc: &HeapDesc) -> RaiseResult<HeapMade<VulkanPlatform>> {
         let sel = "newHeapWithDescriptor:";
         let heap_type = u64::try_from(desc.heap_type)
             .ok()
@@ -2050,7 +2040,6 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             });
         let held = descriptor_options(HEAP_DESCRIPTOR_OPTIONS, &desc.options);
         let options = crate::gpu::resource_options(sel, held);
-        let read_only = held & READ_ONLY_OPTION != 0;
         // A sparse heap's ranges are its range token's, which the runtime drops once the heap,
         // its textures and the command buffers that hold any of them are gone; the runtime holds
         // none of the space for it. One the space refuses dies: the runtime would make it, and
@@ -2096,75 +2085,19 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             })) => metal_aborts(sel, &format!("a heap of resource options {held:#x}")),
             made => made,
         };
-        let heap = match desc.address_ranges {
-            None => create(sel, Policy::Dies, nil, || {
-                storage(match token {
-                    Some(token) => self.raw.new_heap_with_range_token(&descriptor, token),
-                    None => self.raw.new_heap(&descriptor),
-                })
-            })?,
-            Some(_) if desc.size == 0 => None,
-            Some(ranges) => {
-                // The alias the heap is made over, which the runtime's import keeps.
-                let made_over = desc
-                    .size
-                    .checked_next_multiple_of(HEAP_GRANULE)
-                    .and_then(|size| backing::gather_or_nil(sel, &ranges.ranges, size, read_only))
-                    .map(Arc::new);
-                match made_over
-                    .as_ref()
-                    .map(|alias| Arc::clone(alias).into_runtime(backing::ImportSite::Heap))
-                {
-                    None => None,
-                    Some((first, keep, import_made)) => {
-                        let heap = create(sel, Policy::Dies, nil, || {
-                            // SAFETY: the alias covers the heap's size, the descriptor's rounded up
-                            // to the runtime's granule, and starts on a page, the runtime's import
-                            // unit on this host.
-                            storage(unsafe {
-                                match token {
-                                    Some(token) => {
-                                        self.raw.new_heap_with_bytes_no_copy_and_range_token(
-                                            crate::os::host_memory(first),
-                                            &descriptor,
-                                            None,
-                                            Some(keep),
-                                            token,
-                                        )
-                                    }
-                                    None => self.raw.new_heap_with_bytes_no_copy(
-                                        crate::os::host_memory(first),
-                                        &descriptor,
-                                        None,
-                                        Some(keep),
-                                    ),
-                                }
-                            })
-                        })?;
-                        if heap.is_some() {
-                            import_made.made(&self.raw);
-                        }
-                        heap
-                    }
-                }
-            }
-        };
+        let heap = create(sel, Policy::Dies, nil, || {
+            storage(match token {
+                Some(token) => self.raw.new_heap_with_range_token(&descriptor, token),
+                None => self.raw.new_heap(&descriptor),
+            })
+        })?;
         Ok(HeapMade {
             heap: heap.map(|raw| {
-                // A heap over address ranges keeps their pages ([`crate::gpu::backing`]).
-                let backing = match &desc.address_ranges {
-                    Some(ranges) => {
-                        let backing = Backing::new(read_only);
-                        backing.made_over(&ranges.ranges);
-                        backing
-                    }
-                    None => Backing::new(false),
-                };
                 Obj::new(HeapObject {
                     raw,
                     device: self.clone_ref(),
                     descriptor_size: desc.size,
-                    backing,
+                    backing: Backing::new(false),
                     placed: Mutex::default(),
                     space: placing.made(),
                 })
@@ -2183,7 +2116,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     fn new_heap_over_host_memory(
         &self,
         bytes: HostRange<'_>,
-        desc: &HeapDesc<'_, VulkanPlatform>,
+        desc: &HeapDesc,
     ) -> RaiseResult<HeapMade<VulkanPlatform>> {
         let sel = "newHeapWithDescriptor:";
         let heap_type = u64::try_from(desc.heap_type)
@@ -2854,7 +2787,6 @@ pub(crate) mod tests {
             size: 0x1_0001,
             heap_type: 1,
             options: vec![OptionSet::StorageMode(0)],
-            address_ranges: None,
             pinned_gpu_address: Some(pin),
         };
         let short = d.new_heap_over_host_memory(over(0x1_0000), &desc).unwrap();
@@ -3225,7 +3157,6 @@ pub(crate) mod tests {
             size: 0x40000,
             heap_type: 2,
             options: vec![OptionSet::StorageMode(2)],
-            address_ranges: None,
             pinned_gpu_address: pin,
         };
         let made = d.new_heap(&sparse(None)).unwrap();

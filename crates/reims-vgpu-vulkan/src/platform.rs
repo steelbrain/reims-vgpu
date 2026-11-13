@@ -19,7 +19,7 @@ use crate::core::num::ToU64;
 use crate::core::platform::os::Threads;
 use crate::core::platform::os::surface::IoSurfaces;
 use crate::core::platform::os::vm::HostVm;
-use crate::core::platform::types::{MtlSize, ResourceAddressRange};
+use crate::core::platform::types::MtlSize;
 use crate::core::platform::values::{RateMapDesc, TextureDesc};
 use crate::core::platform::{Handle, ObjId, Platform};
 use crate::core::raise::{OnFault, RaiseResult};
@@ -681,7 +681,6 @@ impl Platform for VulkanPlatform {
     type RenderPassDescriptor = VulkanRenderPassDescriptor;
     type RateMapDescriptor = VulkanRateMapDescriptor;
     type RateMapLayerDescriptor = VulkanRateMapLayerDescriptor;
-    type AddressRangeArray = VulkanAddressRangeArray;
     type Surface = OsSurface;
     type Clock = OsClock;
 
@@ -737,16 +736,6 @@ impl Platform for VulkanPlatform {
         Ok(crate::gpu::rate_map::new_layer(sample_count))
     }
 
-    /// A copy of `ranges`, as Metal's array copies them.
-    fn new_address_range_array(
-        &self,
-        ranges: &[ResourceAddressRange],
-    ) -> RaiseResult<VulkanAddressRangeArray> {
-        Ok(Obj::new(AddressRanges {
-            ranges: ranges.to_vec(),
-        }))
-    }
-
     /// A new descriptor with the value's properties, set in its order.
     fn texture_descriptor(&self, desc: &TextureDesc) -> VulkanTextureDescriptor {
         Obj::new(TextureDescriptorObject::new(TextureFields::of(desc)))
@@ -790,17 +779,6 @@ impl Platform for VulkanPlatform {
         &self.threads
     }
 }
-
-/// The private `MTLResourceAddressRangeArray *`: the ranges, as the array copies them, which a
-/// heap is made over ([`crate::gpu::backing`]).
-#[derive(Debug)]
-pub struct AddressRanges {
-    /// The ranges, in order.
-    pub ranges: Vec<ResourceAddressRange>,
-}
-
-/// The private `MTLResourceAddressRangeArray *`.
-pub type VulkanAddressRangeArray = Obj<AddressRanges>;
 
 #[cfg(test)]
 pub(crate) mod tests {

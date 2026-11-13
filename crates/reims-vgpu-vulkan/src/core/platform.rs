@@ -32,7 +32,7 @@ pub use types::NilDefault;
 use os::surface::{IoSurfaces, Surface};
 use os::vm::HostVm;
 use os::{Clock, Threads};
-use types::{MtlSize, ResourceAddressRange};
+use types::MtlSize;
 
 /// An object's identity: its pointer, for the fake's call log and for core's pointer-equality
 /// checks. Name from architecture 4.1.
@@ -128,8 +128,6 @@ pub trait Platform: Sized + Send + Sync + 'static {
     type RateMapDescriptor: rate_map::RateMapDescriptor<Self>;
     /// `MTLRasterizationRateLayerDescriptor *`.
     type RateMapLayerDescriptor: rate_map::RateMapLayerDescriptor;
-    /// The private `MTLResourceAddressRangeArray *`.
-    type AddressRangeArray: Handle;
 
     // Non-Metal handles.
     /// `IOSurfaceRef` / `IOSurface *`.
@@ -169,14 +167,6 @@ pub trait Platform: Sized + Send + Sync + 'static {
         on: OnFault,
         sample_count: MtlSize,
     ) -> RaiseResult<Option<Self::RateMapLayerDescriptor>>;
-    /// sel: initWithRanges:count: SPI
-    /// (`[[MTLResourceAddressRangeArray alloc] initWithRanges:count:]`). The runtime encodes the
-    /// ranges as `^{MTLAddressRange=QQ}`; the array copies them, so `ranges` may live on the stack
-    /// (D41).
-    fn new_address_range_array(
-        &self,
-        ranges: &[ResourceAddressRange],
-    ) -> RaiseResult<Self::AddressRangeArray>;
 
     // Made descriptors and devices, from values.
     /// A texture descriptor made from `desc`: a new descriptor with the value's setters sent in

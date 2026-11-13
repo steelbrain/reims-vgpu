@@ -1316,12 +1316,11 @@ fn swizzled_extended_range_textures_are_made() {
         ..TextureDesc::default()
     };
     // A placement heap of 1 MiB of `Private` storage.
-    fn heap_desc<'a, P: Platform>() -> HeapDesc<'a, P> {
+    fn heap_desc() -> HeapDesc {
         HeapDesc {
             size: 1 << 20,
             heap_type: 1,
             options: vec![OptionSet::StorageMode(2)],
-            address_ranges: None,
             pinned_gpu_address: None,
         }
     }
@@ -3507,44 +3506,22 @@ fn a_buffer_over_a_one_level_two_plane_heap_texture_sees_its_texels_as_metals() 
     assert_eq!(site.file, "dispatchThreads:threadsPerThreadgroup:");
 }
 
-/// A texture Metal may keep losslessly compressed placed in a heap over the guest's pages is
+/// A texture Metal may keep losslessly compressed placed in a heap over the guest's memory is
 /// made, as Metal makes it in the same heap, and the runtime's announcement
 /// (`heap-texture-lossless-layout`, its bytes there Metal's uncompressed tiles) is relayed, not a
 /// death: a two-aspect `Depth32Float_Stencil8` render target, as the suite's depth and stencil
-/// cases place it (core's detach heap, `Shared` over the pages, and the texture of the heap's
-/// options, as core sets them whatever the guest's descriptor names). On a device that clamps a
-/// depth outside `[0, 1]` (MoltenVK), its making dies of `restricted-depth-upload` in strict
-/// mode, and by default it is made, the layout's announcement relayed
+/// cases place it (a `Shared` heap over pages of the test's, made over them as host memory, as
+/// the decoder makes one over the guest's, and the texture of the heap's options). On a device
+/// that clamps a depth outside `[0, 1]` (MoltenVK), its making dies of `restricted-depth-upload`
+/// in strict mode, and by default it is made, the layout's announcement relayed
 #[test]
 fn heap_textures_over_guest_pages_metal_may_compress_are_made() {
-    use crate::core::platform::os::vm::HostVm as _;
-    use crate::core::platform::types::ResourceAddressRange;
-    use crate::os::OsVm;
-
     const SIZE: u64 = 0x10000;
 
     /// Whether a `Depth32Float_Stencil8` render target is made at 0 in a `Shared` heap of
     /// `SIZE` bytes over pages of their own, of the heap's options.
     fn placed<P: Platform>(p: &P, d: &P::Device) -> bool {
-        // Left mapped: the heap's alias shares them until the process ends.
-        let pages = OsVm::new().allocate_anywhere(SIZE).unwrap();
-        let ranges = p
-            .new_address_range_array(&[ResourceAddressRange {
-                address: u64::try_from(pages.addr()).unwrap(),
-                length: SIZE,
-            }])
-            .unwrap();
-        let heap = d
-            .new_heap(&HeapDesc {
-                size: SIZE,
-                heap_type: 1,
-                options: vec![OptionSet::StorageMode(0), OptionSet::HazardTrackingMode(0)],
-                address_ranges: Some(&ranges),
-                pinned_gpu_address: None,
-            })
-            .unwrap()
-            .heap
-            .unwrap();
+        let heap = heap_over::<P>(d, guest_pages_of(SIZE), SIZE);
         let depth_stencil = p.texture_descriptor(&TextureDesc {
             pixel_format: 260,
             width: 16,
@@ -3743,89 +3720,9 @@ fn a_view_keeps_its_released_textures_bytes() {
     assert_eq!(over_the_view(&platform(), &dev()), [true; 2]);
 }
 
-/// A 4-sample `RGBA8Unorm` render target placed in a `Shared` heap over the guest's pages, of
-/// the heap's options as core gives them, where Metal keeps it losslessly compressed (16 by 16,
-/// its sample grid 32 by 32, with `allowGPUOptimizedContents`), dies at the placement: the
-/// runtime makes it, its image in memory of its own, the heap's bytes keeping what they held,
-/// and announces `heap-texture-lossless-layout`, which the placement hears and dies of, naming
-/// it. One Metal keeps uncompressed, whose samples the runtime lays out in the heap's bytes as
-/// Metal's tiles, is made: 16 by 16 with `allowGPUOptimizedContents` off, and 16 by 4, whose
-/// sample grid is 32 by 8. Metal makes each in the same heap. No suite case and no boot is known
-/// to place one
-#[test]
-fn multisampled_textures_in_a_heap_over_guest_pages_die_where_metal_compresses_them() {
-    use crate::core::platform::os::vm::HostVm as _;
-    use crate::core::platform::types::ResourceAddressRange;
-    use crate::os::OsVm;
-
-    const SIZE: u64 = 0x10000;
-
-    /// A `Shared` heap of `SIZE` bytes over pages of its own, and a 4-sample `RGBA8Unorm`
-    /// render target of its options, 16 texels wide and `height` tall, its
-    /// `allowGPUOptimizedContents` `allow`.
-    fn heap_and_texture<P: Platform>(
-        p: &P,
-        d: &P::Device,
-        (height, allow): (u64, Option<bool>),
-    ) -> (P::Heap, P::TextureDescriptor) {
-        // Left mapped: the heap's alias shares them until the process ends.
-        let pages = OsVm::new().allocate_anywhere(SIZE).unwrap();
-        let ranges = p
-            .new_address_range_array(&[ResourceAddressRange {
-                address: u64::try_from(pages.addr()).unwrap(),
-                length: SIZE,
-            }])
-            .unwrap();
-        let heap = d
-            .new_heap(&HeapDesc {
-                size: SIZE,
-                heap_type: 1,
-                options: vec![OptionSet::StorageMode(0), OptionSet::HazardTrackingMode(0)],
-                address_ranges: Some(&ranges),
-                pinned_gpu_address: None,
-            })
-            .unwrap()
-            .heap
-            .unwrap();
-        let multisample = p.texture_descriptor(&TextureDesc {
-            pixel_format: 70,
-            texture_type: 4,
-            sample_count: 4,
-            width: 16,
-            height,
-            usage: 0x4,
-            resource_options: Some(heap.resource_options()),
-            allow_gpu_optimized_contents: allow,
-            ..TextureDesc::default()
-        });
-        (heap, multisample)
-    }
-
-    let compressed = (16, None);
-    let uncompressed = [(16, Some(false)), (4, None)];
-    let (p, d) = (platform(), dev());
-    let (heap, multisample) = heap_and_texture(&p, &d, compressed);
-    *crate::answer::LAST_LINE.lock() = None;
-    let site = catch_death(|| heap.new_texture(&multisample, 0).is_ok()).unwrap_err();
-    let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-    assert_eq!(
-        (site.kind, site.file),
-        (DeathKind::Abort, "newTextureWithDescriptor:offset:"),
-        "{line}"
-    );
-    assert!(line.contains("heap-texture-lossless-layout"), "{line}");
-    for shape in uncompressed {
-        let (heap, multisample) = heap_and_texture(&p, &d, shape);
-        *crate::answer::LAST_LINE.lock() = None;
-        let made = catch_death(|| heap.new_texture(&multisample, 0).unwrap().is_some());
-        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-        assert!(matches!(made, Ok(true)), "{shape:?}: {line}");
-    }
-}
-
 /// A depth or stencil texture without allowGPUOptimizedContents placed in a heap, which the
 /// runtime sizes as Metal does (`heap_depth_stencil_sizes_with_optimized_contents_off`). In a
-/// heap over no address ranges, core's legacy heap, one is made, laid out in Metal's tiles on
+/// heap of the device's memory, core's legacy heap, one is made, laid out in Metal's tiles on
 /// MoltenVK, in the driver's layout on any other driver, which the runtime announces
 /// (`legacy_heap_textures_announce_the_runtimes_layouts`): a `Depth32Float` one and the suite's (a
 /// 2D `Depth32Float_Stencil8` render target, 8x8, as `render_state_depth` and four more cases
@@ -3835,7 +3732,7 @@ fn multisampled_textures_in_a_heap_over_guest_pages_die_where_metal_compresses_t
 /// 128x128 one at 0 (Metal's 65536 bytes), one off Metal's alignment (a 16x16 one at 0x40) and
 /// one past the heap's end, as Metal answers in a heap of its own. A buffer over
 /// all of the heap, as core makes with each heap, is made first. In a `Shared` heap over the
-/// guest's pages, as core's detach heap is, with no such buffer, a `Depth32Float` one is made,
+/// guest's pages, with no such buffer, a `Depth32Float` one is made,
 /// and so are a buffer and a texture over a byte of it while it lives (a `BGRA8Unorm` one, which
 /// the runtime lays out in the device's rows there, `heap-texture-untiled-layout`, relayed), and
 /// such a texture over a byte of a buffer that lives. Metal makes each made here or dying here. On a device that clamps
@@ -4461,7 +4358,6 @@ where
             size: 1 << 20,
             heap_type: 1,
             options: vec![OptionSet::StorageMode(2)],
-            address_ranges: None,
             pinned_gpu_address: None,
         })
         .unwrap()
@@ -4789,7 +4685,7 @@ fn texture_identifiers_are_reissued_as_metals() {
 /// A format's block: its bytes, and its width and height in texels.
 type FormatBlock = (u64, (u64, u64));
 
-/// A texture's shape, placed in a heap over no address ranges by [`legacy_heap_bytes_on`].
+/// A texture's shape, placed in a heap of the device's memory by [`legacy_heap_bytes_on`].
 #[derive(Clone, Copy, Debug)]
 struct LegacyShape {
     format: u64,
@@ -4834,7 +4730,7 @@ impl LegacyShape {
 }
 
 /// What `P`'s device `d` shows of a texture of `shape` at `offset` of a `Private`, untracked
-/// placement heap over no address ranges, made as core makes its legacy heap, with a `Private`
+/// placement heap of the device's memory, made as core makes its legacy heap, with a `Private`
 /// buffer over all of the heap made first, as core's: the texture's size; the heap's bytes over
 /// the texture's span after every level and slice is copied from a `Shared` buffer of one
 /// pattern, read through the heap's buffer, as core copies them to the guest's pages; then each
@@ -5054,7 +4950,7 @@ fn on_moltenvk(d: &VulkanDevice) -> bool {
 
 /// A texture of one sample and a colour format that Metal keeps uncompressed (without
 /// `allowGPUOptimizedContents`, at a level 0 whose shorter side is under 16 texels, or of an
-/// unknown usage or of `ShaderWrite`, `PixelFormatView` or `ShaderAtomic` usage), placed in a heap over no address ranges with a buffer over all of
+/// unknown usage or of `ShaderWrite`, `PixelFormatView` or `ShaderAtomic` usage), placed in a heap of the device's memory with a buffer over all of
 /// the heap first, as core makes its legacy heap, is made on MoltenVK, and the heap's bytes over
 /// it are Metal's both ways ([`legacy_heap_bytes_on`]): the bytes copied out after its texels
 /// are written, and the texels read after other bytes are copied in, byte for byte. Of every
@@ -5165,7 +5061,7 @@ fn legacy_heap_one_plane_textures_are_metals() {
 }
 
 /// A depth or stencil texture of one sample without `allowGPUOptimizedContents`, placed in a heap
-/// over no address ranges with a buffer over all of the heap first, as core makes its legacy
+/// of the device's memory with a buffer over all of the heap first, as core makes its legacy
 /// heap, is made on MoltenVK, laid out in Metal's tiles, and the heap's bytes over it are Metal's
 /// both ways ([`legacy_heap_bytes_on`]), with nothing announced of its layout: `Depth16Unorm`
 /// and `Stencil8` render targets of 8x8, 37x5, 64x64 and 100x70, a 3-level 64x64 one and a
@@ -5209,7 +5105,7 @@ fn legacy_heap_depth_textures_are_metals_where_metal_keeps_them_plain() {
     }
 }
 
-/// A texture placed in a heap over no address ranges whose bytes the runtime does not lay out
+/// A texture placed in a heap of the device's memory whose bytes the runtime does not lay out
 /// there as Metal's is made where Metal makes it, and the runtime announces its layout, which is
 /// relayed: one Metal may keep losslessly compressed (`heap-texture-lossless-layout`), whether
 /// its bytes are Metal's (`RGBA8Unorm`, a 64x64 render target, 16x16 read textures) or not (an

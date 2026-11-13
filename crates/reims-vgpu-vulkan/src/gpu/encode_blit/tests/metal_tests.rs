@@ -434,7 +434,6 @@ fn two_plane_copy_on<P: crate::core::platform::Platform>(
             size: 1 << 20,
             heap_type: 1,
             options: vec![OptionSet::StorageMode(2)],
-            address_ranges: None,
             pinned_gpu_address: None,
         });
         made.unwrap().heap.unwrap()
@@ -691,7 +690,6 @@ fn two_plane_copy_into_heap_on<P: crate::core::platform::Platform>(
                 OptionSet::StorageMode(storage),
                 OptionSet::HazardTrackingMode(0),
             ],
-            address_ranges: None,
             pinned_gpu_address: None,
         })
         .unwrap()
@@ -2351,7 +2349,6 @@ fn two_plane_heap_fill_on<P: crate::core::platform::Platform>(
                 OptionSet::StorageMode(storage),
                 OptionSet::HazardTrackingMode(0),
             ],
-            address_ranges: None,
             pinned_gpu_address: None,
         })
         .unwrap()
@@ -3145,7 +3142,6 @@ fn two_plane_heap_texture_fill_on<P: crate::core::platform::Platform>(
             size: 0x20000,
             heap_type: 1,
             options: vec![OptionSet::StorageMode(0), OptionSet::HazardTrackingMode(0)],
-            address_ranges: None,
             pinned_gpu_address: None,
         })
         .unwrap()

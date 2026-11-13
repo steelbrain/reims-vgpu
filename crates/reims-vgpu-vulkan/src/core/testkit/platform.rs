@@ -11,7 +11,6 @@
 //! p.world().complete_all(CompleteOn::Thread);                   // the GPU finishes
 //! ```
 
-use crate::core::num::ToU64;
 use crate::core::testkit::script::Policy;
 use std::sync::Arc;
 
@@ -28,7 +27,7 @@ use super::vm::FakeVm;
 use crate::core::platform::os::Threads;
 use crate::core::platform::os::surface::IoSurfaces;
 use crate::core::platform::os::vm::HostVm;
-use crate::core::platform::types::{MtlSize, ResourceAddressRange};
+use crate::core::platform::types::MtlSize;
 use crate::core::platform::values::{RateMapDesc, TextureDesc};
 use crate::core::platform::{Handle, ObjId, Platform};
 use crate::core::raise::{OnFault, RaiseResult};
@@ -200,7 +199,6 @@ impl Platform for FakePlatform {
     type RenderPassDescriptor = Fk<kind::RenderPassDescriptor>;
     type RateMapDescriptor = Fk<kind::RateMapDescriptor>;
     type RateMapLayerDescriptor = Fk<kind::RateMapLayerDescriptor>;
-    type AddressRangeArray = Fk<kind::AddressRangeArray>;
     type Surface = Fk<kind::Surface>;
     type Clock = VirtualClock;
 
@@ -272,20 +270,6 @@ impl Platform for FakePlatform {
         step.create(Policy::On(on), sel, || {
             super::impls::rate_map::new_layer(&self.world, sample_count)
         })
-    }
-
-    fn new_address_range_array(
-        &self,
-        ranges: &[ResourceAddressRange],
-    ) -> RaiseResult<Self::AddressRangeArray> {
-        let sel = "initWithRanges:count:";
-        let step = self.class_call(
-            "MTLResourceAddressRangeArray",
-            sel,
-            vec![Arg::val(ranges), Arg::U64(ranges.len().to_u64())],
-        );
-        step.throws(Policy::Caught, sel)?;
-        Ok(self.world.new_obj(Model::Ranges(ranges.to_vec())))
     }
 
     /// A fresh descriptor, then the value's setters ([`Fk::apply`]).
@@ -420,7 +404,7 @@ mod tests {
         );
     }
 
-    /// Layers and range arrays; trace switch; services are reachable
+    /// Layers; trace switch; services are reachable
     #[test]
     fn misc() {
         let p = FakePlatform::new();
@@ -430,13 +414,6 @@ mod tests {
             .unwrap();
         assert_eq!(l.sample_count(), MtlSize::new(3, 2, 1));
         assert!(!l.horizontal_sample_storage().is_null());
-        let r = p
-            .new_address_range_array(&[ResourceAddressRange {
-                address: 1,
-                length: 2,
-            }])
-            .unwrap();
-        assert!(matches!(&r.state().model, Model::Ranges(v) if v.len() == 1));
         assert_eq!(
             p.vm().page_size(),
             crate::core::testkit::guest_ram::PAGE_SIZE

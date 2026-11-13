@@ -1,51 +1,35 @@
-//! Buffers and heaps over the guest's pages: the alias a heap over address ranges is made over
-//! (`setAddressRanges:`), and the one the buffers over a surface lie in ([`Alias`]); and the
-//! guest's pages and the read-only bit each object keeps ([`Backing`]).
+//! The alias the buffers over a surface lie in, of the surface's pages ([`Alias`]), and the
+//! read-only bit each buffer and heap keeps ([`Backing`]).
 //!
-//! - **An alias per object.** The ranges' pages are remapped, shared, into a fresh range of this
-//!   platform's own (`mach_vm_remap`, one call per run of host-contiguous ranges), and the
-//!   runtime is given that range with a keep-alive that frees it (`new_heap_with_bytes_no_copy`,
-//!   [`keep_alive`]), and no deallocator: no one but this platform sees the alias go. A write
-//!   through the alias shows in the guest's pages and one through the guest's pages in the alias,
-//!   so the GPU's writes land in the guest's memory at once and it reads the guest's latest bytes,
-//!   as Metal's do. The runtime keeps an alias, and so the pages under it, until every command
-//!   buffer committed with it completed and it freed its import of them, which it does before it
-//!   drops the keep-alive: the object's release never takes pages a committed command buffer
-//!   still uses or the device still imports, and the guest's memory stays mapped under it
-//!   whatever the guest's own mapping does meanwhile. The runtime keeps the pages a range had
-//!   when it imported them (`tests/no_copy_remap.rs`).
-//! - **Ranges off whole pages.** Core's ranges are whole pages, each starting on a page; Metal
-//!   takes others, and this platform takes them as Metal does (measured on the M3 Max, macOS 26.7,
-//!   `tests/address_ranges.rs`'s `unaligned`): ranges whose bytes follow on from the previous
-//!   range's are one run of bytes, and each run of bytes takes the pages it lies in, whole, from
-//!   the page of its first byte through the page of its last ([`spans`]). A range of part of a
-//!   page takes all of it, the page's bytes past the range included (the CPU and the GPU read
-//!   them, and the GPU's fill writes them), and a later range starting off its page takes it from
-//!   the page's start. A first range starting off its page dies where it is given
-//!   ([`off_the_page`]): Metal's `contents` answers its bytes from the range's own address, and
-//!   its GPU reads and writes them from its page's start, which no alias gives at once.
-//! - **Read-only.** A read-only alias (of an object made with `MTLResourceOptions` bit 24) has
-//!   its maximum protection lowered to read (`mach_vm_protect` with `set_maximum`), as Metal's
-//!   alias of read-only memory over several ranges is (measured: current and maximum protection
-//!   read). The GPU's writes never reach such pages, and the command buffer completes: later
-//!   commands of the same command buffer read what it wrote, and a later command buffer the
-//!   guest's bytes, as on Metal (blit fills, measured on Metal; kernel stores are dropped alike
-//!   on Metal). On Linux the runtime makes the object over a copy of such an alias's pages, or of
-//!   a no-copy object's pages made with bit 24 or mapped read-only, whose GPU writes it drops, as
-//!   the views' gate refuses read-only pages (`crate::os::import_view`): a shader's, a blit's
-//!   into a buffer and a visibility result's are sent, and dropped as Metal's are, while a pass's
-//!   store into the object's memory and a write of a texture over it are answered where they are
+//! - **An alias per surface.** The surface's pages are remapped, shared, into a fresh range of
+//!   this platform's own (`mach_vm_remap`, one call per run of host-contiguous pages), and the
+//!   runtime is given that range with a keep-alive that frees it ([`keep_alive`]), and no
+//!   deallocator: no one but this platform sees the alias go. A write through the alias shows in
+//!   the guest's pages and one through the guest's pages in the alias, so the GPU's writes land
+//!   in the guest's memory at once and it reads the guest's latest bytes, as Metal's do. The
+//!   runtime keeps an alias, and so the pages under it, until every command buffer committed with
+//!   it completed and it freed its import of them, which it does before it drops the keep-alive:
+//!   the buffer's release never takes pages a committed command buffer still uses or the device
+//!   still imports, and the guest's memory stays mapped under it whatever the guest's own mapping
+//!   does meanwhile. The runtime keeps the pages a range had when it imported them
+//!   (`tests/no_copy_remap.rs`).
+//! - **Whole pages.** The alias takes the pages its ranges lie in, whole: ranges whose bytes
+//!   follow on from the previous range's are one run of bytes, and each run of bytes takes the
+//!   pages it lies in, from the page of its first byte through the page of its last ([`spans`]).
+//!   A first range starting off its page dies where it is given ([`off_the_page`]).
+//! - **Read-only.** A read-only alias (of a surface the GPU only reads) has its maximum
+//!   protection lowered to read (`mach_vm_protect` with `set_maximum`), as Metal's alias of
+//!   read-only memory over several ranges is (measured: current and maximum protection read).
+//!   The GPU's writes never reach such pages, and the command buffer completes: later commands
+//!   of the same command buffer read what it wrote, and a later command buffer the guest's
+//!   bytes, as on Metal (blit fills, measured on Metal; kernel stores are dropped alike on
+//!   Metal). On Linux the runtime imports a surface's read-only alias through a writable twin
+//!   ([`ImportSite::twins`]), and makes a no-copy buffer or heap made with `MTLResourceOptions`
+//!   bit 24 or over pages mapped read-only over a copy of them, whose GPU writes it drops, as the
+//!   views' gate refuses read-only pages (`crate::os::import_view`): a shader's, a blit's into a
+//!   buffer and a visibility result's are sent, and dropped as Metal's are, while a pass's store
+//!   into the object's memory and a write of a texture over it are answered where they are
 //!   encoded ([`Backing::read_only_now`], `crate::gpu::writes`).
-//!
-//! What Metal answers, measured on the M3 Max (macOS 26.7, 25G229), and this platform with it:
-//! - **A heap over address ranges** is made over ranges of any total, shorter or longer than its
-//!   size: this platform's heap takes the ranges' pages up to its size, and zero-filled pages of
-//!   its own past them. None is made over an empty array or a NULL or unmapped range, or one
-//!   with a page mapped without access, past its size too, nor of size 0. Read-only pages make
-//!   one, read-only or not (`tests/address_ranges.rs`, `pages_without_access`).
-//! - **`contents`** answers the alias: the bytes are the guest's either way, and the address is
-//!   the host's alone. Metal's differs in where it points: the buffers of a heap made over one
-//!   range answer their offsets in that range.
 
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,117 +50,16 @@ use crate::os::OsVm;
 /// covers all of it.
 pub(crate) const HEAP_GRANULE: u64 = 0x4000;
 
-/// The guest's pages a buffer or heap lies in, and the read-only bit it was made with, which
-/// every alias it takes keeps.
+/// The read-only bit a buffer or heap was made with, and whether the memory it lies in is
+/// read-only.
 #[derive(Debug)]
 pub struct Backing {
     read_only: bool,
     /// Whether the memory the object lies in is read-only where the runtime does not import
-    /// read-only memory as it is mapped ([`crate::os::COPIES_READ_ONLY`]): the alias of the
-    /// ranges a heap was made over with bit 24, or the memory a no-copy buffer or heap was made
-    /// over, mapped read-only or made with bit 24; counted while it holds
+    /// read-only memory as it is mapped ([`crate::os::COPIES_READ_ONLY`]): the memory a no-copy
+    /// buffer or heap was made over, mapped read-only or made with bit 24; counted while it holds
     /// ([`crate::gpu::writes::set_kept`]).
     kept: AtomicBool,
-    /// The guest's pages the object's memory is over, which work encoded reads without the
-    /// object ([`crate::gpu::writes::Kept`]).
-    pages: Arc<Pages>,
-}
-
-/// The guest's pages a buffer's or heap's memory is over, as the host maps them, which its
-/// [`Backing`] keeps and work encoded reads without the object ([`crate::gpu::writes::Kept`]): a
-/// reference that revived a heap or buffer could run its release on the thread that reads.
-#[derive(Debug, Default)]
-pub struct Pages {
-    /// The pages.
-    paged: Mutex<Paged>,
-    /// Whether it is over the guest's pages: `paged` has pages. Written with `paged` locked, and
-    /// read without it, as each bind asks.
-    guests: AtomicBool,
-}
-
-/// The runs of [`Pages`].
-#[derive(Debug, Default)]
-struct Paged {
-    /// The guest's pages, as the host maps them (each a first byte and an end): those of the
-    /// address ranges a heap was made over.
-    pages: Vec<std::ops::Range<u64>>,
-    /// Where each of `pages` ends in the object's bytes, laid out over them in their order: the
-    /// lengths up to it added up, so the run holding an object's byte is found by a search, not
-    /// a walk from the first (a heap over scattered pages holds a run a page).
-    ends: Vec<u64>,
-}
-
-impl Paged {
-    /// `pages`, laid out in their order.
-    fn of(pages: Vec<std::ops::Range<u64>>) -> Paged {
-        let ends = (pages.iter())
-            .scan(0u64, |at, run| {
-                *at = at.saturating_add(run.end - run.start);
-                Some(*at)
-            })
-            .collect();
-        Paged { pages, ends }
-    }
-
-    /// The host ranges that hold the object's bytes `bytes`, as a walk of `pages` from the first
-    /// finds them (`os::surface::in_runs`), from the first run whose end lies past `bytes`' start.
-    fn in_runs(&self, bytes: &std::ops::Range<u64>) -> Vec<std::ops::Range<u64>> {
-        let first = self.ends.partition_point(|&end| end <= bytes.start);
-        let mut held = Vec::new();
-        let mut at = first
-            .checked_sub(1)
-            .and_then(|before| self.ends.get(before).copied())
-            .unwrap_or(0);
-        for (run, &end) in self.pages.iter().zip(&self.ends).skip(first) {
-            if at >= bytes.end {
-                break;
-            }
-            let (from, to) = (bytes.start.max(at), bytes.end.min(end));
-            if from < to {
-                held.push(run.start + (from - at)..run.start + (to - at));
-            }
-            at = end;
-        }
-        held
-    }
-
-    /// Whether [`Paged::in_runs`] finds any of `bytes`: the runs, laid out one after another,
-    /// hold the object's bytes from 0 to the last run's end, so whether `bytes` meet those.
-    fn meets(&self, bytes: &std::ops::Range<u64>) -> bool {
-        let total = self.ends.last().copied().unwrap_or(0);
-        bytes.start < bytes.end && bytes.start < total
-    }
-}
-
-impl Pages {
-    /// The object is over `pages` from now on.
-    fn set(&self, pages: Vec<std::ops::Range<u64>>) {
-        let guests = !pages.is_empty();
-        let mut paged = self.paged.lock();
-        *paged = Paged::of(pages);
-        self.guests.store(guests, Ordering::Release);
-    }
-
-    /// The host memory of the object's bytes `bytes` in the guest's pages it is over, read under
-    /// its lock with no copy of the pages; `None` for one over memory of its own, answered
-    /// without the lock.
-    fn in_pages(&self, bytes: &std::ops::Range<u64>) -> Option<Vec<std::ops::Range<u64>>> {
-        if !self.guests.load(Ordering::Acquire) {
-            return None;
-        }
-        let paged = self.paged.lock();
-        (!paged.pages.is_empty()).then(|| paged.in_runs(bytes))
-    }
-
-    /// Whether [`Pages::in_pages`] finds any memory of `bytes`, read as it reads it, with nothing
-    /// collected; `None` where it answers `None`.
-    fn meets_pages(&self, bytes: &std::ops::Range<u64>) -> Option<bool> {
-        if !self.guests.load(Ordering::Acquire) {
-            return None;
-        }
-        let paged = self.paged.lock();
-        (!paged.pages.is_empty()).then(|| paged.meets(bytes))
-    }
 }
 
 impl Backing {
@@ -186,16 +69,7 @@ impl Backing {
         Backing {
             read_only,
             kept: AtomicBool::new(false),
-            pages: Arc::default(),
         }
-    }
-
-    /// The object, a heap, was made over the alias of `ranges` of the guest's pages
-    /// ([`Backing::in_pages`]), read-only where it was made with bit 24 ([`gather_or_nil`]).
-    pub(crate) fn made_over(&self, ranges: &[ResourceAddressRange]) {
-        let kept = crate::os::COPIES_READ_ONLY && self.read_only;
-        crate::gpu::writes::set_kept(&self.kept, kept);
-        self.pages.set(pages(ranges));
     }
 
     /// The object, a no-copy buffer or heap, was made over memory of the caller's that is
@@ -219,30 +93,9 @@ impl Backing {
     /// object is encoded ([`crate::gpu::writes::Kept`]).
     pub(crate) fn kept(&self) -> crate::gpu::writes::Kept {
         match self.read_only_now() {
-            true => crate::gpu::writes::Kept::Copied(Arc::clone(&self.pages)),
+            true => crate::gpu::writes::Kept::Copied,
             false => crate::gpu::writes::Kept::No,
         }
-    }
-
-    /// The host memory of the object's bytes `bytes` in the guest's pages its memory is over, as
-    /// the host maps them (each a first byte and an end): those of the address ranges a heap was
-    /// made over; `None` for one over memory of its own ([`Pages::in_pages`]).
-    pub(crate) fn in_pages(
-        &self,
-        bytes: &std::ops::Range<u64>,
-    ) -> Option<Vec<std::ops::Range<u64>>> {
-        self.pages.in_pages(bytes)
-    }
-
-    /// Whether [`Backing::in_pages`] finds any memory of `bytes`, with nothing collected
-    /// ([`Pages::meets_pages`]).
-    pub(crate) fn meets_pages(&self, bytes: &std::ops::Range<u64>) -> Option<bool> {
-        self.pages.meets_pages(bytes)
-    }
-
-    /// Whether the object is over the guest's pages: a heap made over address ranges.
-    pub(crate) fn over_guest_pages(&self) -> bool {
-        self.pages.guests.load(Ordering::Acquire)
     }
 }
 
@@ -251,19 +104,6 @@ impl Drop for Backing {
     fn drop(&mut self) {
         crate::gpu::writes::set_kept(&self.kept, false);
     }
-}
-
-/// The host's pages `ranges` lie in, in their order, as an alias of them maps them ([`spans`]),
-/// each a first byte and an end, those that meet merged.
-fn pages(ranges: &[ResourceAddressRange]) -> Vec<std::ops::Range<u64>> {
-    let mut runs: Vec<std::ops::Range<u64>> = Vec::new();
-    for span in spans(ranges, OsVm::new().page_size()).unwrap_or_default() {
-        match runs.last_mut() {
-            Some(run) if run.end == span.start => run.end = span.end,
-            _ => runs.push(span),
-        }
-    }
-    runs
 }
 
 /// A range of this platform's address space whose pages are the guest's, shared, and zeros past
@@ -392,7 +232,7 @@ pub(crate) enum ImportSite {
     NoCopyDescriptor,
     /// A buffer over a surface's alias.
     Surface,
-    /// A heap over guest ranges.
+    /// A heap over host memory (`new_heap_over_host_memory`).
     Heap,
     /// A buffer over a surface, at its base address.
     SurfaceBase,
@@ -407,8 +247,8 @@ impl ImportSite {
     /// each commit would miss while that writer runs.
     ///
     /// Elsewhere the runtime copies such memory, dropping the GPU's writes, as Metal drops them:
-    /// the guest's read-only objects (a heap over address ranges or a no-copy buffer or heap made
-    /// with bit 24), and a no-copy buffer or heap over pages mapped read-only.
+    /// the guest's read-only objects (a no-copy buffer or heap made with bit 24), and a no-copy
+    /// buffer or heap over pages mapped read-only.
     pub(crate) fn twins(self) -> bool {
         matches!(self, Self::Surface)
     }
@@ -548,10 +388,9 @@ pub(crate) fn runs(
 /// The death at `sel` of address ranges whose first starts at `address`, `into` bytes into its
 /// page ([`runs`]). Metal's `contents` answers the range's bytes from its own address, and its
 /// GPU reads and writes them from the start of its page, `into` bytes before it (measured on the
-/// M3 Max, macOS 26.7: one range from 0x40 and from 0x1000 into its page, a heap's,
-/// `tests/address_ranges.rs`); a buffer of the runtime's has one address for
-/// the CPU and the GPU, the first byte of the memory it imports, so no alias of this platform's
-/// gives both.
+/// M3 Max, macOS 26.7: one range from 0x40 and from 0x1000 into its page, a heap's); a buffer of
+/// the runtime's has one address for the CPU and the GPU, the first byte of the memory it
+/// imports, so no alias of this platform's gives both.
 fn off_the_page(sel: &'static str, address: u64, into: u64) -> ! {
     unrepresentable(
         sel,
@@ -570,8 +409,8 @@ fn off_the_page(sel: &'static str, address: u64, into: u64) -> ! {
 /// unmapped range, one with a page the host maps without read access, which the runtime refuses
 /// to import, past `size` too). Where the host refuses the alias what it needs past those checks
 /// (address space, a remap of the guest's pages, which on Linux takes pages with a file behind
-/// them, the block of zeros, a protection), the call it is for (a buffer over a surface, a heap
-/// over address ranges) answers nil, as Metal's does when memory runs out, nothing left mapped
+/// them, the block of zeros, a protection), the call it is for, a buffer over a surface, answers
+/// nil, as Metal's does when memory runs out, nothing left mapped
 /// (`crate::answer::out_of_host_memory`, counted; in strict mode the process ends at `sel`).
 ///
 /// Where the runtime imports a surface's read-only alias through a writable twin of its files
@@ -761,7 +600,7 @@ mod tests {
     use crate::os::PAGE;
 
     /// The selector the tests' gathers are for.
-    const SEL: &str = "newHeapWithDescriptor:";
+    const SEL: &str = "newBufferWithIOSurface:";
 
     fn range(address: u64, length: u64) -> ResourceAddressRange {
         ResourceAddressRange { address, length }
@@ -839,8 +678,7 @@ mod tests {
     /// Each run of ranges whose bytes follow on takes the pages it lies in, whole, as Metal maps
     /// them: a range of part of a page all of it, before another too, and a later range starting
     /// off its page from the page's start, through the page of its last byte; up to the size,
-    /// those that follow on in the host's memory one remap: the shapes `tests/address_ranges.rs`
-    /// compares with Metal's (its `unaligned_shape`'s 2 to 7), and more
+    /// those that follow on in the host's memory one remap
     #[test]
     fn runs_take_the_pages_each_run_of_bytes_lies_in() {
         let g = 0x10_0000;
@@ -938,7 +776,7 @@ mod tests {
         let guest = pages(3, 0);
         for (into, sel) in [
             (0x40, "newBufferWithIOSurface:"),
-            (PAGE / 4, "newHeapWithDescriptor:"),
+            (PAGE / 4, "newBufferWithIOSurface:"),
         ] {
             let ranges = [range(address(guest) + into, 2 * PAGE)];
             *crate::answer::LAST_LINE.lock() = None;
@@ -1069,84 +907,5 @@ mod tests {
         assert!(!crate::os::writable(at, alias.length), "writable");
         drop(alias);
         assert!(OsVm::new().deallocate(guest, PAGE).is_success());
-    }
-
-    /// The length of a run of pages in [`Pages`]' tests.
-    const RUN: u64 = 0x4000;
-
-    /// Whether an object's bytes meet its pages is what its memory there answers: none over memory
-    /// of its own, and whether any of them lie in its pages
-    #[test]
-    fn meeting_pages_is_whether_the_bytes_lie_in_them() {
-        let pages = Arc::new(Pages::default());
-        let all = [
-            0..0,
-            0..1,
-            0..RUN,
-            RUN - 1..RUN + 1,
-            2 * RUN..3 * RUN,
-            3 * RUN..4 * RUN,
-        ];
-        let agree = |pages: &Pages| {
-            for bytes in &all {
-                let memory = pages.in_pages(bytes).map(|ranges| !ranges.is_empty());
-                assert_eq!(pages.meets_pages(bytes), memory, "{bytes:x?}");
-            }
-        };
-        agree(&pages);
-        assert_eq!(pages.meets_pages(&(0..RUN)), None);
-        pages.set(vec![
-            0x10_0000..0x10_0000 + RUN,
-            0x30_0000..0x30_0000 + 2 * RUN,
-        ]);
-        agree(&pages);
-        assert_eq!(pages.meets_pages(&(RUN - 1..RUN + 1)), Some(true));
-        assert_eq!(pages.meets_pages(&(3 * RUN..4 * RUN)), Some(false));
-    }
-
-    /// An object's bytes are found in its pages by a search from the run that holds their first
-    /// byte, as a walk of the runs from the first finds them: in each run they reach, in order, at
-    /// each run's edges, past their end, over runs of no length, and for no bytes; and they meet
-    /// the pages where that finds any
-    #[test]
-    #[expect(clippy::single_range_in_vec_init, reason = "lists of host ranges")]
-    fn bytes_in_pages_are_found_by_a_search_as_by_a_walk() {
-        let scattered: Vec<std::ops::Range<u64>> = (0..64u64)
-            .map(|i| {
-                let at = 0x100_0000 + ((i * 37) % 64) * 2 * RUN;
-                at..at + RUN * (1 + i % 3)
-            })
-            .collect();
-        let lists = [
-            vec![
-                0x10_000..0x14_000,
-                0x50_000..0x50_000,
-                0x40_000..0x48_000,
-                0x20_000..0x24_000,
-            ],
-            vec![0x10_000..0x14_000],
-            vec![0x50_000..0x50_000],
-            vec![],
-            scattered,
-        ];
-        for runs in lists {
-            let paged = Paged::of(runs.clone());
-            let total: u64 = runs.iter().map(|r| r.end - r.start).sum();
-            let mut edges = vec![0, 1, 0x3fff, 0x4000, 0x4001, 0xbfff, 0xc000, 0xffff];
-            edges.extend([total.saturating_sub(1), total, total + 1]);
-            edges.extend((1..12).map(|i| i * total / 11 + i % 3));
-            for &start in &edges {
-                for &end in &edges {
-                    let bytes = start..end;
-                    let walked = crate::os::in_runs(&runs, &bytes);
-                    assert_eq!(
-                        paged.meets(&bytes),
-                        !walked.is_empty(),
-                        "{runs:x?} {bytes:x?}"
-                    );
-                    assert_eq!(paged.in_runs(&bytes), walked, "{runs:x?} {bytes:x?}");
-                }
-            }
-        }
     }
 }

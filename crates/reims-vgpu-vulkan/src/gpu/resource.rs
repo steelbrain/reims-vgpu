@@ -1947,10 +1947,9 @@ impl Heap<VulkanPlatform> for VulkanHeap {
     /// answers nil, dies, and so does one the runtime answers fewer bytes for than Metal's, whose
     /// range would end before Metal's texture does.
     ///
-    /// In a heap over no address ranges, core's legacy heap, whose bytes core copies to and from
-    /// the guest's pages, what the runtime announces of a texture's layout there
+    /// What the runtime announces of a texture's layout in the heap
     /// (`heap-texture-untiled-layout`, `heap-texture-lossless-layout`), its bytes in the heap's
-    /// memory not Metal's, is relayed alone ([`Placements`]).
+    /// memory not Metal's, is relayed alone, in every heap ([`Placements`]).
     fn new_texture(
         &self,
         descriptor: &VulkanTextureDescriptor,
@@ -1986,21 +1985,6 @@ impl Heap<VulkanPlatform> for VulkanHeap {
         }
         made.map(|t| {
             t.map(|raw| {
-                // Over the guest's pages alone: in a legacy heap, over the device's memory, what
-                // the runtime announces of the texture's layout there is relayed alone.
-                let lossless = heard.contains(&rt::Degradation::HeapTextureLosslessLayout)
-                    && self.backing.over_guest_pages();
-                if lossless && desc.sample_count > 1 {
-                    crate::answer::inexact(sel, crate::answer::Inexact::HeapLayout, || {
-                        format!(
-                            "a {}-sample texture in a heap that Metal keeps losslessly \
-                             compressed, whose image the runtime keeps in memory of its own, \
-                             where Metal's lies in the heap's bytes, so a buffer or texture over \
-                             them would neither see nor change it (heap-texture-lossless-layout)",
-                            desc.sample_count
-                        )
-                    });
-                }
                 // Its bytes in the heap, the size the runtime placed it by, which its
                 // `allocatedSize` answers with no query; the rest of the heap where it has none.
                 let size = plain(|| raw.allocated_size());
@@ -3012,7 +2996,6 @@ pub(crate) mod tests {
                 size: 0x4000,
                 heap_type: 0,
                 options: vec![OptionSet::StorageMode(storage)],
-                address_ranges: None,
                 pinned_gpu_address: Some(held.gpu_address()),
             })
         };
@@ -3066,7 +3049,6 @@ pub(crate) mod tests {
                 size: 0x8000,
                 heap_type: 0,
                 options: vec![OptionSet::StorageMode(0)],
-                address_ranges: None,
                 pinned_gpu_address,
             })
             .unwrap()
@@ -3571,7 +3553,7 @@ pub(crate) mod tests {
     /// and the three-level `RGBA16Float` render targets the macOS 26 boots asked the size of,
     /// with `BlockWritesOnly` and without ([`LOSSLESS_MIPMAPPED_SHAPES`]). A texture
     /// of its own memory of each is made, and so is its placement in a heap of the query's size,
-    /// over no address ranges, whose layout there the runtime announces, Metal keeping it
+    /// of the device's memory, whose layout there the runtime announces, Metal keeping it
     /// compressed (`heap-texture-lossless-layout`). On every OS: what is checked
     /// is the runtime's answer and what is made of it, on whatever device; how it compares with
     /// Metal's is `metal_tests`' (`lossless_mipmapped_heap_texture_sizes_are_metals`)
@@ -3609,7 +3591,6 @@ pub(crate) mod tests {
                 size: ours.size,
                 heap_type: 1,
                 options: vec![OptionSet::StorageMode(2)],
-                address_ranges: None,
                 pinned_gpu_address: None,
             });
             let heap = heap.unwrap().heap.unwrap();
@@ -4162,7 +4143,6 @@ pub(crate) mod tests {
                 size: 0x40000,
                 heap_type,
                 options: vec![OptionSet::StorageMode(storage)],
-                address_ranges: None,
                 pinned_gpu_address,
             })
             .unwrap()
@@ -4209,7 +4189,6 @@ pub(crate) mod tests {
             size: 1 << 20,
             heap_type: 1,
             options: vec![OptionSet::StorageMode(2)],
-            address_ranges: None,
             pinned_gpu_address: None,
         });
         let heap = heap.unwrap().heap.unwrap();
@@ -4554,7 +4533,6 @@ pub(crate) mod tests {
                 size,
                 heap_type: 1,
                 options: options.to_vec(),
-                address_ranges: None,
                 pinned_gpu_address: None,
             })
             .unwrap()
@@ -4605,34 +4583,15 @@ pub(crate) mod tests {
         assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
     }
 
-    /// A texture of a plain format of `ShaderWrite` usage placed in a heap over the guest's pages
-    /// is made, and so are one of `BC1_RGBA` and one of a PVRTC format (`PVRTC_RGBA_4BPP`), of
+    /// A texture of a plain format of `ShaderWrite` usage placed in a heap over the guest's memory
+    /// (pages of the test's, as the decoder's `HEAP_OVER_HOST_MEMORY` and `HEAP_OVER_PAGES` give
+    /// it) is made, and so are one of `BC1_RGBA` and one of a PVRTC format (`PVRTC_RGBA_4BPP`), of
     /// `ShaderRead` usage, whose blocks lie in Metal's tiles at every level
     #[test]
     fn heap_textures_over_guest_pages_in_metals_block_layout_are_made() {
-        use crate::core::platform::types::ResourceAddressRange;
-
         const SIZE: u64 = 0x10000;
         let (p, d) = (platform(), dev());
-        // Left mapped: the heap's alias shares them until the process ends.
-        let pages = crate::os::allocate_aliasable(SIZE).unwrap();
-        let ranges = p
-            .new_address_range_array(&[ResourceAddressRange {
-                address: u64::try_from(pages.addr()).unwrap(),
-                length: SIZE,
-            }])
-            .unwrap();
-        let heap = d
-            .new_heap(&HeapDesc {
-                size: SIZE,
-                heap_type: 1,
-                options: vec![OptionSet::StorageMode(0), OptionSet::HazardTrackingMode(0)],
-                address_ranges: Some(&ranges),
-                pinned_gpu_address: None,
-            })
-            .unwrap()
-            .heap
-            .unwrap();
+        let heap = heap_over::<VulkanPlatform>(&d, guest_pages_of(SIZE), SIZE);
         let desc = |pixel_format, usage| {
             p.texture_descriptor(&TextureDesc {
                 pixel_format,
@@ -4646,39 +4605,6 @@ pub(crate) mod tests {
         assert!(heap.new_texture(&desc(70, 0x3), 0).unwrap().is_some());
         assert!(heap.new_texture(&desc(130, 0x1), 0x8000).unwrap().is_some());
         assert!(heap.new_texture(&desc(166, 0x1), 0xc000).unwrap().is_some());
-    }
-
-    /// A writable heap of 4 KiB over a page of the guest's, as of an x86_64 guest's pages, is
-    /// made on every host. The runtime's heap covers 16 KiB
-    /// ([`crate::gpu::backing::HEAP_GRANULE`]), so on a host of 4 KiB pages its alias has zeros
-    /// past the page: on Linux a file of their own, which the runtime imports with the guest's
-    /// page as dma-bufs (`crate::gpu::backing::gather_or_nil`); anonymous zeros beside them would import
-    /// neither as host memory nor as a dma-buf
-    #[test]
-    fn a_heap_over_less_than_its_granule_is_made() {
-        use crate::core::platform::types::ResourceAddressRange;
-
-        const SIZE: u64 = 0x1000;
-        let (p, d) = (platform(), dev());
-        // Left mapped: the heap's alias shares them until the process ends.
-        let pages = crate::os::allocate_aliasable(SIZE).unwrap();
-        let ranges = p
-            .new_address_range_array(&[ResourceAddressRange {
-                address: u64::try_from(pages.addr()).unwrap(),
-                length: SIZE,
-            }])
-            .unwrap();
-        let desc = HeapDesc {
-            size: SIZE,
-            heap_type: 1,
-            options: vec![OptionSet::StorageMode(0), OptionSet::HazardTrackingMode(0)],
-            address_ranges: Some(&ranges),
-            pinned_gpu_address: None,
-        };
-        *crate::answer::LAST_LINE.lock() = None;
-        let made = catch_death(|| d.new_heap(&desc).unwrap().heap.is_some());
-        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-        assert!(matches!(made, Ok(true)), "{line}");
     }
 
     /// The least size of [`heap_over_pages`]' heaps ([`over_pages`]).
@@ -4700,37 +4626,46 @@ pub(crate) mod tests {
         })
     }
 
-    /// The address of [`over_pages`] bytes of pages of their own, left mapped: an alias of a heap
-    /// or buffer over them shares them until the process ends.
+    /// The address of [`over_pages`] bytes of pages of their own, left mapped: a heap or buffer
+    /// over them uses them until the process ends.
     pub(crate) fn guest_pages() -> u64 {
-        let pages = crate::os::allocate_aliasable(over_pages()).unwrap();
+        guest_pages_of(over_pages())
+    }
+
+    /// The address of `size` bytes of pages of their own, left mapped, as [`guest_pages`]'.
+    pub(crate) fn guest_pages_of(size: u64) -> u64 {
+        let pages = crate::os::allocate_aliasable(size).unwrap();
         u64::try_from(pages.addr()).unwrap()
     }
 
-    /// The address range array of the [`over_pages`] bytes at `address`.
-    fn ranges_at<P: Platform>(p: &P, address: u64) -> P::AddressRangeArray {
-        use crate::core::platform::types::ResourceAddressRange;
-        p.new_address_range_array(&[ResourceAddressRange {
-            address,
-            length: over_pages(),
-        }])
-        .unwrap()
-    }
-
-    /// A `Shared` heap of [`over_pages`] bytes over the pages at `address`, made over their
-    /// address range.
-    pub(crate) fn heap_at<P: Platform>(p: &P, d: &P::Device, address: u64) -> P::Heap {
-        let ranges = ranges_at(p, address);
-        d.new_heap(&HeapDesc {
-            size: over_pages(),
-            heap_type: 1,
-            options: vec![OptionSet::StorageMode(0), OptionSet::HazardTrackingMode(0)],
-            address_ranges: Some(&ranges),
-            pinned_gpu_address: None,
-        })
+    /// A `Shared` heap of `size` bytes over the pages at `address` ([`guest_pages_of`]), made
+    /// over them as host memory in place, as the decoder makes a heap over the guest's memory.
+    pub(crate) fn heap_over<P: Platform>(d: &P::Device, address: u64, size: u64) -> P::Heap
+    where
+        P::Device: GpuDevice<P>,
+    {
+        // SAFETY: pages of the test's, left mapped until the process ends.
+        let bytes = unsafe { HostRange::new(HostPtr::from_addr(address.to_usize()), size) };
+        d.new_heap_over_host_memory(
+            bytes,
+            &HeapDesc {
+                size,
+                heap_type: 1,
+                options: vec![OptionSet::StorageMode(0), OptionSet::HazardTrackingMode(0)],
+                pinned_gpu_address: None,
+            },
+        )
         .unwrap()
         .heap
         .unwrap()
+    }
+
+    /// A `Shared` heap of [`over_pages`] bytes over the pages at `address` ([`heap_over`]).
+    pub(crate) fn heap_at<P: Platform>(d: &P::Device, address: u64) -> P::Heap
+    where
+        P::Device: GpuDevice<P>,
+    {
+        heap_over::<P>(d, address, over_pages())
     }
 
     /// A `Shared` heap of [`over_pages`] bytes over pages of its own, a `Depth32Float_Stencil8`
@@ -4752,7 +4687,7 @@ pub(crate) mod tests {
         d: &P::Device,
         address: u64,
     ) -> (P::Heap, P::TextureDescriptor, u64) {
-        let heap = heap_at(p, d, address);
+        let heap = heap_at::<P>(d, address);
         let (depth_stencil, beside) = depth_stencil_of(p, d, &heap);
         (heap, depth_stencil, beside)
     }

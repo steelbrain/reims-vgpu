@@ -88,8 +88,6 @@ pub(crate) use macos::refusing_imports;
 pub(crate) use wsi::seen_devices;
 pub use wsi::{add_window_extensions, present_fences};
 
-#[cfg(test)]
-pub(crate) use surface::in_runs;
 pub(crate) use surface::{
     MadeOver, READ_ONLY_DIRECTION, base_in_pages, dropped_write, gpu_read_only, memory_kind,
     page_runs, plane, plane_facts, surface_alias, surface_bytes_memory, surface_memory,

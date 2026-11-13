@@ -587,19 +587,17 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
     }
 
     /// A heap of the value's size, with its options folded as Metal's heap descriptor folds
-    /// them ([`fold_options`]): memory of its own for a shared or managed heap without address
-    /// ranges.
-    fn new_heap(&self, desc: &HeapDesc<'_, FakePlatform>) -> RaiseResult<HeapMade<FakePlatform>> {
+    /// them ([`fold_options`]): memory of its own for a shared or managed heap.
+    fn new_heap(&self, desc: &HeapDesc) -> RaiseResult<HeapMade<FakePlatform>> {
         let opts = fold_options(&desc.options);
         let (size, pinned) = (desc.size, desc.pinned_gpu_address);
-        let ranges = desc.address_ranges.map(Fk::erase);
         let heap = self.make(
             Policy::Caught,
             "newHeapWithDescriptor:",
             vec![Arg::val(desc)],
             |w| {
                 let storage = opts.wrapping_shr(4) & 0xf;
-                let mem = if storage < 2 && ranges.is_none() && size <= FAKE_MAX_BYTES {
+                let mem = if storage < 2 && size <= FAKE_MAX_BYTES {
                     RawRegion::new(size)
                 } else {
                     None
@@ -609,7 +607,6 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
                     options: opts,
                     gpu_address: pinned.unwrap_or_else(|| w.alloc_gpu_va(size)),
                     mem,
-                    ranges,
                     common: common(w, None),
                 })))
             },
@@ -625,7 +622,7 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
     fn new_heap_over_host_memory(
         &self,
         bytes: HostRange<'_>,
-        desc: &HeapDesc<'_, FakePlatform>,
+        desc: &HeapDesc,
     ) -> RaiseResult<HeapMade<FakePlatform>> {
         let opts = fold_options(&desc.options);
         let (size, pinned) = (desc.size, desc.pinned_gpu_address);
@@ -643,7 +640,6 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
                     options: opts,
                     gpu_address: pinned.unwrap_or_else(|| w.alloc_gpu_va(size)),
                     mem: None,
-                    ranges: None,
                     common: common(w, None),
                 })))
             },

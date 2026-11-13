@@ -55,7 +55,6 @@ fn answers<P: Platform<Surface = OsSurface>>(
             size: 1 << 20,
             heap_type: 1,
             options: vec![OptionSet::StorageMode(2)],
-            address_ranges: None,
             pinned_gpu_address: None,
         })
         .unwrap()
@@ -234,7 +233,6 @@ fn textures_of_formats_metal_makes_none_of_die_where_metal_asserts() {
             size: 1 << 20,
             heap_type: 1,
             options: vec![OptionSet::StorageMode(2)],
-            address_ranges: None,
             pinned_gpu_address: None,
         })
         .unwrap()

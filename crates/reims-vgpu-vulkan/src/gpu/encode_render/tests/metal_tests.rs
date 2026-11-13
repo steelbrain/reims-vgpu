@@ -5561,7 +5561,6 @@ fn untouched_resolves_in_shapes_not_measured_die_named() {
             size: 1 << 20,
             heap_type: 1,
             options: vec![OptionSet::StorageMode(2)],
-            address_ranges: None,
             pinned_gpu_address: None,
         })
         .unwrap()

@@ -27,9 +27,9 @@
 //!   unmeasured for, which refuses the whole state's reflection, leaves every other slot answered.
 //!   A function's write through an address it loads (an argument buffer's, a pointer's) into such
 //!   an object not made resident for writing names nothing and is not seen: it reaches the pages.
-//! - **The guest's read-only objects** (a heap made with `MTLResourceOptions` bit 24 over address
-//!   ranges, a no-copy buffer or heap made with it or over pages mapped
-//!   read-only; [`Kept::Copied`]; [`crate::os::COPIES_READ_ONLY`]), which the runtime makes
+//! - **The guest's read-only objects** (a no-copy buffer or heap made with `MTLResourceOptions`
+//!   bit 24 or over pages mapped read-only; [`Kept::Copied`]; [`crate::os::COPIES_READ_ONLY`]),
+//!   which the runtime makes
 //!   over a copy of the pages whose GPU writes it drops, as Metal's GPU drops them: a write through
 //!   a buffer over it is sent (a shader's store through a slot or a loaded address, a blit's fill
 //!   or copy into the buffer, a pass's visibility results), and so is a pass whose attachment lies
@@ -67,7 +67,6 @@ use metal2vulkan::pipeline::ComputePipelineDescriptor;
 use metal2vulkan::reflection::{SlotWritability, SlotWrite, SlotWriteGap};
 
 use crate::answer::plain;
-use crate::gpu::backing::Pages;
 use crate::gpu::resource::{BufferObject, HeapObject, RenderDescriptor, TextureObject, Under};
 use crate::os::OsSurface;
 
@@ -92,7 +91,7 @@ pub struct Memory {
 /// Whether an object's memory is read-only where the runtime does not answer the GPU's writes
 /// through it as Metal's GPU does ([`Memory::kept`]), asked as work that may write through the
 /// object is encoded ([`Kept::holds`]).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Kept {
     /// It is not.
     #[default]
@@ -103,11 +102,10 @@ pub enum Kept {
     Always,
     /// For the object's life: for a texture over a buffer or heap, read-only memory the runtime
     /// makes the buffer or heap over a copy of, dropping the GPU's writes, where what Metal does
-    /// with a texture's writes is unmeasured ([`crate::gpu::backing::Backing::read_only_now`]),
-    /// with the buffer's or heap's pages, which tell one object's from another's. A buffer's own
-    /// memory the runtime copies is never `Copied`: the runtime drops its writes, as Metal's GPU
-    /// does.
-    Copied(Arc<Pages>),
+    /// with a texture's writes is unmeasured ([`crate::gpu::backing::Backing::read_only_now`]). A
+    /// buffer's own memory the runtime copies is never `Copied`: the runtime drops its writes, as
+    /// Metal's GPU does.
+    Copied,
 }
 
 impl Kept {
@@ -120,22 +118,10 @@ impl Kept {
     pub fn holds(&self) -> bool {
         match self {
             Kept::No => false,
-            Kept::Always | Kept::Copied(_) => true,
+            Kept::Always | Kept::Copied => true,
         }
     }
 }
-
-impl PartialEq for Kept {
-    fn eq(&self, other: &Kept) -> bool {
-        match (self, other) {
-            (Kept::No, Kept::No) | (Kept::Always, Kept::Always) => true,
-            (Kept::Copied(a), Kept::Copied(b)) => Arc::ptr_eq(a, b),
-            _ => false,
-        }
-    }
-}
-
-impl Eq for Kept {}
 
 impl Memory {
     /// Whether it holds no memory.
@@ -363,7 +349,7 @@ pub fn texture_memory(t: &TextureObject) -> Memory {
             kept: under_buffer_kept(b),
             ..buffer_bytes_memory(b, bytes.clone())
         },
-        (None, Some(Under::Heap(h, bytes))) => heap_bytes_memory(h, bytes.clone()),
+        (None, Some(Under::Heap(h, _))) => heap_memory(h),
         _ => Memory::default(),
     }
 }
@@ -390,22 +376,15 @@ pub fn buffer_memory(b: &BufferObject) -> Memory {
 }
 
 /// The host memory `b`'s bytes `bytes` (a first byte and an end) lie in now: in its surface's
-/// memory (`newBufferWithIOSurface:`, from the surface's base address), at its place in its
-/// heap's, or in the memory it was made over; none for a `Private` one.
+/// memory (`newBufferWithIOSurface:`, from the surface's base address), or in the memory it was
+/// made over; none for a `Private` one, or for one in a heap, as for the heap ([`heap_memory`]).
 pub fn buffer_bytes_memory(b: &BufferObject, bytes: Range<u64>) -> Memory {
     if let Some(s) = &b.surface {
         return Memory::of_surface_bytes(s, bytes);
     }
-    if let Some(h) = &b.heap {
-        // A heap buffer's GPU address is its heap's plus its offset there.
-        let at = plain(|| b.raw.gpu_address().0.saturating_sub(h.raw.gpu_address().0));
-        return Memory {
-            kept: Kept::No,
-            ..heap_bytes_memory(
-                h,
-                at.saturating_add(bytes.start)..at.saturating_add(bytes.end),
-            )
-        };
+    if b.heap.is_some() {
+        // None, as for its heap, and nothing kept.
+        return Memory::default();
     }
     // Its writes into read-only memory the runtime copies are dropped, as Metal's GPU drops them:
     // nothing kept.
@@ -455,38 +434,22 @@ pub fn texture_bind(t: &TextureObject) -> Bound {
 
 /// What a bind keeps of `b`'s memory: [`buffer_memory`]'s [`Bound`], read as it reads it, but
 /// without collecting the ranges of its bytes in the guest's pages, one a page run, as each draw
-/// binds its buffers anew.
+/// binds its buffers anew; the same of any of its bytes ([`buffer_bytes_memory`]).
 pub fn buffer_bound(b: &BufferObject) -> Bound {
-    buffer_bytes_bound(b, 0..plain(|| b.raw.length()))
-}
-
-/// [`buffer_bytes_memory`]'s [`Bound`] of `b`'s bytes `bytes`, read as it reads them, without
-/// collecting their ranges ([`buffer_bound`]).
-fn buffer_bytes_bound(b: &BufferObject, bytes: Range<u64>) -> Bound {
     if let Some(s) = &b.surface {
         return surface_bound(s, None);
     }
-    if let Some(h) = &b.heap {
-        // As `buffer_bytes_memory`'s: its bytes at its place in its heap's, nothing kept.
-        let at = plain(|| b.raw.gpu_address().0.saturating_sub(h.raw.gpu_address().0));
-        return Bound {
-            kept: Kept::No,
-            ..heap_bytes_bound(
-                h,
-                &(at.saturating_add(bytes.start)..at.saturating_add(bytes.end)),
-            )
-        };
+    if b.heap.is_some() {
+        // As `buffer_bytes_memory`'s: none, and nothing kept.
+        return Bound::default();
     }
     // Nothing kept, as `buffer_bytes_memory`'s.
     Bound::over(plain(|| b.raw.contents()).is_some(), Kept::No)
 }
 
-/// [`heap_bytes_memory`]'s [`Bound`] of `h`'s bytes `bytes`, without collecting their ranges.
-fn heap_bytes_bound(h: &HeapObject, bytes: &Range<u64>) -> Bound {
-    Bound::over(
-        h.backing.meets_pages(bytes).unwrap_or(false),
-        h.backing.kept(),
-    )
+/// [`heap_memory`]'s [`Bound`] of `h`.
+fn heap_bound(h: &HeapObject) -> Bound {
+    Bound::over(false, h.backing.kept())
 }
 
 /// The [`Bound`] of an object made on `surface`, of the `refused` format where the runtime
@@ -513,23 +476,20 @@ pub fn texture_bound(t: &TextureObject) -> Bound {
             });
             surface_bound(s, refused)
         }
-        (None, Some(Under::Buffer(b, bytes))) => Bound {
+        (None, Some(Under::Buffer(b, _))) => Bound {
             kept: under_buffer_kept(b),
-            ..buffer_bytes_bound(b, bytes.clone())
+            ..buffer_bound(b)
         },
-        (None, Some(Under::Heap(h, bytes))) => heap_bytes_bound(h, bytes),
+        (None, Some(Under::Heap(h, _))) => heap_bound(h),
         _ => Bound::default(),
     }
 }
 
-/// The host memory of `h`'s bytes `bytes`, a first byte and an end: in the guest's pages it was
-/// made over; none for one of memory of its own. What it keeps is a
-/// texture's in it ([`Kept::Copied`]); a buffer in it keeps nothing ([`buffer_bytes_memory`]).
-pub(crate) fn heap_bytes_memory(h: &HeapObject, bytes: Range<u64>) -> Memory {
-    Memory::over(
-        h.backing.in_pages(&bytes).unwrap_or_default(),
-        h.backing.kept(),
-    )
+/// The host memory of `h`'s bytes: none, as this platform records no memory of a heap's, its own
+/// or the host memory it was made over. What it keeps is a texture's in it ([`Kept::Copied`]); a
+/// buffer in it keeps nothing ([`buffer_bytes_memory`]).
+pub(crate) fn heap_memory(h: &HeapObject) -> Memory {
+    Memory::over(Vec::new(), h.backing.kept())
 }
 
 /// What one stage's function may store through each slot its arguments bind, by its pipeline's
@@ -941,9 +901,10 @@ pub(crate) mod tests {
 
     /// What a bind keeps of a buffer's or a texture's memory, read without collecting ranges, is
     /// what the memory collected answers: for a buffer of the device's memory, one placed in a
-    /// heap over the guest's pages (at its bytes and past the pages), one on a surface, textures
+    /// heap over the guest's memory (at its bytes and past the heap's), one on a surface, textures
     /// placed in the heap, over a buffer, on surfaces over the guest's pages and over memory of
-    /// their own, and one of memory of its own
+    /// their own, and one of memory of its own. A heap's buffer and texture lie in no memory a
+    /// surface's write check looks for
     #[test]
     fn bound_memory_is_the_memory_collected() {
         let (p, d) = (
@@ -961,7 +922,7 @@ pub(crate) mod tests {
             })
         };
         let size = over_pages();
-        let heap = heap_at(&p, &d, guest_pages());
+        let heap = heap_at::<crate::platform::VulkanPlatform>(&d, guest_pages());
         let options = heap.resource_options();
         let placed = heap
             .new_buffer_of_length(0x1000, options, 0x2000)
@@ -995,7 +956,7 @@ pub(crate) mod tests {
                 assert_eq!(buffer_bound(b), buffer_memory(b).bound(), "{when}: {name}");
                 for bytes in [0..0x10, 0xff0..0x1010, size..size + 0x10, 0x10..0x10] {
                     assert_eq!(
-                        buffer_bytes_bound(b, bytes.clone()),
+                        buffer_bound(b),
                         buffer_bytes_memory(b, bytes.clone()).bound(),
                         "{when}: {name} {bytes:x?}"
                     );
@@ -1016,7 +977,7 @@ pub(crate) mod tests {
             }
         };
         agree("made");
-        assert!(buffer_bound(&placed).meets && texture_bound(&in_heap).meets);
+        assert!(!buffer_bound(&placed).meets && !texture_bound(&in_heap).meets);
         drop((on_pages, over));
         crate::os::tests::free(pages, length);
     }

@@ -243,10 +243,9 @@ pub struct VertexAmplificationViewMapping {
     pub render_target_array_index_offset: u32,
 }
 
-/// `MTLResourceAddressRange`: one range of an `MTLResourceAddressRangeArray`. The type keeps the
-/// SPI's name, but the runtime tags the struct
-/// `MTLAddressRange` (`^{MTLAddressRange=QQ}` in `-initWithRanges:count:`) (D41). The array
-/// copies its ranges, so a slice on the stack may be passed.
+/// A range of host memory, laid out as Metal's `MTLResourceAddressRange` (`^{MTLAddressRange=QQ}`,
+/// D41): the ranges of the guest's pages the platform gathers into an alias of its own
+/// (`crate::gpu::backing::gather_or_nil`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(C)]
 pub struct ResourceAddressRange {

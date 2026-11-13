@@ -3239,7 +3239,6 @@ impl<P: Platform> GraphicsDecoder<P> {
                     size: m.size_bytes,
                     heap_type: host_heap_type(m.heap_type),
                     options: vec![OptionSet::ResourceOptions(m.options.into())],
-                    address_ranges: None,
                     pinned_gpu_address: (m.gpu_address != 0).then_some(m.gpu_address),
                 };
                 match device.new_heap(&desc)?.heap {
@@ -3285,7 +3284,6 @@ impl<P: Platform> GraphicsDecoder<P> {
                     size: m.size_bytes,
                     heap_type: host_heap_type(m.heap_type),
                     options: vec![OptionSet::ResourceOptions(m.options.into())],
-                    address_ranges: None,
                     pinned_gpu_address: (m.gpu_address != 0).then_some(m.gpu_address),
                 };
                 match device.new_heap_over_host_memory(bytes, &desc)?.heap {

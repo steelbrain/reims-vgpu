@@ -53,9 +53,7 @@ use crate::core::platform::command::{CompletedHandler, CompletedInfo, ScheduledH
 use crate::core::platform::device::NoCopyDeallocator;
 use crate::core::platform::event::Notification;
 use crate::core::platform::os::{Clock, Deadline};
-use crate::core::platform::types::{
-    CommandBufferStatus, MtlSize, NsErrorText, ResourceAddressRange, Swizzle,
-};
+use crate::core::platform::types::{CommandBufferStatus, MtlSize, NsErrorText, Swizzle};
 use crate::core::platform::{Handle, ObjId};
 
 /// A handle kind: the Objective-C class the fake stands in for.
@@ -116,7 +114,6 @@ pub mod kind {
         RenderPassDescriptor => "MTLRenderPassDescriptor",
         RateMapDescriptor => "MTLRasterizationRateMapDescriptor",
         RateMapLayerDescriptor => "MTLRasterizationRateLayerDescriptor",
-        AddressRangeArray => "MTLResourceAddressRangeArray",
     }
 
     /// `IOSurfaceRef`: its retains are logged (`CFRetain`/`CFRelease`).
@@ -337,8 +334,6 @@ pub struct HeapModel {
     pub gpu_address: u64,
     /// Memory the fake owns for a CPU-visible heap.
     pub mem: Option<Arc<RawRegion>>,
-    /// The address ranges it was made over.
-    pub ranges: Option<AnyHandle>,
     /// Common resource state.
     pub common: ResourceCommon,
 }
@@ -464,8 +459,6 @@ pub enum Model {
     Surface(SurfaceModel),
     /// A rasterization-rate layer.
     Layer(LayerModel),
-    /// An address-range array.
-    Ranges(Vec<ResourceAddressRange>),
     /// A function's name, or a library's function names.
     Names(Vec<String>),
     /// A handle object's target (shared event handle, shared texture handle).

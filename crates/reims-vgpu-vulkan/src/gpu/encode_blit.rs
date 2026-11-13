@@ -1483,7 +1483,6 @@ mod tests {
                 size: 1 << 20,
                 heap_type: 1,
                 options: vec![OptionSet::StorageMode(2)],
-                address_ranges: None,
                 pinned_gpu_address: None,
             })
             .unwrap()

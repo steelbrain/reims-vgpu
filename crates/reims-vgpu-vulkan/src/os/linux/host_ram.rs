@@ -943,7 +943,6 @@ mod tests {
                 size: len,
                 heap_type: PLACEMENT,
                 options: vec![OptionSet::ResourceOptions(SHARED_TRACKED)],
-                address_ranges: None,
                 pinned_gpu_address: None,
             };
             device
