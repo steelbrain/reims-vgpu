@@ -240,15 +240,19 @@ typedef void (*RvgCursorMoveFn)(void *ctx);
 // rvg_graphics_device_mmio_write_taking as before. Return false to refuse it: the queue's
 // writes all come through there. With `bell` -1, drop route `route` (of `ring_id`), whose queue
 // ended, before returning: no write reaches the host's copy once the call returns, as the ring
-// may be a later queue's; the answer is not read. The device routes a queue only where the
-// guest's driver took the reims-graphics wire's DOORBELL_ASKS, whose write for a command buffer
+// may be a later queue's; the answer is not read. The device offers the reims-graphics wire's
+// DOORBELL_ASKS only where the host gives this function, on Linux (a host on macOS has no
+// kernel ioeventfd, and its guest's doorbells stay as they were), and routes a queue only where
+// the guest's driver took it, whose write for a command buffer
 // the device may answer at its doorbell holds bit 0 beside the ring's id and so matches no
 // route; at most RVG_GRAPHICS_DOORBELL_ROUTES at once; and it drops none at its end: the host
 // drops those it holds as it releases the device.
 //
-// Thread: one of ring 0's threads (`reims-vgpu.graphics-ring0-<i>`) as a queue is made, destroyed
-// or its process closed, where it may wait for a lock the host holds while it calls the device
-// (QEMU's BQL); with `bell` -1 also the host's own inside rvg_graphics_device_mmio_write_taking
+// Thread: one of ring 0's threads (`reims-vgpu.graphics-ring0-<i>`) or the control thread
+// (`reims-vgpu.graphics-control`) as a queue is made, destroyed or its process closed, where it
+// may wait for a lock the host holds while it calls the device (QEMU's BQL): no function of this
+// header the host calls under that lock waits for a thread inside it, but the release of the
+// process's last device, at most 5 s; with `bell` -1 also the host's own inside rvg_graphics_device_mmio_write_taking
 // (a write of 0 to STATUS) or rvg_graphics_device_reset, where it must not wait for a lock the
 // host holds around that call. The library holds no lock around it that a function of this
 // header waits for, and it may call nothing of the library's. Without it every doorbell write

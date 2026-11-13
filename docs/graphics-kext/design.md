@@ -1483,9 +1483,13 @@ only where no negotiation can carry it.
   answers at the doorbell only an asking write ("The answer at the
   doorbell"), and may take a plain one with no exit to its process, waking
   the queue's thread from the guest's vCPU directly ("Routed doorbells").
-  Every host offers it, the kext takes it, and the bundle sets the bit where
-  the device's word holds it; where it does not, every doorbell write may be
-  answered, as before the bit.
+  A host offers it where it routes doorbells: on Linux, where its host gives
+  the library's `route_doorbell` (QEMU's KVM ioeventfds); a Mac host (QEMU
+  under HVF or TCG) does not offer it
+  (`doorbell_asks_is_offered_only_where_the_host_routes_doorbells_on_linux`).
+  The kext takes it, and the bundle sets
+  the bit where the device's word holds it; where it does not, every
+  doorbell write may be answered, as before the bit.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -3794,7 +3798,12 @@ commit. Each outcome the new design allows is one of those two:
   (`a_queue_past_the_routes_or_refused_keeps_its_doorbell_on_the_write`). A
   queue's route goes at its destroy, its context's close and the device's
   reset (`a_reset_drops_the_queues_routes`), and QEMU drops every route at its
-  teardown. A route changes no order: the ring's records, its completions and
+  teardown. QEMU adds and drops a route under the BQL before the callback
+  returns, so the device calls it holding no lock of its own: on the lane's
+  thread after the queues' table is let go, and in a reset after its rings
+  and table are; and no device function a host calls under the BQL waits
+  for a lane
+  (`the_host_s_lock_held_around_its_calls_while_a_route_waits_for_it_holds_up_nothing`). A route changes no order: the ring's records, its completions and
   interrupts are the thread's, as for a doorbell the host takes in the write.
 
 ## Stage 3 guest stack (from the prior-art study)

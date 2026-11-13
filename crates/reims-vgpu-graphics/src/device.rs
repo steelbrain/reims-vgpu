@@ -109,6 +109,29 @@
 //! queues are routed at once; a queue past them, a route the host refuses, and every write
 //! before the host takes the route, keep the device's write, as before.
 //!
+//! The host's route functions may wait for the host's own lock (QEMU's BQL), so the device calls
+//! them holding no lock of its own, and no function a host calls under that lock waits for a
+//! thread inside one. The calls, and what their thread holds:
+//! - a `QUEUE_CREATE` routes the new queue, and drops the route of a queue it remakes or of one
+//!   whose service thread could not start; an `OBJECT_DESTROY` of a queue and a `CONTEXT_CLOSE`
+//!   drop their queues' routes. Each runs on the context's lane, on one of ring 0's threads or
+//!   the control thread ([`lanes`]), which holds no lock of the device's as it carries out a
+//!   lane's job, and the call comes after the queues' table and the ended queues' rings are let
+//!   go;
+//! - a reset (`STATUS` 0 through [`Device::mmio_write`] or [`Device::mmio_write_taking`], or
+//!   [`Device::reset`]) drops every ended queue's route on the host's thread that resets, after
+//!   the reset let go of ring 0, the display, the completion ring, the queues' table and each
+//!   ended queue's rings. QEMU's registers run with no BQL (a lockless region), and its reset
+//!   holds it already, which its route function sees (`bql_locked`).
+//!
+//! The device's functions a host calls under its lock wait at most for ring 0's message the
+//! control thread holds (a display message, which waits for no thread of the device's), for a
+//! take of a queue's ring or a post onto one under way, and, in a reset, for the queues' table:
+//! none of these is held across a route call, and none waits for a lane. The release of the
+//! process's last device waits for the device's threads, a route call among them, at most 5 s
+//! (docs/api.md, "The process's exit"). Tested by
+//! `the_host_s_lock_held_around_its_calls_while_a_route_waits_for_it_holds_up_nothing`.
+//!
 //! A `DOORBELL` write of ring 0 through [`Device::mmio_write_taking`] answers ring 0's next
 //! message on the writing thread where it is a `SURFACE_DOWNLOAD` the host has carried out
 //! already ([`Host::surface_downloaded`]: a CPU lock of a surface whose pages hold its device
@@ -555,10 +578,11 @@ pub trait Host: Send + Sync + 'static {
     /// `bell` and may take the route after the call: until then, and where it refuses it, the
     /// writes reach the device's write. Whether it took the route, so the device
     /// counts it among its [`MAX_DOORBELL_ROUTES`]; false where it refuses it. Asked only where
-    /// the guest's driver took [`RGFX_FEATURE_DOORBELL_ASKS`], on the context's lane as the
-    /// queue is made, after its service thread started and before the create is answered, with
-    /// no lock held: it may wait for a lock the host holds while it calls the device. The default
-    /// takes none.
+    /// the guest's driver took [`RGFX_FEATURE_DOORBELL_ASKS`], on the context's lane (one of
+    /// ring 0's threads, or the control thread) as the queue is made, after its service thread
+    /// started and before the create is answered, with no lock of the device's held: it may wait
+    /// for a lock the host holds while it calls the device (the module doc, "Routed doorbells").
+    /// The default takes none.
     fn route_doorbell(&self, route: u64, ring_id: u32, bell: RawFd) -> bool {
         let _ = (route, ring_id, bell);
         false
@@ -566,8 +590,8 @@ pub trait Host: Send + Sync + 'static {
 
     /// Drops the route [`Host::route_doorbell`] took as `route`, of ring `ring_id`, once its queue
     /// has ended: once this returns no write reaches the file, as the ring may be a later
-    /// queue's, and the host closes its copy. On the thread that ends the queue, with no lock
-    /// held: the context's lane (an `OBJECT_DESTROY` of the queue, its context's
+    /// queue's, and the host closes its copy. On the thread that ends the queue, with no lock of
+    /// the device's held: the context's lane (an `OBJECT_DESTROY` of the queue, its context's
     /// `CONTEXT_CLOSE`, or a `QUEUE_CREATE` that remakes it), where it may wait for a lock the
     /// host holds while it calls the device, or the host's own inside [`Device::mmio_write`],
     /// [`Device::mmio_write_taking`] (a `STATUS` 0 write) or [`Device::reset`], where it must not

@@ -3112,6 +3112,27 @@ struct Taking {
     routes: Mutex<Vec<(u64, u32, OwnedFd)>>,
     /// Each route dropped ([`Host::unroute_doorbell`]), in order.
     unrouted: Mutex<Vec<u64>>,
+    /// The host's own lock around its calls into the device, as QEMU's BQL is, which its route
+    /// functions take where their thread does not hold it ([`Taking::host_locked`]).
+    host_lock: std::sync::Mutex<()>,
+    /// The thread that holds `host_lock`, as QEMU's `bql_locked()` tells it.
+    host_lock_owner: Mutex<Option<std::thread::ThreadId>>,
+    /// The route calls waiting for `host_lock`.
+    waiting_for_host_lock: AtomicU32,
+}
+
+impl Taking {
+    /// Takes the host's lock where this thread does not hold it, as QEMU's `route_doorbell`
+    /// takes the BQL: `None` where it holds it already.
+    fn host_locked(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        if *self.host_lock_owner.lock() == Some(std::thread::current().id()) {
+            return None;
+        }
+        self.waiting_for_host_lock.fetch_add(1, Ordering::SeqCst);
+        let held = (self.host_lock.lock()).unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.waiting_for_host_lock.fetch_sub(1, Ordering::SeqCst);
+        Some(held)
+    }
 }
 
 /// A host whose command buffers post a `CB_SUBMITTED` and then a `CB_COMPLETE`, as the decoder's
@@ -3175,6 +3196,7 @@ impl Host for TakingHost {
         }
     }
     fn route_doorbell(&self, route: u64, ring_id: u32, bell: RawFd) -> bool {
+        let _host = self.0.host_locked();
         if self.0.refuses_routes.load(Ordering::SeqCst) {
             return false;
         }
@@ -3183,6 +3205,7 @@ impl Host for TakingHost {
         true
     }
     fn unroute_doorbell(&self, route: u64, ring_id: u32) {
+        let _host = self.0.host_locked();
         assert_eq!(ring_id, QUEUE_SUBMIT as u32, "the route's ring");
         self.0.unrouted.lock().push(route);
     }
@@ -3788,6 +3811,75 @@ fn a_reset_drops_the_queues_routes() {
     rig.device
         .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
     assert_eq!(*taking.unrouted.lock(), vec![route]);
+    assert_eq!(rig.device.shared.routes.load(Ordering::SeqCst), 0);
+}
+
+/// The host's lock around its calls into the device (QEMU's BQL), which its route functions
+/// take: while a ring-0 thread waits for it inside `route_doorbell`, the thread that holds it
+/// reads and writes the registers, rings ring 0's and the queue's doorbells and resets the
+/// device, and each call returns. The device calls the route functions with no lock of its own
+/// held, and none of its functions a host calls under its lock waits for a thread inside one
+/// (the module doc, "Routed doorbells"). The route the create took meanwhile goes once the
+/// lock is let go, the reset having ended its queue. A deadlock ends the test process after 20 s
+/// rather than hanging it.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_host_s_lock_held_around_its_calls_while_a_route_waits_for_it_holds_up_nothing() {
+    const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let taking = Arc::new(Taking::default());
+    taking.takes.store(true, Ordering::SeqCst);
+    taking.asks.store(true, Ordering::SeqCst);
+    let mut rig = Rig::with_host(Box::new(TakingHost(Arc::clone(&taking))));
+    rig.device.mmio_write(
+        RGFX_REG_DRIVER_FEATURES_HI.into(),
+        (RGFX_FEATURE_DOORBELL_ASKS >> 32) as u32,
+    );
+    rig.start();
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || {
+        if finished.recv_timeout(Duration::from_secs(20)).is_err() {
+            eprintln!("the calls under the host's lock never returned: a deadlock");
+            std::process::abort();
+        }
+    });
+
+    let held = (taking.host_lock.lock()).unwrap_or_else(std::sync::PoisonError::into_inner);
+    *taking.host_lock_owner.lock() = Some(std::thread::current().id());
+    send_queue_create(&mut rig, QUEUE);
+    assert!(
+        eventually(|| taking.waiting_for_host_lock.load(Ordering::SeqCst) == 1),
+        "the create's route waits for the host's lock"
+    );
+    // What a host calls holding its lock, each while the route waits for it.
+    assert_eq!(
+        rig.device.mmio_read(RGFX_REG_STATUS.into()),
+        RGFX_STATUS_DRIVER_READY
+    );
+    rig.device
+        .mmio_write_taking(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
+    rig.device.mmio_write_taking(
+        RGFX_REG_DOORBELL.into(),
+        QUEUE_SUBMIT as u32 | RGFX_DOORBELL_ASKS,
+    );
+    rig.device
+        .mmio_write_taking(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
+    rig.device.reset();
+    assert_eq!(
+        taking.waiting_for_host_lock.load(Ordering::SeqCst),
+        1,
+        "the route still waits"
+    );
+    *taking.host_lock_owner.lock() = None;
+    drop(held);
+    done.send(()).expect("the watchdog waits");
+    watchdog.join().expect("the watchdog ends");
+
+    assert!(
+        eventually(|| taking.unrouted.lock().len() == 1),
+        "the route the ended queue took is dropped"
+    );
+    assert_eq!(taking.routes.lock().len(), 1);
+    assert_eq!(*taking.unrouted.lock(), vec![taking.routes.lock()[0].0]);
     assert_eq!(rig.device.shared.routes.load(Ordering::SeqCst), 0);
 }
 
