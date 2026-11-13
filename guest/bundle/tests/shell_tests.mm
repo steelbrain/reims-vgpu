@@ -14443,8 +14443,9 @@ void test_region_memory_given_back_after_destroy()
 }
 
 // The bytes of a surface's shared-block header (RgfxIOSurface.mm's RgfxSurfaceHeader), which
-// the writers follow: a copy's seed and serial, and a cached block's CPU generation at 16.
-constexpr uint64_t kSurfaceHeader = 24;
+// the writers follow: a copy's seed and serial, a cached block's CPU generation at 16, and at 24
+// and 28 the unlock seed a copy was synced at and whether a CPU write lock was held then.
+constexpr uint64_t kSurfaceHeader = 32;
 
 // An IOSurface texture's copy goes as the texture goes: the texture, then the copy's buffer,
 // from the host, and only then the copy's block back to the region.
