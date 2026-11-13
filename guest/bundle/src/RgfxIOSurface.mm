@@ -422,8 +422,13 @@ std::atomic<uint64_t> gCopyOwn{0};
 // Of the uploads, those made while a CPU held the surface locked for writing, each synced again
 // at the CPU's unlock.
 std::atomic<uint64_t> gUploadsMidWrite{0};
+// The uploads made because such a CPU had let go of its lock (the unlock seed moved).
+std::atomic<uint64_t> gSyncsAtUnlock{0};
 // The commits that asked the kext whether such a CPU had let go of its lock yet.
 std::atomic<uint64_t> gUnlockAsks{0};
+// Whether the kext answers surfaces' lock and unlock seeds to this process's device
+// (rgfxIOSurfaceNoteSurfaceSeeds): -1 where no device said yet.
+std::atomic<int> gSurfaceSeeds{-1};
 
 // A summary, at most once a minute (docs/conventions.md).
 const uint64_t kCopyReportNs = 60ull * 1000 * 1000 * 1000;
@@ -438,9 +443,9 @@ uint64_t nowNs()
 void reportCopies(uint64_t now)
 {
 	static std::mutex lock;
-	static uint64_t last = 0, upCount = 0, upBytes = 0, upNs = 0, upMidWrite = 0, unlockAsks = 0,
-	                wbCount = 0, wbBytes = 0, wbNs = 0, inPlace = 0, cached = 0, forAlignment = 0,
-	                unsupported = 0, refused = 0, shared = 0, own = 0;
+	static uint64_t last = 0, upCount = 0, upBytes = 0, upNs = 0, upMidWrite = 0, syncsAtUnlock = 0,
+	                unlockAsks = 0, wbCount = 0, wbBytes = 0, wbNs = 0, inPlace = 0, cached = 0,
+	                forAlignment = 0, unsupported = 0, refused = 0, shared = 0, own = 0;
 	std::unique_lock<std::mutex> g(lock, std::try_to_lock);
 	if (!g.owns_lock()) {
 		return;
@@ -453,22 +458,25 @@ void reportCopies(uint64_t now)
 		return;
 	}
 	uint64_t uc = gUploads.count, ub = gUploads.bytes, un = gUploads.ns, um = gUploadsMidWrite,
-	         ua = gUnlockAsks;
+	         ul = gSyncsAtUnlock, ua = gUnlockAsks;
+	const int seeds = gSurfaceSeeds.load(std::memory_order_relaxed);
 	uint64_t wc = gWriteBacks.count, wb = gWriteBacks.bytes, wn = gWriteBacks.ns;
 	uint64_t ip = gInPlace, cc = gCached, ca = gCopiedAlignment, cu = gCopiedUnsupported,
 	         cr = gCopiedRefused, cs = gCopyShared, co = gCopyOwn;
 	// The process's id and name are the log's own.
 	os_log_info(rgfxLog(),
-	            "RGFX: surface copies, %.1f s: %llu uploads %.1f MiB %.2f ms (%llu mid-write, "
-	            "synced again at the unlock; %llu asks for it), %llu write-backs %.1f MiB "
-	            "%.2f ms; views made: %llu in place (%llu cached), copies %llu for alignment, "
-	            "%llu unsupported, %llu refused by the kext; copy blocks: %llu shared, %llu own",
-	            (now - last) / 1e9, uc - upCount, (ub - upBytes) / 1048576.0, (un - upNs) / 1e6,
-	            um - upMidWrite, ua - unlockAsks, wc - wbCount, (wb - wbBytes) / 1048576.0,
+	            "RGFX: surface copies, %.1f s, unlock seeds %{public}s: %llu uploads %.1f MiB "
+	            "%.2f ms (%llu mid-write, %llu synced again at the unlock, %llu asks for it), "
+	            "%llu write-backs %.1f MiB %.2f ms; views made: %llu in place (%llu cached), "
+	            "copies %llu for alignment, %llu unsupported, %llu refused by the kext; copy "
+	            "blocks: %llu shared, %llu own",
+	            (now - last) / 1e9, seeds > 0 ? "on" : seeds == 0 ? "off" : "unknown",
+	            uc - upCount, (ub - upBytes) / 1048576.0, (un - upNs) / 1e6, um - upMidWrite,
+	            ul - syncsAtUnlock, ua - unlockAsks, wc - wbCount, (wb - wbBytes) / 1048576.0,
 	            (wn - wbNs) / 1e6, ip - inPlace, cc - cached, ca - forAlignment, cu - unsupported,
 	            cr - refused, cs - shared, co - own);
 	last = now;
-	upCount = uc, upBytes = ub, upNs = un, upMidWrite = um, unlockAsks = ua;
+	upCount = uc, upBytes = ub, upNs = un, upMidWrite = um, syncsAtUnlock = ul, unlockAsks = ua;
 	wbCount = wc, wbBytes = wb, wbNs = wn;
 	inPlace = ip, cached = cc, forAlignment = ca, unsupported = cu, refused = cr;
 	shared = cs, own = co;
@@ -833,23 +841,27 @@ struct RgfxSurfaceShadow {
 		return {lockSeed != unlockSeed, unlockSeed};
 	}
 
-	/// Whether the block no longer matches the surface's pages, in any process that holds the
+	/// Why the block no longer matches the surface's pages, in any process that holds the
 	/// block: the surface's seed moved since it last did (a CPU wrote the surface under a lock),
 	/// or it was synced while a CPU held its write lock, which the CPU has let go since (the
 	/// unlock seed moved): the copy holds the pages as they were mid-write. Caller holds `lock`.
-	bool changed() const
+	enum class Change { None, Seed, Unlock };
+	Change change() const
 	{
 		uint32_t synced = 0;
 		SyncedWrite write = {};
 		if (!syncedSeed(&synced, &write) || IOSurfaceGetSeed(surface) != synced)
-			return true;
+			return Change::Seed;
 		if (!write.held)
-			return false;
+			return Change::None;
 		gUnlockAsks.fetch_add(1, std::memory_order_relaxed);
 		uint32_t lockSeed = 0, unlockSeed = 0;
 		return region != nullptr && region->surfaceSeeds(surfaceId, &lockSeed, &unlockSeed) &&
-		       unlockSeed != write.unlockSeed;
+		               unlockSeed != write.unlockSeed
+		           ? Change::Unlock
+		           : Change::None;
 	}
+	bool changed() const { return change() != Change::None; }
 
 	/// Pages -> copy, under a read lock of the surface taken before `lock` (the views' lock
 	/// order, ViewLock), where `always` or the seed moved (changed) as `lock` is taken; records
@@ -865,7 +877,8 @@ struct RgfxSurfaceShadow {
 			return;
 		}
 		ViewLock g(lock);
-		const bool copies = always || changed();
+		const Change why = always ? Change::Seed : change();
+		const bool copies = why != Change::None;
 		// A CPU that holds the surface locked for writing as the copy is made may not have
 		// written all of it yet: the copy is synced again at its unlock (changed). One that
 		// locks it later moves the seed past `s`.
@@ -883,6 +896,8 @@ struct RgfxSurfaceShadow {
 			countCopy(gUploads, planeBytes(), start);
 			if (write.held)
 				gUploadsMidWrite.fetch_add(1, std::memory_order_relaxed);
+			if (why == Change::Unlock)
+				gSyncsAtUnlock.fetch_add(1, std::memory_order_relaxed);
 		}
 	}
 
@@ -1474,6 +1489,11 @@ void rgfxIOSurfaceKeepSweepAt(uint64_t now)
 void rgfxIOSurfaceKeepCountClients(bool on)
 {
 	gCountsClients.store(on ? 1 : 0, std::memory_order_relaxed);
+}
+
+void rgfxIOSurfaceNoteSurfaceSeeds(bool on)
+{
+	gSurfaceSeeds.store(on ? 1 : 0, std::memory_order_relaxed);
 }
 
 @interface RgfxIOSurfaceTexture ()

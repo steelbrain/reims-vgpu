@@ -47,7 +47,10 @@
  * copies it. Each view made, in place or a copy and why, and each copy's block, shared or the
  * process's own, is counted in the "surface copies" line the process logs (os_log, info) once a
  * minute at most while views are made or copied; the kext logs why it first refused a shared
- * block.
+ * block. The line also says whether the kext answers the surfaces' unlock seeds ("unlock seeds
+ * on", off, or unknown before a device says), and counts the uploads made while a CPU held the
+ * surface locked for writing ("mid-write"), those made again once such a CPU let go ("synced
+ * again at the unlock"), and the kext's answers they took ("asks for it").
  *
  * The copy holds the planes in plane order, each from a kShadowRowAlign multiple, its rows
  * kShadowRowAlign apart, as the surface's own memory holds them one after another; a header past
@@ -222,6 +225,11 @@ void rgfxIOSurfaceKeepSweepAt(uint64_t nowNs);
 /// Whether the keep keeps a cached block's view while another process holds its surface, as
 /// WindowServer's does (RgfxIOSurface.mm): for the tests.
 void rgfxIOSurfaceKeepCountClients(bool on);
+
+/// Whether the kext answers surfaces' lock and unlock seeds to this process's device
+/// (kRgfxKextFeatureSurfaceSeeds): the "surface copies" summary says so, "unknown" before a device
+/// says.
+void rgfxIOSurfaceNoteSurfaceSeeds(bool on);
 
 /// The rows of a plane, `pitch` bytes apart from its first byte at `offsets[plane]`, that lie before
 /// the next of the `count` planes' first bytes (`offsets`, from the surface's base) and before

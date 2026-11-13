@@ -939,8 +939,10 @@ RGFX_LOG_UNRECOGNIZED
 	_region->setSurfaceWriteSource(&rgfxKextSurfaceWrites, &rgfxKextSurfaceRetire, connContext);
 	// A copy synced while a CPU held its surface locked for writing syncs again at the unlock,
 	// where the kext reads IOSurface's unlock seed (RgfxIOSurface.h).
-	if ((_caps.kextFeatures() & kRgfxKextFeatureSurfaceSeeds) != 0)
+	const bool seeds = (_caps.kextFeatures() & kRgfxKextFeatureSurfaceSeeds) != 0;
+	if (seeds)
 		_region->setSurfaceSeedsSource(&rgfxKextSurfaceSeeds, connContext);
+	rgfxIOSurfaceNoteSurfaceSeeds(seeds);
 	// No-copy buffers over the process's own pages, where the kext makes pages blocks and the
 	// host took the feature that maps them.
 	if ((_caps.kextFeatures() & kRgfxKextFeaturePagesBlock) != 0 &&
