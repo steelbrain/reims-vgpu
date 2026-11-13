@@ -242,15 +242,15 @@ pub trait GpuDevice<P: Platform>: Handle {
         let _ = (planes, pages);
         None
     }
-    /// No Metal counterpart: why textures over a fresh IOSurface's pages, laid out as `planes`
-    /// from a page's first byte, would lie in place over no buffer of them this device makes,
-    /// whatever pages the surface comes to have, asked before it has any: as
+    /// No Metal counterpart: why textures over a fresh IOSurface's pages, `length` bytes laid out
+    /// as `planes` from a page's first byte, would lie in place over no buffer of them this device
+    /// makes, whatever pages the surface comes to have, asked before it has any: as
     /// [`Self::surface_pages_never_in_place`] answers over pages each of which is a piece of its
     /// own, as a fresh surface's pages come in the guest. `None` where textures over some such
     /// pages may lie in place. Asked only of a device whose GPU shares the CPU's memory, as that
     /// is. The default is `None`.
-    fn fresh_surface_never_in_place(&self, planes: &[PagesPlane]) -> Option<String> {
-        let _ = planes;
+    fn fresh_surface_never_in_place(&self, planes: &[PagesPlane], length: u64) -> Option<String> {
+        let _ = (planes, length);
         None
     }
     /// No Metal counterpart: the bytes the device aligns the offset and rows of a linear BGRA8

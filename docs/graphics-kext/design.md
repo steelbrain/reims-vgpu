@@ -784,10 +784,11 @@ Stages:
       asks with the surface's layout (`DEFERRED` with `ASK_CACHE` and no
       runs). The host defers the block only where textures over the layout
       would lie in place over no import of any pages the surface may come
-      to have (`GpuDevice::fresh_surface_never_in_place`): rows that end
-      inside the GPU's lines, which no pages change, or, on RADV, a plane of
-      more pages than one dma-buf takes pieces, each counted a piece of its
-      own, as a fresh surface's come (**measured** on the 780M: Safari's
+      to have (`GpuDevice::fresh_surface_never_in_place`, the runtime's
+      answer before any import of the pages, which makes no image): rows
+      that end inside the GPU's lines, which no pages change, or, on RADV, a
+      plane of more pages than one dma-buf takes pieces, each counted a piece
+      of its own, as a fresh surface's come (**measured** on the 780M: Safari's
       WebKit tiles of 1,824 pages came in 1,379 to 1,824 runs). It refuses
       every other with nothing made, as it refuses one past its budget, and
       the kext then names the block's pages asking as above: answered a

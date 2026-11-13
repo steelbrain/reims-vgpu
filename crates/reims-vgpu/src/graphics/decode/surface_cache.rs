@@ -9525,11 +9525,11 @@ mod tests {
     }
 
     /// On a GPU that shares the CPU's memory, a fresh block that asks to be deferred is asked of
-    /// the device with its planes alone, no page named: where textures over them would lie in
-    /// place over no import of any pages, it is a cache of zeros with no view (the platform's new
-    /// buffer, which the host zeroes no further), as a deferred block of a GPU of its own memory
-    /// is. Where they may lie in place, it is refused with nothing made, counted, and its pages
-    /// then ask whether it needs a cache as any block's do
+    /// the device with its planes and its length alone, no page named: where textures over them
+    /// would lie in place over no import of any pages, it is a cache of zeros with no view (the
+    /// platform's new buffer, which the host zeroes no further), as a deferred block of a GPU of
+    /// its own memory is. Where they may lie in place, it is refused with nothing made, counted,
+    /// and its pages then ask whether it needs a cache as any block's do
     #[test]
     fn a_fresh_block_asking_is_deferred_only_where_it_would_need_a_cache() {
         let mut r = deferring_asking(8);
@@ -9543,6 +9543,11 @@ mod tests {
             RGFX_STATUS_OK
         );
         assert_eq!(world.fresh_surfaces_asked(), [planes]);
+        assert_eq!(
+            world.fresh_lengths_asked(),
+            [2 * page],
+            "the block's length"
+        );
         let calls = r.p.call_log().since(mark);
         assert_eq!(r.dec.caches().len(), 1, "a cache");
         assert!(

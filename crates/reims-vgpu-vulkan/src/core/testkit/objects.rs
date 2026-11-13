@@ -957,10 +957,11 @@ pub struct World {
     /// [`GpuDevice::surface_pages_never_in_place`]: crate::core::platform::device::GpuDevice::surface_pages_never_in_place
     never_in_place: Mutex<(Option<String>, Vec<PagesRuns>)>,
     /// What the devices' [`GpuDevice::fresh_surface_never_in_place`] answers
-    /// ([`World::answer_fresh_surfaces`]), and the planes each call was asked of, in order.
+    /// ([`World::answer_fresh_surfaces`]), and the planes and length each call was asked of, in
+    /// order.
     ///
     /// [`GpuDevice::fresh_surface_never_in_place`]: crate::core::platform::device::GpuDevice::fresh_surface_never_in_place
-    fresh_never_in_place: Mutex<(Option<String>, Vec<Vec<PagesPlane>>)>,
+    fresh_never_in_place: Mutex<(Option<String>, Vec<(Vec<PagesPlane>, u64)>)>,
 }
 
 /// A surface's pages as host addresses, as runs, in its order.
@@ -1062,12 +1063,17 @@ impl World {
     }
 
     /// What the devices answer to [`GpuDevice::fresh_surface_never_in_place`] asked of `planes`
-    /// ([`World::answer_fresh_surfaces`]), the planes asked of kept.
+    /// over `length` bytes ([`World::answer_fresh_surfaces`]), the planes and length asked of
+    /// kept.
     ///
     /// [`GpuDevice::fresh_surface_never_in_place`]: crate::core::platform::device::GpuDevice::fresh_surface_never_in_place
-    pub fn fresh_surface_never_in_place(&self, planes: &[PagesPlane]) -> Option<String> {
+    pub fn fresh_surface_never_in_place(
+        &self,
+        planes: &[PagesPlane],
+        length: u64,
+    ) -> Option<String> {
         let mut state = self.fresh_never_in_place.lock();
-        state.1.push(planes.to_vec());
+        state.1.push((planes.to_vec(), length));
         state.0.clone()
     }
 
@@ -1076,7 +1082,19 @@ impl World {
     ///
     /// [`GpuDevice::fresh_surface_never_in_place`]: crate::core::platform::device::GpuDevice::fresh_surface_never_in_place
     pub fn fresh_surfaces_asked(&self) -> Vec<Vec<PagesPlane>> {
-        self.fresh_never_in_place.lock().1.clone()
+        (self.fresh_never_in_place.lock().1.iter())
+            .map(|(planes, _)| planes.clone())
+            .collect()
+    }
+
+    /// The length each call of [`GpuDevice::fresh_surface_never_in_place`] was asked of, in
+    /// order.
+    ///
+    /// [`GpuDevice::fresh_surface_never_in_place`]: crate::core::platform::device::GpuDevice::fresh_surface_never_in_place
+    pub fn fresh_lengths_asked(&self) -> Vec<u64> {
+        (self.fresh_never_in_place.lock().1.iter())
+            .map(|&(_, length)| length)
+            .collect()
     }
 
     /// The pages, host addresses as runs, each call of [`GpuDevice::surface_pages_never_in_place`]

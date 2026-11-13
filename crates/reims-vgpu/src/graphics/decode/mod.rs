@@ -1607,7 +1607,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                         );
                         return Some(RGFX_STATUS_INVALID_ARGUMENT);
                     };
-                    let Some(why) = device.fresh_surface_never_in_place(&planes) else {
+                    let Some(why) = device.fresh_surface_never_in_place(&planes, pages.length)
+                    else {
                         self.surface_caches.lock().deferred_in_place();
                         log::debug!(
                             target: "reims_vgpu::graphics::surface_pages",

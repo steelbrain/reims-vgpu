@@ -130,9 +130,10 @@
 //! block in place asks for it at its `SURFACE_PAGES` (`RGFX_SURFACE_PAGES_ASK_CACHE`), with its
 //! surface's planes, which must lie in its bytes ([`layout_planes`]). Where the device answers
 //! first that textures over the surface would lie in place over no buffer of its pages, whatever
-//! it imports them as ([`GpuDevice::surface_pages_never_in_place`], asked of the runs' host pages
-//! a view would map: on a device that imports views as dma-bufs alone, RADV, by the dma-bufs'
-//! verdicts and the count of each plane's pieces against one dma-buf's), the block is answered
+//! it imports them as ([`GpuDevice::surface_pages_never_in_place`], the runtime's answer before
+//! any import, asked of the runs' host pages a view would map: on a device that imports views as
+//! dma-bufs alone, RADV, the dma-bufs' answers and the count of each plane's pieces against one
+//! dma-buf's), the block is answered
 //! `RGFX_STATUS_CACHE` at once, with no view made ([`SurfaceViews::cache_unmade`]), where its runs
 //! pass a view's checks. Otherwise its view is made as any block's, and the device asked whether
 //! textures over it lie in place ([`GpuDevice::surface_pages_in_place`]). Where they do, or where

@@ -309,8 +309,8 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
     /// Unlogged, as the world answers it: [`World::answer_fresh_surfaces`].
     ///
     /// [`World::answer_fresh_surfaces`]: crate::core::testkit::objects::World::answer_fresh_surfaces
-    fn fresh_surface_never_in_place(&self, planes: &[PagesPlane]) -> Option<String> {
-        self.world().fresh_surface_never_in_place(planes)
+    fn fresh_surface_never_in_place(&self, planes: &[PagesPlane], length: u64) -> Option<String> {
+        self.world().fresh_surface_never_in_place(planes, length)
     }
 
     fn new_compute_pipeline_state_for_function(
