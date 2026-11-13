@@ -15,11 +15,12 @@
 //! - **What is not given.** The relative priority within the class stays 0, the class's own; no
 //!   policy or priority is set through `pthread_setschedparam`, which would take the thread out of
 //!   the QoS classes for good; no CPU is chosen.
-//! - **The threads the library starts** (a queue's worker, a named thread, a lane's) run at the
-//!   default class whatever their creator's: `pthread_create` gives a thread whose attributes name
-//!   no class `QOS_CLASS_DEFAULT` (`<sys/qos.h>`; the tests read it back), so a walk thread passes
+//! - **The threads the library starts** (a queue's worker, a named thread) run at the default
+//!   class whatever their creator's: `pthread_create` gives a thread whose attributes name no
+//!   class `QOS_CLASS_DEFAULT` (`<sys/qos.h>`; the tests read it back), so a walk thread passes
 //!   its class to none of them and nothing drops it, where Linux's floor is inherited and dropped
-//!   (`os/linux/hints.rs`). The runtime's threads and MoltenVK's are theirs.
+//!   (`os/linux/hints.rs`). A lane's thread gives itself the hint as it starts. The runtime's
+//!   threads and MoltenVK's are theirs.
 //!
 //! The first hint's outcome is logged once.
 
@@ -98,8 +99,8 @@ mod tests {
         assert_eq!(after, (USER_INITIATED, 0));
     }
 
-    /// A queue's worker, a named thread and a `std::thread` (a lane's), each started from a walk
-    /// thread, run at the default class, while the walk thread keeps its own
+    /// A queue's worker and a named thread, each started from a walk thread, run at the default
+    /// class, while the walk thread keeps its own
     #[test]
     fn a_thread_started_from_a_walk_thread_runs_at_the_default_class() {
         let (tx, rx) = mpsc::channel();
@@ -108,7 +109,7 @@ mod tests {
             512 * 1024,
             Box::new(move || {
                 MacThreads::new().give_walk_hints();
-                let (worker_tx, plain_tx, lane_tx) = (tx.clone(), tx.clone(), tx.clone());
+                let (worker_tx, plain_tx) = (tx.clone(), tx.clone());
                 MacThreads::new().spawn_worker(
                     "reims-vgpu.worker",
                     Box::new(move || worker_tx.send(("worker", read_back())).unwrap()),
@@ -118,17 +119,15 @@ mod tests {
                     512 * 1024,
                     Box::new(move || plain_tx.send(("plain", read_back())).unwrap()),
                 );
-                std::thread::spawn(move || lane_tx.send(("lane", read_back())).unwrap());
                 tx.send(("walk", read_back())).unwrap();
             }),
         );
         let mut seen: Vec<(&str, (u32, libc::c_int))> =
-            (0..4).map(|_| rx.recv_timeout(WAIT).unwrap()).collect();
+            (0..3).map(|_| rx.recv_timeout(WAIT).unwrap()).collect();
         seen.sort_by_key(|(who, _)| *who);
         assert_eq!(
             seen,
             [
-                ("lane", (DEFAULT, 0)),
                 ("plain", (DEFAULT, 0)),
                 ("walk", (USER_INITIATED, 0)),
                 ("worker", (DEFAULT, 0)),
