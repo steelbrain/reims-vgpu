@@ -448,7 +448,9 @@ RgfxCreated RgfxSerializer::createBufferAtOffset(RgfxObjId heap, uint64_t offset
 	msg.offset = offset;
 	msg.length = length;
 	msg.options = RgfxHostResourceOptions(options);
-	out.posted = m_control.tryPost(RGFX_CMD_BUFFER_AT_OFFSET, &msg, sizeof(msg), &out.seqno);
+	out.posted = m_control.batches()
+	                 ? m_control.postLater(RGFX_CMD_BUFFER_AT_OFFSET, &msg, sizeof(msg))
+	                 : m_control.tryPost(RGFX_CMD_BUFFER_AT_OFFSET, &msg, sizeof(msg), &out.seqno);
 	return out;
 }
 
@@ -1613,20 +1615,41 @@ bool RgfxSerializer::destroy(RgfxObjId obj_id, std::function<void()> after, bool
 	// A waiting record may name the object (a pipeline or a buffer the app lets go after
 	// encoding it), so the records go first.
 	flushIcbWrites();
+	// Refused just now: it waits for the next destroy or commit.
+	auto noteRefused = [obj_id] {
+		static std::atomic<bool> logged{false};
+		if (!logged.exchange(true))
+			std::fprintf(stderr,
+			             "RGFX: the destroy of 0x%llx was not posted: it waits, and what the "
+			             "object lies over stays the host's, until a later destroy or commit posts "
+			             "it\n",
+			             static_cast<unsigned long long>(obj_id));
+	};
 	// Held to go with others, before anything the process posts after it: what it lay over goes
-	// back now, as anything that takes it again is posted after the destroy.
+	// back now, as anything that takes it again is posted after the destroy. Behind the destroys
+	// refused before, which go first; refused (they or the held before it were), it waits behind
+	// them.
 	if (m_control.batches()) {
-		RgfxObjectDestroy msg = {};
-		msg.obj_id = obj_id;
-		const uint32_t type = RGFX_CMD_OBJECT_DESTROY;
-		const bool posted = atOnce ? m_control.tryPost(type, &msg, sizeof(msg), nullptr)
-		                           : m_control.postLater(type, &msg, sizeof(msg));
+		bool posted = postWaitingDestroys();
+		if (posted) {
+			RgfxObjectDestroy msg = {};
+			msg.obj_id = obj_id;
+			const uint32_t type = RGFX_CMD_OBJECT_DESTROY;
+			posted = atOnce ? m_control.tryPost(type, &msg, sizeof(msg), nullptr)
+			                : m_control.postLater(type, &msg, sizeof(msg));
+		}
 		if (posted) {
 			if (after)
 				after();
 			return true;
 		}
-		// Refused at once (the held before it were too): it waits as below.
+		{
+			std::lock_guard<std::mutex> lock(m_destroyLock);
+			m_destroys.push_back({obj_id, std::move(after)});
+			m_destroysWaiting.store(true, std::memory_order_release);
+		}
+		noteRefused();
+		return false;
 	}
 	// With none waiting, it goes at once; else behind those waiting, which go first.
 	const bool behind = m_destroysWaiting.load(std::memory_order_acquire);
@@ -1642,14 +1665,13 @@ bool RgfxSerializer::destroy(RgfxObjId obj_id, std::function<void()> after, bool
 	}
 	if (behind)
 		return postWaitingDestroys();
-	// Refused just now: it waits for the next destroy or commit.
-	static std::atomic<bool> logged{false};
-	if (!logged.exchange(true))
-		std::fprintf(stderr,
-		             "RGFX: the destroy of 0x%llx was not posted: it waits, and what the object "
-		             "lies over stays the host's, until a later destroy or commit posts it\n",
-		             static_cast<unsigned long long>(obj_id));
+	noteRefused();
 	return false;
+}
+
+bool RgfxSerializer::postHeldCreates()
+{
+	return m_control.flushLater() || !m_control.holdsBut(RGFX_CMD_OBJECT_DESTROY);
 }
 
 bool RgfxSerializer::postWaitingDestroys()

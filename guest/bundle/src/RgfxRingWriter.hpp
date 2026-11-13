@@ -147,18 +147,22 @@ public:
 	/// Whether postLater() holds messages to go together (setBatch).
 	bool batches() const { return m_later != nullptr; }
 
-	/// Posts a message no one waits for (a destroy) together with others where the writer
-	/// batches (setBatch): held, to go in the order held before anything the writer posts after
-	/// it (each tryPost, tryPostKnown and tryPostShared posts the held first), at flushLater(),
-	/// once the held reach the batch's bytes, or setBatch's time after the first held. Else, or for
-	/// a message larger than a batch, posted as tryPost() posts it. True once held or posted. A
-	/// held message the route refuses stays held, first, and the writer posts nothing else until
-	/// it goes.
+	/// Posts a message no one waits for (a destroy, a heap-placed buffer) together with others
+	/// where the writer batches (setBatch): held, to go in the order held before anything the
+	/// writer posts after it (each tryPost, tryPostKnown and tryPostShared posts the held first),
+	/// at flushLater(), once the held reach the batch's bytes, or setBatch's time after the first
+	/// held. Else, or for a message larger than a batch, posted as tryPost() posts it. True once
+	/// held or posted; false, holding nothing more, where the held had to go first to make room
+	/// and the route refused them. A held message the route refuses stays held, first, and the
+	/// writer posts nothing else until it goes.
 	bool postLater(uint32_t type, const void *message, uint32_t size);
 
 	/// Posts what postLater() holds, in its order: whether none is held now. One atomic load
 	/// where none is.
 	bool flushLater();
+
+	/// Whether postLater() holds a message of a type other than `type`.
+	bool holdsBut(uint32_t type);
 
 	/// Whether the route keeps answers for later (setDeferred), so a known pipeline create need
 	/// not wait.

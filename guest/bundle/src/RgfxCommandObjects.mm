@@ -2239,8 +2239,13 @@ enum RgfxStage : unsigned {
 	// host carries out before any later command buffer of the process: the buffer sees every
 	// encode made before its commit, as on every Mac.
 	// So do the destroys the kext refused before (RgfxSerializer::destroy), which free what their
-	// objects lay over once posted.
+	// objects lay over once posted, and the messages held to go together before them
+	// (RgfxSerializer::postHeldCreates): the buffer may name an object one of them makes, which
+	// the host has only where the kext took it, so a buffer behind a create it never took fails
+	// here, unposted, as Metal's work fails at commit on a GPU that is gone.
+	bool heldPosted = true;
 	if (RgfxSerializer *serializer = [queue serializer]) {
+		heldPosted = serializer->postHeldCreates();
 		const RgfxIcbFlush flush = serializer->flushIcbWrites();
 		if (flush.messages != 0)
 			rgfxNoteIcbFlush(flush);
@@ -2255,7 +2260,8 @@ enum RgfxStage : unsigned {
 	const bool held = [queue rgfxHeldBuffers] > 0 || ![self rgfxWaitsMet];
 	if (held)
 		[queue rgfxNoteHeld];
-	const bool posted = _encoder->finish(&_seqno, whileWaiting, expect, outOfLine ? &_body : nullptr);
+	const bool posted =
+	    heldPosted && _encoder->finish(&_seqno, whileWaiting, expect, outOfLine ? &_body : nullptr);
 	// On its ring: the posts of other queues from here name it (RgfxCommitOrder::posted).
 	if (posted)
 		[queue rgfxNotePosted:_seqno];
@@ -2296,10 +2302,16 @@ enum RgfxStage : unsigned {
 	    (_scheduledAsk.fetch_or(kRgfxAskPosted, std::memory_order_acq_rel) & kRgfxAskWanted) != 0)
 		[self rgfxPostScheduledAsk];
 	if (!posted) {
-		// No block for it: the buffer fails as Metal's does when memory runs out, and its
-		// handlers run off the committing thread.
-		static char site;
-		if (rgfxLogFirst(&site))
+		// No block for it: the buffer fails as Metal's does when memory runs out. Behind a
+		// create the kext never took (its control ring stayed full, or the device stopped): it
+		// fails as a GPU recovery's victim does. Either way its handlers run off the committing
+		// thread.
+		static char site, heldSite;
+		if (!heldPosted && rgfxLogFirst(&heldSite))
+			NSLog(@"RGFX: command buffer 0x%llx: an object made before it never reached the "
+			      @"device: it fails with MTLCommandBufferErrorInternal",
+			      (unsigned long long)[self rgfxObjId]);
+		else if (heldPosted && rgfxLogFirst(&site))
 			NSLog(@"RGFX: command buffer 0x%llx: no region block for its %llu bytes: it fails "
 			      @"with MTLCommandBufferErrorOutOfMemory",
 			      (unsigned long long)[self rgfxObjId], (unsigned long long)messageBytes);
@@ -2307,7 +2319,8 @@ enum RgfxStage : unsigned {
 		failed.header.type = RGFX_EVT_CB_COMPLETE;
 		failed.cb_obj_id = [self rgfxObjId];
 		failed.status = RGFX_CB_INTERNAL;
-		failed.error_code = MTLCommandBufferErrorOutOfMemory;
+		failed.error_code =
+		    heldPosted ? MTLCommandBufferErrorOutOfMemory : MTLCommandBufferErrorInternal;
 		RgfxCmdBuffer *strongSelf = self;
 		[self rgfxHostDone:&failed];
 		[queue rgfxDeliver:^{

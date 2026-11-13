@@ -296,10 +296,11 @@ public:
 	void setReleaseAnswer(OSObject *target, ReleaseAnswerHook hook);
 	IOReturn postReleases(const RgfxBlockRelease *releases, UInt32 count,
 	                      UInt64 *const *waiterSeqnos, UInt32 *posted);
-	// `count` messages of `type`, each `size` bytes at `messages` back to back, which no thread
-	// waits for: on the control ring in order as postReleases puts its releases (each one's seqno
-	// into *waiterSeqnos[i] where `waiterSeqnos` is not null), *posted those posted. A process's
-	// destroys in one call (kRgfxAccelMethodSubmitBatch) and the block releases go so.
+	// `count` messages of `type`, each `size` bytes at `messages` back to back, or, with `type`
+	// 0 (the pad's, never a command's), each of the type and size its own header names, which no
+	// thread waits for: on the control ring in order as postReleases puts its releases (each
+	// one's seqno into *waiterSeqnos[i] where `waiterSeqnos` is not null), *posted those posted.
+	// A process's batch (kRgfxAccelMethodSubmitBatch) and the block releases go so.
 	IOReturn postRun(UInt32 type, const void *messages, UInt32 size, UInt32 count,
 	                 UInt64 *const *waiterSeqnos, UInt32 *posted);
 	// A lifecycle message (a CONTEXT_CLOSE) no thread waits for here, its COMPLETE handed to the

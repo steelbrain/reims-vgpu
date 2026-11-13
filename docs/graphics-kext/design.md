@@ -1909,20 +1909,25 @@ library the app let go names a library the host still holds. The host makes the
 pipeline from the library before the library's destroy, and the pipeline needs
 it no more.
 
-**Destroys go together.** Each call into the kext costs the guest its trip
-through the kernel, and a post that finds the host's control thread asleep a
-doorbell's exit too: 14 us a destroy in a Vision request on the RTX 3090 host
-(9 to 10 us without the doorbell), 3415 destroys and 68 to 70 ms a process,
-in runs of about 70 an app lets go back to back. So where the kext carries
-`SubmitBatch` (selector 5), the bundle holds each destroy
+**Destroys and heap-placed buffers go together.** Each call into the kext
+costs the guest its trip through the kernel, and a post that finds the host's
+control thread asleep a doorbell's exit too: 14 us a destroy in a Vision
+request on the RTX 3090 host (9 to 10 us without the doorbell), 3415 destroys
+and 68 to 70 ms a process, in runs of about 70 an app lets go back to back,
+and 12 to 15 us a `BUFFER_AT_OFFSET`, the buffer a heap places (each small
+buffer of a slab), 3079 and 40 to 48 ms a process, between them. So where the
+kext carries `SubmitBatch` (selector 5), the bundle holds each of the two
 (`RgfxRingWriter::postLater`) and posts what it holds in one call, at most
-4096 bytes (170 destroys), before anything else the process posts or asks
-of the kext (every `IOConnectCall` of the device's goes through
-`rgfxKextConn`, which posts the held first), once the held fill a call, or
-1 ms after the first held. The kext checks each as `Submit` checks one, all
-before it posts any, puts the runs on the ring under one hold of its lock with
-one doorbell at most, and ends a queue's as `Submit` does, after the destroys
-before it. What an object lay over goes back as its destroy is held, as it
+4096 bytes (170 destroys, 73 buffers), before anything else the process posts
+or asks of the kext (every `IOConnectCall` of the device's goes through
+`rgfxKextConn`, which posts the held first) and before any command buffer it
+commits (the host reads a command buffer after the control ring's messages
+posted before it), once the held fill a call, or 1 ms after the first held.
+The kext checks each as `Submit` checks one, all before it posts any, puts
+the runs on the ring under one hold of its lock with one doorbell at most,
+ends a queue's as `Submit` does, after the messages before it, and follows a
+buffer made for a context that closed since its check with its destroy, as
+`Submit` does. What an object lay over goes back as its destroy is held, as it
 went back once its destroy was posted: whatever takes it again, a create over
 the bytes or with the id, or a block's free, is posted after the destroy, so
 the host has dropped the object first, and every answer the guest reads (a
@@ -1930,13 +1935,21 @@ heap's `usedSize`, a new object's GPU address and resource id) is the one it
 read before. A texture over an IOSurface goes at once: a present of the surface
 shows the newest live texture the host names it by, and waits for its destroy.
 Where the kext stops taking them (its ring stayed full 5 s, or the device
-stopped), the rest stay held, first, and the process's next post is refused as
-the ring's full ring refuses it; what the held lay over has gone back by then,
-which a guest reading a heap's `usedSize` through a 5 s stall of the control
-ring sees lower than it did. Tested by `serializer_tests`' `test_held_destroys`
-and `shell_tests`' `test_held_destroys_change_nothing_seen` and
-`test_surface_texture_destroys_go_at_once`, and the kext's by
-`submit_gate_test` and `user_client_words_test`.
+stopped), the rest stay held, first: the process's next post retries them,
+under its own post's bound, and is refused only where they are refused again,
+as the full ring refuses it; a commit that finds a buffer still held fails the
+command buffer, unposted, with `MTLCommandBufferErrorInternal`, as a GPU
+recovery's victim fails, as the buffer may name it. Two answers differ from
+an unbatched post's then, and only then: a buffer held when the kext stopped
+taking them was answered as made, where its refused post answered nil (as
+Metal makes objects on a GPU that is gone, and fails the work at commit); and
+what the held destroys lay over has gone back, which a guest reading a heap's
+`usedSize` through a 5 s stall of the control ring sees lower than it did.
+Tested by `serializer_tests`' `test_held_destroys` and
+`test_held_buffers`, `shell_tests`' `test_held_destroys_change_nothing_seen`,
+`test_surface_texture_destroys_go_at_once` and
+`test_commit_behind_an_untaken_buffer_fails`, and the kext's by
+`submit_gate_test`, `spans_test` and `user_client_words_test`.
 
 **Rings.** A 256-byte header, then a byte ring whose size is a power of two
 (64 KiB minus the header for the control rings). Each header field sits in its
@@ -3987,7 +4000,7 @@ Map 1:
 | 2 | | | given to none: the IOGPU base's device-info call on its own client type, so a trace names one call per number |
 | 3 | `Features` | | the device's feature word, the kext's and the selector map; at 3 in every map |
 | 4 | `PagesBlock` | 1 << 0 `PagesBlock` | a block of the runs of a process's own pages, wired, for its no-copy buffers |
-| 5 | `SubmitBatch` | 1 << 1 `SubmitBatch` | a process's destroys onto ring 0 in one call ("Destroys go together") |
+| 5 | `SubmitBatch` | 1 << 1 `SubmitBatch` | a process's destroys and heap-placed buffers onto ring 0 in one call ("Destroys and heap-placed buffers go together") |
 | 6 | `WakeCompletions` | 1 << 2 `WakeCompletions` | reserved: wakes the client's completion waiters |
 | 7 | `TakeAnswers` | 1 << 4 `DeferredAnswers` | hands a process its held pipeline-create answers ("Known pipeline creates") |
 | 8 | `SurfaceBlockRelease` | | lets go of a shared block |

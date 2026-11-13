@@ -223,9 +223,10 @@ bool RgfxRingWriter::postLater(uint32_t type, const void *message, uint32_t size
 	bool arm = false;
 	{
 		std::lock_guard<std::mutex> hold(later->lock);
-		// A call takes at most maxBytes: the held go first where this one would not fit with them.
-		if (later->held.size() + size > later->maxBytes)
-			later->flush();
+		// A call takes at most maxBytes: the held go first where this one would not fit with them,
+		// and it is refused where they do not, as a post behind them would be.
+		if (later->held.size() + size > later->maxBytes && !later->flush())
+			return false;
 		const size_t at = later->held.size();
 		later->held.resize(at + size);
 		std::memcpy(later->held.data() + at, message, size);
@@ -249,6 +250,22 @@ bool RgfxRingWriter::flushLater()
 		return true;
 	std::lock_guard<std::mutex> hold(later->lock);
 	return later->flush();
+}
+
+bool RgfxRingWriter::holdsBut(uint32_t type)
+{
+	RgfxRingLater *later = m_later.get();
+	if (later == nullptr || !later->any.load(std::memory_order_acquire))
+		return false;
+	std::lock_guard<std::mutex> hold(later->lock);
+	for (size_t at = 0; at < later->held.size();) {
+		RgfxMsgHeader header;
+		std::memcpy(&header, later->held.data() + at, sizeof(header));
+		if (header.type != type)
+			return true;
+		at += header.size;
+	}
+	return false;
 }
 
 bool RgfxRingWriter::tryPostKnown(uint32_t type, const void *message, uint32_t size,

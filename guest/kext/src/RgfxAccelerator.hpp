@@ -521,8 +521,9 @@ public:
 	IOReturn postLifecycle(UInt32 type, const void *message, UInt32 size, UInt32 replyType,
 	                       void *reply, UInt32 replyCapacity, UInt32 *replyLength, UInt64 *seqno,
 	                       UInt32 timeoutMs);
-	// `count` lifecycle messages of `type` no thread waits for, `size` bytes each, in one hold of
-	// the control ring (ReimsGraphics::postRun): *posted those posted.
+	// `count` lifecycle messages of `type` no thread waits for, `size` bytes each (with `type` 0,
+	// each its own header's type and size), in one hold of the control ring
+	// (ReimsGraphics::postRun): *posted those posted.
 	IOReturn postRun(UInt32 type, const void *messages, UInt32 size, UInt32 count,
 	                 UInt32 *posted);
 	// The deferred pipeline creates (ReimsGraphics::postDeferred, takeDeferred, dropDeferred,

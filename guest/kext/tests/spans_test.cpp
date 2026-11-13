@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "RgfxRegionSpans.hpp"
+#include "RgfxSubmitGate.hpp"
 
 static int g_checks = 0, g_failed = 0;
 #define CHECK(e)                                                                   \
@@ -80,6 +81,14 @@ int main()
 	CHECK(spansOf(RGFX_CMD_BUFFER_AT_OFFSET, atOffset, sizeof(atOffset), s) == 0);
 	RgfxLibraryCreate library = {};
 	CHECK(spansOf(RGFX_CMD_LIBRARY_CREATE, library, 8, s) == 0);
+	// Nor does any message SubmitBatch takes, which it posts with no block pinned.
+	uint8_t batched[256] = {};
+	for (uint32_t type = 0; type <= RGFX_CMD_CONTEXT_CLOSE + 64; type++) {
+		const uint32_t size = rgfxSubmitBatchSize(type);
+		CHECK(size <= sizeof(batched));
+		if (size != 0 && size <= sizeof(batched))
+			CHECK(rgfxRegionSpans(type, batched, size, s) == 0);
+	}
 
 	if (g_failed) {
 		std::fprintf(stderr, "spans_test: %d of %d checks failed\n", g_failed, g_checks);

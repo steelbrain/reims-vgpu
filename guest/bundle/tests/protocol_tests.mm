@@ -55,6 +55,7 @@
 #include "rgfx_test_ring.hpp" // CHECK, g_checks, TestRing, expectMessage
 
 void rgfxProtocolTests();
+void drainRing(TestRing &ring); // shell_tests.mm
 
 namespace {
 
@@ -475,6 +476,130 @@ void test_inline_bytes_without_region()
 	CHECK([cb.error.localizedDescription
 	    isEqualToString:@"Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"]);
 	} // @autoreleasepool
+}
+
+// A control route as the kext's, which holds destroys and heap-placed buffers to go together
+// (RgfxRingWriter::setBatch), over `direct`'s ring; while `refuse` is set it takes nothing, as the
+// kext where its control ring stays full or the device stopped.
+struct RefusingKext {
+	RgfxRingWriter *direct;
+	bool refuse = false;
+
+	static bool submit(void *context, const void *message, uint32_t size, uint64_t *out_seqno,
+	                   uint32_t *out_status)
+	{
+		RefusingKext *kext = static_cast<RefusingKext *>(context);
+		RgfxMsgHeader header;
+		std::memcpy(&header, message, sizeof(header));
+		if (out_status)
+			*out_status = kRgfxNoAnswer;
+		return !kext->refuse && kext->direct->tryPost(header.type, message, size, out_seqno);
+	}
+
+	static uint32_t batch(void *context, const void *messages, uint32_t bytes)
+	{
+		RefusingKext *kext = static_cast<RefusingKext *>(context);
+		const uint8_t *m = static_cast<const uint8_t *>(messages);
+		uint32_t posted = 0;
+		for (uint32_t at = 0; at < bytes && !kext->refuse; posted++) {
+			RgfxMsgHeader header;
+			std::memcpy(&header, m + at, sizeof(header));
+			if (!kext->direct->tryPost(header.type, m + at, header.size, nullptr))
+				break;
+			at += header.size;
+		}
+		return posted;
+	}
+};
+
+// A heap-placed buffer the kext never took when it was made (RgfxSerializer::createBufferAtOffset
+// holds it to go with others) fails the next command buffer committed, unposted, with
+// MTLCommandBufferErrorInternal, as the buffer may name it, and the next post is refused, as a
+// full control ring refuses it; once the kext takes them again, the buffer goes before the next
+// command buffer, which goes on its ring.
+void test_commit_behind_an_untaken_buffer_fails()
+{
+	TestRing control(0x8000);
+	RgfxRingWriter direct(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
+	                      TestRing::doorbell, nullptr);
+	RefusingKext kext{&direct};
+	RgfxRingWriter writer(&RefusingKext::submit, &kext, 0x4000);
+	writer.setBatch(&RefusingKext::batch, 4096, 600ull * 1000000000);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	TestRing submit(0x8000);
+	RgfxRingWriter submitWriter(submit.base(), submit.dataSize, 1, TestRing::doorbell, nullptr);
+	TestRing completion(0x8000);
+	RgfxReplyReader reader(completion.base(), completion.dataSize);
+	std::vector<uint8_t> mem(0x800000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	control.setConsumerIdle(1);
+	submit.setConsumerIdle(1);
+	@autoreleasepool {
+		RgfxCommandQueue *queue = nil;
+		@autoreleasepool {
+			queue = [RgfxCommandQueue queueWithSubmitRing:&submitWriter
+			                                 submitOffset:0
+			                               completeOffset:0
+			                             completeDataSize:0
+			                                          ids:&ids
+			                                     maxCount:0
+			                                       device:nil
+			                                   serializer:&ser];
+		}
+		CHECK(queue != nil);
+		queue.replyReader = &reader;
+		queue.region = &region;
+		(void)expectQueueCreate(control);
+		MTLHeapDescriptor *hd = [[MTLHeapDescriptor alloc] init];
+		hd.size = 0x100000;
+		hd.storageMode = MTLStorageModePrivate;
+		RgfxHeap *heap = [RgfxHeap heapWithDescriptor:hd device:nil serializer:&ser];
+		CHECK(heap != nil);
+		drainRing(control);
+
+		// Made while the kext takes nothing: answered as made, held.
+		kext.refuse = true;
+		id<MTLBuffer> buffer = [heap newBufferWithLength:256 options:MTLResourceStorageModePrivate];
+		CHECK(buffer != nil);
+		id<MTLCommandBuffer> cb = [queue commandBuffer];
+		id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+		[blit fillBuffer:buffer range:NSMakeRange(0, 256) value:0];
+		[blit endEncoding];
+		[cb commit];
+		[cb waitUntilCompleted];
+		CHECK(cb.status == MTLCommandBufferStatusError);
+		CHECK(cb.error != nil && [cb.error.domain isEqualToString:MTLCommandBufferErrorDomain] &&
+		      cb.error.code == MTLCommandBufferErrorInternal);
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(!submit.next(&h, &bytes));
+		CHECK(!control.next(&h, &bytes));
+		// The next post is refused: the held go first, and the kext takes none of them.
+		CHECK(!ser.createEvent().posted);
+
+		// The kext takes them again: the buffer goes, then the next command buffer is posted.
+		kext.refuse = false;
+		id<MTLCommandBuffer> next = [queue commandBuffer];
+		id<MTLBlitCommandEncoder> blit2 = [next blitCommandEncoder];
+		[blit2 fillBuffer:buffer range:NSMakeRange(0, 256) value:1];
+		[blit2 endEncoding];
+		[next commit];
+		CHECK(control.next(&h, &bytes) && h.type == RGFX_CMD_BUFFER_AT_OFFSET);
+		uint64_t obj = 0;
+		std::memcpy(&obj, bytes.data() + sizeof(h), sizeof(obj));
+		CHECK(obj == [(RgfxResource *)buffer rgfxObjId]);
+		CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER);
+		RgfxCbComplete done = {};
+		done.header.type = RGFX_EVT_CB_COMPLETE;
+		done.header.size = sizeof(done);
+		done.header.seqno = h.seqno;
+		done.cb_obj_id = ((RgfxResource *)next).rgfxObjId;
+		done.status = RGFX_CB_OK;
+		CHECK(completion.postFromHost(&done, sizeof(done)));
+		[next waitUntilCompleted];
+		CHECK(next.status == MTLCommandBufferStatusCompleted);
+	}
 }
 
 // The render barriers: the scope barrier as given; a resource barrier as the scope of the
@@ -2742,6 +2867,7 @@ void rgfxProtocolTests()
 	test_inline_bytes();
 	test_inline_bytes_parallel();
 	test_inline_bytes_without_region();
+	test_commit_behind_an_untaken_buffer_fails();
 	test_render_barriers();
 	test_compute_dispatch_type();
 	test_compute_function_table_bindings();

@@ -432,7 +432,10 @@ public:
 	RgfxCreated createBufferOverPages(uint64_t length, uint32_t options, uint64_t block_offset,
 	                                  uint64_t block_size, uint64_t offset);
 
-	/// A buffer at `offset` in the heap `heap`.
+	/// A buffer at `offset` in the heap `heap`. No one waits for it: where the control ring
+	/// batches (RgfxRingWriter::postLater), it is held to go with the messages around it, before
+	/// anything posted after it and before any command buffer committed after it
+	/// (postHeldCreates), and `seqno` is 0.
 	RgfxCreated createBufferAtOffset(RgfxObjId heap, uint64_t offset, uint64_t length,
 	                                 uint32_t options);
 
@@ -725,13 +728,20 @@ public:
 	/// whatever reuses what it gives back, a create or a block's free, is posted after the held
 	/// destroys, so the host still drops the object first. A destroy the host orders other
 	/// contexts' messages by goes `atOnce`: a texture over an IOSurface, which a present of the
-	/// surface waits for (docs/graphics-kext/design.md, "Destroys go together").
+	/// surface waits for (docs/graphics-kext/design.md, "Destroys and heap-placed buffers go
+	/// together").
 	bool destroy(RgfxObjId obj_id, std::function<void()> after = {}, bool atOnce = false);
 
 	/// Posts the destroys waiting (destroy()), in the order they were made, each one's `after`
 	/// run once it is on the ring, until one is refused again. One load where none waits.
 	/// Returns whether none waits now.
 	bool postWaitingDestroys();
+
+	/// Posts what the control ring holds to go together (RgfxRingWriter::postLater), as a command
+	/// buffer's commit does before the buffer goes on its ring, which the host reads after the
+	/// control ring's messages posted before it: whether no create stays held, which the buffer
+	/// may name. Destroys left held wait for a later post, as refused ones do.
+	bool postHeldCreates();
 
 	/// The default alignment for a picked GPU address when the caller names none.
 	/// The caller passes a caps-derived alignment where Metal demands one; this

@@ -1497,7 +1497,7 @@ struct KextRing {
 		for (uint32_t at = 0; at < bytes; posted++) {
 			RgfxMsgHeader header;
 			std::memcpy(&header, m + at, sizeof(header));
-			CHECK(header.type == RGFX_CMD_OBJECT_DESTROY);
+			CHECK(header.type == RGFX_CMD_OBJECT_DESTROY || header.type == RGFX_CMD_BUFFER_AT_OFFSET);
 			if (!kext->direct.tryPost(header.type, m + at, header.size, nullptr))
 				break;
 			at += header.size;

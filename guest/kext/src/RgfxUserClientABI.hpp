@@ -71,15 +71,17 @@ enum {
 	// kIOReturnNoSpace or kIOReturnNoResources where the region or the kext's table has no room
 	// for the block.
 	kRgfxAccelMethodPagesBlock = 4,
-	// Posts the client's destroys of its own objects on the control ring in one call
-	// (kRgfxKextFeatureSubmitBatch): struct in, inline, OBJECT_DESTROY messages back to back,
-	// each whole (its header's type set; the kext stamps its size and seqno) and of an object in
-	// the client's context, at most kRgfxSubmitBatchBytes in all; out: how many were posted, in
-	// their order, each as kRgfxAccelMethodSubmit posts it (a destroy of one of the client's
-	// command queues ends the queue as Submit's does, after the destroys before it). None is
-	// posted where any is not such a destroy (kIOReturnBadArgument). Succeeds with fewer than
-	// all only where the control ring stayed full or the device stopped: the rest were not
-	// posted, and go in a later call, before anything else of the client's.
+	// Posts the client's destroys and heap-placed buffers of its own objects on the control ring
+	// in one call (kRgfxKextFeatureSubmitBatch): struct in, inline, OBJECT_DESTROY and
+	// BUFFER_AT_OFFSET messages back to back, each whole (its header's type and size set, the
+	// size its type's; the kext stamps its seqno) and of an object in the client's context, at
+	// most kRgfxSubmitBatchBytes in all; out: how many were posted, in their order, each as
+	// kRgfxAccelMethodSubmit posts it (a destroy of one of the client's command queues ends the
+	// queue as Submit's does, after the messages before it; a buffer of a context closed since is
+	// destroyed behind it). None is posted where any is not such a message
+	// (kIOReturnBadArgument). Succeeds with fewer than all only where the control ring stayed full
+	// or the device stopped: the rest were not posted, and go in a later call, before anything
+	// else of the client's.
 	kRgfxAccelMethodSubmitBatch = 5,
 	// 6 is kept for WakeCompletions (kRgfxKextFeatureWakeCompletions).
 	// The answers to the client's deferred pipeline creates (Submit's kRgfxSubmitDeferred) the
@@ -288,7 +290,7 @@ enum {
 };
 
 // The most bytes of messages one kRgfxAccelMethodSubmitBatch takes: an inline struct in, 170
-// destroys.
+// destroys or 73 heap-placed buffers.
 enum {
 	kRgfxSubmitBatchBytes = 4096,
 };

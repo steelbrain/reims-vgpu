@@ -60,16 +60,22 @@ int main()
 	check(!rgfxSubmitRoutesQueueDestroy(RGFX_CMD_QUEUE_CREATE), "QUEUE_CREATE does not route");
 	check(!rgfxSubmitRoutesQueueDestroy(RGFX_CMD_BLOCK_RELEASE), "BLOCK_RELEASE does not route");
 
-	// SubmitBatch takes destroys alone: a message no one waits for, which names no block and
-	// makes nothing, so the batch needs neither answers, pins nor destroys behind it. Every
+	// SubmitBatch takes destroys and heap-placed buffers, each of its one size: messages no one
+	// waits for, which name no block (spans_test), so the batch needs neither answers nor pins;
+	// the buffer is a create, which a close since the check follows with its destroy. Every
 	// other type, accepted by Submit or not, goes one call at a time.
-	check(rgfxSubmitBatchAdmitted(RGFX_CMD_OBJECT_DESTROY), "SubmitBatch takes OBJECT_DESTROY");
+	check(rgfxSubmitBatchSize(RGFX_CMD_OBJECT_DESTROY) == sizeof(RgfxObjectDestroy),
+	      "SubmitBatch takes OBJECT_DESTROY, of its size");
+	check(rgfxSubmitBatchSize(RGFX_CMD_BUFFER_AT_OFFSET) == sizeof(RgfxBufferAtOffset),
+	      "SubmitBatch takes BUFFER_AT_OFFSET, of its size");
 	check(rgfxSubmitAdmitted(RGFX_CMD_OBJECT_DESTROY) && !rgfxSubmitMakes(RGFX_CMD_OBJECT_DESTROY),
 	      "a batched destroy is one Submit takes, and makes nothing");
+	check(rgfxSubmitAdmitted(RGFX_CMD_BUFFER_AT_OFFSET) && rgfxSubmitMakes(RGFX_CMD_BUFFER_AT_OFFSET),
+	      "a batched heap-placed buffer is one Submit takes, and makes one");
 	for (uint32_t type = 0; type <= RGFX_CMD_CONTEXT_CLOSE + 64; type++) {
-		if (type == RGFX_CMD_OBJECT_DESTROY)
+		if (type == RGFX_CMD_OBJECT_DESTROY || type == RGFX_CMD_BUFFER_AT_OFFSET)
 			continue;
-		check(!rgfxSubmitBatchAdmitted(type), "SubmitBatch takes no other type");
+		check(rgfxSubmitBatchSize(type) == 0, "SubmitBatch takes no other type");
 	}
 
 	// Which accepted types make an object a destroy then drops: every type of the accepted

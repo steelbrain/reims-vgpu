@@ -56,12 +56,22 @@ inline bool rgfxSubmitRoutesQueueDestroy(uint32_t type)
 	return type == RGFX_CMD_OBJECT_DESTROY;
 }
 
-// Whether kRgfxAccelMethodSubmitBatch takes a message of `type`: an OBJECT_DESTROY alone, which no
-// one waits for, names no block and makes nothing (the caller also checks its obj_id lies in the
-// sender's context, and routes a queue's as rgfxSubmitRoutesQueueDestroy says).
-inline bool rgfxSubmitBatchAdmitted(uint32_t type)
+// The size of a message of `type` kRgfxAccelMethodSubmitBatch takes, 0 for a type it does not
+// take: an OBJECT_DESTROY, and a BUFFER_AT_OFFSET, the buffer a heap places at an offset. Neither
+// is waited for nor names a block (rgfxRegionSpans), and each is of one size, which its header
+// must name. The caller also checks each obj_id lies in the sender's context, routes a queue's
+// destroy as rgfxSubmitRoutesQueueDestroy says, and follows a create with its destroy as
+// rgfxSubmitDestroysBehind says.
+inline uint32_t rgfxSubmitBatchSize(uint32_t type)
 {
-	return type == RGFX_CMD_OBJECT_DESTROY;
+	switch (type) {
+	case RGFX_CMD_OBJECT_DESTROY:
+		return sizeof(RgfxObjectDestroy);
+	case RGFX_CMD_BUFFER_AT_OFFSET:
+		return sizeof(RgfxBufferAtOffset);
+	default:
+		return 0;
+	}
 }
 
 // Whether an accepted `type` is a pipeline create: a render, mesh render or compute pipeline's,

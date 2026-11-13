@@ -2457,7 +2457,10 @@ uint32_t kextSubmitBatch(void *context, const void *messages, uint32_t bytes)
 	for (uint32_t at = 0; at < bytes && taken < log->batchTakes; taken++) {
 		RgfxMsgHeader header;
 		std::memcpy(&header, m + at, sizeof(header));
-		CHECK(header.size == sizeof(RgfxObjectDestroy) && header.seqno == 0);
+		CHECK(header.seqno == 0);
+		CHECK(header.type == RGFX_CMD_OBJECT_DESTROY ? header.size == sizeof(RgfxObjectDestroy)
+		                                             : header.type == RGFX_CMD_BUFFER_AT_OFFSET &&
+		                                                   header.size == sizeof(RgfxBufferAtOffset));
 		call.objs.push_back(KextLog::objOf(m + at));
 		call.types.push_back(header.type);
 		at += header.size;
@@ -2569,6 +2572,87 @@ void test_held_destroys()
 	// Its timer, which outlives it, then finds it gone and posts nothing more.
 	std::this_thread::sleep_for(std::chrono::milliseconds(3));
 	CHECK(ending.calls.size() == 1);
+}
+
+// Heap-placed buffers held to go together with the destroys around them
+// (RgfxSerializer::createBufferAtOffset): each answered as made and held, in their order with the
+// destroys, before anything posted after them; a commit's postHeldCreates() answers whether none
+// stays held, destroys left aside; a buffer that needs the held to go first to make room is
+// refused at once where they are refused, holding nothing more; a writer that does not batch
+// posts each at once, as before.
+void test_held_buffers()
+{
+	constexpr uint64_t kNever = 600ull * 1000000000;
+	KextLog log;
+	RgfxRingWriter writer(&kextSubmit, &log, 4096);
+	writer.setBatch(&kextSubmitBatch, 4096, kNever);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+
+	RgfxCreated a = ser.createBufferAtOffset(0x10, 0, 256, 0);
+	CHECK(a.posted && a.obj_id != 0 && a.seqno == 0);
+	CHECK(ser.destroy(0x101));
+	RgfxCreated b = ser.createBufferAtOffset(0x10, 256, 256, 0);
+	CHECK(b.posted);
+	CHECK(log.calls.empty());
+	CHECK(ser.postHeldCreates());
+	CHECK(log.calls.size() == 1 && log.calls[0].batch);
+	CHECK(log.calls[0].objs == std::vector<RgfxObjId>({a.obj_id, 0x101, b.obj_id}));
+	CHECK(log.calls[0].types == std::vector<uint32_t>({RGFX_CMD_BUFFER_AT_OFFSET,
+	                                                   RGFX_CMD_OBJECT_DESTROY,
+	                                                   RGFX_CMD_BUFFER_AT_OFFSET}));
+
+	// Before what is posted after them.
+	log.calls.clear();
+	RgfxCreated c = ser.createBufferAtOffset(0x10, 512, 256, 0);
+	RgfxCreated ev = ser.createEvent();
+	CHECK(c.posted && ev.posted);
+	CHECK(log.ring() == std::vector<RgfxObjId>({c.obj_id, ev.obj_id}));
+
+	// The kext takes none: a held buffer leaves the commit's answer false, held destroys alone
+	// do not; once it takes them they go, in order.
+	log.calls.clear();
+	log.batchTakes = 0;
+	CHECK(ser.destroy(0x201));
+	CHECK(ser.postHeldCreates());
+	RgfxCreated d = ser.createBufferAtOffset(0x10, 768, 256, 0);
+	CHECK(d.posted);
+	CHECK(!ser.postHeldCreates());
+	CHECK(!ser.postHeldCreates());
+	CHECK(log.calls.empty());
+	// So is the next post refused, posting nothing.
+	CHECK(!ser.createEvent().posted);
+	CHECK(log.calls.empty());
+	log.batchTakes = UINT32_MAX;
+	CHECK(ser.postHeldCreates());
+	CHECK(log.ring() == std::vector<RgfxObjId>({0x201, d.obj_id}));
+
+	// 73 buffers fill a call (56 bytes each): with the kext taking none, the 74th, which needs
+	// them gone to make room, is refused, and nothing more is held; once the kext takes them,
+	// the 73 go in one call.
+	log.calls.clear();
+	std::vector<RgfxObjId> held;
+	for (int i = 0; i < 73; i++) {
+		RgfxCreated m = ser.createBufferAtOffset(0x10, 4096u * i, 64, 0);
+		CHECK(m.posted);
+		held.push_back(m.obj_id);
+	}
+	CHECK(log.calls.empty());
+	log.batchTakes = 0;
+	CHECK(!ser.createBufferAtOffset(0x10, 0, 64, 0).posted);
+	log.batchTakes = UINT32_MAX;
+	CHECK(writer.flushLater());
+	CHECK(log.calls.size() == 1 && log.calls[0].batch && log.calls[0].objs == held);
+
+	// A writer that does not batch posts each at once.
+	KextLog plain;
+	RgfxRingWriter direct(&kextSubmit, &plain, 4096);
+	RgfxSerializer pser(direct, ids);
+	RgfxCreated p = pser.createBufferAtOffset(0x10, 0, 64, 0);
+	CHECK(p.posted && p.seqno != 0);
+	CHECK(plain.calls.size() == 1 && !plain.calls[0].batch &&
+	      plain.calls[0].types[0] == RGFX_CMD_BUFFER_AT_OFFSET);
+	CHECK(pser.postHeldCreates());
 }
 
 // A synthetic .metallib: its header (the bitcode section at 0x60, 16 bytes), a stand-in for the
@@ -3864,6 +3948,7 @@ int main()
 	test_render_pass_visibility();
 	test_forwarded_lifecycle();
 	test_held_destroys();
+	test_held_buffers();
 	test_library_key();
 	test_library_key_of_file();
 	test_keyed_library_messages();

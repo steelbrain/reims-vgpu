@@ -636,62 +636,101 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	return kIOReturnSuccess;
 }
 
-// kRgfxAccelMethodSubmitBatch (RgfxUserClientABI.hpp): the client's destroys of its own objects
-// onto the control ring in one call, each checked as submitMethod checks one, all before any is
-// posted, then posted in their order: the runs between its queues' destroys under one hold of the
-// ring each (RgfxAccelerator::postRun), and each queue's destroy routed as submitMethod routes it
-// (destroyQueueIfTracked) after the run before it. The count out says how many went: all of them,
-// but where a run met a ring that stayed full or a device that stopped.
+// kRgfxAccelMethodSubmitBatch (RgfxUserClientABI.hpp): the client's destroys and heap-placed
+// buffers of its own objects onto the control ring in one call, each checked as submitMethod
+// checks one, all before any is posted, then posted in their order: the runs between its queues'
+// destroys under one hold of the ring each (RgfxAccelerator::postRun), and each queue's destroy
+// routed as submitMethod routes it (destroyQueueIfTracked) after the run before it. A buffer
+// made for a context that closed since the check is destroyed behind it, as submitMethod does
+// (rgfxSubmitDestroysBehind). The count out says how many went: all of them, but where a run met
+// a ring that stayed full or a device that stopped.
 IOReturn RgfxAcceleratorUserClient::submitBatchMethod(IOExternalMethodArguments *a)
 {
 	IOLockLock(listLock);
 	const bool open = hasContext;
 	const UInt32 ctx = context;
 	IOLockUnlock(listLock);
-	// An inline struct in, in kernel memory already: a whole number of destroys.
-	constexpr UInt32 kSize = sizeof(RgfxObjectDestroy);
+	// An inline struct in, in kernel memory already: whole messages back to back.
 	const UInt64 size = a->structureInputSize;
 	if (!open || a->scalarInputCount != 0 || a->scalarOutputCount != 1 ||
-	    a->structureInputDescriptor || !a->structureInput || size == 0 || size % kSize ||
+	    a->structureInputDescriptor || !a->structureInput || size == 0 ||
 	    size > kRgfxSubmitBatchBytes)
 		return kIOReturnBadArgument;
 	const UInt8 *messages = static_cast<const UInt8 *>(a->structureInput);
-	const UInt32 count = static_cast<UInt32>(size / kSize);
-	auto objIdAt = [&](UInt32 i) {
+	// Each message of a type the batch takes, of that type's size, its obj_id the context's.
+	UInt32 count = 0;
+	for (UInt64 at = 0; at < size; count++) {
+		RgfxMsgHeader header;
+		if (size - at < sizeof(header))
+			return kIOReturnBadArgument;
+		memcpy(&header, messages + at, sizeof(header));
 		UInt64 objId = 0;
-		memcpy(&objId, messages + static_cast<size_t>(i) * kSize + kObjIdOffset, sizeof(objId));
+		if (header.size == 0 || header.size != rgfxSubmitBatchSize(header.type) ||
+		    header.size > size - at)
+			return kIOReturnBadArgument;
+		memcpy(&objId, messages + at + kObjIdOffset, sizeof(objId));
+		if ((objId >> RGFX_CONTEXT_OBJ_ID_SHIFT) != ctx)
+			return kIOReturnBadArgument;
+		at += header.size;
+	}
+	auto typeAt = [&](UInt64 at) {
+		UInt32 type = 0;
+		memcpy(&type, messages + at, sizeof(type));
+		return type;
+	};
+	auto sizeAt = [&](UInt64 at) {
+		RgfxMsgHeader header;
+		memcpy(&header, messages + at, sizeof(header));
+		return header.size;
+	};
+	auto objIdAt = [&](UInt64 at) {
+		UInt64 objId = 0;
+		memcpy(&objId, messages + at + kObjIdOffset, sizeof(objId));
 		return objId;
 	};
-	for (UInt32 i = 0; i < count; i++) {
-		UInt32 type = 0;
-		memcpy(&type, messages + static_cast<size_t>(i) * kSize, sizeof(type));
-		if (!rgfxSubmitBatchAdmitted(type) || (objIdAt(i) >> RGFX_CONTEXT_OBJ_ID_SHIFT) != ctx)
-			return kIOReturnBadArgument;
-	}
 	UInt32 done = 0, from = 0;
+	UInt64 fromAt = 0, at = 0;
 	IOReturn r = kIOReturnSuccess;
 	for (UInt32 i = 0; i <= count && r == kIOReturnSuccess; i++) {
-		if (i < count && !queueListed(objIdAt(i)))
+		if (i < count && !(rgfxSubmitRoutesQueueDestroy(typeAt(at)) && queueListed(objIdAt(at)))) {
+			at += sizeAt(at);
 			continue;
+		}
 		UInt32 posted = 0;
 		if (i > from)
-			r = owner->postRun(RGFX_CMD_OBJECT_DESTROY,
-			                   messages + static_cast<size_t>(from) * kSize, kSize, i - from,
-			                   &posted);
+			r = owner->postRun(0, messages + fromAt, 0, i - from, &posted);
 		done += posted;
 		if (r == kIOReturnSuccess && i < count) {
 			// A queue's, ended as Submit ends it; where another thread ended the queue since the
 			// look, posted as it is, as Submit posts it then.
-			if (!destroyQueueIfTracked(objIdAt(i))) {
+			if (!destroyQueueIfTracked(objIdAt(at))) {
 				UInt32 one = 0;
-				r = owner->postRun(RGFX_CMD_OBJECT_DESTROY,
-				                   messages + static_cast<size_t>(i) * kSize, kSize, 1, &one);
+				r = owner->postRun(0, messages + at, 0, 1, &one);
 				done += one;
 			} else {
 				done++;
 			}
 		}
+		if (i < count)
+			at += sizeAt(at);
 		from = i + 1;
+		fromAt = at;
+	}
+	// The creates posted for a context that closed since the check: its CONTEXT_CLOSE may have
+	// gone before them, which the device's close then never dropped.
+	IOLockLock(listLock);
+	const bool closedSince = !hasContext || context != ctx;
+	IOLockUnlock(listLock);
+	at = 0;
+	for (UInt32 i = 0; i < done && closedSince; i++) {
+		if (rgfxSubmitDestroysBehind(typeAt(at), true, false, true)) {
+			RgfxObjectDestroy destroy = {};
+			destroy.header.type = RGFX_CMD_OBJECT_DESTROY;
+			destroy.obj_id = objIdAt(at);
+			owner->postLifecycle(RGFX_CMD_OBJECT_DESTROY, &destroy, sizeof(destroy), 0, nullptr,
+			                     0, nullptr, nullptr, 0);
+		}
+		at += sizeAt(at);
 	}
 	a->scalarOutput[0] = done;
 	return kIOReturnSuccess;

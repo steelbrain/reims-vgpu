@@ -2580,20 +2580,43 @@ IOReturn ReimsGraphics::postRun(UInt32 type, const void *messages, UInt32 size, 
                                 UInt64 *const *waiterSeqnos, UInt32 *posted)
 {
 	*posted = 0;
-	if (size < kHeaderBytes || size % kMsgAlign || size > kLifecycleMessageMax)
-		return kIOReturnBadArgument;
 	const UInt8 *bytes = static_cast<const UInt8 *>(messages);
+	// Each message's type and size, the run's or, with `type` 0, its own header's.
+	auto at = [&](size_t offset, UInt32 *t, UInt32 *n) {
+		*t = type;
+		*n = size;
+		if (type == 0) {
+			RgfxMsgHeader h;
+			memcpy(&h, bytes + offset, sizeof(h));
+			*t = h.type;
+			*n = h.size;
+		}
+	};
+	size_t length = 0;
+	for (UInt32 i = 0; i < count; i++) {
+		UInt32 t = 0, n = 0;
+		at(length, &t, &n);
+		if (n < kHeaderBytes || n % kMsgAlign || n > kLifecycleMessageMax)
+			return kIOReturnBadArgument;
+		length += n;
+	}
 	uint64_t deadline = 0;
 	clock_interval_to_deadline(kPostTimeoutMs, kMillisecondScale, &deadline);
 	// As many as fit, under one hold of the ring's lock and with one doorbell at most: whether
-	// all are posted.
+	// all are posted. `next` is where the first not yet posted lies.
+	size_t next = 0;
 	auto look = [&]() {
 		UInt32 n = 0;
 		IOSimpleLockLock(submitLock);
-		while (*posted + n < count &&
-		       writeLocked(type, bytes + static_cast<size_t>(*posted + n) * size, size, nullptr,
-		                   waiterSeqnos ? waiterSeqnos[*posted + n] : nullptr))
+		while (*posted + n < count) {
+			UInt32 t = 0, m = 0;
+			at(next, &t, &m);
+			if (!writeLocked(t, bytes + next, m, nullptr,
+			                 waiterSeqnos ? waiterSeqnos[*posted + n] : nullptr))
+				break;
+			next += m;
 			n++;
+		}
 		if (n)
 			publishLocked();
 		IOSimpleLockUnlock(submitLock);
@@ -2607,9 +2630,11 @@ IOReturn ReimsGraphics::postRun(UInt32 type, const void *messages, UInt32 size, 
 		if (look() || (askForRoom() && look()))
 			break;
 		if (!waitForRoom(mark, deadline)) {
+			UInt32 t = 0, m = 0;
+			at(next, &t, &m);
 			static char site;
-			if (rgfxFirstCalls(&site, type, 1))
-				IOLog("ReimsGraphics: command %u: the control ring stayed full\n", type);
+			if (rgfxFirstCalls(&site, t, 1))
+				IOLog("ReimsGraphics: command %u: the control ring stayed full\n", t);
 			return ready ? kIOReturnTimeout : kIOReturnNotReady;
 		}
 	}
