@@ -923,16 +923,6 @@ pub fn created_or_decided<T>(
 ///   the hardware forces it, so a native device does not relay it. Announced once per device
 ///   whatever `announce_each` asks, on the runtime's scheduler thread, outside every call here: it
 ///   would die where it is announced;
-/// - `DrawDroppedStillMaking` and `DispatchDroppedStillMaking`: under the runtime's
-///   `PipelineWaitPolicy::Bounded`, its default, a draw, compute dispatch or tile dispatch whose
-///   `VkPipeline` the driver was still making 4.5 s after its command buffer's commit ran nothing,
-///   the command buffer running on, where Metal's draw renders and its dispatch writes: a cold
-///   compile (seconds on MoltenVK with a cold Metal compiler service) then costs that command's
-///   work, not a stall of every later command of its queue. A strict process takes
-///   `PipelineWaitPolicy::Exact` ([`crate::platform`]'s device options), which waits until the
-///   pipeline is made, so a strict run, this crate's tests among them, never dies of a slow
-///   compile. Announced where the command is recorded: in the commit, or the command buffer's
-///   host step;
 /// - `DrawDroppedUnmade`: a draw whose `VkPipeline` the driver failed to make after the draw
 ///   returned ran nothing, the command buffer running on, where Metal's draw renders, and Metal
 ///   fails the state's creation instead. Announced where the draw is recorded: in the commit, or
@@ -1337,7 +1327,7 @@ pub fn created_or_decided<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 149] = [
+pub const DIES: [rt::Degradation; 147] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1426,8 +1416,6 @@ pub const DIES: [rt::Degradation; 149] = [
     rt::Degradation::HeapTextureLargerThanMetal,
     rt::Degradation::HostDeallocatorDelayed,
     rt::Degradation::GroupedCompletion,
-    rt::Degradation::DrawDroppedStillMaking,
-    rt::Degradation::DispatchDroppedStillMaking,
     rt::Degradation::DrawDroppedUnmade,
     rt::Degradation::VisibilityPastEarlyMask,
     rt::Degradation::VisibilityCountPerColor,

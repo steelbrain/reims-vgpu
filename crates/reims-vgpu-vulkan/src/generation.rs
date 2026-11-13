@@ -158,8 +158,9 @@ mod tests {
 
     /// A generation serves until the device recovers; then its queue is another generation's, so
     /// nothing is submitted with it, and a generation taken again serves, of another `VkDevice`
-    /// and with another queue. An object made before the recovery is of the old one, and one made
-    /// after of the new.
+    /// and with another queue. A device handle an object answered before the recovery keeps
+    /// meaning the old generation, whatever the runtime carries the object itself to, and an
+    /// object made after is of the new.
     #[test]
     fn a_generation_serves_until_its_device_recovers() {
         let device = own_device();
@@ -170,15 +171,18 @@ mod tests {
         let submitted = unsafe { first.with_queue(&queue, |q| q) };
         assert_eq!(submitted, Some(first.queue));
         let before = device.new_fence();
-        assert!(first.is_of(before.device()));
+        // The runtime carries a fence across a recovery, so its `device()` later answers the
+        // generation it was carried to: the handle taken now is the old generation's.
+        let before_device = before.device().clone();
+        assert!(first.is_of(&before_device));
 
         device.recover_for_test().expect("the recovery");
         assert!(!first.serves(&queue));
         // SAFETY: as above.
         assert_eq!(unsafe { first.with_queue(&queue, |q| q) }, None);
         assert!(
-            first.is_of(before.device()),
-            "the old object is the old generation's"
+            first.is_of(&before_device),
+            "a handle taken before the recovery is the old generation's"
         );
 
         let second = Generation::serving(&queue).expect("a generation");
@@ -192,7 +196,7 @@ mod tests {
         );
         let after = device.new_fence();
         assert!(second.is_of(after.device()));
-        assert!(!second.is_of(before.device()));
+        assert!(!second.is_of(&before_device));
         // The old generation's handles still answer its own `VkDevice` while it is held.
         // SAFETY: only the handle is read, while `first` lives.
         assert_eq!(unsafe { first.raw() }.device.handle(), first.handle);

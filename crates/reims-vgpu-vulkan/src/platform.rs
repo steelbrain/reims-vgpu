@@ -356,9 +356,9 @@ pub(crate) fn guest_texture_ids() -> Option<std::ops::RangeInclusive<u64>> {
 /// GPU times answered from the host's clock (`gpu_times_from_host`), the runtime's device policy,
 /// its fast native forms but its exact completion and heap textures and those `REIMS_VGPU_EXACT`
 /// names ([`exact_policy`]), and in a strict process ([`crate::answer::strict_process`]) its
-/// exact pipeline wait, under which no draw or dispatch is dropped while its pipeline is still
-/// being made (the runtime's `DrawDroppedStillMaking` and `DispatchDroppedStillMaking`, kinds of
-/// [`crate::answer::DIES`]), and the degradations the
+/// exact pipeline wait, under which a state's creation returns only once its predicted pipeline
+/// is made (under either wait no draw or dispatch is dropped while its pipeline is being made: a
+/// command buffer committed before it waits for it and completes later), and the degradations the
 /// runtime announces sent to the answer layer ([`crate::answer::notice`]), where those that reach
 /// what the guest sees are counted, and die in strict mode ([`crate::answer::strict`]), with the
 /// kinds announced at every occurrence ([`announced_each`]), its other messages there too but
@@ -375,8 +375,10 @@ pub(crate) fn guest_texture_ids() -> Option<std::ops::RangeInclusive<u64>> {
 /// [`crate::gpu::states`]'s refusals).
 ///
 /// **GPU times from the host.** No command buffer writes GPU timestamps: its `GPUStartTime` is the
-/// host time its submission ended (`kernelEndTime`, or its queue's latest GPU end before it,
-/// where later, so a queue's command buffers do not overlap) and its `GPUEndTime` the host time
+/// host time the first driver submission that carried its work was called (its `kernelEndTime`
+/// where one submission carried it all, as most do; a rate-mapped pass's pieces are submissions
+/// of their own), or its queue's latest GPU end before it, where later, so a queue's command
+/// buffers do not overlap, and its `GPUEndTime` the host time
 /// the runtime saw it complete. On MoltenVK 1.4.1 the runtime answers so whatever the option, as
 /// its timestamps wait for every queue's (the runtime's `TimestampsWaitForEveryQueue`). A
 /// completed handler learns them (core's `CompletedInfo::gpu_times_ns`), and the reims-graphics
@@ -433,9 +435,11 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
 /// `shaderFloat16`, each `half` addition, subtraction and product of a fast-math chain rounded
 /// where it is computed, where the default rounds the chain where a value leaves it
 /// (`half_chains`, `HalfChainPolicy::EachOperation`), a command buffer that waits for each
-/// pipeline the driver is still making until it is made, where the default waits 4.5 s from its
-/// commit and then drops the draws and dispatches whose pipeline is not made (`pipeline_waits`,
-/// `PipelineWaitPolicy::Exact`), and, on a device with `tessellationShader`, a line `setLineWidth:`
+/// pipeline the driver is still making until it is made, and a state's creation that returns only
+/// once its predicted pipeline is made, where the default's creation returns after 4.5 s with it
+/// still being made and a commit records a pass whose executions read the CPU's records at most
+/// 4.5 s after it, leaving the pass to its host step past that (`pipeline_waits`,
+/// `PipelineWaitPolicy::Exact`; under either, no command is dropped), and, on a device with `tessellationShader`, a line `setLineWidth:`
 /// widens drawn as Metal's parallelogram, two triangles over each segment, where the default draws
 /// the device's own line at the width wherever it draws it, which can differ from Metal's
 /// (`wide_lines`, `WideLinePolicy::Exact`), and a blit into or out of a `BGRA10_XR` texture Metal

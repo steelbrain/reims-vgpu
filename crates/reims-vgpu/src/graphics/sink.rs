@@ -2307,11 +2307,6 @@ mod tests {
     /// device"), where the kept pipelines, buffers, ramp and table would be refused on the new
     /// `VkDevice`, or read zero
     #[test]
-    #[ignore = "the pinned runtime (metal2vulkan 1125fb62d2) refuses a new buffer in an address \
-                pool reserved before the recovery (MadeBeforeRecovery, the pool check of \
-                new_buffer_with_descriptor_now), so the draws' pooled buffers are nil after it; \
-                metal2vulkan 8bead88369 (RUNTIME_VERSION 2159) places them, and the pin that \
-                carries it runs this again"]
     fn on_vulkan_a_recovered_device_draws_through_the_colour_as_before() {
         let platform = Arc::new(reims_vgpu_vulkan::VulkanPlatform::new());
         crate::entry::run(|_| recovered_device_draws_as_before(&platform));
