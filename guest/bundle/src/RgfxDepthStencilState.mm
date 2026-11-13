@@ -138,8 +138,9 @@ bool faceReadsStencil(MTLStencilDescriptor *s)
 
 // Nor an index or an identifier: Metal's base state raises an unrecognized selector for each (it
 // sends itself doesNotRecognizeSelector:; read from code, _MTLDepthStencilState, macOS 27.0.1),
-// which ends the process on both x86 Macs (measured: macOS 26.7.1, oracle_spi_members answers),
-// and so does this.
+// which ends the process on both x86 Macs (measured: macOS 26.7.1, oracle_spi_members answers) and
+// on the M3 Max, whose state answers respondsToSelector: YES too (measured: macOS 27.0.1,
+// oracle_bundle Apple ds.resourceIndex and ds.uniqueIdentifier), and so does this, on every guest.
 - (uint64_t)resourceIndex
 {
 	[self doesNotRecognizeSelector:_cmd];
