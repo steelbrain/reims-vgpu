@@ -1077,7 +1077,6 @@ mod tests {
     /// Whether an object's bytes meet its pages is what its memory there answers: none over memory
     /// of its own, and whether any of them lie in its pages
     #[test]
-    #[expect(clippy::single_range_in_vec_init, reason = "lists of host ranges")]
     fn meeting_pages_is_whether_the_bytes_lie_in_them() {
         let pages = Arc::new(Pages::default());
         let all = [
