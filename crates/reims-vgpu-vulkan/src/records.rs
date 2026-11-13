@@ -68,6 +68,15 @@ pub(crate) const CAPACITY: u64 = 64 << 20;
 /// records were about 1.85 MB each, nearly all of it one section the same in every record (as
 /// metal2vulkan read them), so the 4,565 add about 8.5 GB, within the half.
 ///
+/// The bytes counted are what each making writes to its record, before the shader cache's store
+/// keeps a large record's chunks once (metal2vulkan's dedup, `RUNTIME_VERSION` 2187), so on such
+/// a driver they can be many times what the disk takes. **Measured** 2026-11-12 on the same host
+/// and guest, the first walk after the dedup landed (job m3-max-24343): of 4,604 records, 4,123
+/// were made, 474 translated only and 6 failed, 1 was unread and none was not run, 5.64 GB
+/// counted within 112 s, while the shader cache's directory grew from 10,498 to 10,858 MiB; a
+/// 4 GiB budget would have stopped that pass with about a quarter of its records not run. The
+/// next walk's pass (job m3-max-24344, a macOS 15.8.2 guest) added nothing, within 15.75 s.
+///
 /// [`SHADER_CACHE_CAPACITY`]: crate::platform::SHADER_CACHE_CAPACITY
 pub(crate) const WARM_BUDGET: u64 = crate::platform::SHADER_CACHE_CAPACITY / 2;
 
