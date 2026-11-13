@@ -44,6 +44,17 @@
 //! buffer of their view ([`surface_pages_in_place`]), which takes a cache where the making
 //! refuses. They answer no only where every import the pages may take would be answered no, so a
 //! view made would be let go at once.
+//!
+//! **Measured** 2026-11-13, macOS 26.7.2 guests walking the desktop's apps: on the Radeon 780M
+//! (RADV) and over MoltenVK (the M3 Max) a plane at a pitch the driver's linear image does not
+//! take (3904 and 4032 bytes, CoreAnimation's multiples of 64) is in place before the import and
+//! `Refused(Pitch)` over the buffer, which only the image decides (job m3-max-25006,
+//! homelab-um790-xtx-1): the 72 such asks of a walk on homelab-um870-1 (m3-max-24961) still made
+//! their view and took their cache over it, and every fresh block deferred there was deferred for
+//! its pieces alone. On the Iris Xe of homelab-ms01-1 (ANV) the check refuses renders of rows
+//! that end inside its lines for both imports, and the answer before the import deferred 1,615 of
+//! 2,349 fresh blocks and answered 12 asks a cache before any view (m3-max-25031), as the report's
+//! verdicts had (1,658 of 2,420, and 12: m3-max-24973).
 
 #[cfg(target_os = "linux")]
 use crate::core::num::ToU64 as _;
