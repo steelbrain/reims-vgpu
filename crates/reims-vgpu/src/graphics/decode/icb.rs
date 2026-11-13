@@ -1143,6 +1143,11 @@ fn reset_run<I: IndirectCommandBuffer<P>, P: Platform>(
 /// refuses that field (a setter's, the one `send`'s `at` names), and the fields after it are
 /// carried out in a new scope, from the next. One between the fields, in the slot's own reading
 /// (a bug: [`slot_fields`] reads only what it checked), refuses the rest of the slot.
+///
+/// Inlined always, into its one caller of each kind ([`GraphicsDecoder::slot`]): handed over in
+/// a call, its closures and the slot's shape were copied into its frame in loads wider than the
+/// stores that had just written them, which waited for those to land.
+#[inline(always)]
 fn command_fields<C>(
     command: impl FnOnce() -> RaiseResult<Option<C>>,
     (kind, slot, bindings, masks): (u16, &[u8], (u32, u32), (u64, u64)),
@@ -1357,6 +1362,7 @@ unsafe fn take_records_at(
 }
 
 /// The `k`th `u64` of a slot (its masks are words 0 and 1).
+#[inline]
 fn word(slot: &[u8], k: usize) -> u64 {
     u64::read_from_prefix(slot.get(k * 8..).unwrap_or_default()).map_or(0, |(w, _)| w)
 }
@@ -1375,6 +1381,7 @@ enum Field<'s> {
 impl Field<'_> {
     /// How many fields it is, each a place in its slot's order: a record one, the setters one
     /// each.
+    #[inline]
     fn places(&self) -> usize {
         match self {
             Field::Record(..) => 1,
@@ -1398,7 +1405,10 @@ enum Set {
 }
 
 /// A slot's setters ([`Sets::each`]): its pipeline, where its bit is set, and its bindings whose
-/// bits are, of its `a` of the first kind and its `b` of the second.
+/// bits are, of its `a` of the first kind and of the second. What it holds is worked out from
+/// the slot's bits once, where it is made ([`slot_fields`]): worked out at each count and each
+/// walk, from a copy of the `Sets`, its two masks were read back as one 2-lane vector for a
+/// software popcount, the inner walk's hottest line (`icb_slots_cost`, ms01).
 #[derive(Clone, Copy)]
 struct Sets<'s> {
     /// The slot.
@@ -1408,19 +1418,48 @@ struct Sets<'s> {
     pipeline: Option<u64>,
     /// The slot's `strided` bits.
     strided: u32,
-    mask: u64,
-    mask_b: u64,
+    /// The bits of its bindings of the first kind set, by index, and of the second.
+    firsts: u64,
+    seconds: u64,
+    /// The slot's bindings of the first kind, which its bindings of the second follow.
     a: u32,
-    b: u32,
+    /// How many setters it holds.
+    len: usize,
 }
 
 impl<'s> Sets<'s> {
+    /// The setters a slot's bits `(mask, mask_b)` name of its `a` bindings of the first kind and
+    /// `b` of the second, `pipeline` its pipeline state's.
+    #[inline]
+    fn of(
+        (slot, render, strided): (&'s [u8], bool, u32),
+        (mask, mask_b): (u64, u64),
+        (a, b): (u32, u32),
+        pipeline: u64,
+    ) -> Sets<'s> {
+        let bits = |n: u32| (1u64 << n) - 1;
+        let pipeline = (mask & RGFX_ICB_SLOT_PIPELINE != 0).then_some(pipeline);
+        let firsts = (mask >> RGFX_ICB_SLOT_BUFFER_0.trailing_zeros()) & bits(a);
+        let seconds = mask_b & bits(b);
+        let len = usize::from(pipeline.is_some())
+            + firsts.count_ones() as usize
+            + seconds.count_ones() as usize;
+        Sets {
+            slot,
+            render,
+            pipeline,
+            strided,
+            firsts,
+            seconds,
+            a,
+            len,
+        }
+    }
+
     /// How many setters it holds.
+    #[inline]
     fn len(&self) -> usize {
-        let each = self.each();
-        usize::from(each.pipeline.is_some())
-            + each.firsts.count_ones() as usize
-            + each.seconds.count_ones() as usize
+        self.len
     }
 
     /// Each setter, in the slot's order: the pipeline, the bindings of the first kind by index,
@@ -1428,16 +1467,16 @@ impl<'s> Sets<'s> {
     /// lengths).
     #[inline]
     fn each(self) -> Each<'s> {
-        let bits = |n: u32| (1u64 << n) - 1;
         Each {
             pipeline: self.pipeline,
-            firsts: (self.mask >> RGFX_ICB_SLOT_BUFFER_0.trailing_zeros()) & bits(self.a),
-            seconds: self.mask_b & bits(self.b),
+            firsts: self.firsts,
+            seconds: self.seconds,
             sets: self,
         }
     }
 
     /// The slot's fixed part's size.
+    #[inline]
     fn fixed(&self) -> usize {
         if self.render {
             size_of::<RgfxIcbRenderSlot>()
@@ -1447,6 +1486,7 @@ impl<'s> Sets<'s> {
     }
 
     /// The slot's binding `i`, of the first kind's, then the second's.
+    #[inline]
     fn binding(&self, i: u32) -> RgfxIcbSlotBuffer {
         let at = self.fixed() + i as usize * size_of::<RgfxIcbSlotBuffer>();
         RgfxIcbSlotBuffer::read_from_prefix(self.slot.get(at..).unwrap_or_default())
@@ -1454,6 +1494,7 @@ impl<'s> Sets<'s> {
     }
 
     /// A compute slot's threadgroup memory length `j`.
+    #[inline]
     fn length(&self, j: u32) -> u32 {
         let lengths = self.fixed() + self.a as usize * size_of::<RgfxIcbSlotBuffer>();
         let at = lengths + j as usize * 4;
@@ -1521,16 +1562,7 @@ fn slot_fields(
         field(Field::Record(0, &[]));
     }
     let sets = |pipeline: u64, strided: u32| {
-        let sets = Sets {
-            slot,
-            render,
-            pipeline: (mask & RGFX_ICB_SLOT_PIPELINE != 0).then_some(pipeline),
-            strided,
-            mask,
-            mask_b,
-            a,
-            b,
-        };
+        let sets = Sets::of((slot, render, strided), (mask, mask_b), (a, b), pipeline);
         (sets.len() != 0).then_some(Field::Sets(sets))
     };
     if render {
