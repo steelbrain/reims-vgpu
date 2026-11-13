@@ -1445,6 +1445,14 @@ bool entryPoint(const Module &m, uint64_t id, RgfxAirStage stage, RgfxAirFunctio
 	out.name.clear();
 	out.stage = stage;
 	out.arguments.clear();
+	out.locationsMayOverlap = false;
+	// Each binding argument's table (0 buffers, 1 threadgroup memory, 2 textures, 3 samplers) and
+	// declared location, for locationsMayOverlap.
+	struct Location {
+		int table;
+		uint64_t from, to;
+	};
+	std::vector<Location> locations;
 	const Module::Md *entry = mdAt(m, id);
 	if (entry == nullptr || entry->kind != Module::Md::kNode || entry->ops.size() < 3)
 		return false;
@@ -1493,7 +1501,19 @@ bool entryPoint(const Module &m, uint64_t id, RgfxAirStage stage, RgfxAirFunctio
 			continue; // a built-in or a stage input, of no binding
 		if (!binding(m, *arg, kindAt + 1, a))
 			return false;
-		if (a.kind == RgfxAirKind::Buffer && threadgroupMemory(m, *arg))
+		const bool threadgroup = a.kind == RgfxAirKind::Buffer && threadgroupMemory(m, *arg);
+		const int table = threadgroup                         ? 1
+		                  : a.kind == RgfxAirKind::Texture ? 2
+		                  : a.kind == RgfxAirKind::Sampler ? 3
+		                                                   : 0;
+		if (a.anyIndex || a.anyCount)
+			out.locationsMayOverlap = true;
+		const uint64_t from = a.index, to = static_cast<uint64_t>(a.index) + a.count;
+		for (const Location &l : locations)
+			if (l.table == table && l.from < to && from < l.to)
+				out.locationsMayOverlap = true;
+		locations.push_back({table, from, to});
+		if (threadgroup)
 			continue; // threadgroup memory: no buffer at its index
 		// A texture of no access the reader knows is one it may write.
 		if (a.kind == RgfxAirKind::Texture && a.access == RgfxAirAccess::Unknown)

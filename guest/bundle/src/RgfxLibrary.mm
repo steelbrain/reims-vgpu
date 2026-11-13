@@ -18,6 +18,7 @@
 #import "RgfxInterop.h"
 #import "RgfxMetalError.h"
 #import "RgfxMetalPrivate.h"
+#import "RgfxPipelineReflection.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1026,6 +1027,31 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 			std::memcpy(k.value, v->bytes.data(),
 			            v->bytes.size() < sizeof(k.value) ? v->bytes.size() : sizeof(k.value));
 			constants.push_back(k);
+		}
+	}
+	// Values that put two of its present arguments at overlapping locations of one argument table:
+	// Metal refuses the function here (RgfxOverlappingArgumentError), and so does the bundle, where
+	// its module's nodes and code tell; where they do not, the host's compile refuses its pipeline.
+	// Looked at only where its arguments may overlap at all (RgfxAirFunction's
+	// locationsMayOverlap, or arguments that did not read).
+	if (entry != nullptr && !constants.empty() &&
+	    (entry->type == MTLFunctionTypeKernel || entry->type == MTLFunctionTypeVertex ||
+	     entry->type == MTLFunctionTypeFragment)) {
+		std::shared_ptr<const RgfxAirFunction> air = [self rgfxAirFunctionNamed:entry->name];
+		std::shared_ptr<const RgfxAirEntries> module =
+		    air == nullptr || air->locationsMayOverlap ? [self rgfxAirEntryNamed:entry->name] : nullptr;
+		NSError *overlap = module != nullptr && !module->entries.empty()
+		                       ? RgfxOverlappingArgumentError(*module, module->entries.front(), constants.data(),
+		                                                      static_cast<uint32_t>(constants.size()))
+		                       : nil;
+		if (overlap != nil) {
+			static char site;
+			if (rgfxLogFirst(&site))
+				NSLog(@"RGFX: function %@ refused, as Metal refuses it: %@ (logged once a process)", name,
+				      overlap.localizedDescription);
+			if (error)
+				*error = overlap;
+			return nil;
 		}
 	}
 	id<MTLFunction> fn = [self rgfxFunctionNamed:name constants:constants];

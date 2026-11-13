@@ -7725,6 +7725,155 @@ static std::vector<uint8_t> exportedFunctionMetallib()
 	return metallibOf({ { "rgfx_exported", 3, {} } });
 }
 
+// What making a function of tools/oracle/oracle_overlap.metal's answers, for each value of its
+// constants that put two present arguments of one argument table at overlapping locations or not,
+// by every way of making a specialised function: values set by index, by name, by range and a copy
+// of them, a descriptor and a copy of it, one naming a specialized name, and each completion
+// handler form. Each answer, the function or nil and the error's domain, code and words, is Metal's
+// own for the same bytes on this Mac, and the x86 Macs' (measured: oracle_overlap on the AMD Radeon
+// Pro 5300M and the Intel UHD Graphics 630, macOS 26.7.1, and the M3 Max, macOS 27.0.1, the same
+// answers): the bundle refuses such a function where Metal does, with no call to the host.
+void test_overlapping_arguments_refused_as_metal()
+{
+	Fixture fx(0x20000); // the library's bytes fit
+	const char *path = getenv("RGFX_ORACLE_OVERLAP");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	CHECK(bytes.length > 0);
+	uint32_t status = 0;
+	RgfxLibrary *ours = [RgfxLibrary libraryWithData:bytes.bytes
+	                                          length:bytes.length
+	                                             key:nullptr
+	                                          device:nil
+	                                      serializer:&fx.ser
+	                                          status:&status];
+	CHECK(ours != nil);
+	dispatch_data_t data = dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		(void)bytes;
+	});
+	id<MTLLibrary> theirs = [MTLCreateSystemDefaultDevice() newLibraryWithData:data error:nil];
+	CHECK(theirs != nil);
+	if (ours == nil || theirs == nil)
+		return;
+	auto values = [](bool a, bool b, uint32_t idx, int how) {
+		MTLFunctionConstantValues *v = [MTLFunctionConstantValues new];
+		short w = 3;
+		if (how == 1) {
+			[v setConstantValue:&a type:MTLDataTypeBool withName:@"useA"];
+			[v setConstantValue:&b type:MTLDataTypeBool withName:@"useB"];
+			[v setConstantValue:&w type:MTLDataTypeShort withName:@"kW"];
+			[v setConstantValue:&idx type:MTLDataTypeUInt withName:@"kIdx"];
+			return v;
+		}
+		if (how == 2) {
+			const bool both[2] = {a, b};
+			[v setConstantValues:both type:MTLDataTypeBool withRange:NSMakeRange(0, 2)];
+		} else {
+			[v setConstantValue:&a type:MTLDataTypeBool atIndex:0];
+			[v setConstantValue:&b type:MTLDataTypeBool atIndex:1];
+		}
+		[v setConstantValue:&w type:MTLDataTypeShort atIndex:2];
+		[v setConstantValue:&idx type:MTLDataTypeUInt atIndex:3];
+		return v;
+	};
+	// The function `name` of `lib`, by way `way`, and the error with it.
+	auto make = [&](id<MTLLibrary> lib, NSString *name, bool a, bool b, uint32_t idx, int way,
+	                NSError *__strong *error) -> id<MTLFunction> {
+		*error = nil;
+		MTLFunctionDescriptor *fd = [MTLFunctionDescriptor functionDescriptor];
+		fd.name = name;
+		fd.constantValues = values(a, b, idx, 0);
+		__block id<MTLFunction> got = nil;
+		__block NSError *gotError = nil;
+		dispatch_semaphore_t done = dispatch_semaphore_create(0);
+		NSError *e = nil;
+		id<MTLFunction> made = nil;
+		if (way <= 2)
+			made = [lib newFunctionWithName:name constantValues:values(a, b, idx, way) error:&e];
+		else if (way == 3)
+			made = [lib newFunctionWithName:name constantValues:[values(a, b, idx, 0) copy] error:&e];
+		else if (way == 4)
+			made = [lib newFunctionWithDescriptor:fd error:&e];
+		else if (way == 5)
+			made = [lib newFunctionWithDescriptor:[fd copy] error:&e];
+		else if (way == 6) {
+			fd.specializedName = [name stringByAppendingString:@"_spec"];
+			made = [lib newFunctionWithDescriptor:fd error:&e];
+		}
+		if (way <= 6) {
+			*error = e;
+			return made;
+		}
+		if (way == 7)
+			[lib newFunctionWithName:name
+			          constantValues:values(a, b, idx, 0)
+			       completionHandler:^(id<MTLFunction> f, NSError *err) {
+				       got = f;
+				       gotError = err;
+				       dispatch_semaphore_signal(done);
+			       }];
+		else
+			[lib newFunctionWithDescriptor:fd
+			             completionHandler:^(id<MTLFunction> f, NSError *err) {
+				             got = f;
+				             gotError = err;
+				             dispatch_semaphore_signal(done);
+			             }];
+		dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+		*error = gotError;
+		return got;
+	};
+	static const char *const kWays[] = {"values", "names", "range", "copy", "descriptor",
+	                                    "desc-copy", "specialized", "async", "async-desc"};
+	NSArray *functions = @[
+		@"k_overlap", @"k_tex", @"k_texarr", @"k_smp", @"k_tg", @"k_derived", @"k_idx", @"k_bufconst",
+		@"k_unused", @"k_dead", @"k_argbuf", @"k_three", @"v_overlap", @"f_overlap"
+	];
+	const bool cases[4][2] = {{false, false}, {true, false}, {false, true}, {true, true}};
+	int refused = 0;
+	for (NSString *name in functions) {
+		for (int c = 0; c < 4; c++) {
+			for (uint32_t idx = 0; idx < ([name isEqual:@"k_idx"] ? 2u : 1u); idx++) {
+				for (int way = 0; way < 9; way++) {
+					const bool a = cases[c][0], b = cases[c][1];
+					NSError *ourError = nil, *theirError = nil;
+					id<MTLFunction> f = make(ours, name, a, b, idx, way, &ourError);
+					id<MTLFunction> g = make(theirs, name, a, b, idx, way, &theirError);
+					const bool same = (f == nil) == (g == nil) && (ourError == nil) == (theirError == nil) &&
+					                  (ourError == nil || ([ourError.domain isEqual:theirError.domain] &&
+					                                       ourError.code == theirError.code &&
+					                                       [ourError.localizedDescription
+					                                           isEqual:theirError.localizedDescription]));
+					if (!same)
+						NSLog(@"FAIL detail: %@ a=%d b=%d idx=%u %s: ours %@ %@, Metal's %@ %@", name, a, b, idx,
+						      kWays[way], f ? @"fn" : @"nil", ourError, g ? @"fn" : @"nil", theirError);
+					CHECK(same);
+					refused += f == nil;
+				}
+			}
+		}
+	}
+	// The x86 Macs' words, which this Mac's Metal gives too.
+	NSError *e = nil;
+	CHECK(make(ours, @"k_overlap", true, true, 0, 0, &e) == nil && [e.domain isEqual:MTLLibraryErrorDomain] &&
+	      e.code == MTLLibraryErrorCompileFailure &&
+	      [e.localizedDescription isEqual:@"error: buffer argument b has invalid location (<0,1>) in k_overlap\n"]);
+	CHECK(make(ours, @"k_texarr", true, true, 0, 0, &e) == nil &&
+	      [e.localizedDescription isEqual:@"error: texture argument t has invalid location (<1,1>) in k_texarr\n"]);
+	CHECK(make(ours, @"k_smp", true, true, 0, 4, &e) == nil &&
+	      [e.localizedDescription isEqual:@"error: sampler argument t has invalid location (<0,1>) in k_smp\n"]);
+	CHECK(make(ours, @"k_tg", true, true, 0, 1, &e) == nil &&
+	      [e.localizedDescription isEqual:@"error: buffer argument b has invalid location (<0,1>) in k_tg\n"]);
+	CHECK(make(ours, @"k_three", true, true, 0, 6, &e) == nil &&
+	      [e.localizedDescription isEqual:@"error: buffer argument c has invalid location (<0,1>) in k_three\n"
+	                                      @"error: buffer argument d has invalid location (<1,1>) in k_three\n"]);
+	CHECK(make(ours, @"k_derived", true, true, 0, 0, &e) != nil && e == nil);
+	CHECK(make(ours, @"k_idx", false, false, 1, 0, &e) != nil && e == nil);
+	CHECK(refused > 0);
+}
+
 // A post-tessellation vertex function answers its [[patch]]'s type and control point count, from
 // the library's function list, and every other function MTLPatchTypeNone and -1, as Metal's own
 // functions answer for the same bytes (RgfxLibrary.mm, rgfxPatchOf).
@@ -18390,6 +18539,7 @@ int main(int argc, char **argv)
 		test_linked_function_specialised_on_the_wire();
 		test_core_image_extern_functions();
 		test_function_patch_answers();
+		test_overlapping_arguments_refused_as_metal();
 		test_stitched_library_over_shadows();
 		test_stitch_over_specialised_functions();
 		test_stitched_dag_over_shadows();

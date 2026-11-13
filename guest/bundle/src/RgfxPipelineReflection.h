@@ -122,6 +122,26 @@ bool RgfxStageReflectionOfEntry(const RgfxAirEntries &module, const RgfxAirEntry
                                 const std::vector<RgfxDescriptorBuffer> &buffers, RgfxStageReflection &out,
                                 NSString *__strong _Nullable *_Nonnull why);
 
+// Metal's refusal of the entry point `entry` of the module `module` (rgfxReadAirEntries) specialised
+// by the `count` function constant values at `values`, where they put two of its present arguments
+// at overlapping locations of one argument table; nil where they put none there, and nil where
+// that is not known. Metal refuses such values where it makes the function, by values or by a
+// descriptor, at once or with a completion handler, the function's specialized name or not
+// (MTLLibraryErrorDomain, MTLLibraryErrorCompileFailure, "error: buffer argument b has invalid
+// location (<0,1>) in k_overlap\n"): a line for each argument, in their order, whose location
+// overlaps an earlier present one's in its table, with its own index and count, as `buffer` (a
+// buffer, a constant buffer, an argument buffer, threadgroup memory), `texture` (a texture or an
+// array of them) or `sampler`. A buffer's table is not threadgroup memory's. An argument is
+// present where its predicate is true, used or not, its code dead or not; its index or count may
+// be a function constant's. A kernel's, a vertex function's and a fragment function's alike
+// (measured: tools/oracle/oracle_overlap, the AMD Radeon Pro 5300M and the Intel UHD Graphics 630
+// on macOS 26.7.1 and the M3 Max on macOS 27.0.1, the same answers). Not known, so not
+// refused: a predicate, index or count the module's code does not compute from the values, a
+// buffer whose address space is not stated, and an argument of another table's kind (a function
+// table, an acceleration structure), which the host's compile then refuses.
+NSError *_Nullable RgfxOverlappingArgumentError(const RgfxAirEntries &module, const RgfxAirEntry &entry,
+                                                const RgfxFunctionConstant *_Nullable values, uint32_t count);
+
 // As RgfxStageReflectionOfEntry, of `function`, one of our libraries' (RgfxFunction); where
 // `openCLMode` and the function is a kernel's of OpenCL mode (RgfxFunction's rgfxClBindings), as
 // its pipeline of OpenCL mode binds it (RgfxClMode.hpp). This and the creators' three below are

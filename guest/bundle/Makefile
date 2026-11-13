@@ -285,6 +285,17 @@ $(ORACLE_REFLECTION_LIB): tools/oracle/oracle_reflection.metal Makefile
 		-o $(BUILD)/oracle_reflection.air
 	xcrun -sdk macosx metallib $(BUILD)/oracle_reflection.air -o $@
 
+# The overlapping arguments' functions of the oracle probe oracle_overlap
+# (tools/oracle/oracle_overlap.metal), built for macOS 26 and Metal 3.0 as build.sh builds it, whose
+# specialisations the x86 Macs' and the M3 Max's answers were measured over; never committed.
+ORACLE_OVERLAP_LIB = $(BUILD)/oracle_overlap.metallib
+
+$(ORACLE_OVERLAP_LIB): tools/oracle/oracle_overlap.metal Makefile
+	@mkdir -p $(@D)
+	xcrun -sdk macosx metal -c -std=metal3.0 -mmacosx-version-min=26.0 tools/oracle/oracle_overlap.metal \
+		-o $(BUILD)/oracle_overlap.air
+	xcrun -sdk macosx metallib $(BUILD)/oracle_overlap.air -o $@
+
 # The library of pipeline_reflection_check's c_atomic_texture case, of a language Metal 3.0 has not
 # (tools/oracle/oracle_reflection_31.metal); never committed.
 ORACLE_REFLECTION_31_LIB = $(BUILD)/oracle_reflection_31.metallib
@@ -375,6 +386,7 @@ $(VIDEO_DRIVER_TESTBIN): $(VIDEO_DRIVER_TESTOBJS) tests/video_driver_tests.cpp $
 		-framework IOSurface -framework CoreFoundation -o $@
 
 test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(AIR_OLD_LIB) $(AIR_11_LIB) $(AIR_REFLECTED) $(ORACLE_REFLECTION_LIB) \
+	$(ORACLE_OVERLAP_LIB) \
 	$(SHELL_TESTBIN) $(CI_KERNEL) $(STITCHABLE) $(STITCH_CONSTANTS) $(PATCH_LIB) $(INHERIT_TESTBIN) \
 	$(MEMBERS_TESTBIN) $(VIDEO_TESTBIN) $(VIDEO_H265_TESTBIN) $(VIDEO_DRIVER_TESTBIN) $(BUNDLEBIN)
 	arch -$(ARCH) $(SER_TESTBIN)
@@ -384,7 +396,7 @@ test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(AIR_OLD_LIB) $(AIR_11_LIB) $(AI
 	RGFX_CI_KERNEL=$(CI_KERNEL) RGFX_STITCHABLE=$(STITCHABLE) RGFX_STITCH_CONSTANTS=$(STITCH_CONSTANTS) \
 		RGFX_AIR_ARGUMENTS=$(AIR_LIB) RGFX_AIR_ARGUMENTS_11=$(AIR_11_LIB) RGFX_LIBRARY_FILE=$(LIBRARY_FILE) \
 		RGFX_AIR_REFLECTED=$(AIR_REFLECTED) RGFX_ORACLE_REFLECTION=$(ORACLE_REFLECTION_LIB) \
-		RGFX_PATCH=$(PATCH_LIB) $(SHELL_TESTBIN)
+		RGFX_PATCH=$(PATCH_LIB) RGFX_ORACLE_OVERLAP=$(ORACLE_OVERLAP_LIB) $(SHELL_TESTBIN)
 	arch -$(ARCH) $(INHERIT_TESTBIN) $(BUNDLEBIN)
 	arch -$(ARCH) $(MEMBERS_TESTBIN) $(BUNDLEBIN) tests/protocol_members.txt \
 		tests/protocol_members_releases.txt src

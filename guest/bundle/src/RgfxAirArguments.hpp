@@ -114,6 +114,12 @@ struct RgfxAirFunction {
 	std::vector<RgfxAirArgument> arguments;
 	std::vector<RgfxAirConstant> constants;
 	bool constantsRead = false;
+	// Whether function constants may put two of its binding arguments at overlapping locations of
+	// one argument table (its buffers, argument buffers among them; its threadgroup memory; its
+	// textures; its samplers), which Metal refuses where it makes the specialised function
+	// (RgfxOverlappingArgumentError): where two of them declare locations that overlap, or one's
+	// index or count is computed from function constants. False where none can.
+	bool locationsMayOverlap = false;
 	// A kernel's `[[max_total_threads_per_threadgroup(n)]]`: n, which its entry point's node states
 	// in a node of its own after its arguments' (`air.max_work_group_size` and n), read whether or
 	// not its arguments read; 0 where it states none, or one not of that form.

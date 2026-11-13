@@ -1238,6 +1238,88 @@ std::vector<RgfxDescriptorBuffer> RgfxStageInputBuffers(MTLStageInputOutputDescr
 	return out;
 }
 
+NSError *RgfxOverlappingArgumentError(const RgfxAirEntries &module, const RgfxAirEntry &entry,
+                                      const RgfxFunctionConstant *values, uint32_t count)
+{
+	// Each binding node's table: 0 buffers, 1 threadgroup memory, 2 textures, 3 samplers; -1 for a
+	// node of none (a built-in, a stage input), -2 for one of a table the answer is not known for.
+	auto tableOf = [](const RgfxAirNode &n) {
+		if (!n.hasLocation || isStageInput(n.kind))
+			return -1;
+		if (n.kind == "air.buffer")
+			return !n.hasAddressSpace ? -2 : n.addressSpace == 3 ? 1 : 0;
+		if (n.kind == "air.indirect_buffer" || n.kind == "air.constant")
+			return 0;
+		if (n.kind == "air.texture")
+			return 2;
+		if (n.kind == "air.sampler")
+			return 3;
+		return -2;
+	};
+	static const char *const kWords[] = {"buffer", "buffer", "texture", "sampler"};
+	RgfxAirSpecialisation spec;
+	if (!rgfxAirSpecialise(module, entry, values, count, spec))
+		return nil;
+	auto global = [&](uint64_t g, int64_t &v) {
+		auto it = spec.globals.find(g);
+		if (it == spec.globals.end())
+			return false;
+		v = it->second;
+		return true;
+	};
+	struct Taken {
+		int table;
+		uint64_t from, to;
+	};
+	std::vector<Taken> taken;
+	NSMutableString *what = nil;
+	for (const RgfxAirNode &n : entry.arguments) {
+		const int table = tableOf(n);
+		if (table == -1)
+			continue;
+		if (table == -2)
+			return nil;
+		int64_t v = 0;
+		if (n.predicated) {
+			if (!global(n.predicateGlobal, v))
+				return nil;
+			if (v == 0)
+				continue;
+		}
+		uint64_t index = n.index, length = n.count;
+		if (n.indexIsGlobal) {
+			if (!global(n.indexGlobal, v) || v < 0 || v > UINT32_MAX)
+				return nil;
+			index = static_cast<uint64_t>(v);
+		}
+		if (n.countIsGlobal) {
+			if (!global(n.countGlobal, v) || v < 0 || v > UINT32_MAX)
+				return nil;
+			length = static_cast<uint64_t>(v);
+		}
+		if (length == 0)
+			continue;
+		bool overlaps = false;
+		for (const Taken &t : taken)
+			overlaps = overlaps || (t.table == table && t.from < index + length && index < t.to);
+		if (overlaps) {
+			if (n.name.empty())
+				return nil;
+			if (what == nil)
+				what = [NSMutableString string];
+			[what appendFormat:@"error: %s argument %s has invalid location (<%llu,%llu>) in %s\n", kWords[table],
+			                   n.name.c_str(), static_cast<unsigned long long>(index),
+			                   static_cast<unsigned long long>(length), entry.name.c_str()];
+		}
+		taken.push_back({table, index, index + length});
+	}
+	if (what == nil)
+		return nil;
+	return [NSError errorWithDomain:MTLLibraryErrorDomain
+	                           code:MTLLibraryErrorCompileFailure
+	                       userInfo:@{NSLocalizedDescriptionKey : [what copy]}];
+}
+
 bool RgfxStageReflectionOfEntry(const RgfxAirEntries &module, const RgfxAirEntry &entry,
                                 const RgfxFunctionConstant *values, uint32_t count, NSString *prefix,
                                 const std::vector<RgfxDescriptorBuffer> &buffers, RgfxStageReflection &out,
