@@ -127,15 +127,41 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
                                  serializer:(RgfxSerializer *)serializer
 {
 	// The x86 Macs' heap descriptor validation ends the process at a Shared heap (oracle_bundle
-	// heapbuffers, AMD 5300M and Intel 630, macOS 26.7.1; the M3 Max makes one), sending nothing.
-	if (descriptor != nil && descriptor.storageMode == MTLStorageModeShared)
+	// heapbuffers, AMD 5300M and Intel 630, macOS 26.7.1), sending nothing; an Apple GPU makes
+	// one (oracle_bundle Apple heap.shared, 11-13).
+	const bool apple = rgfxAppleGPU(device);
+	if (descriptor != nil && descriptor.storageMode == MTLStorageModeShared && !apple)
 		RgfxMetalAssertionFailed("-[MTLHeapDescriptorInternal validateWithDevice:]",
 		                         @"Heap Descriptor Validation\nShared storage mode disallowed\n");
 	if (descriptor == nil || descriptor.size == 0 ||
 	    (maxLength != 0 && descriptor.size > maxLength))
 		return nil;
-	(void)region; // no heap the device makes lies in the region: a Shared one ends the process
-	return [RgfxHeap heapWithDescriptor:descriptor device:device serializer:serializer];
+	if (descriptor.storageMode != MTLStorageModeShared)
+		return [RgfxHeap heapWithDescriptor:descriptor device:device serializer:serializer];
+	if (region == nullptr || serializer == nullptr)
+		return nil;
+	// A Shared one's memory is a block of the region, on the host too, whole pages of Metal's
+	// 16 KiB, so the CPU and the host's GPU reach its resources in place.
+	const uint64_t size = static_cast<uint64_t>(descriptor.size);
+	RgfxRegion::Block block =
+	    region->allocate((size + kHeapPage - 1) & ~(kHeapPage - 1), kHeapPage);
+	if (!block.ok)
+		return nil;
+	uint8_t *bytes = const_cast<uint8_t *>(block.ptr);
+	std::memset(bytes, 0, block.size);
+	// The block goes back to the region once the host has dropped the heap.
+	const uint64_t offset = block.offset;
+	RgfxHeap *heap = [RgfxHeap heapOverHostMemoryWithDescriptor:descriptor
+	                                              regionOffset:offset
+	                                                  contents:bytes
+	                                               deallocator:^{
+		                                               region->release(offset);
+	                                               }
+	                                                    device:device
+	                                                serializer:serializer];
+	if (heap == nil)
+		region->release(offset); // no heap lies over the block
+	return heap;
 }
 
 + (instancetype)heapOverHostMemoryWithDescriptor:(MTLHeapDescriptor *)descriptor

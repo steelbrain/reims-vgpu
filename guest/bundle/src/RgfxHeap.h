@@ -60,7 +60,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// The heap `newHeapWithDescriptor:` makes: the host's own (heapWithDescriptor:), of any mode
 /// but Shared. A Shared one ends the process with Metal's words, sending nothing, as the heap
 /// descriptor validation of the AMD 5300M and the Intel 630 under macOS 26.7.1 does (oracle_bundle
-/// heapbuffers; the M3 Max makes one); `region` is unused.
+/// heapbuffers), but on an Apple GPU (rgfxAppleGPU), where it is made over a block of `region`
+/// (heapOverHostMemoryWithDescriptor:), its buffers' contents there, as the M3 Max under macOS
+/// 27.0.1 makes one, with buffers whose contents the CPU reaches and a texture (oracle_bundle Apple
+/// heap.shared, 11-13); nil where the region has no room.
 ///
 /// Nil where Metal makes none (measured on the M3 Max, macOS 27.0.1, plain and under
 /// MTL_DEBUG_LAYER, Private, Automatic and Placement): for a size of 0, and for one past

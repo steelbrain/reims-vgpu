@@ -194,6 +194,21 @@ void syncAsCommitted(std::initializer_list<id> textures);
 }
 @end
 
+// An Apple GPU's device that sizes a heap's buffers as the M3 Max under macOS 27.0.1 does in a
+// Shared heap: its length, 256-byte aligned (oracle_bundle Apple heap.shared).
+@interface RgfxAppleHeapDevice : RgfxAppleFamilyDevice
+- (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length
+                                            options:(MTLResourceOptions)options;
+@end
+@implementation RgfxAppleHeapDevice
+- (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length
+                                            options:(MTLResourceOptions)options
+{
+	(void)options;
+	return {length, 256};
+}
+@end
+
 // A device as an arm64 guest's answers: no Apple family, as the host lets it answer none, and an
 // Apple GPU's texture rules (RgfxAppleRulesDevice, on arm64 builds).
 @interface RgfxGuestRulesDevice : NSObject
@@ -2966,6 +2981,56 @@ void test_compressed_buffer_textures_answer_nil()
 		id<MTLTexture> subsampled = over(MTLPixelFormatGBGR422, 64, 64);
 		CHECK(subsampled != nil);
 		drainRing(fx.ring);
+	}
+	drainRing(fx.ring);
+}
+
+// On a device that answers as an Apple GPU, a Shared heap the device is asked for is made over a
+// block of the region, which its resources lie in, as the M3 Max under macOS 27.0.1 makes one
+// (oracle_bundle Apple heap.shared): the heap posts RGFX_CMD_HEAP_OVER_HOST_MEMORY at the block,
+// answers Shared and its contents there, and a Shared buffer in it has contents in the block.
+// None of 0 bytes or past maxBufferLength, as a Private one; none where the region has no room.
+// An arm64 guest's device takes the M3's; where the device answers no Apple family, a Shared heap
+// still ends the process (heap-shared, below).
+void test_shared_heaps_on_an_apple_gpu()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x20000, 0xee);
+	RgfxRegion region(mem.data(), mem.size());
+	auto make = [&](uint64_t size, NSUInteger maxLength, id device) {
+		MTLHeapDescriptor *d = [MTLHeapDescriptor new];
+		d.size = size;
+		d.storageMode = MTLStorageModeShared;
+		return [RgfxHeap heapForDeviceWithDescriptor:d
+		                                   maxLength:maxLength
+		                                      region:&region
+		                                      device:(id<MTLDevice>)device
+		                                  serializer:&fx.ser];
+	};
+	@autoreleasepool {
+		id apple = [RgfxAppleHeapDevice new];
+		RgfxHeap *heap = make(0x1000, 0x100000, apple);
+		CHECK(heap != nil && heap.storageMode == MTLStorageModeShared);
+		uint8_t *at = static_cast<uint8_t *>(heap.rgfxContents);
+		CHECK(at >= mem.data() && at + 0x4000 <= mem.data() + mem.size());
+		CHECK(at[0] == 0 && at[0x3fff] == 0); // its 16 KiB page zeroed
+		auto over = expectMessage<RgfxHeapOverHostMemory>(fx.ring, RGFX_CMD_HEAP_OVER_HOST_MEMORY);
+		CHECK(over.obj_id == heap.rgfxObjId &&
+		      over.region_offset == static_cast<uint64_t>(at - mem.data()));
+		id<MTLBuffer> b = [heap newBufferWithLength:100 options:MTLResourceStorageModeShared];
+		CHECK(b != nil);
+		uint8_t *contents = static_cast<uint8_t *>([b contents]);
+		CHECK(contents >= at && contents + 100 <= at + 0x4000);
+		drainRing(fx.ring);
+		CHECK(make(0, 0x100000, apple) == nil && make(0x100001, 0x100000, apple) == nil);
+		// No room: nil.
+		CHECK(make(0x40000, 0, apple) == nil);
+		CHECK(ringEmpty(fx.ring));
+#if defined(__arm64__)
+		RgfxHeap *guest = make(0x1000, 0x100000, [RgfxGuestRulesDevice new]);
+		CHECK(guest != nil && guest.rgfxContents != nullptr);
+		drainRing(fx.ring);
+#endif
 	}
 	drainRing(fx.ring);
 }
@@ -18964,6 +19029,7 @@ int main(int argc, char **argv)
 		test_device_heaps_answer_as_metal();
 		test_textures_past_max_buffer_length_are_nil();
 		test_shared_heaps_and_cpu_depth_textures_end_the_process();
+		test_shared_heaps_on_an_apple_gpu();
 		test_second_buffer_is_monotonic();
 		test_wrapper_guards_and_base();
 		test_event_routing();
