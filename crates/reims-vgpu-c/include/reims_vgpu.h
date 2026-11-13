@@ -142,6 +142,10 @@
 // The control ring's id, which the guest writes to RVG_GRAPHICS_REG_DOORBELL.
 #define RVG_GRAPHICS_DOORBELL_CONTROL 0
 
+// The most command queues' doorbells the device routes to the host at once (route_doorbell,
+// RvgGraphicsCallbacks).
+#define RVG_GRAPHICS_DOORBELL_ROUTES 128
+
 // Where the guest's allocations start in the region, the scanout among them: below it are the
 // control rings.
 #define RVG_GRAPHICS_ALLOCATIONS_OFFSET 4194304
@@ -225,6 +229,32 @@ typedef void (*RvgCursorShowFn)(void *ctx, uint8_t show);
 // Thread, and what it may call: as RvgCursorGlyphFn.
 typedef void (*RvgCursorMoveFn)(void *ctx);
 
+// `route_doorbell(ctx, route, ring_id, bell)`: with `bell` 0 or more, route a command queue's
+// plain doorbell into the file `bell`: from then on the host takes a write of exactly `ring_id`
+// to RVG_GRAPHICS_REG_DOORBELL without calling rvg_graphics_device_mmio_write_taking, and makes
+// `bell` readable (QEMU: memory_region_add_eventfd on the register, matching `ring_id`, which
+// KVM's ioeventfd takes in the kernel). `bell` is an eventfd the queue's thread sleeps on, which
+// the host duplicates during the call; `route` names the route, a number the device gives no
+// other. A route of a `ring_id` another route holds replaces that one. Return true where the
+// host takes the route, during the call or after it: until then a write comes through
+// rvg_graphics_device_mmio_write_taking as before. Return false to refuse it: the queue's
+// writes all come through there. With `bell` -1, drop route `route` (of `ring_id`), whose queue
+// ended, before returning: no write reaches the host's copy once the call returns, as the ring
+// may be a later queue's; the answer is not read. The device routes a queue only where the
+// guest's driver took the reims-graphics wire's DOORBELL_ASKS, whose write for a command buffer
+// the device may answer at its doorbell holds bit 0 beside the ring's id and so matches no
+// route; at most RVG_GRAPHICS_DOORBELL_ROUTES at once; and it drops none at its end: the host
+// drops those it holds as it releases the device.
+//
+// Thread: one of ring 0's threads (`reims-vgpu.graphics-ring0-<i>`) as a queue is made, destroyed
+// or its process closed, where it may wait for a lock the host holds while it calls the device
+// (QEMU's BQL); with `bell` -1 also the host's own inside rvg_graphics_device_mmio_write_taking
+// (a write of 0 to STATUS) or rvg_graphics_device_reset, where it must not wait for a lock the
+// host holds around that call. The library holds no lock around it that a function of this
+// header waits for, and it may call nothing of the library's. Without it every doorbell write
+// comes through rvg_graphics_device_mmio_write_taking.
+typedef bool (*RvgGraphicsRouteDoorbellFn)(void *ctx, uint64_t route, uint32_t ring_id, int32_t bell);
+
 // The graphics device's callbacks.
 //
 // The cursor's three tell the host the guest's cursor on the device's display, for a host that
@@ -252,6 +282,9 @@ typedef struct {
   // The guest moved its cursor, or a reset put it at (0, 0):
   // rvg_graphics_device_cursor_position reads where its hot spot is.
   RvgCursorMoveFn cursor_move;
+  // Routes a command queue's plain doorbell into its bell, or drops the route. A host built
+  // before it, whose `struct_size` ends before it, gives none.
+  RvgGraphicsRouteDoorbellFn route_doorbell;
 } RvgGraphicsCallbacks;
 
 // `pointer(ctx, x, y, width, height, buttons)`: the pointer is at (`x`, `y`) in the guest's
@@ -501,8 +534,9 @@ uint32_t rvg_graphics_device_mmio_read(RvgGraphicsDevice *device, uint64_t offse
 //
 // A write to RVG_GRAPHICS_REG_DOORBELL of a command queue's ring (any value but
 // RVG_GRAPHICS_DOORBELL_CONTROL) wakes the queue's thread, and may answer the queue's next
-// command buffer on the calling thread, ahead of the queue's own thread, posting the event that
-// says it is submitted there: raise_interrupt is then called on the calling thread, inside this
+// command buffer on the calling thread, ahead of the queue's own thread (where the guest's
+// driver took the wire's DOORBELL_ASKS, only a write that holds bit 0 beside the ring's id, which
+// no route_doorbell route matches), posting the event that says it is submitted there: raise_interrupt is then called on the calling thread, inside this
 // call, after that event is published. The host's raise_interrupt must therefore not wait for a
 // lock the host holds while it calls this. A buffer is answered only where nothing need be
 // waited for (each lock the answer needs is tried, and the queue's thread holds none of the

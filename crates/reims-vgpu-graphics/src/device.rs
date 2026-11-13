@@ -96,6 +96,19 @@
 //! doorbell's write answers it there; it rings for nothing else, which the thread takes after the
 //! walk as it would with no doorbell.
 //!
+//! **Routed doorbells.** Where the guest's driver took `RGFX_FEATURE_DOORBELL_ASKS`, it rings a
+//! queue's doorbell for a buffer that asks for its `CB_SUBMITTED` with the ring's id and
+//! `RGFX_DOORBELL_ASKS`, and for anything else with the id alone, and only the asking write is
+//! offered to the host. Each queue then has a bell, an eventfd its service thread sleeps on
+//! beside its wake, and the host is asked to route the ring's plain doorbell into it
+//! ([`Host::route_doorbell`]; QEMU: a KVM `ioeventfd` matching the ring's id), so a plain
+//! doorbell wakes the queue's thread with no exit of the vCPU to the host's process and nothing
+//! of the device's run on it. The asking write matches no route and comes through
+//! [`Device::mmio_write_taking`] as every doorbell did. The writes a wake coalesces cost nothing:
+//! a woken thread takes every message the guest published. At most [`MAX_DOORBELL_ROUTES`]
+//! queues are routed at once; a queue past them, a route the host refuses, and every write
+//! before the host takes the route, keep the device's write, as before.
+//!
 //! A `DOORBELL` write of ring 0 through [`Device::mmio_write_taking`] answers ring 0's next
 //! message on the writing thread where it is a `SURFACE_DOWNLOAD` the host has carried out
 //! already ([`Host::surface_downloaded`]: a CPU lock of a surface whose pages hold its device
@@ -180,6 +193,14 @@ mod lanes;
 /// buffer to its queue's thread.
 const DOORBELL_READS: usize = 32;
 
+/// The most command queues whose plain doorbells the device routes to the host at once
+/// ([`Host::route_doorbell`]); a queue made past them keeps its doorbell on the device's write
+/// (on the guest's vCPU), and is counted. KVM keeps at most 1000 devices on a VM's MMIO bus, every
+/// `ioeventfd` of every device among them (each queue's route is one), and QEMU ends the VM where
+/// KVM refuses one, so the device takes a share of them that leaves the rest of the VM's devices
+/// theirs.
+pub const MAX_DOORBELL_ROUTES: u32 = 128;
+
 /// The region's size: the control rings, the framebuffer's scanout span and cursor, and room for
 /// the guest processes' rings, buffers, heaps and surfaces (a 3840x2400 BGRA8 surface is 37 MB);
 /// a power of two, as a BAR's size is.
@@ -249,7 +270,7 @@ impl Room {
 const MIN_QUEUE_RING_DATA: u64 = 4096;
 
 /// The feature bits whose meaning the host knows, which a `DRIVER_FEATURES` write may take:
-/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 42.
+/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 43.
 const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_CACHE
     | RGFX_FEATURE_CB_SUBMITTED
@@ -289,7 +310,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_FUNCTION_POINTERS
     | RGFX_FEATURE_DYNAMIC_LIBRARIES
     | RGFX_FEATURE_PIPELINE_KEYS
-    | RGFX_FEATURE_ICB_SLOTS_IN_PAGES;
+    | RGFX_FEATURE_ICB_SLOTS_IN_PAGES
+    | RGFX_FEATURE_DOORBELL_ASKS;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
@@ -521,6 +543,40 @@ pub trait Host: Send + Sync + 'static {
         let _ = completion;
     }
 
+    /// Routes a command queue's plain doorbell into `bell`, a file its service thread sleeps on
+    /// (an eventfd): from then on the host takes a `DOORBELL` write of `ring_id` (the queue's
+    /// submission ring's region offset) where no thread of its runs the write, and makes `bell`
+    /// readable, which wakes the thread as the write through [`Device::mmio_write_taking`] would
+    /// (QEMU: a KVM `ioeventfd` that matches the value). A write of `ring_id` with
+    /// [`RGFX_DOORBELL_ASKS`], for a buffer the host may answer at its doorbell, matches no route
+    /// and reaches [`Device::mmio_write_taking`] as every write did. `route` names the route, a
+    /// number the device gives no other: [`Host::unroute_doorbell`] drops it, and a route of a
+    /// `ring_id` another route of the host's holds replaces that one. The host takes a copy of
+    /// `bell` and may take the route after the call: until then, and where it refuses it, the
+    /// writes reach the device's write. Whether it took the route, so the device
+    /// counts it among its [`MAX_DOORBELL_ROUTES`]; false where it refuses it. Asked only where
+    /// the guest's driver took [`RGFX_FEATURE_DOORBELL_ASKS`], on the context's lane as the
+    /// queue is made, after its service thread started and before the create is answered, with
+    /// no lock held: it may wait for a lock the host holds while it calls the device. The default
+    /// takes none.
+    fn route_doorbell(&self, route: u64, ring_id: u32, bell: RawFd) -> bool {
+        let _ = (route, ring_id, bell);
+        false
+    }
+
+    /// Drops the route [`Host::route_doorbell`] took as `route`, of ring `ring_id`, once its queue
+    /// has ended: once this returns no write reaches the file, as the ring may be a later
+    /// queue's, and the host closes its copy. On the thread that ends the queue, with no lock
+    /// held: the context's lane (an `OBJECT_DESTROY` of the queue, its context's
+    /// `CONTEXT_CLOSE`, or a `QUEUE_CREATE` that remakes it), where it may wait for a lock the
+    /// host holds while it calls the device, or the host's own inside [`Device::mmio_write`],
+    /// [`Device::mmio_write_taking`] (a `STATUS` 0 write) or [`Device::reset`], where it must not
+    /// wait for a lock the host holds around that call. The routes the device holds at its end
+    /// are the host's to drop: no call drops them. The default does nothing.
+    fn unroute_doorbell(&self, route: u64, ring_id: u32) {
+        let _ = (route, ring_id);
+    }
+
     /// Hands a `COMMAND_BUFFER` from a command queue's own submission ring, or from the block a
     /// `COMMAND_BUFFER_IN_REGION` there names, to the host's decoder, on the queue's service
     /// thread, as [`Host::stage3_message`] hands a message: `message` is the copy the device took
@@ -709,6 +765,11 @@ pub(crate) struct Shared {
     lanes: Arc<Lanes>,
     /// The command queues' own rings and service threads, by queue id and by ring id.
     queues: Mutex<Queues>,
+    /// The queues' doorbells the host routes now ([`Host::route_doorbell`]), at most
+    /// [`MAX_DOORBELL_ROUTES`].
+    routes: AtomicU32,
+    /// The last route's number: each route takes the next.
+    last_route: AtomicU64,
     /// A weak handle to this shared state, set at the device's make: a queue's service thread and
     /// its completion poster hold it, so neither keeps the device alive.
     weak_self: OnceLock<Weak<Shared>>,
@@ -805,6 +866,13 @@ pub(crate) struct QueueShared {
     handing: AtomicBool,
     /// The service thread's own wake.
     wake: Wake,
+    /// Its bell, which the service thread sleeps on beside `wake`, where the guest's driver took
+    /// [`RGFX_FEATURE_DOORBELL_ASKS`] and the host has eventfds ([`wake::bell`]): the file the
+    /// host makes readable for the ring's plain doorbell where it routes it.
+    bell: Option<OwnedFd>,
+    /// The route of its plain doorbell the host took ([`Host::route_doorbell`]), 0 where none:
+    /// the queue's end takes it and drops it ([`Shared::unroute`]).
+    route: AtomicU64,
     /// Set when the queue is destroyed, or at a reset or the device's end.
     ending: AtomicBool,
 }
@@ -844,7 +912,9 @@ impl QueueShared {
     /// Ends the queue's service: its thread stops at its next wake, and a post waiting for room
     /// on its completion ring stops waiting.
     fn end(&self) {
-        self.ending.store(true, Ordering::Release);
+        // SeqCst, as the route's store and swap are ([`Shared::route`]): either the queue's maker
+        // sees the end after it stored its route, or the ender sees the route.
+        self.ending.store(true, Ordering::SeqCst);
         self.wake.wake();
         self.room.wake();
     }
@@ -973,6 +1043,8 @@ impl Device {
             gate: Gate::default(),
             lanes: Arc::new(lanes),
             queues: Mutex::new(Queues::default()),
+            routes: AtomicU32::new(0),
+            last_route: AtomicU64::new(0),
             weak_self: OnceLock::new(),
             handed_over: AtomicU64::new(0),
             handed_logged_ns: AtomicU64::new(0),
@@ -1092,8 +1164,9 @@ impl Device {
         }
     }
 
-    /// [`Self::mmio_write`], but a `DOORBELL` write of a command queue's ring first offers the
-    /// queue's next `COMMAND_BUFFER` to the host on the calling thread
+    /// [`Self::mmio_write`], but a `DOORBELL` write of a command queue's ring (with
+    /// [`RGFX_DOORBELL_ASKS`], where the guest's driver took [`RGFX_FEATURE_DOORBELL_ASKS`]) first
+    /// offers the queue's next `COMMAND_BUFFER` to the host on the calling thread
     /// ([`Host::answer_command_buffer`]; the module doc): the host may post its `CB_SUBMITTED`
     /// there, calling [`Host::raise_interrupt`] inside this call. A write of ring 0's
     /// (`RGFX_CONTROL_RING_ID`) first answers the ring's next message there where it is a
@@ -1405,6 +1478,7 @@ impl Shared {
         // process's: the guest's kext gives its blocks out again.
         for queue in &ended {
             queue.fence();
+            self.unroute(queue);
         }
         self.region.revoke_all();
         self.gate.every();
@@ -1793,6 +1867,7 @@ impl Shared {
         // their blocks out again once the close is answered.
         for queue in &ended {
             queue.fence();
+            self.unroute(queue);
         }
         // Their threads waiting for ring 0 look again, and go.
         if !ended.is_empty() {
@@ -1923,10 +1998,11 @@ impl Shared {
         }
     }
 
-    /// A doorbell write of ring id `ring_id`: wakes the control thread (ring id 0) or the service
-    /// thread of the queue whose submission ring is at that region offset; an unknown id is
-    /// ignored.
-    fn ring_doorbell(&self, ring_id: u64) {
+    /// A doorbell write of `value`, a ring's id ([`Self::doorbell_value`]): wakes the control
+    /// thread (ring id 0) or the service thread of the queue whose submission ring is at that
+    /// region offset; an unknown id is ignored.
+    fn ring_doorbell(&self, value: u64) {
+        let (ring_id, _) = self.doorbell_value(value);
         if ring_id == u64::from(RGFX_CONTROL_RING_ID) {
             self.wake.wake();
             self.room.wake();
@@ -1937,12 +2013,27 @@ impl Shared {
         }
     }
 
+    /// The ring a `DOORBELL` write of `value` rings, and whether the guest rang it for a buffer
+    /// the device may answer at the doorbell: where the guest's driver took
+    /// [`RGFX_FEATURE_DOORBELL_ASKS`], the write that holds [`RGFX_DOORBELL_ASKS`] alone, the rest
+    /// of it the ring's id; otherwise any write, as before the feature.
+    fn doorbell_value(&self, value: u64) -> (u64, bool) {
+        if self.driver_took(RGFX_FEATURE_DOORBELL_ASKS) {
+            let asks = u64::from(RGFX_DOORBELL_ASKS);
+            (value & !asks, value & asks != 0)
+        } else {
+            (value, true)
+        }
+    }
+
     /// [`Self::ring_doorbell`], after the rung ring's next message is offered to the host on this
-    /// thread: a command queue's ([`Self::answer_on_doorbell`]), or ring 0's, where it is a
+    /// thread: a command queue's, where the guest rang for a buffer that asks
+    /// ([`Self::doorbell_value`], [`Self::answer_on_doorbell`]), or ring 0's, where it is a
     /// `SURFACE_DOWNLOAD` the host has carried out already ([`Self::download_on_doorbell`]).
     /// The queues' table, held elsewhere, is waited for as `ring_doorbell` waits for it, and
     /// nothing is offered.
-    fn ring_taking(&self, ring_id: u64) {
+    fn ring_taking(&self, value: u64) {
+        let (ring_id, asks) = self.doorbell_value(value);
         if ring_id == u64::from(RGFX_CONTROL_RING_ID) {
             self.download_on_doorbell();
             self.wake.wake();
@@ -1951,10 +2042,12 @@ impl Shared {
         }
         let queue = match self.queues.try_lock() {
             Some(queues) => queues.by_ring.get(&ring_id).cloned(),
-            None => return self.ring_doorbell(ring_id),
+            None => return self.ring_doorbell(value),
         };
         if let Some(queue) = queue {
-            self.answer_on_doorbell(&queue);
+            if asks {
+                self.answer_on_doorbell(&queue);
+            }
             queue.rung();
         }
     }
@@ -2218,6 +2311,13 @@ impl Shared {
             );
             return RGFX_STATUS_INVALID_ARGUMENT;
         };
+        // A guest that rings an asking buffer's doorbell apart from the rest lets the host take
+        // the rest where it runs nothing of the device's ([`Host::route_doorbell`]).
+        let bell = if self.driver_took(RGFX_FEATURE_DOORBELL_ASKS) {
+            wake::bell()
+        } else {
+            None
+        };
         // Take the ring headers as the guest left them: it zeroes both before the create, and may
         // publish its first command buffer on the submission ring before the host gets here (the
         // create rides ring 0, the buffer the queue's own). A reset here would clear that producer
@@ -2247,6 +2347,8 @@ impl Shared {
             handed: Mutex::new(Handed::default()),
             handing: AtomicBool::new(false),
             wake,
+            bell,
+            route: AtomicU64::new(0),
             ending: AtomicBool::new(false),
         });
         let ended: Vec<Arc<QueueShared>> = {
@@ -2272,6 +2374,7 @@ impl Shared {
         };
         for old in &ended {
             old.fence();
+            self.unroute(old);
         }
         if !ended.is_empty() {
             self.gate.every();
@@ -2282,15 +2385,73 @@ impl Shared {
             .spawn(move || me.queue_service(&service));
         if started.is_err() {
             self.queues.lock().remove(&queue);
+            self.unroute(&queue);
             log::error!(
                 target: "reims_vgpu_graphics",
                 "queue {:#x}: no service thread; it is refused", q.obj_id
             );
             return RGFX_STATUS_INVALID_ARGUMENT;
         }
+        self.route(&queue);
         // Before the answer: a buffer of another queue may name this one's from then on.
         self.host.queue_made(&self.queue_poster(&queue));
         RGFX_STATUS_OK
+    }
+
+    /// Has the host route `queue`'s plain doorbell into its bell ([`Host::route_doorbell`]), where
+    /// it has one, while the device routes fewer than [`MAX_DOORBELL_ROUTES`]. A queue past them,
+    /// or whose route the host refuses, keeps its doorbell on the device's write, as every queue
+    /// had it, and the first of each is logged, the rest counted. A queue ended meanwhile drops
+    /// the route it took at once.
+    fn route(&self, queue: &QueueShared) {
+        let Some(bell) = &queue.bell else {
+            return;
+        };
+        // The guest writes a ring's id as 32 bits: a ring past them is never rung.
+        let Ok(ring_id) = u32::try_from(queue.ring_id) else {
+            return;
+        };
+        if self
+            .routes
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_DOORBELL_ROUTES).then_some(n + 1)
+            })
+            .is_err()
+        {
+            log::warn!(
+                target: "reims_vgpu_graphics", kind = "full";
+                "queue {:#x}: the device routes {MAX_DOORBELL_ROUTES} queues' doorbells to the \
+                 host already, so this one's runs on the guest's vCPU", queue.obj_id
+            );
+            return;
+        }
+        let route = self.last_route.fetch_add(1, Ordering::AcqRel) + 1;
+        if !self.host.route_doorbell(route, ring_id, bell.as_raw_fd()) {
+            self.routes.fetch_sub(1, Ordering::AcqRel);
+            log::warn!(
+                target: "reims_vgpu_graphics", kind = "refused";
+                "queue {:#x}: the host refused its doorbell's route, so its doorbell runs on the \
+                 guest's vCPU", queue.obj_id
+            );
+            return;
+        }
+        // SeqCst, as the end's store is ([`QueueShared::end`]): a queue that ended meanwhile is
+        // seen here, or its ender sees the route.
+        queue.route.store(route, Ordering::SeqCst);
+        if queue.ending.load(Ordering::SeqCst) {
+            self.unroute(queue);
+        }
+    }
+
+    /// Drops the route of `queue`'s doorbell the host took ([`Host::unroute_doorbell`]), once,
+    /// where it took one; called once the queue has ended.
+    fn unroute(&self, queue: &QueueShared) {
+        let route = queue.route.swap(0, Ordering::SeqCst);
+        if route != 0 {
+            // A routed ring's id is 32 bits ([`Self::route`]).
+            self.host.unroute_doorbell(route, queue.ring_id as u32);
+            self.routes.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     /// Ends and forgets the queue `obj_id`'s per-queue service, where it has one (an
@@ -2306,6 +2467,7 @@ impl Shared {
         };
         // Its rings are no longer a live queue's (`rings_in`): nothing touches them past this.
         queue.fence();
+        self.unroute(&queue);
         // Its thread, where it waits for ring 0, looks again and goes.
         self.gate.every();
         true
@@ -2375,7 +2537,14 @@ impl Shared {
             if self.ending() || queue.ended() {
                 break;
             }
-            queue.wake.sleep(None);
+            // On its bell too, which the host makes readable for a doorbell it routes: the
+            // writes it holds wake the thread once, and the take finds every buffer they rang for.
+            queue
+                .wake
+                .sleep(queue.bell.as_ref().map(AsRawFd::as_raw_fd));
+            // A doorbell may follow the guest's take of completions, as the control thread's
+            // may: a routed one rings nothing of the device's but the bell.
+            queue.room.wake();
             if idle {
                 // An ended queue's rings may be another process's block by now (`fence`).
                 let submit = queue.submit.lock();

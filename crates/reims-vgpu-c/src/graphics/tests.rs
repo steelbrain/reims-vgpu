@@ -20,6 +20,7 @@ fn callbacks() -> RvgGraphicsCallbacks {
         cursor_glyph: None,
         cursor_show: None,
         cursor_move: None,
+        route_doorbell: None,
     }
 }
 
@@ -198,6 +199,24 @@ fn the_guest_s_architecture_decides_framebuffer_read() {
     // The first version's size, with an arm64 guest past it, which the library does not read.
     c.struct_size = std::mem::offset_of!(RvgGraphicsDeviceConfig, guest_arch) as u32;
     assert_eq!(framebuffer_read(&c), 0);
+}
+
+/// A callback table of the first version, whose `struct_size` ends before `route_doorbell`, is
+/// taken, whatever lies past its size: the host routes no doorbell
+#[test]
+fn a_callback_table_without_route_doorbell_is_taken() {
+    let cb = RvgGraphicsCallbacks {
+        struct_size: std::mem::offset_of!(RvgGraphicsCallbacks, route_doorbell) as u32,
+        destroy: None,
+        ..callbacks()
+    };
+    let c = config(&cb);
+    let mut device = std::ptr::null_mut();
+    // SAFETY: a live config and out-pointer; then a live device, released.
+    unsafe {
+        assert_eq!(rvg_graphics_device_create(&c, &mut device), RVG_OK);
+        rvg_graphics_device_release(device);
+    }
 }
 
 static MOVES: AtomicUsize = AtomicUsize::new(0);

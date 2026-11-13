@@ -1078,7 +1078,7 @@ sit in BAR0 from 0x800.
 | 0x010 | `STATUS` | RW | writing 0 resets the device; the guest writes 1 (driver ready) once it has read the rings' headers |
 | 0x014 | `REGION_SIZE_LO` | RO | BAR2's size, low 32 bits |
 | 0x018 | `REGION_SIZE_HI` | RO | BAR2's size, high 32 bits |
-| 0x020 | `DOORBELL` | WO | writing a ring's id wakes its consumer (an `ioeventfd`) |
+| 0x020 | `DOORBELL` | WO | writing a ring's id wakes its consumer (an `ioeventfd`); under `DOORBELL_ASKS` bit 0 set asks for the answer at the doorbell |
 | 0x024 | `DRIVER_FEATURES_LO` | RW | feature bits 0-31 the guest's driver takes; reads back the ones the host took ("Negotiated features", below) |
 | 0x028 | `DRIVER_FEATURES_HI` | RW | feature bits 32-63, likewise |
 | 0x02c | `CONSUMED` | WO | writing a completion ring's offset wakes its producer waiting for room, under `CONSUMED_DOORBELL`; no host handles it yet, so it reads 0 and a write is ignored |
@@ -1476,6 +1476,16 @@ only where no negotiation can carry it.
   A host offers it where it offers `PAGES_BUFFERS`, and the kext takes it; a
   bundle on a host that did not offer it lays every buffer's slots in the
   region.
+- Bit 43, `FEATURES_HI`'s bit 11, is `DOORBELL_ASKS`: a queue's doorbell is
+  written with the ring's id and `RGFX_DOORBELL_ASKS` (bit 0; a ring's id is a
+  region offset, a multiple of 8) for a command buffer whose stream ends in its
+  ask for its `CB_SUBMITTED`, and with the id alone otherwise. The host
+  answers at the doorbell only an asking write ("The answer at the
+  doorbell"), and may take a plain one with no exit to its process, waking
+  the queue's thread from the guest's vCPU directly ("Routed doorbells").
+  Every host offers it, the kext takes it, and the bundle sets the bit where
+  the device's word holds it; where it does not, every doorbell write may be
+  answered, as before the bit.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -2000,7 +2010,8 @@ own 64-byte line:
   then issues a full fence and reads `consumer_idle`. If it reads 1, it writes
   the ring's id to `DOORBELL`; if it reads 2, it does so only for a command
   buffer whose last op asks for its `CB_SUBMITTED`, which the host may answer
-  inside the write. Before sleeping, the consumer sets `consumer_idle` to 1,
+  inside the write. Under `DOORBELL_ASKS` that buffer's write carries
+  `RGFX_DOORBELL_ASKS` with the id, and every other write the id alone. Before sleeping, the consumer sets `consumer_idle` to 1,
   issues a full fence and reads `producer` again, so no wake is lost. It
   clears `consumer_idle` when it wakes. A queue's consumer sets it to 2 while
   it walks a buffer on its own thread, after which it takes the ring again
@@ -3758,6 +3769,33 @@ commit. Each outcome the new design allows is one of those two:
   `a_buffer_using_a_cache_is_answered_at_its_doorbell_where_it_waits_for_no_copy`,
   the decoder's fuzz (`an_answer_at_the_doorbell_keeps_the_order_of_a_take`),
   and the device's `an_answered_command_buffer_waits_for_no_later_ring_0_message`.
+  Under `DOORBELL_ASKS` only a write that carries `RGFX_DOORBELL_ASKS` is
+  answered there; a plain write wakes the queue's thread alone
+  (`only_an_asking_doorbell_write_is_answered_at_the_doorbell`,
+  `a_guest_without_doorbell_asks_is_answered_at_any_doorbell_and_not_routed`).
+- **Routed doorbells.** A plain doorbell write needs nothing of the host but
+  the wake of the queue's thread, so where the guest took `DOORBELL_ASKS` each
+  queue's thread sleeps on an eventfd of its own as well as on its wake, and
+  the device hands the host that eventfd with the ring's id at the queue's
+  create (the C API's `route_doorbell`). QEMU registers it with KVM as an
+  ioeventfd on `DOORBELL` matching the ring's id exactly, so KVM signals it
+  inside the guest's write and the vCPU returns to the guest with no exit to
+  QEMU; the asking write, the id with bit 0, matches no route and goes to
+  QEMU and the library as before. Measured on the Radeon 780M host before
+  the routes: a write QEMU takes as an ioeventfd (ring 0's) costs the guest
+  8.9 us, one it runs through the library 13.4 us. The thread drains the
+  eventfd and walks the ring on each wake, so writes that coalesce into one
+  wake are all taken, in ring order
+  (`a_routed_doorbell_wakes_its_queue_which_takes_every_buffer_published`).
+  The device routes at most 128 queues' doorbells (KVM holds 1000 devices on
+  its MMIO bus, and QEMU ends the VM where KVM refuses one); a queue past them,
+  or one whose route the host refuses, keeps its doorbell on the write, logged
+  once per kind (`full`, `refused`) and then counted
+  (`a_queue_past_the_routes_or_refused_keeps_its_doorbell_on_the_write`). A
+  queue's route goes at its destroy, its context's close and the device's
+  reset (`a_reset_drops_the_queues_routes`), and QEMU drops every route at its
+  teardown. A route changes no order: the ring's records, its completions and
+  interrupts are the thread's, as for a doorbell the host takes in the write.
 
 ## Stage 3 guest stack (from the prior-art study)
 

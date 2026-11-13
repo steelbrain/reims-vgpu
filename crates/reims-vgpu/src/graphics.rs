@@ -58,15 +58,16 @@ use reims_vgpu_graphics::wire::{
     RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_FUNCTION_POINTER_STATE,
     RGFX_EVT_ICB_STATE, RGFX_EVT_RATE_MAP_ANSWER, RGFX_EVT_RATE_MAP_STATE, RGFX_EVT_SAMPLER_STATE,
     RGFX_FEATURE_CB_SUBMITTED, RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_DISPLAY_COLOR,
-    RGFX_FEATURE_DISPLAY_POWER, RGFX_FEATURE_DISPLAY_SCALE, RGFX_FEATURE_DYNAMIC_LIBRARIES,
-    RGFX_FEATURE_FUNCTION_POINTERS, RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_HOST_TIME,
-    RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_ICB_SLOTS_IN_PAGES, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
-    RGFX_FEATURE_MANAGED_AT_OFFSET, RGFX_FEATURE_MANAGED_BUFFER_SLABS,
-    RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE,
-    RGFX_FEATURE_PAGES_16K, RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PIPELINE_KEYS,
-    RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_RATE_MAPS, RGFX_FEATURE_SCHEDULED_ASK,
-    RGFX_FEATURE_SHARED_EVENT_NAMES, RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM,
-    RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
+    RGFX_FEATURE_DISPLAY_POWER, RGFX_FEATURE_DISPLAY_SCALE, RGFX_FEATURE_DOORBELL_ASKS,
+    RGFX_FEATURE_DYNAMIC_LIBRARIES, RGFX_FEATURE_FUNCTION_POINTERS, RGFX_FEATURE_HEAP_OVER_PAGES,
+    RGFX_FEATURE_HOST_TIME, RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_ICB_SLOTS_IN_PAGES,
+    RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_MANAGED_AT_OFFSET,
+    RGFX_FEATURE_MANAGED_BUFFER_SLABS, RGFX_FEATURE_MANAGED_TEXTURE_SLABS,
+    RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE, RGFX_FEATURE_PAGES_16K,
+    RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PIPELINE_KEYS, RGFX_FEATURE_PRIVATE_RENDER_STATE,
+    RGFX_FEATURE_RATE_MAPS, RGFX_FEATURE_SCHEDULED_ASK, RGFX_FEATURE_SHARED_EVENT_NAMES,
+    RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE,
+    RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
     RGFX_FEATURE_SURFACE_DEFERRED_ASK, RGFX_FEATURE_SURFACE_DEFERRED_CARRY,
     RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA,
     RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
@@ -142,6 +143,24 @@ pub use decode::{GraphicsVideo, GraphicsVideoSession, PlanePages, VideoDecode, V
 /// Raises MSI-X vector `vector`: the device's interrupt.
 pub type GraphicsRaiseFn = Arc<dyn Fn(u32) + Send + Sync>;
 
+/// `(route, ring_id, bell)`: with `Some(bell)`, routes a command queue's plain doorbell, a
+/// `DOORBELL` write of `ring_id`, into the file `bell` (an eventfd the queue's thread sleeps on)
+/// where the host takes such a write with no thread of its running it (QEMU: a KVM
+/// `ioeventfd`), as route number `route`, and answers whether it took it; with `None`, drops
+/// route `route` (of `ring_id`), whose queue ended, and its answer is not read: once the call
+/// returns no write reaches `bell`, as the ring may be a later queue's. A route of a `ring_id`
+/// another route holds replaces that one. The host takes a copy of `bell` and may take the
+/// route after the call; until then, and where it refuses it, the writes come through
+/// [`GraphicsDevice::mmio_write_taking`]. The device routes only where the guest's driver took
+/// `RGFX_FEATURE_DOORBELL_ASKS`, at most `reims_vgpu_graphics::device::MAX_DOORBELL_ROUTES` at
+/// once, and drops none at its end: those it holds then are the host's to drop. Called with no
+/// lock held that a function of the device's waits for: on one of ring 0's threads
+/// (`reims-vgpu.graphics-ring0-<i>`) as a queue is made, destroyed or its process closed, where
+/// it may wait for a lock the host holds while it calls the device (QEMU's BQL); and with
+/// `None` also on the host's own inside a `STATUS` 0 write or [`GraphicsDevice::reset`], where
+/// it must not wait for a lock the host holds around that call.
+pub type GraphicsRouteDoorbellFn = Arc<dyn Fn(u64, u32, Option<RawFd>) -> bool + Send + Sync>;
+
 /// A graphics device's callbacks. `raise_interrupt` is called on the thread that posts the event
 /// it raises for: the device's control thread (`reims-vgpu.graphics-control`), one of ring 0's
 /// threads (`reims-vgpu.graphics-ring0-<i>`), which carry out a guest process's control messages,
@@ -181,6 +200,9 @@ pub struct GraphicsCallbacks {
     pub cursor_show: Option<CursorShowFn>,
     /// The guest moved its cursor: [`GraphicsDevice::cursor_position`] reads where.
     pub cursor_move: Option<CursorMoveFn>,
+    /// Routes a command queue's plain doorbell into its bell, or drops the route. Without it every
+    /// doorbell write comes through [`GraphicsDevice::mmio_write_taking`].
+    pub route_doorbell: Option<GraphicsRouteDoorbellFn>,
 }
 
 /// A graphics device's config.
@@ -395,7 +417,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // while the guest's display sleeps (`DISPLAY_POWER`), and makes the guest's
             // rasterization rate maps on its platform (`RATE_MAPS`), of the layer counts the device
             // info answers, and its compute pipeline states' function handles and visible function
-            // tables (`FUNCTION_POINTERS`).
+            // tables (`FUNCTION_POINTERS`). Every host takes the doorbell of a buffer that asks for
+            // its `CB_SUBMITTED` apart from the rest (`DOORBELL_ASKS`), so a host may take the rest
+            // where it runs nothing of the device's (`GraphicsCallbacks::route_doorbell`).
             let in_place = u64::from(RGFX_FEATURE_SURFACE_PAGES)
                 | u64::from(RGFX_FEATURE_PAGES_BUFFERS)
                 | u64::from(RGFX_FEATURE_HEAP_OVER_PAGES)
@@ -421,6 +445,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 | RGFX_FEATURE_FUNCTION_POINTERS
                 | RGFX_FEATURE_DYNAMIC_LIBRARIES
                 | RGFX_FEATURE_PIPELINE_KEYS
+                | RGFX_FEATURE_DOORBELL_ASKS
                 | if gpu_device.makes_opencl_mode_pipelines() {
                     u64::from(RGFX_FEATURE_OPENCL_MODE)
                 } else {
@@ -2528,6 +2553,18 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
     fn raise_interrupt(&self, vector: u32) {
         if let Some(f) = &self.callbacks.raise_interrupt {
             f(vector);
+        }
+    }
+
+    fn route_doorbell(&self, route: u64, ring_id: u32, bell: RawFd) -> bool {
+        (self.callbacks.route_doorbell)
+            .as_ref()
+            .is_some_and(|f| f(route, ring_id, Some(bell)))
+    }
+
+    fn unroute_doorbell(&self, route: u64, ring_id: u32) {
+        if let Some(f) = &self.callbacks.route_doorbell {
+            f(route, ring_id, None);
         }
     }
 

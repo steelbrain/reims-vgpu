@@ -21,7 +21,8 @@
 //! publishes `producer` (a release store), issues a full fence and reads `consumer_idle`; if it
 //! reads [`RGFX_CONSUMER_ASLEEP`] it writes the ring's id to [`RGFX_REG_DOORBELL`], and so it does
 //! on reading [`RGFX_CONSUMER_WALKING`] for a command buffer that asks to be answered at the
-//! doorbell. The consumer (the host) sets `consumer_idle` before it sleeps, issues a full fence
+//! doorbell, whose id it writes with [`RGFX_DOORBELL_ASKS`] where it took
+//! [`RGFX_FEATURE_DOORBELL_ASKS`]. The consumer (the host) sets `consumer_idle` before it sleeps, issues a full fence
 //! and reads `producer` again, so no wake is lost, and clears it when it wakes. The producer of a completion ring (the host) publishes a
 //! message, issues a full fence and reads `armed`; if it reads 1, it clears it, reads `consumer`,
 //! and raises the ring's MSI-X vector, or, where the guest has taken every message published, sets
@@ -372,6 +373,15 @@ pub const RGFX_FEATURE_PIPELINE_KEYS: u64 = 0x200_0000_0000;
 /// where it maps the region's blocks uncached on an AMD host's guest ([`crate::icb`], "Slots").
 /// A host offers it where it offers [`RGFX_FEATURE_PAGES_BUFFERS`].
 pub const RGFX_FEATURE_ICB_SLOTS_IN_PAGES: u64 = 0x400_0000_0000;
+/// `FEATURES_HI` bit 11, feature bit 43, `DOORBELL_ASKS`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_HI`]: the guest rings a command queue's doorbell for a
+/// [`RGFX_CMD_COMMAND_BUFFER`] whose last op asks for its [`RGFX_EVT_CB_SUBMITTED`]
+/// ([`RGFX_OP_SUBMITTED`](crate::ops::RGFX_OP_SUBMITTED)) with the ring's id and
+/// [`RGFX_DOORBELL_ASKS`], and for any other message with the ring's id alone. The host may then
+/// take a ring's plain doorbell where no thread of its runs the write (QEMU: a KVM `ioeventfd`
+/// that wakes the queue's thread), and answers a buffer at its doorbell only for the write that
+/// holds [`RGFX_DOORBELL_ASKS`], as it did for any write before. Every host offers it.
+pub const RGFX_FEATURE_DOORBELL_ASKS: u64 = 0x800_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -379,8 +389,15 @@ pub const RGFX_REG_STATUS: u32 = 0x010;
 pub const RGFX_REG_REGION_SIZE_LO: u32 = 0x014;
 /// `REGION_SIZE_HI`, RO: BAR 2's size, its high 32 bits.
 pub const RGFX_REG_REGION_SIZE_HI: u32 = 0x018;
-/// `DOORBELL`, WO: writing a ring's id wakes its consumer.
+/// `DOORBELL`, WO: writing a ring's id wakes its consumer. Where the guest took
+/// [`RGFX_FEATURE_DOORBELL_ASKS`], a command queue's ring's id with [`RGFX_DOORBELL_ASKS`] set
+/// wakes it too, and asks the host to answer the buffer it rang for inside the write.
 pub const RGFX_REG_DOORBELL: u32 = 0x020;
+/// Set in a `DOORBELL` value beside a command queue's ring's id, where the guest took
+/// [`RGFX_FEATURE_DOORBELL_ASKS`]: the guest rang for a buffer that asks for its
+/// [`RGFX_EVT_CB_SUBMITTED`], which the host may answer inside the write. A ring's id is its
+/// region offset, a multiple of 8, so the bit names no ring.
+pub const RGFX_DOORBELL_ASKS: u32 = 1;
 /// `DRIVER_FEATURES_LO`, RW: the feature bits 0 to 31 the guest's driver uses. A write takes the
 /// bits written that `FEATURES_LO` offers and the host knows, and a read answers the bits taken.
 /// A write while `STATUS` reads [`RGFX_STATUS_DRIVER_READY`] is ignored, and a reset clears both

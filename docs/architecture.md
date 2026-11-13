@@ -783,7 +783,9 @@ ROM's style, on `stdint.h`'s types, since it has no UEFI.
 `vendor/qemu`'s `reims-graphics-pci` (`hw/display/reims-graphics-pci.c`) is plain C on the C API,
 the device's transport: BAR 0 is the library's registers with the MSI-X table, BAR 2 the library's
 region, and the control ring's doorbell an `ioeventfd` the library's control thread polls, so
-ringing it never runs the library on the vCPU. Meson finds the library as
+ringing it never runs the library on the vCPU. So is a command queue's plain doorbell where the
+library routes it (`route_doorbell`; [graphics-kext/design.md](graphics-kext/design.md), "Routed
+doorbells"): an `ioeventfd` matching the ring's id signals the eventfd the queue's thread polls. Meson finds the library as
 `dependency('reims-vgpu', method: 'pkg-config', static: true)`, the package `cargo xtask dist`
 writes (11.3), so `libreims_vgpu.a` is part of QEMU's binary. Under `-display none` the library
 opens the device's window; the console shows what the display shows, read back with

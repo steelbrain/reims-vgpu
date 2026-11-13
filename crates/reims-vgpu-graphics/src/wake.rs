@@ -114,6 +114,28 @@ impl Wake {
     }
 }
 
+/// A command queue's bell: an eventfd, non-blocking and closed on exec, that its service thread
+/// sleeps on beside its [`Wake`], and that the host makes readable for the queue's plain doorbell
+/// where it routes it ([`crate::device::Host::route_doorbell`]: QEMU's KVM `ioeventfd`). `None`
+/// where the host refuses one, and on a host with no eventfd, whose queues' doorbells run the
+/// device's write as before.
+pub(crate) fn bell() -> Option<OwnedFd> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: no pointer; the flags make it non-blocking and closed on exec.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: `eventfd` made it, and nothing else owns it.
+        Some(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 /// Takes what `fd` holds, at most 64 bytes: an eventfd's count (8 bytes), or a pipe's writes
 /// (QEMU's event notifier is a pipe where the host has no eventfd). One read after a readable
 /// poll never blocks; what it leaves keeps the descriptor readable for the next sleep.

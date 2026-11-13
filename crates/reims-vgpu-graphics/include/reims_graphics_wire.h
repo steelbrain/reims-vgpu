@@ -1398,6 +1398,16 @@
 // A host offers it where it offers [`RGFX_FEATURE_PAGES_BUFFERS`].
 #define RGFX_FEATURE_ICB_SLOTS_IN_PAGES 4398046511104
 
+// `FEATURES_HI` bit 11, feature bit 43, `DOORBELL_ASKS`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_HI`]: the guest rings a command queue's doorbell for a
+// [`RGFX_CMD_COMMAND_BUFFER`] whose last op asks for its [`RGFX_EVT_CB_SUBMITTED`]
+// ([`RGFX_OP_SUBMITTED`](crate::ops::RGFX_OP_SUBMITTED)) with the ring's id and
+// [`RGFX_DOORBELL_ASKS`], and for any other message with the ring's id alone. The host may then
+// take a ring's plain doorbell where no thread of its runs the write (QEMU: a KVM `ioeventfd`
+// that wakes the queue's thread), and answers a buffer at its doorbell only for the write that
+// holds [`RGFX_DOORBELL_ASKS`], as it did for any write before. Every host offers it.
+#define RGFX_FEATURE_DOORBELL_ASKS 8796093022208
+
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 #define RGFX_REG_STATUS 16
@@ -1408,8 +1418,16 @@
 // `REGION_SIZE_HI`, RO: BAR 2's size, its high 32 bits.
 #define RGFX_REG_REGION_SIZE_HI 24
 
-// `DOORBELL`, WO: writing a ring's id wakes its consumer.
+// `DOORBELL`, WO: writing a ring's id wakes its consumer. Where the guest took
+// [`RGFX_FEATURE_DOORBELL_ASKS`], a command queue's ring's id with [`RGFX_DOORBELL_ASKS`] set
+// wakes it too, and asks the host to answer the buffer it rang for inside the write.
 #define RGFX_REG_DOORBELL 32
+
+// Set in a `DOORBELL` value beside a command queue's ring's id, where the guest took
+// [`RGFX_FEATURE_DOORBELL_ASKS`]: the guest rang for a buffer that asks for its
+// [`RGFX_EVT_CB_SUBMITTED`], which the host may answer inside the write. A ring's id is its
+// region offset, a multiple of 8, so the bit names no ring.
+#define RGFX_DOORBELL_ASKS 1
 
 // `DRIVER_FEATURES_LO`, RW: the feature bits 0 to 31 the guest's driver uses. A write takes the
 // bits written that `FEATURES_LO` offers and the host knows, and a read answers the bits taken.

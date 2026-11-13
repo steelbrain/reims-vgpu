@@ -26,7 +26,12 @@ parse_deps = false
 prefix = ""
 item_types = ["constants", "structs"]
 # The host side's constants, which the guest reads from the registers instead.
-exclude = ["REGION_SIZE", "RgfxOpSetDepthCleared", "RgfxOpSetStencilCleared"]
+exclude = [
+    "MAX_DOORBELL_ROUTES",
+    "REGION_SIZE",
+    "RgfxOpSetDepthCleared",
+    "RgfxOpSetStencilCleared",
+]
 # The records, which no function names, listed so that cbindgen writes them.
 include = [
     "RgfxArgumentDescriptor",

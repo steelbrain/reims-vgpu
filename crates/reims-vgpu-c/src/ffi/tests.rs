@@ -106,6 +106,7 @@ fn a_panic_in_a_callback_of_the_first_export_ends_in_the_hook() {
             cursor_glyph: None,
             cursor_show: None,
             cursor_move: None,
+            route_doorbell: None,
         };
         let config = crate::graphics::RvgGraphicsDeviceConfig {
             struct_size: crate::sized::size_u32::<crate::graphics::RvgGraphicsDeviceConfig>(),

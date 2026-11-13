@@ -89,6 +89,7 @@ merge into staging of 2026-06-19), and upstream master is merged into it
 | the device tells the library the guest's architecture (`guest_arch`: arm64 where `target_aarch64()`, else x86-64), which the device's `isFramebufferReadSupported` answer follows, and the class of Mac whose GPU results the library's devices give (`GuestArch::mac_class`) | `c2fb9b92` |
 | the device raises its interrupt through an irqfd where KVM's in-kernel irqchip takes MSI-X through one | `36deb281` |
 | a command buffer is taken, and answered, on the vCPU that rings its queue's doorbell, with the plain register write | `f2c7e2a5`, `67cc08ad`, `5f459785` |
+| a command queue's plain doorbell, which the library routes where the guest took `DOORBELL_ASKS` (`route_doorbell`), is an ioeventfd matching the ring's id that signals the queue's eventfd, added and dropped under the BQL as the library asks, at most 128 at once | `d81bcaac` |
 | the console shows the display (`rvg_graphics_device_read_display`), so QMP's `screendump` saves the guest's frame, and has the guest's cursor | `70a9a466`, `c119b802` |
 | the device's realize warns where BAR 2 would get no address: on a PC machine with RAM at 1 GiB ("The reims-graphics device", below) | `22ae1fd1` |
 | the window opens at the `resolution` property's size, 1920x1080 without it | `93fb0692` |
@@ -133,12 +134,18 @@ is its transport:
   library itself, with no BQL: an access waits at most for the command the
   control thread is taking. A write of 0, the control ring's id, to
   DOORBELL (0x20) is taken by an ioeventfd (an eventfd on Linux, a pipe on
-  a Mac), whose file the library's control thread polls. Every other
-  register write goes to the library through
+  a Mac), whose file the library's control thread polls. So is a write of
+  a command queue's ring the library routes (`route_doorbell`, on Linux,
+  where the guest took `DOORBELL_ASKS`): an ioeventfd matching the ring's id
+  exactly signals the queue's eventfd, which its thread polls, so the vCPU
+  goes back to the guest with no exit to QEMU. The device adds and drops
+  these under the BQL as the library's queues are made and end, at most 128
+  at once. Every other register write goes to the library through
   `rvg_graphics_device_mmio_write_taking`: a write of a command queue's ring
-  may answer the queue's next command buffer on the vCPU, posting its
-  `CB_SUBMITTED` and raising the interrupt inside the call, and wakes the
-  queue's thread, which takes the buffer either way.
+  (with bit 0 set, where the guest took `DOORBELL_ASKS`) may answer the
+  queue's next command buffer on the vCPU, posting its `CB_SUBMITTED` and
+  raising the interrupt inside the call, and wakes the queue's thread, which
+  takes the buffer either way.
 - **BAR 2**, 64-bit and prefetchable: the library's region
   (`rvg_graphics_device_region`), 1 GiB of memory of QEMU's process (on
   Linux a shared mapping of a memfd of the library's, on macOS private

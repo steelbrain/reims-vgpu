@@ -3103,6 +3103,15 @@ struct Taking {
     handed: Mutex<Vec<u32>>,
     /// Each command buffer carried out, and the name of the thread it was carried out on.
     carried: Mutex<Vec<(u64, Option<String>)>>,
+    /// Offer `DOORBELL_ASKS`.
+    asks: AtomicBool,
+    /// Refuse every doorbell's route ([`Host::route_doorbell`]).
+    refuses_routes: AtomicBool,
+    /// Each doorbell route taken: its number, its ring's id, and a copy of its bell, which the
+    /// test writes as KVM's `ioeventfd` would.
+    routes: Mutex<Vec<(u64, u32, OwnedFd)>>,
+    /// Each route dropped ([`Host::unroute_doorbell`]), in order.
+    unrouted: Mutex<Vec<u64>>,
 }
 
 /// A host whose command buffers post a `CB_SUBMITTED` and then a `CB_COMPLETE`, as the decoder's
@@ -3157,6 +3166,25 @@ fn cb_complete(seqno: u64, cb_obj_id: u64) -> RgfxCbComplete {
 impl Host for TakingHost {
     fn raise_interrupt(&self, vector: u32) {
         self.0.raised.lock().push((vector, thread_name()));
+    }
+    fn features(&self) -> u64 {
+        if self.0.asks.load(Ordering::SeqCst) {
+            RGFX_FEATURE_DOORBELL_ASKS
+        } else {
+            0
+        }
+    }
+    fn route_doorbell(&self, route: u64, ring_id: u32, bell: RawFd) -> bool {
+        if self.0.refuses_routes.load(Ordering::SeqCst) {
+            return false;
+        }
+        let copy = wake::duplicate(bell).expect("the bell is open");
+        self.0.routes.lock().push((route, ring_id, copy));
+        true
+    }
+    fn unroute_doorbell(&self, route: u64, ring_id: u32) {
+        assert_eq!(ring_id, QUEUE_SUBMIT as u32, "the route's ring");
+        self.0.unrouted.lock().push(route);
     }
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {
         let (header, _) = RgfxMsgHeader::read_from_prefix(message).unwrap();
@@ -3541,6 +3569,226 @@ fn a_buffer_behind_its_process_s_create_is_answered_on_the_lane_s_thread() {
             .is_some_and(|n| n.starts_with("reims-vgpu.graphics-queue-")),
         "{carried:?}"
     );
+}
+
+/// A rig over a [`TakingHost`] that offers `DOORBELL_ASKS`, which the guest takes, started, with
+/// queue `queue` made, its ring asleep and its completion ring armed.
+fn asking_rig(taking: &Arc<Taking>, queue: u64) -> Rig {
+    taking.asks.store(true, Ordering::SeqCst);
+    let mut rig = Rig::with_host(Box::new(TakingHost(Arc::clone(taking))));
+    rig.device.mmio_write(
+        RGFX_REG_DRIVER_FEATURES_HI.into(),
+        (RGFX_FEATURE_DOORBELL_ASKS >> 32) as u32,
+    );
+    rig.start();
+    let seqno = send_queue_create(&mut rig, queue);
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    wait_queue_idle(&rig);
+    rig.region()
+        .atomic_u32(QUEUE_COMPLETE + 0xc0)
+        .store(1, Ordering::SeqCst);
+    rig
+}
+
+/// Where the guest took `DOORBELL_ASKS`, a plain doorbell write offers the host nothing on the
+/// writing thread, and the queue's thread takes the buffer as it takes any; the write that holds
+/// `RGFX_DOORBELL_ASKS` beside the ring's id is answered there, as every write was before.
+#[test]
+fn only_an_asking_doorbell_write_is_answered_at_the_doorbell() {
+    const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let taking = Arc::new(Taking::default());
+    taking.takes.store(true, Ordering::SeqCst);
+    let rig = asking_rig(&taking, QUEUE);
+
+    let at = publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
+    rig.device
+        .mmio_write_taking(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
+    assert!(
+        taking.answered.lock().is_empty(),
+        "a plain doorbell's write offered the buffer"
+    );
+    assert_eq!(
+        queue_events(&rig, 2),
+        vec![
+            (RGFX_EVT_CB_SUBMITTED, 1, 100),
+            (RGFX_EVT_CB_COMPLETE, 1, 100),
+        ],
+        "the queue's thread took the buffer"
+    );
+    wait_queue_idle(&rig);
+
+    publish_unrung(&rig, at, &[command_buffer(QUEUE, 101, 2)]);
+    rig.device.mmio_write_taking(
+        RGFX_REG_DOORBELL.into(),
+        QUEUE_SUBMIT as u32 | RGFX_DOORBELL_ASKS,
+    );
+    assert_eq!(*taking.answered.lock(), HashMap::from([(2, true)]));
+    assert_eq!(
+        queue_events(&rig, 0).get(2),
+        Some(&(RGFX_EVT_CB_SUBMITTED, 2, 101)),
+        "the CB_SUBMITTED is posted before the asking write returns"
+    );
+    assert_eq!(
+        queue_events(&rig, 4),
+        vec![
+            (RGFX_EVT_CB_SUBMITTED, 1, 100),
+            (RGFX_EVT_CB_COMPLETE, 1, 100),
+            (RGFX_EVT_CB_SUBMITTED, 2, 101),
+            (RGFX_EVT_CB_COMPLETE, 2, 101),
+        ]
+    );
+}
+
+/// A guest that did not take `DOORBELL_ASKS` writes the ring's id alone for every doorbell, and
+/// each write is offered to the host as before; its queues' doorbells are not routed.
+#[test]
+fn a_guest_without_doorbell_asks_is_answered_at_any_doorbell_and_not_routed() {
+    const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let taking = Arc::new(Taking::default());
+    taking.takes.store(true, Ordering::SeqCst);
+    taking.asks.store(true, Ordering::SeqCst);
+    let rig = taking_rig(&taking, QUEUE);
+    assert!(taking.routes.lock().is_empty(), "a route was asked");
+
+    publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
+    rig.device
+        .mmio_write_taking(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
+    assert_eq!(*taking.answered.lock(), HashMap::from([(1, true)]));
+}
+
+/// Writes `count` to the bell `fd` as KVM's `ioeventfd` does for that many doorbell writes: an
+/// eventfd's count, which one read takes whole.
+#[cfg(target_os = "linux")]
+fn ring_bell(fd: &OwnedFd, count: u64) {
+    let bytes = count.to_ne_bytes();
+    // SAFETY: 8 bytes from a local to an eventfd the test holds a copy of.
+    let wrote = unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
+    assert_eq!(wrote, 8, "the bell took the write");
+}
+
+/// Whether the bell `fd` holds a count: false once the thread that sleeps on it took it.
+#[cfg(target_os = "linux")]
+fn bell_holds(fd: &OwnedFd) -> bool {
+    let mut fds = [libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    // SAFETY: one pollfd; a timeout of 0 never blocks.
+    unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) == 1 }
+}
+
+/// Where the guest took `DOORBELL_ASKS`, the host is asked to route the queue's plain doorbell
+/// into the queue's bell as the queue is made: a write the host takes there (KVM's `ioeventfd`)
+/// wakes the queue's thread with nothing run on the writing thread. Writes that coalesce into one
+/// wake lose nothing: the thread takes every buffer published, in order, takes the bell's whole
+/// count and sleeps again. The queue's destroy drops the route.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_routed_doorbell_wakes_its_queue_which_takes_every_buffer_published() {
+    const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let taking = Arc::new(Taking::default());
+    taking.takes.store(true, Ordering::SeqCst);
+    let mut rig = asking_rig(&taking, QUEUE);
+    let route = {
+        let routes = taking.routes.lock();
+        assert_eq!(
+            routes.iter().map(|r| (r.0, r.1)).collect::<Vec<_>>(),
+            vec![(1, QUEUE_SUBMIT as u32)]
+        );
+        routes[0].0
+    };
+    assert_eq!(rig.device.shared.routes.load(Ordering::SeqCst), 1);
+
+    // Three buffers, each one's doorbell taken by the host's route; the three writes coalesce
+    // into one count, and one wake.
+    publish_unrung(
+        &rig,
+        0,
+        &[
+            command_buffer(QUEUE, 100, 1),
+            command_buffer(QUEUE, 101, 2),
+            command_buffer(QUEUE, 102, 3),
+        ],
+    );
+    ring_bell(&taking.routes.lock()[0].2, 3);
+    assert_eq!(
+        queue_events(&rig, 6),
+        vec![
+            (RGFX_EVT_CB_SUBMITTED, 1, 100),
+            (RGFX_EVT_CB_COMPLETE, 1, 100),
+            (RGFX_EVT_CB_SUBMITTED, 2, 101),
+            (RGFX_EVT_CB_COMPLETE, 2, 101),
+            (RGFX_EVT_CB_SUBMITTED, 3, 102),
+            (RGFX_EVT_CB_COMPLETE, 3, 102),
+        ]
+    );
+    assert!(taking.answered.lock().is_empty(), "nothing was offered");
+    wait_queue_idle(&rig);
+    assert!(
+        eventually(|| !bell_holds(&taking.routes.lock()[0].2)),
+        "the thread left the bell's count"
+    );
+
+    rig.send(object_message(RGFX_CMD_OBJECT_DESTROY, QUEUE));
+    assert!(
+        eventually(|| *taking.unrouted.lock() == vec![route]),
+        "the destroy dropped the route"
+    );
+    assert_eq!(rig.device.shared.routes.load(Ordering::SeqCst), 0);
+}
+
+/// A queue made while the device routes `MAX_DOORBELL_ROUTES` queues' doorbells, and one whose
+/// route the host refuses, keeps its doorbell on the device's write, which wakes its thread as
+/// before; the route count is back where it was. One made below the bound is routed again.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_queue_past_the_routes_or_refused_keeps_its_doorbell_on_the_write() {
+    const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let taking = Arc::new(Taking::default());
+    taking.refuses_routes.store(true, Ordering::SeqCst);
+    let mut rig = asking_rig(&taking, QUEUE);
+    assert!(taking.routes.lock().is_empty());
+    assert_eq!(rig.device.shared.routes.load(Ordering::SeqCst), 0);
+    publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
+    rig.device
+        .mmio_write_taking(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
+    assert_eq!(queue_events(&rig, 2).len(), 2, "the refused queue's buffer");
+
+    // The table full: the queue made again (a create under the same id ends the old one) asks
+    // for no route, and its doorbell's write still wakes it.
+    taking.refuses_routes.store(false, Ordering::SeqCst);
+    let shared = Arc::clone(&rig.device.shared);
+    let routes = &shared.routes;
+    routes.store(MAX_DOORBELL_ROUTES, Ordering::SeqCst);
+    let seqno = send_queue_create(&mut rig, QUEUE);
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    assert!(taking.routes.lock().is_empty(), "a route past the bound");
+    assert_eq!(routes.load(Ordering::SeqCst), MAX_DOORBELL_ROUTES);
+
+    // One below the bound: routed, the count at the bound again, and back down at the destroy.
+    routes.store(MAX_DOORBELL_ROUTES - 1, Ordering::SeqCst);
+    let seqno = send_queue_create(&mut rig, QUEUE);
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    assert_eq!(taking.routes.lock().len(), 1);
+    assert_eq!(routes.load(Ordering::SeqCst), MAX_DOORBELL_ROUTES);
+    rig.send(object_message(RGFX_CMD_OBJECT_DESTROY, QUEUE));
+    assert!(eventually(|| taking.unrouted.lock().len() == 1));
+    assert_eq!(routes.load(Ordering::SeqCst), MAX_DOORBELL_ROUTES - 1);
+}
+
+/// A reset ends every queue and drops each one's route, on the thread that resets.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_reset_drops_the_queues_routes() {
+    const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let taking = Arc::new(Taking::default());
+    let rig = asking_rig(&taking, QUEUE);
+    let route = taking.routes.lock()[0].0;
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    assert_eq!(*taking.unrouted.lock(), vec![route]);
+    assert_eq!(rig.device.shared.routes.load(Ordering::SeqCst), 0);
 }
 
 /// `mmio_write_taking` writes every register but `DOORBELL` as `mmio_write` does.
