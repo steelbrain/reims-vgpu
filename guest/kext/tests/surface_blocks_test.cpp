@@ -8,7 +8,9 @@
 // surface too, laid out as the ask, by an ask that maps the surface where it asks, and by no
 // other; a surface's memory is its block's runs only page for page. Pages a SURFACE_PAGES named
 // and the host never answered for stay wired. A client's new hold makes its other asks wait until
-// its share is posted. Each reason a copy block is refused has its own name, logged once.
+// its share is posted. A let-go's unshare, posted out of the lock, holds back every ask of the
+// block and the block's release until it is posted, so the device never ends a hold the kext
+// gave after it. Each reason a copy block is refused has its own name, logged once.
 #include "RgfxSurfaceBlocks.hpp"
 
 #include <cstdio>
@@ -305,6 +307,169 @@ void sharing()
 	      "b's share failed and its hold went: b's other asks find the block no longer b's");
 }
 
+// The device's view of the shared blocks, as the host carries out ring 0's messages, in ring
+// order (crates/reims-vgpu-graphics/src/region.rs). A share adds its context to the block's
+// holders, making the block where none is, and is nothing for a context that holds it already.
+// An unshare ends the context's hold, the block going with its last holder. A release ends every
+// hold of the block. A message that names the block is refused for a context not among its
+// holders. Contexts are below 32, a bit each.
+struct Device {
+	uint64_t offsets[4] = {};
+	uint32_t holders[4] = {};
+	int at(uint64_t offset) const
+	{
+		for (int i = 0; i < 4; i++) {
+			if (holders[i] && offsets[i] == offset)
+				return i;
+		}
+		return -1;
+	}
+	void share(uint32_t context, uint64_t offset)
+	{
+		int i = at(offset);
+		for (int j = 0; i < 0 && j < 4; j++) {
+			if (!holders[j]) {
+				i = j;
+				offsets[i] = offset;
+			}
+		}
+		holders[i] |= 1u << context;
+	}
+	void unshare(uint32_t context, uint64_t offset)
+	{
+		if (int i = at(offset); i >= 0)
+			holders[i] &= ~(1u << context);
+	}
+	void release(uint64_t offset)
+	{
+		if (int i = at(offset); i >= 0)
+			holders[i] = 0;
+	}
+	bool holds(uint32_t context, uint64_t offset) const
+	{
+		int i = at(offset);
+		return i >= 0 && (holders[i] & (1u << context)) != 0;
+	}
+};
+
+// A shared block held by clients `a` of context 1 and `b` of context 2, each share posted, in a
+// table of four blocks: its entry, and the device's view.
+struct TwoHolders {
+	RgfxBlock blocks[4] = {};
+	RgfxBlockTable table = {blocks, 0, 4, 0x100000, 0x200000, 0, 0, 0, 0, 0, 0, 0};
+	RgfxSurfaceEntry e = {};
+	Device device;
+	int pagesA = 0, pagesB = 0;
+	TwoHolders(const void *a, const void *b)
+	{
+		uint64_t offset = 0;
+		check(rgfxBlockAlloc(table, &e, 1, 0x1000, 0x1000, &offset) == kRgfxBlockOk,
+		      "the shared block is made");
+		e.used = true;
+		e.offset = offset;
+		e.size = 0x1000;
+		e.serial = blocks[0].serial;
+		check(rgfxSurfaceHold(e, a, 1, &pagesA) == kRgfxSurfaceHoldNew, "a's first hold");
+		device.share(1, offset);
+		rgfxSurfaceShared(e, a);
+		check(rgfxSurfaceHold(e, b, 2, &pagesB) == kRgfxSurfaceHoldNew, "b's first hold");
+		device.share(2, offset);
+		rgfxSurfaceShared(e, b);
+	}
+};
+
+// A let-go whose block other clients still hold ends the hold under the lock and posts its
+// BLOCK_UNSHARE out of it (releaseSurfaceBlock). Until the unshare is posted, every ask of the
+// block waits (rgfxSurfaceAskWaits), and so does the block's release (rgfxBlockNextRelease). The
+// device carries out a context's share and unshare in ring order, so an unshare posted after
+// that context's next share of the block, or of a block given the span again after the release,
+// ends the new hold. The device then refuses the context's next message that names it (a
+// BUFFER_OVER_SURFACE_PAGES, so the TEXTURE_FROM_IOSURFACE over it too), though the kext gave the
+// hold.
+void unshareOrder()
+{
+	int a = 0, b = 0;
+	void *pages = nullptr;
+	uint32_t context = 0;
+	{
+		// The client lets go and asks again before its unshare is posted.
+		TwoHolders x(&a, &b);
+		const uint64_t offset = x.e.offset;
+		check(rgfxSurfaceLetGo(x.e, &a, false, &pages, &context) == kRgfxSurfaceLetGoHold &&
+		          context == 1,
+		      "a lets go, b holds on: a's unshare is to post");
+		RgfxBlockPin mark = {};
+		check(rgfxBlockBeginUnshare(x.table, offset, &mark), "the unshare is marked on the block");
+		check(rgfxSurfaceAskWaits(x.e, x.table, &a),
+		      "a's next ask of the block waits for a's unshare");
+		check(rgfxSurfaceAskWaits(x.e, x.table, &b), "and so does every other ask of it");
+		x.device.unshare(1, offset);
+		check(!rgfxBlockEndUnshare(x.table, mark), "the unshare posted; b holds it: no release");
+		check(!rgfxSurfaceAskWaits(x.e, x.table, &a), "a's ask goes on");
+		check(rgfxSurfaceHold(x.e, &a, 1, &x.pagesA) == kRgfxSurfaceHoldNew,
+		      "a holds the block anew");
+		x.device.share(1, offset);
+		rgfxSurfaceShared(x.e, &a);
+		check(x.device.holds(1, offset) && rgfxSurfaceHeldBy({&x.e, 1}, &a, offset, 1),
+		      "the device lets a name the block the kext gave a");
+		// The order the wait keeps out: the new hold's share ahead of the old hold's unshare.
+		Device ahead;
+		ahead.share(1, offset);
+		ahead.share(2, offset);
+		ahead.share(1, offset);
+		ahead.unshare(1, offset);
+		check(!ahead.holds(1, offset), "a share ahead of the unshare: the unshare ends the hold");
+	}
+	{
+		// The other holder lets go last, and the span is given out again, before the unshare is
+		// posted.
+		TwoHolders x(&a, &b);
+		const uint64_t offset = x.e.offset;
+		check(rgfxSurfaceLetGo(x.e, &a, false, &pages, &context) == kRgfxSurfaceLetGoHold,
+		      "a lets go, b holds on");
+		RgfxBlockPin mark = {};
+		check(rgfxBlockBeginUnshare(x.table, offset, &mark), "a's unshare is marked");
+		check(rgfxSurfaceLetGo(x.e, &b, false, &pages, &context) == kRgfxSurfaceLetGoLast &&
+		          context == 2,
+		      "b lets go last");
+		check(rgfxBlockFree(x.table, &x.e, offset) == kRgfxBlockOk,
+		      "the block is freed for its release (letGoBlock)");
+		RgfxBlock next = {};
+		check(!rgfxBlockNextRelease(x.table, &next),
+		      "its release is not posted ahead of a's unshare");
+		check(rgfxBlockUnsharing(x.table, offset), "the block still waits for it");
+		x.device.unshare(1, offset);
+		check(rgfxBlockEndUnshare(x.table, mark),
+		      "a's unshare posted: the release is due, and its poster runs the release worker");
+		check(rgfxBlockNextRelease(x.table, &next) && next.offset == offset,
+		      "the release is posted");
+		x.device.release(offset);
+		rgfxBlockReleased(x.table, offset, next.serial, true);
+		RgfxSurfaceEntry f = {};
+		uint64_t again = 0;
+		check(rgfxBlockAlloc(x.table, &f, 1, 0x1000, 0x1000, &again) == kRgfxBlockOk &&
+		          again == offset,
+		      "the span is given out again, to a new block");
+		f.used = true;
+		f.offset = again;
+		f.size = 0x1000;
+		check(!rgfxSurfaceAskWaits(f, x.table, &a), "an ask of the new block waits for nothing");
+		check(!rgfxBlockEndUnshare(x.table, mark), "the old block's mark finds nothing there");
+		check(rgfxSurfaceHold(f, &a, 1, &x.pagesA) == kRgfxSurfaceHoldNew, "a holds the new block");
+		x.device.share(1, again);
+		check(x.device.holds(1, again), "the device lets a name it");
+		// The order the release's wait keeps out: the release, the new block's share, then the
+		// old hold's unshare.
+		Device late;
+		late.share(1, offset);
+		late.share(2, offset);
+		late.release(offset);
+		late.share(1, again);
+		late.unshare(1, offset);
+		check(!late.holds(1, again), "a late unshare ends the new block's hold");
+	}
+}
+
 // A cached block in place is found by its surface too, held or dormant, pending or not, so an ask
 // of the surface that maps it where it asks wires no pages of its own: only one cached in place,
 // not deferred, keyed by its surface's pages from their first byte, laid out as the ask, of that
@@ -417,6 +582,7 @@ int main()
 	runsWalk();
 	dormancy();
 	sharing();
+	unshareOrder();
 	RgfxSurfaceEntry entries[4] = {};
 	RgfxSurfaceTable t = {entries, 4};
 	RgfxPageRun plane[2] = {{0x10000, 0x3000}, {0x40000, 0x1000}};

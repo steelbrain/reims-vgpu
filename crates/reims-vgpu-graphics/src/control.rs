@@ -161,9 +161,9 @@ fn lifecycle(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> 
                 } else {
                     // Another holder of a shared block whose BLOCK_UNSHARE has not come is let go
                     // of here as by it, so the release waits for that context's command buffers
-                    // too: the kext posts an unshare out of its lock, so another holder's last
-                    // let-go may post the block's release first, and gives the block's memory
-                    // back at this answer.
+                    // too, as the kext gives the block's memory back at this answer. The kext
+                    // posts each hold's unshare before the block's release, which waits for the
+                    // holders' lanes, so with it none is left here but the releasing context.
                     for context in holders.into_iter().filter(|&c| c != release.context) {
                         shared.host.block_unshared(&RgfxBlockGrant {
                             header: RgfxMsgHeader {

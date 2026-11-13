@@ -481,6 +481,33 @@ int main()
 		check(t.reservedPeakCount == ws, "and its peak counts them");
 	}
 	{
+		// A BLOCK_UNSHARE a let-go posts out of the lock holds back the block's release until it
+		// is posted (RgfxSurfaceBlocks.hpp's rgfxSurfaceAskWaits holds back the asks of it).
+		Table x;
+		uint64_t at = 0;
+		check(rgfxBlockAlloc(x.t, a, 1, 0x1000, 0x1000, &at) == kRgfxBlockOk, "a block");
+		RgfxBlockPin first = {}, second = {};
+		check(!rgfxBlockBeginUnshare(x.t, at + 0x1000, &first), "no block there: no mark");
+		check(!rgfxBlockUnsharing(x.t, at), "no unshare yet");
+		check(rgfxBlockBeginUnshare(x.t, at, &first) && rgfxBlockBeginUnshare(x.t, at, &second) &&
+		          rgfxBlockUnsharing(x.t, at),
+		      "two unshares to post");
+		check(!rgfxBlockEndUnshare(x.t, first), "one posted, the block not freed: no release due");
+		check(rgfxBlockFree(x.t, a, at) == kRgfxBlockOk, "an unshare does not keep the free back");
+		RgfxBlock next = {};
+		check(!rgfxBlockNextRelease(x.t, &next), "but the release waits for the other unshare");
+		check(rgfxBlockEndUnshare(x.t, second) && !rgfxBlockUnsharing(x.t, at),
+		      "the last posted: the release is due");
+		check(!rgfxBlockEndUnshare(x.t, second), "a mark ends once");
+		check(rgfxBlockNextRelease(x.t, &next) && next.offset == at, "and is posted");
+		rgfxBlockReleased(x.t, at, next.serial, true);
+		uint64_t again = 0;
+		check(rgfxBlockAlloc(x.t, b, 2, 0x1000, 0x1000, &again) == kRgfxBlockOk && again == at &&
+		          !rgfxBlockUnsharing(x.t, again),
+		      "the span given out again starts with no unshare");
+		check(!rgfxBlockEndUnshare(x.t, first), "nor does an old mark reach it");
+	}
+	{
 		// With no reserve, every allocation is as before.
 		Table x;
 		uint64_t at = 0;

@@ -5,7 +5,9 @@
 // A block is given out again only once the device has said nothing of it is in use: a free marks
 // it freed, the kext posts its BLOCK_RELEASE, and the block leaves the table when the device
 // answers OK. Until then it is no one's to name and no one's to take. A block a create in flight
-// names is pinned, and is not freed while it is. The caller holds the accelerator's lock around
+// names is pinned, and is not freed while it is. A shared block whose BLOCK_UNSHARE a let-go is
+// posting has its release held back until the unshare is posted (rgfxBlockBeginUnshare). The
+// caller holds the accelerator's lock around
 // every call. Header-only and free of the kernel's headers, so its native test
 // (tests/blocks_test.cpp) builds it as the kext does.
 //
@@ -55,6 +57,14 @@ struct RgfxBlock {
 	uint32_t context;
 	// Creates in flight that name the block.
 	uint32_t pins;
+	// BLOCK_UNSHAREs of the block (a shared surface block's, RgfxSurfaceBlocks.hpp) that let-gos
+	// post out of the accelerator's lock and have not posted yet. Until each is posted, the
+	// block's release is not posted (rgfxBlockNextRelease), and no ask holds the block again
+	// (rgfxBlockUnsharing). The device carries out a context's unshare and its next share of the
+	// block in ring order, so an unshare posted after that share ends the new hold. An unshare
+	// posted after the block's release could end the context's hold of the next block given the
+	// span. Either way the context's next message that names the block is refused.
+	uint32_t unshares;
 	RgfxBlockState state;
 	// The device refused this block's release (an object of some context lies in it). It is
 	// kept, but posted again (rgfxBlockRetryRefused) after a context close, which may have
@@ -190,6 +200,7 @@ inline RgfxBlockResult rgfxBlockAlloc(RgfxBlockTable &t, const void *owner, uint
 			b.serial = ++t.nextSerial;
 			b.context = context;
 			b.pins = pin ? 1 : 0;
+			b.unshares = 0;
 			b.state = kRgfxBlockLive;
 			b.refused = false;
 			b.wired = nullptr;
@@ -312,6 +323,39 @@ inline void rgfxBlockUnpin(RgfxBlockTable &t, const RgfxBlockPin &pin)
 		t.blocks[at].pins--;
 }
 
+// A let-go of a hold of the block at `offset` is about to post its BLOCK_UNSHARE, out of the
+// lock. The block's release, and new holds of it, wait for that post (RgfxBlock's `unshares`):
+// `*unshare` names it for rgfxBlockEndUnshare. False where no block lies at `offset`; nothing
+// then waits for the post.
+inline bool rgfxBlockBeginUnshare(RgfxBlockTable &t, uint64_t offset, RgfxBlockPin *unshare)
+{
+	int64_t at = rgfxBlockIndex(t, offset);
+	if (at < 0)
+		return false;
+	t.blocks[at].unshares++;
+	*unshare = {t.blocks[at].offset, t.blocks[at].serial};
+	return true;
+}
+
+// The BLOCK_UNSHARE that `unshare` names is posted. Returns whether the block's release is now
+// due, where it was freed meanwhile and no other unshare of it is still to post: the caller then
+// runs the release worker. Nothing where the block has gone since.
+inline bool rgfxBlockEndUnshare(RgfxBlockTable &t, const RgfxBlockPin &unshare)
+{
+	int64_t at = rgfxBlockIndex(t, unshare.offset);
+	if (at < 0 || t.blocks[at].serial != unshare.serial || !t.blocks[at].unshares)
+		return false;
+	return --t.blocks[at].unshares == 0 && t.blocks[at].state == kRgfxBlockFreed;
+}
+
+// Whether a BLOCK_UNSHARE of the block at `offset` is still to post: an ask waits for it before it
+// holds the block again, so the device has the unshare before the ask's share.
+inline bool rgfxBlockUnsharing(const RgfxBlockTable &t, uint64_t offset)
+{
+	int64_t at = rgfxBlockIndex(t, offset);
+	return at >= 0 && t.blocks[at].unshares != 0;
+}
+
 // Takes back the block `pin` names, as if never given out (the device was not told of it).
 inline void rgfxBlockDrop(RgfxBlockTable &t, const RgfxBlockPin &pin)
 {
@@ -349,11 +393,12 @@ inline RgfxBlockResult rgfxBlockFree(RgfxBlockTable &t, const void *owner, uint6
 	return kRgfxBlockOk;
 }
 
-// The first freed block, now releasing: its release is the caller's to post. False where none is.
+// The first freed block with no BLOCK_UNSHARE still to post, now releasing: its release is the
+// caller's to post. False where none is.
 inline bool rgfxBlockNextRelease(RgfxBlockTable &t, RgfxBlock *block)
 {
 	for (uint32_t i = 0; i < t.count; i++) {
-		if (t.blocks[i].state == kRgfxBlockFreed) {
+		if (t.blocks[i].state == kRgfxBlockFreed && !t.blocks[i].unshares) {
 			t.blocks[i].state = kRgfxBlockReleasing;
 			*block = t.blocks[i];
 			return true;

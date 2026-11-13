@@ -52,6 +52,8 @@
 #include "reims_graphics_wire.h"
 // The span a holder's window maps of a block (rgfxWindowSpanLength).
 #include "RgfxWindowSpans.hpp"
+// A block's BLOCK_UNSHAREs not yet posted (rgfxBlockUnsharing).
+#include "RgfxBlockTable.hpp"
 
 // The most clients that hold one plane's block.
 constexpr uint32_t kRgfxSurfaceHolders = 16;
@@ -328,6 +330,19 @@ inline void rgfxSurfaceShared(RgfxSurfaceEntry &e, const void *client)
 		if (e.holds[i].client == client)
 			e.holds[i].sharing = false;
 	}
+}
+
+// Whether an ask of `client` waits before it holds the entry's block. It waits while its own new
+// hold's BLOCK_SHARE is not yet posted (rgfxSurfaceSharing). It also waits while a let-go's
+// BLOCK_UNSHARE of the block, posted out of the lock, is not yet posted (rgfxBlockUnsharing).
+// The device carries out a context's share and unshare of a block in ring order. An ask's share
+// posted ahead of an earlier hold's unshare is a no-op, as the context still holds the block. The
+// unshare then ends the new hold, and the device refuses the context's next message that names
+// the block.
+inline bool rgfxSurfaceAskWaits(const RgfxSurfaceEntry &e, const RgfxBlockTable &blocks,
+                                const void *client)
+{
+	return rgfxSurfaceSharing(e, client) || rgfxBlockUnsharing(blocks, e.offset);
 }
 
 enum RgfxSurfaceLetGo {

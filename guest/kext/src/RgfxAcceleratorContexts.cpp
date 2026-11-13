@@ -26,7 +26,10 @@
  *     block holding every plane), found by the plane's physical pages, which the kext wires in
  *     each asking process's task while it holds the block. The device learns of each
  *     holder (BLOCK_SHARE) before the process learns of the block, and of each but the last
- *     letting go (BLOCK_UNSHARE); the last frees the block as a client's free does. Where the
+ *     letting go (BLOCK_UNSHARE); the last frees the block as a client's free does. An unshare
+ *     goes out of the lock, but before the block's release and before any ask holds the block
+ *     again (RgfxBlockTable.hpp's `unshares`), so the device never ends a later hold with it,
+ *     of the block or of the next block given its span. Where the
  *     device has RGFX_FEATURE_SURFACE_PAGES, a process may ask for a surface's block in place:
  *     the kext wires the surface's whole allocation, writes its runs into the block past the
  *     part the processes map, and hands them to the device (SURFACE_PAGES) before the first
@@ -1843,9 +1846,10 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 					differs = true;
 					break;
 				}
-				// Held new by another of the client's asks, its share not yet posted: held again
-				// once it is (rgfxSurfaceSharing).
-				if (rgfxSurfaceSharing(de, client)) {
+				// Held new by another of the client's asks, its share not yet posted, or let go
+				// by a hold whose unshare is not yet posted: held once it is
+				// (rgfxSurfaceAskWaits).
+				if (rgfxSurfaceAskWaits(de, blockTable, client)) {
 					IOLockSleep(contextLock, &surfaceTable, THREAD_UNINT);
 					continue;
 				}
@@ -1883,7 +1887,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 				release |= letGoDormant(static_cast<UInt32>(meeting), kRgfxDormantStale);
 				continue;
 			}
-			if (at >= 0 && rgfxSurfaceSharing(table.entries[at], client)) {
+			if (at >= 0 && rgfxSurfaceAskWaits(table.entries[at], blockTable, client)) {
 				IOLockSleep(contextLock, &surfaceTable, THREAD_UNINT);
 				continue;
 			}
@@ -2790,8 +2794,14 @@ IOReturn RgfxAccelerator::releaseSurfaceBlock(RgfxAcceleratorUserClient *client,
 		if (!slept)
 			release = letGoBlock(table.entries[at], context, false, pages, &keptWire);
 	}
+	// The hold's BLOCK_UNSHARE is posted out of the lock. Until it is, the block's release and
+	// every new hold of it wait for it (rgfxBlockBeginUnshare), so the device never carries it
+	// out after this context's next share of the block, or of a block given its span again.
+	const bool unsharing = gone == kRgfxSurfaceLetGoHold || slept;
+	RgfxBlockPin unshareMark = {};
+	const bool marked = unsharing && rgfxBlockBeginUnshare(blockTable, offset, &unshareMark);
 	IOLockUnlock(contextLock);
-	if (gone == kRgfxSurfaceLetGoHold || slept) {
+	if (unsharing) {
 		// Other holders keep it, or it sleeps: the device no longer lets this context name it.
 		RgfxBlockGrant unshare = {};
 		unshare.context = context;
@@ -2799,6 +2809,12 @@ IOReturn RgfxAccelerator::releaseSurfaceBlock(RgfxAcceleratorUserClient *client,
 		unshare.size = size;
 		postLifecycle(RGFX_CMD_BLOCK_UNSHARE, &unshare, sizeof(unshare), 0, nullptr, 0, nullptr,
 		              nullptr, 0);
+	}
+	if (marked) {
+		IOLockLock(contextLock);
+		release |= rgfxBlockEndUnshare(blockTable, unshareMark);
+		IOLockWakeup(contextLock, &surfaceTable, false);
+		IOLockUnlock(contextLock);
 	}
 	if (slept)
 		release |= wakeSlept(offset, serial, sleeper);
