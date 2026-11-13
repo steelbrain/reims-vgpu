@@ -1,7 +1,8 @@
 //! `cargo xtask dist` on macOS: the library for arm64 macOS [`DEPLOYMENT_TARGET`], on the Vulkan
 //! platform over MoltenVK, a build for development and tests. The dylib's install name is
-//! `@rpath/libreims_vgpu.dylib`, and it is signed ad hoc again after the name changes.
-//! `Libs.private` names every library the dylib links (`otool -L`).
+//! `@rpath/libreims_vgpu.dylib`, and it is signed ad hoc again after the name changes, both on a
+//! copy under the target dir that is then installed, so a dylib whose bytes come out the same is
+//! left as it was. `Libs.private` names every library the dylib links (`otool -L`).
 //!
 //! **The archive's symbols and classes.** The archive bundles what the library links statically:
 //! Rust's standard library and SDL3, which draws a display's window. A host that links the
@@ -212,13 +213,15 @@ pub fn dist(tools: &mut dyn Tools, o: &Options, target_dir: &Path, header: &Path
         &archive,
     )?;
     write(&stamp, &cflags)?;
-    install(&built.join("libreims_vgpu_c.dylib"), &dylib, 0o755)?;
+    let named = target_dir.join(LOCALIZED).join(format!("lib{LIB}.dylib"));
+    install(&built.join("libreims_vgpu_c.dylib"), &named, 0o755)?;
     // Cargo names the cdylib after the crate; the library's install name is its own.
     tools.run(
         "xcrun",
-        &strs_with(&["install_name_tool", "-id", INSTALL_NAME], &dylib),
+        &strs_with(&["install_name_tool", "-id", INSTALL_NAME], &named),
     )?;
-    tools.run("codesign", &strs_with(&["-s", "-", "-f"], &dylib))?;
+    tools.run("codesign", &strs_with(&["-s", "-", "-f"], &named))?;
+    install(&named, &dylib, 0o755)?;
     install(header, &include, 0o644)?;
     let otool = tools.output("xcrun", &strs_with(&["otool", "-L"], &dylib))?;
     let libs = libs_private(&otool, INSTALL_NAME)?;
@@ -234,9 +237,10 @@ const LOCALIZED: &str = "dist-localized";
 const API_PREFIX: &str = "_rvg_";
 
 /// Writes `archive`, the archive installed, from `built`, Cargo's, in `work` (module doc): its
-/// members linked into one object whose globals are the C API's alone, archived alone, with mode
-/// 0644. Fails where the archive written defines no `rvg_` function, another global, or a class
-/// that keeps an SDL name ([`check_archive`]).
+/// members linked into one object whose globals are the C API's alone, archived alone in `work`
+/// with zero dates (`libtool -D`), and installed with mode 0644, so the same build gives the same
+/// bytes and leaves the installed archive as it was. Fails where the archive written defines no
+/// `rvg_` function, another global, or a class that keeps an SDL name ([`check_archive`]).
 fn localize(tools: &mut dyn Tools, built: &Path, work: &Path, archive: &Path) -> Res<()> {
     std::fs::create_dir_all(work).map_err(|e| format!("{}: {e}", work.display()))?;
     let exported = work.join("exported-symbols");
@@ -260,7 +264,7 @@ fn localize(tools: &mut dyn Tools, built: &Path, work: &Path, archive: &Path) ->
     if std::fs::symlink_metadata(&packed).is_ok() {
         std::fs::remove_file(&packed).map_err(|e| format!("{}: {e}", packed.display()))?;
     }
-    let mut pack = strs_with(&["libtool", "-static", "-o"], &packed);
+    let mut pack = strs_with(&["libtool", "-static", "-D", "-o"], &packed);
     pack.push(object.to_string_lossy().into_owned());
     tools.run("xcrun", &pack)?;
     install(&packed, archive, 0o644)?;
@@ -460,8 +464,8 @@ mod tests {
         _rvg_graphics_device_create T 1000 20\n_rvg_status_message T 1020 8\n\
         _SDL_Init t 2000 40\n_OBJC_CLASS_$_RVGSDL3Window s 3000 28\n";
 
-    /// The programs as `dist` runs them: each call recorded; `libtool` writes the archive it
-    /// names, `nm` lists `nm`, and anything else answers otool's listing.
+    /// The programs as `dist` runs them: each call recorded; `libtool` writes the archive its
+    /// `-o` names, `nm` lists `nm`, and anything else answers otool's listing.
     struct Programs {
         log: Log,
         nm: String,
@@ -482,7 +486,8 @@ mod tests {
     impl Tools for Programs {
         fn run(&mut self, program: &str, args: &[String]) -> Res<()> {
             if args.first().map(String::as_str) == Some("libtool") {
-                put(Path::new(&args[3]), "localized");
+                let out = args.iter().position(|a| a == "-o").unwrap() + 1;
+                put(Path::new(&args[out]), "localized");
             }
             self.log.run(program, args)
         }
@@ -528,6 +533,8 @@ mod tests {
         let dylib = out.join("lib/libreims_vgpu.dylib");
         let d = dylib.to_str().unwrap();
         let work = target.join("dist-localized");
+        let named = work.join("libreims_vgpu.dylib");
+        let n = named.to_str().unwrap();
         let exported = work.join("exported-symbols");
         assert_eq!(std::fs::read_to_string(&exported).unwrap(), "_rvg_*\n");
         let object = work.join("reims_vgpu.o");
@@ -560,13 +567,13 @@ mod tests {
                     object.display()
                 ),
                 format!(
-                    "xcrun libtool -static -o {} {}",
+                    "xcrun libtool -static -D -o {} {}",
                     packed.display(),
                     object.display()
                 ),
                 format!("xcrun nm --defined-only -P {}", archive.display()),
-                format!("xcrun install_name_tool -id @rpath/libreims_vgpu.dylib {d}"),
-                format!("codesign -s - -f {d}"),
+                format!("xcrun install_name_tool -id @rpath/libreims_vgpu.dylib {n}"),
+                format!("codesign -s - -f {n}"),
                 format!("xcrun otool -L {d}"),
             ]
         );

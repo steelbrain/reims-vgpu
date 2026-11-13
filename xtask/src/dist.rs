@@ -11,7 +11,9 @@
 //! - `share/doc/reims-vgpu/`: the license, `LICENSE` and the texts in `LICENSES/` it points at,
 //!   copied from the repository under the same names ([`install_license`]).
 //!
-//! QEMU (`make qemu`) links the archive; the C API's tests link the shared library.
+//! QEMU (`make qemu`) links the archive; the C API's tests link the shared library. A file whose
+//! bytes are those the tree already holds is left as it was, mtime included
+//! ([`replace_if_changed`]), so a dist of an unchanged build has QEMU's build do nothing.
 //!
 //! The library is built on the Vulkan platform (architecture 2.2), its only one: natively on
 //! Linux, and over MoltenVK on macOS, a build for development and tests. `--platform vulkan`
@@ -201,21 +203,40 @@ fn mkdir_parent(p: &Path) -> Res<()> {
     }
 }
 
+/// Writes `content` to `p` with mode 0644 ([`replace_if_changed`]).
 fn write(p: &Path, content: &str) -> Res<()> {
-    mkdir_parent(p)?;
-    std::fs::write(p, content).map_err(|e| format!("{}: {e}", p.display()))
+    replace_if_changed(p, content.as_bytes(), 0o644).map(drop)
 }
 
-/// Copies a built file to `to` with `mode`, replacing what is there.
+/// Copies a built file to `to` with `mode` ([`replace_if_changed`]).
 fn install(from: &Path, to: &Path, mode: u32) -> Res<()> {
+    let bytes = std::fs::read(from).map_err(|e| format!("{}: {e}", from.display()))?;
+    replace_if_changed(to, &bytes, mode).map(drop)
+}
+
+/// Every file `dist` writes is written by this: `to` gets `bytes` and `mode`, and is written only
+/// where it is not already a file holding `bytes`. An unchanged file keeps its mtime, so what is
+/// built from the tree is not built again: `make qemu` recompiles `reims-graphics-pci.c` where
+/// the header is newer, and relinks QEMU where the archive is. A file that changed is removed
+/// first and written anew, so a process that maps the old one (a host running the shared
+/// library) keeps its pages. Returns whether it wrote.
+fn replace_if_changed(to: &Path, bytes: &[u8], mode: u32) -> Res<bool> {
     use std::os::unix::fs::PermissionsExt as _;
-    mkdir_parent(to)?;
-    if std::fs::symlink_metadata(to).is_ok() {
-        std::fs::remove_file(to).map_err(|e| format!("{}: {e}", to.display()))?;
+    let err = |e: std::io::Error| format!("{}: {e}", to.display());
+    let old = std::fs::symlink_metadata(to).ok();
+    let same = old
+        .as_ref()
+        .is_some_and(|m| m.is_file() && m.len() == bytes.len() as u64)
+        && std::fs::read(to).map_err(err)? == bytes;
+    if !same {
+        mkdir_parent(to)?;
+        if old.is_some() {
+            std::fs::remove_file(to).map_err(err)?;
+        }
+        std::fs::write(to, bytes).map_err(err)?;
     }
-    std::fs::copy(from, to).map_err(|e| format!("{} -> {}: {e}", from.display(), to.display()))?;
-    std::fs::set_permissions(to, std::fs::Permissions::from_mode(mode))
-        .map_err(|e| format!("{}: {e}", to.display()))
+    std::fs::set_permissions(to, std::fs::Permissions::from_mode(mode)).map_err(err)?;
+    Ok(!same)
 }
 
 /// What the OSes' tests share.
@@ -223,6 +244,7 @@ fn install(from: &Path, to: &Path, mode: u32) -> Res<()> {
 mod testing {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::SystemTime;
 
     use crate::tools::Tools;
     use crate::util::Res;
@@ -279,6 +301,19 @@ mod testing {
     pub fn mode(p: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A time long past, which no file a test writes has as its mtime unless set to it.
+    pub const LONG_AGO: SystemTime = SystemTime::UNIX_EPOCH;
+
+    /// Sets `p`'s mtime to [`LONG_AGO`].
+    pub fn age(p: &Path) {
+        let file = std::fs::File::options().write(true).open(p).unwrap();
+        file.set_modified(LONG_AGO).unwrap();
+    }
+
+    pub fn mtime(p: &Path) -> SystemTime {
+        std::fs::metadata(p).unwrap().modified().unwrap()
     }
 }
 
@@ -416,6 +451,67 @@ mod tests {
                 "{text} not reported"
             );
         }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Bytes a file already holds leave it as it was, mtime included, and only its mode is set;
+    /// other bytes, of another length or the same, are written, and so is a missing file
+    #[test]
+    fn replace_if_changed_writes_only_other_bytes() {
+        let root = testing::tmp("replace");
+        let p = root.join("lib/libx.a");
+        let read = || std::fs::read_to_string(&p).unwrap();
+        assert!(replace_if_changed(&p, b"one", 0o644).unwrap());
+        assert_eq!(read(), "one");
+        testing::age(&p);
+        assert!(!replace_if_changed(&p, b"one", 0o755).unwrap());
+        assert_eq!(testing::mtime(&p), testing::LONG_AGO);
+        assert_eq!(testing::mode(&p), 0o755);
+        for other in ["two", "a longer one"] {
+            testing::age(&p);
+            assert!(replace_if_changed(&p, other.as_bytes(), 0o644).unwrap());
+            assert_eq!(read(), other);
+            assert_ne!(testing::mtime(&p), testing::LONG_AGO);
+            assert_eq!(testing::mode(&p), 0o644);
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A file that changed is a new file: another name for the old one, as a process that maps
+    /// it holds, keeps the old bytes. A symlink is replaced by a file, even one to the same bytes
+    #[test]
+    fn replace_if_changed_replaces_rather_than_writes_through() {
+        let root = testing::tmp("replace-new");
+        let p = root.join("libx.so");
+        testing::put(&p, "old");
+        let link = root.join("held");
+        std::fs::hard_link(&p, &link).unwrap();
+        assert!(replace_if_changed(&p, b"new", 0o755).unwrap());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "old");
+        let target = root.join("target");
+        testing::put(&target, "same");
+        let sym = root.join("sym");
+        std::os::unix::fs::symlink(&target, &sym).unwrap();
+        assert!(replace_if_changed(&sym, b"same", 0o644).unwrap());
+        assert!(std::fs::symlink_metadata(&sym).unwrap().is_file());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A built file installed again unchanged keeps its mtime; one that changed is copied
+    #[test]
+    fn install_copies_only_a_changed_file() {
+        let root = testing::tmp("install");
+        let (from, to) = (root.join("built.a"), root.join("dist/lib/libx.a"));
+        testing::put(&from, "built");
+        install(&from, &to, 0o644).unwrap();
+        testing::age(&to);
+        install(&from, &to, 0o644).unwrap();
+        assert_eq!(testing::mtime(&to), testing::LONG_AGO);
+        testing::put(&from, "built again");
+        install(&from, &to, 0o644).unwrap();
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "built again");
+        assert_ne!(testing::mtime(&to), testing::LONG_AGO);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

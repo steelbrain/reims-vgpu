@@ -110,8 +110,10 @@ const API_PREFIX: &str = "rvg_";
 
 /// Writes `archive`, the archive installed, from `built`, Cargo's, in `work` (module doc): its
 /// members linked into one object, every global symbol but the C API's made local, archived
-/// alone, with mode 0644. Fails where the object defines no `rvg_` function, or where the archive
-/// written still defines another global ([`check_globals`]).
+/// alone in `work` with zero dates (`ar`'s `D`), and installed with mode 0644, so the same build
+/// gives the same bytes and leaves the installed archive as it was. Fails where the object
+/// defines no `rvg_` function, or where the archive written still defines another global
+/// ([`check_globals`]).
 fn localize(tools: &mut dyn Tools, built: &Path, work: &Path, archive: &Path) -> Res<()> {
     std::fs::create_dir_all(work).map_err(|e| format!("{}: {e}", work.display()))?;
     let object = work.join(format!("{LIB}.o"));
@@ -134,14 +136,15 @@ fn localize(tools: &mut dyn Tools, built: &Path, work: &Path, archive: &Path) ->
     let mut strip = vec![format!("--keep-global-symbols={}", keep.display())];
     strip.push(object.to_string_lossy().into_owned());
     tools.run("objcopy", &strip)?;
-    if std::fs::symlink_metadata(archive).is_ok() {
-        std::fs::remove_file(archive).map_err(|e| format!("{}: {e}", archive.display()))?;
+    // `ar r` adds to an archive that is there: the one packed starts empty.
+    let packed = work.join(format!("lib{LIB}.a"));
+    if std::fs::symlink_metadata(&packed).is_ok() {
+        std::fs::remove_file(&packed).map_err(|e| format!("{}: {e}", packed.display()))?;
     }
-    super::mkdir_parent(archive)?;
-    let mut pack = strs_with(&["rcs"], archive);
+    let mut pack = strs_with(&["rcsD"], &packed);
     pack.push(object.to_string_lossy().into_owned());
     tools.run("ar", &pack)?;
-    set_mode(archive, 0o644)?;
+    install(&packed, archive, 0o644)?;
     check_globals(&tools.output("nm", &nm_args(archive))?, archive)
 }
 
@@ -187,17 +190,10 @@ fn check_globals(nm: &str, archive: &Path) -> Res<()> {
     ))
 }
 
-/// Sets `file`'s mode.
-fn set_mode(file: &Path, mode: u32) -> Res<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(file, std::fs::Permissions::from_mode(mode))
-        .map_err(|e| format!("{}: {e}", file.display()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::parse_args;
-    use super::super::testing::{Log, mode, put, tmp};
+    use super::super::testing::{LONG_AGO, Log, age, mode, mtime, put, tmp};
     use super::*;
     use crate::tools::Profile;
 
@@ -355,6 +351,7 @@ mod tests {
             "rvg_graphics_device_create\nrvg_status_message\n"
         );
         let object = work.join("reims_vgpu.o");
+        let packed = work.join("libreims_vgpu.a");
         let archive = out.join("lib/libreims_vgpu.a");
         let calls = tools.log.lines();
         assert!(
@@ -376,7 +373,7 @@ mod tests {
                     keep.display(),
                     object.display()
                 ),
-                format!("ar rcs {} {}", archive.display(), object.display()),
+                format!("ar rcsD {} {}", packed.display(), object.display()),
                 format!("nm -g --defined-only -P {}", archive.display()),
             ]
         );
@@ -386,6 +383,27 @@ mod tests {
             calls[6]
         );
         assert_eq!(calls.len(), 7, "{calls:?}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A dist of the same build again leaves every file of the tree as it was, mtime included,
+    /// so what is built from the tree is not built again
+    #[test]
+    fn dist_again_keeps_the_tree() {
+        let (root, target, header) = built("again");
+        let o = options(&[], &target);
+        let run = || {
+            let mut tools = Programs::new(OBJECT, LOCALIZED_ARCHIVE);
+            dist(&mut tools, &o, &target, &header).unwrap();
+        };
+        run();
+        for p in layout() {
+            age(&o.out.join(p));
+        }
+        run();
+        for p in layout() {
+            assert_eq!(mtime(&o.out.join(&p)), LONG_AGO, "{p}");
+        }
         std::fs::remove_dir_all(&root).unwrap();
     }
 
