@@ -8,6 +8,7 @@
 #include <vector>
 
 #import "RgfxFunction.h"
+#import "RgfxTexture.h" // rgfxAppleGPU
 #include "RgfxLogOnce.hpp"
 #include "RgfxSerializer.hpp"
 
@@ -71,11 +72,15 @@ void noteNoAnswer(const char *what, uint32_t status)
 	return _functionType;
 }
 
-// The AMD Radeon Pro 5300M's handle raises an unrecognized selector here (measured: macOS
-// 26.7.1, oracle_fnptr), and so does this: a handle reaches a shader through a table.
+// The AMD Radeon Pro 5300M's and the Intel UHD Graphics 630's handles raise an unrecognized
+// selector here (measured: macOS 26.7.1, oracle_fnptr), and so does this: a handle reaches a
+// shader through a table. On an Apple GPU (rgfxAppleGPU) it answers 0, as the M3 Max's handles do,
+// of a compute pipeline's linked functions and a render pipeline's fragment ones alike (measured:
+// macOS 27.0.1, oracle_fnptr Apple).
 - (MTLResourceID)gpuResourceID
 {
-	[self doesNotRecognizeSelector:_cmd];
+	if (!rgfxAppleGPU(self.device))
+		[self doesNotRecognizeSelector:_cmd];
 	return MTLResourceID{};
 }
 

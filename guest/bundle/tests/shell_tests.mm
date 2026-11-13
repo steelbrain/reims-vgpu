@@ -14066,8 +14066,9 @@ struct FunctionPointerDevice {
 // does not link (the host's not found) is nil, asked once too. A table answers the host's
 // resource id, size and options; its sets go on the ring (FUNCTION_TABLE_SET), a nil handle as
 // 0, and a range past its entries sets none. A handle's gpuResourceID and the pipeline's
-// functionHandleWithName: raise an unrecognized selector, as the AMD 5300M's do. Where the host
-// makes none, each is nil and asks nothing.
+// functionHandleWithName: raise an unrecognized selector, as the AMD 5300M's do, but on an Apple GPU
+// a handle's gpuResourceID is 0, as the M3 Max's. Where the host makes none, each is nil and asks
+// nothing.
 void test_function_pointers()
 {
 	Fixture fx;
@@ -14178,6 +14179,24 @@ void test_function_pointers()
 	// A refused table is nil.
 	device.status = RGFX_STATUS_REFUSED;
 	CHECK([cs newVisibleFunctionTableWithDescriptor:td] == nil && device.calls == 4);
+
+	// On an Apple GPU (rgfxAppleGPU) a handle's gpuResourceID is 0, as the M3 Max's handles answer
+	// (oracle_fnptr Apple, macOS 27.0.1); an x86 guest's still raises (above).
+	device.status = RGFX_STATUS_OK;
+	id apple = [RgfxAppleFamilyDevice new]; // held: a handle keeps its device weakly
+	RgfxFunctionHandle *appleHandle = [RgfxFunctionHandle handleOfFunction:add1
+	                                                              pipeline:cs.rgfxObjId
+	                                                                device:(id<MTLDevice>)apple
+	                                                            serializer:&fx.ser];
+	CHECK(appleHandle != nil && device.calls == 5);
+	raised = false;
+	@try {
+		CHECK(appleHandle.gpuResourceID._impl == 0);
+	} @catch (NSException *e) {
+		(void)e;
+		raised = true;
+	}
+	CHECK(!raised);
 	} // @autoreleasepool
 }
 
