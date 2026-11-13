@@ -79,6 +79,7 @@
 #include <IOKit/IOLib.h>
 #include <kern/clock.h>
 #include <libkern/OSAtomic.h>
+#include <libkern/OSKextLib.h>
 #include <libkern/libkern.h>
 #include <mach/mach_vm.h>
 #include <mach/vm_region.h>
@@ -579,6 +580,28 @@ OSObject *rgfxSurfaceLocksLookup(RgfxAccelerator *accel, task_t task, uint32_t s
 	if (surface && !isSurface(surface))
 		OSSafeReleaseNULL(surface);
 	return surface;
+}
+
+bool rgfxSurfaceUnlockSeedExported()
+{
+	return &rgfxIOSurfaceUnlockSeed != nullptr && OSKextSymbolIsResolved(rgfxIOSurfaceUnlockSeed);
+}
+
+IOReturn rgfxSurfaceLocksSeeds(RgfxAccelerator *accel, task_t task, uint32_t surfaceId,
+                               uint32_t *lockSeed, uint32_t *unlockSeed)
+{
+	if (!rgfxSurfaceUnlockSeedExported())
+		return kIOReturnUnsupported;
+	OSObject *surface = rgfxSurfaceLocksLookup(accel, task, surfaceId);
+	if (!surface)
+		return kIOReturnNotFound;
+	// IOSurface's getters load a field each and take no lock (read from its x86_64 code in macOS
+	// 26.7.1's KDK): a lock or an unlock between the two loads leaves them a step apart, which
+	// the next ask reads again.
+	*lockSeed = rgfxIOSurfaceLockSeed(surface);
+	*unlockSeed = rgfxIOSurfaceUnlockSeed(surface);
+	surface->release();
+	return kIOReturnSuccess;
 }
 
 bool rgfxSurfaceLocksMapsAt(OSObject *surface, task_t task, UInt64 address, UInt64 length)

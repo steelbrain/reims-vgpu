@@ -133,6 +133,7 @@ static const Selector kSelectors[] = {
 	{"kRgfxAccelMethodPagesBlock", kRgfxAccelMethodPagesBlock, false},
 	{"kRgfxAccelMethodSubmitBatch", kRgfxAccelMethodSubmitBatch, false},
 	{"kRgfxAccelMethodPagesChunked", kRgfxAccelMethodPagesChunked, false},
+	{"kRgfxAccelMethodSurfaceSeeds", kRgfxAccelMethodSurfaceSeeds, false},
 	{"kRgfxAccelMethodTakeAnswers", kRgfxAccelMethodTakeAnswers, false},
 	{"kRgfxAccelMethodSurfaceBlockRelease", kRgfxAccelMethodSurfaceBlockRelease, false},
 	{"kRgfxAccelMethodSurfaceRetire", kRgfxAccelMethodSurfaceRetire, false},
@@ -306,6 +307,7 @@ static void features()
 		kRgfxKextFeatureWriteCombined,
 		kRgfxKextFeaturePagesChunked,
 		kRgfxKextFeatureSharedPipelines,
+		kRgfxKextFeatureSurfaceSeeds,
 	};
 	for (unsigned i = 0; i < sizeof(bits) / sizeof(bits[0]); i++)
 		CHECK(bits[i] == uint64_t(1) << i);
@@ -328,6 +330,8 @@ static void features()
 	// The chunked pages block past the port's numbers, its chunk 64 KiB.
 	CHECK(kRgfxAccelMethodPagesChunked == 12);
 	CHECK(kRgfxPagesChunk == 0x10000 && kRgfxPagesChunkedMaxBytes % kRgfxPagesChunk == 0);
+	// A surface's seeds at the last of the low numbers.
+	CHECK(kRgfxAccelMethodSurfaceSeeds == 13);
 }
 
 int main()

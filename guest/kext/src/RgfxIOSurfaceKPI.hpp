@@ -114,6 +114,15 @@ void rgfxDeviceCacheSetCurrent(RgfxDeviceCache *cache)
     __asm__("__ZN20IOSurfaceDeviceCache10setCurrentEv");
 // IOSurface::getLockSeed() const: the surface's seed, as IOSurfaceGetSeed reads it.
 uint32_t rgfxIOSurfaceLockSeed(const OSObject *surface) __asm__("__ZNK9IOSurface11getLockSeedEv");
+// IOSurface::getUnlockSeed() const: the surface's unlock seed, which unlockSurface moves at each
+// read-write unlock, as lockSurface moves the lock seed at the lock, and which a GPU write moves
+// with the lock seed (set_current_device_cache, which logs a GPU write made current while the two
+// differ); 0 for a fresh surface, as the lock seed is (read from IOSurface's x86_64 code in macOS
+// 26.7.1's KDK, 25G241, where IOAcceleratorFamily2 and IOGPUFamily import it). Referenced weakly:
+// a release whose IOSurface does not export it binds it to gOSKextUnresolved or 0, and the kext
+// then reads no unlock seed (rgfxSurfaceUnlockSeedExported).
+uint32_t rgfxIOSurfaceUnlockSeed(const OSObject *surface)
+    __asm__("__ZNK9IOSurface13getUnlockSeedEv") __attribute__((weak_import));
 // IOSurface::lockSurface(unsigned int, unsigned int*) and unlockSurface(unsigned int, unsigned
 // int*): a CPU lock of the surface, as a process's, with IOSurface's lock options
 // (kRgfxIOSurfaceLockReadOnly), the seed after it in `*seed` where not null.

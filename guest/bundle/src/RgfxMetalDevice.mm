@@ -573,6 +573,24 @@ void rgfxKextSurfaceRetire(void *context, uint64_t queue, uint64_t seqno)
 	IOConnectCallScalarMethod(conn, kRgfxAccelMethodSurfaceRetire, in, 2, nullptr, nullptr);
 }
 
+// The region's surface seeds source (RgfxRegion::setSurfaceSeedsSource): a surface's lock and
+// unlock seeds from the kext (kRgfxAccelMethodSurfaceSeeds), false where it answers none.
+bool rgfxKextSurfaceSeeds(void *context, uint32_t surfaceId, uint32_t *lockSeed,
+                          uint32_t *unlockSeed)
+{
+	io_connect_t conn = rgfxKextConn(context);
+	const uint64_t in = surfaceId;
+	uint64_t out[2] = {};
+	uint32_t outCount = 2;
+	if (IOConnectCallScalarMethod(conn, kRgfxAccelMethodSurfaceSeeds, &in, 1, out, &outCount) !=
+	        KERN_SUCCESS ||
+	    outCount != 2)
+		return false;
+	*lockSeed = static_cast<uint32_t>(out[0]);
+	*unlockSeed = static_cast<uint32_t>(out[1]);
+	return true;
+}
+
 // The serializer's queue closer: the kext stops watching the queue's completion ring and posts
 // its destroy on the control ring, behind the process's messages before it.
 void rgfxKextQueueCloser(void *context, RgfxObjId objId)
@@ -919,6 +937,10 @@ RGFX_LOG_UNRECOGNIZED
 	                                   : &rgfxKextSurfacePages,
 	                               _caps.linearTextureAlignment(), connContext);
 	_region->setSurfaceWriteSource(&rgfxKextSurfaceWrites, &rgfxKextSurfaceRetire, connContext);
+	// A copy synced while a CPU held its surface locked for writing syncs again at the unlock,
+	// where the kext reads IOSurface's unlock seed (RgfxIOSurface.h).
+	if ((_caps.kextFeatures() & kRgfxKextFeatureSurfaceSeeds) != 0)
+		_region->setSurfaceSeedsSource(&rgfxKextSurfaceSeeds, connContext);
 	// No-copy buffers over the process's own pages, where the kext makes pages blocks and the
 	// host took the feature that maps them.
 	if ((_caps.kextFeatures() & kRgfxKextFeaturePagesBlock) != 0 &&

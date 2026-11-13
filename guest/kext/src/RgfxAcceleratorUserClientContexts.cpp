@@ -337,6 +337,18 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 	}
 	case kRgfxAccelMethodSurfaceWrites:
 		return surfaceWritesMethod(a);
+	case kRgfxAccelMethodSurfaceSeeds: {
+		if (a->scalarInputCount != 1 || a->scalarOutputCount != 2 || in[0] > UINT32_MAX)
+			return kIOReturnBadArgument;
+		uint32_t lockSeed = 0, unlockSeed = 0;
+		IOReturn r = rgfxSurfaceLocksSeeds(owner, task, static_cast<uint32_t>(in[0]), &lockSeed,
+		                                   &unlockSeed);
+		if (r != kIOReturnSuccess)
+			return r;
+		out[0] = lockSeed;
+		out[1] = unlockSeed;
+		return kIOReturnSuccess;
+	}
 	case kRgfxAccelMethodSurfaceRetire:
 		if (a->scalarInputCount != 2 || !ownsQueue(in[0]))
 			return kIOReturnBadArgument;
@@ -346,7 +358,9 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		if (a->scalarInputCount != 0 || a->scalarOutputCount != 3)
 			return kIOReturnBadArgument;
 		out[0] = owner->featureWord();
-		out[1] = kRgfxKextFeatureWord;
+		out[1] = rgfxSurfaceUnlockSeedExported()
+		             ? kRgfxKextFeatureWord
+		             : kRgfxKextFeatureWord & ~static_cast<uint64_t>(kRgfxKextFeatureSurfaceSeeds);
 		out[2] = kRgfxSelectorMap;
 		return kIOReturnSuccess;
 	default:

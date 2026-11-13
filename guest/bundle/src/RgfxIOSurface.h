@@ -55,7 +55,14 @@
  * which every holder reads and writes. The copy syncs with the pages, every plane, at two
  * points:
  *   - before a commit, from the pages, where the surface's seed is not the header's: a CPU
- *     wrote the surface under a lock since any holder synced it;
+ *     wrote the surface under a lock since any holder synced it; and where a CPU held the
+ *     surface locked for writing as a holder last synced it, once it has let go of the lock.
+ *     IOSurface moves the seed at a read-write lock and its unlock seed at the unlock (both at a
+ *     GPU write), so a sync made between the two copies the pages as the CPU has written them so
+ *     far, as a GPU that reads the pages in place reads them then; the header records the unlock
+ *     seed then (RgfxRegion::surfaceSeeds, the kext's), and the commit after the unlock seed
+ *     moves syncs again. Without the kext's seeds, a sync made mid-write stands until the next
+ *     lock;
  *   - when a command buffer that writes the copy completes, before it reports completion,
  *     back to the pages, with no lock of the surface. A write is a render attachment, a
  *     blit's destination, a resource used with Write usage, or a texture bound at an index
@@ -180,7 +187,8 @@ NS_ASSUME_NONNULL_END
 
 /// Before a commit: syncs each copy the command buffer of `enc` uses or writes (as its encoders
 /// named them, rgfxIOSurfaceNoteUse and rgfxIOSurfaceNoteWrite) from the surface's pages, where
-/// the surface's seed moved since any holder synced it (a view in place needs none). A copy the
+/// the surface's seed moved since any holder synced it, or a CPU that held the surface locked for
+/// writing then has let go of the lock since (a view in place needs none). A copy the
 /// buffer does not name is synced at the commit of one that does: Metal has a function reach a
 /// resource only through a binding, an attachment, a blit, or useResource for one an argument
 /// buffer names, and each of those names it.

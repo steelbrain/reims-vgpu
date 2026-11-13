@@ -90,7 +90,8 @@ enum {
 // second word kRgfxAccelMethodFeatures answers: PagesBlock and PagesChunked, SubmitBatch, Submit's
 // deferred and shared flags and TakeAnswers, OpenContext's span, shared events' ports and Alloc's
 // write-combined part, where the region's write-combined mappings are ordinary memory
-// (RgfxRegionMapping.hpp). Each bit is set by the change that lands its call.
+// (RgfxRegionMapping.hpp), and SurfaceSeeds, which Features leaves out where IOSurface exports no
+// unlock seed (rgfxSurfaceUnlockSeedExported). Each bit is set by the change that lands its call.
 constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeaturePagesChunked |
                                           kRgfxKextFeatureSubmitBatch |
@@ -98,6 +99,7 @@ constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeatureSharedPipelines |
                                           kRgfxKextFeatureContextSpan |
                                           kRgfxKextFeatureSharedEvents |
+                                          kRgfxKextFeatureSurfaceSeeds |
                                           kRgfxKextFeatureRegionWriteCombined;
 
 class RgfxAccelerator;
@@ -214,6 +216,13 @@ void rgfxSurfaceLocksWake();
 // The IOSurface of ID `surfaceId` that `task` may see, retained, or null. Under no lock of the
 // kext's: it calls into IOSurface (the contexts' lock order, RgfxAcceleratorContexts.cpp).
 OSObject *rgfxSurfaceLocksLookup(RgfxAccelerator *accel, task_t task, uint32_t surfaceId);
+// Whether this release's IOSurface exports its unlock seed (rgfxIOSurfaceUnlockSeed).
+bool rgfxSurfaceUnlockSeedExported();
+// The lock seed and the unlock seed of the IOSurface of ID `surfaceId` that `task` may see
+// (kRgfxAccelMethodSurfaceSeeds): kIOReturnNotFound where it may see none, kIOReturnUnsupported
+// where IOSurface exports no unlock seed. Under no lock of the kext's, as the lookup.
+IOReturn rgfxSurfaceLocksSeeds(RgfxAccelerator *accel, task_t task, uint32_t surfaceId,
+                               uint32_t *lockSeed, uint32_t *unlockSeed);
 // Whether `task` maps `surface`'s memory from its first byte at `address`, `length` bytes of it
 // or more: IOSurface's own mapping of it for the task's client, found, never made, and not wired.
 bool rgfxSurfaceLocksMapsAt(OSObject *surface, task_t task, UInt64 address, UInt64 length);

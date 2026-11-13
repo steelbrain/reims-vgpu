@@ -113,6 +113,15 @@ enum {
 	// multiple of one, or past kRgfxPagesChunkedMaxBytes; kIOReturnNoMemory where the kernel has
 	// not that many chunks to give, which the process then takes plain pages for.
 	kRgfxAccelMethodPagesChunked = 12,
+	// The two seeds of an IOSurface the client's process holds (kRgfxKextFeatureSurfaceSeeds): in
+	// its IOSurfaceID; out its lock seed (IOSurfaceGetSeed's) and its unlock seed. IOSurface moves
+	// the lock seed at a read-write lock and the unlock seed at that lock's unlock, and both at a
+	// GPU write (IOSurface::getUnlockSeed, which the Mac's GPU families read: the kext's
+	// RgfxIOSurfaceKPI.hpp), so the two differ while a CPU holds the surface locked for writing.
+	// The bundle reads them for a copy of the surface synced while such a lock was held, which it
+	// syncs again once the unlock seed moves. kIOReturnNotFound where the process holds no such
+	// surface; kIOReturnUnsupported where IOSurface has no unlock seed to read.
+	kRgfxAccelMethodSurfaceSeeds = 13,
 	// A new selector takes the next number design.md's registry gives out.
 };
 
@@ -238,6 +247,7 @@ static inline int rgfxAccelContextSelector(unsigned selector)
 	case kRgfxAccelMethodFeatures:
 	case kRgfxAccelMethodPagesBlock:
 	case kRgfxAccelMethodPagesChunked:
+	case kRgfxAccelMethodSurfaceSeeds:
 	case kRgfxAccelMethodSubmitBatch:
 	case kRgfxAccelMethodTakeAnswers:
 	case kRgfxAccelMethodSurfaceBlockRelease:
@@ -335,6 +345,8 @@ enum {
 	// Submit's (0x105) shared flag, kRgfxSubmitShared, which keeps answers only where the feature
 	// word also holds RGFX_FEATURE_PIPELINE_KEYS.
 	kRgfxKextFeatureSharedPipelines = 1 << 9,
+	// SurfaceSeeds, 13.
+	kRgfxKextFeatureSurfaceSeeds = 1 << 10,
 };
 
 // Where a cached block's header holds its surface's CPU generation, a 64-bit count the kext
