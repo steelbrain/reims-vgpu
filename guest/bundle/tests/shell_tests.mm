@@ -7753,6 +7753,12 @@ void test_overlapping_arguments_refused_as_metal()
 	dispatch_data_t data = dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
 		(void)bytes;
 	});
+	// Its bytes, which the device keeps for a library it makes of them, and which its functions'
+	// AIR is read from.
+	[ours rgfxSetSource:data
+	        shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+		        return nil;
+	        }];
 	id<MTLLibrary> theirs = [MTLCreateSystemDefaultDevice() newLibraryWithData:data error:nil];
 	CHECK(theirs != nil);
 	if (ours == nil || theirs == nil)
