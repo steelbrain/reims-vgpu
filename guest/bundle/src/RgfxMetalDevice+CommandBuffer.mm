@@ -123,6 +123,10 @@ constexpr uint32_t kQueueCompleteDataSize = 32768;
 		reader->setRoomEvents(room);
 		submit->setRoomEvents(room);
 	}
+	// A buffer that asks for its CB_SUBMITTED rings its doorbell apart from the rest, so the
+	// host may take the rest with no exit to its process, where the device's word holds
+	// DOORBELL_ASKS.
+	submit->setDoorbellAsks(caps != nullptr && (caps->features() & RGFX_FEATURE_DOORBELL_ASKS) != 0);
 	// Where the host commits a process's command buffers in the order its queues put them on
 	// their rings, the queue takes part in the process's commit order (RgfxCommitOrder.hpp): the
 	// device made one where its word holds RGFX_FEATURE_COMMIT_ORDER.

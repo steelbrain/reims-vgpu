@@ -460,10 +460,11 @@ bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, 
 	store64(m_header + kProducer, m_produced);
 	fullFence();
 	// A walking host comes back to the ring by itself: it is rung only for what it answers in
-	// the doorbell's write.
+	// the doorbell's write, which the write names apart where the host takes that.
 	const uint32_t idle = load32(m_header + kConsumerIdle);
 	if (m_doorbell && (idle == RGFX_CONSUMER_ASLEEP || (idle == RGFX_CONSUMER_WALKING && answered)))
-		m_doorbell(m_doorbellContext, m_ringId);
+		m_doorbell(m_doorbellContext,
+		           answered && m_doorbellAsks ? m_ringId | RGFX_DOORBELL_ASKS : m_ringId);
 
 	if (out_seqno)
 		*out_seqno = seqno;

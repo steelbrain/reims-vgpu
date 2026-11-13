@@ -1569,6 +1569,41 @@ void test_ring_doorbell_follows_the_mark()
 	CHECK(rang(0, true) == 0);
 }
 
+// Where the device's word holds DOORBELL_ASKS, a command buffer that asks for its submission
+// rings its ring's id with RGFX_DOORBELL_ASKS, for the host to answer inside the write, and
+// every other doorbell writes the id alone; where it does not, every doorbell writes the id
+// alone, as before the bit.
+void test_ring_doorbell_asks_where_the_device_takes_them()
+{
+	constexpr uint32_t kRingId = 0x1000; // a region offset, as the device's ring ids are
+	static std::vector<uint32_t> written;
+	const auto record = [](void *, uint32_t value) { written.push_back(value); };
+	for (const bool takes : { false, true }) {
+		TestRing ring(0x8000);
+		RgfxRingWriter writer(ring.base(), ring.dataSize, kRingId, record, nullptr);
+		writer.setDoorbellAsks(takes);
+		const auto rang = [&](uint32_t mark, bool asks) {
+			ring.setConsumerIdle(mark);
+			written.clear();
+			RgfxEncoder enc(writer, /*queue*/ 1, /*cb*/ 100);
+			enc.beginComputePass();
+			enc.endEncoder();
+			if (asks)
+				enc.appendSubmitted();
+			CHECK(enc.finish());
+			RgfxMsgHeader header = {};
+			std::vector<uint8_t> body;
+			CHECK(ring.next(&header, &body) && header.type == RGFX_CMD_COMMAND_BUFFER);
+			CHECK(written.size() == 1);
+			return written.empty() ? 0u : written[0];
+		};
+		const uint32_t asking = takes ? kRingId | RGFX_DOORBELL_ASKS : kRingId;
+		CHECK(rang(RGFX_CONSUMER_ASLEEP, false) == kRingId);
+		CHECK(rang(RGFX_CONSUMER_ASLEEP, true) == asking);
+		CHECK(rang(RGFX_CONSUMER_WALKING, true) == asking);
+	}
+}
+
 void test_ring_post_waits_for_room()
 {
 	constexpr uint32_t kData = 0x1000;
@@ -4137,6 +4172,7 @@ int main()
 	test_mesh_ops();
 	test_ring_wrap_and_no_room();
 	test_ring_doorbell_follows_the_mark();
+	test_ring_doorbell_asks_where_the_device_takes_them();
 	test_ring_post_waits_for_room();
 	test_ring_post_waits_for_the_room_record();
 	test_ring_room_sleeps_count_for_the_line();

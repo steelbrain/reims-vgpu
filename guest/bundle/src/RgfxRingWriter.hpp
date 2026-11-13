@@ -215,6 +215,13 @@ public:
 			m_room = std::move(room);
 	}
 
+	/// Where the device's word holds RGFX_FEATURE_DOORBELL_ASKS: a post that rings for a command
+	/// buffer it may answer at the doorbell (`answered`) writes the ring's id with
+	/// RGFX_DOORBELL_ASKS, which the host answers inside the write, and every other doorbell the
+	/// id alone, which the host may take with no exit to its process. Set once, before the first
+	/// post.
+	void setDoorbellAsks(bool asks) { m_doorbellAsks = asks; }
+
 private:
 	volatile uint8_t *m_header;
 	volatile uint8_t *m_data;
@@ -223,6 +230,7 @@ private:
 	uint32_t m_ringId;
 	RgfxDoorbell m_doorbell;
 	void *m_doorbellContext;
+	bool m_doorbellAsks = false; // setDoorbellAsks'
 	RgfxForward m_forward;
 	void *m_forwardContext;
 	RgfxForwardDeferred m_deferredPost = nullptr;
