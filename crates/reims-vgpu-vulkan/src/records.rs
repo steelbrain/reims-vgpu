@@ -351,13 +351,12 @@ mod tests {
     }
 
     /// The warm pass's budget is a backstop, half the shader cache's cap, and on a host's cap it
-    /// holds the RTX 2080 walk's 4,565 records at that driver's 1.85 MB a record, which 4 GiB did
-    /// not (the budget's doc)
+    /// holds the RTX 2080 walk's 4,565 records at that driver's 1.85 MB a record (the budget's
+    /// doc)
     #[test]
     fn the_warm_budget_is_half_the_cache_and_holds_a_walk_s_records() {
         assert_eq!(WARM_BUDGET, crate::platform::SHADER_CACHE_CAPACITY / 2);
         const { assert!(4_565u64 * 1_853_000 <= rt::DEFAULT_CAPACITY / 2) };
-        const { assert!(4_565u64 * 1_853_000 > 4 << 30) };
     }
 
     /// The records file lies beside the hosts' shader cache directory, under `HOME`, not in it:
