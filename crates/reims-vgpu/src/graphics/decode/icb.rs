@@ -43,7 +43,7 @@ use reims_vgpu_vulkan::core::platform::values::IcbDesc;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use reims_vgpu_vulkan::core::raise::RaiseResult;
+use reims_vgpu_vulkan::core::raise::{Raise, RaiseResult};
 use reims_vgpu_vulkan::core::sync::Mutex;
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -384,7 +384,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             };
             at += size_of::<RgfxIcbSlotRun>();
             let done = self.slot_run(&run, &mut tally);
-            tally.count(run.icb_obj_id, run.first_command.into(), Ok(done));
+            tally.count(run.icb_obj_id, run.first_command.into(), carried(Ok(done)));
         }
         if let Some((icb, index, why)) = &tally.first {
             log::warn!(
@@ -424,7 +424,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             };
             at += size_of::<RgfxIcbSlotPagesRun>();
             let done = self.pages_slot_run(device, &run, &mut tally);
-            tally.count(run.icb_obj_id, run.first_command.into(), done);
+            tally.count(run.icb_obj_id, run.first_command.into(), carried(done));
         }
         if let Some((icb, index, why)) = &tally.first {
             log::warn!(
@@ -631,7 +631,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         let shape = (kind, slot, bindings, (mask, mask_b));
         if kind == RGFX_ICB_SLOTS_RENDER {
-            let carry = |c: &P::IndirectRenderCommand<'_>, field: Field<'_>| {
+            let carry = |c: &P::IndirectRenderCommand<'_>, field: &Field<'_>| {
                 let reset = || c.encode(IcbRenderCmd::Reset);
                 contain(
                     dropped,
@@ -649,7 +649,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 tally,
             );
         } else {
-            let carry = |c: &P::IndirectComputeCommand<'_>, field: Field<'_>| {
+            let carry = |c: &P::IndirectComputeCommand<'_>, field: &Field<'_>| {
                 let reset = || c.encode(IcbComputeCmd::Reset);
                 contain(
                     dropped,
@@ -671,18 +671,14 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// A render slot's `field` on its command: a binding or the pipeline state sent as its record
     /// would send it, with no record made between, and the rest by its record.
-    fn render_field(
-        &self,
-        c: &P::IndirectRenderCommand<'_>,
-        field: Field<'_>,
-    ) -> RaiseResult<Result<(), DecodeError>> {
-        let cmd = match field {
-            Field::Record(op, body) => return self.render_record(c, op, body),
+    fn render_field(&self, c: &P::IndirectRenderCommand<'_>, field: &Field<'_>) -> Carried {
+        let cmd = match *field {
+            Field::Record(op, body) => return carried(self.render_record(c, op, body)),
             Field::Pipeline(obj_id) => IcbRenderCmd::SetRenderPipelineState {
-                pipeline_state: self.get_render_pipeline(obj_id)?,
+                pipeline_state: raised(self.get_render_pipeline(obj_id))?,
             },
             Field::Binding(index, s, strided) => {
-                let buffer = self.get_buffer(s.obj_id)?;
+                let buffer = raised(self.get_buffer(s.obj_id))?;
                 match strided {
                     true => IcbRenderCmd::SetVertexBufferAttributeStride {
                         buffer,
@@ -698,29 +694,24 @@ impl<P: Platform> GraphicsDecoder<P> {
                 }
             }
             Field::Second(index, s) => IcbRenderCmd::SetFragmentBuffer {
-                buffer: self.get_buffer(s.obj_id)?,
+                buffer: raised(self.get_buffer(s.obj_id))?,
                 offset: s.offset,
                 index: index.into(),
             },
-            Field::Length(..) => return Ok(Err(DecodeError::UnknownCommand)),
+            Field::Length(..) => return Err(Box::new(DecodeError::UnknownCommand.into())),
         };
-        c.encode(cmd)?;
-        Ok(Ok(()))
+        raised(c.encode(cmd))
     }
 
     /// A compute slot's `field` on its command, as [`render_field`](Self::render_field) does.
-    fn compute_field(
-        &self,
-        c: &P::IndirectComputeCommand<'_>,
-        field: Field<'_>,
-    ) -> RaiseResult<Result<(), DecodeError>> {
-        let cmd = match field {
-            Field::Record(op, body) => return self.compute_record(c, op, body),
+    fn compute_field(&self, c: &P::IndirectComputeCommand<'_>, field: &Field<'_>) -> Carried {
+        let cmd = match *field {
+            Field::Record(op, body) => return carried(self.compute_record(c, op, body)),
             Field::Pipeline(obj_id) => IcbComputeCmd::SetComputePipelineState {
-                pipeline_state: self.get_compute_pipeline(obj_id)?,
+                pipeline_state: raised(self.get_compute_pipeline(obj_id))?,
             },
             Field::Binding(index, s, strided) => {
-                let buffer = self.get_buffer(s.obj_id)?;
+                let buffer = raised(self.get_buffer(s.obj_id))?;
                 match strided {
                     true => IcbComputeCmd::SetKernelBufferAttributeStride {
                         buffer,
@@ -739,10 +730,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                 length: length.into(),
                 index: index.into(),
             },
-            Field::Second(..) => return Ok(Err(DecodeError::UnknownCommand)),
+            Field::Second(..) => return Err(Box::new(DecodeError::UnknownCommand.into())),
         };
-        c.encode(cmd)?;
-        Ok(Ok(()))
+        raised(c.encode(cmd))
     }
 
     /// One record of an `ICB_WRITE` on `icb` of `size` commands, its command taken from
@@ -785,13 +775,13 @@ impl<P: Platform> GraphicsDecoder<P> {
                 unreachable!("a render command was just taken");
             };
             let reset = || c.encode(IcbRenderCmd::Reset);
-            contain(
+            uncarried(contain(
                 dropped,
                 index,
                 op,
-                || self.render_record(c, op, bytes),
+                || carried(self.render_record(c, op, bytes)),
                 reset,
-            )
+            ))
         } else if computes(op) {
             if !matches!(command, Command::Compute(i, _) if *i == index) {
                 let Some(c) = icb.compute_command(index)? else {
@@ -803,13 +793,13 @@ impl<P: Platform> GraphicsDecoder<P> {
                 unreachable!("a compute command was just taken");
             };
             let reset = || c.encode(IcbComputeCmd::Reset);
-            contain(
+            uncarried(contain(
                 dropped,
                 index,
                 op,
-                || self.compute_record(c, op, bytes),
+                || carried(self.compute_record(c, op, bytes)),
                 reset,
-            )
+            ))
         } else {
             Ok(Err(DecodeError::UnknownCommand))
         }
@@ -1021,16 +1011,88 @@ struct Tally {
 
 impl Tally {
     /// One run or field of buffer `icb` at command `index`, carried out or skipped as `done` says.
-    fn count(&mut self, icb: u64, index: u64, done: RaiseResult<Result<(), DecodeError>>) {
+    #[inline]
+    fn count(&mut self, icb: u64, index: u64, done: Carried) {
         self.tried += 1;
-        let why = match done {
-            Ok(Ok(())) => return,
-            Ok(Err(e)) => format!("{e:?}"),
-            Err(raise) => raise.to_string(),
-        };
-        self.skipped += 1;
-        self.first.get_or_insert((icb, index, why));
+        if let Err(failure) = done {
+            self.skip(icb, index, *failure);
+        }
     }
+
+    /// One run or field of buffer `icb` at command `index` skipped, for `failure`.
+    #[cold]
+    #[inline(never)]
+    fn skip(&mut self, icb: u64, index: u64, failure: Failure) {
+        self.skipped += 1;
+        if self.first.is_none() {
+            let why = match failure {
+                Failure::Decode(e) => format!("{e:?}"),
+                Failure::Raise(raise) => raise.to_string(),
+            };
+            self.first = Some((icb, index, why));
+        }
+    }
+}
+
+/// Why a run or a field was not carried out: the platform's raise, or the decoder's answer.
+#[derive(Debug)]
+enum Failure {
+    Decode(DecodeError),
+    Raise(Raise),
+}
+
+impl From<DecodeError> for Failure {
+    fn from(e: DecodeError) -> Failure {
+        Failure::Decode(e)
+    }
+}
+
+impl From<Raise> for Failure {
+    fn from(raise: Raise) -> Failure {
+        Failure::Raise(raise)
+    }
+}
+
+impl Failure {
+    /// Whether it names an object whose posted create the host refused ([`refused`]).
+    fn refused(&self) -> bool {
+        matches!(self, Failure::Raise(raise) if refused::is_refused(raise))
+    }
+}
+
+/// A field's or a run's carrying out: nothing where it was carried out, and its [`Failure`],
+/// boxed, where it was not. So a field carried out, every field of a take but those refused,
+/// answers in a register, where its [`RaiseResult`], a [`Raise`] wide, went from frame to frame
+/// between the field's encode and its tally, and each copy of it, in loads wider than the stores
+/// that wrote it, waited for them to land.
+type Carried = Result<(), Box<Failure>>;
+
+/// `done` as [`Carried`].
+#[inline]
+fn carried(done: RaiseResult<Result<(), DecodeError>>) -> Carried {
+    match done {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(Box::new(e.into())),
+        Err(raise) => Err(Box::new(raise.into())),
+    }
+}
+
+/// `done` as the [`RaiseResult`] it was carried as ([`carried`]).
+#[inline]
+fn uncarried(done: Carried) -> RaiseResult<Result<(), DecodeError>> {
+    match done {
+        Ok(()) => Ok(Ok(())),
+        Err(failure) => match *failure {
+            Failure::Decode(e) => Ok(Err(e)),
+            Failure::Raise(raise) => Err(raise),
+        },
+    }
+}
+
+/// `got`, its raise as a [`Carried`] failure.
+#[inline]
+fn raised<T>(got: RaiseResult<T>) -> Result<T, Box<Failure>> {
+    got.map_err(|raise| Box::new(raise.into()))
 }
 
 /// The range reset `run` (its first command and its length), where there is one, in one call:
@@ -1043,7 +1105,11 @@ fn reset_run<I: IndirectCommandBuffer<P>, P: Platform>(
     tally: &mut Tally,
 ) {
     if let Some((at, len)) = run {
-        tally.count(obj, at, refusing(|| icb.reset_with_range(at, len).map(Ok)));
+        tally.count(
+            obj,
+            at,
+            carried(refusing(|| icb.reset_with_range(at, len).map(Ok))),
+        );
         dropped.clear(at, len);
     }
 }
@@ -1059,7 +1125,7 @@ fn reset_run<I: IndirectCommandBuffer<P>, P: Platform>(
 fn command_fields<C>(
     command: impl FnOnce() -> RaiseResult<Option<C>>,
     (kind, slot, bindings, masks): (u16, &[u8], (u32, u32), (u64, u64)),
-    carry: impl Fn(&C, Field<'_>) -> RaiseResult<Result<(), DecodeError>>,
+    carry: impl Fn(&C, &Field<'_>) -> Carried,
     (obj, index): (u64, u64),
     tally: &mut Tally,
 ) {
@@ -1073,8 +1139,10 @@ fn command_fields<C>(
             if let Some(take) = command.take() {
                 match take() {
                     Ok(Some(c)) => made = Some(c),
-                    Ok(None) => return tally.count(obj, index, Ok(Err(DecodeError::Refused))),
-                    Err(raise) => return tally.count(obj, index, Err(raise)),
+                    Ok(None) => {
+                        return tally.count(obj, index, Err(Box::new(DecodeError::Refused.into())));
+                    }
+                    Err(raise) => return tally.count(obj, index, Err(Box::new(raise.into()))),
                 }
             }
             let Some(c) = made.as_ref() else {
@@ -1084,7 +1152,7 @@ fn command_fields<C>(
             slot_fields(kind, slot, bindings, masks, |field| {
                 if at == counted {
                     carrying = true;
-                    let done = carry(c, field);
+                    let done = carry(c, &field);
                     carrying = false;
                     tally.count(obj, index, done);
                     counted += 1;
@@ -1095,7 +1163,7 @@ fn command_fields<C>(
         match ran {
             Ok(()) => return,
             Err(refusal) => {
-                tally.count(obj, index, Err(refused_raise(&refusal)));
+                tally.count(obj, index, Err(Box::new(refused_raise(&refusal).into())));
                 if made.is_none() || !carrying {
                     return;
                 }
@@ -1109,23 +1177,24 @@ fn command_fields<C>(
 /// `record`, an encode `op` of command `index`, as [`Dropped`] holds it: a reset of the command
 /// carries it out again; a draw or dispatch of a dropped command is dropped; an encode that names
 /// an object whose create the host refused is dropped, the command reset (`reset`) and dropped.
+#[inline]
 fn contain(
     dropped: &Dropped,
     index: u64,
     op: u16,
-    record: impl FnOnce() -> RaiseResult<Result<(), DecodeError>>,
+    record: impl FnOnce() -> Carried,
     reset: impl FnOnce() -> RaiseResult<()>,
-) -> RaiseResult<Result<(), DecodeError>> {
+) -> Carried {
     if resets(op) {
         dropped.clear(index, 1);
     } else if acts(op) && dropped.holds(index) {
-        return Ok(Ok(()));
+        return Ok(());
     }
     match record() {
-        Err(raise) if refused::is_refused(&raise) => {
-            reset()?;
+        Err(failure) if failure.refused() => {
+            raised(reset())?;
             dropped.mark(index);
-            Ok(Ok(()))
+            Ok(())
         }
         done => done,
     }
@@ -1183,6 +1252,7 @@ fn word(slot: &[u8], k: usize) -> u64 {
 
 /// A field of a slot, as [`slot_fields`] hands it on: a record's op and body, or a binding or
 /// pipeline state taken from the slot as it lies there.
+#[derive(Clone, Copy)]
 enum Field<'s> {
     /// A field its record carries out: the reset, the stage-in region, the imageblock, the
     /// action and the barrier, and op 0 for a bit the slot's kind does not hold.
