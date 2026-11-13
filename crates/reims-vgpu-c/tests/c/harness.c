@@ -96,7 +96,8 @@ static void check_graphics(void) {
                                on_graphics_raise,
                                NULL,
                                NULL,
-                               on_graphics_cursor_move};
+                               on_graphics_cursor_move,
+                               NULL};
     RvgGraphicsDeviceConfig c = {sizeof c, &cb, NULL, NULL, NULL, RVG_GUEST_ARCH_X86_64};
     RvgGraphicsDevice *d = NULL;
     graphics_destroyed = 0;
