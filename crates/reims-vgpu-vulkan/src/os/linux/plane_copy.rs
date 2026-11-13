@@ -839,15 +839,12 @@ fn destination(
     if copy.to.gpu_read_only {
         return Err(refused("the buffer drops the GPU's writes".to_owned()));
     }
-    match buffer.host_backing() {
-        Some(rt::HostBacking::Copied) => {
-            return Err(refused(
-                "the buffer's pages are a copy the runtime keeps, which the GPU's own writes \
-                 would not reach"
-                    .to_owned(),
-            ));
-        }
-        _ => {}
+    if let Some(rt::HostBacking::Copied) = buffer.host_backing() {
+        return Err(refused(
+            "the buffer's pages are a copy the runtime keeps, which the GPU's own writes would \
+             not reach"
+                .to_owned(),
+        ));
     }
     let texel = copy.source.format.texel_bytes();
     let [width, height] = copy.extent;
