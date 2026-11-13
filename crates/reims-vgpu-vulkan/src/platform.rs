@@ -470,12 +470,17 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
 /// once each draw a host step records that the runtime's probe finds safe, a geometry stage
 /// emitting a copy of each triangle for each region it touches, so a pixel centre within a
 /// rounding error of a triangle's edge may be covered by one route and not the other
-/// (`rate_map_regions`, `RateMapRegionPolicy::Exact`). [`EXACT_ALL`] names every one. The
+/// (`rate_map_regions`, `RateMapRegionPolicy::Exact`), and a Managed buffer's modified range
+/// copied on the CPU into staging memory at each commit, as the buffer's host copy holds it then,
+/// so a CPU write after the commit never reaches a command buffer committed before it, as on the
+/// Radeon Pro 5300M, where the default has the GPU copy the range from the host copy as the
+/// submission runs, so such a write may be read, as on the UHD 630 (`managed_copy_in`,
+/// `ManagedCopyInPolicy::AtCommit`). [`EXACT_ALL`] names every one. The
 /// policy's `completion` and `heap_compression` are no names of these: every device takes their
 /// exact forms ([`exact_policy`]). The rest of Metal's values the runtime answers with the
 /// device's own arithmetic, sampling and conversions, each difference a precision note it
 /// records, with no exact form to name.
-pub const EXACT_FORMS: [&str; 12] = [
+pub const EXACT_FORMS: [&str; 13] = [
     "batch_order",
     "host_page_textures",
     "half_chains",
@@ -488,6 +493,7 @@ pub const EXACT_FORMS: [&str; 12] = [
     "vertex_reach",
     "heap_answers",
     "rate_map_regions",
+    "managed_copy_in",
 ];
 
 /// The name `REIMS_VGPU_EXACT` takes for the runtime's `DevicePolicy::exact_answers()`: every
@@ -525,15 +531,17 @@ pub const EXACT_ALL: &str = "all";
 /// pipeline until it is made, `wide_lines`' band variant of each pipeline that draws a line
 /// the device's own lines would draw otherwise than Metal, `extended_range_blits`' rewrite of
 /// each extended-range blit to Metal's encoding, and `heap_answers`' heap texture sizes and
-/// alignments by Metal's model, and `rate_map_regions`' region-by-region draws of each
-/// rate-mapped pass. A name of neither changes nothing,
+/// alignments by Metal's model, `rate_map_regions`' region-by-region draws of each
+/// rate-mapped pass, and `managed_copy_in`'s CPU copy of a Managed buffer's modified range at
+/// each commit. A name of neither changes nothing,
 /// and a line on stderr says so.
 fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
     use metal2vulkan::device::{
         BatchOrderPolicy, CompletionPolicy, DevicePolicy, DontCareColorPolicy,
         ExtendedRangeBlitPolicy, HalfChainPolicy, HeapAnswerPolicy, HeapCompressionPolicy,
-        HostPageTexturePolicy, PipelineWaitPolicy, QueueSharingPolicy, RateMapRegionPolicy,
-        UnstoredDontCarePolicy, VertexReachPolicy, WideLinePolicy, YCbCrInPlacePolicy,
+        HostPageTexturePolicy, ManagedCopyInPolicy, PipelineWaitPolicy, QueueSharingPolicy,
+        RateMapRegionPolicy, UnstoredDontCarePolicy, VertexReachPolicy, WideLinePolicy,
+        YCbCrInPlacePolicy,
     };
     let mut policy = DevicePolicy::default();
     policy.completion = CompletionPolicy::Exact;
@@ -558,6 +566,7 @@ fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
             "vertex_reach" => policy.vertex_reach = VertexReachPolicy::Exact,
             "heap_answers" => policy.heap_answers = HeapAnswerPolicy::Metal,
             "rate_map_regions" => policy.rate_map_regions = RateMapRegionPolicy::Exact,
+            "managed_copy_in" => policy.managed_copy_in = ManagedCopyInPolicy::AtCommit,
             other => {
                 let line = format!(
                     "reims-vgpu: REIMS_VGPU_EXACT names {other:?}, none of {EXACT_ALL}, {}: \
@@ -859,8 +868,9 @@ pub(crate) mod tests {
         use metal2vulkan::device::{
             BatchOrderPolicy, CompletionPolicy, DevicePolicy, DontCareColorPolicy,
             ExtendedRangeBlitPolicy, HalfChainPolicy, HeapAnswerPolicy, HeapCompressionPolicy,
-            HostPageTexturePolicy, PipelineWaitPolicy, QueueSharingPolicy, RateMapRegionPolicy,
-            UnstoredDontCarePolicy, VertexReachPolicy, WideLinePolicy, YCbCrInPlacePolicy,
+            HostPageTexturePolicy, ManagedCopyInPolicy, PipelineWaitPolicy, QueueSharingPolicy,
+            RateMapRegionPolicy, UnstoredDontCarePolicy, VertexReachPolicy, WideLinePolicy,
+            YCbCrInPlacePolicy,
         };
         let runtimes = DevicePolicy::default();
         assert_eq!(runtimes.completion, CompletionPolicy::Grouped);
@@ -884,6 +894,7 @@ pub(crate) mod tests {
         );
         assert_eq!(fast.vertex_reach, VertexReachPolicy::Bounded);
         assert_eq!(fast.rate_map_regions, RateMapRegionPolicy::FanOut);
+        assert_eq!(fast.managed_copy_in, ManagedCopyInPolicy::AtSubmission);
         for unchanged in [
             None,
             Some(""),
@@ -899,7 +910,7 @@ pub(crate) mod tests {
         }
         let one = |name| exact_policy(Some(name));
         type Set = fn(&mut DevicePolicy);
-        let alone: [(&str, Set); 12] = [
+        let alone: [(&str, Set); 13] = [
             ("batch_order", |p| p.batch_order = BatchOrderPolicy::Exact),
             ("host_page_textures", |p| {
                 p.host_page_textures = HostPageTexturePolicy::Shadow;
@@ -930,6 +941,9 @@ pub(crate) mod tests {
             ("rate_map_regions", |p| {
                 p.rate_map_regions = RateMapRegionPolicy::Exact;
             }),
+            ("managed_copy_in", |p| {
+                p.managed_copy_in = ManagedCopyInPolicy::AtCommit;
+            }),
         ];
         assert_eq!(alone.map(|(name, _)| name), EXACT_FORMS);
         let mut every = fast;
@@ -942,7 +956,7 @@ pub(crate) mod tests {
         }
         let named = " half_chains,wide_lines,pipeline_waits,host_page_textures , batch_order,\
                      queue_sharing,extended_range_blits,dont_care_colors,unstored_dont_care_loads,\
-                     vertex_reach,heap_answers,rate_map_regions";
+                     vertex_reach,heap_answers,rate_map_regions,managed_copy_in";
         assert_eq!(exact_policy(Some(named)), every);
         assert_eq!(exact_policy(Some(&EXACT_FORMS.join(","))), every);
         assert_eq!(one(EXACT_ALL), fast.exact_answers());
