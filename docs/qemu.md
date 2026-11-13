@@ -90,6 +90,7 @@ merge into staging of 2026-06-19), and upstream master is merged into it
 | the device raises its interrupt through an irqfd where KVM's in-kernel irqchip takes MSI-X through one | `36deb281` |
 | a command buffer is taken, and answered, on the vCPU that rings its queue's doorbell, with the plain register write | `f2c7e2a5`, `67cc08ad`, `5f459785` |
 | a command queue's plain doorbell, which the library routes where the guest took `DOORBELL_ASKS` (`route_doorbell`), is an ioeventfd matching the ring's id that signals the queue's eventfd, added and dropped under the BQL as the library asks, at most 128 at once | `d81bcaac` |
+| at QEMU's quit the device's release runs with the BQL let go, so a `route_doorbell` waiting for it finds the routes closed and returns, holding the release up no more | `104d7b18` |
 | the console shows the display (`rvg_graphics_device_read_display`), so QMP's `screendump` saves the guest's frame, and has the guest's cursor | `70a9a466`, `c119b802` |
 | a screendump waits for the console's read of the display at most 3 s from the read's start, then is answered with what the console shows, so QMP goes on while the GPU never answers the read | `17098f76` |
 | the device's realize warns where BAR 2 would get no address: on a PC machine with RAM at 1 GiB ("The reims-graphics device", below) | `22ae1fd1` |
@@ -238,6 +239,13 @@ is its transport:
   never ended, and QMP's and HMP's `quit` left QEMU in `thread_pool_free`
   until SIGKILL (**measured**, RTX 2080 and RTX 3090, macOS 26.7.2,
   2026-11-12).
+  The release itself runs with the BQL let go, and nothing else of the
+  teardown does: `route_doorbell`, which the library calls on its threads as
+  a command queue is made or ends, takes the BQL, and one waiting for it as
+  the release began held the release up to its 5 s bound under a BQL the
+  teardown held. Now it takes the BQL, finds the routes the teardown closed
+  and returns. No other callback takes the BQL, and no BH of the device's
+  runs inside the release, which runs on the main loop's thread.
 - **The machine:** macOS places every 64-bit prefetchable BAR below 4 GiB,
   where a 1 GiB BAR needs the window to start at or below 0x4000_0000. So a
   q35 machine with the device keeps at most 1 GiB of the guest's RAM below
