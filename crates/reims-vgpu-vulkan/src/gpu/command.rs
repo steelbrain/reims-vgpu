@@ -2531,6 +2531,29 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// The work of a device that stopped with no loss from its driver (the runtime's wedge rule,
+    /// whose `VkDevice` it parks) fails as a lost device's, as Metal fails a GPU hang's: the
+    /// oldest command buffer in flight as the hang, `MTLCommandBufferErrorTimeout` (code 2), and
+    /// the rest as its victims, `MTLCommandBufferErrorInternal` (code 1). Each is one of Metal's
+    /// failures, which core sees and the guest's completion carries (`RGFX_CB_TIMEOUT` and
+    /// `RGFX_CB_INTERNAL`), at the commit's read and at the wait's, none dying
+    #[test]
+    fn a_stopped_devices_work_fails_as_metals_hang_and_its_victims() {
+        use rt::CommandBufferError as E;
+        for (e, code) in [(E::GpuHang, 2), (E::GpuRecoveryVictim, 1)] {
+            assert_eq!(e.origin(), rt::FailureOrigin::Metal, "{e:?}");
+            for sel in ["commit", "waitUntilCompleted"] {
+                answered(sel, e, None);
+            }
+            let error = command_buffer_error(e, None);
+            assert_eq!(
+                (error.domain.as_str(), error.code),
+                ("MTLCommandBufferErrorDomain", code),
+                "{e:?}"
+            );
+        }
+    }
+
     /// A failure of the GPU's work the driver relayed reaches core with Metal's code where its
     /// code is one of Metal's, and dies where it is none
     #[test]

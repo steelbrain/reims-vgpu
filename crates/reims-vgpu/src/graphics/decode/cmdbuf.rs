@@ -2111,6 +2111,16 @@ impl<P: Platform> GraphicsDecoder<P> {
             } else {
                 cb_complete(cb_obj_id, seqno, start, end, info.error.as_ref())
             };
+            if let Some(error) = &info.error {
+                log::debug!(
+                    target: "reims_vgpu::graphics::completion",
+                    "command buffer {cb_obj_id:#x} (seqno {seqno}) failed: status {}, code {} \
+                     ({})",
+                    record.status,
+                    record.error_code,
+                    error.description
+                );
+            }
             if let Some(sink) = &sink {
                 sink(record);
             }
