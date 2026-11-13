@@ -163,6 +163,14 @@
 //!   are watched: a write over them makes the cache's next use fill it whatever its generation,
 //!   and a download or a release before that copies nothing, the pages being newer than the
 //!   cache.
+//! - **After a recovery of the device** (the platform made its lost GPU again,
+//!   [`GpuDevice::recoveries`]): the platform carries each cache's buffer with its contents lost,
+//!   while its pages hold what the CPU wrote and what the last copies out brought, so the pages
+//!   are the surface. No cache is copied into its pages again until a command buffer writes it,
+//!   no copy waits for the cache's users of the lost device, and each cache with pages is filled
+//!   from them whole before what reads it next, as a block named again over the same pages is
+//!   ([`SurfaceCaches::after_recovery`]). A deferred block's cache whose pages are not named
+//!   loses its bytes, as a `Private` buffer's.
 //! - **Deferred blocks.** Where the guest took `RGFX_FEATURE_SURFACE_DEFERRED`, the kext names a
 //!   fresh surface only the GPU has touched with no pages
 //!   ([`RGFX_SURFACE_PAGES_DEFERRED`](reims_vgpu_graphics::wire::RGFX_SURFACE_PAGES_DEFERRED)), as a
@@ -202,6 +210,7 @@
 //!   command buffer of its own, and a refused copy by runs encodes nothing in it.
 //!
 //! [`GpuDevice::copies_guest_ram`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::copies_guest_ram
+//! [`GpuDevice::recoveries`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::recoveries
 //! [`GpuDevice::linear_rows_pitch`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::linear_rows_pitch
 //! [`GpuDevice::fresh_surface_never_in_place`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::fresh_surface_never_in_place
 //! [`GpuDevice::new_buffer_of_length_padding_unobserved`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::new_buffer_of_length_padding_unobserved
@@ -1152,6 +1161,8 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// Whether laid-out caches of two planes are made with their memory a dma-buf, for the host's
     /// video to decode into ([`Caches::set_dma_buf`]).
     dma_buf: bool,
+    /// The device's recoveries the caches were last looked at for ([`Self::after_recovery`]).
+    recoveries: u64,
 }
 
 /// The command buffers begun and not finished that use one block's cache, by the number each was
@@ -1314,6 +1325,67 @@ impl<P: Platform> SurfaceCaches<P> {
             answering: HashSet::new(),
             copy_gpu: Arc::default(),
             dma_buf: false,
+            recoveries: 0,
+        }
+    }
+
+    /// Where the device recovered since the caches last looked ([`GpuDevice::recoveries`]): the
+    /// platform carries each cache's buffer with its contents lost (a `Private` buffer reads
+    /// zero), while its pages hold what the CPU wrote and what the last copies out brought, so
+    /// the pages are the surface. Each cache with pages, then, holds nothing a buffer wrote
+    /// ([`SurfaceCache::written`]), so no download, release or early copy copies it into its
+    /// pages; waits for none of its users, whose work went with the lost device (a copy would
+    /// wait on the GPU for an end value a buffer that failed there may never signal); and is
+    /// filled again from its pages whole, before what reads it next, as a
+    /// cache named again over the same pages is ([`Self::fill_whole`]), as of the generation it
+    /// held. A cache whose first fill is still owed, or whose decode's picture is still to land
+    /// ([`SurfaceCache::zeros`]), keeps those; a deferred block's cache whose pages are not named
+    /// keeps nothing, as a `Private` buffer's contents. A fill the platform raises at (a cache
+    /// the recovery left, as its runtime leaves exportable memory) is logged, and the cache is
+    /// filled at its next use that needs one. A deferred copy being made keeps its signal
+    /// ([`Self::signal_with`]) for its own command buffer.
+    ///
+    /// Looked at wherever a cache is filled or copied into its pages: a command buffer's begin, a
+    /// present's fill, a download, a release, an early copy and a block named again. A command
+    /// buffer the new device runs between its recovery and that look (the runtime announces the
+    /// recovery once the new device serves) may meet a cache before its fill, as it may a texture
+    /// of the hung work's.
+    fn after_recovery(&mut self, device: &P::Device) {
+        let now = device.recoveries();
+        if self.recoveries == now {
+            return;
+        }
+        self.recoveries = now;
+        let blocks: Vec<(u64, u64)> = (self.by_block.iter())
+            .filter(|(_, c)| c.pages.is_some() && c.first_fill.is_none() && !c.zeros)
+            .map(|(&block, c)| (block, c.generation.unwrap_or(0)))
+            .collect();
+        let signal_with = self.signal_with.take();
+        let mut refused = 0usize;
+        for &(block, generation) in &blocks {
+            if let Some(cache) = self.by_block.get_mut(&block) {
+                cache.written = false;
+                cache.users.clear();
+            }
+            if let Err(raise) = refusing(|| self.fill_whole(device, block, generation)) {
+                refused += 1;
+                log::warn!(
+                    target: "reims_vgpu::graphics", kind:% = raise;
+                    "the device recovered: the IOSurface block at {block:#x}'s device cache was \
+                     not filled again from its pages, the platform raised ({raise:?})"
+                );
+            }
+        }
+        self.signal_with = signal_with;
+        if !self.by_block.is_empty() {
+            log::info!(
+                target: "reims_vgpu::graphics",
+                "the device recovered: {} IOSurface device caches are filled again from their \
+                 pages, {refused} of them refused; {} more keep their owed first fill or hold \
+                 nothing",
+                blocks.len(),
+                self.by_block.len() - blocks.len()
+            );
         }
     }
 
@@ -1369,6 +1441,7 @@ impl<P: Platform> SurfaceCaches<P> {
         layout: Option<Vec<PagesPlane>>,
         made: &mut Option<RaiseResult<Made<P>>>,
     ) -> RaiseResult<bool> {
+        self.after_recovery(device);
         if self.keeps(block, length, &host_pages) {
             return self.named_again(device, block, generation);
         }
@@ -2806,6 +2879,7 @@ impl<P: Platform> SurfaceCaches<P> {
         done: Box<dyn FnOnce() + Send>,
         trace: Option<&CopyTrace>,
     ) -> RaiseResult<()> {
+        self.after_recovery(device);
         if let Some(trace) = trace {
             trace.cache(&self.by_block, block);
         }
@@ -2874,6 +2948,7 @@ impl<P: Platform> SurfaceCaches<P> {
         done: Box<dyn FnOnce() + Send>,
         trace: Option<&CopyTrace>,
     ) -> RaiseResult<Option<SurfaceCache<P>>> {
+        self.after_recovery(device);
         if let Some(trace) = trace {
             trace.cache(&self.by_block, block);
         }
@@ -3798,6 +3873,7 @@ impl<P: Platform> Caches<P> {
         uses: &[RgfxOpSurfaceUse],
         reach: &Reach,
     ) -> RaiseResult<(bool, Option<Uses<P>>)> {
+        state.after_recovery(device);
         let reached = match reach.work {
             true => state.fill_reached(device, cb, reach.context)?,
             false => false,
@@ -3962,6 +4038,7 @@ impl<P: Platform> Caches<P> {
         let signalled = self.state.lock().after(device, queue, cb, &uses.blocks);
         let done = signalled.and_then(|()| commit());
         let mut state = self.state.lock();
+        state.after_recovery(device);
         // The read-back queue runs its copies in order, so one behind a buffer that waits for a
         // deferred copy not yet made would hold every copy after it there, one of which that
         // deferred copy may wait for: such a buffer's write is copied out by the download that
@@ -4002,6 +4079,7 @@ impl<P: Platform> Caches<P> {
         generation: u64,
     ) -> RaiseResult<Option<FillWait>> {
         let mut state = self.state.lock();
+        state.after_recovery(device);
         if !state.needs_fill_at(block, generation) {
             return Ok(None);
         }
@@ -6378,6 +6456,71 @@ mod tests {
             "two made, each filled at its first use, and filled at the two namings; three \
              copies out"
         );
+    }
+
+    /// After a recovery of the device a cache holds nothing a buffer wrote: its pages are the
+    /// surface. A download asked past the recovery copies nothing out of it, and the cache is
+    /// filled again from its pages before it, as of the generation it held, so the next use of
+    /// that generation fills nothing more; a write after the recovery is copied out once, as
+    /// before. With no recovery, the same download copies the write out, and the later write
+    /// takes its early copy, the surface read back
+    #[test]
+    fn a_recovery_fills_each_cache_again_from_its_pages_and_copies_none_out() {
+        for recovered in [false, true] {
+            let mut r = cached();
+            let cache = cache_id(&r);
+            use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, true)]);
+            r.p.world().complete_all(CompleteOn::Caller);
+            if recovered {
+                r.p.world().recover();
+            }
+            let mark = r.p.call_log().mark();
+            let downloaded = download(&r, BLOCK);
+            r.p.world().complete_all(CompleteOn::Caller);
+            assert!(
+                downloaded.load(Ordering::SeqCst),
+                "answered, recovered {recovered}"
+            );
+            let copied = copies(&r.p.call_log().since(mark));
+            assert_eq!(copied.len(), 1, "recovered {recovered}: {copied:?}");
+            match recovered {
+                true => assert_eq!(copied[0].1, cache, "filled from the pages, none out"),
+                false => assert_eq!(copied[0].0, cache, "the write, out of the cache"),
+            }
+            let mark = r.p.call_log().mark();
+            use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 1, false)]);
+            r.p.world().complete_all(CompleteOn::Caller);
+            assert!(
+                copies(&r.p.call_log().since(mark)).is_empty(),
+                "the generation the cache holds, recovered {recovered}"
+            );
+            let mark = r.p.call_log().mark();
+            use_surfaces(&mut r, 1, 0x102, &[(BLOCK, 1, true)]);
+            r.p.world().complete_all(CompleteOn::Caller);
+            let downloaded = download(&r, BLOCK);
+            r.p.world().complete_all(CompleteOn::Caller);
+            assert!(downloaded.load(Ordering::SeqCst));
+            let copied = copies(&r.p.call_log().since(mark));
+            assert_eq!(copied.len(), 1, "recovered {recovered}: {copied:?}");
+            assert_eq!(copied[0].0, cache, "the later write, out of the cache");
+        }
+    }
+
+    /// A command buffer begun past a recovery has its cache filled again from its pages before
+    /// its use, as of the generation the cache held: one fill, and nothing copied out
+    #[test]
+    fn a_begin_past_a_recovery_fills_its_cache_before_its_use() {
+        let mut r = cached();
+        let cache = cache_id(&r);
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        r.p.world().recover();
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 1, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let copied = copies(&r.p.call_log().since(mark));
+        assert_eq!(copied.len(), 1, "{copied:?}");
+        assert_eq!(copied[0].1, cache, "filled from the pages");
     }
 
     /// A block named again over the same pages while a command buffer begun and not finished uses
