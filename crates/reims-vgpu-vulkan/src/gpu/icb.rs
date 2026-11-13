@@ -2367,13 +2367,20 @@ mod tests {
     }
 
     /// The commands of the longest buffer the device's records hold, to 2^20: the runtime keeps
-    /// a buffer's records, a header and then a record a command, in one buffer of the device's
-    /// `max_buffer_length`, and refuses one past it (`IndirectCommandBufferPastMaxBufferLength`).
-    /// lavapipe's 2 GiB holds 955,285 commands.
+    /// a buffer's records, a header, a record a command and then a command's written flag, in one
+    /// buffer of the device's `max_buffer_length` (`written_flag_offset` of the size at the size),
+    /// and refuses one past it (`IndirectCommandBufferPastMaxBufferLength`). lavapipe's 2 GiB
+    /// holds 953,589 commands.
     fn most_commands(d: &VulkanDevice) -> u64 {
-        use metal2vulkan::bind::indirect_commands::{COMMAND_BUFFER_HEADER_BYTES, COMMAND_BYTES};
-        let room = d.raw.properties().max_buffer_length - COMMAND_BUFFER_HEADER_BYTES as u64;
-        (room / COMMAND_BYTES as u64).min(1 << 20)
+        use metal2vulkan::bind::indirect_commands::{
+            COMMAND_BUFFER_HEADER_BYTES, COMMAND_BYTES, WRITTEN_FLAG_BYTES, written_flag_offset,
+        };
+        let most = d.raw.properties().max_buffer_length;
+        let room = most - COMMAND_BUFFER_HEADER_BYTES as u64;
+        let n = (room / (COMMAND_BYTES + WRITTEN_FLAG_BYTES) as u64).min(1 << 20);
+        let fits = |n: u64| written_flag_offset(n as u32, n as u32) <= most;
+        assert!(fits(n) && (n == 1 << 20 || !fits(n + 1)), "{n} commands");
+        n
     }
 
     /// A CPU reset of a range, one call however many commands it spans, leaves each command of it
