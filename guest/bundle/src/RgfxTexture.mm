@@ -515,10 +515,29 @@ uint64_t rgfxDepthStencilBytes(uint64_t f)
 
 } // namespace
 
-void rgfxEndAtUnalignableLinearFormat(MTLPixelFormat format)
+RgfxLinearAlignmentAnswer rgfxLinearAlignmentAnswer(MTLPixelFormat format, id<MTLDevice> device)
 {
 	const uint64_t f = format;
 	auto in = [f](uint64_t lo, uint64_t hi) { return f >= lo && f <= hi; };
+	if (rgfxAppleGPU(device)) {
+		// The M3 Max's (oracle_bundle Apple linalign, RgfxTexture.h).
+		const bool answered =
+		    f == 1 || in(10, 14) || f == 20 || in(22, 26) || in(30, 34) || in(40, 44) ||
+		    in(53, 55) || f == 60 || in(62, 66) || in(70, 74) || f == 80 || f == 81 || f == 84 ||
+		    f == 85 || in(90, 94) || in(103, 105) || f == 110 || in(112, 116) || in(123, 125) ||
+		    f == 263 || in(300, 304) || in(313, 315) || in(323, 325) || in(500, 510) ||
+		    in(520, 530) || in(540, 548) || in(550, 556) || f == 560 || in(562, 613) ||
+		    in(615, 629);
+		if (answered)
+			return RgfxLinearAlignmentAnswer::kAnswered;
+		if (in(130, 135) || in(140, 143) || in(150, 153) || in(160, 167) || f == 170 ||
+		    f == 172 || f == 174 || f == 176 || in(178, 183) || in(185, 200) || in(203, 218) ||
+		    in(221, 236) || in(240, 241))
+			return RgfxLinearAlignmentAnswer::kCompressed;
+		if (f == 250 || f == 252 || f == 253 || f == 260 || f == 261 || f == 651 || f == 652)
+			return RgfxLinearAlignmentAnswer::kDepthStencil;
+		return RgfxLinearAlignmentAnswer::kInvalid;
+	}
 	const bool answered =
 	    f == 1 || f == 10 || in(12, 14) || f == 20 || in(22, 25) || f == 30 || in(32, 34) ||
 	    f == 43 || in(53, 55) || f == 60 || in(62, 65) || in(70, 74) || f == 80 || f == 81 ||
@@ -526,13 +545,26 @@ void rgfxEndAtUnalignableLinearFormat(MTLPixelFormat format)
 	    in(123, 125) || in(300, 304) || in(313, 315) || in(323, 325) || f == 556 || f == 586 ||
 	    f == 587 || f == 628 || f == 629;
 	if (answered)
+		return RgfxLinearAlignmentAnswer::kAnswered;
+	if (in(130, 135) || in(140, 143) || in(150, 153) || in(240, 241))
+		return RgfxLinearAlignmentAnswer::kCompressed;
+	if (f == 250 || f == 252 || f == 253 || f == 260 || f == 261)
+		return RgfxLinearAlignmentAnswer::kDepthStencil;
+	return RgfxLinearAlignmentAnswer::kInvalid;
+}
+
+void rgfxEndAtUnalignableLinearFormat(MTLPixelFormat format, id<MTLDevice> device)
+{
+	const RgfxLinearAlignmentAnswer a = rgfxLinearAlignmentAnswer(format, device);
+	if (a == RgfxLinearAlignmentAnswer::kAnswered)
 		return;
-	const bool compressed = in(130, 135) || in(140, 143) || in(150, 153) || in(240, 241);
-	const bool depth = f == 250 || f == 252 || f == 253 || f == 260 || f == 261;
-	RgfxMetalAssertionFailed("-[_MTLDevice minimumLinearTextureAlignmentForPixelFormat:]",
-	                         compressed ? @"Linear textures do not support compressed pixel formats"
-	                         : depth    ? @"Linear textures do not support depth/stencil pixel formats"
-	                                    : @"MTLPixelFormatInvalid is not supported on this device.");
+	RgfxMetalAssertionFailed(
+	    "-[_MTLDevice minimumLinearTextureAlignmentForPixelFormat:]",
+	    a == RgfxLinearAlignmentAnswer::kCompressed
+	        ? @"Linear textures do not support compressed pixel formats"
+	    : a == RgfxLinearAlignmentAnswer::kDepthStencil
+	        ? @"Linear textures do not support depth/stencil pixel formats"
+	        : @"MTLPixelFormatInvalid is not supported on this device.");
 }
 
 namespace {

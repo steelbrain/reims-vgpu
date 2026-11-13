@@ -204,7 +204,22 @@ void rgfxEndAtHeapStorageMismatch(MTLTextureDescriptor *descriptor, MTLStorageMo
 /// EAC, ETC2, ASTC, the packed 16-bit ones, D24S8 and X24S8 as the lane answers no
 /// Depth24Stencil8, as the Intel 630 does, Unspecialized, the XR10 formats, the Y'CbCr ones, and
 /// values no format has).
-void rgfxEndAtUnalignableLinearFormat(MTLPixelFormat format);
+/// On an Apple GPU (`device`, rgfxAppleGPU), the M3 Max's rules under macOS 27.0.1 with no
+/// validation layer (oracle_bundle Apple linalign, 11-13, the same raw values): it answers 175
+/// values, among them those the x86 Macs lack but Invalid, D24S8 and X24S8 (B5G6R5, A1BGR5, ABGR4,
+/// sRGB R8 and RG8, Unspecialized, the two-plane and XR10 formats) and values of no name in the SDK
+/// (26, 44, 66, 116, 501, 504, 521, 524, 546 to 548, 560, 562 to 613 and 615 to 629); it ends the
+/// process at every compressed format it has (PVRTC, EAC, ETC2 and ASTC too, and 185, 191, 203,
+/// 209, 221 and 227) with the compressed words, at 651 and 652 too with the depth/stencil words,
+/// and at every other value as Invalid (rgfxLinearAlignmentAnswer).
+void rgfxEndAtUnalignableLinearFormat(MTLPixelFormat format, id<MTLDevice> _Nullable device = nil);
+
+/// What minimumLinearTextureAlignmentForPixelFormat: does at `format` on `device`
+/// (rgfxEndAtUnalignableLinearFormat): answers it, or ends the process as at a compressed format,
+/// a depth or stencil one, or one the device lacks (Invalid).
+enum class RgfxLinearAlignmentAnswer { kAnswered, kCompressed, kDepthStencil, kInvalid };
+RgfxLinearAlignmentAnswer rgfxLinearAlignmentAnswer(MTLPixelFormat format,
+                                                    id<MTLDevice> _Nullable device = nil);
 
 /// Ends the process, with Metal's words, where newTextureWithDescriptor:iosurface:plane: ends it on
 /// the AMD 5300M and the Intel 630 under macOS 26.7.1 (oracle_surftex, docs/graphics-kext/

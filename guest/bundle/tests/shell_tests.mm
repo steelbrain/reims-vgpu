@@ -2551,6 +2551,12 @@ static int dies_case(const char *name)
 		rgfxEndAtUnalignableLinearFormat(static_cast<MTLPixelFormat>(500));
 	if (std::strcmp(name, "linear-alignment-unnamed") == 0)
 		rgfxEndAtUnalignableLinearFormat(static_cast<MTLPixelFormat>(4096));
+	// On an Apple GPU (test_linear_alignment_as_an_apple_gpu).
+	if (std::strncmp(name, "apple-linear-alignment-", 23) == 0) {
+		const unsigned long f = std::strtoul(name + 23, nullptr, 10);
+		rgfxEndAtUnalignableLinearFormat(static_cast<MTLPixelFormat>(f),
+		                                 (id<MTLDevice>)[RgfxAppleFamilyDevice new]);
+	}
 	// A view of test_texture_views' texture: a Private 2D array of four slices and seven levels,
 	// of usage 0x17, in RGBA8Unorm.
 	auto viewOf = [&](MTLPixelFormat format, MTLTextureType type, NSRange levels, NSRange slices,
@@ -3090,6 +3096,84 @@ void test_unalignable_linear_formats_end_the_process()
 	                             586, 587, 628, 629};
 	for (uint64_t f : answered) {
 		rgfxEndAtUnalignableLinearFormat(static_cast<MTLPixelFormat>(f));
+		g_checks++;
+	}
+}
+
+// What minimumLinearTextureAlignmentForPixelFormat: does on the M3 Max under macOS 27.0.1 with no
+// validation layer (oracle_bundle Apple linalign, 11-13), at each raw value from 0 to 799, and at
+// 1000, 1023, 4096 and 65535 (Invalid): runs of values, each answered (kA, 16), or ending the
+// process at a compressed format (kC), a depth or stencil one (kD), or one it lacks (kI).
+enum LinearAnswer { kA, kC, kD, kI };
+struct LinearRun {
+	uint64_t first, last;
+	LinearAnswer answer;
+};
+static const LinearRun kAppleLinearAlignment[] = {
+    {0, 0, kI}, {1, 1, kA}, {2, 9, kI}, {10, 14, kA}, {15, 19, kI}, {20, 20, kA}, {21, 21, kI},
+    {22, 26, kA}, {27, 29, kI}, {30, 34, kA}, {35, 39, kI}, {40, 44, kA}, {45, 52, kI},
+    {53, 55, kA}, {56, 59, kI}, {60, 60, kA}, {61, 61, kI}, {62, 66, kA}, {67, 69, kI},
+    {70, 74, kA}, {75, 79, kI}, {80, 81, kA}, {82, 83, kI}, {84, 85, kA}, {86, 89, kI},
+    {90, 94, kA}, {95, 102, kI}, {103, 105, kA}, {106, 109, kI}, {110, 110, kA}, {111, 111, kI},
+    {112, 116, kA}, {117, 122, kI}, {123, 125, kA}, {126, 129, kI}, {130, 135, kC}, {136, 139, kI},
+    {140, 143, kC}, {144, 149, kI}, {150, 153, kC}, {154, 159, kI}, {160, 167, kC}, {168, 169, kI},
+    {170, 170, kC}, {171, 171, kI}, {172, 172, kC}, {173, 173, kI}, {174, 174, kC}, {175, 175, kI},
+    {176, 176, kC}, {177, 177, kI}, {178, 183, kC}, {184, 184, kI}, {185, 200, kC}, {201, 202, kI},
+    {203, 218, kC}, {219, 220, kI}, {221, 236, kC}, {237, 239, kI}, {240, 241, kC}, {242, 249, kI},
+    {250, 250, kD}, {251, 251, kI}, {252, 253, kD}, {254, 259, kI}, {260, 261, kD}, {262, 262, kI},
+    {263, 263, kA}, {264, 299, kI}, {300, 304, kA}, {305, 312, kI}, {313, 315, kA}, {316, 322, kI},
+    {323, 325, kA}, {326, 499, kI}, {500, 510, kA}, {511, 519, kI}, {520, 530, kA}, {531, 539, kI},
+    {540, 548, kA}, {549, 549, kI}, {550, 556, kA}, {557, 559, kI}, {560, 560, kA}, {561, 561, kI},
+    {562, 613, kA}, {614, 614, kI}, {615, 629, kA}, {630, 650, kI}, {651, 652, kD}, {653, 799, kI},
+    {1000, 1000, kI}, {1023, 1023, kI}, {4096, 4096, kI}, {65535, 65535, kI},
+};
+
+// On a device that answers as an Apple GPU, minimumLinearTextureAlignmentForPixelFormat: answers
+// and ends the process as the M3 Max does at every raw value it was asked (kAppleLinearAlignment),
+// in the x86 Macs' words for each kind; the x86 Macs' rules stay where the device answers no Apple
+// family: the 64 values they answer (test_unalignable_linear_formats_end_the_process) and none
+// other. An arm64 guest's device takes the M3's.
+void test_linear_alignment_as_an_apple_gpu()
+{
+	id<MTLDevice> apple = (id<MTLDevice>)[RgfxAppleFamilyDevice new];
+	id<MTLDevice> guest = (id<MTLDevice>)[RgfxGuestRulesDevice new];
+#if defined(__arm64__)
+	const bool guestApple = true;
+#else
+	const bool guestApple = false;
+#endif
+	const RgfxLinearAlignmentAnswer kinds[] = {
+	    RgfxLinearAlignmentAnswer::kAnswered, RgfxLinearAlignmentAnswer::kCompressed,
+	    RgfxLinearAlignmentAnswer::kDepthStencil, RgfxLinearAlignmentAnswer::kInvalid};
+	uint64_t asked = 0, answered = 0;
+	for (const LinearRun &r : kAppleLinearAlignment)
+		for (uint64_t f = r.first; f <= r.last; f++) {
+			const MTLPixelFormat format = static_cast<MTLPixelFormat>(f);
+			CHECK(rgfxLinearAlignmentAnswer(format, apple) == kinds[r.answer]);
+			CHECK((rgfxLinearAlignmentAnswer(format, guest) == kinds[r.answer]) ==
+			      (guestApple || rgfxLinearAlignmentAnswer(format, nil) == kinds[r.answer]));
+			asked++;
+			answered += r.answer == kA;
+		}
+	CHECK(asked == 804 && answered == 175);
+	uint64_t x86 = 0;
+	for (uint64_t f = 0; f < 800; f++)
+		x86 += rgfxLinearAlignmentAnswer(static_cast<MTLPixelFormat>(f), nil) ==
+		       RgfxLinearAlignmentAnswer::kAnswered;
+	CHECK(x86 == 64);
+	const char *const kWhere = "-[_MTLDevice minimumLinearTextureAlignmentForPixelFormat:]: failed "
+	                           "assertion `";
+	checkDies("apple-linear-alignment-204",
+	          (std::string(kWhere) + "Linear textures do not support compressed pixel formats'")
+	              .c_str());
+	checkDies("apple-linear-alignment-651",
+	          (std::string(kWhere) + "Linear textures do not support depth/stencil pixel formats'")
+	              .c_str());
+	checkDies("apple-linear-alignment-255",
+	          (std::string(kWhere) + "MTLPixelFormatInvalid is not supported on this device.'")
+	              .c_str());
+	for (uint64_t f : {40, 263, 500, 554, 600}) {
+		rgfxEndAtUnalignableLinearFormat(static_cast<MTLPixelFormat>(f), apple);
 		g_checks++;
 	}
 }
@@ -19049,6 +19133,7 @@ int main(int argc, char **argv)
 		test_invalid_surface_textures_end_the_process();
 		test_surface_textures_as_an_apple_gpu();
 		test_unalignable_linear_formats_end_the_process();
+		test_linear_alignment_as_an_apple_gpu();
 		test_memoryless_icb_ends_the_process();
 		test_texture_views();
 		test_metal_ended_views_end_the_process();
