@@ -250,6 +250,17 @@ void syncAsCommitted(std::initializer_list<id> textures);
 }
 @end
 
+// The same as an Apple GPU's device (every Apple family).
+@interface RgfxAppleTestDylibDevice : RgfxTestDylibDevice
+- (BOOL)supportsFamily:(MTLGPUFamily)family;
+@end
+@implementation RgfxAppleTestDylibDevice
+- (BOOL)supportsFamily:(MTLGPUFamily)family
+{
+	return family >= MTLGPUFamilyApple1 && family <= MTLGPUFamilyApple9;
+}
+@end
+
 namespace {
 
 // A ring + id space + serialiser over a plain-buffer region, the fixture every
@@ -5114,8 +5125,9 @@ void test_dynamic_library_routing()
 // from the file it names (from the executable's directory, or the directory of the file of the
 // library naming it), each once, and those libraries' own after. A name no file loads refuses the
 // pipeline as the AMD 5300M does, beside a preloaded library or not; so does a name a library made
-// of no file names, its file there or not, the kernel's or a preloaded library's, and a preloaded
-// library of no device of ours; none posts a create.
+// of no file names, its file there or not, the kernel's or a preloaded library's (but on an Apple
+// GPU, an @executable_path name of the kernel's library loads), and a preloaded library of no
+// device of ours; none posts a create.
 void test_compute_pipeline_libraries()
 {
 	Answering &a = *new Answering();
@@ -5244,6 +5256,42 @@ void test_compute_pipeline_libraries()
 		CHECK([error.domain isEqualToString:@"CompilerError"] && error.code == 2);
 		CHECK(device.asked.count == 0);
 	}
+	// On an Apple GPU the library of no file loads liba from the executable's directory, as the M3
+	// Max does (oracle_fnptr Apple, macOS 27.0.1), beside dylibA preloaded or not; a name of the
+	// loader's directory, which a library of no file has none of, still refuses it.
+	RgfxAppleTestDylibDevice *appleDevice = [[RgfxAppleTestDylibDevice alloc] init];
+	appleDevice.make = device.make;
+	for (NSArray *preloaded in @[ @[], @[ dylibA ] ]) {
+		ofBytes.preloadedLibraries = preloaded;
+		[appleDevice.asked removeAllObjects];
+		CHECK([RgfxComputePipelineState computePipelineStateWithDescriptor:ofBytes
+		                                                            device:(id<MTLDevice>)appleDevice
+		                                                        serializer:&a.ser
+		                                                             error:nil] != nil);
+		CHECK(appleDevice.asked.count == 2 &&
+		      [appleDevice.asked[0] isEqualToString:[exeDir stringByAppendingPathComponent:@"liba.metallib"]]);
+	}
+	RgfxLibrary *loaderLib = [RgfxLibrary libraryWithData:kernelBytes.data()
+	                                               length:kernelBytes.size()
+	                                                  key:nullptr
+	                                               device:nil
+	                                           serializer:&a.ser
+	                                               status:&status];
+	std::vector<uint8_t> loaderSource = linkedMetallib("", {"@loader_path/liba.metallib"}, false);
+	[loaderLib rgfxSetSource:dispatch_data_create(loaderSource.data(), loaderSource.size(), nullptr,
+	                                              DISPATCH_DATA_DESTRUCTOR_DEFAULT)
+	             shadowMaker:noShadow()];
+	MTLComputePipelineDescriptor *ofLoader = [[MTLComputePipelineDescriptor alloc] init];
+	ofLoader.computeFunction = [loaderLib newFunctionWithName:@"k"];
+	[appleDevice.asked removeAllObjects];
+	error = nil;
+	CHECK([RgfxComputePipelineState computePipelineStateWithDescriptor:ofLoader
+	                                                            device:(id<MTLDevice>)appleDevice
+	                                                        serializer:&a.ser
+	                                                             error:&error] == nil);
+	CHECK([error.domain isEqualToString:@"CompilerError"] && error.code == 2 && appleDevice.asked.count == 0);
+	ofBytes.preloadedLibraries = @[];
+	creates = a.of(RGFX_CMD_COMPUTE_PIPELINE_CREATE).size();
 	// A preloaded dynamic library of no file that names liba refuses the kernel of a file too.
 	RgfxDynamicLibrary *dylibC = [RgfxDynamicLibrary
 	    dynamicLibraryOfLibrary:linkedLibrary(a.ser, linkedMetallib("@executable_path/libc.metallib",

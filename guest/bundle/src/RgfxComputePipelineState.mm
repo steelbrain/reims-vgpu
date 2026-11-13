@@ -4,6 +4,7 @@
  */
 
 #import "RgfxComputePipelineState.h"
+#import "RgfxTexture.h" // rgfxAppleGPU
 #include "RgfxLogOnce.hpp"
 
 #import <objc/message.h>
@@ -151,14 +152,21 @@ NSArray *arrayOf(id object, std::initializer_list<const char *> names)
 /// alone: a name that a library made of bytes or of source names refuses the pipeline, where its
 /// file is there too (measured: the 5300M and the Intel UHD Graphics 630, macOS 26.7.1,
 /// oracle_fnptr's "linked data bare" and "source", where "by install name", the same bytes read
-/// from their file, makes it). False and the error where a preloaded library is not one of ours, a library of no file
-/// names an install name, or a name loads no dynamic library, as none does where the host makes
+/// from their file, makes it). On an Apple GPU (rgfxAppleGPU) a library made of bytes or of source
+/// loads its @executable_path names too: the M3 Max makes both those pipelines, bare and
+/// preloaded, and they run as the file's (measured: macOS 27.0.1, oracle_fnptr Apple); its
+/// @loader_path names, which no file is the loader of, still refuse it (not measured). False and
+/// the error where a preloaded library is not one of ours, a library of no file names an install
+/// name (but as above), or a name loads no dynamic library, as none does where the host makes
 /// none: the host is never left to load one from a file of its own.
 bool pipelineLibraries(MTLComputePipelineDescriptor *descriptor, RgfxFunction *kernel,
                        id<MTLDevice> device, NSMutableArray *held,
                        std::vector<RgfxPipelineLibraryRef> &refs, std::deque<std::string> &names,
                        NSError *__autoreleasing *error)
 {
+	// On an Apple GPU a library of no file loads its names from the executable's directory too.
+	const bool apple = rgfxAppleGPU(device);
+	static const std::string executable = "@executable_path/";
 	std::set<std::string> loadedNames;
 	std::deque<std::pair<std::string, NSURL *>> pending;
 	auto dependenciesOf = [&](RgfxResource *resource) {
@@ -199,7 +207,7 @@ bool pipelineLibraries(MTLComputePipelineDescriptor *descriptor, RgfxFunction *k
 	while (!pending.empty()) {
 		auto [name, loader] = std::move(pending.front());
 		pending.pop_front();
-		if (loader == nil) {
+		if (loader == nil && !(apple && name.compare(0, executable.size(), executable) == 0)) {
 			if (error)
 				*error = unresolvedLibraryError(name);
 			return false;
