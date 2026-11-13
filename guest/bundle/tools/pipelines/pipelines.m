@@ -45,7 +45,12 @@
 //             each kernel from the first that holds it): each one's newFunctionWithName: (fn, its
 //             first in this process, then again: fn2), newFunctionWithName:constantValues:error:
 //             with each of its function constants 0 (spec), its compute pipeline (cp, then again:
-//             cp2). A second process shows what outlives the first (the host's caches).
+//             cp2). A second process shows what outlives the first (the host's caches). Metal
+//             refuses the zeros of a kernel they put two present arguments of at one location
+//             (cnnConvArray_32x32_128's: "texture argument src has invalid location (<0,1>)",
+//             measured: macOS 26.7.1, the AMD Radeon Pro 5300M): listed as spec_refused, its
+//             first error line after it, and it makes no pipeline. A pipeline refused fails the
+//             case.
 //   draw.first       a pipeline of a fresh library, then a command buffer of one draw into a
 //             256 x 256 target, commit to completed (first), then the same buffer again (next):
 //             the first draw's stall is first - next.
@@ -608,6 +613,7 @@ static NSString *mpsFunctions(void)
 	               *spec = [NSMutableArray array], *cp = [NSMutableArray array],
 	               *cp2 = [NSMutableArray array];
 	int absent = 0, refused = 0, constants = 0;
+	NSMutableArray<NSString *> *specRefused = [NSMutableArray array];
 	for (size_t i = 0; i < sizeof kMpsKernels / sizeof kMpsKernels[0]; i++) {
 		NSString *name = kMpsKernels[i];
 		id<MTLLibrary> lib = nil;
@@ -631,7 +637,9 @@ static NSString *mpsFunctions(void)
 		id<MTLFunction> s = [lib newFunctionWithName:name constantValues:values error:&err];
 		[spec addObject:@(ms(t0))];
 		if (s == nil) {
-			refused++;
+			NSString *why = [err.localizedDescription componentsSeparatedByString:@"\n"].firstObject ?: @"no error";
+			[specRefused addObject:[NSString stringWithFormat:@"%@ (%@ %ld: %@)", name, err.domain,
+			                                                  (long)err.code, why]];
 			continue;
 		}
 		t0 = now();
@@ -646,10 +654,13 @@ static NSString *mpsFunctions(void)
 	NSMutableArray *libText = [NSMutableArray array];
 	for (NSNumber *m in libMs)
 		[libText addObject:[NSString stringWithFormat:@"%.2f", m.doubleValue]];
-	return [NSString stringWithFormat:@"lib_ms=%@ kernels=%lu absent=%d refused=%d constants=%d %@ %@ %@ %@ %@",
+	return [NSString stringWithFormat:@"%@lib_ms=%@ kernels=%lu absent=%d refused=%d constants=%d %@ %@ %@ %@ %@ "
+	                                  @"spec_refused=%lu %@",
+	                                  refused ? @"FAIL a pipeline refused: " : @"",
 	                                  [libText componentsJoinedByString:@","], (unsigned long)fn.count,
 	                                  absent, refused, constants, stat(@"fn", fn), stat(@"fn2", fn2),
-	                                  stat(@"spec", spec), stat(@"cp", cp), stat(@"cp2", cp2)];
+	                                  stat(@"spec", spec), stat(@"cp", cp), stat(@"cp2", cp2),
+	                                  (unsigned long)specRefused.count, [specRefused componentsJoinedByString:@"; "]];
 }
 
 // heapTextureSizeAndAlignWithDescriptor: of a private RGBA8 texture of a fresh width each
