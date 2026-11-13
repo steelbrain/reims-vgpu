@@ -11,9 +11,12 @@
 //! - user networking with virtio-net, and an optional SSH port forward; with networking off,
 //!   `-nic none`, without which QEMU gives the machine its default NIC on user networking (on
 //!   q35 an e1000e in the first free slot, 1, where the root port's address is);
-//! - a virtio sound device on the host's audio backend, one output stream and one input stream,
-//!   which x86-64 macOS's AppleVirtIOSound drives (docs/qemu.md, "x86-64 macOS guests: audio"):
-//!   Safari's Media Source players fail without an output device; and an ICH9 Intel HDA
+//! - two virtio sound devices on the host's audio backend, which x86-64 macOS's AppleVirtIOSound
+//!   drives (docs/qemu.md, "x86-64 macOS guests: audio"): one with an output stream alone, since
+//!   Safari's Media Source players fail without an output device, and one with an input stream
+//!   alone, so a recording starts the guest's input whether or not an output plays (on one device
+//!   with both, the guest starts the input with each output and stops reading it, and a recording
+//!   made while an output plays gets nothing); and an ICH9 Intel HDA
 //!   controller with a line-out codec on that backend, for OpenCore's boot chime: its AudioDxe
 //!   drives HDA, not virtio sound, and x86-64 macOS 26 has no HDA driver, so the guest's only
 //!   output is the virtio device;
@@ -325,7 +328,9 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         push(&["-audiodev", &audiodev(vm, ctx)]);
         push(&[
             "-device",
-            "virtio-sound-pci,id=audio,audiodev=snd0,addr=0x7",
+            "virtio-sound-pci,id=audio,audiodev=snd0,addr=0x7,streams=1",
+            "-device",
+            "virtio-sound-pci,id=audioin,audiodev=snd0,addr=0x8,streams=1,input-streams=1",
         ]);
         // At ICH9's own slot for it.
         push(&["-device", "ich9-intel-hda,id=hda,addr=0x1b"]);
@@ -551,7 +556,9 @@ mod tests {
             &["-audiodev", "pipewire,id=snd0"],
             &[
                 "-device",
-                "virtio-sound-pci,id=audio,audiodev=snd0,addr=0x7",
+                "virtio-sound-pci,id=audio,audiodev=snd0,addr=0x7,streams=1",
+                "-device",
+                "virtio-sound-pci,id=audioin,audiodev=snd0,addr=0x8,streams=1,input-streams=1",
             ],
             &["-device", "ich9-intel-hda,id=hda,addr=0x1b"],
             &["-device", "hda-output,bus=hda.0,audiodev=snd0"],

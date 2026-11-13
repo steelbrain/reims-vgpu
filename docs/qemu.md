@@ -763,16 +763,20 @@ on `reims-graphics-pci` it is **unknown**.
 
 ### x86-64 macOS guests: audio
 
-reims-ctl gives every VM a virtio sound device, with one output and one
-input stream:
+reims-ctl gives every VM two virtio sound devices, one with an output
+stream alone and one with an input stream alone (vendor/qemu's
+`input-streams` property):
 
 ```sh
--audiodev pipewire,id=snd0 -device virtio-sound-pci,audiodev=snd0,addr=0x7
+-audiodev pipewire,id=snd0
+-device virtio-sound-pci,id=audio,audiodev=snd0,addr=0x7,streams=1
+-device virtio-sound-pci,id=audioin,audiodev=snd0,addr=0x8,streams=1,input-streams=1
 ```
 
 macOS's `AppleVirtIO` kext has `AppleVirtIOSound`, matching virtio device
 0x19. **Measured**
-with a macOS 26.7.2 (25G332) x86-64 guest on reims-ctl's q35 command, on a
+with a macOS 26.7.2 (25G332) x86-64 guest on reims-ctl's q35 command with
+one device of both streams (`virtio-sound-pci,audiodev=snd0,addr=0x7`), on a
 Radeon 780M host:
 - `AppleVirtIOPCITransport` binds the device (`pci1af4,1059`), with
   `AppleVirtIOSound` and its user client on it. Core Audio lists one
@@ -785,9 +789,9 @@ Radeon 780M host:
 - Safari's Media Source player plays H.264 with AAC (fragmented MP4) and
   VP9 with Opus (WebM) to the end, and their audio reaches QEMU.
 
-The guest starts its input stream with each output stream, and reads it
-only at first. **Measured** with the 26.7.2 guest on reims-ctl's audio
-devices, on a host whose PipeWire default source is an analog input and
+On one device of both streams, the guest starts its input stream with each
+output stream, and reads it only at first. **Measured** with the 26.7.2
+guest on that device, on a host whose PipeWire default source is an analog input and
 whose sink is the dummy `auto_null` (homelab-um790's Radeon 780M,
 2026-11-12, QEMU's `virtio_snd_*` traces):
 - Each `afplay` sets up and starts stream 1, the input, with stream 0,
@@ -828,6 +832,40 @@ whose sink is the dummy `auto_null` (homelab-um790's Radeon 780M,
   `sshd-keygen-wrapper`; a boot answers it over QMP (`input-send-event`
   on the usb-tablet at its Allow button).
 - A host with no source (um870, ms01) runs no capture cycles.
+
+Why, read from the code of AppleVirtIOSound's HAL plug-in (the x86_64
+slice of macOS 27.0.1's `AppleVirtIOSound.driver`, disassembled for this
+and not committed): the plug-in makes one Core Audio device of each
+virtio-snd device, with all of its streams, and starts them together. It
+posts an input stream's receive buffers at the stream's start (four) and
+again at each one's completion while its ring buffer has room, and a
+client's read takes from that ring. On a device started for an output,
+nothing reads the input's ring, which fills, and the posting ends until
+the device stops.
+
+So reims-ctl gives the input a device of its own. **Measured** with the
+26.7.2 guest on the two devices above and, as the control, on the one
+device of both streams, one cold boot each on the same host with the same
+phases (homelab-um790's Radeon 780M, 2026-11-13, vendor/qemu 1422502b,
+QEMU's `virtio_snd_*` traces; the harness named the sink as the capture's
+target, and the default source, an analog input, ran in its place):
+- Core Audio lists two devices named "Apple Virtual Sound Device": one with
+  2 input channels, the default input, and one with 2 output channels,
+  the default output and system output. Each `AppleVirtIOSound` has one
+  stream.
+- An `afplay` starts the output device's stream alone: the input stays
+  stopped, and the host's source suspended, through plays of 25 and 50 s.
+- A 10 s recording started 20 s into a 50 s play starts the input
+  device's stream 0.65 s after its command, and the guest posts receive
+  buffers to its end, 117 of them, at most 0.13 s apart. The host's
+  default source runs with it, no read found more than 2,824 bytes
+  waiting, and the recording holds the source's audio in each of its 10
+  seconds (98.7% of its samples non-zero; that host's analog input carries
+  full-scale noise). On the one device the same recording got no receive
+  buffer and no captured read: its first 2 s hold samples from before it,
+  and its other 8 s are zeros.
+- A recording alone runs as on the one device: 94 receive buffers in 8 s,
+  and the source's audio in each second.
 
 
 `pa` in place of `pipewire` uses PulseAudio, and `none` gives the guest a

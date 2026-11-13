@@ -331,8 +331,8 @@ pub struct CreateArgs {
     /// Keep the library's log and the serial console
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub logs: Option<bool>,
-    /// A virtio sound device on the host's sound, with a microphone, and the HDA controller
-    /// OpenCore's boot chime plays on
+    /// Two virtio sound devices on the host's sound, a speaker and a microphone, and the HDA
+    /// controller OpenCore's boot chime plays on
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub audio: Option<bool>,
     /// Its network card (user-mode NAT); --network false makes it with none, as an offline

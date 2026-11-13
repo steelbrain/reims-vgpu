@@ -1584,8 +1584,8 @@ impl App {
                 "audio",
                 "Audio",
                 c.audio.enabled,
-                "A virtio sound device on the host's sound, with a microphone, and the HDA \
-                 controller OpenCore's boot chime plays on.",
+                "Two virtio sound devices on the host's sound, a speaker and a microphone, and \
+                 the HDA controller OpenCore's boot chime plays on.",
             ),
             Field::toggle(
                 "logs",
