@@ -23,7 +23,30 @@ RgfxStencilDescriptor RgfxStencilOf(MTLStencilDescriptor *s)
 	return out;
 }
 
-@implementation RgfxDepthStencilState
+namespace {
+
+// Whether a face of a descriptor writes the stencil, and whether it reads it, as the M3 Max's
+// states answer (below).
+bool faceWritesStencil(MTLStencilDescriptor *s)
+{
+	return s.writeMask != 0 && (s.stencilFailureOperation != MTLStencilOperationKeep ||
+	                            s.depthFailureOperation != MTLStencilOperationKeep ||
+	                            s.depthStencilPassOperation != MTLStencilOperationKeep);
+}
+
+bool faceReadsStencil(MTLStencilDescriptor *s)
+{
+	return faceWritesStencil(s) ||
+	       (s.readMask != 0 && s.stencilCompareFunction != MTLCompareFunctionAlways &&
+	        s.stencilCompareFunction != MTLCompareFunctionNever);
+}
+
+} // namespace
+
+@implementation RgfxDepthStencilState {
+	// What the descriptor reads and writes, as an Apple GPU's state answers (below).
+	BOOL _readsDepth, _writesDepth, _readsStencil, _writesStencil;
+}
 
 // The host drops the state as the app lets it go, after any command buffer that names it (each
 // keeps it while it runs).
@@ -52,6 +75,15 @@ RgfxStencilDescriptor RgfxStencilOf(MTLStencilDescriptor *s)
 	// The descriptor's label, nil for an empty one (measured on the M3 Max under macOS 27).
 	if (state != nil && descriptor.label.length != 0)
 		state.label = descriptor.label;
+	if (state != nil) {
+		const MTLCompareFunction depth = descriptor.depthCompareFunction;
+		MTLStencilDescriptor *f = descriptor.frontFaceStencil, *b = descriptor.backFaceStencil;
+		state->_writesDepth = descriptor.depthWriteEnabled;
+		state->_readsDepth = descriptor.depthWriteEnabled ||
+		                     (depth != MTLCompareFunctionAlways && depth != MTLCompareFunctionNever);
+		state->_writesStencil = faceWritesStencil(f) || faceWritesStencil(b);
+		state->_readsStencil = faceReadsStencil(f) || faceReadsStencil(b);
+	}
 	return state;
 }
 
@@ -59,25 +91,34 @@ RgfxStencilDescriptor RgfxStencilOf(MTLStencilDescriptor *s)
 // them unguarded, read from its code). The AMD 5300M's states (GFX10_MtlDepthStencilState) and
 // the Intel 630's (MTLIGDepthStencilState) answer YES to each for every descriptor asked: the
 // default one, depth tests with and without writes, stencil tests, stencil replaces, and a
-// replace with a write mask of 0 (measured: macOS 26.7.1). So does this.
+// replace with a write mask of 0 (measured: macOS 26.7.1). So does this, but on an Apple GPU
+// (rgfxAppleGPU), whose states answer what the descriptor reads and writes (measured: the M3 Max
+// under macOS 27.0.1, oracle_bundle Apple ds.queries and ds.grid, 717 descriptors: every depth
+// compare with and without writes, every stencil compare of either face with each operation set
+// and read and write masks of 0, 1 and 0xff, under the depth tests Always, Never and Less):
+//  - writesDepth: the depth write is enabled;
+//  - readsDepth: it is, or the depth compare is neither Always nor Never;
+//  - writesStencil: a face's write mask is not 0 and one of its three operations is not Keep;
+//  - readsStencil: a face writes it, or its read mask is not 0 and its compare is neither Always
+//    nor Never.
 - (BOOL)readsDepth
 {
-	return YES;
+	return rgfxAppleGPU(self.device) ? _readsDepth : YES;
 }
 
 - (BOOL)writesDepth
 {
-	return YES;
+	return rgfxAppleGPU(self.device) ? _writesDepth : YES;
 }
 
 - (BOOL)readsStencil
 {
-	return YES;
+	return rgfxAppleGPU(self.device) ? _readsStencil : YES;
 }
 
 - (BOOL)writesStencil
 {
-	return YES;
+	return rgfxAppleGPU(self.device) ? _writesStencil : YES;
 }
 
 // The state's id in an argument buffer or an indirect command buffer, which no x86 Mac's state

@@ -10480,6 +10480,65 @@ void test_gl_renderer_spi()
 			                                                                        serializer:&f.ser];
 			CHECK(ds != nil && [ds readsDepth] && [ds writesDepth] && [ds readsStencil] && [ds writesStencil]);
 		}
+		// On an Apple GPU each answers what the descriptor reads and writes, as the M3 Max's states
+		// do (oracle_bundle Apple ds.queries and ds.grid, macOS 27.0.1): the descriptor, then
+		// readsDepth, writesDepth, readsStencil and writesStencil.
+		auto face = [](MTLCompareFunction c, MTLStencilOperation sf, MTLStencilOperation df, MTLStencilOperation p,
+		               uint32_t rm, uint32_t wm) {
+			MTLStencilDescriptor *s = [MTLStencilDescriptor new];
+			s.stencilCompareFunction = c;
+			s.stencilFailureOperation = sf;
+			s.depthFailureOperation = df;
+			s.depthStencilPassOperation = p;
+			s.readMask = rm;
+			s.writeMask = wm;
+			return s;
+		};
+		auto depth = [](MTLCompareFunction c, BOOL write) {
+			MTLDepthStencilDescriptor *d = [MTLDepthStencilDescriptor new];
+			d.depthCompareFunction = c;
+			d.depthWriteEnabled = write;
+			return d;
+		};
+		const MTLStencilOperation keep = MTLStencilOperationKeep, replace = MTLStencilOperationReplace;
+		MTLDepthStencilDescriptor *never = depth(MTLCompareFunctionNever, NO);
+		MTLDepthStencilDescriptor *neverWrites = depth(MTLCompareFunctionNever, YES);
+		MTLDepthStencilDescriptor *alwaysWrites = depth(MTLCompareFunctionAlways, YES);
+		MTLDepthStencilDescriptor *less = depth(MTLCompareFunctionLess, NO);
+		MTLDepthStencilDescriptor *equal = depth(MTLCompareFunctionAlways, NO);
+		equal.frontFaceStencil = face(MTLCompareFunctionEqual, keep, keep, keep, 0xff, 0xff);
+		MTLDepthStencilDescriptor *equalNoReads = depth(MTLCompareFunctionAlways, NO);
+		equalNoReads.frontFaceStencil = face(MTLCompareFunctionEqual, keep, keep, keep, 0, 0xff);
+		MTLDepthStencilDescriptor *alwaysReplaces = depth(MTLCompareFunctionAlways, NO);
+		alwaysReplaces.backFaceStencil = face(MTLCompareFunctionAlways, keep, keep, replace, 0xff, 0xff);
+		MTLDepthStencilDescriptor *replacesNothing = depth(MTLCompareFunctionAlways, NO);
+		replacesNothing.frontFaceStencil = face(MTLCompareFunctionAlways, keep, keep, replace, 0xff, 0);
+		MTLDepthStencilDescriptor *neverFails = depth(MTLCompareFunctionAlways, NO);
+		neverFails.frontFaceStencil = face(MTLCompareFunctionNever, replace, keep, keep, 0xff, 0x0f);
+		const struct {
+			MTLDepthStencilDescriptor *d;
+			BOOL rd, wd, rs, ws;
+		} kApple[] = {
+		    {none, NO, NO, NO, NO},           {both, YES, YES, YES, YES},
+		    {never, NO, NO, NO, NO},          {neverWrites, YES, YES, NO, NO},
+		    {alwaysWrites, YES, YES, NO, NO}, {less, YES, NO, NO, NO},
+		    {equal, NO, NO, YES, NO},         {equalNoReads, NO, NO, NO, NO},
+		    {alwaysReplaces, NO, NO, YES, YES}, {replacesNothing, NO, NO, NO, NO},
+		    {neverFails, NO, NO, YES, YES},
+		};
+		id apple = [RgfxAppleFamilyDevice new]; // held: a state keeps its device weakly
+		for (const auto &k : kApple) {
+			RgfxDepthStencilState *ds = [RgfxDepthStencilState depthStencilStateWithDescriptor:k.d
+			                                                                            device:(id<MTLDevice>)apple
+			                                                                        serializer:&f.ser];
+			CHECK(ds != nil && [ds readsDepth] == k.rd && [ds writesDepth] == k.wd && [ds readsStencil] == k.rs &&
+			      [ds writesStencil] == k.ws);
+			// An x86 guest's device answers YES to each, whatever the descriptor.
+			RgfxDepthStencilState *x86 = [RgfxDepthStencilState depthStencilStateWithDescriptor:k.d
+			                                                                             device:nil
+			                                                                         serializer:&f.ser];
+			CHECK(x86 != nil && [x86 readsDepth] && [x86 writesDepth] && [x86 readsStencil] && [x86 writesStencil]);
+		}
 	}
 }
 
