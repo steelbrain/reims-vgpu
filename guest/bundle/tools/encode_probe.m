@@ -22,6 +22,9 @@
 //                                its buffer, as an app's reference counting may wrap a call:
 //                                what two locked instructions a call add on the encoding thread.
 //   render.setVertexBytes.16     setVertexBytes:length:atIndex: of 16 bytes, index 1.
+//   render.setVertexBytes.16.retained  the same, each call followed by a CFRetain and a CFRelease
+//                                of a buffer: what two locked instructions right after the copy
+//                                of the bytes add, to set against render.setVertexBuffer.retained's.
 //   render.setVertexBytes.4k     the same of 4096 bytes.
 //   render.setFragmentTexture    setFragmentTexture:atIndex: of 8 Private 64 x 64 RGBA8 textures
 //                                in turn, index 0.
@@ -199,6 +202,7 @@ typedef enum {
 	kRenderSetVertexBuffer,
 	kRenderSetVertexBufferRetained,
 	kRenderSetVertexBytes16,
+	kRenderSetVertexBytes16Retained,
 	kRenderSetVertexBytes4k,
 	kRenderSetFragmentTexture,
 	kRenderSetFragmentSampler,
@@ -260,6 +264,13 @@ static Rep renderRep(Case c, int n)
 		case kRenderSetVertexBytes16:
 			for (int i = 0; i < n; i++)
 				[e setVertexBytes:gBytes length:16 atIndex:1];
+			break;
+		case kRenderSetVertexBytes16Retained:
+			for (int i = 0; i < n; i++) {
+				[e setVertexBytes:gBytes length:16 atIndex:1];
+				CFTypeRef b = CFRetain((__bridge CFTypeRef)gBuffers[i & 7]);
+				CFRelease(b);
+			}
 			break;
 		case kRenderSetVertexBytes4k:
 			for (int i = 0; i < n; i++)
@@ -626,6 +637,7 @@ int main(int argc, char **argv)
 		runCase("render.setVertexBuffer", kRenderSetVertexBuffer);
 		runCase("render.setVertexBuffer.retained", kRenderSetVertexBufferRetained);
 		runCase("render.setVertexBytes.16", kRenderSetVertexBytes16);
+		runCase("render.setVertexBytes.16.retained", kRenderSetVertexBytes16Retained);
 		runCase("render.setVertexBytes.4k", kRenderSetVertexBytes4k);
 		runCase("render.setFragmentTexture", kRenderSetFragmentTexture);
 		runCase("render.setFragmentSamplerState", kRenderSetFragmentSampler);
