@@ -1355,7 +1355,7 @@ impl Swapchain {
             };
             // A recovery as the texture was made puts it on the new `VkDevice`, over an image of
             // the old one.
-            if !self.generation.is_of(texture.device()) {
+            if !self.generation.is_of(&texture.device()) {
                 drop(texture);
                 return Err(undo(
                     images,

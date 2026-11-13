@@ -1319,7 +1319,7 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
                         )
                     }
                 })?;
-                made.made(self.raw.device());
+                made.made(&self.raw.device());
                 Ok(())
             },
         )
@@ -2125,7 +2125,7 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                         )
                     }
                 })?;
-                made.made(self.raw.device());
+                made.made(&self.raw.device());
                 Ok(())
             },
         )

@@ -814,7 +814,7 @@ fn destination(
 ) -> Result<(vk::Buffer, u64), CopyError> {
     let refused = |why: String| CopyError::Refused(why);
     let buffer = &copy.to.raw;
-    if !generation.is_of(buffer.device()) {
+    if !generation.is_of(&buffer.device()) {
         return Err(refused(
             "the buffer was made on the device's VkDevice before its recovery".to_owned(),
         ));
@@ -963,7 +963,7 @@ mod tests {
         );
         let objects = copier.objects.as_ref().expect("the copier's objects");
         assert!(objects.generation.serves(&copier.queue));
-        assert!(objects.generation.is_of(device.raw.new_fence().device()));
+        assert!(objects.generation.is_of(&device.raw.new_fence().device()));
         assert!(copier.copy(&[], Box::new(())).is_ok());
         assert_eq!(copier.generations(), 2, "made again once");
     }

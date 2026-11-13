@@ -58,7 +58,7 @@ impl std::fmt::Debug for Generation {
 
 /// The generation of `device`'s line that serves now: the device of a fence made on it.
 fn generation_serving(device: &rt::Device) -> rt::Device {
-    device.new_fence().device().clone()
+    device.new_fence().device()
 }
 
 /// The `VkDevice` of `generation`, a generation handle (an object's device, or one
@@ -173,7 +173,7 @@ mod tests {
         let before = device.new_fence();
         // The runtime carries a fence across a recovery, so its `device()` later answers the
         // generation it was carried to: the handle taken now is the old generation's.
-        let before_device = before.device().clone();
+        let before_device = before.device();
         assert!(first.is_of(&before_device));
 
         device.recover_for_test().expect("the recovery");
@@ -195,7 +195,7 @@ mod tests {
             Some(second.queue)
         );
         let after = device.new_fence();
-        assert!(second.is_of(after.device()));
+        assert!(second.is_of(&after.device()));
         assert!(!second.is_of(&before_device));
         // The old generation's handles still answer its own `VkDevice` while it is held.
         // SAFETY: only the handle is read, while `first` lives.
