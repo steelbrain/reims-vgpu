@@ -850,6 +850,124 @@ Stages:
       32768). Left at IOSurface's own INT_MAX, Safari 16.6 under macOS 13
       drew no tiles of a page that scrolls only vertically at 1x
       (**measured**, 13.7.8; docs/lessons.md).
+    - **Measured, 2026-11-13: surfaces in place first on a GPU of its own
+      memory.** A host whose GPU has memory of its own caches every surface
+      (*The device cache*, above). The unlanded branch `steelbrain/routeb`
+      has such a host offer what a GPU that shares the CPU's memory offers
+      (`SURFACE_CACHE_REFUSED`, `SURFACE_DEFERRED_ASK` and
+      `SURFACE_DEFERRED_CARRY`, never `SURFACE_CACHE` or
+      `SURFACE_DEFERRED`), so every surface lies in place first and takes a
+      device cache only where its pages cannot serve (*Device caches on a
+      GPU that shares the CPU's memory*, above). One walk per GPU, the same
+      in each run: the desktop, Finder, Launchpad, Mission Control, Safari
+      (a page's scroll and autoscroll, WebGL, a GL 3D page, a video) and
+      Maps. Each GPU ran it on development at b615cec64 and on the branch
+      over the same base, and the runs counted the compositor's presents,
+      the GPU's busy time per present, and the bytes on the GPU's link
+      (`nvidia-smi dmon`). In place first laid 3800 to 6900 textures in
+      place where the base laid 240 to 590, and on the NVIDIA GPUs the link
+      then carried 100 to 560 MB a present where the base's carried 1 to
+      44 MB: the GPU reads the layers it composites from guest RAM at each
+      present, changed or not.
+      - RTX 5080 (laptop, PCIe 5.0 x16): presents 6839 to 6415 (-6%), GPU
+        time 2.6 to 7.8 ms a present. Safari's scroll fell from 636
+        presents to 543, its longest gaps (p99) from 92 to 309 ms. The link
+        carried 130 MB/s to 6.6 GB/s over the walk, 16 GB/s at Launchpad.
+      - RX 7900 XTX (PCIe 4.0 x16): level, 5468 presents to 5503, 3.4 to
+        3.8 ms a present; the GL 3D page's GPU time 2.0 to 4.5 ms a present.
+        Its link's bytes were not read: amdgpu gives this GPU no `pcie_bw`.
+      - RTX 3090 (PCIe 3.0, the link trained at x4): presents 4818 to 1236
+        (-74%), GPU time 19.9 to 109 ms a present, and a present shown
+        3.5 to 110 ms (median) after its take. Launchpad fell from 197
+        presents to 30 with 559 MB a present at 2.1 GB/s, Mission Control
+        from 602 to 203 with the GPU 99% busy, Safari's scroll from 369 to
+        90 with its longest gaps (p99) from 0.4 to 6.3 s.
+      - RTX 2080 (Thunderbolt 3), the steps up to the GL 3D page: the GPU
+        fell off its bus (Xid 79) in the in-place run's video step, as it
+        had once before that day with neither run going. Launchpad fell
+        from 219 presents to 30 with 429 MB a present at 1.6 GB/s, Mission
+        Control from 607 to 200 with the GPU 99% busy, Safari's scroll from
+        374 to 91 with its longest gaps (p99) from 0.6 to 6.4 s, the GL 3D
+        page from 498 to 56; a present was shown 3.5 to 84 ms (median)
+        after its take.
+      The cost is the reads, and the link sets how much it is. At 16 GB/s
+      (the 5080) the GPU's time per present triples and the presents fall
+      6%; at the x4 links' 1.6 to 2.4 GB/s the GPU waits on them, and the
+      steps' presents fall three- to ninefold. The path's other work did
+      not grow: the runtime's first copies into its shadows over host pages
+      fell (10.1 to 9.8 GB on the XTX, 2.8 to 2.7 GB on the 5080, 1.7 to
+      0.4 GB on the 3090). On the XTX, in place first also took the
+      runtime's shadows off most of the video's frames: in the walk's 57 s
+      of 1080p video the runtime copied 74.0 million texels into shadow
+      images with every surface cached and 1.6 million in place first
+      (shadow copies 2230 to 977), the decoder's NV12 frames taking device
+      caches through the ask, whose textures are images over the caches'
+      own memory. A host whose GPU has memory of its own keeps caching
+      every surface until a cache can follow measured use (below).
+    - **Proposed, not built: in place first, caches by measured use.** In
+      place first (above) keeps a surface in place for its whole life, so
+      the GPU reads every layer it composites across its link at each
+      present. The proposal keeps every surface in place first and gives
+      one a device cache only once the guest's own use shows it re-read
+      unchanged, from guest behaviour alone, never from a table of hosts or
+      drivers:
+      - *Counting, on the host.* For each block in place, the decoder counts
+        the command buffers that read the surface (a texture over it
+        sampled or read, a blit from it, a render pass that loads it) since
+        its last write. A write is a command that writes it (a render
+        pass's store, a shader's write, a blit into it), or a CPU write by
+        the guest. The host sees a CPU write as the surface's CPU generation
+        moving in the block's header (`surface_cache::cpu_generation`), the
+        count the kext moves at each read-write lock in its op 2. IOSurface
+        calls op 2 only for a surface with a device cache, and a block in
+        place has none today, so the proposal gives each block in place a
+        device cache that copies nothing, for op 2's count alone. Whether
+        such a cache changes IOSurface's lock path in any other way is to
+        be checked (`RgfxIOSurfaceKPI.hpp`). A block read by N command
+        buffers with no write between them is promoted. N is measured, not
+        guessed: from the walks' counts of reads between writes per
+        surface, the least N at which the copy a promotion costs (the
+        surface's bytes across the link once, and back once at the next CPU
+        lock where the GPU wrote it) is below the reads it saves.
+      - *The step.* The host posts the kext a notice naming the block. The
+        kext names the block again, cached (`SURFACE_PAGES` with
+        `RGFX_SURFACE_PAGES_CACHED`, the naming a block takes today only
+        before any process holds it), once no submitted command buffer
+        holds it, and makes the surface's IOSurface device cache with it.
+        The host fills the cache from the pages and moves every buffer and
+        texture over the block onto it. From then on the block is a cached
+        block as any other: its command buffers name it in `SURFACE_USE`,
+        and its locks download as a cached block's do. A surface written by
+        the guest's CPU, or written between its reads, never leaves its
+        pages. Whether IOSurface takes a device cache for a surface that is
+        already in use is the first thing to check (`RgfxIOSurfaceKPI.hpp`).
+      - *The reverse.* A CPU write ends a promotion. IOSurface calls the
+        kext's op 2 at every read-write lock of a surface with a device
+        cache. There the kext asks `SURFACE_DOWNLOAD` where the GPU wrote
+        the surface since the pages last took the cache, as it does today,
+        and then names the block in place again. The host moves the block's
+        buffers and textures back over the pages, which by then hold every
+        GPU write, and lets the cache go once the command buffers that use
+        it finish. The CPU then writes the pages, and the block's count
+        starts over. A read-only lock leaves the promotion as it is.
+      - *The contract.* Every value that reached the guest stays: object
+        ids, GPU addresses, resource ids, and every texture's contents and
+        layout. CPU locks wait as they do now. The notice is a new event
+        behind a new `FEATURES` bit: a host whose GPU has memory of its own
+        offers in place first only with it, and a kext without it keeps
+        every surface cached, as now. Where the host can't promote (no room
+        in the GPU's memory, a texture the GPU can't place there) the block
+        stays in place: the fallback is at the refusal, on every driver.
+      - *What it needs.* The host can't move live objects today: each
+        `BUFFER_OVER_SURFACE_PAGES` buffer is made over either the view or
+        the cache when it is created (`decode::surface_pages`), and
+        metal2vulkan's runtime rebinds a no-copy buffer only to other host
+        pages (`Buffer::detach_backing`, `rebind_bytes_no_copy`). It needs
+        the runtime to move a no-copy buffer, and the textures over it,
+        into device memory at the same GPU address and back (asked of
+        metal2vulkan 2026-11-13), then the event, the kext's naming, the
+        host's counting, and the offer of in place first from
+        `steelbrain/routeb`.
 
 15. **The stage 3 stack is IOGPUFamily.** x86-64 macOS 26 carries IOGPUFamily
     and IOGPU.framework, and the x86-64 port runs Metal compositing on them:
