@@ -1750,35 +1750,53 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 	} asker;
 	if (inPlace && surfaceId && (surfaceCache || deferredBudget))
 		asker.object = rgfxSurfaceLocksLookup(this, task, surfaceId);
-	IOLockLock(contextLock);
-	if (!table.entries) {
-		auto *made = static_cast<RgfxSurfaceEntry *>(
-		    IOMalloc(sizeof(RgfxSurfaceEntry) * kMaxSurfaceBlocks));
-		if (made) {
-			bzero(made, sizeof(RgfxSurfaceEntry) * kMaxSurfaceBlocks);
-			table = {made, kMaxSurfaceBlocks};
-		}
-	}
+	// Whether the asker's surface reads fresh (rgfxSurfaceLocksFresh), counted out of the contexts'
+	// lock, which every process's block allocations, surface asks and releases take: a count makes
+	// a mapping of the surface's memory, which waited up to 9.1 ms (RgfxAcceleratorLocks.cpp). The
+	// ask counts where a deferral is otherwise its, then takes the lock again and looks again;
+	// where it waits under the lock after the count, it counts again.
+	bool fresh = false, counted = false;
 	bool defer = false, deferredFound = false, cachedFound = false;
-	// The surface's resident pages the ask listed, where the host lets a deferral carry them
-	// (RgfxDeferCarry.hpp): a surface fresh but for those may be deferred too.
-	const uint64_t listed =
-	    resident && deferCarries ? rgfxResidentPages(*resident, length, PAGE_SIZE) : 0;
-	if (!listed)
-		resident = nullptr;
-	if (asker.object && table.entries && surfaceCache)
-		cachedFound = rgfxSurfaceFindCached(table, asker.object, length, size, true) >= 0;
-	if (asker.object && table.entries && deferredBudget && !cachedFound) {
-		int32_t d = -1;
-		while (asker.object && (d = rgfxSurfaceFindDeferred(table, asker.object)) >= 0 &&
-		       table.entries[d].pending)
-			IOLockSleep(contextLock, &surfaceTable, THREAD_UNINT);
-		deferredFound = d >= 0;
-		// Where the device answers which surfaces need a cache, the deferral asks with the
-		// surface's layout: an ask with none (an older bundle's) stays in place, as it did.
-		defer = asker.object && !deferredFound && cacheable && (!askCache || layout) &&
-		        rgfxSurfaceDeferFits(table, length, deferredBudget) &&
-		        rgfxSurfaceLocksFresh(asker.object, length, listed);
+	uint64_t listed = 0;
+	for (;;) {
+		IOLockLock(contextLock);
+		if (!table.entries) {
+			auto *made = static_cast<RgfxSurfaceEntry *>(
+			    IOMalloc(sizeof(RgfxSurfaceEntry) * kMaxSurfaceBlocks));
+			if (made) {
+				bzero(made, sizeof(RgfxSurfaceEntry) * kMaxSurfaceBlocks);
+				table = {made, kMaxSurfaceBlocks};
+			}
+		}
+		defer = deferredFound = cachedFound = false;
+		// The surface's resident pages the ask listed, where the host lets a deferral carry
+		// them (RgfxDeferCarry.hpp): a surface fresh but for those may be deferred too.
+		listed = resident && deferCarries ? rgfxResidentPages(*resident, length, PAGE_SIZE) : 0;
+		if (!listed)
+			resident = nullptr;
+		if (asker.object && table.entries && surfaceCache)
+			cachedFound = rgfxSurfaceFindCached(table, asker.object, length, size, true) >= 0;
+		if (asker.object && table.entries && deferredBudget && !cachedFound) {
+			int32_t d = -1;
+			while (asker.object && (d = rgfxSurfaceFindDeferred(table, asker.object)) >= 0 &&
+			       table.entries[d].pending) {
+				counted = false;
+				IOLockSleep(contextLock, &surfaceTable, THREAD_UNINT);
+			}
+			deferredFound = d >= 0;
+			// Where the device answers which surfaces need a cache, the deferral asks with the
+			// surface's layout: an ask with none (an older bundle's) stays in place, as it did.
+			defer = asker.object && !deferredFound && cacheable && (!askCache || layout) &&
+			        rgfxSurfaceDeferFits(table, length, deferredBudget);
+			if (defer && !counted) {
+				IOLockUnlock(contextLock);
+				fresh = rgfxSurfaceLocksFresh(asker.object, length, listed);
+				counted = true;
+				continue;
+			}
+			defer = defer && fresh;
+		}
+		break;
 	}
 	IOLockUnlock(contextLock);
 	// A cached block of the surface is the ask's, found by the surface, only where the asker
@@ -1818,7 +1836,11 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		IOLockLock(contextLock);
 		// The ask finds no deferred block and has no pages: it wires them, and looks again.
 		bool needPages = false;
+		// The surface counted, out of the lock, just before this pass took it.
+		bool countedNow = false;
 		for (;;) {
+			bool countedHere = countedNow;
+			countedNow = false;
 			int32_t d = -1;
 			while (table.entries &&
 			       (rgfxSurfacePending(table, runs, count) ||
@@ -1826,8 +1848,10 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 			         table.entries[d].pending) ||
 			        ((d = rgfxSurfaceFindCached(table, asker.object, length, size,
 			                                    mapsSurface)) >= 0 &&
-			         table.entries[d].pending)))
+			         table.entries[d].pending))) {
+				countedHere = false;
 				IOLockSleep(contextLock, &surfaceTable, THREAD_UNINT);
+			}
 			differs = false;
 			at = -1;
 			// A deferred block of the asker's surface is its block, held again where dormant, and
@@ -1865,9 +1889,18 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 				break;
 			}
 			// No pages, no deferred block: a new one is deferred where its surface is fresh
-			// still, and fits the budget.
-			if (!count && (!defer || !rgfxSurfaceDeferFits(table, length, deferredBudget) ||
-			               !rgfxSurfaceLocksFresh(asker.object, length, listed))) {
+			// still, and fits the budget. The surface is counted again out of the lock, and the
+			// pass looks again under it.
+			const bool fits =
+			    !count && defer && rgfxSurfaceDeferFits(table, length, deferredBudget);
+			if (fits && !countedHere) {
+				IOLockUnlock(contextLock);
+				fresh = rgfxSurfaceLocksFresh(asker.object, length, listed);
+				IOLockLock(contextLock);
+				countedNow = true;
+				continue;
+			}
+			if (!count && (!fits || !fresh)) {
 				needPages = true;
 				break;
 			}

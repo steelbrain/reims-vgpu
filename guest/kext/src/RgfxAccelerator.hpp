@@ -240,7 +240,8 @@ RgfxSurfacePageCounts rgfxSurfaceLocksPageCounts(OSObject *surface);
 // Whether `surface` reads fresh, to look at: its seed 0, its pages counted, none of them
 // compressed or paged out, none resident or as many as `listed`, the pages the ask lists of them
 // (rgfxDeferRead, RgfxDeferCarry.hpp; 0 for none), and its memory holding `length` bytes. Racy:
-// the deferral's own read is rgfxSurfaceLocksDefer's.
+// the deferral's own read is rgfxSurfaceLocksDefer's. Called holding no lock of the kext's: its
+// count makes a mapping, which may wait milliseconds.
 bool rgfxSurfaceLocksFresh(OSObject *surface, UInt64 length, uint64_t listed);
 // What rgfxSurfaceLocksDefer found.
 enum RgfxDeferAnswer {
