@@ -1003,6 +1003,19 @@ void rgfxEndAtHeapStorageMismatch(MTLTextureDescriptor *descriptor, MTLStorageMo
 	                               rgfxStorageModeName(heapMode)]);
 }
 
+void rgfxEndAtLinearDepthStencil(MTLTextureDescriptor *descriptor, id<MTLDevice> device)
+{
+	if (descriptor == nil || rgfxDepthStencilBytes(descriptor.pixelFormat) == 0 ||
+	    !rgfxAppleGPU(device))
+		return;
+	RgfxMetalAssertionFailed(
+	    "_mtlValidateStrideTextureParameters",
+	    [NSString stringWithFormat:@"Texture Descriptor Validation\nLinear texture: cannot create "
+	                               @"compressed, depth, or stencil textures, pixelFormat (%@) "
+	                               @"disallowed\n",
+	                               rgfxPixelFormatName(descriptor.pixelFormat)]);
+}
+
 // Metal checks a texture over a surface in three steps, each its own assertion, and lists every
 // rule of one step a descriptor breaks, a line each (measured: oracle_surftex, Q20).
 void rgfxEndAtInvalidSurfaceTexture(MTLTextureDescriptor *descriptor, IOSurfaceRef surface,

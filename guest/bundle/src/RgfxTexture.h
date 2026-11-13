@@ -166,6 +166,16 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLD
 /// False for nil.
 bool rgfxAppleGPU(id<MTLDevice> _Nullable device);
 
+/// Ends the process, with the M3 Max's words, at a texture of a depth or stencil format over a
+/// buffer's bytes, by the public newTextureWithDescriptor:offset:bytesPerRow: and the linear SPI,
+/// where `device` is an Apple GPU (rgfxAppleGPU): the M3 Max under macOS 27.0.1 with no validation
+/// layer ends it at Depth16Unorm, Depth32Float, Stencil8, Depth32Float_Stencil8 and X32_Stencil8
+/// in Shared storage over a Shared buffer, after the descriptor's validation, which takes them
+/// ("Linear texture: cannot create compressed, depth, or stencil textures", oracle_bundle Apple
+/// buftex.depth*, linear.depth, 11-13). The x86 Macs end it at the descriptor's validation, at
+/// the storage (rgfxEndAtInvalidTextureDescriptor). It returns for any other texture.
+void rgfxEndAtLinearDepthStencil(MTLTextureDescriptor *descriptor, id<MTLDevice> _Nullable device);
+
 /// Whether `format` is a block-compressed format the device has: BC1 to BC7, and on an Apple GPU
 /// (rgfxAppleGPU) PVRTC, EAC, ETC2 and ASTC too.
 bool rgfxBlockCompressedFormat(uint64_t format, id<MTLDevice> _Nullable device);

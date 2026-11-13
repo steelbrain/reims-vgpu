@@ -2625,6 +2625,43 @@ static int dies_case(const char *name)
 		desc.storageMode = MTLStorageModeShared;
 		(void)[buf newTextureWithDescriptor:desc offset:0 bytesPerRow:256];
 	}
+	// oracle_bundle Apple buftex.depth16, .stencil8, .d32s8, .x32s8 and .depth (Depth32Float), and
+	// linear.depth, on an Apple GPU: 64 x 64, Shared, over a Shared buffer.
+	if (std::strncmp(name, "apple-buffer-texture-", 21) == 0) {
+		const char *rest = name + 21;
+		const bool linear = std::strncmp(rest, "linear-", 7) == 0;
+		if (linear)
+			rest += 7;
+		const MTLPixelFormat format =
+		    std::strcmp(rest, "depth16") == 0    ? MTLPixelFormatDepth16Unorm
+		    : std::strcmp(rest, "stencil8") == 0 ? MTLPixelFormatStencil8
+		    : std::strcmp(rest, "d32s8") == 0    ? MTLPixelFormatDepth32Float_Stencil8
+		    : std::strcmp(rest, "x32s8") == 0    ? MTLPixelFormatX32_Stencil8
+		                                         : MTLPixelFormatDepth32Float;
+		std::vector<uint8_t> memory(0x10000, 0);
+		id apple = [RgfxAppleFamilyDevice new]; // held: a buffer keeps its device weakly
+		RgfxBuffer *buf =
+		    [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+		                                    regionOffset:0x10000
+		                                          length:memory.size()
+		                                         options:MTLResourceStorageModeShared
+		                                     deallocator:nil
+		                                          device:(id<MTLDevice>)apple
+		                                      serializer:&fx.ser];
+		MTLTextureDescriptor *desc =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+		                                                       width:64
+		                                                      height:64
+		                                                   mipmapped:NO];
+		desc.storageMode = MTLStorageModeShared;
+		if (linear)
+			(void)[(id<RgfxMetalBufferInternals>)buf newLinearTextureWithDescriptor:desc
+			                                                                offset:0
+			                                                           bytesPerRow:512
+			                                                         bytesPerImage:512 * 64];
+		else
+			(void)[buf newTextureWithDescriptor:desc offset:0 bytesPerRow:512];
+	}
 	if (std::strcmp(name, "texture-stencil-managed") == 0) {
 		MTLTextureDescriptor *desc =
 		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatStencil8
@@ -2989,6 +3026,49 @@ void test_compressed_buffer_textures_answer_nil()
 		drainRing(fx.ring);
 	}
 	drainRing(fx.ring);
+}
+
+// On a device that answers as an Apple GPU, a texture of a depth or stencil format in Shared
+// storage over a Shared buffer's bytes, by the public form and the linear SPI, ends the process
+// after the descriptor's validation, which takes it, as the M3 Max under macOS 27.0.1 ends it
+// (oracle_bundle Apple buftex.depth16, .stencil8, .d32s8, .x32s8, .depth and linear.depth, 11-13);
+// a colour texture passes. Where the device answers no Apple family, the descriptor's validation
+// ends it at the storage, as the x86 Macs do (buffer-texture-depth), and the check passes every
+// texture. An arm64 guest's device takes the M3's.
+void test_depth_buffer_textures_as_an_apple_gpu()
+{
+	const std::string kStride = "_mtlValidateStrideTextureParameters: failed assertion `Texture "
+	                            "Descriptor Validation\nLinear texture: cannot create compressed, "
+	                            "depth, or stencil textures, pixelFormat (";
+	const struct {
+		const char *name, *format;
+	} cases[] = {
+	    {"apple-buffer-texture-depth16", "MTLPixelFormatDepth16Unorm"},
+	    {"apple-buffer-texture-stencil8", "MTLPixelFormatStencil8"},
+	    {"apple-buffer-texture-d32s8", "MTLPixelFormatDepth32Float_Stencil8"},
+	    {"apple-buffer-texture-x32s8", "MTLPixelFormatX32_Stencil8"},
+	    {"apple-buffer-texture-depth", "MTLPixelFormatDepth32Float"},
+	    {"apple-buffer-texture-linear-depth", "MTLPixelFormatDepth32Float"},
+	};
+	for (const auto &c : cases)
+		checkDies(c.name, (kStride + c.format + ") disallowed\n'").c_str());
+	MTLTextureDescriptor *depth =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+	                                                       width:64
+	                                                      height:64
+	                                                   mipmapped:NO];
+	depth.storageMode = MTLStorageModePrivate;
+	rgfxEndAtLinearDepthStencil(depth, nil);
+#if !defined(__arm64__)
+	rgfxEndAtLinearDepthStencil(depth, (id<MTLDevice>)[RgfxGuestRulesDevice new]);
+#endif
+	MTLTextureDescriptor *colour =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:64
+	                                                      height:64
+	                                                   mipmapped:NO];
+	rgfxEndAtLinearDepthStencil(colour, (id<MTLDevice>)[RgfxAppleFamilyDevice new]);
+	g_checks++;
 }
 
 // On a device that answers as an Apple GPU, a Shared heap the device is asked for is made over a
@@ -19114,6 +19194,7 @@ int main(int argc, char **argv)
 		test_textures_past_max_buffer_length_are_nil();
 		test_shared_heaps_and_cpu_depth_textures_end_the_process();
 		test_shared_heaps_on_an_apple_gpu();
+		test_depth_buffer_textures_as_an_apple_gpu();
 		test_second_buffer_is_monotonic();
 		test_wrapper_guards_and_base();
 		test_event_routing();
