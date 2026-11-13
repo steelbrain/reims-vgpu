@@ -338,6 +338,18 @@ impl<P: Platform> GraphicsDecoder<P> {
         {
             return Ok(Err(DecodeError::Malformed));
         }
+        if let Some((first, _)) = ram {
+            log::trace!(
+                target: "reims_vgpu::graphics::surface_pages",
+                "BUFFER_MANAGED_AT_OFFSET in the heap {:#x} over pages at {:#x}: object {:#x}, \
+                 {:#x} bytes at {:#x}",
+                m.heap_obj_id,
+                first.addr(),
+                m.obj_id,
+                m.length,
+                m.offset
+            );
+        }
         let (ram, at, span) = match ram {
             Some((first, _)) => (Some(first), m.offset, (heap_at, heap_length)),
             None => (None, heap_at + m.offset, (heap_at + m.offset, m.length)),

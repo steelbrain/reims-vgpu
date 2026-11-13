@@ -3332,7 +3332,11 @@ impl<P: Platform> GraphicsDecoder<P> {
                     let Some(ObjHandle::Heap(heap)) = self.named(m.heap_obj_id) else {
                         return Ok(Err(DecodeError::BadReference));
                     };
-                    heap.new_texture(&descriptor, m.heap_offset)?
+                    let made = heap.new_texture(&descriptor, m.heap_offset)?;
+                    if made.is_some() {
+                        self.log_placed_texture(device, &m, &descriptor);
+                    }
+                    made
                 } else {
                     // Device-placed at the guest-picked GPU address.
                     device.new_texture(OnFault::Return, &descriptor)?
@@ -3361,6 +3365,18 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // offset: the guest's RAM where the heap lies over a pages block's, else the
                 // heap's block of the region. A heap of the GPU's own memory has neither.
                 let (span, ram) = (self.span_of(m.heap_obj_id), self.ram_of(m.heap_obj_id));
+                if let Some((first, _)) = ram {
+                    log::trace!(
+                        target: "reims_vgpu::graphics::surface_pages",
+                        "BUFFER_AT_OFFSET in the heap {:#x} over pages at {:#x}: object {:#x}, \
+                         {:#x} bytes at {:#x}",
+                        m.heap_obj_id,
+                        first.addr(),
+                        m.obj_id,
+                        m.length,
+                        m.offset
+                    );
+                }
                 let bytes = match (ram, span) {
                     (Some((first, _)), _) => Some(GuestBytes {
                         ram: Some(first),
@@ -3856,6 +3872,41 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// The region span `obj_id`'s object lies over, where it is one the current context may name
     /// and lies over one.
+    /// Logs, at trace, a texture `m` placed in a heap over pages (`HEAP_OVER_PAGES`): its
+    /// heap, offset and size there, so a run tells which of a heap's resources lie where in its
+    /// pages.
+    fn log_placed_texture(
+        &self,
+        device: &P::Device,
+        m: &RgfxTextureCreate,
+        descriptor: &P::TextureDescriptor,
+    ) {
+        let target = "reims_vgpu::graphics::surface_pages";
+        if !log::log_enabled!(target: target, log::Level::Trace) {
+            return;
+        }
+        let Some((first, _)) = self.ram_of(m.heap_obj_id) else {
+            return;
+        };
+        let size = device
+            .heap_texture_size_and_align(descriptor)
+            .map_or(0, |s| s.size);
+        log::trace!(
+            target: target,
+            "TEXTURE_CREATE in the heap {:#x} over pages at {:#x}: object {:#x}, {size:#x} bytes \
+             at {:#x}, {}x{}x{} format {} of {} levels",
+            m.heap_obj_id,
+            first.addr(),
+            m.obj_id,
+            m.heap_offset,
+            m.desc.width,
+            m.desc.height,
+            m.desc.depth,
+            m.desc.pixel_format,
+            m.desc.mipmap_level_count
+        );
+    }
+
     fn span_of(&self, obj_id: u64) -> Option<(u64, u64)> {
         self.entry(obj_id).and_then(|e| e.span)
     }

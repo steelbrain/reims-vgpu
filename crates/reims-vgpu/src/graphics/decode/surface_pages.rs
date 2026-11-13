@@ -501,8 +501,9 @@ pub(crate) fn layout_planes(
     planes.iter().all(lies).then_some(planes)
 }
 
-/// How a surface's runs lie in guest RAM, for the log: each run takes a kernel mapping of its own
-/// in the view, so their count is the view's cost.
+/// How a surface's or a pages block's runs lie in guest RAM, for the log: each run takes a kernel
+/// mapping of its own in the view, so their count is the view's cost; the longest run tells a
+/// pages block of the kext's 64 KiB chunks from one of a process's own scattered pages.
 struct Layout {
     runs: usize,
     /// Runs of one host page.
@@ -514,15 +515,23 @@ struct Layout {
 }
 
 impl Layout {
-    fn of(runs: &[RgfxPageRun], page: u64) -> Layout {
-        Layout {
-            runs: runs.len(),
-            single: runs.iter().filter(|r| r.length == page).count(),
-            downwards: (runs.windows(2))
-                .filter(|w| w[1].address.checked_add(w[1].length) == Some(w[0].address))
-                .count(),
-            longest: runs.iter().map(|r| r.length).max().unwrap_or(0),
+    /// The layout of `runs`, each its guest address and length, in order.
+    fn of(runs: impl IntoIterator<Item = (u64, u64)>, page: u64) -> Layout {
+        let mut layout = Layout {
+            runs: 0,
+            single: 0,
+            downwards: 0,
+            longest: 0,
+        };
+        let mut before: Option<u64> = None;
+        for (address, length) in runs {
+            layout.runs += 1;
+            layout.single += usize::from(length == page);
+            layout.downwards += usize::from(address.checked_add(length) == before);
+            layout.longest = layout.longest.max(length);
+            before = Some(address);
         }
+        layout
     }
 }
 
@@ -1336,11 +1345,28 @@ impl<P: Platform> SurfaceViews<P> {
             )
         };
         Self::make_room_for(views, platform, runs.len());
+        let clock = platform.clock();
+        let start = clock.now_mono();
         let made = match map_view(&memory, lease, teardown, &runs, length) {
-            Ok(view) => match buffer_over(device, &view, 0, view.length(), 0, None)? {
-                Some(import) => Ok((view, import)),
-                None => Err(PagesRefusal::NoBuffer),
-            },
+            Ok(view) => {
+                let mapped = clock.now_mono();
+                match buffer_over(device, &view, 0, view.length(), 0, None)? {
+                    Some(import) => {
+                        log::trace!(
+                            target: "reims_vgpu::graphics::surface_pages",
+                            "the pages block at {block:#x} of context {}: a view of {length:#x} \
+                             bytes at {:#x} in {}; mapped in {} us, imported in {} us",
+                            context.map_or_else(|| "any".to_owned(), |c| c.to_string()),
+                            view.base().addr(),
+                            Layout::of(runs.iter().copied(), GUEST_PAGE),
+                            mapped.saturating_duration_since(start).as_micros(),
+                            clock.now_mono().saturating_duration_since(mapped).as_micros()
+                        );
+                        Ok((view, import))
+                    }
+                    None => Err(PagesRefusal::NoBuffer),
+                }
+            }
             Err(why) => Err(why),
         };
         let mut v = views.lock();
@@ -1582,10 +1608,12 @@ fn make_view<P: Platform>(
     let imported = clock.now_mono();
     log::debug!(
         target: "reims_vgpu::graphics::surface_pages",
-        "the block at {:#x}: a view of {:#x} bytes in {}; mapped in {} us, imported in {} us",
+        "the block at {:#x}: a view of {:#x} bytes at {:#x} in {}; mapped in {} us, imported in \
+         {} us",
         pages.block_offset,
         pages.length,
-        Layout::of(runs, GUEST_PAGE),
+        view.base().addr(),
+        Layout::of(runs.iter().map(|r| (r.address, r.length)), GUEST_PAGE),
         mapped.saturating_duration_since(start).as_micros(),
         imported.saturating_duration_since(mapped).as_micros()
     );
@@ -1737,6 +1765,17 @@ impl<P: Platform> super::GraphicsDecoder<P> {
         else {
             return Ok(Err(super::DecodeError::Refused));
         };
+        log::trace!(
+            target: "reims_vgpu::graphics::surface_pages",
+            "BUFFER_OVER_PAGES of the block at {:#x} ({:#x} bytes of view): object {:#x}, {:#x} \
+             bytes at {:#x}, options {:#x}",
+            m.block_offset,
+            view.length(),
+            m.obj_id,
+            m.length,
+            m.offset,
+            m.options
+        );
         // Its contents are the view's bytes at the offset, which the buffer keeps mapped.
         let bytes = super::GuestBytes {
             ram: Some(view.base()),
@@ -1808,6 +1847,20 @@ impl<P: Platform> super::GraphicsDecoder<P> {
         };
         match device.new_heap_over_host_memory(bytes, &desc)?.heap {
             Some(heap) => {
+                log::trace!(
+                    target: "reims_vgpu::graphics::surface_pages",
+                    "HEAP_OVER_PAGES of the block at {:#x}: object {:#x}, {:#x} bytes at {:#x}, \
+                     {}",
+                    m.block_offset,
+                    m.obj_id,
+                    length,
+                    at.addr(),
+                    if ram.is_some() {
+                        "in the guest's RAM (one run)"
+                    } else {
+                        "in the block's view"
+                    }
+                );
                 let mut entry = super::tables::Entry::of(super::ObjHandle::Heap(heap))
                     .over(Some((m.block_offset, m.block_size)));
                 entry.ram = Some((at, length));
