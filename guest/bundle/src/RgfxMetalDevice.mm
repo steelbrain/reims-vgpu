@@ -1588,7 +1588,8 @@ RGFX_LOG_UNRECOGNIZED
 }
 
 #if defined(__arm64__)
-// In an arm64 guest, Metal's texture rules are an Apple GPU's (RgfxAppleRulesDevice).
+// In an arm64 guest, Metal's rules are an Apple GPU's (RgfxAppleRulesDevice): textures, over a
+// surface too, views, Shared heaps and linear alignments (rgfxAppleGPU; dgpu-oracle.md, Q34).
 - (BOOL)rgfxAppleRules
 {
 	return YES;

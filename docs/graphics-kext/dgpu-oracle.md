@@ -486,7 +486,8 @@ the M3 asserts for compressed and depth ones. `minimumLinearTextureAlignmentForP
 (`oracle_bundle linalign`, every raw value from 0 to 799 and 1000, 1023, 4096 and 65535) answers 256
 for the same 64 values on both, 46 of the SDK's formats and 18 it has no name for, and ends the
 process at every other (compressed, depth and stencil, else MTLPixelFormatInvalid; D24S8 and X24S8
-are depth on AMD, Invalid on Intel); ours does the same, D24S8 as Intel. Our device makes ASTC and the packed formats (m2v),
+are depth on AMD, Invalid on Intel); ours does the same, D24S8 as Intel. The M3 Max answers 175
+values and ends at others; an arm64 guest's device answers as it does (Q34). Our device makes ASTC and the packed formats (m2v),
 which no x86 Mac does; with no Apple family claimed, frameworks should not ask for them.
 
 **Relaxation: none** for performance. One answer helps the host, and the lane gives it, as a
@@ -1064,10 +1065,13 @@ The two x86 GPUs differ only in the words at `Depth24Unorm_Stencil8` in Managed 
 AMD's are the depth formats' storage rule, the Intel's "invalid pixelFormat (255)", as the Intel
 lacks the format.
 
+The M3's answer at each case, measured again on 11-13 with the cases added since, is in Q34, with
+how an arm64 guest's device answers them.
+
 What our stack does:
 - *(class 3)* The device's creator ends the process at every rule the x86 Macs end it at, with
   their words, before it sends the host anything (`rgfxEndAtInvalidSurfaceTexture`,
-  RgfxTexture.h). The bundle had sent each of these to the host, posted, and answered a texture;
+  RgfxTexture.h). An arm64 guest's device ends it and answers nil where the M3 does (Q34). The bundle had sent each of these to the host, posted, and answered a texture;
   the host refused most, and the guest's command buffers naming the texture then failed. That
   includes every two-plane format, which the lane made as the M3 does until 11-05 (Q13).
 - *(class 3)* A BC1 to BC7 texture over a surface is made and posted, as both x86 Macs make it
@@ -1789,6 +1793,54 @@ host (`RgfxOverlappingArgumentError`). Where the AIR does not tell, the host's c
 pipeline, as before. That covers a predicate, index or count that the code does not compute from
 the values, and a function table or an acceleration structure among the arguments, whose words
 were not measured.
+
+## Q34: what an Apple GPU answers where the x86 Macs' rules differ, and the arm64 guest
+
+An arm64 guest's device takes an Apple GPU's rules (`rgfxAppleGPU`, RgfxTexture.h), as every GPU
+an arm64 Mac has is Apple's: its Metal reference is the M3 Max's, where the x86 guest's is the
+x86 Macs'. This section measures the M3 where the bundle had taken the x86 Macs' answer.
+
+Probes, 11-13, on the M3 Max under macOS 27.0.1 (26A434), each case in a child process of its
+own, with `MTL_DEBUG_LAYER`, `METAL_DEVICE_WRAPPER_TYPE`, `MTL_SHADER_VALIDATION` and
+`METAL_ERROR_MODE` unset (each probe prints them): `oracle_surftex Apple`, 297 cases with its
+fourth and fifth rounds (m3-max-26136, 26149 and 26152); `oracle_bundle Apple` view.*,
+buftex.*, linear.*, linalign, heapbuffers, heap.shared, bit17 to bit19, tiled.responds,
+iosurf.buffer and devtex.* (m3-max-26136 and 26149), and argbuf.ds.* (m3-max-26237 and 26239);
+`oracle_mesh Apple icb` (m3-max-26237); and `oracle_spi_members` (m3-max-26149).
+Every answer is measured with no validation layer, as a guest's app meets it: every process end
+below is the release Metal's, not the validation layer's.
+
+| call | x86 Macs (Q20, Q24, Q9) | M3 Max, measured | arm64 guest |
+|---|---|---|---|
+| `newTextureWithDescriptor:iosurface:plane:`, a compressed format (BC1, BC7, ASTC 4x4, ETC2 RGB8, EAC R11, PVRTC RGBA 4 bpp) whose rows and height fit, over a surface without planes, a one-plane BGRA surface's plane, or a 420v surface's luma plane, Managed or Private | BC made; the others end the process at the descriptor's validation (formats they lack) | nil; rows or height past the surface's end the process at the third step, in the x86 Macs' words | the M3's (`rgfxSurfaceMakesNoTextureOf`) |
+| the same, a Cube or CubeArray type, 64 or 32 a side, over a one-plane BGRA surface's plane or a 420v surface's luma plane | made | ends the process: `Assertion failed: (carriesComplexTexture \|\| numFaces == 1), function -[IOGPUMetalTexture initWithDevice:descriptor:iosurface:plane:field:args:argsSize:], file IOGPUMetalTexture.m, line 687.`, a C assertion of the driver's | the M3's (`rgfxEndAtInvalidSurfaceTexture`) |
+| the same, a two-plane format of 4:2:0 or 4:2:2 chroma (500, 502, 505, 506, 508, 509, 520, 522, 525, 526, 528, 529, 540, 541, 543, 544) of an odd width or height (63 x 63, 64 x 63, 63 x 64 over the luma plane; 31 x 31 over the chroma plane; 63 x 63 over a one-plane surface and one without planes), usage RenderTarget or ShaderWrite | ends the process (formats they lack) | nil; of usage ShaderRead alone, or of even sides, made; the 4:4:4 formats (503, 507, 510, 523, 527, 530, 542, 545) and the XR10 ones (550, 551) made at every size and usage asked | the M3's (`rgfxSurfaceMakesNoTextureOf`) |
+| a view in `MTLPixelFormatInvalid` (`view.noformat`) | ends the process | nil | the M3's (`rgfxEndAtViewMetalEnds`) |
+| a view in a format of another class, of levels or slices past the texture's, of a type of another family, or a cube of slices not a multiple of six (`view.class`, `.levels`, `.slices`, `.type`, `.slicecount`) | ends the process | ends the process, in the x86 Macs' words | unchanged |
+| `newHeapWithDescriptor:`, Shared, 4 MiB | ends the process ("Shared storage mode disallowed") | made (`AGXG15XFamilyHeap`); Shared buffers of 1 to 65537 bytes in it, each with contents; a Shared BGRA8Unorm texture in it | the M3's: a heap over a block of the device region (`heapForDeviceWithDescriptor:`) |
+| `minimumLinearTextureAlignmentForPixelFormat:`, every raw value from 0 to 799 and 1000, 1023, 4096 and 65535 | 64 values answered; ends at the rest | 175 values answered, 16 each: those the x86 Macs answer, those they lack but Invalid, D24S8 and X24S8 (B5G6R5, A1BGR5, ABGR4, sRGB R8 and RG8, Unspecialized, the two-plane and XR10 formats), and 26, 44, 66, 116, 501, 504, 521, 524, 546 to 548, 560, 562 to 613 and 615 to 629; ends as at a compressed format at 130 to 135, 140 to 143, 150 to 153, 160 to 167, 170, 172, 174, 176, 178 to 183, 185 to 200, 203 to 218, 221 to 236, 240 and 241; as at a depth or stencil one at 250, 252, 253, 260, 261, 651 and 652; as Invalid at every other | the M3's (`rgfxLinearAlignmentAnswer`); the alignment answered stays the host GPU's |
+| a depth or stencil texture (Depth16Unorm, Depth32Float, Stencil8, Depth32Float_Stencil8, X32_Stencil8) in Shared storage over a Shared buffer, by `newTextureWithDescriptor:offset:bytesPerRow:`, and Depth32Float by the linear SPI | ends the process at the descriptor's validation (the storage) | ends the process after the validation, which takes it: `_mtlValidateStrideTextureParameters`, "Linear texture: cannot create compressed, depth, or stencil textures, pixelFormat (...) disallowed" | the M3's (`rgfxEndAtLinearDepthStencil`) |
+| a depth/stencil state's `gpuResourceID`; an argument encoder's `setDepthStencilState:atIndex:` of a state or nil, at a depth/stencil descriptor's index, beside a texture and a pointer, on an encoder of one texture, and on one of a function's argument buffer (`argbuf.ds.*`) | raise an unrecognized selector, though each answers that it responds | `gpuResourceID` 0 for every state; the encoders write nothing and raise nothing | the M3's (`RgfxDepthStencilState`, `RgfxArgumentEncoder`); a state's `resourceIndex` and `uniqueIdentifier` still raise (not measured on the M3) |
+| an indirect command buffer of the mesh command types, and a mesh draw through it (`oracle_mesh Apple icb`) | no mesh pipeline supports indirect command buffers (Q22) | made, 2 commands, `allocatedSize` 16384; both mesh draws through it draw | unchanged: mesh pipelines that support indirect command buffers are a feature the device lacks |
+| a buffer by length (each storage mode) or by bytes (Shared, Managed), or the device's texture, of options holding bit 18 | nil | nil | unchanged (`RgfxMakesNoResourceOf`) |
+| the same of options holding bit 17 or 19 | made | bit 17: buffers made, then a Shared texture of the same process ends it in `IOGPUMetalSuballocatorAllocate` ("Different MTLResourceOptions used for the same heap index, this is not supported"); bit 19: buffers nil, the texture ends it the same | unchanged; not measured one call a process |
+| `newBufferWithIOSurface:` (SPI) over 64 x 64 and 100 x 7 BGRA surfaces and a 420v one | nil | a buffer (`AGXG15XFamilyBuffer`) of the surface's allocation size, options 0x200, contents NULL, `iosurface` the surface, a GPU write through it reaching the surface's pages | unchanged: nil; a buffer over a surface is a feature the device lacks |
+| a buffer's tiled texture SPI, `newTiledTextureWithDescriptor:offset:bytesPerRow:` | answered | not answered by the M3's buffers in any storage mode (the linear SPI is); the device answers `newTiledTextureWithBytesNoCopy:` in both forms | unchanged: the bundle's buffers answer it |
+| the members `tests/protocol_members.txt` gives the x86 Macs' verdicts for (`%spi-both`, `%spi-neither`, `%spi-differ`), by `respondsToSelector:` | the bundle answers each as they do | of the 67 the probe asks, the M3's objects answer 50 (44 selectors) the bundle's do not: 49 of the `%spi-neither` ones (a buffer's backing SPI such as `detachBacking` and `parentGPUAddress`, a command buffer's resource groups and `encodeSignalEventScheduled:value:`, a compute encoder's virtual substreams, a render encoder's resolve textures and tile dispatches, a texture's `compressionMetadata` and `generateMipmapLevel:slice:`), and `copyFromTexture:...options:`, a `%spi-differ` one | unchanged: SPI members, not rules |
+
+The M3 answers the rest of what this section asked as the x86 Macs do (the surface cases of Q20
+it shares with them, the views' rules, a BC1 texture over a buffer's bytes answered nil, rows
+short of a texture's ending the process). Its words name its own classes (`IOGPUMetalTexture`,
+`IOGPUMetalHeap`) where the x86 Macs name `MTLIOAccelTexture` and `MTLIOAccelHeap`; the bundle
+keeps the x86 Macs' names in its words, which are diagnostics.
+
+What our stack does *(class 3 for each guest: each answer is its reference GPU's)*: where the
+device answers an Apple family, and in every arm64 guest, the bundle answers the M3's column
+above, sending the host nothing for what ends the process or answers nil; an x86 guest's answers
+are unchanged. The shell tests check both: `test_surface_textures_as_an_apple_gpu`,
+`test_views_as_an_apple_gpu`, `test_shared_heaps_on_an_apple_gpu`,
+`test_linear_alignment_as_an_apple_gpu` and `test_depth_buffer_textures_as_an_apple_gpu`, and the
+protocol tests' `test_argument_encoder_members`, beside the x86 Macs' tests they keep.
 
 ## Not measured
 
