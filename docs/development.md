@@ -36,8 +36,6 @@ scripts/internal/           what developing the project runs
   opencore-add-kexts.sh     a copy of a VM's OpenCore image with kexts added
   guest-minibuddy-off.sh    keeps Setup Assistant's panes from a guest's
                             next login
-  run_vmapple.sh            boots a macOS VM on make qemu's QEMU
-  vm_drive.py, vm_ocr.swift drive a VM through a fixed tour
   walk_window_macos.sh      the manual walk of a display's window on macOS
 docs/
   api.md                    the C API and the Rust API it wraps, with the
