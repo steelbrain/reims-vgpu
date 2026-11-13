@@ -29,7 +29,10 @@
 //     constants compute is at that index and of that count, and one the AIR marks
 //     `air.arg_unused`, or the specialised code does not use, is not used (isUsed and isActive
 //     0);
-//   - a constant buffer's alignment is 32, a device or threadgroup buffer's its pointee's;
+//   - a constant buffer's alignment is 32, a device or threadgroup buffer's its pointee's; on an
+//     Apple GPU (rgfxAppleGPU, the arm64 guest's device) a constant buffer's is its pointee's too,
+//     but at least 4, the M3 Max's answer (tools/pipeline_reflection_check Apple, macOS 27.0.1),
+//     which differs from an x86 Mac's there and nowhere else a getter reaches;
 //   - a descriptor's buffer is named `vertexBuffer.N` (`stageInBuffer.N` for a compute
 //     pipeline's), N its place among the descriptor's buffers in buffer index order (buffers 1, 4
 //     and 30 are `vertexBuffer.0`, `.1` and `.2`), at its buffer index, of its layout's stride,
@@ -116,11 +119,12 @@ struct RgfxStageReflection {
 // The answers of the entry point `entry` of the module `module` (rgfxReadAirEntries), specialised by
 // the `count` function constant values at `values`, the descriptor's `buffers` (in buffer index
 // order) first, named `prefix.0` on: false where they are not made (the file's comment), with
-// `*why` saying why.
+// `*why` saying why. `appleGPU` asks for an Apple GPU's answers where they differ from an x86
+// Mac's.
 bool RgfxStageReflectionOfEntry(const RgfxAirEntries &module, const RgfxAirEntry &entry,
                                 const RgfxFunctionConstant *_Nullable values, uint32_t count, NSString *prefix,
                                 const std::vector<RgfxDescriptorBuffer> &buffers, RgfxStageReflection &out,
-                                NSString *__strong _Nullable *_Nonnull why);
+                                NSString *__strong _Nullable *_Nonnull why, bool appleGPU = false);
 
 // Metal's refusal of the entry point `entry` of the module `module` (rgfxReadAirEntries) specialised
 // by the `count` function constant values at `values`, where they put two of its present arguments
@@ -142,7 +146,8 @@ bool RgfxStageReflectionOfEntry(const RgfxAirEntries &module, const RgfxAirEntry
 NSError *_Nullable RgfxOverlappingArgumentError(const RgfxAirEntries &module, const RgfxAirEntry &entry,
                                                 const RgfxFunctionConstant *_Nullable values, uint32_t count);
 
-// As RgfxStageReflectionOfEntry, of `function`, one of our libraries' (RgfxFunction); where
+// As RgfxStageReflectionOfEntry, of `function`, one of our libraries' (RgfxFunction), with an
+// Apple GPU's answers where its device is one (rgfxAppleGPU); where
 // `openCLMode` and the function is a kernel's of OpenCL mode (RgfxFunction's rgfxClBindings), as
 // its pipeline of OpenCL mode binds it (RgfxClMode.hpp). This and the creators' three below are
 // RgfxPipelineReflectionOf.mm's.

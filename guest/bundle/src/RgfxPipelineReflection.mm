@@ -110,8 +110,13 @@ constexpr NSUInteger kMeshBindingType = 35;
 constexpr NSUInteger kMeshBuiltInType = 24;
 constexpr NSUInteger kMeshDataType = 157;
 constexpr NSUInteger kMeshGridPropertiesDataType = 156;
-// A constant buffer's alignment, and a descriptor buffer's.
+// A constant buffer's alignment on an x86 Mac, and a descriptor buffer's. On an Apple GPU a
+// constant buffer's alignment is its pointee's, but at least 4 (measured:
+// tools/pipeline_reflection_check Apple on the M3 Max under macOS 27.0.1: 16 for a struct of
+// float4x4 members, 8 for a half3 and for structs of 8, 4 for a float, a half and a char, where an
+// x86 Mac answers 32).
 constexpr NSUInteger kConstantBufferAlignment = 32;
+constexpr NSUInteger kAppleConstantBufferMinAlignment = 4;
 constexpr NSUInteger kDescriptorBufferAlignment = 4;
 // What a vertex function's post-vertex dump stride adds to its outputs' size (the AMD GPU's).
 constexpr uint64_t kPostVertexDumpPadding = 12;
@@ -472,6 +477,7 @@ NSUInteger accessOf(RgfxAirAccess a)
 // Makes the objects; the first thing it cannot make sets `why`.
 struct Maker {
 	const Classes &c;
+	bool appleGPU = false; // an Apple GPU's answers where they differ (RgfxStageReflectionOfEntry)
 	NSString *why = nil;
 
 	bool fail(NSString *w)
@@ -923,7 +929,10 @@ struct Maker {
 			return nil;
 		}
 		const bool constant = n.addressSpace == 2;
-		const NSUInteger alignment = constant ? kConstantBufferAlignment : n.typeAlign;
+		const NSUInteger alignment =
+		    !constant  ? n.typeAlign
+		    : appleGPU ? std::max<NSUInteger>(n.typeAlign, kAppleConstantBufferMinAlignment)
+		               : kConstantBufferAlignment;
 		id p = pointer(type, st, access, alignment, n.typeSize, argumentBuffer, constant);
 		id b = [make(c.bufferBinding) initWithName:name
 		                                     type:MTLBindingTypeBuffer
@@ -1326,7 +1335,7 @@ NSError *RgfxOverlappingArgumentError(const RgfxAirEntries &module, const RgfxAi
 bool RgfxStageReflectionOfEntry(const RgfxAirEntries &module, const RgfxAirEntry &entry,
                                 const RgfxFunctionConstant *values, uint32_t count, NSString *prefix,
                                 const std::vector<RgfxDescriptorBuffer> &buffers, RgfxStageReflection &out,
-                                NSString *__strong *why)
+                                NSString *__strong *why, bool appleGPU)
 {
 	const Classes &c = classes();
 	if (c.missing != nil) {
@@ -1334,6 +1343,7 @@ bool RgfxStageReflectionOfEntry(const RgfxAirEntries &module, const RgfxAirEntry
 		return false;
 	}
 	Maker m{c};
+	m.appleGPU = appleGPU;
 	NSMutableArray *bindings = [NSMutableArray array];
 	NSMutableArray *builtIns = [NSMutableArray array];
 	// The function as its constants' values specialise it: its nodes' indices, counts and

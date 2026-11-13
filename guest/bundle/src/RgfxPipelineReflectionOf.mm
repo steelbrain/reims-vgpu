@@ -8,6 +8,7 @@
 #import "RgfxFunction.h"
 #import "RgfxGLFunction.h"
 #import "RgfxLibrary.h"
+#import "RgfxTexture.h" // rgfxAppleGPU
 
 #include <mutex>
 #include <set>
@@ -105,7 +106,7 @@ bool RgfxStageReflectionOf(id<MTLFunction> function, NSString *prefix, const std
 	std::shared_ptr<const RgfxClBindings> cl = openCLMode ? [f rgfxClBindings] : nullptr;
 	const RgfxAirEntry entry = cl != nullptr ? clModeEntry(module->entries[0], *cl) : module->entries[0];
 	if (!RgfxStageReflectionOfEntry(*module, entry, [f rgfxConstants], [f rgfxConstantCount], prefix, buffers, out,
-	                                why))
+	                                why, rgfxAppleGPU(f.device)))
 		return false;
 	out.pluginReturnData = RgfxGLPluginReturnData(function);
 	return true;

@@ -6451,9 +6451,50 @@ void test_pipeline_reflection_from_air()
 	CHECK(shape(bindings) == "out:0 params:0 in:0 r:2 s:2 w:2 rw:2 smp:3 tg:1 ");
 	CHECK(shape(ask(basic, @"builtInArguments")) == "gid:15 tid:15 ");
 	CHECK([ask(basic, @"arguments") isEqualToArray:bindings] && ask(basic, @"arguments") != bindings);
+	// On an Apple GPU (rgfxAppleGPU, an arm64 guest's device) a constant buffer's alignment is its
+	// pointee's, but at least 4, 16 for k_basic's params, as the M3 Max answers
+	// (tools/pipeline_reflection_check Apple, macOS 27.0.1), where an x86 Mac's is 32 (below); the
+	// rest of its answers are the same.
+	{
+		id apple = [RgfxAppleFamilyDevice new]; // held: a library keeps its device weakly
+		RgfxLibrary *appleLib = [RgfxLibrary libraryWithData:bytes.bytes
+		                                              length:bytes.length
+		                                                 key:nullptr
+		                                              device:(id<MTLDevice>)apple
+		                                          serializer:&fx.ser
+		                                              status:&status];
+		CHECK(appleLib != nil);
+		[appleLib rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+			          (void)bytes;
+		          })
+		            shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+			            return nil;
+		            }];
+		id appleBasic = RgfxComputePipelineReflectionOf([appleLib newFunctionWithName:@"k_basic"], nil,
+		                                                MTLPipelineOptionBindingInfo);
+		NSArray *appleBindings = ask(appleBasic, @"bindings");
+		CHECK(shape(appleBindings) == "out:0 params:0 in:0 r:2 s:2 w:2 rw:2 smp:3 tg:1 ");
+		if (appleBindings.count == 9) {
+			CHECK(number(appleBindings[1], @"bufferAlignment") == 16 &&
+			      number(appleBindings[1], @"bufferDataSize") == 192 &&
+			      number(ask(appleBindings[1], @"bufferPointerType"), @"alignment") == 16);
+			CHECK(number(appleBindings[0], @"bufferAlignment") == 4 &&
+			      number(appleBindings[2], @"bufferAlignment") == 16);
+		}
+		// At least 4: k_more's constant char, half and half3 are 4, 4 and 8.
+		NSArray *appleMore = ask(RgfxComputePipelineReflectionOf([appleLib newFunctionWithName:@"k_more"], nil,
+		                                                         MTLPipelineOptionBindingInfo),
+		                         @"bindings");
+		CHECK(appleMore.count > 8);
+		if (appleMore.count > 8)
+			CHECK([ask(appleMore[6], @"name") isEqualToString:@"oneChar"] &&
+			      number(appleMore[6], @"bufferAlignment") == 4 && number(appleMore[7], @"bufferAlignment") == 4 &&
+			      number(appleMore[8], @"bufferAlignment") == 8);
+	}
 	if (bindings.count == 9) {
 		id params = bindings[1];
 		CHECK(number(params, @"bufferAlignment") == 32 && number(params, @"bufferDataSize") == 192 &&
+		      number(ask(params, @"bufferPointerType"), @"alignment") == 32 &&
 		      number(params, @"bufferDataType") == MTLDataTypeStruct && number(params, @"access") == 0);
 		NSArray *members = [ask(params, @"bufferStructType") members];
 		CHECK(members.count == 12);

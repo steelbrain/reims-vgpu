@@ -107,8 +107,10 @@ bool stageOf(const Fn &f, NSString *prefix, const std::vector<RgfxDescriptorBuff
 		*why = [NSString stringWithFormat:@"%s: its nodes were not read", f.name.c_str()];
 		return false;
 	}
+	// An Apple GPU's answers on one (rgfxAppleGPU's test, which this tool does not link).
+	const bool apple = [D supportsFamily:MTLGPUFamilyApple7];
 	return RgfxStageReflectionOfEntry(module, module.entries[0], f.values.data(), static_cast<uint32_t>(f.values.size()),
-	                                  prefix, buffers, out, why);
+	                                  prefix, buffers, out, why, apple);
 }
 
 RgfxFunctionConstant constant(uint32_t index, MTLDataType type, int32_t value)
