@@ -611,11 +611,13 @@ bool rgfxPasses(NSRange range, uint64_t count)
 
 void rgfxEndAtViewMetalEnds(MTLPixelFormat from, MTLTextureType fromType, uint64_t levelCount,
                             uint64_t sliceCount, MTLPixelFormat format, MTLTextureType type,
-                            NSRange levels, NSRange slices, bool subrange)
+                            NSRange levels, NSRange slices, bool subrange, id<MTLDevice> device)
 {
 	RgfxFormatBlock a = {}, b = {};
 	NSString *rule = nil;
-	if (format == MTLPixelFormatInvalid) {
+	if (format == MTLPixelFormatInvalid && rgfxAppleGPU(device)) {
+		// An Apple GPU answers nil (RgfxTexture.h), which the view's creator answers too.
+	} else if (format == MTLPixelFormatInvalid) {
 		rule = [NSString stringWithFormat:@"texture view pixelFormat (MTLPixelFormatInvalid) not "
 		                                  @"castable.\nsource texture pixelFormat (%@) not "
 		                                  @"compatible with texture view pixelFormat "
@@ -1557,7 +1559,8 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 // Metal ends the process at a view it does not make (a failed assertion: levels or slices
 // outside the texture, a type of another family, a format of another class), and answers nil
 // for one in no format on the M3 Max. The bundle ends the process where the AMD 5300M and the
-// Intel 630 measurably do (rgfxEndAtViewMetalEnds), and answers nil, sending nothing, for the
+// Intel 630 measurably do, and on an Apple GPU where the M3 Max does (rgfxEndAtViewMetalEnds),
+// and answers nil, sending nothing, for the
 // others it can tell from the texture (rgfxView...); the host refuses any other its platform does
 // not make. It answers nil too for a view of more than one slice of a 2D array over a buffer,
 // which Metal asserts at on the M3 Max and an M4 (`sliceRange.length == 1`: read from
@@ -1579,7 +1582,7 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	const uint64_t parentLevels = self.mipmapLevelCount;
 	const uint64_t parentSlices = rgfxSlicesOf(parentType, self.arrayLength);
 	rgfxEndAtViewMetalEnds(self.pixelFormat, parentType, parentLevels, parentSlices, format, type,
-	                       levels, slices, subrange);
+	                       levels, slices, subrange, self.device);
 	RgfxViewRefusal refusal = kViews;
 	if (format == MTLPixelFormatInvalid) {
 		refusal = kNoFormat;

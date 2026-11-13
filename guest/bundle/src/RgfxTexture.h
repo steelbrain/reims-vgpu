@@ -236,15 +236,18 @@ bool rgfxSurfaceMakesNoTextureOf(MTLTextureDescriptor *_Nullable descriptor,
 /// Ends the process, with Metal's words, at a view of a texture in `from`, of `fromType`,
 /// `levelCount` levels and `sliceCount` slices, that Metal's validation ends it at on the AMD 5300M
 /// and the Intel 630 under macOS 26.7.1 with no validation layer (oracle_bundle view.*): in no
-/// format (MTLPixelFormatInvalid, which the M3 Max under macOS 27.0.1 answers nil for); in a
+/// format (MTLPixelFormatInvalid), but where `device` is an Apple GPU (rgfxAppleGPU), as the M3
+/// Max under macOS 27.0.1 answers nil for it (oracle_bundle Apple view.noformat, 11-13); in a
 /// format of one texel a block of other bytes than the texture's (RGBA16Float in RGBA8Unorm); and,
 /// for a view naming its type, levels and slices (`subrange`), levels or slices past the
 /// texture's, a type of another family (a 2D texture as 3D), or a cube's slices not a multiple of
-/// six, as the M3 Max's does. It returns for any other view, among them those the oracles did not
-/// measure (empty ranges, other slice counts, compressed formats), which the bundle answers nil.
+/// six. The M3 Max ends the process at each of these in the same words (oracle_bundle Apple
+/// view.*, 11-13). It returns for any other view, among them those the oracles did not measure
+/// (empty ranges, other slice counts, compressed formats), which the bundle answers nil.
 void rgfxEndAtViewMetalEnds(MTLPixelFormat from, MTLTextureType fromType, uint64_t levelCount,
                             uint64_t sliceCount, MTLPixelFormat format, MTLTextureType type,
-                            NSRange levels, NSRange slices, bool subrange);
+                            NSRange levels, NSRange slices, bool subrange,
+                            id<MTLDevice> _Nullable device = nil);
 
 /// A device whose linear texture alignment the bundle's own callers ask without
 /// `minimumLinearTextureAlignmentForPixelFormat:`, which ends the process at some formats

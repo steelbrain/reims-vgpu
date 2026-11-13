@@ -2638,6 +2638,15 @@ static int dies_case(const char *name)
 		viewOf(MTLPixelFormatRGBA8Unorm, MTLTextureType3D, one, one, true);
 	if (std::strcmp(name, "view-cube-count") == 0)
 		viewOf(MTLPixelFormatRGBA8Unorm, MTLTextureTypeCube, one, NSMakeRange(0, 4), true);
+	// On an Apple GPU: the rules the M3 Max ends the process at as the x86 Macs do.
+	if (std::strcmp(name, "apple-view-format-class") == 0)
+		rgfxEndAtViewMetalEnds(MTLPixelFormatRGBA16Float, MTLTextureType2D, 1, 1,
+		                       MTLPixelFormatRGBA8Unorm, MTLTextureType2D, one, one, false,
+		                       (id<MTLDevice>)[RgfxAppleFamilyDevice new]);
+	if (std::strcmp(name, "apple-view-levels") == 0)
+		rgfxEndAtViewMetalEnds(MTLPixelFormatRGBA8Unorm, MTLTextureType2D, 3, 1,
+		                       MTLPixelFormatRGBA8Unorm, MTLTextureType2D, NSMakeRange(2, 3), one,
+		                       true, (id<MTLDevice>)[RgfxAppleFamilyDevice new]);
 	// A function of GL IR's encoder, at any buffer index.
 	if (std::strcmp(name, "gl-function-encoder") == 0) {
 		const uint8_t ir[8] = {4, 0, 0, 0, 3, 0, 0, 0};
@@ -2741,6 +2750,36 @@ void test_metal_ended_views_end_the_process()
 	              .c_str());
 	checkDies("view-cube-count",
 	          (kWhere + "newSliceRange.length(4) must be a multiple of (6).\n'").c_str());
+}
+
+// On a device that answers as an Apple GPU, a view in no format goes on, as the M3 Max under
+// macOS 27.0.1 answers nil for it (oracle_bundle Apple view.noformat), and its creator answers
+// nil; the view's other rules end the process as on the x86 Macs, in their words (view.class,
+// view.levels, view.slices, view.type and view.slicecount). An arm64 guest's device takes the
+// M3's; where the device answers no Apple family, a view in no format still ends the process
+// (view-no-format, above).
+void test_views_as_an_apple_gpu()
+{
+	const NSRange one = NSMakeRange(0, 1);
+	rgfxEndAtViewMetalEnds(MTLPixelFormatRGBA8Unorm, MTLTextureType2D, 1, 1,
+	                       MTLPixelFormatInvalid, MTLTextureType2D, one, one, false,
+	                       (id<MTLDevice>)[RgfxAppleFamilyDevice new]);
+	g_checks++;
+#if defined(__arm64__)
+	rgfxEndAtViewMetalEnds(MTLPixelFormatRGBA8Unorm, MTLTextureType2D, 1, 1,
+	                       MTLPixelFormatInvalid, MTLTextureType2D, one, one, false,
+	                       (id<MTLDevice>)[RgfxGuestRulesDevice new]);
+	g_checks++;
+#endif
+	const std::string kWhere = "_mtlValidateArgumentsForTextureViewOnDevice: failed assertion "
+	                           "`Texture Creation\n";
+	checkDies("apple-view-format-class",
+	          (kWhere + "source texture pixelFormat (MTLPixelFormatRGBA16Float) not compatible "
+	                    "with texture view pixelFormat (MTLPixelFormatRGBA8Unorm).\n'")
+	              .c_str());
+	checkDies("apple-view-levels", (kWhere + "(newLevelRange.location + newLevelRange.length)(5) "
+	                                         "must be <= [texture mipmapLevelCount](3).\n'")
+	                                   .c_str());
 }
 
 // A function's encoder at a buffer index where its AIR declares no buffer ends the process with
@@ -18947,6 +18986,7 @@ int main(int argc, char **argv)
 		test_memoryless_icb_ends_the_process();
 		test_texture_views();
 		test_metal_ended_views_end_the_process();
+		test_views_as_an_apple_gpu();
 		test_function_encoder_of_no_buffer_ends_the_process();
 		test_texture_framebuffer_only();
 		test_texture_unknown_usage();
