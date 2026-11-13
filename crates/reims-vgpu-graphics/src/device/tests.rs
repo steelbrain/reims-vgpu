@@ -85,12 +85,14 @@ enum Seen {
     },
 }
 
-/// A host that counts its interrupts and records the presents and refreshes it is told of.
+/// A host that counts its interrupts and records the presents and refreshes it is told of, and
+/// what the device told it of the control completion ring.
 struct TestHost {
     interrupts: Arc<AtomicU32>,
     presented: Presented,
     refreshes: Arc<AtomicU32>,
     seen: Arc<Mutex<Vec<Seen>>>,
+    degraded: Arc<Mutex<Vec<RingDegradation>>>,
 }
 
 /// The one IOSurface the test host holds a texture over.
@@ -103,6 +105,9 @@ impl Host for TestHost {
     }
     fn refreshed(&self) {
         self.refreshes.fetch_add(1, Ordering::SeqCst);
+    }
+    fn ring_degraded(&self, kind: RingDegradation) {
+        self.degraded.lock().push(kind);
     }
     fn present_surface(&self, iosurface_id: u32, generation: Option<u64>, answer: PresentAnswer) {
         self.presented.lock().push((iosurface_id, generation));
@@ -138,6 +143,8 @@ struct Rig {
     refreshes: Arc<AtomicU32>,
     /// What the host was handed on the presents' lane.
     seen: Arc<Mutex<Vec<Seen>>>,
+    /// What the device told the host of the control completion ring.
+    degraded: Arc<Mutex<Vec<RingDegradation>>>,
     /// The guest's count of the submission ring.
     produced: u64,
     /// The guest's count of the completion ring.
@@ -158,17 +165,20 @@ impl Rig {
         let presented = Arc::new(Mutex::new(Vec::new()));
         let refreshes = Arc::new(AtomicU32::new(0));
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let degraded = Arc::new(Mutex::new(Vec::new()));
         let host = TestHost {
             interrupts: Arc::clone(&interrupts),
             presented: Arc::clone(&presented),
             refreshes: Arc::clone(&refreshes),
             seen: Arc::clone(&seen),
+            degraded: Arc::clone(&degraded),
         };
         let mut rig = Rig::with_host(Box::new(host));
         rig.interrupts = interrupts;
         rig.presented = presented;
         rig.refreshes = refreshes;
         rig.seen = seen;
+        rig.degraded = degraded;
         rig
     }
 
@@ -202,6 +212,7 @@ impl Rig {
             presented,
             refreshes: Arc::new(AtomicU32::new(0)),
             seen: Arc::new(Mutex::new(Vec::new())),
+            degraded: Arc::new(Mutex::new(Vec::new())),
             produced: 0,
             consumed: 0,
             seqno: 0,
@@ -1246,6 +1257,61 @@ fn a_full_completion_ring_holds_the_commands_back() {
     for seqno in 1..=count {
         assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
     }
+}
+
+/// The control completion ring's full spell is told to the host once, at its first post that
+/// found no room, a `VBLANK` it has no room for is dropped and told, and the post that waited is
+/// told once it goes on; a ring with room tells nothing, and each later spell is told again
+#[test]
+fn a_full_control_ring_tells_its_spell_its_waited_posts_and_its_dropped_vblanks() {
+    use RingDegradation::{ControlPostWaited, ControlRingFull, VblankDropped};
+    let mut rig = Rig::new();
+    rig.start();
+    let s = rig.send(vblank(1));
+    assert_eq!(rig.complete(), (s, RGFX_STATUS_OK));
+    rig.refresh();
+    assert!(rig.event().is_some(), "a VBLANK");
+    assert_eq!(*rig.degraded.lock(), []);
+
+    // 24-byte answers: the 32 KiB ring holds 1365 of them.
+    let count = 1400u64;
+    for _ in 0..count {
+        rig.send(vblank(1));
+    }
+    assert!(
+        eventually(|| !rig.degraded.lock().is_empty()),
+        "the ring never filled"
+    );
+    // The control thread waits for room for its answer: the spell is told, no waited post yet.
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(*rig.degraded.lock(), [ControlRingFull]);
+    rig.refresh();
+    rig.refresh();
+    assert_eq!(
+        *rig.degraded.lock(),
+        [ControlRingFull, VblankDropped, VblankDropped]
+    );
+
+    // The guest takes every answer: the waiting posts go on, each spell told at its start.
+    for seqno in 2..=count + 1 {
+        assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    }
+    rig.lanes_done();
+    let told = rig.degraded.lock().clone();
+    let spells = told.iter().filter(|&&k| k == ControlRingFull).count();
+    let waited = told.iter().filter(|&&k| k == ControlPostWaited).count();
+    assert_eq!(told.iter().filter(|&&k| k == VblankDropped).count(), 2);
+    assert!(
+        spells >= 1 && waited >= spells,
+        "every spell after the refreshes began with a post that waited: {told:?}"
+    );
+    assert_eq!(told.len(), spells + waited + 2);
+
+    // Room again: a VBLANK is posted, with the count of its refresh, and nothing is told.
+    rig.refresh();
+    let v = RgfxVblank::read_from_bytes(&rig.event().unwrap()).unwrap();
+    assert_eq!((v.header.r#type, v.count), (RGFX_EVT_VBLANK, 4));
+    assert_eq!(rig.degraded.lock().len(), told.len());
 }
 
 /// A post waiting for room on ring 0's full completion ring, driven as the guest's kext drives

@@ -2638,6 +2638,23 @@ pub fn out_of_host_memory_count() -> u64 {
     OUT_OF_HOST_MEMORY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The kinds a caller outside this crate counts by code ([`count_kind`]), each with how many
+/// times: `reims-vgpu`'s, as its reims-graphics device tells it of its control completion ring
+/// (`control-ring-full`, `control-ring-post-waited`, `vblank-dropped`).
+static COUNTED: crate::core::sync::Mutex<Vec<(&'static str, u64)>> =
+    crate::core::sync::Mutex::new(Vec::new());
+
+/// Counts one more of the kind of code `code`, kept outside this crate, which
+/// [`degradation_counts`] gives with the rest. Its line is the caller's to log, once per kind
+/// (docs/conventions.md).
+pub fn count_kind(code: &'static str) {
+    let mut counted = COUNTED.lock();
+    match counted.iter_mut().find(|(c, _)| *c == code) {
+        Some((_, n)) => *n += 1,
+        None => counted.push((code, 1)),
+    }
+}
+
 /// Each kind of [`Inexact`] this process relayed, with how many times.
 pub fn inexact_counts() -> Vec<(Inexact, u64)> {
     use std::sync::atomic::Ordering;
@@ -2651,8 +2668,9 @@ pub fn inexact_counts() -> Vec<(Inexact, u64)> {
 /// of [`DIES`] relayed ([`relayed_counts`]) or relayed natively (`native::counts`), those of
 /// [`RELAYED_ONCE`] and the others the runtime announced, the kinds of [`Inexact`]
 /// ([`inexact_counts`]), the calls answered as when memory runs out (`out-of-host-memory`,
-/// [`out_of_host_memory_count`]), and the driver's and layers' messages relayed, by id name
-/// ([`relay`]). Sorted by code, a code met twice summed.
+/// [`out_of_host_memory_count`]), the driver's and layers' messages relayed, by id name
+/// ([`relay`]), and the kinds counted outside this crate ([`count_kind`]). Sorted by code, a code
+/// met twice summed.
 pub fn degradation_counts() -> Vec<(String, u64)> {
     use std::sync::atomic::Ordering;
     let code = |(k, n): (rt::Degradation, u64)| (k.code().to_owned(), n);
@@ -2669,6 +2687,7 @@ pub fn degradation_counts() -> Vec<(String, u64)> {
             out_of_host_memory_count(),
         )))
         .chain(DRIVER_SAID.lock().counts())
+        .chain(COUNTED.lock().iter().map(|&(c, n)| (c.to_owned(), n)))
         .filter(|&(_, n)| n > 0)
         .collect();
     all.sort();
@@ -2864,6 +2883,19 @@ mod tests {
             .as_deref(),
             Some("reims-vgpu: degradation counts: inexact-heap-layout 3, out-of-host-memory 1\n")
         );
+    }
+
+    /// A kind counted outside this crate by its code ([`count_kind`]) is in the degradation
+    /// counts with how many times it was counted, as the reims-graphics device's control
+    /// completion ring's kinds reach the counts' line
+    #[test]
+    fn a_kind_counted_by_code_is_in_the_degradation_counts() {
+        let code = "test-counted-by-code";
+        let counted = || (degradation_counts().into_iter()).find(|(c, _)| c == code);
+        assert_eq!(counted(), None);
+        count_kind(code);
+        count_kind(code);
+        assert_eq!(counted(), Some((code.to_owned(), 2)));
     }
 
     /// Every kind of degradation the runtime has is placed here once: it dies ([`DIES`]), a

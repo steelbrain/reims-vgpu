@@ -192,7 +192,7 @@ use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use zerocopy::{FromBytes, IntoBytes};
@@ -718,6 +718,42 @@ pub trait Host: Send + Sync + 'static {
     fn trace(&self, kind: &'static str, values: &[u64]) {
         let _ = (kind, values);
     }
+
+    /// The device met `kind` on the control completion ring ([`RingDegradation`]): the host
+    /// counts it with the process's degradations. Called on the thread that posted, with no
+    /// lock of the device's held, after the device logged the kind's line. The default does
+    /// nothing.
+    fn ring_degraded(&self, kind: RingDegradation) {
+        let _ = kind;
+    }
+}
+
+/// What the device tells its host of the control completion ring ([`Host::ring_degraded`]):
+/// every process's ring-0 answers, the `PRESENT_SURFACE` answers and the display's events share
+/// that one ring, and the guest's kext drains it on its work loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RingDegradation {
+    /// A post found the ring with no room where the post before it on the ring found room: a
+    /// spell begins in which the control thread takes no ring-0 command until its answer is
+    /// posted, the other posters wait, and a `VBLANK` is dropped.
+    ControlRingFull,
+    /// A post that waits for room found none at its first look, and went on once the guest took
+    /// more, the device was reset or it ended.
+    ControlPostWaited,
+    /// A `VBLANK` found no room and was dropped: the guest gets no event for that refresh, and the
+    /// next `VBLANK` carries the count.
+    VblankDropped,
+}
+
+impl RingDegradation {
+    /// The kind's code, which the process's degradation counts name.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ControlRingFull => "control-ring-full",
+            Self::ControlPostWaited => "control-ring-post-waited",
+            Self::VblankDropped => "vblank-dropped",
+        }
+    }
 }
 
 /// The largest `COMMAND_BUFFER` message a doorbell's thread offers the host
@@ -776,6 +812,10 @@ pub(crate) struct Shared {
     /// How long a post waits for room before it looks again, in nanoseconds: [`ROOM_POLL`]; the
     /// tests make it long to see what wakes a post.
     room_poll_ns: AtomicU64,
+    /// Whether the last post onto the control completion ring found no room: set and cleared with
+    /// the ring held, so a full spell is told once, at its first post that found no room
+    /// ([`RingDegradation::ControlRingFull`]).
+    control_full: AtomicBool,
     /// The control submission ring's count through the last message the control thread has
     /// carried out, handed to the host or handed to a lane: a command buffer waits for it to pass
     /// the last message published before it that is its context's or every buffer's
@@ -1063,6 +1103,7 @@ impl Device {
             completion: Mutex::new(producer),
             room: Room::default(),
             room_poll_ns: AtomicU64::new(u64::try_from(ROOM_POLL.as_nanos()).unwrap_or(u64::MAX)),
+            control_full: AtomicBool::new(false),
             control_done: AtomicU64::new(0),
             gate: Gate::default(),
             lanes: Arc::new(lanes),
@@ -1817,15 +1858,43 @@ impl Shared {
         self.post_waiting(&submit_room(), epoch);
     }
 
-    /// Posts `message`, waiting for room ([`Room`]) while the device is not reset or ended.
+    /// Posts `message`, waiting for room ([`Room`]) while the device is not reset or ended. A
+    /// post that waited is told to the host ([`RingDegradation::ControlPostWaited`]).
     fn post_waiting(&self, message: &[u8], epoch: u64) {
+        let mut waited_since = None;
         loop {
             let seen = self.room.wakes();
             if self.post(message, epoch) != Post::NoRoom || self.ending() {
+                if let Some(since) = waited_since {
+                    self.post_waited(since);
+                }
                 return;
             }
+            waited_since.get_or_insert_with(Instant::now);
             self.room.wait(seen, self.room_poll());
         }
+    }
+
+    /// A post onto the control completion ring that waited for room since `since` went on.
+    fn post_waited(&self, since: Instant) {
+        log::warn!(
+            target: "reims_vgpu_graphics",
+            "a post onto the full control completion ring waited {:.1} ms for room",
+            since.elapsed().as_secs_f64() * 1e3
+        );
+        self.host.ring_degraded(RingDegradation::ControlPostWaited);
+    }
+
+    /// The first post of a full spell of the control completion ring found no room for
+    /// `message`.
+    fn control_ring_filled(&self, message: &[u8]) {
+        let ty = RgfxMsgHeader::read_from_prefix(message).map_or(0, |(header, _)| header.r#type);
+        log::warn!(
+            target: "reims_vgpu_graphics",
+            "the control completion ring is full: a message of type {ty:#x} found no room, and \
+             ring 0's answers and events wait for the guest to take more"
+        );
+        self.host.ring_degraded(RingDegradation::ControlRingFull);
     }
 
     /// How long a post waits for room before it looks again ([`ROOM_POLL`]).
@@ -1850,8 +1919,18 @@ impl Shared {
                 return Post::Dropped;
             }
             match completion.post(&self.region, message) {
-                Posted::Yes { raise } => raise,
-                Posted::NoRoom => return Post::NoRoom,
+                Posted::Yes { raise } => {
+                    self.control_full.store(false, Ordering::Relaxed);
+                    raise
+                }
+                Posted::NoRoom => {
+                    let began = !self.control_full.swap(true, Ordering::Relaxed);
+                    drop(completion);
+                    if began {
+                        self.control_ring_filled(message);
+                    }
+                    return Post::NoRoom;
+                }
                 Posted::Broken(broken) => {
                     log::warn!(
                         target: "reims_vgpu_graphics", kind:% = broken;
@@ -2914,7 +2993,14 @@ impl Shared {
                 host_time_ns: now,
             };
             // One the ring has no room for is dropped; the next carries the count.
-            let _ = self.post(&sized(&event), epoch);
+            if self.post(&sized(&event), epoch) == Post::NoRoom {
+                log::warn!(
+                    target: "reims_vgpu_graphics",
+                    "the VBLANK of refresh {count} found the control completion ring full and \
+                     was dropped: the next carries the count"
+                );
+                self.host.ring_degraded(RingDegradation::VblankDropped);
+            }
         }
         if changed {
             let event = RgfxDisplayChanged {

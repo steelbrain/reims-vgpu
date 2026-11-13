@@ -2088,7 +2088,12 @@ recovery, where its full cost is paid for the simpler design (owner,
 pages under the scanout are imported at its first draw, and again only when
 the guest moves the scanout or changes its size, so no copy is made on the way
 to the window, and no other page of the region is pinned for it. While vblank is
-enabled, the host sends `VBLANK` at each refresh of the window's screen.
+enabled, the host sends `VBLANK` at each refresh of the window's screen. A
+`VBLANK` the control completion ring has no room for is dropped, and the next
+carries the count; the host counts each dropped one (`vblank-dropped`), each
+spell of that ring with no room (`control-ring-full`), and each post onto it
+that waited for room (`control-ring-post-waited`) in its degradation counts,
+and logs the first of each kind.
 
 **The display's density.** Where the guest took `DISPLAY_SCALE`, the host
 tells it the scale of the screen its window was last drawn on, and the kext

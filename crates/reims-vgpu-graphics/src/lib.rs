@@ -32,5 +32,6 @@ pub mod wire;
 
 pub use device::{
     CompleteAnswer, CompletionPoster, Device, Host, PresentAnswer, QueueClaim, REGION_SIZE,
+    RingDegradation,
 };
 pub use display::{CursorImage, FixedScreen, Mode, Scanout, Screen};

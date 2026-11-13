@@ -80,8 +80,8 @@ use reims_vgpu_graphics::wire::{
     RgfxSharedEventName, RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
 use reims_vgpu_graphics::{
-    CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim, Scanout,
-    Screen,
+    CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim,
+    RingDegradation, Scanout, Screen,
 };
 use reims_vgpu_vulkan::core::host::HostQueue;
 use reims_vgpu_vulkan::core::memory::map::MemoryMap as CoreMemoryMap;
@@ -2587,6 +2587,10 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
 
     fn trace(&self, kind: &'static str, values: &[u64]) {
         reims_vgpu_vulkan::core::trace::event(kind, values);
+    }
+
+    fn ring_degraded(&self, kind: RingDegradation) {
+        reims_vgpu_vulkan::answer::count_kind(kind.code());
     }
 
     fn present_surface(&self, iosurface_id: u32, generation: Option<u64>, answer: PresentAnswer) {
