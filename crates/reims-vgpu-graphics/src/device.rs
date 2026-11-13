@@ -192,7 +192,7 @@ use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use zerocopy::{FromBytes, IntoBytes};
@@ -1870,17 +1870,18 @@ impl Shared {
                 }
                 return;
             }
-            waited_since.get_or_insert_with(Instant::now);
+            waited_since.get_or_insert_with(now_ns);
             self.room.wait(seen, self.room_poll());
         }
     }
 
-    /// A post onto the control completion ring that waited for room since `since` went on.
-    fn post_waited(&self, since: Instant) {
+    /// A post onto the control completion ring that waited for room since `since_ns`
+    /// ([`now_ns`]) went on.
+    fn post_waited(&self, since_ns: u64) {
         log::warn!(
             target: "reims_vgpu_graphics",
             "a post onto the full control completion ring waited {:.1} ms for room",
-            since.elapsed().as_secs_f64() * 1e3
+            now_ns().saturating_sub(since_ns) as f64 / 1e6
         );
         self.host.ring_degraded(RingDegradation::ControlPostWaited);
     }
