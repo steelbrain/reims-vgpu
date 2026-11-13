@@ -53,8 +53,14 @@ pub(crate) const RECORDS: &str = ".cache/reims-vgpu-vulkan-pipelines";
 /// The most bytes the records file holds: past them, no record is appended.
 pub(crate) const CAPACITY: u64 = 64 << 20;
 
-/// The driver's pipeline cache data one warm pass may add, in bytes (`Device::warm`'s budget):
-/// more than a macOS guest's login and built-in apps make, so the pass reaches every record.
+/// The driver's pipeline cache data one warm pass may add, in bytes (`Device::warm`'s budget): the
+/// pass stops before its next record once its makings added this much, and counts the records left
+/// as not run. A making whose data the shader cache holds already adds nothing, so the budget binds
+/// only where the records' data is made anew, as after a change of the translator or the driver.
+/// **Measured** 2026-11-12 on homelab-um790-xtx-1's RTX 2080 (NVIDIA 620.70.06), a macOS 26
+/// guest's walk after a translator change (job m3-max-23661): of 4,565 records, 2,573 were made,
+/// 130 translated only and 130 failed, 1 was unread, and 1,731 were not run, the budget spent by
+/// 4.30 GB of driver data within 50 s, about 1.7 MB a pipeline.
 pub(crate) const WARM_BUDGET: u64 = 4 << 30;
 
 /// How often the warm thread looks whether the runtime's pass has ended.
