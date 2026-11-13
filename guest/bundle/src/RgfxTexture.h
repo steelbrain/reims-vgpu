@@ -213,10 +213,25 @@ void rgfxEndAtUnalignableLinearFormat(MTLPixelFormat format);
 /// Then over a surface without planes: at a type other than 2D or TextureBuffer, a depth other than 1, more
 /// than one level, rows wider than the surface's bytesPerRow (a compressed or 4:2:2 format's
 /// counted in its blocks), a depth or stencil format, a plane other than 0, and more rows than
-/// the surface's. The device's creator calls it before it sends the host anything; it returns for
-/// any other texture, which the creator makes, or answers nil for (RgfxIOSurfaceTexture).
+/// the surface's. Over a plane of a surface with planes, on an Apple GPU (rgfxAppleGPU), at a
+/// Cube or CubeArray type, as the M3 Max under macOS 27.0.1 ends it at a plane of a one-plane
+/// BGRA surface and the luma plane of a 420v one ("carriesComplexTexture || numFaces == 1",
+/// oracle_surftex Apple), where the x86 Macs make it. The device's creator calls it before it
+/// sends the host anything; it returns for any other texture, which the creator makes, or answers
+/// nil for (rgfxSurfaceMakesNoTextureOf, RgfxIOSurfaceTexture).
 void rgfxEndAtInvalidSurfaceTexture(MTLTextureDescriptor *descriptor, IOSurfaceRef surface,
                                     NSUInteger plane, id<MTLDevice> device = nil);
+
+/// Whether newTextureWithDescriptor:iosurface:plane: answers nil for `descriptor`, past what it
+/// ends the process at (rgfxEndAtInvalidSurfaceTexture), sending nothing: on an Apple GPU
+/// (rgfxAppleGPU), a compressed format it has (rgfxBlockCompressedFormat: BC, PVRTC, EAC, ETC2,
+/// ASTC), and a two-plane format of 4:2:0 or 4:2:2 chroma of an odd width or height that is a
+/// render target or that a shader writes, as the M3 Max under macOS 27.0.1 answers over a surface
+/// without planes, a one-plane surface's plane and either plane of a 420v surface (oracle_surftex
+/// Apple, Q20); 4:4:4 and XR10 ones it makes. The x86 Macs make a BC texture wherever its rows fit
+/// and end the process at every two-plane format (rgfxEndAtInvalidTextureDescriptor).
+bool rgfxSurfaceMakesNoTextureOf(MTLTextureDescriptor *_Nullable descriptor,
+                                 id<MTLDevice> _Nullable device);
 
 /// Ends the process, with Metal's words, at a view of a texture in `from`, of `fromType`,
 /// `levelCount` levels and `sliceCount` slices, that Metal's validation ends it at on the AMD 5300M

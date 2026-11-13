@@ -2007,6 +2007,162 @@ static const uint64_t kTwoPlaneFormats[] = {500, 502, 503, 505, 506, 507, 508, 5
                                             520, 522, 523, 525, 526, 527, 528, 529, 530,
                                             540, 541, 542, 543, 544, 545, 550, 551};
 
+// Textures over a surface as oracle_surftex asked them of the M3 Max under macOS 27.0.1 (11-13,
+// with no validation layer; docs/graphics-kext/dgpu-oracle.md, Q20) where an Apple GPU answers
+// otherwise than the x86 Macs, or where the x86 Macs were not asked: over a 64 x 64 'BGRA'
+// surface without planes or of one plane (SurfaceKind), or a 64 x 64 '420v' one (k420vPlane0 and
+// k420vPlane1), with the M3's words where it ended the process, else whether it answered nil.
+enum AppleSurface { kAppleFlat, kAppleOnePlane, k420vPlane0, k420vPlane1 };
+struct AppleSurfaceCase {
+	const char *name;
+	AppleSurface surface;
+	MTLPixelFormat format;
+	MTLTextureType type;
+	NSUInteger width, height;
+	MTLTextureUsage usage;
+	MTLStorageMode storage;
+	const char *words; // null: it goes on
+	bool none;         // where it goes on: nil, else made
+};
+static const MTLTextureUsage kRead = MTLTextureUsageShaderRead;
+static const MTLTextureUsage kTarget = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+static const MTLTextureUsage kWritten = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+#define RGFX_FMT(N) static_cast<MTLPixelFormat>(N)
+static const AppleSurfaceCase kAppleSurfaceCases[] = {
+    // A cube over a plane: the M3's IOGPUMetalTexture asserts.
+    {"apple-surface-plane-cube", kAppleOnePlane, MTLPixelFormatBGRA8Unorm, MTLTextureTypeCube, 64,
+     64, kRead, kManaged, "carriesComplexTexture || numFaces == 1", false},
+    {"apple-surface-plane-cube-32", kAppleOnePlane, MTLPixelFormatBGRA8Unorm, MTLTextureTypeCube,
+     32, 32, kRead, kManaged, "carriesComplexTexture || numFaces == 1", false},
+    {"apple-surface-plane-cube-array", kAppleOnePlane, MTLPixelFormatBGRA8Unorm,
+     MTLTextureTypeCubeArray, 64, 64, kRead, kManaged, "carriesComplexTexture || numFaces == 1",
+     false},
+    {"apple-surface-420v-cube", k420vPlane0, MTLPixelFormatR8Unorm, MTLTextureTypeCube, 64, 64,
+     kRead, kManaged, "carriesComplexTexture || numFaces == 1", false},
+    {"apple-surface-420v-cube-array", k420vPlane0, MTLPixelFormatR8Unorm, MTLTextureTypeCubeArray,
+     64, 64, kRead, kManaged, "carriesComplexTexture || numFaces == 1", false},
+    // A compressed format: its rows and height checked as the x86 Macs check them, then nil.
+    {"apple-surface-astc-wider", kAppleFlat, MTLPixelFormatASTC_4x4_LDR, k2D, 68, 64, kRead,
+     kManaged, "Descriptor rowBytes (272) > IOSurface rowBytes (256)'", false},
+    {"apple-surface-astc-taller", kAppleFlat, MTLPixelFormatASTC_4x4_LDR, k2D, 64, 68, kRead,
+     kManaged, "Descriptor height*arrayLength > IOSurface height'", false},
+    {"apple-surface-bc1-wider", kAppleFlat, MTLPixelFormatBC1_RGBA, k2D, 132, 64, kRead, kManaged,
+     "Descriptor rowBytes (264) > IOSurface rowBytes (256)'", false},
+    {"apple-surface-bc1", kAppleFlat, MTLPixelFormatBC1_RGBA, k2D, 64, 64, kRead, kManaged, nullptr,
+     true},
+    {"apple-surface-bc1-128", kAppleFlat, MTLPixelFormatBC1_RGBA, k2D, 128, 64, kRead, kManaged,
+     nullptr, true},
+    {"apple-surface-bc1-62", kAppleFlat, MTLPixelFormatBC1_RGBA, k2D, 62, 64, kRead, kManaged,
+     nullptr, true},
+    {"apple-surface-bc1-private", kAppleFlat, MTLPixelFormatBC1_RGBA, k2D, 64, 64, kRead,
+     MTLStorageModePrivate, nullptr, true},
+    {"apple-surface-bc7", kAppleFlat, MTLPixelFormatBC7_RGBAUnorm, k2D, 64, 64, kRead, kManaged,
+     nullptr, true},
+    {"apple-surface-astc", kAppleFlat, MTLPixelFormatASTC_4x4_LDR, k2D, 64, 64, kRead, kManaged,
+     nullptr, true},
+    {"apple-surface-etc2", kAppleFlat, MTLPixelFormatETC2_RGB8, k2D, 64, 64, kRead, kManaged,
+     nullptr, true},
+    {"apple-surface-eac", kAppleFlat, MTLPixelFormatEAC_R11Unorm, k2D, 64, 64, kRead, kManaged,
+     nullptr, true},
+    {"apple-surface-pvrtc", kAppleFlat, RGFX_FMT(166), k2D, 64, 64, kRead, kManaged, nullptr, true},
+    {"apple-surface-plane-bc1", kAppleOnePlane, MTLPixelFormatBC1_RGBA, k2D, 64, 64, kRead,
+     kManaged, nullptr, true},
+    {"apple-surface-plane-bc7", kAppleOnePlane, MTLPixelFormatBC7_RGBAUnorm, k2D, 64, 64, kRead,
+     kManaged, nullptr, true},
+    {"apple-surface-plane-astc", kAppleOnePlane, MTLPixelFormatASTC_4x4_LDR, k2D, 64, 64, kRead,
+     kManaged, nullptr, true},
+    {"apple-surface-plane-etc2", kAppleOnePlane, MTLPixelFormatETC2_RGB8, k2D, 64, 64, kRead,
+     kManaged, nullptr, true},
+    {"apple-surface-420v-bc1", k420vPlane0, MTLPixelFormatBC1_RGBA, k2D, 64, 64, kRead, kManaged,
+     nullptr, true},
+    // A subsampled two-plane format of an odd side, written: nil; read, or of even sides: made;
+    // a 4:4:4 or XR10 one: made.
+    {"apple-surface-500-63x63-target", k420vPlane0, RGFX_FMT(500), k2D, 63, 63, kTarget, kManaged,
+     nullptr, true},
+    {"apple-surface-500-64x63-target", k420vPlane0, RGFX_FMT(500), k2D, 64, 63, kTarget, kManaged,
+     nullptr, true},
+    {"apple-surface-500-63x64-target", k420vPlane0, RGFX_FMT(500), k2D, 63, 64, kTarget, kManaged,
+     nullptr, true},
+    {"apple-surface-500-63x63-written", k420vPlane0, RGFX_FMT(500), k2D, 63, 63, kWritten,
+     kManaged, nullptr, true},
+    {"apple-surface-500-chroma-31x31-target", k420vPlane1, RGFX_FMT(500), k2D, 31, 31, kTarget,
+     kManaged, nullptr, true},
+    {"apple-surface-500-plane-63x63-target", kAppleOnePlane, RGFX_FMT(500), k2D, 63, 63, kTarget,
+     kManaged, nullptr, true},
+    {"apple-surface-500-flat-63x63-target", kAppleFlat, RGFX_FMT(500), k2D, 63, 63, kTarget,
+     kManaged, nullptr, true},
+    {"apple-surface-502-64x63-target", k420vPlane0, RGFX_FMT(502), k2D, 64, 63, kTarget, kManaged,
+     nullptr, true},
+    {"apple-surface-544-63x63-written", k420vPlane0, RGFX_FMT(544), k2D, 63, 63, kWritten,
+     kManaged, nullptr, true},
+    {"apple-surface-500-63x63-read", k420vPlane0, RGFX_FMT(500), k2D, 63, 63, kRead, kManaged,
+     nullptr, false},
+    {"apple-surface-500-flat-63x63-read", kAppleFlat, RGFX_FMT(500), k2D, 63, 63, kRead, kManaged,
+     nullptr, false},
+    {"apple-surface-500-62x62-target", k420vPlane0, RGFX_FMT(500), k2D, 62, 62, kTarget, kManaged,
+     nullptr, false},
+    {"apple-surface-500-target", k420vPlane0, RGFX_FMT(500), k2D, 64, 64, kTarget, kManaged,
+     nullptr, false},
+    {"apple-surface-503-63x63-target", k420vPlane0, RGFX_FMT(503), k2D, 63, 63, kTarget, kManaged,
+     nullptr, false},
+    {"apple-surface-545-63x63-written", k420vPlane0, RGFX_FMT(545), k2D, 63, 63, kWritten,
+     kManaged, nullptr, false},
+    {"apple-surface-550-63x63-target", k420vPlane0, RGFX_FMT(550), k2D, 63, 63, kTarget, kManaged,
+     nullptr, false},
+    // What the x86 Macs end the process at and the M3 makes.
+    {"apple-surface-b5g6r5", kAppleFlat, MTLPixelFormatB5G6R5Unorm, k2D, 64, 64, kRead, kManaged,
+     nullptr, false},
+    {"apple-surface-memoryless", kAppleFlat, MTLPixelFormatBGRA8Unorm, k2D, 64, 64, kRead,
+     MTLStorageModeMemoryless, nullptr, false},
+    {"apple-surface-500-flat", kAppleFlat, RGFX_FMT(500), k2D, 64, 64, kRead, kManaged, nullptr,
+     false},
+    {"apple-surface-plane-array", kAppleOnePlane, MTLPixelFormatBGRA8Unorm,
+     MTLTextureType2DArray, 64, 64, kRead, kManaged, nullptr, false},
+};
+#undef RGFX_FMT
+
+// The surface of `c`, retained, and the 420v pixel buffer that holds it where it is one.
+static IOSurfaceRef surfaceOf(const AppleSurfaceCase &c, CVPixelBufferRef *pb)
+{
+	*pb = nullptr;
+	if (c.surface == kAppleFlat || c.surface == kAppleOnePlane) {
+		const SurfaceCase s = {c.name, c.surface == kAppleFlat ? kFlat : kOnePlane, 0, c.format,
+		                       c.type, c.width, c.height, 1, 1, 1, 1, c.storage, nullptr};
+		return surfaceOf(s);
+	}
+	NSDictionary *attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}};
+	CHECK(CVPixelBufferCreate(kCFAllocatorDefault, 64, 64, '420v', (__bridge CFDictionaryRef)attrs,
+	                          pb) == kCVReturnSuccess);
+	IOSurfaceRef surface = CVPixelBufferGetIOSurface(*pb);
+	CHECK(surface != nullptr && IOSurfaceGetPlaneCount(surface) == 2);
+	CFRetain(surface);
+	return surface;
+}
+
+static MTLTextureDescriptor *descriptorOf(const AppleSurfaceCase &c)
+{
+	MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+	td.textureType = c.type;
+	td.pixelFormat = c.format;
+	td.width = c.width;
+	td.height = c.height;
+	td.usage = c.usage;
+	td.storageMode = c.storage;
+	return td;
+}
+
+// Runs `c`'s checks of rgfxEndAtInvalidSurfaceTexture on `device`.
+static void endAtAppleSurfaceCase(const AppleSurfaceCase &c, id<MTLDevice> device)
+{
+	CVPixelBufferRef pb = nullptr;
+	IOSurfaceRef surface = surfaceOf(c, &pb);
+	rgfxEndAtInvalidSurfaceTexture(descriptorOf(c), surface,
+	                               c.surface == k420vPlane1 ? 1 : 0, device);
+	CFRelease(surface);
+	if (pb != nullptr)
+		CVPixelBufferRelease(pb);
+}
+
 std::vector<uint8_t> nextMessage(TestRing &ring, uint32_t type); // below
 
 // A library of the mesh pipeline tests' functions (named as oracle_mesh's), with its create read
@@ -2175,6 +2331,12 @@ static int dies_case(const char *name)
 		for (const DescriptorCase &c : kDescriptorCases)
 			if (std::strcmp(name + 8, c.name) == 0)
 				rgfxEndAtInvalidTextureDescriptor(descriptorOf(c));
+	}
+	if (std::strncmp(name, "apple-surface-", 14) == 0) {
+		id<MTLDevice> apple = (id<MTLDevice>)[RgfxAppleFamilyDevice new];
+		for (const AppleSurfaceCase &c : kAppleSurfaceCases)
+			if (std::strcmp(name, c.name) == 0)
+				endAtAppleSurfaceCase(c, apple);
 	}
 	if (std::strncmp(name, "apple-texdesc-", 14) == 0) {
 		id<MTLDevice> apple = (id<MTLDevice>)[RgfxAppleFamilyDevice new];
@@ -3000,6 +3162,36 @@ void test_invalid_surface_textures_end_the_process()
 	overYCbCrPlane(MTLPixelFormatGBGR422, 0, true);
 	overYCbCrPlane(MTLPixelFormatBGRG422, 0, false);
 	g_checks++;
+}
+
+// On a device that answers as an Apple GPU, a texture over a surface ends the process, answers nil
+// or is made as the M3 Max under macOS 27.0.1 answers (kAppleSurfaceCases): it ends at a cube over
+// a plane, and answers nil for a compressed format and for a subsampled two-plane one of an odd
+// side that is a render target or written (rgfxSurfaceMakesNoTextureOf), sending nothing. Where
+// the device answers no Apple family the x86 Macs' answers stay: none of these is nil, and a
+// cube over a plane is made (kSurfaceCases' surface-plane-cube). An arm64 guest's device takes
+// the M3's.
+void test_surface_textures_as_an_apple_gpu()
+{
+	id<MTLDevice> apple = (id<MTLDevice>)[RgfxAppleFamilyDevice new];
+	id<MTLDevice> guest = (id<MTLDevice>)[RgfxGuestRulesDevice new];
+#if defined(__arm64__)
+	const bool guestApple = true;
+#else
+	const bool guestApple = false;
+#endif
+	for (const AppleSurfaceCase &c : kAppleSurfaceCases) {
+		if (c.words != nullptr) {
+			checkDies(c.name, c.words);
+			continue;
+		}
+		endAtAppleSurfaceCase(c, apple);
+		MTLTextureDescriptor *d = descriptorOf(c);
+		CHECK(rgfxSurfaceMakesNoTextureOf(d, apple) == c.none);
+		CHECK(rgfxSurfaceMakesNoTextureOf(d, guest) == (guestApple && c.none));
+		CHECK(!rgfxSurfaceMakesNoTextureOf(d, nil));
+	}
+	CHECK(!rgfxSurfaceMakesNoTextureOf(nil, apple));
 }
 
 // A texture wrapper's create routes an RGFX_CMD_TEXTURE_CREATE onto the ring
@@ -18750,6 +18942,7 @@ int main(int argc, char **argv)
 		test_texture_descriptor_validation_as_the_x86_macs();
 		test_texture_descriptor_validation_as_an_apple_gpu();
 		test_invalid_surface_textures_end_the_process();
+		test_surface_textures_as_an_apple_gpu();
 		test_unalignable_linear_formats_end_the_process();
 		test_memoryless_icb_ends_the_process();
 		test_texture_views();

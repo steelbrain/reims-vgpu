@@ -984,9 +984,15 @@ void rgfxEndAtInvalidSurfaceTexture(MTLTextureDescriptor *descriptor, IOSurfaceR
 	const uint64_t levels = descriptor.mipmapLevelCount;
 	auto ull = [](uint64_t n) { return static_cast<unsigned long long>(n); };
 	// A surface with planes passes the rest, a plane past its planes answering nil
-	// (RgfxIOSurfaceTexture).
-	if (IOSurfaceGetPlaneCount(surface) != 0)
+	// (RgfxIOSurfaceTexture), but for an Apple GPU's cubes over a plane (RgfxTexture.h).
+	if (IOSurfaceGetPlaneCount(surface) != 0) {
+		if (rgfxAppleGPU(device) && plane < IOSurfaceGetPlaneCount(surface) &&
+		    (type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray))
+			RgfxMetalAssertionFailed("-[IOGPUMetalTexture initWithDevice:descriptor:iosurface:plane:"
+			                         "field:args:argsSize:]",
+			                         @"carriesComplexTexture || numFaces == 1");
 		return;
+	}
 	// The texture's rows against the surface's: a format of one texel a block in this step, a
 	// compressed or 4:2:2 one, in its blocks, in the last.
 	const uint64_t bytesPerRow = IOSurfaceGetBytesPerRow(surface);
@@ -1036,6 +1042,36 @@ void rgfxEndAtInvalidSurfaceTexture(MTLTextureDescriptor *descriptor, IOSurfaceR
 		                               ull(blockRow), ull(bytesPerRow)]);
 	if (height * arrayLength > IOSurfaceGetHeight(surface))
 		RgfxMetalAssertionFailed(init, @"Descriptor height*arrayLength > IOSurface height");
+}
+
+namespace {
+
+// The two-plane formats of 4:2:0 and 4:2:2 chroma: rgfxTwoPlaneFormat's but the 4:4:4 ones (503,
+// 507, 510, 523, 527, 530, 542 and 545) and the XR10 ones.
+bool rgfxSubsampledTwoPlaneFormat(uint64_t f)
+{
+	switch (f) {
+	case 500: case 502: case 505: case 506: case 508: case 509: case 520: case 522: case 525:
+	case 526: case 528: case 529: case 540: case 541: case 543: case 544:
+		return true;
+	default:
+		return false;
+	}
+}
+
+} // namespace
+
+bool rgfxSurfaceMakesNoTextureOf(MTLTextureDescriptor *descriptor, id<MTLDevice> device)
+{
+	if (descriptor == nil || !rgfxAppleGPU(device))
+		return false;
+	const uint64_t format = descriptor.pixelFormat;
+	if (rgfxBlockCompressedFormat(format, device))
+		return true;
+	const bool odd = (descriptor.width % 2) != 0 || (descriptor.height % 2) != 0;
+	const bool written =
+	    (descriptor.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite)) != 0;
+	return rgfxSubsampledTwoPlaneFormat(format) && odd && written;
 }
 
 @interface RgfxTexture () <RgfxMetalTextureInternals>

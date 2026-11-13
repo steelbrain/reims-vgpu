@@ -225,6 +225,14 @@ const char *bufferCause(NSUInteger length, MTLResourceOptions options, NSUIntege
 	// process's copy of the plane in the device region, synced with the surface's pages
 	// (RgfxIOSurface.h).
 	rgfxEndAtInvalidSurfaceTexture(descriptor, iosurface, plane, self);
+	// None of a compressed format, nor of a subsampled two-plane one of an odd side that is
+	// written, on an Apple GPU (rgfxSurfaceMakesNoTextureOf).
+	if (rgfxSurfaceMakesNoTextureOf(descriptor, self)) {
+		noteNil("newTextureWithDescriptor:iosurface:plane:",
+		        "a compressed format, or an odd written two-plane one, on an Apple GPU",
+		        textureAsked(descriptor));
+		return nil;
+	}
 	return [RgfxIOSurfaceTexture textureWithDescriptor:descriptor
 	                                         iosurface:iosurface
 	                                             plane:plane
