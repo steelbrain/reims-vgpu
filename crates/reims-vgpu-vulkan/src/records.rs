@@ -398,12 +398,13 @@ pub(crate) fn summary(statistics: &rt::WarmStatistics, handed: u64) -> Option<St
     let s = statistics;
     (counted(s) >= handed).then(|| {
         format!(
-            "warmed {handed} pipeline records: {} made, {} translated only, {} failed, {} unread, \
-             {} not warmable, {} not run (the budget spent or the process ending); {} bytes of \
-             driver pipeline data added",
+            "warmed {handed} pipeline records: {} made, {} translated only, {} failed ({} of \
+             them a refusal an earlier pass kept), {} unread, {} not warmable, {} not run (the \
+             budget spent or the process ending); {} bytes of driver pipeline data added",
             s.records_warmed,
             s.records_translated,
             s.records_failed,
+            s.records_failed_before,
             s.records_unread,
             s.records_not_warmable,
             s.records_not_run,
@@ -447,15 +448,16 @@ mod tests {
         s.records_unread = 1;
         assert_eq!(summary(&s, 312), None);
         s.records_failed = 4;
+        s.records_failed_before = 3;
         s.records_not_warmable = 1;
         s.records_not_run = 4;
         s.pipeline_bytes = 1 << 20;
         let line = summary(&s, 312).unwrap();
         assert_eq!(
             line,
-            "warmed 312 pipeline records: 300 made, 2 translated only, 4 failed, 1 unread, 1 not \
-             warmable, 4 not run (the budget spent or the process ending); 1048576 bytes of \
-             driver pipeline data added"
+            "warmed 312 pipeline records: 300 made, 2 translated only, 4 failed (3 of them a \
+             refusal an earlier pass kept), 1 unread, 1 not warmable, 4 not run (the budget \
+             spent or the process ending); 1048576 bytes of driver pipeline data added"
         );
     }
 
