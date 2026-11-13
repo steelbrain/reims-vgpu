@@ -349,9 +349,9 @@ const GUEST_CLASS_CHILD: &str = "RVG_GUEST_CLASS_CHILD";
 /// one for an x86-64 guest a Mac with an Intel or AMD GPU (`GuestArch::mac_class`), on an Apple
 /// GPU (MoltenVK) as on any other. A new `Private` 64 by 64 `RGBA8Unorm` render target, blitted
 /// into a buffer before anything writes it, reads Metal's fixed pattern for the arm64 guest, opaque
-/// magenta in every texel, as an Apple M3 Max reads it; for the x86-64 guest the runtime writes no
-/// pattern into it, and on an Apple GPU, whose own image of it would read the pattern, fills it
-/// with zeros, as the Intel UHD 630 and the AMD Radeon Pro 5300M read zero. The class is the
+/// magenta in every texel, as an Apple M3 Max reads it; for the x86-64 guest it reads zero on every
+/// host GPU, as the Intel UHD 630 and the AMD Radeon Pro 5300M read zero: the runtime fills it with
+/// zeros, so it never shows the earlier bytes of its memory. The class is the
 /// process's, fixed at its first device, so each architecture runs in a child process of its own,
 /// in which the graphics device is the process's first
 #[test]
@@ -460,7 +460,6 @@ fn the_guest_s_class_decides_the_answers() {
     let read = unsafe {
         std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), length as usize).to_vec()
     };
-    let unfilled = after.private_textures_unfilled - before.private_textures_unfilled;
     let zero_filled = after.private_textures_zero_filled - before.private_textures_zero_filled;
     match guest {
         GuestArch::Arm64 => {
@@ -470,18 +469,18 @@ fn the_guest_s_class_decides_the_answers() {
                 properties.name,
                 &read[..16]
             );
-            assert_eq!((unfilled, zero_filled), (0, 0));
+            assert_eq!(zero_filled, 0);
         }
-        GuestArch::X86_64 if apple_gpu => {
+        // Whatever the host GPU: a new Private texture never shows its memory's earlier bytes.
+        GuestArch::X86_64 => {
             assert!(
                 read.iter().all(|&b| b == 0),
                 "{guest:?} on {}: a new texture reads zero: {:02x?}",
                 properties.name,
                 &read[..16]
             );
-            assert_eq!((unfilled, zero_filled), (0, 1));
+            assert_eq!(zero_filled, 1);
         }
-        GuestArch::X86_64 => assert_eq!((unfilled, zero_filled), (1, 0)),
     }
     println!(
         "GUEST-CLASS {arch}: {:?} on {}, Apple GPU {apple_gpu}",
