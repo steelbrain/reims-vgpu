@@ -1557,12 +1557,13 @@ struct Reach {
 }
 
 /// Whether a bind's `m` can decide what a draw asks of it ([`Reach::kept`], [`Reach::unsent`]):
-/// it lies over read-only memory whose writes this platform does not answer as Metal's GPU does
-/// (a surface's the runtime twins, or a texture over memory the runtime copies), on a surface
-/// whose GPU writes never reach its memory, or is a texture whose writes the runtime refuses. A
-/// draw asks nothing of any other.
+/// it lies over a surface's read-only memory the runtime twins, where the draw's writes would
+/// land ([`Kept::lands`]), on a surface whose GPU writes never reach its memory, or is a texture
+/// whose writes the runtime refuses. A draw asks nothing of any other: a draw's writes of a
+/// texture over read-only memory the runtime copies are sent, and dropped by the copy
+/// ([`Reach::kept`]).
 fn matters(m: &Bound) -> bool {
-    !matches!(m.kept, Kept::No) || m.dropped || m.refused.is_some()
+    m.kept.lands() || m.dropped || m.refused.is_some()
 }
 
 /// Whether a slot's bind of `m` is held by the reach ([`Reach::bind_one`]): it lies in memory
@@ -1678,20 +1679,30 @@ impl Reach {
 
     /// How a draw, a tile dispatch, or an execution whose commands take `inherits` of the encoder,
     /// writes through an object over read-only memory whose writes this platform does not answer
-    /// as Metal's GPU does ([`crate::gpu::writes::kept_write`]): a surface's the runtime twins, or,
-    /// for a texture, memory the runtime copies, the first found: a texture or buffer
+    /// as Metal's GPU does ([`crate::gpu::writes::kept_write`]): a surface's the runtime twins,
+    /// where the writes would land ([`Kept::lands`]), the first found: a texture or buffer
     /// made resident with write usage, and, as [`Self::at_slots`] reads them, a texture bound at
     /// a slot a function writes and a buffer bound at one, of every stage, but for an execution,
     /// whose commands run no tile, object or mesh function and take the encoder's buffers only
     /// where they inherit them. `None` where it writes none.
+    ///
+    /// A draw's write of a texture over read-only memory the runtime copies is sent, and the copy
+    /// drops it, the command buffer completing. Metal's GPUs differ there, so the envelope holds
+    /// both answers and this platform takes the cheaper: the Radeon Pro 5300M and UHD Graphics 630
+    /// under macOS 26.7.1 complete a fragment or vertex function's `write()` of a texture over a
+    /// bit-24 buffer, writing the pages (bit 24 changes nothing there), and complete one over pages
+    /// the process maps read-only, the pages unchanged; the M3 Max under macOS 27.0.1 fails the
+    /// command buffer with a page fault over either, every run, as at a pass's store
+    /// (m3-max-29292 to m3-max-29294, m3-max-29309 to m3-max-29311). A texture made resident for
+    /// writing that no function writes completes on all three.
     fn kept(&self, inherits: Option<Inherits>) -> Option<Whether> {
         let mut used = (self.used_textures.iter()).chain(&self.used_buffers);
-        if used.any(|m| m.kept.holds()) {
+        if used.any(|m| m.kept.lands()) {
             return Some(Whether::Writes);
         }
         let (buffers, own) = (inherits.is_none_or(|i| i.buffers), inherits.is_none());
         let slots = self.at_slots(inherits, [buffers, buffers, own, own, own], |m| {
-            m.kept.holds()
+            m.kept.lands()
         });
         slots.into_iter().map(|(w, _)| w).find(Whether::holds)
     }
@@ -2187,8 +2198,8 @@ impl VulkanRenderEncoder {
     /// how ([`Whether::through`]). A vertex or fragment function's stores into a buffer on such a
     /// surface are sent, and dropped as on Metal. Before that, it dies where it may write through
     /// an object over read-only memory whose writes this platform does not answer as Metal's GPU
-    /// does ([`Reach::kept`], [`crate::gpu::writes::kept_write`]); a write through a buffer over
-    /// read-only memory the runtime copies is sent, and dropped as on Metal.
+    /// does ([`Reach::kept`], [`crate::gpu::writes::kept_write`]); a write through a buffer or a
+    /// texture over read-only memory the runtime copies is sent, and dropped by the copy.
     /// One that issues nothing, which Metal writes nothing of, is not asked. A pass that holds
     /// nothing a draw asks of ([`Reach::quiet`]) finds nothing.
     fn issues(&self, sel: &'static str, inherits: Option<Inherits>) {
@@ -6352,6 +6363,108 @@ pub(crate) mod tests {
         assert_eq!(
             read_only_resolve_on(&q, CUSTOM_SAMPLE_DEPTH_STORE, None, false),
             Err("renderCommandEncoderWithDescriptor:")
+        );
+    }
+
+    /// A draw whose fragment function `write()`s a texture over a guest's read-only memory (a
+    /// buffer made with bit 24, `resource::tests::read_only_buffer`), bound at the slot it
+    /// writes, and a draw that does not write it but makes it resident for writing, complete with
+    /// no error, the writes dropped and the pages staying zeros: the runtime's copy of the pages
+    /// drops them. Metal's GPUs differ at the first: the M3 Max under macOS 27.0.1 faults the
+    /// command buffer, the Radeon Pro 5300M and UHD Graphics 630 under macOS 26.7.1 complete it,
+    /// writing the pages, and this platform takes completing, the cheaper; all three complete
+    /// the second (plain Metal, m3-max-29292 to m3-max-29294, m3-max-29309 to m3-max-29311;
+    /// `crate::gpu::writes`'s docs). The same draw writes a texture over a buffer of the
+    /// device's, which shows the function writes. Linux's: on macOS it goes to Metal
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_draws_write_into_read_only_memory_is_dropped() {
+        use crate::core::platform::os::vm::HostVm as _;
+        use crate::core::platform::resource::Library as _;
+        use crate::core::platform::values::RenderPipelineDesc;
+
+        use crate::gpu::resource::tests::{bgra_over, host_bytes_at, read_only_buffer};
+        use crate::os::PAGE;
+
+        /// The sweep library, `rounding.metal`; sweep 1 writes values just over 1, every
+        /// component of a `BGRA8Unorm` texel 0xff.
+        const ROUNDING: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rounding.metallib"));
+        /// `MTLTextureUsageShaderWrite` and `MTLResourceUsageWrite`.
+        const WRITE: u64 = 2;
+        let (p, d) = (platform(), dev());
+        let library = d.new_library(ROUNDING).unwrap().unwrap().unwrap();
+        let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
+        let state = |fragment| {
+            d.new_render_pipeline_state(&RenderPipelineDesc {
+                label: None,
+                vertex: &function("sweep_vertex"),
+                fragment: &function(fragment),
+                color0_pixel_format: BGRA8,
+                resource_index: None,
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let (writes, draws) = (state("write_fragment"), state("sweep_fragment"));
+        let kind = buffer::<VulkanPlatform>(&d, 16, 0, &[1, 0, 0, 0]);
+        let drawn = |cmds: Vec<RenderCmd<'_, VulkanPlatform>>| {
+            let (_dst, pass) = pass_of(&p, &d, (16, 16));
+            let q = d.new_command_queue().unwrap();
+            let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+            let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+            send_all(&e, cmds);
+            send_all(&e, vec![three(3, None), RenderCmd::EndEncoding]);
+            cb.commit(OnFault::Die).unwrap();
+            cb.wait_until_completed(OnFault::Die).unwrap();
+            (cb.status().0, cb.error().map(|e| e.code))
+        };
+        let write = |state, texture| {
+            drawn(vec![
+                RenderCmd::SetRenderPipelineState {
+                    pipeline_state: Some(state),
+                },
+                RenderCmd::SetFragmentBuffer {
+                    buffer: Some(&kind),
+                    offset: 0,
+                    index: 0,
+                },
+                RenderCmd::SetFragmentTexture {
+                    texture: Some(texture),
+                    index: 0,
+                },
+            ])
+        };
+        let ours = buffer::<VulkanPlatform>(&d, 16 * 64, 0, &[]);
+        let over_ours = bgra_over(&ours, READ | WRITE);
+        assert_eq!(write(&writes, &over_ours), (4, None), "the device's");
+        // SAFETY: a Shared buffer's bytes, read after its command buffer completed.
+        let written = unsafe { std::slice::from_raw_parts(ours.contents().as_ptr::<u8>(), 64) };
+        assert!(written.iter().all(|&b| b == 0xff), "{written:?}");
+        let (ro, pages) = read_only_buffer(1);
+        let over = bgra_over(&ro, READ | WRITE);
+        assert_eq!(write(&writes, &over), (4, None), "write()");
+        let resident = [Some(ResourceRef::Texture(&over))];
+        let used = drawn(vec![
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&draws),
+            },
+            RenderCmd::SetFragmentBuffer {
+                buffer: Some(&kind),
+                offset: 0,
+                index: 0,
+            },
+            RenderCmd::UseResources {
+                resources: &resident,
+                usage: WRITE,
+            },
+        ]);
+        assert_eq!(used, (4, None), "resident for writing");
+        assert!(host_bytes_at(pages, 16 * 64).iter().all(|&b| b == 0));
+        drop((over, ro, over_ours, ours));
+        assert!(
+            crate::remap::VulkanVm::new()
+                .deallocate(pages, PAGE)
+                .is_success()
         );
     }
 

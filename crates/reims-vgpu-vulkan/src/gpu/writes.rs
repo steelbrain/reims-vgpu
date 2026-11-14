@@ -135,6 +135,13 @@ impl Kept {
             Kept::Always | Kept::Copied => true,
         }
     }
+
+    /// Whether the GPU's writes through the object would land in read-only memory, a surface's
+    /// the runtime twins ([`Kept::Always`]), where Metal's GPU keeps them out: a command that may
+    /// make one dies where it is encoded ([`kept_write`]).
+    pub fn lands(&self) -> bool {
+        matches!(self, Kept::Always)
+    }
 }
 
 impl Memory {
@@ -431,14 +438,14 @@ pub fn buffer_bind_reads(b: &BufferObject) -> bool {
 }
 
 /// [`texture_bound`] where it may decide what work through `t` asks, as [`buffer_bind`] reads a
-/// buffer's: `t` lies on a surface, over a buffer on one, or over a buffer or in a heap over
-/// read-only memory the runtime copies; elsewhere the default one, of no memory.
+/// buffer's: `t` lies on a surface, or over a buffer on one; elsewhere the default one, of no
+/// memory. A texture over read-only memory the runtime copies decides nothing a draw asks: its
+/// writes are sent, and dropped by the copy.
 pub fn texture_bind(t: &TextureObject) -> Bound {
     let kept = match (&t.surface, &t.under) {
         (Some(_), _) => true,
-        (None, Some(Under::Buffer(b, _))) => b.surface.is_some() || under_buffer_kept(b).holds(),
-        (None, Some(Under::Heap(h, _))) => h.backing.read_only_now(),
-        (None, None) => false,
+        (None, Some(Under::Buffer(b, _))) => b.surface.is_some(),
+        (None, Some(Under::Heap(..)) | None) => false,
     };
     if kept {
         texture_bound(t)
