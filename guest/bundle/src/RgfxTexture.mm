@@ -621,6 +621,9 @@ NSString *rgfxPixelFormatName(MTLPixelFormat format)
 {
 	if (format == MTLPixelFormatInvalid)
 		return @"MTLPixelFormatInvalid";
+	// The two-plane 4:2:0 Y'CbCr format, as the texture atomics rule names it (oracle_surftex).
+	if (static_cast<uint64_t>(format) == 500)
+		return @"MTLPixelFormatYCBCR8_420_2P";
 	for (const RgfxNamedFormat &f : kTexelFormats)
 		if (f.format == format)
 			return @(f.name);
@@ -858,6 +861,35 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLD
 	side("height", height, maxHeight);
 	side("depth", depth, maxDepth);
 	side("arrayLength", arrayLength, maxArray);
+	// The usage bits Metal names none for, but 0x8, which it takes and leaves out of the
+	// texture's answer (rgfxAnsweredUsage), and 0x4000, 0x8000 and 0x10000, which it takes and
+	// answers: each other bit, every bit from 0x40 to 0x2000 and from 0x20000 up, ends the process,
+	// the bits named in one line (measured on the M3 Max under macOS 27.0.1, the AMD 5300M and the
+	// Intel UHD 630 under 26.7.1, oracle_surftex's sixth and seventh rounds, over an IOSurface and
+	// over none: 0x40, 0x80, 0x100, 0x200 to 0x2000 and 0x20000 to 0x100000 each, 0x1000000,
+	// 0x80000000, and 0x1c0 at once), in a line before the atomic bit's.
+	constexpr uint64_t kKnownUsage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
+	                                 MTLTextureUsageRenderTarget | 0x8 |
+	                                 MTLTextureUsagePixelFormatView |
+	                                 MTLTextureUsageShaderAtomic | 0x4000 | 0x8000 | 0x10000;
+	if ((usage & ~kKnownUsage) != 0)
+		[rules appendFormat:@"MTLTextureUsage has unknown bits 0x%llx.\n",
+		                    ull(usage & ~kKnownUsage)];
+	// ShaderAtomic takes R32Uint and R32Sint, and on an Apple GPU RG32Uint; any other format ends
+	// the process, the x86 Macs naming RG32Uint in words of its own, after the unknown bits and
+	// before a format the device lacks (measured as above: BGRA8Unorm, R32Float, RGBA8Uint,
+	// R8Uint, R16Uint, RG32Sint, RGBA32Uint and the two-plane format 500, over an IOSurface and
+	// over none).
+	const bool atomicFormat = format == MTLPixelFormatR32Uint || format == MTLPixelFormatR32Sint ||
+	                          (apple && format == MTLPixelFormatRG32Uint);
+	if ((usage & MTLTextureUsageShaderAtomic) != 0 && !atomicFormat) {
+		if (format == MTLPixelFormatRG32Uint)
+			[rules appendString:@"This device does not support ulong texture atomics, so "
+			                    @"MTLPixelFormatRG32Uint cannot be used with texture atomics\n"];
+		else
+			[rules appendFormat:@"%@ is not a valid format to be used with texture atomics.\n",
+			                    rgfxPixelFormatName(static_cast<MTLPixelFormat>(format))];
+	}
 	if (lacked)
 		[rules appendFormat:@"MTLTextureDescriptor has invalid pixelFormat (%llu).\n", ull(format)];
 	if (oneD && height != 1)
@@ -971,10 +1003,6 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLD
 			                    @"MTLStorageModeManaged(1) MTLStorageModeMemoryless(3) "
 			                    @"MTLStorageModePrivate(2)\n",
 			                    ull(storage)];
-	// A usage bit Metal does not know: 0x80, the one measured (other bits past the SDK's may be
-	// the system's own, so they pass).
-	if ((usage & 0x80) != 0)
-		[rules appendString:@"MTLTextureUsage has unknown bits 0x80.\n"];
 	if (rules.length > 0) {
 		// The descriptor, in the unified log, for the process's death the guest's log keeps.
 		// compressionType reached MTLTextureDescriptor in macOS 12.5. Asked by selector, as

@@ -1756,6 +1756,51 @@ static const DescriptorCase kDescriptorCases[] = {
     {"usage.write", 80, 2, 64, 64, 1, 1, 1, 1, 0x2, 2, nullptr},
     {"usage.bit7", 80, 2, 64, 64, 1, 1, 1, 1, 0x81, 2,
      RGFX_VALIDATE "MTLTextureUsage has unknown bits 0x80.\n'"},
+    // The usage bits and the atomic bit's formats (oracle_surftex's sixth and seventh rounds, the
+    // M3 Max's alike but where kAppleDescriptorCases says).
+    {"usage.bit3", 80, 2, 64, 64, 1, 1, 1, 1, 0x9, 2, nullptr},
+    {"usage.bit6", 80, 2, 64, 64, 1, 1, 1, 1, 0x41, 2,
+     RGFX_VALIDATE "MTLTextureUsage has unknown bits 0x40.\n'"},
+    {"usage.bit8", 80, 2, 64, 64, 1, 1, 1, 1, 0x101, 2,
+     RGFX_VALIDATE "MTLTextureUsage has unknown bits 0x100.\n'"},
+    {"usage.bit13", 80, 2, 64, 64, 1, 1, 1, 1, 0x2001, 2,
+     RGFX_VALIDATE "MTLTextureUsage has unknown bits 0x2000.\n'"},
+    {"usage.bit14", 80, 2, 64, 64, 1, 1, 1, 1, 0x4001, 2, nullptr},
+    {"usage.bit15", 80, 2, 64, 64, 1, 1, 1, 1, 0x8001, 2, nullptr},
+    {"usage.bit16", 80, 2, 64, 64, 1, 1, 1, 1, 0x10001, 2, nullptr},
+    {"usage.bit17", 80, 2, 64, 64, 1, 1, 1, 1, 0x20001, 2,
+     RGFX_VALIDATE "MTLTextureUsage has unknown bits 0x20000.\n'"},
+    {"usage.bit31", 80, 2, 64, 64, 1, 1, 1, 1, 0x80000001, 2,
+     RGFX_VALIDATE "MTLTextureUsage has unknown bits 0x80000000.\n'"},
+    {"usage.bits6to8", 80, 2, 64, 64, 1, 1, 1, 1, 0x1c1, 2,
+     RGFX_VALIDATE "MTLTextureUsage has unknown bits 0x1c0.\n'"},
+    {"atomic.r32u", 53, 2, 64, 64, 1, 1, 1, 1, 0x23, 2, nullptr},
+    {"atomic.r32s", 54, 2, 64, 64, 1, 1, 1, 1, 0x23, 2, nullptr},
+    {"atomic.r32u.all", 53, 2, 64, 64, 1, 1, 1, 1, 0x37, 2, nullptr},
+    {"atomic.bgra8", 80, 2, 64, 64, 1, 1, 1, 1, 0x23, 2,
+     RGFX_VALIDATE "MTLPixelFormatBGRA8Unorm is not a valid format to be used with texture "
+                   "atomics.\n'"},
+    {"atomic.r32f", 55, 2, 64, 64, 1, 1, 1, 1, 0x23, 2,
+     RGFX_VALIDATE "MTLPixelFormatR32Float is not a valid format to be used with texture "
+                   "atomics.\n'"},
+    {"atomic.r16u", 23, 2, 64, 64, 1, 1, 1, 1, 0x23, 2,
+     RGFX_VALIDATE "MTLPixelFormatR16Uint is not a valid format to be used with texture "
+                   "atomics.\n'"},
+    {"atomic.rg32s", 104, 2, 64, 64, 1, 1, 1, 1, 0x23, 2,
+     RGFX_VALIDATE "MTLPixelFormatRG32Sint is not a valid format to be used with texture "
+                   "atomics.\n'"},
+    {"atomic.rgba32u", 123, 2, 64, 64, 1, 1, 1, 1, 0x23, 2,
+     RGFX_VALIDATE "MTLPixelFormatRGBA32Uint is not a valid format to be used with texture "
+                   "atomics.\n'"},
+    {"atomic.rg32u", 103, 2, 64, 64, 1, 1, 1, 1, 0x23, 2,
+     RGFX_VALIDATE "This device does not support ulong texture atomics, so "
+                   "MTLPixelFormatRG32Uint cannot be used with texture atomics\n'"},
+    {"atomic.bits6to8.bgra8", 80, 2, 64, 64, 1, 1, 1, 1, 0x1e1, 2,
+     RGFX_VALIDATE "MTLTextureUsage has unknown bits 0x1c0.\nMTLPixelFormatBGRA8Unorm is not a "
+                   "valid format to be used with texture atomics.\n'"},
+    {"atomic.ycbcr500", 500, 2, 64, 64, 1, 1, 1, 1, 0x23, 2,
+     RGFX_VALIDATE "MTLPixelFormatYCBCR8_420_2P is not a valid format to be used with texture "
+                   "atomics.\nMTLTextureDescriptor has invalid pixelFormat (500).\n'"},
     {"srgb.write", 81, 2, 64, 64, 1, 1, 1, 1, 0x2, 2, nullptr},
     {"bc1.rt", 130, 2, 64, 64, 1, 1, 1, 1, 0x4, 2, nullptr},
     {"bc1.write", 130, 2, 64, 64, 1, 1, 1, 1, 0x2, 2, nullptr},
@@ -1903,6 +1948,10 @@ static const AppleDescriptorCase kAppleDescriptorCases[] = {
                    "with a sample count greater than one.\nMTLTextureDescriptor: compressed pixel "
                    "formats require texture type of MTLTextureType2D[Array], MTLTextureType3D or "
                    "MTLTextureTypeCube[Array].\n'"},
+    {"atomic.rg32u", nullptr},
+    {"atomic.ycbcr500",
+     RGFX_VALIDATE "MTLPixelFormatYCBCR8_420_2P is not a valid format to be used with texture "
+                   "atomics.\n'"},
     {"b5g6r5.w0.d2",
      RGFX_VALIDATE "MTLTextureDescriptor has width of zero.\nMTLTextureDescriptor has depth (2) "
                    "greater than the maximum allowed size of 1.\nMTLTextureDescriptor requests a "
