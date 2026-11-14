@@ -53,6 +53,12 @@ xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework 
 xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal \
 	-framework Foundation "$here/oracle_readonly.m" -o "$out/oracle_readonly"
 cp "$here/oracle_readonly.sh" "$out/"
+xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal \
+	-framework Foundation "$here/oracle_failways.m" -o "$out/oracle_failways"
+cp "$here/oracle_failways.sh" "$out/"
+xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal \
+	-framework IOSurface -framework Foundation "$here/oracle_twinwrites.m" -o "$out/oracle_twinwrites"
+cp "$here/oracle_twinwrites.sh" "$out/"
 for m in oracle_bundle oracle_bundle_mesh oracle_bundle_rt oracle_bundle_args; do
 	xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 "$here/$m.metal" \
 		-o "$out/$m.metallib" || echo "oracle_bundle: $m.metallib not built"
