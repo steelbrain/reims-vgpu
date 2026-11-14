@@ -23,7 +23,11 @@
 //! space, one of 0x40000 bytes 0x48000, and a buffer made over the same surface after it
 //! answered the texture's address and took none; `vaprobe surfacetwo`: two buffers over one
 //! surface, both live, answered its address). The guest's surfaces reach this platform as
-//! buffers (`new_texture_over_surface_plane`), whose textures take none.
+//! buffers that stand for them (`new_texture_over_surface_plane`), whose textures take none where
+//! Metal's take their surface's range. No guest reads the difference: on the reims-graphics
+//! device the guest's bundle picks every GPU address and resource ID the guest reads, in its own
+//! part of the space from `RGFX_CONTEXT_VA_BASE` (2^46), and the host pins them there
+//! (docs/graphics-kext/design.md, Decided 6), where no range this model places from 2^40 reaches.
 //!
 //! One model per process ([`process`]): Metal has one device per GPU, so every object of the
 //! process takes its range after those made before it, whoever made them.
