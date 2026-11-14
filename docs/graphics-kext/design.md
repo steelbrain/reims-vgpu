@@ -1008,11 +1008,11 @@ Stages:
       - The compositor's GPU does its part fast: the 780M copies a 30.1 MB
         image from host memory in 1.25 to 1.44 ms, and presents a cleared
         image of the window's size 4656 times a second.
-    - **Proposed, not built: the window shown by the compositor's GPU.**
+    - **Built: the window shown by the compositor's GPU.**
       Where the compositor runs on another GPU, the window's swapchain is
       made on that GPU, whose buffers are its own, and only what changed of
       each frame crosses the runtime's GPU's link. Two routes were weighed.
-      Route 2 was measured and rejected (below); route 1 is the one taken:
+      Route 2 was measured and rejected (below); route 1 is built:
       - *Which device, either route.* The GPU the compositor composites on
         is the main device of the window's surface's dma-buf feedback
         (`zwp_linux_dmabuf_feedback_v1`), matched to a physical device by
@@ -1021,31 +1021,69 @@ Stages:
         makes a second `VkDevice` there (one graphics queue,
         `VK_KHR_swapchain`, `VK_EXT_external_memory_host`), apart from the
         runtime's, and its swapchain over the window's surface.
-      - *Route 1: a copy of the changed tiles.* A frame-sized buffer in
-        host memory, imported into both devices. The runtime's GPU keeps
-        the last frame it sent in its own memory, compares each presented
-        surface with it in 64 x 64 tiles (a compute pass reading the two
-        frames in its own memory: 60 MB, about 0.07 ms at an RTX 3090's
-        memory rate, not measured), reads the tile mask back, and copies
-        the changed tiles into the buffer: D MB of them cost D / 1.8 ms of
-        the 3090's link (measured above). The compositor's GPU then copies
-        the buffer into its next image (1.3 ms, measured above) and
-        presents it. A semaphore exported as a sync file
-        (`VK_KHR_external_semaphore_fd`) orders the two GPUs' work. It is
-        a copy: the driver's copy of each whole image today becomes ours
-        of what changed, and the compositor's GPU copies the frame again
-        into its image.
-        - It touches the window's path alone: the swapchain module, which
-          today makes its swapchain on the runtime's device and wraps its
-          images as the runtime's textures, makes one on a device the
-          runtime does not make; the window reads its surface's dma-buf
-          feedback (Wayland, through SDL's display); the compare is a
-          function of the display's shaders (`shaders.metal`, its
-          metallibs rewritten on a Mac). No guest, kext or placement
-          change.
-        - Its fallback, at each refusal (no second device, a refused
-          import, no feedback): the window presents from the runtime's GPU
-          as now, on every driver.
+      - *Route 1, built: a mirror of the changed tiles* (reims-vgpu's
+        `graphics::mirror`). The window's mirror is a frame-sized buffer
+        of host memory of its own. The runtime's device and the window's
+        device each make a buffer over it. At each draw of a presented
+        surface on the compositor's GPU:
+        - The runtime's GPU copies the presented texture into a buffer of
+          its own memory, as rows of the mirror's pitch.
+        - It compares that copy with the frame it sent last, in 64 x 64
+          tiles (`displayMirrorTile`, the display's shaders). It copies
+          each tile that differs into the mirror, and a tile that changed
+          nothing crosses no link. The copy then stands for the frame sent.
+          A mirror made again (its first sync, a frame of another format
+          or size) sends every tile.
+        - The compositor's GPU draws from a linear texture over its import
+          of the mirror, through the draw the runtime's device would make:
+          the same bytes, so the same pixels.
+        - The CPU orders the two GPUs. A sync is waited for before the
+          draw that reads the mirror is encoded, and the next sync waits
+          for that draw. The runtime exports its semaphores only as opaque
+          descriptors, which a device of another driver cannot import.
+          metal2vulkan exports a command buffer's completion as a sync
+          file from its 2bd067d6c7 on, which moves the first wait onto the
+          compositor's GPU once the pin takes it.
+        - It touches the window's path alone: no guest, kext or placement
+          change. Its fallback, at each refusal on every driver, is the
+          window's present from the runtime's GPU, as before: no feedback,
+          the runtime's own GPU, no second device or swapchain, a surface
+          the mirror does not carry (not 4 or 8 bytes a pixel), or a
+          mirror, sync, import or texture refused.
+        - *Measured 2026-11-13: route 1 against today.* The walk above on
+          um870's RTX 3090, whose compositor composites on its Radeon 780M,
+          with every GPU's driver listed to QEMU and the 3090 picked: route
+          1 (`steelbrain/x4route`) against development at fe56cae17, on the
+          same runtime, both mostly in P2. For each guest present: the
+          megabytes the 3090's link carried from and to the GPU
+          (nvidia-smi), the window's presents, the 3090's busy time, and
+          the time from a present's take to its show (median / 99th
+          percentile):
+
+          | step | build | link MB, from / to the GPU | window presents | busy ms | take to show, ms |
+          |---|---|---|---|---|---|
+          | Mission Control | today | 28.3 / 2.2 | 0.92 | 20.1 | 2.2 / 55.5 |
+          | | route 1 | 1.2 / 2.7 | 1.00 | 6.7 | 14.4 / 45.7 |
+          | autoscroll | today | 28.7 / 0.3 | 0.88 | 17.0 | 5.1 / 15.0 |
+          | | route 1 | 9.9 / 0.6 | 1.00 | 8.9 | 3.3 / 7.1 |
+          | GL 3D | today | 23.8 / 0.4 | 0.84 | 17.0 | 5.7 / 8.4 |
+          | | route 1 | 16.6 / 0.3 | 1.00 | 12.9 | 3.6 / 4.3 |
+          | the walk | today | 31.2 / 2.0 | 0.93 | 21.0 | |
+          | | route 1 | 6.1 / 2.5 | 1.00 | 9.5 | |
+
+          - The guest's presents a second held: 47.8 and 57.7 in Mission
+            Control, 45.7 and 45.0 in the autoscroll, 40.9 and 40.5 in GL
+            3D. The pages' own rates were 60, 59.8 and 60 both times.
+          - The window presents every guest present.
+          - The CPU's order costs the render thread a wait at each sync,
+            the 3090's copy of the changed tiles over its link: 1.6 ms a
+            present in Mission Control (1.0 MB of tiles at most), 7.3 ms in
+            the autoscroll (11.8 MB) and 10.8 ms in GL 3D (18.5 MB). The
+            guest does not wait for it.
+          - Mission Control's median from take to show rose from 2.2 to
+            14.4 ms, about a refresh, while its 99th percentile fell.
+          - The runtime's memory log shows the mirror's host pages
+            imported by their pointer on both devices.
       - *Route 2: the presented surfaces in place.* The surfaces the
         display pipe presents lie in place in guest RAM (route B's
         placement for them alone; every other surface keeps its device
