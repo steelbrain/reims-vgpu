@@ -7,9 +7,10 @@
 //   oracle_surfresolve DEVICE <over> <storage> <from> <into> <action>
 // DEVICE is a substring of the device's name (`AMD`, `Intel`, `Apple`). <over> is what the
 // resolve texture lies over: `own` (memory of its own), `flat` (a surface without planes, of the
-// texture's size, its OSType 'RGhA' for 8 bytes a texel, 'w30r' for 4, 'BGRA' for a BGRA8 one), or
+// texture's size, its OSType 'RGhA' for 8 bytes a texel, 'w30r' for 4, 'BGRA' for a BGRA8 one),
 // `plane` (plane 0 of a 128 x 16 '420v' surface, CoreVideo's, whose rows of 128 bytes or more
-// hold the texture's). <storage> is the texture's: `shared`, `managed` or `private`. <from> is the
+// hold the texture's), or `plane1` (plane 1 of a 128 x 32 one: 16 rows of 64 two-byte chroma
+// elements). <storage> is the texture's: `shared`, `managed` or `private`. <from> is the
 // attachment's raw MTLPixelFormat (80 BGRA8Unorm, 81 BGRA8Unorm_sRGB) and <into> the resolve
 // texture's (115 RGBA16Float, 554 BGR10_XR, 555 BGR10_XR_sRGB, or <from> itself: the control).
 // <action> is the store action: `resolve` (MultisampleResolve) or `smsr`
@@ -115,10 +116,10 @@ static IOSurfaceRef flatSurface(OSType ostype, NSUInteger width, NSUInteger heig
   return IOSurfaceCreate((__bridge CFDictionaryRef)p);
 }
 
-// A 128 x 16 '420v' surface, as CoreVideo lays one out; the pixel buffer is kept in `keep`.
-static IOSurfaceRef planarSurface(CVPixelBufferRef *keep) {
+// A 128 x `height` '420v' surface, as CoreVideo lays one out; the pixel buffer is kept in `keep`.
+static IOSurfaceRef planarSurface(NSUInteger height, CVPixelBufferRef *keep) {
   NSDictionary *attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}};
-  CVReturn r = CVPixelBufferCreate(kCFAllocatorDefault, 128, kSide,
+  CVReturn r = CVPixelBufferCreate(kCFAllocatorDefault, 128, height,
                                    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
                                    (__bridge CFDictionaryRef)attrs, keep);
   if (r != kCVReturnSuccess) return NULL;
@@ -139,6 +140,7 @@ static id<MTLTexture> resolveTexture(const char *over, MTLPixelFormat into, MTLS
     return [gDevice newTextureWithDescriptor:d];
   }
   IOSurfaceRef s = NULL;
+  size_t plane = 0;
   if (strcmp(over, "flat") == 0) {
     OSType ostype = texelBytes(into) == 8                                 ? 'RGhA'
                     : (into == MTLPixelFormatBGRA8Unorm ||
@@ -148,7 +150,11 @@ static id<MTLTexture> resolveTexture(const char *over, MTLPixelFormat into, MTLS
     s = flatSurface(ostype, kSide, kSide, texelBytes(into));
   } else if (strcmp(over, "plane") == 0) {
     stage("new-surface");
-    s = planarSurface(keep);
+    s = planarSurface(kSide, keep);
+  } else if (strcmp(over, "plane1") == 0) {
+    stage("new-surface");
+    s = planarSurface(2 * kSide, keep);
+    plane = 1;
   }
   if (s == NULL) {
     say("surface", @"nil");
@@ -158,9 +164,9 @@ static id<MTLTexture> resolveTexture(const char *over, MTLPixelFormat into, MTLS
   say("surface.row_bytes",
       [NSString stringWithFormat:@"%zu", IOSurfaceGetPlaneCount(s) == 0
                                              ? IOSurfaceGetBytesPerRow(s)
-                                             : IOSurfaceGetBytesPerRowOfPlane(s, 0)]);
+                                             : IOSurfaceGetBytesPerRowOfPlane(s, plane)]);
   stage("new-texture-over-surface");
-  return [gDevice newTextureWithDescriptor:d iosurface:s plane:0];
+  return [gDevice newTextureWithDescriptor:d iosurface:s plane:plane];
 }
 
 // A 4-sample Private texture of `format` of its own, or a 1-sample one.
@@ -209,7 +215,7 @@ static id<MTLDevice> pickDevice(const char *want) {
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     if (argc != 7) {
-      fprintf(stderr, "usage: oracle_surfresolve DEVICE <own|flat|plane> "
+      fprintf(stderr, "usage: oracle_surfresolve DEVICE <own|flat|plane|plane1> "
                       "<shared|managed|private> FROM INTO <resolve|smsr>\n");
       return 2;
     }

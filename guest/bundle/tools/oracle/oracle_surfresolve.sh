@@ -9,7 +9,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 probe=${PROBE:-$here/oracle_surfresolve}
 err=$(mktemp "${TMPDIR:-/tmp}/oracle-surfresolve.XXXXXX")
 trap 'rm -f "$err"' EXIT
-for over in ${OVERS:-own flat plane}; do
+for over in ${OVERS:-own flat plane plane1}; do
   for storage in ${STORAGES:-shared managed private}; do
     for from in ${FROMS:-80 81}; do
       for into in 115 554 555 "$from"; do
