@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <climits>
+#include <cmath>
+#include <cstdio>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -859,6 +861,812 @@ bool RgfxGLNormalizeStageText(std::string &text, const RgfxGLSignature &signatur
 	return true;
 }
 
+std::string RgfxGLStageIn::key() const
+{
+	std::string k;
+	auto put = [&k](uint32_t v) { k.append(reinterpret_cast<const char *>(&v), sizeof v); };
+	for (const Attribute &a : attributes) {
+		put(a.format);
+		put(a.offset);
+		put(a.bufferIndex);
+	}
+	for (const Layout &l : layouts) {
+		put(l.stride);
+		put(l.stepFunction);
+		put(l.stepRate);
+	}
+	put(indexType);
+	put(indexBufferIndex);
+	return k;
+}
+
+namespace {
+
+// MTLStepFunction's values the fetch reads (Metal/MTLStageInputOutputDescriptor.h).
+enum : uint32_t {
+	kStepConstant = 0,
+	kStepGridX = 5,
+	kStepGridY = 6,
+	kStepGridXIndexed = 7,
+};
+
+// How an MTLAttributeFormat's bytes hold its components: `count` of them, of `bits` each,
+// unsigned or signed integers ('u', 's'), halves or floats ('h', 'f'), normalized or not; or one of
+// the packed formats.
+struct AttributeLayout {
+	unsigned count = 0, bits = 0;
+	char kind = 0;
+	bool normalized = false;
+	enum Packed { None, Snorm1010102, Unorm1010102, Bgra8, Rg11b10f, Rgb9e5 } packed = None;
+};
+
+// Metal/MTLStageInputOutputDescriptor.h's MTLAttributeFormat values.
+bool attributeLayout(uint32_t format, AttributeLayout &f)
+{
+	struct Row {
+		uint32_t first;
+		unsigned bits;
+		char kind;
+		bool normalized;
+	};
+	// The formats of 2, 3 and 4 components in runs of three, from their first value.
+	static const Row kRuns[] = {{1, 8, 'u', false},   {4, 8, 's', false},   {7, 8, 'u', true},
+	                            {10, 8, 's', true},   {13, 16, 'u', false}, {16, 16, 's', false},
+	                            {19, 16, 'u', true},  {22, 16, 's', true},  {25, 16, 'h', false}};
+	for (const Row &r : kRuns)
+		if (format >= r.first && format < r.first + 3) {
+			f = {format - r.first + 2, r.bits, r.kind, r.normalized, AttributeLayout::None};
+			return true;
+		}
+	if (format >= 28 && format <= 31) {
+		f = {format - 27, 32, 'f', false, AttributeLayout::None};
+		return true;
+	}
+	if (format >= 32 && format <= 39) {
+		f = {(format - 32) % 4 + 1, 32, format < 36 ? 's' : 'u', false, AttributeLayout::None};
+		return true;
+	}
+	static const struct {
+		uint32_t format;
+		AttributeLayout layout;
+	} kOthers[] = {
+	    {40, {4, 32, 's', true, AttributeLayout::Snorm1010102}},
+	    {41, {4, 32, 'u', true, AttributeLayout::Unorm1010102}},
+	    {42, {4, 8, 'u', true, AttributeLayout::Bgra8}},
+	    {45, {1, 8, 'u', false, AttributeLayout::None}},
+	    {46, {1, 8, 's', false, AttributeLayout::None}},
+	    {47, {1, 8, 'u', true, AttributeLayout::None}},
+	    {48, {1, 8, 's', true, AttributeLayout::None}},
+	    {49, {1, 16, 'u', false, AttributeLayout::None}},
+	    {50, {1, 16, 's', false, AttributeLayout::None}},
+	    {51, {1, 16, 'u', true, AttributeLayout::None}},
+	    {52, {1, 16, 's', true, AttributeLayout::None}},
+	    {53, {1, 16, 'h', false, AttributeLayout::None}},
+	    {54, {3, 32, 'f', false, AttributeLayout::Rg11b10f}},
+	    {55, {3, 32, 'f', false, AttributeLayout::Rgb9e5}},
+	};
+	for (const auto &o : kOthers)
+		if (o.format == format) {
+			f = o.layout;
+			return true;
+		}
+	return false;
+}
+
+// An LLVM scalar or vector type's element type text and lanes ("<4 x float>": "float", 4).
+bool splitVector(std::string t, std::string &element, unsigned &lanes)
+{
+	while (!t.empty() && t.front() == ' ')
+		t.erase(0, 1);
+	while (!t.empty() && t.back() == ' ')
+		t.pop_back();
+	lanes = 1;
+	element = t;
+	if (t.size() > 2 && t.front() == '<' && t.back() == '>') {
+		const std::string inner = t.substr(1, t.size() - 2);
+		const size_t x = inner.find(" x ");
+		if (x == std::string::npos)
+			return false;
+		lanes = static_cast<unsigned>(std::strtoul(inner.c_str(), nullptr, 10));
+		element = inner.substr(x + 3);
+	}
+	return element == "float" || element == "half" || element == "i32" || element == "i16" || element == "i8" ||
+	       element == "i1" || element == "i64";
+}
+
+// The IR a fetch is written in: numbered values, one instruction a line.
+struct Emitter {
+	std::string body;
+	unsigned next = 0;
+	std::string value() { return "%rgfx." + std::to_string(next++); }
+	std::string emit(const std::string &instruction)
+	{
+		const std::string v = value();
+		body += "  " + v + " = " + instruction + "\n";
+		return v;
+	}
+	void line(const std::string &instruction) { body += "  " + instruction + "\n"; }
+};
+
+std::string floatConstant(double d)
+{
+	// LLVM's text writes a float constant as the double of its value, in hex.
+	const float f = static_cast<float>(d);
+	const double exact = f;
+	uint64_t bits = 0;
+	std::memcpy(&bits, &exact, sizeof bits);
+	char text[24];
+	std::snprintf(text, sizeof text, "0x%016llX", static_cast<unsigned long long>(bits));
+	return text;
+}
+
+// One component as float of an unsigned or signed integer `v` of `bits` bits, normalized as Metal's
+// stage input fetch converts it: unsigned c / (2^bits - 1); signed max(c / (2^(bits - 1) - 1), -1),
+// save that `byReciprocal` multiplies c by the float nearest 1 / (2^(bits - 1) - 1) instead
+// (measured: the M3 Max under macOS 27.0.1 fetches Int1010102Normalized's 10-bit components so,
+// and every other normalized format's by the quotient; tests/gl_tests.mm's stage input oracle).
+std::string normalizedComponent(Emitter &e, const std::string &v, unsigned bits, bool isSigned,
+                                bool byReciprocal = false)
+{
+	const std::string i = "i" + std::to_string(bits);
+	if (!isSigned) {
+		const std::string f = e.emit("uitofp " + i + " " + v + " to float");
+		return e.emit("fdiv float " + f + ", " + floatConstant(static_cast<double>((1ull << bits) - 1)));
+	}
+	const std::string f = e.emit("sitofp " + i + " " + v + " to float");
+	const float largest = static_cast<float>((1ull << (bits - 1)) - 1);
+	const std::string q = byReciprocal ? e.emit("fmul float " + f + ", " + floatConstant(1.0f / largest))
+	                                   : e.emit("fdiv float " + f + ", " + floatConstant(largest));
+	const std::string low = e.emit("fcmp olt float " + q + ", " + floatConstant(-1.0));
+	return e.emit("select i1 " + low + ", float " + floatConstant(-1.0) + ", float " + q);
+}
+
+// The float of an unsigned small float of `mantissa` mantissa bits and 5 exponent bits, `v` an i32
+// holding it in its low bits (RG11B10's: 6 or 5 mantissa bits, bias 15).
+std::string smallFloat(Emitter &e, const std::string &v, unsigned mantissa)
+{
+	const std::string m = e.emit("and i32 " + v + ", " + std::to_string((1u << mantissa) - 1));
+	const std::string ex = e.emit("lshr i32 " + v + ", " + std::to_string(mantissa));
+	const std::string x = e.emit("and i32 " + ex + ", 31");
+	// Normal: the float's bits (x - 15 + 127) << 23 | m << (23 - mantissa); 31: infinity where m is
+	// 0, else the quiet NaN 0x7fc00000, whatever m (measured: the M3 Max under macOS 27.0.1,
+	// tests/gl_tests.mm's stage input oracle); 0: the denormal m * 2^(-14 - mantissa).
+	const std::string biased = e.emit("add i32 " + x + ", 112");
+	const std::string hi = e.emit("shl i32 " + biased + ", 23");
+	const std::string lo = e.emit("shl i32 " + m + ", " + std::to_string(23 - mantissa));
+	const std::string normal = e.emit("or i32 " + hi + ", " + lo);
+	const std::string infinite = e.emit("icmp eq i32 " + m + ", 0");
+	const std::string special = e.emit("select i1 " + infinite + ", i32 2139095040, i32 2143289344");
+	const std::string isMax = e.emit("icmp eq i32 " + x + ", 31");
+	const std::string bitsValue = e.emit("select i1 " + isMax + ", i32 " + special + ", i32 " + normal);
+	const std::string asFloat = e.emit("bitcast i32 " + bitsValue + " to float");
+	const std::string mf = e.emit("uitofp i32 " + m + " to float");
+	const std::string denormal =
+	    e.emit("fmul float " + mf + ", " + floatConstant(std::ldexp(1.0, -14 - static_cast<int>(mantissa))));
+	const std::string isZero = e.emit("icmp eq i32 " + x + ", 0");
+	return e.emit("select i1 " + isZero + ", float " + denormal + ", float " + asFloat);
+}
+
+// A component's natural value: an integer of the format's width and signedness, or a float.
+struct Component {
+	std::string value;
+	std::string type; // "float", "half", "iN"
+	bool isSigned = false;
+};
+
+// The components the format at `pointer` (an i8 addrspace(1)*) holds, as Metal's vertex fetch
+// reads them. Each is loaded at its own size's alignment, which it has: Metal takes an attribute's
+// offset and a layout's stride only as multiples of 4.
+std::vector<Component> readComponents(Emitter &e, const std::string &pointer, const AttributeLayout &f)
+{
+	std::vector<Component> out;
+	auto load = [&](const std::string &type, unsigned byteOffset) {
+		std::string p = pointer;
+		if (byteOffset != 0)
+			p = e.emit("getelementptr inbounds i8, i8 addrspace(1)* " + pointer + ", i64 " +
+			           std::to_string(byteOffset));
+		const std::string typed =
+		    type == "i8" ? p : e.emit("bitcast i8 addrspace(1)* " + p + " to " + type + " addrspace(1)*");
+		const char *align = type == "i8" ? "1" : type == "i16" ? "2" : "4";
+		return e.emit("load " + type + ", " + type + " addrspace(1)* " + typed + ", align " + align);
+	};
+	if (f.packed == AttributeLayout::None) {
+		const std::string type = f.kind == 'f' ? "float" : f.kind == 'h' ? "half" : "i" + std::to_string(f.bits);
+		for (unsigned c = 0; c < f.count; c++) {
+			std::string v = load(f.kind == 'h' ? "i16" : type, c * f.bits / 8);
+			if (f.kind == 'h')
+				v = e.emit("bitcast i16 " + v + " to half");
+			if (f.normalized)
+				out.push_back({normalizedComponent(e, v, f.bits, f.kind == 's'), "float", false});
+			else
+				out.push_back({v, type, f.kind == 's'});
+		}
+		return out;
+	}
+	if (f.packed == AttributeLayout::Bgra8) {
+		std::string bytes[4];
+		for (unsigned c = 0; c < 4; c++)
+			bytes[c] = load("i8", c);
+		const unsigned order[4] = {2, 1, 0, 3};
+		for (unsigned c = 0; c < 4; c++)
+			out.push_back({normalizedComponent(e, bytes[order[c]], 8, false), "float", false});
+		return out;
+	}
+	const std::string word = load("i32", 0);
+	auto field = [&](unsigned shift, unsigned width) {
+		const std::string s = shift != 0 ? e.emit("lshr i32 " + word + ", " + std::to_string(shift)) : word;
+		return e.emit("trunc i32 " + s + " to i" + std::to_string(width));
+	};
+	switch (f.packed) {
+	case AttributeLayout::Snorm1010102:
+	case AttributeLayout::Unorm1010102: {
+		const bool isSigned = f.packed == AttributeLayout::Snorm1010102;
+		for (unsigned c = 0; c < 3; c++)
+			out.push_back({normalizedComponent(e, field(10 * c, 10), 10, isSigned, isSigned), "float", false});
+		out.push_back({normalizedComponent(e, field(30, 2), 2, isSigned), "float", false});
+		break;
+	}
+	case AttributeLayout::Rg11b10f: {
+		const unsigned shifts[3] = {0, 11, 22}, widths[3] = {11, 11, 10};
+		for (unsigned c = 0; c < 3; c++) {
+			const std::string s = shifts[c] != 0 ? e.emit("lshr i32 " + word + ", " + std::to_string(shifts[c])) : word;
+			const std::string bits = e.emit("and i32 " + s + ", " + std::to_string((1u << widths[c]) - 1));
+			out.push_back({smallFloat(e, bits, widths[c] - 5), "float", false});
+		}
+		break;
+	}
+	case AttributeLayout::Rgb9e5: {
+		// Each of 9 mantissa bits times 2^(e - 15 - 9), e the shared exponent (bits 27 to 31).
+		const std::string ex = e.emit("lshr i32 " + word + ", 27");
+		const std::string biased = e.emit("add i32 " + ex + ", 103");
+		const std::string scaleBits = e.emit("shl i32 " + biased + ", 23");
+		const std::string scale = e.emit("bitcast i32 " + scaleBits + " to float");
+		for (unsigned c = 0; c < 3; c++) {
+			const std::string s = c != 0 ? e.emit("lshr i32 " + word + ", " + std::to_string(9 * c)) : word;
+			const std::string m = e.emit("and i32 " + s + ", 511");
+			const std::string mf = e.emit("uitofp i32 " + m + " to float");
+			out.push_back({e.emit("fmul float " + mf + ", " + scale), "float", false});
+		}
+		break;
+	}
+	default:
+		break;
+	}
+	return out;
+}
+
+// `c` converted to `element` ("float", "half", "iN"): floats widened or narrowed, integers
+// extended by their signedness or truncated, integers to floats by value, floats to integers
+// toward zero.
+std::string convert(Emitter &e, const Component &c, const std::string &element)
+{
+	if (c.type == element)
+		return c.value;
+	const bool fromFloat = c.type == "float" || c.type == "half";
+	const bool toFloat = element == "float" || element == "half";
+	if (fromFloat && toFloat)
+		return e.emit((element == "float" ? "fpext " : "fptrunc ") + c.type + " " + c.value + " to " + element);
+	if (fromFloat)
+		return e.emit("fptosi " + c.type + " " + c.value + " to " + element);
+	if (toFloat)
+		return e.emit((c.isSigned ? "sitofp " : "uitofp ") + c.type + " " + c.value + " to " + element);
+	const unsigned from = static_cast<unsigned>(std::strtoul(c.type.c_str() + 1, nullptr, 10));
+	const unsigned to = static_cast<unsigned>(std::strtoul(element.c_str() + 1, nullptr, 10));
+	if (from > to)
+		return e.emit("trunc " + c.type + " " + c.value + " to " + element);
+	return e.emit((c.isSigned ? "sext " : "zext ") + c.type + " " + c.value + " to " + element);
+}
+
+// The constant `v` (0 or 1) of `element`.
+std::string constantOf(const std::string &element, int v)
+{
+	if (element == "float" || element == "half")
+		return v == 0 ? "0.0" : "1.0";
+	return std::to_string(v);
+}
+
+// The parameters' types of the function type an operand holds ("void (i8*, <2 x i32>)* @k").
+std::vector<std::string> parameterTexts(const std::string &op)
+{
+	std::vector<std::string> params;
+	size_t open = std::string::npos;
+	int depth = 0;
+	for (size_t i = 0; i < op.size(); i++) {
+		const char c = op[i];
+		if (c == '{' || c == '<' || c == '[')
+			depth++;
+		else if (c == '}' || c == '>' || c == ']')
+			depth--;
+		else if (c == '(' && depth == 0) {
+			open = i;
+			break;
+		}
+	}
+	if (open == std::string::npos)
+		return params;
+	std::string param;
+	depth = 0;
+	for (size_t i = open + 1; i < op.size(); i++) {
+		const char c = op[i];
+		if (c == '(' || c == '{' || c == '<' || c == '[')
+			depth++;
+		else if (c == ')' || c == '}' || c == '>' || c == ']')
+			depth--;
+		if (depth < 0 || (depth == 0 && c == ',')) {
+			while (!param.empty() && param.back() == ' ')
+				param.pop_back();
+			if (!param.empty())
+				params.push_back(param);
+			param.clear();
+			if (depth < 0)
+				break;
+			continue;
+		}
+		if (param.empty() && c == ' ')
+			continue;
+		param += c;
+	}
+	return params;
+}
+
+// The x (`lane` 0) or y (1) of a value of LLVM type `type` (a vector of i32 or one i32; 0 for y
+// of a scalar).
+std::string laneOf(Emitter &e, const std::string &type, const std::string &v, unsigned lane)
+{
+	if (type == "i32")
+		return lane == 0 ? v : "0";
+	return e.emit("extractelement " + type + " " + v + ", i32 " + std::to_string(lane));
+}
+
+} // namespace
+
+bool RgfxGLSpecializeStageInText(std::string &text, const RgfxGLStageIn &in, std::string &why)
+{
+	std::vector<std::string> lines;
+	for (size_t at = 0; at <= text.size();) {
+		size_t end = text.find('\n', at);
+		if (end == std::string::npos)
+			end = text.size();
+		lines.push_back(text.substr(at, end - at));
+		at = end + 1;
+	}
+	std::vector<size_t> nodeLine;
+	size_t kernelList = lines.size();
+	unsigned nextNode = 0;
+	for (size_t i = 0; i < lines.size(); i++) {
+		unsigned n = 0;
+		if (refOp(lines[i], n) && lines[i].find(" = ") != std::string::npos) {
+			if (nodeLine.size() <= n)
+				nodeLine.resize(n + 1, lines.size());
+			nodeLine[n] = i;
+			nextNode = std::max(nextNode, n + 1);
+		} else if (kernelList == lines.size() && lines[i].compare(0, 14, "!air.kernel = ") == 0) {
+			kernelList = i;
+		}
+	}
+	auto node = [&](unsigned n, NodeText &out) {
+		return n < nodeLine.size() && nodeLine[n] < lines.size() && splitNode(lines[nodeLine[n]], out);
+	};
+	NodeText named, entry, inputs;
+	unsigned entryNode = 0, inputsNode = 0;
+	if (kernelList == lines.size() || !splitNode(lines[kernelList], named) || named.ops.empty() ||
+	    !refOp(named.ops[0], entryNode) || !node(entryNode, entry) || entry.ops.size() < 3 ||
+	    !refOp(entry.ops[2], inputsNode) || !node(inputsNode, inputs)) {
+		why = "the module has no kernel entry point";
+		return false;
+	}
+	const size_t at = entry.ops[0].rfind(" @");
+	if (at == std::string::npos) {
+		why = "the kernel's entry node names no function";
+		return false;
+	}
+	const std::string name = entry.ops[0].substr(at + 2);
+	const std::vector<std::string> params = parameterTexts(entry.ops[0]);
+
+	// The kernel's inputs by argument: the control point input, the region's origin, the thread
+	// position, and its buffers by index.
+	struct Input {
+		unsigned node = 0, arg = 0;
+		NodeText text;
+		std::string kind;
+	};
+	std::vector<Input> args;
+	const Input *controlPoints = nullptr;
+	int origin = -1, position = -1;
+	std::vector<int> bufferAt(32, -1);
+	for (const std::string &op : inputs.ops) {
+		Input input;
+		if (!refOp(op, input.node) || !node(input.node, input.text) || input.text.ops.size() < 2 ||
+		    !intOp(input.text.ops[0], input.arg) || !stringOp(input.text.ops[1], input.kind) ||
+		    input.arg >= params.size()) {
+			why = "the kernel's input " + op + " is not an argument's";
+			return false;
+		}
+		args.push_back(input);
+	}
+	for (const Input &input : args) {
+		if (input.kind == "air.patch_control_point_input")
+			controlPoints = &input;
+		else if (input.kind == "air.stage_in_grid_origin")
+			origin = static_cast<int>(input.arg);
+		else if (input.kind == "air.thread_position_in_grid")
+			position = static_cast<int>(input.arg);
+		else if (input.kind == "air.buffer")
+			for (size_t i = 2; i + 1 < input.text.ops.size(); i++) {
+				std::string key;
+				unsigned index = 0;
+				if (stringOp(input.text.ops[i], key) && key == "air.location_index" &&
+				    intOp(input.text.ops[i + 1], index) && index < bufferAt.size())
+					bufferAt[index] = static_cast<int>(input.arg);
+			}
+	}
+	unsigned functionNode = 0;
+	NodeText function;
+	if (controlPoints == nullptr || controlPoints->text.ops.size() < 3 ||
+	    !refOp(controlPoints->text.ops[2], functionNode) || !node(functionNode, function) ||
+	    function.ops.size() < 2) {
+		why = "the kernel takes no patch control point input";
+		return false;
+	}
+	const size_t fnAt = function.ops[1].rfind(" @");
+	const size_t paren = function.ops[1].find(" (");
+	if (fnAt == std::string::npos || paren == std::string::npos) {
+		why = "the control point input names no function";
+		return false;
+	}
+	const std::string fetchName = function.ops[1].substr(fnAt + 2);
+	const std::string resultType = function.ops[1].substr(0, paren);
+	const std::vector<std::string> members = resultMembers(function.ops[1]);
+
+	// Each field: its attribute, layout, member type; the buffers the fields read, in index order.
+	struct Field {
+		unsigned location = 0;
+		RgfxGLStageIn::Attribute attribute;
+		RgfxGLStageIn::Layout layout;
+		AttributeLayout format;
+		std::string element;
+		unsigned lanes = 1;
+	};
+	std::vector<Field> fields;
+	std::vector<unsigned> slots; // buffer indices, sorted
+	auto slotOf = [&slots](unsigned index) {
+		const auto it = std::lower_bound(slots.begin(), slots.end(), index);
+		if (it == slots.end() || *it != index)
+			return slots.insert(it, index) - slots.begin();
+		return it - slots.begin();
+	};
+	bool indexed = false, byY = false;
+	for (size_t k = 3; k < controlPoints->text.ops.size(); k++) {
+		unsigned fieldNode = 0;
+		NodeText f;
+		Field field;
+		if (!refOp(controlPoints->text.ops[k], fieldNode) || !node(fieldNode, f) || k - 3 >= members.size() ||
+		    !splitVector(members[k - 3], field.element, field.lanes)) {
+			why = "the control point input's field " + std::to_string(k - 3) + " has no member type";
+			return false;
+		}
+		bool located = false;
+		for (size_t i = 0; i + 1 < f.ops.size() && !located; i++) {
+			std::string key;
+			located = stringOp(f.ops[i], key) && key == "air.location_index" && intOp(f.ops[i + 1], field.location);
+		}
+		if (!located || field.location >= 31) {
+			why = "the control point input's field " + std::to_string(k - 3) + " has no attribute index";
+			return false;
+		}
+		field.attribute = in.attributes[field.location];
+		if (!attributeLayout(field.attribute.format, field.format) || field.attribute.bufferIndex >= 31) {
+			why = "the stage input descriptor's attribute " + std::to_string(field.location) +
+			      " has no format the fetch reads (" + std::to_string(field.attribute.format) + ")";
+			return false;
+		}
+		field.layout = in.layouts[field.attribute.bufferIndex];
+		const uint32_t step = field.layout.stepFunction;
+		if (step != kStepConstant && step != kStepGridX && step != kStepGridY && step != kStepGridXIndexed) {
+			why = "the stage input descriptor's layout " + std::to_string(field.attribute.bufferIndex) +
+			      " steps by function " + std::to_string(step) + ", which no compute stage input takes";
+			return false;
+		}
+		indexed |= step == kStepGridXIndexed;
+		byY |= step == kStepGridY;
+		fields.push_back(field);
+	}
+	for (const Field &f : fields)
+		slotOf(f.attribute.bufferIndex);
+	if (indexed)
+		slotOf(in.indexBufferIndex);
+	if (indexed && in.indexBufferIndex >= 31) {
+		why = "the stage input descriptor's index buffer index is out of range";
+		return false;
+	}
+
+	// The kernel of the same name: the arguments but the input, then the buffers it lacks, then the
+	// origin and thread position where it lacks them.
+	const std::string inner = name + ".rgfx_gl";
+	const unsigned p = controlPoints->arg;
+	std::vector<std::string> wrapperTypes;
+	std::vector<int> wrapperOf(params.size(), -1);
+	for (unsigned k = 0; k < params.size(); k++)
+		if (k != p) {
+			wrapperOf[k] = static_cast<int>(wrapperTypes.size());
+			wrapperTypes.push_back(params[k]);
+		}
+	std::vector<std::string> added; // the new input nodes' text, before their numbers
+	std::vector<std::string> slotValue(slots.size());
+	for (size_t j = 0; j < slots.size(); j++) {
+		const unsigned index = slots[j];
+		if (bufferAt[index] >= 0 && static_cast<unsigned>(bufferAt[index]) != p) {
+			const unsigned k = static_cast<unsigned>(bufferAt[index]);
+			slotValue[j] = "%rgfx.a" + std::to_string(k);
+			continue;
+		}
+		const unsigned position = static_cast<unsigned>(wrapperTypes.size());
+		wrapperTypes.push_back("i8 addrspace(1)*");
+		slotValue[j] = "%rgfx.b" + std::to_string(index);
+		added.push_back("!{i32 " + std::to_string(position) +
+		                ", !\"air.buffer\", !\"air.location_index\", i32 " + std::to_string(index) +
+		                ", i32 1, !\"air.read\", !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 1, "
+		                "!\"air.arg_type_align_size\", i32 1, !\"air.arg_type_name\", !\"uchar\", "
+		                "!\"air.arg_name\", !\"rgfx_stage_in_buffer_" +
+		                std::to_string(index) + "\"}");
+	}
+	std::string originValue, originType = "<2 x i32>", positionValue, positionType = "<2 x i32>";
+	if (origin >= 0) {
+		originValue = "%rgfx.a" + std::to_string(origin);
+		originType = params[static_cast<unsigned>(origin)];
+	} else {
+		added.push_back("!{i32 " + std::to_string(wrapperTypes.size()) +
+		                ", !\"air.stage_in_grid_origin\", !\"air.arg_type_name\", !\"uint2\", !\"air.arg_name\", "
+		                "!\"rgfx_grid_origin\"}");
+		wrapperTypes.push_back(originType);
+		originValue = "%rgfx.origin";
+	}
+	if (position >= 0) {
+		positionValue = "%rgfx.a" + std::to_string(position);
+		positionType = params[static_cast<unsigned>(position)];
+	} else if (byY) {
+		added.push_back("!{i32 " + std::to_string(wrapperTypes.size()) +
+		                ", !\"air.thread_position_in_grid\", !\"air.arg_type_name\", !\"uint2\", !\"air.arg_name\", "
+		                "!\"rgfx_thread_position\"}");
+		wrapperTypes.push_back(positionType);
+		positionValue = "%rgfx.position";
+	}
+
+	// The record the fetch reads: the buffers, the origin's x and the thread position's y.
+	const std::string record = "{ [" + std::to_string(slots.size()) + " x i8 addrspace(1)*], i32, i32 }";
+	Emitter w;
+	w.body = "define void @" + name + "(";
+	{
+		std::vector<std::string> names;
+		for (unsigned k = 0; k < params.size(); k++)
+			if (k != p)
+				names.push_back("%rgfx.a" + std::to_string(k));
+		for (size_t j = 0; j < slots.size(); j++)
+			if (slotValue[j].compare(0, 7, "%rgfx.b") == 0)
+				names.push_back(slotValue[j]);
+		if (origin < 0)
+			names.push_back(originValue);
+		if (position < 0 && byY)
+			names.push_back(positionValue);
+		for (size_t i = 0; i < names.size(); i++)
+			w.body += (i != 0 ? ", " : "") + wrapperTypes[i] + " " + names[i];
+	}
+	w.body += ") {\nentry:\n";
+	const std::string r = w.emit("alloca " + record + ", align 8");
+	for (size_t j = 0; j < slots.size(); j++) {
+		const std::string slot = w.emit("getelementptr inbounds " + record + ", " + record + "* " + r +
+		                                ", i32 0, i32 0, i32 " + std::to_string(j));
+		std::string v = slotValue[j];
+		const std::string type = slotValue[j].compare(0, 7, "%rgfx.a") == 0
+		                             ? params[std::strtoul(slotValue[j].c_str() + 7, nullptr, 10)]
+		                             : std::string("i8 addrspace(1)*");
+		if (type != "i8 addrspace(1)*")
+			v = w.emit("bitcast " + type + " " + v + " to i8 addrspace(1)*");
+		w.line("store i8 addrspace(1)* " + v + ", i8 addrspace(1)** " + slot + ", align 8");
+	}
+	const std::string ox = laneOf(w, originType, originValue, 0);
+	const std::string originField =
+	    w.emit("getelementptr inbounds " + record + ", " + record + "* " + r + ", i32 0, i32 1");
+	w.line("store i32 " + ox + ", i32* " + originField + ", align 4");
+	const std::string ty = positionValue.empty() ? std::string("0") : laneOf(w, positionType, positionValue, 1);
+	const std::string positionField =
+	    w.emit("getelementptr inbounds " + record + ", " + record + "* " + r + ", i32 0, i32 2");
+	w.line("store i32 " + ty + ", i32* " + positionField + ", align 4");
+	const std::string handle = w.emit("bitcast " + record + "* " + r + " to " + params[p]);
+	{
+		std::string call = "call void @" + inner + "(";
+		for (unsigned k = 0; k < params.size(); k++)
+			call += (k != 0 ? ", " : "") + params[k] + " " + (k == p ? handle : "%rgfx.a" + std::to_string(k));
+		w.line(call + ")");
+	}
+	w.line("ret void");
+	w.body += "}\n";
+
+	// The fetch.
+	Emitter f;
+	f.body = "define internal " + resultType + " @" + fetchName + "(i32 %rgfx.i, i8* %rgfx.h) alwaysinline {\nentry:\n";
+	const std::string fr = f.emit("bitcast i8* %rgfx.h to " + record + "*");
+	auto loadSlot = [&](unsigned index) {
+		const unsigned j = static_cast<unsigned>(std::lower_bound(slots.begin(), slots.end(), index) - slots.begin());
+		const std::string slot = f.emit("getelementptr inbounds " + record + ", " + record + "* " + fr +
+		                                ", i32 0, i32 0, i32 " + std::to_string(j));
+		return f.emit("load i8 addrspace(1)*, i8 addrspace(1)** " + slot + ", align 8");
+	};
+	const std::string originAt = f.emit("getelementptr inbounds " + record + ", " + record + "* " + fr + ", i32 0, i32 1");
+	const std::string fox = f.emit("load i32, i32* " + originAt + ", align 4");
+	const std::string positionAt =
+	    f.emit("getelementptr inbounds " + record + ", " + record + "* " + fr + ", i32 0, i32 2");
+	const std::string fty = f.emit("load i32, i32* " + positionAt + ", align 4");
+	const std::string byPosition = f.emit("add i32 %rgfx.i, " + fox);
+	std::string byIndex;
+	if (indexed) {
+		const std::string ib = loadSlot(in.indexBufferIndex);
+		const std::string it = in.indexType == 1 ? "i32" : "i16";
+		const std::string typed = f.emit("bitcast i8 addrspace(1)* " + ib + " to " + it + " addrspace(1)*");
+		const std::string i64 = f.emit("zext i32 %rgfx.i to i64");
+		const std::string at =
+		    f.emit("getelementptr inbounds " + it + ", " + it + " addrspace(1)* " + typed + ", i64 " + i64);
+		std::string index =
+		    f.emit("load " + it + ", " + it + " addrspace(1)* " + at + (it == "i32" ? ", align 4" : ", align 2"));
+		if (it != "i32")
+			index = f.emit("zext i16 " + index + " to i32");
+		byIndex = f.emit("add i32 " + index + ", " + fox);
+	}
+	std::string result = "undef";
+	for (size_t k = 0; k < fields.size(); k++) {
+		const Field &field = fields[k];
+		std::string element;
+		switch (field.layout.stepFunction) {
+		case kStepGridX:
+			element = byPosition;
+			break;
+		case kStepGridXIndexed:
+			element = byIndex;
+			break;
+		case kStepGridY:
+			element = field.layout.stepRate == 0
+			              ? std::string("0")
+			              : f.emit("udiv i32 " + fty + ", " + std::to_string(field.layout.stepRate));
+			break;
+		default:
+			element = "0";
+			break;
+		}
+		const std::string scaled = f.emit("mul i32 " + element + ", " + std::to_string(field.layout.stride));
+		const std::string offset = f.emit("add i32 " + scaled + ", " + std::to_string(field.attribute.offset));
+		const std::string wide = f.emit("zext i32 " + offset + " to i64");
+		const std::string base = loadSlot(field.attribute.bufferIndex);
+		const std::string pointer = f.emit("getelementptr inbounds i8, i8 addrspace(1)* " + base + ", i64 " + wide);
+		const std::vector<Component> components = readComponents(f, pointer, field.format);
+		std::string v;
+		if (field.lanes == 1) {
+			v = components.empty() ? constantOf(field.element, 0) : convert(f, components[0], field.element);
+		} else {
+			const std::string vector = "<" + std::to_string(field.lanes) + " x " + field.element + ">";
+			v = "undef";
+			for (unsigned c = 0; c < field.lanes; c++) {
+				const std::string lane =
+				    c < components.size() ? convert(f, components[c], field.element) : constantOf(field.element, c == 3 ? 1 : 0);
+				v = f.emit("insertelement " + vector + " " + v + ", " + field.element + " " + lane + ", i32 " +
+				           std::to_string(c));
+			}
+		}
+		std::string memberType = members[k];
+		while (!memberType.empty() && memberType.front() == ' ')
+			memberType.erase(0, 1);
+		while (!memberType.empty() && memberType.back() == ' ')
+			memberType.pop_back();
+		if (members.size() == 1 && resultType.front() != '{') {
+			result = v;
+		} else {
+			result = f.emit("insertvalue " + resultType + " " + result + ", " + memberType + " " + v + ", " +
+			                std::to_string(k));
+		}
+	}
+	f.line("ret " + resultType + " " + result);
+	f.body += "}";
+
+	// The text: the kernel renamed and internal, the fetch in place of its declaration, the
+	// kernel's entry node naming the wrapper and its inputs, the wrapper after the module.
+	bool renamed = false, defined = false;
+	const std::string defineAs = "define void @" + name + "(";
+	for (std::string &line : lines) {
+		if (!renamed && line.compare(0, defineAs.size(), defineAs) == 0) {
+			line = "define internal void @" + inner + "(" + line.substr(defineAs.size());
+			renamed = true;
+		} else if (!defined && line.compare(0, 8, "declare ") == 0 &&
+		           line.find(" @" + fetchName + "(") != std::string::npos) {
+			line = f.body;
+			defined = true;
+		}
+	}
+	if (!renamed || !defined) {
+		why = !renamed ? "the module defines no kernel @" + name + " to wrap"
+		               : "the module declares no control point function @" + fetchName;
+		return false;
+	}
+	std::vector<std::string> inputRefs;
+	for (const Input &input : args) {
+		if (input.arg == p)
+			continue;
+		NodeText t = input.text;
+		t.ops[0] = "i32 " + std::to_string(wrapperOf[input.arg]);
+		lines[nodeLine[input.node]] = joinNode(t);
+		inputRefs.push_back("!" + std::to_string(input.node));
+	}
+	std::string appended;
+	for (const std::string &a : added) {
+		appended += "\n!" + std::to_string(nextNode) + " = " + a;
+		inputRefs.push_back("!" + std::to_string(nextNode++));
+	}
+	std::string list = "!" + std::to_string(nextNode) + " = !{";
+	for (size_t i = 0; i < inputRefs.size(); i++)
+		list += (i != 0 ? ", " : "") + inputRefs[i];
+	appended += "\n" + list + "}";
+	entry.ops[2] = "!" + std::to_string(nextNode++);
+	std::string fnType = "void (";
+	for (size_t i = 0; i < wrapperTypes.size(); i++)
+		fnType += (i != 0 ? ", " : "") + wrapperTypes[i];
+	entry.ops[0] = fnType + ")* @" + name;
+	lines[nodeLine[entryNode]] = joinNode(entry);
+	std::string joined;
+	for (size_t i = 0; i < lines.size(); i++)
+		joined += (i != 0 ? "\n" : "") + lines[i];
+	while (!joined.empty() && joined.back() == '\n')
+		joined.pop_back();
+	text = joined + "\n\n" + w.body + appended + "\n";
+	return true;
+}
+
+bool RgfxGLSpecializeStageIn(const std::string &stageInText, const RgfxGLStageIn &in, RgfxGLLowered &out,
+                             std::string &why)
+{
+	std::string text = stageInText;
+	if (!RgfxGLSpecializeStageInText(text, in, why))
+		return false;
+	Libraries &l = libraries();
+	if (!l.loaded) {
+		why = l.why;
+		return false;
+	}
+	Ref context = l.contextCreate();
+	Ref module = nullptr;
+	char *message = nullptr;
+	Ref buffer = l.bufferCopy(text.data(), text.size(), "rgfx-gl-stage-in");
+	bool ok = l.parseIR(context, buffer, &module, &message) == 0 && module != nullptr;
+	if (!ok)
+		why = std::string("the system's LLVM refused the kernel's specialized text: ") +
+		      (message != nullptr ? message : "no message");
+	if (message != nullptr)
+		l.disposeMessage(message);
+	if (ok) {
+		RgfxMetallibFunction f;
+		std::vector<Ref> named = firstNode(l, module, "air.kernel");
+		size_t length = 0;
+		const char *name = !named.empty() && named[0] != nullptr ? l.valueName(named[0], &length) : nullptr;
+		f.name = name != nullptr ? std::string(name, length) : std::string();
+		f.stage = RgfxMetallibStage::Kernel;
+		std::vector<Ref> v = firstNode(l, module, "air.version");
+		if (v.size() >= 2 && v[0] != nullptr && v[1] != nullptr && l.isConstantInt(v[0]) != nullptr &&
+		    l.isConstantInt(v[1]) != nullptr) {
+			f.airMajor = f.languageMajor = static_cast<uint16_t>(l.constIntValue(v[0]));
+			f.airMinor = f.languageMinor = static_cast<uint16_t>(l.constIntValue(v[1]));
+		}
+		Ref bitcode = l.writeBitcode(module);
+		length = l.bufferSize(bitcode);
+		f.bitcode = RgfxUnwrapBitcode(reinterpret_cast<const uint8_t *>(l.bufferStart(bitcode)), &length);
+		f.bitcodeLength = length;
+		out.metallib = RgfxWriteMetallib(f);
+		out.entry = f.name;
+		out.stage = f.stage;
+		l.disposeBuffer(bitcode);
+	}
+	if (module != nullptr)
+		l.disposeModule(module);
+	l.contextDispose(context);
+	return ok;
+}
+
 bool RgfxGLIRPayload(const void *ir, const uint8_t **payload, size_t *length)
 {
 	if (ir == nullptr)
@@ -919,7 +1727,11 @@ bool RgfxLowerGLIR(const uint8_t *ir, size_t irLength, const uint8_t *plugin, si
 		std::string text = printed != nullptr ? printed : "";
 		if (printed != nullptr)
 			l.disposeMessage(printed);
-		if (RgfxGLNormalizeStageText(text, signatureOf(l, module, f.name))) {
+		const bool normalized = RgfxGLNormalizeStageText(text, signatureOf(l, module, f.name));
+		// A kernel of a patch control point input is made per stage input descriptor, from its text.
+		if (f.stage == RgfxMetallibStage::Kernel && text.find("!\"air.patch_control_point_input\"") != std::string::npos)
+			out.stageInText = text;
+		if (normalized) {
 			Ref parsed = nullptr;
 			char *message = nullptr;
 			Ref buffer = l.bufferCopy(text.data(), text.size(), "rgfx-gl");

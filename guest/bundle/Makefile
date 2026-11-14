@@ -252,6 +252,16 @@ $(PATCH_LIB): tests/patch.metal Makefile
 		-o $(BUILD)/patch.air
 	xcrun -sdk macosx metallib $(BUILD)/patch.air -o $@
 
+# The [[stage_in]] kernels of tests/stage_in_oracle.metal, against which the shell tests run a GL
+# kernel made one under a stage input descriptor on this Mac's GPU.
+STAGE_IN_ORACLE_LIB = $(BUILD)/stage_in_oracle.metallib
+
+$(STAGE_IN_ORACLE_LIB): tests/stage_in_oracle.metal Makefile
+	@mkdir -p $(@D)
+	xcrun -sdk macosx metal -c -std=metal3.1 -mmacosx-version-min=14.0 tests/stage_in_oracle.metal \
+		-o $(BUILD)/stage_in_oracle.air
+	xcrun -sdk macosx metallib $(BUILD)/stage_in_oracle.air -o $@
+
 # --- the AIR argument reader's check (x86_64, Rosetta) ------------------------
 # The reader (src/RgfxAirArguments.*) over a .metallib Apple's Metal compiler builds here from
 # tests/air_arguments.metal, never committed; its function constants against the library's CNST
@@ -387,7 +397,8 @@ $(VIDEO_DRIVER_TESTBIN): $(VIDEO_DRIVER_TESTOBJS) tests/video_driver_tests.cpp $
 
 test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(AIR_OLD_LIB) $(AIR_11_LIB) $(AIR_REFLECTED) $(ORACLE_REFLECTION_LIB) \
 	$(ORACLE_OVERLAP_LIB) \
-	$(SHELL_TESTBIN) $(CI_KERNEL) $(STITCHABLE) $(STITCH_CONSTANTS) $(PATCH_LIB) $(INHERIT_TESTBIN) \
+	$(SHELL_TESTBIN) $(CI_KERNEL) $(STITCHABLE) $(STITCH_CONSTANTS) $(PATCH_LIB) $(STAGE_IN_ORACLE_LIB) \
+	$(INHERIT_TESTBIN) \
 	$(MEMBERS_TESTBIN) $(VIDEO_TESTBIN) $(VIDEO_H265_TESTBIN) $(VIDEO_DRIVER_TESTBIN) $(BUNDLEBIN)
 	arch -$(ARCH) $(SER_TESTBIN)
 	RGFX_AIR_ARGUMENTS=$(AIR_LIB) RGFX_AIR_MODULE=$(AIR_MODULE) RGFX_AIR_ARGUMENTS_OLD=$(AIR_OLD_LIB) \
@@ -396,7 +407,8 @@ test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(AIR_OLD_LIB) $(AIR_11_LIB) $(AI
 	RGFX_CI_KERNEL=$(CI_KERNEL) RGFX_STITCHABLE=$(STITCHABLE) RGFX_STITCH_CONSTANTS=$(STITCH_CONSTANTS) \
 		RGFX_AIR_ARGUMENTS=$(AIR_LIB) RGFX_AIR_ARGUMENTS_11=$(AIR_11_LIB) RGFX_LIBRARY_FILE=$(LIBRARY_FILE) \
 		RGFX_AIR_REFLECTED=$(AIR_REFLECTED) RGFX_ORACLE_REFLECTION=$(ORACLE_REFLECTION_LIB) \
-		RGFX_PATCH=$(PATCH_LIB) RGFX_ORACLE_OVERLAP=$(ORACLE_OVERLAP_LIB) $(SHELL_TESTBIN)
+		RGFX_PATCH=$(PATCH_LIB) RGFX_ORACLE_OVERLAP=$(ORACLE_OVERLAP_LIB) \
+		RGFX_STAGE_IN_ORACLE=$(STAGE_IN_ORACLE_LIB) $(SHELL_TESTBIN)
 	arch -$(ARCH) $(INHERIT_TESTBIN) $(BUNDLEBIN)
 	arch -$(ARCH) $(MEMBERS_TESTBIN) $(BUNDLEBIN) tests/protocol_members.txt \
 		tests/protocol_members_releases.txt src

@@ -17,7 +17,10 @@
 //     the render reflection answers for its stage;
 //   - the stage metadata's normalization (src/RgfxGLLowering.*), over modules' text written here
 //     in the generator's shape: an integer user() varying named unsigned, a node without a type
-//     name given its signature's name and a name, and every other line as it was.
+//     name given its signature's name and a name, and every other line as it was;
+//   - a tessellated draw's kernel made one under a stage input descriptor (src/RgfxGLLowering.*),
+//     over kernels' text written here in the generator's shape, and on this Mac's GPU against its
+//     own [[stage_in]] kernels (tests/stage_in_oracle.metal), bit for bit, for every format.
 // A variant is not lowered here: the GL code generator lowers the IR the renderer gives a device,
 // which only a GL context makes; tools/gl_probe.m, tools/gl_inject.mm and tools/gl_cases.m check
 // that on a device.
@@ -29,6 +32,7 @@
 #include <CommonCrypto/CommonDigest.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -1092,6 +1096,596 @@ void test_stage_metadata_normalized()
 	CHECK(!RgfxGLNormalizeStageText(text, vertex) && text == dangling);
 }
 
+// The head of a kernel module, as tests/gl_tests.mm's stage input fixtures write it.
+const char kStageInModuleHead[] =
+    "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-"
+    "v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-"
+    "v512:512:512-v1024:1024:1024-n8:16:32\"\n"
+    "target triple = \"air64_v23-apple-macosx11.0.0\"\n\n";
+
+// A tessellated draw's kernel in the generator's shape (our own text): its control point input at
+// argument 0, of two fields (float4 at attribute 0, float2 at attribute 1), the region's origin
+// and size and the thread builtins after it, then its buffers at indices 0 and 4; `indexed`, the
+// renderer's indexed variant, takes its index buffer at index 19 too, before them.
+std::string tessKernel(bool indexed)
+{
+	const std::string buffers = indexed ? "i8 addrspace(1)*, i8 addrspace(1)*, i8 addrspace(1)*"
+	                                    : "i8 addrspace(1)*, i8 addrspace(1)*";
+	const std::string index = indexed ? "i8 addrspace(1)* %index, " : "";
+	const unsigned b = indexed ? 7 : 6; // the first of the buffers 0 and 4
+	auto buffer = [](unsigned node, unsigned arg, unsigned location, const char *access, const char *name) {
+		return "!" + std::to_string(node) + " = !{i32 " + std::to_string(arg) +
+		       ", !\"air.buffer\", !\"air.location_index\", i32 " + std::to_string(location) + ", i32 1, !\"" +
+		       access + "\", !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 1, " +
+		       "!\"air.arg_type_align_size\", i32 1, !\"air.arg_type_name\", !\"uchar\", !\"air.arg_name\", !\"" +
+		       name + "\"}\n";
+	};
+	auto builtin = [](unsigned node, unsigned arg, const char *kind, const char *name) {
+		return "!" + std::to_string(node) + " = !{i32 " + std::to_string(arg) + ", !\"" + kind +
+		       "\", !\"air.arg_type_name\", !\"uint2\", !\"air.arg_name\", !\"" + name + "\"}\n";
+	};
+	std::string t = kStageInModuleHead;
+	t += "define void @__main(i8* %cp, <2 x i32> %origin, <2 x i32> %size, <2 x i32> %group, <2 x i32> %thread, "
+	     "<2 x i32> %local, " +
+	     index +
+	     "i8 addrspace(1)* %out, i8 addrspace(1)* %uniforms) {\n"
+	     "entry:\n"
+	     "  %x = extractelement <2 x i32> %thread, i32 0\n"
+	     "  %r = call { <4 x float>, <2 x float> } @gld.cs_cpf(i32 %x, i8* %cp)\n"
+	     "  %p = extractvalue { <4 x float>, <2 x float> } %r, 0\n"
+	     "  %q = bitcast i8 addrspace(1)* %out to <4 x float> addrspace(1)*\n"
+	     "  store <4 x float> %p, <4 x float> addrspace(1)* %q, align 16\n"
+	     "  ret void\n"
+	     "}\n\n"
+	     "declare { <4 x float>, <2 x float> } @gld.cs_cpf(i32, i8*)\n\n"
+	     "!air.kernel = !{!0}\n"
+	     "!air.version = !{!15}\n"
+	     "!air.language_version = !{!16}\n"
+	     "!0 = !{void (i8*, <2 x i32>, <2 x i32>, <2 x i32>, <2 x i32>, <2 x i32>, " +
+	     buffers + ")* @__main, !1, !2, !17}\n" + "!1 = !{}\n" +
+	     (indexed ? "!2 = !{!3, !7, !8, !9, !10, !11, !12, !13, !14}\n" : "!2 = !{!3, !7, !8, !9, !10, !11, !13, !14}\n") +
+	     "!3 = !{i32 0, !\"air.patch_control_point_input\", !4, !5, !6}\n"
+	     "!4 = !{!\"air.patch_control_point_function\", { <4 x float>, <2 x float> } (i32, i8*)* @gld.cs_cpf}\n"
+	     "!5 = !{!\"air.location_index\", i32 0, i32 1, !\"air.arg_type_name\", !\"float4\", !\"air.arg_name\", "
+	     "!\"attrib_0\"}\n"
+	     "!6 = !{!\"air.location_index\", i32 1, i32 1, !\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", "
+	     "!\"attrib_1\"}\n" +
+	     builtin(7, 1, "air.stage_in_grid_origin", "origin") + builtin(8, 2, "air.stage_in_grid_size", "size") +
+	     builtin(9, 3, "air.threadgroup_position_in_grid", "group") +
+	     builtin(10, 4, "air.thread_position_in_grid", "thread") +
+	     builtin(11, 5, "air.thread_position_in_threadgroup", "local") +
+	     (indexed ? buffer(12, 6, 19, "air.read", "index") : std::string("!12 = !{}\n")) +
+	     buffer(13, b, 0, "air.read_write", "out") + buffer(14, b + 1, 4, "air.read_write", "uniforms") +
+	     "!15 = !{i32 2, i32 3, i32 0}\n"
+	     "!16 = !{!\"Metal\", i32 2, i32 3, i32 0}\n"
+	     "!17 = !{!\"air.max_work_group_size\", i32 32}\n";
+	return t;
+}
+
+// A tessellated draw's kernel of Heaven's shape (our own text): its control point input at argument
+// 4, after the thread position, the region's size and two buffers (indices 0 and 1), of four
+// fields of mixed types: float4, float3, float2 and int at attributes 0 to 3; a buffer at index 2
+// after it.
+std::string heavenKernel()
+{
+	std::string t = kStageInModuleHead;
+	t += "define void @__main(<2 x i32> %thread, <2 x i32> %size, i8 addrspace(1)* %u0, i8 addrspace(1)* %u1, "
+	     "i8* %cp, i8 addrspace(1)* %out) {\n"
+	     "entry:\n"
+	     "  %x = extractelement <2 x i32> %thread, i32 0\n"
+	     "  %r = call { <4 x float>, <3 x float>, <2 x float>, i32 } @gld.cs_cpf(i32 %x, i8* %cp)\n"
+	     "  %k = extractvalue { <4 x float>, <3 x float>, <2 x float>, i32 } %r, 3\n"
+	     "  %q = bitcast i8 addrspace(1)* %out to i32 addrspace(1)*\n"
+	     "  store i32 %k, i32 addrspace(1)* %q, align 4\n"
+	     "  ret void\n"
+	     "}\n\n"
+	     "declare { <4 x float>, <3 x float>, <2 x float>, i32 } @gld.cs_cpf(i32, i8*)\n\n"
+	     "!air.kernel = !{!0}\n"
+	     "!air.version = !{!15}\n"
+	     "!air.language_version = !{!16}\n"
+	     "!0 = !{void (<2 x i32>, <2 x i32>, i8 addrspace(1)*, i8 addrspace(1)*, i8*, i8 addrspace(1)*)* @__main, "
+	     "!1, !2}\n"
+	     "!1 = !{}\n"
+	     "!2 = !{!3, !4, !5, !6, !7, !14}\n"
+	     "!3 = !{i32 0, !\"air.thread_position_in_grid\", !\"air.arg_type_name\", !\"uint2\", !\"air.arg_name\", "
+	     "!\"thread\"}\n"
+	     "!4 = !{i32 1, !\"air.stage_in_grid_size\", !\"air.arg_type_name\", !\"uint2\", !\"air.arg_name\", "
+	     "!\"size\"}\n"
+	     "!5 = !{i32 2, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.read\", !\"air.address_space\", "
+	     "i32 1, !\"air.arg_type_size\", i32 1, !\"air.arg_type_align_size\", i32 1, !\"air.arg_type_name\", "
+	     "!\"uchar\", !\"air.arg_name\", !\"u0\"}\n"
+	     "!6 = !{i32 3, !\"air.buffer\", !\"air.location_index\", i32 1, i32 1, !\"air.read\", !\"air.address_space\", "
+	     "i32 1, !\"air.arg_type_size\", i32 1, !\"air.arg_type_align_size\", i32 1, !\"air.arg_type_name\", "
+	     "!\"uchar\", !\"air.arg_name\", !\"u1\"}\n"
+	     "!7 = !{i32 4, !\"air.patch_control_point_input\", !8, !9, !10, !11, !12}\n"
+	     "!8 = !{!\"air.patch_control_point_function\", { <4 x float>, <3 x float>, <2 x float>, i32 } (i32, i8*)* "
+	     "@gld.cs_cpf}\n"
+	     "!9 = !{!\"air.location_index\", i32 0, i32 1, !\"air.arg_type_name\", !\"float4\", !\"air.arg_name\", "
+	     "!\"attrib_0\"}\n"
+	     "!10 = !{!\"air.location_index\", i32 1, i32 1, !\"air.arg_type_name\", !\"float3\", !\"air.arg_name\", "
+	     "!\"attrib_1\"}\n"
+	     "!11 = !{!\"air.location_index\", i32 2, i32 1, !\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", "
+	     "!\"attrib_2\"}\n"
+	     "!12 = !{!\"air.location_index\", i32 3, i32 1, !\"air.arg_type_name\", !\"int\", !\"air.arg_name\", "
+	     "!\"attrib_3\"}\n"
+	     "!14 = !{i32 5, !\"air.buffer\", !\"air.location_index\", i32 2, i32 1, !\"air.read_write\", "
+	     "!\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 1, !\"air.arg_type_align_size\", i32 1, "
+	     "!\"air.arg_type_name\", !\"uchar\", !\"air.arg_name\", !\"out\"}\n"
+	     "!15 = !{i32 2, i32 3, i32 0}\n"
+	     "!16 = !{!\"Metal\", i32 2, i32 3, i32 0}\n";
+	return t;
+}
+
+// A kernel module in the GL generator's shape, written here: its one control point input, at
+// argument 2 between a buffer and the grid builtins, of one field of LLVM type `type` (its MSL
+// name `typeName`) at attribute 0, read at i = the thread's x and stored at
+// out + 16 * (x + y * width), as tests/stage_in_oracle.metal's kernels store their stage input.
+std::string controlPointKernel(const std::string &type, const std::string &typeName)
+{
+	const std::string result = "{ " + type + " }";
+	return "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-"
+	       "v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-"
+	       "v512:512:512-v1024:1024:1024-n8:16:32\"\n"
+	       "target triple = \"air64_v23-apple-macosx11.0.0\"\n"
+	       "\n"
+	       "define void @k(i8 addrspace(1)* %out, <2 x i32> %i, i8* %h, <2 x i32> %g) {\n"
+	       "entry:\n"
+	       "  %x = extractelement <2 x i32> %i, i32 0\n"
+	       "  %y = extractelement <2 x i32> %i, i32 1\n"
+	       "  %w = extractelement <2 x i32> %g, i32 0\n"
+	       "  %r = call " +
+	       result + " @gld.cs_cpf(i32 %x, i8* %h)\n" + "  %v = extractvalue " + result +
+	       " %r, 0\n"
+	       "  %yw = mul i32 %y, %w\n"
+	       "  %e = add i32 %yw, %x\n"
+	       "  %o = mul i32 %e, 16\n"
+	       "  %z = zext i32 %o to i64\n"
+	       "  %p = getelementptr inbounds i8, i8 addrspace(1)* %out, i64 %z\n"
+	       "  %q = bitcast i8 addrspace(1)* %p to " +
+	       type + " addrspace(1)*\n" + "  store " + type + " %v, " + type +
+	       " addrspace(1)* %q, align 4\n"
+	       "  ret void\n"
+	       "}\n"
+	       "\n"
+	       "declare " +
+	       result +
+	       " @gld.cs_cpf(i32, i8*)\n"
+	       "\n"
+	       "!air.kernel = !{!0}\n"
+	       "!air.version = !{!8}\n"
+	       "!air.language_version = !{!9}\n"
+	       "!air.compile_options = !{!10, !11}\n"
+	       "!0 = !{void (i8 addrspace(1)*, <2 x i32>, i8*, <2 x i32>)* @k, !1, !2}\n"
+	       "!1 = !{}\n"
+	       "!2 = !{!3, !4, !5, !7}\n"
+	       "!3 = !{i32 0, !\"air.buffer\", !\"air.location_index\", i32 1, i32 1, !\"air.read_write\", "
+	       "!\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 1, !\"air.arg_type_align_size\", i32 1, "
+	       "!\"air.arg_type_name\", !\"char\", !\"air.arg_name\", !\"out\"}\n"
+	       "!4 = !{i32 1, !\"air.thread_position_in_grid\", !\"air.arg_type_name\", !\"uint2\", !\"air.arg_name\", "
+	       "!\"i\"}\n"
+	       "!5 = !{i32 2, !\"air.patch_control_point_input\", !6, !12}\n"
+	       "!6 = !{!\"air.patch_control_point_function\", " +
+	       result +
+	       " (i32, i8*)* @gld.cs_cpf}\n"
+	       "!7 = !{i32 3, !\"air.threads_per_grid\", !\"air.arg_type_name\", !\"uint2\", !\"air.arg_name\", "
+	       "!\"g\"}\n"
+	       "!8 = !{i32 2, i32 3, i32 0}\n"
+	       "!9 = !{!\"Metal\", i32 2, i32 3, i32 0}\n"
+	       "!10 = !{!\"air.compile.fast_math_enable\"}\n"
+	       "!11 = !{!\"air.compile.denorms_disable\"}\n"
+	       "!12 = !{!\"air.location_index\", i32 0, i32 1, !\"air.arg_type_name\", !\"" +
+	       typeName + "\", !\"air.arg_name\", !\"a\"}\n";
+}
+
+// One case of the oracle: attribute 0 of `format` at `offset` in layout 0 (`stride`, `step`,
+// `rate`), read into a field of `type`; the grid `width` by `height`, its region's origin `origin`;
+// an index buffer of `indexType` at index 2 where the layout steps by index.
+struct StageInCase {
+	MTLAttributeFormat format;
+	const char *type, *typeName, *oracle;
+	unsigned lanes;
+	uint32_t offset = 0, stride = 16;
+	MTLStepFunction step = MTLStepFunctionThreadPositionInGridX;
+	uint32_t rate = 1;
+	unsigned width = 1024, height = 1;
+	MTLIndexType indexType = MTLIndexTypeUInt16;
+};
+
+uint32_t nextRandom(uint32_t &s)
+{
+	s ^= s << 13;
+	s ^= s >> 17;
+	s ^= s << 5;
+	return s;
+}
+
+// What `c` stores, in `out`, run on `metal` once as `pipeline` (the oracle's [[stage_in]] kernel
+// under the descriptor, `stageIn` true) or as the specialized kernel with no descriptor.
+void runStageInCase(id<MTLDevice> metal, id<MTLCommandQueue> queue, id<MTLComputePipelineState> pipeline,
+                    const StageInCase &c, const std::vector<uint8_t> &data, const std::vector<uint8_t> &indices,
+                    std::vector<uint8_t> &out)
+{
+	id<MTLBuffer> in = [metal newBufferWithBytes:data.data() length:data.size() options:MTLResourceStorageModeShared];
+	id<MTLBuffer> index = [metal newBufferWithBytes:indices.data()
+	                                         length:indices.size()
+	                                        options:MTLResourceStorageModeShared];
+	const size_t outLength = 16 * c.width * c.height;
+	id<MTLBuffer> result = [metal newBufferWithLength:outLength options:MTLResourceStorageModeShared];
+	std::memset(result.contents, 0xa5, outLength);
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+	id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+	[enc setComputePipelineState:pipeline];
+	[enc setBuffer:in offset:0 atIndex:0];
+	[enc setBuffer:result offset:0 atIndex:1];
+	[enc setBuffer:index offset:0 atIndex:2];
+	[enc setStageInRegion:MTLRegionMake2D(0, 0, c.width, c.height)];
+	[enc dispatchThreads:MTLSizeMake(c.width, c.height, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+	[enc endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	const uint8_t *bytes = static_cast<const uint8_t *>(result.contents);
+	out.assign(bytes, bytes + outLength);
+}
+
+// A GL kernel's control point input, specialized under a stage input descriptor
+// (RgfxGLSpecializeStageIn), fetches what Metal's own [[stage_in]] kernel fetches under the same
+// descriptor on this Mac's GPU, bit for bit: every MTLAttributeFormat into a field of four
+// components of its kind (float for the normalized, half and float formats, int or uint for the
+// integer ones), fields of fewer components and an integer scalar, an attribute offset, and the
+// layouts that step by thread position in X, by index in X (both index types), by position in Y
+// at a step rate, and constant. The oracle's kernels are tests/stage_in_oracle.metal's
+// (RGFX_STAGE_IN_ORACLE).
+void test_stage_in_matches_metal()
+{
+	const char *path = getenv("RGFX_STAGE_IN_ORACLE");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	CHECK(metal != nil);
+	if (metal == nil)
+		return;
+	NSError *error = nil;
+	id<MTLLibrary> oracle = [metal newLibraryWithURL:[NSURL fileURLWithPath:@(path)] error:&error];
+	CHECK(oracle != nil);
+	if (oracle == nil)
+		return;
+	id<MTLCommandQueue> queue = [metal newCommandQueue];
+
+	std::vector<StageInCase> cases;
+	auto add = [&cases](MTLAttributeFormat format, const char *type, const char *typeName, const char *kernel,
+	                    unsigned lanes) {
+		StageInCase c = {};
+		c.format = format;
+		c.type = type;
+		c.typeName = typeName;
+		c.oracle = kernel;
+		c.lanes = lanes;
+		cases.push_back(c);
+		return &cases.back();
+	};
+	for (uint32_t f = 1; f <= 55; f++) {
+		if (f == 43 || f == 44)
+			continue;
+		const bool isInteger = (f >= 1 && f <= 6) || (f >= 13 && f <= 18) || (f >= 32 && f <= 39) || f == 45 ||
+		                       f == 46 || f == 49 || f == 50;
+		const bool isSigned = (f >= 4 && f <= 6) || (f >= 16 && f <= 18) || (f >= 32 && f <= 35) || f == 46 || f == 50;
+		if (!isInteger)
+			add(static_cast<MTLAttributeFormat>(f), "<4 x float>", "float4", "f4", 4);
+		else if (isSigned)
+			add(static_cast<MTLAttributeFormat>(f), "<4 x i32>", "int4", "i4", 4);
+		else
+			add(static_cast<MTLAttributeFormat>(f), "<4 x i32>", "uint4", "u4", 4);
+	}
+	add(MTLAttributeFormatFloat4, "float", "float", "f1", 1);
+	add(MTLAttributeFormatFloat4, "<2 x float>", "float2", "f2", 2);
+	add(MTLAttributeFormatFloat3, "<3 x float>", "float3", "f3", 3);
+	add(MTLAttributeFormatUChar4Normalized, "<2 x float>", "float2", "f2", 2);
+	add(MTLAttributeFormatHalf2, "<3 x float>", "float3", "f3", 3);
+	add(MTLAttributeFormatInt, "i32", "int", "i1", 1);
+	add(MTLAttributeFormatShort2, "i32", "int", "i1", 1);
+	add(MTLAttributeFormatFloat2, "<4 x float>", "float4", "f4", 4)->offset = 8;
+	add(MTLAttributeFormatUShort4Normalized, "<4 x float>", "float4", "f4", 4)->step =
+	    MTLStepFunctionThreadPositionInGridXIndexed;
+	{
+		StageInCase *c = add(MTLAttributeFormatFloat4, "<4 x float>", "float4", "f4", 4);
+		c->step = MTLStepFunctionThreadPositionInGridXIndexed;
+		c->indexType = MTLIndexTypeUInt32;
+	}
+	{
+		StageInCase *c = add(MTLAttributeFormatFloat4, "<4 x float>", "float4", "f4", 4);
+		c->step = MTLStepFunctionThreadPositionInGridY;
+		c->rate = 3;
+		c->width = 4;
+		c->height = 16;
+	}
+	{
+		// Metal takes a constant layout's step rate only as 0.
+		StageInCase *c = add(MTLAttributeFormatChar4Normalized, "<4 x float>", "float4", "f4", 4);
+		c->step = MTLStepFunctionConstant;
+		c->rate = 0;
+	}
+
+	for (const StageInCase &c : cases) {
+		MTLStageInputOutputDescriptor *descriptor = [MTLStageInputOutputDescriptor stageInputOutputDescriptor];
+		descriptor.attributes[0].format = c.format;
+		descriptor.attributes[0].offset = c.offset;
+		descriptor.attributes[0].bufferIndex = 0;
+		descriptor.layouts[0].stride = c.stride;
+		descriptor.layouts[0].stepFunction = c.step;
+		descriptor.layouts[0].stepRate = c.rate;
+		descriptor.indexType = c.indexType;
+		descriptor.indexBufferIndex = 2;
+		MTLComputePipelineDescriptor *reference = [MTLComputePipelineDescriptor new];
+		reference.computeFunction = [oracle newFunctionWithName:@(c.oracle)];
+		reference.stageInputDescriptor = descriptor;
+		id<MTLComputePipelineState> metalPipeline = [metal newComputePipelineStateWithDescriptor:reference
+		                                                                                 options:0
+		                                                                              reflection:nil
+		                                                                                   error:&error];
+		CHECK(metalPipeline != nil);
+
+		RgfxGLStageIn in;
+		in.attributes[0] = {static_cast<uint32_t>(c.format), c.offset, 0};
+		in.layouts[0] = {c.stride, static_cast<uint32_t>(c.step), c.rate};
+		in.indexType = static_cast<uint32_t>(c.indexType);
+		in.indexBufferIndex = 2;
+		RgfxGLLowered lowered;
+		std::string why;
+		const bool specialized = RgfxGLSpecializeStageIn(controlPointKernel(c.type, c.typeName), in, lowered, why);
+		CHECK(specialized && lowered.entry == "k" && lowered.stage == RgfxMetallibStage::Kernel);
+		if (!specialized) {
+			fprintf(stderr, "stage input oracle: format %lu: %s\n", static_cast<unsigned long>(c.format), why.c_str());
+			continue;
+		}
+		dispatch_data_t bytes = dispatch_data_create(lowered.metallib.data(), lowered.metallib.size(), nullptr,
+		                                             DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+		id<MTLLibrary> library = [metal newLibraryWithData:bytes error:&error];
+		CHECK(library != nil);
+		MTLComputePipelineDescriptor *ours = [MTLComputePipelineDescriptor new];
+		ours.computeFunction = [library newFunctionWithName:@"k"];
+		id<MTLComputePipelineState> ourPipeline = [metal newComputePipelineStateWithDescriptor:ours
+		                                                                               options:0
+		                                                                            reflection:nil
+		                                                                                 error:&error];
+		CHECK(ourPipeline != nil);
+		if (metalPipeline == nil || ourPipeline == nil) {
+			fprintf(stderr, "stage input oracle: format %lu: no pipeline: %s\n", static_cast<unsigned long>(c.format),
+			        error.localizedDescription.UTF8String);
+			continue;
+		}
+
+		// Every byte pattern's chance: random elements, and indices into them.
+		uint32_t seed = 0x9e3779b9u ^ (static_cast<uint32_t>(c.format) * 2654435761u) ^ c.offset ^
+		                (static_cast<uint32_t>(c.step) << 8);
+		const unsigned elements = 1024;
+		std::vector<uint8_t> data(elements * c.stride + 16);
+		for (uint8_t &b : data)
+			b = static_cast<uint8_t>(nextRandom(seed) >> 24);
+		std::vector<uint8_t> indices(4 * c.width * c.height);
+		for (unsigned i = 0; i < c.width * c.height; i++) {
+			const uint32_t k = nextRandom(seed) % elements;
+			if (c.indexType == MTLIndexTypeUInt32)
+				std::memcpy(&indices[4 * i], &k, 4);
+			else {
+				const uint16_t k16 = static_cast<uint16_t>(k);
+				std::memcpy(&indices[2 * i], &k16, 2);
+			}
+		}
+		std::vector<uint8_t> expected, got;
+		runStageInCase(metal, queue, metalPipeline, c, data, indices, expected);
+		runStageInCase(metal, queue, ourPipeline, c, data, indices, got);
+		unsigned wrong = 0;
+		for (unsigned t = 0; t < c.width * c.height; t++)
+			if (std::memcmp(&expected[16 * t], &got[16 * t], 4 * c.lanes) != 0) {
+				if (wrong++ < 3) {
+					uint32_t e[4] = {}, g[4] = {};
+					std::memcpy(e, &expected[16 * t], 4 * c.lanes);
+					std::memcpy(g, &got[16 * t], 4 * c.lanes);
+					fprintf(stderr,
+					        "stage input oracle: format %lu field %s step %lu: thread %u: Metal %08x %08x %08x %08x, "
+					        "ours %08x %08x %08x %08x\n",
+					        static_cast<unsigned long>(c.format), c.typeName, static_cast<unsigned long>(c.step), t,
+					        e[0], e[1], e[2], e[3], g[0], g[1], g[2], g[3]);
+				}
+			}
+		CHECK(wrong == 0);
+	}
+}
+
+// Whether this Mac's Metal makes a compute pipeline of `lowered`'s kernel, with no stage input
+// descriptor.
+bool metalMakesKernel(id<MTLDevice> metal, const RgfxGLLowered &lowered)
+{
+	dispatch_data_t bytes = dispatch_data_create(lowered.metallib.data(), lowered.metallib.size(), nullptr,
+	                                             DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+	NSError *error = nil;
+	id<MTLLibrary> library = [metal newLibraryWithData:bytes error:&error];
+	id<MTLFunction> kernel = [library newFunctionWithName:@(lowered.entry.c_str())];
+	if (kernel == nil)
+		return false;
+	return [metal newComputePipelineStateWithFunction:kernel error:&error] != nil;
+}
+
+bool has(const std::string &text, const std::string &part)
+{
+	return text.find(part) != std::string::npos;
+}
+
+// A GL kernel's patch control point input made a kernel under a stage input descriptor
+// (RgfxGLSpecializeStageIn), over modules written here in the generator's shape: the wrapper
+// takes the kernel's arguments but the input, then a buffer at each index the fields read that the
+// kernel has none at, then the region's origin where the kernel takes none; the input nodes are
+// numbered as its arguments, and the new ones follow; the kernel is internal under its name and
+// .rgfx_gl, called with the record in the input's place; the fetch defines the control point
+// function and reads each field at its element; the system's LLVM parses the text, and this Mac's
+// Metal makes a pipeline of the kernel. A field Metal fetches no format of, a layout no compute
+// stage input steps by and a module without the input are refused, the text as it was; the cache
+// key differs in each field; and a function RgfxGLFunction did not make is not specialized.
+void test_stage_in_specialized()
+{
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	CHECK(metal != nil);
+	RgfxGLStageIn tess;
+	tess.attributes[0] = {MTLAttributeFormatFloat4, 0, 5};
+	tess.attributes[1] = {MTLAttributeFormatFloat2, 0, 6};
+	tess.layouts[5] = {16, MTLStepFunctionThreadPositionInGridX, 1};
+	tess.layouts[6] = {8, MTLStepFunctionThreadPositionInGridX, 1};
+	tess.indexType = MTLIndexTypeUInt16;
+	tess.indexBufferIndex = 19;
+	std::string why;
+	{
+		std::string text = tessKernel(false);
+		CHECK(RgfxGLSpecializeStageInText(text, tess, why));
+		CHECK(has(text, "define internal void @__main.rgfx_gl(i8* %cp, <2 x i32> %origin, "));
+		CHECK(has(text, "define void @__main(<2 x i32> %rgfx.a1, <2 x i32> %rgfx.a2, <2 x i32> %rgfx.a3, "
+		                "<2 x i32> %rgfx.a4, <2 x i32> %rgfx.a5, i8 addrspace(1)* %rgfx.a6, i8 addrspace(1)* "
+		                "%rgfx.a7, i8 addrspace(1)* %rgfx.b5, i8 addrspace(1)* %rgfx.b6) {\n"));
+		CHECK(has(text, "  call void @__main.rgfx_gl(i8* %rgfx.7, <2 x i32> %rgfx.a1, "));
+		CHECK(has(text, "!0 = !{void (<2 x i32>, <2 x i32>, <2 x i32>, <2 x i32>, <2 x i32>, i8 addrspace(1)*, "
+		                "i8 addrspace(1)*, i8 addrspace(1)*, i8 addrspace(1)*)* @__main, !1, !20, !17}\n"));
+		CHECK(has(text, "!7 = !{i32 0, !\"air.stage_in_grid_origin\""));
+		CHECK(has(text, "!14 = !{i32 6, !\"air.buffer\", !\"air.location_index\", i32 4, "));
+		CHECK(has(text, "!18 = !{i32 7, !\"air.buffer\", !\"air.location_index\", i32 5, i32 1, !\"air.read\", "
+		                "!\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 1, "
+		                "!\"air.arg_type_align_size\", i32 1, !\"air.arg_type_name\", !\"uchar\", "
+		                "!\"air.arg_name\", !\"rgfx_stage_in_buffer_5\"}\n"));
+		CHECK(has(text, "!19 = !{i32 8, !\"air.buffer\", !\"air.location_index\", i32 6, "));
+		CHECK(has(text, "!20 = !{!7, !8, !9, !10, !11, !13, !14, !18, !19}\n"));
+		CHECK(!has(text, "declare { <4 x float>, <2 x float> } @gld.cs_cpf"));
+		CHECK(has(text, "define internal { <4 x float>, <2 x float> } @gld.cs_cpf(i32 %rgfx.i, i8* %rgfx.h) "
+		                "alwaysinline {\n"));
+		// Each field at the origin's x plus i, times its layout's stride, plus its offset.
+		CHECK(has(text, "  %rgfx.5 = add i32 %rgfx.i, %rgfx.2\n  %rgfx.6 = mul i32 %rgfx.5, 16\n"));
+		CHECK(has(text, "  %rgfx.28 = mul i32 %rgfx.5, 8\n"));
+		CHECK(has(text, "  ret { <4 x float>, <2 x float> } %rgfx.41\n"));
+		RgfxGLLowered lowered;
+		CHECK(RgfxGLSpecializeStageIn(tessKernel(false), tess, lowered, why));
+		CHECK(lowered.entry == "__main" && lowered.stage == RgfxMetallibStage::Kernel && !lowered.metallib.empty());
+		CHECK(metalMakesKernel(metal, lowered));
+	}
+	{
+		// Indexed: the kernel's own index buffer at index 19 serves, read as UInt16.
+		RgfxGLStageIn indexed = tess;
+		indexed.layouts[5].stepFunction = indexed.layouts[6].stepFunction = MTLStepFunctionThreadPositionInGridXIndexed;
+		std::string text = tessKernel(true);
+		CHECK(RgfxGLSpecializeStageInText(text, indexed, why));
+		CHECK(!has(text, "%rgfx.b19"));
+		CHECK(has(text, "i8 addrspace(1)* %rgfx.a8, i8 addrspace(1)* %rgfx.b5, i8 addrspace(1)* %rgfx.b6) {\n"));
+		CHECK(has(text, "  store i8 addrspace(1)* %rgfx.a6, i8 addrspace(1)** %rgfx.3, align 8\n"));
+		CHECK(has(text, "  %rgfx.11 = load i16, i16 addrspace(1)* %rgfx.10, align 2\n"
+		                "  %rgfx.12 = zext i16 %rgfx.11 to i32\n"
+		                "  %rgfx.13 = add i32 %rgfx.12, %rgfx.2\n"));
+		CHECK(has(text, "!20 = !{!7, !8, !9, !10, !11, !12, !13, !14, !18, !19}\n"));
+		RgfxGLLowered lowered;
+		CHECK(RgfxGLSpecializeStageIn(tessKernel(true), indexed, lowered, why) && metalMakesKernel(metal, lowered));
+	}
+	{
+		// By Y: the thread position's y over each layout's step rate.
+		RgfxGLStageIn byY = tess;
+		byY.layouts[5].stepFunction = byY.layouts[6].stepFunction = MTLStepFunctionThreadPositionInGridY;
+		byY.layouts[6].stepRate = 2;
+		std::string text = tessKernel(false);
+		CHECK(RgfxGLSpecializeStageInText(text, byY, why));
+		CHECK(has(text, "  %rgfx.5 = extractelement <2 x i32> %rgfx.a4, i32 1\n"));
+		CHECK(has(text, "  %rgfx.6 = udiv i32 %rgfx.4, 1\n") && has(text, "  %rgfx.29 = udiv i32 %rgfx.4, 2\n"));
+		RgfxGLLowered lowered;
+		CHECK(RgfxGLSpecializeStageIn(tessKernel(false), byY, lowered, why) && metalMakesKernel(metal, lowered));
+	}
+
+	// Heaven's shape: the input at argument 4; attributes 0 and 1 share layout 7 at offsets 0 and 16;
+	// a half2 into the float2 and an int into the int; no origin, which the wrapper takes last.
+	RgfxGLStageIn heaven;
+	heaven.attributes[0] = {MTLAttributeFormatFloat4, 0, 7};
+	heaven.attributes[1] = {MTLAttributeFormatFloat3, 16, 7};
+	heaven.attributes[2] = {MTLAttributeFormatHalf2, 0, 8};
+	heaven.attributes[3] = {MTLAttributeFormatInt, 0, 9};
+	heaven.layouts[7] = {28, MTLStepFunctionThreadPositionInGridX, 1};
+	heaven.layouts[8] = {4, MTLStepFunctionThreadPositionInGridX, 1};
+	heaven.layouts[9] = {4, MTLStepFunctionThreadPositionInGridX, 1};
+	heaven.indexType = MTLIndexTypeUInt32;
+	heaven.indexBufferIndex = 10;
+	{
+		std::string text = heavenKernel();
+		CHECK(RgfxGLSpecializeStageInText(text, heaven, why));
+		CHECK(has(text, "define void @__main(<2 x i32> %rgfx.a0, <2 x i32> %rgfx.a1, i8 addrspace(1)* %rgfx.a2, "
+		                "i8 addrspace(1)* %rgfx.a3, i8 addrspace(1)* %rgfx.a5, i8 addrspace(1)* %rgfx.b7, "
+		                "i8 addrspace(1)* %rgfx.b8, i8 addrspace(1)* %rgfx.b9, <2 x i32> %rgfx.origin) {\n"));
+		CHECK(has(text, "  call void @__main.rgfx_gl(<2 x i32> %rgfx.a0, <2 x i32> %rgfx.a1, i8 addrspace(1)* "
+		                "%rgfx.a2, i8 addrspace(1)* %rgfx.a3, i8* %rgfx.8, i8 addrspace(1)* %rgfx.a5)\n"));
+		CHECK(has(text, "!14 = !{i32 4, !\"air.buffer\", !\"air.location_index\", i32 2, "));
+		CHECK(has(text, "!20 = !{i32 8, !\"air.stage_in_grid_origin\", !\"air.arg_type_name\", !\"uint2\", "
+		                "!\"air.arg_name\", !\"rgfx_grid_origin\"}\n"));
+		CHECK(has(text, "!21 = !{!3, !4, !5, !6, !14, !17, !18, !19, !20}\n"));
+		CHECK(has(text, "  %rgfx.6 = mul i32 %rgfx.5, 28\n  %rgfx.7 = add i32 %rgfx.6, 0\n"));
+		CHECK(has(text, "  %rgfx.28 = mul i32 %rgfx.5, 28\n  %rgfx.29 = add i32 %rgfx.28, 16\n"));
+		CHECK(has(text, "  %rgfx.59 = fpext half %rgfx.54 to float\n"));
+		CHECK(has(text, "  %rgfx.72 = insertvalue { <4 x float>, <3 x float>, <2 x float>, i32 } %rgfx.63, i32 "
+		                "%rgfx.71, 3\n"));
+		RgfxGLLowered lowered;
+		CHECK(RgfxGLSpecializeStageIn(heavenKernel(), heaven, lowered, why) && metalMakesKernel(metal, lowered));
+	}
+	{
+		// Indexed, its UInt32 index buffer at index 10, which the kernel lacks.
+		RgfxGLStageIn indexed = heaven;
+		for (unsigned b = 7; b <= 9; b++)
+			indexed.layouts[b].stepFunction = MTLStepFunctionThreadPositionInGridXIndexed;
+		std::string text = heavenKernel();
+		CHECK(RgfxGLSpecializeStageInText(text, indexed, why));
+		CHECK(has(text, "i8 addrspace(1)* %rgfx.b9, i8 addrspace(1)* %rgfx.b10, <2 x i32> %rgfx.origin) {\n"));
+		CHECK(has(text, "  %rgfx.11 = load i32, i32 addrspace(1)* %rgfx.10, align 4\n"
+		                "  %rgfx.12 = add i32 %rgfx.11, %rgfx.2\n"));
+		CHECK(has(text, "!20 = !{i32 8, !\"air.buffer\", !\"air.location_index\", i32 10, "));
+		CHECK(has(text, "!22 = !{!3, !4, !5, !6, !14, !17, !18, !19, !20, !21}\n"));
+		RgfxGLLowered lowered;
+		CHECK(RgfxGLSpecializeStageIn(heavenKernel(), indexed, lowered, why) && metalMakesKernel(metal, lowered));
+	}
+
+	// Refusals, the text as it was.
+	{
+		RgfxGLStageIn none = heaven;
+		none.attributes[2].format = MTLAttributeFormatInvalid;
+		const std::string original = heavenKernel();
+		std::string text = original;
+		CHECK(!RgfxGLSpecializeStageInText(text, none, why) && text == original);
+		CHECK(why == "the stage input descriptor's attribute 2 has no format the fetch reads (0)");
+		RgfxGLStageIn perVertex = heaven;
+		perVertex.layouts[8].stepFunction = MTLStepFunctionPerVertex;
+		CHECK(!RgfxGLSpecializeStageInText(text, perVertex, why) && text == original);
+		CHECK(why == "the stage input descriptor's layout 8 steps by function 1, which no compute stage input takes");
+		text = controlPointKernel("<4 x float>", "float4");
+		const size_t input = text.find("!\"air.patch_control_point_input\"");
+		text.replace(input, std::strlen("!\"air.patch_control_point_input\""), "!\"air.stage_in\"");
+		const std::string withoutInput = text;
+		CHECK(!RgfxGLSpecializeStageInText(text, heaven, why) && text == withoutInput);
+		CHECK(why == "the kernel takes no patch control point input");
+	}
+	// The cache key: equal for equal descriptors, and different where any field differs.
+	{
+		CHECK(RgfxGLStageIn().key() == RgfxGLStageIn().key() && heaven.key() == RgfxGLStageIn(heaven).key());
+		std::vector<RgfxGLStageIn> changed(8, heaven);
+		changed[0].attributes[30].format = 1;
+		changed[1].attributes[30].offset = 4;
+		changed[2].attributes[30].bufferIndex = 1;
+		changed[3].layouts[30].stride = 4;
+		changed[4].layouts[30].stepFunction = 5;
+		changed[5].layouts[30].stepRate = 2;
+		changed[6].indexType = 0;
+		changed[7].indexBufferIndex = 11;
+		for (const RgfxGLStageIn &c : changed)
+			CHECK(c.key() != heaven.key());
+	}
+	// A function RgfxGLFunction made no control point kernel of.
+	{
+		id<MTLFunction> kernel = (id<MTLFunction>)[NSNull null];
+		NSError *error = nil;
+		MTLStageInputOutputDescriptor *descriptor = [MTLStageInputOutputDescriptor stageInputOutputDescriptor];
+		CHECK(!RgfxGLStageInKernel(nil, descriptor, &kernel, &error) && kernel == (id)[NSNull null]);
+		CHECK(!RgfxGLStageInKernel((id<MTLFunction>)[NSObject new], descriptor, &kernel, &error) &&
+		      kernel == (id)[NSNull null] && error == nil);
+	}
+}
+
 } // namespace
 
 void rgfxGLTests()
@@ -1104,5 +1698,7 @@ void rgfxGLTests()
 		test_gl_function_answers();
 		test_reflection_answers_return_data();
 		test_stage_metadata_normalized();
+		test_stage_in_specialized();
+		test_stage_in_matches_metal();
 	}
 }

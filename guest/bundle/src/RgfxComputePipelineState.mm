@@ -22,6 +22,7 @@
 #import "RgfxFunction.h"
 #import "RgfxLibrary.h"
 #import "RgfxFunctionTable.h"
+#import "RgfxGLFunction.h"
 #import "RgfxMetalError.h"
 #import "RgfxUnsupported.h"
 
@@ -503,6 +504,28 @@ NSError *RgfxComputeProgressError(BOOL hasProgress, NSInteger progress, BOOL has
 		if (error)
 			*error = RgfxMakeError(RgfxMetalErrorNoRoute, @"compute pipeline: no serialiser route");
 		return nil;
+	}
+	// A GL kernel variant that takes a patch control point input, which Metal compiles in no
+	// kernel: the pipeline is one of the variant made a kernel under the stage input descriptor,
+	// which takes no stage input (RgfxGLStageInKernel). The device's creators answer the
+	// reflection of the descriptor's own function and stage input descriptor, as for any other.
+	id<MTLFunction> stageInKernel = nil;
+	NSError *stageInRefusal = nil;
+	if (RgfxGLStageInKernel(descriptor.computeFunction, descriptor.stageInputDescriptor, &stageInKernel,
+	                        &stageInRefusal)) {
+		if (stageInKernel == nil) {
+			if (error)
+				*error = stageInRefusal;
+			return nil;
+		}
+		MTLComputePipelineDescriptor *kernelDescriptor = [descriptor copy];
+		kernelDescriptor.computeFunction = stageInKernel;
+		kernelDescriptor.stageInputDescriptor = nil;
+		return [self computePipelineStateWithDescriptor:kernelDescriptor
+		                                         device:device
+		                                     serializer:serializer
+		                                          known:std::move(known)
+		                                          error:error];
 	}
 	id<MTLFunction> function = descriptor.computeFunction;
 	if (NSError *unspecialised = [RgfxFunction rgfxUnspecialisedError:function role:@"function"]) {

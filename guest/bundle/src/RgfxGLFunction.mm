@@ -26,20 +26,40 @@
 namespace {
 
 char kReturnDataKey;
+char kStageInKey;
 
-void logOnce(const std::string &why)
+// Logs `why` once, after `what`.
+void logOnce(const char *what, const std::string &why)
 {
 	static std::mutex lock;
 	static std::set<std::string> said;
 	{
 		std::lock_guard<std::mutex> hold(lock);
-		if (!said.insert(why).second)
+		if (!said.insert(std::string(what) + why).second)
 			return;
 	}
-	NSLog(@"RGFX: a GL shader variant was not made: %s; answered nil", why.c_str());
+	NSLog(@"RGFX: %s: %s", what, why.c_str());
+}
+
+void logOnce(const std::string &why)
+{
+	logOnce("a GL shader variant was not made; answered nil", why);
 }
 
 } // namespace
+
+// A kernel variant's module text, which takes a patch control point input, and its kernels made
+// so far under each stage input descriptor (by RgfxGLStageIn::key), guarded by _lock.
+@interface RgfxGLStageInVariant : NSObject
+@end
+
+@implementation RgfxGLStageInVariant {
+@public
+	std::string _text;
+	std::mutex _lock;
+	NSMutableDictionary<NSData *, id<MTLFunction>> *_kernels;
+}
+@end
 
 NSData *RgfxGLPluginReturnData(id<MTLFunction> function)
 {
@@ -49,6 +69,61 @@ NSData *RgfxGLPluginReturnData(id<MTLFunction> function)
 void RgfxGLSetPluginReturnData(id<MTLFunction> function, NSData *data)
 {
 	objc_setAssociatedObject(function, &kReturnDataKey, data, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+BOOL RgfxGLStageInKernel(id<MTLFunction> function, MTLStageInputOutputDescriptor *stageInput, id<MTLFunction> *kernel,
+                         NSError **error)
+{
+	RgfxGLStageInVariant *variant =
+	    function != nil && stageInput != nil ? objc_getAssociatedObject(function, &kStageInKey) : nil;
+	if (variant == nil)
+		return NO;
+	RgfxGLStageIn in;
+	for (NSUInteger i = 0; i < 31; i++) {
+		MTLAttributeDescriptor *a = stageInput.attributes[i];
+		in.attributes[i].format = static_cast<uint32_t>(a.format);
+		in.attributes[i].offset = static_cast<uint32_t>(a.offset);
+		in.attributes[i].bufferIndex = static_cast<uint32_t>(a.bufferIndex);
+		MTLBufferLayoutDescriptor *l = stageInput.layouts[i];
+		in.layouts[i].stride = static_cast<uint32_t>(l.stride);
+		in.layouts[i].stepFunction = static_cast<uint32_t>(l.stepFunction);
+		in.layouts[i].stepRate = static_cast<uint32_t>(l.stepRate);
+	}
+	in.indexType = static_cast<uint32_t>(stageInput.indexType);
+	in.indexBufferIndex = static_cast<uint32_t>(stageInput.indexBufferIndex);
+	const std::string k = in.key();
+	NSData *key = [NSData dataWithBytes:k.data() length:k.size()];
+	std::lock_guard<std::mutex> hold(variant->_lock);
+	id<MTLFunction> made = variant->_kernels[key];
+	if (made == nil) {
+		RgfxGLLowered lowered;
+		std::string why;
+		if (RgfxGLSpecializeStageIn(variant->_text, in, lowered, why)) {
+			dispatch_data_t data = dispatch_data_create(lowered.metallib.data(), lowered.metallib.size(), nullptr,
+			                                            DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+			NSError *refusal = nil;
+			id<MTLLibrary> library = [function.device newLibraryWithData:data error:&refusal];
+			if (library == nil)
+				why = std::string("the device made no library of it: ") +
+				      (refusal != nil ? refusal.localizedDescription.UTF8String : "no error");
+			else if ((made = [library newFunctionWithName:@(lowered.entry.c_str())]) == nil)
+				why = "its library has no function " + lowered.entry;
+		}
+		if (made == nil) {
+			logOnce("a GL kernel was not made under its pipeline's stage input descriptor; the pipeline is refused",
+			        why);
+			*kernel = nil;
+			if (error)
+				*error = RgfxMakeError(RgfxMetalErrorUnsupported,
+				                       [NSString stringWithFormat:@"compute pipeline: the GL kernel under its stage "
+				                                                  @"input descriptor was not made: %s",
+				                                                  why.c_str()]);
+			return YES;
+		}
+		variant->_kernels[key] = made;
+	}
+	*kernel = made;
+	return YES;
 }
 
 @implementation RgfxGLFunction {
@@ -113,6 +188,12 @@ RGFX_LOG_UNRECOGNIZED
 	if (!lowered.returnData.empty())
 		RgfxGLSetPluginReturnData(variant, [NSData dataWithBytes:lowered.returnData.data()
 		                                                  length:lowered.returnData.size()]);
+	if (!lowered.stageInText.empty()) {
+		RgfxGLStageInVariant *stageIn = [RgfxGLStageInVariant new];
+		stageIn->_text = std::move(lowered.stageInText);
+		stageIn->_kernels = [NSMutableDictionary dictionary];
+		objc_setAssociatedObject(variant, &kStageInKey, stageIn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+	}
 	return variant;
 }
 

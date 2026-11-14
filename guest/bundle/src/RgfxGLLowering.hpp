@@ -77,6 +77,13 @@
  *     a buffer (m3-max-3831; with them, they pass, m3-max-3947). metal2vulkan refuses a size
  *     other than the pointee's allocation size: the type name's size made it refuse the block
  *     case's pipelines, and the renderer drew that case in software (m3-max-3947).
+ * The kernel of a tessellated draw is one Metal compiles in no kernel: its patch control point
+ * input names a control point function the generator declares and Metal's own devices define from
+ * the compute pipeline's stage input descriptor, and Metal refuses a pipeline of the kernel as it
+ * is (measured: macOS 27.0.1, the M3 Max, m3-max-30197), so the renderer drew the draw's vertex
+ * and control stages in software. The variant keeps its module's normalized text
+ * (RgfxGLLowered::stageInText), and its pipeline is one of the kernel made a kernel without the
+ * input under the pipeline's descriptor (RgfxGLSpecializeStageIn).
  * Measured on an x86 Mac (macOS 26.7.1, Intel UHD 630 and AMD 5300M): the .metallib of each of
  * a vertex and a fragment shader's variants loads with newLibraryWithData:, makes a render
  * pipeline, and draws what the renderer's own pipeline draws (tools/gld_lower.m).
@@ -99,6 +106,27 @@ struct RgfxGLLowered {
 	std::string entry;               // its entry point
 	RgfxMetallibStage stage = RgfxMetallibStage::Vertex;
 	std::vector<uint8_t> returnData; // the generator's return data (empty where it gave none)
+	// A kernel whose entry takes a patch control point input: its module's normalized text, which
+	// RgfxGLSpecializeStageIn makes a kernel of under each stage input descriptor (empty for any
+	// other variant).
+	std::string stageInText;
+};
+
+/// A compute pipeline's stage input descriptor (MTLStageInputOutputDescriptor), as the fetch reads
+/// it: each attribute's MTLAttributeFormat, offset and buffer index, each buffer layout's stride,
+/// MTLStepFunction and step rate, the MTLIndexType and the index buffer's index.
+struct RgfxGLStageIn {
+	struct Attribute {
+		uint32_t format = 0, offset = 0, bufferIndex = 0;
+	};
+	struct Layout {
+		uint32_t stride = 0, stepFunction = 1, stepRate = 1;
+	};
+	Attribute attributes[31];
+	Layout layouts[31];
+	uint32_t indexType = 0, indexBufferIndex = 0;
+	/// Every field above, as one string: two descriptors fetch alike where their keys are equal.
+	std::string key() const;
 };
 
 /// Lowers the `irLength` bytes of GL IR at `ir` (the renderer's IR after its u32 length) with
@@ -125,6 +153,38 @@ struct RgfxGLSignature {
 /// `signature` gives its value (an input's by its parameter index), and an air.arg_name where it
 /// has none. True where it changed `text`; `text` is unchanged otherwise.
 bool RgfxGLNormalizeStageText(std::string &text, const RgfxGLSignature &signature);
+
+/// Makes `text`, a GL kernel variant's normalized module (RgfxGLLowered::stageInText), a kernel
+/// that takes no patch control point input, under the stage input descriptor `in`, as the rules
+/// at RgfxGLSpecializeStageIn say. False, with `why` and `text` unchanged, where the module has no
+/// such input or `in` does not describe one of its fields.
+bool RgfxGLSpecializeStageInText(std::string &text, const RgfxGLStageIn &in, std::string &why);
+
+/// A GL kernel variant's module (`stageInText`) made a .metallib of a kernel under the stage input
+/// descriptor `in`, in `out` (its metallib, entry and stage):
+///   - the control point function the input names, which the generator declares and Metal's
+///     drivers define from the descriptor, is defined here from it. The kernel calls it with an
+///     index i in the stage input region's size, and it answers each field's attribute fetched at
+///     the element: the region's origin.x + i for a layout stepping by thread position in X,
+///     index[i] + origin.x for one stepping by indexed position in X (the index buffer of the
+///     descriptor's type at its index), thread position in Y / step rate for one stepping by Y,
+///     and 0 for a constant one (measured: macOS 27.0.1, the M3 Max's GL draws of first 4 and of
+///     base vertex 4, m3-max-30212). The attribute is read at the layout's buffer, element times
+///     the layout's stride plus the attribute's offset, in its MTLAttributeFormat as Metal's
+///     [[stage_in]] fetch reads it (bit for bit on the M3 Max, every format: tests/gl_tests.mm's
+///     stage input oracle), and converted to its field's type, components it lacks 0, 0, 0 and 1;
+///   - the kernel becomes an internal function, and a kernel of the same name takes its arguments
+///     but the input, and a device buffer at each buffer index the fields read (the index
+///     buffer's too where a layout steps by index), save where the kernel has a buffer at that
+///     index already (the renderer's indexed variants have the index buffer), which serves. It
+///     passes the function the address of a record of those buffers, the region's origin and the
+///     thread position in place of the input. Its entry node keeps the kernel's other inputs and
+///     operands (air.max_work_group_size).
+/// Metal compiles no kernel with a patch control point input; it compiles this one, and reads the
+/// region's origin (air.stage_in_grid_origin) from the encoder's setStageInRegion: with no stage
+/// input descriptor (measured: macOS 27.0.1, the M3 Max, m3-max-30229).
+bool RgfxGLSpecializeStageIn(const std::string &stageInText, const RgfxGLStageIn &in, RgfxGLLowered &out,
+                             std::string &why);
 
 /// The GL IR a renderer's pointer holds: the u32 length at `ir`, then that many bytes. Writes the
 /// bytes' start and their length; false where `ir` is null.

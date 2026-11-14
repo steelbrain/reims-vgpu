@@ -11,6 +11,9 @@
  * device makes a library of (newLibraryWithData:, so it reaches the host as any library does, by
  * its content key), and the variant is that library's function. The generator's return data
  * stays with it (RgfxGLPluginReturnData), for the pipeline reflection to answer as Metal's does.
+ * A tessellated draw's kernel variant takes a patch control point input, which Metal compiles in
+ * no kernel: its pipeline is made of the variant made a kernel under the pipeline's stage input
+ * descriptor (RgfxGLStageInKernel), and answers the variant's reflection.
  *
  * Our own ObjC++ over public Metal API; it subclasses only NSObject, so it is unit-tested on the
  * Mac.
@@ -53,6 +56,16 @@ NSData *_Nullable RgfxGLPluginReturnData(id<MTLFunction> _Nullable function);
 
 /// Keeps `data` as `function`'s return data (RgfxGLPluginReturnData answers it).
 void RgfxGLSetPluginReturnData(id<MTLFunction> function, NSData *_Nullable data);
+
+/// A compute pipeline's kernel for `function` under `stageInput`, where `function` is a variant
+/// RgfxGLFunction made of a kernel that takes a patch control point input (the vertex and control
+/// stages of a tessellated draw, merged) and `stageInput` is not nil: YES, with `*kernel` the
+/// function of the device's library of the kernel under the descriptor (RgfxGLSpecializeStageIn),
+/// which takes no stage input, made once per descriptor and kept with the variant. `*kernel` is
+/// nil, with `*error` set and the reason logged once, where it is not made. NO, writing nothing,
+/// for any other function or a nil descriptor.
+BOOL RgfxGLStageInKernel(id<MTLFunction> _Nullable function, MTLStageInputOutputDescriptor *_Nullable stageInput,
+                         id<MTLFunction> _Nullable *_Nonnull kernel, NSError *_Nullable *_Nullable error);
 
 NS_ASSUME_NONNULL_END
 

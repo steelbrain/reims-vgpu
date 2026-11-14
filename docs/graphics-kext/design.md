@@ -4569,7 +4569,13 @@ process, through the GL code generator the system ships beside the renderer
 (`libGLDPlugin<V>.dylib`, called in place), into a .metallib of one function,
 and makes an ordinary library of it (`guest/bundle/src/RgfxGLFunction.h`,
 `RgfxGLLowering.hpp`): the host compiles GL shaders as it compiles any
-library. Measured on an x86 Mac (macOS 26.7.1, the Intel UHD 630): the
+library. A tessellated draw's vertex and control shaders are one kernel the
+renderer makes a compute pipeline of under a stage input descriptor; the
+kernel takes the draw's vertices as a patch control point input, which Metal
+compiles in no kernel, so its pipeline is made of the kernel made one without
+the input under that descriptor (`RgfxGLStageInKernel`), whose fetch reads what
+Metal's `[[stage_in]]` fetch reads (bit for bit on the M3 Max, every
+attribute format: `guest/bundle/tests/gl_tests.mm`). Measured on an x86 Mac (macOS 26.7.1, the Intel UHD 630): the
 renderer runs on a non-Apple Metal device, and the bundle's lowering draws what
 Metal's own does (`guest/bundle/tools/gl_probe.m`, `gl_inject.mm`). An
 on-screen context's drawable is the IOGPU base's, over the kext's GL drawable
