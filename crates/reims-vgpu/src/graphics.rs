@@ -910,10 +910,17 @@ pub(crate) enum Shows<P: Platform> {
 /// window needs a frame (a new layout, the cursor): each present is the guest's own, and none is
 /// batched or repeated by the GPU's work. The texture's block is held until the next present, the
 /// device's reset or the device's end, and each draw of it until it has finished
-/// ([`DisplayHold`]).
+/// ([`DisplayHold`]); the texture itself is let go of at the device's refresh after the next
+/// present, or at its reset (`retired`).
 pub(crate) struct Presented<P: Platform> {
     /// The texture shown; `None` shows the scanout.
     pub(crate) texture: Mutex<Option<ShownTexture<P>>>,
+    /// The textures the display showed before, by their surface's id, let go of at the device's
+    /// next refresh ([`Self::refreshed`]) or its reset: a present is shown on the platform's
+    /// thread that runs its writer's completion handlers, which waits for nothing, and the release
+    /// of a texture's last hold is the platform's work, which may wait (a driver that frees an
+    /// import of the guest's pages).
+    retired: Mutex<Vec<(u32, P::Texture)>>,
     /// The holds made and not yet gone, for a release to find those of its block.
     holds: Mutex<Vec<Weak<DisplayHold>>>,
     /// The surface's IOSurface ID, 0 for none.
@@ -947,6 +954,7 @@ impl<P: Platform> Presented<P> {
     fn new(now: compile::Now) -> Self {
         Presented {
             texture: Mutex::new(None),
+            retired: Mutex::default(),
             holds: Mutex::default(),
             surface_id: AtomicU32::new(0),
             window: OnceLock::new(),
@@ -1050,7 +1058,8 @@ impl<P: Platform> Presented<P> {
     }
 
     /// The display shows `texture` (the surface `id`'s), or the scanout for `None`: the hold of
-    /// the texture shown before, for [`Self::show`]'s caller.
+    /// the texture shown before, for [`Self::show`]'s caller. That texture is retired, let go of
+    /// at the next refresh (`retired`).
     fn swap(&self, id: u32, texture: Option<ShownTexture<P>>) -> Option<Arc<DisplayHold>> {
         let previous = self.surface_id.swap(id, Ordering::AcqRel);
         // A guest that draws into a few IOSurfaces in turn (WindowServer's three) changes the
@@ -1068,21 +1077,30 @@ impl<P: Platform> Presented<P> {
                 "the display shows IOSurface {id} (was {previous}; 0 is the scanout)"
             );
         }
-        // The texture shown before may be the last hold of a closed context's: let go of in a
-        // refusal scope, so a release the platform dies at is refused, logged, and the present
-        // goes on.
         let shown = std::mem::replace(&mut *self.texture.lock(), texture);
         let (shown, hold) = shown.map(|s| (s.texture, s.hold)).unzip();
-        if let Err(refusal) =
-            reims_vgpu_vulkan::core::raise::refusals::refusing(move || drop(shown))
-        {
-            log::warn!(
-                target: "reims_vgpu::graphics", kind:% = refusal;
-                "the texture of IOSurface {previous} was let go of, and its release was refused: \
-                 {refusal}"
-            );
+        if let Some(shown) = shown {
+            self.retired.lock().push((previous, shown));
         }
         hold
+    }
+
+    /// Lets go of the textures the display showed before (`retired`), each in a refusal scope:
+    /// one may be the last hold of a closed context's, so a release the platform dies at is
+    /// refused, logged, and the display goes on. `at` names the event, for the log line.
+    fn let_go_of_retired(&self, at: &str) {
+        let retired = std::mem::take(&mut *self.retired.lock());
+        for (id, texture) in retired {
+            if let Err(refusal) =
+                reims_vgpu_vulkan::core::raise::refusals::refusing(move || drop(texture))
+            {
+                log::warn!(
+                    target: "reims_vgpu::graphics", kind:% = refusal;
+                    "the texture of IOSurface {id} was let go of at {at}, and its release was \
+                     refused: {refusal}"
+                );
+            }
+        }
     }
 
     /// The display's colour, and the count of its changes, which names it.
@@ -1092,7 +1110,8 @@ impl<P: Platform> Presented<P> {
     }
 
     /// The device's reset: the display shows the scanout, which the reset keeps, in place of any
-    /// surface, whose texture is let go of in a refusal scope, with every colour stage off; the
+    /// surface, whose texture is let go of in a refusal scope, as are those retired before it
+    /// (`retired`), with every colour stage off; the
     /// answers still owed are given as they come, and dropped, as each is of a present taken
     /// before the reset. The scanout is the guest's own pixels, still in the region, but the
     /// colour is what the transactions of a display pipe the reset ended set: kept, a reset in the
@@ -1103,6 +1122,7 @@ impl<P: Platform> Presented<P> {
             let mut color = self.color.lock();
             *color = (color.0.wrapping_add(1), Arc::default());
         }
+        self.let_go_of_retired("the device's reset");
         let previous = self.surface_id.swap(0, Ordering::AcqRel);
         let shown = self.texture.lock().take();
         let (shown, hold) = shown.map(|s| (s.texture, s.hold)).unzip();
@@ -1142,9 +1162,11 @@ impl<P: Platform> Presented<P> {
         (self.texture.lock().as_ref()).map(|s| (Handle::clone_ref(&s.texture), Arc::clone(&s.hold)))
     }
 
-    /// A refresh of the device's display: the presents it now shows are answered.
+    /// A refresh of the device's display, on its refresh thread: the presents it now shows are
+    /// answered, then the textures it showed before them are let go of (`retired`).
     fn refreshed(&self) {
         self.answers.refreshed();
+        self.let_go_of_retired("a refresh");
     }
 
     /// The sink draws a surface of pixel format `surface` into a drawable of `drawable`: logged

@@ -8328,6 +8328,65 @@ fn a_present_waits_for_the_command_buffer_that_wrote_its_surface() {
     assert_eq!(device.control.pool.favoured(), None);
 }
 
+/// A present shown at its writer's completion, on the platform's thread that runs the buffer's
+/// completion handlers, lets go of the texture the display showed before off that thread: the
+/// release, held here as a driver that takes long to free an import of the guest's pages holds it,
+/// holds up neither the handler nor the present's answer, and comes at the device's next refresh
+#[test]
+fn a_present_shown_at_a_completion_lets_go_of_the_texture_before_off_the_handler_thread() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    let (mut guest, mut ring) = surface_and_queue(&device);
+    assert_eq!(
+        answered(&device, &mut guest, present_surface(0x77)),
+        RGFX_STATUS_OK
+    );
+    let shown = device
+        .control
+        .presented
+        .shown()
+        .expect("the surface shown")
+        .0
+        .id();
+    // The surface again, once buffer 4, which draws it, has finished.
+    ring.publish(command_buffer_at(obj(1, 1), 100, 4));
+    write_writers(&device, BLOCK + WRITERS, &[(obj(1, 1), 4)]);
+    guest.send(&device, present_surface(0x77));
+    let present = guest.seqno;
+    presents_waiting(&device, 1);
+    device.mmio_write(RGFX_REG_DOORBELL.into(), SUBMIT as u32);
+    let ids = committed(&platform, 1);
+
+    let world = Arc::clone(platform.world());
+    let release = HeldCall::new();
+    world.hold_at_release(shown, release.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("platform-handler".into())
+        .spawn(move || {
+            world.complete(
+                ids[0],
+                CommandBufferStatus::COMPLETED,
+                None,
+                CompleteOn::Caller,
+            );
+            let _ = tx.send(());
+        })
+        .unwrap();
+    assert!(
+        rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "the completion handler let go of the texture shown before"
+    );
+    assert_eq!(answer_of(&mut guest, present), RGFX_STATUS_OK);
+    presents_waiting(&device, 0);
+    assert!(
+        release.reached(Duration::from_secs(5)),
+        "the texture shown before was not let go of at a refresh"
+    );
+    release.open();
+    assert_eq!(shown_width(&device), Some(64));
+}
+
 /// A present waits for a writer of a queue created just before it whose handle the host has yet to
 /// make: the device tells the host of the queue before it answers the create, and the guest names
 /// the queue's buffers only after the answer, however late the queue's service thread has the
