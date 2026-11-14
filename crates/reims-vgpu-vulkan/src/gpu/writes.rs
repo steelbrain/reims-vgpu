@@ -829,6 +829,32 @@ pub(crate) mod tests {
         );
     }
 
+    /// A death over a slot the state's slot writes leave undetermined names what leaves it so,
+    /// and the runtime's gap: a slot only a function constant states, a payload argument of an
+    /// unmeasured stage, an argument buffer member's role. No committed function leaves a slot
+    /// undetermined, so this reads the naming alone, not a death through a reflection
+    #[test]
+    fn an_undetermined_slot_names_its_gap() {
+        for (gap, what) in [
+            (
+                SlotWriteGap::UnresolvedIndex,
+                "an argument whose slot only a function constant states",
+            ),
+            (
+                SlotWriteGap::UnmeasuredPayloadStage,
+                "a payload argument of a stage",
+            ),
+            (
+                SlotWriteGap::MemberRole,
+                "an argument of a role only an argument buffer's member takes",
+            ),
+        ] {
+            let named = gap_named(gap);
+            assert!(named.starts_with(what), "{named}");
+            assert!(named.ends_with(&format!(": {gap:?}")), "{named}");
+        }
+    }
+
     /// The tests' functions of `ycbcr_probe.metal`, `read_only_beside_nested_vertex` and
     /// `read_only_beside_nested_fragment` among them.
     pub(crate) const PROBE: &[u8] =
