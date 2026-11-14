@@ -1035,6 +1035,7 @@ mod tests {
     /// lookup, the median of 9 runs.
     #[test]
     #[ignore = "a measurement: run it by name"]
+    #[allow(clippy::disallowed_methods)] // a measurement: real threads contend for the view's lock
     fn a_command_buffer_s_view_costs_beside_ring_0() {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
