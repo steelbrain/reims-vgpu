@@ -161,6 +161,11 @@ use super::{
 /// raise returns for the handler to catch.
 const ON: OnFault = OnFault::Return;
 
+/// How many names of its op stream a command buffer's walk finds at its start
+/// ([`GraphicsDecoder::find_named`]): every name of a few dozen dispatches, and no more of a
+/// longer buffer's, whose walk finds the rest as it reaches them.
+const NAMES_AT_ONCE: usize = 128;
+
 /// `MTLRenderStageFragment`: a render encoder's update of the writers' fence covers its fragment
 /// stage and every stage before it, its render targets' writes among them.
 const RENDER_STAGE_FRAGMENT: u64 = 0x2;
@@ -2265,6 +2270,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         split: &mut Option<Splitting>,
     ) -> RaiseResult<Result<(), DecodeError>> {
         let mut encoder: Option<OpenEncoder<P>> = None;
+        self.find_named(ops);
         self.laid_uses.borrow_mut().clear();
         self.laid_written.borrow_mut().clear();
         let walked = refusing(|| self.walk(ops, cb, &mut encoder, events, split));
@@ -2272,6 +2278,32 @@ impl<P: Platform> GraphicsDecoder<P> {
             end_abandoned(open);
         }
         walked
+    }
+
+    /// Finds the first [`NAMES_AT_ONCE`] objects of the current context the compute ops of the
+    /// command buffer's op stream `ops` name ([`each_named`]) in its view of the context's table,
+    /// where it has one, a few under each hold of the table's lock ([`View::find_all`]): the walk
+    /// then answers them from the view's names, as it would have found them as it reached them.
+    ///
+    /// [`View::find_all`]: super::tables::View::find_all
+    fn find_named(&self, ops: &[u8]) {
+        let Some(context) = self.context else {
+            return;
+        };
+        let views = self.views.borrow();
+        let Some(view) = views.iter().find(|v| v.context().id == context) else {
+            return;
+        };
+        let mut ids = [0u64; NAMES_AT_ONCE];
+        let mut n = 0;
+        each_named(ops, |id| {
+            if self.owned(id) {
+                ids[n] = id;
+                n += 1;
+            }
+            n < NAMES_AT_ONCE
+        });
+        view.find_all(ids[..n].iter().copied());
     }
 
     /// The writers' fence ([`super::surface_cache::Caches::writes_fence`]) where the encoder being
@@ -2937,6 +2969,21 @@ fn next_op(ops: &[u8]) -> Option<(u16, &[u8], usize)> {
         return None;
     }
     Some((h.tag, &ops[RGFX_OP_BODY_OFFSET as usize..len], len))
+}
+
+/// Calls `found` with each object id (not nil) the compute ops of the op stream `ops` name, read
+/// as the walk reads them ([`next_op`], [`compute::names`]), in stream order, until it answers
+/// false, the stream ends or is malformed, or a compute op's body is too short for what it names
+/// or its tag is one the walk does not decode: where the walk faults, if it gets there.
+fn each_named(mut ops: &[u8], mut found: impl FnMut(u64) -> bool) {
+    while let Some((tag, body, len)) = next_op(ops) {
+        if op_group(tag) == RGFX_OP_GROUP_COMPUTE
+            && compute::names(tag, body, &mut found) != Some(true)
+        {
+            return;
+        }
+        ops = &ops[len..];
+    }
 }
 
 /// The most draws [`Draws`] holds before it sends them.
@@ -7667,6 +7714,242 @@ mod tests {
             );
         });
         // A walk begun after the create names it.
+        ring0.set_walk_hook(None);
+        assert_eq!(walker.decode(&device, &message).unwrap(), Ok(()));
+    }
+
+    /// The ids [`each_named`] reads off an op stream: its compute ops' in stream order, each run's
+    /// records each, nil ids, ops that name nothing and ops of other groups left out.
+    #[test]
+    fn a_stream_s_compute_names_come_in_order() {
+        use reims_vgpu_graphics::ops::compute::{
+            RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS, RGFX_OP_COMPUTE_SET_BUFFERS,
+            RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RGFX_OP_COMPUTE_USE_HEAPS,
+            RgfxComputeHeapBinding, RgfxComputeOpDispatchThreadgroups,
+            RgfxComputeOpSetComputePipelineState, RgfxComputeOpUseHeaps,
+        };
+        let mut ops = op(
+            RGFX_OP_ENCODER_BEGIN_COMPUTE,
+            RgfxComputePassDesc::default().as_bytes(),
+        );
+        ops.extend(op(
+            RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE,
+            RgfxComputeOpSetComputePipelineState { pipeline_obj_id: 7 }.as_bytes(),
+        ));
+        ops.extend(op(RGFX_OP_COMPUTE_SET_BUFFERS, &set_buffers(&[11, 0, 12])));
+        let mut heaps = RgfxComputeOpUseHeaps { count: 1 }.as_bytes().to_vec();
+        heaps.extend_from_slice(RgfxComputeHeapBinding { heap_obj_id: 31 }.as_bytes());
+        ops.extend(op(RGFX_OP_COMPUTE_USE_HEAPS, &heaps));
+        ops.extend(op(
+            RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS,
+            RgfxComputeOpDispatchThreadgroups::default().as_bytes(),
+        ));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        assert_eq!(named(&ops), [7, 11, 12, 31]);
+    }
+
+    /// [`each_named`] reads no further than the walk decodes: an op whose head counts more records
+    /// than its body holds, whose length overruns the stream or is no multiple of 8, or a compute
+    /// tag the walk does not decode ends the reading there; and an answer of false ends it at once.
+    #[test]
+    fn a_short_or_malformed_stream_ends_the_reading() {
+        use reims_vgpu_graphics::ops::compute::{
+            RGFX_OP_COMPUTE_SET_BUFFERS, RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE,
+            RgfxComputeOpSetComputePipelineState,
+        };
+        let mut counted = op(RGFX_OP_COMPUTE_SET_BUFFERS, &set_buffers(&[11]));
+        let mut short = set_buffers(&[12, 13]);
+        // The head counts 3 records; the op holds 2.
+        short[8..16].copy_from_slice(&3u64.to_le_bytes());
+        counted.extend(op(RGFX_OP_COMPUTE_SET_BUFFERS, &short));
+        counted.extend(op(RGFX_OP_COMPUTE_SET_BUFFERS, &set_buffers(&[14])));
+        assert_eq!(
+            named(&counted),
+            [11],
+            "the second op's records run past its body"
+        );
+        let mut cut = op(RGFX_OP_COMPUTE_SET_BUFFERS, &set_buffers(&[11]));
+        cut.extend(op(RGFX_OP_COMPUTE_SET_BUFFERS, &set_buffers(&[12])));
+        cut.truncate(cut.len() - 8);
+        assert_eq!(named(&cut), [11], "the second op runs past the stream");
+        let mut odd = op(
+            RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE,
+            RgfxComputeOpSetComputePipelineState { pipeline_obj_id: 7 }.as_bytes(),
+        );
+        odd[4..8].copy_from_slice(&12u32.to_le_bytes());
+        assert_eq!(named(&odd), Vec::<u64>::new());
+        let mut unknown = op(0x2fff, &[0; 8]);
+        unknown.extend(op(RGFX_OP_COMPUTE_SET_BUFFERS, &set_buffers(&[11])));
+        assert_eq!(
+            named(&unknown),
+            Vec::<u64>::new(),
+            "an op the walk does not decode"
+        );
+        let mut first = Vec::new();
+        each_named(
+            &op(RGFX_OP_COMPUTE_SET_BUFFERS, &set_buffers(&[11, 12, 13])),
+            |id| {
+                first.push(id);
+                false
+            },
+        );
+        assert_eq!(first, [11]);
+    }
+
+    /// The ids [`each_named`] reads off `ops`, in order.
+    fn named(ops: &[u8]) -> Vec<u64> {
+        let mut out = Vec::new();
+        each_named(ops, |id| {
+            out.push(id);
+            true
+        });
+        out
+    }
+
+    /// A `SET_BUFFERS` body binding `ids` from slot 0, each at offset 256.
+    fn set_buffers(ids: &[u64]) -> Vec<u8> {
+        use reims_vgpu_graphics::ops::compute::{
+            RgfxComputeBufferBinding, RgfxComputeOpSetBuffers,
+        };
+        let mut body = RgfxComputeOpSetBuffers {
+            location: 0,
+            length: ids.len() as u64,
+        }
+        .as_bytes()
+        .to_vec();
+        for &buffer_obj_id in ids {
+            let binding = RgfxComputeBufferBinding {
+                buffer_obj_id,
+                offset: 256,
+            };
+            body.extend_from_slice(binding.as_bytes());
+        }
+        body
+    }
+
+    /// The names a walk's compute ops give, found as it starts ([`each_named`]), are what its
+    /// table held at its begin, as each op would have found them alone: destroys after the walk
+    /// found them, of the buffers and the texture it binds, and an id destroyed, made again and
+    /// destroyed again, leave it binding the objects it began with, let go of once it ends. One
+    /// destroyed before its begin is found by neither, and stays unfound though made again
+    /// mid-walk: the op naming it faults.
+    #[test]
+    fn a_walk_s_compute_names_found_at_its_start_are_its_begin_s() {
+        use reims_vgpu_graphics::ops::compute::{
+            RGFX_OP_COMPUTE_SET_BUFFERS, RGFX_OP_COMPUTE_SET_TEXTURE, RgfxComputeBufferBinding,
+            RgfxComputeOpSetBuffers, RgfxComputeOpSetTexture,
+        };
+        let (p, dec) = setup();
+        let device = p.device();
+        let buffer = |id| match dec.object(id) {
+            Some(ObjHandle::Buffer(b)) => b,
+            _ => panic!("no buffer {id}"),
+        };
+        let bound = Arg::objs(&[Some(buffer(2)), Some(buffer(3))]);
+        let textured = Arg::opt(match dec.object(5) {
+            Some(ObjHandle::Texture(t)) => Some(t),
+            _ => panic!("no texture 5"),
+        });
+        let mut ring0 = dec.sender(None, super::super::Sinks::default());
+        let mut walker = dec.sender(None, super::super::Sinks::default());
+        drop(dec);
+        let mut ops = op(
+            RGFX_OP_ENCODER_BEGIN_COMPUTE,
+            RgfxComputePassDesc::default().as_bytes(),
+        );
+        let mut binds = RgfxComputeOpSetBuffers {
+            location: 0,
+            length: 2,
+        }
+        .as_bytes()
+        .to_vec();
+        for buffer_obj_id in [2, 3] {
+            let b = RgfxComputeBufferBinding {
+                buffer_obj_id,
+                offset: 0,
+            };
+            binds.extend_from_slice(b.as_bytes());
+        }
+        ops.extend(op(RGFX_OP_COMPUTE_SET_BUFFERS, &binds));
+        ops.extend(op(
+            RGFX_OP_COMPUTE_SET_TEXTURE,
+            RgfxComputeOpSetTexture {
+                texture_obj_id: 5,
+                index: 0,
+            }
+            .as_bytes(),
+        ));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        let message = command_buffer_message(100, 1, &ops);
+        // The gate stops the walk after its encoder's begin: past its start, before its binds.
+        let gate = Gate::on(&ring0, 0);
+        std::thread::scope(|scope| {
+            let walk = scope.spawn(|| {
+                let outcome = walker.decode(&p.device(), &message).unwrap();
+                walker.end_message();
+                outcome
+            });
+            gate.reached();
+            for m in [
+                destroy(5),
+                destroy(2),
+                buffer_create(2),
+                destroy(2),
+                destroy(3),
+            ] {
+                assert_eq!(ring0.decode(&device, &m).unwrap(), Ok(()));
+            }
+            assert_eq!(kept(&ring0), 3, "kept for the walk: 5, 2 and 3");
+            gate.open();
+            assert_eq!(walk.join().unwrap(), Ok(()));
+        });
+        assert_eq!(kept(&ring0), 0, "let go of with the walk");
+        let log = p.call_log();
+        assert_eq!(
+            log.calls_to("setBuffers:offsets:withRange:")
+                .last()
+                .unwrap()
+                .args[0],
+            bound,
+            "the buffers it began with"
+        );
+        assert_eq!(
+            log.calls_to("setTexture:atIndex:").last().unwrap().args[0],
+            textured,
+            "the texture it began with"
+        );
+        // Buffer 2 is gone before this walk's begin, and made again while it walks: the walk
+        // names neither, and faults at its bind; one begun after the make names it.
+        let mut ops = op(
+            RGFX_OP_ENCODER_BEGIN_COMPUTE,
+            RgfxComputePassDesc::default().as_bytes(),
+        );
+        let mut bind = RgfxComputeOpSetBuffers {
+            location: 0,
+            length: 1,
+        }
+        .as_bytes()
+        .to_vec();
+        let b = RgfxComputeBufferBinding {
+            buffer_obj_id: 2,
+            offset: 0,
+        };
+        bind.extend_from_slice(b.as_bytes());
+        ops.extend(op(RGFX_OP_COMPUTE_SET_BUFFERS, &bind));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        let message = command_buffer_message(101, 2, &ops);
+        ring0.set_walk_hook(None);
+        let gate = Gate::on(&ring0, 0);
+        std::thread::scope(|scope| {
+            let walk = scope.spawn(|| walker.decode(&p.device(), &message).map_err(|_| ()));
+            gate.reached();
+            assert_eq!(ring0.decode(&device, &buffer_create(2)).unwrap(), Ok(()));
+            gate.open();
+            assert!(
+                walk.join().unwrap().is_err(),
+                "named the buffer made after its begin"
+            );
+        });
         ring0.set_walk_hook(None);
         assert_eq!(walker.decode(&device, &message).unwrap(), Ok(()));
     }

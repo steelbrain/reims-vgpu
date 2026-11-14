@@ -90,16 +90,23 @@ fn tail<E: FromBytes + Immutable>(
     head_len: usize,
     count: usize,
 ) -> RaiseResult<Tail<'_, E>> {
-    let stride = size_of::<E>();
-    let short = || {
+    records(payload, head_len, count).ok_or_else(|| {
         op_fault(format_args!(
             "compute op {tag:#06x}: body too short for its records"
         ))
-    };
-    let span = count.checked_mul(stride).ok_or_else(short)?;
-    let end = head_len.checked_add(span).ok_or_else(short)?;
-    let bytes = payload.get(head_len..end).ok_or_else(short)?;
-    Ok(Tail {
+    })
+}
+
+/// [`tail`]'s records, `None` where the body is too short for them.
+fn records<E: FromBytes + Immutable>(
+    payload: &[u8],
+    head_len: usize,
+    count: usize,
+) -> Option<Tail<'_, E>> {
+    let span = count.checked_mul(size_of::<E>())?;
+    let end = head_len.checked_add(span)?;
+    let bytes = payload.get(head_len..end)?;
+    Some(Tail {
         bytes,
         count,
         record: PhantomData,
@@ -252,6 +259,162 @@ fn bind_each<'a, R: FromBytes + Immutable, T>(
         ));
     }
     Ok(named)
+}
+
+/// The objects compute op `tag` names, read from its body `payload` with the types [`decode_op`]
+/// reads it with, for a walk to find them in its view of the table before it reaches them
+/// (`cmdbuf`'s `find_named`): each id but nil goes to `found`, in the order the op names them,
+/// until it answers false. `None` for a tag [`decode_op`] does not decode; `Some(false)` where
+/// `found` answered false, or the body is too short for what it names, where the walk faults;
+/// else `Some(true)`. Each op [`decode_op`] decodes has an arm here, those that name no object
+/// among them (`every_compute_op_decoded_is_read_for_its_names`).
+pub(super) fn names(tag: u16, payload: &[u8], found: &mut impl FnMut(u64) -> bool) -> Option<bool> {
+    /// Op body `T`, as [`body`] reads it.
+    fn head<T: FromBytes>(payload: &[u8]) -> Option<T> {
+        T::read_from_prefix(payload).ok().map(|(t, _)| t)
+    }
+    /// The `count` records of `E` after head `H`, as [`tail`] reads them.
+    fn run<H, E: FromBytes + Immutable>(payload: &[u8], count: u64) -> Option<Tail<'_, E>> {
+        records(payload, size_of::<H>(), usize::try_from(count).ok()?)
+    }
+    /// Each of `ids` but nil to `found`: whether it wants more.
+    fn each(found: &mut impl FnMut(u64) -> bool, ids: impl IntoIterator<Item = u64>) -> bool {
+        ids.into_iter().filter(|&id| id != 0).all(found)
+    }
+    let more = match tag {
+        RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE => {
+            head::<RgfxComputeOpSetComputePipelineState>(payload)
+                .map(|m| each(found, [m.pipeline_obj_id]))
+        }
+        RGFX_OP_COMPUTE_SET_BUFFERS => head::<RgfxComputeOpSetBuffers>(payload)
+            .and_then(|m| {
+                run::<RgfxComputeOpSetBuffers, RgfxComputeBufferBinding>(payload, m.length)
+            })
+            .map(|r| each(found, r.iter().map(|r| r.buffer_obj_id))),
+        RGFX_OP_COMPUTE_SET_BUFFERS_ATTRIBUTE_STRIDES => {
+            head::<RgfxComputeOpSetBuffersAttributeStrides>(payload)
+                .and_then(|m| {
+                    run::<RgfxComputeOpSetBuffersAttributeStrides, RgfxComputeBufferStrideBinding>(
+                        payload, m.length,
+                    )
+                })
+                .map(|r| each(found, r.iter().map(|r| r.buffer_obj_id)))
+        }
+        RGFX_OP_COMPUTE_SET_TEXTURE => {
+            head::<RgfxComputeOpSetTexture>(payload).map(|m| each(found, [m.texture_obj_id]))
+        }
+        RGFX_OP_COMPUTE_SET_TEXTURES => head::<RgfxComputeOpSetTextures>(payload)
+            .and_then(|m| {
+                run::<RgfxComputeOpSetTextures, RgfxComputeTextureBinding>(payload, m.length)
+            })
+            .map(|r| each(found, r.iter().map(|r| r.texture_obj_id))),
+        RGFX_OP_COMPUTE_SET_SAMPLER_STATES => head::<RgfxComputeOpSetSamplerStates>(payload)
+            .and_then(|m| {
+                run::<RgfxComputeOpSetSamplerStates, RgfxComputeSamplerBinding>(payload, m.length)
+            })
+            .map(|r| each(found, r.iter().map(|r| r.sampler_obj_id))),
+        RGFX_OP_COMPUTE_SET_SAMPLER_STATES_LOD_CLAMPS => {
+            head::<RgfxComputeOpSetSamplerStatesLodClamps>(payload)
+                .and_then(|m| {
+                    run::<RgfxComputeOpSetSamplerStatesLodClamps, RgfxComputeSamplerLodBinding>(
+                        payload, m.length,
+                    )
+                })
+                .map(|r| each(found, r.iter().map(|r| r.sampler_obj_id)))
+        }
+        RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLE => {
+            head::<RgfxComputeOpSetVisibleFunctionTable>(payload)
+                .map(|m| each(found, [m.table_obj_id]))
+        }
+        RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLES => {
+            head::<RgfxComputeOpSetVisibleFunctionTables>(payload)
+                .and_then(|m| {
+                    run::<
+                        RgfxComputeOpSetVisibleFunctionTables,
+                        RgfxComputeVisibleFunctionTableBinding,
+                    >(payload, m.length)
+                })
+                .map(|r| each(found, r.iter().map(|r| r.table_obj_id)))
+        }
+        RGFX_OP_COMPUTE_SET_STAGE_IN_REGION_INDIRECT => {
+            head::<RgfxComputeOpSetStageInRegionIndirect>(payload)
+                .map(|m| each(found, [m.indirect_buffer_obj_id]))
+        }
+        RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS_INDIRECT => {
+            head::<RgfxComputeOpDispatchThreadgroupsIndirect>(payload)
+                .map(|m| each(found, [m.indirect_buffer_obj_id]))
+        }
+        RGFX_OP_COMPUTE_DISPATCH_THREADS_INDIRECT => {
+            head::<RgfxComputeOpDispatchThreadsIndirect>(payload)
+                .map(|m| each(found, [m.indirect_buffer_obj_id]))
+        }
+        RGFX_OP_COMPUTE_USE_RESOURCES => head::<RgfxComputeOpUseResources>(payload)
+            .and_then(|m| {
+                run::<RgfxComputeOpUseResources, RgfxComputeResourceRef>(payload, m.count)
+            })
+            .map(|r| each(found, resource_ids(&r))),
+        RGFX_OP_COMPUTE_USE_HEAPS => head::<RgfxComputeOpUseHeaps>(payload)
+            .and_then(|m| run::<RgfxComputeOpUseHeaps, RgfxComputeHeapBinding>(payload, m.count))
+            .map(|r| each(found, r.iter().map(|r| r.heap_obj_id))),
+        RGFX_OP_COMPUTE_MEMORY_BARRIER_RESOURCES => {
+            head::<RgfxComputeOpMemoryBarrierResources>(payload)
+                .and_then(|m| {
+                    run::<RgfxComputeOpMemoryBarrierResources, RgfxComputeResourceRef>(
+                        payload, m.count,
+                    )
+                })
+                .map(|r| each(found, resource_ids(&r)))
+        }
+        RGFX_OP_COMPUTE_UPDATE_FENCE => {
+            head::<RgfxComputeOpUpdateFence>(payload).map(|m| each(found, [m.fence_obj_id]))
+        }
+        RGFX_OP_COMPUTE_WAIT_FOR_FENCE => {
+            head::<RgfxComputeOpWaitForFence>(payload).map(|m| each(found, [m.fence_obj_id]))
+        }
+        RGFX_OP_COMPUTE_EXECUTE_COMMANDS_INDIRECT => {
+            head::<RgfxComputeOpExecuteCommandsIndirect>(payload).map(|m| {
+                each(
+                    found,
+                    [
+                        m.indirect_commandbuffer_obj_id,
+                        m.indirect_range_buffer_obj_id,
+                    ],
+                )
+            })
+        }
+        RGFX_OP_COMPUTE_EXECUTE_COMMANDS_IN_BUFFER => {
+            head::<RgfxComputeOpExecuteCommandsInBuffer>(payload)
+                .map(|m| each(found, [m.indirect_command_buffer_obj_id]))
+        }
+        RGFX_OP_COMPUTE_ENCODE_START_IF => {
+            head::<RgfxComputeOpEncodeStartIf>(payload).map(|m| each(found, [m.buffer_obj_id]))
+        }
+        RGFX_OP_COMPUTE_ENCODE_START_WHILE => {
+            head::<RgfxComputeOpEncodeStartWhile>(payload).map(|m| each(found, [m.buffer_obj_id]))
+        }
+        // The ops that name no object.
+        RGFX_OP_COMPUTE_SET_BUFFER_OFFSET
+        | RGFX_OP_COMPUTE_SET_BUFFER_OFFSET_ATTRIBUTE_STRIDE
+        | RGFX_OP_COMPUTE_SET_THREADGROUP_MEMORY_LENGTH
+        | RGFX_OP_COMPUTE_SET_STAGE_IN_REGION
+        | RGFX_OP_COMPUTE_SET_IMAGEBLOCK_WIDTH
+        | RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS
+        | RGFX_OP_COMPUTE_DISPATCH_THREADS
+        | RGFX_OP_COMPUTE_MEMORY_BARRIER_SCOPE
+        | RGFX_OP_COMPUTE_ENCODE_START_ELSE
+        | RGFX_OP_COMPUTE_ENCODE_START_DO_WHILE
+        | RGFX_OP_COMPUTE_COMPRESSED_TEXTURE_REINTERPRETATION_FLUSH => Some(true),
+        _ => return None,
+    };
+    Some(more.unwrap_or(false))
+}
+
+/// The objects resource records name, as [`resolve_resource`] resolves them: a nil kind names
+/// none.
+fn resource_ids(recs: &Tail<'_, RgfxComputeResourceRef>) -> impl Iterator<Item = u64> {
+    recs.iter()
+        .filter(|r| r.kind != RGFX_RESOURCE_KIND_NONE)
+        .map(|r| r.obj_id)
 }
 
 /// Decodes one compute-encoder op: `tag` its op, `payload` its body (the bytes
@@ -1264,5 +1427,108 @@ mod tests {
                 "setTextures:withRange:",
             ]
         );
+    }
+
+    /// Each compute op [`decode_op`] decodes, [`names`] reads for the objects it names or lists as
+    /// naming none, and it reads none that [`decode_op`] does not decode: a new op fails here until
+    /// its names are read with its body's types, or it is listed as naming none.
+    #[test]
+    fn every_compute_op_decoded_is_read_for_its_names() {
+        use reims_vgpu_graphics::ops::RGFX_OP_GROUP_COMPUTE;
+        let (_p, dec, enc) = setup();
+        let zeros = [0u8; 512];
+        let first = RGFX_OP_GROUP_COMPUTE << 12;
+        let mut decoded = 0;
+        for tag in first..=first | 0xfff {
+            let decodes = !matches!(
+                decode_op(tag, &zeros, &dec, &enc, &Marks::default(), OnFault::Return),
+                Ok(false)
+            );
+            let read = names(tag, &zeros, &mut |_| true);
+            assert_eq!(decodes, read.is_some(), "compute op {tag:#06x}");
+            decoded += usize::from(decodes);
+        }
+        assert!(decoded >= 32, "the compute ops 0x2000 to 0x201f decode");
+    }
+
+    /// [`names`] reads each id an op names, in its order, nil and a nil resource kind left out;
+    /// stops where its body is too short for the records its head counts; and stops at once where
+    /// `found` answers false.
+    #[test]
+    fn names_reads_an_op_s_ids_in_its_order() {
+        let read = |tag, body: &[u8]| {
+            let mut ids = Vec::new();
+            let more = names(tag, body, &mut |id| {
+                ids.push(id);
+                true
+            });
+            (more, ids)
+        };
+        let mut uses = RgfxComputeOpUseResources { count: 3, usage: 1 }
+            .as_bytes()
+            .to_vec();
+        for (kind, obj_id) in [
+            (RGFX_RESOURCE_KIND_BUFFER, 21),
+            (RGFX_RESOURCE_KIND_NONE, 99),
+            (RGFX_RESOURCE_KIND_TEXTURE, 22),
+        ] {
+            let r = RgfxComputeResourceRef {
+                kind,
+                reserved_04: 0,
+                obj_id,
+            };
+            uses.extend_from_slice(r.as_bytes());
+        }
+        assert_eq!(
+            read(RGFX_OP_COMPUTE_USE_RESOURCES, &uses),
+            (Some(true), vec![21, 22])
+        );
+        let mut binds = RgfxComputeOpSetBuffers {
+            location: 0,
+            length: 3,
+        }
+        .as_bytes()
+        .to_vec();
+        for buffer_obj_id in [11, 0, 12] {
+            let b = RgfxComputeBufferBinding {
+                buffer_obj_id,
+                offset: 256,
+            };
+            binds.extend_from_slice(b.as_bytes());
+        }
+        assert_eq!(
+            read(RGFX_OP_COMPUTE_SET_BUFFERS, &binds),
+            (Some(true), vec![11, 12])
+        );
+        let short = &binds[..binds.len() - 8];
+        assert_eq!(
+            read(RGFX_OP_COMPUTE_SET_BUFFERS, short),
+            (Some(false), vec![]),
+            "its records run past its body"
+        );
+        let indirect = RgfxComputeOpExecuteCommandsIndirect {
+            indirect_commandbuffer_obj_id: 31,
+            indirect_range_buffer_obj_id: 32,
+            ..Default::default()
+        };
+        assert_eq!(
+            read(
+                RGFX_OP_COMPUTE_EXECUTE_COMMANDS_INDIRECT,
+                indirect.as_bytes()
+            ),
+            (Some(true), vec![31, 32])
+        );
+        assert_eq!(
+            read(RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS, &[]),
+            (Some(true), vec![]),
+            "names none"
+        );
+        let mut first = Vec::new();
+        let more = names(RGFX_OP_COMPUTE_SET_BUFFERS, &binds, &mut |id| {
+            first.push(id);
+            false
+        });
+        assert_eq!((more, first), (Some(false), vec![11]));
+        assert_eq!(read(0x2fff, &binds), (None, vec![]), "not decoded");
     }
 }
