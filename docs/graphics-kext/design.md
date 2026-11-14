@@ -1037,13 +1037,16 @@ Stages:
         - The compositor's GPU draws from a linear texture over its import
           of the mirror, through the draw the runtime's device would make:
           the same bytes, so the same pixels.
-        - The CPU orders the two GPUs. A sync is waited for before the
-          draw that reads the mirror is encoded, and the next sync waits
-          for that draw. The runtime exports its semaphores only as opaque
-          descriptors, which a device of another driver cannot import.
-          metal2vulkan exports a command buffer's completion as a sync
-          file from its 2bd067d6c7 on, which moves the first wait onto the
-          compositor's GPU once the pin takes it.
+        - The compositor's GPU waits for the sync. The sync's command
+          buffer exports its completion as a sync file (metal2vulkan's
+          `add_completion_sync_file`), which the draw that reads the
+          mirror imports and waits for before its work, so the window's
+          thread waits for no GPU work of the sync's. The next sync waits
+          on the host for that draw and for the sync before it. Where the
+          runtime exports no sync file (MoltenVK), the sync finished
+          before the export looked, or the compositor's device imports
+          none, the window's thread waits for the sync before it encodes
+          the draw.
         - It touches the window's path alone: no guest, kext or placement
           change. Its fallback, at each refusal on every driver, is the
           window's present from the runtime's GPU, as before: no feedback,
@@ -1075,15 +1078,63 @@ Stages:
             Control, 45.7 and 45.0 in the autoscroll, 40.9 and 40.5 in GL
             3D. The pages' own rates were 60, 59.8 and 60 both times.
           - The window presents every guest present.
-          - The CPU's order costs the render thread a wait at each sync,
-            the 3090's copy of the changed tiles over its link: 1.6 ms a
-            present in Mission Control (1.0 MB of tiles at most), 7.3 ms in
-            the autoscroll (11.8 MB) and 10.8 ms in GL 3D (18.5 MB). The
-            guest does not wait for it.
+          - Ordered on the CPU, as route 1 was first built, each sync
+            cost the render thread a wait for the 3090's copy of the
+            changed tiles over its link: 1.6 ms a present in Mission
+            Control (1.0 MB of tiles at most), 7.3 ms in the autoscroll
+            (11.8 MB) and 10.8 ms in GL 3D (18.5 MB). The guest does not
+            wait for it.
           - Mission Control's median from take to show rose from 2.2 to
-            14.4 ms, about a refresh, while its 99th percentile fell.
+            14.4 ms, while its mean fell from 18.2 to 10.0 ms. Its presents
+            fall in two groups: those whose writers had finished by their
+            take, shown within 4 ms (55% of them, then 46%), and those whose
+            writers still ran, shown at a median of 39.1 ms, then 15.2 ms.
+            Route 1 makes the second group faster and, at 57.7 presents a
+            second against 47.8, larger, so the median moves from the first
+            group into the second. From take to answer, the mean fell from
+            29.1 to 23.3 ms (1.94 to 1.61 refreshes). The XTX, whose
+            compositor composites on the runtime's own GPU, shows the same
+            two groups: 37% within 4 ms, the rest at a median of 12.0 ms.
           - The runtime's memory log shows the mirror's host pages
             imported by their pointer on both devices.
+        - *Measured 2026-11-13: the sync waited for on the compositor's
+          GPU.* The same walk on metal2vulkan's pin 83, with each sync
+          waited for by the render thread (development at 36b382f9e) and
+          by the compositor's GPU (`steelbrain/x4route`), each after a walk
+          that filled the caches the pin left cold: um870's RTX 3090,
+          whose compositor composites on its Radeon 780M, and um790's
+          Radeon 780M, whose compositor composites on its RX 7900 XTX.
+          The render thread's wait for the syncs:
+
+          | runtime's GPU | sync waited for by | syncs | on the compositor's GPU | render thread's wait a sync |
+          |---|---|---|---|---|
+          | 3090 | the render thread | 6447 | 0 | 4.63 ms |
+          | | the compositor's GPU | 6416 | 6416 | 0.45 ms |
+          | 780M | the render thread | 6709 | 0 | 4.25 ms |
+          | | the compositor's GPU | 6746 | 6746 | 0.99 ms |
+
+          - On the 3090, by step: Mission Control 1.61 ms a sync, then
+            0.38 ms; the autoscroll 7.27, then 0.37 ms; GL 3D 10.79, then
+            0.34 ms.
+          - The runtime exported a sync file for each sync, none of them
+            after host copies (its work counts `sync_files_exported` and
+            `sync_files_after_host_copies`), and neither compositor's
+            device refused one.
+          - The guest's presents a second, the 3090's link and busy time,
+            and the times from take to show stayed as they were. On the
+            3090: 57.7 and 57.6 presents a second in Mission Control, 44.9
+            and 45.2 in the autoscroll, 40.3 and 40.6 in GL 3D. On the
+            780M: 59.7 and 59.1, 45.8 and 45.5, 37.3 and 36.6.
+          - Mission Control's take to show on the 3090, median / 99th
+            percentile: 14.7 / 59.1 ms in the walk that filled the caches,
+            14.2 / 48.6 ms with the render thread's wait, 14.1 / 52.4 ms
+            with the GPU's. Its two groups stayed as they were: 46% of the
+            presents within 4 ms, the rest at a median of 15.6, 15.1 and
+            15.1 ms. The render thread's wait did not hold the shows, and
+            the median above is where the two groups split.
+          - What the render thread still spends on a sync is its encoding,
+            commit and export, and its wait for the last draw and the sync
+            before it.
       - *Route 2: the presented surfaces in place.* The surfaces the
         display pipe presents lie in place in guest RAM (route B's
         placement for them alone; every other surface keeps its device
