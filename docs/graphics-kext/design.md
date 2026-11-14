@@ -1011,8 +1011,8 @@ Stages:
     - **Proposed, not built: the window shown by the compositor's GPU.**
       Where the compositor runs on another GPU, the window's swapchain is
       made on that GPU, whose buffers are its own, and only what changed of
-      each frame crosses the runtime's GPU's link. Two routes, for the
-      owner to choose between; neither is built:
+      each frame crosses the runtime's GPU's link. Two routes were weighed.
+      Route 2 was measured and rejected (below); route 1 is the one taken:
       - *Which device, either route.* The GPU the compositor composites on
         is the main device of the window's surface's dma-buf feedback
         (`zwp_linux_dmabuf_feedback_v1`), matched to a physical device by
@@ -1069,15 +1069,48 @@ Stages:
           GPU cannot import, or no second device, keeps today's device
           cache and the window's present from the runtime's GPU, at the
           refusal, on every driver.
-      - *Measured, and not.* What the guest's frames change (below) is
-        measured: route 1's bytes are that change. Route 2's are not: its
-        loads and its surfaces' catch-up add to the change, by how much
-        is unmeasured. One prototype run measures them: the presented
-        surfaces alone in place (not route B wholesale) and the window as
-        today, the 3090's link counted per present as above (its bytes
-        less today's 34.8 MB window copy) beside the runtime's shadow
-        counts for those surfaces. Neither route's frame rate is
-        measured.
+      - *Route 2, measured 2026-11-13: rejected.* A prototype placed the
+        presented surfaces alone in place. The kext named WindowServer's
+        single-plane surfaces of the scanout's shape in place, not route B
+        wholesale. The window stayed as today. The build was
+        `steelbrain/x4route-proto` on development at 9cb5693ab. It ran
+        the walk above on the RTX 3090, against the same walk on
+        development at 459e76e6a, both mostly in P2. Megabytes a guest
+        present (route 2's are the prototype's, less today's 34.8 MB
+        window copy):
+
+        | step | today, from / to the GPU | route 2, from + to the GPU | what changed (below) |
+        |---|---|---|---|
+        | Finder | 48.3 / 4.4 | 54.8 + 304.6 | 2.7 |
+        | Apps | 34.5 / 5.0 | 99.6 + 257.1 | 0.65 |
+        | Mission Control | 30.2 / 2.0 | 28.6 + 63.6 | 1.6 |
+        | Safari's scroll | 41.6 / 4.9 | 132.7 + 107.5 | 6.1 |
+        | autoscroll | 26.2 / 0.3 | 91.9 + 93.3 | 12.1 |
+        | the WebGL page | 34.6 / 0.1 | 9.4 + 37.4 | 0.3 |
+        | GL 3D | 23.9 / 0.4 | 93.2 + 66.0 | 18.2 |
+        | video | 31.0 / 0.8 | 122.3 + 44.3 | 6.2 |
+        | Maps | 31.1 / 11.3 | 77.0 + 203.6 | 1.6 |
+        | the walk | 30.8 / 2.2 | 90.5 + 78.8 | 6.27 |
+
+        - About 169 MB crossed the link a present, five times today's
+          copy, and the guest slowed to match. Its presents over the walk
+          fell from 4324 to 1735, and the GPU's busy time went from 20.2 to
+          80.0 ms a present.
+        - Rates fell in Mission Control from 47 to 20 presents a second,
+          in the autoscroll from 45 to 9, and in GL 3D from 41 to 7.
+        - The median from a present's take to its show went from 23 to
+          147 ms in Finder, and from 5.6 to 182 ms in GL 3D.
+        - The runtime's shadow counts barely moved: the texels it copied
+          into shadows from host pages stayed under 1.3 MB a present. The
+          bytes are the composite's own passes. The runtime's GPU renders
+          and blends WindowServer's frame straight into guest RAM over the
+          link, its loads as well as its writes, several passes a frame:
+          an in-place display surface puts the whole composite on the
+          link, not one write of the frame.
+        - So the presented surfaces keep their device caches, as every
+          surface does on a GPU with memory of its own (route B's
+          decision holds for them too).
+        - Route 1's bytes are the change measured below.
       - *What the guest's frames change.* The same walk on the RX 7900 XTX,
         with a measuring build (`steelbrain/x4link-damage` at 32bfa734c,
         not landed: a thread that reads what the display shows as
