@@ -59,10 +59,16 @@
  * that source's capacity.
  *
  * THE FALLBACKS, in order, where a buffer finds no room in its class's slabs: a new slab; then,
- * once the sources had no memory for one, the process's own empty and cached slabs let go and a
- * new slab asked again; then, for a small buffer, region slabs half as large down to the buffer's
- * own rounded size. Only where no source has memory even for that is the answer nil: the region
- * is full. (Where the kext's block source places blocks, WindowServer's asks may take its
+ * once the sources had no memory for one, the process's own empty and cached slabs let go, the
+ * slabs other threads (the background's among them) were giving back at that moment waited for,
+ * and a new slab asked again; then, for a small buffer, region slabs half as large down to the
+ * buffer's own rounded size. Only where no source has memory even for that is the answer nil: the
+ * region is full. A slab being given back is out of the slabs' books and not yet back in its
+ * source's, for as long as its block's release takes, a host round trip: without the wait, one
+ * thread's let-go of a batch of slabs makes another's create nil while the memory is on its way
+ * back (measured on the M3 Max: test_slab_thread's 3 MiB takes refused in 8 of 1,000 runs under
+ * Rosetta, with 237 to 253 MiB of its 256 MiB source taken while the slabs held 61 to 150 MiB).
+ * (Where the kext's block source places blocks, WindowServer's asks may take its
  * reserve.) A slab whose heap the device never got (the kext's submit refused it) is nil at once.
  *
  * Thread-safe: Metal creates and frees buffers on the app's threads. Our own C++, free of
@@ -303,7 +309,7 @@ public:
 		uint64_t cachedSlabs = 0;  // dedicated slabs with no buffer, kept for reuse
 		uint64_t cachedBytes = 0;
 		uint64_t dirtyBytes = 0;   // free bytes not yet zeroed
-		uint64_t dooming = 0;      // slabs let go whose drop has not run yet
+		uint64_t dooming = 0;      // slabs let go whose memory is not yet back in its source
 		uint64_t usedBytes = 0;    // bytes taken by buffers
 		uint64_t firstSlabs = 0;   // of the slabs, those the first source made
 	};
@@ -350,8 +356,9 @@ public:
 	void give(const Range &range);
 
 	/// Lets every empty and cached slab go, with the doomed ones, where the source had no room
-	/// for another block of the process's (RgfxRegion::setReclaim): true where one went. Called
-	/// without the lock.
+	/// for another block of the process's (RgfxRegion::setReclaim), and waits for the slabs other
+	/// threads were giving back as it was called (waitForDrops): true where one went or came
+	/// back. Called without the lock.
 	bool reclaim();
 
 	/// Does one piece of the background's work (a drop, a piece zeroed, an idle cached slab let
@@ -433,8 +440,16 @@ private:
 	/// go first where `evict`: the process's own room given back before a create is refused.
 	/// Answers how many it dropped.
 	size_t dropDoomed(bool evict);
-	/// Gives a slab's heap and memory back, and frees it. Called without the lock.
+	/// Gives a slab's heap and memory back, and frees it, its serial in m_dropping meanwhile.
+	/// Called without the lock.
 	void drop(Slab *slab);
+	/// Waits until the slabs being given back (m_dropping) and the doomed ones (m_doomed) as this
+	/// is called are gone, their memory back in their sources (THE FALLBACKS): whether there were
+	/// any. Called without the lock, by a thread that is giving none back, after its own
+	/// dropDoomed(true). Those are the drops that call would have made itself had it come first,
+	/// on the same locks and the same host answers (the heap's destroy, the block's release), so
+	/// the wait holds its thread on nothing that call would not have.
+	bool waitForDrops();
 	/// Gives `range` back to its slab, its buffers' destroys all posted.
 	void giveBack(const Range &range);
 	/// The class of `options`. Caller holds the lock.
@@ -460,6 +475,8 @@ private:
 	Clock m_clock = nullptr;
 	void *m_clockContext = nullptr;
 	std::vector<Slab *> m_doomed;
+	std::set<uint64_t> m_dropping;           // serials of the slabs being given back (drop)
+	std::condition_variable m_dropped;       // a drop is done
 	std::set<Slab *, BySerial> m_dirtySlabs; // slabs with dirty free bytes
 	uint64_t m_nextSerial = 1;
 	std::thread m_thread;

@@ -136,7 +136,8 @@ public:
 
 	/// What the process keeps for reuse and can give back where the kext has no room: `reclaim`
 	/// lets go of such blocks (the buffers' empty and cached slabs, RgfxSlabs.hpp, and the
-	/// IOSurface views the keep holds, RgfxIOSurface.h) and answers whether it let any go, and
+	/// IOSurface views the keep holds, RgfxIOSurface.h), waits for the slabs another thread is
+	/// giving back at that moment (RgfxSlabs::reclaim), and answers whether any went, and
 	/// allocate() then asks the block source once more, so a block is refused only where the
 	/// process holds nothing it could give back; so does acquireSurfacePages where the kext had
 	/// no room (kPagesNoRoom). The surface sources' other refusals are not asked again: theirs

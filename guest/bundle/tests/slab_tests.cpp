@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -38,7 +39,9 @@ constexpr uint64_t kMiB = 1ull << 20;
 
 // Memory of the test's own, handed out first fit in units of `unitBytes` (16 KiB, as the region's),
 // every byte 0xee as it first comes, with a log of what the allocator asked of it, in order. Its
-// Shared classes are heaped where `heapedClasses`, as the region's are.
+// Shared classes are heaped where `heapedClasses`, as the region's are. A give waits while the
+// gate is shut (shut()), as a block's release waits for the host, and `held` counts the gives
+// that came to it.
 struct Source : RgfxSlabSource {
 	std::vector<uint8_t> raw;
 	uint8_t *base; // raw's first byte at a 16 KiB boundary
@@ -53,6 +56,10 @@ struct Source : RgfxSlabSource {
 	std::mutex lock;
 	std::vector<std::string> log;
 	uint64_t takes = 0, refusedTakes = 0, gives = 0, heaps = 0, heapDrops = 0;
+	std::mutex gateLock;
+	std::condition_variable gateMoved;
+	bool gateShut = false;
+	int held = 0;
 
 	explicit Source(uint64_t size, uint64_t unit = 0x4000)
 	    : raw(size + 0x4000, 0xee), bytes(size), free(size), unitBytes(unit)
@@ -87,6 +94,12 @@ struct Source : RgfxSlabSource {
 	}
 	void give(const Memory &memory) override
 	{
+		{
+			std::unique_lock<std::mutex> gate(gateLock);
+			held++;
+			gateMoved.notify_all();
+			gateMoved.wait(gate, [this] { return !gateShut; });
+		}
 		std::lock_guard<std::mutex> hold(lock);
 		gives++;
 		log.push_back("give " + std::to_string(memory.size));
@@ -118,6 +131,35 @@ struct Source : RgfxSlabSource {
 		out->gpuAddress = heap.objId != 0 ? heap.gpuAddress + offset : (gpu += 0x10000);
 		out->ownsAddress = heap.objId == 0;
 		return true;
+	}
+	void shut()
+	{
+		std::lock_guard<std::mutex> gate(gateLock);
+		gateShut = true;
+	}
+	void open()
+	{
+		{
+			std::lock_guard<std::mutex> gate(gateLock);
+			gateShut = false;
+		}
+		gateMoved.notify_all();
+	}
+	// Waits until `n` gives came to the gate.
+	void waitHeld(int n)
+	{
+		std::unique_lock<std::mutex> gate(gateLock);
+		gateMoved.wait(gate, [&] { return held >= n; });
+	}
+	uint64_t refusals()
+	{
+		std::lock_guard<std::mutex> hold(lock);
+		return refusedTakes;
+	}
+	uint64_t used()
+	{
+		std::lock_guard<std::mutex> hold(lock);
+		return free.used();
 	}
 	// Whether the last `n` entries of the log are `want`.
 	bool logEnds(const std::vector<std::string> &want)
@@ -624,6 +666,42 @@ void test_slab_thread()
 			std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	}
 	CHECK(settled && slabs.stats().usedBytes == 0);
+	// Every byte the source gave is a slab's.
+	CHECK(source.used() == slabs.stats().slabBytes);
+}
+
+// A create that finds no room waits for the slabs another thread is giving back as it asks, and
+// takes their memory once it is back, as long as its block's release takes (THE FALLBACKS): a
+// 3 MiB slab let go on one thread, its release held at the source, while another asks for 3 MiB
+// of a 4 MiB source. No background thread: the thread that lets a slab go drops it.
+void test_slab_take_waits_for_slabs_given_back()
+{
+	Source source(4 * kMiB);
+	RgfxSlabs slabs(source);
+	RgfxSlabs::Range first;
+	CHECK(slabs.take(3 * kMiB, kShared, 0, &first));
+	// Past the cache's cap (a sixteenth of the source), the slab goes as its buffer does.
+	source.shut();
+	std::thread giver([&] { slabs.give(first); });
+	source.waitHeld(1);
+	std::atomic<int> answer{-1};
+	RgfxSlabs::Range second;
+	std::thread taker([&] { answer = slabs.take(3 * kMiB, kShared, 0, &second) ? 1 : 0; });
+	// It found no room, and waits for the slab on its way back: no answer while it is held.
+	while (source.refusals() == 0)
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	for (int i = 0; i < 200 && answer == -1; i++)
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	CHECK(answer == -1);
+	// The slab on its way back is out of the slabs and counted as going.
+	CHECK(slabs.stats().slabs == 0 && slabs.stats().dooming == 1);
+	source.open();
+	taker.join();
+	giver.join();
+	CHECK(answer == 1 && second.size == 3 * kMiB && slabs.stats().dooming == 0);
+	CHECK(source.gives == 1 && source.used() == 3 * kMiB);
+	slabs.give(second);
+	CHECK(source.used() == 0 && slabs.stats().slabs == 0);
 }
 
 // Over the region: a Shared slab is a Placement heap over host memory at its block, each buffer a
@@ -677,17 +755,25 @@ void test_region_slab_source()
 	CHECK(!ring.next(&h, &bytes));
 }
 
-// A kext of the test's own: blocks first fit past the floor.
+// A kext of the test's own: blocks first fit past the floor. A release waits while the gate is
+// shut (shut()), as the kext's waits for the device's answer, and `held` counts the releases that
+// came to it.
 struct Kext {
 	RgfxHeapRanges free;
 	std::map<uint64_t, uint64_t> sizes; // each block's, by region offset
-	int reclaims = 0, reclaimed = 0;
+	std::atomic<int> reclaims{0}, reclaimed{0};
 	RgfxSlabs *slabs = nullptr;
+	std::mutex lock;
+	std::mutex gateLock;
+	std::condition_variable gateMoved;
+	bool gateShut = false;
+	int held = 0;
 
 	explicit Kext(uint64_t size) : free(size) {}
 	static bool alloc(void *context, uint64_t size, uint64_t align, uint64_t *offset)
 	{
 		Kext *k = static_cast<Kext *>(context);
+		std::lock_guard<std::mutex> hold(k->lock);
 		if (!k->free.take(size, align, offset))
 			return false;
 		*offset += RGFX_ALLOCATIONS_OFFSET;
@@ -697,6 +783,13 @@ struct Kext {
 	static void release(void *context, uint64_t offset)
 	{
 		Kext *k = static_cast<Kext *>(context);
+		{
+			std::unique_lock<std::mutex> gate(k->gateLock);
+			k->held++;
+			k->gateMoved.notify_all();
+			k->gateMoved.wait(gate, [k] { return !k->gateShut; });
+		}
+		std::lock_guard<std::mutex> hold(k->lock);
 		auto it = k->sizes.find(offset);
 		if (it == k->sizes.end())
 			return;
@@ -710,6 +803,25 @@ struct Kext {
 		const bool went = k->slabs != nullptr ? k->slabs->reclaim() : false;
 		k->reclaimed += went;
 		return went;
+	}
+	void shut()
+	{
+		std::lock_guard<std::mutex> gate(gateLock);
+		gateShut = true;
+	}
+	void open()
+	{
+		{
+			std::lock_guard<std::mutex> gate(gateLock);
+			gateShut = false;
+		}
+		gateMoved.notify_all();
+	}
+	// Waits until `n` releases came to the gate.
+	void waitHeld(int n)
+	{
+		std::unique_lock<std::mutex> gate(gateLock);
+		gateMoved.wait(gate, [&] { return held >= n; });
 	}
 };
 
@@ -759,6 +871,58 @@ void test_region_reclaims_slabs()
 	// The slabs' own blocks ask through the region too: a buffer past the room is nil.
 	RgfxSlabs::Range none;
 	CHECK(!slabs.take(16 * kMiB, kShared, 0, &none));
+}
+
+// A block the kext has no room for waits, in the region's reclaim, for the slab another thread is
+// giving back as it asks, and is placed in its room once its release is answered: a 3 MiB slab
+// let go on one thread, its block's release held at the kext, while another asks the region for
+// 2 MiB with 3 MiB of 8 MiB free only once that release is done. No background thread.
+void test_region_reclaim_waits_for_slabs_given_back()
+{
+	constexpr uint64_t kRoom = 8 * kMiB; // a cache of 512 KiB
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + kRoom, 0xee);
+	TestRing ring(0x8000);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	RgfxRegion region(mem.data(), mem.size());
+	Kext kext(kRoom);
+	region.setBlockSource(&Kext::alloc, &Kext::release, &kext);
+	region.setReclaim(&Kext::reclaim, &kext);
+	RgfxRegionSlabSource source(region, ser);
+	RgfxSlabs slabs(source);
+	kext.slabs = &slabs;
+	RgfxSlabs::Range big;
+	CHECK(slabs.take(3 * kMiB, kShared, 0, &big));
+	RgfxRegion::Block filler = region.allocate(5 * kMiB);
+	CHECK(filler.ok);
+	// Past the cache's cap, the slab goes as its buffer does, its release held.
+	kext.shut();
+	std::thread giver([&] { slabs.give(big); });
+	kext.waitHeld(1);
+	std::atomic<int> answer{-1};
+	RgfxRegion::Block block = {};
+	std::thread asker([&] {
+		block = region.allocate(2 * kMiB);
+		answer = block.ok ? 1 : 0;
+	});
+	while (kext.reclaims == 0)
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	for (int i = 0; i < 200 && answer == -1; i++)
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	CHECK(answer == -1);
+	kext.open();
+	asker.join();
+	giver.join();
+	CHECK(answer == 1 && kext.reclaims == 1 && kext.reclaimed == 1);
+	CHECK(slabs.stats().slabs == 0 && slabs.stats().dooming == 0);
+	region.release(block.offset);
+	region.release(filler.offset);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	while (ring.next(&h, &bytes)) {
+	}
 }
 
 // A kext of the test's own for the pages source: region blocks and pages blocks (16 KiB, which
@@ -1205,8 +1369,10 @@ void rgfxSlabTests()
 	test_slab_fallbacks();
 	test_slab_first_source();
 	test_slab_thread();
+	test_slab_take_waits_for_slabs_given_back();
 	test_region_slab_source();
 	test_region_reclaims_slabs();
+	test_region_reclaim_waits_for_slabs_given_back();
 	test_pages_slab_source();
 	test_pages_slab_source_chunks();
 	test_managed_buffers_over_shared_copies();

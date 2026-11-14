@@ -534,6 +534,7 @@ bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *ou
 		Slab *made = fromEither();
 		if (made == nullptr && !refused) {
 			dropDoomed(true);
+			waitForDrops();
 			made = fromEither();
 		}
 		while (made == nullptr && !refused && !dedicated && ask > least) {
@@ -681,10 +682,36 @@ void RgfxSlabs::giveBack(const Range &range)
 
 void RgfxSlabs::drop(Slab *slab)
 {
+	const uint64_t serial = slab->serial;
 	if (slab->heap.objId != 0)
 		slab->source->dropHeap(slab->heap);
 	slab->source->give(slab->memory);
 	delete slab;
+	{
+		std::lock_guard<std::mutex> hold(m_lock);
+		m_dropping.erase(serial);
+	}
+	m_dropped.notify_all();
+}
+
+bool RgfxSlabs::waitForDrops()
+{
+	std::unique_lock<std::mutex> hold(m_lock);
+	std::set<uint64_t> waited = m_dropping;
+	for (const Slab *slab : m_doomed)
+		waited.insert(slab->serial); // dropped by the background once its piece is zeroed
+	m_dropped.wait(hold, [&] {
+		for (uint64_t serial : waited) {
+			if (m_dropping.count(serial) != 0)
+				return false;
+		}
+		for (const Slab *slab : m_doomed) {
+			if (waited.count(slab->serial) != 0)
+				return false;
+		}
+		return true;
+	});
+	return !waited.empty();
 }
 
 uint64_t RgfxSlabs::cachedBytesOf(const RgfxSlabSource *source) const
@@ -699,7 +726,9 @@ uint64_t RgfxSlabs::cachedBytesOf(const RgfxSlabSource *source) const
 
 bool RgfxSlabs::reclaim()
 {
-	return dropDoomed(true) != 0;
+	const bool dropped = dropDoomed(true) != 0;
+	const bool waited = waitForDrops();
+	return dropped || waited;
 }
 
 size_t RgfxSlabs::dropDoomed(bool evict)
@@ -724,6 +753,7 @@ size_t RgfxSlabs::dropDoomed(bool evict)
 		for (auto it = m_doomed.begin(); it != m_doomed.end();) {
 			if ((*it)->zeroing == 0) {
 				drops.push_back(*it);
+				m_dropping.insert((*it)->serial);
 				m_all.erase(*it);
 				it = m_doomed.erase(it);
 			} else {
@@ -752,6 +782,7 @@ bool RgfxSlabs::step()
 		for (auto it = m_doomed.begin(); it != m_doomed.end(); ++it) {
 			if ((*it)->zeroing == 0) {
 				drops = *it;
+				m_dropping.insert(drops->serial);
 				m_all.erase(drops);
 				m_doomed.erase(it);
 				break;
@@ -872,6 +903,6 @@ RgfxSlabs::Stats RgfxSlabs::stats()
 	}
 	out.cachedSlabs = m_cached.size();
 	out.cachedBytes = m_cachedBytes;
-	out.dooming = m_doomed.size();
+	out.dooming = m_doomed.size() + m_dropping.size();
 	return out;
 }
