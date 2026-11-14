@@ -2169,11 +2169,19 @@ buffer's wait ends with neither a ring-0 thread's wake before the job nor its
 own after it. A queue's destroy routes the queue's doorbell and ends a queue's
 thread, and the other kinds may wait long or for a queue's command buffers, so
 each stays with the lane's thread. Measured before the change in Geekbench
-7.1's Super Resolution on the Radeon 780M (a macOS 26.7.2 guest): 4172 of 6823
-command buffers waited so, 62.6 us at the median and 190 us at the 90th
-percentile from the take to the host's begin, 12 and 38.5 us of it the queue's
-thread's wake after the lane's last job; 96% of them waited only for those two
-kinds. Tested by `a_buffer_s_thread_carries_out_the_creates_and_destroys_it_waits_for`,
+7.1's Super Resolution on the Radeon 780M (a macOS 26.7.2 guest, development
+cee5813f2's timed pass, 19.19 s): 3480 of 6289 command buffers waited so, 30.2
+us at the median and 87.5 us at the 90th percentile from the take to the gate's
+end, 138 ms in all. Each waited only for those two kinds, 6 jobs at the median
+that ran in 17.5 us, and 8.8 us at the median went on the queue's thread's wake
+after the last of them. 56% of them found a ring-0 thread already carrying one
+out at the take, which carries the rest on as before. For the others, carried
+out on the trace's own times with the wakes taken away, the waits shrink by 42.5
+ms over the workload (45.5 ms in the warm pass), 0.2% of it: under a walk's
+run-to-run spread (about 0.5%), so the change was not walked apart. A wait
+without sleeping before the gate was measured against the same trace and
+dropped: it saves only the queue's thread's own wake, at most 17 ms over the
+workload for 34 ms of a core spinning. Tested by `a_buffer_s_thread_carries_out_the_creates_and_destroys_it_waits_for`,
 `a_buffer_s_thread_leaves_other_kinds_to_the_lane_s_thread`,
 `only_a_buffer_at_offset_and_a_destroy_of_no_queue_are_a_buffer_s_thread_s` and
 `buffers_wait_for_their_context_s_messages_over_random_interleavings`.
