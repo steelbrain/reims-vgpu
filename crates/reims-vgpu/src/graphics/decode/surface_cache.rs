@@ -9714,9 +9714,7 @@ mod tests {
         blit_with(&mut r, 0x101, true, slices(12, 11));
         let calls = r.p.call_log().since(mark);
         let fences: Vec<(&str, Option<u64>)> = (calls.iter())
-            .filter(|c| {
-                ["updateFence:", "waitForFence:", "endEncoding", COPY].contains(&c.sel)
-            })
+            .filter(|c| ["updateFence:", "waitForFence:", "endEncoding", COPY].contains(&c.sel))
             .map(|c| (c.sel, c.args.first().and_then(|a| a.as_obj()).map(|o| o.0)))
             .collect();
         let fence = fences
@@ -9729,8 +9727,16 @@ mod tests {
         want.extend([COPY; 8]);
         want.push("endEncoding");
         assert_eq!(sels, want);
-        assert_eq!(fences[2].1, Some(fence), "the copy waits for the writer's fence");
-        assert_eq!(copies(&calls), vec![(cache, home); 8], "the cache's rows into the home");
+        assert_eq!(
+            fences[2].1,
+            Some(fence),
+            "the copy waits for the writer's fence"
+        );
+        assert_eq!(
+            copies(&calls),
+            vec![(cache, home); 8],
+            "the cache's rows into the home"
+        );
     }
 
     /// A blit that reads the texture past the plane's texels and writes the one of the plane's
