@@ -316,9 +316,41 @@ struct Tables<P: Platform> {
     clock: u64,
     /// The open views, by the clock at which each was taken: how many at each.
     views: BTreeMap<u64, usize>,
+    /// The region spans the live entries lie over ([`Entry::span`]), each with how many lie over
+    /// it: what [`Context::span_in`] looks through, a few keys about the range it asks of, where
+    /// the entries themselves are thousands. It cannot go stale: an entry's span is counted where
+    /// the entry goes into `live` ([`Context::insert`], [`Context::insert_if`]) and taken out where
+    /// it leaves ([`Self::retire`], which every removal from `live` goes through: a remove, a make
+    /// over its id again, a close's removal of every entry), each under the table's write lock with
+    /// the change itself, and a span is set at the entry's make and never changed while it is in
+    /// the table (the module doc). A context dropped takes its spans with it.
+    spans: BTreeMap<(u64, u64), usize>,
+    /// The longest span `spans` ever counted: how far before a range a span that reaches into it
+    /// may start.
+    longest: u64,
 }
 
 impl<P: Platform> Tables<P> {
+    /// Counts `span`, a live entry's, in [`Self::spans`].
+    fn count_span(&mut self, span: Option<(u64, u64)>) {
+        if let Some(span) = span {
+            *self.spans.entry(span).or_default() += 1;
+            self.longest = self.longest.max(span.1);
+        }
+    }
+
+    /// Takes `span`, an entry's that leaves the live ones, out of [`Self::spans`].
+    fn uncount_span(&mut self, span: Option<(u64, u64)>) {
+        if let Some(span) = span
+            && let Some(n) = self.spans.get_mut(&span)
+        {
+            *n -= 1;
+            if *n == 0 {
+                self.spans.remove(&span);
+            }
+        }
+    }
+
     /// The entry of `id` a view taken at `at` sees: in the table and made by then, else removed
     /// since and made by then.
     fn find(&self, id: u64, at: u64) -> Option<NonNull<Entry<P>>> {
@@ -334,6 +366,7 @@ impl<P: Platform> Tables<P> {
     /// view was taken before this), else handed back to let go of.
     fn retire(&mut self, id: u64, owned: Owned<P>) -> Option<Removed<P>> {
         self.clock += 1;
+        self.uncount_span(owned.entry().span);
         let removed = Removed { id, owned };
         if self
             .views
@@ -398,6 +431,8 @@ impl<P: Platform> Context<P> {
                 gone: Vec::new(),
                 clock: 0,
                 views: BTreeMap::new(),
+                spans: BTreeMap::new(),
+                longest: 0,
             }),
             drain: Mutex::new(Arc::default()),
             managed_recoveries: Mutex::new(0),
@@ -413,6 +448,7 @@ impl<P: Platform> Context<P> {
         t.clock += 1;
         entry.made = t.clock;
         entry.seen = seen_from.map_or(t.clock, |at| at.min(t.clock));
+        t.count_span(entry.span);
         let owned = Owned::new(entry);
         let at = owned.0;
         let replaced = t.live.insert(id, owned).and_then(|old| t.retire(id, old));
@@ -435,6 +471,7 @@ impl<P: Platform> Context<P> {
         t.clock += 1;
         entry.made = t.clock;
         entry.seen = seen_from.map_or(t.clock, |at| at.min(t.clock));
+        t.count_span(entry.span);
         let owned = Owned::new(entry);
         let at = owned.0;
         let replaced = t.live.insert(id, owned).and_then(|old| t.retire(id, old));
@@ -467,15 +504,15 @@ impl<P: Platform> Context<P> {
         (out, count)
     }
 
-    /// Whether any entry in the table lies in the `size` bytes at region offset `offset`.
+    /// Whether any entry in the table lies in the `size` bytes at region offset `offset`: a span
+    /// the live entries lie over that starts before the range ends and ends past its start, looked
+    /// for among those that start no further before it than the longest span counted.
     pub(crate) fn span_in(&self, offset: u64, size: u64) -> bool {
         let end = offset.saturating_add(size);
         let t = self.tables.read();
-        t.live.values().any(|o| {
-            o.entry()
-                .span
-                .is_some_and(|(at, length)| at < end && offset < at.saturating_add(length))
-        })
+        let from = offset.saturating_sub(t.longest);
+        (t.spans.range((from, 0)..(end, 0)))
+            .any(|(&(at, length), _)| offset < at.saturating_add(length))
     }
 
     /// Calls `f` with each entry the table holds now, with its id, under its read lock: what a
@@ -866,7 +903,7 @@ mod tests {
     /// Through random makes, makes over an id again, removes and a close's removal of every
     /// entry, with views open over some of them, whether an entry lies in a range answers what a
     /// look at every live entry's span answers: spans of blocks apart, of one block shared by the
-    /// objects placed in it, of no bytes, and ranges of no bytes, over, across and beside them
+    /// objects placed in it, of no bytes, and ranges of no bytes, over, across and beside them; and the index of spans holds the live entries' spans, recounted from them at each step
     #[test]
     fn span_in_answers_as_a_look_at_every_live_entry() {
         let p = FakePlatform::new();
@@ -913,6 +950,15 @@ mod tests {
                 _ if round % 500 == 0 => let_go(ctx.remove_all().0),
                 _ => {}
             }
+            // The index holds the live entries' spans, each counted as many times as entries lie
+            // over it.
+            let mut counted: BTreeMap<(u64, u64), usize> = BTreeMap::new();
+            ctx.for_each_live(|_, e| {
+                if let Some(span) = e.span {
+                    *counted.entry(span).or_default() += 1;
+                }
+            });
+            assert_eq!(ctx.tables.read().spans, counted, "the index of spans");
             for _ in 0..4 {
                 let (offset, size) = (0xf000 + next(40) * 0x800, next(4) * 0x800);
                 assert_eq!(
