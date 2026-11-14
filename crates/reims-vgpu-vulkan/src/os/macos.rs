@@ -39,7 +39,7 @@ use self::iosurface::{MacSurface, MacSurfaces};
 use self::threads::MacThreads;
 use self::vm::MacVm;
 
-use super::{MadeOver, READ_ONLY_DIRECTION, page_runs};
+use super::{MadeOver, page_runs};
 use crate::platform::VulkanPlatform;
 
 pub(crate) use drawables::Drawables;
@@ -598,15 +598,8 @@ impl ClientPages {
     }
 
     /// Records `surface`, made over `pages` (host first byte and length of each), its bytes
-    /// `offset` bytes into its allocation, the GPU's writes through it reaching them unless
-    /// `gpu_read_only`.
-    fn record(
-        &mut self,
-        surface: &MacSurface,
-        pages: &[(u64, u64)],
-        offset: u64,
-        gpu_read_only: bool,
-    ) {
+    /// `offset` bytes into its allocation.
+    fn record(&mut self, surface: &MacSurface, pages: &[(u64, u64)], offset: u64) {
         let Some(key) = key(surface) else {
             return;
         };
@@ -621,7 +614,6 @@ impl ClientPages {
             MadeOver {
                 pages: runs,
                 offset,
-                gpu_read_only,
                 alias: Weak::new(),
             },
         );
@@ -643,8 +635,7 @@ fn alive(id: u32) -> bool {
 
 /// `IOSurfaceCreate` and `[[IOSurface alloc] initWithProperties:]`: [`iosurface`]'s. A surface
 /// made over the guest's pages, or at an offset into its allocation, is recorded with them
-/// ([`crate::os::surface_memory`], [`crate::os::surface_offset`]), and with whether the GPU's
-/// writes through it reach them ([`crate::os::gpu_read_only`]); every lookup of it answers the
+/// ([`crate::os::surface_memory`], [`crate::os::surface_offset`]); every lookup of it answers the
 /// record too. Each surface made here drops the record of a surface gone that had its ID.
 #[derive(Debug, Default)]
 pub struct VulkanSurfaces(MacSurfaces);
@@ -665,9 +656,7 @@ impl IoSurfaces<VulkanPlatform> for VulkanSurfaces {
             let pages: Vec<(u64, u64)> = (spec.client_address_ranges.iter().flatten())
                 .map(|r| (r.physical_address, r.physical_length))
                 .collect();
-            let gpu_read_only = spec.client_address_ranges.is_some()
-                && spec.client_direction == Some(READ_ONLY_DIRECTION);
-            recorded.record(&made, &pages, spec.offset, gpu_read_only);
+            recorded.record(&made, &pages, spec.offset);
         }
         drop(recorded);
         Some(made)

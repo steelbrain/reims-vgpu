@@ -93,9 +93,8 @@ pub(crate) use wsi::seen_devices;
 pub use wsi::{add_window_extensions, present_fences};
 
 pub(crate) use surface::{
-    MadeOver, READ_ONLY_DIRECTION, base_in_pages, dropped_write, gpu_read_only, memory_kind,
-    page_runs, plane, plane_facts, surface_alias, surface_bytes_memory, surface_memory,
-    surface_offset, write_surface_bytes, ycbcr_facts,
+    MadeOver, memory_kind, page_runs, plane, plane_facts, surface_alias, surface_bytes_memory,
+    surface_memory, surface_offset, ycbcr_facts,
 };
 
 /// One range of the guest's RAM as the host maps it, and the file behind it: `length` bytes at

@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Weak};
 
-use crate::core::num::{ToU64, ToUsize};
+use crate::core::num::ToU64;
 use crate::core::platform::os::surface::Surface;
 use metal2vulkan_runtime as rt;
 
@@ -15,10 +15,7 @@ use crate::gpu::backing::Alias;
 /// Plane `plane` of `surface`, as a texture on it reads it: its bytes' offset from the surface's
 /// base address, its bytes per row, and whether the surface has planes. A surface without planes
 /// is its plane 0. `None` for a plane the surface lacks, of which Metal makes no texture
-/// (`textures_backing_records`). The plane names no `kIOSurfaceClientDirection`, which the
-/// runtime refuses: where the GPU's writes through a surface never reach its memory
-/// ([`gpu_read_only`]), the buffer under the texture lies over a read-only alias of that memory
-/// (the device's `buffer_over_surface_at`), and the GPU's writes never reach it there either.
+/// (`textures_backing_records`).
 pub(crate) fn plane(surface: &OsSurface, plane: u64) -> Option<rt::IoSurfacePlane> {
     if surface.plane_count() == 0 {
         return (plane == 0).then(|| rt::IoSurfacePlane::new(0, surface.bytes_per_row(), false));
@@ -140,73 +137,14 @@ pub(crate) fn over_guest_pages(surface: &OsSurface) -> bool {
     recorded(surface, |made| !made.pages.is_empty()).unwrap_or(false)
 }
 
-/// The `kIOSurfaceClientDirection` of a surface core makes over the guest's pages read-only for
-/// its clients (core's `iosurface::descriptor`).
-pub(crate) const READ_ONLY_DIRECTION: u32 = 2;
-
-/// Whether the GPU's writes through `surface` never reach its memory: it was made over the
-/// guest's pages with `kIOSurfaceClientDirection` 2, which Metal maps read-only for the GPU.
-///
-/// Measured on the M3 Max (macOS 26.7, one case per process, BGRA8Unorm surfaces of 64 by 16, 256
-/// by 256 and 1024 by 1024 texels, `tests/client_direction.rs`): through a texture on such a
-/// surface, a blit's copy or colour fill and a kernel's writes of one or two texels reach the later
-/// commands of their command buffer and never the pages, which later command buffers and the CPU
-/// read unchanged; of a row of 64 texels or more, they fail the command buffer with a GPU page
-/// fault (`MTLCommandBufferErrorPageFault`), the encoders after them running nothing. So does a
-/// blit's copy of a texture of a row of 64 texels into a buffer made on the surface with
-/// `newBufferWithIOSurface:`, where one of two texels is dropped as above. A blit's copy from a
-/// buffer or colour fill of 1 to 8 texels each way into the texture is dropped at every origin
-/// tried (0,0, 1,1 and one far inside, on surfaces of 64 by 16 and 256 by 256 texels); of a row of
-/// 16 to 63 texels it faults at some origins and is dropped at others (16 at 0,0 faults, at 1,1 is
-/// dropped). A blit's fill of a buffer made on the surface, its copy into one from another buffer,
-/// a kernel's stores into one, plain or by an atomic exchange, and a vertex or fragment function's,
-/// of 8 bytes to 4 MiB, are dropped as above, the later commands of the command buffer reading what
-/// of the write the GPU's caches still hold (all of 4 MiB with nothing else on the GPU, less beside
-/// other GPU work, none after 64 MiB of it; a draw's, all, part or none of it, case to case, in one
-/// process). A render pass that clears it or draws into it and stores fails its command buffer so;
-/// one that stores nothing, or loads, stores and draws nothing, completes, writing nothing.
-/// `replaceRegion:` writes through the surface's base address: the page of a surface over one page,
-/// which lies there; a surface over several (4, 16 and 256) has a mapping of its own there,
-/// read-only, and the write ends the process with a bus error, at every extent measured
-/// ([`base_in_pages`]). The key is not read back (`IOSurfaceCopyValue` answers none), so the
-/// surfaces made here record it. A surface of its own memory takes the key and the GPU's writes
-/// alike; one over the guest's pages takes 3 and the writes land, and none of 0, 1, 4 or 255
-/// (`IOSurfaceCreate` answers NULL); core sets 2 alone.
-pub(crate) fn gpu_read_only(surface: &OsSurface) -> bool {
-    recorded(surface, |made| made.gpu_read_only).unwrap_or(false)
-}
-
-/// Dies at `sel`, a command that may write `what` into the memory of a surface whose GPU writes
-/// never reach it ([`gpu_read_only`]): Metal's GPU drops some such writes and faults the command
-/// buffer at others by their extent, which nothing here can tell before the GPU runs the
-/// command, and the runtime's device loses itself at the same fault, so the write is never sent.
-/// A blit's fill of a buffer made on the surface, its copy into one from another buffer, and a
-/// kernel's, vertex function's or fragment function's stores into one, which Metal drops at
-/// every extent measured, as the runtime does, are sent; a tile function's, which nothing
-/// measured, are not. So is a blit's copy from a buffer or colour fill into a `BGRA8Unorm` 2D
-/// texture made on the surface, of 1 to 8 texels each way inside level 0, on a surface whose rows
-/// hold 256 bytes or more, which Metal drops at every origin measured
-/// (`gpu::encode_blit::dropped_where_measured`).
-pub(crate) fn dropped_write(sel: &'static str, what: &str) -> ! {
-    crate::answer::unrepresentable(
-        sel,
-        &format!(
-            "{what} a surface made read-only for the GPU (kIOSurfaceClientDirection 2), whose \
-             writes Metal's GPU drops or faults on by their extent"
-        ),
-    )
-}
-
-/// The alias of the allocation of `surface`, one at an offset into it ([`surface_offset`]) or
-/// whose GPU writes never reach its memory, read-only then ([`gpu_read_only`]), that every buffer
-/// over it lies over while one lives: the live one, or a new one, kept for the next: the surface's
-/// own view of the guest's pages where it has one (Linux's stand-in over several ranges of them,
-/// `own_alias`), borrowed, and otherwise the one `make` makes; `None` where `make` makes none.
-/// The buffers then lie in one import of the runtime's, as those over a surface at no offset
-/// whose writes land lie over its base address: a write through one reaches the later commands
-/// of its command buffer that read another, as on Metal (`tests/client_direction.rs`), and a
-/// buffer over the surface can share the range of another over the same first byte (the device's
-/// `new_buffer_on_surface`).
+/// The alias of the allocation of `surface`, one at an offset into it ([`surface_offset`]), that
+/// every buffer over it lies over while one lives: the live one, or a new one, kept for the next:
+/// the surface's own view of the guest's pages where it has one (Linux's stand-in over several
+/// ranges of them, `own_alias`), borrowed, and otherwise the one `make` makes; `None` where `make`
+/// makes none. The buffers then lie in one import of the runtime's, as those over a surface at no
+/// offset lie over its base address: a write through one reaches the later commands of its command
+/// buffer that read another, as on Metal, and a buffer over the surface can share the range of
+/// another over the same first byte (the device's `new_buffer_on_surface`).
 pub(crate) fn surface_alias(
     surface: &OsSurface,
     make: impl FnOnce() -> Option<Alias>,
@@ -228,8 +166,7 @@ pub(crate) fn surface_alias(
 
 /// Whether `surface`'s base address lies in the guest's pages it was made over, so that the CPU's
 /// writes through it reach them: as for a surface over one page; one over several, contiguous or
-/// not, has a mapping of its own (measured on the M3 Max: one of 4 contiguous pages), read-only
-/// for a surface of [`gpu_read_only`].
+/// not, has a mapping of its own (measured on the M3 Max: one of 4 contiguous pages).
 pub(crate) fn base_in_pages(surface: &OsSurface) -> bool {
     let base = surface.base_address().as_ptr::<u8>().addr().to_u64();
     recorded(surface, |made| {
@@ -253,43 +190,6 @@ pub(crate) fn memory_kind(surface: &OsSurface) -> &'static str {
     }
 }
 
-/// Writes `bytes` at `offset` in the bytes of `surface`, counted from its first byte, into the
-/// guest's pages it was made over, where those bytes lie (from its `kIOSurfaceOffset` in the
-/// pages, in their order): what the CPU writes through Metal's texture on such a surface
-/// reaches (`replaceRegion:`, measured: `tests/client_direction.rs`). False, writing nothing,
-/// for a surface not made over the guest's pages, and for bytes past them.
-pub(crate) fn write_surface_bytes(surface: &OsSurface, offset: u64, bytes: &[u8]) -> bool {
-    let Some(held) = recorded(surface, |made| {
-        let first = made.offset.saturating_add(offset);
-        in_runs(
-            &made.pages,
-            &(first..first.saturating_add(bytes.len().to_u64())),
-        )
-    }) else {
-        return false;
-    };
-    let total: u64 = held.iter().map(|r| r.end - r.start).sum();
-    if total != bytes.len().to_u64() {
-        return false;
-    }
-    let mut from = bytes;
-    for run in held {
-        let (now, rest) = from.split_at((run.end - run.start).to_usize());
-        // SAFETY: `run` lies in the guest's pages the surface was made over, which the host maps
-        // readable and writable while the surface lives, as core holds them; `now` is the
-        // caller's, apart from them.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                now.as_ptr(),
-                std::ptr::with_exposed_provenance_mut::<u8>(run.start.to_usize()),
-                now.len(),
-            );
-        }
-        from = rest;
-    }
-    true
-}
-
 /// What the OS's record of `surface` holds, read by `read`; `None` for a surface it did not
 /// record.
 fn recorded<T>(surface: &OsSurface, read: impl FnOnce(&MadeOver) -> T) -> Option<T> {
@@ -297,14 +197,12 @@ fn recorded<T>(surface: &OsSurface, read: impl FnOnce(&MadeOver) -> T) -> Option
 }
 
 /// What a surface was made over: the guest's pages, in its bytes' order, merged into runs, and
-/// its bytes' offset into its allocation (`kIOSurfaceOffset`); whether the GPU's writes through
-/// it never reach them ([`gpu_read_only`]), the alias of its allocation its buffers lie over
-/// while one lives, where they lie over one ([`surface_alias`]).
+/// its bytes' offset into its allocation (`kIOSurfaceOffset`); the alias of its allocation its
+/// buffers lie over while one lives, where they lie over one ([`surface_alias`]).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MadeOver {
     pub(crate) pages: Vec<std::ops::Range<u64>>,
     pub(crate) offset: u64,
-    pub(crate) gpu_read_only: bool,
     pub(crate) alias: Weak<Alias>,
 }
 
@@ -411,8 +309,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// A lookup of a surface (`lookup_by_port`), a reference
-    /// of its own, answers what the surface was made over: its offset, memory and GPU writes
+    /// A lookup of a surface (`lookup_by_port`), a reference of its own, answers what the surface
+    /// was made over: its offset and memory
     #[test]
     fn a_lookup_of_a_surface_answers_its_record() {
         let (s, pages, length) = bgra_surface_over_at(16, 16, 0x100);
@@ -420,30 +318,7 @@ pub(crate) mod tests {
         assert_ne!(t.id(), s.id());
         assert_eq!(surface_offset(&t), 0x100);
         assert_eq!(surface_memory(&t), surface_memory(&s));
-        let page = OsVm::new().page_size();
-        let guest = allocate_aliasable(page).unwrap();
-        let spec = SurfaceSpec {
-            pixel_format: u32::from_be_bytes(*b"BGRA"),
-            alloc_size: page,
-            width: 16,
-            height: 16,
-            bytes_per_element: 4,
-            bytes_per_row: 64,
-            element_width: 1,
-            element_height: 1,
-            client_direction: Some(READ_ONLY_DIRECTION),
-            client_address_ranges: Some(vec![PhysicalMemoryRange {
-                physical_address: guest.addr().to_u64(),
-                physical_length: page,
-            }]),
-            ..SurfaceSpec::default()
-        };
-        let read_only = OsSurfaces::new().create(&spec).unwrap();
-        let looked_up = read_only.lookup_by_port().unwrap();
-        assert!(gpu_read_only(&read_only) && gpu_read_only(&looked_up));
-        assert!(!gpu_read_only(&s) && !gpu_read_only(&t));
-        drop((t, s, looked_up, read_only));
+        drop((t, s));
         free(pages, length);
-        free(guest, page);
     }
 }

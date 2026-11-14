@@ -1366,9 +1366,9 @@ struct Unit {
     encoders: u64,
     bindings: Bindings,
     used: Vec<Use>,
-    /// Whether a texture `used` holds lies on a surface whose GPU writes never reach its memory,
-    /// or is one whose writes the runtime refuses ([`Unit::reaches_dropped_texels`]), which a
-    /// texture answers alike for its life: asked once, as it is made resident.
+    /// Whether a texture `used` holds is one whose writes the runtime refuses
+    /// ([`Unit::reaches_dropped_texels`]), which a texture answers alike for its life: asked
+    /// once, as it is made resident.
     used_dropped: bool,
     /// Whether the runtime encoder holds a pipeline the guest did not set.
     foreign: bool,
@@ -1583,9 +1583,8 @@ impl Unit {
         }
     }
 
-    /// Whether a texture the open encoder's next work binds or made resident lies on a surface
-    /// whose GPU writes never reach its memory ([`crate::os::gpu_read_only`]). A kernel's stores
-    /// into a buffer on one are dropped, as on Metal, and are sent ([`crate::os::dropped_write`]).
+    /// Whether a texture the open encoder's next work binds or made resident is one whose writes
+    /// the runtime refuses ([`drops_texels`]).
     fn reaches_dropped_texels(&self) -> bool {
         self.used_dropped || self.bindings.textures.values().any(drops_texels)
     }
@@ -1653,64 +1652,6 @@ impl Unit {
         written
     }
 
-    /// How the open encoder's next work, `inherits` what an execution's commands take of the
-    /// encoder, writes through an object over read-only memory whose writes this platform does
-    /// not answer as Metal's GPU does ([`crate::gpu::writes::kept_write`]): a surface's the
-    /// runtime twins; the first found: a texture
-    /// bound at a slot its kernel writes, as [`Self::texel_writes`] reads them; a buffer bound at
-    /// a slot the kernel writes, by its slot writes (every slot where they cannot tell, and
-    /// every bound buffer an execution's commands take where they run pipeline states of their
-    /// own); and a texture or buffer made resident with write usage (a heap made resident is
-    /// read, as Metal's are). `None` where it writes none, and where no pipeline state is set for
-    /// it, which the runtime refuses.
-    ///
-    /// A kernel's write of a texture over read-only memory the runtime copies is sent: the copy
-    /// drops it, as Metal's GPU drops a kernel's `write()` of a texture over such memory and
-    /// completes the dispatch (measured on the M3 Max, macOS 27.0.1, metal2vulkan's
-    /// `probes/readonly_gpu_writes.m`; the runtime's `read_only_view.rs` and `copied.rs`).
-    fn kept_write_through(&self, inherits: Option<Inherits>) -> Option<Whether> {
-        use crate::gpu::writes::{buffer_kept, texture_twinned};
-        let kernel = match inherits {
-            Some(i) if !i.pipeline => None,
-            _ => Some(self.bindings.pipeline.as_ref()?),
-        };
-        let at = |texture: bool, slot: u32, untold: bool| match kernel {
-            Some(k) => Whether::Slot(
-                Arc::clone(&k.reflection),
-                Slot {
-                    stage: 0,
-                    texture,
-                    slot: u64::from(slot),
-                    untold,
-                },
-            ),
-            None => Whether::Writes,
-        };
-        let mut written = Vec::new();
-        if inherits.is_none_or(|i| i.pipeline) {
-            let writes_textures = kernel.is_some_and(|k| plain(|| k.raw.writes_textures()));
-            let textures = (self.bindings.textures.iter()).filter(|(_, t)| texture_twinned(t));
-            written.extend(textures.map(|(&slot, _)| at(true, slot, writes_textures)));
-        }
-        if inherits.is_none_or(|i| i.buffers) {
-            let buffers = (self.bindings.buffers.iter()).filter(|(_, (b, ..))| buffer_kept(b));
-            written.extend(buffers.map(|(&slot, _)| at(false, slot, true)));
-        }
-        for u in &self.used {
-            if let Use::Resources(list, usage) = u
-                && usage.contains(ResourceUsage::WRITE)
-                && list.iter().any(|r| match r {
-                    Resource::Texture(t) => texture_twinned(t),
-                    Resource::Buffer(b) => buffer_kept(b),
-                    Resource::Icb(_) => false,
-                })
-            {
-                written.push(Whether::Writes);
-            }
-        }
-        written.into_iter().find(Whether::holds)
-    }
-
     /// The runtime encoder's bindings moved to `to`, which the guest's become.
     fn rebind(&mut self, enc: &VulkanComputeEncoder, sel: &'static str, to: Bindings) {
         made(sel, || {
@@ -1752,10 +1693,9 @@ impl Unit {
     }
 }
 
-/// Whether `t` lies on a surface whose GPU writes never reach its memory, or is one whose writes
-/// the runtime refuses ([`Unit::reaches_dropped_texels`]).
+/// Whether `t` is a texture whose writes the runtime refuses ([`Unit::reaches_dropped_texels`]).
 fn drops_texels(t: &VulkanTexture) -> bool {
-    t.gpu_read_only() || t.writes_refused()
+    t.writes_refused()
 }
 
 /// `id<MTLComputeCommandEncoder>`'s object: the runtime's encoder, with its command buffer's
@@ -2161,33 +2101,19 @@ pub fn work(enc: &VulkanComputeEncoder, sel: &'static str, work: Work<'_>) -> Ra
     }
     // An execution of no command runs nothing: it writes and samples nothing.
     let empty = matches!(&work, Work::Execute { range, .. } if range.is_empty());
-    // A write through an object over read-only memory whose writes this platform does not answer
-    // as Metal's GPU does dies, at every extent; with no such object, none is looked for. A
+    // A write of a 4:4:4 two-plane YCbCr texture whose writes the runtime refuses dies. A
     // kernel's stores into a buffer over read-only memory the runtime copies, and its writes of a
     // texture over such memory, are sent, and dropped, as Metal drops them.
-    if crate::os::TWINS_READ_ONLY
-        && !empty
-        && crate::gpu::writes::any_kept()
-        && let Some(whether) = u.kept_write_through(work.inherits())
-    {
-        drop(u);
-        let what = format!("a dispatch's write through {}, into", whether.through());
-        crate::gpu::writes::kept_write(sel, &what);
-    }
-    // A write of a texture on a surface whose GPU writes never reach its memory dies, and so does
-    // one of a 4:4:4 two-plane YCbCr texture whose writes the runtime refuses; a kernel's stores
-    // into a buffer on such a surface are sent and dropped, as Metal drops them.
     if !empty && u.reaches_dropped_texels() {
         let written = u.texel_writes(work.inherits());
-        let hit = (written.iter()).find(|(w, m)| (m.dropped || m.refused.is_some()) && w.holds());
-        if let Some((whether, m)) = hit {
-            let (through, refused) = (whether.through(), m.refused.filter(|_| !m.dropped));
+        let hit = (written.iter()).find(|(w, m)| m.refused.is_some() && w.holds());
+        if let Some((whether, m)) = hit
+            && let Some(pf) = m.refused
+        {
+            let through = whether.through();
             drop(u);
-            let what = format!("a dispatch's write through {through}");
-            match refused {
-                None => crate::os::dropped_write(sel, &format!("{what}, on")),
-                Some(pf) => crate::gpu::ycbcr::refused_write(sel, &format!("{what}, into"), pf),
-            }
+            let what = format!("a dispatch's write through {through}, into");
+            crate::gpu::ycbcr::refused_write(sel, &what, pf);
         }
     }
     if u.foreign && u.bindings.pipeline.is_none() {

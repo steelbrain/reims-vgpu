@@ -461,66 +461,6 @@ fn fill_place(
     ))
 }
 
-/// What a blit `cmd` writes: its destination's memory, as a bind keeps it
-/// ([`crate::gpu::writes::Bound`]).
-fn written_memory(cmd: &BlitCmd<'_, VulkanPlatform>) -> crate::gpu::writes::Bound {
-    use crate::gpu::writes::{buffer_bound, texture_bound};
-    let texture = |t: Option<&VulkanTexture>| t.map(|t| texture_bound(t)).unwrap_or_default();
-    let buffer = |b: Option<&crate::gpu::resource::VulkanBuffer>| {
-        b.map(|b| buffer_bound(b)).unwrap_or_default()
-    };
-    match cmd {
-        BlitCmd::CopyBufferToTexture {
-            destination_texture,
-            ..
-        }
-        | BlitCmd::CopyTextureRegion {
-            destination_texture,
-            ..
-        }
-        | BlitCmd::CopyTextureRegionOptions {
-            destination_texture,
-            ..
-        }
-        | BlitCmd::CopyTextureSlices {
-            destination_texture,
-            ..
-        } => texture(Some(destination_texture)),
-        BlitCmd::CopyBufferToTextureOptions {
-            destination_texture,
-            ..
-        } => texture(*destination_texture),
-        BlitCmd::CopyBufferToBuffer {
-            destination_buffer, ..
-        }
-        | BlitCmd::CopyTextureToBufferOptions {
-            destination_buffer, ..
-        } => buffer(*destination_buffer),
-        BlitCmd::CopyTextureToBuffer {
-            destination_buffer, ..
-        } => buffer(Some(destination_buffer)),
-        BlitCmd::FillBuffer { buffer: b, .. } | BlitCmd::FillBufferPattern4 { buffer: b, .. } => {
-            buffer(Some(b))
-        }
-        BlitCmd::FillTexture { texture: t, .. }
-        | BlitCmd::FillTextureColor { texture: t, .. }
-        | BlitCmd::InvalidateCompressedTexture { texture: t }
-        | BlitCmd::InvalidateCompressedTextureSlice { texture: t, .. } => texture(Some(t)),
-        BlitCmd::GenerateMipmaps { texture: t } => texture(*t),
-        _ => Default::default(),
-    }
-}
-
-/// Whether Metal's GPU drops `cmd`'s write into a surface whose GPU writes never reach its
-/// memory at every extent measured, as this platform's does, which sends it: a fill of a buffer
-/// on the surface, and a copy into one from another buffer (`crate::os::dropped_write`).
-fn dropped_at_every_extent(cmd: &BlitCmd<'_, VulkanPlatform>) -> bool {
-    matches!(
-        cmd,
-        BlitCmd::FillBuffer { .. } | BlitCmd::CopyBufferToBuffer { .. }
-    )
-}
-
 /// The most commands past an indirect command buffer's end a copy was measured to write
 /// ([`overrun_measured`]).
 const OVERRUN_MEASURED: u64 = 63;
@@ -542,80 +482,6 @@ fn overrun_measured(
     into: Option<crate::gpu::icb::OverrunShape>,
 ) -> bool {
     into.is_some() && from == (into, size) && count <= size && to < size && past <= OVERRUN_MEASURED
-}
-
-/// The widest and tallest region of a blit into a texture made on a surface whose GPU writes
-/// never reach its memory that Metal's GPU was measured to drop at every origin
-/// ([`dropped_where_measured`]).
-const DROPPED_EXTENT: u64 = 8;
-
-/// The fewest bytes a row of such a surface held where Metal's GPU was measured to drop those
-/// blits ([`dropped_where_measured`]).
-const DROPPED_ROW_BYTES: u64 = 256;
-
-/// Whether Metal's GPU drops `cmd`, a blit's copy from a buffer or colour fill into a texture
-/// made on a surface whose GPU writes never reach its memory, where it was measured to, as this
-/// platform's does, which sends it: into a `BGRA8Unorm` 2D texture made on the surface (not a
-/// view), at level 0 and slice 0, a region inside the level of 1 to 8 texels each way, on a
-/// surface whose rows hold 256 bytes or more. Measured on this host (macOS 26.7, M3 Max, one case
-/// a process, two runs: `tests/client_direction.rs`'s `sweep`), on surfaces of 64 by 16 and 256
-/// by 256 texels at origins 0,0, 1,1 and 40,10 or 150,200: every region of 1 to 8 texels each way
-/// was dropped, the command buffer completing and the guest's pages unchanged. A row of 16 texels
-/// or more faults the command buffer at some origins (16 at 0,0, 24 at 40,10, 32 at 1,1) and is
-/// dropped at others; a region of more than 8 rows, a smaller surface, another format and every
-/// other blit into such a texture were not measured, and die ([`crate::os::dropped_write`]).
-fn dropped_where_measured(cmd: &BlitCmd<'_, VulkanPlatform>) -> bool {
-    let (texture, level, slice, region) = match cmd {
-        BlitCmd::CopyBufferToTexture {
-            destination_texture,
-            destination_slice,
-            destination_level,
-            destination_origin,
-            source_size,
-            ..
-        } => (
-            *destination_texture,
-            *destination_level,
-            *destination_slice,
-            MtlRegion {
-                origin: *destination_origin,
-                size: *source_size,
-            },
-        ),
-        BlitCmd::FillTextureColor {
-            texture,
-            level,
-            slice,
-            region,
-            ..
-        } => (*texture, *level, *slice, *region),
-        _ => return false,
-    };
-    let Some(plane) = texture.plane.filter(|_| texture.surface.is_some()) else {
-        return false;
-    };
-    let (format, ty, width, height, view) = plain(|| {
-        let raw = &texture.raw;
-        (
-            raw.pixel_format(),
-            raw.texture_type(),
-            raw.width(),
-            raw.height(),
-            raw.parent_texture().is_some(),
-        )
-    });
-    let (origin, size) = (region.origin, region.size);
-    let inside = |at: u64, extent: u64, end: u64| {
-        (1..=DROPPED_EXTENT).contains(&extent) && at.checked_add(extent).is_some_and(|e| e <= end)
-    };
-    format == metal2vulkan::metal::PixelFormat::BGRA8Unorm
-        && ty == metal2vulkan::metal::TextureType::Type2D
-        && !view
-        && (level, slice) == (0, 0)
-        && (origin.z, size.depth) == (0, 1)
-        && inside(origin.x, size.width, width)
-        && inside(origin.y, size.height, height)
-        && plane.bytes_per_row >= DROPPED_ROW_BYTES
 }
 
 /// What the line of a refused copy between a buffer and `texture` names of it: the texture's
@@ -745,19 +611,11 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
     /// ([`FirstUse::TilerBlit`]).
     fn encode(&self, _on: OnFault, cmd: BlitCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
-        let written = written_memory(&cmd);
         if let Some(options) = self.aborts {
             metal_aborts(
                 sel,
                 &format!("a blit encoder's first command under protection options {options}"),
             );
-        }
-        if written.kept.lands() {
-            crate::gpu::writes::kept_write(sel, "a blit's write into");
-        }
-        let dropped = written.dropped;
-        if dropped && !dropped_at_every_extent(&cmd) && !dropped_where_measured(&cmd) {
-            crate::os::dropped_write(sel, "a blit's write into");
         }
         match &cmd {
             BlitCmd::EndEncoding => {}

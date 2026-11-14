@@ -279,8 +279,8 @@ use crate::gpu::icb::{Inherits, VulkanIcb};
 use crate::gpu::rate_map::Class;
 use crate::gpu::resource::{MeshAnswers, RenderDescriptor, VulkanBuffer, VulkanTexture};
 use crate::gpu::writes::{
-    Bound, DRAWING_STAGES, FRAGMENT, Kept, MESH, OBJECT, RENDER_STAGES, Reflected, Reflection,
-    Slot, TILE, VERTEX, Whether,
+    Bound, DRAWING_STAGES, FRAGMENT, MESH, OBJECT, RENDER_STAGES, Reflected, Reflection, Slot,
+    TILE, VERTEX, Whether,
 };
 use crate::gpu::{listed, metal_value, region, size};
 use crate::platform::{Obj, VulkanPlatform};
@@ -419,10 +419,11 @@ pub struct RenderEncoderObject {
     /// ([`VulkanRenderEncoder::resolves_beside_dropped`]).
     dropped: Vec<Dropped>,
     /// The attachments whose store action the descriptor left `Unknown` and no late setter has
-    /// decided yet, each with why a resolve into the resolve texture it names now, the
-    /// descriptor's or a late resolve setter's, is never sent ([`Unsent`]): a late store action
-    /// that resolves into such a one dies ([`VulkanRenderEncoder::late_store`]).
-    undecided: Mutex<Vec<(Attachment, Option<Unsent>)>>,
+    /// decided yet, each with whether the resolve texture it names now, the descriptor's or a
+    /// late resolve setter's, lies over read-only memory the runtime copies
+    /// ([`crate::gpu::writes::texture_kept`]): a late store action that resolves into such a one
+    /// faults the command buffer, or dies ([`VulkanRenderEncoder::late_store`]).
+    undecided: Mutex<Vec<(Attachment, bool)>>,
     /// The attachments of [`Self::undecided`] whose texture lies over read-only memory the
     /// runtime copies: a late store action that keeps such a one ([`faults_over`]) fails the
     /// command buffer as Metal's GPU faults it ([`VulkanRenderEncoder::read_only_stores`]).
@@ -1007,91 +1008,43 @@ fn refused_resolve_format(
     })
 }
 
-/// The attachments of `d` with a texture whose store action is `Unknown`, each with `None`,
-/// which [`VulkanRenderEncoder::undecided_dropped`] sets where a resolve into its resolve texture
-/// is never sent ([`Unsent`]).
-fn undecided(d: &rt::RenderPassDescriptor) -> Vec<(Attachment, Option<Unsent>)> {
+/// The attachments of `d` with a texture whose store action is `Unknown`, each with `false`,
+/// which [`VulkanRenderEncoder::undecided_dropped`] sets where its resolve texture lies over
+/// read-only memory the runtime copies.
+fn undecided(d: &rt::RenderPassDescriptor) -> Vec<(Attachment, bool)> {
     let unknown = |t: &Option<rt::Texture>, store| t.is_some() && store == rt::StoreAction::Unknown;
     let colors = (0u32..).zip(&d.color_attachments);
     let mut out: Vec<_> = colors
         .filter(|(_, c)| unknown(&c.texture, c.store_action))
-        .map(|(i, _)| (Attachment::Color(i), None))
+        .map(|(i, _)| (Attachment::Color(i), false))
         .collect();
     if unknown(&d.depth_attachment.texture, d.depth_attachment.store_action) {
-        out.push((Attachment::Depth, None));
+        out.push((Attachment::Depth, false));
     }
     if unknown(
         &d.stencil_attachment.texture,
         d.stencil_attachment.store_action,
     ) {
-        out.push((Attachment::Stencil, None));
+        out.push((Attachment::Stencil, false));
     }
     out
 }
 
-/// Why a pass's resolve into a texture is never sent as it stands: its memory is read-only, which
-/// the runtime imports through a writable twin of a surface's pages, where the write would land
-/// ([`crate::gpu::writes::kept_write`]), or copies, where only a resolve Metal's GPU faults is
-/// sent ([`faults_into`]), or it lies on a surface whose GPU writes never reach its memory
-/// ([`crate::os::dropped_write`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Unsent {
-    /// Over a surface's read-only memory, which the runtime imports through a writable twin.
-    Kept,
-    /// On a surface whose GPU writes never reach its memory.
-    Dropped,
-    /// Over read-only memory the runtime copies: a late resolve into it that Metal's GPU faults
-    /// ([`faults_into`]) faults the command buffer, as Metal's does, and a depth attachment's
-    /// `StoreAndMultisampleResolve`, which the runtime faults where Metal's GPU completes it,
-    /// dies ([`VulkanRenderEncoder::late_store`], [`VulkanRenderEncoder::late_resolve`]).
-    Copied,
-}
-
-impl Unsent {
-    /// Why a resolve into `t` is never sent as it stands, if it is not: the twin first, which the
-    /// write would reach.
-    fn of(t: &VulkanTexture) -> Option<Unsent> {
-        if crate::gpu::writes::texture_twinned(t) {
-            Some(Unsent::Kept)
-        } else if crate::gpu::writes::texture_kept(t) {
-            Some(Unsent::Copied)
-        } else if t.gpu_read_only() {
-            Some(Unsent::Dropped)
-        } else {
-            None
-        }
-    }
-
-    /// Dies at `sel`, `what` naming a write into a texture, which the death names it lies in.
-    fn dies(self, sel: &'static str, what: &str) -> ! {
-        match self {
-            Unsent::Kept | Unsent::Copied => {
-                crate::gpu::writes::kept_write(sel, &format!("{what} over"))
-            }
-            Unsent::Dropped => crate::os::dropped_write(sel, &format!("{what} on")),
-        }
-    }
-}
-
 /// What a pass of `d` may write in read-only memory whose writes this platform does not answer
 /// as Metal's GPU does ([`crate::gpu::writes::kept_write`]), as `sources` says of its
-/// attachments: an attachment's texture over a surface's memory the runtime twins, whatever the
-/// pass's load and store actions, as the runtime's GPU may write the texels of one it loads and
-/// stores unchanged, or whose store it does not care for, which Vulkan leaves undefined; a
-/// resolve texture over such memory that its known store action resolves into; and a depth
-/// attachment's `StoreAndMultisampleResolve` into a resolve texture over read-only memory the
-/// runtime copies, which the runtime faults where Metal's GPU completes it ([`faults_into`]).
-/// `None` for none. Another attachment over memory the runtime copies, and another resolve into
-/// such a texture, are answered by the store action, which may fault the command buffer as
-/// Metal's GPU does ([`faults_over`], [`faults_into`], [`VulkanRenderEncoder::read_only_stores`]).
-/// A colour or stencil attachment that the descriptor keeps by `CustomSampleDepthStore`, over any
-/// memory, goes to the runtime, which refuses it, so the pass dies at its making, as plain Metal
-/// ends the process in its descriptor's validation ("storeAction is not a valid MTLStoreAction",
-/// `abort()`), with bit 24 or without, on the M3 Max under macOS 27.0.1 and the Radeon Pro 5300M
-/// and UHD Graphics 630 under macOS 26.7.1 (m3-max-29292, m3-max-29293, m3-max-29294). A resolve
-/// texture of an attachment whose store action is `Unknown` is written only where a late store
-/// action resolves into it ([`VulkanRenderEncoder::late_store`]), and a visibility result buffer
-/// only where a mode is set ([`Reach::visibility`]).
+/// attachments: a depth attachment's `StoreAndMultisampleResolve` into a resolve texture over
+/// read-only memory the runtime copies, which the runtime faults where Metal's GPU completes it
+/// ([`faults_into`]). `None` for none. Another attachment over memory the runtime copies, and
+/// another resolve into such a texture, are answered by the store action, which may fault the
+/// command buffer as Metal's GPU does ([`faults_over`], [`faults_into`],
+/// [`VulkanRenderEncoder::read_only_stores`]). A colour or stencil attachment that the descriptor
+/// keeps by `CustomSampleDepthStore`, over any memory, goes to the runtime, which refuses it, so
+/// the pass dies at its making, as plain Metal ends the process in its descriptor's validation
+/// ("storeAction is not a valid MTLStoreAction", `abort()`), with bit 24 or without, on the M3 Max
+/// under macOS 27.0.1 and the Radeon Pro 5300M and UHD Graphics 630 under macOS 26.7.1
+/// (m3-max-29292, m3-max-29293, m3-max-29294). A resolve texture of an attachment whose store
+/// action is `Unknown` is written only where a late store action resolves into it
+/// ([`VulkanRenderEncoder::late_store`]).
 fn kept_attachment(d: &rt::RenderPassDescriptor, sources: &Sources) -> Option<&'static str> {
     let (depth, stencil) = (&d.depth_attachment, &d.stencil_attachment);
     let colors = (0u32..).zip(&d.color_attachments);
@@ -1101,33 +1054,15 @@ fn kept_attachment(d: &rt::RenderPassDescriptor, sources: &Sources) -> Option<&'
         (Attachment::Stencil, stencil.store_action),
     ]);
     let held = (sources.color.iter()).chain([&sources.depth, &sources.stencil]);
-    for ((attachment, store), [texture, resolve]) in stores.zip(held) {
-        if texture.twinned() {
+    for ((attachment, store), [_, resolve]) in stores.zip(held) {
+        if store.resolves() && resolve.writes_kept() && !faults_into(attachment, store) {
             return Some(
-                "a pass, which the runtime's GPU may write whatever its load and store actions, \
-                 whose attachment lies over",
+                "a pass whose depth attachment's StoreAndMultisampleResolve, which the runtime \
+                 faults where Metal's GPU completes it, resolves into a texture over",
             );
-        }
-        if store.resolves()
-            && resolve.writes_kept()
-            && !(over_read_only_copy(resolve) && faults_into(attachment, store))
-        {
-            return Some(resolve_dies(attachment, store));
         }
     }
     None
-}
-
-/// What a death names of a resolve by `attachment`'s `store` into a texture over read-only memory
-/// that [`faults_into`] does not answer: a depth attachment's `StoreAndMultisampleResolve`, which
-/// the runtime faults where Metal's GPU completes it, or a resolve into a surface's twin.
-fn resolve_dies(attachment: Attachment, store: rt::StoreAction) -> &'static str {
-    if attachment == Attachment::Depth && store == rt::StoreAction::StoreAndMultisampleResolve {
-        "a pass whose depth attachment's StoreAndMultisampleResolve, which the runtime faults \
-         where Metal's GPU completes it, resolves into a texture over"
-    } else {
-        "a pass that resolves into a texture over"
-    }
 }
 
 /// Whether a pass's store action `store` keeps an attachment's texels in its memory: `Store`, and
@@ -1182,9 +1117,9 @@ fn faults_into(attachment: Attachment, store: rt::StoreAction) -> bool {
 }
 
 /// Whether `texture`, an attachment's, lies in read-only memory the runtime copies, dropping the
-/// GPU's writes: read-only and not a surface's twin ([`crate::gpu::writes::Kept::Copied`]).
+/// GPU's writes ([`crate::gpu::writes::Kept::Copied`]).
 fn over_read_only_copy(texture: &Source) -> bool {
-    texture.writes_kept() && !texture.twinned()
+    texture.writes_kept()
 }
 
 /// What [`metal_aborts`] says of a pass without attachments whose `defaultRasterSampleCount` is
@@ -1256,31 +1191,6 @@ fn metal_aborts_at(d: &rt::RenderPassDescriptor) -> Option<&'static str> {
     None
 }
 
-/// What a pass of `d` writes in the memory of a surface whose GPU writes never reach it
-/// ([`crate::os::dropped_write`]), as `sources` says of its attachments: an attachment's
-/// texture, a resolve texture its known store action resolves into, or its visibility result
-/// buffer; `None` for none. A resolve texture of an attachment whose store action is `Unknown`
-/// is written only where a late store action resolves into it
-/// ([`VulkanRenderEncoder::late_store`]).
-fn dropped_attachment(d: &rt::RenderPassDescriptor, sources: &Sources) -> Option<&'static str> {
-    let (depth, stencil) = (&d.depth_attachment, &d.stencil_attachment);
-    let colors = d.color_attachments.iter().map(|a| a.store_action);
-    let stores = colors.chain([depth.store_action, stencil.store_action]);
-    let held = (sources.color.iter()).chain([&sources.depth, &sources.stencil]);
-    for (store, [texture, resolve]) in stores.zip(held) {
-        if texture.gpu_read_only() {
-            return Some("a pass whose attachment lies on");
-        }
-        if store.resolves() && resolve.gpu_read_only() {
-            return Some("a pass that resolves into a texture on");
-        }
-    }
-    let visibility = sources.visibility.as_ref();
-    visibility
-        .is_some_and(|b| b.gpu_read_only())
-        .then_some("a pass whose visibility result buffer lies on")
-}
-
 /// `id<MTLRenderCommandEncoder>`.
 pub type VulkanRenderEncoder = Obj<RenderEncoderObject>;
 
@@ -1298,26 +1208,18 @@ pub type VulkanRenderEncoder = Obj<RenderEncoderObject>;
 /// for the 32 by 32 tiles that none of the draws reach of a pass that loads a texture of
 /// rotation 4 and draws, which Metal keeps in place and the runtime lands mirrored as the others
 /// (`rotated-load-tiles`, [`crate::gpu::desc`]), so such a pass dies at `endEncoding`, naming
-/// the kind; a pass that draws nothing is Metal's. One whose attachment lies over read-only
-/// memory the runtime twins, or whose resolve texture it resolves into lies over read-only
-/// memory, dies first ([`kept_attachment`]), but a resolve into memory the runtime copies that
+/// the kind; a pass that draws nothing is Metal's. One whose resolve texture it resolves into lies
+/// over read-only memory the runtime copies dies first ([`kept_attachment`]), but a resolve that
 /// Metal's GPU faults ([`faults_into`]); that one, and one that stores an attachment over
 /// read-only memory the runtime copies (a depth attachment's `CustomSampleDepthStore` among
 /// them), fail the command buffer as Metal's GPU faults it
-/// ([`VulkanRenderEncoder::read_only_stores`]).
-/// One whose attachment, resolve texture or visibility result buffer lies on a surface whose GPU
-/// writes never reach its memory dies ([`crate::os::dropped_write`]): Metal faults the command
-/// buffer of such a pass that stores what it cleared or drew, and completes one that stores
-/// nothing, or draws nothing. A clear to a NaN is the runtime's, which stores Metal's bits, and
-/// so is its resolve (`rgbx`'s `nan_clears_are_metals`).
-/// A colour attachment that resolves into a texture of another format the runtime refuses is
-/// made without the resolve where plain Metal was measured to leave the texture untouched, in
-/// the shapes measured ([`untouched_resolves`]), and dies naming both formats and what plain
-/// Metal was measured to do otherwise ([`refused_resolve_format`]), both decided by the rate map
-/// the pass takes, as it takes it; the pairs the runtime decides itself are its own
-/// ([`runtime_resolves`]). A resolve texture on
-/// a surface whose GPU writes never reach its memory dies as a dropped write before that, as no
-/// such pass was measured.
+/// ([`VulkanRenderEncoder::read_only_stores`]). A clear to a NaN is the runtime's, which stores
+/// Metal's bits, and so is its resolve (`rgbx`'s `nan_clears_are_metals`). A colour attachment that
+/// resolves into a texture of another format the runtime refuses is made without the resolve where
+/// plain Metal was measured to leave the texture untouched, in the shapes measured
+/// ([`untouched_resolves`]), and dies naming both formats and what plain Metal was measured to do
+/// otherwise ([`refused_resolve_format`]), both decided by the rate map the pass takes, as it takes
+/// it; the pairs the runtime decides itself are its own ([`runtime_resolves`]).
 pub(crate) fn open(
     command_buffer: &VulkanCommandBuffer,
     _on: OnFault,
@@ -1335,13 +1237,10 @@ pub(crate) fn open(
     }
     let (d, map) = descriptor.pass();
     let sources = descriptor.sources();
-    if crate::os::TWINS_READ_ONLY
+    if crate::os::COPIES_READ_ONLY
         && let Some(what) = kept_attachment(&d, &sources)
     {
         crate::gpu::writes::kept_write("renderCommandEncoderWithDescriptor:", what);
-    }
-    if let Some(what) = dropped_attachment(&d, &sources) {
-        crate::os::dropped_write("renderCommandEncoderWithDescriptor:", what);
     }
     // The colour resolves into a texture of another format, decided by the rate map the pass
     // takes, as it takes it.
@@ -1374,9 +1273,6 @@ pub(crate) fn open(
     if let Ok(Some(e)) = &made {
         e.undecided_dropped(&sources);
         e.read_only_stores(&sources);
-        let visibility = (sources.visibility.as_ref())
-            .map_or(Kept::No, |b| crate::gpu::writes::buffer_bound(b).kept);
-        plain(|| e.drawing.lock().borrow_mut().reach.visibility = visibility);
     }
     made
 }
@@ -1543,12 +1439,6 @@ struct Reach {
     used_textures: Vec<Bound>,
     /// The buffers made resident with write usage, likewise.
     used_buffers: Vec<Bound>,
-    /// Whether the pass's visibility result buffer lies over read-only memory the runtime imports
-    /// through a writable twin of its pages (a surface's): a mode other than `Disabled` dies, as
-    /// the pass writes a result at its offset, a draw after it or not
-    /// ([`crate::gpu::writes::kept_write`]). One over read-only memory the runtime copies keeps
-    /// nothing: the result is dropped, as Metal drops it.
-    visibility: Kept,
     /// The reflection of the pipeline state set, which this holds as Metal's encoder holds the
     /// state, and whether its functions write textures, which tells which texture slots they
     /// may write where its slot writes cannot: the vertex and mesh functions' where they write
@@ -1556,14 +1446,11 @@ struct Reach {
     pipeline: Option<(Arc<Reflection>, [bool; RENDER_STAGES])>,
 }
 
-/// Whether a bind's `m` can decide what a draw asks of it ([`Reach::kept`], [`Reach::unsent`]):
-/// it lies over a surface's read-only memory the runtime twins, where the draw's writes would
-/// land ([`Kept::lands`]), on a surface whose GPU writes never reach its memory, or is a texture
+/// Whether a bind's `m` can decide what a draw asks of it ([`Reach::unsent`]): it is a texture
 /// whose writes the runtime refuses. A draw asks nothing of any other: a draw's writes of a
-/// texture over read-only memory the runtime copies are sent, and dropped by the copy
-/// ([`Reach::kept`]).
+/// texture over read-only memory the runtime copies are sent, and dropped by the copy.
 fn matters(m: &Bound) -> bool {
-    m.kept.lands() || m.dropped || m.refused.is_some()
+    m.refused.is_some()
 }
 
 /// Whether a slot's bind of `m` is held by the reach ([`Reach::bind_one`]): it lies in memory
@@ -1593,13 +1480,6 @@ fn quiet_bind_decides(bind: &Bind<'_>) -> bool {
             *write && textures.iter().chain(buffers).any(matters)
         }
     }
-}
-
-/// Whether a draw's write through `m` is never sent where it lies on a surface whose GPU writes
-/// never reach its memory, or into a texture whose writes the runtime refuses
-/// ([`VulkanRenderEncoder::issues`]).
-fn unsendable(m: &Bound) -> bool {
-    m.dropped || m.refused.is_some()
 }
 
 impl Reach {
@@ -1641,70 +1521,30 @@ impl Reach {
     }
 
     /// Whether it holds nothing a draw asks of: no bind at a slot and nothing made resident that
-    /// decides anything ([`matters`]), so [`Self::kept`] and [`Self::unsent_dropped`] find
-    /// nothing, whatever the pipeline state. Most passes bind only plain memory, and stay so.
+    /// decides anything ([`matters`]), so [`Self::unsent_refused`] finds nothing, whatever the
+    /// pipeline state. Most passes bind only plain memory, and stay so.
     fn quiet(&self) -> bool {
         (self.buffers.iter().chain(&self.textures)).all(BTreeMap::is_empty)
             && self.used_textures.is_empty()
             && self.used_buffers.is_empty()
     }
 
-    /// Whether a texture bound or made resident for writing, or a buffer bound to the tile,
-    /// object or mesh stage, lies on a surface whose GPU writes never reach its memory
-    /// ([`crate::os::gpu_read_only`]), or is a texture whose writes the runtime refuses. A vertex
-    /// or fragment function's stores into a buffer on one are dropped, as on Metal, and are sent
-    /// ([`crate::os::dropped_write`]); an object or mesh function's, which nothing measured, are
-    /// not, as a tile function's.
-    fn unsent_dropped(&self) -> bool {
-        let unsent_buffers = [TILE, OBJECT, MESH].map(|stage| &self.buffers[stage]);
-        let bound = (self.textures.iter().chain(unsent_buffers)).flat_map(BTreeMap::values);
-        bound.chain(&self.used_textures).any(unsendable)
+    /// Whether a texture bound or made resident for writing is one whose writes the runtime
+    /// refuses.
+    fn unsent_refused(&self) -> bool {
+        let bound = self.textures.iter().flat_map(BTreeMap::values);
+        bound.chain(&self.used_textures).any(matters)
     }
 
     /// What a draw, a tile dispatch, or an execution whose commands take `inherits` of the
-    /// encoder, may write that is never sent where it lies on a surface whose GPU writes never
-    /// reach its memory, or into a texture whose writes the runtime refuses ([`unsendable`],
-    /// [`VulkanRenderEncoder::issues`]): the textures made resident with write usage, then the
-    /// textures bound at the slots the pipeline state's functions write, and, but for an
-    /// execution, whose commands run no tile, object or mesh function, the buffers bound at the
-    /// slots those functions write.
+    /// encoder, may write that is never sent, a texture whose writes the runtime refuses
+    /// ([`matters`], [`VulkanRenderEncoder::issues`]): the textures made resident with write
+    /// usage, then the textures bound at the slots the pipeline state's functions write.
     fn unsent(&self, inherits: Option<Inherits>) -> Vec<(Whether, Bound)> {
-        let used = (self.used_textures.iter()).filter(|m| unsendable(m));
+        let used = (self.used_textures.iter()).filter(|m| matters(m));
         let mut written: Vec<_> = used.map(|m| (Whether::Writes, m.clone())).collect();
-        let own = inherits.is_none();
-        let buffers = [false, false, own, own, own];
-        written.extend(self.at_slots(inherits, buffers, unsendable));
+        written.extend(self.at_slots(inherits, [false; RENDER_STAGES], matters));
         written
-    }
-
-    /// How a draw, a tile dispatch, or an execution whose commands take `inherits` of the encoder,
-    /// writes through an object over read-only memory whose writes this platform does not answer
-    /// as Metal's GPU does ([`crate::gpu::writes::kept_write`]): a surface's the runtime twins,
-    /// where the writes would land ([`Kept::lands`]), the first found: a texture or buffer
-    /// made resident with write usage, and, as [`Self::at_slots`] reads them, a texture bound at
-    /// a slot a function writes and a buffer bound at one, of every stage, but for an execution,
-    /// whose commands run no tile, object or mesh function and take the encoder's buffers only
-    /// where they inherit them. `None` where it writes none.
-    ///
-    /// A draw's write of a texture over read-only memory the runtime copies is sent, and the copy
-    /// drops it, the command buffer completing. Metal's GPUs differ there, so the envelope holds
-    /// both answers and this platform takes the cheaper: the Radeon Pro 5300M and UHD Graphics 630
-    /// under macOS 26.7.1 complete a fragment or vertex function's `write()` of a texture over a
-    /// bit-24 buffer, writing the pages (bit 24 changes nothing there), and complete one over pages
-    /// the process maps read-only, the pages unchanged; the M3 Max under macOS 27.0.1 fails the
-    /// command buffer with a page fault over either, every run, as at a pass's store
-    /// (m3-max-29292 to m3-max-29294, m3-max-29309 to m3-max-29311). A texture made resident for
-    /// writing that no function writes completes on all three.
-    fn kept(&self, inherits: Option<Inherits>) -> Option<Whether> {
-        let mut used = (self.used_textures.iter()).chain(&self.used_buffers);
-        if used.any(|m| m.kept.lands()) {
-            return Some(Whether::Writes);
-        }
-        let (buffers, own) = (inherits.is_none_or(|i| i.buffers), inherits.is_none());
-        let slots = self.at_slots(inherits, [buffers, buffers, own, own, own], |m| {
-            m.kept.lands()
-        });
-        slots.into_iter().map(|(w, _)| w).find(Whether::holds)
     }
 
     /// What a draw, or an execution whose commands take `inherits` of the encoder, may write at the
@@ -2191,43 +2031,29 @@ impl VulkanRenderEncoder {
     }
 
     /// Dies at `sel`, a draw, a tile dispatch or an execution the encoder issues, `inherits` what
-    /// its commands take of the encoder, where it may write the memory of a surface whose GPU
-    /// writes never reach it through a texture, one the pass binds at a slot a function writes,
-    /// by its slot writes, or one made resident for writing, or through a buffer the tile function
-    /// writes, which nothing measured ([`Reach::unsent`], [`crate::os::dropped_write`]), naming
-    /// how ([`Whether::through`]). A vertex or fragment function's stores into a buffer on such a
-    /// surface are sent, and dropped as on Metal. Before that, it dies where it may write through
-    /// an object over read-only memory whose writes this platform does not answer as Metal's GPU
-    /// does ([`Reach::kept`], [`crate::gpu::writes::kept_write`]); a write through a buffer or a
-    /// texture over read-only memory the runtime copies is sent, and dropped by the copy.
-    /// One that issues nothing, which Metal writes nothing of, is not asked. A pass that holds
-    /// nothing a draw asks of ([`Reach::quiet`]) finds nothing.
+    /// its commands take of the encoder, where it may write a texture whose writes the runtime
+    /// refuses, one the pass binds at a slot a function writes, by its slot writes, or one made
+    /// resident for writing ([`Reach::unsent`], [`crate::gpu::ycbcr::refused_write`]), naming how
+    /// ([`Whether::through`]). A write through a buffer or a texture over read-only memory the
+    /// runtime copies is sent, and dropped by the copy. One that issues nothing, which Metal
+    /// writes nothing of, is not asked. A pass that holds nothing a draw asks of
+    /// ([`Reach::quiet`]) finds nothing.
     fn issues(&self, sel: &'static str, inherits: Option<Inherits>) {
         if self.quiet.load(Ordering::Acquire) {
             return;
         }
-        let (kept, written) = plain(|| {
+        let written = plain(|| {
             let locked = self.drawing.lock();
             let drawing = locked.borrow();
             let reach = &drawing.reach;
-            let kept = (crate::os::TWINS_READ_ONLY)
-                .then(|| reach.kept(inherits))
-                .flatten();
-            let written =
-                (kept.is_none() && reach.unsent_dropped()).then(|| reach.unsent(inherits));
-            (kept, written)
+            reach.unsent_refused().then(|| reach.unsent(inherits))
         });
-        if let Some(whether) = kept {
+        let hit = (written.iter().flatten()).find(|(w, m)| matters(m) && w.holds());
+        if let Some((whether, m)) = hit
+            && let Some(pf) = m.refused
+        {
             let what = format!("a draw's write through {}, into", whether.through());
-            crate::gpu::writes::kept_write(sel, &what);
-        }
-        let hit = (written.iter().flatten()).find(|(w, m)| unsendable(m) && w.holds());
-        if let Some((whether, m)) = hit {
-            let what = format!("a draw's write through {}", whether.through());
-            match m.refused.filter(|_| !m.dropped) {
-                None => crate::os::dropped_write(sel, &format!("{what}, on")),
-                Some(pf) => crate::gpu::ycbcr::refused_write(sel, &format!("{what}, into"), pf),
-            }
+            crate::gpu::ycbcr::refused_write(sel, &what, pf);
         }
     }
 
@@ -3674,14 +3500,6 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let mode = rt::VisibilityResultMode::from_raw(mode).unwrap_or_else(|_| {
                     unrepresentable(sel, &format!("visibility result mode {mode}"))
                 });
-                if mode != rt::VisibilityResultMode::Disabled
-                    && plain(|| self.drawing.lock().borrow().reach.visibility.holds())
-                {
-                    crate::gpu::writes::kept_write(
-                        sel,
-                        "a visibility result mode whose result the pass writes into a buffer over",
-                    );
-                }
                 encoded(&mut |e| e.set_visibility_result_mode(mode, offset))
             }
             RenderCmd::UpdateFence { fence, stages } => {
@@ -3870,11 +3688,11 @@ impl VulkanRenderEncoder {
         }
     }
 
-    /// Marks each undecided attachment ([`Self::late_store`]) with why a resolve into its resolve
-    /// texture, as `sources` holds the pass descriptor's, is never sent as it stands ([`Unsent`]).
+    /// Marks each undecided attachment ([`Self::late_store`]) with whether its resolve texture, as
+    /// `sources` holds the pass descriptor's, lies over read-only memory the runtime copies.
     fn undecided_dropped(&self, sources: &Sources) {
         plain(|| {
-            for (a, unsent) in self.undecided.lock().iter_mut() {
+            for (a, copied) in self.undecided.lock().iter_mut() {
                 let resolve = match *a {
                     Attachment::Color(i) => usize::try_from(i)
                         .ok()
@@ -3883,7 +3701,7 @@ impl VulkanRenderEncoder {
                     Attachment::Depth => Some(&sources.depth[1]),
                     Attachment::Stencil => Some(&sources.stencil[1]),
                 };
-                *unsent = resolve.and_then(Source::texture).and_then(Unsent::of);
+                *copied = resolve.is_some_and(Source::writes_kept);
             }
         });
     }
@@ -3947,10 +3765,8 @@ impl VulkanRenderEncoder {
     /// again encodes nothing, as plain Metal resolves nothing into the texture
     /// (`resolves_into_other_formats_are_metals_or_die_named`). A colour index past the eighth is
     /// the runtime's to refuse. One that resolves an undecided attachment into a resolve texture
-    /// whose GPU writes never reach its memory dies ([`crate::os::dropped_write`]), and so does one
-    /// that resolves it into a resolve texture over read-only memory ([`Unsent`]), but a resolve
-    /// Metal's GPU faults into a resolve texture over memory the runtime copies
-    /// ([`Unsent::Copied`], [`faults_into`]). That one, and one that keeps an undecided attachment
+    /// over read-only memory the runtime copies dies, but a resolve Metal's GPU faults
+    /// ([`faults_into`]). That one, and one that keeps an undecided attachment
     /// over read-only memory the runtime copies ([`faults_over`]), fail the command buffer as
     /// Metal's GPU faults it ([`Self::read_only_stores`]). A colour or stencil attachment's
     /// `CustomSampleDepthStore` there is sent: the runtime stores it as `DontCare`, and Metal's
@@ -3967,20 +3783,12 @@ impl VulkanRenderEncoder {
         }
         match self.stored(attachment) {
             Some((rt::StoreAction::Unknown, _)) => {
-                let named = plain(|| {
+                let copied = plain(|| {
                     let undecided = self.undecided.lock();
-                    undecided
-                        .iter()
-                        .find(|(a, _)| *a == attachment)
-                        .and_then(|&(_, unsent)| unsent)
+                    (undecided.iter()).any(|&(a, copied)| a == attachment && copied)
                 });
                 let mut faults = false;
-                if let Some(unsent) = named
-                    && action.resolves()
-                {
-                    if unsent == Unsent::Kept || unsent == Unsent::Dropped {
-                        unsent.dies(sel, "a store action that resolves into a texture");
-                    }
+                if copied && action.resolves() {
                     if !faults_into(attachment, action) {
                         crate::gpu::writes::kept_write(
                             sel,
@@ -4019,16 +3827,14 @@ impl VulkanRenderEncoder {
     /// A late resolve target of `texture` at `at`, its slice, depth plane and level, for
     /// `attachment`, which `sel` sets. Where the attachment's store action is undecided, why a
     /// resolve into the texture is never sent as it stands is kept for the late store action that
-    /// decides whether it resolves ([`Self::late_store`]); elsewhere one whose GPU writes never
-    /// reach its memory dies ([`crate::os::dropped_write`]), and so does one over read-only
-    /// memory ([`Unsent`]), but one over memory the runtime copies: where the known action
-    /// resolves into it as Metal's GPU faults ([`faults_into`]), that fails the command buffer as
-    /// Metal's GPU faults it (measured on the M3 Max, macOS 27.0.1, with the setter's SPI, a
-    /// colour attachment's and a depth attachment's `MultisampleResolve`, the descriptor naming a
-    /// resolve texture of Metal's own memory: m3-max-29292); a depth attachment's
-    /// `StoreAndMultisampleResolve` into it, which the runtime faults where Metal's GPU completes
-    /// it, dies. A known action that does not resolve never reaches here
-    /// ([`Self::resolve_unused`]).
+    /// decides whether it resolves ([`Self::late_store`]); elsewhere one over read-only memory the
+    /// runtime copies dies, but where the known action resolves into it as Metal's GPU faults
+    /// ([`faults_into`]), that fails the command buffer as Metal's GPU faults it (measured on the
+    /// M3 Max, macOS 27.0.1, with the setter's SPI, a colour attachment's and a depth attachment's
+    /// `MultisampleResolve`, the descriptor naming a resolve texture of Metal's own memory:
+    /// m3-max-29292); a depth attachment's `StoreAndMultisampleResolve` into it, which the runtime
+    /// faults where Metal's GPU completes it, dies. A known action that does not resolve never
+    /// reaches here ([`Self::resolve_unused`]).
     fn late_resolve(
         &self,
         sel: &'static str,
@@ -4036,28 +3842,24 @@ impl VulkanRenderEncoder {
         texture: Option<&VulkanTexture>,
         at: (u64, u64, u64),
     ) -> Option<rt::ResolveTarget> {
-        let unsent = texture.and_then(Unsent::of);
+        let copied = texture.is_some_and(|t| crate::gpu::writes::texture_kept(t));
         let kept = plain(|| {
             let mut undecided = self.undecided.lock();
             let named = undecided.iter_mut().find(|(a, _)| *a == attachment);
-            named.map(|(_, never)| *never = unsent)
+            named.map(|(_, over)| *over = copied)
         });
-        if kept.is_none()
-            && let Some(unsent) = unsent
-        {
+        if kept.is_none() && copied {
             match self.stored(attachment) {
-                Some((action, _))
-                    if unsent == Unsent::Copied && faults_into(attachment, action) =>
-                {
+                Some((action, _)) if faults_into(attachment, action) => {
                     self.encoder.faults_at_read_only_store();
                 }
-                Some(_) if unsent == Unsent::Copied => crate::gpu::writes::kept_write(
+                Some(_) => crate::gpu::writes::kept_write(
                     sel,
                     "a late resolve texture of a depth attachment whose \
                      StoreAndMultisampleResolve, which the runtime faults where Metal's GPU \
                      completes it, resolves into a texture over",
                 ),
-                _ => unsent.dies(sel, "a resolve into a texture"),
+                None => crate::gpu::writes::kept_write(sel, "a resolve into a texture over"),
             }
         }
         match kept {
@@ -4636,12 +4438,8 @@ pub(crate) mod tests {
             meets: true,
             ..Bound::default()
         };
-        let dropped = Bound {
-            dropped: true,
-            ..plain.clone()
-        };
-        let kept = Bound {
-            kept: Kept::Always,
+        let refused = Bound {
+            refused: Some(metal2vulkan::metal::PixelFormat::YCBCR84442PSRGB),
             ..plain.clone()
         };
         let mut r = Reach::default();
@@ -4650,17 +4448,16 @@ pub(crate) mod tests {
         }
         r.bind_one(VERTEX, true, 3, plain.clone());
         assert!((r.textures.iter().chain(&r.buffers)).all(BTreeMap::is_empty));
-        assert!(!r.unsent_dropped() && r.kept(None).is_none());
+        assert!(!r.unsent_refused());
         for _ in 0..1000 {
-            let textures = vec![plain.clone(), dropped.clone()];
-            r.used(textures, vec![plain.clone(), kept.clone()]);
+            let textures = vec![plain.clone(), refused.clone()];
+            r.used(textures, vec![plain.clone()]);
         }
-        assert_eq!((r.used_textures.len(), r.used_buffers.len()), (1, 1));
-        assert!(r.unsent_dropped());
-        assert!(matches!(r.kept(None), Some(Whether::Writes)));
-        assert!(matches!(&r.unsent(None)[..], [(Whether::Writes, m)] if *m == dropped));
-        r.bind_one(FRAGMENT, false, 2, dropped.clone());
-        assert_eq!(r.textures[FRAGMENT].get(&2), Some(&dropped));
+        assert_eq!((r.used_textures.len(), r.used_buffers.len()), (1, 0));
+        assert!(r.unsent_refused());
+        assert!(matches!(&r.unsent(None)[..], [(Whether::Writes, m)] if *m == refused));
+        r.bind_one(FRAGMENT, false, 2, refused.clone());
+        assert_eq!(r.textures[FRAGMENT].get(&2), Some(&refused));
         r.bind_one(FRAGMENT, false, 2, plain);
         assert!(r.textures[FRAGMENT].is_empty());
     }
@@ -4675,8 +4472,8 @@ pub(crate) mod tests {
             meets: true,
             ..Bound::default()
         };
-        let dropped = Bound {
-            dropped: true,
+        let refused = Bound {
+            refused: Some(metal2vulkan::metal::PixelFormat::YCBCR84442PSRGB),
             ..plain.clone()
         };
         let mut r = Reach::default();
@@ -4684,12 +4481,12 @@ pub(crate) mod tests {
         r.bind_one(FRAGMENT, false, 0, plain.clone());
         r.bind_one(VERTEX, true, 1, plain.clone());
         assert!(r.quiet());
-        r.bind_one(FRAGMENT, false, 0, dropped.clone());
-        assert!(!r.quiet() && r.unsent_dropped());
+        r.bind_one(FRAGMENT, false, 0, refused.clone());
+        assert!(!r.quiet() && r.unsent_refused());
         r.bind_one(FRAGMENT, false, 0, plain);
         assert!(r.quiet());
-        r.used(vec![dropped], Vec::new());
-        assert!(!r.quiet() && r.unsent_dropped());
+        r.used(vec![refused], Vec::new());
+        assert!(!r.quiet() && r.unsent_refused());
     }
 
     /// An open encoder on a target, on this platform.
@@ -5604,117 +5401,6 @@ pub(crate) mod tests {
         catch_death(|| e.encode(OnFault::Return, cmd))
             .unwrap_err()
             .file
-    }
-
-    /// A draw of `read_only_beside_nested_vertex` and `read_only_beside_nested_fragment`
-    /// ([`crate::gpu::writes::tests::PROBE`]), whose argument buffers' type the runtime refuses
-    /// the reflection of, through a buffer on a surface whose GPU writes never reach its memory
-    /// bound at both functions' buffer slot 1, which they declare `const` and cannot store
-    /// through, draws, indexed: the vertex function writes its words of slot 2 and the fragment
-    /// function red. Bound at the vertex function's slot 2 too, a `device` pointer, the draw dies
-    /// where it is encoded: on Linux the runtime imports a writable twin of the surface's
-    /// read-only alias, which the write would reach ([`crate::gpu::writes::kept_write`]). The
-    /// guest's page stays zeros
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_draw_through_a_read_only_surface_at_slots_it_cannot_write_draws_on_linux() {
-        use crate::core::platform::os::vm::HostVm as _;
-        use crate::core::platform::resource::Library as _;
-        use crate::core::platform::values::RenderPipelineDesc;
-
-        use crate::gpu::resource::VulkanRenderPipeline;
-        use crate::gpu::resource::tests::on_read_only_surface;
-        use crate::os::PAGE;
-
-        /// The state, `nested` at both functions' slot 0, `read_only` at their slot 1 and
-        /// `written` at the vertex function's slot 2, then an indexed triangle of `indices`.
-        fn draw<'a>(
-            state: &'a VulkanRenderPipeline,
-            [nested, read_only, written, indices]: [&'a VulkanBuffer; 4],
-        ) -> Vec<RenderCmd<'a, VulkanPlatform>> {
-            let at = |buffer: &'a VulkanBuffer, index| RenderCmd::SetVertexBuffer {
-                buffer: Some(buffer),
-                offset: 0,
-                index,
-            };
-            let fragment_at = |buffer: &'a VulkanBuffer, index| RenderCmd::SetFragmentBuffer {
-                buffer: Some(buffer),
-                offset: 0,
-                index,
-            };
-            vec![
-                RenderCmd::SetRenderPipelineState {
-                    pipeline_state: Some(state),
-                },
-                at(nested, 0),
-                at(read_only, 1),
-                at(written, 2),
-                fragment_at(nested, 0),
-                fragment_at(read_only, 1),
-                three(3, Some(indices)),
-            ]
-        }
-
-        let (p, d) = (platform(), dev());
-        let library = (d.new_library(crate::gpu::writes::tests::PROBE))
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
-        let (vertex, fragment) = (
-            function("read_only_beside_nested_vertex"),
-            function("read_only_beside_nested_fragment"),
-        );
-        let state = d
-            .new_render_pipeline_state(&RenderPipelineDesc {
-                label: None,
-                vertex: &vertex,
-                fragment: &fragment,
-                color0_pixel_format: BGRA8,
-                resource_index: None,
-            })
-            .unwrap()
-            .unwrap();
-        let (read_only, pages) = on_read_only_surface();
-        let nested = buffer::<VulkanPlatform>(&d, 16, 0, &[0; 16]);
-        let written = buffer::<VulkanPlatform>(&d, 16, 0, &[0; 16]);
-        let indices = buffer::<VulkanPlatform>(&d, 8, 0, &[0, 0, 1, 0, 2, 0, 0, 0]);
-        let pixels = pass_pixels(
-            &p,
-            &d,
-            draw(&state, [&nested, &read_only, &written, &indices]),
-        );
-        assert!(
-            pixels.iter().all(|&t| t == [0, 0, 0xff, 0xff]),
-            "{pixels:?}"
-        );
-        // SAFETY: a Shared buffer's words, read after the draw completed.
-        let words = unsafe { std::slice::from_raw_parts(written.contents().as_ptr::<u32>(), 4) };
-        assert_eq!(words, [1, 1, 1, 0]);
-        let (_dst, pass) = pass_of(&p, &d, (16, 16));
-        let q = d.new_command_queue().unwrap();
-        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-        let mut cmds = draw(&state, [&nested, &read_only, &read_only, &indices]);
-        let issue = cmds.pop().unwrap();
-        send_all(&e, cmds);
-        assert_eq!(
-            dies_at(&e, issue),
-            "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:"
-        );
-        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
-        cb.commit(OnFault::Die).unwrap();
-        cb.wait_until_completed(OnFault::Die).unwrap();
-        assert!(cb.error().is_none(), "{:?}", cb.error());
-        // SAFETY: the page, mapped readable, which no GPU work uses now.
-        let first = unsafe { pages.as_ptr::<u32>().read_volatile() };
-        assert_eq!(first, 0);
-        drop((cb, e, state, read_only));
-        assert!(
-            crate::remap::VulkanVm::new()
-                .deallocate(pages, PAGE)
-                .is_success()
-        );
     }
 
     /// `MTLLoadActionDontCare`, `MTLLoadActionLoad`, `MTLStoreActionDontCare`,
@@ -7919,147 +7605,6 @@ pub(crate) mod tests {
                 "{texel:02x?}"
             );
         }
-    }
-
-    /// An execution whose commands run pipeline states of their own writes no texture bound on
-    /// the encoder ([`Reach::at_slots`]): with a texture on a surface made read-only for the GPU
-    /// bound at fragment texture 0, and made resident for reading, it goes on; with the texture
-    /// made resident for writing, it dies at the execution
-    #[test]
-    fn an_execution_of_states_of_its_own_writes_no_bound_texture() {
-        use crate::core::host::PhysicalMemoryRange;
-        use crate::core::platform::icb::{
-            IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
-        };
-        use crate::core::platform::os::surface::SurfaceSpec;
-        use crate::core::platform::os::vm::HostVm as _;
-        use crate::core::platform::values::IcbDesc;
-        use metal2vulkan::metal::PixelFormat;
-        use metal2vulkan::pipeline::{
-            ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource,
-        };
-
-        const VERT: &[u8] = include_bytes!("../../../../tests/shaders/vert.metallib");
-        const FRAG: &[u8] = include_bytes!("../../../../tests/shaders/frag.metallib");
-        let p = platform();
-        let d = dev();
-        let function = |bytes, name| {
-            d.raw
-                .new_library_with_data(bytes)
-                .unwrap()
-                .new_function_with_name(name)
-                .unwrap()
-        };
-        let mut desc = RenderPipelineDescriptor::new(StageSource::Function(
-            function(VERT, "tri_vert").function_descriptor(),
-        ));
-        desc.fragment = Some(StageSource::Function(
-            function(FRAG, "tri_frag").function_descriptor(),
-        ));
-        desc.color_attachments[0] = Some(ColorAttachmentDescriptor::new(PixelFormat::BGRA8Unorm));
-        desc.support_indirect_command_buffers = true;
-        let pipeline = crate::gpu::resource::render_pipeline(
-            d.raw
-                .new_render_pipeline_state(&desc, &rt::PipelineOptions::default())
-                .unwrap(),
-        );
-        let icb = d
-            .new_indirect_command_buffer(
-                &IcbDesc {
-                    command_types: 1,
-                    ..IcbDesc::default()
-                },
-                1,
-                0,
-            )
-            .unwrap()
-            .unwrap();
-        let c = icb.render_command(0).unwrap().unwrap();
-        for cmd in [
-            IcbRenderCmd::SetRenderPipelineState {
-                pipeline_state: Some(&pipeline),
-            },
-            IcbRenderCmd::DrawPrimitives {
-                primitive_type: 3,
-                vertex_start: 0,
-                vertex_count: 3,
-                instance_count: 1,
-                base_instance: 0,
-            },
-        ] {
-            c.encode(cmd).unwrap();
-        }
-        let vm = crate::remap::VulkanVm::new();
-        let page = vm.page_size();
-        let guest = crate::os::allocate_aliasable(page).unwrap();
-        let spec = SurfaceSpec {
-            pixel_format: u32::from_be_bytes(*b"BGRA"),
-            alloc_size: page,
-            width: 16,
-            height: 16,
-            bytes_per_element: 4,
-            bytes_per_row: 64,
-            element_width: 1,
-            element_height: 1,
-            client_direction: Some(2),
-            client_address_ranges: Some(vec![PhysicalMemoryRange {
-                physical_address: crate::core::num::ToU64::to_u64(guest.addr()),
-                physical_length: page,
-            }]),
-            ..SurfaceSpec::default()
-        };
-        let s = p.surfaces().create(&spec).unwrap();
-        let read = p.texture_descriptor(&TextureDesc {
-            pixel_format: BGRA8,
-            width: 16,
-            height: 16,
-            usage: READ,
-            ..TextureDesc::default()
-        });
-        let t = d
-            .new_texture_on_surface(&read, Some(&s), 0)
-            .unwrap()
-            .unwrap();
-        assert!(t.gpu_read_only());
-        let execute = |usage: u64| {
-            let (_dst, pass) = pass_of(&p, &d, (4, 4));
-            let q = d.new_command_queue().unwrap();
-            let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-            let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-            let (listed, used) = (
-                [Some(ResourceRef::Icb(&icb))],
-                [Some(ResourceRef::Texture(&t))],
-            );
-            for cmd in [
-                RenderCmd::SetFragmentTexture {
-                    texture: Some(&t),
-                    index: 0,
-                },
-                RenderCmd::UseResources {
-                    resources: &listed,
-                    usage: 1,
-                },
-                RenderCmd::UseResources {
-                    resources: &used,
-                    usage,
-                },
-                RenderCmd::ExecuteCommandsInBuffer {
-                    indirect_command_buffer: &icb,
-                    execution_range: NsRange::new(0, 1),
-                },
-                RenderCmd::EndEncoding,
-            ] {
-                e.encode(OnFault::Die, cmd).unwrap();
-            }
-            cb.commit(OnFault::Die).unwrap();
-            cb.wait_until_completed(OnFault::Die).unwrap();
-            cb.status().0
-        };
-        assert_eq!(execute(1), 4);
-        let site = catch_death(|| execute(3)).unwrap_err();
-        assert_eq!(site.file, "executeCommandsInBuffer:withRange:");
-        drop((t, s));
-        assert!(vm.deallocate(guest, page).is_success());
     }
 
     /// A pass of a mutable rate map not yet reset rasterizes nothing, a scissor rectangle set in

@@ -105,11 +105,10 @@ unsafe extern "C" {
     static kIOSurfaceElementHeight: &'static NSString;
 
     // The keys IOSurface exports but the SDK does not declare, linked by name. Their values are
-    // IOSurface's own: `kIOSurfaceClientAddressRanges` is "IOSurfaceAddressRanges",
-    // `kIOSurfaceClientDirection` "IOSurfaceDirection" (`private_keys_link`).
+    // IOSurface's own: `kIOSurfaceClientAddressRanges` is "IOSurfaceAddressRanges"
+    // (`private_keys_link`).
     static kIOSurfaceAddressFormat: &'static NSString;
     static kIOSurfaceClientAddressRanges: &'static NSString;
-    static kIOSurfaceClientDirection: &'static NSString;
     static kIOSurfacePlaneCompressionFootprint: &'static NSString;
     static kIOSurfacePlaneCompressionType: &'static NSString;
     static kIOSurfacePlaneExtendedPixelsOnBottom: &'static NSString;
@@ -428,10 +427,6 @@ pub(crate) fn surface_dictionary(
             spec.extended_pixels_on_bottom,
         );
         set_u64(&d, kIOSurfaceProtectionOptions, spec.protection_options);
-        // Only for a read-only mapping.
-        if let Some(direction) = spec.client_direction {
-            set_u32(&d, kIOSurfaceClientDirection, direction);
-        }
         // Absent for a host-only surface.
         if let Some(ranges) = &spec.client_address_ranges {
             let bytes = range_bytes(ranges);
@@ -672,7 +667,6 @@ mod tests {
                 assert_eq!(number(&d, kIOSurfaceProtectionOptions), 0x1_0000_0001);
                 // A host-only, read-write surface with no planes: none of the optional keys.
                 assert!(!has(&d, kIOSurfacePlaneInfo));
-                assert!(!has(&d, kIOSurfaceClientDirection));
                 assert!(!has(&d, kIOSurfaceClientAddressRanges));
                 assert_eq!(d.count(), 16);
             }
@@ -687,7 +681,6 @@ mod tests {
                     kIOSurfaceClientAddressRanges.to_string(),
                     "IOSurfaceAddressRanges"
                 );
-                assert_eq!(kIOSurfaceClientDirection.to_string(), "IOSurfaceDirection");
                 assert_eq!(
                     kIOSurfaceAddressFormat.to_string(),
                     "IOSurfaceAddressFormat"
@@ -707,18 +700,6 @@ mod tests {
                     assert!(!k.to_string().is_empty());
                 }
             }
-        }
-
-        /// readOnly sets kIOSurfaceClientDirection = 2
-        #[test]
-        fn read_only_direction() {
-            let spec = SurfaceSpec {
-                client_direction: Some(2),
-                ..host_only()
-            };
-            let d = surface_dictionary(&spec);
-            // SAFETY: IOSurface's exported constant.
-            assert_eq!(unsafe { number(&d, kIOSurfaceClientDirection) }, 2);
         }
 
         /// The client ranges are NSData of {address, length} pairs, empty included

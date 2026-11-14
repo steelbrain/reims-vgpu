@@ -386,38 +386,6 @@ fn ycbcr8_420_samples_the_exact_filter_does_not_reach_die() {
     }
 }
 
-/// A 'b3a8' surface of [`b3a8_spec`] made over fresh pages of the host's
-/// (`kIOSurfaceClientAddressRanges`), read-only for the GPU (`kIOSurfaceClientDirection` 2,
-/// as core makes one over the guest's pages), every byte `noise(seed)`'s, and those pages:
-/// their first byte and length, which the caller frees once the surface is gone.
-fn b3a8_read_only(
-    size: (u64, u64),
-    rows: (u64, u64),
-    seed: u64,
-) -> (crate::os::OsSurface, crate::core::host::HostPtr, u64) {
-    use crate::core::host::PhysicalMemoryRange;
-    use crate::core::platform::os::vm::HostVm as _;
-    let vm = crate::os::OsVm::new();
-    let page = vm.page_size();
-    let mut spec = b3a8_spec(size, rows);
-    let length = spec.alloc_size.next_multiple_of(page);
-    let pages = vm.allocate_anywhere(length).unwrap();
-    let first = u64::try_from(pages.addr()).unwrap();
-    spec.alloc_size = length;
-    spec.client_direction = Some(2);
-    spec.client_address_ranges = Some(
-        (0..length / page)
-            .map(|i| PhysicalMemoryRange {
-                physical_address: first + i * page,
-                physical_length: page,
-            })
-            .collect(),
-    );
-    let s = noisy_surface(&spec, seed);
-    assert!(crate::os::gpu_read_only(&s));
-    (s, pages, length)
-}
-
 /// A 2D descriptor of `format` of `size`, one level, usage `ShaderRead`, of the resource
 /// options `options` (0 `Shared`, 0x10 `Managed`).
 fn xr10_desc(
@@ -1166,11 +1134,9 @@ fn a_copy_within_a_two_plane_xr10_texture_over_a_surface_dies() {
 
 /// `replaceRegion:` of a texture of a two-plane XR10 format (550, 551) over plane 0 of a
 /// 'b3a8' surface, and its blits to and from a buffer, write the surface's bytes and the
-/// buffer's as Metal's do, byte for byte; and so does `replaceRegion:` over a 'b3a8' surface
-/// of one page made read-only for the GPU, which this platform writes itself
+/// buffer's as Metal's do, byte for byte
 #[test]
 fn cpu_writes_and_buffer_blits_of_two_plane_xr10_textures_over_surfaces_are_metals() {
-    use crate::core::platform::os::vm::HostVm as _;
     use crate::gpu::ycbcr::sampling::Op;
     use crate::gpu::ycbcr::sampling::written;
     let (p, d) = (crate::platform::tests::platform(), dev());
@@ -1183,14 +1149,6 @@ fn cpu_writes_and_buffer_blits_of_two_plane_xr10_textures_over_surfaces_are_meta
             let key = format!("{format} {op:?}");
             assert!(crate::metal_matches_raw!(key, ours), "{key}");
         }
-        let vm = crate::remap::VulkanVm::new();
-        let other = b3a8(size, rows, 22);
-        let (s, pages, length) = b3a8_read_only(size, rows, 23);
-        let ours = written(&p, &d, Op::Replace, format, (&s, &other), size);
-        drop(s);
-        assert!(vm.deallocate(pages, length).is_success());
-        let key = format!("{format}: read-only for the GPU");
-        assert!(crate::metal_matches_raw!(key, ours), "{key}");
     }
 }
 

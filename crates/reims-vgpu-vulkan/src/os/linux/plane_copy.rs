@@ -836,9 +836,6 @@ fn destination(
             "the buffer was made on the device's VkDevice before its recovery".to_owned(),
         ));
     }
-    if copy.to.gpu_read_only {
-        return Err(refused("the buffer drops the GPU's writes".to_owned()));
-    }
     if let Some(rt::HostBacking::Copied) = buffer.host_backing() {
         return Err(refused(
             "the buffer's pages are a copy the runtime keeps, which the GPU's own writes would \

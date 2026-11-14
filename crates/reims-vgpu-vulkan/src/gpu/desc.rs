@@ -88,7 +88,9 @@
 //!   RGBA8Unorm, RGBA16Float and Depth32Float compared). The texture's `usage` answers 0x4000,
 //!   0x8000 and 0x10000 among its bits and drops 0x8, and so do its views and a texture opened from
 //!   its shared handle: the runtime's texture keeps the four, answering its usage without 0x8, as
-//!   its views and shared opens do. A texture of 0x8 alone is no texture of `Unknown` usage: it
+//!   its views and shared opens do. A texture of `Unknown` usage answers `ShaderRead |
+//!   ShaderWrite | RenderTarget | PixelFormatView` (0x17), as Metal gives it, the runtime's
+//!   `effective_usage` (measured). A texture of 0x8 alone is no texture of `Unknown` usage: it
 //!   answers a usage of 0 and the heap's size query a compressed one's size (16512 bytes for a
 //!   64x64 BGRA8Unorm one in Private storage, where `Unknown` answers 16384), as a texture of
 //!   `ShaderRead` alone does, which reads, samples and renders alike (measured on the M3 Max under
@@ -599,8 +601,8 @@ impl RawPass {
 }
 
 /// An attachment's texture or resolve texture as core set it, beyond the runtime's texture the
-/// attachment holds: whether a pass's writes through it reach its memory
-/// ([`Source::gpu_read_only`]). The default is nil's.
+/// attachment holds: whether its texels lie in read-only memory ([`Source::writes_kept`]), and
+/// what they lie in ([`Source::over`]). The default is nil's.
 #[derive(Debug, Default)]
 pub struct Source(Option<VulkanTexture>);
 
@@ -611,22 +613,10 @@ impl Clone for Source {
 }
 
 impl Source {
-    /// Whether the GPU's writes to its texels never reach their memory
-    /// ([`crate::gpu::resource::TextureObject::gpu_read_only()`]).
-    pub fn gpu_read_only(&self) -> bool {
-        self.0.as_ref().is_some_and(|t| t.gpu_read_only())
-    }
-
     /// Whether its texels lie in read-only memory whose writes this platform does not answer as
     /// Metal's GPU does ([`crate::gpu::writes::texture_kept`]).
     pub fn writes_kept(&self) -> bool {
         (self.0.as_ref()).is_some_and(|t| crate::gpu::writes::texture_kept(t))
-    }
-
-    /// Whether the GPU's writes to its texels reach read-only memory through a writable twin of
-    /// its pages, a surface's, where Metal's drop them ([`crate::gpu::writes::texture_twinned`]).
-    pub fn twinned(&self) -> bool {
-        (self.0.as_ref()).is_some_and(|t| crate::gpu::writes::texture_twinned(t))
     }
 
     /// The texture, if any.

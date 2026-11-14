@@ -29,7 +29,7 @@
 //! height, at depth 1 and array length 1.
 //!
 //! **What this platform's own rules read of a description** ([`block`]: a texture's bytes by
-//! Apple's layout, a CPU write's unit) is the description's compressed bit and block words.
+//! Apple's layout) is the description's compressed bit and block words.
 //!
 //! **Which values Metal's setter takes** ([`setter_takes`]): every value of a format the runtime
 //! has, `MTLPixelFormatInvalid` among them, and **which formats Metal describes** ([`described`]):
@@ -142,19 +142,14 @@ pub(crate) fn name(sel: &'static str, raw: u64) -> &'static str {
 /// What this platform's own rules read of Metal's description of a format ([`block`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Block {
-    /// Whether the format is one of blocks: flags bit 10 ([`COMPRESSED`]).
+    /// Whether the format is one of blocks: flags bit 10 ([`COMPRESSED`]), the compressed formats
+    /// and the 4:2:2 `GBGR422` and `BGRG422`.
     compressed: bool,
     /// The description's four words.
     words: [u64; 4],
 }
 
 impl Block {
-    /// Whether the format is one of blocks: flags bit 10 ([`COMPRESSED`]), the compressed formats
-    /// and the 4:2:2 `GBGR422` and `BGRG422`.
-    pub(crate) fn compressed(self) -> bool {
-        self.compressed
-    }
-
     /// A block's bytes (the first word): a texel's for a format not of blocks, 0 for a value Metal
     /// describes no format for.
     pub(crate) fn bytes(self) -> u64 {
@@ -295,12 +290,12 @@ mod tests {
     fn rules_read_metals_description() {
         let bgra = block(INFO, 80);
         assert_eq!(
-            (bgra.compressed(), bgra.bytes(), bgra.extent()),
+            (bgra.compressed, bgra.bytes(), bgra.extent()),
             (false, 4, [1, 1])
         );
         let astc = block(INFO, 217);
         assert_eq!(
-            (astc.compressed(), astc.bytes(), astc.extent()),
+            (astc.compressed, astc.bytes(), astc.extent()),
             (true, 16, [12, 10])
         );
         for raw in 630..=645 {

@@ -57,8 +57,7 @@ pub struct Backing {
     read_only: bool,
     /// Whether the memory the object lies in is read-only where the runtime does not import
     /// read-only memory as it is mapped ([`crate::os::COPIES_READ_ONLY`]): the memory a no-copy
-    /// buffer or heap was made over, mapped read-only or made with bit 24; counted while it holds
-    /// ([`crate::gpu::writes::set_kept`]).
+    /// buffer or heap was made over, mapped read-only or made with bit 24.
     kept: AtomicBool,
     /// Whether, of that memory, the pages are mapped read-only, which a CPU write through them
     /// cannot write ([`Backing::pages_read_only`]).
@@ -84,7 +83,7 @@ impl Backing {
         let read_only = mapped_read_only || bit_24 || self.read_only;
         let kept = crate::os::COPIES_READ_ONLY && read_only;
         (self.mapped_read_only).store(kept && mapped_read_only, Ordering::Release);
-        crate::gpu::writes::set_kept(&self.kept, kept);
+        self.kept.store(kept, Ordering::Release);
     }
 
     /// Whether the memory the object lies in is read-only memory the runtime copies
@@ -110,13 +109,6 @@ impl Backing {
             true => crate::gpu::writes::Kept::Copied,
             false => crate::gpu::writes::Kept::No,
         }
-    }
-}
-
-impl Drop for Backing {
-    /// The object's release: its memory is read-only no longer ([`crate::gpu::writes::set_kept`]).
-    fn drop(&mut self) {
-        crate::gpu::writes::set_kept(&self.kept, false);
     }
 }
 
