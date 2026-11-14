@@ -232,8 +232,9 @@ fn converted_10_bit(format: u64) -> bool {
 /// Whether the rows of a texture of `format` of `size` over plane `plane` of a surface of
 /// `shape` ([`Shape::spec`]) overlap there: more than one row, of more than 16 bytes of the
 /// format's luma codes, at a `bytesPerRow` whose multiple of 16 below it is shorter than the row
-/// (a 10-bit format over rows of 8-bit codes). Metal makes such a texture, and the runtime
-/// refuses it, a gap of its own (`OverlappingSurfaceRows`).
+/// (a 10-bit format over rows of 8-bit codes). Metal makes such a texture, and so does the
+/// runtime; Metal's reads of one were never recorded (the answers were recorded while the runtime
+/// refused it), so the tests compare only that it is made, with the descriptor's properties.
 fn rows_overlap(format: u64, shape: &Shape, plane: u64, size: (u64, u64)) -> bool {
     let pf = PixelFormat::try_from(u32::try_from(format).unwrap()).unwrap();
     let f = metal2vulkan::metal::format::ycbcr_format(pf).unwrap();
@@ -255,9 +256,10 @@ fn rows_overlap(format: u64, shape: &Shape, plane: u64, size: (u64, u64)) -> boo
 
 /// A texture of `format` of `size` over plane `plane` of `s`, a surface of `shape`, which Metal
 /// makes, reads as Metal's does, bit for bit, into halves and into floats, with the guest
-/// descriptor's properties; one whose rows overlap on the surface ([`rows_overlap`]) dies where
-/// it is made, naming the runtime's refusal. Where `half_relayed`, the read into halves relays
-/// the note `HalfTexelConversion`, a death in strict mode, and reads as Metal's past it.
+/// descriptor's properties; one whose rows overlap on the surface ([`rows_overlap`]) is made,
+/// with the descriptor's properties, and its reads are not compared. Where `half_relayed`, the
+/// read into halves relays the note `HalfTexelConversion`, a death in strict mode, and reads as
+/// Metal's past it.
 fn reads_as_metals_do(
     format: u64,
     (shape, s): (&Shape, &OsSurface),
@@ -271,17 +273,6 @@ fn reads_as_metals_do(
     *crate::answer::LAST_LINE.lock() = None;
     let made = catch_death(|| d.new_texture_on_surface(&desc, Some(s), plane));
     let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-    if rows_overlap(format, shape, plane, size) {
-        let site = made.map(drop).unwrap_err();
-        let sel = "newTextureWithDescriptor:iosurface:plane:";
-        assert_eq!(
-            (site.kind, site.file),
-            (DeathKind::Abort, sel),
-            "{what}: {line}"
-        );
-        assert!(line.contains("OverlappingSurfaceRows"), "{what}: {line}");
-        return;
-    }
     let t = made.unwrap_or_else(|site| panic!("{what}: {site:?}: {line}"));
     let t = t.unwrap().unwrap_or_else(|| panic!("nil: {what}"));
     assert_eq!(
@@ -289,6 +280,9 @@ fn reads_as_metals_do(
         (format, size.0, size.1),
         "{what}"
     );
+    if rows_overlap(format, shape, plane, size) {
+        return;
+    }
     type V = crate::platform::VulkanPlatform;
     let read = || probed::<V>(&d, "read_texels", &t, size, None, None);
     if half_relayed {
@@ -311,9 +305,9 @@ fn reads_as_metals_do(
 /// `P3_D65`, each code read alone, a 10-bit converted format's read into halves relayed as one the
 /// runtime does not convert as Metal does ([`converted_10_bit`]), though it reads as Metal's
 /// here; an `_sRGB` twin over such a surface, whose reads follow no rule
-/// the runtime found, dies where it is made, naming the runtime's refusal, where Metal makes it,
-/// and so does a texture whose rows overlap on the surface, a 10-bit format's over rows of 8-bit
-/// codes ([`rows_overlap`])
+/// the runtime found, dies where it is made, naming the runtime's refusal, where Metal makes it;
+/// a texture whose rows overlap on the surface, a 10-bit format's over rows of 8-bit codes, is
+/// made as Metal makes it ([`rows_overlap`])
 #[test]
 fn textures_over_other_ostypes_read_as_metals() {
     let size = (33, 17);
@@ -352,8 +346,7 @@ fn textures_over_other_ostypes_read_as_metals() {
 /// A texture of each format of the family over plane 1 of a surface of each two-plane OSType,
 /// which Metal makes, reads as Metal's does ([`reads_as_metals_do`]): plane 1's codes as the
 /// luma, at plane 1's rows and past the plane where it is shorter than the texture, with chroma
-/// codes 0. One whose rows overlap on the plane ([`rows_overlap`]) dies where it is made, naming
-/// the runtime's refusal, where Metal makes it
+/// codes 0. One whose rows overlap on the plane is made, as Metal makes it ([`rows_overlap`])
 #[test]
 fn textures_over_plane_1_read_as_metals() {
     let size = (33, 17);

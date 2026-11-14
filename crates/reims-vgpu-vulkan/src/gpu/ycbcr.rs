@@ -92,10 +92,11 @@
 //! the format's own layout and subsampling, over plane 1 of one, its codes the luma and the chroma
 //! codes 0, and, but an `_sRGB` twin, over a surface whose matrix is `DCI_P3` or `P3_D65`, each
 //! code read alone, each read as Metal's (`textures_over_other_ostypes_read_as_metals`,
-//! `textures_over_plane_1_read_as_metals`). What the runtime refuses of them (an `_sRGB` twin
-//! over a P3 surface, a texture whose rows overlap on the surface, such as a 10-bit format's over
-//! rows of 8-bit codes, a lossless compressed OSType, planes off its alignment, a load, write or
-//! pass it has no form for) dies at its selector, naming the refusal, where Metal goes on.
+//! `textures_over_plane_1_read_as_metals`); one whose rows overlap on the surface, such as a
+//! 10-bit format's over rows of 8-bit codes, is made, its reads not compared (Metal's were never
+//! recorded). What the runtime refuses of them (an `_sRGB` twin over a P3 surface, a lossless
+//! compressed OSType, planes off its alignment, a load, write or pass it has no form for) dies at
+//! its selector, naming the refusal, where Metal goes on.
 //!
 //! **Address modes.** Metal addresses a texture of the family by its format: a 4:2:0 or 4:2:2 one
 //! samples repeat, mirrored repeat and mirror-clamp-to-edge as clamp-to-edge, a 4:4:4 one as
