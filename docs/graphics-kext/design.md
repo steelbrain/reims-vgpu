@@ -165,9 +165,24 @@ Stages:
      Metal Super Resolution on the 780M host, a SubmitBatch call, the
      creates and destroys a commit posts there, took 33.6 us p50 (59.4 p90)
      with the data uncached and 31.3 us (58.2) write-combined, so the data's
-     stores are a small part of it: the call spends the rest in the kernel
-     without blocking, not yet split (15.2 us p50 on the Iris Xe host, whose
-     EPT ignores the guest's memory type; 11-14).
+     stores are a small part of it (15.2 us p50 on the Iris Xe host, whose
+     EPT ignores the guest's memory type). The kext's kdebug stamps split the
+     call (33.3 us p50 in the same benchmark): 16.1 us went to the look-up of
+     the framebuffer, which every post made, 5.5 us to ring 0's doorbell
+     write, an exit to the host, 4.7 us to the system call's entry and 3.4 us
+     to its return, and 1.0 us to the data's stores. The look-up is the
+     guest kernel's own code, 1.6-1.8 times slower on the 780M host than on
+     the Iris Xe; the exits, entry and return cost the same on both hosts
+     when warm, and grow after an idle. The kext now keeps the framebuffer
+     it found started, and a commit behind held messages publishes its
+     buffer in the same call ("A commit behind held messages is one call"),
+     so the call now goes to the exits: 18.9 us p50 in the same benchmark
+     (entry 4.6, ring 0's doorbell 5.4, the queue's doorbell 4.1 where the
+     host's queue thread sleeps, return 3.3, the kext's own work about 3),
+     and the benchmark's own doorbell calls fell from 763 to 166. A commit
+     behind held messages, timed in the guest, took 17.4-18.0 us p50 before
+     and 8.7-9.6 us after on the 780M host, and 15.1-15.2 us before and
+     8.8-9.0 us after on the Iris Xe (11-14).
    - The region is memory of QEMU's process, and the host side runs in that
      process. On Linux it is a shared mapping of a memfd of the library's
      (`reims-vgpu-vulkan`'s `RegionMemory`): RADV refuses a pointer to a
@@ -2495,10 +2510,16 @@ own 64-byte line:
   `ring/interleavings.rs` walks every interleaving of the host's post, the
   kext's look and the completion thread's take, arm, arm skipped and sleep (up
   to 3 records and 2 vectors for something else): none leaves a record
-  untaken or the thread asleep unarmed. A wake index the host only reads (virtio's
-  `used_event`) was weighed and declined: it would change a ring's format in
-  the host, the kext and the bundle, and the re-arm closes the race without
-  one.
+  untaken or the thread asleep unarmed. The kext's take of ring 0's
+  completion ring, at each interrupt of the control vector, which every
+  queue's completions share, and at a waiter's look, keeps the same rule
+  (`ReimsGraphics::takeCompletions`, `RgfxCompletionArm.hpp`): it arms only
+  where it took records since its last arm or that arm found records behind
+  it, and stores `consumer` only where it moved; `completion_arm_test` walks
+  every interleaving of the host's post against its take. A wake index the
+  host only reads (virtio's `used_event`) was weighed and declined: it would
+  change a ring's format in the host, the kext and the bundle, and the
+  re-arm closes the race without one.
 
 **Control commands** (guest to host, ring 0). Each is answered by a
 `COMPLETE` with its `seqno` and a status (0 for success), or by the reply
