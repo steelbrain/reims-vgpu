@@ -1296,10 +1296,36 @@ impl Predication {
         })
     }
 
-    /// Whether a unit of compute encoders is open: one began since its last end, and a compute
-    /// encoder after it would go on in it.
-    pub(crate) fn in_unit(&self) -> bool {
-        self.unit.lock().first_type.is_some()
+    /// Whether the command buffer may be cut here into parts, its work so far committed and a
+    /// command buffer of its queue going on from it (`CommandBuffer::split`,
+    /// [`crate::gpu::command`]): no block is open, nor a loop's body being laid down again, and
+    /// no unbalanced record emptied the unit. A unit of compute encoders open at the cut goes on
+    /// in the next part ([`Predication::go_on`]).
+    ///
+    /// Only with no block open: the GPU's skip counter is then 0, as commands run, so the next
+    /// part's own counter, which its first step resets, stands for the cut part's. Inside a block
+    /// the counter may stand above 0, and a part's work after the cut would read another's.
+    pub(crate) fn cuttable(&self) -> bool {
+        let u = self.unit.lock();
+        u.stack.is_empty() && u.cursor.is_none() && !u.emptied
+    }
+
+    /// Carries on, in this, the next part's predication, the unit of compute encoders open in
+    /// `cut`'s, the part just cut where it was [`cuttable`](Self::cuttable): the dispatch type of
+    /// its first encoder, whether it sent work and whether an indirect dispatch went through, and
+    /// the numbering of its encoders and block records. So what Metal decides by the unit dies in
+    /// the next part as in a command buffer kept whole: a record that empties the unit after its
+    /// work, a first indirect dispatch in an encoder of another dispatch type than the unit's
+    /// first. Its steps use GPU objects of the next part's own, its counter reset at its first
+    /// step.
+    pub(crate) fn go_on(&self, cut: &Predication) {
+        let before = cut.unit.lock();
+        let mut u = self.unit.lock();
+        u.first_type = before.first_type;
+        u.work = before.work;
+        u.indirect = before.indirect;
+        u.records = before.records;
+        u.encoders = before.encoders;
     }
 }
 
@@ -3031,6 +3057,92 @@ mod tests {
             completes(&cb);
             let w = words(&w);
             assert_eq!((answered, w[0], w[8]), (answer, count, count), "{label}");
+        }
+    }
+
+    /// A command buffer of compute encoders is cut into parts between its encoders where no
+    /// block is open: each part's work runs, in order, and the unit goes on in the next part, so
+    /// an unbalanced record there after the unit's work dies, as it would whole
+    #[test]
+    fn a_unit_goes_on_in_the_next_part() {
+        let inc = kernel(INC, "inc_k");
+        let w = shared(64);
+        let cb = command_buffer();
+        let e = compute(&cb);
+        encode_all(
+            &e,
+            [
+                set(&inc),
+                bind(&[Some(&w)], &[0]),
+                one(),
+                ComputeCmd::EndEncoding,
+            ],
+        );
+        let next = cb.split(OnFault::Return).unwrap().expect("a part");
+        let e = compute(&next);
+        encode_all(
+            &e,
+            [
+                set(&inc),
+                bind(&[Some(&w)], &[0]),
+                one(),
+                ComputeCmd::EndEncoding,
+            ],
+        );
+        completes(&next);
+        assert_eq!(words(&w)[0], 2);
+
+        let cb = command_buffer();
+        let e = compute(&cb);
+        encode_all(
+            &e,
+            [
+                set(&inc),
+                bind(&[Some(&w)], &[0]),
+                one(),
+                ComputeCmd::EndEncoding,
+            ],
+        );
+        let next = cb.split(OnFault::Return).unwrap().expect("a part");
+        let e = compute(&next);
+        dies_at("encodeEndIf", || {
+            e.encode_end_if().unwrap();
+        });
+    }
+
+    /// With a block open across a unit's encoders, an If, a While or a DoWhile, the command
+    /// buffer is kept whole at an encoder's end, and runs as it would uncut
+    #[test]
+    fn a_block_open_keeps_a_command_buffer_whole() {
+        let inc = kernel(INC, "inc_k");
+        let cond = holding(&[0]);
+        for opens in 0..3 {
+            let w = shared(64);
+            let cb = command_buffer();
+            let e = compute(&cb);
+            let start = match opens {
+                0 => start_if(&cond, 0, 0, 0),
+                1 => start_while(&cond, 0, 0, 1),
+                _ => ComputeCmd::EncodeStartDoWhile,
+            };
+            encode_all(&e, [set(&inc), start, ComputeCmd::EndEncoding]);
+            assert!(
+                cb.split(OnFault::Return).unwrap().is_none(),
+                "block {opens} open"
+            );
+            let e = compute(&cb);
+            encode_all(&e, [set(&inc), bind(&[Some(&w)], &[0]), one()]);
+            let closed = match opens {
+                0 => e.encode_end_if(),
+                1 => e.encode_end_while(),
+                _ => e.encode_end_do_while(Some(&cond), 0, 0, 1),
+            };
+            assert!(closed.unwrap(), "block {opens} closes");
+            encode_all(&e, [ComputeCmd::EndEncoding]);
+            completes(&cb);
+            // The If's condition holds (0 == 0), the While's fails (0 == 1), and the DoWhile
+            // runs once.
+            assert_eq!(words(&w)[0], [1, 0, 1][opens], "block {opens}");
         }
     }
 

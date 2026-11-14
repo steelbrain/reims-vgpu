@@ -23,6 +23,15 @@
 //! each shape and run: 100 µs cost the walk 5% more instructions and gained nothing, 500 µs left
 //! 0.2-0.4 ms on the table.
 //!
+//! A buffer of compute encoders alone is cut too, its unit of command predication going on in the
+//! next part (`gpu/command.rs` of the Vulkan platform, "A command buffer in parts"). Measured the
+//! same way by `dispatch_cost`'s `fluid` shape, a buffer shaped like Geekbench 7's Fluid
+//! Simulation's, of 2,600 encoders of one dispatch each, 6 a run, five runs: from the first
+//! message's take to its completion, the median fell from 87.0 ms whole to 34.8 ms in parts, and
+//! the walk's CPU time a dispatch from 14.7 to 8.8 µs (164.2k to 110.6k instructions): the runtime
+//! measured (metal2vulkan c796a88d6a) does more work for an encoder the more encoders its command
+//! buffer holds before it, and a part holds fewer.
+//!
 //! **What stays as it was.** The parts run in their order on the queue, as the encoders of one
 //! buffer do, and each part is committed only where the whole buffer could be committed then,
 //! waiting for nothing (`GraphicsDecoder::may_commit_now`): its turn on its queue is next, every

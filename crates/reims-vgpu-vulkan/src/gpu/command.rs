@@ -26,9 +26,15 @@
 //!   encoder open; with a way Metal's GPU fails it from an encoder on, every encoder after it
 //!   running nothing (a [`Failing`], a draw of primitive type 9), which a later part would run;
 //!   with protection options set; with an execution of an indirect command buffer whose commands
-//!   its commit reads, or progress kept to its completion; with a unit of command predication
-//!   open, which a later compute encoder would go on; and with an event signalled as it is
-//!   scheduled.
+//!   its commit reads, or progress kept to its completion; with a block of command predication
+//!   open, or a unit an unbalanced record emptied ([`Predication::cuttable`]); and with an event
+//!   signalled as it is scheduled. A unit of compute encoders open at the cut, with no block
+//!   open, goes on in the next part ([`Predication::go_on`]), so a command buffer of compute
+//!   encoders alone, as Geekbench 7's Fluid Simulation commits 2,600 of in one, is cut too, and
+//!   its GPU work starts while the rest is walked. Each part is its own commit of the runtime's,
+//!   so a guest whose walk faults after a part was committed has that part's work run, as for a
+//!   buffer of render passes (`reims-vgpu`'s `decode/split.rs`); Metal would have run none of a
+//!   buffer it never committed. Only invalid input reaches that.
 //! - **The records of an indirect command buffer an execution runs** are checked by the runtime
 //!   as they stand at commit, or, where the GPU may have written them, once the work before the
 //!   execution completed. A refusal at commit dies there naming the runtime's refusal, and says
@@ -375,9 +381,10 @@ impl CommandBufferObject {
     /// it for what its encoders did, nor a draw of primitive type 9, which fail it from an
     /// encoder on, every one after it running nothing; no protection options set; no execution
     /// of an indirect command buffer whose commands its commit reads, and no progress kept to
-    /// its completion (a rate map's reset, an indirect command buffer's numbers); no unit of
-    /// command predication open, which a later compute encoder would go on; and no event
-    /// signalled as it is scheduled. Not committed.
+    /// its completion (a rate map's reset, an indirect command buffer's numbers); no block of
+    /// command predication open, and no unit an unbalanced record emptied
+    /// ([`Predication::cuttable`]; a unit of compute encoders goes on in the next part); and no
+    /// event signalled as it is scheduled. Not committed.
     fn splits(&self) -> bool {
         plain(|| {
             self.open_encoders.load(Ordering::SeqCst) == 0
@@ -389,7 +396,7 @@ impl CommandBufferObject {
                 }
                 && self.executions.lock().is_empty()
                 && self.progress.lock().is_none()
-                && !self.predication.in_unit()
+                && self.predication.cuttable()
                 && !self.signals_scheduled.load(Ordering::SeqCst)
                 && !self.committed.load(Ordering::SeqCst)
         })
@@ -455,6 +462,14 @@ impl CommandBufferObject {
     /// where nothing does, or only its draws of primitive type 9, which the runtime fails it at
     /// ([`CommandBufferObject::fails_at_type_9`]). Two different ways at once, which nothing
     /// measured, die.
+    ///
+    /// A command buffer that fails so is never cut into parts ([`CommandBufferObject::splits`]),
+    /// so what fails is the encoders of one commit of the runtime's: a failure from an encoder
+    /// on is passed as `From` its first. Each part of a buffer that was cut is a commit of its
+    /// own, whose encoders the runtime treats as any commit's: what it records together of a
+    /// commit's encoders (consecutive compute encoders, in one Vulkan command buffer) it records
+    /// within a part, never across a cut, and such a group that fails, fails whole within its
+    /// part.
     fn failure(&self, sel: &'static str) -> Option<rt::CommitFailure> {
         let mut ways = plain(|| self.failing.lock().clone());
         let options = plain(|| self.protection.lock().options);
@@ -1383,12 +1398,15 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         let raw = waiting("commandBuffer", || {
             self.raw.command_queue().command_buffer()
         })?;
+        let predication = Predication::new(&self.device);
+        // The unit of compute encoders open at the cut goes on in the next part.
+        predication.go_on(&self.predication);
         let next = Obj::new(CommandBufferObject {
             raw,
             device: self.device.clone_ref(),
             open_encoders: Arc::default(),
             progress: Mutex::new(None),
-            predication: Predication::new(&self.device),
+            predication,
             committed: AtomicBool::new(false),
             made: AtomicUsize::new(0),
             failing: Mutex::new(Vec::new()),

@@ -198,6 +198,9 @@ enum Part {
     Blit,
     Signal,
     Wait,
+    /// The command buffer cut into parts there (`CommandBuffer::split`), the unit going on in
+    /// the next.
+    Split,
 }
 
 /// A dispatch of `add_one` over 4 words, or none.
@@ -238,7 +241,7 @@ fn unit<P: crate::core::platform::Platform>(d: &P::Device, parts: &[Part]) -> Ve
     let arguments = buffer(&[1, 1, 1, 0, 4, 1, 1, 4, 1, 1]);
     let event = d.new_shared_event().unwrap();
     event.set_signaled_value(5).unwrap();
-    let cb = d
+    let mut cb = d
         .new_command_queue()
         .unwrap()
         .command_buffer(OnFault::Return)
@@ -247,6 +250,10 @@ fn unit<P: crate::core::platform::Platform>(d: &P::Device, parts: &[Part]) -> Ve
     for part in parts {
         let (dispatch_type, dispatch) = match *part {
             Part::Encoder(dispatch_type, dispatch) => (dispatch_type, dispatch),
+            Part::Split => {
+                cb = cb.split(OnFault::Return).unwrap().expect("a part");
+                continue;
+            }
             Part::Blit => {
                 let blit = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
                 blit.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
@@ -313,18 +320,23 @@ fn unit<P: crate::core::platform::Platform>(d: &P::Device, parts: &[Part]) -> Ve
 /// neither serial nor concurrent counts as serial, the first encoder counts with no dispatch,
 /// and later indirect dispatches go on. A blit encoder, an event signal or wait between, a
 /// unit's indirect dispatch of the first's type, and a direct dispatch of another type go on,
-/// as on Metal
+/// as on Metal. A command buffer cut into parts between the encoders answers as it would whole:
+/// the unit goes on in the next part
 #[test]
 fn a_units_first_indirect_dispatch_of_another_type_dies() {
     use Dispatch::{Direct, GroupsIndirect as Groups, Nothing, ThreadsIndirect as Threads};
-    use Part::{Blit, Encoder, Signal, Wait};
+    use Part::{Blit, Encoder, Signal, Split, Wait};
 
     const SERIAL: Option<u64> = None;
     const CONCURRENT: Option<u64> = Some(1);
     let groups =
         "dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup:";
     let threads = "dispatchThreadsWithIndirectBuffer:indirectBufferOffset:";
-    let dies: [(&[Part], &str); 7] = [
+    let dies: [(&[Part], &str); 8] = [
+        (
+            &[Encoder(CONCURRENT, Direct), Split, Encoder(SERIAL, Groups)],
+            groups,
+        ),
         (
             &[Encoder(CONCURRENT, Direct), Encoder(SERIAL, Groups)],
             groups,
@@ -362,7 +374,8 @@ fn a_units_first_indirect_dispatch_of_another_type_dies() {
         let site = catch_death(|| unit::<VulkanPlatform>(&dev(), parts)).unwrap_err();
         assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{parts:?}");
     }
-    let goes_on: [&[Part]; 11] = [
+    let goes_on: [&[Part]; 12] = [
+        &[Encoder(SERIAL, Direct), Split, Encoder(SERIAL, Groups)],
         &[Encoder(CONCURRENT, Groups), Encoder(SERIAL, Direct)],
         &[Encoder(CONCURRENT, Direct), Encoder(CONCURRENT, Groups)],
         &[Encoder(SERIAL, Direct), Encoder(SERIAL, Groups)],

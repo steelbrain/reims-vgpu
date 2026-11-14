@@ -4113,7 +4113,11 @@ commit. Each outcome the new design allows is one of those two:
   completion, as one whose walk faults whole; the parts committed before the
   fault ran, as the encoders before a fault of Metal's GPU run. The Vulkan
   platform keeps a buffer whole where a part would answer otherwise than the
-  whole (`gpu/command.rs`, "A command buffer in parts"). Tested
+  whole (`gpu/command.rs`, "A command buffer in parts"); a buffer of compute
+  encoders alone is cut too, its unit of command predication going on in the
+  next part, and a buffer shaped like Geekbench 7's Fluid Simulation's, of
+  2,600 one-dispatch encoders, then completed in 34.8 ms where it took 87.0 ms
+  whole on the M3 Max (`decode/split.rs`, "What it gains"). Tested
   by `a_buffer_walked_long_is_committed_in_parts_with_one_outcome`,
   `a_buffer_is_committed_whole_where_its_parts_would_wait`,
   `another_queue_s_commit_waits_for_a_buffer_s_last_part` and
