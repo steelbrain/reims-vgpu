@@ -374,8 +374,9 @@ public:
 	void unnameSharedEvent(UInt64 name);
 
 	// The framebuffer on our PCI device (ReimsGraphics), retained for the caller, or nullptr
-	// before it has started. A lookup that finds it names this accelerator on it by its path as
-	// it stands (IOAccelTypes), as a display pipe's accelerator does.
+	// before it is attached. A lookup that finds it names this accelerator on it by its path as
+	// it stands (IOAccelTypes), as a display pipe's accelerator does; the first that finds it
+	// started keeps it, and the lookups after take the kept one while it runs.
 	ReimsGraphics *copyFramebuffer();
 	// Whether that framebuffer has started (ReimsGraphics::hasStarted): before, and once its stop
 	// has begun, the device holds nothing of any context, and no message of one reaches it.

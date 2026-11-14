@@ -10,8 +10,11 @@
 // the accelerated renderer too (measured: CGLQueryRendererInfo after
 // CGSSetDenyWindowServerConnections; IOAccelFindAccelerator answered 0xe00002bc, then 0).
 //
-// So the accelerator names itself on the framebuffer again whenever it finds the framebuffer
-// (RgfxAccelerator::copyFramebuffer), where the framebuffer's path is not its own as it stands.
+// So the accelerator names itself on the framebuffer again as it finds the framebuffer
+// (RgfxAccelerator::copyFramebuffer), where the framebuffer's path is not its own as it stands,
+// until it finds it started, which it keeps from then: the rename is the accelerator's own, at
+// its start, before its first lookup, and a framebuffer names it by the device's name at its
+// own start, before it counts as started, so the path a started framebuffer holds stays right.
 //
 // Header-only and free of the kernel's headers, so its native test (tests/accel_types_test.cpp)
 // builds it as the kext does.
