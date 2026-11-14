@@ -10,7 +10,9 @@
 //!   else (a vblank, ring 0, another queue's ring) may start a pass too;
 //! - the process's completion thread (`RgfxCompletionThread`), which takes the ring's records,
 //!   arms it, reads `producer` again, and sleeps in the kext until a wake moves the client's
-//!   count, which it reads as it returns.
+//!   count, which it reads as it returns. A ring its last arm found empty, from which it has
+//!   taken nothing since, it does not arm again while `producer` reads as it was then
+//!   (`RgfxReplyReader::armAndCheck`): the host clears `armed` only after a publish.
 //!
 //! Each step is one access to shared memory, in sequential consistency: each side fences between
 //! its write and its read, and the host's clear is a locked swap. Where the host has posted every
@@ -63,6 +65,9 @@ enum ThreadAt {
     PumpRead,
     /// The pump's store of `consumer` next.
     PumpTake,
+    /// Armed by a look that found nothing, and nothing taken since: the read of `producer` that
+    /// decides whether it arms again next.
+    ArmedLook,
     /// The store of `armed` 1 next.
     Arm,
     /// The read of `producer` after the arm next.
@@ -96,14 +101,19 @@ struct State {
     k_consumer: u8,
     last: u8,
     foreign: u8,
-    // The thread: where it is, the producer its pump read, what it took, the client's count it
-    // last saw; and the client's count.
+    // The thread: where it is, the producer its pump read, what it took, what it had taken when
+    // its last arm found nothing more (NOT_ARMED where it took something since), the client's
+    // count it last saw; and the client's count.
     thread: ThreadAt,
     pumped: u8,
     taken: u8,
+    armed_at: u8,
     seen: u8,
     count: u8,
 }
+
+/// The thread's `armed_at` where no arm found the ring empty since its last take.
+const NOT_ARMED: u8 = u8::MAX;
 
 /// What the walk found.
 #[derive(Debug, Default)]
@@ -224,15 +234,32 @@ fn next(s: State, post: Post, records: u8) -> Vec<State> {
             n.thread = ThreadAt::PumpTake;
         }
         ThreadAt::PumpTake => {
+            // `consumer` is stored only where the pump took something: the same value otherwise.
             n.taken = n.pumped;
             n.consumer = n.pumped;
-            n.thread = ThreadAt::Arm;
+            n.thread = if n.armed_at == n.taken {
+                ThreadAt::ArmedLook
+            } else {
+                ThreadAt::Arm
+            };
+        }
+        ThreadAt::ArmedLook => {
+            n.thread = if n.producer == n.taken {
+                ThreadAt::Wait
+            } else {
+                ThreadAt::Arm
+            };
         }
         ThreadAt::Arm => {
             n.armed = 1;
             n.thread = ThreadAt::ArmLook;
         }
         ThreadAt::ArmLook => {
+            n.armed_at = if n.producer == n.taken {
+                n.taken
+            } else {
+                NOT_ARMED
+            };
             n.thread = if n.producer != n.taken {
                 ThreadAt::PumpRead
             } else {
@@ -266,6 +293,7 @@ fn walk(post: Post, records: u8, foreign: u8) -> Outcome {
     let mut seen = HashSet::new();
     let mut todo = vec![State {
         foreign,
+        armed_at: NOT_ARMED,
         ..State::default()
     }];
     while let Some(s) = todo.pop() {
