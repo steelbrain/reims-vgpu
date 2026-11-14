@@ -511,7 +511,6 @@ dependencies = [
  "metal2vulkan-runtime",
  "objc2",
  "objc2-foundation",
- "objc2-io-surface",
  "objc2-metal",
  "parking_lot",
  "reims-vgpu-vulkan",

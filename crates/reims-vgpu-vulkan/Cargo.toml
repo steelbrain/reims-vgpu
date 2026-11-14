@@ -32,7 +32,6 @@ ash.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
 objc2-foundation.workspace = true
-objc2-io-surface.workspace = true
 objc2-metal.workspace = true
 mach2.workspace = true
 libc.workspace = true
