@@ -522,12 +522,12 @@ fn runtime_command_buffer(
 
 /// A device of the system default's physical device made with the product's options: the
 /// platform's, but announcing at every occurrence only what the product's device does (the kinds
-/// a call hears and those that die by default), where a test process's device announces every
-/// kind that dies, as in strict mode ([`crate::platform`]'s `announced_each`).
+/// a call hears), where a test process's device announces every kind that dies, as in strict
+/// mode ([`crate::platform`]'s `announced_each`).
 fn product_device() -> VulkanDevice {
-    use crate::answer::{DIES_BY_DEFAULT, HEARD};
+    use crate::answer::HEARD;
     let mut options = crate::platform::device_options().clone();
-    options.announce_each = DIES_BY_DEFAULT.iter().chain(&HEARD).copied().collect();
+    options.announce_each = HEARD.iter().copied().collect();
     // What the runtime costs under other options, for a measurement of the runtime alone:
     // `each` announcing every occurrence of nothing, `sink` without the message sink, `default`
     // the runtime's default options.

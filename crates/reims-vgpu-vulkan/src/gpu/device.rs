@@ -3000,6 +3000,72 @@ pub(crate) mod tests {
         assert_eq!(d.raw.work_counts().host_deallocators_delayed, 0);
     }
 
+    /// A no-copy buffer over a mapping of core's, released while a narrower one made over its
+    /// first page lives, which the device binds inside the wider one's import (the runtime's "One
+    /// page, one import") and which holds that import past the release: the runtime delays a
+    /// deallocator given no keep-alive until the narrower one went, announcing
+    /// `HostDeallocatorDelayed`, where Metal's runs at the release (the runtime's probe
+    /// `dealloc-probe4`, the M3 Max under macOS 27.0.1). Every no-copy buffer and heap this
+    /// platform makes gives one ([`no_copy_release`]), so the deallocator runs at the release, the
+    /// keep-alive keeping the pages mapped for the narrower one, and nothing is announced, which
+    /// in strict mode, this test's, would die there. The narrower one's runs at its own release.
+    /// The narrower one is made under the default: a device that did not bind it inside would make
+    /// it over a copy of its page (`copied-host-pages`), which the test then fails, as it would
+    /// reach nothing
+    #[test]
+    fn a_release_whose_import_another_buffer_holds_runs_its_deallocator_at_once() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let d = dev();
+        let vm = crate::remap::VulkanVm::new();
+        let page = crate::os::PAGE;
+        let va = vm.allocate_anywhere(2 * page).unwrap();
+        let made = |len: u64, ran: mpsc::Sender<()>| {
+            let deallocator: NoCopyDeallocator = Box::new(move || {
+                let _ = ran.send(());
+            });
+            // SAFETY: the pages stay mapped until both buffers went and their imports were freed.
+            let bytes = unsafe { HostRange::new(va, len) };
+            crate::answer::relaxed(|| {
+                d.new_buffer_over_host_memory(OnFault::Die, bytes, 0, Some(deallocator))
+            })
+            .unwrap()
+            .expect("a no-copy buffer")
+        };
+        let base = d.raw.work_counts();
+        let (wide_ran, wide_seen) = mpsc::channel();
+        let (narrow_ran, narrow_seen) = mpsc::channel();
+        let wide = made(2 * page, wide_ran);
+        let narrow = made(page, narrow_ran);
+        let bound = |c: &rt::WorkCounts| c.object_churn.buffers_bound_in_import;
+        let inside = bound(&d.raw.work_counts()) > bound(&base);
+        assert!(
+            inside,
+            "the narrower one lies inside the wider one's import"
+        );
+        drop(wide);
+        assert!(
+            wide_seen.try_recv().is_ok(),
+            "the wider one's deallocator ran at its release"
+        );
+        let counts = d.raw.work_counts();
+        assert_eq!(
+            counts.host_deallocators_delayed,
+            base.host_deallocators_delayed
+        );
+        assert_eq!(
+            counts.host_releases_held_inside - base.host_releases_held_inside,
+            1,
+            "the narrower one held the wider one's import past its release"
+        );
+        drop(narrow);
+        assert!(
+            narrow_seen.recv_timeout(Duration::from_secs(30)).is_ok(),
+            "the narrower one's deallocator ran"
+        );
+        assert!(vm.deallocate(va, 2 * page).is_success());
+    }
+
     #[test]
     fn a_device_is_one_object() {
         let d = dev();

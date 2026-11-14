@@ -51,14 +51,16 @@
 //! refuses alike.
 //!
 //! **A degradation of a kind [`DIES`] lists is relayed, and dies in strict mode** ([`notice`],
-//! the runtime's message sink), but those of [`DIES_BY_DEFAULT`], which die in either mode: the
-//! runtime announces each kind of degradation once per device, but these kinds at every
-//! occurrence in strict and census mode, and those of [`DIES_BY_DEFAULT`] in every mode
+//! the runtime's message sink): the runtime announces each kind of degradation once per device,
+//! but these kinds at every occurrence in strict and census mode
 //! (`DeviceOptions::announce_each`, [`crate::platform`]).
-//! By default the process goes on: the first occurrence of each kind writes the runtime's line,
-//! and each occurrence announced is counted ([`relayed_counts`]), as a native device's relay is
-//! (docs/accuracy-ledger.md: a difference from Metal's answer is logged, never a death of its
-//! own). **Strict mode** ([`strict`], `REIMS_VGPU_STRICT=1`, read once per process) restores the
+//! By default the process goes on, whatever the kind: the first occurrence of each kind writes
+//! the runtime's line, and each occurrence announced is counted ([`relayed_counts`]), as a native
+//! device's relay is (docs/accuracy-ledger.md: a difference from Metal's answer is logged, never a
+//! death of its own; the process ends only where Metal ends it, or where an operation cannot run
+//! at all). No kind dies by default: where Metal goes on, a death is no more Metal's answer than
+//! the difference the runtime relays (`released_command_states_are_relayed_by_default`). **Strict
+//! mode** ([`strict`], `REIMS_VGPU_STRICT=1`, read once per process) restores the
 //! deaths, for tests and audits: the call that announced it dies once it returns, at its selector,
 //! naming the notice, and a notice announced on a thread outside every call here (the runtime's
 //! scheduler thread, at a host step) dies where it is announced. Where a kind's docs below say it
@@ -792,16 +794,18 @@ pub fn created_or_decided<T>(
 ///   the hardware forces the difference, and the blend is not in the function's own arithmetic,
 ///   whose fast-math rewrites `FastMathRewrites` covers. It dies on every device. Announced at
 ///   each draw that binds the state's variant, inside its call, which dies at its selector;
-/// - `PrivateResourceOption`: a resource made with `MTLResourceOptions` bit 24, a private option
-///   Metal takes, which the runtime makes as without it: on Metal a no-copy buffer made with it
-///   keeps the GPU's writes from the CPU (the runtime's probe `nc_bit24`), where the runtime's
-///   reach the CPU. On macOS the runtime imports a no-copy buffer's or heap's pages of the option
-///   through a read-only view of them, which drops the GPU's writes as Metal's does, and
-///   announces nothing there; it announces a heap of its own memory, an indirect command buffer
-///   and, off macOS, the no-copy ones. A device can hold the GPU's writes in memory of its own,
-///   apart from the guest's pages, so nothing in the hardware forces the difference, and it dies
-///   on every device. Announced where the resource is made, inside the creator, which dies at its
-///   selector;
+/// - `PrivateResourceOption`: a heap of the runtime's own memory (a guest's `Private` heap) or an
+///   indirect command buffer made with `MTLResourceOptions` bit 24, a private option Metal takes,
+///   which the runtime makes as without it, the GPU's writes reaching its memory. The M3 Max keeps
+///   the GPU's writes from such memory, a kernel's records of such a buffer among them, and faults
+///   a render pass's store-out into it; the Radeon Pro 5300M and the UHD Graphics 630 write it as
+///   without the bit, a `Private` heap's textures and a kernel's records included
+///   (docs/graphics-kext/dgpu-oracle.md Q38 and Q44). A no-copy buffer or heap of the bit
+///   announces nothing: the runtime imports its pages through a read-only view of them on macOS
+///   and over a copy of them off it, each dropping the GPU's writes as the M3 Max's does. A device
+///   can hold the GPU's writes in memory of its own, so nothing in the hardware forces the
+///   difference, and it dies on every device. Announced where the resource is made, inside the
+///   creator, which dies at its selector;
 /// - `StaleDetachedReach`: a command buffer that bound a heap set, whose commands may reach a
 ///   texture through its ID without naming it, submitted while the texture's bytes were
 ///   detached after a submitted command buffer made them resident: a read that does not name
@@ -1676,11 +1680,16 @@ fn depth() -> u32 {
 /// Whether this process dies at a difference from Metal's answer it could go on past: a
 /// degradation of [`DIES`] or one of [`Inexact`] (the module's docs). `REIMS_VGPU_STRICT` set to
 /// `1`, read once per process, turns it on; by default the process relays them and goes on. A
-/// test of this crate runs strict, but where the tests' `relaxed` runs it on its thread.
+/// test of this crate runs strict, but where the tests' `relaxed` runs it on its thread, or their
+/// `relaxed_process` on every thread.
 pub fn strict() -> bool {
     #[cfg(test)]
     if let Some(strict) = TEST_STRICT.with(Cell::get) {
         return strict;
+    }
+    #[cfg(test)]
+    if TEST_RELAXED_PROCESS.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
     }
     strict_process()
 }
@@ -1712,6 +1721,33 @@ pub(crate) fn relaxed<T>(call: impl FnOnce() -> T) -> T {
         }
     }
     let _restore = Restore(TEST_STRICT.with(|s| s.replace(Some(false))));
+    call()
+}
+
+/// Whether every thread of the process runs under the default, not strict, but where a thread's
+/// own strictness says otherwise ([`relaxed_process`]).
+#[cfg(test)]
+static TEST_RELAXED_PROCESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Runs `call` with the notices of every thread of the process under the default, not strict:
+/// [`relaxed`] for a test of what the process does without `REIMS_VGPU_STRICT` where the runtime
+/// announces on a thread of its own, outside every call here (a host step's, on its scheduler
+/// thread). A thread that runs [`relaxed`] or a strictness of its own keeps it. Process-wide, so
+/// sound only where the process runs one test: nextest runs each test in a process of its own
+/// (which `gpu::device::tests::metal_tests` and `core::trace` rely on too), where no other test's
+/// notice meets the default meanwhile.
+#[cfg(test)]
+pub(crate) fn relaxed_process<T>(call: impl FnOnce() -> T) -> T {
+    use std::sync::atomic::Ordering;
+    /// Puts back the process's strictness on drop, an unwinding call's included.
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_RELAXED_PROCESS.store(self.0, Ordering::Release);
+        }
+    }
+    let _restore = Restore(TEST_RELAXED_PROCESS.swap(true, Ordering::AcqRel));
     call()
 }
 
@@ -1885,27 +1921,11 @@ fn noticed_inside(sel: Option<&'static str>, notice: &rt::DegradeNotice) {
     }
 }
 
-/// The kinds of [`DIES`] that die by default too, not only in strict mode, as the guest or the
-/// host would otherwise go on past a break of what it relies on, which no log line repairs:
-/// - `ReleasedCommandState`: a command whose record the GPU wrote naming a released state whose
-///   program the buffer does not keep runs nothing, and one naming the ID of a released state the
-///   CPU set, which another state held while the GPU could write the record, runs the set state's
-///   program, where Metal runs the state the GPU's write named in both;
-/// - `PrivateResourceOption`: the GPU's writes reach the guest's pages, which Metal's never do
-///   for such a resource (announced off macOS for no-copy memory, as `DIES` says);
-/// - `HostDeallocatorDelayed`: the deallocator, which the host sees as the release, runs after
-///   the release, out of the host's release order.
-pub const DIES_BY_DEFAULT: [rt::Degradation; 3] = [
-    rt::Degradation::ReleasedCommandState,
-    rt::Degradation::PrivateResourceOption,
-    rt::Degradation::HostDeallocatorDelayed,
-];
-
 /// What [`notice`] does with a degradation of [`DIES`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fate {
-    /// Strict mode ([`strict`]), or a kind of [`DIES_BY_DEFAULT`]: it dies at the call it was
-    /// announced inside, or where it was announced outside every call.
+    /// Strict mode ([`strict`]): it dies at the call it was announced inside, or where it was
+    /// announced outside every call.
     Dies,
     /// A native device relays it ([`native::NATIVE_RELAYED`]): counted, the first relayed.
     RelayedNatively,
@@ -1922,7 +1942,7 @@ fn fate(kind: rt::Degradation, placement: native::Placement, census: bool, stric
         Fate::RelayedNatively
     } else if census {
         Fate::Counted
-    } else if strict || DIES_BY_DEFAULT.contains(&kind) {
+    } else if strict {
         Fate::Dies
     } else {
         Fate::Relayed
@@ -3336,7 +3356,9 @@ mod tests {
     /// on a native device the kinds of `native::NATIVE_RELAYED` are relayed and every other one
     /// dies; census mode counts and relays what would die, and leaves a native relay a native
     /// relay. By default every kind is relayed, counted, on every device, and the process goes
-    /// on, but those of `DIES_BY_DEFAULT`, which die
+    /// on: none dies by default, those that break what the guest or the host relies on included
+    /// (a command run otherwise than Metal's, a resource's writes reaching its memory, a
+    /// deallocator run late), as Metal goes on there too
     #[test]
     fn a_kind_of_dies_is_placed_by_the_device_class() {
         use native::Placement::{Native, OnMetal};
@@ -3344,11 +3366,7 @@ mod tests {
             let natively = native::relayed(kind);
             assert_eq!(fate(kind, OnMetal, false, true), Fate::Dies, "{kind:?}");
             assert_eq!(fate(kind, OnMetal, true, true), Fate::Counted, "{kind:?}");
-            let by_default = if DIES_BY_DEFAULT.contains(&kind) {
-                Fate::Dies
-            } else {
-                Fate::Relayed
-            };
+            let by_default = Fate::Relayed;
             assert_eq!(fate(kind, OnMetal, false, false), by_default, "{kind:?}");
             assert_eq!(fate(kind, OnMetal, true, false), Fate::Counted, "{kind:?}");
             let (native, census, relayed) = if natively {
@@ -3384,12 +3402,23 @@ mod tests {
         assert_eq!(fate(scale, OnMetal, false, true), Fate::Dies);
         assert_eq!(fate(scale, Native, false, false), Fate::Relayed);
         assert_eq!(fate(scale, OnMetal, false, false), Fate::Relayed);
-        // A kind whose difference breaks what the guest or host relies on dies by default too,
-        // on every device; each is one of DIES, and none a native relay.
-        for kind in DIES_BY_DEFAULT {
+        // The kinds that died by default until now, whose difference breaks what the guest or the
+        // host relies on, are relayed by default on every device, and die in strict mode: none is
+        // a native relay.
+        for kind in [
+            rt::Degradation::ReleasedCommandState,
+            rt::Degradation::PrivateResourceOption,
+            rt::Degradation::HostDeallocatorDelayed,
+        ] {
             assert!(DIES.contains(&kind) && !native::relayed(kind), "{kind:?}");
-            assert_eq!(fate(kind, OnMetal, false, false), Fate::Dies, "{kind:?}");
-            assert_eq!(fate(kind, Native, false, false), Fate::Dies, "{kind:?}");
+            for placement in [OnMetal, Native] {
+                assert_eq!(
+                    fate(kind, placement, false, false),
+                    Fate::Relayed,
+                    "{kind:?}"
+                );
+                assert_eq!(fate(kind, placement, false, true), Fate::Dies, "{kind:?}");
+            }
         }
     }
 

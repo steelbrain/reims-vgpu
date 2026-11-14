@@ -2236,6 +2236,65 @@ the guest. The device now answers an `MTLTargetDeviceArchitecture` of its own ta
 version 1.0.0 (`versionCombined` 0x10000) with `driverVersion` 0x10000. No Mac's archive holds a
 slice of it, and the device's own archives are of its own format.
 
+## Q43: a command a kernel encodes naming a released state
+
+Probe: `oracle_icb DEVICE freedstate`, 11-14, 2 runs on each Mac: the M3 Max under macOS 27.0.1
+(26A434), m3-max-30466; the AMD 5300M and the Intel UHD 630 under macOS 26.7.1 (25G241),
+m3-max-30464 and m3-max-30465. A kernel writes compute command 0 of an indirect command buffer
+from an argument buffer holding the ID of an `icb_add` state x of indirect command buffer support,
+which the program released (its last reference dropped in an autorelease pool), and the command is
+executed. `out` reads 5 where `icb_add` ran, 6 where an `icb_mul` state y ran, and 2 where nothing
+did.
+
+| shape | M3 Max | AMD 5300M | Intel UHD 630 | class |
+|---|---|---|---|---|
+| x released before the write, no state made since | x runs (5); completes | the command buffer fails with code 2 (`kIOAccelCommandBufferCallbackErrorTimeout`), nothing run (2) | x runs (5); completes | 2 |
+| x released after the write's command buffer completed, before the execute | x runs | the same | the same | 3 |
+| x released before the write, y made since | y took x's ID (7) and runs (6) | the same | y took a new ID (10), and x runs (5) | 3: the ID's last holder runs |
+| the CPU set x, x released, y made, the kernel writes the state | y runs (6) | the same | x runs (5): y took another ID | 3, as above |
+| the CPU set x, x released, y made, the kernel writes the buffers alone | x runs (5) | the same | the same | 3 |
+
+- **Which state runs** *(class 3)*. A record the GPU wrote runs the state that last took the ID it
+  names, released or not, and a command whose state the GPU did not write runs the state the CPU
+  set, whoever took its ID since. Every command buffer but the 5300M's first completes with no
+  error. The M3 Max and the 5300M hand a new state the lowest free ID, the 630 a new one.
+- **A state released before the write, its ID taken by none** *(class 2)*. The M3 Max and the 630
+  run it; the 5300M times the command buffer out.
+
+What our stack does (metal2vulkan ce54ad8b25): a record the GPU wrote runs the program of the state
+that held the ID as the GPU last could write the buffer's records, a released one's where the buffer
+kept it: from a release after a command buffer that may write the records was encoded, so the
+second shape is every Mac's. In the first shape the command runs nothing and its command buffer
+completes, no Mac's answer *(class 4)*, relayed (`released-command-state`), where until 11-14 the
+process ended. In the fourth the runtime runs x, the state the CPU set, as it cannot tell the GPU's
+write of the ID from the CPU's, where the M3 Max and the 5300M run y *(class 4)*, relayed alike; the
+fifth runs x, every Mac's answer, and is relayed too. Each exact answer is the runtime's to build:
+the program of each ID's last released holder kept until another state takes the ID, and a record's
+state told written by the GPU or set by the CPU.
+
+## Q44: an indirect command buffer made with `MTLResourceOptions` bit 24
+
+Probe: `oracle_readonly.sh DEVICE` with `SHAPES="icb-cpu icb-gpu icb-gpu-over-cpu"`, 11-14, 2 runs
+a shape and backing, beside Q43's jobs (m3-max-30466, m3-max-30464, m3-max-30465). An indirect
+command buffer of one compute command, made with bit 24 or without it (the control), Shared where
+the CPU encodes and Private where a kernel alone does; its command a dispatch that adds 5 to a word
+of 16, the CPU's (`icb-cpu`), a kernel's (`icb-gpu`), or a kernel's over the CPU's add of 1
+(`icb-gpu-over-cpu`); executed in one command buffer, and again in another.
+
+| what | M3 Max | AMD 5300M and Intel UHD 630 | class |
+|---|---|---|---|
+| the buffer | made; `resourceOptions` without the bit (0x200 Shared, 0x220 Private), as without it | the same | 3 |
+| a command the CPU encoded | runs (21), in both command buffers | the same | 3 |
+| a command a kernel encoded | nothing runs (16): the GPU's write of the record is dropped | runs (21) | 2 |
+| a kernel's command over the CPU's | the CPU's runs (17) | the kernel's runs (21) | 2 |
+
+Every command buffer completes with no error, and the queue runs on, as without the bit.
+
+What our stack does (metal2vulkan ce54ad8b25): the runtime makes such a buffer as without the bit,
+relayed (`private-resource-option`), dying in strict mode: the CPU's commands run, every Mac's
+answer, and a kernel's records land, the x86 Macs' *(class 2)*. The M3 Max's drop of the GPU's
+writes is the runtime's to build, for an arm64 guest's frameworks.
+
 ## Not measured
 
 - Cross-process lock waits for pending GPU work: rgk-lock's `lock_probe` (x86 matches the M3,

@@ -2444,7 +2444,7 @@ mod tests {
     use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
     use crate::core::platform::device::GpuDevice;
     use crate::core::platform::resource::{Buffer as _, ComputePipeline as _};
-    use crate::core::platform::types::NsRange;
+    use crate::core::platform::types::{NsErrorText, NsRange};
     use crate::core::raise::OnFault;
     use crate::core::raise::death::DeathKind;
     use crate::core::testkit::capture::catch_death;
@@ -3044,15 +3044,35 @@ mod tests {
         icb: &P::Icb,
         state: u64,
     ) {
+        let kernel = kernel_state::<P>(d, library, name);
+        encode_with_kernel::<P>(d, &kernel, icb, state);
+    }
+
+    /// The state of the kernel `name` of `library`, made on `d` without indirect command buffer
+    /// support.
+    fn kernel_state<P: Platform>(
+        d: &P::Device,
+        library: &P::Library,
+        name: &str,
+    ) -> P::ComputePipeline {
         use crate::core::platform::resource::Library as _;
         let f = library
             .new_function(OnFault::Return, name)
             .unwrap()
             .unwrap();
-        let kernel = d
-            .new_compute_pipeline_state_for_function(Some(&f))
+        d.new_compute_pipeline_state_for_function(Some(&f))
             .unwrap()
-            .unwrap();
+            .unwrap()
+    }
+
+    /// Runs `kernel`, one of [`ICB_ENCODE`]'s encoding kernels, once on `d`, as
+    /// [`encode_by_kernel`] runs it.
+    fn encode_with_kernel<P: Platform>(
+        d: &P::Device,
+        kernel: &P::ComputePipeline,
+        icb: &P::Icb,
+        state: u64,
+    ) {
         let held = d
             .new_buffer_of_length(OnFault::Return, 16, 0)
             .unwrap()
@@ -3069,7 +3089,7 @@ mod tests {
         let resident = [Some(ResourceRef::Icb(icb))];
         for cmd in [
             ComputeCmd::SetComputePipelineState {
-                state: Some(&kernel),
+                state: Some(kernel),
             },
             ComputeCmd::SetBuffers {
                 buffers: &buffers,
@@ -3234,12 +3254,136 @@ mod tests {
         unsafe { *out.contents().as_ptr::<u32>() }
     }
 
+    /// An execution of a command a kernel encoded naming a state of `mark` the program released
+    /// before any command buffer that may write the buffer's records was encoded, whose ID no
+    /// state took since, on `d`: the command buffer's status and error, and what `out`'s first word
+    /// reads after it (1 where the released state's program ran).
+    fn released_before_the_write<P: Platform>(d: &P::Device) -> ((u64, Option<NsErrorText>), u32) {
+        let library = d.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
+        // The encoding kernel's state first: no state made after the release takes its ID.
+        let kernel = kernel_state::<P>(d, &library, "set_compute_state");
+        let state = marking_state::<P>(d, &library);
+        let out = d
+            .new_buffer_of_length(OnFault::Return, 16, 0)
+            .unwrap()
+            .unwrap();
+        let icb = make::<P>(d, &compute_desc(), 1);
+        let command = icb.compute_command(0).unwrap().unwrap();
+        command
+            .encode(IcbComputeCmd::SetKernelBuffer {
+                buffer: Some(&out),
+                offset: 0,
+                index: 0,
+            })
+            .unwrap();
+        let id = state.gpu_resource_id();
+        drop(state);
+        encode_with_kernel::<P>(d, &kernel, &icb, id);
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+        let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
+        for cmd in [
+            ComputeCmd::UseResources {
+                resources: &[Some(ResourceRef::Icb(&icb))],
+                usage: 1,
+            },
+            ComputeCmd::UseResources {
+                resources: &[Some(ResourceRef::Buffer(&out))],
+                usage: 3,
+            },
+            ComputeCmd::ExecuteCommandsInBuffer {
+                indirect_command_buffer: &icb,
+                execution_range: NsRange::new(0, 1),
+            },
+            ComputeCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Return, cmd).unwrap();
+        }
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        // SAFETY: the buffer's first Shared word, read after the execution completed.
+        let word = unsafe { *out.contents().as_ptr::<u32>() };
+        ((cb.status().0, cb.error()), word)
+    }
+
+    /// An execution of a command a kernel encoded naming a state the program released before any
+    /// command buffer that may write the buffer's records was encoded, whose ID no state took
+    /// since, runs nothing: the runtime keeps no program for it. The M3 Max and the UHD Graphics
+    /// 630 run the released state's program, and the Radeon Pro 5300M fails the command buffer
+    /// with a timeout (docs/graphics-kext/dgpu-oracle.md Q43), which the runtime's host step,
+    /// naming no command buffer, cannot give. By default that is relayed (`ReleasedCommandState`,
+    /// announced as the host step records the execution, on the runtime's scheduler thread),
+    /// counted once, and the process goes on: the command buffer completes with no error, as the
+    /// M3 Max's does, and the device runs the next one. A death there is no Mac's answer
+    #[test]
+    fn released_command_states_are_relayed_by_default() {
+        let d = dev();
+        let released = rt::Degradation::ReleasedCommandState;
+        let (ended, word) =
+            crate::answer::relaxed_process(|| released_before_the_write::<VulkanPlatform>(&d));
+        assert_eq!(ended, (COMPLETED, None), "the command buffer");
+        assert_eq!(word, 0, "the command ran nothing");
+        let counted = crate::answer::relayed_counts();
+        assert_eq!(counted, [(released, 1)], "the kinds of DIES relayed");
+        // The device goes on: a command the CPU encoded with a live state runs.
+        assert_eq!(released_state_marks::<VulkanPlatform>(&d), 1);
+    }
+
+    /// An indirect command buffer made with `MTLResourceOptions` bit 24, Metal's private option,
+    /// is made as without it, the runtime's `PrivateResourceOption`: in strict mode it dies at its
+    /// creator; by default it is relayed, counted once, and the process goes on. The buffer is
+    /// made, and a command the CPU encoded into it runs, its write landing, as on every Mac asked
+    /// (docs/graphics-kext/dgpu-oracle.md Q44)
+    #[test]
+    fn indirect_command_buffers_of_bit_24_are_relayed_by_default() {
+        use crate::gpu::resource::tests::BIT_24;
+        let d = dev();
+        let kind = rt::Degradation::PrivateResourceOption;
+        let made = || d.new_indirect_command_buffer(&compute_desc(), 1, BIT_24);
+        let site = crate::answer::dies_of(kind, made);
+        assert_eq!(
+            site.file,
+            "newIndirectCommandBufferWithDescriptor:maxCommandCount:options:"
+        );
+        let icb = crate::answer::relaxed(made)
+            .unwrap()
+            .expect("a buffer, as without the bit");
+        let library = d.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
+        let state = marking_state::<VulkanPlatform>(&d, &library);
+        let out = d
+            .new_buffer_of_length(OnFault::Return, 16, 0)
+            .unwrap()
+            .unwrap();
+        let command = icb.compute_command(0).unwrap().unwrap();
+        for cmd in [
+            IcbComputeCmd::SetComputePipelineState {
+                pipeline_state: Some(&state),
+            },
+            IcbComputeCmd::SetKernelBuffer {
+                buffer: Some(&out),
+                offset: 0,
+                index: 0,
+            },
+            IcbComputeCmd::ConcurrentDispatchThreads {
+                threads_per_grid: MtlSize::new(1, 1, 1),
+                threads_per_threadgroup: MtlSize::new(1, 1, 1),
+            },
+        ] {
+            command.encode(cmd).unwrap();
+        }
+        execute_writing::<VulkanPlatform>(&d, &icb, &out);
+        // SAFETY: the buffer's first Shared word, read after the execution completed.
+        let word = unsafe { *out.contents().as_ptr::<u32>() };
+        assert_eq!(word, 1, "the command ran");
+        assert_eq!(crate::answer::relayed_counts(), [(kind, 1)]);
+    }
+
     /// An execution of a command a kernel encoded with a state the program released since, whose
     /// ID nothing took, runs the released state's program: the runtime keeps the program of a
     /// state of indirect command buffer support released after a command buffer that may write
     /// the buffer's records was encoded, and announces nothing (`ReleasedCommandState` covers
-    /// what it does not keep, [`crate::answer::DIES_BY_DEFAULT`]). Metal's is the same
-    /// (`metal_tests`)
+    /// what it does not keep, `released_command_states_are_relayed_by_default`). Metal's is the
+    /// same (`metal_tests`)
     #[test]
     fn an_execution_of_a_record_the_gpu_wrote_naming_a_released_state_runs_it() {
         assert_eq!(released_state_marks::<VulkanPlatform>(&dev()), 1);

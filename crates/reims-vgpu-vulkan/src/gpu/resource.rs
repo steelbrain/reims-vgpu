@@ -3003,6 +3003,67 @@ pub(crate) mod tests {
         assert_eq!(heap(Some(at)).unwrap().gpu_address(), at);
     }
 
+    /// A `Private` heap of the device's own memory made with `MTLResourceOptions` bit 24 (a
+    /// guest's `newHeapWithDescriptor:` of the bit) is made as without it, the runtime's
+    /// `PrivateResourceOption`: in strict mode it dies at its creator; by default it is relayed,
+    /// counted once, and the process goes on. The heap is made, the descriptor's options holding
+    /// the bit as the guest set them, and a blit's fill of a buffer in it lands, as on the Radeon
+    /// Pro 5300M and the UHD Graphics 630, on which bit 24 does nothing, a `Private` heap's
+    /// textures included (docs/graphics-kext/dgpu-oracle.md Q38), where the M3 Max drops the
+    /// GPU's writes into such memory
+    #[test]
+    fn private_heaps_of_bit_24_are_relayed_by_default() {
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::resource::Buffer as _;
+        use crate::core::platform::types::NsRange;
+        let d = dev();
+        let kind = rt::Degradation::PrivateResourceOption;
+        let desc = HeapDesc {
+            size: 0x4000,
+            heap_type: 1,
+            options: vec![
+                OptionSet::StorageMode(2),
+                OptionSet::ResourceOptionsOr(BIT_24),
+            ],
+            pinned_gpu_address: None,
+        };
+        let site = crate::answer::dies_of(kind, || d.new_heap(&desc));
+        assert_eq!(site.file, "newHeapWithDescriptor:");
+        let made = crate::answer::relaxed(|| d.new_heap(&desc)).unwrap();
+        assert_eq!(made.descriptor_resource_options, 0x20 | BIT_24);
+        let heap = made.heap.expect("a heap, as without the bit");
+        let placed = heap.new_buffer_of_length(16, 0x20, 0).unwrap().unwrap();
+        let read = shared(16);
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+        let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+        for cmd in [
+            BlitCmd::FillBuffer {
+                buffer: &placed,
+                range: NsRange::new(0, 16),
+                value: 0x5c,
+            },
+            BlitCmd::CopyBufferToBuffer {
+                source_buffer: Some(&placed),
+                source_offset: 0,
+                destination_buffer: Some(&read),
+                destination_offset: 0,
+                size: 16,
+            },
+            BlitCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Return, cmd).unwrap();
+        }
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        assert_eq!(cb.error(), None);
+        // SAFETY: a Shared buffer's 16 bytes, read after the command buffer completed.
+        let bytes = unsafe { std::slice::from_raw_parts(read.contents().as_ptr::<u8>(), 16) };
+        assert_eq!(bytes, &[0x5c; 16], "the fill landed");
+        assert_eq!(crate::answer::relayed_counts(), [(kind, 1)]);
+    }
+
     /// Core's fill of a texture with the bytes of a buffer whose contents are NULL (a `Private`
     /// one's) reads the buffer's NULL contents plus the offset, and dies at the fill as a NULL
     /// access, where Metal's read of the bytes ends the process with a segmentation fault, of any
