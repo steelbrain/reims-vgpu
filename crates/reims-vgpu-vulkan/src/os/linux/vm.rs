@@ -781,6 +781,7 @@ pub(super) fn mappings_added(pieces: &[files::Piece]) -> u64 {
 /// "Views through dma-bufs" and "Imports of views"). Records them: all or nothing, the pieces
 /// mapped before a refusal put back.
 fn map_view(target: u64, pieces: Vec<files::Piece>) -> Result<(), KernReturn> {
+    trace_view(target, &pieces);
     let adding = mappings_added(&pieces);
     // Held until the pieces are recorded, which counts them.
     let claim = super::import::imports_need_files()
@@ -813,6 +814,50 @@ fn map_view(target: u64, pieces: Vec<files::Piece>) -> Result<(), KernReturn> {
     }
     files::record_pieces(target, pieces);
     Ok(())
+}
+
+/// The block the trace's `view` record measures a view's runs against: 64 KiB.
+const TRACE_BLOCK: u64 = 64 << 10;
+
+/// The trace's record of a view of `pieces` from `target`, with `REIMS_VGPU_TRACE` set
+/// ([`crate::core::trace`]): `view`, its first byte, its runs (pieces whose bytes follow on in
+/// the view and in the same file taken as one), its bytes, the bytes in runs of
+/// [`TRACE_BLOCK`] or more, and the bytes in whole blocks of [`TRACE_BLOCK`] whose offsets from
+/// the view's first byte and in their file are both multiples of it. A diagnostic: nothing with
+/// the trace off.
+fn trace_view(target: u64, pieces: &[files::Piece]) {
+    if !crate::core::trace::on() {
+        return;
+    }
+    let (mut runs, mut bytes, mut long, mut blocks) = (0u64, 0u64, 0u64, 0u64);
+    let mut rest = pieces;
+    while let Some((first, after)) = rest.split_first() {
+        let mut length = first.length;
+        let follows = after
+            .iter()
+            .take_while(|p| {
+                let on = Arc::ptr_eq(&p.backing.fd, &first.backing.fd)
+                    && p.at == first.at + length
+                    && p.backing.offset == first.backing.offset + length;
+                if on {
+                    length += p.length;
+                }
+                on
+            })
+            .count();
+        runs += 1;
+        bytes += length;
+        if length >= TRACE_BLOCK {
+            long += length;
+        }
+        if first.at % TRACE_BLOCK == first.backing.offset % TRACE_BLOCK {
+            let start = first.at.next_multiple_of(TRACE_BLOCK);
+            let end = (first.at + length) / TRACE_BLOCK * TRACE_BLOCK;
+            blocks += end.saturating_sub(start);
+        }
+        rest = &after[follows..];
+    }
+    crate::core::trace::event("view", &[target, runs, bytes, long, blocks]);
 }
 
 /// Logs, once per kind, why a view of several runs is mapped from their files, a mapping a run,

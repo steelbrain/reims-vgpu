@@ -340,6 +340,7 @@ fn make(free: &[Range<u64>]) {
     if let Some(step) = BEFORE_UNMAPS.lock().take() {
         step();
     }
+    let started = crate::core::trace::now();
     let vm = OsVm::new();
     for pages in free {
         let at = HostPtr::from_addr(pages.start.to_usize());
@@ -347,6 +348,9 @@ fn make(free: &[Range<u64>]) {
     }
     HOLDS.lock().unmapped(free);
     UNMAPPED.notify_all();
+    // unmaps (timed at their end): when they began, how many ranges, their bytes
+    let bytes = free.iter().map(|pages| pages.end - pages.start).sum();
+    crate::core::trace::event("unmaps", &[started, free.len().to_u64(), bytes]);
 }
 
 /// A hold on the host pages a runtime import covers, which the runtime is given in a no-copy
