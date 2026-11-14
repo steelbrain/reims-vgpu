@@ -37,8 +37,12 @@ use crate::geometry::Layout;
 use crate::handle::Window;
 use crate::present::{Presenting, RETRY, VulkanTarget};
 
-/// The render thread's stack.
-const STACK: usize = 512 * 1024;
+/// The render thread's stack: 8 MiB, as the process's main thread has, on which the process's
+/// default device is made. The render thread's presenter makes the window's own device where the
+/// compositor composites on another GPU ([`VulkanTarget`]), and the runtime assembles that device
+/// on this thread: at 512 KiB the assembly overflowed the stack, a SIGSEGV in the runtime's
+/// `assemble` (**measured** 2026-11-13, an RTX 3090's process making a device on a Radeon 780M).
+const STACK: usize = 8 << 20;
 
 /// SDL's window, as its render thread holds it: only to make the window's Vulkan surface of it.
 #[derive(Clone, Copy, Debug)]
@@ -277,6 +281,33 @@ fn run(window: &Window) {
 mod tests {
     use super::*;
     use crate::geometry::{self, Insets};
+
+    /// A device is made and let go on a thread of the render thread's own stack, as the render
+    /// thread makes the window's device on the compositor's GPU: the process's first device, so
+    /// the runtime assembles it on that thread (a device it made already it hands out again,
+    /// assembling nothing). A host with no Vulkan device makes none, and the thread still ends.
+    #[test]
+    fn a_device_is_made_on_the_render_threads_stack() {
+        let (sent, ended) = std::sync::mpsc::channel();
+        spawn_named(
+            &OsThreads::new(),
+            "reims-vgpu.window",
+            STACK,
+            Box::new(()),
+            move || {
+                let device = reims_vgpu_vulkan::VulkanPlatform::system_default_device();
+                let made = device.is_some();
+                drop(device);
+                let _ = sent.send(made);
+            },
+        );
+        assert!(
+            ended
+                .recv_timeout(std::time::Duration::from_secs(120))
+                .is_ok(),
+            "the thread ends"
+        );
+    }
 
     /// A layout for a 100×50 point window at scale 2.
     fn a_layout() -> Layout {
