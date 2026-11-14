@@ -482,6 +482,96 @@ pub(crate) fn of_pages(
     made.collect()
 }
 
+/// A group dma-buf ([`of_group`]): several members' pages back to back in one file, and where
+/// each member starts in it.
+#[derive(Debug)]
+pub(crate) struct Group {
+    /// The file every member's piece is of.
+    pub(crate) file: Arc<OwnedFd>,
+    /// The first byte of each member taken, in the order given, each a multiple of the group's
+    /// alignment: `offsets.len()` members were taken, the first that fit.
+    pub(crate) offsets: Vec<u64>,
+    /// The file's bytes.
+    pub(crate) length: u64,
+}
+
+/// One dma-buf of the pages of the first of `members` that fit in it, each member a first byte
+/// and a length (whole pages, resolved through the backing table as [`add_runs`] resolves them),
+/// in order: each member starts at a multiple of `align` (a multiple of the host page; the host
+/// page where less), and the bytes between two members are a file of zeros of the group's own,
+/// so the file holds no page of other memory. A group takes members while they fit udmabuf's
+/// limits as the host has them now, counting each member's runs apart (two members whose pages
+/// follow on in a file are two runs), and stops at the first member that does not fit or whose
+/// pages resolve to no file, leaving it and those after it to another group. Refused where the
+/// first member alone does not fit, where its pages resolve to no file, where `/dev/udmabuf` does
+/// not open, or where the kernel refuses the list. A gap whose file of zeros the kernel does not
+/// give ends the group before the member after it.
+pub(crate) fn of_group(
+    members: &[(u64, u64)],
+    align: u64,
+    zeros: &Zeros,
+) -> Result<Group, Refusal> {
+    let page = vm::page_size();
+    let align = align.max(page);
+    debug_assert!(align.is_multiple_of(page));
+    let device = device()?;
+    let limits = limits();
+    let mut runs: Vec<Run<Arc<OwnedFd>>> = Vec::new();
+    let mut offsets = Vec::new();
+    let mut length: u64 = 0;
+    // The file of zeros the gaps between members take, made at the first gap: a gap is less than
+    // `align`.
+    let mut gaps: Option<Arc<OwnedFd>> = None;
+    for &(first, bytes) in members {
+        let start = length.next_multiple_of(align);
+        let mut member = Vec::new();
+        if start > length {
+            let file = match &gaps {
+                Some(file) => Arc::clone(file),
+                // The first member starts the file, at no gap: where the kernel gives no file for
+                // a later one's, the group ends before that member.
+                None => match vm::memfd(align - page) {
+                    Ok(file) => Arc::clone(gaps.insert(file)),
+                    Err(_) => break,
+                },
+            };
+            member.push(Run {
+                file,
+                offset: 0,
+                length: start - length,
+            });
+        }
+        if let Err(refusal) = add_runs(&mut member, first, bytes, zeros) {
+            if offsets.is_empty() {
+                return Err(refusal);
+            }
+            break;
+        }
+        let pieces = (runs.len() + member.len()) as u64;
+        let end = start.saturating_add(bytes);
+        if pieces > limits.pieces || end > limits.bytes {
+            if offsets.is_empty() {
+                return Err(Refusal::Limit {
+                    pieces,
+                    bytes: end,
+                    granule: end,
+                    limits,
+                });
+            }
+            break;
+        }
+        runs.append(&mut member);
+        offsets.push(start);
+        length = end;
+    }
+    let file = Arc::new(create(device, &runs)?);
+    Ok(Group {
+        file,
+        offsets,
+        length,
+    })
+}
+
 /// One dma-buf of a view's pages ([`of_view`]): `length` bytes of the view from `at`, to map with
 /// protection `prot`.
 #[derive(Debug)]
@@ -950,5 +1040,136 @@ mod tests {
             }
             at += chunk.length / page;
         }
+    }
+
+    /// The byte at `offset` of the group's file, read through a mapping of it.
+    fn read_group(group: &Group, offset: u64) -> u8 {
+        let chunk = DmaBufChunk {
+            file: Arc::clone(&group.file),
+            offset: 0,
+            length: group.length,
+        };
+        read_through(&chunk, offset)
+    }
+
+    /// A range of `pages` pages of memory the backing table resolves, each page's first byte
+    /// `0x40 + its index`.
+    fn marked(pages: u64) -> u64 {
+        let page = vm::page_size();
+        let at = vm::allocate_aliasable(pages * page)
+            .unwrap()
+            .addr()
+            .to_u64();
+        for i in 0..pages {
+            // SAFETY: the range just allocated, read and write.
+            unsafe {
+                vm::ptr(at + i * page)
+                    .cast::<u8>()
+                    .write_volatile(0x40 + i as u8)
+            };
+        }
+        at
+    }
+
+    /// A group dma-buf holds its members' pages back to back, in the order given, each where its
+    /// offset says, and they are the members' pages, not a copy: a write through the file shows
+    /// in the member's memory
+    #[test]
+    fn a_group_dma_buf_holds_its_members_pages_back_to_back() {
+        if !udmabuf() {
+            return;
+        }
+        let page = vm::page_size();
+        let at = marked(6);
+        let members = [(at + page, 2 * page), (at + 4 * page, page), (at, page)];
+        let group = of_group(&members, page, &Zeros::default()).unwrap();
+        assert_eq!(group.offsets, [0, 2 * page, 3 * page]);
+        assert_eq!(group.length, 4 * page);
+        let read: Vec<u8> = (0..4).map(|i| read_group(&group, i * page)).collect();
+        assert_eq!(read, [0x41, 0x42, 0x44, 0x40]);
+        let chunk = DmaBufChunk {
+            file: Arc::clone(&group.file),
+            offset: 0,
+            length: group.length,
+        };
+        write_through(&chunk, 2 * page + 7, 0x5a);
+        // SAFETY: the range `marked` allocated, readable.
+        let shown = unsafe { vm::ptr(at + 4 * page + 7).cast::<u8>().read_volatile() };
+        assert_eq!(shown, 0x5a, "the member's own page");
+    }
+
+    /// Each member of a group starts at a multiple of the group's alignment, and the bytes
+    /// between two members read zeros, of a file of the group's own
+    #[test]
+    fn a_groups_members_start_at_its_alignment() {
+        if !udmabuf() {
+            return;
+        }
+        let page = vm::page_size();
+        let at = marked(3);
+        let members = [(at, page), (at + page, 2 * page)];
+        let group = of_group(&members, 4 * page, &Zeros::default()).unwrap();
+        assert_eq!(group.offsets, [0, 4 * page]);
+        assert_eq!(group.length, 6 * page);
+        assert_eq!(read_group(&group, 0), 0x40);
+        for gap in 1..4 {
+            assert_eq!(read_group(&group, gap * page), 0, "the gap's page {gap}");
+        }
+        assert_eq!(read_group(&group, 4 * page), 0x41);
+        assert_eq!(read_group(&group, 5 * page), 0x42);
+    }
+
+    /// A group takes members while they fit one dma-buf: the first member past the limits, or
+    /// whose pages no file is behind, ends it, and is left with those after it; a first member
+    /// that does not fit alone, or resolves to no file, is refused
+    #[test]
+    fn a_group_ends_at_the_first_member_that_does_not_fit() {
+        if !udmabuf() {
+            return;
+        }
+        let page = vm::page_size();
+        let limits = limits();
+        if limits.bytes > 1 << 30 {
+            eprintln!(
+                "skipped: udmabuf takes {} bytes a dma-buf here",
+                limits.bytes
+            );
+            return;
+        }
+        let at = marked(2);
+        // The whole of the limit, untouched: the backing table resolves it, and only a group
+        // made of it would pin its pages.
+        let large = vm::allocate_aliasable(limits.bytes)
+            .unwrap()
+            .addr()
+            .to_u64();
+        let group = of_group(
+            &[(at, page), (large, limits.bytes), (at + page, page)],
+            page,
+            &Zeros::default(),
+        )
+        .unwrap();
+        assert_eq!(group.offsets, [0], "the second is past the limits");
+        assert_eq!(group.length, page);
+        assert!(matches!(
+            of_group(&[(large, limits.bytes + page)], page, &Zeros::default()),
+            Err(Refusal::Limit { .. })
+        ));
+        let private = vm::anonymous(None, page, "a test's private page").unwrap();
+        let group = of_group(
+            &[(at, page), (private, page), (at + page, page)],
+            page,
+            &Zeros::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            group.offsets,
+            [0],
+            "a member no file is behind ends the group"
+        );
+        assert!(matches!(
+            of_group(&[(private, page), (at, page)], page, &Zeros::default()),
+            Err(Refusal::Unresolved)
+        ));
     }
 }
