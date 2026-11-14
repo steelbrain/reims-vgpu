@@ -1613,6 +1613,40 @@ cgroup and the build's weigh the same, and the guest's frame rate follows
 its vCPUs' share. A host thread sleeping to a 60 Hz grid, as the device's
 refresh thread does, kept every tick in every run, at most 5.9 ms late.
 
+**Beside a terminal's build on Linux** (measured 2026-11-13 on
+`homelab-um870-1`, x86-64 macOS 26.7.2 on KVM with the Radeon 780M, the boot
+harness's walk of the desktop and Safari's pages, jobs `m3-max-27804` and
+`m3-max-27882`): with a cold build of this repository running beside the VM,
+QEMU in its job's cgroup and the build in a systemd user scope of its own,
+each at CPU weight 100 as `reims-ctl-NAME.scope` and a terminal's scope are,
+the guest's pages stop for up to 2.6 s. ananicy-cpp gives every `bash` nice
+-4 (its `Doc-View` type), so a build typed into a bash terminal runs its
+compilers at nice -4, against QEMU's nice 9. Beside a cold `cargo xtask
+dist` started that way, with 8 vCPUs, Safari scrolled at 38.3 frames a
+second with a largest frame gap of 1097 ms, its autoscroll ran at 23.9 with
+2582 ms and a WebGL scene at 41.4 with 116 ms, against 60 frames a second
+and gaps of at most 37 ms on an idle host. QEMU got 1.7 to 1.9 cores against
+the build's 9 to 15. In each host present gap of 100 ms or more, the vCPUs
+spent 51 to 87% of their runnable time waiting on a run queue, while the
+device's threads were idle, QEMU's memory pressure stayed at most 63 ms a
+gap and the vCPUs took no major fault. The gaps are 2.4 to 28 times what
+that lost share accounts for (the idle host's gap divided by 1 - L, L the
+vCPUs' share on a run queue); the guest's own waits across its vCPUs would
+multiply it, which no counter shows (inferred: KVM's pause-loop yields
+stayed at 0, at kvm_amd's stock `pause_filter_count` 3000 and
+`pause_filter_thresh` 128, so it is no spin-wait). A cold `cargo build` of
+the workspace at nice 0 stopped the pages for at most 167 ms. With 4 vCPUs
+beside the nice -4 build, the scroll's largest gap fell to 365 ms at 44.8
+frames a second, still 5.3 times its bound, and on the idle host 8 guest
+workers each piping 3000 MiB through `md5` took 9.67 s a round, against 5.34
+s with 8 vCPUs: reims-ctl's default stays at half the host's threads, at
+most 8. Nothing of ours moves the stall: the device's threads wait on
+nothing in it; KVM's halt polling and pause filter are module parameters,
+which QEMU sets neither of; QEMU's `-overcommit cpu-pm=on` keeps idle vCPUs
+on the host's CPUs; KVM's paravirtual spinlocks and TLB flushes need a guest
+kernel that uses them, and macOS's does not; and a higher CPU weight or nice
+for QEMU's scope would raise it over the user's own work.
+
 **A TCG run** (`-t`) runs on a Linux member. What it needs:
 - **A node** with the arm64 guests: `homelab-um870-1` holds reflink copies of
   all five in `~/.cache/rvg-vms` (`macos-13-arm64` to `macos-27-0-arm64`,
