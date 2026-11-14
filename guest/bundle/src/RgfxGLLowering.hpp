@@ -63,7 +63,12 @@
  *     whose field has both ("attrib_0", and the key for its type): metal2vulkan refused that
  *     kernel's compute pipeline ("UnknownKey" at its argument 0, "attrib_0"), and the renderer
  *     drew the draw's vertices in software (measured: macOS 27.0.1 arm64, a quad patch through a
- *     tessellation control and evaluation shader, m3-max-30129 and m3-max-30158);
+ *     tessellation control and evaluation shader, m3-max-30129 and m3-max-30158). The draw's
+ *     post-tessellation vertex function takes the control points' gl_Position as a field with the
+ *     key air.position after its location, which `metal` writes in no field; it goes too, as
+ *     everything between a field's location and its type name does: metal2vulkan refused the
+ *     draw's render pipeline at it ("UnknownKey", key air.position at its argument 1,
+ *     m3-max-30327);
  *   - a flat fragment input has no sampling key: `metal` writes [[flat]] as air.flat alone, and
  *     the generator writes air.center before it;
  *   - a buffer input has the air.address_space `metal` writes, its parameter's pointer's, and,

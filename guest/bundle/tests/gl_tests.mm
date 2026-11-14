@@ -1063,6 +1063,17 @@ void test_stage_metadata_normalized()
 		const std::string vertexFields = vertexHead + field(6, 3, "float4", false) + field(7, 0, "float2", false) +
 		                                 vertexTail + field(10, 1, "uint", false);
 		CHECK(RgfxGLNormalizeStageText(text, patch) && text == vertexFields);
+		// A field that carries the control points' gl_Position: the generator writes the key
+		// air.position after its location (measured: macOS 27.0.1 arm64, the post-tessellation
+		// vertex function of a quad patch's draw, m3-max-30334), which goes as the name does.
+		const std::string positionField = "!7 = !{!\"air.location_index\", i32 0, i32 1, !\"air.position\", "
+		                                  "!\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", !\"air.position\"}\n";
+		text = vertexHead + field(6, 3, "float4", false) + positionField + vertexTail + field(10, 1, "uint", false);
+		CHECK(RgfxGLNormalizeStageText(text, patch));
+		CHECK(text == vertexHead + field(6, 3, "float4", false) +
+		                  "!7 = !{!\"air.location_index\", i32 0, i32 1, !\"air.arg_type_name\", !\"float2\", "
+		                  "!\"air.arg_name\", !\"air.position\"}\n" +
+		                  vertexTail + field(10, 1, "uint", false));
 
 		// The same input as `metal` writes it (an integer field named "int", the function's
 		// parameter its opaque pointer, the position output without air.arg_name) comes through

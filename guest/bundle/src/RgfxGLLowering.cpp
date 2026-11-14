@@ -541,15 +541,32 @@ bool dropAttributeName(NodeText &n)
 	return false;
 }
 
-// Makes a field node of a patch control point input what `metal` writes: no attribute name, and
-// the Metal name `type` of the field's member of the control point function's result where the
-// generator wrote the key air.arg_type_name in place of a type name. True where it changed.
+// Makes a field node of a patch control point input what `metal` writes: nothing between its
+// location's two operands and its air.arg_type_name (the generator writes the attribute name there,
+// and, for a field that carries gl_Position, the key air.position), and the Metal name `type` of
+// the field's member of the control point function's result where the generator wrote the key
+// air.arg_type_name in place of a type name. True where it changed.
 bool normalizeControlPointField(std::string &line, const std::string &type)
 {
 	NodeText n;
 	if (!splitNode(line, n))
 		return false;
-	bool edited = dropAttributeName(n);
+	bool edited = false;
+	for (size_t i = 0; i + 2 < n.ops.size(); i++) {
+		std::string key;
+		unsigned a = 0, b = 0;
+		if (!stringOp(n.ops[i], key) || key != "air.location_index" || !intOp(n.ops[i + 1], a) ||
+		    !intOp(n.ops[i + 2], b))
+			continue;
+		size_t end = i + 3;
+		while (end < n.ops.size() && !(stringOp(n.ops[end], key) && key == "air.arg_type_name"))
+			end++;
+		if (end < n.ops.size() && end > i + 3) {
+			n.ops.erase(n.ops.begin() + static_cast<std::ptrdiff_t>(i + 3), n.ops.begin() + static_cast<std::ptrdiff_t>(end));
+			edited = true;
+		}
+		break;
+	}
 	for (size_t i = 0; i + 1 < n.ops.size(); i++) {
 		std::string key, value;
 		if (stringOp(n.ops[i], key) && key == "air.arg_type_name" && stringOp(n.ops[i + 1], value) &&
