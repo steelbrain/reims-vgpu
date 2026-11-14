@@ -782,6 +782,78 @@ mod tests {
         drop(old);
     }
 
+    /// What a command buffer's view of its table costs, a command buffer (a measurement, not a
+    /// check; run it by name with `--run-ignored only --no-capture` in a release build): Super
+    /// Resolution's 6,847 command buffers of about 6 dispatches each, each binding buffers that
+    /// lie in heaps. Over a table of `TABLES_COST_LIVE` objects (default 4,096), each of
+    /// `TABLES_COST_CBS` command buffers (default 2,000) takes a view, names `TABLES_COST_NAMED`
+    /// objects of the table (default 64, picked at random) for the first time, then
+    /// `TABLES_COST_AGAIN` more times each (default 3: the names a dispatch's binds take again
+    /// that the decoder's cache of recent entries misses), and drops the view. Prints the
+    /// thread's user-space instructions and cycles a command buffer and a name, the median of 9
+    /// runs.
+    #[test]
+    #[ignore = "a measurement: run it by name"]
+    fn a_command_buffer_s_view_costs() {
+        use crate::graphics::decode::draw_cost::{counts, spread};
+        let env = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let live = env("TABLES_COST_LIVE", 4096);
+        let cbs = env("TABLES_COST_CBS", 2000);
+        let named = env("TABLES_COST_NAMED", 64);
+        let again = env("TABLES_COST_AGAIN", 3);
+        let p = FakePlatform::new();
+        let ctx = Arc::new(Context::<FakePlatform>::new(1));
+        for id in 0..live {
+            ctx.insert(0x1000 + id, Entry::of(fence(&p)), None);
+        }
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let ids: Vec<Vec<u64>> = (0..cbs)
+            .map(|_| (0..named).map(|_| 0x1000 + next(live)).collect())
+            .collect();
+        let mut figures: [Vec<f64>; 2] = Default::default();
+        for _ in 0..9 {
+            let before = counts();
+            for cb in &ids {
+                let view = View::take(Arc::clone(&ctx));
+                for _ in 0..=again {
+                    for &id in cb {
+                        assert!(view.get(std::hint::black_box(id)).is_some());
+                    }
+                }
+                drop(view);
+            }
+            let spent = counts() - before;
+            for (f, figure) in figures.iter_mut().enumerate() {
+                figure.push(spent.0[f + 1] as f64 / cbs as f64);
+            }
+        }
+        eprintln!(
+            "{cbs} views over {live} objects, each naming {named} objects {} times: user-space \
+             instructions and cycles a command buffer, then a name (median, lowest, highest of 9)",
+            again + 1
+        );
+        for (figure, name) in figures.iter_mut().zip(["instructions", "cycles"]) {
+            let [median, low, high] = spread(figure);
+            let names = (named * (again + 1)) as f64;
+            eprintln!(
+                "  {name:<12} {median:9.0} ({low:.0} to {high:.0}) a command buffer, {:6.1} a \
+                 name",
+                median / names
+            );
+        }
+    }
+
     /// An entry removed with no view open is handed back at once, and a view taken after a
     /// removal never keeps it.
     #[test]
