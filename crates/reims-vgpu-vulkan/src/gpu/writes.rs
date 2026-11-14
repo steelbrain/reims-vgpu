@@ -33,13 +33,16 @@
 //!   over a copy of the pages whose GPU writes it drops, as Metal's GPU drops them: a write through
 //!   a buffer over it is sent (a shader's store through a slot or a loaded address, a blit's fill
 //!   or copy into the buffer, a pass's visibility results), and so is a pass whose attachment lies
-//!   in it but does not store it (`DontCare`, `MultisampleResolve`); a pass that stores such an
-//!   attachment (`Store`, `StoreAndMultisampleResolve`) fails its command buffer with Metal's page
-//!   fault, as the runtime faults it itself, the fault counting against its queue as Metal's
-//!   does: the queue's second revokes it (`crate::gpu::encode_render`, `crate::gpu::command`);
-//!   and a resolve into such a texture, a pass that keeps it by `CustomSampleDepthStore`, a write
-//!   of a texture over it by a shader or a blit, and a CPU write of one die as [`kept_write`], as
-//!   what Metal does there is unmeasured, or ends the process.
+//!   in it but does not store it (`DontCare`, `MultisampleResolve` out of it); a pass that stores
+//!   such an attachment (`Store`, `StoreAndMultisampleResolve`, and a depth attachment's
+//!   `CustomSampleDepthStore`), or resolves a colour attachment into such a texture by
+//!   `MultisampleResolve`, fails its command buffer with Metal's page fault, as the runtime faults
+//!   it itself, the fault counting against its queue as Metal's does: the queue's second revokes
+//!   it (`crate::gpu::encode_render`, `crate::gpu::command`); and another resolve into such a
+//!   texture (`StoreAndMultisampleResolve`, a depth or stencil resolve, a resolve texture a late
+//!   setter named), a colour or stencil attachment kept there by `CustomSampleDepthStore`, a
+//!   write of a texture over it by a shader or a blit, and a CPU write of one die as
+//!   [`kept_write`], as what Metal does there is unmeasured, or ends the process.
 //!
 //! On macOS neither is taken: MoltenVK hands Metal the pages, or a read-only view of them made
 //! with bit 24, and Metal's GPU answers every write there itself.
@@ -55,8 +58,11 @@
 //! after its second fault failing (`MTLCommandBufferErrorAccessRevoked`; m3-max-29110,
 //! m3-max-28796 and m3-max-28797, plain Metal; the runtime's `command_buffer/revocation.rs`); the
 //! same attachments under `DontCare` or `Load` complete, as does a resolve texture attached and not
-//! resolved into and a resolve out of a read-only primary. A resolve into such memory is
-//! unknown (no verdict over 520 processes), and so are a blit's copy into it and a texture's
+//! resolved into and a resolve out of a read-only primary. A multisample colour attachment's
+//! `MultisampleResolve` into such a texture, and a depth attachment in a heap of bit 24 kept by
+//! `CustomSampleDepthStore`, each by the descriptor's action or one the encoder set, fail it so
+//! too (m3-max-28796 and m3-max-28797; the runtime's `store_out.rs`). Another resolve into such
+//! memory is unknown, and so are a blit's copy into it and a texture's
 //! writes by a shader or a blit there, which no probe made.
 use std::borrow::Cow;
 use std::ops::Range;
