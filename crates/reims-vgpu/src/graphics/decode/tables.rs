@@ -590,6 +590,11 @@ impl<P: Platform> Drop for Context<P> {
 /// dispatches names tens of objects, and each growth moves every name found so far.
 const SEEN_ROOM: usize = 32;
 
+/// How many entries [`View::find_all`] looks for under one hold of the table's lock: a command
+/// buffer of a few dispatches finds every name it has in one, and the table's makes and removals
+/// wait no longer than as many lookups.
+const FOUND_A_HOLD: usize = 32;
+
 /// A message's view of one context's table (the module doc): open from its taking until it drops,
 /// which lets go of the removed entries only it still kept. It lends the entries it finds for its
 /// own life, and keeps each found, and each change of the message's own, so a name it looks up
@@ -651,6 +656,38 @@ impl<P: Platform> View<P> {
         // names it, so it is freed only once no such view is open, and this one is until it
         // drops: it outlives `&self`.
         found.map(|p| unsafe { p.as_ref() })
+    }
+
+    /// Finds each of `ids` the view has not found yet, [`FOUND_A_HOLD`] of them under each hold
+    /// of the table's lock, so [`Self::get`] answers them from what the view found. A view's
+    /// answer for an id is set at its taking (the module doc): finding it now or at its first
+    /// [`Self::get`] finds the same entry, or none. An id the table holds no entry of for the
+    /// view is not kept, and [`Self::get`] looks it up again; one found that no op of the message
+    /// reaches changes nothing the table keeps.
+    pub(crate) fn find_all(&self, ids: impl IntoIterator<Item = u64>) {
+        let mut ids = ids.into_iter();
+        while self.find_some(&mut ids) {}
+    }
+
+    /// [`Self::find_all`]'s next [`FOUND_A_HOLD`] lookups of `ids` in the table, under one hold
+    /// of its lock, let go of before it answers: whether `ids` may hold more.
+    fn find_some(&self, ids: &mut impl Iterator<Item = u64>) -> bool {
+        let mut seen = self.seen.borrow_mut();
+        let mut tables = None;
+        let mut held = 0;
+        for id in ids {
+            if let std::collections::hash_map::Entry::Vacant(slot) = seen.entry(id) {
+                let t = tables.get_or_insert_with(|| self.context.tables.read());
+                if let Some(found) = t.find(id, self.at) {
+                    slot.insert(Some(found));
+                }
+                held += 1;
+                if held == FOUND_A_HOLD {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// The message made `id`'s entry at `at`: the view sees it from now on.
@@ -719,6 +756,91 @@ mod tests {
         let late = View::take(Arc::clone(&ctx));
         assert!(late.get(1).is_none());
         assert!(late.get(2).is_some());
+    }
+
+    /// A view that finds its names at once ([`View::find_all`]) answers each as one taken at the
+    /// same clock that looks it up only after the table changed: through random makes, makes over
+    /// an id again and removes, each view of a pair taken together sees the same entry, or none,
+    /// for every id, and what the table keeps for them goes once both close.
+    #[test]
+    fn a_view_finds_at_once_what_it_would_find_later() {
+        let p = FakePlatform::new();
+        let ctx = Arc::new(Context::<FakePlatform>::new(1));
+        let mut seed: u64 = 0x1234_5678_9abc_def1;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let change = |ctx: &Context<FakePlatform>, next: &mut dyn FnMut(u64) -> u64| {
+            let id = next(48);
+            if next(3) == 0 {
+                if let Some((_, Some(removed))) = ctx.remove(id) {
+                    let_go(vec![removed]);
+                }
+            } else {
+                let (_, replaced) = ctx.insert(id, Entry::of(fence(&p)), None);
+                let_go(replaced.into_iter().collect());
+            }
+        };
+        for _ in 0..200 {
+            for _ in 0..next(12) {
+                change(&ctx, &mut next);
+            }
+            let early = View::take(Arc::clone(&ctx));
+            let late = View::take(Arc::clone(&ctx));
+            assert_eq!(early.at(), late.at());
+            early.find_all(0..64);
+            for _ in 0..next(24) {
+                change(&ctx, &mut next);
+            }
+            for id in 0..64 {
+                assert_eq!(
+                    early.get(id).map(std::ptr::from_ref),
+                    late.get(id).map(std::ptr::from_ref),
+                    "id {id}"
+                );
+            }
+            drop((early, late));
+            assert_eq!(ctx.gone_len(), 0, "nothing kept once both close");
+        }
+    }
+
+    /// A view finds its names [`FOUND_A_HOLD`] at a time, the table's lock let go of between: a
+    /// make goes through after each hold, before the next, and is not seen by the view; names it
+    /// found already, or found before, take no lookup; and a name the table holds nothing of is
+    /// not kept, so a later [`View::get`] looks it up again.
+    #[test]
+    fn a_view_finds_its_names_a_hold_at_a_time() {
+        let p = FakePlatform::new();
+        let ctx = Arc::new(Context::<FakePlatform>::new(1));
+        for id in 0..100 {
+            ctx.insert(id, Entry::of(fence(&p)), None);
+        }
+        let view = View::take(Arc::clone(&ctx));
+        assert!(view.get(5).is_some());
+        // 0 to 99 twice, and 1,000, which the table does not hold: 100 lookups, as 5 was found.
+        let mut ids = (0..100).chain(0..100).chain([1_000]);
+        let mut holds = 0;
+        loop {
+            let more = view.find_some(&mut ids);
+            holds += 1;
+            assert!(ctx.tables.try_write().is_some(), "let go of after a hold");
+            ctx.insert(10_000 + holds, Entry::of(fence(&p)), None);
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(holds, 4, "100 lookups, 32 a hold");
+        assert!((0..100).all(|id| view.get(id).is_some()));
+        assert!(
+            (1..=4).all(|n| view.get(10_000 + n).is_none()),
+            "made after it"
+        );
+        assert!(!view.seen.borrow().contains_key(&1_000), "not kept");
+        ctx.insert(1_000, Entry::of(fence(&p)), None);
+        assert!(view.get(1_000).is_none(), "made after it, looked up again");
     }
 
     /// One view taken long ago and still open (a message that waits) while frames of messages
@@ -896,6 +1018,150 @@ mod tests {
                 "  {name:<12} {median:9.0} ({low:.0} to {high:.0}) a command buffer, {:6.1} a \
                  name",
                 median / names
+            );
+        }
+    }
+
+    /// What a command buffer's view of its table costs beside the threads that share the table
+    /// (a measurement, not a check; run it by name with `--run-ignored only --no-capture` in a
+    /// release build): [`a_command_buffer_s_view_costs`]'s command buffers, while ring 0's thread
+    /// makes an object and removes one made `TABLES_COST_KEEP` makes before (default 64) every
+    /// `TABLES_COST_SPIN` spins (default 2,000; 0 makes none), and `TABLES_COST_LANES` more lanes
+    /// (default 1) walk command buffers of their own. Each command buffer names
+    /// `TABLES_COST_FRESH` of ring 0's latest makes (default 4) among its `TABLES_COST_NAMED`
+    /// (default 26), as Super Resolution's name the buffers made in its heaps for them; with
+    /// `TABLES_COST_AT_ONCE=1`, each view finds its names at once ([`View::find_all`]). Prints
+    /// the measured lane's user-space instructions and cycles a command buffer and a first
+    /// lookup, the median of 9 runs.
+    #[test]
+    #[ignore = "a measurement: run it by name"]
+    fn a_command_buffer_s_view_costs_beside_ring_0() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        use reims_vgpu_vulkan::core::platform::Handle as _;
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+
+        use crate::graphics::decode::draw_cost::{counts, spread};
+        // Ring 0's latest makes, as ids from `FIRST` on.
+        const FIRST: u64 = 1 << 32;
+        let env = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let live = env("TABLES_COST_LIVE", 4096);
+        let cbs = env("TABLES_COST_CBS", 2000);
+        let named = env("TABLES_COST_NAMED", 26);
+        let fresh = env("TABLES_COST_FRESH", 4).min(named);
+        let again = env("TABLES_COST_AGAIN", 3);
+        let keep = env("TABLES_COST_KEEP", 64).max(fresh + 1);
+        let spin = env("TABLES_COST_SPIN", 2000);
+        let lanes = env("TABLES_COST_LANES", 1);
+        let at_once = env("TABLES_COST_AT_ONCE", 0) == 1;
+        let p = FakePlatform::new();
+        let fence = p.device().new_fence().unwrap().unwrap();
+        let of = |f: &<FakePlatform as Platform>::Fence| Entry::of(ObjHandle::Fence(f.clone_ref()));
+        let ctx = Arc::new(Context::<FakePlatform>::new(1));
+        for id in 0..live {
+            ctx.insert(0x1000 + id, of(&fence), None);
+        }
+        for id in FIRST..FIRST + keep {
+            ctx.insert(id, of(&fence), None);
+        }
+        // The newest of ring 0's makes.
+        let latest = Arc::new(AtomicU64::new(FIRST + keep - 1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut threads = Vec::new();
+        if spin > 0 {
+            let (ctx, latest, stop) = (Arc::clone(&ctx), Arc::clone(&latest), Arc::clone(&stop));
+            let fence = fence.clone_ref();
+            threads.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let next = latest.load(Ordering::Relaxed) + 1;
+                    let (_, replaced) = ctx.insert(next, of(&fence), None);
+                    let_go(replaced.into_iter().collect());
+                    latest.store(next, Ordering::Release);
+                    if let Some((_, Some(removed))) = ctx.remove(next - keep) {
+                        let_go(vec![removed]);
+                    }
+                    for _ in 0..spin {
+                        std::hint::spin_loop();
+                    }
+                }
+            }));
+        }
+        let rng = |mut seed: u64| {
+            move |n: u64| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed % n
+            }
+        };
+        // A command buffer: a view, its names looked up `again` + 1 times, the view dropped.
+        let walk = move |ctx: &Arc<Context<FakePlatform>>,
+                         latest: u64,
+                         next: &mut dyn FnMut(u64) -> u64| {
+            let ids: Vec<u64> = (0..named)
+                .map(|i| {
+                    if i < fresh {
+                        latest - i
+                    } else {
+                        0x1000 + next(live)
+                    }
+                })
+                .collect();
+            let view = View::take(Arc::clone(ctx));
+            if at_once {
+                view.find_all(ids.iter().copied());
+            }
+            for _ in 0..=again {
+                for &id in &ids {
+                    std::hint::black_box(view.get(std::hint::black_box(id)));
+                }
+            }
+            drop(view);
+        };
+        for lane in 0..lanes {
+            let (ctx, latest, stop) = (Arc::clone(&ctx), Arc::clone(&latest), Arc::clone(&stop));
+            threads.push(std::thread::spawn(move || {
+                let mut next = rng(0x2545_f491_4f6c_dd1d ^ (lane + 1));
+                while !stop.load(Ordering::Relaxed) {
+                    walk(&ctx, latest.load(Ordering::Acquire), &mut next);
+                }
+            }));
+        }
+        let mut next = rng(0x9e37_79b9_7f4a_7c15);
+        let mut figures: [Vec<f64>; 2] = Default::default();
+        for _ in 0..9 {
+            let before = counts();
+            for _ in 0..cbs {
+                walk(&ctx, latest.load(Ordering::Acquire), &mut next);
+            }
+            let spent = counts() - before;
+            for (f, figure) in figures.iter_mut().enumerate() {
+                figure.push(spent.0[f + 1] as f64 / cbs as f64);
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for t in threads {
+            t.join().unwrap();
+        }
+        eprintln!(
+            "{cbs} views over {live} objects, each naming {named} objects ({fresh} of ring 0's \
+             latest) {} times{}, ring 0 making and removing every {spin} spins, {lanes} more \
+             lanes: user-space instructions and cycles a command buffer, then a first lookup \
+             (median, lowest, highest of 9)",
+            again + 1,
+            if at_once { ", found at once" } else { "" }
+        );
+        for (figure, name) in figures.iter_mut().zip(["instructions", "cycles"]) {
+            let [median, low, high] = spread(figure);
+            eprintln!(
+                "  {name:<12} {median:9.0} ({low:.0} to {high:.0}) a command buffer, {:7.1} a \
+                 first lookup",
+                median / named as f64
             );
         }
     }
