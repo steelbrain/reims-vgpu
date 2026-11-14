@@ -57,6 +57,10 @@ pub struct TextureObject {
     /// The buffer it is over or the heap it is placed in, its texture's for a view, held while
     /// it lives ([`Under`]).
     pub under: Option<Under>,
+    /// What of an IOSurface it lies over, for one made over a buffer that stands for the surface
+    /// with the surface's facts ([`Buffer::new_texture_over_surface_plane`]), its texture's for
+    /// a view; `None` for any other.
+    pub surface: Option<OverSurface>,
     /// The usage bits it answers beyond the runtime texture's: its texture's for a view and for
     /// one opened from a shared handle; 0 for any other. Apple's private bits Metal answers
     /// (0x4000, 0x8000 and 0x10000) are the runtime's, which keeps them for a texture, its views
@@ -73,6 +77,17 @@ pub struct TextureObject {
 
 /// `id<MTLTexture>`.
 pub type VulkanTexture = Obj<TextureObject>;
+
+/// What of an IOSurface a texture made over a buffer that stands for the surface lies over
+/// ([`Buffer::new_texture_over_surface_plane`] with the surface's facts), as a pass tells them
+/// apart ([`crate::gpu::desc::Over`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverSurface {
+    /// A surface without planes.
+    Whole,
+    /// A plane of a surface with planes.
+    Plane,
+}
 
 /// The buffer a texture is over, or the heap it is placed in, which the texture holds as
 /// Metal's does. Each holds the bytes of the buffer or heap the texture's texels may lie in, a first byte and an end, which
@@ -986,7 +1001,11 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
             bytes = bytes.start.min(facts.chroma_offset.min(length))..bytes.end.max(end);
         }
         let under = Under::Buffer(self.clone_ref(), bytes);
-        Ok(Some(self.device.texture_in(raw, under, 0)))
+        let surface = match facts.plane_count {
+            0 => OverSurface::Whole,
+            _ => OverSurface::Plane,
+        };
+        Ok(Some(self.device.texture_over_surface(raw, under, surface)))
     }
 
     /// The runtime's export of the buffer's memory (`export_memory_fd`): a buffer the runtime
@@ -1144,6 +1163,7 @@ impl VulkanTexture {
             raw,
             device: self.device.clone_ref(),
             under: self.under.as_ref().map(Under::clone_ref),
+            surface: self.surface,
             private_usage: self.private_usage,
             space: Arc::new(Hold::sharing(Arc::clone(&self.space))),
         })))

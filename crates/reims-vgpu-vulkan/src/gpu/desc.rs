@@ -127,7 +127,7 @@ use metal2vulkan_runtime as rt;
 
 use crate::answer::{Policy, metal_aborts, plain, send, unrepresentable};
 use crate::gpu::rate_map::VulkanRateMap;
-use crate::gpu::resource::{Under, VulkanBuffer, VulkanTexture};
+use crate::gpu::resource::{OverSurface, Under, VulkanBuffer, VulkanTexture};
 use crate::gpu::{resource_options, texture_usage};
 use crate::platform::{Obj, VulkanPlatform};
 
@@ -629,7 +629,11 @@ impl Source {
         let t = self.0.as_ref()?;
         Some(match &t.under {
             _ if t.raw.parent_texture().is_some() => Over::View,
-            Some(Under::Buffer(..)) => Over::Buffer,
+            Some(Under::Buffer(..)) => match t.surface {
+                Some(OverSurface::Whole) => Over::Surface,
+                Some(OverSurface::Plane) => Over::Plane,
+                None => Over::Buffer,
+            },
             Some(Under::Heap(..)) => Over::Heap,
             None if t.raw.is_shareable() => Over::Shareable,
             None => Over::Own,
@@ -645,6 +649,11 @@ pub enum Over {
     /// Memory of its own, shareable: a texture of `newSharedTextureWithDescriptor:`, or one
     /// opened from its handle.
     Shareable,
+    /// An IOSurface without planes (`newTextureWithDescriptor:iosurface:plane:` at its plane 0,
+    /// over a buffer that stands for the surface).
+    Surface,
+    /// A plane of an IOSurface with planes, over a buffer that stands for the surface.
+    Plane,
     /// A buffer's bytes (`newTextureWithDescriptor:offset:bytesPerRow:`).
     Buffer,
     /// A heap's memory.
@@ -659,6 +668,8 @@ impl Over {
         match over {
             Some(Over::Own) => "a texture of its own",
             Some(Over::Shareable) => "a shareable texture, or one opened from a shared handle",
+            Some(Over::Surface) => "a texture over an IOSurface",
+            Some(Over::Plane) => "a texture over a plane of an IOSurface with planes",
             Some(Over::Buffer) => "a texture over a buffer",
             Some(Over::Heap) => "a texture in a heap",
             Some(Over::View) => "a view of another texture",

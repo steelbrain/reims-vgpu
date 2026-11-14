@@ -43,6 +43,7 @@ mod tests {
             raw,
             device: d.clone_ref(),
             under: None,
+            surface: None,
             private_usage: 0,
             space: std::sync::Arc::new(crate::gpu::metal_space::Hold::NONE),
         })

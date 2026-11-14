@@ -49,10 +49,10 @@ use crate::gpu::icb::VulkanIcb;
 use crate::gpu::metal_space::{self, PinRefused, Placing, TextureKind};
 use crate::gpu::rate_map::{VulkanRateMap, VulkanRateMapDescriptor};
 use crate::gpu::resource::{
-    BufferObject, ComputePipelineObject, HeapObject, LibraryObject, TextureObject, Under,
-    VulkanBuffer, VulkanComputePipeline, VulkanDepthStencilState, VulkanFence, VulkanFunction,
-    VulkanHeap, VulkanLibrary, VulkanRenderPipeline, VulkanSamplerState, VulkanSharedTextureHandle,
-    VulkanTexture,
+    BufferObject, ComputePipelineObject, HeapObject, LibraryObject, OverSurface, TextureObject,
+    Under, VulkanBuffer, VulkanComputePipeline, VulkanDepthStencilState, VulkanFence,
+    VulkanFunction, VulkanHeap, VulkanLibrary, VulkanRenderPipeline, VulkanSamplerState,
+    VulkanSharedTextureHandle, VulkanTexture,
 };
 use crate::gpu::timing;
 use crate::os::OsVm;
@@ -625,6 +625,7 @@ impl VulkanDevice {
             raw,
             device: self.clone_ref(),
             under: None,
+            surface: None,
             private_usage,
             space,
         })
@@ -640,6 +641,29 @@ impl VulkanDevice {
         under: Under,
         private_usage: u64,
     ) -> VulkanTexture {
+        self.texture_under(raw, under, private_usage, None)
+    }
+
+    /// The handle of a texture this device made over `under`, a buffer that stands for an
+    /// IOSurface, lying over `surface` of it ([`crate::gpu::resource`]'s
+    /// `new_texture_over_surface_plane`), as [`Self::texture_in`]'s.
+    pub(crate) fn texture_over_surface(
+        &self,
+        raw: rt::Texture,
+        under: Under,
+        surface: OverSurface,
+    ) -> VulkanTexture {
+        self.texture_under(raw, under, 0, Some(surface))
+    }
+
+    /// [`Self::texture_in`]'s handle, over `surface` of an IOSurface where given.
+    fn texture_under(
+        &self,
+        raw: rt::Texture,
+        under: Under,
+        private_usage: u64,
+        surface: Option<OverSurface>,
+    ) -> VulkanTexture {
         let kind = match under {
             Under::Buffer(..) => metal_space::TextureKind::OverBuffer,
             Under::Heap(..) => metal_space::TextureKind::InHeap,
@@ -649,6 +673,7 @@ impl VulkanDevice {
             raw,
             device: self.clone_ref(),
             under: Some(under),
+            surface,
             private_usage,
             space,
         })

@@ -2153,6 +2153,45 @@ table above, and 500 stores nothing, both planes keeping their 0xAB bytes. So a 
 an argument buffer stores what a write through a slot stores *(measured on the M3 Max alone, as
 the x86 Macs make none of these textures)*.
 
+## Q41: a colour resolve into a texture over an IOSurface, in a pair the M3 leaves untouched
+
+Probe: `oracle_surfresolve.sh DEVICE` (`oracle_surfresolve`), 11-14, one process a case: the M3
+Max under macOS 27.0.1 (26A434), m3-max-29682, and m3-max-29690 for plane 1; the AMD 5300M and
+the Intel UHD 630 under macOS 26.7.1 (25G241), m3-max-29684 and m3-max-29683, and m3-max-29691
+and m3-max-29692 for plane 1. A 16 x 16 4-sample `BGRA8Unorm` or `BGRA8Unorm_sRGB` attachment
+(Private, of its own) is cleared and stored, then loaded, drawn over every texel and stored by
+`MultisampleResolve` or `StoreAndMultisampleResolve` into a 16 x 16 texture of usage
+`ShaderRead` and `RenderTarget`, filled with 0xA5 bytes first, of `RGBA16Float`, `BGR10_XR`,
+`BGR10_XR_sRGB`, or the attachment's own format (the control): a texture of its own, one over a
+surface without planes of its size ('RGhA', 'w30r' or 'BGRA'), one over plane 0 of a 128 x 16
+'420v' surface, or one over plane 1 of a 128 x 32 '420v' surface, each Shared, Managed and
+Private. A blit reads the texture back, and a second pass resolves the samples into a texture of
+their format.
+
+| what | M3 Max | AMD 5300M and Intel UHD 630 |
+|---|---|---|
+| the resolve into `RGBA16Float`, every texture and storage mode | completes, the texture keeps its bytes | completes, the drawn colour written |
+| the resolve into `BGR10_XR` or `BGR10_XR_sRGB` | completes, the texture keeps its bytes | none: the process ends at the texture's descriptor ("MTLTextureDescriptor has invalid pixelFormat (554)", `abort`) |
+| the resolve into the attachment's own format | the drawn colour written | the same |
+| the samples after `MultisampleResolve` | as before the pass (the earlier clear) | the drawn colour |
+| the samples after `StoreAndMultisampleResolve` | the drawn colour | the same |
+
+Over a surface, without planes or over either plane of one with planes, in every storage mode,
+each GPU answers as for a texture of its own: what decides the resolve is the format pair, not
+the texture's memory *(class 2: the M3 Max leaves the texture untouched where the x86 Macs write
+it)*.
+
+What our stack does: a resolve into a texture of another format that the M3 Max leaves untouched
+is dropped (`gpu::encode_render`'s `untouched_resolves`): the pass is made without it, its
+samples kept as the M3 Max keeps them, and the texture keeps its texels, the M3 Max's answer,
+which costs nothing, as the runtime resolves into no other format. A texture the guest makes
+over a surface's plane, which the device makes over the buffer that stands for the surface
+(`new_texture_over_surface_plane`), Private over a device cache whatever the guest asked, is
+dropped into alike, over a surface without planes or a plane of one with planes, in any storage
+mode, and so is one over read-only memory, whose pass completes with the memory unchanged as the
+M3 Max completes it (Q38). Until 11-14 such a pass ended the process at its making, as a
+resolve into a texture over a buffer, a shape not measured.
+
 ## Not measured
 
 - Cross-process lock waits for pending GPU work: rgk-lock's `lock_probe` (x86 matches the M3,

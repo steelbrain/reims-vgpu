@@ -634,7 +634,13 @@ fn runtime_resolves(from: PixelFormat, into: PixelFormat) -> bool {
 /// [`unmeasured_shape`] states; into `RGB10A2Unorm`, `BGR10A2Unorm`, `BGRA10_XR` or
 /// `BGRA10_XR_sRGB` it writes into the texture, measured from a Private 2D multisample texture of
 /// its own into a Shared single-level 2D texture of its own, both 16 by 16. `None` for any other
-/// pair.
+/// pair. The x86 Macs' GPUs write a resolve into `RGBA16Float` in every shape `oracle_surfresolve`
+/// asks, of its own or over an IOSurface (docs/graphics-kext/dgpu-oracle.md Q41: the Radeon Pro
+/// 5300M and the UHD Graphics 630, macOS 26.7.1), and make no texture of `BGR10_XR` or its
+/// `_sRGB` twin, at whose descriptor Metal's validation ends the process: where the M3 Max leaves
+/// the texture untouched the GPUs differ, and its answer, the drop ([`untouched_resolves`]), lies
+/// inside what Metal's GPUs do and costs nothing, as the runtime resolves into no other format
+/// (`ResolveFormat`).
 fn measured_pair(t: &rt::Texture, r: &rt::Texture) -> Option<Pair> {
     use PixelFormat as P;
     if !matches!(t.pixel_format(), P::BGRA8Unorm | P::BGRA8UnormSRGB) || t.sample_count() != 4 {
@@ -682,9 +688,16 @@ enum Pair {
 ///   not) of usage `ShaderRead` and `RenderTarget` (Shared and Private ones also of
 ///   `RenderTarget` alone, and with `ShaderWrite`, `PixelFormatView` or both), a Private
 ///   shareable one or one opened from its handle, or one over an IOSurface without planes
-///   (Shared or Managed, each also presented as a framebuffer-only drawable), which the drop
-///   does not take here: the guest's surfaces reach this platform as buffers, and a texture over
-///   a buffer is a shape not measured;
+///   (Shared or Managed, each also presented as a framebuffer-only drawable); and, 16 by 16,
+///   loaded by `Load` and drawn, one of its own or over an IOSurface without planes, over plane
+///   0 of a 128 by 16 `420v` surface or over plane 1 of a 128 by 32 one, each Shared, Managed or
+///   Private (`oracle_surfresolve`, docs/graphics-kext/dgpu-oracle.md Q41: m3-max-29682 and
+///   m3-max-29690, macOS 27.0.1). The guest's surfaces reach this platform as buffers that stand
+///   for them, a texture over a surface's plane made over its buffer
+///   (`new_texture_over_surface_plane`) in the storage mode the device picks, Private over a
+///   device cache, whatever the guest asked: the drop takes such a texture, over a surface
+///   without planes or a plane of one with planes ([`Over::Surface`], [`Over::Plane`]), of any
+///   of those storage modes. Any other texture over a buffer is a shape not measured;
 /// - in a pass beside no other attachment, a depth one (`Depth32Float`, memoryless and not
 ///   stored or Private and stored; `Depth32Float_Stencil8` as both depth and stencil attachment,
 ///   memoryless, or Private cleared or not loaded, and not stored), or another 4-sample colour
@@ -779,7 +792,7 @@ fn unmeasured_shape(
         ));
     }
     match (resolve.over(), r.storage_mode()) {
-        (Some(Over::Own), S::Shared | S::Managed | S::Private)
+        (Some(Over::Own | Over::Surface | Over::Plane), S::Shared | S::Managed | S::Private)
         | (Some(Over::Shareable), S::Private) => {}
         (over, storage) => {
             return Some(format!(
@@ -3257,9 +3270,11 @@ impl VulkanRenderEncoder {
     /// action is `Unknown` waits for its late store action ([`Self::late_store`]). One that does
     /// not store into such memory (`DontCare`, and `MultisampleResolve` out of it) is sent, as
     /// Metal completes it, its writes dropped by the copy. A colour resolve this platform made the
-    /// pass without, as plain Metal leaves a texture of that format untouched ([`Dropped`]), is
-    /// never into such memory: the drop takes only a resolve texture of its own memory, a
-    /// shareable one or one over a surface ([`unmeasured_shape`]).
+    /// pass without, as plain Metal leaves a texture of that format untouched ([`Dropped`]), stores
+    /// nothing into its resolve texture, which may lie over such memory (a texture over a
+    /// surface's plane lies over a buffer): the M3 Max completes a pass that resolves into such
+    /// memory in a pair it leaves untouched, the memory unchanged (docs/graphics-kext/dgpu-oracle.md
+    /// Q38).
     fn read_only_stores(&self, sources: &Sources) {
         let colors = (0u32..).zip(&sources.color);
         let attachments = (colors.map(|(i, [t, r])| (Attachment::Color(i), t, r)))
@@ -3271,8 +3286,11 @@ impl VulkanRenderEncoder {
             )]);
         let mut faults = false;
         for (attachment, texture, resolve) in attachments {
+            let dropped =
+                matches!(attachment, Attachment::Color(i) if self.dropped_resolve(i).is_some());
             let (over, into) =
                 plain(|| (over_read_only_copy(texture), over_read_only_copy(resolve)));
+            let into = into && !dropped;
             if !over && !into {
                 continue;
             }
@@ -4876,6 +4894,233 @@ pub(crate) mod tests {
             assert!(rounded() > before);
         } else {
             assert_eq!(rounded(), before);
+        }
+    }
+
+    /// `MTLTextureType2DMultisample`, `MTLPixelFormatBGRA8Unorm_sRGB`,
+    /// `MTLStoreActionStoreAndMultisampleResolve` and `MTLResourceStorageModePrivate`.
+    const MULTISAMPLE_2D: u64 = 4;
+    const BGRA8_SRGB: u64 = 81;
+    const STORE_AND_RESOLVE: u64 = 3;
+    const PRIVATE_STORAGE: u64 = 0x20;
+
+    /// A 16 × 16 4-sample `BGRA8Unorm_sRGB` texture of the device's Private memory, a render
+    /// target.
+    fn srgb_samples() -> VulkanTexture {
+        let p = platform();
+        let desc = p.texture_descriptor(&TextureDesc {
+            texture_type: MULTISAMPLE_2D,
+            pixel_format: BGRA8_SRGB,
+            width: 16,
+            height: 16,
+            sample_count: 4,
+            usage: TARGET,
+            resource_options: Some(PRIVATE_STORAGE),
+            ..TextureDesc::default()
+        });
+        dev().new_texture(OnFault::Die, &desc).unwrap().unwrap()
+    }
+
+    /// A pass that clears `samples` and stores them by `store` into `resolve`.
+    fn resolving_into(
+        samples: &VulkanTexture,
+        resolve: &VulkanTexture,
+        store: u64,
+    ) -> VulkanRenderPassDescriptor {
+        let pass = platform().render_pass_descriptor();
+        let attachment = ColorAttachmentSet {
+            texture: Some(Some(samples)),
+            resolve_texture: Some(Some(resolve)),
+            load_action: Some(CLEAR),
+            store_action: Some(store),
+            clear_color: Some(ClearColor {
+                red: 1.0,
+                green: 0.5,
+                blue: 0.25,
+                alpha: 1.0,
+            }),
+            ..ColorAttachmentSet::default()
+        };
+        pass.set_color_attachment(OnFault::Die, 0, &attachment)
+            .unwrap();
+        pass
+    }
+
+    /// A 4-sample `BGRA8Unorm_sRGB` attachment's resolve into a 16 × 16 `RGBA16Float` texture
+    /// over an IOSurface, as the device's surfaces reach this platform (over a buffer that
+    /// stands for the surface, `new_texture_over_surface_plane`), by `MultisampleResolve` or
+    /// `StoreAndMultisampleResolve`, is dropped, as plain Metal leaves such a texture untouched
+    /// ([`untouched_resolves`]: measured on the M3 Max over a surface without planes and over
+    /// planes 0 and 1 of a `420v` surface, Shared, Managed and Private,
+    /// docs/graphics-kext/dgpu-oracle.md Q41): over a surface without planes, of Shared memory
+    /// and over a Private buffer as over a surface's device cache, and over planes 0 and 1 of a
+    /// `420v` surface, the pass is made, its command buffer completes, and the surface keeps its
+    /// bytes. Over a buffer that stands for no surface (no facts) the pass dies at its making,
+    /// named a texture over a buffer, a shape not measured
+    #[test]
+    fn untouched_resolves_into_textures_over_surfaces_are_dropped() {
+        use crate::core::num::ToUsize as _;
+        use crate::core::platform::values::SurfacePlane;
+        use crate::gpu::resource::tests::{StandIn, facts_of};
+
+        /// `MTLStoreActionMultisampleResolve`.
+        const RESOLVE: u64 = 2;
+        type P = crate::platform::VulkanPlatform;
+        let (p, d) = (platform(), dev());
+        let samples = srgb_samples();
+        let desc = |options| {
+            p.texture_descriptor(&TextureDesc {
+                pixel_format: RGBA16F,
+                width: 16,
+                height: 16,
+                usage: READ | TARGET,
+                resource_options: Some(options),
+                ..TextureDesc::default()
+            })
+        };
+        // A '420v' surface of 128 by 32: plane 0's 32 rows of 128 bytes, then plane 1's 16.
+        let length = 128 * 32 + 128 * 16;
+        let flat = facts_of(*b"RGhA", (16, 16), &[]);
+        let planes = vec![(0, 128), (128 * 32, 128)];
+        let planar = facts_of(*b"420v", (128, 32), &planes);
+        let cache = d.new_buffer_of_length(OnFault::Die, length, PRIVATE_STORAGE);
+        let cases = [
+            (
+                "a surface without planes",
+                StandIn::<P>::shared(&d, flat, vec![(0, 128)], length),
+                0,
+                0,
+            ),
+            (
+                "a device cache of a surface without planes",
+                StandIn::<P>::over(cache.unwrap().unwrap(), flat, vec![(0, 128)]),
+                0,
+                PRIVATE_STORAGE,
+            ),
+            (
+                "plane 0 of a 420v surface",
+                StandIn::<P>::shared(&d, planar, planes.clone(), length),
+                0,
+                0,
+            ),
+            (
+                "plane 1 of a 420v surface",
+                StandIn::<P>::shared(&d, planar, planes, length),
+                1,
+                0,
+            ),
+        ];
+        let q = d.new_command_queue().unwrap();
+        let mut wrong = Vec::new();
+        for (what, surface, plane, options) in &cases {
+            let target = surface.texture(&desc(*options), *plane).unwrap().unwrap();
+            for store in [RESOLVE, STORE_AND_RESOLVE] {
+                let out = buffer::<P>(&d, length, 0, &[]);
+                let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+                let blit = |cmd| {
+                    let b = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+                    b.encode(OnFault::Die, cmd).unwrap();
+                    b.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+                };
+                blit(BlitCmd::FillBuffer {
+                    buffer: &surface.buffer,
+                    range: NsRange::new(0, length),
+                    value: 0xa5,
+                });
+                let pass = resolving_into(&samples, &target, store);
+                let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+                e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+                blit(BlitCmd::CopyBufferToBuffer {
+                    source_buffer: Some(&surface.buffer),
+                    source_offset: 0,
+                    destination_buffer: Some(&out),
+                    destination_offset: 0,
+                    size: length,
+                });
+                cb.commit(OnFault::Die).unwrap();
+                cb.wait_until_completed(OnFault::Die).unwrap();
+                // SAFETY: a Shared buffer's bytes, read after its command buffer completed.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), length.to_usize())
+                };
+                let kept = bytes.iter().all(|&b| b == 0xa5);
+                if cb.status().0 != 4 || cb.error().is_some() || !kept {
+                    wrong.push(format!(
+                        "{what}, store {store}: status {}, error {:?}, kept {kept}",
+                        cb.status().0,
+                        cb.error().map(|e| e.code)
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        // A buffer that stands for no surface: a texture over a buffer.
+        let none = &cases[0].1;
+        let plane = SurfacePlane {
+            facts: None,
+            ..none.plane(0)
+        };
+        let target = (none.buffer).new_texture_over_surface_plane(OnFault::Die, &desc(0), plane);
+        let target = target.unwrap().unwrap();
+        let pass = resolving_into(&samples, &target, RESOLVE);
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        *crate::answer::LAST_LINE.lock() = None;
+        let site = catch_death(|| cb.render_encoder(OnFault::Die, &pass)).unwrap_err();
+        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+        assert_eq!(site.file, "renderCommandEncoderWithDescriptor:", "{line}");
+        assert!(
+            line.contains("the resolve texture is a texture over a buffer of storage mode Shared"),
+            "{line}"
+        );
+    }
+
+    /// A 4-sample `BGRA8Unorm_sRGB` attachment's resolve into an `RGBA16Float` texture over a
+    /// surface without planes over a guest's read-only buffer (made with bit 24,
+    /// `resource::tests::read_only_buffer`), by `MultisampleResolve` or
+    /// `StoreAndMultisampleResolve`, is dropped ([`untouched_resolves`]), and its command buffer
+    /// completes with the pages zeros, as the M3 Max completes a resolve into such memory in a pair
+    /// it leaves untouched (docs/graphics-kext/dgpu-oracle.md Q38), where a resolve it writes
+    /// faults the command buffer ([`a_resolve_into_read_only_memory_faults_its_command_buffer`]).
+    /// Linux's: on macOS it goes to Metal
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_untouched_resolve_into_a_surface_over_read_only_memory_completes() {
+        use crate::core::platform::os::vm::HostVm as _;
+
+        use crate::gpu::resource::tests::{StandIn, facts_of, read_only_buffer};
+        use crate::os::PAGE;
+
+        let p = platform();
+        let desc = p.texture_descriptor(&TextureDesc {
+            pixel_format: RGBA16F,
+            width: 16,
+            height: 16,
+            usage: READ | TARGET,
+            ..TextureDesc::default()
+        });
+        for store in [MULTISAMPLE_RESOLVE, STORE_AND_RESOLVE] {
+            let (ro, pages) = read_only_buffer(1);
+            let facts = facts_of(*b"RGhA", (16, 16), &[]);
+            let surface = StandIn::<crate::platform::VulkanPlatform>::over(
+                ro.clone_ref(),
+                facts,
+                vec![(0, 128)],
+            );
+            let target = surface.texture(&desc, 0).unwrap().unwrap();
+            let samples = srgb_samples();
+            let pass = resolving_into(&samples, &target, store);
+            let q = dev().new_command_queue().unwrap();
+            let line = pass_line_on(&q, &pass, None, (pages, 16 * 128));
+            assert_eq!(
+                line, "status 4 error None before 0x5a after 0x6b signal true zeros true",
+                "{store}"
+            );
+            drop((pass, samples, target, surface, ro));
+            assert!(
+                crate::remap::VulkanVm::new()
+                    .deallocate(pages, PAGE)
+                    .is_success()
+            );
         }
     }
 
