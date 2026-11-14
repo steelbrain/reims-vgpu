@@ -1914,6 +1914,39 @@ Metal's words (`rgfxEndAtInvalidTextureDescriptor`). Until 11-13 a texture answe
 given, and the bundle ended the process at 0x80 alone. The shell tests'
 `test_texture_usage_leaves_out_atomic` and the `usage.*` and `atomic.*` descriptor cases hold it.
 
+## Q37: what one command buffer's encoders see of each other's writes through two textures over one plane
+
+Probe: `oracle_surftex DEVICE --alias N`, its aliasing cases, 11-13 (m3-max-27359 the M3 Max
+under macOS 27.0.1; m3-max-27356 the AMD 5300M and the Intel UHD 630 under 26.7.1), each case in
+a child process of its own with `MTL_DEBUG_LAYER` unset. An `'L008'` surface 64 x 64 in rows of
+128 bytes; `wide`, an `RG8Unorm` 64 x 64 texture over its plane 0, its rows the surface's whole
+128 bytes, and `narrow`, an `R8Unorm` 64 x 64 one, the plane's own texels. One command buffer's
+first encoder writes through one of them (a blit from a buffer, or a render pass that clears and
+stores) and its second blits the other into a Shared buffer; both textures keep the device's
+hazard tracking, or are Untracked with the writer updating a fence the reader waits for. 16 runs a
+case, the CPU setting every byte of the surface to 0x11 under a lock before each.
+
+| what | M3 Max | AMD 5300M and Intel UHD 630 |
+|---|---|---|
+| the second encoder reads the first's writes through the other texture, either way, tracked or behind a fence | every byte, 16 of 16 runs, every case | the same |
+| the surface after the command buffer, under a read-only lock: the plane's texels | the writes, 16 of 16 | the same |
+| the bytes past the plane's texels after the wide texture wrote them | the writes, 16 of 16 | the CPU's 0x11, 16 of 16: the GPU's writes there never reach the CPU |
+| what the wide texture reads past the plane's texels, the CPU having written 0x11 there | 0x11, 16 of 16 | never 0x11 (0 of 16) |
+
+So Metal orders a write through one texture over a plane before the next encoder's read through
+another over it, on all three; the bytes past a plane's texels are the surface's own on the M3
+and the GPU's own on the x86 Macs, which sync only the texels with the CPU. Neither answer is a
+promise of Metal's.
+
+What our stack does *(class 3)*: on a host whose device cache lays a plane out at the GPU's pitch,
+a texture past the plane's texels lies over the block's wide home, and each encoder that writes
+through either it or a texture over the cache is followed in its command buffer by a copy of its
+texel rows into the other side, before the next encoder (`decode::surface_cache`, "Wider than the
+plane"). The home over the block's view of its pages gives the M3's bytes past the texels; the
+stand-in, where the block has no view, gives the x86 Macs'. Until 11-13 such a texture raised
+`RowPitch` where it was wider than the cache's pitch (`l008.fmt.rg8` on an arm64 macOS 27 guest,
+MoltenVK), and read the cache's own bytes past the plane where it fitted the pitch.
+
 ## Not measured
 
 - Cross-process lock waits for pending GPU work: rgk-lock's `lock_probe` (x86 matches the M3,

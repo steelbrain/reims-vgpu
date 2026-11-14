@@ -518,7 +518,15 @@ Stages:
       planes out at the GPU's pitch instead, each texture over a plane at
       the same byte of the same row there, and the cache's copies move each
       row between its place in the pages and its place in the cache
-      (`decode::surface_cache`, "Laid out at the GPU's pitch"). The
+      (`decode::surface_cache`, "Laid out at the GPU's pitch"). A texture
+      over the surface that does not lie in its plane's texels there (wider
+      than the plane's row, or taller, which Metal makes inside the
+      surface's rows) lies over the block's wide home at the surface's own
+      place and pitch: over its view of the pages where it has one, else a
+      stand-in of their layout; each encoder that writes through either side
+      is followed in its command buffer by a copy of its texel rows into the
+      other (`decode::surface_cache`, "Wider than the plane";
+      dgpu-oracle.md Q37). The
       answer is that of a message with no layout. Each
       command buffer names the cached surfaces it uses
       (`RGFX_OP_SURFACE_USE`) with the kext's count of the surface's
