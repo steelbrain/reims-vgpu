@@ -42,8 +42,6 @@ pub(crate) use host_ram::{
     copies as copies_guest_ram, copy_from_host_ram, copy_runs_from_host_ram, copy_to_host_ram,
     ram_over, take_devices as take_ram_devices,
 };
-#[cfg(test)]
-pub(crate) use import::views_through_dma_bufs;
 pub(crate) use import::{
     COPIES_READ_ONLY, ImportMade, ImportView, TWINS_READ_ONLY, allocate_zeros, dma_buf_refusal,
     host_memory, host_memory_vouched, import_view, learn_view_imports, shown_at,

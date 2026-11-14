@@ -140,20 +140,16 @@ fn pages_of(
 mod tests {
     use std::os::fd::AsRawFd as _;
 
-    use crate::core::host::PhysicalMemoryRange;
+    use crate::core::host::HostPtr;
     use crate::core::num::ToUsize as _;
-    use crate::core::platform::os::surface::{IoSurfaces as _, Surface as _, SurfaceSpec};
     use crate::core::platform::os::vm::HostVm as _;
 
-    use super::super::surface::LinuxSurfaces;
     use super::super::vm::{LinuxVm, allocate_aliasable};
     use super::*;
 
-    const BGRA: u32 = u32::from_be_bytes(*b"BGRA");
-
-    /// `count` fresh pages a view can be made of, each byte its page's index, and the ranges of
+    /// `count` fresh pages a view can be made of, each byte its page's index, and the runs of
     /// them a guest's surface names, last first, so that its view is of pages out of order.
-    fn scattered_pages(count: u64) -> (u64, Vec<PhysicalMemoryRange>) {
+    fn scattered_pages(count: u64) -> (u64, Vec<(HostPtr, u64)>) {
         let page = vm::page_size();
         let at = allocate_aliasable(count * page).unwrap().addr().to_u64();
         for i in 0..count {
@@ -166,31 +162,21 @@ mod tests {
                 );
             }
         }
-        let ranges = (0..count)
+        let runs = (0..count)
             .rev()
-            .map(|i| PhysicalMemoryRange {
-                physical_address: at + i * page,
-                physical_length: page,
-            })
+            .map(|i| (HostPtr::from_addr((at + i * page).to_usize()), page))
             .collect();
-        (at, ranges)
+        (at, runs)
     }
 
-    fn over(ranges: &[PhysicalMemoryRange]) -> SurfaceSpec {
-        let page = vm::page_size();
-        SurfaceSpec {
-            pixel_format: BGRA,
-            alloc_size: ranges.len().to_u64() * page,
-            offset: 0x40,
-            width: 16,
-            height: 16,
-            bytes_per_element: 4,
-            bytes_per_row: 64,
-            element_width: 1,
-            element_height: 1,
-            client_address_ranges: Some(ranges.to_vec()),
-            ..SurfaceSpec::default()
-        }
+    /// A view of `runs`' pages in their order, made as the device's views of a guest's pages are
+    /// (`remap_runs_shared_overwrite`): its first byte, freed with [`free`].
+    fn view_of(runs: &[(HostPtr, u64)]) -> u64 {
+        let vm = LinuxVm::new();
+        let length = runs.iter().map(|&(_, length)| length).sum();
+        let at = vm.allocate_anywhere(length).unwrap();
+        assert!(vm.remap_runs_shared_overwrite(at, runs).is_ok());
+        at.addr().to_u64()
     }
 
     fn read(at: u64) -> u8 {
@@ -224,20 +210,19 @@ mod tests {
         }
     }
 
-    /// A dma-buf of ranges of a surface's view holds the pages each lies in, in order, a page two
-    /// share once, and says where each range starts in it: a write there reaches the guest's page
-    /// the view shows at that range
+    /// A dma-buf of ranges of a view of a guest's pages holds the pages each lies in, in order, a
+    /// page two share once, and says where each range starts in it: a write there reaches the
+    /// guest's page the view shows at that range
     #[test]
     fn a_dma_buf_of_ranges_holds_their_pages_in_order() {
         let page = vm::page_size();
-        let (at, ranges) = scattered_pages(4);
-        let s = LinuxSurfaces::new().create(&over(&ranges)).unwrap();
-        let base = s.base_address().addr();
-        let lent = NonNull::new(std::ptr::with_exposed_provenance_mut::<u8>(base)).unwrap();
-        let first = base.to_u64() - 0x40;
-        // From the surface's base address, 0x40 into its view's first page: a range in its first
-        // page, one in its third, and one starting in that third page's last bytes and ending in
-        // the fourth.
+        let (at, runs) = scattered_pages(4);
+        let first = view_of(&runs);
+        let base = first + 0x40;
+        let lent =
+            NonNull::new(std::ptr::with_exposed_provenance_mut::<u8>(base.to_usize())).unwrap();
+        // From 0x40 into the view's first page: a range in its first page, one in its third, and
+        // one starting in that third page's last bytes and ending in the fourth.
         let wanted = [
             (0x100, 0x200),
             (2 * page, 0x100),
@@ -258,7 +243,7 @@ mod tests {
             }
             Err(why) => eprintln!("no dma-buf here, the rest checked: {why:?}"),
         }
-        drop(s);
+        free(first, 4 * page);
         free(at, 4 * page);
     }
 
@@ -267,9 +252,8 @@ mod tests {
     #[test]
     fn a_dma_buf_of_host_memory_holds_the_pages_its_mapping_shows() {
         let page = vm::page_size();
-        let (at, ranges) = scattered_pages(3);
-        let s = LinuxSurfaces::new().create(&over(&ranges)).unwrap();
-        let view = s.base_address().addr().to_u64() - 0x40;
+        let (at, runs) = scattered_pages(3);
+        let view = view_of(&runs);
         let first =
             NonNull::new(std::ptr::with_exposed_provenance_mut::<u8>(view.to_usize())).unwrap();
         match dma_buf_of_host(first, 3 * page, &[(page + 0x80, 0x100)]) {
@@ -300,7 +284,7 @@ mod tests {
         );
         // SAFETY: the mapping made above, which nothing holds.
         unsafe { libc::munmap(anonymous, page.to_usize()) };
-        drop(s);
+        free(view, 3 * page);
         free(at, 3 * page);
     }
 

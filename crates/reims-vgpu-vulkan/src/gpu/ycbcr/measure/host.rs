@@ -1,64 +1,28 @@
-//! The measurement harness's macOS side: a surface's values (`IOSurfaceSetValue`), which only
-//! IOSurface itself takes, the probe kernels and the surfaces they read.
+//! The measurement harness's macOS side: the probe kernels and the surfaces they read.
 
-use std::ffi::c_void;
-
-use crate::core::platform::Handle as _;
 use crate::core::platform::Platform;
 use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
 use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
 use crate::core::platform::device::GpuDevice as _;
 use crate::core::platform::resource::{Buffer as _, Library as _};
 use crate::core::platform::types::{MtlSize, NsRange};
-use crate::core::platform::values::{SamplerDesc, TextureDesc};
+use crate::core::platform::values::{SamplerDesc, SurfaceMatrix, SurfacePlane, TextureDesc};
 use crate::core::raise::OnFault;
 
 use super::*;
-use crate::os::OsSurface;
 
-#[link(name = "IOSurface", kind = "framework")]
-unsafe extern "C" {
-    fn IOSurfaceSetValue(buffer: *const c_void, key: *const c_void, value: *const c_void);
-}
-
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    fn CFStringCreateWithBytes(
-        alloc: *const c_void,
-        bytes: *const u8,
-        num_bytes: isize,
-        encoding: u32,
-        is_external_representation: u8,
-    ) -> *const c_void;
-    fn CFRelease(cf: *const c_void);
-}
-
-/// A CFString of `s`, +1.
-fn cf_string(s: &str) -> *const c_void {
-    // SAFETY: `s`'s bytes, live for the call, which copies them.
-    unsafe {
-        CFStringCreateWithBytes(
-            std::ptr::null(),
-            s.as_ptr(),
-            isize::try_from(s.len()).unwrap(),
-            0x0800_0100,
-            0,
-        )
-    }
-}
-
-/// Sets `surface`'s `key` to the string `value` (`IOSurfaceSetValue`).
-pub(crate) fn set_value(surface: &OsSurface, key: &str, value: &str) {
-    let (key, value) = (cf_string(key), cf_string(value));
-    let surface =
-        std::ptr::with_exposed_provenance::<c_void>(usize::try_from(surface.id().0).unwrap());
-    // SAFETY: a live IOSurfaceRef and two CFStrings, released after the call, which retains
-    // what it keeps.
-    unsafe {
-        IOSurfaceSetValue(surface, key, value);
-        CFRelease(key);
-        CFRelease(value);
-    }
+/// Sets `surface`'s YCbCr matrix to the one `name` names, its `kIOSurfaceYCbCrMatrix` string, as
+/// the guest's surfaces give it: any other string is `Other`.
+pub(crate) fn set_matrix(surface: &mut Surface, name: &str) {
+    surface.facts.ycbcr_matrix = Some(match name {
+        "ITU_R_601_4" => SurfaceMatrix::Itu601,
+        "ITU_R_709_2" => SurfaceMatrix::Itu709,
+        "ITU_R_2020" => SurfaceMatrix::Itu2020,
+        "SMPTE_240M_1995" => SurfaceMatrix::Smpte240M1995,
+        "DCI_P3" => SurfaceMatrix::DciP3,
+        "P3_D65" => SurfaceMatrix::P3D65,
+        _ => SurfaceMatrix::Other,
+    });
 }
 
 /// The tests' kernels that read a texture (`ycbcr_probe.metal`).
@@ -76,59 +40,37 @@ fn shape_420(ostype: &[u8; 4]) -> Shape {
     }
 }
 
-/// A host-only surface of `ostype` with the two planes of a `width` by `height` texture of
-/// 505, rows of a multiple of 64 bytes and plane 1 at a multiple of 4096, as the measured
-/// surfaces were laid out ([`Shape::spec`]).
-pub(crate) fn surface_420(ostype: &[u8; 4], size: (u64, u64)) -> OsSurface {
-    shape_420(ostype).surface(size)
+/// A surface of `ostype` with the two planes of a `width` by `height` texture of 505, rows of a
+/// multiple of 64 bytes and plane 1 at a multiple of 4096, as the measured surfaces were laid
+/// out ([`Shape::layout`]), the buffer that stands for it `d`'s.
+pub(crate) fn surface_420(
+    d: &crate::gpu::device::VulkanDevice,
+    ostype: &[u8; 4],
+    size: (u64, u64),
+) -> Surface {
+    shape_420(ostype).surface(d, size)
 }
 
-/// [`surface_420`], made over pages of its own the host allocates, as a guest's surface is
-/// made over the guest's pages (`kIOSurfaceClientAddressRanges`), and those pages: their first
-/// byte and length, which the caller frees once the surface is gone.
+/// [`surface_420`], the buffer that stands for it a no-copy one of `d`'s over pages of their own
+/// the host allocates, as a guest's surface lies over the guest's pages, and those pages: their
+/// first byte and length, which the caller frees once the buffer is gone.
 pub(crate) fn surface_420_over(
+    d: &crate::gpu::device::VulkanDevice,
     ostype: &[u8; 4],
     size: (u64, u64),
-) -> (OsSurface, crate::core::host::HostPtr, u64) {
-    surface_420_over_at(ostype, size, 0)
-}
-
-/// [`surface_420_over`], its bytes `offset` bytes into its pages (`kIOSurfaceOffset`), its
-/// planes' offsets too, which count from the pages' first byte.
-pub(crate) fn surface_420_over_at(
-    ostype: &[u8; 4],
-    size: (u64, u64),
-    offset: u64,
-) -> (OsSurface, crate::core::host::HostPtr, u64) {
-    use crate::core::host::PhysicalMemoryRange;
-    use crate::core::num::ToU64;
+) -> (Surface, crate::core::host::HostPtr, u64) {
+    use crate::core::platform::HostRange;
     use crate::core::platform::os::vm::HostVm as _;
-    let mut spec = spec_420(ostype, size);
+    let (facts, planes, length) = shape_420(ostype).layout(size);
     let vm = crate::os::OsVm::new();
-    let page = vm.page_size();
-    for plane in spec.planes.iter_mut().flatten() {
-        plane.offset += offset;
-        plane.base += offset;
-    }
-    spec.offset = offset;
-    spec.alloc_size = (spec.alloc_size + offset).next_multiple_of(page);
-    let pages = vm.allocate_anywhere(spec.alloc_size).unwrap();
-    let first = pages.addr().to_u64();
-    spec.client_address_ranges = Some(
-        (0..spec.alloc_size / page)
-            .map(|i| PhysicalMemoryRange {
-                physical_address: first + i * page,
-                physical_length: page,
-            })
-            .collect(),
-    );
-    let s = OsSurfaces::new().create(&spec).unwrap();
-    (s, pages, spec.alloc_size)
-}
-
-/// The spec of [`surface_420`]'s surface.
-fn spec_420(ostype: &[u8; 4], size: (u64, u64)) -> SurfaceSpec {
-    shape_420(ostype).spec(size)
+    let length = length.next_multiple_of(vm.page_size());
+    let pages = vm.allocate_anywhere(length).unwrap();
+    // SAFETY: the pages outlive the buffer, which the caller drops before freeing them.
+    let bytes = unsafe { HostRange::new(pages, length) };
+    let buffer = (d.new_buffer_over_host_memory(OnFault::Die, bytes, 0, None))
+        .unwrap()
+        .unwrap();
+    (Surface::over(buffer, facts, planes), pages, length)
 }
 
 /// A xorshift sequence from `seed`: the same 16-bit values on every run.
@@ -144,7 +86,7 @@ pub(crate) fn noise(seed: u64) -> impl FnMut() -> u16 {
 
 /// Fills `surface`, of [`surface_420`]'s layout, with `noise(seed)`'s samples, the low 6 bits
 /// too.
-pub(crate) fn fill_noise(surface: &OsSurface, size: (u64, u64), seed: u64) {
+pub(crate) fn fill_noise(surface: &Surface, size: (u64, u64), seed: u64) {
     shape_420(b"x420").fill_noise(surface, size, seed);
 }
 
@@ -530,17 +472,13 @@ impl Shape {
     /// low 10 bits into its code's place in its word.
     pub(crate) fn fill(
         &self,
-        surface: &OsSurface,
+        surface: &Surface,
         size: (u64, u64),
         luma: impl Fn(u64, u64) -> u16,
         chroma: impl Fn(u64, u64) -> (u16, u16),
     ) {
-        use crate::core::platform::os::surface::Surface as _;
-        let (y_plane, c_plane) = (
-            crate::os::plane(surface, 0).unwrap(),
-            crate::os::plane(surface, 1).unwrap(),
-        );
-        let base = surface.base_address().as_ptr::<u8>();
+        let (y_plane, c_plane) = (surface.plane(0), surface.plane(1));
+        let base = surface.base();
         let element = self.container;
         if self.packed {
             return self.fill_packed(surface, size, luma, chroma);
@@ -581,14 +519,13 @@ impl Shape {
     /// `10 (i mod 3)`.
     fn fill_packed(
         &self,
-        surface: &OsSurface,
+        surface: &Surface,
         (width, height): (u64, u64),
         luma: impl Fn(u64, u64) -> u16,
         chroma: impl Fn(u64, u64) -> (u16, u16),
     ) {
-        use crate::core::platform::os::surface::Surface as _;
-        let base = surface.base_address().as_ptr::<u8>();
-        let write = |plane: &metal2vulkan_runtime::IoSurfacePlane, y: u64, i: u64, code: u16| {
+        let base = surface.base();
+        let write = |plane: &SurfacePlane, y: u64, i: u64, code: u16| {
             let at = plane.offset + y * plane.bytes_per_row + i / 3 * 4;
             let shift = 10 * (i % 3);
             let at = usize::try_from(at).unwrap();
@@ -601,10 +538,7 @@ impl Shape {
                 word.write_unaligned((kept | code).to_le());
             }
         };
-        let (y_plane, c_plane) = (
-            crate::os::plane(surface, 0).unwrap(),
-            crate::os::plane(surface, 1).unwrap(),
-        );
+        let (y_plane, c_plane) = (surface.plane(0), surface.plane(1));
         for y in 0..height {
             for x in 0..width {
                 write(&y_plane, y, x, luma(x, y));
@@ -624,7 +558,7 @@ impl Shape {
     /// sample's top bits with the low bits 0.
     pub(crate) fn fill_codes(
         &self,
-        surface: &OsSurface,
+        surface: &Surface,
         size: (u64, u64),
         luma: impl Fn(u64, u64) -> u16,
         chroma: impl Fn(u64, u64) -> (u16, u16),
@@ -641,7 +575,7 @@ impl Shape {
     }
 
     /// Fills `surface` with `noise(seed)`'s samples, the low bits too.
-    pub(crate) fn fill_noise(&self, surface: &OsSurface, size: (u64, u64), seed: u64) {
+    pub(crate) fn fill_noise(&self, surface: &Surface, size: (u64, u64), seed: u64) {
         let mut next = noise(seed);
         let (width, height) = size;
         let (chroma_width, chroma_height) = self.chroma_size(size);

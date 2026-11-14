@@ -685,7 +685,10 @@ pub(crate) mod tests {
     use crate::core::raise::OnFault;
 
     use super::*;
-    use crate::gpu::resource::tests::{guest_pages, heap_at, over_pages};
+    use crate::gpu::resource::tests::{
+        StandIn, free_pages, guest_pages, heap_at, host_pages, over_pages,
+    };
+    use crate::platform::VulkanPlatform;
 
     /// A death over a slot whose state's slot writes cannot tell names why they cannot; one they
     /// tell names the declaration that writes
@@ -838,11 +841,11 @@ pub(crate) mod tests {
     }
 
     /// What a bind keeps of a buffer's or a texture's memory, read without collecting ranges, is
-    /// what the memory collected answers: for a buffer of the device's memory, one placed in a
-    /// heap over the guest's memory (at its bytes and past the heap's), one on a surface, textures
-    /// placed in the heap, over a buffer, on surfaces over the guest's pages and over memory of
-    /// their own, and one of memory of its own. A heap's buffer and texture lie in no memory a
-    /// surface's write check looks for
+    /// what the memory collected answers: for a buffer of the device's memory and one placed in a
+    /// heap over the guest's memory (at its bytes and past the heap's), textures placed in the
+    /// heap, over a buffer, over a surface's plane of a buffer over the host's pages and of one of
+    /// the device's memory, and one of memory of its own. A heap's buffer and texture lie in no
+    /// memory a surface's write check looks for
     #[test]
     fn bound_memory_is_the_memory_collected() {
         let (p, d) = (
@@ -876,21 +879,13 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         let alone = d.new_texture(OnFault::Die, &bgra(0)).unwrap().unwrap();
-        let surface = crate::os::tests::bgra_surface(16, 16);
-        let (over, pages, length) = crate::os::tests::bgra_surface_over_at(16, 16, 0x40);
-        let on_surface = (d.new_texture_on_surface(&bgra(0), Some(&surface), 0))
-            .unwrap()
-            .unwrap();
-        let on_pages = (d.new_texture_on_surface(&bgra(0), Some(&over), 0))
-            .unwrap()
-            .unwrap();
-        let surface_buffer = d.new_buffer_on_surface(Some(&surface)).unwrap().unwrap();
+        let surface = StandIn::<VulkanPlatform>::bgra(&d, 16, 16);
+        let (pages, length) = host_pages(16 * 16 * 4);
+        let over = StandIn::<VulkanPlatform>::bgra_over(&d, (16, 16), pages, length);
+        let on_surface = surface.texture(&bgra(0), 0).unwrap().unwrap();
+        let on_pages = over.texture(&bgra(0), 0).unwrap().unwrap();
         let agree = |when: &str| {
-            for (name, b) in [
-                ("placed", &placed),
-                ("own", &own),
-                ("surface", &surface_buffer),
-            ] {
+            for (name, b) in [("placed", &placed), ("own", &own)] {
                 assert_eq!(buffer_bound(b), buffer_memory(b).bound(), "{when}: {name}");
                 for bytes in [0..0x10, 0xff0..0x1010, size..size + 0x10, 0x10..0x10] {
                     assert_eq!(
@@ -917,7 +912,7 @@ pub(crate) mod tests {
         agree("made");
         assert!(!buffer_bound(&placed).meets && !texture_bound(&in_heap).meets);
         drop((on_pages, over));
-        crate::os::tests::free(pages, length);
+        free_pages(pages, length);
     }
 
     /// A texture over a surface's plane reaches the plane's rows where the CPU lays them out and

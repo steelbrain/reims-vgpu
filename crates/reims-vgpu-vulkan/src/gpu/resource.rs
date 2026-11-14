@@ -2131,20 +2131,20 @@ pub(crate) mod tests {
     use std::alloc::{Layout, alloc_zeroed, dealloc};
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use crate::core::num::ToUsize as _;
+    use crate::core::num::{ToU64 as _, ToUsize as _};
     use crate::core::platform::Platform;
     use crate::core::platform::descriptor::TextureDescriptor as _;
     use crate::core::platform::device::{GpuDevice, NoCopyDeallocator};
-    use crate::core::platform::os::surface::{Surface, SurfacePlaneSpec, SurfaceSpec};
     use crate::core::platform::types::MtlOrigin;
-    use crate::core::platform::values::{BufferDesc, HeapDesc, HeapMade, OptionSet, TextureDesc};
+    use crate::core::platform::values::{
+        BufferDesc, HeapDesc, HeapMade, OptionSet, SurfaceFacts, TextureDesc,
+    };
     use crate::core::raise::death::DeathKind;
     use crate::core::sync::Mutex;
     use crate::core::testkit::capture::catch_death;
 
     use super::*;
     use crate::gpu::device::tests::dev;
-    use crate::os::tests::bgra_surface;
     use crate::platform::tests::platform;
 
     /// A no-copy buffer core makes over `pages` pages of zeros mapped read-only
@@ -2670,6 +2670,155 @@ pub(crate) mod tests {
             .unwrap()
     }
 
+    /// A buffer that stands for an IOSurface, as the reims-graphics device's surfaces reach this
+    /// platform (`Buffer::new_texture_over_surface_plane`): its first byte is the surface's base
+    /// address, its planes lie at [`StandIn::planes`], and a texture over one of them reads the
+    /// surface's facts besides.
+    pub(crate) struct StandIn<P: Platform> {
+        /// The buffer, of the surface's bytes.
+        pub(crate) buffer: P::Buffer,
+        /// What a texture over one of its planes reads besides the plane.
+        pub(crate) facts: SurfaceFacts,
+        /// Each plane's first byte and bytes per row: of a surface without planes, its one, at
+        /// 0 (`IOSurfaceGetBytesPerRow`).
+        pub(crate) planes: Vec<(u64, u64)>,
+    }
+
+    /// The facts of a surface of `ostype` whose plane 0 is `width` by `height`, and whose plane
+    /// 1, where `planes` has one, lies there; `planes` has none for a surface without planes, and
+    /// its matrix is none.
+    pub(crate) fn facts_of(
+        ostype: [u8; 4],
+        (width, height): (u64, u64),
+        planes: &[(u64, u64)],
+    ) -> SurfaceFacts {
+        let (chroma_offset, chroma_bytes_per_row) = planes.get(1).copied().unwrap_or((0, 0));
+        SurfaceFacts {
+            pixel_format: u32::from_be_bytes(ostype),
+            plane_count: planes.len().to_u64(),
+            width,
+            height,
+            chroma_offset,
+            chroma_bytes_per_row,
+            ycbcr_matrix: None,
+        }
+    }
+
+    /// Fresh pages of the host's, of zeros, that hold at least `bytes` bytes: their first byte and
+    /// length, which [`free_pages`] frees once nothing lies over them.
+    pub(crate) fn host_pages(bytes: u64) -> (HostPtr, u64) {
+        use crate::core::platform::os::vm::HostVm as _;
+        let length = bytes.next_multiple_of(crate::os::OsVm::new().page_size());
+        (crate::os::allocate_aliasable(length).unwrap(), length)
+    }
+
+    /// The pages of [`host_pages`], freed.
+    pub(crate) fn free_pages(pages: HostPtr, length: u64) {
+        use crate::core::platform::os::vm::HostVm as _;
+        let freed = crate::remap::VulkanVm::new().deallocate(pages, length);
+        assert!(freed.is_success());
+    }
+
+    impl<P: Platform> StandIn<P> {
+        /// A stand-in over `buffer` of a surface of `facts` whose planes lie at `planes` (one at
+        /// 0, of the surface's bytes per row, for a surface without planes).
+        pub(crate) fn over(
+            buffer: P::Buffer,
+            facts: SurfaceFacts,
+            planes: Vec<(u64, u64)>,
+        ) -> Self {
+            StandIn {
+                buffer,
+                facts,
+                planes,
+            }
+        }
+
+        /// A stand-in of `length` bytes of `d`'s `Shared` memory, zeros, of a surface of `facts`
+        /// whose planes lie at `planes`.
+        pub(crate) fn shared(
+            d: &P::Device,
+            facts: SurfaceFacts,
+            planes: Vec<(u64, u64)>,
+            length: u64,
+        ) -> Self {
+            let buffer = (d.new_buffer_of_length(OnFault::Die, length, 0))
+                .unwrap()
+                .unwrap();
+            Self::over(buffer, facts, planes)
+        }
+
+        /// A 'BGRA' surface's stand-in of `width` by `height`, 4 bytes an element, rows of
+        /// `width × 4` bytes, zeros.
+        pub(crate) fn bgra(d: &P::Device, width: u64, height: u64) -> Self {
+            let facts = facts_of(*b"BGRA", (width, height), &[]);
+            Self::shared(d, facts, vec![(0, width * 4)], width * height * 4)
+        }
+
+        /// A 'BGRA' surface's stand-in of `size` (as [`StandIn::bgra`]) over the `length` bytes of
+        /// host pages at `pages` ([`host_pages`]), a no-copy buffer of `d`'s over them, as a
+        /// guest's surface lies over the guest's pages.
+        pub(crate) fn bgra_over(
+            d: &P::Device,
+            (width, height): (u64, u64),
+            pages: HostPtr,
+            length: u64,
+        ) -> Self {
+            // SAFETY: the pages outlive the buffer, which the caller drops before freeing them.
+            let bytes = unsafe { HostRange::new(pages, length) };
+            let buffer = (d.new_buffer_over_host_memory(OnFault::Die, bytes, 0, None))
+                .unwrap()
+                .unwrap();
+            let facts = facts_of(*b"BGRA", (width, height), &[]);
+            Self::over(buffer, facts, vec![(0, width * 4)])
+        }
+
+        /// Plane `plane` as `newTextureWithDescriptor:iosurface:plane:` is given it, with the
+        /// surface's facts: a plane the surface lacks at 0.
+        pub(crate) fn plane(&self, plane: u64) -> SurfacePlane {
+            let at = usize::try_from(plane).ok().and_then(|p| self.planes.get(p));
+            let (offset, bytes_per_row) = at.copied().unwrap_or((0, 0));
+            SurfacePlane {
+                plane,
+                offset,
+                bytes_per_row,
+                planar: self.facts.plane_count != 0,
+                facts: Some(self.facts),
+            }
+        }
+
+        /// A texture of `desc` over plane `plane`, as the device's IOSurface creator makes one
+        /// over the surface the buffer stands for.
+        pub(crate) fn texture(
+            &self,
+            desc: &P::TextureDescriptor,
+            plane: u64,
+        ) -> RaiseResult<Option<P::Texture>> {
+            use crate::core::platform::resource::Buffer as _;
+            (self.buffer).new_texture_over_surface_plane(OnFault::Return, desc, self.plane(plane))
+        }
+
+        /// The surface's base address: the buffer's first byte.
+        pub(crate) fn base(&self) -> *mut u8 {
+            use crate::core::platform::resource::Buffer as _;
+            self.buffer.contents().as_ptr::<u8>()
+        }
+
+        /// The surface's length: the buffer's.
+        #[cfg(target_os = "macos")]
+        pub(crate) fn length(&self) -> u64 {
+            use crate::core::platform::resource::Buffer as _;
+            self.buffer.length()
+        }
+
+        /// The surface's bytes from its base address to `length`, read once the work that wrote
+        /// them completed.
+        pub(crate) fn bytes(&self, length: u64) -> Vec<u8> {
+            // SAFETY: the buffer's Shared bytes, which no GPU work uses now.
+            unsafe { std::slice::from_raw_parts(self.base(), length.to_usize()) }.to_vec()
+        }
+    }
+
     /// Two pages of zeroed host memory at a page boundary, and its layout.
     fn pages() -> (*mut u8, Layout) {
         let layout = Layout::from_size_align(32768, 16384).unwrap();
@@ -2892,18 +3041,21 @@ pub(crate) mod tests {
         assert_eq!(heap(Some(at)).unwrap().gpu_address(), at);
     }
 
-    /// Core's fill of a texture with the bytes of a buffer made on a surface reads the buffer's
-    /// NULL contents plus the offset, and dies at the fill as a NULL access, where Metal's read of
-    /// the bytes ends the process with a segmentation fault, of any length; one of a region of no
-    /// width and no height, whose bytes Metal never reads, fills nothing and goes on
+    /// Core's fill of a texture with the bytes of a buffer whose contents are NULL (a `Private`
+    /// one's) reads the buffer's NULL contents plus the offset, and dies at the fill as a NULL
+    /// access, where Metal's read of the bytes ends the process with a segmentation fault, of any
+    /// length; one of a region of no width and no height, whose bytes Metal never reads, fills
+    /// nothing and goes on
     #[test]
-    fn a_fill_with_a_surface_buffers_bytes_dies() {
+    fn a_fill_with_a_null_buffers_bytes_dies() {
         use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
         use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
         use crate::core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
         let d = dev();
-        let s = bgra_surface(64, 32);
-        let b = d.new_buffer_on_surface(Some(&s)).unwrap().unwrap();
+        let b = (d.new_buffer_of_length(OnFault::Return, 64 * 32 * 4, 0x20))
+            .unwrap()
+            .unwrap();
+        assert!(b.contents().is_null());
         let t = d
             .new_texture(OnFault::Return, &bgra(8, 8, 0))
             .unwrap()
@@ -3764,111 +3916,29 @@ pub(crate) mod tests {
         }
     }
 
-    /// A texture on a surface writes the surface's memory, and holds one reference of the
-    /// surface while it lives; its views share that reference. One over plane 1 of the surface,
-    /// which has no planes, dies where it is made
+    /// A texture on a surface, over the buffer that stands for it, writes the surface's memory,
+    /// and so does a view of it. One over plane 1 of the surface, which has no planes, dies where
+    /// it is made
     #[test]
     fn textures_on_surfaces() {
         let d = dev();
-        let s = bgra_surface(64, 32);
-        let t = d
-            .new_texture_on_surface(&bgra(64, 32, 0), Some(&s), 0)
-            .unwrap()
-            .unwrap();
-        assert_eq!(s.retain_count(), 2);
+        let s = StandIn::<VulkanPlatform>::bgra(&d, 64, 32);
+        let t = s.texture(&bgra(64, 32, 0), 0).unwrap().unwrap();
         let view = t.new_texture_view(70).unwrap().unwrap();
-        assert_eq!(s.retain_count(), 2);
-        assert_eq!(view.iosurface().unwrap().id(), s.id());
         let bytes = pattern(64, 32);
         fill(&t, &bytes);
-        // SAFETY: the surface's memory, rows of 256 bytes, which the texture's write finished.
-        let memory =
-            unsafe { std::slice::from_raw_parts(s.base_address().as_ptr::<u8>(), bytes.len()) };
-        assert_eq!(memory, &bytes[..]);
+        // The surface's memory, rows of 256 bytes, which the texture's write finished.
+        assert_eq!(s.bytes(64 * 32 * 4), bytes);
         assert_eq!(read_back(&t), bytes);
+        let reversed: Vec<u8> = bytes.iter().rev().copied().collect();
+        fill(&view, &reversed);
+        assert_eq!(s.bytes(64 * 32 * 4), reversed);
         drop((t, view));
-        assert_eq!(s.retain_count(), 1);
         // A surface without planes has plane 0 only: a texture over its plane 1 dies where it
         // is made, as Metal asserts there (`textures_over_planes_a_surface_lacks_are_metals`).
-        let site =
-            catch_death(|| d.new_texture_on_surface(&bgra(64, 32, 0), Some(&s), 1)).unwrap_err();
+        let site = catch_death(|| s.texture(&bgra(64, 32, 0), 1)).unwrap_err();
         let sel = "newTextureWithDescriptor:iosurface:plane:";
         assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
-    }
-
-    /// A texture over a surface released while a command buffer that copies it waits keeps the
-    /// surface's range of Metal's space until that command buffer completed, as Metal frees a
-    /// released resource's range (`metal_space::Hold`): a buffer of the range's size made
-    /// meanwhile lies elsewhere, and one made after the completion at the range
-    #[test]
-    fn a_surface_texture_keeps_its_range_until_its_command_buffer_completed() {
-        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
-        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
-        use crate::core::platform::event::{EventRef, SharedEvent as _};
-        use crate::core::platform::resource::Buffer as _;
-        use crate::core::platform::types::MtlSize;
-        use crate::core::rt::Pool;
-        let (p, d) = (platform(), dev());
-        // 64 by 64, 4 bytes a texel: a page, whose range is the space's 0x8000.
-        let side = 64;
-        let s = bgra_surface(side, side);
-        let desc = p.texture_descriptor(&TextureDesc {
-            pixel_format: 80,
-            width: side,
-            height: side,
-            usage: 1,
-            resource_options: Some(0),
-            ..TextureDesc::default()
-        });
-        let q = d.new_command_queue().unwrap();
-        let event = d.new_shared_event().unwrap();
-        let out = d
-            .new_buffer_of_length(OnFault::Die, side * side * 4, 0)
-            .unwrap()
-            .unwrap();
-        let page = |d: &VulkanDevice| {
-            d.new_buffer_of_length(OnFault::Die, 0x4000, 0)
-                .unwrap()
-                .unwrap()
-        };
-        let (cb, at) = {
-            let _pool = Pool::here();
-            let t = d
-                .new_texture_on_surface(&desc, Some(&s), 0)
-                .unwrap()
-                .unwrap();
-            let at = t.space.address().unwrap();
-            let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-            cb.encode_wait(Some(EventRef::Shared(&event)), 1).unwrap();
-            let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
-            e.encode(
-                OnFault::Die,
-                BlitCmd::CopyTextureToBuffer {
-                    source_texture: &t,
-                    source_slice: 0,
-                    source_level: 0,
-                    source_origin: MtlOrigin::new(0, 0, 0),
-                    source_size: MtlSize::new(side, side, 1),
-                    destination_buffer: &out,
-                    destination_offset: 0,
-                    destination_bytes_per_row: side * 4,
-                    destination_bytes_per_image: side * side * 4,
-                },
-            )
-            .unwrap();
-            e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
-            cb.commit(OnFault::Die).unwrap();
-            (cb, at)
-        };
-        let meanwhile = page(&d);
-        assert_ne!(meanwhile.gpu_address(), at, "made while the copy waits");
-        {
-            let _pool = Pool::here();
-            event.set_signaled_value(1).unwrap();
-            cb.wait_until_completed(OnFault::Die).unwrap();
-            assert!(cb.error().is_none(), "{:?}", cb.error());
-        }
-        assert_eq!(page(&d).gpu_address(), at, "made once the copy completed");
     }
 
     /// A texture of its own memory and a shareable texture, released while a command buffer
@@ -3992,8 +4062,8 @@ pub(crate) mod tests {
 
     /// Every texture takes a descriptor in Metal's mempool while it lives
     /// (`metal_space::Elements`): one of memory of its own, a view, one over a buffer and one in a
-    /// heap, over a surface, a shareable one and one opened from its handle each count one, which
-    /// goes with it
+    /// heap, over a buffer that stands for a surface, a shareable one and one opened from its
+    /// handle each count one, which goes with it
     #[test]
     fn every_texture_takes_a_descriptor_while_it_lives() {
         use crate::core::platform::resource::{Heap as _, Texture as _};
@@ -4024,8 +4094,8 @@ pub(crate) mod tests {
         });
         let heap = heap.unwrap().heap.unwrap();
         let placed = heap.new_texture(&private, 0).unwrap().unwrap();
-        let s = bgra_surface(64, 64);
-        let on_surface = d.new_texture_on_surface(&shared, Some(&s), 0);
+        let s = StandIn::<VulkanPlatform>::bgra(&d, 64, 64);
+        let on_surface = s.texture(&shared, 0);
         let shareable = d.new_shared_texture(&private).unwrap().unwrap();
         let handle = shareable.new_shared_texture_handle().unwrap().unwrap();
         let opened = d.open_shared_texture(Some(&handle), 0).unwrap().unwrap();
@@ -4035,50 +4105,20 @@ pub(crate) mod tests {
         assert_eq!(live(), start);
     }
 
-    /// A texture on a plane of a planar surface is over that plane's bytes, at its rows; a plane
-    /// past the surface's planes is nil, as on Metal
+    /// A texture on a plane of a planar surface, over the buffer that stands for it, is over that
+    /// plane's bytes, at its rows; a plane past the surface's planes is nil, as on Metal
     #[test]
     fn textures_on_surface_planes() {
-        let plane = |base: u64| SurfacePlaneSpec {
-            base,
-            offset: base,
-            width: 16,
-            height: 4,
-            size: 16 * 4 * 8,
-            bytes_per_row: 16 * 8,
-            bytes_per_element: 4,
-            element_width: 1,
-            element_height: 1,
-            ..SurfacePlaneSpec::default()
-        };
-        let s = platform()
-            .surfaces()
-            .create(&SurfaceSpec {
-                planes: Some(vec![plane(0), plane(16384)]),
-                pixel_format: u32::from_be_bytes(*b"BGRA"),
-                alloc_size: 32768,
-                width: 16,
-                height: 4,
-                bytes_per_element: 4,
-                bytes_per_row: 16 * 8,
-                element_width: 1,
-                element_height: 1,
-                ..SurfaceSpec::default()
-            })
-            .unwrap();
-        assert_eq!(s.plane_count(), 2);
         let d = dev();
-        let t = d
-            .new_texture_on_surface(&bgra(16, 4, 0), Some(&s), 1)
-            .unwrap()
-            .unwrap();
+        let planes = vec![(0, 16 * 8), (16384, 16 * 8)];
+        let facts = facts_of(*b"BGRA", (16, 4), &planes);
+        let s = StandIn::<VulkanPlatform>::shared(&d, facts, planes, 32768);
+        let t = s.texture(&bgra(16, 4, 0), 1).unwrap().unwrap();
         let bytes = pattern(16, 4);
         fill(&t, &bytes);
-        // SAFETY: the surface's memory, which the texture's write finished: plane 1 at 16384,
-        // rows of 128 bytes of which the texture's 64 are the first.
-        let memory = unsafe {
-            std::slice::from_raw_parts(s.base_address().as_ptr::<u8>().add(16384), 4 * 128)
-        };
+        // The surface's memory, which the texture's write finished: plane 1 at 16384, rows of 128
+        // bytes of which the texture's 64 are the first.
+        let memory = &s.bytes(32768)[16384..];
         for row in 0..4 {
             assert_eq!(
                 memory[row * 128..row * 128 + 64],
@@ -4086,7 +4126,7 @@ pub(crate) mod tests {
             );
         }
         assert_eq!(read_back(&t), bytes);
-        let none = d.new_texture_on_surface(&bgra(16, 4, 0), Some(&s), 2);
+        let none = s.texture(&bgra(16, 4, 0), 2);
         assert!(none.unwrap().is_none());
     }
 
@@ -4204,8 +4244,9 @@ pub(crate) mod tests {
     }
 
     /// A texture of a rotation other than 0 dies where Metal aborts: of a descriptor that is not
-    /// framebufferOnly, of a rotation past 4, and made other than over an IOSurface. Over one, a
-    /// framebufferOnly descriptor's rotations 1 to 4 are made at its size, holding the rotation,
+    /// framebufferOnly, of a rotation past 4, and made other than over an IOSurface. Over one
+    /// (the buffer that stands for it), a framebufferOnly descriptor's rotations 1 to 4 are made
+    /// at its size, holding the rotation,
     /// over a surface that holds the frame it stores (a quarter turn's its height wide and its
     /// width tall); a size query answers them as it answers 0. A quarter turn whose stored frame
     /// runs past the surface dies where it is made: Metal makes it, and the runtime refuses it.
@@ -4215,11 +4256,11 @@ pub(crate) mod tests {
     #[test]
     fn rotated_textures_are_made_only_where_metal_makes_them() {
         let d = dev();
-        let s = bgra_surface(64, 16);
+        let s = StandIn::<VulkanPlatform>::bgra(&d, 64, 16);
         let on_surface = "newTextureWithDescriptor:iosurface:plane:";
         for (rotation, framebuffer_only) in [(2, false), (1, false), (5, true), (u64::MAX, true)] {
             let desc = rotated(rotation, framebuffer_only);
-            let site = catch_death(|| d.new_texture_on_surface(&desc, Some(&s), 0)).unwrap_err();
+            let site = catch_death(|| s.texture(&desc, 0)).unwrap_err();
             assert_eq!(
                 (site.kind, site.file),
                 (DeathKind::Abort, on_surface),
@@ -4267,13 +4308,10 @@ pub(crate) mod tests {
         }
         let site = catch_death(|| d.heap_texture_size_and_align(&rotated(1, false))).unwrap_err();
         assert_eq!(site.file, "heapTextureSizeAndAlignWithDescriptor:");
-        let tall = bgra_surface(64, 64);
+        let tall = StandIn::<VulkanPlatform>::bgra(&d, 64, 64);
         for rotation in 1..=4 {
             let desc = rotated(rotation, true);
-            let t = d
-                .new_texture_on_surface(&desc, Some(&tall), 0)
-                .unwrap()
-                .unwrap();
+            let t = tall.texture(&desc, 0).unwrap().unwrap();
             let turned = plain(|| t.raw.rotation());
             assert_eq!((t.width(), t.height(), turned), (64, 16, rotation));
             let view = t.new_texture_view(81).unwrap().unwrap();
@@ -4300,7 +4338,7 @@ pub(crate) mod tests {
             });
             let sel = "newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:";
             assert_eq!(swizzled.unwrap_err().file, sel);
-            let made = catch_death(|| d.new_texture_on_surface(&desc, Some(&s), 0).map(drop));
+            let made = catch_death(|| s.texture(&desc, 0).map(drop));
             match rotation {
                 2 => assert!(made.is_ok()),
                 _ => assert_eq!(made.unwrap_err().file, on_surface, "rotation {rotation}"),
@@ -4340,8 +4378,8 @@ pub(crate) mod tests {
         for (sel, death) in deaths {
             assert_eq!(death.unwrap_err().file, sel);
         }
-        let s = bgra_surface(64, 16);
-        let on_surface = d.new_texture_on_surface(&desc, Some(&s), 0).unwrap();
+        let s = StandIn::<VulkanPlatform>::bgra(&d, 64, 16);
+        let on_surface = s.texture(&desc, 0).unwrap();
         assert_eq!(on_surface.map(|t| plain(|| t.raw.rotation())), Some(0));
         assert!(d.new_shared_texture(&private).unwrap().is_some());
         let size = |desc: &VulkanTextureDescriptor| {

@@ -9,7 +9,7 @@ use crate::core::platform::values::{BufferDesc, HeapDesc, OptionSet, TextureDesc
 use crate::core::raise::OnFault;
 
 use super::*;
-use crate::os::tests::bgra_surface;
+use crate::gpu::resource::tests::StandIn;
 use crate::platform::tests::platform;
 
 /// The two formats measured first (the module's docs): `YCBCR10_420_2P` (505) and
@@ -310,10 +310,10 @@ fn textures_die_where_made() {
 /// [`textures_die_where_made`] of `format`.
 fn die_where_made(format: u64) {
     let d = dev();
-    let s = bgra_surface(16, 16);
+    let s = StandIn::<crate::platform::VulkanPlatform>::bgra(&dev(), 16, 16);
     let desc = ycbcr(format, |_| {});
     let ours = platform().texture_descriptor(&desc);
-    let site = catch_death(|| d.new_texture_on_surface(&ours, Some(&s), 0)).unwrap_err();
+    let site = catch_death(|| s.texture(&ours, 0)).unwrap_err();
     assert_eq!(
         (site.kind, site.file),
         (

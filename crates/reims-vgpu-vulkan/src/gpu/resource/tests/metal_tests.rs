@@ -7,7 +7,12 @@ use crate::core::platform::values::{
 
 use super::*;
 use crate::gpu::device::tests::uploading_depth;
-use crate::os::OsSurface;
+
+/// A 'BGRA' surface of `width` by `height`: the buffer that stands for it, the process's
+/// device's ([`StandIn::bgra`]).
+fn bgra_stand_in(width: u64, height: u64) -> StandIn<VulkanPlatform> {
+    StandIn::bgra(&dev(), width, height)
+}
 
 /// A heap's texture's making, where a device that clamps a 32-bit float depth into `[0, 1]`
 /// (`gpu::device`'s `clamps_depth`: MoltenVK) dies of `restricted-depth-upload` in strict mode
@@ -400,97 +405,6 @@ fn textures_and_buffers_answer_as_metals_across_descriptors() {
     );
 }
 
-/// newBufferWithIOSurface: makes a Shared buffer over the surface's memory that holds one
-/// reference of the surface while it lives, whose contents are NULL, as Metal's; iosurface
-/// answers it, +1
-#[test]
-fn buffers_on_surfaces() {
-    let d = dev();
-    let s = bgra_surface(64, 32);
-    assert_eq!(s.retain_count(), 1);
-    let b = d.new_buffer_on_surface(Some(&s)).unwrap().unwrap();
-    assert_eq!(s.retain_count(), 2);
-    let seen = (b.contents(), b.length(), b.storage_mode());
-    assert_eq!(seen, (HostPtr::NULL, s.alloc_size(), 0));
-    let again = b.iosurface().unwrap();
-    assert_eq!(again.id(), s.id());
-    assert_eq!(s.retain_count(), 3);
-    drop(again);
-    drop(b);
-    assert_eq!(s.retain_count(), 1);
-}
-
-/// Every buffer over a surface answers the surface's address, as on Metal (where it runs, two
-/// live ones answer one address, and so does one made after the first's release while a
-/// command buffer that fills it waits): a buffer made while another holds the address shares
-/// a live one's range, which stays while one holds it. One made while none lives, after the
-/// last's release while a command buffer that fills it waits, dies at
-/// newBufferWithIOSurface:, naming the surface, as the runtime holds the released one's range
-/// until that command buffer completed and shares a range with a live buffer alone. Then a
-/// buffer over the surface lies at the address again
-#[test]
-fn buffers_over_a_surface_share_its_address() {
-    use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
-    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use crate::core::platform::event::{EventRef, SharedEvent as _};
-    fn waiting_fill<P: Platform>(
-        d: &P::Device,
-        buffer: &P::Buffer,
-    ) -> (P::CommandBuffer, P::SharedEvent) {
-        let q = d.new_command_queue().unwrap();
-        let gate = d.new_shared_event().unwrap();
-        let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
-        cb.encode_wait(Some(EventRef::Shared(&gate)), 1).unwrap();
-        let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
-        let fill = BlitCmd::FillBuffer {
-            buffer,
-            range: NsRange::new(0, 16),
-            value: 0x5c,
-        };
-        e.encode(OnFault::Return, fill).unwrap();
-        e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
-        cb.commit(OnFault::Return).unwrap();
-        (cb, gate)
-    }
-    fn completed<P: Platform>((cb, gate): (P::CommandBuffer, P::SharedEvent)) {
-        gate.set_signaled_value(1).unwrap();
-        cb.wait_until_completed(OnFault::Return).unwrap();
-        assert!(cb.error().is_none(), "{:?}", cb.error());
-    }
-    let d = dev();
-    let s = bgra_surface(64, 64);
-    let first = d.new_buffer_on_surface(Some(&s)).unwrap().unwrap();
-    let at = first.gpu_address();
-    let second = d.new_buffer_on_surface(Some(&s)).unwrap().unwrap();
-    assert_eq!(second.gpu_address(), at, "the first live");
-    drop(first);
-    let third = d.new_buffer_on_surface(Some(&s)).unwrap().unwrap();
-    assert_eq!(
-        third.gpu_address(),
-        at,
-        "the first released, the second live"
-    );
-    drop(third);
-    let waiting = waiting_fill::<VulkanPlatform>(&d, &second);
-    drop(second);
-    *crate::answer::LAST_LINE.lock() = None;
-    let site = catch_death(|| drop(d.new_buffer_on_surface(Some(&s)))).unwrap_err();
-    let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-    assert_eq!(
-        (site.kind, site.file),
-        (DeathKind::Abort, "newBufferWithIOSurface:"),
-        "{line}"
-    );
-    let named = format!(
-        "a buffer over IOSurface {:#x} while a released one",
-        s.id().0
-    );
-    assert!(line.contains(&named), "{line}");
-    completed::<VulkanPlatform>(waiting);
-    let again = d.new_buffer_on_surface(Some(&s)).unwrap().unwrap();
-    assert_eq!(again.gpu_address(), at, "made once the fill completed");
-}
-
 /// A 2D array over a no-copy buffer of host memory made by
 /// `newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:` is Metal's, byte for
 /// byte: its slices as made, after the CPU rewrote the memory (both alias it), and the memory
@@ -505,98 +419,6 @@ fn array_over_host_memory_is_metals() {
     );
     for (step, ours) in steps.iter().zip(&ours) {
         assert!(crate::metal_matches_bytes!(step, ours), "{step}");
-    }
-}
-
-/// newBufferWithIOSurface: of a surface over the guest's pages at an offset into its
-/// allocation (`kIOSurfaceOffset`) reads as Metal's does: as long as the allocation, from the
-/// surface's base address, its last bytes, past the allocation's end, 0
-#[test]
-fn buffers_on_offset_surfaces_read_as_metals() {
-    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-    use crate::core::platform::os::vm::HostVm as _;
-    use crate::core::platform::resource::Library as _;
-    // `copy_words` of the surface's buffer, on `d`: its length, and each 32-bit word of it.
-    fn copied<P: Platform<Surface = OsSurface>>(d: &P::Device, s: &OsSurface) -> (u64, Vec<u32>) {
-        let b = d.new_buffer_on_surface(Some(s)).unwrap().unwrap();
-        let length = b.length();
-        let library = d
-            .new_library(crate::gpu::ycbcr::measure::PROBE)
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        let f = library
-            .new_function(OnFault::Die, "copy_words")
-            .unwrap()
-            .unwrap();
-        let copies = d
-            .new_compute_pipeline_state_for_function(Some(&f))
-            .unwrap()
-            .unwrap();
-        let out = d
-            .new_buffer_of_length(OnFault::Die, length, 0)
-            .unwrap()
-            .unwrap();
-        let q = d.new_command_queue().unwrap();
-        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-        let e = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
-        let buffers = [Some(&b), Some(&out)];
-        for cmd in [
-            ComputeCmd::SetComputePipelineState {
-                state: Some(&copies),
-            },
-            ComputeCmd::SetBuffers {
-                buffers: &buffers,
-                offsets: &[0, 0],
-                range: NsRange::new(0, 2),
-            },
-            ComputeCmd::DispatchThreads {
-                threads_per_grid: MtlSize::new(length / 4, 1, 1),
-                threads_per_threadgroup: MtlSize::new(64, 1, 1),
-            },
-            ComputeCmd::EndEncoding,
-        ] {
-            e.encode(OnFault::Die, cmd).unwrap();
-        }
-        cb.commit(OnFault::Die).unwrap();
-        cb.wait_until_completed(OnFault::Die).unwrap();
-        let n = usize::try_from(length / 4).unwrap();
-        // SAFETY: a Shared buffer's words, read after the command buffer completed.
-        let words = unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u32>(), n) };
-        (length, words.to_vec())
-    }
-    for offset in [0, 0x40, 0x1000, 0x4000] {
-        let (s, pages, length) = crate::os::tests::bgra_surface_over_at(64, 32, offset);
-        // Each word of the pages holds its own offset there, its top bit set.
-        for at in (0..length).step_by(4) {
-            // SAFETY: a word of the test's pages, which no GPU work uses now.
-            unsafe {
-                pages
-                    .as_ptr::<u8>()
-                    .add(usize::try_from(at).unwrap())
-                    .cast::<u32>()
-                    .write(0x8000_0000 | u32::try_from(at).unwrap());
-            }
-        }
-        // Metal's first, before this platform's runtime makes any buffer of its own.
-        let (ours, words) = copied::<VulkanPlatform>(&dev(), &s);
-        assert_eq!(ours, length, "{offset:#x}: the allocation's size");
-        let past = usize::try_from((length - offset) / 4).unwrap();
-        assert_eq!(
-            words[0],
-            0x8000_0000 | u32::try_from(offset).unwrap(),
-            "{offset:#x}"
-        );
-        assert!(
-            words[past..].iter().all(|&w| w == 0),
-            "{offset:#x}: 0 past the allocation"
-        );
-        let key = format!("{offset:#x}");
-        let metals = crate::metal_matches_raw!(key, (ours, words));
-        assert!(metals, "{offset:#x}: Metal's");
-        drop(s);
-        crate::remap::VulkanVm::new().deallocate(pages, length);
     }
 }
 
@@ -1392,63 +1214,6 @@ fn views_need_no_pixel_format_view_usage() {
     assert!(handle.is_none(), "a texture over a buffer is not shareable");
 }
 
-/// How a command buffer reaches a surface ([`surface_references`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Reach {
-    /// A blit's copy of a texture on it into a buffer.
-    Blit,
-    /// A kernel's `read()` of a texture on it, bound at a slot.
-    Kernel,
-    /// A kernel's `read()` of a view of a texture on it, bound at a slot.
-    View,
-    /// A kernel's `read()` of a texture on it through an argument buffer holding its
-    /// resource ID, made resident with `useResource:usage:`.
-    Resident,
-    /// A render pass that clears a texture on it and stores it.
-    Attachment,
-    /// A blit's copy of a buffer on it (`newBufferWithIOSurface:`) into another buffer.
-    SurfaceBuffer,
-    /// Not at all: a texture on it is made and released, and the command buffer's kernel
-    /// reads a texture on another surface.
-    Unused,
-    /// A kernel's `read()` of a texture of the format (raw) over plane 0 of it, a two-plane
-    /// surface of the OSType, bound at a slot.
-    KernelYcbcr(u64, [u8; 4]),
-    /// Not at all, as for `Unused`, the texture on it one of the format (raw) over plane 0
-    /// of it, a two-plane surface of the OSType.
-    UnusedYcbcr(u64, [u8; 4]),
-    /// A draw's `sample()` of a texture on it, bound at a fragment slot, into a target on
-    /// another surface.
-    Sampled(Pipeline),
-    /// A draw into a texture on it, a render pass's color attachment it clears and stores.
-    Drawn(Pipeline),
-}
-
-/// The `VkPipeline` a draw of [`Reach::Sampled`] or [`Reach::Drawn`] takes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Pipeline {
-    /// Made before the command buffer: the state drew the same in one before.
-    Before,
-    /// Made at the draw: the state's first draw, through a triangle fill mode of lines, a
-    /// key its creation does not predict. The test draws on a device whose shader cache is
-    /// its own and empty (`device_with_own_cache`), as a fresh machine's.
-    AtTheDraw,
-}
-
-#[link(name = "IOSurface", kind = "framework")]
-unsafe extern "C" {
-    fn IOSurfaceGetUseCount(buffer: *const std::ffi::c_void) -> i32;
-}
-
-/// `s`'s IOSurface's retain count (`CFGetRetainCount`, which core's unmap reads: Busy unless
-/// 1) and its use count (`IOSurfaceGetUseCount`).
-fn surface_counts(s: &OsSurface) -> (i64, i32) {
-    let at =
-        std::ptr::with_exposed_provenance::<std::ffi::c_void>(usize::try_from(s.id().0).unwrap());
-    // SAFETY: a live IOSurfaceRef, which `s` holds.
-    (s.retain_count(), unsafe { IOSurfaceGetUseCount(at) })
-}
-
 /// Waits until `q`'s command buffers that completed have let go of what they retained, as
 /// Metal lets go of it: on the queue's completion queue, after the command buffer's waiters
 /// returned (`-[IOGPUMetalCommandBuffer didCompleteWithStartTime:endTime:error:]` releases its
@@ -1466,739 +1231,6 @@ fn let_go<P: Platform>(q: &P::CommandQueue) {
     let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
     cb.commit(OnFault::Die).unwrap();
     cb.wait_until_completed(OnFault::Die).unwrap();
-}
-
-/// [`surface_counts`] of a 16 by 16 surface (`BGRA8Unorm`, or two planes for the YCbCr
-/// reaches) as a command buffer of `d`'s reaches it as `reach` says: with the texture or
-/// buffer on it made; once the command buffer committed waiting for an event, every other
-/// handle to the texture or buffer released; after it completed and its queue let go of what
-/// it retained ([`let_go`]), the command buffer still held; and once the command buffer is
-/// released. Each step runs in an autorelease pool of its own, popped before the counts are
-/// read. With them, how many pipelines `made` counts were made from the command buffer's
-/// encoding until it completed.
-fn surface_references<P: Platform<Surface = OsSurface>>(
-    p: &P,
-    d: &P::Device,
-    reach: Reach,
-    made: &dyn Fn(&P::Device) -> u64,
-) -> ([(i64, i32); 4], u64) {
-    use crate::core::platform::blit::{BlitCmd, BlitEncoder as _, ResourceRef};
-    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-    use crate::core::platform::descriptor::RenderPassDescriptor as _;
-    use crate::core::platform::event::{EventRef, SharedEvent as _};
-    use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
-    use crate::core::platform::resource::{Buffer as _, Library as _, Texture as _};
-    use crate::core::platform::values::{ColorAttachmentSet, RenderPipelineDesc};
-    use crate::core::rt::Pool;
-
-    use crate::gpu::ycbcr::measure::{PROBE, sampler};
-    use crate::gpu::ycbcr::measure::{Shape, desc as ycbcr_desc};
-    let side = 16;
-    let ycbcr = match reach {
-        Reach::KernelYcbcr(format, ostype) | Reach::UnusedYcbcr(format, ostype) => {
-            Some((format, ostype))
-        }
-        _ => None,
-    };
-    let s = match ycbcr {
-        Some((_, ostype)) => Shape::of(&ostype).surface((side, side)),
-        None => bgra_surface(side, side),
-    };
-    let other = bgra_surface(side, side);
-    let desc = p.texture_descriptor(&TextureDesc {
-        pixel_format: 80,
-        width: side,
-        height: side,
-        usage: 5,
-        resource_options: Some(0),
-        ..TextureDesc::default()
-    });
-    let on_s = match ycbcr {
-        Some((format, _)) => p.texture_descriptor(&ycbcr_desc(format, (side, side))),
-        None => desc.clone_ref(),
-    };
-    let q = d.new_command_queue().unwrap();
-    let event = d.new_shared_event().unwrap();
-    let out = d
-        .new_buffer_of_length(OnFault::Die, side * side * 8, 0)
-        .unwrap()
-        .unwrap();
-    let args = d
-        .new_buffer_of_length(OnFault::Die, 64, 0)
-        .unwrap()
-        .unwrap();
-    let library = d.new_library(PROBE).unwrap().unwrap().unwrap();
-    let state = |name| {
-        let f = library.new_function(OnFault::Die, name).unwrap().unwrap();
-        d.new_compute_pipeline_state_for_function(Some(&f))
-            .unwrap()
-            .unwrap()
-    };
-    let (read, held) = (state("read_texels"), state("read_held"));
-    let elsewhere = d
-        .new_texture_on_surface(&desc, Some(&other), 0)
-        .unwrap()
-        .unwrap();
-    // A draw's state, sampler and probe (`sample_fragment`'s: each fragment's texel centre,
-    // in rows of `side`).
-    let render = |name| {
-        let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
-        let (vertex, fragment) = (function("cover_vertex"), function(name));
-        d.new_render_pipeline_state(&RenderPipelineDesc {
-            label: None,
-            vertex: &vertex,
-            fragment: &fragment,
-            color0_pixel_format: 80,
-            resource_index: None,
-        })
-        .unwrap()
-        .unwrap()
-    };
-    let drawing = match reach {
-        Reach::Sampled(_) => Some(render("sample_fragment")),
-        Reach::Drawn(_) => Some(render("gradient_fragment")),
-        _ => None,
-    };
-    let nearest = sampler::<P>(d, (0, 0, false), 0);
-    if let Reach::Sampled(_) = reach {
-        let probe: [u32; 6] = [
-            0.5f32.to_bits(),
-            0.5f32.to_bits(),
-            1f32.to_bits(),
-            1f32.to_bits(),
-            u32::try_from(side).unwrap(),
-            u32::try_from(side).unwrap(),
-        ];
-        // SAFETY: a Shared buffer of 64 bytes, which no command uses yet.
-        unsafe {
-            std::ptr::copy_nonoverlapping(probe.as_ptr(), args.contents().as_ptr::<u32>(), 6)
-        };
-    }
-    let draw = |cb: &P::CommandBuffer, target: &P::Texture, sampled: Option<&P::Texture>, lines| {
-        let pass = p.render_pass_descriptor();
-        let attachment = ColorAttachmentSet {
-            texture: Some(Some(target)),
-            load_action: Some(2),
-            store_action: Some(1),
-            ..ColorAttachmentSet::default()
-        };
-        pass.set_color_attachment(OnFault::Die, 0, &attachment)
-            .unwrap();
-        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-        let buffers = [Some(&out), Some(&args)];
-        let samplers = [Some(&nearest)];
-        let mut cmds = vec![RenderCmd::SetRenderPipelineState {
-            pipeline_state: drawing.as_ref(),
-        }];
-        if lines {
-            cmds.push(RenderCmd::SetTriangleFillMode { fill_mode: 1 });
-        }
-        if let Some(t) = sampled {
-            cmds.extend([
-                RenderCmd::SetFragmentTexture {
-                    texture: Some(t),
-                    index: 0,
-                },
-                RenderCmd::SetFragmentSamplerStates {
-                    samplers: &samplers,
-                    range: NsRange::new(0, 1),
-                },
-                RenderCmd::SetFragmentBuffers {
-                    buffers: &buffers,
-                    offsets: &[0, 0],
-                    range: NsRange::new(0, 2),
-                },
-            ]);
-        }
-        cmds.push(RenderCmd::DrawPrimitives {
-            primitive_type: 3,
-            vertex_start: 0,
-            vertex_count: 3,
-        });
-        cmds.push(RenderCmd::EndEncoding);
-        for cmd in cmds {
-            e.encode(OnFault::Die, cmd).unwrap();
-        }
-    };
-    // The same draw before, into and of textures on no surface, completed and released.
-    if let Reach::Sampled(Pipeline::Before) | Reach::Drawn(Pipeline::Before) = reach {
-        let _pool = Pool::here();
-        let plain = || d.new_texture(OnFault::Die, &desc).unwrap().unwrap();
-        let (target, sampled) = (plain(), plain());
-        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-        let sampled = matches!(reach, Reach::Sampled(_)).then_some(&sampled);
-        draw(&cb, &target, sampled, false);
-        cb.commit(OnFault::Die).unwrap();
-        cb.wait_until_completed(OnFault::Die).unwrap();
-        assert!(cb.error().is_none(), "{reach:?}: {:?}", cb.error());
-    }
-    let made_before = made(d);
-    let mut seen = [(0, 0); 4];
-    let cb = {
-        let _pool = Pool::here();
-        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-        cb.encode_wait(Some(EventRef::Shared(&event)), 1).unwrap();
-        let (t, b) = match reach {
-            Reach::SurfaceBuffer => (None, d.new_buffer_on_surface(Some(&s)).unwrap()),
-            _ => (d.new_texture_on_surface(&on_s, Some(&s), 0).unwrap(), None),
-        };
-        assert!(
-            t.is_some() || b.is_some(),
-            "{reach:?}: nothing made on the surface"
-        );
-        seen[0] = surface_counts(&s);
-        let view = match reach {
-            Reach::View => t.as_ref().unwrap().new_texture_view(80).unwrap(),
-            _ => None,
-        };
-        let kernel = |e: &P::ComputeEncoder, state, texture, resident: Option<&P::Texture>| {
-            let buffers = [Some(&out), Some(&args)];
-            let resources = [resident.map(ResourceRef::Texture)];
-            let mut cmds = vec![
-                ComputeCmd::SetComputePipelineState { state: Some(state) },
-                ComputeCmd::SetBuffers {
-                    buffers: &buffers,
-                    offsets: &[0, 0],
-                    range: NsRange::new(0, 2),
-                },
-            ];
-            if let Some(texture) = texture {
-                cmds.push(ComputeCmd::SetTexture {
-                    texture: Some(texture),
-                    index: 0,
-                });
-            }
-            if resident.is_some() {
-                cmds.push(ComputeCmd::UseResources {
-                    resources: &resources,
-                    usage: 1,
-                });
-            }
-            cmds.push(ComputeCmd::DispatchThreads {
-                threads_per_grid: MtlSize::new(side, side, 1),
-                threads_per_threadgroup: MtlSize::new(8, 8, 1),
-            });
-            cmds.push(ComputeCmd::EndEncoding);
-            for cmd in cmds {
-                e.encode(OnFault::Die, cmd).unwrap();
-            }
-        };
-        match reach {
-            Reach::Blit | Reach::SurfaceBuffer => {
-                let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
-                let copy = match &t {
-                    Some(t) => BlitCmd::CopyTextureToBuffer {
-                        source_texture: t,
-                        source_slice: 0,
-                        source_level: 0,
-                        source_origin: MtlOrigin::new(0, 0, 0),
-                        source_size: MtlSize::new(side, side, 1),
-                        destination_buffer: &out,
-                        destination_offset: 0,
-                        destination_bytes_per_row: side * 4,
-                        destination_bytes_per_image: side * side * 4,
-                    },
-                    None => BlitCmd::CopyBufferToBuffer {
-                        source_buffer: b.as_ref(),
-                        source_offset: 0,
-                        destination_buffer: Some(&out),
-                        destination_offset: 0,
-                        size: side * side * 4,
-                    },
-                };
-                e.encode(OnFault::Die, copy).unwrap();
-                e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
-            }
-            Reach::Attachment => {
-                let pass = p.render_pass_descriptor();
-                let attachment = ColorAttachmentSet {
-                    texture: Some(t.as_ref()),
-                    load_action: Some(2),
-                    store_action: Some(1),
-                    ..ColorAttachmentSet::default()
-                };
-                pass.set_color_attachment(OnFault::Die, 0, &attachment)
-                    .unwrap();
-                let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-                e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
-            }
-            Reach::Resident => {
-                let e = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
-                let t = t.as_ref().unwrap();
-                // SAFETY: a Shared buffer of 64 bytes, which no command uses yet.
-                unsafe { args.contents().as_ptr::<u64>().write(t.gpu_resource_id()) };
-                kernel(&e, &held, None, Some(t));
-            }
-            Reach::Kernel | Reach::KernelYcbcr(..) => {
-                let e = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
-                kernel(&e, &read, t.as_ref(), None);
-            }
-            Reach::View => {
-                let e = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
-                kernel(&e, &read, view.as_ref(), None);
-            }
-            Reach::Unused | Reach::UnusedYcbcr(..) => {
-                let e = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
-                kernel(&e, &read, Some(&elsewhere), None);
-            }
-            Reach::Sampled(drawn) => {
-                draw(&cb, &elsewhere, t.as_ref(), drawn == Pipeline::AtTheDraw);
-            }
-            Reach::Drawn(drawn) => {
-                draw(&cb, t.as_ref().unwrap(), None, drawn == Pipeline::AtTheDraw);
-            }
-        }
-        cb.commit(OnFault::Die).unwrap();
-        cb
-    };
-    seen[1] = surface_counts(&s);
-    {
-        let _pool = Pool::here();
-        event.set_signaled_value(1).unwrap();
-        cb.wait_until_completed(OnFault::Die).unwrap();
-        assert!(cb.error().is_none(), "{reach:?}: {:?}", cb.error());
-        let_go::<P>(&q);
-    }
-    seen[2] = surface_counts(&s);
-    let made = made(d) - made_before;
-    {
-        let _pool = Pool::here();
-        drop(cb);
-    }
-    seen[3] = surface_counts(&s);
-    (seen, made)
-}
-
-/// A command buffer holds a surface's IOSurface as Metal's does, measured by its retain
-/// count (which core's unmap reads: Busy unless 1) and its use count: from its commit until
-/// it completed, through a texture on the surface that a blit copies, a kernel reads at a
-/// slot or through an argument buffer made resident, a render pass stores, or a draw samples
-/// at a fragment slot or draws into as its attachment (its `VkPipeline` made before the
-/// command buffer, or at the draw), a buffer on it a blit copies, and a texture of
-/// `YCBCR10_420_2P` (505) or `RGB10_420_2P` (543) over an 'x420' surface, or of
-/// `RGB8_420_2P` (540) over a '420v' one, a kernel reads; not at all
-/// through any of those textures, made and released, that it never names, whose retain
-/// is back to 1 at once. A kernel's read of a view of the texture holds the IOSurface too;
-/// Metal's view takes a reference of its own, 3 while the command buffer runs where this
-/// platform's view shares its texture's, 2. Either way unmap answers Busy until the command
-/// buffer completed. Neither Metal's command buffer nor this platform's changes the use count
-///
-/// On this platform the kernel's read through the argument buffer made resident dies at the
-/// dispatch naming `half-texel-conversion` ([`crate::answer::DIES`]): the runtime announces the
-/// kind for a `half` read of an argument buffer's texture, whose format the function does not
-/// know and whose texel it converts by a rounding Metal's may not be. That case runs last here.
-///
-/// Metal lets go of what a completed command buffer retained after its waiters returned, the
-/// more often once MoltenVK has worked on Metal's device
-/// (`texture_identifiers_are_reused_as_metals`): the counts after the completion are read once
-/// its queue let go of it ([`let_go`])
-#[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "MoltenVK: the runtime records device-denormals, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
-)]
-fn a_command_buffer_holds_a_surface_as_metals_does() {
-    let ycbcr = [(505, *b"x420"), (543, *b"x420"), (540, *b"420v")];
-    let named = [
-        Reach::Blit,
-        Reach::Kernel,
-        Reach::Resident,
-        Reach::Attachment,
-        Reach::SurfaceBuffer,
-        Reach::Sampled(Pipeline::Before),
-        Reach::Sampled(Pipeline::AtTheDraw),
-        Reach::Drawn(Pipeline::Before),
-        Reach::Drawn(Pipeline::AtTheDraw),
-    ];
-    let named = named
-        .into_iter()
-        .chain(ycbcr.map(|(f, o)| Reach::KernelYcbcr(f, o)));
-    let unnamed = [Reach::Unused]
-        .into_iter()
-        .chain(ycbcr.map(|(f, o)| Reach::UnusedYcbcr(f, o)));
-    let cases: Vec<_> = named
-        .map(|reach| (reach, [(2, 0), (2, 0), (1, 0), (1, 0)]))
-        .chain(unnamed.map(|reach| (reach, [(2, 0), (1, 0), (1, 0), (1, 0)])))
-        .chain([(Reach::View, [(2, 0), (2, 0), (1, 0), (1, 0)])])
-        .collect();
-    let (p, d) = (platform(), dev());
-    let made = |d: &VulkanDevice| d.raw.work_counts().variant_pipelines_made;
-    // The draws' device: a shader cache of its own, empty, as a fresh machine's.
-    let (own, _cache) = crate::gpu::device::tests::metal_tests::device_with_own_cache();
-    for &(reach, want) in &cases {
-        if reach == Reach::Resident {
-            continue;
-        }
-        let on = match reach {
-            Reach::Sampled(_) | Reach::Drawn(_) => &own,
-            _ => &d,
-        };
-        let (ours, made) =
-            surface_references::<crate::platform::VulkanPlatform>(&p, on, reach, &made);
-        assert_eq!(ours, want, "{reach:?}");
-        match reach {
-            Reach::Sampled(Pipeline::AtTheDraw) | Reach::Drawn(Pipeline::AtTheDraw) => {
-                assert_eq!(made, 1, "{reach:?}: its pipeline made at the draw");
-            }
-            Reach::Sampled(_) | Reach::Drawn(_) => {
-                assert_eq!(made, 0, "{reach:?}: its pipeline made before");
-            }
-            _ => {}
-        }
-    }
-    let kind = metal2vulkan_runtime::Degradation::HalfTexelConversion;
-    let site = crate::answer::dies_of(kind, || {
-        surface_references::<crate::platform::VulkanPlatform>(&p, &d, Reach::Resident, &made)
-    });
-    assert_eq!(site.file, "dispatchThreads:threadsPerThreadgroup:");
-    // The device before the directory of its shader cache, which it uses while it lives: a
-    // pattern's bindings drop last first.
-    drop(own);
-}
-
-/// What holds a surface beside a command buffer's own uses of it ([`surface_holds`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Beside {
-    /// Another queue's command buffer, committed after a kernel read a texture on it and
-    /// before the texture's release, which reads a texture on another surface: counts once
-    /// the texture is released, the other command buffer waiting for an event; once it
-    /// completed; once it is released.
-    Pending,
-    /// As `Pending`, the other command buffer's kernel reading its texture through an
-    /// argument buffer holding its resource ID, made resident with `useResource:usage:`.
-    PendingArgument,
-    /// As `Pending`, the other command buffer's kernel reaching a buffer of the device's
-    /// own through an address it loads (`reach.metal`), naming no texture.
-    PendingReach,
-    /// A completed handler of the command buffer whose kernel read a texture on it, the
-    /// texture released before the commit: counts inside the handler as it begins and
-    /// 100 ms later; once the wait for the completion returned; 200 ms later; once the
-    /// command buffer is released.
-    Handler,
-    /// Two textures on it, the first read by a kernel, the second never used: counts once
-    /// the command buffer completed and is released; once the first is released; once
-    /// the second is.
-    Two,
-}
-
-/// [`surface_counts`] of a 16 by 16 `BGRA8Unorm` surface at the steps `beside` names, each
-/// step in an autorelease pool of its own. A wait for a command buffer's completion waits until
-/// its queue let go of what it retained too ([`let_go`]).
-fn surface_holds<P: Platform<Surface = OsSurface>>(
-    p: &P,
-    d: &P::Device,
-    beside: Beside,
-) -> Vec<(i64, i32)> {
-    use crate::core::platform::blit::ResourceRef;
-    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-    use crate::core::platform::event::{EventRef, SharedEvent as _};
-    use crate::core::platform::resource::{Buffer as _, Library as _, Texture as _};
-    use crate::core::rt::Pool;
-
-    use crate::gpu::ycbcr::measure::PROBE;
-    let side = 16;
-    let s = Arc::new(bgra_surface(side, side));
-    let other = bgra_surface(side, side);
-    let desc = p.texture_descriptor(&TextureDesc {
-        pixel_format: 80,
-        width: side,
-        height: side,
-        usage: 5,
-        resource_options: Some(0),
-        ..TextureDesc::default()
-    });
-    let (q, q2) = (
-        d.new_command_queue().unwrap(),
-        d.new_command_queue().unwrap(),
-    );
-    let event = d.new_shared_event().unwrap();
-    let out = d
-        .new_buffer_of_length(OnFault::Die, side * side * 8, 0)
-        .unwrap()
-        .unwrap();
-    let library = d.new_library(PROBE).unwrap().unwrap().unwrap();
-    let state = |name| {
-        let f = library.new_function(OnFault::Die, name).unwrap().unwrap();
-        d.new_compute_pipeline_state_for_function(Some(&f))
-            .unwrap()
-            .unwrap()
-    };
-    let (read, held) = (state("read_texels"), state("read_held"));
-    let args = d
-        .new_buffer_of_length(OnFault::Die, 64, 0)
-        .unwrap()
-        .unwrap();
-    let elsewhere = d
-        .new_texture_on_surface(&desc, Some(&other), 0)
-        .unwrap()
-        .unwrap();
-    let reading_how = |q: &P::CommandQueue, texture: &P::Texture, wait: bool, argument: bool| {
-        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-        if wait {
-            cb.encode_wait(Some(EventRef::Shared(&event)), 1).unwrap();
-        }
-        let e = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
-        let buffers = [Some(&out), Some(&args)];
-        let resources = [Some(ResourceRef::Texture(texture))];
-        let mut cmds = vec![
-            ComputeCmd::SetComputePipelineState {
-                state: Some(match argument {
-                    true => &held,
-                    false => &read,
-                }),
-            },
-            ComputeCmd::SetBuffers {
-                buffers: &buffers,
-                offsets: &[0, 0],
-                range: NsRange::new(0, 2),
-            },
-        ];
-        if argument {
-            // SAFETY: a Shared buffer of 64 bytes, which no command uses yet.
-            unsafe {
-                args.contents()
-                    .as_ptr::<u64>()
-                    .write(texture.gpu_resource_id())
-            };
-            cmds.push(ComputeCmd::UseResources {
-                resources: &resources,
-                usage: 1,
-            });
-        } else {
-            cmds.push(ComputeCmd::SetTexture {
-                texture: Some(texture),
-                index: 0,
-            });
-        }
-        for cmd in cmds.into_iter().chain([
-            ComputeCmd::DispatchThreads {
-                threads_per_grid: MtlSize::new(side, side, 1),
-                threads_per_threadgroup: MtlSize::new(8, 8, 1),
-            },
-            ComputeCmd::EndEncoding,
-        ]) {
-            e.encode(OnFault::Die, cmd).unwrap();
-        }
-        cb
-    };
-    let reading = |q, texture, wait| reading_how(q, texture, wait, false);
-    // The command buffer, and the buffer its kernel reaches through the address it loads,
-    // which no command names, so the caller holds it until the command buffer completed.
-    let reaching = |q: &P::CommandQueue| {
-        const REACH: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/reach.metallib"));
-        let library = d.new_library(REACH).unwrap().unwrap().unwrap();
-        let f = library
-            .new_function(OnFault::Die, "reach")
-            .unwrap()
-            .unwrap();
-        let state = d
-            .new_compute_pipeline_state_for_function(Some(&f))
-            .unwrap()
-            .unwrap();
-        let page = || {
-            d.new_buffer_of_length(OnFault::Die, 4096, 0)
-                .unwrap()
-                .unwrap()
-        };
-        let (addresses, words, reached) = (page(), page(), page());
-        // SAFETY: a Shared buffer of a page, which no command uses yet.
-        unsafe {
-            addresses
-                .contents()
-                .as_ptr::<u64>()
-                .write(reached.gpu_address())
-        };
-        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-        cb.encode_wait(Some(EventRef::Shared(&event)), 1).unwrap();
-        let e = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
-        for cmd in [
-            ComputeCmd::SetComputePipelineState {
-                state: Some(&state),
-            },
-            ComputeCmd::SetBuffers {
-                buffers: &[Some(&addresses), Some(&words)],
-                offsets: &[0, 0],
-                range: NsRange::new(0, 2),
-            },
-            ComputeCmd::DispatchThreadgroups {
-                threadgroups_per_grid: MtlSize::new(1, 1, 1),
-                threads_per_threadgroup: MtlSize::new(1, 1, 1),
-            },
-            ComputeCmd::EndEncoding,
-        ] {
-            e.encode(OnFault::Die, cmd).unwrap();
-        }
-        (cb, reached)
-    };
-    let done = |q: &P::CommandQueue, cb: &P::CommandBuffer| {
-        cb.wait_until_completed(OnFault::Die).unwrap();
-        assert!(cb.error().is_none(), "{beside:?}: {:?}", cb.error());
-        let_go::<P>(q);
-    };
-    let on_s = || {
-        d.new_texture_on_surface(&desc, Some(&s), 0)
-            .unwrap()
-            .unwrap()
-    };
-    let mut seen = Vec::new();
-    match beside {
-        Beside::Pending | Beside::PendingArgument | Beside::PendingReach => {
-            let t = {
-                let _pool = Pool::here();
-                on_s()
-            };
-            {
-                let _pool = Pool::here();
-                let cb = reading(&q, &t, false);
-                cb.commit(OnFault::Die).unwrap();
-                done(&q, &cb);
-            }
-            let (cb, reached) = {
-                let _pool = Pool::here();
-                let argument = beside == Beside::PendingArgument;
-                let (cb, reached) = match beside {
-                    Beside::PendingReach => {
-                        let (cb, reached) = reaching(&q2);
-                        (cb, Some(reached))
-                    }
-                    _ => (reading_how(&q2, &elsewhere, true, argument), None),
-                };
-                cb.commit(OnFault::Die).unwrap();
-                (cb, reached)
-            };
-            {
-                let _pool = Pool::here();
-                drop(t);
-            }
-            seen.push(surface_counts(&s));
-            {
-                let _pool = Pool::here();
-                event.set_signaled_value(1).unwrap();
-                done(&q2, &cb);
-            }
-            seen.push(surface_counts(&s));
-            {
-                let _pool = Pool::here();
-                drop(cb);
-                drop(reached);
-            }
-            seen.push(surface_counts(&s));
-        }
-        Beside::Handler => {
-            let inside = Arc::new(Mutex::new(Vec::new()));
-            let cb = {
-                let _pool = Pool::here();
-                let t = on_s();
-                let cb = reading(&q, &t, false);
-                drop(t);
-                let (s, inside) = (Arc::clone(&s), Arc::clone(&inside));
-                let handler = move |_| {
-                    inside.lock().push(surface_counts(&s));
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    inside.lock().push(surface_counts(&s));
-                };
-                cb.add_completed_handler(OnFault::Die, Box::new(handler))
-                    .unwrap();
-                cb.commit(OnFault::Die).unwrap();
-                cb
-            };
-            {
-                let _pool = Pool::here();
-                done(&q, &cb);
-            }
-            let after = surface_counts(&s);
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            seen.extend(inside.lock().drain(..));
-            seen.push(after);
-            seen.push(surface_counts(&s));
-            {
-                let _pool = Pool::here();
-                drop(cb);
-            }
-            seen.push(surface_counts(&s));
-        }
-        Beside::Two => {
-            let (t, unused) = {
-                let _pool = Pool::here();
-                (on_s(), on_s())
-            };
-            {
-                let _pool = Pool::here();
-                let cb = reading(&q, &t, false);
-                cb.commit(OnFault::Die).unwrap();
-                done(&q, &cb);
-            }
-            seen.push(surface_counts(&s));
-            {
-                let _pool = Pool::here();
-                drop(t);
-            }
-            seen.push(surface_counts(&s));
-            {
-                let _pool = Pool::here();
-                drop(unused);
-            }
-            seen.push(surface_counts(&s));
-        }
-    }
-    seen
-}
-
-/// [`surface_holds`] of each case on this platform and on Metal's, which agree, and are its
-/// `want`. Metal lets go of what a completed command buffer retained after its waiters
-/// returned, the more often once MoltenVK has worked on Metal's device
-/// (`texture_identifiers_are_reused_as_metals`), so [`surface_holds`] reads the counts after a
-/// completion once its queue let go of it ([`let_go`]).
-fn holds_as_metals(cases: &[(Beside, &[(i64, i32)])]) {
-    let (p, d) = (platform(), dev());
-    for &(beside, want) in cases {
-        let ours = surface_holds::<crate::platform::VulkanPlatform>(&p, &d, beside);
-        assert_eq!(ours, want, "{beside:?}");
-    }
-}
-
-/// Nothing beside a command buffer's own uses holds a surface's IOSurface, as on Metal: not
-/// a command buffer of another queue that never names it, waiting while the texture on it
-/// a completed one read is released, whose kernel reads a texture at a slot; not a second
-/// texture on it, whose release lets go of its own reference only. A command buffer's
-/// completed handler runs while it still holds the IOSurface, on Metal as here, and lets it go
-/// once the handler returned. Where that other command buffer's kernel reads its texture
-/// through an argument buffer, Metal holds nothing either, and this platform dies at the
-/// dispatch naming `half-texel-conversion` ([`crate::answer::DIES`]): the runtime announces the
-/// kind for a `half` read of an argument buffer's texture, whose format the function does not
-/// know and whose texel it converts by a rounding Metal's may not be
-#[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "MoltenVK: the runtime records native-half-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
-)]
-fn nothing_beside_a_command_buffer_holds_a_surface() {
-    let none = [(1, 0); 3];
-    let handled = [(2, 0), (2, 0), (1, 0), (1, 0), (1, 0)];
-    holds_as_metals(&[
-        (Beside::Pending, &none[..]),
-        (Beside::Handler, &handled[..]),
-        (Beside::Two, &[(3, 0), (2, 0), (1, 0)][..]),
-    ]);
-    let kind = metal2vulkan_runtime::Degradation::HalfTexelConversion;
-    let site = crate::answer::dies_of(kind, || {
-        surface_holds::<crate::platform::VulkanPlatform>(
-            &platform(),
-            &dev(),
-            Beside::PendingArgument,
-        )
-    });
-    assert_eq!(site.file, "dispatchThreads:threadsPerThreadgroup:");
-}
-
-/// A command buffer of another queue that never names a surface, waiting while the texture
-/// on it a completed one read is released, holds nothing of it where its kernel reaches a
-/// buffer through an address it loads, as on Metal
-#[test]
-fn a_command_buffer_reaching_an_address_holds_no_surface_it_never_names() {
-    holds_as_metals(&[(Beside::PendingReach, &[(1, 0); 3][..])]);
 }
 
 /// The address of a one-page buffer made and released on `d`: where the next range lies.
@@ -2473,10 +1505,8 @@ fn views_metal_answers_nil_are_nil() {
 }
 
 /// The surface's bytes, after the work that wrote them completed.
-fn surface_bytes(s: &OsSurface) -> Vec<u8> {
-    let n = usize::try_from(s.alloc_size()).unwrap();
-    // SAFETY: the surface's memory, which no command uses now.
-    unsafe { std::slice::from_raw_parts(s.base_address().as_ptr::<u8>(), n) }.to_vec()
+fn surface_bytes<P: Platform>(s: &StandIn<P>) -> Vec<u8> {
+    s.bytes(s.length())
 }
 
 /// What a render pass of [`rotated_uses`] draws.
@@ -2508,7 +1538,7 @@ impl Drawn {
 /// texture into a buffer, the surface's bytes after the CPU replaced an 8 by 4 region at
 /// (4, 2) of the texture, the surface's bytes after a pass of load action `load` that draws
 /// `drawn`, and a kernel's `read()` after the pass.
-fn rotated_uses<P: Platform<Surface = OsSurface>>(
+fn rotated_uses<P: Platform>(
     p: &P,
     d: &P::Device,
     rotation: u64,
@@ -2523,14 +1553,14 @@ fn rotated_uses<P: Platform<Surface = OsSurface>>(
 
     use crate::gpu::ycbcr::measure::{PROBE, probed};
     let side = drawn.side();
-    let s = bgra_surface(side, side);
+    let s = StandIn::<P>::bgra(d, side, side);
     // Each texel names its place: (x, y, 7, 200).
     let fill: Vec<u8> = (0..side * side)
         .flat_map(|i| [(i % side) as u8, (i / side) as u8, 7, 200])
         .collect();
     // SAFETY: the surface's memory, of `side` rows of `side` texels, which no command uses.
     unsafe {
-        std::ptr::copy_nonoverlapping(fill.as_ptr(), s.base_address().as_ptr::<u8>(), fill.len());
+        std::ptr::copy_nonoverlapping(fill.as_ptr(), s.base(), fill.len());
     }
     let desc = p.texture_descriptor(&TextureDesc {
         pixel_format: 80,
@@ -2542,10 +1572,7 @@ fn rotated_uses<P: Platform<Surface = OsSurface>>(
         rotation: Some(rotation),
         ..TextureDesc::default()
     });
-    let t = d
-        .new_texture_on_surface(&desc, Some(&s), 0)
-        .unwrap()
-        .unwrap();
+    let t = s.texture(&desc, 0).unwrap().unwrap();
     let mut seen = vec![(
         "read",
         probed::<P>(d, "read_texels", &t, (side, side), None, None),
@@ -2683,19 +1710,19 @@ fn rotated_textures_read_copy_and_store_as_metals() {
 /// A texture of `rotation` over a square `BGRA8Unorm` surface of `side` whose texels name
 /// their places (as [`rotated_uses`] fills it), made on `p`'s device `d` with `ShaderRead`,
 /// `RenderTarget` and `PixelFormatView` usage, and the surface.
-fn rotated_named<P: Platform<Surface = OsSurface>>(
+fn rotated_named<P: Platform>(
     p: &P,
     d: &P::Device,
     side: u64,
     rotation: u64,
-) -> (OsSurface, P::Texture) {
-    let s = bgra_surface(side, side);
+) -> (StandIn<P>, P::Texture) {
+    let s = StandIn::<P>::bgra(d, side, side);
     let fill: Vec<u8> = (0..side * side)
         .flat_map(|i| [(i % side) as u8, (i / side) as u8, 7, 200])
         .collect();
     // SAFETY: the surface's memory, of `side` rows of `side` texels, which no command uses.
     unsafe {
-        std::ptr::copy_nonoverlapping(fill.as_ptr(), s.base_address().as_ptr::<u8>(), fill.len());
+        std::ptr::copy_nonoverlapping(fill.as_ptr(), s.base(), fill.len());
     }
     let desc = p.texture_descriptor(&TextureDesc {
         pixel_format: 80,
@@ -2707,17 +1734,14 @@ fn rotated_named<P: Platform<Surface = OsSurface>>(
         rotation: Some(rotation),
         ..TextureDesc::default()
     });
-    let t = d
-        .new_texture_on_surface(&desc, Some(&s), 0)
-        .unwrap()
-        .unwrap();
+    let t = s.texture(&desc, 0).unwrap().unwrap();
     (s, t)
 }
 
 /// The surface's bytes after a pass of load action `load` that draws `drawn` (as
 /// [`rotated_uses`]'s pass does) through a view in `view` of a texture of `rotation`
 /// ([`rotated_named`]), its pipeline state of the view's format, on `p`'s device `d`.
-fn rotated_view_pass<P: Platform<Surface = OsSurface>>(
+fn rotated_view_pass<P: Platform>(
     p: &P,
     d: &P::Device,
     rotation: u64,
@@ -2782,12 +1806,7 @@ fn rotated_view_pass<P: Platform<Surface = OsSurface>>(
 /// The surface's bytes after a pass that clears a 4-sample texture of `format` and resolves
 /// it into a texture of `rotation` ([`rotated_named`], 32 by 32), or into its view in
 /// `format` where that is not the texture's, on `p`'s device `d`.
-fn rotated_resolve<P: Platform<Surface = OsSurface>>(
-    p: &P,
-    d: &P::Device,
-    rotation: u64,
-    format: u64,
-) -> Vec<u8> {
+fn rotated_resolve<P: Platform>(p: &P, d: &P::Device, rotation: u64, format: u64) -> Vec<u8> {
     use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
     use crate::core::platform::descriptor::RenderPassDescriptor as _;
     use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
@@ -3093,8 +2112,8 @@ fn textures_metal_aborts_making_die() {
         let site = catch_death(|| d.new_texture(OnFault::Return, &empty)).unwrap_err();
         assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
     }
-    let s = bgra_surface(8, 8);
-    let site = catch_death(|| d.new_texture_on_surface(&bgra(0, 8, 0), Some(&s), 0)).unwrap_err();
+    let s = bgra_stand_in(8, 8);
+    let site = catch_death(|| s.texture(&bgra(0, 8, 0), 0)).unwrap_err();
     assert_eq!(site.file, "newTextureWithDescriptor:iosurface:plane:");
     let stencil_view_format = bgra(8, 8, 0x20);
     stencil_view_format.set_pixel_format(261);
@@ -3793,10 +2812,10 @@ fn of_usage(usage: u64) -> TextureDesc {
 /// `desc_on` gives), a Shared buffer's two creators' (of `desc_on` too) and a Private
 /// placement heap's; a swizzled view's of the first (blue and red swapped); and the heap's
 /// size query.
-fn usages<P: Platform<Surface = OsSurface>>(
+fn usages<P: Platform>(
     d: &P::Device,
     (desc, desc_on): (&P::TextureDescriptor, &P::TextureDescriptor),
-    s: &OsSurface,
+    s: &StandIn<P>,
 ) -> ([u64; 8], u64, SizeAndAlign) {
     let buffer = d
         .new_buffer(BufferDesc {
@@ -3823,10 +2842,7 @@ fn usages<P: Platform<Surface = OsSurface>>(
             .unwrap()
             .unwrap()
             .usage(),
-        d.new_texture_on_surface(desc_on, Some(s), 0)
-            .unwrap()
-            .unwrap()
-            .usage(),
+        s.texture(desc_on, 0).unwrap().unwrap().usage(),
         buffer
             .new_texture(OnFault::Return, desc_on, 0, 256)
             .unwrap()
@@ -3864,7 +2880,7 @@ fn usages<P: Platform<Surface = OsSurface>>(
 fn usage_bits_metal_takes_are_answered_as_metals() {
     let d = dev();
     let p = platform();
-    let s = bgra_surface(16, 16);
+    let s = bgra_stand_in(16, 16);
     let usage_of_all = |u: u64| [u & !0x8; 8];
     for usage in [0x1_0005, 0x1_0015, 0x4005, 0x8005, 0xd, 0x1_c01d] {
         let (desc, desc_on) = (of_usage(usage), of_usage(usage));
@@ -4034,7 +3050,7 @@ fn pvrtc_heap_sizes_are_metals() {
 fn usage_bits_metal_does_not_define_die_where_textures_are_made() {
     let d = dev();
     let p = platform();
-    let s = bgra_surface(16, 16);
+    let s = bgra_stand_in(16, 16);
     let heap = private_heap();
     let buffer = d
         .new_buffer(BufferDesc {
@@ -4070,7 +3086,7 @@ fn usage_bits_metal_does_not_define_die_where_textures_are_made() {
             ),
             (
                 "newTextureWithDescriptor:iosurface:plane:",
-                catch_death(|| d.new_texture_on_surface(&desc_on, Some(&s), 0)).map(drop),
+                catch_death(|| s.texture(&desc_on, 0)).map(drop),
             ),
             (
                 "newTextureWithDescriptor:offset:bytesPerRow:",
@@ -4109,9 +3125,7 @@ fn usage_bits_metal_does_not_define_die_where_textures_are_made() {
             d.new_texture(OnFault::Return, &desc).unwrap().is_some(),
             d.new_shared_texture(&desc).unwrap().is_some(),
             d.heap_texture_size_and_align(&desc).unwrap().size > 0,
-            d.new_texture_on_surface(&desc_on, Some(&s), 0)
-                .unwrap()
-                .is_some(),
+            s.texture(&desc_on, 0).unwrap().is_some(),
             buffer
                 .new_texture(OnFault::Return, &desc_on, 0, 256)
                 .unwrap()
@@ -4131,7 +3145,7 @@ fn usage_bits_metal_does_not_define_die_where_textures_are_made() {
 /// surface and shareable, beside a buffer, a heap, a sampler state, a command queue, a nil
 /// texture and a release, then, after another release, one on another thread and one on this
 /// thread again.
-fn texture_identifiers_on<P: Platform<Surface = OsSurface>>(
+fn texture_identifiers_on<P: Platform>(
     d: &P::Device,
     desc: &dyn Fn(&TextureDesc) -> P::TextureDescriptor,
 ) -> Vec<(&'static str, u64, u64)>
@@ -4209,11 +3223,11 @@ where
         over.unique_identifier(),
         over.gpu_resource_id(),
     ));
-    let surface = bgra_surface(4, 4);
-    let on = d
-        .new_texture_on_surface(&shared, Some(&surface), 0)
-        .unwrap()
-        .unwrap();
+    // The buffer stands for the surface too, so the sequence makes no object of its own for
+    // it, as Metal's makes none for a surface.
+    let bgra = crate::gpu::resource::tests::facts_of(*b"BGRA", (4, 4), &[]);
+    let surface = StandIn::<P>::over(buffer.clone_ref(), bgra, vec![(0, 16)]);
+    let on = surface.texture(&shared, 0).unwrap().unwrap();
     ids.push((
         "a texture over a surface",
         on.unique_identifier(),

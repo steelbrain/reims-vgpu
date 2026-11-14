@@ -2,29 +2,29 @@
 //! Metal's ([`super::runtime_makes`]): what they read and sample, their IDs and usage, their
 //! views, where the runtime cannot map their samplers, and what they show of writes of their
 //! surfaces. The harness is [`super::measure`]'s.
+use crate::core::platform::Platform;
 use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
 use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
 use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
 use crate::core::platform::device::GpuDevice as _;
-use crate::core::platform::os::surface::Surface as _;
 use crate::core::platform::resource::{Buffer as _, GpuResource as _, Library as _, Texture as _};
 use crate::core::platform::types::{MtlOrigin, MtlSize, NsRange};
 use crate::core::platform::values::TextureDesc;
-use crate::core::platform::{Handle as _, Platform};
 use crate::core::raise::OnFault;
 use crate::core::raise::death::DeathKind;
 use crate::core::testkit::capture::catch_death;
 use metal2vulkan::metal::PixelFormat;
 
-use super::measure::host::set_value;
+use super::measure::Surface;
+use super::measure::host::set_matrix;
 use super::measure::{
     self, PROBE, Shape, desc_505, fill_noise, float_bits, probe, probed, probed_texels, sampled,
     sampled_floats, surface_420, surface_420_over,
 };
 use crate::gpu::device::VulkanDevice;
 use crate::gpu::device::tests::dev;
+use crate::gpu::resource::tests::StandIn;
 use crate::gpu::resource::{VulkanComputePipeline, VulkanTexture};
-use crate::os::{MATRIX_KEY, OsSurface};
 use crate::platform::VulkanPlatform;
 use crate::platform::tests::platform;
 
@@ -32,17 +32,11 @@ use crate::platform::tests::platform;
 /// family's members.
 const RGB8_420_2P: u64 = 540;
 
-/// This platform's texture of `format` of `size` over `surface`.
-fn ours(format: u64, surface: &OsSurface, size: (u64, u64)) -> VulkanTexture {
-    ours_on(&dev(), format, surface, size)
-}
-
-/// [`ours`] on the device `d`.
-fn ours_on(d: &VulkanDevice, format: u64, surface: &OsSurface, size: (u64, u64)) -> VulkanTexture {
+/// This platform's texture of `format` of `size` over `surface`, on the device the buffer that
+/// stands for it is of.
+fn ours(format: u64, surface: &Surface, size: (u64, u64)) -> VulkanTexture {
     let desc = platform().texture_descriptor(&measure::desc(format, size));
-    d.new_texture_on_surface(&desc, Some(surface), 0)
-        .unwrap()
-        .unwrap()
+    surface.texture(&desc, 0).unwrap().unwrap()
 }
 
 /// The device whose samples of the family the comparisons with Metal's read: the platform's
@@ -152,9 +146,9 @@ fn family_samples_as_metals(format: u64) {
         ];
         for matrix in matrices {
             for (size, seed) in [((40, 24), 5), ((33, 17), 6)] {
-                let s = shape.surface(size);
+                let mut s = shape.surface(&dev(), size);
                 if let Some(m) = matrix {
-                    set_value(&s, MATRIX_KEY, m);
+                    set_matrix(&mut s, m);
                 }
                 shape.fill_noise(&s, size, seed);
                 let what = format!(
@@ -249,8 +243,8 @@ fn rows_overlap(format: u64, shape: &Shape, plane: u64, size: (u64, u64)) -> boo
         ..*shape
     };
     let row = own.row_bytes(size.0);
-    let planes = shape.spec(size).planes.unwrap();
-    let bytes_per_row = planes[usize::try_from(plane).unwrap()].bytes_per_row;
+    let (_, planes, _) = shape.layout(size);
+    let (_, bytes_per_row) = planes[usize::try_from(plane).unwrap()];
     size.1 > 1 && row > 16 && bytes_per_row / 16 * 16 < row
 }
 
@@ -262,7 +256,7 @@ fn rows_overlap(format: u64, shape: &Shape, plane: u64, size: (u64, u64)) -> boo
 /// Metal's past it.
 fn reads_as_metals_do(
     format: u64,
-    (shape, s): (&Shape, &OsSurface),
+    (shape, s): (&Shape, &Surface),
     plane: u64,
     size: (u64, u64),
     half_relayed: bool,
@@ -271,7 +265,7 @@ fn reads_as_metals_do(
     let d = dev();
     let desc = platform().texture_descriptor(&measure::desc(format, size));
     *crate::answer::LAST_LINE.lock() = None;
-    let made = catch_death(|| d.new_texture_on_surface(&desc, Some(s), plane));
+    let made = catch_death(|| s.texture(&desc, plane));
     let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
     let t = made.unwrap_or_else(|site| panic!("{what}: {site:?}: {line}"));
     let t = t.unwrap().unwrap_or_else(|| panic!("nil: {what}"));
@@ -315,15 +309,15 @@ fn textures_over_other_ostypes_read_as_metals() {
         let (_, own) = surfaces_of(format, true);
         for ostype in OSTYPES.iter().filter(|o| !own.contains(o)) {
             let shape = Shape::of(ostype);
-            let s = shape.surface(size);
+            let s = shape.surface(&dev(), size);
             shape.fill_noise(&s, size, 9);
             let what = format!("{format} over {}", String::from_utf8_lossy(&ostype[..]));
             reads_as_metals_do(format, (&shape, &s), 0, size, false, &what);
         }
         for matrix in ["DCI_P3", "P3_D65"] {
             let shape = Shape::of(own[0]);
-            let s = shape.surface(size);
-            set_value(&s, MATRIX_KEY, matrix);
+            let mut s = shape.surface(&dev(), size);
+            set_matrix(&mut s, matrix);
             shape.fill_noise(&s, size, 10);
             let what = format!(
                 "{format} over {} {matrix}",
@@ -335,7 +329,7 @@ fn textures_over_other_ostypes_read_as_metals() {
                 continue;
             }
             let desc = platform().texture_descriptor(&measure::desc(format, size));
-            let made = catch_death(|| dev().new_texture_on_surface(&desc, Some(&s), 0));
+            let made = catch_death(|| s.texture(&desc, 0));
             let site = made.map(drop).unwrap_err();
             let sel = "newTextureWithDescriptor:iosurface:plane:";
             assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{what}");
@@ -353,7 +347,7 @@ fn textures_over_plane_1_read_as_metals() {
     for format in family() {
         for ostype in OSTYPES {
             let shape = Shape::of(ostype);
-            let s = shape.surface(size);
+            let s = shape.surface(&dev(), size);
             shape.fill_noise(&s, size, 11);
             let what = format!(
                 "{format} over plane 1 of {}",
@@ -408,9 +402,9 @@ type Probe = (State, Vec<u8>);
 /// colour (alpha 1 at the border too), nearest samples under mirrored clamp to the edge,
 /// repeat and mirrored repeat, and linear samples clamped to the edge, each into halves and
 /// into floats.
-fn sample_as_metals_do(format: u64, s: &OsSurface, size: (u64, u64), what: &str) {
+fn sample_as_metals_do(format: u64, s: &Surface, size: (u64, u64), what: &str) {
     let d = exact();
-    let t = ours_on(&d, format, s, size);
+    let t = ours(format, s, size);
     assert_eq!(
         (
             t.pixel_format(),
@@ -421,10 +415,7 @@ fn sample_as_metals_do(format: u64, s: &OsSurface, size: (u64, u64), what: &str)
         (format, 1, 0, 2),
         "{what}"
     );
-    assert_eq!(
-        (t.width(), t.height(), t.iosurface().map(|s| s.id())),
-        (size.0, size.1, Some(s.id()))
-    );
+    assert_eq!((t.width(), t.height()), (size.0, size.1));
     type V = crate::platform::VulkanPlatform;
     let ours_read = probed::<V>(&d, "read_texels", &t, size, None, None);
     let ours_floats = measure::read_floats::<V>(&d, &t, size);
@@ -479,9 +470,9 @@ fn family_samples_in_fragments_as_metals(format: u64) {
         ];
         for matrix in matrices {
             let size = (33, 17);
-            let s = shape.surface(size);
+            let mut s = shape.surface(&dev(), size);
             if let Some(m) = matrix {
-                set_value(&s, MATRIX_KEY, m);
+                set_matrix(&mut s, m);
             }
             shape.fill_noise(&s, size, 7);
             let what = format!(
@@ -518,9 +509,9 @@ fn fragment_reads<P: Platform>(
 
 /// [`sample_as_metals_do`]'s samples and gathers ([`cases`]) of a texture of `format` over `s`
 /// in a fragment function ([`fragment_reads`]), compared with Metal's bit for bit.
-fn samples_in_fragments_as_metals_do(format: u64, s: &OsSurface, size: (u64, u64), what: &str) {
+fn samples_in_fragments_as_metals_do(format: u64, s: &Surface, size: (u64, u64), what: &str) {
     let (p, d) = (platform(), exact());
-    let t = ours_on(&d, format, s, size);
+    let t = ours(format, s, size);
     let (grid, cases) = cases(size);
     let ours = fragment_reads::<VulkanPlatform>(&p, &d, &t, grid, &cases);
     let keys = |(state, bytes): &Probe| {
@@ -630,9 +621,9 @@ fn views_in_srgb_twins_read_as_metals() {
                 Some("SMPTE_240M_1995"),
             ];
             for matrix in matrices {
-                let s = shape.surface(size);
+                let mut s = shape.surface(&dev(), size);
                 if let Some(m) = matrix {
-                    set_value(&s, MATRIX_KEY, m);
+                    set_matrix(&mut s, m);
                 }
                 shape.fill_noise(&s, size, 8);
                 let what = format!(
@@ -733,7 +724,7 @@ fn own_format_views_are_metals() {
     for format in family() {
         let (_, ostypes) = surfaces_of(format, true);
         let shape = Shape::of(ostypes[0]);
-        let s = shape.surface(size);
+        let s = shape.surface(&dev(), size);
         shape.fill_noise(&s, size, 12);
         let t = ours(format, &s, size);
         for swizzle in [None, Some(BGRA)] {
@@ -751,7 +742,7 @@ fn own_format_views_are_metals() {
             );
             let array = view::<VulkanPlatform>(&t, format, (3, swizzle)).unwrap();
             crate::metal_check!(array_key, (array.texture_type(), array.usage()));
-            let filtered = ours_on(&e, format, &s, size);
+            let filtered = self::ours(format, &s, size);
             let filtered = view::<VulkanPlatform>(&filtered, format, (3, swizzle)).unwrap();
             for sample in [None, Some((0, 0)), Some((1, 0)), Some((0, 1)), Some((0, 2))] {
                 let (on, subject) = match sample {
@@ -804,10 +795,10 @@ fn samples_under_every_mode_as_metals(format: u64, ostypes: [&[u8; 4]; 2]) {
     let size = (40, 24);
     for ostype in ostypes {
         let shape = Shape::of(ostype);
-        let s = shape.surface(size);
+        let s = shape.surface(&dev(), size);
         shape.fill_noise(&s, size, 7);
         let d = exact();
-        let t = ours_on(&d, format, &s, size);
+        let t = ours(format, &s, size);
         let grid = ((size.0 + 2) * 3, (size.1 + 2) * 3);
         type V = crate::platform::VulkanPlatform;
         for (read, filter) in [(0, 0), (0, 1), (1, 0), (2, 0)] {
@@ -906,9 +897,9 @@ fn the_default_filter_samples_within_its_bound_of_metals() {
     let linear = (1, 0, true, 0);
     let mut seen = Vec::new();
     for (format, steps) in [(500, 2048.0_f32), (520, 8192.0)] {
-        let s = surface_420(b"420v", size);
+        let s = surface_420(&dev(), b"420v", size);
         fill_noise(&s, size, 9);
-        let t = ours_on(&d, format, &s, size);
+        let t = ours(format, &s, size);
         *LAST_LINE.lock() = None;
         let strict = catch_death(|| sampled_floats::<V>(&d, &t, linear, grid, &bytes))
             .err()
@@ -1011,10 +1002,10 @@ fn the_default_filter_samples_within_its_bound_of_metals() {
 )]
 fn the_guests_id_is_metals() {
     use crate::core::platform::event::SharedEvent as _;
-    fn ids<P: Platform<Surface = OsSurface>>(
+    fn ids<P: Platform>(
         d: &P::Device,
         descriptor: impl Fn(&TextureDesc) -> P::TextureDescriptor,
-        s: &OsSurface,
+        s: &StandIn<P>,
         size: (u64, u64),
         read_held: bool,
     ) -> (Vec<u64>, Vec<u8>) {
@@ -1030,10 +1021,7 @@ fn the_guests_id_is_metals() {
         };
         let first = plain();
         let desc = descriptor(&desc_505(size));
-        let t = d
-            .new_texture_on_surface(&desc, Some(s), 0)
-            .unwrap()
-            .unwrap();
+        let t = s.texture(&desc, 0).unwrap().unwrap();
         let second = plain();
         let held = match read_held {
             true => held::<P>(d, &t, size),
@@ -1054,7 +1042,7 @@ fn the_guests_id_is_metals() {
         (ids, held)
     }
     let size = (24, 16);
-    let s = surface_420(b"xf20", size);
+    let s = surface_420(&dev(), b"xf20", size);
     fill_noise(&s, size, 8);
     // Metal's first, before this platform's runtime makes any Metal texture of its own in
     // the process, which would take IDs of Metal's pool.
@@ -1087,14 +1075,14 @@ fn the_guests_id_is_metals() {
 #[test]
 fn usage_bits_metal_takes_are_answered_as_metals() {
     let size = (16, 8);
-    let s = surface_420(b"x420", size);
+    let s = surface_420(&dev(), b"x420", size);
     for (usage, answered) in [(0x1_0005, 0x1_0005), (0x1_c00d, 0x1_c005)] {
         let desc = TextureDesc {
             usage,
             ..desc_505(size)
         };
-        let t = dev()
-            .new_texture_on_surface(&platform().texture_descriptor(&desc), Some(&s), 0)
+        let t = s
+            .texture(&platform().texture_descriptor(&desc), 0)
             .unwrap()
             .unwrap();
         assert_eq!(t.usage(), answered, "{usage:#x}");
@@ -1214,7 +1202,7 @@ fn held<P: Platform>(d: &P::Device, t: &P::Texture, (width, height): (u64, u64))
 #[test]
 fn sampling_a_mapped_texture_where_the_runtime_cannot_map_it_dies() {
     let size = (16, 8);
-    let s = surface_420(b"x420", size);
+    let s = surface_420(&dev(), b"x420", size);
     fill_noise(&s, size, 9);
     let d = dev();
     let p = platform();
@@ -1345,9 +1333,9 @@ fn constexpr_samplers_sample_as_metals() {
     let mut differ = Vec::new();
     for (format, ostype, in_place) in cases {
         let shape = Shape::of(ostype);
-        let s = shape.surface(size);
+        let s = shape.surface(&dev(), size);
         shape.fill_noise(&s, size, 11);
-        let t = ours_on(&d, format, &s, size);
+        let t = ours(format, &s, size);
         for kernel in kernels {
             let read = |bytes_read: Vec<u8>| -> Vec<[u32; 4]> {
                 (measure::float_texels(&bytes_read).into_iter())
@@ -1433,19 +1421,15 @@ enum Write {
 
 /// `read_texels` of a texture of `format` over `s` after `write` wrote half the surface's luma,
 /// on `p`'s device `d` (`descriptor` makes `p`'s texture descriptors).
-fn after<P: Platform<Surface = OsSurface>>(
+fn after<P: Platform>(
     d: &P::Device,
     (format, descriptor): (u64, impl Fn(&TextureDesc) -> P::TextureDescriptor),
-    s: &OsSurface,
+    s: &StandIn<P>,
     (width, height): (u64, u64),
     write: Write,
 ) -> Vec<u8> {
-    let t = d
-        .new_texture_on_surface(
-            &descriptor(&measure::desc(format, (width, height))),
-            Some(s),
-            0,
-        )
+    let t = s
+        .texture(&descriptor(&measure::desc(format, (width, height))), 0)
         .unwrap()
         .unwrap();
     let fenced = matches!(write, Write::Fenced | Write::FencedCommandBuffer);
@@ -1459,10 +1443,7 @@ fn after<P: Platform<Surface = OsSurface>>(
         resource_options: Some(if fenced { 0x100 } else { 0 }),
         ..TextureDesc::default()
     };
-    let luma = d
-        .new_texture_on_surface(&descriptor(&luma), Some(s), 0)
-        .unwrap()
-        .unwrap();
+    let luma = s.texture(&descriptor(&luma), 0).unwrap().unwrap();
     let library = d.new_library(PROBE).unwrap().unwrap().unwrap();
     let kernel = |name| {
         let f = library.new_function(OnFault::Die, name).unwrap().unwrap();
@@ -1581,7 +1562,7 @@ fn after<P: Platform<Surface = OsSurface>>(
         }),
         Write::Cpu => {
             run(&read);
-            let base = s.base_address().as_ptr::<u8>();
+            let base = s.base();
             let n = usize::try_from(width * 2).unwrap();
             // SAFETY: plane 0's first row, inside the surface's allocation, which no GPU
             // work uses now.
@@ -1622,7 +1603,7 @@ fn samples_see_the_writes_before_them() {
             Write::FencedCommandBuffer,
         ] {
             let surface = || {
-                let s = surface_420(b"x420", size);
+                let s = surface_420(&dev(), b"x420", size);
                 fill_noise(&s, size, 11);
                 s
             };
@@ -1632,10 +1613,7 @@ fn samples_see_the_writes_before_them() {
             let before = {
                 let d = dev();
                 let desc = p.texture_descriptor(&measure::desc(format, size));
-                let t = d
-                    .new_texture_on_surface(&desc, Some(&unwritten), 0)
-                    .unwrap()
-                    .unwrap();
+                let t = unwritten.texture(&desc, 0).unwrap().unwrap();
                 probed::<VulkanPlatform>(&d, "read_texels", &t, size, None, None)
             };
             let ours = after::<VulkanPlatform>(
@@ -1663,19 +1641,19 @@ enum Before {
 }
 
 /// `read_texels` of a texture of 505 over `s`, after work `before` it zeroed the first luma
-/// row through a buffer `newBufferWithIOSurface:` makes over `s`, on `p`'s device `d`.
-fn through<P: Platform<Surface = OsSurface>>(
+/// row through the buffer that stands for `s`, on `p`'s device `d`.
+fn through<P: Platform>(
     d: &P::Device,
     descriptor: impl Fn(&TextureDesc) -> P::TextureDescriptor,
-    s: &OsSurface,
+    s: &StandIn<P>,
     (width, height): (u64, u64),
     before: Before,
 ) -> Vec<u8> {
-    let t = d
-        .new_texture_on_surface(&descriptor(&desc_505((width, height))), Some(s), 0)
+    let t = s
+        .texture(&descriptor(&desc_505((width, height))), 0)
         .unwrap()
         .unwrap();
-    let over = d.new_buffer_on_surface(Some(s)).unwrap().unwrap();
+    let over = &s.buffer;
     let library = d.new_library(PROBE).unwrap().unwrap().unwrap();
     let kernel = |name| {
         let f = library.new_function(OnFault::Die, name).unwrap().unwrap();
@@ -1690,7 +1668,7 @@ fn through<P: Platform<Surface = OsSurface>>(
         .unwrap()
         .unwrap();
     let q = d.new_command_queue().unwrap();
-    let (written, read) = ([Some(&over)], [Some(&out)]);
+    let (written, read) = ([Some(over)], [Some(&out)]);
     let mut cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
     let mut e = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
     for cmd in [
@@ -1748,16 +1726,16 @@ fn through<P: Platform<Surface = OsSurface>>(
     unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), n) }.to_vec()
 }
 
-/// A kernel's write of a surface's bytes through a buffer `newBufferWithIOSurface:` made over
-/// it, of a surface over the guest's pages, reaches the surface through its own mapping:
-/// Metal's read of a texture of 505 over it shows the write in the same command buffer, after
-/// a barrier or in a later encoder, as in a later one, and so does this platform's
+/// A kernel's write of a surface's bytes through a buffer over it, of a surface over the guest's
+/// pages, reaches a texture over it: Metal's read of a texture of 505 over it shows the write in
+/// the same command buffer, after a barrier or in a later encoder, as in a later one, and so does
+/// this platform's, through the buffer that stands for the surface
 #[test]
 fn a_write_through_a_buffer_on_the_surface_shows_in_the_same_command_buffer() {
     use crate::core::platform::os::vm::HostVm as _;
     let size = (32, 16);
-    let read = |p: &dyn Fn(&OsSurface) -> Vec<u8>| {
-        let (s, pages, length) = surface_420_over(b"x420", size);
+    let read = |p: &dyn Fn(&Surface) -> Vec<u8>| {
+        let (s, pages, length) = surface_420_over(&dev(), b"x420", size);
         fill_noise(&s, size, 13);
         let read = p(&s);
         drop(s);
@@ -1772,8 +1750,8 @@ fn a_write_through_a_buffer_on_the_surface_shows_in_the_same_command_buffer() {
         all.map(|before| read(&|s| through::<VulkanPlatform>(&dev(), descriptor, s, size, before)));
     let unwritten = read(&|s| {
         let d = dev();
-        let t = d
-            .new_texture_on_surface(&p.texture_descriptor(&desc_505(size)), Some(s), 0)
+        let t = s
+            .texture(&p.texture_descriptor(&desc_505(size)), 0)
             .unwrap()
             .unwrap();
         probed::<VulkanPlatform>(&d, "read_texels", &t, size, None, None)
@@ -1787,10 +1765,10 @@ fn a_write_through_a_buffer_on_the_surface_shows_in_the_same_command_buffer() {
 /// dispatch as Metal's is
 #[test]
 fn a_texture_made_in_an_encoder_reads_as_metals() {
-    fn read<P: Platform<Surface = OsSurface>>(
+    fn read<P: Platform>(
         d: &P::Device,
         descriptor: impl Fn(&TextureDesc) -> P::TextureDescriptor,
-        s: &OsSurface,
+        s: &StandIn<P>,
         (width, height): (u64, u64),
     ) -> Vec<u8> {
         let library = d.new_library(PROBE).unwrap().unwrap().unwrap();
@@ -1810,8 +1788,8 @@ fn a_texture_made_in_an_encoder_reads_as_metals() {
         let q = d.new_command_queue().unwrap();
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
         let e = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
-        let t = d
-            .new_texture_on_surface(&descriptor(&desc_505((width, height))), Some(s), 0)
+        let t = s
+            .texture(&descriptor(&desc_505((width, height))), 0)
             .unwrap()
             .unwrap();
         let buffers = [Some(&out)];
@@ -1843,7 +1821,7 @@ fn a_texture_made_in_an_encoder_reads_as_metals() {
         unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), n) }.to_vec()
     }
     let size = (24, 16);
-    let s = surface_420(b"x420", size);
+    let s = surface_420(&dev(), b"x420", size);
     fill_noise(&s, size, 12);
     // Metal's first, before this platform's runtime makes any texture of its own.
     let p = platform();
@@ -1921,33 +1899,31 @@ impl Op {
 }
 
 /// The bytes of `surface`, all of its allocation.
-fn bytes_of(surface: &OsSurface) -> Vec<u8> {
-    let length = usize::try_from(surface.alloc_size()).unwrap();
-    // SAFETY: the surface's allocation, read once the work that wrote it completed.
-    unsafe { std::slice::from_raw_parts(surface.base_address().as_ptr::<u8>(), length) }.to_vec()
+fn bytes_of<P: Platform>(surface: &StandIn<P>) -> Vec<u8> {
+    surface.bytes(surface.length())
 }
 
 /// What `op` writes of a texture of `format` of `size` over plane 0 of `s` on `p`'s device `d`
 /// (`other` a second surface of its shape): the bytes of `s`, of `other`, and of a `Shared`
 /// buffer of 8 bytes a texel that held a pattern first, once the work completed.
-pub(crate) fn written<P: Platform<Surface = OsSurface>>(
+pub(crate) fn written<P: Platform>(
     p: &P,
     d: &P::Device,
     op: Op,
     format: u64,
-    surfaces: (&OsSurface, &OsSurface),
+    surfaces: (&StandIn<P>, &StandIn<P>),
     size: (u64, u64),
 ) -> [Vec<u8>; 3] {
     written_at(p, d, (op, 0), format, surfaces, size)
 }
 
 /// What `op` writes as [`written`] says, of a texture over plane `plane` of `s`.
-fn written_at<P: Platform<Surface = OsSurface>>(
+fn written_at<P: Platform>(
     p: &P,
     d: &P::Device,
     (op, plane): (Op, u64),
     format: u64,
-    (s, other): (&OsSurface, &OsSurface),
+    (s, other): (&StandIn<P>, &StandIn<P>),
     size: (u64, u64),
 ) -> [Vec<u8>; 3] {
     use crate::core::platform::HostRange;
@@ -1968,10 +1944,7 @@ fn written_at<P: Platform<Surface = OsSurface>>(
         _ => 0x1,
     };
     let desc = p.texture_descriptor(&desc);
-    let t = d
-        .new_texture_on_surface(&desc, Some(s), plane)
-        .unwrap()
-        .unwrap();
+    let t = s.texture(&desc, plane).unwrap().unwrap();
     let q = d.new_command_queue().unwrap();
     let (w, h) = size;
     let row = w * 8;
@@ -2031,10 +2004,7 @@ fn written_at<P: Platform<Surface = OsSurface>>(
             destination_origin: origin,
         }),
         Op::Copy => {
-            let to = d
-                .new_texture_on_surface(&desc, Some(other), 0)
-                .unwrap()
-                .unwrap();
+            let to = other.texture(&desc, 0).unwrap().unwrap();
             blit(BlitCmd::CopyTextureRegion {
                 source_texture: &t,
                 source_slice: 0,
@@ -2219,15 +2189,15 @@ fn written_at<P: Platform<Surface = OsSurface>>(
 
 /// Two surfaces of `format`'s first OSType of its own bits and chroma, of `size`, filled with
 /// noise of `seed` and of the next.
-fn noisy_pair(format: u64, size: (u64, u64), seed: u64) -> (OsSurface, OsSurface) {
+fn noisy_pair(format: u64, size: (u64, u64), seed: u64) -> (Surface, Surface) {
     let (_, ostypes) = surfaces_of(format, true);
     noisy_pair_of(ostypes[0], size, seed)
 }
 
 /// Two surfaces of `ostype`, of `size`, filled with noise of `seed` and of the next.
-fn noisy_pair_of(ostype: &[u8; 4], size: (u64, u64), seed: u64) -> (OsSurface, OsSurface) {
+fn noisy_pair_of(ostype: &[u8; 4], size: (u64, u64), seed: u64) -> (Surface, Surface) {
     let shape = Shape::of(ostype);
-    let (s, other) = (shape.surface(size), shape.surface(size));
+    let (s, other) = (shape.surface(&dev(), size), shape.surface(&dev(), size));
     shape.fill_noise(&s, size, seed);
     shape.fill_noise(&other, size, seed + 1);
     (s, other)
@@ -2494,11 +2464,10 @@ fn odd_render_targets_of_subsampled_formats_are_nil_as_metals() {
         let f = metal2vulkan::metal::format::ycbcr_format(pf).unwrap();
         let subsampled = f.subsampling.halved().contains(&true);
         for size in [(33, 17), (33, 16), (32, 17)] {
-            let s = Shape::of(ostypes[0]).surface(size);
+            let s = Shape::of(ostypes[0]).surface(&dev(), size);
             let mut desc = measure::desc(format, size);
             desc.usage = 0x5;
-            let ours =
-                dev().new_texture_on_surface(&platform().texture_descriptor(&desc), Some(&s), 0);
+            let ours = s.texture(&platform().texture_descriptor(&desc), 0);
             let what = format!("{format} of {size:?}");
             assert_eq!(ours.unwrap().is_some(), !subsampled, "{what}");
         }
@@ -2566,35 +2535,6 @@ fn writes_of_444_textures_are_metals() {
     }
 }
 
-/// A kernel's `write()` into a texture over a surface of a 4:4:4 format of the family whose
-/// writes the runtime refuses dies at the dispatch, naming the write and the format: the `_sRGB`
-/// twins 523 and 527, whose planes Metal's changes
-#[test]
-fn writes_the_runtime_refuses_die() {
-    let size = (32, 16);
-    let refused = family().into_iter().filter(|&f| {
-        super::writes_refused(PixelFormat::try_from(u32::try_from(f).unwrap()).unwrap())
-    });
-    let refused: Vec<u64> = refused.collect();
-    assert_eq!(refused, [523, 527]);
-    for format in refused {
-        let pf = PixelFormat::try_from(u32::try_from(format).unwrap()).unwrap();
-        let (s, other) = noisy_pair(format, size, 9);
-        *crate::answer::LAST_LINE.lock() = None;
-        let site =
-            catch_death(|| written(&platform(), &dev(), Op::Kernel, format, (&s, &other), size))
-                .unwrap_err();
-        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-        assert_eq!(
-            (site.kind, site.file),
-            (DeathKind::Abort, Op::Kernel.sel()),
-            "{format}: {line}"
-        );
-        assert!(line.contains(&format!("a texture of {pf:?}")), "{line}");
-        assert!(line.contains("the runtime refuses"), "{line}");
-    }
-}
-
 /// A kernel's `write()` into a texture of 503, 507, 542 or 545 over plane 1 of a surface, which
 /// the runtime makes, dies at the dispatch, naming the runtime's refusal (`Format`): it stores
 /// such a texture's writes over plane 0 alone, and Metal's over plane 1 are not measured
@@ -2634,7 +2574,7 @@ fn every_luma_code_of_505_reads_as_metals() {
     let d = dev();
     for ostype in [b"x420", b"xf20"] {
         let shape = Shape::of(ostype);
-        let s = shape.surface(size);
+        let s = shape.surface(&dev(), size);
         shape.fill_codes(
             &s,
             size,

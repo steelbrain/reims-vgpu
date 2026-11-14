@@ -3,7 +3,9 @@
 //! Metal makes a texture with no GPU work: a texture over an IOSurface (as a guest display's
 //! mapped present makes one) and a texture of memory of its own come back while a committed
 //! kernel still runs. So does the runtime's: it records a new image's move to its first layout
-//! in the device's next submission.
+//! in the device's next submission. The surface is the buffer that stands for it
+//! (`Buffer::new_texture_over_surface_plane`), as the reims-graphics device's surfaces reach this
+//! platform.
 //!
 //! The kernel ([`SPIN`]) runs [`ROUNDS`] rounds of busy work, about half a second, then marks its
 //! end in a word the test reads as each creation returns: still unmarked where the creation did
@@ -37,10 +39,9 @@ use reims_vgpu_vulkan::core::platform::command::{CommandBuffer, CommandQueue};
 use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder};
 use reims_vgpu_vulkan::core::platform::device::GpuDevice;
 use reims_vgpu_vulkan::core::platform::os::clock::{Clock, MonoTime};
-use reims_vgpu_vulkan::core::platform::os::surface::SurfaceSpec;
 use reims_vgpu_vulkan::core::platform::resource::{Buffer, Library};
 use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, MtlSize, NsRange};
-use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+use reims_vgpu_vulkan::core::platform::values::{SurfaceFacts, SurfacePlane, TextureDesc};
 use reims_vgpu_vulkan::core::raise::OnFault;
 
 /// The kernel that keeps the GPU busy (`src/gpu/spin.metal`).
@@ -124,20 +125,25 @@ fn textures_while_a_kernel_runs<P: Platform>(p: &P, d: &P::Device) -> Seen {
     cb.wait_until_scheduled().unwrap();
 
     let (width, height) = (64, 16);
-    let surface = p
-        .surfaces()
-        .create(&SurfaceSpec {
+    let surface = d
+        .new_buffer_of_length(OnFault::Die, 0x4000, SHARED)
+        .unwrap()
+        .unwrap();
+    let plane = SurfacePlane {
+        plane: 0,
+        offset: 0,
+        bytes_per_row: width * 4,
+        planar: false,
+        facts: Some(SurfaceFacts {
             pixel_format: u32::from_be_bytes(*b"BGRA"),
-            alloc_size: 0x4000,
+            plane_count: 0,
             width,
             height,
-            bytes_per_element: 4,
-            bytes_per_row: width * 4,
-            element_width: 1,
-            element_height: 1,
-            ..SurfaceSpec::default()
-        })
-        .unwrap();
+            chroma_offset: 0,
+            chroma_bytes_per_row: 0,
+            ycbcr_matrix: None,
+        }),
+    };
     let on_surface = p.texture_descriptor(&TextureDesc {
         pixel_format: BGRA8,
         width,
@@ -149,8 +155,8 @@ fn textures_while_a_kernel_runs<P: Platform>(p: &P, d: &P::Device) -> Seen {
     let clock = p.clock();
     let since = |at: MonoTime| Duration::from_nanos(clock.now_mono().as_nanos() - at.as_nanos());
     let at = clock.now_mono();
-    let over = d
-        .new_texture_on_surface(&on_surface, Some(&surface), 0)
+    let over = surface
+        .new_texture_over_surface_plane(OnFault::Die, &on_surface, plane)
         .unwrap()
         .unwrap();
     let made = |at: MonoTime| Made {

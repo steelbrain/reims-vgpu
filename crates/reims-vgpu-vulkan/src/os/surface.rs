@@ -285,6 +285,7 @@ pub(crate) mod tests {
     }
 
     /// A host-only 'BGRA' surface of `width` × `height`, 4 bytes an element, rows of `width × 4`.
+    #[cfg(target_os = "macos")]
     pub(crate) fn bgra_surface(width: u64, height: u64) -> OsSurface {
         let spec = SurfaceSpec {
             pixel_format: u32::from_be_bytes(*b"BGRA"),

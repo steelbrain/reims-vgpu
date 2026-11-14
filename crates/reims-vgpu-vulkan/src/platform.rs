@@ -1162,7 +1162,7 @@ pub(crate) mod tests {
     #[test]
     fn services() {
         let p = platform();
-        let _ = (p.surfaces(), p.vm(), p.clock(), p.threads());
+        let _ = (p.vm(), p.clock(), p.threads());
         assert!(format!("{p:?}").contains("VulkanPlatform"));
         let page = if cfg!(target_os = "macos") {
             16384

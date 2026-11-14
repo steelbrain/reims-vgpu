@@ -675,60 +675,9 @@ impl IoSurfaces<VulkanPlatform> for VulkanSurfaces {
 
 #[cfg(test)]
 mod tests {
-    use crate::core::num::ToU64;
-
     use super::*;
     use crate::os::tests::{bgra_surface, bgra_surface_over_at, free};
-    use crate::os::{surface_bytes_memory, surface_memory, surface_offset};
-
-    /// A surface over the guest's pages at an offset into its allocation (`kIOSurfaceOffset`)
-    /// has its base address that offset into its allocation, which is another mapping of the
-    /// pages: a write through its base address shows in the pages at the offset, and its
-    /// memory and its bytes' are found there
-    #[test]
-    fn an_offset_surface_is_at_its_offset_into_its_pages() {
-        use crate::core::platform::os::vm::HostVm as _;
-        for offset in [0x40, 0x1000, 0x4000] {
-            let (s, pages, length) =
-                crate::gpu::ycbcr::measure::surface_420_over_at(b"x420", (32, 16), offset);
-            let (first, base) = (
-                pages.addr().to_u64(),
-                s.base_address().as_ptr::<u8>().addr().to_u64(),
-            );
-            assert_eq!(s.alloc_size(), length, "{offset:#x}");
-            // SAFETY: the surface's first byte, which nothing else uses.
-            unsafe { s.base_address().as_ptr::<u8>().write(0xab) };
-            // SAFETY: the test's pages, mapped until they are freed below.
-            let at = unsafe {
-                pages
-                    .as_ptr::<u8>()
-                    .add(usize::try_from(offset).unwrap())
-                    .read()
-            };
-            assert_eq!(
-                at, 0xab,
-                "{offset:#x}: the base address is the offset into the pages"
-            );
-            let memory = surface_memory(&s);
-            assert_eq!(
-                memory[0],
-                base - offset..base - offset + length,
-                "{offset:#x}"
-            );
-            let (mapped, read) = (first..first + length, 0x10..0x20);
-            assert_eq!(memory[1..], [mapped], "{offset:#x}");
-            assert_eq!(
-                surface_bytes_memory(&s, &[read]),
-                [
-                    base + 0x10..base + 0x20,
-                    first + offset + 0x10..first + offset + 0x20
-                ],
-                "{offset:#x}"
-            );
-            drop(s);
-            MacVm::new().deallocate(pages, length);
-        }
-    }
+    use crate::os::{surface_memory, surface_offset};
 
     /// The records of live surfaces outlast the dropping of those of surfaces gone, which runs
     /// as the records grow past 64

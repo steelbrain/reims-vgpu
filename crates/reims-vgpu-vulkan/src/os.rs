@@ -43,10 +43,6 @@ pub(crate) use host_os::take_ram_devices;
 /// (`os/linux/thread_counts.rs`).
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use host_os::thread_counts;
-/// Whether a view of several runs of pages made now is mapped through dma-bufs, on Linux
-/// (`os/linux/import.rs`).
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) use host_os::views_through_dma_bufs;
 pub(crate) use host_os::{
     COPIES_READ_ONLY, Drawables, ImportMade, ImportView, TWINS_READ_ONLY, allocate_aliasable,
     allocate_zeros, dma_buf_refusal, host_memory, host_memory_vouched, import_view, plane_shape,
@@ -77,8 +73,6 @@ pub(crate) use host_os::{
 /// (`os/linux/dma_buf.rs`).
 #[cfg(target_os = "linux")]
 pub(crate) use host_os::{one_dma_buf_fits, one_dma_buf_of_fits, one_dma_buf_of_pieces_fits};
-#[cfg(all(test, target_os = "macos"))]
-pub(crate) use macos::MATRIX_KEY;
 /// The Objective-C message layer the window's AppKit side sends through, on macOS
 /// (`os/macos/msg.rs`).
 #[cfg(target_os = "macos")]
@@ -160,6 +154,7 @@ impl Drop for PrivateMemory {
 #[cfg(test)]
 pub(crate) mod tests {
     // The surface tests' helpers, which the crate's tests name here.
+    #[cfg(target_os = "macos")]
     pub(crate) use super::surface::tests::*;
     use super::*;
 

@@ -1,6 +1,10 @@
-//! The tests of `device` that compare with Metal on this host: macOS only.
+//! The tests of `device` that compare with Metal on this host: macOS only. A surface is the
+//! buffer that stands for it ([`StandIn`]), as the reims-graphics device's surfaces reach this
+//! platform.
 
 use super::*;
+use crate::gpu::resource::tests::StandIn;
+use crate::gpu::ycbcr::measure::Surface;
 
 /// A reservation keeps its IDs from plain allocation of textures, sampler states and
 /// indirect command buffers, as Metal's does: only a type's first call counts, and none made
@@ -70,18 +74,17 @@ fn reservations_keep_ids_from_plain_allocation() {
     );
 }
 
-/// A `YCBCR8_420_2P` texture of `size` over plane `plane` of `surface` on the device `d`, as the
-/// guest's creator makes it.
+/// A `YCBCR8_420_2P` texture of `size` over plane `plane` of `surface`, as the guest's creator
+/// makes it.
 fn ycbcr8_420_on(
-    d: &VulkanDevice,
-    surface: &OsSurface,
+    surface: &Surface,
     plane: u64,
     size: (u64, u64),
 ) -> RaiseResult<Option<VulkanTexture>> {
     use crate::core::platform::Platform as _;
     let desc = crate::platform::tests::platform()
         .texture_descriptor(&crate::gpu::ycbcr::measure::desc(500, size));
-    d.new_texture_on_surface(&desc, Some(surface), plane)
+    surface.texture(&desc, plane)
 }
 
 /// A probe of [`linear_samples`]: its grid, where it starts and its step, in texels.
@@ -240,11 +243,10 @@ fn linear_samples<P: crate::core::platform::Platform>(
     ignore = "MoltenVK: the runtime records pixel-sampler-scaling, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn ycbcr8_420_textures_over_surfaces_read_as_metals() {
-    use crate::gpu::ycbcr::measure::host::set_value;
+    use crate::gpu::ycbcr::measure::host::set_matrix;
     use crate::gpu::ycbcr::measure::{
         Shape, float_bits, float_texels, probe, read_floats, sampled_floats, texels,
     };
-    use crate::os::MATRIX_KEY;
     let d = dev();
     let p = crate::platform::tests::platform();
     for (ostype, size) in [(b"420v", (33, 17)), (b"420f", (64, 32))] {
@@ -258,12 +260,12 @@ fn ycbcr8_420_textures_over_surfaces_read_as_metals() {
         ];
         for matrix in matrices {
             let case = format!("{} {size:?} {matrix:?}", String::from_utf8_lossy(ostype));
-            let s = shape.surface(size);
+            let mut s = shape.surface(&d, size);
             shape.fill_noise(&s, size, 7);
             if let Some(m) = matrix {
-                set_value(&s, MATRIX_KEY, m);
+                set_matrix(&mut s, m);
             }
-            let t = ycbcr8_420_on(&d, &s, 0, size).unwrap().unwrap();
+            let t = ycbcr8_420_on(&s, 0, size).unwrap().unwrap();
             let read = read_floats::<VulkanPlatform>(&d, &t, size);
             let centres = probe((0.5, 0.5), 1.0, size, false, 0);
             let nearest = (0, 0, false, 0);
@@ -323,7 +325,7 @@ fn ycbcr8_420_samples_the_exact_filter_does_not_reach_die() {
     let p = crate::platform::tests::platform();
     let size = (33, 17);
     let shape = Shape::of(b"420v");
-    let s = shape.surface(size);
+    let s = shape.surface(&d, size);
     shape.fill_noise(&s, size, 7);
     let mut swizzled = desc(500, size);
     swizzled.swizzle = Some(Swizzle {
@@ -332,8 +334,8 @@ fn ycbcr8_420_samples_the_exact_filter_does_not_reach_die() {
         blue: 2,
         alpha: 5,
     });
-    let t = d
-        .new_texture_on_surface(&p.texture_descriptor(&swizzled), Some(&s), 0)
+    let t = s
+        .texture(&p.texture_descriptor(&swizzled), 0)
         .unwrap()
         .unwrap();
     let sampler = linear::<VulkanPlatform>(&d, false, false);
@@ -407,14 +409,14 @@ fn xr10_desc(
 /// A texture of [`xr10_desc`] over plane `plane` of `surface`, made by this platform.
 fn xr10_over(
     format: u64,
-    surface: &crate::os::OsSurface,
+    surface: &Surface,
     plane: u64,
     (size, options): ((u64, u64), u64),
 ) -> RaiseResult<Option<VulkanTexture>> {
     use crate::core::platform::Platform as _;
     let p = crate::platform::tests::platform();
     let desc = p.texture_descriptor(&xr10_desc(format, size, options));
-    dev().new_texture_on_surface(&desc, Some(surface), plane)
+    surface.texture(&desc, plane)
 }
 
 /// A texture of a two-plane XR10 format (550, 551) over plane 0 of a 'b3a8' surface, its
@@ -486,7 +488,7 @@ fn two_plane_xr10_textures_over_unaligned_planes_are_metals() {
     for format in [550, 551] {
         for (rows, seed) in [((132, 36), 7), ((136, 40), 8)] {
             let case = format!("{format} rows {rows:?}");
-            let s = noisy_surface(&b3a8_spec(size, rows), seed);
+            let s = noisy_surface(b3a8_spec(size, rows), seed);
             *crate::answer::LAST_LINE.lock() = None;
             let site = catch_death(|| xr10_over(format, &s, 0, (size, 0x10))).unwrap_err();
             let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
@@ -498,7 +500,7 @@ fn two_plane_xr10_textures_over_unaligned_planes_are_metals() {
             [((192, 64), 192 * 17 + 8, 9), ((144, 48), 144 * 17 + 4, 10)]
         {
             let case = format!("{format} rows {rows:?} plane 1 at {alpha_offset}");
-            let s = noisy_surface(&b3a8_spec_at(size, rows, alpha_offset), seed);
+            let s = noisy_surface(b3a8_spec_at(size, rows, alpha_offset), seed);
             let t = xr10_over(format, &s, 0, (size, 0x10)).unwrap().unwrap();
             assert_eq!(t.pixel_format(), format, "{case}");
             let ours = bits(read_floats::<VulkanPlatform>(&d, &t, size));
@@ -524,8 +526,8 @@ fn two_plane_xr10_textures_the_runtime_refuses_die() {
     use crate::core::platform::Platform as _;
     let size = (16, 16);
     let two = b3a8(size, (64, 64), 5);
-    let one = crate::os::tests::bgra_surface(16, 16);
-    let other = crate::gpu::ycbcr::measure::Shape::of(b"420v").surface(size);
+    let one = StandIn::<VulkanPlatform>::bgra(&dev(), 16, 16);
+    let other = crate::gpu::ycbcr::measure::Shape::of(b"420v").surface(&dev(), size);
     let sel = "newTextureWithDescriptor:iosurface:plane:";
     let refused = |case: &str, made: &dyn Fn() -> RaiseResult<Option<VulkanTexture>>| {
         *crate::answer::LAST_LINE.lock() = None;
@@ -553,9 +555,7 @@ fn two_plane_xr10_textures_the_runtime_refuses_die() {
         };
         let case = format!("{format} rotated");
         let p = crate::platform::tests::platform();
-        refused(&case, &|| {
-            dev().new_texture_on_surface(&p.texture_descriptor(&rotated), Some(&two), 0)
-        });
+        refused(&case, &|| two.texture(&p.texture_descriptor(&rotated), 0));
     }
 }
 
@@ -563,11 +563,11 @@ fn two_plane_xr10_textures_the_runtime_refuses_die() {
 /// `RenderTarget` usage too (E26d's 0x5), after a pass of platform `p` that clears it to
 /// `color` and stores it: the surface's bytes from its base address to `length`, once the
 /// command buffer completed.
-fn cleared<P: crate::core::platform::Platform<Surface = crate::os::OsSurface>>(
+fn cleared<P: crate::core::platform::Platform>(
     p: &P,
     d: &P::Device,
     format: u64,
-    surface: &crate::os::OsSurface,
+    surface: &StandIn<P>,
     (size, options): ((u64, u64), u64),
     color: crate::core::platform::types::ClearColor,
     length: u64,
@@ -578,8 +578,8 @@ fn cleared<P: crate::core::platform::Platform<Surface = crate::os::OsSurface>>(
     use crate::core::platform::values::ColorAttachmentSet;
     let mut desc = xr10_desc(format, size, options);
     desc.usage = 0x5;
-    let t = d
-        .new_texture_on_surface(&p.texture_descriptor(&desc), Some(surface), 0)
+    let t = surface
+        .texture(&p.texture_descriptor(&desc), 0)
         .unwrap()
         .unwrap();
     let pass = p.render_pass_descriptor();
@@ -602,8 +602,7 @@ fn cleared<P: crate::core::platform::Platform<Surface = crate::os::OsSurface>>(
     cb.commit(OnFault::Die).unwrap();
     cb.wait_until_completed(OnFault::Die).unwrap();
     assert_eq!(cb.error(), None);
-    use crate::core::platform::os::surface::Surface as _;
-    let base = surface.base_address().as_ptr::<u8>();
+    let base = surface.base();
     let length = usize::try_from(length).unwrap();
     // SAFETY: the surface's bytes, read after the command buffer that wrote them completed.
     unsafe { std::slice::from_raw_parts(base, length) }.to_vec()
@@ -652,11 +651,11 @@ enum Pattern<'a> {
 /// `surface` (`size`, `options`) with `pattern` writes on `p`'s device `d`: the surface's
 /// bytes from its base address to `length`, once the command buffer completed.
 #[allow(clippy::too_many_arguments)]
-fn filled<P: crate::core::platform::Platform<Surface = crate::os::OsSurface>>(
+fn filled<P: crate::core::platform::Platform>(
     p: &P,
     d: &P::Device,
     format: u64,
-    surface: &crate::os::OsSurface,
+    surface: &StandIn<P>,
     (size, options): ((u64, u64), u64),
     ([x, y], [w, h]): ([u64; 2], [u64; 2]),
     pattern: Pattern<'_>,
@@ -665,13 +664,9 @@ fn filled<P: crate::core::platform::Platform<Surface = crate::os::OsSurface>>(
     use crate::core::platform::HostRange;
     use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
     use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use crate::core::platform::os::surface::Surface as _;
     use crate::core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
     let desc = p.texture_descriptor(&xr10_desc(format, size, options));
-    let t = d
-        .new_texture_on_surface(&desc, Some(surface), 0)
-        .unwrap()
-        .unwrap();
+    let t = surface.texture(&desc, 0).unwrap().unwrap();
     let q = d.new_command_queue().unwrap();
     let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
     let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
@@ -698,7 +693,7 @@ fn filled<P: crate::core::platform::Platform<Surface = crate::os::OsSurface>>(
     cb.commit(OnFault::Die).unwrap();
     cb.wait_until_completed(OnFault::Die).unwrap();
     assert_eq!(cb.error(), None);
-    let base = surface.base_address().as_ptr::<u8>();
+    let base = surface.base();
     let length = usize::try_from(length).unwrap();
     // SAFETY: the surface's bytes, read after the command buffer that wrote them completed.
     unsafe { std::slice::from_raw_parts(base, length) }.to_vec()
@@ -780,7 +775,7 @@ impl Memory {
 /// blit encoder, of a texture of `format` over `memory` (a surface's of luma `size`, or a
 /// buffer's rows of `size`) write on `p`'s device `d`: every byte of the memory, which starts as
 /// `i * 37 % 251` at byte `i` on every platform, once the command buffer completed.
-fn memory_fill_on<P: crate::core::platform::Platform<Surface = crate::os::OsSurface>>(
+fn memory_fill_on<P: crate::core::platform::Platform>(
     p: &P,
     d: &P::Device,
     (format, size, memory): (u64, (u64, u64), Memory),
@@ -789,7 +784,6 @@ fn memory_fill_on<P: crate::core::platform::Platform<Surface = crate::os::OsSurf
     use crate::core::platform::HostRange;
     use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
     use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use crate::core::platform::os::surface::Surface as _;
     use crate::core::platform::resource::Buffer as _;
     use crate::core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
     let texture_size = memory.texture_size(size);
@@ -806,10 +800,12 @@ fn memory_fill_on<P: crate::core::platform::Platform<Surface = crate::os::OsSurf
     let (surface, buffer, t, length);
     match memory {
         Memory::Plane(ostype, plane) => {
-            let made = crate::gpu::ycbcr::measure::Shape::of(ostype).surface(size);
-            length = made.alloc_size();
-            write(made.base_address().as_ptr::<u8>(), length);
-            t = d.new_texture_on_surface(&desc, Some(&made), plane);
+            let shape = crate::gpu::ycbcr::measure::Shape::of(ostype);
+            let (facts, planes, alloc_size) = shape.layout(size);
+            let made = StandIn::<P>::shared(d, facts, planes, alloc_size);
+            length = alloc_size;
+            write(made.base(), length);
+            t = made.texture(&desc, plane);
             (surface, buffer) = (Some(made), None);
         }
         Memory::Buffer(row) => {
@@ -853,13 +849,13 @@ fn memory_fill_on<P: crate::core::platform::Platform<Surface = crate::os::OsSurf
     cb.wait_until_completed(OnFault::Die).unwrap();
     assert_eq!(cb.error(), None);
     let base = match (&surface, &buffer) {
-        (Some(s), _) => s.base_address(),
-        (_, Some(b)) => b.contents(),
+        (Some(s), _) => s.base(),
+        (_, Some(b)) => b.contents().as_ptr::<u8>(),
         _ => unreachable!(),
     };
     let length = usize::try_from(length).unwrap();
     // SAFETY: the memory's bytes, read after the command buffer that wrote them completed.
-    unsafe { std::slice::from_raw_parts(base.as_ptr::<u8>(), length) }.to_vec()
+    unsafe { std::slice::from_raw_parts(base, length) }.to_vec()
 }
 
 /// The textures [`fills_of_ycbcr_and_padded_textures_are_metals`] fills, of `size`: of each
@@ -999,13 +995,10 @@ fn copy_region<'a, P: crate::core::platform::Platform>(
     }
 }
 
-/// The bytes of `surface` from its base address to `length`.
-fn surface_bytes(surface: &crate::os::OsSurface, length: u64) -> Vec<u8> {
-    use crate::core::platform::os::surface::Surface as _;
-    let base = surface.base_address().as_ptr::<u8>();
-    let length = usize::try_from(length).unwrap();
-    // SAFETY: the surface's bytes, read after the command buffers that wrote them completed.
-    unsafe { std::slice::from_raw_parts(base, length) }.to_vec()
+/// The bytes of `surface` from its base address to `length`, read after the command buffers that
+/// wrote them completed.
+fn surface_bytes<P: crate::core::platform::Platform>(surface: &StandIn<P>, length: u64) -> Vec<u8> {
+    surface.bytes(length)
 }
 
 /// What copies between textures of `format` (`size`, `Managed`) over plane 0 of 'b3a8'
@@ -1026,23 +1019,17 @@ fn surface_bytes(surface: &crate::os::OsSurface, length: u64) -> Vec<u8> {
 /// times each at once, two copied zeros 1 and 2 times and four lost a command buffer to the
 /// recovery; copying the top quarter, none in 240 copies of each format; one process alone
 /// copying all of them, none in 200). The top quarter holds every byte the copy into `b` reads.
-fn surface_copies<P: crate::core::platform::Platform<Surface = crate::os::OsSurface>>(
+fn surface_copies<P: crate::core::platform::Platform>(
     p: &P,
     d: &P::Device,
     format: u64,
-    (a, b): (&crate::os::OsSurface, &crate::os::OsSurface),
+    (a, b): (&StandIn<P>, &StandIn<P>),
     size: (u64, u64),
     length: u64,
 ) -> [Vec<u8>; 2] {
     let over = p.texture_descriptor(&xr10_desc(format, size, 0x10));
-    let ta = d
-        .new_texture_on_surface(&over, Some(a), 0)
-        .unwrap()
-        .unwrap();
-    let tb = d
-        .new_texture_on_surface(&over, Some(b), 0)
-        .unwrap()
-        .unwrap();
+    let ta = a.texture(&over, 0).unwrap().unwrap();
+    let tb = b.texture(&over, 0).unwrap().unwrap();
     // Metal's blit rows of a texture of its own memory are `⌊4 w / 16⌋ · 16` bytes apart, its
     // planes' rows `4 w` and `w` rounded up to 16: at a width a multiple of 4 they hold every
     // column, and no copy of it overlaps its rows or reads their padding, whose bytes Metal's
@@ -1100,17 +1087,9 @@ fn copies_between_two_plane_xr10_textures_over_surfaces_write_as_metals() {
 #[test]
 fn a_copy_within_a_two_plane_xr10_texture_over_a_surface_dies() {
     use crate::core::platform::Platform;
-    fn within<P: Platform<Surface = crate::os::OsSurface>>(
-        p: &P,
-        d: &P::Device,
-        format: u64,
-        surface: &crate::os::OsSurface,
-    ) {
+    fn within<P: Platform>(p: &P, d: &P::Device, format: u64, surface: &StandIn<P>) {
         let over = p.texture_descriptor(&xr10_desc(format, (33, 17), 0x10));
-        let t = d
-            .new_texture_on_surface(&over, Some(surface), 0)
-            .unwrap()
-            .unwrap();
+        let t = surface.texture(&over, 0).unwrap().unwrap();
         let q = d.new_command_queue().unwrap();
         blit_one::<P>(&q, copy_region::<P>((&t, [0, 0]), (&t, [16, 8]), [8, 4]));
     }
@@ -1229,8 +1208,8 @@ fn formats_the_runtime_lacks_die_where_textures_are_made() {
             assert!(line.contains("Metal aborts at"), "{line}");
         }
     };
-    let x420 = crate::gpu::ycbcr::measure::Shape::of(b"x420").surface((16, 16));
-    let bgra = crate::os::tests::bgra_surface(16, 16);
+    let x420 = crate::gpu::ycbcr::measure::Shape::of(b"x420").surface(&dev(), (16, 16));
+    let bgra = StandIn::<VulkanPlatform>::bgra(&dev(), 16, 16);
     for format in [576, 577, 578, 579, 624, 625, 626, 627, 630, 640, 650] {
         let (private, shared) = (desc(format, 2), desc(format, 0));
         let ours = p.texture_descriptor(&private);
@@ -1267,9 +1246,7 @@ fn formats_the_runtime_lacks_die_where_textures_are_made() {
         });
         let sel = "newTextureWithDescriptor:iosurface:plane:";
         for (surface, plane) in [(&x420, 0), (&x420, 1), (&bgra, 0)] {
-            made(sel, &|| {
-                (dev().new_texture_on_surface(&ours, Some(surface), plane)).unwrap()
-            });
+            made(sel, &|| (surface.texture(&ours, plane)).unwrap());
         }
         let described =
             crate::gpu::format_info::described("MTLPixelFormatGetInfoForDevice()", format);
@@ -1466,7 +1443,7 @@ fn packed_10_bit_textures_over_memory_die_named() {
         assert!(line.contains(&named), "{sel}: {line}");
         assert!(line.contains("which the runtime refuses"), "{sel}: {line}");
     };
-    let surface = crate::os::tests::bgra_surface(64, 64);
+    let surface = StandIn::<VulkanPlatform>::bgra(&dev(), 64, 64);
     for format in [588, 589] {
         for storage in [0, 2] {
             let desc = packed_10(format, storage, 1);
@@ -1490,7 +1467,7 @@ fn packed_10_bit_textures_over_memory_die_named() {
                 },
             );
             dies("newTextureWithDescriptor:iosurface:plane:", format, &|| {
-                drop(dev().new_texture_on_surface(&ours, Some(&surface), 0));
+                drop(surface.texture(&ours, 0));
             });
         }
     }
@@ -1694,11 +1671,7 @@ fn write_swizzles_are_made_where_read_alone() {
     }
     // Each creator's texture's pixel format (0 for nil) of `desc` on `p`'s device `d`: the
     // device's, the shared one, a buffer's two, a heap's and the IOSurface one.
-    fn made<P: Platform<Surface = OsSurface>>(
-        p: &P,
-        d: &P::Device,
-        desc: &TextureDesc,
-    ) -> Vec<u64> {
+    fn made<P: Platform>(p: &P, d: &P::Device, desc: &TextureDesc) -> Vec<u64> {
         let format = |t: Option<P::Texture>| t.map_or(0, |t| t.pixel_format());
         let ours = p.texture_descriptor(desc);
         let shared = p.texture_descriptor(&TextureDesc {
@@ -1706,10 +1679,10 @@ fn write_swizzles_are_made_where_read_alone() {
             ..*desc
         });
         let (buffer, heap) = memory::<P>(d);
-        let surface = crate::os::tests::bgra_surface(16, 16);
+        let surface = StandIn::<P>::bgra(d, 16, 16);
         let on_buffer = buffer.new_texture(OnFault::Return, &shared, 0, 256);
         let linear = buffer.new_linear_texture(&shared, 0, 256, 4096);
-        let on_surface = d.new_texture_on_surface(&shared, Some(&surface), 0);
+        let on_surface = surface.texture(&shared, 0);
         vec![
             format(d.new_texture(OnFault::Return, &ours).unwrap()),
             format(d.new_shared_texture(&ours).unwrap()),
@@ -1730,7 +1703,7 @@ fn write_swizzles_are_made_where_read_alone() {
         let written = p.texture_descriptor(&desc(usage, 2));
         let shared = p.texture_descriptor(&desc(usage, 0));
         let (buffer, heap) = memory::<VulkanPlatform>(&d);
-        let surface = crate::os::tests::bgra_surface(16, 16);
+        let surface = StandIn::<VulkanPlatform>::bgra(&dev(), 16, 16);
         let creators: [(&str, &dyn Fn()); 6] = [
             ("newTextureWithDescriptor:", &|| {
                 let _ = d.new_texture(OnFault::Return, &written);
@@ -1751,7 +1724,7 @@ fn write_swizzles_are_made_where_read_alone() {
                 let _ = heap.new_texture(&written, 0);
             }),
             ("newTextureWithDescriptor:iosurface:plane:", &|| {
-                let _ = d.new_texture_on_surface(&shared, Some(&surface), 0);
+                let _ = surface.texture(&shared, 0);
             }),
         ];
         for (sel, make) in creators {
@@ -1792,7 +1765,7 @@ fn texture_setters_act_where_metal_does() {
         resource_options: Some(0x20),
         ..TextureDesc::default()
     };
-    let surface = crate::os::tests::bgra_surface(16, 16);
+    let surface = StandIn::<VulkanPlatform>::bgra(&dev(), 16, 16);
     let heap = |d: &VulkanDevice| {
         let made = d.new_heap(&HeapDesc {
             size: 1 << 20,
@@ -1836,7 +1809,7 @@ fn texture_setters_act_where_metal_does() {
                 let _ = heap.new_texture(&ours, 0);
             }),
             ("newTextureWithDescriptor:iosurface:plane:", &|| {
-                let _ = d.new_texture_on_surface(&ours, Some(&surface), 0);
+                let _ = surface.texture(&ours, 0);
             }),
         ];
         for (sel, make) in creators {
@@ -1879,7 +1852,7 @@ fn texture_setters_act_where_metal_does() {
         p: &P,
         d: &P::Device,
         desc: &TextureDesc,
-        surface: &P::Surface,
+        surface: &StandIn<P>,
         heap: &P::Heap,
     ) -> Vec<String> {
         let ours = p.texture_descriptor(desc);
@@ -1899,7 +1872,7 @@ fn texture_setters_act_where_metal_does() {
         let mut out = vec![
             made(d.new_texture(OnFault::Return, &ours).unwrap()),
             made(d.new_shared_texture(&ours).unwrap()),
-            made(d.new_texture_on_surface(&ours, Some(surface), 0).unwrap()),
+            made(surface.texture(&ours, 0).unwrap()),
         ];
         if !placed {
             let size = d.heap_texture_size_and_align(&ours).unwrap();
@@ -1995,7 +1968,7 @@ fn invalid_formats_are_metals() {
         assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{line}");
         assert!(line.contains("Metal aborts at"), "{format}: {line}");
     };
-    let bgra = crate::os::tests::bgra_surface(16, 16);
+    let bgra = StandIn::<VulkanPlatform>::bgra(&dev(), 16, 16);
     for format in [255, 262, 0] {
         let (private, shared) = (desc(format, 2), desc(format, 0));
         let ours = p.texture_descriptor(&private);
@@ -2017,7 +1990,7 @@ fn invalid_formats_are_metals() {
             },
         );
         aborts("newTextureWithDescriptor:iosurface:plane:", format, &|| {
-            let _ = dev().new_texture_on_surface(&ours, Some(&bgra), 0);
+            let _ = bgra.texture(&ours, 0);
         });
         if format == 0 {
             assert!(dev().new_shared_texture(&ours).unwrap().is_none());
@@ -2096,17 +2069,13 @@ fn textures_over_planes_a_surface_lacks_are_metals() {
         (543, b"x420"),
     ] {
         let desc = crate::gpu::ycbcr::measure::desc(format, size);
-        let two = crate::gpu::ycbcr::measure::Shape::of(ostype).surface(size);
-        let made = dev()
-            .new_texture_on_surface(&p.texture_descriptor(&desc), Some(&two), 2)
-            .unwrap();
+        let two = crate::gpu::ycbcr::measure::Shape::of(ostype).surface(&dev(), size);
+        let made = two.texture(&p.texture_descriptor(&desc), 2).unwrap();
         assert!(made.is_none(), "{format}: plane 2 of a two-plane surface");
-        let one = crate::os::tests::bgra_surface(size.0, size.1);
+        let one = StandIn::<VulkanPlatform>::bgra(&dev(), size.0, size.1);
         for plane in [1, 2] {
-            let site = catch_death(|| {
-                dev().new_texture_on_surface(&p.texture_descriptor(&desc), Some(&one), plane)
-            })
-            .unwrap_err();
+            let site =
+                catch_death(|| one.texture(&p.texture_descriptor(&desc), plane)).unwrap_err();
             assert_eq!(
                 (site.kind, site.file),
                 (
@@ -2596,13 +2565,17 @@ pub(crate) fn device_with_own_cache() -> (VulkanDevice, OwnCache) {
     (device, cache)
 }
 
-/// The spec of a 'b3a8' surface of `size` (`kCVPixelFormatType_30RGBLE_8A_BiPlanar`): plane 0
-/// the 32-bit colour words, plane 1 the alpha bytes, rows `rows` bytes apart in each, plane 1
-/// after plane 0 at a multiple of 4096.
+/// The layout of a 'b3a8' surface of `size` (`kCVPixelFormatType_30RGBLE_8A_BiPlanar`): its
+/// facts, its planes and its length. Plane 0 the 32-bit colour words, plane 1 the alpha bytes,
+/// rows `rows` bytes apart in each, plane 1 after plane 0 at a multiple of 4096.
 fn b3a8_spec(
     size: (u64, u64),
     rows: (u64, u64),
-) -> crate::core::platform::os::surface::SurfaceSpec {
+) -> (
+    crate::core::platform::values::SurfaceFacts,
+    Vec<(u64, u64)>,
+    u64,
+) {
     let alpha_offset = (rows.0 * size.1).next_multiple_of(4096);
     b3a8_spec_at(size, rows, alpha_offset)
 }
@@ -2612,58 +2585,41 @@ fn b3a8_spec_at(
     size: (u64, u64),
     rows: (u64, u64),
     alpha_offset: u64,
-) -> crate::core::platform::os::surface::SurfaceSpec {
-    use crate::core::platform::os::surface::{SurfacePlaneSpec, SurfaceSpec};
-    let (width, height) = size;
+) -> (
+    crate::core::platform::values::SurfaceFacts,
+    Vec<(u64, u64)>,
+    u64,
+) {
     let (color_row, alpha_row) = rows;
-    let plane = |offset, bytes_per_row, bytes_per_element| SurfacePlaneSpec {
-        base: offset,
-        offset,
-        width,
-        height,
-        size: bytes_per_row * height,
-        bytes_per_row,
-        bytes_per_element,
-        element_width: 1,
-        element_height: 1,
-        ..SurfacePlaneSpec::default()
-    };
-    SurfaceSpec {
-        planes: Some(vec![
-            plane(0, color_row, 4),
-            plane(alpha_offset, alpha_row, 1),
-        ]),
-        pixel_format: u32::from_be_bytes(*b"b3a8"),
-        alloc_size: (alpha_offset + alpha_row * height).next_multiple_of(16384),
-        width,
-        height,
-        bytes_per_element: 4,
-        bytes_per_row: color_row,
-        element_width: 1,
-        element_height: 1,
-        ..SurfaceSpec::default()
-    }
+    let planes = vec![(0, color_row), (alpha_offset, alpha_row)];
+    let facts = crate::gpu::resource::tests::facts_of(*b"b3a8", size, &planes);
+    let length = (alpha_offset + alpha_row * size.1).next_multiple_of(16384);
+    (facts, planes, length)
 }
 
-/// The surface of `spec`, every byte of its allocation `noise(seed)`'s.
+/// The surface of `layout` ([`b3a8_spec`]), every byte `noise(seed)`'s, the buffer that stands
+/// for it the process's device's.
 fn noisy_surface(
-    spec: &crate::core::platform::os::surface::SurfaceSpec,
+    (facts, planes, length): (
+        crate::core::platform::values::SurfaceFacts,
+        Vec<(u64, u64)>,
+        u64,
+    ),
     seed: u64,
-) -> crate::os::OsSurface {
-    use crate::core::platform::os::surface::{IoSurfaces as _, Surface as _};
-    let s = crate::os::OsSurfaces::new().create(spec).unwrap();
+) -> Surface {
+    let s = Surface::shared(&dev(), facts, planes, length);
     let mut next = crate::gpu::ycbcr::measure::noise(seed);
-    let base = s.base_address().as_ptr::<u8>();
-    for at in 0..usize::try_from(spec.alloc_size).unwrap() {
-        // SAFETY: inside the surface's allocation, which no GPU work uses yet.
+    let base = s.base();
+    for at in 0..usize::try_from(length).unwrap() {
+        // SAFETY: inside the buffer's Shared bytes, which no GPU work uses yet.
         unsafe { base.add(at).write(next().to_le_bytes()[0]) };
     }
     s
 }
 
-/// A host-only 'b3a8' surface of [`b3a8_spec`], every byte `noise(seed)`'s.
-fn b3a8(size: (u64, u64), rows: (u64, u64), seed: u64) -> crate::os::OsSurface {
-    noisy_surface(&b3a8_spec(size, rows), seed)
+/// A 'b3a8' surface of [`b3a8_spec`], every byte `noise(seed)`'s.
+fn b3a8(size: (u64, u64), rows: (u64, u64), seed: u64) -> Surface {
+    noisy_surface(b3a8_spec(size, rows), seed)
 }
 
 /// How [`read_through_another`] orders its two blits: in two encoders of one command buffer, or
@@ -2680,10 +2636,10 @@ enum Order {
 /// texture, then a blit of the second texture's texels into a buffer, ordered as `order` says,
 /// the buffer's bytes answered once both command buffers completed. The two textures are made
 /// first, as a guest makes two over one surface.
-fn read_through_another<P: crate::core::platform::Platform<Surface = crate::os::OsSurface>>(
+fn read_through_another<P: crate::core::platform::Platform>(
     p: &P,
     d: &P::Device,
-    surface: &crate::os::OsSurface,
+    surface: &StandIn<P>,
     ((width, height), order): ((u64, u64), Order),
     texels: &[u8],
 ) -> Vec<u8> {
@@ -2700,12 +2656,8 @@ fn read_through_another<P: crate::core::platform::Platform<Surface = crate::os::
         usage: 1,
         ..crate::core::platform::values::TextureDesc::default()
     });
-    let written = (d.new_texture_on_surface(&desc, Some(surface), 0))
-        .unwrap()
-        .unwrap();
-    let reader = (d.new_texture_on_surface(&desc, Some(surface), 0))
-        .unwrap()
-        .unwrap();
+    let written = (surface.texture(&desc, 0)).unwrap().unwrap();
+    let reader = (surface.texture(&desc, 0)).unwrap().unwrap();
     let length = u64::try_from(texels.len()).unwrap();
     let buffer = || {
         (d.new_buffer_of_length(OnFault::Die, length, 0))
@@ -2791,31 +2743,32 @@ fn surface_texels() -> ((u64, u64), Vec<u8>) {
 
 /// A texture over a surface reads what a blit through another texture over the same surface
 /// wrote before it, as Metal's does, in a later encoder of one command buffer and in a command
-/// buffer of another queue that waits for an event the write signals: two textures over one
-/// surface are one memory, which the runtime imports once for both, the surface over pages of
-/// the host's as a guest's mapper makes it
+/// buffer of another queue that waits for an event the write signals: two textures over the
+/// buffer that stands for one surface are one memory, the surface over pages of the host's as a
+/// guest's mapper makes it
 #[test]
 fn a_texture_over_a_surface_reads_another_ones_writes_as_metals() {
-    use crate::os::tests::{bgra_surface_over_at, free};
+    use crate::gpu::resource::tests::{free_pages, host_pages};
     let p = crate::platform::tests::platform();
     let (size, texels) = surface_texels();
     for order in [Order::OneCommandBuffer, Order::EventAcrossQueues] {
-        let (ours, pages, length) = bgra_surface_over_at(size.0, size.1, 0);
+        let (pages, length) = host_pages(size.0 * size.1 * 4);
+        let ours = StandIn::<VulkanPlatform>::bgra_over(&dev(), size, pages, length);
         let read = read_through_another(&p, &dev(), &ours, (size, order), &texels);
         assert!(read == texels, "{order:?}: in place");
         drop(ours);
-        free(pages, length);
+        free_pages(pages, length);
     }
 }
 
 /// [`a_texture_over_a_surface_reads_another_ones_writes_as_metals`] where every import is
 /// refused, as Linux's views' gate refuses them past the headroom of the views' budget
-/// (`os/linux/import.rs`), so the runtime makes each buffer over the surface over a copy of its
-/// pages (`copied-host-pages`): the texture read must still see the other's writes, as Metal's
-/// does
+/// (`os/linux/import.rs`), so the runtime makes the buffer that stands for the surface over a
+/// copy of its pages (`copied-host-pages`): the texture read must still see the other's writes,
+/// as Metal's does
 #[test]
 fn a_texture_over_a_copied_surface_reads_another_ones_writes_as_metals() {
-    use crate::os::tests::{bgra_surface_over_at, free};
+    use crate::gpu::resource::tests::{free_pages, host_pages};
     let p = crate::platform::tests::platform();
     let (size, texels) = surface_texels();
     let copies = || {
@@ -2827,9 +2780,10 @@ fn a_texture_over_a_copied_surface_reads_another_ones_writes_as_metals() {
     for order in [Order::OneCommandBuffer, Order::EventAcrossQueues] {
         let key = format!("{order:?}");
         let before = copies();
-        let (ours, pages, length) = bgra_surface_over_at(size.0, size.1, 0);
+        let (pages, length) = host_pages(size.0 * size.1 * 4);
         let read = crate::answer::relaxed(|| {
             crate::os::refusing_imports(|| {
+                let ours = StandIn::<VulkanPlatform>::bgra_over(&dev(), size, pages, length);
                 read_through_another(&p, &dev(), &ours, (size, order), &texels)
             })
         });
@@ -2839,8 +2793,7 @@ fn a_texture_over_a_copied_surface_reads_another_ones_writes_as_metals() {
         );
         let metals = crate::metal_matches_bytes!(key, &read);
         stale.push((order, metals, read.len()));
-        drop(ours);
-        free(pages, length);
+        free_pages(pages, length);
     }
     assert!(
         stale.iter().all(|&(_, metals, _)| metals),

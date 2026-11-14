@@ -11,8 +11,7 @@ use crate::core::testkit::capture::catch_death;
 use super::super::NO_VIEW;
 use super::*;
 use crate::gpu::device::tests::dev;
-use crate::os::OsSurface;
-use crate::os::tests::bgra_surface;
+use crate::gpu::resource::tests::StandIn;
 
 /// The formats here.
 const FORMATS: [u64; 4] = [263, 556, 651, 652];
@@ -34,10 +33,10 @@ type Case = (&'static str, fn(&mut TextureDesc));
 /// `newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:`, and a Private placement
 /// heap's `newTextureWithDescriptor:offset:` made a texture, in that order; and
 /// `heapTextureSizeAndAlignWithDescriptor:`.
-fn answers<P: Platform<Surface = OsSurface>>(
+fn answers<P: Platform>(
     d: &P::Device,
     desc: &P::TextureDescriptor,
-    s: &OsSurface,
+    s: &StandIn<P>,
 ) -> (u64, [bool; 6], SizeAndAlign) {
     let buffer = d
         .new_buffer(BufferDesc {
@@ -63,9 +62,7 @@ fn answers<P: Platform<Surface = OsSurface>>(
     let made = [
         d.new_texture(OnFault::Return, desc).unwrap().is_some(),
         d.new_shared_texture(desc).unwrap().is_some(),
-        d.new_texture_on_surface(desc, Some(s), 0)
-            .unwrap()
-            .is_some(),
+        s.texture(desc, 0).unwrap().is_some(),
         buffer
             .new_texture(OnFault::Return, desc, 0, 4096)
             .unwrap()
@@ -144,7 +141,7 @@ fn textures_of_formats_metal_makes_none_of_are_nil_as_metals_are() {
     ];
     let d = dev();
     let p = platform();
-    let s = bgra_surface(16, 16);
+    let s = StandIn::<crate::platform::VulkanPlatform>::bgra(&dev(), 16, 16);
     for format in FORMATS {
         let own: &[Case] = match format {
             556 => &[not_depth.as_slice(), multisample.as_slice()].concat(),
@@ -216,7 +213,7 @@ fn textures_of_formats_metal_makes_none_of_die_where_metal_asserts() {
     ];
     let d = dev();
     let p = platform();
-    let s = bgra_surface(16, 16);
+    let s = StandIn::<crate::platform::VulkanPlatform>::bgra(&dev(), 16, 16);
     let buffer = d
         .new_buffer(BufferDesc {
             length: 1 << 16,
@@ -258,7 +255,7 @@ fn textures_of_formats_metal_makes_none_of_die_where_metal_asserts() {
                 ),
                 (
                     "newTextureWithDescriptor:iosurface:plane:",
-                    catch_death(|| d.new_texture_on_surface(&ours, Some(&s), 0)).map(drop),
+                    catch_death(|| s.texture(&ours, 0)).map(drop),
                 ),
                 (
                     "newTextureWithDescriptor:offset:bytesPerRow:",

@@ -4423,8 +4423,9 @@ fn drawn_extended_range_samples_resolve_as_metals() {
 
 /// How the resolve texture of [`resolved_into`] is made: a texture of its own of a storage
 /// mode (`MTLResourceOptions`), which Metal may compress losslessly or not
-/// (`allowGPUOptimizedContents`); one over a host IOSurface of a storage mode, presented as a
-/// drawable (`setIsDrawable:` and `setFramebufferOnly:`, render target usage alone) or not; or a
+/// (`allowGPUOptimizedContents`); one over an IOSurface of a storage mode, over the buffer that
+/// stands for it, presented as a drawable (`setIsDrawable:` and `setFramebufferOnly:`, render
+/// target usage alone) or not; or a
 /// Private shareable texture (`newSharedTextureWithDescriptor:`), or one opened from its handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Made {
@@ -4752,17 +4753,15 @@ fn even_rate_map<P: Platform>(p: &P, d: &P::Device, (width, height): (u64, u64))
 /// own: what Metal autoreleased (each command buffer and encoder, which a dev build cannot elide,
 /// and through them the case's queue, textures and buffers) goes at its end, where the test
 /// thread, which pops no pool, would keep every case's until the test ends.
-fn resolved_into<P: Platform<Surface = crate::os::OsSurface>>(
+fn resolved_into<P: Platform>(
     p: &P,
     d: &P::Device,
     states: &States<'_, P>,
     c: Resolve,
 ) -> Resolved {
-    use crate::core::platform::os::surface::{Surface as _, SurfaceSpec};
     use crate::core::platform::values::{DepthAttachmentSet, PassSet, StencilAttachmentSet};
+    use crate::gpu::resource::tests::{StandIn, facts_of};
 
-    /// `kIOSurfaceLockReadOnly`.
-    const READ_ONLY: u32 = 1;
     let _pool = crate::core::rt::Pool::here();
     let (into, bytes) = c.into;
     let (width, height) = c.size;
@@ -4809,34 +4808,16 @@ fn resolved_into<P: Platform<Surface = crate::os::OsSurface>>(
     });
     let surface = matches!(c.made, Made::Surface { .. }).then(|| {
         let ostype = if bytes == 8 { *b"RGhA" } else { *b"w30r" };
-        let s = p
-            .surfaces()
-            .create(&SurfaceSpec {
-                pixel_format: u32::from_be_bytes(ostype),
-                alloc_size: length,
-                width,
-                height,
-                bytes_per_element: bytes,
-                bytes_per_row: width * bytes,
-                element_width: 1,
-                element_height: 1,
-                ..SurfaceSpec::default()
-            })
-            .unwrap();
-        assert!(s.lock(0).is_success());
-        let base = s.base_address().as_ptr::<u8>();
-        // SAFETY: the surface's first `n` bytes, locked, which no texture uses yet.
-        unsafe { std::ptr::copy_nonoverlapping(prefill.as_ptr(), base, n) };
-        assert!(s.unlock(0).is_success());
+        let facts = facts_of(ostype, (width, height), &[]);
+        let s = StandIn::<P>::shared(d, facts, vec![(0, width * bytes)], length);
+        // SAFETY: the buffer's first `n` bytes, which no texture uses yet.
+        unsafe { std::ptr::copy_nonoverlapping(prefill.as_ptr(), s.base(), n) };
         s
     });
     let shareable = matches!(c.made, Made::Shareable { .. })
         .then(|| d.new_shared_texture(&desc).unwrap().unwrap());
     let target = match (&surface, &shareable) {
-        (Some(s), _) => d
-            .new_texture_on_surface(&desc, Some(s), 0)
-            .unwrap()
-            .unwrap(),
+        (Some(s), _) => s.texture(&desc, 0).unwrap().unwrap(),
         (None, Some(t)) if c.made == (Made::Shareable { opened: true }) => {
             let handle = t.new_shared_texture_handle().unwrap().unwrap();
             d.open_shared_texture(Some(&handle), 0).unwrap().unwrap()
@@ -5051,15 +5032,7 @@ fn resolved_into<P: Platform<Surface = crate::os::OsSurface>>(
         unsafe { std::slice::from_raw_parts(b.contents().as_ptr::<u8>(), n) }.to_vec()
     };
     let resolved = match &surface {
-        Some(s) => {
-            assert!(s.lock(READ_ONLY).is_success());
-            // SAFETY: the surface's first `n` bytes, locked, after the command buffer
-            // completed.
-            let bytes = unsafe { std::slice::from_raw_parts(s.base_address().as_ptr::<u8>(), n) };
-            let bytes = bytes.to_vec();
-            assert!(s.unlock(READ_ONLY).is_success());
-            bytes
-        }
+        Some(s) => s.bytes(length),
         None => read(&out, n),
     };
     let texels = usize::try_from(texels).unwrap();
