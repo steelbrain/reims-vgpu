@@ -24,8 +24,11 @@
 // buffer (`frag-write`, `vert-write`) or that makes it resident for writing (`resident-write`); a
 // kernel's `write()` (`kernel-write`); a blit's copy, colour fill and bytes fill into it
 // (`blit-copy-into`, `fill-color`, `fill-bytes`, the last two the `fillTexture:` SPI); mipmaps and
-// an invalidation of a heap's texture (`mipmaps`, `mipmaps-shared`, `invalidate`); and the CPU's
-// `replaceRegion:` of a texture over the buffer or in a Shared heap (`replace`, `replace-heap`).
+// an invalidation of a heap's texture (`mipmaps`, `mipmaps-shared`, `invalidate`); the CPU's
+// `replaceRegion:` of a texture over the buffer or in a Shared heap (`replace`, `replace-heap`);
+// and an indirect command buffer made with the bit (`icb-cpu`, a command the CPU encodes in a
+// Shared one; `icb-gpu`, one a kernel encodes in a Private one; `icb-gpu-over-cpu`, a kernel's
+// command over one the CPU encoded in a Shared one), its command executed.
 //
 // After the shape's command buffer (cb1): its status, error and event signal; the pages' bytes
 // that changed (a target over the buffer), or the target's first texels as a blit reads them on a
@@ -571,6 +574,130 @@ static int cpuShape(NSString *shape) {
   return 0;
 }
 
+// The kernels of the indirect command buffer shapes: k_add adds v[0] to out[0]; k_encode writes
+// command 0 of the argument buffer's buffer, k_add's state from it, and out and v.
+static NSString *const kIcbSource =
+    @"#include <metal_stdlib>\n"
+    @"using namespace metal;\n"
+    @"kernel void k_add(device uint *out [[buffer(0)]], device const uint *v [[buffer(1)]]) {\n"
+    @"  out[0] += v[0];\n"
+    @"}\n"
+    @"struct IcbArgs { command_buffer cmds [[id(0)]]; compute_pipeline_state pso [[id(1)]]; };\n"
+    @"kernel void k_encode(device IcbArgs &args [[buffer(0)]], device uint *out [[buffer(1)]],\n"
+    @"                     device uint *v [[buffer(2)]]) {\n"
+    @"  compute_command c(args.cmds, 0);\n"
+    @"  c.set_compute_pipeline_state(args.pso);\n"
+    @"  c.set_kernel_buffer(out, 0);\n"
+    @"  c.set_kernel_buffer(v, 1);\n"
+    @"  c.concurrent_dispatch_threadgroups(uint3(1, 1, 1), uint3(1, 1, 1));\n"
+    @"}\n";
+
+// An indirect command buffer of bit 24 (`bit24`) or not, its command 0 a dispatch of k_add of 5
+// over out[0], 16 first: the CPU's (`icb-cpu`, Shared), a kernel's (`icb-gpu`, Private), or a
+// kernel's over the CPU's of 1 (`icb-gpu-over-cpu`, Shared); what out[0] reads after the
+// execution (21 where the add of 5 ran, 17 where the CPU's add of 1 did, 16 where none did), and
+// the command buffers' status and error.
+static int icbShape(NSString *shape, id<MTLCommandQueue> queue) {
+  NSError *error = nil;
+  id<MTLLibrary> lib = [gDevice newLibraryWithSource:kIcbSource options:nil error:&error];
+  if (lib == nil) {
+    say("icb_library", [NSString stringWithFormat:@"failed: %@", error]);
+    return 2;
+  }
+  MTLComputePipelineDescriptor *pd = [MTLComputePipelineDescriptor new];
+  pd.computeFunction = [lib newFunctionWithName:@"k_add"];
+  pd.supportIndirectCommandBuffers = YES;
+  id<MTLComputePipelineState> add =
+      [gDevice newComputePipelineStateWithDescriptor:pd options:0 reflection:nil error:&error];
+  id<MTLFunction> ef = [lib newFunctionWithName:@"k_encode"];
+  id<MTLComputePipelineState> enc = [gDevice newComputePipelineStateWithFunction:ef error:&error];
+  if (add == nil || enc == nil) {
+    say("icb_pipelines", [NSString stringWithFormat:@"failed: %@", error]);
+    return 2;
+  }
+  BOOL gpu = [shape hasPrefix:@"icb-gpu"];
+  BOOL over = [shape isEqualToString:@"icb-gpu-over-cpu"];
+  MTLResourceOptions storage = gpu && !over ? MTLResourceStorageModePrivate
+                                            : MTLResourceStorageModeShared;
+  MTLIndirectCommandBufferDescriptor *d = [MTLIndirectCommandBufferDescriptor new];
+  d.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
+  d.inheritPipelineState = NO;
+  d.inheritBuffers = NO;
+  d.maxKernelBufferBindCount = 2;
+  stage("new-indirect-command-buffer");
+  id<MTLIndirectCommandBuffer> icb =
+      [gDevice newIndirectCommandBufferWithDescriptor:d
+                                      maxCommandCount:1
+                                              options:storage | (gBit24 ? kBit24 : 0)];
+  if (icb == nil) {
+    say("icb", @"nil");
+    return 0;
+  }
+  say("icb.options", [NSString stringWithFormat:@"%#lx", (unsigned long)icb.resourceOptions]);
+  id<MTLBuffer> out = [gDevice newBufferWithLength:16 options:MTLResourceStorageModeShared];
+  id<MTLBuffer> five = [gDevice newBufferWithLength:16 options:MTLResourceStorageModeShared];
+  id<MTLBuffer> one = [gDevice newBufferWithLength:16 options:MTLResourceStorageModeShared];
+  ((uint32_t *)out.contents)[0] = 16;
+  ((uint32_t *)five.contents)[0] = 5;
+  ((uint32_t *)one.contents)[0] = 1;
+  if (!gpu || over) {
+    stage("cpu-encode");
+    id<MTLIndirectComputeCommand> c = [icb indirectComputeCommandAtIndex:0];
+    [c setComputePipelineState:add];
+    [c setKernelBuffer:out offset:0 atIndex:0];
+    [c setKernelBuffer:over ? one : five offset:0 atIndex:1];
+    [c concurrentDispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+  }
+  id<MTLCommandBuffer> cb = [queue commandBuffer];
+  if (gpu) {
+    id<MTLArgumentEncoder> ae = [ef newArgumentEncoderWithBufferIndex:0];
+    id<MTLBuffer> args = [gDevice newBufferWithLength:ae.encodedLength
+                                              options:MTLResourceStorageModeShared];
+    [ae setArgumentBuffer:args offset:0];
+    [ae setIndirectCommandBuffer:icb atIndex:0];
+    [ae setComputePipelineState:add atIndex:1];
+    stage("gpu-encode");
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:enc];
+    [e setBuffer:args offset:0 atIndex:0];
+    [e setBuffer:out offset:0 atIndex:1];
+    [e setBuffer:five offset:0 atIndex:2];
+    [e useResource:icb usage:MTLResourceUsageWrite];
+    [e dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    [e endEncoding];
+  }
+  stage("execute");
+  id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+  [e useResource:icb usage:MTLResourceUsageRead];
+  [e useResource:out usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+  [e useResource:five usage:MTLResourceUsageRead];
+  [e useResource:one usage:MTLResourceUsageRead];
+  [e executeCommandsInBuffer:icb withRange:NSMakeRange(0, 1)];
+  [e endEncoding];
+  stage("commit");
+  [cb commit];
+  [cb waitUntilCompleted];
+  sayBuffer("cb1", cb);
+  say("cb1.out", [NSString stringWithFormat:@"%u", ((uint32_t *)out.contents)[0]]);
+  // Executed again in a command buffer of its own: what the buffer's command holds now.
+  ((uint32_t *)out.contents)[0] = 16;
+  id<MTLCommandBuffer> again = [queue commandBuffer];
+  e = [again computeCommandEncoder];
+  [e useResource:icb usage:MTLResourceUsageRead];
+  [e useResource:out usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+  [e useResource:five usage:MTLResourceUsageRead];
+  [e useResource:one usage:MTLResourceUsageRead];
+  [e executeCommandsInBuffer:icb withRange:NSMakeRange(0, 1)];
+  [e endEncoding];
+  stage("again");
+  [again commit];
+  [again waitUntilCompleted];
+  sayBuffer("cb2", again);
+  say("cb2.out", [NSString stringWithFormat:@"%u", ((uint32_t *)out.contents)[0]]);
+  return 0;
+}
+
 static id<MTLDevice> pickDevice(const char *want) {
   for (id<MTLDevice> d in MTLCopyAllDevices()) {
     if ([d.name rangeOfString:@(want) options:NSCaseInsensitiveSearch].location != NSNotFound) {
@@ -629,6 +756,13 @@ int main(int argc, const char *argv[]) {
     }
     id<MTLCommandQueue> queue = [gDevice newCommandQueue];
     id<MTLSharedEvent> event = [gDevice newSharedEvent];
+    if ([shape hasPrefix:@"icb-"]) {
+      int status = icbShape(shape, queue);
+      if (status != 0) return status;
+      later("same_queue", queue, event, 2);
+      stage("done");
+      return 0;
+    }
     if ([shape hasPrefix:@"replace"]) {
       int status = cpuShape(shape);
       if (status != 0) return status;

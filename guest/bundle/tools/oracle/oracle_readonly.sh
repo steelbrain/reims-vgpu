@@ -20,7 +20,7 @@ for shape in ${SHAPES:-store resolve-into resolve-into-late smsr-into smsr-into-
   blit-copy-into fill-color fill-bytes mipmaps mipmaps-shared invalidate \
   replace replace-heap ro-pages-store ro-pages-resolve-into ro-pages-smsr-into \
   ro-pages-frag-write ro-pages-vert-write ro-pages-kernel-write ro-pages-blit-copy-into \
-  ro-pages-fill-color ro-pages-fill-bytes ro-pages-replace}; do
+  ro-pages-fill-color ro-pages-fill-bytes ro-pages-replace icb-cpu icb-gpu icb-gpu-over-cpu}; do
   for backing in bit24 plain; do
     i=0
     while [ "$i" -lt "$runs" ]; do

@@ -25,6 +25,9 @@
 //   timing      CPU encode cost per command at 1024 and 16384, the commit after it, what each
 //               encode draws, execution GPU time
 //   freed       buffers the commands name released before an execute, a heap's among them
+//   freedstate  a compute command a kernel encodes naming a state the program released, by the ID
+//               its argument buffer holds: before the write, after it, with a state made since,
+//               and over a state the CPU set (the kernel writing the state or the buffers alone)
 //   resets      what a command's reset and resetWithRange: keep of a command's pipeline state
 //   spi         what a render and a compute command answer to Metal's indirect command SPI
 //               (MTLIndirectRenderCommandSPI, MTLIndirectComputeCommandSPI) fresh, once encoded
@@ -1837,6 +1840,104 @@ static void case_freed(void)
 // What a command's reset and a buffer's resetWithRange: keep: commands 0 and 1 are encoded whole,
 // command 0 reset by its reset, command 1 by resetWithRange {1,1}; then each is given its
 // buffers and its draw or dispatch again, no pipeline state, and executed with none on the encoder.
+// ---- freedstate ------------------------------------------------------------------------------
+
+// One state of icb_add (out 2 + 3 = 5), icb_mul (2 * 3 = 6) or neither (2) per shape, of a compute
+// command icb_encode_one writes from an argument buffer holding the ID of an icb_add state x of
+// indirect command buffer support, which the program releases (its last reference dropped in an
+// autorelease pool):
+//   0 x released before the write; no state made since
+//   1 x released after the write's command buffer completed, before the execute's
+//   2 x released before the write; an icb_mul state y made since
+//   3 the CPU sets x on the command; x released; y made; the kernel writes the state and buffers
+//   4 the CPU sets x on the command; x released; y made; the kernel writes the buffers alone
+// Each line: what out[0] read, the execution's command buffer status and error, x's ID and y's.
+static void case_freedstate(void)
+{
+	printf("freedstate (out reads 5 where icb_add ran, 6 where icb_mul ran, 2 where nothing did):\n");
+	id<MTLFunction> ef = fn("icb_encode_one");
+	id<MTLComputePipelineState> enc = cpso("icb_encode_one", NO);
+	if (!ef || !enc)
+		return;
+	id<MTLArgumentEncoder> ae = [ef newArgumentEncoderWithBufferIndex:0];
+	static const char *const what[] = {
+	    "released before the write",
+	    "released after the write, before the execute",
+	    "released before the write, icb_mul made since",
+	    "CPU-set, released, icb_mul made, the kernel writes the state",
+	    "CPU-set, released, icb_mul made, the kernel writes the buffers alone",
+	};
+	for (int shape = 0; shape < 5; shape++) {
+		id<MTLIndirectCommandBuffer> b =
+		    icb(cdesc(MTLIndirectCommandTypeConcurrentDispatch, NO, NO), 1);
+		id<MTLBuffer> out = buf(16), vals = buf(16), with = buf(16);
+		id<MTLBuffer> args = buf(ae.encodedLength);
+		((uint32_t *)out.contents)[0] = 2;
+		((uint32_t *)vals.contents)[0] = 3;
+		((uint32_t *)with.contents)[0] = shape == 4 ? 0 : 1;
+		[ae setArgumentBuffer:args offset:0];
+		[ae setIndirectCommandBuffer:b atIndex:0];
+		uint64_t xid = 0, yid = 0;
+		id<MTLComputePipelineState> y = nil;
+		// The kernel's write of command 0, encoded into `cb`.
+		void (^write)(id<MTLCommandBuffer>) = ^(id<MTLCommandBuffer> cb) {
+			id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+			[ce setComputePipelineState:enc];
+			[ce setBuffer:args offset:0 atIndex:0];
+			[ce setBuffer:out offset:0 atIndex:1];
+			[ce setBuffer:vals offset:0 atIndex:2];
+			[ce setBuffer:with offset:0 atIndex:3];
+			[ce useResource:b usage:MTLResourceUsageWrite];
+			[ce dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+			[ce endEncoding];
+		};
+		// The execution of command 0, encoded into `cb`.
+		void (^execute)(id<MTLCommandBuffer>) = ^(id<MTLCommandBuffer> cb) {
+			id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+			[ce useResource:out usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+			[ce useResource:vals usage:MTLResourceUsageRead];
+			[ce useResource:b usage:MTLResourceUsageRead];
+			[ce executeCommandsInBuffer:b withRange:NSMakeRange(0, 1)];
+			[ce endEncoding];
+		};
+		@autoreleasepool {
+			id<MTLComputePipelineState> x = cpso("icb_add", YES);
+			xid = x.gpuResourceID._impl;
+			[ae setComputePipelineState:x atIndex:1];
+			if (shape >= 3) {
+				id<MTLIndirectComputeCommand> c = [b indirectComputeCommandAtIndex:0];
+				[c setComputePipelineState:x];
+				[c setKernelBuffer:out offset:0 atIndex:0];
+				[c setKernelBuffer:vals offset:0 atIndex:1];
+				[c concurrentDispatchThreadgroups:MTLSizeMake(1, 1, 1)
+				            threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+			}
+			if (shape == 1) {
+				id<MTLCommandBuffer> cb = [Q commandBuffer];
+				write(cb);
+				run(cb);
+			}
+			x = nil;
+		}
+		if (shape >= 2) {
+			y = cpso("icb_mul", YES);
+			yid = y.gpuResourceID._impl;
+		}
+		id<MTLCommandBuffer> cb = [Q commandBuffer];
+		if (shape != 1)
+			write(cb);
+		execute(cb);
+		run(cb);
+		NSError *err = cb.error;
+		printf("  %-70s %u  status %ld error %s; x ID %llu, y ID %llu\n", what[shape],
+		       ((uint32_t *)out.contents)[0], (long)cb.status,
+		       err ? [NSString stringWithFormat:@"%@ %ld", err.domain, (long)err.code].UTF8String
+		           : "none",
+		       (unsigned long long)xid, (unsigned long long)yid);
+		y = nil;
+	}
+}
+
 static void case_resets(void)
 {
 	printf("resets (what each reset keeps; buffers and draw encoded again, no pipeline):\n");
@@ -2186,6 +2287,8 @@ static int run_case(int argc, char **argv)
 		case_timing();
 	else if (!strcmp(argv[0], "freed"))
 		case_freed();
+	else if (!strcmp(argv[0], "freedstate"))
+		case_freedstate();
 	else if (!strcmp(argv[0], "resets"))
 		case_resets();
 	else if (!strcmp(argv[0], "spi"))
@@ -2255,7 +2358,7 @@ int main(int argc, char **argv)
 	const BOOL validate = getenv("ORACLE_VALIDATE") && *getenv("ORACLE_VALIDATE") == '1';
 	static const char *const all[] = {"info",   "types",   "limits", "descriptor", "setters",
 	                                  "render", "patches", "ranges", "reset",      "order",
-	                                  "compute", "gpu",    "residency", "timing", "freed",      "resets", "spi"};
+	                                  "compute", "gpu",    "residency", "timing", "freed",      "freedstate", "resets", "spi"};
 	for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {
 		if (argc > 2 && strcmp(argv[2], all[i]))
 			continue;

@@ -117,3 +117,17 @@ kernel void icb_encode_dispatch(device IcbComputeArgs &args [[buffer(0)]],
 	cmd.set_kernel_buffer(vals + i, 1);
 	cmd.concurrent_dispatch_threadgroups(uint3(1, 1, 1), uint3(64, 1, 1));
 }
+
+// Encodes compute command 0: the argument buffer's pipeline state where `with_pso`, then icb_add's
+// or icb_mul's buffers (out[0], vals[0]) and one threadgroup of 1.
+kernel void icb_encode_one(device IcbComputeArgs &args [[buffer(0)]],
+                           device uint *out [[buffer(1)]], device uint *vals [[buffer(2)]],
+                           device const uint &with_pso [[buffer(3)]])
+{
+	compute_command cmd(args.cmds, 0);
+	if (with_pso)
+		cmd.set_compute_pipeline_state(args.pso);
+	cmd.set_kernel_buffer(out, 0);
+	cmd.set_kernel_buffer(vals, 1);
+	cmd.concurrent_dispatch_threadgroups(uint3(1, 1, 1), uint3(1, 1, 1));
+}
