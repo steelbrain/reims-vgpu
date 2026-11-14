@@ -2560,7 +2560,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         split::SPLIT_AFTER
     }
 
-    /// Notes a part a walk committed before its buffer's last ([`Self::parts_cut`]).
+    /// Notes a part a walk committed before its buffer's last, which `parts_cut` counts in tests.
     pub(crate) fn note_part_cut(&self) {
         #[cfg(test)]
         self.shared
