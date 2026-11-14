@@ -27,7 +27,9 @@
 //! window's mirror instead (`mirror`): at each draw the runtime's GPU brings the mirror, in host
 //! memory, up to the presented texture, sending only the tiles that changed, and the draw's
 //! device draws from a linear texture over its import of the mirror's pages, as the surface's
-//! texture is drawn above. The import is made once a mirror, its deallocator holding the
+//! texture is drawn above. The draw waits for the mirror's sync on its own GPU where the sync's
+//! completion comes as a sync file, else the window's thread waits for it (`mirror`,
+//! "Ordering"). The import is made once a mirror, its deallocator holding the
 //! runtime's buffer over the mirror, so the mirror's pages stay mapped while it lives. A
 //! presented surface the mirror cannot carry, or whose mirror, import or texture is refused,
 //! cannot be drawn there: the draw draws nothing, says so ([`ScanoutDraw::foreign_refused`]),
@@ -129,7 +131,7 @@ use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
 use reims_vgpu_vulkan::core::platform::types::MtlViewport;
 
 use super::color::DisplayColor;
-use super::mirror::{Mirror, Synced};
+use super::mirror::{Completion, Mirror, Synced};
 use super::{DisplayHold, Drawable, DrawnPresents, Presented, Shown};
 use crate::entry::no_catch;
 use crate::platform::ApiPlatform;
@@ -229,6 +231,11 @@ pub(crate) struct Foreign<P: Platform> {
     mirror: Kept<Mirror<P>>,
     /// The mirror's import on the draw's device, and the textures over it.
     import: Mutex<Option<ForeignImport<P>>>,
+    /// The completion of the mirror's last sync, which the next draw of it waits for on its GPU
+    /// ([`Mirror::sync`]).
+    waiting: Mutex<Option<Completion<P>>>,
+    /// The draw's device could not wait for a sync's completion on its GPU, which was logged.
+    waits_on_host: AtomicBool,
     /// It met a presented surface it cannot draw.
     refused: AtomicBool,
 }
@@ -238,6 +245,8 @@ impl<P: Platform> Default for Foreign<P> {
         Foreign {
             mirror: Kept::new(),
             import: Mutex::new(None),
+            waiting: Mutex::new(None),
+            waits_on_host: AtomicBool::new(false),
             refused: AtomicBool::new(false),
         }
     }
@@ -864,8 +873,36 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             .mirror
             .get_or_make(|| Mirror::new(self.platform.metal_device(None)?))?;
         let align = self.device.caps().limits.linear_texture_alignment_bytes;
-        let synced = mirror.sync(surface, align, &|| self.platform.clock().now_mono())?;
-        self.foreign_texture(foreign, surface.pixel_format(), &synced)
+        let mut synced = mirror.sync(surface, align, &|| self.platform.clock().now_mono())?;
+        let completion = synced.completion.take();
+        let texture = self.foreign_texture(foreign, surface.pixel_format(), &synced)?;
+        // The draw of the texture waits for the sync ([`Self::surface_command_buffer`]).
+        *foreign.waiting.lock() = completion;
+        Some(texture)
+    }
+
+    /// A command buffer of the sink's queue for a draw of a presented surface. On the
+    /// compositor's GPU it waits first, on that GPU, for the window's mirror's sync the draw
+    /// reads, where the sync's completion came as a sync file ([`Mirror::sync`]); where this
+    /// device cannot wait for the file, the window's thread waits for the sync here, logged once.
+    fn surface_command_buffer(&self) -> Option<P::CommandBuffer> {
+        let command_buffer = no_catch(self.queue.command_buffer(OnFault::Die))?;
+        let waiting = (self.foreign.as_ref()).and_then(|f| f.waiting.lock().take());
+        if let Some(Completion { file, sync }) = waiting
+            && !command_buffer.encode_wait_for_sync_file(file)
+        {
+            if let Some(foreign) = &self.foreign
+                && !foreign.waits_on_host.swap(true, Ordering::AcqRel)
+            {
+                log::info!(
+                    target: "reims_vgpu::graphics",
+                    "the compositor's GPU cannot wait for the runtime's sync file of the window's \
+                     mirror: the window's thread waits for each sync"
+                );
+            }
+            no_catch(sync.wait_until_completed(OnFault::Die));
+        }
+        Some(command_buffer)
     }
 
     /// The mirror `synced` as a texture of `format` on this draw's device ([`Self::mirrored`]).
@@ -988,7 +1025,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         texture: &P::Texture,
         region: PixelRect,
     ) -> Option<P::CommandBuffer> {
-        let command_buffer = no_catch(self.queue.command_buffer(OnFault::Die))?;
+        let command_buffer = self.surface_command_buffer()?;
         let (texture_width, texture_height) = (texture.width(), texture.height());
         let x = region.x.min(texture_width);
         let y = region.y.min(texture_height);
@@ -1488,7 +1525,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         texture: &P::Texture,
         region: PixelRect,
     ) -> Option<P::CommandBuffer> {
-        let command_buffer = no_catch(self.queue.command_buffer(OnFault::Die))?;
+        let command_buffer = self.surface_command_buffer()?;
         let (texture_width, texture_height) = (texture.width(), texture.height());
         let x = region.x.min(texture_width);
         let y = region.y.min(texture_height);
@@ -1563,7 +1600,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             format: texture.pixel_format(),
             gamma: false,
         })?;
-        let command_buffer = no_catch(self.queue.command_buffer(OnFault::Die))?;
+        let command_buffer = self.surface_command_buffer()?;
         let (texture_width, texture_height) = (texture.width(), texture.height());
         let x = region.x.min(texture_width);
         let y = region.y.min(texture_height);
@@ -2974,7 +3011,12 @@ mod tests {
     /// window's mirror draws the pixels a draw from the presented texture draws: at the mirror's
     /// first sync, which sends every tile, after a change to two tiles of the frame (one at its
     /// edges), which sends those alone, with nothing changed, which sends none, and at a frame of
-    /// another size and format, for which the mirror is made again
+    /// another size and format, for which the mirror is made again. Each sync asks for its
+    /// completion as a sync file where the runtime exports one (Linux's drivers), which the draw
+    /// waits for on its GPU unless the sync finished before the export looked; else the window's
+    /// thread waits for it (MoltenVK). Where the runtime exports one, at least one of the test's
+    /// eight syncs goes to the draw as a sync file
+    #[test]
     #[test]
     fn on_vulkan_a_draw_from_the_mirror_draws_what_a_draw_from_the_texture_draws() {
         use reims_vgpu_vulkan::VulkanPlatform;
@@ -3061,6 +3103,20 @@ mod tests {
                 bytes
             };
             let runtime = platform.metal_device(None).unwrap();
+            // Whether the runtime exports a command buffer's completion as a sync file here.
+            let exports = {
+                let queue = runtime.new_command_queue().unwrap();
+                let probe = no_catch(queue.command_buffer(OnFault::Die)).unwrap();
+                let asked = probe.add_completion_sync_file();
+                probe.commit(OnFault::Die).unwrap();
+                if asked {
+                    assert!(probe.export_completion_sync_file().is_some());
+                }
+                probe.wait_until_completed(OnFault::Die).unwrap();
+                asked
+            };
+            // The syncs whose completion went to the draw as a sync file.
+            let mut on_gpu = 0;
             // 200 x 130: four tiles by three, those at the right and the bottom partial.
             for (format, pixel, size) in [(94, 4, (200, 130)), (80, 4, (67, 70))] {
                 let surface = texture_on(&runtime, format, 0x1, size);
@@ -3072,11 +3128,22 @@ mod tests {
                         answers: Mutex::default(),
                     }),
                 });
-                let check = |case: &str, tiles: u64| {
+                let mut check = |case: &str, tiles: u64| {
                     let (a, b) = (read(&own, size), read(&theirs, size));
                     let mirror = (theirs.foreign.as_ref())
                         .and_then(|f| f.mirror.made())
                         .unwrap();
+                    assert_eq!(
+                        mirror.last_asked(),
+                        exports,
+                        "format {format} {size:?}, {case}: the sync asked for its completion as \
+                         a sync file"
+                    );
+                    assert!(
+                        exports || !mirror.last_on_gpu(),
+                        "format {format} {size:?}, {case}: a sync file no sync asked for"
+                    );
+                    on_gpu += u64::from(mirror.last_on_gpu());
                     assert_eq!(
                         mirror.last_sent(),
                         tiles,
@@ -3103,6 +3170,10 @@ mod tests {
                 check("two tiles changed", if all == 12 { 2 } else { 1 });
                 check("nothing changed", 0);
             }
+            assert!(
+                !exports || on_gpu > 0,
+                "no sync's completion went to the draw as a sync file"
+            );
         });
     }
 }

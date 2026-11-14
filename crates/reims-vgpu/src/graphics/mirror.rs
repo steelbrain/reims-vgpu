@@ -15,18 +15,25 @@
 //! mirror holds the frame's bytes as the texture holds them, so a draw from it draws what a draw
 //! from the texture draws.
 //!
-//! **Ordering.** A sync waits until the runtime's GPU has finished it, and its command buffer
-//! makes its writes visible to the host as any command buffer's are once it has completed
-//! (Metal's shared memory), before the draw that reads the mirror is encoded on the compositor's
-//! GPU. A sync writes the mirror only once the last draw that read it has finished
-//! ([`Mirror::read_by`]): the draws come one at a time on the window's thread, so that draw was
-//! committed or dropped by then. The runtime exports its semaphores as opaque descriptors, which
-//! only a device of the same driver may import, so the CPU orders the two GPUs.
+//! **Ordering.** The draw that reads the mirror on the compositor's GPU comes after the sync that
+//! wrote it, whose command buffer makes its writes available to the host as its work ends:
+//! - where the platform exports the sync's completion as a sync file
+//!   (`CommandBuffer::export_completion_sync_file`), the draw waits for it on its own GPU
+//!   ([`Synced::completion`], `CommandBuffer::encode_wait_for_sync_file`), and the window's
+//!   thread waits for no GPU work of the sync's;
+//! - else, and where the draw's device cannot wait for the file, the window's thread waits until
+//!   the sync has finished before it encodes the draw.
+//!
+//! A sync writes the mirror only once the last draw that read it has finished
+//! ([`Mirror::read_by`]), and the sync before it too, whose count of tiles it then reads: the
+//! draws come one at a time on the window's thread, so the last draw was committed or dropped by
+//! then, and it waited for the sync before it.
 //!
 //! **What it refuses.** A surface of a pixel format the mirror does not carry (not 4 or 8 bytes a
 //! pixel), and any object the runtime refuses to make or a sync that fails, answer `None`: the
 //! window then presents from the runtime's GPU.
 
+use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use reims_vgpu_vulkan::core::host::HostPtr;
@@ -108,12 +115,19 @@ struct Frame<P: Platform> {
     fresh: bool,
     /// The last draw that read the mirror, on the compositor's GPU.
     reader: Option<P::CommandBuffer>,
+    /// The last sync, where the draw waits for it on its GPU: the next sync waits for it, and
+    /// reads its count of tiles.
+    pending: Option<P::CommandBuffer>,
+    /// The last sync asked for its completion as a sync file.
+    asked: bool,
 }
 
 /// The syncs and tiles counted for the debug log.
 #[derive(Default)]
 struct Counts {
     syncs: u64,
+    /// The syncs the draw waited for on the compositor's GPU.
+    on_gpu: u64,
     tiles: u64,
     bytes: u64,
     /// Nanoseconds the window's thread waited on the syncs.
@@ -131,6 +145,18 @@ pub(crate) struct Synced<P: Platform> {
     pub(crate) width: u64,
     /// Its height in pixels.
     pub(crate) height: u64,
+    /// The sync's completion, where the draw waits for it on its GPU (the module doc,
+    /// "Ordering"); `None` where the sync has finished.
+    pub(crate) completion: Option<Completion<P>>,
+}
+
+/// A sync's completion that the draw waits for on its GPU.
+pub(crate) struct Completion<P: Platform> {
+    /// The sync file of the sync's completion.
+    pub(crate) file: OwnedFd,
+    /// The sync, which the window's thread waits for where the draw's device cannot wait for the
+    /// file.
+    pub(crate) sync: P::CommandBuffer,
 }
 
 /// Host memory of the mirror's own, anonymous pages, unmapped at its drop.
@@ -229,6 +255,23 @@ impl<P: ApiPlatform> Mirror<P> {
             return None;
         }
         let mut kept = self.frame.lock();
+        if let Some(frame) = kept.as_mut() {
+            // The last draw that read the mirror has finished before this sync writes it, or
+            // makes it again.
+            if let Some(reader) = frame.reader.take()
+                && reader.status() != CommandBufferStatus::NOT_ENQUEUED
+            {
+                no_catch(reader.wait_until_completed(OnFault::Die));
+            }
+            // And the last sync, where the draw waited for it on its GPU: its count is read here.
+            if let Some(last) = frame.pending.take() {
+                no_catch(last.wait_until_completed(OnFault::Die));
+                let held = pixel_bytes(frame.shape.0).unwrap_or(bytes);
+                if !self.finished(&last, held) {
+                    return None;
+                }
+            }
+        }
         if kept
             .as_ref()
             .is_none_or(|f| f.shape != (format, width, height))
@@ -237,12 +280,6 @@ impl<P: ApiPlatform> Mirror<P> {
             *kept = Some(self.frame(format, width, height, bytes, align)?);
         }
         let frame = kept.as_mut()?;
-        // The last draw that read the mirror has finished before this sync writes it.
-        if let Some(reader) = frame.reader.take()
-            && reader.status() != CommandBufferStatus::NOT_ENQUEUED
-        {
-            no_catch(reader.wait_until_completed(OnFault::Die));
-        }
         let bytes_per_row = frame.bytes_per_row;
         let words = |b: u64| u32::try_from(b / 4).ok();
         let arguments = [
@@ -315,36 +352,88 @@ impl<P: ApiPlatform> Mirror<P> {
             },
         ));
         compute.end();
+        let exported = command_buffer.add_completion_sync_file();
+        frame.asked = exported;
         no_catch(command_buffer.commit(OnFault::Die));
-        no_catch(command_buffer.wait_until_completed(OnFault::Die));
-        if command_buffer.status() != CommandBufferStatus::COMPLETED {
-            log::warn!(
-                target: "reims_vgpu::graphics",
-                "the window's mirror's sync failed ({:?}): the window presents from the \
-                 runtime's GPU",
-                command_buffer.error()
-            );
-            return None;
-        }
+        // The sync file, where the platform exports one and the sync has not finished already.
+        let file = exported
+            .then(|| command_buffer.export_completion_sync_file())
+            .flatten()
+            .flatten();
         // `now` is the frame sent from here.
         std::mem::swap(&mut frame.now, &mut frame.sent);
         frame.fresh = false;
-        // SAFETY: the 4-byte shared count, which the finished sync wrote.
-        let tiles = u64::from(unsafe { self.tiles.contents().as_ptr::<u32>().read() });
-        self.last.store(tiles, Ordering::Relaxed);
-        self.count(tiles, tiles * TILE * TILE * bytes, started, now());
+        let completion = match file {
+            Some(file) => {
+                frame.pending = Some(command_buffer.clone_ref());
+                Some(Completion {
+                    file,
+                    sync: command_buffer,
+                })
+            }
+            None => {
+                no_catch(command_buffer.wait_until_completed(OnFault::Die));
+                if !self.finished(&command_buffer, bytes) {
+                    return None;
+                }
+                None
+            }
+        };
+        self.count_sync(completion.is_some(), started, now());
         Some(Synced {
             buffer: frame.mirror.clone_ref(),
             bytes_per_row,
             width,
             height,
+            completion,
         })
     }
 
-    /// The tiles the last sync sent.
+    /// The sync `sync`, finished, of a frame of `bytes` bytes a pixel: its count of tiles read
+    /// and counted; `false`, logged, where it failed.
+    fn finished(&self, sync: &P::CommandBuffer, bytes: u64) -> bool {
+        if sync.status() != CommandBufferStatus::COMPLETED {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "the window's mirror's sync failed ({:?}): the window presents from the \
+                 runtime's GPU",
+                sync.error()
+            );
+            return false;
+        }
+        // SAFETY: the 4-byte shared count, which the finished sync wrote, and no sync since.
+        let tiles = u64::from(unsafe { self.tiles.contents().as_ptr::<u32>().read() });
+        self.last.store(tiles, Ordering::Relaxed);
+        self.count_tiles(tiles, tiles * TILE * TILE * bytes);
+        true
+    }
+
+    /// The tiles the last sync sent, once it has finished.
     #[cfg(test)]
     pub(crate) fn last_sent(&self) -> u64 {
+        let pending = self.frame.lock().as_mut().and_then(|f| f.pending.take());
+        if let Some(last) = pending {
+            no_catch(last.wait_until_completed(OnFault::Die));
+            let bytes =
+                (self.frame.lock().as_ref()).map_or(4, |f| pixel_bytes(f.shape.0).unwrap_or(4));
+            assert!(self.finished(&last, bytes), "the mirror's last sync failed");
+        }
         self.last.load(Ordering::Relaxed)
+    }
+
+    /// Whether the last sync asked for its completion as a sync file.
+    #[cfg(test)]
+    pub(crate) fn last_asked(&self) -> bool {
+        self.frame.lock().as_ref().is_some_and(|f| f.asked)
+    }
+
+    /// Whether the last sync's completion went to the draw as a sync file.
+    #[cfg(test)]
+    pub(crate) fn last_on_gpu(&self) -> bool {
+        self.frame
+            .lock()
+            .as_ref()
+            .is_some_and(|f| f.pending.is_some())
     }
 
     /// Whether the runtime's device recovered since the mirror was made: its objects then carry
@@ -403,6 +492,8 @@ impl<P: ApiPlatform> Mirror<P> {
                 arguments: no_catch(self.device.new_buffer_of_length(OnFault::Die, 20, 0))?,
                 fresh: true,
                 reader: None,
+                pending: None,
+                asked: false,
             })
         })();
         if made.is_none() {
@@ -415,25 +506,34 @@ impl<P: ApiPlatform> Mirror<P> {
         made
     }
 
-    /// A sync from `started` to `now` sent `tiles` tiles, `bytes` bytes at most (a tile at the
-    /// frame's edge is smaller): counted, and logged at debug about once a second.
-    fn count(&self, tiles: u64, bytes: u64, started: MonoTime, now: MonoTime) {
+    /// A finished sync sent `tiles` tiles, `bytes` bytes at most (a tile at the frame's edge is
+    /// smaller): counted.
+    fn count_tiles(&self, tiles: u64, bytes: u64) {
         let mut counts = self.counts.lock();
-        counts.syncs += 1;
         counts.tiles += tiles;
         counts.bytes += bytes;
+    }
+
+    /// A sync the window's thread spent from `started` to `now` on, which the draw waits for on
+    /// its GPU where `on_gpu`: counted, and the counts logged at debug about once a second.
+    fn count_sync(&self, on_gpu: bool, started: MonoTime, now: MonoTime) {
+        let mut counts = self.counts.lock();
+        counts.syncs += 1;
+        counts.on_gpu += u64::from(on_gpu);
         counts.waited += now.saturating_duration_since(started).as_nanos() as u64;
         let since = *counts.since.get_or_insert(now);
         let over = now.saturating_duration_since(since).as_secs_f64();
         if over >= 1.0 {
             log::debug!(
                 target: "reims_vgpu::graphics::mirror",
-                "the window's mirror: {} syncs sent {} tiles, at most {} bytes, over {:.1} s; the \
-                 window's thread waited {} us on them",
+                "the window's mirror: {} syncs sent {} tiles, at most {} bytes, over {:.1} s, {} \
+                 of them waited for on the compositor's GPU; the window's thread waited {} us on \
+                 them",
                 counts.syncs,
                 counts.tiles,
                 counts.bytes,
                 over,
+                counts.on_gpu,
                 counts.waited / 1000
             );
             *counts = Counts {
