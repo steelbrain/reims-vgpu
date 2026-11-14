@@ -973,11 +973,10 @@ void test_stage_metadata_normalized()
 	// The module's rules hold for a kernel too: the generator's lists go.
 	text = kernel + "!gld.plugin_info = !{!1}\n";
 	CHECK(RgfxGLNormalizeStageText(text, vertex) && text == kernel);
-	// So do the input rules: a kernel's input loses the bare attribute name after its location,
-	// as the generator writes one in the kernel of a tessellated draw ("attrib_0" at its argument
-	// 0, which metal2vulkan refuses), and its buffer gets the address space of its parameter's
-	// pointer. Our own text: the inputs as `metal` writes a stage_in kernel's, the bare name added
-	// and the buffer's address space taken out.
+	// So do the input rules: a kernel's input loses a bare attribute name after its location, and
+	// its buffer gets the address space of its parameter's pointer. Our own text: the inputs as
+	// `metal` writes a stage_in kernel's, a bare name added and the buffer's address space taken
+	// out.
 	{
 		const std::string inputs = "!air.kernel = !{!0}\n"
 		                           "!0 = !{void (<2 x float>, float addrspace(1)*, i32)* @__main, !1, !2}\n"
@@ -1006,6 +1005,84 @@ void test_stage_metadata_normalized()
 		text = generated;
 		CHECK(RgfxGLNormalizeStageText(text, compute) && text == normalized);
 		CHECK(!RgfxGLNormalizeStageText(text, compute) && text == normalized);
+	}
+	// A patch control point input's fields as the generator writes them in the kernel of a
+	// tessellated draw (measured: macOS 27.0.1 arm64, m3-max-30158): a bare attribute name after
+	// the location, and the key air.arg_type_name where the type name goes. Each field loses the
+	// name and gets its member's type name from the control point function's result, in order, in
+	// a kernel and in a post-tessellation vertex function alike (three fields, an integer's name
+	// unsigned). Our own text.
+	{
+		const std::string kernelHead = "!air.kernel = !{!0}\n"
+		                               "!0 = !{void (i8*, <2 x i32>)* @__main, !1, !2, !6}\n"
+		                               "!1 = !{}\n"
+		                               "!2 = !{!3, !5}\n"
+		                               "!3 = !{i32 0, !\"air.patch_control_point_input\", !4, !7}\n"
+		                               "!4 = !{!\"air.patch_control_point_function\", { <2 x float> } (i32, i8*)* @cpf}\n"
+		                               "!5 = !{i32 1, !\"air.thread_position_in_grid\", !\"air.arg_type_name\", "
+		                               "!\"uint2\", !\"air.arg_name\", !\"i\"}\n"
+		                               "!6 = !{!\"air.max_work_group_size\", i32 32}\n";
+		RgfxGLSignature compute;
+		compute.parameters = {"", "uint2"};
+		text = kernelHead +
+		       "!7 = !{!\"air.location_index\", i32 0, i32 1, !\"attrib_0\", !\"air.arg_type_name\", "
+		       "!\"air.arg_type_name\", !\"air.arg_name\", !\"attrib_0\"}\n";
+		const std::string kernelFields = kernelHead + "!7 = !{!\"air.location_index\", i32 0, i32 1, "
+		                                              "!\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", "
+		                                              "!\"attrib_0\"}\n";
+		CHECK(RgfxGLNormalizeStageText(text, compute) && text == kernelFields);
+		CHECK(!RgfxGLNormalizeStageText(text, compute) && text == kernelFields);
+
+		const std::string vertexHead =
+		    "!air.vertex = !{!0}\n"
+		    "!0 = !{<4 x float> (i8*, <2 x float>)* @__main, !1, !3, !9}\n"
+		    "!1 = !{!2}\n"
+		    "!2 = !{!\"air.position\", !\"air.arg_type_name\", !\"float4\", !\"air.arg_name\", !\"#air_position\"}\n"
+		    "!3 = !{!4, !8}\n"
+		    "!4 = !{i32 0, !\"air.patch_control_point_input\", !5, !6, !7, !10}\n"
+		    "!5 = !{!\"air.patch_control_point_function\", { <4 x float>, <2 x float>, i32 } (i32, i8*)* @cpf}\n";
+		const std::string vertexTail =
+		    "!8 = !{i32 1, !\"air.position_in_patch\", !\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", "
+		    "!\"uv\"}\n"
+		    "!9 = !{!\"air.patch\", !\"quad\", !\"air.patch_control_point\", i32 4}\n";
+		auto field = [](unsigned node, unsigned location, const char *type, bool generated) {
+			const std::string name = "attrib_" + std::to_string(location);
+			return "!" + std::to_string(node) + " = !{!\"air.location_index\", i32 " + std::to_string(location) +
+			       ", i32 1, " + (generated ? "!\"" + name + "\", " : std::string()) + "!\"air.arg_type_name\", !\"" +
+			       type + "\", !\"air.arg_name\", !\"" + name + "\"}\n";
+		};
+		RgfxGLSignature patch;
+		patch.outputs = {"float4"};
+		patch.parameters = {"", "float2"};
+		text = vertexHead + field(6, 3, "air.arg_type_name", true) + field(7, 0, "air.arg_type_name", true) +
+		       vertexTail + field(10, 1, "air.arg_type_name", true);
+		const std::string vertexFields = vertexHead + field(6, 3, "float4", false) + field(7, 0, "float2", false) +
+		                                 vertexTail + field(10, 1, "uint", false);
+		CHECK(RgfxGLNormalizeStageText(text, patch) && text == vertexFields);
+
+		// The same input as `metal` writes it (an integer field named "int", the function's
+		// parameter its opaque pointer, the position output without air.arg_name) comes through
+		// unchanged, byte for byte.
+		const std::string metal =
+		    "!air.vertex = !{!9}\n"
+		    "!9 = !{<4 x float> (%struct._patch_control_point_t*, <2 x float>)* @v, !10, !12, !19}\n"
+		    "!10 = !{!11}\n"
+		    "!11 = !{!\"air.position\", !\"air.arg_type_name\", !\"float4\"}\n"
+		    "!12 = !{!13, !18}\n"
+		    "!13 = !{i32 0, !\"air.patch_control_point_input\", !14, !15, !16, !17}\n"
+		    "!14 = !{!\"air.patch_control_point_function\", { <4 x float>, <2 x float>, i32 } (i32, "
+		    "%struct._patch_control_point_t*)* @cp}\n"
+		    "!15 = !{!\"air.location_index\", i32 3, i32 1, !\"air.arg_type_name\", !\"float4\", !\"air.arg_name\", "
+		    "!\"c\"}\n"
+		    "!16 = !{!\"air.location_index\", i32 0, i32 1, !\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", "
+		    "!\"p\"}\n"
+		    "!17 = !{!\"air.location_index\", i32 1, i32 1, !\"air.arg_type_name\", !\"int\", !\"air.arg_name\", "
+		    "!\"k\"}\n"
+		    "!18 = !{i32 1, !\"air.position_in_patch\", !\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", "
+		    "!\"uv\"}\n"
+		    "!19 = !{!\"air.patch\", !\"quad\", !\"air.patch_control_point\", i32 4}\n";
+		text = metal;
+		CHECK(!RgfxGLNormalizeStageText(text, patch) && text == metal);
 	}
 	text = "";
 	CHECK(!RgfxGLNormalizeStageText(text, vertex) && text.empty());

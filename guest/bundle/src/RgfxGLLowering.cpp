@@ -464,6 +464,104 @@ bool llvmTypeSize(std::string t, uint64_t &size, uint64_t &align)
 	return true;
 }
 
+// The Metal name of LLVM type `t` as a module's text writes it, as metalTypeName names a type:
+// "float2" for <2 x float>, "uint" for i32; integers unsigned. "" for any other type.
+std::string metalTextTypeName(std::string t)
+{
+	while (!t.empty() && t.front() == ' ')
+		t.erase(0, 1);
+	while (!t.empty() && t.back() == ' ')
+		t.pop_back();
+	unsigned lanes = 1;
+	if (t.size() > 2 && t.front() == '<' && t.back() == '>') {
+		const std::string inner = t.substr(1, t.size() - 2);
+		const size_t x = inner.find(" x ");
+		char *end = nullptr;
+		lanes = static_cast<unsigned>(std::strtoul(inner.c_str(), &end, 10));
+		if (x == std::string::npos || end != inner.c_str() + x || lanes < 2)
+			return "";
+		t = inner.substr(x + 3);
+	}
+	static const struct {
+		const char *llvm, *metal;
+	} kNames[] = {{"half", "half"},   {"float", "float"}, {"i1", "bool"},  {"i8", "uchar"},
+	              {"i16", "ushort"}, {"i32", "uint"},    {"i64", "ulong"}};
+	for (const auto &n : kNames)
+		if (t == n.llvm)
+			return lanes > 1 ? n.metal + std::to_string(lanes) : n.metal;
+	return "";
+}
+
+// The member types of the result of the function type an operand holds
+// ("{ <4 x float>, <2 x float> } (i32, i8*)* @fn"): a struct's members, or the one result.
+std::vector<std::string> resultMembers(const std::string &op)
+{
+	std::vector<std::string> members;
+	if (op.empty() || op.front() != '{') {
+		const size_t open = op.find(" (");
+		if (open != std::string::npos)
+			members.push_back(op.substr(0, open));
+		return members;
+	}
+	std::string member;
+	int depth = 0;
+	for (size_t i = 1; i < op.size(); i++) {
+		const char c = op[i];
+		if (c == '(' || c == '{' || c == '<' || c == '[')
+			depth++;
+		else if (c == ')' || c == '}' || c == '>' || c == ']')
+			depth--;
+		if (depth < 0 || (depth == 0 && c == ',')) {
+			members.push_back(member);
+			member.clear();
+			if (depth < 0)
+				break;
+			continue;
+		}
+		member += c;
+	}
+	return members;
+}
+
+// Drops an input's attribute name, which the generator writes as a bare string after its
+// location's two operands and `metal` does not; true where it did.
+bool dropAttributeName(NodeText &n)
+{
+	for (size_t i = 0; i + 3 < n.ops.size(); i++) {
+		std::string key, bare;
+		unsigned a = 0, b = 0;
+		if (stringOp(n.ops[i], key) && key == "air.location_index" && intOp(n.ops[i + 1], a) &&
+		    intOp(n.ops[i + 2], b) && stringOp(n.ops[i + 3], bare) && bare.compare(0, 4, "air.") != 0) {
+			n.ops.erase(n.ops.begin() + static_cast<std::ptrdiff_t>(i + 3));
+			return true;
+		}
+	}
+	return false;
+}
+
+// Makes a field node of a patch control point input what `metal` writes: no attribute name, and
+// the Metal name `type` of the field's member of the control point function's result where the
+// generator wrote the key air.arg_type_name in place of a type name. True where it changed.
+bool normalizeControlPointField(std::string &line, const std::string &type)
+{
+	NodeText n;
+	if (!splitNode(line, n))
+		return false;
+	bool edited = dropAttributeName(n);
+	for (size_t i = 0; i + 1 < n.ops.size(); i++) {
+		std::string key, value;
+		if (stringOp(n.ops[i], key) && key == "air.arg_type_name" && stringOp(n.ops[i + 1], value) &&
+		    value.compare(0, 4, "air.") == 0 && !type.empty()) {
+			n.ops[i + 1] = "!\"" + type + "\"";
+			edited = true;
+			break;
+		}
+	}
+	if (edited)
+		line = joinNode(n);
+	return edited;
+}
+
 // Makes one output or input node's text what the rules in RgfxGLLowering.hpp say; true where it
 // changed. `type` is the Metal name of the value's type from the entry point's signature, and
 // `param` an input's parameter in the entry point's function type (parameterTypes).
@@ -472,21 +570,11 @@ bool normalizeNode(std::string &line, bool input, const std::string &type, const
 	NodeText n;
 	if (!splitNode(line, n))
 		return false;
-	// An input's attribute name, which the generator writes as a bare string after the location's
-	// two operands (a vertex function's vertex input, a kernel's input), is not in the node `metal`
-	// writes.
-	bool edited = false;
-	for (size_t i = 0; input && i + 3 < n.ops.size(); i++) {
-		std::string key, bare;
-		unsigned a = 0, b = 0;
-		if (stringOp(n.ops[i], key) && key == "air.location_index" && intOp(n.ops[i + 1], a) &&
-		    intOp(n.ops[i + 2], b) && stringOp(n.ops[i + 3], bare) && bare.compare(0, 4, "air.") != 0) {
-			n.ops.erase(n.ops.begin() + static_cast<std::ptrdiff_t>(i + 3));
-			line = joinNode(n);
-			edited = true;
-			break;
-		}
-	}
+	// An input's attribute name (a vertex function's vertex input, a kernel's input) is not in the
+	// node `metal` writes.
+	bool edited = input && dropAttributeName(n);
+	if (edited)
+		line = joinNode(n);
 	// A flat fragment input's sampling key: `metal` writes [[flat]] as air.flat alone.
 	bool flat = false, fragmentInput = false;
 	for (const std::string &op : n.ops) {
@@ -740,6 +828,21 @@ bool RgfxGLNormalizeStageText(std::string &text, const RgfxGLSignature &signatur
 			                         param < signature.parameters.size() ? signature.parameters[param]
 			                                                             : std::string(),
 			                         param < params.size() ? params[param] : ParameterType());
+			// A patch control point input's fields, one per member of its control point function's
+			// result, in order.
+			std::string kind;
+			unsigned function = 0;
+			NodeText f;
+			if (in.ops.size() < 3 || !stringOp(in.ops[1], kind) || kind != "air.patch_control_point_input" ||
+			    !refOp(in.ops[2], function) || !node(function, f) || f.ops.size() < 2)
+				continue;
+			const std::vector<std::string> members = resultMembers(f.ops[1]);
+			for (size_t k = 0; k + 3 < in.ops.size(); k++) {
+				unsigned field = 0;
+				if (refOp(in.ops[k + 3], field) && field < nodeLine.size() && nodeLine[field] < lines.size())
+					changed |= normalizeControlPointField(
+					    lines[nodeLine[field]], k < members.size() ? metalTextTypeName(members[k]) : std::string());
+			}
 		}
 	}
 	if (!changed)
