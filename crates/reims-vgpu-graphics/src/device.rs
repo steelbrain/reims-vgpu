@@ -55,7 +55,11 @@
 //! as long as the control thread takes to hand it to its lane), so the creates it names are made,
 //! or, for a pipeline the host compiles on threads of its own, known to the host, which holds a
 //! buffer that names it until it is made. The thread sleeps for those at the gate, which wakes
-//! it only once they are done, whatever other processes' messages (`gate`). An
+//! it only once they are done, whatever other processes' messages (`gate`), but where its
+//! context's lane holds a `BUFFER_AT_OFFSET` or an `OBJECT_DESTROY` of no queue it waits for that
+//! no thread of the lane's carries out yet, the creates and destroys the bundle posts ahead of
+//! each commit: it carries that out itself, as the lane's job, in place of sleeping while a
+//! ring-0 thread is woken for it (`lanes`, "A command buffer's thread"). An
 //! `OBJECT_DESTROY` of the queue, a
 //! `CONTEXT_CLOSE` of its process (the host then
 //! drops the process's objects, [`Host::context_closed`]), a reset and the device's end, end a
@@ -199,7 +203,7 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use crate::control;
 use crate::device::backlog::Backlog;
-use crate::device::gate::{Gate, Look, Offer};
+use crate::device::gate::{Gate, Look, Offer, Waited};
 use crate::device::lanes::{Hand, Key, Lanes};
 use crate::display::{Mode, Scanout, Screen};
 use crate::ops::RgfxCommandBuffer;
@@ -542,7 +546,10 @@ pub trait Host: Send + Sync + 'static {
     }
 
     /// Hands a stage-3 message to the host's decoder: from ring 0, on its context's lane, an
-    /// object-lifecycle create or destroy; for a command queue, on its service thread, its
+    /// object-lifecycle create or destroy (on one of ring 0's threads, or, for a
+    /// `BUFFER_AT_OFFSET` or an `OBJECT_DESTROY` of no queue, on the service thread of a queue of
+    /// the context whose command buffer waits for it, `lanes`); for a command queue, on its
+    /// service thread, its
     /// `QUEUE_CREATE` first and its `OBJECT_DESTROY` last, its `COMMAND_BUFFER`s between them
     /// coming through [`Host::command_buffer`]. Each ring's messages come whole, in the
     /// order the guest published them (ring 0's, each context's in that order, on one thread at a
@@ -2762,7 +2769,9 @@ impl Shared {
             // 0; it never consumes it, so it keeps one consumer and its `consumer_idle` handshake
             // is untouched. It sleeps at the gate, woken once `control_done` reaches what it
             // waits for, then once its context's lane has carried out its own, or at a reset, the
-            // queue's end or the device's ([`gate`]). A buffer the host answered on a doorbell's
+            // queue's end or the device's ([`gate`]), but carries out itself a job of the lane's
+            // it waits for that no thread of the lane's carries out yet, where it may
+            // ([`Self::helps`]). A buffer the host answered on a doorbell's
             // thread waits no more: that thread found ring 0 carried out through what the buffer
             // waits for.
             let answered = consuming.take() == Some(message.header.seqno);
@@ -2792,13 +2801,18 @@ impl Shared {
                 let bytes = std::mem::take(&mut message.bytes);
                 Arc::new(Offer::new(Arc::clone(queue), bytes, waits_for, own))
             });
-            self.gate.wait_offering(
+            // A job of its context's lane it waits for, which no thread of the lane's carries out
+            // yet, it carries out itself, in place of sleeping while a ring-0 thread is woken for
+            // it ([`Self::help_lane`]).
+            while self.gate.wait_offering(
                 || {
                     if self.ending()
                         || queue.ended()
                         || self.epoch.load(Ordering::Acquire) != queue.epoch
                     {
                         Look::Done
+                    } else if (self.lanes).has_help(queue.context, own, |m| self.helps(m)) {
+                        Look::Help
                     } else if self.control_done.load(Ordering::Acquire) < waits_for {
                         Look::Count(waits_for)
                     } else if !self.lanes.through(queue.context, own) {
@@ -2808,7 +2822,10 @@ impl Shared {
                     }
                 },
                 offer.as_ref(),
-            );
+            ) == Waited::Help
+            {
+                self.help_lane(queue.context, own);
+            }
             if let Some(offer) = &offer {
                 message.bytes = offer.withdraw();
             }
@@ -2877,6 +2894,33 @@ impl Shared {
             && let Some(line) = self.guest_times.lock().add(&spans, noted_ns)
         {
             log::debug!(target: guest_times::TARGET, "{line}");
+        }
+    }
+
+    /// On the thread of a queue of context `context` whose command buffer waits for the context's
+    /// lane through ring 0's count `own`: carries out the lane's front job, where the lane's thread
+    /// carries none out and it is one the buffer waits for and [`Self::helps`] takes
+    /// ([`Lanes::help`]), as the lane's thread would ([`carry_out_job`]).
+    fn help_lane(&self, context: u32, own: u64) {
+        if let Some(job) = self.lanes.help(context, own, |m| self.helps(m)) {
+            carry_out_job(&self.lanes, self, Key::Context(context), job);
+        }
+    }
+
+    /// Whether a command buffer's thread may carry out ring-0 `message` of its context's lane
+    /// ([`Lanes::help`]): a `BUFFER_AT_OFFSET`, or an `OBJECT_DESTROY` of no queue, which the host
+    /// carries out with no thread of the device's to wait for. A queue's destroy routes its
+    /// doorbell (the host's lock) and ends a queue's thread, and a close, a block's release or a
+    /// create the host makes elsewhere may wait long or for a queue's buffers: each is left to
+    /// the lane's thread. The bundle holds these two kinds and posts them in one call ahead of
+    /// each command buffer it commits (docs/graphics-kext/design.md, "Destroys and creates no
+    /// one waits for go together"), so they are what a buffer finds left on its lane.
+    fn helps(&self, message: &Message) -> bool {
+        match message.header.r#type {
+            RGFX_CMD_BUFFER_AT_OFFSET => true,
+            RGFX_CMD_OBJECT_DESTROY => RgfxObjectDestroy::read_from_prefix(&message.bytes)
+                .is_ok_and(|(m, _)| !self.queues.lock().by_obj.contains_key(&m.obj_id)),
+            _ => false,
         }
     }
 
@@ -3147,20 +3191,28 @@ fn serve_lane(lanes: &Lanes, shared: &Weak<Shared>, key: Key, spare: Option<usiz
             lanes.finished(key);
             return;
         };
-        let seqno = job.message.header.seqno;
-        (shared.host).trace("r0job", &[u64::from(job.message.header.r#type), seqno]);
-        let answer = if shared.epoch.load(Ordering::Acquire) == job.epoch {
-            control::unheld(&shared, &job.message, job.epoch)
-        } else {
-            None
-        };
-        (shared.host).trace("r0jobdone", &[seqno]);
-        if let Some((context, done)) = lanes.finished(key) {
-            (shared.gate).carried_out_offering(context, done, |offer| shared.answer_offered(offer));
-        }
-        if let Some(answer) = answer {
-            shared.post_waiting(&answer, job.epoch);
-        }
+        carry_out_job(lanes, &shared, key, job);
+    }
+}
+
+/// Carries out `job`, which the lane `key` gave this thread ([`Lanes::next`], or [`Lanes::help`]
+/// on a command buffer's thread), with no lock of the device's held: tells the lanes it is done,
+/// offers the host each command buffer its carrying out ends the wait of at the gate, then posts
+/// its answer. A job taken before a reset is not carried out.
+fn carry_out_job(lanes: &Lanes, shared: &Shared, key: Key, job: lanes::Job) {
+    let seqno = job.message.header.seqno;
+    (shared.host).trace("r0job", &[u64::from(job.message.header.r#type), seqno]);
+    let answer = if shared.epoch.load(Ordering::Acquire) == job.epoch {
+        control::unheld(shared, &job.message, job.epoch)
+    } else {
+        None
+    };
+    (shared.host).trace("r0jobdone", &[seqno]);
+    if let Some((context, done)) = lanes.finished(key) {
+        (shared.gate).carried_out_offering(context, done, |offer| shared.answer_offered(offer));
+    }
+    if let Some(answer) = answer {
+        shared.post_waiting(&answer, job.epoch);
     }
 }
 

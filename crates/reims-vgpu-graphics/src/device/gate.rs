@@ -17,6 +17,10 @@
 //! device's end and anything else that ends a wait other than the move it waits for wake every
 //! waiting thread ([`Gate::every`]), which looks again.
 //!
+//! **A job of its own.** Where its context's lane holds a job the thread waits for and may carry
+//! out itself ([`Lanes::help`](super::lanes::Lanes::help)), it does that in place of sleeping:
+//! its look finds [`Look::Help`], and the wait returns for it to, unfiled, then begins again.
+//!
 //! **An offer.** A queue's thread that waits with a `COMMAND_BUFFER` taken files it with itself
 //! ([`Offer`], [`Gate::wait_offering`]). A lane whose move ends the wait offers the buffer to the
 //! host on its own thread before it wakes the waiting one ([`Gate::carried_out_offering`]), so a
@@ -158,8 +162,20 @@ pub(super) enum Look {
     /// The control thread has, and the lane of its context `0` has not carried out the
     /// context's messages through count `1`.
     Lane(u32, u64),
+    /// Its context's lane holds a job it waits for that the thread may carry out itself
+    /// ([`Lanes::help`](super::lanes::Lanes::help)): it goes to do so, then waits again.
+    Help,
     /// It waits no more.
     Done,
+}
+
+/// How a wait at the gate ended ([`Gate::wait_offering`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Waited {
+    /// The thread waits no more.
+    Done,
+    /// It has a job of its context's lane to carry out, and then waits again ([`Look::Help`]).
+    Help,
 }
 
 impl Gate {
@@ -172,8 +188,14 @@ impl Gate {
     /// Waits until `look` finds nothing more to wait for, looking again at each wake, each time
     /// with the gate's lock held, filed with `offer`, the buffer the waiting thread holds, which
     /// the lane whose move ends the wait may offer to the host before it wakes the thread (the
-    /// module doc). The thread withdraws it once this returns ([`Offer::withdraw`]).
-    pub(super) fn wait_offering(&self, mut look: impl FnMut() -> Look, offer: Option<&Arc<Offer>>) {
+    /// module doc), or until `look` finds a job of the thread's lane for it to carry out
+    /// ([`Look::Help`]), which it does unfiled, so nothing offers its buffer meanwhile. The thread
+    /// withdraws its offer once it waits no more ([`Offer::withdraw`]).
+    pub(super) fn wait_offering(
+        &self,
+        mut look: impl FnMut() -> Look,
+        offer: Option<&Arc<Offer>>,
+    ) -> Waited {
         let wake = Arc::new(Condvar::new());
         let file = || File {
             wake: Arc::clone(&wake),
@@ -182,7 +204,8 @@ impl Gate {
         let mut state = self.state.lock();
         loop {
             let filed = match look() {
-                Look::Done => return,
+                Look::Done => return Waited::Done,
+                Look::Help => return Waited::Help,
                 Look::Count(count) => {
                     let key = (count, state.next);
                     state.counts.insert(key, file());

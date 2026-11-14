@@ -3972,6 +3972,8 @@ fn a_taking_write_starts_and_resets_as_a_plain_one() {
 
 /// The guest's times of its command buffers (`guest_times.rs`).
 mod guest_times;
+/// A command buffer's thread carries out the creates and destroys it waits for (`help.rs`).
+mod help;
 /// A fuzz of ring 0's lanes (`lanes_fuzz.rs`).
 mod lanes_fuzz;
 /// The wire round trip with a fake peer (`peer.rs`).

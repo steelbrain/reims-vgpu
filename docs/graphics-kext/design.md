@@ -2156,6 +2156,28 @@ queue, and take 49 to 123 us now, as beside none
 (`a_burst_beside_waiting_queues`, release build, M3 Max under other builds'
 load).
 
+A queue's thread that waits so for its context's lane carries out the lane's
+next job itself where no thread of the lane's carries one out yet, the buffer
+waits for it, and it is a `BUFFER_AT_OFFSET` or an `OBJECT_DESTROY` of no queue:
+the creates and destroys the bundle holds and posts ahead of each commit
+("Destroys and creates no one waits for go together"). The job is the lane's
+running one meanwhile, so the lane still carries its jobs out one at a time in
+ring order, and the lane's thread waits for it before its next. The buffer
+waits for the same messages as before, carried out through the same host code
+before its begin; only the thread that carries them out changes, and the
+buffer's wait ends with neither a ring-0 thread's wake before the job nor its
+own after it. A queue's destroy routes the queue's doorbell and ends a queue's
+thread, and the other kinds may wait long or for a queue's command buffers, so
+each stays with the lane's thread. Measured before the change in Geekbench
+7.1's Super Resolution on the Radeon 780M (a macOS 26.7.2 guest): 4172 of 6823
+command buffers waited so, 62.6 us at the median and 190 us at the 90th
+percentile from the take to the host's begin, 12 and 38.5 us of it the queue's
+thread's wake after the lane's last job; 96% of them waited only for those two
+kinds. Tested by `a_buffer_s_thread_carries_out_the_creates_and_destroys_it_waits_for`,
+`a_buffer_s_thread_leaves_other_kinds_to_the_lane_s_thread`,
+`only_a_buffer_at_offset_and_a_destroy_of_no_queue_are_a_buffer_s_thread_s` and
+`buffers_wait_for_their_context_s_messages_over_random_interleavings`.
+
 **The surface and ICB workers.** A lane hands what it would wait long for, and
 the guest learns of only through an answer or a later message, to a worker of
 the host's: a `SURFACE_PAGES`, whose view of a 3840x2400 layer took 9000

@@ -120,6 +120,16 @@
 //! WindowServer probe (car 12's B1, msi RTX 5080 host; measured). A thread is never refused to a
 //! lane with a job, so the waits still end.
 //!
+//! **A command buffer's thread.** A queue's thread that waits at the gate for its context's lane
+//! carries out the lane's front job itself where the lane carries none out ([`Lanes::help`]): one
+//! the buffer waits for, ready, and of a kind the device lets it take (a `BUFFER_AT_OFFSET`, or an
+//! `OBJECT_DESTROY` of no queue). The job is the lane's running one meanwhile, so the lane's
+//! thread waits for it before its next, as for its own: the lane still carries its jobs out one
+//! at a time in the order they were handed, and every wait for the lane sees it as before. A
+//! thread was woken for the lane all the same; it finds the job begun or gone, and goes on or
+//! leaves the lane. So the buffer's wait ends on the thread that waits, with neither the wake of a
+//! ring-0 thread before the job nor its own wake after it.
+//!
 //! **A reset** drops every job not yet begun ([`Lanes::reset`]); one begun carries on, and the
 //! control thread tells the host of the reset only once it has ended ([`Lanes::wait_begun`]).
 
@@ -319,6 +329,9 @@ struct State {
     /// How many times a blocked lane was woken (the tests).
     #[cfg(test)]
     woken: u64,
+    /// Ring 0's threads take no job while set ([`Lanes::hold_threads`], the tests).
+    #[cfg(test)]
+    held: bool,
 }
 
 impl State {
@@ -326,6 +339,25 @@ impl State {
     /// before the last reset, which drops it.
     fn ready(&self, job: &Job) -> bool {
         job.epoch != self.epoch || job.after.iter().all(|&(k, t)| self.through(k, t))
+    }
+
+    /// Whether context `context`'s lane's front job is one a command buffer's thread that waits for
+    /// the lane through count `through` may carry out ([`Lanes::help`]).
+    fn helpable(&self, context: u32, through: u64, helps: impl Fn(&Message) -> bool) -> bool {
+        if self.ended {
+            return false;
+        }
+        let Some(lane) = self.lanes.get(&Key::Context(context)) else {
+            return false;
+        };
+        let Some((job, _)) = lane.jobs.front() else {
+            return false;
+        };
+        lane.running.is_none()
+            && job.epoch == self.epoch
+            && job.through <= through
+            && self.ready(job)
+            && helps(&job.message)
     }
 
     /// Every lane's wake.
@@ -765,11 +797,18 @@ impl Lanes {
             if state.ended {
                 return None;
             }
+            #[cfg(test)]
+            if state.held && spare.is_some() {
+                self.moved.wait(&mut state);
+                continue;
+            }
             let epoch = state.epoch;
             let lane = state.lanes.get(&key)?;
             let wake = Arc::clone(&lane.wake);
+            // A job a command buffer's thread carries out ([`Self::help`]) is the lane's running
+            // one: the next waits for it, as one job of a lane at a time.
             let ready = match lane.jobs.front() {
-                Some((job, _)) => state.ready(job),
+                Some((job, _)) => lane.running.is_none() && state.ready(job),
                 None => {
                     if let Some(lane) = state.lanes.get_mut(&key) {
                         lane.served = false;
@@ -820,12 +859,23 @@ impl Lanes {
                     }),
             };
             let done = context.map(|context| (context, state.context_done(context)));
+            // A lane a command buffer's thread emptied ([`Self::help`]) whose thread left it holds
+            // nothing: let go of it, as its thread does of a lane it empties.
+            if (state.lanes.get(&key))
+                .is_some_and(|lane| !lane.served && lane.jobs.is_empty() && lane.running.is_none())
+            {
+                state.lanes.remove(&key);
+            }
             // Only the blocked lanes this job let go: a lane waits for other lanes' jobs handed
-            // before its own, and only their carrying out moves what it waits for. A device of
-            // many processes may hold many blocked lanes while other lanes finish jobs.
+            // before its own, and for its own job a command buffer's thread carries out, and only
+            // their carrying out moves what it waits for. A device of many processes may hold many
+            // blocked lanes while other lanes finish jobs.
             let blocked: Vec<Arc<Condvar>> = (state.blocked.iter())
                 .filter_map(|k| state.lanes.get(k))
-                .filter(|lane| lane.jobs.front().is_none_or(|(job, _)| state.ready(job)))
+                .filter(|lane| {
+                    lane.running.is_none()
+                        && lane.jobs.front().is_none_or(|(job, _)| state.ready(job))
+                })
                 .map(|lane| Arc::clone(&lane.wake))
                 .collect();
             #[cfg(test)]
@@ -839,6 +889,38 @@ impl Lanes {
         }
         self.moved.notify_all();
         done
+    }
+
+    /// The front job of context `context`'s lane, for the thread of a command buffer of the
+    /// context that waits for the lane through ring 0's count `through` to carry out itself, in
+    /// place of the lane's thread (the module doc, "Threads"), and then [`Self::finished`]:
+    /// where the lane carries no job out now, the job was handed through `through` at most, at the
+    /// current reset count, is ready ([`State::ready`]) and is one `helps` takes. `None` otherwise,
+    /// and once the device ended. The lane's thread waits for it as for its own job.
+    pub(super) fn help(
+        &self,
+        context: u32,
+        through: u64,
+        helps: impl Fn(&Message) -> bool,
+    ) -> Option<Job> {
+        let mut state = self.state.lock();
+        if !state.helpable(context, through, helps) {
+            return None;
+        }
+        let lane = state.lanes.get_mut(&Key::Context(context))?;
+        let (job, note) = lane.jobs.pop_front()?;
+        lane.running = Some(note);
+        Some(job)
+    }
+
+    /// Whether [`Self::help`] would give the thread a job now.
+    pub(super) fn has_help(
+        &self,
+        context: u32,
+        through: u64,
+        helps: impl Fn(&Message) -> bool,
+    ) -> bool {
+        self.state.lock().helpable(context, through, helps)
     }
 
     /// Ring 0's thread `index`, with no lane to serve, waits for one, the threads that went idle
@@ -954,6 +1036,14 @@ impl Lanes {
         for wake in wakes {
             wake.notify_one();
         }
+        self.moved.notify_all();
+    }
+
+    /// Ring 0's threads take no job while `held`, as threads not yet woken (the tests); the jobs
+    /// stay for a command buffer's thread to take ([`Self::help`]).
+    #[cfg(test)]
+    pub(super) fn hold_threads(&self, held: bool) {
+        self.state.lock().held = held;
         self.moved.notify_all();
     }
 
