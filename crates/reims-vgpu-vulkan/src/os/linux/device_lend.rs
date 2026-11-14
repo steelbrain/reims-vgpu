@@ -14,7 +14,7 @@ use std::ptr::NonNull;
 
 use crate::core::num::ToU64 as _;
 
-use super::dma_buf::{self, Refusal, Zeros};
+use super::dma_buf::{self, Refusal};
 use super::vm;
 
 /// A dma-buf of ranges of host memory ([`dma_buf_of_host`]): the descriptor, its size, and where
@@ -67,7 +67,7 @@ pub fn dma_buf_of_host(
     let (pages, offsets) = pages_of(first, length, vm::page_size(), ranges)
         .map_err(|why| LendRefusal::Refused(why.to_owned()))?;
     let size = pages.iter().map(|&(_, length)| length).sum();
-    match dma_buf::of_ranges(&pages, &Zeros::default()) {
+    match dma_buf::of_ranges(&pages) {
         Ok(fd) => Ok(LentDmaBuf { fd, size, offsets }),
         Err(
             refusal @ Refusal::Limit {

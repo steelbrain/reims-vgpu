@@ -229,7 +229,6 @@ impl ImportView {
     /// the bytes themselves: `inner`, as it is, and nothing, as the runtime imports the bytes.
     pub(crate) fn release(
         self,
-        _original: std::ptr::NonNull<u8>,
         inner: Option<rt::Deallocator>,
     ) -> (Option<rt::Deallocator>, Option<rt::KeepAlive>) {
         (inner, None)
@@ -246,8 +245,8 @@ impl ImportMade {
 }
 
 /// The memory the runtime imports for `length` bytes at `at`: those bytes ([`ImportView`]),
-/// read-only ones too, whether a twin is asked for (`twin`, a surface's read-only alias) or not.
-pub(crate) fn import_view(at: std::ptr::NonNull<u8>, _length: u64, _twin: bool) -> ImportView {
+/// read-only ones too.
+pub(crate) fn import_view(at: std::ptr::NonNull<u8>, _length: u64) -> ImportView {
     ImportView { at }
 }
 
@@ -307,11 +306,6 @@ pub(crate) unsafe fn host_memory_vouched(
 /// Why this thread's last dma-buf source made none: never, on macOS, where imports carry none.
 pub(crate) fn dma_buf_refusal() -> Option<String> {
     None
-}
-
-/// The address whose bytes the runtime's memory at `at` shows: `at`, on macOS.
-pub(crate) fn shown_at(at: std::ptr::NonNull<u8>) -> std::ptr::NonNull<u8> {
-    at
 }
 
 /// A fresh range of `len` bytes that a view can be made of: on Mach, any allocation.

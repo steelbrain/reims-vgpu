@@ -66,8 +66,7 @@ repeats the ones code cites.
   the guest edge. A raw integer is kept only where the guest can write any
   value. There are no `pub mod x { pub const … }` integer-enum modules.
 - **Refcounts**: a type whose drop has an observable effect (a Metal object,
-  an IOSurface, a host block, a device or display handle) never implements
-  `Clone`. Another reference is taken with `.clone_ref()`, everywhere, API
+  a host block, a device or display handle) never implements `Clone`. Another reference is taken with `.clone_ref()`, everywhere, API
   types included (D6). A derive that would copy one does not compile.
 - **Order-bearing types** have an explicit `Drop` that takes their parts in
   the order the API shows (architecture 15.3). Field declaration order is

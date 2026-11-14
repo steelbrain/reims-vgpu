@@ -5,7 +5,8 @@
 //! Two kinds of entry:
 //! - **Registrations** of memory the library does not map itself: the guest's RAM, a shared
 //!   mapping of the files the host names in its memory map (the `guest_memory` lease of the
-//!   memory map's device), and the memory of IOSurface's stand-in. One registered again over the
+//!   memory map's device), and memory of the library's own (`super::vm::OwnMemory`). One
+//!   registered again over the
 //!   same descriptor and offset is counted, and goes with the last. The C API duplicates the
 //!   host's descriptors for each device it makes, so devices over the same RAM register it each
 //!   under its own: a byte resolves through the first registration that holds it, and every one
@@ -704,7 +705,7 @@ impl Registration {
 /// The guest's RAM behind `length` bytes from `first`, as the leases registered it: runs of the
 /// RAM's own host addresses, each an address and a length, in the bytes' order, neighbours that
 /// follow on joined; `None` where a byte shows no page of the guest's RAM (memory of the
-/// library's own, a file of zeros, an IOSurface stand-in's), shows nothing, or is mapped without
+/// library's own), shows nothing, or is mapped without
 /// write permission: a device pins imported pages for writing, so read-only memory keeps the
 /// imports it has (`super::import`'s module docs).
 pub(crate) fn guest_ram_runs(first: u64, length: u64) -> Option<Vec<(u64, u64)>> {
@@ -978,7 +979,7 @@ mod tests {
         );
         assert_eq!(guest_ram_runs(view + 0x4000, 0x2000), None);
         assert_eq!(guest_ram_runs(view + 0x6000, 0x1000), None);
-        // A stand-in's registration, of a file of its own, is no RAM either.
+        // The library's own memory's registration, of a file of its own, is no RAM either.
         let stand_in = Registration::new(
             base + 0x80_000,
             0x1000,

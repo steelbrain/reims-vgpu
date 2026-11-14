@@ -1,5 +1,5 @@
 //! Plain Metal value types: `MtlSize`/`Origin`/`Region`, `NsRange`, `SizeAndAlign`, `ClearColor`,
-//! `Swizzle`, `ResourceAddressRange`, `PixelFormatInfo`, `TextureLevelInfo`,
+//! `Swizzle`, `PixelFormatInfo`, `TextureLevelInfo`,
 //! `CommandBufferStatus`, and the other structs core passes by value.
 //!
 //! Widths follow the Objective-C runtime's encodings (D41): `NSUInteger` is `u64`, `float` is
@@ -243,18 +243,6 @@ pub struct VertexAmplificationViewMapping {
     pub render_target_array_index_offset: u32,
 }
 
-/// A range of host memory, laid out as Metal's `MTLResourceAddressRange` (`^{MTLAddressRange=QQ}`,
-/// D41): the ranges of the guest's pages the platform gathers into an alias of its own
-/// (`crate::gpu::backing::gather_or_nil`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-#[repr(C)]
-pub struct ResourceAddressRange {
-    /// `address` (name is ours: the host VA the range starts at).
-    pub address: u64,
-    /// `length` (name is ours: the range's length in bytes).
-    pub length: u64,
-}
-
 /// `MTLPixelFormatInfo`: what `MTLPixelFormatGetInfoForDevice` returns (0x38 bytes; names are
 /// Metal's metadata's). From +0x18 Metal has a union, and these are its compressed form's names;
 /// copies the four words at +0x18 whole as a plane, so all four are kept raw. They are a block's
@@ -441,7 +429,6 @@ nil_default_is_default!(
     MtlScissorRect,
     MtlSamplePosition,
     VertexAmplificationViewMapping,
-    ResourceAddressRange,
     PixelFormatInfo,
     TextureLevelInfo,
     CommandBufferStatus,
@@ -459,7 +446,6 @@ const _: () = assert!(size_of::<MtlViewport>() == 48);
 const _: () = assert!(size_of::<MtlScissorRect>() == 32);
 const _: () = assert!(size_of::<MtlSamplePosition>() == 8);
 const _: () = assert!(size_of::<VertexAmplificationViewMapping>() == 8);
-const _: () = assert!(size_of::<ResourceAddressRange>() == 16);
 const _: () = assert!(size_of::<TextureLevelInfo>() == 0x68);
 const _: () = assert!(std::mem::offset_of!(TextureLevelInfo, aligned_height) == 0x38);
 const _: () = assert!(std::mem::offset_of!(TextureLevelInfo, bytes_per_pixel) == 0x48);

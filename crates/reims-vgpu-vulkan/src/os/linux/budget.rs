@@ -3,29 +3,26 @@
 //! A view of scattered guest pages is a mapping per run of them ([`super::vm`]), and the kernel
 //! refuses any map past `vm.max_map_count` mappings in the process: past that, not only views
 //! fail but every map the process makes, QEMU's, the C library's and the GPU driver's among them.
-//! So the views stop short of the limit: a view, a range a view can be made of, an import's
-//! writable twin or an IOSurface stand-in's memory that would take the mappings the library holds
-//! past `vm.max_map_count - RESERVE` is refused before anything is mapped ([`admit`]), and the
-//! mappings the rest of the process makes are never refused for the views' sake. macOS has no
-//! such limit, so no answer of Metal's fits exactly: the call answers as it does on the Metal
-//! platform when memory runs out, a remap or a range `KERN_NO_SPACE`, a stand-in no memory, a
-//! twin none (so the runtime refuses its import as it refuses read-only pages), counted and
+//! So the views stop short of the limit: a view, a range a view can be made of or memory of the
+//! library's own that would take the mappings the library holds past
+//! `vm.max_map_count - RESERVE` is refused before anything is mapped ([`admit`]), and the mappings
+//! the rest of the process makes are never refused for the views' sake. macOS has no such limit,
+//! so no answer of Metal's fits exactly: the call answers as it does on the Metal platform when
+//! memory runs out, a remap or a range `KERN_NO_SPACE`, the library's own memory none, counted and
 //! logged (`crate::answer::out_of_host_memory`), and in strict mode (`REIMS_VGPU_STRICT=1`) it
 //! ends the process, naming what it would have mapped, the mappings and the limit.
 //!
 //! The mappings the library holds are counted exactly where it makes them: the backing table's
-//! runs, each protect or unmap that cuts one included ([`super::files::mappings`]), the import
-//! twins' pieces ([`super::import`]) and the stand-ins' memory ([`super::vm::OwnMemory`]). What it
-//! does not count is the reserve's to cover ([`RESERVE`]).
+//! runs, each protect or unmap that cuts one included ([`super::files::mappings`]), and its own
+//! memory ([`super::vm::OwnMemory`]). What it does not count is the reserve's to cover
+//! ([`RESERVE`]).
 //!
 //! Where the library has another way than mappings of its own, it takes it short of the budget,
-//! [`HEADROOM`] below it ([`claim`], [`Reach::ShortOfHeadroom`]): a view a device would need from
-//! its files goes through dma-bufs instead, and a no-copy buffer's or heap's import of such a
-//! view's pages, or of read-only pages with no twin, is refused at the runtime's gate, the buffer
-//! or heap made over a copy (`super::vm`'s module docs, "Imports of views").
-//! What has no other way has the headroom to itself: a view through dma-bufs, a range, a
-//! stand-in, and a twin where no device needs imported pages mapped from their files
-//! ([`Reach::Whole`]).
+//! [`HEADROOM`] below it ([`claim`]): a view a device would need from its files goes through
+//! dma-bufs instead, and a no-copy buffer's or heap's import of such a view's pages is refused at
+//! the runtime's gate, the buffer or heap made over a copy (`super::vm`'s module docs, "Imports
+//! of views"). What has no other way has the headroom to itself: a view through dma-bufs, a range
+//! and the library's own memory.
 //!
 //! What would pass the budget first folds the views' runs mapped from their files that no import
 //! a device may pin holds back into dma-bufs (`super::vm::fold_idle`), a mapping per 4 MiB of
@@ -95,10 +92,8 @@ pub(super) const RESERVE: u64 = 16_384;
 /// The mappings kept below the budget for what has no way but mappings of its own, where the
 /// library chooses a view's or an import's mappings ([`claim`]): views through dma-bufs, each a
 /// mapping per 4 MiB of scattered pages at udmabuf's stock `list_limit` and one at each end
-/// (`super::vm`'s `map_through`), the ranges views are made of, IOSurface stand-ins' memory, and
-/// twins where no device needs imported pages mapped from their files ([`Reach::Whole`]). A
-/// margin,
-/// as [`RESERVE`] is, sized from the views it is for: views through dma-bufs of all of a 16 GiB
+/// (`super::vm`'s `map_through`), the ranges views are made of, and the library's own memory. A
+/// margin, as [`RESERVE`] is, sized from the views it is for: views through dma-bufs of all of a 16 GiB
 /// guest's pages take 4,096 mappings and two for each view, and the
 /// views held at the 3840 × 2160 death (RTX 5080 Laptop, 16 GiB guest, 2026-10-27), 391 surfaces
 /// over 3.9 GiB, would take about 1,800 through dma-bufs. Claims made at once are weighed together
@@ -167,44 +162,29 @@ fn budget(limit: u64) -> u64 {
     limit.saturating_sub(RESERVE)
 }
 
-/// The import twins' mappings.
-static TWIN_MAPPINGS: AtomicU64 = AtomicU64::new(0);
-
 /// The mappings claimed ([`claim`]) and not yet counted where they are made.
 static CLAIMED: AtomicU64 = AtomicU64::new(0);
 
-/// The IOSurface stand-ins' mappings of their own memory.
+/// The mappings of the library's own memory ([`super::vm::OwnMemory`]).
 static OWN_MAPPINGS: AtomicU64 = AtomicU64::new(0);
 
-/// Counts `count` more import twin mappings, or fewer.
-pub(super) fn twins_hold(count: u64, holding: bool) {
-    count_on(&TWIN_MAPPINGS, count, holding);
-}
-
-/// Counts `count` more stand-in mappings, or fewer.
+/// Counts `count` more mappings of the library's own memory, or fewer.
 pub(super) fn own_hold(count: u64, holding: bool) {
-    count_on(&OWN_MAPPINGS, count, holding);
-}
-
-/// Adds `count` to `counter` while `holding`, else takes it away.
-fn count_on(counter: &AtomicU64, count: u64, holding: bool) {
     if holding {
-        counter.fetch_add(count, Ordering::Relaxed);
+        OWN_MAPPINGS.fetch_add(count, Ordering::Relaxed);
     } else {
-        counter.fetch_sub(count, Ordering::Relaxed);
+        OWN_MAPPINGS.fetch_sub(count, Ordering::Relaxed);
     }
 }
 
 /// The mappings the library's views hold now (module docs).
 pub(super) fn held() -> u64 {
-    files::mappings()
-        .saturating_add(TWIN_MAPPINGS.load(Ordering::Relaxed))
-        .saturating_add(OWN_MAPPINGS.load(Ordering::Relaxed))
+    files::mappings().saturating_add(OWN_MAPPINGS.load(Ordering::Relaxed))
 }
 
 /// The mappings the views may still take, now: short of the headroom where a device of the
 /// process needs imported pages mapped from their files, past which a view is mapped through
-/// dma-bufs, which such a device cannot import ([`claim`], [`Reach::ShortOfHeadroom`]); else short
+/// dma-bufs, which such a device cannot import ([`claim`]); else short
 /// of the budget, past which a view is refused ([`admit`]). Less the mappings held and claimed,
 /// at the limit as last read.
 pub(super) fn room() -> u64 {
@@ -245,31 +225,16 @@ impl Drop for Claim {
     }
 }
 
-/// How far into the budget a [`claim`] may reach.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Reach {
-    /// Short of it by [`HEADROOM`]: for what has another way than mappings of its own, which it
-    /// takes past that (module docs).
-    ShortOfHeadroom,
-    /// All of it, the headroom included: for what has no other way, an import's twin where no
-    /// device needs imported pages mapped from their files (`super::import`'s `twin`).
-    Whole,
-}
-
-/// Claims `adding` mappings, where they fit as far into the budget as `reach` lets them with
-/// those held and claimed, at the limit read again where they would not as last read; `None`
-/// where they do not, and the caller takes its other way, or refuses. Claims made at once are
-/// weighed together: each counts itself before it weighs, so the last of them to weigh sees the
-/// others, and a claim never lets two pass that do not fit together.
-pub(super) fn claim(adding: u64, reach: Reach) -> Option<Claim> {
+/// Claims `adding` mappings, where they fit short of the budget by [`HEADROOM`] with those held
+/// and claimed, at the limit read again where they would not as last read; `None` where they do
+/// not, and the caller takes its other way (module docs). Claims made at once are weighed
+/// together: each counts itself before it weighs, so the last of them to weigh sees the others,
+/// and a claim never lets two pass that do not fit together.
+pub(super) fn claim(adding: u64) -> Option<Claim> {
     // Acquire: a claim given back before this one counts sees the mappings it was counted as.
     CLAIMED.fetch_add(adding, Ordering::AcqRel);
     let claim = Claim(adding);
-    let kept = match reach {
-        Reach::ShortOfHeadroom => HEADROOM,
-        Reach::Whole => 0,
-    };
-    weigh(0, kept).is_ok().then_some(claim)
+    weigh(0, HEADROOM).is_ok().then_some(claim)
 }
 
 /// Whether `what` may add up to `adding` mappings: not where the views would pass the budget with
@@ -391,9 +356,9 @@ fn short(what: &str, kept: u64, level: log::Level) {
 #[cfg(test)]
 mod tests {
     use crate::core::num::ToU64 as _;
-    use crate::core::platform::os::vm::{HostAddr, HostVm as _, VmProt};
+    use crate::core::platform::os::vm::{HostAddr, HostVm as _};
 
-    use super::super::{LinuxVm, import, vm};
+    use super::super::{LinuxVm, vm};
     use super::*;
 
     const PAGE: u64 = 0x1000;
@@ -449,41 +414,24 @@ mod tests {
         assert!(v.deallocate(src, 64 * PAGE).is_success());
     }
 
-    /// In strict mode, a range a view can be made of, an import's twin and an IOSurface stand-in's
-    /// memory end the process past the budget too; with room, the twin is made
+    /// In strict mode, a range a view can be made of and the library's own memory end the process
+    /// past the budget too
     #[test]
-    fn ranges_twins_and_stand_ins_past_the_budget_die() {
-        let v = LinuxVm::new();
-        let at = vm::allocate_aliasable(2 * PAGE).unwrap();
-        assert!(v.protect_max(at, 2 * PAGE, VmProt::READ).is_ok());
-        let p = std::ptr::NonNull::new(at.as_ptr::<u8>()).unwrap();
-        {
-            let _limit = Limit::room(0);
-            assert!(dies_at_the_budget(|| vm::allocate_aliasable(PAGE)));
-            assert!(dies_at_the_budget(|| import::import_view(p, PAGE, true)));
-            assert!(dies_at_the_budget(|| vm::OwnMemory::new(PAGE)));
-        }
-        assert_ne!(
-            import::import_view(p, PAGE, true).at(),
-            p,
-            "a twin with room"
-        );
-        assert!(v.deallocate(at, 2 * PAGE).is_success());
+    fn ranges_and_own_memory_past_the_budget_die() {
+        let _limit = Limit::room(0);
+        assert!(dies_at_the_budget(|| vm::allocate_aliasable(PAGE)));
+        assert!(dies_at_the_budget(|| vm::OwnMemory::new(PAGE)));
     }
 
     /// By default, past the budget, a view of guest pages and a range a view can be made of
-    /// answer `KERN_NO_SPACE` with nothing mapped, a stand-in's memory none, and an import's
-    /// twin none, its pages given as they are, each counted, as Mach's and IOSurface's calls
-    /// answer when memory runs out
+    /// answer `KERN_NO_SPACE` with nothing mapped, and the library's own memory none, each
+    /// counted, as Mach's calls answer when memory runs out
     #[test]
     fn past_the_budget_answers_as_memory_runs_out_by_default() {
         use crate::core::platform::os::vm::KernReturn;
         let v = LinuxVm::new();
         let src = vm::allocate_aliasable(64 * PAGE).unwrap();
         let at = v.allocate_anywhere(64 * PAGE).unwrap();
-        let ro = vm::allocate_aliasable(PAGE).unwrap();
-        assert!(v.protect_max(ro, PAGE, VmProt::READ).is_ok());
-        let p = std::ptr::NonNull::new(ro.as_ptr::<u8>()).unwrap();
         let page = |base: HostAddr, i: u64| base.wrapping_add(i * PAGE);
         let before = crate::answer::out_of_host_memory_count();
         let limit = Limit::room(8);
@@ -505,13 +453,11 @@ mod tests {
             crate::answer::relaxed(|| {
                 assert_eq!(vm::allocate_aliasable(PAGE).err(), Some(KernReturn(3)));
                 assert!(vm::OwnMemory::new(PAGE).is_none());
-                assert_eq!(import::import_view(p, PAGE, true).at(), p, "no twin");
             });
         }
-        assert_eq!(crate::answer::out_of_host_memory_count(), before + 4);
+        assert_eq!(crate::answer::out_of_host_memory_count(), before + 3);
         assert!(v.deallocate(at, 64 * PAGE).is_success());
         assert!(v.deallocate(src, 64 * PAGE).is_success());
-        assert!(v.deallocate(ro, PAGE).is_success());
     }
 
     /// The death names what would be mapped, the mappings, the limit, the reserve and a setting
@@ -574,15 +520,15 @@ mod tests {
         assert!(v.deallocate(src, n * PAGE).is_success());
     }
 
-    /// A claim for what has another way stops the headroom short of the budget; one for what has
-    /// none reaches into the headroom, and neither past the budget
+    /// A claim stops the headroom short of the budget, which what has no other way takes
+    /// ([`admit`])
     #[test]
-    fn only_what_has_no_other_way_claims_the_headroom() {
+    fn a_claim_stops_the_headroom_short_of_the_budget() {
         let _limit = Limit::room(HEADROOM + 10);
-        assert!(claim(11, Reach::ShortOfHeadroom).is_none());
-        assert!(claim(10, Reach::ShortOfHeadroom).is_some());
-        assert!(claim(HEADROOM + 10, Reach::Whole).is_some());
-        assert!(claim(HEADROOM + 11, Reach::Whole).is_none());
+        assert!(claim(11).is_none());
+        assert!(claim(10).is_some());
+        assert!(weigh(HEADROOM + 10, 0).is_ok());
+        assert!(weigh(HEADROOM + 11, 0).is_err());
     }
 
     /// The budget is the limit less the reserve, and none where the limit does not read

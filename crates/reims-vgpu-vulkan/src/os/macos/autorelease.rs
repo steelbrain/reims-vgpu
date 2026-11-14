@@ -1,5 +1,5 @@
 //! The Objective-C runtime's autorelease pool, which core's `rt::pool::Pool` pushes and pops
-//! around each unit of work (D22): what MoltenVK, IOSurface and Foundation autorelease inside one
+//! around each unit of work (D22): what MoltenVK and Foundation autorelease inside one
 //! is freed at its end. Core's own values never go to it: those a release point holds are in
 //! core's holders (`rt::held`).
 

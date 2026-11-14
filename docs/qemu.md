@@ -464,9 +464,8 @@ through dma-bufs"). How the GPU then takes those pages depends on its driver:
   - Views are mapped from their files while they fit 8,192 mappings short of
     the budget (`budget.rs`, `HEADROOM`), and through dma-bufs past that. Any
     other import of a view's pages (a no-copy buffer's or a heap's) maps
-    them from their files while they fit short of those 8,192 mappings too,
-    as does the writable twin an import of read-only pages needs. Past that
-    line the library's import gate refuses the pages, and
+    them from their files while they fit short of those 8,192 mappings too.
+    Past that line the library's import gate refuses the pages, and
     the runtime makes the object over a copy of them, which takes no mapping
     (metal2vulkan's `HostMemory::with_import_gate`, announced
     `copied-host-pages`; with `REIMS_VGPU_STRICT=1` it ends the process),
@@ -500,8 +499,8 @@ through dma-bufs"). How the GPU then takes those pages depends on its driver:
   the same way and is tried once more.
 - **What is refused for want of mappings** answers as the same call does on
   Metal when memory runs out: a remap of guest pages, or a range
-  a view is made of, answers `KERN_NO_SPACE` with nothing mapped, and an
-  import's twin is none. Each is counted and
+  a view is made of, answers `KERN_NO_SPACE` with nothing mapped, and the
+  library's own memory none. Each is counted and
   logged at the first and at each power of two, those after the first at
   debug (docs/conventions.md). With `REIMS_VGPU_STRICT=1` each ends the
   process at the call, naming the numbers.
@@ -533,8 +532,7 @@ What gets logged:
 - Each buffer or heap copied for want of mappings is counted with
   its bytes, logged at the first and at each power of two (after the first
   at debug), and written to
-  the trace (`nrcopy` for pages left in dma-bufs, `notwin` for read-only
-  pages with no twin: first byte, length, mappings it would have taken).
+  the trace (`nrcopy`: first byte, length, mappings it would have taken).
 - On a device that needs pages mapped from their files but takes no host
   memory by its pointer, an information line, once, that the guest's RAM is
   not used whole.

@@ -11,9 +11,8 @@
 //! - **`allocate_anywhere`** is private anonymous memory (`MAP_NORESERVE`), zero-filled and in no
 //!   file, so no view can be made of it: it serves reservations and the address space views are
 //!   mapped over. A range a view must be made of comes from [`allocate_aliasable`], a shared
-//!   mapping of a file of its own (core's `HostVm::allocate_aliasable`): an alias whose zeros past
-//!   the guest's pages the runtime imports with them (`crate::gpu::backing::gather_or_nil`), as a
-//!   dma-buf takes file pages alone, is one, and so is the tests' stand-in for guest memory.
+//!   mapping of a file of its own (core's `HostVm::allocate_aliasable`), as a dma-buf takes file
+//!   pages alone: the tests' stand-in for guest memory is one.
 //! - **`remap_shared_overwrite`** fails with `KERN_INVALID_ADDRESS` where a byte of the source
 //!   has no file behind it, as Mach fails for an unmapped source, before it maps anything. A
 //!   piece the kernel refuses fails the call with nothing changed, as Mach's remap is all or
@@ -34,9 +33,9 @@
 //!
 //! **Mappings.** A run of a view mapped from its file is a VMA, so such a view of scattered pages
 //! costs one per run. The views share a budget short of `vm.max_map_count` ([`super::budget`]): a
-//! remap, a range a view can be made of or a stand-in's memory that would pass it is refused
-//! before anything is mapped, so the rest of the process keeps its mappings: a remap or a range
-//! answers `KERN_NO_SPACE` and a stand-in no memory, as Mach's and IOSurface's calls answer when
+//! remap, a range a view can be made of or memory of the library's own that would pass it is
+//! refused before anything is mapped, so the rest of the process keeps its mappings: a remap or a
+//! range answers `KERN_NO_SPACE` and the library's own memory none, as Mach's calls answer when
 //! memory runs out, which core answers as Metal does then (`crate::answer::out_of_host_memory`,
 //! counted; in strict mode a death).
 //!
@@ -65,7 +64,7 @@
 //! million VMAs, about 4 GiB of the guest's pages, each page in about one view, within 190 s of a
 //! drag, a resize and Safari's scroll, and passed the budget of a `vm.max_map_count` of 1,048,576.
 //! So a view of more than one run of file pages made at once (`remap_runs_shared_overwrite`, which
-//! core's memory map, the surface stand-in and the platform's aliases make their views with) is
+//! core's memory map makes its views with) is
 //! mapped as dma-bufs of those pages instead, made by udmabuf (`UDMABUF_CREATE_LIST`, in any order)
 //! within its limits, one after another, each one VMA ([`super::dma_buf::of_view`]): at udmabuf's
 //! stock `list_limit` of 1,024 a view of scattered pages takes a VMA per 4 MiB. Such a mapping
@@ -277,17 +276,6 @@ fn fold_short() {
     fold_idle();
     SHORT_FOLDED[0].store(files::mappings(), Relaxed);
     SHORT_FOLDED[1].store(unpinned, Relaxed);
-}
-
-/// Claims `adding` mappings short of the headroom of the views' budget for a gated import's twin
-/// (`super::import`'s `twin`), the views no import holds folded first where the budget refuses and
-/// a fold may free something ([`fold_short_due`]).
-pub(super) fn claim_short(adding: u64) -> Option<budget::Claim> {
-    let reach = budget::Reach::ShortOfHeadroom;
-    budget::claim(adding, reach).or_else(|| {
-        fold_short_due().then(fold_short)?;
-        budget::claim(adding, reach)
-    })
 }
 
 thread_local! {
@@ -566,7 +554,8 @@ pub(crate) fn allocate_aliasable(len: u64) -> Result<HostAddr, KernReturn> {
 
 /// Memory of the library's own that a view can be made of and that only its holder frees: a
 /// shared mapping of a new file, read and write, registered in the backing table
-/// ([`files::Registration`]), so that `deallocate` refuses it. An IOSurface stand-in's memory.
+/// ([`files::Registration`]), so that `deallocate` refuses it: a graphics device's region
+/// ([`RegionMemory`]).
 #[derive(Debug)]
 pub(crate) struct OwnMemory {
     first: u64,
@@ -576,15 +565,15 @@ pub(crate) struct OwnMemory {
 
 impl OwnMemory {
     /// `len` bytes, rounded up to whole pages, of zeros; `None` for none, or where the host
-    /// gives no file, no address space or no mapping within the views' budget, as an IOSurface's
-    /// creation answers nil when memory runs out.
+    /// gives no file, no address space or no mapping within the views' budget, as when memory runs
+    /// out.
     pub(crate) fn new(len: u64) -> Option<OwnMemory> {
         let (_, length) = pages(HostAddr::NULL, len)?;
         if length == 0 {
             return None;
         }
         let (first, backing) = reclaiming(|| {
-            if !budget::admit(1, "an IOSurface stand-in's memory") {
+            if !budget::admit(1, "memory of the library's own") {
                 return None;
             }
             let backing = Backing {
@@ -712,7 +701,7 @@ fn no_file(call: &'static str, length: u64, error: std::io::Error) -> std::io::E
     crate::answer::out_of_host_memory(call, || {
         format!(
             "the kernel gave no file of {length:#x} bytes for the library's memory ({error}); \
-             the open-file limit is {limit}; IOSurface's and Mach's calls need no file on macOS"
+             the open-file limit is {limit}; Mach's calls need no file on macOS"
         )
     });
     error
@@ -724,8 +713,8 @@ fn no_file(call: &'static str, length: u64, error: std::io::Error) -> std::io::E
 /// piece is mapped), and fresh zeros with no access over bytes of no file.
 ///
 /// Bytes of no file in a remap's target are a reservation: a mapping task's, which has no access,
-/// or a fresh range its caller frees after the failure (core's range mappings, an alias, a
-/// surface's view), so the protection of those zeros never shows. No import of the runtime's
+/// or a fresh range its caller frees after the failure (core's range mappings, a surface's
+/// view), so the protection of those zeros never shows. No import of the runtime's
 /// lies over them, as the runtime imports no page without read access and nothing imports a
 /// fresh range before its remaps succeed, so putting zeros there is reported to no one
 /// ([`crate::remap`]); the table's files are mapped back as they were, the same pages. A
@@ -795,7 +784,7 @@ fn map_view(target: u64, pieces: Vec<files::Piece>) -> Result<(), KernReturn> {
     let adding = mappings_added(&pieces);
     // Held until the pieces are recorded, which counts them.
     let claim = super::import::imports_need_files()
-        .then(|| budget::claim(adding, budget::Reach::ShortOfHeadroom))
+        .then(|| budget::claim(adding))
         .flatten();
     if pieces.len() > 1 && claim.is_none() {
         match super::dma_buf::of_view(&pieces) {
@@ -971,8 +960,7 @@ fn unfold_once(first: u64, end: u64) -> Result<(), u64> {
     // Held until the pieces are recorded, which counts them. An import folds the views no import
     // holds first, its own pages among those held (module docs), where a fold may free something
     // since the last ([`fold_short`]).
-    let reach = budget::Reach::ShortOfHeadroom;
-    let mut claim = budget::claim(adding, reach);
+    let mut claim = budget::claim(adding);
     if claim.is_none() && fold_short_due() {
         drop(held);
         fold_short();
@@ -982,7 +970,7 @@ fn unfold_once(first: u64, end: u64) -> Result<(), u64> {
             return Ok(());
         }
         adding = mappings_added(&pieces);
-        claim = budget::claim(adding, reach);
+        claim = budget::claim(adding);
     }
     let Some(_claim) = claim else {
         return Err(adding);
@@ -1660,8 +1648,8 @@ pub(crate) mod tests {
     }
 
     /// Where the kernel gives no file, a range a view can be made of answers `KERN_NO_SPACE` and
-    /// a stand-in's memory none, as Mach's and IOSurface's calls do when memory runs out,
-    /// counted; in strict mode the process ends at the call that made no file
+    /// the library's own memory none, as Mach's calls do when memory runs out, counted; in strict
+    /// mode the process ends at the call that made no file
     #[test]
     fn no_file_answers_as_memory_runs_out() {
         use crate::core::testkit::capture::catch_death;
@@ -1673,11 +1661,10 @@ pub(crate) mod tests {
             Err((DeathKind::Abort, "memfd_create"))
         );
         let before = crate::answer::out_of_host_memory_count();
-        let (range, stand_in) =
-            crate::answer::relaxed(|| (allocate_aliasable(p), OwnMemory::new(p)));
+        let (range, own) = crate::answer::relaxed(|| (allocate_aliasable(p), OwnMemory::new(p)));
         TEST_NO_FILE.with(|t| t.set(false));
         assert_eq!(range, Err(NO_SPACE));
-        assert!(stand_in.is_none());
+        assert!(own.is_none());
         assert_eq!(crate::answer::out_of_host_memory_count(), before + 2);
         let at = allocate_aliasable(p).unwrap();
         assert!(vm().deallocate(at, p).is_success());

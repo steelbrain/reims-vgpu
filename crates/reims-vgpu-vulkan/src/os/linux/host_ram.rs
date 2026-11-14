@@ -34,8 +34,8 @@
 //!
 //! - **What is handed.** Each lease's ranges of the guest's RAM (`super::files`'s
 //!   `lease_guest_memory`): the host's own shared mappings of the files it named, writable, mapped
-//!   while the lease lives. Nothing else: read-only memory, files of zeros, twins and the library's
-//!   own memory answer no runs, and keep the imports they have.
+//!   while the lease lives. Nothing else: read-only memory and the library's own memory answer no
+//!   runs, and keep the imports they have.
 //! - **To whom.** Every device whose imports of views were learned (`super::import`'s
 //!   `learn_view_imports`), as each is learned ([`hand_ram_to`]) and as each lease is made
 //!   ([`lease`]): a device made after a lease gets its RAM then, and a lease made after the device
@@ -193,12 +193,11 @@ fn dma_bufs_of_runs() -> Option<rt::DmaBufRunsSource> {
     if !super::dma_buf::opens() {
         return None;
     }
-    let zeros = super::dma_buf::Zeros::default();
     Some(Arc::new(move |requests: &[rt::DmaBufRequest]| {
         let ranges: Vec<(u64, u64)> = (requests.iter())
             .map(|r| (r.start.as_ptr().addr().to_u64(), r.length))
             .collect();
-        ram_dma_buf_of_runs(&ranges, &zeros)
+        ram_dma_buf_of_runs(&ranges)
     }))
 }
 
@@ -206,14 +205,10 @@ fn dma_bufs_of_runs() -> Option<rt::DmaBufRunsSource> {
 /// address and a length, whole pages by address and apart: those pages one after another,
 /// resolved through the backing table (`super::dma_buf::of_ranges`). A refusal (a page the table
 /// resolves to no file, a limit, udmabuf's own) answers an error, which leaves the copy to what it
-/// takes without the source. The RAM's pages are never the block of zeros', so `zeros` stays
-/// empty.
-fn ram_dma_buf_of_runs(
-    ranges: &[(u64, u64)],
-    zeros: &super::dma_buf::Zeros,
-) -> std::io::Result<rt::DmaBufChunk> {
+/// takes without the source.
+fn ram_dma_buf_of_runs(ranges: &[(u64, u64)]) -> std::io::Result<rt::DmaBufChunk> {
     let length = ranges.iter().map(|&(_, n)| n).sum();
-    match super::dma_buf::of_ranges(ranges, zeros) {
+    match super::dma_buf::of_ranges(ranges) {
         Ok(fd) => Ok(rt::DmaBufChunk {
             file: Arc::new(fd),
             offset: 0,
@@ -236,10 +231,9 @@ fn dma_bufs() -> Option<rt::DmaBufSource> {
     if !super::dma_buf::opens() {
         return None;
     }
-    let zeros = super::dma_buf::Zeros::default();
     Some(Arc::new(move |request: rt::DmaBufRequest| {
         let first = request.start.as_ptr().addr().to_u64();
-        ram_dma_bufs(first, request.length, request.granule, &zeros)
+        ram_dma_bufs(first, request.length, request.granule)
     }))
 }
 
@@ -247,15 +241,9 @@ fn dma_bufs() -> Option<rt::DmaBufSource> {
 /// host addresses, at `granule`: those pages resolved through the backing table and cut within
 /// udmabuf's limits at multiples of `granule` from `first` (`super::dma_buf::of_pages`), as a
 /// no-copy import's source makes them. A refusal (pages the table resolves to no file, a limit,
-/// udmabuf's own) answers an error, which leaves the chunk to its pointer. The RAM's pages are its
-/// files' and never the block of zeros', so `zeros`, the source's files of zeros, stays empty.
-fn ram_dma_bufs(
-    first: u64,
-    length: u64,
-    granule: u64,
-    zeros: &super::dma_buf::Zeros,
-) -> std::io::Result<Vec<rt::DmaBufChunk>> {
-    super::dma_buf::of_pages(first, length, granule, zeros).map_err(|refusal| {
+/// udmabuf's own) answers an error, which leaves the chunk to its pointer.
+fn ram_dma_bufs(first: u64, length: u64, granule: u64) -> std::io::Result<Vec<rt::DmaBufChunk>> {
+    super::dma_buf::of_pages(first, length, granule).map_err(|refusal| {
         log::debug!(
             target: "reims_vgpu_vulkan::os",
             "no dma-buf of the guest's RAM's {length:#x} bytes at {first:#x}: {refusal}"
@@ -1417,10 +1405,9 @@ mod tests {
                 assert_eq!(libc::munmap(mapped, chunk.length.to_usize()), 0);
             }
         };
-        let zeros = super::super::dma_buf::Zeros::default();
         let limit = super::super::dma_buf::limits().bytes;
         for (offset, bytes, granule) in [(2 * MIB, 4 * MIB, 4 * MIB), (MIB, 6 * MIB, MIB)] {
-            let chunks = super::ram_dma_bufs(at + offset, bytes, granule, &zeros).unwrap();
+            let chunks = super::ram_dma_bufs(at + offset, bytes, granule).unwrap();
             let mut ends = 0;
             for chunk in &chunks {
                 assert!(
@@ -1436,7 +1423,7 @@ mod tests {
             }
             assert_eq!(ends, bytes, "the request's pages, no more");
         }
-        let chunks = super::ram_dma_bufs(at + 2 * MIB, 4 * MIB, 4 * MIB, &zeros).unwrap();
+        let chunks = super::ram_dma_bufs(at + 2 * MIB, 4 * MIB, 4 * MIB).unwrap();
         assert_eq!(chunks.len(), 1);
         through(&chunks[0], &mut |bytes| {
             // SAFETY: the dma-buf's mapping, 4 MiB long.
@@ -1461,7 +1448,7 @@ mod tests {
             )
         };
         assert_ne!(anonymous, libc::MAP_FAILED);
-        let refused = super::ram_dma_bufs(anonymous.addr().to_u64(), 2 * MIB, 2 * MIB, &zeros);
+        let refused = super::ram_dma_bufs(anonymous.addr().to_u64(), 2 * MIB, 2 * MIB);
         assert!(refused.is_err());
         drop((chunks, lease));
         // SAFETY: the mappings made above, which nothing uses any more.
@@ -1523,8 +1510,7 @@ mod tests {
             ram(5 * PAGE).write_volatile(0x22);
             ram(7 * MIB + PAGE - 1).write_volatile(0x33);
         }
-        let zeros = super::super::dma_buf::Zeros::default();
-        let chunk = super::ram_dma_buf_of_runs(&runs, &zeros).unwrap();
+        let chunk = super::ram_dma_buf_of_runs(&runs).unwrap();
         assert_eq!(chunk.length, 4 * PAGE, "the runs' pages, no more");
         // SAFETY: a fresh shared mapping of the dma-buf, unmapped below.
         let mapped = unsafe {
@@ -1573,7 +1559,7 @@ mod tests {
         let mut with = vec![(anonymous.addr().to_u64(), PAGE)];
         with.extend_from_slice(&runs);
         with.sort_unstable();
-        assert!(super::ram_dma_buf_of_runs(&with, &zeros).is_err());
+        assert!(super::ram_dma_buf_of_runs(&with).is_err());
         drop((chunk, lease));
         // SAFETY: the mappings made above, which nothing uses any more.
         unsafe {

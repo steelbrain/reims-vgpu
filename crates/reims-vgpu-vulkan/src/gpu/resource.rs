@@ -810,7 +810,7 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
     /// NULL for a `Private` buffer, as Metal's.
     fn contents(&self) -> HostPtr {
         let at = |p: NonNull<u8>| HostPtr::from_ptr(p.as_ptr());
-        plain(|| self.raw.contents().map(crate::os::shown_at).map(at)).unwrap_or(HostPtr::NULL)
+        plain(|| self.raw.contents().map(at)).unwrap_or(HostPtr::NULL)
     }
 
     /// Nothing for a buffer that is not `Managed`, as Metal; for a `Managed` one, refused for a

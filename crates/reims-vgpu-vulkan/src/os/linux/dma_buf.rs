@@ -69,13 +69,6 @@
 //! What udmabuf takes besides ([`Refusal`]): memfds sealed against shrinking (`F_SEAL_SHRINK`,
 //! which QEMU's `seal=on`, its default, sets, and [`super::vm::memfd`] sets on the library's own),
 //! at page offsets. The device node is the `kvm` group's on Ubuntu.
-//!
-//! Pieces of the block of zeros read-only aliases share ([`super::import::allocate_zeros`]) are
-//! made of files of zeros of the import's own instead ([`Zeros`]), as an import's twin maps private
-//! zeros there: the GPU's writes stay in them and never reach the block. Its source answers the
-//! same pieces of the same files for every request over the same pages, as the runtime's contract
-//! asks (`rt::HostMemory::with_dma_buf`), so a texture's dma-buf over the import's pages shows
-//! what the GPU wrote there through the import's.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -87,7 +80,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use crate::core::sync::Mutex;
 use metal2vulkan_runtime::DmaBufChunk;
 
-use super::files::{self, Backing};
+use super::files;
 use super::vm;
 
 /// `UDMABUF_FLAGS_CLOEXEC`.
@@ -120,8 +113,8 @@ pub(crate) enum Refusal {
     /// The kernel refused the call otherwise (a file it takes no pages of, unsealed or not a
     /// memfd, or no memory to pin the pages).
     Kernel(io::Error),
-    /// The kernel gave no file for zeros the range takes, a pad's or the block of zeros' pieces
-    /// ([`vm::memfd`], which counts it as the host's memory running out).
+    /// The kernel gave no file for zeros the range takes, a pad's ([`vm::memfd`], which counts it
+    /// as the host's memory running out).
     NoFile(io::Error),
     /// A view would write through a dma-buf of a file the process holds open read-only, whose
     /// pages the kernel maps writable from the file for no one ([`of_view`]).
@@ -286,82 +279,27 @@ fn padded<F: Clone>(
     chunks(runs, granule, limits)
 }
 
-/// The files of zeros one import's dma-buf source answers the block of zeros' pages with
-/// ([`of_pages`]), each by the first address of the pages it holds: a page asked for again is
-/// answered by the same piece of the same file, and pages asked for the first time by a file made
-/// for them, so every request over the same pages answers the same files (module docs).
-#[derive(Debug, Default)]
-pub(crate) struct Zeros(Mutex<BTreeMap<u64, (u64, Arc<OwnedFd>)>>);
-
-impl Zeros {
-    /// The pieces of its files that answer the `length` bytes of the block of zeros at `at`, in
-    /// order, each with its length: those its files hold already, and a new file for each run of
-    /// the rest; the kernel's refusal where it gives no file for one ([`vm::memfd`]).
-    fn pieces(&self, at: u64, length: u64) -> Result<Vec<(Backing, u64)>, Refusal> {
-        let end = at.saturating_add(length);
-        let mut files = self.0.lock();
-        let held: Vec<(u64, u64, Arc<OwnedFd>)> = (files.range(..end))
-            .filter(|&(&first, &(bytes, _))| first.saturating_add(bytes) > at)
-            .map(|(&first, (bytes, fd))| (first, *bytes, Arc::clone(fd)))
-            .collect();
-        let made = |files: &mut BTreeMap<u64, (u64, Arc<OwnedFd>)>, first: u64, bytes: u64| {
-            let fd = vm::memfd(bytes).map_err(Refusal::NoFile)?;
-            files.insert(first, (bytes, Arc::clone(&fd)));
-            Ok::<_, Refusal>((Backing { fd, offset: 0 }, bytes))
-        };
-        let mut pieces = Vec::new();
-        let mut next = at;
-        for (first, bytes, fd) in held {
-            if first > next {
-                pieces.push(made(&mut files, next, first - next)?);
-            }
-            let from = first.max(next);
-            let to = first.saturating_add(bytes).min(end);
-            let offset = from - first;
-            pieces.push((Backing { fd, offset }, to - from));
-            next = to;
-        }
-        if next < end {
-            pieces.push(made(&mut files, next, end - next)?);
-        }
-        Ok(pieces)
-    }
-}
-
 /// The runs of file pages behind the `length` bytes from `first`, whole pages, each resolved
 /// through the backing table, added to `runs` in order: one for each run of a file's pages that
-/// follow on, the one before included, the block of zeros' pieces from `zeros`, the files of zeros
-/// of the import's own.
-fn add_runs(
-    runs: &mut Vec<Run<Arc<OwnedFd>>>,
-    first: u64,
-    length: u64,
-    zeros: &Zeros,
-) -> Result<(), Refusal> {
+/// follow on, the one before included.
+fn add_runs(runs: &mut Vec<Run<Arc<OwnedFd>>>, first: u64, length: u64) -> Result<(), Refusal> {
     let page = vm::page_size();
     debug_assert!(first.is_multiple_of(page) && length.is_multiple_of(page));
     let resolved = files::pieces(first, length).ok_or(Refusal::Unresolved)?;
-    let of_zeros = super::import::of_zeros(&resolved);
-    for (piece, of_zeros) in resolved.into_iter().zip(of_zeros) {
-        let backings = if of_zeros {
-            zeros.pieces(first + piece.at, piece.length)?
-        } else {
-            vec![(piece.backing, piece.length)]
-        };
-        for (backing, bytes) in backings {
-            match runs.last_mut() {
-                Some(last)
-                    if Arc::ptr_eq(&last.file, &backing.fd)
-                        && last.offset + last.length == backing.offset =>
-                {
-                    last.length += bytes;
-                }
-                _ => runs.push(Run {
-                    file: backing.fd,
-                    offset: backing.offset,
-                    length: bytes,
-                }),
+    for piece in resolved {
+        let (backing, bytes) = (piece.backing, piece.length);
+        match runs.last_mut() {
+            Some(last)
+                if Arc::ptr_eq(&last.file, &backing.fd)
+                    && last.offset + last.length == backing.offset =>
+            {
+                last.length += bytes;
             }
+            _ => runs.push(Run {
+                file: backing.fd,
+                offset: backing.offset,
+                length: bytes,
+            }),
         }
     }
     Ok(())
@@ -370,10 +308,10 @@ fn add_runs(
 /// One dma-buf of the pages of `ranges`, each a first byte and a length, whole pages in
 /// ascending order and apart, which in order are those pages (as [`add_runs`] resolves them);
 /// refused with udmabuf's limits where they are more than one dma-buf takes.
-pub(crate) fn of_ranges(ranges: &[(u64, u64)], zeros: &Zeros) -> Result<OwnedFd, Refusal> {
+pub(crate) fn of_ranges(ranges: &[(u64, u64)]) -> Result<OwnedFd, Refusal> {
     let mut runs = Vec::new();
     for &(first, length) in ranges {
-        add_runs(&mut runs, first, length, zeros)?;
+        add_runs(&mut runs, first, length)?;
     }
     let device = device()?;
     let limits = limits();
@@ -393,8 +331,7 @@ pub(crate) fn of_ranges(ranges: &[(u64, u64)], zeros: &Zeros) -> Result<OwnedFd,
 /// asks an import's source for a texture's own pages, at a granule of their length
 /// (`super::import`'s `host_memory`): refused, with udmabuf's limits named, where they are more
 /// runs of file pages, or more bytes, than one takes, and where the backing table resolves a byte
-/// to no file. It counts the runs as [`add_runs`] makes them, and makes nothing: each piece of the
-/// block of zeros counts as a run of its own, as a file of zeros of the import's own holds it.
+/// to no file. It counts the runs as [`add_runs`] makes them, and makes nothing.
 pub(crate) fn fits_one(first: u64, length: u64) -> Result<(), Refusal> {
     let page = vm::page_size();
     let start = first & !(page - 1);
@@ -414,18 +351,17 @@ pub(crate) fn fits_one_of(ranges: &[std::ops::Range<u64>]) -> Result<(), Refusal
     for range in ranges {
         let length = range.end.saturating_sub(range.start);
         let resolved = files::pieces(range.start, length).ok_or(Refusal::Unresolved)?;
-        let of_zeros = super::import::of_zeros(&resolved);
-        for (piece, of_zeros) in resolved.into_iter().zip(of_zeros) {
+        for piece in resolved {
             let follows = matches!(
                 &last,
-                Some((fd, end)) if !of_zeros && Arc::ptr_eq(fd, &piece.backing.fd)
+                Some((fd, end)) if Arc::ptr_eq(fd, &piece.backing.fd)
                     && *end == piece.backing.offset
             );
             if !follows {
                 pieces += 1;
             }
             let end = piece.backing.offset + piece.length;
-            last = (!of_zeros).then_some((piece.backing.fd, end));
+            last = Some((piece.backing.fd, end));
         }
         bytes = bytes.saturating_add(length);
     }
@@ -451,15 +387,10 @@ pub(crate) fn fits_pieces(pieces: u64, bytes: u64) -> Result<(), Refusal> {
 /// Dma-bufs of the `length` bytes from `first`, whole pages, each resolved through the backing
 /// table, which in order are those bytes ([`add_runs`]), cut into chunks within udmabuf's limits
 /// at multiples of `granule` from `first` (module docs).
-pub(crate) fn of_pages(
-    first: u64,
-    length: u64,
-    granule: u64,
-    zeros: &Zeros,
-) -> Result<Vec<DmaBufChunk>, Refusal> {
+pub(crate) fn of_pages(first: u64, length: u64, granule: u64) -> Result<Vec<DmaBufChunk>, Refusal> {
     let page = vm::page_size();
     let mut runs: Vec<Run<Arc<OwnedFd>>> = Vec::new();
-    add_runs(&mut runs, first, length, zeros)?;
+    add_runs(&mut runs, first, length)?;
     let device = device()?;
     let limits = limits();
     let granule = granule.max(page);
@@ -527,7 +458,6 @@ pub(crate) fn of_group(
     members: &[(u64, u64)],
     align: u64,
     limits: Limits,
-    zeros: &Zeros,
 ) -> Result<Group, Refusal> {
     let page = vm::page_size();
     let align = align.max(page);
@@ -558,7 +488,7 @@ pub(crate) fn of_group(
                 length: start - length,
             });
         }
-        if let Err(refusal) = add_runs(&mut member, first, bytes, zeros) {
+        if let Err(refusal) = add_runs(&mut member, first, bytes) {
             if offsets.is_empty() {
                 return Err(refusal);
             }
@@ -679,11 +609,9 @@ fn group_views_at(views: &[(u64, u64)], align: u64) -> Groups {
     let mut files = Vec::new();
     let mut members: Vec<Option<Membership>> = views.iter().map(|_| None).collect();
     let align = align.max(vm::page_size());
-    // The views hold no page of the block of zeros: the group's own files of them go with it.
-    let zeros = Zeros::default();
     let mut at = 0;
     while views.len() - at > 1 {
-        let group = match of_group(&views[at..], align, limits, &zeros) {
+        let group = match of_group(&views[at..], align, limits) {
             Ok(group) => group,
             Err(refusal) => {
                 log::debug!(
@@ -826,8 +754,7 @@ fn create(device: &OwnedFd, runs: &[Run<Arc<OwnedFd>>]) -> Result<OwnedFd, Refus
         let memfd = u32::try_from(run.file.as_raw_fd()).unwrap_or(u32::MAX);
         call.extend([u64::from(memfd), run.offset, run.length]);
     }
-    // SAFETY: the list describes open memfds the backing table and the import's zeros hold
-    // through the call; the kernel reads the header and its items.
+    // SAFETY: the list describes open memfds the backing table holds through the call; the kernel reads the header and its items.
     let made = unsafe { libc::ioctl(device.as_raw_fd(), CREATE_LIST as _, call.as_ptr()) };
     if made < 0 {
         return Err(Refusal::Kernel(io::Error::last_os_error()));
@@ -897,48 +824,6 @@ mod tests {
                 .write_volatile(byte);
             libc::munmap(at, length);
         }
-    }
-
-    /// A source's files of zeros answer pages asked for again with the same pieces of the same
-    /// files, whatever the requests' extents, and pages asked for the first time with files of
-    /// their own
-    #[test]
-    fn zero_pages_asked_again_take_the_same_pieces() {
-        let zeros = Zeros::default();
-        let shape = |pieces: &[(Backing, u64)]| -> Vec<(u64, u64)> {
-            pieces.iter().map(|(b, n)| (b.offset, *n)).collect()
-        };
-        let middle = zeros.pieces(0x3000, 0x2000).unwrap();
-        assert_eq!(shape(&middle), [(0, 0x2000)]);
-        let inside = zeros.pieces(0x4000, 0x1000).unwrap();
-        assert_eq!(shape(&inside), [(0x1000, 0x1000)]);
-        assert!(Arc::ptr_eq(&inside[0].0.fd, &middle[0].0.fd));
-        // Pages on both sides, asked for the first time, take files of their own around it.
-        let around = zeros.pieces(0x1000, 0x6000).unwrap();
-        assert_eq!(shape(&around), [(0, 0x2000), (0, 0x2000), (0, 0x2000)]);
-        assert!(Arc::ptr_eq(&around[1].0.fd, &middle[0].0.fd));
-        assert!(!Arc::ptr_eq(&around[0].0.fd, &around[2].0.fd));
-        let again = zeros.pieces(0x2000, 0x4000).unwrap();
-        assert_eq!(shape(&again), [(0x1000, 0x1000), (0, 0x2000), (0, 0x1000)]);
-        for (a, b) in again.iter().zip(&around) {
-            assert!(Arc::ptr_eq(&a.0.fd, &b.0.fd));
-        }
-        // Another import's source answers files of its own.
-        let other = Zeros::default().pieces(0x3000, 0x2000).unwrap();
-        assert!(!Arc::ptr_eq(&other[0].0.fd, &middle[0].0.fd));
-    }
-
-    /// Where the kernel gives no file for zeros, the request is refused (`Refusal::NoFile`),
-    /// counted by default and keeping nothing; the pages asked for again take a file then
-    #[test]
-    fn zero_pages_the_kernel_gives_no_file_for_are_refused() {
-        let zeros = Zeros::default();
-        vm::TEST_NO_FILE.with(|no| no.set(true));
-        let refused = crate::answer::relaxed(|| zeros.pieces(0x3000, 0x2000));
-        vm::TEST_NO_FILE.with(|no| no.set(false));
-        assert!(matches!(refused, Err(Refusal::NoFile(_))), "{refused:?}");
-        assert!(zeros.0.lock().is_empty(), "nothing kept");
-        assert_eq!(zeros.pieces(0x3000, 0x2000).unwrap().len(), 1);
     }
 
     fn run(file: u32, offset: u64, length: u64) -> Run<u32> {
@@ -1085,7 +970,7 @@ mod tests {
                     .write_volatile(0x10 + i as u8)
             };
         }
-        let chunks = of_pages(at + page, 2 * page, page, &Zeros::default()).unwrap();
+        let chunks = of_pages(at + page, 2 * page, page).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].length, 2 * page);
         assert_eq!(read_through(&chunks[0], 0), 0x11);
@@ -1099,7 +984,7 @@ mod tests {
         );
         let private = vm::anonymous(None, page, "a test's private page").unwrap();
         assert!(matches!(
-            of_pages(private, page, page, &Zeros::default()),
+            of_pages(private, page, page),
             Err(Refusal::Unresolved)
         ));
     }
@@ -1170,7 +1055,7 @@ mod tests {
             );
             assert!(host.remap_shared_overwrite(to, from, page).is_ok());
         }
-        let chunks = of_pages(view.addr().to_u64(), count * page, page, &Zeros::default()).unwrap();
+        let chunks = of_pages(view.addr().to_u64(), count * page, page).unwrap();
         assert!(chunks.len() >= 2);
         assert_eq!(chunks.iter().map(|c| c.length).sum::<u64>(), count * page);
         let mut at = 0;
@@ -1232,7 +1117,7 @@ mod tests {
         let page = vm::page_size();
         let at = marked(6);
         let members = [(at + page, 2 * page), (at + 4 * page, page), (at, page)];
-        let group = of_group(&members, page, LIMITS, &Zeros::default()).unwrap();
+        let group = of_group(&members, page, LIMITS).unwrap();
         assert_eq!(group.offsets, [0, 2 * page, 3 * page]);
         assert_eq!(group.length, 4 * page);
         let read: Vec<u8> = (0..4).map(|i| read_group(&group, i * page)).collect();
@@ -1258,7 +1143,7 @@ mod tests {
         let page = vm::page_size();
         let at = marked(3);
         let members = [(at, page), (at + page, 2 * page)];
-        let group = of_group(&members, 4 * page, LIMITS, &Zeros::default()).unwrap();
+        let group = of_group(&members, 4 * page, LIMITS).unwrap();
         assert_eq!(group.offsets, [0, 4 * page]);
         assert_eq!(group.length, 6 * page);
         assert_eq!(read_group(&group, 0), 0x40);
@@ -1290,18 +1175,12 @@ mod tests {
             &[(at, page), (large, LIMITS.bytes), (at + page, page)],
             page,
             LIMITS,
-            &Zeros::default(),
         )
         .unwrap();
         assert_eq!(group.offsets, [0], "the second is past the bytes");
         assert_eq!(group.length, page);
         assert!(matches!(
-            of_group(
-                &[(large, LIMITS.bytes + page)],
-                page,
-                LIMITS,
-                &Zeros::default()
-            ),
+            of_group(&[(large, LIMITS.bytes + page)], page, LIMITS),
             Err(Refusal::Limit { .. })
         ));
         // Three runs apart, at two runs a dma-buf.
@@ -1310,14 +1189,13 @@ mod tests {
             ..LIMITS
         };
         let apart = [(at, page), (at + 2 * page, page), (at + 3 * page, page)];
-        let group = of_group(&apart, page, two, &Zeros::default()).unwrap();
+        let group = of_group(&apart, page, two).unwrap();
         assert_eq!(group.offsets, [0, page], "the third is past the runs");
         let private = vm::anonymous(None, page, "a test's private page").unwrap();
         let group = of_group(
             &[(at, page), (private, page), (at + page, page)],
             page,
             LIMITS,
-            &Zeros::default(),
         )
         .unwrap();
         assert_eq!(
@@ -1326,12 +1204,7 @@ mod tests {
             "a member no file is behind ends the group"
         );
         assert!(matches!(
-            of_group(
-                &[(private, page), (at, page)],
-                page,
-                LIMITS,
-                &Zeros::default()
-            ),
+            of_group(&[(private, page), (at, page)], page, LIMITS),
             Err(Refusal::Unresolved)
         ));
     }

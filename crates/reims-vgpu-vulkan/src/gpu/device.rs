@@ -407,7 +407,7 @@ fn keep_unrun<D, T>(made: &RaiseResult<Option<T>>, slot: Option<Slot<D>>) {
 /// core's `HostRange` vouches for, with `run`, the runtime's form of core's deallocator: the first
 /// byte it imports (the bytes, read-only ones too, which the runtime copies,
 /// [`crate::os::import_view`]), the deallocator,
-/// which runs at Metal's moment, given the bytes' own address, and the keep-alive, which the
+/// which runs at Metal's moment, and the keep-alive, which the
 /// runtime drops once it freed its import: it holds what the view keeps of the pages
 /// ([`crate::os::ImportView::release`]), and an unmap hold on the bytes' pages, so that core's
 /// unmap of its mapping of them through the platform's VM, which its deallocator may make, waits
@@ -421,11 +421,11 @@ fn no_copy_release(
     run: Option<rt::Deallocator>,
     site: backing::ImportSite,
 ) -> NoCopyImport {
-    let view = crate::os::import_view(start, length, false);
+    let view = crate::os::import_view(start, length);
     let imported = view.at();
     let (read_only, vouched) = (view.read_only(), view.vouched());
     let made = view.made();
-    let (run, kept) = view.release(start, run);
+    let (run, kept) = view.release(run);
     let hold = crate::remap::UnmapHold::new(start, length);
     let traced = backing::ImportTrace::new(site, start, length, imported);
     NoCopyImport {
@@ -1570,9 +1570,8 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                 rt::BufferContents::NoCopy {
                     // SAFETY: `HostRange::new`'s contract keeps the bytes mapped until the
                     // deallocator runs, or for the buffer's life with none, and an unmap of
-                    // core's through the platform's VM waits for the keep-alive; a twin of them
-                    // stays until it goes; and a vouch is the table's record of the pages as they
-                    // are mapped now.
+                    // core's through the platform's VM waits for the keep-alive; and a vouch is the
+                    // table's record of the pages as they are mapped now.
                     memory: unsafe { crate::os::host_memory_vouched(imported, vouched) },
                     deallocator: run,
                     keep_alive: Some(keep),

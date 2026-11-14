@@ -43,7 +43,7 @@ pub(crate) use host_os::take_ram_devices;
 pub(crate) use host_os::thread_counts;
 pub(crate) use host_os::{
     COPIES_READ_ONLY, Drawables, ImportMade, allocate_aliasable, dma_buf_refusal, host_memory,
-    host_memory_vouched, import_view, shown_at,
+    host_memory_vouched, import_view,
 };
 /// Copies by the GPU of planes another driver wrote into dma-bufs into a runtime buffer, on Linux
 /// (`os/linux/plane_copy.rs`).

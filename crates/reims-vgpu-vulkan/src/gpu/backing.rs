@@ -137,7 +137,8 @@ impl Drop for ImportTrace {
 }
 
 /// The runtime's keep-alive of `kept`, what keeps the memory of a no-copy buffer's or heap's
-/// import mapped (a twin, an [`UnmapHold`](crate::remap::UnmapHold)): the runtime
+/// import mapped (the record of its pinned pages, an [`UnmapHold`](crate::remap::UnmapHold)): the
+/// runtime
 /// drops it once it freed the device's import of the memory, after the deallocator ran, on
 /// the thread that frees the import, which may be one of the runtime's; or, for a buffer whose
 /// import keeps another buffer's keep-alive already (one that lies in a live buffer's import),

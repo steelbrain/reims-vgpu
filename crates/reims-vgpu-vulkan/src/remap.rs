@@ -10,8 +10,8 @@
 //!
 //! A host address takes new pages through core's Mach VM calls, and each reports what it changed,
 //! with the call's own arguments and answer passed through unchanged. A call that maps reports
-//! after it, and one that unmaps before it, at the unmap: a mapping that reports nothing (an
-//! IOSurface's, `malloc`'s) could take the freed address between the unmap and a later report,
+//! after it, and one that unmaps before it, at the unmap: a mapping that reports nothing
+//! (`malloc`'s) could take the freed address between the unmap and a later report,
 //! while a live buffer still lies in an import of the old pages there:
 //! - **Core's Mach VM calls** ([`VulkanVm`], the platform's `HostVm`): a memory map's mappings
 //!   (`remap_shared_overwrite`), fixed overwrites (`allocate_fixed_overwrite`), every
@@ -23,25 +23,9 @@
 //!   pages from the page of the address, a deallocate's every page its bytes touch; a call of no
 //!   bytes changes none. `protect_max` changes no pages.
 //!
-//! The platform's own Mach VM calls in [`crate::gpu::backing`] report nothing: an alias's
-//! mapping (`gather_or_nil`), the block of zeros, and an alias's release; nor do those of Linux's
-//! surface stand-in (`os::linux::surface`), whose view of the guest's pages is the alias of a
-//! surface over several ranges of them. Each range is a fresh one of the platform's own, which
-//! backs the no-copy buffers over a surface at an offset into its allocation or whose GPU writes
-//! never reach its memory (`buffer_over_surface_at` in [`crate::gpu::device`]). A surface's alias
-//! is released by the keep-alive of the last buffer over it, which the runtime drops after it freed that
-//! buffer's import, or, where it is the surface's view, by the surface's last release where that
-//! comes later, so no buffer made later at the address could lie in one.
-//!
 //! **Not reported**: the pages of the host's own RAM a memory map names, which core reads at the
 //! host's addresses with no mapping of its own. The host changes those without the library: no call
-//! of the C API tells it, and Metal needs none. The only no-copy buffers at those addresses are
-//! those under a surface whose base address lies in the guest's pages it was made over
-//! (`os::surface::base_in_pages`: one over a single page; one over several pages, a range each, has
-//! a mapping of its own there, measured), at no offset into its allocation and with GPU writes that
-//! reach its memory (the others lie over an alias): one made after the host replaced the pages lies
-//! in a live one's import, over the old pages, and what Metal's texture on such a surface reads
-//! then is not measured.
+//! of the C API tells it, and Metal needs none.
 //!
 //! **Unmaps an import waits for** ([`UnmapHold`]). The runtime runs a no-copy buffer's
 //! deallocator, given with a keep-alive, as the buffer is released, Metal's moment, and then
@@ -88,33 +72,24 @@
 //!   runtime's handler thread as a command buffer that read it completed (**measured** on the
 //!   Iris Xe host, ANV, a macOS 26.7.2 guest's Mission Control, 2026-11-08), and the guest's
 //!   texture over that page, and every later message of its process, waited with it.
-//! - **What is not ours to unmap**: memory a no-copy buffer lies in whose unmap is the system's,
-//!   which no hold defers: on macOS an IOSurface's memory that a buffer over it at no offset
-//!   imports as it is. There the deallocator (the surface's release) may unmap the pages before the free, in the same release, or, where
-//!   a command buffer submitted before a texture over them was released still holds the import,
-//!   until it completes. Ground: MoltenVK's no-copy buffer keeps the pages it was made over,
-//!   which Metal wires as it makes the buffer (`tests/no_copy_remap.rs` measures a remap under
-//!   one), and so do NVIDIA's host-pointer import and an import of dma-bufs of a file's pages,
-//!   which the dma-buf pinned (RADV's, for any page with a file behind it):
+//! - **What a remap under an import reads.** MoltenVK's no-copy buffer keeps the pages it was
+//!   made over, which Metal wires as it makes the buffer (`tests/no_copy_remap.rs` measures a
+//!   remap under one), and so do NVIDIA's host-pointer import and an import of dma-bufs of a
+//!   file's pages, which the dma-buf pinned (RADV's, for any page with a file behind it):
 //!   `tests/no_copy_remap_linux.rs` measures a remap under each, on an RTX 5080 Laptop GPU and
 //!   on RADV's Radeon 780M and RX 7900 XTX. On those devices the GPU still reads the pages it
-//!   imported, as Metal's reads those it wired. What other drivers' host-pointer imports read
-//!   after such a remap is unspecified (`VK_EXT_external_memory_host` leaves it to the driver),
-//!   and one that validates the pages again at each submission fails a submission that lists the
-//!   import in that window.
-//!   RADV's pointer imports take only pages with no file behind them (amdgpu's userptr), and it
-//!   lists every import in every submission: once a file's pages are mapped under one, every
-//!   submission of the device fails, the runtime answering
-//!   `DeviceLost`, and other pages with no file behind them are what the GPU reads from then
-//!   (measured on both, Mesa 26.2.4). On Linux the surface stand-in's own memory and views
-//!   (`os::linux::surface`) are held until the free, by the keep-alive of a buffer over a surface
-//!   at no offset (`surface_memory_hold`). A surface over a single range of the guest's pages
-//!   maps nothing: core makes one only over a page of the host's own RAM ("Not reported",
-//!   above), which no hold defers, and the [`UnmapHold`] its hold carries defers an unmap only of
-//!   pages [`VulkanVm`] maps.
-//!   Measured on an Iris Xe (Mesa 26.2.4's ANV, i915) before that hold: ANV lists every live
-//!   import in each execbuffer, and one listing an import whose pages a surface's release had
-//!   unmapped failed with `EFAULT`, which ANV answers as the device lost.
+//!   imported, as Metal's reads those it wired, so a buffer over the host's own RAM ("Not
+//!   reported", above) reads the old pages. What other drivers' host-pointer imports read after
+//!   such a remap is unspecified (`VK_EXT_external_memory_host` leaves it to the driver), and one
+//!   that validates the pages again at each submission fails a submission that lists the import
+//!   in that window. RADV's pointer imports take only pages with no file behind them (amdgpu's
+//!   userptr), and it lists every import in every submission: once a file's pages are mapped
+//!   under one, every submission of the device fails, the runtime answering `DeviceLost`, and
+//!   other pages with no file behind them are what the GPU reads from then (measured on both,
+//!   Mesa 26.2.4). ANV lists every live import in each execbuffer, and one listing an import
+//!   whose pages had been unmapped failed with `EFAULT`, which ANV answers as the device lost
+//!   (measured on an Iris Xe, Mesa 26.2.4's ANV, i915, before the holds): the holds keep the
+//!   pages [`VulkanVm`] unmaps mapped until the free.
 //!
 //! **Memory the library does not unmap** (the host's RAM, a test's own memory): its owner unmaps
 //! it, with no call of [`VulkanVm`], so no hold defers that unmap. Before it unmaps or frees memory

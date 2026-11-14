@@ -41,7 +41,7 @@ pub(crate) use host_ram::{
 };
 pub(crate) use import::{
     COPIES_READ_ONLY, ImportMade, dma_buf_refusal, host_memory, host_memory_vouched, import_view,
-    learn_view_imports, shown_at,
+    learn_view_imports,
 };
 pub(crate) use vm::allocate_aliasable;
 #[cfg(test)]
