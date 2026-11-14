@@ -686,13 +686,15 @@ mod tests {
     #[cfg(target_os = "linux")]
     const TEXWRITE: &[u8] = include_bytes!("../../../../tests/shaders/compute_texwrite.metallib");
 
-    /// A 16 × 16 `BGRA8Unorm` texture of shader read and write usage at the start of a heap made
-    /// with bit 24 over pages of the test's own (`resource::tests::guest_pages_of`), as the guest
-    /// makes a read-only heap, with the pages and their length; the runtime makes the heap over
-    /// a copy of them on Linux, announcing `copied-host-pages`, which dies in strict mode, so it
-    /// is made under the default.
+    /// A 16 × 16 `BGRA8Unorm` texture of `levels` mipmap levels and shader read and write usage
+    /// at the start of a heap made with bit 24 over pages of the test's own
+    /// (`resource::tests::guest_pages_of`), as the guest makes a read-only heap, with the pages and
+    /// their length; the runtime makes the heap over a copy of them on Linux, announcing
+    /// `copied-host-pages`, which dies in strict mode, so it is made under the default.
     #[cfg(target_os = "linux")]
-    fn bgra_in_read_only_heap() -> (
+    fn bgra_in_read_only_heap(
+        levels: u64,
+    ) -> (
         crate::gpu::resource::VulkanTexture,
         crate::core::host::HostPtr,
         u64,
@@ -731,6 +733,7 @@ mod tests {
             pixel_format: 80,
             width: 16,
             height: 16,
+            mipmap_level_count: levels,
             usage: 0x3,
             resource_options: Some(heap.resource_options() & !BIT_24),
             ..TextureDesc::default()
@@ -763,7 +766,7 @@ mod tests {
         let held = d_texture(0x5a);
         let (ro, pages) = read_only_buffer(1);
         let over = bgra_over(&ro, 0x3);
-        let (in_heap, heap_pages, heap_size) = bgra_in_read_only_heap();
+        let (in_heap, heap_pages, heap_size) = bgra_in_read_only_heap(1);
         let whole = MtlSize::new(16, 16, 1);
         let at = MtlOrigin::new(0, 0, 0);
         for (name, texture, (pages, length)) in [
@@ -843,6 +846,104 @@ mod tests {
             cb.wait_until_completed(OnFault::Return).unwrap();
             assert!(words(&out).iter().all(|&w| w == 0), "{name}: read back");
         }
+        drop((over, ro, in_heap));
+        assert!(
+            crate::remap::VulkanVm::new()
+                .deallocate(pages, crate::os::PAGE)
+                .is_success()
+        );
+    }
+
+    /// A blit's other writes of a texture over a guest's read-only memory, a buffer made with bit
+    /// 24 (`resource::tests::read_only_buffer`) or a heap made with it
+    /// ([`bgra_in_read_only_heap`]), complete with no error, the writes dropped and the buffer's
+    /// pages staying zeros, as the M3 Max's GPU drops them (plain Metal, macOS 27.0.1,
+    /// m3-max-29292 and m3-max-29309): a fill by a colour or by bytes and an invalidation (the
+    /// `fillTexture:` and `invalidateCompressedTexture:` SPI, which the Radeon Pro 5300M and UHD
+    /// Graphics 630 under macOS 26.7.1 end the process at with bit 24 or without), and mipmaps'
+    /// generation, after which level 1 of a heap's texture whose level 0 the CPU wrote reads
+    /// zeros, where it reads level 0's texels without bit 24 (`mipmaps-shared`, m3-max-29309).
+    /// The two x86 GPUs complete mipmaps' generation too, writing it. Linux's: on macOS they go to
+    /// Metal
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn blit_writes_of_a_texture_in_read_only_memory_are_dropped() {
+        use crate::core::platform::HostRange;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::os::vm::HostVm as _;
+        use crate::core::platform::resource::Texture as _;
+        use crate::core::platform::types::{ClearColor, MtlOrigin, MtlRegion};
+
+        use crate::gpu::resource::tests::{bgra_over, host_bytes_at, read_only_buffer};
+
+        let blit = |cmd| {
+            let cb = command_buffer();
+            let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+            e.encode(OnFault::Return, cmd).unwrap();
+            e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+            cb.commit(OnFault::Return).unwrap();
+            cb.wait_until_completed(OnFault::Return).unwrap();
+            (cb.status().0, cb.error())
+        };
+        let (ro, pages) = read_only_buffer(1);
+        let over = bgra_over(&ro, 0x3);
+        let (in_heap, _, _) = bgra_in_read_only_heap(2);
+        let at = MtlOrigin::new(0, 0, 0);
+        let region = MtlRegion::new(at, MtlSize::new(16, 16, 1));
+        let texel = [0x77u8; 4];
+        let white = ClearColor {
+            red: 1.0,
+            green: 1.0,
+            blue: 1.0,
+            alpha: 1.0,
+        };
+        for (name, texture) in [("over a buffer", &over), ("in a heap", &in_heap)] {
+            let fills = [
+                BlitCmd::FillTextureColor {
+                    texture,
+                    level: 0,
+                    slice: 0,
+                    region,
+                    color: white,
+                    pixel_format: 80,
+                },
+                BlitCmd::FillTexture {
+                    texture,
+                    level: 0,
+                    slice: 0,
+                    region,
+                    bytes: HostRange::of_slice(&texel),
+                },
+                BlitCmd::InvalidateCompressedTexture { texture },
+            ];
+            for fill in fills {
+                let sel = fill.selector();
+                assert_eq!(blit(fill), (COMPLETED, None), "{name}: {sel}");
+            }
+        }
+        assert!(host_bytes_at(pages, 16 * 64).iter().all(|&b| b == 0));
+        let level_0 = [0x3cu8; 16 * 64];
+        in_heap
+            .replace_region(region, 0, 0, HostRange::of_slice(&level_0), 64, 0)
+            .unwrap();
+        let mipmaps = BlitCmd::GenerateMipmaps {
+            texture: Some(&in_heap),
+        };
+        assert_eq!(blit(mipmaps), (COMPLETED, None), "mipmaps");
+        let out = shared(8 * 32);
+        let read = BlitCmd::CopyTextureToBuffer {
+            source_texture: &in_heap,
+            source_slice: 0,
+            source_level: 1,
+            source_origin: at,
+            source_size: MtlSize::new(8, 8, 1),
+            destination_buffer: &out,
+            destination_offset: 0,
+            destination_bytes_per_row: 32,
+            destination_bytes_per_image: 8 * 32,
+        };
+        assert_eq!(blit(read), (COMPLETED, None), "level 1 read back");
+        assert!(words(&out).iter().all(|&w| w == 0), "level 1");
         drop((over, ro, in_heap));
         assert!(
             crate::remap::VulkanVm::new()

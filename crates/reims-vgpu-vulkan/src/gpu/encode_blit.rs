@@ -511,25 +511,6 @@ fn written_memory(cmd: &BlitCmd<'_, VulkanPlatform>) -> crate::gpu::writes::Boun
     }
 }
 
-/// Whether `cmd` is a copy into a texture over read-only memory the runtime copies, as `kept`
-/// says of the texture's memory ([`crate::gpu::writes::Kept::Copied`]), which is sent: the copy
-/// drops the write, as Metal's GPU drops a blit's copy into a texture over such memory, out of a
-/// buffer or a texture, and completes it (measured on the M3 Max, macOS 27.0.1, metal2vulkan's
-/// `probes/readonly_gpu_writes.m`; the runtime's `read_only_view.rs` and `copied.rs`). Another
-/// blit's write of such a texture (a fill, mipmaps, an invalidation), which nothing measured,
-/// dies ([`crate::gpu::writes::kept_write`]).
-fn copy_dropped(cmd: &BlitCmd<'_, VulkanPlatform>, kept: &crate::gpu::writes::Kept) -> bool {
-    *kept == crate::gpu::writes::Kept::Copied
-        && matches!(
-            cmd,
-            BlitCmd::CopyBufferToTexture { .. }
-                | BlitCmd::CopyBufferToTextureOptions { .. }
-                | BlitCmd::CopyTextureRegion { .. }
-                | BlitCmd::CopyTextureRegionOptions { .. }
-                | BlitCmd::CopyTextureSlices { .. }
-        )
-}
-
 /// Whether Metal's GPU drops `cmd`'s write into a surface whose GPU writes never reach its
 /// memory at every extent measured, as this platform's does, which sends it: a fill of a buffer
 /// on the surface, and a copy into one from another buffer (`crate::os::dropped_write`).
@@ -771,7 +752,7 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
                 &format!("a blit encoder's first command under protection options {options}"),
             );
         }
-        if written.kept.holds() && !copy_dropped(&cmd, &written.kept) {
+        if written.kept.lands() {
             crate::gpu::writes::kept_write(sel, "a blit's write into");
         }
         let dropped = written.dropped;
