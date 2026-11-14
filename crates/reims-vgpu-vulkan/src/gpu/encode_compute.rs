@@ -1402,6 +1402,74 @@ mod tests {
         }
     }
 
+    /// What a compute encoder's `setBuffers:` costs the thread that encodes it (a measurement, not
+    /// a check; run it by name with `--run-ignored only --no-capture` in a release build, holding
+    /// the host's GPU): `BIND_COST_ROUNDS` sends (default 4,096) of 8 buffers at indices 0 to 7,
+    /// as a kernel's binds before each of its dispatches, in two shapes. `same`: an upload chunk
+    /// at index 0 at its next 256-byte offset, as the bundle sends `setBytes:`, and the same 7
+    /// buffers after it each time; `fresh`: 8 buffers of a pool of 64 each time, none bound at its
+    /// index the send before. Prints each shape's user-space instructions and cycles a buffer
+    /// bound, the median of 5 runs, each an encoder of its own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "a measurement: run it by name"]
+    fn set_buffers_cost() {
+        let rounds: u64 = std::env::var("BIND_COST_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4096);
+        let chunk = shared(0x1_0000);
+        let pool: Vec<VulkanBuffer> = (0..64).map(|_| shared(256)).collect();
+        let offsets_of = |r: u64| -> [u64; 8] {
+            let mut offsets = [0; 8];
+            offsets[0] = (r * 256) % 0x1_0000;
+            offsets
+        };
+        for shape in ["same", "fresh"] {
+            let mut figures: [Vec<u64>; 2] = Default::default();
+            for _ in 0..5 {
+                let cb = command_buffer();
+                let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
+                let mut spent = [0u64; 2];
+                for r in 0..rounds {
+                    let mut buffers: [Option<&VulkanBuffer>; 8] = [Some(&chunk); 8];
+                    for (i, slot) in buffers.iter_mut().enumerate().skip(1) {
+                        let pick = match shape {
+                            "same" => i,
+                            _ => (r as usize * 8 + i) % pool.len(),
+                        };
+                        *slot = Some(&pool[pick]);
+                    }
+                    let offsets = offsets_of(r);
+                    let cmd = ComputeCmd::SetBuffers {
+                        buffers: &buffers,
+                        offsets: &offsets,
+                        range: NsRange::new(0, 8),
+                    };
+                    let before = crate::os::thread_counts::now();
+                    e.encode(OnFault::Return, cmd).unwrap();
+                    let after = crate::os::thread_counts::now();
+                    for k in 0..2 {
+                        spent[k] += after[k] - before[k];
+                    }
+                }
+                e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
+                cb.commit(OnFault::Return).unwrap();
+                cb.wait_until_completed(OnFault::Return).unwrap();
+                for k in 0..2 {
+                    figures[k].push(spent[k] / (rounds * 8));
+                }
+            }
+            for (figure, name) in figures.iter_mut().zip(["instructions", "cycles"]) {
+                figure.sort_unstable();
+                eprintln!(
+                    "setBuffers of 8, {shape:<5}: {name:<12} a buffer bound {:6} ({} to {})",
+                    figure[2], figure[0], figure[4]
+                );
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     mod metal_tests;
 }
