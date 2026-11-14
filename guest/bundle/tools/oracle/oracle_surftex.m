@@ -39,10 +39,11 @@
 // runs read all of them, none, or some; and, of the surface after the command buffer completed
 // (read under a read-only lock), in how many runs the plane's texels held every byte written
 // there, the bytes past them every byte the wide writer wrote there, and the bytes past them
-// still held the CPU's 0x11:
+// still held the CPU's 0x11; and, where the reader is `wide`, in how many runs it read the
+// CPU's 0x11 in every byte past the plane's texels:
 //   alias N NAME | surface ... | WRITER through W, read through R, HAZARD
-//   alias N NAME => runs R: all A, none Z, some S; surface after: texels all P, bytes past them
-//   written Q, still 0x11 O
+//   alias N NAME => runs R: all A, none Z, some S; a wide reader read the CPU's 0x11 past the
+//   texels K; surface after: texels all P, bytes past them written Q, still 0x11 O
 //   oracle_surftex DEVICE --alias N    aliasing case N alone (what the children run)
 // Build: see README.md.
 #import "oracle_common.h"
@@ -923,6 +924,7 @@ static int runAlias(id<MTLDevice> d, int n)
 	id<MTLCommandQueue> q = [d newCommandQueue];
 	id<MTLFence> fence = a->fenced ? [d newFence] : nil;
 	int all = 0, none = 0, some = 0, after = 0, afterBeside = 0, afterBesideOld = 0;
+	int readPastOld = 0;
 	for (int run = 0; run < kAliasRuns; run++) {
 		IOSurfaceLock(s, 0, NULL);
 		memset(IOSurfaceGetBaseAddress(s), 0x11, IOSurfaceGetAllocSize(s));
@@ -988,6 +990,12 @@ static int runAlias(id<MTLDevice> d, int n)
 		all += seen == want;
 		none += seen == 0;
 		some += seen != want && seen != 0;
+		// A wide reader's bytes past the plane's texels: the CPU's 0x11 in each.
+		int pastOld = !wideFirst;
+		for (int y = 0; y < kSize && pastOld; y++)
+			for (NSUInteger x = kSize; x < readRow; x++)
+				pastOld &= got[y * readRow + x] == 0x11;
+		readPastOld += pastOld;
 		// The surface after: the plane's texels (the first 64 bytes of each row) and the bytes
 		// past them apart, each counted where it holds every byte the writer wrote there.
 		IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
@@ -1011,9 +1019,11 @@ static int runAlias(id<MTLDevice> d, int n)
 		afterBeside += wideFirst && beside;
 		afterBesideOld += besideOld;
 	}
-	printf("alias %d %s => runs %d: all %d, none %d, some %d; surface after: texels all %d, "
-	       "bytes past them written %d, still 0x11 %d\n",
-	       n, a->name, kAliasRuns, all, none, some, after, afterBeside, afterBesideOld);
+	printf("alias %d %s => runs %d: all %d, none %d, some %d; a wide reader read the CPU's 0x11 "
+	       "past the texels %d; surface after: texels all %d, bytes past them written %d, still "
+	       "0x11 %d\n",
+	       n, a->name, kAliasRuns, all, none, some, readPastOld, after, afterBeside,
+	       afterBesideOld);
 	fflush(stdout);
 	CFRelease(s);
 	return 0;
