@@ -12119,6 +12119,63 @@ fn separate_contexts_never_share_a_group() {
     assert_eq!(platform.fake_vm().groups_made(), 2);
 }
 
+/// A message over a member's block that comes once the group is sealed and its members' messages
+/// are being carried out waits behind them, on the group's job, never ahead of them: the group
+/// stays until its job has carried out every message, those that joined late among them
+#[test]
+fn a_message_over_a_member_s_block_waits_behind_its_sealed_group_s_messages() {
+    let (device, platform, _ram, page) = grouping_device(16, GROUP_LIMITS);
+    let mut guest = Guest::new(&device);
+    let blocks = grouped_blocks(&device, &mut guest, 1, SURFACE_BLOCK, 2, page);
+    let decoder = device.control.decoder();
+    for (i, &block) in blocks.iter().enumerate() {
+        guest.send(
+            &device,
+            buffer_over_pages_of(obj(1, 11 + i as u64), block, 2 * page),
+        );
+    }
+    assert!(eventually(
+        || decoder.views_of_surfaces().forming() == (1, 2)
+    ));
+    // The seal makes the two views' imports, then carries out the first member's message, whose
+    // buffer is held.
+    let held = HeldCall::new();
+    platform.faults().at(
+        "MTLDevice",
+        "newBufferWithDescriptor:",
+        2,
+        Fault::Hold(held.clone()),
+    );
+    platform.virtual_clock().advance(Duration::from_millis(1));
+    assert!(
+        held.reached(Duration::from_secs(60)),
+        "the first member's buffer was not made"
+    );
+    for (i, &block) in blocks.iter().enumerate() {
+        guest.send(
+            &device,
+            buffer_over_pages_of(obj(1, 21 + i as u64), block, page),
+        );
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        device.decoder_object_count(),
+        0,
+        "the later messages wait behind the held one, though the views are made"
+    );
+    assert_eq!(
+        decoder.views_of_surfaces().forming(),
+        (1, 2),
+        "the group stays while its messages are carried out"
+    );
+    held.open();
+    assert!(objects_become(&device, 4), "the four buffers");
+    decoder.surface_worker().flush();
+    assert_eq!(decoder.views_of_surfaces().forming(), (0, 0));
+    let counts = decoder.views_of_surfaces().counts();
+    assert_eq!((counts.private, counts.grouped, counts.groups), (2, 2, 1));
+}
+
 /// The device's reset inside a group's window makes nothing of it: its views and its messages go,
 /// the context and its blocks settle, and the window's end makes no import or buffer
 #[test]

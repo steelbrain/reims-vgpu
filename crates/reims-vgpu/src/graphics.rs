@@ -2357,12 +2357,15 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let Some(sealing) = decoder.group_closed(number) else {
             return;
         };
-        let then = {
+        {
             let _carried = self.reset_gate.read_recursive();
-            decoder.seal_group(&self.device, sealing)
-        };
-        for job in then {
-            job();
+            decoder.seal_group(&self.device, sealing);
+        }
+        // The members' messages, and those that join a member while they are carried out.
+        while let Some(jobs) = decoder.group_jobs(number) {
+            for job in jobs {
+                job();
+            }
         }
     }
 

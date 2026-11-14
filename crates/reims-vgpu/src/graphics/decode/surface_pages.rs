@@ -631,8 +631,9 @@ struct Forming<P: Platform> {
     bytes: u64,
     /// It reached the limits: it takes no more, and is sealed at once.
     full: bool,
-    /// Its window closed and its seal makes its imports: it takes no more members, and a later
-    /// message of a member's block waits behind its members' ([`SurfaceViews::seal`]).
+    /// Its window closed: it takes no more members, and until its members' messages are carried
+    /// out, a later message of a member's block waits behind them ([`SurfaceViews::seal`],
+    /// [`SurfaceViews::group_jobs`]).
     sealing: bool,
 }
 
@@ -645,13 +646,15 @@ struct Member<P: Platform> {
     then: Vec<Job>,
 }
 
-/// A group whose window closed, to seal ([`SurfaceViews::seal`]): its number, the device's resets
-/// as it opened, its context, and each member's block, runs and view.
+/// A member of a group being sealed ([`Sealing`]): its block, runs and view.
+type SealedMember<P> = (u64, Vec<(u64, u64)>, Arc<SurfaceView<P>>);
+
+/// A group whose window closed, to seal ([`SurfaceViews::seal`]): the device's resets as it
+/// opened, its context, and its members.
 pub(crate) struct Sealing<P: Platform> {
-    number: u64,
     resets: u64,
     context: u32,
-    members: Vec<(u64, Vec<(u64, u64)>, Arc<SurfaceView<P>>)>,
+    members: Vec<SealedMember<P>>,
 }
 
 /// Groups being formed that went with their context's close ([`SurfaceViews::groups_closed`]),
@@ -1605,11 +1608,11 @@ impl<P: Platform> SurfaceViews<P> {
             else {
                 return Joined::Now(then);
             };
-            if p.view.is_some() || p.mapped.is_some() || p.read_only || (heap && p.ram.is_some()) {
-                return Joined::Now(then);
-            }
             let (runs, length) = (p.runs.clone(), p.length);
-            // A member already: behind the messages that joined with it.
+            let alone = p.view.is_some() || p.mapped.is_some() || p.read_only;
+            let alone = alone || (heap && p.ram.is_some());
+            // A member of a group not yet carried out to its end, its view made or not: behind
+            // the messages that joined with it, on the group's job ([`Self::group_jobs`]).
             let member = (v.forming.iter_mut())
                 .filter(|f| f.context == context)
                 .flat_map(|f| f.members.iter_mut())
@@ -1617,6 +1620,9 @@ impl<P: Platform> SurfaceViews<P> {
             if let Some(member) = member {
                 member.then.push(then);
                 return Joined::Waits;
+            }
+            if alone {
+                return Joined::Now(then);
             }
             let alone = length > GROUP_MEMBER_MAX
                 || runs.len().to_u64() >= limits.runs
@@ -1704,7 +1710,6 @@ impl<P: Platform> SurfaceViews<P> {
                     .map(|m| (m.block, m.runs.clone(), Arc::clone(&m.view)))
                     .collect();
                 return Some(Sealing {
-                    number,
                     resets: f.resets,
                     context: f.context,
                     members,
@@ -1719,12 +1724,11 @@ impl<P: Platform> SurfaceViews<P> {
     /// shared files ([`HostVm::group_views`]), and each grouped view's import is made, a piece of
     /// its group's file; a view the platform left alone, or whose piece the runtime refused,
     /// leaves its group. Then, under one hold of the views' lock, each view becomes its block's,
-    /// made, or mapped for the block's first message to make alone ([`Self::private_view`]), and
-    /// the group goes: its members' messages, those that joined while it was sealed among them,
-    /// are handed back in their order to be carried out, so a later message over a member's block
-    /// comes after them. Nothing is handed back where the device was reset since the group opened
-    /// or its context closed meanwhile. A block that went meanwhile lets go of its view with no
-    /// lock held.
+    /// made, or mapped for the block's first message to make alone ([`Self::private_view`]). The
+    /// group stays until its members' messages are carried out ([`Self::group_jobs`]), so a later
+    /// message over a member's block still waits behind them. Nothing is made where the device was
+    /// reset since the group opened. A block that went meanwhile lets go of its view with no lock
+    /// held.
     ///
     /// [`HostVm::group_views`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::group_views
     pub(crate) fn seal(
@@ -1732,15 +1736,14 @@ impl<P: Platform> SurfaceViews<P> {
         platform: &P,
         device: &P::Device,
         sealing: Sealing<P>,
-    ) -> Vec<Job> {
+    ) {
         let Sealing {
-            number,
             resets,
             context,
             members,
         } = sealing;
         if views.lock().resets != resets {
-            return Vec::new();
+            return;
         }
         let list: Vec<(HostAddr, u64)> = (members.iter())
             .map(|(_, _, view)| (view.base(), view.length()))
@@ -1784,12 +1787,6 @@ impl<P: Platform> SurfaceViews<P> {
         if grouped > 0 {
             v.counts.groups += 1;
         }
-        let then: Vec<Job> = match v.forming.iter().position(|f| f.number == number) {
-            Some(at) => (v.forming.remove(at).members.into_iter())
-                .flat_map(|m| m.then)
-                .collect(),
-            None => Vec::new(),
-        };
         drop(v);
         drop(gone);
         log::debug!(
@@ -1798,7 +1795,25 @@ impl<P: Platform> SurfaceViews<P> {
              pieces of group dma-bufs",
             list.len()
         );
-        then
+    }
+
+    /// The messages over the blocks of the sealed group numbered `number` not yet carried out, in
+    /// their order, taken to carry out ([`Self::seal`]); `None`, the group gone, where none is
+    /// left, or it went (its context's close, the device's reset). Its job takes them until then,
+    /// so a message that joins a member meanwhile is carried out behind those before it.
+    pub(crate) fn group_jobs(views: &Mutex<SurfaceViews<P>>, number: u64) -> Option<Vec<Job>> {
+        let mut v = views.lock();
+        let at = v.forming.iter().position(|f| f.number == number)?;
+        let jobs: Vec<Job> = (v.forming[at].members.iter_mut())
+            .flat_map(|m| std::mem::take(&mut m.then))
+            .collect();
+        if jobs.is_empty() {
+            let gone = v.forming.remove(at);
+            drop(v);
+            drop(gone);
+            return None;
+        }
+        Some(jobs)
     }
 
     /// Context `context` closed: its groups being formed go, their views and their messages with
@@ -2327,8 +2342,13 @@ impl<P: Platform> super::GraphicsDecoder<P> {
     }
 
     /// [`SurfaceViews::seal`] of the decoder's views, on `device`.
-    pub(crate) fn seal_group(&self, device: &P::Device, sealing: Sealing<P>) -> Vec<Job> {
-        SurfaceViews::seal(&self.shared.surface_views, &*self.platform, device, sealing)
+    pub(crate) fn seal_group(&self, device: &P::Device, sealing: Sealing<P>) {
+        SurfaceViews::seal(&self.shared.surface_views, &*self.platform, device, sealing);
+    }
+
+    /// [`SurfaceViews::group_jobs`] of the decoder's views.
+    pub(crate) fn group_jobs(&self, number: u64) -> Option<Vec<Job>> {
+        SurfaceViews::group_jobs(&self.shared.surface_views, number)
     }
 
     /// Context `context` closed: its groups being formed go ([`SurfaceViews::groups_closed`]),
