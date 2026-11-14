@@ -1356,6 +1356,26 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// where it may be split ([`CommandBufferObject::splits`]); `None` otherwise, the command
     /// buffer as it was. Its make waits while the queue holds 64 uncompleted command buffers, as
     /// `commandBuffer` does: the caller leaves room.
+    /// The runtime's sync file of the command buffer's completion
+    /// ([`crate::gpu::sync_file`]); `false` where it refuses one: on a device that exports none
+    /// as a sync file (`RuntimeGap::SyncFileExport`, MoltenVK among them), after the commit, on
+    /// a lost device.
+    fn add_completion_sync_file(&self) -> bool {
+        self.raw.add_completion_sync_file().is_ok()
+    }
+
+    /// The runtime's export of the sync file asked for ([`crate::gpu::sync_file`]); `None`
+    /// where it refuses it.
+    fn export_completion_sync_file(&self) -> Option<Option<std::os::fd::OwnedFd>> {
+        self.raw.export_completion_sync_file().ok()
+    }
+
+    /// A semaphore of the command buffer's device, given `file` as a temporary import, waited for
+    /// before the command buffer's work ([`crate::gpu::sync_file`]).
+    fn encode_wait_for_sync_file(&self, file: std::os::fd::OwnedFd) -> bool {
+        crate::gpu::sync_file::encode_wait(&self.raw, file)
+    }
+
     fn split(&self, on: OnFault) -> RaiseResult<Option<VulkanCommandBuffer>> {
         if !self.splits() {
             return Ok(None);

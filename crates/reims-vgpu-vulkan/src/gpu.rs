@@ -52,6 +52,7 @@ mod slice_write_repro;
 #[cfg(test)]
 pub(crate) mod spin;
 pub mod states;
+mod sync_file;
 pub mod timing;
 #[cfg(test)]
 #[cfg(target_os = "macos")]

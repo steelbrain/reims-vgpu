@@ -244,4 +244,29 @@ pub trait CommandBuffer<P: Platform>: Handle {
         let _ = on;
         Ok(None)
     }
+    /// The platform's own, no Metal call: asked before the commit, the buffer's completion is
+    /// exported as a sync file once it is committed ([`Self::export_completion_sync_file`]).
+    /// `false` where the platform exports none, the default: the caller waits for the buffer on
+    /// the host.
+    fn add_completion_sync_file(&self) -> bool {
+        false
+    }
+    /// The platform's own, no Metal call: after the commit, the buffer's completion as a sync
+    /// file, asked for before it ([`Self::add_completion_sync_file`]), which a device of another
+    /// driver waits for on its GPU ([`Self::encode_wait_for_sync_file`]): `Some(Some(file))`;
+    /// `Some(None)` where the buffer has finished, so there is nothing to wait for (its
+    /// [`Self::status`] tells how it ended); `None` where the platform refuses it, the default:
+    /// the caller waits for the buffer on the host.
+    fn export_completion_sync_file(&self) -> Option<Option<std::os::fd::OwnedFd>> {
+        None
+    }
+    /// The platform's own, no Metal call: before any encoder, the buffer's work waits on its GPU
+    /// for the sync file `file`, another device's completion
+    /// ([`Self::export_completion_sync_file`]); the buffer's device takes the file. `false`, the
+    /// file closed, where the platform cannot, the default: the caller waits for that completion
+    /// on the host.
+    fn encode_wait_for_sync_file(&self, file: std::os::fd::OwnedFd) -> bool {
+        drop(file);
+        false
+    }
 }
