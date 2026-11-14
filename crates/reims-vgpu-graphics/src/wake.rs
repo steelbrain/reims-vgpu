@@ -5,7 +5,7 @@
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The device's own wake: a pipe, both ends non-blocking and closed on exec.
 #[derive(Debug)]
@@ -14,9 +14,10 @@ pub(crate) struct Wake {
     read: OwnedFd,
     /// The end a wake writes.
     write: OwnedFd,
-    /// Set from just before [`Self::sleep`]'s poll until it returns ([`Self::parked`]).
+    /// Moved on once just before [`Self::sleep`]'s poll and once as it returns, so odd while the
+    /// thread is in it, and changed by each sleep ([`Self::parked`]).
     #[cfg(test)]
-    sleeping: AtomicBool,
+    sleeps: AtomicU64,
 }
 
 impl Wake {
@@ -36,7 +37,7 @@ impl Wake {
             read,
             write,
             #[cfg(test)]
-            sleeping: AtomicBool::new(false),
+            sleeps: AtomicU64::new(0),
         })
     }
 
@@ -44,10 +45,13 @@ impl Wake {
     /// on `doorbell`: it took everything it was woken for, so what it writes of the rings stays
     /// as it is until the guest or the host wakes it. A wake that comes while it is awake stays
     /// in the pipe, and has it wake once more with nothing to take, which a test's settled state
-    /// must not catch half done.
+    /// must not catch half done. The thread is in one sleep from before the look at the pipe to
+    /// after it: a poll that returned just as the look began may have its wake drained before
+    /// the look, which then finds nothing pending of a thread that is awake.
     #[cfg(test)]
     pub(crate) fn parked(&self, doorbell: Option<RawFd>) -> bool {
-        if !self.sleeping.load(Ordering::SeqCst) {
+        let sleep = self.sleeps.load(Ordering::SeqCst);
+        if sleep % 2 == 0 {
             return false;
         }
         let mut fds = [
@@ -64,7 +68,7 @@ impl Wake {
         ];
         // SAFETY: two pollfds, a negative descriptor ignored; a timeout of 0 never blocks.
         let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, 0) };
-        n == 0
+        n == 0 && self.sleeps.load(Ordering::SeqCst) == sleep
     }
 
     /// The end the control thread polls, for a test that stands it in for a host's doorbell.
@@ -97,12 +101,12 @@ impl Wake {
             },
         ];
         #[cfg(test)]
-        self.sleeping.store(true, Ordering::SeqCst);
+        self.sleeps.fetch_add(1, Ordering::SeqCst);
         // SAFETY: two pollfds, a negative descriptor ignored.
         let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
         // Before the drain: until it, a wake that ended the poll is still pending.
         #[cfg(test)]
-        self.sleeping.store(false, Ordering::SeqCst);
+        self.sleeps.fetch_add(1, Ordering::SeqCst);
         if n <= 0 {
             return;
         }
