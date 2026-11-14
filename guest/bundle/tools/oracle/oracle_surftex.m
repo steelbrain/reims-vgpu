@@ -17,10 +17,13 @@
 //   bgrapad 'BGRA', 4 bytes an element, without planes, 512 bytes a row (kIOSurfaceBytesPerRow)
 // The descriptor of a case starts as a 2D texture of the case's format and size, one level, one
 // sample, depth and array length 1, usage ShaderRead, the descriptor's own storage, CPU cache
-// and hazard tracking modes and the identity swizzle, and changes what the case's name says.
+// and hazard tracking modes and the identity swizzle, and changes what the case's name says. A
+// `nosurface.` case makes its texture by newTextureWithDescriptor: alone, for the answers to set
+// beside the surface's.
 // Each case prints:
 //   case N NAME | SURFACE plane P | asked: fmt F type T WxHxD a A m M s S usage U storage S'
 //   case N NAME => made: fmt F type T WxHxD a A m M s S usage U storage S plane P | nil
+// with, for a case that also makes a view of its texture, `case N NAME => view: fmt F usage U`,
 // and, where the case ends the process, Metal's words (its stderr is the child's stdout), then
 //   => case N died on signal X | exited X
 // Build: see README.md.
@@ -50,7 +53,13 @@ struct Case {
 	int cache;    // kDefault: the descriptor's own
 	int hazard;   // kDefault: the descriptor's own
 	int swizzled; // 1: red and blue swapped
+	int mode;     // kOverSurface, kNoSurface or kViewOf
 };
+
+// What a case makes: the texture over the surface's plane; the same descriptor's texture by
+// newTextureWithDescriptor:, over no surface; or the texture over the plane and then a view of it
+// in the same format, both printed.
+enum { kOverSurface = 0, kNoSurface = 1, kViewOf = 2 };
 
 #define T2D MTLTextureType2D
 // A case over SURFACE's plane PLANE of FORMAT at W x H, all else the start's.
@@ -63,6 +72,10 @@ struct Case {
 // The same of USAGE, STORAGE, CACHE, HAZARD and SWIZZLED.
 #define CU(NAME, SURFACE, PLANE, FORMAT, W, H, USAGE, STORAGE, CACHE, HAZARD, SWIZZLED)            \
 	{NAME, SURFACE, PLANE, FORMAT, T2D, W, H, 1, 1, 1, 1, USAGE, STORAGE, CACHE, HAZARD, SWIZZLED}
+// The same of USAGE and STORAGE, made as MODE says.
+#define CM(NAME, SURFACE, PLANE, FORMAT, W, H, USAGE, STORAGE, MODE)                               \
+	{NAME, SURFACE, PLANE, FORMAT, T2D, W, H, 1, 1, 1, 1, USAGE, STORAGE, kDefault, kDefault, 0,    \
+	 MODE}
 // A 64 x 64 4x multisample render target in Private storage.
 #define CMS(NAME, SURFACE, FORMAT)                                                                 \
 	{NAME, SURFACE, 0, FORMAT, MTLTextureType2DMultisample, 64, 64, 1, 1, 1, 4,                    \
@@ -514,7 +527,47 @@ static const struct Case kCases[] = {
     CU("420v.p0.fmt550.63x63.write", k420v, 0, (MTLPixelFormat)550, 63, 63,
        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite, kDefault, kDefault, kDefault, 0),
     CU("420v.p0.fmt551.63x63.write", k420v, 0, (MTLPixelFormat)551, 63, 63,
-       MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite, kDefault, kDefault, kDefault, 0),
+       MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite, kDefault, kDefault, kDefault, 0),    // The sixth round (11-13): which usage bits a texture over a surface keeps, by format, by the
+    // pixel format view bit and by the surface, beside the same descriptor's texture over no
+    // surface and a view of the texture over the surface.
+    CM("bgra.atomic.r32s", kBGRA, 0, MTLPixelFormatR32Sint, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | 0x20, kDefault, kOverSurface),
+    CM("bgra.atomic.only", kBGRA, 0, MTLPixelFormatR32Uint, 64, 64, 0x20, kDefault, kOverSurface),
+    CM("bgra.atomic.read", kBGRA, 0, MTLPixelFormatR32Uint, 64, 64, MTLTextureUsageShaderRead | 0x20, kDefault, kOverSurface),
+    CM("bgra.atomic.view", kBGRA, 0, MTLPixelFormatR32Uint, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView | 0x20, kDefault, kOverSurface),
+    CM("bgra.atomic.rt", kBGRA, 0, MTLPixelFormatR32Uint, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget | 0x20, kDefault, kOverSurface),
+    CM("bgra.atomic.all", kBGRA, 0, MTLPixelFormatR32Uint, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView | 0x20, kDefault, kOverSurface),
+    CM("bgra.atomic.bgra8", kBGRA, 0, BGRA8, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | 0x20, kDefault, kOverSurface),
+    CM("bgra.atomic.bgra8.view", kBGRA, 0, BGRA8, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView | 0x20, kDefault, kOverSurface),
+    CM("bgra.atomic.r32f", kBGRA, 0, MTLPixelFormatR32Float, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | 0x20, kDefault, kOverSurface),
+    CM("bgra.atomic.rgba8u", kBGRA, 0, MTLPixelFormatRGBA8Uint, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | 0x20, kDefault, kOverSurface),
+    CM("bgra.atomic.shared", kBGRA, 0, MTLPixelFormatR32Uint, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | 0x20, MTLStorageModeShared, kOverSurface),
+    CM("bgra.atomic.private", kBGRA, 0, MTLPixelFormatR32Uint, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | 0x20, MTLStorageModePrivate, kOverSurface),
+    CM("bgra1.atomic", kBGRA1, 0, MTLPixelFormatR32Uint, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | 0x20, kDefault, kOverSurface),
+    CM("bgrapad.atomic", kBGRAPad, 0, MTLPixelFormatR32Uint, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | 0x20, kDefault, kOverSurface),
+    CM("rgha.atomic.rg32u", kRGhA, 0, MTLPixelFormatRG32Uint, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | 0x20, kDefault, kOverSurface),
+    CM("rgha.atomic.r32u.128x64", kRGhA, 0, MTLPixelFormatR32Uint, 128, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | 0x20, kDefault, kOverSurface),
+    CM("l008.atomic.r8u", kL008, 0, MTLPixelFormatR8Uint, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | 0x20, kDefault, kOverSurface),
+    CM("420v.p0.atomic.r32u", k420v, 0, MTLPixelFormatR32Uint, 16, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | 0x20, kDefault, kOverSurface),
+    CM("420v.p1.atomic.r32u", k420v, 1, MTLPixelFormatR32Uint, 16, 32, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | 0x20, kDefault, kOverSurface),
+    CM("420v.p0.ycbcr.atomic", k420v, 0, (MTLPixelFormat)500, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | 0x20, kDefault, kOverSurface),
+    CM("bgra.view.r32u", kBGRA, 0, MTLPixelFormatR32Uint, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView, kDefault, kOverSurface),
+    CM("bgra.write.r32u", kBGRA, 0, MTLPixelFormatR32Uint, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite, kDefault, kOverSurface),
+    CM("bgra.view.only", kBGRA, 0, BGRA8, 64, 64, MTLTextureUsagePixelFormatView, kDefault, kOverSurface),
+    CM("420v.p0.ycbcr.view", k420v, 0, (MTLPixelFormat)500, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView, kDefault, kOverSurface),
+    CM("420v.p0.view", k420v, 0, MTLPixelFormatR8Unorm, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView, kDefault, kOverSurface),
+    CM("bgra.usage.0x8", kBGRA, 0, BGRA8, 64, 64, MTLTextureUsageShaderRead | 0x8, kDefault, kOverSurface),
+    CM("bgra.usage.0x40", kBGRA, 0, BGRA8, 64, 64, MTLTextureUsageShaderRead | 0x40, kDefault, kOverSurface),
+    CM("bgra.usage.0x100", kBGRA, 0, BGRA8, 64, 64, MTLTextureUsageShaderRead | 0x100, kDefault, kOverSurface),
+    CM("bgra.usage.0x4000", kBGRA, 0, BGRA8, 64, 64, MTLTextureUsageShaderRead | 0x4000, kDefault, kOverSurface),
+    CM("bgra.usage.0x10000", kBGRA, 0, BGRA8, 64, 64, MTLTextureUsageShaderRead | 0x10000, kDefault, kOverSurface),
+    CM("nosurface.atomic.r32u", kBGRA, 0, MTLPixelFormatR32Uint, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | 0x20, kDefault, kNoSurface),
+    CM("nosurface.atomic.r32u.private", kBGRA, 0, MTLPixelFormatR32Uint, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | 0x20, MTLStorageModePrivate, kNoSurface),
+    CM("nosurface.atomic.bgra8", kBGRA, 0, BGRA8, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | 0x20, kDefault, kNoSurface),
+    CM("nosurface.atomic.rg32u", kBGRA, 0, MTLPixelFormatRG32Uint, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | 0x20, kDefault, kNoSurface),
+    CM("nosurface.usage.0x40", kBGRA, 0, BGRA8, 64, 64, MTLTextureUsageShaderRead | 0x40, kDefault, kNoSurface),
+    CM("viewof.atomic.r32u", kBGRA, 0, MTLPixelFormatR32Uint, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView | 0x20, kDefault, kViewOf),
+    CM("viewof.atomic.r32u.noview", kBGRA, 0, MTLPixelFormatR32Uint, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | 0x20, kDefault, kViewOf),
+    CM("viewof.all.bgra8", kBGRA, 0, BGRA8, 64, 64, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView, kDefault, kViewOf),
 };
 enum { kCaseCount = sizeof kCases / sizeof kCases[0] };
 
@@ -635,7 +688,9 @@ static int runCase(id<MTLDevice> d, int n)
 	       (unsigned long)td.usage, (unsigned long)td.storageMode,
 	       (unsigned long)td.cpuCacheMode, (unsigned long)td.hazardTrackingMode);
 	fflush(stdout);
-	id<MTLTexture> t = [d newTextureWithDescriptor:td iosurface:s plane:(NSUInteger)c->plane];
+	id<MTLTexture> t = c->mode == kNoSurface
+	                       ? [d newTextureWithDescriptor:td]
+	                       : [d newTextureWithDescriptor:td iosurface:s plane:(NSUInteger)c->plane];
 	if (t == nil) {
 		printf("case %d %s => nil\n", n, c->name);
 	} else {
@@ -647,6 +702,14 @@ static int runCase(id<MTLDevice> d, int n)
 		       (unsigned long)t.sampleCount, (unsigned long)t.usage,
 		       (unsigned long)t.storageMode, (unsigned long)t.cpuCacheMode,
 		       (unsigned long)t.hazardTrackingMode, (unsigned long)t.iosurfacePlane);
+		if (c->mode == kViewOf) {
+			id<MTLTexture> v = [t newTextureViewWithPixelFormat:t.pixelFormat];
+			if (v == nil)
+				printf("case %d %s => view nil\n", n, c->name);
+			else
+				printf("case %d %s => view: fmt %lu usage 0x%lx\n", n, c->name,
+				       (unsigned long)v.pixelFormat, (unsigned long)v.usage);
+		}
 	}
 	fflush(stdout);
 	t = nil;
