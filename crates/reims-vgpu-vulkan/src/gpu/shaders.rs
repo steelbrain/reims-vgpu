@@ -98,8 +98,8 @@ mod tests {
     use super::*;
     use crate::gpu::device::tests::dev;
 
-    /// The display's seven entry points.
-    const FUNCTIONS: [&str; 7] = [
+    /// The display's eight entry points: the window's mirror's kernel among them.
+    const FUNCTIONS: [&str; 8] = [
         "displayPresentVertex",
         "displayPresentFragment",
         "displayPresentFragmentWithGammaTableAndColorMatrix",
@@ -107,6 +107,7 @@ mod tests {
         "displayPipeColorScanoutFragment",
         "displayPipeLutFragment",
         "displayPipeLutScanoutFragment",
+        "displayMirrorTile",
     ];
 
     fn function(lib: &VulkanLibrary, name: &str) -> rt::Function {
@@ -115,17 +116,17 @@ mod tests {
             .unwrap_or_else(|e| panic!("no function {name}: {e}"))
     }
 
-    /// The metallib loads as a library of the device holding the seven functions
+    /// The metallib loads as a library of the device holding the eight functions
     #[test]
-    fn the_metallib_loads_with_the_seven_functions() {
+    fn the_metallib_loads_with_the_eight_functions() {
         let d = dev();
         let lib = library(&d).unwrap().unwrap();
         assert_eq!(lib.device.id(), d.id());
         let mut names = lib.raw.function_names();
         names.sort();
-        let mut seven = FUNCTIONS.map(str::to_owned);
-        seven.sort();
-        assert_eq!(names, seven);
+        let mut eight = FUNCTIONS.map(str::to_owned);
+        eight.sort();
+        assert_eq!(names, eight);
     }
 
     /// The metallibs the repository holds for a build without Apple's tools (`metallibs/`,
