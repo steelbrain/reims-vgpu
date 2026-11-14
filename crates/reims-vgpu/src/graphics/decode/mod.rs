@@ -919,6 +919,9 @@ pub struct GraphicsDecoder<P: Platform> {
     /// far ([`Self::reconcile_laid`]).
     laid_uses: RefCell<Vec<LaidUse>>,
     laid_written: RefCell<Vec<u64>>,
+    /// The encoder being walked is a blit encoder, which writes only the destinations its ops
+    /// name ([`Self::texture_written`]), whatever its textures' usage.
+    laid_blit: Cell<bool>,
 }
 
 impl<P: Platform> Drop for GraphicsDecoder<P> {
@@ -1060,6 +1063,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             recent: Recent::new(),
             laid_uses: RefCell::new(Vec::new()),
             laid_written: RefCell::new(Vec::new()),
+            laid_blit: Cell::new(false),
         }
     }
 
@@ -5655,8 +5659,8 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.require_texture(id).map(Some)
     }
 
-    /// The texture `id` names is a blit's destination: noted as written, whatever its usage
-    /// ([`Self::note_laid`]).
+    /// The texture `id` names is a blit's destination or a render pass's attachment: noted as
+    /// written, whatever its usage ([`Self::note_laid`]). Nothing for 0.
     pub(crate) fn texture_written(&self, id: u64) {
         if let Some(used) = self.entry(id).and_then(|e| e.laid_use) {
             self.note_laid(used, true);
@@ -5664,13 +5668,17 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// Notes the use `used` of a texture over a plane of a laid-out device cache or its wide home
-    /// by the encoder being walked, written where `written` or where its usage may write it: at
-    /// the encoder's end the side written is copied into the other ([`Self::reconcile_laid`]).
+    /// by the encoder being walked, written where `written` (a blit's destination, a render
+    /// pass's attachment) or, outside a blit encoder, where its usage lets a shader write it: at
+    /// the encoder's end the side written is copied into the other ([`Self::reconcile_laid`]). A
+    /// blit's source is no write: counted as one, its stale side was copied over the other's
+    /// write (oracle_surftex `alias.narrow-clear.wide.fence` on RADV, its surface left without
+    /// the clear).
     fn note_laid(&self, mut used: LaidUse, written: bool) {
         if !self.surface_caches.any_home() {
             return;
         }
-        used.writes |= written;
+        used.writes = written || (used.writes && !self.laid_blit.get());
         self.laid_uses.borrow_mut().push(used);
     }
 }
@@ -5934,9 +5942,9 @@ fn surface_plane(
     })
 }
 
-/// `MTLTextureUsageShaderWrite` and `MTLTextureUsageRenderTarget`: a texture of either may be
-/// written by a shader or a render pass.
-const TEXTURE_USAGE_WRITES: u64 = 0x2 | 0x4;
+/// `MTLTextureUsageShaderWrite`: a texture of it may be written by a shader wherever it is bound.
+/// A render pass writes its attachments alone, which it names ([`GraphicsDecoder::texture_written`]).
+const TEXTURE_USAGE_WRITES: u64 = 0x2;
 
 /// The plane `plane` of the texture `m` makes over a buffer of a device cache laid out at the
 /// GPU's pitch, `laid`: its first byte, and its chroma plane's where its facts name a second

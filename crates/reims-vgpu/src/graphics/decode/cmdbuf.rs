@@ -160,6 +160,10 @@ use super::{
 /// raise returns for the handler to catch.
 const ON: OnFault = OnFault::Return;
 
+/// `MTLRenderStageFragment`: a render encoder's update of the writers' fence covers its fragment
+/// stage and every stage before it, its render targets' writes among them.
+const RENDER_STAGE_FRAGMENT: u64 = 0x2;
+
 /// What a command buffer's op stream does with events: the shared events it signals, whose values
 /// go to the guest as the GPU reaches them or once it finishes ([`Signals`]), the events it
 /// waits for, and the decodes of its video encoders, whose sessions' events it waits for too.
@@ -2266,6 +2270,19 @@ impl<P: Platform> GraphicsDecoder<P> {
         walked
     }
 
+    /// The writers' fence ([`super::surface_cache::Caches::writes_fence`]) where the encoder being
+    /// walked noted a use that may write a laid-out cache or its wide home ([`Self::note_laid`]),
+    /// for it to update as it ends; `None` where it noted none.
+    fn laid_writes_fence(&self, cb: &P::CommandBuffer) -> RaiseResult<Option<P::Fence>> {
+        if !self.laid_uses.borrow().iter().any(|u| u.writes) {
+            return Ok(None);
+        }
+        let Some(device) = cb.device() else {
+            return Ok(None);
+        };
+        self.surface_caches.writes_fence(&device)
+    }
+
     /// The encoder just ended in `cb` wrote, through textures over the planes of laid-out device
     /// caches or over their wide homes, the blocks its uses noted ([`Self::note_laid`]): each
     /// side written is copied into the other in `cb` before the next encoder
@@ -2535,6 +2552,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         match tag {
             RGFX_OP_ENCODER_BEGIN_RENDER => {
                 already_open(encoder, "ENCODER_BEGIN_RENDER")?;
+                self.laid_blit.set(false);
                 let built = self.build_render_pass(body, |count| {
                     cb.device()
                         .is_some_and(|d| makes_sample_count(&d.caps(), count))
@@ -2556,6 +2574,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             RGFX_OP_ENCODER_BEGIN_COMPUTE => {
                 already_open(encoder, "ENCODER_BEGIN_COMPUTE")?;
+                self.laid_blit.set(false);
                 let desc = compute_pass(body)?;
                 let enc = cb
                     .compute_encoder_for_pass(&desc)?
@@ -2564,6 +2583,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             RGFX_OP_ENCODER_BEGIN_BLIT => {
                 already_open(encoder, "ENCODER_BEGIN_BLIT")?;
+                self.laid_blit.set(true);
                 let enc = cb
                     .blit_encoder(ON)?
                     .ok_or_else(|| op_fault("the blit encoder was nil"))?;
@@ -2571,6 +2591,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             RGFX_OP_ENCODER_BEGIN_VIDEO => {
                 already_open(encoder, "ENCODER_BEGIN_VIDEO")?;
+                self.laid_blit.set(false);
                 let pass = RgfxOpVideoPass::read_from_prefix(body)
                     .map(|(pass, _)| pass)
                     .map_err(|_| op_fault("ENCODER_BEGIN_VIDEO: body too short"))?;
@@ -2583,13 +2604,44 @@ impl<P: Platform> GraphicsDecoder<P> {
                     Err(raise) => return Err(raise),
                 });
             }
-            RGFX_OP_ENCODER_END => match encoder.take() {
-                Some(OpenEncoder::Render(enc, _)) => enc.encode(ON, RenderCmd::EndEncoding)?,
-                Some(OpenEncoder::Compute(enc, _)) => enc.encode(ON, ComputeCmd::EndEncoding)?,
-                Some(OpenEncoder::Blit(enc)) => enc.encode(ON, BlitCmd::EndEncoding)?,
-                Some(OpenEncoder::Video(_) | OpenEncoder::Skipped(_)) => {}
-                None => return Err(op_fault("ENCODER_END with no open encoder")),
-            },
+            RGFX_OP_ENCODER_END => {
+                // An encoder that may have written a laid-out cache or its wide home updates the
+                // writers' fence as it ends, which the copies of its writes into the other side
+                // wait for ([`Self::reconcile_laid`]).
+                let fence = match encoder {
+                    Some(OpenEncoder::Video(_) | OpenEncoder::Skipped(_)) | None => None,
+                    Some(_) => self.laid_writes_fence(cb)?,
+                };
+                let fence = fence.as_ref();
+                match encoder.take() {
+                    Some(OpenEncoder::Render(enc, _)) => {
+                        if let Some(fence) = fence {
+                            enc.encode(
+                                ON,
+                                RenderCmd::UpdateFence {
+                                    fence,
+                                    stages: RENDER_STAGE_FRAGMENT,
+                                },
+                            )?;
+                        }
+                        enc.encode(ON, RenderCmd::EndEncoding)?;
+                    }
+                    Some(OpenEncoder::Compute(enc, _)) => {
+                        if let Some(fence) = fence {
+                            enc.encode(ON, ComputeCmd::UpdateFence { fence })?;
+                        }
+                        enc.encode(ON, ComputeCmd::EndEncoding)?;
+                    }
+                    Some(OpenEncoder::Blit(enc)) => {
+                        if let Some(fence) = fence {
+                            enc.encode(ON, BlitCmd::UpdateFence { fence })?;
+                        }
+                        enc.encode(ON, BlitCmd::EndEncoding)?;
+                    }
+                    Some(OpenEncoder::Video(_) | OpenEncoder::Skipped(_)) => {}
+                    None => return Err(op_fault("ENCODER_END with no open encoder")),
+                }
+            }
             RGFX_OP_SIGNAL_EVENT | RGFX_OP_WAIT_EVENT => {
                 let signal = tag == RGFX_OP_SIGNAL_EVENT;
                 let name = if signal { "SIGNAL_EVENT" } else { "WAIT_EVENT" };
@@ -2682,6 +2734,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             let tex = self.require_texture(a.texture_obj_id)?;
             let resolve = self.get_texture(a.resolve_texture_obj_id)?;
+            // The pass may write each attachment, and each resolve texture.
+            self.texture_written(a.texture_obj_id);
+            self.texture_written(a.resolve_texture_obj_id);
             let aset = ColorAttachmentSet {
                 texture: Some(Some(tex)),
                 resolve_texture: resolve.map(Some),
@@ -2767,6 +2822,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             let d = &desc.depth;
             let tex = self.require_texture(d.texture_obj_id)?;
             let resolve = self.get_texture(d.resolve_texture_obj_id)?;
+            self.texture_written(d.texture_obj_id);
+            self.texture_written(d.resolve_texture_obj_id);
             let dset = DepthAttachmentSet {
                 texture: Some(Some(tex)),
                 resolve_texture: resolve.map(Some),
@@ -2789,6 +2846,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             let s = &desc.stencil;
             let tex = self.require_texture(s.texture_obj_id)?;
             let resolve = self.get_texture(s.resolve_texture_obj_id)?;
+            self.texture_written(s.texture_obj_id);
+            self.texture_written(s.resolve_texture_obj_id);
             let sset = StencilAttachmentSet {
                 texture: Some(Some(tex)),
                 resolve_texture: resolve.map(Some),

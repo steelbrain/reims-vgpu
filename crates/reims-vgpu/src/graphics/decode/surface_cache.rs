@@ -153,8 +153,12 @@
 //!   its texel rows are copied into the other side in the same command buffer, before the next
 //!   encoder ([`SurfaceCaches::reconcile`]), as each Mac's next encoder of a command buffer reads
 //!   a write through another texture over the same plane, tracked or untracked behind a fence
-//!   (Q37). An encoder that writes through both keeps the home's writes in the texels both
-//!   hold, logged. What no walk sees written (a texture reached through an argument buffer with no
+//!   (Q37). A write is a blit's destination, a render pass's attachment, or, outside a blit
+//!   encoder, a texture whose usage lets a shader write it. The writing encoder updates a fence
+//!   of the caches' own as it ends, which every copy between a cache and its home waits for
+//!   ([`SurfaceCaches::writes_fence`]), so the copy follows the write whatever the textures'
+//!   hazard tracking. An encoder that writes through both keeps the home's writes in the texels
+//!   both hold, logged. What no walk sees written (a texture reached through an argument buffer with no
 //!   use named, a video op's picture) and what a fill brings into a stand-in's cache leaves the
 //!   home to take the cache's texel rows first in the next command buffer that uses the block
 //!   ([`SurfaceCaches::home_in`]), as does a home made over a cache that holds a write its
@@ -1213,6 +1217,10 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     dma_buf: bool,
     /// The device's recoveries the caches were last looked at for ([`Self::after_recovery`]).
     recoveries: u64,
+    /// The fence each encoder that wrote a laid-out cache or its wide home updates as it ends,
+    /// once one did, which every copy between a cache and its home waits for
+    /// ([`Self::writes_fence`]).
+    fence: Option<P::Fence>,
 }
 
 /// The command buffers begun and not finished that use one block's cache, by the number each was
@@ -1376,6 +1384,7 @@ impl<P: Platform> SurfaceCaches<P> {
             copy_gpu: Arc::default(),
             dma_buf: false,
             recoveries: 0,
+            fence: None,
         }
     }
 
@@ -2150,7 +2159,7 @@ impl<P: Platform> SurfaceCaches<P> {
         if home.pages && !written {
             return Ok(());
         }
-        if encode_home::<P>(cb, cache, Way::Out)? {
+        if encode_home::<P>(cb, cache, Way::Out, self.fence.as_ref())? {
             self.counts.wide_copies += 1;
         }
         Ok(())
@@ -2175,10 +2184,27 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         home.stale = false;
         let way = if from_home { Way::In } else { Way::Out };
-        if encode_home::<P>(cb, cache, way)? {
+        if encode_home::<P>(cb, cache, way, self.fence.as_ref())? {
             self.counts.wide_copies += 1;
         }
         Ok(())
+    }
+
+    /// The fence an encoder that may have written a laid-out cache or its wide home updates as it
+    /// ends, made the first time one does: the copies between the caches and their homes wait
+    /// for it ([`Self::reconcile`], [`Self::home_in`]), so they follow the writer's work whatever
+    /// its resources' hazard tracking. A writer through Untracked textures orders its readers
+    /// with fences of its own, which a copy the host adds between them does not wait for, and
+    /// the device may run that copy beside the writer: oracle_surftex
+    /// `alias.narrow-clear.wide.fence` on RADV read none of a render pass's writes through the
+    /// other texture. The runtime keys a fence on its identity alone, waits across queues for
+    /// an update on another, and keeps it past a recovery. `None` where the platform made no
+    /// fence.
+    pub(crate) fn writes_fence(&mut self, device: &P::Device) -> RaiseResult<Option<P::Fence>> {
+        if self.fence.is_none() {
+            self.fence = device.new_fence()?;
+        }
+        Ok(self.fence.as_ref().map(|f| f.clone_ref()))
     }
 
     /// The command buffer that ended with uses that may write the blocks `written` wrote them
@@ -3955,6 +3981,14 @@ impl<P: Platform> Caches<P> {
         self.homes.load(Ordering::Acquire)
     }
 
+    /// The fence an encoder that may have written a laid-out cache or its wide home updates as
+    /// it ends ([`SurfaceCaches::writes_fence`]).
+    pub(crate) fn writes_fence(&self, device: &P::Device) -> RaiseResult<Option<P::Fence>> {
+        let mut state = self.state.lock();
+        state.after_recovery(device);
+        state.writes_fence(device)
+    }
+
     /// An encoder just ended in command buffer `cb` that may have written the surfaces of
     /// `written`, each by its block and whether through a texture over its wide home: each side
     /// written is copied into the other in `cb` ([`SurfaceCaches::reconcile`]).
@@ -5174,12 +5208,14 @@ fn between<P: Platform>(
 /// Encodes in `cb`, in a blit encoder of its own, a copy of `cache`'s texel rows between the
 /// cache and its wide home ([`WideHome`]): into the cache for [`Way::In`], out of it into the home
 /// for [`Way::Out`]. Each row moves between its place in the cache, at the GPU's pitch, and its
-/// place in the surface's layout, which the home keeps ([`Repitched::cut`]). False, with nothing
+/// place in the surface's layout, which the home keeps ([`Repitched::cut`]), after the encoder
+/// waits for `fence`, the writers' ([`SurfaceCaches::writes_fence`]). False, with nothing
 /// encoded, where the cache has no home or the platform made no encoder.
 fn encode_home<P: Platform>(
     cb: &P::CommandBuffer,
     cache: &SurfaceCache<P>,
     way: Way,
+    fence: Option<&P::Fence>,
 ) -> RaiseResult<bool> {
     let Some(home) = &cache.wide else {
         return Ok(false);
@@ -5187,6 +5223,9 @@ fn encode_home<P: Platform>(
     let Some(blit) = cb.blit_encoder(ON)? else {
         return Ok(false);
     };
+    if let Some(fence) = fence {
+        blit.encode(ON, BlitCmd::WaitForFence { fence })?;
+    }
     let parts = cache.moves([(0..cache.length, 0)]);
     between::<P>(&blit, (&cache.device, &home.buffer), &parts, way)?;
     blit.encode(ON, BlitCmd::EndEncoding)?;
@@ -9399,6 +9438,18 @@ mod tests {
     /// first byte and rows 128 bytes apart, in buffer `buffer`: `format` (10 R8Unorm), `size`
     /// texels, usage ShaderRead.
     fn surface_texture(obj_id: u64, buffer: u64, format: u32, size: (u32, u32)) -> Vec<u8> {
+        surface_texture_as(obj_id, buffer, format, size, (1, 0))
+    }
+
+    /// [`surface_texture`]'s message with `(usage, options)` its descriptor's usage and resource
+    /// options.
+    fn surface_texture_as(
+        obj_id: u64,
+        buffer: u64,
+        format: u32,
+        size: (u32, u32),
+        (usage, options): (u32, u32),
+    ) -> Vec<u8> {
         use reims_vgpu_graphics::wire::{
             RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_SURFACE_NO_WRITERS, RgfxTextureDescriptor,
             RgfxTextureFromIOSurface,
@@ -9425,7 +9476,8 @@ mod tests {
                 mipmap_level_count: 1,
                 array_length: 1,
                 sample_count: 1,
-                usage: 1,
+                usage,
+                options,
                 ..RgfxTextureDescriptor::default()
             },
             writers_offset: RGFX_SURFACE_NO_WRITERS,
@@ -9635,6 +9687,78 @@ mod tests {
         let calls = r.p.call_log().since(mark);
         assert_eq!(copies(&calls), vec![(home, cache); 8]);
         assert_eq!(offsets(&calls), wide_rows(256));
+    }
+
+    /// The wide rig's textures 11 and 12 made again Untracked (resource options 0x100), with usage
+    /// ShaderRead and RenderTarget, as oracle_surftex's aliasing cases make them.
+    fn untracked_wide_rig() -> Rig {
+        let mut r = wide_rig(256, false);
+        for (obj_id, width) in [(11, 64), (12, 128)] {
+            let message = surface_texture_as(obj_id, 10, 10, (width, 8), (0x5, 0x100));
+            assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
+        }
+        r
+    }
+
+    /// An encoder that writes through a texture over a laid-out cache, Untracked, updates a fence
+    /// as it ends, and the copy of its write into the wide home waits for that fence before its
+    /// rows: so the copy follows the write, where it ran beside an Untracked writer and copied
+    /// the rows from before it (oracle_surftex `alias.narrow-clear.wide.fence` on RADV)
+    #[test]
+    fn a_writing_encoder_updates_the_fence_its_copies_wait_for() {
+        let mut r = untracked_wide_rig();
+        let cache = cache_id(&r);
+        let home = id_of(r.dec.caches().wide_buffer(BLOCK).unwrap().0);
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, false)]);
+        let mark = r.p.call_log().mark();
+        blit_with(&mut r, 0x101, true, slices(12, 11));
+        let calls = r.p.call_log().since(mark);
+        let fences: Vec<(&str, Option<u64>)> = (calls.iter())
+            .filter(|c| {
+                ["updateFence:", "waitForFence:", "endEncoding", COPY].contains(&c.sel)
+            })
+            .map(|c| (c.sel, c.args.first().and_then(|a| a.as_obj()).map(|o| o.0)))
+            .collect();
+        let fence = fences
+            .iter()
+            .find(|(sel, _)| *sel == "updateFence:")
+            .and_then(|(_, f)| *f)
+            .expect("the writer updates a fence");
+        let sels: Vec<&str> = fences.iter().map(|(sel, _)| *sel).collect();
+        let mut want = vec!["updateFence:", "endEncoding", "waitForFence:"];
+        want.extend([COPY; 8]);
+        want.push("endEncoding");
+        assert_eq!(sels, want);
+        assert_eq!(fences[2].1, Some(fence), "the copy waits for the writer's fence");
+        assert_eq!(copies(&calls), vec![(cache, home); 8], "the cache's rows into the home");
+    }
+
+    /// A blit that reads the texture past the plane's texels and writes the one of the plane's
+    /// own size (or writes neither) is no write of the home, whatever the textures' usage: only
+    /// the cache's rows go into the home, and nothing into the cache. Counted as a write by its
+    /// RenderTarget usage, the home's rows from before the write were copied over the cache's
+    /// write, which the surface then lost (oracle_surftex `alias.narrow-clear.wide.fence`)
+    #[test]
+    fn a_blit_reading_the_wide_texture_copies_nothing_into_the_cache() {
+        let mut r = untracked_wide_rig();
+        let cache = cache_id(&r);
+        let home = id_of(r.dec.caches().wide_buffer(BLOCK).unwrap().0);
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, false)]);
+        let mark = r.p.call_log().mark();
+        blit_with(&mut r, 0x101, true, slices(12, 11));
+        assert_eq!(
+            copies(&r.p.call_log().since(mark)),
+            vec![(cache, home); 8],
+            "the narrow texture's write alone"
+        );
+        let mark = r.p.call_log().mark();
+        blit_with(&mut r, 0x102, false, sync_texture(12));
+        let calls = r.p.call_log().since(mark);
+        assert!(copies(&calls).is_empty(), "{:?}", copies(&calls));
+        assert!(
+            !calls.iter().any(|c| c.sel == "updateFence:"),
+            "no write, no fence"
+        );
     }
 
     /// A blit synchronizing texture `texture`, which writes nothing of it.
