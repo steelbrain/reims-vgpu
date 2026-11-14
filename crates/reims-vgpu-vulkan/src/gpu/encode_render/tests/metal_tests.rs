@@ -4423,14 +4423,11 @@ fn drawn_extended_range_samples_resolve_as_metals() {
 
 /// How the resolve texture of [`resolved_into`] is made: a texture of its own of a storage
 /// mode (`MTLResourceOptions`), which Metal may compress losslessly or not
-/// (`allowGPUOptimizedContents`); one over an IOSurface of a storage mode, over the buffer that
-/// stands for it, presented as a drawable (`setIsDrawable:` and `setFramebufferOnly:`, render
-/// target usage alone) or not; or a
-/// Private shareable texture (`newSharedTextureWithDescriptor:`), or one opened from its handle.
+/// (`allowGPUOptimizedContents`); or a Private shareable texture
+/// (`newSharedTextureWithDescriptor:`), or one opened from its handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Made {
     Own { options: u64, optimized: bool },
-    Surface { options: u64, drawable: bool },
     Shareable { opened: bool },
 }
 
@@ -4447,9 +4444,9 @@ const PRIVATE: Made = Made::Own {
 };
 
 /// The resolve textures [`resolved_into`] measures plain Metal at: of its own, Shared, Managed
-/// and Private (compressed where Metal may, and not), over an IOSurface, Shared and Managed,
-/// each as a drawable too, and a shareable one and one opened from its handle.
-const SHAPES: [Made; 10] = [
+/// and Private (compressed where Metal may, and not), and a shareable one and one opened from its
+/// handle.
+const SHAPES: [Made; 6] = [
     SHARED,
     Made::Own {
         options: MANAGED,
@@ -4459,22 +4456,6 @@ const SHAPES: [Made; 10] = [
     Made::Own {
         options: 0x20,
         optimized: false,
-    },
-    Made::Surface {
-        options: 0,
-        drawable: false,
-    },
-    Made::Surface {
-        options: 0,
-        drawable: true,
-    },
-    Made::Surface {
-        options: MANAGED,
-        drawable: false,
-    },
-    Made::Surface {
-        options: MANAGED,
-        drawable: true,
     },
     Made::Shareable { opened: false },
     Made::Shareable { opened: true },
@@ -4741,15 +4722,14 @@ fn even_rate_map<P: Platform>(p: &P, d: &P::Device, (width, height): (u64, u64))
     d.new_rate_map(&m).unwrap().unwrap()
 }
 
-/// What a resolve texture made as `c.made` says holds, prefilled with 0xa5 (a surface's
-/// through its base address, another by a blit), after a 4-sample `c.from` colour attachment
+/// What a resolve texture made as `c.made` says holds, prefilled with 0xa5 by a blit, after a 4-sample `c.from` colour attachment
 /// of its size, cleared to (0.25, 0.5, 0.75, 1) and stored by an earlier pass, is drawn by
 /// `states`' state ([`sweep_state`]) as `c.calls` says and resolved into it by `c.store` in a
 /// pass of `c.load`, as [`Resolve`] says, and what its samples and the resolve texture of an
 /// attachment beside it
 /// hold after that pass ([`Resolved`]). The resolving pass clears to (0.75, 0.25, 0.5, 1), an
-/// attachment beside to (0.125, 0.25, 0.5, 1). A surface's bytes are read through its base
-/// address, as the guest reads them; another's by a blit. It runs in an autorelease pool of its
+/// attachment beside to (0.125, 0.25, 0.5, 1). Its bytes are read by a blit. It runs in an
+/// autorelease pool of its
 /// own: what Metal autoreleased (each command buffer and encoder, which a dev build cannot elide,
 /// and through them the case's queue, textures and buffers) goes at its end, where the test
 /// thread, which pops no pool, would keep every case's until the test ends.
@@ -4760,7 +4740,6 @@ fn resolved_into<P: Platform>(
     c: Resolve,
 ) -> Resolved {
     use crate::core::platform::values::{DepthAttachmentSet, PassSet, StencilAttachmentSet};
-    use crate::gpu::resource::tests::{StandIn, facts_of};
 
     let _pool = crate::core::rt::Pool::here();
     let (into, bytes) = c.into;
@@ -4783,47 +4762,28 @@ fn resolved_into<P: Platform>(
         d.new_texture(OnFault::Die, &desc).unwrap().unwrap()
     };
     let samples = multisample(c.from, c.usage.0, PRIVATE_OPTIONS, c.optimized);
-    let (options, usage, optimized, drawable) = match c.made {
-        Made::Own { options, optimized } => (options, c.usage.1, optimized, false),
-        Made::Surface {
-            options,
-            drawable: false,
-        } => (options, c.usage.1, true, false),
-        Made::Surface {
-            options,
-            drawable: true,
-        } => (options, TARGET, true, true),
-        Made::Shareable { .. } => (PRIVATE_OPTIONS, c.usage.1, true, false),
+    let (options, optimized) = match c.made {
+        Made::Own { options, optimized } => (options, optimized),
+        Made::Shareable { .. } => (PRIVATE_OPTIONS, true),
     };
     let desc = p.texture_descriptor(&TextureDesc {
         pixel_format: into,
         width,
         height,
-        usage,
+        usage: c.usage.1,
         resource_options: Some(options),
         allow_gpu_optimized_contents: (!optimized).then_some(false),
-        framebuffer_only: drawable.then_some(true),
-        is_drawable: drawable.then_some(true),
         ..TextureDesc::default()
-    });
-    let surface = matches!(c.made, Made::Surface { .. }).then(|| {
-        let ostype = if bytes == 8 { *b"RGhA" } else { *b"w30r" };
-        let facts = facts_of(ostype, (width, height), &[]);
-        let s = StandIn::<P>::shared(d, facts, vec![(0, width * bytes)], length);
-        // SAFETY: the buffer's first `n` bytes, which no texture uses yet.
-        unsafe { std::ptr::copy_nonoverlapping(prefill.as_ptr(), s.base(), n) };
-        s
     });
     let shareable = matches!(c.made, Made::Shareable { .. })
         .then(|| d.new_shared_texture(&desc).unwrap().unwrap());
-    let target = match (&surface, &shareable) {
-        (Some(s), _) => s.texture(&desc, 0).unwrap().unwrap(),
-        (None, Some(t)) if c.made == (Made::Shareable { opened: true }) => {
+    let target = match &shareable {
+        Some(t) if c.made == (Made::Shareable { opened: true }) => {
             let handle = t.new_shared_texture_handle().unwrap().unwrap();
             d.open_shared_texture(Some(&handle), 0).unwrap().unwrap()
         }
-        (None, Some(t)) => t.clone_ref(),
-        (None, None) => d.new_texture(OnFault::Die, &desc).unwrap().unwrap(),
+        Some(t) => t.clone_ref(),
+        None => d.new_texture(OnFault::Die, &desc).unwrap().unwrap(),
     };
     let beside = c.beside.map(|b| {
         let other = multisample(b.format, TARGET, PRIVATE_OPTIONS, true);
@@ -4844,22 +4804,20 @@ fn resolved_into<P: Platform>(
     let source = buffer::<P>(d, length, 0, &prefill);
     let q = d.new_command_queue().unwrap();
     let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-    if surface.is_none() {
-        blit_one::<P>(
-            &cb,
-            BlitCmd::CopyBufferToTexture {
-                source_buffer: &source,
-                source_offset: 0,
-                source_bytes_per_row: width * bytes,
-                source_bytes_per_image: length,
-                source_size: MtlSize::new(width, height, 1),
-                destination_texture: &target,
-                destination_slice: 0,
-                destination_level: 0,
-                destination_origin: MtlOrigin::new(0, 0, 0),
-            },
-        );
-    }
+    blit_one::<P>(
+        &cb,
+        BlitCmd::CopyBufferToTexture {
+            source_buffer: &source,
+            source_offset: 0,
+            source_bytes_per_row: width * bytes,
+            source_bytes_per_image: length,
+            source_size: MtlSize::new(width, height, 1),
+            destination_texture: &target,
+            destination_slice: 0,
+            destination_level: 0,
+            destination_origin: MtlOrigin::new(0, 0, 0),
+        },
+    );
     let colour = |red, green, blue| ClearColor {
         red,
         green,
@@ -5021,9 +4979,7 @@ fn resolved_into<P: Platform>(
         Some(out)
     });
     let out = buffer::<P>(d, length, 0, &[]);
-    if surface.is_none() {
-        blit_one::<P>(&cb, copy_out::<P>(&target, (width, height, bytes), &out));
-    }
+    blit_one::<P>(&cb, copy_out::<P>(&target, (width, height, bytes), &out));
     cb.commit(OnFault::Die).unwrap();
     cb.wait_until_completed(OnFault::Die).unwrap();
     assert!(cb.error().is_none(), "{c:?}: {:?}", cb.error());
@@ -5031,10 +4987,7 @@ fn resolved_into<P: Platform>(
         // SAFETY: a Shared buffer's first `n` bytes, read after the command buffer completed.
         unsafe { std::slice::from_raw_parts(b.contents().as_ptr::<u8>(), n) }.to_vec()
     };
-    let resolved = match &surface {
-        Some(s) => s.bytes(length),
-        None => read(&out, n),
-    };
+    let resolved = read(&out, n);
     let texels = usize::try_from(texels).unwrap();
     Resolved {
         resolved,
@@ -5458,16 +5411,14 @@ fn samples_resolved_into_the_twin_are_metals() {
 /// untouched ([`measured_pair`]), a 4-sample `BGRA8Unorm_sRGB` attachment into `RGBA16Float`,
 /// in a shape not measured ([`unmeasured_shape`]), whatever the runtime refuses of it, named
 /// with what lies outside: a resolve texture of another size, level 1 of a texture whose level
-/// 1 is the attachment's size, a 2D array's slice 1, a memoryless texture, a Private texture
-/// over an IOSurface, a texture over a plane of a surface with planes, a view, a texture over a
-/// buffer, and one in a heap; an attachment memoryless, in a heap, or with store action
+/// 1 is the attachment's size, a 2D array's slice 1, a memoryless texture, a view, a texture over
+/// a buffer, and one in a heap; an attachment memoryless, in a heap, or with store action
 /// options; a depth attachment that resolves; another colour attachment that resolves into a
 /// texture of another format the runtime does not resolve into; and a rate map the runtime does
 /// not take as the identity, a mutable one not yet reset and one whose rates vary. So does one
 /// by a store action left `Unknown`, which the runtime refuses as the pass is made
 #[test]
 fn untouched_resolves_in_shapes_not_measured_die_named() {
-    use crate::core::platform::os::surface::{SurfacePlaneSpec, SurfaceSpec};
     use crate::core::platform::rate_map::{RateMapDescriptor as _, RateMapLayerDescriptor as _};
     use crate::core::platform::resource::Heap as _;
     use crate::core::platform::values::{
@@ -5498,37 +5449,6 @@ fn untouched_resolves_in_shapes_not_measured_die_named() {
         d.new_texture(OnFault::Die, &desc).unwrap().unwrap()
     };
     let flat = desc(2, (16, 16), 1, 1, 0);
-    let surface = |planes: Option<Vec<SurfacePlaneSpec>>| {
-        let size = 16 * 16 * 8;
-        p.surfaces()
-            .create(&SurfaceSpec {
-                planes,
-                pixel_format: u32::from_be_bytes(*b"RGhA"),
-                alloc_size: 2 * size,
-                width: 16,
-                height: 16,
-                bytes_per_element: 8,
-                bytes_per_row: 16 * 8,
-                element_width: 1,
-                element_height: 1,
-                ..SurfaceSpec::default()
-            })
-            .unwrap()
-    };
-    let plane = |base: u64| SurfacePlaneSpec {
-        base,
-        offset: base,
-        width: 16,
-        height: 16,
-        size: 16 * 16 * 8,
-        bytes_per_row: 16 * 8,
-        bytes_per_element: 8,
-        element_width: 1,
-        element_height: 1,
-        ..SurfacePlaneSpec::default()
-    };
-    let flat_surface = surface(None);
-    let planar = surface(Some(vec![plane(0), plane(16 * 16 * 8)]));
     let heap = d
         .new_heap(&HeapDesc {
             size: 1 << 20,
@@ -5542,7 +5462,7 @@ fn untouched_resolves_in_shapes_not_measured_die_named() {
     let bytes = d.new_buffer_of_length(OnFault::Die, 16 * 16 * 8, 0);
     let bytes = bytes.unwrap().unwrap();
     let own = made(2, (16, 16), 1, 1, 0);
-    let resolves: [(&str, VulkanTexture, (u64, u64)); 10] = [
+    let resolves: [(&str, VulkanTexture, (u64, u64)); 8] = [
         (
             "the resolve texture is 32 by 32, the attachment 16 by 16",
             made(2, (32, 32), 1, 1, 0),
@@ -5561,24 +5481,6 @@ fn untouched_resolves_in_shapes_not_measured_die_named() {
         (
             "the resolve texture is a texture of its own of storage mode Memoryless",
             made(2, (16, 16), 1, 1, MEMORYLESS),
-            (0, 0),
-        ),
-        (
-            "the resolve texture is a texture over an IOSurface of storage mode Private",
-            d.new_texture_on_surface(
-                &desc(2, (16, 16), 1, 1, PRIVATE_OPTIONS),
-                Some(&flat_surface),
-                0,
-            )
-            .unwrap()
-            .unwrap(),
-            (0, 0),
-        ),
-        (
-            "the resolve texture is a texture over a plane of an IOSurface with planes",
-            d.new_texture_on_surface(&flat, Some(&planar), 0)
-                .unwrap()
-                .unwrap(),
             (0, 0),
         ),
         (

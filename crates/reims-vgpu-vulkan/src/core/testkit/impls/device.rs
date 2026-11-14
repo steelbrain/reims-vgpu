@@ -30,7 +30,7 @@ use crate::core::platform::values::{
     FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc, HeapMade, IcbDesc, OptionSet,
     PagesInPlace, PagesPlane, RenderPipelineDesc, SamplerDesc,
 };
-use crate::core::platform::{Handle, HostRange, Platform};
+use crate::core::platform::{HostRange, Platform};
 use crate::core::raise::{OnFault, RaiseResult};
 
 /// The name the fake logs and scripts [`GpuDevice::new_command_queue_unshared`] under: no selector
@@ -144,30 +144,6 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
                 let b = new_buffer(w, length, options, Backing::At(pointer), None)?;
                 if let Model::Buffer(m) = &mut b.state().model {
                     m.deallocator = deallocator;
-                }
-                Some(b)
-            },
-        )
-    }
-
-    fn new_buffer_on_surface(
-        &self,
-        iosurface: Option<&<FakePlatform as Platform>::Surface>,
-    ) -> RaiseResult<Option<<FakePlatform as Platform>::Buffer>> {
-        let surface = iosurface.map(Handle::clone_ref);
-        self.make(
-            Policy::Caught,
-            "newBufferWithIOSurface:",
-            vec![Arg::opt(iosurface)],
-            |w| {
-                let s = surface?;
-                let (base, len) = (
-                    crate::core::platform::os::surface::Surface::base_address(&s),
-                    crate::core::platform::os::surface::Surface::alloc_size(&s),
-                );
-                let b = new_buffer(w, len, 0, Backing::At(base), None)?;
-                if let Model::Buffer(m) = &mut b.state().model {
-                    m.surface = Some(s);
                 }
                 Some(b)
             },
@@ -417,7 +393,7 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
             Policy::Caught,
             "newSharedTextureWithDescriptor:",
             vec![Arg::obj(descriptor)],
-            |w| Some(new_texture(w, desc, None, 0, None, true)),
+            |w| Some(new_texture(w, desc, None, true)),
         )
     }
 
@@ -445,7 +421,7 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
                     .unwrap_or_default();
                 desc.resource_index = Some(resource_index);
                 desc.force_resource_index = true;
-                Some(new_texture(w, desc, None, 0, Some(t), true))
+                Some(new_texture(w, desc, Some(t), true))
             },
         )
     }
@@ -460,23 +436,7 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
             Policy::On(on),
             "newTextureWithDescriptor:",
             vec![Arg::obj(descriptor)],
-            |w| Some(new_texture(w, desc, None, 0, None, false)),
-        )
-    }
-
-    fn new_texture_on_surface(
-        &self,
-        descriptor: &<FakePlatform as Platform>::TextureDescriptor,
-        iosurface: Option<&<FakePlatform as Platform>::Surface>,
-        plane: u64,
-    ) -> RaiseResult<Option<<FakePlatform as Platform>::Texture>> {
-        let desc = descriptor.desc();
-        let surface = iosurface.map(Handle::clone_ref);
-        self.make(
-            Policy::Caught,
-            "newTextureWithDescriptor:iosurface:plane:",
-            vec![Arg::obj(descriptor), Arg::opt(iosurface), Arg::U64(plane)],
-            |w| Some(new_texture(w, desc, Some(surface?), plane, None, false)),
+            |w| Some(new_texture(w, desc, None, false)),
         )
     }
 

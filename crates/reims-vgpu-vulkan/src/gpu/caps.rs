@@ -339,7 +339,8 @@ fn computed(device: &rt::Device, private: &rt::PrivateProperties) -> (u64, Limit
         is_large_mrt_supported: flag(F::IsLargeMrtSupported),
         is_rgb10a2_gamma_supported: stand_in::RGB10A2_GAMMA,
         supports_buffer_with_address_ranges: false,
-        // This platform makes a buffer at an IOSurface's base (`new_buffer_on_surface`).
+        // The guest makes a buffer over a surface's pages through the reims-graphics device
+        // (`RgfxBufferOverSurfacePages`), which this platform makes as any no-copy buffer.
         supports_buffer_with_iosurface: true,
         // The adapter builds command predication (`predication`).
         supports_command_buffer_jump: true,

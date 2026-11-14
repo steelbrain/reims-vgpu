@@ -117,43 +117,20 @@
 //! (`family_samples_in_fragments_as_metals`), as 500's linear samples magnified and minified are
 //! (`ycbcr8_420_textures_over_surfaces_read_as_metals`).
 //!
+//! **Writes.** The runtime stores a GPU write of a texture of 503, 507, 542 or 545 into the
+//! surface's planes as Metal's GPU does, a kernel's and a fragment function's
+//! (`writes_of_444_textures_are_metals`, `fragment_writes_of_444_textures_are_metals`), and drops
+//! a 4:2:0 or 4:2:2 one's and the packed 510's and 530's, as Metal's GPU drops them on this host
+//! (`kernel_writes_metal_drops_are_dropped_as_metals`). Metal's kernel stores into a texture of
+//! the `_sRGB` twins 523 and 527 change its planes by a rule the runtime does not hold; the
+//! runtime's stores of them are not compared.
+//!
 //! Not measured: anisotropic filtering (a texture over an IOSurface has one level).
 
 use metal2vulkan::metal::PixelFormat;
 use metal2vulkan_runtime as rt;
 
 use crate::answer::unrepresentable;
-
-/// Whether the runtime refuses a GPU write of a texture of `pf` over a surface that Metal's GPU
-/// writes otherwise: a 4:4:4 format of the family whose writes the runtime neither stores as
-/// Metal does (`metal::format::ycbcr_writes_stored`) nor drops as Metal does
-/// (`metal::format::writes_dropped`), the `_sRGB` twins 523 and 527, whose planes Metal's kernel
-/// stores change by a rule the runtime does not hold (measured:
-/// `writes_the_runtime_refuses_die`). The runtime stores a write of 503, 507, 542 and 545 into
-/// the surface's planes as Metal's does, a kernel's and a fragment function's
-/// (`writes_of_444_textures_are_metals`, `fragment_writes_of_444_textures_are_metals`), and
-/// drops a 4:2:0 or 4:2:2 one's and the packed 510's and 530's, as Metal's GPU drops them on
-/// this host (`kernel_writes_metal_drops_are_dropped_as_metals`).
-pub(crate) fn writes_refused(pf: PixelFormat) -> bool {
-    use metal2vulkan::metal::format::{writes_dropped, ycbcr_format, ycbcr_writes_stored};
-    runtime_makes(pf)
-        && !ycbcr_writes_stored(pf)
-        && !writes_dropped(pf)
-        && ycbcr_format(pf).is_some_and(|f| f.subsampling.halved() == [false, false])
-}
-
-/// Dies at `sel`, a command that may write `what` a texture of `pf` over a surface
-/// ([`writes_refused`]), whose write the runtime refuses where Metal's GPU stores it into the
-/// surface's planes.
-pub(crate) fn refused_write(sel: &'static str, what: &str, pf: PixelFormat) -> ! {
-    crate::answer::unrepresentable(
-        sel,
-        &format!(
-            "{what} a texture of {pf:?} over a surface, a write the runtime refuses and Metal's \
-             GPU stores into the surface's planes"
-        ),
-    )
-}
 
 /// Dies at `sel`, the creator of the render pass `d`, which the runtime refused with `e`, a
 /// refusal of a pixel format ([`crate::gpu::desc::is_format_refusal`]), where a colour attachment

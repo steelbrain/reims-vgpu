@@ -21,11 +21,9 @@ use super::impls::descriptor::TextureDescriptorModel;
 use super::impls::device::DeviceModel;
 use super::objects::{Fk, Model, TexDesc, World, kind};
 use super::script::Script;
-use super::surfaces::FakeSurfaces;
 use super::threads::FakeThreads;
 use super::vm::FakeVm;
 use crate::core::platform::os::Threads;
-use crate::core::platform::os::surface::IoSurfaces;
 use crate::core::platform::os::vm::HostVm;
 use crate::core::platform::types::MtlSize;
 use crate::core::platform::values::{RateMapDesc, TextureDesc};
@@ -60,7 +58,6 @@ pub mod types {
 pub struct FakePlatform {
     world: Arc<World>,
     device: Fk<kind::Device>,
-    surfaces: FakeSurfaces,
     threads: FakeThreads,
     registry_id: u64,
 }
@@ -85,7 +82,6 @@ impl FakePlatform {
         let world = World::new();
         let device = world.new_obj(Model::Device(DeviceModel::default()));
         FakePlatform {
-            surfaces: FakeSurfaces::new(world.clone()),
             threads: FakeThreads::for_world(world.clone()),
             registry_id: FAKE_REGISTRY_ID,
             device,
@@ -132,11 +128,6 @@ impl FakePlatform {
     /// The address space.
     pub fn fake_vm(&self) -> &FakeVm {
         &self.world.vm
-    }
-
-    /// The IOSurface factory.
-    pub fn fake_surfaces(&self) -> &FakeSurfaces {
-        &self.surfaces
     }
 
     /// The thread recorder.
@@ -199,7 +190,6 @@ impl Platform for FakePlatform {
     type RenderPassDescriptor = Fk<kind::RenderPassDescriptor>;
     type RateMapDescriptor = Fk<kind::RateMapDescriptor>;
     type RateMapLayerDescriptor = Fk<kind::RateMapLayerDescriptor>;
-    type Surface = Fk<kind::Surface>;
     type Clock = VirtualClock;
 
     fn new_render_pass_descriptor(&self) -> Self::RenderPassDescriptor {
@@ -289,10 +279,6 @@ impl Platform for FakePlatform {
     /// The fake's device when `registry_id` is its registry ID.
     fn open_device(&self, registry_id: u64) -> Option<Self::Device> {
         (registry_id == self.registry_id).then(|| self.device.clone_ref())
-    }
-
-    fn surfaces(&self) -> &dyn IoSurfaces<Self> {
-        &self.surfaces
     }
 
     fn vm(&self) -> &dyn HostVm {

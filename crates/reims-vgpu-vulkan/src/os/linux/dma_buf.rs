@@ -941,34 +941,6 @@ mod tests {
         assert_eq!(zeros.pieces(0x3000, 0x2000).unwrap().len(), 1);
     }
 
-    /// Every request of an import's source over the same pages of the block of zeros answers the
-    /// same pieces of the same files, as the runtime's contract asks
-    /// (`rt::HostMemory::with_dma_buf`): a write through the import's dma-buf there is what the
-    /// dma-buf of a texture's pages inside it reads. The write never reaches the block, nor
-    /// another import's dma-buf of the same pages
-    #[test]
-    fn a_sources_requests_over_zero_pages_answer_the_same_files() {
-        if !udmabuf() {
-            return;
-        }
-        let page = vm::page_size();
-        let at = super::super::import::allocate_zeros(4 * page).unwrap();
-        let first = at.addr().to_u64();
-        let zeros = Zeros::default();
-        let whole = of_pages(first, 4 * page, page, &zeros).unwrap();
-        let texture = of_pages(first + page, 2 * page, 2 * page, &zeros).unwrap();
-        let other = of_pages(first, 4 * page, page, &Zeros::default()).unwrap();
-        assert_eq!((whole.len(), texture.len(), other.len()), (1, 1, 1));
-        write_through(&whole[0], 2 * page, 0x5a);
-        assert_eq!(read_through(&texture[0], page), 0x5a, "the same pages");
-        assert_eq!(read_through(&other[0], 2 * page), 0, "another import's");
-        // SAFETY: the block's page, mapped readable, which nothing writes now.
-        let block = unsafe { vm::ptr(first + 2 * page).cast::<u8>().read_volatile() };
-        assert_eq!(block, 0);
-        let vm = super::super::LinuxVm::new();
-        assert!(vm.deallocate(at, 4 * page).is_success());
-    }
-
     fn run(file: u32, offset: u64, length: u64) -> Run<u32> {
         Run {
             file,

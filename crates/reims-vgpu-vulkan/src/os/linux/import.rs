@@ -106,17 +106,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::core::num::{ToU64, ToUsize};
-use crate::core::platform::os::vm::{HostAddr, KernReturn};
+use crate::core::platform::os::vm::HostAddr;
 use crate::core::sync::Mutex;
 use metal2vulkan_runtime as rt;
 
 use super::budget;
 use super::files;
 use super::vm;
-
-/// Whether the runtime imports a surface's read-only alias through a writable twin of its files:
-/// on Linux, so read-only memory the library makes has a file behind every byte (module docs).
-pub(crate) const TWINS_READ_ONLY: bool = true;
 
 /// Whether the runtime makes read-only memory other than a surface's, and memory made with
 /// `MTLResourceOptions` bit 24, over a copy of it whose GPU writes it drops, where Metal's GPU
@@ -129,23 +125,6 @@ static TWINS: Mutex<BTreeMap<u64, (u64, u64)>> = Mutex::new(BTreeMap::new());
 
 /// The files of zeros ([`allocate_zeros`]), held for the process.
 static ZERO_FILES: Mutex<Vec<Arc<OwnedFd>>> = Mutex::new(Vec::new());
-
-/// A fresh range of `len` bytes of zeros that a view can be made of, as
-/// [`vm::allocate_aliasable`] makes, whose file is kept for the process: an import's twin of it
-/// is private zeros, never the file (module docs).
-pub(crate) fn allocate_zeros(len: u64) -> Result<HostAddr, KernReturn> {
-    let at = vm::allocate_aliasable(len)?;
-    if let Some(piece) = files::pieces(at.addr().to_u64(), 1).and_then(|p| p.into_iter().next()) {
-        ZERO_FILES.lock().push(piece.backing.fd);
-    }
-    Ok(at)
-}
-
-/// Whether `fd` is a file of zeros.
-#[cfg(test)]
-fn zeros(fd: &Arc<OwnedFd>) -> bool {
-    ZERO_FILES.lock().iter().any(|z| Arc::ptr_eq(z, fd))
-}
 
 /// Whether each of `pieces` is of a file of zeros, the files looked at once.
 pub(super) fn of_zeros(pieces: &[files::Piece]) -> Vec<bool> {
@@ -1057,26 +1036,6 @@ impl ImportView {
         ImportMade(self.pinned.as_ref().map(|p| p.0))
     }
 
-    /// Another import of the same memory while the view lives (`crate::gpu::backing`'s aliases,
-    /// whose imports share one view): its pages counted as being made again, so no fold maps
-    /// them through dma-bufs meanwhile, and what of them a fold mapped so mapped from their files
-    /// again, as for the first ([`import_view`]); the word that it was made.
-    pub(crate) fn again(&self) -> ImportMade {
-        let Some(pinned) = &self.pinned else {
-            return ImportMade(None);
-        };
-        let end = match PINNED.lock().get_mut(&pinned.0) {
-            Some(record) => {
-                record.making = record.making.saturating_add(1);
-                record.end
-            }
-            None => return ImportMade(None),
-        };
-        // Pages left in views through dma-bufs for want of room are refused at the gate.
-        let _ = vm::unfold(pinned.0.0, end);
-        ImportMade(Some(pinned.0))
-    }
-
     /// The runtime's deallocator of the import, and what keeps the import's memory mapped beside
     /// the bytes themselves. With a twin: `inner`, given `original`, the address the bytes were
     /// given at, and the twin, which the runtime drops once it freed the import, so the twin is
@@ -1570,15 +1529,10 @@ mod tests {
     }
 
     /// A twin takes a mapping for each run of its pieces that maps as one, following pieces of
-    /// one file or neighbouring pieces of zeros, and the kernel maps it so
+    /// one file, and the kernel maps it so
     #[test]
     fn a_twin_counts_its_mappings_as_the_kernel_maps_them() {
         let f = vm::memfd(4 * PAGE).unwrap();
-        let zero_at = allocate_zeros(PAGE).unwrap();
-        let z = files::pieces(zero_at.addr().to_u64(), 1).unwrap()[0]
-            .backing
-            .fd
-            .clone();
         let piece = |at: u64, fd: &Arc<OwnedFd>, offset: u64| files::Piece {
             at: at * PAGE,
             length: PAGE,
@@ -1591,9 +1545,6 @@ mod tests {
         let mappings = |pieces: &[files::Piece]| twin_mappings(pieces, &of_zeros(pieces));
         assert_eq!(mappings(&[piece(0, &f, 0), piece(1, &f, 1)]), 1);
         assert_eq!(mappings(&[piece(0, &f, 1), piece(1, &f, 0)]), 2);
-        assert_eq!(mappings(&[piece(0, &z, 0), piece(1, &z, 5)]), 1);
-        let mixed = [piece(0, &f, 0), piece(1, &z, 0), piece(2, &f, 2)];
-        assert_eq!(mappings(&mixed), 3);
         // A read-only view of the file's pages 2, 3, 0 and 1: its twin maps as two.
         let vm = LinuxVm::new();
         let source = vm::allocate_aliasable(4 * PAGE).unwrap();
@@ -1615,83 +1566,6 @@ mod tests {
         drop(import);
         assert!(vm.deallocate(view, 4 * PAGE).is_success());
         assert!(vm.deallocate(source, 4 * PAGE).is_success());
-        assert!(vm.deallocate(zero_at, PAGE).is_success());
-    }
-
-    /// A twin of zeros is private zeros: its writes never reach the shared file
-    #[test]
-    fn a_twin_of_zeros_keeps_its_writes_to_itself() {
-        let vm = LinuxVm::new();
-        let at = allocate_zeros(PAGE).unwrap();
-        let first = at.addr().to_u64();
-        assert!(zeros(&files::pieces(first, 1).unwrap()[0].backing.fd));
-        assert!(vm.protect_max(at, PAGE, VmProt::READ).is_ok());
-        let p = address(first).unwrap();
-        let view = import_view(p, PAGE, true);
-        let twin = addr(view.at());
-        assert_ne!(twin, first);
-        assert_eq!(read(twin), 0);
-        write(twin, 7);
-        assert_eq!((read(twin), read(first)), (7, 0));
-        drop(view);
-        assert!(vm.deallocate(at, PAGE).is_success());
-    }
-
-    /// A read-only alias of guest pages shorter than its size, a heap's, is
-    /// imported through a writable twin: the pages' bytes, then zeros of the twin's own past
-    /// them, as its zeros map the block of zeros
-    #[test]
-    fn a_read_only_alias_with_zeros_past_its_pages_is_twinned() {
-        use crate::core::platform::types::ResourceAddressRange;
-
-        let vm = LinuxVm::new();
-        let guest = vm::allocate_aliasable(PAGE).unwrap();
-        let first = guest.addr().to_u64();
-        write(first + 5, 0x6b);
-        let ranges = [ResourceAddressRange {
-            address: first,
-            length: PAGE,
-        }];
-        let alias = crate::gpu::backing::gather_or_nil("test", &ranges, 3 * PAGE, true).unwrap();
-        let at = alias.first();
-        let view = import_view(at, 3 * PAGE, true);
-        let twin = addr(view.at());
-        assert_ne!(twin, addr(at), "a twin");
-        assert_eq!(read(twin + 5), 0x6b, "the guest's page");
-        assert_eq!((read(twin + PAGE), read(twin + 3 * PAGE - 1)), (0, 0));
-        write(twin + 2 * PAGE, 9);
-        assert_eq!(
-            read(addr(at) + 2 * PAGE),
-            0,
-            "the alias's zeros keep none of it"
-        );
-        drop(view);
-        drop(alias);
-        assert!(vm.deallocate(guest, PAGE).is_success());
-    }
-
-    /// Readable pages with no file behind them, which no view is made of, are the host's refusal
-    /// of an alias of them, where Metal takes them: the call that gathers them, whose refusal is
-    /// nil, answers nil by default, counted, as when memory runs out, and dies in strict mode
-    #[test]
-    fn a_gather_of_pages_without_a_file_is_the_hosts_refusal() {
-        use crate::core::platform::types::ResourceAddressRange;
-        use crate::core::raise::death::DeathKind;
-        use crate::core::testkit::capture::catch_death;
-
-        let vm = LinuxVm::new();
-        let at = vm.allocate_anywhere(PAGE).unwrap();
-        let ranges = [ResourceAddressRange {
-            address: at.addr().to_u64(),
-            length: PAGE,
-        }];
-        let or_nil = || crate::gpu::backing::gather_or_nil("test", &ranges, PAGE, false).is_some();
-        let site = catch_death(or_nil).unwrap_err();
-        assert_eq!((site.kind, site.file), (DeathKind::Abort, "test"), "strict");
-        let before = crate::answer::out_of_host_memory_count();
-        assert!(!crate::answer::relaxed(or_nil), "nil");
-        assert_eq!(crate::answer::out_of_host_memory_count(), before + 1);
-        assert!(vm.deallocate(at, PAGE).is_success());
     }
 
     /// Memory with no file behind it is given as it is, for the runtime to refuse
@@ -1844,12 +1718,10 @@ mod tests {
     }
 
     /// An import's view is folded into a dma-buf as a view no import holds is once the import is
-    /// made on a device that keeps what it pinned at the import, and not while it is being made;
-    /// another import of the same view (an alias's, `crate::gpu::backing`) maps it from its files
-    /// again and keeps it so until that import is made too. The flag is the process's, which
-    /// nextest runs this test alone in.
+    /// made on a device that keeps what it pinned at the import, and not while it is being made.
+    /// The flag is the process's, which nextest runs this test alone in.
     #[test]
-    fn a_made_import_s_view_folds_and_another_maps_it_from_its_files_again() {
+    fn a_made_import_s_view_folds_once_made() {
         if !super::super::dma_buf::opens() {
             return;
         }
@@ -1871,13 +1743,6 @@ mod tests {
         import.made().made_here();
         vm::fold_idle();
         assert!(folded(), "made: folded ({} mappings)", maps());
-        let again = import.again();
-        assert!(from_files(), "another import: mapped from its files again");
-        vm::fold_idle();
-        assert!(from_files(), "the other being made: not folded");
-        again.made_here();
-        vm::fold_idle();
-        assert!(folded(), "both made: folded ({} mappings)", maps());
         drop(import);
         IMPORTS_NEED_FILES.store(false, Ordering::Relaxed);
         assert!(vm.deallocate(view, n * PAGE).is_success());

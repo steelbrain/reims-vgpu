@@ -9,31 +9,18 @@
 //!   (`crate::platform::default_device`),
 //!   asked of Metal at run time on macOS ([`registry_id`]), which is what a host names it by; the
 //!   runtime's own on Linux.
-//! - **A texture over an IOSurface** is a debug line under this module's target
-//!   (`REIMS_VGPU_LOG=debug`, or `warn,reims_vgpu_vulkan::gpu::device=debug`), written as
-//!   `newTextureWithDescriptor:iosurface:plane:` is called, before it answers or dies, but after
-//!   a nil surface, which dies first ([`OnSurface`]): which formats a guest makes over which
-//!   plane of which surfaces, at what size. The line is a diagnostic: it changes nothing the
-//!   guest or the host sees, and with the target's debug lines off nothing formats it.
-//! - **A buffer over an IOSurface** is a debug line under the same target, written as the buffer
-//!   is made (`buffer_over_surface_at`): its selector and length, the memory the surface is in
-//!   (its own, the guest's pages, or a mapping of its own of them, `crate::os::memory_kind`), and
-//!   whether the buffer is imported at the surface's base address or lies over an alias of its
-//!   allocation, at which offset, and whether the alias is new, kept from an earlier buffer, or
-//!   none. It too changes nothing the guest or the host sees.
 
 use std::collections::BTreeMap;
-use std::fmt;
 use std::ptr::NonNull;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, OnceLock};
 
 use crate::core::host::HostPtr;
 use crate::core::platform::caps::{DeviceCaps, IdentityCaps};
 use crate::core::platform::device::{GpuDevice, NoCopyDeallocator};
 use crate::core::platform::os::vm::HostVm;
 use crate::core::platform::types::{
-    ArgumentKind, ArgumentLayout, ArgumentMember, NsErrorText, PixelFormatInfo,
-    ResourceAddressRange, SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
+    ArgumentKind, ArgumentLayout, ArgumentMember, NsErrorText, PixelFormatInfo, SizeAndAlign,
+    TextureLevelInfo, TextureLevelQuery,
 };
 use crate::core::platform::values::{
     ArgumentDesc, BufferDeallocator, BufferDesc, DepthStencilDesc, FullComputePipelineDesc,
@@ -44,7 +31,7 @@ use crate::core::platform::{Handle, HostRange};
 use crate::core::raise::{Kept, OnFault, RaiseResult, keep_forever};
 use crate::core::rt::BlockEnv;
 use crate::core::sync::Mutex;
-use metal2vulkan::pipeline::{ComputePipelineDescriptor, StageSource};
+use metal2vulkan::pipeline::ComputePipelineDescriptor;
 use metal2vulkan_runtime as rt;
 
 use crate::answer::{
@@ -59,7 +46,7 @@ use crate::gpu::desc::{
 };
 use crate::gpu::event::{VulkanEvent, VulkanSharedEvent};
 use crate::gpu::icb::VulkanIcb;
-use crate::gpu::metal_space::{self, PinRefused, Placing, SurfacePlace, TextureKind};
+use crate::gpu::metal_space::{self, PinRefused, Placing, TextureKind};
 use crate::gpu::rate_map::{VulkanRateMap, VulkanRateMapDescriptor};
 use crate::gpu::resource::{
     BufferObject, ComputePipelineObject, HeapObject, LibraryObject, TextureObject, Under,
@@ -68,7 +55,7 @@ use crate::gpu::resource::{
     VulkanTexture,
 };
 use crate::gpu::timing;
-use crate::os::{OsSurface, OsVm};
+use crate::os::OsVm;
 use crate::platform::{Obj, VulkanPlatform};
 
 /// Core's layout of the runtime's `layout`, nested layouts with it.
@@ -110,76 +97,6 @@ fn argument_kind(ty: metal2vulkan::bind::ArgumentType) -> ArgumentKind {
         T::DepthStencilState => ArgumentKind::DepthStencilState,
         T::Struct => ArgumentKind::Struct,
         _ => ArgumentKind::Constant,
-    }
-}
-
-/// `newTextureWithDescriptor:iosurface:plane:`'s debug line ([the module docs](self)): the
-/// selector; the descriptor's pixel format, raw and by Metal's name; the plane asked for; the
-/// descriptor's width by height, its usage (the runtime's flags and the raw bits beside them) and
-/// its storage mode; then the surface's OSType (its four characters where they print, otherwise
-/// in hex), its plane count, and each plane's width by height and bytes per row, one plane after
-/// another, or the surface's own for a surface of no planes.
-pub struct OnSurface<'a> {
-    /// The descriptor's fields.
-    pub fields: &'a TextureFields,
-    /// The surface.
-    pub surface: &'a OsSurface,
-    /// The plane asked for.
-    pub plane: u64,
-}
-
-impl fmt::Display for OnSurface<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use crate::core::platform::os::surface::Surface as _;
-        let OnSurface {
-            fields,
-            surface,
-            plane,
-        } = self;
-        let d = &fields.desc;
-        let format = fields.raw_pixel_format();
-        let name = u32::try_from(format)
-            .ok()
-            .and_then(|raw| metal2vulkan::metal::PixelFormat::try_from(raw).ok())
-            .map_or("an unnamed format", metal2vulkan::metal::PixelFormat::name);
-        let usage = u64::from(d.usage.as_raw()) | fields.private_usage;
-        let storage = (d.resource_options.raw() >> 4) & 0xf;
-        let ostype = surface.pixel_format().to_be_bytes();
-        let count = surface.plane_count();
-        write!(
-            f,
-            "newTextureWithDescriptor:iosurface:plane: format {format} {name}, plane {plane}, \
-             {}x{}, usage {usage:#x}, storage {storage}; surface ",
-            d.width, d.height
-        )?;
-        if ostype.iter().all(|c| c.is_ascii_graphic() || *c == b' ') {
-            write!(f, "'{}'", String::from_utf8_lossy(&ostype))?;
-        } else {
-            write!(f, "{:#010x}", surface.pixel_format())?;
-        }
-        write!(f, ", {count} planes")?;
-        if count == 0 {
-            return write!(
-                f,
-                ": {}x{}, {} bytes per row",
-                surface.width(),
-                surface.height(),
-                surface.bytes_per_row()
-            );
-        }
-        for i in 0..count {
-            let separator = if i == 0 { ": " } else { "; " };
-            write!(f, "{separator}plane {i} ")?;
-            match crate::os::plane_shape(surface, i) {
-                Some((width, height, _)) => write!(f, "{width}x{height}")?,
-                None => f.write_str("unsized")?,
-            }
-            match crate::os::plane(surface, i) {
-                Some(p) => write!(f, ", {} bytes per row", p.bytes_per_row)?,
-                None => f.write_str(", no rows")?,
-            }
-        }
-        Ok(())
     }
 }
 
@@ -290,20 +207,6 @@ fn compile_error(
 /// else holds one (the C API's release of the process's last graphics device), takes them all:
 /// a device adopted after it is a new runtime device.
 static DEVICES: Mutex<Vec<(u64, VulkanDevice)>> = Mutex::new(Vec::new());
-
-/// The buffers over each surface at its range's address ([`metal_space::surface_buffer`]), by
-/// the surface's key: a buffer made over the surface while another holds the address shares the
-/// range of a live one (`newBufferWithIOSurface:`). Each holds its surface, so a key names one
-/// surface while a buffer under it lives.
-static SURFACE_BUFFERS: Mutex<BTreeMap<u64, Vec<Weak<BufferObject>>>> = Mutex::new(BTreeMap::new());
-
-/// Held while a buffer over a surface is made (`newBufferWithIOSurface:`), from Metal's space's
-/// count of the buffers at the surface's address ([`metal_space::surface_buffer`]) to the made
-/// buffer's place among [`SURFACE_BUFFERS`]: so a second buffer over the surface, made at once
-/// on another thread, is made
-/// after the first is kept, and shares its range, where it would otherwise find the address
-/// counted and no live buffer to share, and die.
-static SURFACE_BUFFER_MAKES: Mutex<()> = Mutex::new(());
 
 /// The runtime device of the first device the process adopted, if it adopted one.
 pub(crate) fn first_adopted() -> Option<rt::Device> {
@@ -710,21 +613,17 @@ impl VulkanDevice {
         })
     }
 
-    /// The handle of a texture this device made, on `surface` when it was made on one, answering
-    /// the usage bits `private_usage` beyond the runtime's ([`TextureObject::private_usage`]),
-    /// holding `space` of Metal's address space.
+    /// The handle of a texture this device made, answering the usage bits `private_usage` beyond
+    /// the runtime's ([`TextureObject::private_usage`]), holding `space` of Metal's address space.
     pub(crate) fn texture_of(
         &self,
         raw: rt::Texture,
-        surface: Option<Arc<OsSurface>>,
         private_usage: u64,
         space: Arc<metal_space::Hold>,
     ) -> VulkanTexture {
         Obj::new(TextureObject {
             raw,
             device: self.clone_ref(),
-            surface,
-            plane: None,
             under: None,
             private_usage,
             space,
@@ -749,8 +648,6 @@ impl VulkanDevice {
         Obj::new(TextureObject {
             raw,
             device: self.clone_ref(),
-            surface: None,
-            plane: None,
             under: Some(under),
             private_usage,
             space,
@@ -766,7 +663,7 @@ impl VulkanDevice {
         let mut desc = fields.descriptor("newTextureWithDescriptor:", Maker::Other);
         desc.placement = rt::IdPlacement::Outside;
         let raw = plain(|| self.raw.new_texture(&desc)).ok()?;
-        Some(self.texture_of(raw, None, 0, Arc::new(metal_space::Hold::NONE)))
+        Some(self.texture_of(raw, 0, Arc::new(metal_space::Hold::NONE)))
     }
 
     /// `newBufferWithLength:options:`'s buffer (`new_buffer_of_length`), declaring the bytes
@@ -820,15 +717,14 @@ impl VulkanDevice {
             },
         };
         metal_space::let_go(pool);
-        made.map(|b| b.map(|raw| self.buffer(raw, None)))
+        made.map(|b| b.map(|raw| self.buffer(raw)))
     }
 
-    /// The handle of a buffer this device made, over `surface` when it was made on one.
-    pub(crate) fn buffer(&self, raw: rt::Buffer, surface: Option<Arc<OsSurface>>) -> VulkanBuffer {
+    /// The handle of a buffer this device made.
+    pub(crate) fn buffer(&self, raw: rt::Buffer) -> VulkanBuffer {
         Obj::new(BufferObject {
             raw,
             device: self.clone_ref(),
-            surface,
             backing: Backing::new(false),
             heap: None,
         })
@@ -839,172 +735,9 @@ impl VulkanDevice {
         Obj::new(BufferObject {
             raw,
             device: self.clone_ref(),
-            surface: None,
             backing: Backing::new(false),
             heap: Some(heap.clone_ref()),
         })
-    }
-
-    /// A Shared no-copy buffer over all of `surface`'s memory (`IOSurfaceGetBaseAddress`, its
-    /// allocation size), whose deallocator holds `surface` until the runtime releases the buffer,
-    /// at Metal's moment (given a keep-alive), and whose range token is
-    /// `token`, which the runtime drops as it frees the buffer's range. Over the surface's memory
-    /// itself, the keep-alive holds that memory until the runtime frees its import on Linux,
-    /// whatever the surface's last release (`crate::os::surface_memory_hold`), and nothing holds
-    /// it on macOS, where the surface's last release may unmap it before (`crate::remap`'s docs,
-    /// "What is not ours to unmap"); over an alias, the keep-alive holds the alias until then.
-    ///
-    /// At an offset into the surface's allocation (`kIOSurfaceOffset`,
-    /// [`crate::os::surface_offset`]) the base address lies that far into it, and the buffer's last
-    /// bytes, as many, lie past the allocation's end. Metal's buffer on such a surface
-    /// (`newBufferWithIOSurface:`) answers the allocation size too, its first byte the surface's at
-    /// the base address, and reads 0 past the allocation's end (measured on the M3 Max at 0x40,
-    /// 0x1000 and 0x4000, by a kernel's copy). So the buffer is over an alias of the allocation's
-    /// pages followed by zero-filled pages of the platform's own ([`backing::gather_or_nil`]), from the
-    /// offset into it, where the pages past the allocation would be other memory or none; what a
-    /// write past the allocation's end does on Metal is not measured, and here it reaches those
-    /// pages alone. On Linux a surface over several ranges of the guest's pages lends its own
-    /// view of them as that alias, made with those zeros past its allocation, so no second view
-    /// of its pages is made (`crate::os::surface_alias`).
-    pub(crate) fn buffer_over_surface(
-        &self,
-        sel: &'static str,
-        surface: &Arc<OsSurface>,
-        token: rt::RangeToken,
-    ) -> RaiseResult<Option<rt::Buffer>> {
-        let any = rt::AddressPlacement::Any;
-        self.buffer_over_surface_at(sel, surface, (any, Some(token)), None, Nil::BufferLength)
-    }
-
-    /// [`buffer_over_surface`](Self::buffer_over_surface), at `placement` in the Metal address
-    /// space with its range token where it has one ([`metal_space::surface_buffer`]), sharing
-    /// the range of `shares`, a buffer over the surface, where given, `nil` saying which of the
-    /// runtime's refusals are nil: `Outside` for one of the platform's own, which takes no Metal
-    /// address ([`crate::gpu::own_buffer`]). The alias of the allocation, where the buffer lies
-    /// over one, is one for the surface, which every buffer over it lies over while one lives
-    /// ([`crate::os::surface_alias`]), so that each lies over the same first byte, in one import
-    /// of the same memory (`backing::Alias::into_runtime`).
-    pub(crate) fn buffer_over_surface_at(
-        &self,
-        sel: &'static str,
-        surface: &Arc<OsSurface>,
-        (placement, token): (rt::AddressPlacement, Option<rt::RangeToken>),
-        shares: Option<&rt::Buffer>,
-        nil: Nil,
-    ) -> RaiseResult<Option<rt::Buffer>> {
-        use crate::core::platform::os::surface::Surface as _;
-        let held = Arc::clone(surface);
-        let run: rt::Deallocator = Box::new(move |_, _| {
-            let _env = BlockEnv::foreign();
-            drop(held);
-        });
-        let (base, length) = (pointer(sel, surface.base_address()), surface.alloc_size());
-        let offset = crate::os::surface_offset(surface);
-        let (base, keep, import_made) = if offset == 0 {
-            log::debug!(
-                "{sel}: a buffer of {length:#x} bytes over a surface in {}, imported at its base \
-                 address",
-                crate::os::memory_kind(surface)
-            );
-            // The runtime runs the deallocator as it lets go of the buffer, which may drop the
-            // surface's last reference, and frees its import once nothing else holds it.
-            let hold = crate::os::surface_memory_hold(surface);
-            // The runtime imports the pages as they are mapped, from their files on Linux where a
-            // device needs them so (`crate::os::import_view`).
-            let site = backing::ImportSite::SurfaceBase;
-            let view = crate::os::import_view(base, length, false);
-            let traced = backing::ImportTrace::new(site, base, length, view.at());
-            let made = view.made();
-            (base, backing::keep_alive((hold, view, traced)), made)
-        } else {
-            let first = u64::try_from(base.as_ptr().addr())
-                .unwrap_or(u64::MAX)
-                .saturating_sub(offset);
-            let allocation = [ResourceAddressRange {
-                address: first,
-                length,
-            }];
-            let mut fresh = false;
-            let made = || {
-                fresh = true;
-                backing::gather_or_nil(sel, &allocation, length.saturating_add(offset), false)
-            };
-            let alias = crate::os::surface_alias(surface, made);
-            log::debug!(
-                "{sel}: a buffer of {length:#x} bytes over a surface in {}, at offset \
-                 {offset:#x}, over {} alias of its allocation",
-                crate::os::memory_kind(surface),
-                match (&alias, fresh) {
-                    (None, _) => "no",
-                    (Some(_), true) => "a new",
-                    (Some(_), false) => "the kept",
-                }
-            );
-            let Some(alias) = alias else {
-                return Ok(None);
-            };
-            let (at, keep, made) = alias.into_runtime(backing::ImportSite::Surface);
-            // The alias holds `offset` bytes more than the buffer, past its end.
-            let from = at
-                .as_ptr()
-                .wrapping_add(usize::try_from(offset).unwrap_or(usize::MAX));
-            (pointer(sel, HostPtr::from_ptr(from)), keep, made)
-        };
-        // SAFETY: an alias of the surface's allocation stays mapped until the runtime freed its
-        // import, which the keep-alive holds, and so does the surface's own memory on Linux
-        // (`surface_memory_hold`). On macOS the keep-alive holds nothing of that memory: it stays
-        // while the surface lives, which the deallocator holds until the runtime lets go of the
-        // buffer, Metal's moment, which may come before the import is freed. That falls short of
-        // `HostMemory::new`'s keep-alive clause, a deviation whose ground is MoltenVK's no-copy
-        // buffer keeping the pages Metal wired as it was made (`crate::remap`, "What is not ours
-        // to unmap").
-        let memory = unsafe { crate::os::host_memory(base) };
-        let contents = rt::BufferContents::NoCopy {
-            memory,
-            deallocator: Some(run),
-            keep_alive: Some(keep),
-        };
-        let descriptor =
-            rt::BufferDescriptor::new(length, rt::ResourceOptions::default(), contents)
-                .with_placement(placement);
-        let descriptor = match shares {
-            Some(other) => descriptor.with_range_of(other),
-            None => descriptor,
-        };
-        let made = create_buffer(sel, nil, None, || {
-            self.raw
-                .new_buffer_with_descriptor(with_token(descriptor, token))
-        });
-        if matches!(made, Ok(Some(_))) {
-            import_made.made(&self.raw);
-        }
-        made
-    }
-
-    /// A live buffer of this device over the surface `key` at its range's address
-    /// ([`SURFACE_BUFFERS`]), forgetting those gone.
-    fn live_surface_buffer(&self, key: u64) -> Option<VulkanBuffer> {
-        let mut surfaces = SURFACE_BUFFERS.lock();
-        let buffers = surfaces.get_mut(&key)?;
-        buffers.retain(|buffer| buffer.strong_count() > 0);
-        let live = (buffers.iter())
-            .filter_map(Obj::upgrade)
-            .find(|buffer| buffer.device.id() == self.id());
-        if buffers.is_empty() {
-            surfaces.remove(&key);
-        }
-        live
-    }
-
-    /// `buffer`, over the surface `key` at its range's address, for the buffers made over it
-    /// after it to share ([`SURFACE_BUFFERS`]).
-    fn keep_surface_buffer(key: u64, buffer: &VulkanBuffer) {
-        let mut surfaces = SURFACE_BUFFERS.lock();
-        surfaces.retain(|_, buffers| {
-            buffers.retain(|buffer| buffer.strong_count() > 0);
-            !buffers.is_empty()
-        });
-        surfaces.entry(key).or_default().push(buffer.downgrade());
     }
 }
 
@@ -1210,67 +943,11 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         }
         made.map(|b| {
             b.map(|raw| {
-                let buffer = self.buffer(raw, None);
+                let buffer = self.buffer(raw);
                 buffer.backing.imported(read_only, bit_24);
                 buffer
             })
         })
-    }
-
-    /// A no-copy buffer over all of the surface's memory, holding one reference of the surface
-    /// while the runtime keeps the buffer, at the surface's address in Metal's space
-    /// ([`metal_space::surface_buffer`]). The runtime takes no nil surface: a nil one dies. A
-    /// buffer over the surface while another holds that address shares the range of a live one,
-    /// as Metal answers the address for both; one made while none lives, after the last's
-    /// release and before the runtime frees its range, dies: Metal makes it there, and the
-    /// runtime shares a range only with a live buffer. Buffers over surfaces are made one at a
-    /// time ([`SURFACE_BUFFER_MAKES`]).
-    fn new_buffer_on_surface(
-        &self,
-        iosurface: Option<&OsSurface>,
-    ) -> RaiseResult<Option<VulkanBuffer>> {
-        use crate::core::platform::os::surface::Surface as _;
-        let sel = "newBufferWithIOSurface:";
-        let surface = iosurface.unwrap_or_else(|| unrepresentable(sel, "a nil IOSurface"));
-        let _making = SURFACE_BUFFER_MAKES.lock();
-        let surface = Arc::new(surface.clone_ref());
-        let (key, alloc_size) = (surface.id().0, surface.alloc_size());
-        let (place, space) = metal_space::surface_buffer(key, alloc_size);
-        let address = space.address().unwrap_or_default();
-        // At the surface's address, Metal makes the buffer: the runtime's refusal of the address
-        // dies, as a placed range's does ([`placed_nil`]), and so does its refusal to share.
-        let (placement, nil, live) = match place {
-            SurfacePlace::At(placement @ rt::AddressPlacement::At(_)) => {
-                (placement, Nil::Memory, None)
-            }
-            SurfacePlace::At(placement) => (placement, Nil::BufferLength, None),
-            SurfacePlace::Shared => {
-                let Some(live) = self.live_surface_buffer(key) else {
-                    unrepresentable(
-                        sel,
-                        &format!(
-                            "a buffer over IOSurface {key:#x} while a released one over it holds \
-                             its address until the command buffers that used it complete, which \
-                             Metal makes at that address too and the runtime shares with a live \
-                             buffer alone"
-                        ),
-                    );
-                };
-                let at = rt::AddressPlacement::At(rt::GpuAddress(address));
-                (at, Nil::Memory, Some(live))
-            }
-        };
-        let token: rt::RangeToken = Box::new(space);
-        let shares = live.as_ref().map(|live| &live.raw);
-        let made =
-            self.buffer_over_surface_at(sel, &surface, (placement, Some(token)), shares, nil)?;
-        Ok(made.map(|raw| {
-            let buffer = self.buffer(raw, Some(surface));
-            if let rt::AddressPlacement::At(_) = placement {
-                VulkanDevice::keep_surface_buffer(key, &buffer);
-            }
-            buffer
-        }))
     }
 
     /// [`VulkanDevice::buffer_of_length`]'s, with neither of its declarations.
@@ -1338,7 +1015,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             None => descriptor,
         };
         match plain(|| self.raw.new_buffer_with_descriptor(descriptor)) {
-            Ok(raw) => Ok(Some(self.buffer(raw, None))),
+            Ok(raw) => Ok(Some(self.buffer(raw))),
             Err(error) => {
                 log::debug!("no exportable buffer of {length} bytes: {error}");
                 Ok(None)
@@ -1502,11 +1179,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                 self.raw
                     .new_compute_pipeline_state_with_function(function, &options)
             }) {
-                Ok(state) => {
-                    let source = StageSource::Function(function.function_descriptor());
-                    let desc = ComputePipelineDescriptor::new(source);
-                    Ok(Some(Obj::new(ComputePipelineObject::of(state, desc))))
-                }
+                Ok(state) => Ok(Some(Obj::new(ComputePipelineObject::new(state)))),
                 Err(e) => Err(compile_error(sel, e, None)),
             },
             || format!("kernel {:?}", function.name()),
@@ -1663,7 +1336,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         if made.is_some() {
             fields.made_unprotected(sel);
         }
-        Ok(made.map(|raw| self.texture_of(raw, None, 0, space)))
+        Ok(made.map(|raw| self.texture_of(raw, 0, space)))
     }
 
     /// The texture of a handle of this process, its resource ID at `resource_index` (0: one the
@@ -1693,7 +1366,6 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let usage = handle.private_usage;
         Ok(Some(self.texture_of(
             raw,
-            None,
             usage,
             Arc::new(metal_space::Hold::sharing(Arc::clone(&handle.space))),
         )))
@@ -1757,88 +1429,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         if made.is_some() {
             fields.made_unprotected(sel);
         }
-        Ok(made.map(|raw| self.texture_of(raw, None, 0, space)))
-    }
-
-    /// A texture over a no-copy buffer of all of the surface's memory, of its plane at the plane's
-    /// offset with rows the plane's bytes per row apart, under Metal's IOSurface rules
-    /// (`Buffer::new_texture_with_iosurface_plane`), holding one reference of the surface while
-    /// the runtime keeps the texture. Nil for a format Metal makes no texture of
-    /// ([`crate::gpu::no_texture`]) once the runtime's validation of it passes, which dies where
-    /// Metal's aborts ([`crate::gpu::no_texture::descriptor`]), for a plane past a planar
-    /// surface's last, and for what the runtime answers nil for over a plane (`Error::Nil`), as
-    /// Metal answers; a nil surface dies, and so does a plane past 0 of a surface without planes,
-    /// where Metal asserts. A
-    /// texture of a two-plane YCbCr format the runtime reads (`YCBCR8_420_2P`, 505 and 543 among
-    /// them) is the runtime's, over the surface's facts it reads ([`crate::os::ycbcr_facts`],
-    /// [`crate::gpu::ycbcr::runtime_makes`]): each surface, plane, size or matrix it refuses dies
-    /// here, naming the refusal. So is one of a two-plane XR10 format (550, 551), over the color
-    /// words of plane 0 and the alpha bytes of plane 1 ([`crate::os::plane_facts`]), which Metal
-    /// reads alike ('b3a8'); what the runtime refuses of it (a single-plane surface, plane 1, a
-    /// rotation) dies here too, naming the refusal. It takes the descriptor's rotation, which the
-    /// runtime's texture holds ([`crate::gpu::desc`]).
-    fn new_texture_on_surface(
-        &self,
-        descriptor: &VulkanTextureDescriptor,
-        iosurface: Option<&OsSurface>,
-        plane: u64,
-    ) -> RaiseResult<Option<VulkanTexture>> {
-        let sel = "newTextureWithDescriptor:iosurface:plane:";
-        let surface = iosurface.unwrap_or_else(|| unrepresentable(sel, "a nil IOSurface"));
-        let fields = descriptor.fields();
-        log::debug!(
-            "{}",
-            OnSurface {
-                fields: &fields,
-                surface,
-                plane
-            }
-        );
-        let Some(desc) = surface_plane_descriptor(&self.raw, sel, &fields)? else {
-            return Ok(None);
-        };
-        // Metal asserts at a plane past 0 of a surface without planes, whatever the format
-        // ("IOSurface is non-planar, but plane 1 specified"), and answers nil at a plane past a
-        // planar surface's last (measured: `textures_over_planes_a_surface_lacks_are_metals`).
-        if plane != 0 && crate::core::platform::os::surface::Surface::plane_count(surface) == 0 {
-            metal_aborts(sel, &format!("plane {plane} of a surface without planes"));
-        }
-        let Some(mut at) = crate::os::plane(surface, plane) else {
-            return Ok(None);
-        };
-        let facts = match plane_facts_taken(desc.pixel_format) {
-            Some(PlaneFacts::YCbCr) => crate::os::ycbcr_facts(surface, plane),
-            Some(PlaneFacts::Planes) => crate::os::plane_facts(surface, plane),
-            None => None,
-        };
-        if let Some(facts) = facts {
-            at = at.with_ycbcr(facts);
-        }
-        let plane = at;
-        let surface = Arc::new(surface.clone_ref());
-        // The texture's hold on its surface's range, which the range token of the buffer it is
-        // over holds too: the range goes once the runtime frees that buffer, after the last
-        // command buffer that used the texture completed, as Metal frees it ([`metal_space::Hold`]).
-        let space = Arc::new(metal_space::surface(
-            surface.id().0,
-            crate::core::platform::os::surface::Surface::alloc_size(&*surface),
-        ));
-        let token: rt::RangeToken = Box::new(Arc::clone(&space));
-        let Some(buffer) = self.buffer_over_surface(sel, &surface, token)? else {
-            return Ok(None);
-        };
-        let Some(raw) = texture_over_plane(sel, &fields, &buffer, &desc, plane)? else {
-            return Ok(None);
-        };
-        Ok(Some(Obj::new(TextureObject {
-            raw,
-            device: self.clone_ref(),
-            space,
-            surface: Some(surface),
-            plane: Some(plane),
-            under: None,
-            private_usage: 0,
-        })))
+        Ok(made.map(|raw| self.texture_of(raw, 0, space)))
     }
 
     /// Keeps `indices` from plain allocation of IDs of the type for the device's life: textures
@@ -2011,7 +1602,6 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                 Obj::new(BufferObject {
                     raw,
                     device: self.clone_ref(),
-                    surface: None,
                     backing,
                     heap: None,
                 })
@@ -2260,7 +1850,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             sel,
             timing::DISPATCH_LATER,
             || match plain_at(sel, || self.raw.new_compute_pipeline_state(&d, &options)) {
-                Ok(state) => Ok(Some(Obj::new(ComputePipelineObject::of(state, d.clone())))),
+                Ok(state) => Ok(Some(Obj::new(ComputePipelineObject::new(state)))),
                 Err(e) => Err(compile_error(sel, e, Some(&d))),
             },
             || format!("kernel {}", timing::stage(&d.kernel)),
@@ -2270,8 +1860,8 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
 }
 
 /// The runtime's descriptor of a texture of `fields` over a surface's plane, made by `sel` on
-/// `device`: Metal's `newTextureWithDescriptor:iosurface:plane:` over the surface, or over a
-/// buffer that stands for it ([`crate::gpu::resource`]'s `new_texture_over_surface_plane`).
+/// `device`: Metal's `newTextureWithDescriptor:iosurface:plane:`, over a buffer that stands for
+/// the surface ([`crate::gpu::resource`]'s `new_texture_over_surface_plane`).
 /// `None` for a format of [`crate::gpu::no_texture`], nil once Metal's validation passes, before
 /// the plane and the surface are looked at: the runtime's heap size query validates its
 /// descriptor as the runtime's creators do (over a surface's plane too), and answers 0 bytes for

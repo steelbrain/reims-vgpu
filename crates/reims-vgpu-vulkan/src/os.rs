@@ -1,12 +1,11 @@
-//! The OS services: core's threads, clocks, host VM and IOSurface, each OS's own behind one
-//! facade (`OsClock`, `OsThreads`, `OsVm`, `OsSurface`, `OsSurfaces`), and what this platform
-//! reads of a surface beyond core's trait, written against it (`surface.rs`).
+//! The OS services: core's threads, clocks and host VM, each OS's own behind one facade
+//! (`OsClock`, `OsThreads`, `OsVm`).
 //!
-//! - **macOS** (`os/macos.rs`): the system's threads, clocks, Mach VM, autorelease pool and
-//!   IOSurface, and the Objective-C message layer the window's AppKit side sends through (`msg`).
-//! - **Linux** (`os/linux.rs`): the clocks (`CLOCK_BOOTTIME`, `CLOCK_REALTIME`), threads, a host
-//!   VM over `mmap` that makes views of the guest's pages by mapping their files (the backing
-//!   table), and IOSurface's stand-in over that memory.
+//! - **macOS** (`os/macos.rs`): the system's threads, clocks, Mach VM and autorelease pool, and
+//!   the Objective-C message layer the window's AppKit side sends through (`msg`).
+//! - **Linux** (`os/linux.rs`): the clocks (`CLOCK_BOOTTIME`, `CLOCK_REALTIME`), threads, and a
+//!   host VM over `mmap` that makes views of the guest's pages by mapping their files (the backing
+//!   table).
 //!
 //! Either way the platform's VM reports the pages it changes to the runtime
 //! ([`crate::remap::VulkanVm`]), and a display's window presents through a swapchain over the
@@ -18,7 +17,6 @@
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
-mod surface;
 mod wsi;
 
 #[cfg(target_os = "linux")]
@@ -44,18 +42,16 @@ pub(crate) use host_os::take_ram_devices;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use host_os::thread_counts;
 pub(crate) use host_os::{
-    COPIES_READ_ONLY, Drawables, ImportMade, ImportView, TWINS_READ_ONLY, allocate_aliasable,
-    allocate_zeros, dma_buf_refusal, host_memory, host_memory_vouched, import_view, plane_shape,
-    shown_at, surface_memory_hold,
+    COPIES_READ_ONLY, Drawables, ImportMade, allocate_aliasable, dma_buf_refusal, host_memory,
+    host_memory_vouched, import_view, shown_at,
 };
 /// Copies by the GPU of planes another driver wrote into dma-bufs into a runtime buffer, on Linux
 /// (`os/linux/plane_copy.rs`).
 #[cfg(target_os = "linux")]
 pub use host_os::{CopyError, DmaBufPlane, PlaneCopier, PlaneCopy, PlaneFormat};
 pub use host_os::{
-    GuestMemoryLease, OsClock, OsSurface, OsSurfaces, OsThreads, OsVm, RegionMemory,
-    default_driver_sizes, default_gpu_core_count, default_registry_id, install_process_services,
-    lease_guest_memory,
+    GuestMemoryLease, OsClock, OsThreads, OsVm, RegionMemory, default_driver_sizes,
+    default_gpu_core_count, default_registry_id, install_process_services, lease_guest_memory,
 };
 /// Dma-bufs of host memory lent to a device outside the runtime, on Linux
 /// (`os/linux/device_lend.rs`).
@@ -85,11 +81,6 @@ pub(crate) use macos::refusing_imports;
 /// library's choice of device reads (`crate::device_choice`).
 pub(crate) use wsi::seen_devices;
 pub use wsi::{add_window_extensions, present_fences};
-
-pub(crate) use surface::{
-    MadeOver, memory_kind, page_runs, plane, plane_facts, surface_alias, surface_bytes_memory,
-    surface_memory, surface_offset, ycbcr_facts,
-};
 
 /// One range of the guest's RAM as the host maps it, and the file behind it: `length` bytes at
 /// `host`, a shared mapping (`MAP_SHARED`) of `fd` from byte `offset`. A device's lease of the
@@ -153,9 +144,6 @@ impl Drop for PrivateMemory {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    // The surface tests' helpers, which the crate's tests name here.
-    #[cfg(target_os = "macos")]
-    pub(crate) use super::surface::tests::*;
     use super::*;
 
     /// The tests' page is the host's

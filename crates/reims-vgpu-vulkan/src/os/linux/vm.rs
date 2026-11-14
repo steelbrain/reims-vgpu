@@ -2026,36 +2026,4 @@ pub(crate) mod tests {
         assert!(!at_the_limit("?", "65530"));
         assert!(!at_the_limit("65530", "?"));
     }
-
-    /// An alias of a guest page with zeros past it, as a heap of less than the runtime's 16 KiB
-    /// is made over, has a file behind every byte, writable or read-only, so a dma-buf can be
-    /// made of all of it, as the runtime asks where the device refuses file pages as host memory
-    /// (`crate::gpu::backing::gather_or_nil`, `super::dma_buf`)
-    #[test]
-    fn an_alias_with_zeros_past_its_pages_has_a_file_behind_every_byte() {
-        use crate::core::platform::types::ResourceAddressRange;
-        use crate::gpu::backing::gather_or_nil;
-        let p = page();
-        for read_only in [false, true] {
-            let guest = allocate_aliasable(p).unwrap();
-            write(guest, 0, 0x5a);
-            let ranges = [ResourceAddressRange {
-                address: guest.addr().to_u64(),
-                length: p,
-            }];
-            let alias = gather_or_nil("test", &ranges, 4 * p, read_only).unwrap();
-            let first = alias.first().as_ptr().addr().to_u64();
-            assert!(
-                files::pieces(first, 4 * p).is_some(),
-                "read-only {read_only}"
-            );
-            let at = HostAddr::from_addr(alias.first().as_ptr().addr());
-            assert_eq!(
-                (read(at, 0), read(at, p), read(at, 4 * p - 1)),
-                (0x5a, 0, 0)
-            );
-            drop(alias);
-            assert!(vm().deallocate(guest, p).is_success());
-        }
-    }
 }

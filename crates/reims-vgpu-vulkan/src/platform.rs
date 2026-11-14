@@ -17,7 +17,6 @@ use std::sync::{Arc, LazyLock, OnceLock, Weak};
 
 use crate::core::num::ToU64;
 use crate::core::platform::os::Threads;
-use crate::core::platform::os::surface::IoSurfaces;
 use crate::core::platform::os::vm::HostVm;
 use crate::core::platform::types::MtlSize;
 use crate::core::platform::values::{RateMapDesc, TextureDesc};
@@ -45,7 +44,7 @@ use crate::gpu::resource::{
     VulkanHeap, VulkanLibrary, VulkanRenderPipeline, VulkanSamplerState, VulkanSharedTextureHandle,
     VulkanTexture,
 };
-use crate::os::{OsClock, OsSurface, OsSurfaces, OsThreads};
+use crate::os::{OsClock, OsThreads};
 use crate::remap::VulkanVm;
 
 /// One counted reference to an object of this platform (architecture 4.1).
@@ -113,10 +112,9 @@ impl<T: Send + Sync + 'static> Handle for Obj<T> {
 /// object of its own (`id`).
 static LISTENER: OnceLock<rt::SharedEventListener> = OnceLock::new();
 
-/// The process's platform: the runtime's GPU objects, and the OS's IOSurface, VM (reporting the
-/// pages it changes, [`crate::remap`]), clocks and threads ([`crate::os`]).
+/// The process's platform: the runtime's GPU objects, and the OS's VM (reporting the pages it
+/// changes, [`crate::remap`]), clocks and threads ([`crate::os`]).
 pub struct VulkanPlatform {
-    surfaces: OsSurfaces,
     vm: VulkanVm,
     clock: OsClock,
     threads: OsThreads,
@@ -137,11 +135,10 @@ impl fmt::Debug for VulkanPlatform {
 impl VulkanPlatform {
     /// The process's platform. Make one per process (D17). It installs what the OS's services need
     /// first ([`crate::os::install_process_services`]): on macOS the Objective-C autorelease
-    /// pool core's pools push, as IOSurface and Foundation still autorelease into it.
+    /// pool core's pools push, as Foundation still autoreleases into it.
     pub fn new() -> VulkanPlatform {
         crate::os::install_process_services();
         VulkanPlatform {
-            surfaces: OsSurfaces::new(),
             vm: VulkanVm::new(),
             clock: OsClock::new(),
             threads: OsThreads::new(),
@@ -718,7 +715,6 @@ impl Platform for VulkanPlatform {
     type RenderPassDescriptor = VulkanRenderPassDescriptor;
     type RateMapDescriptor = VulkanRateMapDescriptor;
     type RateMapLayerDescriptor = VulkanRateMapLayerDescriptor;
-    type Surface = OsSurface;
     type Clock = OsClock;
 
     /// A descriptor of Metal's defaults.
@@ -798,10 +794,6 @@ impl Platform for VulkanPlatform {
             },
             || made_devices(OPEN_DEVICE, || rt::Device::all_with(device_options())),
         )
-    }
-
-    fn surfaces(&self) -> &dyn IoSurfaces<VulkanPlatform> {
-        &self.surfaces
     }
 
     fn vm(&self) -> &dyn HostVm {

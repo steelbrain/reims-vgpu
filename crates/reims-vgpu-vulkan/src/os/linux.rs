@@ -1,7 +1,6 @@
 //! The OS services on Linux: the clocks ([`LinuxClock`]), threads ([`LinuxThreads`]), Mach VM's
 //! calls over `mmap` ([`LinuxVm`]), whose views of the guest's pages map the files the backing
-//! table names (`files`), IOSurface's stand-in over that memory ([`LinuxSurface`]), what the
-//! window system's Vulkan extensions take here (`crate::os`'s `wsi`: the surface extensions and
+//! table names (`files`), what the window system's Vulkan extensions take here (`crate::os`'s `wsi`: the surface extensions and
 //! the loader), and the GPU's copies of another driver's planes in dma-bufs into a runtime buffer
 //! ([`PlaneCopier`]). No Objective-C runs here: core pushes no autorelease pool where none is
 //! installed.
@@ -15,7 +14,6 @@ mod hints;
 mod host_ram;
 mod import;
 mod plane_copy;
-mod surface;
 #[cfg(test)]
 pub(crate) mod thread_counts;
 mod threads;
@@ -30,7 +28,6 @@ pub use clock::LinuxClock;
 pub use device_lend::{LendRefusal, LentDmaBuf, dma_buf_of_host};
 pub use files::{GuestMemoryLease, lease_guest_memory};
 pub use plane_copy::{CopyError, DmaBufPlane, PlaneCopier, PlaneCopy, PlaneFormat};
-pub use surface::{LinuxSurface, LinuxSurfaces};
 pub use threads::LinuxThreads;
 pub use vm::{LinuxVm, RegionMemory};
 
@@ -43,11 +40,8 @@ pub(crate) use host_ram::{
     ram_over, take_devices as take_ram_devices,
 };
 pub(crate) use import::{
-    COPIES_READ_ONLY, ImportMade, ImportView, TWINS_READ_ONLY, allocate_zeros, dma_buf_refusal,
-    host_memory, host_memory_vouched, import_view, learn_view_imports, shown_at,
-};
-pub(crate) use surface::{
-    own_alias, plane_at, plane_shape, recorded_mut, surface_memory_hold, ycbcr_matrix,
+    COPIES_READ_ONLY, ImportMade, dma_buf_refusal, host_memory, host_memory_vouched, import_view,
+    learn_view_imports, shown_at,
 };
 pub(crate) use vm::allocate_aliasable;
 #[cfg(test)]
@@ -99,14 +93,10 @@ pub type OsClock = LinuxClock;
 pub type OsThreads = LinuxThreads;
 /// Mach VM's calls.
 pub type OsVm = LinuxVm;
-/// An IOSurface: the stand-in's, one reference.
-pub type OsSurface = LinuxSurface;
-/// IOSurface creation: the stand-in's.
-pub type OsSurfaces = LinuxSurfaces;
 
 /// Installs what the process's platform needs before it runs, once: the soft limit of open files
-/// raised to the hard limit, as each IOSurface stand-in of its own memory holds a file open
-/// (`memfd_create`), as does each range a view can be made of. A limit left lower is logged.
+/// raised to the hard limit, as each range a view can be made of holds a file open
+/// (`memfd_create`). A limit left lower is logged.
 pub fn install_process_services() {
     static RAISED: std::sync::Once = std::sync::Once::new();
     RAISED.call_once(|| {

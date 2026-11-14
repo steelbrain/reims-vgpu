@@ -247,8 +247,6 @@ pub fn new_buffer(
 pub fn new_texture(
     w: &Arc<World>,
     desc: TexDesc,
-    surface: Option<Fk<kind::Surface>>,
-    plane: u64,
     parent: Option<AnyHandle>,
     shareable: bool,
 ) -> Fk<kind::Texture> {
@@ -259,8 +257,6 @@ pub fn new_texture(
     };
     w.new_obj(Model::Texture(TextureModel {
         desc,
-        surface,
-        plane,
         parent,
         shareable,
         common: common(w, Some((Space::TEXTURE, forced))),

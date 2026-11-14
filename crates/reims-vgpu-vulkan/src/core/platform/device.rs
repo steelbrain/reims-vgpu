@@ -93,12 +93,6 @@ pub trait GpuDevice<P: Platform>: Handle {
         options: u64,
         deallocator: Option<NoCopyDeallocator>,
     ) -> RaiseResult<Option<P::Buffer>>;
-    /// sel: newBufferWithIOSurface: SPI — The buffer retains
-    /// the surface (a guest-visible count).
-    fn new_buffer_on_surface(
-        &self,
-        iosurface: Option<&P::Surface>,
-    ) -> RaiseResult<Option<P::Buffer>>;
     /// sel: newBufferWithLength:options:
     /// nil means the resource is refused. Its bytes are zeros, as Metal's are, before any work
     /// of the platform's reads them: the graphics lane's device caches take them as made
@@ -328,15 +322,6 @@ pub trait GpuDevice<P: Platform>: Handle {
         &self,
         on: OnFault,
         descriptor: &P::TextureDescriptor,
-    ) -> RaiseResult<Option<P::Texture>>;
-    /// sel: newTextureWithDescriptor:iosurface:plane:
-    /// The texture retains the surface (guest-visible count). aborts: Metal's validation on some
-    /// descriptors (measured).
-    fn new_texture_on_surface(
-        &self,
-        descriptor: &P::TextureDescriptor,
-        iosurface: Option<&P::Surface>,
-        plane: u64,
     ) -> RaiseResult<Option<P::Texture>>;
     /// sel: reserveResourceIndicesForResourceType:indices:indexCount: SPI
     /// (types 0, 1 and 5). `indexCount` is `indices.len()`.

@@ -148,9 +148,9 @@ reims-vgpu-graphics, reims-vgpu-video-*  <-  reims-vgpu  <-  reims-vgpu-c  <-  Q
   `metal2vulkan-runtime`, the Metal-shaped API on Vulkan of metal2vulkan, at the commit of its
   public repository `Cargo.toml` names, on the host's Vulkan driver, or MoltenVK on a Mac (a build
   for development and tests). Its OS services are its own: on macOS over the system's (`os/macos/`:
-  IOSurfaces, Mach VM, the clock, threads, the autorelease pool, and the message layer, 4.6); on
-  Linux `os/linux/` (a host VM over `mmap` of the guest RAM's files, an IOSurface stand-in over
-  that memory, and the GPU's copies of a video driver's planes in dma-bufs into a runtime buffer). It compiles the library's shaders (4.7). Where its answer differs from Metal's it logs the difference and goes on, and dies
+  Mach VM, the clock, threads, the autorelease pool, and the message layer, 4.6); on Linux
+  `os/linux/` (a host VM over `mmap` of the guest RAM's files, and the GPU's copies of a video
+  driver's planes in dma-bufs into a runtime buffer). It compiles the library's shaders (4.7). Where its answer differs from Metal's it logs the difference and goes on, and dies
   where Metal would or where the runtime cannot run the call ([accuracy-ledger.md](accuracy-ledger.md)).
 - **Core** (`reims_vgpu_vulkan::core`) uses `parking_lot`, `zerocopy` and `log`, and nothing else
   of the Vulkan crate: the crate's platform implements core's traits, and core is generic over
@@ -309,8 +309,8 @@ calls it.
 ### 4.5 OS services
 
 `platform/os/`: `clock` (monotonic and wall time, `wait_until`), `threads` (the threads the library
-runs on and the timers' clock), `autorelease` (the real pool), `surface` (IOSurface creation,
-getters and retain counts), `vm` (allocate, remap, protect, deallocate). The Vulkan crate implements
+runs on and the timers' clock), `autorelease` (the real pool), `vm` (allocate, remap, protect,
+deallocate). The Vulkan crate implements
 each over the system: macOS's on macOS, Linux's on Linux; the testkit models each (13.2).
 
 ### 4.6 The answer layer and the macOS message layer
@@ -321,11 +321,10 @@ decides what the runtime's typed error becomes, an `Err(Raise)` for the caller t
 a death at the call, where Metal raises, answers nil or ends the process
 ([accuracy-ledger.md](accuracy-ledger.md)).
 
-On macOS the Objective-C sends the library makes itself (the window's AppKit side, IOSurface's
-creation) run in the message layer, `os/macos/msg.rs` of the Vulkan crate, named by their
-selector: `msg::get(sel, || call)` for a call whose raise dies at the call (a getter, a property
-setter, a C function), `msg::catch(sel, || call)` for one whose exception is the caller's to
-decide, and `fatal_send` and `value` for Foundation and IOSurface sends, which die at the send. The
+On macOS the Objective-C sends the library makes itself (the window's AppKit side) run in the
+message layer, `os/macos/msg.rs` of the Vulkan crate, named by their selector:
+`msg::get(sel, || call)` for a call whose raise dies at the call (a getter, a property setter, a C
+function), and `msg::catch(sel, || call)` for one whose exception is the caller's to decide. The
 call runs inside objc2's `exception::catch`, so an exception stops at the call before any Rust
 frame unwinds, and the closure borrows its receiver and arguments and owns nothing with a `Drop`
 (D34).
@@ -822,8 +821,8 @@ Rosetta runs x86-64 code, core's tests (the Vulkan crate's unit tests below `cor
   position is observable (4.3) and scripted by `Faults` (nil, error, raise or crash at the nth call
   of a selector on a class). A scripted raise is decided as the platform's answer layer decides
   the same call (4.6), by a `Policy` with the same labels. A free call answers from the model and is not logged.
-  Its models keep what the contract sees: fresh numbering, command buffers retaining what they
-  reference until completion, counted IOSurfaces.
+  Its models keep what the contract sees: fresh numbering, and command buffers retaining what they
+  reference until completion.
 - **Memory**: `GuestRam`, a VM model with remap aliasing and maximum protection, `VirtualClock`
   with both deadlines.
 - **Threads**: `FakeThreads` (std threads, recorded; timers on the virtual clock).
@@ -832,7 +831,7 @@ Rosetta runs x86-64 code, core's tests (the Vulkan crate's unit tests below `cor
   crate's lines.
 
 Tests assert what the guest and host observe: guest bytes, MMIO reads, interrupts, host calls in
-order, outcomes, IOSurface counts, object creation and release order, and the ordered Metal calls
+order, outcomes, object creation and release order, and the ordered Metal calls
 in the fake's log. They never assert internal field values, and assert a log line only where the
 line is the point of the test (14).
 
@@ -911,7 +910,7 @@ crosses the API, or the platform under it, forces them.
 | a real autorelease pool around each unit of work, and a last-resort one on the library's threads | `rt/pool.rs`, `rt/queue.rs`, `reims-vgpu/src/entry.rs`, `vulkan/src/os/macos/autorelease.rs` | Metal: what it autoreleases (an uncommitted command buffer in a dev build, its encoders) must go at the unit's end, or the queue's 65th `-commandBuffer` hangs |
 | named release points for a drop that crosses the API (`Held`, `Hold::keep`) | `rt/held.rs` | the order of host callbacks and IOSurface retain counts against the rest of the API (7.4) |
 | a label at each raise site: `Err`, a death at the raise, or the caller's `OnFault` | `raise.rs`, `raise/on_fault.rs` | where a run dies: a raise no frame handles ends the process at the raise, before any drop (6.2) |
-| every Objective-C call inside a catch: the message layer around AppKit, Foundation and IOSurface, `host_call` around every host call | `vulkan/src/os/macos/msg.rs`, `reims-vgpu-c/src/ffi.rs` | an exception out of Metal, Foundation or host code ends the process at the call (D35, 6.7) |
+| every Objective-C call inside a catch: the message layer around AppKit, `host_call` around every host call | `vulkan/src/os/macos/msg.rs`, `reims-vgpu-c/src/ffi.rs` | an exception out of Metal, Foundation or host code ends the process at the call (D35, 6.7) |
 | one typed call per Metal method, each ordered call where its caller makes it, with raw guest values; descriptor values applied to real descriptors in a stated order | `platform/`, `vulkan/src/answer.rs`, `vulkan/src/gpu/` | Metal's results, aborts and numbering (resource indices, GPU addresses) follow the calls a process makes (D4, D5) |
 | one display thread per process for the cursor callbacks | `reims-vgpu/src/platform.rs` | the order of the cursor callbacks across devices (D49) |
 | a window that closes at the device's release first, and waits for nothing, the main thread included | `reims-vgpu/src/window.rs`, `reims-vgpu-window/src/handle.rs` | where the tables' `destroy`s land, and a host whose main thread creates the device before it runs its run loop (D51) |

@@ -41,16 +41,14 @@
 //! **A call Metal never returns from** parks the calling thread for good ([`hang`]), as the
 //! contract keeps a hang a hang.
 //!
-//! **A write the runtime refuses where Metal's GPU writes it** dies at the command: a
-//! dispatch's or a draw's write through a texture over a surface of the 4:4:4 two-plane YCbCr
-//! formats whose writes the runtime does not store as Metal does, the `_sRGB` twins 523 and 527
-//! ([`crate::gpu::ycbcr::refused_write`]). The runtime stores the writes of 503, 507, 542 and
-//! 545 into the surface's planes as Metal's GPU does, drops those of the packed 510 and 530 as
-//! Metal's GPU drops them on this host, and refuses
-//! where the command is encoded the writes of those it does not store: through a texture over
-//! plane 1, which dies there naming the refusal (`writes_of_444_textures_over_plane_1_die`), and
-//! through a slot that also reads the texture, or by a command that writes the planes through the
-//! texture and another way, which the runtime refuses alike.
+//! **A write the runtime refuses where Metal's GPU writes it** dies at the command. The runtime
+//! stores the writes of 503, 507, 542 and 545 into the surface's planes as Metal's GPU does,
+//! drops those of the packed 510 and 530 as Metal's GPU drops them on this host
+//! ([`crate::gpu::ycbcr`], "Writes"), and refuses where the command is encoded the writes of
+//! those it does not store: through a texture over plane 1, which dies there naming the refusal
+//! (`writes_of_444_textures_over_plane_1_die`), and through a slot that also reads the texture,
+//! or by a command that writes the planes through the texture and another way, which the runtime
+//! refuses alike.
 //!
 //! **A degradation of a kind [`DIES`] lists is relayed, and dies in strict mode** ([`notice`],
 //! the runtime's message sink), but those of [`DIES_BY_DEFAULT`], which die in either mode: the
@@ -2612,7 +2610,8 @@ pub fn relay_gap(sel: &'static str, e: &Error, descriptor: Option<&str>) -> bool
     true
 }
 
-/// How many times this process answered a call as when memory runs out ([`out_of_host_memory`]).
+/// How many times this process answered a call as when memory runs out (`out_of_host_memory`,
+/// on Linux).
 static OUT_OF_HOST_MEMORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A map, a file or memory that this platform's host refused at `call` for want of mappings
@@ -2622,6 +2621,7 @@ static OUT_OF_HOST_MEMORY: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// answer is counted ([`out_of_host_memory_count`], [`degradation_counts`]) and logged at the
 /// first, and at each power of two, at debug after the first (`core::logging`'s once per kind).
 /// `detail` is asked only for a line.
+#[cfg(target_os = "linux")]
 pub(crate) fn out_of_host_memory(call: &'static str, detail: impl FnOnce() -> String) {
     use std::sync::atomic::Ordering;
     if strict() {
@@ -2644,7 +2644,8 @@ pub(crate) fn out_of_host_memory(call: &'static str, detail: impl FnOnce() -> St
     }
 }
 
-/// How many times this process answered a call as when memory runs out ([`out_of_host_memory`]).
+/// How many times this process answered a call as when memory runs out (`out_of_host_memory`,
+/// on Linux; none on macOS).
 pub fn out_of_host_memory_count() -> u64 {
     OUT_OF_HOST_MEMORY.load(std::sync::atomic::Ordering::Relaxed)
 }

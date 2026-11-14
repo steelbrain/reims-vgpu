@@ -4,9 +4,7 @@
 //! typed by a [`Kind`] marker so that `FakePlatform`'s associated types stay distinct (a
 //! texture cannot be passed where a buffer is expected, as with the real platform). A handle is
 //! not `Clone` (D6): `clone_ref()` adds a reference and `Drop` removes one, and the live count is
-//! the object's retain count as far as core can observe it ([`Fk::retain_count`]). For an
-//! IOSurface that count is guest-visible, and every model that keeps a surface (a texture or
-//! buffer over it) holds a real handle, so it counts as Metal's retain does.
+//! the object's retain count as far as core can observe it ([`Fk::retain_count`]).
 //!
 //! The shared [`World`] holds what one fake "process" has: the call log, the script, the virtual
 //! clock, the address space, the GPU VA allocator, resource-index spaces, and the list of
@@ -60,9 +58,6 @@ use crate::core::platform::{Handle, ObjId};
 pub trait Kind: Send + Sync + 'static {
     /// The class name the call log records.
     const CLASS: &'static str;
-    /// Whether `clone_ref()` and `Drop` are logged (`CFRetain`/`CFRelease`): only for IOSurfaces,
-    /// whose count is guest-visible (D6).
-    const LOG_RETAIN: bool = false;
 }
 
 /// The kind markers, one per associated type of `Platform`.
@@ -114,14 +109,6 @@ pub mod kind {
         RenderPassDescriptor => "MTLRenderPassDescriptor",
         RateMapDescriptor => "MTLRasterizationRateMapDescriptor",
         RateMapLayerDescriptor => "MTLRasterizationRateLayerDescriptor",
-    }
-
-    /// `IOSurfaceRef`: its retains are logged (`CFRetain`/`CFRelease`).
-    #[derive(Debug)]
-    pub struct Surface;
-    impl Kind for Surface {
-        const CLASS: &'static str = "IOSurface";
-        const LOG_RETAIN: bool = true;
     }
 }
 
@@ -202,8 +189,6 @@ pub struct BufferModel {
     pub options: u64,
     /// `gpuAddress`.
     pub gpu_address: u64,
-    /// The IOSurface it was made over (a counted reference).
-    pub surface: Option<Fk<kind::Surface>>,
     /// The heap it was placed in.
     pub heap: Option<AnyHandle>,
     /// A no-copy buffer's deallocator, run when the buffer dies.
@@ -311,10 +296,6 @@ impl TexDesc {
 pub struct TextureModel {
     /// The descriptor it was made with (a view's changed fields applied).
     pub desc: TexDesc,
-    /// The IOSurface it was made over (a counted reference), and the plane.
-    pub surface: Option<Fk<kind::Surface>>,
-    /// The plane of `surface`.
-    pub plane: u64,
     /// The texture or buffer it is a view of (retained, as Metal's views retain their parent).
     pub parent: Option<AnyHandle>,
     /// Made shareable (`newSharedTexture…`).
@@ -380,37 +361,6 @@ impl std::fmt::Debug for CommandBufferModel {
     }
 }
 
-/// An IOSurface's model.
-#[derive(Debug, Default)]
-pub struct SurfaceModel {
-    /// The surface's memory (`IOSurfaceGetBaseAddress`).
-    pub mem: Option<Arc<RawRegion>>,
-    /// `IOSurfaceGetPixelFormat`.
-    pub pixel_format: u32,
-    /// `IOSurfaceGetWidth`.
-    pub width: u64,
-    /// `IOSurfaceGetHeight`.
-    pub height: u64,
-    /// `IOSurfaceGetBytesPerElement`.
-    pub bytes_per_element: u64,
-    /// `IOSurfaceGetBytesPerRow`.
-    pub bytes_per_row: u64,
-    /// `IOSurfaceGetPlaneCount`.
-    pub plane_count: u64,
-    /// `IOSurfaceGetAllocSize`.
-    pub alloc_size: u64,
-    /// `IOSurfaceGetProtectionOptions`.
-    pub protection_options: u64,
-    /// `IOSurfaceAllowsPixelSizeCasting`.
-    pub allows_pixel_size_casting: bool,
-    /// Outstanding `IOSurfaceLock`s.
-    pub lock_count: i64,
-    /// The creation spec, when made by `IOSurfaceCreate`.
-    pub spec: Option<crate::core::platform::os::surface::SurfaceSpec>,
-    /// The creation properties, when made by `initWithProperties:`.
-    pub backing_spec: Option<crate::core::platform::os::surface::BackingSurfaceSpec>,
-}
-
 /// A rasterization-rate layer: its sample count and sample storage.
 #[derive(Debug, Default)]
 pub struct LayerModel {
@@ -455,8 +405,6 @@ pub enum Model {
     Icb(IcbModel),
     /// An ICB's render or compute command.
     IcbCommand(Box<IcbCommandModel>),
-    /// An IOSurface.
-    Surface(SurfaceModel),
     /// A rasterization-rate layer.
     Layer(LayerModel),
     /// A function's name, or a library's function names.
@@ -697,12 +645,6 @@ impl<K: Kind> std::fmt::Debug for Fk<K> {
 
 impl<K: Kind> Handle for Fk<K> {
     fn clone_ref(&self) -> Self {
-        if K::LOG_RETAIN {
-            self.obj()
-                .world
-                .log
-                .push(self.id(), K::CLASS, "CFRetain", vec![]);
-        }
         Fk::from_obj(self.h.0.clone())
     }
 
@@ -712,16 +654,9 @@ impl<K: Kind> Handle for Fk<K> {
 }
 
 impl<K: Kind> Drop for Fk<K> {
-    /// A release: logged where `K` logs its retains, then the death [`World::die_at_release`]
-    /// set for the object and the hold [`World::hold_at_release`] set for it, where the thread
-    /// is not unwinding already.
+    /// A release: the death [`World::die_at_release`] set for the object and the hold
+    /// [`World::hold_at_release`] set for it, where the thread is not unwinding already.
     fn drop(&mut self) {
-        if K::LOG_RETAIN {
-            self.obj()
-                .world
-                .log
-                .push(self.id(), K::CLASS, "CFRelease", vec![]);
-        }
         if !std::thread::panicking() && self.obj().world.take_release_death(self.id()) {
             crate::core::raise::Raise::platform("release")
                 .with_detail("the platform died letting go of the object")
@@ -754,7 +689,7 @@ impl<K: Kind> Fk<K> {
     }
 
     /// The object's retain count as core can observe it: the live handles, including those
-    /// models hold (a texture over a surface holds one of the surface).
+    /// models hold.
     pub fn retain_count(&self) -> i64 {
         self.h.0.handle_count()
     }
@@ -1756,16 +1691,6 @@ mod tests {
         drop((b2, e, back));
         assert_eq!(b.retain_count(), 1);
         assert_eq!(format!("{b:?}"), format!("MTLBuffer#{}", b.id().0));
-    }
-
-    /// Surface retains and releases are logged
-    #[test]
-    fn surface_retains_logged() {
-        let w = World::new();
-        let s: Fk<kind::Surface> = w.new_obj(Model::None);
-        let s2 = s.clone_ref();
-        drop(s2);
-        assert_eq!(w.log.sels(), vec!["CFRetain", "CFRelease"]);
     }
 
     /// Lookup by id and live lists follow object lifetime

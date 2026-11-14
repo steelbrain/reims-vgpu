@@ -1434,9 +1434,7 @@ impl Swapchain {
             };
             images.push(Image {
                 raw,
-                texture: self
-                    .device
-                    .texture_of(texture, None, 0, Arc::new(Hold::NONE)),
+                texture: self.device.texture_of(texture, 0, Arc::new(Hold::NONE)),
                 ready,
                 last: None,
                 presented: 0,
@@ -1602,7 +1600,7 @@ mod tests {
             (d.raw).new_texture_with_vk_image(&image_descriptor(extent), image, &info, layouts)
         }
         .unwrap();
-        let texture = d.texture_of(texture, None, 0, Arc::new(Hold::NONE));
+        let texture = d.texture_of(texture, 0, Arc::new(Hold::NONE));
         assert_eq!(texture.unique_identifier(), 0);
         assert_eq!(guest(), without);
         drop(texture);

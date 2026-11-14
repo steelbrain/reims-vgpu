@@ -29,7 +29,6 @@ pub use event::EventRef;
 pub use host_range::HostRange;
 pub use types::NilDefault;
 
-use os::surface::{IoSurfaces, Surface};
 use os::vm::HostVm;
 use os::{Clock, Threads};
 use types::MtlSize;
@@ -130,8 +129,6 @@ pub trait Platform: Sized + Send + Sync + 'static {
     type RateMapLayerDescriptor: rate_map::RateMapLayerDescriptor;
 
     // Non-Metal handles.
-    /// `IOSurfaceRef` / `IOSurface *`.
-    type Surface: Surface;
     /// Time and timed waits (not object safe: its waits are generic).
     type Clock: Clock;
 
@@ -180,8 +177,6 @@ pub trait Platform: Sized + Send + Sync + 'static {
     fn open_device(&self, registry_id: u64) -> Option<Self::Device>;
 
     // Services.
-    /// IOSurface creation.
-    fn surfaces(&self) -> &dyn IoSurfaces<Self>;
     /// Mach VM.
     fn vm(&self) -> &dyn HostVm;
     /// Time.

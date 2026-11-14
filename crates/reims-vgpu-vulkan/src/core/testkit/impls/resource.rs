@@ -1,8 +1,8 @@
 //! Fake: the `platform/resource.rs` traits over the fake models (architecture 13.2).
 //!
-//! The ordered calls (creators, labels, purgeable states, backing changes, `iosurface`, the
-//! depth-stencil state's raising getters) log their selector and arguments and consult the
-//! script; the free getters read the models.
+//! The ordered calls (creators, labels, purgeable states, backing changes, the depth-stencil
+//! state's raising getters) log their selector and arguments and consult the script; the free
+//! getters read the models.
 
 use super::super::calllog::Arg;
 use super::super::objects::{Fk, Model, ResourceCommon, TexDesc, TextureModel, kind};
@@ -12,7 +12,7 @@ use crate::core::host::HostPtr;
 use crate::core::platform::resource::*;
 use crate::core::platform::types::{MtlRegion, MtlSize, NsRange, Swizzle};
 use crate::core::platform::values::SurfacePlane;
-use crate::core::platform::{Handle, HostRange, Platform};
+use crate::core::platform::{HostRange, Platform};
 use crate::core::raise::{OnFault, RaiseResult};
 use crate::core::testkit::script::Policy;
 
@@ -123,15 +123,6 @@ impl Buffer<FakePlatform> for Fk<kind::Buffer> {
         self.buffer(|m| m.gpu_address)
     }
 
-    fn iosurface(&self) -> Option<<FakePlatform as Platform>::Surface> {
-        let step = self.call("iosurface", vec![]);
-        step.getter("iosurface");
-        match &self.state().model {
-            Model::Buffer(m) => m.surface.as_ref().map(Handle::clone_ref),
-            _ => None,
-        }
-    }
-
     fn length(&self) -> u64 {
         self.buffer(|m| m.length)
     }
@@ -154,7 +145,7 @@ impl Buffer<FakePlatform> for Fk<kind::Buffer> {
                 Arg::U64(bytes_per_row),
                 Arg::U64(bytes_per_image),
             ],
-            |w| Some(new_texture(w, desc, None, 0, Some(parent), false)),
+            |w| Some(new_texture(w, desc, Some(parent), false)),
         )
     }
 
@@ -175,7 +166,7 @@ impl Buffer<FakePlatform> for Fk<kind::Buffer> {
                 Arg::U64(offset),
                 Arg::U64(bytes_per_row),
             ],
-            |w| Some(new_texture(w, desc, None, 0, Some(parent), false)),
+            |w| Some(new_texture(w, desc, Some(parent), false)),
         )
     }
 
@@ -195,7 +186,7 @@ impl Buffer<FakePlatform> for Fk<kind::Buffer> {
                 Arg::U64(offset),
                 Arg::U64(bytes_per_row),
             ],
-            |w| Some(new_texture(w, desc, None, 0, Some(parent), false)),
+            |w| Some(new_texture(w, desc, Some(parent), false)),
         )
     }
 
@@ -220,7 +211,7 @@ impl Buffer<FakePlatform> for Fk<kind::Buffer> {
                 Arg::Bool(plane.planar),
                 Arg::val(&plane.facts),
             ],
-            |w| Some(new_texture(w, desc, None, 0, Some(parent), false)),
+            |w| Some(new_texture(w, desc, Some(parent), false)),
         )
     }
 }
@@ -244,15 +235,6 @@ impl Texture<FakePlatform> for Fk<kind::Texture> {
 
     fn height(&self) -> u64 {
         self.texture(|m| m.desc.height)
-    }
-
-    fn iosurface(&self) -> Option<<FakePlatform as Platform>::Surface> {
-        let step = self.call("iosurface", vec![]);
-        step.getter("iosurface");
-        match &self.state().model {
-            Model::Texture(m) => m.surface.as_ref().map(Handle::clone_ref),
-            _ => None,
-        }
     }
 
     fn is_shareable(&self) -> bool {
@@ -285,7 +267,7 @@ impl Texture<FakePlatform> for Fk<kind::Texture> {
             Policy::Caught,
             "newTextureViewWithPixelFormat:",
             vec![Arg::U64(pixel_format)],
-            |w| Some(new_texture(w, desc, None, 0, Some(parent), false)),
+            |w| Some(new_texture(w, desc, Some(parent), false)),
         )
     }
 
@@ -303,7 +285,7 @@ impl Texture<FakePlatform> for Fk<kind::Texture> {
             Policy::Caught,
             "newTextureViewWithPixelFormat:resourceIndex:",
             vec![Arg::U64(pixel_format), Arg::U64(resource_index)],
-            |w| Some(new_texture(w, desc, None, 0, Some(parent), false)),
+            |w| Some(new_texture(w, desc, Some(parent), false)),
         )
     }
 
@@ -331,7 +313,7 @@ impl Texture<FakePlatform> for Fk<kind::Texture> {
                 Arg::val(&level_range),
                 Arg::val(&slice_range),
             ],
-            |w| Some(new_texture(w, desc, None, 0, Some(parent), false)),
+            |w| Some(new_texture(w, desc, Some(parent), false)),
         )
     }
 
@@ -362,7 +344,7 @@ impl Texture<FakePlatform> for Fk<kind::Texture> {
                 Arg::val(&slice_range),
                 Arg::val(&swizzle),
             ],
-            |w| Some(new_texture(w, desc, None, 0, Some(parent), false)),
+            |w| Some(new_texture(w, desc, Some(parent), false)),
         )
     }
 
@@ -395,7 +377,7 @@ impl Texture<FakePlatform> for Fk<kind::Texture> {
                 Arg::val(&swizzle),
                 Arg::U64(resource_index),
             ],
-            |w| Some(new_texture(w, desc, None, 0, Some(parent), false)),
+            |w| Some(new_texture(w, desc, Some(parent), false)),
         )
     }
 
@@ -425,7 +407,7 @@ impl Texture<FakePlatform> for Fk<kind::Texture> {
                 Arg::val(&slices),
                 Arg::U64(resource_index),
             ],
-            |w| Some(new_texture(w, desc, None, 0, Some(parent), false)),
+            |w| Some(new_texture(w, desc, Some(parent), false)),
         )
     }
 
@@ -537,7 +519,7 @@ impl Heap<FakePlatform> for Fk<kind::Heap> {
             Policy::Caught,
             "newTextureWithDescriptor:offset:",
             vec![Arg::obj(descriptor), Arg::U64(offset)],
-            |w| Some(new_texture(w, desc, None, 0, Some(parent), false)),
+            |w| Some(new_texture(w, desc, Some(parent), false)),
         )
     }
 

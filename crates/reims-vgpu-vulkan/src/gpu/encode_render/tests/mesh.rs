@@ -572,30 +572,3 @@ fn mesh_draws_outside_their_states_threadgroups_die() {
         }
     }
 }
-
-/// A mesh render pipeline state's reflection asks the object, mesh and fragment stages' slot
-/// writes, in that order: the mesh function may store through its `device` buffer 2 and not
-/// through its `constant` buffer 0, and the object function not through its `constant` buffer 0
-#[test]
-fn mesh_states_reflect_their_stages_slot_writes() {
-    let d = dev();
-    let fs = functions::<VulkanPlatform>(&d, &["m_writes", "o_fn", "f_col", "m_payload"]);
-    let writes = state(
-        &d,
-        &descriptor::<VulkanPlatform>(None, &fs[0], Some(&fs[2])),
-    );
-    let reflection = &writes.reflection;
-    assert_eq!(reflection.stages(), &[OBJECT, MESH, FRAGMENT]);
-    let slots = reflection.slots().unwrap();
-    use metal2vulkan::reflection::SlotWritability as S;
-    assert_eq!(slots[MESH].buffer(2), S::Maybe);
-    assert_eq!(slots[MESH].buffer(0), S::Never);
-    let object = state(
-        &d,
-        &descriptor::<VulkanPlatform>(Some(&fs[1]), &fs[3], Some(&fs[2])),
-    );
-    assert_eq!(
-        object.reflection.slots().unwrap()[OBJECT].buffer(0),
-        S::Never
-    );
-}

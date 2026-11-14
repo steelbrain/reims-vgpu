@@ -1,11 +1,8 @@
 //! The message layer of the macOS side: where a raise inside an Objective-C send is decided,
 //! named by its selector, which a death names. The window's AppKit side sends through [`get`] and
-//! [`catch`], and IOSurface's creation (`iosurface`) through [`fatal_send`] and [`value`]:
+//! [`catch`]:
 //! - [`get`]: a call whose raise dies at the call (a getter, a property setter, a C function).
 //! - [`catch`]: the call's exception handed back as [`Caught`], the caller's to decide.
-//! - [`fatal_send`] and [`value`]: a Foundation or IOSurface send, which dies at the send; a send
-//!   that only makes or reads a value (a string, a number, a collection, an `+alloc`) goes through
-//!   [`value`], and [`string_text`] is its string.
 //!
 //! The call runs inside objc2's `exception::catch`, so an Objective-C exception stops at the
 //! call before any Rust frame of the caller unwinds. The closure owns nothing with a `Drop`
@@ -20,7 +17,6 @@
 use std::panic::AssertUnwindSafe;
 
 use crate::core::raise::Raise;
-use crate::core::raise::death::{DeathId, DeathKind};
 use objc2::exception::{self, Exception};
 use objc2_foundation::{NSException, NSString};
 
@@ -108,45 +104,10 @@ pub fn get<R>(sel: &'static str, call: impl FnOnce() -> R) -> R {
     catch(sel, call).unwrap_or_else(|c| c.fatal())
 }
 
-/// A Foundation or IOSurface send (a getter, a property setter, a configuration): a raise inside
-/// `f` dies at the send, named by `sel`, whatever handler is live.
-///
-/// `f` holds no value with a `Drop` (D34): a foreign unwind runs the landing pads of its frame,
-/// and a `Retained` dropped there would be a release the process never makes otherwise.
-pub fn fatal_send<R>(sel: &'static str, f: impl FnOnce() -> R) -> R {
-    value(sel, f)
-}
-
-/// A send that makes or reads a value and has no effect anyone sees (a string, a number, a
-/// collection, an error's text, an `+alloc`): a raise inside `f` dies at the send, named by
-/// `sel`, whatever handler is live, as at [`fatal_send`].
-///
-/// `f` holds no value with a `Drop` (D34), as for [`fatal_send`].
-pub fn value<R>(sel: &'static str, f: impl FnOnce() -> R) -> R {
-    match exception::catch(AssertUnwindSafe(f)) {
-        Ok(r) => r,
-        Err(exc) => {
-            let (name, reason) = name_and_reason(exc.as_deref());
-            let id = DeathId::Platform {
-                kind: DeathKind::UncaughtObjc,
-                call: sel,
-            };
-            match exception_detail(&name, &reason) {
-                Some(detail) => crate::core::raise::death::fatal_with_detail(id, &detail),
-                None => crate::core::raise::fatal(id),
-            }
-        }
-    }
-}
-
-/// The text of `s`, copied out (`-UTF8String`, a [`value`] send).
-pub fn string_text(s: &NSString) -> String {
-    value("UTF8String", || s.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::raise::death::DeathKind;
     use crate::core::testkit::capture::catch_death;
     use objc2::rc::Retained;
     use objc2::runtime::NSObject;
@@ -169,31 +130,6 @@ mod tests {
         assert_eq!(site.kind, DeathKind::UncaughtObjc);
         assert_eq!((site.file, site.line), ("setWidth:", 0));
         assert_eq!(get("count", || 3), 3);
-    }
-
-    /// A value send passes its value through and dies at the send
-    #[test]
-    fn a_value_send_dies_at_the_send() {
-        assert_eq!(value("count", || 3), 3);
-        let a = array();
-        let site = catch_death(|| {
-            let _ = value("objectAtIndex:", || a.objectAtIndex(5));
-        })
-        .unwrap_err();
-        assert_eq!(
-            (site.kind, site.file, site.line),
-            (DeathKind::UncaughtObjc, "objectAtIndex:", 0)
-        );
-    }
-
-    /// `string_text` copies a string's text out
-    #[test]
-    fn strings_carry_their_text() {
-        assert_eq!(
-            string_text(&NSString::from_str("reims-vgpu.test")),
-            "reims-vgpu.test"
-        );
-        assert_eq!(string_text(&NSString::from_str("")), "");
     }
 
     objc2::define_class!(
@@ -242,21 +178,6 @@ mod tests {
         let c = catch("length", || a.objectAtIndex(5)).unwrap_err();
         assert_eq!(c.sel, "length");
         assert_eq!(c.name, "NSRangeException");
-    }
-
-    /// fatal_send dies at the send, and passes a value through
-    #[test]
-    fn fatal_send_dies_at_the_send() {
-        let a = array();
-        let site = catch_death(|| {
-            let _ = fatal_send("objectAtIndex:", || a.objectAtIndex(5));
-        })
-        .unwrap_err();
-        assert_eq!(
-            (site.kind, site.file, site.line),
-            (DeathKind::UncaughtObjc, "objectAtIndex:", 0)
-        );
-        assert!(fatal_send("isProxy", || true));
     }
 
     /// A death's detail names the caught exception, leaving out what is empty

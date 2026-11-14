@@ -500,9 +500,8 @@ through dma-bufs"). How the GPU then takes those pages depends on its driver:
   the same way and is tried once more.
 - **What is refused for want of mappings** answers as the same call does on
   Metal when memory runs out: a remap of guest pages, or a range
-  a view is made of, answers `KERN_NO_SPACE` with nothing mapped, an
-  IOSurface stand-in's memory is none, an import's twin is none, and a buffer
-  over a surface is nil. Each is counted and
+  a view is made of, answers `KERN_NO_SPACE` with nothing mapped, and an
+  import's twin is none. Each is counted and
   logged at the first and at each power of two, those after the first at
   debug (docs/conventions.md). With `REIMS_VGPU_STRICT=1` each ends the
   process at the call, naming the numbers.

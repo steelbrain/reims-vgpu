@@ -1,14 +1,5 @@
 //! Metal's resources and state objects over the runtime's: buffers, textures, heaps, samplers,
 //! depth-stencil states, pipelines, libraries and functions, fences, and shared texture handles.
-//!
-//! **An object over an IOSurface** (`newBufferWithIOSurface:`, a texture made on a surface)
-//! holds one reference of the surface for as long as the runtime keeps the object, as Metal's
-//! does: the surface's retain count is guest-visible, and the runtime holds none of its own. The
-//! reference is shared by the handle (for `iosurface`) and the runtime's deallocator of the
-//! no-copy buffer over the surface's memory, which lets it go when the runtime releases the
-//! buffer, after the last command buffer that used it. A command buffer that may reach a released
-//! texture on the surface through its resource ID alone keeps that image's memory and not the
-//! buffer, so it holds no reference of the surface.
 
 use std::collections::BTreeMap;
 use std::ptr::NonNull;
@@ -25,9 +16,7 @@ use crate::core::platform::{Handle, HostRange};
 use crate::core::raise::{OnFault, Raise, RaiseResult};
 use crate::core::sync::Mutex;
 use metal2vulkan::metal::{PixelFormat, PrimitiveTopologyClass, TextureType};
-use metal2vulkan::pipeline::{
-    ComputePipelineDescriptor, MeshPipelineDescriptor, RenderPipelineDescriptor,
-};
+use metal2vulkan::pipeline::{MeshPipelineDescriptor, RenderPipelineDescriptor};
 use metal2vulkan_runtime as rt;
 
 use crate::answer::{
@@ -39,20 +28,15 @@ use crate::gpu::backing::Backing;
 use crate::gpu::desc::{Maker, VulkanTextureDescriptor, created_format_refused};
 use crate::gpu::device::VulkanDevice;
 use crate::gpu::metal_space::Hold;
-use crate::gpu::writes::{Reflected, Reflection};
-use crate::os::OsSurface;
 use crate::platform::{Obj, VulkanPlatform};
 
-/// A runtime buffer, with the device that made it and the IOSurface it retains.
+/// A runtime buffer, with the device that made it.
 #[derive(Debug)]
 pub struct BufferObject {
     /// The runtime's buffer.
     pub raw: rt::Buffer,
     /// The device that made it.
     pub device: VulkanDevice,
-    /// The IOSurface whose memory it is (`newBufferWithIOSurface:`): one reference, which the
-    /// runtime's deallocator of the buffer shares.
-    pub surface: Option<Arc<OsSurface>>,
     /// The guest's pages it is over, and the read-only bit it was made with
     /// ([`crate::gpu::backing`]).
     pub backing: Backing,
@@ -70,13 +54,6 @@ pub struct TextureObject {
     pub raw: rt::Texture,
     /// The device that made it.
     pub device: VulkanDevice,
-    /// The IOSurface whose memory it is (`newTextureWithDescriptor:iosurface:plane:`): one
-    /// reference, which the runtime's deallocator of the buffer under the texture shares.
-    pub surface: Option<Arc<OsSurface>>,
-    /// Where its texels lie in the bytes of `surface`, for one made on it
-    /// (`newTextureWithDescriptor:iosurface:plane:`), its texture's for a view; `None` for any
-    /// other.
-    pub plane: Option<rt::IoSurfacePlane>,
     /// The buffer it is over or the heap it is placed in, its texture's for a view, held while
     /// it lives ([`Under`]).
     pub under: Option<Under>,
@@ -85,8 +62,8 @@ pub struct TextureObject {
     /// (0x4000, 0x8000 and 0x10000) are the runtime's, which keeps them for a texture, its views
     /// and a texture opened from its shared handle, as Metal does (measured: [`crate::gpu::desc`]).
     pub private_usage: u64,
-    /// What it holds of Metal's address space, which its views share: a range of its own, its
-    /// surface's, a slot in one of Metal's pools, or none
+    /// What it holds of Metal's address space, which its views share: a range of its own, a slot
+    /// in one of Metal's pools, or none
     /// ([`crate::gpu::metal_space::texture_space`]), and its descriptor in Metal's mempool, which
     /// a view takes one of its own of ([`Hold::sharing`]). The range token of the runtime's
     /// texture, or of the buffer it is over, holds it too, until the runtime frees that
@@ -99,7 +76,7 @@ pub type VulkanTexture = Obj<TextureObject>;
 
 /// The buffer a texture is over, or the heap it is placed in, which the texture holds as
 /// Metal's does. Each holds the bytes of the buffer or heap the texture's texels may lie in, a first byte and an end, which
-/// a write of the texture may change ([`crate::gpu::writes::texture_memory`]).
+/// a write of the texture may change.
 #[derive(Debug)]
 pub enum Under {
     /// The buffer whose bytes it is.
@@ -162,21 +139,10 @@ fn ycbcr_matrix(matrix: SurfaceMatrix) -> rt::SurfaceYCbCrMatrix {
 impl TextureObject {
     /// The texture's life as [`Placements`] reads it, which it does not revive: its [`space`](TextureObject::space), which every view of it shares, views of views
     /// included ([`Hold::sharing`]), so its bytes stay taken while it or a view of it lives, as a
-    /// Metal view's `parentTexture` keeps the texture and its bytes. A texture on a surface's
-    /// lasts until the runtime frees the buffer under it too, whose range token holds it, once
-    /// the last command buffer that used it completed, as Metal's command buffer keeps the
-    /// texture until then.
+    /// Metal view's `parentTexture` keeps the texture and its bytes.
     pub(crate) fn life(&self) -> Weak<dyn std::any::Any + Send + Sync> {
         let space: Weak<Hold> = Arc::downgrade(&self.space);
         space
-    }
-
-    /// Whether the runtime refuses the GPU's writes of its texels: one over a surface of a 4:4:4
-    /// two-plane YCbCr format whose writes it does not store as Metal's GPU does
-    /// ([`crate::gpu::ycbcr::writes_refused`]).
-    pub(crate) fn writes_refused(&self) -> bool {
-        self.surface.is_some()
-            && crate::gpu::ycbcr::writes_refused(plain(|| self.raw.pixel_format()))
     }
 
     /// The runtime's texture, for `sel`, which reads or writes its texels. A rotated one is the
@@ -618,10 +584,6 @@ pub struct ComputePipelineObject {
     pub raw: rt::ComputePipelineState,
     /// Its `uniqueIdentifier`.
     pub unique_identifier: u64,
-    /// The reflection of the descriptor it was made of, where a creator of the guest's made it,
-    /// whose slot writes tell which texture and buffer slots its kernel writes
-    /// ([`Reflection::slots`]).
-    pub reflection: Arc<Reflection>,
 }
 
 impl ComputePipelineObject {
@@ -633,15 +595,7 @@ impl ComputePipelineObject {
         ComputePipelineObject {
             raw,
             unique_identifier,
-            reflection: Reflection::new(None),
         }
-    }
-
-    /// `raw`, just made of `descriptor`, as [`ComputePipelineObject::new`] makes it.
-    pub fn of(raw: rt::ComputePipelineState, descriptor: ComputePipelineDescriptor) -> Self {
-        let mut object = ComputePipelineObject::new(raw);
-        object.reflection = Reflection::new(Some(Reflected::Compute(Box::new(descriptor))));
-        object
     }
 }
 
@@ -666,9 +620,10 @@ pub struct RenderPipelineObject {
     /// of a vertex function that writes no `[[point_size]]` ([`crate::gpu::encode_render`]);
     /// `Unspecified`, Metal's default, for a state of no guest descriptor's.
     pub input_primitive_topology: PrimitiveTopologyClass,
-    /// The reflection of the descriptor it was made of, whose slot writes tell which slots each
-    /// stage writes ([`Reflection::slots`]); of none for a state made otherwise.
-    pub reflection: Arc<Reflection>,
+    /// The guest's descriptor it was made of, which an encoder that sets it reads
+    /// ([`crate::gpu::encode_render::StateFacts`]); `None` for a state no creator of the guest's
+    /// made.
+    pub descriptor: Option<RenderDescriptor>,
     /// What it tells a render encoder that sets it, read at its first set
     /// ([`crate::gpu::encode_render::StateFacts`]).
     pub(crate) drawn: std::sync::OnceLock<crate::gpu::encode_render::StateFacts>,
@@ -789,7 +744,7 @@ pub(crate) fn render_pipeline_of(
         raw,
         unique_identifier,
         input_primitive_topology,
-        reflection: Reflection::new(descriptor.map(Reflected::Render)),
+        descriptor,
         drawn: std::sync::OnceLock::new(),
     })
 }
@@ -797,8 +752,8 @@ pub(crate) fn render_pipeline_of(
 impl RenderPipelineObject {
     /// What a mesh render pipeline state answers ([`MeshAnswers`]); `None` for any other state.
     pub(crate) fn mesh_answers(&self) -> Option<&MeshAnswers> {
-        match self.reflection.descriptor() {
-            Some(Reflected::Render(RenderDescriptor::Mesh(m))) => Some(&m.answers),
+        match &self.descriptor {
+            Some(RenderDescriptor::Mesh(m)) => Some(&m.answers),
             _ => None,
         }
     }
@@ -852,14 +807,8 @@ impl GpuResource<VulkanPlatform> for VulkanBuffer {
 }
 
 impl Buffer<VulkanPlatform> for VulkanBuffer {
-    /// NULL for a `Private` buffer, as Metal's, and for one made on a surface
-    /// (`newBufferWithIOSurface:`), as Metal's on every surface, of `Shared` storage all the same
-    /// (measured on the M3 Max: a surface of its own memory, and ones over the guest's pages
-    /// without `kIOSurfaceClientDirection` and with 2 and 3).
+    /// NULL for a `Private` buffer, as Metal's.
     fn contents(&self) -> HostPtr {
-        if self.surface.is_some() {
-            return HostPtr::NULL;
-        }
         let at = |p: NonNull<u8>| HostPtr::from_ptr(p.as_ptr());
         plain(|| self.raw.contents().map(crate::os::shown_at).map(at)).unwrap_or(HostPtr::NULL)
     }
@@ -876,11 +825,6 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
 
     fn gpu_address(&self) -> u64 {
         plain(|| self.raw.gpu_address()).0
-    }
-
-    /// The surface the buffer was made on, +1; `None` for any other buffer.
-    fn iosurface(&self) -> Option<OsSurface> {
-        plain(|| self.surface.as_deref().map(Handle::clone_ref))
     }
 
     fn length(&self) -> u64 {
@@ -977,8 +921,8 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
     /// a surface the buffer stands for (`Buffer::new_texture_with_iosurface_plane`), at the
     /// plane's offset with rows its bytes per row apart: of the descriptor's options, a sampler
     /// ID of the device taken, as Metal's device takes one, and as the device's
-    /// `new_texture_on_surface` makes one over an `IOSurfaceRef`, minus its reads of the surface,
-    /// which the facts give ([`crate::gpu::device::surface_plane_descriptor`],
+    /// Metal's makes one over an `IOSurfaceRef`, minus its reads of the surface, which the facts
+    /// give ([`crate::gpu::device::surface_plane_descriptor`],
     /// [`crate::gpu::device::texture_over_plane`]). A two-plane YCbCr format the runtime reads
     /// and a two-plane XR10 one read the facts of a surface of two planes or more
     /// ([`crate::gpu::device::plane_facts_taken`]): its OSType, which says its range, its size,
@@ -1005,7 +949,9 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
         let Some(desc) = crate::gpu::device::surface_plane_descriptor(device, sel, &fields)? else {
             return Ok(None);
         };
-        // As over an `IOSurfaceRef` (`textures_over_planes_a_surface_lacks_are_metals`).
+        // Metal asserts at a plane past 0 of a surface without planes, whatever the format
+        // ("IOSurface is non-planar, but plane 1 specified"), and answers nil at a plane past a
+        // planar surface's last (measured: `textures_over_planes_a_surface_lacks_are_metals`).
         if plane.plane != 0 && facts.plane_count == 0 {
             let what = format!("plane {} of a surface without planes", plane.plane);
             metal_aborts(sel, &what);
@@ -1197,8 +1143,6 @@ impl VulkanTexture {
         Ok(Some(Obj::new(TextureObject {
             raw,
             device: self.device.clone_ref(),
-            surface: self.surface.clone(),
-            plane: self.plane,
             under: self.under.as_ref().map(Under::clone_ref),
             private_usage: self.private_usage,
             space: Arc::new(Hold::sharing(Arc::clone(&self.space))),
@@ -1264,11 +1208,6 @@ impl Texture<VulkanPlatform> for VulkanTexture {
 
     fn height(&self) -> u64 {
         plain(|| self.raw.height())
-    }
-
-    /// The surface the texture (or the texture it views) was made on, +1; `None` for any other.
-    fn iosurface(&self) -> Option<OsSurface> {
-        plain(|| self.surface.as_deref().map(Handle::clone_ref))
     }
 
     fn is_shareable(&self) -> bool {
@@ -2705,7 +2644,9 @@ pub(crate) mod tests {
     }
 
     /// Fresh pages of the host's, of zeros, that hold at least `bytes` bytes: their first byte and
-    /// length, which [`free_pages`] frees once nothing lies over them.
+    /// length, which [`free_pages`] frees once nothing lies over them. Only the Metal comparisons
+    /// (macOS) call it.
+    #[cfg(target_os = "macos")]
     pub(crate) fn host_pages(bytes: u64) -> (HostPtr, u64) {
         use crate::core::platform::os::vm::HostVm as _;
         let length = bytes.next_multiple_of(crate::os::OsVm::new().page_size());
@@ -2713,6 +2654,7 @@ pub(crate) mod tests {
     }
 
     /// The pages of [`host_pages`], freed.
+    #[cfg(target_os = "macos")]
     pub(crate) fn free_pages(pages: HostPtr, length: u64) {
         use crate::core::platform::os::vm::HostVm as _;
         let freed = crate::remap::VulkanVm::new().deallocate(pages, length);
@@ -2758,6 +2700,7 @@ pub(crate) mod tests {
         /// A 'BGRA' surface's stand-in of `size` (as [`StandIn::bgra`]) over the `length` bytes of
         /// host pages at `pages` ([`host_pages`]), a no-copy buffer of `d`'s over them, as a
         /// guest's surface lies over the guest's pages.
+        #[cfg(target_os = "macos")]
         pub(crate) fn bgra_over(
             d: &P::Device,
             (width, height): (u64, u64),
@@ -2840,7 +2783,6 @@ pub(crate) mod tests {
         assert_ne!(b.contents(), HostPtr::NULL);
         assert_ne!(b.gpu_address(), 0);
         assert_eq!(GpuResource::device(&b).unwrap().id(), d.id());
-        assert!(b.iosurface().is_none());
         let private = d
             .new_buffer_of_length(OnFault::Return, 64, 0x20)
             .unwrap()
@@ -3430,7 +3372,7 @@ pub(crate) mod tests {
         assert_eq!((t.storage_mode(), t.protection_options()), (0, 0));
         assert_ne!(t.gpu_resource_id(), 0);
         assert_eq!(t.resource_index(), t.gpu_resource_id());
-        assert!(!t.is_shareable() && t.iosurface().is_none());
+        assert!(!t.is_shareable());
         assert_eq!(GpuResource::device(&t).unwrap().id(), d.id());
         t.set_label("reims-vgpu.texture").unwrap();
         let bytes = pattern(16, 8);
@@ -4496,7 +4438,8 @@ pub(crate) mod tests {
     }
 
     /// The address of [`over_pages`] bytes of pages of their own, left mapped: a heap or buffer
-    /// over them uses them until the process ends.
+    /// over them uses them until the process ends. Only the Metal comparisons (macOS) call it.
+    #[cfg(target_os = "macos")]
     pub(crate) fn guest_pages() -> u64 {
         guest_pages_of(over_pages())
     }
@@ -4530,6 +4473,7 @@ pub(crate) mod tests {
     }
 
     /// A `Shared` heap of [`over_pages`] bytes over the pages at `address` ([`heap_over`]).
+    #[cfg(target_os = "macos")]
     pub(crate) fn heap_at<P: Platform>(d: &P::Device, address: u64) -> P::Heap
     where
         P::Device: GpuDevice<P>,

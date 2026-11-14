@@ -42,8 +42,6 @@ mod tests {
         Obj::new(TextureObject {
             raw,
             device: d.clone_ref(),
-            surface: None,
-            plane: None,
             under: None,
             private_usage: 0,
             space: std::sync::Arc::new(crate::gpu::metal_space::Hold::NONE),

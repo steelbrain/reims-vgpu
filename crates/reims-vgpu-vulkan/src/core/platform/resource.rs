@@ -47,10 +47,6 @@ pub trait Buffer<P: Platform>: GpuResource<P> {
     fn did_modify_range(&self, on: OnFault, range: NsRange) -> RaiseResult<()>;
     /// sel: gpuAddress SPI
     fn gpu_address(&self) -> u64;
-    /// sel: iosurface SPI
-    /// Returns +1: the handle is the retain core makes right after the getter (`[(id)surface
-    /// retain]`); callers do not `.clone_ref()` it. `None` when the buffer has no IOSurface.
-    fn iosurface(&self) -> Option<P::Surface>;
     /// sel: length
     fn length(&self) -> u64;
     /// sel: newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage: SPI
@@ -163,10 +159,6 @@ pub trait Texture<P: Platform>: GpuResource<P> {
     fn gpu_resource_id(&self) -> u64;
     /// sel: height
     fn height(&self) -> u64;
-    /// sel: iosurface SPI
-    /// Returns +1: the handle is the retain core makes right after the getter (`[(id)surface
-    /// retain]`); callers do not `.clone_ref()` it. `None` when the texture has no IOSurface.
-    fn iosurface(&self) -> Option<P::Surface>;
     /// sel: isShareable
     fn is_shareable(&self) -> bool;
     /// sel: mipmapLevelCount

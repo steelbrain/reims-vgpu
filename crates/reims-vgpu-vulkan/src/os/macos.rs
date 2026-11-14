@@ -1,28 +1,19 @@
 //! The OS services on macOS: core's threads ([`threads`]) and the scheduling hint of the
-//! graphics device's walk threads ([`hints`]), clocks ([`clock`]), Mach VM ([`vm`]),
-//! the Objective-C autorelease pool ([`autorelease`]) and IOSurface ([`iosurface`]), whose
-//! surface is one CF reference whose retain count the guest sees; and the message layer the
-//! Objective-C sends go through ([`msg`]), which the window's AppKit side uses too.
-//! `VulkanPlatform` holds them; its Mach VM reports the pages it changes to the runtime
-//! ([`crate::remap::VulkanVm`]).
-//!
-//! [`VulkanSurfaces`] answers each IOSurface creation with [`iosurface`]'s, and records what each
-//! surface it made over the guest's pages, or at an offset into its allocation, was made over
-//! ([`ClientPages`]).
+//! graphics device's walk threads ([`hints`]), clocks ([`clock`]), Mach VM ([`vm`]) and the
+//! Objective-C autorelease pool ([`autorelease`]); and the message layer the Objective-C sends go
+//! through ([`msg`]), which the window's AppKit side uses too. `VulkanPlatform` holds them; its
+//! Mach VM reports the pages it changes to the runtime ([`crate::remap::VulkanVm`]).
 
 mod autorelease;
 mod clock;
 mod drawables;
 mod hints;
-mod iosurface;
 pub mod msg;
 mod threads;
 mod vm;
 
-use std::collections::BTreeMap;
-use std::ffi::{CStr, c_void};
+use std::ffi::CStr;
 use std::path::PathBuf;
-use std::sync::Weak;
 
 use metal2vulkan_runtime as rt;
 use objc2::rc::Retained;
@@ -30,17 +21,11 @@ use objc2::runtime::{NSObjectProtocol as _, ProtocolObject, Sel};
 use objc2::{msg_send, sel};
 use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
 
-use crate::core::platform::Handle;
-use crate::core::platform::os::surface::{BackingSurfaceSpec, IoSurfaces, Surface, SurfaceSpec};
 use crate::core::platform::os::vm::{HostAddr, HostVm as _, KernReturn};
 
 use self::clock::MacClock;
-use self::iosurface::{MacSurface, MacSurfaces};
 use self::threads::MacThreads;
 use self::vm::MacVm;
-
-use super::{MadeOver, page_runs};
-use crate::platform::VulkanPlatform;
 
 pub(crate) use drawables::Drawables;
 
@@ -50,13 +35,9 @@ pub type OsClock = MacClock;
 pub type OsThreads = MacThreads;
 /// Mach VM: [`vm`]'s.
 pub type OsVm = MacVm;
-/// An IOSurface: [`iosurface`]'s, one CF reference.
-pub type OsSurface = MacSurface;
-/// IOSurface creation: [`VulkanSurfaces`].
-pub type OsSurfaces = VulkanSurfaces;
 
 /// Installs what the process's platform needs before it runs: the Objective-C autorelease pool
-/// core's pools push, which MoltenVK, IOSurface and Foundation autorelease into.
+/// core's pools push, which MoltenVK and Foundation autorelease into.
 pub fn install_process_services() {
     autorelease::install();
 }
@@ -201,15 +182,6 @@ impl RegionMemory {
     }
 }
 
-/// A fresh range of `len` bytes of zeros that a view can be made of: on Mach, any allocation.
-pub(crate) fn allocate_zeros(len: u64) -> Result<HostAddr, KernReturn> {
-    allocate_aliasable(len)
-}
-
-/// Whether the runtime imports a surface's read-only alias through a writable twin of its files:
-/// not on macOS, where it imports the bytes themselves ([`import_view`]).
-pub(crate) const TWINS_READ_ONLY: bool = false;
-
 /// Whether the runtime makes read-only memory, and memory made with `MTLResourceOptions` bit 24,
 /// over a copy of it whose GPU writes it drops: not on macOS, where MoltenVK hands Metal the
 /// pages, or a read-only view of them, and Metal's GPU answers its writes there itself, as the
@@ -250,13 +222,6 @@ impl ImportView {
     /// The word that the runtime's import was made: nothing on macOS, where no view of the bytes
     /// is folded.
     pub(crate) fn made(&self) -> ImportMade {
-        ImportMade
-    }
-
-    /// Another import of the same memory while the view lives: nothing on macOS ([`made`]).
-    ///
-    /// [`made`]: ImportView::made
-    pub(crate) fn again(&self) -> ImportMade {
         ImportMade
     }
 
@@ -381,373 +346,4 @@ pub(crate) fn mapped(at: HostAddr) -> bool {
     let vm = MacVm::new();
     vm.protect_max(at, vm.page_size(), crate::core::platform::os::vm::VmProt(7))
         != Err(KernReturn(1))
-}
-
-// IOSurface's plane and value queries, which [`iosurface`]'s surface does not answer.
-#[link(name = "IOSurface", kind = "framework")]
-unsafe extern "C" {
-    fn IOSurfaceGetBaseAddressOfPlane(buffer: *const c_void, plane_index: usize) -> *mut c_void;
-    fn IOSurfaceGetBytesPerRowOfPlane(buffer: *const c_void, plane_index: usize) -> usize;
-    fn IOSurfaceGetWidthOfPlane(buffer: *const c_void, plane_index: usize) -> usize;
-    fn IOSurfaceGetHeightOfPlane(buffer: *const c_void, plane_index: usize) -> usize;
-    fn IOSurfaceGetBytesPerElementOfPlane(buffer: *const c_void, plane_index: usize) -> usize;
-    /// `CFTypeRef IOSurfaceCopyValue(IOSurfaceRef, CFStringRef)`: +1 or NULL.
-    fn IOSurfaceCopyValue(buffer: *const c_void, key: *const c_void) -> *const c_void;
-    fn IOSurfaceGetID(buffer: *const c_void) -> u32;
-    /// `IOSurfaceRef IOSurfaceLookup(IOSurfaceID)`: +1 or NULL.
-    fn IOSurfaceLookup(csid: u32) -> *const c_void;
-}
-
-// The CoreFoundation calls that read a surface's value as a string.
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    fn CFStringCreateWithBytes(
-        alloc: *const c_void,
-        bytes: *const u8,
-        num_bytes: isize,
-        encoding: u32,
-        is_external_representation: u8,
-    ) -> *const c_void;
-    fn CFGetTypeID(cf: *const c_void) -> usize;
-    fn CFStringGetTypeID() -> usize;
-    fn CFStringGetCString(
-        string: *const c_void,
-        buffer: *mut u8,
-        buffer_size: isize,
-        encoding: u32,
-    ) -> u8;
-    fn CFRelease(cf: *const c_void);
-}
-
-/// `kCFStringEncodingUTF8`.
-const UTF8: u32 = 0x0800_0100;
-
-/// The `IOSurfaceRef` of `surface`: its identity is the reference's address (`MacSurface`'s
-/// `Handle::id`), live while `surface` holds its reference.
-fn surface_ref(surface: &MacSurface) -> Option<*const c_void> {
-    let address = usize::try_from(surface.id().0).ok()?;
-    Some(std::ptr::with_exposed_provenance::<c_void>(address))
-}
-
-/// Plane `plane` of `surface`: its bytes' offset from the surface's base address
-/// (`IOSurfaceGetBaseAddressOfPlane`) and its bytes per row; `None` for a plane the surface lacks.
-pub(crate) fn plane_at(surface: &MacSurface, plane: u64) -> Option<(u64, u64)> {
-    if plane >= surface.plane_count() {
-        return None;
-    }
-    let index = usize::try_from(plane).ok()?;
-    let surface_ref = surface_ref(surface)?;
-    // SAFETY: a live IOSurfaceRef, and a plane index under its plane count.
-    let (base, bytes_per_row) = unsafe {
-        (
-            IOSurfaceGetBaseAddressOfPlane(surface_ref, index),
-            IOSurfaceGetBytesPerRowOfPlane(surface_ref, index),
-        )
-    };
-    let offset = base.addr().checked_sub(surface.base_address().addr())?;
-    Some((
-        u64::try_from(offset).ok()?,
-        u64::try_from(bytes_per_row).ok()?,
-    ))
-}
-
-/// The width, height and bytes per element of plane `plane` of `surface`, which has planes;
-/// `None` for a plane it lacks.
-pub(crate) fn plane_shape(surface: &MacSurface, plane: u64) -> Option<(u64, u64, u64)> {
-    if plane >= surface.plane_count() {
-        return None;
-    }
-    let index = usize::try_from(plane).ok()?;
-    let surface_ref = surface_ref(surface)?;
-    // SAFETY: a live IOSurfaceRef, and a plane index under its plane count.
-    let shape = unsafe {
-        (
-            IOSurfaceGetWidthOfPlane(surface_ref, index),
-            IOSurfaceGetHeightOfPlane(surface_ref, index),
-            IOSurfaceGetBytesPerElementOfPlane(surface_ref, index),
-        )
-    };
-    Some((
-        u64::try_from(shape.0).ok()?,
-        u64::try_from(shape.1).ok()?,
-        u64::try_from(shape.2).ok()?,
-    ))
-}
-
-/// What keeps `surface`'s memory mapped while a device imports it at its base address, the
-/// surface gone or not: nothing here. IOSurface's memory is the surface's own, and nothing but a
-/// reference of the surface, which the guest counts, keeps it.
-pub(crate) fn surface_memory_hold(_surface: &MacSurface) -> impl Send + 'static {}
-
-/// The alias of `surface`'s allocation its buffers lie over where it is the surface's own
-/// mapping (`crate::os::surface_alias`): none on macOS, where IOSurface's mapping goes with the
-/// surface's last release, which a buffer's alias may outlive.
-pub(crate) fn own_alias(_surface: &MacSurface) -> Option<crate::gpu::backing::Alias> {
-    None
-}
-
-/// The surface's key that names its YCbCr matrix (`kIOSurfaceYCbCrMatrix`).
-pub(crate) const MATRIX_KEY: &str = "IOSurfaceYCbCrMatrix";
-
-/// The YCbCr matrix `surface` names now (`kIOSurfaceYCbCrMatrix`, [`MATRIX_KEY`]): `None` for no
-/// value there, a value that is no string the runtime's `Other`.
-pub(crate) fn ycbcr_matrix(surface: &MacSurface) -> Option<rt::SurfaceYCbCrMatrix> {
-    match surface_value(surface, MATRIX_KEY) {
-        SurfaceValue::Absent => None,
-        SurfaceValue::Text(t) => Some(rt::SurfaceYCbCrMatrix::from_attachment(&t)),
-        SurfaceValue::Other => Some(rt::SurfaceYCbCrMatrix::Other),
-    }
-}
-
-/// A value of a surface's (`IOSurfaceCopyValue`), as far as a reader of strings sees it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SurfaceValue {
-    /// The surface has no value at the key.
-    Absent,
-    /// A string.
-    Text(String),
-    /// A value of another type, or a string with no UTF-8 form.
-    Other,
-}
-
-/// The value of `surface` at `key` (`IOSurfaceCopyValue`).
-fn surface_value(surface: &MacSurface, key: &str) -> SurfaceValue {
-    let Some(surface_ref) = surface_ref(surface) else {
-        return SurfaceValue::Other;
-    };
-    let Ok(length) = isize::try_from(key.len()) else {
-        return SurfaceValue::Other;
-    };
-    // SAFETY: `key`'s bytes, of `length`, are live for the call, which copies them.
-    let cf_key =
-        unsafe { CFStringCreateWithBytes(std::ptr::null(), key.as_ptr(), length, UTF8, 0) };
-    if cf_key.is_null() {
-        return SurfaceValue::Other;
-    }
-    // SAFETY: a live IOSurfaceRef and a CFString; the value is +1, released below.
-    let value = unsafe { IOSurfaceCopyValue(surface_ref, cf_key) };
-    // SAFETY: the key's +1 reference, made above.
-    unsafe { CFRelease(cf_key) };
-    if value.is_null() {
-        return SurfaceValue::Absent;
-    }
-    let mut text = [0u8; 256];
-    // SAFETY: a live CF object; a string is read into `text`, whose length the call is given.
-    let read = unsafe {
-        CFGetTypeID(value) == CFStringGetTypeID()
-            && CFStringGetCString(value, text.as_mut_ptr(), 256, UTF8) != 0
-    };
-    // SAFETY: the value's +1 reference, copied above.
-    unsafe { CFRelease(value) };
-    if !read {
-        return SurfaceValue::Other;
-    }
-    let end = text.iter().position(|&b| b == 0).unwrap_or(text.len());
-    match std::str::from_utf8(&text[..end]) {
-        Ok(s) => SurfaceValue::Text(s.to_owned()),
-        Err(_) => SurfaceValue::Other,
-    }
-}
-
-/// What [`ClientPages`] recorded of `surface`, `change` given the record to change; `None` for a
-/// surface it did not record.
-pub(crate) fn recorded_mut<T>(
-    surface: &MacSurface,
-    change: impl FnOnce(&mut MadeOver) -> T,
-) -> Option<T> {
-    let key = key(surface)?;
-    CLIENT_PAGES.lock().entries.get_mut(&key).map(change)
-}
-
-/// The key of a surface's record, its `IOSurfaceID`: every object over the same IOSurface
-/// answers it, each a reference of its own. Measured on the M3 Max: a lookup in this process
-/// (`IOSurfaceLookupFromMachPort` and `IOSurfaceLookup`)
-/// answers a new reference each time, of the same ID and base address.
-type SurfaceKey = u32;
-
-/// `surface`'s [`SurfaceKey`].
-fn key(surface: &MacSurface) -> Option<SurfaceKey> {
-    let at = surface_ref(surface)?;
-    // SAFETY: a live surface.
-    Some(unsafe { IOSurfaceGetID(at) })
-}
-
-/// What each surface [`VulkanSurfaces::create`] made over the guest's pages, or at an offset
-/// into its allocation, was made over, by its `IOSurfaceID` ([`SurfaceKey`]). An ID names one
-/// live surface, so a surface made here drops the entry of one gone that had its ID
-/// ([`ClientPages::forget`]), and entries whose ID no surface holds are dropped as it grows.
-/// Each record a command's objects read at its encode is found by its ID.
-struct ClientPages {
-    entries: BTreeMap<SurfaceKey, MadeOver>,
-    /// The length at which the next record drops the entries of surfaces gone.
-    prune_at: usize,
-}
-
-static CLIENT_PAGES: crate::core::sync::Mutex<ClientPages> =
-    crate::core::sync::Mutex::new(ClientPages {
-        entries: BTreeMap::new(),
-        prune_at: 64,
-    });
-
-impl ClientPages {
-    /// Drops the entry of `surface`'s ID, one of a surface gone where `surface` was just made.
-    fn forget(&mut self, surface: &MacSurface) {
-        if let Some(key) = key(surface) {
-            self.entries.remove(&key);
-        }
-    }
-
-    /// Records `surface`, made over `pages` (host first byte and length of each), its bytes
-    /// `offset` bytes into its allocation.
-    fn record(&mut self, surface: &MacSurface, pages: &[(u64, u64)], offset: u64) {
-        let Some(key) = key(surface) else {
-            return;
-        };
-        let runs = page_runs(pages.iter().copied());
-        self.entries.remove(&key);
-        if self.entries.len() >= self.prune_at {
-            self.entries.retain(|&id, _| alive(id));
-            self.prune_at = (self.entries.len() * 2).max(64);
-        }
-        self.entries.insert(
-            key,
-            MadeOver {
-                pages: runs,
-                offset,
-                alias: Weak::new(),
-            },
-        );
-    }
-}
-
-/// Whether a surface of `IOSurfaceID` `id` lives: one made here, or one another process made
-/// since, whose ID's entry goes when a surface made here takes the ID.
-fn alive(id: u32) -> bool {
-    // SAFETY: a lookup by ID, which answers +1 or NULL.
-    let found = unsafe { IOSurfaceLookup(id) };
-    if found.is_null() {
-        return false;
-    }
-    // SAFETY: the lookup's +1 reference.
-    unsafe { CFRelease(found) };
-    true
-}
-
-/// `IOSurfaceCreate` and `[[IOSurface alloc] initWithProperties:]`: [`iosurface`]'s. A surface
-/// made over the guest's pages, or at an offset into its allocation, is recorded with them
-/// ([`crate::os::surface_memory`], [`crate::os::surface_offset`]); every lookup of it answers the
-/// record too. Each surface made here drops the record of a surface gone that had its ID.
-#[derive(Debug, Default)]
-pub struct VulkanSurfaces(MacSurfaces);
-
-impl VulkanSurfaces {
-    /// The process's IoSurfaces.
-    pub fn new() -> VulkanSurfaces {
-        VulkanSurfaces(MacSurfaces::new())
-    }
-}
-
-impl IoSurfaces<VulkanPlatform> for VulkanSurfaces {
-    fn create(&self, spec: &SurfaceSpec) -> Option<MacSurface> {
-        let made = self.0.create(spec)?;
-        let mut recorded = CLIENT_PAGES.lock();
-        recorded.forget(&made);
-        if spec.client_address_ranges.is_some() || spec.offset != 0 {
-            let pages: Vec<(u64, u64)> = (spec.client_address_ranges.iter().flatten())
-                .map(|r| (r.physical_address, r.physical_length))
-                .collect();
-            recorded.record(&made, &pages, spec.offset);
-        }
-        drop(recorded);
-        Some(made)
-    }
-
-    fn create_backing(&self, spec: &BackingSurfaceSpec) -> Option<MacSurface> {
-        let made = self.0.create_backing(spec)?;
-        CLIENT_PAGES.lock().forget(&made);
-        Some(made)
-    }
-
-    fn describe(&self, spec: &SurfaceSpec) -> String {
-        self.0.describe(spec)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::os::tests::{bgra_surface, bgra_surface_over_at, free};
-    use crate::os::{surface_memory, surface_offset};
-
-    /// The records of live surfaces outlast the dropping of those of surfaces gone, which runs
-    /// as the records grow past 64
-    #[test]
-    fn records_of_live_surfaces_outlast_the_pruning() {
-        let made: Vec<_> = (0..80).map(|_| bgra_surface_over_at(4, 4, 0x40)).collect();
-        let offsets: Vec<u64> = made.iter().map(|(s, ..)| surface_offset(s)).collect();
-        assert_eq!(offsets, [0x40; 80]);
-        for (s, pages, length) in made {
-            drop(s);
-            free(pages, length);
-        }
-    }
-
-    /// A surface made with the ID of one gone, which IOSurface hands out again at once, answers
-    /// no record of that one's, made by `IOSurfaceCreate` or by `initWithProperties:`. Another
-    /// process's surface can take the freed ID first: with 8 tries, 2 of 5 runs alone found no
-    /// ID handed out again on the M3 Max (macOS 27.0.1), and 0 of 40 with 64
-    #[test]
-    fn a_surface_taking_the_id_of_one_gone_takes_none_of_its_record() {
-        use crate::core::platform::os::surface::{BackingPlaneSpec, BackingSurfaceSpec};
-        let backing = BackingSurfaceSpec {
-            pixel_format: u32::from_be_bytes(*b"BGRA"),
-            planes: vec![BackingPlaneSpec {
-                width: 16,
-                height: 16,
-                bytes_per_element: 4,
-                bytes_per_row: 64,
-                base: 0,
-                offset: 0,
-            }],
-            width: 16,
-            height: 16,
-        };
-        let makers: [&dyn Fn() -> MacSurface; 2] = [&|| bgra_surface(16, 16), &|| {
-            VulkanSurfaces::new().create_backing(&backing).unwrap()
-        }];
-        for make in makers {
-            let reused = (0..64).any(|_| {
-                let (gone, pages, length) = bgra_surface_over_at(16, 16, 0x100);
-                let id = key(&gone);
-                drop(gone);
-                free(pages, length);
-                let made = make();
-                let same = key(&made) == id;
-                assert_eq!(surface_offset(&made), 0);
-                assert!(surface_memory(&made).len() <= 1);
-                same
-            });
-            assert!(reused, "IOSurface handed out no ID again");
-        }
-    }
-
-    /// A host-only surface is one CF reference, of the spec's size
-    #[test]
-    fn host_only_surfaces_are_one_reference() {
-        let spec = SurfaceSpec {
-            pixel_format: u32::from_be_bytes(*b"BGRA"),
-            alloc_size: 16 * 64,
-            width: 16,
-            height: 16,
-            bytes_per_element: 4,
-            bytes_per_row: 64,
-            element_width: 1,
-            element_height: 1,
-            ..SurfaceSpec::default()
-        };
-        let s = VulkanSurfaces::new().create(&spec).unwrap();
-        assert_eq!((s.width(), s.height(), s.bytes_per_row()), (16, 16, 64));
-        assert_eq!(s.retain_count(), 1);
-        assert!(!VulkanSurfaces::new().describe(&spec).is_empty());
-    }
 }

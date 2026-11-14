@@ -627,14 +627,12 @@ impl Source {
     /// What its texture's texels lie in, as far as a pass tells them apart; `None` for nil.
     pub fn over(&self) -> Option<Over> {
         let t = self.0.as_ref()?;
-        Some(match (&t.under, &t.plane) {
+        Some(match &t.under {
             _ if t.raw.parent_texture().is_some() => Over::View,
-            (Some(Under::Buffer(..)), _) => Over::Buffer,
-            (Some(Under::Heap(..)), _) => Over::Heap,
-            (None, Some(plane)) if plane.planar => Over::Plane,
-            (None, Some(_)) => Over::Surface,
-            (None, None) if t.raw.is_shareable() => Over::Shareable,
-            (None, None) => Over::Own,
+            Some(Under::Buffer(..)) => Over::Buffer,
+            Some(Under::Heap(..)) => Over::Heap,
+            None if t.raw.is_shareable() => Over::Shareable,
+            None => Over::Own,
         })
     }
 }
@@ -647,10 +645,6 @@ pub enum Over {
     /// Memory of its own, shareable: a texture of `newSharedTextureWithDescriptor:`, or one
     /// opened from its handle.
     Shareable,
-    /// An IOSurface without planes (`newTextureWithDescriptor:iosurface:plane:` at its plane 0).
-    Surface,
-    /// A plane of an IOSurface with planes.
-    Plane,
     /// A buffer's bytes (`newTextureWithDescriptor:offset:bytesPerRow:`).
     Buffer,
     /// A heap's memory.
@@ -665,8 +659,6 @@ impl Over {
         match over {
             Some(Over::Own) => "a texture of its own",
             Some(Over::Shareable) => "a shareable texture, or one opened from a shared handle",
-            Some(Over::Surface) => "a texture over an IOSurface",
-            Some(Over::Plane) => "a texture over a plane of an IOSurface with planes",
             Some(Over::Buffer) => "a texture over a buffer",
             Some(Over::Heap) => "a texture in a heap",
             Some(Over::View) => "a view of another texture",

@@ -4,8 +4,8 @@
 //! - [`platform::FakePlatform`]: every platform trait over small object models ([`objects`],
 //!   [`impls`]), recording each call whose position is observable in a [`calllog::CallLog`],
 //!   scripted by a [`script::Script`], and answering the free calls from the models;
-//! - [`surfaces`], [`vm`], [`guest_ram`]: IOSurfaces with guest-visible retain counts, Mach VM
-//!   with remap aliasing and maximum protection, guest RAM, all over real memory;
+//! - [`vm`], [`guest_ram`]: Mach VM with remap aliasing and maximum protection, and guest RAM,
+//!   over real memory;
 //! - [`clock::VirtualClock`]: virtual time for core's timed waits;
 //! - [`threads`]: a thread recorder;
 //! - [`logs`]: a capture of the `log` crate's lines.
@@ -25,7 +25,6 @@ pub mod metal_answers;
 pub mod objects;
 pub mod platform;
 pub mod script;
-pub mod surfaces;
 pub mod threads;
 pub mod vm;
 
