@@ -1055,9 +1055,10 @@ storage or of BC1 is made. The M3 makes the same but the Cube, at which its own 
 process ("carriesComplexTexture || numFaces == 1"), and the BC1, for which it answers nil. A plane
 past a planar surface's planes answers nil on all three. All three make the formats of one texel a
 block whose rows fit, a surface of 512-byte rows taking a texture 128 wide, the 4:2:2 formats of
-an even width (an odd height too, as a render target as well), every usage (usage 0 answers 0x17),
-every storage but Memoryless, and every CPU cache and hazard tracking mode and swizzle; and a
-TextureBuffer of one row. The x86 Macs make BC1 and BC7 textures wherever their rows fit, where the
+an even width (an odd height too, as a render target as well), every usage the SDK names (usage 0
+answers 0x17; Q36 has which bits each answers and ends the process at), every storage but
+Memoryless, and every CPU cache and hazard tracking mode and swizzle; and a TextureBuffer of one
+row. The x86 Macs make BC1 and BC7 textures wherever their rows fit, where the
 M3 answers nil, over a surface with planes or without, in Managed or Private storage. The M3
 answers nil for a render target of the 4:2:0 Y'CbCr format 500 of an odd width or height.
 
@@ -1882,6 +1883,36 @@ What our stack does: each answer above, on every guest. A no-copy buffer stays N
 (`RgfxBuffer`), as a view, a texture over a buffer and a heap's resource do, and so does a
 visible function table, the Intel's and the M3's answer (`RgfxVisibleFunctionTable`); the rest
 keep the state told (`RgfxResource`). The device purges nothing, whatever the state.
+
+## Q36: which usage bits a texture answers, and which end the process
+
+Probe: `oracle_surftex DEVICE`, its sixth and seventh rounds, 11-13 (m3-max-27149 and 27157 the
+M3 Max under macOS 27.0.1, 27152 and 27156 the AMD 5300M and 27151 and 27155 the Intel UHD 630
+under 26.7.1), each case in a child process of its own with `MTL_DEBUG_LAYER`,
+`METAL_DEVICE_WRAPPER_TYPE`, `MTL_SHADER_VALIDATION` and `METAL_ERROR_MODE` unset. The atomic bit
+with each format over each surface kind and over none (`nosurface.` cases, by
+`newTextureWithDescriptor:`), in Managed, Shared and Private storage, with and without
+PixelFormatView, a view of the texture over the surface, and every usage bit the SDK names none
+for, alone and three at once.
+
+All three Macs answer alike, but where the table says:
+
+| usage asked | AMD, Intel and M3 Max |
+|---|---|
+| ShaderAtomic (0x20) on R32Uint or R32Sint, with any other bits | made; the answer leaves 0x20 out (0x23 answers 0x3, 0x20 answers 0, 0x37 answers 0x17), over an IOSurface or over none, in each storage mode; a view of the texture answers the same |
+| ShaderAtomic on RG32Uint | made, 0x20 left out, on the M3; ends the process on the x86 Macs: `This device does not support ulong texture atomics, so MTLPixelFormatRG32Uint cannot be used with texture atomics` |
+| ShaderAtomic on any other format (BGRA8Unorm, R32Float, RGBA8Uint, R8Uint, R16Uint, RG32Sint, RGBA32Uint, 500) | ends the process at `-[MTLTextureDescriptorInternal validateWithDevice:]`: `MTLPixelFormatBGRA8Unorm is not a valid format to be used with texture atomics.`, before a lacked format's line (500 on the x86 Macs) |
+| 0x8 | made; the answer leaves it out (0x9 answers 0x1, 0x8 answers 0) |
+| 0x4000, 0x8000, 0x10000 | made and answered as asked |
+| 0x40, 0x80, 0x100, 0x200 to 0x2000, 0x20000 to 0x100000, 0x1000000, 0x80000000 | ends the process at the same validation: `MTLTextureUsage has unknown bits 0x40.`, the bits in one line (`0x1c0` for three), before the atomic bit's line |
+
+What our stack does *(class 3, and the M3's column for RG32Uint on an arm64 guest, class 2)*: a
+texture answers the usage it was made with but 0x20 and 0x8 (`rgfxAnsweredUsage`, RgfxTexture.mm),
+on every guest, while its create carries the usage given, so the host's texture keeps the atomic
+bit; and every creator ends the process at the unknown bits and the atomic formats above, in
+Metal's words (`rgfxEndAtInvalidTextureDescriptor`). Until 11-13 a texture answered the bits as
+given, and the bundle ended the process at 0x80 alone. The shell tests'
+`test_texture_usage_leaves_out_atomic` and the `usage.*` and `atomic.*` descriptor cases hold it.
 
 ## Not measured
 
