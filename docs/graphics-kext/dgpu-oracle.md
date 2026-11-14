@@ -2043,11 +2043,13 @@ command buffer as the M3 Max's does *(class 2: the runtime's own fault, which co
 every other GPU write completes with its write dropped *(class 2 or 3: the draw's `write()`,
 which the M3 Max faults, takes the x86 Macs' completion, the cheaper)*; a CPU write writes the
 pages where the process can, and ends the process over pages it maps read-only *(class 3)*. A
-depth attachment's `StoreAndMultisampleResolve` into such memory ends the process where the pass
-is made, or at the late store action or resolve texture: the runtime (metal2vulkan 20f7e82bbe)
-faults it where all three Macs complete it *(class 4: outside the envelope; metal2vulkan takes
-it on, to complete it with the resolve dropped)*. On macOS MoltenVK hands Metal the pages, or a
-read-only view of them, and Metal answers.
+depth attachment's `StoreAndMultisampleResolve` into such memory completes, the attachment
+stored and the resolve dropped, the texture unchanged *(class 2: the M3 Max's answer; the x86
+Macs write the texture)*: the runtime (metal2vulkan 5d33e0c74a) drops the resolve, which it
+faulted until then, when this platform ended the process there. Beside a stencil attachment
+that resolves, which no Mac was asked, the runtime still faults it, and the process ends where
+the pass is made, or at the late store action or resolve texture. On macOS MoltenVK hands Metal
+the pages, or a read-only view of them, and Metal answers.
 
 ## Q39: a command buffer failed two ways: a read-only store-out beside protection options
 

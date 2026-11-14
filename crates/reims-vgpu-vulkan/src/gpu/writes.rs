@@ -23,10 +23,11 @@
 //! into such a texture (a colour or stencil attachment's `MultisampleResolve` or
 //! `StoreAndMultisampleResolve`, a depth attachment's `MultisampleResolve`, into the descriptor's
 //! resolve texture or a late setter's). A depth attachment's `StoreAndMultisampleResolve` into such
-//! a texture, which the runtime faults where Metal's GPU completes it, dies where it is encoded
-//! ([`kept_write`]). A CPU write of a texture over such memory (`replaceRegion:`) writes the pages
-//! where the process can write them, and dies over pages it maps read-only, as Metal's ends the
-//! process there (`crate::gpu::resource`).
+//! a texture completes, its resolve dropped and the texture unchanged, as Metal's GPU completes it,
+//! but beside a stencil attachment that resolves, a pairing nothing measured, which dies where it
+//! is encoded ([`kept_write`]). A CPU write of a texture over such memory (`replaceRegion:`)
+//! writes the pages where the process can write them, and dies over pages it maps read-only, as
+//! Metal's ends the process there (`crate::gpu::resource`).
 //!
 //! On macOS it is not taken: MoltenVK hands Metal the pages, or a read-only view of them made
 //! with bit 24, and Metal's GPU answers every write there itself.
@@ -224,16 +225,17 @@ fn under_buffer_kept(b: &BufferObject) -> Kept {
 /// Dies at `sel`, a command that may write `what` an object over read-only memory whose write
 /// this platform does not answer as Metal's GPU does ([`Memory::kept`]): a depth attachment's
 /// `StoreAndMultisampleResolve` into a texture over read-only guest pages (a read-only heap, a
-/// resource made with `MTLResourceOptions` bit 24) the runtime copies, which the runtime faults
-/// where Metal's GPU completes it (`crate::gpu::encode_render`'s `faults_into`). Ending the
-/// process is this platform's divergence from Metal (`docs/accuracy-ledger.md`,
-/// `read-only-pages-written`).
+/// resource made with `MTLResourceOptions` bit 24) the runtime copies, beside a stencil
+/// attachment that resolves, which the runtime faults where nothing measured Metal's GPU, and a
+/// late resolve texture there of an attachment the pass lacks (`crate::gpu::encode_render`'s
+/// `stencil_may_resolve` and `late_resolve`). Ending the process is this platform's divergence
+/// from Metal (`docs/accuracy-ledger.md`, `read-only-pages-written`).
 pub(crate) fn kept_write(sel: &'static str, what: &str) -> ! {
     crate::answer::unrepresentable(
         sel,
         &format!(
-            "{what} read-only memory (a read-only heap or resource, whose copy the runtime \
-             faults such a resolve into), where Metal's GPU completes the command"
+            "{what} read-only memory (a read-only heap or resource the runtime copies), where \
+             nothing measured what Metal's GPU does"
         ),
     )
 }
