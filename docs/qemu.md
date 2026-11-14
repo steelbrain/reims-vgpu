@@ -636,6 +636,104 @@ What NVMe does gain is the boot: the guest answered SSH 9 to 10 s after
 QEMU started in three NVMe boots of four, on both hosts, against 17 to
 19 s in every AHCI boot; the fourth, on the Lexar, took 22 s.
 
+### Linux hosts: KVM halt polling
+
+QEMU sets no halt polling for a VM (`KVM_CAP_HALT_POLL`), and `reims-ctl`
+gives no `-overcommit cpu-pm=on`, so a halted vCPU is the host's to wake.
+KVM polls it for up to the module parameter `kvm.halt_poll_ns`, which it
+reads at each halt of a VM that set no limit of its own (200 µs on x86
+unless the host sets another), grows each vCPU's window from 10 µs up to
+that limit and shrinks it again to fit how long its halts last, and stops
+polling as soon as another task wants the CPU. A vCPU halted longer than its window sleeps, and its
+host CPU may go to its deepest idle state. The measurements below are why
+both stay so.
+
+**Where a cold wake's time goes** (measured 2026-11-14; x86-64 macOS 26.7.2
+on reims-graphics-pci, 8 vCPUs, `Skylake-Client-noTSX-IBRS`; exclusive jobs
+on reflink clones with `restrict=on`, `m3-max-29907` and `m3-max-29908`). A
+probe in the guest sleeps 2 ms, then times a syscall, a CPUID or its wake
+of a thread blocked as long, and KVM's and the scheduler's tracepoints on
+the host time the same halts. Each figure is a p50.
+- On `homelab-um870-1` (Ryzen 7 8745H, Linux 7.3.3; `acpi_idle`, whose C3
+  is entered by I/O port 0x415 with a declared exit latency of 350 µs;
+  kvm_amd's `avic` off), a vCPU halted for 2.8 ms reached VM entry 48 to
+  52 µs after the host's `sched_waking`, from C3 in 85 and 93% of the
+  wakes. A wake by IPI, half to three quarters of them, took 28 µs for the
+  target CPU to leave its idle state and 18 µs more to switch the vCPU
+  thread in; a vCPU thread queued on the waking CPU itself reached VM entry
+  in 39 to 43 µs; and VM entry came 16 to 17 µs after the switch-in. In the
+  guest the thread's wake took 25 to 29 µs, and the first CPUID 4.2 to
+  4.6 µs, against 1.9 µs after 200 µs asleep and 0.24 µs on the host itself.
+- On `homelab-ms01-1` (Core i9-13900H, Linux 7.3.1; `intel_idle`, with C2
+  at MWAIT 0x21 and C3 at 0x60; kvm_intel's APICv on, IPI virtualization
+  off), the same halts reached VM entry 20 to 23 µs after `sched_waking`,
+  30 and 48% of them from C3. In the guest the wake took 5.1 to 5.9 µs and
+  the first CPUID 1.0 to 1.25 µs, as after 200 µs asleep.
+- The guest's first syscall after 2 ms asleep costs no more than the host's
+  own: 3.0 to 4.1 µs on um870, where Linux's takes 4.2 to 4.4 µs (1.0 µs
+  back to back), and 0.6 to 0.7 µs on ms01, where Linux's takes 1.7 µs
+  (0.25 µs). macOS on a MacBook Pro's Core i7-9750H takes 3.3 µs (1.2 µs;
+  job `m3-max-29818`).
+
+**A longer poll.** The jobs below set `kvm.halt_poll_ns` live inside the
+job and put it back at its end. In one boot per host, at 200 µs, 1 ms, 4 ms
+and 200 µs again: 30 s of the idle desktop, 40 s of Safari playing H.264
+1080p60, then the probe, and the `single.sleep` and `tex1.sleep` cases of
+kcall_split, which times the guest's commit of a Metal command buffer after
+its thread slept (medians of 500). Then Geekbench 7.1.0's Metal timed pass,
+one cold boot per value, in the order 200 µs, 4 ms, 1 ms, 200 µs. Jobs
+`m3-max-30079` on um870's Radeon 780M and `m3-max-29946` on ms01's Iris
+Xe, 2026-11-14. Package W is RAPL's package energy over the window or the
+pass; poll CPUs is KVM's own halt-poll time.
+
+| host | `halt_poll_ns` | GB total s | vCPU CPUs | poll CPUs | package W |
+|---|---|---|---|---|---|
+| um870 | 200 µs | 173.1 | 0.53 | 0.026 | 16.8 |
+| um870 | 4 ms | 170.1 | 1.02 | 0.562 | 21.1 |
+| um870 | 1 ms | 172.5 | 0.66 | 0.179 | 18.4 |
+| um870 | 200 µs | 174.1 | 0.52 | 0.025 | 17.1 |
+| ms01 | 200 µs | 286.6 | 0.48 | 0.025 | 37.4 |
+| ms01 | 4 ms | 285.7 | 0.96 | 0.533 | 38.3 |
+| ms01 | 1 ms | 286.3 | 0.56 | 0.105 | 38.1 |
+| ms01 | 200 µs | 286.3 | 0.47 | 0.025 | 34.7 |
+
+| host | `halt_poll_ns` | video W | vCPU CPUs | poll CPUs | wake after 2 ms, µs | CPUID after 2 ms, µs | `single.sleep` / `tex1.sleep` commit, µs |
+|---|---|---|---|---|---|---|---|
+| um870 | 200 µs | 7.74 | 0.50 | 0.055 | 29.1 | 4.18 | 19.8 / 47.6 |
+| um870 | 1 ms | 7.53 | 0.65 | 0.267 | 28.5 | 4.04 | 24.4 / 49.6 |
+| um870 | 4 ms | 24.72 | 2.95 | 2.107 | 4.9 | 1.16 | 15.5 / 34.9 |
+| um870 | 200 µs | 7.38 | 0.50 | 0.053 | 25.0 | 4.50 | 24.0 / 52.0 |
+| ms01 | 200 µs | 23.4 | 0.38 | 0.057 | 5.72 | 1.25 | 13.4 / 37.6 |
+| ms01 | 1 ms | 24.0 | 0.52 | 0.274 | 6.15 | 1.20 | 12.0 / 27.4 |
+| ms01 | 4 ms | 41.2 | 4.27 | 2.651 | 4.46 | 1.10 | 8.0 / 18.7 |
+| ms01 | 200 µs | 25.0 | 0.44 | 0.084 | 5.86 | 1.00 | 12.8 / 29.1 |
+
+Safari presented 474 to 491 frames in each 10 s file on um870 at every
+value, and 487 to 491 on ms01, but for the boot's first file. The idle
+desktop drew 3.2 to 3.8 W on um870 at every value, but for the second
+200 µs window's 9.8 W, in which the guest kept 0.64 vCPUs busy. On ms01 it
+drew 18.5 and 19.5 W at 200 µs, 22.3 W at 1 ms and 23.7 W at 4 ms, with
+0.25 CPUs polling.
+
+No value beats KVM's default on either host. At 4 ms the guest's cold wake
+is gone, a slept commit is 4 to 19 µs shorter, and um870's Geekbench pass
+is 1.7 to 2.3% shorter (in its Background Blur, Face Tracking, Super
+Resolution and Feature Matching workloads), ms01's no shorter. For that the
+host polls half a CPU more over the pass, 4 W more on um870, and 2.1 to
+2.7 CPUs while Safari plays a video, 16 to 18 W more on both hosts. At
+1 ms the probe's 2 ms halts outlast the window, so its wake is unchanged;
+the Geekbench totals fall inside or 0.6 s beside the two 200 µs passes'
+spread; and the host polls 0.2 CPUs more during the video, and draws 1.3 to
+1.6 W more over um870's pass.
+
+`-overcommit cpu-pm=on` lets the guest's HLT, MWAIT and PAUSE run without
+exits, so each vCPU keeps a host CPU busy while the guest idles: in boots
+of jobs `m3-max-29907` and `m3-max-29908`, 7.98 CPUs on um870, its package
+at 5.97 W where the idle windows without it drew 3.2 to 4.0 W, and 8.0 CPUs
+on ms01, at 20.1 W where they drew 16.8 to 19.5 W but for one of 23.8 W.
+On um870 the cold costs stay: the guest's 2 ms wake took 22 µs and its
+CPUID after 2 ms 4.1 µs.
+
 ## x86-64 macOS guests
 
 What `reims-ctl`'s q35 command gives an x86-64 macOS guest, and why
@@ -1638,9 +1736,11 @@ frames a second, still 5.3 times its bound, and on the idle host 8 guest
 workers each piping 3000 MiB through `md5` took 9.67 s a round, against 5.34
 s with 8 vCPUs: reims-ctl's default stays at half the host's threads, at
 most 8. Nothing of ours moves the stall: the device's threads wait on
-nothing in it; KVM's halt polling and pause filter are module parameters,
-which QEMU sets neither of; QEMU's `-overcommit cpu-pm=on` keeps idle vCPUs
-on the host's CPUs; KVM's paravirtual spinlocks and TLB flushes need a guest
+nothing in it; KVM's pause filter is a module parameter, which QEMU does not
+set; KVM polls a halted vCPU only while no other task wants its CPU, as the
+build's tasks do, and QEMU leaves a VM's polling to the host ("Linux hosts:
+KVM halt polling"); QEMU's `-overcommit cpu-pm=on` keeps idle vCPUs on the
+host's CPUs; KVM's paravirtual spinlocks and TLB flushes need a guest
 kernel that uses them, and macOS's does not; and a higher CPU weight or nice
 for QEMU's scope would raise it over the user's own work.
 
