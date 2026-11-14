@@ -27,7 +27,12 @@
 //!   its block's or its context's still being made) are their block's, as are a released block's
 //!   views and its device cache's let-go; an over-view buffer's drop at its destroy is its
 //!   block's, or its id's where it has none. A view's mapping, let go of there wherever the
-//!   view's last hold goes, is under a key of its own (`surface_pages::TEARDOWN`).
+//!   view's last hold goes, is under a key of its own (`surface_pages::TEARDOWN`). The seal of a
+//!   group of pages blocks' views (`surface_pages`, "Group dma-bufs") is under its context's key
+//!   (`GraphicsControl::seal_group`): it waits for the group's window, at most
+//!   `surface_pages::GROUP_WINDOW`, never for another key's job, then carries out the messages
+//!   its members' jobs left it; a later message of a member's block joins them there, or waits
+//!   for them on its ring (`GraphicsControl::pages_buffers`), never on the worker.
 //! - The ICB worker's (`reims-vgpu.icb-create-<i>`) key is the buffer's context: a process's
 //!   `ICB_CREATE`s are made in its ring order, other processes' beside them.
 //! - The closes' worker's (`reims-vgpu.graphics-closes-<i>`) key is the closed context: a

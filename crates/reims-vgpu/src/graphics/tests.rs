@@ -11918,3 +11918,452 @@ fn a_backing_scale_is_told_in_120ths() {
         assert_eq!(scale_in_120ths(scale), told, "{scale}");
     }
 }
+
+/// What one group of views takes in the grouping tests: udmabuf's defaults.
+const GROUP_LIMITS: reims_vgpu_vulkan::core::platform::os::vm::GroupLimits =
+    reims_vgpu_vulkan::core::platform::os::vm::GroupLimits {
+        runs: 1024,
+        bytes: 64 << 20,
+    };
+
+/// A device of [`surface_device`]'s whose platform groups the pages blocks' views within `limits`
+/// (`decode::surface_pages`, "Group dma-bufs"). Its groups' windows close as the test moves the
+/// platform's clock.
+fn grouping_device(
+    pages: u64,
+    limits: reims_vgpu_vulkan::core::platform::os::vm::GroupLimits,
+) -> (
+    GraphicsDevice<FakePlatform>,
+    Arc<FakePlatform>,
+    reims_vgpu_vulkan::core::testkit::GuestRam,
+    u64,
+) {
+    let made = surface_device(pages);
+    made.1.fake_vm().set_view_groups(Some(limits));
+    made
+}
+
+/// Context `context`'s pages block at `block` of `runs`, given as (page, pages) of guest RAM:
+/// granted, and described by its `SURFACE_PAGES`, answered.
+fn pages_block(
+    device: &GraphicsDevice<FakePlatform>,
+    guest: &mut Guest,
+    context: u32,
+    block: u64,
+    page: u64,
+    runs: &[(u64, u64)],
+) {
+    guest.send(device, block_grant(context, block, SURFACE_BLOCK_SIZE));
+    let mut pages = surface_pages_of(device, context, block, page, runs);
+    pages.extend_from_slice(
+        RgfxSurfacePagesCache {
+            flags: RGFX_SURFACE_PAGES_PRIVATE,
+            reserved_04: 0,
+        }
+        .as_bytes(),
+    );
+    guest.send(device, pages);
+    let seqno = guest.seqno;
+    let answer = complete_of(&guest.event().expect("the SURFACE_PAGES' answer"));
+    assert_eq!(answer, (seqno, RGFX_STATUS_OK));
+}
+
+/// A `BUFFER_OVER_PAGES` of `length` bytes over the pages block at `block`, at no GPU address of
+/// the guest's.
+fn buffer_over_pages_of(obj_id: u64, block: u64, length: u64) -> Vec<u8> {
+    let mut message = buffer_over_pages(obj_id, length);
+    let mut m = RgfxBufferOverPages::read_from_bytes(&message).unwrap();
+    m.block_offset = block;
+    message.copy_from_slice(m.as_bytes());
+    message
+}
+
+/// The no-copy buffers the platform made since `mark`: the views' imports and the buffers over
+/// them.
+fn buffers_since(platform: &FakePlatform, mark: u64) -> usize {
+    (platform.call_log().sels_since(mark).iter())
+        .filter(|&&s| s == "newBufferWithDescriptor:")
+        .count()
+}
+
+/// The group of the view of the pages block at `block`, and its offset there, while its
+/// membership lives.
+fn group_of(
+    device: &GraphicsDevice<FakePlatform>,
+    platform: &FakePlatform,
+    block: u64,
+) -> Option<(u64, u64)> {
+    let base = (device.control.decoder().views_of_surfaces())
+        .private_view_base(block)
+        .expect("a view");
+    platform.fake_vm().view_group(base)
+}
+
+/// The blocks of the grouping tests: `n` pages blocks from `first`, each of two pages of guest RAM
+/// apart, the i-th at pages 4i and 4i + 2.
+fn grouped_blocks(
+    device: &GraphicsDevice<FakePlatform>,
+    guest: &mut Guest,
+    context: u32,
+    first: u64,
+    n: u64,
+    page: u64,
+) -> Vec<u64> {
+    let blocks: Vec<u64> = (0..n).map(|i| first + i * 0x4000).collect();
+    for (i, &block) in blocks.iter().enumerate() {
+        let at = 4 * i as u64;
+        pages_block(device, guest, context, block, page, &[(at, 1), (at + 2, 1)]);
+    }
+    device.control.decoder().surface_worker().flush();
+    blocks
+}
+
+/// The no-copy buffers a context makes over its pages blocks' views in a burst share one group
+/// dma-buf (`decode::surface_pages`, "Group dma-bufs"): each view joins its context's group and
+/// nothing is made while the group's window is open, the context's next message waiting for it;
+/// once the window closes, the views lie in one shared file, each at an offset of its own, each
+/// view's import made over its piece, then the buffers over them, then the context's next message
+#[test]
+fn a_burst_of_pages_buffers_of_one_context_shares_one_group() {
+    let (device, platform, _ram, page) = grouping_device(16, GROUP_LIMITS);
+    let mut guest = Guest::new(&device);
+    let blocks = grouped_blocks(&device, &mut guest, 1, SURFACE_BLOCK, 3, page);
+    let decoder = device.control.decoder();
+    let mark = platform.call_log().mark();
+    for (i, &block) in blocks.iter().enumerate() {
+        guest.send(
+            &device,
+            buffer_over_pages_of(obj(1, 11 + i as u64), block, 2 * page),
+        );
+    }
+    let joined = eventually(|| decoder.views_of_surfaces().forming() == (1, 3));
+    assert!(joined, "the three views joined one group");
+    guest.send(&device, event_create(obj(1, 20)));
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(
+        device.decoder_object_count(),
+        0,
+        "nothing made while the group's window is open, the context's next message waiting"
+    );
+    assert_eq!(buffers_since(&platform, mark), 0, "no import made yet");
+
+    platform.virtual_clock().advance(Duration::from_millis(1));
+    assert!(
+        objects_become(&device, 4),
+        "the three buffers, then the event"
+    );
+    decoder.surface_worker().flush();
+    assert_eq!(
+        buffers_since(&platform, mark),
+        6,
+        "each view's import, and a buffer over it"
+    );
+    let groups: Vec<(u64, u64)> = (blocks.iter())
+        .map(|&b| group_of(&device, &platform, b).expect("in a group"))
+        .collect();
+    assert!(
+        groups.iter().all(|g| g.0 == groups[0].0),
+        "one group: {groups:?}"
+    );
+    let mut offsets: Vec<u64> = groups.iter().map(|g| g.1).collect();
+    offsets.dedup();
+    assert_eq!(offsets.len(), 3, "each view at its own offset: {groups:?}");
+    assert_eq!(platform.fake_vm().groups_made(), 1);
+    let counts = decoder.views_of_surfaces().counts();
+    assert_eq!((counts.private, counts.grouped, counts.groups), (3, 3, 1));
+    assert_eq!(decoder.views_of_surfaces().forming(), (0, 0));
+}
+
+/// Two contexts' bursts of no-copy buffers over their pages blocks form a group each, never one
+/// group of both: a group's views are one process's
+#[test]
+fn separate_contexts_never_share_a_group() {
+    let (device, platform, _ram, page) = grouping_device(32, GROUP_LIMITS);
+    let mut guest = Guest::new(&device);
+    let mine = grouped_blocks(&device, &mut guest, 1, SURFACE_BLOCK, 2, page);
+    let theirs = {
+        let first = SURFACE_BLOCK + 0x10_0000;
+        let blocks: Vec<u64> = (0..2).map(|i| first + i * 0x4000).collect();
+        for (i, &block) in blocks.iter().enumerate() {
+            let at = 16 + 4 * i as u64;
+            pages_block(&device, &mut guest, 2, block, page, &[(at, 1), (at + 2, 1)]);
+        }
+        blocks
+    };
+    let decoder = device.control.decoder();
+    decoder.surface_worker().flush();
+    for (i, (&a, &b)) in mine.iter().zip(&theirs).enumerate() {
+        guest.send(
+            &device,
+            buffer_over_pages_of(obj(1, 11 + i as u64), a, 2 * page),
+        );
+        guest.send(
+            &device,
+            buffer_over_pages_of(obj(2, 11 + i as u64), b, 2 * page),
+        );
+    }
+    let joined = eventually(|| decoder.views_of_surfaces().forming() == (2, 4));
+    assert!(joined, "a group for each context");
+    platform.virtual_clock().advance(Duration::from_millis(1));
+    assert!(objects_become(&device, 4), "the four buffers");
+    decoder.surface_worker().flush();
+    let of = |blocks: &[u64]| -> Vec<u64> {
+        (blocks.iter())
+            .map(|&b| group_of(&device, &platform, b).expect("in a group").0)
+            .collect()
+    };
+    let (mine, theirs) = (of(&mine), of(&theirs));
+    assert_eq!(mine[0], mine[1], "context 1's views share a group");
+    assert_eq!(theirs[0], theirs[1], "context 2's views share a group");
+    assert_ne!(mine[0], theirs[0], "never the other's");
+    assert_eq!(platform.fake_vm().groups_made(), 2);
+}
+
+/// The device's reset inside a group's window makes nothing of it: its views and its messages go,
+/// the context and its blocks settle, and the window's end makes no import or buffer
+#[test]
+fn a_reset_inside_a_group_s_window_makes_nothing() {
+    let (device, platform, _ram, page) = grouping_device(16, GROUP_LIMITS);
+    let mut guest = Guest::new(&device);
+    let blocks = grouped_blocks(&device, &mut guest, 1, SURFACE_BLOCK, 2, page);
+    let decoder = device.control.decoder();
+    let mark = platform.call_log().mark();
+    for (i, &block) in blocks.iter().enumerate() {
+        guest.send(
+            &device,
+            buffer_over_pages_of(obj(1, 11 + i as u64), block, 2 * page),
+        );
+    }
+    let joined = eventually(|| decoder.views_of_surfaces().forming() == (1, 2));
+    assert!(joined, "both views joined");
+
+    device.reset();
+    assert!(eventually(|| decoder.views_of_surfaces().resets() == 1));
+    assert_eq!(
+        decoder.views_of_surfaces().forming(),
+        (0, 0),
+        "the group went"
+    );
+    let pages = &device.control.pages_buffers;
+    let keys = || [pages_context(1), blocks[0], blocks[1]].into_iter();
+    assert!(
+        eventually(|| !pages.any(keys())),
+        "the context and blocks settled"
+    );
+    platform.virtual_clock().advance(Duration::from_millis(1));
+    decoder.surface_worker().flush();
+    assert_eq!(
+        buffers_since(&platform, mark),
+        0,
+        "no import or buffer made"
+    );
+    assert_eq!(device.decoder_object_count(), 0);
+    assert_eq!(platform.fake_vm().groups_made(), 0);
+}
+
+/// A context's close inside its group's window drops the group: the close is answered with
+/// nothing made, and the window's end makes nothing
+#[test]
+fn a_close_inside_a_group_s_window_drops_the_group() {
+    let (device, platform, _ram, page) = grouping_device(16, GROUP_LIMITS);
+    let mut guest = Guest::new(&device);
+    let blocks = grouped_blocks(&device, &mut guest, 1, SURFACE_BLOCK, 2, page);
+    let decoder = device.control.decoder();
+    let mark = platform.call_log().mark();
+    for (i, &block) in blocks.iter().enumerate() {
+        guest.send(
+            &device,
+            buffer_over_pages_of(obj(1, 11 + i as u64), block, 2 * page),
+        );
+    }
+    let joined = eventually(|| decoder.views_of_surfaces().forming() == (1, 2));
+    assert!(joined, "both views joined");
+
+    assert_eq!(
+        answered(&device, &mut guest, context_close(1)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        decoder.views_of_surfaces().forming(),
+        (0, 0),
+        "the group went"
+    );
+    platform.virtual_clock().advance(Duration::from_millis(1));
+    decoder.surface_worker().flush();
+    assert_eq!(
+        buffers_since(&platform, mark),
+        0,
+        "no import or buffer made"
+    );
+    assert_eq!(platform.fake_vm().groups_made(), 0);
+}
+
+/// Where the platform makes no shared file of a group's views, each view's import is made alone,
+/// as without groups; where the runtime refuses a grouped view's piece, that view leaves its group
+/// and its import is made alone, the others' pieces of the group's file
+#[test]
+fn a_refused_group_falls_back_to_an_import_of_each_view() {
+    use reims_vgpu_vulkan::core::testkit::Step;
+
+    let (device, platform, _ram, page) = grouping_device(32, GROUP_LIMITS);
+    let mut guest = Guest::new(&device);
+    let decoder = device.control.decoder();
+
+    // No shared file.
+    platform.fake_vm().refuse_view_groups(true);
+    let blocks = grouped_blocks(&device, &mut guest, 1, SURFACE_BLOCK, 2, page);
+    let mark = platform.call_log().mark();
+    for (i, &block) in blocks.iter().enumerate() {
+        guest.send(
+            &device,
+            buffer_over_pages_of(obj(1, 11 + i as u64), block, 2 * page),
+        );
+    }
+    assert!(eventually(
+        || decoder.views_of_surfaces().forming() == (1, 2)
+    ));
+    platform.virtual_clock().advance(Duration::from_millis(1));
+    assert!(objects_become(&device, 2), "both buffers");
+    decoder.surface_worker().flush();
+    assert_eq!(
+        buffers_since(&platform, mark),
+        4,
+        "each view's import, alone, and its buffer"
+    );
+    for &block in &blocks {
+        assert_eq!(group_of(&device, &platform, block), None, "alone");
+    }
+    let counts = decoder.views_of_surfaces().counts();
+    assert_eq!((counts.private, counts.grouped, counts.groups), (2, 0, 0));
+
+    // The runtime refuses the first view's piece.
+    platform.fake_vm().refuse_view_groups(false);
+    let blocks = grouped_blocks(&device, &mut guest, 1, SURFACE_BLOCK + 0x8000, 2, page);
+    let mark = platform.call_log().mark();
+    for (i, &block) in blocks.iter().enumerate() {
+        guest.send(
+            &device,
+            buffer_over_pages_of(obj(1, 21 + i as u64), block, 2 * page),
+        );
+    }
+    assert!(eventually(
+        || decoder.views_of_surfaces().forming() == (1, 2)
+    ));
+    platform
+        .script()
+        .push("newBufferWithDescriptor:", Step::Nil);
+    platform.virtual_clock().advance(Duration::from_millis(1));
+    assert!(objects_become(&device, 4), "both buffers");
+    decoder.surface_worker().flush();
+    assert_eq!(
+        buffers_since(&platform, mark),
+        5,
+        "the refused piece's import, then each view's import and its buffer"
+    );
+    // The surface worker runs the two messages side by side: either view may have joined first,
+    // and taken the refusal.
+    let grouped: Vec<bool> = (blocks.iter())
+        .map(|&block| group_of(&device, &platform, block).is_some())
+        .collect();
+    assert!(
+        grouped == [false, true] || grouped == [true, false],
+        "one view left its group, the other is a piece: {grouped:?}"
+    );
+    let counts = decoder.views_of_surfaces().counts();
+    assert_eq!((counts.private, counts.grouped, counts.groups), (4, 1, 1));
+}
+
+/// A view past 16 MiB takes no group: its import is made at once, as without groups, with no
+/// window waited for
+#[test]
+fn a_view_past_16_mib_takes_no_group() {
+    let page = FakePlatform::new().vm().page_size();
+    let pages = (16 << 20) / page + 1;
+    let (device, platform, _ram, page) = grouping_device(pages, GROUP_LIMITS);
+    let mut guest = Guest::new(&device);
+    pages_block(&device, &mut guest, 1, SURFACE_BLOCK, page, &[(0, pages)]);
+    let decoder = device.control.decoder();
+    decoder.surface_worker().flush();
+    let mark = platform.call_log().mark();
+    guest.send(&device, buffer_over_pages(obj(1, 11), 2 * page));
+    assert!(objects_become(&device, 1), "made with no window waited for");
+    decoder.surface_worker().flush();
+    assert_eq!(buffers_since(&platform, mark), 2);
+    assert_eq!(decoder.views_of_surfaces().forming(), (0, 0));
+    assert_eq!(group_of(&device, &platform, SURFACE_BLOCK), None);
+}
+
+/// A read-only buffer (`MTLResourceOptions` bit 24), which the platform makes over a copy of its
+/// pages, takes no group: its view's import is made at once, as without groups, with no window
+/// waited for
+#[test]
+fn a_read_only_buffer_takes_no_group() {
+    let (device, platform, _ram, page) = grouping_device(16, GROUP_LIMITS);
+    let mut guest = Guest::new(&device);
+    let blocks = grouped_blocks(&device, &mut guest, 1, SURFACE_BLOCK, 1, page);
+    let decoder = device.control.decoder();
+    let mark = platform.call_log().mark();
+    let mut message = buffer_over_pages_of(obj(1, 11), blocks[0], 2 * page);
+    let mut m = RgfxBufferOverPages::read_from_bytes(&message).unwrap();
+    m.options |= 1 << 24;
+    message.copy_from_slice(m.as_bytes());
+    guest.send(&device, message);
+    assert!(objects_become(&device, 1), "made with no window waited for");
+    decoder.surface_worker().flush();
+    assert_eq!(buffers_since(&platform, mark), 2);
+    assert_eq!(decoder.views_of_surfaces().forming(), (0, 0));
+    assert_eq!(group_of(&device, &platform, blocks[0]), None);
+}
+
+/// A group closes once its views reach the platform's limits for one shared file, its runs or its
+/// bytes, and is sealed then, with no window waited for; the next view opens a group of its own
+#[test]
+fn a_group_closes_at_its_limits() {
+    use reims_vgpu_vulkan::core::platform::os::vm::GroupLimits;
+
+    for what in ["runs", "bytes"] {
+        let (device, platform, _ram, page) = surface_device(16);
+        // Two views of two runs of a page each reach either.
+        let limits = match what {
+            "runs" => GroupLimits {
+                runs: 4,
+                bytes: 64 << 20,
+            },
+            _ => GroupLimits {
+                runs: 1024,
+                bytes: 4 * page,
+            },
+        };
+        platform.fake_vm().set_view_groups(Some(limits));
+        let mut guest = Guest::new(&device);
+        let blocks = grouped_blocks(&device, &mut guest, 1, SURFACE_BLOCK, 3, page);
+        let decoder = device.control.decoder();
+        for (i, &block) in blocks.iter().take(2).enumerate() {
+            guest.send(
+                &device,
+                buffer_over_pages_of(obj(1, 11 + i as u64), block, 2 * page),
+            );
+        }
+        assert!(
+            objects_become(&device, 2),
+            "{what}: sealed at the limit, with no window waited for"
+        );
+        guest.send(
+            &device,
+            buffer_over_pages_of(obj(1, 13), blocks[2], 2 * page),
+        );
+        let opened = eventually(|| decoder.views_of_surfaces().forming() == (1, 1));
+        assert!(opened, "{what}: the next view opens a group");
+        platform.virtual_clock().advance(Duration::from_millis(1));
+        assert!(objects_become(&device, 3), "{what}");
+        decoder.surface_worker().flush();
+        let first = group_of(&device, &platform, blocks[0]).expect("in a group");
+        let second = group_of(&device, &platform, blocks[1]).expect("in a group");
+        assert_eq!(first.0, second.0, "{what}: the two at the limit share one");
+        assert_eq!(
+            group_of(&device, &platform, blocks[2]),
+            None,
+            "{what}: a group of one leaves its view alone"
+        );
+    }
+}

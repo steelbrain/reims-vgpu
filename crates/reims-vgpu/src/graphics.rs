@@ -107,9 +107,9 @@ use crate::graphics::color::{ColorChange, ColorStaging, DisplayColor};
 use crate::graphics::compile::{CompileKind, CompileOf, CompilePool, Pending};
 use crate::graphics::completion::cb_failed;
 use crate::graphics::decode::shares::ListenSink;
-use crate::graphics::decode::worker::{Unsettled, Worker};
+use crate::graphics::decode::worker::{Job, Settle, Unsettled, Worker};
 use crate::graphics::decode::{
-    Begun, CompletionSink, DecodeError, Decoders, DrainAnswer, GraphicsDecoder, LibraryJob,
+    Begun, CompletionSink, DecodeError, Decoders, DrainAnswer, GraphicsDecoder, Joined, LibraryJob,
     LibraryStart, MadeLibrary, PipelineJob, PipelineReply, ReflectionSink, ScheduledSink,
     SignalSink, Sinks, SubmittedSink, SurfacePresent, compile_refusing, complete, make_library,
     refused_reply, refusing,
@@ -1241,7 +1241,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// committed has finished: the kext then gives the context's blocks, texture resource ids and
     /// GPU addresses out again.
     fn close_context(&self, context: u32, answer: CompleteAnswer) {
-        // After its no-copy buffers being made, so none lands in the table its close empties.
+        // Its groups of views being formed make nothing (`decode::surface_pages`, "Group
+        // dma-bufs"); then after its no-copy buffers being made, so none lands in the table its
+        // close empties.
+        self.decoder().drop_groups(context);
         self.pages_buffers.wait(pages_context(context));
         entry::run(|_| {
             let decoder = self.decoder();
@@ -2280,25 +2283,87 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         decoder.on_surface_worker(
             block,
             Box::new(move || {
-                let outcome = {
+                let context = sender_context(&poster, &message);
+                // Where the platform groups views, the block's view is mapped here and joins its
+                // context's group, and the rest waits for the group's seal
+                // (`decode::surface_pages`, "Group dma-bufs").
+                let joined = {
                     let _carried = me.reset_gate.read_recursive();
                     if poster.stale() {
                         return;
                     }
-                    let mut decoder = (me.decoders)
-                        .sender(Some(sender_context(&poster, &message)), me.sinks(&poster));
-                    decoder.decode_refusing(&me.device, &message)
+                    let carry = (poster.clone(), message.clone(), name, block, settles);
+                    let then = Arc::clone(&me).over_pages_job(carry);
+                    let decoder = (me.decoders).sender(Some(context), Sinks::default());
+                    decoder.join_group(&message, then)
                 };
-                me.report(&poster, &message, outcome, false);
-                log::debug!(
-                    target: "reims_vgpu::graphics::surface_pages",
-                    "{name} of the block at {block:#x} made on the worker {} us after its begin",
-                    me.pool.now().saturating_duration_since(begun).as_micros()
-                );
-                drop(settles);
+                match joined {
+                    Joined::Now(then) => then(),
+                    Joined::Waits => {}
+                    Joined::Opened(number) => {
+                        let sealer = Arc::clone(&me);
+                        let seal = Box::new(move || sealer.seal_group(number));
+                        me.decoder().on_surface_worker(group_key(context), seal);
+                    }
+                }
             }),
         );
         true
+    }
+
+    /// The carrying out of a `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` handed to the surface
+    /// worker ([`Self::start_over_pages`]): `carry` is its poster, the message, its name, its
+    /// block and its settles, which drop once it is made. Made under the reset gate, held shared
+    /// recursively; where the device was reset since, nothing is made.
+    fn over_pages_job(
+        self: Arc<Self>,
+        carry: (
+            CompletionPoster,
+            Vec<u8>,
+            &'static str,
+            u64,
+            (Settle, Settle),
+        ),
+    ) -> Job {
+        let (poster, message, name, block, settles) = carry;
+        Box::new(move || {
+            let outcome = {
+                let _carried = self.reset_gate.read_recursive();
+                if poster.stale() {
+                    return;
+                }
+                let mut decoder = (self.decoders)
+                    .sender(Some(sender_context(&poster, &message)), self.sinks(&poster));
+                decoder.decode_refusing(&self.device, &message)
+            };
+            self.report(&poster, &message, outcome, false);
+            log::debug!(
+                target: "reims_vgpu::graphics::surface_pages",
+                "{name} of the block at {block:#x} made on the worker {} us after its begin",
+                self.pool.now().saturating_duration_since(settles.0.begun).as_micros()
+            );
+            drop(settles);
+        })
+    }
+
+    /// The seal of the group of pages blocks' views numbered `number` (`decode::surface_pages`,
+    /// "Group dma-bufs"), on the surface worker, under its context's key ([`group_key`]): waits
+    /// for its window to close, makes the members' imports under the reset gate, held shared
+    /// recursively, as the worker's other jobs are, then carries out the messages that waited
+    /// for them, in their order, each as [`Self::over_pages_job`] does. Where the group went (its
+    /// context's close, the device's reset), nothing.
+    fn seal_group(&self, number: u64) {
+        let decoder = self.decoder();
+        let Some(sealing) = decoder.group_closed(number) else {
+            return;
+        };
+        let then = {
+            let _carried = self.reset_gate.read_recursive();
+            decoder.seal_group(&self.device, sealing)
+        };
+        for job in then {
+            job();
+        }
     }
 
     /// An `ICB_CREATE` from ring 0: unsettled here, in ring order, and made on the ICB worker,
@@ -3348,6 +3413,13 @@ fn sender_context(poster: &CompletionPoster, message: &[u8]) -> u32 {
 /// `GraphicsControl::pages_buffers`, apart from their blocks' offsets, which lie below 2^63.
 fn pages_context(context: u32) -> u64 {
     1 << 63 | u64::from(context)
+}
+
+/// The surface worker's key the seals of context `context`'s groups of views run under
+/// (`GraphicsControl::seal_group`), apart from its blocks' offsets, which lie below 2^63, and the
+/// views' teardowns' key (`u64::MAX`).
+fn group_key(context: u32) -> u64 {
+    0xffff_fffe_0000_0000 | u64::from(context)
 }
 
 /// The name of the `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` `message`, and its pages block's

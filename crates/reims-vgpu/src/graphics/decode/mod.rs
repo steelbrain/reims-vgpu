@@ -231,6 +231,7 @@ use sequencer::Sequencer;
 pub(crate) use sequencer::Ticket;
 use surface_cache::Caches;
 pub(crate) use surface_cache::{FillHook, FillWait};
+pub(crate) use surface_pages::Joined;
 use tables::{Context, Entry, GuestBytes, LaidUse, QueueCounts, View};
 
 /// A sink the decoder calls with each command buffer's completion record once its
@@ -1341,10 +1342,11 @@ impl<P: Platform> GraphicsDecoder<P> {
                  the cache; {} named by their runs; refused: {} for bad runs, {} not mapped; \
                  asked whether they need a device cache: {} in place, {} in place while the \
                  device's verdict was pending, {} answered a cache, {} of them for want of room \
-                 for their views",
+                 for their views; {} pages blocks' views imported as pieces of group dma-bufs, \
+                 in {} groups",
                 c.made, c.reused, c.idle_returned, c.private, c.private_reused, c.by_runs,
                 c.bad_runs, c.not_mapped, c.asked_in_place, c.asked_pending, c.asked_cache,
-                c.asked_room
+                c.asked_room, c.grouped, c.groups
             );
             if d.made != 0 {
                 log::info!(

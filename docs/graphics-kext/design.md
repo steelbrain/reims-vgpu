@@ -2161,7 +2161,11 @@ for each other: a `BUFFER_OVER_PAGES` waits only for its own block's
 build checks. What the guest can tell apart from one thread: two
 `BUFFER_OVER_PAGES` of one process on different blocks are made in either
 order, which no answer orders, and the process's later messages wait for
-both. Tested by `a_key_whose_job_hangs_holds_no_other_keys_jobs`,
+both. Where the host groups the pages blocks' views (below, "Group dma-bufs of
+the pages blocks' views"), a group's seal is a job under its process's key,
+which waits at most for the group's 1 ms window, never for another key's job,
+and then carries out its members' messages. Tested by
+`a_key_whose_job_hangs_holds_no_other_keys_jobs`,
 `a_key_waits_for_a_free_thread_once_every_thread_is_busy`,
 `each_keys_jobs_run_one_at_a_time_in_handed_order`,
 `an_idle_thread_ends_after_keep` and
@@ -3216,6 +3220,46 @@ to the other, byte by byte, so CPU and GPU writes beside each other both stand
 its command buffer's completion, not as it runs, and memory mapped read-only is
 never written back, though the GPU's writes stay in the range for later command
 buffers to read, where Metal's are dropped.
+
+**Group dma-bufs of the pages blocks' views.** The host imports each pages
+block's view once, as a buffer over the whole view that the block's
+`BUFFER_OVER_PAGES` buffers lie in. Where the Vulkan platform imports a view as
+a dma-buf of its own and the driver lists every import in every submission
+(RADV), each live view costs every `vkQueueSubmit` about 0.45 us: Geekbench
+Metal's ML workloads hold 600 to 1,000 such views at once, and Super
+Resolution's submissions took about 450 us (Radeon 780M, measured). There the
+surface worker gathers a process's views for a window: the `BUFFER_OVER_PAGES`
+or `HEAP_OVER_PAGES` that makes a block's view maps it and joins its process's
+open group, which stays open 1 ms from its first member, or until its members
+reach one dma-buf's limits: udmabuf's `list_limit` runs and `size_limit_mb`
+bytes, as the host has them (the host sets neither), and at most 64 MiB,
+whatever udmabuf takes (below). The group is then sealed: the views' pages go
+into shared dma-bufs back to back, and each view's import is a piece of its
+group's file, so the driver lists one import for the group. Only then are the
+members' messages carried out, and the process's and the blocks' later
+messages wait for that, so each sees its buffer as right after its create.
+
+Some views take no group: a view over 16 MiB, one past a group's limits alone,
+a view the host's cache of views holds, a heap over the guest's RAM, a block of
+pages its process maps read-only and a read-only buffer (both made over a copy
+of the pages), and a texture's import. A view whose group the host refuses is
+imported alone, as before. A process's close and the device's reset drop its
+groups being formed, which make nothing. What the guest sees does not change
+beyond timing: object ids, GPU addresses, refusals, and the order of events and
+interrupts are as before.
+
+A member whose buffers went keeps its pages pinned (udmabuf holds them) and
+mapped in the GPU's address space inside its group's import until the group's
+last member goes, though no object covers them: in each group, at most the
+group's bytes, 64 MiB. That cap is the host's own: udmabuf's default
+`size_limit_mb` is 64, but CachyOS's 7.3 kernels boot with it at 2147483647,
+where `list_limit` alone would let a group of large views pin gigabytes. With
+the cap, a simulation over the creates and frees of Geekbench's Super
+Resolution on the Radeon 780M holds 26 to 182 MiB of such pages at once, in all
+groups, by the runs' sizes (4 KiB to 64 KiB), on every host alike. They are the
+guest's RAM, resident anyway, and only a stale GPU address would reach them, as
+it would reach any freed memory; the guest reuses them once the kext unwires
+them.
 
 **Managed storage** (Decided 4). A Managed buffer's or texture's CPU copy is
 memory of its process's, which the guest maps: a buffer's a Shared buffer of

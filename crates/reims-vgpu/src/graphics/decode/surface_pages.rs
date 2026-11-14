@@ -109,6 +109,43 @@
 //! it lives (its `BLOCK_RELEASE` is refused), and a context's close lets go of its objects before
 //! its pages blocks' views: the view outlives the heap with no hold of its own.
 //!
+//! **Group dma-bufs.** On a device that imports each view as a dma-buf of its own and lists every
+//! import in every submission (RADV, `os::linux::dma_buf` of the Vulkan crate), each live pages
+//! block's import costs every `vkQueueSubmit` about 0.45 us. **Measured** 2026-11-14 on
+//! homelab-um870-1's Radeon 780M, an x86-64 macOS 26.7.2 guest running Geekbench 7.1 Metal (two
+//! walks): Super Resolution held about 1,000 such imports at its midpoint and `vkQueueSubmit` took
+//! about 450 us, and Feature Matching, Horizon Detection and Fluid Simulation 700 to 1,200 us.
+//! Where the platform answers limits for a shared file of views ([`HostVm::view_groups`]), a
+//! `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` the surface worker carries out that makes its block's
+//! view maps the view and joins its context's open group ([`SurfaceViews::join_group`]), and its
+//! carrying out waits for the group's seal. A group stays open [`GROUP_WINDOW`] from its first
+//! member's join, or until its members' runs or bytes reach the platform's limits; then a job of
+//! its own on the surface worker seals it ([`SurfaceViews::seal`]): the views go into shared files
+//! ([`HostVm::group_views`]), each view's import is made, a piece of its file, so the device
+//! imports one file for the group, and the members' messages are carried out in their order. Their
+//! context's and their blocks' settles drop only then (`GraphicsControl::start_over_pages`), so the
+//! guest's later messages see each buffer as right after its create; the window delays only the
+//! context's first message after a burst, which waits for the creates anyway. Creates come in
+//! bursts (**measured** on the second walk's trace, Super Resolution: 126 us apart at the median),
+//! and a replay of that trace kept 81 to 86% of the cut in live imports with a 1 ms window, against
+//! about 43% for a seal of what is queued alone. A view past [`GROUP_MEMBER_MAX`] or past a group's
+//! limits alone, a view the cache holds, a heap over the guest's RAM, and a block of pages its
+//! process maps read-only or a read-only buffer (made over a copy of the pages) take no group; a
+//! view the platform leaves alone, or whose piece the runtime refuses, leaves its group and is made
+//! alone, as before. A context's close and the device's reset drop its groups being formed, whose
+//! messages make nothing. Only the views' imports are pieces: a texture's import over a view stays
+//! its own.
+//!
+//! A member whose buffers went keeps its group's file alive while another member's import lives:
+//! its pages stay pinned by udmabuf and mapped in the device's GPU address space inside the group's
+//! import until the group's last member goes, though no object covers them: at most a group's
+//! bytes, which the Vulkan platform holds to 64 MiB whatever udmabuf takes (its `dma_buf`'s
+//! `GROUP_BYTES`; CachyOS's 7.3 kernels boot with udmabuf's `size_limit_mb` at 2147483647). They
+//! are the guest's RAM, resident anyway; the guest reuses them once the kext unwires them.
+//!
+//! [`HostVm::view_groups`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::view_groups
+//! [`HostVm::group_views`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::group_views
+//!
 //! **By runs.** A cached block (`RGFX_SURFACE_PAGES_CACHED`) on a device that copies the guest's
 //! RAM by its runs ([`GpuDevice::copies_guest_ram`]) takes no view: its `SURFACE_PAGES` checks
 //! its runs and finds their pages' host addresses in the guest's RAM, in the surface's order, and
@@ -209,8 +246,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use reims_vgpu_graphics::wire::{
-    RGFX_SURFACE_PAGES_PLANES, RgfxBufferOverPages, RgfxBufferOverSurfacePages, RgfxHeapOverPages,
-    RgfxPageRun, RgfxSurfacePages, RgfxSurfacePagesLayout,
+    RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_HEAP_OVER_PAGES, RGFX_SURFACE_PAGES_PLANES,
+    RgfxBufferOverPages, RgfxBufferOverSurfacePages, RgfxHeapOverPages, RgfxMsgHeader, RgfxPageRun,
+    RgfxSurfacePages, RgfxSurfacePagesLayout,
 };
 use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryIdentity, MemoryLife};
 #[cfg(target_os = "linux")]
@@ -222,13 +260,14 @@ use reims_vgpu_vulkan::core::memory::map::MemoryMap;
 use reims_vgpu_vulkan::core::memory::mapping::Mapping;
 use reims_vgpu_vulkan::core::num::{ToU64 as _, ToUsize as _};
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
-use reims_vgpu_vulkan::core::platform::os::clock::Clock as _;
+use reims_vgpu_vulkan::core::platform::os::clock::{Clock as _, Deadline, MonoTime};
+use reims_vgpu_vulkan::core::platform::os::vm::{GroupHold, GroupLimits, HostAddr};
 use reims_vgpu_vulkan::core::platform::values::{BufferDesc, HeapDesc, OptionSet, PagesPlane};
 use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_vulkan::core::raise::{RaiseResult, refusals};
-use reims_vgpu_vulkan::core::sync::Mutex;
+use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
 
-use super::worker::{Settle, Worker};
+use super::worker::{Job, Settle, Worker};
 
 /// The guest's least page: every run is whole pages of it, and of the host's ([`SurfaceViews`]'
 /// checks).
@@ -276,6 +315,10 @@ pub(crate) struct SurfaceView<P: Platform> {
     held: Arc<MappingHold<P>>,
     /// The view's life, which ends as it goes ([`Self::memory`]).
     life: MemoryLife,
+    /// Its membership of a group dma-buf (the module doc, "Group dma-bufs"), which keeps the
+    /// import of its pages a piece of the group's file while it lives: dropped with the view,
+    /// before its mapping goes.
+    group: Mutex<Option<GroupHold>>,
 }
 
 /// A view's mapping: the runs mapped in order, and the platform's hold on the guest's RAM, kept
@@ -367,7 +410,19 @@ impl<P: Platform> SurfaceView<P> {
                 here: AtomicBool::new(false),
             }),
             life: MemoryLife::new(),
+            group: Mutex::new(None),
         }
+    }
+
+    /// The view joins a group dma-buf with `membership`, before its import is made.
+    fn join(&self, membership: GroupHold) {
+        *self.group.lock() = Some(membership);
+    }
+
+    /// The view leaves its group dma-buf, so its import is made of its own pages again.
+    fn leave(&self) {
+        let membership = self.group.lock().take();
+        drop(membership);
     }
 
     /// The view as the host's video devices take memory: its identity, which ends as the view
@@ -455,6 +510,10 @@ pub(crate) struct ViewCounts {
     /// Of `asked_cache`, those answered so with no view made, the platform having no room for
     /// its mappings ([`PagesRefusal::NoRoom`]).
     pub(crate) asked_room: u64,
+    /// Groups of pages blocks' views sealed (the module doc, "Group dma-bufs").
+    pub(crate) groups: u64,
+    /// Of `private`, the views whose import is a piece of a group dma-buf.
+    pub(crate) grouped: u64,
 }
 
 /// How a block that asked whether it needs a device cache was answered, for the counts
@@ -545,6 +604,83 @@ impl std::fmt::Display for Layout {
     }
 }
 
+/// How long a context's group of views stays open for more members after its first joins (the
+/// module doc, "Group dma-bufs").
+pub(crate) const GROUP_WINDOW: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// The largest view a group takes: a larger one keeps a dma-buf of its own, so a large view whose
+/// buffers went never holds a group's pages.
+pub(crate) const GROUP_MEMBER_MAX: u64 = 16 << 20;
+
+/// A context's group of views being formed (the module doc, "Group dma-bufs").
+struct Forming<P: Platform> {
+    /// Its number, which the job that seals it holds.
+    number: u64,
+    /// The context whose views it takes.
+    context: u32,
+    /// When its window closes.
+    closes: MonoTime,
+    /// The device's resets as it opened: a reset since makes nothing of it.
+    resets: u64,
+    /// What one group takes at most, as the platform answered at its opening.
+    limits: GroupLimits,
+    /// Its members, in the order they joined.
+    members: Vec<Member<P>>,
+    /// What its members take of the limits: runs, and bytes.
+    runs: u64,
+    bytes: u64,
+    /// It reached the limits: it takes no more, and is sealed at once.
+    full: bool,
+    /// Its window closed and its seal makes its imports: it takes no more members, and a later
+    /// message of a member's block waits behind its members' ([`SurfaceViews::seal`]).
+    sealing: bool,
+}
+
+/// A pages block's view in a group being formed: the block, its runs, its view, mapped, and the
+/// messages that wait for its import, in their order.
+struct Member<P: Platform> {
+    block: u64,
+    runs: Vec<(u64, u64)>,
+    view: Arc<SurfaceView<P>>,
+    then: Vec<Job>,
+}
+
+/// A group whose window closed, to seal ([`SurfaceViews::seal`]): its number, the device's resets
+/// as it opened, its context, and each member's block, runs and view.
+pub(crate) struct Sealing<P: Platform> {
+    number: u64,
+    resets: u64,
+    context: u32,
+    members: Vec<(u64, Vec<(u64, u64)>, Arc<SurfaceView<P>>)>,
+}
+
+/// Groups being formed that went with their context's close ([`SurfaceViews::groups_closed`]),
+/// to let go of with no lock held.
+pub(crate) struct GroupsGone<P: Platform> {
+    _gone: Vec<Forming<P>>,
+}
+
+/// A `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` of context `context` over the pages block at `block`
+/// naming `block_size` bytes of it, a heap's where `heap` ([`SurfaceViews::join_group`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OverPages {
+    pub(crate) block: u64,
+    pub(crate) block_size: u64,
+    pub(crate) context: u32,
+    pub(crate) heap: bool,
+}
+
+/// What a message did as its view joined a group ([`SurfaceViews::join_group`]).
+pub(crate) enum Joined {
+    /// Its view is grouped with no other: it is carried out now, as handed back.
+    Now(Job),
+    /// It waits for its group's seal, which a job waits for.
+    Waits,
+    /// It opened its context's group of this number, whose seal the caller hands over
+    /// ([`SurfaceViews::group_closed`], [`SurfaceViews::seal`]).
+    Opened(u64),
+}
+
 /// A view the cache keeps, with the buffer that holds the runtime's import of its pages.
 struct Cached<P: Platform> {
     /// The runs the view maps, in order.
@@ -597,6 +733,10 @@ pub(crate) struct Private<P: Platform> {
     /// The view, made at the block's first `BUFFER_OVER_PAGES`, with a buffer over the whole of
     /// it that holds the runtime's import of its pages for the buffers over its parts.
     view: Option<(Arc<SurfaceView<P>>, P::Buffer)>,
+    /// The view mapped as it joined a group, whose import its group's seal did not make (a view
+    /// the platform left alone, or whose piece was refused): made, alone, by the block's first
+    /// message carried out ([`SurfaceViews::private_view`]).
+    mapped: Option<Arc<SurfaceView<P>>>,
     /// Where the guest's RAM mapping holds the block's pages, where they are one run: what a
     /// `HEAP_OVER_PAGES` lies over, which then makes no view (a block of more runs holds its heap
     /// over the view).
@@ -680,6 +820,14 @@ pub(crate) struct SurfaceViews<P: Platform> {
     /// The device's resets so far: a `SURFACE_PAGES` begun before the last makes no view
     /// ([`Settle`]).
     resets: u64,
+    /// The groups of views being formed, at most one of each context's open for more members
+    /// (the module doc, "Group dma-bufs").
+    forming: Vec<Forming<P>>,
+    /// The number the next group takes.
+    next_group: u64,
+    /// Signalled as a group fills or goes, for the job that waits for its window
+    /// ([`Self::group_closed`]).
+    group_changed: Arc<Condvar>,
 }
 
 /// What a `SURFACE_PAGES` found under the views' lock ([`SurfaceViews::surface_pages`]).
@@ -721,6 +869,9 @@ impl<P: Platform> SurfaceViews<P> {
             cache: VecDeque::new(),
             counts: ViewCounts::default(),
             resets: 0,
+            forming: Vec::new(),
+            next_group: 0,
+            group_changed: Arc::new(Condvar::new()),
         }
     }
 
@@ -953,6 +1104,7 @@ impl<P: Platform> SurfaceViews<P> {
                         block_size: pages.block_size,
                         context: pages.context,
                         view: None,
+                        mapped: None,
                         ram,
                         read_only,
                     },
@@ -1301,12 +1453,13 @@ impl<P: Platform> SurfaceViews<P> {
 
     /// The view of the pages block at `block`, where it was made for `context` (any context
     /// where `None`, the decoder's own tests) and holds the `block_size` bytes a message names:
-    /// the first time, the cache's view of its runs, taken to the back, with its import, else
-    /// made with its import on `device` (the module doc), with `views` unlocked, so a message
-    /// that asks of the views meanwhile does not wait for the mapping or the import, after room
-    /// is made in `platform`'s mappings for it. `None` where the block is no such pages block, or
-    /// the view or its import is not made, which is counted, or the block went while it was
-    /// made.
+    /// the first time, the view its group mapped where the group made no import of it (the
+    /// module doc, "Group dma-bufs"), else the cache's view of its runs, taken to the back, with
+    /// its import, else made, the view with its import on `device` (the module doc), with
+    /// `views` unlocked, so a message that asks of the views meanwhile does not wait for the
+    /// mapping or the import, after room is made in `platform`'s mappings for it. `None` where
+    /// the block is no such pages block, or the view or its import is not made, which is
+    /// counted, or the block went while it was made.
     pub(crate) fn private_view(
         views: &Mutex<SurfaceViews<P>>,
         platform: &P,
@@ -1315,9 +1468,9 @@ impl<P: Platform> SurfaceViews<P> {
         block_size: u64,
         context: Option<u32>,
     ) -> RaiseResult<Option<Arc<SurfaceView<P>>>> {
-        let (memory, lease, teardown, runs, length) = {
+        let (mapped, runs, length) = {
             let mut v = views.lock();
-            let Some(p) = (v.private.get(&block))
+            let Some(p) = (v.private.get_mut(&block))
                 .filter(|p| block_size <= p.block_size && context.is_none_or(|c| c == p.context))
             else {
                 return Ok(None);
@@ -1325,35 +1478,28 @@ impl<P: Platform> SurfaceViews<P> {
             if let Some((view, _)) = &p.view {
                 return Ok(Some(Arc::clone(view)));
             }
-            let (runs, length) = (p.runs.clone(), p.length);
-            let hit = v.cache.iter().position(|c| c.runs == runs);
-            if let Some(cached) = hit.and_then(|at| v.cache.remove(at)) {
-                let view = Arc::clone(&cached.view);
-                let import = cached.import.clone_ref();
-                v.cache.push_back(cached);
-                if let Some(p) = v.private.get_mut(&block) {
-                    p.view = Some((Arc::clone(&view), import));
+            let (runs, length, mapped) = (p.runs.clone(), p.length, p.mapped.take());
+            if mapped.is_none() {
+                if let Some(view) = v.take_cached(block, &runs) {
+                    return Ok(Some(view));
                 }
-                v.counts.private_reused += 1;
-                return Ok(Some(view));
+                if v.memory.is_none() {
+                    v.refused(PagesRefusal::NoMemoryMap);
+                    return Ok(None);
+                }
             }
-            let Some((memory, lease)) = v.memory.as_ref() else {
-                v.refused(PagesRefusal::NoMemoryMap);
-                return Ok(None);
-            };
-            let teardown = v.teardown.clone();
-            (
-                Arc::clone(memory),
-                Arc::clone(lease),
-                teardown,
-                runs,
-                length,
-            )
+            (mapped, runs, length)
         };
-        Self::make_room_for(views, platform, runs.len());
         let clock = platform.clock();
-        let start = clock.now_mono();
-        let made = match map_view(&memory, lease, teardown, &runs, length) {
+        let (view, start) = match mapped {
+            Some(view) => (Ok(view), clock.now_mono()),
+            None => {
+                Self::make_room_for(views, platform, runs.len());
+                let start = clock.now_mono();
+                (Self::map_runs(views, &runs, length), start)
+            }
+        };
+        let made = match view {
             Ok(view) => {
                 let mapped = clock.now_mono();
                 match buffer_over(device, &view, 0, view.length(), 0, None)? {
@@ -1394,6 +1540,299 @@ impl<P: Platform> SurfaceViews<P> {
         p.view = Some((Arc::clone(&view), import));
         v.counts.private += 1;
         Ok(Some(view))
+    }
+
+    /// The cache's view of `runs`, taken to the back, with its import, as the view of the pages
+    /// block at `block`; `None` where the cache has none.
+    fn take_cached(&mut self, block: u64, runs: &[(u64, u64)]) -> Option<Arc<SurfaceView<P>>> {
+        let at = self.cache.iter().position(|c| c.runs == runs)?;
+        let cached = self.cache.remove(at)?;
+        let view = Arc::clone(&cached.view);
+        let import = cached.import.clone_ref();
+        self.cache.push_back(cached);
+        if let Some(p) = self.private.get_mut(&block) {
+            p.view = Some((Arc::clone(&view), import));
+        }
+        self.counts.private_reused += 1;
+        Some(view)
+    }
+
+    /// A view of `runs`, `length` bytes, through the views' memory map, mapped with `views`
+    /// unlocked.
+    fn map_runs(
+        views: &Mutex<SurfaceViews<P>>,
+        runs: &[(u64, u64)],
+        length: u64,
+    ) -> Result<Arc<SurfaceView<P>>, PagesRefusal> {
+        let (memory, lease, teardown) = {
+            let v = views.lock();
+            let Some((memory, lease)) = v.memory.as_ref() else {
+                return Err(PagesRefusal::NoMemoryMap);
+            };
+            (Arc::clone(memory), Arc::clone(lease), v.teardown.clone())
+        };
+        map_view(&memory, lease, teardown, runs, length)
+    }
+
+    /// A `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` the surface worker carries out, `over`, whose
+    /// carrying out is `then` (the module doc, "Group dma-bufs"), where `platform` groups views
+    /// within `limits`: its pages block's view is mapped here, with `views` unlocked, and joins
+    /// its context's open group, and `then` waits for the group's seal, which makes the view's
+    /// import a piece of the group's file; a later message over a block in a group waits behind
+    /// those before it there. Handed back to be carried out now where the block is no pages block
+    /// of the context's, its view is made, mapped or cached, its pages are mapped read-only by
+    /// their process (`RGFX_SURFACE_PAGES_READ_ONLY`: its buffers are made over a copy of them,
+    /// docs/accuracy-ledger.md, `read-only-pages-written`), a heap lies over the guest's RAM (a
+    /// block of one run), the view is past [`GROUP_MEMBER_MAX`] or the group's limits alone, or
+    /// the view is not mapped (refused as the message is carried out).
+    pub(crate) fn join_group(
+        views: &Mutex<SurfaceViews<P>>,
+        platform: &P,
+        limits: GroupLimits,
+        over: OverPages,
+        then: Job,
+    ) -> Joined {
+        let OverPages {
+            block,
+            block_size,
+            context,
+            heap,
+        } = over;
+        let (runs, length) = {
+            let mut v = views.lock();
+            let Some(p) = (v.private.get(&block))
+                .filter(|p| block_size <= p.block_size && p.context == context)
+            else {
+                return Joined::Now(then);
+            };
+            if p.view.is_some() || p.mapped.is_some() || p.read_only || (heap && p.ram.is_some()) {
+                return Joined::Now(then);
+            }
+            let (runs, length) = (p.runs.clone(), p.length);
+            // A member already: behind the messages that joined with it.
+            let member = (v.forming.iter_mut())
+                .filter(|f| f.context == context)
+                .flat_map(|f| f.members.iter_mut())
+                .find(|m| m.block == block);
+            if let Some(member) = member {
+                member.then.push(then);
+                return Joined::Waits;
+            }
+            let alone = length > GROUP_MEMBER_MAX
+                || runs.len().to_u64() >= limits.runs
+                || length >= limits.bytes
+                || v.memory.is_none()
+                || v.cache.iter().any(|c| c.runs == runs);
+            if alone {
+                return Joined::Now(then);
+            }
+            (runs, length)
+        };
+        Self::make_room_for(views, platform, runs.len());
+        let Ok(view) = Self::map_runs(views, &runs, length) else {
+            return Joined::Now(then);
+        };
+        let now = platform.clock().now_mono();
+        let page = platform.vm().page_size();
+        let mut v = views.lock();
+        let unmade = (v.private.get(&block))
+            .is_some_and(|p| p.runs == runs && p.view.is_none() && p.mapped.is_none());
+        if !unmade {
+            drop(v);
+            drop(view);
+            return Joined::Now(then);
+        }
+        let open = (v.forming.iter()).position(|f| f.context == context && !f.full && !f.sealing);
+        let (at, opened) = match open {
+            Some(at) => (at, None),
+            None => {
+                let number = v.next_group;
+                v.next_group += 1;
+                let forming = Forming {
+                    number,
+                    context,
+                    closes: now.saturating_add(GROUP_WINDOW),
+                    resets: v.resets,
+                    limits,
+                    members: Vec::new(),
+                    runs: 0,
+                    bytes: 0,
+                    full: false,
+                    sealing: false,
+                };
+                v.forming.push(forming);
+                (v.forming.len() - 1, Some(number))
+            }
+        };
+        let f = &mut v.forming[at];
+        f.runs += runs.len().to_u64();
+        f.bytes += length.next_multiple_of(page);
+        f.members.push(Member {
+            block,
+            runs,
+            view,
+            then: vec![then],
+        });
+        f.full = f.runs >= f.limits.runs || f.bytes >= f.limits.bytes;
+        if f.full {
+            v.group_changed.notify_all();
+        }
+        match opened {
+            Some(number) => Joined::Opened(number),
+            None => Joined::Waits,
+        }
+    }
+
+    /// Waits for the window of the group numbered `number` to close, on `platform`'s clock: its
+    /// time passed, or it filled; then marks it sealing, so it takes no more members, and answers
+    /// what its seal makes imports of ([`Self::seal`]). `None` where it went meanwhile (its
+    /// context's close, the device's reset).
+    pub(crate) fn group_closed(
+        views: &Mutex<SurfaceViews<P>>,
+        platform: &P,
+        number: u64,
+    ) -> Option<Sealing<P>> {
+        let clock = platform.clock();
+        let mut v = views.lock();
+        loop {
+            let at = v.forming.iter().position(|f| f.number == number)?;
+            let (full, closes) = (v.forming[at].full, v.forming[at].closes);
+            if full || clock.now_mono() >= closes {
+                let f = &mut v.forming[at];
+                f.sealing = true;
+                let members = (f.members.iter())
+                    .map(|m| (m.block, m.runs.clone(), Arc::clone(&m.view)))
+                    .collect();
+                return Some(Sealing {
+                    number,
+                    resets: f.resets,
+                    context: f.context,
+                    members,
+                });
+            }
+            let changed = Arc::clone(&v.group_changed);
+            clock.wait_until(&changed, &mut v, Deadline::Mono(closes));
+        }
+    }
+
+    /// Seals `sealing` on `device` (the module doc, "Group dma-bufs"): its members' views go into
+    /// shared files ([`HostVm::group_views`]), and each grouped view's import is made, a piece of
+    /// its group's file; a view the platform left alone, or whose piece the runtime refused,
+    /// leaves its group. Then, under one hold of the views' lock, each view becomes its block's,
+    /// made, or mapped for the block's first message to make alone ([`Self::private_view`]), and
+    /// the group goes: its members' messages, those that joined while it was sealed among them,
+    /// are handed back in their order to be carried out, so a later message over a member's block
+    /// comes after them. Nothing is handed back where the device was reset since the group opened
+    /// or its context closed meanwhile. A block that went meanwhile lets go of its view with no
+    /// lock held.
+    ///
+    /// [`HostVm::group_views`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::group_views
+    pub(crate) fn seal(
+        views: &Mutex<SurfaceViews<P>>,
+        platform: &P,
+        device: &P::Device,
+        sealing: Sealing<P>,
+    ) -> Vec<Job> {
+        let Sealing {
+            number,
+            resets,
+            context,
+            members,
+        } = sealing;
+        if views.lock().resets != resets {
+            return Vec::new();
+        }
+        let list: Vec<(HostAddr, u64)> = (members.iter())
+            .map(|(_, _, view)| (view.base(), view.length()))
+            .collect();
+        let groups = platform.vm().group_views(&list);
+        let mut memberships = groups.members.into_iter();
+        let imports: Vec<Option<P::Buffer>> = (members.iter())
+            .map(|(_, _, view)| {
+                let membership = memberships.next().flatten()?;
+                view.join(membership);
+                let length = view.length();
+                let made = refusals::refusing(|| buffer_over(device, view, 0, length, 0, None));
+                let import = match made {
+                    Ok(Ok(Some(import))) => Some(import),
+                    _ => None,
+                };
+                if import.is_none() {
+                    view.leave();
+                }
+                import
+            })
+            .collect();
+        drop(groups.making);
+        let mut v = views.lock();
+        let mut gone = Vec::new();
+        let mut grouped = 0;
+        for ((block, runs, view), import) in members.into_iter().zip(imports) {
+            let p = (v.private.get_mut(&block))
+                .filter(|p| p.runs == runs && p.view.is_none() && p.mapped.is_none());
+            match (p, import) {
+                (Some(p), Some(import)) => {
+                    p.view = Some((view, import));
+                    grouped += 1;
+                }
+                (Some(p), None) => p.mapped = Some(view),
+                (None, import) => gone.push((view, import)),
+            }
+        }
+        v.counts.private += grouped;
+        v.counts.grouped += grouped;
+        if grouped > 0 {
+            v.counts.groups += 1;
+        }
+        let then: Vec<Job> = match v.forming.iter().position(|f| f.number == number) {
+            Some(at) => (v.forming.remove(at).members.into_iter())
+                .flat_map(|m| m.then)
+                .collect(),
+            None => Vec::new(),
+        };
+        drop(v);
+        drop(gone);
+        log::debug!(
+            target: "reims_vgpu::graphics::surface_pages",
+            "a group of {} pages blocks' views of context {context} sealed: {grouped} imported as \
+             pieces of group dma-bufs",
+            list.len()
+        );
+        then
+    }
+
+    /// Context `context` closed: its groups being formed go, their views and their messages with
+    /// them, taken out for the caller to let go of with no lock held.
+    pub(crate) fn groups_closed(&mut self, context: u32) -> GroupsGone<P> {
+        let mut gone = Vec::new();
+        let mut at = 0;
+        while at < self.forming.len() {
+            if self.forming[at].context == context {
+                gone.push(self.forming.remove(at));
+            } else {
+                at += 1;
+            }
+        }
+        if !gone.is_empty() {
+            self.group_changed.notify_all();
+        }
+        GroupsGone { _gone: gone }
+    }
+
+    /// The first byte of the view of the pages block at `block`, made or mapped by its group
+    /// (for the tests).
+    #[cfg(test)]
+    pub(crate) fn private_view_base(&self, block: u64) -> Option<HostPtr> {
+        let p = self.private.get(&block)?;
+        let made = p.view.as_ref().map(|(v, _)| v.base());
+        made.or_else(|| p.mapped.as_ref().map(|v| v.base()))
+    }
+
+    /// How many groups are being formed, and how many members they have (for the tests).
+    #[cfg(test)]
+    pub(crate) fn forming(&self) -> (usize, usize) {
+        let members = self.forming.iter().map(|f| f.members.len()).sum();
+        (self.forming.len(), members)
     }
 
     /// Where the guest's RAM mapping holds the pages of the pages block at `block`, where they are
@@ -1514,16 +1953,20 @@ impl<P: Platform> SurfaceViews<P> {
     }
 
     /// The device's reset: every block's view and every cached one go, each buffer over them
-    /// let go of in a refusal scope, as no block names its pages any more; what the views did is
-    /// still counted.
+    /// let go of in a refusal scope, as no block names its pages any more, and the groups being
+    /// formed with their views and messages, which make nothing; what the views did is still
+    /// counted.
     pub(crate) fn reset(&mut self) {
         self.resets += 1;
         let views = std::mem::take(&mut self.by_block);
         let private = std::mem::take(&mut self.private);
         let cache = std::mem::take(&mut self.cache);
+        // The groups being formed make nothing: their views and messages go.
+        let forming = std::mem::take(&mut self.forming);
+        self.group_changed.notify_all();
         self.by_runs.clear();
         self.laid_out.clear();
-        if let Err(refusal) = refusals::refusing(move || drop((views, private, cache))) {
+        if let Err(refusal) = refusals::refusing(move || drop((views, private, cache, forming))) {
             log::warn!(
                 target: "reims_vgpu::graphics", kind:% = refusal;
                 "the IOSurface views were let go of at the device's reset, and a release was \
@@ -1837,6 +2280,62 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             .with_bytes(Some(bytes));
         self.store(m.obj_id, entry);
         Ok(Ok(()))
+    }
+
+    /// [`SurfaceViews::join_group`] for the `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` `message` of
+    /// the sender's, on the surface worker, once its block's `SURFACE_PAGES` is carried out:
+    /// `then` handed back to be carried out now where the platform groups no views
+    /// ([`HostVm::view_groups`]), it names no block of the sender's, or it is a read-only buffer
+    /// ([`READ_ONLY_OPTION`]), made over a copy of its pages.
+    ///
+    /// [`HostVm::view_groups`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::view_groups
+    pub(crate) fn join_group(&self, message: &[u8], then: Job) -> Joined {
+        let Some(limits) = self.platform.vm().view_groups() else {
+            return Joined::Now(then);
+        };
+        let named = match super::read::<RgfxMsgHeader>(message).map(|h| h.r#type) {
+            // A read-only buffer is made over a copy of its pages (docs/accuracy-ledger.md,
+            // `read-only-pages-written`): no piece of a group's file.
+            Some(RGFX_CMD_BUFFER_OVER_PAGES) => super::read::<RgfxBufferOverPages>(message)
+                .filter(|m| m.options & READ_ONLY_OPTION == 0)
+                .map(|m| (m.block_offset, m.block_size, false)),
+            Some(RGFX_CMD_HEAP_OVER_PAGES) => super::read::<RgfxHeapOverPages>(message)
+                .map(|m| (m.block_offset, m.block_size, true)),
+            _ => None,
+        };
+        let (Some((block, block_size, heap)), Some(context)) = (named, self.context) else {
+            return Joined::Now(then);
+        };
+        if !self.in_own_block(block, block_size) {
+            return Joined::Now(then);
+        }
+        // Its block's `SURFACE_PAGES` is carried out on the surface worker.
+        self.settle_surface(block);
+        let over = OverPages {
+            block,
+            block_size,
+            context,
+            heap,
+        };
+        let views = &self.shared.surface_views;
+        SurfaceViews::join_group(views, &*self.platform, limits, over, then)
+    }
+
+    /// [`SurfaceViews::group_closed`] of the decoder's views.
+    pub(crate) fn group_closed(&self, number: u64) -> Option<Sealing<P>> {
+        SurfaceViews::group_closed(&self.shared.surface_views, &*self.platform, number)
+    }
+
+    /// [`SurfaceViews::seal`] of the decoder's views, on `device`.
+    pub(crate) fn seal_group(&self, device: &P::Device, sealing: Sealing<P>) -> Vec<Job> {
+        SurfaceViews::seal(&self.shared.surface_views, &*self.platform, device, sealing)
+    }
+
+    /// Context `context` closed: its groups being formed go ([`SurfaceViews::groups_closed`]),
+    /// let go of here, with no lock held.
+    pub(crate) fn drop_groups(&self, context: u32) {
+        let gone = self.shared.surface_views.lock().groups_closed(context);
+        drop(gone);
     }
 
     /// `HEAP_OVER_PAGES`: a Shared heap over the pages of a pages block of the sender's (the
