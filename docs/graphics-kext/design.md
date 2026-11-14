@@ -3163,9 +3163,20 @@ from the pages at the create, and one copy, over the pages, where the GPU
 shares the CPU's memory, as the Intel UHD 630's is (dgpu-oracle.md Q3). Its
 `didModifyRange:`, and a blit's synchronize of it or of a texture over it, go
 to the host as any Managed buffer's do; Apple's OpenCL makes them around its
-maps of a buffer's memory. Over any other memory (read-only, a Managed buffer's
-where the device makes no Managed buffer over a Shared one, or memory the kext
-or host makes no pages block of) the buffer lies
+maps of a buffer's memory. Shared memory the process maps read-only lies in
+place too, where the device took `READ_ONLY_PAGES`: the kext wires it for
+reading alone and marks its block read-only, and the buffer over it is made
+with `MTLResourceOptions` bit 24, sent to the host alone (the buffer's options
+answer the app's, as Metal's leave the bit out), whose GPU writes the host
+drops as Metal drops them: Metal makes a buffer over read-only memory whose GPU
+reads see the memory and whose blit fills and kernel stores complete with their
+writes dropped, a file mapped under it unchanged (the AMD 5300M and the Intel
+UHD 630, `oracle_bundle` `nocopy.ro`; the M3, accuracy-ledger.md
+`read-only-pages-written`, whose row the host's drop follows). Over any other
+memory (read-only Managed memory, whose copies the host would write back to
+its pages; read-only memory where the kext makes no block of it; a Managed
+buffer's where the device makes no Managed buffer over a Shared one; or memory
+the kext or host makes no pages block of) the buffer lies
 over a range of a slab of its own options, as a device buffer of them does
 ("Shared and Managed buffers lie in slabs"): the process's own pages where
 the device takes them, so no app-sized copy lies in the region. `contents`
@@ -3176,13 +3187,8 @@ completion is reported. Each side's bytes that moved since the two last agreed g
 to the other, byte by byte, so CPU and GPU writes beside each other both stand
 (`guest/bundle/src/RgfxMemoryShadow.hpp`). A GPU write shows in the memory at
 its command buffer's completion, not as it runs, and memory mapped read-only is
-never written back. That is why read-only memory never lies in place: Metal
-makes a buffer over it whose GPU reads see the memory and whose blit fills and
-kernel stores complete with their writes dropped, a file mapped under it
-unchanged (the AMD 5300M and the Intel UHD 630, `oracle_bundle` `nocopy.ro`;
-the M3, accuracy-ledger.md `read-only-pages-written`), where the host's buffer
-over a pages block takes the GPU's writes (`BUFFER_OVER_PAGES` has no read-only
-form), which would reach pages the process maps read-only, a file's among them.
+never written back, though the GPU's writes stay in the range for later command
+buffers to read, where Metal's are dropped.
 
 **Managed storage** (Decided 4). A Managed buffer's or texture's CPU copy is
 memory of its process's, which the guest maps: a buffer's a Shared buffer of

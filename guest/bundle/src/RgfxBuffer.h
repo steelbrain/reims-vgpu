@@ -117,8 +117,11 @@ static inline BOOL RgfxMakesNoResourceOf(MTLResourceOptions options)
 /// `region` has pages blocks (RgfxRegion::acquirePages), the host sees in place too: the kext
 /// wires their pages for the buffer's life, the buffer's GPU address keeps the pointer's offset
 /// in its page, and a Managed one's CPU copy is a Shared buffer over them, where `slabs` lays
-/// Managed buffers over Shared copies (RgfxSlabs::overCopy). Read-only bytes, and those the kext
-/// or the host makes no pages block of, get a range of a
+/// Managed buffers over Shared copies (RgfxSlabs::overCopy). Shared bytes the process maps
+/// read-only the host sees in place where the kext makes a pages block of them
+/// (RGFX_FEATURE_READ_ONLY_PAGES), a buffer of Metal's private bit 24, whose GPU writes the host
+/// drops. Read-only Managed bytes, and those the kext or the host makes no pages block of, get a
+/// range of a
 /// slab of `slabs` as a device buffer of their options does (RgfxSlabs.hpp), the GPU's copy,
 /// synced with them at the command buffers that use the buffer (RgfxMemoryShadow.hpp): the
 /// process's own pages where the device takes them, the region's only where the kernel has none.

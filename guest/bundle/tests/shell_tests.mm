@@ -13135,9 +13135,11 @@ void test_no_copy_buffers()
 // keeps the pointer's offset in its page. Its didModifyRange:, a texture's write over it, and a
 // blit's synchronize of it or of a texture over it go to the host, as a Managed buffer's shadow's
 // do; at its release the buffer's destroy goes first, then its CPU copy's, then the block. Where
-// the device makes none, Managed memory takes the shadow. Read-only memory, a null pointer and
-// bytes in the region never ask for a block, and a block not given, or one the region does not
-// hold, falls back to the shadow.
+// the device makes none, Managed memory takes the shadow. Shared memory the process maps
+// read-only asks for a read-only block and lies over it, made with Metal's private bit 24, sent to
+// the host alone; read-only Managed memory, a null pointer and bytes in the region never ask for
+// a block, and a block not given (for read-only memory, by a kext without READ_ONLY_PAGES), or
+// one the region does not hold, falls back to the shadow.
 void test_no_copy_buffers_in_place()
 {
 	@autoreleasepool {
@@ -13366,21 +13368,47 @@ void test_no_copy_buffers_in_place()
 		drainRing(f.control);
 	}
 	@autoreleasepool {
-		// Never asked: a null pointer, bytes in the region, read-only memory.
+		// Never asked: a null pointer, bytes in the region.
 		pages.asked.clear();
 		RgfxBuffer *own = noCopy(nullptr, 0x1000, shared);
 		CHECK(own != nil && [own rgfxShadow] == nullptr);
 		RgfxRegion::Block inRegion = region.allocate(0x1000);
 		RgfxBuffer *placed = noCopy(const_cast<uint8_t *>(inRegion.ptr), 0x1000, shared);
 		CHECK(placed != nil && [placed rgfxShadow] == nullptr);
+		CHECK(pages.asked.empty());
+		drainRing(f.control);
+
+		// Read-only Shared memory: a read-only block of exactly its bytes, and a BUFFER_OVER_PAGES
+		// over it at the pointer's offset in its page, made with bit 24, which the host takes as
+		// memory whose GPU writes it drops; the buffer answers the app's options, without the bit,
+		// as Metal's does, and the rest as a writable one's.
 		uint8_t *ro = reinterpret_cast<uint8_t *>(app) + 0x30000;
 		CHECK(vm_protect(mach_task_self(), reinterpret_cast<vm_address_t>(ro), 0x4000, false,
 		                 VM_PROT_READ) == KERN_SUCCESS);
-		RgfxBuffer *readOnly = noCopy(ro, 0x4000, shared);
-		CHECK(readOnly != nil && [readOnly rgfxShadow] != nullptr);
-		CHECK(pages.asked.empty());
+		const MTLResourceOptions roOptions = shared | MTLResourceCPUCacheModeWriteCombined;
+		RgfxBuffer *readOnly = noCopy(ro + 0x40, 0x2000, roOptions);
+		CHECK(readOnly != nil && [readOnly rgfxShadow] == nullptr && [readOnly contents] == ro + 0x40);
+		CHECK(pages.asked.size() == 1 && std::get<0>(pages.asked[0]) == ro + 0x40 &&
+		      std::get<1>(pages.asked[0]) == 0x2000 && !std::get<2>(pages.asked[0]));
+		auto over = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+		CHECK(over.obj_id == readOnly.rgfxObjId && over.length == 0x2000 && over.offset == 0x40);
+		CHECK(over.block_offset == pages.offset && over.gpu_address == readOnly.gpuAddress);
+		CHECK(over.options == (roOptions | (1u << 24)));
+		CHECK(readOnly.storageMode == MTLStorageModeShared &&
+		      readOnly.cpuCacheMode == MTLCPUCacheModeWriteCombined &&
+		      ([(id<RgfxMetalResourceInternals>)readOnly unfilteredResourceOptions] & (1u << 24)) == 0);
+		CHECK(readOnly.gpuAddress % 0x1000 == 0x40 && readOnly.allocatedSize == 0x3000);
+		// Read-only Managed memory keeps its shadow (above), and where the kext gives no
+		// read-only block, as on a host without READ_ONLY_PAGES, Shared memory takes one too.
+		pages.gives = false;
+		RgfxBuffer *copied = noCopy(ro + 0x3000, 0x1000, shared);
+		CHECK(copied != nil && [copied rgfxShadow] != nullptr && ![copied rgfxShadow]->writable());
+		CHECK(pages.asked.size() == 2 && !std::get<2>(pages.asked[1]));
+		pages.gives = true;
+		drainRing(f.control);
 
 		// Asked, and no block given, or one the region does not hold: a shadow.
+		pages.asked.clear();
 		pages.gives = false;
 		RgfxBuffer *refused = noCopy(p, 0x1000, shared);
 		CHECK(refused != nil && [refused rgfxShadow] != nullptr && pages.asked.size() == 1);
@@ -13667,7 +13695,8 @@ void test_no_copy_buffer_over_remapped_memory_takes_its_own_block()
 
 // A no-copy buffer's GPU copy (its shadow) is a range of a slab of its options, as a device
 // buffer's is (RgfxBuffer.h): with the process's own pages as the slabs' first source, the
-// copies of read-only memory, Shared and Managed, lie in them, seeded from the memory, eight 4 KiB
+// copies of read-only memory, Shared and Managed, where the kext makes no block of it (a host
+// without READ_ONLY_PAGES), lie in them, seeded from the memory, eight 4 KiB
 // copies a page apart in one heap over one pages block, and the region gives none of them a block
 // of its own (each took one before: the region held every app-sized copy).
 void test_no_copy_shadows_lie_in_slabs()
@@ -13693,9 +13722,12 @@ void test_no_copy_shadows_lie_in_slabs()
 			return KERN_SUCCESS;
 		}
 		static void unmap(void *c, uint8_t *bytes, uint64_t) { static_cast<Vm *>(c)->held.erase(bytes); }
-		static bool block(void *c, const void *address, uint64_t, bool, uint64_t *offset,
+		static bool block(void *c, const void *address, uint64_t, bool writable, uint64_t *offset,
 		                  uint64_t *size)
 		{
+			// No block of read-only memory, as a kext on a host without READ_ONLY_PAGES.
+			if (!writable)
+				return false;
 			Vm *vm = static_cast<Vm *>(c);
 			vm->wired.push_back(address);
 			*size = 0x1000;

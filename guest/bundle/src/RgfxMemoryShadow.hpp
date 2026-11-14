@@ -1,9 +1,9 @@
 /*
  * RgfxMemoryShadow: the GPU's copy of app memory a no-copy buffer wraps
  * (`newBufferWithBytesNoCopy:length:options:deallocator:` over memory outside the device
- * region that the host does not use in place: read-only memory, a Managed buffer's where the
- * device makes no Managed buffer over a Shared one, or memory the kext or the host makes no pages
- * block of). The buffer lies over a range of a slab of its own
+ * region that the host does not use in place: read-only Managed memory, a Managed buffer's where
+ * the device makes no Managed buffer over a Shared one, or memory the kext or the host makes no
+ * pages block of, read-only memory among it where the kext makes no read-only blocks). The buffer lies over a range of a slab of its own
  * (RgfxSlabs.hpp, RgfxBuffer.h), the block here, and `contents` stays the app's pointer, as
  * Metal's does.
  *

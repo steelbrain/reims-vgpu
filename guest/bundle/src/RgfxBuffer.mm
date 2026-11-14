@@ -364,21 +364,26 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 		return nil;
 	// The app's own pages in place, where the kext wires them for the buffer and the host maps
 	// them: a Shared buffer's memory, and a Managed buffer's CPU copy, where the device makes a
-	// Managed buffer over a Shared one (bufferOverPagesOf). Read-only memory, and memory the kext
-	// or the host makes no pages block of, takes a shadow in a slab below. Read-only memory stays
-	// out of place: Metal makes the buffer, its GPU reads see the memory, and its blit fills and
-	// kernel stores complete with their writes dropped, the memory and a file mapped under it
-	// unchanged (the AMD 5300M and the Intel UHD 630 under macOS 26.7.1, oracle_bundle
-	// nocopy.ro; the M3, docs/accuracy-ledger.md `read-only-pages-written`). The host's buffer
-	// over a pages block takes the GPU's writes (BUFFER_OVER_PAGES has no read-only form), so in
-	// place they would reach pages the process maps read-only, a file's among them; the shadow
-	// never writes back to read-only memory, which drops them as Metal does.
+	// Managed buffer over a Shared one (bufferOverPagesOf). Shared memory the process maps
+	// read-only lies there too, where the kext makes a block of it (RGFX_FEATURE_READ_ONLY_PAGES),
+	// its buffer made with Metal's private bit 24, which the host's runtime takes as memory whose
+	// GPU writes it drops: Metal makes a buffer over read-only memory whose GPU reads see the
+	// memory and whose blit fills and kernel stores complete with their writes dropped, the
+	// memory and a file mapped under it unchanged (the AMD 5300M and the Intel UHD 630 under
+	// macOS 26.7.1, oracle_bundle nocopy.ro; the M3, docs/accuracy-ledger.md
+	// `read-only-pages-written`, whose row the host's drop follows). The kext marks the block
+	// read-only, and the host lays nothing over it that could write its pages. Read-only Managed
+	// memory, whose copies the host would write back to the pages, and memory the kext or the
+	// host makes no pages block of (read-only memory among it where the kext makes none), takes
+	// a shadow in a slab below, which never writes back to read-only memory.
 	const bool managed = (options & MTLResourceStorageModeMask) == MTLResourceStorageModeManaged;
-	if (pointer != nullptr && writable && region->hasPagesBlocks() &&
-	    (!managed || slabs->overCopy(static_cast<uint32_t>(options)))) {
+	const bool overPages =
+	    writable ? !managed || slabs->overCopy(static_cast<uint32_t>(options)) : !managed;
+	if (pointer != nullptr && overPages && region->hasPagesBlocks()) {
 		RgfxBuffer *inPlace = [RgfxBuffer bufferOverPagesOf:pointer
 		                                             length:length
 		                                            options:options
+		                                           writable:writable
 		                                        deallocator:appDeallocator
 		                                             region:region
 		                                             device:device
@@ -456,16 +461,24 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 // still lives (measured: a macOS 26.6.1 guest on the RTX 5080 host, 2026-11-11). One with Metal's
 // private bit 24, which the host's runtime takes as read-only memory, joins only its own kind,
 // never a writable one's view.
+//
+// Memory the process maps read-only (not `writable`, Shared alone) takes a block the kext wires
+// for reading and marks read-only, which only buffers of bit 24 lie over: the buffer is made with
+// the bit, sent to the host alone, so its GPU writes are dropped as Metal drops them, and its
+// options answer the app's, as Metal's leave the bit out. Its blocks join only read-only ones
+// (RgfxRegion keys them by writability).
 + (instancetype)bufferOverPagesOf:(void *)pointer
                            length:(NSUInteger)length
                           options:(MTLResourceOptions)options
+                         writable:(bool)writable
                       deallocator:(void (^)(void *, NSUInteger))appDeallocator
                            region:(RgfxRegion *)region
                            device:(id<MTLDevice>)device
                        serializer:(RgfxSerializer *)serializer
 {
-	const uint32_t join = (options & kBit24) != 0 ? kPagesJoinBit24 : kPagesJoin;
-	RgfxRegion::Block block = region->acquirePages(pointer, length, true, join);
+	const MTLResourceOptions hostOptions = writable ? options : options | kBit24;
+	const uint32_t join = (hostOptions & kBit24) != 0 ? kPagesJoinBit24 : kPagesJoin;
+	RgfxRegion::Block block = region->acquirePages(pointer, length, writable, join);
 	if (!block.ok)
 		return nil;
 	// The block's view starts at the page of the pointer's first byte, of the kext's page.
@@ -477,7 +490,8 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 	const uint64_t offset = reinterpret_cast<uintptr_t>(pointer) & (page - 1);
 	const bool managed = (options & MTLResourceStorageModeMask) == MTLResourceStorageModeManaged;
 	const MTLResourceOptions overPages =
-	    managed ? (options & ~MTLResourceStorageModeMask) | MTLResourceStorageModeShared : options;
+	    managed ? (hostOptions & ~MTLResourceStorageModeMask) | MTLResourceStorageModeShared
+	            : hostOptions;
 	RgfxCreated created = serializer->createBufferOverPages(
 	    length, static_cast<uint32_t>(overPages), block.offset, block.size, offset);
 	const uint64_t at = block.offset;
