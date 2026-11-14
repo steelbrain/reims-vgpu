@@ -2133,12 +2133,25 @@ into one at its creation, so the dispatch, the draw or the pass ends the process
 refusal; a blit into one from a buffer completes *(class 4: Metal stores them; these bytes went
 to metal2vulkan)*. Through an argument buffer the runtime refuses a write of every two-plane
 YCbCr texture, of 503, 507, 542 and 545, whose slot writes it stores, and of 500, whose slot
-writes it drops as Metal does, among them, ending the process at the dispatch *(Metal's answer
-there not measured)*. Measured on ms01's Iris Xe (ANV), m3-max-29517 and m3-max-29593, over
+writes it drops as Metal does, among them, ending the process at the dispatch *(class 4: the M3
+Max stores them as through a slot, below; metal2vulkan takes them on)*. Measured on ms01's Iris
+Xe (ANV), m3-max-29517 and m3-max-29593, over
 textures made as the device makes them over a guest's surface plane
 (`gpu::ycbcr::plane_writes`). Only an arm64 guest reaches it: the x86 guests' bundle ends the
 process at a texture of a two-plane format's creation, as the x86 Macs do (Q13; read from code,
 `guest/bundle/src/RgfxTexture.mm`'s descriptor check).
+
+**Through an argument buffer.** `oracle_twinwrites.sh Apple` with `FORMATS="500 503 507 523
+527" OPS="kernel argbuf"`, the M3 Max under macOS 27.0.1 (26A434), m3-max-29643: the kernel
+writes the eight colours through an argument buffer that holds the texture
+(`MTLArgumentEncoder`), made resident with `useResource:usage:` of `MTLResourceUsageWrite`,
+beside the same kernel's write through a slot, one process each. 500 is an 8 x 2 texture over
+plane 0 of a '420v' surface (plane 1 of 4 x 1 Cb, Cr pairs at 4096). Every command buffer
+completed, and both planes hold the same bytes after the write through the argument buffer as
+after the one through the slot, format by format: 503, 507, 523 and 527 store the codes of the
+table above, and 500 stores nothing, both planes keeping their 0xAB bytes. So a write through
+an argument buffer stores what a write through a slot stores *(measured on the M3 Max alone, as
+the x86 Macs make none of these textures)*.
 
 ## Not measured
 
