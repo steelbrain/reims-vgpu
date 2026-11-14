@@ -221,6 +221,8 @@ pub(crate) fn pass_refused(sel: &'static str, d: &rt::RenderPassDescriptor, e: &
 #[cfg(test)]
 pub(crate) mod measure;
 #[cfg(test)]
+mod plane_writes;
+#[cfg(test)]
 #[cfg(target_os = "macos")]
 pub(crate) mod sampling;
 
