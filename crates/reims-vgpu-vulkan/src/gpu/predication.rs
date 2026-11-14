@@ -404,12 +404,26 @@ impl Bindings {
         }
     }
 
+    /// `buffer` at buffer index `at`, from `offset`, with attribute stride `stride`, in place of
+    /// any buffer or table there; nil unbinds the index. The buffer the index holds already (an
+    /// upload chunk bound again at its next offset) keeps its reference, as the new one would hold
+    /// the same object: only its offset and stride change.
     fn bind_buffer(&mut self, at: u32, buffer: Option<&VulkanBuffer>, offset: u64, stride: u64) {
         self.tables.remove(&at);
         match buffer {
-            Some(b) => {
-                self.buffers.insert(at, (b.clone_ref(), offset, stride));
-            }
+            Some(b) => match self.buffers.entry(at) {
+                std::collections::btree_map::Entry::Occupied(mut bound) => {
+                    let bound = bound.get_mut();
+                    if bound.0.id() != b.id() {
+                        bound.0 = b.clone_ref();
+                    }
+                    bound.1 = offset;
+                    bound.2 = stride;
+                }
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert((b.clone_ref(), offset, stride));
+                }
+            },
             None => {
                 self.buffers.remove(&at);
             }
