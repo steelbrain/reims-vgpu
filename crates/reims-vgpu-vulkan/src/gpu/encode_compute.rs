@@ -682,6 +682,198 @@ mod tests {
         );
     }
 
+    /// The tests' kernel that writes texel (x, y) of texture 0.
+    #[cfg(target_os = "linux")]
+    const TEXWRITE: &[u8] = include_bytes!("../../../../tests/shaders/compute_texwrite.metallib");
+
+    /// A 16 × 16 `BGRA8Unorm` texture of shader read and write usage at the start of a heap made
+    /// with bit 24 over pages of the test's own (`resource::tests::guest_pages_of`), as the guest
+    /// makes a read-only heap, with the pages and their length; the runtime makes the heap over
+    /// a copy of them on Linux, announcing `copied-host-pages`, which dies in strict mode, so it
+    /// is made under the default.
+    #[cfg(target_os = "linux")]
+    fn bgra_in_read_only_heap() -> (
+        crate::gpu::resource::VulkanTexture,
+        crate::core::host::HostPtr,
+        u64,
+    ) {
+        use crate::core::host::HostPtr;
+        use crate::core::num::ToUsize as _;
+        use crate::core::platform::HostRange;
+        use crate::core::platform::resource::Heap as _;
+        use crate::core::platform::values::{HeapDesc, OptionSet};
+
+        use crate::gpu::resource::tests::{BIT_24, guest_pages_of, over_pages};
+
+        let size = over_pages();
+        let pages = HostPtr::from_addr(guest_pages_of(size).to_usize());
+        // SAFETY: pages of the test's, left mapped until the process ends.
+        let bytes = unsafe { HostRange::new(pages, size) };
+        let heap = crate::answer::relaxed(|| {
+            dev().new_heap_over_host_memory(
+                bytes,
+                &HeapDesc {
+                    size,
+                    heap_type: 1,
+                    options: vec![
+                        OptionSet::StorageMode(0),
+                        OptionSet::HazardTrackingMode(0),
+                        OptionSet::ResourceOptionsOr(BIT_24),
+                    ],
+                    pinned_gpu_address: None,
+                },
+            )
+        })
+        .unwrap()
+        .heap
+        .unwrap();
+        let desc = platform().texture_descriptor(&TextureDesc {
+            pixel_format: 80,
+            width: 16,
+            height: 16,
+            usage: 0x3,
+            resource_options: Some(heap.resource_options() & !BIT_24),
+            ..TextureDesc::default()
+        });
+        let texture = heap.new_texture(&desc, 0).unwrap().unwrap();
+        (texture, pages, size)
+    }
+
+    /// A kernel's `write()` of a texture over a guest's read-only memory, a buffer made with bit
+    /// 24 (`resource::tests::read_only_buffer`) or a heap made with it over pages
+    /// ([`bgra_in_read_only_heap`]), and a blit's copy into such a texture out of a buffer or a
+    /// texture, each complete with no error, and the pages, and what a later command buffer
+    /// reads of the texture, stay zeros, as Metal's GPU takes those writes nowhere (measured on
+    /// the M3 Max, macOS 27.0.1, metal2vulkan's `probes/readonly_gpu_writes.m`; the runtime's
+    /// `read_only_view.rs`): the runtime's copy of the pages drops them. Linux's: on macOS they go
+    /// to Metal
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn texture_writes_into_read_only_memory_are_dropped() {
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::os::vm::HostVm as _;
+        use crate::core::platform::types::MtlOrigin;
+
+        use crate::gpu::resource::tests::{bgra_over, host_bytes_at, read_only_buffer};
+
+        let write = pipeline(TEXWRITE, "tex_write");
+        let source = shared(16 * 64);
+        // SAFETY: a Shared buffer of 16 rows of 64 bytes, which no command uses yet.
+        unsafe { std::ptr::write_bytes(source.contents().as_ptr::<u8>(), 0x3c, 16 * 64) };
+        let held = d_texture(0x5a);
+        let (ro, pages) = read_only_buffer(1);
+        let over = bgra_over(&ro, 0x3);
+        let (in_heap, heap_pages, heap_size) = bgra_in_read_only_heap();
+        let whole = MtlSize::new(16, 16, 1);
+        let at = MtlOrigin::new(0, 0, 0);
+        for (name, texture, (pages, length)) in [
+            ("over a buffer", &over, (pages, 16 * 64)),
+            ("in a heap", &in_heap, (heap_pages, heap_size)),
+        ] {
+            // The kernel's write.
+            run_serial(vec![
+                ComputeCmd::SetComputePipelineState {
+                    state: Some(&write),
+                },
+                ComputeCmd::SetTexture {
+                    texture: Some(texture),
+                    index: 0,
+                },
+                ComputeCmd::DispatchThreads {
+                    threads_per_grid: whole,
+                    threads_per_threadgroup: MtlSize::new(4, 4, 1),
+                },
+            ]);
+            // The blit's copies, out of a buffer and out of a texture.
+            for copy in [
+                BlitCmd::CopyBufferToTexture {
+                    source_buffer: &source,
+                    source_offset: 0,
+                    source_bytes_per_row: 64,
+                    source_bytes_per_image: 16 * 64,
+                    source_size: whole,
+                    destination_texture: texture,
+                    destination_slice: 0,
+                    destination_level: 0,
+                    destination_origin: at,
+                },
+                BlitCmd::CopyTextureRegion {
+                    source_texture: &held,
+                    source_slice: 0,
+                    source_level: 0,
+                    source_origin: at,
+                    source_size: whole,
+                    destination_texture: texture,
+                    destination_slice: 0,
+                    destination_level: 0,
+                    destination_origin: at,
+                },
+            ] {
+                let cb = command_buffer();
+                let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+                e.encode(OnFault::Return, copy).unwrap();
+                e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+                cb.commit(OnFault::Return).unwrap();
+                cb.wait_until_completed(OnFault::Return).unwrap();
+                assert_eq!((cb.status().0, cb.error()), (COMPLETED, None), "{name}");
+            }
+            let length = usize::try_from(length).unwrap();
+            assert!(
+                host_bytes_at(pages, length).iter().all(|&b| b == 0),
+                "{name}: the pages"
+            );
+            // What a later command buffer reads of the texture.
+            let out = shared(16 * 64);
+            let cb = command_buffer();
+            let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+            let read = BlitCmd::CopyTextureToBuffer {
+                source_texture: texture,
+                source_slice: 0,
+                source_level: 0,
+                source_origin: at,
+                source_size: whole,
+                destination_buffer: &out,
+                destination_offset: 0,
+                destination_bytes_per_row: 64,
+                destination_bytes_per_image: 16 * 64,
+            };
+            e.encode(OnFault::Return, read).unwrap();
+            e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+            cb.commit(OnFault::Return).unwrap();
+            cb.wait_until_completed(OnFault::Return).unwrap();
+            assert!(words(&out).iter().all(|&w| w == 0), "{name}: read back");
+        }
+        drop((over, ro, in_heap));
+        assert!(
+            crate::remap::VulkanVm::new()
+                .deallocate(pages, crate::os::PAGE)
+                .is_success()
+        );
+    }
+
+    /// A 16 × 16 `BGRA8Unorm` texture of the device's memory, every byte `byte`.
+    #[cfg(target_os = "linux")]
+    fn d_texture(byte: u8) -> crate::gpu::resource::VulkanTexture {
+        use crate::core::platform::HostRange;
+        use crate::core::platform::resource::Texture as _;
+        use crate::core::platform::types::{MtlOrigin, MtlRegion};
+
+        let desc = platform().texture_descriptor(&TextureDesc {
+            pixel_format: 80,
+            width: 16,
+            height: 16,
+            usage: 0x1,
+            resource_options: Some(0),
+            ..TextureDesc::default()
+        });
+        let t = dev().new_texture(OnFault::Return, &desc).unwrap().unwrap();
+        let region = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(16, 16, 1));
+        let texels = [byte; 16 * 64];
+        t.replace_region(region, 0, 0, HostRange::of_slice(&texels), 64, 0)
+            .unwrap();
+        t
+    }
+
     /// A dispatch whose kernel stores into a guest's read-only buffer (made with bit 24,
     /// `resource::tests::read_only_buffer`), bound at the slot it writes and made resident for
     /// writing, completes with no error, its stores dropped, the pages staying zeros, as Metal

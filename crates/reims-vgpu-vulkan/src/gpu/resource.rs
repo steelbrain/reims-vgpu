@@ -2534,13 +2534,13 @@ pub(crate) mod tests {
     }
 
     /// A guest's read-only buffer (a no-copy buffer made with bit 24, [`read_only_buffer`])
-    /// takes a blit's fill into it, and on Linux a copy into it too, the command buffer
-    /// completing with no error, and its pages stay as they were: the runtime drops the writes,
-    /// through its copy of the pages on Linux and Metal's read-only view on macOS, as Metal
-    /// drops a fill (measured, `crate::gpu::writes`'s docs). What Metal does with a copy into
-    /// such memory is unmeasured, so a Mac, whose GPU every process shares, runs only the fill.
-    /// On Linux a blit into a texture over it dies where it is encoded, as what Metal does
-    /// there is unmeasured. Its contents answer the pages' address on both
+    /// takes a blit's fill into it, and on Linux a copy into it too, and a copy into a texture
+    /// over it, the command buffer completing with no error, and its pages stay as they were: the
+    /// runtime drops the writes, through its copy of the pages on Linux and Metal's read-only view
+    /// on macOS, as Metal drops a fill and a copy into such a texture (measured,
+    /// `crate::gpu::writes`'s docs). What Metal does with a copy into such a buffer is
+    /// unmeasured, so a Mac, whose GPU every process shares, runs only the fill. Its contents
+    /// answer the pages' address on both
     #[test]
     fn a_blit_into_a_read_only_buffer_is_dropped() {
         use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
@@ -2594,9 +2594,7 @@ pub(crate) mod tests {
                 destination_level: 0,
                 destination_origin: MtlOrigin::new(0, 0, 0),
             };
-            let sel = into_texture.selector();
-            let site = catch_death(|| e.encode(OnFault::Die, into_texture)).unwrap_err();
-            assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
+            e.encode(OnFault::Die, into_texture).unwrap();
         }
         e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
         cb.commit(OnFault::Die).unwrap();

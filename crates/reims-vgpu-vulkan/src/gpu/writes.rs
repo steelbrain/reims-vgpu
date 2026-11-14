@@ -38,11 +38,13 @@
 //!   `CustomSampleDepthStore`), or resolves a colour attachment into such a texture by
 //!   `MultisampleResolve`, fails its command buffer with Metal's page fault, as the runtime faults
 //!   it itself, the fault counting against its queue as Metal's does: the queue's second revokes
-//!   it (`crate::gpu::encode_render`, `crate::gpu::command`); and another resolve into such a
-//!   texture (`StoreAndMultisampleResolve`, a depth or stencil resolve, a resolve texture a late
-//!   setter named), a colour or stencil attachment kept there by `CustomSampleDepthStore`, a
-//!   write of a texture over it by a shader or a blit, and a CPU write of one die as
-//!   [`kept_write`], as what Metal does there is unmeasured, or ends the process.
+//!   it (`crate::gpu::encode_render`, `crate::gpu::command`); a kernel's write of a texture over
+//!   it and a blit's copy into one are sent and dropped (`crate::gpu::predication`,
+//!   `crate::gpu::encode_blit`); and another resolve into such a texture
+//!   (`StoreAndMultisampleResolve`, a depth or stencil resolve, a resolve texture a late setter
+//!   named), a colour or stencil attachment kept there by `CustomSampleDepthStore`, a draw's
+//!   write of such a texture, another blit's write of one (a fill, mipmaps), and a CPU write of
+//!   one die as [`kept_write`], as what Metal does there is unmeasured, or ends the process.
 //!
 //! On macOS neither is taken: MoltenVK hands Metal the pages, or a read-only view of them made
 //! with bit 24, and Metal's GPU answers every write there itself.
@@ -61,9 +63,12 @@
 //! resolved into and a resolve out of a read-only primary. A multisample colour attachment's
 //! `MultisampleResolve` into such a texture, and a depth attachment in a heap of bit 24 kept by
 //! `CustomSampleDepthStore`, each by the descriptor's action or one the encoder set, fail it so
-//! too (m3-max-28796 and m3-max-28797; the runtime's `store_out.rs`). Another resolve into such
-//! memory is unknown, and so are a blit's copy into it and a texture's
-//! writes by a shader or a blit there, which no probe made.
+//! too (m3-max-28796 and m3-max-28797; the runtime's `store_out.rs`). A texture over such memory
+//! takes a kernel's `write()` and a blit's copy into it, out of a buffer or a texture, nowhere:
+//! each completes with no error and leaves the pages as they were (the runtime's
+//! `read_only_view.rs`). Another resolve into such memory is unknown, and so are a blit's copy
+//! into a buffer there and a draw's or another blit's write of a texture there, which no probe
+//! made.
 use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
@@ -110,9 +115,10 @@ pub enum Kept {
     Always,
     /// For the object's life: for a texture over a buffer or heap, read-only memory the runtime
     /// makes the buffer or heap over a copy of, dropping the GPU's writes, where what Metal does
-    /// with a texture's writes is unmeasured ([`crate::gpu::backing::Backing::read_only_now`]). A
-    /// buffer's own memory the runtime copies is never `Copied`: the runtime drops its writes, as
-    /// Metal's GPU does.
+    /// with a texture's writes is unmeasured but for a kernel's and a blit's copy, which the
+    /// runtime drops as Metal's GPU does (`crate::gpu::predication`, `crate::gpu::encode_blit`;
+    /// [`crate::gpu::backing::Backing::read_only_now`]). A buffer's own memory the runtime copies
+    /// is never `Copied`: the runtime drops its writes, as Metal's GPU does.
     Copied,
 }
 
@@ -311,12 +317,13 @@ impl Drop for Keeping {
 /// this platform does not answer as Metal's GPU does ([`Memory::kept`]): a surface the GPU only
 /// reads, which the runtime imports through a writable twin of its pages, where the write would
 /// land in those pages, and later reads see it; or, for a
-/// texture's write, a resolve into one or a CPU write, read-only guest pages (a read-only heap, a
-/// resource made with `MTLResourceOptions` bit 24) the runtime copies, dropping the
-/// write, where what Metal does is unmeasured. Metal's GPU drops a shader's store, a fill's or
-/// a visibility result's there and completes the command, and fails the command buffer of a
-/// pass that stores an attachment back to it (the module's measurements), and its CPU's write
-/// through the pages' read-only mapping ends the process. Ending the process is this platform's
+/// texture's write that is not a kernel's nor a blit's copy, a resolve into one or a CPU write,
+/// read-only guest pages (a read-only heap, a resource made with `MTLResourceOptions` bit 24) the
+/// runtime copies, dropping the write, where what Metal does is unmeasured. Metal's GPU drops a
+/// shader's store, a fill's, a visibility result's, a kernel's texture write and a blit's copy
+/// into a texture there and completes the command, and fails the command buffer of a pass that
+/// stores an attachment back to it (the module's measurements), and its CPU's write through the
+/// pages' read-only mapping ends the process. Ending the process is this platform's
 /// divergence from Metal (`docs/accuracy-ledger.md`, `read-only-pages-written`).
 pub(crate) fn kept_write(sel: &'static str, what: &str) -> ! {
     crate::answer::unrepresentable(
