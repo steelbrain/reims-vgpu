@@ -36,10 +36,13 @@
 // Untracked with the writer updating a fence the reader waits for (`fence`). Each case runs
 // kAliasRuns command buffers, the CPU setting every byte of the surface to 0x11 under a lock
 // before each, and prints, of the bytes the writer wrote that the reader's texels hold, how many
-// runs read all of them, none, or some; and in how many runs the surface held them all after
-// the command buffer completed (read under a read-only lock):
+// runs read all of them, none, or some; and, of the surface after the command buffer completed
+// (read under a read-only lock), in how many runs the plane's texels held every byte written
+// there, the bytes past them every byte the wide writer wrote there, and the bytes past them
+// still held the CPU's 0x11:
 //   alias N NAME | surface ... | WRITER through W, read through R, HAZARD
-//   alias N NAME => runs R: all A, none Z, some S; surface after: all P
+//   alias N NAME => runs R: all A, none Z, some S; surface after: texels all P, bytes past them
+//   written Q, still 0x11 O
 //   oracle_surftex DEVICE --alias N    aliasing case N alone (what the children run)
 // Build: see README.md.
 #import "oracle_common.h"
@@ -919,7 +922,7 @@ static int runAlias(id<MTLDevice> d, int n)
 	id<MTLBuffer> out = [d newBufferWithLength:readRow * kSize options:MTLResourceStorageModeShared];
 	id<MTLCommandQueue> q = [d newCommandQueue];
 	id<MTLFence> fence = a->fenced ? [d newFence] : nil;
-	int all = 0, none = 0, some = 0, after = 0;
+	int all = 0, none = 0, some = 0, after = 0, afterBeside = 0, afterBesideOld = 0;
 	for (int run = 0; run < kAliasRuns; run++) {
 		IOSurfaceLock(s, 0, NULL);
 		memset(IOSurfaceGetBaseAddress(s), 0x11, IOSurfaceGetAllocSize(s));
@@ -985,22 +988,32 @@ static int runAlias(id<MTLDevice> d, int n)
 		all += seen == want;
 		none += seen == 0;
 		some += seen != want && seen != 0;
+		// The surface after: the plane's texels (the first 64 bytes of each row) and the bytes
+		// past them apart, each counted where it holds every byte the writer wrote there.
 		IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
 		const uint8_t *pages = IOSurfaceGetBaseAddress(s);
-		int held = 1;
-		for (int y = 0; y < kSize && held; y++)
+		int texels = 1, beside = 1, besideOld = 1;
+		for (int y = 0; y < kSize; y++)
 			for (int x = 0; x < kAliasRow; x++) {
 				int w = aliasWritten(a, x, y);
-				if (w >= 0 && pages[y * kAliasRow + x] != w) {
-					held = 0;
-					break;
-				}
+				uint8_t b = pages[y * kAliasRow + x];
+				if (x >= kSize)
+					besideOld &= b == 0x11;
+				if (w < 0)
+					continue;
+				if (x < kSize)
+					texels &= b == w;
+				else
+					beside &= b == w;
 			}
 		IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
-		after += held;
+		after += texels;
+		afterBeside += wideFirst && beside;
+		afterBesideOld += besideOld;
 	}
-	printf("alias %d %s => runs %d: all %d, none %d, some %d; surface after: all %d\n", n,
-	       a->name, kAliasRuns, all, none, some, after);
+	printf("alias %d %s => runs %d: all %d, none %d, some %d; surface after: texels all %d, "
+	       "bytes past them written %d, still 0x11 %d\n",
+	       n, a->name, kAliasRuns, all, none, some, after, afterBeside, afterBesideOld);
 	fflush(stdout);
 	CFRelease(s);
 	return 0;
