@@ -1228,7 +1228,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         made.map(|b| {
             b.map(|raw| {
                 let buffer = self.buffer(raw, None);
-                buffer.backing.imported(read_only || bit_24);
+                buffer.backing.imported(read_only, bit_24);
                 buffer
             })
         })
@@ -2030,7 +2030,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         made.map(|b| {
             b.map(|raw| {
                 let backing = Backing::new(held & READ_ONLY_OPTION != 0);
-                backing.imported(read_only);
+                backing.imported(read_only, false);
                 Obj::new(BufferObject {
                     raw,
                     device: self.clone_ref(),
@@ -2207,7 +2207,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         Ok(HeapMade {
             heap: heap.map(|raw| {
                 let backing = Backing::new(false);
-                backing.imported(read_only || bit_24);
+                backing.imported(read_only, bit_24);
                 Obj::new(HeapObject {
                     raw,
                     device: self.clone_ref(),

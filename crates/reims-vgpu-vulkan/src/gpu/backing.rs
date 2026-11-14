@@ -60,6 +60,9 @@ pub struct Backing {
     /// buffer or heap was made over, mapped read-only or made with bit 24; counted while it holds
     /// ([`crate::gpu::writes::set_kept`]).
     kept: AtomicBool,
+    /// Whether, of that memory, the pages are mapped read-only, which a CPU write through them
+    /// cannot write ([`Backing::pages_read_only`]).
+    mapped_read_only: AtomicBool,
 }
 
 impl Backing {
@@ -69,16 +72,27 @@ impl Backing {
         Backing {
             read_only,
             kept: AtomicBool::new(false),
+            mapped_read_only: AtomicBool::new(false),
         }
     }
 
-    /// The object, a no-copy buffer or heap, was made over memory of the caller's that is
-    /// read-only where `read_only` (mapped so, [`crate::os::ImportView::read_only`], or made with
-    /// bit 24): its memory is read-only then, and where it was made with bit 24
-    /// ([`Backing::read_only_now`]).
-    pub(crate) fn imported(&self, read_only: bool) {
-        let kept = crate::os::COPIES_READ_ONLY && (read_only || self.read_only);
+    /// The object, a no-copy buffer or heap, was made over memory of the caller's whose pages are
+    /// mapped read-only where `mapped_read_only` ([`crate::os::ImportView::read_only`]), with
+    /// `MTLResourceOptions` bit 24 where `bit_24` or [`Backing::new`] was told so: its memory is
+    /// read-only where either holds ([`Backing::read_only_now`]).
+    pub(crate) fn imported(&self, mapped_read_only: bool, bit_24: bool) {
+        let read_only = mapped_read_only || bit_24 || self.read_only;
+        let kept = crate::os::COPIES_READ_ONLY && read_only;
+        (self.mapped_read_only).store(kept && mapped_read_only, Ordering::Release);
         crate::gpu::writes::set_kept(&self.kept, kept);
+    }
+
+    /// Whether the memory the object lies in is read-only memory the runtime copies
+    /// ([`Backing::read_only_now`]) whose pages are mapped read-only: a CPU write of a texture
+    /// over it, which the runtime makes through the pages, dies, as Metal's CPU write through
+    /// such a mapping ends the process (`crate::gpu::resource`).
+    pub(crate) fn pages_read_only(&self) -> bool {
+        self.mapped_read_only.load(Ordering::Acquire)
     }
 
     /// Whether the memory the object lies in is read-only where the runtime does not import

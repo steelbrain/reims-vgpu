@@ -1650,6 +1650,19 @@ impl Texture<VulkanPlatform> for VulkanTexture {
     /// reaches the pages, where Metal's CPU writes through their read-only mapping
     /// ([`crate::gpu::writes::kept_write`]). A surface's reads a copy of them first
     /// ([`host_bytes`]), which it writes row by row.
+    ///
+    /// One of a texture over read-only memory the runtime copies (bit 24, or pages mapped
+    /// read-only) writes the pages, as the runtime writes a texture's bytes through the caller's
+    /// pointer, and the copy takes them at the next commit, so later command buffers read them, as
+    /// Metal's CPU writes a bit-24 buffer's pages; over pages mapped read-only it dies, as Metal's
+    /// write through that mapping ends the process with a bus error
+    /// ([`crate::gpu::writes::texture_pages_read_only`]). Measured with a texture over a no-copy
+    /// buffer, plain Metal, on the M3 Max under macOS 27.0.1 and the Radeon Pro 5300M and UHD
+    /// Graphics 630 under macOS 26.7.1 (m3-max-29292 to m3-max-29294): over a bit-24 buffer of
+    /// writable pages the pages take the bytes and the GPU reads them, and over pages the process
+    /// maps read-only, with bit 24 or without, the process ends in the call (`SIGBUS`). A texture
+    /// in a Shared heap of bit 24 takes them too on the M3 Max, which a blit reads back; the x86
+    /// Macs make no Shared heap.
     fn replace_region(
         &self,
         region: MtlRegion,
@@ -1667,8 +1680,15 @@ impl Texture<VulkanPlatform> for VulkanTexture {
             return self.replaced_on_surface(sel, raw, (region, level, slice), &bytes, rows);
         }
         let bytes = guest_bytes(sel, pixel_bytes);
-        if crate::os::TWINS_READ_ONLY && crate::gpu::writes::texture_kept(self) {
+        if crate::os::TWINS_READ_ONLY && crate::gpu::writes::texture_twinned(self) {
             crate::gpu::writes::kept_write(sel, "a CPU write of a texture into");
+        }
+        if crate::gpu::writes::texture_pages_read_only(self) {
+            metal_aborts(
+                sel,
+                "a CPU write of a texture over pages the process maps read-only, through that \
+                 mapping (a bus error)",
+            );
         }
         send(sel, Policy::Dies, || {
             raw.replace_region_with_host_bytes(
@@ -2610,24 +2630,118 @@ pub(crate) mod tests {
         );
     }
 
-    /// A CPU write of a texture over a guest's read-only buffer ([`read_only_buffer`]) dies at
-    /// `replaceRegion:` on Linux, where Metal's CPU write through the read-only mapping ends the
-    /// process, and the runtime's would land in its copy
+    /// The 16 × 16 texels of `texture`, 64 bytes a row, as a blit in a command buffer of its own
+    /// reads them.
+    #[cfg(target_os = "linux")]
+    fn texels_read_back(texture: &VulkanTexture) -> Vec<u8> {
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::resource::Buffer as _;
+        use crate::core::platform::types::MtlSize;
+
+        let d = dev();
+        let out = d
+            .new_buffer_of_length(OnFault::Die, 16 * 64, 0)
+            .unwrap()
+            .unwrap();
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        let read = BlitCmd::CopyTextureToBuffer {
+            source_texture: texture,
+            source_slice: 0,
+            source_level: 0,
+            source_origin: MtlOrigin::new(0, 0, 0),
+            source_size: MtlSize::new(16, 16, 1),
+            destination_buffer: &out,
+            destination_offset: 0,
+            destination_bytes_per_row: 64,
+            destination_bytes_per_image: 16 * 64,
+        };
+        e.encode(OnFault::Die, read).unwrap();
+        e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert!(cb.error().is_none(), "{:?}", cb.error());
+        host_bytes_at(out.contents(), 16 * 64)
+    }
+
+    /// A CPU write of a texture over a guest's read-only memory whose pages it can write, a
+    /// buffer made with bit 24 ([`read_only_buffer`]) or a heap made with it, takes the texels,
+    /// as Metal's CPU write does: a later command buffer reads them, and the buffer's pages hold
+    /// them (measured, plain Metal, on the M3 Max under macOS 27.0.1 and the Radeon Pro 5300M and
+    /// UHD Graphics 630 under macOS 26.7.1, m3-max-29292 to m3-max-29294: a texture over a bit-24
+    /// buffer, the pages taking the bytes and a blit reading them; on the M3 Max, a texture in a
+    /// Shared heap of bit 24, which a blit reads back). The runtime writes them through the pages
+    /// on Linux, and its copy of them takes them at the next commit. One over pages the process
+    /// maps read-only ([`over_read_only_pages`]) dies at `replaceRegion:`, as Metal's write
+    /// through that mapping ends the process with a bus error, with bit 24 or without (the same
+    /// runs), the pages staying zeros. Linux's: on macOS the runtime imports the pages as they
+    /// are mapped
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_cpu_write_of_a_texture_over_a_read_only_buffer_dies_on_linux() {
+    fn a_cpu_write_of_a_texture_over_read_only_memory_takes_its_texels_on_linux() {
+        use crate::core::num::ToUsize as _;
         use crate::core::platform::os::vm::HostVm as _;
-        use crate::core::platform::resource::Texture as _;
+        use crate::core::platform::resource::{Heap as _, Texture as _};
         use crate::core::platform::types::{MtlRegion, MtlSize};
 
         use crate::os::PAGE;
 
+        let texels: Vec<u8> = (0..16 * 64).map(|i| (i % 251) as u8 + 1).collect();
+        let region = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(16, 16, 1));
+        let write =
+            |t: &VulkanTexture| t.replace_region(region, 0, 0, HostRange::of_slice(&texels), 64, 0);
         let (b, pages) = read_only_buffer(1);
-        let texture = bgra_over(&b, 0x1);
-        let texels = [0x77u8; 64];
-        let region = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(16, 1, 1));
-        let write = || texture.replace_region(region, 0, 0, HostRange::of_slice(&texels), 64, 0);
-        let site = catch_death(write).unwrap_err();
+        let over = bgra_over(&b, 0x1);
+        write(&over).unwrap();
+        assert_eq!(host_bytes_at(pages, 16 * 64), texels, "the buffer's pages");
+        assert_eq!(texels_read_back(&over), texels, "over a buffer");
+        drop((over, b));
+        assert!(
+            crate::remap::VulkanVm::new()
+                .deallocate(pages, PAGE)
+                .is_success()
+        );
+
+        let size = over_pages();
+        let at = HostPtr::from_addr(guest_pages_of(size).to_usize());
+        // SAFETY: pages of the test's, left mapped until the process ends.
+        let bytes = unsafe { HostRange::new(at, size) };
+        let heap = crate::answer::relaxed(|| {
+            dev().new_heap_over_host_memory(
+                bytes,
+                &HeapDesc {
+                    size,
+                    heap_type: 1,
+                    options: vec![
+                        OptionSet::StorageMode(0),
+                        OptionSet::HazardTrackingMode(0),
+                        OptionSet::ResourceOptionsOr(BIT_24),
+                    ],
+                    pinned_gpu_address: None,
+                },
+            )
+        })
+        .unwrap()
+        .heap
+        .unwrap();
+        let desc = platform().texture_descriptor(&TextureDesc {
+            pixel_format: 80,
+            width: 16,
+            height: 16,
+            usage: 0x1,
+            resource_options: Some(heap.resource_options() & !BIT_24),
+            ..TextureDesc::default()
+        });
+        let in_heap = heap.new_texture(&desc, 0).unwrap().unwrap();
+        write(&in_heap).unwrap();
+        assert_eq!(texels_read_back(&in_heap), texels, "in a heap");
+        drop((in_heap, heap));
+
+        let (b, pages) = over_read_only_pages(1);
+        let over = bgra_over(&b, 0x1);
+        let site = catch_death(|| write(&over)).unwrap_err();
         assert_eq!(
             (site.kind, site.file),
             (
@@ -2635,8 +2749,8 @@ pub(crate) mod tests {
                 "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:"
             )
         );
-        assert!(host_bytes_at(pages, 64).iter().all(|&byte| byte == 0));
-        drop((texture, b));
+        assert!(host_bytes_at(pages, 16 * 64).iter().all(|&byte| byte == 0));
+        drop((over, b));
         assert!(
             crate::remap::VulkanVm::new()
                 .deallocate(pages, PAGE)
