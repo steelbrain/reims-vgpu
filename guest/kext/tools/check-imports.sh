@@ -2,8 +2,11 @@
 # Checks a kext's imports against a macOS 26 KDK, as the kernel's linker
 # resolves them: every name the executable imports must be exported by a
 # library its OSBundleLibraries names, and it may name no private KPI
-# (com.apple.kpi.private and com.apple.kpi.unsupported are open to
-# com.apple.* kexts alone). Prints how many names each library gives.
+# (com.apple.kpi.private is open to com.apple.* kexts alone: the kernel's
+# OSKext::resolveDependencies fails any other kext that names it, and checks
+# no other KPI so; com.apple.kpi.unsupported, whose mach_vm_region and
+# kernel_map the kext imports, is open to every kext). Prints how many names
+# each library gives.
 #
 #   tools/check-imports.sh KDK KEXT
 #
@@ -53,7 +56,7 @@ libraries=$(plutil -convert json -o - "$plist" | python3 -I -c \
 status=0
 for lib in $libraries; do
 	case $lib in
-	com.apple.kpi.private | com.apple.kpi.unsupported)
+	com.apple.kpi.private)
 		echo "check-imports: $lib is named: only com.apple.* kexts may link it" >&2
 		status=1
 		continue ;;
