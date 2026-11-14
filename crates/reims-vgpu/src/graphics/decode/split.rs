@@ -32,6 +32,31 @@
 //! measured (metal2vulkan c796a88d6a) does more work for an encoder the more encoders its command
 //! buffer holds before it, and a part holds fewer.
 //!
+//! **How many parts.** A part is cut each [`SPLIT_AFTER`] however many of the buffer's parts are
+//! out, up to its queue's room for command buffers (`TAKE_IN_FLIGHT_MAX`, [`super::cmdbuf`]). A
+//! limit on the parts out, under which the walk goes on into a longer part while the GPU is
+//! behind, gained nothing measured. `dispatch_cost` (the decoder alone, release, the median of 5
+//! runs of 6 repetitions) measured its fluid shape and its heavy one, whose GPU work outlasts its
+//! walk as Fluid Simulation's does on a Radeon 780M, with at most 2 or 16 parts out against no
+//! limit, on metal2vulkan afba68e6e4:
+//! - Radeon 780M (RADV): the heavy shape's latency 166.8 and 167.0 ms against 166.2 ms, its walk
+//!   6.6 and 7.0 µs a dispatch against 7.3 µs; the fluid shape's GPU keeps up, so neither limit
+//!   was reached;
+//! - Iris Xe (ANV): heavy 252.4 and 252.2 ms against 253.0 ms; fluid as on the 780M;
+//! - M3 Max (MoltenVK): the latency rose from 33.8 to 44.3 and 35.7 ms (fluid) and from 121.9 to
+//!   132.2 and 127.2 ms (heavy), the cuts waiting for MoltenVK's late completions. Parts that
+//!   double in length (250, 500, 1,000 µs and on) lost there too: 45.6 and 139.2 ms against 34.4
+//!   and 122.3 ms.
+//!
+//! A walk in parts takes no more instructions than a whole one, but it stalls longer. Each
+//! part's commit, and its GPU work beside the walk, cost the walk 110 to 210 thousand cycles on
+//! the Iris Xe and the Radeon 780M (the fluid shape in 88 and 72 parts, against whole).
+//! At metal2vulkan bc12f6d95a a busy GPU stalled the walk far more: on the Radeon 780M the heavy
+//! shape's walk took 55.8 thousand cycles a dispatch against fluid's 34.5 thousand, for 55.7 and
+//! 59.0 thousand instructions. Fluid Simulation's walk there took 33.6 µs a dispatch in parts
+//! against 17.2 µs whole (perfscout5's dp-gbr-780m against perfscout4's gbr-780m). At
+//! afba68e6e4 the heavy shape's walk takes 30.2 thousand cycles against fluid's 33.3 thousand.
+//!
 //! **What stays as it was.** The parts run in their order on the queue, as the encoders of one
 //! buffer do, and each part is committed only where the whole buffer could be committed then,
 //! waiting for nothing (`GraphicsDecoder::may_commit_now`): its turn on its queue is next, every
