@@ -153,10 +153,7 @@ fn compute_answers<P: Platform>(d: &P::Device, data: &[u8]) -> Vec<(String, Comp
 /// though with another error or a death (the library makes compute states of functions alone
 /// only in its tests). One kernel Metal makes a state of dies: `ycbcr_probe`'s
 /// `sample_held_sampler_float`, which samples a texture an argument buffer holds, the runtime's
-/// gap (`ArgumentBufferTextures`), where its tests pin the death. One answers another
-/// `staticThreadgroupMemoryLength`: the display's `displayMirrorTile`, whose threadgroup
-/// variables take 1028 bytes, which the runtime answers as they are and Metal rounds up to 1040,
-/// a multiple of 16 (measured on the M3 Max, 2026-11-13), the runtime's gap, pinned here
+/// gap (`ArgumentBufferTextures`), where its tests pin the death
 #[test]
 fn compute_state_answers_are_metals_for_every_kernel_here() {
     // Metal's answer of each function by its values, `None` where it makes no state.
@@ -175,14 +172,11 @@ fn compute_state_answers_are_metals_for_every_kernel_here() {
             }
         }
     }
-    assert_eq!(
-        differ,
-        [
-            "shaders displayMirrorTile: ours Ok((1024, 32, 1028, false)), Metal's \
-          Some((1024, 32, 1040, false))"
-        ],
-        "{} differ",
-        differ.len()
+    assert!(
+        differ.is_empty(),
+        "{} differ:\n{}",
+        differ.len(),
+        differ.join("\n")
     );
     assert_eq!(died, ["sample_held_sampler_float"]);
     assert!(compared > 100, "{compared} kernels");
