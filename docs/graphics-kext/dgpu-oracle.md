@@ -413,6 +413,30 @@ behind one on its queue, is at the signal *(class 3)*; whether the buffer is `Sc
 and its scheduled handlers have run, is a race on all three *(class 2)*, and an idle queue
 returns while it is still `Committed` *(class 3)*.
 
+`oracle_waits DEVICE`: waits against handlers that block (each handler sleeps 20 ms), 20 runs
+each, tiny blit buffers, on the 5300M, the 630 (both macOS 26.7.1) and the M3 Max (macOS 27.0.1).
+Every row was the same in all 20 runs on all three:
+
+| | all three |
+|---|---|
+| `waitUntilCompleted` against a completed handler that blocks | returns after it ends (0.01 to 0.15 ms after) |
+| the same with two completed handlers, the second blocking | returns after the second ends; the first ran before the second |
+| the status read in a completed handler, and once the wait returns | `Completed` |
+| `waitUntilScheduled` against a scheduled handler that blocks | returns after it ends |
+| the buffer's completed handler, its `Completed` status and `waitUntilCompleted` against that scheduled handler | all after it ends |
+| a second buffer of the queue, committed right after one whose completed handler blocks, with no handler or a quick one: its `Completed` status, its handler and its `waitUntilCompleted` | all after the first's handler ends |
+| a second buffer with no handler, committed while the first's completed handler blocks: its `Scheduled` and `Completed` status, `waitUntilScheduled` and `waitUntilCompleted` | all after the first's handler ends (the polling thread never read `Scheduled` in 5 runs on the 630 and 2 on the 5300M, the buffer passing it between two reads) |
+| idle GPU, tiny buffer, commit to `waitUntilCompleted`'s return, no handler / an empty completed handler (median) | AMD 0.50 / 0.50 ms, Intel 0.39 / 0.39 ms, M3 0.72 / 0.89 ms |
+
+So a queue's buffers become `Scheduled` and `Completed`, run their handlers and release their
+waiters in one order, on its completion queue: a buffer's status changes before its handlers of
+the stage run, its waits return only after them, and a handler that blocks holds everything of its
+queue after it, other buffers' statuses and waits included *(class 3)*. Our stack does the same:
+each queue's records run in ring order on its completion queue (design.md, "Who takes the
+completions"), a record's status changes before its handlers and its waiters go after them, and
+a buffer's records run on the thread that took them only while none of its queue's are still to
+run.
+
 The M3 also runs a creator's handler after the creator returns, on the global default-QoS queue
 (`com.apple.root.default-qos`) *(class 3 that it runs after the return; class 2 which queue)*.
 

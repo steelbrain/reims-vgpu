@@ -21,7 +21,8 @@
 //      its wait against the first's handler.
 //   6  a buffer with a completed handler that blocks; once that handler runs, a second buffer
 //      with no handler is committed: its waitUntilScheduled and waitUntilCompleted, and its
-//      Scheduled and Completed status, against the first's handler.
+//      Scheduled and Completed status, against the first's handler ("not seen": the polling
+//      thread never read that status, the buffer passing it between two reads).
 //   7  no handler blocks, an idle GPU: commit to waitUntilCompleted's return with no handler;
 //      with an empty completed handler, commit to the handler's start and to the wait's return,
 //      and how often the wait returned before the handler started or ended (median ms).
@@ -91,13 +92,17 @@ static void spin_until(_Atomic double *t, double ms)
 }
 
 typedef struct {
-	int before, during, after, never;
+	int before, during, after, never, unseen;
 	double v[256];
 	int n;
 } Tally;
 
 static void tally(Tally *t, double at, double start, double end)
 {
+	if (at == 0) {
+		t->unseen++;
+		return;
+	}
 	if (start == 0 || end == 0)
 		t->never++;
 	else if (at < start)
@@ -122,6 +127,8 @@ static void tally_print(const char *what, Tally *t)
 	printf("    %s: before %d, while %d, after %d", what, t->before, t->during, t->after);
 	if (t->never)
 		printf(", handler not seen %d", t->never);
+	if (t->unseen)
+		printf(", not seen %d", t->unseen);
 	if (t->n)
 		printf("; from the end: median %+.3f, min %+.3f, max %+.3f", t->v[t->n / 2], t->v[0],
 		       t->v[t->n - 1]);
