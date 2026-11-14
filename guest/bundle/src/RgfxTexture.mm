@@ -298,9 +298,19 @@ constexpr uint64_t kRgfxUnknownUsageAnswer = MTLTextureUsageShaderRead |
                                              MTLTextureUsageRenderTarget |
                                              MTLTextureUsagePixelFormatView;
 
+// The usage bits a texture made with them leaves out of its answer: ShaderAtomic, and 0x8, which
+// the SDK names none for; every other bit it was made with it answers (measured on the M3 Max
+// under macOS 27.0.1, and the AMD 5300M and the Intel UHD 630 under 26.7.1, oracle_surftex's
+// sixth and seventh rounds: R32Uint, R32Sint and RG32Uint textures over an IOSurface of each kind
+// and over none, in Managed, Shared and Private storage, and their views, of usage 0x23 answer 0x3,
+// 0x20 answers 0, 0x29 answers 0x1, 0x8 answers 0). The wire carries the usage the descriptor
+// gave, the atomic bit among them, which the host's texture takes.
+constexpr uint64_t kRgfxUnansweredUsage = MTLTextureUsageShaderAtomic | 0x8;
+
 uint64_t rgfxAnsweredUsage(uint64_t usage)
 {
-	return usage == MTLTextureUsageUnknown ? kRgfxUnknownUsageAnswer : usage;
+	return usage == MTLTextureUsageUnknown ? kRgfxUnknownUsageAnswer
+	                                       : usage & ~kRgfxUnansweredUsage;
 }
 
 uint32_t rgfxPackSwizzle(MTLTextureSwizzleChannels sw)
@@ -2513,8 +2523,9 @@ RGFX_RESOURCE_SPI
 	    self.storageMode == MTLStorageModeMemoryless || !_allowGPUOptimizedContents) {
 		return NO;
 	}
-	const MTLTextureUsage usage = self.usage;
-	const MTLTextureUsage uncompressed =
+	// The usage the texture was made with, ShaderAtomic among it, which its answer leaves out.
+	const uint64_t usage = _desc.usage;
+	const uint64_t uncompressed =
 	    MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView | MTLTextureUsageShaderAtomic;
 	if (usage == MTLTextureUsageUnknown || (usage & uncompressed) != 0) {
 		return NO;

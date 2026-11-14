@@ -14836,6 +14836,102 @@ void test_texture_unknown_usage()
 	}
 }
 
+// A texture answers the usage it was made with but ShaderAtomic and 0x8, which Metal's textures
+// leave out of theirs, over an IOSurface and over none, in each storage mode, and its views too,
+// while its create carries the usage given, atomic bit and all (measured on the M3 Max under
+// macOS 27.0.1, the AMD 5300M and the Intel UHD 630 under 26.7.1: oracle_surftex's sixth and
+// seventh rounds).
+void test_texture_usage_leaves_out_atomic()
+{
+	Fixture fx;
+	int calls = 0;
+	fx.ids.setResourceIdSource(&oneChunk, &calls);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	const struct {
+		uint64_t asked, answered;
+	} kUsages[] = {
+	    {0x23, 0x3}, {0x20, 0x0}, {0x21, 0x1},       {0x33, 0x13},      {0x37, 0x17},     {0x29, 0x1},
+	    {0x9, 0x1},  {0x8, 0x0},  {0x4001, 0x4001}, {0x8001, 0x8001}, {0x10001, 0x10001},
+	};
+	for (MTLStorageMode storage :
+	     {MTLStorageModePrivate, MTLStorageModeShared, MTLStorageModeManaged}) {
+		for (const auto &u : kUsages) {
+			@autoreleasepool {
+				MTLTextureDescriptor *desc =
+				    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Uint
+				                                                       width:16
+				                                                      height:16
+				                                                   mipmapped:NO];
+				desc.usage = static_cast<MTLTextureUsage>(u.asked);
+				desc.storageMode = storage;
+				RgfxTexture *tex = [RgfxTexture textureWithDescriptor:desc
+				                                                 heap:RGFX_OBJ_NONE
+				                                           heapOffset:0
+				                                               device:nil
+				                                           serializer:&fx.ser];
+				CHECK(tex != nil && tex.usage == u.answered);
+				id<MTLTexture> view = [tex newTextureViewWithPixelFormat:MTLPixelFormatR32Uint];
+				CHECK(view != nil && view.usage == u.answered);
+				RgfxMsgHeader h = {};
+				std::vector<uint8_t> bytes;
+				bool created = false;
+				while (fx.ring.next(&h, &bytes)) {
+					RgfxTextureCreate made = {};
+					if (h.type == RGFX_CMD_TEXTURE_CREATE && bytes.size() >= sizeof(made)) {
+						std::memcpy(&made, bytes.data(), sizeof(made));
+						created = made.obj_id == tex.rgfxObjId && made.desc.usage == u.asked;
+					}
+				}
+				CHECK(created);
+			}
+			drainRing(fx.ring);
+		}
+	}
+	// Over an IOSurface, its create carrying the usage given.
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth : @16,
+		(id)kIOSurfaceHeight : @16,
+		(id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+	};
+	IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(surface != nullptr);
+	for (const auto &u : kUsages) {
+		@autoreleasepool {
+			MTLTextureDescriptor *td =
+			    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Uint
+			                                                       width:16
+			                                                      height:16
+			                                                   mipmapped:NO];
+			td.usage = static_cast<MTLTextureUsage>(u.asked);
+			RgfxIOSurfaceTexture *t = [RgfxIOSurfaceTexture textureWithDescriptor:td
+			                                                            iosurface:surface
+			                                                                plane:0
+			                                                               region:&region
+			                                                               device:nil
+			                                                           serializer:&fx.ser];
+			CHECK(t != nil && t.usage == u.answered);
+			CHECK([t newTextureViewWithPixelFormat:MTLPixelFormatR32Uint].usage == u.answered);
+			RgfxMsgHeader h = {};
+			std::vector<uint8_t> bytes;
+			bool created = false;
+			while (fx.ring.next(&h, &bytes)) {
+				RgfxTextureFromIOSurface made = {};
+				if (h.type == RGFX_CMD_TEXTURE_FROM_IOSURFACE && bytes.size() >= sizeof(made)) {
+					std::memcpy(&made, bytes.data(), sizeof(made));
+					created = made.obj_id == t.rgfxObjId && made.desc.usage == u.asked;
+				}
+			}
+			CHECK(created);
+		}
+		drainRing(fx.ring);
+	}
+	CFRelease(surface);
+}
+
 // A texture's views (RGFX_CMD_TEXTURE_VIEW): each form posts its view of the texture with the
 // fields it names, and the view answers its own shape and its texture's memory, as Metal's do
 // (measured on the M3 Max under macOS 27.0.1). A view Metal makes none of, or asserts at,
@@ -19399,6 +19495,7 @@ int main(int argc, char **argv)
 		test_function_encoder_of_no_buffer_ends_the_process();
 		test_texture_framebuffer_only();
 		test_texture_unknown_usage();
+		test_texture_usage_leaves_out_atomic();
 		test_view_keeps_its_texture();
 		test_texture_resource_ids();
 		test_sampler_routing();
