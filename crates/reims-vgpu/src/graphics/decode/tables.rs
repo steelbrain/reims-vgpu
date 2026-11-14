@@ -350,6 +350,9 @@ impl<P: Platform> Tables<P> {
     /// The gone entries no open view names any more, in the order removed: a view names one where
     /// it was taken from the entry's `seen` up to its removal.
     fn sweep(&mut self) -> Vec<Removed<P>> {
+        if self.gone.is_empty() {
+            return Vec::new();
+        }
         if self.views.is_empty() {
             return std::mem::take(&mut self.gone)
                 .into_iter()
@@ -546,6 +549,10 @@ impl<P: Platform> Drop for Context<P> {
     }
 }
 
+/// The names a view's map of what it found holds before it grows: a command buffer of a few
+/// dispatches names tens of objects, and each growth moves every name found so far.
+const SEEN_ROOM: usize = 32;
+
 /// A message's view of one context's table (the module doc): open from its taking until it drops,
 /// which lets go of the removed entries only it still kept. It lends the entries it finds for its
 /// own life, and keeps each found, and each change of the message's own, so a name it looks up
@@ -574,7 +581,10 @@ impl<P: Platform> View<P> {
         View {
             context,
             at,
-            seen: RefCell::new(HashMap::default()),
+            seen: RefCell::new(HashMap::with_capacity_and_hasher(
+                SEEN_ROOM,
+                KeyBuild::default(),
+            )),
         }
     }
 
@@ -588,15 +598,14 @@ impl<P: Platform> View<P> {
         &self.context
     }
 
-    /// The entry of `id` the view sees.
+    /// The entry of `id` the view sees: looked up in what the view found and changed with one
+    /// hash of `id`, which the table's answer then goes in at.
     pub(crate) fn get(&self, id: u64) -> Option<&Entry<P>> {
-        let seen = self.seen.borrow().get(&id).copied();
-        let found = match seen {
-            Some(found) => found,
-            None => {
+        let found = match self.seen.borrow_mut().entry(id) {
+            std::collections::hash_map::Entry::Occupied(seen) => *seen.get(),
+            std::collections::hash_map::Entry::Vacant(slot) => {
                 let found = self.context.tables.read().find(id, self.at)?;
-                self.seen.borrow_mut().insert(id, Some(found));
-                Some(found)
+                *slot.insert(Some(found))
             }
         };
         // SAFETY: the entry was in the table, made by the view's taking, or removed after it; or
