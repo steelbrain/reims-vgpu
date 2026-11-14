@@ -3752,6 +3752,23 @@ stamps each buffer so the host can split it:
   `guest_clock_offset_ns`, the held reading's offset, then
   `guest_clock_bound_ns`, its bound (half the reading's round trip, widened by
   50 ppm of its age), with release. The host zeroes both at a reset.
+- The queue's thread stamps the host's clock as it takes the buffer, before
+  the gate, and as it comes back to the ring after the buffer before it
+  (`ring_free`, 0 for the first of a take). It reads the bound with acquire,
+  then the offset, and gives each buffer `encode` (committed − made),
+  `post_wait` (posted − committed: the ring's room, the queue's buffers
+  committed before it, its commit order's naming), and where the bound is not
+  0, `queued` (`ring_free` − posted, where the thread came back after the
+  post: behind the queue's buffer before it, the host's) and `transport` (the
+  take less the later of posted and `ring_free`: the doorbell, the thread's
+  wake and the ring), posted mapped to the host's clock by the offset.
+- The host writes them to its trace (`REIMS_VGPU_TRACE`) as `cbguest queue
+  seqno encode post_wait queued transport bound held` (`cbguest queue seqno
+  encode post_wait held` with no offset held), `held` the time from the take
+  to the event (the buffer's wait at the gate, the read of a block), so a
+  reader places the take at the event less it. Once a second a debug line of
+  target `reims_vgpu_graphics::guest_times` gives the buffers' count, each
+  span's sum and median and the longest transport.
 - The offset is off by at most its bound, microseconds, under the millisecond
   spans it splits. The stamps cost three clock reads a buffer. Nothing else
   the guest or the host observes changes: a guest that did not take the bit

@@ -210,6 +210,7 @@ use crate::wire::*;
 
 mod backlog;
 mod gate;
+mod guest_times;
 mod lanes;
 
 /// How many of ring 0's messages a doorbell's take reads ([`Backlog::read`]) before it leaves the
@@ -704,7 +705,7 @@ pub trait Host: Send + Sync + 'static {
         let _ = (color, entries);
     }
 
-    /// One event of ring 0's timeline for the host's profiling trace, `kind` and its `values`,
+    /// One event of the device's timeline for the host's profiling trace, `kind` and its `values`,
     /// timed by the host as it is called, on the thread it happened on: a diagnostic, which
     /// changes nothing the device does. Ring 0's events and their values:
     /// - `r0wake`: the control thread woke from its sleep (a doorbell, a `STATUS` write or the
@@ -714,6 +715,13 @@ pub trait Host: Send + Sync + 'static {
     /// - `r0job type seqno`, `r0jobdone seqno`: a lane's job began and was carried out;
     /// - `r0post type seqno raise`: an answer or event went on the control completion ring,
     ///   `raise` 1 where its interrupt is raised next.
+    ///
+    /// And one of each command buffer a queue's thread takes, where the guest stamps them
+    /// ([`RGFX_FEATURE_GUEST_TIMES`]), on that thread, as it hands the buffer to the host:
+    /// - `cbguest queue seqno encode post_wait queued transport bound held`: the buffer's spans
+    ///   before its take, in nanoseconds ([`guest_times`]), `queued`, `transport` and the clocks'
+    ///   `bound` only where the guest holds the offset of its clock from the host's, and `held`,
+    ///   from its take to the event.
     ///
     /// The default writes nothing.
     fn trace(&self, kind: &'static str, values: &[u64]) {
@@ -847,6 +855,9 @@ pub(crate) struct Shared {
     /// The longest a record handed over waited for a thread to take it to post, in nanoseconds,
     /// since that line ([`Shared::post_handed`]).
     handed_wait_ns: AtomicU64,
+    /// The command buffers' guest times since the last line of them ([`guest_times`]), kept
+    /// while that line's target logs.
+    guest_times: Mutex<guest_times::Window>,
     /// Where the tests stop the control thread once it has found no reset came since it took a
     /// message it carried out or handed on with no ring held, before it moves `control_done` past
     /// it: called with the count it moves to.
@@ -1115,6 +1126,7 @@ impl Device {
             handed_over: AtomicU64::new(0),
             handed_logged_ns: AtomicU64::new(0),
             handed_wait_ns: AtomicU64::new(0),
+            guest_times: Mutex::new(guest_times::Window::default()),
             #[cfg(test)]
             before_count: Mutex::new(None),
         });
@@ -2667,13 +2679,19 @@ impl Shared {
     /// posted onto the queue's completion ring through `poster`, from the GPU's thread.
     fn take_queue_messages(&self, queue: &Arc<QueueShared>, poster: &CompletionPoster) {
         let mut consuming = queue.consuming.lock();
+        // Where the guest stamps its buffers ([`guest_times`]): when this thread came back to the
+        // ring after the buffer it handed over before, on the host's clock; 0 before its first.
+        let guest_times = self.driver_took(RGFX_FEATURE_GUEST_TIMES);
+        let mut ring_free_ns = 0;
         loop {
-            let (next, room) = {
+            let (next, room, taken_ns) = {
                 let mut submit = queue.submit.lock();
                 if !self.started() || submit.broken || self.ending() || queue.ended() {
                     return;
                 }
                 let next = submit.consumer.next(&self.region);
+                // The buffer's take, before it waits at the gate.
+                let taken_ns = if guest_times { now_ns() } else { 0 };
                 // A commit waiting for room: after this take, a doorbell's thread's before it, or
                 // the last, where the ring is empty.
                 let room = next.is_ok() && self.room_wanted(&submit.consumer);
@@ -2688,7 +2706,7 @@ impl Shared {
                     );
                     submit.broken = true;
                 }
-                (next, room)
+                (next, room, taken_ns)
             };
             // Told with nothing held, on the queue's completion ring.
             if room {
@@ -2816,6 +2834,9 @@ impl Shared {
             } else {
                 message
             };
+            if guest_times {
+                self.note_guest_times(queue, &message, taken_ns, ring_free_ns);
+            }
             // The host may let the claim go once the buffer is begun ([`QueueClaim`]); a buffer
             // a doorbell's thread answered meanwhile is the ring's next, which this takes next.
             let mut claim = QueueClaim {
@@ -2826,6 +2847,35 @@ impl Shared {
             };
             self.host.command_buffer(poster, message.bytes, &mut claim);
             consuming = claim.retake();
+            if guest_times {
+                ring_free_ns = now_ns();
+            }
+        }
+    }
+
+    /// The guest's times of the `COMMAND_BUFFER` `message` ([`guest_times`]), taken off `queue`'s
+    /// ring at `taken_ns` by a thread that came back to the ring at `ring_free_ns`: its `cbguest`
+    /// event in the host's trace, and its spans in the once-a-second line where its target logs.
+    /// Nothing for a buffer whose stream does not start with its times.
+    fn note_guest_times(
+        &self,
+        queue: &QueueShared,
+        message: &Message,
+        taken_ns: u64,
+        ring_free_ns: u64,
+    ) {
+        let Some(times) = guest_times::of(&message.bytes) else {
+            return;
+        };
+        let clock = guest_times::clock(&self.region);
+        let noted_ns = now_ns();
+        let spans = guest_times::spans(&times, clock, taken_ns, ring_free_ns, noted_ns);
+        self.host
+            .trace("cbguest", &spans.event(queue.obj_id, message.header.seqno));
+        if log::log_enabled!(target: guest_times::TARGET, log::Level::Debug)
+            && let Some(line) = self.guest_times.lock().add(&spans, noted_ns)
+        {
+            log::debug!(target: guest_times::TARGET, "{line}");
         }
     }
 
