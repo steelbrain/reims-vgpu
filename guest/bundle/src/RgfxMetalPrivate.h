@@ -246,7 +246,7 @@ NS_ASSUME_NONNULL_END
 // collectable signal, the layer's next drawable or flush, or 1.1 s on), at once where the drawable
 // has no layer on screen.
 @protocol RgfxDrawablePresentScheduled
-- (void)addPresentScheduledHandler:(void (^)(id<MTLDrawable>))block;
+- (void)addPresentScheduledHandler:(void (^_Nonnull)(id<MTLDrawable> _Nonnull))block;
 @end
 
 // read from code: macOS 27.0.1 Metal.framework — what Metal's base command queue reads off the
