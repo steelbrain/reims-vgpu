@@ -23,8 +23,12 @@ pub(crate) type Surface = StandIn<VulkanPlatform>;
 /// interleaved, each sample a code in the top bits of `container` bytes, or, `packed`, three
 /// codes to a little-endian 32-bit word, at its bits 0, 10 and 20 (bits 30 and 31 unread): luma
 /// code `x` of a row in word `x / 3`, the chroma pair `x` as codes `2 x` (Cb) and `2 x + 1`
-/// (Cr).
-#[cfg(target_os = "macos")]
+/// (Cr). On every target, as the plane-write tests (`super::plane_writes`) lay surfaces out by
+/// it; only macOS's harness reads every field.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "only macOS's harness reads ostype and bits")
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Shape {
     /// The surface's OSType.
@@ -40,7 +44,6 @@ pub(crate) struct Shape {
     pub packed: bool,
 }
 
-#[cfg(target_os = "macos")]
 impl Shape {
     /// The shape CoreVideo gives `ostype`, one of the two-plane OSTypes measured.
     pub(crate) fn of(ostype: &[u8; 4]) -> Shape {
@@ -86,6 +89,7 @@ impl Shape {
     /// plane 1 at a multiple of 4096, as CoreVideo lays them out; a packed row holds a word of
     /// three luma codes (3 texels in 4 bytes), or two words of three chroma pairs (3 texels in 8
     /// bytes).
+    #[cfg(target_os = "macos")]
     pub(crate) fn layout(&self, size: (u64, u64)) -> (SurfaceFacts, Vec<(u64, u64)>, u64) {
         let (width, height) = size;
         let (chroma_width, chroma_height) = self.chroma_size(size);
@@ -102,6 +106,7 @@ impl Shape {
 
     /// A surface of this shape whose luma plane is `size` ([`Shape::layout`]), zeros, the buffer
     /// that stands for it `d`'s.
+    #[cfg(target_os = "macos")]
     pub(crate) fn surface(&self, d: &VulkanDevice, size: (u64, u64)) -> Surface {
         let (facts, planes, length) = self.layout(size);
         Surface::shared(d, facts, planes, length)
