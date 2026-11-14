@@ -3551,6 +3551,105 @@ mod tests {
         assert_eq!(crate::answer::degradation_counts(), before);
     }
 
+    /// A recovery of the device while commands' sets are sent in one call each loses none of
+    /// them and ends no run: [`SENDERS`] threads each send their own commands' vertex and fragment
+    /// buffers, nil at offsets of the round and the command (a nil buffer's address is its
+    /// offset), one call a command, then read their commands back, round after round, while
+    /// another thread recovers the device again and again, each time once every sender finished
+    /// a round more. Each read-back, and each command at the end, holds the round last sent it.
+    /// A device of its own, as a recovery moves every user of the device.
+    #[test]
+    fn a_recovery_while_a_command_is_sent_in_one_call_loses_no_set() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        const SENDERS: u64 = 4;
+        const EACH: u64 = 16;
+        const RECOVERIES: u64 = 16;
+        let d = crate::gpu::device::tests::device_of_options(crate::platform::device_options());
+        let icb = &make::<VulkanPlatform>(&d, &render_desc(), SENDERS * EACH);
+        // The four addresses of command `i` in `round`: its vertex and fragment buffers 0 and 1.
+        let at = |round: u64, i: u64| {
+            let first = (round * SENDERS * EACH + i) * 64;
+            [first, first + 16, first + 32, first + 48]
+        };
+        let sets = |round: u64, i: u64| {
+            let [v0, v1, f0, f1] = at(round, i);
+            let vertex = |offset, index| IcbRenderCmd::<'_, VulkanPlatform>::SetVertexBuffer {
+                buffer: None,
+                offset,
+                index,
+            };
+            let fragment = |offset, index| IcbRenderCmd::<'_, VulkanPlatform>::SetFragmentBuffer {
+                buffer: None,
+                offset,
+                index,
+            };
+            [
+                vertex(v0, 0),
+                vertex(v1, 1),
+                fragment(f0, 0),
+                fragment(f1, 1),
+            ]
+        };
+        let read = |i: u64| {
+            let c = icb.render_command(i).unwrap().unwrap();
+            let read = [
+                c.vertex_buffer_address(0),
+                c.vertex_buffer_address(1),
+                c.fragment_buffer_address(0),
+                c.fragment_buffer_address(1),
+            ];
+            read.map(Result::unwrap)
+        };
+        let rounds: Vec<AtomicU64> = (0..SENDERS).map(|_| AtomicU64::new(0)).collect();
+        let recovered = AtomicBool::new(false);
+        let last = std::thread::scope(|s| {
+            let senders: Vec<_> = (0..SENDERS)
+                .map(|sender| {
+                    let (rounds, recovered) = (&rounds[sender as usize], &recovered);
+                    s.spawn(move || {
+                        let commands = sender * EACH..(sender + 1) * EACH;
+                        let mut round = 0;
+                        loop {
+                            for i in commands.clone() {
+                                let cmds = sets(round, i).into_iter();
+                                assert!(icb.encode_render_command(i, cmds).unwrap());
+                            }
+                            for i in commands.clone() {
+                                assert_eq!(read(i), at(round, i), "command {i} in round {round}");
+                            }
+                            rounds.store(round + 1, Ordering::Release);
+                            if recovered.load(Ordering::Acquire) {
+                                return (commands, round);
+                            }
+                            round += 1;
+                        }
+                    })
+                })
+                .collect();
+            for n in 0..RECOVERIES {
+                let behind = || rounds.iter().any(|r| r.load(Ordering::Acquire) <= n);
+                while behind() && !senders.iter().any(|s| s.is_finished()) {
+                    std::thread::yield_now();
+                }
+                d.raw.recover_for_test().expect("the recovery");
+            }
+            recovered.store(true, Ordering::Release);
+            senders
+                .into_iter()
+                .map(|s| s.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for (commands, round) in last {
+            for i in commands {
+                assert_eq!(
+                    read(i),
+                    at(round, i),
+                    "command {i}, sent last in round {round}"
+                );
+            }
+        }
+    }
+
     /// An execution range past the buffer's size, which Metal runs without validation, dies at
     /// its selector, naming the runtime's refusal
     #[test]
