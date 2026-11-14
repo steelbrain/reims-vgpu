@@ -78,7 +78,10 @@ struct RgfxAirCode {
 		uint64_t attributes = 0, section = 0;
 		uint8_t builtin = 0;
 	};
-	enum Builtin : uint8_t { kNoBuiltin, kIsDefined, kNormalize };
+	// kConvertS, kConvertU: Metal's conversion between a float and a signed or an unsigned integer
+	// (air.convert.s.*.f.*, air.convert.f.*.s.*; the same with u); kConvertF: from a float to a
+	// float (air.convert.f.*.f.*).
+	enum Builtin : uint8_t { kNoBuiltin, kIsDefined, kNormalize, kConvertS, kConvertU, kConvertF };
 	// A call's attributes: whether it may write memory, unwind or not return.
 	struct Attributes {
 		bool noWrite = false, noUnwind = false, willReturn = false;
@@ -1399,18 +1402,24 @@ bool indirectWritesTextures(const Module &m, const Module::Md &node)
 	return true;
 }
 
+// The function tables and acceleration structures, bound among the buffers: each takes a location
+// of the buffers' table (measured: oracle Q33's probe of them, the 5300M, the 630 and the M3).
+bool bindsAmongBuffers(const std::string &kind)
+{
+	return kind == "air.visible_function_table" || kind == "air.intersection_function_table" ||
+	       kind == "air.instance_acceleration_structure" ||
+	       kind == "air.primitive_acceleration_structure";
+}
+
 // The binding kinds besides buffers, argument buffers, textures and samplers that our Metal
 // compiler gives an `air.location_index`, none of them a texture: a vertex function's and a
 // kernel's stage input attribute and a post-tessellation vertex function's patch input (an
 // attribute of the stage input descriptor, fetched from buffers), and the function tables and
-// acceleration structures, bound among the buffers.
+// acceleration structures (bindsAmongBuffers).
 bool bindsNoTexture(const std::string &kind)
 {
 	return kind == "air.vertex_input" || kind == "air.stage_in" || kind == "air.patch_input" ||
-	       kind == "air.visible_function_table" ||
-	       kind == "air.intersection_function_table" ||
-	       kind == "air.instance_acceleration_structure" ||
-	       kind == "air.primitive_acceleration_structure";
+	       bindsAmongBuffers(kind);
 }
 
 // Whether an argument node names a binding (`air.location_index`).
@@ -1494,8 +1503,23 @@ bool entryPoint(const Module &m, uint64_t id, RgfxAirStage stage, RgfxAirFunctio
 			a.kind = RgfxAirKind::Texture;
 		else if (*kind == "air.sampler")
 			a.kind = RgfxAirKind::Sampler;
-		else if (bindsNoTexture(*kind))
+		else if (bindsNoTexture(*kind)) {
+			// No argument the bindings list, but a function table's or an acceleration
+			// structure's location may overlap another of the buffers' table.
+			RgfxAirArgument t = {};
+			if (bindsAmongBuffers(*kind)) {
+				if (!binding(m, *arg, kindAt + 1, t) || t.anyIndex || t.anyCount) {
+					out.locationsMayOverlap = true;
+				} else {
+					const uint64_t from = t.index, to = static_cast<uint64_t>(t.index) + t.count;
+					for (const Location &l : locations)
+						if (l.table == 0 && l.from < to && from < l.to)
+							out.locationsMayOverlap = true;
+					locations.push_back({0, from, to});
+				}
+			}
 			continue;
+		}
 		else if (hasBinding(m, *arg))
 			return false; // a binding of a kind the reader does not know: it may be a texture
 		else
@@ -2185,12 +2209,29 @@ Val integer(uint32_t width, uint64_t bits)
 	return scalar(s);
 }
 
+// `f` rounded to the nearest half (IEEE binary16, ties to even), as LLVM folds a half: 11
+// significant bits, 2^-24 apart below 2^-14, and infinite from 65520 up.
+double roundedToHalf(double f)
+{
+	if (std::isnan(f) || std::isinf(f))
+		return f;
+	const double a = std::fabs(f);
+	if (a >= 65520.0)
+		return std::copysign(INFINITY, f);
+	if (a == 0.0)
+		return f;
+	int e = 0;
+	std::frexp(a, &e); // a = m * 2^e, m in [0.5, 1)
+	const double step = e - 1 < -14 ? std::ldexp(1.0, -24) : std::ldexp(1.0, e - 1 - 10);
+	return std::copysign(std::nearbyint(a / step) * step, f);
+}
+
 Val real(uint32_t width, double f)
 {
 	Code::Scalar s;
 	s.isFloat = true;
 	s.width = width;
-	s.f = width == 32 ? static_cast<double>(static_cast<float>(f)) : f;
+	s.f = width == 32 ? static_cast<double>(static_cast<float>(f)) : width == 16 ? roundedToHalf(f) : f;
 	return scalar(s);
 }
 
@@ -2300,6 +2341,31 @@ Val castOp(uint32_t op, const Code::Scalar &a, const Code::Type *to)
 	}
 }
 
+// A call of Metal's conversion `builtin` (RgfxAirCode::Builtin) of `a` to type `to`: a float to
+// an integer toward zero where that is in the integer's range (as LLVM's fptoui and fptosi, and
+// measured: oracle Q33's k_halfidx and k_sidx, -1.5 to -1), else any value; an integer of 32 bits
+// at most to a float, and a float to a float, to the nearest.
+Val convertOp(uint8_t builtin, const Code::Scalar &a, const Code::Type &to)
+{
+	const uint32_t fw = floatWidth(to.kind);
+	if (builtin == Code::kConvertF)
+		return fw != 0 && a.isFloat ? real(fw, a.f) : over();
+	const bool sign = builtin == Code::kConvertS;
+	if (!a.isFloat) {
+		if (fw == 0 || a.width > 32)
+			return over();
+		return real(fw, sign ? static_cast<double>(signedOf(a)) : static_cast<double>(a.bits));
+	}
+	if (to.kind != Code::Kind::Int || to.width == 0 || to.width > 64 || !std::isfinite(a.f))
+		return over();
+	const double t = std::trunc(a.f);
+	const double lo = sign ? -std::ldexp(1.0, static_cast<int>(to.width) - 1) : 0.0;
+	const double hi = std::ldexp(1.0, static_cast<int>(to.width) - (sign ? 1 : 0));
+	if (t < lo || t >= hi)
+		return over();
+	return integer(to.width, sign ? static_cast<uint64_t>(static_cast<int64_t>(t)) : static_cast<uint64_t>(t));
+}
+
 // LLVM's comparison predicates: FCMP_* 0 to 15, ICMP_* 32 to 41.
 Val cmpOp(uint32_t pred, const Code::Scalar &a, const Code::Scalar &b)
 {
@@ -2341,8 +2407,11 @@ std::atomic<uint64_t> gInitialisersRun{0}, gBodiesFollowed{0};
 // `values`, or (`blind`) by none known, each constant any value, defined or not.
 class Specialiser {
 public:
-	Specialiser(const Code &code, const RgfxFunctionConstant *values, uint32_t count, bool blind)
-	    : c_(code), values_(values), count_(count), blind_(blind)
+	// `locations`: a half constant's value and Metal's conversions (convertOp) are folded too,
+	// which only the argument locations' check asks for (rgfxAirConstantGlobals).
+	Specialiser(const Code &code, const RgfxFunctionConstant *values, uint32_t count, bool blind,
+	            bool locations = false)
+	    : c_(code), values_(values), count_(count), blind_(blind), locations_(locations)
 	{
 	}
 
@@ -2517,6 +2586,13 @@ private:
 				const uint32_t b = static_cast<uint32_t>(raw);
 				std::memcpy(&f, &b, sizeof(f));
 				s.f = f;
+			} else if (locations_) {
+				// IEEE half: a sign, 5 bits of exponent, 10 of fraction.
+				const uint32_t h = static_cast<uint32_t>(raw & 0xFFFF), e = (h >> 10) & 31, m = h & 1023;
+				const double sign = (h & 0x8000) != 0 ? -1.0 : 1.0;
+				s.f = e == 31   ? (m != 0 ? NAN : sign * INFINITY)
+				      : e == 0 ? sign * std::ldexp(static_cast<double>(m), -24)
+				               : sign * std::ldexp(static_cast<double>(m | 1024), static_cast<int>(e) - 25);
 			} else {
 				return over(); // a half constant: not folded
 			}
@@ -2598,10 +2674,19 @@ private:
 		case Code::Op::Load:
 			return in.keeps ? over() : load(body, in.ops[0], in.type);
 		case Code::Op::Call: {
-			if (in.ops[0] >= c_.globals.size() || in.type >= c_.types.size() ||
-			    c_.types[in.type].kind != Code::Kind::Int)
+			if (in.ops[0] >= c_.globals.size() || in.type >= c_.types.size())
 				return over();
 			const uint8_t builtin = c_.globals[in.ops[0]].builtin;
+			if (builtin == Code::kConvertS || builtin == Code::kConvertU || builtin == Code::kConvertF) {
+				if (!locations_ || in.ops.size() != 2)
+					return over();
+				const Val a = operand(1);
+				if (a.kind != Val::Const)
+					return a.kind == Val::Top ? Val{} : over();
+				return convertOp(builtin, a.s, c_.types[in.type]);
+			}
+			if (c_.types[in.type].kind != Code::Kind::Int)
+				return over();
 			const uint32_t width = c_.types[in.type].width;
 			if (builtin == Code::kIsDefined && in.ops.size() == 2) {
 				uint64_t g = 0;
@@ -2824,6 +2909,7 @@ private:
 	const RgfxFunctionConstant *values_;
 	uint32_t count_;
 	bool blind_;
+	bool locations_;
 	std::map<uint64_t, Val> memory_;
 	std::map<uint32_t, Val> results_;
 	std::set<uint32_t> resultSet_;
@@ -2831,6 +2917,37 @@ private:
 	std::set<std::pair<uint32_t, uint32_t>> edges_;
 	std::vector<bool> reachable_;
 };
+
+// The conversion (RgfxAirCode::Builtin) a function of name `name` is, of Metal's scalar
+// conversions air.convert.TO.TYPE.FROM.TYPE (read: the compiler's modules, air.convert.u.i32.f.f16
+// and air.convert.f.f32.s.i32, a conversion each of a constant's initialiser and a function's
+// body): TO and FROM each f, s or u, TYPE f or i and its bits (f16, i32), the f's with a float's.
+// None (kNoBuiltin) for one of two integers, of vectors or of any other name.
+uint8_t conversionOf(const std::string &name)
+{
+	static const std::string kPrefix = "air.convert.";
+	if (name.compare(0, kPrefix.size(), kPrefix) != 0)
+		return RgfxAirCode::kNoBuiltin;
+	std::vector<std::string> parts;
+	size_t from = kPrefix.size();
+	for (size_t dot; (dot = name.find('.', from)) != std::string::npos; from = dot + 1)
+		parts.push_back(name.substr(from, dot - from));
+	parts.push_back(name.substr(from));
+	auto scalarType = [](const std::string &kind, const std::string &type) {
+		if (kind.size() != 1 || type.size() < 2 || type.size() > 3 ||
+		    type.find_first_not_of("0123456789", 1) != std::string::npos)
+			return false;
+		return kind == "f" ? type[0] == 'f' : (kind == "s" || kind == "u") && type[0] == 'i';
+	};
+	if (parts.size() != 4 || !scalarType(parts[0], parts[1]) || !scalarType(parts[2], parts[3]))
+		return RgfxAirCode::kNoBuiltin;
+	const std::string &to = parts[0], &of = parts[2];
+	if (to == "f" && of == "f")
+		return RgfxAirCode::kConvertF;
+	if (to != "f" && of != "f")
+		return RgfxAirCode::kNoBuiltin;
+	return (to == "f" ? of : to) == "s" ? RgfxAirCode::kConvertS : RgfxAirCode::kConvertU;
+}
 
 // The module's code once read (Module::code), where it is one rgfxAirSpecialise can follow: its
 // function constants' globals and the intrinsics it calls found, and every initialiser's body
@@ -2867,6 +2984,8 @@ std::shared_ptr<const RgfxAirCode> finishCode(const Module &m)
 			g.builtin = RgfxAirCode::kIsDefined;
 		else if (name.compare(0, 41, "air.normalize_function_constant_predicate") == 0)
 			g.builtin = RgfxAirCode::kNormalize;
+		else
+			g.builtin = conversionOf(name);
 		const bool init = g.section >= 1 && g.section <= c.sections.size() && c.sections[g.section - 1] == "air.static_init";
 		if (init && (g.proto || bodies.count(static_cast<uint32_t>(v)) == 0))
 			return nullptr; // an initialiser of no body read: what it stores is unknown
@@ -3107,7 +3226,7 @@ bool rgfxAirConstantGlobals(const RgfxAirEntries &module, const RgfxFunctionCons
 	out.clear();
 	if (module.code == nullptr)
 		return false;
-	Specialiser s(*module.code, values, count, false);
+	Specialiser s(*module.code, values, count, false, true);
 	s.initialise();
 	constantGlobalsOf(s, out);
 	return true;

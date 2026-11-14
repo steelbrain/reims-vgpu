@@ -1757,14 +1757,22 @@ size answers its threads as its maximum, and the arm64 guest's pipelines answer
 ## Q33: function constants that put two arguments at one location
 
 Probe: `oracle_overlap DEVICE`, 11-13 (m3-max-25546 on the AMD, 25547 on the Intel, 25548 on the
-M3). It covers 14 functions of `oracle_overlap.metal`: kernels, a vertex function and a fragment
-function. Each has arguments of one argument table that may take overlapping locations, each
-present under function constants. Every value of the two bools that gate them was tried, by
+M3), then 11-14 with eight more functions (k_halfpred, k_halfidx, k_fidx, k_sidx, k_vft, k_ift,
+k_pas and k_ias; m3-max-28663 on the AMD, 28662 on the Intel, 28659 on the M3). It covers 22
+functions of `oracle_overlap.metal`: kernels, a vertex function and a fragment function. Each
+has arguments of one argument table that may take overlapping locations, each present under
+function constants. Every value of the two bools that gate them was tried, by
 every way of making a specialised function: values set by index, by name and by range, a copy
 of the values, a descriptor, a copy of it, a descriptor that names a `specializedName`, and each
 completion-handler form.
 
-The three GPUs give the same answers, line for line:
+The three GPUs make and refuse the same functions, line for line, with the same errors. One
+pipeline differs: the 630 refuses the compute pipeline of k_vft wherever its visible function
+table is present and called (useB), with `CompilerError` 1, "Compilation failed due to an
+interrupted connection: XPC_ERROR_CONNECTION_INTERRUPTED. This error occurred after multiple
+retries.", at every way and in each of its 11-14 runs, though it answers
+`supportsFunctionPointers` true; the 5300M and the M3 make it. That is a pipeline's answer, not
+the overlap's, and making it stays inside what the two x86 Macs answer. The answers:
 
 - Where the values put two present arguments of one table at overlapping locations, Metal
   refuses the function where it makes it. It answers nil with MTLLibraryErrorDomain 3
@@ -1775,10 +1783,16 @@ The three GPUs give the same answers, line for line:
   entry point's name, not the specialized name.
 - The word is `buffer` for buffers, constant buffers, argument buffers and threadgroup memory,
   `texture` for textures and arrays of them, and `sampler` for samplers.
+- Function tables (visible and intersection) and acceleration structures (primitive and
+  instance) take locations of the buffers' table, and their word is `buffer` too.
 - Threadgroup memory's table is not the buffers' table.
 - An argument counts as present wherever its predicate is true. It counts whether the function
   uses it or not, and whether its code is dead under the values or not.
-- An index set by a function constant (`[[buffer(kIdx)]]`) counts like a literal one.
+- An index set by a function constant (`[[buffer(kIdx)]]`) counts like a literal one, and so
+  do a predicate and an index computed from a half constant (`kH > 1.0h`, `uint(kH * 0.5h)`)
+  and an index through conversions to a float and back, truncated toward zero
+  (`uint(float(kIdx + 1u) * 0.75f)`, `uint(int(float(kW) * -0.5f) + 2 - int(kIdx))`, where -1.5
+  gives -1).
 - With no overlap, the function and its pipeline are made.
 
 Where this showed: the guest's pipelines tool (`mps.fn`) gives
@@ -1791,10 +1805,25 @@ from the function's AIR, under the module's initialisers run with the values
 (`rgfxAirConstantGlobals`). It does not follow the entry point's body, which costs many times the
 initialisers at every make of the function. It refuses as above in
 `newFunctionWithName:constantValues:error:`, which every other way reaches, with no call to the
-host (`RgfxOverlappingArgumentError`). Where the AIR does not tell, the host's compile refuses the
-pipeline, as before. That covers a predicate, index or count that the code does not compute from
-the values, and a function table or an acceleration structure among the arguments, whose words
-were not measured.
+host (`RgfxOverlappingArgumentError`). For this check, the initialisers' evaluator also folds a
+half constant's value, each half result rounded to the nearest half as LLVM folds one, and the
+compiler's scalar conversions between floats and integers, the calls `air.convert.u.i32.f.f16`
+and the like that its initialisers make (read: the probe's module). Where the AIR does not tell,
+the host's compile refuses the pipeline, as before (read from code):
+
+- a predicate, index or count whose initialiser takes an operation the evaluator does not fold:
+  it folds integer and float arithmetic, comparisons, casts, `air.convert` of scalars, selects,
+  branches and `is_function_constant_defined`, not a vector constant's elements, an array's
+  elements, a conversion of two integers or of vectors, or other calls;
+- an `air.buffer` with no `air.address_space`, whose table (buffers or threadgroup memory) is not
+  known: none of the 22 functions of the 11-14 probe, built with Xcode 27.2 for Metal 3.0, writes
+  one;
+- a function of a library Metal's link made (`newLibraryWithDAG:functions:error:`), which the
+  bundle makes over the linked library's bytes but keeps no source for, so no AIR is read.
+
+A stitched library holds stitched visible functions, which have no argument locations, and a
+library of a function array answers the function given whatever the values (oracle_bundle
+libforms2 and libforms3), as Metal's does: neither has a function to refuse here.
 
 ## Q34: what an Apple GPU answers where the x86 Macs' rules differ, and the arm64 guest
 

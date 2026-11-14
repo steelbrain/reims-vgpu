@@ -3,8 +3,9 @@
 // which call and with which error. Shaders: oracle_overlap.metallib (oracle_overlap.metal), next
 // to the probe.
 //   oracle_overlap DEVICE
-// For each function, each of useA and useB false and true (and, for k_idx, kIdx 0 and 1; kW 3),
-// each way of making the specialised function:
+// For each function, each of useA and useB false and true (and, for k_idx, k_halfpred, k_halfidx,
+// k_fidx and k_sidx, kIdx 0 and 1 with kH 2 and 0.5; else kIdx 0 and kH 2; kW 3), each way of
+// making the specialised function:
 //   values      newFunctionWithName:constantValues:error:, the values set by index
 //   names       the same, set by name
 //   range       the same, useA and useB set by setConstantValues:type:withRange:
@@ -51,11 +52,13 @@ static MTLFunctionConstantValues *values(bool a, bool b, uint32_t idx, int how)
 {
 	MTLFunctionConstantValues *v = [MTLFunctionConstantValues new];
 	short w = 3;
+	__fp16 h = idx != 0 ? 0.5 : 2.0;
 	if (how == 1) {
 		[v setConstantValue:&a type:MTLDataTypeBool withName:@"useA"];
 		[v setConstantValue:&b type:MTLDataTypeBool withName:@"useB"];
 		[v setConstantValue:&w type:MTLDataTypeShort withName:@"kW"];
 		[v setConstantValue:&idx type:MTLDataTypeUInt withName:@"kIdx"];
+		[v setConstantValue:&h type:MTLDataTypeHalf withName:@"kH"];
 		return v;
 	}
 	if (how == 2) {
@@ -67,6 +70,7 @@ static MTLFunctionConstantValues *values(bool a, bool b, uint32_t idx, int how)
 	}
 	[v setConstantValue:&w type:MTLDataTypeShort atIndex:2];
 	[v setConstantValue:&idx type:MTLDataTypeUInt atIndex:3];
+	[v setConstantValue:&h type:MTLDataTypeHalf atIndex:4];
 	return v;
 }
 
@@ -84,11 +88,16 @@ int main(int argc, char **argv)
 			return 1;
 		NSArray *functions = @[
 			@"k_overlap", @"k_tex", @"k_texarr", @"k_smp", @"k_tg", @"k_derived", @"k_idx", @"k_bufconst",
-			@"k_unused", @"k_dead", @"k_argbuf", @"k_three", @"v_overlap", @"f_overlap"
+			@"k_unused", @"k_dead", @"k_argbuf", @"k_three", @"v_overlap", @"f_overlap", @"k_halfpred",
+			@"k_halfidx", @"k_fidx", @"k_sidx", @"k_vft", @"k_ift", @"k_pas", @"k_ias"
 		];
 		const bool cases[4][2] = {{false, false}, {true, false}, {false, true}, {true, true}};
 		for (NSString *name in functions) {
-			const int idxCount = [name isEqual:@"k_idx"] ? 2 : 1;
+			const int idxCount = [name isEqual:@"k_idx"] || [name isEqual:@"k_halfpred"] ||
+			                             [name isEqual:@"k_halfidx"] || [name isEqual:@"k_fidx"] ||
+			                             [name isEqual:@"k_sidx"]
+			                         ? 2
+			                         : 1;
 			for (int c = 0; c < 4; c++) {
 				for (uint32_t idx = 0; idx < (uint32_t)idxCount; idx++) {
 					const bool a = cases[c][0], b = cases[c][1];

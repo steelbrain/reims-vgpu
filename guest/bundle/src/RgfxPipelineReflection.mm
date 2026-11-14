@@ -1257,7 +1257,12 @@ NSError *RgfxOverlappingArgumentError(const RgfxAirEntries &module, const RgfxAi
 			return -1;
 		if (n.kind == "air.buffer")
 			return !n.hasAddressSpace ? -2 : n.addressSpace == 3 ? 1 : 0;
-		if (n.kind == "air.indirect_buffer" || n.kind == "air.constant")
+		// Function tables and acceleration structures take locations of the buffers' table, and
+		// Metal's word for them is `buffer` (measured: oracle Q33's probe of them).
+		if (n.kind == "air.indirect_buffer" || n.kind == "air.constant" ||
+		    n.kind == "air.visible_function_table" || n.kind == "air.intersection_function_table" ||
+		    n.kind == "air.primitive_acceleration_structure" ||
+		    n.kind == "air.instance_acceleration_structure")
 			return 0;
 		if (n.kind == "air.texture")
 			return 2;

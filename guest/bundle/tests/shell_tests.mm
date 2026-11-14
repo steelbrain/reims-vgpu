@@ -8364,11 +8364,13 @@ void test_overlapping_arguments_refused_as_metal()
 	auto values = [](bool a, bool b, uint32_t idx, int how) {
 		MTLFunctionConstantValues *v = [MTLFunctionConstantValues new];
 		short w = 3;
+		__fp16 h = idx != 0 ? 0.5 : 2.0;
 		if (how == 1) {
 			[v setConstantValue:&a type:MTLDataTypeBool withName:@"useA"];
 			[v setConstantValue:&b type:MTLDataTypeBool withName:@"useB"];
 			[v setConstantValue:&w type:MTLDataTypeShort withName:@"kW"];
 			[v setConstantValue:&idx type:MTLDataTypeUInt withName:@"kIdx"];
+			[v setConstantValue:&h type:MTLDataTypeHalf withName:@"kH"];
 			return v;
 		}
 		if (how == 2) {
@@ -8380,6 +8382,7 @@ void test_overlapping_arguments_refused_as_metal()
 		}
 		[v setConstantValue:&w type:MTLDataTypeShort atIndex:2];
 		[v setConstantValue:&idx type:MTLDataTypeUInt atIndex:3];
+		[v setConstantValue:&h type:MTLDataTypeHalf atIndex:4];
 		return v;
 	};
 	// The function `name` of `lib`, by way `way`, and the error with it.
@@ -8433,13 +8436,16 @@ void test_overlapping_arguments_refused_as_metal()
 	                                    "desc-copy", "specialized", "async", "async-desc"};
 	NSArray *functions = @[
 		@"k_overlap", @"k_tex", @"k_texarr", @"k_smp", @"k_tg", @"k_derived", @"k_idx", @"k_bufconst",
-		@"k_unused", @"k_dead", @"k_argbuf", @"k_three", @"v_overlap", @"f_overlap"
+		@"k_unused", @"k_dead", @"k_argbuf", @"k_three", @"v_overlap", @"f_overlap", @"k_halfpred",
+		@"k_halfidx", @"k_fidx", @"k_sidx", @"k_vft", @"k_ift", @"k_pas", @"k_ias"
 	];
 	const bool cases[4][2] = {{false, false}, {true, false}, {false, true}, {true, true}};
 	int refused = 0;
 	for (NSString *name in functions) {
+		const bool twoIdx = [name isEqual:@"k_idx"] || [name isEqual:@"k_halfpred"] ||
+		                    [name isEqual:@"k_halfidx"] || [name isEqual:@"k_fidx"] || [name isEqual:@"k_sidx"];
 		for (int c = 0; c < 4; c++) {
-			for (uint32_t idx = 0; idx < ([name isEqual:@"k_idx"] ? 2u : 1u); idx++) {
+			for (uint32_t idx = 0; idx < (twoIdx ? 2u : 1u); idx++) {
 				for (int way = 0; way < 9; way++) {
 					const bool a = cases[c][0], b = cases[c][1];
 					NSError *ourError = nil, *theirError = nil;
@@ -8475,6 +8481,27 @@ void test_overlapping_arguments_refused_as_metal()
 	                                      @"error: buffer argument d has invalid location (<1,1>) in k_three\n"]);
 	CHECK(make(ours, @"k_derived", true, true, 0, 0, &e) != nil && e == nil);
 	CHECK(make(ours, @"k_idx", false, false, 1, 0, &e) != nil && e == nil);
+	// The words of the 5300M and the 630 too: a half constant's predicate and index, and function
+	// tables and acceleration structures, in the buffers' table.
+	CHECK(make(ours, @"k_halfpred", true, false, 0, 0, &e) == nil &&
+	      [e.localizedDescription isEqual:@"error: buffer argument b has invalid location (<0,1>) in k_halfpred\n"]);
+	CHECK(make(ours, @"k_halfpred", true, true, 1, 0, &e) != nil && e == nil);
+	CHECK(make(ours, @"k_halfidx", true, false, 1, 0, &e) == nil &&
+	      [e.localizedDescription isEqual:@"error: buffer argument b has invalid location (<0,1>) in k_halfidx\n"]);
+	CHECK(make(ours, @"k_halfidx", true, false, 0, 0, &e) != nil && e == nil);
+	// Indices through Metal's conversions (air.convert), truncated toward zero.
+	CHECK(make(ours, @"k_fidx", true, false, 0, 0, &e) == nil &&
+	      [e.localizedDescription isEqual:@"error: buffer argument b has invalid location (<0,1>) in k_fidx\n"]);
+	CHECK(make(ours, @"k_fidx", true, false, 1, 0, &e) != nil && e == nil);
+	CHECK(make(ours, @"k_sidx", true, false, 1, 0, &e) == nil &&
+	      [e.localizedDescription isEqual:@"error: buffer argument b has invalid location (<0,1>) in k_sidx\n"]);
+	CHECK(make(ours, @"k_sidx", true, false, 0, 0, &e) != nil && e == nil);
+	for (NSString *name in @[ @"k_vft", @"k_ift", @"k_pas", @"k_ias" ]) {
+		NSString *arg = [name isEqual:@"k_vft"] || [name isEqual:@"k_ift"] ? @"t" : @"s";
+		NSString *line = [NSString
+		    stringWithFormat:@"error: buffer argument %@ has invalid location (<0,1>) in %@\n", arg, name];
+		CHECK(make(ours, name, true, true, 0, 0, &e) == nil && [e.localizedDescription isEqual:line]);
+	}
 	CHECK(refused > 0);
 }
 
