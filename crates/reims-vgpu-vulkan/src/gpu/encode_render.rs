@@ -6074,7 +6074,13 @@ pub(crate) mod tests {
             resource_options: Some(heap.resource_options() & !BIT_24),
             ..TextureDesc::default()
         });
-        let depth = heap.new_texture(&desc, 0).unwrap().unwrap();
+        // Its image is a shadow of the heap's bytes on Linux, which a device without
+        // `VK_EXT_depth_range_unrestricted` (ANV) copies in clamped: the runtime announces
+        // `restricted-depth-upload` as it makes it, which dies in strict mode, so it is made under
+        // the default too.
+        let depth = crate::answer::relaxed(|| heap.new_texture(&desc, 0))
+            .unwrap()
+            .unwrap();
         let pass = p.render_pass_descriptor();
         pass.set_depth_attachment(&DepthAttachmentSet {
             texture: Some(Some(&depth)),
