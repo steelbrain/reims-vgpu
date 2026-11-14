@@ -1,29 +1,17 @@
 # How cargo-nextest schedules the workspace's tests, `cargo xtask check`'s among them.
 #
-# A Mac's GPU is shared by every process on it. The test that faults it on purpose and the one
-# that holds the most of its memory run first, each with nothing else in flight; the longest
-# tests start next, so the run does not end on one that began late. Why, and what these tests
-# did to the others before, is in docs/lessons.md ("Tools and worktrees", and "The platform and
-# the runtime" for Metal's compiles). Every override but the last three is the Mac's alone; on
+# A Mac's GPU is shared by every process on it. The test that holds the most of its memory runs
+# first, with nothing else in flight; the longest tests start next, so the run does not end on one
+# that began late. Why, and what such tests did to the others before, is in docs/lessons.md
+# ("Tools and worktrees", and "The platform and the runtime" for Metal's compiles). Every override but the last three is the Mac's alone; on
 # Linux only the last three apply, and nextest runs the other tests in its own order. A filter that
 # names a package or binary the workspace no longer has fails every nextest run, so a rename
 # updates this file too.
 
-# Writes that fault a Mac's GPU on purpose: opt-in (`#[ignore]`), run only for a change to what
-# they test, with `--run-ignored only`. Each fault is a GPU recovery (84 GPU events in its
-# 1.8 s, measured on the M3 Max, macOS 27.0.1), and every command buffer of another process in
-# flight then fails as its victim ("Discarded (victim of GPU error/recovery)"): the YCbCr
-# sweeps, the extended-range blends (Metal's side then reads zeros), the textures made while a
-# kernel runs.
-[[profile.default.overrides]]
-platform = 'cfg(target_os = "macos")'
-filter = 'binary_id(reims-vgpu-vulkan::client_direction) & test(=metal_drops_small_blits_into_the_texture)'
-threads-required = "num-test-threads"
-priority = 100
-
-# A reservation of 2^31 - 1 resource IDs, opt-in (`#[ignore]`) like the one above: 16 GiB of
-# memory for about a second, six times any other test's peak, where others' command buffers fail with "Insufficient Memory" when the
-# GPU's memory runs out.
+# A reservation of 2^31 - 1 resource IDs, opt-in (`#[ignore]`), run only for a change to what it
+# tests, with `--run-ignored only`: 16 GiB of memory for about a second, six times any other
+# test's peak, where others' command buffers fail with "Insufficient Memory" when the GPU's memory
+# runs out.
 [[profile.default.overrides]]
 platform = 'cfg(target_os = "macos")'
 filter = 'binary_id(reims-vgpu-vulkan) & test(=gpu::icb::tests::metal_tests::a_reservation_of_2_31_minus_1_is_metals)'
