@@ -77,6 +77,7 @@ pub(crate) fn decode_op<P: Platform>(
             let m: RgfxBlitOpCopyBufferToTexture = body(tag, payload)?;
             let source = objs.require_buffer(m.source_buffer_obj_id)?;
             let destination = objs.require_texture(m.destination_texture_obj_id)?;
+            objs.texture_written(m.destination_texture_obj_id);
             enc.encode(
                 on,
                 BlitCmd::CopyBufferToTexture {
@@ -104,6 +105,7 @@ pub(crate) fn decode_op<P: Platform>(
             let m: RgfxBlitOpCopyBufferToTextureOptions = body(tag, payload)?;
             let source = objs.get_buffer(m.source_buffer_obj_id)?;
             let destination = objs.get_texture(m.destination_texture_obj_id)?;
+            objs.texture_written(m.destination_texture_obj_id);
             enc.encode(
                 on,
                 BlitCmd::CopyBufferToTextureOptions {
@@ -187,6 +189,7 @@ pub(crate) fn decode_op<P: Platform>(
             let m: RgfxBlitOpCopyTextureRegion = body(tag, payload)?;
             let source = objs.require_texture(m.source_texture_obj_id)?;
             let destination = objs.require_texture(m.destination_texture_obj_id)?;
+            objs.texture_written(m.destination_texture_obj_id);
             enc.encode(
                 on,
                 BlitCmd::CopyTextureRegion {
@@ -218,6 +221,7 @@ pub(crate) fn decode_op<P: Platform>(
             let m: RgfxBlitOpCopyTextureRegionOptions = body(tag, payload)?;
             let source = objs.require_texture(m.source_texture_obj_id)?;
             let destination = objs.require_texture(m.destination_texture_obj_id)?;
+            objs.texture_written(m.destination_texture_obj_id);
             enc.encode(
                 on,
                 BlitCmd::CopyTextureRegionOptions {
@@ -250,6 +254,7 @@ pub(crate) fn decode_op<P: Platform>(
             let m: RgfxBlitOpCopyTextureSlices = body(tag, payload)?;
             let source = objs.require_texture(m.source_texture_obj_id)?;
             let destination = objs.require_texture(m.destination_texture_obj_id)?;
+            objs.texture_written(m.destination_texture_obj_id);
             enc.encode(
                 on,
                 BlitCmd::CopyTextureSlices {
@@ -310,6 +315,7 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_BLIT_FILL_TEXTURE => {
             let m: RgfxBlitOpFillTexture = body(tag, payload)?;
             let texture = objs.require_texture(m.texture_obj_id)?;
+            objs.texture_written(m.texture_obj_id);
             // The `length` fill bytes follow the fixed head in the op body; a body
             // too short for them faults the exec.
             let start = RGFX_OP_BLIT_FILL_TEXTURE_BYTES_OFFSET as usize;
@@ -338,6 +344,7 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_BLIT_FILL_TEXTURE_COLOR => {
             let m: RgfxBlitOpFillTextureColor = body(tag, payload)?;
             let texture = objs.require_texture(m.texture_obj_id)?;
+            objs.texture_written(m.texture_obj_id);
             enc.encode(
                 on,
                 BlitCmd::FillTextureColor {
@@ -360,6 +367,7 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_BLIT_GENERATE_MIPMAPS => {
             let m: RgfxBlitOpGenerateMipmaps = body(tag, payload)?;
             let texture = objs.get_texture(m.texture_obj_id)?;
+            objs.texture_written(m.texture_obj_id);
             enc.encode(on, BlitCmd::GenerateMipmaps { texture })?;
         }
         RGFX_OP_BLIT_INVALIDATE_COMPRESSED_TEXTURE => {

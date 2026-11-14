@@ -134,9 +134,34 @@
 //!   copied cache's staging, a copy for each row, or for rows that follow on at both ends. The
 //!   bytes between the pages' rows and outside the planes stay the guest's CPU's alone, as above.
 //!   A host video op writes its picture at the cache's place of its texture, and a decode that
-//!   writes both planes whole names the surface's (`video::PlanePlace`). A texture whose first
-//!   byte lies in no plane of such a cache, or whose texels pass its plane, is made all the same
-//!   and logged (`decode::laid_plane`, which says which of them the bundle makes).
+//!   writes both planes whole names the surface's (`video::PlanePlace`). A texture that does not
+//!   lie in its plane's texels in such a cache lies over the block's wide home (below).
+//! - **Wider than the plane.** A texture over a surface whose cache is laid out at the GPU's pitch
+//!   whose first byte lies in no plane's texels there, or whose texels pass its plane's (wider
+//!   than the plane's row, which may be wider than the cache's pitch, or taller than its rows:
+//!   all three Macs make an RG8 texture of 128-byte rows over an L008 surface 64 wide in rows of
+//!   128, and one 128 texels wide over a BGRA surface 64 wide in rows of 512,
+//!   docs/graphics-kext/dgpu-oracle.md Q20), lies at the surface's own place and pitch over the
+//!   block's wide home ([`WideHome`], `decode::laid_plane`): in place over the block's view of
+//!   its pages, the cache's own, or one made then for a cache that copies by the pages' runs,
+//!   which copies through it from then on (the runtime's image over the pages where the device
+//!   takes that pitch, its shadow where not); and where the block has no view (a deferred block
+//!   whose pages are not named, pages copied, or a view the platform did not make), a Private
+//!   stand-in of the surface's bytes, made as zeros, logged. Its texels and the cache's are two
+//!   copies of the same texels, kept one by the copy of what each encoder writes: at the end of
+//!   each encoder of a command buffer that may write the surface through textures over one side,
+//!   its texel rows are copied into the other side in the same command buffer, before the next
+//!   encoder ([`SurfaceCaches::reconcile`]), as each Mac's next encoder of a command buffer reads
+//!   a write through another texture over the same plane, tracked or untracked behind a fence
+//!   (Q37). An encoder that writes through both keeps the home's writes in the texels both
+//!   hold, logged. What no walk sees written (a texture reached through an argument buffer with no
+//!   use named, a video op's picture) and what a fill brings into a stand-in's cache leaves the
+//!   home to take the cache's texel rows first in the next command buffer that uses the block
+//!   ([`SurfaceCaches::home_in`]), as does a home made over a cache that holds a write its
+//!   pages lack. The bytes beside the texels are the home's alone: over the pages, the surface's
+//!   own, the CPU's writes read and the GPU's reaching the CPU, as on the M3; in a stand-in, the
+//!   GPU's own, as on the 5300M and the UHD 630, which read and keep none of the CPU's there and
+//!   whose writes there never reach it (Q37). Neither is a promise of Metal's.
 //! - **Early copy.** A surface the CPU reads back after each GPU write (a decoder's output, or a
 //!   pixel transfer's, that its client locks each frame to read) is copied into its pages as the
 //!   write ends, not at the lock that follows it ([`SurfaceCaches::early_copies`]). Once a
@@ -244,7 +269,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use reims_vgpu_graphics::ops::{RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse};
@@ -388,6 +413,22 @@ pub(crate) struct SurfaceCache<P: Platform> {
     /// cache's memory (an import of it, [`SurfaceCaches::identity`]): it ends as the cache goes.
     /// `None` for any other cache, whose memory no device of the host's video reaches.
     life: Option<MemoryLife>,
+    /// Where the cache is laid out at the GPU's pitch, the buffer the textures over the surface
+    /// that pass their plane's texels there lie over, once one is made ([`WideHome`]).
+    wide: Option<WideHome<P>>,
+}
+
+/// A laid-out cache's wide home (the module doc, "Wider than the plane"): a buffer that keeps
+/// the surface's own layout, which the textures over the surface that pass their plane's texels
+/// at the cache's pitch lie over, at the surface's place and pitch.
+struct WideHome<P: Platform> {
+    /// A Shared buffer over the block's view of its pages, or a Private stand-in of their layout.
+    buffer: P::Buffer,
+    /// The buffer lies over the surface's pages (not a stand-in).
+    pages: bool,
+    /// The home lacks texels the cache holds: the next command buffer that uses the block copies
+    /// the cache's texels into it before its work ([`SurfaceCaches::before_one`]).
+    stale: bool,
 }
 
 impl<P: Platform> SurfaceCache<P> {
@@ -1034,6 +1075,12 @@ pub(crate) struct CacheCounts {
     pub(crate) aligned: u64,
     /// Caches made laid out at the GPU's pitch ([`Repitched`]).
     pub(crate) repitched: u64,
+    /// Wide homes made (the module doc, "Wider than the plane"): over the pages' view, and
+    /// stand-ins; and the copies of texels between a cache and its wide home, at a command
+    /// buffer's begin or an encoder's end.
+    pub(crate) wide_homes: u64,
+    pub(crate) wide_stand_ins: u64,
+    pub(crate) wide_copies: u64,
     /// The GPU's time in the fills' command buffers, and in the copies' into the pages, in
     /// nanoseconds, where the platform gave it ([`CopyGpu`]).
     pub(crate) fill_gpu_ns: u64,
@@ -1505,6 +1552,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 read_back: ReadBack::default(),
                 out: None,
                 life,
+                wide: None,
             },
         );
         let pages = Pages {
@@ -1728,6 +1776,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 read_back: ReadBack::default(),
                 out: None,
                 life,
+                wide: None,
             },
         );
         if carries {
@@ -2077,8 +2126,150 @@ impl<P: Platform> SurfaceCaches<P> {
             }
         }
         let count = self.hold(block, u.flags & RGFX_SURFACE_USE_WRITES != 0);
-        let follows = filled.and_then(|()| self.follow(cb, count));
+        let follows = filled
+            .and_then(|()| self.follow(cb, count))
+            .and_then(|follows| self.home_in(cb, block).map(|()| follows));
         (Some(count), follows)
+    }
+
+    /// The block at `block`'s wide home, where it lacks texels its cache holds
+    /// ([`WideHome::stale`]), takes them first in command buffer `cb`, after what `cb` waits for:
+    /// the cache's texel rows copied into it, the bytes beside them left as the home holds them.
+    /// A home over the pages takes them only while the cache holds a write the pages lack
+    /// ([`SurfaceCache::written`]): a download since copied the cache into them, and a write of
+    /// the host's devices since made the pages the newer.
+    fn home_in(&mut self, cb: &P::CommandBuffer, block: u64) -> RaiseResult<()> {
+        let Some(cache) = self.by_block.get_mut(&block) else {
+            return Ok(());
+        };
+        let written = cache.written;
+        let Some(home) = cache.wide.as_mut().filter(|h| h.stale) else {
+            return Ok(());
+        };
+        home.stale = false;
+        if home.pages && !written {
+            return Ok(());
+        }
+        if encode_home::<P>(cb, cache, Way::Out)? {
+            self.counts.wide_copies += 1;
+        }
+        Ok(())
+    }
+
+    /// A command buffer's encoder, just ended in `cb`, may have written the surface at `block`
+    /// through the textures over its wide home (`from_home`) or over its cache: the side it
+    /// wrote is copied into the other in `cb`, its texel rows alone, so the encoders after it
+    /// read the write through either, as Metal's do (the module doc, "Wider than the plane").
+    /// Nothing where the block has no wide home.
+    pub(crate) fn reconcile(
+        &mut self,
+        cb: &P::CommandBuffer,
+        block: u64,
+        from_home: bool,
+    ) -> RaiseResult<()> {
+        let Some(cache) = self.by_block.get_mut(&block) else {
+            return Ok(());
+        };
+        let Some(home) = cache.wide.as_mut() else {
+            return Ok(());
+        };
+        home.stale = false;
+        let way = if from_home { Way::In } else { Way::Out };
+        if encode_home::<P>(cb, cache, way)? {
+            self.counts.wide_copies += 1;
+        }
+        Ok(())
+    }
+
+    /// The command buffer that ended with uses that may write the blocks `written` wrote them
+    /// in ways its walk did not see ([`Self::reconcile`]): through an argument buffer with no use
+    /// named, or by a video op. A block among them with a wide home has its home copied into
+    /// again by the next command buffer that uses it ([`Self::home_in`]).
+    pub(crate) fn unseen_writes(&mut self, written: &[u64]) {
+        for block in written {
+            if let Some(home) = (self.by_block.get_mut(block)).and_then(|c| c.wide.as_mut()) {
+                home.stale = true;
+            }
+        }
+    }
+
+    /// The block at `block`'s wide home's buffer, and whether it lies over the pages (for the
+    /// tests).
+    #[cfg(test)]
+    pub(crate) fn wide_buffer(&self, block: u64) -> Option<(&P::Buffer, bool)> {
+        let home = self.by_block.get(&block)?.wide.as_ref()?;
+        Some((&home.buffer, home.pages))
+    }
+
+    /// The block at `block`'s wide home (the module doc, "Wider than the plane"), made where it
+    /// has none: the cache's buffer over the pages' view, the view made now for a cache that
+    /// copies by the pages' runs, which copies through it from then on, as a copy by runs the
+    /// platform refuses does; else a Private stand-in of the surface's bytes, made as zeros.
+    /// The buffer, and whether it lies over the pages; `None` where the block has no cache laid
+    /// out at the GPU's pitch, or the platform made no stand-in.
+    pub(crate) fn wide_home(
+        &mut self,
+        device: &P::Device,
+        block: u64,
+    ) -> RaiseResult<Option<(P::Buffer, bool)>> {
+        let Some(cache) = self.by_block.get_mut(&block) else {
+            return Ok(None);
+        };
+        if cache.repitched.is_none() {
+            return Ok(None);
+        }
+        if let Some(home) = &cache.wide {
+            return Ok(Some((home.buffer.clone_ref(), home.pages)));
+        }
+        if let Some(CachePages::Runs { unmade, .. }) = &cache.pages {
+            match unmade.make(device)? {
+                Ok((_view, import)) => {
+                    log::info!(
+                        target: "reims_vgpu::graphics",
+                        "the IOSurface block at {block:#x}: a texture passes its plane's texels in \
+                         its device cache laid out at the GPU's pitch; it lies over a view of the \
+                         pages, made now, which the cache copies through from now on"
+                    );
+                    cache.pages = Some(CachePages::View(import));
+                }
+                Err(why) => log::warn!(
+                    target: "reims_vgpu::graphics", kind:? = why;
+                    "the IOSurface block at {block:#x}: no view of its pages was made for a \
+                     texture past its plane's texels ({why:?})"
+                ),
+            }
+        }
+        let home: WideHome<P> = match &cache.pages {
+            Some(CachePages::View(pages)) => WideHome {
+                buffer: pages.clone_ref(),
+                pages: true,
+                stale: cache.written,
+            },
+            _ => {
+                let Some(buffer) =
+                    device.new_buffer_of_length(ON, cache.length, STORAGE_PRIVATE)?
+                else {
+                    return Ok(None);
+                };
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "the IOSurface block at {block:#x}: a texture passes its plane's texels in its \
+                     device cache laid out at the GPU's pitch, and the block has no view of its \
+                     pages; it lies over a stand-in of the surface's layout, whose bytes beside \
+                     the texels are its own, zeros at first, as an x86 Mac's GPU keeps them"
+                );
+                self.counts.wide_stand_ins += 1;
+                WideHome {
+                    buffer,
+                    pages: false,
+                    stale: true,
+                }
+            }
+        };
+        let answer = (home.buffer.clone_ref(), home.pages);
+        cache.wide = Some(home);
+        self.counts.wide_homes += 1;
+        Ok(Some(answer))
     }
 
     /// The first fill the block at `block`'s cache owes taken as met by a decode that writes the
@@ -2806,6 +2997,11 @@ impl<P: Platform> SurfaceCaches<P> {
             cache.host_read = host;
             cache.filled_at = value;
             cache.users.clear();
+            // A stand-in home lacks the pages' texels the fill brought; a home over the pages
+            // holds them.
+            if let Some(home) = cache.wide.as_mut().filter(|home| !home.pages) {
+                home.stale = true;
+            }
         }
         self.owes_none(block);
         self.counts.fills += 1;
@@ -3172,6 +3368,10 @@ impl<P: Platform> SurfaceCaches<P> {
         if let Some(cache) = self.by_block.get_mut(&block) {
             cache.written = false;
             cache.users.clear();
+            // A home over the pages takes the cache's texels with them.
+            if let Some(home) = cache.wide.as_mut().filter(|home| home.pages) {
+                home.stale = false;
+            }
             // This copy is the cache's last: an early copy before it is waited for on the GPU.
             cache.read_back.writes = 0;
             cache.read_back.copy = None;
@@ -3335,6 +3535,9 @@ pub(crate) struct Caches<P: Platform> {
     moved: Condvar,
     /// What each fill tells as it finishes ([`Self::on_fill_done`]).
     on_fill_done: Arc<OnceLock<FillHook>>,
+    /// A wide home was made ([`Self::wide_home`]): until then no walk notes its encoders' uses
+    /// of textures over laid-out caches, nor takes the caches' lock at their ends.
+    homes: AtomicBool,
 }
 
 /// How a new cache's buffer is made ([`SurfaceCaches::maker`]): read under the caches' lock and
@@ -3567,6 +3770,18 @@ pub(crate) struct Uses<P: Platform> {
     blocks: Vec<Count>,
     /// The deferred copies it waits for on the GPU, each by block and number.
     follows: Vec<(u64, u64)>,
+    /// The blocks its walk saw written through textures over a laid-out cache or its wide home
+    /// ([`Self::saw_written`]); a use that may write another block's cache wrote it unseen
+    /// ([`SurfaceCaches::unseen_writes`]).
+    seen: Vec<u64>,
+}
+
+impl<P: Platform> Uses<P> {
+    /// The command buffer's walk saw `blocks` written through textures over their caches or
+    /// their wide homes, and copied each write into the other side ([`Caches::reconcile`]).
+    pub(crate) fn saw_written(&mut self, blocks: impl IntoIterator<Item = u64>) {
+        self.seen.extend(blocks);
+    }
 }
 
 impl<P: Platform> Drop for Uses<P> {
@@ -3605,6 +3820,7 @@ impl<P: Platform> Caches<P> {
             state: Mutex::new(SurfaceCaches::new(Arc::clone(&on_fill_done))),
             moved: Condvar::new(),
             on_fill_done,
+            homes: AtomicBool::new(false),
         }
     }
 
@@ -3717,6 +3933,41 @@ impl<P: Platform> Caches<P> {
     /// Whether the block at `block` has a cache.
     pub(crate) fn has(&self, block: u64) -> bool {
         self.state.lock().has(block)
+    }
+
+    /// The block at `block`'s wide home, made where it has none ([`SurfaceCaches::wide_home`]).
+    pub(crate) fn wide_home(
+        &self,
+        device: &P::Device,
+        block: u64,
+    ) -> RaiseResult<Option<(P::Buffer, bool)>> {
+        let mut state = self.state.lock();
+        state.after_recovery(device);
+        let home = state.wide_home(device, block)?;
+        if home.is_some() {
+            self.homes.store(true, Ordering::Release);
+        }
+        Ok(home)
+    }
+
+    /// Whether a wide home was ever made ([`Self::wide_home`]).
+    pub(crate) fn any_home(&self) -> bool {
+        self.homes.load(Ordering::Acquire)
+    }
+
+    /// An encoder just ended in command buffer `cb` that may have written the surfaces of
+    /// `written`, each by its block and whether through a texture over its wide home: each side
+    /// written is copied into the other in `cb` ([`SurfaceCaches::reconcile`]).
+    pub(crate) fn reconcile(
+        &self,
+        cb: &P::CommandBuffer,
+        written: &[(u64, bool)],
+    ) -> RaiseResult<()> {
+        let mut state = self.state.lock();
+        for &(block, from_home) in written {
+            state.reconcile(cb, block, from_home)?;
+        }
+        Ok(())
     }
 
     /// The device's reset ([`SurfaceCaches::reset`]), which no command buffer is begun across:
@@ -3938,6 +4189,7 @@ impl<P: Platform> Caches<P> {
             caches: Arc::clone(self),
             blocks: Vec::new(),
             follows: Vec::new(),
+            seen: Vec::new(),
         };
         let mut waits = reached;
         let mut raised = None;
@@ -4049,7 +4301,15 @@ impl<P: Platform> Caches<P> {
         mut uses: Uses<P>,
         commit: impl FnOnce() -> RaiseResult<()>,
     ) -> RaiseResult<()> {
-        let signalled = self.state.lock().after(device, queue, cb, &uses.blocks);
+        let signalled = {
+            let mut state = self.state.lock();
+            let unseen: Vec<u64> = (uses.blocks.iter())
+                .filter(|c| c.writes && !uses.seen.contains(&c.block))
+                .map(|c| c.block)
+                .collect();
+            state.unseen_writes(&unseen);
+            state.after(device, queue, cb, &uses.blocks)
+        };
         let done = signalled.and_then(|()| commit());
         let mut state = self.state.lock();
         state.after_recovery(device);
@@ -4909,6 +5169,28 @@ fn between<P: Platform>(
         )?;
     }
     Ok(())
+}
+
+/// Encodes in `cb`, in a blit encoder of its own, a copy of `cache`'s texel rows between the
+/// cache and its wide home ([`WideHome`]): into the cache for [`Way::In`], out of it into the home
+/// for [`Way::Out`]. Each row moves between its place in the cache, at the GPU's pitch, and its
+/// place in the surface's layout, which the home keeps ([`Repitched::cut`]). False, with nothing
+/// encoded, where the cache has no home or the platform made no encoder.
+fn encode_home<P: Platform>(
+    cb: &P::CommandBuffer,
+    cache: &SurfaceCache<P>,
+    way: Way,
+) -> RaiseResult<bool> {
+    let Some(home) = &cache.wide else {
+        return Ok(false);
+    };
+    let Some(blit) = cb.blit_encoder(ON)? else {
+        return Ok(false);
+    };
+    let parts = cache.moves([(0..cache.length, 0)]);
+    between::<P>(&blit, (&cache.device, &home.buffer), &parts, way)?;
+    blit.encode(ON, BlitCmd::EndEncoding)?;
+    Ok(true)
 }
 
 /// A copied cache's Shared buffer for one copy ([`CachePages::Copied`]), which lives until the
@@ -9004,6 +9286,8 @@ mod tests {
             };
             Arg::val(&Some(facts))
         };
+        // Each texture's rows inside its plane's texels, in R8's bytes.
+        r8_texels(&r);
         for (obj_id, plane, offset, format, size, at, why) in [
             (11, 0, 0x20, 10, (100, 10), 0, "luma"),
             (12, 1, 0x520, 30, (50, 5), 4096, "chroma"),
@@ -9032,6 +9316,427 @@ mod tests {
                 "{why}"
             );
         }
+    }
+
+    /// Where a texture over a plane of a cache laid out at the GPU's pitch lies (`laid_plane`):
+    /// over the cache, at the plane's place there, where its texels lie in the plane's; nowhere
+    /// in the cache where they pass them. An L008 surface 64 wide in rows 128 bytes apart: R8 of
+    /// the plane's own size lies in the cache; RG8 of its whole rows (oracle_surftex's
+    /// `l008.fmt.rg8`) passes the plane wider than a cache pitch of 64, and inside one of 256 past
+    /// the texels; a texture a row taller, or one whose first byte lies past a row's texels, does
+    /// too
+    #[test]
+    fn a_texture_past_its_planes_texels_lies_in_no_place_of_the_cache() {
+        use reims_vgpu_vulkan::core::platform::values::SurfacePlane;
+        let surface = SurfacePlane {
+            plane: 0,
+            offset: 0,
+            bytes_per_row: 128,
+            planar: false,
+            facts: None,
+        };
+        let at = |offset| SurfacePlane { offset, ..surface };
+        for (pitch, why) in [(64, "a cache pitch of 64"), (256, "a cache pitch of 256")] {
+            let laid = Repitched::of(&[plane(0, 128, 64, 64)], rows_at(pitch)).unwrap();
+            let fits = super::super::laid_plane(&laid, surface, 64, 64).expect(why);
+            assert_eq!((fits.offset, fits.bytes_per_row), (0, pitch), "{why}");
+            let row = super::super::laid_plane(&laid, at(3 * 128 + 8), 56, 4).expect(why);
+            assert_eq!(
+                (row.offset, row.bytes_per_row),
+                (3 * pitch + 8, pitch),
+                "{why}"
+            );
+            for (offset, row_bytes, rows, case) in [
+                (0, 128, 64, "RG8 of the whole rows"),
+                (0, 65, 64, "one byte past the texels"),
+                (0, 64, 65, "a row taller"),
+                (64, 32, 4, "its first byte past a row's texels"),
+            ] {
+                assert_eq!(
+                    super::super::laid_plane(&laid, at(offset), row_bytes, rows),
+                    None,
+                    "{case}, {why}"
+                );
+            }
+        }
+    }
+
+    /// A rig whose block at [`BLOCK`] is a cached L008 surface 64 wide, 8 rows 128 bytes apart,
+    /// on a device that lays linear rows at multiples of `pitch` bytes, with buffer 10 over it
+    /// and textures over its plane 0: 11, R8 of the plane's own size, and 12, R8 of the
+    /// surface's whole rows (128 texels, the bytes of oracle_surftex's RG8 64 wide); `runs`
+    /// copies the guest's RAM by its runs. Each texture's usage is ShaderRead.
+    fn wide_rig(pitch: u64, runs: bool) -> Rig {
+        use super::super::surface_pages::tests::one_plane;
+        let mut r = rig(16);
+        let page = r.page;
+        r.p.world().lay_linear_rows(Some(pitch));
+        r.p.world().copy_guest_ram(runs);
+        r.dec.hold_resource_ids(0, 1);
+        queues(&mut r);
+        assert_eq!(
+            r.pages_laid_out(
+                BLOCK,
+                0,
+                &[(1, 1)],
+                page,
+                RGFX_SURFACE_PAGES_CACHED,
+                Some(one_plane(128, 64, 8))
+            ),
+            RGFX_STATUS_OK
+        );
+        assert!(r.dec.caches().repitched(BLOCK).is_some());
+        assert_eq!(r.buffer(10, BLOCK, page), Ok(()));
+        r8_texels(&r);
+        for (obj_id, width) in [(11, 64), (12, 128)] {
+            let message = surface_texture(obj_id, 10, 10, (width, 8));
+            assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
+        }
+        r
+    }
+
+    /// The `TEXTURE_FROM_IOSURFACE` of texture `obj_id` over plane 0 of surface 0x77, at its
+    /// first byte and rows 128 bytes apart, in buffer `buffer`: `format` (10 R8Unorm), `size`
+    /// texels, usage ShaderRead.
+    fn surface_texture(obj_id: u64, buffer: u64, format: u32, size: (u32, u32)) -> Vec<u8> {
+        use reims_vgpu_graphics::wire::{
+            RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_SURFACE_NO_WRITERS, RgfxTextureDescriptor,
+            RgfxTextureFromIOSurface,
+        };
+        RgfxTextureFromIOSurface {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+                size: size_of::<RgfxTextureFromIOSurface>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+            resource_id: 0x40 + obj_id,
+            buffer_obj_id: buffer,
+            offset: 0,
+            bytes_per_row: 128,
+            iosurface_id: 0x77,
+            plane: 0,
+            desc: RgfxTextureDescriptor {
+                pixel_format: format,
+                texture_type: 2,
+                width: size.0,
+                height: size.1,
+                depth: 1,
+                mipmap_level_count: 1,
+                array_length: 1,
+                sample_count: 1,
+                usage: 1,
+                ..RgfxTextureDescriptor::default()
+            },
+            writers_offset: RGFX_SURFACE_NO_WRITERS,
+        }
+        .as_bytes()
+        .to_vec()
+    }
+
+    /// The buffer each `newTextureWithDescriptor:iosurface:plane:` in `calls` was made over, and
+    /// its offset and pitch there.
+    fn surface_textures(calls: &[Call]) -> Vec<(u64, u64, u64)> {
+        (calls.iter())
+            .filter(|c| c.sel == "newTextureWithDescriptor:iosurface:plane:")
+            .map(|c| {
+                let at = |i: usize| c.args[i].as_u64().unwrap_or(u64::MAX);
+                (c.obj.0, at(2), at(3))
+            })
+            .collect()
+    }
+
+    /// The id of buffer `buffer`.
+    fn id_of(buffer: &<FakePlatform as Platform>::Buffer) -> u64 {
+        Arg::obj(buffer).as_obj().unwrap().0
+    }
+
+    /// The rig's device describes every pixel format as R8Unorm's, one byte a texel, where the
+    /// fake's own answer is four.
+    fn r8_texels(r: &Rig) {
+        use reims_vgpu_vulkan::core::platform::types::PixelFormatInfo;
+        use reims_vgpu_vulkan::core::testkit::Step;
+        let r8 = PixelFormatInfo {
+            name: Some("MTLPixelFormatR8Unorm".to_owned()),
+            block_bytes: 1,
+            block_width: 1,
+            block_height: 1,
+            block_depth: 1,
+            ..PixelFormatInfo::default()
+        };
+        (r.p.script()).always("MTLPixelFormatGetInfoForDevice()", Step::value(r8));
+    }
+
+    /// Over a cache laid out at the GPU's pitch, a texture of its plane's own size lies over the
+    /// cache, at the cache's pitch, in place; one past the plane's texels there, wider than the
+    /// cache's pitch (128-byte rows at a pitch of 64, as MoltenVK lays an L008 surface 64 wide)
+    /// or inside it past the texels (at RADV's 256), lies over the block's view of its
+    /// pages at the surface's own place and pitch, a Shared texture, where it raised `RowPitch` or
+    /// read the cache's own bytes past the texels
+    #[test]
+    fn a_texture_past_its_planes_texels_lies_over_the_pages_at_their_pitch() {
+        for pitch in [64, 256] {
+            let mut r = wide_rig(pitch, false);
+            let cache = cache_id(&r);
+            let mark = r.p.call_log().mark();
+            for (obj_id, width) in [(21, 64), (22, 128)] {
+                let message = surface_texture(obj_id, 10, 10, (width, 8));
+                assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
+            }
+            let caches = r.dec.caches();
+            let (home, pages) = caches.wide_buffer(BLOCK).expect("a wide home");
+            assert!(pages, "over the pages");
+            let home = id_of(home);
+            assert_ne!(home, cache);
+            assert_eq!(
+                surface_textures(&r.p.call_log().since(mark)),
+                [(cache, 0, pitch), (home, 0, 128)],
+                "pitch {pitch}"
+            );
+            assert_eq!(
+                (caches.counts().wide_homes, caches.counts().wide_stand_ins),
+                (1, 0)
+            );
+            drop(caches);
+            assert_eq!(
+                r.dec.entry(22).and_then(|e| e.place),
+                None,
+                "no place for video"
+            );
+        }
+    }
+
+    /// Command buffer `cb_obj_id` on queue 1 that uses [`BLOCK`] at generation 0, writing where
+    /// `writes`, and holds one blit encoder of `op`'s.
+    fn blit_with(r: &mut Rig, cb_obj_id: u64, writes: bool, op: (u16, Vec<u8>)) {
+        use reims_vgpu_graphics::ops::{RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END};
+        use zerocopy::FromBytes as _;
+        let op_of = |tag: u16, body: &[u8]| {
+            let mut v = RgfxOpHeader {
+                tag,
+                flags: 0,
+                len: (8 + body.len()) as u32,
+            }
+            .as_bytes()
+            .to_vec();
+            v.extend_from_slice(body);
+            v
+        };
+        let mut message = surfaces_message(1, cb_obj_id, &[(BLOCK, 0, writes)], false);
+        let mut ops = op_of(RGFX_OP_ENCODER_BEGIN_BLIT, &[]);
+        ops.extend(op_of(op.0, &op.1));
+        ops.extend(op_of(RGFX_OP_ENCODER_END, &[]));
+        let op_bytes = message.len() - RGFX_COMMAND_BUFFER_OPS_OFFSET as usize + ops.len();
+        message.extend_from_slice(&ops);
+        let mut m = RgfxCommandBuffer::read_from_prefix(&message).unwrap().0;
+        m.header.size = message.len() as u32;
+        m.op_bytes = op_bytes as u64;
+        message[..size_of::<RgfxCommandBuffer>()].copy_from_slice(m.as_bytes());
+        assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
+    }
+
+    /// A blit copy of texture `from`'s slices into `to`'s.
+    fn slices(from: u64, to: u64) -> (u16, Vec<u8>) {
+        use reims_vgpu_graphics::ops::blit::{
+            RGFX_OP_BLIT_COPY_TEXTURE_SLICES, RgfxBlitOpCopyTextureSlices,
+        };
+        let m = RgfxBlitOpCopyTextureSlices {
+            source_texture_obj_id: from,
+            destination_texture_obj_id: to,
+            slice_count: 1,
+            level_count: 1,
+            ..Default::default()
+        };
+        (RGFX_OP_BLIT_COPY_TEXTURE_SLICES, m.as_bytes().to_vec())
+    }
+
+    /// Each row of the wide rig's surface: its first byte in the surface, at the pages' pitch,
+    /// and in the cache, at `pitch`, and its texels' bytes.
+    fn wide_rows(pitch: u64) -> Vec<(u64, u64, u64)> {
+        (0..8).map(|row| (row * 128, row * pitch, 64)).collect()
+    }
+
+    /// An encoder that writes a surface through a texture past its plane's texels, over the
+    /// block's wide home, is followed in its command buffer by a copy of the home's texel rows
+    /// into the cache, before the next encoder, so a texture over the cache reads the write
+    /// there, as the Macs' next encoders read it (Q37); one that writes through a texture over
+    /// the cache is followed by a copy of the cache's texel rows into the home; an encoder that
+    /// writes neither (a copy out of the surface into another texture) copies nothing
+    #[test]
+    fn an_encoders_write_through_either_texture_reaches_the_other() {
+        let mut r = wide_rig(256, false);
+        let cache = cache_id(&r);
+        let home = id_of(r.dec.caches().wide_buffer(BLOCK).unwrap().0);
+        // A command buffer that makes the cache's first fill, before the marks.
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, false)]);
+
+        let mark = r.p.call_log().mark();
+        blit_with(&mut r, 0x101, true, slices(11, 12));
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(
+            copies(&calls),
+            vec![(home, cache); 8],
+            "the home's rows into the cache"
+        );
+        let into_cache: Vec<(u64, u64, u64)> = wide_rows(256);
+        assert_eq!(offsets(&calls), into_cache);
+
+        let mark = r.p.call_log().mark();
+        blit_with(&mut r, 0x102, true, slices(12, 11));
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(
+            copies(&calls),
+            vec![(cache, home); 8],
+            "the cache's rows into the home"
+        );
+        let into_home: Vec<(u64, u64, u64)> = (wide_rows(256).into_iter())
+            .map(|(surface, in_cache, bytes)| (in_cache, surface, bytes))
+            .collect();
+        assert_eq!(offsets(&calls), into_home);
+
+        // An encoder that only synchronizes the wide texture writes neither side: it copies
+        // nothing.
+        let mark = r.p.call_log().mark();
+        blit_with(&mut r, 0x103, false, sync_texture(12));
+        let calls = r.p.call_log().since(mark);
+        assert!(
+            copies(&calls).is_empty(),
+            "nothing written: {:?}",
+            copies(&calls)
+        );
+        assert_eq!(r.dec.caches().counts().wide_copies, 2);
+    }
+
+    /// A view of a texture past its plane's texels lies over the wide home as its parent does:
+    /// an encoder that writes through it is followed by a copy of the home's texel rows into
+    /// the cache, as one that writes through its parent is
+    #[test]
+    fn a_write_through_a_view_of_a_wide_texture_reaches_the_cache() {
+        use reims_vgpu_graphics::wire::{RGFX_CMD_TEXTURE_VIEW, RgfxTextureView};
+        let mut r = wide_rig(256, false);
+        let cache = cache_id(&r);
+        let home = id_of(r.dec.caches().wide_buffer(BLOCK).unwrap().0);
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, false)]);
+        let view = RgfxTextureView {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_VIEW,
+                size: size_of::<RgfxTextureView>() as u32,
+                seqno: 0,
+            },
+            obj_id: 13,
+            parent_obj_id: 12,
+            resource_id: 0x40 + 13,
+            pixel_format: 10,
+            ..RgfxTextureView::default()
+        };
+        assert_eq!(r.dec.decode(&r.device, view.as_bytes()).unwrap(), Ok(()));
+        let mark = r.p.call_log().mark();
+        blit_with(&mut r, 0x101, true, slices(11, 13));
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(copies(&calls), vec![(home, cache); 8]);
+        assert_eq!(offsets(&calls), wide_rows(256));
+    }
+
+    /// A blit synchronizing texture `texture`, which writes nothing of it.
+    fn sync_texture(texture: u64) -> (u16, Vec<u8>) {
+        use reims_vgpu_graphics::ops::blit::{
+            RGFX_OP_BLIT_SYNCHRONIZE_TEXTURE, RgfxBlitOpSynchronizeTexture,
+        };
+        let m = RgfxBlitOpSynchronizeTexture {
+            texture_obj_id: texture,
+            ..Default::default()
+        };
+        (RGFX_OP_BLIT_SYNCHRONIZE_TEXTURE, m.as_bytes().to_vec())
+    }
+
+    /// On a device that copies the guest's RAM by its runs, the block's first texture past its
+    /// plane's texels makes the block's view, which the texture lies over; the cache's copies
+    /// go through the view from then on, never by runs beside a texture over the view
+    #[test]
+    fn a_wide_texture_over_a_cache_by_runs_makes_its_view() {
+        use reims_vgpu_vulkan::core::testkit::impls::blit::{
+            BUFFER_TO_GUEST_RAM, GUEST_RAM_RUNS_TO_BUFFER,
+        };
+        let mut r = wide_rig(64, true);
+        let cache = cache_id(&r);
+        let (home, pages) = r
+            .dec
+            .caches()
+            .wide_buffer(BLOCK)
+            .map(|(b, p)| (id_of(b), p))
+            .unwrap();
+        assert!(pages);
+        assert_ne!(home, cache);
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        (r.dec).surface_download(&r.device, BLOCK, Box::new(|| {}), no_raise());
+        let calls = r.p.call_log().since(mark);
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.sel == GUEST_RAM_RUNS_TO_BUFFER || c.sel == BUFFER_TO_GUEST_RAM),
+            "no copy by runs"
+        );
+        assert_eq!(
+            copies(&calls).first(),
+            Some(&(home, cache)),
+            "the fill, through the view"
+        );
+        assert_eq!(
+            copies(&calls).last(),
+            Some(&(cache, home)),
+            "the download, through it"
+        );
+    }
+
+    /// A deferred block's cache laid out at the GPU's pitch, whose pages are not named, has no
+    /// view: a texture past its plane's texels lies over a Private stand-in of the surface's
+    /// layout, made as zeros, which the first command buffer that uses the block fills with the
+    /// cache's texel rows before its work; a fill of the cache leaves the stand-in to take them
+    /// again
+    #[test]
+    fn a_wide_texture_over_a_deferred_block_lies_over_a_stand_in() {
+        use super::super::surface_pages::tests::one_plane;
+        let mut r = rig(16);
+        let page = r.page;
+        r.p.world().lay_linear_rows(Some(64));
+        r.dec.hold_resource_ids(0, 1);
+        r.dec.set_deferred_budget(8 * page);
+        queues(&mut r);
+        let flags = RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_DEFERRED;
+        assert_eq!(
+            r.pages_of_runs(BLOCK, 0, &[], page, flags, Some(one_plane(128, 64, 8))),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(r.buffer(10, BLOCK, page), Ok(()));
+        let cache = cache_id(&r);
+        let mark = r.p.call_log().mark();
+        r8_texels(&r);
+        let message = surface_texture(12, 10, 10, (128, 8));
+        assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
+        let (home, pages) = r
+            .dec
+            .caches()
+            .wide_buffer(BLOCK)
+            .map(|(b, p)| (id_of(b), p))
+            .unwrap();
+        assert!(!pages, "a stand-in");
+        assert_eq!(r.dec.caches().counts().wide_stand_ins, 1);
+        assert_eq!(
+            surface_textures(&r.p.call_log().since(mark)),
+            [(home, 0, 128)]
+        );
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, false)]);
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(
+            copies(&calls),
+            vec![(cache, home); 8],
+            "the cache's rows into it"
+        );
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 0, false)]);
+        assert!(copies(&r.p.call_log().since(mark)).is_empty(), "taken once");
     }
 
     /// A copy out of a cache by runs that the platform refuses, at a download, makes the block's

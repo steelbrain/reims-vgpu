@@ -1792,15 +1792,19 @@ impl<P: Platform> GraphicsDecoder<P> {
         match uses {
             // Its end event signalled for the caches' later copies under their lock, committed
             // with it let go, still among their users, and then the early copies behind it on its
-            // queue ([`super::surface_cache::Caches::finish`]).
-            Some(uses) => self.surface_caches.finish(
-                device,
-                queue_obj_id,
-                queue.as_ref(),
-                &cb,
-                uses,
-                commit,
-            )?,
+            // queue ([`super::surface_cache::Caches::finish`]); the blocks its walk saw written
+            // through textures over laid-out caches or their wide homes told first.
+            Some(mut uses) => {
+                uses.saw_written(self.laid_written.borrow_mut().drain(..));
+                self.surface_caches.finish(
+                    device,
+                    queue_obj_id,
+                    queue.as_ref(),
+                    &cb,
+                    uses,
+                    commit,
+                )?
+            }
             None => commit()?,
         }
         // Committed: a buffer behind it in the commit order goes on, and so does its context's
@@ -2253,11 +2257,48 @@ impl<P: Platform> GraphicsDecoder<P> {
         split: &mut Option<Splitting>,
     ) -> RaiseResult<Result<(), DecodeError>> {
         let mut encoder: Option<OpenEncoder<P>> = None;
+        self.laid_uses.borrow_mut().clear();
+        self.laid_written.borrow_mut().clear();
         let walked = refusing(|| self.walk(ops, cb, &mut encoder, events, split));
         if let Some(open) = encoder.take() {
             end_abandoned(open);
         }
         walked
+    }
+
+    /// The encoder just ended in `cb` wrote, through textures over the planes of laid-out device
+    /// caches or over their wide homes, the blocks its uses noted ([`Self::note_laid`]): each
+    /// side written is copied into the other in `cb` before the next encoder
+    /// ([`super::surface_cache::Caches::reconcile`]), so it reads the write through either, as
+    /// the Macs' next encoders read it (docs/graphics-kext/dgpu-oracle.md, Q37). An encoder that
+    /// wrote both sides of a block keeps the home's writes in the texels both hold.
+    fn reconcile_laid(&self, cb: &P::CommandBuffer) -> RaiseResult<()> {
+        let uses = std::mem::take(&mut *self.laid_uses.borrow_mut());
+        let mut written: Vec<(u64, bool)> = Vec::new();
+        for u in uses.iter().filter(|u| u.writes) {
+            match written.iter_mut().find(|(block, _)| *block == u.block) {
+                Some((_, from_home)) => *from_home |= u.wide,
+                None => written.push((u.block, u.wide)),
+            }
+        }
+        if written.is_empty() {
+            return Ok(());
+        }
+        let both = written.iter().any(|&(block, from_home)| {
+            from_home && uses.iter().any(|u| u.block == block && u.writes && !u.wide)
+        });
+        if both {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "an encoder may write an IOSurface through textures over its device cache laid \
+                 out at the GPU's pitch and over its wide home at once: the home's writes are kept \
+                 in the texels both hold"
+            );
+        }
+        self.laid_written
+            .borrow_mut()
+            .extend(written.iter().map(|&(block, _)| block));
+        self.surface_caches.reconcile(cb, &written)
     }
 
     /// [`Self::walk_ops`]'s walk, `encoder` the one it holds open, `split` where it may commit
@@ -2279,6 +2320,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             match op_group(tag) {
                 RGFX_OP_GROUP_FRAMING => {
                     self.framing_op((tag, body, &ops[len..]), cb, encoder, events)?;
+                    if tag == RGFX_OP_ENCODER_END {
+                        self.reconcile_laid(cb)?;
+                    }
                     if tag == RGFX_OP_ENCODER_END && len < ops.len() {
                         self.split_here(cb, split)?;
                     }

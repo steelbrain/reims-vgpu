@@ -22,7 +22,7 @@ use reims_vgpu_vulkan::core::platform::resource::Texture;
 use reims_vgpu_vulkan::core::platform::types::{NsRange, Swizzle};
 use reims_vgpu_vulkan::core::raise::RaiseResult;
 
-use super::{DecodeError, GraphicsDecoder, ObjHandle, read};
+use super::{DecodeError, Entry, GraphicsDecoder, ObjHandle, read};
 
 impl<P: Platform> GraphicsDecoder<P> {
     /// `TEXTURE_VIEW`: the platform's view of the named texture (module doc). Malformed for flags
@@ -77,8 +77,16 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
         };
         let span = self.span_of(m.parent_obj_id);
+        // A view of a texture over a plane of a laid-out device cache, or over its wide home,
+        // lies where its parent does, and its uses are noted as the parent's are.
+        let laid_use = self.entry(m.parent_obj_id).and_then(|e| e.laid_use);
         match made {
-            Some(view) => self.insert_over(m.obj_id, ObjHandle::Texture(view), span),
+            Some(view) => {
+                let mut entry = Entry::of(ObjHandle::Texture(view)).over(span);
+                entry.laid_use = laid_use;
+                self.store(m.obj_id, entry);
+                Ok(Ok(()))
+            }
             None => Ok(Err(DecodeError::Refused)),
         }
     }

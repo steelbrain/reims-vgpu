@@ -148,6 +148,10 @@ pub(crate) struct Entry<P: Platform> {
     /// pitch: that layout, by which each texture over the buffer is placed in it
     /// ([`Repitched`]); `None` for any other object.
     pub(crate) laid_out: Option<Arc<Repitched>>,
+    /// A texture over a plane of a device cache laid out at the GPU's pitch: its block, and
+    /// whether it lies in the cache or in the block's wide home ([`LaidUse`]); `None` for any
+    /// other object.
+    pub(crate) laid_use: Option<LaidUse>,
     /// The table's clock at its make.
     made: u64,
     /// The first clock of a view that names it: its make's, or the making message's view's where
@@ -169,6 +173,7 @@ impl<P: Platform> Entry<P> {
             over_view: false,
             icb_dropped: None,
             laid_out: None,
+            laid_use: None,
             made: 0,
             seen: 0,
         }
@@ -198,6 +203,18 @@ impl<P: Platform> Entry<P> {
         self.bytes = bytes;
         self
     }
+}
+
+/// A texture over a plane of a surface whose device cache lays its planes out at the GPU's pitch
+/// ([`Repitched`]), as a command buffer's walk notes each use of it
+/// ([`super::surface_cache::Caches::reconcile`]): the block, whether the texture lies in the
+/// block's wide home rather than in the cache (`super::surface_cache`, "Wider than the plane"), and
+/// whether the use may write it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LaidUse {
+    pub(crate) block: u64,
+    pub(crate) wide: bool,
+    pub(crate) writes: bool,
 }
 
 /// An entry the table owns: boxed, and freed only by its drop, so a view's pointer to it stays

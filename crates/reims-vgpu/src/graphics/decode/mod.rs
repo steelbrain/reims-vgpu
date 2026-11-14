@@ -229,7 +229,7 @@ use sequencer::Sequencer;
 pub(crate) use sequencer::Ticket;
 use surface_cache::Caches;
 pub(crate) use surface_cache::{FillHook, FillWait};
-use tables::{Context, Entry, GuestBytes, QueueCounts, View};
+use tables::{Context, Entry, GuestBytes, LaidUse, QueueCounts, View};
 
 /// A sink the decoder calls with each command buffer's completion record once its
 /// work finishes (the handler the stream's close registers). The ring loop sets
@@ -914,6 +914,11 @@ pub struct GraphicsDecoder<P: Platform> {
     committed: RefCell<Option<(Arc<surface_order::Marks>, u64)>>,
     /// The entries the message found last ([`Recent`]).
     recent: Recent<P>,
+    /// The uses of textures over laid-out device caches or their wide homes by the encoder its
+    /// command buffer's walk is in ([`Self::note_laid`]), and the blocks the walk saw written so
+    /// far ([`Self::reconcile_laid`]).
+    laid_uses: RefCell<Vec<LaidUse>>,
+    laid_written: RefCell<Vec<u64>>,
 }
 
 impl<P: Platform> Drop for GraphicsDecoder<P> {
@@ -1053,6 +1058,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             commit_after: RefCell::new(Vec::new()),
             committed: RefCell::new(None),
             recent: Recent::new(),
+            laid_uses: RefCell::new(Vec::new()),
+            laid_written: RefCell::new(Vec::new()),
         }
     }
 
@@ -3552,20 +3559,58 @@ impl<P: Platform> GraphicsDecoder<P> {
                 let row_bytes = video::row_bytes(&info, m.desc.width, m.bytes_per_row);
                 // Over a device cache laid out at the GPU's pitch the texture lies at the same
                 // byte of the same row of its plane in the cache, its rows at the cache's pitch
-                // (`surface_cache::Repitched`).
+                // (`surface_cache::Repitched`); one past its plane's texels there lies over the
+                // block's wide home, at the surface's own place (`surface_cache`, "Wider than
+                // the plane").
                 let laid_out = self.entry(m.buffer_obj_id).and_then(|e| e.laid_out.clone());
-                let plane = match &laid_out {
-                    Some(laid) => {
-                        let rows = video::texel_rows(&info, m.desc.height);
-                        laid_plane(laid, plane, row_bytes, rows, &m)
+                let laid = laid_out.as_deref().map(|laid| {
+                    let rows = video::texel_rows(&info, m.desc.height);
+                    laid_plane(laid, plane, row_bytes, rows)
+                });
+                let wide = match (laid, span) {
+                    (Some(None), Some((block, _))) => {
+                        let Some(home) = self.surface_caches.wide_home(device, block)? else {
+                            log::warn!(
+                                target: "reims_vgpu::graphics",
+                                "the texture {:#x} over plane {} of the IOSurface {} passes its \
+                                 plane's texels in its device cache laid out at the GPU's pitch, \
+                                 and no wide home was made for it",
+                                m.obj_id, m.plane, m.iosurface_id
+                            );
+                            return Ok(Err(DecodeError::Refused));
+                        };
+                        Some(home)
                     }
-                    None => plane,
+                    _ => None,
+                };
+                let laid_use = match (laid, span) {
+                    (Some(_), Some((block, _))) => Some(LaidUse {
+                        block,
+                        wide: wide.is_some(),
+                        writes: m.desc.usage == 0
+                            || u64::from(m.desc.usage) & TEXTURE_USAGE_WRITES != 0,
+                    }),
+                    _ => None,
+                };
+                let plane = match laid {
+                    Some(Some(laid)) => laid,
+                    _ => plane,
+                };
+                // Over a home over the pages the texture is Shared, as the buffer over them is.
+                let descriptor = match &wide {
+                    Some((_, true)) => {
+                        desc.resource_options =
+                            Some(desc.resource_options.unwrap_or(0) & !surface_cache::STORAGE_MASK);
+                        self.platform.texture_descriptor(&desc)
+                    }
+                    _ => descriptor,
                 };
                 let at = (plane.offset, plane.bytes_per_row);
                 let made = {
-                    let Some(ObjHandle::Buffer(buffer)) = self.named(m.buffer_obj_id) else {
+                    let Some(ObjHandle::Buffer(cache)) = self.named(m.buffer_obj_id) else {
                         return Ok(Err(DecodeError::BadReference));
                     };
+                    let buffer = wide.as_ref().map_or(cache, |(home, _)| home);
                     let made = buffer.new_texture_over_surface_plane(
                         OnFault::Return,
                         &descriptor,
@@ -3590,7 +3635,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                         // An id made again names only its new texture's surface.
                         self.forget_surface_texture(m.obj_id);
                         let mut entry = Entry::of(ObjHandle::Texture(texture)).over(span);
-                        entry.place = Some(video::PlanePlace {
+                        // A texture over a wide home lies in no place of the buffer a video op
+                        // writes a picture through; one over the pages' view is let go of as a
+                        // buffer over it is, on the surface worker.
+                        entry.place = wide.is_none().then(|| video::PlanePlace {
                             buffer_obj_id: m.buffer_obj_id,
                             offset: at.0,
                             bytes_per_row: at.1,
@@ -3605,6 +3653,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                                 m.desc.height,
                             ),
                         });
+                        entry.laid_use = laid_use;
+                        entry.over_view = matches!(wide, Some((_, true)));
                         self.store(m.obj_id, entry);
                         if m.plane == 0 {
                             let mut names = self.shared.surfaces.lock();
@@ -5572,9 +5622,61 @@ macro_rules! resolvers {
     };
 }
 
+impl<P: Platform> GraphicsDecoder<P> {
+    /// The texture `id` names; an exec fault when `id` is 0 or names no texture. A texture over
+    /// a plane of a laid-out device cache, or over its wide home, is noted among the uses of the
+    /// encoder being walked ([`Self::note_laid`]).
+    pub(crate) fn require_texture(&self, id: u64) -> RaiseResult<&P::Texture> {
+        match self.entry(id) {
+            Some(Entry {
+                handle: ObjHandle::Texture(h),
+                laid_use,
+                ..
+            }) => {
+                if let Some(used) = laid_use {
+                    self.note_laid(*used, false);
+                }
+                Ok(h)
+            }
+            Some(Entry {
+                handle: ObjHandle::Refused(r),
+                ..
+            }) => Err(r.reference(id)),
+            _ => Err(bad_reference()),
+        }
+    }
+
+    /// The texture `id` names, `None` for 0; an exec fault when a non-zero `id` names no texture.
+    /// Noted as [`Self::require_texture`] notes it.
+    pub(crate) fn get_texture(&self, id: u64) -> RaiseResult<Option<&P::Texture>> {
+        if id == 0 {
+            return Ok(None);
+        }
+        self.require_texture(id).map(Some)
+    }
+
+    /// The texture `id` names is a blit's destination: noted as written, whatever its usage
+    /// ([`Self::note_laid`]).
+    pub(crate) fn texture_written(&self, id: u64) {
+        if let Some(used) = self.entry(id).and_then(|e| e.laid_use) {
+            self.note_laid(used, true);
+        }
+    }
+
+    /// Notes the use `used` of a texture over a plane of a laid-out device cache or its wide home
+    /// by the encoder being walked, written where `written` or where its usage may write it: at
+    /// the encoder's end the side written is copied into the other ([`Self::reconcile_laid`]).
+    fn note_laid(&self, mut used: LaidUse, written: bool) {
+        if !self.surface_caches.any_home() {
+            return;
+        }
+        used.writes |= written;
+        self.laid_uses.borrow_mut().push(used);
+    }
+}
+
 resolvers! {
     (require_buffer, get_buffer, Buffer, Buffer, "buffer"),
-    (require_texture, get_texture, Texture, Texture, "texture"),
     (require_sampler, get_sampler, Sampler, SamplerState, "sampler"),
     (require_depth_stencil, get_depth_stencil, DepthStencil, DepthStencilState, "depth/stencil state"),
     (require_render_pipeline, get_render_pipeline, RenderPipeline, RenderPipeline, "render pipeline"),
@@ -5832,62 +5934,48 @@ fn surface_plane(
     })
 }
 
+/// `MTLTextureUsageShaderWrite` and `MTLTextureUsageRenderTarget`: a texture of either may be
+/// written by a shader or a render pass.
+const TEXTURE_USAGE_WRITES: u64 = 0x2 | 0x4;
+
 /// The plane `plane` of the texture `m` makes over a buffer of a device cache laid out at the
 /// GPU's pitch, `laid`: its first byte, and its chroma plane's where its facts name a second
 /// plane, at the same byte of the same row of the same plane of the cache, its rows at the
-/// cache's pitch ([`surface_cache::Repitched::place`]). A texture whose texels, `row_bytes` by
-/// `rows` from its first, pass its plane's, made over its plane all the same, reads the cache's
-/// bytes past them, not the guest's beside the plane; one whose first byte lies in no plane of
-/// the cache keeps the surface's place, over bytes of the cache that are not its own. Each says
-/// so. The bundle places each texture over a plane of the surface where the layout the cache's
-/// comes from places the plane, at the plane's pitch (`RgfxIOSurface.mm`), so its first byte lies
-/// in the plane's texels, and checks that one made at an origin inside the plane fits it; one at
-/// the plane's first byte it does not check.
+/// cache's pitch ([`surface_cache::Repitched::place`]). `None` where the texture does not lie
+/// in its plane's texels there: its first byte, or its chroma plane's, in no plane's texels, or
+/// its texels, `row_bytes` by `rows` from its first, past its plane's. Such a texture lies over the
+/// block's wide home at the surface's own place instead (`surface_cache`, "Wider than the
+/// plane"), as all three Macs make it: an RG8 texture of 128-byte rows over a 64-wide L008
+/// surface of 128-byte rows (oracle_surftex `l008.fmt.rg8`), or one 128 texels wide over a BGRA
+/// surface of 512-byte rows (`bgrapad.128x64`).
 fn laid_plane(
     laid: &surface_cache::Repitched,
     plane: SurfacePlane,
     row_bytes: u64,
     rows: u64,
-    m: &RgfxTextureFromIOSurface,
-) -> SurfacePlane {
-    let chroma = (plane.facts)
-        .filter(|f| f.plane_count >= 2)
-        .map(|f| laid.place(f.chroma_offset, f.chroma_bytes_per_row));
-    let (Some(placed), None | Some(Some(_))) =
-        (laid.place(plane.offset, plane.bytes_per_row), chroma)
-    else {
-        log::warn!(
-            target: "reims_vgpu::graphics",
-            "the texture {:#x} over plane {} of the IOSurface {} at {} with rows {} apart lies in \
-             no plane of its device cache laid out at the GPU's pitch: made at the surface's place, \
-             over bytes of the cache that are not its texels",
-            m.obj_id, m.plane, m.iosurface_id, m.offset, m.bytes_per_row
-        );
-        return plane;
+) -> Option<SurfacePlane> {
+    let chroma = match (plane.facts).filter(|f| f.plane_count >= 2) {
+        Some(f) => Some(laid.place(f.chroma_offset, f.chroma_bytes_per_row)?),
+        None => None,
     };
+    let placed = laid.place(plane.offset, plane.bytes_per_row)?;
     if row_bytes > placed.room.0 || rows > placed.room.1 {
-        log::warn!(
-            target: "reims_vgpu::graphics",
-            "the texture {:#x} over plane {} of the IOSurface {} ({} bytes by {} rows from {}) \
-             passes its plane: over its device cache laid out at the GPU's pitch it reads the \
-             cache's bytes past the plane's texels",
-            m.obj_id, m.plane, m.iosurface_id, row_bytes, rows, m.offset
-        );
+        return None;
     }
     let facts = plane.facts.map(|f| match chroma {
-        Some(Some(c)) => SurfaceFacts {
+        Some(c) => SurfaceFacts {
             chroma_offset: c.offset,
             chroma_bytes_per_row: c.bytes_per_row,
             ..f
         },
-        _ => f,
+        None => f,
     });
-    SurfacePlane {
+    Some(SurfacePlane {
         offset: placed.offset,
         bytes_per_row: placed.bytes_per_row,
         facts,
         ..plane
-    }
+    })
 }
 
 /// An OSType as its four characters, quoted, where each is printable ASCII; else its value in hex.
