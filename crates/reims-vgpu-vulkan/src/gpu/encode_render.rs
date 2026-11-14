@@ -3740,10 +3740,11 @@ impl VulkanRenderEncoder {
         self.dropped.iter().find(|d| d.index == index).copied()
     }
 
-    /// Fails the command buffer from this pass on with Metal's page fault where the pass keeps an
-    /// attachment whose texture lies over read-only memory the runtime copies
-    /// ([`over_read_only_copy`], [`stores_out`]), as `sources` holds the pass descriptor's: Metal's
-    /// GPU faults the command buffer there, where the runtime's copy would take the store
+    /// Tells the command buffer that this pass faults it where the pass keeps an attachment whose
+    /// texture lies over read-only memory the runtime copies ([`over_read_only_copy`],
+    /// [`stores_out`]), as `sources` holds the pass descriptor's: Metal's GPU faults the command
+    /// buffer there from this pass on, as the runtime faults it itself, so its commit dies where
+    /// it fails another way too
     /// ([`crate::gpu::command::CommandBufferObject::faults_at_read_only_store`]). One whose store
     /// action is `Unknown` waits for its late store action ([`Self::late_store`]). One that does
     /// not store (`DontCare`, `MultisampleResolve`) is sent, as Metal completes it, its writes
@@ -5600,13 +5601,21 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     const UNKNOWN: u64 = 4;
 
-    /// A pass whose colour attachment is a 16 × 16 `BGRA8Unorm` texture over a guest's read-only
-    /// buffer (made with bit 24, `resource::tests::read_only_buffer`), loaded by `load` and
-    /// stored by `store`, or by `late`'s store action set in the pass where given, drawing
-    /// nothing, committed and completed: its command buffer's status and error code, and whether
-    /// the pages stayed zeros.
+    /// What a command buffer of `q` shows whose render pass's colour attachment is a 16 × 16
+    /// `BGRA8Unorm` texture over a guest's read-only buffer (made with bit 24,
+    /// `resource::tests::read_only_buffer`), loaded by `load` and stored by `store`, or by
+    /// `late`'s store action set in the pass where given, drawing nothing, a blit before the pass
+    /// filling a buffer with 0x5a and one after it another with 0x6b, then an event signal,
+    /// committed and completed: its status and error, the first byte of each buffer, whether the
+    /// signal fired, and whether the pages stayed zeros.
     #[cfg(target_os = "linux")]
-    fn read_only_pass(load: u64, store: u64, late: Option<u64>) -> (u64, Option<i64>, bool) {
+    fn read_only_pass_on(
+        q: &crate::gpu::command::VulkanCommandQueue,
+        load: u64,
+        store: u64,
+        late: Option<u64>,
+    ) -> String {
+        use crate::core::platform::event::{EventRef, SharedEvent as _};
         use crate::core::platform::os::vm::HostVm as _;
 
         use crate::gpu::resource::tests::{bgra_over, host_bytes_at, read_only_buffer};
@@ -5630,8 +5639,22 @@ pub(crate) mod tests {
         };
         pass.set_color_attachment(OnFault::Die, 0, &attachment)
             .unwrap();
-        let q = d.new_command_queue().unwrap();
+        let blank = || buffer::<crate::platform::VulkanPlatform>(&d, 16, 0, &[0; 16]);
+        let (before, after) = (blank(), blank());
+        let event = d.new_shared_event().unwrap();
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let fill = |b, value| {
+            let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+            let range = NsRange::new(0, 16);
+            let fill = BlitCmd::FillBuffer {
+                buffer: b,
+                range,
+                value,
+            };
+            blit.encode(OnFault::Die, fill).unwrap();
+            blit.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+        };
+        fill(&before, 0x5a);
         let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
         if let Some(store_action) = late {
             let set = RenderCmd::SetColorStoreAction {
@@ -5641,77 +5664,158 @@ pub(crate) mod tests {
             e.encode(OnFault::Die, set).unwrap();
         }
         e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+        fill(&after, 0x6b);
+        cb.encode_signal(Some(EventRef::Shared(&event)), 1).unwrap();
         cb.commit(OnFault::Die).unwrap();
         cb.wait_until_completed(OnFault::Die).unwrap();
         let zeros = host_bytes_at(pages, 16 * 64).iter().all(|&b| b == 0);
-        let answer = (cb.status().0, cb.error().map(|e| e.code), zeros);
+        // SAFETY: Shared buffers' bytes, read after their command buffer completed.
+        let first =
+            |b: &crate::gpu::resource::VulkanBuffer| unsafe { *b.contents().as_ptr::<u8>() };
+        let line = format!(
+            "status {} error {:?} before {:#x} after {:#x} signal {} zeros {zeros}",
+            cb.status().0,
+            cb.error().map(|e| e.code),
+            first(&before),
+            first(&after),
+            event.wait_until_signaled_value(1, 1),
+        );
         drop((cb, e, pass, target, ro));
         assert!(
             crate::remap::VulkanVm::new()
                 .deallocate(pages, PAGE)
                 .is_success()
         );
-        answer
+        line
     }
 
-    /// Commits an empty command buffer of a fresh queue: the selector it dies at, if it dies.
+    /// [`read_only_pass_on`]'s line of a command buffer whose pass stores the attachment
+    /// (`Store`) into the read-only memory: Metal's GPU faults it
+    /// (`MTLCommandBufferErrorPageFault`, status 5, code 3), the pages staying zeros and every
+    /// event signal firing (measured on the M3 Max, macOS 27.0.1, metal2vulkan's
+    /// `probes/readonly_gpu_writes.m`; the runtime's `store_out.rs`). The pass and every encoder
+    /// after it run nothing and the blit before it runs, as the runtime answers every fault:
+    /// which of them Metal runs is not measured for this fault.
     #[cfg(target_os = "linux")]
-    fn later_commit() -> Option<&'static str> {
-        let q = dev().new_command_queue().unwrap();
+    const FAULTED: &str = "status 5 error Some(3) before 0x5a after 0x0 signal true zeros true";
+
+    /// What a command buffer of `q` shows that fills a new 16-byte buffer with 0x11 in a blit,
+    /// then signals an event, committed and completed: its status and error, the buffer's first
+    /// byte and whether the signal fired.
+    #[cfg(target_os = "linux")]
+    fn filled_on(q: &crate::gpu::command::VulkanCommandQueue) -> String {
+        use crate::core::platform::event::{EventRef, SharedEvent as _};
+
+        let d = dev();
+        let b = buffer::<crate::platform::VulkanPlatform>(&d, 16, 0, &[0; 16]);
+        let event = d.new_shared_event().unwrap();
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-        match catch_death(|| cb.commit(OnFault::Die)) {
-            Ok(_) => {
-                cb.wait_until_completed(OnFault::Die).unwrap();
-                None
-            }
-            Err(site) => Some(site.file),
-        }
+        let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        let fill = BlitCmd::FillBuffer {
+            buffer: &b,
+            range: NsRange::new(0, 16),
+            value: 0x11,
+        };
+        blit.encode(OnFault::Die, fill).unwrap();
+        blit.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+        cb.encode_signal(Some(EventRef::Shared(&event)), 1).unwrap();
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        // SAFETY: a Shared buffer's bytes, read after its command buffer completed.
+        let first = unsafe { *b.contents().as_ptr::<u8>() };
+        format!(
+            "status {} error {:?} filled {first:#x} signal {}",
+            cb.status().0,
+            cb.error().map(|e| e.code),
+            event.wait_until_signaled_value(1, 1),
+        )
     }
+
+    /// [`filled_on`]'s line of a command buffer that runs.
+    #[cfg(target_os = "linux")]
+    const FILLED: &str = "status 4 error None filled 0x11 signal true";
 
     /// A pass that stores a colour attachment over a guest's read-only memory (`Store`) fails its
-    /// command buffer with Metal's page fault (`MTLCommandBufferErrorPageFault`, 3), as Metal's
-    /// GPU faults it, the pages staying zeros, where the runtime's copy of them would take the
-    /// store; the commit of every later command buffer of the process then dies, as Metal fails
-    /// each with a code nothing recorded (`crate::gpu::command`'s docs; one process per test, as
-    /// nextest runs them). Linux's: on macOS the pass goes to Metal, whose fault this host's GPU
-    /// takes no test of
+    /// command buffer as Metal's GPU faults it ([`FAULTED`]), where the runtime's copy of the
+    /// pages would take the store, and the process goes on: a command buffer committed after it
+    /// on its queue runs, as does one on a new queue, as on Metal (one fault a process, measured
+    /// on the M3 Max, macOS 27.0.1, plain Metal: m3-max-29110, the next command buffer of the
+    /// queue `Completed`, twice; m3-max-28796 and m3-max-28797, at once and 100 ms on and on a
+    /// new queue). Linux's: on macOS the pass goes to Metal, whose fault this host's GPU takes no
+    /// test of
     #[cfg(target_os = "linux")]
     #[test]
     fn a_store_into_read_only_memory_fails_its_command_buffer() {
-        assert_eq!(later_commit(), None, "before the fault");
-        assert_eq!(read_only_pass(CLEAR, STORE, None), (5, Some(3), true));
-        assert_eq!(later_commit(), Some("commit"), "after it");
+        let q = dev().new_command_queue().unwrap();
+        assert_eq!(filled_on(&q), FILLED, "before the fault");
+        assert_eq!(read_only_pass_on(&q, CLEAR, STORE, None), FAULTED);
+        assert_eq!(filled_on(&q), FILLED, "its queue after it");
+        let other = dev().new_command_queue().unwrap();
+        assert_eq!(filled_on(&other), FILLED, "a new queue after it");
     }
 
     /// A late store action that stores the colour attachment over a guest's read-only memory,
-    /// of a pass that left it `Unknown`, fails the command buffer as `Store` given at once does
-    /// (`a_store_into_read_only_memory_fails_its_command_buffer`)
+    /// of a pass that left it `Unknown`, fails the command buffer as `Store` given at once does,
+    /// and its queue runs on (`a_store_into_read_only_memory_fails_its_command_buffer`)
     #[cfg(target_os = "linux")]
     #[test]
     fn a_late_store_into_read_only_memory_fails_its_command_buffer() {
-        assert_eq!(
-            read_only_pass(CLEAR, UNKNOWN, Some(STORE)),
-            (5, Some(3), true)
-        );
-        assert_eq!(later_commit(), Some("commit"));
+        let q = dev().new_command_queue().unwrap();
+        let line = read_only_pass_on(&q, CLEAR, UNKNOWN, Some(STORE));
+        assert_eq!(line, FAULTED);
+        assert_eq!(filled_on(&q), FILLED);
+    }
+
+    /// A queue's second command buffer that a store into read-only memory faulted revokes it, as
+    /// Metal's: every command buffer committed on it after that fails at once with
+    /// `MTLCommandBufferErrorAccessRevoked` (status 5, code 4), running none of its work and
+    /// firing none of its signals, where a new queue runs, and the process goes on (measured on
+    /// the M3 Max, macOS 27.0.1, plain Metal, m3-max-29110: four faulting runs on one queue, every
+    /// command buffer after the queue's second fault failing; the runtime's
+    /// `command_buffer/revocation.rs`). A command buffer that runs between the two faults leaves
+    /// the count as it was, as in m3-max-29110's runs, each a faulting command buffer then one
+    /// that reads back
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_only_faults_revoke_queues_as_metals() {
+        let q = dev().new_command_queue().unwrap();
+        assert_eq!(read_only_pass_on(&q, CLEAR, STORE, None), FAULTED);
+        assert_eq!(filled_on(&q), FILLED, "after the first fault");
+        assert_eq!(read_only_pass_on(&q, LOAD, STORE, None), FAULTED);
+        for later in 0..2 {
+            assert_eq!(
+                filled_on(&q),
+                "status 5 error Some(4) filled 0x0 signal false",
+                "after the second fault, {later}"
+            );
+        }
+        let other = dev().new_command_queue().unwrap();
+        assert_eq!(filled_on(&other), FILLED, "a new queue");
+        assert_eq!(read_only_pass_on(&other, CLEAR, STORE, None), FAULTED);
+        assert_eq!(filled_on(&other), FILLED, "the new queue's first fault");
     }
 
     /// A pass over a colour attachment over a guest's read-only memory that does not store it
-    /// completes with no error, as Metal's does, the pages staying zeros: `DontCare`, given at
-    /// once or late, after a clear, a load or no load; and every later command buffer runs
+    /// completes with no error, as Metal's does, every encoder running and the pages staying
+    /// zeros: `DontCare`, given at once or late, after a clear, a load or no load; and the queue
+    /// runs on
     #[cfg(target_os = "linux")]
     #[test]
     fn a_pass_that_does_not_store_read_only_memory_completes() {
+        let q = dev().new_command_queue().unwrap();
         for (load, store, late) in [
             (CLEAR, DONT_CARE, None),
             (LOAD, DONT_CARE, None),
             (LOAD_DONT_CARE, DONT_CARE, None),
             (CLEAR, UNKNOWN, Some(DONT_CARE)),
         ] {
-            let answer = read_only_pass(load, store, late);
-            assert_eq!(answer, (4, None, true), "{load} {store} {late:?}");
+            assert_eq!(
+                read_only_pass_on(&q, load, store, late),
+                "status 4 error None before 0x5a after 0x6b signal true zeros true",
+                "{load} {store} {late:?}"
+            );
         }
-        assert_eq!(later_commit(), None);
+        assert_eq!(filled_on(&q), FILLED);
     }
 
     /// A pass that resolves a multisample attachment of the device's memory into a texture over

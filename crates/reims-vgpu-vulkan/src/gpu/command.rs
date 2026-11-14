@@ -52,7 +52,9 @@
 //!   buffer whose records the GPU may have written is asked at the runtime's host step instead,
 //!   which reads them once the work before it completed, and dies there, at `commit`, at a
 //!   command that decides a death ([`executions`]). An encoder the command buffer's failure runs
-//!   nothing of is not asked.
+//!   nothing of is not asked, whether this platform commits the failure or the runtime makes it
+//!   itself, at a draw of primitive type 9 or a pass's store into read-only memory
+//!   ([`CommandBufferObject::runs_nothing_from`]).
 //! - **A draw's or dispatch's pipeline the driver did not make**, which the runtime makes while
 //!   the command goes on and reports as the command buffer's failure
 //!   (`CommandBufferError::PipelineCreation`), dies
@@ -137,16 +139,22 @@
 //!   encoders, its protection options, or another type-9 draw's other failure, dies at the commit, as do two different ways at once of any
 //!   kind, which nothing measured.
 //!
-//!   A render pass that stores an attachment into read-only memory the runtime copies
-//!   (`Store`, `StoreAndMultisampleResolve`), where Metal's GPU faults the command buffer
+//!   At a render pass that stores an attachment into read-only memory the runtime copies
+//!   (`Store`, `StoreAndMultisampleResolve`), Metal's GPU faults the command buffer
 //!   (`kIOGPUCommandBufferCallbackErrorPageFault`, measured on the M3 Max, macOS 27.0.1, by
-//!   metal2vulkan's `probes/readonly_gpu_writes.m`) and the runtime's copy would take the store,
-//!   fails it so (`MTLCommandBufferErrorPageFault`, 3), its render encoder and every encoder
-//!   after it running nothing and every event signal firing, as a type-9 draw's page fault does
-//!   ([`CommandBufferObject::faults_at_read_only_store`]); which encoders of such a command
-//!   buffer run, and whether its signals fire, are not measured for this fault. Metal then fails
-//!   every later command buffer of the process, with a code nothing recorded, so the commit of
-//!   one dies ([`READ_ONLY_FAULTED`]).
+//!   metal2vulkan's `probes/readonly_gpu_writes.m`), and the runtime faults it so itself
+//!   (`MTLCommandBufferErrorPageFault`, 3; the runtime's `store_out.rs`): its render encoder and
+//!   every encoder after it run nothing and every event signal fires, as a type-9 draw's page
+//!   fault does. Which encoders before the pass run is not measured for this fault. Such a pass
+//!   is told to the command buffer as a failure the runtime makes
+//!   ([`CommandBufferObject::faults_at_read_only_store`]), so one that fails another way too dies
+//!   at the commit, as above. The fault counts against its queue as every page fault does: the
+//!   command buffers committed after it on the same queue, at once or 100 ms on, and on a new
+//!   queue run, and the queue's second fault revokes it, every later command buffer of that queue
+//!   failing with `AccessRevoked` (4), as Metal's (measured on the M3 Max, macOS 27.0.1, plain
+//!   Metal, `probes/readonly_gpu_writes.m` and `readonly_encode_answers.m`, m3-max-29110,
+//!   m3-max-28796 and m3-max-28797; the runtime's `command_buffer/revocation.rs`;
+//!   `read_only_faults_revoke_queues_as_metals`). Other queues serve on.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -227,9 +235,11 @@ pub struct CommandBufferObject {
     /// How Metal's GPU fails it for what its encoders did ([`Failing`]), which its commit fails
     /// it with ([`CommandBufferObject::failure`]).
     failing: Mutex<Vec<Failing>>,
-    /// How Metal's GPU fails it at its draws of primitive type 9, which the runtime fails it
-    /// with itself ([`CommandBufferObject::fails_at_type_9`]).
-    type_9: Mutex<Vec<Failing>>,
+    /// How Metal's GPU fails it where the runtime fails it so itself: at its draws of primitive
+    /// type 9 ([`CommandBufferObject::fails_at_type_9`]) and at its render passes' stores into
+    /// read-only memory the runtime copies
+    /// ([`CommandBufferObject::faults_at_read_only_store`]).
+    by_runtime: Mutex<Vec<Failing>>,
     /// The protection options `setProtectionOptions:` set, which the runtime does not hold.
     protection: Mutex<Protection>,
     /// Whether it carries the submission handler that takes Metal's allocation for its work for
@@ -242,17 +252,7 @@ pub struct CommandBufferObject {
     /// Whether it signals an event as it is scheduled (`encodeSignalEventScheduled:value:`),
     /// which keeps it whole ([`CommandBufferObject::splits`]).
     signals_scheduled: AtomicBool,
-    /// Whether a render pass in it stores an attachment into read-only memory the runtime copies,
-    /// which fails it ([`CommandBufferObject::faults_at_read_only_store`]): its commit marks the
-    /// process's later commits ([`READ_ONLY_FAULTED`]).
-    read_only_store: AtomicBool,
 }
-
-/// Whether a command buffer of the process failed at a render pass's store into read-only memory
-/// ([`CommandBufferObject::faults_at_read_only_store`]), committed before: Metal fails every later
-/// command buffer of the process with a code nothing recorded (the module docs), so the commit of
-/// a later one dies.
-static READ_ONLY_FAULTED: AtomicBool = AtomicBool::new(false);
 
 /// The submission handler of a command buffer that holds work for Metal's tiler
 /// ([`CommandBufferObject::tiler_work`]): Metal's allocation for that work. Metal takes its own
@@ -389,7 +389,7 @@ impl CommandBufferObject {
         plain(|| {
             self.open_encoders.load(Ordering::SeqCst) == 0
                 && self.failing.lock().is_empty()
-                && self.type_9.lock().is_empty()
+                && self.by_runtime.lock().is_empty()
                 && {
                     let protection = self.protection.lock();
                     protection.options == 0 && !protection.used
@@ -408,23 +408,24 @@ impl CommandBufferObject {
     }
 
     /// Records that the render pass at `from`, in the order the runtime ended its encoders, stores
-    /// an attachment into read-only memory the runtime copies, which fails it with Metal's page
-    /// fault from that pass on, its event signals firing (the module docs), and marks the process's
-    /// later commits at its own ([`READ_ONLY_FAULTED`]).
+    /// an attachment into read-only memory the runtime copies, at which Metal's GPU faults it from
+    /// that pass on, its event signals firing, as the runtime faults it itself (the module docs):
+    /// its commit dies where it fails another way too ([`CommandBufferObject::failure`]).
     pub(crate) fn faults_at_read_only_store(&self, from: usize) {
-        self.fail(Failing {
-            code: rt::CommandBufferError::PageFault.metal_code(),
-            from,
-            signals: true,
+        plain(|| {
+            self.by_runtime.lock().push(Failing {
+                code: rt::CommandBufferError::PageFault.metal_code(),
+                from,
+                signals: true,
+            });
         });
-        self.read_only_store.store(true, Ordering::SeqCst);
     }
 
     /// Records `failing`, how a draw of primitive type 9 in it fails it, as Metal's GPU does,
     /// which the runtime fails it with itself (`crate::gpu::encode_render`'s `nine`): its
     /// commit dies where it fails another way too ([`CommandBufferObject::failure`]).
     pub(crate) fn fails_at_type_9(&self, failing: Failing) {
-        plain(|| self.type_9.lock().push(failing));
+        plain(|| self.by_runtime.lock().push(failing));
     }
 
     /// `execution`, a command of the encoder it made last, is checked at its commit, where its
@@ -435,18 +436,13 @@ impl CommandBufferObject {
     }
 
     /// Checks at its commit the executions [`CommandBufferObject::checked_at_commit`] took, in
-    /// their order, but those of an encoder `failed` runs nothing of; each whose records it read
-    /// for a death is held as read until it ends ([`executions::reads`]).
-    fn check_executions(&self, failed: Option<&rt::FailedEncoders>, progress: Option<&Progress>) {
+    /// their order, but those of an encoder from `failed` on, which run nothing; each whose
+    /// records it read for a death is held as read until it ends ([`executions::reads`]).
+    fn check_executions(&self, failed: Option<usize>, progress: Option<&Progress>) {
         let taken = std::mem::take(&mut *self.executions.lock());
-        let runs = |at: usize| match failed {
-            Some(rt::FailedEncoders::From(from)) => at < *from,
-            Some(rt::FailedEncoders::Set(set)) => !set.contains(&at),
-            _ => true,
-        };
         let read: Vec<_> = taken
             .into_iter()
-            .filter(|(at, _)| runs(*at))
+            .filter(|(at, _)| failed.is_none_or(|from| *at < from))
             .filter_map(|(_, execution)| execution.check())
             .collect();
         if let Some(progress) = progress {
@@ -459,10 +455,11 @@ impl CommandBufferObject {
     /// How Metal's GPU fails it, at its commit (`sel`): what its encoders did ([`Failing`]),
     /// and protection options with a bit from 0x10 up, which fail it with [`INVALID_INPUT`]
     /// though no encoder was made under them (measured), all of its encoders running; `None`
-    /// where nothing does, or only its draws of primitive type 9, which the runtime fails it at
-    /// ([`CommandBufferObject::fails_at_type_9`]). Two different ways at once, which nothing
-    /// measured, die. The encoders it fails are always [`rt::FailedEncoders::From`] the first
-    /// that runs nothing, never a `Set`.
+    /// where nothing does, or only the failures the runtime makes itself, at its draws of
+    /// primitive type 9 ([`CommandBufferObject::fails_at_type_9`]) and its passes' stores into
+    /// read-only memory ([`CommandBufferObject::faults_at_read_only_store`]). Two different ways
+    /// at once, which nothing measured, die. The encoders it fails are always
+    /// [`rt::FailedEncoders::From`] the first that runs nothing, never a `Set`.
     ///
     /// A command buffer that fails so is never cut into parts ([`CommandBufferObject::splits`]),
     /// so what fails is the encoders of one commit of the runtime's: a failure from an encoder
@@ -483,7 +480,7 @@ impl CommandBufferObject {
             });
         }
         let own = ways.len();
-        ways.extend(plain(|| self.type_9.lock().clone()));
+        ways.extend(plain(|| self.by_runtime.lock().clone()));
         let first = *ways.first()?;
         if ways
             .iter()
@@ -501,6 +498,20 @@ impl CommandBufferObject {
         failure.encoders = rt::FailedEncoders::From(from);
         failure.signals = first.signals;
         Some(failure)
+    }
+
+    /// The first of its encoders that runs nothing, by its place among those the runtime ended:
+    /// the first that `failure` ([`CommandBufferObject::failure`]) fails, or that a failure the
+    /// runtime makes itself fails ([`CommandBufferObject::fails_at_type_9`],
+    /// [`CommandBufferObject::faults_at_read_only_store`]), each failing every encoder from its
+    /// own on; `None` where none fails.
+    fn runs_nothing_from(&self, failure: Option<&rt::CommitFailure>) -> Option<usize> {
+        let own = match failure.map(|f| &f.encoders) {
+            Some(rt::FailedEncoders::From(from)) => Some(*from),
+            _ => None,
+        };
+        let by_runtime = plain(|| self.by_runtime.lock().iter().map(|w| w.from).min());
+        own.into_iter().chain(by_runtime).min()
     }
 
     /// Its progress ([`Progress`]), for `sel`, an encoder's command: made the first time one asks,
@@ -912,12 +923,11 @@ impl CommandQueue<VulkanPlatform> for VulkanCommandQueue {
             committed: AtomicBool::new(false),
             made: AtomicUsize::new(0),
             failing: Mutex::new(Vec::new()),
-            type_9: Mutex::new(Vec::new()),
+            by_runtime: Mutex::new(Vec::new()),
             protection: Mutex::new(Protection::default()),
             tiler: AtomicBool::new(false),
             executions: Mutex::new(Vec::new()),
             signals_scheduled: AtomicBool::new(false),
-            read_only_store: AtomicBool::new(false),
         })))
     }
 
@@ -1324,22 +1334,12 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         // The guest's GPU work, which keeps the GPU awake ([`crate::awake`]).
         self.device.awake.touch();
         let progress = self.progress.lock().clone();
-        if READ_ONLY_FAULTED.load(Ordering::Acquire) {
-            unrepresentable(
-                "commit",
-                "a command buffer committed after a render pass's store into read-only memory \
-                 failed one of its process's, where Metal fails every later command buffer of \
-                 the process with a code nothing recorded",
-            );
-        }
-        if self.read_only_store.load(Ordering::SeqCst) {
-            READ_ONLY_FAULTED.store(true, Ordering::Release);
-        }
         encoding("commit", Policy::Dies, || {
             predication::boundary(&self.predication, "commit");
             self.committed.store(true, Ordering::SeqCst);
             let failure = self.failure("commit");
-            self.check_executions(failure.as_ref().map(|f| &f.encoders), progress.as_deref());
+            let failed = self.runs_nothing_from(failure.as_ref());
+            self.check_executions(failed, progress.as_deref());
             if let Some(progress) = &progress {
                 progress.committing();
             }
@@ -1412,12 +1412,11 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
             committed: AtomicBool::new(false),
             made: AtomicUsize::new(0),
             failing: Mutex::new(Vec::new()),
-            type_9: Mutex::new(Vec::new()),
+            by_runtime: Mutex::new(Vec::new()),
             protection: Mutex::new(Protection::default()),
             tiler: AtomicBool::new(false),
             executions: Mutex::new(Vec::new()),
             signals_scheduled: AtomicBool::new(false),
-            read_only_store: AtomicBool::new(false),
         });
         self.commit(on)?;
         Ok(Some(next))
@@ -2836,15 +2835,18 @@ mod tests {
     }
 
     /// A command buffer Metal's GPU fails in one way fails so at its commit, from the first
-    /// encoder that fails; one nothing fails commits as it is, and one only its draws of
-    /// primitive type 9 fail, of one kind, is left to the runtime. One it would fail in two, a
-    /// draw of type 9's and another of its own or of another kind, dies at its commit, as
-    /// nothing measured it
+    /// encoder that fails; one nothing fails commits as it is, and one only the runtime's own
+    /// failures fail, of one kind (its draws of primitive type 9, its passes' stores into
+    /// read-only memory), is left to the runtime. One it would fail in two, one of the runtime's
+    /// and another of its own or of another kind, dies at its commit, as nothing measured it.
+    /// The first encoder that runs nothing is the first either fails, whose executions are not
+    /// checked
     #[test]
     fn a_command_buffer_failing_two_ways_dies_at_its_commit() {
         let q = dev().new_command_queue().unwrap();
         let cb = buffer(&q);
         assert!(cb.failure("commit").is_none(), "nothing fails it");
+        assert_eq!(cb.runs_nothing_from(None), None);
         for from in [3, 1] {
             cb.fail(Failing {
                 code: PROTECTION_VIOLATION,
@@ -2854,9 +2856,10 @@ mod tests {
         }
         let failure = cb.failure("commit").unwrap();
         assert_eq!(
-            (failure.code, failure.encoders, failure.signals),
-            (PROTECTION_VIOLATION, rt::FailedEncoders::From(1), false)
+            (failure.code, &failure.encoders, failure.signals),
+            (PROTECTION_VIOLATION, &rt::FailedEncoders::From(1), false)
         );
+        assert_eq!(cb.runs_nothing_from(Some(&failure)), Some(1));
         let hang = Failing {
             code: rt::CommandBufferError::GpuHang.metal_code(),
             from: 2,
@@ -2870,9 +2873,27 @@ mod tests {
             cb.fails_at_type_9(Failing { from, ..hang });
         }
         assert!(cb.failure("commit").is_none(), "type 9 alone");
-        cb.fails_at_type_9(Failing {
+        assert_eq!(cb.runs_nothing_from(None), Some(2));
+        let fault = Failing {
             code: rt::CommandBufferError::PageFault.metal_code(),
             ..hang
+        };
+        cb.fails_at_type_9(fault);
+        let site = catch_death(|| cb.failure("commit")).unwrap_err();
+        assert_eq!(site.file, "commit");
+        // A pass's store into read-only memory, alone, beside a type-9 draw's page fault, and
+        // beside a failure of its own.
+        let cb = buffer(&q);
+        cb.faults_at_read_only_store(3);
+        assert!(cb.failure("commit").is_none(), "a read-only store alone");
+        assert_eq!(cb.runs_nothing_from(None), Some(3));
+        cb.fails_at_type_9(Failing { from: 1, ..fault });
+        assert!(cb.failure("commit").is_none(), "beside a type-9 page fault");
+        assert_eq!(cb.runs_nothing_from(None), Some(1));
+        cb.fail(Failing {
+            code: PROTECTION_VIOLATION,
+            from: 4,
+            signals: false,
         });
         let site = catch_death(|| cb.failure("commit")).unwrap_err();
         assert_eq!(site.file, "commit");

@@ -35,11 +35,11 @@
 //!   or copy into the buffer, a pass's visibility results), and so is a pass whose attachment lies
 //!   in it but does not store it (`DontCare`, `MultisampleResolve`); a pass that stores such an
 //!   attachment (`Store`, `StoreAndMultisampleResolve`) fails its command buffer with Metal's page
-//!   fault, and every later command buffer of its task dies at its commit, as Metal fails each with
-//!   a code nothing recorded (`crate::gpu::encode_render`, `crate::gpu::command`); and a resolve
-//!   into such a texture, a pass that keeps it by `CustomSampleDepthStore`, a write of a texture
-//!   over it by a shader or a blit, and a CPU write of one die as [`kept_write`], as what Metal
-//!   does there is unmeasured, or ends the process.
+//!   fault, as the runtime faults it itself, the fault counting against its queue as Metal's
+//!   does: the queue's second revokes it (`crate::gpu::encode_render`, `crate::gpu::command`);
+//!   and a resolve into such a texture, a pass that keeps it by `CustomSampleDepthStore`, a write
+//!   of a texture over it by a shader or a blit, and a CPU write of one die as [`kept_write`], as
+//!   what Metal does there is unmeasured, or ends the process.
 //!
 //! On macOS neither is taken: MoltenVK hands Metal the pages, or a read-only view of them made
 //! with bit 24, and Metal's GPU answers every write there itself.
@@ -50,9 +50,11 @@
 //! slot or a loaded address, `drawIndexedPrimitives` among them), a blit fill into it and a pass
 //! that keeps its visibility results in it, and drops those writes, over 8,314 runs; a colour,
 //! depth or stencil attachment of it stored back (`Store`), a multisample primary among them,
-//! fails the command buffer (`MTLCommandBufferErrorDomain`, a page fault) every run, the process
-//! going on with every later command buffer failing too, with a code not recorded; the same
-//! attachments under `DontCare` or `Load` complete, as does a resolve texture attached and not
+//! fails the command buffer (`MTLCommandBufferErrorDomain`, a page fault) every run, the next
+//! command buffer of its queue and of a new queue running, and every command buffer of the queue
+//! after its second fault failing (`MTLCommandBufferErrorAccessRevoked`; m3-max-29110,
+//! m3-max-28796 and m3-max-28797, plain Metal; the runtime's `command_buffer/revocation.rs`); the
+//! same attachments under `DontCare` or `Load` complete, as does a resolve texture attached and not
 //! resolved into and a resolve out of a read-only primary. A resolve into such memory is
 //! unknown (no verdict over 520 processes), and so are a blit's copy into it and a texture's
 //! writes by a shader or a blit there, which no probe made.
