@@ -494,6 +494,13 @@ impl Default for VulkanVm {
     }
 }
 
+// Every method, the trait's defaults included, is the OS's VM's, as the call reports it: one the
+// trait answers by default and this impl did not name would answer the default where the OS's VM
+// answers otherwise, and turn its feature off unseen (docs/lessons.md).
+#[deny(
+    clippy::missing_trait_methods,
+    reason = "each method the trait answers by default is forwarded to the OS's VM"
+)]
 impl HostVm for VulkanVm {
     fn page_size(&self) -> u64 {
         self.vm.page_size()
@@ -597,6 +604,10 @@ impl HostVm for VulkanVm {
 
     fn view_room(&self) -> Option<u64> {
         self.vm.view_room()
+    }
+
+    fn view_mappings(&self, at: HostAddr, len: u64) -> Option<u64> {
+        self.vm.view_mappings(at, len)
     }
 
     fn view_groups(&self) -> Option<GroupLimits> {
@@ -718,6 +729,40 @@ mod tests {
         for (range, length) in [(view, 2 * page), (at, 2 * page), (anonymous, page)] {
             assert!(vm.deallocate(range, length).is_success());
         }
+    }
+
+    /// The VM answers each question the trait answers by default as the OS's VM does, of a view
+    /// made through it: on Linux the OS's VM answers each otherwise, and one falling through to
+    /// the default turns its feature off unseen (`view_mappings`, where room for a view let go of
+    /// no cached view, and `view_groups`, where no view was grouped)
+    #[test]
+    fn the_vm_answers_the_oss_questions_of_a_view() {
+        let vm = VulkanVm {
+            vm: OsVm::new(),
+            report: seen,
+        };
+        let os = OsVm::new();
+        let page = vm.page_size();
+        let n = 4u64;
+        let src = vm.allocate_aliasable(n * page).unwrap();
+        let view = vm.allocate_anywhere(n * page).unwrap();
+        // Backwards, a page a run.
+        let runs: Vec<_> = (0..n)
+            .map(|i| (src.wrapping_add((n - 1 - i) * page), page))
+            .collect();
+        vm.remap_runs_shared_overwrite(view, &runs).unwrap();
+        let held = vm.view_mappings(view, n * page);
+        assert_eq!(held, os.view_mappings(view, n * page));
+        let linux = cfg!(target_os = "linux");
+        assert_eq!(held.map(|mappings| mappings > 0), linux.then_some(true));
+        assert_eq!(vm.idle_view_mappings(), os.idle_view_mappings());
+        assert_eq!(vm.view_room().is_some(), os.view_room().is_some());
+        assert_eq!(vm.view_room().is_some(), linux);
+        assert_eq!(vm.view_groups(), os.view_groups());
+        for range in [view, src] {
+            assert!(vm.deallocate(range, n * page).is_success());
+        }
+        let _ = take();
     }
 
     /// A released hold makes its unmaps outside the overwrites' order, marked as being made
