@@ -353,7 +353,13 @@ runtime's own device. The switches above apply, and `resolution=` too.
   image, with the display's gamma and colour matrix, in sRGB: a GPU copy
   where the colour is at identity and the frame is the guest's scanout or a
   surface in the image's format, else a draw, as above; the window makes no
-  other copy of it. The compositor cannot be handed the guest's surface in
+  other copy of it where the compositor composites on the guest's GPU.
+  Where it composites on another GPU (a GPU in an eGPU enclosure or an x4
+  slot beside the screen's), the swapchain is that GPU's, and the guest's
+  GPU first brings a mirror of the presented frame in host memory up to
+  date, copying only its 64 × 64 tiles that changed; the pass then runs on
+  the compositor's GPU from the mirror (reims-vgpu's `graphics::mirror`).
+  The compositor cannot be handed the guest's surface in
   place: it lies in guest RAM a page a run, and a dma-buf over a 3648 × 2038
   surface's pages would take a udmabuf list of 7,261 entries, past the 1,024
   the kernel takes by default. `manual`
