@@ -106,6 +106,7 @@
 //!   a command of the other kind, and a Private buffer's command each answer a command object).
 
 use std::collections::BTreeSet;
+use std::marker::PhantomData;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -1256,7 +1257,7 @@ impl IndirectCommandBuffer<VulkanPlatform> for VulkanIcb {
                 sel: TAKE,
                 after: After::Nothing,
                 alone: None,
-                set: render_set,
+                kind: PhantomData::<RenderSets>,
             };
             let done = plain_at(TAKE, || {
                 self.raw.set_render_command(command_index, &mut sets)
@@ -1294,7 +1295,7 @@ impl IndirectCommandBuffer<VulkanPlatform> for VulkanIcb {
                 sel: TAKE,
                 after: After::Nothing,
                 alone: None,
-                set: compute_set,
+                kind: PhantomData::<ComputeSets>,
             };
             let done = plain_at(TAKE, || {
                 self.raw.set_compute_command(command_index, &mut sets)
@@ -1476,26 +1477,26 @@ enum After {
 }
 
 /// A command's sets, as the runtime's `set_render_command` or `set_compute_command` takes them:
-/// each of `cmds` made into the runtime's set by `set`, in turn, ending at the first `set` does
-/// not make, which is kept (`alone`) for [`encode`] to send alone. The runtime takes a set once
+/// each of `cmds` made into the runtime's set by its kind `K` ([`MakeSet`]), in turn, ending at
+/// the first `K` does not make, which is kept (`alone`) for [`encode`] to send alone. The runtime takes a set once
 /// it made the one before ([`rt::IndirectCommandBuffer::set_render_command`]), so each set's
 /// [`After`] is noted as the next is taken, and the last's once the call returns: what the
 /// runtime made alone is noted. `sel` is the selector of the last set handed out, which a
 /// refusal is the set's of; while none is, the take's.
 ///
 /// [`encode`]: IndirectRenderCommand::encode
-struct Sets<'i, I, Cmd, F> {
+struct Sets<'i, I, K: MakeSet> {
     icb: &'i IcbObject,
     index: u32,
     cmds: I,
     sel: &'static str,
     /// What the last set handed out notes once made.
     after: After,
-    alone: Option<Cmd>,
-    set: F,
+    alone: Option<K::Cmd>,
+    kind: PhantomData<K>,
 }
 
-impl<I, Cmd, F> Sets<'_, I, Cmd, F> {
+impl<I, K: MakeSet> Sets<'_, I, K> {
     /// Note what the last set handed out set, which the runtime made.
     #[inline(always)]
     fn note(&mut self) {
@@ -1509,20 +1510,16 @@ impl<I, Cmd, F> Sets<'_, I, Cmd, F> {
     }
 }
 
-impl<I, Cmd, Set, F> Iterator for Sets<'_, I, Cmd, F>
-where
-    I: Iterator<Item = Cmd>,
-    F: FnMut(Cmd) -> Result<(Set, &'static str, After), Cmd>,
-{
-    type Item = Set;
+impl<I: Iterator<Item = K::Cmd>, K: MakeSet> Iterator for Sets<'_, I, K> {
+    type Item = K::Set;
 
     #[inline(always)]
-    fn next(&mut self) -> Option<Set> {
+    fn next(&mut self) -> Option<K::Set> {
         self.note();
         if self.alone.is_some() {
             return None;
         }
-        match (self.set)(self.cmds.next()?) {
+        match K::make(self.cmds.next()?) {
             Ok((set, sel, after)) => {
                 self.sel = sel;
                 self.after = after;
@@ -1533,6 +1530,42 @@ where
                 None
             }
         }
+    }
+}
+
+/// How [`Sets`] makes a command kind's sets: [`render_set`] or [`compute_set`], called by name,
+/// so that it inlines into the runtime's loop over the sets. Passed as a function, its `FnMut`
+/// shim was a call of its own, whose set came back through the caller's frame: stored field by
+/// field, then copied out in loads wider than those stores, each waiting for them to land.
+trait MakeSet {
+    type Cmd;
+    type Set;
+    fn make(cmd: Self::Cmd) -> Result<(Self::Set, &'static str, After), Self::Cmd>;
+}
+
+/// [`MakeSet`] of a render command: [`render_set`].
+struct RenderSets<'c>(PhantomData<&'c ()>);
+
+impl<'c> MakeSet for RenderSets<'c> {
+    type Cmd = IcbRenderCmd<'c, VulkanPlatform>;
+    type Set = rt::IndirectRenderSet<'c>;
+
+    #[inline(always)]
+    fn make(cmd: Self::Cmd) -> Result<(Self::Set, &'static str, After), Self::Cmd> {
+        render_set(cmd)
+    }
+}
+
+/// [`MakeSet`] of a compute command: [`compute_set`].
+struct ComputeSets<'c>(PhantomData<&'c ()>);
+
+impl<'c> MakeSet for ComputeSets<'c> {
+    type Cmd = IcbComputeCmd<'c, VulkanPlatform>;
+    type Set = rt::IndirectComputeSet<'c>;
+
+    #[inline(always)]
+    fn make(cmd: Self::Cmd) -> Result<(Self::Set, &'static str, After), Self::Cmd> {
+        compute_set(cmd)
     }
 }
 
