@@ -48,7 +48,7 @@ impl Backing {
     }
 
     /// The object, a no-copy buffer or heap, was made over memory of the caller's whose pages are
-    /// mapped read-only where `mapped_read_only` ([`crate::os::ImportView::read_only`]), with
+    /// mapped read-only where `mapped_read_only` (`os::ImportView::read_only`), with
     /// `MTLResourceOptions` bit 24 where `bit_24` or [`Backing::new`] was told so: its memory is
     /// read-only where either holds ([`Backing::read_only_now`]).
     pub(crate) fn imported(&self, mapped_read_only: bool, bit_24: bool) {

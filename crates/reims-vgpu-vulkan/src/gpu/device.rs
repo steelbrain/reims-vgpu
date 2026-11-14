@@ -409,11 +409,11 @@ fn keep_unrun<D, T>(made: &RaiseResult<Option<T>>, slot: Option<Slot<D>>) {
 /// [`crate::os::import_view`]), the deallocator,
 /// which runs at Metal's moment, and the keep-alive, which the
 /// runtime drops once it freed its import: it holds what the view keeps of the pages
-/// ([`crate::os::ImportView::release`]), and an unmap hold on the bytes' pages, so that core's
+/// (`os::ImportView::release`), and an unmap hold on the bytes' pages, so that core's
 /// unmap of its mapping of them through the platform's VM, which its deallocator may make, waits
 /// for the free ([`crate::remap::UnmapHold`]); whether the pages are mapped read-only
 /// ([`Backing::imported`]); whether the runtime may be told the pages are writable
-/// ([`crate::os::ImportView::vouched`]); and the word that the import was made, which the caller
+/// (`os::ImportView::vouched`); and the word that the import was made, which the caller
 /// gives once the runtime's call returned ([`crate::os::ImportMade`]).
 fn no_copy_release(
     start: NonNull<u8>,
@@ -446,7 +446,7 @@ struct NoCopyImport {
     run: Option<rt::Deallocator>,
     /// What keeps the import's pages mapped until the runtime freed it.
     keep: rt::KeepAlive,
-    /// The pages are mapped read-only ([`crate::os::ImportView::read_only`]).
+    /// The pages are mapped read-only (`os::ImportView::read_only`).
     read_only: bool,
     /// The runtime may be told the pages are writable.
     vouched: bool,
