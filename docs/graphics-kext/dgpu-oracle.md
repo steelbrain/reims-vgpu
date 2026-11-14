@@ -12,7 +12,8 @@ The probes are in `guest/bundle/tools/oracle` ([README](../../guest/bundle/tools
 `oracle_errors`, `oracle_source`, `oracle_ycbcr`, `oracle_ca_ycbcr`, `oracle_sampler`,
 `oracle_icb`, `oracle_order`, `oracle_names`, `oracle_surftex`, `oracle_reflection`,
 `oracle_mesh`, `oracle_events`, `oracle_texdesc`, `oracle_nilbind`, `oracle_complete`,
-`oracle_residency`, `oracle_threads`, `oracle_overlap` and `oracle_readonly`; the upload costs (Q17) are `guest/bundle/tools/upload_probe.m`'s.
+`oracle_residency`, `oracle_threads`, `oracle_overlap`, `oracle_readonly`, `oracle_failways`
+and `oracle_twinwrites`; the upload costs (Q17) are `guest/bundle/tools/upload_probe.m`'s.
 
 **Machines.** Every claim below is measured, on:
 - **AMD**: AMD Radeon Pro 5300M (Navi 14, `amdgpu_gfx1012`, 4 GB; AMDRadeonX6000 on
@@ -2047,6 +2048,95 @@ is made, or at the late store action or resolve texture: the runtime (metal2vulk
 faults it where all three Macs complete it *(class 4: outside the envelope; metal2vulkan takes
 it on, to complete it with the resolve dropped)*. On macOS MoltenVK hands Metal the pages, or a
 read-only view of them, and Metal answers.
+
+## Q39: a command buffer failed two ways: a read-only store-out beside protection options
+
+Probe: `oracle_failways.sh DEVICE` (`oracle_failways`), 11-14, every shape in a process of its
+own, against a writable control (`plain`): the M3 Max under macOS 27.0.1 (26A434), m3-max-29535
+(2 runs a shape) and m3-max-29547 (4 runs); the AMD 5300M and the Intel UHD 630 under macOS
+26.7.1 (25G241), m3-max-29536 and m3-max-29537 (2 runs; a probe error lost the shapes of four
+encoders there) and m3-max-29549 and m3-max-29550 (4 runs). A command buffer of compute encoders
+that each write a mark and a render pass that clears and stores a 4 x 4 RGBA8Unorm texture over a
+no-copy buffer made with bit 24 (Q38's store-out), each encoder followed by the signal of an
+event of its own, with `setProtectionOptions:` (the command buffer's SPI) of 2 or 0x10 set before
+the pass, after it, or after every encoder. Type-9 draws, which hang the GPU, are left out on
+every Mac: what one does beside another failure is not measured.
+
+| what | M3 Max | AMD 5300M | Intel UHD 630 | class |
+|---|---|---|---|---|
+| encoders made under options 2 | code 16 ("Protection Violation"); the first encoder made under them and every later one run nothing; the signals encoded before it fire, none after it | the same | code 16; every encoder runs and every signal fires (the error's encoder infos say Pending) | 2 |
+| encoders made under options 0x10 | code 1 ("Invalid Input"); encoders and signals as under 2 | code 16; as under 2 | code 16; as under 2 | 2 (the code: 4 for the x86 lane, below) |
+| options set after every encoder | 2: completes; 0x10: code 1, every encoder running, every signal firing | completes, under both | the same | 2 (0x10: 4 for the x86 lane) |
+| a store-out alone | `PageFault` (3), as Q38; the compute encoder after the pass ran in 11 runs of 18 (here and beside options 2 or 0x10 set after every encoder); every signal fires | completes, the store written | the same | 2 |
+| a store-out, then encoders made under options 2 or 0x10 | the options' failure alone, code 16 or 1, no `PageFault`; the encoders made under them run nothing; the signals encoded before the first of them fire, the pass's among them; the pages unchanged | the same, code 16, the store written | code 16, every encoder running and every signal firing, the store written | 2 |
+| encoders made under the options, the pass among them | the options' failure; the pass runs nothing, so nothing faults | the same, code 16 | code 16, every encoder running | 2 |
+| a store-out, then options 0x10 after every encoder | code 1, no `PageFault`; every signal fires; the encoder after the pass ran in 3 runs of 6 | completes, the store written | the same | 2 |
+| a store-out, then options 2 after every encoder | `PageFault`, as the store-out alone | completes, the store written | the same | 2 |
+
+The next command buffer on the same queue, and one on a new queue, ran after every shape on all
+three Macs.
+
+What our stack does (`crate::gpu::command`): it keeps protection options itself, and fails a
+command buffer of encoders made under them as the M3 Max does: code 16 or 1, the encoders from
+the first made under them running nothing, the signals encoded before it firing and none after
+it *(class 2: the M3 Max's and the 5300M's answer)*. The runtime's injected failure fires every
+signal or none, so the platform sends no signal encoded after such an encoder. Options from 0x10
+set after every encoder fail it with code 1, every encoder running and every signal firing (the
+M3 Max's). A store-out's fault beside such a failure is answered by that failure, as on all
+three Macs *(class 2)*, the encoders from the faulting pass on running nothing, as the M3 Max
+runs nothing there in 7 runs of 18; until 11-14 the platform ended the process at such a commit.
+A type-9 draw's failure beside another way still ends the process there.
+
+Outside the envelope for x86 guests *(class 4, not yet answered)*: the M3 Max's code 1 under
+options from 0x10, and its failure where such options come after every encoder; both x86 Macs
+answer code 16 and complete the latter. The platform answers the M3 Max's for every guest.
+
+## Q40: what Metal stores through the 4:4:4 `_sRGB` two-plane formats
+
+Probe: `oracle_twinwrites.sh DEVICE` (`oracle_twinwrites`), 11-14, one process a format and a
+write: the M3 Max under macOS 27.0.1 (26A434), m3-max-29535; the AMD 5300M and the Intel UHD
+630 under macOS 26.7.1 (25G241), m3-max-29536 and m3-max-29537, which end the process at every
+texture of the four formats, at its creation ("MTLTextureDescriptor has invalid pixelFormat
+(N)", as Q13 and Q20 found): the x86 Macs make none. An 8 x 2 texture of 503, 507 or their
+`_sRGB` twins 523 (YCBCR8_444_2P_sRGB) and 527 (YCBCR10_444_2P_sRGB) over plane 0 of a two-plane
+surface ('444v' for the 8-bit ones, 'x444' for the 10-bit ones; rows of 64 bytes, plane 1 at
+4096, no matrix), each column x written colour x, alpha 1, by a kernel's `write()`, by a fragment
+function's `write()` drawn over a BGRA8Unorm target of its size, and by a render pass a colour
+that clears the texture and stores it.
+
+Every command buffer completed. Both rows hold the same bytes, and a 10-bit sample's code is its
+16-bit word's top 10 bits, its low 6 zero. The codes, as Y, Cb and Cr; the kernel's and the
+fragment function's alike in every case, and the pass's but where named:
+
+| colour | 503 | 523 | 507 | 527 |
+|---|---|---|---|---|
+| black | 16, 128, 128 | 16, 128, 128 | 64, 512, 512 | 64, 512, 512 |
+| white | 235, 128, 128 | 235, 128, 128 | 940, 512, 512 | 940, 512, 512 |
+| grey 0.5 | 126, 128, 128 | 177, 128, 128 | 502, 512, 512 | 708, 512, 512 |
+| red | 81, 90, 240 | 81, 90, 240 | 326, 361, 960 | 326, 361, 960 |
+| green | 145, 54, 34 | 145, 54, 34 | 578, 215, 137 | 578, 215, 137 |
+| blue | 41, 240, 110 | 41, 240, 110 | 164, 960, 439 | 164, 960, 439 |
+| (0.2, 0.6, 0.9) | 129, 177, 78 | 174, 157, 90 | 515, 707, 311 | 696, 630, 360; the pass 697, 630, 360 |
+| (0.9, 0.3, 0.1) | 116, 83, 199 | 162, 88, 174 | 464, 332, 795 | 649, 351, 695 |
+
+Where every channel is 0 or 1 a twin stores its format's codes. Elsewhere its codes are those of
+the colour encoded by the sRGB curve first: grey 0.5 encodes to 0.7354, and 16 + 219 x 0.7354 is
+177.05 and 64 + 876 x 0.7354 is 708.2; (0.2, 0.6, 0.9) encodes to (0.4845, 0.7977, 0.9547),
+whose BT.601 codes at the video range are 174.1, 157.4 and 90.05, and 696.4 for the 10-bit luma
+(arithmetic on these eight colours alone; the 10-bit pass rounds that luma up).
+
+What our stack does: the runtime (metal2vulkan 20f7e82bbe) stores neither twin's writes. It
+refuses a kernel's or a fragment function's write through one at the slot's bind, and a pass
+into one at its creation, so the dispatch, the draw or the pass ends the process, naming the
+refusal; a blit into one from a buffer completes *(class 4: Metal stores them; these bytes went
+to metal2vulkan)*. Through an argument buffer the runtime refuses a write of every two-plane
+YCbCr texture, of 503, 507, 542 and 545, whose slot writes it stores, and of 500, whose slot
+writes it drops as Metal does, among them, ending the process at the dispatch *(Metal's answer
+there not measured)*. Measured on ms01's Iris Xe (ANV), m3-max-29517 and m3-max-29593, over
+textures made as the device makes them over a guest's surface plane
+(`gpu::ycbcr::plane_writes`). Only an arm64 guest reaches it: the x86 guests' bundle ends the
+process at a texture of a two-plane format's creation, as the x86 Macs do (Q13; read from code,
+`guest/bundle/src/RgfxTexture.mm`'s descriptor check).
 
 ## Not measured
 
