@@ -19,13 +19,22 @@
 //! decoder's handlers; the gaps between the paths are the decoder's share and the platform's. The
 //! runtime's path commits as the platform does (`commit_and_submit`), submitting on the thread.
 //!
+//! Each path's latency too: a repetition's wall time from its first command buffer's begin to its
+//! last one's completion, which the guest waits for before it commits the next. The decoder's
+//! messages are a process's, of context 0, as a queue's ring hands them, so its walk commits a
+//! command buffer in parts where it may ([`super::split`]); the platform's and the runtime's paths
+//! commit theirs whole.
+//!
 //! The environment picks what runs: `DISPATCH_COST_SHAPE` the shape (`fluid`, the default; `one`,
 //! the same dispatches in one encoder, each after its bindings, whose gap to `fluid` is what an
 //! encoder a dispatch costs; or `small`, 64 command buffers of 5 encoders, the median of the pass's
 //! other command buffers), `DISPATCH_COST_RUNS` the runs (5), `DISPATCH_COST_ONLY` one path, for a
-//! profile of it (`decoder`, `platform` or `runtime`), and `DISPATCH_COST_SECONDS` a time to keep
-//! running that path for, so a sampling profiler can attach.
+//! profile of it (`decoder`, `platform` or `runtime`), `DISPATCH_COST_SECONDS` a time to keep
+//! running that path for, so a sampling profiler can attach, and `DISPATCH_COST_SPLIT_US` how long
+//! a part of a command buffer is walked before the walk commits it (the decoder's own
+//! `SPLIT_AFTER` where unset; one longer than the walk keeps it whole).
 
+use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -291,6 +300,8 @@ struct Bench<P: ApiPlatform> {
     device: P::Device,
     decoder: GraphicsDecoder<P>,
     completed: mpsc::Receiver<u64>,
+    /// The last repetition's latency, of whichever path ran it.
+    latency: Cell<Duration>,
 }
 
 impl<P: ApiPlatform> Bench<P> {
@@ -368,11 +379,18 @@ impl<P: ApiPlatform> Bench<P> {
         ] {
             assert_eq!(decoder.insert(id, handle).unwrap(), Ok(()));
         }
+        // Its messages are a process's, in context 0, whose objects the ids above are.
+        decoder.set_context(Some(0));
+        let split_us = std::env::var("DISPATCH_COST_SPLIT_US").ok();
+        if let Some(us) = split_us.and_then(|v| v.parse().ok()) {
+            decoder.set_split_after(Some(Duration::from_micros(us)));
+        }
         Bench {
             shape,
             device,
             decoder,
             completed,
+            latency: Cell::new(Duration::ZERO),
         }
     }
 
@@ -411,7 +429,9 @@ impl<P: ApiPlatform> Bench<P> {
 
     /// One repetition through the decoder: the thread's CPU time from the first message's take
     /// to the last one's commit.
+    #[allow(clippy::disallowed_methods)] // a measurement: real time is what it measures
     fn through_decoder(&mut self, messages: &[Vec<u8>]) -> Counts {
+        let began = Instant::now();
         let start = counts();
         for m in messages {
             assert_eq!(self.decoder.decode(&self.device, m).unwrap(), Ok(()));
@@ -422,16 +442,19 @@ impl<P: ApiPlatform> Bench<P> {
                 .recv_timeout(Duration::from_secs(30))
                 .expect("a command buffer never completed");
         }
+        self.latency.set(began.elapsed());
         spent
     }
 
     /// One repetition through the platform's core traits, on the decoder's objects, each op's
     /// command as the decoder sends it.
+    #[allow(clippy::disallowed_methods)] // a measurement: real time is what it measures
     fn through_platform(&self) -> Counts {
         let o = OnFault::Die;
         let queue = self.queue();
         let bound = self.bound();
         let (tx, rx) = mpsc::channel();
+        let began = Instant::now();
         let start = counts();
         for cb_bound in &bound {
             let cb = queue.command_buffer(o).unwrap().unwrap();
@@ -502,6 +525,7 @@ impl<P: ApiPlatform> Bench<P> {
             rx.recv_timeout(Duration::from_secs(30))
                 .expect("a command buffer never completed");
         }
+        self.latency.set(began.elapsed());
         spent
     }
 }
@@ -527,11 +551,13 @@ impl<P: Platform> Copy for Bound<'_, P> {}
 
 /// The runtime alone, on the Vulkan platform's objects of `bench`: the calls the platform makes
 /// of it for each command.
+#[allow(clippy::disallowed_methods)] // a measurement: real time is what it measures
 fn through_runtime(bench: &Bench<reims_vgpu_vulkan::VulkanPlatform>) -> Counts {
     use metal2vulkan_runtime as rt;
     let queue = bench.queue();
     let bound = bench.bound();
     let (tx, rx) = mpsc::channel();
+    let began = Instant::now();
     let start = counts();
     for cb_bound in &bound {
         let cb = queue.raw.command_buffer().unwrap();
@@ -577,6 +603,7 @@ fn through_runtime(bench: &Bench<reims_vgpu_vulkan::VulkanPlatform>) -> Counts {
         rx.recv_timeout(Duration::from_secs(30))
             .expect("a command buffer never completed");
     }
+    bench.latency.set(began.elapsed());
     spent
 }
 
@@ -636,25 +663,34 @@ fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>, runtime: fn(&Bench<P
         return;
     }
     let paths = ["decoder", "platform", "runtime"];
-    // Each path's figures a dispatch, by run.
+    // Each path's figures a dispatch, by run, and its latencies in milliseconds, by repetition.
     let mut seen: [Vec<[f64; 3]>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut late: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
     for _ in 0..runs {
         let mut totals = [Counts::default(); 3];
         for rep in 0..WARM + REPS {
             let m = messages();
             let mut spent = [Counts::default(); 3];
+            let mut took = [None; 3];
             if only.is_none_or(|o| o == "decoder") {
                 spent[0] = bench.through_decoder(&m);
+                took[0] = Some(ms(bench.latency.get()));
             }
             if only.is_none_or(|o| o == "platform") {
                 spent[1] = bench.through_platform();
+                took[1] = Some(ms(bench.latency.get()));
             }
             if only.is_none_or(|o| o == "runtime") {
                 spent[2] = runtime(&bench);
+                took[2] = Some(ms(bench.latency.get()));
             }
             if rep >= WARM {
                 for (t, s) in totals.iter_mut().zip(spent) {
                     *t += s;
+                }
+                for (l, t) in late.iter_mut().zip(took) {
+                    l.extend(t);
                 }
             }
         }
@@ -694,6 +730,18 @@ fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>, runtime: fn(&Bench<P
                 medians[1] - medians[2]
             );
         }
+    }
+    println!(
+        "  a repetition's latency, its first command buffer's begin to its last one's \
+         completion, ms (the decoder's walk commits parts after {} us):",
+        bench.decoder.split_after().as_micros()
+    );
+    for (path, late) in paths.iter().zip(&mut late) {
+        if late.is_empty() {
+            continue;
+        }
+        let [median, lowest, highest] = spread(late);
+        println!("  {:>12} {path:>9}: {median:9.3} [{lowest:.3}, {highest:.3}]", "latency");
     }
 }
 
