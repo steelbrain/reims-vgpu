@@ -11,7 +11,7 @@ struct Frame {
 	float time;
 	uint objects;
 	uint icb_objects;
-	uint pad;
+	uint cicb_commands;
 };
 
 // One object (gameload.m's GlObject): 64 bytes.
@@ -162,6 +162,57 @@ kernel void icb_encode_bound(device IcbArgs &args [[buffer(0)]], device const Ob
 	} else {
 		cmd.reset();
 	}
+}
+
+// The GPU-driven compute pass (cicb): a kernel encodes CICB_COMMANDS concurrent dispatches into
+// a compute indirect command buffer, which a later compute encoder executes. Command i dispatches
+// 1 + i % 4 threadgroups of 64 threads, and every fifth command (i % 5 == 4) is reset, so the sum
+// the dispatches make (cicb_work) holds each command's grid and the encoder's bindings, which
+// gameload.m checks against its own.
+struct CicbArgs {
+	command_buffer cmds [[id(0)]];
+};
+
+kernel void cicb_encode(device CicbArgs &args [[buffer(0)]], constant Frame &f [[buffer(1)]],
+                        uint i [[thread_position_in_grid]])
+{
+	if (i >= f.cicb_commands)
+		return;
+	compute_command cmd(args.cmds, i);
+	if (i % 5 == 4)
+		cmd.reset();
+	else
+		cmd.concurrent_dispatch_threadgroups(uint3(1 + i % 4, 1, 1), uint3(64, 1, 1));
+}
+
+// The same, for a compute indirect command buffer that inherits no buffers (gameload -b): each
+// command sets the three buffers cicb_work reads, its input 64 words further on than the last's.
+kernel void cicb_encode_bound(device CicbArgs &args [[buffer(0)]], constant Frame &f [[buffer(1)]],
+                              device const uint *in [[buffer(2)]], device uint *sum [[buffer(3)]],
+                              device const uint *mul [[buffer(4)]], uint i [[thread_position_in_grid]])
+{
+	if (i >= f.cicb_commands)
+		return;
+	compute_command cmd(args.cmds, i);
+	if (i % 5 == 4) {
+		cmd.reset();
+		return;
+	}
+	cmd.set_kernel_buffer(in + i * 64, 0);
+	cmd.set_kernel_buffer(sum, 1);
+	cmd.set_kernel_buffer(mul, 2);
+	cmd.concurrent_dispatch_threadgroups(uint3(1 + i % 4, 1, 1), uint3(64, 1, 1));
+}
+
+// One dispatch of the compute indirect command buffer: each thread's input word times mul, summed
+// over its SIMD group and added into the sum.
+kernel void cicb_work(device const uint *in [[buffer(0)]], device atomic_uint *sum [[buffer(1)]],
+                      constant uint &mul [[buffer(2)]], uint g [[thread_position_in_grid]],
+                      uint lane [[thread_index_in_simdgroup]])
+{
+	uint v = simd_sum(in[g] * mul);
+	if (lane == 0)
+		atomic_fetch_add_explicit(sum, v, memory_order_relaxed);
 }
 
 // Post-processing: a luminance histogram, a bloom chain down and up, and a tone map.

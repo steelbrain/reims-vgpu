@@ -21,6 +21,12 @@
 //            indexed draw into an indirect command buffer (or resets its command), which the
 //            scene pass executes; the commands inherit the pipeline, and the encoder's buffers
 //            unless -b, and sample only through the material's argument buffer (icb_fs).
+//   cicb     a GPU-driven compute pass: a kernel encodes CICB_COMMANDS concurrent dispatches into
+//            a compute indirect command buffer (every fifth reset), and a later compute encoder
+//            sets the pipeline and its buffers at non-zero offsets and executes it; the commands
+//            inherit the pipeline, and the encoder's buffers unless -b. The dispatches sum their
+//            input into a word, which the CPU checks against its own sum as the frame slot comes
+//            back: a wrong sum is counted, and the run exits 1 (see cicb_bad).
 //   draws    DRAWS CPU-encoded indexed draws in the scene pass (8 pipeline changes over 4
 //            function-constant variants, each draw its own object-buffer offset and material
 //            argument-buffer offset) and DRAWS/4 in a 2048 x 2048 Depth32Float shadow pass.
@@ -35,16 +41,18 @@
 // UI, composite and read-back), FRAMES_IN_FLIGHT at most in flight.
 //
 //   gameload [-d NAME] [-f FRAMES] [-w WARMUP] [-s WxH] [-n DRAWS] [-i ICB_OBJECTS]
-//            [-k FRAMES_IN_FLIGHT] [-b] [--off NAME,...] [-q] [-l]
+//            [-c CICB_COMMANDS] [-k FRAMES_IN_FLIGHT] [-b] [--off NAME,...] [-q] [-l]
 //     -d NAME   the first of MTLCopyAllDevices whose name holds NAME (default: the first);
 //               never MTLCreateSystemDefaultDevice, which switches a dual-GPU MacBook's display.
 //     -f        measured frames (default 300), after -w warm-up frames (default 30).
 //     -s        the scene's size (default 1920x1080).
 //     -n        CPU draws in the scene pass (default 4000).
 //     -i        the ICB pass's objects (default 8192).
+//     -c        the compute ICB's commands (default 512).
 //     -k        frames in flight (default 2).
-//     -b        the ICB inherits no buffers: its kernel sets each drawn command's vertex and
-//               fragment buffers (icb_encode_bound); by default it inherits the encoder's.
+//     -b        the ICBs inherit no buffers: their kernels set each drawn command's vertex and
+//               fragment buffers (icb_encode_bound) and each dispatch's kernel buffers
+//               (cicb_encode_bound); by default they inherit the encoder's.
 //     -q        no per-frame lines.
 //     -l        lists the devices and exits.
 //
@@ -58,7 +66,9 @@
 //            buffer's GPUStartTime to the second's GPUEndTime (G), and each buffer's own span.
 //   "GAMELOAD shape NAME cpu_ms P50 MEAN"   each shape's own CPU encode time a frame.
 //   "GAMELOAD summary ..."          per-frame p50/p90/mean of each number, fps, the work a frame
-//            holds (draws, dispatches, passes, heap objects made) and command-buffer errors.
+//            holds (draws, dispatches, passes, heap objects made), command-buffer errors, and
+//            the compute ICB's sums checked (cicb_checks) and wrong (cicb_bad).
+//   "GAMELOAD cicb wrong sum ..."   the first wrong sum, when there is one.
 // Shaders compile from source at run time (newLibraryWithSource:), from gameload.metal, which
 // the build embeds (make -C guest/bundle/tools/gameload).
 #import <Foundation/Foundation.h>
@@ -78,9 +88,9 @@
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #pragma clang diagnostic ignored "-Wunguarded-availability-new"
 
-enum { S_HEAP, S_RTHEAP, S_TARGETS, S_VIEWS, S_ICB, S_DRAWS, S_POST, S_BLIT, S_COUNT };
-static const char *const kShape[S_COUNT] = {"heap", "rtheap", "targets", "views", "icb", "draws", "post", "blit"};
-static bool on[S_COUNT] = {true, true, true, true, true, true, true, true};
+enum { S_HEAP, S_RTHEAP, S_TARGETS, S_VIEWS, S_ICB, S_CICB, S_DRAWS, S_POST, S_BLIT, S_COUNT };
+static const char *const kShape[S_COUNT] = {"heap", "rtheap", "targets", "views", "icb", "cicb", "draws", "post", "blit"};
+static bool on[S_COUNT] = {true, true, true, true, true, true, true, true, true};
 
 typedef struct {
 	simd_float4x4 view_proj;
@@ -89,7 +99,7 @@ typedef struct {
 	float time;
 	uint32_t objects;
 	uint32_t icb_objects;
-	uint32_t pad;
+	uint32_t cicb_commands;
 } GlFrame;
 
 typedef struct {
@@ -116,6 +126,8 @@ enum {
 	READBACK = 256,
 	BLOOM = 4,
 	MAX_FRAMES = 100000,
+	CICB_LEAD = 64,     // words before the compute ICB's input (its binding's offset, 256 bytes)
+	CICB_SLOT = 256,    // bytes a frame in flight's sum takes; the sum lies 64 bytes into it
 };
 
 static double now_ms(void)
@@ -197,6 +209,9 @@ static id<MTLCommandQueue> Q;
 static id<MTLTexture> slot_tex[SLOTS], statics[STATIC_TEX];
 static atomic_int cb_errors;
 static char first_error[512];
+// The compute ICB's sums checked and wrong, and the first wrong one.
+static uint64_t cicb_checks, cicb_bad;
+static char cicb_first_bad[160];
 
 // A Private buffer holding `len` bytes of `bytes`, uploaded through a Shared one.
 static id<MTLBuffer> private_buffer(const void *bytes, size_t len)
@@ -275,6 +290,7 @@ int main(int argc, char **argv)
 	@autoreleasepool {
 		const char *want = "";
 		int frames = 300, warmup = 30, draws = 4000, icb_objects = 8192, inflight = 2, quiet = 0, icb_bound = 0;
+		int cicb_commands = 512;
 		int W = 1920, H = 1080;
 		for (int i = 1; i < argc; i++) {
 			const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -295,6 +311,8 @@ int main(int argc, char **argv)
 				draws = atoi(v), i++;
 			} else if (v && !strcmp(a, "-i")) {
 				icb_objects = atoi(v), i++;
+			} else if (v && !strcmp(a, "-c")) {
+				cicb_commands = atoi(v), i++;
 			} else if (v && !strcmp(a, "-k")) {
 				inflight = atoi(v), i++;
 			} else if (v && !strcmp(a, "-s")) {
@@ -308,7 +326,7 @@ int main(int argc, char **argv)
 					while (k < S_COUNT && strcmp(t, kShape[k]))
 						k++;
 					if (k == S_COUNT) {
-						fprintf(stderr, "gameload: no shape %s (heap rtheap targets views icb draws post blit)\n", t);
+						fprintf(stderr, "gameload: no shape %s (heap rtheap targets views icb cicb draws post blit)\n", t);
 						return 2;
 					}
 					on[k] = false;
@@ -321,7 +339,7 @@ int main(int argc, char **argv)
 			}
 		}
 		if (frames < 1 || warmup < 0 || frames + warmup > MAX_FRAMES || inflight < 1 || inflight > 8 ||
-		    draws < 0 || icb_objects < 1 || W < 64 || H < 64)
+		    draws < 0 || icb_objects < 1 || cicb_commands < 1 || cicb_commands > 65536 || W < 64 || H < 64)
 			die("an argument is out of range", nil);
 		for (id<MTLDevice> d in MTLCopyAllDevices()) {
 			if (!*want || strcasestr(d.name.UTF8String, want)) {
@@ -433,6 +451,18 @@ int main(int argc, char **argv)
 		// The histogram's threadgroups: 16 x 16, or 8 x 8 where the kernel takes fewer (its 64 bins
 		// need 64 threads).
 		const NSUInteger lum_tg = luminance.maxTotalThreadsPerThreadgroup >= 256 ? 16 : 8;
+		// The compute ICB's encoder and the pipeline its dispatches inherit.
+		id<MTLFunction> cicb_fn = [lib newFunctionWithName:icb_bound ? @"cicb_encode_bound" : @"cicb_encode"];
+		id<MTLComputePipelineState> cicb_encode = cicb_fn ? [D newComputePipelineStateWithFunction:cicb_fn error:&err] : nil;
+		if (!cicb_encode)
+			die("the compute ICB's encode kernel", err);
+		MTLComputePipelineDescriptor *cwd = [MTLComputePipelineDescriptor new];
+		cwd.computeFunction = [lib newFunctionWithName:@"cicb_work"];
+		cwd.supportIndirectCommandBuffers = YES;
+		id<MTLComputePipelineState> cicb_work = [D newComputePipelineStateWithDescriptor:cwd options:0 reflection:nil
+		                                                                           error:&err];
+		if (!cicb_work)
+			die("the compute ICB's pipeline", err);
 
 		MTLDepthStencilDescriptor *dsd = [MTLDepthStencilDescriptor new];
 		dsd.depthCompareFunction = MTLCompareFunctionLess;
@@ -717,6 +747,51 @@ int main(int argc, char **argv)
 			[ae setArgumentBuffer:icb_args offset:0];
 			[ae setIndirectCommandBuffer:icb atIndex:0];
 		}
+		// The compute ICB, its input (random bytes, 0 to 255 a word), its multiplier and the sums, one
+		// a frame in flight, and the sum its dispatches make, worked out here.
+		id<MTLIndirectCommandBuffer> cicb = nil;
+		id<MTLBuffer> cicb_args = nil, cicb_in = nil, cicb_mul = nil, cicb_sums = nil;
+		uint32_t cicb_want = 0;
+		if (on[S_CICB]) {
+			MTLIndirectCommandBufferDescriptor *d = [MTLIndirectCommandBufferDescriptor new];
+			d.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
+			d.inheritBuffers = !icb_bound;
+			d.inheritPipelineState = YES;
+			if (icb_bound)
+				d.maxKernelBufferBindCount = 3;
+			cicb = [D newIndirectCommandBufferWithDescriptor:d maxCommandCount:cicb_commands options:0];
+			if (!cicb)
+				die("the compute indirect command buffer", nil);
+			id<MTLArgumentEncoder> ae = [cicb_fn newArgumentEncoderWithBufferIndex:0];
+			cicb_args = [D newBufferWithLength:ae.encodedLength options:MTLResourceStorageModeShared];
+			[ae setArgumentBuffer:cicb_args offset:0];
+			[ae setIndirectCommandBuffer:cicb atIndex:0];
+			const size_t words = CICB_LEAD + (size_t)cicb_commands * 64 + 4 * 64;
+			uint32_t *in = malloc(words * 4), mul[CICB_LEAD + 1] = {0};
+			for (size_t w = 0; w < words; w++)
+				in[w] = rnd() & 0xff;
+			mul[CICB_LEAD] = 3;
+			for (int c = 0; c < cicb_commands; c++) {
+				if (c % 5 == 4)
+					continue;
+				const uint32_t *base = in + CICB_LEAD + (icb_bound ? (size_t)c * 64 : 0);
+				for (int g = 0; g < 64 * (1 + c % 4); g++)
+					cicb_want += base[g] * mul[CICB_LEAD];
+			}
+			cicb_in = private_buffer(in, words * 4);
+			cicb_mul = private_buffer(mul, sizeof(mul));
+			free(in);
+			cicb_sums = [D newBufferWithLength:(NSUInteger)CICB_SLOT * inflight options:MTLResourceStorageModeShared];
+			memset(cicb_sums.contents, 0, (size_t)CICB_SLOT * inflight);
+		}
+		// The sum of the frame that last had slot k, checked, then cleared for the next.
+		void (^cicb_check)(int, int) = ^(int k, int frame) {
+			uint32_t *sum = (uint32_t *)((uint8_t *)cicb_sums.contents + (size_t)k * CICB_SLOT + 64);
+			if (*sum != cicb_want && cicb_bad++ == 0)
+				snprintf(cicb_first_bad, sizeof(cicb_first_bad), "frame %d got %u want %u", frame, *sum, cicb_want);
+			cicb_checks++;
+			*sum = 0;
+		};
 		__unsafe_unretained id<MTLResource> statics_list[STATIC_TEX];
 		for (int i = 0; i < STATIC_TEX; i++)
 			statics_list[i] = statics[i];
@@ -751,10 +826,10 @@ int main(int argc, char **argv)
 		printf("GAMELOAD config device \"%s\" unified %d bc %d shapes", D.name.UTF8String, (int)D.hasUnifiedMemory, (int)bc);
 		for (int s = 0; s < S_COUNT; s++)
 			printf(" %s=%d", kShape[s], (int)on[s]);
-		printf(" icb_bound %d size %dx%d draws %d shadow_draws %d icb_objects %d frames %d warmup %d inflight %d"
-		       " placement_heap %zu transient_heap %zu targets_heap %zu library_ms %.1f\n",
-		       icb_bound, W, H, on[S_DRAWS] ? draws : 0, on[S_DRAWS] ? shadow_draws : 0, on[S_ICB] ? icb_objects : 0, frames,
-		       warmup, inflight, place_size, transient_size, targets_heap_size, t_lib);
+		printf(" icb_bound %d size %dx%d draws %d shadow_draws %d icb_objects %d cicb_commands %d frames %d warmup %d"
+		       " inflight %d placement_heap %zu transient_heap %zu targets_heap %zu library_ms %.1f\n",
+		       icb_bound, W, H, on[S_DRAWS] ? draws : 0, on[S_DRAWS] ? shadow_draws : 0, on[S_ICB] ? icb_objects : 0,
+		       on[S_CICB] ? cicb_commands : 0, frames, warmup, inflight, place_size, transient_size, targets_heap_size, t_lib);
 		fflush(stdout);
 
 		for (int f = 0; f < total; f++) {
@@ -771,6 +846,8 @@ int main(int argc, char **argv)
 				f_start[f] = t1;
 				const int k = f % inflight;
 				int fp = 0, fd = 0;
+				if (on[S_CICB] && f >= inflight)
+					cicb_check(k, f - inflight);
 
 				// The frame's readback from FRAMES_IN_FLIGHT frames ago, which the CPU reads.
 				if (on[S_BLIT] && f >= inflight) {
@@ -787,6 +864,7 @@ int main(int argc, char **argv)
 				fc->time = t;
 				fc->objects = n_objects;
 				fc->icb_objects = icb_objects;
+				fc->cicb_commands = cicb_commands;
 				const NSUInteger fo = k * frame_stride;
 
 				// The uploads: the CPU writes this frame's data into its staging buffer.
@@ -912,6 +990,43 @@ int main(int argc, char **argv)
 					[ce endEncoding];
 					fd++;
 					shape_cpu[S_ICB][f] += now_ms() - ts;
+				}
+
+				// 3b. The GPU-driven compute pass: the compute ICB's encode, then its execution in a
+				// compute encoder of its own, its buffers bound at non-zero offsets.
+				if (on[S_CICB]) {
+					ts = now_ms();
+					const NSUInteger sum_off = (NSUInteger)k * CICB_SLOT + 64;
+					id<MTLComputeCommandEncoder> ce = [a computeCommandEncoder];
+					[ce setComputePipelineState:cicb_encode];
+					[ce setBuffer:cicb_args offset:0 atIndex:0];
+					[ce setBuffer:frame_buf offset:fo atIndex:1];
+					if (icb_bound) {
+						[ce setBuffer:cicb_in offset:CICB_LEAD * 4 atIndex:2];
+						[ce setBuffer:cicb_sums offset:sum_off atIndex:3];
+						[ce setBuffer:cicb_mul offset:CICB_LEAD * 4 atIndex:4];
+					}
+					[ce useResource:cicb usage:MTLResourceUsageWrite];
+					NSUInteger tg = MIN(cicb_encode.maxTotalThreadsPerThreadgroup, 64);
+					[ce dispatchThreadgroups:MTLSizeMake((cicb_commands + tg - 1) / tg, 1, 1)
+					   threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+					[ce endEncoding];
+					ce = [a computeCommandEncoder];
+					[ce setComputePipelineState:cicb_work];
+					if (icb_bound) {
+						[ce useResource:cicb_in usage:MTLResourceUsageRead];
+						[ce useResource:cicb_mul usage:MTLResourceUsageRead];
+						[ce useResource:cicb_sums usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+					} else {
+						[ce setBuffer:cicb_in offset:CICB_LEAD * 4 atIndex:0];
+						[ce setBuffer:cicb_sums offset:sum_off atIndex:1];
+						[ce setBuffer:cicb_mul offset:CICB_LEAD * 4 atIndex:2];
+					}
+					[ce useResource:cicb usage:MTLResourceUsageRead];
+					[ce executeCommandsInBuffer:cicb withRange:NSMakeRange(0, cicb_commands)];
+					[ce endEncoding];
+					fd += 2;
+					shape_cpu[S_CICB][f] += now_ms() - ts;
 				}
 
 				// 4. The scene pass: CPU draws, then the ICB's.
@@ -1134,6 +1249,10 @@ int main(int argc, char **argv)
 		// Back to its first value: libdispatch traps on a semaphore freed below it.
 		for (int k = 0; k < inflight; k++)
 			dispatch_semaphore_signal(slots);
+		// The last frames' sums, whose slots no frame took back.
+		if (on[S_CICB])
+			for (int f = MAX(total - inflight, 0); f < total; f++)
+				cicb_check(f % inflight, f);
 		window_end = epoch_s();
 		printf("GAMELOAD window end %.6f\n", window_end);
 		fflush(stdout);
@@ -1167,14 +1286,19 @@ int main(int argc, char **argv)
 		       " wall_ms p50 %.3f p90 %.3f mean %.3f gpu_ms p50 %.3f p90 %.3f mean %.3f"
 		       " gpu_a_ms p50 %.3f mean %.3f gpu_b_ms p50 %.3f mean %.3f"
 		       " cpu_draws %d icb_objects %d passes %d dispatches %d command_buffers 2"
-		       " heap_objects_per_frame %.2f heap_failures %llu cb_errors %d readback %llu\n",
+		       " heap_objects_per_frame %.2f heap_failures %llu cb_errors %d readback %llu"
+		       " cicb_commands %d cicb_checks %llu cicb_bad %llu\n",
 		       frames, window_end - window_start, frames / (window_end - window_start), c50, c90, cm, w50, w90, wm,
 		       l50, l90, lm, g50, g90, gm, a50, am, b50, bm, frame_draws, on[S_ICB] ? icb_objects : 0, passes,
 		       dispatches, (double)heap_objects / total, (unsigned long long)heap_failures, atomic_load(&cb_errors),
-		       (unsigned long long)readback_sum);
+		       (unsigned long long)readback_sum, on[S_CICB] ? cicb_commands : 0, (unsigned long long)cicb_checks,
+		       (unsigned long long)cicb_bad);
 		if (atomic_load(&cb_errors))
 			printf("GAMELOAD first command-buffer error: %s\n", first_error);
+		if (cicb_bad)
+			printf("GAMELOAD cicb wrong sum: %llu of %llu frames, the first %s\n", (unsigned long long)cicb_bad,
+			       (unsigned long long)cicb_checks, cicb_first_bad);
 		fflush(stdout);
-		return atomic_load(&cb_errors) ? 1 : 0;
+		return atomic_load(&cb_errors) || cicb_bad ? 1 : 0;
 	}
 }

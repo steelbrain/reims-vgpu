@@ -51,11 +51,13 @@ number of frames, which prints each frame's CPU, wait, frame-to-frame and GPU ti
 p50, p90 and mean. A frame holds what AAA Metal ports make: textures and a buffer placed in a
 placement heap and uploaded each frame, transient textures from an automatic heap made aliasable as
 they are done with, render targets placed in a heap, a 4x MSAA scene with depth resolved and
-composited through an sRGB view, a UI pass into a BGRA view, an indirect command buffer a kernel
-encodes, 4000 CPU draws and 1000 shadow draws over argument buffers, compute post-processing and a
-blit stream with a read-back. Each of its eight shapes (`heap`, `rtheap`, `targets`, `views`, `icb`,
-`draws`, `post`, `blit`) turns off with `--off NAME,...`, so a run with one off measures that
-shape's share; `gameload.m`'s header lists every option and line.
+composited through an sRGB view, a UI pass into a BGRA view, an indirect command buffer of draws a
+kernel encodes, a compute indirect command buffer of concurrent dispatches a kernel encodes (their
+sum checked by the CPU every frame), 4000 CPU draws and 1000 shadow draws over argument buffers,
+compute post-processing and a blit stream with a read-back. Each of its nine shapes (`heap`,
+`rtheap`, `targets`, `views`, `icb`, `cicb`, `draws`, `post`, `blit`) turns off with
+`--off NAME,...`, so a run with one off measures that shape's share; `gameload.m`'s header lists
+every option and line.
 `make -C guest/bundle/tools/gameload` builds one universal binary (arm64 and x86_64),
 `guest/bundle/build/gameload`, which runs on an Apple-silicon Mac, an Intel Mac and both guests.
 The measured runs were these. Each of the first four ran once with every shape on and then once
