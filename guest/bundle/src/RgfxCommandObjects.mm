@@ -2249,13 +2249,21 @@ enum RgfxStage : unsigned {
 	// (RgfxSerializer::postHeldCreates): the buffer may name an object one of them makes, which
 	// the host has only where the kext took it, so a buffer behind a create it never took fails
 	// here, unposted, as Metal's work fails at commit on a GPU that is gone.
+	// Where the kext takes it (RgfxSerializer::publishVia), the held go in the call that publishes
+	// the buffer, before it, as one call where two were made; a buffer behind a create the kext
+	// never took is then taken off its ring unseen, and fails here as below (`via.refused`).
 	bool heldPosted = true;
+	RgfxPublishVia via;
 	if (RgfxSerializer *serializer = [queue serializer]) {
-		heldPosted = serializer->postHeldCreates();
-		const RgfxIcbFlush flush = serializer->flushIcbWrites();
-		if (flush.messages != 0)
-			rgfxNoteIcbFlush(flush);
-		serializer->postWaitingDestroys();
+		via.control = serializer->publishVia();
+		via.queue = queue.rgfxObjId;
+		if (via.control == nullptr) {
+			heldPosted = serializer->postHeldCreates();
+			const RgfxIcbFlush flush = serializer->flushIcbWrites();
+			if (flush.messages != 0)
+				rgfxNoteIcbFlush(flush);
+			serializer->postWaitingDestroys();
+		}
 	}
 	// Held: it waits on an event not at its value as far as this process knows, or is posted
 	// behind a held buffer of its queue. Metal submits such a buffer only once it is scheduled,
@@ -2266,8 +2274,23 @@ enum RgfxStage : unsigned {
 	const bool held = [queue rgfxHeldBuffers] > 0 || ![self rgfxWaitsMet];
 	if (held)
 		[queue rgfxNoteHeld];
+	// The seqno the buffer's completion was expected at, forgotten where it never went.
+	uint64_t expectedAt = 0;
+	std::function<void(uint64_t)> expectAt = expect;
+	if (expect && via.control != nullptr)
+		expectAt = [&expect, &expectedAt](uint64_t seqno) {
+			expectedAt = seqno;
+			expect(seqno);
+		};
 	const bool posted =
-	    heldPosted && _encoder->finish(&_seqno, whileWaiting, expect, outOfLine ? &_body : nullptr);
+	    heldPosted && _encoder->finish(&_seqno, whileWaiting, expectAt,
+	                                   outOfLine ? &_body : nullptr,
+	                                   via.control != nullptr ? &via : nullptr);
+	if (via.refused) {
+		heldPosted = false;
+		if (expectedAt != 0 && _reader != nullptr)
+			_reader->forget(expectedAt);
+	}
 	// On its ring: the posts of other queues from here name it (RgfxCommitOrder::posted).
 	if (posted)
 		[queue rgfxNotePosted:_seqno];

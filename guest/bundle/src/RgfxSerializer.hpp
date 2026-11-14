@@ -749,6 +749,19 @@ public:
 	/// wait for a later post, as refused ones do.
 	bool postHeldCreates();
 
+	/// The control ring's writer, where a command buffer's commit may hand its publish to the held
+	/// messages instead of posting them first (RgfxPublishVia): the route takes it
+	/// (RgfxRingWriter::publishesQueues) and nothing else goes between them, no encode into an
+	/// indirect command buffer nor a refused destroy waiting (flushIcbWrites,
+	/// postWaitingDestroys). Else null, and the commit posts them first (postHeldCreates).
+	RgfxRingWriter *publishVia() const
+	{
+		return m_control.publishesQueues() && !m_icbPending.load(std::memory_order_acquire) &&
+		               !m_destroysWaiting.load(std::memory_order_acquire)
+		           ? &m_control
+		           : nullptr;
+	}
+
 	/// The default alignment for a picked GPU address when the caller names none.
 	/// The caller passes a caps-derived alignment where Metal demands one; this
 	/// is a safe floor for the first slice.

@@ -129,6 +129,8 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 	case kRgfxAccelMethodFree:
 		if (a->scalarInputCount != 1)
 			return kIOReturnBadArgument;
+		// The kext publishes on no ring in the block from here (RgfxQueuePublish.hpp).
+		dropQueueHeaders(kDropBlock, in[0]);
 		return owner->freeBlock(this, in[0]);
 	case kRgfxAccelMethodQueueCreate: {
 		// Six inputs, or a seventh of the flags the process wants with a second output of the
@@ -203,6 +205,10 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		IOLockUnlock(listLock);
 		if (status != RGFX_STATUS_OK)
 			owner->unwatchQueue(this, open.obj_id);
+		// Its submission ring's header, which SubmitBatch publishes its buffers on, kept while
+		// the ring's block is still pinned, so no free of it comes first (RgfxQueuePublish.hpp).
+		else
+			keepQueueHeader(open.obj_id, pins[0].offset, open.submit_offset);
 		IOLockUnlock(queueLock);
 		unpin();
 		out[0] = status;
@@ -658,7 +664,9 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 // (destroyQueueIfTracked) after the run before it. An object made for a context that closed
 // since the check is destroyed behind it, as submitMethod does
 // (rgfxSubmitDestroysBehind). The count out says how many went: all of them, but where a run met
-// a ring that stayed full or a device that stopped.
+// a ring that stayed full or a device that stopped. With a queue, its producer and the publish's
+// flags in, the queue's ring is published after them once all went, and the second output says
+// whether it was (RgfxQueuePublish.hpp).
 IOReturn RgfxAcceleratorUserClient::submitBatchMethod(IOExternalMethodArguments *a)
 {
 	IOLockLock(listLock);
@@ -667,9 +675,11 @@ IOReturn RgfxAcceleratorUserClient::submitBatchMethod(IOExternalMethodArguments 
 	IOLockUnlock(listLock);
 	// An inline struct in, in kernel memory already: whole messages back to back.
 	const UInt64 size = a->structureInputSize;
-	if (!open || a->scalarInputCount != 0 || a->scalarOutputCount != 1 ||
-	    a->structureInputDescriptor || !a->structureInput || size == 0 ||
-	    size > kRgfxSubmitBatchBytes)
+	const bool publishes = a->scalarInputCount == 3;
+	if (!open || (a->scalarInputCount != 0 && !publishes) ||
+	    a->scalarOutputCount != (publishes ? 2u : 1u) || a->structureInputDescriptor ||
+	    !a->structureInput || size == 0 || size > kRgfxSubmitBatchBytes ||
+	    (publishes && (a->scalarInput[2] & ~static_cast<uint64_t>(kRgfxPublishFlags)) != 0))
 		return kIOReturnBadArgument;
 	const UInt8 *messages = static_cast<const UInt8 *>(a->structureInput);
 	// Each message of a type the batch takes, of that type's size, its obj_id the context's.
@@ -747,6 +757,15 @@ IOReturn RgfxAcceleratorUserClient::submitBatchMethod(IOExternalMethodArguments 
 		}
 		at += sizeAt(at);
 	}
+	// The queue's buffer after every message, as the bundle would publish it once the call
+	// returned; none where any message did not go, which the bundle then decides on.
+	if (publishes) {
+		a->scalarOutput[1] =
+		    r == kIOReturnSuccess && done == count &&
+		            publishQueue(a->scalarInput[0], a->scalarInput[1], a->scalarInput[2])
+		        ? 1
+		        : 0;
+	}
 	a->scalarOutput[0] = done;
 	return kIOReturnSuccess;
 }
@@ -815,11 +834,82 @@ bool RgfxAcceleratorUserClient::destroyQueueIfTracked(UInt64 objId)
 	}
 	IOLockUnlock(listLock);
 	if (found) {
+		dropQueueHeaders(kDropQueue, objId);
 		owner->unwatchQueue(this, objId);
 		owner->closeQueue(objId);
 	}
 	IOLockUnlock(queueLock);
 	return found;
+}
+
+void RgfxAcceleratorUserClient::keepQueueHeader(UInt64 objId, UInt64 block, UInt64 ring)
+{
+	// Only a ring in a block of the client's own, which its free names (a shared surface's block
+	// or a granted scanout goes another way), and whose offset is a doorbell id.
+	if (ring > UINT32_MAX || !owner->ownsBlock(this, block))
+		return;
+	volatile UInt8 *header = nullptr;
+	IOMemoryMap *map = owner->mapRingHeader(ring, &header);
+	if (!map)
+		return;
+	const RgfxQueueHeader<IOMemoryMap> entry = {objId, block, static_cast<UInt32>(ring), map,
+	                                            header};
+	IOLockLock(listLock);
+	const bool kept = rgfxQueueHeaderAdd(queueHeaders, entry);
+	IOLockUnlock(listLock);
+	if (!kept)
+		map->release();
+}
+
+void RgfxAcceleratorUserClient::dropQueueHeaders(QueueHeaderDrop which, UInt64 key)
+{
+	IOMemoryMap *maps[kQueueHeaders];
+	IOLockLock(listLock);
+	const UInt32 n = which == kDropQueue   ? rgfxQueueHeaderDrop(queueHeaders, key, maps)
+	                 : which == kDropBlock ? rgfxQueueHeaderDropBlock(queueHeaders, key, maps)
+	                                       : rgfxQueueHeaderDropAll(queueHeaders, maps);
+	IOLockUnlock(listLock);
+	for (UInt32 i = 0; i < n; i++)
+		maps[i]->release();
+}
+
+namespace {
+// A kept submission ring header's fields, as the bundle's publish touches them.
+struct KeptRing {
+	volatile UInt8 *header;
+	void storeProducer(uint64_t producer)
+	{
+		__atomic_store_n(reinterpret_cast<volatile UInt64 *>(
+		                     header + __builtin_offsetof(RgfxRingHeader, producer)),
+		                 producer, __ATOMIC_RELEASE);
+	}
+	void fullFence() { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+	uint32_t consumerIdle()
+	{
+		return __atomic_load_n(reinterpret_cast<const volatile UInt32 *>(
+		                           header + __builtin_offsetof(RgfxRingHeader, consumer_idle)),
+		                       __ATOMIC_ACQUIRE);
+	}
+};
+} // namespace
+
+bool RgfxAcceleratorUserClient::publishQueue(UInt64 objId, UInt64 producer, UInt64 flags)
+{
+	bool kept = false, ring = false;
+	UInt32 word = 0;
+	// Under the list lock, which every drop of a header takes, so the header is the queue's,
+	// in a block of the client's, for the whole publish.
+	IOLockLock(listLock);
+	if (const RgfxQueueHeader<IOMemoryMap> *q = rgfxQueueHeaderFind(queueHeaders, objId)) {
+		KeptRing r = {q->header};
+		kept = true;
+		ring = rgfxQueuePublish(r, q->ring, producer, flags, &word);
+	}
+	IOLockUnlock(listLock);
+	// The doorbell as the bundle's own call writes it (doorbellMethod), out of the lock.
+	if (ring)
+		owner->ringDoorbell(word);
+	return kept;
 }
 
 // kRgfxAccelMethodSurfaceWrites (RgfxUserClientABI.hpp): the surfaces a command buffer of one of
@@ -952,6 +1042,8 @@ void RgfxAcceleratorUserClient::releaseContext()
 	hasContext = false;
 	queueCount = 0;
 	IOLockUnlock(listLock);
+	// The kext publishes on none of its rings from here (RgfxQueuePublish.hpp).
+	dropQueueHeaders(kDropAll, 0);
 	// The process reaches nothing of the region from here on: its window goes before anything
 	// it held is freed, and given to another process.
 	closeWindow();

@@ -93,6 +93,8 @@ void writeBytes(volatile uint8_t *data, uint32_t at, const void *src, uint32_t l
 struct RgfxRingLater {
 	std::mutex lock;
 	RgfxForwardBatch post = nullptr;
+	// The route that takes a queue's publish with the held (setBatchPublish), or null.
+	RgfxForwardBatchPublish publishPost = nullptr;
 	void *context = nullptr;
 	uint32_t maxBytes = 0;
 	uint64_t laterNs = kRgfxLaterNs;
@@ -104,11 +106,12 @@ struct RgfxRingLater {
 	bool open = true;
 
 	// Posts what is held, from the first, at most maxBytes a call: whether none is held now.
-	// With `lock` held.
-	bool flush();
+	// With `publish`, the last call carries it (publishPost), `*published` then whether the route
+	// published. With `lock` held.
+	bool flush(const RgfxQueuePublish *publish = nullptr, bool *published = nullptr);
 };
 
-bool RgfxRingLater::flush()
+bool RgfxRingLater::flush(const RgfxQueuePublish *publish, bool *published)
 {
 	size_t at = 0;
 	bool all = true;
@@ -124,7 +127,11 @@ bool RgfxRingLater::flush()
 			end += header.size;
 			count++;
 		}
-		const uint32_t posted = post(context, held.data() + at, static_cast<uint32_t>(end - at));
+		const uint32_t bytes = static_cast<uint32_t>(end - at);
+		const uint32_t posted = publish != nullptr && end == held.size()
+		                            ? publishPost(context, held.data() + at, bytes, *publish,
+		                                          published)
+		                            : post(context, held.data() + at, bytes);
 		for (uint32_t i = 0; i < posted && i < count; i++) {
 			RgfxMsgHeader header;
 			std::memcpy(&header, held.data() + at, sizeof(header));
@@ -277,6 +284,28 @@ bool RgfxRingWriter::flushLater()
 	return later->flush();
 }
 
+void RgfxRingWriter::setBatchPublish(RgfxForwardBatchPublish post)
+{
+	if (m_later)
+		m_later->publishPost = post;
+}
+
+bool RgfxRingWriter::publishesQueues() const
+{
+	return m_later != nullptr && m_later->publishPost != nullptr;
+}
+
+bool RgfxRingWriter::flushPublishing(const RgfxQueuePublish &publish)
+{
+	RgfxRingLater *later = m_later.get();
+	if (later == nullptr || later->publishPost == nullptr ||
+	    !later->any.load(std::memory_order_acquire))
+		return false;
+	std::lock_guard<std::mutex> hold(later->lock);
+	bool published = false;
+	return later->flush(&publish, &published) && published;
+}
+
 bool RgfxRingWriter::holdsBut(uint32_t type)
 {
 	RgfxRingLater *later = m_later.get();
@@ -357,7 +386,7 @@ bool RgfxRingWriter::fits(uint32_t size) const
 bool RgfxRingWriter::post(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,
                           const std::function<void()> &whileWaiting,
                           const std::function<void(uint64_t)> &beforePublish, bool answered,
-                          uint32_t stampAt)
+                          uint32_t stampAt, RgfxPublishVia *via)
 {
 	if (!fits(size))
 		return false;
@@ -365,16 +394,21 @@ bool RgfxRingWriter::post(uint32_t type, const void *message, uint32_t size, uin
 	for (;;) {
 		// The room records so far, read before the look: one that comes after it ends the wait.
 		const uint64_t seen = m_room ? m_room->seen() : 0;
-		if (tryPost(type, message, size, out_seqno, nullptr, beforePublish, answered, stampAt))
+		if (tryPost(type, message, size, out_seqno, nullptr, beforePublish, answered, stampAt, via))
 			return true;
+		if (via != nullptr && via->refused)
+			return false;
 		// Where the host posts room records, it is told a post waits, then the ring is looked
 		// at once more: either this look finds what the host took, or the host's next take finds
 		// the flag and posts a record.
 		if (m_room) {
 			store32(m_header + kProducerWaiting, 1);
 			fullFence();
-			if (tryPost(type, message, size, out_seqno, nullptr, beforePublish, answered, stampAt))
+			if (tryPost(type, message, size, out_seqno, nullptr, beforePublish, answered, stampAt,
+			            via))
 				return true;
+			if (via != nullptr && via->refused)
+				return false;
 		}
 		// The host takes the ring on a thread of its own: make sure it is awake, then let it.
 		if (m_doorbell && (sleepUs == 0 || load32(m_header + kConsumerIdle) == RGFX_CONSUMER_ASLEEP))
@@ -420,7 +454,7 @@ void RgfxRingWriter::logSleeps(const RgfxRingRoomSleeps &seen) const
 bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,
                              uint32_t *out_status,
                              const std::function<void(uint64_t)> &beforePublish, bool answered,
-                             uint32_t stampAt)
+                             uint32_t stampAt, RgfxPublishVia *via)
 {
 	if (size < kHeaderBytes || size % kMsgAlign != 0 || size > m_dataSize)
 		return false;
@@ -465,6 +499,8 @@ bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, 
 	if (used > m_dataSize || static_cast<uint64_t>(m_dataSize) - used < static_cast<uint64_t>(pad) + size)
 		return false;
 
+	// Where it goes back to, should the held before it be refused (`via`).
+	const uint64_t producedBefore = m_produced;
 	if (pad) {
 		// A pad is a type-0 message covering the bytes left (8 or more); its
 		// seqno is not written.
@@ -489,6 +525,25 @@ bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, 
 	}
 
 	storeFence();
+	if (via != nullptr && via->control != nullptr) {
+		// The held messages go first, and the kext publishes this ring after them, as below: one
+		// call where two were made (the held, then the doorbell).
+		const RgfxQueuePublish publish = {via->queue, m_produced, answered,
+		                                  answered && m_doorbellAsks};
+		if (via->control->flushPublishing(publish)) {
+			if (out_seqno)
+				*out_seqno = seqno;
+			return true;
+		}
+		// A held message the buffer may name never went (RgfxSerializer::postHeldCreates): the
+		// buffer comes off the ring unseen, and fails.
+		if (via->control->holdsBut(RGFX_CMD_OBJECT_DESTROY)) {
+			m_produced = producedBefore;
+			m_nextSeqno = seqno;
+			via->refused = true;
+			return false;
+		}
+	}
 	store64(m_header + kProducer, m_produced);
 	fullFence();
 	// A walking host comes back to the ring by itself: it is rung only for what it answers in

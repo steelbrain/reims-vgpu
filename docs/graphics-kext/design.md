@@ -2393,6 +2393,38 @@ Tested by `serializer_tests`' `test_held_destroys` and
 `test_commit_behind_an_untaken_buffer_fails`, and the kext's by
 `submit_gate_test`, `spans_test` and `user_client_words_test`.
 
+**A commit behind held messages is one call.** A command buffer committed
+while the control ring holds messages (above) made two kext calls: the held
+went in a `SubmitBatch`, and the bundle then published the buffer on its
+queue's ring and, where the host's queue thread slept, rang its doorbell
+through the kext. Where the kext takes it (1 << 11 `QueuePublish`), the
+bundle writes the buffer on its ring and fences its stores, but leaves the
+producer, and hands the queue, the new producer and the doorbell's flags
+(whether the host answers the buffer at the doorbell, and whether that
+doorbell names `RGFX_DOORBELL_ASKS`) to the `SubmitBatch` that posts the held
+(`RgfxRingWriter::tryPost`'s `via`, `RgfxSerializer::publishVia`). Once
+every held message is posted, the kext stores the producer, fences, reads
+`consumer_idle` and rings the queue's doorbell as the bundle would
+(`RgfxQueuePublish.hpp`), so the host sees what it saw before: the held on
+ring 0, then the buffer on its queue's ring. The kext keeps a kernel mapping
+of each queue's ring header for it, made at the queue's create while the
+ring's block is pinned, and let go at the queue's destroy, at the free of
+the block the ring lies in and at the context's close, before the blocks go,
+so it never writes a ring the process no longer holds; a queue past its first
+64, or a ring outside the process's own blocks, has its buffers published by
+the bundle. A commit with nothing held, or behind an encode into an indirect
+command buffer or a refused destroy waiting, goes as before. Where the kext
+leaves a held message other than a destroy unposted, it publishes nothing,
+and the bundle takes the buffer off its ring unseen (its seqno the next
+buffer's, its completion's handlers dropped) and fails it as above; with
+only destroys left, the bundle publishes the buffer itself. The buffer's
+posted time (`GUEST_TIMES`) is stamped before the call, not just before the
+producer moves. Tested by `shell_tests`'
+`test_commit_hands_its_publish_to_the_held` (the route, nothing held, a kext
+without the feature, a refused create and refused destroys) and the kext's
+`queue_publish_test` (the publish against the bundle's own, and the headers'
+table).
+
 **A waiter looks for its answer.** A lifecycle message the kext waits for
 (`postLifecycle`: a heap texture's size, a library's lookup, a surface's
 pages) is answered within tens of microseconds of its post, 60 to 110 us for a
@@ -4666,7 +4698,7 @@ Map 1:
 | 2 | | | given to none: the IOGPU base's device-info call on its own client type, so a trace names one call per number |
 | 3 | `Features` | | the device's feature word, the kext's and the selector map; at 3 in every map |
 | 4 | `PagesBlock` | 1 << 0 `PagesBlock` | a block of the runs of a process's own pages, wired, for its no-copy buffers |
-| 5 | `SubmitBatch` | 1 << 1 `SubmitBatch` | a process's destroys, and its creates and writes no one waits for that name no block, onto ring 0 in one call ("Destroys and creates no one waits for go together") |
+| 5 | `SubmitBatch` | 1 << 1 `SubmitBatch`, 1 << 11 `QueuePublish` (three inputs and a second output: a queue's publish after them) | a process's destroys, and its creates and writes no one waits for that name no block, onto ring 0 in one call ("Destroys and creates no one waits for go together"), and with three inputs a command buffer's publish on its queue's ring after them ("A commit behind held messages is one call") |
 | 6 | `WakeCompletions` | 1 << 2 `WakeCompletions` | reserved: wakes the client's completion waiters |
 | 7 | `TakeAnswers` | 1 << 4 `DeferredAnswers` | hands a process its held pipeline-create answers ("Known pipeline creates") |
 | 8 | `SurfaceBlockRelease` | | lets go of a shared block |
@@ -4693,7 +4725,7 @@ the accelerator, which the bundle opens for each event it hands out: 10 and 11
 are its own selectors, numbered apart from the accelerator's own so that a call
 on a connection of another kind finds none of that number there.
 
-The kext sets 1 << 0 `PagesBlock`, 1 << 1 `SubmitBatch`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked`, 1 << 9 `SharedPipelines` and 1 << 10 `SurfaceSeeds`, the last only where the release's IOSurface exports its unlock seed; no other bit yet.
+The kext sets 1 << 0 `PagesBlock`, 1 << 1 `SubmitBatch`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked`, 1 << 9 `SharedPipelines`, 1 << 10 `SurfaceSeeds` and 1 << 11 `QueuePublish`, `SurfaceSeeds` only where the release's IOSurface exports its unlock seed; no other bit yet.
 
 **A GL window: the drawable (type 7) and the window surface (type 0x20).**
 These are IOGPU's types, not ours. The bundle leaves `newGLDrawable` to its

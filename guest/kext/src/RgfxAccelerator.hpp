@@ -90,11 +90,13 @@ enum {
 // second word kRgfxAccelMethodFeatures answers: PagesBlock and PagesChunked, SubmitBatch, Submit's
 // deferred and shared flags and TakeAnswers, OpenContext's span, shared events' ports and Alloc's
 // write-combined part, where the region's write-combined mappings are ordinary memory
-// (RgfxRegionMapping.hpp), and SurfaceSeeds, which Features leaves out where IOSurface exports no
-// unlock seed (rgfxSurfaceUnlockSeedExported). Each bit is set by the change that lands its call.
+// (RgfxRegionMapping.hpp), SurfaceSeeds, which Features leaves out where IOSurface exports no
+// unlock seed (rgfxSurfaceUnlockSeedExported), and SubmitBatch's publish of a queue's ring. Each
+// bit is set by the change that lands its call.
 constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeaturePagesChunked |
                                           kRgfxKextFeatureSubmitBatch |
+                                          kRgfxKextFeatureQueuePublish |
                                           kRgfxKextFeatureDeferredAnswers |
                                           kRgfxKextFeatureSharedPipelines |
                                           kRgfxKextFeatureContextSpan |
@@ -467,6 +469,9 @@ public:
 	// Pins the owner's live block that holds the `length` bytes at `offset`, for a create that
 	// names them, until unpinBlock: false where no block of the owner's does.
 	bool pinRange(const void *owner, UInt64 offset, UInt64 length, RgfxBlockPin *pin);
+	// Whether the block at region offset `offset` is a live block of `owner`'s own in the region
+	// (not a pages block), which only its free, or its owner's close, lets go of.
+	bool ownsBlock(const void *owner, UInt64 offset);
 	void unpinBlock(const RgfxBlockPin &pin);
 	// The shared blocks of IOSurface planes (RgfxSurfaceBlocks.hpp), for our user client `client`
 	// of context `context` in `task`: the block of the plane of `length` bytes at `address` in
@@ -563,6 +568,11 @@ public:
 	// (queueInterrupt, on the framebuffer's work loop). unwatchQueue and unwatchClient stop it.
 	IOReturn watchQueue(RgfxAcceleratorUserClient *client, UInt64 objId, UInt64 completeOffset);
 	void unwatchQueue(RgfxAcceleratorUserClient *client, UInt64 objId);
+	// A kernel mapping of the ring header at region offset `offset`, write-back as the bundle maps
+	// the region, with `*header` the header in it; nullptr where it lies outside the region or
+	// none is made. A watched completion ring's, and a submission ring's the kext publishes on
+	// (RgfxQueuePublish.hpp).
+	IOMemoryMap *mapRingHeader(UInt64 offset, volatile UInt8 **header);
 	void unwatchClient(RgfxAcceleratorUserClient *client);
 	void queueInterrupt();
 	// The seqno the device last completed on queue `objId` (RgfxRingHeader::completed_seqno, 0

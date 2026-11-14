@@ -189,7 +189,7 @@ bool RgfxEncoder::fitsRing() const
 
 bool RgfxEncoder::finish(uint64_t *out_seqno, const std::function<void()> &whileWaiting,
                          const std::function<void(uint64_t)> &beforePublish,
-                         RgfxMessageBlock *held)
+                         RgfxMessageBlock *held, RgfxPublishVia *via)
 {
 	if (m_ring == nullptr || messageSize() > UINT32_MAX)
 		return false;
@@ -205,7 +205,7 @@ bool RgfxEncoder::finish(uint64_t *out_seqno, const std::function<void()> &while
 		// a walk too (RgfxRingWriter::tryPost).
 		return m_ring->post(RGFX_CMD_COMMAND_BUFFER, message, static_cast<uint32_t>(size),
 		                    out_seqno, whileWaiting, beforePublish, endsInAsk(),
-		                    timed ? RGFX_GUEST_TIMES_POSTED_OFFSET : 0);
+		                    timed ? RGFX_GUEST_TIMES_POSTED_OFFSET : 0, via);
 	}
 	// Out of line: the whole message copied once into a block of the pool, from its start. The
 	// host reads the block once the reference's `producer` is published, which the ring writer
@@ -241,7 +241,7 @@ bool RgfxEncoder::finish(uint64_t *out_seqno, const std::function<void()> &while
 	}
 	if (!timed)
 		return m_ring->post(RGFX_CMD_COMMAND_BUFFER_IN_REGION, &ref, sizeof(ref), out_seqno,
-		                    whileWaiting, beforePublish);
+		                    whileWaiting, beforePublish, false, 0, via);
 	// Its posted time goes into the block as its reference goes on the ring, under the ring's
 	// lock, after the caller's beforePublish and before the publish, which the ring writer's
 	// storeFence orders it before: the wait for the ring is the post's, as a message on the ring
@@ -254,7 +254,7 @@ bool RgfxEncoder::finish(uint64_t *out_seqno, const std::function<void()> &while
 		std::memcpy(posted, &now, sizeof(now));
 	};
 	return m_ring->post(RGFX_CMD_COMMAND_BUFFER_IN_REGION, &ref, sizeof(ref), out_seqno,
-	                    whileWaiting, stamped);
+	                    whileWaiting, stamped, false, 0, via);
 }
 
 // --- framing ----------------------------------------------------------------

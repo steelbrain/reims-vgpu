@@ -70,6 +70,27 @@ void RgfxReplyReader::expectSubmitted(uint64_t seqno, SubmittedHandler handler)
 	m_submitted[seqno] = std::move(handler);
 }
 
+void RgfxReplyReader::forget(uint64_t seqno)
+{
+	// Moved out under the lock, let go after it: a handler holds its command buffer.
+	CompletionHandler completion;
+	ScheduledHandler scheduled;
+	SubmittedHandler submitted;
+	{
+		std::lock_guard<std::mutex> guard(m_lock);
+		auto take = [seqno](auto &map, auto &into) {
+			auto it = map.find(seqno);
+			if (it != map.end()) {
+				into = std::move(it->second);
+				map.erase(it);
+			}
+		};
+		take(m_completions, completion);
+		take(m_scheduled, scheduled);
+		take(m_submitted, submitted);
+	}
+}
+
 RgfxReplyReader::RgfxReplyReader()
     : m_header(nullptr), m_data(nullptr), m_dataSize(0), m_mask(0), m_consumed(0), m_nextToken(1)
 {

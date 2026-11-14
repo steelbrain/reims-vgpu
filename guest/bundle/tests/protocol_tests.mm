@@ -53,6 +53,7 @@
 #include "rgfx_argument_reply.hpp"
 #include "reims_graphics_wire.h"
 #include "rgfx_test_ring.hpp" // CHECK, g_checks, TestRing, expectMessage
+#include "../../kext/src/RgfxQueuePublish.hpp"
 
 void rgfxProtocolTests();
 void drainRing(TestRing &ring); // shell_tests.mm
@@ -641,6 +642,250 @@ void test_commit_behind_an_untaken_buffer_fails()
 		CHECK(completion.postFromHost(&done, sizeof(done)));
 		[fourth waitUntilCompleted];
 		CHECK(fourth.status == MTLCommandBufferStatusCompleted);
+	}
+}
+
+// A control route as the kext's that takes a queue's publish with the held messages
+// (RgfxRingWriter::setBatchPublish, the kext's SubmitBatch with its publish): it posts the held on
+// `direct`'s ring, and once every one went it publishes the queue's ring after them by the kext's
+// own rule (RgfxQueuePublish.hpp), as the kext does. Every call and doorbell goes in `calls`: B a
+// batch, P a batch with a publish, D a doorbell the bundle rang through the kext, K one the kext
+// rang in the publish; `heldAtPublish` is what the control ring held as the kext published.
+struct PublishingKext {
+	RgfxRingWriter *direct;
+	TestRing *control;
+	TestRing *submit;
+	bool refuse = false;
+	std::string calls;
+	uint64_t heldAtPublish = 0;
+	uint32_t word = 0;
+
+	static bool submitOne(void *context, const void *message, uint32_t size, uint64_t *out_seqno,
+	                      uint32_t *out_status)
+	{
+		PublishingKext *kext = static_cast<PublishingKext *>(context);
+		RgfxMsgHeader header;
+		std::memcpy(&header, message, sizeof(header));
+		if (out_status)
+			*out_status = kRgfxNoAnswer;
+		return !kext->refuse && kext->direct->tryPost(header.type, message, size, out_seqno);
+	}
+
+	uint32_t post(const void *messages, uint32_t bytes)
+	{
+		const uint8_t *m = static_cast<const uint8_t *>(messages);
+		uint32_t posted = 0;
+		for (uint32_t at = 0; at < bytes && !refuse; posted++) {
+			RgfxMsgHeader header;
+			std::memcpy(&header, m + at, sizeof(header));
+			if (!direct->tryPost(header.type, m + at, header.size, nullptr))
+				break;
+			at += header.size;
+		}
+		return posted;
+	}
+
+	static uint32_t batch(void *context, const void *messages, uint32_t bytes)
+	{
+		PublishingKext *kext = static_cast<PublishingKext *>(context);
+		kext->calls += 'B';
+		return kext->post(messages, bytes);
+	}
+
+	struct Header {
+		TestRing *ring;
+		void storeProducer(uint64_t producer) { ring->setProducer(producer); }
+		void fullFence() { std::atomic_thread_fence(std::memory_order_seq_cst); }
+		uint32_t consumerIdle()
+		{
+			uint32_t idle;
+			std::memcpy(&idle, ring->mem.data() + __builtin_offsetof(RgfxRingHeader, consumer_idle),
+			            sizeof(idle));
+			return idle;
+		}
+	};
+
+	static uint32_t batchPublish(void *context, const void *messages, uint32_t bytes,
+	                             const RgfxQueuePublish &publish, bool *out_published)
+	{
+		PublishingKext *kext = static_cast<PublishingKext *>(context);
+		kext->calls += 'P';
+		uint32_t count = 0;
+		for (uint32_t at = 0; at < bytes; count++) {
+			RgfxMsgHeader header;
+			std::memcpy(&header, static_cast<const uint8_t *>(messages) + at, sizeof(header));
+			at += header.size;
+		}
+		const uint32_t posted = kext->post(messages, bytes);
+		*out_published = false;
+		if (posted == count) {
+			kext->heldAtPublish = kext->control->producer();
+			Header h{kext->submit};
+			const uint64_t flags = (publish.answered ? kRgfxPublishAnswered : 0) |
+			                       (publish.asks ? kRgfxPublishAsks : 0);
+			if (rgfxQueuePublish(h, kQueueRing, publish.producer, flags, &kext->word))
+				kext->calls += 'K';
+			*out_published = true;
+		}
+		return posted;
+	}
+
+	static void doorbell(void *context, uint32_t)
+	{
+		static_cast<PublishingKext *>(context)->calls += 'D';
+	}
+
+	static constexpr uint32_t kQueueRing = 0x40000;
+};
+
+// A command buffer committed behind held messages hands its publish to them where the kext takes
+// it (kRgfxKextFeatureQueuePublish): one call posts the held on the control ring and then publishes
+// the buffer on its queue's ring, ringing its doorbell as the bundle's own publish would, so the
+// host sees what it saw before, the held first. With nothing held the bundle publishes as before;
+// with a kext without the feature (no setBatchPublish) the held go in a call of their own first,
+// then the bundle publishes and rings. A held create the kext refuses fails the buffer, unposted
+// and unseen, its seqno the next buffer's; held destroys it refuses leave the buffer to the bundle's
+// own publish, as postHeldCreates leaves it.
+void test_commit_hands_its_publish_to_the_held()
+{
+	for (int withFeature = 0; withFeature < 2; withFeature++) {
+		TestRing control(0x8000);
+		RgfxRingWriter direct(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
+		                      TestRing::doorbell, nullptr);
+		TestRing submit(0x8000);
+		PublishingKext kext{&direct, &control, &submit, false, {}, 0, 0};
+		RgfxRingWriter writer(&PublishingKext::submitOne, &kext, 0x4000);
+		writer.setBatch(&PublishingKext::batch, 4096, 600ull * 1000000000);
+		if (withFeature)
+			writer.setBatchPublish(&PublishingKext::batchPublish);
+		CHECK(writer.publishesQueues() == (withFeature != 0));
+		RgfxIdSpace ids;
+		RgfxSerializer ser(writer, ids);
+		RgfxRingWriter submitWriter(submit.base(), submit.dataSize, PublishingKext::kQueueRing,
+		                            &PublishingKext::doorbell, &kext);
+		TestRing completion(0x8000);
+		RgfxReplyReader reader(completion.base(), completion.dataSize);
+		std::vector<uint8_t> mem(0x800000, 0);
+		RgfxRegion region(mem.data(), mem.size());
+		control.setConsumerIdle(1);
+		submit.setConsumerIdle(RGFX_CONSUMER_ASLEEP);
+		@autoreleasepool {
+			RgfxCommandQueue *queue = nil;
+			@autoreleasepool {
+				queue = [RgfxCommandQueue queueWithSubmitRing:&submitWriter
+				                                 submitOffset:PublishingKext::kQueueRing
+				                               completeOffset:0
+				                             completeDataSize:0
+				                                          ids:&ids
+				                                     maxCount:0
+				                                       device:nil
+				                                   serializer:&ser];
+			}
+			CHECK(queue != nil);
+			queue.replyReader = &reader;
+			queue.region = &region;
+			(void)expectQueueCreate(control);
+			MTLHeapDescriptor *hd = [[MTLHeapDescriptor alloc] init];
+			hd.size = 0x100000;
+			hd.storageMode = MTLStorageModePrivate;
+			RgfxHeap *heap = [RgfxHeap heapWithDescriptor:hd device:nil serializer:&ser];
+			CHECK(heap != nil);
+			drainRing(control);
+			RgfxMsgHeader h = {};
+			std::vector<uint8_t> bytes;
+			auto commitFill = [&](id<MTLBuffer> buffer, uint8_t value) {
+				id<MTLCommandBuffer> cb = [queue commandBuffer];
+				id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+				[blit fillBuffer:buffer range:NSMakeRange(0, 256) value:value];
+				[blit endEncoding];
+				[cb commit];
+				return cb;
+			};
+			auto complete = [&](id<MTLCommandBuffer> cb, uint64_t seqno) {
+				RgfxCbComplete done = {};
+				done.header.type = RGFX_EVT_CB_COMPLETE;
+				done.header.size = sizeof(done);
+				done.header.seqno = seqno;
+				done.cb_obj_id = ((RgfxResource *)cb).rgfxObjId;
+				done.status = RGFX_CB_OK;
+				CHECK(completion.postFromHost(&done, sizeof(done)));
+				[cb waitUntilCompleted];
+				CHECK(cb.status == MTLCommandBufferStatusCompleted);
+			};
+
+			// A heap-placed buffer, held, then a commit that names it.
+			kext.calls.clear();
+			id<MTLBuffer> buffer = [heap newBufferWithLength:256
+			                                         options:MTLResourceStorageModePrivate];
+			CHECK(buffer != nil);
+			id<MTLCommandBuffer> first = commitFill(buffer, 0);
+			CHECK(control.next(&h, &bytes) && h.type == RGFX_CMD_BUFFER_AT_OFFSET);
+			CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER && h.seqno == 1);
+			if (withFeature) {
+				// One call: the held, then the buffer's publish and its doorbell, by the kext.
+				CHECK(kext.calls == "PK");
+				CHECK(kext.heldAtPublish == control.consumed);
+				CHECK(kext.word == PublishingKext::kQueueRing);
+			} else {
+				// The held in their own call, then the bundle's publish and doorbell.
+				CHECK(kext.calls == "BD");
+			}
+			complete(first, 1);
+
+			// Nothing held: the bundle publishes and rings, as before.
+			kext.calls.clear();
+			id<MTLCommandBuffer> second = commitFill(buffer, 1);
+			CHECK(!control.next(&h, &bytes));
+			CHECK(submit.next(&h, &bytes) && h.seqno == 2);
+			CHECK(kext.calls == "D");
+			complete(second, 2);
+
+			// A held create the kext refuses: the buffer fails unposted, unseen by the host.
+			kext.refuse = true;
+			kext.calls.clear();
+			id<MTLBuffer> refused = [heap newBufferWithLength:256
+			                                          options:MTLResourceStorageModePrivate];
+			CHECK(refused != nil);
+			const uint64_t producedBefore = submit.producer();
+			id<MTLCommandBuffer> third = commitFill(refused, 2);
+			[third waitUntilCompleted];
+			CHECK(third.status == MTLCommandBufferStatusError);
+			CHECK(third.error != nil && third.error.code == MTLCommandBufferErrorInternal);
+			CHECK(submit.producer() == producedBefore);
+			CHECK(!submit.next(&h, &bytes) && !control.next(&h, &bytes));
+			CHECK(kext.calls == (withFeature ? "P" : "B"));
+			// Taken again: the create goes, then the next buffer, at the seqno the failed one
+			// never used.
+			kext.refuse = false;
+			kext.calls.clear();
+			id<MTLCommandBuffer> fourth = commitFill(refused, 3);
+			CHECK(control.next(&h, &bytes) && h.type == RGFX_CMD_BUFFER_AT_OFFSET);
+			CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER);
+			CHECK(h.seqno == 3);
+			CHECK(kext.calls == (withFeature ? "PK" : "BD"));
+			complete(fourth, h.seqno);
+
+			// Held destroys alone that the kext refuses: the buffer goes all the same, published
+			// by the bundle, the destroys still held.
+			@autoreleasepool {
+				id<MTLBuffer> gone = [heap newBufferWithLength:256
+				                                       options:MTLResourceStorageModePrivate];
+				CHECK(gone != nil);
+				CHECK(ser.postHeldCreates());
+				CHECK(control.next(&h, &bytes) && h.type == RGFX_CMD_BUFFER_AT_OFFSET);
+				gone = nil;
+			}
+			CHECK(writer.holdsBut(RGFX_CMD_OBJECT_DESTROY) == false);
+			kext.refuse = true;
+			kext.calls.clear();
+			id<MTLCommandBuffer> fifth = commitFill(buffer, 4);
+			CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER);
+			CHECK(kext.calls == (withFeature ? "PD" : "BD"));
+			complete(fifth, h.seqno);
+			kext.refuse = false;
+			CHECK(writer.flushLater());
+			CHECK(control.next(&h, &bytes) && h.type == RGFX_CMD_OBJECT_DESTROY);
+		}
 	}
 }
 
@@ -2942,6 +3187,7 @@ void rgfxProtocolTests()
 	test_inline_bytes_parallel();
 	test_inline_bytes_without_region();
 	test_commit_behind_an_untaken_buffer_fails();
+	test_commit_hands_its_publish_to_the_held();
 	test_render_barriers();
 	test_compute_dispatch_type();
 	test_compute_function_table_bindings();

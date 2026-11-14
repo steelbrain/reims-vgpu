@@ -1261,6 +1261,18 @@ bool RgfxAccelerator::pinRange(const void *owner, UInt64 offset, UInt64 length, 
 	return pinned;
 }
 
+bool RgfxAccelerator::ownsBlock(const void *owner, UInt64 offset)
+{
+	if (!contextLock)
+		return false;
+	IOLockLock(contextLock);
+	const int64_t at = rgfxBlockIndex(blockTable, offset);
+	const bool owns = at >= 0 && blockTable.blocks[at].owner == owner &&
+	                  blockTable.blocks[at].state == kRgfxBlockLive && !blockTable.blocks[at].wired;
+	IOLockUnlock(contextLock);
+	return owns;
+}
+
 void RgfxAccelerator::unpinBlock(const RgfxBlockPin &pin)
 {
 	if (!contextLock)
@@ -2984,22 +2996,31 @@ void RgfxAccelerator::dropSurfaceBlocks(const void *client, bool closed)
 
 // MARK: - The queues' completion rings
 
+IOMemoryMap *RgfxAccelerator::mapRingHeader(UInt64 offset, volatile UInt8 **header)
+{
+	if (!region || offset % 8 || offset + RGFX_RING_HEADER_SIZE > regionSize)
+		return nullptr;
+	// The header's page or pages, write-back as the bundle maps the region.
+	UInt64 page = offset & ~(kPage - 1);
+	UInt64 length = alignUp(offset + RGFX_RING_HEADER_SIZE, kPage) - page;
+	IOMemoryMap *map = region->createMappingInTask(kernel_task, 0,
+	                                               kIOMapAnywhere | kIOMapCopybackCache, page,
+	                                               length);
+	if (map)
+		*header = reinterpret_cast<volatile UInt8 *>(map->getVirtualAddress()) + (offset - page);
+	return map;
+}
+
 IOReturn RgfxAccelerator::watchQueue(RgfxAcceleratorUserClient *client, UInt64 objId,
                                      UInt64 completeOffset)
 {
 	if (!contextLock || !region || completeOffset % 8 ||
 	    completeOffset + RGFX_RING_HEADER_SIZE > regionSize)
 		return kIOReturnBadArgument;
-	// The header's page or pages, write-back as the bundle maps the region.
-	UInt64 page = completeOffset & ~(kPage - 1);
-	UInt64 length = alignUp(completeOffset + RGFX_RING_HEADER_SIZE, kPage) - page;
-	IOMemoryMap *map = region->createMappingInTask(kernel_task, 0,
-	                                               kIOMapAnywhere | kIOMapCopybackCache, page,
-	                                               length);
+	volatile UInt8 *header = nullptr;
+	IOMemoryMap *map = mapRingHeader(completeOffset, &header);
 	if (!map)
 		return kIOReturnNoMemory;
-	volatile UInt8 *header =
-	    reinterpret_cast<volatile UInt8 *>(map->getVirtualAddress()) + (completeOffset - page);
 	IOLockLock(watchLock);
 	if (!rgfxWatchAdmitted(watchedCount, client->isWindowServer())) {
 		IOLockUnlock(watchLock);

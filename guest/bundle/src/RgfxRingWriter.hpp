@@ -93,6 +93,37 @@ typedef bool (*RgfxAwaitAnswer)(void *context, uint64_t seqno);
 /// only where the kext refused them, as it does where its control ring stays full.
 typedef uint32_t (*RgfxForwardBatch)(void *context, const void *messages, uint32_t bytes);
 
+/// A command queue's publish the kext makes after the held messages it posts (the accelerator's
+/// SubmitBatch with its publish): the queue, its submission ring's new producer, whether its
+/// command buffer is one the host answers at the doorbell (rung for a walking ring too), and
+/// whether that doorbell names RGFX_DOORBELL_ASKS.
+struct RgfxQueuePublish {
+	uint64_t queue;
+	uint64_t producer;
+	bool answered;
+	bool asks;
+};
+
+/// Hands `bytes` bytes of held messages to the kext as RgfxForwardBatch does, and with them
+/// `publish`, which the kext makes after them once it has posted every one, as the queue's writer
+/// would (RgfxRingWriter::tryPost): how many it posted, from the first, and `*out_published`
+/// whether it published.
+typedef uint32_t (*RgfxForwardBatchPublish)(void *context, const void *messages, uint32_t bytes,
+                                            const RgfxQueuePublish &publish, bool *out_published);
+
+class RgfxRingWriter;
+
+/// A command buffer's post that hands its publish to the control ring's held messages, so a commit
+/// behind them makes one kext call (RgfxRingWriter::tryPost): the control ring's writer and the
+/// buffer's queue. `refused` is set where the post left the buffer off its ring because a held
+/// message other than a destroy was refused, which the buffer may name (as
+/// RgfxSerializer::postHeldCreates fails it).
+struct RgfxPublishVia {
+	RgfxRingWriter *control = nullptr;
+	uint64_t queue = 0;
+	bool refused = false;
+};
+
 /// How long a message RgfxRingWriter::postLater() holds waits at most for others to go with it:
 /// a run of destroys an app lets go back to back takes tens of microseconds.
 constexpr uint64_t kRgfxLaterNs = 1000000;
@@ -152,10 +183,15 @@ public:
 	/// RGFX_OP_GUEST_TIMES, RGFX_GUEST_TIMES_POSTED_OFFSET): the guest's clock is written there in
 	/// the ring's copy, under the lock, after the copy and `beforePublish` and before `producer`
 	/// moves, as the seqno is stamped. A forwarding writer writes no stamp.
+	/// With `via`, the publish goes to `via->control`'s held messages (flushPublishing), which
+	/// the kext posts first and then publishes this ring as this writer would; where none is held
+	/// or the kext did not publish, this writer publishes as it does without `via`, but where a
+	/// held message other than a destroy is still held then: the message is taken off the ring
+	/// again, unpublished, its seqno the next post's, `via->refused` set and false returned.
 	bool tryPost(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,
 	             uint32_t *out_status = nullptr,
 	             const std::function<void(uint64_t)> &beforePublish = {}, bool answered = false,
-	             uint32_t stampAt = 0);
+	             uint32_t stampAt = 0, RgfxPublishVia *via = nullptr);
 
 	/// Where a forwarding writer posts a known pipeline create (RgfxForwardDeferred) and takes
 	/// its answer (RgfxAwaitAnswer), both called with `context`: the kext's deferred submit,
@@ -199,6 +235,20 @@ public:
 	/// Whether postLater() holds a message of a type other than `type`.
 	bool holdsBut(uint32_t type);
 
+	/// Where a batching writer's route takes a queue's publish with the held messages
+	/// (RgfxForwardBatchPublish), called with the forward's context. Set once, after setBatch,
+	/// before the first post.
+	void setBatchPublish(RgfxForwardBatchPublish post);
+
+	/// Whether the route takes a queue's publish with the held messages (setBatchPublish).
+	bool publishesQueues() const;
+
+	/// Posts what postLater() holds, as flushLater() does, with `publish` in its last call: true
+	/// where the route posted every held message and published the queue's ring after them. False
+	/// where none was held (nothing posted), where the route refused a held message (the rest stay
+	/// held, first) or published nothing: the queue's writer then publishes, or not.
+	bool flushPublishing(const RgfxQueuePublish &publish);
+
 	/// Whether the route keeps answers for later (setDeferred), so a known pipeline create need
 	/// not wait.
 	bool defers() const { return m_forward != nullptr && m_deferredPost != nullptr; }
@@ -232,12 +282,12 @@ public:
 	/// producer_waiting, fences and looks once more, then waits for the host's room record
 	/// instead of the sleep: up to 20 ms where no `whileWaiting` is given (a completion thread
 	/// takes the record), else up to the sleep's step, as `whileWaiting` may be what takes it.
-	/// False, writing nothing, only for a message that does not fit(). `stampAt` as tryPost's: the
-	/// stamp is the post's that finds room.
+	/// False, writing nothing, only for a message that does not fit(), or where tryPost set
+	/// `via->refused`. `stampAt` and `via` as tryPost's: the stamp is the post's that finds room.
 	bool post(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,
 	          const std::function<void()> &whileWaiting = {},
 	          const std::function<void(uint64_t)> &beforePublish = {}, bool answered = false,
-	          uint32_t stampAt = 0);
+	          uint32_t stampAt = 0, RgfxPublishVia *via = nullptr);
 
 	/// The byte ring's size.
 	uint32_t dataSize() const { return m_dataSize; }

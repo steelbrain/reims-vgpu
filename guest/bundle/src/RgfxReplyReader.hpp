@@ -121,6 +121,11 @@ public:
 	/// posts CB_SUBMITTED ahead of both, and none for a buffer it could not take.
 	void expectSubmitted(uint64_t seqno, SubmittedHandler handler);
 
+	/// Removes, unfired, what expectCompletion, expectScheduled and expectSubmitted registered for
+	/// `seqno`: a command buffer taken off its ring before the host saw it, whose seqno the next
+	/// buffer on the ring takes (RgfxRingWriter::tryPost's `via`).
+	void forget(uint64_t seqno);
+
 	/// Registers `handler` for the pipeline created at `seqno`; fired once, when its
 	/// RGFX_EVT_PIPELINE_REFLECTION arrives, then removed.
 	void expectReflection(uint64_t seqno, ReflectionHandler handler);

@@ -87,6 +87,12 @@ enum {
 	// (kIOReturnBadArgument). Succeeds with fewer than all only where the control ring stayed full
 	// or the device stopped: the rest were not posted, and go in a later call, before anything
 	// else of the client's.
+	// With three scalars in and two out (kRgfxKextFeatureQueuePublish): one of the client's
+	// queues, its submission ring's new producer and the publish's flags (RgfxQueuePublish.hpp's
+	// kRgfxPublish*): once every message is posted, the kext publishes the producer on the queue's
+	// ring after them and rings its doorbell as the bundle's own publish would; the second output
+	// says whether it did (0 where any message was not posted, or the queue is not one whose ring
+	// header the kext keeps: the bundle then publishes the buffer itself, or fails it).
 	kRgfxAccelMethodSubmitBatch = 5,
 	// 6 is kept for WakeCompletions (kRgfxKextFeatureWakeCompletions).
 	// The answers to the client's deferred pipeline creates (Submit's kRgfxSubmitDeferred) the
@@ -350,6 +356,8 @@ enum {
 	kRgfxKextFeatureSharedPipelines = 1 << 9,
 	// SurfaceSeeds, 13.
 	kRgfxKextFeatureSurfaceSeeds = 1 << 10,
+	// SubmitBatch's (5) publish of a queue's ring with the messages (RgfxQueuePublish.hpp).
+	kRgfxKextFeatureQueuePublish = 1 << 11,
 };
 
 // Where a cached block's header holds its surface's CPU generation, a 64-bit count the kext

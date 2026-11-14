@@ -26,6 +26,7 @@
 #include "RgfxAccelerator.hpp"
 #include "RgfxAskGate.hpp"
 #include "RgfxQueueLimits.hpp"
+#include "RgfxQueuePublish.hpp"
 
 class IOBufferMemoryDescriptor;
 
@@ -149,6 +150,16 @@ private:
 	// Whether `objId` is one of the client's queues, listed or in the making, read under
 	// listLock: destroyQueueIfTracked's first look.
 	bool queueListed(UInt64 objId);
+	// The submission ring headers the kext publishes the client's queues' buffers on
+	// (RgfxQueuePublish.hpp): keepQueueHeader maps queue `objId`'s, whose ring lies at region
+	// offset `ring` in the client's block at `block`, at its create; publishQueue publishes
+	// `producer` on it with `flags` (SubmitBatch's), false where none is kept for the queue;
+	// dropQueueHeaders lets go of the queue `key`'s, those in the block at `key`, or every one,
+	// before what they lie in goes.
+	enum QueueHeaderDrop { kDropQueue, kDropBlock, kDropAll };
+	void keepQueueHeader(UInt64 objId, UInt64 block, UInt64 ring);
+	bool publishQueue(UInt64 objId, UInt64 producer, UInt64 flags);
+	void dropQueueHeaders(QueueHeaderDrop which, UInt64 key);
 
 	// As many as the device watches for one process (RgfxQueueLimits.hpp).
 	static const UInt32 kMaxQueues = kRgfxMaxQueuesPerClient;
@@ -176,6 +187,10 @@ private:
 	UInt64 queues[kMaxQueues];
 	// The queue a QUEUE_CREATE is making, its device's answer not yet in; 0 for none.
 	UInt64 creatingQueue;
+	// The queues' submission ring headers the kext publishes on, under listLock: the first 64
+	// queues' kept at once; a queue made past them has its buffers published by the bundle.
+	static const UInt32 kQueueHeaders = 64;
+	RgfxQueueHeaders<IOMemoryMap, kQueueHeaders> queueHeaders;
 	IOLock *queueLock;
 	IOLock *listLock;
 

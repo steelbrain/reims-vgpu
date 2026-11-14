@@ -46,6 +46,7 @@
 // The accelerator's user-client protocol, the kext's own header: its type, its selectors and
 // the kext's own feature bits.
 #include "../../kext/src/RgfxDeferCarry.hpp"
+#include "../../kext/src/RgfxQueuePublish.hpp"
 #include "../../kext/src/RgfxUserClientABI.hpp"
 
 namespace {
@@ -251,6 +252,28 @@ uint32_t rgfxKextSubmitBatch(void *context, const void *messages, uint32_t bytes
 	    outCount != 1)
 		return 0;
 	return static_cast<uint32_t>(posted);
+}
+
+// The control ring's batch with a queue's publish after it (RgfxRingWriter::setBatchPublish):
+// SubmitBatch with the queue, its producer and the publish's flags in, the kext publishing once it
+// posted every message (RgfxQueuePublish.hpp): how many it posted, `*out_published` whether it
+// published.
+uint32_t rgfxKextSubmitBatchPublish(void *context, const void *messages, uint32_t bytes,
+                                    const RgfxQueuePublish &publish, bool *out_published)
+{
+	RgfxKextLink *link = static_cast<RgfxKextLink *>(context);
+	const uint64_t in[3] = {publish.queue, publish.producer,
+	                        (publish.answered ? uint64_t(kRgfxPublishAnswered) : 0) |
+	                            (publish.asks ? uint64_t(kRgfxPublishAsks) : 0)};
+	uint64_t out[2] = {};
+	uint32_t outCount = 2;
+	*out_published = false;
+	if (IOConnectCallMethod(link->conn, kRgfxAccelMethodSubmitBatch, in, 3, messages, bytes, out,
+	                        &outCount, nullptr, nullptr) != KERN_SUCCESS ||
+	    outCount != 2)
+		return 0;
+	*out_published = out[1] == 1;
+	return static_cast<uint32_t>(out[0]);
 }
 
 // The serializer's queries: the kext posts the message on the control ring, stamping its seqno,
@@ -967,6 +990,10 @@ RGFX_LOG_UNRECOGNIZED
 	if ((_caps.kextFeatures() & kRgfxKextFeatureSubmitBatch) != 0) {
 		_controlRing->setBatch(&rgfxKextSubmitBatch, kRgfxSubmitBatchBytes);
 		_link.control = _controlRing.get();
+		// A commit behind held messages hands its buffer's publish to them, where the kext makes
+		// it after them (RgfxQueuePublish.hpp): one call, not the held and then the doorbell.
+		if ((_caps.kextFeatures() & kRgfxKextFeatureQueuePublish) != 0)
+			_controlRing->setBatchPublish(&rgfxKextSubmitBatchPublish);
 	}
 	// A pipeline create equal to one the device accepted is posted without waiting, where the
 	// kext keeps its answer for later (RgfxKnownPipelines.hpp).

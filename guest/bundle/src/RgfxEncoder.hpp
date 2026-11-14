@@ -541,9 +541,12 @@ public:
 	/// or too long for a header's `size`. On success `*out_seqno` (when not null) holds the
 	/// stamped seqno, which the completion carries. `beforePublish` gets the seqno before the
 	/// host can see the buffer (RgfxRingWriter::tryPost), so its completion is expected first.
+	/// `via` (when not null) hands the publish to the control ring's held messages
+	/// (RgfxRingWriter::tryPost): false, with `via->refused`, where a held message the buffer may
+	/// name was refused.
 	bool finish(uint64_t *out_seqno = nullptr, const std::function<void()> &whileWaiting = {},
 	            const std::function<void(uint64_t)> &beforePublish = {},
-	            RgfxMessageBlock *held = nullptr);
+	            RgfxMessageBlock *held = nullptr, RgfxPublishVia *via = nullptr);
 
 	/// Whether the finished message goes on the ring (RgfxRingWriter::fits), not in a block.
 	bool fitsRing() const;
