@@ -863,6 +863,118 @@ mod tests {
         }
     }
 
+    /// Through random makes, makes over an id again, removes and a close's removal of every
+    /// entry, with views open over some of them, whether an entry lies in a range answers what a
+    /// look at every live entry's span answers: spans of blocks apart, of one block shared by the
+    /// objects placed in it, of no bytes, and ranges of no bytes, over, across and beside them
+    #[test]
+    fn span_in_answers_as_a_look_at_every_live_entry() {
+        let p = FakePlatform::new();
+        let ctx = Arc::new(Context::<FakePlatform>::new(1));
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let every = |ctx: &Context<FakePlatform>, offset: u64, size: u64| {
+            let end = offset.saturating_add(size);
+            let mut any = false;
+            ctx.for_each_live(|_, e| {
+                any |= e
+                    .span
+                    .is_some_and(|(at, length)| at < end && offset < at.saturating_add(length));
+            });
+            any
+        };
+        let mut views = Vec::new();
+        for round in 0..3000 {
+            let id = next(64);
+            match next(8) {
+                0..=3 => {
+                    let span = match next(4) {
+                        0 => None,
+                        1 => Some((0x1_0000 + next(32) * 0x1000, 0)),
+                        _ => Some((0x1_0000 + next(32) * 0x1000, (1 + next(4)) * 0x1000)),
+                    };
+                    let (_, replaced) = ctx.insert(id, Entry::of(fence(&p)).over(span), None);
+                    let_go(replaced.into_iter().collect());
+                }
+                4 | 5 => {
+                    if let Some((_, Some(removed))) = ctx.remove(id) {
+                        let_go(vec![removed]);
+                    }
+                }
+                6 => match views.len() {
+                    0..4 => views.push(View::take(Arc::clone(&ctx))),
+                    _ => views.clear(),
+                },
+                _ if round % 500 == 0 => let_go(ctx.remove_all().0),
+                _ => {}
+            }
+            for _ in 0..4 {
+                let (offset, size) = (0xf000 + next(40) * 0x800, next(4) * 0x800);
+                assert_eq!(
+                    ctx.span_in(offset, size),
+                    every(&ctx, offset, size),
+                    "{offset:#x}+{size:#x}"
+                );
+            }
+        }
+    }
+
+    /// What a block's release's check that no object lies in it costs ([`Context::span_in`];
+    /// a measurement, not a check; run it by name with `--run-ignored only --no-capture` in a
+    /// release build): Particle Physics' 106 releases spent 2.31 us a dispatch there on gbp-iris,
+    /// about 0.5 ms each. A table of `TABLES_COST_LIVE` objects (default 8,192), each over a
+    /// block of its own of 64 KiB, one in four over the block of the object before (a buffer
+    /// placed in a heap), and 2,000 checks of blocks among them and past them. Prints the
+    /// thread's user-space instructions and cycles a check, the median of 9 runs.
+    #[test]
+    #[ignore = "a measurement: run it by name"]
+    fn a_block_release_s_check_costs() {
+        use crate::graphics::decode::draw_cost::{counts, spread};
+        let live: u64 = std::env::var("TABLES_COST_LIVE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8192);
+        let p = FakePlatform::new();
+        let ctx = Arc::new(Context::<FakePlatform>::new(1));
+        let block = |i: u64| (0x10_0000 + i * 0x1_0000, 0x1_0000);
+        let mut at = 0;
+        for id in 0..live {
+            if id % 4 != 3 {
+                at += 1;
+            }
+            ctx.insert(id, Entry::of(fence(&p)).over(Some(block(at))), None);
+        }
+        let checks: Vec<(u64, u64)> = (0..2000u64)
+            .map(|i| block((i * 7919) % (at + at / 8)))
+            .collect();
+        let mut figures: [Vec<f64>; 2] = Default::default();
+        let mut held = 0;
+        for _ in 0..9 {
+            let before = counts();
+            for &(offset, size) in &checks {
+                held += usize::from(ctx.span_in(std::hint::black_box(offset), size));
+            }
+            let spent = counts() - before;
+            for (f, figure) in figures.iter_mut().enumerate() {
+                figure.push(spent.0[f + 1] as f64 / checks.len() as f64);
+            }
+        }
+        assert!(held > 0);
+        eprintln!(
+            "span_in over {live} objects: user-space instructions and cycles a check (median, \
+             lowest, highest of 9)"
+        );
+        for (figure, name) in figures.iter_mut().zip(["instructions", "cycles"]) {
+            let [median, low, high] = spread(figure);
+            eprintln!("  {name:<12} {median:9.0} ({low:.0} to {high:.0})");
+        }
+    }
+
     /// An entry removed with no view open is handed back at once, and a view taken after a
     /// removal never keeps it.
     #[test]
