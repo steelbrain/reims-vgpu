@@ -44,6 +44,32 @@ MacBook's display to its discrete GPU. A case that may end the process (Metal's 
 asserts on some creates) runs in a child process of its own, and the line says how it died.
 The header of each `.m` lists its cases and the meaning of every column.
 
+## Beside the probes: gameload
+
+`../gameload` is a load, not a probe: a game-shaped frame of our own, rendered offscreen for a fixed
+number of frames, which prints each frame's CPU, wait, frame-to-frame and GPU times in ms and their
+p50, p90 and mean. A frame holds what AAA Metal ports make: textures and a buffer placed in a
+placement heap and uploaded each frame, transient textures from an automatic heap made aliasable as
+they are done with, render targets placed in a heap, a 4x MSAA scene with depth resolved and
+composited through an sRGB view, a UI pass into a BGRA view, an indirect command buffer a kernel
+encodes, 4000 CPU draws and 1000 shadow draws over argument buffers, compute post-processing and a
+blit stream with a read-back. Each of its eight shapes (`heap`, `rtheap`, `targets`, `views`, `icb`,
+`draws`, `post`, `blit`) turns off with `--off NAME,...`, so a run with one off measures that
+shape's share; `gameload.m`'s header lists every option and line.
+`make -C guest/bundle/tools/gameload` builds one universal binary (arm64 and x86_64),
+`guest/bundle/build/gameload`, which runs on an Apple-silicon Mac, an Intel Mac and both guests.
+The measured runs were these. Each of the first four ran once with every shape on and then once
+with each shape off (`--off heap`, `--off rtheap`, and so on), the native ones each in a potluck job
+holding the GPU it measures; the last ran once:
+
+```sh
+caffeinate -s ./gameload -d Apple -f 1500 -w 150 -q             # the M3 Max (--gpu m3max --ram 2)
+caffeinate -s ./gameload -d AMD -f 600 -w 60 -q                 # the oracle's 5300M (--gpu 5300m --ram 1)
+caffeinate -s ./gameload -d Intel -f 600 -w 60 -q               # the oracle's 630 (--gpu 630 --ram 1)
+~/walk/gl/gameload -f 300 -w 30                                 # a guest, in its GUI session
+~/walk/gl/gameload -f 300 -w 30 -b                              # a guest, the ICB inheriting no buffers
+```
+
 ## Build
 
 On a Mac with Xcode's toolchain, never on the oracle:
