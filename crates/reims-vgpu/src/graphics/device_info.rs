@@ -346,6 +346,24 @@ fn cap_apple_families(identity: &mut IdentityCaps, wired: &[Piece]) {
 /// place: on NVIDIA's driver only that pitch is (the tight row rounded up to 128), so rows at
 /// another multiple of 128, such as the tight row rounded up to 256, are the runtime's shadow.
 ///
+/// The answer moves only the layouts the guest's frameworks make by it. The device's tiled form
+/// (`newTiledTextureWithBytesNoCopy:` and a buffer's `newTiledTextureWithDescriptor:offset:
+/// bytesPerRow:`) takes a texture at any offset and pitch, as the 5300M's does (`RgfxBuffer.mm`),
+/// and WindowServer makes textures by it over the images other processes hand it, in no-copy
+/// buffers over pages it maps read-only, each buffer at the start of a page and the texels where
+/// the image puts them. In a desktop and Finder walk of a macOS 26.7.2 guest on a Radeon 780M,
+/// the device answering 256 for every format such a texture had, 233 of them were the runtime's
+/// shadows: 134 icons of 128 x 128 `BGRA8Unorm` 32 bytes into their buffers with rows of 512
+/// bytes, one more 32 bytes in with rows of 320, and 98 at offset 0 with rows at multiples of 32
+/// bytes off 256 (192 for widths of 42 to 48 pixels, 128 for 26 to 32). Textures of the tiled form
+/// over writable pages keep their own layouts too: `A8Unorm` 256 bytes in, rows at multiples of
+/// 64 bytes. RADV takes a `LINEAR` plane only at an offset and a row pitch that are multiples of
+/// 256 bytes on GFX9 to GFX11 (the pitch 128 on GFX12; Mesa 26.2.6's
+/// `ac_surface_override_offset_stride`, which `radv_image`'s layout calls for an explicit
+/// modifier's plane), so such textures are shadows there at any answer of the device's. On an
+/// Iris Xe, over a walk of every step of the same guest, 514 of the 515 read-only ones lay in
+/// place.
+///
 /// An IOSurface's rows follow two other answers. A surface made with no pitch named
 /// (`IOSurfaceCreate`, and CoreVideo's buffers and pools) takes rows at IOSurface's own
 /// alignment, `IOSurfaceGetPropertyAlignment(kIOSurfaceBytesPerRow)`: 64 bytes on the 5300M's Mac
