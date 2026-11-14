@@ -2615,7 +2615,9 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	[_completedHandlers removeAllObjects];
 	// What it kept goes after its handlers, which may still name it, and before its waiters
 	// wake, as Metal's buffer lets its retained references go; the blocks
-	// __waitUntilCompletedAsync: was given run between the two, as Metal's do.
+	// __waitUntilCompletedAsync: was given run between the two, as Metal's do. The destroys
+	// those releases hold arm their timer once the waiters are let go (RgfxRingLaterArms).
+	RgfxRingLaterArms arms;
 	_kept.clear();
 	[self rgfxLetResidencySetsGo];
 	[self rgfxRunWaiters:_completedWaiters done:&_completedWaitersDone];

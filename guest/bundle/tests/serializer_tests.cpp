@@ -2680,8 +2680,8 @@ uint32_t kextSubmitBatch(void *context, const void *messages, uint32_t bytes)
 
 // Destroys held to go together (RgfxRingWriter::postLater): each `after` runs at the destroy, as
 // it did once the destroy was posted, and the destroys reach the "kext" in their order before
-// anything the process posts after them, at most a batch's bytes a call, or once the timer fires;
-// a destroy the host orders other contexts by goes at once; a batch the kext takes only in part
+// anything the process posts after them, at most a batch's bytes a call, or once the timer fires,
+// whose arm an RgfxRingLaterArms holds until it ends; a destroy the host orders other contexts by goes at once; a batch the kext takes only in part
 // keeps the rest held, first, and the writer posts nothing past them until they go.
 void test_held_destroys()
 {
@@ -2732,6 +2732,26 @@ void test_held_destroys()
 		std::this_thread::sleep_for(std::chrono::microseconds(100));
 	CHECK(std::chrono::steady_clock::now() - from >= std::chrono::nanoseconds(kRgfxLaterNs));
 	CHECK(timed.ring() == std::vector<RgfxObjId>({0x2001, 0x2002}));
+
+	// Held inside an RgfxRingLaterArms, nothing goes while it lives, however long, and the timer
+	// it arms as it ends posts kRgfxLaterNs after that.
+	KextLog scoped;
+	RgfxRingWriter scopedWriter(&kextSubmit, &scoped, 4096);
+	scopedWriter.setBatch(&kextSubmitBatch, 4096);
+	RgfxSerializer sser(scopedWriter, ids);
+	std::chrono::steady_clock::time_point ended;
+	{
+		RgfxRingLaterArms arms;
+		CHECK(sser.destroy(0x2101));
+		CHECK(sser.destroy(0x2102));
+		std::this_thread::sleep_for(std::chrono::nanoseconds(5 * kRgfxLaterNs));
+		CHECK(scoped.ring().empty());
+		ended = std::chrono::steady_clock::now();
+	}
+	for (int i = 0; i < 20000 && scoped.ring().size() < 2; i++)
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	CHECK(std::chrono::steady_clock::now() - ended >= std::chrono::nanoseconds(kRgfxLaterNs));
+	CHECK(scoped.ring() == std::vector<RgfxObjId>({0x2101, 0x2102}));
 
 	// At once: the held first, then the destroy alone, its `after` run.
 	log.calls.clear();

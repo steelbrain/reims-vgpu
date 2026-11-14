@@ -34,6 +34,7 @@
 #include <memory>
 #include <mutex>
 #include <time.h>
+#include <vector>
 
 #include "RgfxRingRoomEvents.hpp"
 #include "reims_graphics_wire.h"
@@ -97,6 +98,24 @@ typedef uint32_t (*RgfxForwardBatch)(void *context, const void *messages, uint32
 constexpr uint64_t kRgfxLaterNs = 1000000;
 
 struct RgfxRingLater;
+
+/// While one lives on a thread, the postLater() calls the thread makes arm no timer: the timers
+/// they would have armed are armed as it ends, each then posting what is held setBatch's time
+/// later at most. A command buffer's delivery holds one from the release of what the buffer kept
+/// to its waiters' release, so the arm, a wake of the dispatch manager's thread (about 15 us of
+/// the delivery's on a 780M host, 11-14), comes after the waiters are let go, not before.
+class RgfxRingLaterArms {
+public:
+	RgfxRingLaterArms();
+	~RgfxRingLaterArms();
+	RgfxRingLaterArms(const RgfxRingLaterArms &) = delete;
+	RgfxRingLaterArms &operator=(const RgfxRingLaterArms &) = delete;
+
+private:
+	friend class RgfxRingWriter;
+	RgfxRingLaterArms *m_outer;
+	std::vector<std::shared_ptr<RgfxRingLater>> m_arms;
+};
 
 class RgfxRingWriter {
 public:
@@ -166,7 +185,8 @@ public:
 	/// others where the writer batches (setBatch): held, to go in the order held before anything
 	/// the writer posts after it (each tryPost, tryPostKnown and tryPostShared posts the held first),
 	/// at flushLater(), once the held reach the batch's bytes, or setBatch's time after the first
-	/// held. Else, or for a message larger than a batch, posted as tryPost() posts it. True once
+	/// held (after the end of the RgfxRingLaterArms the thread that held it was in, where it was).
+	/// Else, or for a message larger than a batch, posted as tryPost() posts it. True once
 	/// held or posted; false, holding nothing more, where the held had to go first to make room
 	/// and the route refused them. A held message the route refuses stays held, first, and the
 	/// writer posts nothing else until it goes.

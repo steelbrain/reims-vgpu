@@ -157,7 +157,30 @@ void laterFire(void *context)
 	delete later;
 }
 
+// Arms `later`'s timer: it posts what is held laterNs from now.
+void armLater(const std::shared_ptr<RgfxRingLater> &later)
+{
+	dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(later->laterNs)),
+	                 dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
+	                 new std::shared_ptr<RgfxRingLater>(later), &laterFire);
+}
+
+// The thread's innermost RgfxRingLaterArms, where one lives.
+thread_local RgfxRingLaterArms *t_laterArms = nullptr;
+
 } // namespace
+
+RgfxRingLaterArms::RgfxRingLaterArms() : m_outer(t_laterArms)
+{
+	t_laterArms = this;
+}
+
+RgfxRingLaterArms::~RgfxRingLaterArms()
+{
+	t_laterArms = m_outer;
+	for (const std::shared_ptr<RgfxRingLater> &later : m_arms)
+		armLater(later);
+}
 
 RgfxRingWriter::RgfxRingWriter(volatile uint8_t *ring_base, uint32_t data_size, uint32_t ring_id,
                                RgfxDoorbell doorbell, void *doorbell_context)
@@ -236,10 +259,12 @@ bool RgfxRingWriter::postLater(uint32_t type, const void *message, uint32_t size
 		arm = !later->armed;
 		later->armed = true;
 	}
-	if (arm)
-		dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(later->laterNs)),
-		                 dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
-		                 new std::shared_ptr<RgfxRingLater>(m_later), &laterFire);
+	if (arm) {
+		if (t_laterArms != nullptr)
+			t_laterArms->m_arms.push_back(m_later);
+		else
+			armLater(m_later);
+	}
 	return true;
 }
 
