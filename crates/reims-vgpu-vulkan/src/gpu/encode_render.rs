@@ -1029,32 +1029,32 @@ fn undecided(d: &rt::RenderPassDescriptor) -> Vec<(Attachment, Option<Unsent>)> 
     out
 }
 
-/// Why a pass's write into a texture is never sent: its memory is read-only, which the runtime
-/// imports through a writable twin of a surface's pages, where the write would land, or copies,
-/// where what Metal does with a resolve into it is unmeasured
-/// ([`crate::gpu::writes::kept_write`]), or it lies on a surface whose GPU writes never reach its
-/// memory ([`crate::os::dropped_write`]); or a colour attachment's resolve texture, the
-/// descriptor's, over read-only memory the runtime copies, into which only a resolve Metal's GPU
-/// faults is sent ([`faults_into`]).
+/// Why a pass's resolve into a texture is never sent as it stands: its memory is read-only, which
+/// the runtime imports through a writable twin of a surface's pages, where the write would land
+/// ([`crate::gpu::writes::kept_write`]), or copies, where only a resolve Metal's GPU faults is
+/// sent ([`faults_into`]), or it lies on a surface whose GPU writes never reach its memory
+/// ([`crate::os::dropped_write`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Unsent {
-    /// Over read-only memory whose writes this platform does not answer as Metal's GPU does.
+    /// Over a surface's read-only memory, which the runtime imports through a writable twin.
     Kept,
     /// On a surface whose GPU writes never reach its memory.
     Dropped,
-    /// A colour attachment's resolve texture, the pass descriptor's, over read-only memory the
-    /// runtime copies: a late `MultisampleResolve` into it faults the command buffer, as Metal's
-    /// GPU does, and another resolving action dies as [`Unsent::Kept`]
-    /// ([`VulkanRenderEncoder::late_store`]).
+    /// Over read-only memory the runtime copies: a late resolve into it that Metal's GPU faults
+    /// ([`faults_into`]) faults the command buffer, as Metal's does, and a depth attachment's
+    /// `StoreAndMultisampleResolve`, which the runtime faults where Metal's GPU completes it,
+    /// dies ([`VulkanRenderEncoder::late_store`], [`VulkanRenderEncoder::late_resolve`]).
     Copied,
 }
 
 impl Unsent {
-    /// Why a write into `t` is never sent, if it is not: the twin first, which the write would
-    /// reach.
+    /// Why a resolve into `t` is never sent as it stands, if it is not: the twin first, which the
+    /// write would reach.
     fn of(t: &VulkanTexture) -> Option<Unsent> {
-        if crate::gpu::writes::texture_kept(t) {
+        if crate::gpu::writes::texture_twinned(t) {
             Some(Unsent::Kept)
+        } else if crate::gpu::writes::texture_kept(t) {
+            Some(Unsent::Copied)
         } else if t.gpu_read_only() {
             Some(Unsent::Dropped)
         } else {
@@ -1077,14 +1077,18 @@ impl Unsent {
 /// as Metal's GPU does ([`crate::gpu::writes::kept_write`]), as `sources` says of its
 /// attachments: an attachment's texture over a surface's memory the runtime twins, whatever the
 /// pass's load and store actions, as the runtime's GPU may write the texels of one it loads and
-/// stores unchanged, or whose store it does not care for, which Vulkan leaves undefined; a colour
-/// or stencil attachment over read-only memory the runtime copies that the pass keeps by
-/// `CustomSampleDepthStore`, which nothing measured; or a resolve texture over either that its
-/// known store action resolves into, which nothing measured either for read-only memory Metal
-/// keeps the GPU's writes from, but a colour attachment's `MultisampleResolve` into memory the
-/// runtime copies. `None` for none. Another attachment over memory the runtime copies, and such a
-/// resolve, are answered by the store action, which may fault the command buffer as Metal's GPU
-/// does ([`faults_over`], [`faults_into`], [`VulkanRenderEncoder::read_only_stores`]). A resolve
+/// stores unchanged, or whose store it does not care for, which Vulkan leaves undefined; a
+/// resolve texture over such memory that its known store action resolves into; and a depth
+/// attachment's `StoreAndMultisampleResolve` into a resolve texture over read-only memory the
+/// runtime copies, which the runtime faults where Metal's GPU completes it ([`faults_into`]).
+/// `None` for none. Another attachment over memory the runtime copies, and another resolve into
+/// such a texture, are answered by the store action, which may fault the command buffer as
+/// Metal's GPU does ([`faults_over`], [`faults_into`], [`VulkanRenderEncoder::read_only_stores`]).
+/// A colour or stencil attachment that the descriptor keeps by `CustomSampleDepthStore`, over any
+/// memory, goes to the runtime, which refuses it, so the pass dies at its making, as plain Metal
+/// ends the process in its descriptor's validation ("storeAction is not a valid MTLStoreAction",
+/// `abort()`), with bit 24 or without, on the M3 Max under macOS 27.0.1 and the Radeon Pro 5300M
+/// and UHD Graphics 630 under macOS 26.7.1 (m3-max-29292, m3-max-29293, m3-max-29294). A resolve
 /// texture of an attachment whose store action is `Unknown` is written only where a late store
 /// action resolves into it ([`VulkanRenderEncoder::late_store`]), and a visibility result buffer
 /// only where a mode is set ([`Reach::visibility`]).
@@ -1104,20 +1108,26 @@ fn kept_attachment(d: &rt::RenderPassDescriptor, sources: &Sources) -> Option<&'
                  whose attachment lies over",
             );
         }
-        if store == rt::StoreAction::CustomSampleDepthStore
-            && texture.writes_kept()
-            && !faults_over(attachment, store)
-        {
-            return Some("a pass that keeps by CustomSampleDepthStore an attachment over");
-        }
         if store.resolves()
             && resolve.writes_kept()
             && !(over_read_only_copy(resolve) && faults_into(attachment, store))
         {
-            return Some("a pass that resolves into a texture over");
+            return Some(resolve_dies(attachment, store));
         }
     }
     None
+}
+
+/// What a death names of a resolve by `attachment`'s `store` into a texture over read-only memory
+/// that [`faults_into`] does not answer: a depth attachment's `StoreAndMultisampleResolve`, which
+/// the runtime faults where Metal's GPU completes it, or a resolve into a surface's twin.
+fn resolve_dies(attachment: Attachment, store: rt::StoreAction) -> &'static str {
+    if attachment == Attachment::Depth && store == rt::StoreAction::StoreAndMultisampleResolve {
+        "a pass whose depth attachment's StoreAndMultisampleResolve, which the runtime faults \
+         where Metal's GPU completes it, resolves into a texture over"
+    } else {
+        "a pass that resolves into a texture over"
+    }
 }
 
 /// Whether a pass's store action `store` keeps an attachment's texels in its memory: `Store`, and
@@ -1135,23 +1145,40 @@ fn stores_out(store: rt::StoreAction) -> bool {
 /// and a depth attachment's `CustomSampleDepthStore` (measured on the M3 Max, macOS 27.0.1, plain
 /// Metal, m3-max-28796 and m3-max-28797: a depth attachment in a heap of bit 24, by the
 /// descriptor's action or one the encoder set; the runtime's `store_out.rs`). A colour or stencil
-/// attachment's `CustomSampleDepthStore` there, which nothing measured, dies before it is asked
-/// ([`kept_attachment`], [`VulkanRenderEncoder::late_store`]).
+/// attachment's `CustomSampleDepthStore` keeps nothing: the descriptor's dies at the runtime's
+/// refusal, as plain Metal aborts there ([`kept_attachment`]), and a late one stores nothing, as
+/// the runtime and Metal's GPU take it as `DontCare` (m3-max-29292: the M3 Max completes it over a
+/// bit-24 buffer or heap, writing nothing; [`VulkanRenderEncoder::late_store`]).
 fn faults_over(attachment: Attachment, store: rt::StoreAction) -> bool {
     stores_out(store)
         || (attachment == Attachment::Depth && store == rt::StoreAction::CustomSampleDepthStore)
 }
 
 /// Whether `attachment`'s store action `store` resolves its texels into its resolve texture where
-/// Metal's GPU faults the command buffer if that texture's memory is read-only: a colour
-/// attachment's `MultisampleResolve` (measured on the M3 Max, macOS 27.0.1, plain Metal,
-/// m3-max-28796 and m3-max-28797: a multisample attachment resolving into a texture over a buffer
-/// of bit 24, by the descriptor's action or one the encoder set; the runtime's `store_out.rs`).
-/// Another resolve into such a texture, which nothing measured (`StoreAndMultisampleResolve`, a
-/// depth or stencil attachment's, one into a resolve texture a late setter named), dies
-/// ([`kept_attachment`], [`VulkanRenderEncoder::late_store`]).
+/// Metal's GPU faults the command buffer if that texture's memory is read-only: a colour or
+/// stencil attachment's `MultisampleResolve` and `StoreAndMultisampleResolve`, and a depth
+/// attachment's `MultisampleResolve`, by the descriptor's action or a late one, into the
+/// descriptor's resolve texture or one a late resolve setter named (the setter's SPI, measured on
+/// the M3 Max for colour and depth). Measured on the M3 Max, macOS 27.0.1, plain Metal, a 4x
+/// multisample attachment resolving into a texture over a buffer of bit 24 (colour) or in a heap
+/// of bit 24 (depth and stencil), and the same over pages the process maps read-only without the
+/// bit: each fails the command buffer with `MTLCommandBufferErrorPageFault`, its signal firing and
+/// the pages unchanged, every run (m3-max-28796, m3-max-28797, m3-max-29292, m3-max-29309; the
+/// runtime's `store_out.rs`), as the runtime faults it itself. A depth attachment's
+/// `StoreAndMultisampleResolve` there does not fault: the M3 Max completes it (4 runs of 6, the
+/// other 2 failing with code 1, `kIOGPUCommandBufferCallbackErrorInnocentVictim`), the resolve
+/// texture unchanged, and the Radeon Pro 5300M and UHD Graphics 630 (macOS 26.7.1) complete it,
+/// writing it, 4 runs of 4 each (m3-max-29292 to m3-max-29294, m3-max-29309 to m3-max-29311); the
+/// runtime faults it, so it dies ([`kept_attachment`], [`VulkanRenderEncoder::late_store`]). On
+/// those two x86 GPUs bit 24 changes nothing: every resolve writes the texture and completes.
 fn faults_into(attachment: Attachment, store: rt::StoreAction) -> bool {
-    matches!(attachment, Attachment::Color(_)) && store == rt::StoreAction::MultisampleResolve
+    use rt::StoreAction::{MultisampleResolve, StoreAndMultisampleResolve};
+    match attachment {
+        Attachment::Depth => store == MultisampleResolve,
+        Attachment::Color(_) | Attachment::Stencil => {
+            matches!(store, MultisampleResolve | StoreAndMultisampleResolve)
+        }
+    }
 }
 
 /// Whether `texture`, an attachment's, lies in read-only memory the runtime copies, dropping the
@@ -1273,10 +1300,11 @@ pub type VulkanRenderEncoder = Obj<RenderEncoderObject>;
 /// (`rotated-load-tiles`, [`crate::gpu::desc`]), so such a pass dies at `endEncoding`, naming
 /// the kind; a pass that draws nothing is Metal's. One whose attachment lies over read-only
 /// memory the runtime twins, or whose resolve texture it resolves into lies over read-only
-/// memory, dies first ([`kept_attachment`]), but a colour attachment's `MultisampleResolve` into
-/// memory the runtime copies; that one, and one that stores an attachment over read-only memory
-/// the runtime copies (a depth attachment's `CustomSampleDepthStore` among them), fail the
-/// command buffer as Metal's GPU faults it ([`VulkanRenderEncoder::read_only_stores`]).
+/// memory, dies first ([`kept_attachment`]), but a resolve into memory the runtime copies that
+/// Metal's GPU faults ([`faults_into`]); that one, and one that stores an attachment over
+/// read-only memory the runtime copies (a depth attachment's `CustomSampleDepthStore` among
+/// them), fail the command buffer as Metal's GPU faults it
+/// ([`VulkanRenderEncoder::read_only_stores`]).
 /// One whose attachment, resolve texture or visibility result buffer lies on a surface whose GPU
 /// writes never reach its memory dies ([`crate::os::dropped_write`]): Metal faults the command
 /// buffer of such a pass that stores what it cleared or drew, and completes one that stores
@@ -3793,9 +3821,10 @@ impl VulkanRenderEncoder {
     /// ([`crate::gpu::command::CommandBufferObject::faults_at_read_only_store`]). One whose store
     /// action is `Unknown` waits for its late store action ([`Self::late_store`]). One that does
     /// not store into such memory (`DontCare`, and `MultisampleResolve` out of it) is sent, as
-    /// Metal completes it, its writes dropped by the copy. A resolve into such memory that this
-    /// platform made the pass without, as plain Metal leaves a texture of that format untouched
-    /// ([`Dropped`]), dies, as what Metal does with it over read-only memory is not measured.
+    /// Metal completes it, its writes dropped by the copy. A colour resolve this platform made the
+    /// pass without, as plain Metal leaves a texture of that format untouched ([`Dropped`]), is
+    /// never into such memory: the drop takes only a resolve texture of its own memory, a
+    /// shareable one or one over a surface ([`unmeasured_shape`]).
     fn read_only_stores(&self, sources: &Sources) {
         let colors = (0u32..).zip(&sources.color);
         let attachments = (colors.map(|(i, [t, r])| (Attachment::Color(i), t, r)))
@@ -3809,16 +3838,6 @@ impl VulkanRenderEncoder {
         for (attachment, texture, resolve) in attachments {
             let (over, into) =
                 plain(|| (over_read_only_copy(texture), over_read_only_copy(resolve)));
-            if into
-                && matches!(attachment, Attachment::Color(i)
-                    if self.dropped_resolve(i).is_some_and(|d| d.store.resolves()))
-            {
-                crate::gpu::writes::kept_write(
-                    "renderCommandEncoderWithDescriptor:",
-                    "a pass, made without a resolve plain Metal leaves untouched, that resolves \
-                     into a texture over",
-                );
-            }
             if !over && !into {
                 continue;
             }
@@ -3841,8 +3860,7 @@ impl VulkanRenderEncoder {
     }
 
     /// Marks each undecided attachment ([`Self::late_store`]) with why a resolve into its resolve
-    /// texture, as `sources` holds the pass descriptor's, is never sent ([`Unsent`]): a colour
-    /// attachment's over read-only memory the runtime copies is [`Unsent::Copied`].
+    /// texture, as `sources` holds the pass descriptor's, is never sent as it stands ([`Unsent`]).
     fn undecided_dropped(&self, sources: &Sources) {
         plain(|| {
             for (a, unsent) in self.undecided.lock().iter_mut() {
@@ -3854,12 +3872,7 @@ impl VulkanRenderEncoder {
                     Attachment::Depth => Some(&sources.depth[1]),
                     Attachment::Stencil => Some(&sources.stencil[1]),
                 };
-                *unsent = match resolve {
-                    Some(r) if matches!(a, Attachment::Color(_)) && over_read_only_copy(r) => {
-                        Some(Unsent::Copied)
-                    }
-                    _ => resolve.and_then(Source::texture).and_then(Unsent::of),
-                };
+                *unsent = resolve.and_then(Source::texture).and_then(Unsent::of);
             }
         });
     }
@@ -3924,13 +3937,13 @@ impl VulkanRenderEncoder {
     /// (`resolves_into_other_formats_are_metals_or_die_named`). A colour index past the eighth is
     /// the runtime's to refuse. One that resolves an undecided attachment into a resolve texture
     /// whose GPU writes never reach its memory dies ([`crate::os::dropped_write`]), and so does one
-    /// that resolves it into a resolve texture over read-only memory ([`Unsent`]), but a colour
-    /// attachment's `MultisampleResolve` into the descriptor's resolve texture over memory the
-    /// runtime copies ([`Unsent::Copied`], [`faults_into`]). That one, and one that keeps an
-    /// undecided attachment over read-only memory the runtime copies ([`faults_over`]), fail the
-    /// command buffer as Metal's GPU faults it ([`Self::read_only_stores`]); one that keeps a
-    /// colour or stencil attachment there by `CustomSampleDepthStore`, which nothing measured,
-    /// dies.
+    /// that resolves it into a resolve texture over read-only memory ([`Unsent`]), but a resolve
+    /// Metal's GPU faults into a resolve texture over memory the runtime copies
+    /// ([`Unsent::Copied`], [`faults_into`]). That one, and one that keeps an undecided attachment
+    /// over read-only memory the runtime copies ([`faults_over`]), fail the command buffer as
+    /// Metal's GPU faults it ([`Self::read_only_stores`]). A colour or stencil attachment's
+    /// `CustomSampleDepthStore` there is sent: the runtime stores it as `DontCare`, and Metal's
+    /// GPU completes it, writing nothing ([`faults_over`]).
     fn late_store(
         &self,
         sel: &'static str,
@@ -3954,8 +3967,16 @@ impl VulkanRenderEncoder {
                 if let Some(unsent) = named
                     && action.resolves()
                 {
-                    if unsent != Unsent::Copied || !faults_into(attachment, action) {
+                    if unsent == Unsent::Kept || unsent == Unsent::Dropped {
                         unsent.dies(sel, "a store action that resolves into a texture");
+                    }
+                    if !faults_into(attachment, action) {
+                        crate::gpu::writes::kept_write(
+                            sel,
+                            "a late StoreAndMultisampleResolve of a depth attachment, which the \
+                             runtime faults where Metal's GPU completes it, resolving into a \
+                             texture over",
+                        );
                     }
                     faults = true;
                 }
@@ -3964,15 +3985,6 @@ impl VulkanRenderEncoder {
                     let at = undecided.iter().position(|&a| a == attachment);
                     at.map(|at| undecided.remove(at)).is_some()
                 });
-                if read_only
-                    && action == rt::StoreAction::CustomSampleDepthStore
-                    && !faults_over(attachment, action)
-                {
-                    crate::gpu::writes::kept_write(
-                        sel,
-                        "a store action CustomSampleDepthStore that keeps an attachment over",
-                    );
-                }
                 if faults || (read_only && faults_over(attachment, action)) {
                     self.encoder.faults_at_read_only_store();
                 }
@@ -3994,10 +4006,18 @@ impl VulkanRenderEncoder {
     }
 
     /// A late resolve target of `texture` at `at`, its slice, depth plane and level, for
-    /// `attachment`, which `sel` sets. Where the attachment's store action is undecided, whether
-    /// the texture's GPU writes never reach its memory is kept for the late store action that
-    /// decides whether it resolves ([`Self::late_store`]); elsewhere the action resolves, so one
-    /// whose GPU writes never reach its memory dies ([`crate::os::dropped_write`]).
+    /// `attachment`, which `sel` sets. Where the attachment's store action is undecided, why a
+    /// resolve into the texture is never sent as it stands is kept for the late store action that
+    /// decides whether it resolves ([`Self::late_store`]); elsewhere one whose GPU writes never
+    /// reach its memory dies ([`crate::os::dropped_write`]), and so does one over read-only
+    /// memory ([`Unsent`]), but one over memory the runtime copies: where the known action
+    /// resolves into it as Metal's GPU faults ([`faults_into`]), that fails the command buffer as
+    /// Metal's GPU faults it (measured on the M3 Max, macOS 27.0.1, with the setter's SPI, a
+    /// colour attachment's and a depth attachment's `MultisampleResolve`, the descriptor naming a
+    /// resolve texture of Metal's own memory: m3-max-29292); a depth attachment's
+    /// `StoreAndMultisampleResolve` into it, which the runtime faults where Metal's GPU completes
+    /// it, dies. A known action that does not resolve never reaches here
+    /// ([`Self::resolve_unused`]).
     fn late_resolve(
         &self,
         sel: &'static str,
@@ -4014,7 +4034,20 @@ impl VulkanRenderEncoder {
         if kept.is_none()
             && let Some(unsent) = unsent
         {
-            unsent.dies(sel, "a resolve into a texture");
+            match self.stored(attachment) {
+                Some((action, _))
+                    if unsent == Unsent::Copied && faults_into(attachment, action) =>
+                {
+                    self.encoder.faults_at_read_only_store();
+                }
+                Some(_) if unsent == Unsent::Copied => crate::gpu::writes::kept_write(
+                    sel,
+                    "a late resolve texture of a depth attachment whose \
+                     StoreAndMultisampleResolve, which the runtime faults where Metal's GPU \
+                     completes it, resolves into a texture over",
+                ),
+                _ => unsent.dies(sel, "a resolve into a texture"),
+            }
         }
         match kept {
             Some(()) => resolve_target(texture.map(|t| &t.raw), at),
@@ -5898,8 +5931,10 @@ pub(crate) mod tests {
 
     /// A pass over a colour attachment over a guest's read-only memory that does not store it
     /// completes with no error, as Metal's does, every encoder running and the pages staying
-    /// zeros: `DontCare`, given at once or late, after a clear, a load or no load; and the queue
-    /// runs on
+    /// zeros: `DontCare`, given at once or late, after a clear, a load or no load, and
+    /// `CustomSampleDepthStore` set late, which the runtime stores as `DontCare` and the M3 Max
+    /// completes, writing nothing (plain Metal, macOS 27.0.1, m3-max-29292); and the queue runs
+    /// on
     #[cfg(target_os = "linux")]
     #[test]
     fn a_pass_that_does_not_store_read_only_memory_completes() {
@@ -5909,6 +5944,7 @@ pub(crate) mod tests {
             (LOAD, DONT_CARE, None),
             (LOAD_DONT_CARE, DONT_CARE, None),
             (CLEAR, UNKNOWN, Some(DONT_CARE)),
+            (CLEAR, UNKNOWN, Some(CUSTOM_SAMPLE_DEPTH_STORE)),
         ] {
             assert_eq!(
                 read_only_pass_on(&q, load, store, late),
@@ -5929,12 +5965,15 @@ pub(crate) mod tests {
     /// `BGRA8Unorm` colour attachment of the device's memory, cleared, into a 16 × 16 texture over
     /// a guest's read-only buffer (made with bit 24, `resource::tests::read_only_buffer`), by
     /// `store`, or by `late`'s store action set in the pass where given; the pages are the
-    /// buffer's. The selector it dies at instead, where it dies.
+    /// buffer's. Where `setter`, the descriptor names a resolve texture of the device's memory
+    /// and the pass sets the read-only one late (the setter's SPI). The selector it dies at
+    /// instead, where it dies.
     #[cfg(target_os = "linux")]
     fn read_only_resolve_on(
         q: &crate::gpu::command::VulkanCommandQueue,
         store: u64,
         late: Option<u64>,
+        setter: bool,
     ) -> Result<String, &'static str> {
         use crate::core::platform::os::vm::HostVm as _;
 
@@ -5962,10 +6001,11 @@ pub(crate) mod tests {
             )
             .unwrap()
             .unwrap();
+        let own = texture(&p, &d, BGRA8, READ | TARGET, (16, 16), None);
         let pass = p.render_pass_descriptor();
         let attachment = ColorAttachmentSet {
             texture: Some(Some(&samples)),
-            resolve_texture: Some(Some(&target)),
+            resolve_texture: Some(Some(if setter { &own } else { &target })),
             load_action: Some(CLEAR),
             store_action: Some(store),
             clear_color: Some(ClearColor {
@@ -5982,8 +6022,17 @@ pub(crate) mod tests {
             store_action,
             color_attachment_index: 0,
         });
-        let line = catch_death(|| pass_line_on(q, &pass, late, (pages, 16 * 64)));
-        drop((pass, samples, target, ro));
+        let set = setter.then(|| RenderCmd::SetColorResolveTexture {
+            texture: Some(&target),
+            slice: 0,
+            depth_plane: 0,
+            level: 0,
+            y_invert: false,
+            index: 0,
+        });
+        assert!(!(setter && late.is_some()), "one late command");
+        let line = catch_death(|| pass_line_on(q, &pass, late.or(set), (pages, 16 * 64)));
+        drop((pass, samples, own, target, ro));
         assert!(
             crate::remap::VulkanVm::new()
                 .deallocate(pages, PAGE)
@@ -5993,53 +6042,72 @@ pub(crate) mod tests {
     }
 
     /// A pass that resolves a multisample attachment of the device's memory into a texture over
-    /// a guest's read-only memory by `MultisampleResolve`, the descriptor's action or a late one,
-    /// fails its command buffer as Metal's GPU faults it ([`FAULTED`]: measured on the M3 Max,
-    /// macOS 27.0.1, plain Metal, m3-max-28796 and m3-max-28797; the runtime's `store_out.rs`),
-    /// the pages staying zeros, and its queue runs on. `StoreAndMultisampleResolve` into it, which
-    /// nothing measured, dies where the pass is made, or at the late store action. Linux's: on
-    /// macOS it goes to Metal
+    /// a guest's read-only memory by `MultisampleResolve` or `StoreAndMultisampleResolve`, the
+    /// descriptor's action or a late one, fails its command buffer as Metal's GPU faults it
+    /// ([`FAULTED`]: measured on the M3 Max, macOS 27.0.1, plain Metal, m3-max-28796,
+    /// m3-max-28797, m3-max-29292 and m3-max-29309; the runtime's `store_out.rs`), the pages
+    /// staying zeros, and its queue runs on. Linux's: on macOS it goes to Metal
     #[cfg(target_os = "linux")]
     #[test]
     fn a_resolve_into_read_only_memory_faults_its_command_buffer() {
         for (store, late) in [
             (MULTISAMPLE_RESOLVE, None),
             (UNKNOWN, Some(MULTISAMPLE_RESOLVE)),
+            (STORE_AND_MULTISAMPLE_RESOLVE, None),
+            (UNKNOWN, Some(STORE_AND_MULTISAMPLE_RESOLVE)),
         ] {
             let q = dev().new_command_queue().unwrap();
-            let line = read_only_resolve_on(&q, store, late);
+            let line = read_only_resolve_on(&q, store, late, false);
             assert_eq!(line.as_deref(), Ok(FAULTED), "{store} {late:?}");
             assert_eq!(filled_on(&q), FILLED, "{store} {late:?}");
         }
-        let q = dev().new_command_queue().unwrap();
-        assert_eq!(
-            read_only_resolve_on(&q, STORE_AND_MULTISAMPLE_RESOLVE, None),
-            Err("renderCommandEncoderWithDescriptor:")
-        );
-        assert_eq!(
-            read_only_resolve_on(&q, UNKNOWN, Some(STORE_AND_MULTISAMPLE_RESOLVE)),
-            Err("setColorStoreAction:atIndex:")
-        );
     }
 
-    /// [`pass_line_on`]'s line of a command buffer of `q` whose render pass's depth attachment is
-    /// a 16 × 16 `Depth32Float` texture at the start of a heap made with bit 24 over pages of the
-    /// test's own (`resource::tests::guest_pages_of`), as the guest makes a read-only heap,
-    /// cleared to 0.5 and stored by `store`, or by `late`'s store action set in the pass where
-    /// given; the pages are the heap's.
+    /// What a depth or stencil pass of [`read_only_depth_stencil_on`] takes: the attachment, the
+    /// 16 × 16 texture's format (`Depth32Float`, 252, or `Stencil8`, 253), whether it resolves a
+    /// 4-sample attachment of the device's memory into the heap's texture, which is otherwise the
+    /// attachment, whether the heap's resolve texture is set late (the setter's SPI) over one of
+    /// the device's memory the descriptor names, and its store action, or `Unknown` and a late
+    /// one.
     #[cfg(target_os = "linux")]
-    fn read_only_depth_on(
-        q: &crate::gpu::command::VulkanCommandQueue,
+    #[derive(Clone, Copy, Debug, Default)]
+    struct ReadOnlyDepthStencil {
+        stencil: bool,
+        resolve: bool,
+        setter: bool,
         store: u64,
         late: Option<u64>,
-    ) -> String {
+    }
+
+    /// [`pass_line_on`]'s line of a command buffer of `q` whose render pass's depth or stencil
+    /// attachment (`shape`) is a 16 × 16 texture at the start of a heap made with bit 24 over
+    /// pages of the test's own (`resource::tests::guest_pages_of`), as the guest makes a
+    /// read-only heap, or resolves into it, cleared to 0.5 or 0x5a; the pages are the heap's. The
+    /// selector it dies at instead, where it dies.
+    #[cfg(target_os = "linux")]
+    fn read_only_depth_stencil_on(
+        q: &crate::gpu::command::VulkanCommandQueue,
+        shape: ReadOnlyDepthStencil,
+    ) -> Result<String, &'static str> {
         use crate::core::host::HostPtr;
         use crate::core::num::ToUsize as _;
         use crate::core::platform::resource::Heap as _;
-        use crate::core::platform::values::{DepthAttachmentSet, HeapDesc, OptionSet};
+        use crate::core::platform::values::{
+            DepthAttachmentSet, HeapDesc, OptionSet, StencilAttachmentSet,
+        };
 
         use crate::gpu::resource::tests::{BIT_24, guest_pages_of, over_pages};
 
+        /// `MTLTextureType2DMultisample`.
+        const MULTISAMPLE: u64 = 4;
+        let ReadOnlyDepthStencil {
+            stencil,
+            resolve,
+            setter,
+            store,
+            late,
+        } = shape;
+        let format = if stencil { 253 } else { 252 };
         let (p, d) = (platform(), dev());
         let size = over_pages();
         let address = guest_pages_of(size);
@@ -6067,7 +6135,7 @@ pub(crate) mod tests {
         .heap
         .unwrap();
         let desc = p.texture_descriptor(&TextureDesc {
-            pixel_format: 252,
+            pixel_format: format,
             width: 16,
             height: 16,
             usage: TARGET,
@@ -6078,46 +6146,212 @@ pub(crate) mod tests {
         // `VK_EXT_depth_range_unrestricted` (ANV) copies in clamped: the runtime announces
         // `restricted-depth-upload` as it makes it, which dies in strict mode, so it is made under
         // the default too.
-        let depth = crate::answer::relaxed(|| heap.new_texture(&desc, 0))
+        let in_heap = crate::answer::relaxed(|| heap.new_texture(&desc, 0))
             .unwrap()
             .unwrap();
+        let private = |texture_type, sample_count| {
+            d.new_texture(
+                OnFault::Die,
+                &p.texture_descriptor(&TextureDesc {
+                    texture_type,
+                    pixel_format: format,
+                    width: 16,
+                    height: 16,
+                    sample_count,
+                    usage: TARGET,
+                    resource_options: Some(0x20),
+                    ..TextureDesc::default()
+                }),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let samples = resolve.then(|| private(MULTISAMPLE, 4));
+        let own = setter.then(|| private(2, 1));
+        let (texture, resolve_texture) = match (&samples, &own) {
+            (Some(samples), Some(own)) => (samples, Some(Some(own))),
+            (Some(samples), None) => (samples, Some(Some(&in_heap))),
+            (None, _) => (&in_heap, None),
+        };
         let pass = p.render_pass_descriptor();
-        pass.set_depth_attachment(&DepthAttachmentSet {
-            texture: Some(Some(&depth)),
-            load_action: Some(CLEAR),
-            store_action: Some(store),
-            clear_depth: Some(0.5),
-            ..DepthAttachmentSet::default()
+        if stencil {
+            pass.set_stencil_attachment(&StencilAttachmentSet {
+                texture: Some(Some(texture)),
+                resolve_texture,
+                load_action: Some(CLEAR),
+                store_action: Some(store),
+                clear_stencil: Some(0x5a),
+                ..StencilAttachmentSet::default()
+            });
+        } else {
+            pass.set_depth_attachment(&DepthAttachmentSet {
+                texture: Some(Some(texture)),
+                resolve_texture,
+                load_action: Some(CLEAR),
+                store_action: Some(store),
+                clear_depth: Some(0.5),
+                ..DepthAttachmentSet::default()
+            });
+        }
+        let late = late.map(|store_action| match stencil {
+            true => RenderCmd::SetStencilStoreAction { store_action },
+            false => RenderCmd::SetDepthStoreAction { store_action },
         });
-        let late = late.map(|store_action| RenderCmd::SetDepthStoreAction { store_action });
-        let line = pass_line_on(q, &pass, late, (pages, size.to_usize()));
-        drop((pass, depth, heap));
-        line
+        let set = setter.then(|| match stencil {
+            true => RenderCmd::SetStencilResolveTexture {
+                texture: Some(&in_heap),
+                slice: 0,
+                depth_plane: 0,
+                level: 0,
+                y_invert: false,
+            },
+            false => RenderCmd::SetDepthResolveTexture {
+                texture: Some(&in_heap),
+                slice: 0,
+                depth_plane: 0,
+                level: 0,
+                y_invert: false,
+            },
+        });
+        assert!(!(setter && late.is_some()), "one late command");
+        let line = catch_death(|| pass_line_on(q, &pass, late.or(set), (pages, size.to_usize())));
+        drop((pass, samples, own, in_heap, heap));
+        line.map_err(|site| site.file)
     }
 
-    /// A pass that keeps a depth attachment in a guest's read-only heap by
-    /// `CustomSampleDepthStore`, the descriptor's action or a late one, fails its command buffer
-    /// as Metal's GPU faults it ([`FAULTED`]: measured on the M3 Max, macOS 27.0.1, plain Metal,
-    /// m3-max-28796 and m3-max-28797, a depth attachment in a heap of bit 24; the runtime's
-    /// `store_out.rs`), as does `Store`, the pages staying zeros, and its queue runs on; one that
-    /// does not store it (`DontCare`) completes. Linux's: on macOS it goes to Metal
+    /// A pass that keeps a depth attachment in a guest's read-only heap by `Store` or
+    /// `CustomSampleDepthStore`, the descriptor's action or a late one, and one that keeps a
+    /// stencil attachment there by `Store`, fail their command buffers as Metal's GPU faults them
+    /// ([`FAULTED`]: measured on the M3 Max, macOS 27.0.1, plain Metal, a heap of bit 24:
+    /// m3-max-28796, m3-max-28797 and m3-max-29292; the runtime's `store_out.rs`), the pages
+    /// staying zeros, and the queue runs on. One that does not store it completes, as on the M3
+    /// Max (m3-max-29292): `DontCare`, and a stencil attachment's `CustomSampleDepthStore` set
+    /// late, which the runtime stores as `DontCare`. Linux's: on macOS it goes to Metal
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_depth_store_into_read_only_memory_faults_its_command_buffer() {
-        for (store, late) in [
-            (CUSTOM_SAMPLE_DEPTH_STORE, None),
-            (UNKNOWN, Some(CUSTOM_SAMPLE_DEPTH_STORE)),
-            (STORE, None),
+    fn a_depth_or_stencil_store_into_read_only_memory_faults_its_command_buffer() {
+        let kept = |stencil, store, late| ReadOnlyDepthStencil {
+            stencil,
+            store,
+            late,
+            ..ReadOnlyDepthStencil::default()
+        };
+        for shape in [
+            kept(false, STORE, None),
+            kept(false, CUSTOM_SAMPLE_DEPTH_STORE, None),
+            kept(false, UNKNOWN, Some(CUSTOM_SAMPLE_DEPTH_STORE)),
+            kept(true, STORE, None),
+            kept(true, UNKNOWN, Some(STORE)),
         ] {
             let q = dev().new_command_queue().unwrap();
-            let line = read_only_depth_on(&q, store, late);
-            assert_eq!(line, FAULTED, "{store} {late:?}");
-            assert_eq!(filled_on(&q), FILLED, "{store} {late:?}");
+            let line = read_only_depth_stencil_on(&q, shape);
+            assert_eq!(line.as_deref(), Ok(FAULTED), "{shape:?}");
+            assert_eq!(filled_on(&q), FILLED, "{shape:?}");
+        }
+        let q = dev().new_command_queue().unwrap();
+        for shape in [
+            kept(false, DONT_CARE, None),
+            kept(true, DONT_CARE, None),
+            kept(true, UNKNOWN, Some(CUSTOM_SAMPLE_DEPTH_STORE)),
+        ] {
+            assert_eq!(
+                read_only_depth_stencil_on(&q, shape).as_deref(),
+                Ok("status 4 error None before 0x5a after 0x6b signal true zeros true"),
+                "{shape:?}"
+            );
+        }
+        assert_eq!(filled_on(&q), FILLED);
+    }
+
+    /// A pass that resolves a 4-sample depth attachment of the device's memory into a texture in
+    /// a guest's read-only heap by `MultisampleResolve`, and a stencil one by `MultisampleResolve`
+    /// or `StoreAndMultisampleResolve`, the descriptor's action or a late one, the descriptor's
+    /// resolve texture or one the setter's SPI set late, fails its command buffer as Metal's GPU
+    /// faults it ([`FAULTED`]: measured on the M3 Max, macOS 27.0.1, plain Metal, a heap of bit
+    /// 24, every run: m3-max-29292 and m3-max-29309; the runtime's `store_out.rs`), the pages
+    /// staying zeros, and its queue runs on. A depth attachment's `StoreAndMultisampleResolve`
+    /// there, which the runtime faults where Metal's GPU completes it (the M3 Max, and the Radeon
+    /// Pro 5300M and UHD Graphics 630 under macOS 26.7.1), dies where the pass is made, or at the
+    /// late store action or resolve texture. Linux's: on macOS it goes to Metal
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_depth_or_stencil_resolve_into_read_only_memory_faults_its_command_buffer() {
+        let resolve = |stencil, store, late| ReadOnlyDepthStencil {
+            stencil,
+            resolve: true,
+            store,
+            late,
+            ..ReadOnlyDepthStencil::default()
+        };
+        let set = |stencil, store| ReadOnlyDepthStencil {
+            setter: true,
+            ..resolve(stencil, store, None)
+        };
+        for shape in [
+            resolve(false, MULTISAMPLE_RESOLVE, None),
+            resolve(false, UNKNOWN, Some(MULTISAMPLE_RESOLVE)),
+            set(false, MULTISAMPLE_RESOLVE),
+            resolve(true, MULTISAMPLE_RESOLVE, None),
+            resolve(true, UNKNOWN, Some(MULTISAMPLE_RESOLVE)),
+            resolve(true, STORE_AND_MULTISAMPLE_RESOLVE, None),
+            resolve(true, UNKNOWN, Some(STORE_AND_MULTISAMPLE_RESOLVE)),
+            set(true, STORE_AND_MULTISAMPLE_RESOLVE),
+        ] {
+            let q = dev().new_command_queue().unwrap();
+            let line = read_only_depth_stencil_on(&q, shape);
+            assert_eq!(line.as_deref(), Ok(FAULTED), "{shape:?}");
+            assert_eq!(filled_on(&q), FILLED, "{shape:?}");
+        }
+        let q = dev().new_command_queue().unwrap();
+        for (shape, site) in [
+            (
+                resolve(false, STORE_AND_MULTISAMPLE_RESOLVE, None),
+                "renderCommandEncoderWithDescriptor:",
+            ),
+            (
+                resolve(false, UNKNOWN, Some(STORE_AND_MULTISAMPLE_RESOLVE)),
+                "setDepthStoreAction:",
+            ),
+            (
+                set(false, STORE_AND_MULTISAMPLE_RESOLVE),
+                "setDepthResolveTexture:slice:depthPlane:level:yInvert:",
+            ),
+        ] {
+            assert_eq!(
+                read_only_depth_stencil_on(&q, shape),
+                Err(site),
+                "{shape:?}"
+            );
+        }
+    }
+
+    /// A colour attachment's resolve texture over a guest's read-only memory set late by the
+    /// setter's SPI, over one of the device's memory the descriptor names, fails the command
+    /// buffer where the known store action resolves (`MultisampleResolve`,
+    /// `StoreAndMultisampleResolve`), as Metal's GPU faults it ([`FAULTED`]: measured on the M3
+    /// Max, macOS 27.0.1, plain Metal, m3-max-29292), and where it does not (`Store`), the setter
+    /// encodes nothing, as Metal resolves nothing there, and the command buffer completes, the
+    /// pages staying zeros. A colour attachment
+    /// the descriptor keeps by `CustomSampleDepthStore` dies where the pass is made, at the
+    /// runtime's refusal, as plain Metal aborts there over any memory (m3-max-29292 to
+    /// m3-max-29294). Linux's: on macOS it goes to Metal
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_late_resolve_texture_in_read_only_memory_faults_where_it_resolves() {
+        for store in [MULTISAMPLE_RESOLVE, STORE_AND_MULTISAMPLE_RESOLVE] {
+            let q = dev().new_command_queue().unwrap();
+            let line = read_only_resolve_on(&q, store, None, true);
+            assert_eq!(line.as_deref(), Ok(FAULTED), "{store}");
+            assert_eq!(filled_on(&q), FILLED, "{store}");
         }
         let q = dev().new_command_queue().unwrap();
         assert_eq!(
-            read_only_depth_on(&q, DONT_CARE, None),
-            "status 4 error None before 0x5a after 0x6b signal true zeros true"
+            read_only_resolve_on(&q, STORE, None, true).as_deref(),
+            Ok("status 4 error None before 0x5a after 0x6b signal true zeros true")
+        );
+        assert_eq!(
+            read_only_resolve_on(&q, CUSTOM_SAMPLE_DEPTH_STORE, None, false),
+            Err("renderCommandEncoderWithDescriptor:")
         );
     }
 
