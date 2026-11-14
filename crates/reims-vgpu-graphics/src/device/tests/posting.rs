@@ -7,10 +7,13 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use zerocopy::IntoBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
-use super::{QUEUE_COMPLETE, QUEUE_RING_DATA, Rig, eventually, object_message, send_queue_create};
-use crate::device::{CompletionPoster, Host, RingDegradation, Then};
+use super::{
+    QUEUE_COMPLETE, QUEUE_RING_DATA, Rig, eventually, object_message, present, send_queue_create,
+    vblank,
+};
+use crate::device::{CompletionPoster, Host, PresentAnswer, RingDegradation, Then};
 use crate::wire::*;
 
 /// The queue the tests make, in context 5.
@@ -360,4 +363,100 @@ fn a_queue_s_destroy_drops_its_handed_records_and_runs_what_follows_them() {
     let ran = ran.lock().clone();
     assert_eq!(ran.iter().map(|r| r.0).collect::<Vec<_>>(), [1, 2, 3]);
     assert_eq!(produced(&rig), HOLDS * 48, "posted after the destroy");
+}
+
+/// A host that keeps each present's answer for the test to give, and records what the device
+/// told it of its completion rings.
+#[derive(Clone, Default)]
+struct AnsweringHost {
+    answers: Arc<Mutex<Vec<PresentAnswer>>>,
+    degraded: Arc<Mutex<Vec<RingDegradation>>>,
+}
+
+impl Host for AnsweringHost {
+    fn raise_interrupt(&self, _vector: u32) {}
+    fn present_surface(&self, _iosurface_id: u32, _generation: Option<u64>, answer: PresentAnswer) {
+        self.answers.lock().push(answer);
+    }
+    fn ring_degraded(&self, kind: RingDegradation) {
+        self.degraded.lock().push(kind);
+    }
+}
+
+/// An answer given off the control thread onto a full control ring returns at once: handed to the
+/// control thread, it goes behind the answer the control thread waits to post and ahead of that
+/// thread's next, and tells nothing itself. A `VBLANK` that finds it handed over is dropped though
+/// the guest made room meanwhile, ringing nothing, and a tried post goes nowhere; once the guest
+/// rings, every answer comes in that order
+#[test]
+fn an_answer_given_onto_a_full_control_ring_waits_for_nothing_and_keeps_its_place() {
+    use RingDegradation::{ControlRingFull, VblankDropped};
+    let host = AnsweringHost::default();
+    let mut rig = Rig::with_host(Box::new(host.clone()));
+    rig.start();
+    let shown = rig.send(present(0));
+    assert!(eventually(|| host.answers.lock().len() == 1), "no present");
+    rig.device
+        .shared
+        .room_poll_ns
+        .store(60_000_000_000, Ordering::Relaxed);
+    // 24-byte answers: the 32 KiB ring holds 1365 of them, and the control thread waits for room
+    // for the next.
+    let count = 1400;
+    for _ in 0..count {
+        rig.send(vblank(1));
+    }
+    assert!(
+        eventually(|| *host.degraded.lock() == [ControlRingFull]),
+        "the ring never filled"
+    );
+    let answer = host.answers.lock().pop().unwrap();
+    assert!(
+        returns_at_once(move || answer.answer(RGFX_STATUS_OK)),
+        "an answer waited for room"
+    );
+
+    // The guest takes the ring, ringing nothing: the control thread looks again only after its
+    // long poll.
+    let mut seqnos = Vec::new();
+    while let Some(bytes) = rig.event_now() {
+        seqnos.push(complete_seqno(&bytes));
+    }
+    assert!(
+        !seqnos.contains(&shown),
+        "the answer went ahead of the post waiting"
+    );
+    rig.refresh();
+    assert_eq!(*host.degraded.lock(), [ControlRingFull, VblankDropped]);
+    assert!(
+        !(rig.device.shared)
+            .control_poster(rig.device.shared.epoch.load(Ordering::Acquire))
+            .try_post(&crate::control::complete(1, 0)),
+        "a tried post went ahead of the answer handed over"
+    );
+    assert!(
+        rig.event_now().is_none(),
+        "posted ahead of the answer handed over"
+    );
+
+    // The guest rings: the answer the control thread waited to post, then the one handed over,
+    // then the rest of its answers.
+    rig.device
+        .mmio_write(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
+    while seqnos.len() < count as usize + 1 {
+        seqnos.push(complete_seqno(&rig.event().expect("an answer")));
+    }
+    let at = seqnos.iter().position(|&s| s == shown).unwrap();
+    let waited = seqnos[at - 1];
+    let mut expected: Vec<u64> = (shown + 1..=waited).collect();
+    expected.push(shown);
+    expected.extend(waited + 1..=shown + count);
+    assert_eq!(seqnos, expected);
+}
+
+/// The seqno of the `COMPLETE` in `bytes`.
+fn complete_seqno(bytes: &[u8]) -> u64 {
+    let (header, _) = RgfxMsgHeader::read_from_prefix(bytes).unwrap();
+    assert_eq!(header.r#type, RGFX_EVT_COMPLETE);
+    header.seqno
 }

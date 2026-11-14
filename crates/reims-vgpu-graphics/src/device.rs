@@ -75,7 +75,10 @@
 //! record a thread that may not raise hands over ([`CompletionPoster::post_elsewhere`]), and one a
 //! thread that may not wait finds no room for, or finds records handed over before
 //! ([`CompletionPoster::post_unwaiting`]), is posted, and raised for, by its queue's service thread,
-//! or by the next thread of the device's that posts onto that ring, which posts it first.
+//! or by the next thread of the device's that posts onto that ring, which posts it first. A
+//! command's answer the host gives off the control thread ([`CompleteAnswer::answer`]) waits for no
+//! room either: one the control completion ring has no room for, or that finds answers handed over
+//! before it, is posted by the control thread, ahead of its own posts.
 //!
 //! **An answer on the doorbell's thread.** A `DOORBELL` write of a command queue's ring through
 //! [`Device::mmio_write_taking`] offers the queue's next `COMMAND_BUFFER` to the host on the
@@ -754,7 +757,9 @@ pub trait Host: Send + Sync + 'static {
 pub enum RingDegradation {
     /// A post found the ring with no room where the post before it on the ring found room: a
     /// spell begins in which the control thread takes no ring-0 command until its answer is
-    /// posted, the other posters wait, and a `VBLANK` is dropped.
+    /// posted (or queued behind the answers another thread is posting), the other posts that
+    /// wait for room wait, the answers given elsewhere wait for the control thread to post them
+    /// ([`CompleteAnswer::answer`]), and a `VBLANK` is dropped.
     ControlRingFull,
     /// A post that waits for room found none at its first look, and went on once the guest took
     /// more, the device was reset or it ended.
@@ -845,6 +850,13 @@ pub(crate) struct Shared {
     /// the ring held, so a full spell is told once, at its first post that found no room
     /// ([`RingDegradation::ControlRingFull`]).
     control_full: AtomicBool,
+    /// The answers a thread that may not wait for room on the control completion ring handed
+    /// over ([`CompleteAnswer::answer`]), for the control thread, or the next thread that posts
+    /// onto the ring waiting for room, to post in their order.
+    control_handed: Mutex<Handed>,
+    /// Whether `control_handed` holds an answer or a thread is posting them: every post onto the
+    /// control completion ring then goes behind them.
+    control_handing: AtomicBool,
     /// The control submission ring's count through the last message the control thread has
     /// carried out, handed to the host or handed to a lane: a command buffer waits for it to pass
     /// the last message published before it that is its context's or every buffer's
@@ -1180,6 +1192,8 @@ impl Device {
             room: Room::default(),
             room_poll_ns: AtomicU64::new(u64::try_from(ROOM_POLL.as_nanos()).unwrap_or(u64::MAX)),
             control_full: AtomicBool::new(false),
+            control_handed: Mutex::new(Handed::default()),
+            control_handing: AtomicBool::new(false),
             control_done: AtomicU64::new(0),
             gate: Gate::default(),
             lanes: Arc::new(lanes),
@@ -1425,10 +1439,16 @@ impl<'a> QueueClaim<'a> {
 }
 
 impl CompleteAnswer {
-    /// Posts the `COMPLETE` with `status` onto the control completion ring, waiting for room.
+    /// Posts the `COMPLETE` with `status` onto the control completion ring, waiting for nothing,
+    /// on whichever thread gives it: the platform's that run a command buffer's handlers, where a
+    /// drain's or a display hold's answer is given as the buffer completes, hold up every queue's
+    /// work behind them while they wait. Where the ring has room and no answer is handed over
+    /// before it, it is posted here, and the control vector raised here; otherwise it is handed to
+    /// the control thread, which posts the answers in their order before its own posts, waiting
+    /// for room, and every post onto the ring that waits goes behind them.
     pub fn answer(self, status: u32) {
         if let Some(shared) = self.shared.upgrade() {
-            shared.post_waiting(&crate::control::complete(self.seqno, status), self.epoch);
+            shared.post_unwaiting(&crate::control::complete(self.seqno, status), self.epoch);
         }
     }
 }
@@ -1527,15 +1547,15 @@ impl CompletionPoster {
     /// record [`Self::post_elsewhere`] hands over. The only locks it takes are the ring's, held
     /// elsewhere only across a write into it, and the records', held only across a hand-over or
     /// a take of one. Where the device has ended, the queue is gone, or a reset came since the
-    /// work began, `message` is dropped and `then` run here. A poster of the control ring, onto
-    /// which no handler posts, posts at once, waiting for room.
+    /// work began, `message` is dropped and `then` run here. A poster of the control ring posts
+    /// as [`CompleteAnswer::answer`] posts, then runs `then` here.
     pub fn post_unwaiting(&self, message: &[u8], then: Option<Then>) {
         let Some(shared) = self.shared.upgrade() else {
             return run(then);
         };
         match &self.queue {
             None => {
-                shared.post_waiting(message, self.epoch);
+                shared.post_unwaiting(message, self.epoch);
                 run(then);
             }
             Some((queue, _)) => match queue.upgrade() {
@@ -1764,6 +1784,10 @@ impl Shared {
     /// The control thread (the module doc).
     fn control_thread(&self) {
         while !self.ending() {
+            // The answers handed over to it, posted first, as a post onto the ring would.
+            if self.control_handing.load(Ordering::Acquire) {
+                self.post_behind_control_handed(None);
+            }
             self.tell_reset();
             self.take_messages();
             // Asleep with `consumer_idle` set only while the device takes the ring.
@@ -1984,9 +2008,20 @@ impl Shared {
         self.post_waiting(&submit_room(), epoch);
     }
 
-    /// Posts `message`, waiting for room ([`Room`]) while the device is not reset or ended. A
-    /// post that waited is told to the host ([`RingDegradation::ControlPostWaited`]).
+    /// Posts `message`, waiting for room ([`Room`]) while the device is not reset or ended,
+    /// behind the answers handed over before it ([`Self::post_unwaiting`]). A post that waited is
+    /// told to the host ([`RingDegradation::ControlPostWaited`]).
     fn post_waiting(&self, message: &[u8], epoch: u64) {
+        if self.control_handing.load(Ordering::Acquire)
+            && self.post_behind_control_handed(Some((message, epoch)))
+        {
+            return;
+        }
+        self.post_waiting_now(message, epoch);
+    }
+
+    /// [`Self::post_waiting`] of `message` with no answer handed over before it.
+    fn post_waiting_now(&self, message: &[u8], epoch: u64) {
         let mut waited_since = None;
         loop {
             let seen = self.room.wakes();
@@ -2030,14 +2065,26 @@ impl Shared {
     }
 
     /// Posts `message` into the completion ring, for work begun at reset count `epoch`, and
-    /// raises the ring's interrupt where the guest armed it, with no lock held.
+    /// raises the ring's interrupt where the guest armed it, with no lock held. A full spell of
+    /// the ring is told at its first post that finds no room
+    /// ([`RingDegradation::ControlRingFull`]).
     fn post(&self, message: &[u8], epoch: u64) -> Post {
         self.post_on(message, epoch, true)
     }
 
     /// [`Self::post`], which waits for the ring held elsewhere where `wait`, and else is
-    /// [`Post::Busy`].
+    /// [`Post::Busy`], as it is where an answer is handed over before it.
     fn post_on(&self, message: &[u8], epoch: u64, wait: bool) -> Post {
+        if !wait && self.control_handing.load(Ordering::Acquire) {
+            return Post::Busy;
+        }
+        self.post_telling(message, epoch, wait, true)
+    }
+
+    /// [`Self::post_on`], which tells a full spell that begins at this post only where `tells`:
+    /// an answer that waits for nothing leaves it to the control thread's post of it, so the
+    /// spell's line is never written on the platform's threads.
+    fn post_telling(&self, message: &[u8], epoch: u64, wait: bool, tells: bool) -> Post {
         let raise = {
             let Some(mut completion) = lock_ring(&self.completion, wait) else {
                 return Post::Busy;
@@ -2051,7 +2098,7 @@ impl Shared {
                     raise
                 }
                 Posted::NoRoom => {
-                    let began = !self.control_full.swap(true, Ordering::Relaxed);
+                    let began = tells && !self.control_full.swap(true, Ordering::Relaxed);
                     drop(completion);
                     if began {
                         self.control_ring_filled(message);
@@ -2311,7 +2358,8 @@ impl Shared {
     /// the device is started, not reset since the host was last told, and the ring not broken;
     /// the control thread sleeps with every answer of what it took posted (`asleep`), so the
     /// download is the next message after all it carried out, and no answer of its comes after
-    /// this one; the block's lane has nothing left; the control completion ring has room; and
+    /// this one; no answer given elsewhere waits to be posted ([`CompleteAnswer::answer`]); the
+    /// block's lane has nothing left; the control completion ring has room; and
     /// each lock is tried, the control submission ring's, the completion ring's and the lanes'.
     /// Otherwise the message stays, and the control thread, which the write wakes, takes it as
     /// it takes any. No buffer waits for a download's count (`backlog`: a download is no
@@ -2326,6 +2374,8 @@ impl Shared {
                 || submit.broken
                 || self.ending()
                 || self.reset_owed.load(Ordering::Acquire)
+                // Its answer goes behind the answers handed over, which the control thread posts.
+                || self.control_handing.load(Ordering::Acquire)
             {
                 return;
             }
@@ -3252,8 +3302,14 @@ impl Shared {
                 count,
                 host_time_ns: now,
             };
-            // One the ring has no room for is dropped; the next carries the count.
-            if self.post(&sized(&event), epoch) == Post::NoRoom {
+            // One the ring has no room for is dropped, as is one that finds answers handed over
+            // before it, which wait for room; the next carries the count.
+            let posted = if self.control_handing.load(Ordering::Acquire) {
+                Post::NoRoom
+            } else {
+                self.post(&sized(&event), epoch)
+            };
+            if posted == Post::NoRoom {
                 log::warn!(
                     target: "reims_vgpu_graphics",
                     "the VBLANK of refresh {count} found the control completion ring full and \
@@ -3268,7 +3324,10 @@ impl Shared {
                 display: 0,
                 reserved_14: 0,
             };
-            if self.post(&sized(&event), epoch) == Post::Done {
+            // Told again at the next refresh where answers handed over wait before it.
+            if !self.control_handing.load(Ordering::Acquire)
+                && self.post(&sized(&event), epoch) == Post::Done
+            {
                 self.display.lock().changed = false;
             }
         }
@@ -3380,6 +3439,73 @@ fn carry_out_job(lanes: &Lanes, shared: &Shared, key: Key, job: lanes::Job) {
 }
 
 impl Shared {
+    /// Posts `message`, for work begun at reset count `epoch`, onto the control completion ring,
+    /// waiting for nothing ([`CompleteAnswer::answer`]): here where no answer is handed over before
+    /// it and the ring has room, else handed to the control thread behind those, which it wakes
+    /// unless a thread is posting them already.
+    fn post_unwaiting(&self, message: &[u8], epoch: u64) {
+        if !self.control_handing.load(Ordering::Acquire)
+            && self.post_telling(message, epoch, true, false) != Post::NoRoom
+        {
+            return;
+        }
+        let wake = {
+            let mut handed = self.control_handed.lock();
+            handed.records.push_back(HandedRecord {
+                message: message.to_vec(),
+                epoch,
+                at: now_ns(),
+                then: None,
+                no_room_since: 0,
+            });
+            self.control_handing.store(true, Ordering::Release);
+            !handed.posting
+        };
+        if wake {
+            self.wake.wake();
+        }
+    }
+
+    /// [`Self::post_behind_handed`] on the control completion ring: `message` (where given)
+    /// joins the answers handed over where a thread is posting them; else this thread posts them,
+    /// oldest first, then it, waiting for room. False, with nothing done, where none is held.
+    fn post_behind_control_handed(&self, message: Option<(&[u8], u64)>) -> bool {
+        {
+            let mut handed = self.control_handed.lock();
+            if handed.records.is_empty() && !handed.posting {
+                self.control_handing.store(false, Ordering::Release);
+                return false;
+            }
+            if let Some((message, epoch)) = message {
+                handed.records.push_back(HandedRecord {
+                    message: message.to_vec(),
+                    epoch,
+                    at: 0,
+                    then: None,
+                    no_room_since: 0,
+                });
+            }
+            if handed.posting {
+                return true;
+            }
+            handed.posting = true;
+        }
+        loop {
+            let record = {
+                let mut handed = self.control_handed.lock();
+                match handed.records.pop_front() {
+                    Some(next) => next,
+                    None => {
+                        handed.posting = false;
+                        self.control_handing.store(false, Ordering::Release);
+                        return true;
+                    }
+                }
+            };
+            self.post_waiting_now(&record.message, record.epoch);
+        }
+    }
+
     /// Hands `message`, posted at reset count `epoch`, to `queue`'s service thread to post
     /// ([`CompletionPoster::post_elsewhere`]), after the records handed over before it, and wakes
     /// that thread unless a thread is posting them already. Waits for nothing.

@@ -2595,7 +2595,14 @@ enabled, the host sends `VBLANK` at each refresh of the window's screen. A
 carries the count; the host counts each dropped one (`vblank-dropped`), each
 spell of that ring with no room (`control-ring-full`), and each post onto it
 that waited for room (`control-ring-post-waited`) in its degradation counts,
-and logs the first of each kind.
+and logs the first of each kind. An answer the host gives off the control
+thread waits for no room on it: a present's at its refresh, a close's or a
+block release's as the last command buffer it waits for completes (on the
+platform's thread that sees it, which holds up every queue's completions
+while it waits), a download's as its copy lands. One the ring has no room
+for, or that finds answers handed over before it, is handed to the control
+thread, which posts them in their order ahead of its own answers; a `VBLANK`
+that finds answers handed over is dropped, as one that finds no room is.
 
 **The display's density.** Where the guest took `DISPLAY_SCALE`, the host
 tells it the scale of the screen its window was last drawn on, and the kext

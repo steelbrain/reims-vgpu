@@ -1,7 +1,8 @@
-//! A command queue's completion ring the guest holds full: the platform's threads that run a
-//! decoder buffer's submission and completion handlers wait for no room on it
-//! (`CompletionPoster::post_unwaiting`), and its records, the values the buffer signalled and
-//! their posts to the other holders of an event's name reach the guest in their order once it
+//! A completion ring the guest holds full: the platform's threads that run a decoder buffer's
+//! submission and completion handlers wait for no room on a command queue's
+//! (`CompletionPoster::post_unwaiting`), nor on the control ring's for the answers they give
+//! (`CompleteAnswer::answer`), and the records, the values the buffer signalled, their posts to
+//! the other holders of an event's name and the answers reach the guest in their order once it
 //! takes them.
 
 use reims_vgpu_graphics::ops::{RGFX_OP_SIGNAL_EVENT, RgfxOpEvent};
@@ -311,4 +312,103 @@ fn a_reset_with_records_handed_over_posts_none_of_them() {
     assert!(complete_until_event(&platform, &mut ring), "no completion");
     let records = take_records(&mut ring);
     assert_eq!(records, [(RGFX_EVT_CB_COMPLETE, 200, 0)]);
+}
+
+/// A `SET_VBLANK` that turns display 0's vblanks off: a ring-0 command the control thread answers
+/// as it takes it.
+fn vblanks_off() -> Vec<u8> {
+    RgfxSetVblank {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SET_VBLANK,
+            size: 0,
+            seqno: 0,
+        },
+        display: 0,
+        enabled: 0,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// [`Guest::send`] once the control submission ring has room for `command` (and a pad before
+/// it), as a guest sends.
+fn send_with_room(guest: &mut Guest, device: &GraphicsDevice<FakePlatform>, command: Vec<u8>) {
+    let len = command.len() as u64;
+    let room = eventually(|| {
+        // SAFETY: as `Guest`'s helpers; the consumer count is at 0x40 of the ring's header.
+        let taken = unsafe { guest.load_u64(RGFX_CONTROL_SUBMIT_OFFSET as usize + 0x40) };
+        guest.produced - taken + 2 * len <= RING_DATA
+    });
+    assert!(room, "the control thread took no command");
+    guest.send(device, command);
+}
+
+/// How many full spells of the control completion ring this process told.
+fn control_ring_full_spells() -> u64 {
+    (reims_vgpu_vulkan::answer::degradation_counts().into_iter())
+        .find(|(code, _)| code == "control-ring-full")
+        .map_or(0, |(_, n)| n)
+}
+
+/// A command buffer's completion handler that ends the drain of its context's close, run on the
+/// platform's thread while the guest holds the control completion ring full, returns at once: the
+/// close's answer is handed to the control thread, which posts it after the answer it waits to
+/// post and before its next one, once the guest takes the ring
+#[test]
+fn a_seen_handler_that_ends_a_drain_waits_for_no_room_on_the_control_ring() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, mut guest, mut ring) = one_queue(&raised);
+    ring.send(&device, command_buffer(obj(1, 1), 100));
+    let ids = committed(&platform, 1);
+    guest.send(&device, context_close(1));
+    let close = guest.seqno;
+    // Answered while the close waits for the buffer: the control thread has taken the close.
+    guest.send(&device, vblanks_off());
+    let taken = guest.seqno;
+    assert_eq!(answer_of(&mut guest, taken), RGFX_STATUS_OK);
+    // The close's objects let go of: the buffer's completion holds the drain's last clone.
+    device.control.decoder().closes_let_go();
+
+    // More answers than the ring holds, none taken: the control thread waits for room.
+    let spells = control_ring_full_spells();
+    let first = guest.seqno + 1;
+    let count = (RING_DATA / 24) + 40;
+    for _ in 0..count {
+        send_with_room(&mut guest, &device, vblanks_off());
+    }
+    let last = guest.seqno;
+    assert!(
+        eventually(|| control_ring_full_spells() > spells),
+        "the control completion ring never filled"
+    );
+    let world = Arc::clone(platform.world());
+    let returned = returns_at_once(move || {
+        world.complete(
+            ids[0],
+            CommandBufferStatus::COMPLETED,
+            None,
+            CompleteOn::Caller,
+        );
+    });
+    assert!(
+        returned,
+        "the completion handler waited for room on the control ring"
+    );
+
+    let mut seqnos = Vec::new();
+    while seqnos.len() < count as usize + 1 {
+        let event = next_event(&mut guest, RGFX_EVT_COMPLETE);
+        let complete = RgfxComplete::read_from_bytes(&event).unwrap();
+        assert_eq!(complete.status, RGFX_STATUS_OK);
+        seqnos.push(complete.header.seqno);
+    }
+    let at = seqnos
+        .iter()
+        .position(|&s| s == close)
+        .expect("the close was never answered");
+    let waited = seqnos[at - 1];
+    let mut expected: Vec<u64> = (first..=waited).collect();
+    expected.push(close);
+    expected.extend(waited + 1..=last);
+    assert_eq!(seqnos, expected);
 }
