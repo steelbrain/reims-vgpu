@@ -472,8 +472,9 @@ bool normalizeNode(std::string &line, bool input, const std::string &type, const
 	NodeText n;
 	if (!splitNode(line, n))
 		return false;
-	// A vertex input's attribute name, which the generator writes as a bare string after the
-	// location's two operands, is not in the node `metal` writes.
+	// An input's attribute name, which the generator writes as a bare string after the location's
+	// two operands (a vertex function's vertex input, a kernel's input), is not in the node `metal`
+	// writes.
 	bool edited = false;
 	for (size_t i = 0; input && i + 3 < n.ops.size(); i++) {
 		std::string key, bare;
@@ -627,7 +628,8 @@ bool RgfxGLNormalizeStageText(std::string &text, const RgfxGLSignature &signatur
 				nodeLine.resize(n + 1, lines.size());
 			nodeLine[n] = i;
 		} else if (entryList == lines.size() &&
-		           (starts(line, "!air.vertex = ") || starts(line, "!air.fragment = "))) {
+		           (starts(line, "!air.vertex = ") || starts(line, "!air.fragment = ") ||
+		            starts(line, "!air.kernel = "))) {
 			entryList = i;
 		} else if (starts(line, "!air.version = ")) {
 			versionList = i;

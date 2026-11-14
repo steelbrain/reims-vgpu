@@ -53,8 +53,13 @@
  *     fetch, denormals), the first, and no air.compile.native_double_disable, which `metal` does
  *     not write; llvm.module.flags holds the first flag of each name (the module's own limits,
  *     4096 buffers, not the builtins' 31);
- *   - a vertex input's attribute name, a bare string after its air.location_index's two
- *     operands, is dropped (the input keeps its air.arg_name, which holds the same name);
+ *   - an input's attribute name, a bare string after its air.location_index's two operands, is
+ *     dropped (the input keeps its air.arg_name, which holds the same name), in a vertex
+ *     function's inputs and a kernel's alike. The kernel the renderer makes for a tessellated
+ *     draw has one at its argument 0 ("attrib_0"): metal2vulkan refused that kernel's compute
+ *     pipeline ("UnknownKey"), and the renderer drew the draw's vertices in software (measured:
+ *     macOS 27.0.1 arm64, a quad patch through a tessellation control and evaluation shader,
+ *     m3-max-30129);
  *   - a flat fragment input has no sampling key: `metal` writes [[flat]] as air.flat alone, and
  *     the generator writes air.center before it;
  *   - a buffer input has the air.address_space `metal` writes, its parameter's pointer's, and,
@@ -108,12 +113,12 @@ struct RgfxGLSignature {
 
 /// Makes `text`, a module as LLVM prints it, follow the rules above: the module's (no gld.*
 /// lists; one version, its language Metal's; its own compile options and module flags, once
-/// each), and those of the stage metadata of its vertex or fragment entry point where it has one:
-/// an integer user() varying's air.arg_type_name is the unsigned name, a vertex input has no
-/// bare attribute name, a flat fragment input no sampling key, and an output or input node
-/// without air.arg_type_name gets the name `signature` gives its value (an input's by its
-/// parameter index), and an air.arg_name where it has none. True where it changed `text`; `text`
-/// is unchanged otherwise.
+/// each), and those of the stage metadata of its vertex, fragment or kernel entry point where it
+/// has one: an integer user() varying's air.arg_type_name is the unsigned name, an input has no
+/// bare attribute name, a flat fragment input no sampling key, a buffer input its address space
+/// and pointee size, and an output or input node without air.arg_type_name gets the name
+/// `signature` gives its value (an input's by its parameter index), and an air.arg_name where it
+/// has none. True where it changed `text`; `text` is unchanged otherwise.
 bool RgfxGLNormalizeStageText(std::string &text, const RgfxGLSignature &signature);
 
 /// The GL IR a renderer's pointer holds: the u32 length at `ir`, then that many bytes. Writes the

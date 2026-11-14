@@ -964,7 +964,8 @@ void test_stage_metadata_normalized()
 	CHECK(RgfxGLNormalizeStageText(text, vertex));
 	CHECK(text == kVertexNormalized);
 
-	// No vertex or fragment entry point: a kernel's module, or none at all.
+	// A kernel's module whose one input node has no parameter index, which the input rules leave
+	// as it is.
 	const std::string kernel = "!air.kernel = !{!0}\n!0 = !{void ()* @__main, !1, !2}\n!1 = !{}\n!2 = "
 	                           "!{!3}\n!3 = !{!\"air.depth\"}\n";
 	text = kernel;
@@ -972,6 +973,40 @@ void test_stage_metadata_normalized()
 	// The module's rules hold for a kernel too: the generator's lists go.
 	text = kernel + "!gld.plugin_info = !{!1}\n";
 	CHECK(RgfxGLNormalizeStageText(text, vertex) && text == kernel);
+	// So do the input rules: a kernel's input loses the bare attribute name after its location,
+	// as the generator writes one in the kernel of a tessellated draw ("attrib_0" at its argument
+	// 0, which metal2vulkan refuses), and its buffer gets the address space of its parameter's
+	// pointer. Our own text: the inputs as `metal` writes a stage_in kernel's, the bare name added
+	// and the buffer's address space taken out.
+	{
+		const std::string inputs = "!air.kernel = !{!0}\n"
+		                           "!0 = !{void (<2 x float>, float addrspace(1)*, i32)* @__main, !1, !2}\n"
+		                           "!1 = !{}\n"
+		                           "!2 = !{!3, !4, !5}\n";
+		const std::string thread = "!5 = !{i32 2, !\"air.thread_position_in_grid\", !\"air.arg_type_name\", "
+		                           "!\"uint\", !\"air.arg_name\", !\"i\"}\n";
+		const std::string generated =
+		    inputs +
+		    "!3 = !{i32 0, !\"air.stage_in\", !\"air.location_index\", i32 0, i32 1, !\"attrib_0\", "
+		    "!\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", !\"attrib_0\"}\n"
+		    "!4 = !{i32 1, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.read\", "
+		    "!\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", i32 4, !\"air.arg_type_name\", "
+		    "!\"float\", !\"air.arg_name\", !\"b\"}\n" +
+		    thread;
+		const std::string normalized =
+		    inputs +
+		    "!3 = !{i32 0, !\"air.stage_in\", !\"air.location_index\", i32 0, i32 1, "
+		    "!\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", !\"attrib_0\"}\n"
+		    "!4 = !{i32 1, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.read\", "
+		    "!\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", "
+		    "i32 4, !\"air.arg_type_name\", !\"float\", !\"air.arg_name\", !\"b\"}\n" +
+		    thread;
+		RgfxGLSignature compute;
+		compute.parameters = {"float2", "float", "uint"};
+		text = generated;
+		CHECK(RgfxGLNormalizeStageText(text, compute) && text == normalized);
+		CHECK(!RgfxGLNormalizeStageText(text, compute) && text == normalized);
+	}
 	text = "";
 	CHECK(!RgfxGLNormalizeStageText(text, vertex) && text.empty());
 	// An entry node naming nodes the text lacks.
