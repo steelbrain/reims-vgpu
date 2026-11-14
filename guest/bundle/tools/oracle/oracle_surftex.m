@@ -26,6 +26,21 @@
 // with, for a case that also makes a view of its texture, `case N NAME => view: fmt F usage U`,
 // and, where the case ends the process, Metal's words (its stderr is the child's stdout), then
 //   => case N died on signal X | exited X
+// Then the aliasing cases (the seventh round, 11-13), each in a child process of its own
+// (`--alias N`): one command buffer writes texels of an 'L008' 64 x 64 surface of 128-byte rows
+// through one texture over its plane in its first encoder, and reads them through another in its
+// second. `wide` is RG8Unorm 64 x 64, its rows the surface's whole 128 bytes (the plane's texels
+// and the bytes past them); `narrow` is R8Unorm 64 x 64, the plane's own texels. The writer is a
+// blit from a buffer (`blit`) or a render pass that clears and stores (`clear`); the reader is a
+// blit into a Shared buffer. Both textures keep the device's hazard tracking (`tracked`), or are
+// Untracked with the writer updating a fence the reader waits for (`fence`). Each case runs
+// kAliasRuns command buffers, the CPU setting every byte of the surface to 0x11 under a lock
+// before each, and prints, of the bytes the writer wrote that the reader's texels hold, how many
+// runs read all of them, none, or some; and in how many runs the surface held them all after
+// the command buffer completed (read under a read-only lock):
+//   alias N NAME | surface ... | WRITER through W, read through R, HAZARD
+//   alias N NAME => runs R: all A, none Z, some S; surface after: all P
+//   oracle_surftex DEVICE --alias N    aliasing case N alone (what the children run)
 // Build: see README.md.
 #import "oracle_common.h"
 #import <CoreVideo/CoreVideo.h>
@@ -809,17 +824,206 @@ static int runCase(id<MTLDevice> d, int n)
 	return 0;
 }
 
+// The aliasing cases (the header).
+enum AliasWay { kWideThenNarrow, kNarrowThenWide };
+enum AliasWriter { kBlitWrite, kClearWrite };
+struct Alias {
+	const char *name;
+	enum AliasWay way;
+	enum AliasWriter writer;
+	int fenced; // 1: Untracked textures, the writer updates a fence the reader waits for
+};
+static const struct Alias kAliases[] = {
+    {"alias.wide-blit.narrow.tracked", kWideThenNarrow, kBlitWrite, 0},
+    {"alias.wide-blit.narrow.fence", kWideThenNarrow, kBlitWrite, 1},
+    {"alias.wide-clear.narrow.tracked", kWideThenNarrow, kClearWrite, 0},
+    {"alias.wide-clear.narrow.fence", kWideThenNarrow, kClearWrite, 1},
+    {"alias.narrow-blit.wide.tracked", kNarrowThenWide, kBlitWrite, 0},
+    {"alias.narrow-blit.wide.fence", kNarrowThenWide, kBlitWrite, 1},
+    {"alias.narrow-clear.wide.tracked", kNarrowThenWide, kClearWrite, 0},
+    {"alias.narrow-clear.wide.fence", kNarrowThenWide, kClearWrite, 1},
+};
+enum { kAliasCount = sizeof kAliases / sizeof kAliases[0], kAliasRuns = 16, kAliasRow = 128 };
+
+// The byte a blit writer writes at byte `x` of row `y` of the texture it writes.
+static uint8_t aliasPattern(int x, int y)
+{
+	return (uint8_t)(0x80 | ((x * 3 + y * 5) & 0x7f));
+}
+
+// The byte the writer of `a` leaves at byte `x` of row `y` of the surface, where it writes it;
+// -1 where it writes none (past the narrow texture's 64 bytes of a row).
+static int aliasWritten(const struct Alias *a, int x, int y)
+{
+	int wide = a->way == kWideThenNarrow;
+	if (!wide && x >= kSize)
+		return -1;
+	if (a->writer == kBlitWrite)
+		return aliasPattern(x, y);
+	// A clear to red 128/255 and green 64/255: RG8's two bytes, R8's one.
+	return wide && (x & 1) ? 0x40 : 0x80;
+}
+
+static id<MTLTexture> aliasTexture(id<MTLDevice> d, IOSurfaceRef s, MTLPixelFormat format,
+                                   int fenced)
+{
+	MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+	td.textureType = MTLTextureType2D;
+	td.pixelFormat = format;
+	td.width = kSize;
+	td.height = kSize;
+	td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+	if (fenced)
+		td.hazardTrackingMode = MTLHazardTrackingModeUntracked;
+	return [d newTextureWithDescriptor:td iosurface:s plane:0];
+}
+
+static int runAlias(id<MTLDevice> d, int n)
+{
+	const struct Alias *a = &kAliases[n];
+	IOSurfaceRef s = flatSurface('L008', 1, kAliasRow);
+	if (s == NULL) {
+		printf("alias %d %s => no surface\n", n, a->name);
+		return 1;
+	}
+	char surface[400];
+	surfaceText(s, surface, sizeof surface);
+	int wideFirst = a->way == kWideThenNarrow;
+	printf("alias %d %s | %s | %s through %s, read through %s, %s\n", n, a->name, surface,
+	       a->writer == kBlitWrite ? "a blit" : "a clear", wideFirst ? "wide" : "narrow",
+	       wideFirst ? "narrow" : "wide", a->fenced ? "Untracked with a fence" : "tracked");
+	fflush(stdout);
+	if (IOSurfaceGetBytesPerRow(s) != kAliasRow) {
+		printf("alias %d %s => the surface's rows are not %d bytes\n", n, a->name, kAliasRow);
+		CFRelease(s);
+		return 1;
+	}
+	id<MTLTexture> wide = aliasTexture(d, s, MTLPixelFormatRG8Unorm, a->fenced);
+	id<MTLTexture> narrow = aliasTexture(d, s, MTLPixelFormatR8Unorm, a->fenced);
+	if (wide == nil || narrow == nil) {
+		printf("alias %d %s => nil (wide %d, narrow %d)\n", n, a->name, wide != nil,
+		       narrow != nil);
+		CFRelease(s);
+		return 1;
+	}
+	id<MTLTexture> writer = wideFirst ? wide : narrow;
+	id<MTLTexture> reader = wideFirst ? narrow : wide;
+	NSUInteger writeRow = wideFirst ? kAliasRow : kSize;
+	NSUInteger readRow = wideFirst ? kSize : kAliasRow;
+	id<MTLBuffer> source = [d newBufferWithLength:writeRow * kSize
+	                                      options:MTLResourceStorageModeShared];
+	uint8_t *src = source.contents;
+	for (int y = 0; y < kSize; y++)
+		for (NSUInteger x = 0; x < writeRow; x++)
+			src[y * writeRow + x] = aliasPattern((int)x, y);
+	id<MTLBuffer> out = [d newBufferWithLength:readRow * kSize options:MTLResourceStorageModeShared];
+	id<MTLCommandQueue> q = [d newCommandQueue];
+	id<MTLFence> fence = a->fenced ? [d newFence] : nil;
+	int all = 0, none = 0, some = 0, after = 0;
+	for (int run = 0; run < kAliasRuns; run++) {
+		IOSurfaceLock(s, 0, NULL);
+		memset(IOSurfaceGetBaseAddress(s), 0x11, IOSurfaceGetAllocSize(s));
+		IOSurfaceUnlock(s, 0, NULL);
+		memset(out.contents, 0, out.length);
+		id<MTLCommandBuffer> cb = [q commandBuffer];
+		if (a->writer == kBlitWrite) {
+			id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+			[b copyFromBuffer:source
+			           sourceOffset:0
+			      sourceBytesPerRow:writeRow
+			    sourceBytesPerImage:writeRow * kSize
+			             sourceSize:MTLSizeMake(kSize, kSize, 1)
+			              toTexture:writer
+			       destinationSlice:0
+			       destinationLevel:0
+			      destinationOrigin:MTLOriginMake(0, 0, 0)];
+			if (fence != nil)
+				[b updateFence:fence];
+			[b endEncoding];
+		} else {
+			MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+			rp.colorAttachments[0].texture = writer;
+			rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+			rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+			rp.colorAttachments[0].clearColor = MTLClearColorMake(128.0 / 255, 64.0 / 255, 0, 1);
+			id<MTLRenderCommandEncoder> r = [cb renderCommandEncoderWithDescriptor:rp];
+			if (fence != nil)
+				[r updateFence:fence afterStages:MTLRenderStageFragment];
+			[r endEncoding];
+		}
+		id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+		if (fence != nil)
+			[b waitForFence:fence];
+		[b copyFromTexture:reader
+		                 sourceSlice:0
+		                 sourceLevel:0
+		                sourceOrigin:MTLOriginMake(0, 0, 0)
+		                  sourceSize:MTLSizeMake(kSize, kSize, 1)
+		                    toBuffer:out
+		           destinationOffset:0
+		      destinationBytesPerRow:readRow
+		    destinationBytesPerImage:readRow * kSize];
+		[b endEncoding];
+		[cb commit];
+		[cb waitUntilCompleted];
+		if (cb.status != MTLCommandBufferStatusCompleted) {
+			printf("alias %d %s => run %d: status %ld, error %s\n", n, a->name, run,
+			       (long)cb.status, cb.error.description.UTF8String);
+			continue;
+		}
+		// Of the bytes the writer wrote that the reader's texels hold: how many read written.
+		const uint8_t *got = out.contents;
+		int want = 0, seen = 0;
+		for (int y = 0; y < kSize; y++)
+			for (NSUInteger x = 0; x < readRow; x++) {
+				int w = aliasWritten(a, (int)x, y);
+				if (w < 0)
+					continue;
+				want++;
+				seen += got[y * readRow + x] == w;
+			}
+		all += seen == want;
+		none += seen == 0;
+		some += seen != want && seen != 0;
+		IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
+		const uint8_t *pages = IOSurfaceGetBaseAddress(s);
+		int held = 1;
+		for (int y = 0; y < kSize && held; y++)
+			for (int x = 0; x < kAliasRow; x++) {
+				int w = aliasWritten(a, x, y);
+				if (w >= 0 && pages[y * kAliasRow + x] != w) {
+					held = 0;
+					break;
+				}
+			}
+		IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+		after += held;
+	}
+	printf("alias %d %s => runs %d: all %d, none %d, some %d; surface after: all %d\n", n,
+	       a->name, kAliasRuns, all, none, some, after);
+	fflush(stdout);
+	CFRelease(s);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	if (argc < 2) {
-		fprintf(stderr, "usage: %s DEVICE [--case N | --list]\n", argv[0]);
+		fprintf(stderr, "usage: %s DEVICE [--case N | --alias N | --list]\n", argv[0]);
 		return 2;
 	}
 	if (argc > 2 && !strcmp(argv[2], "--list")) {
 		for (int n = 0; n < kCaseCount; n++)
 			printf("%d %s\n", n, kCases[n].name);
 		return 0;
+	}
+	if (argc > 3 && !strcmp(argv[2], "--alias")) {
+		dup2(STDOUT_FILENO, STDERR_FILENO);
+		int n = atoi(argv[3]);
+		if (n < 0 || n >= kAliasCount)
+			return 2;
+		return runAlias(oracle_device(argv[1]), n);
 	}
 	if (argc > 3 && !strcmp(argv[2], "--case")) {
 		// Metal's words where it ends the process go to stderr: put them in the case's lines.
@@ -844,6 +1048,21 @@ int main(int argc, char **argv)
 			printf("=> case %d died on signal %d\n", n, WTERMSIG(st));
 		else if (WEXITSTATUS(st))
 			printf("=> case %d exited %d\n", n, WEXITSTATUS(st));
+		fflush(stdout);
+	}
+	for (int n = 0; n < kAliasCount; n++) {
+		char index[16];
+		snprintf(index, sizeof index, "%d", n);
+		char *args[] = {argv[0], argv[1], "--alias", index, NULL};
+		pid_t pid;
+		if (posix_spawn(&pid, argv[0], NULL, NULL, args, environ))
+			return 1;
+		int st;
+		waitpid(pid, &st, 0);
+		if (WIFSIGNALED(st))
+			printf("=> alias %d died on signal %d\n", n, WTERMSIG(st));
+		else if (WEXITSTATUS(st))
+			printf("=> alias %d exited %d\n", n, WEXITSTATUS(st));
 		fflush(stdout);
 	}
 	return 0;
