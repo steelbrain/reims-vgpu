@@ -275,8 +275,10 @@ impl Signals {
             && !*posted
         {
             *posted = true;
-            sink(event_signalled(*obj_id, *value));
-            fan_out.reached(*obj_id, *value);
+            sink(
+                event_signalled(*obj_id, *value),
+                fanned(fan_out, *obj_id, *value),
+            );
         }
     }
 
@@ -293,11 +295,21 @@ impl Signals {
         for (obj_id, value, posted) in signals {
             if !*posted {
                 *posted = true;
-                sink(event_signalled(*obj_id, *value));
-                fan_out.reached(*obj_id, *value);
+                sink(
+                    event_signalled(*obj_id, *value),
+                    fanned(fan_out, *obj_id, *value),
+                );
             }
         }
     }
+}
+
+/// What follows the post of shared event `obj_id`'s `value` to its own holder: its post to the
+/// other holders of the event's name through `fan_out`, once the guest's ring holds the holder's
+/// own, so no other process has a value before the process that signalled it.
+fn fanned(fan_out: &Arc<dyn FanOut>, obj_id: u64, value: u64) -> super::Then {
+    let fan_out = Arc::clone(fan_out);
+    Box::new(move || fan_out.reached(obj_id, value))
 }
 
 /// A command buffer's `CB_SUBMITTED`, posted once: by the first of the answer on a doorbell's
@@ -2137,11 +2149,12 @@ impl<P: Platform> GraphicsDecoder<P> {
                     error.description
                 );
             }
-            if let Some(sink) = &sink {
-                sink(record);
+            // The buffer's work and its completion are done: a drain of its context may end,
+            // once the record is on the guest's ring.
+            match &sink {
+                Some(sink) => sink(record, Box::new(move || drop(drain))),
+                None => drop(drain),
             }
-            // The buffer's work and its completion are done: a drain of its context may end.
-            drop(drain);
         })
     }
 

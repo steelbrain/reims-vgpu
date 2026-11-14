@@ -3508,7 +3508,16 @@ tells of a completion only on its completed handlers' thread, a completed
 handler. Where a queue's completion ring has no room, the host counts each
 spell of it (`queue-ring-full`) and each post onto it that waited for room
 (`queue-ring-post-waited`) in its degradation counts, and logs the first of
-each kind, naming the thread that waited.
+each kind, naming the thread that waited. No handler of the buffer's waits
+for room: the platform's thread that runs one holds up every queue's
+completions or submissions behind it. A record the ring has room for, with
+no record handed over before it, is posted on the handler's thread; any
+other is handed to the queue's service thread, which posts the records in
+the order handed, waiting for room, and runs what follows each right after
+it: a value's posts to the other holders of the event's name, the shows of
+the presents waiting for the buffer, and the answers waiting for its
+context's drain. So the guest sees them in the order it would had the
+handler waited, and every later post onto the ring goes behind them.
 
 **Scheduled** (per-queue completion ring). A `CB_SCHEDULED` record (the command-buffer
 `ObjId`, at the buffer's seqno; 24 bytes, and the guest reads a record of at least that size)

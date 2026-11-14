@@ -234,17 +234,23 @@ pub(crate) use surface_cache::{FillHook, FillWait};
 pub(crate) use surface_pages::Joined;
 use tables::{Context, Entry, GuestBytes, LaidUse, QueueCounts, View};
 
+/// What follows a record handed to a [`CompletionSink`] or a [`SignalSink`], which the sink runs
+/// once the record is on the ring, or dropped, on the thread that posted it.
+pub(crate) type Then = reims_vgpu_graphics::Then;
+
 /// A sink the decoder calls with each command buffer's completion record once its
-/// work finishes (the handler the stream's close registers). The ring loop sets
-/// one that writes the record to the queue's completion ring; until it is set, a
+/// work finishes (the handler the stream's close registers), and what follows it ([`Then`]). The
+/// ring loop sets one that writes the record to the queue's completion ring, waiting for nothing
+/// (`reims_vgpu_graphics::CompletionPoster::post_unwaiting`); until it is set, a
 /// completion is built and dropped.
-pub(crate) type CompletionSink = Arc<dyn Fn(RgfxCbComplete) + Send + Sync>;
+pub(crate) type CompletionSink = Arc<dyn Fn(RgfxCbComplete, Then) + Send + Sync>;
 
 /// A sink the decoder calls with each shared event a command buffer signalled
 /// (`encodeSignalEvent:value:`), once the buffer's work finishes and before its completion record
-/// goes to the [`CompletionSink`]. The ring loop sets one that writes it to the queue's completion
-/// ring; until it is set, it is built and dropped.
-pub(crate) type SignalSink = Arc<dyn Fn(RgfxEventSignalled) + Send + Sync>;
+/// goes to the [`CompletionSink`], and what follows it ([`Then`]). The ring loop sets one that
+/// writes it to the queue's completion ring, waiting for nothing; until it is set, it is built and
+/// dropped.
+pub(crate) type SignalSink = Arc<dyn Fn(RgfxEventSignalled, Then) + Send + Sync>;
 
 /// A sink the decoder calls with each command buffer's `CB_SCHEDULED` record once the buffer is
 /// scheduled (its platform command buffer's scheduled handler), ahead of its completion record.
@@ -2192,16 +2198,24 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// Sets the sink the decoder hands each command buffer's completion record to
     /// once its work finishes (the ring loop's, writing the queue's completion
     /// ring).
+    /// What follows each record is run as soon as `sink` returns.
     #[cfg(test)]
-    pub(crate) fn set_completion_sink(&mut self, sink: CompletionSink) {
-        self.sinks.completion = Some(sink);
+    pub(crate) fn set_completion_sink(&mut self, sink: Arc<dyn Fn(RgfxCbComplete) + Send + Sync>) {
+        self.sinks.completion = Some(Arc::new(move |record, then: Then| {
+            sink(record);
+            then();
+        }));
     }
 
     /// Sets the sink the decoder hands each shared event a command buffer signalled to, once the
     /// buffer's work finishes (the ring loop's, writing the queue's completion ring).
+    /// What follows each record is run as soon as `sink` returns.
     #[cfg(test)]
-    pub(crate) fn set_signal_sink(&mut self, sink: SignalSink) {
-        self.sinks.signal = Some(sink);
+    pub(crate) fn set_signal_sink(&mut self, sink: Arc<dyn Fn(RgfxEventSignalled) + Send + Sync>) {
+        self.sinks.signal = Some(Arc::new(move |record, then: Then| {
+            sink(record);
+            then();
+        }));
     }
 
     /// Sets the sink the decoder hands each command buffer's `CB_SCHEDULED` to once the buffer is

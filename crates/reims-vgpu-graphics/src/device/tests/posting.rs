@@ -9,8 +9,8 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use zerocopy::IntoBytes;
 
-use super::{QUEUE_COMPLETE, QUEUE_RING_DATA, Rig, eventually, send_queue_create};
-use crate::device::{CompletionPoster, Host, RingDegradation};
+use super::{QUEUE_COMPLETE, QUEUE_RING_DATA, Rig, eventually, object_message, send_queue_create};
+use crate::device::{CompletionPoster, Host, RingDegradation, Then};
 use crate::wire::*;
 
 /// The queue the tests make, in context 5.
@@ -176,4 +176,188 @@ fn a_full_queue_ring_tells_its_spell_and_its_waited_posts() {
             QueuePostWaited
         ]
     );
+}
+
+/// What ran after a record ([`Then`]): its tag, the thread it ran on and the ring's producer
+/// count then.
+type Ran = Arc<Mutex<Vec<(u64, Option<String>, u64)>>>;
+
+/// What follows a record: notes `tag` in `ran`, with its thread and the ring's producer count.
+fn noting(rig: &Rig, ran: &Ran, tag: u64) -> Option<Then> {
+    let (ran, region) = (Arc::clone(ran), Arc::clone(&rig.device.shared.region));
+    Some(Box::new(move || {
+        let produced = region.atomic_u64(QUEUE_COMPLETE).load(Ordering::SeqCst);
+        let thread = std::thread::current();
+        ran.lock()
+            .push((tag, thread.name().map(str::to_owned), produced));
+    }))
+}
+
+/// Runs `post` on a thread of its own, as a platform's handler thread: whether it returned
+/// within two seconds.
+fn returns_at_once(post: impl FnOnce() + Send + 'static) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("platform-handler".into())
+        .spawn(move || {
+            post();
+            let _ = tx.send(());
+        })
+        .unwrap();
+    rx.recv_timeout(Duration::from_secs(2)).is_ok()
+}
+
+/// Whether `name` is the tests' queue's service thread's.
+fn on_service_thread(name: &Option<String>) -> bool {
+    name.as_deref() == Some(&*format!("reims-vgpu.graphics-queue-{QUEUE:#x}"))
+}
+
+/// A post that waits for nothing onto a full queue ring returns at once, the record handed to
+/// the queue's service thread with what follows it; a post that waits goes behind them, and waits
+/// for nothing either. Once the guest takes the ring, the service thread posts them in their
+/// order, each followed by what follows it, then the waiting post's; it tells the ring's full
+/// spell, and each of the three as a post that waited
+#[test]
+fn a_post_unwaiting_onto_a_full_queue_ring_returns_at_once_and_its_records_follow_in_order() {
+    use RingDegradation::{QueuePostWaited, QueueRingFull};
+    let host = PostingHost::default();
+    let rig = queue_rig(&host);
+    let poster = host.poster();
+    for cb in 0..HOLDS {
+        poster.post(&record(cb));
+    }
+    let ran = Ran::default();
+    let posted = {
+        let (poster, a, b) = (poster.clone(), noting(&rig, &ran, 1), noting(&rig, &ran, 2));
+        returns_at_once(move || {
+            poster.post_unwaiting(&record(HOLDS), a);
+            poster.post_unwaiting(&record(HOLDS + 1), b);
+            poster.post(&record(HOLDS + 2));
+        })
+    };
+    assert!(posted, "a post behind records handed over waited for room");
+    assert_eq!(rig.device.handed_over(), 2);
+    assert_eq!(produced(&rig), HOLDS * 48, "posted onto a full ring");
+    assert!(ran.lock().is_empty(), "ran before its record was posted");
+    assert!(
+        eventually(|| host.degraded() == [QueueRingFull]),
+        "the spell was not told: {:?}",
+        host.degraded()
+    );
+
+    let (taken, consumed) = take_all(&rig, 0);
+    assert_eq!(taken, (0..HOLDS).collect::<Vec<_>>());
+    assert!(
+        eventually(|| produced(&rig) >= consumed + 16 + 3 * 48),
+        "the handed records were never posted"
+    );
+    let (taken, _) = take_all(&rig, consumed);
+    assert_eq!(taken, [HOLDS, HOLDS + 1, HOLDS + 2]);
+    // Each ran on the service thread right after its own record: the first with its record on
+    // the ring and the second's not yet, past the 16 bytes of padding at the ring's end.
+    let ran = ran.lock().clone();
+    assert_eq!(ran.iter().map(|r| r.0).collect::<Vec<_>>(), [1, 2]);
+    assert!(
+        ran.iter().all(|(_, thread, _)| on_service_thread(thread)),
+        "{ran:?}"
+    );
+    assert_eq!(ran[0].2, consumed + 16 + 48);
+    assert_eq!(ran[1].2, consumed + 16 + 2 * 48);
+    let told = [
+        QueueRingFull,
+        QueuePostWaited,
+        QueuePostWaited,
+        QueuePostWaited,
+    ];
+    assert!(
+        eventually(|| host.degraded() == told),
+        "{:?}",
+        host.degraded()
+    );
+}
+
+/// A post that waits for nothing, finding records handed over and not yet posted, goes behind
+/// them though the ring has room by then, posting them first, and a tried post goes nowhere:
+/// here the guest takes the ring while the service thread, waiting for room, has not looked again
+#[test]
+fn a_post_unwaiting_goes_behind_records_handed_over_though_the_ring_has_room() {
+    let host = PostingHost::default();
+    let rig = queue_rig(&host);
+    rig.device
+        .shared
+        .room_poll_ns
+        .store(60_000_000_000, Ordering::Relaxed);
+    let poster = host.poster();
+    for cb in 0..HOLDS {
+        poster.post(&record(cb));
+    }
+    poster.post_unwaiting(&record(HOLDS), None);
+    // The service thread found no room for the record and looks again only after its poll; the
+    // guest makes room, ringing nothing.
+    std::thread::sleep(Duration::from_millis(50));
+    let (taken, consumed) = take_all(&rig, 0);
+    assert_eq!(taken.len() as u64, HOLDS);
+    assert!(!poster.try_post(&record(99)), "a tried post went ahead");
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(
+        produced(&rig),
+        consumed,
+        "a post went ahead of a record handed over"
+    );
+
+    poster.post_unwaiting(&record(HOLDS + 1), None);
+    assert_eq!(produced(&rig), consumed + 16 + 2 * 48);
+    let (taken, _) = take_all(&rig, consumed);
+    assert_eq!(taken, [HOLDS, HOLDS + 1]);
+    assert_eq!(rig.device.handed_over(), 2);
+}
+
+/// The records handed over to a queue's service thread when the device is reset are dropped,
+/// none posted, and what follows each is run there; a post through the poster after the reset
+/// posts nothing and runs what follows it at once
+#[test]
+fn a_reset_drops_the_records_handed_over_and_runs_what_follows_them() {
+    let host = PostingHost::default();
+    let rig = queue_rig(&host);
+    let poster = host.poster();
+    for cb in 0..HOLDS {
+        poster.post(&record(cb));
+    }
+    let ran = Ran::default();
+    poster.post_unwaiting(&record(HOLDS), noting(&rig, &ran, 1));
+    poster.post_unwaiting(&record(HOLDS + 1), noting(&rig, &ran, 2));
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(ran.lock().is_empty());
+
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    assert!(eventually(|| ran.lock().len() == 2), "{:?}", ran.lock());
+    poster.post_unwaiting(&record(HOLDS + 2), noting(&rig, &ran, 3));
+    let ran = ran.lock().clone();
+    assert_eq!(ran.iter().map(|r| r.0).collect::<Vec<_>>(), [1, 2, 3]);
+    assert!(ran.iter().all(|&(_, _, produced)| produced == HOLDS * 48));
+    assert_eq!(produced(&rig), HOLDS * 48, "posted after the reset");
+}
+
+/// The records handed over to a queue's service thread when the queue is destroyed are dropped
+/// and what follows each is run, in order; a post after the destroy runs what follows it at once
+#[test]
+fn a_queue_s_destroy_drops_its_handed_records_and_runs_what_follows_them() {
+    let host = PostingHost::default();
+    let mut rig = queue_rig(&host);
+    let poster = host.poster();
+    for cb in 0..HOLDS {
+        poster.post(&record(cb));
+    }
+    let ran = Ran::default();
+    poster.post_unwaiting(&record(HOLDS), noting(&rig, &ran, 1));
+    poster.post_unwaiting(&record(HOLDS + 1), noting(&rig, &ran, 2));
+
+    rig.send(object_message(RGFX_CMD_OBJECT_DESTROY, QUEUE));
+    assert!(eventually(|| ran.lock().len() == 2), "{:?}", ran.lock());
+    assert!(eventually(|| rig.device.queue_count() == 0));
+    poster.post_unwaiting(&record(HOLDS + 2), noting(&rig, &ran, 3));
+    let ran = ran.lock().clone();
+    assert_eq!(ran.iter().map(|r| r.0).collect::<Vec<_>>(), [1, 2, 3]);
+    assert_eq!(produced(&rig), HOLDS * 48, "posted after the destroy");
 }

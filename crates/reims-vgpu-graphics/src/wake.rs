@@ -88,6 +88,14 @@ impl Wake {
     /// Sleeps until a wake, or until `doorbell` (the host's file, where it gave one) is
     /// readable, then takes what either holds.
     pub(crate) fn sleep(&self, doorbell: Option<RawFd>) {
+        self.sleep_for(doorbell, None);
+    }
+
+    /// [`Self::sleep`], for `timeout` at most where one is given (rounded up to a millisecond).
+    pub(crate) fn sleep_for(&self, doorbell: Option<RawFd>, timeout: Option<std::time::Duration>) {
+        let timeout_ms = timeout.map_or(-1, |t| {
+            libc::c_int::try_from(t.as_nanos().div_ceil(1_000_000)).unwrap_or(libc::c_int::MAX)
+        });
         let mut fds = [
             libc::pollfd {
                 fd: self.read.as_raw_fd(),
@@ -103,7 +111,7 @@ impl Wake {
         #[cfg(test)]
         self.sleeps.fetch_add(1, Ordering::SeqCst);
         // SAFETY: two pollfds, a negative descriptor ignored.
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
         // Before the drain: until it, a wake that ended the poll is still pending.
         #[cfg(test)]
         self.sleeps.fetch_add(1, Ordering::SeqCst);

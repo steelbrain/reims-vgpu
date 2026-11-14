@@ -14,6 +14,8 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use super::*;
 
+mod full_ring;
+
 /// A graphics device on the testkit's platform, with no window, raising through `raised`.
 fn headless(raised: &Arc<AtomicU32>) -> GraphicsDevice<FakePlatform> {
     let raised = Arc::clone(raised);
@@ -11604,7 +11606,8 @@ fn a_read_of_the_display_calls_nothing_back_and_waits_for_no_full_ring() {
     );
     guest.send(&device, shared_event_create(obj(1, 7), 0));
     // A buffer that signals the event 150 times: its completion posts each value, 32 bytes, more
-    // than the ring holds, and waits on its completion thread for room the guest does not make.
+    // than the ring holds: what finds no room it hands, with its completion, to the queue's service
+    // thread, which waits for room the guest does not make.
     let signals: Vec<RgfxOpEvent> = (1..=SIGNALS)
         .map(|value| RgfxOpEvent {
             event_obj_id: obj(1, 7),
@@ -11625,6 +11628,8 @@ fn a_read_of_the_display_calls_nothing_back_and_waits_for_no_full_ring() {
     );
     std::thread::sleep(Duration::from_millis(50));
     let full = produced(&ring);
+    let handed = device.handed_over();
+    assert!(handed > 0, "the completion posted onto a full ring");
 
     platform.world().hold_submissions();
     ring.send(&device, waiting_and_asking(obj(1, 1), 101, obj(1, 7), 1000));
@@ -11648,7 +11653,7 @@ fn a_read_of_the_display_calls_nothing_back_and_waits_for_no_full_ring() {
     assert!(read, "the read failed");
     assert_eq!(produced(&ring), full, "posted onto a full ring");
     assert_eq!(
-        device.handed_over(),
+        device.handed_over() - handed,
         2,
         "the buffer's records were not handed over"
     );

@@ -111,8 +111,8 @@ use crate::graphics::decode::worker::{Job, Settle, Unsettled, Worker};
 use crate::graphics::decode::{
     Begun, CompletionSink, DecodeError, Decoders, DrainAnswer, GraphicsDecoder, Joined, LibraryJob,
     LibraryStart, MadeLibrary, PipelineJob, PipelineReply, ReflectionSink, ScheduledSink,
-    SignalSink, Sinks, SubmittedSink, SurfacePresent, compile_refusing, complete, make_library,
-    refused_reply, refusing,
+    SignalSink, Sinks, SubmittedSink, SurfacePresent, Then, compile_refusing, complete,
+    make_library, refused_reply, refusing,
 };
 use crate::graphics::device_info::device_info;
 use crate::graphics::present::{Drawing, PresentAnswers, PresentQueue};
@@ -1642,16 +1642,23 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let queue_poster = poster.clone();
         let presents = Arc::clone(&self.presents);
         let queue = poster.queue_obj_id();
-        let completion: CompletionSink = Arc::new(move |record: RgfxCbComplete| {
-            queue_poster.post(record.as_bytes());
-            // A present waiting for the buffer is shown once its completion is posted.
-            if let Some(queue) = queue {
-                presents.finished(queue, record.header.seqno, &queue_poster);
-            }
+        // Each posted waiting for nothing, on whichever thread finds the buffer complete
+        // (`CompletionPoster::post_unwaiting`).
+        let completion: CompletionSink = Arc::new(move |record: RgfxCbComplete, then: Then| {
+            let seqno = record.header.seqno;
+            let (presents, poster) = (Arc::clone(&presents), queue_poster.clone());
+            let then: Then = Box::new(move || {
+                // A present waiting for the buffer is shown once its completion is posted.
+                if let Some(queue) = queue {
+                    presents.finished(queue, seqno, &poster);
+                }
+                then();
+            });
+            queue_poster.post_unwaiting(record.as_bytes(), Some(then));
         });
         let signal_poster = poster.clone();
-        let signal: SignalSink = Arc::new(move |record: RgfxEventSignalled| {
-            signal_poster.post(record.as_bytes());
+        let signal: SignalSink = Arc::new(move |record: RgfxEventSignalled, then: Then| {
+            signal_poster.post_unwaiting(record.as_bytes(), Some(then));
         });
         // A buffer's submission handler posts these, on whichever thread runs it
         // ([`post_from_handler`]).
@@ -2788,21 +2795,24 @@ fn stepped<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-/// Posts a command buffer's `CB_SUBMITTED` or `CB_SCHEDULED` `record` through `poster`: at once,
-/// raising the queue's vector there, on a thread the header names for the device's raise
-/// (`RvgGraphicsRaiseFn`: the device's and the decoder's own threads, and the platform's that
-/// run a buffer's handlers); handed to the queue's service thread, which posts it and raises
-/// there, where a submission handler runs inside a commit on any other thread
-/// ([`foreign_committer`]). The platform's runtime may run every ready buffer's submission
-/// handlers inside one commit (`reims_vgpu_vulkan::core::platform::command::committing`): the window's
-/// render thread, the host's thread inside `rvg_graphics_device_read_display`, or another
-/// device's, which neither post nor raise for this one, so none of them waits for room on a full
-/// ring either.
+/// Posts a command buffer's `CB_SUBMITTED` or `CB_SCHEDULED` `record` through `poster`, waiting
+/// for nothing: on a thread the header names for the device's raise (`RvgGraphicsRaiseFn`: the
+/// device's and the decoder's own threads, and the platform's that run a buffer's handlers), at
+/// once where the ring has room and no record is handed over before it, raising the queue's
+/// vector there, else handed to the queue's service thread
+/// (`CompletionPoster::post_unwaiting`); handed to it always, which posts it and raises there,
+/// where a submission handler runs inside a commit on any other thread ([`foreign_committer`]).
+/// The platform's runtime runs submission handlers on its scheduler thread, and may run every
+/// ready buffer's inside one commit (`reims_vgpu_vulkan::core::platform::command::committing`):
+/// a lane's of any queue, the window's render thread, the host's thread inside
+/// `rvg_graphics_device_read_display`, or another device's. A wait for room on any of them would
+/// hold up every queue's submissions, and the record's mutex, which the buffer's completion
+/// handler takes, across the wait: none waits.
 fn post_from_handler(poster: &CompletionPoster, record: &[u8]) {
     if foreign_committer() {
         poster.post_elsewhere(record);
     } else {
-        poster.post(record);
+        poster.post_unwaiting(record, None);
     }
 }
 
