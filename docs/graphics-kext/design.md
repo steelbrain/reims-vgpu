@@ -3505,7 +3505,10 @@ events it signalled ahead of it: on metal2vulkan the runtime's thread that saw
 the buffer complete runs it, in its queue's commit order, and with no
 completed handler on the buffer no handler thread is woken; on Metal, which
 tells of a completion only on its completed handlers' thread, a completed
-handler.
+handler. Where a queue's completion ring has no room, the host counts each
+spell of it (`queue-ring-full`) and each post onto it that waited for room
+(`queue-ring-post-waited`) in its degradation counts, and logs the first of
+each kind, naming the thread that waited.
 
 **Scheduled** (per-queue completion ring). A `CB_SCHEDULED` record (the command-buffer
 `ObjId`, at the buffer's seqno; 24 bytes, and the guest reads a record of at least that size)

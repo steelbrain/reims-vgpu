@@ -11,6 +11,8 @@ use zerocopy::{FromBytes, FromZeros, IntoBytes};
 use super::*;
 use crate::display::CursorImage;
 
+mod posting;
+
 /// How many times [`eventually`] polls, a millisecond's sleep apart, for a state the device's own
 /// threads reach: a minute at least, as a loaded host starves those threads for seconds. A test
 /// that passes polls only until the state holds; the bound guards against a hang alone.

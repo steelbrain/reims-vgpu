@@ -100,9 +100,10 @@ repeats the ones code cites.
     on stderr, sorted by code, is every kind relayed or counted since the
     process began: the runtime's degradation codes
     (`metal2vulkan-degrade-…`), `inexact-…`, `out-of-host-memory`, the
-    driver's message id names, and the reims-graphics device's control
-    completion ring's (`control-ring-full`, `control-ring-post-waited`,
-    `vblank-dropped`); a boot's degradations are read from its last such
+    driver's message id names, and the reims-graphics device's completion
+    rings' (`control-ring-full`, `control-ring-post-waited`,
+    `vblank-dropped`, `queue-ring-full`, `queue-ring-post-waited`); a boot's
+    degradations are read from its last such
     line. `reims-vgpu INFO reims_vgpu_vulkan::core::logging: lines
     repeated since the last count: <n> more of <file>:<line>[ [<kind>]]
     (<target>: <the first line's message>); …` is how many lines of each

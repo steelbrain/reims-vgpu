@@ -2651,8 +2651,9 @@ pub fn out_of_host_memory_count() -> u64 {
 }
 
 /// The kinds a caller outside this crate counts by code ([`count_kind`]), each with how many
-/// times: `reims-vgpu`'s, as its reims-graphics device tells it of its control completion ring
-/// (`control-ring-full`, `control-ring-post-waited`, `vblank-dropped`).
+/// times: `reims-vgpu`'s, as its reims-graphics device tells it of its completion rings
+/// (`control-ring-full`, `control-ring-post-waited`, `vblank-dropped`, `queue-ring-full`,
+/// `queue-ring-post-waited`).
 static COUNTED: crate::core::sync::Mutex<Vec<(&'static str, u64)>> =
     crate::core::sync::Mutex::new(Vec::new());
 

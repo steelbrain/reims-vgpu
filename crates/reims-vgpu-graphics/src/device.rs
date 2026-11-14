@@ -736,18 +736,19 @@ pub trait Host: Send + Sync + 'static {
         let _ = (kind, values);
     }
 
-    /// The device met `kind` on the control completion ring ([`RingDegradation`]): the host
-    /// counts it with the process's degradations. Called on the thread that posted, with no
-    /// lock of the device's held, after the device logged the kind's line. The default does
-    /// nothing.
+    /// The device met `kind` on a completion ring ([`RingDegradation`]): the host counts it with
+    /// the process's degradations. Called on the thread that posted, with no lock of the device's
+    /// held, after the device logged the kind's line. The default does nothing.
     fn ring_degraded(&self, kind: RingDegradation) {
         let _ = kind;
     }
 }
 
-/// What the device tells its host of the control completion ring ([`Host::ring_degraded`]):
-/// every process's ring-0 answers, the `PRESENT_SURFACE` answers and the display's events share
-/// that one ring, and the guest's kext drains it on its work loop.
+/// What the device tells its host of its completion rings ([`Host::ring_degraded`]). Every
+/// process's ring-0 answers, the `PRESENT_SURFACE` answers and the display's events share the
+/// control completion ring, which the guest's kext drains on its work loop; a command queue's
+/// ring takes its command buffers' records, which the guest's process drains on its completion
+/// thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RingDegradation {
     /// A post found the ring with no room where the post before it on the ring found room: a
@@ -760,6 +761,14 @@ pub enum RingDegradation {
     /// A `VBLANK` found no room and was dropped: the guest gets no event for that refresh, and the
     /// next `VBLANK` carries the count.
     VblankDropped,
+    /// A post that waits for room found a command queue's completion ring with none where the
+    /// post that waited on it before had gone on: a spell begins in which the queue's posts that
+    /// wait for room wait for the guest's process to take more.
+    QueueRingFull,
+    /// A post onto a command queue's completion ring that waits for room found none at its first
+    /// look, and went on once the guest took more, the queue ended, the device was reset or it
+    /// ended.
+    QueuePostWaited,
 }
 
 impl RingDegradation {
@@ -769,6 +778,8 @@ impl RingDegradation {
             Self::ControlRingFull => "control-ring-full",
             Self::ControlPostWaited => "control-ring-post-waited",
             Self::VblankDropped => "vblank-dropped",
+            Self::QueueRingFull => "queue-ring-full",
+            Self::QueuePostWaited => "queue-ring-post-waited",
         }
     }
 }
@@ -941,6 +952,10 @@ pub(crate) struct QueueShared {
     complete: Mutex<Producer>,
     /// Where posts onto the completion ring wait for room.
     room: Room,
+    /// Whether a post that waits for room found none on the completion ring, and no post onto
+    /// it has gone in since: a full spell is told once, at its first such post
+    /// ([`RingDegradation::QueueRingFull`]).
+    full: AtomicBool,
     /// The records a thread that may not post onto the completion ring handed over
     /// ([`CompletionPoster::post_elsewhere`]), for the service thread, or the next thread of the
     /// device's that posts onto the ring, to post in their order.
@@ -2469,6 +2484,7 @@ impl Shared {
             consuming: Mutex::new(None),
             complete: Mutex::new(producer),
             room: Room::default(),
+            full: AtomicBool::new(false),
             handed: Mutex::new(Handed::default()),
             handing: AtomicBool::new(false),
             wake,
@@ -2990,18 +3006,61 @@ impl Shared {
         self.post_queue_now(queue, message, epoch);
     }
 
-    /// [`Self::post_queue_waiting`] of `message` with no record handed over before it.
+    /// [`Self::post_queue_waiting`] of `message` with no record handed over before it. A full
+    /// spell of the ring is told at its first post that found no room, and each post that
+    /// waited once it goes on ([`RingDegradation::QueueRingFull`],
+    /// [`RingDegradation::QueuePostWaited`]).
     fn post_queue_now(&self, queue: &QueueShared, message: &[u8], epoch: u64) {
+        let mut waited_since = None;
         loop {
             let seen = queue.room.wakes();
             if self.post_queue(queue, message, epoch) != Post::NoRoom
                 || self.ending()
                 || queue.ended()
             {
+                if let Some(since) = waited_since {
+                    self.queue_post_waited(queue, since);
+                }
                 return;
+            }
+            if waited_since.is_none() {
+                waited_since = Some(now_ns());
+                if !queue.full.swap(true, Ordering::Relaxed) {
+                    self.queue_ring_filled(queue, message);
+                }
             }
             queue.room.wait(seen, self.room_poll());
         }
+    }
+
+    /// The first post that waits for room in a full spell of `queue`'s completion ring found
+    /// none for `message`. The line names the thread that waits, as a wait on a thread that runs
+    /// the platform's handlers holds up the work behind them there.
+    fn queue_ring_filled(&self, queue: &QueueShared, message: &[u8]) {
+        let ty = RgfxMsgHeader::read_from_prefix(message).map_or(0, |(header, _)| header.r#type);
+        let thread = std::thread::current();
+        log::warn!(
+            target: "reims_vgpu_graphics",
+            "queue {:#x}'s completion ring is full: a message of type {ty:#x} found no room, and \
+             its posts that wait for room wait for the guest to take more, on {}",
+            queue.obj_id,
+            thread.name().unwrap_or("an unnamed thread")
+        );
+        self.host.ring_degraded(RingDegradation::QueueRingFull);
+    }
+
+    /// A post onto `queue`'s completion ring that waited for room since `since_ns` ([`now_ns`])
+    /// went on.
+    fn queue_post_waited(&self, queue: &QueueShared, since_ns: u64) {
+        let thread = std::thread::current();
+        log::warn!(
+            target: "reims_vgpu_graphics",
+            "a post onto queue {:#x}'s full completion ring waited {:.1} ms for room, on {}",
+            queue.obj_id,
+            now_ns().saturating_sub(since_ns) as f64 / 1e6,
+            thread.name().unwrap_or("an unnamed thread")
+        );
+        self.host.ring_degraded(RingDegradation::QueuePostWaited);
     }
 
     /// Posts `message` into `queue`'s completion ring, for work begun at reset count `epoch`, and
@@ -3026,7 +3085,10 @@ impl Shared {
                 return Post::Dropped;
             }
             match completion.post(&self.region, message) {
-                Posted::Yes { raise } => raise,
+                Posted::Yes { raise } => {
+                    queue.full.store(false, Ordering::Relaxed);
+                    raise
+                }
                 Posted::NoRoom => return Post::NoRoom,
                 Posted::Broken(broken) => {
                     log::warn!(
