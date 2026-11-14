@@ -16,6 +16,8 @@ mod host_ram;
 mod import;
 mod plane_copy;
 mod surface;
+#[cfg(test)]
+pub(crate) mod thread_counts;
 mod threads;
 mod vm;
 

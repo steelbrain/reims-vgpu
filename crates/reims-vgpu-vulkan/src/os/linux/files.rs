@@ -1295,4 +1295,128 @@ mod tests {
         );
         drop(held);
     }
+
+    /// What the table costs a view of scattered pages of the guest's RAM over its life, a page
+    /// (a measurement, not a check; run it by name with `--run-ignored only --no-capture` in a
+    /// release build): Feature Matching's no-copy buffers, views of up to 140,000 scattered
+    /// 4 KiB pages each, made beside each other. The table first holds `FILES_COST_RUNS`
+    /// one-page runs of other views (default 200,000), then each of `FILES_COST_VIEWS` views
+    /// (default 8) of `FILES_COST_PAGES` pages (default 16,384, 64 MiB) goes through what a
+    /// buffer over a pages block's view asks of the table on a device that imports views
+    /// mapped from their files (Iris Xe's ANV): the resolve of its sources and the record of
+    /// its pieces (`super::vm`'s `remap_runs_shared_overwrite`), the import's write check, the
+    /// gate's write check and dma-buf pieces (`super::import`), the runs of the guest's RAM the
+    /// runtime asks for (`super::host_ram::runs`), and the teardown's forget, a mebibyte at a
+    /// time (`super::vm`'s `deallocate`). Each step's user-space instructions and cycles a page,
+    /// the median of the views, are printed.
+    #[test]
+    #[ignore = "a measurement: run it by name"]
+    fn a_scattered_views_life_costs() {
+        let env = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let (others, views, pages) = (
+            env("FILES_COST_RUNS", 200_000),
+            env("FILES_COST_VIEWS", 8),
+            env("FILES_COST_PAGES", 16_384),
+        );
+        let page = 0x1000u64;
+        let f = file();
+        let ram_first = 0x7100_0000_0000u64;
+        let ram_pages = 4 * (views * pages).max(1 << 20);
+        let _ram = Registration::guest_ram(
+            ram_first,
+            ram_pages * page,
+            Backing {
+                fd: Arc::clone(&f),
+                offset: 0,
+            },
+        );
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        // Other views' runs, one page each, none following on in the file.
+        let others_first = 0x7300_0000_0000u64;
+        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        for i in 0..others {
+            let offset = 2 * next(ram_pages / 2) * page;
+            let backing = Backing {
+                fd: Arc::clone(&f),
+                offset,
+            };
+            record(others_first + i * page, page, backing, rw);
+        }
+        const STEPS: [&str; 8] = [
+            "resolve (view_pieces)",
+            "record (record_pieces)",
+            "import's writable",
+            "import's through_pieces",
+            "gate's writable",
+            "guest_ram_runs",
+            "forget (teardown)",
+            "the view's life",
+        ];
+        let mut figures: Vec<[[u64; 2]; 8]> = Vec::new();
+        let views_first = 0x7500_0000_0000u64;
+        for v in 0..views {
+            let sources: Vec<(u64, u64)> = (0..pages)
+                .map(|_| (ram_first + next(ram_pages) * page, page))
+                .collect();
+            let target = views_first + v * (pages + 16) * page;
+            let length = pages * page;
+            let end = target + length;
+            let mut step = [[0u64; 2]; 8];
+            let mut timed = |i: usize, f: &mut dyn FnMut()| {
+                let before = super::super::thread_counts::now();
+                f();
+                let after = super::super::thread_counts::now();
+                for k in 0..2 {
+                    step[i][k] += after[k] - before[k];
+                    step[7][k] += after[k] - before[k];
+                }
+            };
+            let mut resolved = Vec::new();
+            timed(0, &mut || resolved = view_pieces(&sources).unwrap());
+            assert_eq!(resolved.len() as u64, pages, "scattered: a piece a page");
+            timed(1, &mut || {
+                record_pieces(target, std::mem::take(&mut resolved))
+            });
+            timed(2, &mut || assert_eq!(writable(target, length), Some(true)));
+            timed(3, &mut || assert!(through_pieces(target, end).is_empty()));
+            timed(4, &mut || assert_eq!(writable(target, length), Some(true)));
+            let mut runs = None;
+            timed(5, &mut || runs = guest_ram_runs(target, length));
+            let runs = runs.unwrap();
+            assert_eq!(runs.iter().map(|r| r.1).sum::<u64>(), length);
+            timed(6, &mut || {
+                let mut at = target;
+                while at < end {
+                    let now = (end - at).min(1 << 20);
+                    forget(at, now);
+                    at += now;
+                }
+            });
+            assert!(pieces(target, length).is_none(), "forgotten");
+            figures.push(step);
+        }
+        eprintln!(
+            "a view of {pages} scattered pages beside {others} other runs, {views} views: \
+             user-space instructions / cycles a page, the median"
+        );
+        for (i, name) in STEPS.iter().enumerate() {
+            let median = |k: usize| {
+                let mut all: Vec<u64> = figures.iter().map(|s| s[i][k]).collect();
+                all.sort_unstable();
+                all[all.len() / 2] as f64 / pages as f64
+            };
+            eprintln!("  {name:<26} {:9.1} {:9.1}", median(0), median(1));
+        }
+    }
 }

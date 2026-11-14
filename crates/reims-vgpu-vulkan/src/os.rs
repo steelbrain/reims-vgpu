@@ -39,6 +39,10 @@ pub(crate) use host_os::learn_view_imports;
 /// platform's let-go of its devices ([`crate::let_go`]).
 #[cfg(target_os = "linux")]
 pub(crate) use host_os::take_ram_devices;
+/// The calling thread's user-space instructions and cycles, which cost tests count in, on Linux
+/// (`os/linux/thread_counts.rs`).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use host_os::thread_counts;
 /// Whether a view of several runs of pages made now is mapped through dma-bufs, on Linux
 /// (`os/linux/import.rs`).
 #[cfg(all(test, target_os = "linux"))]
