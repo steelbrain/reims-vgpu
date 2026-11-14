@@ -175,6 +175,8 @@ mod commit_order;
 mod composite_cost;
 mod compute;
 #[cfg(test)]
+mod dispatch_cost;
+#[cfg(test)]
 pub(super) mod draw_cost;
 mod dynamic_library;
 mod function_table;
