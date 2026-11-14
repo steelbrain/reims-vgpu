@@ -158,6 +158,10 @@ public:
 	/// Arms the ring (its `armed` set to 1, so the host raises the vector with its next
 	/// completion), then, after a full fence, whether the host published records this has
 	/// not taken: true means pump again before sleeping. False for a ringless reader.
+	/// A ring armed by an earlier call that found nothing, whose `producer` has not moved
+	/// since, is armed still, as the host clears `armed` only as it publishes a record: then
+	/// only `producer` is read, as the region's header is uncached memory to the guest and a
+	/// store there costs more than a load (RgfxRegion.hpp).
 	bool armAndCheck();
 
 	/// Whether the ring holds, among the records not yet taken, the host's word that the command
@@ -207,6 +211,10 @@ private:
 
 	std::mutex m_lock;
 	uint64_t m_consumed; // the guest's count: what it has taken
+	// The count at which an armAndCheck() that found nothing left the ring armed (kNotArmed:
+	// none did since a record came), so the next one need not arm it again (armAndCheck).
+	static constexpr uint64_t kNotArmed = ~0ull;
+	uint64_t m_armedAt = kNotArmed;
 	bool m_closed = false; // close(): the ring is not read again
 	std::atomic<bool> m_driven{false};
 

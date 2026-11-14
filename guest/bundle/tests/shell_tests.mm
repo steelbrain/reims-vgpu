@@ -19557,6 +19557,46 @@ void test_objects_outlive_an_uncommitted_buffer()
 	}
 }
 
+// The reader writes the ring's header, uncached memory to the guest, only where something
+// changed: a ring armed by an armAndCheck that found nothing is not armed again while the host
+// publishes nothing (it clears `armed` only as it publishes), and a pump that takes nothing
+// leaves `consumer` as it was. A record the host publishes is still seen at once, and the ring
+// is armed again after its take.
+void test_reply_reader_arms_once()
+{
+	TestRing ring(0x1000);
+	RgfxReplyReader reader(ring.base(), ring.dataSize);
+	CHECK(!reader.armAndCheck());
+	CHECK(ringArmed(ring) == 1);
+	// Marks the header's words where the reader would write them: a write would show.
+	auto setArmed = [&](uint32_t v) {
+		__atomic_store_n(reinterpret_cast<uint32_t *>(ring.mem.data() +
+		                                              __builtin_offsetof(RgfxRingHeader, armed)),
+		                 v, __ATOMIC_SEQ_CST);
+	};
+	setArmed(7);
+	ring.setConsumer(5);
+	CHECK(reader.pump() == 0);
+	CHECK(!reader.armAndCheck());
+	CHECK(ringArmed(ring) == 7 && ring.consumerCount() == 5);
+	ring.setConsumer(0);
+	setArmed(1);
+	// The host publishes and clears `armed` (ring.rs Producer::post): seen at once.
+	int fired = 0;
+	reader.expectCompletion(7, [&](const RgfxCbComplete &) { fired++; });
+	RgfxCbComplete done = cbComplete(7, 1);
+	CHECK(ring.postFromHost(&done, sizeof(done)));
+	setArmed(0);
+	CHECK(reader.armAndCheck());
+	CHECK(ringArmed(ring) == 1);
+	CHECK(reader.pump() == 1 && fired == 1);
+	CHECK(ring.consumerCount() == ring.produced);
+	setArmed(0);
+	// Taken since it was armed: armed again before the reader sleeps.
+	CHECK(!reader.armAndCheck());
+	CHECK(ringArmed(ring) == 1);
+}
+
 // A closed reader takes nothing more off its ring: no handler runs, the consumer stays, and
 // the ring is not armed.
 void test_reply_reader_close()
@@ -19755,6 +19795,7 @@ int main(int argc, char **argv)
 		test_command_buffer_keeps_once();
 		test_resource_ids();
 		test_reply_reader_arm();
+		test_reply_reader_arms_once();
 		test_reply_reader_holds_submitted();
 		test_completion_thread_runs_handlers();
 		test_wait_with_the_completion_thread();

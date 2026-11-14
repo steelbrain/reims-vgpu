@@ -185,6 +185,10 @@ bool RgfxReplyReader::armAndCheck()
 	std::lock_guard<std::mutex> guard(m_lock);
 	if (m_closed)
 		return false;
+	// Armed by a call that found nothing, and nothing taken since: where the host has published
+	// nothing since either, it is armed still, as the host clears `armed` only as it publishes.
+	if (m_armedAt == m_consumed && load64(m_header + kProducer) == m_consumed)
+		return false;
 	// The host's post publishes `producer`, fences, then reads and clears `armed`; this
 	// sets `armed`, fences, then reads `producer`. One of the two sees the other's write:
 	// either the host raises the vector, or this sees the record and pumps again.
@@ -192,6 +196,7 @@ bool RgfxReplyReader::armAndCheck()
 	                 __ATOMIC_SEQ_CST);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	uint64_t producer = load64(m_header + kProducer);
+	m_armedAt = producer == m_consumed ? m_consumed : kNotArmed;
 	return producer != m_consumed;
 }
 
@@ -273,6 +278,7 @@ uint32_t RgfxReplyReader::pump()
 		if (m_closed)
 			return 0;
 		uint64_t producer = load64(m_header + kProducer);
+		const uint64_t taken = m_consumed;
 		while (m_consumed != producer) {
 			uint32_t offset = static_cast<uint32_t>(m_consumed) & m_mask;
 			// Read `type` and `size` first (they fit before the ring's end, as the
@@ -386,8 +392,10 @@ uint32_t RgfxReplyReader::pump()
 			}
 			m_consumed += size;
 		}
-		// Publish the consumer count so the host's producer sees the room freed.
-		store64(m_header + kConsumer, m_consumed);
+		// Publish the consumer count so the host's producer sees the room freed, where it moved:
+		// the header is uncached memory to the guest (RgfxRegion.hpp).
+		if (m_consumed != taken)
+			store64(m_header + kConsumer, m_consumed);
 	}
 
 	for (auto &call : calls) {
