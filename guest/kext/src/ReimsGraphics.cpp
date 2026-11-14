@@ -7,6 +7,7 @@
 #include "RgfxAccelerator.hpp"
 #include "RgfxAnswerLook.hpp"
 #include "RgfxBootConsole.hpp"
+#include "RgfxCompletionArm.hpp"
 #include "RgfxControlRing.hpp"
 #include "RgfxDisplayPower.hpp"
 #include "RgfxFeatures.hpp"
@@ -754,17 +755,22 @@ void ReimsGraphics::service()
 }
 
 // The completion ring drained, then its interrupt armed and the ring looked at again, so an event
-// published meanwhile is never left without one: in the work loop's gate (service, takeAction).
+// published meanwhile is never left without one; armed only where something changed since the
+// last arm found it empty (RgfxCompletionArm.hpp): in the work loop's gate (service, takeAction).
 void ReimsGraphics::takeCompletions()
 {
-	volatile UInt8 *events = ring(RGFX_CONTROL_COMPLETE_OFFSET);
-	for (;;) {
-		drainEvents();
-		store32(events + kRingArmed, 1);
-		fullFence();
-		if (load64(events + kRingProducer) == consumed)
-			break;
-	}
+	struct Ring {
+		ReimsGraphics *self;
+		volatile UInt8 *events;
+		uint64_t producer() { return load64(events + kRingProducer); }
+		void take(uint64_t end) { self->drainEvents(end); }
+		void arm()
+		{
+			store32(events + kRingArmed, 1);
+			fullFence();
+		}
+	} completions = {this, ring(RGFX_CONTROL_COMPLETE_OFFSET)};
+	rgfxTakeAndArm(completions, consumed, armedAt);
 }
 
 // A waiter's take of the completion ring (lookForAnswer), in the work loop's gate as the work
@@ -806,12 +812,11 @@ void ReimsGraphics::lookForAnswer(const LifecycleWaiter *w)
 	gate->release();
 }
 
-bool ReimsGraphics::drainEvents()
+void ReimsGraphics::drainEvents(UInt64 end)
 {
 	volatile UInt8 *header = ring(RGFX_CONTROL_COMPLETE_OFFSET);
 	volatile UInt8 *bytes = header + RGFX_RING_HEADER_SIZE;
-	UInt64 end = load64(header + kRingProducer);
-	bool any = consumed != end;
+	const UInt64 from = consumed;
 	while (consumed != end) {
 		static char outOfRange;
 		if (end - consumed > kRingBytes) {
@@ -848,8 +853,8 @@ bool ReimsGraphics::drainEvents()
 		handleEvent(type, seqno, m + kHeaderBytes, size - kHeaderBytes);
 		consumed += size;
 	}
-	store64(header + kRingConsumer, consumed);
-	return any;
+	if (consumed != from)
+		store64(header + kRingConsumer, consumed);
 }
 
 void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 *payload, UInt32 size)
@@ -1569,6 +1574,7 @@ bool ReimsGraphics::start(IOService *provider)
 	}
 	produced = load64(ring(RGFX_CONTROL_SUBMIT_OFFSET) + kRingProducer);
 	consumed = load64(ring(RGFX_CONTROL_COMPLETE_OFFSET) + kRingConsumer);
+	armedAt = kRgfxNotArmed;
 	writeRegister(RGFX_REG_STATUS, RGFX_STATUS_DRIVER_READY);
 	ready = true;
 	msix->enable();

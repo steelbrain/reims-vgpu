@@ -456,7 +456,9 @@ private:
 	void takeCompletions();
 	static IOReturn takeAction(OSObject *owner, void *, void *, void *, void *);
 	void lookForAnswer(const LifecycleWaiter *w);
-	bool drainEvents();
+	// Takes the completion ring's records up to the producer `end`, and stores the consumer where
+	// it moved.
+	void drainEvents(UInt64 end);
 	void handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 *payload, UInt32 size);
 	UInt32 parseDisplays(const volatile UInt8 *payload, UInt32 size);
 	void answer(UInt64 seqno, UInt32 status);
@@ -512,8 +514,10 @@ private:
 	UInt32 hotX;
 	UInt32 hotY;
 
-	// The completion ring's bytes consumed: the work loop's alone.
+	// The completion ring's bytes consumed, and the count at which its last arm found it empty
+	// (RgfxCompletionArm.hpp): the work loop's alone.
 	UInt64 consumed;
+	UInt64 armedAt;
 
 	// The control ring's room (roomMark, waitForRoom): the work loop's passes, which it moves
 	// at each, and the posts waiting for room, which a pass wakes under stateLock. Atomic.
