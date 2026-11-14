@@ -121,9 +121,10 @@
 //! surface's planes as Metal's GPU does, a kernel's and a fragment function's
 //! (`writes_of_444_textures_are_metals`, `fragment_writes_of_444_textures_are_metals`), and drops
 //! a 4:2:0 or 4:2:2 one's and the packed 510's and 530's, as Metal's GPU drops them on this host
-//! (`kernel_writes_metal_drops_are_dropped_as_metals`). Metal's kernel stores into a texture of
-//! the `_sRGB` twins 523 and 527 change its planes by a rule the runtime does not hold; the
-//! runtime's stores of them are not compared.
+//! (`kernel_writes_metal_drops_are_dropped_as_metals`). It stores the `_sRGB` twins 523's and
+//! 527's writes and passes by Metal's rule too (dgpu-oracle.md Q40), and a write through an
+//! argument buffer as the same write through a slot (`plane_writes`); its stores of 523 and 527
+//! are not compared with Metal's bytes here.
 //!
 //! Not measured: anisotropic filtering (a texture over an IOSurface has one level).
 

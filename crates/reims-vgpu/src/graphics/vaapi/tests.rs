@@ -648,7 +648,10 @@ fn cache_target(
             )
             .expect("no raise")
             .expect("a cache made as any other");
-        let shadows = || reader.device.raw.work_counts().shadowed_textures;
+        let shadows = || {
+            let c = reader.device.raw.work_counts();
+            c.shadowed_textures + c.shadows_left_unmade - c.shadows_made_at_use
+        };
         let route = |shadowed: bool| ["over its memory", "a shadow"][usize::from(shadowed)];
         let planes = [0, 1].map(|n| {
             let descriptor = platform.texture_descriptor(&TextureDesc {

@@ -3,10 +3,9 @@
 //! ([`crate::core::platform::resource::Buffer::new_texture_over_surface_plane`] with the surface's
 //! facts): a kernel's and a fragment function's `write()`, a kernel's `write()` through an
 //! argument buffer, a blit from a buffer and a pass. The runtime stores a write of a 4:4:4
-//! two-plane format into its planes as Metal's GPU does where `metal::format::ycbcr_writes_stored`
-//! says so, and refuses the rest where they are encoded, which dies there: the `_sRGB` ones (523,
-//! 527), whose stores Metal encodes by a rule it does not hold (dgpu-oracle.md Q40), through a
-//! slot or a pass, and every format of the family through an argument buffer.
+//! two-plane format into its planes as Metal's GPU does, the `_sRGB` ones (523, 527) included,
+//! whose stores and passes it encodes by Metal's rule (dgpu-oracle.md Q40), and a write through
+//! an argument buffer stores or drops as the same write through a slot does.
 use crate::core::platform::Platform as _;
 use crate::core::platform::blit::{BlitCmd, BlitEncoder as _, ResourceRef};
 use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
@@ -335,9 +334,6 @@ const SIZE: (u64, u64) = (32, 16);
 /// `rgbx_write_held_float` writes 16 by 16 texels.
 const HELD: (u64, u64) = (16, 16);
 
-/// What the runtime answers when it refuses a bind state: a write it does not store.
-const BIND_REFUSED: &str = "the bind state was refused";
-
 /// What `f` came to: `Ok` of its answer where it completed, else where it died and the line its
 /// death named.
 fn outcome<R>(f: impl FnOnce() -> R) -> Result<R, (&'static str, String)> {
@@ -358,14 +354,13 @@ fn changed(
     outcome(|| written(op, format, ostype, size)).map(|(before, after)| before != after)
 }
 
-/// A kernel's and a fragment function's write of a 4:4:4 `_sRGB` two-plane texture (523, 527)
-/// over a guest's surface plane dies where it is encoded, at the runtime's refusal of the bind
-/// state, and a pass into one at its creation, naming the format: the runtime stores neither as
-/// Metal's GPU does (`metal::format::ycbcr_writes_stored`). A blit into one from a buffer, which
-/// moves bytes no format's rule changes, completes. Every write into a texture of the 4:4:4
-/// formats whose writes the runtime stores (503, 507, 542, 545) completes, changing the planes.
+/// Every write into a texture of a 4:4:4 two-plane format over a guest's surface plane completes
+/// and changes the planes, as Metal's GPU stores it: a kernel's and a fragment function's
+/// `write()`, a blit from a buffer and a pass, for the formats whose writes the runtime stored
+/// before (503, 507, 542, 545) and for their `_sRGB` twins (523, 527), which the runtime stores
+/// by Metal's rule since its RUNTIME 2305.
 #[test]
-fn writes_over_surface_planes_are_stored_or_die_where_encoded() {
+fn writes_over_surface_planes_are_stored() {
     for (format, ostype) in [
         (503, b"444v"),
         (523, b"444v"),
@@ -374,61 +369,50 @@ fn writes_over_surface_planes_are_stored_or_die_where_encoded() {
         (527, b"x444"),
         (545, b"x444"),
     ] {
-        let refused = matches!(format, 523 | 527);
         for op in [Op::Kernel, Op::Fragment, Op::FromBuffer, Op::Clear] {
             let got = changed(op, format, ostype, SIZE);
-            let at = match (refused, op) {
-                (true, Op::Kernel) => {
-                    Some(("dispatchThreads:threadsPerThreadgroup:", BIND_REFUSED))
-                }
-                (true, Op::Fragment) => {
-                    Some(("drawPrimitives:vertexStart:vertexCount:", BIND_REFUSED))
-                }
-                (true, Op::Clear) => Some(("renderCommandEncoderWithDescriptor:", "pixel format")),
-                _ => None,
-            };
-            match (at, &got) {
-                (None, Ok(true)) => {}
-                (Some((site, named)), Err((died, line))) => {
-                    assert_eq!(*died, site, "{format} {op:?}: {line}");
-                    assert!(line.contains(named), "{format} {op:?}: {line}");
-                    if op == Op::Clear {
-                        assert!(line.contains(&format!("pixel format {format} ")), "{line}");
-                    }
-                }
-                _ => panic!("{format} {op:?}: {got:?}, where {at:?} was expected"),
-            }
+            assert!(matches!(got, Ok(true)), "{format} {op:?}: {got:?}");
         }
     }
 }
 
 /// A kernel's write through an argument buffer that holds a two-plane YCbCr texture over a
-/// guest's surface plane, made resident for writing, dies where it is encoded, at the runtime's
-/// refusal of the bind state, for every format of the family: those whose writes through a slot
-/// the runtime stores (503, 507, 542, 545) or drops as Metal's GPU does (500, a 4:2:0 one) too,
-/// which is the runtime's gap (Metal's answer through an argument buffer is not measured). A
-/// `BGRA8Unorm` texture over a buffer written so completes, its bytes written.
+/// guest's surface plane, made resident for writing, completes and stores or drops as the same
+/// write through a slot does (the runtime's SEMANTICS 2114): the 4:4:4 formats' writes (503, 507,
+/// 542, 545 and their `_sRGB` twins 523, 527) change the planes, and the 4:2:0 500's, which
+/// Metal's GPU drops on this host, leaves them as they were. A `BGRA8Unorm` texture over a buffer
+/// written so completes, its bytes written.
+///
+/// 500's is checked as the process runs by default, not strict. Where the device's own sampler
+/// Y′CbCr conversion reads 500's planes (Iris Xe; the Mac's runtime reads them in place), the
+/// dispatch announces `ycbcr-filter-not-exact` for the texture the argument buffer holds, though
+/// the kernel only writes it: strict, that dies at the dispatch, and the test takes that death
+/// and no other.
 #[test]
-fn writes_through_argument_buffers_of_two_plane_ycbcr_textures_die_where_encoded() {
-    for (format, ostype) in [
-        (500, b"420v"),
-        (503, b"444v"),
-        (523, b"444v"),
-        (542, b"444v"),
-        (507, b"x444"),
-        (527, b"x444"),
-        (545, b"x444"),
+fn writes_through_argument_buffers_of_two_plane_ycbcr_textures_are_the_slots() {
+    for (format, ostype, stored) in [
+        (503, b"444v", true),
+        (523, b"444v", true),
+        (542, b"444v", true),
+        (507, b"x444", true),
+        (527, b"x444", true),
+        (545, b"x444", true),
     ] {
         let got = changed(Op::Held, format, ostype, HELD);
-        match &got {
-            Err((died, line)) => {
-                assert_eq!(
-                    *died, "dispatchThreads:threadsPerThreadgroup:",
-                    "{format}: {line}"
-                );
-                assert!(line.contains(BIND_REFUSED), "{format}: {line}");
-            }
-            Ok(_) => panic!("{format}: {got:?}"),
+        assert_eq!(got, Ok(stored), "{format}");
+    }
+    let got = crate::answer::relaxed(|| changed(Op::Held, 500, b"420v", HELD));
+    assert_eq!(got, Ok(false), "500");
+    match changed(Op::Held, 500, b"420v", HELD) {
+        Ok(changed) => assert!(!changed, "500 strict"),
+        Err((site, line)) => {
+            assert_eq!(
+                site, "dispatchThreads:threadsPerThreadgroup:",
+                "500 strict: {line}"
+            );
+            let named =
+                "the Vulkan runtime degraded it (metal2vulkan-degrade-ycbcr-filter-not-exact)";
+            assert!(line.starts_with(named), "500 strict: {line}");
         }
     }
     let (w, h) = HELD;

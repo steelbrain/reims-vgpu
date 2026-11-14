@@ -2494,7 +2494,7 @@ pub(crate) mod tests {
             let counts = d.raw.work_counts();
             (
                 counts.unobserved_padding_aliases,
-                counts.shadowed_textures,
+                counts.shadowed_textures + counts.shadows_left_unmade - counts.shadows_made_at_use,
                 counts.kept_padding_aliases,
             )
         };
@@ -2576,7 +2576,10 @@ pub(crate) mod tests {
         settle_device_checks(&d);
         let counts = || {
             let counts = d.raw.work_counts();
-            (counts.unobserved_padding_aliases, counts.shadowed_textures)
+            (
+                counts.unobserved_padding_aliases,
+                counts.shadowed_textures + counts.shadows_left_unmade - counts.shadows_made_at_use,
+            )
         };
         let unit = d
             .raw
@@ -2726,13 +2729,17 @@ pub(crate) mod tests {
                 )
                 .unwrap()
                 .expect("a buffer");
-            let before = d.raw.work_counts().shadowed_textures;
+            let shadows = || {
+                let c = d.raw.work_counts();
+                c.shadowed_textures + c.shadows_left_unmade - c.shadows_made_at_use
+            };
+            let before = shadows();
             let texture = buffer.new_texture(OnFault::Return, &desc, 0, pitch);
             assert!(
                 matches!(texture, Ok(Some(_))),
                 "{width}x{height}: a texture"
             );
-            let shadows = d.raw.work_counts().shadowed_textures - before;
+            let shadows = shadows() - before;
             let rows_on_lines = line > 0 && pitch.is_multiple_of(line) && row.is_multiple_of(line);
             let verdict = match rows_on_lines {
                 true => "Pooled unobserved renders, rows on lines: ",

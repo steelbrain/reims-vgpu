@@ -642,7 +642,10 @@ fn the_answer_over_the_pages_is_what_the_runtimes_making_does() {
                 > before.host_texture_shadows_refused_image
             {
                 Over::Neither
-            } else if after.shadowed_textures > before.shadowed_textures {
+            } else if after.shadowed_textures + after.shadows_left_unmade
+                - after.shadows_made_at_use
+                > before.shadowed_textures + before.shadows_left_unmade - before.shadows_made_at_use
+            {
                 Over::Cache(String::new())
             } else {
                 Over::Neither

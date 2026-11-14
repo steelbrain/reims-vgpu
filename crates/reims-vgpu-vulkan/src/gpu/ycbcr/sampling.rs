@@ -2516,7 +2516,9 @@ fn fragment_writes_of_444_textures_are_metals() {
 }
 
 /// A kernel's `write()` into a texture of 503, 507, 542 or 545 over a surface stores its codes
-/// into the surface's planes as Metal's does, byte for byte
+/// into the surface's planes as Metal's does, byte for byte; one into a texture of their `_sRGB`
+/// twins 523 and 527 stores into the planes too, its bytes not compared with Metal's, of which
+/// none are recorded
 #[test]
 fn writes_of_444_textures_are_metals() {
     let size = (32, 16);
@@ -2525,13 +2527,15 @@ fn writes_of_444_textures_are_metals() {
         metal2vulkan::metal::format::ycbcr_writes_stored(pf)
     });
     let stored: Vec<u64> = stored.collect();
-    assert_eq!(stored, [503, 507, 542, 545]);
+    assert_eq!(stored, [503, 507, 523, 527, 542, 545]);
     for format in stored {
         let (s, other) = noisy_pair(format, size, 9);
         let before = bytes_of(&s);
         let ours = written(&platform(), &dev(), Op::Kernel, format, (&s, &other), size);
         assert!(ours[0] != before, "{format}'s planes");
-        crate::metal_check_raw!(format!("{format}"), ours);
+        if ![523, 527].contains(&format) {
+            crate::metal_check_raw!(format!("{format}"), ours);
+        }
     }
 }
 
