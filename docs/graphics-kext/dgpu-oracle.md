@@ -12,7 +12,7 @@ The probes are in `guest/bundle/tools/oracle` ([README](../../guest/bundle/tools
 `oracle_errors`, `oracle_source`, `oracle_ycbcr`, `oracle_ca_ycbcr`, `oracle_sampler`,
 `oracle_icb`, `oracle_order`, `oracle_names`, `oracle_surftex`, `oracle_reflection`,
 `oracle_mesh`, `oracle_events`, `oracle_texdesc`, `oracle_nilbind`, `oracle_complete`,
-`oracle_residency`, `oracle_threads` and `oracle_overlap`; the upload costs (Q17) are `guest/bundle/tools/upload_probe.m`'s.
+`oracle_residency`, `oracle_threads`, `oracle_overlap` and `oracle_readonly`; the upload costs (Q17) are `guest/bundle/tools/upload_probe.m`'s.
 
 **Machines.** Every claim below is measured, on:
 - **AMD**: AMD Radeon Pro 5300M (Navi 14, `amdgpu_gfx1012`, 4 GB; AMDRadeonX6000 on
@@ -1978,6 +1978,51 @@ Macs'. Until 11-13 such a texture raised `RowPitch` where it was wider than the 
 where it fitted the pitch. On an arm64 macOS 27.0.1 guest on the M3 the eight cases now answer as
 the M3 does natively (before: the wide texture refused, so its writes never landed and the narrow
 texture's never reached it).
+
+## Q38: writes into read-only memory
+
+Probe: `oracle_readonly.sh DEVICE` (`oracle_readonly`), 11-14, every shape in a process of its
+own, against a writable control (`plain`): the M3 Max under macOS 27.0.1 (26A434), m3-max-29292
+(2 runs a shape) and m3-max-29309 (4 runs of the shapes it asked again); the AMD 5300M and the
+Intel UHD 630 under macOS 26.7.1 (25G241), m3-max-29293 and m3-max-29294, then m3-max-29310 and
+m3-max-29311 (2 runs a shape each). Read-only memory is a no-copy buffer over the process's pages
+or a heap made with `MTLResourceOptions` bit 24, Metal's private read-only option, which the
+guest's no-copy buffers over memory its process maps read-only carry (design.md, "No-copy
+buffers"), or a buffer over pages the process maps read-only (`ro-pages-`). Each shape's command
+buffer is sent twice on one queue, with a fill on the same queue and on a new one after each.
+
+**On the x86 Macs bit 24 does nothing.** Every GPU write below lands in the pages (or the heap's
+texture) and completes, as without the bit, on both GPUs. Over pages the process maps read-only,
+every GPU write measured (a pass's store, colour resolve and `StoreAndMultisampleResolve`, a
+fragment or vertex function's and a kernel's `write()`, a blit's copy) completes, the pages
+unchanged. The M3 Max keeps the GPU's writes out under bit 24 and over read-only pages alike.
+
+| what, into read-only memory | M3 Max | AMD 5300M and Intel UHD 630 | class |
+|---|---|---|---|
+| a pass's store-out: a colour `Store`; a colour `MultisampleResolve` or `StoreAndMultisampleResolve` into it, the descriptor's or late, into the descriptor's resolve texture or one the setter's SPI named under a known action; a depth or stencil `Store`; a depth `CustomSampleDepthStore`, the descriptor's or late; a depth `MultisampleResolve` and a stencil `MultisampleResolve` or `StoreAndMultisampleResolve`, the descriptor's or late, a depth one into a late texture too | `PageFault` (3), every first command buffer, the event signalled and the memory unchanged; the next command buffer of the queue and of a new queue run; the second command buffer faults too and revokes the queue (`AccessRevoked`, 4), but for a stencil `StoreAndMultisampleResolve`'s 4 runs of 6, whose second fails with code 1 (`kIOGPUCommandBufferCallbackErrorInnocentVictim`), the queue running on | completes, the memory written | 2 |
+| a depth attachment's `StoreAndMultisampleResolve` into it | completes, 4 runs of 6 (2 failed with code 1, `kIOGPUCommandBufferCallbackErrorInnocentVictim`), the second command buffer 2 of 6 (4 the same victims), never `PageFault`, the queue never revoked; the resolve texture unchanged | completes, 4 of 4 each, the resolve texture written | 3 |
+| a pass that does not store it: `DontCare` of colour, depth or stencil; a colour or stencil `CustomSampleDepthStore` set late; a resolve the pass makes into a texture of a format pair Metal leaves untouched (BGRA8 into RGBA16Float) | completes, the memory unchanged | completes; the untouched pair's resolve written | 3 (the untouched pair: 2) |
+| a colour or stencil attachment the descriptor keeps by `CustomSampleDepthStore` | ends the process in the descriptor's validation (`abort`), with the bit or without | the same | 3 |
+| a fragment or vertex function's `write()` of a texture over it | `PageFault`, every first command buffer; the second faults and revokes the queue, but 2 runs of 12 whose second fails with code 1, the queue running on | completes, the pages written | 2 |
+| a texture over it made resident for writing that no function writes | completes | completes | 3 |
+| a kernel's `write()`; a blit's copy into a texture over it; mipmaps of a heap's texture | completes, the writes dropped (`mipmaps-shared`: level 1 of a Shared heap's texture whose level 0 the CPU wrote stays zeros, written without the bit) | completes, written | 2 |
+| a blit's colour or bytes fill and an invalidation of such a texture (the `fillTexture:` and `invalidateCompressedTexture:` SPI) | completes, the writes dropped | ends the process, with the bit or without: the SPI is not the x86 drivers' | 2 |
+| the CPU's `replaceRegion:` of a texture over a bit-24 buffer of writable pages | the pages take the bytes, which the GPU reads | the same | 3 |
+| the CPU's `replaceRegion:` of a texture in a Shared heap of bit 24 | the texture takes the bytes, which a blit reads back | no Shared heap is made | 3 (the M3 alone) |
+| the CPU's `replaceRegion:` of a texture over pages the process maps read-only | ends the process (`SIGBUS`), with the bit or without | the same | 3 |
+| a late colour resolve texture where the pass named none, under a late resolving action | completes, nothing resolved, with the bit or without | the 5300M ends the process at `endEncoding` (`SIGSEGV`); the 630 fails the command buffer (code 9), with the bit or without | 2 |
+
+What our stack does: on Linux the runtime makes read-only memory over a copy of its pages whose
+GPU writes it drops (accuracy-ledger.md, `read-only-pages-written`). A store-out faults the
+command buffer as the M3 Max's does *(class 2: the runtime's own fault, which costs nothing)*;
+every other GPU write completes with its write dropped *(class 2 or 3: the draw's `write()`,
+which the M3 Max faults, takes the x86 Macs' completion, the cheaper)*; a CPU write writes the
+pages where the process can, and ends the process over pages it maps read-only *(class 3)*. A
+depth attachment's `StoreAndMultisampleResolve` into such memory ends the process where the pass
+is made, or at the late store action or resolve texture: the runtime (metal2vulkan 20f7e82bbe)
+faults it where all three Macs complete it *(class 4: outside the envelope; metal2vulkan takes
+it on, to complete it with the resolve dropped)*. On macOS MoltenVK hands Metal the pages, or a
+read-only view of them, and Metal answers.
 
 ## Not measured
 

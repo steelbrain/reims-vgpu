@@ -3172,7 +3172,12 @@ drops as Metal drops them: Metal makes a buffer over read-only memory whose GPU
 reads see the memory and whose blit fills and kernel stores complete with their
 writes dropped, a file mapped under it unchanged (the AMD 5300M and the Intel
 UHD 630, `oracle_bundle` `nocopy.ro`; the M3, accuracy-ledger.md
-`read-only-pages-written`, whose row the host's drop follows). Over any other
+`read-only-pages-written`, whose row the host's drop follows). A texture over
+such a buffer takes the same answers: a draw's, a kernel's or a blit's write of
+it completes, dropped, and a render pass that stores into it or resolves into
+it fails its command buffer with a page fault, as the M3's does, where the x86
+Macs, on which bit 24 does nothing, complete it and write the pages
+(dgpu-oracle.md Q38). Over any other
 memory (read-only Managed memory, whose copies the host would write back to
 its pages; read-only memory where the kext makes no block of it; a Managed
 buffer's where the device makes no Managed buffer over a Shared one; or memory

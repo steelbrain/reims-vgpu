@@ -29,46 +29,60 @@
 //!   an object not made resident for writing names nothing and is not seen: it reaches the pages.
 //! - **The guest's read-only objects** (a no-copy buffer or heap made with `MTLResourceOptions`
 //!   bit 24 or over pages mapped read-only; [`Kept::Copied`]; [`crate::os::COPIES_READ_ONLY`]),
-//!   which the runtime makes
-//!   over a copy of the pages whose GPU writes it drops, as Metal's GPU drops them: a write through
-//!   a buffer over it is sent (a shader's store through a slot or a loaded address, a blit's fill
-//!   or copy into the buffer, a pass's visibility results), and so is a pass whose attachment lies
-//!   in it but does not store it (`DontCare`, `MultisampleResolve` out of it); a pass that stores
-//!   such an attachment (`Store`, `StoreAndMultisampleResolve`, and a depth attachment's
-//!   `CustomSampleDepthStore`), or resolves a colour attachment into such a texture by
-//!   `MultisampleResolve`, fails its command buffer with Metal's page fault, as the runtime faults
-//!   it itself, the fault counting against its queue as Metal's does: the queue's second revokes
-//!   it (`crate::gpu::encode_render`, `crate::gpu::command`); a kernel's write of a texture over
-//!   it and a blit's copy into one are sent and dropped (`crate::gpu::predication`,
-//!   `crate::gpu::encode_blit`); and another resolve into such a texture
-//!   (`StoreAndMultisampleResolve`, a depth or stencil resolve, a resolve texture a late setter
-//!   named), a colour or stencil attachment kept there by `CustomSampleDepthStore`, a draw's
-//!   write of such a texture, another blit's write of one (a fill, mipmaps), and a CPU write of
-//!   one die as [`kept_write`], as what Metal does there is unmeasured, or ends the process.
+//!   which the runtime makes over a copy of the pages whose GPU writes it drops: every GPU write
+//!   there is sent and completes, its write dropped (a shader's store through a slot or a loaded
+//!   address, a draw's or a kernel's write of a texture, a blit's fill, copy or mipmaps, a pass's
+//!   visibility results, an attachment the pass does not store, a resolve the pass does not
+//!   make), but a render pass's store-out, which fails its command buffer with Metal's page
+//!   fault, as the runtime faults it itself, the fault counting against its queue as Metal's
+//!   does: the queue's second revokes it (`crate::gpu::encode_render`, `crate::gpu::command`).
+//!   A store-out is an attachment stored (`Store`, `StoreAndMultisampleResolve`, and a depth
+//!   attachment's `CustomSampleDepthStore`), or a resolve into such a texture (a colour or
+//!   stencil attachment's `MultisampleResolve` or `StoreAndMultisampleResolve`, a depth
+//!   attachment's `MultisampleResolve`, into the descriptor's resolve texture or a late
+//!   setter's). A depth attachment's `StoreAndMultisampleResolve` into such a texture, which the
+//!   runtime faults where Metal's GPU completes it, dies as [`kept_write`]. A CPU write of a
+//!   texture over such memory (`replaceRegion:`) writes the pages where the process can write
+//!   them, and dies over pages it maps read-only, as Metal's ends the process there
+//!   (`crate::gpu::resource`).
 //!
 //! On macOS neither is taken: MoltenVK hands Metal the pages, or a read-only view of them made
 //! with bit 24, and Metal's GPU answers every write there itself.
 //!
-//! What Metal does there, measured on an M3 Max (macOS 27.0.1) by metal2vulkan's probes
-//! (`read_only_view.rs`, `probes/readonly_gpu_writes.m`), 2026-10-25 and since: it completes a
-//! draw or a dispatch whose shader stores may write through read-only memory (through a bound
-//! slot or a loaded address, `drawIndexedPrimitives` among them), a blit fill into it and a pass
-//! that keeps its visibility results in it, and drops those writes, over 8,314 runs; a colour,
-//! depth or stencil attachment of it stored back (`Store`), a multisample primary among them,
-//! fails the command buffer (`MTLCommandBufferErrorDomain`, a page fault) every run, the next
-//! command buffer of its queue and of a new queue running, and every command buffer of the queue
-//! after its second fault failing (`MTLCommandBufferErrorAccessRevoked`; m3-max-29110,
-//! m3-max-28796 and m3-max-28797, plain Metal; the runtime's `command_buffer/revocation.rs`); the
-//! same attachments under `DontCare` or `Load` complete, as does a resolve texture attached and not
-//! resolved into and a resolve out of a read-only primary. A multisample colour attachment's
-//! `MultisampleResolve` into such a texture, and a depth attachment in a heap of bit 24 kept by
-//! `CustomSampleDepthStore`, each by the descriptor's action or one the encoder set, fail it so
-//! too (m3-max-28796 and m3-max-28797; the runtime's `store_out.rs`). A texture over such memory
-//! takes a kernel's `write()` and a blit's copy into it, out of a buffer or a texture, nowhere:
-//! each completes with no error and leaves the pages as they were (the runtime's
-//! `read_only_view.rs`). Another resolve into such memory is unknown, and so are a blit's copy
-//! into a buffer there and a draw's or another blit's write of a texture there, which no probe
-//! made.
+//! What Metal does there, measured by metal2vulkan's probes (`read_only_view.rs`,
+//! `probes/readonly_gpu_writes.m`) on the M3 Max (macOS 27.0.1), 2026-10-25 and since, and by
+//! this platform's probe of every write it answered by ending the process (2026-11-14, plain
+//! Metal, one shape a process, against a writable control) on the M3 Max and on the dGPU oracle's
+//! Radeon Pro 5300M and UHD Graphics 630 (macOS 26.7.1, the x86 guests' line; m3-max-29292 to
+//! m3-max-29294 and m3-max-29309 to m3-max-29311; `docs/graphics-kext/dgpu-oracle.md`):
+//! - **On the M3 Max** bit 24, and pages the process maps read-only alike, keep the GPU's writes
+//!   out. It completes a draw or a dispatch whose shader stores may write through such memory
+//!   (through a bound slot or a loaded address, `drawIndexedPrimitives` among them), a kernel's
+//!   `write()` of a texture there, a blit's fill, copy, colour fill or mipmaps into it and a pass
+//!   that keeps its visibility results in it, and drops those writes, over 8,314 runs and every
+//!   run since. A pass's store-out into it fails the command buffer
+//!   (`MTLCommandBufferErrorPageFault`) every run, its signal firing, the next command buffer of
+//!   its queue and of a new queue running, and every command buffer of the queue after its second
+//!   fault failing (`MTLCommandBufferErrorAccessRevoked`; m3-max-29110, m3-max-28796,
+//!   m3-max-28797, m3-max-29292, m3-max-29309; the runtime's `command_buffer/revocation.rs`), and
+//!   so does a fragment or vertex function's `write()` of a texture there. A depth attachment's
+//!   `StoreAndMultisampleResolve` into it completes (4 runs of 6; the other 2 failing as innocent
+//!   victims of a recovery, code 1), the resolve texture unchanged. The same attachments under
+//!   `DontCare` or `Load` complete, as does a resolve texture attached and not resolved into, a
+//!   resolve out of a read-only primary and a resolve of a format pair Metal leaves untouched.
+//! - **On the Radeon Pro 5300M and the UHD Graphics 630** bit 24 changes nothing: every write
+//!   above lands in the pages and every command buffer completes, as without the bit. Over pages
+//!   the process maps read-only, every GPU write measured (a pass's store and resolves, a draw's
+//!   and a kernel's texture writes, a blit's copy) completes, the pages unchanged.
+//! - **On all three** a CPU `replaceRegion:` of a texture over a bit-24 buffer writes the pages,
+//!   and of one over pages the process maps read-only ends the process with a bus error, with the
+//!   bit or without; and a colour or stencil attachment that the pass descriptor keeps by
+//!   `CustomSampleDepthStore` ends the process in the descriptor's validation, with the bit or
+//!   without.
+//!
+//! Where these GPUs differ, the envelope holds each answer, and this platform takes the cheaper:
+//! the runtime's fault at a store-out (the M3 Max's), and completion with the writes dropped
+//! elsewhere.
 use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;

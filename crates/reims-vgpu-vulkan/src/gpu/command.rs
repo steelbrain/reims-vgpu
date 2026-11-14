@@ -139,10 +139,14 @@
 //!   encoders, its protection options, or another type-9 draw's other failure, dies at the commit, as do two different ways at once of any
 //!   kind, which nothing measured.
 //!
-//!   At a render pass that stores an attachment into read-only memory the runtime copies
-//!   (`Store`, `StoreAndMultisampleResolve`), Metal's GPU faults the command buffer
+//!   At a render pass that stores an attachment into read-only memory the runtime copies, or
+//!   resolves into a texture there (`Store`, `StoreAndMultisampleResolve`, a depth attachment's
+//!   `CustomSampleDepthStore`; a colour or stencil attachment's `MultisampleResolve` and
+//!   `StoreAndMultisampleResolve`, a depth attachment's `MultisampleResolve`: the store-outs of
+//!   `crate::gpu::writes`), the M3 Max's GPU faults the command buffer
 //!   (`kIOGPUCommandBufferCallbackErrorPageFault`, measured on the M3 Max, macOS 27.0.1, by
-//!   metal2vulkan's `probes/readonly_gpu_writes.m`), and the runtime faults it so itself
+//!   metal2vulkan's `probes/readonly_gpu_writes.m` and plain Metal, m3-max-29292 and
+//!   m3-max-29309), and the runtime faults it so itself
 //!   (`MTLCommandBufferErrorPageFault`, 3; the runtime's `store_out.rs`): its render encoder and
 //!   every encoder after it run nothing and every event signal fires, as a type-9 draw's page
 //!   fault does. Which encoders before the pass run is not measured for this fault. Such a pass
