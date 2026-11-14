@@ -40,8 +40,19 @@
 // A frame is two command buffers (uploads, shadow, the ICB's encode and the scene; then post,
 // UI, composite and read-back), FRAMES_IN_FLIGHT at most in flight.
 //
+// The buffers the GPU reads and the CPU writes are Shared by default, the frame's constants and
+// the materials' argument buffers each frame and the ICBs' argument buffers once, so a discrete
+// GPU reads them in system memory. --private NAME,... puts each named one in a Private buffer
+// instead, which the GPU reads in its own memory:
+//   frame      the frame's constants, copied from their Shared buffer by a blit at the start of
+//              the frame's first command buffer (in the upload blit where there is one).
+//   materials  the materials' argument buffers, copied the same way where the CPU encodes them
+//              each frame (heap on), else once before the frames.
+//   args       the ICB's and the compute ICB's argument buffers, copied once before the frames.
+//
 //   gameload [-d NAME] [-f FRAMES] [-w WARMUP] [-s WxH] [-n DRAWS] [-i ICB_OBJECTS]
-//            [-c CICB_COMMANDS] [-k FRAMES_IN_FLIGHT] [-b] [--off NAME,...] [-q] [-l]
+//            [-c CICB_COMMANDS] [-k FRAMES_IN_FLIGHT] [-b] [--off NAME,...] [--private NAME,...]
+//            [-q] [-l]
 //     -d NAME   the first of MTLCopyAllDevices whose name holds NAME (default: the first);
 //               never MTLCreateSystemDefaultDevice, which switches a dual-GPU MacBook's display.
 //     -f        measured frames (default 300), after -w warm-up frames (default 30).
@@ -53,6 +64,8 @@
 //     -b        the ICBs inherit no buffers: their kernels set each drawn command's vertex and
 //               fragment buffers (icb_encode_bound) and each dispatch's kernel buffers
 //               (cicb_encode_bound); by default they inherit the encoder's.
+//     --off     the shapes to leave out (above); --private, the buffers to make Private (above).
+//               Both may be given more than once.
 //     -q        no per-frame lines.
 //     -l        lists the devices and exits.
 //
@@ -91,6 +104,10 @@
 enum { S_HEAP, S_RTHEAP, S_TARGETS, S_VIEWS, S_ICB, S_CICB, S_DRAWS, S_POST, S_BLIT, S_COUNT };
 static const char *const kShape[S_COUNT] = {"heap", "rtheap", "targets", "views", "icb", "cicb", "draws", "post", "blit"};
 static bool on[S_COUNT] = {true, true, true, true, true, true, true, true, true};
+// The buffers --private makes Private (the header).
+enum { P_FRAME, P_MATERIALS, P_ARGS, P_COUNT };
+static const char *const kPrivate[P_COUNT] = {"frame", "materials", "args"};
+static bool priv[P_COUNT];
 
 typedef struct {
 	simd_float4x4 view_proj;
@@ -227,6 +244,19 @@ static id<MTLBuffer> private_buffer(const void *bytes, size_t len)
 	return dst;
 }
 
+// A Private buffer of `src`'s length, its bytes copied from `src` by a blit (--private).
+static id<MTLBuffer> private_copy(id<MTLBuffer> src)
+{
+	id<MTLBuffer> dst = [D newBufferWithLength:src.length options:MTLResourceStorageModePrivate];
+	id<MTLCommandBuffer> cb = [Q commandBuffer];
+	id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+	[b copyFromBuffer:src sourceOffset:0 toBuffer:dst destinationOffset:0 size:src.length];
+	[b endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	return dst;
+}
+
 static MTLTextureDescriptor *tex_desc(MTLPixelFormat fmt, NSUInteger w, NSUInteger h, BOOL mips,
                                       MTLTextureUsage usage)
 {
@@ -330,6 +360,20 @@ int main(int argc, char **argv)
 						return 2;
 					}
 					on[k] = false;
+				}
+				free(list);
+				i++;
+			} else if (v && !strcmp(a, "--private")) {
+				char *list = strdup(v), *save = NULL;
+				for (char *t = strtok_r(list, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
+					int k = 0;
+					while (k < P_COUNT && strcmp(t, kPrivate[k]))
+						k++;
+					if (k == P_COUNT) {
+						fprintf(stderr, "gameload: no buffer %s to make Private (frame materials args)\n", t);
+						return 2;
+					}
+					priv[k] = true;
 				}
 				free(list);
 				i++;
@@ -784,6 +828,18 @@ int main(int argc, char **argv)
 			cicb_sums = [D newBufferWithLength:(NSUInteger)CICB_SLOT * inflight options:MTLResourceStorageModeShared];
 			memset(cicb_sums.contents, 0, (size_t)CICB_SLOT * inflight);
 		}
+		// The buffers the GPU reads: the Shared ones the CPU writes, or their Private copies
+		// (--private). A copy made each frame is written by the frame's first blit (below).
+		id<MTLBuffer> frame_gpu = priv[P_FRAME] ? [D newBufferWithLength:frame_buf.length options:MTLResourceStorageModePrivate]
+		                                        : frame_buf;
+		id<MTLBuffer> mat_gpu[8];
+		for (int k = 0; k < inflight; k++)
+			mat_gpu[k] = !priv[P_MATERIALS] ? mat_buf[k]
+			             : on[S_HEAP]       ? [D newBufferWithLength:mat_buf[k].length options:MTLResourceStorageModePrivate]
+			                                : private_copy(mat_buf[k]);
+		id<MTLBuffer> icb_args_gpu = icb_args && priv[P_ARGS] ? private_copy(icb_args) : icb_args;
+		id<MTLBuffer> cicb_args_gpu = cicb_args && priv[P_ARGS] ? private_copy(cicb_args) : cicb_args;
+		const bool frame_copies = priv[P_FRAME] || (priv[P_MATERIALS] && on[S_HEAP]);
 		// The sum of the frame that last had slot k, checked, then cleared for the next.
 		void (^cicb_check)(int, int) = ^(int k, int frame) {
 			uint32_t *sum = (uint32_t *)((uint8_t *)cicb_sums.contents + (size_t)k * CICB_SLOT + 64);
@@ -826,9 +882,12 @@ int main(int argc, char **argv)
 		printf("GAMELOAD config device \"%s\" unified %d bc %d shapes", D.name.UTF8String, (int)D.hasUnifiedMemory, (int)bc);
 		for (int s = 0; s < S_COUNT; s++)
 			printf(" %s=%d", kShape[s], (int)on[s]);
-		printf(" icb_bound %d size %dx%d draws %d shadow_draws %d icb_objects %d cicb_commands %d frames %d warmup %d"
+		printf(" icb_bound %d private", icb_bound);
+		for (int p = 0; p < P_COUNT; p++)
+			printf(" %s=%d", kPrivate[p], (int)priv[p]);
+		printf(" size %dx%d draws %d shadow_draws %d icb_objects %d cicb_commands %d frames %d warmup %d"
 		       " inflight %d placement_heap %zu transient_heap %zu targets_heap %zu library_ms %.1f\n",
-		       icb_bound, W, H, on[S_DRAWS] ? draws : 0, on[S_DRAWS] ? shadow_draws : 0, on[S_ICB] ? icb_objects : 0,
+		       W, H, on[S_DRAWS] ? draws : 0, on[S_DRAWS] ? shadow_draws : 0, on[S_ICB] ? icb_objects : 0,
 		       on[S_CICB] ? cicb_commands : 0, frames, warmup, inflight, place_size, transient_size, targets_heap_size, t_lib);
 		fflush(stdout);
 
@@ -897,9 +956,10 @@ int main(int argc, char **argv)
 				}];
 
 				// 1. The upload blit: the stream slots made again at their offsets, their levels and
-				// the vertex buffer uploaded; the blit stream's texture, buffer and mipmaps.
+				// the vertex buffer uploaded; the blit stream's texture, buffer and mipmaps; and the
+				// frame's copies into its Private buffers (--private).
 				id<MTLBuffer> stream_buf = nil;
-				if (on[S_HEAP] || on[S_BLIT]) {
+				if (on[S_HEAP] || on[S_BLIT] || frame_copies) {
 					ts = now_ms();
 					id<MTLBlitCommandEncoder> be = [a blitCommandEncoder];
 					if (on[S_HEAP]) {
@@ -930,6 +990,12 @@ int main(int argc, char **argv)
 						[be copyFromBuffer:staging[k] sourceOffset:so toBuffer:blit_dst destinationOffset:0 size:BLIT_BUF];
 						[be generateMipmapsForTexture:dyn];
 					}
+					// The CPU writes this frame's constants and materials before the commit, below.
+					if (priv[P_FRAME])
+						[be copyFromBuffer:frame_buf sourceOffset:fo toBuffer:frame_gpu destinationOffset:fo size:frame_stride];
+					if (priv[P_MATERIALS] && on[S_HEAP])
+						[be copyFromBuffer:mat_buf[k] sourceOffset:0 toBuffer:mat_gpu[k] destinationOffset:0
+						              size:mat_buf[k].length];
 					if (on[S_HEAP])
 						[be updateFence:upload_fence];
 					[be endEncoding];
@@ -958,7 +1024,7 @@ int main(int argc, char **argv)
 					[re setDepthStencilState:depth_less];
 					[re setCullMode:MTLCullModeBack];
 					[re setVertexBuffer:mesh_buf offset:0 atIndex:0];
-					[re setVertexBuffer:frame_buf offset:fo atIndex:1];
+					[re setVertexBuffer:frame_gpu offset:fo atIndex:1];
 					[re setVertexBuffer:objects offset:0 atIndex:2];
 					for (int i = 0; i < shadow_draws; i++) {
 						[re setVertexBufferOffset:(NSUInteger)i * sizeof(GlObject) atIndex:2];
@@ -975,13 +1041,13 @@ int main(int argc, char **argv)
 					ts = now_ms();
 					id<MTLComputeCommandEncoder> ce = [a computeCommandEncoder];
 					[ce setComputePipelineState:icb_encode];
-					[ce setBuffer:icb_args offset:0 atIndex:0];
+					[ce setBuffer:icb_args_gpu offset:0 atIndex:0];
 					[ce setBuffer:objects offset:0 atIndex:1];
-					[ce setBuffer:frame_buf offset:fo atIndex:2];
+					[ce setBuffer:frame_gpu offset:fo atIndex:2];
 					[ce setBuffer:indices offset:0 atIndex:3];
 					if (icb_bound) {
 						[ce setBuffer:on[S_HEAP] ? stream_buf : mesh offset:0 atIndex:4];
-						[ce setBuffer:mat_buf[k] offset:0 atIndex:5];
+						[ce setBuffer:mat_gpu[k] offset:0 atIndex:5];
 					}
 					[ce useResource:icb usage:MTLResourceUsageWrite];
 					NSUInteger tg = MIN(icb_encode.maxTotalThreadsPerThreadgroup, 64);
@@ -999,8 +1065,8 @@ int main(int argc, char **argv)
 					const NSUInteger sum_off = (NSUInteger)k * CICB_SLOT + 64;
 					id<MTLComputeCommandEncoder> ce = [a computeCommandEncoder];
 					[ce setComputePipelineState:cicb_encode];
-					[ce setBuffer:cicb_args offset:0 atIndex:0];
-					[ce setBuffer:frame_buf offset:fo atIndex:1];
+					[ce setBuffer:cicb_args_gpu offset:0 atIndex:0];
+					[ce setBuffer:frame_gpu offset:fo atIndex:1];
 					if (icb_bound) {
 						[ce setBuffer:cicb_in offset:CICB_LEAD * 4 atIndex:2];
 						[ce setBuffer:cicb_sums offset:sum_off atIndex:3];
@@ -1057,10 +1123,10 @@ int main(int argc, char **argv)
 					[re setDepthStencilState:depth_less];
 				[re setCullMode:MTLCullModeBack];
 				[re setVertexBuffer:mesh_buf offset:0 atIndex:0];
-				[re setVertexBuffer:frame_buf offset:fo atIndex:1];
+				[re setVertexBuffer:frame_gpu offset:fo atIndex:1];
 				[re setVertexBuffer:objects offset:0 atIndex:2];
-				[re setFragmentBuffer:mat_buf[k] offset:0 atIndex:0];
-				[re setFragmentBuffer:frame_buf offset:fo atIndex:1];
+				[re setFragmentBuffer:mat_gpu[k] offset:0 atIndex:0];
+				[re setFragmentBuffer:frame_gpu offset:fo atIndex:1];
 				[re setFragmentTexture:shadow_map atIndex:0];
 				[re setFragmentSamplerState:smp atIndex:0];
 				[re setFragmentSamplerState:cmp atIndex:1];
@@ -1087,8 +1153,8 @@ int main(int argc, char **argv)
 					[re useResource:objects usage:MTLResourceUsageRead stages:MTLRenderStageVertex];
 					if (icb_bound) {
 						[re useResource:mesh_buf usage:MTLResourceUsageRead stages:MTLRenderStageVertex];
-						[re useResource:frame_buf usage:MTLResourceUsageRead stages:MTLRenderStageVertex | MTLRenderStageFragment];
-						[re useResource:mat_buf[k] usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+						[re useResource:frame_gpu usage:MTLResourceUsageRead stages:MTLRenderStageVertex | MTLRenderStageFragment];
+						[re useResource:mat_gpu[k] usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
 					}
 					[re executeCommandsInBuffer:icb withRange:NSMakeRange(0, icb_objects)];
 					shape_cpu[S_ICB][f] += now_ms() - ts;
