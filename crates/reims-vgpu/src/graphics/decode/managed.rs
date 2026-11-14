@@ -388,7 +388,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// platform refuses it. The buffer lies over what its CPU copy lies over. A CPU copy that is
     /// no such buffer (a `Managed` one, one of the GPU's own memory, a refused one), or is shorter
     /// than the buffer, is a bad reference; a buffer of no bytes is malformed, and one of options
-    /// other than `Managed` is refused.
+    /// other than `Managed`, or whose CPU copy lies over pages its process maps read-only, which
+    /// the copies would write ([`Self::copy_admitted`]), is refused.
     pub(super) fn managed_buffer_create(
         &self,
         device: &P::Device,
@@ -414,6 +415,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             return Ok(Err(DecodeError::BadReference));
         }
         let span = self.span_of(m.cpu_buffer_obj_id);
+        if !self.copy_admitted("MANAGED_BUFFER_CREATE", span) {
+            return Ok(Err(DecodeError::Refused));
+        }
         let cpu = cpu.clone_ref();
         let pin = (m.gpu_address != 0).then_some(m.gpu_address);
         let Some(buffer) =
@@ -532,6 +536,14 @@ impl<P: Platform> GraphicsDecoder<P> {
         Ok(Ok(()))
     }
 
+    /// Whether a `Managed` object `name` makes may take the CPU copy that lies over `span` (its
+    /// buffer's block): not where that is a block of pages its process maps read-only, whose
+    /// copies (a synchronize, a texture's writes over its CPU copy) would write them
+    /// (`GraphicsDecoder::read_only_pages_admit`).
+    fn copy_admitted(&self, name: &str, span: Option<(u64, u64)>) -> bool {
+        span.is_none_or(|(block, _)| self.read_only_pages_admit(name, block, None))
+    }
+
     /// `MANAGED_TEXTURE_CREATE`: over the CPU copy's buffer in place where the GPU shares the
     /// CPU's memory and the platform makes a texture over a buffer of the shape, else the
     /// platform's own `Managed` texture beside it, refused where the platform refuses that one.
@@ -539,7 +551,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// ([`GuestBytes`]): over a block of the sender's, placed in a heap over one or over a pages
     /// block's guest RAM, or over a pages block's view. A bad reference for a CPU copy that is no
     /// such buffer (a `Managed` one, or one of the GPU's own memory), or is shorter than the
-    /// layout.
+    /// layout; refused for one over pages its process maps read-only ([`Self::copy_admitted`]).
     pub(super) fn managed_texture(
         &self,
         device: &P::Device,
@@ -572,6 +584,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         // The texture lies over what the buffer lies over, so that block is not given out again
         // while the texture lives.
         let span = self.span_of(m.cpu_buffer_obj_id);
+        if !self.copy_admitted("MANAGED_TEXTURE_CREATE", span) {
+            return Ok(Err(DecodeError::Refused));
+        }
         let cpu = cpu.clone_ref();
         let desc = texture_desc(&m.desc, m.resource_id);
         let in_place = |this: &Self| -> RaiseResult<Option<P::Texture>> {

@@ -1387,8 +1387,10 @@ void unwire(void *pages)
 		map->release();
 		return;
 	}
+	// A pages block's (pagesBlock) is the descriptor of the process's pages, completed for the
+	// direction it was prepared for: reading alone for read-only memory.
 	if (IOMemoryDescriptor *md = OSDynamicCast(IOMemoryDescriptor, held)) {
-		md->complete(kIODirectionOutIn);
+		md->complete(md->getDirection());
 		md->release();
 	}
 }
@@ -2625,9 +2627,10 @@ IOReturn RgfxAccelerator::pagesBlock(RgfxAcceleratorUserClient *client, UInt32 c
 	// no pages block: the process copies the memory instead.
 	if (!surfacePages || !region || !(featureWord() & RGFX_FEATURE_PAGES_BUFFERS))
 		return kIOReturnUnsupported;
-	// Read-only memory is not mapped in place until such pages have a user: the GPU's writes
-	// would land in pages the process cannot write.
-	if (!writable)
+	// Read-only memory only where the host keeps the GPU's writes out of it: the GPU's writes
+	// would otherwise land in pages the process cannot write, a file's among them.
+	const RgfxPagesWiring wiring = rgfxPagesWiring(writable, featureWord());
+	if (wiring.access == RgfxPagesAccess::kRefused)
 		return kIOReturnUnsupported;
 	RgfxPagesRange range = {};
 #if RGFX_GUEST_ARM64
@@ -2639,17 +2642,21 @@ IOReturn RgfxAccelerator::pagesBlock(RgfxAcceleratorUserClient *client, UInt32 c
 #endif
 	if (!rgfxPagesRange(address, length, rangePage, &range))
 		return kIOReturnBadArgument;
-	// Wired for the block's life, which resolves copy-on-write first, so a private mapping's
-	// pages are its own before the device maps them.
+	// Wired for the block's life: writable memory for reading and writing, which resolves
+	// copy-on-write first, so a private mapping's pages are its own before the device maps them;
+	// read-only memory for reading alone (kIODirectionOut: the device reads the memory), which
+	// asks of the VM system no access the process lacks.
+	const IODirection direction =
+	    wiring.access == RgfxPagesAccess::kRead ? kIODirectionOut : kIODirectionOutIn;
 	IOMemoryDescriptor *md =
-	    IOMemoryDescriptor::withAddressRange(range.base, range.length, kIODirectionOutIn, task);
+	    IOMemoryDescriptor::withAddressRange(range.base, range.length, direction, task);
 	if (!md)
 		return kIOReturnNoMemory;
-	if (md->prepare(kIODirectionOutIn) != kIOReturnSuccess) {
+	if (md->prepare(direction) != kIOReturnSuccess) {
 		md->release();
 		return kIOReturnBadArgument;
 	}
-	return pagesBlockOver(client, context, md, range.length, md, offset, size);
+	return pagesBlockOver(client, context, md, range.length, md, offset, size, wiring.flags);
 }
 
 IOReturn RgfxAccelerator::pagesChunked(RgfxAcceleratorUserClient *client, UInt32 context,
@@ -2705,7 +2712,8 @@ IOReturn RgfxAccelerator::pagesChunked(RgfxAcceleratorUserClient *client, UInt32
 	}
 	md->release();
 	const UInt64 at = map->getAddress();
-	const IOReturn r = pagesBlockOver(client, context, md, length, map, offset, size);
+	const IOReturn r =
+	    pagesBlockOver(client, context, md, length, map, offset, size, RGFX_SURFACE_PAGES_PRIVATE);
 	if (r == kIOReturnSuccess)
 		*address = at;
 	return r;
@@ -2713,7 +2721,7 @@ IOReturn RgfxAccelerator::pagesChunked(RgfxAcceleratorUserClient *client, UInt32
 
 IOReturn RgfxAccelerator::pagesBlockOver(RgfxAcceleratorUserClient *client, UInt32 context,
                                          IOMemoryDescriptor *md, UInt64 length, void *wired,
-                                         UInt64 *offset, UInt64 *size)
+                                         UInt64 *offset, UInt64 *size, UInt32 flags)
 {
 	auto segment = [md](uint64_t at, uint64_t *bytes) -> uint64_t {
 		IOByteCount n = 0;
@@ -2753,8 +2761,7 @@ IOReturn RgfxAccelerator::pagesBlockOver(RgfxAcceleratorUserClient *client, UInt
 		written = rgfxPagesRuns(length, segment, runs, count) == count;
 		map->release();
 	}
-	IOReturn r = written ? postPages(context, at, bytes, at, length, count,
-	                                 RGFX_SURFACE_PAGES_PRIVATE)
+	IOReturn r = written ? postPages(context, at, bytes, at, length, count, flags)
 	                     : kIOReturnUnsupported;
 	// The device has no view of a block it never heard of, or refused: the block goes back as if
 	// never made, and its pages are unwired.

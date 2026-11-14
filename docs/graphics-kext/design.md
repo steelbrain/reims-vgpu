@@ -1870,6 +1870,21 @@ only where no negotiation can carry it.
   it takes each buffer ("Guest times"). Every host offers it, and the kext
   takes it; a bundle on a host that did not offer it stamps nothing, and the
   host reads no times of a guest that did not take it.
+- Bit 45, `FEATURES_HI`'s bit 13, is `READ_ONLY_PAGES`, which means nothing
+  without `PAGES_BUFFERS`: the kext makes pages blocks of memory a process
+  maps read-only too, wired for reading alone (`kIODirectionOut`), and marks
+  their `SURFACE_PAGES` `RGFX_SURFACE_PAGES_READ_ONLY` (1 << 5, with
+  `RGFX_SURFACE_PAGES_PRIVATE` alone). The host keeps every object over such
+  a block from writing its pages: a `BUFFER_OVER_PAGES` over it carries
+  `MTLResourceOptions` bit 24, whose GPU writes the platform drops as Metal
+  drops them (accuracy-ledger.md, `read-only-pages-written`), and one without
+  the bit, a `HEAP_OVER_PAGES`, an `ICB_SLOTS_IN_PAGES` and a Managed
+  object's CPU copy over it are refused. The mark is where the host holds that
+  line: a process can post any message on its rings, and the pages may be a
+  file's, so the kext makes such a block only where the host took the bit,
+  and a kext on a host without it refuses read-only memory, which the bundle
+  then copies ("No-copy buffers"). A host offers it where it offers
+  `PAGES_BUFFERS`, and the kext takes it.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed

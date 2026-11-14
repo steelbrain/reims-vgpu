@@ -336,7 +336,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_PIPELINE_KEYS
     | RGFX_FEATURE_ICB_SLOTS_IN_PAGES
     | RGFX_FEATURE_DOORBELL_ASKS
-    | RGFX_FEATURE_GUEST_TIMES;
+    | RGFX_FEATURE_GUEST_TIMES
+    | RGFX_FEATURE_READ_ONLY_PAGES;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks

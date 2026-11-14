@@ -8894,7 +8894,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     );
     let carries = want & RGFX_FEATURE_SURFACE_DEFERRED_ASK != 0;
     let slots_in_pages = if want != 0 {
-        RGFX_FEATURE_ICB_SLOTS_IN_PAGES
+        RGFX_FEATURE_ICB_SLOTS_IN_PAGES | RGFX_FEATURE_READ_ONLY_PAGES
     } else {
         0
     };
@@ -8965,6 +8965,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
                 | RGFX_FEATURE_PIPELINE_KEYS
                 | RGFX_FEATURE_GUEST_TIMES
                 | RGFX_FEATURE_ICB_SLOTS_IN_PAGES
+                | RGFX_FEATURE_READ_ONLY_PAGES
                 | RGFX_FEATURE_PAGES_16K
                 | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
         );
@@ -9096,6 +9097,11 @@ fn a_gpu_of_its_own_memory_has_the_guest_align_its_surfaces_rows_too() {
         high & RGFX_FEATURE_ICB_SLOTS_IN_PAGES != 0,
         !sixteen,
         "indirect command buffers' slots in a process's own pages"
+    );
+    assert_eq!(
+        high & RGFX_FEATURE_READ_ONLY_PAGES != 0,
+        !sixteen,
+        "pages blocks of memory a process maps read-only"
     );
     assert_eq!(
         u64::from(device_info_of(&device).linear_row_alignment),

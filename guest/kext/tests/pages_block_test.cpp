@@ -1,7 +1,8 @@
 // The native test of RgfxPagesBlock.hpp: a pages block's range rounded out to whole pages with
 // the call's offset in the first, its runs counted and then written as one per stretch of
 // contiguous segments, and its size in whole pages; and a span's runs and length taken to the
-// end of its last 16 KiB page, as PAGES_16K names them.
+// end of its last 16 KiB page, as PAGES_16K names them; and how a block's pages are wired, and
+// marked, for memory the process maps writable or read-only.
 #include "RgfxPagesBlock.hpp"
 
 #include <cstdio>
@@ -106,6 +107,27 @@ int main()
 	rgfxRunsToPageEnd(&whole, 1, kRgfxPage16K);
 	check(whole.length == 0x4000, "a whole page stays whole");
 	rgfxRunsToPageEnd(nullptr, 0, kRgfxPage16K);
+
+	// Writable memory: wired for reading and writing, a block of the process's, whatever the
+	// word.
+	const uint64_t pagesWord = RGFX_FEATURE_PAGES_BUFFERS;
+	const uint64_t readOnlyWord = RGFX_FEATURE_PAGES_BUFFERS | RGFX_FEATURE_READ_ONLY_PAGES;
+	for (uint64_t word : {pagesWord, readOnlyWord}) {
+		const RgfxPagesWiring w = rgfxPagesWiring(true, word);
+		check(w.access == RgfxPagesAccess::kReadWrite && w.flags == RGFX_SURFACE_PAGES_PRIVATE,
+		      "writable memory is wired for reading and writing, unmarked");
+	}
+	// Read-only memory: wired for reading alone and marked read-only where the host took
+	// READ_ONLY_PAGES, which holds every object over the block to leave its pages as they are;
+	// else no block, as a host that does not know the mark would not hold it.
+	const RgfxPagesWiring ro = rgfxPagesWiring(false, readOnlyWord);
+	check(ro.access == RgfxPagesAccess::kRead &&
+	          ro.flags == (RGFX_SURFACE_PAGES_PRIVATE | RGFX_SURFACE_PAGES_READ_ONLY),
+	      "read-only memory is wired for reading alone, marked read-only");
+	check(rgfxPagesWiring(false, pagesWord).access == RgfxPagesAccess::kRefused,
+	      "read-only memory makes no block where the host did not take READ_ONLY_PAGES");
+	check(rgfxPagesWiring(false, 0).access == RgfxPagesAccess::kRefused,
+	      "nor with no feature at all");
 
 	std::printf("pages_block_test: OK (%d checks)\n", checks);
 	return 0;

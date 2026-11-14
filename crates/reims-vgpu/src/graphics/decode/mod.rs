@@ -117,22 +117,22 @@ use reims_vgpu_graphics::wire::{
     RGFX_STATUS_CACHE, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
     RGFX_SURFACE_FACTS_OFFSET, RGFX_SURFACE_NO_WRITERS, RGFX_SURFACE_PAGES_ASK_CACHE,
     RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_DEFERRED,
-    RGFX_SURFACE_PAGES_PRIVATE, RGFX_YCBCR_MATRIX_DCI_P3, RGFX_YCBCR_MATRIX_ITU_R_601_4,
-    RGFX_YCBCR_MATRIX_ITU_R_709_2, RGFX_YCBCR_MATRIX_ITU_R_2020, RGFX_YCBCR_MATRIX_NONE,
-    RGFX_YCBCR_MATRIX_OTHER, RGFX_YCBCR_MATRIX_P3_D65, RGFX_YCBCR_MATRIX_SMPTE_240M_1995,
-    RgfxBufferAtOffset, RgfxBufferCreate, RgfxBufferOverHostMemory, RgfxBufferOverPages,
-    RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorAttachmentDesc,
-    RgfxComputePipelineCreate, RgfxDepthStencilCreate, RgfxEventSignalled, RgfxFunctionConstant,
-    RgfxHeapCreate, RgfxHeapOverHostMemory, RgfxHeapOverPages, RgfxHeapTextureSizeAndAlign,
-    RgfxLinearTextureFromBuffer, RgfxLinkedFunction, RgfxMeshPipelineReflection,
-    RgfxMeshRenderPipelineCreate, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxPageRun,
-    RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate,
-    RgfxRenderPipelinePrivateState, RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSamplerCreateExt,
-    RgfxSamplerState, RgfxSharedEventCreate, RgfxSharedEventSetValue, RgfxSizeAndAlign,
-    RgfxStencilDescriptor, RgfxSurfaceFacts, RgfxSurfacePages, RgfxSurfacePagesLayout,
-    RgfxSurfaceWriter, RgfxSurfaceWriters, RgfxTextureCreate, RgfxTextureDescriptor,
-    RgfxTextureDidModifyData, RgfxTextureFromBuffer, RgfxTextureFromIOSurface, RgfxVertexAttribute,
-    RgfxVertexBufferLayout, RgfxVideoSessionCreate,
+    RGFX_SURFACE_PAGES_PRIVATE, RGFX_SURFACE_PAGES_READ_ONLY, RGFX_YCBCR_MATRIX_DCI_P3,
+    RGFX_YCBCR_MATRIX_ITU_R_601_4, RGFX_YCBCR_MATRIX_ITU_R_709_2, RGFX_YCBCR_MATRIX_ITU_R_2020,
+    RGFX_YCBCR_MATRIX_NONE, RGFX_YCBCR_MATRIX_OTHER, RGFX_YCBCR_MATRIX_P3_D65,
+    RGFX_YCBCR_MATRIX_SMPTE_240M_1995, RgfxBufferAtOffset, RgfxBufferCreate,
+    RgfxBufferOverHostMemory, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled,
+    RgfxCbSubmitted, RgfxColorAttachmentDesc, RgfxComputePipelineCreate, RgfxDepthStencilCreate,
+    RgfxEventSignalled, RgfxFunctionConstant, RgfxHeapCreate, RgfxHeapOverHostMemory,
+    RgfxHeapOverPages, RgfxHeapTextureSizeAndAlign, RgfxLinearTextureFromBuffer,
+    RgfxLinkedFunction, RgfxMeshPipelineReflection, RgfxMeshRenderPipelineCreate, RgfxMsgHeader,
+    RgfxObjectCreate, RgfxObjectDestroy, RgfxPageRun, RgfxPipelineReflection, RgfxQueueCreate,
+    RgfxRenderPipelineCreate, RgfxRenderPipelinePrivateState, RgfxResourceIdChunk,
+    RgfxSamplerCreate, RgfxSamplerCreateExt, RgfxSamplerState, RgfxSharedEventCreate,
+    RgfxSharedEventSetValue, RgfxSizeAndAlign, RgfxStencilDescriptor, RgfxSurfaceFacts,
+    RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxSurfaceWriter, RgfxSurfaceWriters,
+    RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureDidModifyData, RgfxTextureFromBuffer,
+    RgfxTextureFromIOSurface, RgfxVertexAttribute, RgfxVertexBufferLayout, RgfxVideoSessionCreate,
 };
 use reims_vgpu_video::core::device_memory::MemoryLife;
 use reims_vgpu_vulkan::core::host::HostPtr;
@@ -1267,7 +1267,10 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// none, logged as a guest error; `None`, with nothing made, where the device was reset since
     /// its begin. `flags` are the message's `RGFX_SURFACE_PAGES_*`: a block marked
     /// [`RGFX_SURFACE_PAGES_PRIVATE`] is a pages block, its view made at its first
-    /// `BUFFER_OVER_PAGES` and its buffers' alone, with no device cache ([`surface_pages`]); else
+    /// `BUFFER_OVER_PAGES` and its buffers' alone, with no device cache ([`surface_pages`]), and
+    /// one marked [`RGFX_SURFACE_PAGES_READ_ONLY`] too a block of pages its process maps read-only,
+    /// which nothing over it writes (one so marked that is no pages block is
+    /// [`RGFX_STATUS_INVALID_ARGUMENT`]); else
     /// one marked [`RGFX_SURFACE_PAGES_CACHED`] may be given a device cache, and with it one
     /// marked [`RGFX_SURFACE_PAGES_DEFERRED`] or [`RGFX_SURFACE_PAGES_ATTACH`] is a deferred
     /// block or its pages ([`Self::deferred_surface_pages`]); and one marked
@@ -1390,6 +1393,17 @@ impl<P: Platform> GraphicsDecoder<P> {
     ) -> Option<u32> {
         let private = flags & RGFX_SURFACE_PAGES_PRIVATE != 0;
         let cached = flags & RGFX_SURFACE_PAGES_CACHED != 0;
+        // Pages a process maps read-only are a pages block's alone.
+        let read_only = flags & RGFX_SURFACE_PAGES_READ_ONLY != 0;
+        if read_only && !private {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "the IOSurface block at {:#x}: marked read-only with flags {flags:#x}, which are \
+                 no pages block's: refused",
+                pages.block_offset
+            );
+            return Some(RGFX_STATUS_INVALID_ARGUMENT);
+        }
         // An ask whether the block needs a device cache is a block in place's, with a layout
         // that lies in the surface's bytes.
         let ask = flags & RGFX_SURFACE_PAGES_ASK_CACHE != 0;
@@ -1463,6 +1477,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 &self.platform,
                 pages,
                 runs,
+                read_only,
                 settle,
             ))
         } else {

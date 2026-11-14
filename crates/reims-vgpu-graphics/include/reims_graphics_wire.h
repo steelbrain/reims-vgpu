@@ -1077,8 +1077,8 @@
 // [`RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA`], [`RGFX_FEATURE_DISPLAY_POWER`],
 // [`RGFX_FEATURE_RATE_MAPS`], [`RGFX_FEATURE_FUNCTION_POINTERS`],
 // [`RGFX_FEATURE_DYNAMIC_LIBRARIES`], [`RGFX_FEATURE_PIPELINE_KEYS`],
-// [`RGFX_FEATURE_ICB_SLOTS_IN_PAGES`], [`RGFX_FEATURE_DOORBELL_ASKS`] and
-// [`RGFX_FEATURE_GUEST_TIMES`].
+// [`RGFX_FEATURE_ICB_SLOTS_IN_PAGES`], [`RGFX_FEATURE_DOORBELL_ASKS`],
+// [`RGFX_FEATURE_GUEST_TIMES`] and [`RGFX_FEATURE_READ_ONLY_PAGES`].
 // On a host that offers `PAGES_16K`, `FEATURES_LO` and `_HI` read the guest RAM features only
 // once the guest took it.
 #define RGFX_REG_FEATURES_HI 12
@@ -1432,6 +1432,18 @@
 // guest's wait to post it, the wait behind the queue's buffer before it and the transport, for
 // its trace and its log; it changes nothing else the device does. Every host offers it.
 #define RGFX_FEATURE_GUEST_TIMES 17592186044416
+
+// `FEATURES_HI` bit 13, feature bit 45, `READ_ONLY_PAGES`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_HI`], and which means nothing without
+// [`RGFX_FEATURE_PAGES_BUFFERS`]: a pages block's `SURFACE_PAGES` may carry
+// [`RGFX_SURFACE_PAGES_READ_ONLY`], a block of pages its process maps read-only, and the host
+// keeps every object over such a block from writing its pages: a `BUFFER_OVER_PAGES` over one
+// carries `MTLResourceOptions` bit 24, whose GPU writes the host drops as Metal does, and nothing
+// else lies over one. The flag is where the host holds that line, not a hint: a process can post
+// any message on its rings, so a kext makes a pages block of read-only memory only where the host
+// offers the bit, and a host that does not know the flag never gets one. A host offers it where
+// it offers [`RGFX_FEATURE_PAGES_BUFFERS`].
+#define RGFX_FEATURE_READ_ONLY_PAGES 35184372088832
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -1857,7 +1869,8 @@
 // Command `BUFFER_OVER_PAGES` ([`RgfxBufferOverPages`]), where the guest took
 // [`RGFX_FEATURE_PAGES_BUFFERS`]: a buffer over a range of a pages block of the sender's context,
 // the guest's own pages in place. A host without the feature refuses the message as one it does
-// not know.
+// not know. Over a read-only pages block ([`RGFX_SURFACE_PAGES_READ_ONLY`]) its options carry
+// `MTLResourceOptions` bit 24, or it is refused.
 #define RGFX_CMD_BUFFER_OVER_PAGES 542
 
 // Command `ICB_CREATE` ([`RgfxIcbCreate`]), where the guest took
@@ -2398,6 +2411,17 @@
 // [`RGFX_SURFACE_PAGES_DEFERRED`], where the guest took [`RGFX_FEATURE_SURFACE_DEFERRED_ASK`], a
 // fresh surface's block asks to be deferred, carrying the layout the same way.
 #define RGFX_SURFACE_PAGES_ASK_CACHE (1 << 4)
+
+// [`RgfxSurfacePagesCache::flags`], with [`RGFX_SURFACE_PAGES_PRIVATE`], where the guest took
+// [`RGFX_FEATURE_READ_ONLY_PAGES`]: the pages block's pages are ones its process maps read-only,
+// which the kext wired for reading alone. Their memory may be a file's, or another process's
+// that it writes; the guest's RAM under them is still the host's to map. Every object over the
+// block must leave its pages as they are: a `BUFFER_OVER_PAGES` over it that does not carry
+// `MTLResourceOptions` bit 24 is refused, as is a `HEAP_OVER_PAGES` over it, an
+// `ICB_SLOTS_IN_PAGES` that names it, and a `MANAGED_BUFFER_CREATE` or `MANAGED_TEXTURE_CREATE`
+// whose CPU copy lies over it. One without [`RGFX_SURFACE_PAGES_PRIVATE`] is
+// [`RGFX_STATUS_INVALID_ARGUMENT`].
+#define RGFX_SURFACE_PAGES_READ_ONLY (1 << 5)
 
 // Where a `SURFACE_PAGES` message's [`RgfxSurfacePagesLayout`] starts: right after its
 // [`RgfxSurfacePagesCache`].
@@ -3537,7 +3561,9 @@ typedef struct {
   uint64_t offset;
   // The buffer's length in bytes.
   uint64_t length;
-  // `MTLResourceOptions`: storage mode, cache mode, hazard tracking.
+  // `MTLResourceOptions`: storage mode, cache mode, hazard tracking, and bit 24, Metal's
+  // private bit, a buffer whose GPU writes are dropped (the only kind over a read-only pages
+  // block, [`RGFX_SURFACE_PAGES_READ_ONLY`]).
   uint32_t options;
   // Pads to a multiple of 8; 0.
   uint32_t reserved_44;
@@ -7206,8 +7232,8 @@ typedef struct {
 // [`RGFX_SURFACE_PAGES_CACHE_OFFSET`].
 typedef struct {
   // `RGFX_SURFACE_PAGES_*`: [`RGFX_SURFACE_PAGES_CACHED`], [`RGFX_SURFACE_PAGES_PRIVATE`],
-  // [`RGFX_SURFACE_PAGES_DEFERRED`], [`RGFX_SURFACE_PAGES_ATTACH`] and
-  // [`RGFX_SURFACE_PAGES_ASK_CACHE`].
+  // [`RGFX_SURFACE_PAGES_DEFERRED`], [`RGFX_SURFACE_PAGES_ATTACH`],
+  // [`RGFX_SURFACE_PAGES_ASK_CACHE`] and [`RGFX_SURFACE_PAGES_READ_ONLY`].
   uint32_t flags;
   // Zero.
   uint32_t reserved_04;

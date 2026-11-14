@@ -441,7 +441,8 @@ public:
 	                    UInt64 align, UInt64 writeCombinedFrom, UInt64 *offset);
 	IOReturn freeBlock(RgfxAcceleratorUserClient *owner, UInt64 offset);
 	// A pages block (kRgfxAccelMethodPagesBlock) of `owner` of context `context` over the
-	// `length` bytes at `address` in `task`, `writable` there: the block's offset and size. The
+	// `length` bytes at `address` in `task`, `writable` there or not (rgfxPagesWiring): the
+	// block's offset and size. The
 	// block is never in the owner's window; freeBlock frees it, and its pages are unwired once
 	// its release is answered OK, or once freeBlocks frees it after the owner's close.
 	IOReturn pagesBlock(RgfxAcceleratorUserClient *owner, UInt32 context, task_t task,
@@ -679,11 +680,12 @@ private:
 	                   const RgfxSurfacePagesLayout *layout = nullptr);
 	// A pages block's making past its memory's (pagesBlock, pagesChunked): the runs of the
 	// `length` bytes `md` describes, wired, in a block of `owner`'s that holds `wired` from here
-	// on (unwire), the device told of them (SURFACE_PAGES, RGFX_SURFACE_PAGES_PRIVATE) and the
-	// block granted: its offset and size. `wired` is unwired where no block is made.
+	// on (unwire), the device told of them (SURFACE_PAGES, of `flags`: RGFX_SURFACE_PAGES_PRIVATE,
+	// and RGFX_SURFACE_PAGES_READ_ONLY for read-only memory) and the block granted: its offset
+	// and size. `wired` is unwired where no block is made.
 	IOReturn pagesBlockOver(RgfxAcceleratorUserClient *owner, UInt32 context,
 	                        IOMemoryDescriptor *md, UInt64 length, void *wired, UInt64 *offset,
-	                        UInt64 *size);
+	                        UInt64 *size, UInt32 flags);
 	// The new deferred block of entry `e`, pending, held by its asker of context `context` alone,
 	// `total` bytes with its runs' room, its surface laid out as `layout`: makes its surface's
 	// device cache and reads the surface (rgfxSurfaceLocksDefer); fresh, asks the host to defer

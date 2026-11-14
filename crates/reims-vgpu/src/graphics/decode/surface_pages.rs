@@ -601,6 +601,9 @@ pub(crate) struct Private<P: Platform> {
     /// `HEAP_OVER_PAGES` lies over, which then makes no view (a block of more runs holds its heap
     /// over the view).
     ram: Option<(HostPtr, u64)>,
+    /// Pages its process maps read-only (`RGFX_SURFACE_PAGES_READ_ONLY`): only a buffer whose GPU
+    /// writes are dropped lies over the block (`GraphicsDecoder::read_only_pages_admit`).
+    read_only: bool,
 }
 
 /// What makes the view of a block named by its runs (the module doc): its runs, checked, the
@@ -908,7 +911,8 @@ impl<P: Platform> SurfaceViews<P> {
     }
 
     /// `SURFACE_PAGES` of a pages block (`RGFX_SURFACE_PAGES_PRIVATE`, the module doc): `runs`,
-    /// checked and in guest RAM, for the block `pages` names, in place of any view it had; its
+    /// checked and in guest RAM, for the block `pages` names, in place of any view it had, of
+    /// pages its process maps read-only where `read_only` (`RGFX_SURFACE_PAGES_READ_ONLY`); its
     /// view is made at its first `BUFFER_OVER_PAGES` ([`Self::private_view`]). What the block
     /// had goes once the lock is let go, on this thread. `None` where the device was reset since
     /// `settle` began it.
@@ -917,6 +921,7 @@ impl<P: Platform> SurfaceViews<P> {
         platform: &P,
         pages: &RgfxSurfacePages,
         runs: &[RgfxPageRun],
+        read_only: bool,
         settle: &Settle,
     ) -> Option<Result<(), PagesRefusal>> {
         let mut v = views.lock();
@@ -949,6 +954,7 @@ impl<P: Platform> SurfaceViews<P> {
                         context: pages.context,
                         view: None,
                         ram,
+                        read_only,
                     },
                 );
                 Ok(())
@@ -1411,6 +1417,12 @@ impl<P: Platform> SurfaceViews<P> {
         self.private.get(&block).is_some_and(|p| p.view.is_none())
     }
 
+    /// Whether the block at `block` is a pages block of pages its process maps read-only
+    /// (`RGFX_SURFACE_PAGES_READ_ONLY`).
+    pub(crate) fn private_read_only(&self, block: u64) -> bool {
+        self.private.get(&block).is_some_and(|p| p.read_only)
+    }
+
     /// The host addresses of the guest pages of `runs` in the mapping of the guest's RAM the
     /// memory map names, as runs ([`crate::device_writes::sorted`]): what the host's devices'
     /// writes of them name. A page the map does not hold is left out.
@@ -1620,6 +1632,11 @@ fn make_view<P: Platform>(
     Ok(Ok((view, import)))
 }
 
+/// `MTLResourceOptions` bit 24, Metal's private bit, which the platform takes as memory whose GPU
+/// writes it drops, as Metal drops them (docs/accuracy-ledger.md, `read-only-pages-written`): the
+/// one kind of object that lies over a block of pages its process maps read-only.
+pub(crate) const READ_ONLY_OPTION: u32 = 1 << 24;
+
 /// A Shared buffer of `options` over the `length` bytes at `offset` in `view`, at GPU address
 /// `pin` where given, which holds the view until the platform frees it.
 pub(crate) fn buffer_over<P: Platform>(
@@ -1727,11 +1744,41 @@ impl<P: Platform> super::GraphicsDecoder<P> {
         Ok(Ok(()))
     }
 
+    /// Whether the message `name`, which lays an object over the pages block at `block` (one of
+    /// the sender's, settled), may lie there: anything over a block of pages its process maps
+    /// read-only must leave them as they are (`RGFX_SURFACE_PAGES_READ_ONLY`), so only a buffer
+    /// whose `options` drop its GPU writes ([`READ_ONLY_OPTION`]) may, and an object with no such
+    /// options (`None`: a heap, an indirect command buffer's slots, a Managed object's CPU copy)
+    /// may not. The kext marks the block, as the process can post any message on its rings; a
+    /// refusal is logged as the guest error it is.
+    pub(super) fn read_only_pages_admit(
+        &self,
+        name: &str,
+        block: u64,
+        options: Option<u32>,
+    ) -> bool {
+        if !(self.shared.surface_views.lock()).private_read_only(block) {
+            return true;
+        }
+        let admitted = options.is_some_and(|o| o & READ_ONLY_OPTION != 0);
+        if !admitted {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "{name} over the read-only pages block at {block:#x}{}: refused, as it could \
+                 write pages its process maps read-only",
+                options.map_or_else(String::new, |o| format!(" with options {o:#x}"))
+            );
+        }
+        admitted
+    }
+
     /// `BUFFER_OVER_PAGES`: a Shared buffer over the `length` bytes at `offset` in the view of a
     /// pages block of the sender's (the module doc), at the guest's GPU address, lying over the
     /// block, so the block is not released while it lives, its contents those bytes of the view.
     /// A block the sender does not hold is a guest protocol error; one that is no pages block of
-    /// its context's, or a range past its view, is refused.
+    /// its context's, or a range past its view, is refused, and so is a buffer over a block of
+    /// pages its process maps read-only whose options do not drop its GPU writes
+    /// ([`Self::read_only_pages_admit`]).
     pub(super) fn buffer_over_pages(
         &self,
         device: &P::Device,
@@ -1745,6 +1792,9 @@ impl<P: Platform> super::GraphicsDecoder<P> {
         }
         // Its block's `SURFACE_PAGES` is carried out on the surface worker.
         self.settle_surface(m.block_offset);
+        if !self.read_only_pages_admit("BUFFER_OVER_PAGES", m.block_offset, Some(m.options)) {
+            return Ok(Err(super::DecodeError::Refused));
+        }
         let view = SurfaceViews::private_view(
             &self.shared.surface_views,
             &*self.platform,
@@ -1795,7 +1845,8 @@ impl<P: Platform> super::GraphicsDecoder<P> {
     /// guest's RAM is mapped for a block of one run, else in the block's view. It lies over the
     /// block, and records its bytes, where a `BUFFER_MANAGED_AT_OFFSET` in it finds its CPU copy.
     /// A block the sender does not hold is a guest protocol error; one that is no pages block of
-    /// its context's, has no view, or is smaller than the heap, is refused.
+    /// its context's, has no view, or is smaller than the heap, is refused, as is any heap over a
+    /// block of pages its process maps read-only ([`Self::read_only_pages_admit`]).
     pub(super) fn heap_over_pages(
         &self,
         device: &P::Device,
@@ -1809,6 +1860,9 @@ impl<P: Platform> super::GraphicsDecoder<P> {
         }
         // Its block's `SURFACE_PAGES` is carried out on the surface worker.
         self.settle_surface(m.block_offset);
+        if !self.read_only_pages_admit("HEAP_OVER_PAGES", m.block_offset, None) {
+            return Ok(Err(super::DecodeError::Refused));
+        }
         let ram = (self.shared.surface_views.lock()).private_ram(
             m.block_offset,
             m.block_size,
@@ -1884,8 +1938,9 @@ impl<P: Platform> super::GraphicsDecoder<P> {
     /// names with `block_size`, where the host reads and writes them in place
     /// (`ICB_SLOTS_IN_PAGES`): in the guest's RAM for a block of one run, as a heap over the block
     /// lies, else in the block's view, made here where it is not yet. A block the sender does not
-    /// hold is a guest protocol error; one that is no pages block of its context's, or whose view
-    /// is not made, is refused.
+    /// hold is a guest protocol error; one that is no pages block of its context's, whose view
+    /// is not made, or of pages its process maps read-only ([`Self::read_only_pages_admit`]), is
+    /// refused.
     pub(super) fn own_pages(
         &self,
         device: &P::Device,
@@ -1897,6 +1952,9 @@ impl<P: Platform> super::GraphicsDecoder<P> {
         }
         // Its block's `SURFACE_PAGES` is carried out on the surface worker.
         self.settle_surface(block);
+        if !self.read_only_pages_admit("ICB_SLOTS_IN_PAGES", block, None) {
+            return Ok(Err(super::DecodeError::Refused));
+        }
         let ram = (self.shared.surface_views.lock()).private_ram(block, block_size, self.context);
         if let Some((at, length)) = ram {
             return Ok(Ok(OwnPages {
@@ -1958,12 +2016,13 @@ pub(super) mod tests {
     use reims_vgpu_graphics::region::Region;
     use reims_vgpu_graphics::wire::{
         RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_BUFFER_OVER_PAGES,
-        RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_OBJECT_DESTROY,
-        RGFX_CMD_SURFACE_PAGES, RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CONTEXT_ALLOCATIONS_OFFSET,
-        RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN, RGFX_STATUS_CACHE,
-        RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
-        RGFX_SURFACE_PAGES_ASK_CACHE, RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_PRIVATE,
-        RgfxBufferAtOffset, RgfxBufferOverHostMemory, RgfxMsgHeader, RgfxObjectDestroy,
+        RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_HEAP_OVER_PAGES,
+        RGFX_CMD_MANAGED_BUFFER_CREATE, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_SURFACE_PAGES,
+        RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT,
+        RGFX_CURSOR_SPAN, RGFX_STATUS_CACHE, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
+        RGFX_STATUS_REFUSED, RGFX_SURFACE_PAGES_ASK_CACHE, RGFX_SURFACE_PAGES_CACHED,
+        RGFX_SURFACE_PAGES_PRIVATE, RGFX_SURFACE_PAGES_READ_ONLY, RgfxBufferAtOffset,
+        RgfxBufferOverHostMemory, RgfxManagedBufferCreate, RgfxMsgHeader, RgfxObjectDestroy,
         RgfxSurfacePagesLayout, RgfxSurfacePlaneLayout, RgfxTextureDescriptor,
         RgfxTextureFromBuffer,
     };
@@ -2161,6 +2220,19 @@ pub(super) mod tests {
             offset: u64,
             length: u64,
         ) -> Result<(), DecodeError> {
+            self.pages_buffer_of(obj_id, gpu_address, block, offset, length, 0)
+        }
+
+        /// [`Self::pages_buffer`] of `options`.
+        fn pages_buffer_of(
+            &mut self,
+            obj_id: u64,
+            gpu_address: u64,
+            block: u64,
+            offset: u64,
+            length: u64,
+            options: u32,
+        ) -> Result<(), DecodeError> {
             let m = RgfxBufferOverPages {
                 header: header(RGFX_CMD_BUFFER_OVER_PAGES),
                 obj_id,
@@ -2169,7 +2241,7 @@ pub(super) mod tests {
                 block_size: 0x2000,
                 offset,
                 length,
-                options: 0,
+                options,
                 reserved_44: 0,
             };
             self.dec.decode(&self.device, m.as_bytes()).unwrap()
@@ -3341,6 +3413,87 @@ pub(super) mod tests {
         r.dec.surface_worker().flush();
         assert_eq!(r.dec.views_of_surfaces().len().1, 1, "the first view alone");
         assert_eq!(Arc::strong_count(&big_view), 1, "only the test holds it");
+    }
+
+    /// A pages block of pages its process maps read-only (`RGFX_SURFACE_PAGES_READ_ONLY`) holds a
+    /// `BUFFER_OVER_PAGES` only of `MTLResourceOptions` bit 24, which the platform takes as memory
+    /// whose GPU writes it drops, so nothing the GPU or the host does writes its pages: a buffer
+    /// without the bit, a heap over it, an indirect command buffer's slots in its pages and a
+    /// Managed buffer whose CPU copy lies over it are refused, where a writable pages block takes
+    /// each. The flag marks pages blocks alone: on a block without `PRIVATE` it is an invalid
+    /// argument
+    #[test]
+    fn a_read_only_pages_block_holds_only_buffers_that_drop_their_writes() {
+        let mut r = rig(16);
+        let page = r.page;
+        let read_only = RGFX_SURFACE_PAGES_PRIVATE | RGFX_SURFACE_PAGES_READ_ONLY;
+        let writable = BLOCK + 0x8000;
+        let length = 4 * page;
+        assert_eq!(
+            r.pages_flagged(BLOCK, 0, &[(0, 4)], length, read_only),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(
+            r.pages_flagged(writable, 0, &[(8, 4)], length, RGFX_SURFACE_PAGES_PRIVATE),
+            RGFX_STATUS_OK
+        );
+        // The guest's no-copy buffer over its read-only memory: made over the view, in place.
+        assert_eq!(
+            r.pages_buffer_of(10, 0, BLOCK, 0x10, page, READ_ONLY_OPTION),
+            Ok(())
+        );
+        let (_, contents) = r.buffer_at(10);
+        assert_eq!(contents, r.private_view(BLOCK).base().wrapping_add(0x10));
+        // Without bit 24 its GPU writes would reach the pages: refused, where a writable block
+        // takes it.
+        assert_eq!(
+            r.pages_buffer_of(11, 0, BLOCK, 0, page, 0),
+            Err(DecodeError::Refused)
+        );
+        assert!(r.dec.object(11).is_none());
+        assert_eq!(r.pages_buffer_of(11, 0, writable, 0, page, 0), Ok(()));
+        // A heap, whose buffers write the pages.
+        assert_eq!(r.pages_heap(12, BLOCK, page), Err(DecodeError::Refused));
+        assert_eq!(r.pages_heap(12, writable, page), Ok(()));
+        // An indirect command buffer's slots, which the host writes in place.
+        assert!(matches!(
+            r.dec.own_pages(&r.device, BLOCK, 0x2000),
+            Ok(Err(DecodeError::Refused))
+        ));
+        assert!(matches!(
+            r.dec.own_pages(&r.device, writable, 0x2000),
+            Ok(Ok(_))
+        ));
+        // A Managed buffer whose CPU copy is the buffer over the read-only pages, whose copies
+        // would write them back.
+        let managed = |obj_id: u64, cpu: u64| RgfxManagedBufferCreate {
+            header: header(RGFX_CMD_MANAGED_BUFFER_CREATE),
+            obj_id,
+            gpu_address: 0x1_0000_0000 + obj_id * 0x10_0000,
+            cpu_buffer_obj_id: cpu,
+            length: 0x100,
+            options: 0x10,
+            reserved_34: 0,
+        };
+        assert_eq!(
+            r.dec.decode(&r.device, managed(13, 10).as_bytes()).unwrap(),
+            Err(DecodeError::Refused)
+        );
+        assert_eq!(
+            r.dec.decode(&r.device, managed(13, 11).as_bytes()).unwrap(),
+            Ok(())
+        );
+        // The flag on a surface's block.
+        assert_eq!(
+            r.pages_flagged(
+                BLOCK + 0x10000,
+                0,
+                &[(12, 1)],
+                page,
+                RGFX_SURFACE_PAGES_READ_ONLY
+            ),
+            RGFX_STATUS_INVALID_ARGUMENT
+        );
     }
 
     /// A `BUFFER_OVER_PAGES` is the sender's own pages block's alone: a block the sender does not

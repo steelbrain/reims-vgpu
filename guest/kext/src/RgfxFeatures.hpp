@@ -131,7 +131,12 @@
 //    stream with RGFX_OP_GUEST_TIMES, the guest's clock as the buffer was made, committed and put
 //    on its ring, and the framebuffer writes, after each VBLANK's reading of the host's clock, the
 //    reading's offset and bound in ring 0's header (RgfxVblankClock::offsetAt), for the host to
-//    split the time before it takes each buffer: a diagnostic.
+//    split the time before it takes each buffer: a diagnostic;
+//  - READ_ONLY_PAGES (bit 45), meaningful only with PAGES_BUFFERS: the kext makes pages blocks of
+//    memory the process maps read-only too, wired for reading alone and marked so in their
+//    SURFACE_PAGES (RGFX_SURFACE_PAGES_READ_ONLY, rgfxPagesWiring), for the host to keep every
+//    object over them from writing their pages, and the bundle lays its no-copy buffers over
+//    read-only memory there with MTLResourceOptions bit 24, whose GPU writes the host drops.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -171,7 +176,7 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA | RGFX_FEATURE_RATE_MAPS |
     RGFX_FEATURE_FUNCTION_POINTERS | RGFX_FEATURE_DYNAMIC_LIBRARIES | RGFX_FEATURE_PIPELINE_KEYS |
     RGFX_FEATURE_ICB_SLOTS_IN_PAGES | RGFX_FEATURE_DOORBELL_ASKS | RGFX_FEATURE_GUEST_TIMES |
-    (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K : RGFX_FEATURE_DISPLAY_POWER);
+    RGFX_FEATURE_READ_ONLY_PAGES | (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K : RGFX_FEATURE_DISPLAY_POWER);
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
 inline uint64_t rgfxDriverFeatures(uint64_t offered)

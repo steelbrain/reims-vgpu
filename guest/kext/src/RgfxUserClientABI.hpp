@@ -64,9 +64,12 @@ enum {
 	// offset in its page (BUFFER_OVER_PAGES). The block is the client's, freed through
 	// kRgfxAccelMethodFree; the process never maps it, so it never sees a guest physical address.
 	// The pages are unwired once the device has answered the block's release, or the client's
-	// close, and stay wired for good where neither is answered. kIOReturnUnsupported where the
-	// device lacks RGFX_FEATURE_PAGES_BUFFERS or refused the pages, and for memory the process may
-	// not write (0) until read-only pages have a user: the GPU's writes would land in pages the
+	// close, and stay wired for good where neither is answered. Memory the process may not write
+	// (0) is wired for reading alone and its SURFACE_PAGES marked RGFX_SURFACE_PAGES_READ_ONLY,
+	// where the device took RGFX_FEATURE_READ_ONLY_PAGES: the host lets only objects whose GPU
+	// writes it drops lie over it. kIOReturnUnsupported where the device lacks
+	// RGFX_FEATURE_PAGES_BUFFERS or refused the pages, and for memory the process may not write
+	// where it lacks RGFX_FEATURE_READ_ONLY_PAGES: the GPU's writes would land in pages the
 	// process cannot write. kIOReturnBadArgument where the range is not mapped in the process;
 	// kIOReturnNoSpace or kIOReturnNoResources where the region or the kext's table has no room
 	// for the block.

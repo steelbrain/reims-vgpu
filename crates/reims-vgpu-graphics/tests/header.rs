@@ -293,6 +293,8 @@ CHECK(offsetof(RgfxOpGuestTimes, posted_ns) == 16);
 CHECK(RGFX_GUEST_TIMES_POSTED_OFFSET == RGFX_COMMAND_BUFFER_OPS_OFFSET + sizeof(RgfxOpHeader) + 16);
 CHECK(offsetof(RgfxRingHeader, guest_clock_offset_ns) == 0x18);
 CHECK(offsetof(RgfxRingHeader, guest_clock_bound_ns) == 0x20);
+CHECK(RGFX_FEATURE_READ_ONLY_PAGES == 0x200000000000ULL);
+CHECK(RGFX_SURFACE_PAGES_READ_ONLY == 0x20);
 CHECK(sizeof(RgfxIcbSlotRun) == 32);
 CHECK(sizeof(RgfxIcbSlotPagesRun) == 48);
 CHECK(offsetof(RgfxIcbSlotPagesRun, block_offset) == 8);
