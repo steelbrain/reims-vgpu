@@ -34,7 +34,11 @@
 //! Every import also carries a dma-buf source ([`host_memory`]): a device that refuses the pages
 //! as host memory, as RADV refuses any page with a file behind it, imports a dma-buf of the same
 //! pages instead (`super::dma_buf`). The runtime asks for it only where it would refuse the
-//! import otherwise, so every device that imports host memory imports as it did.
+//! import otherwise, so every device that imports host memory imports as it did. A buffer's or a
+//! heap's request over a view in a group dma-buf, of the memory itself and not a twin, is answered
+//! with the view's piece of the group's file (`super::dma_buf`'s module docs, "Groups"), where
+//! that piece's offset is a multiple of the alignment the request asks; a texture's, a twin's and
+//! any other request with a dma-buf of its own, as before.
 //!
 //! And every import carries the views' gate ([`import_gate`]), which the runtime asks before it
 //! imports a no-copy buffer's or heap's pages, or a buffer's new pages, by their pointer: where
@@ -328,6 +332,21 @@ fn one_dma_buf_imports() -> bool {
     ONE_DMA_BUF.load(Ordering::Relaxed)
 }
 
+/// Whether a device of the process took a view of guest pages through the dma-bufs its source
+/// made ([`learn_view_imports`]), as RADV does, which imports no page with a file behind it by
+/// pointer ([`groups_views`]).
+static VIEWS_BY_SOURCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the views no-copy buffers lie over are put in group dma-bufs
+/// (`crate::core::platform::os::vm::HostVm::group_views`, `super::dma_buf`'s module docs,
+/// "Groups"): a device of the process takes views through its source's dma-bufs, so its import of
+/// a grouped view's pages is a piece of the group's file ([`host_memory`]); none needs imported
+/// pages mapped from their files, whose imports are made by pointer, or of one dma-buf dedicated
+/// to its buffer, which no shared file serves; and udmabuf is the process's.
+pub(super) fn groups_views() -> bool {
+    VIEWS_BY_SOURCE.load(Ordering::Relaxed) && !imports_need_files() && super::dma_buf::opens()
+}
+
 /// Whether a view of several runs of pages made now is mapped through dma-bufs: udmabuf is the
 /// process's, and no device of it needs imported pages mapped from their files (`super::vm`'s
 /// module docs, "Views through dma-bufs").
@@ -478,6 +497,9 @@ pub(crate) fn learn_view_imports(device: &rt::Device) {
     );
     if let Some(why) = why {
         log::debug!(target: "reims_vgpu_vulkan::os", "the view's dma-buf source: {why}");
+    }
+    if through_dma_bufs {
+        VIEWS_BY_SOURCE.store(true, Ordering::Relaxed);
     }
     if !through_dma_bufs {
         // The pages one dma-buf holds, as many runs as it takes, within its bytes.
@@ -1141,6 +1163,22 @@ unsafe fn host_memory_noting(
         }
         let first = shown_at(request.start).as_ptr().addr().to_u64();
         let (length, granule) = (request.length, request.granule);
+        // A buffer's or a heap's import of a grouped view's pages, not a twin's: a piece of the
+        // group's file (`super::dma_buf`'s module docs, "Groups").
+        if request.shared_files && first == addr_of(request.start) {
+            let alignment = request.alignment;
+            super::dma_buf::asked_alignment(alignment);
+            if let Some((file, offset)) = super::dma_buf::piece_of(first, length, alignment) {
+                log::debug!(
+                    "{length:#x} bytes at {first:#x} as the piece at {offset:#x} of a group dma-buf"
+                );
+                return Ok(vec![rt::DmaBufChunk {
+                    file,
+                    offset,
+                    length,
+                }]);
+            }
+        }
         match super::dma_buf::of_pages(first, length, granule, &zeros) {
             Ok(chunks) => {
                 log::debug!(
@@ -2216,5 +2254,97 @@ mod tests {
         assert!(vm.deallocate(other, n * PAGE).is_success());
         assert!(vm.deallocate(view, n * PAGE).is_success());
         assert!(vm.deallocate(src, n * PAGE).is_success());
+    }
+
+    /// Where views are imported through their dma-bufs and udmabuf opens ([`groups_views`],
+    /// RADV's), the platform's VM (`crate::remap::VulkanVm`, which the library's devices are
+    /// given) answers a shared file's limits, and no-copy buffers over views it puts into one
+    /// group dma-buf (`super::dma_buf`'s module docs, "Groups") are imported as pieces of its
+    /// file: the device imports the file at the first piece, and the others join that import; the
+    /// GPU reads each view's own pages, in the view's order, and its fill shows through them; once
+    /// the buffers go, so does the file's import. Elsewhere, said on stderr, nothing is checked.
+    #[test]
+    fn grouped_views_are_imported_as_pieces_of_one_file() {
+        let d = crate::gpu::device::tests::dev();
+        crate::gpu::device::tests::settle_device_checks(&d);
+        probes_gone();
+        if !groups_views() {
+            eprintln!(
+                "skipped: {} takes no view through its dma-bufs here, or udmabuf does not open",
+                d.raw.properties().name
+            );
+            return;
+        }
+        // The members at offsets every request's alignment divides.
+        super::super::dma_buf::asked_alignment(1 << 16);
+        let vm = LinuxVm::new();
+        // Pages of each view; 32 pages are more than the runtime's 64 KiB granule.
+        let made: Vec<(HostAddr, HostAddr, u64)> = [4, 32, 4]
+            .into_iter()
+            .map(|n| {
+                let (src, view) = backwards(&vm, n);
+                (src, view, n)
+            })
+            .collect();
+        let platform_vm = crate::remap::VulkanVm::new();
+        let limits = platform_vm.view_groups().expect("a shared file's limits");
+        assert!(limits.bytes <= super::super::dma_buf::GROUP_BYTES && limits.runs > 0);
+        let views: Vec<(HostAddr, u64)> = (made.iter())
+            .map(|&(_, view, n)| (view, n * PAGE))
+            .collect();
+        let groups = platform_vm.group_views(&views);
+        let (files, members) = (groups.making, groups.members);
+        let shared = (files.as_ref())
+            .and_then(|f| f.downcast_ref::<Vec<Arc<OwnedFd>>>())
+            .map(Vec::len);
+        assert_eq!(shared, Some(1), "one group");
+        assert!(members.iter().all(Option::is_some), "every view in it");
+        let before = d.raw.work_counts();
+        let mut buffers = Vec::new();
+        for (round, &(src, view, n)) in made.iter().enumerate() {
+            let check = FoldCheck {
+                own: src.addr().to_u64(),
+                view: view.addr().to_u64(),
+                pages: n,
+                round: round.to_u64(),
+            };
+            check.write();
+            let (buffer, gone) = no_copy(&d, view, n);
+            assert_eq!(check.gpu(&d.raw, &buffer.raw), Ok(()), "view {round}");
+            buffers.push((buffer, gone));
+        }
+        let after = d.raw.work_counts();
+        assert_eq!(
+            (
+                after.dma_buf_imports - before.dma_buf_imports,
+                after.dma_buf_pieces_joined - before.dma_buf_pieces_joined,
+                after.dma_buf_shared_imports_live,
+            ),
+            (1, 2, before.dma_buf_shared_imports_live + 1),
+            "the file imported once, the other pieces joining it"
+        );
+        drop(files);
+        let wait = std::time::Duration::from_secs(10);
+        for (buffer, gone) in buffers {
+            drop(buffer);
+            assert_eq!(gone.recv_timeout(wait), Ok(()), "the deallocator ran");
+        }
+        let live = || d.raw.work_counts().dma_buf_shared_imports_live;
+        for _ in 0..wait.as_millis() {
+            if live() == before.dma_buf_shared_imports_live {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            live(),
+            before.dma_buf_shared_imports_live,
+            "the file's import freed"
+        );
+        drop(members);
+        for (src, view, n) in made {
+            assert!(vm.deallocate(view, n * PAGE).is_success());
+            assert!(vm.deallocate(src, n * PAGE).is_success());
+        }
     }
 }

@@ -139,7 +139,9 @@ use std::ptr::NonNull;
 
 use crate::core::host::HostPtr;
 use crate::core::num::{ToU64, ToUsize};
-use crate::core::platform::os::vm::{HostAddr, HostVm, KernReturn, VmProt};
+use crate::core::platform::os::vm::{
+    GroupLimits, HostAddr, HostVm, KernReturn, ViewGroups, VmProt,
+};
 use crate::core::sync::{Condvar, Mutex};
 
 use crate::os::OsVm;
@@ -595,6 +597,14 @@ impl HostVm for VulkanVm {
 
     fn view_room(&self) -> Option<u64> {
         self.vm.view_room()
+    }
+
+    fn view_groups(&self) -> Option<GroupLimits> {
+        self.vm.view_groups()
+    }
+
+    fn group_views(&self, views: &[(HostAddr, u64)]) -> ViewGroups {
+        self.vm.group_views(views)
     }
 
     fn deallocate(&self, addr: HostAddr, len: u64) -> KernReturn {

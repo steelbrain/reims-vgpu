@@ -31,6 +31,21 @@
 //! (RADV passes each in a list on every submit): 1,024 live imports cost 642 µs a submit, 4,096
 //! about 2.5 ms. So the fewest chunks are made, and an import goes with its buffer.
 //!
+//! **Groups.** Views of guest pages that no-copy buffers lie over are imported one each, so a
+//! process with many of them pays for each at every submission. The graphics device's surface
+//! worker gathers the views a process makes at once and hands them to [`group_views`]
+//! (`crate::core::platform::os::vm::HostVm::group_views`): their pages go into group dma-bufs
+//! ([`of_group`]), each as many views back to back as fit udmabuf's limits, and each view's place
+//! is registered ([`GROUPED`]) while its membership lives. The import source then answers a
+//! buffer's or a heap's request over a registered view's pages with that piece of the group's
+//! file ([`piece_of`], `super::import`'s `host_memory`), the file shared by its `Arc`, and the
+//! runtime imports the file once for all of them. A member's place goes as its view does, before
+//! the view is unmapped, so a view mapped later at its address is never answered with its pages;
+//! a request after it, or once the group's file is gone (a device's recovery asking again), is
+//! answered with a dma-buf of its own, as before. While any member's import lives, every member's
+//! pages stay pinned in the file and mapped in the device's import: a group holds at most
+//! [`GROUP_BYTES`], 64 MiB, whatever udmabuf takes.
+//!
 //! **The pages' size** (**measured** 2026-10-26, RADV of Mesa 26.2.4, raw Vulkan with no runtime
 //! between, kernels of our own reading 64 MiB and writing 64 MiB, the median GPU time of five in
 //! ms; what else the pages cost is in `super::import`):
@@ -66,7 +81,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 
 use crate::core::sync::Mutex;
 use metal2vulkan_runtime::DmaBufChunk;
@@ -499,9 +515,10 @@ pub(crate) struct Group {
 /// and a length (whole pages, resolved through the backing table as [`add_runs`] resolves them),
 /// in order: each member starts at a multiple of `align` (a multiple of the host page; the host
 /// page where less), and the bytes between two members are a file of zeros of the group's own,
-/// so the file holds no page of other memory. A group takes members while they fit udmabuf's
-/// limits as the host has them now, counting each member's runs apart (two members whose pages
-/// follow on in a file are two runs), and stops at the first member that does not fit or whose
+/// so the file holds no page of other memory. A group takes members while they fit `limits`
+/// (within udmabuf's as the host has them, [`limits`]), counting each member's runs apart (two
+/// members whose pages follow on in a file are two runs), and stops at the first member that
+/// does not fit or whose
 /// pages resolve to no file, leaving it and those after it to another group. Refused where the
 /// first member alone does not fit, where its pages resolve to no file, where `/dev/udmabuf` does
 /// not open, or where the kernel refuses the list. A gap whose file of zeros the kernel does not
@@ -509,13 +526,13 @@ pub(crate) struct Group {
 pub(crate) fn of_group(
     members: &[(u64, u64)],
     align: u64,
+    limits: Limits,
     zeros: &Zeros,
 ) -> Result<Group, Refusal> {
     let page = vm::page_size();
     let align = align.max(page);
     debug_assert!(align.is_multiple_of(page));
     let device = device()?;
-    let limits = limits();
     let mut runs: Vec<Run<Arc<OwnedFd>>> = Vec::new();
     let mut offsets = Vec::new();
     let mut length: u64 = 0;
@@ -570,6 +587,160 @@ pub(crate) fn of_group(
         offsets,
         length,
     })
+}
+
+/// The views [`group_views`] put in group dma-bufs whose membership lives ([`Membership`]), by
+/// first byte: what the import source answers a request over their pages with
+/// ([`piece_of`]).
+static GROUPED: Mutex<BTreeMap<u64, Grouped>> = Mutex::new(BTreeMap::new());
+
+/// A view in [`GROUPED`].
+#[derive(Debug)]
+struct Grouped {
+    /// The view's bytes.
+    length: u64,
+    /// Its group's file: the runtime's imports of it, and the caller of [`group_views`] until it
+    /// has made each member's import, hold it.
+    file: Weak<OwnedFd>,
+    /// Where the view's pages start in the file.
+    offset: u64,
+    /// Its membership's number, so a membership drops its own entry alone.
+    number: u64,
+}
+
+/// The largest alignment a request of the runtime's has asked a shared piece's offset to be a
+/// multiple of ([`asked_alignment`]), which each group's members start at, at least the host page.
+static ALIGNMENT: AtomicU64 = AtomicU64::new(0);
+
+/// A request of the runtime's asked for pieces at offsets that are multiples of `alignment`: the
+/// groups made from now on start their members at a multiple of it, at least.
+pub(crate) fn asked_alignment(alignment: u64) {
+    ALIGNMENT.fetch_max(alignment, Ordering::Relaxed);
+}
+
+/// A view's place in its group dma-buf ([`GROUPED`]), until it drops: the view's owner drops it
+/// before the view is unmapped, so a view mapped later at the same address is never answered with
+/// the old view's pages.
+#[derive(Debug)]
+pub(crate) struct Membership {
+    first: u64,
+    number: u64,
+}
+
+impl Drop for Membership {
+    fn drop(&mut self) {
+        let mut grouped = GROUPED.lock();
+        if grouped
+            .get(&self.first)
+            .is_some_and(|g| g.number == self.number)
+        {
+            grouped.remove(&self.first);
+        }
+    }
+}
+
+/// The most bytes one group dma-buf holds, whatever udmabuf takes: a member whose buffers went
+/// keeps its pages pinned and mapped in the device's import while another member's import lives,
+/// so a group's bytes bound what such members hold (`super::dma_buf`'s module docs, "Groups").
+/// udmabuf's default `size_limit_mb`, which CachyOS's 7.3 kernels raise to 2147483647 as they boot
+/// (`super::host_ram`'s module docs), where `list_limit` alone would let a group of large views
+/// grow to gigabytes.
+pub(crate) const GROUP_BYTES: u64 = 64 << 20;
+
+/// What one group dma-buf holds at most: udmabuf's limits as the host has them ([`limits`]), its
+/// bytes at most [`GROUP_BYTES`].
+pub(crate) fn group_limits() -> Limits {
+    let limits = limits();
+    Limits {
+        pieces: limits.pieces,
+        bytes: limits.bytes.min(GROUP_BYTES),
+    }
+}
+
+/// What [`group_views`] made: the group dma-bufs, which the caller holds until it has made each
+/// member's import, and each view's membership, `None` for a view left alone.
+pub(crate) type Groups = (Vec<Arc<OwnedFd>>, Vec<Option<Membership>>);
+
+/// Puts `views`, each a first byte and a length (whole pages of the library's views, mapped),
+/// into group dma-bufs ([`of_group`]), in order, each as many as fit, the members starting at the
+/// alignment the runtime's requests have asked for ([`asked_alignment`]), and registers each
+/// member's place ([`GROUPED`]). A view a group refuses as its first member (its pages past the
+/// limits alone, or resolving to no file) is left alone and the next starts a group, and a group
+/// that would take only its first member is not made: its import is made as before, a dma-buf
+/// of its own.
+pub(crate) fn group_views(views: &[(u64, u64)]) -> Groups {
+    group_views_at(views, ALIGNMENT.load(Ordering::Relaxed))
+}
+
+/// [`group_views`], the members starting at multiples of `align`, at least the host page.
+fn group_views_at(views: &[(u64, u64)], align: u64) -> Groups {
+    static NUMBER: AtomicU64 = AtomicU64::new(0);
+    let limits = group_limits();
+    let mut files = Vec::new();
+    let mut members: Vec<Option<Membership>> = views.iter().map(|_| None).collect();
+    let align = align.max(vm::page_size());
+    // The views hold no page of the block of zeros: the group's own files of them go with it.
+    let zeros = Zeros::default();
+    let mut at = 0;
+    while views.len() - at > 1 {
+        let group = match of_group(&views[at..], align, limits, &zeros) {
+            Ok(group) => group,
+            Err(refusal) => {
+                log::debug!(
+                    "a view of {:#x} bytes at {:#x} starts no group dma-buf: {refusal}",
+                    views[at].1,
+                    views[at].0
+                );
+                at += 1;
+                continue;
+            }
+        };
+        let taken = group.offsets.len();
+        if taken > 1 {
+            let mut grouped = GROUPED.lock();
+            for (i, &offset) in group.offsets.iter().enumerate() {
+                let (first, length) = views[at + i];
+                let number = NUMBER.fetch_add(1, Ordering::Relaxed);
+                let file = Arc::downgrade(&group.file);
+                grouped.insert(
+                    first,
+                    Grouped {
+                        length,
+                        file,
+                        offset,
+                        number,
+                    },
+                );
+                members[at + i] = Some(Membership { first, number });
+            }
+            drop(grouped);
+            log::debug!(
+                "{taken} views in a group dma-buf of {:#x} bytes, from the view at {:#x}",
+                group.length,
+                views[at].0
+            );
+            files.push(group.file);
+        }
+        at += taken;
+    }
+    (files, members)
+}
+
+/// The piece of a group dma-buf that holds the `length` bytes from `first` ([`GROUPED`]): its
+/// file and the bytes' offset in it, where they lie in one view whose membership lives, its file
+/// held still, and that offset is a multiple of `alignment`.
+pub(crate) fn piece_of(first: u64, length: u64, alignment: u64) -> Option<(Arc<OwnedFd>, u64)> {
+    let grouped = GROUPED.lock();
+    let (&base, view) = grouped.range(..=first).next_back()?;
+    let end = first.checked_add(length)?;
+    if end > base.saturating_add(view.length) {
+        return None;
+    }
+    let offset = view.offset + (first - base);
+    if !offset.is_multiple_of(alignment.max(1)) {
+        return None;
+    }
+    Some((view.file.upgrade()?, offset))
 }
 
 /// One dma-buf of a view's pages ([`of_view`]): `length` bytes of the view from `at`, to map with
@@ -1042,6 +1213,13 @@ mod tests {
         }
     }
 
+    /// The limits the group tests make their dma-bufs within: udmabuf's defaults, whatever the
+    /// host's.
+    const LIMITS: Limits = Limits {
+        pieces: DEFAULT_LIST_LIMIT,
+        bytes: DEFAULT_SIZE_LIMIT_MB << 20,
+    };
+
     /// The byte at `offset` of the group's file, read through a mapping of it.
     fn read_group(group: &Group, offset: u64) -> u8 {
         let chunk = DmaBufChunk {
@@ -1082,7 +1260,7 @@ mod tests {
         let page = vm::page_size();
         let at = marked(6);
         let members = [(at + page, 2 * page), (at + 4 * page, page), (at, page)];
-        let group = of_group(&members, page, &Zeros::default()).unwrap();
+        let group = of_group(&members, page, LIMITS, &Zeros::default()).unwrap();
         assert_eq!(group.offsets, [0, 2 * page, 3 * page]);
         assert_eq!(group.length, 4 * page);
         let read: Vec<u8> = (0..4).map(|i| read_group(&group, i * page)).collect();
@@ -1108,7 +1286,7 @@ mod tests {
         let page = vm::page_size();
         let at = marked(3);
         let members = [(at, page), (at + page, 2 * page)];
-        let group = of_group(&members, 4 * page, &Zeros::default()).unwrap();
+        let group = of_group(&members, 4 * page, LIMITS, &Zeros::default()).unwrap();
         assert_eq!(group.offsets, [0, 4 * page]);
         assert_eq!(group.length, 6 * page);
         assert_eq!(read_group(&group, 0), 0x40);
@@ -1119,46 +1297,54 @@ mod tests {
         assert_eq!(read_group(&group, 5 * page), 0x42);
     }
 
-    /// A group takes members while they fit one dma-buf: the first member past the limits, or
-    /// whose pages no file is behind, ends it, and is left with those after it; a first member
-    /// that does not fit alone, or resolves to no file, is refused
+    /// A group takes members while they fit one dma-buf: the first member past the limits, its
+    /// bytes or its runs, or whose pages no file is behind, ends it, and is left with those after
+    /// it; a first member that does not fit alone, or resolves to no file, is refused. With limits
+    /// of the test's own, udmabuf's defaults, so it holds whatever the host's are
     #[test]
     fn a_group_ends_at_the_first_member_that_does_not_fit() {
         if !udmabuf() {
             return;
         }
         let page = vm::page_size();
-        let limits = limits();
-        if limits.bytes > 1 << 30 {
-            eprintln!(
-                "skipped: udmabuf takes {} bytes a dma-buf here",
-                limits.bytes
-            );
-            return;
-        }
-        let at = marked(2);
-        // The whole of the limit, untouched: the backing table resolves it, and only a group
-        // made of it would pin its pages.
-        let large = vm::allocate_aliasable(limits.bytes)
+        let at = marked(4);
+        // The whole of the limit and a page, untouched: the backing table resolves it, and only a
+        // group made of it would pin its pages.
+        let large = vm::allocate_aliasable(LIMITS.bytes + page)
             .unwrap()
             .addr()
             .to_u64();
         let group = of_group(
-            &[(at, page), (large, limits.bytes), (at + page, page)],
+            &[(at, page), (large, LIMITS.bytes), (at + page, page)],
             page,
+            LIMITS,
             &Zeros::default(),
         )
         .unwrap();
-        assert_eq!(group.offsets, [0], "the second is past the limits");
+        assert_eq!(group.offsets, [0], "the second is past the bytes");
         assert_eq!(group.length, page);
         assert!(matches!(
-            of_group(&[(large, limits.bytes + page)], page, &Zeros::default()),
+            of_group(
+                &[(large, LIMITS.bytes + page)],
+                page,
+                LIMITS,
+                &Zeros::default()
+            ),
             Err(Refusal::Limit { .. })
         ));
+        // Three runs apart, at two runs a dma-buf.
+        let two = Limits {
+            pieces: 2,
+            ..LIMITS
+        };
+        let apart = [(at, page), (at + 2 * page, page), (at + 3 * page, page)];
+        let group = of_group(&apart, page, two, &Zeros::default()).unwrap();
+        assert_eq!(group.offsets, [0, page], "the third is past the runs");
         let private = vm::anonymous(None, page, "a test's private page").unwrap();
         let group = of_group(
             &[(at, page), (private, page), (at + page, page)],
             page,
+            LIMITS,
             &Zeros::default(),
         )
         .unwrap();
@@ -1168,8 +1354,128 @@ mod tests {
             "a member no file is behind ends the group"
         );
         assert!(matches!(
-            of_group(&[(private, page), (at, page)], page, &Zeros::default()),
+            of_group(
+                &[(private, page), (at, page)],
+                page,
+                LIMITS,
+                &Zeros::default()
+            ),
             Err(Refusal::Unresolved)
         ));
+    }
+
+    /// udmabuf's limits are read from the module's parameters where the host shows them, and
+    /// are its defaults where it does not; a group dma-buf takes them, its bytes at most
+    /// [`GROUP_BYTES`]
+    #[test]
+    fn the_limits_are_the_hosts_and_a_groups_bytes_at_most_64_mib() {
+        let read = |name: &str| {
+            std::fs::read_to_string(format!("/sys/module/udmabuf/parameters/{name}"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+        };
+        let expected = Limits {
+            pieces: read("list_limit").unwrap_or(DEFAULT_LIST_LIMIT),
+            bytes: read("size_limit_mb").unwrap_or(DEFAULT_SIZE_LIMIT_MB) << 20,
+        };
+        assert_eq!(limits(), expected);
+        let group = group_limits();
+        assert_eq!(group.pieces, expected.pieces);
+        assert_eq!(group.bytes, expected.bytes.min(64 << 20));
+    }
+
+    /// Grouped views are answered with their pieces of one group dma-buf while their memberships
+    /// live and the file is held: the same file for each, each view at its offset, a part of a
+    /// view at its offset there, which holds the view's own pages, and none at an offset that is
+    /// not a multiple of the alignment asked, nor past a view's end. A view whose membership
+    /// went, and every view once the group's file is let go of (a device's recovery asking
+    /// again after the imports went), is answered by no piece, so its pages take a dma-buf of
+    /// their own, as before
+    #[test]
+    fn grouped_views_are_answered_with_their_pieces_while_their_group_lives() {
+        if !udmabuf() {
+            return;
+        }
+        let page = vm::page_size();
+        let at = marked(6);
+        let views = [(at, 2 * page), (at + 3 * page, page), (at + 5 * page, page)];
+        let (files, members) = group_views_at(&views, page);
+        assert_eq!(files.len(), 1, "one group");
+        assert!(members.iter().all(Option::is_some), "each view a member");
+        let pieces: Vec<(Arc<OwnedFd>, u64)> = (views.iter())
+            .map(|&(first, length)| piece_of(first, length, page).expect("a piece"))
+            .collect();
+        assert!(pieces.iter().all(|(f, _)| Arc::ptr_eq(f, &files[0])));
+        let offsets: Vec<u64> = pieces.iter().map(|p| p.1).collect();
+        assert_eq!(offsets, [0, 2 * page, 3 * page]);
+        let group = Group {
+            file: Arc::clone(&files[0]),
+            offsets: offsets.clone(),
+            length: 4 * page,
+        };
+        assert_eq!(read_group(&group, 2 * page), 0x43, "the second view's page");
+        // A part of the first view, and its alignment.
+        let (file, offset) = piece_of(at + page, page, page).expect("a part's piece");
+        assert!(Arc::ptr_eq(&file, &files[0]));
+        assert_eq!(offset, page);
+        assert!(
+            piece_of(at + page, page, 2 * page).is_none(),
+            "not a multiple of 2 pages"
+        );
+        assert!(
+            piece_of(at + page, 2 * page, page).is_none(),
+            "past the view's end"
+        );
+        // Asked again, as at a recovery, while the group lives: the same piece.
+        let again = piece_of(views[1].0, views[1].1, page).expect("a piece again");
+        assert!(Arc::ptr_eq(&again.0, &files[0]));
+        assert_eq!(again.1, 2 * page);
+        drop(again);
+        // A membership gone: none for that view.
+        let mut members = members;
+        members[0] = None;
+        assert!(
+            piece_of(views[0].0, views[0].1, page).is_none(),
+            "its membership went"
+        );
+        assert!(piece_of(views[2].0, views[2].1, page).is_some());
+        // The group's file let go of: none for any, though their memberships live.
+        drop((pieces, file, group, files));
+        assert!(
+            piece_of(views[1].0, views[1].1, page).is_none(),
+            "the file went"
+        );
+        assert!(
+            piece_of(views[2].0, views[2].1, page).is_none(),
+            "the file went"
+        );
+        drop(members);
+    }
+
+    /// A group's members start at the alignment asked; a view a group cannot start with (its
+    /// pages resolving to no file) is left alone and the next starts the group; and a group that
+    /// would take one view alone is not made
+    #[test]
+    fn views_no_group_takes_are_left_alone() {
+        if !udmabuf() {
+            return;
+        }
+        let page = vm::page_size();
+        let at = marked(4);
+        let (files, members) = group_views_at(&[(at, page), (at + 2 * page, page)], 4 * page);
+        assert_eq!(files.len(), 1);
+        assert!(members.iter().all(Option::is_some));
+        assert_eq!(piece_of(at + 2 * page, page, 4 * page).unwrap().1, 4 * page);
+        drop((files, members));
+        let private = vm::anonymous(None, page, "a test's private page").unwrap();
+        let views = [(private, page), (at, page), (at + page, page)];
+        let (files, members) = group_views_at(&views, page);
+        assert_eq!(files.len(), 1);
+        assert!(members[0].is_none(), "no file behind it: alone");
+        assert!(members[1].is_some() && members[2].is_some());
+        assert!(piece_of(private, page, page).is_none());
+        drop((files, members));
+        let (files, members) = group_views_at(&[(at + 3 * page, page)], page);
+        assert!(files.is_empty() && members[0].is_none(), "one view alone");
     }
 }

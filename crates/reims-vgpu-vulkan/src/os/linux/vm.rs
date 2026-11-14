@@ -134,7 +134,9 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::sync::Arc;
 
 use crate::core::num::{ToU64, ToUsize};
-use crate::core::platform::os::vm::{HostAddr, HostVm, KernReturn, VmProt};
+use crate::core::platform::os::vm::{
+    GroupHold, GroupLimits, HostAddr, HostVm, KernReturn, ViewGroups, VmProt,
+};
 use crate::core::sync::{ReadGuard, WriterPrefRwLock};
 
 use super::budget;
@@ -1268,6 +1270,40 @@ impl HostVm for LinuxVm {
     fn view_mappings(&self, at: HostAddr, len: u64) -> Option<u64> {
         let first = at.addr().to_u64();
         Some(files::mappings_between(first, first.saturating_add(len)))
+    }
+
+    /// udmabuf's limits as the host has them, a group's bytes at most 64 MiB
+    /// ([`super::dma_buf::group_limits`]), where the process's devices import views through their
+    /// dma-buf sources ([`super::import::groups_views`]).
+    fn view_groups(&self) -> Option<GroupLimits> {
+        super::import::groups_views().then(|| {
+            let limits = super::dma_buf::group_limits();
+            GroupLimits {
+                runs: limits.pieces,
+                bytes: limits.bytes,
+            }
+        })
+    }
+
+    /// Group dma-bufs of the views' pages ([`super::dma_buf::group_views`]), where
+    /// [`Self::view_groups`] answers limits; none otherwise.
+    fn group_views(&self, views: &[(HostAddr, u64)]) -> ViewGroups {
+        if !super::import::groups_views() {
+            return ViewGroups {
+                making: None,
+                members: views.iter().map(|_| None).collect(),
+            };
+        }
+        let views: Vec<(u64, u64)> = (views.iter())
+            .map(|&(at, length)| (at.addr().to_u64(), length))
+            .collect();
+        let (files, members) = super::dma_buf::group_views(&views);
+        ViewGroups {
+            making: (!files.is_empty()).then(|| -> GroupHold { Box::new(files) }),
+            members: (members.into_iter())
+                .map(|m| m.map(|m| -> GroupHold { Box::new(m) }))
+                .collect(),
+        }
     }
 }
 
