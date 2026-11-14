@@ -1938,14 +1938,17 @@ another over it, on all three; the bytes past a plane's texels are the surface's
 and the GPU's own on the x86 Macs, which sync only the texels with the CPU. Neither answer is a
 promise of Metal's.
 
-What our stack does *(class 3)*: on a host whose device cache lays a plane out at the GPU's pitch,
-a texture past the plane's texels lies over the block's wide home, and each encoder that writes
-through either it or a texture over the cache is followed in its command buffer by a copy of its
-texel rows into the other side, before the next encoder (`decode::surface_cache`, "Wider than the
-plane"). The home over the block's view of its pages gives the M3's bytes past the texels; the
-stand-in, where the block has no view, gives the x86 Macs'. Until 11-13 such a texture raised
-`RowPitch` where it was wider than the cache's pitch (`l008.fmt.rg8` on an arm64 macOS 27 guest,
-MoltenVK), and read the cache's own bytes past the plane where it fitted the pitch.
+What our stack does *(class 3 for the order; class 2 for the bytes past the texels)*: on a host
+whose device cache lays a plane out at the GPU's pitch, a texture past the plane's texels lies over
+the block's wide home, and each encoder that writes through either it or a texture over the cache is
+followed in its command buffer by a copy of its texel rows into the other side, before the next
+encoder (`decode::surface_cache`, "Wider than the plane"). The home over the block's view of its
+pages gives the M3's bytes past the texels; the stand-in, where the block has no view, gives the x86
+Macs'. Until 11-13 such a texture raised `RowPitch` where it was wider than the cache's pitch
+(`l008.fmt.rg8` on an arm64 macOS 27 guest, MoltenVK), and read the cache's own bytes past the plane
+where it fitted the pitch. On an arm64 macOS 27.0.1 guest on the M3 the eight cases now answer as
+the M3 does natively (before: the wide texture refused, so its writes never landed and the narrow
+texture's never reached it).
 
 ## Not measured
 
