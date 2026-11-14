@@ -405,12 +405,15 @@ impl<P: ApiPlatform> Bench<P> {
     /// Each command buffer's ops of a repetition, their objects looked up: made before a count
     /// starts.
     fn bound(&self) -> Vec<Vec<Bound<'_, P>>> {
-        let named = |step: Step| match (step, self.decoder.object(match step {
-            Step::Pipeline => PIPELINE_ID,
-            Step::Texture(id, _) | Step::Buffer(id, _, _) => id,
-            Step::Sampler => SAMPLER_ID,
-            Step::Begin | Step::Dispatch | Step::End => 0,
-        })) {
+        let named = |step: Step| match (
+            step,
+            self.decoder.object(match step {
+                Step::Pipeline => PIPELINE_ID,
+                Step::Texture(id, _) | Step::Buffer(id, _, _) => id,
+                Step::Sampler => SAMPLER_ID,
+                Step::Begin | Step::Dispatch | Step::End => 0,
+            }),
+        ) {
             (Step::Begin, _) => Bound::Begin,
             (Step::End, _) => Bound::End,
             (Step::Dispatch, _) => Bound::Dispatch,
@@ -585,10 +588,9 @@ fn through_runtime(bench: &Bench<reims_vgpu_vulkan::VulkanPlatform>) -> Counts {
                 Bound::Buffer(buffer, offset, index) => {
                     e.set_buffers(&[Some(&buffer.raw)], &[offset], index as u32)
                 }
-                Bound::Dispatch => e.dispatch_threadgroups(
-                    rt::Size::new(1, 1, 1),
-                    rt::Size::new(THREADS, 1, 1),
-                ),
+                Bound::Dispatch => {
+                    e.dispatch_threadgroups(rt::Size::new(1, 1, 1), rt::Size::new(THREADS, 1, 1))
+                }
             }
             .unwrap();
         }
@@ -741,7 +743,10 @@ fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>, runtime: fn(&Bench<P
             continue;
         }
         let [median, lowest, highest] = spread(late);
-        println!("  {:>12} {path:>9}: {median:9.3} [{lowest:.3}, {highest:.3}]", "latency");
+        println!(
+            "  {:>12} {path:>9}: {median:9.3} [{lowest:.3}, {highest:.3}]",
+            "latency"
+        );
     }
 }
 
