@@ -197,3 +197,63 @@ fragment float4 displayPipeLutScanoutFragment(PresentVertex in [[stage_in]],
     return float4(lut.read(uint2(bgra.z, 0)).r, lut.read(uint2(bgra.y, 0)).g,
                   lut.read(uint2(bgra.x, 0)).b, 1.0f);
 }
+
+// ---- The window's mirror on the compositor's GPU ----
+
+// The window's mirror (reims-vgpu's graphics/mirror.rs): a presented frame's bytes, `rows` rows
+// `words_per_row` 32-bit words apart, whose first `row_words` words are its pixels, in 64-row
+// tiles `tile_words` words wide. `all` is 1 where every tile goes.
+struct DisplayMirrorFrame {
+    uint words_per_row;
+    uint row_words;
+    uint rows;
+    uint tile_words;
+    uint all;
+};
+
+// The threads of a mirror tile's threadgroup.
+constant uint display_mirror_threads = 256;
+
+// Tile `tile` of the presented frame `now`: where any of its words differs from the frame the
+// mirror holds (`sent`, the frame its last sync copied), or every tile goes, all of its words are
+// copied into the mirror (`mirror`, in host memory) and `tiles` counts it. A tile that changed
+// nothing writes nothing.
+kernel void displayMirrorTile(device const uint *now [[buffer(0)]],
+                              device const uint *sent [[buffer(1)]],
+                              device uint *mirror [[buffer(2)]],
+                              constant DisplayMirrorFrame &frame [[buffer(3)]],
+                              device atomic_uint *tiles [[buffer(4)]],
+                              uint2 tile [[threadgroup_position_in_grid]],
+                              uint index [[thread_index_in_threadgroup]]) {
+    threadgroup uint differs[display_mirror_threads];
+    threadgroup uint changed;
+    uint x0 = tile.x * frame.tile_words;
+    uint y0 = tile.y * 64;
+    uint width = min(x0 + frame.tile_words, frame.row_words) - x0;
+    uint count = width * (min(y0 + 64, frame.rows) - y0);
+    uint mine = 0;
+    for (uint i = index; i < count; i += display_mirror_threads) {
+        uint at = (y0 + i / width) * frame.words_per_row + x0 + i % width;
+        mine |= now[at] ^ sent[at];
+    }
+    differs[index] = mine;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (index == 0) {
+        uint any = frame.all;
+        for (uint t = 0; t < display_mirror_threads; t++) {
+            any |= differs[t];
+        }
+        changed = any;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (changed == 0) {
+        return;
+    }
+    if (index == 0) {
+        atomic_fetch_add_explicit(tiles, 1u, memory_order_relaxed);
+    }
+    for (uint i = index; i < count; i += display_mirror_threads) {
+        uint at = (y0 + i / width) * frame.words_per_row + x0 + i % width;
+        mirror[at] = now[at];
+    }
+}

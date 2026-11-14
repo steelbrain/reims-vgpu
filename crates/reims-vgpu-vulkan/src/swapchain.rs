@@ -30,10 +30,13 @@
 //! (an RTX 5080 Laptop GPU's NVIDIA driver under KWin), while its feature, like any the runtime
 //! enables for a listed extension, would be one more a device could be refused for.
 //!
-//! **A compositor on another GPU (measured).** The swapchain is the runtime's device's, whatever
-//! GPU the compositor runs on. Where that is another GPU (a GPU in an eGPU enclosure or an x4
-//! slot beside the integrated GPU that drives the screen, or a laptop's discrete GPU beside the
-//! panel's), each present crosses the GPU's link once. An RTX 3090 on PCIe 3.0 x4 under KWin on
+//! **A compositor on another GPU (measured).** The swapchain is made on its queue's device: the
+//! runtime's, or, where the window system names another GPU the compositor composites on, a
+//! device of the window's own there, which presents the guest's frames from a mirror in host
+//! memory (reims-vgpu's `graphics::vulkan`, "The compositor's GPU"). On the runtime's device with the
+//! compositor on another GPU (a GPU in an eGPU enclosure or an x4 slot beside the integrated GPU
+//! that drives the screen, or a laptop's discrete GPU beside the panel's), each present crosses
+//! the GPU's link once. An RTX 3090 on PCIe 3.0 x4 under KWin on
 //! a Radeon 780M (NVIDIA 620.70.06, 2026-11-13) handed KWin four LINEAR XRGB8888 buffers of the
 //! window's size (3648 x 2039, 29.75 MB), and each present moved one of them; on a desktop walk
 //! the window presented 0.93 times for each of the guest's presents. The 3090's link carries
@@ -41,8 +44,8 @@
 //! takes 16.4 ms of it: 61 presents a second at most, with nothing else crossing. Only its
 //! graphics family presents to the surface. Where the compositor runs on the runtime's GPU (an
 //! RTX 5080 Laptop GPU driving its panel), the buffers are the GPU's own tiled images, and
-//! nothing crosses. docs/graphics-kext/design.md (Decided, 14) has the walks, and two routes
-//! proposed for showing the window on the compositor's GPU.
+//! nothing crosses. docs/graphics-kext/design.md (Decided, 14) has the walks, and the window
+//! shown by the compositor's GPU.
 //!
 //! **Pacing, on the render thread.** Each draw takes the next image with a fence, and waits for the
 //! fence, up to [`WAIT_NS`]: that is the render thread's wait for the compositor, as `nextDrawable`

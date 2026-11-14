@@ -125,6 +125,7 @@ mod compile;
 mod completion;
 mod decode;
 mod device_info;
+mod mirror;
 #[cfg(target_os = "linux")]
 mod nvidia;
 mod present;
