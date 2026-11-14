@@ -1037,7 +1037,7 @@ supportsYCBCRFormatsXR base %base-spi
 supportsYCBCRPackedFormats12 base %base-spi
 supportsYCBCRPackedFormatsPQ base %base-spi
 supportsYCBCRPackedFormatsXR base %base-spi
-targetDeviceArchitecture base class 2 (the Macs diverge): the IOGPU base answers nil, the lane's answer. Each Mac answers an MTLTargetDeviceArchitecture naming its GPU compiler's target (measured: cpuType 0x1000013 subType 0x1a3 on the M3 Max, 0x1000014 0x1773 on the AMD 5300M, 0x1000015 0x950200 on the Intel UHD 630), an instruction set the host cannot run; nil names none
+targetDeviceArchitecture implemented class 4 (outside the envelope) for nil, which the IOGPU base answered and no Mac does: Metal's loader ends the process at nil (+[MTLLoader sliceIDForDevice:legacyDriverVersion:airntDriverVersion:]), and MTLAssetUpgraderD ended at every app installed in the guest. Every Mac answers Metal's MTLTargetDeviceArchitecture naming its own compiler's target (measured, tools/oracle/oracle_archtype.m: cpuType 0x1000013 subType 0x1a3 driverVersion and versionCombined 0x30000 on the M3 Max, 0x1000014 0x1773 0x7d4 0xe0002 on the AMD 5300M, 0x1000015 0x950200 0x1a0701 0x1a0701 on the Intel UHD 630), so the device answers one naming its own: cpuType 0x01005247 (its PCI device id), which no Metal slice carries, subType 0, version 1.0.0 and driverVersion 0x10000
 targetDeviceInfo base %base-spi
 tensorSizeAndAlignWithDescriptor: unsupported tensors
 threadsPerCompilerProcess base %base-spi

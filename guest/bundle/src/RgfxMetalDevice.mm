@@ -765,6 +765,57 @@ RGFX_LOG_UNRECOGNIZED
 }
 @end
 
+namespace {
+
+// The device's GPU compiler target, which `targetDeviceArchitecture` answers (it says why).
+constexpr uint32_t kRgfxTargetCpuType = 0x0100'5247;
+constexpr uint32_t kRgfxTargetSubType = 0;
+constexpr uint64_t kRgfxTargetDriverVersion = 0x1'0000;
+
+// Metal's MTLTargetDeviceArchVersion, `{MTLTargetDeviceArchVersion=SCC}` (measured: its setter's
+// type on macOS 26.7.1 and 27.0.1): a 16-bit and two 8-bit fields, which its versionCombined
+// answers as field_00 << 16 | field_02 << 8 | field_03 (tests/inherited_tests.mm reads it back).
+struct RgfxTargetArchVersion {
+	uint16_t field_00;
+	uint8_t field_02;
+	uint8_t field_03;
+};
+static_assert(sizeof(RgfxTargetArchVersion) == 4, "MTLTargetDeviceArchVersion is 4 bytes");
+
+constexpr RgfxTargetArchVersion kRgfxTargetVersion = {1, 0, 0};
+
+// Whether `cls` has the instance method `sel` of the type encoding `types`.
+bool rgfxHasMethod(Class cls, SEL sel, const char *types)
+{
+	Method m = class_getInstanceMethod(cls, sel);
+	return m != nullptr && std::strcmp(method_getTypeEncoding(m), types) == 0;
+}
+
+// An MTLTargetDeviceArchitecture naming the device's target; nil where the guest's Metal has no
+// such class, or its setters are not the ones this sets.
+id rgfxTargetDeviceArchitecture()
+{
+	Class cls = objc_getClass("MTLTargetDeviceArchitecture");
+	if (cls == Nil || !rgfxHasMethod(cls, @selector(setCpuType:), "v20@0:8I16") ||
+	    !rgfxHasMethod(cls, @selector(setSubType:), "v20@0:8I16") ||
+	    !rgfxHasMethod(cls, @selector(setDriverVersion:), "v24@0:8Q16") ||
+	    !rgfxHasMethod(cls, @selector(setVersion:), "v20@0:8{MTLTargetDeviceArchVersion=SCC}16")) {
+		os_log_error(rgfxLog(), "RGFX: the guest's Metal has no MTLTargetDeviceArchitecture of the "
+		                        "setters the device sets; targetDeviceArchitecture answers nil");
+		return nil;
+	}
+	id a = [[cls alloc] init];
+	((void (*)(id, SEL, uint32_t))objc_msgSend)(a, @selector(setCpuType:), kRgfxTargetCpuType);
+	((void (*)(id, SEL, uint32_t))objc_msgSend)(a, @selector(setSubType:), kRgfxTargetSubType);
+	((void (*)(id, SEL, uint64_t))objc_msgSend)(a, @selector(setDriverVersion:),
+	                                            kRgfxTargetDriverVersion);
+	((void (*)(id, SEL, RgfxTargetArchVersion))objc_msgSend)(a, @selector(setVersion:),
+	                                                         kRgfxTargetVersion);
+	return a;
+}
+
+} // namespace
+
 @implementation RgfxMetalDevice {
 	RgfxCaps _caps;              // host device caps; invalid until the region is read
 	RgfxVideoCaps _videoCaps;    // the host's video codecs; none until the region is read
@@ -1305,6 +1356,30 @@ RGFX_LOG_UNRECOGNIZED
 		    &sup, @selector(architecture));
 	}
 	return [[RgfxArchitecture alloc] initWithArchitectureName:@""];
+}
+
+// The device's GPU compiler target, MTLDeviceSPI's `targetDeviceArchitecture`: an object of
+// Metal's own class, MTLTargetDeviceArchitecture, as every Mac's device answers (measured:
+// tools/oracle/oracle_archtype.m on the AMD 5300M, the Intel 630 and the M3 Max,
+// docs/graphics-kext/dgpu-oracle.md Q42). nil, which the IOGPU base answered, is outside that:
+// Metal's loader ends the process at it (+[MTLLoader sliceIDForDevice:legacyDriverVersion:
+// airntDriverVersion:], read from macOS 27's Metal), and MTLAssetUpgraderD, which asks Metal's
+// archive reader about every .metallib of an app it is told of for every device, ended with
+// SIGABRT at each app installed in the guest. Each Mac's answer names its own compiler's
+// target, so the device's names its own:
+// - cpuType 0x01005247: CPU_ARCH_ABI64 with the device's PCI device id, 0x5247. No Metal slice
+//   carries it (Apple's GPUs are 0x01000013, AMD's 0x01000014, Intel's 0x01000015, AIR
+//   0x01000017), so no archive or dynamic library holds a slice Metal reads as this device's:
+//   the device makes its pipelines from AIR on the host, and its archives are of its own format
+//   (RgfxBinaryArchiveFile.hpp).
+// - subType 0: the device has one target, whatever the host's GPU.
+// - version 1.0.0, versionCombined 0x10000, and driverVersion 0x10000, the same value, as the M3
+//   Max (0x30000) and the Intel 630 (0x1a0701) answer theirs.
+// Where the guest's Metal has no such class, nil.
+- (id)targetDeviceArchitecture
+{
+	static id answer = rgfxTargetDeviceArchitecture();
+	return answer;
 }
 
 - (BOOL)hasUnifiedMemory

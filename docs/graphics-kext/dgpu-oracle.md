@@ -2192,6 +2192,50 @@ mode, and so is one over read-only memory, whose pass completes with the memory 
 M3 Max completes it (Q38). Until 11-14 such a pass ended the process at its making, as a
 resolve into a texture over a buffer, a shape not measured.
 
+## Q42: the device's compiler target, and Metal's archive readers
+
+Probe: `oracle_archtype DEVICE FILE...`, 11-14: the AMD 5300M and the Intel UHD 630 under macOS
+26.7.1 (25G241), m3-max-30048 and m3-max-30049, and the M3 Max under macOS 27.0.1 (26A434),
+m3-max-30050. The files: a `.metallib` of AIR (`oracle.metallib`), a dynamic library of AIR
+(`oracle_bundle_dyn.metallib`), and a binary archive and a dynamic library the device serializes
+itself.
+
+| what | AMD 5300M | Intel UHD 630 | M3 Max |
+|---|---|---|---|
+| `targetDeviceArchitecture` | an `MTLTargetDeviceArchitecture` (Metal's class, of `NSObject`) | the same | the same |
+| its `cpuType`, `subType` | 0x1000014, 0x1773 | 0x1000015, 0x950200 | 0x1000013, 0x1a3 |
+| its `driverVersion`, `versionCombined` | 0x7d4, 0xe0002 | 0x1a0701, 0x1a0701 | 0x30000, 0x30000 |
+| the archive reader, AIR `.metallib`; AIR dynamic library | 1, 1 | 1, 1 | 1, 1 |
+| the dynamic library reader, the same files | 0, 1 | 0, 1 | 0, 1 |
+| the archive reader, the device's own archive; its dynamic library | 2, 1 | 3, 1 | 2, 1 |
+| the dynamic library reader, the device's own archive; its dynamic library | 0, 2 | 1, 1 | 0, 2 |
+
+The class has `cpuType`, `subType`, `driverVersion`, `version` (`{MTLTargetDeviceArchVersion=SCC}`)
+and `versionCombined`, and setters of all but the last. The readers' numbers are the names
+MTLAssetUpgraderD prints for them: the archive reader's 0 Invalid, 1 Legacy, 2 Compatible,
+3 Rebuild, 4 NoVendorSlice, and the dynamic library reader's 0 Invalid, 1 AIROnly, 2 Compatible,
+3 Rebuild, 4 NoVendorSlice.
+
+Every Mac answers an object, and no Mac answers nil *(class 3)*. Its values are each GPU's own
+compiler target and versions: an answer that describes the device, which is the device's own and
+not a pick between the Macs'. What it is read for (read from macOS 27's Metal and MTLAssetUpgraderD):
+- Metal's loader (`+[MTLLoader sliceIDForDevice:legacyDriverVersion:airntDriverVersion:]`) makes
+  the slice it looks for in a binary archive or a dynamic library of `cpuType` and `subType`, and
+  ends the process where the answer is nil. MTLAssetUpgraderD, told of an app installed, asks
+  Metal's archive and dynamic library readers about each `.metallib` in it, for each device, and
+  queues a rebuild of the file for the device where the archive reader answers 3 or the dynamic
+  library reader 1 or 3.
+- MPS keeps `cpuType << 32 | subType` and gives it to its NDArray kernels' prefix and postfix
+  queries, and Metal's `_MTLUseAIRNTBinaryArchive` answers YES for a `cpuType` of 0x1000013 to
+  0x1000015 alone, where no setting of Metal's decides it.
+
+What our stack does: until 11-14 the device left `targetDeviceArchitecture` to the IOGPU base,
+which answers nil *(class 4)*, and MTLAssetUpgraderD ended with SIGABRT at each app installed in
+the guest. The device now answers an `MTLTargetDeviceArchitecture` of its own target: `cpuType`
+0x01005247, `CPU_ARCH_ABI64` with its PCI device id, which no Metal slice carries, `subType` 0, and
+version 1.0.0 (`versionCombined` 0x10000) with `driverVersion` 0x10000. No Mac's archive holds a
+slice of it, and the device's own archives are of its own format.
+
 ## Not measured
 
 - Cross-process lock waits for pending GPU work: rgk-lock's `lock_probe` (x86 matches the M3,

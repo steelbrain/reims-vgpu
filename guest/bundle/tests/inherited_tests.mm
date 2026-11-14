@@ -13,7 +13,9 @@
 //     or an argument or return value of another size.
 // A listed selector this macOS's base classes lack is reported, not failed: the guest's macOS can
 // differ.
-// It also checks the x86 device's answer to newResidencySetWithDescriptor:error:: nil, its error
+// It also checks the device's targetDeviceArchitecture, Metal's MTLTargetDeviceArchitecture naming
+// the device's own compiler target (checkTargetDeviceArchitecture); the x86 device's answer to
+// newResidencySetWithDescriptor:error:: nil, its error
 // out set to nil from an error it held, as the x86 Macs answer (measured: macOS 26.7.1, the AMD
 // Radeon Pro 5300M and the Intel UHD 630); the refusals Metal answers at a URL before it reads it
 // (checkUrlRefusals); and that each call Metal's device ends the process at for its argument
@@ -23,6 +25,7 @@
 
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
+#include <objc/message.h>
 #include <objc/runtime.h>
 #include <signal.h>
 #include <spawn.h>
@@ -200,6 +203,34 @@ void checkResidencySetAnswer(Class device)
 		                                set, error == sentinel ? @"untouched" : error]);
 }
 
+// The device's compiler target (src/RgfxMetalDevice.mm says why): an object of Metal's own
+// MTLTargetDeviceArchitecture, as each Mac's device answers, never the IOGPU base's nil, at which
+// Metal's loader ends the process; cpuType 0x01005247, subType 0, driverVersion 0x10000, and
+// versionCombined 0x10000, which Metal works out from the version the device sets (1.0.0). The
+// member reads no device state, so it is called with the class as `self`.
+void checkTargetDeviceArchitecture(Class device)
+{
+	SEL sel = sel_registerName("targetDeviceArchitecture");
+	Method m = class_getInstanceMethod(device, sel), base = class_getInstanceMethod(class_getSuperclass(device), sel);
+	if (m == nullptr || (base != nullptr && method_getImplementation(m) == method_getImplementation(base))) {
+		fail(@"the device does not answer targetDeviceArchitecture itself");
+		return;
+	}
+	id a = ((id(*)(id, SEL))method_getImplementation(m))((id)device, sel);
+	if (a == nil || strcmp(object_getClassName(a), "MTLTargetDeviceArchitecture") != 0) {
+		fail([NSString stringWithFormat:@"targetDeviceArchitecture answers %@, not an MTLTargetDeviceArchitecture", a]);
+		return;
+	}
+	const uint32_t cpuType = ((uint32_t(*)(id, SEL))objc_msgSend)(a, sel_registerName("cpuType"));
+	const uint32_t subType = ((uint32_t(*)(id, SEL))objc_msgSend)(a, sel_registerName("subType"));
+	const uint64_t driver = ((uint64_t(*)(id, SEL))objc_msgSend)(a, sel_registerName("driverVersion"));
+	const uint32_t combined = ((uint32_t(*)(id, SEL))objc_msgSend)(a, sel_registerName("versionCombined"));
+	if (cpuType != 0x01005247 || subType != 0 || driver != 0x10000 || combined != 0x10000)
+		fail([NSString stringWithFormat:@"targetDeviceArchitecture answers cpuType 0x%x subType 0x%x driverVersion "
+		                                @"0x%llx versionCombined 0x%x (want 0x1005247 0 0x10000 0x10000)",
+		                                cpuType, subType, (unsigned long long)driver, combined]);
+}
+
 // The device's refusals at a URL that Metal answers before it reads the URL: newArchiveWithURL:error:
 // a device without Metal 4's, and newBinaryLibraryWithOptions:url:error: of no option, "At least one
 // option must be set.", each at every URL, nil among them (measured: macOS 26.7.1, the AMD Radeon
@@ -335,6 +366,7 @@ int main(int argc, char **argv)
 			printf("FAIL: RgfxMetalDevice is not a subclass of IOGPUMetalDevice, of _MTLDevice\n");
 			return 1;
 		}
+		checkTargetDeviceArchitecture(device);
 		checkResidencySetAnswer(device);
 		checkUrlRefusals(device);
 		for (const Death &d : kDeaths)
