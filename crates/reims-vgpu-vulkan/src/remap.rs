@@ -49,28 +49,42 @@
 //!
 //! - **Nothing waits.** `deallocate` never waits for a hold: it records the unmap under a leaf
 //!   lock and returns. The hold's drop takes the same lock, takes the unmaps no hold meets any
-//!   more, lets the lock go, and unmaps them (`munmap` or `mach_vm_deallocate`), calling nothing
-//!   else. So neither side waits for another thread, and no thread can wait on a hold whose drop
-//!   needs it, or a thread it blocks: not the graphics device's threads, which release buffers and
-//!   so may run core's deallocators, nor a vCPU thread of QEMU's that holds its BQL inside a call
-//!   of the C API. The calls of `deallocate` are core's: a mapping's last release on the thread
-//!   that lets it go (a device thread, the host's thread inside a call, or the runtime's thread
-//!   that runs a buffer's deallocator, the releasing thread or one of its handler threads as a
-//!   command buffer completes), and a failed map's. The holds go on the runtime's thread that frees
-//!   the import: the releasing thread, or a handler thread once the last command buffer that held
-//!   the import completed, or the creating thread where the runtime refused the call.
+//!   more, lets the lock go, and hands them to the unmap thread (below), calling nothing else. So
+//!   neither side waits for another thread, and no thread can wait on a hold whose drop needs it,
+//!   or a thread it blocks: not the graphics device's threads, which release buffers and so may
+//!   run core's deallocators, nor a vCPU thread of QEMU's that holds its BQL inside a call of the
+//!   C API. The calls of `deallocate` are core's: a mapping's last release on the thread that lets
+//!   it go (a device thread, the host's thread inside a call, or the runtime's thread that runs a
+//!   buffer's deallocator, the releasing thread or one of its handler threads as a command buffer
+//!   completes), and a failed map's. The holds go on the runtime's thread that frees the import:
+//!   the releasing thread, or a handler thread once the last command buffer that held the import
+//!   completed, or the creating thread where the runtime refused the call.
+//! - **Where the unmaps are made.** On a thread of the platform's own,
+//!   `reims-vgpu.graphics-unmaps`, started at the first hold whose drop has any, which makes each
+//!   hold's in the order the holds went (`munmap` or `mach_vm_deallocate`), never on the thread
+//!   that drops the hold, so a command buffer's completion handler, which every process's
+//!   completions go through, waits for none of them. Where the OS gives no such thread they are
+//!   made on the dropping thread, as before it. On Linux an unmap of a view mapped from its files
+//!   is a TLB shootdown a mapping, to every other CPU running a thread of the process, a vCPU's
+//!   among them, whatever the call (an `munmap` of the whole view or in pieces, an
+//!   `MADV_DONTNEED` first, an anonymous map over it) and whether the pages' entries are dirty or
+//!   clean (**measured** on homelab-ms01-1, Linux 7.3.1, 2026-11-14, jobs m3-max-30403 and
+//!   m3-max-30404: 2,048 one-page mappings of a memfd unmapped beside 0, 2, 4 and 8 spinning
+//!   threads took 0.00, 2.0, 3.6 and 8.0 shootdowns a page, and 0.54, 2.1, 2.1 and 1.9 to 9.2 us
+//!   a page). In a pass of Geekbench 7.1's Metal benchmarks on the Iris Xe host (ANV), 3.45 CPU-s
+//!   of the runtime's handler threads' 9.5 were these unmaps (job m3-max-30243, its call graphs).
 //! - **What it keeps.** The pages stay mapped, at their address, until the hold goes: the kernel
 //!   gives no range over them meanwhile. Core deallocates only whole ranges it made and never
 //!   reaches again, so nothing maps over a waiting unmap but a fixed overwrite, which takes those
 //!   pages out of it (`Holds::replaced`). A released hold decides its unmaps in one order with
-//!   the fixed overwrites ([`OVERWRITES`]) and marks them as being made, then makes them outside
-//!   that order: an overwrite that meets them waits until they are made, so none lands between
-//!   the decision and the unmap, to be unmapped with the pages that waited there, and an
-//!   overwrite of other pages goes on meanwhile. A view of the guest's scattered pages mapped
-//!   from their files is a mapping a 4 KiB run: in that order, the map of a view of one page
-//!   waited 11.7 and 26.4 ms through the unmap of a 29.7 MB view's 7,261 runs, made on the
-//!   runtime's handler thread as a command buffer that read it completed (**measured** on the
-//!   Iris Xe host, ANV, a macOS 26.7.2 guest's Mission Control, 2026-11-08), and the guest's
+//!   the fixed overwrites ([`OVERWRITES`]) and marks them as being made, then the unmap thread
+//!   makes them outside that order: an overwrite that meets them waits until they are made, so
+//!   none lands between the decision and the unmap, to be unmapped with the pages that waited
+//!   there, and an overwrite of other pages goes on meanwhile. A view of the guest's scattered
+//!   pages mapped from their files is a mapping a 4 KiB run: in that order, the map of a view of
+//!   one page waited 11.7 and 26.4 ms through the unmap of a 29.7 MB view's 7,261 runs, made on
+//!   the runtime's handler thread as a command buffer that read it completed (**measured** on
+//!   the Iris Xe host, ANV, a macOS 26.7.2 guest's Mission Control, 2026-11-08), and the guest's
 //!   texture over that page, and every later message of its process, waited with it.
 //! - **What a remap under an import reads.** MoltenVK's no-copy buffer keeps the pages it was
 //!   made over, which Metal wires as it makes the buffer (`tests/no_copy_remap.rs` measures a
@@ -258,12 +272,81 @@ fn overwrite<T>(
     Ok(made)
 }
 
+/// What the unmap thread does between taking released holds' unmaps and making them, for tests.
 #[cfg(test)]
-thread_local! {
-    /// What a released hold's drop does between deciding its unmaps and making them, for tests:
-    /// the drop's thread's own.
-    static BEFORE_UNMAPS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-        const { std::cell::RefCell::new(None) };
+static BEFORE_UNMAPS: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
+/// The unmaps released holds decided, which the unmap thread makes in their order ([`unmaps`]):
+/// each list one hold's, marked as being made (`Holds::unmapping`) until it is. A leaf lock:
+/// nothing is called under it.
+static QUEUED: Mutex<Vec<Vec<Range<u64>>>> = Mutex::new(Vec::new());
+
+/// Raised as a hold's unmaps are queued, for the unmap thread.
+static UNMAPS_QUEUED: Condvar = Condvar::new();
+
+/// Whether the unmap thread runs: started at the first hold whose drop has unmaps to make, and
+/// `false` where the OS gave no thread, the unmaps then made on the dropping thread.
+static UNMAP_THREAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// The unmap thread's name: it is the graphics device's, among its threads' names, so profiles
+/// of `reims-vgpu.graphics-*` take it in.
+const UNMAP_THREAD_NAME: &str = "reims-vgpu.graphics-unmaps";
+
+/// Hands `free`, a released hold's unmaps, to the unmap thread (module docs, "Where the unmaps
+/// are made"), starting it the first time; makes them here where the OS gave no thread.
+fn hand_off(free: Vec<Range<u64>>) {
+    let running = *UNMAP_THREAD.get_or_init(|| {
+        let started = std::thread::Builder::new()
+            .name(UNMAP_THREAD_NAME.into())
+            .spawn(unmaps);
+        if let Err(e) = &started {
+            log::warn!(
+                target: "reims_vgpu_vulkan::remap",
+                "no thread for the unmaps imports held ({e}): they are made on the threads that \
+                 free the imports"
+            );
+        }
+        started.is_ok()
+    });
+    if !running {
+        return make(&free);
+    }
+    QUEUED.lock().push(free);
+    UNMAPS_QUEUED.notify_one();
+}
+
+/// The unmap thread's body: makes each queued hold's unmaps, in the order they were queued.
+fn unmaps() {
+    // A panic here ends the process, as on every thread of the library's.
+    crate::core::rt::thread::become_ours();
+    loop {
+        let batch = {
+            let mut queued = QUEUED.lock();
+            while queued.is_empty() {
+                UNMAPS_QUEUED.wait(&mut queued);
+            }
+            std::mem::take(&mut *queued)
+        };
+        for free in &batch {
+            make(free);
+        }
+    }
+}
+
+/// Unmaps `free`, which a released hold decided and marked as being made, then marks them made
+/// and wakes the overwrites waiting for them ([`after_unmaps`]).
+fn make(free: &[Range<u64>]) {
+    #[cfg(test)]
+    if let Some(step) = BEFORE_UNMAPS.lock().take() {
+        step();
+    }
+    let vm = OsVm::new();
+    for pages in free {
+        let at = HostPtr::from_addr(pages.start.to_usize());
+        let _ = vm.deallocate(at, pages.end - pages.start);
+    }
+    HOLDS.lock().unmapped(free);
+    UNMAPPED.notify_all();
 }
 
 /// A hold on the host pages a runtime import covers, which the runtime is given in a no-copy
@@ -290,10 +373,11 @@ impl UnmapHold {
 }
 
 impl Drop for UnmapHold {
-    /// Unmaps what waited for this hold and no other, calling nothing else: decided in
-    /// [`OVERWRITES`]' order where an unmap waits, and made outside it, marked as being made
-    /// meanwhile, so an overwrite of other pages never waits for them. Wakes the waits for the
-    /// imports ([`wait_unimported`]).
+    /// Hands the unmap thread what waited for this hold and no other, calling nothing else:
+    /// decided in [`OVERWRITES`]' order where an unmap waits, and made outside it, on that thread,
+    /// marked as being made meanwhile, so an overwrite of other pages never waits for them and
+    /// the thread that frees the import waits for none of them (module docs, "Where the unmaps
+    /// are made"). Wakes the waits for the imports ([`wait_unimported`]).
     fn drop(&mut self) {
         {
             let mut holds = HOLDS.lock();
@@ -314,17 +398,7 @@ impl Drop for UnmapHold {
         if free.is_empty() {
             return;
         }
-        #[cfg(test)]
-        if let Some(step) = BEFORE_UNMAPS.with(|step| step.borrow_mut().take()) {
-            step();
-        }
-        let vm = OsVm::new();
-        for pages in &free {
-            let at = HostPtr::from_addr(pages.start.to_usize());
-            let _ = vm.deallocate(at, pages.end - pages.start);
-        }
-        HOLDS.lock().unmapped(&free);
-        UNMAPPED.notify_all();
+        hand_off(free);
     }
 }
 
@@ -408,14 +482,30 @@ pub(crate) fn free_unimported(at: *mut u8, length: u64, free: impl FnOnce()) {
     free();
 }
 
-/// Whether an unmap of a page of the `length` bytes at `at` waits for a hold, or is being made,
-/// for tests: `false` once a released hold's drop has unmapped what waited for it there.
+/// Whether an unmap of a page of the `length` bytes at `at` waits for a hold, for tests, once
+/// the unmaps released holds handed the unmap thread there are made (at most 30 s): `false`
+/// once a released hold's unmaps of what waited for it there are made.
 #[cfg(test)]
 pub(crate) fn unmap_waits(at: HostPtr, length: u64) -> bool {
+    use crate::core::platform::os::clock::{Clock as _, Deadline};
     let _order = OVERWRITES.lock();
     let (at, length) = pages(at, length, OsVm::new().page_size());
     let first = at.addr().to_u64();
-    HOLDS.lock().waits(&(first..first.saturating_add(length)))
+    let asked = first..first.saturating_add(length);
+    let clock = crate::os::OsClock::new();
+    let bound = clock
+        .now_mono()
+        .saturating_add(std::time::Duration::from_secs(30));
+    let mut holds = HOLDS.lock();
+    while holds.unmapping_meets(&asked) {
+        if clock
+            .wait_until(&UNMAPPED, &mut holds, Deadline::Mono(bound))
+            .timed_out()
+        {
+            break;
+        }
+    }
+    holds.waits(&asked)
 }
 
 /// The host bytes of each run of core's mappings of the guest's pages that shows a page of
@@ -771,11 +861,15 @@ mod tests {
         assert!(vm.deallocate(held, 4 * page).is_success());
         assert!(unmap_waits(held, 4 * page));
         let _ = take();
-        // The hold goes on a thread of its own, which stops between deciding its unmaps and
-        // making them until it is told to go on.
+        // The hold goes on a thread of its own; the unmap thread stops between taking its unmaps
+        // and making them until it is told to go on.
         let (stopped, at_stop) = mpsc::channel();
         let (go_on, until_told) = mpsc::channel::<()>();
         let (dropped, until_dropped) = mpsc::channel();
+        *BEFORE_UNMAPS.lock() = Some(Box::new(move || {
+            stopped.send(()).unwrap();
+            until_told.recv().unwrap();
+        }));
         let threads = crate::core::rt::thread::test_threads::StdThreads;
         crate::core::rt::thread::spawn_named(
             &threads,
@@ -783,12 +877,6 @@ mod tests {
             1 << 20,
             Box::new(()),
             move || {
-                BEFORE_UNMAPS.with(|step| {
-                    *step.borrow_mut() = Some(Box::new(move || {
-                        stopped.send(()).unwrap();
-                        until_told.recv().unwrap();
-                    }));
-                });
                 drop(hold);
                 let _ = dropped.send(());
             },
@@ -819,10 +907,10 @@ mod tests {
             },
         );
         let landed = answered.recv_timeout(Duration::from_secs(10));
-        go_on.send(()).unwrap();
         until_dropped
             .recv_timeout(Duration::from_secs(10))
-            .expect("the drop made its unmaps");
+            .expect("the drop returned while its unmaps waited to be made");
+        go_on.send(()).unwrap();
         assert!(
             being_made,
             "the unmap was being made, its pages still mapped"
@@ -842,6 +930,97 @@ mod tests {
         for (p, length) in [(other, page), (src, page)] {
             assert!(OsVm::new().deallocate(p, length).is_success());
         }
+    }
+
+    /// A released hold's unmaps are made on the unmap thread, never on the thread that drops the
+    /// hold, the runtime's thread that freed the import (a command buffer's completion handler
+    /// among them): that thread's drop returns while they wait to be made. Until they are made
+    /// the pages stay mapped with their bytes, the unmap still waits, and a fixed overwrite of
+    /// them waits too, so nothing lands on them before they are unmapped; it lands once they are
+    #[test]
+    fn a_released_holds_unmaps_wait_for_no_thread_that_frees_its_import() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let vm = VulkanVm {
+            vm: OsVm::new(),
+            report: |_, _| {},
+        };
+        let page = vm.page_size();
+        let held = vm.allocate_anywhere(4 * page).unwrap();
+        // SAFETY: pages this test just mapped, readable and writable.
+        unsafe { std::ptr::write_bytes(held.as_ptr::<u8>(), 0xa5, (4 * page).to_usize()) };
+        let hold = UnmapHold::new(NonNull::new(held.as_ptr::<u8>()).unwrap(), 4 * page);
+        assert!(vm.deallocate(held, 4 * page).is_success());
+        // The unmap thread stops before making them, saying which thread it is, until told.
+        let (stopped, at_stop) = mpsc::channel();
+        let (go_on, until_told) = mpsc::channel::<()>();
+        *BEFORE_UNMAPS.lock() = Some(Box::new(move || {
+            let name = std::thread::current().name().map(str::to_owned);
+            stopped.send(name).unwrap();
+            until_told.recv().unwrap();
+        }));
+        // The hold goes on a thread of its own, as on the runtime's handler thread.
+        let (dropped, until_dropped) = mpsc::channel();
+        let dropper = std::thread::Builder::new()
+            .name("reims-vgpu.test-handler".into())
+            .spawn(move || {
+                drop(hold);
+                let _ = dropped.send(());
+            })
+            .unwrap();
+        let maker = at_stop
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the unmap thread took the unmaps");
+        until_dropped
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the drop returned while its unmaps waited to be made");
+        dropper.join().unwrap();
+        assert_eq!(
+            maker.as_deref(),
+            Some(UNMAP_THREAD_NAME),
+            "made on the unmap thread"
+        );
+        let waiting = {
+            let first = held.addr().to_u64();
+            HOLDS.lock().waits(&(first..first + 4 * page))
+        };
+        assert!(waiting, "the unmap waits until it is made");
+        assert!(
+            (0..4).all(|i| crate::os::mapped(held.wrapping_add(i * page))
+                // SAFETY: a page the hold kept mapped, with the bytes written there.
+                && unsafe { held.wrapping_add(i * page).as_ptr::<u8>().read_volatile() } == 0xa5),
+            "the pages stay mapped with their bytes"
+        );
+        // A fixed overwrite of the first page, on a thread of its own, waits for the unmap.
+        let (answer, answered) = mpsc::channel();
+        let overwriter = std::thread::Builder::new()
+            .spawn(move || {
+                let vm = VulkanVm {
+                    vm: OsVm::new(),
+                    report: |_, _| {},
+                };
+                let _ = answer.send(vm.allocate_fixed_overwrite(held, page).is_ok());
+            })
+            .unwrap();
+        assert!(
+            answered.recv_timeout(Duration::from_millis(100)).is_err(),
+            "the overwrite of the pages waited for their unmap"
+        );
+        go_on.send(()).unwrap();
+        assert_eq!(
+            answered.recv_timeout(Duration::from_secs(10)),
+            Ok(true),
+            "the overwrite landed once the unmap was made"
+        );
+        overwriter.join().unwrap();
+        assert!(!unmap_waits(held, 4 * page), "made");
+        // SAFETY: the page the overwrite mapped, fresh zeros.
+        assert_eq!(
+            unsafe { held.as_ptr::<u8>().read_volatile() },
+            0,
+            "the overwrite's page"
+        );
+        assert!(vm.deallocate(held, page).is_success());
     }
 
     /// A wait for the imports over pages ends once the last hold and keep that meets them went,
