@@ -146,7 +146,8 @@ TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surf
 	$(BUILD)/tests/legacy_overrides_test $(BUILD)/tests/legacy_swap_queue_test \
 	$(BUILD)/tests/mobile_modes_test $(BUILD)/tests/swap_rate_test \
 	$(BUILD)/tests/legacy_swap_info_test $(BUILD)/tests/mobile_color_test \
-	$(BUILD)/tests/mobile_cursor_test $(BUILD)/tests/display_power_test
+	$(BUILD)/tests/mobile_cursor_test $(BUILD)/tests/display_power_test \
+	$(BUILD)/tests/control_ring_test $(BUILD)/tests/control_ring_arm64_test
 
 $(BUILD)/tests/%: tests/%.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)
@@ -154,6 +155,11 @@ $(BUILD)/tests/%: tests/%.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/includ
 
 # The region's rules as the arm64e kext builds them (RgfxRegionMapping.hpp).
 $(BUILD)/tests/arm64_region_test: tests/arm64_region_test.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
+	@mkdir -p $(@D)
+	xcrun clang++ -std=c++17 -Wall -Wextra -Werror -DRGFX_GUEST_ARM64=1 -Isrc -I../../crates/reims-vgpu-graphics/include $< -o $@
+
+# Ring 0's writes as the arm64e kext makes them (RgfxControlRing.hpp): no write-combined part.
+$(BUILD)/tests/control_ring_arm64_test: tests/control_ring_test.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)
 	xcrun clang++ -std=c++17 -Wall -Wextra -Werror -DRGFX_GUEST_ARM64=1 -Isrc -I../../crates/reims-vgpu-graphics/include $< -o $@
 

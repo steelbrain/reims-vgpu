@@ -7,6 +7,7 @@
 #include "RgfxAccelerator.hpp"
 #include "RgfxAnswerLook.hpp"
 #include "RgfxBootConsole.hpp"
+#include "RgfxControlRing.hpp"
 #include "RgfxDisplayPower.hpp"
 #include "RgfxFeatures.hpp"
 #include "RgfxPipeColor.hpp"
@@ -112,6 +113,23 @@ inline void fullFence()
 {
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
+
+// Ring 0's submit ring as RgfxControlRing.hpp writes it: the rings' mapping, and the
+// write-combined one of the data's span (null where none was made: every word then goes through
+// the rings' mapping).
+struct ControlWords {
+	volatile UInt8 *rings;
+	volatile UInt8 *combined;
+
+	void data(UInt32 at, UInt64 word, bool viaCombined)
+	{
+		volatile UInt8 *p = viaCombined && combined ? combined + (at - kRgfxControlWcFrom)
+		                                            : rings + at;
+		*reinterpret_cast<volatile UInt64 *>(p) = word;
+	}
+	void storeFence() { rgfxStoreFence(); }
+	void publish(UInt64 count) { store64(rings + RGFX_CONTROL_SUBMIT_OFFSET + kRingProducer, count); }
+};
 
 // A payload's 32-bit field, little-endian as x86-64 is.
 inline UInt32 field32(const volatile UInt8 *payload, UInt32 offset)
@@ -232,7 +250,7 @@ bool ReimsGraphics::writeLocked(UInt32 type, const void *message, UInt32 size, U
                                 UInt64 *waiterSeqno)
 {
 	volatile UInt8 *header = ring(RGFX_CONTROL_SUBMIT_OFFSET);
-	volatile UInt8 *bytes = header + RGFX_RING_HEADER_SIZE;
+	ControlWords words = {rings, controlData};
 	UInt64 used = produced - load64(header + kRingConsumer);
 	UInt32 offset = static_cast<UInt32>(produced) & kRingMask;
 	UInt32 tail = kRingBytes - offset;
@@ -242,11 +260,8 @@ bool ReimsGraphics::writeLocked(UInt32 type, const void *message, UInt32 size, U
 	if (pad) {
 		// A message never wraps: type 0 pads to the ring's end. When 8
 		// bytes are left, they hold its type and size alone.
-		volatile UInt32 *p = reinterpret_cast<volatile UInt32 *>(bytes + offset);
-		p[0] = RGFX_MSG_PAD;
-		p[1] = pad;
-		if (pad >= kHeaderBytes)
-			*reinterpret_cast<volatile UInt64 *>(bytes + offset + 8) = 0;
+		const UInt32 padHeader[4] = {RGFX_MSG_PAD, pad, 0, 0};
+		rgfxControlWrite(words, offset, padHeader, pad >= kHeaderBytes ? 16 : 8);
 		produced += pad;
 		offset = 0;
 	}
@@ -254,30 +269,23 @@ bool ReimsGraphics::writeLocked(UInt32 type, const void *message, UInt32 size, U
 	if (waiterSeqno)
 		__atomic_store_n(waiterSeqno, s, __ATOMIC_RELEASE);
 	// The caller filled the payload fields; the header is stamped here.
-	RgfxMsgHeader h = {type, size, s};
-	UInt64 words[2];
-	memcpy(words, &h, sizeof(words));
-	volatile UInt64 *dst = reinterpret_cast<volatile UInt64 *>(bytes + offset);
-	dst[0] = words[0];
-	dst[1] = words[1];
-	const UInt8 *src = static_cast<const UInt8 *>(message);
-	for (UInt32 i = kHeaderBytes / 8; i < size / 8; i++) {
-		UInt64 w;
-		memcpy(&w, src + i * 8, sizeof(w));
-		dst[i] = w;
-	}
+	const RgfxMsgHeader h = {type, size, s};
+	rgfxControlWrite(words, offset, &h, kHeaderBytes);
+	rgfxControlWrite(words, offset + kHeaderBytes, static_cast<const UInt8 *>(message) + kHeaderBytes,
+	                 size - kHeaderBytes);
 	produced += size;
 	if (seqno)
 		*seqno = s;
 	return true;
 }
 
-// Publishes what writeLocked wrote, submitLock held: the doorbell rings only when the host's
-// consumer sleeps.
+// Publishes what writeLocked wrote, submitLock held, after it (RgfxControlRing.hpp): the doorbell
+// rings only when the host's consumer sleeps.
 void ReimsGraphics::publishLocked()
 {
 	volatile UInt8 *header = ring(RGFX_CONTROL_SUBMIT_OFFSET);
-	store64(header + kRingProducer, produced);
+	ControlWords words = {rings, controlData};
+	rgfxControlPublish(words, produced);
 	fullFence();
 	if (load32(header + kRingConsumerIdle) == 1)
 		writeRegister(RGFX_REG_DOORBELL, RGFX_CONTROL_RING_ID);
@@ -1472,6 +1480,23 @@ bool ReimsGraphics::start(IOService *provider)
 	}
 	rings = reinterpret_cast<volatile UInt8 *>(ringMap->getVirtualAddress());
 	cursorPixels = reinterpret_cast<UInt8 *>(cursorMap->getVirtualAddress());
+	// Ring 0's submit data, write-combined where the region's write-combined mappings are
+	// ordinary memory (RgfxControlRing.hpp), from a descriptor of its own: a mapping's cache mode
+	// is set on its descriptor's one VM object (RgfxAccelerator::copyWriteCombinedRegion). Without
+	// it, the data goes through `rings` as before.
+	if (kRgfxControlWriteCombines) {
+		IODeviceMemory *span = IODeviceMemory::withRange(
+		    region->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone) + kRgfxControlWcFrom,
+		    kRgfxControlWcTo - kRgfxControlWcFrom);
+		if (span) {
+			controlDataMap = span->createMappingInTask(
+			    kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache, 0,
+			    kRgfxControlWcTo - kRgfxControlWcFrom);
+			span->release();
+		}
+		if (controlDataMap)
+			controlData = reinterpret_cast<volatile UInt8 *>(controlDataMap->getVirtualAddress());
+	}
 
 	// MSI-X vector 0 is the device's first message-signalled interrupt.
 	for (int i = 0;; i++) {
@@ -1755,10 +1780,12 @@ void ReimsGraphics::teardown()
 	OSSafeReleaseNULL(lookGate);
 	OSSafeReleaseNULL(workLoop);
 	OSSafeReleaseNULL(cursorMap);
+	OSSafeReleaseNULL(controlDataMap);
 	OSSafeReleaseNULL(ringMap);
 	OSSafeReleaseNULL(region);
 	OSSafeReleaseNULL(registerMap);
 	rings = nullptr;
+	controlData = nullptr;
 	cursorPixels = nullptr;
 	registers = nullptr;
 }

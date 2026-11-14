@@ -483,6 +483,10 @@ private:
 	UInt64 regionSize;
 	IOMemoryMap *ringMap;
 	volatile UInt8 *rings;
+	// Ring 0's submit data from kRgfxControlWcFrom, write-combined (RgfxControlRing.hpp): null
+	// where it is not mapped so.
+	IOMemoryMap *controlDataMap;
+	volatile UInt8 *controlData;
 	// The cursor image's slot, at the region's end: kCursorMax x kCursorMax BGRA8, the largest
 	// image the hardware cursor takes (RGFX_CURSOR_MAX_SIZE). A larger one is IOFramebuffer's to
 	// draw on x86-64; on arm64 the display shows its top left corner.
