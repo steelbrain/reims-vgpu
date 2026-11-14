@@ -42,7 +42,8 @@
  * takes the ring itself only where no thread drives it (a unit test, or its thread has
  * ended), where the taker runs the record too.
  * `presentDrawable:` and its variants present the drawable from a scheduled handler,
- * unless the buffer failed by then (see the .mm).
+ * unless the buffer failed by then, and the queue posts none of its later buffers until the
+ * drawable reports its present scheduled, as Metal's queue submits none (PRESENT HOLD, the .mm).
  *
  * Our own ObjC++; the only Apple names are the real Metal protocols these conform to.
  */

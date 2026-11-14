@@ -3952,6 +3952,28 @@ the front posts every ready buffer behind it, in order, on its own thread. An
 enqueued buffer let go uncommitted stays, holding back the buffers after it,
 as Metal's does.
 
+**Present hold.** A buffer that presents drawables (`presentDrawable:` and its
+variants) holds back its queue's later buffers until each of those drawables
+reports its present scheduled, as Metal's queue does. Metal's base command
+buffer asks the drawable for that report (`addPresentScheduledHandler:`,
+CoreAnimation's), and its queue submits up to and including the presenting
+buffer, then waits for one report a present before it submits more (read from
+code, macOS 27). On the MBP16's AMD 5300M and Intel 630 (macOS 26.7.1), with a
+drawable that reported 200 ms after its present, a buffer committed right
+behind the presenting one was scheduled and ran at 200.7 to 210.5 ms, against
+0.3 to 1.3 ms with an immediate report, and both commits returned in 0.03 ms.
+So the bundle asks every drawable for the report as Metal does (a drawable that
+cannot report ends the process there, as on the MBP), the queue counts the
+presents each posted buffer owes and the reports that came, and posts nothing
+past a buffer while they fall short: the later buffers stay `Committed` and
+unposted, as behind a buffer not yet committed, and the report posts them, on
+a thread of its own. A report that came first counts, so a drawable with no
+layer on screen, which CoreAnimation reports at once, holds nothing. A
+CAMetalDrawable reports once its layer's image queue has taken the present,
+which WindowServer paces (CoreAnimation's `layer_collectable_signal`, the
+layer's next drawable or flush, or after 1.1 s, read from code), so a GPU-bound
+app's frames reach the GPU paced by what WindowServer takes.
+
 **Surface order**, where the guest took `SURFACE_ORDER` (`FEATURES_LO` bit 11).
 On a Mac, a GPU access to an IOSurface committed after another process's
 pending GPU access to it runs after that access, where either writes:

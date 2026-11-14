@@ -238,6 +238,17 @@ NS_ASSUME_NONNULL_END
 - (BOOL)commitAndWaitUntilSubmitted;
 @end
 
+// read from code: macOS 27 Metal.framework and QuartzCore.framework — the drawable member Metal's
+// base command buffer's presentDrawable: calls (-[_MTLCommandBuffer presentDrawable:], which the
+// AMD 5300M's and the Intel 630's buffers call through super; measured, macOS 26.7.1: a drawable
+// without it ends the process there with an unrecognized selector). CAMetalDrawable keeps the
+// block and calls it once the layer's image queue has taken the present (its image queue's
+// collectable signal, the layer's next drawable or flush, or 1.1 s on), at once where the drawable
+// has no layer on screen.
+@protocol RgfxDrawablePresentScheduled
+- (void)addPresentScheduledHandler:(void (^)(id<MTLDrawable>))block;
+@end
+
 // read from code: macOS 27.0.1 Metal.framework — what Metal's base command queue reads off the
 // descriptor it is made with as it starts, the members of the descriptor's internal subclass
 // (`MTLCommandQueueDescriptorInternal`), which RgfxCommandQueue's rgfxTakeDescriptor: reads where

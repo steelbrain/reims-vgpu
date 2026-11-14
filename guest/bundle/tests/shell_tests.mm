@@ -121,35 +121,69 @@
                                  error:(NSError **)error;
 @end
 
-// A drawable that records how it was presented: "now", "at T" or "after D", in order.
+// A drawable that records how it was presented: "now", "at T" or "after D", in order. It keeps
+// the present-scheduled handlers Metal's presentDrawable: adds (addPresentScheduledHandler:,
+// RgfxMetalPrivate.h) and calls them at reportPresentScheduled, as CAMetalDrawable does once its
+// layer's image queue has taken the present; or, where `reports` says, at the add (a drawable with
+// no layer on screen) or at its present.
+typedef NS_ENUM(int, TestDrawableReports) {
+	TestDrawableReportsWhenTold,
+	TestDrawableReportsAtAdd,
+	TestDrawableReportsAtPresent,
+};
 @interface TestDrawable : NSObject <MTLDrawable>
 @property(nonatomic) NSMutableArray<NSString *> *presents;
+@property(nonatomic) NSMutableArray *scheduledHandlers;
+@property(nonatomic) TestDrawableReports reports;
+- (void)reportPresentScheduled;
 @end
 
 @implementation TestDrawable
 - (instancetype)init
 {
-	if ((self = [super init]))
+	if ((self = [super init])) {
 		_presents = [NSMutableArray array];
+		_scheduledHandlers = [NSMutableArray array];
+	}
 	return self;
+}
+- (void)addPresentScheduledHandler:(void (^)(id<MTLDrawable>))block
+{
+	@synchronized(self) {
+		[_scheduledHandlers addObject:[block copy]];
+	}
+	if (_reports == TestDrawableReportsAtAdd)
+		[self reportPresentScheduled];
+}
+- (void)reportPresentScheduled
+{
+	NSArray *handlers = nil;
+	@synchronized(self) {
+		handlers = [_scheduledHandlers copy];
+		[_scheduledHandlers removeAllObjects];
+	}
+	for (void (^h)(id<MTLDrawable>) in handlers)
+		h(self);
+}
+- (void)noteAndReport:(NSString *)how
+{
+	@synchronized(self) {
+		[_presents addObject:how];
+	}
+	if (_reports == TestDrawableReportsAtPresent)
+		[self reportPresentScheduled];
 }
 - (void)present
 {
-	@synchronized(self) {
-		[_presents addObject:@"now"];
-	}
+	[self noteAndReport:@"now"];
 }
 - (void)presentAtTime:(CFTimeInterval)presentationTime
 {
-	@synchronized(self) {
-		[_presents addObject:[NSString stringWithFormat:@"at %g", presentationTime]];
-	}
+	[self noteAndReport:[NSString stringWithFormat:@"at %g", presentationTime]];
 }
 - (void)presentAfterMinimumDuration:(CFTimeInterval)duration
 {
-	@synchronized(self) {
-		[_presents addObject:[NSString stringWithFormat:@"after %g", duration]];
-	}
+	[self noteAndReport:[NSString stringWithFormat:@"after %g", duration]];
 }
 - (void)addPresentedHandler:(MTLDrawablePresentedHandler)block
 {
@@ -11445,6 +11479,143 @@ void test_present_drawable()
 	}
 }
 
+// The seqno of the next command buffer `f`'s queue posts, waiting up to `ms` for it (past the
+// other messages of its ring); 0 where none comes.
+uint64_t postedWithin(QueueFixture &f, int ms)
+{
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	for (int i = 0; i <= ms;) {
+		if (!f.submit.next(&h, &bytes)) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			i++;
+		} else if (h.type == RGFX_CMD_COMMAND_BUFFER) {
+			return h.seqno;
+		}
+	}
+	return 0;
+}
+
+// A buffer that presents a drawable holds back its queue's later buffers until the drawable
+// reports its present scheduled, as Metal's queue does on the AMD 5300M and the Intel 630
+// (PRESENT HOLD, RgfxCommandObjects.mm): the later buffers' commits return, and they stay
+// Committed and unposted through the presenting buffer's scheduling and its present, then go in
+// their order once the report comes. Each variant of presentDrawable: holds so. A report that
+// comes before the presenting buffer is posted (a drawable with no layer on screen) holds nothing;
+// one at the present holds the later buffers until the presenting one is scheduled. A presenting
+// buffer the host fails still presents, and holds the later buffers until the report.
+void test_a_present_holds_the_queue_s_later_buffers_until_it_is_scheduled()
+{
+	@autoreleasepool {
+	QueueFixture f;
+	FakeKext *kext = new FakeKext();
+	RgfxCompletionThread thread(&FakeKext::wait, kext);
+	CHECK(thread.start());
+	thread.add([f.queue sharedReplyReader]);
+	auto objId = [](id<MTLCommandBuffer> cb) { return ((RgfxResource *)cb).rgfxObjId; };
+	auto schedule = [&](uint64_t seqno, id<MTLCommandBuffer> cb) {
+		RgfxCbScheduled scheduled = cbScheduled(seqno, objId(cb));
+		hostPost(f.completion, *kext, &scheduled, sizeof(scheduled));
+		[cb waitUntilScheduled];
+	};
+	auto complete = [&](uint64_t seqno, id<MTLCommandBuffer> cb, uint32_t status) {
+		RgfxCbComplete done = cbComplete(seqno, objId(cb));
+		done.status = status;
+		hostPost(f.completion, *kext, &done, sizeof(done));
+		[cb waitUntilCompleted];
+	};
+
+	for (int variant = 0; variant < 3; variant++) {
+		TestDrawable *d = [TestDrawable new];
+		id<MTLCommandBuffer> a = [f.queue commandBuffer];
+		if (variant == 0)
+			[a presentDrawable:d];
+		else if (variant == 1)
+			[a presentDrawable:d atTime:12.5];
+		else
+			[a presentDrawable:d afterMinimumDuration:0.25];
+		[a commit];
+		uint64_t sa = postedWithin(f, 1000);
+		CHECK(sa != 0);
+		id<MTLCommandBuffer> b = [f.queue commandBuffer];
+		id<MTLCommandBuffer> c = [f.queue commandBuffer];
+		auto start = std::chrono::steady_clock::now();
+		[b commit];
+		[c commit];
+		CHECK(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500));
+		CHECK(b.status == MTLCommandBufferStatusCommitted && c.status == MTLCommandBufferStatusCommitted);
+		CHECK(postedWithin(f, 20) == 0);
+		schedule(sa, a);
+		CHECK(d.seen.count == 1);
+		CHECK(postedWithin(f, 20) == 0); // presented, not yet reported
+		[d reportPresentScheduled];
+		uint64_t sb = postedWithin(f, 1000), sc = postedWithin(f, 1000);
+		CHECK(sb == sa + 1 && sc == sb + 1);
+		complete(sa, a, RGFX_CB_OK);
+		complete(sb, b, RGFX_CB_OK);
+		complete(sc, c, RGFX_CB_OK);
+	}
+
+	// Reported before the presenting buffer is posted: nothing is held.
+	{
+		TestDrawable *d = [TestDrawable new];
+		d.reports = TestDrawableReportsAtAdd;
+		id<MTLCommandBuffer> a = [f.queue commandBuffer];
+		[a presentDrawable:d];
+		[a commit];
+		id<MTLCommandBuffer> b = [f.queue commandBuffer];
+		[b commit];
+		uint64_t sa = postedWithin(f, 1000), sb = postedWithin(f, 1000);
+		CHECK(sa != 0 && sb == sa + 1);
+		schedule(sa, a);
+		complete(sa, a, RGFX_CB_OK);
+		complete(sb, b, RGFX_CB_OK);
+	}
+
+	// Reported at the present: the later buffer goes once the presenting one is scheduled.
+	{
+		TestDrawable *d = [TestDrawable new];
+		d.reports = TestDrawableReportsAtPresent;
+		id<MTLCommandBuffer> a = [f.queue commandBuffer];
+		[a presentDrawable:d];
+		[a commit];
+		uint64_t sa = postedWithin(f, 1000);
+		id<MTLCommandBuffer> b = [f.queue commandBuffer];
+		[b commit];
+		CHECK(postedWithin(f, 20) == 0);
+		schedule(sa, a);
+		uint64_t sb = postedWithin(f, 1000);
+		CHECK(sa != 0 && sb == sa + 1);
+		complete(sa, a, RGFX_CB_OK);
+		complete(sb, b, RGFX_CB_OK);
+	}
+
+	// The host fails the presenting buffer without scheduling it: its scheduled handlers run at its
+	// completion, before its error is known, so it presents, and the later buffer waits for the
+	// report.
+	{
+		TestDrawable *d = [TestDrawable new];
+		id<MTLCommandBuffer> a = [f.queue commandBuffer];
+		[a presentDrawable:d];
+		[a commit];
+		uint64_t sa = postedWithin(f, 1000);
+		id<MTLCommandBuffer> b = [f.queue commandBuffer];
+		[b commit];
+		CHECK(postedWithin(f, 20) == 0);
+		complete(sa, a, RGFX_CB_INTERNAL);
+		CHECK(a.status == MTLCommandBufferStatusError);
+		CHECK(d.seen.count == 1);
+		CHECK(postedWithin(f, 20) == 0);
+		[d reportPresentScheduled];
+		uint64_t sb = postedWithin(f, 1000);
+		CHECK(sa != 0 && sb == sa + 1);
+		complete(sb, b, RGFX_CB_OK);
+	}
+	kext->close();
+	CHECK(eventually([&] { return !thread.running(); }));
+	}
+}
+
 // The host's side of a commitAndWaitUntilSubmitted: takes the buffer's message off `ring`,
 // counts its RGFX_OP_SUBMITTED ops into `asked`, and after 30 ms posts `type`'s record for it
 // (CB_SUBMITTED or CB_SCHEDULED) on `completion`. `seqno` gets the buffer's seqno.
@@ -20103,6 +20274,7 @@ int main(int argc, char **argv)
 		test_wait_with_the_completion_thread();
 		test_scheduled_before_completion();
 		test_present_drawable();
+		test_a_present_holds_the_queue_s_later_buffers_until_it_is_scheduled();
 		test_submitted_before_scheduled();
 		test_waiting_asks_for_its_scheduling();
 		test_submitted_at_the_doorbell_wakes_no_thread();

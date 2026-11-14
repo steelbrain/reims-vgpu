@@ -638,6 +638,9 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 /// Posts its message on the queue's submission ring: its queue's poster calls it in enqueue
 /// order (rgfxPostReady).
 - (void)rgfxPost;
+/// How many drawables it presents (presentDrawable: and its variants): the present-scheduled
+/// signals its queue waits for once it is posted, before it posts a later buffer (PRESENT HOLD).
+- (uint32_t)rgfxPresentWaits;
 @end
 
 /// How many barrier fences a queue has (QUEUE BARRIERS, above).
@@ -684,6 +687,9 @@ struct RgfxBarrierSlot {
 - (BOOL)rgfxEnqueue:(RgfxCmdBuffer *)cb;
 /// Posts the buffers at the front of the enqueue order that are ready, in that order.
 - (void)rgfxPostReady;
+/// A drawable a posted buffer presents reports its present scheduled, or the buffer failed before
+/// presenting it: one signal of the present hold (PRESENT HOLD), which posts what it held.
+- (void)rgfxPresentScheduled;
 /// Before a buffer of the queue goes on its ring: the buffers of the process's other queues it
 /// is to be committed after (RgfxCommitOrder::name), none where the queue takes no part.
 - (std::vector<RgfxSurfaceOrderWait>)rgfxNameCommitOrder;
@@ -748,6 +754,10 @@ struct RgfxBarrierSlot {
 	std::mutex _orderLock;
 	std::deque<RgfxCmdBuffer *> _order;
 	bool _postingFront;
+	// The present hold (PRESENT HOLD, below), under `_orderLock`: the present-scheduled signals the
+	// buffers posted so far owe, and those their drawables (or their failures) gave.
+	uint64_t _presentsOwed;
+	uint64_t _presentsSignalled;
 	std::recursive_mutex _postLock;
 	// Its process's commit order (rgfxJoinCommitOrder:), its slot there, and what its posts named
 	// last, which only its posts read and write, one at a time (`_postLock`).
@@ -1058,6 +1068,9 @@ struct RgfxBarrierSlot {
 			// outer loop posts the rest after it.
 			if (_postingFront || _order.empty() || ![_order.front() rgfxReadyToPost])
 				return;
+			// Behind a posted present not yet scheduled (PRESENT HOLD, below).
+			if (_presentsOwed > _presentsSignalled)
+				return;
 			next = _order.front();
 			_postingFront = true;
 		}
@@ -1066,8 +1079,37 @@ struct RgfxBarrierSlot {
 			std::lock_guard<std::mutex> hold(_orderLock);
 			_order.pop_front();
 			_postingFront = false;
+			_presentsOwed += [next rgfxPresentWaits];
 		}
 	}
+}
+
+// PRESENT HOLD. A buffer that presents drawables holds back the queue's later buffers until each
+// of its drawables reports its present scheduled, as Metal's base queue does on the AMD 5300M and
+// the Intel 630 (measured, macOS 26.7.1: with the report 200 ms after the present, a buffer
+// committed right behind it was scheduled at 200.7 to 210.5 ms against 0.3 to 1.3 ms, and both
+// commits returned in 0.03 ms). Metal's queue submits up to and including such a buffer, then
+// waits on a semaphore of the queue's once for each of its presents before it submits more
+// (-[_MTLCommandQueue _submitAvailableCommandBuffers], read from code): the signals count, so a
+// report that comes before the buffer is posted holds nothing. The held buffers stay Committed and
+// unposted, as behind a buffer not yet committed (ENQUEUE ORDER, above); the commits return. A
+// CAMetalDrawable reports once the layer's image queue has taken the present, which WindowServer
+// paces, so a GPU-bound app's frames reach the GPU as WindowServer takes them, not as fast as its
+// queue holds them. The post goes on another thread: a drawable may report inside the app's
+// nextDrawable, under the layer's lock.
+- (void)rgfxPresentScheduled
+{
+	{
+		std::lock_guard<std::mutex> hold(_orderLock);
+		_presentsSignalled++;
+		// Still held, or nothing waits: a later commit posts it.
+		if (_presentsOwed > _presentsSignalled || _order.empty())
+			return;
+	}
+	RgfxCommandQueue *queue = self;
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+		[queue rgfxPostReady];
+	});
 }
 
 - (RgfxCmdBuffer *)rgfxCommandBufferRetained:(BOOL)retained
@@ -1682,6 +1724,8 @@ enum RgfxStage : unsigned {
 	// post once every buffer before it is.
 	BOOL _enqueued;
 	std::atomic<bool> _readyToPost;
+	// The drawables it presents (rgfxPresentWaits), counted before the commit.
+	std::atomic<uint32_t> _presentWaits;
 	uint64_t _seqno;
 	// Written by the thread that delivers the completion, read by any: atomic.
 	std::atomic<MTLCommandBufferStatus> _status;
@@ -2082,6 +2126,11 @@ enum RgfxStage : unsigned {
 - (BOOL)rgfxReadyToPost
 {
 	return _readyToPost.load(std::memory_order_acquire);
+}
+
+- (uint32_t)rgfxPresentWaits
+{
+	return _presentWaits.load(std::memory_order_acquire);
 }
 
 - (void)commitAndHold
@@ -2989,13 +3038,27 @@ static NSError *rgfxInvalidInputError()
 // CAMetalLayer's) is then the layer's next frame: its presented handlers report the refresh that
 // showed it, or 0 where a later frame took its place, and the layer gives it back to
 // nextDrawable once the display is done with it. The block keeps the drawable until it runs.
+// As Metal's base buffer does (read from code, macOS 27 Metal.framework), the buffer then owes
+// its queue one present-scheduled signal, which the drawable gives once its present is scheduled
+// (addPresentScheduledHandler:, asked of every drawable as Metal asks it): the queue posts
+// nothing after the buffer until then (PRESENT HOLD). Where the buffer has failed by its
+// scheduling, the scheduled handler gives the signal instead, as Metal's does; the bundle's
+// buffers learn a failure at their completion, after their scheduled handlers, so they present.
 - (void)rgfxPresent:(id<MTLDrawable>)drawable with:(void (^)(id<MTLDrawable>))present
 {
 	if (drawable == nil)
 		return;
+	RgfxCommandQueue *queue = _queue;
 	[self addScheduledHandler:^(id<MTLCommandBuffer> cb) {
 		if (cb.error == nil)
 			present(drawable);
+		else
+			[queue rgfxPresentScheduled];
+	}];
+	_presentWaits.fetch_add(1, std::memory_order_acq_rel);
+	[(id<RgfxDrawablePresentScheduled>)drawable addPresentScheduledHandler:^(id<MTLDrawable> d) {
+		(void)d;
+		[queue rgfxPresentScheduled];
 	}];
 }
 
