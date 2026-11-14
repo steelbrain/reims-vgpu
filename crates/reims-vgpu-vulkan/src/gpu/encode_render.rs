@@ -6033,7 +6033,7 @@ pub(crate) mod tests {
             store_action,
             color_attachment_index: 0,
         });
-        let set = setter.then(|| RenderCmd::SetColorResolveTexture {
+        let set = setter.then_some(RenderCmd::SetColorResolveTexture {
             texture: Some(&target),
             slice: 0,
             depth_plane: 0,
@@ -6208,7 +6208,7 @@ pub(crate) mod tests {
             true => RenderCmd::SetStencilStoreAction { store_action },
             false => RenderCmd::SetDepthStoreAction { store_action },
         });
-        let set = setter.then(|| match stencil {
+        let set = setter.then_some(match stencil {
             true => RenderCmd::SetStencilResolveTexture {
                 texture: Some(&in_heap),
                 slice: 0,
