@@ -4417,6 +4417,22 @@ that answers none ("Unknown GPU!!"). Among what the settings decide:
   (jobs m3-max-26654 and m3-max-26650). The Vulkan platform holds no such
   mode and dies on it (read from its code: `metal_value` of the runtime's
   `TriangleFillMode`), which only a guest given Intel's settings reaches.
+- Whether texture uploads and mipmap generation take the renderer's other
+  path (`gldModifyTexSubImage`, `gldGenerateTexMipmaps`): the Apple settings
+  alone.
+- Whether it keeps `supportsForceSeamsOnCubemaps`' answer: the Apple settings
+  alone; every other vendor's drop it.
+- The largest point the renderer draws (`updateRenderPointSettings` clamps
+  GL's point size to it): 16 pixels under Apple5's settings, 64 under every
+  other set.
+
+Apple7's settings and Apple5's are the same but for that point size: both
+answer each of the settings above as Apple's (read from the five settings
+records and the code that copies them, macOS 27.0.1's arm64e slice). So the
+narrowest answers that give a device the Apple settings are a `vendorName`
+that holds none of "AMD", "ATI", "NVIDIA" and "Intel" and `supportsFamily:`
+of Apple5; "Apple" without Apple5 or Apple7 ends every process that makes a
+GL context.
 
 Our device answers `vendorName` with the host GPU's vendor, and "AMD" for any
 other (`rgfxVendorNameOf` in `guest/bundle/src/RgfxCaps.hpp`), and no Apple
@@ -4426,8 +4442,15 @@ Macs' GPUs measured above would. An arm64 guest on the M3 Max gets NVIDIA's
 settings where the M3 Max's own renderer takes the Apple ones: GL lines under
 the last-vertex convention take their first vertex's flat value there (arm64
 macOS 27.0.1, a64walk2's walks), whatever the bundle and the host do with the
-setter. The Apple settings would need the device to answer Apple7 and the
-vendor the M3 Max answers ("Apple").
+setter. The device does not answer Apple5 for it: Apple4's and Apple5's rows
+hold tile shaders, imageblocks and nonsquare tile dispatch, which the device
+does not carry (no tile pipeline crosses the wire) and the Vulkan platform's
+runtime refuses on every device (its family audit, measured on an Iris Xe at
+metal2vulkan c796a88d6a: 26 rows of Apple5's block it, these four among
+them). And the Apple settings send `GL_POINT` polygon mode as
+`setTriangleFillMode:` 2, on which the platform dies. Apple5 without Apple7
+is also no Mac's answer, which is why the device claims no Apple family short
+of Apple7 (`FIRST_MAC_APPLE_FAMILY` in `device_info.rs`).
 
 **Registration waits for the bundle.** Where the accelerator is registered and
 its bundle is not on disk, every WindowServer aborts in CoreDisplay as it
