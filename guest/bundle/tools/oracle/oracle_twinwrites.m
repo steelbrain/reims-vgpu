@@ -1,17 +1,20 @@
-// What Metal stores into an IOSurface's two planes through a 4:4:4 two-plane Y'CbCr texture over
-// plane 0, by format: the `_sRGB` twins 523 (YCBCR8_444_2P_sRGB) and 527 (YCBCR10_444_2P_sRGB),
-// and beside them 503 (YCBCR8_444_2P) and 507 (YCBCR10_444_2P), whose stores metal2vulkan holds.
-// dgpu-oracle.md Q40 holds what it found.
+// What Metal stores into an IOSurface's two planes through a two-plane Y'CbCr texture over plane
+// 0, by format: the 4:4:4 `_sRGB` twins 523 (YCBCR8_444_2P_sRGB) and 527 (YCBCR10_444_2P_sRGB),
+// and beside them 503 (YCBCR8_444_2P) and 507 (YCBCR10_444_2P), whose stores metal2vulkan holds,
+// and 500 (YCBCR8_420_2P), whose writes it drops. dgpu-oracle.md Q40 holds what it found.
 //
 // One format and one write a process, named on the command line:
-//   oracle_twinwrites DEVICE FORMAT <kernel|fragment|clear>
+//   oracle_twinwrites DEVICE FORMAT <kernel|fragment|clear|argbuf>
 // DEVICE is a substring of the device's name (`AMD`, `Intel`, `Apple`), FORMAT the raw
-// MTLPixelFormat (503, 507, 523 or 527). The surface is 8 by 2 texels, of OSType '444v' for an
-// 8-bit format and 'x444' for a 10-bit one, made by IOSurfaceCreate with its planes named (rows of
-// 64 bytes, plane 1 at 4096) and no matrix, every byte of both planes 0xAB before each write.
+// MTLPixelFormat (500, 503, 507, 523 or 527). The surface is 8 by 2 texels, of OSType '444v' for
+// an 8-bit 4:4:4 format, 'x444' for a 10-bit one and '420v' for 500 (plane 1 of 4 by 1 Cb, Cr
+// pairs), made by IOSurfaceCreate with its planes named (rows of 64 bytes, plane 1 at 4096) and
+// no matrix, every byte of both planes 0xAB before each write.
 // Column x is written colour x of kColours, alpha 1:
 //   0 black, 1 white, 2 grey 0.5, 3 red, 4 green, 5 blue, 6 (0.2, 0.6, 0.9), 7 (0.9, 0.3, 0.1).
-// `kernel` dispatches 8 x 2 threads of a kernel that write()s each texel's colour; `fragment`
+// `kernel` dispatches 8 x 2 threads of a kernel that write()s each texel's colour; `argbuf` does
+// the same through an argument buffer that holds the texture, made resident for writing
+// (`useResource:usage:` of `MTLResourceUsageWrite`); `fragment`
 // draws over an 8 x 2 BGRA8Unorm target with a fragment function that write()s it at its
 // position; `clear` runs, for each colour, a render pass into the texture that clears it to that
 // colour and stores it, then reads the planes. Each stage prints a line and flushes before the
@@ -19,8 +22,8 @@
 // alarm ends one stuck past 30 s. `oracle_twinwrites.sh DEVICE` runs every format and write.
 //
 // After each command buffer: its status and error, then each plane's rows of the written
-// texels' bytes in hex (plane 0: 8 luma samples a row; plane 1: 8 Cb, Cr pairs a row; a 10-bit
-// sample is a little-endian 16-bit word, its code in the top 10 bits).
+// texels' bytes in hex (plane 0: 8 luma samples a row; plane 1: 8 Cb, Cr pairs a row, or 4 in
+// one row for 500; a 10-bit sample is a little-endian 16-bit word, its code in the top 10 bits).
 //
 // Build (universal, on a Mac with the command line tools; build.sh builds it with the others):
 //   clang -arch arm64 -arch x86_64 -mmacosx-version-min=14.0 -fobjc-arc -framework Metal \
@@ -89,6 +92,12 @@ static NSString *const kSource =
     @"                    uint2 g [[thread_position_in_grid]]) {\n"
     @"  t.write(colours[g.x], g);\n"
     @"}\n"
+    @"struct Held { texture2d<float, access::write> t [[id(0)]]; };\n"
+    @"kernel void k_write_held(constant float4 *colours [[buffer(0)]],\n"
+    @"                         constant Held &held [[buffer(1)]],\n"
+    @"                         uint2 g [[thread_position_in_grid]]) {\n"
+    @"  held.t.write(colours[g.x], g);\n"
+    @"}\n"
     @"fragment float4 f_write(VOut in [[stage_in]],\n"
     @"                        texture2d<float, access::write> t [[texture(0)]],\n"
     @"                        constant float4 *colours [[buffer(0)]]) {\n"
@@ -97,9 +106,9 @@ static NSString *const kSource =
     @"  return float4(0);\n"
     @"}\n";
 
-// A surface of `ostype` of kWidth by kHeight texels, two planes of 4:4:4 samples of `bytes`
-// bytes each (a chroma element two of them).
-static IOSurfaceRef surface(uint32_t ostype, NSUInteger bytes) {
+// A surface of `ostype` of kWidth by kHeight texels, two planes of samples of `bytes` bytes each
+// (a chroma element two of them), its chroma 4:4:4, or 4:2:0 where `sub`.
+static IOSurfaceRef surface(uint32_t ostype, NSUInteger bytes, BOOL sub) {
   NSDictionary *plane0 = @{
     (id)kIOSurfacePlaneWidth : @(kWidth),
     (id)kIOSurfacePlaneHeight : @(kHeight),
@@ -109,8 +118,8 @@ static IOSurfaceRef surface(uint32_t ostype, NSUInteger bytes) {
     (id)kIOSurfacePlaneSize : @(kRow * kHeight),
   };
   NSDictionary *plane1 = @{
-    (id)kIOSurfacePlaneWidth : @(kWidth),
-    (id)kIOSurfacePlaneHeight : @(kHeight),
+    (id)kIOSurfacePlaneWidth : @(sub ? kWidth / 2 : kWidth),
+    (id)kIOSurfacePlaneHeight : @(sub ? kHeight / 2 : kHeight),
     (id)kIOSurfacePlaneBytesPerElement : @(2 * bytes),
     (id)kIOSurfacePlaneBytesPerRow : @(kRow),
     (id)kIOSurfacePlaneOffset : @(kChroma),
@@ -132,14 +141,15 @@ static void pad(IOSurfaceRef s) {
   IOSurfaceUnlock(s, 0, NULL);
 }
 
-// Each plane's rows of the written texels' bytes, under `prefix`.
-static void sayPlanes(NSString *prefix, IOSurfaceRef s, NSUInteger bytes) {
+// Each plane's rows of the written texels' bytes, under `prefix`; plane 1's 4:2:0 where `sub`.
+static void sayPlanes(NSString *prefix, IOSurfaceRef s, NSUInteger bytes, BOOL sub) {
   IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
   for (NSUInteger plane = 0; plane < 2; plane++) {
     const uint8_t *base = IOSurfaceGetBaseAddressOfPlane(s, plane);
     NSUInteger row = IOSurfaceGetBytesPerRowOfPlane(s, plane);
-    NSUInteger used = kWidth * bytes * (plane + 1);
-    for (NSUInteger y = 0; y < kHeight; y++) {
+    NSUInteger used = kWidth * bytes * (plane == 1 && !sub ? 2 : 1);
+    NSUInteger rows = plane == 1 && sub ? kHeight / 2 : kHeight;
+    for (NSUInteger y = 0; y < rows; y++) {
       NSMutableString *hex = [NSMutableString string];
       for (NSUInteger i = 0; i < used; i++) [hex appendFormat:@"%02x", base[y * row + i]];
       NSString *key = [NSString stringWithFormat:@"%@.plane%lu.row%lu", prefix,
@@ -162,14 +172,15 @@ static id<MTLDevice> pickDevice(const char *want) {
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     if (argc != 4) {
-      fprintf(stderr, "usage: oracle_twinwrites DEVICE FORMAT <kernel|fragment|clear>\n");
+      fprintf(stderr, "usage: oracle_twinwrites DEVICE FORMAT <kernel|fragment|clear|argbuf>\n");
       return 2;
     }
     alarm(30);
     NSUInteger format = strtoul(argv[2], NULL, 0);
     NSString *op = @(argv[3]);
     BOOL tenBit = format == 507 || format == 527;
-    if (format != 503 && format != 507 && format != 523 && format != 527) return 2;
+    BOOL sub = format == 500;
+    if (format != 500 && format != 503 && format != 507 && format != 523 && format != 527) return 2;
     gDevice = pickDevice(argv[1]);
     if (gDevice == nil) {
       say("device", @"none");
@@ -189,14 +200,14 @@ int main(int argc, const char *argv[]) {
       return 2;
     }
     NSUInteger bytes = tenBit ? 2 : 1;
-    uint32_t ostype = tenBit ? 'x444' : '444v';
-    IOSurfaceRef s = surface(ostype, bytes);
+    uint32_t ostype = sub ? '420v' : tenBit ? 'x444' : '444v';
+    IOSurfaceRef s = surface(ostype, bytes, sub);
     if (s == NULL) {
       say("surface", @"none");
       return 2;
     }
     say("surface", [NSString stringWithFormat:@"%@ planes %zu rows %zu,%zu chroma at %zu",
-                                              tenBit ? @"x444" : @"444v",
+                                              sub ? @"420v" : tenBit ? @"x444" : @"444v",
                                               IOSurfaceGetPlaneCount(s),
                                               IOSurfaceGetBytesPerRowOfPlane(s, 0),
                                               IOSurfaceGetBytesPerRowOfPlane(s, 1),
@@ -245,7 +256,37 @@ int main(int argc, const char *argv[]) {
       [cb commit];
       [cb waitUntilCompleted];
       sayBuffer(prefix, cb);
-      sayPlanes(prefix, s, bytes);
+      sayPlanes(prefix, s, bytes, sub);
+    } else if ([op isEqualToString:@"argbuf"]) {
+      id<MTLFunction> f = [gLibrary newFunctionWithName:@"k_write_held"];
+      id<MTLComputePipelineState> state = [gDevice newComputePipelineStateWithFunction:f
+                                                                                 error:&error];
+      if (state == nil) {
+        say("compute", [NSString stringWithFormat:@"failed: %@", error]);
+        return 2;
+      }
+      id<MTLArgumentEncoder> ae = [f newArgumentEncoderWithBufferIndex:1];
+      id<MTLBuffer> held = [gDevice newBufferWithLength:ae.encodedLength
+                                                options:MTLResourceStorageModeShared];
+      [ae setArgumentBuffer:held offset:0];
+      [ae setTexture:t atIndex:0];
+      pad(s);
+      id<MTLCommandBuffer> cb = [queue commandBuffer];
+      stage("compute-encoder");
+      id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+      [e setComputePipelineState:state];
+      [e setBuffer:colours offset:0 atIndex:0];
+      [e setBuffer:held offset:0 atIndex:1];
+      [e useResource:t usage:MTLResourceUsageWrite];
+      stage("dispatch");
+      [e dispatchThreads:MTLSizeMake(kWidth, kHeight, 1)
+          threadsPerThreadgroup:MTLSizeMake(kWidth, kHeight, 1)];
+      [e endEncoding];
+      stage("commit");
+      [cb commit];
+      [cb waitUntilCompleted];
+      sayBuffer(prefix, cb);
+      sayPlanes(prefix, s, bytes, sub);
     } else if ([op isEqualToString:@"fragment"]) {
       MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
       d.vertexFunction = [gLibrary newFunctionWithName:@"v_cover"];
@@ -282,7 +323,7 @@ int main(int argc, const char *argv[]) {
       [cb commit];
       [cb waitUntilCompleted];
       sayBuffer(prefix, cb);
-      sayPlanes(prefix, s, bytes);
+      sayPlanes(prefix, s, bytes, sub);
     } else if ([op isEqualToString:@"clear"]) {
       for (NSUInteger c = 0; c < kWidth; c++) {
         MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -301,7 +342,7 @@ int main(int argc, const char *argv[]) {
         [cb waitUntilCompleted];
         NSString *each = [NSString stringWithFormat:@"%@.c%lu", prefix, (unsigned long)c];
         sayBuffer(each, cb);
-        sayPlanes(each, s, bytes);
+        sayPlanes(each, s, bytes, sub);
       }
     } else {
       return 2;
