@@ -153,6 +153,21 @@ Stages:
      region's own descriptor it would hold for every region page faulted
      after it, and each later write-back ask would walk the object's pages
      to take it back (`RgfxAccelerator::copyWriteCombinedRegion`).
+     The kext writes ring 0's submit data the same way on x86-64: the
+     data's whole 4 KiB pages past its header's, through a write-combined
+     map of a descriptor of their own, the header's page uncached
+     (`RgfxControlRing.hpp`). A write-combined store is ordered with no
+     later store, so the kext fences its stores (SFENCE) before it stores
+     the producer: the host never sees the producer before the data it
+     covers. arm64 maps no write-combined part, and its release store of the
+     producer orders the data's stores before it. `control_ring_test` holds
+     both orders, under each architecture's rules. Measured in Geekbench's
+     Metal Super Resolution on the 780M host, a SubmitBatch call, the
+     creates and destroys a commit posts there, took 33.6 us p50 (59.4 p90)
+     with the data uncached and 31.3 us (58.2) write-combined, so the data's
+     stores are a small part of it: the call spends the rest in the kernel
+     without blocking, not yet split (15.2 us p50 on the Iris Xe host, whose
+     EPT ignores the guest's memory type; 11-14).
    - The region is memory of QEMU's process, and the host side runs in that
      process. On Linux it is a shared mapping of a memfd of the library's
      (`reims-vgpu-vulkan`'s `RegionMemory`): RADV refuses a pointer to a
@@ -2434,10 +2449,17 @@ own 64-byte line:
   so a clear that read its arm sees its take, and only the host writes 0, so
   the 1 undoes nothing of the guest's. The fix is the host's alone: no kext or
   bundle changes, and ring 0's completion ring takes it too.
+- The completion thread's arm, once. The header is uncached memory to the
+  guest on an AMD host, so the completion thread writes it only where
+  something changed (`RgfxReplyReader::armAndCheck`): a ring its last arm
+  found empty, from which it has taken nothing since, it does not arm again
+  while `producer` reads as it did then, as the host clears `armed` only in a
+  post, after its publish; and a pump that took nothing leaves `consumer` as
+  it was.
   `ring/interleavings.rs` walks every interleaving of the host's post, the
-  kext's look and the completion thread's take, arm and sleep (up to 3
-  records and 2 vectors for something else): none leaves a record untaken or
-  the thread asleep unarmed. A wake index the host only reads (virtio's
+  kext's look and the completion thread's take, arm, arm skipped and sleep (up
+  to 3 records and 2 vectors for something else): none leaves a record
+  untaken or the thread asleep unarmed. A wake index the host only reads (virtio's
   `used_event`) was weighed and declined: it would change a ring's format in
   the host, the kext and the bundle, and the re-arm closes the race without
   one.
