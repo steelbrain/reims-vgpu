@@ -214,7 +214,11 @@ fn ram_dma_buf_of_runs(
 ) -> std::io::Result<rt::DmaBufChunk> {
     let length = ranges.iter().map(|&(_, n)| n).sum();
     match super::dma_buf::of_ranges(ranges, zeros) {
-        Ok(fd) => Ok(rt::DmaBufChunk { fd, length }),
+        Ok(fd) => Ok(rt::DmaBufChunk {
+            file: Arc::new(fd),
+            offset: 0,
+            length,
+        }),
         Err(refusal) => {
             log::debug!(
                 target: "reims_vgpu_vulkan::os",
@@ -1405,7 +1409,7 @@ mod tests {
                     chunk.length.to_usize(),
                     libc::PROT_READ | libc::PROT_WRITE,
                     libc::MAP_SHARED,
-                    chunk.fd.as_raw_fd(),
+                    chunk.file.as_raw_fd(),
                     0,
                 );
                 assert_ne!(mapped, libc::MAP_FAILED);
@@ -1529,7 +1533,7 @@ mod tests {
                 chunk.length.to_usize(),
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
-                chunk.fd.as_raw_fd(),
+                chunk.file.as_raw_fd(),
                 0,
             )
         };

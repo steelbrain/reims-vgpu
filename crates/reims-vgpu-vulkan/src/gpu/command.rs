@@ -461,15 +461,17 @@ impl CommandBufferObject {
     /// though no encoder was made under them (measured), all of its encoders running; `None`
     /// where nothing does, or only its draws of primitive type 9, which the runtime fails it at
     /// ([`CommandBufferObject::fails_at_type_9`]). Two different ways at once, which nothing
-    /// measured, die.
+    /// measured, die. The encoders it fails are always [`rt::FailedEncoders::From`] the first
+    /// that runs nothing, never a `Set`.
     ///
     /// A command buffer that fails so is never cut into parts ([`CommandBufferObject::splits`]),
     /// so what fails is the encoders of one commit of the runtime's: a failure from an encoder
     /// on is passed as `From` its first. Each part of a buffer that was cut is a commit of its
     /// own, whose encoders the runtime treats as any commit's: what it records together of a
     /// commit's encoders (consecutive compute encoders, in one Vulkan command buffer) it records
-    /// within a part, never across a cut, and such a group that fails, fails whole within its
-    /// part.
+    /// within a part, never across a cut. The encoder that fails can directly follow compute
+    /// encoders the runtime records with it; the encoders before it run all the same
+    /// (`protection_options_fail_compute_encoders_from_the_one_made_under_them`).
     fn failure(&self, sel: &'static str) -> Option<rt::CommitFailure> {
         let mut ways = plain(|| self.failing.lock().clone());
         let options = plain(|| self.protection.lock().options);
@@ -2677,6 +2679,80 @@ mod tests {
         let after = filled(&cb, 0x7c);
         assert_eq!(completed(&cb), (4, None), "options 2, then 0");
         assert_eq!(sixteen(&after), vec![0x7c; 16]);
+    }
+
+    /// Under protection options, a compute encoder made right after another compute encoder
+    /// fails from itself on, as the blit encoders above do: the earlier encoder's work runs and
+    /// the later one's runs nothing, though the runtime records consecutive compute encoders
+    /// into one Vulkan command buffer
+    #[test]
+    fn protection_options_fail_compute_encoders_from_the_one_made_under_them() {
+        use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+        use crate::core::platform::resource::Library as _;
+        use crate::core::platform::types::{MtlSize, NsRange};
+        use crate::gpu::resource::VulkanBuffer;
+        use crate::gpu::resource::tests::shared;
+
+        // `inc_k`: one thread adds 1 to `c[0]`, and marks `c[n]` with `n * 0x11` below 16.
+        const INC: &[u8] = include_bytes!("../../../../tests/shaders/compute_inc.metallib");
+        let d = dev();
+        let f = d
+            .new_library(INC)
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .new_function(OnFault::Return, "inc_k")
+            .unwrap()
+            .unwrap();
+        let inc = d
+            .new_compute_pipeline_state_for_function(Some(&f))
+            .unwrap()
+            .unwrap();
+        let q = d.new_command_queue().unwrap();
+        let run = |cb: &VulkanCommandBuffer, c: &VulkanBuffer| {
+            let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
+            let buffers = [Some(c)];
+            for cmd in [
+                ComputeCmd::SetComputePipelineState { state: Some(&inc) },
+                ComputeCmd::SetBuffers {
+                    buffers: &buffers,
+                    offsets: &[0],
+                    range: NsRange::new(0, 1),
+                },
+                ComputeCmd::DispatchThreads {
+                    threads_per_grid: MtlSize::new(1, 1, 1),
+                    threads_per_threadgroup: MtlSize::new(1, 1, 1),
+                },
+                ComputeCmd::EndEncoding,
+            ] {
+                e.encode(OnFault::Return, cmd).unwrap();
+            }
+        };
+        // A command buffer before them has the pipeline made, so the two encoders below meet it
+        // ready and the runtime records them together.
+        let warm = buffer(&q);
+        run(&warm, &shared(64));
+        assert_eq!(completed(&warm), (4, None));
+        let cb = buffer(&q);
+        let (before, under) = (shared(64), shared(64));
+        let folded = || d.raw.work_counts().encoders_folded;
+        let was = folded();
+        run(&cb, &before);
+        cb.set_protection_options(OnFault::Return, 2).unwrap();
+        run(&cb, &under);
+        assert_eq!(
+            folded() - was,
+            1,
+            "the runtime records the two encoders together"
+        );
+        assert_eq!(completed(&cb), (5, Some(16)));
+        assert_eq!(
+            (
+                sixteen(&before)[..8].to_vec(),
+                sixteen(&under)[..8].to_vec()
+            ),
+            (vec![1, 0, 0, 0, 0x11, 0, 0, 0], vec![0; 8])
+        );
     }
 
     /// A command buffer split at an encoder's end commits its work so far as a part, as its

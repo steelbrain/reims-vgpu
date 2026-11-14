@@ -474,7 +474,8 @@ pub(crate) fn of_pages(
     let made = cut.iter().map(|chunk| {
         let fd = create(device, chunk)?;
         Ok(DmaBufChunk {
-            fd,
+            file: Arc::new(fd),
+            offset: 0,
             length: chunk.iter().map(|r| r.length).sum(),
         })
     });
@@ -603,7 +604,7 @@ mod tests {
                 length,
                 libc::PROT_READ,
                 libc::MAP_SHARED,
-                chunk.fd.as_raw_fd(),
+                chunk.file.as_raw_fd(),
                 0,
             );
             assert_ne!(at, libc::MAP_FAILED);
@@ -626,7 +627,7 @@ mod tests {
                 length,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
-                chunk.fd.as_raw_fd(),
+                chunk.file.as_raw_fd(),
                 0,
             );
             assert_ne!(at, libc::MAP_FAILED);
