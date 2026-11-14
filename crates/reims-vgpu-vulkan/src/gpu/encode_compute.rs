@@ -257,7 +257,7 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                 comparison,
                 reference_value,
             } => predication::start_while(self, sel, buffer, offset, comparison, reference_value),
-            ComputeCmd::EndEncoding => self.end(sel, rt::ComputeCommandEncoder::end_encoding),
+            ComputeCmd::EndEncoding => self.end(sel, |e| e.end_encoding()),
             ComputeCmd::ExecuteCommandsIndirect {
                 indirect_commandbuffer,
                 indirect_range_buffer,
