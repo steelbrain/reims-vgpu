@@ -418,6 +418,7 @@ fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>) {
     let mut latency_us = Vec::new();
     let mut gpu_us = Vec::new();
     let mut after_walk_us = Vec::new();
+    let cut = bench.decoder.parts_cut();
     for n in 0..WARM + shape.frames {
         let cb_obj_id = 0x1000 + n as u64;
         let message = frame(shape, cb_obj_id);
@@ -447,7 +448,8 @@ fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>) {
     }
     println!(
         "{name}: {} frames of 1 command buffer of {} passes of {} draws over {} x {}, a draw {} \
-         of the target, every {}th pass reading its target {}, parts walked {} us at least",
+         of the target, every {}th pass reading its target {}, parts walked {} us at least, \
+         {:.2} parts a frame",
         shape.frames,
         shape.passes,
         shape.draws,
@@ -460,7 +462,8 @@ fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>) {
         } else {
             "after its draws"
         },
-        (shape.split_us).map_or(super::split::SPLIT_AFTER.as_micros(), u128::from)
+        (shape.split_us).map_or(super::split::SPLIT_AFTER.as_micros(), u128::from),
+        1.0 + (bench.decoder.parts_cut() - cut) as f64 / (WARM + shape.frames) as f64
     );
     for (figure, values) in [
         ("walk us", &mut walk_us),

@@ -2211,6 +2211,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 *cb = next;
                 s.hold = Some(hold);
                 s.since = clock.now_mono();
+                self.note_part_cut();
             }
             None => {
                 // Kept whole: the handler just added sees the buffer's own completion, which

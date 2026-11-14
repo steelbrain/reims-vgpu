@@ -27,12 +27,13 @@
 //!
 //! The environment picks what runs: `DISPATCH_COST_SHAPE` the shape (`fluid`, the default; `one`,
 //! the same dispatches in one encoder, each after its bindings, whose gap to `fluid` is what an
-//! encoder a dispatch costs; or `small`, 64 command buffers of 5 encoders, the median of the pass's
-//! other command buffers), `DISPATCH_COST_RUNS` the runs (5), `DISPATCH_COST_ONLY` one path, for a
-//! profile of it (`decoder`, `platform` or `runtime`), `DISPATCH_COST_SECONDS` a time to keep
-//! running that path for, so a sampling profiler can attach, and `DISPATCH_COST_SPLIT_US` how long
-//! a part of a command buffer is walked before the walk commits it (the decoder's own
-//! `SPLIT_AFTER` where unset; one longer than the walk keeps it whole).
+//! encoder a dispatch costs; `small`, 64 command buffers of 5 encoders, the median of the pass's
+//! other command buffers; or `heavy`, `fluid` with dispatches whose GPU work outlasts their walk),
+//! `DISPATCH_COST_RUNS` the runs (5), `DISPATCH_COST_ONLY` one path, for a profile of it
+//! (`decoder`, `platform` or `runtime`), `DISPATCH_COST_SECONDS` a time to keep running that path
+//! for, so a sampling profiler can attach, and `DISPATCH_COST_SPLIT_US` how long a part of a
+//! command buffer is walked before the walk commits it (the decoder's own `SPLIT_AFTER` where
+//! unset; one longer than the walk keeps it whole).
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -70,12 +71,14 @@ use super::{GraphicsDecoder, ObjHandle};
 use crate::platform::ApiPlatform;
 
 /// How a repetition's work is cut: `cbs` command buffers, committed back to back and then waited
-/// for, each of `dispatches` dispatches in `encoders` compute encoders of as many each.
+/// for, each of `dispatches` dispatches in `encoders` compute encoders of as many each, each
+/// dispatch of `groups` threadgroups.
 #[derive(Debug, Clone, Copy)]
 struct Shape {
     cbs: usize,
     dispatches: usize,
     encoders: usize,
+    groups: u64,
 }
 
 impl Shape {
@@ -84,6 +87,14 @@ impl Shape {
         cbs: 1,
         dispatches: 2600,
         encoders: 2600,
+        groups: 1,
+    };
+    /// Fluid's command buffer whose GPU work outlasts its walk, as Fluid Simulation's does on a
+    /// Radeon 780M (perfscout4's gbr-780m: about 200 µs of the GPU's a dispatch against a walk of
+    /// 12 to 20 µs): each dispatch of [`HEAVY_GROUPS`] threadgroups.
+    const HEAVY: Shape = Shape {
+        groups: HEAVY_GROUPS,
+        ..Shape::FLUID
     };
     /// The same dispatches in one encoder.
     const ONE: Shape = Shape {
@@ -95,13 +106,15 @@ impl Shape {
         cbs: 64,
         dispatches: 5,
         encoders: 5,
+        groups: 1,
     };
 
-    /// The shape `DISPATCH_COST_SHAPE` names: `one`, `small` or, by default, `fluid`.
+    /// The shape `DISPATCH_COST_SHAPE` names: `one`, `small`, `heavy` or, by default, `fluid`.
     fn chosen() -> Shape {
         match std::env::var("DISPATCH_COST_SHAPE").as_deref() {
             Ok("one") => Shape::ONE,
             Ok("small") => Shape::SMALL,
+            Ok("heavy") => Shape::HEAVY,
             _ => Shape::FLUID,
         }
     }
@@ -138,6 +151,9 @@ const SAMPLED_USAGE: u64 = 1;
 const SIDE: u64 = 64;
 /// The threads of the threadgroup each dispatch runs.
 const THREADS: u64 = 32;
+/// The threadgroups of each dispatch of [`Shape::HEAVY`]: a million threads, each sampling a
+/// texel and writing 4 bytes of the output buffer.
+const HEAVY_GROUPS: u64 = 32768;
 
 /// One op: its header, then its body.
 fn op(tag: u16, body: &[u8]) -> Vec<u8> {
@@ -175,7 +191,7 @@ enum Step {
     /// `setBuffer:offset:atIndex:` (or `setBytes:length:atIndex:`, an upload chunk at its offset),
     /// which the bundle sends as a `setBuffers:` of one.
     Buffer(u64, u64, u64),
-    /// `dispatchThreadgroups:threadsPerThreadgroup:` of one threadgroup.
+    /// `dispatchThreadgroups:threadsPerThreadgroup:` of the shape's threadgroups.
     Dispatch,
     /// The encoder's end.
     End,
@@ -208,8 +224,8 @@ fn steps(shape: Shape, cb: usize) -> Vec<Step> {
     steps
 }
 
-/// The op the bundle sends for `step`.
-fn step_op(step: Step) -> Vec<u8> {
+/// The op the bundle sends for `step`, a dispatch of `groups` threadgroups.
+fn step_op(step: Step, groups: u64) -> Vec<u8> {
     match step {
         Step::Begin => op(RGFX_OP_ENCODER_BEGIN_COMPUTE, &[]),
         Step::End => op(RGFX_OP_ENCODER_END, &[]),
@@ -262,7 +278,7 @@ fn step_op(step: Step) -> Vec<u8> {
         Step::Dispatch => op(
             RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS,
             RgfxComputeOpDispatchThreadgroups {
-                threadgroups_width: 1,
+                threadgroups_width: groups,
                 threadgroups_height: 1,
                 threadgroups_depth: 1,
                 threads_width: THREADS,
@@ -277,7 +293,9 @@ fn step_op(step: Step) -> Vec<u8> {
 /// The `COMMAND_BUFFER` message of command buffer `cb` of a repetition of `shape`, as the bundle
 /// sends its ops ([`steps`]).
 fn command_buffer(shape: Shape, cb: usize, cb_obj_id: u64) -> Vec<u8> {
-    let ops: Vec<u8> = steps(shape, cb).into_iter().flat_map(step_op).collect();
+    let ops: Vec<u8> = (steps(shape, cb).into_iter())
+        .flat_map(|step| step_op(step, shape.groups))
+        .collect();
     let m = RgfxCommandBuffer {
         header: RgfxMsgHeader {
             r#type: RGFX_CMD_COMMAND_BUFFER,
@@ -369,7 +387,7 @@ impl<P: ApiPlatform> Bench<P> {
             .unwrap()
             .unwrap();
         let output = device
-            .new_buffer_of_length(o, THREADS * 4, 0)
+            .new_buffer_of_length(o, THREADS * shape.groups * 4, 0)
             .unwrap()
             .unwrap();
         for (id, handle) in [
@@ -511,7 +529,7 @@ impl<P: ApiPlatform> Bench<P> {
                         .encode(
                             o,
                             ComputeCmd::DispatchThreadgroups {
-                                threadgroups_per_grid: MtlSize::new(1, 1, 1),
+                                threadgroups_per_grid: MtlSize::new(self.shape.groups, 1, 1),
                                 threads_per_threadgroup: MtlSize::new(THREADS, 1, 1),
                             },
                         )
@@ -588,9 +606,10 @@ fn through_runtime(bench: &Bench<reims_vgpu_vulkan::VulkanPlatform>) -> Counts {
                 Bound::Buffer(buffer, offset, index) => {
                     e.set_buffers(&[Some(&buffer.raw)], &[offset], index as u32)
                 }
-                Bound::Dispatch => {
-                    e.dispatch_threadgroups(rt::Size::new(1, 1, 1), rt::Size::new(THREADS, 1, 1))
-                }
+                Bound::Dispatch => e.dispatch_threadgroups(
+                    rt::Size::new(bench.shape.groups, 1, 1),
+                    rt::Size::new(THREADS, 1, 1),
+                ),
             }
             .unwrap();
         }
@@ -668,6 +687,9 @@ fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>, runtime: fn(&Bench<P
     // Each path's figures a dispatch, by run, and its latencies in milliseconds, by repetition.
     let mut seen: [Vec<[f64; 3]>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     let mut late: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    // The parts the decoder's walks committed before their buffers' last, over the timed
+    // repetitions.
+    let mut cut = 0u64;
     let ms = |d: Duration| d.as_secs_f64() * 1e3;
     for _ in 0..runs {
         let mut totals = [Counts::default(); 3];
@@ -676,8 +698,12 @@ fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>, runtime: fn(&Bench<P
             let mut spent = [Counts::default(); 3];
             let mut took = [None; 3];
             if only.is_none_or(|o| o == "decoder") {
+                let before = bench.decoder.parts_cut();
                 spent[0] = bench.through_decoder(&m);
                 took[0] = Some(ms(bench.latency.get()));
+                if rep >= WARM {
+                    cut += bench.decoder.parts_cut() - before;
+                }
             }
             if only.is_none_or(|o| o == "platform") {
                 spent[1] = bench.through_platform();
@@ -735,8 +761,10 @@ fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>, runtime: fn(&Bench<P
     }
     println!(
         "  a repetition's latency, its first command buffer's begin to its last one's \
-         completion, ms (the decoder's walk commits parts after {} us):",
-        bench.decoder.split_after().as_micros()
+         completion, ms (the decoder's walk commits parts after {} us; {:.1} parts a command \
+         buffer):",
+        bench.decoder.split_after().as_micros(),
+        1.0 + cut as f64 / (runs * REPS * shape.cbs) as f64
     );
     for (path, late) in paths.iter().zip(&mut late) {
         if late.is_empty() {
@@ -751,7 +779,8 @@ fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>, runtime: fn(&Bench<P
 }
 
 /// The fluid shape holds an encoder a dispatch, each dispatch after its pipeline and its five
-/// bindings, its bytes at its own 256-byte offset; the one shape holds the same ops in one encoder.
+/// bindings, its bytes at its own 256-byte offset; the one shape holds the same ops in one encoder,
+/// and the heavy shape the same ops as fluid, each dispatch of [`HEAVY_GROUPS`] threadgroups.
 #[test]
 fn the_fluid_shape_holds_an_encoder_a_dispatch() {
     let fluid = steps(Shape::FLUID, 0);
@@ -768,6 +797,10 @@ fn the_fluid_shape_holds_an_encoder_a_dispatch() {
     assert_eq!(count(&one, Step::Begin), 1);
     assert_eq!(one.len(), 2600 * 7 + 2);
     assert_eq!(Shape::SMALL.chunks(), 64);
+    assert_eq!(steps(Shape::HEAVY, 0), fluid);
+    let width = |groups| step_op(Step::Dispatch, groups)[8..16].to_vec();
+    assert_eq!(width(Shape::FLUID.groups), 1u64.to_le_bytes());
+    assert_eq!(width(Shape::HEAVY.groups), HEAVY_GROUPS.to_le_bytes());
 }
 
 /// On the Vulkan platform: the decoder, the platform and the runtime alone.

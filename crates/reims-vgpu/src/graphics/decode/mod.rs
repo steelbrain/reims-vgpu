@@ -803,6 +803,9 @@ pub(crate) struct Shared<P: Platform> {
     /// The tests' own [`split::SPLIT_AFTER`], where one is set ([`GraphicsDecoder::split_after`]).
     #[cfg(test)]
     split_after: Mutex<Option<std::time::Duration>>,
+    /// The parts the walks committed before their buffers' last (for the benches).
+    #[cfg(test)]
+    parts_cut: std::sync::atomic::AtomicU64,
     /// The device's BAR 2 region: the host memory the over-host-memory buffers
     /// and heaps are placed over. Held so it stays mapped while the decoder's
     /// objects live; declared last so the contexts drop before it (a buffer
@@ -1036,6 +1039,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             walk_hook: Mutex::new(None),
             #[cfg(test)]
             split_after: Mutex::new(None),
+            #[cfg(test)]
+            parts_cut: std::sync::atomic::AtomicU64::new(0),
             region,
         });
         GraphicsDecoder::on(shared, None, Sinks::default())
@@ -2553,6 +2558,20 @@ impl<P: Platform> GraphicsDecoder<P> {
             return after;
         }
         split::SPLIT_AFTER
+    }
+
+    /// Notes a part a walk committed before its buffer's last ([`Self::parts_cut`]).
+    pub(crate) fn note_part_cut(&self) {
+        #[cfg(test)]
+        self.shared
+            .parts_cut
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The parts the walks committed before their buffers' last so far (for the benches).
+    #[cfg(test)]
+    pub(crate) fn parts_cut(&self) -> u64 {
+        (self.shared.parts_cut).load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The texture a present of IOSurface `iosurface_id` shows ([`Self::surface_present`]).
