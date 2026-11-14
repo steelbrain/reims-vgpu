@@ -111,30 +111,35 @@
 //!
 //! **Group dma-bufs.** On a device that imports each view as a dma-buf of its own and lists every
 //! import in every submission (RADV, `os::linux::dma_buf` of the Vulkan crate), each live pages
-//! block's import costs every `vkQueueSubmit` about 0.45 us. **Measured** 2026-11-14 on
-//! homelab-um870-1's Radeon 780M, an x86-64 macOS 26.7.2 guest running Geekbench 7.1 Metal (two
-//! walks): Super Resolution held about 1,000 such imports at its midpoint and `vkQueueSubmit` took
-//! about 450 us, and Feature Matching, Horizon Detection and Fluid Simulation 700 to 1,200 us.
-//! Where the platform answers limits for a shared file of views ([`HostVm::view_groups`]), a
-//! `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` the surface worker carries out that makes its block's
-//! view maps the view and joins its context's open group ([`SurfaceViews::join_group`]), and its
-//! carrying out waits for the group's seal. A group stays open [`GROUP_WINDOW`] from its first
-//! member's join, or until its members' runs or bytes reach the platform's limits; then a job of
-//! its own on the surface worker seals it ([`SurfaceViews::seal`]): the views go into shared files
-//! ([`HostVm::group_views`]), each view's import is made, a piece of its file, so the device
-//! imports one file for the group, and the members' messages are carried out in their order. Their
-//! context's and their blocks' settles drop only then (`GraphicsControl::start_over_pages`), so the
-//! guest's later messages see each buffer as right after its create; the window delays only the
-//! context's first message after a burst, which waits for the creates anyway. Creates come in
-//! bursts (**measured** on the second walk's trace, Super Resolution: 126 us apart at the median),
-//! and a replay of that trace kept 81 to 86% of the cut in live imports with a 1 ms window, against
-//! about 43% for a seal of what is queued alone. A view past [`GROUP_MEMBER_MAX`] or past a group's
-//! limits alone, a view the cache holds, a heap over the guest's RAM, and a block of pages its
-//! process maps read-only or a read-only buffer (made over a copy of the pages) take no group; a
-//! view the platform leaves alone, or whose piece the runtime refuses, leaves its group and is made
-//! alone, as before. A context's close and the device's reset drop its groups being formed, whose
-//! messages make nothing. Only the views' imports are pieces: a texture's import over a view stays
-//! its own.
+//! block's import is one more buffer object every `vkQueueSubmit` lists, at about 0.5 us each.
+//! **Measured** 2026-11-14 on homelab-um870-1's Radeon 780M, an x86-64 macOS 26.7.2 guest running
+//! Geekbench 7.1 Metal (three walks): at Super Resolution's midpoint about 580 such imports were
+//! live (debugfs `amdgpu_gem_info`, and the runtime's `dma_buf_memories_live`), under about 1,573
+//! no-copy objects, of the 945 buffer objects the process held (about 605 of them the runtime's own
+//! memory, by its gauges), and `vkQueueSubmit` took about 494 us a batch; grouping is projected to
+//! bring a batch to about 250 us or less. Horizon Detection, Photo Filter, Video Filter and RAW
+//! list about as many buffer objects and took 760 to 1,000 us a batch; in Feature Matching,
+//! Particle Physics and Fluid Simulation other buffer objects of the process (2,000 to 8,700)
+//! outnumber the imports, and grouping cuts less there. Where the platform answers limits for a
+//! shared file of views ([`HostVm::view_groups`]), a `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` the
+//! surface worker carries out that makes its block's view maps the view and joins its context's
+//! open group ([`SurfaceViews::join_group`]), and its carrying out waits for the group's seal. A
+//! group stays open [`GROUP_WINDOW`] from its first member's join, or until its members' runs or
+//! bytes reach the platform's limits; then a job of its own on the surface worker seals it
+//! ([`SurfaceViews::seal`]): the views go into shared files ([`HostVm::group_views`]), each view's
+//! import is made, a piece of its file, so the device imports one file for the group, and the
+//! members' messages are carried out in their order. Their context's and their blocks' settles drop
+//! only then (`GraphicsControl::start_over_pages`), so the guest's later messages see each buffer
+//! as right after its create; the window delays only the context's first message after a burst,
+//! which waits for the creates anyway. Creates come in bursts (**measured** on the second walk's
+//! trace, Super Resolution: 126 us apart at the median), and a replay of that trace's creates and
+//! frees cut its live views' imports by 81 to 86% with a 1 ms window, against about 43% for a seal
+//! of what is queued alone. A view past [`GROUP_MEMBER_MAX`] or past a group's limits alone, a view
+//! the cache holds, a heap over the guest's RAM, and a block of pages its process maps read-only or
+//! a read-only buffer (made over a copy of the pages) take no group; a view the platform leaves
+//! alone, or whose piece the runtime refuses, leaves its group and is made alone, as before. A
+//! context's close and the device's reset drop its groups being formed, whose messages make
+//! nothing. Only the views' imports are pieces: a texture's import over a view stays its own.
 //!
 //! A member whose buffers went keeps its group's file alive while another member's import lives:
 //! its pages stay pinned by udmabuf and mapped in the device's GPU address space inside the group's

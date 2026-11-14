@@ -3225,18 +3225,23 @@ buffers to read, where Metal's are dropped.
 block's view once, as a buffer over the whole view that the block's
 `BUFFER_OVER_PAGES` buffers lie in. Where the Vulkan platform imports a view as
 a dma-buf of its own and the driver lists every import in every submission
-(RADV), each live view costs every `vkQueueSubmit` about 0.45 us: Geekbench
-Metal's ML workloads hold 600 to 1,000 such views at once, and Super
-Resolution's submissions took about 450 us (Radeon 780M, measured). There the
-surface worker gathers a process's views for a window: the `BUFFER_OVER_PAGES`
-or `HEAP_OVER_PAGES` that makes a block's view maps it and joins its process's
-open group, which stays open 1 ms from its first member, or until its members
-reach one dma-buf's limits: udmabuf's `list_limit` runs and `size_limit_mb`
-bytes, as the host has them (the host sets neither), and at most 64 MiB,
-whatever udmabuf takes (below). The group is then sealed: the views' pages go
-into shared dma-bufs back to back, and each view's import is a piece of its
-group's file, so the driver lists one import for the group. Only then are the
-members' messages carried out, and the process's and the blocks' later
+(RADV), each live view is one more buffer object every `vkQueueSubmit` lists, at
+about 0.5 us each. Measured on the Radeon 780M (Geekbench 7.1 Metal in a macOS
+26.7.2 guest): at Super Resolution's midpoint about 580 such imports were live,
+under about 1,573 no-copy objects, of the 945 buffer objects the process held
+(about 605 of them the runtime's own memory, by its gauges), and a submission
+took about 494 us; grouping is projected to bring a submission to about 250 us
+or less. In Feature Matching, Particle Physics and Fluid Simulation other buffer
+objects of the process (2,000 to 8,700) outnumber the imports, and grouping cuts
+less there. There the surface worker gathers a process's views for a window: the
+`BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` that makes a block's view maps it and
+joins its process's open group, which stays open 1 ms from its first member, or
+until its members reach one dma-buf's limits: udmabuf's `list_limit` runs and
+`size_limit_mb` bytes, as the host has them (the host sets neither), and at most
+64 MiB, whatever udmabuf takes (below). The group is then sealed: the views'
+pages go into shared dma-bufs back to back, and each view's import is a piece of
+its group's file, so the driver lists one import for the group. Only then are
+the members' messages carried out, and the process's and the blocks' later
 messages wait for that, so each sees its buffer as right after its create.
 
 Some views take no group: a view over 16 MiB, one past a group's limits alone,
