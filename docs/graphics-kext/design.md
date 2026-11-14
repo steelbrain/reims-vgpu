@@ -968,6 +968,125 @@ Stages:
         metal2vulkan 2026-11-13), then the event, the kext's naming, the
         host's counting, and the offer of in place first from
         `steelbrain/routeb`.
+    - **Measured, 2026-11-13: what crosses a GPU's link at each present
+      with every surface cached.** On development at 459e76e6a, the walk
+      above, the link of a GPU whose compositor runs on another GPU
+      carries the window's presents, and little else:
+      - RTX 3090 on PCIe 3.0 x4, its host's one screen (3840 x 2160, scale
+        2.1) on a Radeon 780M, which KWin composites on: the window's
+        swapchain (3648 x 2039) handed KWin four LINEAR XRGB8888 buffers
+        of 29.75 MB, and each of its 4010 presents moved one across the
+        link, 0.93 to each of the guest's 4324. nvidia-smi counted 34.8 MB
+        from the GPU a window present and 2.3 MB to it a guest present,
+        and the GPU was busy 20.2 ms a present (Mission Control: 43 window
+        presents a second, the GPU 96% busy, in P2).
+      - RTX 5080 Laptop GPU, which drives its panel: the window's buffers
+        are the GPU's own tiled images, and nothing crosses: 5985 window
+        presents to 5984 of the guest's, 0.8 MB from the GPU and 1.4 MB
+        to it a present, the GPU busy 2.8 ms a present.
+      - On the host of the RX 7900 XTX and the RTX 2080 the screen is the
+        XTX's: the XTX's presents cross nothing, and the 2080's cross its
+        Thunderbolt link (28.4 MB from the GPU a present, the base runs
+        above).
+      - The link is the limit, not the GPU's engines. The 3090's carries
+        1.83 GB/s from the GPU to the host: a 3648 x 2060 image (30.1 MB)
+        copied into host memory takes 16.4 ms from its graphics family,
+        its compute family and its family of transfers alone alike, and
+        a bare swapchain of that size presenting a cleared image to the
+        780M's compositor reaches 61 presents a second, 1.84 GB/s. Only
+        the graphics family presents to the window's surface. Smaller
+        copies keep the rate: 16 regions of 256 x 256 (4.2 MB) in 2.4 ms,
+        64 of 64 x 64 (1.05 MB) in 0.63 to 0.69 ms.
+      - The compositor's GPU does its part fast: the 780M copies a 30.1 MB
+        image from host memory in 1.25 to 1.44 ms, and presents a cleared
+        image of the window's size 4656 times a second.
+    - **Proposed, not built: the window shown by the compositor's GPU.**
+      Where the compositor runs on another GPU, the window's swapchain is
+      made on that GPU, whose buffers are its own, and only what changed of
+      each frame crosses the runtime's GPU's link. Two routes, for the
+      owner to choose between; neither is built:
+      - *Which device, either route.* The GPU the compositor composites on
+        is the main device of the window's surface's dma-buf feedback
+        (`zwp_linux_dmabuf_feedback_v1`), matched to a physical device by
+        its DRM nodes (`VK_EXT_physical_device_drm`). Where it is the
+        runtime's own GPU, the window stays as it is. Otherwise the window
+        makes a second `VkDevice` there (one graphics queue,
+        `VK_KHR_swapchain`, `VK_EXT_external_memory_host`), apart from the
+        runtime's, and its swapchain over the window's surface.
+      - *Route 1: a copy of the changed tiles.* A frame-sized buffer in
+        host memory, imported into both devices. The runtime's GPU keeps
+        the last frame it sent in its own memory, compares each presented
+        surface with it in 64 x 64 tiles (a compute pass reading the two
+        frames in its own memory: 60 MB, about 0.07 ms at an RTX 3090's
+        memory rate, not measured), reads the tile mask back, and copies
+        the changed tiles into the buffer: D MB of them cost D / 1.8 ms of
+        the 3090's link (measured above). The compositor's GPU then copies
+        the buffer into its next image (1.3 ms, measured above) and
+        presents it. A semaphore exported as a sync file
+        (`VK_KHR_external_semaphore_fd`) orders the two GPUs' work. It is
+        a copy: the driver's copy of each whole image today becomes ours
+        of what changed, and the compositor's GPU copies the frame again
+        into its image.
+        - It touches the window's path alone: the swapchain module, which
+          today makes its swapchain on the runtime's device and wraps its
+          images as the runtime's textures, makes one on a device the
+          runtime does not make; the window reads its surface's dma-buf
+          feedback (Wayland, through SDL's display); the compare is a
+          function of the display's shaders (`shaders.metal`, its
+          metallibs rewritten on a Mac). No guest, kext or placement
+          change.
+        - Its fallback, at each refusal (no second device, a refused
+          import, no feedback): the window presents from the runtime's GPU
+          as now, on every driver.
+      - *Route 2: the presented surfaces in place.* The surfaces the
+        display pipe presents lie in place in guest RAM (route B's
+        placement for them alone; every other surface keeps its device
+        cache), and the compositor's GPU imports their pages and copies
+        from them into its image. Nothing computes damage: the runtime's
+        GPU writes into guest RAM what the guest's composite draws,
+        through the runtime's shadow of the surface, whose copies in and
+        back cover only the rectangle a pass loads and writes inside its
+        draws' scissors (metal2vulkan's `shadow.rs` at 522a8245e2, read
+        from its code). The link carries the composite's passes over the
+        surface, its loads as well as its writes, and each of the
+        compositor's two or three surfaces catches up on the frames it was
+        not drawn in. It is in place: the runtime's GPU writes the guest's
+        pages, and the compositor's GPU reads them.
+        - It touches placement and the window: the kext names the
+          presented surfaces' blocks in place on a host whose GPU has
+          memory of its own (route B's offer, for those blocks alone), and
+          the window's second device imports the pages of the surface each
+          present shows. The window part is route 1's but the copy.
+        - Its fallback: a presented surface whose pages the compositor's
+          GPU cannot import, or no second device, keeps today's device
+          cache and the window's present from the runtime's GPU, at the
+          refusal, on every driver.
+      - *Measured, and not.* What the guest's frames change (below) is
+        measured: route 1's bytes are that change. Route 2's are not: its
+        loads and its surfaces' catch-up add to the change, by how much
+        is unmeasured. One prototype run measures them: the presented
+        surfaces alone in place (not route B wholesale) and the window as
+        today, the 3090's link counted per present as above (its bytes
+        less today's 34.8 MB window copy) beside the runtime's shadow
+        counts for those surfaces. Neither route's frame rate is
+        measured.
+      - *What the guest's frames change.* The same walk on the RX 7900 XTX,
+        with a measuring build (`steelbrain/x4link-damage` at 32bfa734c,
+        not landed: a thread that reads what the display shows as
+        `read_display` does, about once a present, 8 ms a read, and
+        compares each read with the one before in 64 x 64 tiles): 6.27 MB
+        of the 29.7 MB frame changed a present on average, 136 MB/s over
+        the walk, where the 3090's link carried 599 MB/s. By step: the
+        GL 3D page 18.2 MB a present, the autoscroll 12.1, the video 6.2,
+        Safari's scroll 6.1, Finder 2.7, Maps 1.6, Mission Control 1.6,
+        Apps 0.65, the WebGL page 0.3. Presents that come closer together
+        than a read are compared as one, so where presents come fast the
+        figure a present is low. At the 3090's rate that change is 3.5 ms
+        of its link a present on average, where the window's copy takes
+        16.4 ms now (the GL 3D page 10 ms, Mission Control 0.9 ms).
+      - *The contract, either route.* Nothing the guest sees changes:
+        presents are taken, shown and answered as now, and the window
+        shows the same pixels.
 
 15. **The stage 3 stack is IOGPUFamily.** x86-64 macOS 26 carries IOGPUFamily
     and IOGPU.framework, and the x86-64 port runs Metal compositing on them:
