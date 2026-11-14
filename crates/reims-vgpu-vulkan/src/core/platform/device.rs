@@ -180,15 +180,17 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// Never nil-checked. No path reaches it under a handler: a raise inside it dies at the send.
     fn new_command_queue(&self) -> Option<P::CommandQueue>;
     /// No Metal counterpart: a queue as [`new_command_queue`](GpuDevice::new_command_queue)'s,
-    /// which shares the GPU queue it submits to with no other command queue for its life, where
-    /// the platform would otherwise share one between command queues: the queues on a present's
-    /// path are made so, lest another queue's long command buffer hold theirs back: WindowServer's
-    /// in the graphics lane (`RGFX_QUEUE_UNSHARED`), so that no other process's work queues on
-    /// the GPU ahead of its frames, and the host's own on that path (the device's blit and exec
-    /// queues, the process's frame queue, a graphics display's scanout draw and the IOSurface
-    /// device caches' transfer queue). A platform that shares no GPU queue between command queues
-    /// answers `new_command_queue`'s queue. Never nil-checked; a raise inside it dies at the
-    /// call, as one inside `newCommandQueue` does.
+    /// which shares the GPU queue it submits to with no other command queue for its life, where the
+    /// platform would otherwise share one between command queues, lest another queue's long command
+    /// buffer hold theirs back. Made so: WindowServer's in the graphics lane
+    /// (`RGFX_QUEUE_UNSHARED`), so that no other process's work queues on the GPU ahead of its
+    /// frames; and the host's own: a graphics display's window sink's and its mirror's, whose draws
+    /// and syncs are on a present's path; the IOSurface device caches' transfer queue, whose fills
+    /// a present of a surface and a frame drawn from a cache wait for; and the decoder's release
+    /// queue, which signals a closed context's plain events, so that no command buffer of the
+    /// guest's, nor one waiting on another GPU queue, holds it up. A platform that shares no GPU
+    /// queue between command queues answers `new_command_queue`'s queue. Never nil-checked; a raise
+    /// inside it dies at the call, as one inside `newCommandQueue` does.
     fn new_command_queue_unshared(&self) -> Option<P::CommandQueue>;
     /// No Metal counterpart: how many times the platform recovered the device's GPU so far, its
     /// lost device made again behind the same device object (the Vulkan platform's runtime makes

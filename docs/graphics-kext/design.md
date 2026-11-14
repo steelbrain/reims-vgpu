@@ -2192,8 +2192,8 @@ input never grants the flag. The host makes such a queue with the platform's
 `new_command_queue_unshared` (`GpuDevice`): on the Vulkan platform the
 runtime's queue `unshared_queue` makes, and on Metal the queue any create
 makes. The host logs each unshared queue
-at info level (`reims_vgpu::graphics`). Nothing the guest's processes see
-changes.
+at debug level, on its own target (`reims_vgpu::graphics::queues`). Nothing
+the guest's processes see changes.
 
 **Reset.** A reset leaves the device as one just made, as a device's
 function reset does: `STATUS` 0, which the framebuffer writes at its start,
