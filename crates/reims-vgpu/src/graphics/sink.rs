@@ -3017,7 +3017,6 @@ mod tests {
     /// thread waits for it (MoltenVK). Where the runtime exports one, at least one of the test's
     /// eight syncs goes to the draw as a sync file
     #[test]
-    #[test]
     fn on_vulkan_a_draw_from_the_mirror_draws_what_a_draw_from_the_texture_draws() {
         use reims_vgpu_vulkan::VulkanPlatform;
         let platform = Arc::new(VulkanPlatform::new());
