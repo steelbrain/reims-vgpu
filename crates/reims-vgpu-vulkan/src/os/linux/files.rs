@@ -170,11 +170,6 @@ impl Table {
             .map(|(&first, run)| (first, run))
     }
 
-    /// The first run starting after `at`, before `end`: its first byte.
-    fn next_run(&self, at: u64, end: u64) -> Option<u64> {
-        self.runs.range(at..end).next().map(|(&first, _)| first)
-    }
-
     /// The registration holding byte `at`.
     fn registered_at(&self, at: u64) -> Option<&Registered> {
         self.registered.iter().find(|r| r.first <= at && at < r.end)
@@ -192,19 +187,67 @@ impl Table {
             })
     }
 
-    /// The file behind byte `at`: the run or registration holding it, the file offset of `at`, its
-    /// protection, and the end of the bytes from `at` that show the same file on, with the same
-    /// protection, up to `end` (a registration's stop where a run starts); `None` where neither
-    /// holds it.
-    fn file_at(&self, at: u64, end: u64) -> Option<(&Arc<OwnedFd>, u64, i32, u64)> {
-        if let Some((first, run)) = self.run_at(at) {
-            let offset = run.backing.offset + (at - first);
-            return Some((&run.backing.fd, offset, run.prot, run.end.min(end)));
+    /// Calls `each` with the file behind each stretch of `first..end`, in order: the run or
+    /// registration holding its first byte (its file, the file offset of that byte, its
+    /// protection), and the stretch's first byte and end, where the bytes stop showing that file on
+    /// with that protection (a run's end, a registration's, or where a run starts in a
+    /// registration). False where a byte lies in neither, after the stretches before it, or where
+    /// `each` answers false. A range of no bytes has no stretch, and is known.
+    ///
+    /// One search of the runs finds those in the range, which are then taken in order: a range
+    /// of a view's thousands of runs costs one search, not one a run, and a range no run reaches
+    /// (the guest's RAM, a view's sources) only that search.
+    fn walk(
+        &self,
+        first: u64,
+        end: u64,
+        mut each: impl FnMut(&Arc<OwnedFd>, u64, i32, u64, u64) -> bool,
+    ) -> bool {
+        if first >= end {
+            return true;
         }
-        let registered = self.registered_at(at)?;
-        let to = (registered.end.min(end)).min(self.next_run(at, end).unwrap_or(end));
-        let offset = registered.backing.offset + (at - registered.first);
-        Some((&registered.backing.fd, offset, READ_WRITE, to))
+        let mut at = first;
+        // The last run that starts before `end`: where it ends by `first`, no run lies in the
+        // range.
+        let reaches = (self.runs.range(..end).next_back()).is_some_and(|(_, run)| run.end > first);
+        if !reaches {
+            return self.walk_registered(&mut at, end, &mut each);
+        }
+        let from = self.run_at(first).map_or(first, |(start, _)| start);
+        for (&start, run) in self.runs.range(from..end) {
+            if !self.walk_registered(&mut at, start, &mut each) {
+                return false;
+            }
+            let to = run.end.min(end);
+            let offset = run.backing.offset + (at - start);
+            if !each(&run.backing.fd, offset, run.prot, at, to) {
+                return false;
+            }
+            at = to;
+        }
+        self.walk_registered(&mut at, end, &mut each)
+    }
+
+    /// [`Self::walk`] of the bytes from `at` to `to`, which no run holds, through the
+    /// registrations; `at` moved past the stretches walked.
+    fn walk_registered(
+        &self,
+        at: &mut u64,
+        to: u64,
+        each: &mut impl FnMut(&Arc<OwnedFd>, u64, i32, u64, u64) -> bool,
+    ) -> bool {
+        while *at < to {
+            let Some(r) = self.registered_at(*at) else {
+                return false;
+            };
+            let stop = r.end.min(to);
+            let offset = r.backing.offset + (*at - r.first);
+            if !each(&r.backing.fd, offset, READ_WRITE, *at, stop) {
+                return false;
+            }
+            *at = stop;
+        }
+        true
     }
 
     /// Cuts the run holding `at` in two there, where `at` lies past its first byte: two runs the
@@ -232,16 +275,31 @@ impl Table {
         self.insert(at, tail);
     }
 
-    /// Drops what of the runs lies in `first..end`, keeping the rest of each.
+    /// Drops what of the runs lies in `first..end`, keeping the rest of each. Once cut at both
+    /// ends, the runs in the range go in one pass, with the joins they take part in: those
+    /// between them, and the first's with the run before the range and the last's with the run
+    /// after it, as removing them one at a time ([`Self::remove`]) uncounts them.
     fn forget(&mut self, first: u64, end: u64) {
         if first >= end {
             return;
         }
         self.cut(first);
         self.cut(end);
-        while let Some(at) = self.runs.range(first..end).next().map(|(&at, _)| at) {
-            self.remove(at);
+        let mut gone = 0;
+        let mut prior = self.runs.range(..first).next_back();
+        for (at, run) in self.runs.range(first..) {
+            if let Some((&prior_at, prior)) = prior
+                && joined(prior_at, prior, *at, run)
+            {
+                gone += 1;
+            }
+            if *at >= end {
+                break;
+            }
+            prior = Some((at, run));
         }
+        self.joins -= gone;
+        self.runs.extract_if(first..end, |_, _| true).for_each(drop);
     }
 
     /// `first..end` shows `backing` with protection `prot` from now on, mapped through the
@@ -276,11 +334,7 @@ impl Table {
         let Some(end) = first.checked_add(length) else {
             return false;
         };
-        let mut from = first;
-        while from < end {
-            let Some((fd, offset, prot, to)) = self.file_at(from, end) else {
-                return false;
-            };
+        self.walk(first, end, |fd, offset, prot, from, to| {
             match into.last_mut() {
                 Some(last)
                     if Arc::ptr_eq(&last.backing.fd, fd)
@@ -299,52 +353,49 @@ impl Table {
                     prot,
                 }),
             }
-            from = to;
-        }
-        true
+            true
+        })
     }
 
-    /// Whether no run holds a byte of `first..end`.
+    /// Whether no run holds a byte of `first..end`: the last run that starts before `end` ends
+    /// by `first`, where there is one.
     fn holds_none(&self, first: u64, end: u64) -> bool {
-        self.run_at(first).is_none() && self.next_run(first, end).is_none()
+        (self.runs.range(..end).next_back()).is_none_or(|(_, run)| run.end <= first)
     }
 
     /// [`Self::record`] of each of `pieces` from `target`, `piece.at` bytes in, over bytes no run
     /// holds ([`Self::holds_none`]), in order: nothing of another run to cut or drop, and each
     /// piece joins only the one before it, the first the run before the range and the last the
-    /// run after it, as [`Self::insert`] counts them.
+    /// run after it, as [`Self::insert`] counts them, counted from the pieces themselves before
+    /// they go in.
     fn record_fresh(&mut self, target: u64, pieces: Vec<Piece>) {
-        let mut before: Option<u64> = (self.runs.range(..target).next_back()).map(|(&at, _)| at);
-        let mut last: Option<u64> = None;
-        for piece in pieces {
-            let first = target.saturating_add(piece.at);
-            let end = first.saturating_add(piece.length);
-            if first >= end {
-                continue;
-            }
-            let run = Run {
-                end,
-                backing: piece.backing,
-                prot: piece.prot,
-                through: None,
-            };
-            if let Some(at) = before.take()
-                && let Some(prior) = self.runs.get(&at)
-                && joined(at, prior, first, &run)
-            {
-                self.joins += 1;
-            }
-            self.runs.insert(first, run);
-            before = Some(first);
-            last = Some(first);
-        }
-        if let Some(at) = last
-            && let Some(run) = self.runs.get(&at)
-            && let Some((&next, after)) = self.runs.range(run.end..).next()
-            && joined(at, run, next, after)
-        {
-            self.joins += 1;
-        }
+        let runs: Vec<(u64, Run)> = (pieces.into_iter())
+            .filter_map(|piece| {
+                let first = target.saturating_add(piece.at);
+                let end = first.saturating_add(piece.length);
+                (first < end).then_some((
+                    first,
+                    Run {
+                        end,
+                        backing: piece.backing,
+                        prot: piece.prot,
+                        through: None,
+                    },
+                ))
+            })
+            .collect();
+        let (Some((head_at, head)), Some((tail_at, tail))) = (runs.first(), runs.last()) else {
+            return;
+        };
+        let before = (self.runs.range(..*head_at).next_back())
+            .is_some_and(|(&at, prior)| joined(at, prior, *head_at, head));
+        let after = (self.runs.range(tail.end..).next())
+            .is_some_and(|(&at, next)| joined(*tail_at, tail, at, next));
+        let between = (runs.windows(2))
+            .filter(|w| joined(w[0].0, &w[0].1, w[1].0, &w[1].1))
+            .count();
+        self.joins += usize::from(before) + usize::from(after) + between;
+        self.runs.extend(runs);
     }
 
     /// Sets the protection of what of the runs lies in `first..end` (`protect`), cutting a run it
@@ -377,13 +428,11 @@ impl Table {
     /// a byte lies in neither a run nor a registration.
     fn all_have(&self, first: u64, end: u64, bit: i32) -> Option<bool> {
         let mut all = true;
-        let mut at = first;
-        while at < end {
-            let (_, _, prot, to) = self.file_at(at, end)?;
+        let known = self.walk(first, end, |_, _, prot, _, _| {
             all &= prot & bit != 0;
-            at = to;
-        }
-        Some(all)
+            true
+        });
+        known.then_some(all)
     }
 }
 
@@ -565,15 +614,22 @@ pub(crate) fn protected(first: u64, length: u64, prot: i32) -> bool {
     let Some(end) = first.checked_add(length) else {
         return false;
     };
-    let table = TABLE.lock();
-    let mut at = first;
-    while at < end {
-        match table.run_at(at) {
-            Some((_, run)) if run.prot == prot => at = run.end,
-            _ => return false,
-        }
+    if length == 0 {
+        return true;
     }
-    true
+    let table = TABLE.lock();
+    let Some((from, _)) = table.run_at(first) else {
+        return false;
+    };
+    // The runs from the one holding `first`, in order, each starting where the one before ends.
+    let mut at = first;
+    for (&start, run) in table.runs.range(from..end) {
+        if start > at || run.prot != prot {
+            return false;
+        }
+        at = run.end;
+    }
+    at >= end
 }
 
 /// Whether the table knows every byte of `length` bytes from `first`: `Some(readable)` where
@@ -662,21 +718,27 @@ pub(crate) fn guest_ram_runs(first: u64, length: u64) -> Option<Vec<(u64, u64)>>
     let end = first.checked_add(length)?;
     let table = TABLE.lock();
     let mut runs: Vec<(u64, u64)> = Vec::new();
-    let mut at = first;
-    while at < end {
-        let (fd, offset, prot, to) = table.file_at(at, end)?;
+    let all = table.walk(first, end, |fd, mut offset, prot, mut at, to| {
         if prot & libc::PROT_WRITE == 0 {
-            return None;
+            return false;
         }
-        let (host, room) = table.ram_at(fd, offset)?;
-        let take = (to - at).min(room);
-        match runs.last_mut() {
-            Some(last) if last.0 + last.1 == host => last.1 += take,
-            _ => runs.push((host, take)),
+        // A stretch may run past the end of the range of the RAM its offset starts in, into
+        // another's, or none.
+        while at < to {
+            let Some((host, room)) = table.ram_at(fd, offset) else {
+                return false;
+            };
+            let take = (to - at).min(room);
+            match runs.last_mut() {
+                Some(last) if last.0 + last.1 == host => last.1 += take,
+                _ => runs.push((host, take)),
+            }
+            at += take;
+            offset += take;
         }
-        at += take;
-    }
-    Some(runs)
+        true
+    });
+    all.then_some(runs)
 }
 
 /// The guest's RAM registered while a device made over it lives: the `guest_memory` lease its
@@ -1138,6 +1200,106 @@ mod tests {
         assert!(pieces(base, 0x1000).is_some());
         drop(second);
         assert!(pieces(base, 0x1000).is_none());
+    }
+
+    /// Through random records, forgets and protects of runs over and beside a registration, the
+    /// table's walk of a range answers, page by page, what a lookup of each page alone through
+    /// every run and then every registration answers, and fails where a page has neither; no run
+    /// is held where none overlaps; and the joins the table counts are those its neighbouring
+    /// runs make, counted again from scratch
+    #[test]
+    fn walks_and_joins_match_a_page_by_page_table() {
+        let (f, g) = (file(), file());
+        let page = 0x1000;
+        let at = |i: u64| 0x6000_0000 + i * page;
+        let mut t = Table::default();
+        t.registered.push(Registered {
+            first: at(8),
+            end: at(64),
+            backing: Backing {
+                fd: Arc::clone(&f),
+                offset: 0x1000 * page,
+            },
+            count: 1,
+            ram: 1,
+        });
+        let alone = |t: &Table, a: u64| {
+            let run = (t.runs.iter()).find(|&(&s, r)| s <= a && a < r.end);
+            match run {
+                Some((&s, r)) => {
+                    Some((Arc::as_ptr(&r.backing.fd), r.backing.offset + a - s, r.prot))
+                }
+                None => (t.registered.iter())
+                    .find(|r| r.first <= a && a < r.end)
+                    .map(|r| {
+                        (
+                            Arc::as_ptr(&r.backing.fd),
+                            r.backing.offset + a - r.first,
+                            READ_WRITE,
+                        )
+                    }),
+            }
+        };
+        let recount = |t: &Table| {
+            let runs: Vec<(&u64, &Run)> = t.runs.iter().collect();
+            (runs.windows(2))
+                .filter(|w| joined(*w[0].0, w[0].1, *w[1].0, w[1].1))
+                .count()
+        };
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        for _ in 0..4000 {
+            let first = next(72);
+            let (first, end) = (at(first), at(first + 1 + next(6)));
+            let prot = if next(4) == 0 { libc::PROT_READ } else { rw };
+            match next(5) {
+                0..=2 => {
+                    let fd = if next(4) == 0 { &g } else { &f };
+                    let backing = Backing {
+                        fd: Arc::clone(fd),
+                        offset: (0x1000 + next(80)) * page,
+                    };
+                    let through = (next(3) == 0).then(|| Through {
+                        buf: next(2),
+                        offset: next(8) * page,
+                    });
+                    t.record(first, end, backing, prot, through);
+                }
+                3 => t.forget(first, end),
+                _ => t.protect(first, end, prot),
+            }
+            assert_eq!(t.joins, recount(&t), "the joins counted");
+            let first = next(80);
+            let (first, end) = (at(first), at(first + 1 + next(24)));
+            let mut walked = Vec::new();
+            let known = t.walk(first, end, |fd, offset, prot, from, to| {
+                assert!(first <= from && from < to && to <= end);
+                for a in (from..to).step_by(page as usize) {
+                    walked.push((Arc::as_ptr(fd), offset + (a - from), prot));
+                }
+                true
+            });
+            let each: Option<Vec<_>> = (first..end)
+                .step_by(page as usize)
+                .map(|a| alone(&t, a))
+                .collect();
+            match each {
+                Some(each) => assert!(known && walked == each, "{first:#x}..{end:#x}"),
+                None => assert!(!known, "{first:#x}..{end:#x} has a page of no file"),
+            }
+            let overlaps = (t.runs.iter()).any(|(&s, r)| s < end && first < r.end);
+            assert_eq!(t.holds_none(first, end), !overlaps);
+            assert!(
+                t.walk(first, first, |_, _, _, _, _| false),
+                "a range of no bytes: no stretch"
+            );
+        }
     }
 
     /// A view's pieces recorded over bytes no run holds leave the table as recording them one at
