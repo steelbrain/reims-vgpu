@@ -8813,10 +8813,10 @@ fn a_release_the_platform_dies_at_is_refused() {
 /// unshared queue (`UNSHARED_QUEUES`), tells a producer waiting for room on a full submission
 /// ring of the device's takes (`SUBMIT_ROOM`), reads indirect command buffers' CPU encodes from
 /// slots in the region (`ICB_SLOTS`), lets the guest read the clock its VBLANKs are stamped on
-/// (`HOST_TIME`), shows the display pipe's colour (`DISPLAY_COLOR`), and posts a waited-for
-/// buffer's `CB_SCHEDULED` at a thread's ask (`SCHEDULED_ASK`, `FEATURES_HI` bit 1). The fake's
-/// GPU shares the CPU's memory, so a device with `SURFACE_PAGES` answers which surfaces need a
-/// device cache
+/// (`HOST_TIME`), shows the display pipe's colour (`DISPLAY_COLOR`), posts a waited-for buffer's
+/// `CB_SCHEDULED` at a thread's ask (`SCHEDULED_ASK`, `FEATURES_HI` bit 1), and takes the guest's
+/// stamps of its command buffers (`GUEST_TIMES`, `FEATURES_HI` bit 12). The fake's GPU shares the
+/// CPU's memory, so a device with `SURFACE_PAGES` answers which surfaces need a device cache
 /// (`SURFACE_CACHE_REFUSED`), keeps none of the rest, defers a fresh one of those that would need
 /// one whatever its pages (`SURFACE_DEFERRED_ASK`), within a quarter of its GPU's own memory's
 /// budget, the few pages a process wrote of it without a lock carried in
@@ -8908,6 +8908,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_FUNCTION_POINTERS
             | RGFX_FEATURE_DYNAMIC_LIBRARIES
             | RGFX_FEATURE_PIPELINE_KEYS
+            | RGFX_FEATURE_GUEST_TIMES
             | slots_in_pages
             | sixteen_bit
             | if carries {
@@ -8962,6 +8963,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
                 | RGFX_FEATURE_FUNCTION_POINTERS
                 | RGFX_FEATURE_DYNAMIC_LIBRARIES
                 | RGFX_FEATURE_PIPELINE_KEYS
+                | RGFX_FEATURE_GUEST_TIMES
                 | RGFX_FEATURE_ICB_SLOTS_IN_PAGES
                 | RGFX_FEATURE_PAGES_16K
                 | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
@@ -9003,6 +9005,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_FUNCTION_POINTERS
             | RGFX_FEATURE_DYNAMIC_LIBRARIES
             | RGFX_FEATURE_PIPELINE_KEYS
+            | RGFX_FEATURE_GUEST_TIMES
     );
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);

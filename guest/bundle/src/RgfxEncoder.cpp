@@ -151,6 +151,19 @@ void RgfxEncoder::prependCommitOrder(const RgfxSurfaceOrderWait *waits, size_t c
 	std::memcpy(at + RGFX_OP_BODY_OFFSET, waits, count * sizeof(RgfxSurfaceOrderWait));
 }
 
+bool RgfxEncoder::prependGuestTimes()
+{
+	if (!m_timesPending)
+		return false;
+	m_timesPending = false;
+	uint8_t *at = prependRoom(kGuestTimesBytes);
+	putHeader(at, RGFX_OP_GUEST_TIMES, kGuestTimesBytes);
+	RgfxOpGuestTimes times = m_times;
+	times.posted_ns = 0; // stamped as it goes on the ring
+	std::memcpy(at + RGFX_OP_BODY_OFFSET, &times, sizeof(times));
+	return true;
+}
+
 uint8_t *RgfxEncoder::prependRoom(size_t bytes)
 {
 	// Before the header's room: the ops move up where the room before them is short.
@@ -178,9 +191,12 @@ bool RgfxEncoder::finish(uint64_t *out_seqno, const std::function<void()> &while
                          const std::function<void(uint64_t)> &beforePublish,
                          RgfxMessageBlock *held)
 {
-	const uint64_t size = messageSize();
-	if (m_ring == nullptr || size > UINT32_MAX)
+	if (m_ring == nullptr || messageSize() > UINT32_MAX)
 		return false;
+	// The guest's times go first, the last op put there: the posted time is stamped as the
+	// message goes on the ring, the last write before its publish.
+	const bool timed = prependGuestTimes();
+	const uint64_t size = messageSize();
 	uint8_t *message = m_ops - m_prefix - RGFX_COMMAND_BUFFER_OPS_OFFSET;
 	m_head.op_bytes = opBytes();
 	if (m_ring->fits(static_cast<uint32_t>(size))) {
@@ -188,7 +204,8 @@ bool RgfxEncoder::finish(uint64_t *out_seqno, const std::function<void()> &while
 		// A buffer whose stream ends in its ask is one the host answers at the doorbell, behind
 		// a walk too (RgfxRingWriter::tryPost).
 		return m_ring->post(RGFX_CMD_COMMAND_BUFFER, message, static_cast<uint32_t>(size),
-		                    out_seqno, whileWaiting, beforePublish, endsInAsk());
+		                    out_seqno, whileWaiting, beforePublish, endsInAsk(),
+		                    timed ? RGFX_GUEST_TIMES_POSTED_OFFSET : 0);
 	}
 	// Out of line: the whole message copied once into a block of the pool, from its start. The
 	// host reads the block once the reference's `producer` is published, which the ring writer
@@ -215,15 +232,29 @@ bool RgfxEncoder::finish(uint64_t *out_seqno, const std::function<void()> &while
 	if (held != nullptr) {
 		// The holder has it before the host can see the message, as the completion may come
 		// before the post returns; it gives it back once the buffer is done, or goes. The
-		// builder writes it no more.
+		// builder writes it no more, but for its posted time below.
 		*held = m_block;
 		m_block = {};
 		m_inBlock = false;
 		m_store = m_ops = m_cur = m_end = nullptr;
 		m_prefix = 0;
 	}
+	if (!timed)
+		return m_ring->post(RGFX_CMD_COMMAND_BUFFER_IN_REGION, &ref, sizeof(ref), out_seqno,
+		                    whileWaiting, beforePublish);
+	// Its posted time goes into the block as its reference goes on the ring, under the ring's
+	// lock, after the caller's beforePublish and before the publish, which the ring writer's
+	// storeFence orders it before: the wait for the ring is the post's, as a message on the ring
+	// is stamped.
+	uint8_t *posted = to + RGFX_GUEST_TIMES_POSTED_OFFSET;
+	const std::function<void(uint64_t)> stamped = [&beforePublish, posted](uint64_t seqno) {
+		if (beforePublish)
+			beforePublish(seqno);
+		const uint64_t now = rgfxGuestClockNs();
+		std::memcpy(posted, &now, sizeof(now));
+	};
 	return m_ring->post(RGFX_CMD_COMMAND_BUFFER_IN_REGION, &ref, sizeof(ref), out_seqno,
-	                    whileWaiting, beforePublish);
+	                    whileWaiting, stamped);
 }
 
 // --- framing ----------------------------------------------------------------

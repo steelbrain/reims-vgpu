@@ -1841,6 +1841,9 @@ enum RgfxStage : unsigned {
 		cb->_profilingEnabled.store([queue isProfilingEnabled]);
 		const uint32_t reserve = queue.rgfxMessageReserve;
 		cb->_encoder = new RgfxEncoder(*ring, queue.rgfxObjId, cbObjId, reserve);
+		// Its stream starts with the guest's times where the device takes them: made now.
+		if (queue.stampsGuestTimes)
+			cb->_encoder->stampGuestTimes(rgfxGuestClockNs());
 		// Past its ring, the message grows to the size of the queue's recent largest at once, and
 		// goes into a block of the queue's pool at the commit.
 		cb->_encoder->setMessageBlocks([queue rgfxBodyPool], reserve);
@@ -2068,6 +2071,9 @@ enum RgfxStage : unsigned {
 
 - (void)commit
 {
+	// Its commit's time, where its stream carries the guest's times: on entry.
+	if (_encoder->stampsGuestTimes())
+		_encoder->noteCommitted(rgfxGuestClockNs());
 	// Commit is once: a second, or a commitAndWaitUntilSubmitted after it, ends the process with
 	// Metal's words, as Metal does on the M3 Max, an AMD 5300M and an Intel 630 (measured; the
 	// Intel's assertion is its completed handler's).

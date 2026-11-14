@@ -197,6 +197,7 @@ include = [
     "RgfxOpEvent",
     "RgfxOpExecuteCommandsInBuffer",
     "RgfxOpExecuteCommandsIndirect",
+    "RgfxOpGuestTimes",
     "RgfxOpHeader",
     "RgfxOpMemoryBarrierWithScope",
     "RgfxOpQueueBarrier",

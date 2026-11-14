@@ -142,6 +142,13 @@ pub const RGFX_OP_SURFACE_ORDER: u16 = 0x000c;
 /// committed through the seqno named. It changes no GPU wait: the platform orders what the buffers
 /// share by the order they are committed in.
 pub const RGFX_OP_COMMIT_ORDER: u16 = 0x000d;
+/// Op `GUEST_TIMES` ([`RgfxOpGuestTimes`]), where the guest took
+/// [`RGFX_FEATURE_GUEST_TIMES`](crate::wire::RGFX_FEATURE_GUEST_TIMES): the guest's clock at three
+/// points of the command buffer's life, a diagnostic. First in the stream, once: the bundle puts it
+/// before every other op as it posts the buffer, so its `posted_ns` lies at
+/// [`RGFX_GUEST_TIMES_POSTED_OFFSET`] in the message. The host reads it as it takes the buffer, and
+/// the walk steps past it: it changes nothing the buffer does.
+pub const RGFX_OP_GUEST_TIMES: u16 = 0x000e;
 
 /// [`RgfxOpSurfaceUse::flags`]: the command buffer may write the surface.
 pub const RGFX_SURFACE_USE_WRITES: u32 = 1 << 0;
@@ -161,6 +168,28 @@ pub struct RgfxOpSurfaceUse {
     /// Zero.
     pub reserved_14: u32,
 }
+
+/// The body of [`RGFX_OP_GUEST_TIMES`]: each the guest's clock (`mach_absolute_time`, in
+/// nanoseconds), the clock of ring 0's
+/// [`guest_clock_offset_ns`](crate::wire::RgfxRingHeader::guest_clock_offset_ns).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxOpGuestTimes {
+    /// When the command buffer was made (`commandBuffer`).
+    pub began_ns: u64,
+    /// When its `commit` was entered.
+    pub committed_ns: u64,
+    /// When its message was written on its queue's ring, under the ring's lock, before the
+    /// `producer` that publishes it; for a buffer that lies in a block of the region
+    /// (`COMMAND_BUFFER_IN_REGION`), as its reference was.
+    pub posted_ns: u64,
+}
+
+/// Where a `COMMAND_BUFFER` message whose op stream starts with an [`RGFX_OP_GUEST_TIMES`] holds
+/// its [`RgfxOpGuestTimes::posted_ns`]: the op's body's third field.
+pub const RGFX_GUEST_TIMES_POSTED_OFFSET: u32 = 64;
 
 /// The body of [`RGFX_OP_ENCODER_BEGIN_VIDEO`].
 #[repr(C)]
@@ -521,6 +550,14 @@ const _: () = {
     assert!(op_group(RGFX_OP_SCHEDULED_WANTED) == RGFX_OP_GROUP_FRAMING);
     assert!(op_group(RGFX_OP_SURFACE_ORDER) == RGFX_OP_GROUP_FRAMING);
     assert!(op_group(RGFX_OP_COMMIT_ORDER) == RGFX_OP_GROUP_FRAMING);
+    assert!(op_group(RGFX_OP_GUEST_TIMES) == RGFX_OP_GROUP_FRAMING);
+    assert!(size_of::<RgfxOpGuestTimes>() == 24);
+    assert!(
+        RGFX_GUEST_TIMES_POSTED_OFFSET as usize
+            == RGFX_COMMAND_BUFFER_OPS_OFFSET as usize
+                + size_of::<RgfxOpHeader>()
+                + core::mem::offset_of!(RgfxOpGuestTimes, posted_ns)
+    );
     assert!(size_of::<RgfxSurfaceOrderWait>() == 16);
     assert!(op_group(RGFX_OP_ENCODER_BEGIN_VIDEO) == RGFX_OP_GROUP_FRAMING);
     assert!(op_group(RGFX_OP_SURFACE_USE) == RGFX_OP_GROUP_FRAMING);

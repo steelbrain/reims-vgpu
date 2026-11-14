@@ -33,6 +33,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <time.h>
 
 #include "RgfxRingRoomEvents.hpp"
 #include "reims_graphics_wire.h"
@@ -40,6 +41,14 @@
 /// Rings the doorbell for ring `ring_id`: in the bundle, writes `ring_id` to the
 /// device's `DOORBELL` register; in a test, records the wake.
 typedef void (*RgfxDoorbell)(void *context, uint32_t ring_id);
+
+/// The guest's clock in nanoseconds, the kext's: mach_absolute_time in nanoseconds, which the
+/// command buffers' times are stamped with where the device's word holds RGFX_FEATURE_GUEST_TIMES
+/// (RgfxEncoder::stampGuestTimes, RgfxRingWriter::tryPost's `stampAt`).
+inline uint64_t rgfxGuestClockNs()
+{
+	return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
 
 /// What tryPost() gives as a message's answer where none came back: the message is not one the
 /// device answers, or the ring is one the process writes itself, whose answers come later.
@@ -120,9 +129,14 @@ public:
 	/// `answered` (a command buffer that asks for its CB_SUBMITTED, which the host may answer
 	/// inside the doorbell's write), where it marked it walking (RGFX_CONSUMER_WALKING): a
 	/// walking host takes the ring again once its walk is done, with no doorbell.
+	/// A `stampAt` other than 0 is where in the message its posted time lies (a command buffer's
+	/// RGFX_OP_GUEST_TIMES, RGFX_GUEST_TIMES_POSTED_OFFSET): the guest's clock is written there in
+	/// the ring's copy, under the lock, after the copy and `beforePublish` and before `producer`
+	/// moves, as the seqno is stamped. A forwarding writer writes no stamp.
 	bool tryPost(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,
 	             uint32_t *out_status = nullptr,
-	             const std::function<void(uint64_t)> &beforePublish = {}, bool answered = false);
+	             const std::function<void(uint64_t)> &beforePublish = {}, bool answered = false,
+	             uint32_t stampAt = 0);
 
 	/// Where a forwarding writer posts a known pipeline create (RgfxForwardDeferred) and takes
 	/// its answer (RgfxAwaitAnswer), both called with `context`: the kext's deferred submit,
@@ -198,10 +212,12 @@ public:
 	/// producer_waiting, fences and looks once more, then waits for the host's room record
 	/// instead of the sleep: up to 20 ms where no `whileWaiting` is given (a completion thread
 	/// takes the record), else up to the sleep's step, as `whileWaiting` may be what takes it.
-	/// False, writing nothing, only for a message that does not fit().
+	/// False, writing nothing, only for a message that does not fit(). `stampAt` as tryPost's: the
+	/// stamp is the post's that finds room.
 	bool post(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,
 	          const std::function<void()> &whileWaiting = {},
-	          const std::function<void(uint64_t)> &beforePublish = {}, bool answered = false);
+	          const std::function<void(uint64_t)> &beforePublish = {}, bool answered = false,
+	          uint32_t stampAt = 0);
 
 	/// The byte ring's size.
 	uint32_t dataSize() const { return m_dataSize; }

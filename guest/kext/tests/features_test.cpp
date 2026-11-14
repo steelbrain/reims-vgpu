@@ -32,6 +32,7 @@ static_assert(RGFX_FEATURE_DYNAMIC_LIBRARIES == (1ull << 40), "DYNAMIC_LIBRARIES
 static_assert(RGFX_FEATURE_PIPELINE_KEYS == (1ull << 41), "PIPELINE_KEYS is bit 41");
 static_assert(RGFX_FEATURE_ICB_SLOTS_IN_PAGES == (1ull << 42), "ICB_SLOTS_IN_PAGES is bit 42");
 static_assert(RGFX_FEATURE_DOORBELL_ASKS == (1ull << 43), "DOORBELL_ASKS is bit 43");
+static_assert(RGFX_FEATURE_GUEST_TIMES == (1ull << 44), "GUEST_TIMES is bit 44");
 static_assert(RGFX_DOORBELL_ASKS == 1, "an asking doorbell sets bit 0 of the ring's id");
 static_assert(sizeof(RgfxDisplayScale) == 8, "the display's scale record");
 static_assert(RGFX_STATUS_CACHE == 7, "STATUS_CACHE");
@@ -129,13 +130,16 @@ constexpr uint64_t kPipelineKeys = RGFX_FEATURE_PIPELINE_KEYS;
 constexpr uint64_t kSlotsInPages = RGFX_FEATURE_ICB_SLOTS_IN_PAGES;
 // Its bundle sets bit 0 of a doorbell's value where the buffer asks for its scheduling.
 constexpr uint64_t kDoorbellAsks = RGFX_FEATURE_DOORBELL_ASKS;
+// Its bundle stamps each command buffer with the guest's clock, and its framebuffer gives the host
+// the clocks' offset.
+constexpr uint64_t kGuestTimes = RGFX_FEATURE_GUEST_TIMES;
 constexpr uint64_t kCarried = kPages | kOrder | kIcb | kUnshared | kManaged | kHeaps | kRoom |
                               kSlots | kCommits | kDeferred | kTime | kTextureSlabs |
                               kBufferSlabs | kSmallIds | kColor | kMesh | kShares | kOpenCL |
                               kPrivate | kCacheRefused | kDeferredAsk | kDeferredCarry |
                               kScheduledAsk | kDisplayScale | kDidModify | kRateMaps |
                               kFunctionPointers | kDynamicLibraries | kPipelineKeys |
-                              kSlotsInPages | kDoorbellAsks |
+                              kSlotsInPages | kDoorbellAsks | kGuestTimes |
                               kDisplayPowerCarried |
                               k16KCarried;
 // Every bit the wire names from bit 3.
@@ -318,6 +322,13 @@ int main()
 	check(rgfxFeatureWord(kRgfxOfferedFeatures | kDoorbellAsks, kDoorbellAsks) ==
 	          (kRgfxOfferedFeatures | kDoorbellAsks),
 	      "DOORBELL_ASKS taken is in the word");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kGuestTimes) == kGuestTimes,
+	      "GUEST_TIMES offered, written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kGuestTimes, 0) == kRgfxOfferedFeatures,
+	      "GUEST_TIMES offered but not taken is not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kGuestTimes, kGuestTimes) ==
+	          (kRgfxOfferedFeatures | kGuestTimes),
+	      "GUEST_TIMES taken is in the word");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kDisplayPower) ==
 	          kDisplayPowerCarried,
 	      "DISPLAY_POWER offered, written by the x86-64 kext alone");
@@ -333,9 +344,9 @@ int main()
 	check(rgfxFeatureWord(kRgfxOfferedFeatures | k16K, k16K) == (kRgfxOfferedFeatures | k16KCarried),
 	      "PAGES_16K taken is in the word where carried");
 	check(rgfxDriverFeatures(0) == 0, "nothing offered, nothing written");
-	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | (1ull << 44)) == 0,
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | (1ull << 45)) == 0,
 	      "every other bit offered, none written");
-	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNew | (1ull << 44)) == kCarried,
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNew | (1ull << 45)) == kCarried,
 	      "every bit offered, the carried bits written");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kPages) == kPages,
 	      "PAGES_BUFFERS offered, written");
@@ -376,7 +387,7 @@ int main()
 	      "SUBMIT_ROOM offered but not taken is not");
 	// A read-back of bits the kext never wrote, or of bits 0 to 2 the host does not offer, adds
 	// nothing.
-	check(rgfxFeatureWord(kRgfxOfferedFeatures, kNotCarried | (1ull << 44)) ==
+	check(rgfxFeatureWord(kRgfxOfferedFeatures, kNotCarried | (1ull << 45)) ==
 	          kRgfxOfferedFeatures,
 	      "taken bits the kext does not carry out are dropped");
 	check(rgfxFeatureWord(kRgfxOfferedFeatures | kNew, kNew) == (kRgfxOfferedFeatures | kCarried),

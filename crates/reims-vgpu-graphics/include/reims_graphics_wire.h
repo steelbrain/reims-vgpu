@@ -225,8 +225,20 @@
 // share by the order they are committed in.
 #define RGFX_OP_COMMIT_ORDER 13
 
+// Op `GUEST_TIMES` ([`RgfxOpGuestTimes`]), where the guest took
+// [`RGFX_FEATURE_GUEST_TIMES`](crate::wire::RGFX_FEATURE_GUEST_TIMES): the guest's clock at three
+// points of the command buffer's life, a diagnostic. First in the stream, once: the bundle puts it
+// before every other op as it posts the buffer, so its `posted_ns` lies at
+// [`RGFX_GUEST_TIMES_POSTED_OFFSET`] in the message. The host reads it as it takes the buffer, and
+// the walk steps past it: it changes nothing the buffer does.
+#define RGFX_OP_GUEST_TIMES 14
+
 // [`RgfxOpSurfaceUse::flags`]: the command buffer may write the surface.
 #define RGFX_SURFACE_USE_WRITES (1 << 0)
+
+// Where a `COMMAND_BUFFER` message whose op stream starts with an [`RGFX_OP_GUEST_TIMES`] holds
+// its [`RgfxOpGuestTimes::posted_ns`]: the op's body's third field.
+#define RGFX_GUEST_TIMES_POSTED_OFFSET 64
 
 // Where an op's body starts in the op: right after its header.
 #define RGFX_OP_BODY_OFFSET 8
@@ -1064,8 +1076,9 @@
 // [`RGFX_FEATURE_SCHEDULED_ASK`], [`RGFX_FEATURE_PAGES_16K`], [`RGFX_FEATURE_DISPLAY_SCALE`],
 // [`RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA`], [`RGFX_FEATURE_DISPLAY_POWER`],
 // [`RGFX_FEATURE_RATE_MAPS`], [`RGFX_FEATURE_FUNCTION_POINTERS`],
-// [`RGFX_FEATURE_DYNAMIC_LIBRARIES`], [`RGFX_FEATURE_PIPELINE_KEYS`] and
-// [`RGFX_FEATURE_ICB_SLOTS_IN_PAGES`].
+// [`RGFX_FEATURE_DYNAMIC_LIBRARIES`], [`RGFX_FEATURE_PIPELINE_KEYS`],
+// [`RGFX_FEATURE_ICB_SLOTS_IN_PAGES`], [`RGFX_FEATURE_DOORBELL_ASKS`] and
+// [`RGFX_FEATURE_GUEST_TIMES`].
 // On a host that offers `PAGES_16K`, `FEATURES_LO` and `_HI` read the guest RAM features only
 // once the guest took it.
 #define RGFX_REG_FEATURES_HI 12
@@ -1407,6 +1420,18 @@
 // that wakes the queue's thread), and answers a buffer at its doorbell only for the write that
 // holds [`RGFX_DOORBELL_ASKS`], as it did for any write before. Every host offers it.
 #define RGFX_FEATURE_DOORBELL_ASKS 8796093022208
+
+// `FEATURES_HI` bit 12, feature bit 44, `GUEST_TIMES`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_HI`]: a diagnostic of the time before the host takes a command
+// buffer. Each [`RGFX_CMD_COMMAND_BUFFER`]'s op stream starts with one
+// [`RGFX_OP_GUEST_TIMES`](crate::ops::RGFX_OP_GUEST_TIMES), the guest's clock as the buffer was
+// made, committed and published on its ring, and the kext keeps ring 0's
+// [`RgfxRingHeader::guest_clock_offset_ns`] and [`RgfxRingHeader::guest_clock_bound_ns`], the
+// guest's clock less the host's, from its reading of [`RGFX_REG_HOST_TIME_LO`] at each `VBLANK`.
+// The host splits the time from a buffer's making to its take into the guest's encode, the
+// guest's wait to post it, the wait behind the queue's buffer before it and the transport, for
+// its trace and its log; it changes nothing else the device does. Every host offers it.
+#define RGFX_FEATURE_GUEST_TIMES 17592186044416
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -5582,6 +5607,20 @@ typedef struct {
   uint64_t indirect_buffer_offset;
 } RgfxOpExecuteCommandsIndirect;
 
+// The body of [`RGFX_OP_GUEST_TIMES`]: each the guest's clock (`mach_absolute_time`, in
+// nanoseconds), the clock of ring 0's
+// [`guest_clock_offset_ns`](crate::wire::RgfxRingHeader::guest_clock_offset_ns).
+typedef struct {
+  // When the command buffer was made (`commandBuffer`).
+  uint64_t began_ns;
+  // When its `commit` was entered.
+  uint64_t committed_ns;
+  // When its message was written on its queue's ring, under the ring's lock, before the
+  // `producer` that publishes it; for a buffer that lies in a block of the region
+  // (`COMMAND_BUFFER_IN_REGION`), as its reference was.
+  uint64_t posted_ns;
+} RgfxOpGuestTimes;
+
 // Every op's header: its tag, its flags and its total byte count.
 typedef struct {
   // The op's tag: its group ([`op_group`]) and its op within the group.
@@ -6795,8 +6834,21 @@ typedef struct {
   // guest producer waits for room ([`RGFX_FEATURE_SUBMIT_ROOM`]), written 1 by the guest and 0
   // by the host as it posts the ring's [`RGFX_EVT_SUBMIT_ROOM`]; 0 on every other ring.
   uint32_t producer_waiting;
+  // Zero.
+  uint32_t reserved_14;
+  // On the control submission ring (ring 0), where the guest took
+  // [`RGFX_FEATURE_GUEST_TIMES`]: the guest's clock (`mach_absolute_time`, in nanoseconds)
+  // less the host's (the clock [`RGFX_REG_HOST_TIME_LO`] reads), as the kext's reading of
+  // `HOST_TIME` between two reads of its own clock found it, written by the guest before
+  // [`Self::guest_clock_bound_ns`]. 0 on every other ring.
+  int64_t guest_clock_offset_ns;
+  // On ring 0, where the guest took [`RGFX_FEATURE_GUEST_TIMES`]: how far
+  // [`Self::guest_clock_offset_ns`] may be off, in nanoseconds (half its reading's round trip,
+  // widened by the reading's age), stored by the guest with release after the offset; 0 while
+  // the guest holds no reading, and on every other ring.
+  uint32_t guest_clock_bound_ns;
   // The rest of `producer`'s line.
-  uint8_t reserved_14[44];
+  uint8_t reserved_24[28];
   // The consumer's free-running byte count, written by the consumer.
   uint64_t consumer;
   // The rest of `consumer`'s line.

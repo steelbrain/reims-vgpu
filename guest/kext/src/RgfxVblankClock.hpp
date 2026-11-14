@@ -25,6 +25,11 @@
 //
 // Either way no mapped time lies after its receipt, and a mapped time never goes back.
 //
+// Where the bundle stamps its command buffers with the guest's clock (GUEST_TIMES), the kext
+// hands the host the held reading's offset (offsetAt) in ring 0's header after each reading, its
+// bound widened by its age then, so the host maps those stamps to its own clock (design.md,
+// "Guest times").
+//
 // A display pipe transaction completes at the host's answer, which the host gives in the refresh
 // that showed its surface, right after that refresh's VBLANK, or, a host with no window, as it
 // shows the surface: its time is the last refresh's at the answer's receipt (shownAt), the last
@@ -114,6 +119,27 @@ public:
 		time_ = time;
 		receipt_ = receipt;
 		return time;
+	}
+
+	// The held reading's offset (the guest's clock less the host's) and its bound at the guest's
+	// `now`, widened by kAgePpm of the reading's age: false, writing neither, before a reading
+	// was held.
+	bool offsetAt(uint64_t now, int64_t *offset, uint64_t *bound) const
+	{
+		if (!haveReading_)
+			return false;
+		*offset = readingOffset_;
+		*bound = readingBound_ + (now > readingAt_ ? (now - readingAt_) * kAgePpm / 1000000 : 0);
+		return true;
+	}
+
+	// A bound as ring 0's header holds it (RgfxRingHeader's guest_clock_bound_ns): at least 1 ns,
+	// as 0 there says no reading is held, and at most what 32 bits hold.
+	static uint32_t headerBound(uint64_t bound)
+	{
+		if (bound == 0)
+			return 1;
+		return bound > 0xffffffffull ? 0xffffffffu : static_cast<uint32_t>(bound);
 	}
 
 	// The last refresh's time (0 before any), and the next one's, a period after it.

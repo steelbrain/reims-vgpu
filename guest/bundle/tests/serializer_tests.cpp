@@ -1911,6 +1911,159 @@ void test_command_buffer_storage()
 	}
 }
 
+// A message's posted time (tryPost's stampAt) is written in the ring's copy, not the caller's
+// bytes, after the copy and beforePublish and before the publish: no earlier than the clock read
+// in beforePublish, no later than the doorbell the publish rings. A post with no stamp writes
+// nothing there, and a forwarding writer none.
+void test_ring_stamps_the_posted_time_before_the_publish()
+{
+	static uint64_t rang = 0;
+	const auto doorbell = [](void *, uint32_t) { rang = rgfxGuestClockNs(); };
+	TestRing ring(0x8000);
+	ring.setConsumerIdle(RGFX_CONSUMER_ASLEEP);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, 1, doorbell, nullptr);
+	uint8_t msg[96] = {};
+	const uint64_t marker = 0x0123456789abcdefull;
+	std::memcpy(msg + 64, &marker, sizeof(marker));
+	uint64_t before = 0;
+	const auto seen = [&](uint64_t) { before = rgfxGuestClockNs(); };
+	CHECK(writer.tryPost(RGFX_CMD_COMMAND_BUFFER, msg, sizeof(msg), nullptr, nullptr, seen, false,
+	                     RGFX_GUEST_TIMES_POSTED_OFFSET));
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(ring.next(&h, &bytes) && bytes.size() == sizeof(msg));
+	uint64_t posted = 0;
+	std::memcpy(&posted, bytes.data() + RGFX_GUEST_TIMES_POSTED_OFFSET, sizeof(posted));
+	CHECK(before != 0 && rang != 0);
+	CHECK(posted >= before && posted <= rang);
+	uint64_t kept = 0;
+	std::memcpy(&kept, msg + 64, sizeof(kept));
+	CHECK(kept == marker); // the caller's bytes stay as they were
+	// No stamp asked: the bytes go as given.
+	CHECK(writer.tryPost(RGFX_CMD_COMMAND_BUFFER, msg, sizeof(msg), nullptr));
+	CHECK(ring.next(&h, &bytes));
+	std::memcpy(&posted, bytes.data() + RGFX_GUEST_TIMES_POSTED_OFFSET, sizeof(posted));
+	CHECK(posted == marker);
+	// Past the message: no stamp.
+	uint8_t small[32] = {};
+	CHECK(writer.tryPost(RGFX_CMD_COMMAND_BUFFER, small, sizeof(small), nullptr, nullptr, {}, false,
+	                     RGFX_GUEST_TIMES_POSTED_OFFSET));
+	CHECK(ring.next(&h, &bytes) && bytes.size() == sizeof(small));
+}
+
+// Where the buffer stamps the guest's times (stampGuestTimes), its stream starts with
+// RGFX_OP_GUEST_TIMES, the last op put first, before its surface uses and its commit order: its
+// making and its commit as noted, and its posted time stamped as it went on the ring, on the
+// ring for a message there and in the block for one too large for the ring. A buffer that does
+// not stamp carries none, and its message keeps its size.
+void test_guest_times_go_first()
+{
+	TestRing ring(0x1000);
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, 1, TestRing::doorbell, nullptr);
+	auto blocks = std::make_shared<TestBlocks>();
+	const auto build = [&](RgfxEncoder &enc, int fills) {
+		enc.setMessageBlocks(blocks, 0);
+		enc.beginBlitPass();
+		for (int i = 0; i < fills; i++)
+			enc.blitFillBuffer(9, 0, 4, 1);
+		enc.endEncoder();
+		RgfxOpSurfaceUse use = {};
+		use.block_offset = 77;
+		enc.prependSurfaceUses(&use, 1);
+		RgfxSurfaceOrderWait wait = {2, 5};
+		enc.prependCommitOrder(&wait, 1);
+	};
+	const auto tags = [](const uint8_t *ops, uint64_t n) {
+		std::vector<uint16_t> out;
+		OpWalk walk(ops, n);
+		while (!walk.done()) {
+			uint16_t tag = 0, flags = 0;
+			uint32_t len = 0;
+			const uint8_t *body = nullptr;
+			size_t body_len = 0;
+			CHECK(walk.next(&tag, &flags, &len, &body, &body_len));
+			out.push_back(tag);
+		}
+		return out;
+	};
+	const std::vector<uint16_t> plain = {RGFX_OP_COMMIT_ORDER, RGFX_OP_SURFACE_USE,
+	                                     RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_BLIT_FILL_BUFFER,
+	                                     RGFX_OP_ENCODER_END};
+	std::vector<uint16_t> timed = plain;
+	timed.insert(timed.begin(), RGFX_OP_GUEST_TIMES);
+
+	// Not stamped: no times.
+	{
+		RgfxEncoder enc(writer, 1, 2);
+		build(enc, 1);
+		CHECK(!enc.stampsGuestTimes());
+		const uint64_t size = enc.messageSize();
+		CHECK(enc.finish());
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(ring.next(&h, &bytes) && h.size == size);
+		CHECK(tags(bytes.data() + RGFX_COMMAND_BUFFER_OPS_OFFSET,
+		           bytes.size() - RGFX_COMMAND_BUFFER_OPS_OFFSET) == plain);
+	}
+	// Stamped, on the ring: first, its size counted before the finish.
+	{
+		RgfxEncoder enc(writer, 1, 3);
+		enc.stampGuestTimes(1000);
+		CHECK(enc.stampsGuestTimes());
+		build(enc, 1);
+		enc.noteCommitted(2000);
+		const uint64_t size = enc.messageSize();
+		const uint64_t before = rgfxGuestClockNs();
+		CHECK(enc.fitsRing() && enc.finish());
+		const uint64_t after = rgfxGuestClockNs();
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(ring.next(&h, &bytes) && h.size == size && h.type == RGFX_CMD_COMMAND_BUFFER);
+		RgfxCommandBuffer cb = {};
+		std::memcpy(&cb, bytes.data(), sizeof(cb));
+		CHECK(cb.op_bytes == bytes.size() - RGFX_COMMAND_BUFFER_OPS_OFFSET);
+		CHECK(tags(bytes.data() + RGFX_COMMAND_BUFFER_OPS_OFFSET, cb.op_bytes) == timed);
+		RgfxOpHeader op = {};
+		std::memcpy(&op, bytes.data() + RGFX_COMMAND_BUFFER_OPS_OFFSET, sizeof(op));
+		CHECK(op.len == RGFX_OP_BODY_OFFSET + sizeof(RgfxOpGuestTimes));
+		RgfxOpGuestTimes t = {};
+		std::memcpy(&t, bytes.data() + RGFX_COMMAND_BUFFER_OPS_OFFSET + RGFX_OP_BODY_OFFSET,
+		            sizeof(t));
+		CHECK(t.began_ns == 1000 && t.committed_ns == 2000);
+		CHECK(t.posted_ns >= before && t.posted_ns <= after);
+	}
+	// Stamped, too large for the ring: in the block, its posted time there too.
+	{
+		RgfxEncoder enc(writer, 1, 4);
+		enc.stampGuestTimes(3000);
+		build(enc, 200);
+		enc.noteCommitted(4000);
+		CHECK(!enc.fitsRing());
+		const uint64_t size = enc.messageSize();
+		RgfxMessageBlock held = {};
+		const uint64_t before = rgfxGuestClockNs();
+		CHECK(enc.finish(nullptr, {}, {}, &held));
+		const uint64_t after = rgfxGuestClockNs();
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(ring.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER_IN_REGION);
+		RgfxCommandBufferInRegion ref = {};
+		std::memcpy(&ref, bytes.data(), sizeof(ref));
+		CHECK(ref.byte_length == size && ref.region_offset == held.offset);
+		const uint8_t *message = blocks->mem.data() + ref.region_offset;
+		RgfxCommandBuffer cb = {};
+		std::memcpy(&cb, message, sizeof(cb));
+		const std::vector<uint16_t> got = tags(message + RGFX_COMMAND_BUFFER_OPS_OFFSET, cb.op_bytes);
+		CHECK(got.size() == timed.size() + 199 && got[0] == RGFX_OP_GUEST_TIMES &&
+		      got[1] == RGFX_OP_COMMIT_ORDER);
+		RgfxOpGuestTimes t = {};
+		std::memcpy(&t, message + RGFX_COMMAND_BUFFER_OPS_OFFSET + RGFX_OP_BODY_OFFSET, sizeof(t));
+		CHECK(t.began_ns == 3000 && t.committed_ns == 4000);
+		CHECK(t.posted_ns >= before && t.posted_ns <= after);
+	}
+}
+
 // A pass's sample positions follow its colour records, and its flag says so; a pass without
 // them carries none, whatever flag its description held. The depth store action options are
 // one op.
@@ -4178,6 +4331,8 @@ int main()
 	test_ring_room_sleeps_count_for_the_line();
 	test_command_buffer_encoder();
 	test_command_buffer_storage();
+	test_ring_stamps_the_posted_time_before_the_publish();
+	test_guest_times_go_first();
 	test_video_command_buffer();
 	test_render_pass_sample_positions();
 	test_render_pass_visibility();

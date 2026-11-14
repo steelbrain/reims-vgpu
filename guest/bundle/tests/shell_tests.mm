@@ -16354,6 +16354,91 @@ void test_iosurface_writers()
 	CFRelease(surface);
 }
 
+// The guest's times (RGFX_OP_GUEST_TIMES): a queue that stamps them (stampsGuestTimes, where the
+// device's word holds RGFX_FEATURE_GUEST_TIMES) starts each buffer's stream with them, before its
+// commit order and every other op: made at -commandBuffer, committed at -commit's entry and
+// posted as it went on its ring, in that order, within the calls; a queue that does not stamps
+// none.
+void test_guest_times_where_the_queue_stamps()
+{
+	// Never freed, as Fixture's: the queues and their buffers may go after the test.
+	TestRing &control = *new TestRing(0x8000);
+	control.setConsumerIdle(1);
+	RgfxRingWriter &controlWriter = *new RgfxRingWriter(
+	    control.base(), control.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell, nullptr);
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	int &calls = *new int(0);
+	ids.setResourceIdSource(&oneChunk, &calls);
+	RgfxSerializer &ser = *new RgfxSerializer(controlWriter, ids);
+	TestRing &submit = *new TestRing(0x8000);
+	submit.setConsumerIdle(1);
+	RgfxRingWriter &submitWriter =
+	    *new RgfxRingWriter(submit.base(), submit.dataSize, 1, TestRing::doorbell, nullptr);
+	auto order = std::make_shared<RgfxCommitOrder>();
+	auto queueMade = [&](bool stamps) {
+		drainRing(control);
+		RgfxCommandQueue *q = [RgfxCommandQueue queueWithSubmitRing:&submitWriter
+		                                              submitOffset:0
+		                                            completeOffset:0
+		                                          completeDataSize:0
+		                                                       ids:&ids
+		                                                  maxCount:0
+		                                                    device:nil
+		                                                serializer:&ser];
+		CHECK(q != nil);
+		(void)expectQueueCreate(control);
+		[q rgfxJoinCommitOrder:order];
+		q.stampsGuestTimes = stamps ? YES : NO;
+		return q;
+	};
+	// The tags of a buffer's stream as it went on the ring, and its times where it starts with
+	// them.
+	struct Posted {
+		std::vector<uint16_t> tags;
+		RgfxOpGuestTimes times = {};
+		uint64_t made = 0, committing = 0, committed = 0;
+	};
+	auto commit = [&](RgfxCommandQueue *q) {
+		Posted out;
+		out.made = rgfxGuestClockNs();
+		id<MTLCommandBuffer> cb = [q commandBuffer];
+		out.committing = rgfxGuestClockNs();
+		[cb commit];
+		out.committed = rgfxGuestClockNs();
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER);
+		size_t at = RGFX_COMMAND_BUFFER_OPS_OFFSET;
+		while (at + sizeof(RgfxOpHeader) <= bytes.size()) {
+			RgfxOpHeader op = {};
+			std::memcpy(&op, bytes.data() + at, sizeof(op));
+			CHECK(op.len >= RGFX_OP_BODY_OFFSET && at + op.len <= bytes.size());
+			if (op.tag == RGFX_OP_GUEST_TIMES) {
+				CHECK(op.len == RGFX_OP_BODY_OFFSET + sizeof(RgfxOpGuestTimes));
+				std::memcpy(&out.times, bytes.data() + at + RGFX_OP_BODY_OFFSET, sizeof(out.times));
+			}
+			out.tags.push_back(op.tag);
+			at += op.len;
+		}
+		drainRing(control);
+		return out;
+	};
+	@autoreleasepool {
+		RgfxCommandQueue *plain = queueMade(false), *stamped = queueMade(true);
+		const Posted first = commit(plain);
+		CHECK(first.tags.empty());
+		// The stamped queue's buffer names the plain queue's (its commit order) after its times.
+		const Posted p = commit(stamped);
+		CHECK((p.tags == std::vector<uint16_t>{RGFX_OP_GUEST_TIMES, RGFX_OP_COMMIT_ORDER}));
+		CHECK(p.made <= p.times.began_ns && p.times.began_ns <= p.committing);
+		CHECK(p.committing <= p.times.committed_ns && p.times.committed_ns <= p.times.posted_ns);
+		CHECK(p.times.posted_ns <= p.committed);
+		// And the plain queue's next buffer, which names the stamped one's, still carries none.
+		const Posted again = commit(plain);
+		CHECK((again.tags == std::vector<uint16_t>{RGFX_OP_COMMIT_ORDER}));
+	}
+}
+
 // A process's commit order (RgfxCommitOrder.hpp; design.md, "Commit order"): a queue that takes
 // part names, before its buffer goes on its ring, once and before its first other op
 // (RGFX_OP_COMMIT_ORDER), the latest buffer each other queue that takes part put on its ring since
@@ -19653,6 +19738,7 @@ int main(int argc, char **argv)
 		test_iosurface_full_records_take_this_process_s_slots();
 		test_iosurface_held_buffer_names_at_scheduling();
 		test_commit_order();
+		test_guest_times_where_the_queue_stamps();
 		test_commit_order_names_no_cycle();
 		test_iosurface_writes_named();
 		test_iosurface_writes_by_function();

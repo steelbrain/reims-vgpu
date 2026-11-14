@@ -68,6 +68,8 @@ constexpr UInt32 kRingConsumer = __builtin_offsetof(RgfxRingHeader, consumer);
 constexpr UInt32 kRingConsumerIdle = __builtin_offsetof(RgfxRingHeader, consumer_idle);
 constexpr UInt32 kRingProducerWaiting = __builtin_offsetof(RgfxRingHeader, producer_waiting);
 constexpr UInt32 kRingArmed = __builtin_offsetof(RgfxRingHeader, armed);
+constexpr UInt32 kRingGuestClockOffset = __builtin_offsetof(RgfxRingHeader, guest_clock_offset_ns);
+constexpr UInt32 kRingGuestClockBound = __builtin_offsetof(RgfxRingHeader, guest_clock_bound_ns);
 
 // Scanout rows start on 256-byte boundaries, as the option ROM's do, so the
 // boot frame keeps its layout when the driver takes the display over.
@@ -948,6 +950,16 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 			UInt64 after = clockNs(mach_absolute_time());
 			UInt32 hiAgain = readRegister(RGFX_REG_HOST_TIME_HI);
 			vblankClock.reading(before, RgfxVblankClock::hostTime(hi, lo, hiAgain), after);
+			// Where the bundle stamps its command buffers (GUEST_TIMES), the held reading's
+			// offset and bound go in ring 0's header for the host: the offset, then the bound
+			// with release, which the host reads first.
+			int64_t offset = 0;
+			uint64_t bound = 0;
+			if (guestTimes && vblankClock.offsetAt(after, &offset, &bound)) {
+				volatile UInt8 *header = ring(RGFX_CONTROL_SUBMIT_OFFSET);
+				store64(header + kRingGuestClockOffset, static_cast<UInt64>(offset));
+				store32(header + kRingGuestClockBound, RgfxVblankClock::headerBound(bound));
+			}
 		}
 		UInt64 time = clockAbsolute(
 		    size >= 24 ? vblankClock.vblank(count,
@@ -1385,6 +1397,7 @@ bool ReimsGraphics::start(IOService *provider)
 	displayScaleTaken = false;
 	displayScale = 0;
 	hostTime = false;
+	guestTimes = false;
 	displayPowerTaken = false;
 	wranglerNotifier = nullptr;
 	wranglerInterest = nullptr;
@@ -1526,6 +1539,7 @@ bool ReimsGraphics::start(IOService *provider)
 		displayColorTaken = (took & RGFX_FEATURE_DISPLAY_COLOR) != 0;
 		displayScaleTaken = (took & RGFX_FEATURE_DISPLAY_SCALE) != 0;
 		hostTime = (took & RGFX_FEATURE_HOST_TIME) != 0;
+		guestTimes = (took & RGFX_FEATURE_GUEST_TIMES) != 0;
 		displayPowerTaken = (took & RGFX_FEATURE_DISPLAY_POWER) != 0;
 	}
 	produced = load64(ring(RGFX_CONTROL_SUBMIT_OFFSET) + kRingProducer);

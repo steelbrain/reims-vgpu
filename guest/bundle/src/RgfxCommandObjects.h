@@ -133,6 +133,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// buffer waits for nothing, not at its platform's submission. NO by default.
 @property(nonatomic) BOOL asksScheduled;
 
+/// Whether its command buffers start their streams with the guest's times
+/// (RGFX_OP_GUEST_TIMES: made, committed and posted, on the guest's clock), where the device's
+/// word holds RGFX_FEATURE_GUEST_TIMES, a diagnostic the host splits the time before it takes
+/// each buffer by. NO by default.
+@property(nonatomic) BOOL stampsGuestTimes;
+
 /// The bytes the queue guesses a new command buffer's message takes (RgfxEncoder): the
 /// largest of the queue's recent messages, as its command buffers committed them. Each smaller
 /// one takes an eighth off, so one large buffer does not hold it. A message has room for it

@@ -28,8 +28,9 @@ use std::sync::Arc;
 
 use reims_vgpu_graphics::ops::{
     RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_COMPUTE,
-    RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_END, RGFX_OP_SUBMITTED, RGFX_PASS_FLAG_RT_SIZE,
-    RgfxCommandBuffer, RgfxOpHeader, RgfxRenderPassColorAttachment, RgfxRenderPassDesc,
+    RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_END, RGFX_OP_GUEST_TIMES, RGFX_OP_SUBMITTED,
+    RGFX_PASS_FLAG_RT_SIZE, RgfxCommandBuffer, RgfxOpHeader, RgfxRenderPassColorAttachment,
+    RgfxRenderPassDesc,
 };
 use reims_vgpu_graphics::region::Region;
 use reims_vgpu_graphics::wire::{
@@ -334,10 +335,11 @@ fn tag_of(rng: &mut Rng, group: u16) -> u16 {
     }
 }
 
-/// Whether `tag` is one no group decodes.
+/// Whether `tag` is one no group decodes: the guest's times (`GUEST_TIMES`), past framing's last,
+/// are the device's, which the walk steps past.
 fn unknown(tag: u16) -> bool {
     let group = (tag >> 12) as usize;
-    group >= LAST_TAG.len() || tag > LAST_TAG[group] || tag == 0
+    tag != RGFX_OP_GUEST_TIMES && (group >= LAST_TAG.len() || tag > LAST_TAG[group] || tag == 0)
 }
 
 /// A render pass over texture 4 (colour, clear then store), 256 × 256.
@@ -363,13 +365,18 @@ fn render_pass() -> Vec<u8> {
     body
 }
 
-/// A fuzzed op stream. Most streams open
+/// A fuzzed op stream. Half of them start with the guest's times of fuzzed stamps
+/// (`GUEST_TIMES`), as the bundle puts them first. Most streams open
 /// one encoder as the bundle does (a render pass over texture 4, a compute or a blit pass), then
 /// carry fuzzed ops of its group, then end it; the rest are fuzzed ops of any group, framing ops
 /// among them. No stream waits for an event or uses an IOSurface's device cache, so each buffer
 /// the decoder carries out completes at its commit.
 fn op_stream(rng: &mut Rng) -> Vec<u8> {
     let mut ops = Vec::new();
+    if rng.one_in(2) {
+        let times = words(rng, 3);
+        ops.extend(op(rng, RGFX_OP_GUEST_TIMES, &times));
+    }
     let fuzzed = |rng: &mut Rng, group: u16, ops: &mut Vec<u8>| {
         let mut tag = tag_of(rng, group);
         // Framing's event and surface ops wait or fill, so a buffer that holds one need not

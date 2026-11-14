@@ -524,6 +524,10 @@ private:
 	// The host took HOST_TIME: each VBLANK reads the host's clock for the refreshes' times
 	// (vblankClock), set before `ready`.
 	bool hostTime;
+	// The host took GUEST_TIMES: each VBLANK's reading of the host's clock goes in ring 0's header
+	// as the clocks' offset, for the host to map the bundle's stamps (vblankClock.offsetAt), set
+	// before `ready`.
+	bool guestTimes;
 	// The host took DISPLAY_POWER: the work loop tells it the display's panel (panelWanted), set
 	// before `ready`.
 	bool displayPowerTaken;

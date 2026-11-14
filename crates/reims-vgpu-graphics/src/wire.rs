@@ -77,8 +77,9 @@ pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// [`RGFX_FEATURE_SCHEDULED_ASK`], [`RGFX_FEATURE_PAGES_16K`], [`RGFX_FEATURE_DISPLAY_SCALE`],
 /// [`RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA`], [`RGFX_FEATURE_DISPLAY_POWER`],
 /// [`RGFX_FEATURE_RATE_MAPS`], [`RGFX_FEATURE_FUNCTION_POINTERS`],
-/// [`RGFX_FEATURE_DYNAMIC_LIBRARIES`], [`RGFX_FEATURE_PIPELINE_KEYS`] and
-/// [`RGFX_FEATURE_ICB_SLOTS_IN_PAGES`].
+/// [`RGFX_FEATURE_DYNAMIC_LIBRARIES`], [`RGFX_FEATURE_PIPELINE_KEYS`],
+/// [`RGFX_FEATURE_ICB_SLOTS_IN_PAGES`], [`RGFX_FEATURE_DOORBELL_ASKS`] and
+/// [`RGFX_FEATURE_GUEST_TIMES`].
 /// On a host that offers `PAGES_16K`, `FEATURES_LO` and `_HI` read the guest RAM features only
 /// once the guest took it.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
@@ -382,6 +383,17 @@ pub const RGFX_FEATURE_ICB_SLOTS_IN_PAGES: u64 = 0x400_0000_0000;
 /// that wakes the queue's thread), and answers a buffer at its doorbell only for the write that
 /// holds [`RGFX_DOORBELL_ASKS`], as it did for any write before. Every host offers it.
 pub const RGFX_FEATURE_DOORBELL_ASKS: u64 = 0x800_0000_0000;
+/// `FEATURES_HI` bit 12, feature bit 44, `GUEST_TIMES`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_HI`]: a diagnostic of the time before the host takes a command
+/// buffer. Each [`RGFX_CMD_COMMAND_BUFFER`]'s op stream starts with one
+/// [`RGFX_OP_GUEST_TIMES`](crate::ops::RGFX_OP_GUEST_TIMES), the guest's clock as the buffer was
+/// made, committed and published on its ring, and the kext keeps ring 0's
+/// [`RgfxRingHeader::guest_clock_offset_ns`] and [`RgfxRingHeader::guest_clock_bound_ns`], the
+/// guest's clock less the host's, from its reading of [`RGFX_REG_HOST_TIME_LO`] at each `VBLANK`.
+/// The host splits the time from a buffer's making to its take into the guest's encode, the
+/// guest's wait to post it, the wait behind the queue's buffer before it and the transport, for
+/// its trace and its log; it changes nothing else the device does. Every host offers it.
+pub const RGFX_FEATURE_GUEST_TIMES: u64 = 0x1000_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -562,8 +574,21 @@ pub struct RgfxRingHeader {
     /// guest producer waits for room ([`RGFX_FEATURE_SUBMIT_ROOM`]), written 1 by the guest and 0
     /// by the host as it posts the ring's [`RGFX_EVT_SUBMIT_ROOM`]; 0 on every other ring.
     pub producer_waiting: u32,
+    /// Zero.
+    pub reserved_14: u32,
+    /// On the control submission ring (ring 0), where the guest took
+    /// [`RGFX_FEATURE_GUEST_TIMES`]: the guest's clock (`mach_absolute_time`, in nanoseconds)
+    /// less the host's (the clock [`RGFX_REG_HOST_TIME_LO`] reads), as the kext's reading of
+    /// `HOST_TIME` between two reads of its own clock found it, written by the guest before
+    /// [`Self::guest_clock_bound_ns`]. 0 on every other ring.
+    pub guest_clock_offset_ns: i64,
+    /// On ring 0, where the guest took [`RGFX_FEATURE_GUEST_TIMES`]: how far
+    /// [`Self::guest_clock_offset_ns`] may be off, in nanoseconds (half its reading's round trip,
+    /// widened by the reading's age), stored by the guest with release after the offset; 0 while
+    /// the guest holds no reading, and on every other ring.
+    pub guest_clock_bound_ns: u32,
     /// The rest of `producer`'s line.
-    pub reserved_14: [u8; 44],
+    pub reserved_24: [u8; 28],
     /// The consumer's free-running byte count, written by the consumer.
     pub consumer: u64,
     /// The rest of `consumer`'s line.
@@ -1487,6 +1512,8 @@ const _: () = {
     assert!(offset_of!(RgfxRingHeader, consumer_idle) == 0x80);
     assert!(offset_of!(RgfxRingHeader, armed) == 0xc0);
     assert!(offset_of!(RgfxRingHeader, producer_waiting) == 0x10);
+    assert!(offset_of!(RgfxRingHeader, guest_clock_offset_ns) == 0x18);
+    assert!(offset_of!(RgfxRingHeader, guest_clock_bound_ns) == 0x20);
     assert!(offset_of!(RgfxRingHeader, raise_all) == 0xc4);
     assert!(size_of::<RgfxMsgHeader>() == 16);
     assert!(size_of::<RgfxGetDisplays>() == 16);

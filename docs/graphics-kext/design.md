@@ -1811,6 +1811,14 @@ only where no negotiation can carry it.
   The kext takes it, and the bundle sets
   the bit where the device's word holds it; where it does not, every
   doorbell write may be answered, as before the bit.
+- Bit 44, `FEATURES_HI`'s bit 12, is `GUEST_TIMES`, which means nothing
+  without `HOST_TIME`: a diagnostic. Each command buffer's stream starts with
+  `GUEST_TIMES` (0x000e), the guest's clock as the buffer was made, committed
+  and put on its ring, and the framebuffer keeps the offset of the guest's
+  clock from the host's in ring 0's header, so the host splits the time before
+  it takes each buffer ("Guest times"). Every host offers it, and the kext
+  takes it; a bundle on a host that did not offer it stamps nothing, and the
+  host reads no times of a guest that did not take it.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -2323,6 +2331,9 @@ own 64-byte line:
 |---|---|---|
 | 0x00 | `producer`: u64, free-running byte count | producer |
 | 0x08 | `completed_seqno`: u64, on a queue's completion ring the seqno of the last command buffer that finished OK, 0 before one has | host (queue completion rings) |
+| 0x10 | `producer_waiting`: u32, 1 while a producer waits for room (`SUBMIT_ROOM`, `CONSUMED_DOORBELL`) | the waiting side; host 0 |
+| 0x18 | `guest_clock_offset_ns`: i64, on ring 0 where the guest took `GUEST_TIMES`, the guest's clock less the host's | guest (ring 0) |
+| 0x20 | `guest_clock_bound_ns`: u32, how far that offset may be off; 0 while the guest holds none, stored after it with release | guest (ring 0) |
 | 0x40 | `consumer`: u64, free-running byte count | consumer |
 | 0x80 | `consumer_idle`: u32, 1 (`RGFX_CONSUMER_ASLEEP`) while the consumer sleeps, 2 (`RGFX_CONSUMER_WALKING`) while a queue's consumer walks a command buffer | consumer |
 | 0xc0 | `armed`: u32, 1 when the guest wants an interrupt | guest (completion rings) |
@@ -3202,6 +3213,10 @@ opens the `Platform` command buffer and walks the ops:
   committed by `commitAndWaitUntilSubmitted`, and asks for its `CB_SUBMITTED`
   ("Submitted", below). The bundle puts it last, as it commits; the host reads
   it as it takes the buffer, before its other ops.
+- `GUEST_TIMES` (made, committed and posted, each the guest's clock), where
+  the guest took `GUEST_TIMES`: first in the stream, once, a diagnostic the
+  host reads as it takes the buffer ("Guest times", below). The walk steps
+  past it.
 
 A command buffer too large for half its queue's submission ring goes out of
 line: the whole `COMMAND_BUFFER` message lies in a block of the process's own,
@@ -3720,6 +3735,27 @@ every word stale). The bundle names the order as it posts each buffer:
   closes.
 - Nothing else changes: no GPU wait is added, the buffer's records go as they
   did, and the platform orders what the buffers share by the commit order.
+
+**Guest times**, where the guest took `GUEST_TIMES` (`FEATURES_HI` bit 12), a
+diagnostic. The host sees a command buffer only once its queue's thread takes
+it off the ring, so the time before that, the app's encode and the buffer's
+way to the host, shows as one span with nothing pending on the host. The guest
+stamps each buffer so the host can split it:
+- The bundle reads its clock (`mach_absolute_time` in nanoseconds, the kext's
+  clock) as the buffer is made (`commandBuffer`), as its `commit` is entered,
+  and as its message goes on its ring: under the ring's lock, after the copy
+  and before `producer` is published, written in the ring's copy at
+  `RGFX_GUEST_TIMES_POSTED_OFFSET` (64), as the seqno is stamped; for a buffer
+  in a block, into the block, under the ring's lock as its reference goes on
+  the ring. The op, 32 bytes, goes first, the last op put before the stream.
+- At each `VBLANK`'s reading of `HOST_TIME` the framebuffer writes ring 0's
+  `guest_clock_offset_ns`, the held reading's offset, then
+  `guest_clock_bound_ns`, its bound (half the reading's round trip, widened by
+  50 ppm of its age), with release. The host zeroes both at a reset.
+- The offset is off by at most its bound, microseconds, under the millisecond
+  spans it splits. The stamps cost three clock reads a buffer. Nothing else
+  the guest or the host observes changes: a guest that did not take the bit
+  stamps nothing, and the host ignores the op.
 
 **Left for later** (extends the same op families, not the transport):
 command-buffer/queue descriptors and `errorOptions`; labels and debug groups

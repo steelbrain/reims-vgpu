@@ -4,9 +4,19 @@
 // going back; either offset follows a drift; the period comes from the stamps; and an answer taken
 // within a period after a VBLANK is that refresh's, one taken whole periods after it the refresh
 // that many periods on, up to kOffPeriods, and the answers' times never go back.
+#include <cstddef>
 #include <cstdio>
 
 #include "RgfxVblankClock.hpp"
+#include "reims_graphics_wire.h"
+
+// Where the framebuffer writes the held reading for the host (GUEST_TIMES): ring 0's header, in
+// the producer's line, the offset at 0x18 and its bound at 0x20 (design.md, "Guest times").
+static_assert(offsetof(RgfxRingHeader, guest_clock_offset_ns) == 0x18, "the offset's place");
+static_assert(sizeof(RgfxRingHeader::guest_clock_offset_ns) == 8, "the offset's width");
+static_assert(offsetof(RgfxRingHeader, guest_clock_bound_ns) == 0x20, "the bound's place");
+static_assert(sizeof(RgfxRingHeader::guest_clock_bound_ns) == 4, "the bound's width");
+static_assert(offsetof(RgfxRingHeader, consumer) == 0x40, "both in the producer's line");
 
 static int g_checks = 0, g_failed = 0;
 #define CHECK(e)                                                                   \
@@ -222,6 +232,33 @@ static void readingsNeverAfterReceipt()
 	      receipt + kPeriod - 10000);
 }
 
+// What the framebuffer hands the host after each reading (offsetAt): nothing before one is held;
+// then the held one's offset, its bound widened by kAgePpm of its age, whichever reading holds,
+// and in the header at least 1 ns, as 0 there says none is held.
+static void offsetForTheHost()
+{
+	RgfxVblankClock c;
+	int64_t offset = 7;
+	uint64_t bound = 7;
+	CHECK(!c.offsetAt(1000000, &offset, &bound) && offset == 7 && bound == 7);
+	uint64_t host = 1000000;
+	readAt(c, host, kOffset, 2000);
+	CHECK(c.offsetAt(host + kOffset + 2000, &offset, &bound));
+	CHECK(offset == static_cast<int64_t>(kOffset) && bound == 2000);
+	// 20 ms on, a wider reading: the held one stands, its bound 1 us wider.
+	host += 20000000;
+	readAt(c, host, kOffset + 4000, 6000);
+	CHECK(c.offsetAt(host + kOffset - 2000, &offset, &bound));
+	CHECK(offset == static_cast<int64_t>(kOffset) && bound == 2000 + 1000);
+	// An offset behind the guest's clock, the guest's clock behind the host's.
+	RgfxVblankClock behind;
+	behind.reading(1000, 5000000, 3000);
+	CHECK(behind.offsetAt(3000, &offset, &bound) && offset == 2000 - 5000000 && bound == 1000);
+	CHECK(RgfxVblankClock::headerBound(0) == 1);
+	CHECK(RgfxVblankClock::headerBound(1500) == 1500);
+	CHECK(RgfxVblankClock::headerBound(1ull << 40) == 0xffffffffu);
+}
+
 int main()
 {
 	first();
@@ -235,6 +272,7 @@ int main()
 	shortestRoundTripHolds();
 	readingsFollowADrift();
 	readingsNeverAfterReceipt();
+	offsetForTheHost();
 	if (g_failed) {
 		std::fprintf(stderr, "vblank_clock_test: %d of %d checks failed\n", g_failed, g_checks);
 		return 1;

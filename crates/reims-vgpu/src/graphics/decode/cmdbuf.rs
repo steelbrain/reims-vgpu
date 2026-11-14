@@ -108,14 +108,15 @@ use reims_vgpu_graphics::ops::{
     RGFX_OP_COMMIT_ORDER, RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_COMPUTE,
     RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_BEGIN_VIDEO, RGFX_OP_ENCODER_END,
     RGFX_OP_GROUP_BLIT, RGFX_OP_GROUP_COMPUTE, RGFX_OP_GROUP_FRAMING, RGFX_OP_GROUP_RENDER,
-    RGFX_OP_GROUP_VIDEO, RGFX_OP_SIGNAL_EVENT, RGFX_OP_SUBMITTED, RGFX_OP_SURFACE_ORDER,
-    RGFX_OP_SURFACE_USE, RGFX_OP_WAIT_EVENT, RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT,
-    RGFX_PASS_FLAG_RATE_MAP, RGFX_PASS_FLAG_RT_ARRAY_LENGTH, RGFX_PASS_FLAG_RT_SIZE,
-    RGFX_PASS_FLAG_SAMPLE_POSITIONS, RGFX_PASS_FLAG_VISIBILITY_RESULT,
-    RGFX_PASS_MAX_SAMPLE_POSITIONS, RGFX_RENDER_PASS_COLOR_OFFSET, RgfxCommandBuffer,
-    RgfxComputePassDesc, RgfxOpEvent, RgfxOpHeader, RgfxOpSurfaceUse, RgfxOpVideoPass,
-    RgfxRenderPassColorAttachment, RgfxRenderPassDesc, RgfxRenderPassRateMap,
-    RgfxRenderPassSamplePositions, RgfxRenderPassVisibility, RgfxSurfaceOrderWait, op_group,
+    RGFX_OP_GROUP_VIDEO, RGFX_OP_GUEST_TIMES, RGFX_OP_SIGNAL_EVENT, RGFX_OP_SUBMITTED,
+    RGFX_OP_SURFACE_ORDER, RGFX_OP_SURFACE_USE, RGFX_OP_WAIT_EVENT,
+    RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT, RGFX_PASS_FLAG_RATE_MAP,
+    RGFX_PASS_FLAG_RT_ARRAY_LENGTH, RGFX_PASS_FLAG_RT_SIZE, RGFX_PASS_FLAG_SAMPLE_POSITIONS,
+    RGFX_PASS_FLAG_VISIBILITY_RESULT, RGFX_PASS_MAX_SAMPLE_POSITIONS,
+    RGFX_RENDER_PASS_COLOR_OFFSET, RgfxCommandBuffer, RgfxComputePassDesc, RgfxOpEvent,
+    RgfxOpHeader, RgfxOpSurfaceUse, RgfxOpVideoPass, RgfxRenderPassColorAttachment,
+    RgfxRenderPassDesc, RgfxRenderPassRateMap, RgfxRenderPassSamplePositions,
+    RgfxRenderPassVisibility, RgfxSurfaceOrderWait, op_group,
 };
 use reims_vgpu_graphics::wire::{
     RGFX_EVT_CB_SCHEDULED, RGFX_EVT_CB_SUBMITTED, RGFX_EVT_EVENT_SIGNALLED, RgfxCbScheduled,
@@ -954,6 +955,8 @@ fn take(mut ops: &[u8]) -> Take {
             RGFX_OP_ENCODER_BEGIN_RENDER
             | RGFX_OP_ENCODER_BEGIN_COMPUTE
             | RGFX_OP_ENCODER_BEGIN_BLIT => out.work = true,
+            // The device's diagnostic, read as it took the buffer: no work, and nothing taken.
+            RGFX_OP_GUEST_TIMES => {}
             tag => match op_group(tag) {
                 RGFX_OP_GROUP_RENDER | RGFX_OP_GROUP_COMPUTE | RGFX_OP_GROUP_BLIT => {
                     out.work = true;
@@ -2678,11 +2681,13 @@ impl<P: Platform> GraphicsDecoder<P> {
                     events.waits.push((op.event_obj_id, op.value));
                 }
             }
-            // Carried out before the walk, wherever they lie ([`take`]).
+            // Carried out before the walk, wherever they lie ([`take`]); the guest's times are
+            // the device's, read as it took the buffer.
             RGFX_OP_SURFACE_USE
             | RGFX_OP_SUBMITTED
             | RGFX_OP_SURFACE_ORDER
-            | RGFX_OP_COMMIT_ORDER => {}
+            | RGFX_OP_COMMIT_ORDER
+            | RGFX_OP_GUEST_TIMES => {}
             _ => return Err(unknown_op(tag)),
         }
         Ok(())
@@ -6855,6 +6860,47 @@ mod tests {
         ops.extend(op(0x1fff, &[0u8; 8]));
         let message = command_buffer_message(101, 1, &ops);
         assert!(dec.decode(&device, &message).is_err());
+    }
+
+    /// A buffer whose stream starts with the guest's times (`GUEST_TIMES`) is carried out as the
+    /// same buffer without them: the walk steps past the op, which is the device's diagnostic,
+    /// whatever its stamps hold, and a stream of the times alone is an empty buffer.
+    #[test]
+    fn a_buffer_s_guest_times_change_nothing_it_does() {
+        use reims_vgpu_graphics::ops::RgfxOpGuestTimes;
+        let times = RgfxOpGuestTimes {
+            began_ns: u64::MAX,
+            committed_ns: 3,
+            posted_ns: 0,
+        };
+        let stamped = |ops: &[u8]| {
+            let mut v = op(RGFX_OP_GUEST_TIMES, times.as_bytes());
+            v.extend_from_slice(ops);
+            v
+        };
+        let mut blit = op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]);
+        blit.extend(op(RGFX_OP_ENCODER_END, &[]));
+        let mut render = pass_of(&draw_ops(2, 0, 0));
+        render.extend(op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]));
+        render.extend(op(RGFX_OP_ENCODER_END, &[]));
+        for (i, ops) in [Vec::new(), blit, render].into_iter().enumerate() {
+            let i = i as u64;
+            let (p, mut dec) = setup();
+            let device = p.device();
+            let mark = p.call_log().mark();
+            let plain = command_buffer_message(300 + i, 1, &ops);
+            assert_eq!(dec.decode(&device, &plain).unwrap(), Ok(()), "case {i}");
+            p.world().complete_all(CompleteOn::Caller);
+            let without = p.call_log().sels_since(mark);
+
+            let (p, mut dec) = setup();
+            let device = p.device();
+            let mark = p.call_log().mark();
+            let message = command_buffer_message(300 + i, 1, &stamped(&ops));
+            assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()), "case {i}");
+            p.world().complete_all(CompleteOn::Caller);
+            assert_eq!(p.call_log().sels_since(mark), without, "case {i}");
+        }
     }
 
     /// A render op with no open encoder faults the exec.

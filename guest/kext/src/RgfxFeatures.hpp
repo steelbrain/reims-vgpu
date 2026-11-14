@@ -126,7 +126,12 @@
 //    for its CB_SUBMITTED with the ring's id and RGFX_DOORBELL_ASKS, and for anything else with
 //    the id alone (RgfxRingWriter::setDoorbellAsks), so the host may take the plain ones with no
 //    exit to its process; the kext writes what the bundle hands its doorbell call, so it needs
-//    nothing of the kext.
+//    nothing of the kext;
+//  - GUEST_TIMES (bit 44), meaningful only with HOST_TIME: the bundle starts each command buffer's
+//    stream with RGFX_OP_GUEST_TIMES, the guest's clock as the buffer was made, committed and put
+//    on its ring, and the framebuffer writes, after each VBLANK's reading of the host's clock, the
+//    reading's offset and bound in ring 0's header (RgfxVblankClock::offsetAt), for the host to
+//    split the time before it takes each buffer: a diagnostic.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -165,7 +170,7 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_SCHEDULED_ASK | RGFX_FEATURE_DISPLAY_SCALE |
     RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA | RGFX_FEATURE_RATE_MAPS |
     RGFX_FEATURE_FUNCTION_POINTERS | RGFX_FEATURE_DYNAMIC_LIBRARIES | RGFX_FEATURE_PIPELINE_KEYS |
-    RGFX_FEATURE_ICB_SLOTS_IN_PAGES | RGFX_FEATURE_DOORBELL_ASKS |
+    RGFX_FEATURE_ICB_SLOTS_IN_PAGES | RGFX_FEATURE_DOORBELL_ASKS | RGFX_FEATURE_GUEST_TIMES |
     (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K : RGFX_FEATURE_DISPLAY_POWER);
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.

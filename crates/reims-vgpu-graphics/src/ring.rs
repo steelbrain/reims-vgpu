@@ -40,6 +40,8 @@ pub(crate) struct RingAt {
 const PRODUCER: u64 = 0x00;
 const COMPLETED_SEQNO: u64 = 0x08;
 const PRODUCER_WAITING: u64 = 0x10;
+pub(crate) const GUEST_CLOCK_OFFSET: u64 = 0x18;
+pub(crate) const GUEST_CLOCK_BOUND: u64 = 0x20;
 const CONSUMER: u64 = 0x40;
 const CONSUMER_IDLE: u64 = 0x80;
 const ARMED: u64 = 0xc0;
@@ -84,9 +86,9 @@ impl std::fmt::Display for Broken {
 }
 
 impl RingAt {
-    /// Writes the header of a ring nothing has passed through: both counts 0, `armed` and
-    /// `producer_waiting` 0, and `consumer_idle` [`RGFX_CONSUMER_ASLEEP`] where `consumer_idle`,
-    /// else 0.
+    /// Writes the header of a ring nothing has passed through: both counts 0, `armed`,
+    /// `producer_waiting` and the guest's clock offset and its bound 0, and `consumer_idle`
+    /// [`RGFX_CONSUMER_ASLEEP`] where `consumer_idle`, else 0.
     pub(crate) fn initialize(&self, region: &Region, consumer_idle: bool) {
         region
             .atomic_u64(self.header + PRODUCER)
@@ -96,6 +98,12 @@ impl RingAt {
             .store(0, Ordering::Release);
         region
             .atomic_u32(self.header + PRODUCER_WAITING)
+            .store(0, Ordering::Release);
+        region
+            .atomic_u32(self.header + GUEST_CLOCK_BOUND)
+            .store(0, Ordering::Release);
+        region
+            .atomic_u64(self.header + GUEST_CLOCK_OFFSET)
             .store(0, Ordering::Release);
         region
             .atomic_u64(self.header + CONSUMER)

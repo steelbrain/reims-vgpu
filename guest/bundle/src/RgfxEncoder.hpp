@@ -559,8 +559,12 @@ public:
 		return last.tag == RGFX_OP_SUBMITTED && last.len == sizeof(last);
 	}
 
-	/// The finished message's length: the header, the op stream and the surface uses before it.
-	uint64_t messageSize() const { return RGFX_COMMAND_BUFFER_OPS_OFFSET + opBytes(); }
+	/// The finished message's length: the header, the op stream and the surface uses before it,
+	/// and the guest's times finish() puts first (stampGuestTimes).
+	uint64_t messageSize() const
+	{
+		return RGFX_COMMAND_BUFFER_OPS_OFFSET + opBytes() + (m_timesPending ? kGuestTimesBytes : 0);
+	}
 
 	/// The bytes the message holds before it grows.
 	size_t capacity() const
@@ -621,6 +625,20 @@ public:
 	/// Puts one RGFX_OP_COMMIT_ORDER naming `waits` (`count` of them) before the op stream's first
 	/// op, as prependSurfaceOrder does; nothing where `count` is 0.
 	void prependCommitOrder(const RgfxSurfaceOrderWait *waits, size_t count);
+	/// Where the device's word holds RGFX_FEATURE_GUEST_TIMES: the finished stream starts with
+	/// RGFX_OP_GUEST_TIMES (the last op put first, by finish), the buffer made at `beganNs`, the
+	/// guest's clock (rgfxGuestClockNs), committed as noteCommitted says, and posted as its message
+	/// goes on the ring (RgfxRingWriter::tryPost's `stampAt`; for a message in a block, written
+	/// into the block under the ring's lock). Set as the buffer is made.
+	void stampGuestTimes(uint64_t beganNs)
+	{
+		m_timesPending = true;
+		m_times.began_ns = beganNs;
+	}
+	/// Whether the buffer's stream will start with the guest's times (stampGuestTimes).
+	bool stampsGuestTimes() const { return m_timesPending; }
+	/// The commit was entered at `committedNs`, the guest's clock.
+	void noteCommitted(uint64_t committedNs) { m_times.committed_ns = committedNs; }
 	/// Where the command buffer keeps the objects its encoders name, as Metal's command buffer
 	/// with retained references keeps what it encodes: `keep(context, object)` for each one
 	/// (once for a run of the same object), from the encode until the buffer completes or goes.
@@ -695,6 +713,10 @@ private:
 	uint8_t *prependRoom(size_t bytes);
 	/// The bytes before the header a commit's surface uses take with no move: 64 of them.
 	static constexpr size_t kHeadroom = 64 * (RGFX_OP_BODY_OFFSET + sizeof(RgfxOpSurfaceUse));
+	/// The bytes the guest's times take in the stream.
+	static constexpr size_t kGuestTimesBytes = RGFX_OP_BODY_OFFSET + sizeof(RgfxOpGuestTimes);
+	/// Puts the guest's times first where they are to go (stampGuestTimes), once: whether it did.
+	bool prependGuestTimes();
 
 	// Takes `n` bytes at the stream's end (growing it where it has less room) and answers them.
 	__attribute__((always_inline)) uint8_t *reserve(size_t n)
@@ -783,6 +805,9 @@ private:
 	uint8_t *m_end = nullptr;
 	size_t m_prefix = 0;
 	bool m_inBlock = false;
+	// The guest's times, to go first at finish while pending (stampGuestTimes).
+	bool m_timesPending = false;
+	RgfxOpGuestTimes m_times = {};
 	RgfxMessageBlock m_block = {};
 	std::shared_ptr<RgfxMessageBlocks> m_blocks;
 	uint64_t m_sizeHint = 0;

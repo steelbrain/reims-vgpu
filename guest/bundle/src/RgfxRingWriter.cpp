@@ -331,7 +331,8 @@ bool RgfxRingWriter::fits(uint32_t size) const
 
 bool RgfxRingWriter::post(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,
                           const std::function<void()> &whileWaiting,
-                          const std::function<void(uint64_t)> &beforePublish, bool answered)
+                          const std::function<void(uint64_t)> &beforePublish, bool answered,
+                          uint32_t stampAt)
 {
 	if (!fits(size))
 		return false;
@@ -339,7 +340,7 @@ bool RgfxRingWriter::post(uint32_t type, const void *message, uint32_t size, uin
 	for (;;) {
 		// The room records so far, read before the look: one that comes after it ends the wait.
 		const uint64_t seen = m_room ? m_room->seen() : 0;
-		if (tryPost(type, message, size, out_seqno, nullptr, beforePublish, answered))
+		if (tryPost(type, message, size, out_seqno, nullptr, beforePublish, answered, stampAt))
 			return true;
 		// Where the host posts room records, it is told a post waits, then the ring is looked
 		// at once more: either this look finds what the host took, or the host's next take finds
@@ -347,7 +348,7 @@ bool RgfxRingWriter::post(uint32_t type, const void *message, uint32_t size, uin
 		if (m_room) {
 			store32(m_header + kProducerWaiting, 1);
 			fullFence();
-			if (tryPost(type, message, size, out_seqno, nullptr, beforePublish, answered))
+			if (tryPost(type, message, size, out_seqno, nullptr, beforePublish, answered, stampAt))
 				return true;
 		}
 		// The host takes the ring on a thread of its own: make sure it is awake, then let it.
@@ -393,7 +394,8 @@ void RgfxRingWriter::logSleeps(const RgfxRingRoomSleeps &seen) const
 
 bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,
                              uint32_t *out_status,
-                             const std::function<void(uint64_t)> &beforePublish, bool answered)
+                             const std::function<void(uint64_t)> &beforePublish, bool answered,
+                             uint32_t stampAt)
 {
 	if (size < kHeaderBytes || size % kMsgAlign != 0 || size > m_dataSize)
 		return false;
@@ -455,6 +457,11 @@ bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, 
 	m_produced += size;
 	if (beforePublish)
 		beforePublish(seqno);
+	// The message's posted time, the last write before the publish (GUEST_TIMES).
+	if (stampAt != 0 && stampAt % 8 == 0 && stampAt <= size - sizeof(uint64_t)) {
+		const uint64_t now = rgfxGuestClockNs();
+		writeBytes(m_data, offset + stampAt, &now, sizeof(now));
+	}
 
 	storeFence();
 	store64(m_header + kProducer, m_produced);
