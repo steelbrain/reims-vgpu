@@ -55,7 +55,7 @@ use std::sync::LazyLock;
 use ash::vk;
 use metal2vulkan_runtime as rt;
 
-use crate::device_choice::Seen;
+use crate::device_choice::{DrmNodes, Seen};
 
 use super::host_os::{WINDOW_DEVICE_EXTENSIONS, WINDOW_SURFACE_EXTENSIONS, open_loader};
 
@@ -340,7 +340,13 @@ fn probe(entry: &ash::Entry, listed: &[&CStr]) -> Probed {
             });
         let seen = devices
             .iter()
-            .map(|&device| seen(&instance, device, features2))
+            .zip(&extensions)
+            .map(|(&device, names)| {
+                let drm = names
+                    .iter()
+                    .any(|n| n.as_c_str() == ash::ext::physical_device_drm::NAME);
+                seen(&instance, device, features2, drm)
+            })
             .collect();
         Probed {
             extensions,
@@ -355,12 +361,18 @@ fn probe(entry: &ash::Entry, listed: &[&CStr]) -> Probed {
 
 /// What the library's choice of device reads of `device` ([`Seen`]): its properties, its
 /// largest device-local heap, whether a queue family does graphics and compute work, and its UUID,
-/// read where the instance (`properties2`) and the device are at Vulkan 1.1 or later.
+/// read where the instance (`properties2`) and the device are at Vulkan 1.1 or later, and its DRM
+/// nodes where it also lists `VK_EXT_physical_device_drm` (`drm`).
 ///
 /// # Safety
 ///
 /// `device` is a physical device `instance` lists, and `instance` is live.
-unsafe fn seen(instance: &ash::Instance, device: vk::PhysicalDevice, properties2: bool) -> Seen {
+unsafe fn seen(
+    instance: &ash::Instance,
+    device: vk::PhysicalDevice,
+    properties2: bool,
+    drm: bool,
+) -> Seen {
     // SAFETY: the caller's.
     let (properties, memory, families) = unsafe {
         (
@@ -376,6 +388,31 @@ unsafe fn seen(instance: &ash::Instance, device: vk::PhysicalDevice, properties2
         // the structure is core.
         unsafe { instance.get_physical_device_properties2(device, &mut asked) };
         id.device_uuid
+    });
+    let drm = (drm && properties2 && properties.api_version >= vk::API_VERSION_1_1).then(|| {
+        let mut nodes = vk::PhysicalDeviceDrmPropertiesEXT::default();
+        let mut asked = vk::PhysicalDeviceProperties2::default().push_next(&mut nodes);
+        // SAFETY: the caller's; the device lists the extension whose structure this is.
+        unsafe { instance.get_physical_device_properties2(device, &mut asked) };
+        let node = |has: vk::Bool32, major: i64, minor: i64| {
+            (has == vk::TRUE).then(|| (u32::try_from(major).ok(), u32::try_from(minor).ok()))
+        };
+        let pair = |n: Option<(Option<u32>, Option<u32>)>| match n {
+            Some((Some(a), Some(b))) => Some((a, b)),
+            _ => None,
+        };
+        DrmNodes {
+            primary: pair(node(
+                nodes.has_primary,
+                nodes.primary_major,
+                nodes.primary_minor,
+            )),
+            render: pair(node(
+                nodes.has_render,
+                nodes.render_major,
+                nodes.render_minor,
+            )),
+        }
     });
     let work = vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE;
     Seen {
@@ -397,6 +434,7 @@ unsafe fn seen(instance: &ash::Instance, device: vk::PhysicalDevice, properties2
             .max()
             .unwrap_or(0),
         uuid,
+        drm,
     }
 }
 

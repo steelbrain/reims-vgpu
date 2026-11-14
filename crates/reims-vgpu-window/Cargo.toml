@@ -19,6 +19,8 @@ reims-vgpu-vulkan.workspace = true
 # The window on Linux (`sdl`): SDL3 for the window, its input and its Vulkan surface.
 [target.'cfg(target_os = "linux")'.dependencies]
 sdl3-sys.workspace = true
+# libwayland-client's calls, looked up in the library SDL opened (`native/linux/feedback.rs`).
+libc.workspace = true
 
 [features]
 default = ["macos-sdl"]

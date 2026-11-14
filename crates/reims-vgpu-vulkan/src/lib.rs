@@ -29,7 +29,7 @@ pub mod answer;
 pub mod api;
 pub(crate) mod awake;
 pub mod core;
-pub(crate) mod device_choice;
+pub mod device_choice;
 pub mod exit_gate;
 pub(crate) mod generation;
 pub mod gpu;

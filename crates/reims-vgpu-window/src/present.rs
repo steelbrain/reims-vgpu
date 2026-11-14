@@ -104,6 +104,14 @@ pub trait VulkanTarget {
         get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
         instance: vk::Instance,
     ) -> Option<vk::SurfaceKHR>;
+
+    /// The GPU the host's compositor composites the window on, as its DRM node's major and minor
+    /// numbers: on Linux under Wayland the main device of the window's surface's dma-buf feedback
+    /// (`native/linux/feedback.rs`). `None` where the window system does not say, as on X11 and
+    /// macOS: the window then presents from the runtime's own GPU.
+    fn compositor_device(&self) -> Option<(u32, u32)> {
+        None
+    }
 }
 
 /// A render thread's presenter, made of the sink at the first draw and made again after one ends,

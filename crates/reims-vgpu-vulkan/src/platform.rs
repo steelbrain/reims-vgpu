@@ -148,6 +148,32 @@ impl VulkanPlatform {
         }
     }
 
+    /// The registry ID of the process's default device, as the runtime answers it, which
+    /// [`crate::device_choice::compositor_gpu`] tells the compositor's GPU from: `None` where it
+    /// has none.
+    pub fn default_device_registry_id() -> Option<u64> {
+        default_device_registry_id()
+    }
+
+    /// A device of a window's own on the GPU of registry ID `registry_id` (the compositor's,
+    /// [`crate::device_choice::CompositorGpu::Other`]), apart from the process's default device
+    /// the guest's work runs on, which it shares no object with ([`device::window_device`]).
+    /// `None` where the runtime refuses it, logged: the window then presents from the default
+    /// device.
+    pub fn window_device(registry_id: u64) -> Option<VulkanDevice> {
+        match rt::Device::with_registry_id(registry_id, device_options()) {
+            Ok(raw) => Some(device::window_device(raw)),
+            Err(e) => {
+                log::warn!(
+                    target: "reims_vgpu_vulkan::device",
+                    "the runtime refused a window's device on registry ID {registry_id:#x} \
+                     ({e}): the window presents from the default device"
+                );
+                None
+            }
+        }
+    }
+
     /// The process's default device (`MTLCreateSystemDefaultDevice`, [`default_device`]): `None`
     /// where the runtime finds no Vulkan device it can use, or no Vulkan loader. Any other
     /// refusal dies here, naming it ([`made_devices`]).

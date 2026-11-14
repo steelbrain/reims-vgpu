@@ -74,6 +74,12 @@ impl VulkanTarget for Target {
             None
         }
     }
+
+    /// The main device of the dma-buf feedback of SDL's window's Wayland surface (`feedback`).
+    fn compositor_device(&self) -> Option<(u32, u32)> {
+        // SAFETY: the window lives while the render thread holds the target (above).
+        unsafe { super::feedback::main_device_of(self.0) }
+    }
 }
 
 /// What the render thread draws with, shared with the window and the UI thread.

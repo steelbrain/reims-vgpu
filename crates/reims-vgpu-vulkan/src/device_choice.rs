@@ -95,6 +95,63 @@ pub(crate) struct Seen {
     /// `VkPhysicalDeviceIDProperties::deviceUUID`; `None` where there is none to read (below
     /// Vulkan 1.1).
     pub(crate) uuid: Option<[u8; 16]>,
+    /// Its DRM nodes (`VK_EXT_physical_device_drm`); `None` where it does not list the extension.
+    pub(crate) drm: Option<DrmNodes>,
+}
+
+/// A physical device's DRM nodes, by major and minor number (`VkPhysicalDeviceDrmPropertiesEXT`):
+/// what a window system names a GPU by ([`compositor_gpu`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DrmNodes {
+    /// Its primary node, where it has one.
+    pub(crate) primary: Option<(u32, u32)>,
+    /// Its render node, where it has one.
+    pub(crate) render: Option<(u32, u32)>,
+}
+
+impl DrmNodes {
+    /// Whether `node` is one of these.
+    fn names(&self, node: (u32, u32)) -> bool {
+        self.primary == Some(node) || self.render == Some(node)
+    }
+}
+
+/// The GPU a window's compositor composites on, against the runtime's own
+/// ([`compositor_gpu`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompositorGpu {
+    /// The runtime's own GPU, or none the probe can tell: the window presents from the
+    /// runtime's device, as on a host of one GPU.
+    Own,
+    /// Another GPU the runtime makes devices of, by its registry ID: the window may present
+    /// from a device of its own there.
+    Other(u64),
+}
+
+/// The GPU the compositor that names DRM node `node` composites on, by what the probe read of
+/// each physical device (`crate::os`'s `seen_devices`), against `own`, the registry
+/// ID of the runtime's default device: [`CompositorGpu::Other`] only where `node` is a node of a
+/// candidate (the module doc's) with a registry ID that is not `own`. Every other answer is
+/// [`CompositorGpu::Own`]: no device lists the node (none lists `VK_EXT_physical_device_drm`, or
+/// the node is a GPU the runtime cannot use), or it is the runtime's own.
+pub fn compositor_gpu(node: (u32, u32), own: Option<u64>) -> CompositorGpu {
+    compositor_gpu_of(crate::os::seen_devices(), node, own, Seen::registry_id)
+}
+
+/// [`compositor_gpu`] of the devices `seen`, their registry IDs as `registry_id` answers them.
+fn compositor_gpu_of(
+    seen: &[Seen],
+    node: (u32, u32),
+    own: Option<u64>,
+    registry_id: impl Fn(&Seen) -> Option<u64>,
+) -> CompositorGpu {
+    let listed = (seen.iter())
+        .filter(|s| s.candidate() && s.drm.is_some_and(|d| d.names(node)))
+        .find_map(&registry_id);
+    match listed {
+        Some(id) if Some(id) != own => CompositorGpu::Other(id),
+        _ => CompositorGpu::Own,
+    }
 }
 
 impl Seen {
@@ -411,7 +468,70 @@ pub(crate) mod tests {
             graphics_compute: true,
             device_local,
             uuid: Some(std::array::from_fn(|i| if i == 0 { id } else { 0 })),
+            drm: None,
         }
+    }
+
+    /// `seen` with DRM nodes `card` (primary) and `render`.
+    fn with_nodes(seen: Seen, card: u32, render: u32) -> Seen {
+        Seen {
+            drm: Some(DrmNodes {
+                primary: Some((226, card)),
+                render: Some((226, render)),
+            }),
+            ..seen
+        }
+    }
+
+    /// The compositor's GPU is another only where a candidate other than the runtime's own lists
+    /// the node it names, primary or render; a node no device lists, the runtime's own node, and a
+    /// device the runtime cannot make all answer the runtime's own GPU
+    #[test]
+    fn the_compositors_gpu_is_another_only_where_a_candidate_lists_its_node() {
+        let id = |s: &Seen| s.uuid.map(|u| u64::from(u[0]));
+        let list = [
+            with_nodes(discrete(24, 1), 0, 128),
+            with_nodes(integrated(2, 2), 1, 129),
+        ];
+        // The runtime on the discrete GPU, the compositor on the integrated one.
+        assert_eq!(
+            compositor_gpu_of(&list, (226, 129), Some(1), id),
+            CompositorGpu::Other(2)
+        );
+        assert_eq!(
+            compositor_gpu_of(&list, (226, 1), Some(1), id),
+            CompositorGpu::Other(2)
+        );
+        // The compositor on the runtime's own GPU.
+        assert_eq!(
+            compositor_gpu_of(&list, (226, 128), Some(1), id),
+            CompositorGpu::Own
+        );
+        assert_eq!(
+            compositor_gpu_of(&list, (226, 0), Some(1), id),
+            CompositorGpu::Own
+        );
+        // A node no device lists.
+        assert_eq!(
+            compositor_gpu_of(&list, (226, 130), Some(1), id),
+            CompositorGpu::Own
+        );
+        // No device lists its nodes (no `VK_EXT_physical_device_drm`).
+        let bare = [discrete(24, 1), integrated(2, 2)];
+        assert_eq!(
+            compositor_gpu_of(&bare, (226, 129), Some(1), id),
+            CompositorGpu::Own
+        );
+        // A device the runtime cannot make.
+        let old = Seen {
+            api_version: vk::API_VERSION_1_1,
+            ..with_nodes(integrated(2, 2), 1, 129)
+        };
+        let list = [with_nodes(discrete(24, 1), 0, 128), old];
+        assert_eq!(
+            compositor_gpu_of(&list, (226, 129), Some(1), id),
+            CompositorGpu::Own
+        );
     }
 
     pub(crate) fn integrated(gib: u64, id: u8) -> Seen {

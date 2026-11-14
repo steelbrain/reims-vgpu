@@ -7,6 +7,7 @@
 //! the window's opening, changes and end, posted to the UI thread, and the host's screens as SDL
 //! lists them.
 
+mod feedback;
 mod input;
 mod keymap;
 mod render;

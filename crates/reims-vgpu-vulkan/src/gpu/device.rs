@@ -390,6 +390,25 @@ pub fn adopt(raw: rt::Device) -> VulkanDevice {
     made
 }
 
+/// A device of a window's own over `raw`, a runtime device of another GPU than the process's
+/// default device's (`VulkanPlatform::window_device`): not adopted, so no open of the process
+/// answers it, and none of what an adopted device starts runs on it (the guest's texture IDs,
+/// the answers of the process's placement, the imports' probe, its records, work log and checks
+/// of textures over host pages). The window that made it draws on it alone, and it goes with
+/// its last handle.
+pub fn window_device(raw: rt::Device) -> VulkanDevice {
+    let id = raw.registry_id();
+    Obj::new(DeviceObject {
+        awake: crate::awake::Awake::start(&raw),
+        raw,
+        registry_id: id,
+        caps: OnceLock::new(),
+        threads: crate::let_go::DeviceThreads::default(),
+        rows_pitches: Mutex::default(),
+        guest_texture_ids: None,
+    })
+}
+
 /// Reserves the guest's texture resource IDs on `raw` where the process declared them
 /// (`crate::platform::present_guest_texture_ids`), the device's first call, before the library's
 /// own work on it makes a command queue or a texture ([`adopt`]): the IDs it reserved, or `None`
