@@ -37,7 +37,7 @@
 //! host's addresses with no mapping of its own. The host changes those without the library: no call
 //! of the C API tells it, and Metal needs none. The only no-copy buffers at those addresses are
 //! those under a surface whose base address lies in the guest's pages it was made over
-//! ([`crate::os::base_in_pages`]: one over a single page; one over several pages, a range each, has
+//! (`os::surface::base_in_pages`: one over a single page; one over several pages, a range each, has
 //! a mapping of its own there, measured), at no offset into its allocation and with GPU writes that
 //! reach its memory (the others lie over an alias): one made after the host replaced the pages lies
 //! in a live one's import, over the old pages, and what Metal's texture on such a surface reads
