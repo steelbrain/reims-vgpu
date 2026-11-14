@@ -50,6 +50,9 @@ xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework 
 	-framework Foundation -framework IOSurface "$here/oracle_bundle.m" -o "$out/oracle_bundle"
 xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal \
 	-framework Foundation -framework IOKit "$here/oracle_events.m" -o "$out/oracle_events"
+xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal \
+	-framework Foundation "$here/oracle_readonly.m" -o "$out/oracle_readonly"
+cp "$here/oracle_readonly.sh" "$out/"
 for m in oracle_bundle oracle_bundle_mesh oracle_bundle_rt oracle_bundle_args; do
 	xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 "$here/$m.metal" \
 		-o "$out/$m.metallib" || echo "oracle_bundle: $m.metallib not built"
