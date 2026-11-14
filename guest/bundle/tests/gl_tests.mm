@@ -1686,6 +1686,40 @@ void test_stage_in_specialized()
 		for (const RgfxGLStageIn &c : changed)
 			CHECK(c.key() != heaven.key());
 	}
+	// The kernel's reflection lists its stage input region's built-ins as Metal does (measured:
+	// built-in types 15 and 16, of uint2, on the M3 Max under macOS 27.0.1 and the AMD Radeon Pro
+	// 5300M and the Intel UHD Graphics 630 under macOS 26.7.1; m3-max-30339 to 30341).
+	{
+		auto builtIn = [](uint32_t position, const char *kind, const char *name) {
+			RgfxAirNode n;
+			n.hasPosition = true;
+			n.position = position;
+			n.kind = kind;
+			n.typeName = "uint2";
+			n.name = name;
+			return n;
+		};
+		RgfxAirEntries module;
+		RgfxAirEntry entry;
+		entry.name = "__main";
+		entry.stage = RgfxAirEntryStage::Kernel;
+		entry.arguments = {builtIn(0, "air.stage_in_grid_origin", "grid_origin"),
+		                   builtIn(1, "air.stage_in_grid_size", "grid_size"),
+		                   builtIn(2, "air.thread_position_in_grid", "thread_position_in_grid")};
+		module.entries = {entry};
+		RgfxStageReflection stage;
+		NSString *reason = nil;
+		CHECK(RgfxStageReflectionOfEntry(module, module.entries[0], nullptr, 0, @"stageInBuffer", {}, stage, &reason,
+		                                 true));
+		NSArray *builtIns = [RgfxComputePipelineReflectionMake(stage, &reason) valueForKey:@"builtInArguments"];
+		CHECK(builtIns.count == 3);
+		if (builtIns.count == 3) {
+			const NSUInteger kTypes[] = {15, 16, 5};
+			for (NSUInteger i = 0; i < 3; i++)
+				CHECK([[builtIns[i] valueForKey:@"builtInType"] unsignedIntegerValue] == kTypes[i] &&
+				      [[builtIns[i] valueForKey:@"builtInDataType"] unsignedIntegerValue] == MTLDataTypeUInt2);
+		}
+	}
 	// A function RgfxGLFunction made no control point kernel of.
 	{
 		id<MTLFunction> kernel = (id<MTLFunction>)[NSNull null];

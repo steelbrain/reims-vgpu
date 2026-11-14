@@ -152,6 +152,12 @@ const struct {
     // and the M3 Max under macOS 27.0.1).
     {"air.patch_id", 13},
     {"air.position_in_patch", 14},
+    // A kernel's stage input region (measured: a kernel of air.stage_in_grid_origin and
+    // air.stage_in_grid_size, both uint2, its pipeline made with no stage input descriptor, on the
+    // M3 Max under macOS 27.0.1 and the AMD Radeon Pro 5300M and the Intel UHD Graphics 630 under
+    // macOS 26.7.1: data type 34, m3-max-30339, m3-max-30340 and m3-max-30341).
+    {"air.stage_in_grid_origin", 15},
+    {"air.stage_in_grid_size", 16},
     {"air.simdgroup_index_in_threadgroup", 0},
     {"air.simdgroups_per_threadgroup", 0},
     {"air.quadgroup_index_in_threadgroup", 0},
