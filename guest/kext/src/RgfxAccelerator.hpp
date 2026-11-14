@@ -376,7 +376,8 @@ public:
 	// The framebuffer on our PCI device (ReimsGraphics), retained for the caller, or nullptr
 	// before it is attached. A lookup that finds it names this accelerator on it by its path as
 	// it stands (IOAccelTypes), as a display pipe's accelerator does; the first that finds it
-	// started keeps it, and the lookups after take the kept one while it runs.
+	// started keeps it, and the lookups after take the kept one while it has started and is not
+	// terminated, else look it up again (RgfxKeptService.hpp).
 	ReimsGraphics *copyFramebuffer();
 	// Whether that framebuffer has started (ReimsGraphics::hasStarted): before, and once its stop
 	// has begun, the device holds nothing of any context, and no message of one reaches it.

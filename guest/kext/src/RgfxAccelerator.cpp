@@ -21,6 +21,7 @@
 #include "RgfxBundlePaths.hpp"
 #include "RgfxFeatures.hpp"
 #include "RgfxIOSurfaceKPI.hpp"
+#include "RgfxKeptService.hpp"
 #include "RgfxPciClass.hpp"
 #include "RgfxRegionMapping.hpp"
 #include "RgfxSurfaceLimits.hpp"
@@ -33,11 +34,17 @@ OSDefineMetaClassAndStructors(RgfxAccelerator, IOAccelerator);
 
 namespace {
 // The started framebuffer copyFramebuffer found, retained, under keptLock (made at the
-// accelerator's start): one accelerator per device, one device per guest, as the contexts' state
-// (RgfxAcceleratorContexts.cpp), and kept out of the class, whose layout stays as the loader's
-// sites were taken from (RgfxAccelerator.hpp).
+// accelerator's start), handed out while it is live (RgfxKeptService.hpp): one accelerator per
+// device, one device per guest, as the contexts' state (RgfxAcceleratorContexts.cpp), and kept out
+// of the class, whose layout stays as the loader's sites were taken from (RgfxAccelerator.hpp).
 IOLock *keptLock = nullptr;
 ReimsGraphics *keptFramebuffer = nullptr;
+
+// A framebuffer is live while it has started and its termination has not begun.
+struct KeptOps {
+	bool live(ReimsGraphics *fb) { return fb->hasStarted() && !fb->isInactive(); }
+	void retain(ReimsGraphics *fb) { fb->retain(); }
+};
 } // namespace
 
 // MARK: - The bundle
@@ -677,20 +684,16 @@ IOReturn RgfxAccelerator::newSurface(task_t owningTask, void *securityID, UInt32
 
 ReimsGraphics *RgfxAccelerator::copyFramebuffer()
 {
-	// The one kept, while it runs: a lookup walks the PCI device's clients and builds this
+	// The one kept, while it is live: a lookup walks the PCI device's clients and builds this
 	// accelerator's path under the registry's lock, which every message the kext posts paid for.
+	// One that stopped or was terminated is let go, and the lookup made again (RgfxKeptService.hpp).
+	KeptOps ops;
 	if (keptLock) {
-		ReimsGraphics *kept = nullptr, *stopped = nullptr;
+		ReimsGraphics *dropped = nullptr;
 		IOLockLock(keptLock);
-		if (keptFramebuffer && !keptFramebuffer->hasStarted()) {
-			stopped = keptFramebuffer;
-			keptFramebuffer = nullptr;
-		} else if (keptFramebuffer) {
-			kept = keptFramebuffer;
-			kept->retain();
-		}
+		ReimsGraphics *kept = rgfxKeptTake(keptFramebuffer, ops, &dropped);
 		IOLockUnlock(keptLock);
-		OSSafeReleaseNULL(stopped);
+		OSSafeReleaseNULL(dropped);
 		if (kept)
 			return kept;
 	}
@@ -720,14 +723,11 @@ ReimsGraphics *RgfxAccelerator::copyFramebuffer()
 				found->setProperty("IOAccelTypes", path);
 		}
 	}
-	// Kept once it has started, as named: the rename is this accelerator's own, at its start,
-	// before any lookup (nameProviderForVideo), so the path stays as it stands now.
-	if (found && found->hasStarted() && keptLock) {
+	// Kept once it is live, as named: the rename is this accelerator's own, at its start, before
+	// any lookup (nameProviderForVideo), so the path stays as it stands now.
+	if (found && keptLock) {
 		IOLockLock(keptLock);
-		if (!keptFramebuffer) {
-			found->retain();
-			keptFramebuffer = found;
-		}
+		rgfxKeptOffer(keptFramebuffer, ops, found);
 		IOLockUnlock(keptLock);
 	}
 	return found;
