@@ -114,16 +114,21 @@
 //! - **How Metal's GPU fails a command buffer for what its encoders did** is injected at its
 //!   commit ([`rt::CommandBuffer::commit_failed`]): Metal's code, the first encoder that runs
 //!   nothing, every one after it running nothing too, and whether its event signals fire
-//!   ([`Failing`]). Measured on the M3 Max (macOS 26.7), `setProtectionOptions:` is kept here,
-//!   as the runtime has no protected content ([`CommandBufferObject::made_encoder`]). An encoder
-//!   made under options other than 0 runs nothing, nor does any after it, and fails the command
-//!   buffer with code 16 ("Protection Violation") below 0x10 and `MTLCommandBufferErrorInternal`
-//!   ("Invalid Input") from 0x10 up, none of its signals firing; options from 0x10 up fail it so
-//!   with no encoder made under them too, every encoder running. An encoder made before the
-//!   options runs. Under 1, 3 and 7 a compute or render encoder's creation, and a blit encoder's
-//!   first command, die, as Metal ends the process there. A protection failure reaches no later
-//!   command buffer: one committed on its queue while it is in flight runs, on Metal (measured
-//!   alike) as here.
+//!   ([`Failing`]). Measured on the M3 Max (macOS 26.7 and 27.0.1), `setProtectionOptions:` is
+//!   kept here, as the runtime has no protected content ([`CommandBufferObject::made_encoder`]).
+//!   An encoder made under options other than 0 runs nothing, nor does any after it, and fails
+//!   the command buffer with code 16 ("Protection Violation") below 0x10 and
+//!   `MTLCommandBufferErrorInternal` ("Invalid Input") from 0x10 up; the event signals encoded
+//!   before it fire, and none after it, so this platform sends none encoded after it
+//!   ([`CommandBufferObject::withholds_signals`]). Options from 0x10 up fail it so with no
+//!   encoder made under them too, every encoder running and every signal firing. An encoder made
+//!   before the options runs. The dGPU oracle (macOS 26.7.1, dgpu-oracle.md Q39) answers code 16
+//!   at 0x10 too, and completes a command buffer whose options no encoder was made under; its
+//!   AMD 5300M runs and signals as the M3 Max does, and its Intel UHD 630 runs every encoder and
+//!   fires every signal. Under 1, 3 and 7 a compute or render encoder's creation, and a blit
+//!   encoder's first command, die, as Metal ends the process there. A protection failure reaches
+//!   no later command buffer: one committed on its queue while it is in flight runs, on Metal
+//!   (measured alike) as here.
 //!
 //!   A render encoder's draw of primitive type 9, at which Metal's GPU hangs, faults or fails a
 //!   victim of its recovery, the runtime fails the command buffer at as Metal's GPU does
@@ -136,8 +141,9 @@
 //!   `AccessRevoked` (4), running nothing and signalling nothing, as Metal's
 //!   (`type_9_faults_revoke_queues_as_metals`). Such a draw is told to the command buffer
 //!   ([`CommandBufferObject::fails_at_type_9`]): one that fails another way too, by its own
-//!   encoders, its protection options, or another type-9 draw's other failure, dies at the commit, as do two different ways at once of any
-//!   kind, which nothing measured.
+//!   encoders, its protection options, a store-out's fault or another type-9 draw's failure of
+//!   another code, dies at the commit, as nothing measured it (a type-9 draw hangs the GPU, which
+//!   no probe takes on).
 //!
 //!   At a render pass that stores an attachment into read-only memory the runtime copies, or
 //!   resolves into a texture there (`Store`, `StoreAndMultisampleResolve`, a depth attachment's
@@ -149,10 +155,14 @@
 //!   m3-max-29309), and the runtime faults it so itself
 //!   (`MTLCommandBufferErrorPageFault`, 3; the runtime's `store_out.rs`): its render encoder and
 //!   every encoder after it run nothing and every event signal fires, as a type-9 draw's page
-//!   fault does. Which encoders before the pass run is not measured for this fault. Such a pass
-//!   is told to the command buffer as a failure the runtime makes
-//!   ([`CommandBufferObject::faults_at_read_only_store`]), so one that fails another way too dies
-//!   at the commit, as above. The fault counts against its queue as every page fault does: the
+//!   fault does: the M3 Max runs the encoder after the faulting pass in 11 runs of 18 and not in
+//!   7, and fires every signal (dgpu-oracle.md Q39). Which encoders before the pass run is not
+//!   measured for this fault. Such a pass is told to the command buffer as a failure the runtime
+//!   makes ([`CommandBufferObject::faults_at_read_only_store`]). Beside a failure of its own, by
+//!   its protection options, the command buffer fails as that failure says, its code and its
+//!   signals, as the M3 Max's does whether the options came before the pass, after it or after
+//!   every encoder (Q39; the x86 Macs, whose GPU stores into such memory, fail it so too); beside
+//!   a type-9 draw's failure of another code it dies at the commit, as above. The fault counts against its queue as every page fault does: the
 //!   command buffers committed after it on the same queue, at once or 100 ms on, and on a new
 //!   queue run, and the queue's second fault revokes it, every later command buffer of that queue
 //!   failing with `AccessRevoked` (4), as Metal's (measured on the M3 Max, macOS 27.0.1, plain
@@ -239,11 +249,13 @@ pub struct CommandBufferObject {
     /// How Metal's GPU fails it for what its encoders did ([`Failing`]), which its commit fails
     /// it with ([`CommandBufferObject::failure`]).
     failing: Mutex<Vec<Failing>>,
-    /// How Metal's GPU fails it where the runtime fails it so itself: at its draws of primitive
-    /// type 9 ([`CommandBufferObject::fails_at_type_9`]) and at its render passes' stores into
-    /// read-only memory the runtime copies
-    /// ([`CommandBufferObject::faults_at_read_only_store`]).
+    /// How Metal's GPU fails it where the runtime fails it so itself at its draws of primitive
+    /// type 9 ([`CommandBufferObject::fails_at_type_9`]).
     by_runtime: Mutex<Vec<Failing>>,
+    /// How Metal's GPU faults it where the runtime faults it so itself at its render passes'
+    /// stores into read-only memory the runtime copies
+    /// ([`CommandBufferObject::faults_at_read_only_store`]).
+    stores: Mutex<Vec<Failing>>,
     /// The protection options `setProtectionOptions:` set, which the runtime does not hold.
     protection: Mutex<Protection>,
     /// Whether it carries the submission handler that takes Metal's allocation for its work for
@@ -302,7 +314,13 @@ pub(crate) struct Failing {
     pub code: u64,
     /// The first encoder that runs nothing, in the order the runtime ended them.
     pub from: usize,
-    /// Whether its event signals fire.
+    /// Whether the event signals encoded after its first failing encoder fire: true at a GPU
+    /// fault or hang, where every signal fires; false for an encoder made under protection
+    /// options, after which none fires, those encoded before it firing (dgpu-oracle.md Q39). The
+    /// runtime drops every signal of an injected failure whose signals do not fire
+    /// ([`rt::CommitFailure::signals`]), so this platform sends none encoded after such an
+    /// encoder ([`CommandBufferObject::withholds_signals`]) and injects the failure with its
+    /// signals firing.
     pub signals: bool,
 }
 
@@ -394,6 +412,7 @@ impl CommandBufferObject {
             self.open_encoders.load(Ordering::SeqCst) == 0
                 && self.failing.lock().is_empty()
                 && self.by_runtime.lock().is_empty()
+                && self.stores.lock().is_empty()
                 && {
                     let protection = self.protection.lock();
                     protection.options == 0 && !protection.used
@@ -411,13 +430,22 @@ impl CommandBufferObject {
         self.failing.lock().push(failing);
     }
 
+    /// Whether it sends no more event signals: one of its encoders fails it with signals that do
+    /// not fire after it ([`Failing::signals`]), as an encoder made under protection options does,
+    /// after which Metal's GPU fires none of its signals (the M3 Max and the AMD 5300M; the Intel
+    /// UHD 630 fires them all; dgpu-oracle.md Q39). Those encoded before it fire.
+    fn withholds_signals(&self) -> bool {
+        plain(|| self.failing.lock().iter().any(|f| !f.signals))
+    }
+
     /// Records that the render pass at `from`, in the order the runtime ended its encoders, stores
     /// an attachment into read-only memory the runtime copies, at which Metal's GPU faults it from
     /// that pass on, its event signals firing, as the runtime faults it itself (the module docs):
-    /// its commit dies where it fails another way too ([`CommandBufferObject::failure`]).
+    /// a failure of its own, by its protection options, stands beside the fault, and its commit
+    /// dies where a type-9 draw fails it another way too ([`CommandBufferObject::failure`]).
     pub(crate) fn faults_at_read_only_store(&self, from: usize) {
         plain(|| {
-            self.by_runtime.lock().push(Failing {
+            self.stores.lock().push(Failing {
                 code: rt::CommandBufferError::PageFault.metal_code(),
                 from,
                 signals: true,
@@ -458,11 +486,21 @@ impl CommandBufferObject {
 
     /// How Metal's GPU fails it, at its commit (`sel`): what its encoders did ([`Failing`]),
     /// and protection options with a bit from 0x10 up, which fail it with [`INVALID_INPUT`]
-    /// though no encoder was made under them (measured), all of its encoders running; `None`
-    /// where nothing does, or only the failures the runtime makes itself, at its draws of
-    /// primitive type 9 ([`CommandBufferObject::fails_at_type_9`]) and its passes' stores into
-    /// read-only memory ([`CommandBufferObject::faults_at_read_only_store`]). Two different ways
-    /// at once, which nothing measured, die. The encoders it fails are always
+    /// though no encoder was made under them, all of its encoders running and every event signal
+    /// firing (measured on the M3 Max; dgpu-oracle.md Q39); `None` where nothing does, or only
+    /// the failures the runtime makes itself, at its draws of primitive type 9
+    /// ([`CommandBufferObject::fails_at_type_9`]) and its passes' stores into read-only memory
+    /// ([`CommandBufferObject::faults_at_read_only_store`]). Its event signals fire, but those
+    /// it never sent ([`CommandBufferObject::withholds_signals`]).
+    ///
+    /// A store-out's fault beside a failure of its own is answered by the latter, as Metal's GPU
+    /// answers it: its code and its signals, the encoders from its first failing one running
+    /// nothing, and from the faulting pass too, as the runtime runs nothing after it (the M3 Max
+    /// runs an encoder after the faulting pass in 11 runs of 18, alone and beside options set
+    /// after every encoder; dgpu-oracle.md Q39). The x86 Macs, whose GPU writes bit-24 memory,
+    /// answer the failure of its own alone. Two different ways at once that nothing measured
+    /// die: a type-9 draw's failure beside one of its own, or beside a type-9 failure or a
+    /// store-out's fault of another code. The encoders it fails are always
     /// [`rt::FailedEncoders::From`] the first that runs nothing, never a `Set`.
     ///
     /// A command buffer that fails so is never cut into parts ([`CommandBufferObject::splits`]),
@@ -474,33 +512,41 @@ impl CommandBufferObject {
     /// encoders the runtime records with it; the encoders before it run all the same
     /// (`protection_options_fail_compute_encoders_from_the_one_made_under_them`).
     fn failure(&self, sel: &'static str) -> Option<rt::CommitFailure> {
-        let mut ways = plain(|| self.failing.lock().clone());
-        let options = plain(|| self.protection.lock().options);
-        if protection_code(options) == INVALID_INPUT {
-            ways.push(Failing {
+        let mut own = plain(|| self.failing.lock().clone());
+        let protection = plain(|| *self.protection.lock());
+        // No encoder fails, and no signal follows the first that runs nothing.
+        if protection_code(protection.options) == INVALID_INPUT && !protection.used {
+            own.push(Failing {
                 code: INVALID_INPUT,
                 from: self.made.load(Ordering::SeqCst),
                 signals: false,
             });
         }
-        let own = ways.len();
-        ways.extend(plain(|| self.by_runtime.lock().clone()));
-        let first = *ways.first()?;
-        if ways
-            .iter()
-            .any(|w| (w.code, w.signals) != (first.code, first.signals))
-        {
+        let nines = plain(|| self.by_runtime.lock().clone());
+        let stores = plain(|| self.stores.lock().clone());
+        let by_runtime: Vec<Failing> = nines.iter().chain(&stores).copied().collect();
+        let differ = |ways: &[Failing]| {
+            ways.first().is_some_and(|f| {
+                ways.iter()
+                    .any(|w| (w.code, w.signals) != (f.code, f.signals))
+            })
+        };
+        if (!own.is_empty() && !nines.is_empty()) || (own.is_empty() && differ(&by_runtime)) {
+            let mut ways = own.clone();
+            ways.extend(by_runtime);
             unrepresentable(
                 sel,
-                &format!("a command buffer Metal's GPU fails in more than one way: {ways:?}"),
+                &format!(
+                    "a command buffer Metal's GPU fails in more than one way, which nothing \
+                     measured: {ways:?}"
+                ),
             );
         }
-        ways.truncate(own);
-        let first = *ways.first()?;
+        let first = *own.first()?;
         let mut failure = rt::CommitFailure::new(first.code);
-        let from = ways.iter().map(|w| w.from).min().unwrap_or(first.from);
+        let from = own.iter().map(|w| w.from).min().unwrap_or(first.from);
         failure.encoders = rt::FailedEncoders::From(from);
-        failure.signals = first.signals;
+        failure.signals = true;
         Some(failure)
     }
 
@@ -514,7 +560,10 @@ impl CommandBufferObject {
             Some(rt::FailedEncoders::From(from)) => Some(*from),
             _ => None,
         };
-        let by_runtime = plain(|| self.by_runtime.lock().iter().map(|w| w.from).min());
+        let by_runtime = plain(|| {
+            let (nines, stores) = (self.by_runtime.lock(), self.stores.lock());
+            nines.iter().chain(stores.iter()).map(|w| w.from).min()
+        });
         own.into_iter().chain(by_runtime).min()
     }
 
@@ -928,6 +977,7 @@ impl CommandQueue<VulkanPlatform> for VulkanCommandQueue {
             made: AtomicUsize::new(0),
             failing: Mutex::new(Vec::new()),
             by_runtime: Mutex::new(Vec::new()),
+            stores: Mutex::new(Vec::new()),
             protection: Mutex::new(Protection::default()),
             tiler: AtomicBool::new(false),
             executions: Mutex::new(Vec::new()),
@@ -1417,6 +1467,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
             made: AtomicUsize::new(0),
             failing: Mutex::new(Vec::new()),
             by_runtime: Mutex::new(Vec::new()),
+            stores: Mutex::new(Vec::new()),
             protection: Mutex::new(Protection::default()),
             tiler: AtomicBool::new(false),
             executions: Mutex::new(Vec::new()),
@@ -1426,6 +1477,9 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         Ok(Some(next))
     }
 
+    /// The runtime's, but once an encoder made under protection options failed it, after which
+    /// Metal's GPU fires none of its signals: then sent nowhere
+    /// ([`CommandBufferObject::withholds_signals`]).
     fn encode_signal(
         &self,
         event: Option<EventRef<'_, VulkanPlatform>>,
@@ -1434,10 +1488,14 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         let sel = "encodeSignalEvent:value:";
         // evsig: command buffer, event, value
         trace_event("evsig", &self.raw, event.as_ref(), value);
+        let withheld = self.withholds_signals();
         encoding(sel, Policy::Dies, || {
             let event = self::event(sel, event);
             predication::boundary(&self.predication, sel);
-            self.raw.encode_signal_event(event, value)
+            match withheld {
+                true => Ok(()),
+                false => self.raw.encode_signal_event(event, value),
+            }
         })
     }
 
@@ -2643,16 +2701,18 @@ mod tests {
 
     /// Protection options fail a command buffer as Metal's GPU does: an encoder made under
     /// options below 0x10 runs nothing and fails it with code 16, one made before them runs,
-    /// and none of its event signals fires; options from 0x10 up fail it with code 1, with an
-    /// encoder or without; options below 0x10 with no encoder under them, or 0 again before
-    /// one, complete it
+    /// and of its event signals those encoded before that encoder fire and none after it;
+    /// options from 0x10 up fail it with code 1, with an encoder or without, every signal firing
+    /// where no encoder was made under them; options below 0x10 with no encoder under them, or 0
+    /// again before one, complete it (the M3 Max, dgpu-oracle.md Q39)
     #[test]
     fn protection_options_fail_command_buffers_as_metals_gpu_does() {
         let d = dev();
         let q = d.new_command_queue().unwrap();
         let cb = buffer(&q);
-        let event = d.new_shared_event().unwrap();
+        let (first, event) = (d.new_shared_event().unwrap(), d.new_shared_event().unwrap());
         let before = filled(&cb, 0x5a);
+        cb.encode_signal(Some(EventRef::Shared(&first)), 3).unwrap();
         cb.set_protection_options(OnFault::Return, 2).unwrap();
         let under = filled(&cb, 0x6b);
         let signal = Some(EventRef::Shared(&event));
@@ -2662,7 +2722,7 @@ mod tests {
             (sixteen(&before), sixteen(&under)),
             (vec![0x5a; 16], vec![0; 16])
         );
-        assert_eq!(event.signaled_value(), 0);
+        assert_eq!((first.signaled_value(), event.signaled_value()), (3, 0));
         for options in [0x10, u64::MAX] {
             let cb = buffer(&q);
             cb.set_protection_options(OnFault::Return, options).unwrap();
@@ -2672,6 +2732,18 @@ mod tests {
             let under = filled(&cb, 0x6b);
             assert_eq!(completed(&cb), (5, Some(1)), "{options:#x}");
             assert_eq!(sixteen(&under), vec![0; 16]);
+            // Set after every encoder: each runs, and each signal fires.
+            let cb = buffer(&q);
+            let event = d.new_shared_event().unwrap();
+            let ran = filled(&cb, 0x5a);
+            cb.encode_signal(Some(EventRef::Shared(&event)), 5).unwrap();
+            cb.set_protection_options(OnFault::Return, options).unwrap();
+            assert_eq!(
+                completed(&cb),
+                (5, Some(1)),
+                "{options:#x}, after every encoder"
+            );
+            assert_eq!((sixteen(&ran), event.signaled_value()), (vec![0x5a; 16], 5));
         }
         let cb = buffer(&q);
         cb.set_protection_options(OnFault::Return, 2).unwrap();
@@ -2839,14 +2911,16 @@ mod tests {
     }
 
     /// A command buffer Metal's GPU fails in one way fails so at its commit, from the first
-    /// encoder that fails; one nothing fails commits as it is, and one only the runtime's own
-    /// failures fail, of one kind (its draws of primitive type 9, its passes' stores into
-    /// read-only memory), is left to the runtime. One it would fail in two, one of the runtime's
-    /// and another of its own or of another kind, dies at its commit, as nothing measured it.
-    /// The first encoder that runs nothing is the first either fails, whose executions are not
-    /// checked
+    /// encoder that fails, every signal it was sent firing; one nothing fails commits as it is,
+    /// and one only the runtime's own failures fail, of one kind (its draws of primitive type 9,
+    /// its passes' stores into read-only memory), is left to the runtime. A store-out's fault
+    /// beside a failure of its own fails it as its own says, as Metal's GPU does
+    /// (dgpu-oracle.md Q39). One it would fail in two ways nothing measured dies at its commit:
+    /// a type-9 draw's failure beside one of its own, or beside a type-9 failure or a store-out's
+    /// fault of another code. The first encoder that runs nothing is the first either fails,
+    /// whose executions are not checked
     #[test]
-    fn a_command_buffer_failing_two_ways_dies_at_its_commit() {
+    fn a_command_buffer_failing_two_ways_is_answered_where_measured() {
         let q = dev().new_command_queue().unwrap();
         let cb = buffer(&q);
         assert!(cb.failure("commit").is_none(), "nothing fails it");
@@ -2861,7 +2935,7 @@ mod tests {
         let failure = cb.failure("commit").unwrap();
         assert_eq!(
             (failure.code, &failure.encoders, failure.signals),
-            (PROTECTION_VIOLATION, &rt::FailedEncoders::From(1), false)
+            (PROTECTION_VIOLATION, &rt::FailedEncoders::From(1), true)
         );
         assert_eq!(cb.runs_nothing_from(Some(&failure)), Some(1));
         let hang = Failing {
@@ -2901,6 +2975,149 @@ mod tests {
         });
         let site = catch_death(|| cb.failure("commit")).unwrap_err();
         assert_eq!(site.file, "commit");
+        // Beside a failure of its own alone, after the pass or before it, its own stands.
+        for (store, own) in [(1, 2), (2, 1)] {
+            let cb = buffer(&q);
+            cb.faults_at_read_only_store(store);
+            cb.fail(Failing {
+                code: PROTECTION_VIOLATION,
+                from: own,
+                signals: false,
+            });
+            let failure = cb.failure("commit").unwrap();
+            assert_eq!(
+                (failure.code, &failure.encoders, failure.signals),
+                (PROTECTION_VIOLATION, &rt::FailedEncoders::From(own), true),
+                "a store-out at {store}, its own failure at {own}"
+            );
+            assert_eq!(cb.runs_nothing_from(Some(&failure)), Some(1));
+        }
+    }
+
+    /// Where protection options are set in a command buffer of [`read_only_store_beside`]:
+    /// before its pass, after it, or after every encoder.
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Options {
+        BeforeThePass,
+        AfterThePass,
+        AfterEveryEncoder,
+    }
+
+    /// What a command buffer of `q` shows that fills a buffer with 0x5a, signals an event, runs a
+    /// pass that clears and stores a colour attachment over a guest's read-only memory (made with
+    /// bit 24, `resource::tests::read_only_buffer`), signals a second event, fills a buffer with
+    /// 0x6b and signals a third, with protection `options` set `at` its place: its status and
+    /// error, each buffer's first byte, each signal's value and whether the pages stayed zeros.
+    #[cfg(target_os = "linux")]
+    fn read_only_store_beside(q: &VulkanCommandQueue, options: u64, at: Options) -> String {
+        use crate::core::platform::Platform as _;
+        use crate::core::platform::descriptor::RenderPassDescriptor as _;
+        use crate::core::platform::os::vm::HostVm as _;
+        use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+        use crate::core::platform::types::ClearColor;
+        use crate::core::platform::values::ColorAttachmentSet;
+        use crate::gpu::resource::tests::{bgra_over, host_bytes_at, read_only_buffer};
+        use crate::os::PAGE;
+        use crate::platform::tests::platform;
+
+        let d = dev();
+        let (ro, pages) = read_only_buffer(1);
+        // `MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget`.
+        let target = bgra_over(&ro, 0x5);
+        let pass = platform().render_pass_descriptor();
+        let attachment = ColorAttachmentSet {
+            texture: Some(Some(&target)),
+            load_action: Some(2),
+            store_action: Some(1),
+            clear_color: Some(ClearColor {
+                red: 1.0,
+                green: 0.5,
+                blue: 0.25,
+                alpha: 1.0,
+            }),
+            ..ColorAttachmentSet::default()
+        };
+        pass.set_color_attachment(OnFault::Die, 0, &attachment)
+            .unwrap();
+        let events: Vec<_> = (0..3).map(|_| d.new_shared_event().unwrap()).collect();
+        let signal = |cb: &VulkanCommandBuffer, i: usize| {
+            let event = Some(EventRef::Shared(&events[i]));
+            cb.encode_signal(event, 1).unwrap();
+        };
+        let protect = |cb: &VulkanCommandBuffer, here: Options| {
+            if at == here {
+                cb.set_protection_options(OnFault::Return, options).unwrap();
+            }
+        };
+        let cb = buffer(q);
+        let before = filled(&cb, 0x5a);
+        signal(&cb, 0);
+        protect(&cb, Options::BeforeThePass);
+        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+        signal(&cb, 1);
+        protect(&cb, Options::AfterThePass);
+        let after = filled(&cb, 0x6b);
+        signal(&cb, 2);
+        protect(&cb, Options::AfterEveryEncoder);
+        let (status, error) = completed(&cb);
+        let zeros = host_bytes_at(pages, 16 * 64).iter().all(|&b| b == 0);
+        let values: Vec<u64> = events.iter().map(|e| e.signaled_value()).collect();
+        let line = format!(
+            "status {status} error {error:?} before {:#x} after {:#x} signals {values:?} zeros \
+             {zeros}",
+            sixteen(&before)[0],
+            sixteen(&after)[0],
+        );
+        drop((pass, target, ro));
+        assert!(
+            crate::remap::VulkanVm::new()
+                .deallocate(pages, PAGE)
+                .is_success()
+        );
+        line
+    }
+
+    /// A pass that stores into a guest's read-only memory, which Metal's GPU faults, beside
+    /// protection options, fails its command buffer as the options say, as the M3 Max's does
+    /// (plain Metal, macOS 27.0.1, dgpu-oracle.md Q39): an encoder made under options below or
+    /// from 0x10 fails it with code 16 or 1, it and every encoder after it running nothing, and
+    /// of the event signals those encoded before it fire, whether the options came after the
+    /// pass or before it, where the pass runs nothing; options from 0x10 set after every encoder
+    /// fail it with code 1, every signal firing, and the encoder after the faulting pass runs
+    /// nothing, as one of Metal's runs does (the M3 Max ran it in 3 of 6). The pages stay zeros.
+    /// Linux's: on macOS the pass goes to Metal
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_read_only_store_beside_protection_options_fails_as_the_options_say() {
+        for (options, at, line) in [
+            (
+                2,
+                Options::AfterThePass,
+                "status 5 error Some(16) before 0x5a after 0x0 signals [1, 1, 0] zeros true",
+            ),
+            (
+                0x10,
+                Options::AfterThePass,
+                "status 5 error Some(1) before 0x5a after 0x0 signals [1, 1, 0] zeros true",
+            ),
+            (
+                2,
+                Options::BeforeThePass,
+                "status 5 error Some(16) before 0x5a after 0x0 signals [1, 0, 0] zeros true",
+            ),
+            (
+                0x10,
+                Options::AfterEveryEncoder,
+                "status 5 error Some(1) before 0x5a after 0x0 signals [1, 1, 1] zeros true",
+            ),
+        ] {
+            // A queue of its own: a queue's second fault revokes it.
+            let q = dev().new_command_queue().unwrap();
+            let what = format!("{options:#x} {at:?}");
+            assert_eq!(read_only_store_beside(&q, options, at), line, "{what}");
+        }
     }
 
     /// While an encoder is open, what Metal asserts at dies whatever the handler: another
