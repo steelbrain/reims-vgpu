@@ -59,10 +59,16 @@ struct Failure {
 // address, the modifier for an arm64e signature and the base for a branch
 // displacement. The two coincide in the running consumer; a coalesced image
 // (arm64e) resolves both through its segment map, so neither is loadAddress +
-// offset. The caller must also check segment permissions and lifetime.
-template <typename Resolve, typename Read, typename Sign>
+// offset. island(destination) is the address of a branch island that jumps to
+// destination, one already written or one reserved for this plan, or 0 when
+// none is free. plan asks for one only for a branch whose target lies beyond
+// its 32-bit displacement (x86-64), as when the provider's collection is loaded
+// far from the consumer's, and writes that branch to the island instead; a
+// branch in reach is written to its target as before. The caller must also
+// check segment permissions and lifetime.
+template <typename Resolve, typename Read, typename Sign, typename Island>
 Failure plan(const Site *sites, size_t count, Write *writes, size_t capacity, Resolve resolve,
-             Read read, Sign sign) {
+             Read read, Sign sign, Island island) {
     if (count > capacity || (count && (!sites || !writes)))
         return {Error::Capacity};
     uint64_t end = 0;
@@ -91,6 +97,13 @@ Failure plan(const Site *sites, size_t count, Write *writes, size_t capacity, Re
         uint64_t value = 0;
         auto result = fixup::replacement(s.width, s.opcode, actualOpcode, site, old, s.placeholder,
                                          target, s.addend, value, s.diversity);
+        if (result == fixup::Error::Range) {
+            // replacement checked the placeholder and target + addend before the
+            // range, so only the branch's reach is left to solve.
+            uint64_t destination = 0;
+            uint64_t via = fixup::add(target, s.addend, destination) ? island(destination) : 0;
+            result = via ? fixup::branch(site, via, value) : fixup::Error::Island;
+        }
         if (result != fixup::Error::None)
             return {Error::Fixup, i, result};
         writes[i] = {s.offset, old, value, s.width};

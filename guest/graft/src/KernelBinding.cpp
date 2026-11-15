@@ -10,6 +10,7 @@
 #include "KernelBinding.h"
 #include "BindingPlacement.h"
 #include "Consumer.h"
+#include "Island.h"
 #include "KernelWrite.h"
 #include "Log.h"
 #include "Memory.h"
@@ -388,8 +389,9 @@ bool planConsumerImports(const manifest::View &view, const RuntimeImage &consume
         }
         return true;
     };
+    // A branch that cannot reach its target reaches it through a branch island.
     auto result = planConsumerSites(view, providers, h.libraries.count, unresolved, map, read,
-                                    scratch, writes, capacity);
+                                    reserveIsland, scratch, writes, capacity);
     if (result.error == binding::Error::None)
         return true;
     if (result.site < h.sites.count) {
@@ -419,7 +421,8 @@ bool verifyTargets(const manifest::View &view, const RuntimeImage &consumer, uin
     auto map = [&](uint64_t offset, uint64_t size) {
         return mapConsumerOffset(view, consumer, base, offset, size);
     };
-    auto result = checkTargets(view, map, unresolved, writes, inProvider, inConsumer);
+    auto result =
+            checkTargets(view, map, unresolved, writes, islandDestination, inProvider, inConsumer);
     if (result.error == binding::Error::None)
         return true;
     auto site = view.row<manifest::Site>(h.sites, static_cast<uint32_t>(result.site));
@@ -967,6 +970,14 @@ bool commitWrites(const manifest::View &view, const RuntimeImage &consumer, uint
                       reinterpret_cast<const uint8_t *>(&writes[i].before),
                       reinterpret_cast<const uint8_t *>(&writes[i].after), writes[i].width};
     }
+    // Write the branch islands the plan reserved before any branch to them.
+    auto islands = commitIslands();
+    if (islands != WriteError::None) {
+        preserveBindings = false;
+        snprintf(reason, reasonSize, "branch island transaction refused (%u)",
+                 static_cast<unsigned>(islands));
+        return false;
+    }
     auto result = applyWrites(patches, count);
     preserveBindings = result == WriteError::None || result == WriteError::Rollback;
     if (result == WriteError::None)
@@ -997,6 +1008,32 @@ void noteAbsentWeakImports(const manifest::View &view, const RuntimeImage &consu
             address == unresolved)
             note("binding: %s: weak import absent, bound to gOSKextUnresolved",
                  view.string(view.row<uint32_t>(h.candidates, import.firstCandidate)));
+    }
+}
+
+// Log each import whose branches reach it through a branch island, with how
+// many do: its provider lies beyond a branch's 32-bit displacement from the
+// consumer, as when its collection is loaded far from the Boot collection.
+void noteIslandBranches(const char *identifier, const manifest::View &view,
+                        const RuntimeImage &consumer, uint64_t base, const binding::Write *writes) {
+    const auto &h = view.header();
+    for (uint32_t i = 0; i < h.imports.count; ++i) {
+        uint32_t branches = 0;
+        for (uint32_t j = 0; j < h.sites.count; ++j) {
+            auto site = view.row<manifest::Site>(h.sites, j);
+            uint64_t next = site.import == i && site.width == 4
+                                    ? mapConsumerOffset(view, consumer, base, site.offset, 4)
+                                    : 0;
+            // The branch's target, decoded as checkTargets decodes it.
+            auto displacement = static_cast<int32_t>(static_cast<uint32_t>(writes[j].after));
+            uint64_t target = 0;
+            if (next && fixup::add(next + 4, displacement, target) && islandDestination(target))
+                ++branches;
+        }
+        auto import = view.row<manifest::Import>(h.imports, i);
+        if (branches)
+            note("binding: %s: %s: %u branches reach it through a branch island", identifier,
+                 view.string(view.row<uint32_t>(h.candidates, import.firstCandidate)), branches);
     }
 }
 
@@ -1222,6 +1259,7 @@ void attemptBind(Consumer &record) {
                                 preserveBindings, reason, sizeof(reason));
     if (complete) {
         noteAbsentWeakImports(view, consumer, base, providers, unresolved);
+        noteIslandBranches(record.identifier, view, consumer, base, writes);
         // Open the activation gate: watch for the consumer's provider nubs and set
         // its gate property so the personalities' passive IOPropertyMatch, which
         // deferred the consumer's very construction, now matches and the kernel
@@ -1241,6 +1279,9 @@ void attemptBind(Consumer &record) {
         states = nullptr;
     }
     if (!complete) {
+        // A refused commit has dropped them already; any other refusal or wait
+        // leaves the islands its plan reserved unwritten.
+        discardIslands();
         report(record, waiting ? "waiting" : "refused", reason);
         record.finished = !waiting;
     }

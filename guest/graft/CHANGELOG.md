@@ -5,6 +5,25 @@ Each release of Graft, newest first. A version is the kext's
 that lists `ai.aneesiqbal.graft` 0.1.0 in its `OSBundleLibraries` loads with
 each later release that keeps it.
 
+## 0.3.1
+
+**Upgrading**
+
+- No consumer or client needs a rebuild. The manifest format, `Graft.h` and the
+  SDK are unchanged, and Graft still declares `OSBundleCompatibleVersion` 0.1.0.
+- The arm64 boot firmware hands over nothing new.
+
+**The kext**
+
+- On x86-64, a bound consumer whose call cannot reach its import now binds. A
+  call's 32-bit displacement reaches 2 GiB either way, and in a recovery image
+  booted through OpenCore a provider family's collection was loaded farther than
+  that from the Boot collection, so Graft refused the consumer with `branch out
+  of range`. Graft now writes such a call to a branch island, an absolute jump
+  to the import in a pool of 256 in Graft's own `__TEXT`, beside the consumer,
+  and logs each import whose calls take one. A call in reach is written as
+  before. arm64e, which has no branch sites, is unchanged.
+
 ## 0.3.0
 
 **Upgrading**

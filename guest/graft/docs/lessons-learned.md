@@ -124,6 +124,25 @@ and so no header ([manifest.md](manifest.md#tables)). The SDK fails the build
 for a provider with neither a declared class nor an anchor, rather than leave
 Graft to refuse it at boot.
 
+### A provider can lie beyond a call's reach
+
+In a recovery image booted through OpenCore, Graft refused the x86-64 display
+consumer once its provider family loaded, with `branch out of range`. The
+consumer calls the provider's constructor with a `call` whose 32-bit
+displacement reaches 2 GiB either way, and the family's collection had been
+loaded farther than that from the Boot collection the consumer is placed in.
+Every installed system had kept the two in reach, so the refusal had never
+shown.
+
+Nothing promises that a collection loaded later in boot lies within a call's
+reach of the Boot collection.
+
+Give a call that cannot reach its import an island beside it: Graft keeps a
+pool of absolute jumps in its own `__TEXT`, which is placed in the Boot
+collection beside the consumer, and writes the call to the island that jumps
+to the import. A call in reach is written as before, so nothing changes where
+nothing was wrong (`src/x86_64/Island.cpp`).
+
 ## Starting and activating
 
 ### Start from your own kmod start routine

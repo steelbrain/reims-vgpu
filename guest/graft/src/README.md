@@ -11,7 +11,8 @@ and [docs/manifest.md](../docs/manifest.md) specifies what a consumer embeds.
 The code is C++17 for the kernel: no exceptions, no RTTI, no standard library.
 Types are PascalCase, functions and variables camelCase. The constants of the
 generic mechanism are in one place, [Policy.h](Policy.h): the identifiers of the
-MAC policies the arm64e routes shadow, AMFI and Sandbox, and the route limits.
+MAC policies the arm64e routes shadow, AMFI and Sandbox, the route limits, and
+the x86-64 branch islands' capacity.
 No kext Graft serves is named anywhere in the source: a
 client is served because the identifier it passes names a placed kext, and a
 consumer is bound because it carries a manifest.
@@ -61,7 +62,8 @@ After that:
 - [Policy.h](Policy.h): the bundle identifiers of the MAC policies the arm64e
   routes shadow -- AMFI, the default, and Sandbox -- and the route limits: at
   most sixteen routes in one call, and a shared pool of thirty-two route slots
-  on x86-64.
+  on x86-64. It also sizes the x86-64 pool of branch islands, 256, shared by
+  every consumer.
 
 ### Diagnostics
 
@@ -116,10 +118,16 @@ After that:
   manifest's magic, and each record holds that consumer's state and gate.
   `attemptBind` runs named stages for one consumer: open the manifest, verify the providers and class layouts,
   parse its provider matching, plan the import and vtable writes, build any
-  synthesized vtable, check each write's target and commit the writes, and
+  synthesized vtable, check each write's target, write the branch islands its
+  calls need and commit the writes, and
   open the consumer's activation gate on every nub a personality's provider
   matching matches, present or published later. A refusal at any stage leaves
   the consumer unbound.
+- [Island.h](Island.h): branch islands, how a consumer's call reaches an import
+  beyond its 32-bit displacement. The binding reserves an island for each such
+  call's destination while it plans, writes the reserved islands before the
+  consumer, and drops them when the bind is refused or waits. Each
+  architecture implements it.
 - [BindingPlacement.h](BindingPlacement.h): how the binding finds the images it
   works on: install the trigger, locate a provider by bundle identifier, visit
   every placed kext so the binding can find the consumers among them, and ask
@@ -133,6 +141,12 @@ After that:
   the kernel's own accessor, and `IOLog`'s linked address.
 - [x86_64/Fixup.h](x86_64/Fixup.h): an import site's new value, a pointer or a
   branch displacement, with checked arithmetic.
+- [x86_64/IslandPool.h](x86_64/IslandPool.h), [x86_64/Island.cpp](x86_64/Island.cpp):
+  the branch islands. Each is one absolute jump in a pool in Graft's own
+  `__TEXT`, which lies in the Boot collection beside the consumers, so every
+  consumer call reaches it. One island serves each destination, shared by every
+  call to it. IslandPool.h keeps the reservations and builds each island, which
+  the host tests run; Island.cpp writes the islands through the write window.
 - [x86_64/X86Route.h](x86_64/X86Route.h): instruction decoding and building a
   route's entry patch and trampoline.
 - [x86_64/Route.cpp](x86_64/Route.cpp): the route installer. It reserves slots
@@ -179,6 +193,8 @@ After that:
   consumers are found among the device-tree nodes of the placed kexts. Nothing
   waits for a kext to start. A write may land only in a writable data segment
   that the kernel has not locked read-only.
+- [arm64e/Island.cpp](arm64e/Island.cpp): no branch islands. Every arm64e
+  import site is a pointer, which reaches any address.
 - [arm64e/Fixup.h](arm64e/Fixup.h): an import site's new value. Each site holds
   a pointer the loader signed for the local placeholder. Graft authenticates it
   and signs the real target under the same key and discriminator.
@@ -217,7 +233,9 @@ directory:
   (`BindingPlacement.cpp`, behind [BindingPlacement.h](BindingPlacement.h));
 - how an import site's new value is built (`Fixup.h`, behind
   [Fixup.h](Fixup.h), with the shared arithmetic in
-  [FixupShared.h](FixupShared.h)).
+  [FixupShared.h](FixupShared.h));
+- how a call reaches an import beyond its displacement (`Island.cpp`, behind
+  [Island.h](Island.h)).
 
 The manifest carries both site forms ([Manifest.h](Manifest.h)): a version-4
 x86-64 pointer or `0xe8`/`0xe9` branch, and a version-5 arm64e pointer whose

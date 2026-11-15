@@ -7,6 +7,21 @@
 namespace graft {
 namespace fixup {
 
+// The four-byte displacement at site of a branch to destination. The branch
+// instruction ends at site + 4, and its displacement reaches 2 GiB either way of
+// that; Range beyond it. On failure, value is untouched.
+inline Error branch(uint64_t site, uint64_t destination, uint64_t &value) {
+    uint64_t next;
+    if (!add(site, 4, next))
+        return Error::Address;
+    // Subtract in the wider domain: kernel addresses exceed INT64_MAX.
+    __int128 displacement = static_cast<__int128>(destination) - next;
+    if (displacement < INT32_MIN || displacement > INT32_MAX)
+        return Error::Range;
+    value = static_cast<uint32_t>(displacement);
+    return Error::None;
+}
+
 // A pointer, or the four-byte displacement of E8/E9. The caller supplies the
 // byte immediately before a displacement as actualOpcode. On failure, value is
 // untouched. Both targets include the original relocation addend. diversity is
@@ -37,12 +52,7 @@ inline Error replacement(uint8_t width, uint8_t opcode, uint8_t actualOpcode, ui
         return Error::Address;
     if (priorTarget != expected)
         return Error::Placeholder;
-    // Subtract in the wider domain: kernel addresses exceed INT64_MAX.
-    __int128 displacement = static_cast<__int128>(target) - next;
-    if (displacement < INT32_MIN || displacement > INT32_MAX)
-        return Error::Range;
-    value = static_cast<uint32_t>(displacement);
-    return Error::None;
+    return branch(site, target, value);
 }
 
 // A code pointer with its signature removed. x86-64 pointers are unsigned, so

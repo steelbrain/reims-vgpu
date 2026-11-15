@@ -102,11 +102,13 @@ A refusal is final for the boot. The reasons, in the order Graft checks:
 | `<class>: vtable slot S is not retained executable code` | a slot of the live parent's vtable does not point into the code of the kernel or of a provider, so Graft does not trust that vtable |
 | `site N: address outside consumer segments`, `import N: fallback outside consumer segments` | the manifest names a place outside the consumer's loaded image. Rebuild the consumer |
 | `<symbol>: site N refused (plan P, <detail>)` or `site plan refused (P)` | an import could not be resolved or written. `<symbol>` is its first candidate name, and `<detail>` names the fixup error |
+| `<symbol>: site N refused (plan 7, branch out of range and no branch island free)` | x86-64: the import lies beyond the call's 32-bit reach, and every one of Graft's 256 branch islands already jumps to another function ([design.md](../design.md#branch-islands)) |
 | `site N: <symbol> resolves outside its provider`, `site N: <symbol>: replacement address overflow` | the import resolved to an address outside the library it was declared from, or its new value overflows |
 | `<class> slot S refused (plan P, layout L)` or `vtable V slot S refused (plan P, layout L)` | the parent class in this release differs from the one the consumer was compiled against, or consumer vtable `V` could not be planned. See [the codes](#reading-the-codes) |
 | `write N: offset outside consumer segments` | a planned write lies outside the consumer's loaded image. Rebuild the consumer |
 | `write N: target segment is not writable` | arm64e: a write would land in a segment the kernel maps read-only, such as `__DATA_CONST`. Build the consumer through `consumer.mk`, which links it with `-no_data_const` |
 | `write N: target overlaps the manifest section` | a write would land in the consumer's own `__DATA,__graft`. Rebuild the consumer with the current SDK |
+| `branch island transaction refused (E)` | x86-64: an island the plan reserved was not the `int3` fill Graft writes over, or did not read back. Graft wrote nothing to the consumer and drops the islands it reserved. `E` is `WriteError` in `src/WritePlan.h` |
 | `write transaction refused (E)` | a value changed under Graft before it wrote, or a write did not read back. Graft restores what it wrote |
 
 An arm64e consumer with a synthesized class can also be refused for the
@@ -124,6 +126,11 @@ whether the gate is open:
 | `imports and vtables committed; waiting for a provider of personality <names> to open the gate` | no nub that the provider matching of any personality in `<names>` matches is published yet. Graft opens the gate on every matching nub, whenever it appears |
 | `imports and vtables committed; activation gate open on a provider of personality <name>` | Graft set the gate property on a nub that personality `<name>`'s provider matching matches, and the kernel now constructs and starts the consumer |
 | `imports and vtables committed; cannot watch for a provider of personality <name>` | Graft could not register for the publication of personality `<name>`'s providers, so that personality's gate stays shut. When another personality's provider has already opened the gate, the state keeps saying so, and this reason is in the log only |
+
+On x86-64, a bound consumer whose calls reach a provider through branch
+islands ([design.md](../design.md#branch-islands)) also has a log line for
+each such import: `binding: <consumer>: <symbol>: N branches reach it through
+a branch island`.
 
 A consumer that stays at `waiting for a provider` has no nub in the guest that
 its personalities match: check the devices the virtual machine presents

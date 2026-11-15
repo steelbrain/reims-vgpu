@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later OR LGPL-3.0-or-later
 // Host test of the import-site plan (src/Binding.h), its pointer and branch
-// arithmetic (src/x86_64/Fixup.h) and class size and vtable length comparison
+// arithmetic (src/x86_64/Fixup.h), the x86-64 branch islands' bookkeeping
+// (src/x86_64/IslandPool.h) and class size and vtable length comparison
 // (src/Layout.h).
 #include "Binding.h"
 #include "Check.h"
 #include "Layout.h"
+#include "x86_64/IslandPool.h"
 #include <initializer_list>
 #include <stdio.h>
 #include <string.h>
@@ -58,6 +60,16 @@ static void arithmetic() {
           Error::Address);
     CHECK(fixup::replacement(4, 0xe8, 0xe8, next - 4, 0x100000000, placeholder, next, 0, out) ==
           Error::Address);
+
+    // A branch's displacement to any destination, as an island's is computed.
+    out = 7;
+    CHECK(fixup::branch(next - 4, next + uint64_t{INT32_MAX}, out) == Error::None &&
+          out == uint64_t{INT32_MAX});
+    CHECK(fixup::branch(next - 4, next - (uint64_t{INT32_MAX} + 1), out) == Error::None &&
+          out == uint64_t{0x80000000});
+    out = 7;
+    CHECK(fixup::branch(next - 4, next + uint64_t{INT32_MAX} + 1, out) == Error::Range && out == 7);
+    CHECK(fixup::branch(UINT64_MAX - 2, next, out) == Error::Address && out == 7);
     puts("fixups: pass (pointers, signed addends, branch endpoints, overflow)");
 }
 
@@ -87,13 +99,19 @@ static void preflight() {
         opcode = width == 4 ? image[offset - 1] : 0;
         return true;
     };
+    // A branch in reach never asks for a branch island.
+    size_t asked = 0;
+    auto island = [&](uint64_t) -> uint64_t {
+        ++asked;
+        return 0;
+    };
     auto run = [&](size_t capacity = 2, uint64_t base = 0x4000) {
         auto sign = [base](uint64_t offset) -> uint64_t {
             return offset > UINT64_MAX - base ? 0 : base + offset;
         };
-        return plan(sites, 2, writes, capacity, resolve, read, sign);
+        return plan(sites, 2, writes, capacity, resolve, read, sign, island);
     };
-    CHECK(run().error == Error::None);
+    CHECK(run().error == Error::None && !asked);
     CHECK(writes[0].offset == 8 && writes[0].before == placeholder && writes[0].after == 0x9000);
     CHECK(writes[1].offset == 24 && writes[1].before == displacement && writes[1].after == 0x4fe4);
     auto capacity = run(1);
@@ -126,7 +144,8 @@ static void failures() {
             return offset > UINT64_MAX - base ? 0 : base + offset;
         };
     };
-    auto run = [&](auto r, auto sign) { return plan(sites, 2, writes, 2, r, read, sign); };
+    auto none = [](uint64_t) -> uint64_t { return 0; };
+    auto run = [&](auto r, auto sign) { return plan(sites, 2, writes, 2, r, read, sign, none); };
     uint8_t before[sizeof(image)];
     memcpy(before, image, sizeof(image));
     sites[1].placeholder = 0x2000;
@@ -151,9 +170,100 @@ static void failures() {
     auto ambiguous = [](const Site &, uint64_t &) { return Resolution::Ambiguous; };
     CHECK(run(ambiguous, signAt(0)).error == Error::Ambiguous);
     auto noRead = [](uint64_t, uint8_t, uint64_t &, uint8_t &) { return false; };
-    CHECK(plan(sites, 2, writes, 2, resolve, noRead, signAt(0)).error == Error::Bounds);
-    CHECK(plan(nullptr, 0, nullptr, 0, resolve, read, signAt(0)).error == Error::None);
+    CHECK(plan(sites, 2, writes, 2, resolve, noRead, signAt(0), none).error == Error::Bounds);
+    CHECK(plan(nullptr, 0, nullptr, 0, resolve, read, signAt(0), none).error == Error::None);
     puts("binding: pass (whole-plan validation, bounds, overlap, missing/ambiguous)");
+}
+
+// A branch whose target lies beyond its 32-bit displacement is written to the
+// branch island the plan asks for, which jumps to the target plus the site's
+// addend; with no island free the site is refused. A pointer reaches any
+// address and never asks.
+static void islands() {
+    using namespace binding;
+    const uint64_t base = 0xffffff8001000000ULL; // the consumer's load address
+    const uint64_t far = base + (uint64_t{1} << 33);
+    const uint64_t island = base - 0x100000; // beside the consumer
+    uint8_t image[64] = {};
+    uint64_t placeholder = base + 0x30;
+    memcpy(image + 8, &placeholder, 8);
+    image[23] = 0xe8;
+    uint32_t displacement = static_cast<uint32_t>(0x30 - (24 + 4));
+    memcpy(image + 24, &displacement, 4);
+    Site sites[] = {{8, placeholder, 0, 8, 0}, {24, placeholder, 0, 4, 0xe8}};
+    Write writes[2] = {};
+    auto resolve = [&](const Site &, uint64_t &address) {
+        address = far;
+        return Resolution::Found;
+    };
+    auto read = [&](uint64_t offset, uint8_t width, uint64_t &old, uint8_t &opcode) {
+        if (offset > sizeof(image) || width > sizeof(image) - offset || (width == 4 && !offset))
+            return false;
+        old = 0;
+        memcpy(&old, image + offset, width);
+        opcode = width == 4 ? image[offset - 1] : 0;
+        return true;
+    };
+    auto sign = [&](uint64_t offset) { return base + offset; };
+    uint64_t asked = 0;
+    size_t asks = 0;
+    auto give = [&](uint64_t destination) {
+        asked = destination;
+        ++asks;
+        return island;
+    };
+    CHECK(plan(sites, 2, writes, 2, resolve, read, sign, give).error == Error::None);
+    CHECK(asks == 1 && asked == far);
+    CHECK(writes[0].after == far);
+    CHECK(writes[1].before == displacement &&
+          writes[1].after == static_cast<uint32_t>(island - (base + 24 + 4)));
+    // The island jumps to the target plus the addend, as the branch would have.
+    image[23] = 0xe9;
+    sites[1] = {24, placeholder - 4, 4, 4, 0xe9};
+    asks = 0;
+    CHECK(plan(sites, 2, writes, 2, resolve, read, sign, give).error == Error::None);
+    CHECK(asks == 1 && asked == far + 4);
+    auto none = [](uint64_t) -> uint64_t { return 0; };
+    auto full = plan(sites, 2, writes, 2, resolve, read, sign, none);
+    CHECK(full.error == Error::Fixup && full.site == 1 && full.detail == fixup::Error::Island);
+    // An island the branch cannot reach either leaves it out of range.
+    auto beyond = [&](uint64_t) { return far; };
+    auto unreachable = plan(sites, 2, writes, 2, resolve, read, sign, beyond);
+    CHECK(unreachable.error == Error::Fixup && unreachable.site == 1 &&
+          unreachable.detail == fixup::Error::Range);
+    puts("islands: pass (a far branch through its island, addend, none free, island beyond reach)");
+}
+
+// The pool shares one island per destination, reserves until it is full, tells
+// where a written or reserved island jumps, and drops reservations on discard.
+static void islandPool() {
+    using x86::IslandSize;
+    static x86::IslandPool<3> pool;
+    const uint64_t base = 0xffffff8000200000ULL;
+    CHECK(pool.reserve(base, 0x1000) == base);
+    CHECK(pool.reserve(base, 0x2000) == base + IslandSize);
+    CHECK(pool.reserve(base, 0x1000) == base); // shared
+    CHECK(!pool.reserve(base, 0));
+    CHECK(pool.destination(base, base + IslandSize) == 0x2000);
+    CHECK(!pool.destination(base, base + 1) && !pool.destination(base, base - IslandSize) &&
+          !pool.destination(base, base + 2 * IslandSize));
+    pool.commit();
+    CHECK(pool.reserve(base, 0x3000) == base + 2 * IslandSize);
+    CHECK(!pool.reserve(base, 0x4000)); // full
+    CHECK(pool.reserve(base, 0x2000) == base + IslandSize);
+    pool.discard();
+    CHECK(!pool.destination(base, base + 2 * IslandSize));
+    CHECK(pool.destination(base, base) == 0x1000);
+    CHECK(pool.reserve(base, 0x4000) == base + 2 * IslandSize); // the dropped slot again
+    static x86::IslandPool<3> overflowing;
+    CHECK(!overflowing.reserve(UINT64_MAX - IslandSize, 0x5000));
+
+    uint8_t code[IslandSize];
+    x86::islandCode(code, 0x1122334455667788ULL);
+    const uint8_t expected[IslandSize] = {0xff, 0x25, 0,    0,    0,    0,    0x88, 0x77,
+                                          0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0xcc, 0xcc};
+    CHECK(!memcmp(code, expected, sizeof(code)));
+    puts("island pool: pass (shared destination, full, lookup, commit and discard, code)");
 }
 
 static void layouts() {
@@ -191,6 +301,8 @@ int main() {
     arithmetic();
     preflight();
     failures();
+    islands();
+    islandPool();
     layouts();
     overlap();
 }

@@ -264,19 +264,24 @@ they are. Each attempt runs these steps:
    it declared one, and a weak import that nothing defines binds to the
    pointer the kernel's `gOSKextUnresolved` holds, as the kernel's linker
    would. Each site's new value is computed and checked against the bytes the
-   build left there.
+   build left there. On x86-64, a call whose import lies beyond its 32-bit
+   displacement is planned to a branch island instead
+   ([Branch islands](#branch-islands)).
 6. **Check every target.** Each site must now point into its provider (into
    code, for a call), at its own fallback, or, for an absent weak import, at
-   exactly the kernel's unresolved-symbol pointer.
+   exactly the kernel's unresolved-symbol pointer. A call planned to a branch
+   island is checked at the address the island jumps to.
 7. **Plan the vtables.** Each inherited slot is filled from the parent's live
    vtable. The consumer's own overrides stay as they are. On arm64e, a class
    whose parent has no Apple header has its whole vtable built here instead
    ([manifest.md](manifest.md#synthesized-classes)).
 8. **Write everything in one transaction.** Before the first store, Graft
    checks that every target lies in the consumer, outside its manifest
-   section, and, on arm64e, in a writable segment. Every site and slot is then
-   written and read back together. If anything fails, Graft restores what it
-   wrote.
+   section, and, on arm64e, in a writable segment. The branch islands the
+   plan reserved are written first, in a transaction of their own, so that no
+   call is written to an island that is not there yet. Every site and slot is
+   then written and read back together. If anything fails, Graft restores what
+   it wrote.
 9. **Open the activation gate.** Graft watches for each personality's
    providers by its provider matching, with one `IOFirstPublish` matching
    notification per personality. On every matching nub, present now or
@@ -302,6 +307,41 @@ Graft never binds part of a consumer, and it never panics the guest over one.
 
 Once the gate is open, the consumer can start at any moment. Graft therefore
 keeps the providers loaded and its writes in place for the rest of the boot.
+
+### Branch islands
+
+On x86-64, a consumer calls an imported function with a `call` (or, for a
+tail call, a `jmp`) whose 32-bit displacement reaches 2 GiB either way of the
+next instruction. The consumer is placed in the Boot collection, and the
+libraries it imports from are in a collection loaded later in boot. In an
+installed system they lie within that reach. In a
+recovery image booted through OpenCore, a library can lie farther away, and
+the call cannot be written to reach it.
+
+Graft writes such a call to a branch island instead: 16 bytes holding one
+absolute jump, `jmp [rip+0]` followed by the import's eight-byte address,
+padded with `int3`. The islands are a pool in Graft's own `__TEXT`, and Graft
+is placed in the Boot collection beside the consumer, so every island lies in
+the call's reach, and its jump reaches any address. The call pushes the
+consumer's own return address, so the function returns straight to the
+consumer.
+
+- A call within reach of its import is written to the import directly, and
+  takes no island, so a boot where every library is in reach writes the same
+  bytes as one where Graft had no islands.
+- An island serves one destination. Every call to the same function, from any
+  consumer, shares it. The pool holds 256 islands for the boot
+  (`IslandCapacity` in [src/Policy.h](../src/Policy.h)), and a consumer that
+  needs one when all are taken is refused, naming the site.
+- Graft writes each island once, over the `int3` the pool is filled with,
+  through the write window the x86-64 route trampolines use, and before any
+  call is written to it. A bind that is refused or waits leaves the islands it
+  reserved unwritten.
+- Graft logs each import whose calls take an island, with how many do:
+  `binding: <consumer>: <symbol>: N branches reach it through a branch island`.
+
+An arm64e import site is an eight-byte pointer, which reaches any address, so
+arm64e has no branch islands.
 
 ## Start and binding on arm64e
 
@@ -382,16 +422,17 @@ reason.
 Most of the code is architecture-neutral. What differs has a file in each of
 `src/x86_64/` and `src/arm64e/`: how the Boot collection is found, how kernel
 memory is written and which targets may be written, how a kernel function is
-routed, how the binding finds its images, and how a site's new value is built
+routed, how the binding finds its images, how a site's new value is built, and
+how a call reaches an import beyond its displacement
 ([src/README.md](../src/README.md#the-architecture-boundary)).
 
 ## What is tested where
 
 The host tests, run with `make test` on a Mac with Apple silicon, cover the
 logic that needs no kernel: Mach-O reading, symbol lookup, the manifest
-format, import resolution, site and target checks, vtable planning, write
-transactions, route building for both architectures, and the arm64e synthesis
-plan and discriminator tables. The arm64e signing tests run as native arm64e
+format, import resolution, site and target checks, the branch islands a far
+call takes, vtable planning, write transactions, route building for both
+architectures, and the arm64e synthesis plan and discriminator tables. The arm64e signing tests run as native arm64e
 processes. `make kernel-check` compiles a test kext carrying a manifest
 (`tests/kernel_fixture.cpp`) with kext flags against Kernel.framework, and
 links it. `make kernel-check-arm64e` compiles the neutral core and the arm64e

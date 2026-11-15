@@ -32,5 +32,10 @@ constexpr size_t MaxRequestRoutes = 16;
 // own two catalogue-send entries plus up to thirty more across all clients.
 constexpr size_t RouteCapacity = 32;
 
+// Graft's branch islands on x86-64 (src/Island.h), shared by every bound
+// consumer: one for each distinct function a consumer's branch cannot reach
+// with its 32-bit displacement, however many branches call it.
+constexpr size_t IslandCapacity = 256;
+
 } // namespace policy
 } // namespace graft

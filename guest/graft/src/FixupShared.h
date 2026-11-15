@@ -8,7 +8,8 @@
 namespace graft {
 namespace fixup {
 
-enum class Error { None, Width, Opcode, Address, Placeholder, Range };
+// Island: a branch out of range that no branch island could take (Binding.h).
+enum class Error { None, Width, Opcode, Address, Placeholder, Range, Island };
 
 inline const char *describe(Error error) {
     switch (error) {
@@ -18,6 +19,7 @@ inline const char *describe(Error error) {
     case Error::Address: return "address overflow";
     case Error::Placeholder: return "placeholder mismatch";
     case Error::Range: return "branch out of range";
+    case Error::Island: return "branch out of range and no branch island free";
     }
     return "unknown fixup error";
 }

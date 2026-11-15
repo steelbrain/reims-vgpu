@@ -42,6 +42,12 @@ static auto imageReader(const uint8_t *image, size_t size) {
     };
 }
 
+// No branch island, for a plan whose branches all reach their targets, and no
+// address that is one, for its target check.
+static uint64_t noIsland(uint64_t) {
+    return 0;
+}
+
 struct Fixture {
     std::vector<uint8_t> bytes = std::vector<uint8_t>(sizeof(Header));
     Header h{Magic, Version, 0, sizeof(Header), {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
@@ -242,7 +248,8 @@ static void resolution() {
     auto resolve = [&](const binding::Site &, uint64_t &value) {
         return binding::resolveImport(v, record.import, find, 0, map, value);
     };
-    CHECK(binding::plan(&site, 1, &write, 1, resolve, read, sign).error == binding::Error::None);
+    CHECK(binding::plan(&site, 1, &write, 1, resolve, read, sign, noIsland).error ==
+          binding::Error::None);
     CHECK(write.before == placeholder && write.after == 0x9000);
     uint64_t unchanged;
     memcpy(&unchanged, image + 8, 8);
@@ -256,13 +263,13 @@ static void resolution() {
     definition.n_value = 0x9000;
     Provider provider{{&definition, 1, providerNames, sizeof(providerNames)}};
     binding::Site scratch{};
-    CHECK(planConsumerSites(v, &provider, 1, 0, map, read, &scratch, &write, 1).error ==
+    CHECK(planConsumerSites(v, &provider, 1, 0, map, read, noIsland, &scratch, &write, 1).error ==
           binding::Error::None);
     CHECK(write.before == placeholder && write.after == 0x9000);
     // A failure that concerns no one site names none.
-    auto metadata = planConsumerSites(v, nullptr, 0, 0, map, read, &scratch, &write, 1);
+    auto metadata = planConsumerSites(v, nullptr, 0, 0, map, read, noIsland, &scratch, &write, 1);
     CHECK(metadata.error == binding::Error::Metadata && metadata.site == binding::NoSite);
-    auto capacity = planConsumerSites(v, &provider, 1, 0, map, read, &scratch, &write, 0);
+    auto capacity = planConsumerSites(v, &provider, 1, 0, map, read, noIsland, &scratch, &write, 0);
     CHECK(capacity.error == binding::Error::Capacity && capacity.site == binding::NoSite);
     puts("resolution: pass (provider scope, candidates, fallback, ambiguity, site plan)");
 }
@@ -341,8 +348,8 @@ static void weak() {
     Provider provider{{&definition, 1, providerNames, sizeof(providerNames)}};
     binding::Site scratch[2]{};
     binding::Write writes[2]{};
-    auto result =
-            planConsumerSites(v, &provider, 1, unresolved, map, imageRead, scratch, writes, 2);
+    auto result = planConsumerSites(v, &provider, 1, unresolved, map, imageRead, noIsland, scratch,
+                                    writes, 2);
     CHECK(result.error == binding::Error::None);
     CHECK(writes[0].before == 0x4020 && writes[0].after == 0x9000);
     CHECK(writes[1].before == 0x4028 && writes[1].after == unresolved);
@@ -353,34 +360,36 @@ static void weak() {
         return library == 0 && address >= 0x9000 && address < 0x9100;
     };
     auto inConsumer = [](uint64_t address, bool) { return address >= 0x4000 && address < 0x4040; };
-    CHECK(checkTargets(v, map, unresolved, writes, inProvider, inConsumer).error ==
+    CHECK(checkTargets(v, map, unresolved, writes, noIsland, inProvider, inConsumer).error ==
           binding::Error::None);
     // The sentinel is accepted for that import and nothing else: not with
     // no gOSKextUnresolved, not for a strong import, not for a weak one
     // with a fallback, and no other address outside the provider.
-    auto refused = checkTargets(v, map, 0, writes, inProvider, inConsumer);
+    auto refused = checkTargets(v, map, 0, writes, noIsland, inProvider, inConsumer);
     CHECK(refused.error == binding::Error::Target && refused.site == 1);
     writes[1].after = variable;
-    refused = checkTargets(v, map, unresolved, writes, inProvider, inConsumer);
+    refused = checkTargets(v, map, unresolved, writes, noIsland, inProvider, inConsumer);
     CHECK(refused.error == binding::Error::Target && refused.site == 1);
     writes[1].after = unresolved + 8;
-    refused = checkTargets(v, map, unresolved, writes, inProvider, inConsumer);
+    refused = checkTargets(v, map, unresolved, writes, noIsland, inProvider, inConsumer);
     CHECK(refused.error == binding::Error::Target && refused.site == 1);
     writes[1].after = unresolved;
     two.set<Import>(two.h.imports, 1, {0, 1, 1, ImportWeak, 48});
     CHECK(two.open(v).error == Error::None);
-    refused = checkTargets(v, map, unresolved, writes, inProvider, inConsumer);
+    refused = checkTargets(v, map, unresolved, writes, noIsland, inProvider, inConsumer);
     CHECK(refused.error == binding::Error::Target && refused.site == 1);
-    result = planConsumerSites(v, &provider, 1, unresolved, map, imageRead, scratch, writes, 2);
+    result = planConsumerSites(v, &provider, 1, unresolved, map, imageRead, noIsland, scratch,
+                               writes, 2);
     CHECK(result.error == binding::Error::None && writes[1].after == 0x4030);
-    CHECK(checkTargets(v, map, unresolved, writes, inProvider, inConsumer).error ==
+    CHECK(checkTargets(v, map, unresolved, writes, noIsland, inProvider, inConsumer).error ==
           binding::Error::None);
     two.set<Import>(two.h.imports, 1, {0, 1, 1, 0, NoFallback});
     CHECK(two.open(v).error == Error::None);
-    result = planConsumerSites(v, &provider, 1, unresolved, map, imageRead, scratch, writes, 2);
+    result = planConsumerSites(v, &provider, 1, unresolved, map, imageRead, noIsland, scratch,
+                               writes, 2);
     CHECK(result.error == binding::Error::Missing && result.site == 1);
     writes[1] = {16, 0x4028, unresolved, 8};
-    refused = checkTargets(v, map, unresolved, writes, inProvider, inConsumer);
+    refused = checkTargets(v, map, unresolved, writes, noIsland, inProvider, inConsumer);
     CHECK(refused.error == binding::Error::Target && refused.site == 1);
 
     // A strong import with no site, as an inherited vtable slot's method is: the
@@ -394,7 +403,8 @@ static void weak() {
     siteless.h.size = static_cast<uint32_t>(siteless.bytes.size());
     siteless.save();
     CHECK(siteless.open(v).error == Error::None);
-    result = planConsumerSites(v, &provider, 1, unresolved, map, imageRead, scratch, writes, 2);
+    result = planConsumerSites(v, &provider, 1, unresolved, map, imageRead, noIsland, scratch,
+                               writes, 2);
     CHECK(result.error == binding::Error::None && writes[0].after == 0x9000);
 
     // A weak call nothing defines: the branch's displacement reaches
@@ -414,17 +424,77 @@ static void weak() {
     binding::Write write{};
     auto codeMap = contiguous(0x4000, sizeof(code));
     auto codeRead = imageReader(code, sizeof(code));
-    result = planConsumerSites(v, &none, 1, unresolved, codeMap, codeRead, &branch, &write, 1);
+    result = planConsumerSites(v, &none, 1, unresolved, codeMap, codeRead, noIsland, &branch,
+                               &write, 1);
     CHECK(result.error == binding::Error::None);
     CHECK(static_cast<int32_t>(write.after) == static_cast<int64_t>(unresolved) - (0x4000 + 9 + 4));
-    CHECK(checkTargets(v, codeMap, unresolved, &write, inProvider, inConsumer).error ==
+    CHECK(checkTargets(v, codeMap, unresolved, &write, noIsland, inProvider, inConsumer).error ==
           binding::Error::None);
     call.set<Import>(call.h.imports, 0, {0, 0, 2, 0, NoFallback});
     CHECK(call.open(v).error == Error::None);
-    refused = checkTargets(v, codeMap, unresolved, &write, inProvider, inConsumer);
+    refused = checkTargets(v, codeMap, unresolved, &write, noIsland, inProvider, inConsumer);
     CHECK(refused.error == binding::Error::Target && refused.site == 0);
     puts("weak: pass (absent weak to gOSKextUnresolved through the plan and the target check, "
          "pointer and branch, present weak, fallback, strong miss, no sentinel)");
+}
+
+// A call whose provider lies beyond its 32-bit displacement, as when the
+// provider's collection is loaded far from the consumer's: the plan writes it
+// to the branch island it reserves, and the target check follows the island to
+// the provider. An island that jumps outside the provider is refused, and with
+// no island free the site is.
+static void islands() {
+    Fixture call;
+    View v;
+    call.set<Site>(call.h.sites, 0, {9, 32, 0, 0, 4, 0xe8, 0});
+    CHECK(call.open(v).error == Error::None);
+    const uint64_t base = 0xffffff8001000000ULL; // the consumer's load address
+    const uint64_t far = base + (uint64_t{3} << 31);
+    const uint64_t island = base - 0x10000; // beside the consumer
+    uint8_t code[64]{};
+    code[8] = 0xe8;
+    int32_t toPlaceholder = 32 - (9 + 4);
+    memcpy(code + 9, &toPlaceholder, 4);
+    const char names[] = "\0_renamed\0";
+    nlist_64 definition{};
+    definition.n_type = N_SECT;
+    definition.n_sect = 1;
+    definition.n_un.n_strx = 1;
+    definition.n_value = far;
+    Provider provider{{&definition, 1, names, sizeof(names)}};
+    auto map = contiguous(base, sizeof(code));
+    auto read = imageReader(code, sizeof(code));
+    uint64_t reserved = 0;
+    auto reserve = [&](uint64_t destination) {
+        reserved = destination;
+        return island;
+    };
+    binding::Site branch{};
+    binding::Write write{};
+    auto result = planConsumerSites(v, &provider, 1, 0, map, read, reserve, &branch, &write, 1);
+    CHECK(result.error == binding::Error::None && reserved == far);
+    CHECK(static_cast<int32_t>(write.after) == static_cast<int64_t>(island - (base + 9 + 4)));
+    auto inProvider = [&](uint32_t library, uint64_t address, bool code) {
+        return library == 0 && code && address >= far && address < far + 0x100;
+    };
+    auto inConsumer = [&](uint64_t address, bool) {
+        return address >= base && address < base + sizeof(code);
+    };
+    uint64_t jumpsTo = far;
+    auto destination = [&](uint64_t address) { return address == island ? jumpsTo : 0; };
+    CHECK(checkTargets(v, map, 0, &write, destination, inProvider, inConsumer).error ==
+          binding::Error::None);
+    jumpsTo = far + 0x100;
+    auto refused = checkTargets(v, map, 0, &write, destination, inProvider, inConsumer);
+    CHECK(refused.error == binding::Error::Target && refused.site == 0);
+    // The island itself is not the provider.
+    refused = checkTargets(v, map, 0, &write, noIsland, inProvider, inConsumer);
+    CHECK(refused.error == binding::Error::Target && refused.site == 0);
+    result = planConsumerSites(v, &provider, 1, 0, map, read, noIsland, &branch, &write, 1);
+    CHECK(result.error == binding::Error::Fixup && result.site == 0 &&
+          result.detail == fixup::Error::Island);
+    puts("islands: pass (a far call through its island, the island's destination checked, none "
+         "free)");
 }
 
 // The class that verifies a provider: its anchor where it has one, else the
@@ -723,6 +793,7 @@ int main(int argc, char **argv) {
     validation();
     resolution();
     weak();
+    islands();
     anchors();
     duplicates();
     vtables();

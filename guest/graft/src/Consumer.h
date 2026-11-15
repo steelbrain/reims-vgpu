@@ -20,11 +20,12 @@ struct Provider {
 // image (arm64e) resolves it through its segment table rather than loadAddress +
 // offset. read(offset, width, old, opcode) serves the width old bytes and a
 // branch's leading opcode byte through the live mapping. unresolved is the
-// pointer gOSKextUnresolved holds (binding::unresolvedValue), or 0.
-template <typename Map, typename Read>
+// pointer gOSKextUnresolved holds (binding::unresolvedValue), or 0. island
+// gives a branch that cannot reach its target a branch island (binding::plan).
+template <typename Map, typename Read, typename Island>
 binding::Failure planConsumerSites(const manifest::View &view, const Provider *providers,
                                    size_t providerCount, uint64_t unresolved, Map map, Read read,
-                                   binding::Site *scratch, binding::Write *writes,
+                                   Island island, binding::Site *scratch, binding::Write *writes,
                                    size_t capacity) {
     using namespace binding;
     if (!view.valid() || providerCount != view.header().libraries.count ||
@@ -49,7 +50,7 @@ binding::Failure planConsumerSites(const manifest::View &view, const Provider *p
         return resolveImport(view, site.import, find, unresolved, map, address);
     };
     auto sign = [&](uint64_t offset) { return map(offset, 1); };
-    return plan(scratch, h.sites.count, writes, capacity, resolve, read, sign);
+    return plan(scratch, h.sites.count, writes, capacity, resolve, read, sign, island);
 }
 
 // Check where each planned site now points, before anything is written. A
@@ -58,14 +59,16 @@ binding::Failure planConsumerSites(const manifest::View &view, const Provider *p
 // has no fallback, exactly unresolved, the pointer gOSKextUnresolved holds:
 // the address the kernel's linker gives such an import, which the consumer
 // tests and never follows. map(offset, size) resolves a branch's next
-// instruction and a fallback, as in planConsumerSites. inProvider(library,
-// address, code) and inConsumer(address, code) report the live mappings. A
-// refusal names the site: Bounds where a branch's target overflows, Target
-// where it lies anywhere else.
-template <typename Map, typename InProvider, typename InConsumer>
+// instruction and a fallback, as in planConsumerSites. islandDestination(address)
+// is where the branch island at address jumps, or 0 where address is no island,
+// so a branch planned through an island is checked where the island jumps.
+// inProvider(library, address, code) and inConsumer(address, code) report the
+// live mappings. A refusal names the site: Bounds where a branch's target
+// overflows, Target where it lies anywhere else.
+template <typename Map, typename IslandDestination, typename InProvider, typename InConsumer>
 binding::Failure checkTargets(const manifest::View &view, Map map, uint64_t unresolved,
-                              const binding::Write *writes, InProvider inProvider,
-                              InConsumer inConsumer) {
+                              const binding::Write *writes, IslandDestination islandDestination,
+                              InProvider inProvider, InConsumer inConsumer) {
     const auto &h = view.header();
     for (uint32_t i = 0; i < h.sites.count; ++i) {
         auto site = view.row<manifest::Site>(h.sites, i);
@@ -81,6 +84,8 @@ binding::Failure checkTargets(const manifest::View &view, Map map, uint64_t unre
             uint64_t next = map(site.offset, site.width);
             if (!next || next > UINT64_MAX - 4 || !fixup::add(next + 4, displacement, target))
                 return {binding::Error::Bounds, i};
+            if (uint64_t destination = islandDestination(target))
+                target = destination;
         }
         if (inProvider(import.library, target, code))
             continue;

@@ -85,6 +85,13 @@ inline Error replacement(uint8_t width, uint8_t opcode, uint8_t /*actualOpcode*/
     return Error::None;
 }
 
+// A branch's displacement. arm64e has no branch sites, so replacement never
+// reports a branch out of range and Binding.h never asks for one; this keeps one
+// call signature across architectures, as stripCode does on x86-64.
+inline Error branch(uint64_t /*site*/, uint64_t /*destination*/, uint64_t & /*value*/) {
+    return Error::Width;
+}
+
 // A code pointer with its pointer-authentication signature removed, not
 // authenticated: __builtin_ptrauth_strip clears the signature bits with no
 // braa/autia, so it never faults under FEAT_FPAC. Every arm64e key shares the

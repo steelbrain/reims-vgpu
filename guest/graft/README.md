@@ -42,21 +42,33 @@ own.
 
 ## Status
 
-This is release 0.3.0. It passes the host tests and the build checks
-([CONTRIBUTING.md](CONTRIBUTING.md#checks)). It adds, on arm64e, routing a named
-MAC policy's operation beside AMFI's: an owned client names the policy in the
-route symbol, such as `Sandbox:file_check_mmap`. AMFI's own routing, the binding
-and the x86-64 path are unchanged from 0.2.0.
+This is release 0.3.1. It passes the host tests and the build checks
+([CONTRIBUTING.md](CONTRIBUTING.md#checks)). On x86-64 it binds a consumer whose
+call cannot reach its import with the call's 32-bit displacement, by writing the
+call to a branch island ([docs/design.md](docs/design.md#branch-islands)). A
+call in reach is written as before, and arm64e is unchanged.
 
-reims-vgpu, a paravirtual GPU for macOS virtual machines, verified the new path
-in its guests: with its arm64 kexts on macOS 27.0.1 and 26.6.2, SIP on and no
-boot-arg, its client routed the Sandbox policy's `file_check_mmap` as well as
-AMFI's operations, neither route refused. A Metal bundle the Sandbox profile
-otherwise refuses to map executable then loaded, so Safari's WebGL ran where it
-had been dead, and a control mapping the profile denies stayed denied.
+reims-vgpu, a paravirtual GPU for macOS virtual machines, verified the branch
+islands in its guests, with SIP on and no boot-arg. In Apple's macOS 15.4 and
+26.6.2 recovery images booted through OpenCore, Graft had refused its x86-64
+display driver with `branch out of range`. Graft now bound it, 21 of its calls
+reaching their six targets through branch islands, and the recovery screen was
+drawn on the driver's display. Recovery's WindowServer draws in software there,
+so Metal does not run in it. Installed macOS 26.7.2 and 11.7.11 bound as before,
+with no call through an island and Metal running, and the arm64 kexts still bound
+on macOS 27.0.1.
 
-Release 0.2.0's kexts, which 0.3.0 leaves unchanged but for the route layer and
-the version they carry, passed the boots below, with SIP on (`csr-active-config`
+Release 0.3.0 added, on arm64e, routing a named MAC policy's operation beside
+AMFI's: an owned client names the policy in the route symbol, such as
+`Sandbox:file_check_mmap`. reims-vgpu verified it with its arm64 kexts on macOS
+27.0.1 and 26.6.2: its client routed the Sandbox policy's `file_check_mmap` as
+well as AMFI's operations, neither route refused. A Metal bundle the Sandbox
+profile otherwise refuses to map executable then loaded, so Safari's WebGL ran
+where it had been dead, and a control mapping the profile denies stayed denied.
+
+Release 0.2.0's kexts, which later releases leave unchanged but for 0.3.0's route
+layer, 0.3.1's branch islands and the version they carry, passed the boots
+below, with SIP on (`csr-active-config`
 0) and no boot-arg for Graft or the kexts it serves. Several used the guest
 kexts of reims-vgpu: its display and Metal driver is a bound consumer, and the
 kext that installs its Metal bundle is an owned client.

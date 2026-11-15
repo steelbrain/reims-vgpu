@@ -356,7 +356,10 @@ If no candidate is defined:
 Candidates, fallbacks and weak imports are how a consumer copes with a
 symbol that only some releases have, without a version check.
 
-Graft resolves an import only to write its sites. An import with no site is
+Graft resolves an import only to write its sites. A version-4 branch site is
+written with the displacement to the import, or, when the import lies beyond
+the branch's 32-bit reach, to a branch island that jumps to it
+([design.md](design.md#branch-islands)). An import with no site is
 never resolved, so a release that does not define it refuses nothing. The SDK
 records such imports for the methods a consumer's vtable inherits: the build
 needs them to replace each inherited slot's reference with a placeholder, and
