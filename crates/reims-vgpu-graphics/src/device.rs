@@ -126,9 +126,9 @@
 //! and counted for any other (ring 0's, another context's, an unbound page's): the device trusts
 //! the page's address for the context, never the value written. A queue whose context has a
 //! page is routed there ([`DoorbellAt::Page`]), where the host routes pages; otherwise on
-//! `DOORBELL`, as before. A page rebound to another context reaches that context's rings from the
-//! bind on; a route of a queue of the context before stays the host's until the queue ends, and
-//! wakes only that queue. A reset unbinds every page.
+//! `DOORBELL`, as before. A page bound to another context reaches that context's rings from the
+//! bind on, and the routes on it of its old context's queues go, their doorbells left to
+//! `DOORBELL`: the host wakes no ring at a page but its context's. A reset unbinds every page.
 //!
 //! The host's route functions may wait for the host's own lock (QEMU's BQL), so the device calls
 //! them holding no lock of its own, and no function a host calls under that lock waits for a
@@ -143,7 +143,10 @@
 //!   [`Device::reset`]) drops every ended queue's route on the host's thread that resets, after
 //!   the reset let go of ring 0, the display, the completion ring, the queues' table and each
 //!   ended queue's rings. QEMU's registers run with no BQL (a lockless region), and its reset
-//!   holds it already, which its route function sees (`bql_locked`).
+//!   holds it already, which its route function sees (`bql_locked`);
+//! - a `DOORBELL_PAGE_BIND` write that binds a page to another context (through
+//!   [`Device::mmio_write`] or [`Device::mmio_write_taking`]) drops the routes on the page of its
+//!   old context's queues on the host's thread that writes it, after the queues' table is let go.
 //!
 //! The device's functions a host calls under its lock wait at most for ring 0's message the
 //! control thread holds (a display message, which waits for no thread of the device's), for a
@@ -605,10 +608,11 @@ pub trait Host: Send + Sync + 'static {
     /// A write of `ring_id` with [`RGFX_DOORBELL_ASKS`], for a buffer the host may answer at its
     /// doorbell, matches no route and reaches the device's write as every write did. `route`
     /// names the route, a number the device gives no other: [`Host::unroute_doorbell`] drops it,
-    /// and a route of a `ring_id` at `at` another route of the host's holds replaces that one. The host takes a copy of
-    /// `bell` and may take the route after the call: until then, and where it refuses it, the
-    /// writes reach the device's write. Whether it took the route, so the device
-    /// counts it among its [`MAX_DOORBELL_ROUTES`]; false where it refuses it. Asked only where
+    /// and a route of a `ring_id` at `at` another route of the host's holds replaces that one.
+    /// The host takes a copy of `bell` and may take the route after the call: until then, and
+    /// where it refuses it, the writes reach the device's write. Whether it took the route, so
+    /// the device counts it among its [`MAX_DOORBELL_ROUTES`]; false where it refuses it. Asked
+    /// only where
     /// the guest's driver took [`RGFX_FEATURE_DOORBELL_ASKS`], on the context's lane (one of
     /// ring 0's threads, or the control thread) as the queue is made, after its service thread
     /// started and before the create is answered, with no lock of the device's held: it may wait
@@ -626,14 +630,16 @@ pub trait Host: Send + Sync + 'static {
         false
     }
 
-    /// Drops the route [`Host::route_doorbell`] took as `route`, of ring `ring_id` at `at`, once its queue
-    /// has ended: once this returns no write reaches the file, as the ring may be a later
-    /// queue's, and the host closes its copy. On the thread that ends the queue, with no lock of
-    /// the device's held: the context's lane (an `OBJECT_DESTROY` of the queue, its context's
-    /// `CONTEXT_CLOSE`, or a `QUEUE_CREATE` that remakes it), where it may wait for a lock the
-    /// host holds while it calls the device, or the host's own inside [`Device::mmio_write`],
-    /// [`Device::mmio_write_taking`] (a `STATUS` 0 write) or [`Device::reset`], where it must not
-    /// wait for a lock the host holds around that call. The routes the device holds at its end
+    /// Drops the route [`Host::route_doorbell`] took as `route`, of ring `ring_id` at `at`, once
+    /// its queue has ended, or, at a doorbell page, once the page is bound to another context:
+    /// once this returns no write reaches the file, as the ring may be a later queue's, and the
+    /// host closes its copy. On the thread that ends the queue, with no lock of the device's held:
+    /// the context's lane (an `OBJECT_DESTROY` of the queue, its context's `CONTEXT_CLOSE`, or a
+    /// `QUEUE_CREATE` that remakes it), where it may wait for a lock the host holds while it calls
+    /// the device, or the host's own inside [`Device::mmio_write`], [`Device::mmio_write_taking`]
+    /// (a `STATUS` 0 write, or a `DOORBELL_PAGE_BIND` write that binds a page to another context)
+    /// or [`Device::reset`], where it must not wait for a lock the host holds around that call.
+    /// The routes the device holds at its end
     /// are the host's to drop: no call drops them. The default does nothing.
     fn unroute_doorbell(&self, route: u64, at: DoorbellAt, ring_id: u32) {
         let _ = (route, at, ring_id);
