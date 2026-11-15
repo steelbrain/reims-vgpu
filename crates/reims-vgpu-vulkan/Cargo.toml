@@ -41,6 +41,15 @@ libc.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 
+# On Windows the OS services are this crate's own (`os/windows.rs`), as they are ported: the
+# clocks.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_WindowsProgramming",
+] }
+
 # The hashes of the metallibs' sources, which a metallib built elsewhere is checked by (build.rs).
 [build-dependencies]
 sha2.workspace = true

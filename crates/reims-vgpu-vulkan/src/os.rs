@@ -19,6 +19,8 @@ mod files;
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(windows)]
+mod windows;
 mod wsi;
 
 #[cfg(target_os = "linux")]
