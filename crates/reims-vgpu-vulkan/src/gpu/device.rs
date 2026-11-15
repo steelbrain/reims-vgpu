@@ -1008,6 +1008,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// Metal's space gives it, as that buffer's. Any refusal (a device that exports no dma-buf of
     /// a buffer's memory, `RuntimeGap::DmaBufExport`, among them) answers `None`, logged at debug,
     /// and the caller makes the buffer as any other.
+    #[cfg(unix)]
     fn new_dma_buf_buffer_of_length_padding_unobserved(
         &self,
         _on: OnFault,
@@ -1025,6 +1026,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// the runtime rather than as Metal places a new buffer's, as nothing of Metal's makes one.
     /// Any refusal (a device that exports no buffer's memory, `RuntimeGap::ExportableMemory`,
     /// among them) answers `None`, logged at debug, and the caller makes the buffer as any other.
+    #[cfg(unix)]
     fn new_exportable_buffer_of_length(
         &self,
         _on: OnFault,
@@ -3299,6 +3301,7 @@ pub(crate) mod tests {
     /// buffer made as any other exports no dma-buf. On macOS, where MoltenVK exports no dma-buf of
     /// a buffer's memory, none is made, and the caller makes the cache as any other.
     #[test]
+    #[cfg(unix)]
     fn a_dma_buf_cache_exports_its_memory_with_its_aligned_byte_on_256_bytes() {
         use crate::core::platform::resource::Buffer as _;
         let d = dev();

@@ -1532,18 +1532,21 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// ([`crate::gpu::sync_file`]); `false` where it refuses one: on a device that exports none
     /// as a sync file (`RuntimeGap::SyncFileExport`, MoltenVK among them), after the commit, on
     /// a lost device.
+    #[cfg(unix)]
     fn add_completion_sync_file(&self) -> bool {
         self.raw.add_completion_sync_file().is_ok()
     }
 
     /// The runtime's export of the sync file asked for ([`crate::gpu::sync_file`]); `None`
     /// where it refuses it.
+    #[cfg(unix)]
     fn export_completion_sync_file(&self) -> Option<Option<std::os::fd::OwnedFd>> {
         self.raw.export_completion_sync_file().ok()
     }
 
     /// A semaphore of the command buffer's device, given `file` as a temporary import, waited for
     /// before the command buffer's work ([`crate::gpu::sync_file`]).
+    #[cfg(unix)]
     fn encode_wait_for_sync_file(&self, file: std::os::fd::OwnedFd) -> bool {
         crate::gpu::sync_file::encode_wait(&self.raw, file)
     }

@@ -213,6 +213,15 @@ pub trait CommandQueue<P: Platform>: Handle {
     fn set_label(&self, label: &str);
 }
 
+/// A command buffer's completion as a sync file, which another device waits for on its GPU
+/// ([`CommandBuffer::export_completion_sync_file`]): an open descriptor on Linux and macOS.
+#[cfg(unix)]
+pub type SyncFile = std::os::fd::OwnedFd;
+/// On Windows the runtime exports no sync file, so the type has no values, and a caller always
+/// waits for a command buffer on the host.
+#[cfg(windows)]
+pub type SyncFile = std::convert::Infallible;
+
 /// `id<MTLCommandBuffer>` (`MTLCommandBufferSPI` included).
 pub trait CommandBuffer<P: Platform>: Handle {
     /// sel: addCompletedHandler:
@@ -343,16 +352,15 @@ pub trait CommandBuffer<P: Platform>: Handle {
     /// `Some(None)` where the buffer has finished, so there is nothing to wait for (its
     /// [`Self::status`] tells how it ended); `None` where the platform refuses it, the default:
     /// the caller waits for the buffer on the host.
-    fn export_completion_sync_file(&self) -> Option<Option<std::os::fd::OwnedFd>> {
+    fn export_completion_sync_file(&self) -> Option<Option<SyncFile>> {
         None
     }
     /// The platform's own, no Metal call: before any encoder, the buffer's work waits on its GPU
-    /// for the sync file `file`, another device's completion
+    /// for the sync file it is given, another device's completion
     /// ([`Self::export_completion_sync_file`]); the buffer's device takes the file. `false`, the
     /// file closed, where the platform cannot, the default: the caller waits for that completion
     /// on the host.
-    fn encode_wait_for_sync_file(&self, file: std::os::fd::OwnedFd) -> bool {
-        drop(file);
+    fn encode_wait_for_sync_file(&self, _file: SyncFile) -> bool {
         false
     }
 }

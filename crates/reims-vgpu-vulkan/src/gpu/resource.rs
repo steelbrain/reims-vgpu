@@ -6,9 +6,11 @@ use std::ptr::NonNull;
 use std::sync::{Arc, Weak};
 
 use crate::core::host::HostPtr;
+#[cfg(unix)]
+use crate::core::platform::resource::ExportedMemory;
 use crate::core::platform::resource::{
-    Buffer, ComputePipeline, DepthStencilState, ExportedMemory, GpuResource, Heap, Library,
-    RenderPipeline, SamplerState, Texture,
+    Buffer, ComputePipeline, DepthStencilState, GpuResource, Heap, Library, RenderPipeline,
+    SamplerState, Texture,
 };
 use crate::core::platform::types::{MtlRegion, MtlSize, NsRange, Swizzle};
 use crate::core::platform::values::{SurfaceMatrix, SurfacePlane};
@@ -1010,6 +1012,7 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
 
     /// The runtime's export of the buffer's memory (`export_memory_fd`): a buffer the runtime
     /// made exportable ([`VulkanDevice`]'s `new_exportable_buffer_of_length`), else refused.
+    #[cfg(unix)]
     fn export_memory(&self) -> Result<ExportedMemory, String> {
         let exported = plain(|| self.raw.export_memory_fd()).map_err(|error| error.to_string())?;
         Ok(exported_memory(exported))
@@ -1018,6 +1021,7 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
     /// The runtime's export of the buffer's memory as a dma-buf (`export_memory_dma_buf`): a
     /// buffer the runtime made so ([`VulkanDevice`]'s
     /// `new_dma_buf_buffer_of_length_padding_unobserved`), else refused.
+    #[cfg(unix)]
     fn export_dma_buf(&self) -> Result<ExportedMemory, String> {
         let exported =
             (plain(|| self.raw.export_memory_dma_buf())).map_err(|error| error.to_string())?;
@@ -1028,12 +1032,14 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
     /// (`external_write_done`), which the device's next submission records before its commands,
     /// and after which a shadow of a texture over the buffer's bytes copies them in again at its
     /// next use in a command buffer committed after the call.
+    #[cfg(unix)]
     fn external_write_done(&self) -> Result<(), String> {
         plain(|| self.raw.external_write_done()).map_err(|error| error.to_string())
     }
 }
 
 /// What an import of a buffer's exported memory names, from the runtime's export of it.
+#[cfg(unix)]
 fn exported_memory(exported: rt::ExportedMemory) -> ExportedMemory {
     ExportedMemory {
         fd: exported.fd,

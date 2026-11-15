@@ -65,12 +65,11 @@
 //! pixel), and any object the runtime refuses to make or a sync that fails, answer `None`: the
 //! window then presents from the runtime's GPU.
 
-use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use reims_vgpu_vulkan::core::host::HostPtr;
 use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
-use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _, SyncFile};
 use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
 use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
@@ -196,7 +195,7 @@ pub(crate) struct Synced<P: Platform> {
 /// A sync's completion that the draw waits for on its GPU.
 pub(crate) struct Completion<P: Platform> {
     /// The sync file of the sync's completion.
-    pub(crate) file: OwnedFd,
+    pub(crate) file: SyncFile,
     /// The sync, which the window's thread waits for where the draw's device cannot wait for the
     /// file.
     pub(crate) sync: P::CommandBuffer,
