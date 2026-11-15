@@ -880,13 +880,13 @@ void ReimsGraphics::completeMobileSwap()
 	if (queue.current() != swap)
 		return;
 	// The swap's presentation time, the refresh the host answered in, a refresh after the swap's
-	// before, in mach_continuous_time's clock, which its frame info carries
-	// (notify_swap_done_gated, which the class's swap_complete_gated calls).
+	// before where that refresh has come by now, in mach_continuous_time's clock, which its frame
+	// info carries (notify_swap_done_gated, which the class's swap_complete_gated calls).
 	const UInt64 shown = __atomic_exchange_n(&mobileShownAt, 0, __ATOMIC_ACQ_REL);
 	const UInt64 period = __atomic_load_n(&mobileShownPeriod, __ATOMIC_RELAXED);
 	rgfxReadClocks([] { return mach_absolute_time(); }, [] { return mach_continuous_time(); },
 	               mobileFrameClock);
-	mobilePresentedAt = mobileFrameClock.time(shown, period);
+	mobilePresentedAt = mobileFrameClock.time(shown, period, mach_absolute_time());
 	rgfxLegacySwapComplete(this);
 	const UInt64 now = mach_absolute_time();
 	noteMobileSwapRate(now);

@@ -175,7 +175,7 @@ void frameInfo()
 		Clocks k{ticks};
 		RgfxFrameInfoClock clock;
 		rgfxReadClocks([&] { return k.absolute(); }, [&] { return k.continuous(); }, clock);
-		check(clock.lead() == 40 && clock.time(1000, 0) == 1040,
+		check(clock.lead() == 40 && clock.time(1000, 0, 1000) == 1040,
 		      "reads that agree give the lead exactly", "frameInfo");
 	}
 	{
@@ -187,47 +187,59 @@ void frameInfo()
 		check(k.continuousReads == kRgfxClockReads && clock.lead() == 39,
 		      "none agree: every try made, the lead at least the continuous less the later read",
 		      "frameInfo");
-		check(clock.time(1000, 0) == 1039, "a time short by the tick", "frameInfo");
+		check(clock.time(1000, 0, 1000) == 1039, "a time short by the tick", "frameInfo");
 		// A later reading that agrees: the lead exact, the time with it.
 		Clocks again{};
 		again.now = 9000;
 		rgfxReadClocks([&] { return again.absolute(); }, [&] { return again.continuous(); },
 		               clock);
-		check(clock.lead() == 40 && clock.time(1000, 0) == 1040, "the lead exact once read so",
+		check(clock.lead() == 40 && clock.time(1000, 0, 1000) == 1040, "the lead exact once read so",
 		      "frameInfo");
 		// A reading short again leaves the lead: it never shrinks.
 		clock.read(20000, 20039, 20001);
 		check(clock.lead() == 40, "a lower bound under the lead leaves it", "frameInfo");
 		// The system slept 500 ticks: the lead grows with the next reading.
 		clock.read(30000, 30540, 30000);
-		check(clock.lead() == 540 && clock.time(2000, 0) == 2540, "a longer lead after a sleep",
+		check(clock.lead() == 540 && clock.time(2000, 0, 2000) == 2540, "a longer lead after a sleep",
 		      "frameInfo");
 	}
 	{
 		// Each time is a refresh, 400 ticks, after the one given before: a swap whose refresh is
-		// not after the last one's is given the refresh after that, up to two periods past its
-		// own, then the last one's; a swap that showed nothing reads 0 and changes nothing.
+		// not a period after the last one's is given the refresh after that where it came by the
+		// swap's completion, else its own where that lies nearer the refresh after, else the last
+		// one's; a swap that showed nothing reads 0 and changes nothing.
 		RgfxFrameInfoClock clock;
 		clock.read(5000, 5040, 5000);
-		check(clock.time(1001, 400) == 1041, "the first time", "frameInfo");
-		check(clock.time(1000, 400) == 1441, "one before it: the next refresh", "frameInfo");
-		check(clock.time(0, 400) == 0, "nothing shown, 0", "frameInfo");
-		check(clock.time(1401, 400) == 1841, "the last one's refresh: the next", "frameInfo");
-		check(clock.time(1402, 400) == 2241, "two periods past its own at most", "frameInfo");
-		check(clock.time(1403, 400) == 2241, "past that, the last time", "frameInfo");
-		check(clock.time(2201, 400) == 2641, "its own refresh, the last one's: the next",
+		check(clock.time(1001, 400, 1100) == 1041, "the first time", "frameInfo");
+		check(clock.time(1000, 400, 1401) == 1441, "one before it: the next refresh, come by then",
 		      "frameInfo");
-		check(clock.time(3001, 400) == 3041, "a later refresh as it is", "frameInfo");
-		check(clock.time(3441, 400) == 3481, "a period on, as it is", "frameInfo");
+		check(clock.time(0, 400, 1500) == 0, "nothing shown, 0", "frameInfo");
+		check(clock.time(1401, 400, 1801) == 1841, "the last one's refresh: the next, come by then",
+		      "frameInfo");
+		check(clock.time(1401, 400, 2200) == 1841,
+		      "the next refresh a tick after the completion: the last one's", "frameInfo");
+		check(clock.time(1402, 400, 1900) == 1841, "two in one refresh: the last one's",
+		      "frameInfo");
+		check(clock.time(1403, 400, 2201) == 2241, "its refresh come at the completion: given",
+		      "frameInfo");
+		check(clock.time(2201, 400, 2601) == 2641, "its own refresh, the last one's: the next",
+		      "frameInfo");
+		check(clock.time(3001, 400, 3001) == 3041, "a later refresh as it is", "frameInfo");
+		check(clock.time(3441, 400, 3441) == 3481, "a period on, as it is", "frameInfo");
 		// A sleep of 500 ticks between two swaps: the second is a period after the first in the
 		// absolute clock, its time with the longer lead.
 		clock.read(6000, 6540, 6000);
-		check(clock.time(3442, 400) == 3841 + 540, "a period on after a sleep, with its lead",
+		check(clock.time(3442, 400, 3900) == 3841 + 540, "a period on after a sleep, with its lead",
 		      "frameInfo");
+		// The refresh after mapped early, the next one a period on still to come: as it is.
+		check(clock.time(4100, 400, 4200) == 4100 + 540,
+		      "its own, nearer the refresh after than the last: as it is", "frameInfo");
+		check(clock.time(4000, 400, 4300) == 4100 + 540,
+		      "its own, nearer the last than the refresh after: the last one's", "frameInfo");
 		// No period (no refresh seen): never before the last one.
 		RgfxFrameInfoClock still;
 		still.read(5000, 5040, 5000);
-		check(still.time(1001, 0) == 1041 && still.time(1000, 0) == 1041,
+		check(still.time(1001, 0, 1001) == 1041 && still.time(1000, 0, 1001) == 1041,
 		      "no period: a time before the last given as it", "frameInfo");
 	}
 
@@ -249,12 +261,13 @@ void frameInfo()
 // read with 0 to 2 ticks of mach time passing at each read, so many readings agree in none of
 // their tries; midway the system sleeps for a second, which grows the continuous clock's lead.
 // QuartzCore takes each time back by the exact lead (mach_get_times): what it traces never goes
-// back, is never more than 2 ticks before the shown refresh nor more than two periods after it,
-// and is never before it once a reading gave the lead exactly; each is a period after the one
-// before, but where swaps come faster than the refreshes and the one before is two periods ahead
-// already, which gives its time again. The run also gives each swap the time its own last try's
-// reading gave, as the display did before the clock kept its lead: that time goes back in the
-// run, as it did on Ambrosia's boots.
+// back, is never more than 2 ticks before the shown refresh nor after the swap's completion, and is
+// never before it once a reading gave the lead exactly; each is a period after the one before,
+// but where the refresh a period on is still to come at the swap's completion (swaps faster than
+// the refreshes), which gives the time before again, or its own refresh where the VBLANKs map that
+// nearer the refresh after. The run also gives each swap the time its own last
+// try's reading gave, as the display did before the clock kept its lead: that time goes back in
+// the run, as it did on Ambrosia's boots.
 void longRun()
 {
 	uint64_t x = 0x2545f4914f6cdd1dull;
@@ -274,6 +287,7 @@ void longRun()
 	uint64_t lastAfter = 0, lastC = 0;    // the last try's later absolute read and continuous read
 	uint64_t oldTraced = 0, oldBack = 0;  // the time from each swap's own last try
 	uint64_t again = 0;                   // swaps given the time before theirs
+	uint64_t ahead = 0;                   // swaps given a refresh after their own
 	for (uint64_t n = 1; n <= 100000; n++) {
 		if (n == 50000)
 			lead += 24000000; // a second asleep: the absolute clock stops, the continuous one not
@@ -301,8 +315,8 @@ void longRun()
 			};
 			rgfxReadClocks(absolute, continuous, clock);
 			const uint64_t periodTicks = toTicks(vblank.period());
-			const uint64_t ahead = RgfxFrameInfoClock::kAheadPeriods * periodTicks;
-			const uint64_t time = clock.time(shown, periodTicks);
+			const uint64_t completed = mach;
+			const uint64_t time = clock.time(shown, periodTicks, completed);
 			// What QuartzCore traces, by the lead itself, and the refresh the clock gave, by the
 			// lead it read: the two agree where it read the lead exactly.
 			const uint64_t seen = time - lead;
@@ -310,19 +324,26 @@ void longRun()
 			const bool exact = clock.lead() == static_cast<int64_t>(lead);
 			check(clock.lead() <= static_cast<int64_t>(lead), "the lead never read past itself",
 			      "longRun");
-			check(given >= shown && given <= shown + ahead,
-			      "a given refresh is its own or at most two periods after", "longRun");
+			check(given >= shown && given <= completed,
+			      "a given refresh is its own or a later one, never after the completion", "longRun");
+			// Where a period after the one before is still to come at the completion: that one, or
+			// the swap's own refresh where the VBLANKs map it after that one (their offset moves
+			// with their delivery, so the refreshes they map lie a period apart give or take it).
 			check(swaps == 0 || given - lastGiven >= periodTicks ||
-			          (given == lastGiven && lastGiven + periodTicks > shown + ahead),
-			      "a period after the one before, or its refresh where that is two periods ahead",
+			          (lastGiven + periodTicks > completed &&
+			           (given == lastGiven || (given == shown && shown > lastGiven))),
+			      "a period after the one before, or where that is still to come that one or its "
+			      "own refresh",
 			      "longRun");
-			check(seen + 2 >= shown && seen <= shown + ahead,
-			      "a traced time is at most 2 ticks before its refresh, two periods after",
+			check(seen + 2 >= shown && seen <= completed,
+			      "a traced time is at most 2 ticks before its refresh, never after the completion",
 			      "longRun");
+			ahead += given > shown ? 1 : 0;
 			if (swaps && exact && lastExact)
-				check(seen == traced || seen - traced >= periodTicks,
-				      "with the lead read exactly, a traced time is a period after the one before "
-				      "or that one",
+				check(seen == traced || seen - traced >= periodTicks ||
+				          (traced + periodTicks > completed && seen == shown && shown > traced),
+				      "with the lead read exactly, a traced time is a period after the one before, "
+				      "that one, or where that is still to come its own refresh",
 				      "longRun");
 			if (exact)
 				check(seen >= shown, "never before its refresh once the lead was read exactly",
@@ -341,17 +362,22 @@ void longRun()
 	}
 	check(shared > 1000, "the run has swaps sharing a refresh", "longRun");
 	check(again > 0, "the run has swaps faster than the refreshes", "longRun");
+	check(ahead > 0, "the run has swaps given the refresh after their own", "longRun");
 	check(oldBack > 0, "each swap's own last reading gives times that go back", "longRun");
 }
 
 // A swap a refresh, each answered at, or just before or after, its refresh's VBLANK is taken (a
 // host with no window answers as it shows the surface; the VBLANK reaches the guest 0.1 to 3.1 ms
-// after its refresh, the answer between the refresh and a millisecond past the VBLANK's receipt).
-// An answer taken before its refresh's VBLANK maps to the refresh before (RgfxVblankClock::shownAt).
-// Each swap's time is a period after the one before, and its own refresh's: no earlier than the
-// refresh, no later than the latest the VBLANKs' delivery maps it to. The rule before,
-// each time never before the one given before (a period of 0), gives two swaps a refresh apart
-// one time.
+// after its refresh, the answer between the refresh and a millisecond past the VBLANK's receipt),
+// and completed a little after its answer. An answer taken before its refresh's VBLANK maps to the
+// refresh before (RgfxVblankClock::shownAt). Each swap's time is a period after the one before,
+// and its own refresh's: no earlier than the refresh, no later than the latest the VBLANKs'
+// delivery maps it to; where the refresh as the delivery maps it comes after the completion (an
+// answer within the least delivery of its refresh), the one before's, or after a swap so held
+// back, the refresh before its own; only an answer before its VBLANK is. Never after the
+// completion.
+// The rule before, each time never before the one given before (a period of 0), gives two swaps a
+// refresh apart one time.
 void refreshEdges()
 {
 	uint64_t x = 0x9e3779b97f4a7c15ull;
@@ -367,7 +393,7 @@ void refreshEdges()
 	RgfxFrameInfoClock clock, before;
 	clock.read(0, lead, 0);
 	before.read(0, lead, 0);
-	uint64_t last = 0, lastBefore = 0, early = 0, onTime = 0, pushed = 0, shared = 0;
+	uint64_t last = 0, lastBefore = 0, early = 0, onTime = 0, pushed = 0, shared = 0, heldBack = 0;
 	for (uint64_t n = 1; n <= 20000; n++) {
 		const uint64_t hostNs = 5000000000ull + n * periodNs;
 		const int64_t delay = 100000 + static_cast<int64_t>(next(3000000));
@@ -390,17 +416,34 @@ void refreshEdges()
 		}
 		const uint64_t periodTicks = toTicks(vblank.period());
 		const uint64_t shown = toTicks(shownNs);
-		const uint64_t time = clock.time(shown, periodTicks) - lead;
-		const uint64_t old = before.time(shown, 0) - lead;
+		const uint64_t completed = toTicks(answerNs + 1000 + next(20000));
+		const uint64_t time = clock.time(shown, periodTicks, completed) - lead;
+		const uint64_t old = before.time(shown, 0, completed) - lead;
+		check(time <= completed, "never after the completion", "refreshEdges");
+		const bool held = n > 1 && time == last;
 		if (n > 1) {
-			check(time - last >= periodTicks, "a period after the one before", "refreshEdges");
+			check(time - last >= periodTicks ||
+			          (last + periodTicks > completed && (held || (time == shown && shown > last))),
+			      "a period after the one before, or that one where its refresh came after the "
+			      "completion",
+			      "refreshEdges");
 			shared += old == lastBefore ? 1 : 0;
 		}
 		// The guest's clock is the host's here: a refresh maps to its time plus the least delivery
-		// the VBLANKs showed, 0.1 to 3.1 ms on, a period before the next.
-		check(time >= toTicks(hostNs) && time <= toTicks(hostNs + 3100000) + 2,
-		      "on its own refresh", "refreshEdges");
-		pushed += time != shown ? 1 : 0;
+		// the VBLANKs showed, 0.1 to 3.1 ms on, a period before the next. Where its own refresh may
+		// map after the completion (an answer before its VBLANK, after a swap held back), the one
+		// before.
+		const bool own = time >= toTicks(hostNs) && time <= toTicks(hostNs + 3100000) + 2;
+		const bool behind = !own && time >= toTicks(hostNs - periodNs) &&
+		                    time <= toTicks(hostNs - periodNs + 3100000) + 2 &&
+		                    completed < toTicks(hostNs + 3100000) + 2;
+		check(held || own || behind,
+		      "on its own refresh, or the one before where its own may map after the completion",
+		      "refreshEdges");
+		check(!(held || behind) || at < 0, "only an answer before its VBLANK held back",
+		      "refreshEdges");
+		pushed += time != shown && !held ? 1 : 0;
+		heldBack += held || behind ? 1 : 0;
 		last = time;
 		lastBefore = old;
 	}
@@ -408,6 +451,8 @@ void refreshEdges()
 	check(pushed > 1000, "answers before their VBLANK given the refresh after the last",
 	      "refreshEdges");
 	check(shared > 0, "the rule before gives two swaps a refresh apart one time", "refreshEdges");
+	check(heldBack > 1000, "answers before their refresh as the delivery maps it held back",
+	      "refreshEdges");
 }
 
 // What IOMobileFramebuffer.framework makes of an entry of the client's shared data queue
@@ -533,7 +578,8 @@ void imports()
 	      "supported_frame_info answers the tags", "imports");
 	check(source.find("rgfxReadClocks([] { return mach_absolute_time(); }, [] { return "
 	                  "mach_continuous_time(); },") != std::string::npos &&
-	          source.find("mobilePresentedAt = mobileFrameClock.time(shown, period);") !=
+	          source.find("mobilePresentedAt = mobileFrameClock.time(shown, period, "
+	                      "mach_absolute_time());") !=
 	              std::string::npos &&
 	          source.find("nanoseconds_to_absolutetime(self->vblankClock.period(), &period);") !=
 	              std::string::npos,
