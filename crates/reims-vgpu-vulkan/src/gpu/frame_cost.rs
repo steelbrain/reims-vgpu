@@ -130,6 +130,7 @@ impl Tally {
 }
 
 /// CPU time in nanoseconds: this thread's, the process's, and the monotonic clock's (wall).
+#[cfg(unix)]
 fn cpu_now() -> [u64; 3] {
     #[repr(C)]
     struct Timespec {
@@ -150,6 +151,52 @@ fn cpu_now() -> [u64; 3] {
         assert_eq!(unsafe { clock_gettime(clock, &mut at) }, 0);
         u64::try_from(at.sec).unwrap() * 1_000_000_000 + u64::try_from(at.nsec).unwrap()
     })
+}
+
+/// [`cpu_now`] on Windows: this thread's and the process's kernel and user times
+/// (`GetThreadTimes`, `GetProcessTimes`), and the monotonic clock's, the interrupt time
+/// (`QueryInterruptTimePrecise`), each in 100 ns units.
+#[cfg(windows)]
+fn cpu_now() -> [u64; 3] {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentThread, GetProcessTimes, GetThreadTimes,
+    };
+    let nanos =
+        |t: FILETIME| ((u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime)) * 100;
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let [mut made, mut ended, mut kernel, mut user] = [zero; 4];
+    // SAFETY: the running thread's pseudo-handle, and four live out-parameters.
+    let ok = unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut made,
+            &mut ended,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    assert_ne!(ok, 0);
+    let thread = nanos(kernel) + nanos(user);
+    // SAFETY: the current process's pseudo-handle, and four live out-parameters.
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut made,
+            &mut ended,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    assert_ne!(ok, 0);
+    let process = nanos(kernel) + nanos(user);
+    let mut wall = 0u64;
+    // SAFETY: a live out-parameter; the call cannot fail.
+    unsafe { windows_sys::Win32::System::WindowsProgramming::QueryInterruptTimePrecise(&mut wall) };
+    [thread, process, wall * 100]
 }
 
 /// Runs `call`, adding the CPU it took ([`cpu_now`]) to `into`.
