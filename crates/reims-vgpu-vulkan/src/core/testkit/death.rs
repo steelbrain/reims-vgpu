@@ -34,19 +34,33 @@
 //! The handlers chain to the actions they replace, on the alternate signal stack: std's
 //! stack-overflow handler still reports an overflow and aborts, as it does without the harness.
 //!
+//! On Windows the scratch file is a shared view of it (`CreateFileMapping`), whose writes reach
+//! the file however the child ends. An abort there is a fast fail no handler sees, so core's death
+//! marks itself on the dying thread before it aborts ([`dying`]), and a fault is marked by the
+//! child's unhandled-exception filter on the faulting thread (`sys::arm`). A death's record carries
+//! the signal a Unix child would have died of. The body shares no memory in place there
+//! ([`Child::share_ram`] and [`Child::share_region`] are Linux's and macOS's): heap pages cannot be
+//! replaced in place by a view.
+//!
 //! No product change: the child uses the capture's public switch, and this module is
 //! test-only (`cfg(any(test, feature = "testkit"))`).
 
-// Architecture 17.3, test harness: `mmap` over live pages, signal handlers and `_exit`.
+// Architecture 17.3, test harness: `mmap` over live pages, signal handlers and `_exit` (Windows:
+// a view of the file, the unhandled-exception filter and `TerminateProcess`).
 #![allow(unsafe_code)]
 // A test harness reports failure by panicking, and times its child in real time (17.4:
 // test-only code, as `testkit::capture`).
 #![allow(clippy::panic, clippy::disallowed_methods)]
 
-use std::ffi::{OsString, c_char, c_int, c_void};
+use std::ffi::{OsString, c_int};
+#[cfg(unix)]
+use std::ffi::{c_char, c_void};
 use std::fs::{File, OpenOptions};
+#[cfg(unix)]
 use std::os::fd::AsRawFd as _;
+#[cfg(unix)]
 use std::os::unix::fs::FileExt as _;
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -61,6 +75,7 @@ use crate::core::testkit::capture::DeathSlot;
 use crate::core::testkit::capture::VirtualTime;
 use crate::core::testkit::capture::set_capture_enabled;
 use crate::core::testkit::capture::with_slot;
+#[cfg(unix)]
 use crate::core::testkit::guest_ram::{GuestRam, RawRegion};
 
 /// The environment marker: set to the full test name in the child that runs it.
@@ -131,11 +146,15 @@ mod sys;
 static SHARED: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 
 struct ChildState {
+    /// The scratch file, held open (Linux and macOS remap shared memory onto it).
+    #[cfg_attr(windows, allow(dead_code))]
     file: File,
+    #[cfg_attr(windows, allow(dead_code))]
     alloc: Mutex<Alloc>,
 }
 
 #[derive(Default)]
+#[cfg_attr(windows, allow(dead_code))]
 struct Alloc {
     /// The next free offset for shared RAM in the file.
     next: u64,
@@ -153,6 +172,7 @@ pub fn in_child() -> bool {
 }
 
 /// The calling thread's system id and name, without allocating (the signal handler calls it).
+#[cfg(unix)]
 fn this_thread() -> (u64, [u8; NAME_MAX], usize) {
     let tid = sys::current_thread_id();
     let mut name = [0u8; NAME_MAX];
@@ -167,6 +187,15 @@ fn this_thread() -> (u64, [u8; NAME_MAX], usize) {
     }
     let len = name.iter().position(|b| *b == 0).unwrap_or(NAME_MAX);
     (tid, name, len)
+}
+
+/// The calling thread's system id and name, on Windows (`GetThreadDescription`, which allocates:
+/// no signal handler runs here, and a fault's filter runs as the thread itself would).
+#[cfg(windows)]
+fn this_thread() -> (u64, [u8; NAME_MAX], usize) {
+    let mut name = [0u8; NAME_MAX];
+    let len = sys::thread_name(&mut name);
+    (sys::current_thread_id(), name, len)
 }
 
 /// A header field as an atomic. `off` is a constant inside the header page.
@@ -251,10 +280,28 @@ pub fn trace(op: &str) {
     }
 }
 
+/// Marks the death of the calling thread, where this process is a child, as the signal handler
+/// does on Linux and macOS: core's death calls it on Windows just before it aborts, as that abort
+/// is a fast fail no handler sees (the module docs).
+#[cfg(windows)]
+pub fn dying() {
+    if in_child() {
+        append_here(K_DEATH, sys::SIGABRT.cast_unsigned(), b"");
+    }
+}
+
+/// [`dying`] for a fault the child's unhandled-exception filter met, of the signal `sig`.
+#[cfg(windows)]
+fn on_fatal_exception(sig: c_int) {
+    append_here(K_DEATH, sig.cast_unsigned(), b"");
+}
+
 /// The actions the harness's handler replaced, by signal: the handler (`SIG_DFL` is 0) and its
 /// flags. Stored before the handler is installed; the handler only reads them.
+#[cfg(unix)]
 static PREV_HANDLER: [AtomicUsize; sys::NSIG] =
     [const { AtomicUsize::new(sys::SIG_DFL) }; sys::NSIG];
+#[cfg(unix)]
 static PREV_FLAGS: [AtomicU32; sys::NSIG] = [const { AtomicU32::new(0) }; sys::NSIG];
 
 /// The handler for the signals that end a child: it marks the death on the dying thread and
@@ -267,6 +314,7 @@ static PREV_FLAGS: [AtomicU32; sys::NSIG] = [const { AtomicU32::new(0) }; sys::N
 ///   overflow and aborts, so the death is marked by the `SIGABRT` it raises; for any other fault
 ///   it restores the default action and returns. If it returns, the handler appends the marker
 ///   and returns, and the faulting instruction runs again and ends the process.
+#[cfg(unix)]
 extern "C" fn on_fatal_signal(sig: c_int, info: *mut c_void, ctx: *mut c_void) {
     let i = usize::try_from(sig).unwrap_or(0);
     let prev = PREV_HANDLER
@@ -296,6 +344,7 @@ extern "C" fn on_fatal_signal(sig: c_int, info: *mut c_void, ctx: *mut c_void) {
 
 /// Sets `sig`'s action to `handler` (on the alternate stack, with `flags`), and returns the
 /// action it replaced.
+#[cfg(unix)]
 fn set_action(sig: c_int, handler: sys::Handler, flags: c_int) -> Option<sys::SigAction> {
     let act = sys::SigAction::new(handler, flags | sys::SA_ONSTACK);
     let mut old = sys::SigAction::new(sys::Handler { raw: sys::SIG_DFL }, 0);
@@ -306,6 +355,7 @@ fn set_action(sig: c_int, handler: sys::Handler, flags: c_int) -> Option<sys::Si
 
 /// Installs [`on_fatal_signal`] for `sig`, keeping the action it replaces for the handler to
 /// chain to. A signal the process ignores is left ignored.
+#[cfg(unix)]
 fn arm(sig: c_int) {
     let mut cur = sys::SigAction::new(sys::Handler { raw: sys::SIG_DFL }, 0);
     // SAFETY: a query: `act` is null and `old` is a live `struct sigaction`.
@@ -331,8 +381,90 @@ fn arm(sig: c_int) {
     );
 }
 
+#[cfg(unix)]
 fn page_size() -> usize {
     usize::try_from(sys::getpagesize()).unwrap_or(0x4000)
+}
+
+/// A shared mapping of the scratch file's first `RAM_OFF` bytes (the parent sized the file), at
+/// an address the kernel picks, or null. It is never unmapped.
+#[cfg(unix)]
+fn map_shared(file: &File) -> *mut u8 {
+    // SAFETY: a fresh shared mapping of the open file at an address the kernel picks.
+    let p = unsafe {
+        sys::mmap(
+            std::ptr::null_mut(),
+            RAM_OFF,
+            sys::PROT_READ | sys::PROT_WRITE,
+            sys::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if p.addr() == usize::MAX {
+        return std::ptr::null_mut();
+    }
+    p.cast::<u8>()
+}
+
+/// [`map_shared`] on Windows: a view of the file (`sys::map_shared`).
+#[cfg(windows)]
+fn map_shared(file: &File) -> *mut u8 {
+    sys::map_shared(file, RAM_OFF)
+}
+
+/// Writes all of `buf` to `file` at `off`.
+#[cfg(unix)]
+fn write_all_at(file: &File, buf: &[u8], off: u64) -> std::io::Result<()> {
+    file.write_all_at(buf, off)
+}
+
+/// Writes all of `buf` to `file` at `off` (`seek_write` until it is written).
+#[cfg(windows)]
+fn write_all_at(file: &File, mut buf: &[u8], mut off: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt as _;
+    while !buf.is_empty() {
+        let n = file.seek_write(buf, off)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        buf = buf.get(n..).unwrap_or_default();
+        off = off.saturating_add(n.to_u64());
+    }
+    Ok(())
+}
+
+/// Fills `buf` from `file` at `off`.
+#[cfg(unix)]
+fn read_exact_at(file: &File, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+    file.read_exact_at(buf, off)
+}
+
+/// Fills `buf` from `file` at `off` (`seek_read` until it is filled).
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut off: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt as _;
+    while !buf.is_empty() {
+        let n = file.seek_read(buf, off)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        buf = std::mem::take(&mut buf).get_mut(n..).unwrap_or_default();
+        off = off.saturating_add(n.to_u64());
+    }
+    Ok(())
+}
+
+/// The signal a child's exit status says it died of; `None` for an exit.
+#[cfg(unix)]
+fn exit_signal(status: std::process::ExitStatus) -> Option<c_int> {
+    status.signal()
+}
+
+/// [`exit_signal`] on Windows: the signal a Unix child would have died of (`sys::exit_signal`).
+#[cfg(windows)]
+fn exit_signal(status: std::process::ExitStatus) -> Option<c_int> {
+    sys::exit_signal(status)
 }
 
 /// The child's side of [`run`]: [`enter`], run `body`, [`Child::finish`]. A body that panics
@@ -358,22 +490,10 @@ pub fn enter() -> Child {
         Ok(f) => f,
         Err(e) => panic!("death harness: cannot open {}: {e}", path.display()),
     };
-    // SAFETY: a fresh shared mapping of the file's first `RAM_OFF` bytes (the parent sized the
-    // file), at an address the kernel picks. It is never unmapped.
-    let p = unsafe {
-        sys::mmap(
-            std::ptr::null_mut(),
-            RAM_OFF,
-            sys::PROT_READ | sys::PROT_WRITE,
-            sys::MAP_SHARED,
-            file.as_raw_fd(),
-            0,
-        )
-    };
-    if p.addr() == usize::MAX || p.is_null() {
+    let base = map_shared(&file);
+    if base.is_null() {
         panic!("death harness: cannot map {}", path.display());
     }
-    let base = p.cast::<u8>();
     if header_u64(base, H_MAGIC).load(Ordering::Acquire) != MAGIC {
         panic!("death harness: {} is not a harness file", path.display());
     }
@@ -392,6 +512,7 @@ pub fn enter() -> Child {
     SHARED.store(base, Ordering::Release);
     set_capture_enabled(false);
     sys::widen_alternate_stack();
+    #[cfg(unix)]
     for sig in [
         sys::SIGABRT,
         sys::SIGTRAP,
@@ -401,6 +522,8 @@ pub fn enter() -> Child {
     ] {
         arm(sig);
     }
+    #[cfg(windows)]
+    sys::arm(on_fatal_exception);
     let (tid, _, _) = this_thread();
     header_u64(base, H_BODY_TID).store(tid, Ordering::Release);
     header_u32(base, H_STATE).store(STATE_STARTED, Ordering::Release);
@@ -448,7 +571,9 @@ impl Child {
 
     /// Makes every range of `ram` shared with the parent, in place: the parent reads it by
     /// guest-physical address ([`Report::ram`]) after the child ends. Call it before any other
-    /// thread touches the ranges' pages; ranges added later are not shared.
+    /// thread touches the ranges' pages; ranges added later are not shared. Linux and macOS only
+    /// (the module docs).
+    #[cfg(unix)]
     pub fn share_ram(&self, ram: &GuestRam) {
         for r in ram.ranges() {
             self.share(
@@ -461,13 +586,16 @@ impl Child {
         }
     }
 
-    /// Makes `region` shared with the parent under `tag` ([`Report::region`]), in place.
+    /// Makes `region` shared with the parent under `tag` ([`Report::region`]), in place. Linux and
+    /// macOS only (the module docs).
+    #[cfg(unix)]
     pub fn share_region(&self, tag: &str, region: &RawRegion) {
         self.share(region.addr().addr(), region.len(), DIR_TAGGED, 0, tag);
     }
 
     /// Remaps the pages under `addr..addr+len` onto the file, keeping their bytes, and writes
     /// a directory entry for the parent.
+    #[cfg(unix)]
     fn share(&self, addr: usize, len: u64, kind: u32, key: u64, tag: &str) {
         let (Some(st), false) = (CHILD.get(), SHARED.load(Ordering::Acquire).is_null()) else {
             panic!("death harness: share outside a child");
@@ -1026,7 +1154,7 @@ impl Report {
 
     fn read_at(&self, off: u64, len: u64) -> Option<Vec<u8>> {
         let mut v = vec![0u8; usize::try_from(len).ok()?];
-        self.file.read_exact_at(&mut v, off).ok()?;
+        read_exact_at(&self.file, &mut v, off).ok()?;
         Some(v)
     }
 
@@ -1234,7 +1362,7 @@ pub fn spawn_command(mut cmd: Command, label: &str, opts: Options) -> Report {
         .unwrap_or_else(|e| fail("cannot create the scratch file", e));
     if let Err(e) = file
         .set_len(RAM_OFF.to_u64())
-        .and_then(|()| file.write_all_at(&MAGIC.to_ne_bytes(), 0))
+        .and_then(|()| write_all_at(&file, &MAGIC.to_ne_bytes(), 0))
     {
         fail("cannot size the scratch file", e)
     }
@@ -1273,7 +1401,7 @@ pub fn spawn_command(mut cmd: Command, label: &str, opts: Options) -> Report {
     let _ = std::fs::remove_file(&path);
 
     let mut head = vec![0u8; TRACE_OFF];
-    if let Err(e) = file.read_exact_at(&mut head, 0) {
+    if let Err(e) = read_exact_at(&file, &mut head, 0) {
         fail("cannot read the header", e)
     }
     let state = ne_u32(&head, H_STATE);
@@ -1283,7 +1411,7 @@ pub fn spawn_command(mut cmd: Command, label: &str, opts: Options) -> Report {
         .min(SLOTS)
         .saturating_mul(SLOT);
     let mut t = vec![0u8; used];
-    if let Err(e) = file.read_exact_at(&mut t, TRACE_OFF.to_u64()) {
+    if let Err(e) = read_exact_at(&file, &mut t, TRACE_OFF.to_u64()) {
         fail("cannot read the trace", e)
     }
     let Trace {
@@ -1321,7 +1449,7 @@ pub fn spawn_command(mut cmd: Command, label: &str, opts: Options) -> Report {
     };
     let outcome = if timed_out {
         Outcome::TimedOut
-    } else if let Some(signal) = status.signal() {
+    } else if let Some(signal) = exit_signal(status) {
         let marker = records
             .iter()
             .enumerate()
@@ -1482,6 +1610,7 @@ mod tests {
     use crate::core::platform::os::{Clock as _, Deadline, MonoTime};
     use crate::core::raise::death::DeathKind;
     use crate::core::raise::death::DeathSite;
+    #[cfg(unix)]
     use crate::core::testkit::capture::capture_enabled;
     use crate::core::testkit::clock::VirtualClock;
     use std::sync::Arc;
@@ -1492,6 +1621,7 @@ mod tests {
         file: "site_t",
         line: 0,
     };
+    #[cfg(unix)]
     const WRITER_SITE: DeathSite = DeathSite {
         kind: DeathKind::NullDeref,
         file: "site_w",
@@ -1499,7 +1629,9 @@ mod tests {
     };
 
     /// Records "dropped" when dropped: a death must never run it.
+    #[cfg(unix)]
     struct Noisy;
+    #[cfg(unix)]
     impl Drop for Noisy {
         fn drop(&mut self) {
             trace("dropped");
@@ -1519,8 +1651,19 @@ mod tests {
         }
     }
 
+    /// An abort from a test's body, standing in for a death: on Windows, where the abort is a fast
+    /// fail no handler sees, it is first marked on the calling thread, as core's death marks
+    /// itself there ([`dying`]).
+    fn abort() -> ! {
+        #[cfg(windows)]
+        dying();
+        #[allow(clippy::disallowed_methods)] // the test's own death
+        std::process::abort()
+    }
+
     death_test!(
         /// A death after a side effect shows the effect, and runs no `Drop`
+        #[cfg(unix)]
         a_death_after_a_side_effect_shows_the_effect,
         |t| {
             let ram = GuestRam::with_range(0x1_0000_0000, 0x4000).unwrap();
@@ -1584,6 +1727,7 @@ mod tests {
     death_test!(
         /// Post-death RAM is visible, on every shared range and region, with the bytes written
         /// before the share kept
+        #[cfg(unix)]
         post_death_ram_is_visible,
         |t| {
             let ram = GuestRam::with_range(0x1_0000_0000, 0x8000).unwrap();
@@ -1735,7 +1879,7 @@ mod tests {
             CHILD_TIMEOUT,
             |t| {
                 t.op("aborting");
-                std::process::abort()
+                abort()
             },
             |r| {
                 let d = r.died();
@@ -1832,7 +1976,7 @@ mod tests {
                 // went on would leave.
                 append_here(K_DEATH, 6, b"");
                 t.op("after");
-                std::process::abort()
+                abort()
             },
             |_| {},
         );
@@ -1864,7 +2008,7 @@ mod tests {
             while !done.load(Ordering::Acquire) {
                 std::hint::spin_loop();
             }
-            std::process::abort()
+            abort()
         },
         |r| {
             let d = r.died();
@@ -2068,8 +2212,13 @@ mod tests {
         recurse(std::hint::black_box(n.wrapping_add(1))).wrapping_add(a[0])
     }
 
+    /// The signal a stack overflow ends this test binary with: std's diagnostic, then its abort
+    /// (`SIGABRT`) on Linux and macOS; on Windows std's diagnostic alone, and the overflow's own
+    /// exception, the harness's `SIGSEGV`.
+    const OVERFLOW_SIGNAL: c_int = if cfg!(windows) { 11 } else { 6 };
+
     /// The control for `a_stack_overflow_dies_as_without_the_harness`: without the harness, a
-    /// stack overflow in this test binary is std's death, its diagnostic and `SIGABRT`.
+    /// stack overflow in this test binary is std's death, its diagnostic and [`OVERFLOW_SIGNAL`].
     #[test]
     fn a_stack_overflow_without_the_harness_aborts() {
         const ENV: &str = "REIMS_VGPU_DEATH_OVERFLOW_CONTROL";
@@ -2088,7 +2237,7 @@ mod tests {
             .output()
             .unwrap();
         let err = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.signal(), Some(6), "{err}");
+        assert_eq!(exit_signal(out.status), Some(OVERFLOW_SIGNAL), "{err}");
         assert!(err.contains("overflowed its stack"), "{err}");
     }
 
@@ -2102,7 +2251,7 @@ mod tests {
         },
         |r| {
             let d = r.died();
-            assert_eq!(d.signal, 6, "{}", r.stderr());
+            assert_eq!(d.signal, OVERFLOW_SIGNAL, "{}", r.stderr());
             assert!(d.thread.body, "{d:?}");
             assert_eq!(d.op.as_deref(), Some("recursing"));
             assert_eq!(d.id, None);
@@ -2111,13 +2260,18 @@ mod tests {
                 "{}",
                 r.stderr()
             );
-            // std's line is one death's, and one death alone did not race.
+            // std's line is one death's, and one death alone did not race. On Windows std prints
+            // no abort line: the overflow's exception ends the process.
             assert!(!d.raced, "{d:?}");
-            assert_eq!(d.abort_lines.len(), 1, "{d:?}");
-            assert!(
-                d.abort_lines[0].contains("fatal runtime error: stack overflow"),
-                "{d:?}"
-            );
+            if cfg!(windows) {
+                assert!(d.abort_lines.is_empty(), "{d:?}");
+            } else {
+                assert_eq!(d.abort_lines.len(), 1, "{d:?}");
+                assert!(
+                    d.abort_lines[0].contains("fatal runtime error: stack overflow"),
+                    "{d:?}"
+                );
+            }
         }
     );
 
@@ -2236,7 +2390,7 @@ mod tests {
                 append_here(K_DEATH, 6, b"");
                 drop(held);
                 wait_until(|| locked.load(Ordering::Acquire));
-                std::process::abort()
+                abort()
             },
             |_| {},
         );
@@ -2320,7 +2474,13 @@ mod tests {
     /// `__builtin_trap`'s death on arm64: `SIGTRAP` on the calling thread, which ends the process
     /// and prints nothing.
     fn trap() -> ! {
+        #[cfg(unix)]
         sys::raise(sys::SIGTRAP);
+        // SAFETY: a breakpoint, whose exception no handler takes, so it ends the process.
+        #[cfg(windows)]
+        unsafe {
+            std::arch::asm!("int3", options(nomem, nostack));
+        }
         panic!("SIGTRAP returned")
     }
 
@@ -2520,7 +2680,7 @@ mod tests {
             if std::thread::current().name() == Some("b") {
                 use std::io::Write as _;
                 let _ = writeln!(std::io::stderr(), "{prefix}: {info}");
-                std::process::abort();
+                abort();
             }
             previous(info);
         }));
@@ -2563,6 +2723,11 @@ mod tests {
         /// A death line is not paired with a thread std aborted, with a line of its own, for a
         /// panic that could not unwind: `a` printed its line and `b` panicked inside an
         /// `extern "C"` function
+        #[cfg_attr(
+            windows,
+            ignore = "std's own abort is a fast fail on Windows, which no handler \
+            sees, so nothing marks its thread"
+        )]
         a_death_line_beside_a_std_abort_is_not_paired,
         |_| {
             printed_not_marked("a", "site_a", 0);
@@ -2575,6 +2740,11 @@ mod tests {
     death_test!(
         /// A death line is not paired with a thread std's allocation-error hook aborted, with a
         /// line of its own
+        #[cfg_attr(
+            windows,
+            ignore = "std's own abort is a fast fail on Windows, which no handler \
+            sees, so nothing marks its thread"
+        )]
         a_death_line_beside_an_allocation_failure_is_not_paired,
         |_| {
             printed_not_marked("a", "site_a", 0);

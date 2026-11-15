@@ -214,6 +214,10 @@ pub(crate) fn die(id: DeathId, detail: Option<&str>) -> ! {
     let _ = std::io::stderr().write_all(line.as_bytes());
     // The trace's last lines, the events that led here (a diagnostic).
     crate::core::trace::flush_before_death();
+    // The subprocess harness's mark of the death on the dying thread, on Windows, where the abort
+    // below is a fast fail that no handler sees (`testkit::death`).
+    #[cfg(all(windows, any(test, feature = "testkit")))]
+    crate::core::testkit::death::dying();
     #[allow(clippy::disallowed_methods)] // the one fatal path's abort (6.4)
     std::process::abort()
 }
