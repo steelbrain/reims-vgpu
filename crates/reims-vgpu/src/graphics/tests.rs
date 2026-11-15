@@ -1662,12 +1662,14 @@ fn a_doorbell_write_answers_a_command_buffer_on_its_thread() {
         ring.publish(asking(queue, cb));
         let raises = raised.lock().len();
         device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
-        answered = ring.has_event();
+        // Answered in the write where the vector was raised on this thread, which runs nothing of
+        // the device's but the write: a `CB_SUBMITTED` there now may be the queue's thread's,
+        // posted as soon as the write that left the buffer woke it.
+        answered = raised.lock()[raises..].contains(&(1, here.clone()));
         if answered {
             assert!(
-                raised.lock()[raises..].contains(&(1, here.clone())),
-                "no raise of buffer {cb}'s vector in the write: {:?}",
-                raised.lock()
+                ring.has_event(),
+                "the CB_SUBMITTED is posted before the write returns"
             );
         }
         // Posted before the write returned, or by the queue's thread where the write left it.
