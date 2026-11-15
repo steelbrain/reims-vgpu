@@ -177,8 +177,9 @@
 //!
 //! **The end.** The last [`Device`] handle's drop ends its threads without waiting for them: each
 //! sees the end at its next wake (the control thread and the lanes' at once, or once the message
-//! a lane carries out returns, the refresh thread within a refresh), and the last of them to let
-//! go drops its reference to the region and the host's callbacks.
+//! a lane carries out returns, the refresh thread within a refresh, or within
+//! [`REFRESH_SLEEP_PART`] where a refresh is longer), and the last of them to let go drops its
+//! reference to the region and the host's callbacks.
 //!
 //! **Reset.** Writing `STATUS` 0, and the host's reset, put the device back as it was made, as a
 //! device's function reset does: no command is taken until the guest writes `STATUS` 1, the
@@ -260,6 +261,13 @@ pub const MAX_DOORBELL_ROUTES: u32 = 128;
 /// at or below 0x4000_0000: the host caps the guest's RAM below 4 GiB at 1 GiB (QEMU's
 /// `-machine max-ram-below-4g=1G`). With q35's default of 2 GiB there the BAR gets no address.
 pub const REGION_SIZE: u64 = 1 << 30;
+
+/// The longest the refresh thread sleeps at once: a longer wait for its next tick is slept in
+/// parts, so the thread, which holds the region and the host's callbacks, sees the device's end
+/// within this of it whatever the mode's refresh (the tests' is once in 1000 s). A refresh at
+/// 20 Hz or more is one sleep, as before. Windows charges the region to the host's commit limit
+/// whole for as long as it lives (`region.rs`).
+const REFRESH_SLEEP_PART: Duration = Duration::from_millis(50);
 
 /// How long a post waits for room in a full completion ring before it looks again, where nothing
 /// wakes it sooner ([`Room`]): the guest makes room by moving the ring's consumer count, which
@@ -3491,11 +3499,20 @@ impl Shared {
     /// ([`RefreshGrid`]), stamped with the tick's time however late the thread woke for it.
     fn refresh_thread(&self) {
         let mut grid = RefreshGrid::new(now_ns());
+        let part = u64::try_from(REFRESH_SLEEP_PART.as_nanos()).unwrap_or(u64::MAX);
         while !self.ending() {
             let now = now_ns();
             let tick = grid.next(self.screen.mode().period_ns(), now);
-            if tick > now {
-                std::thread::sleep(Duration::from_nanos(tick - now));
+            let mut left = tick.saturating_sub(now);
+            while left > part {
+                std::thread::sleep(REFRESH_SLEEP_PART);
+                if self.ending() {
+                    return;
+                }
+                left = tick.saturating_sub(now_ns());
+            }
+            if left > 0 {
+                std::thread::sleep(Duration::from_nanos(left));
             }
             if self.ending() {
                 break;

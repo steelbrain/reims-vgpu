@@ -1000,6 +1000,22 @@ fn a_new_scale_is_told_with_display_changed() {
     assert!(rig.quiet_for(2000), "told once");
 }
 
+/// A dropped device lets its region go once its threads see the end, though its refresh comes
+/// once in 1000 s ([`NEVER_MHZ`]): the refresh thread sleeps that wait in parts
+/// ([`REFRESH_SLEEP_PART`]). Windows charges each region to the host's commit limit whole while
+/// it lives, so a test that makes many devices would otherwise hold every region it made
+#[test]
+fn a_dropped_device_lets_its_region_go() {
+    let rig = Rig::new();
+    rig.start();
+    let region = Arc::downgrade(&rig.device.shared.region);
+    drop(rig);
+    assert!(
+        eventually(|| region.upgrade().is_none()),
+        "the region outlived its device"
+    );
+}
+
 /// A reset stops the device, puts both rings back as new and the display with no cursor or
 /// `VBLANK`, its scanout kept, and the guest starts again from its first command
 #[test]
