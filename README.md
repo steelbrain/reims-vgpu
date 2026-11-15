@@ -27,9 +27,12 @@ We don't ship disk images: macOS comes straight from Apple. `reims-ctl` download
 from Apple and sets the VM up for you, or uses a disk that already has macOS on it.
 
 You need an x86-64 Linux host. Our drivers load on macOS 26.4 and later for now; we've tested
-macOS 26 on an RTX 5080 laptop GPU and a Radeon 780M. arm64 macOS guests on Apple silicon Macs aren't built
-right now: they come back with Ambrosia, our own arm64 firmware. [docs/qemu.md](docs/qemu.md) has
-the details.
+macOS 26 on an RTX 5080 laptop GPU and a Radeon 780M.
+
+On an Apple silicon Mac, arm64 macOS 14 to 27 runs on QEMU with Ambrosia, our own arm64 firmware,
+and the same virtual GPU. `reims-ctl` doesn't set these VMs up: you install macOS with a tool
+built on Apple's Virtualization.framework first, then boot it with Ambrosia, which adds our drivers
+to the guest as it starts. [docs/qemu.md](docs/qemu.md), "arm64 guests", has the details.
 
 ### Install reims-ctl
 
