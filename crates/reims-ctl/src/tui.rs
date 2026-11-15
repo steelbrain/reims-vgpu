@@ -67,11 +67,28 @@ pub fn run() -> Result<()> {
     let result = app.run(&mut terminal);
     let _ = app.hand_over();
     ratatui::restore();
+    stop_restores();
     result?;
     if app.update_requested {
         return run_update(app.update_channel);
     }
     Ok(())
+}
+
+/// Stops the restores of arm64 VMs still running as the interface ends, and waits while each
+/// removes its VM's files, so none is left half made.
+fn stop_restores() {
+    if crate::restore::running() == 0 {
+        return;
+    }
+    println!("Stopping the restore of each arm64 VM being made, which removes its files…");
+    crate::restore::cancel();
+    if !crate::restore::wait_stopped(Duration::from_secs(120)) {
+        eprintln!(
+            "warning: a restore did not stop within 2 minutes: its VM's directory may be left; \
+             delete it before you create the VM again"
+        );
+    }
 }
 
 /// Runs the update in the plain terminal, then reims-ctl again in this process's place: the new
@@ -99,6 +116,8 @@ enum Msg {
     Progress(String, u64, String),
     Done(String, u64, Result<String, String>),
     Gpus(Vec<GpuInfo>),
+    /// Apple's catalog of IPSWs, read on an arm64 host as the interface starts.
+    Ipsws(Result<Vec<reims_restore::catalog::Entry>, String>),
 }
 
 enum Overlay {
@@ -113,6 +132,11 @@ enum Overlay {
         title: String,
         body: String,
         options: Vec<(&'static str, Action)>,
+        choice: usize,
+    },
+    /// What's downloaded for new VMs (downloads.rs): `choice` is the selected row.
+    Downloads {
+        items: Vec<crate::downloads::Item>,
         choice: usize,
     },
     /// The host's USB devices, to give the VM `vm` or take back (usb.rs): `choice` is the
@@ -148,10 +172,17 @@ enum TextKind {
 #[derive(Clone)]
 enum Action {
     None,
-    Delete { vm: String, keep_files: bool },
+    Delete {
+        vm: String,
+        keep_files: bool,
+    },
     ForceStop(String),
     UpdateOpencore(String),
     Update(Option<Channel>),
+    /// Deletes a download by its name, then shows the downloads again.
+    DeleteDownload(String),
+    /// Shows the downloads again.
+    Downloads,
     Quit,
 }
 
@@ -231,6 +262,8 @@ struct App {
     pending_view: Option<Vm>,
     /// The macOS versions reims-util downloads, read when the first x86-64 VM's form opens.
     macos_versions: Option<Result<Vec<reims_util::Version>, String>>,
+    /// Apple's catalog of IPSWs, on an arm64 host, once read.
+    ipsw_catalog: Option<Result<Vec<reims_restore::catalog::Entry>, String>>,
     /// The works `spawn` started: the last one's id.
     spawned: u64,
     /// The forms closed while the work they started runs, by its id: one whose work fails
@@ -273,6 +306,7 @@ impl App {
             pending_page: None,
             pending_view: None,
             macos_versions: None,
+            ipsw_catalog: None,
             spawned: 0,
             closed_forms: BTreeMap::new(),
             failed_forms: Vec::new(),
@@ -298,6 +332,14 @@ impl App {
         if !app.rows.is_empty() {
             app.table.select(Some(0));
         }
+        if host.default_profile() == Some(Profile::VmappleArm64) {
+            let tx = app.tx.clone();
+            std::thread::spawn(move || {
+                let client = reims_restore::http::Client::apple();
+                let r = reims_restore::catalog::fetch(&client, reims_restore::catalog::URL);
+                let _ = tx.send(Msg::Ipsws(r.map_err(|e| format!("{e:#}"))));
+            });
+        }
         if matches!(host.os, Os::Linux | Os::Windows) {
             let tx = app.tx.clone();
             std::thread::spawn(move || {
@@ -309,7 +351,7 @@ impl App {
                 &format!("reims-ctl runs no VMs on {host} yet"),
                 Level::Error,
             );
-        } else if app.qemu.is_none() {
+        } else if app.qemu.is_none() && host.default_profile().is_some_and(Profile::starts) {
             app.say(
                 "QEMU is not installed: run scripts/install-ctl.sh in your reims-vgpu checkout",
                 Level::Warn,
@@ -541,6 +583,16 @@ impl App {
                     f.set_options("gpu", options);
                 }
             }
+            Msg::Ipsws(r) => {
+                self.ipsw_catalog = Some(r);
+                let options = ipsw_options(self.ipsw_catalog.as_ref());
+                if let Some(Overlay::Form(FormKind::Create, f)) = &mut self.overlay
+                    && f.is_shown("source")
+                    && self.host.default_profile() == Some(Profile::VmappleArm64)
+                {
+                    f.set_options("source", options);
+                }
+            }
         }
         self.open_failed_form();
     }
@@ -625,6 +677,7 @@ impl App {
                 devices,
                 choice,
             }) => self.usb_key(k, vm, devices, choice),
+            Some(Overlay::Downloads { items, choice }) => self.downloads_key(k, items, choice),
             None => self.main_key(k),
         }
         self.open_failed_form();
@@ -872,7 +925,8 @@ impl App {
             body: format!(
                 "{busy}\n\nQuitting stops this work where it is: a guest asked to shut down still does, \
                  but is no longer powered off if it does not; a VM being created is left unfinished, \
-                 though a download of macOS picks up where it stopped when you create it again."
+                 though a download of macOS picks up where it stopped when you create it again; an \
+                 arm64 VM being restored is stopped, and its files removed."
             ),
             options: vec![("Keep working", Action::None), ("Quit", Action::Quit)],
             choice: 0,
@@ -899,6 +953,7 @@ impl App {
             KeyCode::Enter => self.open_menu(None, k.modifiers.contains(KeyModifiers::CONTROL)),
             KeyCode::Delete => self.ask_delete(),
             KeyCode::Char('u') => self.ask_update(),
+            KeyCode::Char('D') => self.open_downloads(),
             KeyCode::Char('r') => {
                 let _ = self.reload();
                 self.say("reloaded", Level::Info);
@@ -942,6 +997,14 @@ impl App {
     fn act(&mut self, a: Action) {
         match a {
             Action::None => {}
+            Action::Downloads => self.open_downloads(),
+            Action::DeleteDownload(name) => {
+                match crate::downloads::delete(&name) {
+                    Ok(s) => self.say(&s, Level::Ok),
+                    Err(e) => self.say(&format!("{e:#}"), Level::Error),
+                }
+                self.open_downloads();
+            }
             Action::Quit => self.quit = true,
             Action::Update(channel) => {
                 self.update_requested = true;
@@ -1158,12 +1221,13 @@ impl App {
             .and_then(Channel::of);
         // __record-install installs reims-util where the host makes x86-64 VMs, or where one is
         // beside reims-ctl (cli.rs).
-        let what = if self.host.default_profile() == Some(Profile::Q35X86_64)
-            || reims_util::beside().is_some()
-        {
-            "reims-ctl, the library, QEMU and reims-util"
-        } else {
-            "reims-ctl, the library and QEMU"
+        // An arm64 host builds no QEMU (scripts/install-ctl.sh).
+        let what = match (self.host.default_profile(), reims_util::beside().is_some()) {
+            (Some(Profile::Q35X86_64), _) => "reims-ctl, the library, QEMU and reims-util",
+            (Some(Profile::VmappleArm64), true) => "reims-ctl and reims-util",
+            (Some(Profile::VmappleArm64), false) => "reims-ctl",
+            (None, true) => "reims-ctl, the library, QEMU and reims-util",
+            (None, false) => "reims-ctl, the library and QEMU",
         };
         let mut options = vec![("Cancel", Action::None), ("Update", Action::Update(None))];
         for c in Channel::ALL.into_iter().filter(|&c| Some(c) != current) {
@@ -1211,6 +1275,48 @@ impl App {
             .map(|vm| vm.config.usb.clone())
             .unwrap_or_default();
         usb::rows(&chosen, devices)
+    }
+
+    fn open_downloads(&mut self) {
+        self.overlay = Some(Overlay::Downloads {
+            items: crate::downloads::list(),
+            choice: 0,
+        });
+    }
+
+    fn downloads_key(&mut self, k: KeyEvent, items: Vec<crate::downloads::Item>, choice: usize) {
+        let last = items.len().saturating_sub(1);
+        let mut choice = choice.min(last);
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => return,
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => choice = (choice + 1).min(last),
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                choice = choice.saturating_sub(1)
+            }
+            KeyCode::Home => choice = 0,
+            KeyCode::End => choice = last,
+            KeyCode::Char('r') => return self.open_downloads(),
+            KeyCode::Char('d') | KeyCode::Delete => {
+                if let Some(i) = items.get(choice) {
+                    let name = i.name();
+                    self.overlay = Some(Overlay::Confirm {
+                        title: "Delete a download".into(),
+                        body: format!(
+                            "Delete {name}, {}? A later VM of its macOS downloads it again.",
+                            crate::downloads::size(i.bytes)
+                        ),
+                        options: vec![
+                            ("Delete", Action::DeleteDownload(name)),
+                            ("Keep", Action::Downloads),
+                        ],
+                        choice: 1,
+                    });
+                    return;
+                }
+            }
+            _ => {}
+        }
+        self.overlay = Some(Overlay::Downloads { items, choice });
     }
 
     fn usb_key(
@@ -1442,6 +1548,43 @@ impl App {
             self.say(crate::host::UNSUPPORTED, Level::Error);
             return;
         };
+        if profile == Profile::VmappleArm64 {
+            let options = ipsw_options(self.ipsw_catalog.as_ref());
+            let first = options[0].0.clone();
+            let mut fields = vec![
+                Field::text("name", "Name", "", "Letters, digits, '-', '_' and '.'."),
+                Field::choice(
+                    "source",
+                    "macOS from",
+                    options,
+                    &first,
+                    "The macOS restored onto the VM's new disk, with tickets Apple signs for \
+                     this VM, as a Mac restores one. Apple offers only the current macOS to \
+                     download: reims-ctl downloads its IPSW once (about 25 GB) and keeps it for \
+                     the next VM (D lists what's kept); a stopped download continues. For \
+                     another macOS, give an IPSW of your own. reims-ctl doesn't start arm64 VMs \
+                     yet.",
+                ),
+                Field::path(
+                    "ipsw",
+                    "IPSW",
+                    "",
+                    "A Mac's IPSW (Tab completes), such as \
+                     UniversalMac_14.6.1_23G93_Restore.ipsw, read where it is.",
+                )
+                .show_if("source", &["path"]),
+                Field::text(
+                    "disk_size",
+                    "Disk size",
+                    &format_mib(create::DEFAULT_DISK_MIB),
+                    "The new disk's size; it takes only what macOS writes, about the IPSW's size.",
+                ),
+            ];
+            fields.extend(place_fields());
+            let form = Form::new("New arm64 VM", "create", fields);
+            self.overlay = Some(Overlay::Form(FormKind::Create, form));
+            return;
+        }
         let mut fields = vec![
             Field::text(
                 "name",
@@ -1483,33 +1626,7 @@ impl App {
             Field::path("opencore", "OpenCore image", "", "Empty makes one for this VM, with OVMF, presenting the Mac of the image beside an existing disk (opencore.qcow2, as a VM's directory holds them), unless the disk is copied from a VM reims-ctl has, else a Mac identity of its own. Or an OpenCore image of yours to copy, with OVMF_CODE.fd and OVMF_VARS.fd beside it, such as the one a disk of macOS booted from, which keeps its Mac's identity.")
                 .placeholder("made for this VM"),
         ]);
-        fields.extend([
-            Field::path(
-                "dir",
-                "Storage directory",
-                "",
-                "Where its disks and settings go (Tab completes). Empty for the default.",
-            )
-            .placeholder(&format!(
-                "{}/<name>",
-                paths::tilde(&paths::default_vms_dir())
-            )),
-            Field::text(
-                "cpus",
-                "CPU cores",
-                &create::default_cpus().to_string(),
-                &format!("vCPUs; this host has {}.", create::host_cpus()),
-            ),
-            Field::text(
-                "memory",
-                "Memory",
-                &format_mib(create::default_memory_mib()),
-                &format!(
-                    "Such as 8G; this host has {}.",
-                    format_mib(create::host_memory_mib() / 1024 * 1024)
-                ),
-            ),
-        ]);
+        fields.extend(place_fields());
         fields.push(graphics_field(Graphics::default()));
         if profile.gpu_choice(self.host) {
             fields.push(
@@ -1559,6 +1676,11 @@ impl App {
             ),
             Field::text("memory", "Memory", &format_mib(c.memory_mib), "Such as 8G."),
         ];
+        if !c.profile.starts() {
+            let form = Form::new(&format!("Edit {}", c.name), "save", fields);
+            self.overlay = Some(Overlay::Form(FormKind::Edit(c.name.clone()), form));
+            return;
+        }
         // The displays', the resolution's, borderless's and the GPU's fields are reims-vgpu's.
         fields.push(graphics_field(c.graphics()));
         fields.extend([
@@ -1707,6 +1829,14 @@ impl App {
                 let name = spec.name.clone();
                 self.spawn_for(f, &name, "creating", move |p| {
                     let vm = create::create(spec, host, p)?;
+                    if !vm.config.profile.starts() {
+                        return Ok(format!(
+                            "created {} in {}: its macOS is restored (reims-ctl doesn't start \
+                             arm64 VMs yet)",
+                            vm.name(),
+                            paths::tilde(&vm.dir)
+                        ));
+                    }
                     let next = if runtime::install_steps(&vm).is_some() {
                         "; its details say how to install macOS"
                     } else {
@@ -1822,6 +1952,19 @@ impl App {
                 }
                 s.opencore = opt_path("opencore");
             }
+            Some(Profile::VmappleArm64) => {
+                s.ipsw = Some(match f.choice("source").as_str() {
+                    "path" => opt_path("ipsw")
+                        .context("give the IPSW to restore")?
+                        .display()
+                        .to_string(),
+                    // latest, or the path of an IPSW downloaded before
+                    other => other.to_string(),
+                });
+                s.disk = Some(DiskSource::New {
+                    size_mib: parse_size_mib(&f.text("disk_size")).context("disk size")?,
+                });
+            }
             None => bail!(crate::host::UNSUPPORTED),
         }
         if f.is_shown("graphics") {
@@ -1832,10 +1975,15 @@ impl App {
             s.display.resolution = f.text("resolution");
         }
         s.display.check()?;
-        s.logs = f.toggle("logs");
-        s.network = f.toggle("network");
-        if s.network {
-            s.ssh_port = ssh_port_field(f)?;
+        // The arm64 form has neither: its VM takes the defaults.
+        if f.is_shown("logs") {
+            s.logs = f.toggle("logs");
+        }
+        if f.is_shown("network") {
+            s.network = f.toggle("network");
+            if s.network {
+                s.ssh_port = ssh_port_field(f)?;
+            }
         }
         Ok(s)
     }
@@ -1966,6 +2114,7 @@ impl App {
                 let running = self.rows.iter().any(|r| &r.name == vm && r.pid.is_some());
                 draw_usb(f, area, vm, running, &rows, devices, *choice);
             }
+            Some(Overlay::Downloads { items, choice }) => draw_downloads(f, area, items, *choice),
             // A menu whose VM has left the list closes.
             Some(Overlay::Menu {
                 vm,
@@ -1986,19 +2135,22 @@ impl App {
             .default_profile()
             .map(|p| p.describe(self.host).to_string())
             .unwrap_or_else(|| "no VMs on this host".into());
-        let qemu = match &self.qemu {
-            Some(q) => Span::styled(q.clone(), Style::new().fg(Color::Green)),
-            None => Span::styled("QEMU not installed", Style::new().fg(Color::Red).bold()),
-        };
-        let line = Line::from(vec![
+        let mut spans = vec![
             Span::styled(
                 " reims-ctl ",
                 Style::new().fg(Color::Black).bg(Color::Cyan).bold(),
             ),
-            Span::raw(format!("  {} · {profile} · ", self.host)),
-            qemu,
-        ]);
-        f.render_widget(Paragraph::new(line), area);
+            Span::raw(format!("  {} · {profile}", self.host)),
+        ];
+        // An arm64 host has no QEMU: its VMs are made by a restore, which runs none.
+        if self.host.default_profile().is_none_or(Profile::starts) {
+            spans.push(Span::raw(" · "));
+            spans.push(match &self.qemu {
+                Some(q) => Span::styled(q.clone(), Style::new().fg(Color::Green)),
+                None => Span::styled("QEMU not installed", Style::new().fg(Color::Red).bold()),
+            });
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn draw_list(&mut self, f: &mut Frame, area: Rect) {
@@ -2212,8 +2364,12 @@ fn vm_menu(row: &VmRow, all: bool, host: Host) -> Vec<(VmCommand, &'static str)>
 /// Whether the VM can be given the host's USB devices: an x86-64 VM on a Linux host. Else why
 /// not, to say.
 fn usb_available(host: Host, vm: &Vm) -> Result<(), String> {
-    if host.default_profile().is_none() {
-        return Err(crate::host::UNSUPPORTED.into());
+    match host.default_profile() {
+        None => return Err(crate::host::UNSUPPORTED.into()),
+        Some(Profile::VmappleArm64) => {
+            return Err(format!("USB passthrough: {}", crate::host::X86_64_ONLY));
+        }
+        Some(Profile::Q35X86_64) => {}
     }
     if vm.config.q35.is_none() {
         return Err(format!(
@@ -2282,6 +2438,37 @@ fn displays_field(current: u32) -> Field {
 /// The graphics field's values that show a field of the library's.
 const LIBRARY: &[&str] = &["reims-vgpu"];
 
+/// A new VM's directory, vCPUs and memory: the create forms' fields.
+fn place_fields() -> Vec<Field> {
+    vec![
+        Field::path(
+            "dir",
+            "Storage directory",
+            "",
+            "Where its disks and settings go (Tab completes). Empty for the default.",
+        )
+        .placeholder(&format!(
+            "{}/<name>",
+            paths::tilde(&paths::default_vms_dir())
+        )),
+        Field::text(
+            "cpus",
+            "CPU cores",
+            &create::default_cpus().to_string(),
+            &format!("vCPUs; this host has {}.", create::host_cpus()),
+        ),
+        Field::text(
+            "memory",
+            "Memory",
+            &format_mib(create::default_memory_mib()),
+            &format!(
+                "Such as 8G; this host has {}.",
+                format_mib(create::host_memory_mib() / 1024 * 1024)
+            ),
+        ),
+    ]
+}
+
 /// The graphics choice of a VM, at `current`.
 fn graphics_field(current: Graphics) -> Field {
     let options = Graphics::ALL.map(|g| (g.id().to_string(), g.describe().to_string()));
@@ -2347,6 +2534,10 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
     let c = &mut vm.config;
     c.cpus = f.text("cpus").parse().context("CPU cores: a number")?;
     c.memory_mib = parse_size_mib(&f.text("memory")).context("memory")?;
+    // An arm64 VM's form has these two alone: the rest is its start's.
+    if !c.profile.starts() {
+        return c.check();
+    }
     if f.is_shown("graphics") {
         c.graphics = Some(Graphics::parse(&f.choice("graphics"))?);
     }
@@ -2497,7 +2688,10 @@ of its own. A VM runs reims-vgpu's own GPU device unless its settings choose ano
               installer from Apple and makes the VM's OpenCore image and disk, and the VM
               boots into the installer; its details then say how to install macOS. The form
               stays open until the VM is made, and shows what failed, to fix and create again;
-              Esc closes it meanwhile, and it opens again if the create fails
+              Esc closes it meanwhile, and it opens again if the create fails. On an arm64
+              Mac or arm64 Linux, it makes an arm64 VM: from the current macOS, which
+              reims-ctl downloads from Apple (about 25 GB) and keeps for the next, or an IPSW
+              you have, restored onto its new disk. reims-ctl doesn't start arm64 VMs yet
   s           start it
   x           stop it: the guest is asked to shut down, and powered off if it has not
               when its shutdown timeout ends (edit e to change it)
@@ -2528,6 +2722,9 @@ of its own. A VM runs reims-vgpu's own GPU device unless its settings choose ano
               same Mac, for its graphics: on reims-vgpu with the macOS drivers of its GPU
               device that this reims-ctl carries, which an image an older reims-ctl made
               lacks
+  D           downloads: the macOS installers and IPSWs kept for new VMs, and the space
+              each takes; d deletes the selected one (a later VM of its macOS downloads it
+              again). Also reims-ctl downloads
   u           update reims-ctl and QEMU from your reims-vgpu checkout
   r           reload the list
   ?           this help
@@ -2745,6 +2942,117 @@ fn draw_usb(
     );
 }
 
+/// The arm64 form's choices of macOS: the current one from Apple (`latest`), as Apple's catalog
+/// names it once read, unless it is downloaded already; each IPSW downloaded, by its path; or
+/// an IPSW of the user's own (`path`).
+fn ipsw_options(
+    catalog: Option<&Result<Vec<reims_restore::catalog::Entry>, String>>,
+) -> Vec<(String, String)> {
+    let have = crate::ipsw::on_disk();
+    let mut v = Vec::new();
+    match catalog
+        .and_then(|c| c.as_ref().ok())
+        .and_then(|l| l.first())
+    {
+        Some(e) if have.iter().any(|o| o.build == e.build) => {}
+        Some(e) => v.push((
+            "latest".into(),
+            format!("macOS {} ({}), downloaded from Apple", e.version, e.build),
+        )),
+        None => v.push((
+            "latest".into(),
+            "The current macOS, downloaded from Apple".into(),
+        )),
+    }
+    for o in &have {
+        v.push((
+            o.path.display().to_string(),
+            format!("macOS {} ({}), downloaded", o.version, o.build),
+        ));
+    }
+    v.push(("path".into(), "An IPSW of my own".into()));
+    v
+}
+
+/// Draws what's downloaded for new VMs: each of `items` with the space it takes and what it is,
+/// `choice` highlighted, and the space they take in all.
+fn draw_downloads(f: &mut Frame, area: Rect, items: &[crate::downloads::Item], choice: usize) {
+    let width = area.width.saturating_sub(4).min(110);
+    let inner_w = width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = vec![
+        Line::from(
+            "What reims-ctl keeps downloaded for new VMs: macOS installers, and IPSWs for arm64 \
+             VMs. Each is used by the next VM of its macOS; a deleted one is downloaded again \
+             when a VM needs it.",
+        )
+        .dim(),
+        Line::from(""),
+    ];
+    let first_row = lines.len();
+    if items.is_empty() {
+        lines.push(Line::from("Nothing is downloaded."));
+    }
+    let name_w = items
+        .iter()
+        .map(|i| i.name().chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(inner_w.saturating_sub(14).max(12));
+    for (n, i) in items.iter().enumerate() {
+        let mut name: String = i.name().chars().take(name_w).collect();
+        if i.name().chars().count() > name_w {
+            name.pop();
+            name.push('…');
+        }
+        let mut text = format!(
+            "{} {name:<name_w$}  {:>8}  {}",
+            if n == choice { "›" } else { " " },
+            crate::downloads::size(i.bytes),
+            i.what
+        );
+        // A row a line, cut where it is too long.
+        if text.chars().count() > inner_w {
+            text = text.chars().take(inner_w.saturating_sub(1)).collect();
+            text.push('…');
+        }
+        lines.push(if n == choice {
+            Line::from(text).style(Style::new().fg(Color::Black).bg(Color::Cyan))
+        } else {
+            Line::from(text)
+        });
+    }
+    lines.push(Line::from(""));
+    let total: u64 = items.iter().map(|i| i.bytes).sum();
+    lines.push(
+        Line::from(format!(
+            "{} in all · d delete · r rescan · Esc close",
+            crate::downloads::size(total)
+        ))
+        .dim(),
+    );
+    let rows_of = |l: &Line| (l.width().max(1)).div_ceil(inner_w.max(1)) as u16;
+    let need: u16 = lines.iter().map(rows_of).sum::<u16>() + 2;
+    let height = need.min(area.height);
+    let popup = area.centered(Constraint::Length(width), Constraint::Length(height));
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .title(Line::from(" Downloads ").bold())
+        .border_style(Style::new().fg(Color::Cyan));
+    let body = block.inner(popup);
+    let above: u16 = lines[..first_row + choice.min(items.len().saturating_sub(1))]
+        .iter()
+        .map(rows_of)
+        .sum();
+    let scroll = (above + 1).saturating_sub(body.height);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        popup,
+    );
+}
+
 /// Draws a VM's menu below the cell `at`, or above it where the screen has no room below,
 /// and as far left or up as the screen needs; returns where. Each item shows its key at its
 /// right.
@@ -2826,6 +3134,97 @@ mod tests {
             Some(Overlay::Form(_, f)) => f,
             _ => panic!("no form is open"),
         }
+    }
+
+    /// D shows the downloads; d asks, and Delete deletes the selected one, and the view shows
+    /// what is left.
+    #[test]
+    fn the_downloads_view_deletes_what_is_chosen() {
+        let _env = crate::testenv::Env::new("tui-downloads");
+        let dir = paths::installers_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = "UniversalMac_14.6.1_23G93_Restore.ipsw";
+        let b = "UniversalMac_27.2.1_26B131_Restore.ipsw";
+        std::fs::write(dir.join(a), b"a").unwrap();
+        std::fs::write(dir.join(b), b"b").unwrap();
+        let mut app = App::with(Host {
+            os: Os::Linux,
+            arch: Arch::Aarch64,
+        });
+        press(
+            &mut app,
+            [KeyCode::Char('D'), KeyCode::Down, KeyCode::Char('d')],
+        );
+        assert!(matches!(app.overlay, Some(Overlay::Confirm { .. })));
+        // Keep, the default, goes back to the list
+        press(&mut app, [KeyCode::Enter]);
+        assert!(matches!(app.overlay, Some(Overlay::Downloads { .. })));
+        press(
+            &mut app,
+            [
+                KeyCode::Down,
+                KeyCode::Char('d'),
+                KeyCode::Left,
+                KeyCode::Enter,
+            ],
+        );
+        let Some(Overlay::Downloads { items, .. }) = &app.overlay else {
+            panic!("the downloads view closed");
+        };
+        let left: Vec<_> = items.iter().map(|i| i.name()).collect();
+        assert_eq!(left, [a]);
+        assert!(!dir.join(b).exists());
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .0
+                .starts_with(&format!("deleted {b}"))
+        );
+    }
+
+    /// The arm64 form offers the current macOS from Apple once its catalog is read, each IPSW
+    /// downloaded, and an IPSW of the user's own.
+    #[test]
+    fn the_arm64_form_offers_apples_current_macos_and_those_downloaded() {
+        let _env = crate::testenv::Env::new("tui-ipsws");
+        let dir = paths::installers_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("UniversalMac_14.6.1_23G93_Restore.ipsw"), b"a").unwrap();
+        let entry = |v: &str, b: &str| reims_restore::catalog::Entry {
+            version: v.into(),
+            build: b.into(),
+            url: format!("https://updates.cdn-apple.com/x/UniversalMac_{v}_{b}_Restore.ipsw"),
+            sha1: None,
+        };
+        let labels = |c| -> Vec<String> { ipsw_options(c).into_iter().map(|o| o.1).collect() };
+        assert_eq!(
+            labels(None),
+            [
+                "The current macOS, downloaded from Apple",
+                "macOS 14.6.1 (23G93), downloaded",
+                "An IPSW of my own"
+            ]
+        );
+        let read = Ok(vec![entry("27.2.1", "26B131")]);
+        assert_eq!(
+            labels(Some(&read))[0],
+            "macOS 27.2.1 (26B131), downloaded from Apple"
+        );
+        // downloaded already: offered once, as downloaded
+        let read = Ok(vec![entry("14.6.1", "23G93")]);
+        assert_eq!(
+            labels(Some(&read)),
+            ["macOS 14.6.1 (23G93), downloaded", "An IPSW of my own"]
+        );
+        let mut app = App::with(Host {
+            os: Os::Mac,
+            arch: Arch::Aarch64,
+        });
+        app.open_create();
+        assert_eq!(form(&app).choice("source"), "latest");
+        app.message(Msg::Ipsws(Ok(vec![entry("27.2.1", "26B131")])));
+        assert_eq!(form(&app).choice("source"), "latest");
     }
 
     #[test]
@@ -3048,12 +3447,22 @@ mod tests {
 
         let mut app = App::with(Host {
             os: Os::Mac,
-            arch: Arch::Aarch64,
+            arch: Arch::X86_64,
         });
         app.reload().unwrap();
         press(&mut app, [KeyCode::Char('p')]);
         assert!(app.overlay.is_none());
         assert_eq!(app.status.as_ref().unwrap().0, crate::host::UNSUPPORTED);
+        // An arm64 Mac makes arm64 VMs, which take no USB devices.
+        let mut app = App::with(Host {
+            os: Os::Mac,
+            arch: Arch::Aarch64,
+        });
+        app.reload().unwrap();
+        press(&mut app, [KeyCode::Char('p')]);
+        assert!(app.overlay.is_none());
+        let said = &app.status.as_ref().unwrap().0;
+        assert!(said.ends_with(crate::host::X86_64_ONLY), "{said}");
 
         let mut app = App::with(LINUX);
         app.reload().unwrap();

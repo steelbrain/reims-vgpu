@@ -6,11 +6,14 @@
 #   scripts/install-ctl.sh [--yes] [--update] [--skip-qemu]
 #
 # Linux on x86-64 (Ubuntu or Debian, Arch or CachyOS; other distributions get
-# the list of what to install), where the library runs on Vulkan; reims-ctl
-# runs no VMs on another host. It:
+# the list of what to install), where the library runs on Vulkan and VMs run;
+# and arm64 Macs and arm64 Linux (Ubuntu or Debian, Arch, Fedora), where
+# reims-ctl makes arm64 VMs by restoring macOS from an IPSW, which runs no
+# QEMU: there it installs reims-ctl alone (step 4). It:
 #   1. checks the build's dependencies, and offers to install those missing
-#      (apt or pacman, through sudo), and rustup through rustup.rs, beside any
-#      other cargo, whose installer asks its own questions;
+#      (apt, pacman or dnf, through sudo; on a Mac, Xcode's command line tools
+#      are needed), and rustup through rustup.rs, beside any other cargo, whose
+#      installer asks its own questions;
 #   2. fetches vendor/qemu, QEMU's source, without QEMU's own submodules (its
 #      build fetches what it needs); cargo fetches metal2vulkan itself, at the
 #      commit the library's Cargo.toml names;
@@ -80,14 +83,23 @@ ask() {
 }
 
 OS="$(uname -s)" ARCH="$(uname -m)"
-[[ $OS/$ARCH == Linux/x86_64 ]] || die "reims-ctl runs VMs on Linux x86-64 hosts; this is $OS on $ARCH"
-PLATFORM=linux-x86_64
-# libusb (usb-host, USB passthrough) and SPICE (-spice, a display a SPICE
-# client connects to) are enabled by name: configure leaves out an optional
-# feature whose library it does not find, saying nothing.
-QEMU_CONFIGURE=(--target-list=x86_64-softmmu --enable-kvm --disable-sdl --enable-gtk --enable-slirp
-  --enable-libusb --enable-spice)
-QEMU_BINARY=qemu-system-x86_64
+# BUILDS_QEMU: whether this host runs VMs, on QEMU built on the library: Linux
+# x86-64. An arm64 host makes arm64 VMs by a restore, which runs no QEMU, and
+# reims-ctl doesn't start them: it gets reims-ctl alone.
+BUILDS_QEMU=1
+case "$OS/$ARCH" in
+  Linux/x86_64)
+    PLATFORM=linux-x86_64
+    # libusb (usb-host, USB passthrough) and SPICE (-spice, a display a SPICE
+    # client connects to) are enabled by name: configure leaves out an
+    # optional feature whose library it does not find, saying nothing.
+    QEMU_CONFIGURE=(--target-list=x86_64-softmmu --enable-kvm --disable-sdl --enable-gtk --enable-slirp
+      --enable-libusb --enable-spice)
+    QEMU_BINARY=qemu-system-x86_64
+    ;;
+  Darwin/arm64 | Linux/aarch64) BUILDS_QEMU=0 ;;
+  *) die "reims-ctl runs VMs on Linux x86-64 hosts, and makes arm64 VMs from an IPSW on arm64 Macs and arm64 Linux; this is $OS on $ARCH" ;;
+esac
 
 # The XDG directory VAR names, else ~/FALLBACK: ignored unless absolute (as
 # reims-ctl does).
@@ -100,6 +112,9 @@ CACHE="$(xdg XDG_CACHE_HOME .cache)/reims-ctl"
 mkdir -p "$DATA" "$CACHE"
 
 # Every VM runs on QEMU: --skip-qemu keeps the installed one, and needs one.
+if [[ $SKIP_QEMU == 1 && $BUILDS_QEMU == 0 ]]; then
+  die "--skip-qemu keeps the installed QEMU, and this host has none: reims-ctl makes arm64 VMs here by a restore, which runs no QEMU; run this without --skip-qemu"
+fi
 if [[ $SKIP_QEMU == 1 && ! -x "$DATA/qemu/current/bin/$QEMU_BINARY" ]]; then
   die "--skip-qemu keeps the installed QEMU, and none is installed ($DATA/qemu/current/bin/$QEMU_BINARY is missing): run this without --skip-qemu, which builds it"
 fi
@@ -169,8 +184,13 @@ fi
 
 missing=()
 
+# A Mac's C compiler and linker, which Rust's builds use.
+if [[ $OS == Darwin ]]; then
+  xcode-select -p >/dev/null 2>&1 || die "Xcode's command line tools are missing: run xcode-select --install, then this again"
+fi
+
 distro_id="" distro_like=""
-if [[ -r /etc/os-release ]]; then
+if [[ $OS == Linux && -r /etc/os-release ]]; then
   # shellcheck disable=SC1091
   distro_id="$(. /etc/os-release && echo "${ID:-}")"
   # shellcheck disable=SC1091
@@ -194,7 +214,16 @@ pacman_pkgs=(base-devel git curl python ninja pkgconf flex bison bzip2 cmake
   glib2 pixman libslirp zlib dtc pipewire libpulse alsa-lib libusb spice vulkan-icd-loader
   libx11 libxext libxrandr libxcursor libxi libxfixes libxss libxtst libxkbcommon
   wayland libdecor mesa libdrm dbus systemd-libs gtk3)
-case " $distro_id $distro_like " in
+dnf_pkgs=()
+if [[ $BUILDS_QEMU == 0 ]]; then
+  # reims-ctl alone, for arm64 Linux: a C compiler and linker for Rust's
+  # builds, git, and curl for rustup. Fedora is Asahi Linux's own distribution.
+  apt_pkgs=(build-essential git curl ca-certificates)
+  pacman_pkgs=(base-devel git curl)
+  dnf_pkgs=(gcc make git curl)
+fi
+case "$OS $distro_id $distro_like " in
+  Darwin*) ;;
   *" debian "* | *" ubuntu "*)
     for p in "${apt_pkgs[@]}"; do
       dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'install ok installed' || missing+=("$p")
@@ -204,6 +233,20 @@ case " $distro_id $distro_like " in
       ask "Install them with sudo apt-get?" || die "install them (sudo apt-get install ${missing[*]}), then run this again"
       sudo apt-get update
       sudo apt-get install -y "${missing[@]}"
+    fi
+    ;;
+  *" fedora "*)
+    if ((${#dnf_pkgs[@]} == 0)); then
+      warn "$distro_id is neither Debian/Ubuntu nor Arch/CachyOS: install the equivalents of these Ubuntu packages yourself if the build stops: ${apt_pkgs[*]}"
+    else
+      for p in "${dnf_pkgs[@]}"; do
+        rpm -q "$p" >/dev/null 2>&1 || missing+=("$p")
+      done
+      if ((${#missing[@]})); then
+        say "Missing packages: ${missing[*]}"
+        ask "Install them with sudo dnf?" || die "install them (sudo dnf install ${missing[*]}), then run this again"
+        sudo dnf install -y "${missing[@]}"
+      fi
     fi
     ;;
   *" arch "* | *" cachyos "*)
@@ -220,94 +263,98 @@ case " $distro_id $distro_like " in
     warn "$distro_id is neither Debian/Ubuntu nor Arch/CachyOS: install the equivalents of these Ubuntu packages yourself if the build stops: ${apt_pkgs[*]}"
     ;;
 esac
-if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
-  warn "/dev/kvm is not usable by you: enable virtualization in the firmware and add yourself to the kvm group (sudo usermod -aG kvm \$USER; log in again), or VMs will not start"
-fi
-# The guest's memory reaches the GPU through /dev/udmabuf, on every GPU: without
-# it the library's views of that memory take a kernel mapping per 4 KiB page,
-# past vm.max_map_count at 4K even at the guest's desktop (reims-ctl's
-# runtime::udmabuf_problem, docs/qemu.md "Linux hosts: vm.max_map_count").
-why="the guest's memory reaches the GPU through it, and without it the guest can crash at higher resolutions, at 4K even at its desktop"
-udmabuf=0
-if [[ ! -e /dev/udmabuf ]]; then
-  warn "there's no /dev/udmabuf: $why. Load it with sudo modprobe udmabuf, and put udmabuf in a file in /etc/modules-load.d to keep it"
-else
-  group="$(stat -c %G /dev/udmabuf)"
-  if [[ -r /dev/udmabuf && -w /dev/udmabuf ]]; then
-    udmabuf=1
-    if [[ $group != root ]] && ! id -nG | tr ' ' '\n' | grep -qx "$group"; then
-      say "You can open /dev/udmabuf in this session, but you're not in its $group group: over ssh, where a desktop session's access doesn't apply, add yourself to it (sudo usermod -aG $group \$USER) to start VMs there"
-    fi
-  elif [[ $group == root ]]; then
-    warn "only root can open /dev/udmabuf: $why. Give it to the kvm group with a udev rule, a file in /etc/udev/rules.d holding KERNEL==\"udmabuf\", GROUP=\"kvm\", MODE=\"0660\", add yourself to kvm (sudo usermod -aG kvm \$USER), and restart"
+# The rest of the host's checks are for the VMs it runs: KVM, the library's
+# GPU access to the guest's memory, and USB passthrough.
+if [[ $BUILDS_QEMU == 1 ]]; then
+  if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+    warn "/dev/kvm is not usable by you: enable virtualization in the firmware and add yourself to the kvm group (sudo usermod -aG kvm \$USER; log in again), or VMs will not start"
+  fi
+  # The guest's memory reaches the GPU through /dev/udmabuf, on every GPU: without
+  # it the library's views of that memory take a kernel mapping per 4 KiB page,
+  # past vm.max_map_count at 4K even at the guest's desktop (reims-ctl's
+  # runtime::udmabuf_problem, docs/qemu.md "Linux hosts: vm.max_map_count").
+  why="the guest's memory reaches the GPU through it, and without it the guest can crash at higher resolutions, at 4K even at its desktop"
+  udmabuf=0
+  if [[ ! -e /dev/udmabuf ]]; then
+    warn "there's no /dev/udmabuf: $why. Load it with sudo modprobe udmabuf, and put udmabuf in a file in /etc/modules-load.d to keep it"
   else
-    say "You can't open /dev/udmabuf: $why. You need its $group group"
-    if ask "Add you to the $group group with sudo usermod?"; then
-      sudo usermod -aG "$group" "$USER"
-      say "Added you to $group: log in again for it to take effect"
+    group="$(stat -c %G /dev/udmabuf)"
+    if [[ -r /dev/udmabuf && -w /dev/udmabuf ]]; then
+      udmabuf=1
+      if [[ $group != root ]] && ! id -nG | tr ' ' '\n' | grep -qx "$group"; then
+        say "You can open /dev/udmabuf in this session, but you're not in its $group group: over ssh, where a desktop session's access doesn't apply, add yourself to it (sudo usermod -aG $group \$USER) to start VMs there"
+      fi
+    elif [[ $group == root ]]; then
+      warn "only root can open /dev/udmabuf: $why. Give it to the kvm group with a udev rule, a file in /etc/udev/rules.d holding KERNEL==\"udmabuf\", GROUP=\"kvm\", MODE=\"0660\", add yourself to kvm (sudo usermod -aG kvm \$USER), and restart"
     else
-      warn "add yourself to the $group group (sudo usermod -aG $group \$USER) and log in again, or the guest can crash at higher resolutions"
+      say "You can't open /dev/udmabuf: $why. You need its $group group"
+      if ask "Add you to the $group group with sudo usermod?"; then
+        sudo usermod -aG "$group" "$USER"
+        say "Added you to $group: log in again for it to take effect"
+      else
+        warn "add yourself to the $group group (sudo usermod -aG $group \$USER) and log in again, or the guest can crash at higher resolutions"
+      fi
     fi
   fi
-fi
-# With udmabuf, vm.max_map_count is only a speed-up, on NVIDIA: a view of an
-# x86-64 guest's memory takes a mapping per 4 KiB page there, and past the
-# library's budget (the limit less 16,384 and 8,192) its buffers are copied,
-# which works and is slower (reims-ctl's runtime::max_map_count). A new VM
-# gets half the host's memory, 4 to 16 GiB.
-maps="$(cat /proc/sys/vm/max_map_count 2>/dev/null || echo 0)"
-vm_mib=$(($(awk '/^MemTotal:/ { print $2 }' /proc/meminfo) / 2 / 1048576 * 1024))
-vm_mib=$((vm_mib < 4096 ? 4096 : vm_mib > 16384 ? 16384 : vm_mib))
-want=$((vm_mib * 256 + 24576))
-if ((udmabuf && maps < want)) && grep -qsx 0x10de /sys/class/drm/*/device/vendor; then
-  raise=1048576
-  while ((raise < want)); do raise=$((raise * 2)); done
-  uncopied=$((maps > 24576 ? (maps - 24576) / 256 : 0))
-  say "vm.max_map_count is $maps: on an NVIDIA GPU, past about $uncopied MiB of a new VM's $((vm_mib / 1024)) GiB the GPU gets copies of its memory, which is slower; sudo sysctl -w vm.max_map_count=$raise, and a file in /etc/sysctl.d to keep it, avoids them"
-fi
-# MGLRU's thrashing guard (reims-ctl's runtime::MIN_TTL_FILE): above 0, the
-# kernel kills a process where it can't keep the pages used in the last that
-# many ms, even with RAM free, and a VM's QEMU can be the one. Measured on
-# CachyOS hosts at 100, its kernel's default there. Offered off on a terminal
-# only, and never required; the tmpfiles.d line keeps it off.
-min_ttl_file=/sys/kernel/mm/lru_gen/min_ttl_ms
-min_ttl_line='w /sys/kernel/mm/lru_gen/min_ttl_ms - - - - 0'
-min_ttl="$(cat "$min_ttl_file" 2>/dev/null || echo 0)"
-if [[ $min_ttl =~ ^[0-9]+$ ]] && ((min_ttl > 0)); then
-  warn "$min_ttl_file is $min_ttl: where the kernel can't keep the pages used in the last $min_ttl ms in memory, it kills a process, which can be a VM's QEMU, even while RAM is free (measured on hosts at 100, killing builds with most RAM free); 0 turns this off"
-  if [[ -t 0 ]] && ask "Write 0 to $min_ttl_file now with sudo?"; then
-    echo 0 | sudo tee "$min_ttl_file" >/dev/null || warn "sudo didn't write it"
+  # With udmabuf, vm.max_map_count is only a speed-up, on NVIDIA: a view of an
+  # x86-64 guest's memory takes a mapping per 4 KiB page there, and past the
+  # library's budget (the limit less 16,384 and 8,192) its buffers are copied,
+  # which works and is slower (reims-ctl's runtime::max_map_count). A new VM
+  # gets half the host's memory, 4 to 16 GiB.
+  maps="$(cat /proc/sys/vm/max_map_count 2>/dev/null || echo 0)"
+  vm_mib=$(($(awk '/^MemTotal:/ { print $2 }' /proc/meminfo) / 2 / 1048576 * 1024))
+  vm_mib=$((vm_mib < 4096 ? 4096 : vm_mib > 16384 ? 16384 : vm_mib))
+  want=$((vm_mib * 256 + 24576))
+  if ((udmabuf && maps < want)) && grep -qsx 0x10de /sys/class/drm/*/device/vendor; then
+    raise=1048576
+    while ((raise < want)); do raise=$((raise * 2)); done
+    uncopied=$((maps > 24576 ? (maps - 24576) / 256 : 0))
+    say "vm.max_map_count is $maps: on an NVIDIA GPU, past about $uncopied MiB of a new VM's $((vm_mib / 1024)) GiB the GPU gets copies of its memory, which is slower; sudo sysctl -w vm.max_map_count=$raise, and a file in /etc/sysctl.d to keep it, avoids them"
   fi
-  keep="the line $min_ttl_line in a file in /etc/tmpfiles.d, such as /etc/tmpfiles.d/reims-ctl-min-ttl.conf"
-  if [[ "$(cat "$min_ttl_file" 2>/dev/null)" == 0 ]]; then
-    say "It's 0 now; $keep, keeps it at 0 after a restart"
-  else
-    say "echo 0 | sudo tee $min_ttl_file turns it off now, and $keep, keeps it at 0 after a restart"
+  # MGLRU's thrashing guard (reims-ctl's runtime::MIN_TTL_FILE): above 0, the
+  # kernel kills a process where it can't keep the pages used in the last that
+  # many ms, even with RAM free, and a VM's QEMU can be the one. Measured on
+  # CachyOS hosts at 100, its kernel's default there. Offered off on a terminal
+  # only, and never required; the tmpfiles.d line keeps it off.
+  min_ttl_file=/sys/kernel/mm/lru_gen/min_ttl_ms
+  min_ttl_line='w /sys/kernel/mm/lru_gen/min_ttl_ms - - - - 0'
+  min_ttl="$(cat "$min_ttl_file" 2>/dev/null || echo 0)"
+  if [[ $min_ttl =~ ^[0-9]+$ ]] && ((min_ttl > 0)); then
+    warn "$min_ttl_file is $min_ttl: where the kernel can't keep the pages used in the last $min_ttl ms in memory, it kills a process, which can be a VM's QEMU, even while RAM is free (measured on hosts at 100, killing builds with most RAM free); 0 turns this off"
+    if [[ -t 0 ]] && ask "Write 0 to $min_ttl_file now with sudo?"; then
+      echo 0 | sudo tee "$min_ttl_file" >/dev/null || warn "sudo didn't write it"
+    fi
+    keep="the line $min_ttl_line in a file in /etc/tmpfiles.d, such as /etc/tmpfiles.d/reims-ctl-min-ttl.conf"
+    if [[ "$(cat "$min_ttl_file" 2>/dev/null)" == 0 ]]; then
+      say "It's 0 now; $keep, keeps it at 0 after a restart"
+    else
+      say "echo 0 | sudo tee $min_ttl_file turns it off now, and $keep, keeps it at 0 after a restart"
+    fi
   fi
-fi
-# USB passthrough (reims-ctl usb): QEMU opens a USB device's file in
-# /dev/bus/usb, which only root may write unless a udev rule says otherwise.
-# This one gives USB devices other than hubs to the kvm group, over SSH too,
-# and to the user at the host's screen (uaccess, which a file sorting before
-# systemd's 73-seat-late.rules sets). reims-ctl's usb::UDEV_RULE is the same
-# line, which its tests check.
-usb_rule_file=/etc/udev/rules.d/70-reims-ctl-usb.rules
-usb_rule='SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{bDeviceClass}!="09", GROUP="kvm", MODE="0664", TAG+="uaccess"'
-if ! grep -qsxF "$usb_rule" "$usb_rule_file"; then
-  say "A VM can be given this host's USB devices once QEMU, running as you, may open them"
-  if ask "Add the udev rule $usb_rule_file, giving USB devices other than hubs to the kvm group and to you at this host's screen, with sudo?"; then
-    printf '# reims-ctl: USB devices for VMs (reims-ctl usb --help)\n%s\n' "$usb_rule" |
-      sudo tee "$usb_rule_file" >/dev/null
-    # Applied to the devices plugged in now, as to those plugged in later.
-    sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb ||
-      warn "udev did not reload its rules: unplug a USB device and plug it in again, or restart, before giving it to a VM"
-  else
-    warn "without the rule, a VM can be given only the USB devices you may open; reims-ctl usb --help shows it"
+  # USB passthrough (reims-ctl usb): QEMU opens a USB device's file in
+  # /dev/bus/usb, which only root may write unless a udev rule says otherwise.
+  # This one gives USB devices other than hubs to the kvm group, over SSH too,
+  # and to the user at the host's screen (uaccess, which a file sorting before
+  # systemd's 73-seat-late.rules sets). reims-ctl's usb::UDEV_RULE is the same
+  # line, which its tests check.
+  usb_rule_file=/etc/udev/rules.d/70-reims-ctl-usb.rules
+  usb_rule='SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{bDeviceClass}!="09", GROUP="kvm", MODE="0664", TAG+="uaccess"'
+  if ! grep -qsxF "$usb_rule" "$usb_rule_file"; then
+    say "A VM can be given this host's USB devices once QEMU, running as you, may open them"
+    if ask "Add the udev rule $usb_rule_file, giving USB devices other than hubs to the kvm group and to you at this host's screen, with sudo?"; then
+      printf '# reims-ctl: USB devices for VMs (reims-ctl usb --help)\n%s\n' "$usb_rule" |
+        sudo tee "$usb_rule_file" >/dev/null
+      # Applied to the devices plugged in now, as to those plugged in later.
+      sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb ||
+        warn "udev did not reload its rules: unplug a USB device and plug it in again, or restart, before giving it to a VM"
+    else
+      warn "without the rule, a VM can be given only the USB devices you may open; reims-ctl usb --help shows it"
+    fi
   fi
-fi
-# Unless /dev/udmabuf's group, kvm, was the one named above.
-if [[ ${group:-} != kvm ]] && getent group kvm >/dev/null && ! id -nG | tr ' ' '\n' | grep -qx kvm; then
-  say "You're not in the kvm group: over SSH, where a desktop session's access doesn't apply, add yourself to it (sudo usermod -aG kvm \$USER) to give VMs USB devices there"
+  # Unless /dev/udmabuf's group, kvm, was the one named above.
+  if [[ ${group:-} != kvm ]] && getent group kvm >/dev/null && ! id -nG | tr ' ' '\n' | grep -qx kvm; then
+    say "You're not in the kvm group: over SSH, where a desktop session's access doesn't apply, add yourself to it (sudo usermod -aG kvm \$USER) to give VMs USB devices there"
+  fi
 fi
 
 # The build runs the toolchain rust-toolchain.toml pins, through rustup's proxies in Cargo's
@@ -343,7 +390,7 @@ fetch_qemu() {
     die "could not fetch vendor/qemu's commit $(git -C "$ROOT" ls-tree HEAD vendor/qemu | awk '{print $3}') from $(git -C "$ROOT" config -f .gitmodules --get submodule.vendor/qemu.url): check that you can read that repository; a commit it does not have was not pushed to it"
 }
 
-if [[ $SKIP_QEMU == 0 ]]; then
+if [[ $BUILDS_QEMU == 1 && $SKIP_QEMU == 0 ]]; then
   # A linked worktree shares the main checkout's module repository: initialising
   # vendor/qemu here would rewrite that repository's core.worktree for every
   # worktree (docs/lessons.md).
@@ -402,7 +449,7 @@ COMMIT="$(git -C "$ROOT" rev-parse --short HEAD)"
 TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
 DIST="$TARGET/dist-vulkan"
 
-if [[ $SKIP_QEMU == 0 ]]; then
+if [[ $BUILDS_QEMU == 1 && $SKIP_QEMU == 0 ]]; then
   say "Building the library (cargo xtask dist --platform vulkan)"
   (cd "$ROOT" && CARGO_TARGET_DIR="$TARGET" cargo xtask dist --platform vulkan)
   [[ -f "$DIST/lib/pkgconfig/reims-vgpu.pc" ]] || die "cargo xtask dist wrote no $DIST/lib/pkgconfig/reims-vgpu.pc"
@@ -457,9 +504,11 @@ if [[ $SKIP_QEMU == 0 ]]; then
   ln -sfn "$ID" "$DATA/qemu/current"
   prune_qemu "$DATA/qemu"
   QEMU_DIR="$DATA/qemu/$ID"
-else
+elif [[ $BUILDS_QEMU == 1 ]]; then
   QEMU_DIR="$(cd "$DATA/qemu/current" && pwd -P)"
   kept_qemu "$QEMU_DIR" | while read -r why; do warn "$why"; done
+else
+  QEMU_DIR=""
 fi
 
 # ------------------------------------------------------------------ reims-ctl
@@ -468,13 +517,17 @@ say "Installing reims-ctl (cargo install)"
 (cd "$ROOT" && CARGO_TARGET_DIR="$CACHE/ctl-target" cargo install --locked --force --quiet --path crates/reims-ctl)
 BIN="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin/reims-ctl"
 [[ -x "$BIN" ]] || die "cargo install left no $BIN"
-"$BIN" __record-install --repo "$ROOT" --qemu "$QEMU_DIR" --commit "$COMMIT"
+"$BIN" __record-install --repo "$ROOT" ${QEMU_DIR:+--qemu "$QEMU_DIR"} --commit "$COMMIT"
 
 echo
 printf '%sreims-ctl is installed.%s\n' "$green$bold" "$off"
-echo "  reims-ctl            the interactive interface: create, start and stop VMs"
+if [[ $BUILDS_QEMU == 1 ]]; then
+  echo "  reims-ctl            the interactive interface: create, start and stop VMs"
+else
+  echo "  reims-ctl            the interactive interface: make arm64 VMs from IPSWs"
+fi
 echo "  reims-ctl help       the same from a shell"
-echo "  QEMU                 $QEMU_DIR"
+[[ -z $QEMU_DIR ]] || echo "  QEMU                 $QEMU_DIR"
 echo
 # By its full path, which works before PATH finds reims-ctl.
 echo "Check this host:"

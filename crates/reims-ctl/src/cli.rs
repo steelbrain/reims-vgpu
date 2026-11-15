@@ -111,6 +111,12 @@ pub enum Cmd {
         #[arg(long, value_name = "DEVICE")]
         remove: Vec<String>,
     },
+    /// List what's downloaded for new VMs (macOS installers and IPSWs) and the space each
+    /// takes, or delete one
+    Downloads {
+        #[command(subcommand)]
+        action: Option<DownloadsCmd>,
+    },
     /// Print the end of a VM's QEMU log, or its serial console's
     Logs {
         name: String,
@@ -140,8 +146,9 @@ pub enum Cmd {
     RecordInstall {
         #[arg(long)]
         repo: PathBuf,
+        /// The QEMU build installed; none on an arm64 host, which makes VMs without one.
         #[arg(long)]
-        qemu: PathBuf,
+        qemu: Option<PathBuf>,
         #[arg(long, default_value = "")]
         commit: String,
     },
@@ -267,7 +274,85 @@ const CREATE_EXAMPLES: &str = r"
     reims-ctl create mac --disk ~/vms/old/disk.qcow2
 
     # Or with the OpenCore image it booted from, copied, which keeps its Mac too
-    reims-ctl create mac --disk ~/vms/mac.qcow2 --opencore ~/vms/OpenCore.qcow2";
+    reims-ctl create mac --disk ~/vms/mac.qcow2 --opencore ~/vms/OpenCore.qcow2
+
+  An arm64 guest on an arm64 Mac or arm64 Linux:
+
+    # Download the current macOS's IPSW from Apple (about 25 GB, kept for the next VM; a
+    # stopped download continues) and restore it onto a new 128G disk, with tickets Apple
+    # signs for the VM (reims-ctl doesn't start arm64 VMs yet)
+    reims-ctl create mac --ipsw latest
+
+    # An IPSW of your own, read where it is: Apple offers only the current macOS to download.
+    # macOS 14 makes its Data volume at the VM's first boot and then resets the VM: after that
+    # boot, reims-restore finish-eacs DIR makes it ready for Setup Assistant
+    reims-ctl create mac --ipsw ~/Downloads/UniversalMac_14.6.1_23G93_Restore.ipsw";
+
+#[derive(Subcommand)]
+pub enum DownloadsCmd {
+    /// Delete downloads, by the names the list shows: a later VM of their macOS downloads them
+    /// again
+    Delete {
+        #[arg(required = true, value_name = "NAME")]
+        names: Vec<String>,
+        /// Do not ask
+        #[arg(long, short)]
+        yes: bool,
+    },
+}
+
+/// `downloads`: what's kept for new VMs, and the space it takes.
+fn downloads() {
+    let items = crate::downloads::list();
+    let dirs: Vec<String> = crate::downloads::dirs()
+        .iter()
+        .filter(|d| d.is_dir())
+        .map(|d| paths::tilde(d))
+        .collect();
+    if items.is_empty() {
+        println!(
+            "Nothing is downloaded: a new VM downloads its macOS, and it's kept here for the next."
+        );
+        return;
+    }
+    let w = items
+        .iter()
+        .map(|i| i.name().len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    println!("{:<w$}  {:>8}  WHAT", "NAME", "SIZE");
+    for i in &items {
+        println!(
+            "{:<w$}  {:>8}  {}",
+            i.name(),
+            crate::downloads::size(i.bytes),
+            i.what
+        );
+    }
+    let total: u64 = items.iter().map(|i| i.bytes).sum();
+    println!(
+        "\n{} in {}. reims-ctl downloads delete NAME deletes one.",
+        crate::downloads::size(total),
+        dirs.join(" and ")
+    );
+}
+
+/// `downloads delete`: each of `names`, asking first unless `yes`.
+fn delete_downloads(names: &[String], yes: bool) -> Result<()> {
+    let items = crate::downloads::list();
+    for n in names {
+        let Some(i) = items.iter().find(|i| &i.name() == n) else {
+            bail!("no download is named {n}: reims-ctl downloads lists them");
+        };
+        if !yes && !confirm(&format!("Delete {n}, {}?", crate::downloads::size(i.bytes))) {
+            println!("{n}: not deleted");
+            continue;
+        }
+        println!("{}", crate::downloads::delete(n)?);
+    }
+    Ok(())
+}
 
 #[derive(Args)]
 pub struct CreateArgs {
@@ -310,6 +395,12 @@ pub struct CreateArgs {
     /// image's BaseSystem.img, or a DMG, converted to a raw image in the VM's directory
     #[arg(long)]
     pub installer: Option<PathBuf>,
+    /// On an arm64 Mac or arm64 Linux: the IPSW to restore an arm64 VM's macOS from: latest,
+    /// the current macOS, downloaded from Apple once and kept (reims-ctl downloads lists it),
+    /// or an IPSW's path, read where it is. A macOS 14 VM needs one boot, which makes its Data
+    /// volume, and then `reims-restore finish-eacs DIR`
+    #[arg(long, value_name = "latest|PATH", conflicts_with_all = ["macos", "installer", "disk", "opencore"])]
+    pub ipsw: Option<String>,
     /// An OpenCore image of your own to copy, with OVMF_CODE.fd and OVMF_VARS.fd beside it
     /// (default: a new one made for the VM, with OVMF, presenting the Mac of the image beside
     /// --disk, opencore.qcow2, where there is one and --disk is no copy of the disk of a VM
@@ -513,6 +604,10 @@ pub fn main(cli: Cli) -> Result<i32> {
             );
         }
         Cmd::Gpus => gpus(host),
+        Cmd::Downloads { action } => match action {
+            None => downloads(),
+            Some(DownloadsCmd::Delete { names, yes }) => delete_downloads(&names, yes)?,
+        },
         Cmd::Usb { name, add, remove } => usb(host, name.as_deref(), &add, &remove)?,
         Cmd::Logs {
             name,
@@ -550,7 +645,7 @@ pub fn main(cli: Cli) -> Result<i32> {
             install::Install {
                 repo: repo.clone(),
                 commit,
-                qemu,
+                qemu: qemu.unwrap_or_default(),
                 installed_at: runtime::now_stamp("%Y-%m-%d %H:%M:%S %z"),
             }
             .save()?;
@@ -682,8 +777,15 @@ fn create_cmd(a: CreateArgs, host: Host) -> Result<()> {
         .or(a.name_pos.clone())
         .ok_or_else(|| with_create_examples("give the VM a name: reims-ctl create NAME"))?;
     // Nothing a VM is made from: whatever create says is missing, the examples show the ways.
-    let source =
-        a.macos.is_some() || a.installer.is_some() || a.disk.is_some() || a.opencore.is_some();
+    let source = a.macos.is_some()
+        || a.installer.is_some()
+        || a.disk.is_some()
+        || a.opencore.is_some()
+        || a.ipsw.is_some();
+    let arm64 = host.default_profile() == Some(Profile::VmappleArm64);
+    if arm64 && a.start {
+        bail!("reims-ctl doesn't start arm64 VMs yet: create it without --start");
+    }
     let mut s = Spec::new(&name);
     s.dir = a
         .dir
@@ -700,7 +802,7 @@ fn create_cmd(a: CreateArgs, host: Host) -> Result<()> {
             mode: ImportMode::parse(&a.disk_mode)?,
         }),
         (None, None) => Some(DiskSource::New {
-            size_mib: 128 * 1024,
+            size_mib: create::DEFAULT_DISK_MIB,
         }),
     };
     let abs = |p: &Option<PathBuf>| p.as_ref().map(|p| paths::absolute(&p.to_string_lossy()));
@@ -710,6 +812,13 @@ fn create_cmd(a: CreateArgs, host: Host) -> Result<()> {
     });
     s.opencore = abs(&a.opencore);
     s.installer = abs(&a.installer);
+    s.ipsw = a.ipsw.as_deref().map(|i| {
+        if crate::ipsw::is_path(i) {
+            paths::absolute(i).display().to_string()
+        } else {
+            i.to_string()
+        }
+    });
     s.mac = a.mac.clone();
     s.graphics = a.graphics.as_deref().map(vm::Graphics::parse).transpose()?;
     if let Some(n) = a.displays {
@@ -727,6 +836,10 @@ fn create_cmd(a: CreateArgs, host: Host) -> Result<()> {
     s.audio = a.audio.unwrap_or(true);
     s.network = a.network.unwrap_or(true);
     s.ssh_port = a.ssh_port;
+    if arm64 {
+        // Ctrl-C stops the restore, which removes what it made.
+        crate::restore::stop_at_interrupt();
+    }
     let vm = create::create(s, host, &mut |p| println!("{name}: {p}")).map_err(|e| {
         if source {
             e
@@ -896,6 +1009,15 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
             ),
         ),
         None => add("disk", format!("{disk_name} ({})", c.disk_format.as_str())),
+    }
+    if let Some(a) = &c.vmapple {
+        add("aux", paths::tilde(&vm.path(&a.aux)));
+        add("ecid", format!("{:#018x}", a.ecid));
+    }
+    // Its devices are those of its start, which an arm64 VM doesn't have yet.
+    if !c.profile.starts() {
+        add("start", "not yet: reims-ctl doesn't start arm64 VMs".into());
+        return v;
     }
     let graphics = c.graphics();
     match graphics {
@@ -1188,9 +1310,12 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
 }
 
 fn gpus(host: Host) {
-    if host.default_profile().is_none() {
-        println!("{}", crate::host::UNSUPPORTED);
-        return;
+    match host.default_profile() {
+        None => return println!("{}", crate::host::UNSUPPORTED),
+        Some(p) if !p.gpu_choice(host) => {
+            return println!("A VM's GPU: {}", crate::host::X86_64_ONLY);
+        }
+        Some(_) => {}
     }
     let list = gpu::list();
     if list.is_empty() {
@@ -1220,8 +1345,10 @@ fn gpus(host: Host) {
 /// `remove` first.
 fn usb(host: Host, name: Option<&str>, add: &[String], remove: &[String]) -> Result<()> {
     use crate::usb;
-    if host.default_profile().is_none() {
-        bail!("{}", crate::host::UNSUPPORTED);
+    match host.default_profile() {
+        None => bail!("{}", crate::host::UNSUPPORTED),
+        Some(Profile::VmappleArm64) => bail!("USB passthrough: {}", crate::host::X86_64_ONLY),
+        Some(Profile::Q35X86_64) => {}
     }
     let devices = usb::host_devices();
     let Some(name) = name else {
@@ -1340,7 +1467,11 @@ fn doctor(host: Host) -> Result<i32> {
         format!(
             "{host}{}",
             profile
-                .map(|p| format!(", runs {p} VMs"))
+                .map(|p| if p.starts() {
+                    format!(", runs {p} VMs")
+                } else {
+                    format!(", makes {p} VMs from IPSWs (it doesn't start them yet)")
+                })
                 .unwrap_or_else(|| format!(": {}", crate::host::UNSUPPORTED))
         ),
     );
@@ -1354,29 +1485,32 @@ fn doctor(host: Host) -> Result<i32> {
         ),
     );
     let Some(profile) = profile else { return Ok(1) };
-    match install::qemu_binary(profile) {
-        Ok(q) => {
-            line(
-                true,
-                "qemu",
-                format!(
-                    "{} ({})",
-                    q.display(),
-                    install::qemu_version(&q).unwrap_or_default()
-                ),
-            );
-            let b = install::audio_backends(&q);
-            line(
-                true,
-                "audio backends",
-                format!(
-                    "{} (default {})",
-                    b.join(", "),
-                    install::default_audio_backend(&b)
-                ),
-            );
+    // An arm64 VM is made by a restore, which runs no QEMU, and isn't started.
+    if profile.starts() {
+        match install::qemu_binary(profile) {
+            Ok(q) => {
+                line(
+                    true,
+                    "qemu",
+                    format!(
+                        "{} ({})",
+                        q.display(),
+                        install::qemu_version(&q).unwrap_or_default()
+                    ),
+                );
+                let b = install::audio_backends(&q);
+                line(
+                    true,
+                    "audio backends",
+                    format!(
+                        "{} (default {})",
+                        b.join(", "),
+                        install::default_audio_backend(&b)
+                    ),
+                );
+            }
+            Err(e) => line(false, "qemu", format!("{e:#}")),
         }
-        Err(e) => line(false, "qemu", format!("{e:#}")),
     }
     match install::Install::load() {
         Some(i) => line(
@@ -1395,8 +1529,9 @@ fn doctor(host: Host) -> Result<i32> {
             "no install record: reims-ctl update needs scripts/install-ctl.sh to have run".into(),
         ),
     }
+    // KVM and the library's needs, for the x86-64 VMs Linux runs.
     match host.os {
-        crate::host::Os::Linux => {
+        crate::host::Os::Linux if profile == Profile::Q35X86_64 => {
             let kvm = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -1529,7 +1664,10 @@ fn doctor(host: Host) -> Result<i32> {
                 },
             );
         }
-        crate::host::Os::Mac | crate::host::Os::Windows | crate::host::Os::Other => {}
+        crate::host::Os::Linux
+        | crate::host::Os::Mac
+        | crate::host::Os::Windows
+        | crate::host::Os::Other => {}
     }
     if profile == Profile::Q35X86_64 {
         // What makes a new VM's OpenCore image, with its OVMF, and downloads its installer.

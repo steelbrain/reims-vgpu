@@ -272,8 +272,9 @@ mod tests {
     }
 
     /// The installer's --skip-qemu keeps the installed QEMU: with none installed it ends at
-    /// once, before it builds or installs anything, saying what to do. On a host other than
-    /// Linux on x86-64 it ends before that, saying where reims-ctl runs VMs.
+    /// once, before it builds or installs anything, saying what to do, as it does on an arm64
+    /// host, which has no QEMU. On a host reims-ctl has no VMs for (an Intel Mac) it ends before
+    /// that, saying where it runs and makes them.
     #[test]
     fn the_installer_skips_qemu_only_where_one_is_installed() {
         let dir = std::env::var_os("CARGO_MANIFEST_DIR")
@@ -297,6 +298,12 @@ mod tests {
             assert!(
                 err.contains("--skip-qemu keeps the installed QEMU, and none is installed")
                     && err.contains("run this without --skip-qemu, which builds it"),
+                "{err}"
+            );
+        } else if cfg!(target_arch = "aarch64") {
+            assert!(
+                err.contains("--skip-qemu keeps the installed QEMU, and this host has none")
+                    && err.contains("run this without --skip-qemu"),
                 "{err}"
             );
         } else {

@@ -1,14 +1,16 @@
 //! reims-ctl: creates, boots and manages x86-64 macOS VMs on Linux, on the QEMU
-//! scripts/install-ctl.sh builds with reims-vgpu. With no command it opens its interactive
-//! interface.
+//! scripts/install-ctl.sh builds with reims-vgpu, and makes arm64 macOS VMs from an IPSW on arm64
+//! Macs and arm64 Linux (restore.rs). With no command it opens its interactive interface.
 
 mod cli;
 mod copy;
 mod create;
+mod downloads;
 mod form;
 mod gpu;
 mod host;
 mod install;
+mod ipsw;
 mod logs;
 mod macos;
 mod migrate;
@@ -19,6 +21,7 @@ mod prebuilt;
 mod qemu;
 mod qmp;
 mod reims_util;
+mod restore;
 mod runtime;
 #[cfg(test)]
 mod testenv;

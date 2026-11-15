@@ -55,12 +55,28 @@ pub fn running(vm: &Vm) -> bool {
     pid(vm).is_some()
 }
 
+/// What reims-ctl says of a start of a VM it makes and doesn't start, an arm64 VM: where its
+/// restored macOS is.
+pub fn not_started(vm: &Vm) -> String {
+    format!(
+        "reims-ctl doesn't start arm64 VMs yet: {}'s macOS is restored in {} (its disk, {}, and \
+         its auxiliary storage, aux.img), which boots on QEMU's vmapple with Ambrosia, our arm64 \
+         firmware",
+        vm.name(),
+        crate::paths::tilde(&vm.dir),
+        vm.config.disk.display()
+    )
+}
+
 /// What is wrong with the host or the VM's files for a start, if anything.
 pub fn preflight(vm: &Vm, host: Host) -> Result<()> {
     let c = &vm.config;
     c.check()?;
     if !crate::host::Profile::supported_on(host).contains(&c.profile) {
         bail!("{}", crate::host::UNSUPPORTED);
+    }
+    if !c.profile.starts() {
+        bail!("{}", not_started(vm));
     }
     let need = |p: &Path, what: &str| -> Result<()> {
         if !p.exists() {
@@ -86,6 +102,7 @@ pub fn preflight(vm: &Vm, host: Host) -> Result<()> {
                 );
             }
         }
+        Profile::VmappleArm64 => {}
     }
     if host.os == Os::Linux {
         let kvm = std::fs::OpenOptions::new()

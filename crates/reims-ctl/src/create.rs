@@ -11,13 +11,20 @@
 //! no VM half made, or one given. An installer is used in place, except a DMG, which qemu-img
 //! converts to a raw image in the VM's directory, saying how far it is ([`installer_media`]). A
 //! VM's settings name its graphics: reims-vgpu's own device unless the create chose another.
+//!
+//! An arm64 VM (`vmapple-arm64`) is macOS restored from an IPSW onto a new raw disk
+//! (restore.rs), with the auxiliary storage and ECID the restore leaves beside it. Its IPSW is
+//! found, and downloaded where it isn't here (ipsw.rs), before its directory is made; the restore
+//! checks the space it writes before it writes anything.
 
 use crate::copy;
 use crate::host::{Host, Profile};
 use crate::install;
+use crate::ipsw;
 use crate::opencore::{self, Identity};
 use crate::paths;
 use crate::reims_util::{self, Download};
+use crate::restore::{self, Restorer};
 use crate::vm::*;
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
@@ -75,6 +82,10 @@ pub struct Spec {
     pub macos: Option<Download>,
     pub opencore: Option<PathBuf>,
     pub installer: Option<PathBuf>,
+    // vmapple
+    /// The IPSW an arm64 VM's macOS is restored from: its path, or `latest`, the current macOS,
+    /// downloaded from Apple (ipsw.rs).
+    pub ipsw: Option<String>,
 }
 
 impl Spec {
@@ -97,6 +108,7 @@ impl Spec {
             macos: None,
             opencore: None,
             installer: None,
+            ipsw: None,
         }
     }
 }
@@ -127,6 +139,23 @@ pub fn default_dir(name: &str) -> PathBuf {
 
 /// Makes the VM, calling `progress` with each step, and registers it.
 pub fn create(spec: Spec, host: Host, progress: &mut dyn FnMut(&str)) -> Result<Vm> {
+    create_with(
+        spec,
+        host,
+        progress,
+        &restore::Pipeline,
+        restore::cancel_flag(),
+    )
+}
+
+/// [`create`], restoring an arm64 VM's macOS with `restorer`, which stops when `cancel` is set.
+pub fn create_with(
+    spec: Spec,
+    host: Host,
+    progress: &mut dyn FnMut(&str),
+    restorer: &dyn Restorer,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vm> {
     check_name(&spec.name)?;
     if let Some(m) = &spec.mac {
         check_mac(m)?;
@@ -142,6 +171,12 @@ pub fn create(spec: Spec, host: Host, progress: &mut dyn FnMut(&str)) -> Result<
     };
     if !Profile::supported_on(host).contains(&profile) {
         bail!("{}", crate::host::UNSUPPORTED);
+    }
+    if profile == Profile::VmappleArm64 {
+        return create_vmapple(spec, progress, restorer, cancel);
+    }
+    if spec.ipsw.is_some() {
+        bail!("an IPSW makes an arm64 VM, which arm64 Macs and arm64 Linux make");
     }
     // The image reims-util makes holds them.
     if graphics == Graphics::ReimsVgpu && spec.opencore.is_none() {
@@ -193,15 +228,25 @@ pub fn create(spec: Spec, host: Host, progress: &mut dyn FnMut(&str)) -> Result<
         macos = Some(i.version);
     }
     let made = claim(&dir)?;
-    let result = match profile {
-        Profile::Q35X86_64 => make_q35(&spec, graphics, &dir, macos.as_deref(), progress),
-    };
+    let result = make_q35(&spec, graphics, &dir, macos.as_deref(), progress);
+    finish(&spec.name, &dir, made, result, progress)
+}
+
+/// Saves and registers the VM made in `dir`, or, where making it failed, removes what was made:
+/// `dir` itself where the create made it, else everything in it.
+fn finish(
+    name: &str,
+    dir: &Path,
+    made: bool,
+    result: Result<Vm>,
+    progress: &mut dyn FnMut(&str),
+) -> Result<Vm> {
     let vm = match result {
         Ok(vm) => vm,
         Err(e) => {
             if made {
-                let _ = std::fs::remove_dir_all(&dir);
-            } else if let Ok(rd) = std::fs::read_dir(&dir) {
+                let _ = std::fs::remove_dir_all(dir);
+            } else if let Ok(rd) = std::fs::read_dir(dir) {
                 for e in rd.flatten() {
                     let _ = if e.path().is_dir() {
                         std::fs::remove_dir_all(e.path())
@@ -217,10 +262,172 @@ pub fn create(spec: Spec, host: Host, progress: &mut dyn FnMut(&str)) -> Result<
     let _ = std::fs::remove_file(dir.join(CREATING));
     // Read again: VMs may have come and gone while this one was made, over a download.
     let mut reg = Registry::load()?;
-    reg.add(&spec.name, &dir)?;
+    reg.add(name, dir)?;
     reg.save()?;
     progress("done");
     Ok(vm)
+}
+
+/// Makes an arm64 VM: macOS restored from the spec's IPSW onto a new raw disk.
+fn create_vmapple(
+    spec: Spec,
+    progress: &mut dyn FnMut(&str),
+    restorer: &dyn Restorer,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vm> {
+    // Held until the directory of a failed restore is gone, which the interface waits for as it
+    // quits.
+    let _busy = restore::Busy::new();
+    let Some(want) = spec.ipsw.clone() else {
+        bail!("an arm64 VM is made from an IPSW: give one with --ipsw, or --ipsw latest");
+    };
+    let size_mib = match &spec.disk {
+        None => DEFAULT_DISK_MIB,
+        Some(DiskSource::New { size_mib }) => *size_mib,
+        Some(DiskSource::Existing { .. }) => {
+            bail!("an arm64 VM's disk is a new one its IPSW is restored onto, not an existing one")
+        }
+    };
+    if spec.macos.is_some() || spec.installer.is_some() || spec.opencore.is_some() {
+        bail!(
+            "an arm64 VM's macOS comes from its IPSW: a download, an installer and OpenCore are \
+             for x86-64 VMs"
+        );
+    }
+    if spec.graphics.is_some() {
+        bail!("an arm64 VM has no choice of graphics");
+    }
+    let dir = spec.dir.clone().unwrap_or_else(|| default_dir(&spec.name));
+    if dir.exists() && std::fs::read_dir(&dir)?.next().is_some() {
+        return Err(not_empty(&dir));
+    }
+    // The IPSW, downloaded first where it isn't here: a download that stops leaves its part
+    // for the next, and no VM.
+    // The space a restore writes is checked by the restore, before it writes anything.
+    let ipsw = match restorer.ipsws().find(&want)? {
+        ipsw::Found::Here(p) => p,
+        ipsw::Found::Download { entry, total, have } => {
+            let what = format!("macOS {} ({})", entry.version, entry.build);
+            restore::check_download_space(&what, total, have, &ipsw::dir(), &dir)?;
+            restorer
+                .ipsws()
+                .download(&entry, progress, cancel)
+                .map_err(|e| {
+                    if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                        anyhow::anyhow!(
+                            "the download was stopped, and {} was not made: the next create of \
+                             {what} continues the download",
+                            spec.name
+                        )
+                    } else {
+                        e
+                    }
+                })?
+        }
+    };
+    let made = claim(&dir)?;
+    let result =
+        make_vmapple(&spec, &ipsw, size_mib, &dir, progress, restorer, cancel).map_err(|e| {
+            let kept = keep_restore_log(&dir, &spec.name);
+            // Stopped (Ctrl-C, or the interface quitting), it is no failure to report.
+            if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                return anyhow::anyhow!("the restore was stopped, and {} was not made", spec.name);
+            }
+            match kept {
+                // The error names the log where the restore wrote it, in the directory that
+                // goes: it names it where it is kept.
+                Some(kept) => anyhow::anyhow!(
+                    "{}\nThe restore's log is kept in {}",
+                    format!("{e:#}").replace(&dir.display().to_string(), &paths::tilde(&kept)),
+                    paths::tilde(&kept.join(restore::LOG))
+                ),
+                None => e,
+            }
+        });
+    finish(&spec.name, &dir, made, result, progress)
+}
+
+/// Moves the log of the failed restore in `dir`, which goes, into the restore logs' directory
+/// for `name` ([`restore::logs_dir`]), replacing an earlier failure's; that directory, if the
+/// log was there.
+fn keep_restore_log(dir: &Path, name: &str) -> Option<PathBuf> {
+    let log = dir.join(restore::LOG);
+    if !log.is_file() {
+        return None;
+    }
+    let to = restore::logs_dir().join(name);
+    let _ = std::fs::remove_dir_all(&to);
+    std::fs::create_dir_all(&to).ok()?;
+    let dest = to.join(restore::LOG);
+    if std::fs::rename(&log, &dest).is_err() {
+        std::fs::copy(&log, &dest).ok()?;
+    }
+    Some(to)
+}
+
+/// A new disk's size where none is given, as the CLI's default.
+pub const DEFAULT_DISK_MIB: u64 = 128 * 1024;
+
+/// The files a restore leaves in an arm64 VM's directory.
+pub const VMAPPLE_DISK: &str = "disk.img";
+pub const VMAPPLE_AUX: &str = "aux.img";
+
+fn make_vmapple(
+    spec: &Spec,
+    ipsw: &Path,
+    size_mib: u64,
+    dir: &Path,
+    progress: &mut dyn FnMut(&str),
+    restorer: &dyn Restorer,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vm> {
+    let request = restore::Request {
+        ipsw,
+        dir,
+        disk_size: size_mib << 20,
+    };
+    let restored = restorer.restore(&request, progress, cancel)?;
+    for f in [VMAPPLE_DISK, VMAPPLE_AUX] {
+        if !dir.join(f).is_file() {
+            bail!("the restore left no {f} in {}", dir.display());
+        }
+    }
+    let mut c = base_config(
+        spec,
+        Profile::VmappleArm64,
+        VMAPPLE_DISK.into(),
+        ImageFormat::Raw,
+    );
+    // Its boot, on Ambrosia, is not reims-ctl's yet: no device is chosen.
+    c.graphics = None;
+    c.vmapple = Some(Vmapple {
+        aux: VMAPPLE_AUX.into(),
+        ecid: restored.ecid,
+    });
+    progress(&format!(
+        "restored macOS {} ({})",
+        restored.version, restored.build
+    ));
+    first_boot(restored.first_boot, dir, progress);
+    Ok(Vm {
+        dir: dir.to_path_buf(),
+        config: c,
+    })
+}
+
+/// What the VM's first boot asks of the create after the restore. For macOS 14
+/// ([`restore::FirstBoot::Eacs`]) that is one boot, in which macOS makes its Data volume and
+/// resets the VM, and then reims-restore's finish step; reims-ctl starts no arm64 VM yet, so it
+/// names the step left.
+fn first_boot(first: restore::FirstBoot, dir: &Path, progress: &mut dyn FnMut(&str)) {
+    if first == restore::FirstBoot::Eacs {
+        progress(&format!(
+            "one step is left: macOS 14 makes its Data volume at the VM's first boot and then \
+             resets the VM, which doesn't start again until it is finished; after that boot, \
+             run `reims-restore finish-eacs {}`, and the next boot goes to Setup Assistant",
+            paths::tilde(dir)
+        ));
+    }
 }
 
 /// Marks a directory a VM is being made in, until its vm.toml is written.
@@ -279,6 +486,7 @@ fn base_config(spec: &Spec, profile: Profile, disk: PathBuf, disk_format: ImageF
             ..Logs::default()
         },
         q35: None,
+        vmapple: None,
         extra_env: BTreeMap::new(),
         usb: vec![],
     }
@@ -1016,5 +1224,410 @@ mod tests {
         std::fs::remove_file(d.join(CREATING)).unwrap();
         assert!(!claim(&d).unwrap());
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// What a test's restore does: write files into the VM's directory, then succeed with an
+    /// ECID past TOML's integers, fail, or wait for its cancel.
+    enum Fake {
+        Succeeds,
+        /// Restores macOS 14, whose first boot makes its Data volume.
+        SucceedsForEacs,
+        Fails,
+        WaitsForCancel,
+        /// Its download waits for the cancel.
+        StopsDownloading,
+    }
+
+    /// An IPSW path is taken as it is; `latest` is a download, of an IPSW of 1 MiB.
+    impl crate::ipsw::Source for Fake {
+        fn find(&self, want: &str) -> Result<crate::ipsw::Found> {
+            if crate::ipsw::is_path(want) {
+                return crate::ipsw::here(want);
+            }
+            assert_eq!(want, "latest");
+            Ok(crate::ipsw::Found::Download {
+                entry: reims_restore::catalog::Entry {
+                    version: "27.2.1".into(),
+                    build: "26B131".into(),
+                    url: "https://updates.cdn-apple.com/x/UniversalMac_27.2.1_26B131_Restore.ipsw"
+                        .into(),
+                    sha1: None,
+                },
+                total: 1 << 20,
+                have: 0,
+            })
+        }
+
+        fn download(
+            &self,
+            e: &reims_restore::catalog::Entry,
+            progress: &mut dyn FnMut(&str),
+            cancel: &std::sync::atomic::AtomicBool,
+        ) -> Result<PathBuf> {
+            progress("Downloading macOS 27.2.1 (26B131): 0%");
+            if let Fake::StopsDownloading = self {
+                while !cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                bail!("the download was stopped");
+            }
+            let path = crate::ipsw::dir().join(e.file_name());
+            std::fs::create_dir_all(crate::ipsw::dir()).unwrap();
+            std::fs::File::create(&path)
+                .unwrap()
+                .set_len(1 << 20)
+                .unwrap();
+            progress("Downloading macOS 27.2.1 (26B131): 100%");
+            Ok(path)
+        }
+    }
+
+    impl Restorer for Fake {
+        fn ipsws(&self) -> &dyn crate::ipsw::Source {
+            self
+        }
+
+        fn restore(
+            &self,
+            r: &restore::Request,
+            progress: &mut dyn FnMut(&str),
+            cancel: &std::sync::atomic::AtomicBool,
+        ) -> Result<restore::Restored> {
+            progress("Restoring");
+            assert!(r.dir.is_dir());
+            assert_eq!(r.disk_size, 64 << 30);
+            std::fs::write(r.dir.join("disk.img.part"), b"partial").unwrap();
+            std::fs::write(r.dir.join("aux.img"), b"aux").unwrap();
+            match self {
+                Fake::Succeeds => {
+                    std::fs::rename(r.dir.join("disk.img.part"), r.dir.join("disk.img")).unwrap();
+                    Ok(restore::Restored {
+                        ecid: 0xc208_f7ea_febd_c581,
+                        version: "27.2.1".into(),
+                        build: "26B131".into(),
+                        first_boot: restore::FirstBoot::SetupAssistant,
+                    })
+                }
+                Fake::SucceedsForEacs => {
+                    std::fs::rename(r.dir.join("disk.img.part"), r.dir.join("disk.img")).unwrap();
+                    Ok(restore::Restored {
+                        ecid: 0x1234,
+                        version: "14.6.1".into(),
+                        build: "23G93".into(),
+                        first_boot: restore::FirstBoot::Eacs,
+                    })
+                }
+                Fake::Fails => {
+                    let log = r.dir.join(restore::LOG);
+                    std::fs::write(&log, b"what the restore did").unwrap();
+                    Err(
+                        anyhow::anyhow!("Apple's TSS doesn't sign this build for VirtualMac2,1")
+                            .context(format!("the restore failed: its log is {}", log.display())),
+                    )
+                }
+                Fake::WaitsForCancel | Fake::StopsDownloading => {
+                    while !cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    bail!("the restore was stopped")
+                }
+            }
+        }
+    }
+
+    fn arm64() -> Host {
+        Host {
+            os: crate::host::Os::Linux,
+            arch: crate::host::Arch::Aarch64,
+        }
+    }
+
+    /// An arm64 spec, with an IPSW that exists.
+    fn arm64_spec(env: &crate::testenv::Env) -> Spec {
+        let ipsw = env.root.join("UniversalMac_27.2.1_26B131_Restore.ipsw");
+        std::fs::File::create(&ipsw)
+            .unwrap()
+            .set_len(1 << 20)
+            .unwrap();
+        Spec {
+            dir: Some(env.root.join("vms/t")),
+            ipsw: Some(ipsw.display().to_string()),
+            disk: Some(DiskSource::New { size_mib: 64 << 10 }),
+            ..Spec::new("t")
+        }
+    }
+
+    /// A macOS 14 VM is made, and the create names the one step left: its first boot, then
+    /// reims-restore's finish.
+    #[test]
+    fn an_arm64_create_of_macos_14_names_the_step_left() {
+        let env = crate::testenv::Env::new("create-arm64-eacs");
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut steps = Vec::new();
+        create_with(
+            arm64_spec(&env),
+            arm64(),
+            &mut |p| steps.push(p.to_string()),
+            &Fake::SucceedsForEacs,
+            &cancel,
+        )
+        .unwrap();
+        let dir = paths::tilde(&env.root.join("vms/t"));
+        let left: Vec<&String> = steps
+            .iter()
+            .filter(|s| s.starts_with("one step is left"))
+            .collect();
+        assert_eq!(left.len(), 1, "{steps:?}");
+        assert!(
+            left[0].contains(&format!("run `reims-restore finish-eacs {dir}`")),
+            "{}",
+            left[0]
+        );
+        let at = steps
+            .iter()
+            .position(|s| s == "restored macOS 14.6.1 (23G93)");
+        assert_eq!(
+            at.map(|i| i + 1),
+            steps.iter().position(|s| s.starts_with("one step is left"))
+        );
+        assert!(Registry::load().unwrap().open("t").is_ok());
+    }
+
+    #[test]
+    fn an_arm64_create_of_a_later_macos_has_no_step_left() {
+        let env = crate::testenv::Env::new("create-arm64-no-step");
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut steps = Vec::new();
+        create_with(
+            arm64_spec(&env),
+            arm64(),
+            &mut |p| steps.push(p.to_string()),
+            &Fake::Succeeds,
+            &cancel,
+        )
+        .unwrap();
+        assert!(!steps.iter().any(|s| s.starts_with("one step is left")));
+    }
+
+    #[test]
+    fn an_arm64_vm_is_its_restored_disk_aux_and_ecid() {
+        let env = crate::testenv::Env::new("create-arm64");
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut steps = Vec::new();
+        let vm = create_with(
+            arm64_spec(&env),
+            arm64(),
+            &mut |p| steps.push(p.to_string()),
+            &Fake::Succeeds,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(steps.first().map(String::as_str), Some("Restoring"));
+        assert!(
+            steps.contains(&"restored macOS 27.2.1 (26B131)".to_string()),
+            "{steps:?}"
+        );
+        let dir = env.root.join("vms/t");
+        assert!(!dir.join(CREATING).exists());
+        let text = std::fs::read_to_string(dir.join(CONFIG_FILE)).unwrap();
+        assert!(text.contains("profile = \"vmapple-arm64\""), "{text}");
+        assert!(text.contains("disk = \"disk.img\""), "{text}");
+        assert!(text.contains("disk_format = \"raw\""), "{text}");
+        assert!(
+            text.contains("[vmapple]\naux = \"aux.img\"\necid = \"0xc208f7eafebdc581\""),
+            "{text}"
+        );
+        let saved = Registry::load().unwrap().open("t").unwrap();
+        assert_eq!(saved.config, vm.config);
+        assert_eq!(
+            saved.config.vmapple.as_ref().unwrap().ecid,
+            0xc208_f7ea_febd_c581
+        );
+        assert!(saved.config.graphics.is_none());
+        let e = crate::runtime::preflight(&saved, arm64())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.starts_with("reims-ctl doesn't start arm64 VMs yet"),
+            "{e}"
+        );
+    }
+
+    /// A failed or stopped restore leaves no VM: its directory goes, with what the restore wrote,
+    /// and the registry doesn't list it.
+    #[test]
+    fn a_failed_or_stopped_restore_leaves_nothing() {
+        let env = crate::testenv::Env::new("create-arm64-fail");
+        let dir = env.root.join("vms/t");
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let e = create_with(
+            arm64_spec(&env),
+            arm64(),
+            &mut |_| {},
+            &Fake::Fails,
+            &cancel,
+        )
+        .unwrap_err();
+        // It names the log where it is kept, not in the directory that went.
+        let kept = paths::tilde(&env.root.join("cache/reims-ctl/restore/logs/t"));
+        assert_eq!(
+            format!("{e:#}"),
+            format!(
+                "the restore failed: its log is {kept}/restore.log: Apple's TSS doesn't sign \
+                 this build for VirtualMac2,1\nThe restore's log is kept in {kept}/restore.log"
+            )
+        );
+        assert!(!dir.exists());
+        assert!(Registry::load().unwrap().find("t").is_none());
+        assert_eq!(restore::running(), 0);
+        // Its log is kept out of the VM's directory.
+        let kept = env.root.join("cache/reims-ctl/restore/logs/t/restore.log");
+        assert_eq!(std::fs::read(&kept).unwrap(), b"what the restore did");
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        let e = create_with(
+            arm64_spec(&env),
+            arm64(),
+            &mut |_| {},
+            &Fake::WaitsForCancel,
+            &cancel,
+        )
+        .unwrap_err();
+        stop.join().unwrap();
+        assert_eq!(
+            format!("{e:#}"),
+            "the restore was stopped, and t was not made"
+        );
+        assert!(!dir.exists());
+        assert!(Registry::load().unwrap().find("t").is_none());
+
+        // An empty directory given for it stays, emptied.
+        std::fs::create_dir_all(&dir).unwrap();
+        create_with(
+            arm64_spec(&env),
+            arm64(),
+            &mut |_| {},
+            &Fake::Fails,
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(dir.is_dir());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    /// `latest` downloads the current IPSW into the installers directory first, then restores
+    /// it; a stopped download makes no VM.
+    #[test]
+    fn latest_is_downloaded_then_restored() {
+        let env = crate::testenv::Env::new("create-arm64-latest");
+        let dir = env.root.join("vms/t");
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut steps = Vec::new();
+        create_with(
+            Spec {
+                ipsw: Some("latest".into()),
+                ..arm64_spec(&env)
+            },
+            arm64(),
+            &mut |p| steps.push(p.to_string()),
+            &Fake::Succeeds,
+            &cancel,
+        )
+        .unwrap();
+        let i = |s: &str| steps.iter().position(|p| p == s).unwrap();
+        assert!(
+            i("Downloading macOS 27.2.1 (26B131): 100%") < i("Restoring"),
+            "{steps:?}"
+        );
+        assert!(
+            crate::ipsw::dir()
+                .join("UniversalMac_27.2.1_26B131_Restore.ipsw")
+                .is_file()
+        );
+        assert!(dir.join("vm.toml").is_file());
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        let e = create_with(
+            Spec {
+                name: "u".into(),
+                dir: Some(env.root.join("vms/u")),
+                ipsw: Some("latest".into()),
+                ..arm64_spec(&env)
+            },
+            arm64(),
+            &mut |_| {},
+            &Fake::StopsDownloading,
+            &cancel,
+        )
+        .unwrap_err();
+        stop.join().unwrap();
+        assert_eq!(
+            format!("{e:#}"),
+            "the download was stopped, and u was not made: the next create of macOS 27.2.1 \
+             (26B131) continues the download"
+        );
+        assert!(!env.root.join("vms/u").exists());
+        assert!(Registry::load().unwrap().find("u").is_none());
+        assert_eq!(restore::running(), 0);
+    }
+
+    /// What an arm64 create needs is checked before its directory is made.
+    #[test]
+    fn an_arm64_create_checks_its_ipsw_and_options_first() {
+        let env = crate::testenv::Env::new("create-arm64-checks");
+        let dir = env.root.join("vms/t");
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let fails = |spec: Spec| {
+            let e = create_with(spec, arm64(), &mut |_| {}, &Fake::Succeeds, &cancel).unwrap_err();
+            assert!(!dir.exists(), "{e:#}");
+            format!("{e:#}")
+        };
+        let e = fails(Spec {
+            ipsw: None,
+            ..arm64_spec(&env)
+        });
+        assert!(e.contains("give one with --ipsw"), "{e}");
+        let e = fails(Spec {
+            ipsw: Some(env.root.join("missing.ipsw").display().to_string()),
+            ..arm64_spec(&env)
+        });
+        assert!(e.contains("missing.ipsw does not exist"), "{e}");
+        let e = fails(Spec {
+            installer: Some(env.root.join("BaseSystem.img")),
+            ..arm64_spec(&env)
+        });
+        assert!(e.contains("for x86-64 VMs"), "{e}");
+        let e = fails(Spec {
+            disk: Some(DiskSource::Existing {
+                path: env.root.join("disk.img"),
+                mode: ImportMode::Copy,
+            }),
+            ..arm64_spec(&env)
+        });
+        assert!(e.contains("not an existing one"), "{e}");
+        // And an x86-64 host takes no IPSW.
+        let x86 = Host {
+            os: crate::host::Os::Linux,
+            arch: crate::host::Arch::X86_64,
+        };
+        let e = create_with(arm64_spec(&env), x86, &mut |_| {}, &Fake::Succeeds, &cancel)
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("an IPSW makes an arm64 VM"), "{e}");
+        assert!(!dir.exists());
     }
 }

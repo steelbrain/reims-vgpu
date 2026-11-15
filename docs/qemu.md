@@ -9,10 +9,17 @@ users run them with `reims-ctl`, whose installer,
 platform. This file says how QEMU is built and uses the library, and the
 measured facts QEMU's side and the guests rely on.
 
-`make qemu` builds no `qemu-system-aarch64`, and `reims-ctl` makes no arm64
-VMs. QEMU's `vmapple` machine, without the Apple paravirtualized GPU it once
-had, builds again in an `aarch64-softmmu` build, under HVF or TCG, for
-Ambrosia, our own arm64 firmware ("arm64 guests", below).
+`make qemu` builds no `qemu-system-aarch64`. QEMU's `vmapple` machine,
+without the Apple paravirtualized GPU it once had, builds again in an
+`aarch64-softmmu` build, under HVF or TCG, for Ambrosia, our own arm64
+firmware ("arm64 guests", below). On an arm64 Mac or arm64 Linux,
+`reims-ctl` makes arm64 VMs by restoring macOS from an IPSW onto their disk
+(`crates/reims-restore`), which runs no QEMU, and doesn't start them;
+`scripts/install-ctl.sh` builds no QEMU there. A macOS 14 VM needs one boot
+before it is ready: macOS 14 makes its Data volume at its first boot and
+resets the VM, and `reims-restore finish-eacs DIR` then makes it bootable for
+Setup Assistant (`crates/reims-restore/docs/design.md`, "macOS 14's Data
+volume").
 
 No test runs QEMU, so a VM boot is the only check of QEMU's side of the
 API ([lessons.md](lessons.md)). Each measurement below names its host and
@@ -1669,7 +1676,8 @@ shared memory.
 arm64 macOS guests ran on QEMU's `vmapple` machine on an Apple silicon Mac,
 and the machine's display was Apple's paravirtualized GPU. That device is
 gone from the library and from QEMU: `make qemu` builds no
-`qemu-system-aarch64`, and `reims-ctl` makes no arm64 VMs. `vmapple` builds
+`qemu-system-aarch64`, and `reims-ctl` starts no arm64 VMs (it makes them,
+by a restore from an IPSW, above). `vmapple` builds
 again, without the device, in an `aarch64-softmmu` build, and runs under HVF
 or TCG on Ambrosia, our own arm64 firmware, which enters macOS's kernel
 itself. Virtualization.framework's firmware, AVPBooter, does not boot on the

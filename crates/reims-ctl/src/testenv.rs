@@ -8,15 +8,17 @@ use std::sync::{Mutex, MutexGuard};
 
 static LOCK: Mutex<()> = Mutex::new(());
 
-const VARS: [&str; 4] = [
+const VARS: [&str; 5] = [
     "REIMS_CTL_CONFIG_DIR",
     "REIMS_CTL_DATA_DIR",
     "REIMS_CTL_QEMU",
     "REIMS_CTL_UTIL",
+    "XDG_CACHE_HOME",
 ];
 
-/// A temporary directory holding reims-ctl's config and data directories, `config` and
-/// `data`, named in the environment until it drops, with no QEMU or reims-util named.
+/// A temporary directory holding reims-ctl's config, data and cache directories, `config`,
+/// `data` and `cache`, named in the environment until it drops, with no QEMU or reims-util
+/// named.
 pub struct Env {
     pub root: PathBuf,
     saved: Vec<(&'static str, Option<OsString>)>,
@@ -37,6 +39,7 @@ impl Env {
         };
         env.set("REIMS_CTL_CONFIG_DIR", env.root.join("config"));
         env.set("REIMS_CTL_DATA_DIR", env.root.join("data"));
+        env.set("XDG_CACHE_HOME", env.root.join("cache"));
         // SAFETY: the tests that set the environment hold LOCK.
         unsafe {
             std::env::remove_var("REIMS_CTL_QEMU");

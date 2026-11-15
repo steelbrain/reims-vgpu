@@ -80,7 +80,7 @@
 
 use crate::host::{Host, Profile};
 use crate::vm::{DiskController, Graphics, Vm};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
 /// The SMC key `isa-applesmc` gives every x86-64 guest.
@@ -126,6 +126,7 @@ pub fn invocation(vm: &Vm, ctx: &Ctx) -> Result<Invocation> {
     push(&["-name", &c.name]);
     match c.profile {
         Profile::Q35X86_64 => q35(vm, ctx, &mut a)?,
+        Profile::VmappleArm64 => bail!("{}", crate::runtime::not_started(vm)),
     }
     common(vm, ctx, &mut a)?;
     a.extend(c.extra_args.iter().cloned());
@@ -519,6 +520,7 @@ mod tests {
                     disk_controller: DiskController::Ahci,
                     disk_port: 3,
                 }),
+                vmapple: None,
                 extra_env: BTreeMap::new(),
                 usb: vec![],
             },

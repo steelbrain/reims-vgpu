@@ -47,6 +47,9 @@ pub struct VmConfig {
     pub logs: Logs,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub q35: Option<Q35>,
+    /// An arm64 VM's own settings ([`crate::host::Profile::VmappleArm64`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vmapple: Option<Vmapple>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_env: BTreeMap<String, String>,
     /// The host's USB devices the guest is given while the VM runs (usb.rs), x86-64 VMs'.
@@ -450,6 +453,49 @@ pub struct Q35 {
     pub disk_port: u32,
 }
 
+/// An arm64 VM's own settings: what its restore left beside its disk (restore.rs).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Vmapple {
+    /// The auxiliary storage, in the VM's directory: iBoot's NVRAM and the boot's records, with
+    /// Virtualization.framework's 16 KiB header; `aux.img.trimmed` beside it is the same without
+    /// the header, which QEMU attaches.
+    pub aux: PathBuf,
+    /// The VM's ECID, which every ticket of its macOS is bound to, and QEMU's `vmapple,uuid`.
+    /// Saved as text, `0x` and 16 hex digits: TOML's integers stop at 2^63, below many ECIDs.
+    #[serde(with = "ecid")]
+    pub ecid: u64,
+}
+
+/// An ECID in settings: written as `"0x…"`, and read from that, from decimal text, or from an
+/// integer, as settings of an earlier reims-ctl hold it.
+mod ecid {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&format!("{v:#018x}"))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Ecid {
+            Int(i64),
+            Text(String),
+        }
+        match Ecid::deserialize(d)? {
+            Ecid::Int(i) => u64::try_from(i).map_err(D::Error::custom),
+            Ecid::Text(t) => {
+                let t = t.trim();
+                match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+                    Some(hex) => u64::from_str_radix(hex, 16),
+                    None => t.parse(),
+                }
+                .map_err(|e| D::Error::custom(format!("ecid {t:?}: {e}")))
+            }
+        }
+    }
+}
+
 /// Skylake-Client without TSX: macOS boots on it without an OpenCore CPUID spoof, and it has no
 /// AVX-512, whose state XNU mishandles on AMD hosts (docs/qemu.md, "x86-64 macOS guests: the CPU
 /// model").
@@ -553,8 +599,14 @@ impl VmConfig {
         }
         check_mac(&self.network.mac)?;
         self.check_usb()?;
-        if self.q35.is_none() {
-            bail!("{}: no [q35] settings", self.name);
+        match self.profile {
+            Profile::Q35X86_64 if self.q35.is_none() => {
+                bail!("{}: no [q35] settings", self.name)
+            }
+            Profile::VmappleArm64 if self.vmapple.is_none() => {
+                bail!("{}: no [vmapple] settings", self.name)
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -791,6 +843,9 @@ impl Vm {
             v.extend([&q.opencore, &q.firmware_code, &q.firmware_vars].map(|p| self.path(p)));
             v.extend(q.installer.as_deref().map(|p| self.path(p)));
         }
+        if let Some(a) = &self.config.vmapple {
+            v.push(self.path(&a.aux));
+        }
         v
     }
 
@@ -904,7 +959,7 @@ impl Registry {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A resolution is the window's first size, `<width>x<height>`; reims-vgpu's window opens
@@ -1055,7 +1110,7 @@ mod tests {
         );
     }
 
-    fn x86_64_config() -> VmConfig {
+    pub(crate) fn x86_64_config() -> VmConfig {
         VmConfig {
             name: "t".into(),
             profile: Profile::Q35X86_64,
@@ -1091,6 +1146,7 @@ mod tests {
                 disk_controller: DiskController::Nvme,
                 disk_port: 3,
             }),
+            vmapple: None,
             extra_env: BTreeMap::from([("A".into(), "b".into())]),
             usb: vec![],
         }
@@ -1373,5 +1429,27 @@ mod tests {
             w[0].contains("reims-ctl set t --audio-backend none"),
             "{w:?}"
         );
+    }
+
+    /// An arm64 VM's ECID is saved as hex text, which TOML holds whole where its integers stop at
+    /// 2^63, and read from that, decimal text, or the integer earlier settings hold.
+    #[test]
+    fn an_ecid_past_tomls_integers_is_saved_as_text() {
+        let a = Vmapple {
+            aux: "aux.img".into(),
+            ecid: 13_981_697_631_839_962_497,
+        };
+        let text = toml::to_string(&a).unwrap();
+        assert_eq!(text, "aux = \"aux.img\"\necid = \"0xc208f7eafebdc581\"\n");
+        assert_eq!(toml::from_str::<Vmapple>(&text).unwrap(), a);
+        for ecid in ["\"13981697631839962497\"", "\"0xC208F7EAFEBDC581\""] {
+            let read: Vmapple =
+                toml::from_str(&format!("aux = \"aux.img\"\necid = {ecid}")).unwrap();
+            assert_eq!(read, a, "{ecid}");
+        }
+        let small: Vmapple =
+            toml::from_str("aux = \"aux.img\"\necid = 7075345111536996972").unwrap();
+        assert_eq!(small.ecid, 7_075_345_111_536_996_972);
+        assert!(toml::from_str::<Vmapple>("aux = \"a\"\necid = \"0xzz\"").is_err());
     }
 }
