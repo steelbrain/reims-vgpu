@@ -30,19 +30,29 @@
 //!   header that is not this identity's, and the whole file reads as none and is started again:
 //!   the kext takes what the device hands it, so no damaged or foreign answer reaches it. A file
 //!   holds at most [`CAPACITY`] records: past half of them it is written again at its next open,
-//!   and at all of them before the run appends another, with the newest answers kept, a quarter of
-//!   the capacity at most (the 2,048 answers the kext's table holds), in memory as in the file. As
-//!   each run appends a record of each key it uses, a host whose runs each use all 2,048 writes
-//!   its file again at every second open. A drop that cannot be written removes the file, so no
-//!   answer the device dropped reaches a later run. The newest [`KEEP_FILES`] files of the
-//!   directory are kept, and the rest removed.
+//!   and at all of them before the next record, with the newest answers it holds kept, a quarter
+//!   of the capacity at most (the 2,048 answers the kext's table holds); the store keeps in
+//!   memory only those of its answers. As each run appends a record of each key it uses, a host
+//!   whose runs each use all 2,048 writes its file again at every second open. A drop that cannot
+//!   be written, or a full file that cannot be written again, removes the file, so no answer the
+//!   device dropped reaches a later run. The newest [`KEEP_FILES`] files of the directory are
+//!   kept, and the rest removed.
+//! - **Shared.** Every store of one identity (each QEMU of one build on the host) writes the one
+//!   file. A store takes the file's lock (`File::lock`: `flock` on Linux and macOS, `LockFileEx`
+//!   on Windows) for each record it appends and each rewrite or removal, and with it the file the
+//!   path names now, where another store wrote it again or removed it meanwhile; a rewrite reads
+//!   every store's records from the file under that lock. So no record goes to a file no later
+//!   run reads, and no rewrite brings back an answer another store dropped. A rewrite renames over
+//!   a file other stores may hold open: on Windows, std's `rename` replaces it with POSIX
+//!   semantics (each of std's opens shares the file's deletion), which Windows has from 10 1607;
+//!   where the rename fails, the full file is removed.
 //! - A test build keeps no file ([`KEPT`]): its answers are kept in memory for the device's life
 //!   alone, so no test's pipelines reach a host's later guests.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use reims_vgpu_graphics::wire::{
@@ -59,15 +69,16 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
-// A file's build ([`library_build`]), each OS's own, and the tests' link to a file.
-#[cfg(unix)]
-use unix::file_build;
+// A file's build ([`library_build`]) and whether a path still names an open file, each OS's own,
+// and the tests' link to a file.
 #[cfg(all(test, unix))]
 use unix::symlink;
-#[cfg(windows)]
-use windows::file_build;
+#[cfg(unix)]
+use unix::{file_build, same_file};
 #[cfg(all(test, windows))]
 use windows::symlink;
+#[cfg(windows)]
+use windows::{file_build, same_file};
 
 /// A pipeline create's key ([`RGFX_PIPELINE_REFLECT_KEYED`]).
 pub(crate) type AnswerKey = [u8; 32];
@@ -135,9 +146,11 @@ struct State {
     /// The last stamp of the records of earlier runs: a key stamped past it was learnt or used in
     /// this run, and its record appended in it.
     run_start: u64,
-    /// The file, where it is written, and the records it holds.
+    /// The file at the path as this store last found it, open to read and append: another store
+    /// of the identity can write it again or remove it meanwhile ([`State::lock_file`]).
     file: Option<File>,
-    records: usize,
+    /// Whether a kept answer's record failed to reach the file in this run (its line given).
+    unwritten: bool,
 }
 
 /// How a create of a key the device keeps an answer of was answered now ([`PipelineAnswers::observe`]).
@@ -184,35 +197,35 @@ impl PipelineAnswers {
             path: Some(path.clone()),
             ..State::default()
         };
-        let read = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| read(&bytes, &identity));
+        // The file is locked while it is read and, where it must be, written again, so no record
+        // of another store falls between the two.
+        let read = state
+            .lock_file()
+            .then(|| {
+                state
+                    .file
+                    .as_ref()
+                    .and_then(|file| read_file(file, &identity))
+            })
+            .flatten();
         let unread = read.is_none();
-        let records = read.as_ref().map_or(0, |records| records.len());
-        for (kind, key, answer) in read.into_iter().flatten() {
-            state.next += 1;
-            if kind == KEPT_RECORD {
-                state.kept.insert(key, (answer, state.next));
-            } else {
-                state.kept.remove(&key);
-            }
-        }
+        let records = read.as_ref().map_or(0, Vec::len);
+        state.kept = kept_by(read.unwrap_or_default());
+        state.next = records as u64;
         state.run_start = state.next;
         // A missing, damaged or foreign file is started again, and one past half its capacity
         // written again with its newest answers: as many as the kext's table holds.
         if unread || records > CAPACITY / 2 {
-            state.rewrite();
-        } else {
-            state.records = records;
-            state.file = OpenOptions::new().append(true).open(&path).ok();
+            state.rewrite_with(newest(&state.kept, CAPACITY / 4));
         }
+        state.unlock();
         prune(dir, &path);
         log::info!(
             target: "reims_vgpu::graphics::answers",
             "kept pipeline answers: {} of earlier runs read from {}{}",
             state.kept.len(),
             path.display(),
-            if state.file.is_none() { " (none is kept in it this run)" } else { "" }
+            if state.file.is_none() { " (it could not be written)" } else { "" }
         );
         PipelineAnswers {
             state: Mutex::new(state),
@@ -317,64 +330,133 @@ impl State {
         }
     }
 
-    /// Appends a record of `kind` to the file, where one is written: one at its capacity is
-    /// written again first. A drop that cannot be written removes the file ([`State::discard`]).
+    /// Appends a record of `kind` to the file, with its lock held ([`State::lock_file`]): one at
+    /// its capacity is written again first, from the answers it holds. A drop that cannot be
+    /// written removes the file ([`State::discard`]).
     fn append(&mut self, kind: u32, key: &AnswerKey, answer: &RgfxPipelineReflection) {
         let Some(identity) = self.identity else {
             return;
         };
-        let in_file = self.file.is_some();
-        if in_file && self.records >= CAPACITY {
-            self.rewrite();
-        }
-        let appended = self.file.as_mut().is_some_and(|file| {
-            file.write_all(&record(&identity, kind, key, answer))
-                .is_ok()
-        });
+        let locked = self.lock_file()
+            && (self.records_in_file() < CAPACITY || {
+                self.rewrite_full(key);
+                self.lock_file()
+            });
+        let appended = locked
+            && self.file.as_mut().is_some_and(|file| {
+                file.write_all(&record(&identity, kind, key, answer))
+                    .is_ok()
+            });
+        self.unlock();
         if appended {
-            self.records += 1;
             return;
         }
-        if in_file {
-            self.file = None;
+        if kind == DROPPED_RECORD {
+            self.discard();
+        } else if !self.unwritten {
+            self.unwritten = true;
             log::warn!(
                 target: "reims_vgpu::graphics::answers",
-                "the pipeline answers' file took no more records: this run's answers are kept \
-                 in memory alone"
+                "a kept pipeline answer could not be written to its file: it is kept in memory \
+                 alone"
             );
         }
-        if kind == DROPPED_RECORD {
+    }
+
+    /// Locks the file at the path against every other store of the identity (another device's,
+    /// or another process's: each QEMU of one build), until [`State::unlock`]. A store writes the
+    /// file again, or removes it, only with the lock of the file it replaces held, so the file
+    /// this store holds is locked where the path still names it, and else the one now there,
+    /// which it holds from then on: no record goes to a file no run reads. False where there is
+    /// none, or it cannot be locked.
+    fn lock_file(&mut self) -> bool {
+        let Some(path) = self.path.as_deref() else {
+            return false;
+        };
+        // Each try but the last finds the file another store put in place meanwhile.
+        for _ in 0..8 {
+            if self.file.is_none() {
+                self.file = OpenOptions::new().read(true).append(true).open(path).ok();
+            }
+            let Some(file) = self.file.as_ref() else {
+                return false;
+            };
+            if file.lock().is_err() {
+                self.file = None;
+                return false;
+            }
+            if same_file(file, path) {
+                return true;
+            }
+            self.file = None;
+        }
+        false
+    }
+
+    /// Unlocks the file [`State::lock_file`] locked.
+    fn unlock(&self) {
+        if let Some(file) = &self.file {
+            let _ = file.unlock();
+        }
+    }
+
+    /// The records of the file held, from its length.
+    fn records_in_file(&self) -> usize {
+        self.file
+            .as_ref()
+            .and_then(|file| file.metadata().ok())
+            .map_or(0, |meta| {
+                usize::try_from(meta.len())
+                    .unwrap_or(usize::MAX)
+                    .saturating_sub(HEADER_BYTES)
+                    / RECORD_BYTES
+            })
+    }
+
+    /// Writes the file held, locked and at its capacity, again with the newest answers it holds,
+    /// every store's records and drops counted (none where it does not read), before a record of
+    /// `key`, whose answer memory keeps. A file that cannot be written again is removed
+    /// ([`State::discard`]), as one past its capacity would take every later record of the run
+    /// with a rewrite each.
+    fn rewrite_full(&mut self, key: &AnswerKey) {
+        let held = self
+            .identity
+            .zip(self.file.as_ref())
+            .and_then(|(identity, file)| read_file(file, &identity))
+            .unwrap_or_default();
+        let appending = self.kept.get(key).copied();
+        self.rewrite_with(newest(&kept_by(held), CAPACITY / 4));
+        if let Some(answer) = appending {
+            self.kept.insert(*key, answer);
+        }
+        if self.file.is_none() {
             self.discard();
         }
     }
 
-    /// Writes the file again with its newest answers, a quarter of the capacity at most (as many
-    /// as the kext's table holds), and keeps only those in memory too: the file is written from
-    /// then on where that succeeds, and no more in this run where it does not.
-    fn rewrite(&mut self) {
-        let newest = newest(&self.kept, CAPACITY / 4);
+    /// Writes the file again with `newest`, through a file beside it renamed over it, while the
+    /// lock of the file it replaces is held where there is one, and keeps in memory only the
+    /// answers it holds. The file written is the one held from then on, unlocked; the one it
+    /// replaced, and its lock, go once it is in place.
+    fn rewrite_with(&mut self, newest: Vec<(AnswerKey, RgfxPipelineReflection)>) {
         let keys: HashSet<AnswerKey> = newest.iter().map(|(key, _)| *key).collect();
         self.kept.retain(|key, _| keys.contains(key));
-        // The handle to the file it replaces goes first: a file open on Windows can refuse a
-        // rename over it.
-        self.file = None;
-        self.records = 0;
         if let (Some(identity), Some(path)) = (self.identity, self.path.as_deref()) {
             self.file = rewrite_file(path, &identity, &newest);
         }
-        if self.file.is_some() {
-            self.records = newest.len();
-        }
     }
 
-    /// Removes the file, as a drop that cannot be written to it leaves it: the next run then
-    /// starts from none, and no answer the device dropped reaches it. Once a run, since none of
-    /// its records is written after.
+    /// Removes the file, as a drop that cannot be written to it leaves it, with its lock held where
+    /// it can be: the next run then starts from none, and no answer the device dropped reaches
+    /// it. Once a run, since none of its records is written after.
     fn discard(&mut self) {
+        self.lock_file();
         let Some(path) = self.path.take() else {
             return;
         };
-        match std::fs::remove_file(&path) {
+        let removed = std::fs::remove_file(&path);
+        self.file = None;
+        match removed {
             Ok(()) => log::warn!(
                 target: "reims_vgpu::graphics::answers",
                 "a dropped pipeline answer could not be written to its file: {} is removed, \
@@ -510,6 +592,32 @@ fn read(
         .collect()
 }
 
+/// The records of the open `file`, of `identity`, read from its start ([`read`]).
+fn read_file(
+    mut file: &File,
+    identity: &[u8; 32],
+) -> Option<Vec<(u32, AnswerKey, RgfxPipelineReflection)>> {
+    let mut bytes = Vec::new();
+    file.seek(SeekFrom::Start(0)).ok()?;
+    file.read_to_end(&mut bytes).ok()?;
+    read(&bytes, identity)
+}
+
+/// The answers `records` leave kept, each with its record's place (from 1).
+fn kept_by(
+    records: Vec<(u32, AnswerKey, RgfxPipelineReflection)>,
+) -> HashMap<AnswerKey, (RgfxPipelineReflection, u64)> {
+    let mut kept = HashMap::new();
+    for (place, (kind, key, answer)) in (1..).zip(records) {
+        if kind == KEPT_RECORD {
+            kept.insert(key, (answer, place));
+        } else {
+            kept.remove(&key);
+        }
+    }
+    kept
+}
+
 /// The `most` newest of `kept`, oldest first.
 fn newest(
     kept: &HashMap<AnswerKey, (RgfxPipelineReflection, u64)>,
@@ -540,7 +648,7 @@ fn rewrite_file(
         let _ = std::fs::remove_file(&staged);
         return None;
     }
-    OpenOptions::new().append(true).open(path).ok()
+    OpenOptions::new().read(true).append(true).open(path).ok()
 }
 
 /// Removes the files of `dir` but the [`KEEP_FILES`] last written and `keep`.
@@ -993,11 +1101,12 @@ mod tests {
             answers.observe(&many_key(n), Some(&made(1, 1, n as u64)));
         }
         assert_eq!(records(&dir), CAPACITY);
-        // The newest answer refused: the file is written again with the newest 2,048 left, in
-        // memory too, and then takes the drop.
+        // The newest answer refused: the file is written again with the newest 2,048 it holds,
+        // the refused one among them, of which memory keeps the 2,047 others, and then takes the
+        // drop.
         let newest = many_key(CAPACITY - 1);
         assert_eq!(answers.observe(&newest, None), Observed::Refused);
-        assert_eq!(answers.len(), CAPACITY / 4);
+        assert_eq!(answers.len(), CAPACITY / 4 - 1);
         assert_eq!(records(&dir), CAPACITY / 4 + 1);
         // And what the run learns after.
         assert_eq!(
@@ -1006,7 +1115,7 @@ mod tests {
         );
         drop(answers);
         let answers = PipelineAnswers::open_in(&dir.0, IDENTITY);
-        assert_eq!(answers.len(), CAPACITY / 4 + 1);
+        assert_eq!(answers.len(), CAPACITY / 4);
         assert_eq!(
             threads(answers.replies(0, 2, 0)),
             [7, (CAPACITY - 2) as u64]
@@ -1018,26 +1127,113 @@ mod tests {
     }
 
     /// A drop that cannot be written to the file removes it, so the next run starts from none and
-    /// takes no answer the device dropped; a kept answer that cannot be written leaves it.
+    /// takes no answer the device dropped; a kept answer that cannot be written leaves it. Here the
+    /// file put in place meanwhile cannot be opened to write: on Unix, one without write
+    /// permission (to a user other than root).
+    #[cfg(unix)]
     #[test]
     fn a_drop_that_cannot_be_written_removes_the_file() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = Scratch::new("lost-drop");
         let answers = PipelineAnswers::open_in(&dir.0, IDENTITY);
         answers.observe(&key(1), Some(&made(1, 1, 64)));
         answers.observe(&key(2), Some(&made(1, 1, 128)));
         drop(answers);
         let answers = PipelineAnswers::open_in(&dir.0, IDENTITY);
-        // The file takes no more records, as after a write that failed.
-        answers.state.lock().file = None;
+        let path = dir.file(&IDENTITY);
+        let copy = dir.0.join("copy");
+        std::fs::copy(&path, &copy).unwrap();
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::rename(&copy, &path).unwrap();
         assert_eq!(
             answers.observe(&key(3), Some(&made(1, 1, 256))),
             Observed::New
         );
-        assert!(dir.file(&IDENTITY).exists());
+        assert!(path.exists());
         assert_eq!(answers.observe(&key(1), None), Observed::Refused);
-        assert!(!dir.file(&IDENTITY).exists());
+        assert!(!path.exists());
         drop(answers);
         assert_eq!(PipelineAnswers::open_in(&dir.0, IDENTITY).len(), 0);
+    }
+
+    /// Two stores of one identity, as two QEMUs of one build keep: one writes the file again at
+    /// its open, renamed over the file the other holds, and the other's later records, a drop
+    /// among them, still reach the file the next run reads.
+    #[test]
+    fn a_drop_reaches_the_file_another_store_wrote_again() {
+        let dir = Scratch::new("two-stores");
+        let first = PipelineAnswers::open_in(&dir.0, IDENTITY);
+        for n in 0..CAPACITY / 2 {
+            first.observe(&many_key(n), Some(&made(1, 1, 64)));
+        }
+        assert_eq!(
+            first.observe(&key(1), Some(&made(1, 1, 1024))),
+            Observed::New
+        );
+        // Past half its capacity: the second's open writes it again, the newest kept.
+        let second = PipelineAnswers::open_in(&dir.0, IDENTITY);
+        assert_eq!(second.len(), CAPACITY / 4);
+        assert_eq!(records(&dir), CAPACITY / 4);
+        assert_eq!(first.observe(&key(1), None), Observed::Refused);
+        assert_eq!(
+            first.observe(&key(2), Some(&made(1, 1, 256))),
+            Observed::New
+        );
+        assert_eq!(
+            second.observe(&key(3), Some(&made(1, 1, 512))),
+            Observed::New
+        );
+        assert_eq!(records(&dir), CAPACITY / 4 + 3);
+        drop(first);
+        drop(second);
+        let next = PipelineAnswers::open_in(&dir.0, IDENTITY);
+        assert_eq!(
+            next.observe(&key(1), Some(&made(2, 2, 1024))),
+            Observed::New
+        );
+        assert_eq!(
+            next.observe(&key(2), Some(&made(2, 2, 256))),
+            Observed::Same
+        );
+        assert_eq!(
+            next.observe(&key(3), Some(&made(2, 2, 512))),
+            Observed::Same
+        );
+    }
+
+    /// A file at its capacity counts every store's records, and its rewrite keeps the answers the
+    /// file holds, not those the writing store remembers: an answer another store dropped stays
+    /// dropped.
+    #[test]
+    fn a_rewrite_at_the_capacity_keeps_no_answer_another_store_dropped() {
+        let dir = Scratch::new("two-stores-cap");
+        let first = PipelineAnswers::open_in(&dir.0, IDENTITY);
+        let second = PipelineAnswers::open_in(&dir.0, IDENTITY);
+        for n in 0..CAPACITY - 3 {
+            first.observe(&many_key(n), Some(&made(1, 1, 64)));
+        }
+        first.observe(&key(1), Some(&made(1, 1, 1024)));
+        second.observe(&key(1), Some(&made(2, 2, 1024)));
+        assert_eq!(second.observe(&key(1), None), Observed::Refused);
+        assert_eq!(records(&dir), CAPACITY);
+        // The first's next record finds the file full, and writes it again first.
+        assert_eq!(
+            first.observe(&key(2), Some(&made(1, 1, 256))),
+            Observed::New
+        );
+        assert_eq!(records(&dir), CAPACITY / 4 + 1);
+        drop(first);
+        drop(second);
+        let next = PipelineAnswers::open_in(&dir.0, IDENTITY);
+        assert_eq!(next.len(), CAPACITY / 4 + 1);
+        assert_eq!(
+            next.observe(&key(1), Some(&made(3, 3, 1024))),
+            Observed::New
+        );
+        assert_eq!(
+            next.observe(&key(2), Some(&made(3, 3, 256))),
+            Observed::Same
+        );
     }
 
     /// Answers kept in memory alone, as a test build's device keeps them, write no file.

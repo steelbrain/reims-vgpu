@@ -1,5 +1,5 @@
 //! The build of a file on Windows ([`file_build`]), which names the build of the library that runs
-//! (`super::library_build`).
+//! (`super::library_build`), and whether a path still names an open file ([`same_file`]).
 
 use std::fs::File;
 use std::os::windows::io::AsRawHandle as _;
@@ -35,6 +35,28 @@ pub(super) fn file_build(path: &Path) -> Option<Vec<u8>> {
         build.extend_from_slice(&word.to_le_bytes());
     }
     Some(build)
+}
+
+/// Whether `path` names the open `file`: the same volume and file ID. False where another file was
+/// renamed over it, or it was removed (or is pending removal, which no open takes).
+pub(super) fn same_file(file: &File, path: &Path) -> bool {
+    let Ok(named) = File::open(path) else {
+        return false;
+    };
+    // SAFETY: FILE_ID_INFO is FileIdInfo's record, plain data.
+    let ids = unsafe {
+        (
+            information::<FILE_ID_INFO>(file, FileIdInfo),
+            information::<FILE_ID_INFO>(&named, FileIdInfo),
+        )
+    };
+    match ids {
+        (Some(open), Some(named)) => {
+            open.VolumeSerialNumber == named.VolumeSerialNumber
+                && open.FileId.Identifier == named.FileId.Identifier
+        }
+        _ => false,
+    }
 }
 
 /// The open `file`'s information of `class`, whose record is a `T`; `None` where Windows gives
