@@ -271,6 +271,8 @@ pub fn adopt(raw: rt::Device) -> VulkanDevice {
     crate::answer::native::device_made(raw.properties());
     #[cfg(target_os = "linux")]
     crate::os::learn_view_imports(&raw);
+    #[cfg(windows)]
+    crate::os::hand_ram_to(&raw);
     let mut threads = crate::let_go::DeviceThreads::default();
     if crate::records::KEPT
         && let Some(home) = std::env::var_os("HOME")
@@ -1074,14 +1076,14 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         crate::answer::recoveries()
     }
 
-    /// On Linux, where the device uses the guest's RAM whole and the runtime copies by its runs
-    /// (`os/linux/host_ram.rs`); never on macOS, whose devices are handed no RAM.
+    /// On Linux and Windows, where the device uses the guest's RAM whole and the runtime copies
+    /// by its runs (`os/host_ram.rs`); never on macOS, whose devices are handed no RAM.
     fn copies_guest_ram(&self) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         {
             crate::os::copies_guest_ram(&self.raw)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             false
         }

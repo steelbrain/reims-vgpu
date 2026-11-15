@@ -35,15 +35,16 @@ pub(crate) use dma_buf::{
     fits_one as one_dma_buf_fits, fits_one_of as one_dma_buf_of_fits,
     fits_pieces as one_dma_buf_of_pieces_fits,
 };
-pub(crate) use host_ram::{
-    copies as copies_guest_ram, copy_from_host_ram, copy_runs_from_host_ram, copy_to_host_ram,
-    ram_over, take_devices as take_ram_devices,
-};
+#[cfg(test)]
+pub(crate) use host_ram::ram_has_sources;
+pub(crate) use host_ram::with_ram_sources;
 pub(crate) use import::{
     COPIES_READ_ONLY, ImportMade, dma_buf_refusal, host_memory, host_memory_vouched, import_view,
     learn_view_imports,
 };
 pub(crate) use vm::allocate_aliasable;
+#[cfg(test)]
+pub(crate) use vm::memfd;
 #[cfg(test)]
 pub(crate) use vm::tests::{PAGE, mapped, writable};
 

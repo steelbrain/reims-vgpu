@@ -1,6 +1,9 @@
 //! The guest's RAM a device holds on Windows: each range of it registered in the backing table
-//! (`crate::os::files`) as a view of the pagefile-backed section the host names, while the device
-//! lives, so views of the guest's pages map that section ([`super::vm`]).
+//! (`crate::os::files`) as a view of the pagefile-backed section the host names, so views of the
+//! guest's pages map that section ([`super::vm`]), and handed whole to the devices that take it
+//! (`crate::os`'s `host_ram`), while the device lives.
+
+use std::sync::Arc;
 
 use crate::os::GuestRamFile;
 use crate::os::files::{Backing, Registration};
@@ -10,6 +13,9 @@ use crate::os::files::{Backing, Registration};
 /// guest's pages are made of these sections.
 #[derive(Debug)]
 pub struct GuestMemoryLease {
+    /// The RAM as the devices that take it whole are handed it (`crate::os`'s `host_ram`), let go
+    /// of first.
+    _ram: Arc<crate::os::host_ram::LeasedRam>,
     _registrations: Vec<Registration>,
 }
 
@@ -17,6 +23,8 @@ pub struct GuestMemoryLease {
 /// (`crate::os::files`'s `Registration::guest_ram`): counted where the same range was registered
 /// already over the same section handle (`crate::os::files`'s module docs).
 pub fn lease_guest_memory(ranges: impl IntoIterator<Item = GuestRamFile>) -> GuestMemoryLease {
+    let ranges: Vec<GuestRamFile> = ranges.into_iter().collect();
+    let ram: Vec<(u64, u64)> = ranges.iter().map(|r| (r.host, r.length)).collect();
     let registrations = ranges
         .into_iter()
         .map(|r| {
@@ -28,6 +36,7 @@ pub fn lease_guest_memory(ranges: impl IntoIterator<Item = GuestRamFile>) -> Gue
         })
         .collect();
     GuestMemoryLease {
+        _ram: crate::os::host_ram::lease(&ram),
         _registrations: registrations,
     }
 }

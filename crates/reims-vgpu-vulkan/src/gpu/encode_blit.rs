@@ -296,15 +296,15 @@ pub type VulkanBlitEncoder = Obj<EncoderObject<Box<rt::BlitCommandEncoder>>>;
 
 /// What the encoder's lines name [`BlitEncoder::copy_from_guest_ram`] by: no selector of Metal's
 /// does.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 const GUEST_RAM_TO_BUFFER: &str = "copyFromGuestRam:toBuffer:destinationOffset: (no Metal)";
 
 /// What they name [`BlitEncoder::copy_from_guest_ram_at`] by.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 const GUEST_RAM_RUNS_TO_BUFFER: &str = "copyFromGuestRamRuns:toBuffer: (no Metal)";
 
 /// What they name [`BlitEncoder::copy_to_guest_ram`] by.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 const BUFFER_TO_GUEST_RAM: &str = "copyFromBuffer:toGuestRamRuns: (no Metal)";
 
 /// A raw `MTLBlitOption` of a copy between a buffer and a texture, sent with `sel`: none, depth
@@ -513,8 +513,8 @@ fn buffer_copy_shape(
 }
 
 impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
-    /// On Linux, through the RAM the destination's device uses that holds every run
-    /// (`os/linux/host_ram.rs`), where the runtime copies by runs: a first use of Metal's device,
+    /// On Linux and Windows, through the RAM the destination's device uses that holds every run
+    /// (`os/host_ram.rs`), where the runtime copies by runs: a first use of Metal's device,
     /// as a blit's copy is. False, with nothing encoded, where no such RAM holds them or the
     /// runtime refuses the copy; never on macOS.
     fn copy_from_guest_ram(
@@ -524,7 +524,7 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
         destination: &VulkanBuffer,
         destination_offset: u64,
     ) -> RaiseResult<bool> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         {
             let device = &destination.device.raw;
             let Some(ram) = (crate::os::copies_guest_ram(device))
@@ -539,7 +539,7 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
             });
             Ok(copied.is_ok())
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = (runs, destination, destination_offset);
             Ok(false)
@@ -554,7 +554,7 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
         runs: &[(u64, std::ops::Range<u64>)],
         destination: &VulkanBuffer,
     ) -> RaiseResult<bool> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         {
             let device = &destination.device.raw;
             let Some(ram) = (crate::os::copies_guest_ram(device))
@@ -569,7 +569,7 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
             });
             Ok(copied.is_ok())
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = (runs, destination);
             Ok(false)
@@ -583,7 +583,7 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
         source: &VulkanBuffer,
         runs: &[(u64, std::ops::Range<u64>)],
     ) -> RaiseResult<bool> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         {
             let device = &source.device.raw;
             let Some(ram) = (crate::os::copies_guest_ram(device))
@@ -598,7 +598,7 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
             });
             Ok(copied.is_ok())
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = (source, runs);
             Ok(false)

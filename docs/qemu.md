@@ -478,7 +478,7 @@ through dma-bufs"). How the GPU then takes those pages depends on its driver:
   device is made: its import fails, and the copy the runtime makes in its
   place counts as the refusal. From then on:
   - The device is handed the guest's RAM whole (metal2vulkan's `HostRam`,
-    `crates/reims-vgpu-vulkan/src/os/linux/host_ram.rs`). An object whose
+    `crates/reims-vgpu-vulkan/src/os/host_ram.rs`). An object whose
     pages are one run of the RAM inside one 64 MiB chunk of it is bound in
     the device's import of that chunk, made the first time an object over it
     is made: it takes no mapping and asks no gate. A device without

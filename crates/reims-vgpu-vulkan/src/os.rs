@@ -15,6 +15,8 @@
 
 #[cfg(any(target_os = "linux", windows))]
 mod files;
+#[cfg(any(target_os = "linux", windows))]
+mod host_ram;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -38,10 +40,6 @@ use crate::core::platform::os::vm::{HostAddr, HostVm as _};
 /// (`os/linux/import.rs`).
 #[cfg(target_os = "linux")]
 pub(crate) use host_os::learn_view_imports;
-/// Takes the devices handed the guest's RAM, on Linux (`os/linux/host_ram.rs`), for the
-/// platform's let-go of its devices ([`crate::let_go`]).
-#[cfg(target_os = "linux")]
-pub(crate) use host_os::take_ram_devices;
 /// The calling thread's user-space instructions and cycles, which cost tests count in, on Linux
 /// (`os/linux/thread_counts.rs`).
 #[cfg(all(test, target_os = "linux"))]
@@ -64,16 +62,25 @@ pub use host_os::{
 pub use host_os::{LendRefusal, LentDmaBuf, dma_buf_of_host};
 #[cfg(test)]
 pub(crate) use host_os::{PAGE, mapped, writable};
-/// The guest's RAM a device copies by runs of it, on Linux (`os/linux/host_ram.rs`).
-#[cfg(target_os = "linux")]
-pub(crate) use host_os::{
-    copies_guest_ram, copy_from_host_ram, copy_runs_from_host_ram, copy_to_host_ram, ram_over,
-};
 /// Whether one dma-buf takes the pages of a range, as the runtime asks for a texture's own, of a
 /// list of ranges, before a view of them is made, or of pieces of pages not made yet, on Linux
 /// (`os/linux/dma_buf.rs`).
 #[cfg(target_os = "linux")]
 pub(crate) use host_os::{one_dma_buf_fits, one_dma_buf_of_fits, one_dma_buf_of_pieces_fits};
+/// Hands a device the guest's RAM as it is adopted, on Windows (`os/host_ram.rs`); on Linux the
+/// learning of its imports of views hands it (`learn_view_imports`).
+#[cfg(windows)]
+pub(crate) use host_ram::hand_ram_to;
+/// Takes the devices handed the guest's RAM, on Linux and Windows (`os/host_ram.rs`), for the
+/// platform's let-go of its devices ([`crate::let_go`]).
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) use host_ram::take_devices as take_ram_devices;
+/// The guest's RAM a device copies by runs of it, on Linux and Windows (`os/host_ram.rs`).
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) use host_ram::{
+    copies as copies_guest_ram, copy_from_host_ram, copy_runs_from_host_ram, copy_to_host_ram,
+    ram_over,
+};
 /// The Objective-C message layer the window's AppKit side sends through, on macOS
 /// (`os/macos/msg.rs`).
 #[cfg(target_os = "macos")]

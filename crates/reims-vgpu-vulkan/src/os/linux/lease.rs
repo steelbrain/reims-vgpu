@@ -1,6 +1,6 @@
 //! The guest's RAM a device holds on Linux: each range of it registered in the backing table
 //! (`crate::os::files`) as a shared mapping of the file the host names, and handed whole to the
-//! devices that take it (`super::host_ram`), while the device lives.
+//! devices that take it (`crate::os`'s `host_ram`), while the device lives.
 
 use std::sync::Arc;
 
@@ -12,9 +12,9 @@ use crate::os::files::{Backing, Registration};
 /// guest's pages are made of these files.
 #[derive(Debug)]
 pub struct GuestMemoryLease {
-    /// The RAM as the devices that take it whole are handed it (`super::host_ram`), let go of
+    /// The RAM as the devices that take it whole are handed it (`crate::os`'s `host_ram`), let go of
     /// first.
-    _ram: Arc<super::host_ram::LeasedRam>,
+    _ram: Arc<crate::os::host_ram::LeasedRam>,
     _registrations: Vec<Registration>,
 }
 
@@ -41,7 +41,7 @@ pub fn lease_guest_memory(ranges: impl IntoIterator<Item = GuestRamFile>) -> Gue
         .collect();
     super::budget::warn_if_short(guest_ram);
     GuestMemoryLease {
-        _ram: super::host_ram::lease(&ram),
+        _ram: crate::os::host_ram::lease(&ram),
         _registrations: registrations,
     }
 }

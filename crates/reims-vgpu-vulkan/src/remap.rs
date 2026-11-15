@@ -117,7 +117,7 @@
 //! their imports ([`wait_unimported`]), which comes after the objects go where a command buffer
 //! or another of the runtime's threads still holds an import, and frees it beside the owner's next
 //! steps. The wait reads the holds, and the keeps of the runtime's own imports of the guest's RAM
-//! whole ([`ImportKeep`], `os/linux/host_ram.rs`), which defer no unmap. Measured on a Radeon 780M
+//! whole ([`ImportKeep`], `os/host_ram.rs`), which defer no unmap. Measured on a Radeon 780M
 //! (RADV, Linux 7.3.3, 2026-11-11): a test's `munmap` of its region, anonymous memory a no-copy
 //! buffer's import still lay over while a completed command buffer's handler freed it on another
 //! thread, faulted the kernel in amdgpu's notifier (`amdgpu_hmm_invalidate_gfx`), and the GPU's
@@ -413,11 +413,11 @@ impl Drop for UnmapHold {
 }
 
 /// A keep of host pages a runtime import holds whose unmap is not the library's (the guest's RAM,
-/// which the runtime imports whole, `os/linux/host_ram.rs`), which the runtime is given in the
+/// which the runtime imports whole, `os/host_ram.rs`), which the runtime is given in the
 /// import's keep-alive: while it lives, [`wait_unimported`] waits for it, and it defers no unmap,
 /// as the library makes none of those pages (module docs, "Memory the library does not unmap").
-// Made on Linux alone, where the runtime imports the guest's RAM whole.
-#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+// Made on Linux and Windows alone, where the runtime imports the guest's RAM whole.
+#[cfg_attr(not(any(test, target_os = "linux", windows)), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct ImportKeep {
     /// The first byte of its pages.
@@ -426,8 +426,8 @@ pub(crate) struct ImportKeep {
     id: u64,
 }
 
-// Made on Linux alone, where the runtime imports the guest's RAM whole.
-#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+// Made on Linux and Windows alone, where the runtime imports the guest's RAM whole.
+#[cfg_attr(not(any(test, target_os = "linux", windows)), allow(dead_code))]
 impl ImportKeep {
     /// A keep of the pages the `length` bytes at `bytes` lie in (one page for a length of 0).
     pub(crate) fn new(bytes: NonNull<u8>, length: u64) -> ImportKeep {

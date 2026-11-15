@@ -35,7 +35,7 @@
 //! a kernel with free RAM in one piece gives them), downwards (each page right below the one
 //! before: 512 runs of a page, as a kernel's free list may give them) and scattered (pages picked
 //! at random over the RAM: 512 runs). A device that takes the guest's RAM whole (the Vulkan
-//! platform on NVIDIA's driver, `os/linux/host_ram.rs`) imports it in the runtime's chunks, so
+//! platform on NVIDIA's driver, `os/host_ram.rs`) imports it in the runtime's chunks, so
 //! this is where a take over a chunk not yet imported shows. `RGK_BENCH_TAKES` slabs an order
 //! (default 256, 512 MiB), `RGK_BENCH_RAM_MIB` the RAM (at least twice the takes'),
 //! `RGK_BENCH_TAKE_GAP_US` a pause before each take (default 0, a burst), and `RGK_BENCH_ORDERS` a

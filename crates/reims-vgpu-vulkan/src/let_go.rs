@@ -62,7 +62,7 @@ pub fn let_go_of_devices(bound: Duration) -> Result<usize, String> {
     drop(libraries);
     drop(crate::gpu::metal_space::take_sampler_ids());
     drop(crate::platform::take_answering_device());
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     drop(crate::os::take_ram_devices());
     drop(devices);
     log::debug!(

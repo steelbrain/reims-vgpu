@@ -403,7 +403,7 @@ fn addr_of(at: NonNull<u8>) -> u64 {
 /// views"). There a second probe, of a view of as many pages as one dma-buf takes, learns whether
 /// the device takes the pages one dma-buf holds through it ([`ONE_DMA_BUF`]), as NVIDIA's driver
 /// does, dedicated to the buffer. Either way the device is handed the guest's RAM then
-/// (`super::host_ram`). Nothing is learned where the view is not mapped through dma-bufs (udmabuf
+/// (`crate::os`'s `host_ram`). Nothing is learned where the view is not mapped through dma-bufs (udmabuf
 /// not the process's): no import then needs it, and the device takes no RAM.
 pub(crate) fn learn_view_imports(device: &rt::Device) {
     if IMPORTS_NEED_FILES.load(Ordering::Relaxed) {
@@ -462,8 +462,8 @@ pub(crate) fn learn_view_imports(device: &rt::Device) {
         budget::warn_if_imports_short();
     }
     // Either way the device copies by runs of the guest's RAM, and binds objects over it in the
-    // RAM's chunks it imported (`super::host_ram`).
-    super::host_ram::hand_ram_to(device);
+    // RAM's chunks it imported (`crate::os`'s `host_ram`).
+    crate::os::host_ram::hand_ram_to(device);
 }
 
 /// How long the last of [`learn_folds`]' answers took, a kept verdict's read or the probe, in
@@ -1073,11 +1073,11 @@ unsafe fn host_memory_noting(
     static GATE: std::sync::LazyLock<rt::ImportGate> =
         std::sync::LazyLock::new(|| Arc::new(import_gate));
     static RUNS: std::sync::LazyLock<rt::RunResolver> =
-        std::sync::LazyLock::new(|| Arc::new(super::host_ram::runs));
+        std::sync::LazyLock::new(|| Arc::new(crate::os::host_ram::runs));
     // SAFETY: the caller's.
     let memory =
         unsafe { rt::HostMemory::with_dma_buf(at, source) }.with_import_gate(Arc::clone(&GATE));
-    // The runs of the guest's RAM the pages are (`super::host_ram`), which the runtime asks of the
+    // The runs of the guest's RAM the pages are (`crate::os`'s `host_ram`), which the runtime asks of the
     // import's window, on every device: where the device imports the RAM's chunks for its objects,
     // the object lies in its chunk; where it lists its imports in every submission, in a chunk a
     // copy imported, and else in an import of its own, as with no runs.

@@ -720,7 +720,6 @@ impl Registration {
 /// library's own), shows nothing, or is mapped without
 /// write permission: a device pins imported pages for writing, so read-only memory keeps the
 /// imports it has (`super::linux`'s `import` module docs).
-#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
 pub(crate) fn guest_ram_runs(first: u64, length: u64) -> Option<Vec<(u64, u64)>> {
     let end = first.checked_add(length)?;
     let table = TABLE.lock();
@@ -1422,7 +1421,7 @@ pub(crate) mod tests {
     /// mapped from their files (Iris Xe's ANV): the resolve of its sources and the record of
     /// its pieces (Linux's `vm`'s `remap_runs_shared_overwrite`), the import's write check, the
     /// gate's write check and dma-buf pieces (Linux's `import`), the runs of the guest's RAM the
-    /// runtime asks for (Linux's `host_ram::runs`), and the teardown's forget, a mebibyte at a
+    /// runtime asks for (`super::host_ram`'s `runs`), and the teardown's forget, a mebibyte at a
     /// time (Linux's `vm`'s `deallocate`). Each step's user-space instructions and cycles a page,
     /// the median of the views, are printed.
     #[test]

@@ -1,7 +1,8 @@
 //! The OS services on Windows: the clocks ([`WindowsClock`]), threads ([`WindowsThreads`]), Mach
 //! VM's calls over views of pagefile-backed sections ([`WindowsVm`]), whose views of the guest's
 //! pages map the sections the backing table names (`crate::os`'s `files`), the runtime's imports of
-//! host memory (`import`), and what the window system's Vulkan extensions take here (`crate::os`'s
+//! host memory (`import`), with the guest's RAM handed to the devices whole (`crate::os`'s
+//! `host_ram`), and what the window system's Vulkan extensions take here (`crate::os`'s
 //! `wsi`: the Win32 surface and the loader). No Objective-C runs here: core pushes no autorelease
 //! pool where none is installed.
 
@@ -64,6 +65,18 @@ impl Drawables {
     pub(crate) unsafe fn fetch(&self, _image: vk::Image) -> bool {
         match *self {}
     }
+}
+
+/// The guest's RAM as the devices are handed it (`crate::os`'s `host_ram`): `ram` as it is, as
+/// Windows has no dma-bufs to give it sources of.
+pub(crate) fn with_ram_sources(ram: rt::HostRam) -> rt::HostRam {
+    ram
+}
+
+/// Whether the RAM has sources of dma-bufs ([`with_ram_sources`]): never on Windows.
+#[cfg(test)]
+pub(crate) fn ram_has_sources() -> bool {
+    false
 }
 
 /// The clocks.

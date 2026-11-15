@@ -100,7 +100,9 @@ fn gate(first: u64, length: u64) -> bool {
 }
 
 /// The runtime's host memory at `at`, the first byte of an import ([`ImportView::at`]), with the
-/// views' gate ([`import_gate`]).
+/// views' gate ([`import_gate`]) and the runs of the guest's RAM its pages are (`crate::os`'s
+/// `host_ram`), which the runtime asks of the import's window, so an object over the RAM lies in
+/// the RAM's chunk a device imported, and else takes an import of its own, as with no runs.
 ///
 /// # Safety
 ///
@@ -108,8 +110,11 @@ fn gate(first: u64, length: u64) -> bool {
 pub(crate) unsafe fn host_memory(at: NonNull<u8>) -> rt::HostMemory {
     static GATE: std::sync::LazyLock<rt::ImportGate> =
         std::sync::LazyLock::new(|| Arc::new(import_gate));
+    static RUNS: std::sync::LazyLock<rt::RunResolver> =
+        std::sync::LazyLock::new(|| Arc::new(crate::os::host_ram::runs));
     // SAFETY: the caller's.
-    unsafe { rt::HostMemory::new(at) }.with_import_gate(Arc::clone(&GATE))
+    let memory = unsafe { rt::HostMemory::new(at) }.with_import_gate(Arc::clone(&GATE));
+    memory.with_runs(Arc::clone(&RUNS))
 }
 
 /// [`host_memory`], its pages' write permission vouched for where `vouched`
