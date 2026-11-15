@@ -114,9 +114,12 @@
 //! [`DEAL_MIN_ENCODERS`](super::cmdbuf::DEAL_MIN_ENCODERS) at least, all of them render and
 //! blit encoders that hold no event, rate map, indirect command buffer or residency of
 //! resources (`cmdbuf.rs`'s `deal`), is cut at encoder ends into chunks of
-//! [`DEAL_CHUNK_BYTES`](super::cmdbuf::DEAL_CHUNK_BYTES) of ops or more, dealt in turn to the
-//! lane's thread, the even ones, and a helper thread ([`super::helpers`]), the odd ones, handed
-//! over at once as the walk starts. Each chunk goes into a command buffer of its own on the
+//! [`DEAL_CHUNK_BYTES`](super::cmdbuf::DEAL_CHUNK_BYTES) of ops or more, dealt to the lane's
+//! thread and a helper thread ([`super::helpers`]), handed over at once as the walk starts: the
+//! first chunk to the lane's thread, then the longest first, each to the thread dealt fewer bytes
+//! so far (`cmdbuf.rs`'s `helper_chunks`), so the longest starts at once on the thread that is
+//! free (chunks of one length go in turn, the odd ones to the helper), and each thread walks its
+//! chunks in their order. Each chunk goes into a command buffer of its own on the
 //! buffer's queue, which the platform makes before any chunk is walked (`CommandBuffer::part`),
 //! each while the queue holds room, as a cut's make does, so no make waits on the queue's room
 //! while parts of the buffer wait uncommitted (where the room runs out first, the buffer is

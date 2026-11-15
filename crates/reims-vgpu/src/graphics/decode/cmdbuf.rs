@@ -693,6 +693,8 @@ enum Kept<P: Platform> {
 struct Deal<'a, P: Platform> {
     /// Its chunks, each a range of its op stream.
     chunks: &'a [Range<usize>],
+    /// Which of them the helper walks ([`helper_chunks`]).
+    helper: &'a [bool],
     /// The slots the helper publishes its chunks to.
     slots: &'a Slots<Walked<P>>,
     /// The helper's chunks, handed over.
@@ -2452,8 +2454,9 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// [`Self::walk_ops`] for a command buffer whose op stream `ops` is cut at `cuts` into chunks
     /// dealt to two threads at once ([`super::split`], "Two threads at once"), `queue` and `seqno`
-    /// its queue and its message's, for the trace: this thread walks the even chunks and a helper
-    /// the odd ones ([`super::helpers`]), handed over at once, on a handle of its own
+    /// its queue and its message's, for the trace: this thread walks the first chunk and those
+    /// [`helper_chunks`] leaves it, and a helper ([`super::helpers`]) the others, each thread its
+    /// chunks in their order, handed over at once, on a handle of its own
     /// ([`GraphicsDecoder::twin`]), each chunk into a command buffer of its own that the platform
     /// makes on the buffer's queue before any is walked ([`CommandBuffer::part`]), each while the
     /// queue holds room, the first chunk into `cb`; where the platform makes none, or the queue's
@@ -2501,11 +2504,13 @@ impl<P: Platform> GraphicsDecoder<P> {
                 }
             }
         }
+        let helper = helper_chunks(&chunks);
         let (mut theirs, mut ours) = (Vec::new(), VecDeque::new());
         for (i, part) in (1..n).zip(parts) {
-            match i % 2 {
-                1 => theirs.push((i, part)),
-                _ => ours.push_back(part),
+            if helper[i] {
+                theirs.push((i, part));
+            } else {
+                ours.push_back(part);
             }
         }
         self.walk_begins(ops);
@@ -2540,6 +2545,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         let mut deal = Deal {
             chunks: &chunks,
+            helper: &helper,
             slots: &slots,
             hand: &hand,
             ours,
@@ -2564,9 +2570,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         let s = &deal.stats;
         let ns = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
-        let bytes = |from: usize| -> u64 {
-            let dealt = chunks.iter().skip(from).step_by(2);
-            dealt.map(ExactSizeIterator::len).sum::<usize>() as u64
+        let bytes = |theirs: bool| -> u64 {
+            let dealt = chunks.iter().zip(&helper).filter(|(_, h)| **h == theirs);
+            dealt.map(|(c, _)| c.len()).sum::<usize>() as u64
         };
         // cbpar: queue, seqno, its chunks, the bytes of this thread's and of the helper's, 1
         // where the helper's were taken back (else 0), this thread's walk of its chunks, the hand
@@ -2578,8 +2584,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                 queue,
                 seqno,
                 n as u64,
-                bytes(0),
-                bytes(1),
+                bytes(false),
+                bytes(true),
                 u64::from(s.back),
                 ns(s.walk_here),
                 s.helper_began.map_or(0, ns),
@@ -2604,7 +2610,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     ) -> RaiseResult<Result<(), DecodeError>> {
         let n = deal.chunks.len();
         let clock = self.shared.platform.clock();
-        for k in (0..n).step_by(2) {
+        for k in (0..n).filter(|&k| !deal.helper[k]) {
             let began = clock.now_mono();
             let outcome = self.walk_range(&ops[deal.chunks[k].clone()], cb, events, &mut None);
             let walk = clock.now_mono().saturating_duration_since(began);
@@ -2775,7 +2781,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     deal.queue,
                     deal.seqno,
                     j as u64,
-                    (j % 2) as u64,
+                    u64::from(deal.helper[j]),
                     deal.chunks[j].len() as u64,
                     ns(began),
                     ns(walk),
@@ -3684,6 +3690,39 @@ fn deal(ops: &[u8], min_bytes: usize, chunk_bytes: usize, most: usize) -> Option
         at += len;
     }
     (!cuts.is_empty() && encoders >= DEAL_MIN_ENCODERS).then_some(cuts)
+}
+
+/// Which of the `chunks` of a command buffer dealt to two threads at once the helper walks
+/// ([`super::split`], "Two threads at once"), `true` at each of the helper's. The first chunk is
+/// the lane's thread's, walked into the buffer's own command buffer. The others go the longest
+/// first (by their op bytes, as far as the stream tells a walk's length), each to the thread
+/// dealt fewer bytes so far, the lane's thread on a tie: so the longest chunk starts as the walk
+/// starts, on whichever thread is free, and chunks of one length go in turn, the odd ones to the
+/// helper. Each thread walks its chunks in their order, and they are committed in their order
+/// whichever thread walked them, so only when the walk ends moves.
+///
+/// Dealt in turn, Unigine Heaven's frame buffer (five chunks of 161, 135, 471, 51 and under 1 KiB)
+/// had the lane's thread walk its 471 KiB pass, 12 to 15 ms, only after the 6 ms first chunk,
+/// while the helper walked the second and fourth and then waited: the run's 10,022 dealt walks
+/// took 15.3 ms from the hand-over to the walk's end at the median and 25.3 ms at the 90th
+/// percentile (1920 x 1080, an RX 7900 XTX host, m3-max-32395; measured). From the chunk walks the
+/// trace gave, the turns end the walks in 12.6 and 22.7 ms, and this deal in 9.7 and 16.4 ms
+/// (modelled). WindowServer's composite of the app's window waits for the app's frame, which its
+/// commit order holds until that walk ends.
+fn helper_chunks(chunks: &[Range<usize>]) -> Vec<bool> {
+    let mut helper = vec![false; chunks.len()];
+    let mut longest_first: Vec<usize> = (1..chunks.len()).collect();
+    longest_first.sort_by_key(|&i| std::cmp::Reverse(chunks[i].len()));
+    let (mut here, mut there) = (chunks.first().map_or(0, |c| c.len()), 0);
+    for i in longest_first {
+        if there < here {
+            helper[i] = true;
+            there += chunks[i].len();
+        } else {
+            here += chunks[i].len();
+        }
+    }
+    helper
 }
 
 /// Calls `found` with each object id (not nil) the compute ops of the op stream `ops` name, read
@@ -9338,10 +9377,12 @@ mod tests {
             .collect()
     }
 
-    /// `calls`' chunks, each with the command buffer it was encoded into: each thread's calls cut
-    /// where an encoder is made on another command buffer than the last, this thread's chunks and
-    /// the helper's dealt in turn. A whole walk's, in its order, where each op of a dealt buffer
-    /// was walked once, its chunks in their order ([`shapes`]).
+    /// `calls`' chunks, each with the command buffer it was encoded into, in their order: each
+    /// thread's calls cut where an encoder is made on another command buffer than the last, and
+    /// the chunks of both threads ordered by their command buffers, which the walk makes in the
+    /// chunks' order before it walks any, the first chunk's the buffer's own, made before them
+    /// ([`GraphicsDecoder::walk_dealt`]). A whole walk's, in its order, where each op of a dealt
+    /// buffer was walked once, its chunks in their order ([`shapes`]).
     fn dealt_chunks(calls: &[(bool, Shape, Option<ObjId>)]) -> Vec<(Vec<Shape>, ObjId)> {
         let of = |helper: bool| {
             let mut chunks: Vec<(Vec<Shape>, ObjId)> = Vec::new();
@@ -9355,14 +9396,9 @@ mod tests {
             }
             chunks
         };
-        let (mut here, mut helper) = (of(false).into_iter(), of(true).into_iter());
-        let mut dealt = Vec::new();
-        loop {
-            match (here.next(), helper.next()) {
-                (None, None) => return dealt,
-                (a, b) => dealt.extend(a.into_iter().chain(b)),
-            }
-        }
+        let mut dealt = [of(false), of(true)].concat();
+        dealt.sort_by_key(|(_, cb)| *cb);
+        dealt
     }
 
     /// The calls of `chunks`, in their order.
@@ -9865,6 +9901,114 @@ mod tests {
         );
     }
 
+    /// A dealt buffer's chunks go to the two threads the longest first, each to the thread dealt
+    /// fewer bytes so far, this thread on a tie, the first chunk always this thread's: chunks of
+    /// one length in turn, the odd ones to the helper; a longest chunk anywhere after the first
+    /// to the helper, which takes the others only while it holds fewer bytes.
+    #[test]
+    fn helper_chunks_deals_the_longest_first_to_the_thread_dealt_fewer_bytes() {
+        let chunks_of = |lens: &[usize]| -> Vec<Range<usize>> {
+            let mut at = 0;
+            (lens.iter())
+                .map(|len| {
+                    at += len;
+                    at - len..at
+                })
+                .collect()
+        };
+        let (f, t) = (false, true);
+        for (lens, helper) in [
+            (&[4, 4, 4, 4, 4, 4][..], &[f, t, f, t, f, t][..]),
+            (&[4, 4, 4, 4, 4], &[f, t, f, t, f]),
+            (&[5, 7], &[f, t]),
+            // Heaven's frame buffer's chunks, in KiB (m3-max-32395).
+            (&[161, 135, 471, 51, 1], &[f, f, t, f, f]),
+            (&[10, 10, 10, 100], &[f, f, f, t]),
+            (&[100, 10, 10, 10], &[f, t, t, t]),
+            (&[30, 10, 50, 40, 20], &[f, f, t, f, t]),
+        ] {
+            assert_eq!(helper_chunks(&chunks_of(lens)), helper, "{lens:?}");
+        }
+    }
+
+    /// A dealt buffer whose third pass is far the longest has the helper walk that pass alone,
+    /// from the walk's start, and this thread every other chunk: each op walked once, each
+    /// chunk a part committed in their order, and the buffer's records as a whole walk's.
+    #[test]
+    fn a_dealt_buffer_s_longest_chunk_goes_to_the_helper_and_the_order_stays() {
+        let Split {
+            p, mut dec, posted, ..
+        } = splitting();
+        let device = p.device();
+        let draws = |pass: u64, n: u64| -> Vec<u8> {
+            (0..n).flat_map(|d| draw_ops(2, 16 * pass, d)).collect()
+        };
+        let long = 2;
+        let ops: Vec<u8> = (0..8)
+            .map(|i| pass_of(&draws(i, if i == long { 40 } else { 2 })))
+            .collect::<Vec<_>>()
+            .concat();
+        let mark = p.call_log().mark();
+        assert_eq!(
+            dec.decode(&device, &command_buffer_message(365, 95, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        let whole = whole_shapes(&walk_calls(&p, mark));
+        p.world().complete_all(CompleteOn::Caller);
+        let answered_whole = answered(&posted);
+
+        dec.set_deal_min_bytes(Some(0));
+        dec.set_deal_chunk_bytes(Some(0));
+        dec.set_helper_first(true);
+        let (begun, mark) = (dec.walks_begun(), p.call_log().mark());
+        assert_eq!(
+            dec.decode(&device, &command_buffer_message(366, 96, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(dec.walks_begun(), begun + 1, "its walk begun once");
+        // Each call to the chunk whose command buffer its thread's last encoder was made on.
+        let calls = walk_calls(&p, mark);
+        let mut chunk_of: Vec<(ObjId, bool, Vec<Shape>)> = Vec::new();
+        let mut last = [None::<usize>, None];
+        for (helper, shape, made) in calls {
+            let at = match made {
+                Some(cb) => {
+                    chunk_of.push((cb, helper, Vec::new()));
+                    chunk_of.len() - 1
+                }
+                None => last[usize::from(helper)].expect("a call in an encoder"),
+            };
+            last[usize::from(helper)] = Some(at);
+            chunk_of[at].2.push(shape);
+        }
+        let parts = p.world().committed();
+        assert_eq!(parts.len(), 8, "a chunk a pass, each a part");
+        let in_order: Vec<&(ObjId, bool, Vec<Shape>)> = (parts.iter())
+            .map(|cb| chunk_of.iter().find(|c| c.0 == *cb).expect("a chunk walked"))
+            .collect();
+        assert_eq!(
+            in_order.iter().map(|c| c.1).collect::<Vec<_>>(),
+            [false, false, true, false, false, false, false, false],
+            "the longest chunk the helper's alone"
+        );
+        assert_eq!(
+            in_order.iter().flat_map(|c| c.2.iter().cloned()).collect::<Vec<_>>(),
+            whole,
+            "each op walked once, its chunks committed in their order"
+        );
+        let sels = p.call_log().sels_since(mark);
+        assert_eq!(sels.iter().filter(|s| **s == "commitPart").count(), 7);
+        assert_eq!(
+            answered(&posted),
+            [(RGFX_EVT_CB_SCHEDULED, RGFX_CB_OK)],
+            "at its take"
+        );
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(answered(&posted), answered_whole[1..], "completed as a whole walk");
+    }
+
     /// The chunks of a dealt buffer no helper has taken by the end of this thread's first are
     /// taken back and walked here, as a whole walk goes on: each op once, the walk begun once,
     /// the command buffers made for the chunks let go of unused, and the buffer's parts and
@@ -10061,8 +10205,10 @@ mod tests {
                 .concat()
         };
         // The stream; the chunk that faults first, and its group: the helper's, this thread's
-        // later chunk walked; this thread's, the helper's later; the helper's, found as this
-        // thread found its own later one; and this thread's first chunk.
+        // later chunk walked; the helper's, found as this thread found its own later one; this
+        // thread's, the helper's later; and this thread's first chunk. A chunk with a fault op is
+        // longer than the others, so it is dealt first ([`helper_chunks`]): the longest to the
+        // helper, the next to this thread.
         let cases: [(u64, Vec<u8>, usize, &str); 4] = [
             (390, with(&[(3, &render[..])]), 3, "render"),
             (391, with(&[(2, &blit[..]), (5, &render[..])]), 2, "blit"),
