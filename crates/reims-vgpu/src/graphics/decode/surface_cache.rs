@@ -1206,7 +1206,7 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// import ([`Caches::set_exportable`]).
     exportable: bool,
     /// The blocks whose caches owe their first fill ([`SurfaceCache::first_fill`]).
-    owed: HashSet<u64>,
+    owed: Owed,
     /// The blocks of the begins answered before the fills they make ([`Caches::before_answering`]),
     /// from the answer until those fills are made: no other begin counts a use of one meanwhile.
     answering: HashSet<u64>,
@@ -1215,8 +1215,11 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// Whether laid-out caches of two planes are made with their memory a dma-buf, for the host's
     /// video to decode into ([`Caches::set_dma_buf`]).
     dma_buf: bool,
-    /// The device's recoveries the caches were last looked at for ([`Self::after_recovery`]).
+    /// The device's recoveries the caches were last looked at for ([`Self::after_recovery`]),
+    /// told to begins outside the lock too ([`Unlocked::recoveries`]).
     recoveries: u64,
+    /// What a begin reads of the caches without their lock ([`Unlocked`]).
+    unlocked: Arc<Unlocked>,
     /// The fence each encoder that wrote a laid-out cache or its wide home updates as it ends,
     /// once one did, which every copy between a cache and its home waits for
     /// ([`Self::writes_fence`]).
@@ -1353,8 +1356,9 @@ impl DeferredFill {
 }
 
 impl<P: Platform> SurfaceCaches<P> {
-    /// No caches, each fill telling `on_fill_done` as it finishes.
-    fn new(on_fill_done: Arc<OnceLock<FillHook>>) -> Self {
+    /// No caches, each fill telling `on_fill_done` as it finishes, and what a begin reads without
+    /// their lock telling `unlocked`.
+    fn new(on_fill_done: Arc<OnceLock<FillHook>>, unlocked: Arc<Unlocked>) -> Self {
         let watched = Arc::new(Watched::default());
         let watcher: Arc<dyn Watcher> = Arc::clone(&watched) as Arc<dyn Watcher>;
         device_writes::watch(&watcher);
@@ -1379,11 +1383,15 @@ impl<P: Platform> SurfaceCaches<P> {
             deferred_carries: false,
             into_pages: Vec::new(),
             exportable: false,
-            owed: HashSet::new(),
+            owed: Owed {
+                blocks: HashSet::new(),
+                unlocked: Arc::clone(&unlocked),
+            },
             answering: HashSet::new(),
             copy_gpu: Arc::default(),
             dma_buf: false,
             recoveries: 0,
+            unlocked,
             fence: None,
         }
     }
@@ -1418,6 +1426,7 @@ impl<P: Platform> SurfaceCaches<P> {
             return;
         }
         self.recoveries = now;
+        self.unlocked.recoveries.store(now, Ordering::Release);
         // A cache made for the host's video keeps its bytes over its own memory: only its users,
         // whose work went with the lost device, go.
         let mut video = 0usize;
@@ -3510,6 +3519,72 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 }
 
+/// The blocks whose caches owe their first fill ([`SurfaceCache::first_fill`]), whose
+/// emptiness a begin reads without the caches' lock ([`Unlocked::owed`]): each change, made under
+/// that lock, tells it.
+struct Owed {
+    blocks: HashSet<u64>,
+    unlocked: Arc<Unlocked>,
+}
+
+impl Owed {
+    fn insert(&mut self, block: u64) {
+        self.blocks.insert(block);
+        self.told();
+    }
+
+    fn remove(&mut self, block: &u64) {
+        self.blocks.remove(block);
+        self.told();
+    }
+
+    fn clear(&mut self) {
+        self.blocks.clear();
+        self.told();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &u64> {
+        self.blocks.iter()
+    }
+
+    /// Whether any cache owes its first fill, told with the change, under the caches' lock.
+    fn told(&self) {
+        (self.unlocked.owed).store(!self.blocks.is_empty(), Ordering::Release);
+    }
+}
+
+/// What a command buffer's begin reads of the caches without their lock
+/// ([`Caches::before_answering`]): whether any cache owes its first fill, and the device's
+/// recoveries the caches last looked at ([`SurfaceCaches::after_recovery`]). Each is stored with
+/// `Release` under the caches' lock as what it tells changes there, and loaded with `Acquire`:
+/// a begin that loads them sees the caches as a hold of the lock at that moment would, and what
+/// made a fill owed before the buffer was taken (its process's `BUFFER_OVER_SURFACE_PAGES` on
+/// ring 0, carried out before the buffer's begin) is seen.
+#[derive(Default)]
+struct Unlocked {
+    /// Some cache owes its first fill ([`SurfaceCaches::owed`]).
+    owed: AtomicBool,
+    /// The device's recoveries the caches were last looked at for.
+    recoveries: AtomicU64,
+}
+
+impl Unlocked {
+    /// Whether a buffer with work that names no use finds nothing to do under the caches' lock:
+    /// no cache owes its first fill, which its work might reach ([`SurfaceCaches::fill_reached`]),
+    /// and the device has not recovered since the caches last looked
+    /// ([`SurfaceCaches::after_recovery`]). The lock, which every queue's begin and every walk's
+    /// end of a use takes, took 0.49 µs of a Super Resolution buffer's begin on the Iris Xe host
+    /// to find that (**measured** 2026-11-14, laps of the begin, gpre m3-max-31335).
+    /// `recoveries` is the device's count now ([`GpuDevice::recoveries`]).
+    fn nothing_to_do(&self, recoveries: u64) -> bool {
+        !self.owed.load(Ordering::Acquire) && self.recoveries.load(Ordering::Acquire) == recoveries
+    }
+}
+
 /// The device caches behind their lock, and the order of their copies against the command buffers
 /// that use them. A command buffer counts among a block's users from its begin to its finish
 /// ([`Uses`]), each use under a number of its own in the order they are counted: where its use is
@@ -3558,6 +3633,8 @@ impl<P: Platform> SurfaceCaches<P> {
 /// it.
 pub(crate) struct Caches<P: Platform> {
     state: Mutex<SurfaceCaches<P>>,
+    /// What a begin reads of `state` without its lock ([`Self::before_answering`]).
+    unlocked: Arc<Unlocked>,
     moved: Condvar,
     /// What each fill tells as it finishes ([`Self::on_fill_done`]).
     on_fill_done: Arc<OnceLock<FillHook>>,
@@ -3851,8 +3928,13 @@ impl<P: Platform> Caches<P> {
     /// No caches.
     pub(crate) fn new() -> Self {
         let on_fill_done = Arc::default();
+        let unlocked = Arc::new(Unlocked::default());
         Caches {
-            state: Mutex::new(SurfaceCaches::new(Arc::clone(&on_fill_done))),
+            state: Mutex::new(SurfaceCaches::new(
+                Arc::clone(&on_fill_done),
+                Arc::clone(&unlocked),
+            )),
+            unlocked,
             moved: Condvar::new(),
             on_fill_done,
             homes: AtomicBool::new(false),
@@ -4139,7 +4221,7 @@ impl<P: Platform> Caches<P> {
         reach: &Reach,
         answer: Option<&mut dyn FnMut()>,
     ) -> RaiseResult<(bool, bool, Option<Uses<P>>)> {
-        if uses.is_empty() && !reach.work {
+        if uses.is_empty() && (!reach.work || self.unlocked.nothing_to_do(device.recoveries())) {
             if let Some(answer) = answer {
                 answer();
             }
@@ -5896,6 +5978,107 @@ mod tests {
             "filled once"
         );
         assert_eq!(r.dec.caches().counts().made_fills, 1);
+    }
+
+    /// A command buffer of work that names no use, begun while no cache owes its first fill,
+    /// takes nothing of the caches; one begun after another thread made a cache that owes it, and
+    /// the first buffer over it, in its context, makes that fill and waits for it on the GPU, as
+    /// a begin under the caches' lock would: the begin reads what the other thread told
+    /// ([`Unlocked`])
+    #[test]
+    fn work_begun_after_another_thread_owed_a_fill_makes_it() {
+        let mut r = rig(8);
+        queues(&mut r);
+        let page = r.page;
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.dec.decode(&r.device, &blit_work(0x100)).unwrap(), Ok(()));
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "no cache yet"
+        );
+        std::thread::scope(|scope| {
+            let mut dec = r.dec.sender(None, super::super::Sinks::default());
+            let device = r.device.clone_ref();
+            scope
+                .spawn(move || {
+                    let runs = [RgfxPageRun {
+                        address: RAM + page,
+                        length: 2 * page,
+                    }];
+                    let m = RgfxSurfacePages {
+                        header: RgfxMsgHeader {
+                            r#type: reims_vgpu_graphics::wire::RGFX_CMD_SURFACE_PAGES,
+                            size: 0,
+                            seqno: 0,
+                        },
+                        context: 0,
+                        run_count: 1,
+                        block_offset: BLOCK,
+                        block_size: 0x2000,
+                        runs_offset: BLOCK + 0x1000,
+                        length: 2 * page,
+                    };
+                    let status = dec.surface_pages_laid_out(
+                        &device,
+                        &m,
+                        &runs,
+                        RGFX_SURFACE_PAGES_CACHED,
+                        None,
+                    );
+                    assert_eq!(status, RGFX_STATUS_OK, "the cache made");
+                    let buffer = RgfxBufferOverSurfacePages {
+                        header: RgfxMsgHeader {
+                            r#type: reims_vgpu_graphics::wire::RGFX_CMD_BUFFER_OVER_SURFACE_PAGES,
+                            size: 0,
+                            seqno: 0,
+                        },
+                        obj_id: 10,
+                        block_offset: BLOCK,
+                        block_size: 0x1000,
+                        length: 2 * page,
+                        options: 0,
+                        reserved_34: 0,
+                    };
+                    assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
+                })
+                .join()
+                .unwrap();
+        });
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.dec.decode(&r.device, &blit_work(0x101)).unwrap(), Ok(()));
+        let calls = r.p.call_log().since(mark);
+        let filled = copies(&calls);
+        assert_eq!(filled.len(), 1, "the first fill");
+        assert_eq!(filled[0].1, cache_id(&r), "into the cache");
+        let transfer = events(&calls, SIGNAL)[0];
+        assert!(
+            events(&calls, WAIT).contains(&transfer),
+            "the buffer waits for the fill"
+        );
+        assert_eq!(r.dec.caches().counts().made_fills, 1);
+    }
+
+    /// A command buffer of work that names no use, begun past a recovery of the device, has the
+    /// caches look at the recovery first: a cache with pages is filled again from them, as a
+    /// begin that uses it would have it
+    #[test]
+    fn work_begun_past_a_recovery_fills_the_caches_again() {
+        let mut r = cached();
+        let cache = cache_id(&r);
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.dec.decode(&r.device, &blit_work(0x101)).unwrap(), Ok(()));
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "no recovery: nothing to fill"
+        );
+        r.p.world().recover();
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.dec.decode(&r.device, &blit_work(0x102)).unwrap(), Ok(()));
+        let filled = copies(&r.p.call_log().since(mark));
+        assert_eq!(filled.len(), 1, "filled again: {filled:?}");
+        assert_eq!(filled[0].1, cache, "from the pages, into the cache");
     }
 
     /// A buffer over a new cache made in another context than the first's makes the cache's
