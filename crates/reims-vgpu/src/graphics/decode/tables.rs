@@ -22,8 +22,8 @@
 //!
 //! **When an entry goes.** An entry removed (a destroy, an id made again, the context's close or
 //! the device's reset) while a view that names it is open is kept on the table's gone list, where
-//! only such views find it, and let go of when the last of them closes, on that view's thread,
-//! with the others it frees in the order they were removed: as an object destroyed after a whole
+//! only such views find it, and let go of once the last of them closes, on the thread of a view
+//! closing then, with the others it frees in the order they were removed: as an object destroyed after a whole
 //! message under one lock is let go of after it. A view names an entry where it was taken at or
 //! after the entry's make, or by the message that made it ([`View::made`]), and before its removal.
 //! Else it is let go of at once, by whoever removed it, as one is that only a view taken before its
@@ -314,8 +314,6 @@ struct Tables<P: Platform> {
     gone: Vec<(Removed<P>, u64)>,
     /// Moves at each make and removal.
     clock: u64,
-    /// The open views, by the clock at which each was taken: how many at each.
-    views: BTreeMap<u64, usize>,
     /// The region spans the live entries lie over ([`Entry::span`]), each with how many lie over
     /// it: what [`Context::span_in`] looks through, a few keys about the range it asks of, where
     /// the entries themselves are thousands. It cannot go stale: an entry's span is counted where
@@ -362,14 +360,13 @@ impl<P: Platform> Tables<P> {
         })
     }
 
-    /// Removes `owned`, `id`'s entry: onto the gone list where an open view names it (each open
-    /// view was taken before this), else handed back to let go of.
-    fn retire(&mut self, id: u64, owned: Owned<P>) -> Option<Removed<P>> {
+    /// Removes `owned`, `id`'s entry: onto the gone list where an open view of `views` names it
+    /// (each open view was taken before this), else handed back to let go of.
+    fn retire(&mut self, id: u64, owned: Owned<P>, views: &mut Views) -> Option<Removed<P>> {
         self.clock += 1;
         self.uncount_span(owned.entry().span);
         let removed = Removed { id, owned };
-        if self
-            .views
+        if (views.open)
             .range(removed.owned.entry().seen..)
             .next()
             .is_none()
@@ -377,33 +374,62 @@ impl<P: Platform> Tables<P> {
             return Some(removed);
         }
         self.gone.push((removed, self.clock));
+        views.gone = true;
         None
     }
 
-    /// The gone entries no open view names any more, in the order removed: a view names one where
-    /// it was taken from the entry's `seen` up to its removal.
-    fn sweep(&mut self) -> Vec<Removed<P>> {
+    /// The gone entries no open view of `views` names any more, in the order removed: a view
+    /// names one where it was taken from the entry's `seen` up to its removal.
+    fn sweep(&mut self, views: &mut Views) -> Vec<Removed<P>> {
         if self.gone.is_empty() {
             return Vec::new();
         }
-        if self.views.is_empty() {
+        if views.open.is_empty() {
+            views.gone = false;
             return std::mem::take(&mut self.gone)
                 .into_iter()
                 .map(|(r, _)| r)
                 .collect();
         }
-        let views = &self.views;
+        let open = &views.open;
         let (keep, out): (Vec<_>, Vec<_>) =
             std::mem::take(&mut self.gone)
                 .into_iter()
                 .partition(|(r, removed_at)| {
-                    views
-                        .range(r.owned.entry().seen..*removed_at)
+                    open.range(r.owned.entry().seen..*removed_at)
                         .next()
                         .is_some()
                 });
         self.gone = keep;
+        views.gone = !self.gone.is_empty();
         out.into_iter().map(|(r, _)| r).collect()
+    }
+}
+
+/// The open views of a context's table, by the clock at which each was taken: how many at each,
+/// and whether the table's gone list holds an entry. A view is counted with the table's read lock
+/// held, so no make or removal (each under its write lock) comes between its reading of the clock
+/// and its count, and a removal, which reads them with the write lock held, finds every view open
+/// then; a view's close uncounts it under this lock alone, and takes the write lock to sweep the
+/// gone list only where the list holds an entry. So a command buffer's view, taken at its begin
+/// on its queue's thread and closed after its walk on its lane's, holds up neither the lanes'
+/// lookups of the table nor ring 0's makes: as the write lock, the view's taking was 1.2 µs of a
+/// Super Resolution buffer's begin on the Iris Xe host, up to 9.8 µs in one of a hundred
+/// (**measured** 2026-11-14, laps of the begin, gpre m3-max-31335).
+#[derive(Default)]
+struct Views {
+    /// How many views are open at each clock.
+    open: BTreeMap<u64, usize>,
+    /// The table's gone list holds an entry: set as one goes on it, cleared as a sweep empties
+    /// it, both with the write lock held too.
+    gone: bool,
+}
+
+impl<P: Platform> Tables<P> {
+    /// Removes `id`'s live entry, where it has one, as [`Self::retire`] does.
+    fn retire_live(&mut self, id: u64, views: &mut Views) -> Option<Option<Removed<P>>> {
+        let owned = self.live.remove(&id)?;
+        Some(self.retire(id, owned, views))
     }
 }
 
@@ -412,6 +438,11 @@ pub(crate) struct Context<P: Platform> {
     /// The context's id.
     pub(crate) id: u32,
     tables: RwLock<Tables<P>>,
+    /// The table's open views ([`Views`]), taken with `tables`' lock held where both are.
+    views: Mutex<Views>,
+    /// What a test runs at a step of a view's taking or close ([`ViewStep`]).
+    #[cfg(test)]
+    view_step: Mutex<Option<ViewStepHook>>,
     /// The command buffers committed since the context's last drain began: each holds a clone
     /// until its completion handler has run ([`super::GraphicsDecoder::drain_context`]).
     pub(crate) drain: Mutex<Arc<Drain>>,
@@ -430,10 +461,12 @@ impl<P: Platform> Context<P> {
                 live: HashMap::default(),
                 gone: Vec::new(),
                 clock: 0,
-                views: BTreeMap::new(),
                 spans: BTreeMap::new(),
                 longest: 0,
             }),
+            views: Mutex::default(),
+            #[cfg(test)]
+            view_step: Mutex::new(None),
             drain: Mutex::new(Arc::default()),
             managed_recoveries: Mutex::new(0),
         }
@@ -451,7 +484,8 @@ impl<P: Platform> Context<P> {
         t.count_span(entry.span);
         let owned = Owned::new(entry);
         let at = owned.0;
-        let replaced = t.live.insert(id, owned).and_then(|old| t.retire(id, old));
+        let replaced =
+            (t.live.insert(id, owned)).and_then(|old| t.retire(id, old, &mut self.views.lock()));
         (at, replaced)
     }
 
@@ -474,7 +508,8 @@ impl<P: Platform> Context<P> {
         t.count_span(entry.span);
         let owned = Owned::new(entry);
         let at = owned.0;
-        let replaced = t.live.insert(id, owned).and_then(|old| t.retire(id, old));
+        let replaced =
+            (t.live.insert(id, owned)).and_then(|old| t.retire(id, old, &mut self.views.lock()));
         Some((at, replaced))
     }
 
@@ -482,22 +517,21 @@ impl<P: Platform> Context<P> {
     /// where no view needs it.
     pub(crate) fn remove(&self, id: u64) -> Option<(bool, Option<Removed<P>>)> {
         let mut t = self.tables.write();
-        let owned = t.live.remove(&id)?;
-        let texture = matches!(owned.entry().handle, ObjHandle::Texture(_));
-        Some((texture, t.retire(id, owned)))
+        let texture = matches!(t.live.get(&id)?.entry().handle, ObjHandle::Texture(_));
+        let removed = t.retire_live(id, &mut self.views.lock())?;
+        Some((texture, removed))
     }
 
     /// Removes every entry, in the table's order: those to let go of now, where no view needs
     /// them, and how many there were.
     pub(crate) fn remove_all(&self) -> (Vec<Removed<P>>, usize) {
         let mut t = self.tables.write();
+        let mut views = self.views.lock();
         let ids: Vec<u64> = t.live.keys().copied().collect();
         let count = ids.len();
         let mut out = Vec::new();
         for id in ids {
-            if let Some(owned) = t.live.remove(&id)
-                && let Some(removed) = t.retire(id, owned)
-            {
+            if let Some(Some(removed)) = t.retire_live(id, &mut views) {
                 out.push(removed);
             }
         }
@@ -615,9 +649,11 @@ impl<P: Platform> View<P> {
     /// A view of `context`'s table, taken now.
     pub(crate) fn take(context: Arc<Context<P>>) -> Self {
         let at = {
-            let mut t = context.tables.write();
+            let t = context.tables.read();
             let at = t.clock;
-            *t.views.entry(at).or_default() += 1;
+            #[cfg(test)]
+            context.step(ViewStep::Taking);
+            *context.views.lock().open.entry(at).or_default() += 1;
             at
         };
         View {
@@ -635,10 +671,9 @@ impl<P: Platform> View<P> {
     /// buffer walked on another thread beside the rest ([`super::split`], "Two threads at once").
     /// The entries it keeps are let go of once both have closed, as any open view's are.
     pub(crate) fn twin(&self) -> Self {
-        {
-            let mut t = self.context.tables.write();
-            *t.views.entry(self.at).or_default() += 1;
-        }
+        // This view, open at the same clock, holds its count there: no removal's or sweep's answer
+        // changes with the twin's, so no lock of the table's is needed for it.
+        *self.context.views.lock().open.entry(self.at).or_default() += 1;
         View {
             context: Arc::clone(&self.context),
             at: self.at,
@@ -718,18 +753,59 @@ impl<P: Platform> View<P> {
 }
 
 impl<P: Platform> Drop for View<P> {
+    /// Uncounts the view; then, where the table's gone list holds an entry, lets go of those no
+    /// open view names any more ([`Views`]).
     fn drop(&mut self) {
-        let out = {
-            let mut t = self.context.tables.write();
-            if let Some(n) = t.views.get_mut(&self.at) {
+        let gone = {
+            let mut views = self.context.views.lock();
+            if let Some(n) = views.open.get_mut(&self.at) {
                 *n -= 1;
                 if *n == 0 {
-                    t.views.remove(&self.at);
+                    views.open.remove(&self.at);
                 }
             }
-            t.sweep()
+            views.gone
+        };
+        if !gone {
+            return;
+        }
+        #[cfg(test)]
+        self.context.step(ViewStep::Uncounted);
+        let out = {
+            let mut t = self.context.tables.write();
+            t.sweep(&mut self.context.views.lock())
         };
         let_go(out);
+    }
+}
+
+/// A step of a view's taking or close, at which a test runs what it set
+/// ([`Context::on_view_step`]), to put another thread's work there.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewStep {
+    /// The table's clock read for the view, its read lock held, the view not yet counted.
+    Taking,
+    /// The view uncounted, the gone list holding an entry, before the sweep.
+    Uncounted,
+}
+
+/// What a test runs at a [`ViewStep`].
+#[cfg(test)]
+type ViewStepHook = Arc<dyn Fn(ViewStep) + Send + Sync>;
+
+#[cfg(test)]
+impl<P: Platform> Context<P> {
+    /// Runs `hook` at each step of a view's taking or close from now on.
+    pub(crate) fn on_view_step(&self, hook: impl Fn(ViewStep) + Send + Sync + 'static) {
+        *self.view_step.lock() = Some(Arc::new(hook));
+    }
+
+    fn step(&self, step: ViewStep) {
+        let hook = self.view_step.lock().clone();
+        if let Some(hook) = hook {
+            hook(step);
+        }
     }
 }
 
@@ -771,6 +847,127 @@ mod tests {
         );
         let late = View::take(Arc::clone(&ctx));
         assert!(late.get(1).is_none());
+        assert!(late.get(2).is_some());
+    }
+
+    /// Holds the first view step of `want` a thread comes to, there, until the test lets it go:
+    /// the step's answer on `at` once there, and the thread goes on once `go` is sent to. Every
+    /// later step runs on.
+    fn hold_first(
+        ctx: &Context<FakePlatform>,
+        want: ViewStep,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (at_tx, at) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel::<()>();
+        let held = std::sync::atomic::AtomicBool::new(false);
+        let (at_tx, go_rx) = (Mutex::new(at_tx), Mutex::new(go_rx));
+        ctx.on_view_step(move |step| {
+            if step == want && !held.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                at_tx.lock().send(()).unwrap();
+                go_rx.lock().recv().unwrap();
+            }
+        });
+        (at, go)
+    }
+
+    /// A view's taking reads the table's clock and counts the view with the table's read lock
+    /// held: a removal, which takes its write lock, comes wholly before it or after it. Held
+    /// between the two, the taking keeps the write lock from every removal; the removal after it
+    /// keeps the entry for the view, which finds it, and lets go of it once the view closes. A
+    /// removal before a taking is not seen by its view.
+    #[test]
+    fn a_views_taking_and_a_removal_come_one_after_the_other() {
+        let p = FakePlatform::new();
+        let ctx = Arc::new(Context::<FakePlatform>::new(1));
+        for id in [1, 2] {
+            let (_, replaced) = ctx.insert(id, Entry::of(fence(&p)), None);
+            assert!(replaced.is_none());
+        }
+        let (at, go) = hold_first(&ctx, ViewStep::Taking);
+        std::thread::scope(|scope| {
+            let taking = scope.spawn(|| View::take(Arc::clone(&ctx)));
+            at.recv().unwrap();
+            assert!(
+                ctx.tables.try_write().is_none(),
+                "no removal while the taking holds the read lock"
+            );
+            assert!(
+                ctx.views.lock().open.is_empty(),
+                "not counted yet, the clock read"
+            );
+            go.send(()).unwrap();
+            let view = taking.join().unwrap();
+            assert!(
+                ctx.remove(1).is_some_and(|(_, now)| now.is_none()),
+                "kept for the view taken before the removal"
+            );
+            assert!(view.get(1).is_some(), "the view finds it");
+            assert_eq!(ctx.gone_len(), 1);
+            drop(view);
+            assert_eq!(ctx.gone_len(), 0, "let go of as the view closes");
+        });
+        assert!(
+            ctx.remove(2).is_some_and(|(_, now)| now.is_some()),
+            "no view open: let go of at once"
+        );
+        let late = View::take(Arc::clone(&ctx));
+        assert!(late.get(2).is_none(), "removed before the view: not seen");
+    }
+
+    /// A view's close uncounts it before it sweeps the gone list, with no lock of the table's
+    /// held between: a removal there finds the view closed and lets go of its entry at once, a
+    /// view closed meanwhile sweeps what neither names, and the sweep after lets go of what is
+    /// left, each entry once.
+    #[test]
+    fn a_removal_between_a_views_uncounting_and_its_sweep_lets_go_at_once() {
+        let p = FakePlatform::new();
+        let ctx = Arc::new(Context::<FakePlatform>::new(1));
+        for id in [1, 2, 3] {
+            let (_, replaced) = ctx.insert(id, Entry::of(fence(&p)), None);
+            assert!(replaced.is_none());
+        }
+        let first = View::take(Arc::clone(&ctx));
+        let second = View::take(Arc::clone(&ctx));
+        assert!(first.get(1).is_some() && second.get(1).is_some());
+        assert!(
+            ctx.remove(3).is_some_and(|(_, now)| now.is_none()),
+            "kept for the open views"
+        );
+        let (at, go) = hold_first(&ctx, ViewStep::Uncounted);
+        std::thread::scope(|scope| {
+            let closing = scope.spawn(move || drop(first));
+            at.recv().unwrap();
+            assert!(
+                ctx.tables.try_write().is_some(),
+                "no lock of the table's held between the two"
+            );
+            assert_eq!(
+                ctx.views.lock().open.values().sum::<usize>(),
+                1,
+                "the first uncounted"
+            );
+            drop(second);
+            assert_eq!(
+                ctx.gone_len(),
+                0,
+                "the second's sweep let go of what neither names"
+            );
+            assert!(
+                ctx.remove(1).is_some_and(|(_, now)| now.is_some()),
+                "both closed: let go of at once"
+            );
+            go.send(()).unwrap();
+            closing.join().unwrap();
+        });
+        assert_eq!(ctx.gone_len(), 0, "the first's sweep found nothing more");
+        let views = ctx.views.lock();
+        assert!(
+            views.open.is_empty() && !views.gone,
+            "nothing open, nothing gone"
+        );
+        drop(views);
+        let late = View::take(Arc::clone(&ctx));
+        assert!(late.get(1).is_none() && late.get(3).is_none());
         assert!(late.get(2).is_some());
     }
 
