@@ -8,8 +8,9 @@
 //! `deferred`, the directories of the VMs that were running then. A lock beside it,
 //! `migrations.lock`, keeps two reims-ctl starting at once from migrating a VM twice.
 //!
-//! Each makes a VM's OpenCore image again, presenting the same Mac ([`crate::opencore::renew`]),
-//! for the graphics it runs, the old image kept beside it as `<image>.pre-migration-<n>`:
+//! Migrations 1 to 4 each make a VM's OpenCore image again, presenting the same Mac
+//! ([`crate::opencore::renew`]), for the graphics it runs, the old image kept beside it as
+//! `<image>.pre-migration-<n>`; migration 5 changes only a VM's settings:
 //! - Migration 1 is for the x86-64 VMs a reims-ctl from before reims-vgpu's own GPU device made:
 //!   their settings name no graphics, which is that device, and their image has no kexts for it,
 //!   and may hold the ported drivers images no longer carry.
@@ -26,7 +27,14 @@
 //!   loader or one of its two shims, enabled or not, whatever its device: the guest's set now
 //!   loads through Graft. A VM on reims-vgpu's own device gets Graft and the set; one on another
 //!   device gets no kext.
+//! - Migration 5 is for the VMs given a GPU from `reims-ctl gpus` by a reims-ctl that named it by
+//!   its driver's manifest alone, which hid the host's other GPUs from the library: where the
+//!   host's list has that GPU, by its manifest, name and any device ID, its settings name it as a
+//!   pick from the list does now ([`crate::gpu::GpuInfo::to_config`]), by its IDs where those
+//!   name it. A running VM's too: QEMU reads them at the VM's next start. The host's GPUs are
+//!   listed once a run, and only for a VM that has such a GPU.
 
+use crate::gpu::GpuInfo;
 use crate::opencore::{self, Config};
 use crate::vm::{CONFIG_FILE, Graphics, Registry, Vm};
 use crate::{host::Profile, paths, runtime};
@@ -37,7 +45,7 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 /// The migrations this reims-ctl carries: 1 to this.
-pub const CURRENT: u32 = 4;
+pub const CURRENT: u32 = 5;
 
 /// The ported drivers older OpenCore images load, by bundle name: the seven kexts that run Apple's
 /// arm64 GPU driver on x86-64, which reims-util carried until its fe9bfe1.
@@ -99,6 +107,8 @@ enum Plan {
     Defer,
     /// Its image made again for the graphics it runs, for this reason.
     Image(Why),
+    /// Migration 5: its GPU's settings replaced by these.
+    Gpu(crate::vm::Gpu),
 }
 
 /// Why a VM's image is made again.
@@ -171,6 +181,35 @@ fn plan_4(vm: &Vm, running: bool, kexts: &[String]) -> Plan {
     }
 }
 
+/// Migration 5's plan for `vm`, of the host's GPUs `gpus`, asked only where its settings name a
+/// GPU of the list by its driver's manifest and name with no IDs: the settings a pick of that
+/// GPU from the list gives, where they name it by its IDs and the list has one GPU of that
+/// manifest, name and device ID (where the settings keep one).
+fn plan_5(vm: &Vm, gpus: impl FnOnce() -> Vec<GpuInfo>) -> Plan {
+    let g = &vm.config.gpu;
+    let (Some(file), Some(name), None) = (&g.driver_file, &g.name, &g.select) else {
+        return Plan::Skip;
+    };
+    let gpus = gpus();
+    let listed: Vec<&GpuInfo> = (gpus.iter())
+        .filter(|l| {
+            &l.driver_file == file
+                && &l.name == name
+                && g.device_id.is_none_or(|id| id == l.device_id)
+        })
+        .collect();
+    match listed.as_slice() {
+        [only] if only.to_config().select.is_some() => Plan::Gpu(only.to_config()),
+        _ => Plan::Skip,
+    }
+}
+
+/// The host's GPUs ([`crate::gpu::list`]), listed at the first ask of a run.
+fn host_gpus() -> Vec<GpuInfo> {
+    static LISTED: std::sync::OnceLock<Vec<GpuInfo>> = std::sync::OnceLock::new();
+    LISTED.get_or_init(crate::gpu::list).clone()
+}
+
 /// Whether `vm`'s settings, as saved, name apple-gfx: they read as reims-vgpu's own device.
 fn names_apple_gfx(vm: &Vm) -> bool {
     std::fs::read_to_string(vm.dir.join(CONFIG_FILE))
@@ -208,6 +247,7 @@ fn plan_of(n: u32, vm: &Vm, running: bool) -> Plan {
                 .unwrap_or_default();
             plan_4(vm, running, &kexts)
         }
+        5 => plan_5(vm, host_gpus),
         _ => Plan::Skip,
     }
 }
@@ -316,7 +356,31 @@ fn carry_out(vm: &mut Vm, plan: Plan, n: u32) -> Option<String> {
                  OpenCore image again"
             ),
         }),
+        Plan::Gpu(gpu) => Some(match pick_gpu(vm, gpu) {
+            Ok(line) => format!("{name}: {line}"),
+            Err(e) => format!(
+                "{name}: left as it was: {e:#}; reims-ctl set {name} --gpu NUMBER picks its GPU \
+                 again, from reims-ctl gpus"
+            ),
+        }),
     }
+}
+
+/// Gives `vm` the GPU settings `gpu` and saves them (migration 5); what changed, or an error with
+/// the VM as it was.
+fn pick_gpu(vm: &mut Vm, gpu: crate::vm::Gpu) -> Result<String> {
+    let before = std::mem::replace(&mut vm.config.gpu, gpu);
+    if let Err(e) = vm.save() {
+        vm.config.gpu = before;
+        return Err(e);
+    }
+    let g = &vm.config.gpu;
+    Ok(format!(
+        "its GPU, {}, is now picked by its IDs ({}) instead of hiding the host's other GPUs, so \
+         its window can be drawn on the GPU your desktop runs on",
+        g.name.as_deref().unwrap_or("?"),
+        g.select.as_deref().unwrap_or("?"),
+    ))
 }
 
 /// Makes `vm`'s OpenCore image again for the graphics it runs, keeping the old image beside it as
@@ -966,6 +1030,171 @@ mod tests {
                 .unwrap()
                 .contains("--add-kext")
         );
+    }
+
+    /// A VM whose settings, as a reims-ctl before migration 5 saved a pick from `reims-ctl gpus`,
+    /// end with `gpu`, its `[gpu]` table.
+    fn vm_with_gpu(dir: &Path, gpu: &str) -> Vm {
+        vm(dir, "q35-x86_64", None, "");
+        let file = dir.join(CONFIG_FILE);
+        let text = std::fs::read_to_string(&file).unwrap() + gpu;
+        std::fs::write(&file, text).unwrap();
+        Vm::load(dir).unwrap()
+    }
+
+    /// A GPU of the host's list.
+    fn listed(name: &str, ids: (u32, u32), kind: &str, file: &str) -> GpuInfo {
+        GpuInfo {
+            name: name.into(),
+            vendor_id: ids.0,
+            device_id: ids.1,
+            kind: kind.into(),
+            driver_file: file.into(),
+            shares_driver: false,
+            shares_ids: false,
+        }
+    }
+
+    const NVIDIA: &str = "/usr/share/vulkan/icd.d/nvidia_icd.json";
+    const RADEON: &str = "/usr/share/vulkan/icd.d/radeon_icd.json";
+    const LVP: &str = "/usr/share/vulkan/icd.d/lvp_icd.json";
+    const AMDVLK: &str = "/usr/share/vulkan/icd.d/amd_icd64.json";
+
+    /// A host's list: an RTX 3090, an RX 7900 XTX and a Radeon 780M on RADV, which drives both,
+    /// and lavapipe.
+    fn host() -> Vec<GpuInfo> {
+        let mut xtx = listed(
+            "AMD Radeon RX 7900 XTX (RADV NAVI31)",
+            (0x1002, 0x744c),
+            "discrete",
+            RADEON,
+        );
+        let mut igpu = listed(
+            "AMD Radeon 780M Graphics (RADV PHOENIX)",
+            (0x1002, 0x15bf),
+            "integrated",
+            RADEON,
+        );
+        xtx.shares_driver = true;
+        igpu.shares_driver = true;
+        vec![
+            listed(
+                "NVIDIA GeForce RTX 3090",
+                (0x10de, 0x2204),
+                "discrete",
+                NVIDIA,
+            ),
+            xtx,
+            igpu,
+            listed("llvmpipe (LLVM 23.1.4, 256 bits)", (0x10005, 0), "cpu", LVP),
+        ]
+    }
+
+    /// Migration 5 names a GPU an older reims-ctl gave a VM from the list by its IDs, its device
+    /// ID kept where its driver drives several, and tells it in one line; the settings saved,
+    /// the next run leaves the VM be without listing the host's GPUs.
+    #[test]
+    fn migration_5_names_a_gpu_from_the_list_by_its_ids() {
+        let env = crate::testenv::Env::new("migrate-gpu");
+        let unasked = || -> Vec<GpuInfo> { panic!("the host's GPUs were listed") };
+        let dir = env.root.join("nv");
+        let mut v = vm_with_gpu(
+            &dir,
+            "[gpu]\ndriver_file = \"/usr/share/vulkan/icd.d/nvidia_icd.json\"\n\
+             name = \"NVIDIA GeForce RTX 3090\"\n",
+        );
+        let plan = plan_5(&v, host);
+        let want = crate::vm::Gpu {
+            driver_file: Some(NVIDIA.into()),
+            device_id: None,
+            select: Some("10de:2204".into()),
+            name: Some("NVIDIA GeForce RTX 3090".into()),
+        };
+        assert_eq!(plan, Plan::Gpu(want.clone()));
+        let line = carry_out(&mut v, plan, 5).unwrap();
+        assert_eq!(
+            line,
+            "nv: its GPU, NVIDIA GeForce RTX 3090, is now picked by its IDs (10de:2204) instead \
+             of hiding the host's other GPUs, so its window can be drawn on the GPU your desktop \
+             runs on"
+        );
+        let saved = Vm::load(&dir).unwrap();
+        assert_eq!(saved.config.gpu, want);
+        assert_eq!(plan_of(5, &saved, false), Plan::Skip);
+        assert_eq!(plan_5(&saved, unasked), Plan::Skip);
+
+        let dir = env.root.join("xtx");
+        let v = vm_with_gpu(
+            &dir,
+            "[gpu]\ndriver_file = \"/usr/share/vulkan/icd.d/radeon_icd.json\"\n\
+             device_id = 29772\nname = \"AMD Radeon RX 7900 XTX (RADV NAVI31)\"\n",
+        );
+        assert_eq!(
+            plan_5(&v, host),
+            Plan::Gpu(crate::vm::Gpu {
+                driver_file: Some(RADEON.into()),
+                device_id: Some(0x744c),
+                select: Some("1002:744c".into()),
+                name: Some("AMD Radeon RX 7900 XTX (RADV NAVI31)".into()),
+            })
+        );
+    }
+
+    /// Migration 5 leaves a VM's GPU be where IDs cannot name it or the list does not have it:
+    /// lavapipe, a GPU another manifest reaches too, a manifest given by its path, a GPU of
+    /// another host, and a device ID the list does not have for that GPU; the host's GPUs are
+    /// listed only for a VM whose settings name a GPU of the list.
+    #[test]
+    fn migration_5_leaves_gpus_their_ids_cannot_name() {
+        let env = crate::testenv::Env::new("migrate-gpu-kept");
+        let unasked = || -> Vec<GpuInfo> { panic!("the host's GPUs were listed") };
+        let gpu = |file: &str, extra: &str, name: &str| {
+            format!("[gpu]\ndriver_file = \"{file}\"\n{extra}name = \"{name}\"\n")
+        };
+        let lvp = vm_with_gpu(
+            &env.root.join("lvp"),
+            &gpu(LVP, "", "llvmpipe (LLVM 23.1.4, 256 bits)"),
+        );
+        assert_eq!(plan_5(&lvp, host), Plan::Skip);
+        let twin = || {
+            let mut list = host();
+            list[1].shares_ids = true;
+            let mut amdvlk = list[1].clone();
+            amdvlk.driver_file = AMDVLK.into();
+            list.push(amdvlk);
+            list
+        };
+        let xtx = vm_with_gpu(
+            &env.root.join("xtx"),
+            &gpu(
+                RADEON,
+                "device_id = 29772\n",
+                "AMD Radeon RX 7900 XTX (RADV NAVI31)",
+            ),
+        );
+        assert!(matches!(plan_5(&xtx, host), Plan::Gpu(_)));
+        assert_eq!(plan_5(&xtx, twin), Plan::Skip);
+        let elsewhere = vm_with_gpu(
+            &env.root.join("elsewhere"),
+            &gpu(NVIDIA, "", "NVIDIA GeForce RTX 2080"),
+        );
+        assert_eq!(plan_5(&elsewhere, host), Plan::Skip);
+        let other_id = vm_with_gpu(
+            &env.root.join("other-id"),
+            &gpu(
+                RADEON,
+                "device_id = 5567\n",
+                "AMD Radeon RX 7900 XTX (RADV NAVI31)",
+            ),
+        );
+        assert_eq!(plan_5(&other_id, host), Plan::Skip);
+        let path = vm_with_gpu(
+            &env.root.join("path"),
+            "[gpu]\ndriver_file = \"/opt/mesa/share/vulkan/icd.d/radeon_icd.x86_64.json\"\n",
+        );
+        assert_eq!(plan_5(&path, unasked), Plan::Skip);
+        let auto = vm(&env.root.join("auto"), "q35-x86_64", None, "");
+        assert_eq!(plan_5(&auto, unasked), Plan::Skip);
     }
 
     #[test]
