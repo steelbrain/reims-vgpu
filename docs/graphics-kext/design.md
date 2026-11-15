@@ -3224,8 +3224,11 @@ disk. The host keeps each made pipeline's keyed answer, with the fields it
 gives each create alone zeroed, in a file of its own, under the identity of
 what decides its answers: the platform's translation profile (its
 fingerprint), its runtime's semantic, artifact and runtime versions, the
-driver's version, and the file's format (`crates/reims-vgpu/src/graphics/answers.rs`).
-A file of another identity is never read. The file is a header (its magic,
+driver's version, the build of the library that runs (the host's executable,
+which links it, by path, size and modification time: how the library decodes a
+create and replies is its build's), and the file's format
+(`crates/reims-vgpu/src/graphics/answers.rs`). A file of another identity is
+never read, so an upgrade of the library or of its host starts from none. The file is a header (its magic,
 format, record size and identity, with their checksum) and 128-byte records,
 each one key's answer or the drop of a key's answer, with its checksum over
 the identity and its bytes; a damaged or foreign file, or one holding an

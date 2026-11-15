@@ -12,9 +12,11 @@
 //!   ([`PipelineAnswers::observe`]).
 //! - **Under what.** Each file is the answers of one identity: the platform's account of what
 //!   decides its answers to a pipeline create (on the Vulkan platform the runtime's translation
-//!   profile, its semantics, artifact and runtime versions and the driver's version), with
-//!   [`ANSWERS_FORMAT`], which says what this crate does with them. Answers of another identity
-//!   are never read.
+//!   profile, its semantics, artifact and runtime versions and the driver's version), the build of
+//!   this library that runs ([`library_build`]: how its decode makes a create's descriptor, its
+//!   platform's queries and its replies are that build's), and [`ANSWERS_FORMAT`], the file's
+//!   layout. Answers of another identity are never read, so an upgrade of the library starts
+//!   from none, as a driver's does.
 //! - **The file** (`~/.cache/reims-vgpu-pipeline-answers/<identity>`) is a header of
 //!   [`HEADER_BYTES`] (its magic, [`ANSWERS_FORMAT`], the record size, the identity and a
 //!   checksum of them) and then records of [`RECORD_BYTES`] each (kept or dropped, the key, the
@@ -47,10 +49,9 @@ use zerocopy::{FromBytes, IntoBytes};
 /// A pipeline create's key ([`RGFX_PIPELINE_REFLECT_KEYED`]).
 pub(crate) type AnswerKey = [u8; 32];
 
-/// What this crate does with the platform's answers to a pipeline create, which the identity of
-/// every file names: bump it whenever the reply the device gives a create of an unchanged key may
-/// change under an unchanged platform identity (how a create's message becomes the platform's
-/// descriptor, or the platform's answers its reply), and whenever the file's layout changes.
+/// The file's layout, which the identity of every file names: bump it whenever the layout
+/// changes. What the device answers a create is the platform's identity's and the library
+/// build's ([`library_build`]), which no bump need follow.
 pub(crate) const ANSWERS_FORMAT: u32 = 1;
 
 /// Whether this build keeps the answers in a file: all but a test build's (the module docs).
@@ -125,11 +126,13 @@ pub(crate) enum Observed {
 }
 
 impl PipelineAnswers {
-    /// The answers of `identity`, the platform's ([`answers_identity`]): read from its file under
-    /// `HOME` where this build keeps them ([`KEPT`]) and the platform gives one; else kept in
-    /// memory alone.
+    /// The answers of `identity`, the platform's, of this library's build ([`answers_identity`],
+    /// [`library_build`]): read from its file under `HOME` where this build keeps them
+    /// ([`KEPT`]) and the platform and the build each give one; else kept in memory alone.
     pub(crate) fn open(identity: Option<&[u8]>) -> PipelineAnswers {
-        let identity = identity.map(answers_identity);
+        let identity = identity
+            .zip(library_build())
+            .map(|(platform, build)| answers_identity(platform, &build));
         let dir = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(DIR));
         match (identity, dir) {
             (Some(identity), Some(dir)) if KEPT => PipelineAnswers::open_in(&dir, identity),
@@ -293,14 +296,36 @@ impl State {
     }
 }
 
-/// The identity of a file: SHA-256 of the crate's own words, [`ANSWERS_FORMAT`] and the
-/// platform's identity bytes.
-pub(crate) fn answers_identity(platform: &[u8]) -> [u8; 32] {
+/// The identity of a file: SHA-256 of the crate's own words, [`ANSWERS_FORMAT`], the platform's
+/// identity bytes and the library's build ([`library_build`]), each of the two after its length.
+pub(crate) fn answers_identity(platform: &[u8], build: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"rgfx-pipeline-answers");
     hasher.update(ANSWERS_FORMAT.to_le_bytes());
-    hasher.update(platform);
+    for part in [platform, build] {
+        hasher.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(part);
+    }
     hasher.finalize().into()
+}
+
+/// The build of this library that runs: the file its code runs from, the host's executable, which
+/// links the library statically (QEMU's `reims-graphics-pci`), by its path, size and modification
+/// time. A new build of the library, or of its host, is another identity's, so no answer a build
+/// gave reaches a guest of another, whatever its decode, platform or replies changed. `None` where
+/// the file cannot be told: then nothing is kept past the device's life.
+pub(crate) fn library_build() -> Option<Vec<u8>> {
+    let path = std::env::current_exe().ok()?;
+    let meta = std::fs::metadata(&path).ok()?;
+    let modified = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    let mut build = path.as_os_str().as_encoded_bytes().to_vec();
+    build.extend_from_slice(&meta.len().to_le_bytes());
+    build.extend_from_slice(&modified.as_nanos().to_le_bytes());
+    Some(build)
 }
 
 /// `reflection` as it is kept: a keyed reply's header (its size counting the key, its seqno 0),
@@ -630,6 +655,26 @@ mod tests {
         std::fs::copy(dir.file(&IDENTITY), dir.file(&[9; 32])).unwrap();
         assert_eq!(PipelineAnswers::open_in(&dir.0, [9; 32]).len(), 0);
         assert_eq!(PipelineAnswers::open_in(&dir.0, IDENTITY).len(), 1);
+    }
+
+    /// The identity names the platform's bytes and the library's build each apart: another of
+    /// either is another identity, so another build's answers are never read. The build that runs
+    /// is told, and the same at each ask.
+    #[test]
+    fn another_build_or_platform_is_another_identity() {
+        let identity = answers_identity(b"platform", b"build 1");
+        assert_ne!(identity, answers_identity(b"platform", b"build 2"));
+        assert_ne!(identity, answers_identity(b"platform 2", b"build 1"));
+        assert_ne!(
+            answers_identity(b"ab", b"c"),
+            answers_identity(b"a", b"bc"),
+            "the parts' bounds are named"
+        );
+        let build = library_build().expect("the test binary's build is told");
+        assert_eq!(library_build(), Some(build.clone()));
+        let exe = std::env::current_exe().unwrap();
+        assert!(build.starts_with(exe.as_os_str().as_encoded_bytes()));
+        assert_eq!(build.len(), exe.as_os_str().len() + 8 + 16);
     }
 
     /// Any damage reads the whole file as none, and it is started again: a flipped byte of a
