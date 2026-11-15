@@ -909,6 +909,50 @@ pub(crate) mod tests {
         forget(base + 0x20_000, 0x2000);
     }
 
+    /// A range's stretches are walked in order through the runs over it, then the registrations,
+    /// each with its file offset and bytes, cut where a run starts or ends and not joined; a byte
+    /// of neither ends the walk unresolved after the stretches before it
+    #[test]
+    fn each_stretch_of_a_range_is_walked_in_order() {
+        let f = file();
+        let base = 0x7a08_0000_0000;
+        let backing = |offset| Backing {
+            file: Arc::clone(&f),
+            offset,
+        };
+        let held = Registration::new(base, 0x10_000, backing(0x100_000));
+        // A run in the registration, and one that follows on from it in the file.
+        record(base + 0x2000, 0x1000, backing(0x5000), VmProt::READ);
+        record(base + 0x3000, 0x1000, backing(0x6000), VmProt::READ);
+        let walked = |first, length| {
+            let mut stretches = Vec::new();
+            let known = each_stretch(first, length, |file, offset, bytes| {
+                assert!(Arc::ptr_eq(file, &f));
+                stretches.push((offset, bytes));
+            });
+            (known, stretches)
+        };
+        assert_eq!(
+            walked(base + 0x1000, 0x4000),
+            (
+                true,
+                vec![
+                    (0x101_000, 0x1000),
+                    (0x5000, 0x1000),
+                    (0x6000, 0x1000),
+                    (0x104_000, 0x1000)
+                ]
+            )
+        );
+        assert_eq!(
+            walked(base + 0xf000, 0x2000),
+            (false, vec![(0x10f_000, 0x1000)])
+        );
+        assert_eq!(walked(base, 0), (true, vec![]));
+        forget(base + 0x2000, 0x2000);
+        drop(held);
+    }
+
     /// A run replaces what of another it covers, and an unmap drops what it covers, keeping
     /// each run's other bytes at their file offsets
     #[test]
