@@ -54,6 +54,12 @@
 //! of its own after the frame's, in the frame's command buffer (`cursor`). The host's reads of
 //! the display draw no cursor.
 //!
+//! **A display the guest does not drive.** The window of a display after display 0
+//! ([`Shown`]'s `black_undriven`) draws black while the guest shows nothing on it, no scanout and
+//! no presented surface: a guest whose driver drives display 0 alone leaves the others so, and a
+//! compositor shows no window that was never drawn into (Wayland maps a surface at its first
+//! buffer), so the window would not show at all. Display 0's draw is `None` then, as before.
+//!
 //! **The display's colour.** While any stage of the display pipe's colour is on (`color`: gamma
 //! tables and a colour matrix a transaction set), the draw puts what the display shows through it:
 //! a presented surface is drawn into the drawable by the colour's fragment function
@@ -897,8 +903,9 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
     /// `region`, as [`Self::encode`] draws it, not committed, and the hold of the block of the
     /// presented surface it reads, where it draws one: the caller keeps it until the buffer has
     /// finished; all of `texture` cleared to black while the display's panel is off (the module
-    /// doc, "The panel"). `None`, with nothing encoded, where the guest has no scanout or the queue
-    /// gives no command buffer. It answers no present, so the host's reads of the display
+    /// doc, "The panel"), and on a display after display 0 the guest shows nothing on ("A display
+    /// the guest does not drive"). `None`, with nothing encoded, where the guest has no scanout on
+    /// display 0 or the queue gives no command buffer. It answers no present, so the host's reads of the display
     /// (`graphics::read`) draw with it.
     pub(crate) fn encode_shown(
         &self,
@@ -947,6 +954,12 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
                 return Some((drawn, Some(hold)));
             }
             self.presented.refuse_format(from, to);
+        }
+        if self.shown.black_undriven && self.shown.scanout.lock().is_none() {
+            // A display the guest does not drive: black (the module doc).
+            let command_buffer = no_catch(self.queue.command_buffer(OnFault::Die))?;
+            self.clear(&command_buffer, texture);
+            return Some((command_buffer, None));
         }
         let command_buffer = match &color {
             Some((changes, color)) => self.encode_scanout_colored(*changes, color, texture, region),
@@ -1956,6 +1969,46 @@ mod tests {
                 .collect::<Vec<_>>(),
             drawn
         );
+    }
+
+    /// With no scanout and no presented surface, display 0's window draws nothing, and the window
+    /// of a display after it clears its drawable to black: one render pass, which copies and
+    /// draws nothing of the guest's; once the guest sets a scanout there, it blits the scanout
+    #[test]
+    fn a_display_after_display_0_draws_black_while_the_guest_shows_nothing_there() {
+        let platform = Arc::new(FakePlatform::new());
+        let region = Arc::new(Region::new(reims_vgpu_graphics::REGION_SIZE as usize).unwrap());
+        let presented = Arc::new(Presented::<FakePlatform>::default());
+        let count =
+            |calls: &[Call], sel: &str| calls.iter().filter(|c| c.sel.starts_with(sel)).count();
+        let display_0 = Arc::new(Shown::default());
+        let draw =
+            ScanoutDraw::new(Arc::clone(&platform), &region, &display_0, &presented).unwrap();
+        let drawable = texture(&draw, 80);
+        assert!(draw.encode_shown(&drawable, WHOLE).is_none());
+
+        let display_1 = Arc::new(Shown {
+            black_undriven: true,
+            ..Shown::default()
+        });
+        let draw =
+            ScanoutDraw::new(Arc::clone(&platform), &region, &display_1, &presented).unwrap();
+        let log = platform.call_log();
+        let mark = log.mark();
+        let (_black, hold) = draw.encode_shown(&drawable, WHOLE).expect("a black draw");
+        assert!(hold.is_none());
+        let calls = log.since(mark);
+        assert_eq!(count(&calls, "renderCommandEncoderWithDescriptor:"), 1);
+        assert_eq!(count(&calls, "copyFrom"), 0);
+        assert_eq!(count(&calls, "drawPrimitives"), 0);
+
+        *display_1.scanout.lock() = Some(SCANOUT);
+        let mark = log.mark();
+        let _scanout = draw
+            .encode_shown(&drawable, WHOLE)
+            .expect("the scanout's draw");
+        let calls = log.since(mark);
+        assert_eq!(count(&calls, "copyFrom"), 1, "{calls:?}");
     }
 
     /// On the compositor's GPU a presented surface of a pixel format the window's mirror does not

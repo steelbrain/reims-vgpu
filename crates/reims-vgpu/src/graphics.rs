@@ -3218,8 +3218,8 @@ const RAISE_THREADS: [&str; 11] = [
 ];
 
 /// What the window and its sink share: the scanout the guest set, whether the display's panel is
-/// off, and the drawable the window's render thread last drew into: its size in pixels, and its
-/// pixels a point.
+/// off, the drawable the window's render thread last drew into (its size in pixels, and its
+/// pixels a point), and whether the window draws black while the guest shows nothing.
 #[derive(Debug, Default)]
 pub(crate) struct Shown {
     /// The guest's scanout; `None` shows black.
@@ -3229,6 +3229,10 @@ pub(crate) struct Shown {
     pub(crate) asleep: AtomicBool,
     /// The window's drawable, once drawn into.
     pub(crate) drawable: Mutex<Option<Drawable>>,
+    /// A display after display 0, whose window draws black while the guest shows nothing on it
+    /// (no scanout, no presented surface; `sink`'s module doc, "A display the guest does not
+    /// drive"). Display 0's draws nothing then, as before: the option ROM drives it at once.
+    pub(crate) black_undriven: bool,
 }
 
 impl Shown {
@@ -3554,7 +3558,10 @@ impl WindowScreen {
             reims_vgpu_window::screens::screen_for_port(port)
                 .map_or(FALLBACK_MODE.refresh_mhz, |s| hz_to_mhz(s.refresh_hz))
         };
-        let shown = Arc::new(Shown::default());
+        let shown = Arc::new(Shown {
+            black_undriven: port > 0,
+            ..Shown::default()
+        });
         if let Some(sink) = scanout_sink(platform, region, &shown, presented) {
             window.attach(sink);
             // Presents wait for the window's draw only where it has a sink to draw them.
