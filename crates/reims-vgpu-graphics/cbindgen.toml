@@ -275,6 +275,7 @@ include = [
     "RgfxOpVideoPass",
     "RgfxOpWaitForFence",
     "RgfxPageRun",
+    "RgfxPipelineAnswersQuery",
     "RgfxPipelineLibrary",
     "RgfxPipelineReflection",
     "RgfxPresentSurface",

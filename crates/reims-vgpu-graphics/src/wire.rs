@@ -97,8 +97,8 @@ pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// [`RGFX_FEATURE_RATE_MAPS`], [`RGFX_FEATURE_FUNCTION_POINTERS`],
 /// [`RGFX_FEATURE_DYNAMIC_LIBRARIES`], [`RGFX_FEATURE_PIPELINE_KEYS`],
 /// [`RGFX_FEATURE_ICB_SLOTS_IN_PAGES`], [`RGFX_FEATURE_DOORBELL_ASKS`],
-/// [`RGFX_FEATURE_GUEST_TIMES`], [`RGFX_FEATURE_READ_ONLY_PAGES`] and
-/// [`RGFX_FEATURE_DOORBELL_PAGES`].
+/// [`RGFX_FEATURE_GUEST_TIMES`], [`RGFX_FEATURE_READ_ONLY_PAGES`],
+/// [`RGFX_FEATURE_DOORBELL_PAGES`] and [`RGFX_FEATURE_PIPELINE_ANSWERS`].
 /// On a host that offers `PAGES_16K`, `FEATURES_LO` and `_HI` read the guest RAM features only
 /// once the guest took it.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
@@ -432,6 +432,15 @@ pub const RGFX_FEATURE_READ_ONLY_PAGES: u64 = 0x2000_0000_0000;
 /// plain doorbell on its context's page where the context has one, and on `DOORBELL` otherwise.
 /// A host offers it where it maps BAR 4 and hands the device its writes.
 pub const RGFX_FEATURE_DOORBELL_PAGES: u64 = 0x4000_0000_0000;
+/// `FEATURES_HI` bit 15, feature bit 47, `PIPELINE_ANSWERS`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_HI`], and which means nothing without
+/// [`RGFX_FEATURE_PIPELINE_KEYS`]: the device keeps the answers it gave keyed pipeline creates
+/// ([`RGFX_PIPELINE_REFLECT_KEYED`]) from one run of the host to the next, under the identity of
+/// what decides them (its platform's runtime, translation profile and driver), and hands them to
+/// the kext on [`RGFX_CMD_PIPELINE_ANSWERS`]. A kept answer is the device's own to a create of
+/// that key, which it accepted: a refused create is never kept, and a kept answer whose create the
+/// device later refuses, or answers otherwise, is dropped. Every host offers it.
+pub const RGFX_FEATURE_PIPELINE_ANSWERS: u64 = 0x8000_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -1012,6 +1021,16 @@ pub const RGFX_CMD_RESOURCE_ID_CHUNK: u32 = 0x2f1;
 /// `chunk` ([`RGFX_RESOURCE_ID_SMALL_CHUNK`] ids, below [`RGFX_RESOURCE_ID_SMALL_CHUNKS`]). A host
 /// without the feature refuses the message as one it does not know.
 pub const RGFX_CMD_RESOURCE_ID_SMALL_CHUNK: u32 = 0x2f8;
+/// `PIPELINE_ANSWERS` ([`RgfxPipelineAnswersQuery`]), on ring 0 from the kext, where the guest
+/// took [`RGFX_FEATURE_PIPELINE_ANSWERS`]: the answers the device keeps from earlier runs, newest
+/// first, from the `first`th, at most `most` of them. Each goes on the control completion ring as
+/// a [`RGFX_EVT_PIPELINE_REFLECTION`] with this message's `seqno`: a made pipeline's keyed reply
+/// (its `status` [`RGFX_PIPELINE_OK`], [`RGFX_PIPELINE_REFLECT_KEYED`] set, its key after it at
+/// [`RGFX_PIPELINE_REFLECTION_KEY_OFFSET`]), with its `obj_id`, `gpu_resource_id`,
+/// `unique_identifier` and `resource_index` 0, as the kext keeps an answer. Then an
+/// [`RGFX_EVT_COMPLETE`] of the same `seqno` whose `status` is how many went; fewer than `most`
+/// where none is left. No command buffer waits for it, and it makes nothing.
+pub const RGFX_CMD_PIPELINE_ANSWERS: u32 = 0x2f9;
 /// `BLOCK_RELEASE` ([`RgfxBlockRelease`]), on ring 0 from the accelerator kext: context `context`
 /// freed its region block of `size` bytes at `offset`, which the kext gives out again only once
 /// this is answered [`RGFX_EVT_COMPLETE`] with [`RGFX_STATUS_OK`]. The host answers
@@ -1589,6 +1608,7 @@ const _: () = {
     assert!(RGFX_CONTEXT_ALLOCATIONS_OFFSET.is_multiple_of(0x1000));
     assert!(size_of::<RgfxContextClose>() == 24);
     assert!(size_of::<RgfxResourceIdChunk>() == 24);
+    assert!(size_of::<RgfxPipelineAnswersQuery>() == 24);
     assert!(size_of::<RgfxCommandBufferInRegion>() == 32);
     assert!(size_of::<RgfxBlockRelease>() == 40);
     assert!(size_of::<RgfxBlockGrant>() == 40);
@@ -1915,6 +1935,21 @@ pub struct RgfxResourceIdChunk {
     /// up; of a `RESOURCE_ID_SMALL_CHUNK`, below [`RGFX_RESOURCE_ID_SMALL_CHUNKS`]: ids
     /// `1 + chunk * RGFX_RESOURCE_ID_SMALL_CHUNK` and up.
     pub chunk: u32,
+}
+
+/// `PIPELINE_ANSWERS`: the kept answers the kext asks for, from the `first`th, at most `most`
+/// ([`RGFX_CMD_PIPELINE_ANSWERS`]).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxPipelineAnswersQuery {
+    /// [`RGFX_CMD_PIPELINE_ANSWERS`].
+    pub header: RgfxMsgHeader,
+    /// The first answer wanted, counted from the newest.
+    pub first: u32,
+    /// The most answers wanted.
+    pub most: u32,
 }
 
 /// `BLOCK_RELEASE`: context `context` freed its region block of `size` bytes at `offset`.

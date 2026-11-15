@@ -20,12 +20,13 @@
 //! carries ring 0 out in order, so a buffer that waits for its context's share waits for those
 //! too. Shared events and textures do not cross processes.
 //!
-//! No buffer waits for a display command (`GET_DISPLAYS` to `SET_DISPLAY_POWER`) or a
-//! `SURFACE_DOWNLOAD`: a buffer reads nothing they make. A present waits for the writers the
-//! guest's record of its surface names (`RgfxSurfaceWriters`), whatever the host has taken. A
-//! download waits for the buffers that used the surface's device cache before it was taken, so a
-//! buffer posted after it that writes the surface, but taken before it, is among them, as one
-//! posted before it is: the guest writes a surface a CPU lock holds only racing the lock
+//! No buffer waits for a display command (`GET_DISPLAYS` to `SET_DISPLAY_POWER`), a
+//! `SURFACE_DOWNLOAD` or the kext's `PIPELINE_ANSWERS`: a buffer reads nothing they make. A
+//! present waits for the writers the guest's record of its surface names (`RgfxSurfaceWriters`),
+//! whatever the host has taken. A download waits for the buffers that used the surface's device
+//! cache before it was taken, so a buffer posted after it that writes the surface, but taken
+//! before it, is among them, as one posted before it is: the guest writes a surface a CPU lock
+//! holds only racing the lock
 //! (`a_command_buffer_is_handed_over_while_a_download_published_ahead_of_it_is_carried_out`). Every
 //! buffer waits for a message of any other type, and for one too short to hold its field: the
 //! host refuses either, and the order is as it was.
@@ -66,9 +67,12 @@ pub(super) enum Whose {
 /// Whose a message of `type` is, its 8 bytes at offset 16 `field`, where it holds them.
 pub(super) fn whose(r#type: u32, field: Option<u64>) -> Whose {
     match (r#type, field) {
-        (RGFX_CMD_GET_DISPLAYS..=RGFX_CMD_SET_DISPLAY_POWER | RGFX_CMD_SURFACE_DOWNLOAD, _) => {
-            Whose::NoOne
-        }
+        (
+            RGFX_CMD_GET_DISPLAYS..=RGFX_CMD_SET_DISPLAY_POWER
+            | RGFX_CMD_SURFACE_DOWNLOAD
+            | RGFX_CMD_PIPELINE_ANSWERS,
+            _,
+        ) => Whose::NoOne,
         (RGFX_CMD_QUEUE_CREATE..RGFX_CMD_CONTEXT_CLOSE, Some(obj_id)) => {
             Whose::Context((obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32)
         }
@@ -200,7 +204,8 @@ mod tests {
     use super::*;
 
     /// Each message is its context's, by its object's id or its context field, but a display
-    /// command and a download, which are no buffer's, and anything else, which is every buffer's.
+    /// command, a download and the kext's ask for the kept pipeline answers, which are no
+    /// buffer's, and anything else, which is every buffer's.
     /// Every type the kext takes from a process by its object's id is its object's context's,
     /// those after `BUFFER_OVER_PAGES` and one the host does not know among them.
     #[test]
@@ -242,15 +247,13 @@ mod tests {
             RGFX_CMD_DISPLAY_COLOR,
             RGFX_CMD_SET_DISPLAY_POWER,
             RGFX_CMD_SURFACE_DOWNLOAD,
+            RGFX_CMD_PIPELINE_ANSWERS,
         ] {
             assert_eq!(whose(r#type, field), Whose::NoOne);
         }
         assert_eq!(whose(RGFX_CMD_BUFFER_CREATE, None), Whose::Every);
         assert_eq!(whose(RGFX_CMD_SET_DISPLAY_POWER + 1, obj(5)), Whose::Every);
-        assert_eq!(
-            whose(RGFX_CMD_RESOURCE_ID_SMALL_CHUNK + 1, obj(5)),
-            Whose::Every
-        );
+        assert_eq!(whose(RGFX_CMD_PIPELINE_ANSWERS + 1, obj(5)), Whose::Every);
         assert_eq!(whose(RGFX_CMD_COMMAND_BUFFER, obj(5)), Whose::Every);
     }
 }

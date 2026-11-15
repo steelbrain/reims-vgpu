@@ -1928,6 +1928,20 @@ only where no negotiation can carry it.
   every doorbell on `DOORBELL` as before the bit: the device ignores
   `DOORBELL_PAGE_BIND` and drops every write to BAR4
   (`without_doorbell_pages_the_doorbells_are_the_register_s`).
+- Bit 47, `FEATURES_HI`'s bit 15, is `PIPELINE_ANSWERS`, which means nothing
+  without `PIPELINE_KEYS`: the device keeps the keyed answers it gave made
+  pipelines' creates from one run of the host to the next, and ring 0 carries
+  the kext's `PIPELINE_ANSWERS` (0x2f9, `RgfxPipelineAnswersQuery`: `first`
+  and `most`), which asks for them, newest first, from the `first`th, at most
+  `most`. Each goes on the control completion ring as a
+  `PIPELINE_REFLECTION` of the query's `seqno`, a keyed reply (status OK,
+  `RGFX_PIPELINE_REFLECT_KEYED`, the key after it) with its `obj_id`,
+  `gpu_resource_id`, unique identifier and resource index 0, then a
+  `COMPLETE` of that `seqno` whose `status` is how many went, fewer than
+  `most` where none is left. It makes nothing and holds up no command buffer.
+  The kext seeds the answers it keeps for every process with them at its
+  start ("Known pipeline creates"). Every host offers it, and the kext takes
+  it; a host without it refuses the message as one it does not know.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -2085,8 +2099,9 @@ only by its name ("Shared events across processes"): the process that makes an
 event of another's posts its own `SHARED_EVENT_IMPORT`, an object message of
 its context's, which its buffers that name the event wait for, and the kext's
 `SHARED_EVENT_UNNAME` is context 0's, which no buffer is. A
-display command (`GET_DISPLAYS` to `SET_DISPLAY_POWER`) or a `SURFACE_DOWNLOAD`
-holds up no buffer: none reads what they make. A present waits for the writers
+display command (`GET_DISPLAYS` to `SET_DISPLAY_POWER`), a `SURFACE_DOWNLOAD`
+or a `PIPELINE_ANSWERS` holds up no buffer: none reads what they make. A
+present waits for the writers
 the guest's record of its surface names, whatever the host has taken, those of
 a queue created just before among them: the device tells the host of a queue
 before it answers its create, so the present knows the queue though the host has
@@ -2106,7 +2121,8 @@ Tested by `a_command_buffer_waits_for_no_other_process_s_creates`,
 and `a_doorbell_write_answers_a_command_buffer_behind_another_process_s_create`.
 
 **Ring 0's lanes.** The control thread takes ring 0 in ring order and carries
-out only the display commands itself. It hands each context's messages, in ring
+out only the display commands and the kext's `PIPELINE_ANSWERS` itself. It
+hands each context's messages, in ring
 order, to that context's lane, every `PRESENT_SURFACE` and `DISPLAY_COLOR` to
 the presents' lane, in ring order, and every `SURFACE_PAGES` and
 `SURFACE_DOWNLOAD` to the lane of the block it names, whichever process posted
