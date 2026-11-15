@@ -229,7 +229,7 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     push(&["-global", "ICH9-LPC.disable_s3=1"]);
     push(&[
         "-device",
-        "pcie-root-port,bus=pcie.0,addr=0x1,slot=1,x-speed=16,x-width=32",
+        "pcie-root-port,bus=pcie.0,addr=0x1,slot=1,speed=16,width=32",
     ]);
     push(&["-device", &format!("isa-applesmc,osk={OSK}")]);
     push(&[

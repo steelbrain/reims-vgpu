@@ -78,7 +78,7 @@ exec $QEMU -name rgk-$TAG \\
   -cpu Skylake-Client-noTSX-IBRS,kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,vmx=on,+ssse3,+sse4.2,+popcnt,+avx,+aes,+xsave,+xsaveopt,check \\
   -smp 8,sockets=1,cores=8,threads=1 \\
   -global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off -global ICH9-LPC.disable_s3=1 \\
-  -device pcie-root-port,bus=pcie.0,addr=0x1,slot=1,x-speed=16,x-width=32 \\
+  -device pcie-root-port,bus=pcie.0,addr=0x1,slot=1,speed=16,width=32 \\
   -device 'isa-applesmc,osk=ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc' \\
   -drive if=pflash,format=raw,readonly=on,file=/home/aneesiqbal/.local/share/reims-ctl/vms/macos-26/OVMF_CODE.fd \\
   -drive if=pflash,format=raw,file=$B/OVMF_VARS.fd \\
