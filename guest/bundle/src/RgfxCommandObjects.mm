@@ -3208,7 +3208,7 @@ static NSError *rgfxInvalidInputError()
 
 #if defined(__arm64__)
 // An Apple GPU's command buffer's SPI, which MPSGraph's Neural Engine region op sends with no
-// respondsToSelector: check (read from code, macOS 27.0.1; dgpu-oracle.md, Q43); neither x86
+// respondsToSelector: check (read from code, macOS 27.0.1; dgpu-oracle.md, Q45); neither x86
 // Mac's buffers answer it (%spi-neither), so an x86-64 guest's do not. The shared event takes `value` as its queue's submission reaches the
 // call, where its GPU work has not begun (rgfxSetScheduledSignalsAtPost), and its value only
 // rises, as Metal's (measured on the M3 Max, macOS 27.0.1, oracle_cmdbuf schedsig: an event at 5
