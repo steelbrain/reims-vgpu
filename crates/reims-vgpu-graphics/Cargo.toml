@@ -13,16 +13,24 @@ workspace = true
 [dependencies]
 # The wire's records, read from and written into the rings as bytes.
 zerocopy.workspace = true
-# On Linux and macOS: the region's mapping, the control thread's pipe and poll, and the monotonic
-# clock.
-libc.workspace = true
 # The device's locks, the Vulkan crate's core's (`core::sync`).
 parking_lot.workspace = true
 log.workspace = true
 
-# On Windows: the monotonic clock (the performance counter) and the region's memory.
+# On Linux and macOS: the region's mapping, the control thread's pipe and poll, and the monotonic
+# clock.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+# On Windows: the monotonic clock (the performance counter), the region's memory, and the
+# control thread's events and their wait.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_System_Memory", "Win32_System_Performance"] }
+windows-sys = { workspace = true, features = [
+    "Win32_Security",
+    "Win32_System_Memory",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+] }
 
 # On Windows, the tests: the process's peak working set.
 [target.'cfg(windows)'.dev-dependencies]

@@ -1197,12 +1197,9 @@ fn a_reset_keeps_the_scanout_and_what_the_guest_writes_there_shows() {
 fn the_host_s_doorbell_file_wakes_the_device() {
     let mut rig = Rig::new();
     let bell = Wake::new().unwrap();
-    assert!(rig.device.set_doorbell(bell.read_fd()));
-    assert!(
-        !rig.device.set_doorbell(bell.read_fd()),
-        "one doorbell file"
-    );
-    assert!(!rig.device.set_doorbell(-1));
+    assert!(rig.device.set_doorbell(bell.raw()));
+    assert!(!rig.device.set_doorbell(bell.raw()), "one doorbell file");
+    assert!(!rig.device.set_doorbell(wake::not_open()));
     rig.start();
     // Let the control thread go to sleep on the empty ring.
     std::thread::sleep(Duration::from_millis(50));
@@ -3183,7 +3180,7 @@ struct Taking {
     routed_at: Mutex<Vec<DoorbellAt>>,
     /// Each doorbell route taken: its number, its ring's id, and a copy of its bell, which the
     /// test writes as KVM's `ioeventfd` would.
-    routes: Mutex<Vec<(u64, u32, OwnedFd)>>,
+    routes: Mutex<Vec<(u64, u32, wake::Doorbell)>>,
     /// Each route dropped ([`Host::unroute_doorbell`]), in order.
     unrouted: Mutex<Vec<u64>>,
     /// The host's own lock around its calls into the device, as QEMU's BQL is, which its route
@@ -3275,7 +3272,7 @@ impl Host for TakingHost {
         };
         asks | pages
     }
-    fn route_doorbell(&self, route: u64, at: DoorbellAt, ring_id: u32, bell: RawFd) -> bool {
+    fn route_doorbell(&self, route: u64, at: DoorbellAt, ring_id: u32, bell: RawDoorbell) -> bool {
         let _host = self.0.host_locked();
         if self.0.refuses_routes.load(Ordering::SeqCst) {
             return false;
@@ -3769,7 +3766,8 @@ fn a_guest_without_doorbell_asks_is_answered_at_any_doorbell_and_not_routed() {
 /// Writes `count` to the bell `fd` as KVM's `ioeventfd` does for that many doorbell writes: an
 /// eventfd's count, which one read takes whole.
 #[cfg(target_os = "linux")]
-fn ring_bell(fd: &OwnedFd, count: u64) {
+fn ring_bell(fd: &wake::Doorbell, count: u64) {
+    use std::os::fd::AsRawFd as _;
     let bytes = count.to_ne_bytes();
     // SAFETY: 8 bytes from a local to an eventfd the test holds a copy of.
     let wrote = unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
@@ -3778,7 +3776,8 @@ fn ring_bell(fd: &OwnedFd, count: u64) {
 
 /// Whether the bell `fd` holds a count: false once the thread that sleeps on it took it.
 #[cfg(target_os = "linux")]
-fn bell_holds(fd: &OwnedFd) -> bool {
+fn bell_holds(fd: &wake::Doorbell) -> bool {
+    use std::os::fd::AsRawFd as _;
     let mut fds = [libc::pollfd {
         fd: fd.as_raw_fd(),
         events: libc::POLLIN,

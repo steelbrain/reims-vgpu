@@ -1,190 +1,36 @@
-//! How the control thread sleeps: on [`Wake`], a pipe of the device's own, which a doorbell
-//! written through the device's MMIO, the guest's `STATUS` and the device's end write to, and on
-//! the host's doorbell file (its `ioeventfd`'s), which the guest's doorbell writes signal without
-//! the host's MMIO path. A read of each after it wakes takes what woke it.
+//! How the control thread sleeps: on [`Wake`], the device's own, which a doorbell written through
+//! the device's MMIO, the guest's `STATUS` and the device's end set, and on the host's doorbell
+//! (its `ioeventfd`'s), which the guest's doorbell writes signal without the host's MMIO path. A
+//! sleep takes, as it ends, what woke it on each, so the next sleep waits for a new wake.
+//!
+//! Each OS's own (`unix.rs`, `windows.rs`): on Linux and macOS a pipe and the host's file, polled;
+//! on Windows events, waited for, and the host's doorbell an event (QEMU's `EventNotifier` there).
+//! Both give the same names: [`Doorbell`] and [`RawDoorbell`], the host's doorbell owned and as
+//! the host hands it, [`bell`], [`duplicate`] and [`raw`].
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-#[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
 
-/// The device's own wake: a pipe, both ends non-blocking and closed on exec.
-#[derive(Debug)]
-pub(crate) struct Wake {
-    /// The end the control thread polls.
-    read: OwnedFd,
-    /// The end a wake writes.
-    write: OwnedFd,
-    /// Moved on once just before [`Self::sleep`]'s poll and once as it returns, so odd while the
-    /// thread is in it, and changed by each sleep ([`Self::parked`]).
-    #[cfg(test)]
-    sleeps: AtomicU64,
-}
-
-impl Wake {
-    /// A new pipe, or `None` where the host refuses one.
-    pub(crate) fn new() -> Option<Wake> {
-        let mut fds = [0 as RawFd; 2];
-        // SAFETY: `fds` holds the two descriptors `pipe` writes.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return None;
-        }
-        // SAFETY: `pipe` made both, and nothing else owns them.
-        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-        for fd in [&read, &write] {
-            set_flags(fd.as_raw_fd());
-        }
-        Some(Wake {
-            read,
-            write,
-            #[cfg(test)]
-            sleeps: AtomicU64::new(0),
-        })
-    }
-
-    /// Whether the thread that sleeps on it is in its sleep with no wake pending, on the pipe or
-    /// on `doorbell`: it took everything it was woken for, so what it writes of the rings stays
-    /// as it is until the guest or the host wakes it. A wake that comes while it is awake stays
-    /// in the pipe, and has it wake once more with nothing to take, which a test's settled state
-    /// must not catch half done. The thread is in one sleep from before the look at the pipe to
-    /// after it: a poll that returned just as the look began may have its wake drained before
-    /// the look, which then finds nothing pending of a thread that is awake.
-    #[cfg(test)]
-    pub(crate) fn parked(&self, doorbell: Option<RawFd>) -> bool {
-        let sleep = self.sleeps.load(Ordering::SeqCst);
-        if sleep % 2 == 0 {
-            return false;
-        }
-        let mut fds = [
-            libc::pollfd {
-                fd: self.read.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: doorbell.unwrap_or(-1),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        // SAFETY: two pollfds, a negative descriptor ignored; a timeout of 0 never blocks.
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, 0) };
-        n == 0 && self.sleeps.load(Ordering::SeqCst) == sleep
-    }
-
-    /// The end the control thread polls, for a test that stands it in for a host's doorbell.
-    #[cfg(test)]
-    pub(crate) fn read_fd(&self) -> RawFd {
-        self.read.as_raw_fd()
-    }
-
-    /// Wakes the control thread. A pipe already full has a wake pending, so a write it refuses
-    /// loses nothing.
-    pub(crate) fn wake(&self) {
-        let byte = 1u8;
-        // SAFETY: one byte from a local, to a descriptor the struct owns.
-        let _ = unsafe { libc::write(self.write.as_raw_fd(), (&raw const byte).cast(), 1) };
-    }
-
-    /// Sleeps until a wake, or until `doorbell` (the host's file, where it gave one) is
-    /// readable, then takes what either holds.
-    pub(crate) fn sleep(&self, doorbell: Option<RawFd>) {
-        self.sleep_for(doorbell, None);
-    }
-
-    /// [`Self::sleep`], for `timeout` at most where one is given (rounded up to a millisecond).
-    pub(crate) fn sleep_for(&self, doorbell: Option<RawFd>, timeout: Option<std::time::Duration>) {
-        let timeout_ms = timeout.map_or(-1, |t| {
-            libc::c_int::try_from(t.as_nanos().div_ceil(1_000_000)).unwrap_or(libc::c_int::MAX)
-        });
-        let mut fds = [
-            libc::pollfd {
-                fd: self.read.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: doorbell.unwrap_or(-1),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        #[cfg(test)]
-        self.sleeps.fetch_add(1, Ordering::SeqCst);
-        // SAFETY: two pollfds, a negative descriptor ignored.
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
-        // Before the drain: until it, a wake that ended the poll is still pending.
-        #[cfg(test)]
-        self.sleeps.fetch_add(1, Ordering::SeqCst);
-        if n <= 0 {
-            return;
-        }
-        for pollfd in fds {
-            if pollfd.fd >= 0 && pollfd.revents & libc::POLLIN != 0 {
-                drain(pollfd.fd);
-            }
-        }
-    }
-}
-
-/// A command queue's bell: an eventfd, non-blocking and closed on exec, that its service thread
-/// sleeps on beside its [`Wake`], and that the host makes readable for the queue's plain doorbell
-/// where it routes it ([`crate::device::Host::route_doorbell`]: QEMU's KVM `ioeventfd`). `None`
-/// where the host refuses one, and on a host with no eventfd, whose queues' doorbells run the
-/// device's write as before.
-pub(crate) fn bell() -> Option<OwnedFd> {
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: no pointer; the flags make it non-blocking and closed on exec.
-        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        if fd < 0 {
-            return None;
-        }
-        // SAFETY: `eventfd` made it, and nothing else owns it.
-        Some(unsafe { OwnedFd::from_raw_fd(fd) })
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
-}
-
-/// Takes what `fd` holds, at most 64 bytes: an eventfd's count (8 bytes), or a pipe's writes
-/// (QEMU's event notifier is a pipe where the host has no eventfd). One read after a readable
-/// poll never blocks; what it leaves keeps the descriptor readable for the next sleep.
-fn drain(fd: RawFd) {
-    let mut buf = [0u8; 64];
-    // SAFETY: up to 64 bytes into a local.
-    let _ = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-}
-
-/// Makes `fd` non-blocking and closed on exec.
-fn set_flags(fd: RawFd) {
-    // SAFETY: flag changes on a descriptor the caller owns.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        let fd_flags = libc::fcntl(fd, libc::F_GETFD);
-        libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC);
-    }
-}
-
-/// A copy of the host's descriptor `fd`, closed on exec, which the device owns; `None` where
-/// `fd` is not open.
-pub(crate) fn duplicate(fd: RawFd) -> Option<OwnedFd> {
-    // SAFETY: `fcntl` duplicates whatever `fd` names, or fails.
-    let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-    if copy < 0 {
-        return None;
-    }
-    // SAFETY: the duplicate is new, and nothing else owns it.
-    Some(unsafe { OwnedFd::from_raw_fd(copy) })
-}
+#[cfg(unix)]
+pub use unix::RawDoorbell;
+#[cfg(all(test, unix))]
+pub(crate) use unix::not_open;
+#[cfg(unix)]
+pub(crate) use unix::{Doorbell, Wake, bell, duplicate, raw};
+#[cfg(windows)]
+pub use windows::RawDoorbell;
+#[cfg(all(test, windows))]
+pub(crate) use windows::not_open;
+#[cfg(windows)]
+pub(crate) use windows::{Doorbell, Wake, bell, duplicate, raw};
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A wake ends a sleep, and a doorbell file's write ends one too
+    /// A wake ends a sleep, and a doorbell's signal ends one too
     #[test]
     fn a_wake_or_a_doorbell_ends_a_sleep() {
         let wake = Wake::new().unwrap();
@@ -192,9 +38,51 @@ mod tests {
         wake.sleep(None);
         let bell = Wake::new().unwrap();
         bell.wake();
-        wake.sleep(Some(bell.read.as_raw_fd()));
-        // Both drained: a wake after them ends the next sleep, not what they left.
+        wake.sleep(Some(bell.raw()));
+        // Both taken: a wake after them ends the next sleep, not what they left.
         wake.wake();
-        wake.sleep(Some(bell.read.as_raw_fd()));
+        wake.sleep(Some(bell.raw()));
+    }
+
+    /// A sleep for a time with nothing to wake it ends once the time has passed
+    #[test]
+    fn a_sleep_for_a_time_ends_with_no_wake() {
+        let wake = Wake::new().unwrap();
+        let bell = Wake::new().unwrap();
+        wake.sleep_for(Some(bell.raw()), Some(std::time::Duration::from_millis(1)));
+        wake.sleep_for(None, Some(std::time::Duration::ZERO));
+    }
+
+    /// The thread is parked only inside a sleep with no wake pending
+    #[test]
+    fn parked_only_inside_a_sleep_with_no_wake_pending() {
+        let wake = Wake::new().unwrap();
+        assert!(!wake.parked(None), "not in a sleep");
+        std::thread::scope(|scope| {
+            scope.spawn(|| wake.sleep(None));
+            let parked = (0..2000).any(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                wake.parked(None)
+            });
+            assert!(parked, "the sleeper parked");
+            wake.wake();
+        });
+        assert!(!wake.parked(None), "out of its sleep");
+    }
+
+    /// A copy of a doorbell is a doorbell of its own: it stays open once the original goes, and a
+    /// signal of either ends a sleep on the other
+    #[test]
+    fn a_duplicated_doorbell_outlives_its_original() {
+        let wake = Wake::new().unwrap();
+        let bell = Wake::new().unwrap();
+        let copy = duplicate(bell.raw()).unwrap();
+        bell.wake();
+        drop(bell);
+        wake.sleep(Some(raw(&copy)));
+        assert!(
+            duplicate(not_open()).is_none(),
+            "no copy of a doorbell that is not open"
+        );
     }
 }

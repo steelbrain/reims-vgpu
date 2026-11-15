@@ -36,3 +36,4 @@ pub use device::{
     REGION_SIZE, RingDegradation, Then,
 };
 pub use display::{CursorImage, FixedScreen, Mode, Scanout, Screen};
+pub use wake::RawDoorbell;

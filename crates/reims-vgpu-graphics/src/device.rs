@@ -213,7 +213,6 @@
 //! until the reset.
 
 use std::collections::{HashMap, VecDeque};
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
@@ -230,7 +229,7 @@ use crate::display::{Mode, Scanout, Screen};
 use crate::ops::RgfxCommandBuffer;
 use crate::region::Region;
 use crate::ring::{Consumer, Message, Posted, Producer, RingAt, sized};
-use crate::wake::{self, Wake};
+use crate::wake::{self, Doorbell, RawDoorbell, Wake};
 use crate::wire::*;
 
 mod backlog;
@@ -620,7 +619,7 @@ pub trait Host: Send + Sync + 'static {
     /// started and before the create is answered, with no lock of the device's held: it may wait
     /// for a lock the host holds while it calls the device (the module doc, "Routed doorbells").
     /// The default takes none.
-    fn route_doorbell(&self, route: u64, at: DoorbellAt, ring_id: u32, bell: RawFd) -> bool {
+    fn route_doorbell(&self, route: u64, at: DoorbellAt, ring_id: u32, bell: RawDoorbell) -> bool {
         let _ = (route, at, ring_id, bell);
         false
     }
@@ -877,7 +876,7 @@ pub(crate) struct Shared {
     /// The control thread's own wake.
     wake: Wake,
     /// The host's doorbell file for ring 0, once given.
-    doorbell: OnceLock<OwnedFd>,
+    doorbell: OnceLock<Doorbell>,
     /// The control submission ring, held while the control thread takes a message.
     submit: Mutex<Submit>,
     /// The display, as the guest has set it.
@@ -1038,7 +1037,7 @@ pub(crate) struct QueueShared {
     /// Its bell, which the service thread sleeps on beside `wake`, where the guest's driver took
     /// [`RGFX_FEATURE_DOORBELL_ASKS`] and the host has eventfds ([`wake::bell`]): the file the
     /// host makes readable for the ring's plain doorbell where it routes it.
-    bell: Option<OwnedFd>,
+    bell: Option<Doorbell>,
     /// The route of its plain doorbell the host took ([`Host::route_doorbell`]), 0 where none:
     /// the queue's end takes it and drops it ([`Shared::unroute`]).
     route: AtomicU64,
@@ -1314,7 +1313,7 @@ impl Device {
     /// stays as it is until the guest acts.
     #[cfg(test)]
     pub(crate) fn parked(&self) -> bool {
-        let doorbell = self.shared.doorbell.get().map(AsRawFd::as_raw_fd);
+        let doorbell = self.shared.doorbell.get().map(wake::raw);
         self.shared.wake.parked(doorbell)
             && self.shared.lanes.idle()
             && self
@@ -1414,11 +1413,12 @@ impl Device {
         self.shared.page_doorbell(offset, value);
     }
 
-    /// Takes a copy of `fd`, the host's doorbell file for ring 0 (its `ioeventfd`'s, readable
-    /// once the guest writes 0 to `DOORBELL`), which the control thread then sleeps on too.
-    /// False where `fd` is not open, or the device has one already.
-    pub fn set_doorbell(&self, fd: RawFd) -> bool {
-        let Some(copy) = wake::duplicate(fd) else {
+    /// Takes a copy of `doorbell`, the host's doorbell for ring 0 (its `ioeventfd`'s, readable
+    /// or set once the guest writes 0 to `DOORBELL`: a file on Linux and macOS, an event on
+    /// Windows), which the control thread then sleeps on too. False where `doorbell` is not open,
+    /// or the device has one already.
+    pub fn set_doorbell(&self, doorbell: RawDoorbell) -> bool {
+        let Some(copy) = wake::duplicate(doorbell) else {
             return false;
         };
         if self.shared.doorbell.set(copy).is_err() {
@@ -1886,7 +1886,7 @@ impl Shared {
             if self.ending() {
                 break;
             }
-            self.wake.sleep(self.doorbell.get().map(AsRawFd::as_raw_fd));
+            self.wake.sleep(self.doorbell.get().map(wake::raw));
             self.host.trace("r0wake", &[]);
             // A doorbell may follow the guest's take of completions.
             self.room.wake();
@@ -2898,7 +2898,7 @@ impl Shared {
         let route = self.last_route.fetch_add(1, Ordering::AcqRel) + 1;
         if !self
             .host
-            .route_doorbell(route, at, ring_id, bell.as_raw_fd())
+            .route_doorbell(route, at, ring_id, wake::raw(bell))
         {
             self.routes.fetch_sub(1, Ordering::AcqRel);
             log::warn!(
@@ -3042,7 +3042,7 @@ impl Shared {
                 .then(|| self.room_poll());
             queue
                 .wake
-                .sleep_for(queue.bell.as_ref().map(AsRawFd::as_raw_fd), poll);
+                .sleep_for(queue.bell.as_ref().map(wake::raw), poll);
             // A doorbell may follow the guest's take of completions, as the control thread's
             // may: a routed one rings nothing of the device's but the bell.
             queue.room.wake();
