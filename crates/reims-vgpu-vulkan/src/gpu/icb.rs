@@ -3735,20 +3735,34 @@ mod tests {
         assert_eq!(crate::answer::degradation_counts(), before);
     }
 
+    /// A device of the platform's options but for indirect command buffers' records, which lie in
+    /// the runtime's own pages imported by their pointer wherever the device imports host
+    /// pointers, so a recovery keeps them (`indirect_records`, `IndirectRecordsPolicy::Carried`,
+    /// the exact form [`crate::platform::EXACT_FORMS`] names): a device of its own, as a recovery
+    /// moves every user of the device.
+    fn carried_records_device() -> VulkanDevice {
+        let mut options = crate::platform::device_options().clone();
+        options.policy.indirect_records = metal2vulkan::device::IndirectRecordsPolicy::Carried;
+        crate::gpu::device::tests::device_of_options(&options)
+    }
+
     /// A recovery of the device while commands' sets are sent in one call each loses none of
-    /// them and ends no run: [`SENDERS`] threads each send their own commands' vertex and fragment
-    /// buffers, nil at offsets of the round and the command (a nil buffer's address is its
-    /// offset), one call a command, then read their commands back, round after round, while
-    /// another thread recovers the device again and again, each time once every sender finished
-    /// a round more. Each read-back, and each command at the end, holds the round last sent it.
-    /// A device of its own, as a recovery moves every user of the device.
+    /// them and ends no run, where the records lie where a recovery keeps them
+    /// ([`carried_records_device`]; under the default, a device whose held pointer import costs
+    /// every submission lays them in pooled memory, whose recovery resets every command:
+    /// `a_recovery_under_the_default_keeps_every_command_or_resets_every_one`): [`SENDERS`] threads
+    /// each send their own commands' vertex and fragment buffers, nil at offsets of the round and
+    /// the command (a nil buffer's address is its offset), one call a command, then read their
+    /// commands back, round after round, while another thread recovers the device again and
+    /// again, each time once every sender finished a round more. Each read-back, and each command
+    /// at the end, holds the round last sent it.
     #[test]
     fn a_recovery_while_a_command_is_sent_in_one_call_loses_no_set() {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         const SENDERS: u64 = 4;
         const EACH: u64 = 16;
         const RECOVERIES: u64 = 16;
-        let d = crate::gpu::device::tests::device_of_options(crate::platform::device_options());
+        let d = carried_records_device();
         let icb = &make::<VulkanPlatform>(&d, &render_desc(), SENDERS * EACH);
         // The four addresses of command `i` in `round`: its vertex and fragment buffers 0 and 1.
         let at = |round: u64, i: u64| {
@@ -3832,6 +3846,79 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A recovery of the device under the platform's own options, the runtime's default
+    /// `IndirectRecordsPolicy::Untaxed`, keeps every command of an indirect command buffer as the
+    /// CPU left it, or resets every one, on a device whose check found that a held pointer import
+    /// costs every submission (RADV; ANV on i915), where the runtime lays the records in pooled
+    /// memory, which the recovery loses with the `VkDevice` and writes again as a new buffer's,
+    /// where Metal keeps them (docs/accuracy-ledger.md): never some commands and not others, nor
+    /// some fields of a command. Either way the buffer goes on: commands sent after the recovery
+    /// read back as sent. Each command's vertex and fragment buffers 0 and 1 are nil at offsets
+    /// of its own (a nil buffer's address is its offset). A device of its own, as a recovery moves
+    /// every user of the device.
+    #[test]
+    fn a_recovery_under_the_default_keeps_every_command_or_resets_every_one() {
+        const COMMANDS: u64 = 64;
+        let d = crate::gpu::device::tests::device_of_options(crate::platform::device_options());
+        let icb = make::<VulkanPlatform>(&d, &render_desc(), COMMANDS);
+        // The four addresses of command `i` before the recovery (`round` 0) and after it (1).
+        let at = |round: u64, i: u64| {
+            let first = (round * COMMANDS + i + 1) * 64;
+            [first, first + 16, first + 32, first + 48]
+        };
+        let send = |round: u64| {
+            for i in 0..COMMANDS {
+                let [v0, v1, f0, f1] = at(round, i);
+                let vertex = |offset, index| IcbRenderCmd::<'_, VulkanPlatform>::SetVertexBuffer {
+                    buffer: None,
+                    offset,
+                    index,
+                };
+                let fragment =
+                    |offset, index| IcbRenderCmd::<'_, VulkanPlatform>::SetFragmentBuffer {
+                        buffer: None,
+                        offset,
+                        index,
+                    };
+                let cmds = [
+                    vertex(v0, 0),
+                    vertex(v1, 1),
+                    fragment(f0, 0),
+                    fragment(f1, 1),
+                ];
+                assert!(icb.encode_render_command(i, cmds.into_iter()).unwrap());
+            }
+        };
+        let read = || {
+            (0..COMMANDS)
+                .map(|i| {
+                    let c = icb.render_command(i).unwrap().unwrap();
+                    let read = [
+                        c.vertex_buffer_address(0),
+                        c.vertex_buffer_address(1),
+                        c.fragment_buffer_address(0),
+                        c.fragment_buffer_address(1),
+                    ];
+                    read.map(Result::unwrap)
+                })
+                .collect::<Vec<_>>()
+        };
+        let sent = |round| (0..COMMANDS).map(|i| at(round, i)).collect::<Vec<_>>();
+        send(0);
+        assert_eq!(read(), sent(0), "before the recovery");
+        d.raw.recover_for_test().expect("the recovery");
+        let after = read();
+        let kept = after == sent(0);
+        let reset = after.iter().all(|command| *command == [0; 4]);
+        assert!(kept || reset, "after the recovery: {after:?}");
+        eprintln!(
+            "the recovery {} every command",
+            if kept { "kept" } else { "reset" }
+        );
+        send(1);
+        assert_eq!(read(), sent(1), "sent after the recovery");
     }
 
     /// An execution range past the buffer's size, which Metal runs without validation, dies at
