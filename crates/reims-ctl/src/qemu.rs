@@ -3,9 +3,9 @@
 //! runs it in a systemd user scope of its own ([`crate::runtime::launch`]).
 //!
 //! Every VM gets:
-//! - on reims-vgpu's own device, the library's window for its display: `-display none` with
-//!   `REIMS_VGPU_WINDOW` unset (`0` would keep the device headless), never a window of QEMU's
-//!   own;
+//! - on reims-vgpu's own device, the library's window for each of its displays: `-display none`
+//!   with `REIMS_VGPU_WINDOW` unset (`0` would keep the device headless), never a window of
+//!   QEMU's own;
 //! - a QMP socket (`-qmp`), through which reims-ctl stops the VM;
 //! - QEMU's pid file;
 //! - user networking with virtio-net, and an optional SSH port forward; with networking off,
@@ -57,10 +57,13 @@
 //!   for. The guest drives it with the kexts reims-ctl puts in the VM's OpenCore image. Its
 //!   BAR 2, the library's region, is 1 GiB below 4 GiB, which macOS gives an address only where
 //!   q35 leaves room there, so the machine keeps 1 GiB of RAM below 4 GiB
-//!   (`max-ram-below-4g=1G`): with more, the guest's kext finds no region. Its one display opens
-//!   in the library's window at the resolution's size ([`crate::vm::Display::window_size`],
-//!   the device's `resolution`; 1920x1080 by default) and follows the window's size at the host
-//!   screen's rate; borderless reaches it as `REIMS_VGPU_WINDOW_BORDERLESS`.
+//!   (`max-ram-below-4g=1G`): with more, the guest's kext finds no region. It has as many
+//!   displays as the VM's settings give, its `displays`, named only above one, the device's own
+//!   count, since a QEMU built before the property refuses it. Each display opens in a window of
+//!   the library's at the resolution's size ([`crate::vm::Display::window_size`], the device's
+//!   `resolution`, every window's; 1920x1080 by default) and follows its window's size at the
+//!   rate of the host screen the window is on; borderless reaches every window as
+//!   `REIMS_VGPU_WINDOW_BORDERLESS`.
 //! - QEMU's `vmware-svga` (`graphics = "vmware-svga"`). The library then draws nothing, so the
 //!   window's and the GPU's variables are left out, and QEMU's own window, GTK's (`-display
 //!   gtk`), shows the display. Where QEMU's environment names no Wayland compositor or X server,
@@ -323,11 +326,14 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     }
     push(&["-vga", "none"]);
     let gfx = match graphics {
-        // The window's first size only where it is not the device's own, 1920x1080: a QEMU
-        // built before the property refuses it.
+        // The displays only above one, and the windows' first size only where it is not the
+        // device's own, 1920x1080: a QEMU built before either property refuses it.
         Graphics::ReimsVgpu => format!(
-            "reims-graphics-pci,id=gfx,bus=pcie.0,addr=0x4,romfile={}{}",
+            "reims-graphics-pci,id=gfx,bus=pcie.0,addr=0x4,romfile={}{}{}",
             optp(&ctx.graphics_rom),
+            c.display
+                .qemu_displays()
+                .map_or(String::new(), |n| format!(",displays={n}")),
             c.display
                 .window_size()
                 .map_or(String::new(), |(w, h)| format!(",resolution={w}x{h}"))
@@ -1055,10 +1061,57 @@ mod tests {
                 .any(|x| x.starts_with("reims-graphics-pci,") && !x.contains("resolution")),
             "{a:?}"
         );
+        // One display, the device's own, names none.
+        assert!(!a.iter().any(|x| x.contains("displays")), "{a:?}");
         // VMware SVGA keeps the machine's RAM below 4 GiB as it was.
         vm.config.graphics = Some(Graphics::VmwareSvga);
         let a = invocation(&vm, &ctx(linux())).unwrap().args;
         assert!(!a.iter().any(|x| x.contains("max-ram-below-4g")), "{a:?}");
+    }
+
+    /// A VM of several displays gives reims-vgpu's device their count, and nothing else of the
+    /// command changes: the resolution is every window's first size, and borderless every
+    /// window's, as for one display. VMware SVGA has one display, whatever the count.
+    #[test]
+    fn reims_vgpu_has_the_vms_displays() {
+        let one = invocation(&q35_vm(), &ctx(linux())).unwrap();
+        let mut vm = q35_vm();
+        for n in 2..=DISPLAYS_MAX {
+            vm.config.display.count = n;
+            let inv = invocation(&vm, &ctx(linux())).unwrap();
+            let mut want = one.clone();
+            for a in &mut want.args {
+                if a.starts_with("reims-graphics-pci,") {
+                    a.push_str(&format!(",displays={n}"));
+                }
+            }
+            assert_eq!(inv, want, "{n}");
+        }
+        vm.config.display.resolution = "2560x1600".into();
+        vm.config.display.borderless = true;
+        let inv = invocation(&vm, &ctx(linux())).unwrap();
+        assert!(
+            has(
+                &inv.args,
+                &[
+                    "-device",
+                    "reims-graphics-pci,id=gfx,bus=pcie.0,addr=0x4,\
+                     romfile=/d/firmware/ReimsGraphics-0123456789abcdef.rom,displays=4,\
+                     resolution=2560x1600"
+                ]
+            ),
+            "{:?}",
+            inv.args
+        );
+        let env: BTreeMap<_, _> = inv.env.iter().cloned().collect();
+        assert_eq!(env["REIMS_VGPU_WINDOW_BORDERLESS"], "1");
+        vm.config.graphics = Some(Graphics::VmwareSvga);
+        let a = invocation(&vm, &ctx(linux())).unwrap().args;
+        assert!(
+            has(&a, &["-device", "vmware-svga,id=gfx,bus=pcie.0,addr=0x4"]),
+            "{a:?}"
+        );
+        assert!(!a.iter().any(|x| x.contains("displays")), "{a:?}");
     }
 
     /// A variable for QEMU's environment is named as the printed script's export takes it: a

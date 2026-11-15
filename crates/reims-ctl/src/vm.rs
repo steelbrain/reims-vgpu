@@ -98,9 +98,10 @@ impl ImageFormat {
 pub enum Graphics {
     /// reims-vgpu's own GPU device, QEMU's `reims-graphics-pci`: the guest drives it with
     /// reims-vgpu's kexts, which reims-ctl puts in the VM's OpenCore image
-    /// ([`crate::prebuilt`]), on one display in a window of the library's. The default. Settings
-    /// an older reims-ctl saved for apple-gfx, Apple's paravirtualized GPU, which reims-vgpu no
-    /// longer has, read as it ([`crate::migrate`] makes their OpenCore image again for it).
+    /// ([`crate::prebuilt`]), on the VM's displays ([`Display`]), each in a window of the
+    /// library's. The default. Settings an older reims-ctl saved for apple-gfx, Apple's
+    /// paravirtualized GPU, which reims-vgpu no longer has, read as it ([`crate::migrate`] makes
+    /// their OpenCore image again for it).
     #[default]
     #[serde(alias = "apple-gfx")]
     ReimsVgpu,
@@ -142,7 +143,7 @@ impl Graphics {
             .with_context(|| format!("graphics is reims-vgpu or vmware-svga, not {s:?}"))
     }
 
-    /// Whether the library runs the device, and draws its display in its window.
+    /// Whether the library runs the device, and draws its displays in their windows.
     pub fn library(self) -> bool {
         self != Graphics::VmwareSvga
     }
@@ -190,25 +191,52 @@ impl DiskController {
     }
 }
 
-/// reims-vgpu's one display: its window opens at the resolution's size
-/// ([`Display::window_size`]) and keeps the size the person gives it, which the guest follows, at
-/// the refresh rate of the host screen it is on. The guest starts a HiDPI desktop by itself in a
-/// window at least 3840 pixels wide, and offers one in its Displays settings from 2880 (the
-/// kext's HiDPI modes, whose pixels halve exactly: the guest is offered the window's pixels, the
-/// width rounded down to a multiple of 16 and the height to even). Settings an older reims-ctl saved for apple-gfx's displays (their
-/// count, HiDPI and refresh rate) are read past, and left out of the next save.
+/// reims-vgpu's displays, one by default and up to [`DISPLAYS_MAX`], each in a window of its own:
+/// every window opens at the resolution's size ([`Display::window_size`]) and keeps the size the
+/// person gives it, which its display follows, at the refresh rate of the host screen it is on.
+/// The guest starts a HiDPI desktop by itself on a display whose window is at least 3840 pixels
+/// wide, and offers one in its Displays settings from 2880 (the kext's HiDPI modes, whose pixels
+/// halve exactly: the guest is offered the window's pixels, the width rounded down to a multiple
+/// of 16 and the height to even). The count an older reims-ctl saved for apple-gfx's displays
+/// comes back as reims-vgpu's ([`saved_display_count`]); its HiDPI and refresh rate are read
+/// past, and left out of the next save.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Display {
-    /// The size the window opens at, `<width>x<height>`.
+    /// The displays, 1 to [`DISPLAYS_MAX`], each in a window of its own; saved only above 1, so
+    /// a VM of one display saves as one before the setting did.
+    #[serde(
+        skip_serializing_if = "Display::is_one",
+        deserialize_with = "saved_display_count"
+    )]
+    pub count: u32,
+    /// The size every window opens at, `<width>x<height>`.
     pub resolution: String,
-    /// A borderless window that fills its screen.
+    /// Borderless windows that fill their screens: every display's.
     pub borderless: bool,
+}
+
+/// The most displays reims-vgpu's device takes (the device's `RGFX_DISPLAYS_MAX`, QEMU's
+/// `displays` property's top).
+pub const DISPLAYS_MAX: u32 = 4;
+
+/// The display count a VM's settings saved: an older reims-ctl saved apple-gfx's, 1 to 8, which
+/// comes back as reims-vgpu's, one above [`DISPLAYS_MAX`] as its most.
+fn saved_display_count<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<u32, D::Error> {
+    let n = u32::deserialize(d)?;
+    Ok(if (DISPLAYS_MAX + 1..=8).contains(&n) {
+        DISPLAYS_MAX
+    } else {
+        n
+    })
 }
 
 impl Default for Display {
     fn default() -> Display {
         Display {
+            count: 1,
             resolution: "1920x1080".into(),
             borderless: false,
         }
@@ -216,8 +244,18 @@ impl Default for Display {
 }
 
 impl Display {
-    /// The size reims-vgpu's window opens at, the resolution's, in the host's points (a guest
-    /// point per host point), shrunk to fit the screen, which its guest takes in pixels and
+    fn is_one(count: &u32) -> bool {
+        *count == 1
+    }
+
+    /// The `displays` reims-vgpu's device is given: none for one, the device's own, which a
+    /// QEMU built before the property takes.
+    pub fn qemu_displays(&self) -> Option<u32> {
+        (self.count != 1).then_some(self.count)
+    }
+
+    /// The size each of reims-vgpu's windows opens at, the resolution's, in the host's points (a
+    /// guest point per host point), shrunk to fit the screen, which its guest takes in pixels and
     /// follows: measured on a Linux desktop at 2.1x, 1280x720 opened 1280x720 points and the
     /// guest ran 2688x1512. None for the device's own, 1920x1080.
     pub fn window_size(&self) -> Option<(u32, u32)> {
@@ -227,6 +265,9 @@ impl Display {
     }
 
     pub fn check(&self) -> Result<()> {
+        if !(1..=DISPLAYS_MAX).contains(&self.count) {
+            bail!("a VM has 1 to {DISPLAYS_MAX} displays, not {}", self.count);
+        }
         parse_resolution(self.resolution.trim()).map(|_| ())
     }
 }
@@ -1175,20 +1216,58 @@ mod tests {
         }
     }
 
-    /// What an older reims-ctl saved for apple-gfx alone (video acceleration, the displays'
-    /// count, HiDPI and refresh rate) is read past, and left out of the next save.
+    /// What an older reims-ctl saved for apple-gfx alone (video acceleration, HiDPI and the
+    /// refresh rate) is read past, and left out of the next save. The displays' count it saved
+    /// (1 to 8) comes back as reims-vgpu's, one above 4 as 4, and is saved only above 1.
     #[test]
     fn apple_gfx_s_settings_are_read_past() {
         let c = x86_64_config();
         let text = toml::to_string_pretty(&c).unwrap();
-        let old = text.replace(
-            "[display]\n",
-            "video_acceleration = false\n\n[display]\ncount = 2\nhidpi = true\nrefresh = 120\n",
-        );
-        assert_ne!(old, text);
-        let loaded = toml::from_str::<VmConfig>(&old).unwrap();
-        assert_eq!(loaded, c);
-        assert_eq!(toml::to_string_pretty(&loaded).unwrap(), text);
+        assert!(!text.contains("count"), "{text}");
+        for (saved, count) in [(1, 1), (2, 2), (3, 3), (4, 4), (5, 4), (8, 4)] {
+            let old = text.replace(
+                "[display]\n",
+                &format!(
+                    "video_acceleration = false\n\n[display]\ncount = {saved}\nhidpi = true\n\
+                     refresh = 120\n"
+                ),
+            );
+            assert_ne!(old, text);
+            let loaded = toml::from_str::<VmConfig>(&old).unwrap();
+            let mut want = c.clone();
+            want.display.count = count;
+            assert_eq!(loaded, want, "{saved}");
+            assert!(loaded.check().is_ok(), "{saved}");
+            let saved_again = toml::to_string_pretty(&loaded).unwrap();
+            if count == 1 {
+                assert_eq!(saved_again, text);
+            } else {
+                assert_eq!(
+                    saved_again,
+                    text.replace("[display]\n", &format!("[display]\ncount = {count}\n"))
+                );
+            }
+        }
+    }
+
+    /// A VM has 1 to 4 displays, the device's most; any other count saved by hand is refused.
+    #[test]
+    fn a_vm_has_1_to_4_displays() {
+        let mut c = x86_64_config();
+        for n in 1..=DISPLAYS_MAX {
+            c.display.count = n;
+            assert!(c.check().is_ok(), "{n}");
+            assert_eq!(c.display.qemu_displays(), (n > 1).then_some(n));
+            let text = toml::to_string_pretty(&c).unwrap();
+            assert_eq!(toml::from_str::<VmConfig>(&text).unwrap(), c);
+        }
+        let text = toml::to_string_pretty(&c).unwrap();
+        for bad in [0, 9, 100] {
+            let hand = text.replace("count = 4", &format!("count = {bad}"));
+            let loaded = toml::from_str::<VmConfig>(&hand).unwrap();
+            let e = format!("{:#}", loaded.check().unwrap_err());
+            assert!(e.contains("1 to 4 displays"), "{bad}: {e}");
+        }
     }
 
     /// A VM an earlier create saved with an SSH port of 0 has no forward, as `set --ssh-port 0`
