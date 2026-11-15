@@ -6,6 +6,9 @@ use std::path::Path;
 use std::process::{Command, ExitStatus};
 
 pub use std::os::unix::fs::FileExt;
+#[cfg(test)]
+pub use std::os::unix::net::UnixListener;
+pub use std::os::unix::net::UnixStream;
 
 /// What a write to a closed pipe fails with: EPIPE.
 pub const CLOSED_PIPE: i32 = libc::EPIPE;

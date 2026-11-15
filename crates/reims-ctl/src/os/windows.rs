@@ -6,6 +6,11 @@ use std::path::Path;
 use std::process::{Command, ExitStatus};
 use windows_sys::Win32::Foundation::SYSTEMTIME;
 
+mod socket;
+#[cfg(test)]
+pub use socket::UnixListener;
+pub use socket::UnixStream;
+
 /// What a write to a closed pipe fails with: ERROR_NO_DATA, "The pipe is being closed".
 pub const CLOSED_PIPE: i32 = 232;
 
@@ -397,46 +402,6 @@ pub fn flush_input() {
 /// Reads what the terminal sends. Not on Windows yet: nothing.
 pub fn read_terminal(_buf: &mut [u8], _timeout: std::time::Duration) -> io::Result<usize> {
     Ok(0)
-}
-
-/// A connection to a Unix socket, as QMP's: none on Windows yet, which refuses each connect.
-pub struct UnixStream(std::convert::Infallible);
-
-impl UnixStream {
-    pub fn connect(_path: &Path) -> io::Result<UnixStream> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "reims-ctl speaks no QMP on Windows yet",
-        ))
-    }
-
-    pub fn set_read_timeout(&self, _t: Option<std::time::Duration>) -> io::Result<()> {
-        match self.0 {}
-    }
-
-    pub fn set_write_timeout(&self, _t: Option<std::time::Duration>) -> io::Result<()> {
-        match self.0 {}
-    }
-
-    pub fn try_clone(&self) -> io::Result<UnixStream> {
-        match self.0 {}
-    }
-}
-
-impl io::Read for UnixStream {
-    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-        match self.0 {}
-    }
-}
-
-impl io::Write for UnixStream {
-    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-        match self.0 {}
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self.0 {}
-    }
 }
 
 #[cfg(test)]

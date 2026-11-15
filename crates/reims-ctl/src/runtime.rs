@@ -1363,10 +1363,9 @@ mod tests {
 
     /// A QMP server at `sock` that greets, answers every command, and records each command but
     /// qmp_capabilities.
-    #[cfg(unix)]
     fn fake_qmp(sock: &Path) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
         use std::io::BufRead;
-        let listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
+        let listener = crate::os::UnixListener::bind(sock).unwrap();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let record = seen.clone();
         std::thread::spawn(move || {
@@ -1417,8 +1416,6 @@ mod tests {
         assert!(not_dir.is_err(), "{not_dir:?}");
     }
 
-    // Windows: with its QMP connection (os/windows.rs).
-    #[cfg(unix)]
     #[test]
     fn a_stop_timeout_of_0_waits_for_the_guest() {
         let d = std::env::temp_dir().join(format!("reims-ctl-stop-{}", std::process::id()));

@@ -1,12 +1,10 @@
-//! A QMP client: one command at a time over the VM's Unix socket, events skipped.
+//! A QMP client: one command at a time over the VM's Unix socket, events skipped. On Windows the
+//! socket is Winsock's AF_UNIX ([`crate::os::UnixStream`]).
 
-#[cfg(windows)]
 use crate::os::UnixStream;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
@@ -65,4 +63,46 @@ impl Qmp {
 /// Runs one command on the VM's socket.
 pub fn run(socket: &Path, command: &str, arguments: Option<Value>) -> Result<Value> {
     Qmp::connect(socket, Duration::from_secs(10))?.execute(command, arguments)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The QEMU that `REIMS_CTL_TEST_QEMU` names answers this client on its `-qmp unix:` socket,
+    /// as a start asks it for one (qemu.rs): a check of a host's QEMU, which only that host has.
+    /// On Windows its directory holds the DLLs it was linked with, or PATH does.
+    #[test]
+    #[ignore = "needs a QEMU: REIMS_CTL_TEST_QEMU names its qemu-system-x86_64"]
+    fn a_qemu_answers_on_its_unix_socket() {
+        let qemu = std::env::var_os("REIMS_CTL_TEST_QEMU").expect("REIMS_CTL_TEST_QEMU");
+        let env = crate::testenv::Env::new("qmp-qemu");
+        let sock = env.root.join("qmp.sock");
+        let mut child = std::process::Command::new(qemu)
+            .args([
+                "-machine",
+                "none",
+                "-nodefaults",
+                "-display",
+                "none",
+                "-qmp",
+            ])
+            .arg(format!("unix:{},server=on,wait=off", sock.display()))
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let answer = loop {
+            match Qmp::connect(&sock, Duration::from_secs(2)) {
+                Ok(mut q) => break q.execute("query-version", None),
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => break Err(e),
+            }
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        let v = answer.unwrap();
+        assert!(v["qemu"]["major"].as_u64().is_some(), "{v}");
+    }
 }

@@ -928,8 +928,6 @@ mod tests {
     /// Every VM name has a QMP socket that binds, with a runtime directory as long as macOS's
     /// `$TMPDIR/reims-ctl-<uid>` and a VM directory too long for its own; and a VM keeps the
     /// socket earlier reims-ctl gave it wherever that fits.
-    // Windows: with its QMP connection (os/windows.rs).
-    #[cfg(unix)]
     #[test]
     fn every_name_has_a_qmp_socket_that_binds() {
         let dir = Path::new("/Users/someone/VMs").join("d".repeat(80));
@@ -957,13 +955,17 @@ mod tests {
         // Bound where it falls, in the runtime directory or the short one: under a `$TMPDIR`
         // too long for even a hashed name, as a CI job's can be, the short one.
         let tmp = std::env::temp_dir().join(format!("reims-ctl-qmp-{}", std::process::id()));
+        #[cfg(unix)]
         let short_tmp = Path::new("/tmp").join(format!("reims-ctl-qmp-{}", std::process::id()));
+        // Windows' short directory is the runtime one (`paths::short_runtime_dir`).
+        #[cfg(windows)]
+        let short_tmp = tmp.join("short");
         for d in [&tmp, &short_tmp] {
             std::fs::create_dir_all(d).unwrap();
         }
         let s = qmp_socket_in(&dir, &long, &tmp, &short_tmp);
-        let bound = std::os::unix::net::UnixListener::bind(&s)
-            .and_then(|_l| std::os::unix::net::UnixStream::connect(&s));
+        let bound =
+            crate::os::UnixListener::bind(&s).and_then(|_l| crate::os::UnixStream::connect(&s));
         for d in [&tmp, &short_tmp] {
             let _ = std::fs::remove_dir_all(d);
         }
