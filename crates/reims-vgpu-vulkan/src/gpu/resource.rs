@@ -3337,7 +3337,11 @@ pub(crate) mod tests {
         unsafe { std::ptr::copy_nonoverlapping(cpu.as_ptr(), memory.add(at), inside) };
         let mut rewritten = cpu.clone();
         rewritten.resize(span, 0);
-        assert_eq!(kernel_read(), rewritten, "a kernel's read after a CPU write");
+        assert_eq!(
+            kernel_read(),
+            rewritten,
+            "a kernel's read after a CPU write"
+        );
 
         // A blit into every texel writes the buffer's bytes inside the length and the tail past
         // it, which every path then reads, and no other byte of the memory changes.
@@ -3359,9 +3363,17 @@ pub(crate) mod tests {
             e.encode(OnFault::Die, copy).unwrap();
             e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
         });
-        assert_eq!(kernel_read(), written, "a kernel's read after a blit's write");
+        assert_eq!(
+            kernel_read(),
+            written,
+            "a kernel's read after a blit's write"
+        );
         assert_eq!(blit_read(), written, "a blit's read after a blit's write");
-        assert_eq!(host(at..at + inside), written[..inside], "the buffer's bytes");
+        assert_eq!(
+            host(at..at + inside),
+            written[..inside],
+            "the buffer's bytes"
+        );
         assert_eq!(host(0..at), laid[..at], "the bytes before the texels");
         assert_eq!(
             host(at + inside..MEMORY),
@@ -3448,12 +3460,24 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_some()
         };
-        assert!(linear(&rgba(2, 64, 1), 0, 256), "a 2D texture at the length");
-        assert!(!linear(&rgba(2, 65, 1), 0, 256), "a 2D texture past the allocation");
+        assert!(
+            linear(&rgba(2, 64, 1), 0, 256),
+            "a 2D texture at the length"
+        );
+        assert!(
+            !linear(&rgba(2, 65, 1), 0, 256),
+            "a 2D texture past the allocation"
+        );
         assert!(linear(&rgba(3, 32, 2), 0, 256), "an array at the length");
-        assert!(!linear(&rgba(3, 33, 2), 0, 256), "an array past the allocation");
+        assert!(
+            !linear(&rgba(3, 33, 2), 0, 256),
+            "an array past the allocation"
+        );
         assert!(linear(&texels, 16320, 64), "a texture buffer at the length");
-        assert!(!linear(&texels, 16352, 64), "a texture buffer past the allocation");
+        assert!(
+            !linear(&texels, 16352, 64),
+            "a texture buffer past the allocation"
+        );
     }
 
     /// What a 2D array texture over a no-copy buffer of 64 KiB of host memory shows on `P`, made
