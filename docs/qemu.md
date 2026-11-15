@@ -923,6 +923,11 @@ drawn in its first rows):
   117 and 117 of 118 held their numbers in order, none missed; of the
   frames macOS converted to '2vuy' and '420v', every one but the first,
   which was black on both. The guest logged no `mismatched event TRB`.
+- Photo Booth, with the camera at 640x480, showed its frames on
+  `reims-graphics-pci` (homelab-um790-xtx-1's Radeon 780M, at `1890afed`;
+  m3-max-31967). On `vmware-svga`, for which system_profiler lists no
+  Metal support, its viewfinder stayed black while the camera sent 589
+  frames (m3-max-31926).
 
 **Unknown**: a guest's view of a device on a USB 3 port; whether macOS
 guests before 26 drive the controller with 14 ports as with 8.
