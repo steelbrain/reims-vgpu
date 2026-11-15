@@ -1755,7 +1755,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// taken first and its `CB_SUBMITTED` posted where it gets it at its take
     /// ([`GraphicsDecoder::begin_taken`]), then walked and committed on the lane, in its turn
     /// ([`Self::carry_out`]), so the thread goes on to the queue's next buffer meanwhile, `message`
-    /// going there as it is.
+    /// going there as it is. A buffer longer than [`INLINE_WALK_MAX`] has the lane's idle thread
+    /// woken for it as its turn is taken, so the thread wakes during the rest of its begin
+    /// (`decode::lane`, "Woken as the buffer is begun").
     fn begin_command_buffer(
         self: &Arc<Self>,
         poster: &CompletionPoster,
@@ -1772,8 +1774,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             }
             let mut decoder =
                 (self.decoders).sender(Some(sender_context(poster, &message)), self.sinks(poster));
-            let begun =
-                refusing(|| decoder.begin_taken(&self.device, &message, poster.queue_obj_id()));
+            let to_lane = self.goes_to_lane(&message);
+            let queue = poster.queue_obj_id();
+            let begun = refusing(|| decoder.begin_taken(&self.device, &message, queue, to_lane));
             self.carry_out(decoder, begun, carried, poster.clone(), message, claim);
         });
     }
@@ -1821,6 +1824,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         claim: Option<&mut QueueClaim<'_>>,
     ) {
         let lane = decoder.lane();
+        let expected = self.goes_to_lane(&message);
         let begun_whole = matches!(&begun, Ok(Ok(_)));
         let here = match &begun {
             Ok(Ok(b)) if b.ordered() => decoder.turn_is_next(),
@@ -1860,7 +1864,12 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         };
         match lane {
             Some(lane) if !here => lane.run(Box::new(job)),
-            _ => {
+            lane => {
+                // A long buffer walked in its turn here: the lane's thread woken for it as it was
+                // begun waits for it no more.
+                if let Some(lane) = lane.filter(|_| expected) {
+                    lane.withdraw();
+                }
                 // Begun, its place among the queue's buffers taken: the queue's next buffer may
                 // be answered while this one is walked here, as while a lane's thread walks it.
                 if let Some(claim) = claim.filter(|_| begun_whole) {
@@ -1869,6 +1878,13 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 job();
             }
         }
+    }
+
+    /// Whether the `COMMAND_BUFFER` `message` goes to its queue's lane wherever it is not walked
+    /// in its turn with its turn next ([`Self::carry_out`]): it is longer than the service thread
+    /// walks itself, [`INLINE_WALK_MAX`] bytes.
+    fn goes_to_lane(&self, message: &[u8]) -> bool {
+        message.len() > self.inline_walk_max.load(Ordering::Relaxed)
     }
 
     /// [`Host::answer_command_buffer`]: answers the `COMMAND_BUFFER` `message` of the queue

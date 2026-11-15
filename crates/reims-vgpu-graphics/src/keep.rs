@@ -59,6 +59,12 @@ impl Keep {
         }
     }
 
+    /// Whether the keep has passed since `since` (a [`Self::now`]), waiting for nothing.
+    pub fn passed(&self, since: u64) -> bool {
+        let keep = u64::try_from(self.keep.as_nanos()).unwrap_or(u64::MAX);
+        self.now().saturating_sub(since) >= keep
+    }
+
     /// Waits on `wake`, whose lock `guard` holds, until it is notified or the keep has passed
     /// since `since` (a [`Self::now`]); whether it has passed. On a [`TestClock`] it looks again
     /// every millisecond, so a move of the clock is seen at once.

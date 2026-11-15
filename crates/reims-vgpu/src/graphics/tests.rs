@@ -5529,6 +5529,95 @@ fn a_short_buffer_that_waits_for_nothing_is_walked_on_its_queue_s_service_thread
     );
 }
 
+/// A long command buffer, its queue's lane idle, has the lane's thread that waits for a job woken
+/// for it as it is begun (`decode`'s `lane`, "Woken as the buffer is begun"), and is walked on
+/// that thread; a short one, walked on the service thread, wakes nothing. One sent behind a
+/// buffer whose walk the lane holds finds no thread waiting, wakes none, and is walked beside
+/// it and committed after it, in its turn
+#[test]
+fn a_long_buffer_wakes_its_idle_lane_s_thread_as_it_is_begun() {
+    use reims_vgpu_graphics::ops::{RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END};
+
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, mut ring) = one_queue(&raised);
+    let threads = walk_threads(&device);
+    let passes: Vec<(u16, &[u8])> = (0..200)
+        .flat_map(|_| {
+            [
+                (RGFX_OP_ENCODER_BEGIN_BLIT, &[][..]),
+                (RGFX_OP_ENCODER_END, &[][..]),
+            ]
+        })
+        .collect();
+    let long = |cb| command_buffer_of(obj(1, 1), cb, &passes);
+    assert!(long(100).len() > super::INLINE_WALK_MAX);
+    let wakes = || device.control.decoder().lane_wakes(obj(1, 1)).unwrap();
+    let complete = |ring: &mut QueueRing, cb| {
+        assert!(complete_until_event(&platform, ring), "no completion");
+        let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+        assert_eq!((done.cb_obj_id, done.status), (cb, RGFX_CB_OK));
+    };
+    // The first makes the lane's thread, which then waits for a job.
+    ring.send(&device, long(100));
+    complete(&mut ring, 100);
+    assert!(
+        eventually(|| wakes().2 == 1),
+        "the lane's thread: {:?}",
+        wakes()
+    );
+    assert_eq!(
+        wakes().1,
+        0,
+        "an expectation woke a thread before there was one"
+    );
+    ring.send(&device, long(101));
+    complete(&mut ring, 101);
+    assert_eq!(wakes().1, 1, "the begin woke no thread for the long buffer");
+    ring.send(&device, sampler_command_buffer(obj(1, 1), 102, obj(1, 4)));
+    complete(&mut ring, 102);
+    assert_eq!(wakes().1, 1, "a short buffer woke a thread");
+    let walked = threads.lock().clone();
+    assert_eq!(walked.len(), 3, "walks seen: {walked:?}");
+    assert!(
+        walked[..2]
+            .iter()
+            .all(|name| name.starts_with("reims-vgpu.graphics-lane-")),
+        "a long buffer walked off its lane: {walked:?}"
+    );
+    assert!(
+        walked[2].starts_with("reims-vgpu.graphics-queue-"),
+        "the short buffer walked on {:?}",
+        walked[2]
+    );
+
+    // Behind a held walk on the lane's one thread, woken for it: no thread waits, and none is
+    // woken.
+    assert!(eventually(|| wakes().2 == 1));
+    let gate = WalkGate::on(&device);
+    ring.send(&device, long(103));
+    assert!(gate.reached(), "the held walk did not start");
+    assert_eq!(wakes().1, 2, "the begin woke no thread for the held buffer");
+    ring.send(&device, long(104));
+    assert!(
+        gate.passed(400),
+        "the buffer behind was not walked beside the held one"
+    );
+    assert_eq!(
+        wakes().1,
+        2,
+        "an expectation woke a thread with none waiting"
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        platform.world().committed().is_empty(),
+        "the buffer behind was committed before the held one"
+    );
+    gate.open();
+    committed(&platform, 2);
+    complete(&mut ring, 103);
+    complete(&mut ring, 104);
+}
+
 /// A command buffer that asks for its `CB_SUBMITTED` behind a short buffer its queue's service
 /// thread walks is answered before that walk ends, as behind one a lane's thread walks:
 /// published during the walk, rung for, as the guest rings for an asking buffer on a ring the

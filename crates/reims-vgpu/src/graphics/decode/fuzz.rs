@@ -813,7 +813,7 @@ fn an_answer_at_the_doorbell_keeps_the_order_of_a_take() {
                         });
                     answered += u64::from(yes);
                 }
-                let begun = refusing(|| dec.begin_taken(&device, &m, Some(queue)));
+                let begun = refusing(|| dec.begin_taken(&device, &m, Some(queue), false));
                 let outcome = match begun {
                     Ok(Ok(begun)) => refusing(|| dec.finish_command_buffer(&device, &m, begun)),
                     Ok(Err(e)) => Ok(Err(e)),

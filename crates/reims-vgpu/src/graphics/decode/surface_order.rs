@@ -1451,7 +1451,7 @@ mod tests {
         r.dec.set_context(Some(context(B)));
         let begun = r
             .dec
-            .begin_taken(&r.device, &ordered, Some(B))
+            .begin_taken(&r.device, &ordered, Some(B), false)
             .unwrap()
             .unwrap();
         assert_eq!(of(&posted, &[o]), [(SUB, o), (SCHED, o)], "at its take");
@@ -1483,7 +1483,7 @@ mod tests {
         assert_eq!(of(&posted, &[o, d]), answered, "nothing at its commit");
         let begun = r
             .dec
-            .begin_taken(&r.device, &next, Some(B))
+            .begin_taken(&r.device, &next, Some(B), false)
             .unwrap()
             .unwrap();
         let finished = r

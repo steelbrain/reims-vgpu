@@ -4253,8 +4253,13 @@ commit. Each outcome the new design allows is one of those two:
   (`a_lane_keeps_its_thread_through_a_steady_load_s_pauses`,
   `a_burst_s_other_threads_go_after_keep_while_one_takes_the_jobs`). Each lane
   thread gives itself the walk hints as it starts (on Linux, a utilization
-  floor; no thread is bound to a CPU). Tested through the device
-  by
+  floor; no thread is bound to a CPU). A buffer longer than its service
+  thread walks itself has the lane's idle thread woken as its turn is taken,
+  before the rest of its begin, and that thread spins for the job for 50 µs
+  at most, so its wake is made while the buffer is begun: no job, turn or
+  order changes, only when the thread wakes
+  (`a_long_buffer_wakes_its_idle_lane_s_thread_as_it_is_begun`). Tested
+  through the device by
   `a_queue_s_buffers_are_walked_at_once_and_committed_in_order`,
   `every_buffer_behind_a_held_walk_is_walked_beside_it_and_committed_in_turn`,
   `a_queue_s_buffers_past_its_lane_s_most_threads_wait_to_start_and_commit_in_turn`,
@@ -4273,8 +4278,12 @@ commit. Each outcome the new design allows is one of those two:
   `a_lane_with_no_budget_left_runs_its_jobs_on_its_own_thread_in_order`,
   `busy_lanes_hold_one_thread_each_and_the_budget_s`,
   `a_burst_s_threads_go_while_jobs_come_one_at_a_time`,
-  `a_burst_after_the_threads_went_grows_the_lane_to_its_limit_again` and
-  `each_thread_gives_itself_the_walk_hints_before_its_first_job`.
+  `a_burst_after_the_threads_went_grows_the_lane_to_its_limit_again`,
+  `each_thread_gives_itself_the_walk_hints_before_its_first_job`,
+  `an_expected_job_starts_on_the_thread_woken_for_it`,
+  `an_expected_job_that_comes_after_the_spin_wakes_its_thread_as_it_comes`,
+  `a_withdrawn_expectation_or_the_close_ends_the_spin_at_once` and
+  `an_expectation_wakes_only_an_idle_thread_and_one_at_a_time`.
 - **A command buffer in parts.** Where the platform starts a command buffer's
   GPU work only at its commit (the Vulkan platform's runtime records it and
   submits it then), a long buffer's walk and its GPU work run in series:

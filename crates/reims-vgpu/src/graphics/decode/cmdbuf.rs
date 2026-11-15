@@ -1419,12 +1419,15 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// where it was answered there ([`Answered`]). A context closed before the buffer came gets
     /// [`DecodeError::ContextClosed`], with no turn taken; and where it gets its
     /// `CB_SUBMITTED` or its `CB_SCHEDULED` at its take, they are posted here, once its ticket in
-    /// the commit order is issued, unless the answer posted them ([`Begun::post_at_take`]).
+    /// the commit order is issued, unless the answer posted them ([`Begun::post_at_take`]). Where
+    /// the rest of its work goes to the lane (`to_lane`), the lane's idle thread is woken for it
+    /// once its turn is taken ([`Lane::expect`]), so it wakes during the rest of the begin.
     pub(crate) fn begin_taken(
         &mut self,
         device: &P::Device,
         message: &[u8],
         queue: Option<u64>,
+        to_lane: bool,
     ) -> RaiseResult<Result<Begun<P>, DecodeError>> {
         self.end_message();
         let drain = self.command_buffer_drain();
@@ -1442,6 +1445,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                     self.scheduled_at_doorbell.set(answered.scheduled);
                 }
                 None => *self.turn.borrow_mut() = Self::turn_on(counts),
+            }
+            if to_lane && let Some(lane) = &counts.lane {
+                lane.expect();
             }
             // Its queue's commit marks rise to it, in its turn, whether it is committed, stood in
             // for or fails, however little of its message can be read ([`super::commit_order`]).
@@ -1509,6 +1515,15 @@ impl<P: Platform> GraphicsDecoder<P> {
             _ => true,
         };
         tickets && ranges
+    }
+
+    /// How many idle threads of queue `queue`'s lane a job woke as it came, how many a begin woke
+    /// for a job about to come ([`Lane::expect`]), and how many wait for a job; `None` where the
+    /// queue has no lane (for the tests).
+    #[cfg(test)]
+    pub(crate) fn lane_wakes(&self, queue: u64) -> Option<(usize, usize, usize)> {
+        let lane = self.queue_counts(queue)?.lane.as_ref()?;
+        Some(lane.wakes())
     }
 
     /// The lane of the command buffer's queue, where it was given a turn there.
@@ -5318,7 +5333,7 @@ mod tests {
             assert!(answer(&dec, &message, &posted, posts));
             assert!(p.call_log().sels_since(mark).is_empty(), "a platform call");
             let begun = dec
-                .begin_taken(&device, &message, Some(1))
+                .begin_taken(&device, &message, Some(1), false)
                 .unwrap()
                 .unwrap();
             assert!(!let_go_of_answer(&dec), "the begin took the answer");
@@ -5459,7 +5474,7 @@ mod tests {
         assert_eq!(*posted.lock(), [(SUB, 185, 115), (SCHED, 185, 115)]);
         let mark = p.call_log().mark();
         let begun = dec
-            .begin_taken(&device, &message, Some(1))
+            .begin_taken(&device, &message, Some(1), false)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -5481,7 +5496,7 @@ mod tests {
         assert!(answer(&dec, &message, &posted, true));
         assert_eq!(posted.lock()[2..], [(SUB, 186, 116)]);
         let begun = dec
-            .begin_taken(&device, &message, Some(1))
+            .begin_taken(&device, &message, Some(1), false)
             .unwrap()
             .unwrap();
         assert_eq!(posted.lock().len(), 3, "still owed at its take");
@@ -5517,7 +5532,7 @@ mod tests {
         assert!(answer(&dec, &asking(191, 121), &posted, true));
         dec.shared.closed.forget_all();
         let begun = dec
-            .begin_taken(&device, &asking(191, 121), Some(1))
+            .begin_taken(&device, &asking(191, 121), Some(1), false)
             .unwrap()
             .unwrap();
         assert!(!let_go_of_answer(&dec), "taken off its queue");
@@ -5601,7 +5616,7 @@ mod tests {
                 .name("first".into())
                 .spawn_scoped(scope, || {
                     let device = p.device();
-                    let begun = first.begin_taken(&device, &asked, Some(1)).unwrap();
+                    let begun = first.begin_taken(&device, &asked, Some(1), false).unwrap();
                     first.finish_command_buffer(&device, &asked, begun.unwrap())
                 })
                 .unwrap();
@@ -5634,12 +5649,15 @@ mod tests {
             seen.lock().push((m.cb_obj_id, m.status));
         }));
         let first = command_buffer_message(193, 123, &render_ops());
-        let begun = dec.begin_taken(&device, &first, Some(1)).unwrap().unwrap();
+        let begun = dec
+            .begin_taken(&device, &first, Some(1), false)
+            .unwrap()
+            .unwrap();
         let mut later = dec.decoders().sender(None, dec.sinks.clone());
         assert!(answer(&later, &asking(194, 124), &posted, true));
         p.script().push("commandBuffer", Step::Nil);
         let refused = later
-            .begin_taken(&device, &asking(194, 124), Some(1))
+            .begin_taken(&device, &asking(194, 124), Some(1), false)
             .unwrap();
         assert!(matches!(refused, Err(DecodeError::Refused)));
         let stand_in = {
@@ -6042,13 +6060,19 @@ mod tests {
             let device = &device;
             let taken_first = scope.spawn(|| {
                 let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
-                let begun = second.begin_taken(device, &b, Some(2)).unwrap().unwrap();
+                let begun = second
+                    .begin_taken(device, &b, Some(2), false)
+                    .unwrap()
+                    .unwrap();
                 let done = second.finish_command_buffer(device, &b, begun).unwrap();
                 second.end_message();
                 done
             });
             std::thread::sleep(Duration::from_millis(50));
-            let begun = first.begin_taken(device, &a, Some(1)).unwrap().unwrap();
+            let begun = first
+                .begin_taken(device, &a, Some(1), false)
+                .unwrap()
+                .unwrap();
             std::thread::sleep(Duration::from_millis(100));
             assert_eq!(
                 first.finish_command_buffer(device, &a, begun).unwrap(),
@@ -7996,7 +8020,7 @@ mod tests {
         let late = command_buffer_message(101, 2, &render_ops());
         let mut taken = dec.sender(Some(0), super::super::Sinks::default());
         assert!(matches!(
-            taken.begin_taken(&device, &late, Some(1)).unwrap(),
+            taken.begin_taken(&device, &late, Some(1), false).unwrap(),
             Err(DecodeError::ContextClosed)
         ));
         taken.end_message();

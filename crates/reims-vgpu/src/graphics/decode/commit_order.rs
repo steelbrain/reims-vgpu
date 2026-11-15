@@ -347,7 +347,9 @@ mod tests {
             (std::thread::Builder::new().name(name.into()))
                 .spawn(move || {
                     let device = p.device();
-                    let begun = dec.begin_taken(&device, &message, Some(queue)).unwrap()?;
+                    let begun = dec
+                        .begin_taken(&device, &message, Some(queue), false)
+                        .unwrap()?;
                     dec.finish_command_buffer(&device, &message, begun).unwrap()
                 })
                 .unwrap()
@@ -422,7 +424,10 @@ mod tests {
         let device = r.p.device();
         let mut y = r.sender(A);
         let named = message(A, 5, &ops(&[], false));
-        let begun = y.begin_taken(&device, &named, Some(A)).unwrap().unwrap();
+        let begun = y
+            .begin_taken(&device, &named, Some(A), false)
+            .unwrap()
+            .unwrap();
         assert_eq!(r.state(A), (5, 0));
         until("its begin", || r.state(A2).0 == 3);
         std::thread::sleep(WATCH);
@@ -462,7 +467,7 @@ mod tests {
                     (namer, message(A2, 3, &ops(&[(A, 5)], false))),
                     (asker, message(A2, 4, &ops(&[], true))),
                 ] {
-                    let begun = dec.begin_taken(&device, &message, Some(A2)).unwrap();
+                    let begun = dec.begin_taken(&device, &message, Some(A2), false).unwrap();
                     to_lane.send((dec, message, begun)).unwrap();
                 }
             })
@@ -562,7 +567,7 @@ mod tests {
                 "short" => named.truncate(size_of::<RgfxMsgHeader>() + 4),
                 _ => r.p.script().push("commandBuffer", Step::Nil),
             }
-            let failed = y.begin_taken(&device, &named, Some(A)).unwrap();
+            let failed = y.begin_taken(&device, &named, Some(A), false).unwrap();
             let expected = if how == "refused" {
                 DecodeError::Refused
             } else {
@@ -587,7 +592,10 @@ mod tests {
             let device = r.p.device();
             let mut y = r.sender(A);
             let named = message(A, 5, &ops(&[], false));
-            let begun = y.begin_taken(&device, &named, Some(A)).unwrap().unwrap();
+            let begun = y
+                .begin_taken(&device, &named, Some(A), false)
+                .unwrap()
+                .unwrap();
             let x = r.carry_out("x", A2, 3, &ops(&[(A, 5)], false));
             std::thread::sleep(WATCH);
             assert!(
@@ -610,7 +618,10 @@ mod tests {
         let device = r.p.device();
         let mut y = r.sender(A);
         let named = message(A, 5, &ops(&[], false));
-        let begun = y.begin_taken(&device, &named, Some(A)).unwrap().unwrap();
+        let begun = y
+            .begin_taken(&device, &named, Some(A), false)
+            .unwrap()
+            .unwrap();
         let x = r.carry_out("x", A2, 3, &ops(&[(A, 5)], false));
         std::thread::sleep(WATCH);
         assert!(
