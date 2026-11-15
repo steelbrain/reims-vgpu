@@ -11,6 +11,7 @@ pub(crate) mod hevc;
 
 use std::sync::OnceLock;
 
+use crate::core::sync::Mutex;
 use crate::nvidia::cuda::Gpu;
 use crate::nvidia::dl::Library;
 use crate::nvidia::error::Error;
@@ -152,9 +153,41 @@ pub struct DecodeCapabilities {
     pub min_height: u32,
 }
 
-/// Asks NVDEC on `gpu` what it decodes of `codec` at `chroma` and
-/// `bit_depth`.
+/// What NVDEC answered each GPU, by its PCI address, for each codec, chroma
+/// format and bit depth asked ([`decode_capabilities`]).
+static CAPABILITIES: Mutex<Vec<(String, DecodeCapabilities)>> = Mutex::new(Vec::new());
+
+/// What NVDEC on `gpu` decodes of `codec` at `chroma` and `bit_depth`:
+/// asked once a GPU, codec, chroma format and bit depth, and the answer kept
+/// for the process; a query that failed is asked again where it is next
+/// needed. The graphics device's NVDEC arm asks as it opens, and each
+/// session's first decoder of a codec and bit depth asks again
+/// (`decoder::Decoder::new`), so the kept answer spares that session the
+/// query: `cuvidGetDecoderCaps` took 6-9 ms on an RTX 3090 (driver
+/// 620.70.06, CachyOS), and 15-19 ms beside two running decoders or a busy
+/// loop on each of 16 CPUs (**measured**, 2026-11-14, the session-start
+/// probe, `crate::probes`).
 pub fn decode_capabilities(
+    gpu: &Gpu,
+    codec: NvdecCodec,
+    chroma: ChromaFormat,
+    bit_depth: u32,
+) -> Result<DecodeCapabilities, Error> {
+    let on = &gpu.info().pci_bus_id;
+    let same = |(at, caps): &&(String, DecodeCapabilities)| {
+        at == on && (caps.codec, caps.chroma, caps.bit_depth) == (codec, chroma, bit_depth)
+    };
+    if let Some((_, caps)) = CAPABILITIES.lock().iter().find(same) {
+        return Ok(caps.clone());
+    }
+    let caps = ask_capabilities(gpu, codec, chroma, bit_depth)?;
+    CAPABILITIES.lock().push((on.clone(), caps.clone()));
+    Ok(caps)
+}
+
+/// NVDEC's answer on `gpu` for `codec` at `chroma` and `bit_depth`, asked
+/// now (`cuvidGetDecoderCaps`).
+fn ask_capabilities(
     gpu: &Gpu,
     codec: NvdecCodec,
     chroma: ChromaFormat,
@@ -189,4 +222,28 @@ pub fn decode_capabilities(
         min_width: caps.nMinWidth.into(),
         min_height: caps.nMinHeight.into(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChromaFormat, NvdecCodec, decode_capabilities};
+    use crate::nvidia::cuda::{Gpu, GpuSelector};
+    use crate::probes::timeline;
+
+    /// A GPU's capabilities are asked of NVDEC once a codec, chroma format and bit depth: the
+    /// second ask answers as the first did, and makes no `cuvidGetDecoderCaps`.
+    #[test]
+    #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
+    fn capabilities_are_asked_once_a_codec_chroma_format_and_bit_depth() {
+        let gpu = Gpu::open(&GpuSelector::First).expect("an NVIDIA GPU");
+        let ask = || decode_capabilities(&gpu, NvdecCodec::Hevc, ChromaFormat::Yuv420, 10);
+        let first = ask().expect("NVDEC's answer");
+        let (second, span) = timeline::record(ask);
+        assert_eq!(second.expect("the kept answer"), first);
+        let calls: Vec<&str> = span.steps.iter().map(|(call, _)| *call).collect();
+        assert!(
+            !calls.contains(&"cuvidGetDecoderCaps"),
+            "asked again: {calls:?}"
+        );
+    }
 }

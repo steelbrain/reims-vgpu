@@ -321,6 +321,9 @@ unmapped, freed or destroyed until it has.
   HEVC's current sets.
 - **On the NVIDIA host**, the ignored tests (`cargo nextest run -p
   reims-vgpu-video --run-ignored only -E 'test(/^nvidia::/)'`):
+  - `capabilities_are_asked_once_a_codec_chroma_format_and_bit_depth`
+    (`src/nvidia/nvdec.rs`): NVDEC's capabilities kept from the first ask,
+    which the device's arm makes as it opens, for its sessions' decoders;
   - `layouts_match_nvidia_headers` (`src/nvidia/layout.rs`): the binding against
     ffnvcodec-headers 13.1.15.0 in `/usr/include/ffnvcodec`, built with the
     host's C compiler ("The binding");

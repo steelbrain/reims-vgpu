@@ -21,8 +21,14 @@
 //! running decoders, where a guest's player makes a session for each clip
 //! and for each probe of a stream's format. A 4K HEVC decoder made alone
 //! takes 29-36 ms whether it has 1, 8 or 20 surfaces, so the cost is the
-//! session's, not its surfaces'. The capabilities are asked once per GPU,
-//! codec, chroma format and bit depth, and kept. A kept decoder keeps its
+//! session's, not its surfaces'. On an RTX 3090 (driver 620.70.06), a new
+//! decoder's `cuvidCreateDecoder` took 14 ms for 1080p H.264 and 20-26 ms
+//! for 4K H.264 and HEVC, 41-50 ms beside two running decoders or a busy
+//! loop on each of 16 CPUs, and a session's first decode on a kept decoder
+//! 0.05-0.26 ms, 2.0 ms at most beside them (**measured**, 2026-11-14, the
+//! session-start probe, `crate::probes`). The capabilities are asked once
+//! per GPU, codec, chroma format and bit depth, and kept
+//! (`super::decode_capabilities`). A kept decoder keeps its
 //! handle, its surfaces, its stream and its GPU's context, and nothing of
 //! its pictures:
 //! NVDEC's decoder holds no stream state between pictures (each
@@ -72,9 +78,7 @@ use crate::core::runtime::{Answer, Unanswered};
 use crate::core::sync::Mutex;
 
 use super::ffi::{self, CUvideodecoder, Zeroed};
-use super::{
-    ChromaFormat, DecodeCapabilities, Nvdec, NvdecCodec, SurfaceFormat, decode_capabilities,
-};
+use super::{ChromaFormat, Nvdec, NvdecCodec, SurfaceFormat, decode_capabilities};
 use crate::nvidia::cuda::ffi::{CU_MEMORYTYPE_DEVICE, CU_MEMORYTYPE_HOST, CUDA_MEMCPY2D, CUstream};
 use crate::nvidia::cuda::{Gpu, Pinned, Stream};
 use crate::nvidia::error::Error;
@@ -332,10 +336,6 @@ static KEPT: Mutex<Vec<Made>> = Mutex::new(Vec::new());
 /// 10-bit HEVC decoders of 9 surfaces (224 MiB each), or four at 8 bits.
 pub(crate) const KEPT_BYTES: u64 = 512 << 20;
 
-/// What NVDEC answered each GPU, by its PCI address, for each codec, chroma
-/// format and bit depth asked ([`capabilities`]).
-static CAPABILITIES: Mutex<Vec<(String, DecodeCapabilities)>> = Mutex::new(Vec::new());
-
 /// Decoders taken from the kept ones and made, process-wide, for the tests.
 #[cfg(test)]
 pub(crate) static TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -416,26 +416,6 @@ fn take_kept(gpu: &Gpu, spec: &DecoderSpec) -> Option<Made> {
     Some(kept.remove(at))
 }
 
-/// NVDEC's capabilities on `gpu` for `codec`, `chroma` and `bit_depth`, asked
-/// once and kept.
-fn capabilities(
-    gpu: &Arc<Gpu>,
-    codec: NvdecCodec,
-    chroma: ChromaFormat,
-    bit_depth: u32,
-) -> Result<DecodeCapabilities, Error> {
-    let on = &gpu.info().pci_bus_id;
-    let same = |(at, caps): &&(String, DecodeCapabilities)| {
-        at == on && (caps.codec, caps.chroma, caps.bit_depth) == (codec, chroma, bit_depth)
-    };
-    if let Some((_, caps)) = CAPABILITIES.lock().iter().find(same) {
-        return Ok(caps.clone());
-    }
-    let caps = decode_capabilities(gpu, codec, chroma, bit_depth)?;
-    CAPABILITIES.lock().push((on.clone(), caps.clone()));
-    Ok(caps)
-}
-
 /// An NVDEC decoder.
 pub(crate) struct Decoder {
     inner: Arc<Inner>,
@@ -452,7 +432,7 @@ impl Decoder {
             return Ok(Self::of(made));
         }
         let nvdec = Nvdec::get()?;
-        let caps = capabilities(&gpu, spec.codec, spec.chroma, spec.bit_depth)?;
+        let caps = decode_capabilities(&gpu, spec.codec, spec.chroma, spec.bit_depth)?;
         if !caps.supported {
             return Err(Error::Unsupported(format!(
                 "NVDEC does not decode {:?} at {:?}, {} bits",
