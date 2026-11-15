@@ -635,15 +635,15 @@ void checkWrittenModule()
 		ops.insert(ops.end(), extra.begin(), extra.end());
 		return w.node(ops);
 	};
-	// A chain of nine layouts, each a member of the next's type: the ninth past the depth the reader
-	// follows from an argument of the first, one deep from an argument of its own.
+	// A chain of kRgfxAirNesting + 1 layouts, each a member of the next's type: the last past the
+	// depth the reader follows from an argument of the first, one deep from an argument of its own.
 	uint64_t layout = w.node({w.i32(0), w.i32(4), w.i32(0), w.str("T"), w.str("m")});
-	const uint64_t ninth = layout;
-	for (int k = 0; k < 8; k++)
+	const uint64_t last = layout;
+	for (unsigned k = 0; k < kRgfxAirNesting; k++)
 		layout = w.node({w.str("air.struct_type_info"), layout, w.i32(0), w.i32(4), w.i32(0), w.str("T"), w.str("m")});
 	std::vector<uint64_t> deep = buffer(0, 1), shallow = buffer(0, 2);
 	deep.insert(deep.end(), {w.str("air.struct_type_info"), layout});
-	shallow.insert(shallow.end(), {w.str("air.struct_type_info"), ninth});
+	shallow.insert(shallow.end(), {w.str("air.struct_type_info"), last});
 	std::vector<uint64_t> underBad = {w.i32(1), w.str("air.function_constant"),
 	                                  w.node({w.global(1), w.str("uint"), w.str("kBad")}), w.str("air.buffer"),
 	                                  w.str("air.location_index"), w.i32(5), w.i32(1)};
@@ -715,7 +715,7 @@ void checkWrittenModule()
 		          shallowEntry.arguments[0].layout->size() == 1 &&
 		          (*shallowEntry.arguments[0].layout)[0].typeName == "T" &&
 		          (*shallowEntry.arguments[0].layout)[0].size == 4,
-		      "k_shallow: the ninth layout, read from its own node after k_deep did not read it");
+		      "k_shallow: the last layout, read from its own node after k_deep did not read it");
 		check(after.hasWorkGroupSize && after.workGroupSize[0] == 8 && after.workGroupSize[1] == 4 &&
 		          after.workGroupSize[2] == 1 && after.arguments.size() == 1 && after.arguments[0].predicated &&
 		          after.arguments[0].predicate == "kBad" && after.arguments[0].predicateGlobal == 1,
@@ -1744,6 +1744,19 @@ int main()
 			          nestedBuffer.layout->at(6).indirect->layout != nullptr,
 			      "k_nested: child, a pointer to an argument buffer of its own");
 		}
+		// A chain of seven argument buffers, each a pointer to the next, past 12 of the reader's
+		// levels: each layout is read, to the last's two members.
+		const RgfxAirEntry deepAb = entriesOf("k_deep_ab").entries.at(0);
+		std::shared_ptr<const std::vector<RgfxAirMember>> chain = deepAb.arguments.at(0).layout;
+		int links = 0;
+		while (chain != nullptr && !chain->empty() && chain->front().name == "next" &&
+		       chain->front().indirect != nullptr && chain->front().indirect->kind == "air.indirect_buffer") {
+			chain = chain->front().indirect->layout;
+			links++;
+		}
+		check(links == 6 && chain != nullptr && chain->size() == 2 && chain->at(0).name == "data" &&
+		          chain->at(1).name == "v",
+		      "k_deep_ab: six pointers to argument buffers, to the last's data and v");
 
 		// The specialisation of k_specialised by its constants' values (RgfxAirArguments.hpp):
 		// Metal's answers, measured on both x86 Macs (tools/pipeline_reflection_check's

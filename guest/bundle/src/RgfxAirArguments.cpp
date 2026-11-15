@@ -1356,7 +1356,7 @@ bool binding(const Module &m, const Module::Md &node, size_t from, RgfxAirArgume
 // writes: each member names its argument with `air.indirect_argument` and that argument's node.
 bool membersWriteTextures(const Module &m, const Module::Md &info, unsigned depth)
 {
-	if (depth > 8)
+	if (depth > kRgfxAirNesting)
 		return true;
 	for (size_t i = 0; i + 1 < info.ops.size(); i++) {
 		const std::string *s = mdString(m, info.ops[i]);
@@ -1987,7 +1987,7 @@ bool nodeKeys(const Module &m, uint64_t id, unsigned depth,
               std::map<uint64_t, std::shared_ptr<const std::vector<RgfxAirMember>>> &layouts, RgfxAirNode &out)
 {
 	const Module::Md *node = mdNode(m, id);
-	if (node == nullptr || depth > 8)
+	if (node == nullptr || depth > kRgfxAirNesting)
 		return false;
 	size_t i = 0;
 	int64_t position = 0;
@@ -2124,7 +2124,7 @@ bool readLayout(const Module &m, uint64_t id, unsigned depth,
                 std::shared_ptr<const std::vector<RgfxAirMember>> &out)
 {
 	const Module::Md *node = mdNode(m, id);
-	if (node == nullptr || depth > 8)
+	if (node == nullptr || depth > kRgfxAirNesting)
 		return false;
 	auto members = std::make_shared<std::vector<RgfxAirMember>>();
 	for (size_t i = 0; i < node->ops.size();) {

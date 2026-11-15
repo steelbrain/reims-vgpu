@@ -651,7 +651,7 @@ struct Maker {
 		out = 0;
 		for (const RgfxAirMember &m : layout) {
 			NSUInteger first = 0, each = 0;
-			if (m.hasFirstId && m.layout != nullptr && depth < 8) {
+			if (m.hasFirstId && m.layout != nullptr && depth < kRgfxAirNesting) {
 				if (!idsOf(*m.layout, depth + 1, each))
 					return false;
 				first = m.firstId;

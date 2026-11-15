@@ -18,6 +18,7 @@
 //                constants and textures, and a pointer to another argument buffer
 //   c_nested_more  an argument buffer of C arrays of samplers and of pointers to argument
 //                buffers, a struct of members holding one and a C array, and a C array of those
+//   c_deep_ab    a chain of seven argument buffers, each a pointer to the next
 //   c_tables     a visible function table, an intersection function table and acceleration
 //                structures of both kinds
 //   c_ab_tables  the same, as an argument buffer's members
@@ -415,7 +416,7 @@ int main(int argc, char **argv)
 		                {"k_builtins", "k_builtins"}, {"c_nested", "k_nested"},
 		                {"c_nested_more", "k_nested_more"}, {"c_tables", "k_tables"},
 		                {"c_ab_tables", "k_ab_tables"}, {"c_more_textures", "k_more_textures"},
-		                {"c_imageblock", "k_imageblock"}};
+		                {"c_imageblock", "k_imageblock"}, {"c_deep_ab", "k_deep_ab"}};
 		for (const auto &k : kKernels)
 			if (CASE(k.name))
 				computeCase(k.name, Fn{k.kernel, {}}, nil, false);

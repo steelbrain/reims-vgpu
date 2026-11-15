@@ -438,6 +438,46 @@ kernel void k_nested_more(device More &m [[buffer(0)]], device float *out [[buff
 	out[gid] = c.x + m.children[1]->data[gid] + m.deep.data[1][gid] + m.deeps[1].data[0][gid];
 }
 
+// A chain of seven argument buffers, each a pointer to the next: past 12 levels of the bundle's
+// AIR reader (a layout and a member's node each), the most macOS 27's frameworks take.
+struct Deep6 {
+	device float *data [[id(0)]];
+	float v [[id(1)]];
+};
+
+struct Deep5 {
+	device Deep6 *next [[id(0)]];
+};
+
+struct Deep4 {
+	device Deep5 *next [[id(0)]];
+};
+
+struct Deep3 {
+	device Deep4 *next [[id(0)]];
+};
+
+struct Deep2 {
+	device Deep3 *next [[id(0)]];
+};
+
+struct Deep1 {
+	device Deep2 *next [[id(0)]];
+	texture2d<float> t [[id(1)]];
+};
+
+struct Deep0 {
+	device Deep1 *next [[id(0)]];
+	Leaf leaf [[id(1)]];
+};
+
+kernel void k_deep_ab(device Deep0 &d [[buffer(0)]], device float *out [[buffer(1)]],
+                      uint gid [[thread_position_in_grid]])
+{
+	device Deep6 *last = d.next->next->next->next->next->next;
+	out[gid] = last->data[gid] + last->v + d.next->t.read(uint2(0)).x + d.leaf.t.sample(d.leaf.s, float2(0)).x;
+}
+
 [[visible]] float twice(float x)
 {
 	return 2 * x;

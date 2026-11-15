@@ -284,6 +284,15 @@ bool rgfxReadAirVisible(const uint8_t *bitcode, size_t size, std::vector<RgfxAir
 // A layout is a run of members, each `[air.struct_type_info !layout] offset size arrayLength
 // "type" "name"` and, in an argument buffer's, `air.indirect_argument` and the member's own node
 // (or its first id, for a struct of members), or `air.render_target` n, `air.raster_order_group` n.
+// The reader follows layouts and argument buffers' members to kRgfxAirNesting deep.
+
+// How deep the reader follows a node's layouts and argument buffers' members, each a level: past
+// it, a node does not read (and an argument buffer's members are taken as writing a texture). It
+// only bounds the reader's recursion: a layout that holds itself reads as none at any depth. Every
+// entry point of macOS 27's frameworks reads within 12 (measured: the M3 Max under macOS 27.0.1,
+// every system .metallib; the 39 past 8, VFX's vfx_rt_direct_lighting_reservoir and CoreUSDEdit's
+// evaluate among them, all read at 12).
+constexpr unsigned kRgfxAirNesting = 32;
 
 struct RgfxAirNode;
 

@@ -6849,6 +6849,20 @@ void test_pipeline_reflection_from_air()
 		CHECK(child.pointerType.elementIsArgumentBuffer && child.pointerType.dataSize == 16 &&
 		      child.pointerType.alignment == 8 && child.pointerType.elementStructType.members.count == 2);
 	}
+	// A chain of seven argument buffers, each a pointer to the next, deeper than macOS 27's
+	// frameworks nest them: each a pointer to an argument buffer of its own, to the last's members.
+	id deepAb = [ask(RgfxComputePipelineReflectionOf(fn(@"k_deep_ab"), nil, both), @"bindings") firstObject];
+	MTLStructType *link = [ask(deepAb, @"bufferStructType") isKindOfClass:[MTLStructType class]]
+	                          ? (MTLStructType *)ask(deepAb, @"bufferStructType")
+	                          : nil;
+	int links = 0;
+	while (link.members.count > 0 && [link.members[0].name isEqualToString:@"next"] &&
+	       link.members[0].dataType == MTLDataTypePointer && link.members[0].pointerType.elementIsArgumentBuffer) {
+		link = link.members[0].pointerType.elementStructType;
+		links++;
+	}
+	CHECK(links == 6 && link.members.count == 2 && [link.members[1].name isEqualToString:@"v"] &&
+	      link.members[1].argumentIndex == 1);
 	// Function tables and acceleration structures: bindings of their own types, read only (the
 	// intersection function table's AIR says read_write).
 	NSArray *tables = ask(RgfxComputePipelineReflectionOf(fn(@"k_tables"), nil, both), @"bindings");
