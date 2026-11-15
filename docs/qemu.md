@@ -1761,7 +1761,7 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/target/ambrosia.bin \
   verdict; the script's header says what each one reads. `firmware`:
   Ambrosia entered the kernel; where it stops the boot, its line, and QEMU
   is stopped at once. `console`: the module's early console. `ssh`: a login
-  within 90 s of QEMU's start under HVF, 300 s under TCG. `sip`, `boot-args`:
+  within 90 s of QEMU's start under HVF, 450 s under TCG. `sip`, `boot-args`:
   `csrutil status` enabled and `kern.bootargs` empty. `kexts`: `kmutil
   showloaded` lists the three identifiers. `windowserver-metal`: the lane
   gate's reading of it, the desktop's processes up, `bench -l` listing a
@@ -1982,8 +1982,12 @@ for QEMU's scope would raise it over the user's own work.
 - **RAM**: `--ram 18`. A boot with the device peaked at 11.8 GiB by `potluck
   why`, page cache included, and at 9.4 GiB of anonymous and shared memory,
   QEMU's own high-water mark 9.5 GiB.
-- **Time**: the script's limits are 300 s to SSH and 300 s more for the
-  desktop; a boot with the module's bundle alone took 5 min 20 s.
+- **Time**: the script's limits are 450 s to SSH and 300 s more for the
+  desktop; a boot with the module's bundle alone took 5 min 20 s. The SSH
+  login of macOS 26 on `homelab-um870-1`'s 780M comes at one of two times:
+  122-132 s (m3-max-32336, 32792) or 301-315 s (32613, 33045, and 33301,
+  which failed at the old 300 s limit with the desktop presenting), so the
+  limit sits well past the slow one.
 
 **Measured** on `homelab-um870-1` under TCG on 2026-11-08, with our QEMU at
 `bc378624` built there as above on the library of the same tree, Ambrosia

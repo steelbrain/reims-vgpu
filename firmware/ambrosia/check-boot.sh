@@ -40,7 +40,7 @@
 #              ...", "boot failed: ...", docs/running.md in Ambrosia), this fails with its line,
 #              QEMU is stopped, and the guest's checks fail as not run.
 #   console    Ambrosia logged the module's early console.
-#   ssh        the guest took an SSH login within 90 s of QEMU's start under HVF, 300 s under TCG.
+#   ssh        the guest took an SSH login within 90 s of QEMU's start under HVF, 450 s under TCG.
 #              Under TCG every command the checks run in the guest, each SSH login the boot waits
 #              on, and the wait for the desktop have 5 times their HVF limits.
 #              A check whose reading in the guest printed nothing (its command failed or ran
@@ -156,7 +156,7 @@ if ((tcg)); then
       die "the job holds several GPUs ($gpu), as an --exclusive job does: name one in MESA_VK_DEVICE_SELECT (vendor:device!)"
     export MESA_VK_DEVICE_SELECT="${gpu%%@*}!"
   fi
-  accel=(-accel tcg,thread=multi) limit=300 desktop_wait=300 slow=5
+  accel=(-accel tcg,thread=multi) limit=450 desktop_wait=300 slow=5
   machine=",memory-backend=ram,dump-guest-core=off"
   mem=(-m "$ram" -object "memory-backend-memfd,id=ram,size=$ram,share=on")
 else
