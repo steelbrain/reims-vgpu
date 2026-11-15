@@ -103,13 +103,16 @@ use std::time::Duration;
 
 use reims_vgpu_graphics::ops::blit::{
     RGFX_OP_BLIT_COPY_INDIRECT_COMMAND_BUFFER, RGFX_OP_BLIT_OPTIMIZE_INDIRECT_COMMAND_BUFFER,
-    RGFX_OP_BLIT_RESET_COMMANDS_IN_BUFFER,
+    RGFX_OP_BLIT_RESET_COMMANDS_IN_BUFFER, RGFX_OP_BLIT_UPDATE_FENCE, RGFX_OP_BLIT_WAIT_FOR_FENCE,
+};
+use reims_vgpu_graphics::ops::compute::{
+    RGFX_OP_COMPUTE_UPDATE_FENCE, RGFX_OP_COMPUTE_WAIT_FOR_FENCE,
 };
 use reims_vgpu_graphics::ops::render::{
     RGFX_OP_RENDER_DRAW_PRIMITIVES, RGFX_OP_RENDER_EXECUTE_COMMANDS_IN_BUFFER,
     RGFX_OP_RENDER_EXECUTE_COMMANDS_INDIRECT, RGFX_OP_RENDER_SET_VERTEX_BUFFER,
-    RGFX_OP_RENDER_USE_RESOURCES, RGFX_OP_RENDER_USE_RESOURCES_STAGES, RgfxOpDrawPrimitives,
-    RgfxOpSetVertexBuffer,
+    RGFX_OP_RENDER_UPDATE_FENCE, RGFX_OP_RENDER_USE_RESOURCES, RGFX_OP_RENDER_USE_RESOURCES_STAGES,
+    RGFX_OP_RENDER_WAIT_FOR_FENCE, RgfxOpDrawPrimitives, RgfxOpSetVertexBuffer,
 };
 use reims_vgpu_graphics::ops::{
     RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_COMPUTE_PASS_FLAG_DISPATCH_TYPE, RGFX_OP_BODY_OFFSET,
@@ -1866,9 +1869,25 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(ops) = read::<RgfxCommandBuffer>(message).and_then(|m| ops_of(message, &m)) else {
             return Ok(Err(DecodeError::Malformed));
         };
-        // cenc: queue, seqno, its op bytes: its walk's start, on the thread that walks it and
-        // commits it, whose `cbcommit`s up to its `cbwalked` are its parts'
-        reims_vgpu_vulkan::core::trace::event("cenc", &[queue_obj_id, seqno, ops.len().to_u64()]);
+        // cenc: queue, seqno, its op bytes, then its ops, encoders, dispatches, fence updates and
+        // fence waits ([`walk_counts`]): its walk's start, on the thread that walks it and commits
+        // it, whose `cbcommit`s up to its `cbwalked` are its parts'
+        if reims_vgpu_vulkan::core::trace::on() {
+            let [n, encoders, dispatches, updates, waits] = walk_counts(ops);
+            reims_vgpu_vulkan::core::trace::event(
+                "cenc",
+                &[
+                    queue_obj_id,
+                    seqno,
+                    ops.len().to_u64(),
+                    n,
+                    encoders,
+                    dispatches,
+                    updates,
+                    waits,
+                ],
+            );
+        }
         // A structural malformation in the stream stops the walk and is reported;
         // everything else faults the exec and propagates.
         let mut events = EventOps::default();
@@ -3746,6 +3765,33 @@ fn helper_chunks(chunks: &[Range<usize>]) -> Vec<bool> {
         }
     }
     helper
+}
+
+/// What the trace's `cenc` counts of a command buffer's op stream `ops`, read only while the
+/// trace is on: its ops, its encoders (their ends), its dispatches ([`compute::dispatches`]), and
+/// its fence updates and fence waits, of every encoder kind.
+fn walk_counts(mut ops: &[u8]) -> [u64; 5] {
+    let mut counts = [0u64; 5];
+    while let Some((tag, _, len)) = next_op(ops) {
+        counts[0] += 1;
+        match tag {
+            RGFX_OP_ENCODER_END => counts[1] += 1,
+            RGFX_OP_COMPUTE_UPDATE_FENCE
+            | RGFX_OP_RENDER_UPDATE_FENCE
+            | RGFX_OP_BLIT_UPDATE_FENCE => {
+                counts[3] += 1;
+            }
+            RGFX_OP_COMPUTE_WAIT_FOR_FENCE
+            | RGFX_OP_RENDER_WAIT_FOR_FENCE
+            | RGFX_OP_BLIT_WAIT_FOR_FENCE => counts[4] += 1,
+            tag if op_group(tag) == RGFX_OP_GROUP_COMPUTE && compute::dispatches(tag) => {
+                counts[2] += 1;
+            }
+            _ => {}
+        }
+        ops = &ops[len..];
+    }
+    counts
 }
 
 /// Calls `found` with each object id (not nil) the compute ops of the op stream `ops` name, read
@@ -7793,11 +7839,13 @@ mod tests {
         }
     }
 
-    /// With the trace on, a command buffer's begin's end, its walk's start (with its op bytes) and
-    /// its end after its commit are each an event of its queue and seqno, in that order, on the
-    /// thread that carries it out; a buffer whose walk faults has no end.
+    /// With the trace on, a command buffer's begin's end, its walk's start (with its op bytes and
+    /// the counts of its ops, encoders, dispatches and fence updates and waits) and its end after
+    /// its commit are each an event of its queue and seqno, in that order, on the thread that
+    /// carries it out; a buffer whose walk faults has no end.
     #[test]
     fn a_traced_buffer_marks_its_begin_walk_and_end() {
+        use reims_vgpu_graphics::ops::compute::RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS;
         use reims_vgpu_vulkan::core::trace;
         // nextest runs each test in a process of its own, whose trace file is this one
         let path = std::env::temp_dir().join(format!("rvg-cbtrace-{}.txt", std::process::id()));
@@ -7809,8 +7857,18 @@ mod tests {
         blit.extend(op(RGFX_OP_ENCODER_END, &[]));
         let message = command_buffer_message(310, 7, &blit);
         assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        // The walk faults at the unknown op: the ops after it are counted, never walked.
         let mut faults = op(RGFX_OP_ENCODER_BEGIN_RENDER, &begin_render_body());
         faults.extend(op(0x1fff, &[0u8; 8]));
+        for tag in [
+            RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS,
+            RGFX_OP_COMPUTE_UPDATE_FENCE,
+            RGFX_OP_BLIT_WAIT_FOR_FENCE,
+            RGFX_OP_RENDER_WAIT_FOR_FENCE,
+            RGFX_OP_ENCODER_END,
+        ] {
+            faults.extend(op(tag, &[0u8; 8]));
+        }
         let message = command_buffer_message(311, 8, &faults);
         assert!(dec.decode(&device, &message).is_err());
         trace::flush_before_death();
@@ -7830,12 +7888,12 @@ mod tests {
         let thread = events[0].0;
         assert!(events.iter().all(|(t, _)| *t == thread), "{events:?}");
         let rests: Vec<&str> = events.iter().map(|(_, rest)| *rest).collect();
-        let faulted = format!("cenc 1 8 {}", faults.len());
+        let faulted = format!("cenc 1 8 {} 7 1 1 1 2", faults.len());
         assert_eq!(
             rests,
             [
                 "cbbegun 1 7",
-                "cenc 1 7 16",
+                "cenc 1 7 16 2 1 0 0 0",
                 "cbwalked 1 7",
                 "cbbegun 1 8",
                 faulted.as_str()
