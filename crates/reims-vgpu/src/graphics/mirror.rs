@@ -299,12 +299,13 @@ impl<P: ApiPlatform> Mirror<P> {
             return None;
         };
         let copies = copies.and_then(|copies| {
-            let listing = (no_catch(library.new_function(OnFault::Die, LIST_FUNCTION)))
-                .and_then(|function| {
+            let listing = (no_catch(library.new_function(OnFault::Die, LIST_FUNCTION))).and_then(
+                |function| {
                     (device.new_compute_pipeline_state_for_function(Some(&function)))
                         .ok()
                         .flatten()
-                });
+                },
+            );
             if listing.is_none() {
                 log::warn!(
                     target: "reims_vgpu::graphics",
@@ -870,7 +871,11 @@ mod tests {
         mirror: &Arc<Mirror<FakePlatform>>,
         surface: &<FakePlatform as Platform>::Texture,
     ) -> std::thread::JoinHandle<Option<(u64, bool)>> {
-        let (platform, mirror, surface) = (Arc::clone(platform), Arc::clone(mirror), surface.clone_ref());
+        let (platform, mirror, surface) = (
+            Arc::clone(platform),
+            Arc::clone(mirror),
+            surface.clone_ref(),
+        );
         std::thread::spawn(move || {
             let synced = mirror.sync(&surface, 256, &|| platform.clock().now_mono())?;
             Some((synced.bytes_per_row, synced.completion.is_some()))
@@ -886,14 +891,22 @@ mod tests {
                 assert_eq!(committed.len(), count, "more command buffers than expected");
                 return committed;
             }
-            assert!(std::time::Instant::now() < deadline, "{committed:?} of {count}");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{committed:?} of {count}"
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
     }
 
     /// `id`, a command buffer, completed.
     fn complete(platform: &FakePlatform, id: ObjId) {
-        assert!(platform.world().complete(id, CommandBufferStatus::COMPLETED, None, CompleteOn::Thread));
+        assert!(platform.world().complete(
+            id,
+            CommandBufferStatus::COMPLETED,
+            None,
+            CompleteOn::Thread
+        ));
     }
 
     /// The buffers the last kernel among `calls` was handed.
@@ -913,7 +926,9 @@ mod tests {
         let buffer = (platform.world().find(list.unwrap()))
             .and_then(|b| b.cast::<kind::Buffer>())
             .unwrap();
-        let words: Vec<u32> = std::iter::once(tiles.len() as u32).chain(tiles.iter().copied()).collect();
+        let words: Vec<u32> = std::iter::once(tiles.len() as u32)
+            .chain(tiles.iter().copied())
+            .collect();
         assert!(buffer.length() >= 4 * words.len() as u64);
         // SAFETY: the fake buffer's contents, which no command buffer reads now.
         unsafe {
@@ -928,7 +943,13 @@ mod tests {
         (calls.iter())
             .filter(|c| c.sel == "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:")
             .map(|c| match c.args.as_slice() {
-                [Arg::Obj(from), Arg::U64(at), Arg::Obj(to), Arg::U64(there), Arg::U64(length)] => {
+                [
+                    Arg::Obj(from),
+                    Arg::U64(at),
+                    Arg::Obj(to),
+                    Arg::U64(there),
+                    Arg::U64(length),
+                ] => {
                     assert_eq!(at, there, "a copy to another place in the mirror");
                     (*from, *at, *to, *length)
                 }
@@ -968,7 +989,9 @@ mod tests {
         complete(&platform, compare);
         let copy = committed(&platform, 1)[0];
         let calls = log.since(mark);
-        let queued = (calls.iter()).find(|c| c.sel == "commandBuffer").expect("the copy's buffer");
+        let queued = (calls.iter())
+            .find(|c| c.sel == "commandBuffer")
+            .expect("the copy's buffer");
         assert_eq!(queued.obj, copy_queue, "the copy on the queue for copies");
         let rows: Vec<_> = (64..128).map(|y| (now, y * 1024, 512)).collect();
         let copied = copies(&calls);
@@ -992,7 +1015,10 @@ mod tests {
         let mark = log.mark();
         let second = sync_on_a_thread(&platform, &mirror, &surface);
         let running = committed(&platform, 2);
-        assert_eq!(running[0], reading, "the draw still runs as the compare is committed");
+        assert_eq!(
+            running[0], reading,
+            "the draw still runs as the compare is committed"
+        );
         let compare = running[1];
         let buffers = bound(&log.since(mark));
         assert_ne!(buffers[0], now, "the compare copies into the other frame");
@@ -1010,7 +1036,11 @@ mod tests {
         complete(&platform, reading);
         let copy = committed(&platform, 1)[0];
         let rows: Vec<_> = (0..64).map(|y| (now, y * 1024, mirrored, 256)).collect();
-        assert_eq!(copies(&log.since(mark)), rows, "tile 0, out of the frame just compared");
+        assert_eq!(
+            copies(&log.since(mark)),
+            rows,
+            "tile 0, out of the frame just compared"
+        );
         complete(&platform, copy);
         assert_eq!(second.join().unwrap(), Some((1024, false)));
         assert_eq!(mirror.last_sent(), 1);
@@ -1057,7 +1087,11 @@ mod tests {
             let sync = sync_on_a_thread(&platform, &mirror, &surface);
             if let Some(reader) = reader {
                 std::thread::sleep(Duration::from_millis(100));
-                assert_eq!(platform.world().committed(), [reader], "no sync while the draw runs");
+                assert_eq!(
+                    platform.world().committed(),
+                    [reader],
+                    "no sync while the draw runs"
+                );
                 complete(&platform, reader);
             }
             let made = committed(&platform, 1)[0];
@@ -1083,7 +1117,11 @@ mod tests {
             ];
             assert_eq!(sels, expected, "sync {at}");
             let buffers = bound(&calls);
-            assert_eq!(buffers.len(), 5, "now, sent, the mirror, the arguments and the count");
+            assert_eq!(
+                buffers.len(),
+                5,
+                "now, sent, the mirror, the arguments and the count"
+            );
             complete(&platform, made);
             assert_eq!(sync.join().unwrap(), Some((1024, false)));
         }

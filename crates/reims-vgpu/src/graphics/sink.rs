@@ -3126,7 +3126,10 @@ mod tests {
                     .mirror
                     .get_or_make(|| Mirror::with_copies(runtime.clone_ref(), queue))
                     .unwrap();
-                assert!(mirror.copies_on_their_queue(), "the list's kernel's pipeline");
+                assert!(
+                    mirror.copies_on_their_queue(),
+                    "the list's kernel's pipeline"
+                );
             }
             // Whether the runtime exports a command buffer's completion as a sync file here.
             let exports = {
