@@ -24,6 +24,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::core::runtime::{Runtime, StdRuntime};
 use crate::core::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+// Each OS's CPU-time clock and abort report (`unix.rs`, `windows.rs`).
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
+
+#[cfg(unix)]
+use unix as os;
+#[cfg(windows)]
+use windows as os;
+
 /// SplitMix64 (Steele, Lea and Flood, 2014): small, fast and seedable.
 #[derive(Clone, Debug)]
 pub struct Rng(u64);
@@ -348,54 +359,6 @@ fn over_the_limit(size: usize) -> ! {
     std::process::abort();
 }
 
-/// Names the input in hand on stderr as the process aborts, as it does
-/// after a thread overflows its stack (Rust's handler prints the thread
-/// and aborts) and past [`HARD_LIMIT`]: abort raises SIGABRT, whose
-/// handler this is, and ends the process once it returns.
-#[cfg(unix)]
-fn install_abort_report() {
-    unsafe extern "C" {
-        fn signal(signal: i32, handler: extern "C" fn(i32)) -> usize;
-    }
-    /// SIGABRT, 6 on Linux and on macOS.
-    const ABORT: i32 = 6;
-    // SAFETY: the handler touches only atomics and a buffer on its own
-    // stack, and writes it to stderr.
-    unsafe {
-        signal(ABORT, report_abort);
-    }
-}
-
-#[cfg(not(unix))]
-fn install_abort_report() {}
-
-/// SIGABRT's handler: the input in hand, written without allocating.
-#[cfg(unix)]
-extern "C" fn report_abort(_: i32) {
-    unsafe extern "C" {
-        fn write(fd: std::ffi::c_int, bytes: *const std::ffi::c_void, count: usize) -> isize;
-    }
-    let name = CASE_NAME.load(Ordering::SeqCst);
-    // SAFETY: null, or a name `run` leaked, which lives for ever.
-    let name = unsafe { name.as_ref() }.map_or(&b""[..], |name| name.as_bytes());
-    let mut line = [0u8; 300];
-    let mut cursor = std::io::Cursor::new(&mut line[..]);
-    let _ = cursor.write_all(b"fuzz ");
-    let _ = cursor.write_all(name);
-    let _ = writeln!(
-        cursor,
-        ": the process aborted in input {} of seed {:#x}; RVGV_FUZZ_SEED and \
-         RVGV_FUZZ_INDEX replay it",
-        CASE_INDEX.load(Ordering::SeqCst),
-        CASE_SEED.load(Ordering::SeqCst),
-    );
-    let end = usize::try_from(cursor.position()).unwrap_or(0);
-    // SAFETY: `end` bytes of `line` are initialised.
-    unsafe {
-        write(2, line.as_ptr().cast(), end);
-    }
-}
-
 fn thread_live() -> isize {
     THREAD_LIVE.try_with(Cell::get).unwrap_or(0)
 }
@@ -419,7 +382,7 @@ static PANIC_MESSAGE: Mutex<String> = Mutex::new(String::new());
 /// the other tests of a binary print theirs as before.
 fn install_panic_hook() {
     HOOK.call_once(|| {
-        install_abort_report();
+        os::install_abort_report();
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             PANICKED.store(true, Ordering::SeqCst);
@@ -452,21 +415,7 @@ impl Accounting {
     /// it stops while the host runs other work, so a host under load does
     /// not make an input slow.
     fn cpu_time(self) -> Duration {
-        let clock = match self {
-            Accounting::Thread => libc::CLOCK_THREAD_CPUTIME_ID,
-            Accounting::Process => libc::CLOCK_PROCESS_CPUTIME_ID,
-        };
-        let mut now = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: `now` is a timespec the call writes, and nothing else.
-        let read = unsafe { libc::clock_gettime(clock, &mut now) };
-        assert_eq!(read, 0, "clock_gettime({clock}) failed");
-        Duration::new(
-            u64::try_from(now.tv_sec).unwrap_or(0),
-            u32::try_from(now.tv_nsec).unwrap_or(0),
-        )
+        os::cpu_time(self)
     }
 }
 

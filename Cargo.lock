@@ -494,6 +494,7 @@ dependencies = [
  "parking_lot",
  "reims-vgpu-video-conformance",
  "thiserror",
+ "windows-sys",
 ]
 
 [[package]]

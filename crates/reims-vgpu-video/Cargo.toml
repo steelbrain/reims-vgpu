@@ -21,9 +21,15 @@ memchr.workspace = true
 [dev-dependencies]
 # The examples' stream readers and writers, and their frame hashes.
 reims-vgpu-video-conformance = { path = "conformance" }
+
 # The fuzzers' harness (`codec::fuzz_support`) bounds each input by its CPU time, which
-# `clock_gettime` reads.
+# `clock_gettime` reads on Linux and macOS (`fuzz_support/unix.rs`).
+[target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
+
+# On Windows, `GetThreadTimes` and `GetProcessTimes` read it (`fuzz_support/windows.rs`).
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 # The tests of VA-API's bounded waits hold the GPU with a compute shader of their own, on Vulkan
 # (`src/vaapi/va/spin.rs`).
