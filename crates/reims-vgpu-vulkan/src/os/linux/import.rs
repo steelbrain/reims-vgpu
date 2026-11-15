@@ -1041,6 +1041,7 @@ unsafe fn host_memory_noting(
     // The source's number in the trace's `dmabufsrc` (below): a diagnostic.
     static SOURCES: AtomicU64 = AtomicU64::new(0);
     let number = SOURCES.fetch_add(1, Ordering::Relaxed);
+    let kept: Mutex<Kept> = Mutex::new(Kept::default());
     let source: rt::DmaBufSource = Arc::new(move |request: rt::DmaBufRequest| {
         if let Some(asked) = &asked {
             asked.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1080,17 +1081,43 @@ unsafe fn host_memory_noting(
             }
         }
         let began = crate::core::trace::on().then(crate::core::trace::now);
-        let made = super::dma_buf::of_pages_counted(first, length, granule);
+        // A texture's own pages asked for again: the answer kept ([`Kept`]).
+        let again = match request.shared_files {
+            false => kept.lock().again(first, length, granule),
+            true => None,
+        };
+        let from_kept = again.is_some();
+        let made = match again {
+            Some(answer) => answer,
+            None => {
+                let made = super::dma_buf::of_pages_counted(first, length, granule);
+                if !request.shared_files {
+                    kept.lock().keep(first, length, granule, &made);
+                }
+                made.map_err(|refusal| refusal.to_string())
+            }
+        };
+        if !request.shared_files {
+            let answers = match from_kept {
+                true => &TEXTURE_ANSWERS_KEPT,
+                false => &TEXTURE_ANSWERS_MADE,
+            };
+            answers.fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(began) = began {
             // The trace's `dmabufsrc`: the source's number, the request's first byte, length and
             // granule, whether it takes shared files, the dma-bufs answered (0 where refused),
-            // the runs of file pages they hold, and the nanoseconds the answer took.
+            // the runs of file pages they hold, the nanoseconds the answer took, and whether it
+            // was an answer the source kept.
             let (chunks, runs) = made
                 .as_ref()
                 .map_or((0, 0), |(c, r)| (c.len().to_u64(), *r));
             let took = crate::core::trace::now().saturating_sub(began);
             let shared = u64::from(request.shared_files);
-            let event = [number, first, length, granule, shared, chunks, runs, took];
+            let again = u64::from(from_kept);
+            let event = [
+                number, first, length, granule, shared, chunks, runs, took, again,
+            ];
             crate::core::trace::event("dmabufsrc", &event);
         }
         match made {
@@ -1105,7 +1132,7 @@ unsafe fn host_memory_noting(
                 let line = format!("no dma-buf of its {length:#x} bytes at {first:#x}: {refusal}");
                 log::debug!("{line}");
                 REFUSAL.with_borrow_mut(|kept| *kept = Some(line));
-                Err(std::io::Error::other(refusal.to_string()))
+                Err(std::io::Error::other(refusal))
             }
         }
     });
@@ -1121,6 +1148,151 @@ unsafe fn host_memory_noting(
     // the object lies in its chunk; where it lists its imports in every submission, in a chunk a
     // copy imported, and else in an import of its own, as with no runs.
     memory.with_runs(Arc::clone(&RUNS))
+}
+
+/// How many requests of a texture's own pages the import sources answered with dma-bufs made for
+/// them or refusals of them, and how many with an answer kept ([`Kept`]): diagnostics, which the
+/// tests read.
+static TEXTURE_ANSWERS_MADE: AtomicU64 = AtomicU64::new(0);
+static TEXTURE_ANSWERS_KEPT: AtomicU64 = AtomicU64::new(0);
+
+/// How many answers to requests of a texture's own pages a source keeps ([`Kept`]): of the 4,500
+/// such requests of a guest's boot to its desktop and Geekbench 7.1.0's compute passes, warm and
+/// timed (the walk measured in [`Kept`]'s docs), the latest four answers each source gave would
+/// have answered 3,100, the latest one 2,812 and the latest eight 3,192.
+const KEPT_ANSWERS: usize = 4;
+
+/// What a source answered to requests of a texture's own pages ([`host_memory`]), kept to answer
+/// the same request again, as a texture made again over the same bytes of its buffer asks for the
+/// same pages at the same granule. **Measured** 2026-11-15 on a Radeon 780M, Geekbench 7.1.0's
+/// compute pass: of its 1,368 such requests, 1,244 asked again for pages a source was asked for
+/// before, and 782 of the 800 refused for the pages the source last refused. The 606 textures
+/// it made over buffers took 1,006 of them, each made anew (the backing table walked for the
+/// pages' runs, a dma-buf made of them or refused), which took 73% of those textures' making.
+///
+/// - **Dma-bufs made.** Each answer again is a duplicate of each dma-buf's descriptor, in an
+///   `Arc` of its own, so the runtime is its `Arc`'s only holder, as a texture's request asks
+///   (`rt::DmaBufRequest::shared_files`), and imports it for that texture's image alone: Vulkan
+///   imports one dma-buf as many times as it is asked (a payload, `VK_KHR_external_memory_fd`),
+///   and each import shows the same pages. They are the pages a new dma-buf would hold: the source
+///   lives while the runtime keeps an import or an image made through it, and while it does the
+///   import's pages stay mapped as they were (an unmap waits for the import's free,
+///   `crate::remap`'s `UnmapHold`; no call of this platform rebinds a buffer or heap; a fold maps
+///   the same file pages through dma-bufs), so the backing table resolves them to the same file
+///   pages, which udmabuf pins (`super::dma_buf`'s module docs).
+/// - **Refusals for udmabuf's limits** ([`super::dma_buf::Refusal::Limit`]), with the limits they
+///   were refused at: the same pages are as many runs, so they are refused again while the limits
+///   are the same, which are the host's within a second (`super::dma_buf`'s `limits`). Other
+///   refusals are not kept: they are asked again.
+///
+/// The latest [`KEPT_ANSWERS`] are kept. Each holds a descriptor of each of its dma-bufs, and pins
+/// pages the buffer's own import holds, until the source goes with the last import made through
+/// it.
+#[derive(Default)]
+struct Kept {
+    /// The answers, the latest last.
+    answers: Vec<KeptAnswer>,
+}
+
+/// An answer [`Kept`]: the request's first byte, length and granule, and what it was answered.
+struct KeptAnswer {
+    first: u64,
+    length: u64,
+    granule: u64,
+    answer: Answer,
+}
+
+/// What a request [`Kept`] was answered.
+enum Answer {
+    /// Dma-bufs: a descriptor of each and its bytes, and the runs of file pages they hold (the
+    /// trace's `dmabufsrc`).
+    Made {
+        files: Vec<(std::os::fd::OwnedFd, u64)>,
+        runs: u64,
+    },
+    /// A refusal for udmabuf's limits, as they were then, and the refusal's text.
+    Refused {
+        limits: super::dma_buf::Limits,
+        refusal: String,
+    },
+}
+
+/// A source's answer: dma-bufs and the runs of file pages they hold, or a refusal's text.
+type SourceAnswer = Result<(Vec<rt::DmaBufChunk>, u64), String>;
+
+impl Kept {
+    /// The answer kept for the request of `length` bytes from `first` at `granule`, again: each
+    /// dma-buf a new descriptor of it, or the refusal, where udmabuf's limits are those it was
+    /// refused at. `None` where none is kept, the limits changed, or a descriptor is not
+    /// duplicated, as the process's descriptors ran out: the request is answered anew then.
+    fn again(&mut self, first: u64, length: u64, granule: u64) -> Option<SourceAnswer> {
+        let at = (self.answers.iter())
+            .position(|a| (a.first, a.length, a.granule) == (first, length, granule))?;
+        let answer = match &self.answers[at].answer {
+            Answer::Made { files, runs } => {
+                let chunks = (files.iter())
+                    .map(|(file, length)| {
+                        Some(rt::DmaBufChunk {
+                            file: Arc::new(file.try_clone().ok()?),
+                            offset: 0,
+                            length: *length,
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Ok((chunks, *runs))
+            }
+            Answer::Refused { limits, refusal } => {
+                if *limits != super::dma_buf::limits() {
+                    return None;
+                }
+                Err(refusal.clone())
+            }
+        };
+        let latest = self.answers.remove(at);
+        self.answers.push(latest);
+        Some(answer)
+    }
+
+    /// Keeps `made`, the answer to the request of `length` bytes from `first` at `granule`, as
+    /// the latest, in place of an earlier answer to it: dma-bufs, each a dma-buf of its own at
+    /// offset 0 as a texture's request takes them, where each descriptor is duplicated, and a
+    /// refusal for udmabuf's limits. The oldest past [`KEPT_ANSWERS`] goes.
+    fn keep(
+        &mut self,
+        first: u64,
+        length: u64,
+        granule: u64,
+        made: &Result<(Vec<rt::DmaBufChunk>, u64), super::dma_buf::Refusal>,
+    ) {
+        let answer = match made {
+            Ok((chunks, runs)) => {
+                let files = (chunks.iter())
+                    .map(|chunk| Some((chunk.file.try_clone().ok()?, chunk.length)))
+                    .collect::<Option<Vec<_>>>();
+                files.map(|files| Answer::Made { files, runs: *runs })
+            }
+            Err(refusal @ super::dma_buf::Refusal::Limit { limits, .. }) => Some(Answer::Refused {
+                limits: *limits,
+                refusal: refusal.to_string(),
+            }),
+            Err(_) => None,
+        };
+        let asked = (first, length, granule);
+        self.answers
+            .retain(|a| (a.first, a.length, a.granule) != asked);
+        let Some(answer) = answer else {
+            return;
+        };
+        if self.answers.len() == KEPT_ANSWERS {
+            self.answers.remove(0);
+        }
+        self.answers.push(KeptAnswer {
+            first,
+            length,
+            granule,
+            answer,
+        });
+    }
 }
 
 thread_local! {
@@ -1909,6 +2081,266 @@ mod tests {
             assert!(vm.deallocate(view, n * PAGE).is_success());
             assert!(vm.deallocate(src, n * PAGE).is_success());
         }
+    }
+
+    /// A source keeps its latest four answers to requests of a texture's pages ([`Kept`]): dma-bufs
+    /// made are answered again as new descriptors of the same files, each in an `Arc` of its own at
+    /// offset 0; a refusal for udmabuf's limits is answered again while the limits are those it
+    /// was refused at, and not at others; another refusal is not kept, and takes the place of the
+    /// answer kept for its request; past four, the answer asked for longest ago goes. It needs no
+    /// GPU
+    #[test]
+    fn a_source_keeps_its_latest_four_answers() {
+        use super::super::dma_buf::{Limits, Refusal};
+        type Made = Result<(Vec<rt::DmaBufChunk>, u64), Refusal>;
+        let made = |pages: u64| -> Made {
+            let chunk = rt::DmaBufChunk {
+                file: vm::memfd(pages * PAGE).unwrap(),
+                offset: 0,
+                length: pages * PAGE,
+            };
+            Ok((vec![chunk], pages))
+        };
+        let inode = |fd: &std::os::fd::OwnedFd| {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: a query of an open descriptor; `fstat` writes the structure.
+            assert_eq!(
+                unsafe { libc::fstat(std::os::fd::AsRawFd::as_raw_fd(fd), stat.as_mut_ptr()) },
+                0
+            );
+            // SAFETY: the call succeeded, so it wrote the structure.
+            unsafe { stat.assume_init() }.st_ino
+        };
+        let limits = super::super::dma_buf::limits();
+        let refused = |limits: Limits| -> Made {
+            Err(Refusal::Limit {
+                pieces: 2000,
+                bytes: 0x7d_0000,
+                granule: 0x7d_0000,
+                limits,
+            })
+        };
+        let mut kept = Kept::default();
+        let a = made(2);
+        let file = inode(&a.as_ref().unwrap().0[0].file);
+        kept.keep(0x1000, 2 * PAGE, 2 * PAGE, &a);
+        drop(a);
+        let (chunks, runs) = kept.again(0x1000, 2 * PAGE, 2 * PAGE).unwrap().unwrap();
+        assert_eq!(
+            (chunks.len(), chunks[0].offset, chunks[0].length, runs),
+            (1, 0, 2 * PAGE, 2)
+        );
+        assert_eq!(Arc::strong_count(&chunks[0].file), 1, "an Arc of its own");
+        assert_eq!(
+            inode(&chunks[0].file),
+            file,
+            "a descriptor of the same file"
+        );
+        assert!(
+            kept.again(0x1000, 2 * PAGE, PAGE).is_none(),
+            "another granule"
+        );
+        assert!(kept.again(0x1000, PAGE, PAGE).is_none(), "another length");
+        // Refused for the limits now, and for others.
+        kept.keep(0x2000, 0x7d_0000, 0x7d_0000, &refused(limits));
+        let refusal = kept
+            .again(0x2000, 0x7d_0000, 0x7d_0000)
+            .unwrap()
+            .unwrap_err();
+        assert!(refusal.contains("2000 pieces"), "{refusal}");
+        let other = Limits {
+            pieces: limits.pieces + 1,
+            ..limits
+        };
+        kept.keep(0x3000, 0x7d_0000, 0x7d_0000, &refused(other));
+        assert!(kept.again(0x3000, 0x7d_0000, 0x7d_0000).is_none());
+        // Another refusal: none kept for the request.
+        kept.keep(0x1000, 2 * PAGE, 2 * PAGE, &Err(Refusal::Unresolved));
+        assert!(kept.again(0x1000, 2 * PAGE, 2 * PAGE).is_none());
+        // Kept: 0x2000, 0x3000, then 0x4000 and 0x5000; 0x2000 asked again is the latest.
+        kept.keep(0x4000, PAGE, PAGE, &made(1));
+        kept.keep(0x5000, PAGE, PAGE, &made(1));
+        assert!(kept.again(0x2000, 0x7d_0000, 0x7d_0000).is_some());
+        // 0x3000 and 0x4000 go, the longest ago asked for.
+        kept.keep(0x6000, PAGE, PAGE, &made(1));
+        kept.keep(0x7000, PAGE, PAGE, &made(1));
+        assert!(kept.again(0x4000, PAGE, PAGE).is_none(), "gone");
+        for first in [0x5000, 0x6000, 0x7000] {
+            assert!(kept.again(first, PAGE, PAGE).is_some(), "{first:#x} kept");
+        }
+        assert!(
+            kept.again(0x2000, 0x7d_0000, 0x7d_0000).is_some(),
+            "0x2000 kept"
+        );
+    }
+
+    /// Where the device makes a texture over a no-copy buffer's pages through a dma-buf of those
+    /// pages (RADV's in-place image), a texture made again over the same bytes of the buffer is
+    /// answered with an answer the source kept, a new descriptor of the same dma-buf ([`Kept`]),
+    /// one over other bytes with a dma-buf made for it, and one over the first bytes after that
+    /// with the first answer, still kept: each reads the pages as the CPU wrote them through the
+    /// view, and a blit into the second shows in the pages and through the first. Elsewhere, said
+    /// on stderr, nothing is checked
+    #[test]
+    fn a_texture_made_again_over_the_same_bytes_takes_the_kept_dma_buf() {
+        use crate::core::platform::Platform as _;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::platform::resource::Buffer as _;
+        use crate::core::platform::types::{MtlOrigin, MtlSize};
+        use crate::core::platform::values::TextureDesc;
+        use crate::core::raise::OnFault;
+        use crate::gpu::resource::{VulkanBuffer, VulkanTexture};
+
+        // 64 x 64 RGBA8 texels, rows of 256 bytes: four pages a texture, at the buffer's start and
+        // 64 KiB in, past what a driver may round a linear image's memory up to.
+        const WIDTH: u64 = 64;
+        const ROW: u64 = WIDTH * 4;
+        const BYTES: u64 = 4 * PAGE;
+        const OTHER: u64 = 16 * PAGE;
+        const PAGES: u64 = 32;
+        let d = crate::gpu::device::tests::dev();
+        crate::gpu::device::tests::settle_device_checks(&d);
+        probes_gone();
+        let vm = LinuxVm::new();
+        // A view of scattered pages: a run of file pages each.
+        let (src, view) = backwards(&vm, PAGES);
+        let first = view.addr().to_u64();
+        let laid = |i: u64| (i.wrapping_mul(7) ^ (i >> 8)) as u8;
+        for i in 0..PAGES * PAGE {
+            write(first + i, laid(i));
+        }
+        let (buffer, gone) = no_copy(&d, view, PAGES);
+        let desc = crate::platform::tests::platform().texture_descriptor(&TextureDesc {
+            texture_type: 2,
+            pixel_format: 70,
+            width: WIDTH,
+            height: BYTES / ROW,
+            usage: 0x1,
+            resource_options: Some(0),
+            ..TextureDesc::default()
+        });
+        let over = |offset| {
+            (buffer.new_texture(OnFault::Die, &desc, offset, ROW))
+                .unwrap()
+                .unwrap()
+        };
+        let answers = || {
+            (
+                TEXTURE_ANSWERS_MADE.load(Ordering::Relaxed),
+                TEXTURE_ANSWERS_KEPT.load(Ordering::Relaxed),
+            )
+        };
+        let (made, kept) = answers();
+        let t1 = over(0);
+        if answers() == (made, kept) {
+            eprintln!(
+                "skipped: {} makes no texture over a no-copy buffer's pages through a dma-buf of \
+                 them",
+                d.raw.properties().name
+            );
+            return;
+        }
+        assert_eq!(answers(), (made + 1, kept), "the first made for it");
+        let t2 = over(0);
+        assert_eq!(
+            answers(),
+            (made + 1, kept + 1),
+            "the same bytes: the kept answer"
+        );
+        let t3 = over(OTHER);
+        assert_eq!(answers(), (made + 2, kept + 1), "other bytes: made for it");
+        let t4 = over(0);
+        assert_eq!(
+            answers(),
+            (made + 2, kept + 2),
+            "the first bytes again: still kept"
+        );
+
+        let q = d.new_command_queue().unwrap();
+        let run = |encode: &dyn Fn(&crate::gpu::command::VulkanCommandBuffer)| {
+            let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+            encode(&cb);
+            cb.commit(OnFault::Die).unwrap();
+            cb.wait_until_completed(OnFault::Die).unwrap();
+            assert!(cb.error().is_none(), "{:?}", cb.error());
+        };
+        let whole = MtlSize::new(WIDTH, BYTES / ROW, 1);
+        let shared = || {
+            d.new_buffer_of_length(OnFault::Die, BYTES, 0)
+                .unwrap()
+                .unwrap()
+        };
+        let bytes_of = |s: &VulkanBuffer| -> Vec<u8> {
+            // SAFETY: a Shared buffer of `BYTES` bytes, read after its work completed.
+            unsafe { std::slice::from_raw_parts(s.contents().as_ptr::<u8>(), BYTES.to_usize()) }
+                .to_vec()
+        };
+        // A blit out of the texture into a buffer.
+        let read_out = |t: &VulkanTexture| -> Vec<u8> {
+            let out = shared();
+            run(&|cb| {
+                let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+                let copy = BlitCmd::CopyTextureToBuffer {
+                    source_texture: t,
+                    source_slice: 0,
+                    source_level: 0,
+                    source_origin: MtlOrigin::new(0, 0, 0),
+                    source_size: whole,
+                    destination_buffer: &out,
+                    destination_offset: 0,
+                    destination_bytes_per_row: ROW,
+                    destination_bytes_per_image: BYTES,
+                };
+                e.encode(OnFault::Die, copy).unwrap();
+                e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+            });
+            bytes_of(&out)
+        };
+        let pages =
+            |from: u64| -> Vec<u8> { (from..from + BYTES).map(|i| read(first + i)).collect() };
+        let expect = |from: u64| -> Vec<u8> { (from..from + BYTES).map(laid).collect() };
+        assert_eq!(read_out(&t1), expect(0), "the first texture's texels");
+        assert_eq!(read_out(&t2), expect(0), "the kept answer's texels");
+        assert_eq!(read_out(&t3), expect(OTHER), "the other bytes' texels");
+        assert_eq!(read_out(&t4), expect(0), "the first bytes' texels again");
+
+        // A blit into the second texture reaches the pages, and the first reads it.
+        let written: Vec<u8> = (0..BYTES).map(|i| (i as u8) ^ 0xa5).collect();
+        let source = shared();
+        // SAFETY: a Shared buffer of `BYTES` bytes, which no command uses yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                written.as_ptr(),
+                source.contents().as_ptr::<u8>(),
+                written.len(),
+            );
+        }
+        run(&|cb| {
+            let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+            let copy = BlitCmd::CopyBufferToTexture {
+                source_buffer: &source,
+                source_offset: 0,
+                source_bytes_per_row: ROW,
+                source_bytes_per_image: BYTES,
+                source_size: whole,
+                destination_texture: &t2,
+                destination_slice: 0,
+                destination_level: 0,
+                destination_origin: MtlOrigin::new(0, 0, 0),
+            };
+            e.encode(OnFault::Die, copy).unwrap();
+            e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+        });
+        assert_eq!(pages(0), written, "the blit's bytes in the pages");
+        assert_eq!(read_out(&t1), written, "the first texture reads them");
+        assert_eq!(pages(OTHER), expect(OTHER), "the other bytes as they were");
+
+        drop((t1, t2, t3, t4));
+        released(buffer, &gone, first, first + PAGES * PAGE);
+        assert!(vm.deallocate(view, PAGES * PAGE).is_success());
+        assert!(vm.deallocate(src, PAGES * PAGE).is_success());
     }
 
     /// Where views are imported through their dma-bufs and udmabuf opens (RADV's), no-copy
