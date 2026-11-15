@@ -10,6 +10,10 @@
 //! threads of their own, and a test returns while they still may. With no gate the test's
 //! process then exits beside them: the driver's exit-time destructors, which `vaInitialize`
 //! registered, run while a thread is still in the driver.
+//!
+//! The NVIDIA arm's tests run on it too (`crate::nvidia::wait`'s runtime in a test), for its
+//! call threads and kept work, which call NVDEC, NVENC and CUDA so: the gate is the process's
+//! one, whichever arm's driver loads.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;

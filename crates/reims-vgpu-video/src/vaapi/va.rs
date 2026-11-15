@@ -19,7 +19,7 @@ mod fence;
 mod ffi;
 mod frame;
 #[cfg(test)]
-mod gated;
+pub(crate) mod gated;
 mod h264;
 mod hevc;
 mod host_memory;

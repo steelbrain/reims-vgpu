@@ -38,6 +38,7 @@ use crate::nvidia::{
     AnnexBCodec, AnnexBDecoder, AnnexBPicture, ChromaFormat, Gpu, GpuSelector, NvdecCodec,
     decode_capabilities,
 };
+use crate::vaapi::gated::GatedRuntime;
 use crate::vaapi::{Display, Frame, H264Decoder, HevcDecoder};
 
 /// A stream the probes decode.
@@ -223,7 +224,7 @@ fn va_picture(
 pub(crate) fn va() {
     let asked = Asked::of_env();
     let node = std::env::var("RVG_VAAPI_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
-    let (display, open) = timed(|| Display::open(&node, StdRuntime::shared()));
+    let (display, open) = timed(|| Display::open(&node, Arc::new(GatedRuntime)));
     let display = display.expect("a VA display");
     println!(
         "VA-API at {node}: {}, opened in {} ms",
@@ -326,7 +327,7 @@ pub(crate) fn nvdec() {
     let selector = GpuSelector::parse(&std::env::var("RVG_NVIDIA_GPU").unwrap_or_default());
     let (gpu, open) = timed(|| Gpu::open(&selector));
     let gpu = Arc::new(gpu.expect("an NVIDIA GPU"));
-    let runtime: Arc<dyn Runtime> = StdRuntime::shared();
+    let runtime: Arc<dyn Runtime> = Arc::new(GatedRuntime);
     // The capabilities the graphics device's NVDEC arm asks as it opens (reims-vgpu's
     // `graphics/nvidia.rs`, `supported`), which load NVDEC's library.
     let ((), caps_took) = timed(|| {

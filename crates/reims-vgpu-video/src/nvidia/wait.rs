@@ -35,14 +35,30 @@ use std::time::Duration;
 
 pub(crate) use crate::core::device_wait::Unfinished;
 use crate::core::device_wait::{self, DEVICE_WAIT, Lingering};
-use crate::core::runtime::{
-    Answer, Bell, MonoTime, Runtime, StdRuntime, Unanswered, answer, park_for_good,
-};
+#[cfg(not(test))]
+use crate::core::runtime::StdRuntime;
+use crate::core::runtime::{Answer, Bell, MonoTime, Runtime, Unanswered, answer, park_for_good};
 use crate::core::sync::Mutex;
 
 /// The runtime the crate's waits run on: the first the backend was opened
-/// with, else std's.
+/// with, else [`fallback`]'s.
 static RUNTIME: OnceLock<Arc<dyn Runtime>> = OnceLock::new();
+
+/// The runtime where no backend's opening made one: std's.
+#[cfg(not(test))]
+fn fallback() -> Arc<dyn Runtime> {
+    StdRuntime::shared()
+}
+
+/// A test's runtime where it made none: the tests' gated one (`crate::vaapi::gated`), whose
+/// gate closes as the process exits, before the exit-time destructors NVIDIA's libraries
+/// registered as they loaded, as the host's does. Without it a call thread, or the sweep of work
+/// kept past its deadline, called the driver beside them as a test's process exited, the class
+/// of the exit abort the VA-API tests met on iHD (b52eea52f).
+#[cfg(test)]
+fn fallback() -> Arc<dyn Runtime> {
+    Arc::new(crate::vaapi::gated::GatedRuntime)
+}
 
 /// Makes `runtime` the one the crate's waits run on, where none was made
 /// yet: the backend's opening calls it.
@@ -55,8 +71,12 @@ pub(crate) fn use_runtime(runtime: &Arc<dyn Runtime>) {
 /// Registers the runtime's exit gate's handler again ([`Runtime::arm_exit`]), after a driver's
 /// library loaded or initialised (`super::dl::Library::open`, `cuInit`), so that it runs before
 /// what the library registered for the process's exit; nothing before the backend's opening
-/// made the runtime, which arms it then ([`use_runtime`]).
+/// made the runtime, which arms it then ([`use_runtime`]). In a test the first library's load
+/// makes it where the test handed none before: the gated [`fallback`].
 pub(crate) fn arm_exit() {
+    #[cfg(test)]
+    runtime().arm_exit();
+    #[cfg(not(test))]
     if let Some(runtime) = RUNTIME.get() {
         runtime.arm_exit();
     }
@@ -64,7 +84,7 @@ pub(crate) fn arm_exit() {
 
 /// The runtime the crate's waits run on.
 pub(crate) fn runtime() -> &'static Arc<dyn Runtime> {
-    RUNTIME.get_or_init(StdRuntime::shared)
+    RUNTIME.get_or_init(fallback)
 }
 
 /// How long a frame's work is waited for: [`DEVICE_WAIT`], or what a test
@@ -356,6 +376,55 @@ pub(crate) mod tests {
         release.send(()).expect("the call waits");
         assert!(within_5_s(|| shared.strong_count() == 0));
         assert!(returned(&answer));
+    }
+
+    /// The child's role in
+    /// [`a_tests_waits_run_on_a_runtime_whose_gate_closes_before_the_drivers_exit`].
+    const GATE_CHILD: &str = "RVG_TEST_NVIDIA_GATE_CHILD";
+
+    /// An exit handler registered before the crate's, as a driver's library registers its
+    /// exit-time destructors as it loads, so that it runs after the gate's: ends the process
+    /// with 0 where a step of the crate's is refused by then, 3 where one is still given.
+    extern "C" fn as_a_drivers_destructor() {
+        let code = if runtime().exit_step().is_none() {
+            0
+        } else {
+            3
+        };
+        // SAFETY: ends the process at once, which is the point.
+        unsafe { libc::_exit(code) };
+    }
+
+    /// The NVIDIA arm's tests run on a runtime with an exit gate, as the host's does: once a
+    /// driver's library loads (`arm_exit`, which `Library::open` and `cuInit` call), the gate's
+    /// hook is registered after what the library registered, so as the process exits the gate
+    /// closes first, and a call thread or the sweep of kept work parks rather than calling the
+    /// driver beside its exit-time destructors (the VA-API tests' iHD abort, b52eea52f). On
+    /// std's runtime, which tests ran on before, no gate closed. Run in a child process of its
+    /// own, which exits.
+    #[test]
+    fn a_tests_waits_run_on_a_runtime_whose_gate_closes_before_the_drivers_exit() {
+        if std::env::var_os(GATE_CHILD).is_some() {
+            // SAFETY: a plain function that never unwinds.
+            assert_eq!(unsafe { libc::atexit(as_a_drivers_destructor) }, 0);
+            arm_exit();
+            assert!(
+                runtime().exit_step().is_some(),
+                "a step refused before the exit"
+            );
+            std::process::exit(0);
+        }
+        let name = "nvidia::wait::tests::\
+                    a_tests_waits_run_on_a_runtime_whose_gate_closes_before_the_drivers_exit";
+        let status = std::process::Command::new(std::env::current_exe().expect("the test"))
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(GATE_CHILD, "1")
+            .status()
+            .expect("a child");
+        assert!(
+            status.success(),
+            "a step was given past the process's exit (3): {status:?}"
+        );
     }
 
     /// A shared deadline is the wait from the first time any of its clones

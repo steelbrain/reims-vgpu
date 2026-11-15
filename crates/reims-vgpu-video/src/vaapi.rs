@@ -24,6 +24,10 @@ pub use va::{
 #[cfg(test)]
 pub(crate) use va::target_probe;
 
+/// The tests' runtime with an exit gate, which the NVIDIA arm's tests run on too.
+#[cfg(test)]
+pub(crate) use va::gated;
+
 pub use va::{
     EncoderCapabilities, EncoderSupport, Feature, HevcBlockSizes, HevcFeatures, UploadMethod,
     VideoEncoder, encoder_support,

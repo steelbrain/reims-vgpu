@@ -7,13 +7,14 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use crate::core::device_memory::{DeviceMemory, HostView, MemoryIdentity, MemoryLife};
-use crate::core::runtime::{Runtime, StdRuntime};
+use crate::core::runtime::Runtime;
 use crate::core::surfaces::SurfaceError;
 
 use super::*;
 use crate::nvidia::cuda::GpuSelector;
 use crate::nvidia::nvenc::encoder::tests::{noise, params};
 use crate::nvidia::nvenc::encoder::{EncodeParams, EncodeProfile, NvencEncoder, RawFrame};
+use crate::vaapi::gated::GatedRuntime;
 
 /// The alignment of the test's memory: whole pages on every host's page size.
 const PAGE: usize = 64 << 10;
@@ -104,7 +105,7 @@ impl DeviceMemory for PagesMemory {
 #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
 fn access_units_decode_in_place_and_land_by_the_gpu_as_they_read_back() {
     let gpu = Arc::new(Gpu::open(&GpuSelector::First).expect("an NVIDIA GPU"));
-    let runtime: Arc<dyn Runtime> = StdRuntime::shared();
+    let runtime: Arc<dyn Runtime> = Arc::new(GatedRuntime);
     let (width, height, pitch) = (1920u32, 1080u32, 2048usize);
     let rows = usize::try_from(height).expect("rows");
     let chroma_at = pitch * rows;

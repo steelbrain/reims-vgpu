@@ -12,8 +12,9 @@ overview.
   platform's (reims-vgpu's `video/runtime.rs`, `PlatformRuntime`): a thread is a worker of the
   platform's, named as the video code asks and marked as the library's, so that a panic on it ends
   the process at once, and every bound is kept on the platform's monotonic clock, which a test
-  makes virtual. `StdRuntime` is std's threads and clock, for the examples and the hardware
-  tests. A `Bell` is the one place the video code waits on a condition variable with a
+  makes virtual. `StdRuntime` is std's threads and clock, for the examples; the hardware
+  tests of both arms run on it with an exit gate of their own (`vaapi::gated`), as the host's
+  runtime has one. A `Bell` is the one place the video code waits on a condition variable with a
   deadline.
 - **`sync`**: the locks, `parking_lot`'s, the types `reims_vgpu_vulkan::core::sync` re-exports.
 
