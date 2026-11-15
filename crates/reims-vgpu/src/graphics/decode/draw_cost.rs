@@ -9,7 +9,10 @@
 //! [`Stream`]). In `draws.10k`'s stream
 //! each draw of 3 vertices comes after a `setVertexBuffer:` at index 0 of an upload chunk at its
 //! next 256-byte offset, as the bundle sends `setVertexBytes:` (a 64 KiB chunk, 256 draws a
-//! chunk, [`Chunks`]). In a compositor's, each
+//! chunk, [`Chunks`]), under the bench's own pipeline: its vertex function reads the draw's bytes
+//! and its fragment function a colour set once a pass, each a `constant float4 &` at buffer 0
+//! (`render_small` and `render_flat` of the tests' shaders), as the runtime binds an app's bytes.
+//! In a compositor's, each
 //! draw of a 4-vertex strip binds a texture of 16 and its own vertex and fragment bytes, under one
 //! of 4 pipelines that change every 4 draws with the sampler set again. The command buffers go
 //! back to back and are then waited for, as `draws.10k` commits them. Each path's figures are
@@ -26,8 +29,10 @@
 //! `mc` is what 91 more passes cost), `DRAW_COST_RUNS` the runs (9), `DRAW_COST_ONLY` one path, for
 //! a profile of it (`decoder`, `platform` or `runtime`, the runtime alone),
 //! `DRAW_COST_SECONDS` a time to keep running that path for, so a sampling profiler can attach,
-//! and `DRAW_COST_CHUNKS` where the upload chunks lie: `pages`, the default where the host maps
-//! the guest's pages, else `heap`; or `buffer` ([`Chunks`]).
+//! `DRAW_COST_CHUNKS` where the upload chunks lie: `pages`, the default where the host maps
+//! the guest's pages, else `heap`; or `buffer` ([`Chunks`]); and `DRAW_COST_RUNTIME_PASS=fresh`
+//! a runtime path that makes each pass's descriptor anew inside the count, as the platform's
+//! path and the decoder's do, where by default it takes one of two made before it.
 
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -224,18 +229,20 @@ enum Chunks {
 }
 
 /// The object ids: the queue, the target, the per-draw constant buffers (vertex 1 and fragment
-/// 0), the pipelines from [`PIPELINE_ID`], the textures from [`TEXTURE_ID`], the sampler, the
-/// slabs' heaps from [`HEAP_ID`], then the chunks from [`CHUNK_ID`].
+/// 0), the compositor's pipelines from [`PIPELINE_ID`], `draws.10k`'s pipeline, the textures from
+/// [`TEXTURE_ID`], the sampler, the slabs' heaps from [`HEAP_ID`], then the chunks from
+/// [`CHUNK_ID`].
 const QUEUE_ID: u64 = 1;
 const TARGET_ID: u64 = 2;
 const CONSTANTS_ID: u64 = 4;
 const PIPELINE_ID: u64 = 0x10;
+const SMALL_PIPELINE_ID: u64 = 0x18;
 const TEXTURE_ID: u64 = 0x20;
 const SAMPLER_ID: u64 = 0x40;
 const HEAP_ID: u64 = 0x80;
 const CHUNK_ID: u64 = 0x100;
 /// A compositor's pipelines: a fragment buffer's colour and a texture's, each opaque and blended
-/// over (`draws.10k`'s is the first); its textures; and the draws a pipeline runs for.
+/// over; its textures; and the draws a pipeline runs for.
 const PIPELINES: u64 = 4;
 const TEXTURES: u64 = 16;
 const RUN: usize = 4;
@@ -417,11 +424,17 @@ fn steps(shape: Shape, cb: usize) -> Vec<Vec<Step>> {
                 passes[draw / a_group / (shape.groups / shape.passes) - 1] =
                     std::mem::take(&mut steps);
             }
-            steps.extend([
-                Step::Pipeline(PIPELINE_ID),
-                Step::VertexBuffer(CONSTANTS_ID, 0, 1),
-                Step::FragmentBuffer(CONSTANTS_ID, 0, 0),
-            ]);
+            match shape.stream {
+                Stream::Bytes => steps.extend([
+                    Step::Pipeline(SMALL_PIPELINE_ID),
+                    Step::FragmentBuffer(CONSTANTS_ID, 0, 0),
+                ]),
+                Stream::Layers => steps.extend([
+                    Step::Pipeline(PIPELINE_ID),
+                    Step::VertexBuffer(CONSTANTS_ID, 0, 1),
+                    Step::FragmentBuffer(CONSTANTS_ID, 0, 0),
+                ]),
+            }
         }
         let slot = draw as u64 * shape.slots();
         match shape.stream {
@@ -778,6 +791,24 @@ impl<P: ApiPlatform> Bench<P> {
             let handle = ObjHandle::RenderPipeline(pipeline);
             assert_eq!(decoder.insert(PIPELINE_ID + n, handle).unwrap(), Ok(()));
         }
+        let small = device
+            .new_render_pipeline_state_full(&FullRenderPipelineDesc {
+                colors: vec![(
+                    0,
+                    ColorAttachmentDesc {
+                        pixel_format: BGRA8,
+                        ..ColorAttachmentDesc::default()
+                    },
+                )],
+                ..FullRenderPipelineDesc::new(
+                    &fixture::<P>(&device, "render_small"),
+                    Some(&fixture::<P>(&device, "render_flat")),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        let handle = ObjHandle::RenderPipeline(small);
+        assert_eq!(decoder.insert(SMALL_PIPELINE_ID, handle).unwrap(), Ok(()));
         let sampled = platform.texture_descriptor(&TextureDesc {
             pixel_format: BGRA8,
             width: TEXTURE_SIDE,
@@ -1058,19 +1089,36 @@ fn target_pass<P: ApiPlatform>(bench: &Bench<P>, pass: usize) -> P::RenderPassDe
 /// of it for each command.
 fn through_runtime(bench: &Bench<reims_vgpu_vulkan::VulkanPlatform>) -> Counts {
     use metal2vulkan_runtime as rt;
-    let (queue, _) = bench.queue_and_target();
+    let (queue, target) = bench.queue_and_target();
     let shape = bench.shape;
     let bound = bench.bound();
     let passes = [
         target_pass(bench, 0).pass().0,
         target_pass(bench, 1).pass().0,
     ];
+    // The descriptor `target_pass` sets, made with the runtime alone.
+    let fresh = |p: usize| {
+        let mut d = rt::RenderPassDescriptor::new();
+        let a = &mut d.color_attachments[0];
+        a.texture = Some(target.raw.clone());
+        a.load_action = rt::LoadAction::from_raw(Shape::load(p)).unwrap();
+        a.store_action = rt::StoreAction::from_raw(STORE).unwrap();
+        d
+    };
+    let anew = runtime_passes_fresh();
     let (tx, rx) = mpsc::channel();
     let start = counts();
     for cb_bound in &bound {
         let cb = queue.raw.command_buffer().unwrap();
         for (p, pass_bound) in cb_bound.iter().enumerate() {
-            let mut e = cb.render_command_encoder(&passes[p.min(1)]).unwrap();
+            let made;
+            let pass = if anew {
+                made = fresh(p);
+                &made
+            } else {
+                &passes[p.min(1)]
+            };
+            let mut e = cb.render_command_encoder(pass).unwrap();
             for &b in pass_bound {
                 match b {
                     Bound::Pipeline(p) => e.set_render_pipeline_state(&p.raw),
@@ -1107,6 +1155,20 @@ fn through_runtime(bench: &Bench<reims_vgpu_vulkan::VulkanPlatform>) -> Counts {
             .expect("a command buffer never completed");
     }
     spent
+}
+
+/// Whether the runtime path makes each pass's descriptor anew (`DRAW_COST_RUNTIME_PASS=fresh`).
+fn runtime_passes_fresh() -> bool {
+    std::env::var("DRAW_COST_RUNTIME_PASS").is_ok_and(|v| v == "fresh")
+}
+
+/// What the figures' line says of the runtime path's descriptors where it makes them anew.
+fn fresh_note() -> &'static str {
+    if runtime_passes_fresh() {
+        ", the runtime's pass descriptors made anew each pass"
+    } else {
+        ""
+    }
 }
 
 /// The median, lowest and highest of `values`.
@@ -1175,9 +1237,10 @@ fn measure<P: ApiPlatform>(
         let [ns, instructions, cycles] = a_draw(spent, reps);
         println!(
             "{name}: {} for {seconds} s: {reps} repetitions, a draw {ns:.1} ns, {instructions:.0} \
-             instructions, {cycles:.0} cycles, the upload chunks {:?}",
+             instructions, {cycles:.0} cycles, the upload chunks {:?}{}",
             only.unwrap_or("decoder"),
             bench.chunks,
+            fresh_note(),
         );
         return;
     }
@@ -1212,8 +1275,14 @@ fn measure<P: ApiPlatform>(
     println!(
         "{name}: a draw on the decoding thread, median [lowest, highest] of {runs} runs of {REPS} \
          repetitions of {} command buffers of {} draws of {:?} in {} passes, {ops} ops (a command \
-         buffer's: {} times as much), the upload chunks {:?}",
-        shape.cbs, shape.draws, shape.stream, shape.passes, shape.draws, bench.chunks
+         buffer's: {} times as much), the upload chunks {:?}{}",
+        shape.cbs,
+        shape.draws,
+        shape.stream,
+        shape.passes,
+        shape.draws,
+        bench.chunks,
+        fresh_note(),
     );
     for (f, figure) in FIGURES.iter().enumerate() {
         let mut medians = [0.0f64; 3];
@@ -1243,7 +1312,7 @@ fn measure<P: ApiPlatform>(
 
 /// The mc shapes' command buffers: in `mc`, 92 passes of 3 draws, each pass's ops beginning with
 /// its pipeline and constant buffers; in `mc1`, the same ops in one pass. The other shapes keep
-/// one pass.
+/// one pass, `draws.10k`'s under the bench's pipeline.
 #[test]
 fn the_mc_shapes_cut_their_draws_into_passes() {
     let draws = |pass: &Vec<Step>| pass.iter().filter(|s| matches!(s, Step::Draw(..))).count();
@@ -1261,6 +1330,14 @@ fn the_mc_shapes_cut_their_draws_into_passes() {
         assert_eq!(one.len(), 1);
         assert_eq!(draws(&one[0]), shape.draws);
     }
+    // `draws.10k`'s stream runs under the bench's own pipeline.
+    assert!(matches!(
+        steps(Shape::TEN_K, 0)[0][..2],
+        [
+            Step::Pipeline(SMALL_PIPELINE_ID),
+            Step::FragmentBuffer(CONSTANTS_ID, 0, 0)
+        ]
+    ));
 }
 
 /// A pages slab is 32 runs of 64 KiB of the guest's RAM, as the kext's chunks make the bundle's
