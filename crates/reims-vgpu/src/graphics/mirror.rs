@@ -496,6 +496,13 @@ impl<P: ApiPlatform> Mirror<P> {
     /// already, which the draw waits for on its GPU (`Some(Some(_))`), else finished on the host
     /// (`Some(None)`), its count of tiles read where `count_of` says the bytes of the frame's
     /// pixels; `None` where it failed, logged.
+    #[cfg_attr(
+        windows,
+        expect(
+            unreachable_code,
+            reason = "a Windows sync file has no values (`SyncFile`): no code past one runs"
+        )
+    )]
     fn hand_over(
         &self,
         frame: &mut Frame<P>,

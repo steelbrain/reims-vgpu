@@ -883,6 +883,13 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
     /// compositor's GPU it waits first, on that GPU, for the window's mirror's sync the draw
     /// reads, where the sync's completion came as a sync file ([`Mirror::sync`]); where this
     /// device cannot wait for the file, the window's thread waits for the sync here, logged once.
+    #[cfg_attr(
+        windows,
+        expect(
+            unreachable_code,
+            reason = "a Windows sync file has no values (`SyncFile`): no code past one runs"
+        )
+    )]
     fn surface_command_buffer(&self) -> Option<P::CommandBuffer> {
         let command_buffer = no_catch(self.queue.command_buffer(OnFault::Die))?;
         let waiting = (self.foreign.as_ref()).and_then(|f| f.waiting.lock().take());

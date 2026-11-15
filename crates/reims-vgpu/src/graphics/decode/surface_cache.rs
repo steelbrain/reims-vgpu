@@ -3574,6 +3574,13 @@ pub(crate) struct Caches<P: Platform> {
 /// the scroll's begins for 14 to 25 ms each; made outside it, none of the same scroll's begins
 /// took 2 ms or more for its caches (**measured** 2026-11-09, the same guest and host).
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(
+    windows,
+    expect(
+        dead_code,
+        reason = "Windows makes no exportable or dma-buf buffer: `make_laid` reads these on Unix"
+    )
+)]
 struct CacheMaker {
     /// Caches of surfaces of two planes are made exportable, for the host's video to import
     /// ([`Caches::set_exportable`]).
@@ -3641,8 +3648,10 @@ impl CacheMaker {
             None => layout.and_then(aligned_byte),
         };
         let length = repitched.map_or(length, Repitched::length);
+        #[cfg(unix)]
         let two_planes = layout.is_some_and(|planes| planes.len() == 2);
         let mut counts = MakerCounts::default();
+        #[cfg(unix)]
         let life = || Some(MemoryLife::new());
         #[cfg(unix)]
         if self.exportable && two_planes {
