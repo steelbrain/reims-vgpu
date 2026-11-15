@@ -1165,6 +1165,63 @@ Stages:
           - What the render thread still spends on a sync is its encoding,
             commit and export, and its wait for the last draw and the sync
             before it.
+        - *Measured 2026-11-14: route 1 under a GPU-bound guest.* The walk's
+          applesample step (a GPU-bound guest app, 125 s) on um870's RTX
+          3090 on PCIe 3.0 x4, whose compositor composites on its Radeon
+          780M, the guest at 3648 x 2038, metal2vulkan's pin 92, at
+          d2e5a7d46 (`steelbrain/gpupick`): with NVIDIA's driver alone
+          listed to QEMU or every GPU's, and with no window or a Wayland
+          one. The 3090 was in P2 throughout every arm:
+
+          | drivers listed | window | frames | frame, median ms | guest's GPU time a frame, median ms | link MB/s from the GPU |
+          |---|---|---|---|---|---|
+          | NVIDIA's alone | none | 1631 | 33.5 | 37.8 | 300 |
+          | every GPU's | none | 1627 | 38.3 | 38.2 | 307 |
+          | NVIDIA's alone | presents from the 3090 | 1149 | 50.1 | 53.2 | 798 |
+          | every GPU's | route 1 | 1025 | 83.2 | 68.1 | 643 |
+
+          - Listing every driver cost the guest no frames. A window
+            presenting from the 3090 cost it 30% of them, about the 20.2 ms
+            the 3090 is busy at each of its 15.0 window presents a second
+            (measured 2026-11-13, above). Route 1 cost another 11%: 1025
+            frames against 1149.
+          - Route 1 made 13.5 syncs a second, each sending 1651 of the
+            frame's 1824 tiles (27.1 MB), every one waited for on the 780M.
+            The render thread waited 71.4 ms a sync, for the sync before it.
+          - The tile kernel writes the changed tiles into host memory
+            itself. Those writes hold the engine every queue of the 3090's
+            graphics family runs on for as long as they take to cross the
+            link, at least 14.8 ms for 27.1 MB at 1.83 GB/s. No other queue
+            of that family runs meanwhile: in metal2vulkan's measure, a
+            readback on another queue of the family waited 1.88 s behind a
+            2 s kernel, and one on the copy engine took 7.8 to 13.5 ms beside
+            it (its `src/device/staging.rs`). Each sync also waits behind
+            the guest's command buffers.
+          - The arms without a window had none at all: with
+            `WAYLAND_DISPLAY` left out and no `XAUTHORITY`, Xwayland
+            refused SDL's connection.
+        - *Built: the copies on a copy engine.* Where the platform gives a
+          queue whose copies run on a copy engine of the runtime's GPU
+          (`GpuDevice::new_command_queue_for_copies`):
+          - The sync's command buffer copies the presented texture into
+            the runtime's buffer and compares it with the frame sent last,
+            as above, but only lists the tiles that differ
+            (`displayMirrorTileList`). It writes nothing into host memory.
+          - The render thread commits it at once, then waits for it, for
+            the last draw that read the mirror and for the last copy into
+            it. Then it copies the listed tiles into the mirror on the copy
+            engine: a run of tiles side by side is one copy in each of its
+            pixel rows, a run of whole rows of tiles one copy.
+          - The draw waits for that copy as it waited for the sync. No tile
+            changed means no copy, and the draw waits for nothing.
+          - The bytes that cross the link are the changed tiles' bytes, as
+            before. The compositor's GPU still waits for the compare, which
+            runs on the engine the guest's work runs on.
+          - Where the platform gives no such queue, each sync is the one
+            command buffer above. That is the case on the Vulkan platform
+            until metal2vulkan's runtime gives a program a queue on a copy
+            engine (asked 2026-11-14). It is also the case where the
+            runtime refuses the list's kernel.
       - *Route 2: the presented surfaces in place.* The surfaces the
         display pipe presents lie in place in guest RAM (route B's
         placement for them alone; every other surface keeps its device
