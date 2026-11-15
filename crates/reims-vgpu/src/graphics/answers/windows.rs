@@ -53,3 +53,10 @@ unsafe fn information<T: Default>(file: &File, class: FILE_INFO_BY_HANDLE_CLASS)
     };
     (got != 0).then_some(info)
 }
+
+/// A symbolic link at `link` to the file `original`, for the tests (Windows makes one for a
+/// process without the privilege where Developer Mode is on).
+#[cfg(test)]
+pub(super) fn symlink(original: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(original, link)
+}

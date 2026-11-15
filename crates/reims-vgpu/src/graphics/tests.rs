@@ -2660,8 +2660,10 @@ fn the_sink_imports_only_the_scanout_s_pages() {
         assert_eq!(platform.call_log().count("newCommandQueue"), 0);
     }
 
-    // SAFETY: sysconf reads a constant of the host's.
-    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+    let page = {
+        use reims_vgpu_vulkan::core::platform::os::vm::HostVm as _;
+        reims_vgpu_vulkan::os::OsVm::new().page_size()
+    };
     let base = region.base() as u64;
     let addr = |b: &<FakePlatform as Platform>::Buffer| b.contents().addr() as u64;
     let scanout = |width: u32, height: u32, offset: u64| Scanout {

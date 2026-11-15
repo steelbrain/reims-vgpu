@@ -1144,13 +1144,8 @@ mod tests {
         let platform = Arc::new(VulkanPlatform::new());
         crate::entry::run(|_| {
             // Whether the page at `at` is mapped, read without touching it.
-            let mapped = |at: HostPtr| {
-                // SAFETY: `msync` of the page at `at`, which reads no byte and fails where no
-                // page is mapped.
-                unsafe { libc::msync(at.as_ptr(), 1, libc::MS_ASYNC) == 0 }
-            };
-            // SAFETY: sysconf reads a constant of the host's.
-            let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+            let mapped = |at: HostPtr| crate::platform::page_mapped(at.as_ptr());
+            let page = OsVm::new().page_size();
             let device = platform.metal_device(None).unwrap();
             let mirror = Mirror::<VulkanPlatform>::new(device.clone_ref()).expect("the mirror");
             let surface = |side: u64| {

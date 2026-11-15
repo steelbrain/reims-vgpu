@@ -264,6 +264,13 @@ const TEXTURE_SIDE: u64 = 64;
 /// This thread's CPU time in nanoseconds, the instructions it retired and its cycles, each as a
 /// count that only grows; the counters are 0 where the host gives none.
 pub(in crate::graphics) fn counts() -> Counts {
+    let [instructions, cycles] = counters::now();
+    Counts([thread_cpu_ns(), instructions, cycles])
+}
+
+/// This thread's CPU time in nanoseconds (`CLOCK_THREAD_CPUTIME_ID`).
+#[cfg(unix)]
+fn thread_cpu_ns() -> u64 {
     let mut at = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -273,9 +280,34 @@ pub(in crate::graphics) fn counts() -> Counts {
         unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut at) },
         0
     );
-    let ns = u64::try_from(at.tv_sec).unwrap() * 1_000_000_000 + u64::try_from(at.tv_nsec).unwrap();
-    let [instructions, cycles] = counters::now();
-    Counts([ns, instructions, cycles])
+    u64::try_from(at.tv_sec).unwrap() * 1_000_000_000 + u64::try_from(at.tv_nsec).unwrap()
+}
+
+/// [`thread_cpu_ns`] on Windows: this thread's kernel and user times (`GetThreadTimes`), kept in
+/// 100 ns units.
+#[cfg(windows)]
+fn thread_cpu_ns() -> u64 {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+    let nanos =
+        |t: FILETIME| ((u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime)) * 100;
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let [mut made, mut ended, mut kernel, mut user] = [zero; 4];
+    // SAFETY: the running thread's pseudo-handle, and four live out-parameters.
+    let ok = unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut made,
+            &mut ended,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    assert_ne!(ok, 0);
+    nanos(kernel) + nanos(user)
 }
 
 /// What [`counts`] answers, and the differences of two answers.
@@ -313,6 +345,21 @@ mod counters {
         // SAFETY: kind 1 writes two `u64`s, the thread's instructions and cycles, into `out`.
         let r = unsafe { thread_selfcounts(1, out.as_mut_ptr(), size_of_val(&out)) };
         if r != 0 { [0, 0] } else { out }
+    }
+}
+
+/// This thread's instructions and cycles: on Windows its cycles alone (`QueryThreadCycleTime`),
+/// with no count of instructions, which stays 0.
+#[cfg(windows)]
+mod counters {
+    use windows_sys::Win32::System::Threading::GetCurrentThread;
+    use windows_sys::Win32::System::WindowsProgramming::QueryThreadCycleTime;
+
+    pub(super) fn now() -> [u64; 2] {
+        let mut cycles = 0u64;
+        // SAFETY: the running thread's pseudo-handle, and a live out-parameter.
+        let ok = unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut cycles) };
+        [0, if ok != 0 { cycles } else { 0 }]
     }
 }
 

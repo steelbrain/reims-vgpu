@@ -51,11 +51,15 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
-// A file's build ([`library_build`]), each OS's own.
+// A file's build ([`library_build`]), each OS's own, and the tests' link to a file.
 #[cfg(unix)]
 use unix::file_build;
+#[cfg(all(test, unix))]
+use unix::symlink;
 #[cfg(windows)]
 use windows::file_build;
+#[cfg(all(test, windows))]
+use windows::symlink;
 
 /// A pipeline create's key ([`RGFX_PIPELINE_REFLECT_KEYED`]).
 pub(crate) type AnswerKey = [u8; 32];
@@ -692,7 +696,7 @@ mod tests {
             "untouched, the same"
         );
         let link = dir.0.join("current");
-        std::os::unix::fs::symlink(&path, &link).unwrap();
+        symlink(&path, &link).unwrap();
         assert_eq!(
             file_build(&link),
             Some(first.clone()),

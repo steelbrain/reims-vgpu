@@ -32,6 +32,7 @@ const ROUNDS: usize = 2000;
 const WARM: usize = 100;
 
 /// The host's clock, in nanoseconds: the one the platform gives GPU times in.
+#[cfg(unix)]
 pub(super) fn host_ns() -> u64 {
     #[cfg(target_os = "macos")]
     let clock = libc::CLOCK_UPTIME_RAW;
@@ -44,6 +45,24 @@ pub(super) fn host_ns() -> u64 {
     // SAFETY: `t` is the timespec the call writes.
     unsafe { libc::clock_gettime(clock, &mut t) };
     (t.tv_sec as u64) * 1_000_000_000 + t.tv_nsec as u64
+}
+
+/// [`host_ns`] on Windows: the performance counter (`QueryPerformanceCounter`), the clock Windows
+/// GPUs' timestamps are calibrated against, in nanoseconds.
+#[cfg(windows)]
+pub(super) fn host_ns() -> u64 {
+    use windows_sys::Win32::System::Performance::{
+        QueryPerformanceCounter, QueryPerformanceFrequency,
+    };
+    let (mut count, mut frequency) = (0i64, 0i64);
+    // SAFETY: two live out-parameters; neither call fails on a supported Windows.
+    unsafe {
+        QueryPerformanceCounter(&mut count);
+        QueryPerformanceFrequency(&mut frequency);
+    }
+    let ns = u128::from(count.cast_unsigned()) * 1_000_000_000
+        / u128::from(frequency.cast_unsigned().max(1));
+    u64::try_from(ns).unwrap_or(u64::MAX)
 }
 
 /// Which handler told, when on the host's clock, and the buffer's GPU times it learned.

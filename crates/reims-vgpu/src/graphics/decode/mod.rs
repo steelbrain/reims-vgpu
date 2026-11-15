@@ -11613,10 +11613,7 @@ lacks {part}"
         use crate::platform::ApiPlatform as _;
 
         // Whether the page at `at` is mapped, read without touching it.
-        let mapped = |at: *mut u8| {
-            // SAFETY: `msync` of one page, which reads no byte and fails where none is mapped.
-            unsafe { libc::msync(at.cast(), 1, libc::MS_ASYNC) == 0 }
-        };
+        let mapped = crate::platform::page_mapped;
         let platform = reims_vgpu_vulkan::VulkanPlatform::process();
         let device = platform.metal_device(None).unwrap();
         let region = crate::platform::test_region(&*platform, 0x10000);

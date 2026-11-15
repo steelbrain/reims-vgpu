@@ -7,10 +7,11 @@
 //! ```
 //!
 //! The guest's RAM is what QEMU gives the device: on Linux a shared mapping of a memfd, whose file
-//! the platform's lease registers; on macOS anonymous memory. Each surface is fresh pages, as a
-//! browser's are: its runs are slots of the RAM picked at random, so no two surfaces name the same
-//! runs and the cache of views takes none. Each step is timed on the thread that carries it out
-//! (the surface worker, for `SURFACE_PAGES`):
+//! the platform's lease registers; on Windows a view of a pagefile-backed section, whose handle it
+//! registers; on macOS anonymous memory. Each surface is fresh pages, as a browser's are: its runs
+//! are slots of the RAM picked at random, so no two surfaces name the same runs and the cache of
+//! views takes none. Each step is timed on the thread that carries it out (the surface worker, for
+//! `SURFACE_PAGES`):
 //! - `SURFACE_PAGES`: the view (a range mapping of the runs) and the buffer over all of it, which
 //!   holds the runtime's import; for a cached block also the device cache;
 //! - `BUFFER_OVER_SURFACE_PAGES`, its `OBJECT_DESTROY`, and the block's `BLOCK_RELEASE`;
@@ -236,8 +237,7 @@ impl Drop for Ram {
             );
             return;
         }
-        // SAFETY: the RAM's own mapping, which no device, view or import uses any more.
-        unsafe { libc::munmap(self.at.cast(), self.length.to_usize()) };
+        unmap(self.at, self.length);
     }
 }
 
@@ -245,10 +245,26 @@ impl Drop for Ram {
 /// over it ([`Ram`]'s drop).
 pub(in crate::graphics::decode) const IMPORTS_BOUND: Duration = Duration::from_secs(30);
 
+/// Unmaps the RAM's own mapping, which no device, view or import uses any more.
+#[cfg(unix)]
+fn unmap(at: *mut u8, length: u64) {
+    // SAFETY: the RAM's own mapping, as the caller says.
+    unsafe { libc::munmap(at.cast(), length.to_usize()) };
+}
+
+/// [`unmap`] on Windows: the RAM's view of its section.
+#[cfg(windows)]
+fn unmap(at: *mut u8, _length: u64) {
+    use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+    // SAFETY: the RAM's own view, as the caller says.
+    unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at.cast() }) };
+}
+
 /// `length` bytes of guest RAM at [`RAM`], every page touched where `touched`, else none: a
 /// memfd's shared mapping on Linux (with huge pages asked for where `RGK_BENCH_THP=1`), sealed as
 /// QEMU's `memory-backend-memfd` seals it (`F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL`), since
-/// udmabuf refuses a memfd not sealed against shrinking; anonymous memory on macOS.
+/// udmabuf refuses a memfd not sealed against shrinking; on Windows a view of a pagefile-backed
+/// section, as QEMU's Windows build backs the guest's RAM; anonymous memory on macOS.
 pub(in crate::graphics::decode) fn guest_ram(length: u64, touched: bool) -> Ram {
     #[cfg(target_os = "linux")]
     let (at, file) = {
@@ -296,7 +312,48 @@ pub(in crate::graphics::decode) fn guest_ram(length: u64, touched: bool) -> Ram 
         };
         (at.cast::<u8>(), file)
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    let (at, file) = {
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE, SEC_COMMIT,
+        };
+        let (high, low) = ((length >> 32) as u32, length as u32);
+        // SAFETY: a new pagefile-backed section of `length` bytes; its handle is owned from here
+        // on.
+        let section = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_COMMIT,
+                high,
+                low,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: the section's handle, just made, owned once.
+        let section = Arc::new(unsafe { OwnedHandle::from_raw_handle(section) });
+        // SAFETY: a view of the whole section, unmapped at the drop.
+        let view = unsafe {
+            MapViewOfFile(
+                section.as_raw_handle(),
+                FILE_MAP_ALL_ACCESS,
+                0,
+                0,
+                length.to_usize(),
+            )
+        };
+        assert!(!view.Value.is_null());
+        let file = crate::memory::MemoryFile {
+            file: section,
+            offset: 0,
+        };
+        (view.Value.cast::<u8>(), file)
+    };
+    #[cfg(target_os = "macos")]
     let (at, file) = {
         // SAFETY: a new anonymous mapping, unmapped at the drop.
         let at = unsafe {
@@ -330,7 +387,13 @@ pub(in crate::graphics::decode) fn guest_ram(length: u64, touched: bool) -> Ram 
             fd,
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        // SAFETY: as above; the map holds the section.
+        unsafe { map.push_with_file(RAM, length, at, Some(file)) };
+        Ram { map, at, length }
+    }
+    #[cfg(target_os = "macos")]
     {
         let () = file;
         // SAFETY: as above.

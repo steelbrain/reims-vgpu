@@ -26,3 +26,9 @@ pub(super) fn file_build(path: &Path) -> Option<Vec<u8>> {
     }
     Some(build)
 }
+
+/// A symbolic link at `link` to `original`, for the tests.
+#[cfg(test)]
+pub(super) fn symlink(original: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(original, link)
+}

@@ -110,6 +110,24 @@ pub(crate) fn test_region<P: ApiPlatform>(
         .expect("a region")
 }
 
+/// Whether the host page at `at` is mapped, for a test, read without touching it: `msync` of
+/// the page, which reads no byte of it and fails where none is mapped.
+#[cfg(all(test, unix))]
+pub(crate) fn page_mapped(at: *mut u8) -> bool {
+    // SAFETY: `msync` of one page, which reads no byte and fails where none is mapped.
+    unsafe { libc::msync(at.cast(), 1, libc::MS_ASYNC) == 0 }
+}
+
+/// [`page_mapped`] on Windows: the page is committed (`VirtualQuery`, which reads no byte of it).
+#[cfg(all(test, windows))]
+pub(crate) fn page_mapped(at: *mut u8) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: a query of the address, which reads no byte there, into a live record of its size.
+    let got = unsafe { VirtualQuery(at.cast(), &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+    got != 0 && info.State == MEM_COMMIT
+}
+
 /// The API's state for one platform instance.
 pub(crate) struct ApiState<P: Platform> {
     /// The display thread, made at the first device whose host takes the cursor.
