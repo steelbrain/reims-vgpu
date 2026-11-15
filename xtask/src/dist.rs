@@ -4,7 +4,8 @@
 //!
 //! - `lib/libreims_vgpu.a`, and the shared library beside it, built from `reims-vgpu-c`, the
 //!   crate of the C API: `lib/libreims_vgpu.dylib` on macOS, `lib/libreims_vgpu.so` on Linux.
-//!   How each OS builds and names them is its own module's: `macos`, `linux`.
+//!   How each OS builds and names them is its own module's: `macos`, `linux`. On Windows
+//!   (`windows`) no tree is made yet, and `dist` refuses.
 //! - `include/reims_vgpu.h`, the committed header.
 //! - `lib/pkgconfig/reims-vgpu.pc`. Its `Libs.private` names every library a static link of the
 //!   archive needs.
@@ -28,10 +29,14 @@ use crate::util::{Res, repo_root};
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(windows)]
+mod windows;
 #[cfg(target_os = "linux")]
 use linux as native;
 #[cfg(target_os = "macos")]
 use macos as native;
+#[cfg(windows)]
+use windows as native;
 
 /// The library's name: `lib/libreims_vgpu.{a,dylib,so}`, linked with `-lreims_vgpu`.
 pub const LIB: &str = "reims_vgpu";
@@ -95,6 +100,7 @@ pub fn parse_args(args: &[String], target_dir: &Path) -> Res<Options> {
 
 /// The Cargo arguments every OS's build of the library starts its own with, after the
 /// subcommand: `reims-vgpu-c`'s libraries in the profile.
+#[cfg_attr(windows, expect(dead_code, reason = "used by the Unix dists alone"))]
 pub fn c_api_args(o: &Options) -> Vec<String> {
     strs(&[
         "--profile",
@@ -107,6 +113,10 @@ pub fn c_api_args(o: &Options) -> Vec<String> {
 
 /// `reims-vgpu.pc`. Its prefix is the file's grandparent directory (`${pcfiledir}`), so the tree
 /// can be moved.
+#[cfg_attr(
+    all(windows, not(test)),
+    expect(dead_code, reason = "used by the Unix dists alone")
+)]
 pub fn pc_file(version: &str, libs_private: &[String]) -> String {
     format!(
         "# Written by `cargo xtask dist`.\n\
@@ -186,10 +196,15 @@ pub fn cmd_dist(args: &[String]) -> Res<bool> {
     Ok(true)
 }
 
+#[cfg_attr(
+    all(windows, not(test)),
+    expect(dead_code, reason = "used by the Unix dists alone")
+)]
 fn strs(args: &[&str]) -> Vec<String> {
     args.iter().map(|s| (*s).to_owned()).collect()
 }
 
+#[cfg_attr(windows, expect(dead_code, reason = "used by the Unix dists alone"))]
 fn strs_with(args: &[&str], p: &Path) -> Vec<String> {
     let mut v = strs(args);
     v.push(p.to_string_lossy().into_owned());
@@ -204,6 +219,7 @@ fn mkdir_parent(p: &Path) -> Res<()> {
 }
 
 /// Writes `content` to `p` with mode 0644 ([`replace_if_changed`]).
+#[cfg_attr(windows, expect(dead_code, reason = "used by the Unix dists alone"))]
 fn write(p: &Path, content: &str) -> Res<()> {
     replace_if_changed(p, content.as_bytes(), 0o644).map(drop)
 }
@@ -214,14 +230,14 @@ fn install(from: &Path, to: &Path, mode: u32) -> Res<()> {
     replace_if_changed(to, &bytes, mode).map(drop)
 }
 
-/// Every file `dist` writes is written by this: `to` gets `bytes` and `mode`, and is written only
-/// where it is not already a file holding `bytes`. An unchanged file keeps its mtime, so what is
-/// built from the tree is not built again: `make qemu` recompiles `reims-graphics-pci.c` where
-/// the header is newer, and relinks QEMU where the archive is. A file that changed is removed
+/// Every file `dist` writes is written by this: `to` gets `bytes` and `mode` (on Unix; Windows
+/// keeps no mode bits), and is written only where it is not already a file holding `bytes`. An
+/// unchanged file keeps its mtime, so what is built from the tree is not built again: `make qemu`
+/// recompiles `reims-graphics-pci.c` where the header is newer, and relinks QEMU where the
+/// archive is. A file that changed is removed
 /// first and written anew, so a process that maps the old one (a host running the shared
 /// library) keeps its pages. Returns whether it wrote.
 fn replace_if_changed(to: &Path, bytes: &[u8], mode: u32) -> Res<bool> {
-    use std::os::unix::fs::PermissionsExt as _;
     let err = |e: std::io::Error| format!("{}: {e}", to.display());
     let old = std::fs::symlink_metadata(to).ok();
     let same = old
@@ -235,7 +251,13 @@ fn replace_if_changed(to: &Path, bytes: &[u8], mode: u32) -> Res<bool> {
         }
         std::fs::write(to, bytes).map_err(err)?;
     }
-    std::fs::set_permissions(to, std::fs::Permissions::from_mode(mode)).map_err(err)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(to, std::fs::Permissions::from_mode(mode)).map_err(err)?;
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
     Ok(!same)
 }
 
@@ -254,6 +276,7 @@ mod testing {
     pub struct Log {
         pub calls: Vec<(String, Vec<String>)>,
         pub answer: String,
+        #[cfg_attr(windows, expect(dead_code, reason = "used by the Unix dists alone"))]
         pub fail: Option<&'static str>,
     }
 
@@ -298,6 +321,7 @@ mod testing {
         std::fs::write(p, content).unwrap();
     }
 
+    #[cfg(unix)]
     pub fn mode(p: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
@@ -402,6 +426,7 @@ mod tests {
         assert_eq!(read(&written[0]), "either, at your option");
         assert_eq!(read(&written[1]), "a");
         assert_eq!(read(&written[2]), "b");
+        #[cfg(unix)]
         for p in &written {
             assert_eq!(testing::mode(&out.join(p)), 0o644, "{p}");
         }
@@ -466,19 +491,22 @@ mod tests {
         testing::age(&p);
         assert!(!replace_if_changed(&p, b"one", 0o755).unwrap());
         assert_eq!(testing::mtime(&p), testing::LONG_AGO);
+        #[cfg(unix)]
         assert_eq!(testing::mode(&p), 0o755);
         for other in ["two", "a longer one"] {
             testing::age(&p);
             assert!(replace_if_changed(&p, other.as_bytes(), 0o644).unwrap());
             assert_eq!(read(), other);
             assert_ne!(testing::mtime(&p), testing::LONG_AGO);
+            #[cfg(unix)]
             assert_eq!(testing::mode(&p), 0o644);
         }
         std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// A file that changed is a new file: another name for the old one, as a process that maps
-    /// it holds, keeps the old bytes. A symlink is replaced by a file, even one to the same bytes
+    /// it holds, keeps the old bytes. A symlink (on Unix, where the test makes one) is replaced by
+    /// a file, even one to the same bytes
     #[test]
     fn replace_if_changed_replaces_rather_than_writes_through() {
         let root = testing::tmp("replace-new");
@@ -489,12 +517,15 @@ mod tests {
         assert!(replace_if_changed(&p, b"new", 0o755).unwrap());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "new");
         assert_eq!(std::fs::read_to_string(&link).unwrap(), "old");
-        let target = root.join("target");
-        testing::put(&target, "same");
-        let sym = root.join("sym");
-        std::os::unix::fs::symlink(&target, &sym).unwrap();
-        assert!(replace_if_changed(&sym, b"same", 0o644).unwrap());
-        assert!(std::fs::symlink_metadata(&sym).unwrap().is_file());
+        #[cfg(unix)]
+        {
+            let target = root.join("target");
+            testing::put(&target, "same");
+            let sym = root.join("sym");
+            std::os::unix::fs::symlink(&target, &sym).unwrap();
+            assert!(replace_if_changed(&sym, b"same", 0o644).unwrap());
+            assert!(std::fs::symlink_metadata(&sym).unwrap().is_file());
+        }
         std::fs::remove_dir_all(&root).unwrap();
     }
 
