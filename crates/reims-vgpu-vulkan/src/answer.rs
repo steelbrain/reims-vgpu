@@ -317,11 +317,11 @@ pub fn created_or_decided<T>(
 /// announced at every occurrence:
 /// - `ReleasedCommandState`: an execution of an indirect command whose record the GPU wrote
 ///   naming a state of its kind the program released whose program the buffer does not keep
-///   (released before any command buffer that may write the buffer's records was encoded, or
-///   past its ID's last four holders), which runs nothing where Metal runs the released state's
-///   program; and, at a host step of records the GPU may write, one naming the ID of the state
-///   the CPU set, released, where the GPU could write the records while another state held the
-///   ID, which runs the set state's program where Metal runs the other's for the GPU's write.
+///   (released while no indirect command buffer of the device lived, or past its ID's last four
+///   holders), which runs nothing where Metal runs the released state's program; the device
+///   keeps the program of each freed ID's last holder while an indirect command buffer of it
+///   lives, and a record whose pipeline a kernel wrote runs the state that held the ID as the GPU
+///   last could write it, as Metal's does, both unannounced.
 ///   Announced by the execution alone: at `commit` for records the CPU
 ///   wrote, a pass whose pipelines were still being made then included, which `commit` waits for
 ///   before it records the pass; and for records the GPU may write or a range a buffer holds, at

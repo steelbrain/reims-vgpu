@@ -3257,8 +3257,13 @@ mod tests {
     /// An execution of a command a kernel encoded naming a state of `mark` the program released
     /// before any command buffer that may write the buffer's records was encoded, whose ID no
     /// state took since, on `d`: the command buffer's status and error, and what `out`'s first word
-    /// reads after it (1 where the released state's program ran).
-    fn released_before_the_write<P: Platform>(d: &P::Device) -> ((u64, Option<NsErrorText>), u32) {
+    /// reads after it (1 where the released state's program ran). The indirect command buffer is
+    /// made before the release where `buffer_first`, so one of the device lives at it, and after
+    /// it otherwise, so none does.
+    fn released_before_the_write<P: Platform>(
+        d: &P::Device,
+        buffer_first: bool,
+    ) -> ((u64, Option<NsErrorText>), u32) {
         let library = d.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
         // The encoding kernel's state first: no state made after the release takes its ID.
         let kernel = kernel_state::<P>(d, &library, "set_compute_state");
@@ -3267,17 +3272,22 @@ mod tests {
             .new_buffer_of_length(OnFault::Return, 16, 0)
             .unwrap()
             .unwrap();
-        let icb = make::<P>(d, &compute_desc(), 1);
-        let command = icb.compute_command(0).unwrap().unwrap();
-        command
-            .encode(IcbComputeCmd::SetKernelBuffer {
-                buffer: Some(&out),
-                offset: 0,
-                index: 0,
-            })
-            .unwrap();
+        let made = || {
+            let icb = make::<P>(d, &compute_desc(), 1);
+            let command = icb.compute_command(0).unwrap().unwrap();
+            command
+                .encode(IcbComputeCmd::SetKernelBuffer {
+                    buffer: Some(&out),
+                    offset: 0,
+                    index: 0,
+                })
+                .unwrap();
+            icb
+        };
+        let first = buffer_first.then(&made);
         let id = state.gpu_resource_id();
         drop(state);
+        let icb = first.unwrap_or_else(&made);
         encode_with_kernel::<P>(d, &kernel, &icb, id);
         let q = d.new_command_queue().unwrap();
         let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
@@ -3307,26 +3317,53 @@ mod tests {
     }
 
     /// An execution of a command a kernel encoded naming a state the program released before any
-    /// command buffer that may write the buffer's records was encoded, whose ID no state took
-    /// since, runs nothing: the runtime keeps no program for it. The M3 Max and the UHD Graphics
-    /// 630 run the released state's program, and the Radeon Pro 5300M fails the command buffer
-    /// with a timeout (docs/graphics-kext/dgpu-oracle.md Q43), which the runtime's host step,
-    /// naming no command buffer, cannot give. By default that is relayed (`ReleasedCommandState`,
-    /// announced as the host step records the execution, on the runtime's scheduler thread),
-    /// counted once, and the process goes on: the command buffer completes with no error, as the
-    /// M3 Max's does, and the device runs the next one. A death there is no Mac's answer
+    /// command buffer that may write the buffer's records was encoded, while no indirect command
+    /// buffer of the device lived, whose ID no state took since, runs nothing: the runtime keeps
+    /// the program of a released state only while an indirect command buffer of the device lives
+    /// (`a_state_released_while_a_buffer_lives_runs_where_a_kernel_names_it`). The M3 Max and the
+    /// UHD Graphics 630 run the released state's program, and the Radeon Pro 5300M fails the
+    /// command buffer with a timeout (docs/graphics-kext/dgpu-oracle.md Q43), which the runtime's
+    /// host step, naming no command buffer, cannot give. By default that is relayed
+    /// (`ReleasedCommandState`, announced as the host step records the execution, on the runtime's
+    /// scheduler thread), counted once, and the process goes on: the command buffer completes with
+    /// no error, as the M3 Max's does, and the device runs the next one. A death there is no Mac's
+    /// answer
     #[test]
     fn released_command_states_are_relayed_by_default() {
         let d = dev();
         let released = rt::Degradation::ReleasedCommandState;
-        let (ended, word) =
-            crate::answer::relaxed_process(|| released_before_the_write::<VulkanPlatform>(&d));
+        let (ended, word) = crate::answer::relaxed_process(|| {
+            released_before_the_write::<VulkanPlatform>(&d, false)
+        });
         assert_eq!(ended, (COMPLETED, None), "the command buffer");
         assert_eq!(word, 0, "the command ran nothing");
         let counted = crate::answer::relayed_counts();
         assert_eq!(counted, [(released, 1)], "the kinds of DIES relayed");
         // The device goes on: a command the CPU encoded with a live state runs.
         assert_eq!(released_state_marks::<VulkanPlatform>(&d), 1);
+    }
+
+    /// An execution of a command a kernel encoded naming a state the program released before any
+    /// command buffer that may write the buffer's records was encoded, while an indirect command
+    /// buffer of the device lived, whose ID no state took since, runs the released state's
+    /// program, as the M3 Max's and the UHD Graphics 630's does, where the Radeon Pro 5300M fails
+    /// the command buffer with a timeout (docs/graphics-kext/dgpu-oracle.md Q43): the device keeps
+    /// the program of each freed ID's last holder while an indirect command buffer of it lives,
+    /// and a buffer the GPU may write takes those at its first such write. Nothing is announced,
+    /// and the command buffer completes with no error, as the M3 Max's does
+    #[test]
+    fn a_state_released_while_a_buffer_lives_runs_where_a_kernel_names_it() {
+        let d = dev();
+        let (ended, word) = crate::answer::relaxed_process(|| {
+            released_before_the_write::<VulkanPlatform>(&d, true)
+        });
+        assert_eq!(ended, (COMPLETED, None), "the command buffer");
+        assert_eq!(word, 1, "the released state's program ran");
+        assert_eq!(
+            crate::answer::relayed_counts(),
+            [],
+            "the kinds of DIES relayed"
+        );
     }
 
     /// An indirect command buffer made with `MTLResourceOptions` bit 24, Metal's private option,
@@ -3382,8 +3419,9 @@ mod tests {
     /// ID nothing took, runs the released state's program: the runtime keeps the program of a
     /// state of indirect command buffer support released after a command buffer that may write
     /// the buffer's records was encoded, and announces nothing (`ReleasedCommandState` covers
-    /// what it does not keep, `released_command_states_are_relayed_by_default`). Metal's is the
-    /// same (`metal_tests`)
+    /// what it does not keep: a state released while no indirect command buffer of the device
+    /// lived, `released_command_states_are_relayed_by_default`). Metal's is the same
+    /// (`metal_tests`)
     #[test]
     fn an_execution_of_a_record_the_gpu_wrote_naming_a_released_state_runs_it() {
         assert_eq!(released_state_marks::<VulkanPlatform>(&dev()), 1);

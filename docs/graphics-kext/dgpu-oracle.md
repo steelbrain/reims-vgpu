@@ -2347,16 +2347,16 @@ did.
 - **A state released before the write, its ID taken by none** *(class 2)*. The M3 Max and the 630
   run it; the 5300M times the command buffer out.
 
-What our stack does (metal2vulkan ce54ad8b25): a record the GPU wrote runs the program of the state
-that held the ID as the GPU last could write the buffer's records, a released one's where the buffer
-kept it: from a release after a command buffer that may write the records was encoded, so the
-second shape is every Mac's. In the first shape the command runs nothing and its command buffer
-completes, no Mac's answer *(class 4)*, relayed (`released-command-state`), where until 11-14 the
-process ended. In the fourth the runtime runs x, the state the CPU set, as it cannot tell the GPU's
-write of the ID from the CPU's, where the M3 Max and the 5300M run y *(class 4)*, relayed alike; the
-fifth runs x, every Mac's answer, and is relayed too. Each exact answer is the runtime's to build:
-the program of each ID's last released holder kept until another state takes the ID, and a record's
-state told written by the GPU or set by the CPU.
+What our stack does (metal2vulkan d9236a8a11, v0.2.0): a record the GPU wrote runs the program of
+the state that held the ID as the GPU last could write the buffer's records, released since or not:
+the device keeps the program of each freed ID's last holder while an indirect command buffer of it
+lives, and a buffer the GPU may write takes those at its first such write, so the second shape is
+every Mac's. In the first shape x runs and the command buffer completes, the M3 Max's and the 630's
+answer *(class 2)*, unannounced. The record tells a pipeline a kernel wrote from one the CPU set, so
+the fourth shape runs y, the ID's last holder, and the fifth x, every Mac's answer, both
+unannounced. Still relayed (`released-command-state`), the command running nothing, no Mac's answer
+*(class 4)*: a state released while no indirect command buffer of the device lived, or past its
+ID's last four holders. Until 11-14 the process ended there.
 
 ## Q44: an indirect command buffer made with `MTLResourceOptions` bit 24
 
