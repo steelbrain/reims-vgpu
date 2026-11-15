@@ -37,7 +37,7 @@ every call to the host are the device's, and a window's are the window's.
 
 | object | made by | released by | its end |
 |---|---|---|---|
-| `RvgGraphicsDevice` | `rvg_graphics_device_create` | `rvg_graphics_device_release` | its window closes and its threads end at its release, waited for by nothing but the release of the process's last device ("The process's exit"); its region stays mapped until both threads and the window's GPU work have let it go |
+| `RvgGraphicsDevice` | `rvg_graphics_device_create` | `rvg_graphics_device_release` | its windows close and its threads end at its release, waited for by nothing but the release of the process's last device ("The process's exit"); its region stays mapped until both threads and the window's GPU work have let it go |
 
 - **One reference.** The host owns exactly one reference to a device; there is no retain.
 - **NULL.** A release of NULL does nothing. Elsewhere a NULL handle is `RVG_ERR_INVALID_ARGUMENT`
@@ -56,12 +56,15 @@ Every struct the host fills in, and every struct the library hands out, starts w
     zero, and is `RVG_ERR_UNSUPPORTED` otherwise. A host built against a newer header then works
     with an older library as long as it leaves the new fields at zero.
   - `RvgWindowConfig` and `RvgWindowCallbacks` are at their first version.
-    `RvgGraphicsDeviceConfig` is at its third: the second added `guest_arch`, and a host built
+    `RvgGraphicsDeviceConfig` is at its fourth: the second added `guest_arch`, and a host built
     before it, whose `struct_size` ends before that field, serves an x86-64 guest; the third added
-    `doorbell_pages`, and a host built before it maps no doorbell pages. `RvgGraphicsCallbacks` is
-    at its third: the second added `route_doorbell`, and a host built before it routes no
-    doorbell; the third added `route_doorbell_page`, and a host built before it routes none on a
-    doorbell page. A struct that
+    `doorbell_pages`, and a host built before it maps no doorbell pages; the fourth added
+    `display_count` and `display_windows`, and a host built before it makes a device of one
+    display. `RvgGraphicsCallbacks` is at its fourth: the second added `route_doorbell`, and a host
+    built before it routes no doorbell; the third added `route_doorbell_page`, and a host built
+    before it routes none on a doorbell page; the fourth added `cursor_glyph_at`, `cursor_show_at`
+    and `cursor_move_at`, and a host built before it is told the cursor of display 0 alone. A
+    struct that
     grows keeps its first version's size as the least it accepts, and reads the later fields of a
     host built before them as zero.
 - **A struct the library writes** (`RvgCursorGlyph`, `RvgWindowScroll`): the host reads a field
@@ -79,14 +82,16 @@ unknown status as a failure.
 | value | name | when |
 |---|---|---|
 | 0 | `RVG_OK` | |
-| 1 | `RVG_ERR_INVALID_ARGUMENT` | a NULL handle, config or out-pointer where one is needed; a `struct_size` too small; a refused memory file; a `guest_arch` that is none of `RVG_GUEST_ARCH_*`; a `doorbell_pages` other than 0 or 1; a doorbell that is not open, or a second one; `read_display`'s destination missing or too short |
+| 1 | `RVG_ERR_INVALID_ARGUMENT` | a NULL handle, config or out-pointer where one is needed; a `struct_size` too small; a refused memory file; a `guest_arch` that is none of `RVG_GUEST_ARCH_*`; a `doorbell_pages` other than 0 or 1; a `display_count` past `RVG_GRAPHICS_DISPLAYS_MAX`, or `display_windows` not given exactly where `window` is (one for each display from 1), or holding NULL; a doorbell that is not open, or a second one; `read_display`'s destination missing or too short; `read_display_at`'s display at or past the device's count |
 | 2 | `RVG_ERR_UNSUPPORTED` | a larger `struct_size` with non-zero bytes the library does not know |
 | 3 | `RVG_ERR_METAL` | the platform refused the display's texture or its draw (`rvg_graphics_device_read_display`) |
 | 4 | `RVG_ERR_GPU` | the call's GPU work ended with an error |
 | 5 | `RVG_ERR_HOST_RESOURCES` | the host refused the device's region (its memory), a pipe or a thread, or has no GPU device the library can use: none, or one its Vulkan driver refused |
 
 `rvg_graphics_device_create` reads, in order, the config, its callbacks, its window config and the
-window's callbacks, then the memory map and the files behind its ranges. The struct checks
+window's callbacks, each display window's config and callbacks from display 1 on (where the
+window is given and the count is one the device takes), then the memory map and the files behind
+its ranges. The struct checks
 (`INVALID_ARGUMENT`, `UNSUPPORTED`) come first and touch nothing. The files are refused when given
 without a map, then, range by range from the first, for an `fd` below -1, for `flags` other than 0,
 and, for an `fd` of 0 or more, for a file `fstat` cannot read, a file holding fewer than `offset`
@@ -109,8 +114,9 @@ refusal logs a line saying which, and no file is duplicated until every entry ha
   release of the process's last graphics device waits for the device's threads: that one waits
   for them at most 5 s ("The process's exit"). A STATUS write of 0 and `rvg_graphics_device_reset` wait only for the command the device's control
   thread is taking, and for a take of a queue's ring or a post onto one under way, none of which
-  waits for anything of the host's. `rvg_graphics_device_read_display` waits for its own draw on the
-  GPU, on a queue of its own, and one read runs at a time.
+  waits for anything of the host's. `rvg_graphics_device_read_display` and `_read_display_at`
+  wait for their own draw on the GPU, on a queue of its own, and one read of each display runs at
+  a time.
 
 ### What may be called inside a callback
 
@@ -118,7 +124,7 @@ refusal logs a line saying which, and no file is duplicated until every entry ha
 |---|---|
 | `raise_interrupt` | `rvg_status_message` and the `rvg_graphics_device_*` functions, except the release of its own device |
 | `route_doorbell`, `route_doorbell_page` | nothing |
-| `cursor_glyph`, `cursor_show`, `cursor_move` | every function: the library never waits for the display thread |
+| `cursor_glyph`, `cursor_show`, `cursor_move` and their `_at` forms | every function: the library never waits for the display thread |
 | a window callback (`pointer`, `wheel`, `key`, `close`, `scroll`) | every function; it must not block (section 5) |
 | a `destroy` | nothing |
 
@@ -167,17 +173,17 @@ pauses it keeps its device to the exit, and so does a quit while a read of its d
 
 ## 2. The C header
 
-The header has the ten functions, every type, callback typedef and constant, with the thread and
+The header has the twelve functions, every type, callback typedef and constant, with the thread and
 ordering rules on each callback and each function. Its preamble states the rules for handles,
 configs, callbacks and deaths. The C API's tests compile it as C11, as C++17 and, on macOS, as
 Objective-C.
 
 | group | items |
 |---|---|
-| constants | the status codes; the PCI facts (`RVG_GRAPHICS_PCI_VENDOR_ID` 0x1234, `_DEVICE_ID` 0x5247, `_CLASS` 0x380, `RVG_GRAPHICS_PCI_BAR_REGISTERS` 0, `RVG_GRAPHICS_REGISTERS_SIZE` 4096, `RVG_GRAPHICS_MSIX_OFFSET` 2048, `RVG_GRAPHICS_MSIX_VECTORS` 1, `RVG_GRAPHICS_PCI_BAR_REGION` 2, `RVG_GRAPHICS_PCI_BAR_DOORBELLS` 4, `RVG_GRAPHICS_DOORBELLS_SIZE` 4 MiB, `RVG_GRAPHICS_DOORBELL_PAGE_SIZE` 16 KiB, `RVG_GRAPHICS_DOORBELL_PAGES` 256); the doorbell (`RVG_GRAPHICS_REG_DOORBELL`, `RVG_GRAPHICS_DOORBELL_CONTROL`); `RVG_GRAPHICS_ALLOCATIONS_OFFSET`; `RVG_GUEST_ARCH_X86_64` 0 and `RVG_GUEST_ARCH_ARM64` 1; `RVG_WINDOW_BUTTON_*`, `RVG_WINDOW_SCROLL_PHASE_*`, `RVG_WINDOW_SCROLL_MOMENTUM_*` |
+| constants | the status codes; the PCI facts (`RVG_GRAPHICS_PCI_VENDOR_ID` 0x1234, `_DEVICE_ID` 0x5247, `_CLASS` 0x380, `RVG_GRAPHICS_PCI_BAR_REGISTERS` 0, `RVG_GRAPHICS_REGISTERS_SIZE` 4096, `RVG_GRAPHICS_MSIX_OFFSET` 2048, `RVG_GRAPHICS_MSIX_VECTORS` 1, `RVG_GRAPHICS_PCI_BAR_REGION` 2, `RVG_GRAPHICS_PCI_BAR_DOORBELLS` 4, `RVG_GRAPHICS_DOORBELLS_SIZE` 4 MiB, `RVG_GRAPHICS_DOORBELL_PAGE_SIZE` 16 KiB, `RVG_GRAPHICS_DOORBELL_PAGES` 256); `RVG_GRAPHICS_DISPLAYS_MAX` 4; the doorbell (`RVG_GRAPHICS_REG_DOORBELL`, `RVG_GRAPHICS_DOORBELL_CONTROL`); `RVG_GRAPHICS_ALLOCATIONS_OFFSET`; `RVG_GUEST_ARCH_X86_64` 0 and `RVG_GUEST_ARCH_ARM64` 1; `RVG_WINDOW_BUTTON_*`, `RVG_WINDOW_SCROLL_PHASE_*`, `RVG_WINDOW_SCROLL_MOMENTUM_*` |
 | status | `rvg_status_message` |
-| the device | `RvgGraphicsDeviceConfig`, `RvgGuestArch`, `RvgGraphicsCallbacks` and its function types, `RvgCursorGlyph`, `RvgDisplayCoord`, `RvgMemoryMap`, `RvgMemoryRange`, `RvgMemoryRangeFile`; `rvg_graphics_device_create`, `_release`, `_region`, `_mmio_read`, `_mmio_write_taking`, `_doorbell_write`, `_set_doorbell`, `_reset`, `_read_display`, `_cursor_position` |
-| its window | `RvgWindowConfig`, `RvgWindowCallbacks`, `RvgWindowPointerFn`, `RvgWindowWheelFn`, `RvgWindowKeyFn`, `RvgWindowCloseFn`, `RvgWindowScrollFn`, `RvgWindowScroll`; no function of its own: `RvgGraphicsDeviceConfig.window` carries it |
+| the device | `RvgGraphicsDeviceConfig`, `RvgGuestArch`, `RvgGraphicsCallbacks` and its function types, `RvgCursorGlyph`, `RvgDisplayCoord`, `RvgMemoryMap`, `RvgMemoryRange`, `RvgMemoryRangeFile`; `rvg_graphics_device_create`, `_release`, `_region`, `_mmio_read`, `_mmio_write_taking`, `_doorbell_write`, `_set_doorbell`, `_reset`, `_read_display`, `_cursor_position`, `_read_display_at`, `_cursor_position_at` |
+| its windows | `RvgWindowConfig`, `RvgWindowCallbacks`, `RvgWindowPointerFn`, `RvgWindowWheelFn`, `RvgWindowKeyFn`, `RvgWindowCloseFn`, `RvgWindowScrollFn`, `RvgWindowScroll`; no function of their own: `RvgGraphicsDeviceConfig.window` carries display 0's, and `display_windows` those of displays 1 and up |
 
 ### Windows forms
 
@@ -202,7 +208,8 @@ Two items take the host's OS handles, and Windows has its own form of each, unde
 ### Settings and the environment
 
 Everything a host can set that shapes what the library does, beside the guest's own input:
-- **The config**: the device's callbacks, its window (its callbacks and the mode it opens at),
+- **The config**: the device's callbacks, how many displays it has (1 to 4), each display's window
+  (its callbacks and the mode it opens at),
   the guest's RAM with the files behind it, which let the GPU use an IOSurface's own pages in place
   and, on a host GPU that shares the CPU's memory, set the device's `recommendedMaxWorkingSetSize`
   (three quarters of that RAM, at most the host GPU's answer), and the guest's architecture,
@@ -245,8 +252,10 @@ Rust enum; the handle is a Rust struct cbindgen emits as opaque; the configs are
   default platform (`VulkanPlatform`) or `with_platform`, so its
   forwarding is unit-tested on core's fake platform;
 - `GraphicsConfig`: `GraphicsCallbacks` (closures, `Arc<dyn Fn … + Send + Sync>`, each optional),
-  an optional `WindowConfig`, an optional `MemoryMap` with its `MemoryFile`s, and the guest's
-  `GuestArch` (`X86_64`, the default, or `Arm64`);
+  an optional `WindowConfig`, the display count and the windows of displays 1 and up, an optional
+  `MemoryMap` with its `MemoryFile`s, and the guest's `GuestArch` (`X86_64`, the default, or
+  `Arm64`); `GraphicsDevice::read_display_at` and `cursor_position_at` name a display, and
+  `display_count` answers how many there are;
 - `Error`: `InvalidArgument`, `Metal`, `Gpu`, `HostResources`, the C API's statuses but
   `UNSUPPORTED`, which only the C layer's struct checks give;
 - the host video types (`GraphicsVideo`, `PlanePages`, `VideoDecode`, `VideoPlane`), through which
@@ -271,6 +280,8 @@ returns. The library logs through the `log` crate; a Rust host installs its own 
 | `rvg_graphics_device_reset` | `route_doorbell` and `route_doorbell_page`, dropping routes | the command the control thread is taking, and a ring's take or post under way |
 | `rvg_graphics_device_read_display` | never | its draw on the GPU |
 | `rvg_graphics_device_cursor_position` | never | nothing |
+| `rvg_graphics_device_read_display_at` | never | its draw on the GPU |
+| `rvg_graphics_device_cursor_position_at` | never | nothing |
 
 ## 5. Callbacks and threads
 
@@ -278,9 +289,9 @@ returns. The library logs through the `log` crate; a Rust host installs its own 
 
 | callback | thread | serialized with | order |
 |---|---|---|---|
-| `raise_interrupt` | the thread that posts the event it raises for: the device's control thread, `reims-vgpu.graphics-control`; one of ring 0's threads, `reims-vgpu.graphics-ring0-<i>`, which carry out a guest process's control messages, its presents and a block's pages and downloads, each on its lane; its refresh thread, `reims-vgpu.graphics-refresh`; a command queue's service thread, `reims-vgpu.graphics-queue-<id>`, or one of its lane's threads, which walk and commit its command buffers, `reims-vgpu.graphics-lane-<id>`; a pipeline compile's thread, `reims-vgpu.graphics-compile-<n>`; a thread that makes IOSurfaces' and pages blocks' views, `reims-vgpu.graphics-surfaces-<i>`; a thread that makes indirect command buffers, `reims-vgpu.icb-create-<i>`; a thread that lets go of a closed process's objects and answers its close, `reims-vgpu.graphics-closes-<i>`; or the platform's thread that runs a command buffer's scheduled or completed handler; or the host's own, inside `rvg_graphics_device_mmio_write_taking` or `rvg_graphics_device_doorbell_write`. Never inside another call of the host's | nothing: they may call at once | each after the completion ring's message it raises for is published |
+| `raise_interrupt` | the thread that posts the event it raises for: the device's control thread, `reims-vgpu.graphics-control`; one of ring 0's threads, `reims-vgpu.graphics-ring0-<i>`, which carry out a guest process's control messages, its presents and a block's pages and downloads, each on its lane; a display's refresh thread, `reims-vgpu.graphics-refresh` (display 0's) and, on a device of several displays, `reims-vgpu.graphics-refresh-<i>`; a command queue's service thread, `reims-vgpu.graphics-queue-<id>`, or one of its lane's threads, which walk and commit its command buffers, `reims-vgpu.graphics-lane-<id>`; a pipeline compile's thread, `reims-vgpu.graphics-compile-<n>`; a thread that makes IOSurfaces' and pages blocks' views, `reims-vgpu.graphics-surfaces-<i>`; a thread that makes indirect command buffers, `reims-vgpu.icb-create-<i>`; a thread that lets go of a closed process's objects and answers its close, `reims-vgpu.graphics-closes-<i>`; or the platform's thread that runs a command buffer's scheduled or completed handler; or the host's own, inside `rvg_graphics_device_mmio_write_taking` or `rvg_graphics_device_doorbell_write`. Never inside another call of the host's | nothing: they may call at once | each after the completion ring's message it raises for is published |
 | `route_doorbell`, `route_doorbell_page` (the route of a queue whose process has a doorbell page, at that page's doorbell in BAR 4) | one of ring 0's threads, `reims-vgpu.graphics-ring0-<i>`, or the control thread, `reims-vgpu.graphics-control`, as a command queue is made, destroyed or its process closed, with no lock of the library's held, where it may wait for a lock the host holds while it calls the device (QEMU's BQL), since no function the host calls under it waits for a thread inside the callback but the release of the process's last device, at most 5 s; dropping a route, also the host's own inside `rvg_graphics_device_mmio_write_taking` (a STATUS write of 0, or a `DOORBELL_PAGE_BIND` write that binds a page to another context) or `rvg_graphics_device_reset`, where it must not wait for a lock the host holds around that call | nothing: they may call at once | a queue's route before its create is answered, and its drop once its queue has ended and before its destroy, its process's close or the reset is answered; a dropped route takes no write once the call returns |
-| `cursor_glyph`, `cursor_show`, `cursor_move` | the display thread: one serial worker for the whole process (after 5 s idle it exits, and the next callback starts a new one) | every display callback of the process: one at a time | the order the device's control thread took the guest's cursor and display power commands, and its resets |
+| `cursor_glyph`, `cursor_show`, `cursor_move` (display 0's), and `cursor_glyph_at`, `cursor_show_at`, `cursor_move_at` (each display's from 1, named) | the display thread: one serial worker for the whole process (after 5 s idle it exits, and the next callback starts a new one) | every display callback of the process: one at a time | the order the device's control thread took the guest's cursor and display power commands, of every display, and its resets |
 | a window's `pointer`, `wheel`, `key`, `close`, `scroll` | on macOS the process's main thread, where AppKit runs; on Linux and Windows the library's thread `reims-vgpu.ui`; never inside a call of the host's | every window callback of the process: one at a time | the order the events arrived |
 | `destroy` (each table) | the device's: once its threads have ended, after their last callback, possibly on one of them after the release has returned; the window's: once the release has closed the window, on the releasing thread or, while a window callback runs, the window's thread once it returns; either, on the caller's thread, in a refused create | nothing | once, after every call of its table |
 

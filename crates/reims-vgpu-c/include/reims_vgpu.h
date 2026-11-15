@@ -166,6 +166,9 @@
 // How many doorbell pages BAR 4 holds.
 #define RVG_GRAPHICS_DOORBELL_PAGES 256
 
+// The most displays a graphics device has (RvgGraphicsDeviceConfig's `display_count`).
+#define RVG_GRAPHICS_DISPLAYS_MAX 4
+
 // An x86-64 guest: the default, and what a host built before `guest_arch` serves.
 #define RVG_GUEST_ARCH_X86_64 0
 
@@ -186,8 +189,9 @@ typedef void (*RvgDestroyFn)(void *ctx);
 // Thread: the one that posts the event it raises for: the device's control thread
 // (`reims-vgpu.graphics-control`), one of ring 0's threads (`reims-vgpu.graphics-ring0-<i>`),
 // which carry out a guest process's control messages, its presents and a block's pages and
-// downloads, each on its lane, its refresh thread
-// (`reims-vgpu.graphics-refresh`), a command queue's service thread
+// downloads, each on its lane, a display's refresh thread
+// (`reims-vgpu.graphics-refresh`, and `reims-vgpu.graphics-refresh-<i>` for display i from 1),
+// a command queue's service thread
 // (`reims-vgpu.graphics-queue-<id>`) or one of its lane's threads, which walk and commit its
 // command buffers (`reims-vgpu.graphics-lane-<id>`), a pipeline compile's thread
 // (`reims-vgpu.graphics-compile-<n>`), a thread that makes IOSurfaces' and pages blocks' views
@@ -298,6 +302,24 @@ typedef bool (*RvgGraphicsRouteDoorbellPageFn)(void *ctx,
                                                uint32_t ring_id,
                                                int32_t bell);
 
+// `cursor_glyph_at(ctx, display, glyph)`: the guest set the cursor's image of display `display`,
+// 1 or above (display 0's is cursor_glyph).
+//
+// Thread, and what it may call: as RvgCursorGlyphFn, in order with every display callback.
+typedef void (*RvgCursorGlyphAtFn)(void *ctx, uint32_t display, const RvgCursorGlyph *glyph);
+
+// `cursor_show_at(ctx, display, show)`: whether display `display`'s cursor shows changed, 1 or
+// above (display 0's is cursor_show).
+//
+// Thread, and what it may call: as RvgCursorGlyphFn, in order with every display callback.
+typedef void (*RvgCursorShowAtFn)(void *ctx, uint32_t display, uint8_t show);
+
+// `cursor_move_at(ctx, display)`: the guest moved display `display`'s cursor, 1 or above
+// (display 0's is cursor_move); rvg_graphics_device_cursor_position_at reads where.
+//
+// Thread, and what it may call: as RvgCursorGlyphFn, in order with every display callback.
+typedef void (*RvgCursorMoveAtFn)(void *ctx, uint32_t display);
+
 // The graphics device's callbacks.
 //
 // The cursor's three tell the host the guest's cursor on the device's display, for a host that
@@ -305,7 +327,9 @@ typedef bool (*RvgGraphicsRouteDoorbellPageFn)(void *ctx,
 // shows it either way. Thread, and what they may call: as RvgCursorGlyphFn's, on the display
 // thread, one at a time with every display callback of the process, in the order the device
 // took the guest's cursor and display power commands and resets. The guest sees nothing of
-// whether the host gives them.
+// whether the host gives them. They are display 0's; on a device of several displays
+// (RvgGraphicsDeviceConfig's `display_count`) the `_at` three are those of displays 1 and up,
+// each called as display 0's is, naming the display, in order with every display callback.
 typedef struct {
   // sizeof(RvgGraphicsCallbacks) as the host was compiled.
   uint32_t struct_size;
@@ -331,6 +355,15 @@ typedef struct {
   // Routes a command queue's plain doorbell on its process's doorbell page into its bell, or
   // drops the route. A host built before it, whose `struct_size` ends before it, gives none.
   RvgGraphicsRouteDoorbellPageFn route_doorbell_page;
+  // cursor_glyph of display 1 and up. A host built before it, whose `struct_size` ends before
+  // it, gives none.
+  RvgCursorGlyphAtFn cursor_glyph_at;
+  // cursor_show of display 1 and up, hidden until its first call. A host built before it gives
+  // none.
+  RvgCursorShowAtFn cursor_show_at;
+  // cursor_move of display 1 and up: rvg_graphics_device_cursor_position_at reads where. A
+  // host built before it gives none.
+  RvgCursorMoveAtFn cursor_move_at;
 } RvgGraphicsCallbacks;
 
 // `pointer(ctx, x, y, width, height, buttons)`: the pointer is at (`x`, `y`) in the guest's
@@ -546,6 +579,25 @@ typedef struct {
   // kext. 0 for none, as a host built before this field, whose `struct_size` ends before it,
   // has. Refused (RVG_ERR_INVALID_ARGUMENT): any other value.
   uint32_t doorbell_pages;
+  // How many displays the device has: 0 and 1 are one display, as a host built before this
+  // field, whose `struct_size` ends before it, has; 2 to RVG_GRAPHICS_DISPLAYS_MAX make a device
+  // of that many, each with its own scanout, mode, cursor, presents and colour, which the
+  // guest's driver sees where it takes the reims-graphics wire's MULTI_DISPLAY (one that does
+  // not sees display 0 alone). Each display's scanout keeps to an even share of the scanout's
+  // room, and is offered the largest mode of its window's ratio that fits there. Display 0 is
+  // the one every other function and callback names; rvg_graphics_device_read_display_at,
+  // rvg_graphics_device_cursor_position_at and the `_at` cursor callbacks name each display.
+  // Refused (RVG_ERR_INVALID_ARGUMENT): any other value.
+  uint32_t display_count;
+  // The window configs of displays 1 to `display_count - 1`, an array of that many pointers,
+  // each to a window config read as `window` is, its window opened as `window`'s, on the window
+  // crate's port of its display (titled "Reims vGPU (port N)" and placed on host screen N, as
+  // REIMS_VGPU_WINDOW_SCREENS picks), given exactly where `window` is: with `window` and more
+  // than one display, `display_count - 1` non-NULL pointers; otherwise NULL. Refused
+  // (RVG_ERR_INVALID_ARGUMENT): one given where `window` is NULL or the device has one
+  // display, missing where `window` is given and it has several, or a NULL entry. A host built
+  // before this field gives none.
+  const RvgWindowConfig *const *display_windows;
 } RvgGraphicsDeviceConfig;
 
 #ifdef __cplusplus
@@ -557,9 +609,9 @@ extern "C" {
 const char *rvg_status_message(RvgStatus status);
 
 // A new graphics device, its region mapped and zeroed, its threads started, with a window for
-// its display where the config gives one. Its config and window config are read, with their
-// tables, before either table is the library's: a struct_size refusal runs no destroy, and a
-// later refusal runs both, the window's first. Refusals: RVG_ERR_INVALID_ARGUMENT,
+// each display where the config gives them. Its config and window configs are read, with their
+// tables, before any table is the library's: a struct_size refusal runs no destroy, and a later
+// refusal runs each, the windows' first, display 0's first. Refusals: RVG_ERR_INVALID_ARGUMENT,
 // RVG_ERR_UNSUPPORTED, RVG_ERR_HOST_RESOURCES (the host refused the region's memory, a pipe or
 // a thread, or has no GPU device the library can use: none, or one its driver refused). Calls
 // back: never, but a refusal's destroys.
@@ -714,6 +766,33 @@ RvgStatus rvg_graphics_device_read_display(RvgGraphicsDevice *device,
 // # Safety
 // `device` is a live graphics device handle.
 RvgDisplayCoord rvg_graphics_device_cursor_position(const RvgGraphicsDevice *device);
+
+// What display `display` of the device shows now, read back into `dst`, as
+// rvg_graphics_device_read_display reads display 0's, which is this with `display` 0: at the
+// display's own mode, the size the guest is told for it. RVG_ERR_INVALID_ARGUMENT, with nothing
+// written to `dst` and `*width` and `*height` 0, for a display at or past the device's count
+// (RvgGraphicsDeviceConfig's `display_count`); otherwise as rvg_graphics_device_read_display.
+// Reads of one display run one at a time. On any thread. Calls back: never.
+//
+// # Safety
+// `device` is a live graphics device handle; `dst` is NULL or holds `dst_length` writable bytes;
+// `width` and `height` are each NULL or writable.
+RvgStatus rvg_graphics_device_read_display_at(RvgGraphicsDevice *device,
+                                              uint32_t display,
+                                              uint8_t *dst,
+                                              size_t dst_length,
+                                              uint32_t *width,
+                                              uint32_t *height);
+
+// Where the guest last put display `display`'s cursor's hot spot, in that display's pixels, as
+// rvg_graphics_device_cursor_position reads display 0's, which is this with `display` 0: (0, 0)
+// before the guest moved it, after a reset, and for a display at or past the device's count. The
+// host reads it at its cursor_move_at. On any thread. Calls back: never.
+//
+// # Safety
+// `device` is a live graphics device handle.
+RvgDisplayCoord rvg_graphics_device_cursor_position_at(const RvgGraphicsDevice *device,
+                                                       uint32_t display);
 
 #ifdef __cplusplus
 }  // extern "C"

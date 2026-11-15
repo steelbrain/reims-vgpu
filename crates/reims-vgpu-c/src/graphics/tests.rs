@@ -22,6 +22,9 @@ fn callbacks() -> RvgGraphicsCallbacks {
         cursor_move: None,
         route_doorbell: None,
         route_doorbell_page: None,
+        cursor_glyph_at: None,
+        cursor_show_at: None,
+        cursor_move_at: None,
     }
 }
 
@@ -34,6 +37,8 @@ fn config(callbacks: &RvgGraphicsCallbacks) -> RvgGraphicsDeviceConfig {
         memory_files: std::ptr::null(),
         guest_arch: RVG_GUEST_ARCH_X86_64,
         doorbell_pages: 0,
+        display_count: 0,
+        display_windows: std::ptr::null(),
     }
 }
 
@@ -137,14 +142,14 @@ fn refused_graphics_configs() {
             rvg_graphics_device_create(&c, &mut device),
             RVG_ERR_INVALID_ARGUMENT
         );
-        let mut big = [0u8; 64];
+        let mut big = [0u8; 80];
         std::ptr::copy_nonoverlapping(
             std::ptr::from_ref(&config(&cb)).cast::<u8>(),
             big.as_mut_ptr(),
             size_of::<RvgGraphicsDeviceConfig>(),
         );
-        big[0] = 64;
-        big[60] = 1;
+        big[0] = 80;
+        big[76] = 1;
         assert_eq!(
             rvg_graphics_device_create(big.as_ptr().cast(), &mut device),
             RVG_ERR_UNSUPPORTED
@@ -285,6 +290,114 @@ fn the_doorbell_pages_the_host_maps_decide_the_feature() {
         unsafe { rvg_graphics_device_create(&c, &mut device) },
         RVG_ERR_INVALID_ARGUMENT
     );
+}
+
+/// `MULTI_DISPLAY`, `FEATURES_HI` bit 16, read from a device made from `c`, with what reading
+/// each display and one past them answers.
+fn displays_of(c: &RvgGraphicsDeviceConfig) -> (bool, Vec<(RvgStatus, u32, u32)>, RvgDisplayCoord) {
+    const MULTI_DISPLAY: u32 = 1 << 16;
+    let mut device = std::ptr::null_mut();
+    // SAFETY: a live config and out-pointer; then a live device, its reads given NULL buffers
+    // and writable sizes, released.
+    unsafe {
+        assert_eq!(rvg_graphics_device_create(c, &mut device), RVG_OK);
+        let hi = rvg_graphics_device_mmio_read(device, 0x00c);
+        let reads = (0..=RVG_GRAPHICS_DISPLAYS_MAX)
+            .map(|display| {
+                let (mut width, mut height) = (7, 7);
+                let status = rvg_graphics_device_read_display_at(
+                    device,
+                    display,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut width,
+                    &mut height,
+                );
+                (status, width, height)
+            })
+            .collect();
+        let past = rvg_graphics_device_cursor_position_at(device, RVG_GRAPHICS_DISPLAYS_MAX);
+        rvg_graphics_device_release(device);
+        (hi & MULTI_DISPLAY != 0, reads, past)
+    }
+}
+
+/// A config's `display_count` makes that many displays, 0 and 1 one, as a config whose
+/// `struct_size` ends before the field: two or more offer `MULTI_DISPLAY`, and each display reads
+/// back at its mode, 1920 x 1080 with no window, where a display past them is refused with a
+/// size of 0 x 0 and its cursor at (0, 0); a callback table whose `struct_size` ends before
+/// `cursor_glyph_at` is taken
+#[test]
+fn the_display_count_makes_the_displays() {
+    let cb = RvgGraphicsCallbacks {
+        struct_size: std::mem::offset_of!(RvgGraphicsCallbacks, cursor_glyph_at) as u32,
+        destroy: None,
+        ..callbacks()
+    };
+    let shown = (RVG_ERR_INVALID_ARGUMENT, 1920, 1080);
+    let past = (RVG_ERR_INVALID_ARGUMENT, 0, 0);
+    let mut c = config(&cb);
+    for count in 0..=RVG_GRAPHICS_DISPLAYS_MAX {
+        c.display_count = count;
+        let (multi, reads, cursor) = displays_of(&c);
+        let made = count.max(1) as usize;
+        assert_eq!(multi, made > 1, "{count} displays");
+        assert!(
+            reads[..made].iter().all(|r| *r == shown),
+            "{count}: {reads:?}"
+        );
+        assert!(
+            reads[made..].iter().all(|r| *r == past),
+            "{count}: {reads:?}"
+        );
+        assert_eq!(cursor, RvgDisplayCoord { x: 0, y: 0 });
+    }
+    // A host built before the field reads one display whatever lies past its size.
+    c.display_count = 3;
+    c.struct_size = std::mem::offset_of!(RvgGraphicsDeviceConfig, display_count) as u32;
+    let (multi, reads, _) = displays_of(&c);
+    assert!(!multi);
+    assert_eq!(reads[1], past);
+}
+
+/// A display count past `RVG_GRAPHICS_DISPLAYS_MAX`, and display windows not given exactly where
+/// display 0's window is, are refused once the tables are the library's, running their destroys
+#[test]
+fn refused_display_configs() {
+    let cb = callbacks();
+    let window = RvgWindowConfig {
+        struct_size: size_of::<RvgWindowConfig>() as u32,
+        callbacks: std::ptr::null(),
+        mode_width: 0,
+        mode_height: 0,
+    };
+    let one: [*const RvgWindowConfig; 1] = [&window];
+    let none: [*const RvgWindowConfig; 1] = [std::ptr::null()];
+    let refused = |c: &RvgGraphicsDeviceConfig| {
+        let mut device = std::ptr::null_mut();
+        let before = DESTROYS.load(Ordering::SeqCst);
+        // SAFETY: a live config and out-pointer.
+        let status = unsafe { rvg_graphics_device_create(c, &mut device) };
+        assert!(device.is_null());
+        (status, DESTROYS.load(Ordering::SeqCst) - before)
+    };
+    let mut c = config(&cb);
+    c.display_count = RVG_GRAPHICS_DISPLAYS_MAX + 1;
+    assert_eq!(refused(&c), (RVG_ERR_INVALID_ARGUMENT, 1));
+    // Windows of displays 1 and up with no window of display 0's.
+    c.display_count = 2;
+    c.display_windows = one.as_ptr();
+    assert_eq!(refused(&c), (RVG_ERR_INVALID_ARGUMENT, 1));
+    // Display 0's window with none of display 1's, or a NULL one.
+    c.window = &window;
+    c.display_windows = std::ptr::null();
+    assert_eq!(refused(&c), (RVG_ERR_INVALID_ARGUMENT, 1));
+    c.display_windows = none.as_ptr();
+    assert_eq!(refused(&c), (RVG_ERR_INVALID_ARGUMENT, 1));
+    // Windows given for a device of one display.
+    c.display_count = 1;
+    c.display_windows = one.as_ptr();
+    assert_eq!(refused(&c), (RVG_ERR_INVALID_ARGUMENT, 1));
 }
 
 static MOVES: AtomicUsize = AtomicUsize::new(0);

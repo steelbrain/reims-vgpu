@@ -108,6 +108,9 @@ fn a_panic_in_a_callback_of_the_first_export_ends_in_the_hook() {
             cursor_move: None,
             route_doorbell: None,
             route_doorbell_page: None,
+            cursor_glyph_at: None,
+            cursor_show_at: None,
+            cursor_move_at: None,
         };
         let config = crate::graphics::RvgGraphicsDeviceConfig {
             struct_size: crate::sized::size_u32::<crate::graphics::RvgGraphicsDeviceConfig>(),
@@ -117,6 +120,8 @@ fn a_panic_in_a_callback_of_the_first_export_ends_in_the_hook() {
             memory_files: std::ptr::null(),
             guest_arch: crate::graphics::RVG_GUEST_ARCH_X86_64,
             doorbell_pages: 0,
+            display_count: 0,
+            display_windows: std::ptr::null(),
         };
         // SAFETY: a live config; a NULL out-pointer, which the create refuses.
         let _ =

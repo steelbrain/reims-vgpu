@@ -1,11 +1,15 @@
-//! The guest's cursor on the graphics device's display, as the host is told it
-//! (`RvgGraphicsCallbacks`' `cursor_*`): [`RvgCursorGlyph`], the three callback types, and the
-//! position [`RvgDisplayCoord`] that `rvg_graphics_device_cursor_position` answers.
+//! The guest's cursor on the graphics device's displays, as the host is told it
+//! (`RvgGraphicsCallbacks`' `cursor_*`): [`RvgCursorGlyph`], the callback types of display 0 and
+//! of displays 1 and up (`_at`), and the position [`RvgDisplayCoord`] that
+//! `rvg_graphics_device_cursor_position` and `rvg_graphics_device_cursor_position_at` answer.
 
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use reims_vgpu::{CursorGlyph, CursorGlyphFn, CursorMoveFn, CursorShowFn};
+use reims_vgpu::{
+    CursorGlyph, CursorGlyphAtFn, CursorGlyphFn, CursorMoveAtFn, CursorMoveFn, CursorShowAtFn,
+    CursorShowFn,
+};
 
 use crate::ffi;
 use crate::sized;
@@ -64,27 +68,54 @@ pub type RvgCursorShowFn = Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, 
 /// Thread, and what it may call: as RvgCursorGlyphFn.
 pub type RvgCursorMoveFn = Option<unsafe extern "C-unwind" fn(ctx: *mut c_void)>;
 
+/// `cursor_glyph_at(ctx, display, glyph)`: the guest set the cursor's image of display `display`,
+/// 1 or above (display 0's is cursor_glyph).
+///
+/// Thread, and what it may call: as RvgCursorGlyphFn, in order with every display callback.
+pub type RvgCursorGlyphAtFn = Option<
+    unsafe extern "C-unwind" fn(ctx: *mut c_void, display: u32, glyph: *const RvgCursorGlyph),
+>;
+
+/// `cursor_show_at(ctx, display, show)`: whether display `display`'s cursor shows changed, 1 or
+/// above (display 0's is cursor_show).
+///
+/// Thread, and what it may call: as RvgCursorGlyphFn, in order with every display callback.
+pub type RvgCursorShowAtFn =
+    Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, display: u32, show: u8)>;
+
+/// `cursor_move_at(ctx, display)`: the guest moved display `display`'s cursor, 1 or above
+/// (display 0's is cursor_move); rvg_graphics_device_cursor_position_at reads where.
+///
+/// Thread, and what it may call: as RvgCursorGlyphFn, in order with every display callback.
+pub type RvgCursorMoveAtFn = Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, display: u32)>;
+
+/// The C form of `g`, lent to `f` for the call.
+fn lend_glyph(g: &CursorGlyph<'_>, f: impl FnOnce(*const RvgCursorGlyph)) {
+    let glyph = RvgCursorGlyph {
+        struct_size: sized::size_u32::<RvgCursorGlyph>(),
+        width: g.width,
+        height: g.height,
+        hot_spot: RvgDisplayCoord {
+            x: g.hot_spot.0,
+            y: g.hot_spot.1,
+        },
+        rgba: g.rgba.as_ptr(),
+        rgba_length: g.rgba.len(),
+    };
+    f(&raw const glyph);
+}
+
 /// The Rust API's closure over a table's `cursor_glyph`: it holds the table, and lends the host
 /// the glyph for the call.
 pub(crate) fn cursor_glyph(t: &Arc<Table>, f: RvgCursorGlyphFn) -> Option<CursorGlyphFn> {
     f.map(|f| {
         let t = t.clone();
         let c: CursorGlyphFn = Arc::new(move |g: &CursorGlyph<'_>| {
-            let glyph = RvgCursorGlyph {
-                struct_size: sized::size_u32::<RvgCursorGlyph>(),
-                width: g.width,
-                height: g.height,
-                hot_spot: RvgDisplayCoord {
-                    x: g.hot_spot.0,
-                    y: g.hot_spot.1,
-                },
-                rgba: g.rgba.as_ptr(),
-                rgba_length: g.rgba.len(),
-            };
-            let glyph = &raw const glyph;
-            // SAFETY: the host's function over its ctx; the glyph and its pixels are live for the
-            // call.
-            ffi::host_call("cursor_glyph", || unsafe { f(t.ctx(), glyph) });
+            lend_glyph(g, |glyph| {
+                // SAFETY: the host's function over its ctx; the glyph and its pixels are live for
+                // the call.
+                ffi::host_call("cursor_glyph", || unsafe { f(t.ctx(), glyph) });
+            });
         });
         c
     })
@@ -109,6 +140,45 @@ pub(crate) fn cursor_move(t: &Arc<Table>, f: RvgCursorMoveFn) -> Option<CursorMo
         let c: CursorMoveFn = Arc::new(move || {
             // SAFETY: the host's function over its ctx.
             ffi::host_call("cursor_move", || unsafe { f(t.ctx()) });
+        });
+        c
+    })
+}
+
+/// The Rust API's closure over a table's `cursor_glyph_at`, as [`cursor_glyph`]'s.
+pub(crate) fn cursor_glyph_at(t: &Arc<Table>, f: RvgCursorGlyphAtFn) -> Option<CursorGlyphAtFn> {
+    f.map(|f| {
+        let t = t.clone();
+        let c: CursorGlyphAtFn = Arc::new(move |display, g: &CursorGlyph<'_>| {
+            lend_glyph(g, |glyph| {
+                // SAFETY: the host's function over its ctx; the glyph and its pixels are live for
+                // the call.
+                ffi::host_call("cursor_glyph_at", || unsafe { f(t.ctx(), display, glyph) });
+            });
+        });
+        c
+    })
+}
+
+/// The Rust API's closure over a table's `cursor_show_at`, as [`cursor_glyph`]'s.
+pub(crate) fn cursor_show_at(t: &Arc<Table>, f: RvgCursorShowAtFn) -> Option<CursorShowAtFn> {
+    f.map(|f| {
+        let t = t.clone();
+        let c: CursorShowAtFn = Arc::new(move |display, show| {
+            // SAFETY: the host's function over its ctx.
+            ffi::host_call("cursor_show_at", || unsafe { f(t.ctx(), display, show) });
+        });
+        c
+    })
+}
+
+/// The Rust API's closure over a table's `cursor_move_at`, as [`cursor_glyph`]'s.
+pub(crate) fn cursor_move_at(t: &Arc<Table>, f: RvgCursorMoveAtFn) -> Option<CursorMoveAtFn> {
+    f.map(|f| {
+        let t = t.clone();
+        let c: CursorMoveAtFn = Arc::new(move |display| {
+            // SAFETY: the host's function over its ctx.
+            ffi::host_call("cursor_move_at", || unsafe { f(t.ctx(), display) });
         });
         c
     })

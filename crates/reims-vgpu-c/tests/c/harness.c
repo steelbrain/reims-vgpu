@@ -131,8 +131,12 @@ static void check_graphics(void) {
                                NULL,
                                on_graphics_cursor_move,
                                NULL,
+                               NULL,
+                               NULL,
+                               NULL,
                                NULL};
-    RvgGraphicsDeviceConfig c = {sizeof c, &cb, NULL, NULL, NULL, RVG_GUEST_ARCH_X86_64, 2};
+    RvgGraphicsDeviceConfig c = {
+        sizeof c, &cb, NULL, NULL, NULL, RVG_GUEST_ARCH_X86_64, 2, 0, NULL};
     RvgGraphicsDevice *d = NULL;
     graphics_destroyed = 0;
     graphics_raised = 0;
@@ -155,8 +159,10 @@ static void check_graphics(void) {
     CHECK(rvg_graphics_device_mmio_read(d, 0x014) == (uint32_t)size);
     CHECK(rvg_graphics_device_mmio_read(d, 0x018) == (uint32_t)(size >> 32));
     CHECK(rvg_graphics_device_mmio_read(d, 0x7fc) == 0);
-    /* FEATURES_HI offers DOORBELL_PAGES, bit 46, where the host maps BAR 4. */
+    /* FEATURES_HI offers DOORBELL_PAGES, bit 46, where the host maps BAR 4, and not
+     * MULTI_DISPLAY, bit 48, with one display. */
     CHECK((rvg_graphics_device_mmio_read(d, 0x00c) >> 14) & 1);
+    CHECK(!((rvg_graphics_device_mmio_read(d, 0x00c) >> 16) & 1));
 
 #if defined(_WIN32)
     /* NULL names no handle; the device takes a copy of the event, and refuses a second. */
@@ -235,6 +241,66 @@ static void check_graphics(void) {
 #endif
     CHECK(wait_for(&graphics_destroyed, 2));
     rvg_graphics_device_release(NULL);
+}
+
+/* A graphics device of two displays with no windows: it offers MULTI_DISPLAY, FEATURES_HI's bit
+ * 16; each display reads back, black with no scanout, at 1920 x 1080, and has its cursor at
+ * (0, 0); a display past the count is refused with a size of 0 x 0; and the configs the library
+ * refuses (more than RVG_GRAPHICS_DISPLAYS_MAX displays, display windows with no window), each
+ * with its table's one destroy. */
+static _Atomic int displays_destroyed;
+
+static void check_displays(void) {
+    RvgGraphicsCallbacks cb;
+    memset(&cb, 0, sizeof cb);
+    cb.struct_size = sizeof cb;
+    cb.ctx = &displays_destroyed;
+    cb.destroy = on_graphics_destroy;
+    RvgGraphicsDeviceConfig c = {
+        sizeof c, &cb, NULL, NULL, NULL, RVG_GUEST_ARCH_X86_64, 0, 2, NULL};
+    RvgGraphicsDevice *d = NULL;
+    displays_destroyed = 0;
+    CHECK_STATUS(rvg_graphics_device_create(&c, &d), RVG_OK);
+    CHECK(d != NULL);
+    if (!d) {
+        return;
+    }
+    CHECK((rvg_graphics_device_mmio_read(d, 0x00c) >> 16) & 1);
+    for (uint32_t display = 0; display < 2; display++) {
+        uint32_t width = 0, height = 0;
+        CHECK_STATUS(rvg_graphics_device_read_display_at(d, display, NULL, 0, &width, &height),
+                     RVG_ERR_INVALID_ARGUMENT);
+        CHECK(width == 1920 && height == 1080);
+        size_t length = (size_t)width * height * 4;
+        uint8_t *pixels = malloc(length);
+        CHECK(pixels != NULL);
+        if (pixels) {
+            CHECK_STATUS(
+                rvg_graphics_device_read_display_at(d, display, pixels, length, NULL, NULL),
+                RVG_OK);
+            CHECK(pixels[0] == 0 && pixels[1] == 0 && pixels[2] == 0 && pixels[3] == 0xff);
+            free(pixels);
+        }
+        RvgDisplayCoord at = rvg_graphics_device_cursor_position_at(d, display);
+        CHECK(at.x == 0 && at.y == 0);
+    }
+    uint32_t width = 1, height = 1;
+    uint8_t pixel[4];
+    CHECK_STATUS(rvg_graphics_device_read_display_at(d, 2, pixel, sizeof pixel, &width, &height),
+                 RVG_ERR_INVALID_ARGUMENT);
+    CHECK(width == 0 && height == 0);
+    rvg_graphics_device_release(d);
+    CHECK(wait_for(&displays_destroyed, 1));
+
+    d = (RvgGraphicsDevice *)0x1;
+    c.display_count = RVG_GRAPHICS_DISPLAYS_MAX + 1;
+    CHECK_STATUS(rvg_graphics_device_create(&c, &d), RVG_ERR_INVALID_ARGUMENT);
+    const RvgWindowConfig *none[1] = {NULL};
+    c.display_count = 2;
+    c.display_windows = none;
+    CHECK_STATUS(rvg_graphics_device_create(&c, &d), RVG_ERR_INVALID_ARGUMENT);
+    CHECK(displays_destroyed == 3);
+    CHECK(d == (RvgGraphicsDevice *)0x1);
 }
 
 #if defined(_WIN32)
@@ -329,7 +395,8 @@ static void check_memory_files(void) {
     cb.struct_size = sizeof cb;
     cb.ctx = &files_destroyed;
     cb.destroy = on_graphics_destroy;
-    RvgGraphicsDeviceConfig c = {sizeof c, &cb, NULL, &map, &file, RVG_GUEST_ARCH_X86_64, 0};
+    RvgGraphicsDeviceConfig c = {
+        sizeof c, &cb, NULL, &map, &file, RVG_GUEST_ARCH_X86_64, 0, 0, NULL};
     files_destroyed = 0;
     RvgGraphicsDevice *d = NULL;
     CHECK_STATUS(rvg_graphics_device_create(&c, &d), RVG_OK);
@@ -376,6 +443,7 @@ int main(int argc, char **argv) {
     check_status();
     check_graphics();
     check_memory_files();
+    check_displays();
     if (failures) {
         fprintf(stderr, "harness: %d failures\n", failures);
         return 1;

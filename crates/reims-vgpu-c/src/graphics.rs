@@ -17,8 +17,9 @@ use reims_vgpu::{
 use reims_vgpu::{GraphicsRouteDoorbellFn, GraphicsRouteDoorbellPageFn};
 
 use crate::cursor::{
-    RvgCursorGlyphFn, RvgCursorMoveFn, RvgCursorShowFn, RvgDisplayCoord, cursor_glyph, cursor_move,
-    cursor_show,
+    RvgCursorGlyphAtFn, RvgCursorGlyphFn, RvgCursorMoveAtFn, RvgCursorMoveFn, RvgCursorShowAtFn,
+    RvgCursorShowFn, RvgDisplayCoord, cursor_glyph, cursor_glyph_at, cursor_move, cursor_move_at,
+    cursor_show, cursor_show_at,
 };
 use crate::ffi;
 use crate::handle;
@@ -87,6 +88,9 @@ pub const RVG_GRAPHICS_DOORBELL_PAGE_SIZE: u32 = 0x4000;
 /// How many doorbell pages BAR 4 holds.
 pub const RVG_GRAPHICS_DOORBELL_PAGES: u32 = 256;
 
+/// The most displays a graphics device has (RvgGraphicsDeviceConfig's `display_count`).
+pub const RVG_GRAPHICS_DISPLAYS_MAX: u32 = 4;
+
 const _: () = {
     use reims_vgpu_graphics::wire;
     assert!(RVG_GRAPHICS_PCI_VENDOR_ID == wire::RGFX_PCI_VENDOR_ID);
@@ -105,6 +109,7 @@ const _: () = {
     assert!(RVG_GRAPHICS_DOORBELLS_SIZE == wire::RGFX_DOORBELLS_SIZE);
     assert!(RVG_GRAPHICS_DOORBELL_PAGE_SIZE == wire::RGFX_DOORBELL_PAGE_SIZE);
     assert!(RVG_GRAPHICS_DOORBELL_PAGES == wire::RGFX_DOORBELL_PAGES);
+    assert!(RVG_GRAPHICS_DISPLAYS_MAX == wire::RGFX_DISPLAYS_MAX);
 };
 
 /// `raise_interrupt(ctx, vector)`: raise the device's MSI-X vector `vector` (0).
@@ -112,8 +117,9 @@ const _: () = {
 /// Thread: the one that posts the event it raises for: the device's control thread
 /// (`reims-vgpu.graphics-control`), one of ring 0's threads (`reims-vgpu.graphics-ring0-<i>`),
 /// which carry out a guest process's control messages, its presents and a block's pages and
-/// downloads, each on its lane, its refresh thread
-/// (`reims-vgpu.graphics-refresh`), a command queue's service thread
+/// downloads, each on its lane, a display's refresh thread
+/// (`reims-vgpu.graphics-refresh`, and `reims-vgpu.graphics-refresh-<i>` for display i from 1),
+/// a command queue's service thread
 /// (`reims-vgpu.graphics-queue-<id>`) or one of its lane's threads, which walk and commit its
 /// command buffers (`reims-vgpu.graphics-lane-<id>`), a pipeline compile's thread
 /// (`reims-vgpu.graphics-compile-<n>`), a thread that makes IOSurfaces' and pages blocks' views
@@ -197,7 +203,9 @@ pub type RvgGraphicsRouteDoorbellPageFn = Option<
 /// shows it either way. Thread, and what they may call: as RvgCursorGlyphFn's, on the display
 /// thread, one at a time with every display callback of the process, in the order the device
 /// took the guest's cursor and display power commands and resets. The guest sees nothing of
-/// whether the host gives them.
+/// whether the host gives them. They are display 0's; on a device of several displays
+/// (RvgGraphicsDeviceConfig's `display_count`) the `_at` three are those of displays 1 and up,
+/// each called as display 0's is, naming the display, in order with every display callback.
 #[repr(C)]
 #[derive(Clone, Copy)]
 #[expect(
@@ -229,6 +237,15 @@ pub struct RvgGraphicsCallbacks {
     /// Routes a command queue's plain doorbell on its process's doorbell page into its bell, or
     /// drops the route. A host built before it, whose `struct_size` ends before it, gives none.
     pub route_doorbell_page: RvgGraphicsRouteDoorbellPageFn,
+    /// cursor_glyph of display 1 and up. A host built before it, whose `struct_size` ends before
+    /// it, gives none.
+    pub cursor_glyph_at: RvgCursorGlyphAtFn,
+    /// cursor_show of display 1 and up, hidden until its first call. A host built before it gives
+    /// none.
+    pub cursor_show_at: RvgCursorShowAtFn,
+    /// cursor_move of display 1 and up: rvg_graphics_device_cursor_position_at reads where. A
+    /// host built before it gives none.
+    pub cursor_move_at: RvgCursorMoveAtFn,
 }
 
 // SAFETY: repr(C), a u32 first; a pointer and optional function pointers.
@@ -305,6 +322,25 @@ pub struct RvgGraphicsDeviceConfig {
     /// kext. 0 for none, as a host built before this field, whose `struct_size` ends before it,
     /// has. Refused (RVG_ERR_INVALID_ARGUMENT): any other value.
     pub doorbell_pages: u32,
+    /// How many displays the device has: 0 and 1 are one display, as a host built before this
+    /// field, whose `struct_size` ends before it, has; 2 to RVG_GRAPHICS_DISPLAYS_MAX make a device
+    /// of that many, each with its own scanout, mode, cursor, presents and colour, which the
+    /// guest's driver sees where it takes the reims-graphics wire's MULTI_DISPLAY (one that does
+    /// not sees display 0 alone). Each display's scanout keeps to an even share of the scanout's
+    /// room, and is offered the largest mode of its window's ratio that fits there. Display 0 is
+    /// the one every other function and callback names; rvg_graphics_device_read_display_at,
+    /// rvg_graphics_device_cursor_position_at and the `_at` cursor callbacks name each display.
+    /// Refused (RVG_ERR_INVALID_ARGUMENT): any other value.
+    pub display_count: u32,
+    /// The window configs of displays 1 to `display_count - 1`, an array of that many pointers,
+    /// each to a window config read as `window` is, its window opened as `window`'s, on the window
+    /// crate's port of its display (titled "Reims vGPU (port N)" and placed on host screen N, as
+    /// REIMS_VGPU_WINDOW_SCREENS picks), given exactly where `window` is: with `window` and more
+    /// than one display, `display_count - 1` non-NULL pointers; otherwise NULL. Refused
+    /// (RVG_ERR_INVALID_ARGUMENT): one given where `window` is NULL or the device has one
+    /// display, missing where `window` is given and it has several, or a NULL entry. A host built
+    /// before this field gives none.
+    pub display_windows: *const *const RvgWindowConfig,
 }
 
 // SAFETY: repr(C), a u32 first; pointers and u32s.
@@ -315,17 +351,17 @@ unsafe impl HostStruct for RvgGraphicsDeviceConfig {
 
 /// The graphics device.
 pub struct RvgGraphicsDevice {
-    /// The window's table, for a device with a window: held here so that a table with no
-    /// function still has its destroy at the release. It goes before the device, whose window
-    /// holds the table's other references until it closes.
-    window_table: Option<Arc<Table>>,
+    /// The windows' tables, display 0's first, for a device with windows: held here so that a
+    /// table with no function still has its destroy at the release. They go before the device,
+    /// whose windows hold the tables' other references until they close.
+    window_tables: Vec<Arc<Table>>,
     device: WithTable<GraphicsDevice<Plat>>,
 }
 
 impl Drop for RvgGraphicsDevice {
-    /// The window's table first, then the device (`crate::display`'s order).
+    /// The windows' tables first, display 0's first, then the device (`crate::display`'s order).
     fn drop(&mut self) {
-        drop(self.window_table.take());
+        drop(std::mem::take(&mut self.window_tables));
     }
 }
 
@@ -339,9 +375,9 @@ unsafe fn live<'a>(device: *const RvgGraphicsDevice, call: &'static str) -> &'a 
 }
 
 /// A new graphics device, its region mapped and zeroed, its threads started, with a window for
-/// its display where the config gives one. Its config and window config are read, with their
-/// tables, before either table is the library's: a struct_size refusal runs no destroy, and a
-/// later refusal runs both, the window's first. Refusals: RVG_ERR_INVALID_ARGUMENT,
+/// each display where the config gives them. Its config and window configs are read, with their
+/// tables, before any table is the library's: a struct_size refusal runs no destroy, and a later
+/// refusal runs each, the windows' first, display 0's first. Refusals: RVG_ERR_INVALID_ARGUMENT,
 /// RVG_ERR_UNSUPPORTED, RVG_ERR_HOST_RESOURCES (the host refused the region's memory, a pipe or
 /// a thread, or has no GPU device the library can use: none, or one its driver refused). Calls
 /// back: never, but a refusal's destroys.
@@ -391,18 +427,56 @@ unsafe fn create(
             Err(s) => return s,
         },
     };
+    // The windows of displays 1 and up, read as display 0's where it has one and the count is
+    // one the device takes; a NULL entry and a count it does not take are refused below.
+    let count = c.display_count.max(1);
+    let more = match window {
+        Some(_) if count <= RVG_GRAPHICS_DISPLAYS_MAX && !c.display_windows.is_null() => count - 1,
+        _ => 0,
+    };
+    let mut display_windows = Vec::new();
+    for i in 0..more as usize {
+        // SAFETY: the config's contract: `display_count - 1` readable pointers.
+        let entry = unsafe { c.display_windows.add(i).read() };
+        // SAFETY: the entry's contract: NULL or a live window config.
+        let w = match unsafe { sized::read(entry) } {
+            Ok(w) => w,
+            Err(s) => return s,
+        };
+        let Some(w) = w else {
+            display_windows.push(None);
+            continue;
+        };
+        // SAFETY: the window config's contract: NULL or a live table.
+        match unsafe { sized::read_or_zero(w.callbacks) } {
+            Ok(t) => display_windows.push(Some((w, t))),
+            Err(s) => return s,
+        }
+    }
     // From here the tables are the library's: a refusal ends them before it returns, the
-    // window's first, as a release does.
+    // windows' first, display 0's first, as a release does.
     let table = Table::new(callbacks.ctx, callbacks.destroy);
-    let window_table = window.as_ref().map(|(_, t)| Table::new(t.ctx, t.destroy));
+    let window_tables: Vec<Arc<Table>> = (window.iter())
+        .chain(display_windows.iter().flatten())
+        .map(|(_, t)| Table::new(t.ctx, t.destroy))
+        .collect();
     let refuse = |s: RvgStatus| {
-        if let Some(t) = &window_table {
+        for t in &window_tables {
             t.end();
         }
         table.end();
         s
     };
     if device.is_null() {
+        return refuse(RVG_ERR_INVALID_ARGUMENT);
+    }
+    // Windows given exactly where display 0's is: one for each display from 1, none without it.
+    let windows_given = !c.display_windows.is_null();
+    let windows_wanted = window.is_some() && count > 1;
+    if count > RVG_GRAPHICS_DISPLAYS_MAX
+        || windows_given != windows_wanted
+        || display_windows.iter().any(Option::is_none)
+    {
         return refuse(RVG_ERR_INVALID_ARGUMENT);
     }
     let guest_arch = match c.guest_arch {
@@ -461,13 +535,20 @@ unsafe fn create(
             cursor_glyph: cursor_glyph(&table, callbacks.cursor_glyph),
             cursor_show: cursor_show(&table, callbacks.cursor_show),
             cursor_move: cursor_move(&table, callbacks.cursor_move),
+            cursor_glyph_at: cursor_glyph_at(&table, callbacks.cursor_glyph_at),
+            cursor_show_at: cursor_show_at(&table, callbacks.cursor_show_at),
+            cursor_move_at: cursor_move_at(&table, callbacks.cursor_move_at),
             route_doorbell,
             route_doorbell_page,
         },
-        window: match (&window, &window_table) {
-            (Some((w, wc)), Some(t)) => Some(w.to_config(window_callbacks(t, wc))),
-            _ => None,
-        },
+        window: (window.iter().zip(&window_tables))
+            .map(|((w, wc), t)| w.to_config(window_callbacks(t, wc)))
+            .next(),
+        display_count: c.display_count,
+        display_windows: (display_windows.iter().flatten())
+            .zip(window_tables.iter().skip(1))
+            .map(|((w, wc), t)| w.to_config(window_callbacks(t, wc)))
+            .collect(),
         memory_map,
         guest_arch,
         doorbell_pages,
@@ -475,7 +556,7 @@ unsafe fn create(
     match GraphicsDevice::with_platform(<Plat as reims_vgpu::ApiPlatform>::process(), config) {
         Ok(d) => {
             let h = handle::new(RvgGraphicsDevice {
-                window_table,
+                window_tables,
                 device: WithTable::new(d, table),
             });
             // SAFETY: checked non-NULL; the caller's contract.
@@ -724,23 +805,14 @@ pub unsafe extern "C" fn rvg_graphics_device_read_display(
 ) -> RvgStatus {
     ffi::export(|| {
         // SAFETY: the caller's contract.
-        let d = unsafe { live(device, "rvg_graphics_device_read_display") };
-        let mut none: [u8; 0] = [];
-        let dst: &mut [u8] = if dst.is_null() {
-            &mut none
-        } else {
-            // SAFETY: the caller's contract.
-            unsafe { std::slice::from_raw_parts_mut(dst, dst_length) }
-        };
-        let ((w, h), read) = d.device.read_display(dst);
-        // SAFETY: the caller's contract.
         unsafe {
-            handle::write_out(width, w);
-            handle::write_out(height, h);
-        }
-        match read {
-            Ok(()) => RVG_OK,
-            Err(e) => status(e),
+            read_display(
+                "rvg_graphics_device_read_display",
+                device,
+                0,
+                (dst, dst_length),
+                (width, height),
+            )
         }
     })
 }
@@ -760,6 +832,94 @@ pub unsafe extern "C" fn rvg_graphics_device_cursor_position(
         let (x, y) = unsafe { live(device, "rvg_graphics_device_cursor_position") }
             .device
             .cursor_position();
+        RvgDisplayCoord { x, y }
+    })
+}
+
+/// What display `display` of the device shows now, read back into `dst`, as
+/// rvg_graphics_device_read_display reads display 0's, which is this with `display` 0: at the
+/// display's own mode, the size the guest is told for it. RVG_ERR_INVALID_ARGUMENT, with nothing
+/// written to `dst` and `*width` and `*height` 0, for a display at or past the device's count
+/// (RvgGraphicsDeviceConfig's `display_count`); otherwise as rvg_graphics_device_read_display.
+/// Reads of one display run one at a time. On any thread. Calls back: never.
+///
+/// # Safety
+/// `device` is a live graphics device handle; `dst` is NULL or holds `dst_length` writable bytes;
+/// `width` and `height` are each NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvg_graphics_device_read_display_at(
+    device: *mut RvgGraphicsDevice,
+    display: u32,
+    dst: *mut u8,
+    dst_length: usize,
+    width: *mut u32,
+    height: *mut u32,
+) -> RvgStatus {
+    ffi::export(|| {
+        // SAFETY: the caller's contract.
+        unsafe {
+            read_display(
+                "rvg_graphics_device_read_display_at",
+                device,
+                display,
+                (dst, dst_length),
+                (width, height),
+            )
+        }
+    })
+}
+
+/// The body of `rvg_graphics_device_read_display` and `rvg_graphics_device_read_display_at`
+/// (`call`), inside their `ffi::export`: display `display` into `dst` and its length, its size
+/// out through `size`'s width and height.
+///
+/// # Safety
+/// As rvg_graphics_device_read_display_at's.
+unsafe fn read_display(
+    call: &'static str,
+    device: *mut RvgGraphicsDevice,
+    display: u32,
+    (dst, dst_length): (*mut u8, usize),
+    (width, height): (*mut u32, *mut u32),
+) -> RvgStatus {
+    // SAFETY: the caller's contract.
+    let d = unsafe { live(device, call) };
+    let mut none: [u8; 0] = [];
+    let dst: &mut [u8] = if dst.is_null() {
+        &mut none
+    } else {
+        // SAFETY: the caller's contract.
+        unsafe { std::slice::from_raw_parts_mut(dst, dst_length) }
+    };
+    let ((w, h), read) = d.device.read_display_at(display, dst);
+    // SAFETY: the caller's contract.
+    unsafe {
+        handle::write_out(width, w);
+        handle::write_out(height, h);
+    }
+    match read {
+        Ok(()) => RVG_OK,
+        Err(e) => status(e),
+    }
+}
+
+/// Where the guest last put display `display`'s cursor's hot spot, in that display's pixels, as
+/// rvg_graphics_device_cursor_position reads display 0's, which is this with `display` 0: (0, 0)
+/// before the guest moved it, after a reset, and for a display at or past the device's count. The
+/// host reads it at its cursor_move_at. On any thread. Calls back: never.
+///
+/// # Safety
+/// `device` is a live graphics device handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvg_graphics_device_cursor_position_at(
+    device: *const RvgGraphicsDevice,
+    display: u32,
+) -> RvgDisplayCoord {
+    ffi::export(|| {
+        // SAFETY: the caller's contract.
+        let (x, y) = unsafe { live(device, "rvg_graphics_device_cursor_position_at") }
+            .device
+            .cursor_position_at(display);
         RvgDisplayCoord { x, y }
     })
 }
