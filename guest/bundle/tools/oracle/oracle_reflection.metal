@@ -550,6 +550,19 @@ fragment Fetched f_fetch(VertexOut in [[stage_in]], float4 last [[color(0)]], ha
 	return f;
 }
 
+// A colour attachment's read in a raster order group, and one at an index a function constant gives.
+fragment float4 f_fetch_group(VertexOut in [[stage_in]], float4 last [[color(0), raster_order_group(0)]])
+{
+	return last * 0.5 + float4(in.uv, 0, 0);
+}
+
+constant uint kFetchAt [[function_constant(5)]];
+
+fragment float4 f_fetch_at(VertexOut in [[stage_in]], float4 last [[color(kFetchAt)]])
+{
+	return last * 0.25 + float4(in.uv, 0, 0);
+}
+
 fragment float4 f_tables(VertexOut in [[stage_in]], primitive_acceleration_structure primitives [[buffer(0)]],
                          visible_function_table<float(float)> table [[buffer(1)]])
 {

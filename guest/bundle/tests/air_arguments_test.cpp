@@ -117,8 +117,9 @@ static bool operator==(const RgfxAirNode &a, const RgfxAirNode &b)
 	       a.typeName == b.typeName && a.name == b.name && a.unused == b.unused && sameValue(a.layout, b.layout) &&
 	       a.predicateGlobal == b.predicateGlobal && a.countIsGlobal == b.countIsGlobal &&
 	       a.indexGlobal == b.indexGlobal && a.countGlobal == b.countGlobal && a.hasRenderTarget == b.hasRenderTarget &&
-	       a.renderTarget == b.renderTarget &&
-	       a.hasMesh == b.hasMesh && a.meshVertexData == b.meshVertexData &&
+	       a.renderTarget == b.renderTarget && a.renderTargetIsGlobal == b.renderTargetIsGlobal &&
+	       a.renderTargetGlobal == b.renderTargetGlobal && a.hasRasterOrderGroup == b.hasRasterOrderGroup &&
+	       a.rasterOrderGroup == b.rasterOrderGroup && a.hasMesh == b.hasMesh && a.meshVertexData == b.meshVertexData &&
 	       a.meshPrimitiveData == b.meshPrimitiveData && a.meshVertices == b.meshVertices &&
 	       a.meshPrimitives == b.meshPrimitives && a.meshTopology == b.meshTopology &&
 	       a.controlPoints == b.controlPoints;
@@ -1725,6 +1726,17 @@ int main()
 		          fetch.arguments.at(3).renderTarget == 1 && fetch.arguments.at(3).typeName == "half4" &&
 		          !fetch.arguments.at(3).hasLocation,
 		      "f_fetch: its colour attachments' reads");
+		// One in a raster order group, and one at an index a function constant computes, the global
+		// the module's initialiser stores it in.
+		const RgfxAirNode group = entriesOf("f_fetch_group").entries.at(0).arguments.at(2);
+		check(group.kind == "air.render_target" && group.hasRenderTarget && group.renderTarget == 0 &&
+		          !group.renderTargetIsGlobal && group.hasRasterOrderGroup && group.rasterOrderGroup == 0 &&
+		          group.name == "last",
+		      "f_fetch_group: colour attachment 0's read in raster order group 0");
+		const RgfxAirNode at = entriesOf("f_fetch_at").entries.at(0).arguments.at(2);
+		check(at.kind == "air.render_target" && at.hasRenderTarget && at.renderTargetIsGlobal &&
+		          at.renderTargetGlobal != UINT64_MAX && !at.hasRasterOrderGroup && at.name == "last",
+		      "f_fetch_at: a colour attachment's read at an index kFetchAt computes");
 		// An argument buffer's struct of members is its first id and its layout, the layout's ids its
 		// own from 0; a C array of members is its node of count 1 and the member's array length.
 		const RgfxAirEntry nested = entriesOf("k_nested").entries.at(0);

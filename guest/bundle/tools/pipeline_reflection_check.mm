@@ -27,6 +27,9 @@
 //   c_atomic_texture  a texture of 64-bit atomics (its library, LIB, is
 //                tools/oracle/oracle_reflection_31.metal's)
 //   r_fetch      v_buffers and f_fetch, which reads its colour attachments (framebuffer fetch)
+//   r_fetch_group  v_buffers and f_fetch_group, which reads colour attachment 0 in raster order
+//                group 0
+//   r_fetch_at   v_buffers and f_fetch_at, which reads colour attachment kFetchAt, 0
 //   r_tables     v_buffers and f_tables, an acceleration structure and a function table in a
 //                fragment function
 //   c_specialised_on, c_specialised_off
@@ -461,6 +464,12 @@ int main(int argc, char **argv)
 		const Fn fetch{"f_fetch", {}}, tables{"f_tables", {}};
 		if (CASE("r_fetch"))
 			renderCase("r_fetch", Fn{"v_buffers", {}}, &fetch, nil, MTLPixelFormatBGRA8Unorm, MTLPixelFormatRGBA16Float);
+		const Fn fetchGroup{"f_fetch_group", {}}, fetchAt{"f_fetch_at", {constant(5, MTLDataTypeUInt, 0)}};
+		if (CASE("r_fetch_group"))
+			renderCase("r_fetch_group", Fn{"v_buffers", {}}, &fetchGroup, nil, MTLPixelFormatBGRA8Unorm,
+			           MTLPixelFormatInvalid);
+		if (CASE("r_fetch_at"))
+			renderCase("r_fetch_at", Fn{"v_buffers", {}}, &fetchAt, nil, MTLPixelFormatBGRA8Unorm, MTLPixelFormatInvalid);
 		if (CASE("r_tables"))
 			renderCase("r_tables", Fn{"v_buffers", {}}, &tables, nil, MTLPixelFormatBGRA8Unorm, MTLPixelFormatInvalid);
 		if (CASE("r_specialised_one"))

@@ -2069,11 +2069,22 @@ bool nodeKeys(const Module &m, uint64_t id, unsigned depth,
 			out.hasMesh = true;
 			i += 1;
 		} else if (k == "air.render_target" && out.kind.empty()) {
-			// A fragment function's input of a colour attachment's value: the attachment's index.
+			// A fragment function's input of a colour attachment's value: the attachment's index, an
+			// integer or a global function constants compute.
 			out.kind = k;
-			if (!mdUnsigned(m, *node, i + 1, out.renderTarget))
+			if (i + 1 < node->ops.size() && mdGlobalVariable(m, node->ops[i + 1])) {
+				out.renderTargetIsGlobal = true;
+				out.renderTargetGlobal = mdAt(m, node->ops[i + 1])->value;
+			} else if (!mdUnsigned(m, *node, i + 1, out.renderTarget)) {
 				return false;
+			}
 			out.hasRenderTarget = true;
+			i += 1;
+		} else if (k == "air.raster_order_group" && out.kind == "air.render_target") {
+			// The colour attachment's input's raster order group.
+			if (!mdUnsigned(m, *node, i + 1, out.rasterOrderGroup))
+				return false;
+			out.hasRasterOrderGroup = true;
 			i += 1;
 		} else if (k == "air.patch_control_point_input" && out.kind.empty()) {
 			// Its control point function's node and its attributes' nodes, every operand left.

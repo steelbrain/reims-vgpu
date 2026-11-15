@@ -264,7 +264,11 @@ bool rgfxReadAirVisible(const uint8_t *bitcode, size_t size, std::vector<RgfxAir
 //   `air.read`, `air.write`, `air.read_write`, `air.sample`: its access;
 //   `air.arg_unused`: the function never references it;
 //   `air.render_target` n, as its kind: a fragment function's input of colour attachment n's value
-//   (`[[color(n)]]`);
+//   (`[[color(n)]]`), n an integer or a global the module's initialiser sets, for an index function
+//   constants compute (`[[color(kIndex)]]`), then `air.raster_order_group` g where the input is in
+//   raster order group g (`[[color(0), raster_order_group(g)]]`; read: Metal's compiler on macOS
+//   27.0.1, tools/oracle/oracle_reflection.metal's f_fetch_at and f_fetch_group, as LLVM's text form
+//   prints them);
 //   `air.patch_control_point_input`, as its kind: a post-tessellation vertex function's control
 //   points (its `patch_control_point<T>` stage input, alone or a member of its stage input's
 //   struct), then a node of its control point function (`air.patch_control_point_function` and
@@ -339,9 +343,13 @@ struct RgfxAirNode {
 	std::string typeName, name;
 	bool unused = false;
 	std::shared_ptr<const std::vector<RgfxAirMember>> layout;
-	// `air.render_target` n, its kind: a fragment function's input of colour attachment n's value.
-	bool hasRenderTarget = false;
-	uint32_t renderTarget = 0;
+	// `air.render_target` n, its kind: a fragment function's input of colour attachment n's value;
+	// `renderTargetIsGlobal` where function constants compute n, which the module's initialiser
+	// stores in the global `renderTargetGlobal`, `renderTarget` then 0. `air.raster_order_group`:
+	// the input's raster order group.
+	bool hasRenderTarget = false, renderTargetIsGlobal = false, hasRasterOrderGroup = false;
+	uint32_t renderTarget = 0, rasterOrderGroup = 0;
+	uint64_t renderTargetGlobal = UINT64_MAX;
 	// `air.mesh`: its vertex and primitive data, its vertex and primitive counts and its topology's
 	// name.
 	bool hasMesh = false;

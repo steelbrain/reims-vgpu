@@ -6960,6 +6960,16 @@ void test_pipeline_reflection_from_air()
 	// pipeline).
 	id fetch = RgfxRenderPipelineReflectionOf(fn(@"v_buffers"), nil, fn(@"f_fetch"), both);
 	CHECK(fetch != nil && ask(fetch, @"fragmentArguments") == nil && [ask(fetch, @"fragmentBindings") count] == 0);
+	// So are one in a raster order group and one at an index a function constant gives.
+	id fetchGroup = RgfxRenderPipelineReflectionOf(fn(@"v_buffers"), nil, fn(@"f_fetch_group"), both);
+	CHECK(fetchGroup != nil && [ask(fetchGroup, @"fragmentBindings") count] == 0);
+	MTLFunctionConstantValues *fetchValues = [MTLFunctionConstantValues new];
+	const uint32_t fetchAt = 0;
+	[fetchValues setConstantValue:&fetchAt type:MTLDataTypeUInt withName:@"kFetchAt"];
+	NSError *fetchError = nil;
+	id<MTLFunction> fetchAtFn = [lib newFunctionWithName:@"f_fetch_at" constantValues:fetchValues error:&fetchError];
+	id fetchAtReflection = RgfxRenderPipelineReflectionOf(fn(@"v_buffers"), nil, fetchAtFn, both);
+	CHECK(fetchAtFn != nil && fetchAtReflection != nil && [ask(fetchAtReflection, @"fragmentBindings") count] == 0);
 	CHECK(shape(ask(RgfxRenderPipelineReflectionOf(fn(@"v_buffers"), nil, fn(@"f_tables"), both),
 	                @"fragmentBindings")) == "primitives:25 table:24 ");
 	// base_vertex and base_instance are listed, a fragment function's front_facing and sample_id are
