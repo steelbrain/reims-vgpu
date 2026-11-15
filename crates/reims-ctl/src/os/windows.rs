@@ -256,26 +256,119 @@ pub fn gone(pid: i32) -> bool {
     }
 }
 
-/// Process `pid`'s command line. Not on Windows yet.
-pub fn cmdline(_pid: i32) -> Option<Vec<u8>> {
-    None
+/// Process `pid`'s command line, as the process was given it, in the encoding of
+/// `OsStr::as_encoded_bytes`; None for a process whose command line can't be read: one of
+/// another user's, or one that has ended.
+pub fn cmdline(pid: i32) -> Option<Vec<u8>> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Wdk::System::Threading::{
+        NtQueryInformationProcess, ProcessCommandLineInformation,
+    };
+    use windows_sys::Win32::Foundation::UNICODE_STRING;
+    use windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
+    let p = Process::open(pid, PROCESS_QUERY_LIMITED_INFORMATION).ok()?;
+    // The size first, which the query fails with, then the line: a UNICODE_STRING and the text
+    // it points to after it, in a buffer aligned for the string's pointer.
+    let mut len = 0u32;
+    // SAFETY: a query into no buffer, which writes only `len`.
+    unsafe {
+        NtQueryInformationProcess(
+            p.0,
+            ProcessCommandLineInformation,
+            std::ptr::null_mut(),
+            0,
+            &mut len,
+        )
+    };
+    if (len as usize) < std::mem::size_of::<UNICODE_STRING>() {
+        return None;
+    }
+    let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+    // SAFETY: buf holds `len` bytes or more, aligned for a UNICODE_STRING.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            p.0,
+            ProcessCommandLineInformation,
+            buf.as_mut_ptr().cast(),
+            (buf.len() * 8) as u32,
+            &mut len,
+        )
+    };
+    if status < 0 {
+        return None;
+    }
+    // SAFETY: the query wrote a UNICODE_STRING at buf's start, whose text, `Length` bytes, is in
+    // buf after it.
+    let line = unsafe {
+        let s = &*buf.as_ptr().cast::<UNICODE_STRING>();
+        if s.Buffer.is_null() {
+            return None;
+        }
+        std::slice::from_raw_parts(s.Buffer, usize::from(s.Length) / 2)
+    };
+    Some(std::ffi::OsString::from_wide(line).into_encoded_bytes())
 }
 
-/// Whether process `pid` may be a QEMU. Not on Windows yet.
-pub fn may_be_qemu(_pid: i32) -> bool {
-    false
+/// Whether process `pid` may be a QEMU: its program's name starts `qemu-system`, as each of
+/// QEMU's system emulators' does (`qemu-system-x86_64.exe`). Windows gives a pid to a new process
+/// soon after its last owner ended, so a pid file a QEMU left can name another program.
+pub fn may_be_qemu(pid: i32) -> bool {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Threading::{
+        PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    };
+    let Ok(p) = Process::open(pid, PROCESS_QUERY_LIMITED_INFORMATION) else {
+        return false;
+    };
+    let mut buf = vec![0u16; 32_768];
+    let mut size = buf.len() as u32;
+    // SAFETY: buf holds `size` UTF-16 units, which the call sets to the path's length.
+    if unsafe { QueryFullProcessImageNameW(p.0, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut size) }
+        == 0
+    {
+        return false;
+    }
+    let image = std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..size as usize]));
+    image
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.to_ascii_lowercase().starts_with("qemu-system"))
 }
 
-/// Runs `cmd` detached. Not on Windows yet.
-pub fn spawn_detached(_cmd: Command) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "reims-ctl starts no QEMU on Windows yet",
-    ))
+/// Runs `cmd` detached, and returns once it runs: with no console (`DETACHED_PROCESS`), so
+/// closing the terminal does not end it, in a process group of its own, and out of this
+/// process's job where the job lets it go (`CREATE_BREAKAWAY_FROM_JOB`), as one an SSH login
+/// runs in, which ends its processes when the login does. Windows keeps nothing of a process
+/// that ended for its parent to collect.
+pub fn spawn_detached(mut cmd: Command) -> io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
+    };
+    let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    cmd.creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB);
+    match cmd.spawn() {
+        // A job that keeps its processes refuses the breakaway.
+        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+            cmd.creation_flags(flags);
+            cmd.spawn().map(drop)
+        }
+        r => r.map(drop),
+    }
 }
 
-/// The ways a stop ends a QEMU that QMP's `quit` did not: none on Windows yet.
-pub const ENDS: &[super::End] = &[];
+/// The ways a stop ends a QEMU that QMP's `quit` did not: TerminateProcess. Windows has no
+/// signal that asks a process with no console to end.
+pub const ENDS: &[super::End] = &[(terminate, "killed (TerminateProcess)")];
+
+fn terminate(pid: i32) {
+    use windows_sys::Win32::System::Threading::{PROCESS_TERMINATE, TerminateProcess};
+    if let Ok(p) = Process::open(pid, PROCESS_TERMINATE) {
+        // SAFETY: the handle is open with PROCESS_TERMINATE; pid is a QEMU's, checked by
+        // runtime::pid.
+        unsafe { TerminateProcess(p.0, 1) };
+    }
+}
 
 /// Runs `cmd` to its end, then ends this process with its exit code: Windows replaces no
 /// running program with another. Returns only why `cmd` could not run.

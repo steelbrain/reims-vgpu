@@ -487,14 +487,13 @@ mod tests {
     use super::*;
     use crate::opencore::tests::{image as oc_image, plist, qcow2};
 
-    // Windows: with its process handling (os/windows.rs).
-    #[cfg(unix)]
     /// A stand-in for a running VM's QEMU: a shell whose command line names `pidfile`, as QEMU's
     /// does, and which writes its own pid there, as QEMU does. Only then can runtime::pid_at take
     /// it for running: until then its pid holds the test's command line, then `sh`'s, which may
     /// exec another shell, and none during each exec. It loops, since a shell may exec a lone
     /// command in its own place, dropping `pidfile` from its command line. It is returned once
     /// runtime::pid_at sees it.
+    #[cfg(unix)]
     fn running_qemu(pidfile: &Path) -> std::process::Child {
         let child = std::process::Command::new("sh")
             .args(["-c", r#"echo $$ > "$1"; while :; do sleep 1; done"#, "sh"])
@@ -510,6 +509,12 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         child
+    }
+
+    /// A stand-in for a running VM's QEMU on Windows ([`runtime::test_qemu`]).
+    #[cfg(windows)]
+    fn running_qemu(pidfile: &Path) -> runtime::TestQemu {
+        runtime::test_qemu(pidfile, 600)
     }
 
     fn entry(bundle: &str) -> String {
@@ -986,8 +991,6 @@ mod tests {
         }
     }
 
-    // Windows: with its process handling (os/windows.rs).
-    #[cfg(unix)]
     #[test]
     fn migration_4_defers_a_running_vm_and_runs_at_its_next_start() {
         let env = crate::testenv::Env::new("migrate-graft-running");
@@ -1212,8 +1215,6 @@ mod tests {
 
     /// The first run records the migrations, and later ones do nothing; a VM running then waits
     /// for its next start, which migrates it once.
-    // Windows: with its process handling (os/windows.rs).
-    #[cfg(unix)]
     #[test]
     fn migrations_run_once_and_a_running_vm_waits_for_its_start() {
         let env = crate::testenv::Env::new("migrate-run");

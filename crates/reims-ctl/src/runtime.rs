@@ -6,6 +6,11 @@
 //! while that process runs and its command line names the pid file, so a stale file or a reused
 //! pid is never taken for the VM. A VM started from a printed script is found the same way.
 //!
+//! On Windows, QEMU runs with no console, in a process group of its own, and out of reims-ctl's
+//! job where the job lets it go ([`crate::os::spawn_detached`]); its pid counts only while its
+//! program is a QEMU's too ([`crate::os::may_be_qemu`]), as Windows soon gives a freed pid to a
+//! new process. A stop that QMP's `quit` does not end terminates it, with no signal before.
+//!
 //! On Linux, QEMU runs in a systemd user scope of its own, `reims-ctl-NAME.scope`, where the
 //! user's manager answers and outlasts the start ([`launch`]); elsewhere, and where none does, in
 //! the cgroup of the process that starts it, with a warning on Linux.
@@ -931,6 +936,79 @@ pub(crate) fn test_qemu(pidfile: &Path, secs: u32) -> std::process::Child {
     qemu
 }
 
+/// A QEMU for tests on Windows: a copy of this test binary named as QEMU's programs are
+/// (`os::may_be_qemu`), running only the test `runtime::tests::fake_qemu`, with `pidfile` on its
+/// command line; it writes its pid there, as QEMU's `-pidfile` does, and runs `secs` seconds.
+/// It returns once the pid file names it, and ends with its copy when the [`TestQemu`] drops.
+#[cfg(all(test, windows))]
+pub(crate) fn test_qemu(pidfile: &Path, secs: u32) -> TestQemu {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    let me = std::env::current_exe().unwrap();
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let exe = me.with_file_name(format!("qemu-system-test-{}-{n}.exe", std::process::id()));
+    std::fs::copy(&me, &exe).unwrap();
+    let child = std::process::Command::new(&exe)
+        .args(["--exact", "runtime::tests::fake_qemu", "--nocapture"])
+        .arg(pidfile)
+        .env("REIMS_CTL_TEST_QEMU_PIDFILE", pidfile)
+        .env("REIMS_CTL_TEST_QEMU_SECS", secs.to_string())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut qemu = TestQemu { child, exe };
+    let (id, deadline) = (qemu.id(), Instant::now() + Duration::from_secs(10));
+    let written = || {
+        let s = std::fs::read_to_string(pidfile).unwrap_or_default();
+        s.trim().parse::<u32>().ok() == Some(id)
+    };
+    while !written() {
+        if Instant::now() > deadline || qemu.try_wait().unwrap().is_some() {
+            panic!("the test QEMU wrote no pid file at {}", pidfile.display());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    qemu
+}
+
+/// [`test_qemu`]'s process on Windows, which ends, its program's copy removed, when this drops.
+#[cfg(all(test, windows))]
+pub(crate) struct TestQemu {
+    child: std::process::Child,
+    exe: std::path::PathBuf,
+}
+
+#[cfg(all(test, windows))]
+impl std::ops::Deref for TestQemu {
+    type Target = std::process::Child;
+
+    fn deref(&self) -> &std::process::Child {
+        &self.child
+    }
+}
+
+#[cfg(all(test, windows))]
+impl std::ops::DerefMut for TestQemu {
+    fn deref_mut(&mut self) -> &mut std::process::Child {
+        &mut self.child
+    }
+}
+
+#[cfg(all(test, windows))]
+impl Drop for TestQemu {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        // Windows keeps a program's file until its process is all gone.
+        for _ in 0..200 {
+            if std::fs::remove_file(&self.exe).is_ok() || !self.exe.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1153,8 +1231,63 @@ mod tests {
         }
     }
 
-    // Windows: with its process handling (os/windows.rs).
-    #[cfg(unix)]
+    /// What [`test_qemu`] runs as a QEMU on Windows: this test binary, which writes its pid to
+    /// the file `REIMS_CTL_TEST_QEMU_PIDFILE` names and runs on; in a run of the tests, nothing.
+    #[cfg(windows)]
+    #[test]
+    fn fake_qemu() {
+        if let Some(pidfile) = std::env::var_os("REIMS_CTL_TEST_QEMU_PIDFILE") {
+            let secs = std::env::var("REIMS_CTL_TEST_QEMU_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30);
+            std::fs::write(pidfile, format!("{}\n", std::process::id())).unwrap();
+            std::thread::sleep(Duration::from_secs(secs));
+        }
+    }
+
+    /// A pid file names a running QEMU only while its process runs, its command line names the
+    /// file and, on Windows, its program is a QEMU's: not once it ends, nor where another file
+    /// names its pid, nor, on Windows, for a process of another program.
+    #[test]
+    fn a_pid_file_names_a_qemu_only_while_it_runs() {
+        let env = crate::testenv::Env::new("pidfile");
+        let pidfile = env.root.join("qemu.pid");
+        let mut qemu = test_qemu(&pidfile, 30);
+        let id = qemu.id() as i32;
+        assert_eq!(pid_at(&pidfile), Some(id));
+        let other = env.root.join("other.pid");
+        std::fs::write(&other, format!("{id}\n")).unwrap();
+        assert_eq!(pid_at(&other), None, "its command line names another file");
+        let _ = qemu.kill();
+        let _ = qemu.wait();
+        assert_eq!(pid_at(&pidfile), None, "it ended");
+        // A process of another program whose command line names the file is no QEMU, where
+        // Windows reads its program's name (os::may_be_qemu): this test binary as itself.
+        #[cfg(windows)]
+        {
+            let mut other = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "runtime::tests::fake_qemu", "--nocapture"])
+                .arg(&pidfile)
+                .env("REIMS_CTL_TEST_QEMU_PIDFILE", &pidfile)
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let named = || {
+                std::fs::read_to_string(&pidfile).unwrap_or_default().trim()
+                    == other.id().to_string()
+            };
+            while !named() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let seen = (named(), pid_at(&pidfile));
+            let _ = other.kill();
+            let _ = other.wait();
+            assert_eq!(seen, (true, None));
+        }
+    }
+
     /// A VM does not start on a disk another VM, using it in place too, runs on.
     #[test]
     fn a_vm_does_not_start_on_a_disk_another_runs_on() {
@@ -1178,7 +1311,7 @@ mod tests {
                 firmware_code = "OVMF_CODE.fd"
                 firmware_vars = "OVMF_VARS.fd"
                 "#,
-                disk.display()
+                crate::testenv::toml_path(&disk)
             );
             std::fs::write(dir.join(crate::vm::CONFIG_FILE), config).unwrap();
             reg.add(name, &dir).unwrap();

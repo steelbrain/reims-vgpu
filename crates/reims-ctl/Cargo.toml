@@ -39,6 +39,7 @@ libc = "0.2.190"
 # workspace takes them.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
+    "Wdk_System_Threading",
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",

@@ -1540,8 +1540,6 @@ mod tests {
         reg.save().unwrap();
     }
 
-    // Windows: with its process handling (os/windows.rs).
-    #[cfg(unix)]
     #[test]
     fn a_running_vm_whose_settings_do_not_read_is_not_deleted() {
         let env = Env::new("delete-running");
