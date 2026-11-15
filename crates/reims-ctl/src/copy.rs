@@ -1,10 +1,10 @@
-//! Copying an image into a VM's directory: a reflink (Linux's btrfs and XFS) or a clone (APFS),
-//! which shares the source's blocks and takes no time whatever its size, where the source and the
-//! copy are on one file system that makes them; else a full copy, which reads and writes every
-//! byte. A long full copy says so before it starts, with how much it copies and why it is no
-//! reflink, then how far it is, as reims-util's downloads do (reims_util.rs). Either way the copy
-//! is the source's bytes, its holes kept, and a file of its own: a write to one leaves the other
-//! as it was.
+//! Copying an image into a VM's directory: a reflink (Linux's btrfs and XFS) or a clone (APFS, and
+//! Windows' ReFS, a Dev Drive's file system), which shares the source's blocks and takes no time
+//! whatever its size, where the source and the copy are on one file system that makes them; else
+//! a full copy, which reads and writes every byte. A long full copy says so before it starts,
+//! with how much it copies and why it is no reflink, then how far it is, as reims-util's
+//! downloads do (reims_util.rs). Either way the copy is the source's bytes, its holes kept, and a
+//! file of its own: a write to one leaves the other as it was.
 //!
 //! Measured with copies of a 57.9 GB qcow2 between two directories of one btrfs subvolume (Linux
 //! 7.3.1, 2026-11-08): a reflink took 119 ms where it had 11,477 extents, and 785 ms where it had
@@ -241,6 +241,9 @@ mod tests {
     /// A file of `len` bytes: data at 0, a run of zeros, then a hole to the end.
     fn sparse_file(p: &Path, len: u64) -> Vec<u8> {
         let f = File::create(p).unwrap();
+        // As QEMU's own images and reims-ctl's copies are there.
+        #[cfg(windows)]
+        windows::set_sparse(&f).unwrap();
         let data: Vec<u8> = (0..300_000u32).map(|i| (i * 7 + 1) as u8).collect();
         f.write_all_at(&data, 0).unwrap();
         f.write_all_at(&[0u8; 65536], data.len() as u64).unwrap();
@@ -334,6 +337,18 @@ mod tests {
                 meta.blocks() * 512
             );
         }
+        // What the file system holds of the copy, a sparse file.
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW;
+            let path: Vec<u16> = d.join("dst").as_os_str().encode_wide().chain([0]).collect();
+            let mut high = 0u32;
+            // SAFETY: path is NUL-terminated; the call fills `high`.
+            let low = unsafe { GetCompressedFileSizeW(path.as_ptr(), &mut high) };
+            let held = (u64::from(high) << 32) | u64::from(low);
+            assert!(held < 8 << 20, "{held} bytes");
+        }
         let total: u64 = ranges.iter().map(|(a, b)| b - a).sum();
         assert_eq!(seen.first(), Some(&0));
         assert_eq!(seen.last(), Some(&total));
@@ -341,17 +356,15 @@ mod tests {
         std::fs::remove_dir_all(&d).unwrap();
     }
 
-    /// A copy within a directory of btrfs or APFS is a reflink or clone, and says nothing; one
-    /// within tmpfs, which makes none, is a full copy that says so; one between file systems of
-    /// two types is a full copy that says they differ. Each is the source's bytes. The test
-    /// copies within and between the temporary directory, the test's own and, on Linux,
-    /// /dev/shm: one APFS volume on a Mac, and btrfs and tmpfs on the Linux hosts that check
-    /// it.
-    // Windows: with its block clones (copy/windows.rs).
-    #[cfg(unix)]
+    /// A copy within a directory of btrfs, APFS or ReFS is a reflink or clone, and says
+    /// nothing; one within tmpfs or NTFS, which make none, is a full copy that says so; one
+    /// between file systems of two types is a full copy that says they differ. Each is the
+    /// source's bytes. The test copies within and between the temporary directory, the test's
+    /// own, on Linux /dev/shm, and on Windows the user's own temporary directory where the
+    /// process's is elsewhere: one APFS volume on a Mac, btrfs and tmpfs on the Linux hosts that
+    /// check it, and ReFS (a Dev Drive) and NTFS on the Windows one.
     #[test]
     fn a_copy_is_a_reflink_where_it_can_be_and_says_why_where_not() {
-        use std::os::unix::fs::MetadataExt;
         let exe = std::env::current_exe().unwrap();
         let mut dirs = vec![
             dir(&std::env::temp_dir(), "tmp"),
@@ -360,6 +373,13 @@ mod tests {
         // tmpfs on Linux, wherever the temporary directory is.
         if Path::new("/dev/shm").is_dir() {
             dirs.push(dir(Path::new("/dev/shm"), "shm"));
+        }
+        // On Windows, the user's own, where a job runs with another: on the system's NTFS.
+        if let Some(own) = std::env::var_os("USERPROFILE")
+            .map(|p| Path::new(&p).join(r"AppData\Local\Temp"))
+            .filter(|p| cfg!(windows) && p.is_dir() && *p != std::env::temp_dir())
+        {
+            dirs.push(dir(&own, "own"));
         }
         for (i, from) in dirs.iter().enumerate() {
             let bytes = sparse_file(&from.join("src"), 4 << 20);
@@ -371,7 +391,11 @@ mod tests {
                 })
                 .unwrap();
                 assert_eq!(std::fs::read(&dst).unwrap(), bytes);
-                assert_eq!(std::fs::metadata(&dst).unwrap().mode() & 0o777, 0o640);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    assert_eq!(std::fs::metadata(&dst).unwrap().mode() & 0o777, 0o640);
+                }
                 let (a, b) = (file_system(from).unwrap(), file_system(to).unwrap());
                 let said = seen.first().map(String::as_str).unwrap_or("");
                 if a != b {
@@ -379,14 +403,14 @@ mod tests {
                         said.contains("are different file systems"),
                         "{a} {b}: {seen:?}"
                     );
-                } else if i == j && ["btrfs", "apfs"].contains(&a.as_str()) {
+                } else if i == j && ["btrfs", "apfs", "ReFS"].contains(&a.as_str()) {
                     assert!(seen.is_empty(), "{a}: {seen:?}");
-                } else if i == j && a == "tmpfs" {
+                } else if i == j && ["tmpfs", "NTFS"].contains(&a.as_str()) {
                     assert!(said.ends_with("makes none"), "{seen:?}");
                     assert!(said.starts_with("copying src in full, 1 MB, not as a reflink"));
                     assert_eq!(
                         seen.last().unwrap(),
-                        "copying src in full (tmpfs makes no reflinks): 100% of 1 MB"
+                        &format!("copying src in full ({a} makes no reflinks): 100% of 1 MB")
                     );
                 }
                 std::fs::remove_file(&dst).unwrap();
