@@ -106,7 +106,7 @@ fn consumer(rig: &Rig, submit: u64) -> u64 {
 /// `taking` says, whose guest takes `taken` (the `FEATURES_HI` half), started.
 fn rig_taking(taking: &Arc<Taking>, taken: u64) -> Rig {
     taking.takes.store(true, Ordering::SeqCst);
-    let mut rig = Rig::with_host(Box::new(TakingHost(Arc::clone(taking))));
+    let rig = Rig::with_host(Box::new(TakingHost(Arc::clone(taking))));
     rig.device
         .mmio_write(RGFX_REG_DRIVER_FEATURES_HI.into(), (taken >> 32) as u32);
     rig.start();

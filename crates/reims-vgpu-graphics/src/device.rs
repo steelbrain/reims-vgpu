@@ -2472,7 +2472,7 @@ impl Shared {
             .pages
             .get(usize::try_from(page).unwrap_or(usize::MAX))
             .map_or(0, |bound| bound.load(Ordering::Acquire));
-        if context == 0 || offset % page_size != 0 {
+        if context == 0 || !offset.is_multiple_of(page_size) {
             self.pages_dropped.fetch_add(1, Ordering::Relaxed);
             log::warn!(
                 target: "reims_vgpu_graphics", kind = "unbound";
