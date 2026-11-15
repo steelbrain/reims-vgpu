@@ -138,11 +138,11 @@ pub(crate) fn kept_write(sel: &'static str, what: &str) -> ! {
 
 #[cfg(test)]
 mod tests {
-    /// A buffer or heap over read-only memory the runtime copies is read-only while its memory
-    /// is, set so again or not, and no longer once it is not. Of such memory, only pages mapped
-    /// read-only refuse a CPU write, not memory of bit 24 alone. Linux's: on macOS the runtime
-    /// copies none
-    #[cfg(target_os = "linux")]
+    /// A buffer or heap over read-only memory the runtime copies is read-only while its memory is,
+    /// set so again or not, and no longer once it is not. Of such memory, only pages mapped
+    /// read-only refuse a CPU write, not memory of bit 24 alone. Linux's and Windows's: on macOS
+    /// the runtime copies none
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn backings_over_copied_memory_are_read_only_while_it_is() {
         use crate::gpu::backing::Backing;

@@ -2114,10 +2114,10 @@ pub(crate) mod tests {
 
     /// A no-copy buffer core makes over `pages` pages of zeros mapped read-only
     /// (`newBufferWithBytesNoCopy`), which the runtime makes over a copy of them whose GPU writes
-    /// it drops on Linux (announcing `copied-host-pages`, which dies in strict mode, so it is made
-    /// under the default), and the pages' first byte, which the caller frees once the buffer is
-    /// gone.
-    #[cfg(target_os = "linux")]
+    /// it drops on Linux and Windows (announcing `copied-host-pages`, which dies in strict mode, so
+    /// it is made under the default), and the pages' first byte, which the caller frees once the
+    /// buffer is gone.
+    #[cfg(any(target_os = "linux", windows))]
     fn over_read_only_pages(pages: u64) -> (VulkanBuffer, HostPtr) {
         use crate::core::platform::os::vm::{HostVm as _, VmProt};
 
@@ -2144,7 +2144,7 @@ pub(crate) mod tests {
 
     /// A no-copy buffer a descriptor names over `pages` pages of zeros of the platform's own,
     /// made with bit 24 ([`BIT_24`]), as the guest makes a read-only one: the runtime makes it
-    /// over a copy of the pages whose GPU writes it drops on Linux (announcing
+    /// over a copy of the pages whose GPU writes it drops on Linux and Windows (announcing
     /// `copied-host-pages`, which dies in strict mode, so it is made under the default), and
     /// imports a read-only view of them on macOS; and the pages' first byte, which the caller
     /// frees once the buffer is gone.
@@ -2193,14 +2193,14 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// A no-copy buffer core makes over pages mapped read-only, made where Metal makes it,
-    /// answers its own address as its contents and takes a GPU fill into it, the command buffer
-    /// completing with no error, and the pages stay zeros: on Linux the runtime makes it over a
-    /// copy of the pages whose GPU writes it drops, as Metal drops a fill (`os/linux/import.rs`,
+    /// A no-copy buffer core makes over pages mapped read-only, made where Metal makes it, answers
+    /// its own address as its contents and takes a GPU fill into it, the command buffer completing
+    /// with no error, and the pages stay zeros: on Linux and Windows the runtime makes it over a
+    /// copy of the pages whose GPU writes it drops, as Metal drops a fill (each OS's `import`,
     /// `crate::gpu::writes`'s docs), so nothing of it is kept ([`crate::gpu::writes::Kept`])
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
-    fn a_fill_into_read_only_pages_is_dropped_on_linux() {
+    fn a_fill_into_read_only_pages_is_dropped() {
         use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
         use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
         use crate::core::platform::os::vm::HostVm as _;
@@ -2236,14 +2236,14 @@ pub(crate) mod tests {
         );
     }
 
-    /// A guest's read-only buffer (a no-copy buffer made with bit 24, [`read_only_buffer`])
-    /// takes a blit's fill into it, and on Linux a copy into it too, and a copy into a texture
+    /// A guest's read-only buffer (a no-copy buffer made with bit 24, [`read_only_buffer`]) takes a
+    /// blit's fill into it, and on Linux and Windows a copy into it too, and a copy into a texture
     /// over it, the command buffer completing with no error, and its pages stay as they were: the
-    /// runtime drops the writes, through its copy of the pages on Linux and Metal's read-only view
-    /// on macOS, as Metal drops a fill and a copy into such a texture (measured,
-    /// `crate::gpu::writes`'s docs). What Metal does with a copy into such a buffer is
-    /// unmeasured, so a Mac, whose GPU every process shares, runs only the fill. Its contents
-    /// answer the pages' address on both
+    /// runtime drops the writes, through its copy of the pages on Linux and Windows, and Metal's
+    /// read-only view on macOS, as Metal drops a fill and a copy into such a texture (measured,
+    /// `crate::gpu::writes`'s docs). What Metal does with a copy into such a buffer is unmeasured,
+    /// so a Mac, whose GPU every process shares, runs only the fill. Its contents answer the pages'
+    /// address on both
     #[test]
     fn a_blit_into_a_read_only_buffer_is_dropped() {
         use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
@@ -2314,7 +2314,7 @@ pub(crate) mod tests {
 
     /// The 16 × 16 texels of `texture`, 64 bytes a row, as a blit in a command buffer of its own
     /// reads them.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     fn texels_read_back(texture: &VulkanTexture) -> Vec<u8> {
         use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
         use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
@@ -2348,21 +2348,21 @@ pub(crate) mod tests {
         host_bytes_at(out.contents(), 16 * 64)
     }
 
-    /// A CPU write of a texture over a guest's read-only memory whose pages it can write, a
-    /// buffer made with bit 24 ([`read_only_buffer`]) or a heap made with it, takes the texels,
-    /// as Metal's CPU write does: a later command buffer reads them, and the buffer's pages hold
-    /// them (measured, plain Metal, on the M3 Max under macOS 27.0.1 and the Radeon Pro 5300M and
-    /// UHD Graphics 630 under macOS 26.7.1, m3-max-29292 to m3-max-29294: a texture over a bit-24
+    /// A CPU write of a texture over a guest's read-only memory whose pages it can write, a buffer
+    /// made with bit 24 ([`read_only_buffer`]) or a heap made with it, takes the texels, as Metal's
+    /// CPU write does: a later command buffer reads them, and the buffer's pages hold them
+    /// (measured, plain Metal, on the M3 Max under macOS 27.0.1 and the Radeon Pro 5300M and UHD
+    /// Graphics 630 under macOS 26.7.1, m3-max-29292 to m3-max-29294: a texture over a bit-24
     /// buffer, the pages taking the bytes and a blit reading them; on the M3 Max, a texture in a
     /// Shared heap of bit 24, which a blit reads back). The runtime writes them through the pages
-    /// on Linux, and its copy of them takes them at the next commit. One over pages the process
-    /// maps read-only ([`over_read_only_pages`]) dies at `replaceRegion:`, as Metal's write
+    /// on Linux and Windows, and its copy of them takes them at the next commit. One over pages the
+    /// process maps read-only ([`over_read_only_pages`]) dies at `replaceRegion:`, as Metal's write
     /// through that mapping ends the process with a bus error, with bit 24 or without (the same
-    /// runs), the pages staying zeros. Linux's: on macOS the runtime imports the pages as they
-    /// are mapped
-    #[cfg(target_os = "linux")]
+    /// runs), the pages staying zeros. Linux's and Windows's: on macOS the runtime imports the
+    /// pages as they are mapped
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
-    fn a_cpu_write_of_a_texture_over_read_only_memory_takes_its_texels_on_linux() {
+    fn a_cpu_write_of_a_texture_over_read_only_memory_takes_its_texels() {
         use crate::core::platform::os::vm::HostVm as _;
         use crate::core::platform::resource::{Heap as _, Texture as _};
         use crate::core::platform::types::{MtlRegion, MtlSize};
@@ -4819,7 +4819,6 @@ pub(crate) mod tests {
     }
 
     /// The least size of [`heap_over_pages`]' heaps ([`over_pages`]).
-    #[cfg(not(windows))]
     pub(crate) const OVER_PAGES: u64 = 0x10000;
 
     /// The size of [`heap_over_pages`]' heaps: [`OVER_PAGES`] where the test device answers two
@@ -4828,7 +4827,6 @@ pub(crate) mod tests {
     /// where they fit. A native device's image of such a texture can take more than Metal's
     /// (`heap-texture-larger-than-metal`, relayed there: RADV 26.0.8 answers 0x24008 bytes at an
     /// alignment of 0x10000), and a heap places the texture by the device's answer.
-    #[cfg(not(windows))]
     pub(crate) fn over_pages() -> u64 {
         static SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         *SIZE.get_or_init(|| {
@@ -4924,7 +4922,6 @@ pub(crate) mod tests {
 
     /// [`heap_over_pages`]' texture of the resource options `options`, the offset past its bytes
     /// at its alignment, and its size, as `d` answers them.
-    #[cfg(not(windows))]
     fn depth_stencil_with<P: Platform>(
         p: &P,
         d: &P::Device,

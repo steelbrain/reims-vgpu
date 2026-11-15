@@ -3208,7 +3208,7 @@ mod tests {
 
     /// Where protection options are set in a command buffer of [`read_only_store_beside`]:
     /// before its pass, after it, or after every encoder.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Options {
         BeforeThePass,
@@ -3221,7 +3221,7 @@ mod tests {
     /// bit 24, `resource::tests::read_only_buffer`), signals a second event, fills a buffer with
     /// 0x6b and signals a third, with protection `options` set `at` its place: its status and
     /// error, each buffer's first byte, each signal's value and whether the pages stayed zeros.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     fn read_only_store_beside(q: &VulkanCommandQueue, options: u64, at: Options) -> String {
         use crate::core::platform::Platform as _;
         use crate::core::platform::descriptor::RenderPassDescriptor as _;
@@ -3299,8 +3299,8 @@ mod tests {
     /// pass or before it, where the pass runs nothing; options from 0x10 set after every encoder
     /// fail it with code 1, every signal firing, and the encoder after the faulting pass runs
     /// nothing, as one of Metal's runs does (the M3 Max ran it in 3 of 6). The pages stay zeros.
-    /// Linux's: on macOS the pass goes to Metal
-    #[cfg(target_os = "linux")]
+    /// Linux's and Windows's: on macOS the pass goes to Metal
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn a_read_only_store_beside_protection_options_fails_as_the_options_say() {
         for (options, at, line) in [

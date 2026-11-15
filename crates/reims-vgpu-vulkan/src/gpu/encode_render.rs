@@ -5122,8 +5122,8 @@ pub(crate) mod tests {
     /// completes with the pages zeros, as the M3 Max completes a resolve into such memory in a pair
     /// it leaves untouched (docs/graphics-kext/dgpu-oracle.md Q38), where a resolve it writes
     /// faults the command buffer ([`a_resolve_into_read_only_memory_faults_its_command_buffer`]).
-    /// Linux's: on macOS it goes to Metal
-    #[cfg(target_os = "linux")]
+    /// Linux's and Windows's: on macOS it goes to Metal
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn an_untouched_resolve_into_a_surface_over_read_only_memory_completes() {
         use crate::core::platform::os::vm::HostVm as _;
@@ -5230,15 +5230,15 @@ pub(crate) mod tests {
 
     /// `MTLLoadActionDontCare`, `MTLLoadActionLoad`, `MTLStoreActionDontCare`,
     /// `MTLStoreActionMultisampleResolve` and `MTLStoreActionUnknown`.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     const LOAD_DONT_CARE: u64 = 0;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     const LOAD: u64 = 1;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     const DONT_CARE: u64 = 0;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     const MULTISAMPLE_RESOLVE: u64 = 2;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     const UNKNOWN: u64 = 4;
 
     /// What a command buffer of `q` shows whose render pass of `pass` draws nothing, `late`
@@ -5246,7 +5246,7 @@ pub(crate) mod tests {
     /// with 0x5a and one after it another with 0x6b, then an event signal, committed and
     /// completed: its status and error, the first byte of each buffer, whether the signal fired,
     /// and whether the `n` bytes at `pages` stayed zeros.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     fn pass_line_on(
         q: &crate::gpu::command::VulkanCommandQueue,
         pass: &VulkanRenderPassDescriptor,
@@ -5301,7 +5301,7 @@ pub(crate) mod tests {
     /// a 16 × 16 `BGRA8Unorm` texture over a guest's read-only buffer (made with bit 24,
     /// `resource::tests::read_only_buffer`), loaded by `load` and stored by `store`, or by
     /// `late`'s store action set in the pass where given; the pages are the buffer's.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     fn read_only_pass_on(
         q: &crate::gpu::command::VulkanCommandQueue,
         load: u64,
@@ -5352,13 +5352,13 @@ pub(crate) mod tests {
     /// `probes/readonly_gpu_writes.m`; the runtime's `store_out.rs`). The pass and every encoder
     /// after it run nothing and the blit before it runs, as the runtime answers every fault:
     /// which of them Metal runs is not measured for this fault.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     const FAULTED: &str = "status 5 error Some(3) before 0x5a after 0x0 signal true zeros true";
 
     /// What a command buffer of `q` shows that fills a new 16-byte buffer with 0x11 in a blit,
     /// then signals an event, committed and completed: its status and error, the buffer's first
     /// byte and whether the signal fired.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     fn filled_on(q: &crate::gpu::command::VulkanCommandQueue) -> String {
         use crate::core::platform::event::{EventRef, SharedEvent as _};
 
@@ -5388,18 +5388,18 @@ pub(crate) mod tests {
     }
 
     /// [`filled_on`]'s line of a command buffer that runs.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     const FILLED: &str = "status 4 error None filled 0x11 signal true";
 
     /// A pass that stores a colour attachment over a guest's read-only memory (`Store`) fails its
-    /// command buffer as Metal's GPU faults it ([`FAULTED`]), where the runtime's copy of the
-    /// pages would take the store, and the process goes on: a command buffer committed after it
-    /// on its queue runs, as does one on a new queue, as on Metal (one fault a process, measured
-    /// on the M3 Max, macOS 27.0.1, plain Metal: m3-max-29110, the next command buffer of the
-    /// queue `Completed`, twice; m3-max-28796 and m3-max-28797, at once and 100 ms on and on a
-    /// new queue). Linux's: on macOS the pass goes to Metal, whose fault this host's GPU takes no
-    /// test of
-    #[cfg(target_os = "linux")]
+    /// command buffer as Metal's GPU faults it ([`FAULTED`]), where the runtime's copy of the pages
+    /// would take the store, and the process goes on: a command buffer committed after it on its
+    /// queue runs, as does one on a new queue, as on Metal (one fault a process, measured on the M3
+    /// Max, macOS 27.0.1, plain Metal: m3-max-29110, the next command buffer of the queue
+    /// `Completed`, twice; m3-max-28796 and m3-max-28797, at once and 100 ms on and on a new
+    /// queue). Linux's and Windows's: on macOS the pass goes to Metal, whose fault this host's GPU
+    /// takes no test of
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn a_store_into_read_only_memory_fails_its_command_buffer() {
         let q = dev().new_command_queue().unwrap();
@@ -5413,7 +5413,7 @@ pub(crate) mod tests {
     /// A late store action that stores the colour attachment over a guest's read-only memory,
     /// of a pass that left it `Unknown`, fails the command buffer as `Store` given at once does,
     /// and its queue runs on (`a_store_into_read_only_memory_fails_its_command_buffer`)
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn a_late_store_into_read_only_memory_fails_its_command_buffer() {
         let q = dev().new_command_queue().unwrap();
@@ -5431,7 +5431,7 @@ pub(crate) mod tests {
     /// `command_buffer/revocation.rs`). A command buffer that runs between the two faults leaves
     /// the count as it was, as in m3-max-29110's runs, each a faulting command buffer then one
     /// that reads back
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn read_only_faults_revoke_queues_as_metals() {
         let q = dev().new_command_queue().unwrap();
@@ -5457,7 +5457,7 @@ pub(crate) mod tests {
     /// `CustomSampleDepthStore` set late, which the runtime stores as `DontCare` and the M3 Max
     /// completes, writing nothing (plain Metal, macOS 27.0.1, m3-max-29292); and the queue runs
     /// on
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn a_pass_that_does_not_store_read_only_memory_completes() {
         let q = dev().new_command_queue().unwrap();
@@ -5478,9 +5478,9 @@ pub(crate) mod tests {
     }
 
     /// `MTLStoreActionStoreAndMultisampleResolve` and `MTLStoreActionCustomSampleDepthStore`.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     const STORE_AND_MULTISAMPLE_RESOLVE: u64 = 3;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     const CUSTOM_SAMPLE_DEPTH_STORE: u64 = 5;
 
     /// [`pass_line_on`]'s line of a command buffer of `q` whose render pass resolves a 4-sample
@@ -5490,7 +5490,7 @@ pub(crate) mod tests {
     /// buffer's. Where `setter`, the descriptor names a resolve texture of the device's memory
     /// and the pass sets the read-only one late (the setter's SPI). The selector it dies at
     /// instead, where it dies.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     fn read_only_resolve_on(
         q: &crate::gpu::command::VulkanCommandQueue,
         store: u64,
@@ -5568,8 +5568,8 @@ pub(crate) mod tests {
     /// descriptor's action or a late one, fails its command buffer as Metal's GPU faults it
     /// ([`FAULTED`]: measured on the M3 Max, macOS 27.0.1, plain Metal, m3-max-28796,
     /// m3-max-28797, m3-max-29292 and m3-max-29309; the runtime's `store_out.rs`), the pages
-    /// staying zeros, and its queue runs on. Linux's: on macOS it goes to Metal
-    #[cfg(target_os = "linux")]
+    /// staying zeros, and its queue runs on. Linux's and Windows's: on macOS it goes to Metal
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn a_resolve_into_read_only_memory_faults_its_command_buffer() {
         for (store, late) in [
@@ -5592,7 +5592,7 @@ pub(crate) mod tests {
     /// the device's memory the descriptor names, its store action, or `Unknown` and a late one,
     /// and whether a depth pass has beside it a 4-sample `Stencil8` attachment of the device's
     /// memory that resolves into a texture of the device's memory (`MultisampleResolve`).
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[derive(Clone, Copy, Debug, Default)]
     struct ReadOnlyDepthStencil {
         stencil: bool,
@@ -5608,7 +5608,7 @@ pub(crate) mod tests {
     /// pages of the test's own (`resource::tests::guest_pages_of`), as the guest makes a
     /// read-only heap, or resolves into it, cleared to 0.5 or 0x5a; the pages are the heap's. The
     /// selector it dies at instead, where it dies.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     fn read_only_depth_stencil_on(
         q: &crate::gpu::command::VulkanCommandQueue,
         shape: ReadOnlyDepthStencil,
@@ -5761,10 +5761,10 @@ pub(crate) mod tests {
     /// stencil attachment there by `Store`, fail their command buffers as Metal's GPU faults them
     /// ([`FAULTED`]: measured on the M3 Max, macOS 27.0.1, plain Metal, a heap of bit 24:
     /// m3-max-28796, m3-max-28797 and m3-max-29292; the runtime's `store_out.rs`), the pages
-    /// staying zeros, and the queue runs on. One that does not store it completes, as on the M3
-    /// Max (m3-max-29292): `DontCare`, and a stencil attachment's `CustomSampleDepthStore` set
-    /// late, which the runtime stores as `DontCare`. Linux's: on macOS it goes to Metal
-    #[cfg(target_os = "linux")]
+    /// staying zeros, and the queue runs on. One that does not store it completes, as on the M3 Max
+    /// (m3-max-29292): `DontCare`, and a stencil attachment's `CustomSampleDepthStore` set late,
+    /// which the runtime stores as `DontCare`. Linux's and Windows's: on macOS it goes to Metal
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn a_depth_or_stencil_store_into_read_only_memory_faults_its_command_buffer() {
         let kept = |stencil, store, late| ReadOnlyDepthStencil {
@@ -5811,8 +5811,8 @@ pub(crate) mod tests {
     /// unchanged (the Radeon Pro 5300M and UHD Graphics 630 under macOS 26.7.1 write it): the
     /// runtime drops the resolve. Beside a stencil attachment that resolves, which the runtime
     /// faults where nothing measured Metal's GPU, it dies where the pass is made, or at the late
-    /// store action or resolve texture. Linux's: on macOS it goes to Metal
-    #[cfg(target_os = "linux")]
+    /// store action or resolve texture. Linux's and Windows's: on macOS it goes to Metal
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn a_depth_or_stencil_resolve_into_read_only_memory_faults_its_command_buffer() {
         let resolve = |stencil, store, late| ReadOnlyDepthStencil {
@@ -5883,8 +5883,8 @@ pub(crate) mod tests {
     /// pages staying zeros. A colour attachment
     /// the descriptor keeps by `CustomSampleDepthStore` dies where the pass is made, at the
     /// runtime's refusal, as plain Metal aborts there over any memory (m3-max-29292 to
-    /// m3-max-29294). Linux's: on macOS it goes to Metal
-    #[cfg(target_os = "linux")]
+    /// m3-max-29294). Linux's and Windows's: on macOS it goes to Metal
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn a_late_resolve_texture_in_read_only_memory_faults_where_it_resolves() {
         for store in [MULTISAMPLE_RESOLVE, STORE_AND_MULTISAMPLE_RESOLVE] {
@@ -5913,8 +5913,8 @@ pub(crate) mod tests {
     /// writing the pages, and this platform takes completing, the cheaper; all three complete
     /// the second (plain Metal, m3-max-29292 to m3-max-29294, m3-max-29309 to m3-max-29311;
     /// `crate::gpu::writes`'s docs). The same draw writes a texture over a buffer of the
-    /// device's, which shows the function writes. Linux's: on macOS it goes to Metal
-    #[cfg(target_os = "linux")]
+    /// device's, which shows the function writes. Linux's and Windows's: on macOS it goes to Metal
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn a_draws_write_into_read_only_memory_is_dropped() {
         use crate::core::platform::os::vm::HostVm as _;

@@ -607,15 +607,15 @@ mod tests {
     }
 
     /// The tests' kernel that writes texel (x, y) of texture 0.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     const TEXWRITE: &[u8] = include_bytes!("../../../../tests/shaders/compute_texwrite.metallib");
 
-    /// A 16 × 16 `BGRA8Unorm` texture of `levels` mipmap levels and shader read and write usage
-    /// at the start of a heap made with bit 24 over pages of the test's own
+    /// A 16 × 16 `BGRA8Unorm` texture of `levels` mipmap levels and shader read and write usage at
+    /// the start of a heap made with bit 24 over pages of the test's own
     /// (`resource::tests::guest_pages_of`), as the guest makes a read-only heap, with the pages and
-    /// their length; the runtime makes the heap over a copy of them on Linux, announcing
-    /// `copied-host-pages`, which dies in strict mode, so it is made under the default.
-    #[cfg(target_os = "linux")]
+    /// their length; the runtime makes the heap over a copy of them on Linux and Windows,
+    /// announcing `copied-host-pages`, which dies in strict mode, so it is made under the default.
+    #[cfg(any(target_os = "linux", windows))]
     fn bgra_in_read_only_heap(
         levels: u64,
     ) -> (
@@ -666,15 +666,15 @@ mod tests {
         (texture, pages, size)
     }
 
-    /// A kernel's `write()` of a texture over a guest's read-only memory, a buffer made with bit
-    /// 24 (`resource::tests::read_only_buffer`) or a heap made with it over pages
+    /// A kernel's `write()` of a texture over a guest's read-only memory, a buffer made with bit 24
+    /// (`resource::tests::read_only_buffer`) or a heap made with it over pages
     /// ([`bgra_in_read_only_heap`]), and a blit's copy into such a texture out of a buffer or a
-    /// texture, each complete with no error, and the pages, and what a later command buffer
-    /// reads of the texture, stay zeros, as Metal's GPU takes those writes nowhere (measured on
-    /// the M3 Max, macOS 27.0.1, metal2vulkan's `probes/readonly_gpu_writes.m`; the runtime's
-    /// `read_only_view.rs`): the runtime's copy of the pages drops them. Linux's: on macOS they go
-    /// to Metal
-    #[cfg(target_os = "linux")]
+    /// texture, each complete with no error, and the pages, and what a later command buffer reads
+    /// of the texture, stay zeros, as Metal's GPU takes those writes nowhere (measured on the M3
+    /// Max, macOS 27.0.1, metal2vulkan's `probes/readonly_gpu_writes.m`; the runtime's
+    /// `read_only_view.rs`): the runtime's copy of the pages drops them. Linux's and Windows's: on
+    /// macOS they go to Metal
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn texture_writes_into_read_only_memory_are_dropped() {
         use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
@@ -781,15 +781,15 @@ mod tests {
     /// A blit's other writes of a texture over a guest's read-only memory, a buffer made with bit
     /// 24 (`resource::tests::read_only_buffer`) or a heap made with it
     /// ([`bgra_in_read_only_heap`]), complete with no error, the writes dropped and the buffer's
-    /// pages staying zeros, as the M3 Max's GPU drops them (plain Metal, macOS 27.0.1,
-    /// m3-max-29292 and m3-max-29309): a fill by a colour or by bytes and an invalidation (the
-    /// `fillTexture:` and `invalidateCompressedTexture:` SPI, which the Radeon Pro 5300M and UHD
-    /// Graphics 630 under macOS 26.7.1 end the process at with bit 24 or without), and mipmaps'
-    /// generation, after which level 1 of a heap's texture whose level 0 the CPU wrote reads
-    /// zeros, where it reads level 0's texels without bit 24 (`mipmaps-shared`, m3-max-29309).
-    /// The two x86 GPUs complete mipmaps' generation too, writing it. Linux's: on macOS they go to
+    /// pages staying zeros, as the M3 Max's GPU drops them (plain Metal, macOS 27.0.1, m3-max-29292
+    /// and m3-max-29309): a fill by a colour or by bytes and an invalidation (the `fillTexture:`
+    /// and `invalidateCompressedTexture:` SPI, which the Radeon Pro 5300M and UHD Graphics 630
+    /// under macOS 26.7.1 end the process at with bit 24 or without), and mipmaps' generation,
+    /// after which level 1 of a heap's texture whose level 0 the CPU wrote reads zeros, where it
+    /// reads level 0's texels without bit 24 (`mipmaps-shared`, m3-max-29309). The two x86 GPUs
+    /// complete mipmaps' generation too, writing it. Linux's and Windows's: on macOS they go to
     /// Metal
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn blit_writes_of_a_texture_in_read_only_memory_are_dropped() {
         use crate::core::platform::HostRange;
@@ -877,7 +877,7 @@ mod tests {
     }
 
     /// A 16 × 16 `BGRA8Unorm` texture of the device's memory, every byte `byte`.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     fn d_texture(byte: u8) -> crate::gpu::resource::VulkanTexture {
         use crate::core::platform::HostRange;
         use crate::core::platform::resource::Texture as _;
@@ -903,7 +903,8 @@ mod tests {
     /// `resource::tests::read_only_buffer`), bound at the slot it writes and made resident for
     /// writing, completes with no error, its stores dropped, the pages staying zeros, as Metal
     /// drops a kernel's stores there (`crate::gpu::writes`'s docs): through the runtime's copy of
-    /// the pages on Linux, and Metal's read-only view on macOS. The kernel reads it as the pages
+    /// the pages on Linux and Windows, and Metal's read-only view on macOS. The kernel reads it as
+    /// the pages
     #[test]
     fn a_kernel_store_into_a_read_only_buffer_is_dropped() {
         use crate::core::platform::os::vm::HostVm as _;
