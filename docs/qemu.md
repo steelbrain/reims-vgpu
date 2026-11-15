@@ -822,6 +822,8 @@ to itself, QMP screendumps every 15 s, then QEMU's CPU time and memory read
   the guest's RAM, and 5.03 GB without.
 - QEMU quit over QMP and exited 0 both ways.
 
+## x86-64 macOS guests
+
 What `reims-ctl`'s q35 command gives an x86-64 macOS guest, and why
 (`crates/reims-ctl/src/qemu.rs`).
 
