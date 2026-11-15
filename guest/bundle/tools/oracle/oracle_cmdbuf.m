@@ -50,15 +50,17 @@
 //             it): which class answers it; when a shared event it signals reads the value, against
 //             the buffer's scheduled handler, GPUStartTime and GPUEndTime, encoded before and after a
 //             ~100 ms kernel on an idle queue and behind a ~200 ms buffer of its queue, where a
-//             buffer of a second queue waits for the value; the same for a plain event, which only
-//             that buffer's wait sees; the value it leaves on an event at 5 (3, 7, two signals in
-//             either order) against a GPU signal and a CPU set of 3; the order against GPU signals
-//             of the buffer; against a wait of the buffer on another event, encoded before and
-//             after it, and behind a kernel; against a wait on the same event; and the queue of a
-//             listener's block. Times are ms from the commit.
-//   schedsig_open, schedsig_late, schedsig_nil
-//             the same call with a blit encoder open, after the commit and with a nil event: a
-//             line after the call, the buffer's status and error, the event's value.
+//             buffer of a second queue waits for the value; the value it leaves on an event at 5
+//             (3, 7, two signals in either order) against a GPU signal and a CPU set of 3; the
+//             order against GPU signals of the buffer; against a wait of the buffer on another
+//             event, encoded before and after it, and behind a kernel; against a wait on the same
+//             event; and the queue of a listener's block. Times are ms from the commit.
+//   schedsig_open, schedsig_late, schedsig_nil, schedsig_nil_unretained, schedsig_plain,
+//   schedsig_plain_unretained
+//             the same call with a blit encoder open, after the commit, with a nil event and with
+//             a plain event (newEvent), the last two on a buffer that retains its references and
+//             on one that does not: a line after the call, the buffer's status and error, the
+//             event's value.
 // Build: see README.md.
 #import "oracle_common.h"
 #include <dispatch/dispatch.h>
@@ -1077,45 +1079,7 @@ static void case_schedsig(void)
 		printf("    C's GPU work ended before A's: %d of %d\n", c_before_a, SCHED_RUNS);
 	}
 
-	printf("  5. the same with a plain event (newEvent): A ~200 ms, B scheduled signal 1 and a tiny blit, C on a "
-	       "second queue waits for 1; %d runs (ms from B's commit)\n",
-	       SCHED_RUNS);
-	{
-		double a_end[SCHED_RUNS], b_start[SCHED_RUNS], c_done[SCHED_RUNS];
-		int c_before_a = 0, ok = 0;
-		for (int k = 0; k < SCHED_RUNS; k++) {
-			id<MTLEvent> ev = [D newEvent];
-			id<MTLCommandBuffer> a = long_cb(Q, big, iters * 2);
-			id<MTLCommandBuffer> b = [Q commandBuffer];
-			sched_signal(b, ev, 1);
-			enc_tiny(b, small);
-			id<MTLCommandBuffer> cq = [q2 commandBuffer];
-			[cq encodeWaitForEvent:ev value:1];
-			enc_tiny(cq, small);
-			__block volatile double tcq = 0;
-			[cq addCompletedHandler:^(id<MTLCommandBuffer> _) { tcq = oracle_now_ms(); }];
-			[a commit];
-			double c = oracle_now_ms();
-			[b commit];
-			[cq commit];
-			[b waitUntilCompleted];
-			[cq waitUntilCompleted];
-			usleep(5000);
-			a_end[k] = (a.GPUEndTime - c / 1e3) * 1e3;
-			b_start[k] = (b.GPUStartTime - c / 1e3) * 1e3;
-			c_done[k] = tcq - c;
-			c_before_a += cq.GPUEndTime < a.GPUEndTime;
-			ok += cq.status == MTLCommandBufferStatusCompleted;
-			usleep(5000);
-		}
-		print_ms("A's GPUEndTime", a_end, SCHED_RUNS);
-		print_ms("B's GPUStartTime", b_start, SCHED_RUNS);
-		print_ms("C's completed handler runs", c_done, SCHED_RUNS);
-		printf("    C completed: %d of %d; C's GPU work ended before A's: %d of %d\n", ok, SCHED_RUNS,
-		       c_before_a, SCHED_RUNS);
-	}
-
-	printf("  6. value: a shared event at 5, one buffer each (the value once it completed)\n");
+	printf("  5. value: a shared event at 5, one buffer each (the value once it completed)\n");
 	{
 		static const char *const names[] = {
 		    "scheduled signal 3", "GPU signal 3 (encodeSignalEvent)", "CPU set 3 (setSignaledValue)",
@@ -1151,7 +1115,7 @@ static void case_schedsig(void)
 		}
 	}
 
-	printf("  7. order against the buffer's GPU signals, %d runs each (ms from the commit)\n", SCHED_RUNS);
+	printf("  6. order against the buffer's GPU signals, %d runs each (ms from the commit)\n", SCHED_RUNS);
 	{
 		static const char *const names[] = {
 		    "a. ~50 ms kernel, GPU signal 2, scheduled signal 1",
@@ -1211,7 +1175,7 @@ static void case_schedsig(void)
 		}
 	}
 
-	printf("  8. against the buffer's waits on another shared event W, which the CPU sets to 1 at 200 ms; "
+	printf("  7. against the buffer's waits on another shared event W, which the CPU sets to 1 at 200 ms; "
 	       "3 runs each (ms from the commit)\n");
 	{
 		static const char *const names[] = {
@@ -1263,7 +1227,7 @@ static void case_schedsig(void)
 		}
 	}
 
-	printf("  9. the same event: a scheduled signal and a wait on it in one buffer, no CPU set (up to 8 s)\n");
+	printf("  8. the same event: a scheduled signal and a wait on it in one buffer, no CPU set (up to 8 s)\n");
 	{
 		static const char *const names[] = {
 		    "a. wait 1, scheduled signal 1, tiny blit",
@@ -1303,7 +1267,7 @@ static void case_schedsig(void)
 		}
 	}
 
-	printf("  10. a listener's queue: the block's queue label for a listener of its own queue, and the "
+	printf("  9. a listener's queue: the block's queue label for a listener of its own queue, and the "
 	       "default listener's\n");
 	{
 		dispatch_queue_t own = dispatch_queue_create("oracle.listener", DISPATCH_QUEUE_SERIAL);
@@ -1331,14 +1295,19 @@ static void case_schedsig(void)
 	}
 }
 
-// Misuse, each in a child process of its own: the call with an encoder open, after the commit and
-// with a nil event. Prints a line after the call, so a line missing says it ended the process.
+// Misuse, each in a child process of its own: the call with an encoder open, after the commit,
+// with a nil event (on a buffer that retains its references and on one that does not) and with a
+// plain event (newEvent). Prints a line after the call, so a line missing says it ended the
+// process.
 static void case_schedsig_misuse(const char *which)
 {
 	gSchedSel = sel_registerName("encodeSignalEventScheduled:value:");
 	id<MTLBuffer> small = [D newBufferWithLength:4096 options:MTLResourceStorageModeShared];
 	id<MTLSharedEvent> ev = [D newSharedEvent];
-	id<MTLCommandBuffer> cb = [Q commandBuffer];
+	id<MTLCommandBuffer> cb = !strcmp(which, "schedsig_nil_unretained") ||
+	                                  !strcmp(which, "schedsig_plain_unretained")
+	                              ? [Q commandBufferWithUnretainedReferences]
+	                              : [Q commandBuffer];
 	if (![(id)cb respondsToSelector:gSchedSel]) {
 		printf("case %s: n/r\n", which);
 		return;
@@ -1355,6 +1324,13 @@ static void case_schedsig_misuse(const char *which)
 		[cb commit];
 		sched_signal(cb, ev, 1);
 		printf("case %s: the call returned after the commit\n", which);
+		[cb waitUntilCompleted];
+	} else if (!strncmp(which, "schedsig_plain", 14)) {
+		id<MTLEvent> plain = [D newEvent];
+		sched_signal(cb, plain, 1);
+		printf("case %s: the call returned for a plain event\n", which);
+		enc_tiny(cb, small);
+		[cb commit];
 		[cb waitUntilCompleted];
 	} else {
 		sched_signal(cb, nil, 1);
@@ -1559,7 +1535,8 @@ int main(int argc, char **argv)
 	D = nil;
 	static const char *const all[] = {"hazards",  "timing",        "submitted",     "events",
 	                                  "gputimes", "schedsig",      "schedsig_open", "schedsig_late",
-	                                  "schedsig_nil"};
+	                                  "schedsig_nil", "schedsig_nil_unretained", "schedsig_plain",
+	                                  "schedsig_plain_unretained"};
 	for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {
 		if (argc > 2 && strcmp(argv[2], all[i]))
 			continue;
