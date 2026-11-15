@@ -129,8 +129,8 @@ fn a_doorbell_page_wakes_only_the_rings_of_the_context_it_is_bound_to() {
     make_other_queue(&mut rig, OTHER);
 
     // Its own context's ring: taken, and answered on the writing thread.
-    let first = publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
     wait_parked(&rig);
+    let first = publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
     rig.device.doorbell_write(page_at(3), QUEUE_SUBMIT as u32);
     assert_eq!(taking.answered.lock().get(&1), Some(&true));
     assert_eq!(
@@ -143,6 +143,7 @@ fn a_doorbell_page_wakes_only_the_rings_of_the_context_it_is_bound_to() {
     assert_eq!(dropped(&rig), 0);
 
     // Context 6's ring and ring 0 through context 5's page: dropped and counted, nothing woken.
+    wait_parked(&rig);
     publish_other(&rig, &command_buffer(OTHER, 200, 7));
     assert!(eventually(|| rig.device.parked()));
     rig.device.doorbell_write(page_at(3), OTHER_SUBMIT as u32);
@@ -242,8 +243,8 @@ fn without_doorbell_pages_the_doorbells_are_the_register_s() {
         #[cfg(target_os = "linux")]
         assert_eq!(*taking.routed_at.lock(), vec![DoorbellAt::Register]);
 
-        publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
         wait_parked(&rig);
+        publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
         rig.device.mmio_write_taking(
             RGFX_REG_DOORBELL.into(),
             QUEUE_SUBMIT as u32 | RGFX_DOORBELL_ASKS,

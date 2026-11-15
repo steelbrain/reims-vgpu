@@ -3413,12 +3413,12 @@ fn a_doorbell_write_answers_a_command_buffer_on_its_thread() {
     taking.takes.store(true, Ordering::SeqCst);
     let rig = taking_rig(&taking, QUEUE);
 
+    wait_parked(&rig);
     publish_unrung(
         &rig,
         0,
         &[command_buffer(QUEUE, 100, 1), command_buffer(QUEUE, 101, 2)],
     );
-    wait_parked(&rig);
     rig.device
         .mmio_write_taking(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
     let here = thread_name();
@@ -3473,6 +3473,7 @@ fn an_answered_command_buffer_waits_for_no_later_ring_0_message() {
     taking.takes.store(true, Ordering::SeqCst);
     let mut rig = taking_rig(&taking, QUEUE);
     taking.hold_creates.store(true, Ordering::SeqCst);
+    wait_parked(&rig);
     // The create, published on ring 0 inside the answer: after it, and before the queue's thread
     // takes the buffer.
     let mut create = object_message(RGFX_CMD_BUFFER_CREATE, QUEUE + 1);
@@ -3488,7 +3489,6 @@ fn an_answered_command_buffer_waits_for_no_later_ring_0_message() {
         (region.atomic_u64(RGFX_CONTROL_SUBMIT_OFFSET)).store(produced, Ordering::SeqCst);
     }));
     publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
-    wait_parked(&rig);
     rig.device
         .mmio_write_taking(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
     assert_eq!(*taking.answered.lock(), HashMap::from([(1, true)]));
@@ -3730,8 +3730,8 @@ fn only_an_asking_doorbell_write_is_answered_at_the_doorbell() {
     );
     wait_queue_idle(&rig);
 
-    publish_unrung(&rig, at, &[command_buffer(QUEUE, 101, 2)]);
     wait_parked(&rig);
+    publish_unrung(&rig, at, &[command_buffer(QUEUE, 101, 2)]);
     rig.device.mmio_write_taking(
         RGFX_REG_DOORBELL.into(),
         QUEUE_SUBMIT as u32 | RGFX_DOORBELL_ASKS,
@@ -3764,8 +3764,8 @@ fn a_guest_without_doorbell_asks_is_answered_at_any_doorbell_and_not_routed() {
     let rig = taking_rig(&taking, QUEUE);
     assert!(taking.routes.lock().is_empty(), "a route was asked");
 
-    publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
     wait_parked(&rig);
+    publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
     rig.device
         .mmio_write_taking(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
     assert_eq!(*taking.answered.lock(), HashMap::from([(1, true)]));
@@ -4814,11 +4814,14 @@ fn wait_control_parked(rig: &Rig) {
 }
 
 /// Waits, [`PATIENCE`] polls at most, for the control thread to sleep with nothing in flight
-/// (`Submit::asleep`) and every thread of the device's to be parked ([`Device::parked`]): none
-/// takes a lock a doorbell's thread tries until the test acts, so the doorbell's thread finds each
-/// free. A lane's thread posts its answer, then takes the lanes' lock twice more before it waits
-/// for a lane ([`Lanes::parked`]), and the control thread sets `asleep` before its look at its
-/// wake: a write made as soon as an answer or `asleep` is seen may find a lock held, under load.
+/// (`Submit::asleep`) and every thread of the device's to be parked ([`Device::parked`]): until
+/// the test rings, none takes a message published after this, or a lock a doorbell's thread
+/// tries, so the doorbell's thread takes the message and finds each lock free. What a test saw
+/// before comes before its thread lets go: a lane's thread posts its answer, then takes the
+/// lanes' lock twice more before it waits for a lane ([`Lanes::parked`]), and the control thread
+/// sets `asleep`, and a queue's thread `consumer_idle`, before its look at its wake, which may
+/// find one pending and have it take the ring again. Under load, a message published as soon as
+/// the test saw those was taken by its ring's thread, or the write found a lock held.
 fn wait_parked(rig: &Rig) {
     assert!(
         eventually(|| rig.device.shared.submit.lock().asleep && rig.device.parked()),
