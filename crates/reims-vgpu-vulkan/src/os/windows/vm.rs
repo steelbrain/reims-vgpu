@@ -23,6 +23,12 @@
 //!   A view then maps each piece of its source into the placeholders left, a Windows view for each
 //!   piece in each placeholder ([`place`]); an unmap releases them (`VirtualFree` with
 //!   `MEM_RELEASE`).
+//! - **`allocate_fixed_overwrite`** over bytes no view of the VM's holds, free address space as
+//!   a deallocate leaves it, first takes them: each run reserved at its place and mapped from a
+//!   new section, as a view of the VM's ([`take_free`]), so the call meets views alone, as
+//!   Mach's fixed overwrite takes unmapped bytes. Windows reserves address space from its
+//!   allocation granularity (64 KiB) alone, so a run that starts inside such a block is refused,
+//!   as are bytes in use outside the VM, with nothing changed.
 //! - **While a call makes room**, the bytes of the Windows views it meets are unmapped for a
 //!   moment. A thread that touches one then faults, and the VM's exception handler holds it until
 //!   the call is done, then runs the access again where the page now allows it ([`transit`]): no
@@ -618,6 +624,113 @@ fn put_back(
     }
 }
 
+/// Takes the bytes of `first..end` no view of the VM's holds, free address space as a deallocate
+/// leaves it: each run of them reserved at its place as a placeholder (`VirtualAlloc2` with
+/// `MEM_RESERVE_PLACEHOLDER` at its first byte) and mapped from a new section of zeros, read and
+/// write, as a view of the VM's, so a call over `first..end` meets views alone. The runs taken,
+/// each its first byte and end. Where Windows refuses one (bytes in use outside the VM), those
+/// taken before it are given back ([`give_back`]) and its code answered. With [`VIEWS`] held.
+fn take_free(
+    views: &mut BTreeMap<u64, View>,
+    first: u64,
+    end: u64,
+) -> Result<Vec<(u64, u64)>, KernReturn> {
+    let before = (views.range(..first).next_back())
+        .filter(|(_, v)| v.end > first)
+        .map(|(&at, v)| (at, v.end));
+    let meeting = before
+        .into_iter()
+        .chain(views.range(first..end).map(|(&at, v)| (at, v.end)));
+    let mut free = Vec::new();
+    let mut at = first;
+    for (lo, hi) in meeting {
+        if lo > at {
+            free.push((at, lo));
+        }
+        at = at.max(hi);
+    }
+    if at < end {
+        free.push((at, end));
+    }
+    let mut taken = Vec::with_capacity(free.len());
+    for (lo, hi) in free {
+        match take(lo, hi - lo) {
+            Ok(backing) => {
+                views.insert(
+                    lo,
+                    View {
+                        end: hi,
+                        backing: backing.clone(),
+                    },
+                );
+                files::record(lo, hi - lo, backing, READ_WRITE);
+                taken.push((lo, hi));
+            }
+            Err(kr) => {
+                give_back(views, &taken);
+                return Err(kr);
+            }
+        }
+    }
+    Ok(taken)
+}
+
+/// A new section of `length` bytes mapped, read and write, into a placeholder reserved at `at`,
+/// free address space: the section's backing.
+fn take(at: u64, length: u64) -> Result<Backing, KernReturn> {
+    let backing = Backing {
+        file: section(length)?,
+        offset: 0,
+    };
+    // SAFETY: a reservation of address space at `at`, which Windows refuses where any of it is
+    // in use.
+    let reserved = unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            ptr(at),
+            length.to_usize(),
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            PAGE_NOACCESS,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if reserved.is_null() {
+        return Err(refused("VirtualAlloc2 (fixed)", &last_error()));
+    }
+    if reserved.addr().to_u64() != at {
+        let _ = release(reserved.addr().to_u64());
+        return Err(NO_SPACE);
+    }
+    if let Err(kr) = map(at, length, &backing, READ_WRITE) {
+        let _ = release(at);
+        return Err(kr);
+    }
+    Ok(backing)
+}
+
+/// Gives back the runs [`take_free`] took, each `(first, end)`, as a deallocate does: unmapped,
+/// released and forgotten by the table. With [`VIEWS`] held.
+fn give_back(views: &mut BTreeMap<u64, View>, taken: &[(u64, u64)]) {
+    for &(first, end) in taken {
+        match make_room(views, first, end, false) {
+            Ok((room, transit)) => {
+                files::forget(first, end - first);
+                for (at, _) in room {
+                    let _ = release(at);
+                }
+                drop(transit);
+            }
+            Err(kr) => log::error!(
+                target: "reims_vgpu_vulkan::os",
+                "a refused fixed overwrite's {:#x} bytes at {first:#x} could not be given back \
+                 ({kr:?})",
+                end - first
+            ),
+        }
+    }
+}
+
 /// Maps a new section of `length` bytes into a placeholder of its own, read and write, recording
 /// the view: its first byte, and the section's backing.
 fn fresh(views: &mut BTreeMap<u64, View>, length: u64) -> Result<(u64, Backing), KernReturn> {
@@ -823,7 +936,9 @@ impl HostVm for WindowsVm {
     }
 
     /// A new section's view over the pages of the range's length from the page of its address
-    /// (module docs), every byte of which must lie in the VM's views.
+    /// (module docs): over the VM's views it meets, and over free address space between them
+    /// ([`take_free`]), as Mach's fixed overwrite takes unmapped bytes. Bytes in use outside the
+    /// VM refuse it, with nothing changed.
     fn allocate_fixed_overwrite(&self, addr: HostAddr, len: u64) -> Result<(), KernReturn> {
         let (first, length) = length_pages(addr, len).ok_or(NO_SPACE)?;
         if length == 0 {
@@ -840,7 +955,12 @@ impl HostVm for WindowsVm {
             prot: READ_WRITE,
         };
         let mut views = VIEWS.lock();
-        map_view(&mut views, first, length, vec![piece])
+        let taken = take_free(&mut views, first, first + length)?;
+        let mapped = map_view(&mut views, first, length, vec![piece]);
+        if mapped.is_err() {
+            give_back(&mut views, &taken);
+        }
+        mapped
     }
 
     /// The source's pages of the length, from the page of its first byte, mapped from their
@@ -1164,6 +1284,31 @@ pub(crate) mod tests {
         assert_eq!(v.deallocate(a.wrapping_add(p), p), KernReturn::SUCCESS);
         assert!(!mapped(a.wrapping_add(p)) && mapped(a) && mapped(a.wrapping_add(2 * p)));
         assert_eq!(v.deallocate(a, 4 * p), KernReturn::SUCCESS);
+    }
+
+    /// A fixed overwrite over a range the VM deallocated whole takes the free address space
+    /// again, fresh zeros; over a page freed inside a range, which starts no block of Windows's
+    /// allocation granularity, it is refused, the bytes beside it as they were
+    #[test]
+    fn a_fixed_overwrite_takes_freed_address_space() {
+        let v = vm();
+        let p = page();
+        let a = v.allocate_anywhere(4 * p).unwrap();
+        write(a, 0, 7);
+        assert_eq!(v.deallocate(a, 4 * p), KernReturn::SUCCESS);
+        assert!(!mapped(a));
+        assert_eq!(v.allocate_fixed_overwrite(a, 2 * p), Ok(()));
+        assert!(mapped(a) && writable(a, 2 * p) && !mapped(a.wrapping_add(2 * p)));
+        assert_eq!([read(a, 0), read(a, p)], [0, 0]);
+        write(a, p, 5);
+        assert_eq!(read(a, p), 5);
+        let inner = a.wrapping_add(p);
+        assert_eq!(v.deallocate(inner, p), KernReturn::SUCCESS);
+        assert!(!mapped(inner));
+        assert!(v.allocate_fixed_overwrite(inner, p).is_err());
+        assert!(!mapped(inner) && mapped(a));
+        assert_eq!(read(a, 0), 0);
+        assert_eq!(v.deallocate(a, 2 * p), KernReturn::SUCCESS);
     }
 
     /// A thread that reads a page while other calls unmap it for a moment, again and again (a
