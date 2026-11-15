@@ -3286,7 +3286,7 @@ mod tests {
             drop(command);
             icb
         };
-        let first = buffer_first.then(&made);
+        let first = buffer_first.then(made);
         let id = state.gpu_resource_id();
         drop(state);
         let icb = first.unwrap_or_else(&made);
