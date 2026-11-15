@@ -30,6 +30,7 @@
 
 #import "RgfxBuffer.h"
 #import "RgfxCommandObjects.h"
+#import "RgfxEvent.h"
 #import "RgfxFunction.h"
 #import "RgfxIOSurface.h"
 #import "RgfxMetalPrivate.h"
@@ -114,6 +115,11 @@ RGFX_RESOURCE_SPI
 - (void)setResponsibleTaskIDs:(const int *)taskIDs count:(NSUInteger)count;
 - (void)useInternalResidencySet:(id)residencySet;
 - (void)useInternalResidencySets:(const id _Nonnull[_Nonnull])residencySets count:(NSUInteger)count;
+@end
+
+// The command-buffer SPI an Apple GPU's buffers answer, and an arm64 guest's.
+@protocol QueueTestScheduledSignalSPI
+- (void)encodeSignalEventScheduled:(id<MTLEvent>)event value:(uint64_t)value;
 @end
 
 // The command-queue SPI members the queue answers (RgfxCommandQueue, MTLCommandQueueSPI).
@@ -1741,8 +1747,16 @@ void test_buffers_let_go_give_their_blocks_back()
 
 } // namespace
 
+#if defined(__arm64__)
+int rgfxQueueDiesScheduledPlain();
+#endif
+
 int rgfxQueueDiesCase(const char *name)
 {
+#if defined(__arm64__)
+	if (std::strcmp(name, "scheduled-signal-plain") == 0)
+		return rgfxQueueDiesScheduledPlain();
+#endif
 	signal(SIGABRT, [](int) { _exit(kAborted); });
 	@autoreleasepool {
 		if (std::strcmp(name, "function-handle") == 0) {
@@ -1789,6 +1803,21 @@ int rgfxQueueDiesCase(const char *name)
 	}
 	return 0;
 }
+
+#if defined(__arm64__)
+// A scheduled signal of a plain event, on a buffer not yet committed: it ends the process.
+int rgfxQueueDiesScheduledPlain()
+{
+	signal(SIGABRT, [](int) { _exit(kAborted); });
+	@autoreleasepool {
+		Queue q(true);
+		id<MTLCommandBuffer> cb = [q.queue commandBufferWithUnretainedReferences];
+		RgfxEvent *plain = [RgfxEvent eventWithDevice:nil serializer:&q.ser];
+		[(id<QueueTestScheduledSignalSPI>)cb encodeSignalEventScheduled:plain value:1];
+	}
+	return 0;
+}
+#endif
 
 // A command buffer's signal of a shared event that the host posts while the buffer runs, ahead of
 // its CB_SCHEDULED, reaches the process through the completion thread: a thread waiting on the
@@ -2316,6 +2345,248 @@ void test_residency_sets_are_held_until_let_go()
 }
 #endif
 
+
+#if defined(__arm64__)
+// A shared event of `q`'s, registered with its queue's reader, at `initial`.
+RgfxSharedEvent *queueEvent(Queue &q, uint64_t initial)
+{
+	RgfxSharedEvent *ev = [RgfxSharedEvent sharedEventWithInitialValue:initial
+	                                                             device:nil
+	                                                         serializer:&q.ser];
+	CHECK(ev != nil);
+	[ev rgfxRegisterWithReplyReader:[q.queue sharedReplyReader].get()];
+	return ev;
+}
+
+// The values `q`'s control ring carries for `event` (SHARED_EVENT_SET_VALUE), in order; every
+// message is taken off the ring.
+std::vector<uint64_t> setsOf(Queue &q, RgfxObjId event)
+{
+	std::vector<uint64_t> values;
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	while (q.control.next(&h, &bytes)) {
+		RgfxSharedEventSetValue m = {};
+		if (h.type != RGFX_CMD_SHARED_EVENT_SET_VALUE || bytes.size() < sizeof(m))
+			continue;
+		std::memcpy(&m, bytes.data(), sizeof(m));
+		if (m.obj_id == event)
+			values.push_back(m.value);
+	}
+	return values;
+}
+
+void scheduleSignal(id<MTLCommandBuffer> cb, id<MTLEvent> event, uint64_t value)
+{
+	[(id<QueueTestScheduledSignalSPI>)cb encodeSignalEventScheduled:event value:value];
+}
+
+// An arm64 guest's command buffer answers an Apple GPU's SPI encodeSignalEventScheduled:value:,
+// which MPSGraph sends with no respondsToSelector: check. Its shared event takes the value as
+// the buffer's queue submits it, as Metal's does (measured on the M3 Max, macOS 27.0.1,
+// oracle_cmdbuf schedsig): at the commit's post, before the buffer's work or its scheduling,
+// whatever the buffer encoded before the call; the host is told first, as the CPU's set tells
+// it, then this process's listeners and waits, and the scheduled handler reads the value. The
+// value only rises: an event at 5 stays 5 after a signal of 3, and of two the higher stays, in
+// either order. After the commit the call sets nothing.
+void test_a_scheduled_signal_is_set_as_its_queue_submits_it()
+{
+	@autoreleasepool {
+		Queue q(true);
+		Driven driven({&q});
+		RgfxSharedEvent *ev = queueEvent(q, 0);
+		id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+		CHECK([(id)cb respondsToSelector:@selector(encodeSignalEventScheduled:value:)]);
+		[[cb blitCommandEncoder] endEncoding];
+		scheduleSignal(cb, ev, 3);
+		std::atomic<uint64_t> inHandler{0};
+		std::atomic<uint64_t> *inHandlerAt = &inHandler;
+		[cb addScheduledHandler:^(id<MTLCommandBuffer> c) {
+			(void)c;
+			inHandlerAt->store(ev.signaledValue);
+		}];
+		dispatch_semaphore_t heard = dispatch_semaphore_create(0);
+		MTLSharedEventListener *listener = [[MTLSharedEventListener alloc] init];
+		[ev notifyListener:listener
+		           atValue:3
+		             block:^(id<MTLSharedEvent> e, uint64_t v) {
+			             (void)e;
+			             (void)v;
+			             dispatch_semaphore_signal(heard);
+		             }];
+		CHECK(ev.signaledValue == 0);
+		CHECK(setsOf(q, ev.rgfxObjId).empty());
+		[cb commit];
+		CHECK(ev.signaledValue == 3);
+		CHECK((setsOf(q, ev.rgfxObjId) == std::vector<uint64_t>{3}));
+		CHECK(waitFor(heard, 5) == 0);
+		CHECK(cb.status == MTLCommandBufferStatusCommitted);
+		const uint64_t seqno = nextSeqno(q);
+		hostScheduled(q, *driven.kext, seqno, cb);
+		[cb waitUntilScheduled];
+		CHECK(inHandler == 3);
+		hostComplete(q, *driven.kext, seqno, cb);
+		[cb waitUntilCompleted];
+		CHECK(cb.status == MTLCommandBufferStatusCompleted);
+		CHECK(ev.signaledValue == 3);
+
+		struct Case {
+			uint64_t initial;
+			std::vector<uint64_t> signals;
+			uint64_t after;
+		};
+		const Case cases[] = {{5, {3}, 5}, {5, {7}, 7}, {5, {6, 8}, 8}, {5, {8, 6}, 8}};
+		for (const Case &c : cases) {
+			RgfxSharedEvent *e = queueEvent(q, c.initial);
+			id<MTLCommandBuffer> b = [q.queue commandBuffer];
+			for (uint64_t v : c.signals)
+				scheduleSignal(b, e, v);
+			[b commit];
+			CHECK(e.signaledValue == c.after);
+			CHECK(setsOf(q, e.rgfxObjId) == c.signals); // the host keeps the higher too
+			const uint64_t s = nextSeqno(q);
+			hostComplete(q, *driven.kext, s, b);
+			[b waitUntilCompleted];
+		}
+
+		RgfxSharedEvent *late = queueEvent(q, 0);
+		id<MTLCommandBuffer> b = [q.queue commandBuffer];
+		[b commit];
+		scheduleSignal(b, late, 1);
+		const uint64_t s = nextSeqno(q);
+		hostComplete(q, *driven.kext, s, b);
+		[b waitUntilCompleted];
+		CHECK(late.signaledValue == 0);
+		CHECK(setsOf(q, late.rgfxObjId).empty());
+		CHECK(b.status == MTLCommandBufferStatusCompleted);
+	}
+}
+
+// A scheduled signal behind a wait the process does not know met, its buffer's own encoded
+// before it or one of an earlier buffer of its queue, is set at its buffer's scheduling, before
+// the scheduled handlers, as Metal's queue reaches it only once that wait is met (measured on
+// the M3 Max, macOS 27.0.1, oracle_cmdbuf schedsig: 0.04 to 0.15 ms after the CPU set the
+// event waited on, before the scheduled handler). One behind a wait met already, or ahead of a
+// wait, is set at the post; a wait after it on its own event is then met, and the buffer holds
+// up no later signal of its queue (Metal's buffer runs).
+void test_a_scheduled_signal_behind_a_wait_is_set_at_its_scheduling()
+{
+	@autoreleasepool {
+		Queue q(true);
+		Driven driven({&q});
+
+		RgfxSharedEvent *w = queueEvent(q, 0), *e = queueEvent(q, 0);
+		id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+		[cb encodeWaitForEvent:w value:1];
+		scheduleSignal(cb, e, 1);
+		std::atomic<uint64_t> inHandler{0};
+		std::atomic<uint64_t> *inHandlerAt = &inHandler;
+		[cb addScheduledHandler:^(id<MTLCommandBuffer> c) {
+			(void)c;
+			inHandlerAt->store(e.signaledValue);
+		}];
+		[cb commit];
+		const uint64_t s1 = nextSeqno(q);
+		CHECK(e.signaledValue == 0);
+		CHECK(setsOf(q, e.rgfxObjId).empty());
+		w.signaledValue = 1; // the host's wait goes
+		hostScheduled(q, *driven.kext, s1, cb);
+		[cb waitUntilScheduled];
+		CHECK(inHandler == 1);
+		CHECK(e.signaledValue == 1);
+		CHECK((setsOf(q, e.rgfxObjId) == std::vector<uint64_t>{1}));
+		hostComplete(q, *driven.kext, s1, cb);
+		[cb waitUntilCompleted];
+
+		// Behind an earlier buffer of its queue that waits.
+		RgfxSharedEvent *w2 = queueEvent(q, 0), *e2 = queueEvent(q, 0);
+		id<MTLCommandBuffer> a = [q.queue commandBuffer];
+		[a encodeWaitForEvent:w2 value:1];
+		[a commit];
+		const uint64_t sa = nextSeqno(q);
+		id<MTLCommandBuffer> b = [q.queue commandBuffer];
+		scheduleSignal(b, e2, 1);
+		[b commit];
+		const uint64_t sb = nextSeqno(q);
+		CHECK(e2.signaledValue == 0);
+		CHECK(setsOf(q, e2.rgfxObjId).empty());
+		w2.signaledValue = 1;
+		hostScheduled(q, *driven.kext, sa, a);
+		[a waitUntilScheduled];
+		hostScheduled(q, *driven.kext, sb, b);
+		[b waitUntilScheduled];
+		CHECK(e2.signaledValue == 1);
+		CHECK((setsOf(q, e2.rgfxObjId) == std::vector<uint64_t>{1}));
+		hostComplete(q, *driven.kext, sa, a);
+		hostComplete(q, *driven.kext, sb, b);
+		[b waitUntilCompleted];
+
+		// Behind a wait met already; and ahead of a wait on its own event, which it meets.
+		RgfxSharedEvent *met = queueEvent(q, 1), *e3 = queueEvent(q, 0), *own = queueEvent(q, 0);
+		id<MTLCommandBuffer> c = [q.queue commandBuffer];
+		[c encodeWaitForEvent:met value:1];
+		scheduleSignal(c, e3, 1);
+		scheduleSignal(c, own, 2);
+		[c encodeWaitForEvent:own value:2];
+		[c commit];
+		const uint64_t sc = nextSeqno(q);
+		CHECK(e3.signaledValue == 1);
+		CHECK(own.signaledValue == 2);
+		// So the queue holds nothing: a later buffer's signal is set at its post.
+		RgfxSharedEvent *e4 = queueEvent(q, 0);
+		id<MTLCommandBuffer> d = [q.queue commandBuffer];
+		scheduleSignal(d, e4, 1);
+		[d commit];
+		const uint64_t sd = nextSeqno(q);
+		CHECK(e4.signaledValue == 1);
+		hostComplete(q, *driven.kext, sc, c);
+		hostComplete(q, *driven.kext, sd, d);
+		[d waitUntilCompleted];
+		CHECK(c.status == MTLCommandBufferStatusCompleted);
+	}
+}
+
+// What the call does with no shared event, as Metal's does (measured on the M3 Max, macOS
+// 27.0.1, oracle_cmdbuf schedsig_plain, schedsig_nil, schedsig_nil_unretained): a plain event
+// ends the process with Metal's words; nil raises Metal's NSInvalidArgumentException on a buffer
+// that retains its references, and fails one that retains none with Metal's error.
+void test_a_scheduled_signal_takes_only_a_shared_event()
+{
+	checkDies("scheduled-signal-plain", "MTLEvent passed to API expecting MTLSharedEvent");
+	@autoreleasepool {
+		Queue q(true);
+		Driven driven({&q});
+		id<MTLCommandBuffer> retained = [q.queue commandBuffer];
+		bool raised = false;
+		@try {
+			scheduleSignal(retained, nil, 1);
+		} @catch (NSException *ex) {
+			raised = [ex.name isEqualToString:NSInvalidArgumentException] &&
+			         [ex.reason isEqualToString:@"*** -[__NSArrayM insertObject:atIndex:]: object "
+			                                    @"cannot be nil"];
+		}
+		CHECK(raised);
+		[retained commit];
+		const uint64_t sr = nextSeqno(q);
+		hostComplete(q, *driven.kext, sr, retained);
+		[retained waitUntilCompleted];
+		CHECK(retained.status == MTLCommandBufferStatusCompleted);
+
+		id<MTLCommandBuffer> unretained = [q.queue commandBufferWithUnretainedReferences];
+		scheduleSignal(unretained, nil, 1);
+		[unretained commit];
+		const uint64_t su = nextSeqno(q);
+		hostComplete(q, *driven.kext, su, unretained);
+		[unretained waitUntilCompleted];
+		CHECK(unretained.status == MTLCommandBufferStatusError);
+		CHECK([unretained.error.domain isEqualToString:MTLCommandBufferErrorDomain]);
+		CHECK(unretained.error.code == MTLCommandBufferErrorInternal);
+		CHECK([unretained.error.localizedDescription
+		    isEqualToString:@"Invalid Input (0000000a:kIOGPUCommandBufferCallbackErrorInvalidInput)"]);
+	}
+}
+#endif
+
 } // namespace
 
 void rgfxQueueTests(const char *self)
@@ -2346,5 +2617,10 @@ void rgfxQueueTests(const char *self)
 	test_finish_waits_for_committed_buffers();
 #if RgfxMakesResidencySets
 	test_residency_sets_are_held_until_let_go();
+#endif
+#if defined(__arm64__)
+	test_a_scheduled_signal_is_set_as_its_queue_submits_it();
+	test_a_scheduled_signal_behind_a_wait_is_set_at_its_scheduling();
+	test_a_scheduled_signal_takes_only_a_shared_event();
 #endif
 }

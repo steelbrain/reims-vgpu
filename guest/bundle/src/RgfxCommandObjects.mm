@@ -1622,6 +1622,16 @@ constexpr uint64_t kRgfxBarrierRenderStages = MTLRenderStageVertex | MTLRenderSt
 constexpr uint32_t kRgfxSlotsNamed = 1, kRgfxSlotsFinished = 2, kRgfxSlotsHeld = 4,
                    kRgfxSlotsScheduled = 8;
 
+#if defined(__arm64__)
+// A scheduled signal of a command buffer (encodeSignalEventScheduled:value:): the shared event,
+// the value it takes, and how many of the buffer's waits were encoded before it.
+struct RgfxScheduledSignal {
+	RgfxSharedEvent *event;
+	uint64_t value;
+	size_t waitsBefore;
+};
+#endif
+
 // A waiting thread's ask of a command buffer's scheduling (RgfxCmdBuffer's _scheduledAsk): a
 // thread waits for it to be scheduled; its message is on its ring, held by nothing.
 constexpr uint32_t kRgfxAskWanted = 1, kRgfxAskPosted = 2;
@@ -1776,6 +1786,16 @@ enum RgfxStage : unsigned {
 	// finish of the buffer raises each plain event's value as this process knows it.
 	std::vector<std::pair<id, uint64_t>> _eventWaits;
 	std::vector<std::pair<RgfxEvent *, uint64_t>> _plainSignals;
+#if defined(__arm64__)
+	// Its scheduled signals (encodeSignalEventScheduled:value:), in the order encoded, and how
+	// many of them are set: at its post, those its queue's submission reaches there, the rest at
+	// its scheduling (rgfxSetScheduledSignalsAtPost, rgfxReachScheduled).
+	std::vector<RgfxScheduledSignal> _scheduledSignals;
+	size_t _scheduledSignalsSet;
+	// A scheduled signal of a nil event on a buffer that retains no references: it fails, as
+	// Metal's does (encodeSignalEventScheduled:value:).
+	bool _invalidInput;
+#endif
 	// Signalled once the queue's write-back queue has written its copies back and retired its
 	// writes, where its take left them to it (rgfxHostDone:); nil otherwise.
 	dispatch_semaphore_t _writtenBack;
@@ -2184,6 +2204,11 @@ enum RgfxStage : unsigned {
 	RgfxRegion *writesRegion = _surfaceWritesRegion;
 	std::function<void(uint64_t)> expect;
 	std::function<void()> whileWaiting;
+#if defined(__arm64__)
+	// The scheduled signals its queue's submission reaches now, before it goes on its ring and
+	// before a wait of it on the same event is looked at.
+	[self rgfxSetScheduledSignalsAtPost];
+#endif
 	if (_reader != nullptr) {
 		RgfxCmdBuffer *strongSelf = self;
 		RgfxReplyReader *reader = _reader;
@@ -2409,6 +2434,22 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	return [NSError errorWithDomain:MTLCommandBufferErrorDomain code:code userInfo:nil];
 }
 
+#if defined(__arm64__)
+// The NSError Metal gives a command buffer that retains no references, one of whose scheduled
+// signals names no event: its description, under the code it carries (measured on the M3 Max,
+// macOS 27.0.1, oracle_cmdbuf schedsig_nil_unretained; an underlying error is not measured).
+static NSError *rgfxInvalidInputError()
+{
+	return [NSError
+	    errorWithDomain:MTLCommandBufferErrorDomain
+	               code:MTLCommandBufferErrorInternal
+	           userInfo:@{
+		           NSLocalizedDescriptionKey :
+		               @"Invalid Input (0000000a:kIOGPUCommandBufferCallbackErrorInvalidInput)"
+	           }];
+}
+#endif
+
 // What the host is done with at the buffer's completion, on the thread that took it off the
 // ring, before its record goes to the queue's completion queue: it is submitted where it was
 // not yet (its CB_COMPLETE stands for both); its writes of surfaces all in place retire; the
@@ -2431,6 +2472,58 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	}
 	return YES;
 }
+
+#if defined(__arm64__)
+// Whether the first `count` events it waits on are at their values, as rgfxWaitsMet reads them.
+- (BOOL)rgfxWaitsMetBefore:(size_t)count
+{
+	for (size_t i = 0; i < count && i < _eventWaits.size(); i++) {
+		const auto &wait = _eventWaits[i];
+		uint64_t now = 0;
+		if ([wait.first isKindOfClass:[RgfxSharedEvent class]])
+			now = [(RgfxSharedEvent *)wait.first signaledValue];
+		else if ([wait.first isKindOfClass:[RgfxEvent class]])
+			now = [(RgfxEvent *)wait.first rgfxSignalledValue];
+		if (now < wait.second)
+			return NO;
+	}
+	return YES;
+}
+
+// At its post, the scheduled signals its queue's submission reaches there, in the order
+// encoded: where no buffer posted before it on its queue is held, each whose waits encoded before
+// it are met as this process knows them (rgfxWaitsMetBefore:). The rest are set at its
+// scheduling, which then runs on its queue's completion queue, as a scheduled handler's does.
+// Metal's queue submits a buffer's stream in order: a scheduled signal takes its value as the
+// submission reaches it, behind every wait before it on the queue, its buffer's own and an
+// earlier buffer's, and ahead of the buffer's GPU work and of a wait encoded after it (measured
+// on the M3 Max, macOS 27.0.1, oracle_cmdbuf schedsig: 0.04 to 0.1 ms after the commit, before
+// GPUStartTime and the scheduled handler, behind a 190 ms buffer of its queue too; behind a wait,
+// 0.04 to 0.15 ms after the CPU set its event; with a wait on its own event after it, the
+// buffer runs). One held at its post is set later than Metal's, at its buffer's scheduling,
+// where a wait after it on the buffer is not yet met.
+- (void)rgfxSetScheduledSignalsAtPost
+{
+	if (_scheduledSignals.empty())
+		return;
+	if ([_queue rgfxHeldBuffers] == 0) {
+		while (_scheduledSignalsSet < _scheduledSignals.size() &&
+		       [self rgfxWaitsMetBefore:_scheduledSignals[_scheduledSignalsSet].waitsBefore])
+			[self rgfxSetScheduledSignal:_scheduledSignals[_scheduledSignalsSet++]];
+	}
+	if (_scheduledSignalsSet < _scheduledSignals.size()) {
+		_schedulesWhereSeen = false;
+		_deliversWhereSeen = false;
+	}
+}
+
+// Sets a scheduled signal's event to its value, as the CPU's set does: the host first, then
+// this process's listeners and waits; a lower value leaves the event, as Metal's does.
+- (void)rgfxSetScheduledSignal:(const RgfxScheduledSignal &)signal
+{
+	[signal.event setSignaledValue:signal.value];
+}
+#endif
 
 // Names its surface accesses, once: its queue among the writers of each view it writes and the
 // readers of each it only reads, so a present of the surface waits for it and a buffer of
@@ -2613,7 +2706,14 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	// The resources it kept are out of flight before it is seen complete, where its take did
 	// not do it.
 	_kept.land();
-	// A buffer some of whose inline bytes found no chunk ran without those bindings, so it fails.
+	// A buffer some of whose inline bytes found no chunk ran without those bindings, so it fails;
+	// so does one with a scheduled signal of a nil event, as Metal's does.
+#if defined(__arm64__)
+	if (msg->status == RGFX_CB_OK && _invalidInput) {
+		_cbError = rgfxInvalidInputError();
+		_status.store(MTLCommandBufferStatusError);
+	} else
+#endif
 	if (msg->status == RGFX_CB_OK && _uploadsFailed) {
 		// It ran without some of its bindings, so it fails as Metal's does when memory runs out.
 		static char site;
@@ -2667,6 +2767,11 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 		return;
 	[self rgfxReachSubmitted];
 	[self rgfxScheduledNamesAccesses];
+#if defined(__arm64__)
+	// Its scheduled signals its post did not set, before its scheduled handlers run.
+	while (_scheduledSignalsSet < _scheduledSignals.size())
+		[self rgfxSetScheduledSignal:_scheduledSignals[_scheduledSignalsSet++]];
+#endif
 	MTLCommandBufferStatus committed = MTLCommandBufferStatusCommitted;
 	_status.compare_exchange_strong(committed, MTLCommandBufferStatusScheduled);
 	[self rgfxNoteStage:kRgfxStageSubmitToHW];
@@ -3100,6 +3205,43 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	(void)agentMask;
 	[self encodeSignalEvent:event value:value];
 }
+
+#if defined(__arm64__)
+// An Apple GPU's command buffer's SPI, which MPSGraph, CMImaging and PhotosensitivityProcessing
+// send with no respondsToSelector: check; neither x86 Mac's buffers answer it (%spi-neither), so
+// an x86-64 guest's do not. The shared event takes `value` as its queue's submission reaches the
+// call, where its GPU work has not begun (rgfxSetScheduledSignalsAtPost), and its value only
+// rises, as Metal's (measured on the M3 Max, macOS 27.0.1, oracle_cmdbuf schedsig: an event at 5
+// stays 5 after a scheduled signal of 3; of two, 6 and 8 in either order, 8). After the commit
+// the call sets nothing. A plain event ends the process with Metal's words, as Metal does; a nil
+// event raises Metal's exception on a buffer that retains its references, and fails a buffer
+// that retains none with Metal's error (measured, schedsig_plain, schedsig_late, schedsig_nil,
+// schedsig_nil_unretained). An event no device of ours made is not carried (rgfxEventOf:).
+- (void)encodeSignalEventScheduled:(id<MTLEvent>)event value:(uint64_t)value
+{
+	if ([(id)event isKindOfClass:[RgfxEvent class]]) {
+		NSLog(@"MTLEvent passed to API expecting MTLSharedEvent");
+		abort();
+	}
+	if (event == nil && _retained)
+		@throw [NSException
+		    exceptionWithName:NSInvalidArgumentException
+		               reason:@"*** -[__NSArrayM insertObject:atIndex:]: object cannot be nil"
+		             userInfo:nil];
+	std::lock_guard<std::mutex> hold(_handlersLock);
+	if (_committed)
+		return;
+	if (event == nil) {
+		_invalidInput = true;
+		return;
+	}
+	if (![(id)event isKindOfClass:[RgfxSharedEvent class]]) {
+		[self rgfxEventOf:event op:"encodeSignalEventScheduled" value:value];
+		return;
+	}
+	_scheduledSignals.push_back({(RgfxSharedEvent *)event, value, _eventWaits.size()});
+}
+#endif
 
 // Statistics, as the queue's.
 - (void)setStatEnabled:(BOOL)enabled

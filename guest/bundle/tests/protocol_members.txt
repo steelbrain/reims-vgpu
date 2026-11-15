@@ -1428,7 +1428,7 @@ encodeDashboardFinalizeForResourceGroup:dashboard:value:forIndex: metal ends the
 encodeDashboardFinalizeForResourceGroup:dashboard:values:indices:count: metal ends the process with Metal's words, as Metal's base buffer does: not supported on this device (read from code, %cb-base)
 encodeDashboardTagForResourceGroup: metal ends the process with Metal's words, as Metal's base buffer does: not supported on this device (read from code, %cb-base)
 encodeSignalEvent:value:agentMask: implemented
-encodeSignalEventScheduled:value: absent %spi-neither
+encodeSignalEventScheduled:value: absent %spi-neither (the arm64 bundle answers it, as the M3 Max's buffers do: an Apple GPU's SPI, src/RgfxCommandObjects.mm)
 encodeWaitForEvent:value:timeout: implemented
 getListIndex metal 0, as the AMD 5300M's and the Intel 630's buffers answer (measured, %cb-answers)
 globalTraceObjectID implemented
