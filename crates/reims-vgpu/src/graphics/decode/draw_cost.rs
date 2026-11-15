@@ -49,10 +49,10 @@ use reims_vgpu_graphics::ops::{
 use reims_vgpu_graphics::wire::{
     RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_COMMAND_BUFFER,
     RGFX_CMD_HEAP_OVER_HOST_MEMORY, RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_QUEUE_CREATE,
-    RGFX_CMD_SURFACE_PAGES, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN, RGFX_STATUS_OK,
-    RGFX_SURFACE_PAGES_PRIVATE, RgfxBufferAtOffset, RgfxBufferOverHostMemory,
-    RgfxHeapOverHostMemory, RgfxHeapOverPages, RgfxMsgHeader, RgfxPageRun, RgfxQueueCreate,
-    RgfxSurfacePages,
+    RGFX_CMD_SURFACE_PAGES, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_VA_BASE,
+    RGFX_CURSOR_SPAN, RGFX_STATUS_OK, RGFX_SURFACE_PAGES_PRIVATE, RgfxBufferAtOffset,
+    RgfxBufferOverHostMemory, RgfxHeapOverHostMemory, RgfxHeapOverPages, RgfxMsgHeader,
+    RgfxPageRun, RgfxQueueCreate, RgfxSurfacePages,
 };
 use reims_vgpu_vulkan::core::memory::map::MemoryMap as CoreMemoryMap;
 use reims_vgpu_vulkan::core::platform::Platform;
@@ -198,9 +198,13 @@ const CHUNKS_A_SLAB: u64 = SLAB / CHUNK;
 /// chunk of the slab's pages, as the kext's 64 KiB chunks make a slab.
 const PAGES_BLOCK: u64 =
     GUEST_PAGE + (CHUNKS_A_SLAB * size_of::<RgfxPageRun>() as u64).next_multiple_of(GUEST_PAGE);
-/// The GPU address the first slab's heap is pinned at, each next one a slab further: the guest
-/// picks a heap's address.
-const SLAB_ADDRESS: u64 = 0x2_0000_0000;
+/// The GPU address the first slab's heap is pinned at, the first of the guest's
+/// (`RGFX_CONTEXT_VA_BASE`), each next one a slab's span further: the guest picks a heap's
+/// address, a span of its pages and one guard page, rounded up to 32 KiB
+/// (`RgfxIdSpace::addressSpan`), which Metal's space holds for a pin, so a heap pinned a bare
+/// slab further meets the one before it and is nil.
+const SLAB_ADDRESS: u64 = RGFX_CONTEXT_VA_BASE;
+const SLAB_SPAN: u64 = SLAB + 0x8000;
 /// `MTLResourceHazardTrackingModeTracked`, which the bundle resolves a slab's `Default` mode to
 /// and gives its heap, as Metal resolves a buffer's.
 const TRACKED: u32 = 2 << 8;
@@ -641,7 +645,7 @@ fn make_chunks<P: ApiPlatform>(
         return;
     }
     for slab in 0..shape.slabs() {
-        let gpu_address = SLAB_ADDRESS + slab * SLAB;
+        let gpu_address = SLAB_ADDRESS + slab * SLAB_SPAN;
         if chunks == Chunks::Heap {
             let heap = RgfxHeapOverHostMemory {
                 header: header(RGFX_CMD_HEAP_OVER_HOST_MEMORY),
@@ -1284,6 +1288,8 @@ fn pages_slabs_are_the_bundle_s() {
         assert!(shape.chunks() <= shape.slabs() * CHUNKS_A_SLAB);
         assert!(shape.slabs() * PAGES_BLOCK <= shape.slabs() * SLAB);
     }
+    // A heap's pin holds its pages, one 16 KiB guard page and the rounding up to 32 KiB.
+    assert_eq!(SLAB_SPAN, (SLAB + 0x4000).next_multiple_of(0x8000));
 }
 
 /// On the Vulkan platform: the decoder, the platform and the runtime alone.
