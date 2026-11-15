@@ -3104,6 +3104,60 @@ mod tests {
         }
     }
 
+    /// A command buffer that may be cut is committed as a part at a range's end
+    /// (`CommandBuffer::commit_part`), the one `part` made for its later range going on. One kept
+    /// whole only by a failure from an encoder on commits nothing and answers so, and takes in
+    /// the later one's ways of failing as though its encoders had followed its own
+    /// (`CommandBuffer::fold`): a type-9 draw of the later one's fails from its place counted
+    /// after this one's encoders, and one of another code beside this one's dies at the commit,
+    /// as in one command buffer. One kept whole by its protection options is neither.
+    #[test]
+    fn a_later_part_folds_into_a_buffer_that_fails_from_an_encoder_on() {
+        let q = dev().new_command_queue().unwrap();
+        let cb = buffer(&q);
+        let later = cb
+            .part(OnFault::Return)
+            .unwrap()
+            .expect("one that may be cut");
+        assert_eq!(cb.commit_part(OnFault::Return).unwrap(), PartCut::Cut);
+        assert!(cb.committed.load(Ordering::SeqCst));
+        drop(later);
+        let hang = Failing {
+            code: rt::CommandBufferError::GpuHang.metal_code(),
+            from: 0,
+            signals: true,
+        };
+        let fault = Failing {
+            code: rt::CommandBufferError::PageFault.metal_code(),
+            ..hang
+        };
+        for (theirs, dies) in [(hang, false), (fault, true)] {
+            let cb = buffer(&q);
+            let later = cb.part(OnFault::Return).unwrap().unwrap();
+            cb.made.store(3, Ordering::SeqCst);
+            cb.fails_at_type_9(Failing { from: 2, ..hang });
+            later.made.store(2, Ordering::SeqCst);
+            later.fails_at_type_9(Failing { from: 1, ..theirs });
+            assert_eq!(cb.commit_part(OnFault::Return).unwrap(), PartCut::Fails);
+            assert!(!cb.committed.load(Ordering::SeqCst), "nothing committed");
+            cb.fold(later);
+            assert_eq!(cb.made.load(Ordering::SeqCst), 5);
+            let froms: Vec<usize> = cb.by_runtime.lock().iter().map(|w| w.from).collect();
+            assert_eq!(froms, [2, 4], "the later one's counted after this one's");
+            assert_eq!(cb.runs_nothing_from(None), Some(2));
+            match dies {
+                false => assert!(cb.failure("commit").is_none(), "type 9 of one code"),
+                true => assert!(catch_death(|| cb.failure("commit")).is_err(), "two codes"),
+            }
+        }
+        let cb = buffer(&q);
+        let later = cb.part(OnFault::Return).unwrap().unwrap();
+        cb.set_protection_options(OnFault::Return, 2).unwrap();
+        assert_eq!(cb.commit_part(OnFault::Return).unwrap(), PartCut::Whole);
+        assert!(cb.part(OnFault::Return).unwrap().is_none(), "no part made");
+        drop(later);
+    }
+
     /// Where protection options are set in a command buffer of [`read_only_store_beside`]:
     /// before its pass, after it, or after every encoder.
     #[cfg(target_os = "linux")]
