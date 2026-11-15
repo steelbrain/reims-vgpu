@@ -3520,11 +3520,21 @@ less there. There the surface worker gathers a process's views for a window: the
 joins its process's open group, which stays open 1 ms from its first member, or
 until its members reach one dma-buf's limits: udmabuf's `list_limit` runs and
 `size_limit_mb` bytes, as the host has them (the host sets neither), and at most
-64 MiB, whatever udmabuf takes (below). The group is then sealed: the views'
-pages go into shared dma-bufs back to back, and each view's import is a piece of
-its group's file, so the driver lists one import for the group. Only then are
-the members' messages carried out, and the process's and the blocks' later
-messages wait for that, so each sees its buffer as right after its create.
+64 MiB, whatever udmabuf takes (below). It closes sooner once nothing more can
+join it: a later message of the process on the control ring waits for the views,
+which holds the process's messages behind it, and every view posted before that
+message has joined. The group is then sealed: the views' pages go into shared
+dma-bufs back to back, and each view's import is a piece of its group's file, so
+the driver lists one import for the group. Only then are the members' messages
+carried out, and the process's and the blocks' later messages wait for that, so
+each sees its buffer as right after its create. A `BUFFER_OVER_PAGES` has no
+answer, so the window delays only the process's messages that wait for the views.
+A Geekbench 7.1 Metal walk on the Radeon 780M (2026-11-15) put 3,665 of its 4,686
+views in 930 groups. A walk of a macOS 26.7.2 desktop on the same GPU, Finder
+then Launchpad, made 559 groups of one view each and a view took 1.25 ms at the
+median from its begin on the host to its make, nearly all of it the window; with
+the early close, 537 of its 553 groups closed as a message of the process waited
+for them, and a view took 0.20 ms.
 
 Some views take no group: a view over 16 MiB, one past a group's limits alone,
 a view the host's cache of views holds, a heap over the guest's RAM, a block of

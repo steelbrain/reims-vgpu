@@ -12569,8 +12569,9 @@ fn grouped_blocks(
 
 /// The no-copy buffers a context makes over its pages blocks' views in a burst share one group
 /// dma-buf (`decode::surface_pages`, "Group dma-bufs"): each view joins its context's group and
-/// nothing is made while the group's window is open, the context's next message waiting for it;
-/// once the window closes, the views lie in one shared file, each at an offset of its own, each
+/// nothing is made while the group's window is open; the context's next message on ring 0, which
+/// waits for them and holds the context's lane, closes the group once the three have joined, with
+/// no window waited for: the views lie in one shared file, each at an offset of its own, each
 /// view's import made over its piece, then the buffers over them, then the context's next message
 #[test]
 fn a_burst_of_pages_buffers_of_one_context_shares_one_group() {
@@ -12587,19 +12588,18 @@ fn a_burst_of_pages_buffers_of_one_context_shares_one_group() {
     }
     let joined = eventually(|| decoder.views_of_surfaces().forming() == (1, 3));
     assert!(joined, "the three views joined one group");
-    guest.send(&device, event_create(obj(1, 20)));
     std::thread::sleep(Duration::from_millis(30));
     assert_eq!(
         device.decoder_object_count(),
         0,
-        "nothing made while the group's window is open, the context's next message waiting"
+        "nothing made while the group's window is open"
     );
     assert_eq!(buffers_since(&platform, mark), 0, "no import made yet");
 
-    platform.virtual_clock().advance(Duration::from_millis(1));
+    guest.send(&device, event_create(obj(1, 20)));
     assert!(
         objects_become(&device, 4),
-        "the three buffers, then the event"
+        "the three buffers, then the event, with the platform's clock where it was"
     );
     decoder.surface_worker().flush();
     assert_eq!(
@@ -12621,6 +12621,85 @@ fn a_burst_of_pages_buffers_of_one_context_shares_one_group() {
     let counts = decoder.views_of_surfaces().counts();
     assert_eq!((counts.private, counts.grouped, counts.groups), (3, 3, 1));
     assert_eq!(decoder.views_of_surfaces().forming(), (0, 0));
+}
+
+/// A lone no-copy buffer's view takes no window: the context's next message on ring 0, which waits
+/// for it on the context's lane, so that no later view can join its group, closes the group of one
+/// at once, and is answered with the platform's clock where it was; the view, alone in its group,
+/// is imported alone (`decode::surface_pages`, "Group dma-bufs")
+#[test]
+fn a_lone_view_s_context_is_answered_without_waiting_for_a_window() {
+    let (device, platform, _ram, page) = grouping_device(16, GROUP_LIMITS);
+    let mut guest = Guest::new(&device);
+    let blocks = grouped_blocks(&device, &mut guest, 1, SURFACE_BLOCK, 1, page);
+    let decoder = device.control.decoder();
+    let mark = platform.call_log().mark();
+    guest.send(
+        &device,
+        buffer_over_pages_of(obj(1, 11), blocks[0], 2 * page),
+    );
+    // A library lookup's miss, answered once the context's messages before it are carried out.
+    carried_out_of(&device, &mut guest, 1);
+    assert_eq!(
+        device.decoder_object_count(),
+        1,
+        "the buffer, before the answer"
+    );
+    decoder.surface_worker().flush();
+    assert_eq!(
+        buffers_since(&platform, mark),
+        2,
+        "the view's import, alone, and the buffer over it"
+    );
+    assert_eq!(group_of(&device, &platform, blocks[0]), None, "alone");
+    assert_eq!(platform.fake_vm().groups_made(), 0);
+    let counts = decoder.views_of_surfaces().counts();
+    assert_eq!((counts.private, counts.grouped, counts.groups), (1, 0, 0));
+    assert_eq!(decoder.views_of_surfaces().forming(), (0, 0));
+}
+
+/// A message of the context that waits for its no-copy buffers on ring 0 closes the context's group
+/// only once every view its lane handed over before it has joined: a view whose job has not yet run
+/// joins the same group, and the two lie in one shared file, with the platform's clock where it was
+#[test]
+fn a_waiting_message_closes_its_context_s_group_once_the_views_before_it_joined() {
+    let (device, platform, _ram, page) = grouping_device(16, GROUP_LIMITS);
+    let mut guest = Guest::new(&device);
+    let blocks = grouped_blocks(&device, &mut guest, 1, SURFACE_BLOCK, 2, page);
+    let decoder = device.control.decoder();
+    guest.send(
+        &device,
+        buffer_over_pages_of(obj(1, 11), blocks[0], 2 * page),
+    );
+    let opened = eventually(|| decoder.views_of_surfaces().forming() == (1, 1));
+    assert!(opened, "the first view opened its context's group");
+    // The second view is handed over, its job held; then the context's next message waits.
+    decoder.surface_worker().hold();
+    guest.send(
+        &device,
+        buffer_over_pages_of(obj(1, 12), blocks[1], 2 * page),
+    );
+    guest.send(&device, event_create(obj(1, 20)));
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(
+        decoder.views_of_surfaces().forming(),
+        (1, 1),
+        "the group waits for the view handed over before the message"
+    );
+    assert_eq!(device.decoder_object_count(), 0, "nothing made yet");
+
+    decoder.surface_worker().release();
+    assert!(
+        objects_become(&device, 3),
+        "the two buffers, then the event, with the platform's clock where it was"
+    );
+    decoder.surface_worker().flush();
+    let first = group_of(&device, &platform, blocks[0]).expect("in a group");
+    let second = group_of(&device, &platform, blocks[1]).expect("in a group");
+    assert_eq!(first.0, second.0, "one group");
+    assert_eq!(platform.fake_vm().groups_made(), 1);
+    let counts = decoder.views_of_surfaces().counts();
+    assert_eq!((counts.private, counts.grouped, counts.groups), (2, 2, 1));
 }
 
 /// Two contexts' bursts of no-copy buffers over their pages blocks form a group each, never one

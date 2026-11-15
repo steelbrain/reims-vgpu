@@ -1583,8 +1583,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         }
         // A message of a context whose no-copy buffer is being made on the surface worker, which
         // it may name, is carried out after it.
-        self.pages_buffers
-            .wait(pages_context(sender_context(poster, message)));
+        self.wait_for_pages_buffers(poster, message);
         match r#type {
             RGFX_CMD_RENDER_PIPELINE_CREATE
             | RGFX_CMD_MESH_RENDER_PIPELINE_CREATE
@@ -2403,6 +2402,34 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         poster.post(answer.as_bytes());
     }
 
+    /// Waits for the no-copy buffers and heaps of `message`'s context being made on the surface
+    /// worker ([`Self::start_over_pages`]), which it may name. A ring-0 message waits on its
+    /// context's lane, which hands no later message over meanwhile, so no view behind it can
+    /// join the context's group being formed: the group closes once the views handed over before
+    /// it have joined, rather than at its window's end (`decode::surface_pages`, "Group
+    /// dma-bufs"). A message of a queue's ring leaves the group its window, as a later view of the
+    /// context may still come on ring 0.
+    fn wait_for_pages_buffers(&self, poster: &CompletionPoster, message: &[u8]) {
+        let context = sender_context(poster, message);
+        let key = pages_context(context);
+        if !self.pages_buffers.any(std::iter::once(key)) {
+            return;
+        }
+        let begun = self.pool.now();
+        let ring_0 = poster.queue_obj_id().is_none();
+        let waits = ring_0.then(|| self.decoder().wait_for_views(context));
+        self.pages_buffers.wait(key);
+        drop(waits);
+        let (ty, seqno, _) = message_identity(message);
+        log::debug!(
+            target: "reims_vgpu::graphics::surface_pages",
+            "a message (type {ty:#x}, seqno {seqno}) of context {context} on {} waited {} us for \
+             its no-copy buffers being made",
+            if ring_0 { "ring 0" } else { "its queue's ring" },
+            self.pool.now().saturating_duration_since(begun).as_micros()
+        );
+    }
+
     /// A `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` from ring 0 that makes its pages block's view
     /// (the block's first; a heap over a block of one run makes none), follows its block's
     /// `SURFACE_PAGES` still on the surface worker, or follows another of its context's still
@@ -2433,6 +2460,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             self.pages_buffers.begin(context, 0, begun),
             self.pages_buffers.begin(block, 0, begun),
         );
+        // Counted until its job has joined its context's group or gone on alone, so a message of
+        // the context that waits behind it on its lane leaves the group open for it.
+        let handed = decoder.hand_over_pages(sender_context(poster, message));
         let (me, poster, message) = (Arc::clone(self), poster.clone(), message.to_vec());
         decoder.on_surface_worker(
             block,
@@ -2451,6 +2481,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     let decoder = (me.decoders).sender(Some(context), Sinks::default());
                     decoder.join_group(&message, then)
                 };
+                drop(handed);
                 match joined {
                     Joined::Now(then) => then(),
                     Joined::Waits => {}

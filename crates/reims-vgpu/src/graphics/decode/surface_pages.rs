@@ -124,18 +124,33 @@
 //! shared file of views ([`HostVm::view_groups`]), a `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` the
 //! surface worker carries out that makes its block's view maps the view and joins its context's
 //! open group ([`SurfaceViews::join_group`]), and its carrying out waits for the group's seal. A
-//! group stays open [`GROUP_WINDOW`] from its first member's join, or until its members' runs or
-//! bytes reach the platform's limits; then a job of its own on the surface worker seals it
+//! group stays open [`GROUP_WINDOW`] from its first member's join, until its members' runs or
+//! bytes reach the platform's limits, or until nothing more can join it: a ring-0 message of its
+//! context waits for it, which holds the context's lane, so no later message is handed over, and
+//! every message the lane handed over before has joined or gone on alone ([`HandedOver`],
+//! [`WaitsForViews`]). Then a job of its own on the surface worker seals it
 //! ([`SurfaceViews::seal`]): the views go into shared files ([`HostVm::group_views`]), each view's
 //! import is made, a piece of its file, so the device imports one file for the group, and the
 //! members' messages are carried out in their order. Their context's and their blocks' settles drop
 //! only then (`GraphicsControl::start_over_pages`), so the guest's later messages see each buffer
-//! as right after its create; the window delays only the context's first message after a burst,
-//! which waits for the creates anyway. Creates come in bursts (**measured** on the second walk's
-//! trace, Super Resolution: 126 us apart at the median), and a replay of that trace's creates and
-//! frees cut its live views' imports by 81 to 86% with a 1 ms window, against about 43% for a seal
-//! of what is queued alone. A view past [`GROUP_MEMBER_MAX`] or past a group's limits alone, a view
-//! the cache holds, a heap over the guest's RAM, and a block of pages its process maps read-only or
+//! as right after its create. Creates come in bursts (**measured** on the second walk's trace,
+//! Super Resolution: 126 us apart at the median), and a replay of that trace's creates and frees
+//! cut its live views' imports by 81 to 86% with a 1 ms window, against about 43% for a seal of
+//! what is queued alone; a walk of Geekbench 7.1 Metal on the same 780M (2026-11-15) grouped 3,665
+//! of its 4,686 pages blocks' views, in 930 groups. A `BUFFER_OVER_PAGES` has no answer, so the
+//! window delays only the context's messages that wait for it. A ring-0 message of the context
+//! behind a view waits for it on the context's lane, so no view behind that message can join the
+//! view's group: such a message closes the group once the views handed over before it have joined,
+//! rather than wait out the window. A message of a queue's ring leaves the group its window, as a
+//! later view may still come on ring 0 and join. **Measured** 2026-11-15 on homelab-gem10-1's
+//! Radeon 780M, a macOS 26.7.2 guest's desktop walk (Finder, then Launchpad three times; two walks
+//! each way): with the window alone, 559 and 550 groups formed, all of one view but one of two, and
+//! a `BUFFER_OVER_PAGES`' view took 1.23 to 1.25 ms at the median from its begin to its make,
+//! nearly all of it the window; with the close, 537 of 553 and 551 of 572 groups closed as a ring-0
+//! message waited, 2 us at the median after their first member, the rest at the window's end with
+//! nothing waiting, and a view took 0.20 to 0.22 ms. A view past [`GROUP_MEMBER_MAX`] or past a
+//! group's limits alone, a view the cache holds, a heap over the guest's RAM, and a block of pages
+//! its process maps read-only or
 //! a read-only buffer (made over a copy of the pages) take no group; a view the platform leaves
 //! alone, or whose piece the runtime refuses, leaves its group and is made alone, as before. A
 //! context's close and the device's reset drop its groups being formed, whose messages make
@@ -623,7 +638,8 @@ struct Forming<P: Platform> {
     number: u64,
     /// The context whose views it takes.
     context: u32,
-    /// When its window closes.
+    /// When its first member joined, and when its window closes.
+    opened: MonoTime,
     closes: MonoTime,
     /// The device's resets as it opened: a reset since makes nothing of it.
     resets: u64,
@@ -655,11 +671,49 @@ struct Member<P: Platform> {
 type SealedMember<P> = (u64, Vec<(u64, u64)>, Arc<SurfaceView<P>>);
 
 /// A group whose window closed, to seal ([`SurfaceViews::seal`]): the device's resets as it
-/// opened, its context, and its members.
+/// opened, its context, and its members; why it closed, and how long after its first member's
+/// join (for its log line).
 pub(crate) struct Sealing<P: Platform> {
     resets: u64,
     context: u32,
     members: Vec<SealedMember<P>>,
+    closed: Closed,
+    open_for: std::time::Duration,
+}
+
+/// Why a group being formed took no more members ([`SurfaceViews::group_closed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Closed {
+    /// Its members reached the platform's limits for one shared file.
+    Full,
+    /// A ring-0 message of its context waits for it, and every message the context's lane handed
+    /// over before has joined or gone on alone: nothing more can join.
+    Waited,
+    /// Its window passed.
+    Window,
+}
+
+impl std::fmt::Display for Closed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Closed::Full => "at its limits",
+            Closed::Waited => "as its context waited for it",
+            Closed::Window => "at its window's end",
+        })
+    }
+}
+
+/// One more of `context`'s in `counts`, or one less where `more` is false, with no entry left at
+/// none.
+fn count(counts: &mut HashMap<u32, u64>, context: u32, more: bool) {
+    if more {
+        *counts.entry(context).or_default() += 1;
+    } else if let Some(n) = counts.get_mut(&context) {
+        *n -= 1;
+        if *n == 0 {
+            counts.remove(&context);
+        }
+    }
 }
 
 /// Groups being formed that went with their context's close ([`SurfaceViews::groups_closed`]),
@@ -833,9 +887,15 @@ pub(crate) struct SurfaceViews<P: Platform> {
     forming: Vec<Forming<P>>,
     /// The number the next group takes.
     next_group: u64,
-    /// Signalled as a group fills or goes, for the job that waits for its window
-    /// ([`Self::group_closed`]).
+    /// Signalled as a group fills or goes, or as nothing more can join a context's group, for the
+    /// job that waits for its window ([`Self::group_closed`]).
     group_changed: Arc<Condvar>,
+    /// By context, its `BUFFER_OVER_PAGES` and `HEAP_OVER_PAGES` handed to the surface worker
+    /// whose jobs have not yet joined a group or gone on alone ([`HandedOver`]).
+    handed: HashMap<u32, u64>,
+    /// By context, its ring-0 messages that wait for its no-copy buffers being made
+    /// ([`WaitsForViews`]).
+    waiting: HashMap<u32, u64>,
 }
 
 /// What a `SURFACE_PAGES` found under the views' lock ([`SurfaceViews::surface_pages`]).
@@ -880,6 +940,8 @@ impl<P: Platform> SurfaceViews<P> {
             forming: Vec::new(),
             next_group: 0,
             group_changed: Arc::new(Condvar::new()),
+            handed: HashMap::new(),
+            waiting: HashMap::new(),
         }
     }
 
@@ -1662,6 +1724,7 @@ impl<P: Platform> SurfaceViews<P> {
                 let forming = Forming {
                     number,
                     context,
+                    opened: now,
                     closes: now.saturating_add(GROUP_WINDOW),
                     resets: v.resets,
                     limits,
@@ -1694,10 +1757,11 @@ impl<P: Platform> SurfaceViews<P> {
         }
     }
 
-    /// Waits for the window of the group numbered `number` to close, on `platform`'s clock: its
-    /// time passed, or it filled; then marks it sealing, so it takes no more members, and answers
-    /// what its seal makes imports of ([`Self::seal`]). `None` where it went meanwhile (its
-    /// context's close, the device's reset).
+    /// Waits for the window of the group numbered `number` to close, on `platform`'s clock: it
+    /// filled, nothing more can join it ([`Self::joins_ended`]), or its time passed; then marks it
+    /// sealing, so it takes no more members, and answers what its seal makes imports of
+    /// ([`Self::seal`]). `None` where it went meanwhile (its context's close, the device's
+    /// reset).
     pub(crate) fn group_closed(
         views: &Mutex<SurfaceViews<P>>,
         platform: &P,
@@ -1707,8 +1771,17 @@ impl<P: Platform> SurfaceViews<P> {
         let mut v = views.lock();
         loop {
             let at = v.forming.iter().position(|f| f.number == number)?;
-            let (full, closes) = (v.forming[at].full, v.forming[at].closes);
-            if full || clock.now_mono() >= closes {
+            let f = &v.forming[at];
+            let (context, closes) = (f.context, f.closes);
+            let now = clock.now_mono();
+            let closed = if f.full {
+                Some(Closed::Full)
+            } else if v.joins_ended(context) {
+                Some(Closed::Waited)
+            } else {
+                (now >= closes).then_some(Closed::Window)
+            };
+            if let Some(closed) = closed {
                 let f = &mut v.forming[at];
                 f.sealing = true;
                 let members = (f.members.iter())
@@ -1716,8 +1789,10 @@ impl<P: Platform> SurfaceViews<P> {
                     .collect();
                 return Some(Sealing {
                     resets: f.resets,
-                    context: f.context,
+                    context,
                     members,
+                    closed,
+                    open_for: now.saturating_duration_since(f.opened),
                 });
             }
             let changed = Arc::clone(&v.group_changed);
@@ -1746,6 +1821,8 @@ impl<P: Platform> SurfaceViews<P> {
             resets,
             context,
             members,
+            closed,
+            open_for,
         } = sealing;
         if views.lock().resets != resets {
             return;
@@ -1796,9 +1873,10 @@ impl<P: Platform> SurfaceViews<P> {
         drop(gone);
         log::debug!(
             target: "reims_vgpu::graphics::surface_pages",
-            "a group of {} pages blocks' views of context {context} sealed: {grouped} imported as \
-             pieces of group dma-bufs",
-            list.len()
+            "a group of {} pages blocks' views of context {context} closed {closed} {} us after \
+             its first member joined, sealed: {grouped} imported as pieces of group dma-bufs",
+            list.len(),
+            open_for.as_micros()
         );
     }
 
@@ -1837,6 +1915,36 @@ impl<P: Platform> SurfaceViews<P> {
             self.group_changed.notify_all();
         }
         GroupsGone { _gone: gone }
+    }
+
+    /// Whether nothing more can join context `context`'s group being formed (the module doc,
+    /// "Group dma-bufs"): a ring-0 message of the context waits for its no-copy buffers being
+    /// made, so its lane hands no later message over, and every message the lane handed over
+    /// before has joined a group or gone on alone.
+    fn joins_ended(&self, context: u32) -> bool {
+        self.waiting.contains_key(&context) && !self.handed.contains_key(&context)
+    }
+
+    /// One more of `context`'s messages handed to the surface worker whose job has not joined a
+    /// group or gone on alone ([`HandedOver`]), or one less where `more` is false.
+    fn handed_over(&mut self, context: u32, more: bool) {
+        count(&mut self.handed, context, more);
+        self.joins_may_end(context);
+    }
+
+    /// One more of `context`'s ring-0 messages waiting for its no-copy buffers being made
+    /// ([`WaitsForViews`]), or one less where `more` is false.
+    fn waits_for_views(&mut self, context: u32, more: bool) {
+        count(&mut self.waiting, context, more);
+        self.joins_may_end(context);
+    }
+
+    /// Signals the groups' waits where context `context` has a group being formed, whose joins
+    /// may have ended ([`Self::joins_ended`]).
+    fn joins_may_end(&self, context: u32) {
+        if self.forming.iter().any(|f| f.context == context) {
+            self.group_changed.notify_all();
+        }
     }
 
     /// The first byte of the view of the pages block at `block`, made or mapped by its group
@@ -2129,6 +2237,33 @@ pub(crate) fn buffer_over<P: Platform>(
     })
 }
 
+/// A `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` handed to the surface worker whose job has not yet
+/// joined a group or gone on alone ([`super::GraphicsDecoder::hand_over_pages`]): counted until
+/// it drops.
+pub(crate) struct HandedOver<P: Platform> {
+    shared: Arc<super::Shared<P>>,
+    context: u32,
+}
+
+impl<P: Platform> Drop for HandedOver<P> {
+    fn drop(&mut self) {
+        (self.shared.surface_views.lock()).handed_over(self.context, false);
+    }
+}
+
+/// A ring-0 message of a context waiting for its no-copy buffers being made
+/// ([`super::GraphicsDecoder::wait_for_views`]): counted until it drops.
+pub(crate) struct WaitsForViews<P: Platform> {
+    shared: Arc<super::Shared<P>>,
+    context: u32,
+}
+
+impl<P: Platform> Drop for WaitsForViews<P> {
+    fn drop(&mut self) {
+        (self.shared.surface_views.lock()).waits_for_views(self.context, false);
+    }
+}
+
 impl<P: Platform> super::GraphicsDecoder<P> {
     /// `BUFFER_OVER_SURFACE_PAGES`: a Shared buffer over the view of the surface whose shared
     /// block the sender holds, lying over the block's part the holders map (`spans`), as a
@@ -2361,6 +2496,36 @@ impl<P: Platform> super::GraphicsDecoder<P> {
     pub(crate) fn drop_groups(&self, context: u32) {
         let gone = self.shared.surface_views.lock().groups_closed(context);
         drop(gone);
+    }
+
+    /// A `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` of context `context` handed to the surface
+    /// worker (`GraphicsControl::start_over_pages`), on the context's lane, in ring order:
+    /// until the answer drops, once its job has joined a group or gone on alone
+    /// ([`Self::join_group`]), a group of the context may still take it, so no message of the
+    /// context's that waits closes the context's group ([`WaitsForViews`]).
+    pub(crate) fn hand_over_pages(&self, context: u32) -> HandedOver<P> {
+        self.shared.surface_views.lock().handed_over(context, true);
+        HandedOver {
+            shared: Arc::clone(&self.shared),
+            context,
+        }
+    }
+
+    /// A ring-0 message of context `context` waits for the context's no-copy buffers being made
+    /// on the surface worker (`GraphicsControl::wait_for_pages_buffers`), on the context's lane,
+    /// until the answer drops: the lane hands no later message over meanwhile, so once the
+    /// messages it handed over before have joined ([`HandedOver`]), nothing more can join the
+    /// context's group being formed, which closes then rather than at its window's end (the
+    /// module doc, "Group dma-bufs").
+    pub(crate) fn wait_for_views(&self, context: u32) -> WaitsForViews<P> {
+        self.shared
+            .surface_views
+            .lock()
+            .waits_for_views(context, true);
+        WaitsForViews {
+            shared: Arc::clone(&self.shared),
+            context,
+        }
     }
 
     /// `HEAP_OVER_PAGES`: a Shared heap over the pages of a pages block of the sender's (the
