@@ -553,7 +553,7 @@ mod tests {
             // SAFETY: sysconf reads a constant of the host's.
             let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
             let device = platform.metal_device(None).unwrap();
-            let mirror = Mirror::new(device.clone_ref()).expect("the mirror");
+            let mirror = Mirror::<VulkanPlatform>::new(device.clone_ref()).expect("the mirror");
             let surface = |side: u64| {
                 let descriptor = platform.texture_descriptor(&TextureDesc {
                     pixel_format: 80,
