@@ -1487,6 +1487,17 @@
 // device later refuses, or answers otherwise, is dropped. Every host offers it.
 #define RGFX_FEATURE_PIPELINE_ANSWERS 140737488355328
 
+// `FEATURES_HI` bit 16, feature bit 48, `MULTI_DISPLAY`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_HI`]: the device has two displays or more, up to
+// [`RGFX_DISPLAYS_MAX`], each with its own scanout, modes, `VBLANK`s, cursor, presents, colour and
+// panel, which each display message names by the display's id (docs/graphics-kext/design.md,
+// "Multiple displays"). A host offers it only where the device has two displays or more. A guest
+// that took it is answered `DISPLAYS` with every display, ids 0 up, and is sent the events of
+// each; a guest that did not sees display 0 alone, as from a device of one display, and is sent
+// no event of another. Each display's scanout lies in a room of its own
+// ([`RGFX_SCANOUT_ROOM_ALIGN`]). No host offers it yet.
+#define RGFX_FEATURE_MULTI_DISPLAY 281474976710656
+
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 #define RGFX_REG_STATUS 16
@@ -1773,6 +1784,26 @@
 
 // The displays the device has: display 0.
 #define RGFX_DISPLAY_COUNT 1
+
+// The most displays a device has. A device of two or more offers [`RGFX_FEATURE_MULTI_DISPLAY`],
+// and has them from its start to its end: none is added or removed while it runs.
+#define RGFX_DISPLAYS_MAX 4
+
+// What a display's scanout room is a multiple of on a device of `count` displays: the scanout's
+// room ([`RGFX_SCANOUT_SPAN`] bytes at [`RGFX_ALLOCATIONS_OFFSET`]) split evenly among them,
+// `room = (RGFX_SCANOUT_SPAN / count)` rounded down to a multiple of this, display `i`'s from
+// `RGFX_ALLOCATIONS_OFFSET + i * room`: 128 MiB for one display, as before any display had a
+// room of its own, 64 MiB each for two, 0x2aa_0000 bytes each for three and 32 MiB each for
+// four. A display's `SET_SCANOUT` lies in its own room, so display 0's starts where the one
+// display's always has, and the firmware's framebuffer lies in display 0's.
+#define RGFX_SCANOUT_ROOM_ALIGN 65536
+
+// The row alignment a display's modes are sized for on a device of more than one display
+// ([`RGFX_FEATURE_MULTI_DISPLAY`]): the device offers each display only modes whose rows,
+// `width * RGFX_SCANOUT_BYTES_PER_PIXEL` bytes rounded up to a multiple of this, fit its room
+// ([`RGFX_SCANOUT_ROOM_ALIGN`]) `height` times, as the guest's kexts and the option ROM lay
+// their scanouts out.
+#define RGFX_SCANOUT_STRIDE_ALIGN 256
 
 // Device-level object lifecycle (ring 0, which the accelerator kext posts for
 // the guest's processes). Creates with a guest-picked id or address are

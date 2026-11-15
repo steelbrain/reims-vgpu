@@ -2002,6 +2002,10 @@ only where no negotiation can carry it.
   The kext seeds the answers it keeps for every process with them at its
   start ("Known pipeline creates"). Every host offers it, and the kext takes
   it; a host without it refuses the message as one it does not know.
+- Bit 48, `FEATURES_HI`'s bit 16, is `MULTI_DISPLAY`: the device has two
+  displays or more, and a guest that takes it drives each ("Multiple
+  displays", below). A host offers it only on a device of two displays or
+  more; no host offers it yet, and no kext takes it.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -2948,6 +2952,305 @@ scanout or the presented IOSurface through the display's colour, drawn as the
 window draws it into a texture of the display's mode, so QEMU's own displays and
 a QMP `screendump` see what the guest shows (docs/qemu.md, "The reims-graphics
 device").
+
+## Multiple displays
+
+Status: designed, not built (the owner's decision of 2026-11-15: several
+displays on this device, each in a window of its own, on x86-64 macOS 11 to 26
+and arm64 macOS from 14). The wire's definitions are in `wire.rs`
+(`RGFX_FEATURE_MULTI_DISPLAY`, `RGFX_DISPLAYS_MAX`, `RGFX_SCANOUT_ROOM_ALIGN`,
+`RGFX_SCANOUT_STRIDE_ALIGN`); no host offers the feature and no kext takes it
+yet. The lanes at the end of this section build it.
+
+**A device of one display is what it was.** A device has 1 to
+`RGFX_DISPLAYS_MAX` (4) displays, 1 by default, fixed when it is made. With
+one, everything the guest and the host observe stays as before this section:
+the registers (`FEATURES_HI` offers no new bit), every message and event,
+`DISPLAYS` with display 0 alone, the scanout's room and the modes offered, the
+C API's results and callbacks, QEMU's one console and its properties, the
+window and its register (`crates/reims-vgpu-window/features.md`), and the
+option ROM's bytes. Each lane holds that line with the tests that hold it
+today, unchanged, and with a one-display boot that logs the feature words a
+boot before the change logged (`RgfxFeaturesOffered`, `RgfxFeaturesWanted`,
+`RgfxFeaturesTaken`).
+
+**How the guest learns the count.** By `MULTI_DISPLAY` (feature bit 48,
+`FEATURES_HI` bit 16), which the host offers only on a device of two displays
+or more. A guest that takes it, as it takes any bit ("Negotiated features"),
+is answered `DISPLAYS` with every display, ids 0 to count − 1, each connected,
+and gets each display's events. One that does not (the option ROM, Ambrosia's
+module as it is, a kext built before the bit, the arm64e kext until its lane
+lands) is answered display 0 alone, as by a device of one display: its
+commands for another display are refused `NO_DISPLAY`, as now, and the host
+sends it no `VBLANK` or `DISPLAY_CHANGED` of another display, since today's
+framebuffer reads neither event's display (`ReimsGraphics.cpp`, the completion
+ring's service). No register is added: the kext reads `DISPLAYS` in its start,
+before it registers a framebuffer, which is the first point the count is
+needed. A reset clears the take, as it clears every bit's.
+
+**The count is fixed; no display is plugged in or out (decided for v1).** The
+count is QEMU's `displays` property, and every display is connected from the
+device's start to its end:
+- an arm64 guest's processes count their displays once each, from device-tree
+  nodes the firmware placed before the kernel started ("The arm64e kext",
+  below), so a display added later reaches no running WindowServer;
+- the x86-64 kext would make and end framebuffers while WindowServer runs, which
+  nothing calls for while closing any window powers the VM off (features.md,
+  "Leaving");
+- the device makes its consoles in QEMU's realize, and its windows as it is
+  made.
+`RgfxDisplayEntry.connected` stays in the wire for a later lane that
+disconnects a display rather than ending the VM.
+
+**Messages name their display.** Each display message carries the display's
+id already: `SET_SCANOUT`, `SET_CURSOR`, `MOVE_CURSOR`, `SET_VBLANK`,
+`SET_DISPLAY_POWER`, `PRESENT_SURFACE`, `DISPLAY_COLOR`, `DISPLAY_CHANGED` and
+`VBLANK`. Display 0 keeps today's encoding exactly, and display i's id is i, so
+no layout changes and `VERSION` stays 2. An id at or past the count is
+refused `NO_DISPLAY` (a `DISPLAY_COLOR` dropped and logged, as now). Each
+display has its own:
+- **scanout**, in a room of its own (below);
+- **mode**: the one mode today's rule ("Display", above) gives, from its own
+  window: the window's pixels, the width rounded down to a multiple of 16 and
+  the height to even, at the refresh rate of the window's screen, with that
+  screen's scale where the guest took `DISPLAY_SCALE`. A resize of window i, or
+  its move to a screen of another scale, sends `DISPLAY_CHANGED` of display i.
+  Without windows every display offers 1920 × 1080 at 60 Hz;
+- **`VBLANK`s**, while the guest has them on for it, at each refresh of its
+  window's screen, stamped on a grid of its own and counted from 0 at a reset;
+  one dropped for want of room counts as `vblank-dropped`, as now;
+- **presents and colour**: `PRESENT_SURFACE` and `DISPLAY_COLOR` of display i
+  show and colour display i alone, and a present is answered at the refresh of
+  display i that shows it. A block's release waits until no display reads a
+  surface's texture over the block;
+- **cursor**: `SET_CURSOR` and `MOVE_CURSOR` of display i set and move display
+  i's (its image below);
+- **panel**: `SET_DISPLAY_POWER` of display i turns display i's panel off and
+  on;
+- across a reset, as display 0 now: its scanout kept, its cursor image gone,
+  its panel on.
+
+**The scanout's rooms.** The scanout's room, `RGFX_SCANOUT_SPAN` (128 MiB) at
+`RGFX_ALLOCATIONS_OFFSET`, is split evenly among the displays: each room is
+`RGFX_SCANOUT_SPAN / count` rounded down to a multiple of
+`RGFX_SCANOUT_ROOM_ALIGN` (64 KiB), display i's from
+`RGFX_ALLOCATIONS_OFFSET + i × room`. That is 128 MiB for one display, 64 MiB
+each for two, 0x2aa_0000 bytes (42.6 MiB) each for three and 32 MiB each for
+four. The host refuses (`INVALID_ARGUMENT`) a display's `SET_SCANOUT` outside
+its own room. Nothing else of the region moves: the accelerator's blocks start
+at `RGFX_CONTEXT_ALLOCATIONS_OFFSET`, and a scanout's grant (`BLOCK_GRANT` in
+the scanout's span) lies in the span, as now. Growing the span with the count
+was weighed and declined: each display would take 128 MiB of the blocks' room,
+about 892 MiB of the 1 GiB region with one display and 508 MiB with four,
+whose last 160 MiB is WindowServer's reserve ("WindowServer's reserve", above).
+On a device of more than one display the host offers each display only modes
+whose rows, `width × 4` bytes rounded up to `RGFX_SCANOUT_STRIDE_ALIGN` (256,
+the kexts' and the option ROM's row alignment), fit its room `height` times:
+a window too large for its room is offered the largest mode of the window's
+ratio that fits, in the same steps of 16 and 2, which the window draws as it
+draws any mode of other pixels (the window crate's `geometry`). So four
+displays take up to 3840 × 2160 each (31.6 MiB of 32), and two up to
+5120 × 2880 each (56.3 MiB of 64). With one display the host offers what it
+offers today. The option ROM and Ambrosia's module, which take no feature,
+scan out display 0 at `RGFX_ALLOCATIONS_OFFSET` in display 0's preferred mode,
+which the host's sizing keeps inside display 0's room.
+
+**One cursor slot.** The region keeps one cursor slot (`RGFX_CURSOR_SPAN` at
+its end). The host copies a `SET_CURSOR`'s image out of the region before it
+answers (`control.rs`, `set_cursor`), so the kexts set every display's image
+through the one slot in turn: the framebuffer that owns the device holds a lock
+from its write into the slot to the command's answer.
+
+**Interrupts.** Every display's events go on the control completion ring,
+MSI-X vector 0, as now: `RGFX_MSIX_VECTORS` stays 1. Four displays at 120 Hz
+send 480 `VBLANK`s a second there.
+
+**The C API.** Additions only. Each function and callback there now is display
+0's, so a host of one display, or one built before the additions, sees what it
+sees today, and QEMU's side changes with them:
+- `RvgGraphicsDeviceConfig`, version 4: `display_count` (0 and 1 are one
+  display, as a host built before the field has; 2 to
+  `RVG_GRAPHICS_DISPLAYS_MAX`; any other value `RVG_ERR_INVALID_ARGUMENT`), and
+  `display_windows`, the window configs of displays 1 to count − 1, given
+  exactly where `window` is;
+- `RvgGraphicsCallbacks`, version 4: `cursor_glyph_at(ctx, display, glyph)`,
+  `cursor_show_at(ctx, display, show)` and `cursor_move_at(ctx, display)`,
+  called for displays 1 and up on the display thread, in order with every
+  display callback; display 0's stay `cursor_glyph`, `cursor_show` and
+  `cursor_move`;
+- `rvg_graphics_device_read_display_at(device, display, dst, dst_length,
+  width, height)` and `rvg_graphics_device_cursor_position_at(device,
+  display)`, whose display 0 is `rvg_graphics_device_read_display` and
+  `rvg_graphics_device_cursor_position`; a display at or past the count is
+  `RVG_ERR_INVALID_ARGUMENT`, and (0, 0) for the position;
+- `RVG_GRAPHICS_DISPLAYS_MAX`, 4. docs/api.md gives the versions (section 1)
+  and the threads (section 5).
+
+The Rust API mirrors it. Inside the library each display gets what display 0
+has now: its `Screen` (`reims-vgpu-graphics`' `display.rs`), its
+`DisplayState` and refresh grid (`device.rs`), and its window
+(`WindowScreen`), presented surface, present queue, colour, read-back and
+host cursor (`crates/reims-vgpu/src/graphics.rs` and `graphics/`);
+`Host::present_surface`, `present_keep`, `display_color` and `refreshed` take
+the display. Which threads run the displays' refreshes is free (AGENTS.md,
+"What is free").
+
+**QEMU.** `reims-graphics-pci` takes `displays`, 1 to 4 and 1 by default
+(realize refuses others), makes a graphic console per display
+(`qemu_graphic_console_create` with head i), fills console i with
+`rvg_graphics_device_read_display_at` and gives it display i's cursor, and
+under `-display none` has the library open a window per display whose input
+goes to console i. `resolution` is every window's first size, and QMP's
+`screendump` with head i saves display i. With `displays` 1 nothing of QEMU's
+changes.
+
+**The pointer across displays.** Each window's pointer goes to its display's
+console, in that display's pixels, and keys from every window reach the one
+keyboard. A VM has one USB tablet, which reports a position in its range with
+no display in it, so how a pointer over display 1's window reaches the guest's
+display 1 waits on X1 (below). Until it is settled, reims-ctl offers no
+setting for it (its lane lands last).
+
+**The windows.** One window per display, as the window crate already makes
+them (`Window::new(config, port, title(port))`, `screens::screen_for_port`):
+display i's is port i's, titled "Reims vGPU (port i)", opened on host screen i
+or the main screen (`REIMS_VGPU_WINDOW_SCREENS` picks), and cascaded where two
+share a screen. In features.md:
+- each window keeps the entries of "The picture", "Matching the host's
+  screen", "Borderless", "Pointer", "Keyboard", "Capture", "Scrolling" and
+  "Cursor" for its own display ("Pointer"'s first entry, the guest's pointer
+  under the host's, waits on X1 for displays 1 and up). A capture holds the
+  pointer over its own window's image, so reaching another display's window
+  takes a release (⌃⌥⌘) or a move uncaptured;
+- "The VM is an app", the switches and "Leaving" (closing any window powers the
+  VM off) are the process's;
+- the entries written for several windows were never walked with a second
+  display driven, since apple-gfx's guests drove port 0 alone (docs/qemu.md):
+  one window per guest display, the port in the title, display i on screen i,
+  the cascade, the screens changing, and on Linux the cursor set only by the
+  window the pointer is in (`manual (a VM with two displays)`);
+- new entries, in a commit of their own: each window offers its display its
+  own mode, rate and scale; a window whose display the guest does not drive
+  shows black; and the pointer's, once X1 settles it.
+
+**The x86-64 kext.** `ReimsGraphics` stays the device's driver and display
+0's IOFramebuffer. Where it took `MULTI_DISPLAY` and `DISPLAYS` lists more
+displays, its start makes an IOFramebuffer of the kext's for each display from
+1, registered after display 0's (where each attaches in the service plane is
+the lane's to settle), each with:
+- its own connection, mode list (`RgfxDisplayModes.hpp`), timings, EDID (its
+  serial is the display's already, `rgfxDisplaySerial`), cursor, vblank and
+  connect interrupts, and server connection's scanout owner;
+- `IOFBDependentID` display 0's registry ID and `IOFBDependentIndex` i, as
+  IOGraphics groups one GPU's framebuffers, and `IOAccelTypes` and
+  `IOAccelIndex` 0, the one accelerator;
+- its aperture and VRAM range in display i's room (`scanoutLimit` per
+  display);
+- its commands posted on display 0's control ring under its lock, naming
+  display i; the work loop hands display i's `VBLANK` and `DISPLAY_CHANGED` to
+  framebuffer i.
+Each display pipe client works on the framebuffer whose index IOPresentment
+associates it with (X3), and the scanout grant (selector 0x108) grants the room
+of the display the surface is drawn for. `DisplayPortCount` is the count where
+the bit was taken (X4). The x86-64 build carries the bit
+(`kRgfxCarriedFeatures`) only once all of this lands, and the arm64e build once
+its own lane lands.
+
+**The arm64e kext.** `ReimsGraphics` stays display 0's IOMobileFramebuffer, on
+`/arm-io/reims-display0`. Each display i from 1 needs an IOMobileFramebuffer
+service of its own, on a node `/arm-io/reims-display<i>` that the firmware
+placed before the kernel started, with its own attributes (`IOMFBUUID` and
+`DisplayAttributes` carry the display's serial), timings, swaps (layer 0 its
+surface, layer 1 its cursor, `RgfxMobileCursor.hpp`), `VBLANK`s and
+republished modes. A1 and A2 (below) settle its shape before it is built.
+
+**The option ROM** drives display 0 alone, unchanged: it takes no feature, so
+it sees one display, and its GOP framebuffer lies in display 0's room. Its
+bytes do not change. Displays 1 and up show black until the kext drives them.
+Ambrosia's module likewise brings up display 0 alone.
+
+**reims-ctl.** A VM's `[display]` takes `count`, 1 to 4, saved only above 1,
+so a one-display VM's file is unchanged. It is the key reims-ctl saved for
+apple-gfx's display ports (1 to 8), which it reads past since apple-gfx was
+dropped (`crates/reims-ctl/src/vm.rs`, `apple_gfx_s_settings_are_read_past`):
+such a VM's count comes back, one above 4 read as 4. The QEMU command gives
+`reims-graphics-pci` `displays=N` only above 1, as it gives `resolution` only
+where it is not the device's own, since a QEMU built before the property
+refuses it. `resolution` and `borderless` are every window's. The VM form of
+the terminal UI has a Displays field beside Resolution, shown on reims-vgpu and
+hidden on VMware SVGA, which has one display; `create` and `set` take
+`--displays N`; a VM's summary says how many windows it opens. The terminal
+viewer shows display 0, the head its screendumps name.
+
+**Unknowns.** None is guessed: each lane measures its own before it builds on
+it.
+- X1, the pointer. Where macOS 11 to 26 puts the USB tablet's position with
+  two displays: over the box around all its displays, or over its main display
+  alone. Found on mmx86's first boot with two displays: with display 1's window
+  sending known positions, read where the guest puts its cursor
+  (`MOVE_CURSOR`'s display, x and y, logged by the host) beside the displays'
+  arrangement (`system_profiler SPDisplaysDataType`, and the screens' frames
+  from a tool of our own). Over the box, the host maps window i's pointer by
+  display i's place in the guest's arrangement, which it learns from the
+  cursor's moves or from the guest, in a command added to `MULTI_DISPLAY`
+  before any host offers it (an x86-64 IOFramebuffer is told its screen's
+  bounds, `extSetBounds` into its shared memory's `screenBounds` in IOGraphics'
+  public source, to be checked on the guests). Over the main display alone, no
+  mapping on the host reaches display 1, and the pointer needs a pointing
+  service of the kext's own: a lane of its own.
+- X2, the second display's connection. Whether macOS 11 to 26 runs two
+  displays that both say they are built in (`kIOConnectionBuiltIn`, which
+  display 0 says so that its HiDPI start follows its density): booted with
+  displays 1 and up built in, then external, reading CoreDisplay's choice of
+  default mode and System Settings' names. External would start display 1 at
+  1x below 3800 pixels wide ("The display's density", above).
+- X3, the pipe's index. Which index IOPresentment associates display 1's pipe
+  client with (today's kext takes 0 and 0xffffffff), read from the kext's log
+  of each associate on the first boot with two displays.
+- X4, `DisplayPortCount`. What on x86-64 reads the accelerator's
+  `DisplayPortCount`; on arm64 IOMobileFramebuffer.framework reads it only of an
+  AppleParavirtGPU (`ReimsGraphicsMobile.cpp`).
+- X5, WindowServer's reserve. WindowServer's peak blocks at four displays of
+  3840 × 2160 against the reserve's 160 MiB and 4096 entries, from the kext's
+  log of its peak ("WindowServer's reserve", above).
+- A1, the arm64 display nodes. Ambrosia adds one node, `Graphics` >
+  `DisplayNode` (a string; Ambrosia's docs/configuration.md), and a
+  process waits up to 30 seconds for a service for each node it counted, so
+  the nodes must number the device's displays. Ambrosia needs a change, its
+  owner's to make: its graphics driver interface's next revision lets the
+  module say how many displays the device has (it reads `DISPLAYS` having taken
+  `MULTI_DISPLAY`), and Ambrosia adds that many nodes from a list in the
+  configuration; or `DisplayNode` takes a list, and each configuration bundle
+  is made for one count. The first leaves no bundle that disagrees with its
+  device.
+- A2, the arm64 services. How IOMobileFramebuffer.framework pairs the displays
+  it counted with services, and what a second service of one kext needs for
+  WindowServer to drive it (its index, its UUID, its swaps and cursor): read
+  from macOS 14.6.1's and 27.0.1's framework (`iomfb_populate_all_display_infos`
+  and the service matching) and from how AppleParavirtGPU publishes a display
+  per port, kept local and never committed, then checked by a boot of arm64 14
+  with two displays under TCG.
+- A3, the pointer on arm64: X1's question on an arm64 guest, found on mma64's
+  first boot of arm64 14 with two displays, as X1 is.
+
+**The lanes**, in the order they land:
+
+| lane | owns | waits for | checks |
+|---|---|---|---|
+| mmhost | the device crate (each display's state, rooms, mode sizing, events by the bit, the offer), `reims-vgpu` (each display's screen, window, presents, colour, read-back and cursor), the C API, its header and docs/api.md, `vendor/qemu` (`displays`, a console and window per display), features.md's new entries, docs/qemu.md, and the pointer's host side once X1 is settled | this design | `cargo xtask check` (the Mac's and Linux's); QEMU built, realized paused (`-S`) at `displays` 1 and 4, refused at 0 and 5; boots of x86-64 26.7 at `displays` 1 (the feature words unchanged) and 2 with today's kexts (display 0 as before, display 1's window black); features.md's entries for several windows walked on a Linux host |
+| mmx86 | `guest/kext`: the owner's code per display shared by both architectures (the display table, events by display, the cursor slot's lock), the x86-64 framebuffers per display, X1 to X5 and the guest side of the pointer; both prebuilt sets | mmhost, for its boots | `make -C guest test`; `make -C guest prebuilt` and `prebuilt-arm64e` committed; boots of x86-64 11.7, 12.7, 13.7, 14.8, 15.8 and 26.7 at `displays` 2 and 1 |
+| mma64 | the arm64e framebuffers per display (`ReimsGraphicsMobile.cpp`), `firmware/ambrosia`'s nodes, A1 to A3 | mmhost; mmx86's shared code; Ambrosia's nodes (A1) | `make -C guest test`; `make -C guest prebuilt` and `prebuilt-arm64e` committed (each set's record lists every kext source); `make -C firmware/ambrosia bundle` and `config-bundle`; boots of arm64 14, 15 and 26 under TCG and 27 under HVF on the M3 at `displays` 2 and 1 |
+| mmctl | `crates/reims-ctl`: the setting, the QEMU command, the terminal UI and the command line | mmhost's `displays` landed, and the pointer reaching display 1 (X1) | `cargo test`, `cargo fmt --check` and `cargo clippy --all-targets` in it; an install and a boot at `displays` 2 on a Linux host |
+
+mmhost, mmctl and the reading for X2 to X5, A1 and A2 start at once; mmx86
+builds and unit-tests its framebuffers at once and boots them on mmhost's
+branch; mma64 builds once mmx86's shared code has landed. A boot at `displays`
+2 passes where `system_profiler SPDisplaysDataType` lists both displays at
+their windows' modes, a `screendump` of each head shows the desktop, both
+displays get `VBLANK`s, the cursor shows on the display it is on, no
+`reims-vgpu: fatal` line is logged, and the boot's usual checks pass; one at
+`displays` 1 passes the usual checks with the feature words of a boot before
+the change.
 
 ## Stage 3 wire protocol: the Metal-call stream
 
