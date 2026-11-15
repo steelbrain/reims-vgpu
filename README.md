@@ -92,11 +92,11 @@ pins, and Cargo fetches metal2vulkan from its public repository, at the commit t
 
 ### Day to day
 
-`reims-ctl` with no command opens its interactive interface: create a VM, start it (its display
-opens in a window), stop it (the guest shuts down, or is powered off after a timeout), edit its
-CPUs, memory, resolution, borderless window, GPU, audio and logs, change its installer, print the
-exact QEMU command it runs, and zip its logs with the host's details into Downloads for a bug
-report.
+`reims-ctl` with no command opens its interactive interface: create a VM, start it (each of its
+displays opens in a window), stop it (the guest shuts down, or is powered off after a timeout),
+edit its CPUs, memory, displays (up to four), resolution, borderless windows, GPU, audio and logs,
+change its installer, print the exact QEMU command it runs, and zip its logs with the host's
+details into Downloads for a bug report.
 
 ```sh
 reims-ctl list                  # the VMs and whether they run
@@ -112,7 +112,7 @@ VM keeps the QEMU it started with across an update.
 
 ### The window takes your keyboard shortcuts and your mouse
 
-The guest's display opens in a window the library owns (`crates/reims-vgpu-window`). **Click into the
+Each of the guest's displays opens in a window the library owns (`crates/reims-vgpu-window`). **Click into the
 guest's picture to capture the keyboard and the mouse:** shortcuts and system keys then go to the
 guest instead of the host, and the pointer stays inside the picture until you release it, so you
 can throw it at the guest's corners and edges without landing on another window. Keys reach the

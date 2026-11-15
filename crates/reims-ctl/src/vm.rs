@@ -264,6 +264,20 @@ impl Display {
             .filter(|&size| size != (1920, 1080))
     }
 
+    /// [`Display::check`], and more than one display refused on VMware SVGA, which has one. A
+    /// count kept from reims-vgpu waits unused on VMware SVGA, as the resolution does, so only
+    /// a count given with it is checked so.
+    pub fn check_on(&self, graphics: Graphics) -> Result<()> {
+        self.check()?;
+        if graphics == Graphics::VmwareSvga && self.count > 1 {
+            bail!(
+                "VMware SVGA has one display; more displays take reims-vgpu's own device \
+                 (--graphics reims-vgpu)"
+            );
+        }
+        Ok(())
+    }
+
     pub fn check(&self) -> Result<()> {
         if !(1..=DISPLAYS_MAX).contains(&self.count) {
             bail!("a VM has 1 to {DISPLAYS_MAX} displays, not {}", self.count);
@@ -1268,6 +1282,27 @@ mod tests {
             let e = format!("{:#}", loaded.check().unwrap_err());
             assert!(e.contains("1 to 4 displays"), "{bad}: {e}");
         }
+    }
+
+    /// VMware SVGA has one display: more are refused where they are given with it, and a count
+    /// kept from reims-vgpu waits unused there, as the resolution does.
+    #[test]
+    fn vmware_svga_has_one_display() {
+        let mut d = Display::default();
+        for g in Graphics::ALL {
+            assert!(d.check_on(g).is_ok(), "{g:?}");
+        }
+        d.count = 2;
+        assert!(d.check_on(Graphics::ReimsVgpu).is_ok());
+        let e = format!("{:#}", d.check_on(Graphics::VmwareSvga).unwrap_err());
+        assert!(e.contains("VMware SVGA has one display"), "{e}");
+        d.count = 0;
+        let e = format!("{:#}", d.check_on(Graphics::ReimsVgpu).unwrap_err());
+        assert!(e.contains("1 to 4 displays"), "{e}");
+        let mut c = x86_64_config();
+        c.display.count = 2;
+        c.graphics = Some(Graphics::VmwareSvga);
+        assert!(c.check().is_ok());
     }
 
     /// A VM an earlier create saved with an SSH port of 0 has no forward, as `set --ssh-port 0`

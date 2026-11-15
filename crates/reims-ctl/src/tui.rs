@@ -1556,9 +1556,10 @@ impl App {
             ),
             Field::text("memory", "Memory", &format_mib(c.memory_mib), "Such as 8G."),
         ];
-        // The resolution's, borderless's and the GPU's fields are reims-vgpu's.
+        // The displays', the resolution's, borderless's and the GPU's fields are reims-vgpu's.
         fields.push(graphics_field(c.graphics()));
         fields.extend([
+            displays_field(c.display.count).show_if("graphics", LIBRARY),
             Field::text(
                 "resolution",
                 "Resolution",
@@ -1570,7 +1571,7 @@ impl App {
                 "borderless",
                 "Borderless",
                 c.display.borderless,
-                "A window without borders that fills its screen.",
+                "Windows without borders that fill their screens, one for each display.",
             )
             .show_if("graphics", LIBRARY),
         ]);
@@ -2255,10 +2256,25 @@ fn gpu_from_choice(id: &str, list: &[GpuInfo]) -> crate::vm::Gpu {
     }
 }
 
-const RESOLUTION_HELP: &str = "The size the window opens at, WIDTHxHEIGHT in the desktop's \
+const RESOLUTION_HELP: &str = "The size each window opens at, WIDTHxHEIGHT in the desktop's \
      points, shrunk to fit the screen; the guest takes the window's size in pixels, and follows \
-     it as you resize it. It starts a HiDPI desktop by itself in a window at least 3840 pixels \
-     wide.";
+     it as you resize it. It starts a HiDPI desktop by itself on a display whose window is at \
+     least 3840 pixels wide.";
+
+/// The choice of a VM's displays on reims-vgpu, at `current`.
+fn displays_field(current: u32) -> Field {
+    let options = (1..=crate::vm::DISPLAYS_MAX)
+        .map(|n| (n.to_string(), n.to_string()))
+        .collect();
+    Field::choice(
+        "displays",
+        "Displays",
+        options,
+        &current.to_string(),
+        "How many displays the guest has, each in a window of its own; closing any of the \
+         windows powers the VM off. VMware SVGA has one.",
+    )
+}
 
 /// The graphics field's values that show a field of the library's.
 const LIBRARY: &[&str] = &["reims-vgpu"];
@@ -2272,8 +2288,8 @@ fn graphics_field(current: Graphics) -> Field {
         options.to_vec(),
         current.id(),
         "reims-vgpu is its own GPU device, which macOS drives with the drivers reims-ctl puts in \
-         the VM's OpenCore image (after a change to it, U makes the image again): one display, \
-         in a window whose size the guest follows. VMware SVGA is QEMU's: one \
+         the VM's OpenCore image (after a change to it, U makes the image again): one to four \
+         displays, each in a window whose size the guest follows. VMware SVGA is QEMU's: one \
          display at the firmware's resolution, with no GPU acceleration (macOS has no driver \
          for it), in QEMU's own window.",
     )
@@ -2336,8 +2352,11 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
     {
         q.disk_controller = DiskController::parse(&f.choice("disk_controller"))?;
     }
-    // Hidden on VMware SVGA, the resolution, the window's first size, and borderless stay as
-    // they were.
+    // Hidden on VMware SVGA, which has one display, the displays, the resolution, the windows'
+    // first size, and borderless stay as they were.
+    if f.is_shown("displays") {
+        c.display.count = f.choice("displays").parse().context("displays: a number")?;
+    }
     if f.is_shown("resolution") {
         c.display.resolution = f.text("resolution");
         c.display.check()?;
@@ -2463,8 +2482,8 @@ fn copy_to_clipboard(s: &str) -> Option<&'static str> {
 }
 
 const HELP: &str = "\
-reims-ctl runs x86-64 macOS VMs on QEMU with reims-vgpu: each VM's display opens in a window of
-its own. A VM runs reims-vgpu's own GPU device unless its settings choose another (e, graphics).
+reims-ctl runs x86-64 macOS VMs on QEMU with reims-vgpu: each of a VM's displays opens in a window
+of its own. A VM runs reims-vgpu's own GPU device unless its settings choose another (e, graphics).
 
   ↑ ↓ / j k   choose a VM, or click it
   Enter       open its menu: what can be done with it now, each with its key. A right
@@ -2480,15 +2499,15 @@ its own. A VM runs reims-vgpu's own GPU device unless its settings choose anothe
   x           stop it: the guest is asked to shut down, and powered off if it has not
               when its shutdown timeout ends (edit e to change it)
   K           kill it: power it off at once
-  e           edit its settings: CPUs, memory, resolution, borderless, GPU, audio,
-              network, logs, extra QEMU arguments (they apply at its next start), its disk
-              controller (SATA or NVMe), its installer image, its boot selection
+  e           edit its settings: CPUs, memory, displays, resolution, borderless, GPU,
+              audio, network, logs, extra QEMU arguments (they apply at its next start), its
+              disk controller (SATA or NVMe), its installer image, its boot selection
               (OpenCore's picker, which makes it a new OpenCore image) and
-              graphics: reims-vgpu, its own GPU device, on one display in a window whose
-              size the guest follows, with the macOS drivers reims-ctl puts in its OpenCore
-              image (made again on a change); or QEMU's VMware SVGA, one display with no GPU
-              acceleration, in QEMU's own window. Resolution, borderless and GPU are
-              reims-vgpu's
+              graphics: reims-vgpu, its own GPU device, on one to four displays, each in a
+              window whose size the guest follows, with the macOS drivers reims-ctl puts in
+              its OpenCore image (made again on a change); or QEMU's VMware SVGA, one display
+              with no GPU acceleration, in QEMU's own window. Displays, resolution,
+              borderless and GPU are reims-vgpu's
   p           give it this host's USB devices: Space gives the selected one to
               the guest or takes it back, at once while the VM runs; a device you gave it
               joins the guest when it is plugged in. More in reims-ctl usb --help
@@ -3134,6 +3153,48 @@ mod tests {
             vm.config.display.resolution, "1280x720",
             "a hidden field changes nothing"
         );
+    }
+
+    /// A VM's edit form shows reims-vgpu's displays, 1 to 4, and saves the one chosen; on
+    /// VMware SVGA, which has one display, it hides them, and the count stays as it was.
+    #[test]
+    fn the_edit_form_sets_reims_vgpu_s_displays() {
+        let mut row = vm_row("t");
+        let c = &mut row.vm.as_mut().unwrap().config;
+        c.graphics = None;
+        c.display.count = 2;
+        let mut app = test_app(vec![row]);
+        app.open_edit();
+        assert!(form(&app).is_shown("displays"));
+        assert_eq!(form(&app).choice("displays"), "2");
+        let focus = |app: &mut App, key: &str| {
+            for _ in 0..form(app).fields.len() {
+                if form(app).focused_key() == key {
+                    return;
+                }
+                press(app, [KeyCode::Down]);
+            }
+            panic!("no field {key}");
+        };
+        focus(&mut app, "displays");
+        press(&mut app, [KeyCode::Right]);
+        assert_eq!(form(&app).choice("displays"), "3");
+        let mut vm = app.rows[0].vm.as_ref().unwrap().clone();
+        apply_edit(&mut vm, form(&app), None).unwrap();
+        assert_eq!(vm.config.display.count, 3);
+        press(&mut app, [KeyCode::Right]);
+        press(&mut app, [KeyCode::Right]);
+        assert_eq!(form(&app).choice("displays"), "1");
+        apply_edit(&mut vm, form(&app), None).unwrap();
+        assert_eq!(vm.config.display.count, 1);
+        focus(&mut app, "graphics");
+        press(&mut app, [KeyCode::Right]);
+        assert_eq!(form(&app).choice("graphics"), "vmware-svga");
+        assert!(!form(&app).is_shown("displays"));
+        vm.config.display.count = 2;
+        apply_edit(&mut vm, form(&app), None).unwrap();
+        assert_eq!(vm.config.graphics, Some(Graphics::VmwareSvga));
+        assert_eq!(vm.config.display.count, 2, "a hidden field changes nothing");
     }
 
     #[test]

@@ -46,7 +46,7 @@ pub enum Cmd {
         #[arg(long, short)]
         yes: bool,
     },
-    /// Start a VM: a window opens for its display
+    /// Start a VM: a window opens for each of its displays
     #[command(after_help = START_HELP)]
     Start { name: String },
     /// Shut a VM down; if the guest has not shut down when the timeout ends, power it off
@@ -158,7 +158,8 @@ const VIEW_HELP: &str = "\
 For a VM on a host with no screen, to set macOS up before it has screen sharing or remote \
 login. The screen is drawn with the terminal's graphics (kitty's, iTerm2's or sixel; half-block \
 characters where it has none), over SSH as well, and the terminal's keys, mouse and pasted text \
-go to the guest as a US keyboard's and a tablet's.
+go to the guest as a US keyboard's and a tablet's. On a VM with several displays it shows the \
+first.
 
 Ctrl-] disconnects; the VM keeps running. Alt+key is Cmd+key. The Cmd, Opt, Ctrl and Shift \
 buttons on the top row hold that key for the next key or click.";
@@ -317,12 +318,16 @@ pub struct CreateArgs {
     /// reims-vgpu (the default) or vmware-svga (see reims-ctl set --help)
     #[arg(long)]
     pub graphics: Option<String>,
-    /// The size reims-vgpu's window opens at, WIDTHxHEIGHT in the desktop's points, which the
-    /// guest follows; it starts a HiDPI desktop by itself in a window at least 3840 pixels
-    /// wide, and offers one in its Displays settings from 2880
+    /// How many displays the guest has on reims-vgpu, 1 to 4 (default 1), each in a window of
+    /// its own; VMware SVGA has one
+    #[arg(long, value_name = "N")]
+    pub displays: Option<u32>,
+    /// The size each of reims-vgpu's windows opens at, WIDTHxHEIGHT in the desktop's points,
+    /// which its display follows; the guest starts a HiDPI desktop by itself on a display whose
+    /// window is at least 3840 pixels wide, and offers one in its Displays settings from 2880
     #[arg(long)]
     pub resolution: Option<String>,
-    /// A borderless window that fills its screen
+    /// Borderless windows that fill their screens, one for each display
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub borderless: Option<bool>,
     /// The GPU: auto, a number or name from `reims-ctl gpus`, or a Vulkan ICD JSON file
@@ -357,18 +362,23 @@ pub struct SetArgs {
     pub memory: Option<String>,
     /// reims-vgpu (the default), its own GPU device, which the guest drives with the kexts
     /// reims-ctl puts in its OpenCore image (a change of graphics makes the image again for
-    /// them, as update-opencore does, where the VM is stopped), on one display in a window whose
-    /// size the guest follows; or vmware-svga, QEMU's VMware SVGA: one display with no GPU
-    /// acceleration, in QEMU's own window
+    /// them, as update-opencore does, where the VM is stopped), on 1 to 4 displays (--displays),
+    /// each in a window whose size the guest follows; or vmware-svga, QEMU's VMware SVGA: one
+    /// display with no GPU acceleration, in QEMU's own window
     #[arg(long)]
     pub graphics: Option<String>,
+    /// How many displays the guest has on reims-vgpu, 1 to 4, each in a window of its own;
+    /// VMware SVGA has one
+    #[arg(long, value_name = "N")]
+    pub displays: Option<u32>,
     /// The system disk's controller: ahci (SATA) or nvme. Once macOS is installed, eject the
     /// installer before a move, or OpenCore may start it
     #[arg(long)]
     pub disk_controller: Option<String>,
-    /// The size reims-vgpu's window opens at, WIDTHxHEIGHT in the desktop's points
+    /// The size each of reims-vgpu's windows opens at, WIDTHxHEIGHT in the desktop's points
     #[arg(long)]
     pub resolution: Option<String>,
+    /// Borderless windows that fill their screens, one for each display
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub borderless: Option<bool>,
     /// auto, a number or name from `reims-ctl gpus`, or a Vulkan ICD JSON file
@@ -556,11 +566,17 @@ pub fn main(cli: Cli) -> Result<i32> {
 
 pub fn script_comment(vm: &Vm) -> String {
     let screen = match vm.config.graphics() {
-        vm::Graphics::ReimsVgpu => "Its window opens under -display none",
+        vm::Graphics::ReimsVgpu if vm.config.display.count > 1 => format!(
+            "Its {} windows, one for each display, open under -display none",
+            vm.config.display.count
+        ),
+        vm::Graphics::ReimsVgpu => "Its window opens under -display none".into(),
         vm::Graphics::VmwareSvga if crate::host::has_screen(&vm.config.extra_env) => {
-            "Its window is QEMU's own, under -display gtk"
+            "Its window is QEMU's own, under -display gtk".into()
         }
-        vm::Graphics::VmwareSvga => "With no screen here, it runs headless under -display none",
+        vm::Graphics::VmwareSvga => {
+            "With no screen here, it runs headless under -display none".into()
+        }
     };
     format!(
         "{}: the QEMU command reims-ctl {} runs for this VM.\n{screen}; QMP is at the -qmp socket.",
@@ -690,6 +706,9 @@ fn create_cmd(a: CreateArgs, host: Host) -> Result<()> {
     s.installer = abs(&a.installer);
     s.mac = a.mac.clone();
     s.graphics = a.graphics.as_deref().map(vm::Graphics::parse).transpose()?;
+    if let Some(n) = a.displays {
+        s.display.count = n;
+    }
     if let Some(r) = &a.resolution {
         s.display.resolution = r.clone();
     }
@@ -880,18 +899,26 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
         ),
         g => add("graphics", g.describe().into()),
     }
-    // reims-vgpu's one display follows its window: of the settings, only the window's first size
-    // and borderless reach it.
+    // reims-vgpu's displays follow their windows: of the settings, only their count, the
+    // windows' first size and borderless reach them.
     if graphics == vm::Graphics::ReimsVgpu {
-        add(
-            "display",
-            if c.display.borderless {
-                "one, filling its screen, borderless".into()
-            } else {
-                let (w, h) = c.display.window_size().unwrap_or((1920, 1080));
-                format!("one, in a window opening at {w}x{h}, whose size the guest follows")
-            },
-        );
+        let n = c.display.count;
+        let (w, h) = c.display.window_size().unwrap_or((1920, 1080));
+        match (n, c.display.borderless) {
+            (1, true) => add("display", "one, filling its screen, borderless".into()),
+            (1, false) => add(
+                "display",
+                format!("one, in a window opening at {w}x{h}, whose size the guest follows"),
+            ),
+            (n, true) => add(
+                "displays",
+                format!("{n}, in {n} borderless windows, each filling its screen"),
+            ),
+            (n, false) => add(
+                "displays",
+                format!("{n}, in {n} windows opening at {w}x{h}, whose sizes the guest follows"),
+            ),
+        }
     }
     if graphics.library() && c.profile.gpu_choice(host) {
         add(
@@ -1067,6 +1094,12 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
             Some(q) => q.disk_controller = d,
             None => bail!("{}: --disk-controller is for x86-64 VMs", c.name),
         }
+    }
+    // A count given is checked against the graphics; one kept from reims-vgpu waits unused on
+    // VMware SVGA, as the resolution does.
+    if let Some(n) = a.displays {
+        c.display.count = n;
+        c.display.check_on(c.graphics())?;
     }
     if let Some(r) = &a.resolution {
         c.display.resolution = r.clone();
@@ -1602,6 +1635,135 @@ mod tests {
         delete_vm("a", true).unwrap();
         assert!(Registry::load().unwrap().find("a").is_none());
         assert!(shared.is_file());
+    }
+
+    /// A VM's settings, for tests: `graphics` its graphics line, or empty for none.
+    fn config(graphics: &str) -> String {
+        format!(
+            r#"
+            name = "t"
+            profile = "q35-x86_64"
+            cpus = 2
+            memory_mib = 4096
+            disk = "disk.qcow2"
+            {graphics}
+            [q35]
+            opencore = "opencore.qcow2"
+            firmware_code = "OVMF_CODE.fd"
+            firmware_vars = "OVMF_VARS.fd"
+            "#
+        )
+    }
+
+    fn set_args(argv: &[&str]) -> SetArgs {
+        match Cli::try_parse_from(argv).unwrap().command {
+            Some(Cmd::Set(a)) => *a,
+            _ => unreachable!(),
+        }
+    }
+
+    /// `set --displays` takes 1 to 4 on reims-vgpu, and refuses more than one on VMware SVGA,
+    /// which has one; a refused set saves nothing.
+    #[test]
+    fn set_takes_reims_vgpu_s_displays_and_refuses_vmware_svga_more_than_one() {
+        let env = Env::new("set-displays");
+        let dir = env.root.join("vms/t");
+        register("t", &dir, &config(""));
+        let count = || Vm::load(&dir).unwrap().config.display.count;
+        let host = Host::current();
+        set(
+            set_args(&["reims-ctl", "set", "t", "--displays", "2"]),
+            host,
+        )
+        .unwrap();
+        assert_eq!(count(), 2);
+        for bad in ["0", "5"] {
+            let e = set(
+                set_args(&["reims-ctl", "set", "t", "--displays", bad]),
+                host,
+            );
+            let e = format!("{:#}", e.unwrap_err());
+            assert!(e.contains("1 to 4 displays"), "{bad}: {e}");
+            assert_eq!(count(), 2, "{bad}");
+        }
+        std::fs::write(
+            dir.join(vm::CONFIG_FILE),
+            config("graphics = \"vmware-svga\""),
+        )
+        .unwrap();
+        let e = set(set_args(&["reims-ctl", "set", "t", "--displays=3"]), host);
+        let e = format!("{:#}", e.unwrap_err());
+        assert!(e.contains("VMware SVGA has one display"), "{e}");
+        assert_eq!(count(), 1);
+        set(
+            set_args(&["reims-ctl", "set", "t", "--displays", "1"]),
+            host,
+        )
+        .unwrap();
+        assert_eq!(count(), 1);
+    }
+
+    /// A VM's summary and its printed command say how many windows it opens: one, as before
+    /// the setting, or one for each display.
+    #[test]
+    fn a_vms_summary_says_how_many_windows_it_opens() {
+        let mut vm = Vm {
+            dir: "/nonexistent/reims-ctl/t".into(),
+            config: toml::from_str(&config("")).unwrap(),
+        };
+        let host = Host::current();
+        let line = |vm: &Vm| {
+            describe(vm, host)
+                .into_iter()
+                .find(|(k, _)| k.starts_with("display"))
+                .unwrap()
+        };
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(
+            line(&vm),
+            pair(
+                "display",
+                "one, in a window opening at 1920x1080, whose size the guest follows"
+            )
+        );
+        assert!(script_comment(&vm).contains("\nIts window opens under -display none;"));
+        vm.config.display.count = 2;
+        vm.config.display.resolution = "2560x1440".into();
+        assert_eq!(
+            line(&vm),
+            pair(
+                "displays",
+                "2, in 2 windows opening at 2560x1440, whose sizes the guest follows"
+            )
+        );
+        assert!(
+            script_comment(&vm)
+                .contains("\nIts 2 windows, one for each display, open under -display none;"),
+            "{}",
+            script_comment(&vm)
+        );
+        vm.config.display.borderless = true;
+        assert_eq!(
+            line(&vm),
+            pair(
+                "displays",
+                "2, in 2 borderless windows, each filling its screen"
+            )
+        );
+        vm.config.display.count = 1;
+        assert_eq!(
+            line(&vm),
+            pair("display", "one, filling its screen, borderless")
+        );
+        // VMware SVGA's one display is QEMU's window, which the graphics line names.
+        vm.config.display.count = 2;
+        vm.config.graphics = Some(vm::Graphics::VmwareSvga);
+        assert!(
+            !describe(&vm, host)
+                .iter()
+                .any(|(k, _)| k.starts_with("display"))
+        );
+        assert!(!script_comment(&vm).contains("windows"));
     }
 
     #[test]

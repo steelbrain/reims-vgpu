@@ -131,6 +131,8 @@ pub fn create(spec: Spec, host: Host, progress: &mut dyn FnMut(&str)) -> Result<
     if let Some(m) = &spec.mac {
         check_mac(m)?;
     }
+    let graphics = spec.graphics.unwrap_or_default();
+    spec.display.check_on(graphics)?;
     if Registry::load()?.find(&spec.name).is_some() {
         bail!("a VM named {} already exists", spec.name);
     }
@@ -141,8 +143,6 @@ pub fn create(spec: Spec, host: Host, progress: &mut dyn FnMut(&str)) -> Result<
     if !Profile::supported_on(host).contains(&profile) {
         bail!("{}", crate::host::UNSUPPORTED);
     }
-    let graphics = spec.graphics.unwrap_or_default();
-    spec.display.check()?;
     // The image reims-util makes holds them.
     if graphics == Graphics::ReimsVgpu && spec.opencore.is_none() {
         crate::prebuilt::set()?;
@@ -729,6 +729,22 @@ mod tests {
         spec.mac = Some("52:54:00:12:34:56,romfile=/x".into());
         let e = create(spec, Host::current(), &mut |_| {}).unwrap_err();
         assert!(format!("{e:#}").starts_with("a MAC is six pairs"), "{e:#}");
+        assert!(!env.root.join("t").exists());
+    }
+
+    /// VMware SVGA has one display: a create given more stops at once, with the reason.
+    #[test]
+    fn a_create_of_several_displays_on_vmware_svga_stops_at_once() {
+        let env = crate::testenv::Env::new("create-displays");
+        let mut spec = Spec::new("t");
+        spec.dir = Some(env.root.join("t"));
+        spec.graphics = Some(Graphics::VmwareSvga);
+        spec.display.count = 2;
+        let e = create(spec, Host::current(), &mut |_| {}).unwrap_err();
+        assert!(
+            format!("{e:#}").starts_with("VMware SVGA has one display"),
+            "{e:#}"
+        );
         assert!(!env.root.join("t").exists());
     }
 

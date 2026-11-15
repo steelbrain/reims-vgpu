@@ -1,7 +1,7 @@
 //! The terminal viewer (`reims-ctl view`, and `v` in the interactive interface): a running VM's
-//! display drawn in the terminal, with the terminal's keys, mouse and pasted text sent to the
-//! guest. It is for VMs on hosts with no screen, to set the guest up before it has screen
-//! sharing or remote login.
+//! display drawn in the terminal, its first on a VM of several (head 0, display 0), with the
+//! terminal's keys, mouse and pasted text sent to the guest. It is for VMs on hosts with no
+//! screen, to set the guest up before it has screen sharing or remote login.
 //!
 //! Everything goes through the VM's QMP socket, so it works on any running VM:
 //! - A frame is QMP's `screendump` of the display's console: a PPM, written into a directory of
