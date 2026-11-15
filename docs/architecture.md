@@ -177,10 +177,11 @@ reims-vgpu-graphics, reims-vgpu-video-*  <-  reims-vgpu  <-  reims-vgpu-c  <-  Q
     (`REIMS_VGPU_WINDOW_IMPL=sdl`, in a build with the `macos-sdl` feature, on by default) SDL's
     shell and cursor (`sdl/`) run on the main thread inside the same application, with AppKit's
     events given to the same `InputState`.
-  - **On Linux** the window is SDL3's (`native/linux/`, with SDL's shared shell and cursor in
-    `sdl/`), on Wayland or X11, built from SDL's pinned source release with its video subsystem
-    alone and linked statically (`sdl3-sys`), and drawn through Vulkan on the runtime's own device.
-    SDL runs on the library's thread `reims-vgpu.ui` (7.3).
+  - **On Linux** the window is SDL3's (`native/sdl_thread/`, with SDL's shared shell and cursor in
+    `sdl/` and what only Linux has in `native/linux.rs`), on Wayland or X11, built from SDL's
+    pinned source release with its video subsystem alone and linked statically (`sdl3-sys`), and
+    drawn through Vulkan on the runtime's own device. SDL runs on the library's thread
+    `reims-vgpu.ui` (7.3).
   - It holds two `#[link]`s of its own: Carbon's (`KBGetLayoutType` and `LMGetKbdType`, for the
     ISO keyboard check) and AppKit's (the `NSApp` global). SkyLight's hot-key functions are looked
     up with `dlsym`, since the package's link line cannot name a private framework.

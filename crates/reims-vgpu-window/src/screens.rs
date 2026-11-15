@@ -2,7 +2,7 @@
 //! main one first, and the window of the display on port i opens on screen i
 //! ([`screen_for_port`]). On macOS they come from CoreGraphics, which answers on any thread; on
 //! Linux from SDL, on the library's UI thread, which takes a snapshot of them
-//! (`native/linux/ui.rs`). Where there are none (no window system to reach), there is no screen
+//! (`native/sdl_thread/ui.rs`). Where there are none (no window system to reach), there is no screen
 //! to open on ([`screen_for_port`]).
 //!
 //! A screen's refresh rate is the one it runs at ([`screen_refresh`]): its current mode's, so a

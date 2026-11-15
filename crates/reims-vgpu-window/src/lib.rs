@@ -32,12 +32,12 @@
 //!   `shell` (a display's `NSWindow` and its delegate), `view` (its content view, layer and
 //!   layout), `render` (the thread that draws each frame into the layer), `input` (the view's and
 //!   the application's events to the host's callbacks), `cursor` (the guest's cursor as the
-//!   host's) and `hotkeys` (the system's hot keys while captured). On Linux (`native/linux/`) it
-//!   is SDL's: a UI thread of the library's own that SDL runs on (`ui`), a window's input there
-//!   (`input`, `keymap`), and its render thread (`render`), which draws through a presenter the
-//!   display's sink makes over the window's swapchain (`present`, which macOS's render thread
-//!   draws through too on the Vulkan platform), with the window's shell and cursor SDL's shared
-//!   ones (`sdl`). SDL's window on macOS shares `sdl`'s shell and cursor, and AppKit's
+//!   host's) and `hotkeys` (the system's hot keys while captured). On Linux
+//!   (`native/sdl_thread/`) it is SDL's: a UI thread of the library's own that SDL runs on
+//!   (`ui`), a window's input there (`input`, `keymap`), and its render thread (`render`), which
+//!   draws through a presenter the display's sink makes over the window's swapchain (`present`,
+//!   which macOS's render thread draws through too on the Vulkan platform), with the window's
+//!   shell and cursor SDL's shared ones (`sdl`), and what only Linux has in `native/linux.rs`. SDL's window on macOS shares `sdl`'s shell and cursor, and AppKit's
 //!   application, render thread, input and hot keys, with its own side in `native/macos/sdl.rs`.
 
 pub mod capture;
@@ -52,7 +52,7 @@ mod present;
 pub mod screens;
 pub mod scroll;
 
-// The SDL3 window: Linux's (`native/linux.rs`), and macOS's with the `macos-sdl` feature, behind
+// The SDL3 window: Linux's (`native/sdl_thread.rs`), and macOS's with the `macos-sdl` feature, behind
 // `REIMS_VGPU_WINDOW_IMPL`.
 #[cfg(any(target_os = "linux", feature = "macos-sdl"))]
 mod sdl;

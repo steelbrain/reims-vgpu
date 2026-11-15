@@ -380,9 +380,9 @@ runtime's own device. The switches above apply, and `resolution=` too.
   the guest's mode, as on macOS. `manual`
 - Nothing is drawn while the window is hidden or minimized, nor before it
   and its layout exist; it redraws when it shows.
-  `test: native::linux::render::a_hidden_window_is_drawn_when_it_shows`,
-  `test: native::linux::render::nothing_is_drawn_before_the_window_and_layout`,
-  `test: native::linux::render::what_asks_for_a_draw`
+  `test: native::sdl_thread::render::a_hidden_window_is_drawn_when_it_shows`,
+  `test: native::sdl_thread::render::nothing_is_drawn_before_the_window_and_layout`,
+  `test: native::sdl_thread::render::what_asks_for_a_draw`
 - Nothing is presented while the compositor suspends the window (Wayland's
   suspended state, as KWin and Mutter set it for a covered window or one on
   another desktop): from SDL's occluded event until it is exposed again, the
@@ -396,25 +396,25 @@ runtime's own device. The switches above apply, and `resolution=` too.
   when it shows, and holds none back.
   `test: sdl::shell::a_covered_window_stops_drawing_until_exposed`,
   `test: sdl::shell::the_last_show_or_hide_of_a_batch_decides`,
-  `test: native::linux::render::a_hidden_window_takes_no_retry`, `manual`
+  `test: native::sdl_thread::render::a_hidden_window_takes_no_retry`, `manual`
 - Pointer: absolute, held at the image's nearest edge; five buttons; a
   drag ends in the guest; the click that focuses the window is not sent;
   nothing is sent before the guest has a mode.
-  `test: native::linux::input::sdl_buttons_are_the_hosts_bits`,
-  `test: native::linux::input::a_drag_ends_in_the_guest_outside_the_window`,
-  `test: native::linux::input::the_click_that_focuses_the_window_is_not_sent`,
-  `test: native::linux::input::before_the_guest_has_a_mode_the_pointer_sends_nothing`,
-  `test: native::linux::input::moves_are_sent_where_the_guest_pixel_changes`
+  `test: native::sdl_thread::input::sdl_buttons_are_the_hosts_bits`,
+  `test: native::sdl_thread::input::a_drag_ends_in_the_guest_outside_the_window`,
+  `test: native::sdl_thread::input::the_click_that_focuses_the_window_is_not_sent`,
+  `test: native::sdl_thread::input::before_the_guest_has_a_mode_the_pointer_sends_nothing`,
+  `test: native::sdl_thread::input::moves_are_sent_where_the_guest_pixel_changes`
 - Keys by position, as evdev reports them, so the guest's layout applies and
   ISO keys arrive as on a real ISO keyboard; media keys are dropped.
-  `test: native::linux::keymap::scancodes_are_usb_usages`,
-  `test: native::linux::keymap::keys_off_the_keyboard_page_are_dropped`
+  `test: native::sdl_thread::keymap::scancodes_are_usb_usages`,
+  `test: native::sdl_thread::keymap::keys_off_the_keyboard_page_are_dropped`
 - Held keys repeat at the guest's rate; host repeats are dropped. No stuck
   keys: losing the keyboard, releasing capture or closing lifts every key.
-  `test: native::linux::input::host_repeats_are_dropped`,
-  `test: native::linux::input::losing_the_keyboard_leaves_nothing_stuck`,
-  `test: native::linux::input::closing_leaves_nothing_stuck`,
-  `test: native::linux::sdl::a_close_the_person_asks_for_lifts_every_key_and_ends_capture`,
+  `test: native::sdl_thread::input::host_repeats_are_dropped`,
+  `test: native::sdl_thread::input::losing_the_keyboard_leaves_nothing_stuck`,
+  `test: native::sdl_thread::input::closing_leaves_nothing_stuck`,
+  `test: native::sdl_thread::sdl::a_close_the_person_asks_for_lifts_every_key_and_ends_capture`,
   `test: sdl::shell::a_close_sends_the_key_ups_and_ends_capture_before_the_host_hears_of_it`
 - Capture: a click in the image captures the keyboard and the pointer, and
   the window then grabs the keyboard, so the compositor's own shortcuts
@@ -428,15 +428,15 @@ runtime's own device. The switches above apply, and `resolution=` too.
   both, and the grab and the hold go with the capture before it hides; the
   title says whether input is captured, as on macOS, with Ctrl+Alt+Super to
   release.
-  `test: native::linux::input::a_click_in_the_image_captures_and_is_sent`,
-  `test: native::linux::input::ctrl_alt_super_releases_capture`,
+  `test: native::sdl_thread::input::a_click_in_the_image_captures_and_is_sent`,
+  `test: native::sdl_thread::input::ctrl_alt_super_releases_capture`,
   `test: sdl::shell::the_end_lets_go_of_the_grab_and_the_holds`,
   `test: sdl::shell::the_pointer_is_held_over_the_image_in_whole_points`,
   `manual` (the grab and the hold)
 - Scrolling: the wheel's notches, or, where the host takes smooth
   scrolling, its lines at 10 points each, in no gesture (SDL gives no
   phases); the guest gets the device's own direction.
-  `test: native::linux::input::the_wheel_sends_the_devices_own_direction`
+  `test: native::sdl_thread::input::the_wheel_sends_the_devices_own_direction`
 - Cursor: over the image the guest's glyph at the image's scale, with an
   image at the screen's own scale for HiDPI; hidden when the guest hides
   its own; the host's arrow over the bars and the title bar. Where the guest's
@@ -466,7 +466,7 @@ runtime's own device. The switches above apply, and `resolution=` too.
   keeps its window, its swapchain made again on the new device. On macOS the
   window stays as it is after such a stop.
   `test: present::a_parked_presenter_asks_for_a_new_window`,
-  `test: native::linux::render::a_parked_window_is_drawn_only_in_its_new_window`,
+  `test: native::sdl_thread::render::a_parked_window_is_drawn_only_in_its_new_window`,
   `manual` (a boot whose GPU stops: NVIDIA's Xid 109)
 
 Not on Linux: a menu bar, Dock icon or ⌘Tab entry (the compositor's task
