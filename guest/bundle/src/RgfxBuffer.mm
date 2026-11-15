@@ -778,6 +778,11 @@ RGFX_RESOURCE_SPI
 
 // --- what a buffer that is not sparse or remote answers ------------------------------
 
+- (BOOL)rgfxOverCallerBytes
+{
+	return _noCopy;
+}
+
 // Whether a texture of `descriptor` over the buffer from `offset`, rows `bytesPerRow` apart, is
 // nil for its texels' end past an Apple GPU's allocation of the buffer (rgfxTexelsPastAllocation),
 // logged once: a 2D texture, a 2D array, its slices where the linear form lays them, or a texture

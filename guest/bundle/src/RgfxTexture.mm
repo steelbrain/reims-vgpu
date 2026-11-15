@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <vector>
 
 /// Maps an MTLTextureDescriptor into the wire's RgfxTextureDescriptor. Each Metal
 /// enum is carried as its raw value (the wire's convention); the four swizzle
@@ -2192,6 +2193,24 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 // CPU copy) is copied through a staging buffer of the region's rows, by a blit the call waits
 // for, so the GPU's later work sees what was written and the bytes read are the GPU's.
 //
+// The bytes of a texture over a buffer past the buffer's length are copied so too: the host's
+// platform keeps them in a tail of the texture's own, which every GPU path reads and writes
+// (metal2vulkan's linear_plan.rs, "Length"), and the guest's memory past the buffer is another
+// allocation's, or none. Metal's CPU and GPU paths agree on those bytes inside the buffer's
+// allocation, the length rounded up to its pages (the Intel 630 and the AMD 5300M under macOS
+// 26.7.1, 4 KiB pages) or to the M3 Max's 16 KiB granule, a small buffer's 128 KiB pool, or a
+// heap's size (macOS 27.0.1): getBytes: reads what a kernel or a blit wrote there, and a kernel
+// reads what replaceRegion: wrote. Past the allocation the x86 Macs' paths part: the CPU's
+// reach the next allocation of the process's memory, or fault at a mapping's end, while the
+// GPU's reach memory of their own (zero or older words on the AMD, a page every process shares
+// on the Intel), and the AMD's blits of a 2D texture there fail (`oracle_pastlen DEVICE paths`,
+// docs/graphics-kext/dgpu-oracle.md, Q11). The device keeps the M3's one memory everywhere past
+// the length, at the cost of a blit the call waits for, for the bytes past the length alone.
+// A no-copy buffer's bytes past its length are the app's own memory, which Metal's CPU paths
+// reach in place on all three, each dying of SIGBUS where the app's mapping ends: the bundle
+// copies them in place too, so a copy past the mapping's end faults as Metal's does, while the
+// GPU's paths there use the host's tail.
+//
 // Over a Managed buffer, Metal's replaceRegion: reaches the GPU's next read of the texture with
 // no didModifyRange: of the app's (measured on the AMD 5300M, whose Managed buffers are two
 // copies, under macOS 26.7.1: `oracle_storage AMD lintex managed`), so a write there tells the
@@ -2213,6 +2232,79 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	const RgfxBlockShape b = rgfxBlockShapeOf(self.pixelFormat);
 	const uint64_t rows = (std::max<uint64_t>(1, _desc.height) + b.height - 1) / b.height;
 	return (_bufferBytesPerRow * rows + 127) / 128 * 128;
+}
+
+// Copies `region` (of shape `shape`) of `level` and `slice` between the texture and the
+// caller's `caller`, rows `bytesPerRow` apart and images `imageBytes` apart, through a staging
+// buffer of the region's rows, packed, by a blit on the device's copy queue that the call waits
+// for: out of the texture when `toBytes`, else into it. NO where no staging buffer or command
+// buffer is made or the device fails the blit, each logged once, having copied nothing out.
+- (BOOL)rgfxCopyRegionByBlit:(MTLRegion)region
+                 mipmapLevel:(NSUInteger)level
+                       slice:(NSUInteger)slice
+                       shape:(RgfxCopyShape)shape
+                       bytes:(uint8_t *)caller
+                 bytesPerRow:(uint64_t)bytesPerRow
+                  imageBytes:(uint64_t)imageBytes
+                     toBytes:(BOOL)toBytes
+{
+	auto copyRows = [&](uint8_t *dst, uint64_t dstRow, uint64_t dstImage, const uint8_t *src,
+	                    uint64_t srcRow, uint64_t srcImage) {
+		for (uint64_t z = 0; z < shape.images; z++) {
+			for (uint64_t r = 0; r < shape.rows; r++) {
+				std::memcpy(dst + z * dstImage + r * dstRow, src + z * srcImage + r * srcRow,
+				            shape.rowBytes);
+			}
+		}
+	};
+	id<MTLDevice> device = self.device;
+	id<MTLCommandQueue> queue = rgfxCopyQueue(device);
+	uint64_t stageImage = shape.rowBytes * shape.rows;
+	id<MTLBuffer> stage = [device newBufferWithLength:stageImage * shape.images
+	                                          options:MTLResourceStorageModeShared];
+	uint8_t *staged = static_cast<uint8_t *>([stage contents]);
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+	id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+	if (staged == nullptr || blit == nil) {
+		static std::atomic<bool> logged{false};
+		rgfxNoteCopyRefused(logged, @"no staging buffer or command buffer for a CPU copy", self);
+		[blit endEncoding];
+		return NO;
+	}
+	if (toBytes) {
+		[blit copyFromTexture:self
+		                 sourceSlice:slice
+		                 sourceLevel:level
+		                sourceOrigin:region.origin
+		                  sourceSize:region.size
+		                    toBuffer:stage
+		           destinationOffset:0
+		      destinationBytesPerRow:shape.rowBytes
+		    destinationBytesPerImage:stageImage];
+	} else {
+		copyRows(staged, shape.rowBytes, stageImage, caller, bytesPerRow, imageBytes);
+		[blit copyFromBuffer:stage
+		           sourceOffset:0
+		      sourceBytesPerRow:shape.rowBytes
+		    sourceBytesPerImage:stageImage
+		             sourceSize:region.size
+		              toTexture:self
+		       destinationSlice:slice
+		       destinationLevel:level
+		      destinationOrigin:region.origin];
+	}
+	[blit endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	if (cb.status != MTLCommandBufferStatusCompleted) {
+		static std::atomic<bool> logged{false};
+		rgfxNoteCopyRefused(logged, @"the device failed a CPU copy's blit", self);
+		return NO;
+	}
+	if (toBytes) {
+		copyRows(caller, bytesPerRow, imageBytes, staged, shape.rowBytes, stageImage);
+	}
+	return YES;
 }
 
 // Copies `region` of `level` and `slice` between the texture and the caller's `bytes`, rows
@@ -2246,15 +2338,6 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 		rgfxNoteCopyRefused(logged, @"a CPU copy past the texture or with rows too short", self);
 		return;
 	}
-	auto copyRows = [&](uint8_t *dst, uint64_t dstRow, uint64_t dstImage, const uint8_t *src,
-	                    uint64_t srcRow, uint64_t srcImage) {
-		for (uint64_t z = 0; z < shape.images; z++) {
-			for (uint64_t r = 0; r < shape.rows; r++) {
-				std::memcpy(dst + z * dstImage + r * dstRow, src + z * srcImage + r * srcRow,
-				            shape.rowBytes);
-			}
-		}
-	};
 	uint8_t *caller = static_cast<uint8_t *>(bytes);
 
 	if (_buffer != nil && level == 0) {
@@ -2272,85 +2355,106 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 			                    self);
 			return;
 		}
-		uint8_t *at = contents + _bufferOffset + slice * [self rgfxBufferSlicePitch] +
-		              region.origin.y / b.height * _bufferBytesPerRow +
-		              region.origin.x / b.width * b.bytes;
-		if (toBytes) {
-			copyRows(caller, bytesPerRow, imageBytes, at, _bufferBytesPerRow, 0);
-		} else {
-			copyRows(at, _bufferBytesPerRow, 0, caller, bytesPerRow, imageBytes);
-			// The rows' span, from the first row's first byte written to the last row's last,
-			// told as the buffer's didModifyRange: tells it: a Managed buffer's GPU copy takes
-			// it (BUFFER_DID_MODIFY_RANGE, a no-copy one's block first taking the app's bytes),
-			// and a Shared buffer's posts nothing. The span told stops at the buffer's length:
-			// texels past it lie in the host's tail of the texture, which no range of the buffer
-			// names, and the host refuses a range past the buffer whole, which would keep the
-			// bytes inside the length from the GPU's copy too.
-			const uint64_t first = static_cast<uint64_t>(at - contents);
-			const uint64_t span = (shape.rows - 1) * _bufferBytesPerRow + shape.rowBytes;
-			const uint64_t length = [_buffer length];
-			if (first < length)
-				[_buffer didModifyRange:NSMakeRange(first, std::min(span, length - first))];
-			// A tiled texture's copy of the bytes takes them again at its next use, as after its
-			// didModifyData (didModifyData, below): Metal's getBytes: and replaceRegion: of a tiled
-			// texture's level 0 read and write the buffer's bytes, not the copy, and the next GPU
-			// use after a replaceRegion: of level 0 reads every level made from the new bytes,
-			// where a CPU write of the bytes alone is not taken (measured on the AMD 5300M and the
-			// Intel 630 under macOS 26.7.1, docs/graphics-kext/dgpu-oracle.md, Q11).
-			if (_desc.mipmap_level_count > 1 && _serializer != nullptr)
-				_serializer->textureDidModifyData([self rgfxObjId]);
+		// The region's first byte in the buffer, and each row's bytes there that lie inside the
+		// buffer's length, which the CPU copies in place, every byte of a no-copy buffer's among
+		// them (above). Rows from `past` on run past the length; their bytes past it are the
+		// host's tail's, which a blit reaches (above). Every row after the first of those lies
+		// wholly past the length, as rows are no closer together than their bytes.
+		const uint64_t first = _bufferOffset + slice * [self rgfxBufferSlicePitch] +
+		                       region.origin.y / b.height * _bufferBytesPerRow +
+		                       region.origin.x / b.width * b.bytes;
+		const uint64_t length = [_buffer length];
+		const bool overCaller = [_buffer isKindOfClass:[RgfxBuffer class]] &&
+		                        [(RgfxBuffer *)_buffer rgfxOverCallerBytes];
+		auto inside = [&](uint64_t r) -> uint64_t {
+			const uint64_t start = first + r * _bufferBytesPerRow;
+			if (overCaller)
+				return shape.rowBytes;
+			return start >= length ? 0 : std::min<uint64_t>(shape.rowBytes, length - start);
+		};
+		uint64_t past = 0;
+		while (past < shape.rows && inside(past) == shape.rowBytes)
+			past++;
+		for (uint64_t r = 0; r < shape.rows; r++) {
+			const uint64_t n = inside(r);
+			if (n == 0)
+				break;
+			uint8_t *in = contents + first + r * _bufferBytesPerRow;
+			if (toBytes)
+				std::memcpy(caller + r * bytesPerRow, in, n);
+			else
+				std::memcpy(in, caller + r * bytesPerRow, n);
 		}
+		if (!toBytes && first < length) {
+			// The rows' span inside the length, from the first row's first byte written to the
+			// last row's last, told as the buffer's didModifyRange: tells it: a Managed buffer's
+			// GPU copy takes it (BUFFER_DID_MODIFY_RANGE, a no-copy one's block first taking the
+			// app's bytes), and a Shared buffer's posts nothing. The host refuses a range past
+			// the buffer whole, which would keep the bytes inside the length from the GPU's copy
+			// too.
+			const uint64_t span = (shape.rows - 1) * _bufferBytesPerRow + shape.rowBytes;
+			[_buffer didModifyRange:NSMakeRange(first, std::min(span, length - first))];
+		}
+		if (past < shape.rows) {
+			// The rows from `past` on, by a blit of the texture: in the host's tail past the
+			// length, and over the buffer's bytes inside it, which the in-place copy above read
+			// or wrote alike.
+			MTLRegion rest = region;
+			rest.origin.y += past * b.height;
+			rest.size.height -= std::min<NSUInteger>(rest.size.height, past * b.height);
+			RgfxCopyShape restShape = shape;
+			restShape.rows = shape.rows - past;
+			uint8_t *restBytes = caller + past * bytesPerRow;
+			if (!toBytes) {
+				(void)[self rgfxCopyRegionByBlit:rest
+				                     mipmapLevel:level
+				                           slice:slice
+				                           shape:restShape
+				                           bytes:restBytes
+				                     bytesPerRow:bytesPerRow
+				                      imageBytes:imageBytes
+				                         toBytes:NO];
+			} else {
+				// Read into a copy of the rows, of which the bytes past the length alone are
+				// taken: those inside it stay as the CPU read them in place, a Managed buffer's
+				// CPU copy's.
+				std::vector<uint8_t> read(restShape.rows * shape.rowBytes);
+				if ([self rgfxCopyRegionByBlit:rest
+				                   mipmapLevel:level
+				                         slice:slice
+				                         shape:restShape
+				                         bytes:read.data()
+				                   bytesPerRow:shape.rowBytes
+				                    imageBytes:read.size()
+				                       toBytes:YES]) {
+					for (uint64_t r = past; r < shape.rows; r++) {
+						const uint64_t n = inside(r);
+						std::memcpy(caller + r * bytesPerRow + n,
+						            read.data() + (r - past) * shape.rowBytes + n,
+						            shape.rowBytes - n);
+					}
+				}
+			}
+		}
+		// A tiled texture's copy of the bytes takes them again at its next use, as after its
+		// didModifyData (didModifyData, below): Metal's getBytes: and replaceRegion: of a tiled
+		// texture's level 0 read and write the buffer's bytes, not the copy, and the next GPU
+		// use after a replaceRegion: of level 0 reads every level made from the new bytes,
+		// where a CPU write of the bytes alone is not taken (measured on the AMD 5300M and the
+		// Intel 630 under macOS 26.7.1, docs/graphics-kext/dgpu-oracle.md, Q11).
+		if (!toBytes && _desc.mipmap_level_count > 1 && _serializer != nullptr)
+			_serializer->textureDidModifyData([self rgfxObjId]);
 		return;
 	}
 
-	// Through a staging buffer of the region's rows, packed.
-	id<MTLDevice> device = self.device;
-	id<MTLCommandQueue> queue = rgfxCopyQueue(device);
-	uint64_t stageImage = shape.rowBytes * shape.rows;
-	id<MTLBuffer> stage = [device newBufferWithLength:stageImage * shape.images
-	                                          options:MTLResourceStorageModeShared];
-	uint8_t *staged = static_cast<uint8_t *>([stage contents]);
-	id<MTLCommandBuffer> cb = [queue commandBuffer];
-	id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-	if (staged == nullptr || blit == nil) {
-		static std::atomic<bool> logged{false};
-		rgfxNoteCopyRefused(logged, @"no staging buffer or command buffer for a CPU copy", self);
-		[blit endEncoding];
-		return;
-	}
-	if (toBytes) {
-		[blit copyFromTexture:self
-		                 sourceSlice:slice
-		                 sourceLevel:level
-		                sourceOrigin:region.origin
-		                  sourceSize:region.size
-		                    toBuffer:stage
-		           destinationOffset:0
-		      destinationBytesPerRow:shape.rowBytes
-		    destinationBytesPerImage:stageImage];
-	} else {
-		copyRows(staged, shape.rowBytes, stageImage, caller, bytesPerRow, imageBytes);
-		[blit copyFromBuffer:stage
-		           sourceOffset:0
-		      sourceBytesPerRow:shape.rowBytes
-		    sourceBytesPerImage:stageImage
-		             sourceSize:region.size
-		              toTexture:self
-		       destinationSlice:slice
-		       destinationLevel:level
-		      destinationOrigin:region.origin];
-	}
-	[blit endEncoding];
-	[cb commit];
-	[cb waitUntilCompleted];
-	if (cb.status != MTLCommandBufferStatusCompleted) {
-		static std::atomic<bool> logged{false};
-		rgfxNoteCopyRefused(logged, @"the device failed a CPU copy's blit", self);
-		return;
-	}
-	if (toBytes) {
-		copyRows(caller, bytesPerRow, imageBytes, staged, shape.rowBytes, stageImage);
-	}
+	(void)[self rgfxCopyRegionByBlit:region
+	                     mipmapLevel:level
+	                           slice:slice
+	                           shape:shape
+	                           bytes:caller
+	                     bytesPerRow:bytesPerRow
+	                      imageBytes:imageBytes
+	                         toBytes:toBytes];
 }
 
 // --- the descriptor's members the wire does not carry -------------------------------

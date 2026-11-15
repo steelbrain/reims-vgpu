@@ -147,6 +147,10 @@ static inline BOOL RgfxMakesNoResourceOf(MTLResourceOptions options)
 - (std::shared_ptr<RgfxMemoryShadow>)rgfxShadow;
 #endif
 
+/// Whether the buffer lies over the caller's bytes (bufferWithBytesNoCopy), whose memory past
+/// the length is the caller's own.
+- (BOOL)rgfxOverCallerBytes;
+
 /// Designated initialiser: wraps an already-created host buffer. `objId` and
 /// `gpuAddress` are the guest-picked values the create returned; `length` and
 /// `options` are the buffer's. Allocates the CPU-visible backing `contents` vends,

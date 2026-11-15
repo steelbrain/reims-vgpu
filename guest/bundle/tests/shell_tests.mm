@@ -261,6 +261,161 @@ void syncAsCommitted(std::initializer_list<id> textures);
 }
 @end
 
+// The device of a texture over a buffer as the host's platform answers the CPU's copies the
+// bundle routes through it: a blit between a staging buffer of its own and a slice-0 region of
+// level 0 reads and writes the buffer's bytes inside its length in place, and those past it in
+// `tail`, from the length on, as metal2vulkan's runtime keeps them in a tail of the texture's own
+// (linear_plan.rs, "Length"). Texels are `texelBytes` long; `blits` counts its blits and `lastY`
+// and `lastRows` give the last one's first row and rows.
+@class RgfxTailDevice;
+@interface RgfxTailStage : NSObject
+@property(nonatomic, strong) NSMutableData *bytes;
+- (void *)contents;
+- (NSUInteger)length;
+@end
+@implementation RgfxTailStage
+- (void *)contents
+{
+	return _bytes.mutableBytes;
+}
+- (NSUInteger)length
+{
+	return _bytes.length;
+}
+@end
+@interface RgfxTailDevice : NSObject
+@property(nonatomic, strong) NSMutableData *tail;
+@property(nonatomic) NSUInteger texelBytes;
+@property(nonatomic) NSUInteger blits;
+@property(nonatomic) NSUInteger lastY;
+@property(nonatomic) NSUInteger lastRows;
+- (id)newCommandQueue;
+- (id)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options;
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format;
+@end
+@interface RgfxTailBlit : NSObject
+@property(nonatomic, weak) RgfxTailDevice *device;
+@end
+@implementation RgfxTailBlit
+// The byte `o` of the texture's buffer, from its start: inside the length, in place; past it, in
+// the tail.
+- (uint8_t *)byteOf:(id<MTLTexture>)t at:(uint64_t)o
+{
+	id<MTLBuffer> b = t.buffer;
+	return o < b.length ? static_cast<uint8_t *>(b.contents) + o
+	                    : static_cast<uint8_t *>(_device.tail.mutableBytes) + (o - b.length);
+}
+- (void)copyRegion:(MTLOrigin)origin
+              size:(MTLSize)size
+             slice:(NSUInteger)slice
+           texture:(id<MTLTexture>)t
+             stage:(id<MTLBuffer>)stage
+            offset:(NSUInteger)stageOffset
+               bpr:(NSUInteger)stageBpr
+         toTexture:(BOOL)toTexture
+{
+	CHECK(slice == 0);
+	const NSUInteger tb = _device.texelBytes;
+	uint8_t *staged = static_cast<uint8_t *>(stage.contents) + stageOffset;
+	for (NSUInteger y = 0; y < size.height; y++) {
+		for (NSUInteger x = 0; x < size.width * tb; x++) {
+			const uint64_t o = t.bufferOffset + (origin.y + y) * t.bufferBytesPerRow +
+			                   origin.x * tb + x;
+			uint8_t *in = [self byteOf:t at:o];
+			uint8_t *at = staged + y * stageBpr + x;
+			if (toTexture)
+				*in = *at;
+			else
+				*at = *in;
+		}
+	}
+	_device.blits++;
+	_device.lastY = origin.y;
+	_device.lastRows = size.height;
+}
+- (void)copyFromTexture:(id<MTLTexture>)t
+                 sourceSlice:(NSUInteger)slice
+                 sourceLevel:(NSUInteger)level
+                sourceOrigin:(MTLOrigin)origin
+                  sourceSize:(MTLSize)size
+                    toBuffer:(id<MTLBuffer>)stage
+           destinationOffset:(NSUInteger)offset
+      destinationBytesPerRow:(NSUInteger)bpr
+    destinationBytesPerImage:(NSUInteger)bpi
+{
+	CHECK(level == 0);
+	[self copyRegion:origin size:size slice:slice texture:t stage:stage offset:offset bpr:bpr toTexture:NO];
+}
+- (void)copyFromBuffer:(id<MTLBuffer>)stage
+           sourceOffset:(NSUInteger)offset
+      sourceBytesPerRow:(NSUInteger)bpr
+    sourceBytesPerImage:(NSUInteger)bpi
+             sourceSize:(MTLSize)size
+              toTexture:(id<MTLTexture>)t
+       destinationSlice:(NSUInteger)slice
+       destinationLevel:(NSUInteger)level
+      destinationOrigin:(MTLOrigin)origin
+{
+	CHECK(level == 0);
+	[self copyRegion:origin size:size slice:slice texture:t stage:stage offset:offset bpr:bpr toTexture:YES];
+}
+- (void)endEncoding
+{
+}
+@end
+@interface RgfxTailCommandBuffer : NSObject
+@property(nonatomic, weak) RgfxTailDevice *device;
+@end
+@implementation RgfxTailCommandBuffer
+- (id)blitCommandEncoder
+{
+	RgfxTailBlit *blit = [RgfxTailBlit new];
+	blit.device = _device;
+	return blit;
+}
+- (void)commit
+{
+}
+- (void)waitUntilCompleted
+{
+}
+- (MTLCommandBufferStatus)status
+{
+	return MTLCommandBufferStatusCompleted;
+}
+@end
+@interface RgfxTailQueue : NSObject
+@property(nonatomic, weak) RgfxTailDevice *device;
+@end
+@implementation RgfxTailQueue
+- (id)commandBuffer
+{
+	RgfxTailCommandBuffer *cb = [RgfxTailCommandBuffer new];
+	cb.device = _device;
+	return cb;
+}
+@end
+@implementation RgfxTailDevice
+- (id)newCommandQueue
+{
+	RgfxTailQueue *queue = [RgfxTailQueue new];
+	queue.device = self;
+	return queue;
+}
+- (id)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options
+{
+	(void)options;
+	RgfxTailStage *stage = [RgfxTailStage new];
+	stage.bytes = [NSMutableData dataWithLength:length];
+	return stage;
+}
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format
+{
+	(void)format;
+	return 16;
+}
+@end
+
 // A device whose newDynamicLibraryWithURL: answers a URL whose last part names one of `made` with
 // that dynamic library (made by `make`, which the test sets), keeping each path it was asked for,
 // as the pipeline's loads ask the device for the libraries their install names name.
@@ -3277,6 +3432,132 @@ void test_textures_past_a_buffers_allocation_answer_nil()
 		CHECK(ringEmpty(fx.ring));
 	}
 	drainRing(fx.ring);
+}
+
+// getBytes: and replaceRegion: of a texture over a buffer reach its bytes past the buffer's
+// length through the device's blit, where the host's platform keeps them in a tail of the
+// texture's own, so the CPU's copies and the GPU's paths are one memory there, as Metal's are
+// inside the buffer's allocation on the AMD 5300M, the Intel 630 and the M3 Max (oracle_pastlen,
+// docs/graphics-kext/dgpu-oracle.md Q11). The bytes inside the length, a row's or a texel's across
+// it among them, the CPU copies in place. The guest's memory past the length is neither read nor
+// written, and a copy inside the length blits nothing. A no-copy buffer's copies stay in place.
+void test_buffer_texture_copies_past_the_length_reach_the_tail()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(0x800000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	RgfxRegionSlabSource slabSource(region, fx.ser);
+	RgfxSlabs slabs(slabSource);
+	uint8_t *app = static_cast<uint8_t *>(aligned_alloc(0x4000, 0x4000)); // a no-copy buffer's
+	CHECK(app != nullptr);
+	@autoreleasepool {
+		RgfxTailDevice *device = [RgfxTailDevice new];
+		device.tail = [NSMutableData dataWithLength:0x1000];
+		uint8_t *tail = static_cast<uint8_t *>(device.tail.mutableBytes);
+		for (size_t i = 0; i < 0x1000; i++)
+			tail[i] = static_cast<uint8_t>(0xc0 ^ i);
+		const NSUInteger length = 0x1000;
+		std::vector<uint8_t> memory(2 * length, 0x11); // past the length: the next allocation's
+		for (size_t i = 0; i < length; i++)
+			memory[i] = static_cast<uint8_t>(i * 7);
+		RgfxBuffer *buf = [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+		                                                  regionOffset:0x10000
+		                                                        length:length
+		                                                       options:MTLResourceStorageModeShared
+		                                                   deallocator:nil
+		                                                        device:(id<MTLDevice>)device
+		                                                    serializer:&fx.ser];
+		CHECK(buf != nil);
+		drainRing(fx.ring);
+		auto pastUntouched = [&]() {
+			return std::all_of(memory.begin() + length, memory.end(),
+			                   [](uint8_t v) { return v == 0x11; });
+		};
+		uint8_t in[512];
+		for (size_t i = 0; i < sizeof in; i++)
+			in[i] = static_cast<uint8_t>(0x30 + i);
+		uint8_t out[512] = {};
+
+		// A 2D texture of 64 x 17 RGBA8Unorm, rows 256 bytes apart from 0: its last row past the
+		// length. getBytes: of rows 15 and 16 reads row 15 in place and row 16 from the tail, by
+		// one blit of row 16.
+		device.texelBytes = 4;
+		MTLTextureDescriptor *desc =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:64
+		                                                      height:17
+		                                                   mipmapped:NO];
+		desc.storageMode = MTLStorageModeShared;
+		desc.usage = MTLTextureUsageShaderRead;
+		id<MTLTexture> rows = [buf newTextureWithDescriptor:desc offset:0 bytesPerRow:256];
+		CHECK(rows != nil);
+		drainRing(fx.ring);
+		[rows getBytes:out bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 15, 64, 2) mipmapLevel:0];
+		CHECK(std::memcmp(out, memory.data() + 0xf00, 256) == 0);
+		CHECK(std::memcmp(out + 256, tail, 256) == 0);
+		CHECK(device.blits == 1 && device.lastY == 16 && device.lastRows == 1);
+		// replaceRegion: of the same rows writes row 15 in place and row 16 into the tail.
+		[rows replaceRegion:MTLRegionMake2D(0, 15, 64, 2) mipmapLevel:0 withBytes:in bytesPerRow:256];
+		CHECK(std::memcmp(memory.data() + 0xf00, in, 256) == 0);
+		CHECK(std::memcmp(tail, in + 256, 256) == 0);
+		CHECK(pastUntouched());
+		CHECK(device.blits == 2 && device.lastY == 16 && device.lastRows == 1);
+		CHECK(ringEmpty(fx.ring)); // a Shared buffer's writes post nothing
+		// A copy inside the length blits nothing.
+		[rows getBytes:out bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 0, 64, 2) mipmapLevel:0];
+		CHECK(std::memcmp(out, memory.data(), 512) == 0 && device.blits == 2);
+
+		// A texture buffer of 4 RGBA32Float texels from 4088: 8 bytes of its first texel inside
+		// the length, the rest of it and the other three past it. The bytes inside are copied in
+		// place, the rest through the blit of the region.
+		device.texelBytes = 16;
+		MTLTextureDescriptor *texels =
+		    [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+		                                                           width:4
+		                                                 resourceOptions:MTLResourceStorageModeShared
+		                                                           usage:MTLTextureUsageShaderRead];
+		id<MTLTexture> across = [buf newTextureWithDescriptor:texels offset:length - 8 bytesPerRow:64];
+		CHECK(across != nil);
+		drainRing(fx.ring);
+		std::memset(out, 0, sizeof out);
+		[across getBytes:out bytesPerRow:64 fromRegion:MTLRegionMake1D(0, 4) mipmapLevel:0];
+		CHECK(std::memcmp(out, memory.data() + length - 8, 8) == 0);
+		CHECK(std::memcmp(out + 8, tail, 56) == 0);
+		CHECK(device.blits == 3 && device.lastY == 0 && device.lastRows == 1);
+		[across replaceRegion:MTLRegionMake1D(0, 4) mipmapLevel:0 withBytes:in bytesPerRow:64];
+		CHECK(std::memcmp(memory.data() + length - 8, in, 8) == 0);
+		CHECK(std::memcmp(tail, in + 8, 56) == 0);
+		CHECK(pastUntouched() && device.blits == 4);
+		CHECK(ringEmpty(fx.ring));
+
+		// A no-copy buffer's bytes past its length are the app's own memory, which Metal's CPU
+		// copies reach in place, faulting where the app's mapping ends: getBytes: and
+		// replaceRegion: of rows past its length copy them in place and blit nothing.
+		for (size_t i = 0; i < 0x4000; i++)
+			app[i] = static_cast<uint8_t>(i * 5);
+		RgfxBuffer *noCopy = [RgfxBuffer bufferWithBytesNoCopy:app
+		                                                length:length
+		                                               options:MTLResourceStorageModeShared
+		                                           deallocator:nil
+		                                                region:&region
+		                                                 slabs:&slabs
+		                                                device:(id<MTLDevice>)device
+		                                            serializer:&fx.ser];
+		CHECK(noCopy != nil && [noCopy contents] == app);
+		drainRing(fx.ring);
+		device.texelBytes = 4;
+		id<MTLTexture> appRows = [noCopy newTextureWithDescriptor:desc offset:0 bytesPerRow:256];
+		CHECK(appRows != nil);
+		drainRing(fx.ring);
+		std::memset(out, 0, sizeof out);
+		[appRows getBytes:out bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 15, 64, 2) mipmapLevel:0];
+		CHECK(std::memcmp(out, app + 0xf00, 512) == 0);
+		[appRows replaceRegion:MTLRegionMake2D(0, 15, 64, 2) mipmapLevel:0 withBytes:in bytesPerRow:256];
+		CHECK(std::memcmp(app + 0xf00, in, 512) == 0);
+		CHECK(device.blits == 4);
+	}
+	drainRing(fx.ring);
+	free(app);
 }
 
 // A texture over a buffer's bytes of a block-compressed format is nil and posts nothing, by the
@@ -12850,7 +13131,9 @@ void test_buffer_texture_replace_region_past_the_length_tells_the_length()
 	RgfxRegion region(mem.data(), mem.size());
 	const NSUInteger length = 0x1000;
 	@autoreleasepool {
-		// The block runs on past the buffer, so the rows' bytes past it land in the block.
+		// The block runs on past the buffer; the rows' bytes past the length are the device's
+		// tail's, which its blit reaches (test_buffer_texture_copies_past_the_length_reach_the_tail;
+		// no device here), not the block's.
 		RgfxRegion::Block block = region.allocate(2 * length);
 		CHECK(block.ok);
 		uint8_t *bytes = const_cast<uint8_t *>(block.ptr);
@@ -20335,6 +20618,7 @@ int main(int argc, char **argv)
 		test_compressed_buffer_textures_answer_nil();
 		test_buffer_texture_buffers();
 		test_textures_past_a_buffers_allocation_answer_nil();
+		test_buffer_texture_copies_past_the_length_reach_the_tail();
 		test_invalid_texture_descriptors_end_the_process();
 		test_texture_descriptor_validation_as_the_x86_macs();
 		test_texture_descriptor_validation_as_an_apple_gpu();
