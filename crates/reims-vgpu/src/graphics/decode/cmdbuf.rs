@@ -10159,6 +10159,6 @@ mod tests {
         }
         reims_vgpu_vulkan::exit_gate::arm();
         drop(walker);
-        std::process::exit(0);
+        crate::graphics::tests::host_exit(0);
     }
 }

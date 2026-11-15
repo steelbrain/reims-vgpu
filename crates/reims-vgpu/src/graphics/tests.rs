@@ -6931,6 +6931,21 @@ pub(crate) fn eventually(mut done: impl FnMut() -> bool) -> bool {
     done()
 }
 
+unsafe extern "C" {
+    /// The C library's `exit`, which runs the exit handlers ([`host_exit`]).
+    #[link_name = "exit"]
+    fn c_exit(status: i32) -> !;
+}
+
+/// Ends a test's child as a host ends: through the C library's `exit`, which runs the exit
+/// handlers, the exit gate's hook among them (`reims_vgpu_vulkan::exit_gate`). That is what
+/// `std::process::exit` calls on Unix; on Windows it calls `ExitProcess`, which runs none of them,
+/// where QEMU ends through the C library's.
+pub(crate) fn host_exit(status: i32) -> ! {
+    // SAFETY: the C library's exit, which never returns.
+    unsafe { c_exit(status) }
+}
+
 /// Waits ([`eventually`]) for the platform to hold `n` committed command buffers not yet
 /// completed; their ids, in commit order.
 fn committed(platform: &FakePlatform, n: usize) -> Vec<ObjId> {

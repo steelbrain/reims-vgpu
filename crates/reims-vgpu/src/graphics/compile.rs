@@ -832,7 +832,7 @@ mod tests {
             assert!(pool.submit(of(1), first).is_ok());
             assert!(pool.submit(of(2), second).is_ok());
             at_begin.recv().unwrap();
-            std::process::exit(7);
+            crate::graphics::tests::host_exit(7);
         }
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
