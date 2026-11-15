@@ -133,7 +133,7 @@ fn c_harness_calls_every_function() {
             Some(&rest[..end])
         })
         .collect();
-    assert_eq!(declared.len(), 10, "{declared:?}");
+    assert_eq!(declared.len(), 11, "{declared:?}");
     let missing: Vec<&str> = declared
         .iter()
         .copied()

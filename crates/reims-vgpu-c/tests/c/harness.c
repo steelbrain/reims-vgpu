@@ -87,8 +87,9 @@ static void on_graphics_cursor_move(void *ctx) {
 
 /* A graphics device with no window, on every host: its registers, its region, its doorbell, a
  * GET_DISPLAYS the guest writes into the control ring answered with DISPLAYS and an interrupt,
- * a MOVE_CURSOR the host is told of and reads, a taking write, a read of its display, its reset,
- * and its release, which ends its table once its threads have ended. */
+ * a MOVE_CURSOR the host is told of and reads, a taking write, its doorbell pages (offered, and
+ * a write at a page no process holds), a read of its display, its reset, and its release, which
+ * ends its table once its threads have ended. */
 static void check_graphics(void) {
     RvgGraphicsCallbacks cb = {sizeof cb,
                                &graphics_destroyed,
@@ -97,13 +98,18 @@ static void check_graphics(void) {
                                NULL,
                                NULL,
                                on_graphics_cursor_move,
+                               NULL,
                                NULL};
-    RvgGraphicsDeviceConfig c = {sizeof c, &cb, NULL, NULL, NULL, RVG_GUEST_ARCH_X86_64};
+    RvgGraphicsDeviceConfig c = {sizeof c, &cb, NULL, NULL, NULL, RVG_GUEST_ARCH_X86_64, 2};
     RvgGraphicsDevice *d = NULL;
     graphics_destroyed = 0;
     graphics_raised = 0;
     graphics_moved = 0;
     CHECK_STATUS(rvg_graphics_device_create(NULL, &d), RVG_ERR_INVALID_ARGUMENT);
+    /* doorbell_pages is 0 or 1; the refusal ends its table, with its one destroy. */
+    CHECK_STATUS(rvg_graphics_device_create(&c, &d), RVG_ERR_INVALID_ARGUMENT);
+    CHECK(d == NULL && graphics_destroyed == 1);
+    c.doorbell_pages = 1;
     CHECK_STATUS(rvg_graphics_device_create(&c, &d), RVG_OK);
     CHECK(d != NULL);
     if (!d) {
@@ -117,6 +123,8 @@ static void check_graphics(void) {
     CHECK(rvg_graphics_device_mmio_read(d, 0x014) == (uint32_t)size);
     CHECK(rvg_graphics_device_mmio_read(d, 0x018) == (uint32_t)(size >> 32));
     CHECK(rvg_graphics_device_mmio_read(d, 0x7fc) == 0);
+    /* FEATURES_HI offers DOORBELL_PAGES, bit 46, where the host maps BAR 4. */
+    CHECK((rvg_graphics_device_mmio_read(d, 0x00c) >> 14) & 1);
 
     int doorbell[2];
     CHECK(pipe(doorbell) == 0);
@@ -151,8 +159,10 @@ static void check_graphics(void) {
     CHECK(wait_for(&graphics_moved, 1));
     RvgDisplayCoord at = rvg_graphics_device_cursor_position(d);
     CHECK(at.x == 300 && at.y == 200);
-    /* A ring no queue has is ignored. */
+    /* A ring no queue has is ignored, and a write at a doorbell page no process holds is
+     * dropped. */
     rvg_graphics_device_mmio_write_taking(d, 0x020, 0x40000);
+    rvg_graphics_device_doorbell_write(d, 0, 0x40000);
     CHECK(rvg_graphics_device_mmio_read(d, 0x010) == 1);
     /* The display read back: a NULL buffer asks its size, 1920 x 1080 with no window, and with
      * no scanout it shows black, B, G, R, A. */
@@ -177,7 +187,7 @@ static void check_graphics(void) {
     CHECK(at.x == 0 && at.y == 0);
     rvg_graphics_device_release(d);
     close(doorbell[1]);
-    CHECK(wait_for(&graphics_destroyed, 1));
+    CHECK(wait_for(&graphics_destroyed, 2));
     rvg_graphics_device_release(NULL);
 }
 
@@ -204,7 +214,7 @@ static void check_memory_files(void) {
     cb.struct_size = sizeof cb;
     cb.ctx = &files_destroyed;
     cb.destroy = on_graphics_destroy;
-    RvgGraphicsDeviceConfig c = {sizeof c, &cb, NULL, &map, &file, RVG_GUEST_ARCH_X86_64};
+    RvgGraphicsDeviceConfig c = {sizeof c, &cb, NULL, &map, &file, RVG_GUEST_ARCH_X86_64, 0};
     files_destroyed = 0;
     RvgGraphicsDevice *d = NULL;
     CHECK_STATUS(rvg_graphics_device_create(&c, &d), RVG_OK);
