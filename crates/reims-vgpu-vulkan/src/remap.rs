@@ -73,6 +73,12 @@
 //!   threads took 0.00, 2.0, 3.6 and 8.0 shootdowns a page, and 0.54, 2.1, 2.1 and 1.9 to 9.2 us
 //!   a page). In a pass of Geekbench 7.1's Metal benchmarks on the Iris Xe host (ANV), 3.45 CPU-s
 //!   of the runtime's handler threads' 9.5 were these unmaps (job m3-max-30243, its call graphs).
+//!   Made on this one thread instead, the same pass's unmaps took 1.48 CPU-s where they had taken
+//!   4.03 on the handler threads, where each waited for the process's `mmap_lock` behind another
+//!   writer (`munmap`'s spinning on it fell from 0.47 to 0.02 CPU-s, the shootdowns' sending from
+//!   0.92 to 0.41); the handler threads' CPU fell from 9.82 to 6.40 CPU-s, and Geekbench's times
+//!   did not move (**measured** on that host, 2026-11-14, a macOS 26.7.2 guest, jobs
+//!   m3-max-30523 before and m3-max-30516 after, the timed pass's call graphs).
 //! - **What it keeps.** The pages stay mapped, at their address, until the hold goes: the kernel
 //!   gives no range over them meanwhile. Core deallocates only whole ranges it made and never
 //!   reaches again, so nothing maps over a waiting unmap but a fixed overwrite, which takes those
