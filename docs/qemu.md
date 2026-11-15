@@ -57,7 +57,7 @@ through ninja at its default, to the same binary. configure fetches meson subpro
   and meson keeps it as its `pkg_config_path`, so ninja's own reconfigures
   find the package too. The `reims_vgpu` dependency (`--enable-reims-vgpu`)
   is `dependency('reims-vgpu', method: 'pkg-config', static: true)`, looked
-  for on Linux and macOS hosts, so QEMU links `libreims_vgpu.a` and what its
+  for on Linux, macOS and Windows hosts, so QEMU links `libreims_vgpu.a` and what its
   `Libs.private` names, and records no path to the library: nothing of it
   is loaded from a file at run time.
 - **The package's flags are configure's.** meson reads `reims-vgpu.pc` at
@@ -73,7 +73,9 @@ through ninja at its default, to the same binary. configure fetches meson subpro
   `firmware/prebuilt/ReimsGraphics.rom` as its `romfile`.
 - **Hosts.** On Linux the guest runs under KVM. On a Mac the same
   `qemu-system-x86_64` runs it under TCG, over MoltenVK, which realizes the
-  device and checks it paused ("The reims-graphics device", below).
+  device and checks it paused ("The reims-graphics device", below). On
+  Windows QEMU builds in MSYS2's CLANG64 environment and runs the guest
+  under WHPX ("Windows hosts", below).
 
 ## What vendor/qemu carries
 
@@ -127,6 +129,9 @@ virtio device (`d151bcd9`, upstream's `b501f21312`).
 | `qemu-xhci` completes each command with a Command Completion Event of its own (xHCI 6.4.2.2): No Op, Set LTV, Get Port Bandwidth, a command it does not support and an Enable Slot that finds no free slot complete with Slot ID 0, and a command for a slot completes with that Slot ID whether or not the slot is enabled. Upstream's kept the previous command's Slot ID across one doorbell's commands, gave an NEC firmware revision reply the previous command's completion code, and gave every command after an NEC reply the reply's type and fields; `tests/qtest/usb-hcd-xhci-test.c` queues both kinds at one doorbell | `347a2204`, `3b327429` |
 | while a `usb-host` device's SET_INTERFACE call runs on its worker, the main loop makes no usbfs call on the device, each of which would wait for the call: it handles no libusb events, so every usb-host device's completions wait for the call, and the device's submits and cancels wait in order in a queue of its own, made when the call returns ("x86-64 macOS guests: USB passthrough", below) | `db125fda` |
 | `qemu-xhci` posts each Transfer Event a TD's TRBs owe after a Short Packet (xHCI 4.10.1.1.2): the TRB the packet is met on, where it has ISP or IOC, and each later TRB of the TD with IOC, with the same residue. Upstream's posted one event per TD, so macOS's isoch IN TDs of an Isoch TRB chained to a Normal TRB never completed, and a passed-through camera's stream stopped before its first frame ("x86-64 macOS guests: USB passthrough", below); `tests/qtest/usb-hcd-xhci-test.c` runs TDs of two TRBs into usb-kbd's reports | `ae97f3f5`, `1890afed` |
+| WHPX answers CPUID leaf 4 from the CPU model: its exit list lacked the leaf, so Hyper-V answered it with no cache levels, and macOS panicked 1.3 s into boot ("Windows hosts", below) | `cc128f0e` |
+| on Windows, shared RAM (`memory-backend-ram,share=on`, any RAM_SHARED block) is a view of a section the paging file backs, whose handle the RAMBlock keeps (`qemu_ram_get_section`); `qemu_win32_map_alloc` passes a size's high 32 bits ("Windows hosts: guest RAM in a section", below) | `6c2cae16` |
+| `reims-graphics-pci` on Windows: meson looks for the library there too, the memory walk passes each range of RAM that is a view of a section with the section's handle and the range's offset in it, and the control ring's doorbell is the EventNotifier's event | `a86885f8` |
 
 The branch's other commits are the apple-gfx work `96e1b470` removes, and
 `cfaadbfa09`, an HVF workaround that `478c28ff70` reverts, upstream having
@@ -752,7 +757,70 @@ on ms01, at 20.1 W where they drew 16.8 to 19.5 W but for one of 23.8 W.
 On um870 the cold costs stay: the guest's 2 ms wake took 22 µs and its
 CPUID after 2 ms 4.1 µs.
 
-## x86-64 macOS guests
+## Windows hosts
+
+Windows hosts are being brought up on homelab-mac-mini-2018 (Windows 11
+26H2, i7-8700B, 64 GiB, Intel UHD 630); nothing ships for them yet. QEMU
+builds there in MSYS2's CLANG64 environment (clang and lld; QEMU builds on
+Windows only with MinGW, `vendor/qemu/docs/about/build-platforms.rst`), and
+runs x86-64 guests under WHPX, the Windows Hypervisor Platform
+(`-accel whpx`):
+
+```sh
+../configure --target-list=x86_64-softmmu --enable-whpx --enable-sdl \
+  --enable-gtk --enable-slirp --disable-rust --disable-docs --disable-werror
+```
+
+**Measured** on the mini (2026-11-15, clang 23.1.5): configure took 169 s
+and `ninja -j12` 349 s for a clean build; the binary's accelerators are tcg
+and whpx. Without a `reims-vgpu.pc` on its `PKG_CONFIG_PATH`, configure finds
+no library ("Run-time dependency reims-vgpu found: NO") and leaves
+`reims-graphics-pci` out.
+
+- **CPUID leaf 4.** WHPX takes from QEMU's CPU model only the CPUID leaves
+  in its exit list, and Hyper-V answers the rest. Before `cc128f0e` the list
+  had no leaf 4, so the guest saw no cache levels: macOS counted 0 CPUs
+  sharing the last-level cache and panicked 1.3 s into boot
+  (`osfmk/i386/cpu_threads.c:198`, zero divisor), under `-cpu host` and
+  `kernel-irqchip=off` alike.
+- **The host's CPUID.** WHPX offers the guest no invariant TSC (CPUID
+  80000007h EDX bit 8) and no ARAT (06h EAX bit 2) on the mini, so `check`
+  warns about both. macOS boots without them: its kernel takes the TSC
+  deadline timer, at 3.19 GHz.
+- **No `dump-guest-core=off`.** QEMU refuses it on Windows ("Dumping guest
+  memory cannot be disabled on this host") and exits, so a Windows host's
+  `-machine` leaves it out.
+
+### Windows hosts: guest RAM in a section
+
+QEMU's anonymous RAM on Windows comes from VirtualAlloc, private to the
+process: no second mapping can share its pages, as `mach_vm_remap` shares a
+Mac's, so the library could not view a guest buffer's pages in place over
+it. Shared RAM (`memory-backend-ram,share=on`, as every RAM_SHARED block) is
+a view of a section the paging file backs (`CreateFileMapping` with
+SEC_COMMIT, then `MapViewOfFile`, `6c2cae16`), committed whole as
+VirtualAlloc's memory is. The RAMBlock keeps the section's handle
+(`qemu_ram_get_section`), which `reims-graphics-pci` hands the library with
+each range's offset in the section, and the library maps views of the
+section's pages (`MapViewOfFile3`) that share the pages WHPX maps into the
+guest. The guest's RAM is one block, so
+`-machine q35,memory-backend=ram -object memory-backend-ram,id=ram,size=4096M,share=on`
+makes one section of it.
+
+**Measured** on the mini (2026-11-15), booting Sequoia's recovery image
+(Darwin 24.4.0) on a 15.8.2 VM's OpenCore and OVMF under WHPX, with
+vmware-svga, 6 vCPUs, 4 GiB and `-display gtk`, each run with the machine
+to itself, QMP screendumps every 15 s, then QEMU's CPU time and memory read
+60 s apart (`m3-max-32230` share=on, `m3-max-32232` share=off):
+- share=on: QEMU's trace shows one 4 GiB section (`win32_map_alloc
+  size:4294967296`), and WHPX maps its view (`WHvMapGpaRange`) as it maps
+  VirtualAlloc's memory. The Recovery window was up 2:09 to 2:24 after
+  QEMU's start, as with share=off.
+- Idle at the Recovery window, 7 minutes in: 0.45 CPUs with share=on and
+  0.48 without; working set 0.81 and 0.78 GB, peak working set 4.26 and
+  4.27 GB. Private bytes were 0.78 GB with share=on, where the section holds
+  the guest's RAM, and 5.03 GB without.
+- QEMU quit over QMP and exited 0 both ways.
 
 What `reims-ctl`'s q35 command gives an x86-64 macOS guest, and why
 (`crates/reims-ctl/src/qemu.rs`).
