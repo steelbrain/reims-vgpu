@@ -261,6 +261,19 @@ void syncAsCommitted(std::initializer_list<id> textures);
 }
 @end
 
+// An Apple GPU's device that answers the M3 Max's linear texture alignment, 16 bytes, for the
+// formats the tests make textures over buffers of (oracle_pastlen Apple, R32Uint and R8Uint).
+@interface RgfxAppleLinearDevice : RgfxAppleHeapDevice
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format;
+@end
+@implementation RgfxAppleLinearDevice
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format
+{
+	(void)format;
+	return 16;
+}
+@end
+
 // The device of a texture over a buffer as the host's platform answers the CPU's copies the
 // bundle routes through it: a blit between a staging buffer of its own and a slice-0 region of
 // level 0 reads and writes the buffer's bytes inside its length in place, and those past it in
@@ -3430,6 +3443,152 @@ void test_textures_past_a_buffers_allocation_answer_nil()
 		answers(16384, rgba(MTLTextureType2DArray, 32, 2), 0, 256, true, true);
 		answers(16384, rgba(MTLTextureType2DArray, 33, 2), 0, 256, true, false);
 		CHECK(ringEmpty(fx.ring));
+	}
+	drainRing(fx.ring);
+}
+
+// Under an Apple GPU's rules, a texture over a buffer's bytes is nil past the M3 Max's allocation
+// of the buffer, counted from the buffer's start, and posts nothing (`oracle_pastlen Apple limits`,
+// docs/graphics-kext/dgpu-oracle.md Q11): for a buffer of fewer than 16 KiB the 128 KiB pool
+// Metal suballocates it from, for a no-copy buffer the 16 KiB pages its bytes meet, for a heap's
+// buffer the heap's size; a 2D texture's and a texture buffer's last texel counted, whatever the
+// bytes per row past it, and a 2D array's slices, each its rows' whole pitch, its texels inside
+// the length or not. The x86 Macs make the 2D textures and texture buffers past the pool (the AMD
+// 5300M and the Intel 630 under macOS 26.7.1), and the bundle makes them under their rules.
+void test_apple_textures_past_a_buffers_allocation_answer_nil()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(0x800000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	RgfxRegionSlabSource slabSource(region, fx.ser);
+	RgfxSlabs slabs(slabSource);
+	@autoreleasepool {
+		id apple = [RgfxAppleLinearDevice new]; // held: a buffer keeps its device weakly
+		id x86 = [RgfxTailDevice new];          // no Apple family, a linear alignment of 16
+		std::vector<uint8_t> memory(0x10000, 0);
+		NSMutableArray *kept = [NSMutableArray array]; // kept, so no destroy posts between
+		auto over = [&](NSUInteger length, id device) {
+			RgfxBuffer *b = [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+			                                                regionOffset:0x10000
+			                                                      length:length
+			                                                     options:MTLResourceStorageModeShared
+			                                                 deallocator:nil
+			                                                      device:(id<MTLDevice>)device
+			                                                  serializer:&fx.ser];
+			CHECK(b != nil);
+			if (b != nil)
+				[kept addObject:b];
+			drainRing(fx.ring);
+			return b;
+		};
+		auto texels = [](NSUInteger width) {
+			return [MTLTextureDescriptor
+			    textureBufferDescriptorWithPixelFormat:MTLPixelFormatR8Uint
+			                                     width:width
+			                           resourceOptions:MTLResourceStorageModeShared
+			                                     usage:MTLTextureUsageShaderRead];
+		};
+		auto rows = [](NSUInteger height, NSUInteger slices) {
+			MTLTextureDescriptor *d =
+			    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Uint
+			                                                       width:64
+			                                                      height:height
+			                                                   mipmapped:NO];
+			if (slices > 1) {
+				d.textureType = MTLTextureType2DArray;
+				d.arrayLength = slices;
+			}
+			d.storageMode = MTLStorageModeShared;
+			d.usage = MTLTextureUsageShaderRead;
+			return d;
+		};
+		// What a form answers over `b`: made, posting its create, or nil, posting nothing.
+		auto answers = [&](id<MTLBuffer> b, MTLTextureDescriptor *d, NSUInteger offset,
+		                   NSUInteger pitch, bool linear, bool made) {
+			id<MTLTexture> t =
+			    linear ? [(id<RgfxMetalBufferInternals>)b newLinearTextureWithDescriptor:d
+			                                                                      offset:offset
+			                                                                 bytesPerRow:pitch
+			                                                               bytesPerImage:0]
+			           : [b newTextureWithDescriptor:d offset:offset bytesPerRow:pitch];
+			if (t != nil)
+				[kept addObject:t];
+			CHECK((t != nil) == made);
+			if (t != nil)
+				CHECK(!ringEmpty(fx.ring));
+			drainRing(fx.ring);
+		};
+		for (id device : @[ apple, x86 ]) {
+			const bool x = device == x86;
+			// Over 4096 bytes: a texture buffer ending at 128 KiB is made, with 4096 bytes a row
+			// more too; one ending a byte past it is nil.
+			answers(over(4096, device), texels(131072), 0, 131072, false, true);
+			answers(over(4096, device), texels(131072), 0, 131072 + 4096, false, true);
+			answers(over(4096, device), texels(131073), 0, 131073, false, x);
+			// A 2D texture of 512 rows 256 bytes apart, ending at 128 KiB, is made, and of 513
+			// nil; one of 256 rows 512 bytes apart from 256, its last texel at 128 KiB and its last
+			// row's end 256 bytes past, is made. By the linear SPI alike.
+			for (const bool linear : {false, true}) {
+				answers(over(4096, device), rows(512, 1), 0, 256, linear, true);
+				answers(over(4096, device), rows(513, 1), 0, 256, linear, x);
+				answers(over(4096, device), rows(256, 1), 256, 512, linear, true);
+			}
+			// The linear SPI's 2D array of two slices, rows 512 bytes apart from 256: of 127 rows,
+			// its slices ending at 130304, made; of 128, its last texel at 128 KiB and its slices'
+			// end 256 bytes past it, nil. Over 16384 bytes, of 16 rows, its last texel at the
+			// length and its slices' end past it, nil too.
+			answers(over(4096, device), rows(127, 2), 256, 512, true, true);
+			answers(over(4096, device), rows(128, 2), 256, 512, true, x);
+			answers(over(16384, device), rows(16, 2), 256, 512, true, x);
+		}
+		// A no-copy buffer of 4096 bytes from 0x3000 into a 16 KiB page: a texture buffer ending
+		// 16 KiB from the buffer's start, the one page its bytes meet, is made, and a byte past it
+		// nil; one of 4097 bytes meets two pages, 32 KiB.
+		uint8_t *app = static_cast<uint8_t *>(aligned_alloc(0x4000, 0x10000));
+		CHECK(app != nullptr);
+		std::memset(app, 0, 0x10000);
+		for (const NSUInteger length : {NSUInteger{4096}, NSUInteger{4097}}) {
+			RgfxBuffer *noCopy = [RgfxBuffer bufferWithBytesNoCopy:app + 0x3000
+			                                                length:length
+			                                               options:MTLResourceStorageModeShared
+			                                           deallocator:nil
+			                                                region:&region
+			                                                 slabs:&slabs
+			                                                device:(id<MTLDevice>)apple
+			                                            serializer:&fx.ser];
+			CHECK(noCopy != nil);
+			if (noCopy != nil)
+				[kept addObject:noCopy];
+			drainRing(fx.ring);
+			const NSUInteger end = length == 4096 ? 0x4000 : 0x8000;
+			answers(noCopy, texels(end), 0, end, false, true);
+			answers(noCopy, texels(end + 1), 0, end + 1, false, false);
+		}
+		// A heap's buffer of 100 bytes: a texture buffer ending the heap's 64 KiB past the
+		// buffer's start is made, wherever the buffer lies, and a byte past it nil.
+		MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+		hd.size = 0x10000;
+		hd.storageMode = MTLStorageModeShared;
+		RgfxHeap *heap = [RgfxHeap heapForDeviceWithDescriptor:hd
+		                                             maxLength:0x100000
+		                                                region:&region
+		                                                device:(id<MTLDevice>)apple
+		                                            serializer:&fx.ser];
+		CHECK(heap != nil && heap.size == 0x10000);
+		drainRing(fx.ring);
+		for (int i = 0; i < 2; i++) {
+			id<MTLBuffer> b = [heap newBufferWithLength:100 options:MTLResourceStorageModeShared];
+			CHECK(b != nil);
+			if (b != nil)
+				[kept addObject:b];
+			drainRing(fx.ring);
+			answers(b, texels(0x10000), 0, 0x10000, false, true);
+			answers(b, texels(0x10001), 0, 0x10001, false, false);
+		}
+		CHECK(ringEmpty(fx.ring));
+		[kept removeAllObjects];
+		drainRing(fx.ring);
+		free(app);
 	}
 	drainRing(fx.ring);
 }
@@ -20618,6 +20777,7 @@ int main(int argc, char **argv)
 		test_compressed_buffer_textures_answer_nil();
 		test_buffer_texture_buffers();
 		test_textures_past_a_buffers_allocation_answer_nil();
+		test_apple_textures_past_a_buffers_allocation_answer_nil();
 		test_buffer_texture_copies_past_the_length_reach_the_tail();
 		test_invalid_texture_descriptors_end_the_process();
 		test_texture_descriptor_validation_as_the_x86_macs();
