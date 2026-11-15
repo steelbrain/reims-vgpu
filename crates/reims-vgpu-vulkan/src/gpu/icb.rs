@@ -3757,6 +3757,12 @@ mod tests {
     /// the device again and again, each time once every sender finished a round more. Each
     /// read-back, and each command at the end, holds the round last sent it.
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "m2v: a recovery resets an indirect command buffer's records on Windows, \
+                  which lays them in pooled memory alone (m3-max-33234, m3-max-33248; \
+                  ledger: Windows ICB records lost at a recovery)"
+    )]
     fn a_recovery_while_a_command_is_sent_in_one_call_loses_no_set() {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         const SENDERS: u64 = 4;
@@ -3863,6 +3869,12 @@ mod tests {
     /// are nil at offsets of its own (a nil buffer's address is its offset). A device of its own,
     /// as a recovery moves every user of the device.
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "m2v: a recovery resets an indirect command buffer's records on Windows, \
+                  which lays them in pooled memory alone (m3-max-33234, m3-max-33248; \
+                  ledger: Windows ICB records lost at a recovery)"
+    )]
     fn a_recovery_under_the_default_resets_every_command_where_an_import_taxes_submissions() {
         const COMMANDS: u64 = 64;
         let d = crate::gpu::device::tests::device_of_options(crate::platform::device_options());
