@@ -36,6 +36,7 @@
 //! Every public method runs as an entry ([`crate::entry`]).
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -606,6 +607,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 decoders: decoder.decoders(),
                 device: gpu_device,
                 presents,
+                queue_sinks: RwLock::default(),
                 presented,
                 color: Mutex::default(),
                 pool,
@@ -713,6 +715,22 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
     #[cfg(any(test, feature = "testkit"))]
     pub fn graphics_queue_count(&self) -> usize {
         self.device.queue_count()
+    }
+
+    /// By queue id, where the completion sink its command buffers are begun with lies
+    /// (`GraphicsControl::queue_sinks`): the tests check a queue's buffers share one.
+    #[cfg(test)]
+    pub(crate) fn queue_completion_sinks(&self) -> Vec<(u64, usize)> {
+        let sinks = self.control.queue_sinks.read();
+        let at = |sinks: &Sinks| {
+            sinks
+                .completion
+                .as_ref()
+                .map(|c| Arc::as_ptr(c).cast::<()>())
+        };
+        (sinks.iter())
+            .map(|(&queue, (_, s))| (queue, at(s).map_or(0, |p| p as usize)))
+            .collect()
     }
 
     /// The region's size: BAR 2's, a power of two.
@@ -863,6 +881,10 @@ struct GraphicsControl<P: ApiPlatform> {
     presented: Arc<Presented<P>>,
     /// The presents waiting for the command buffers that write their surfaces.
     presents: Arc<PresentQueue<P>>,
+    /// By queue id: the sinks a command queue's buffers are begun with, and the poster they were
+    /// made for ([`Self::queue_sinks`]). An entry goes with its queue's destroy, its context's
+    /// close or the device's reset.
+    queue_sinks: RwLock<HashMap<u64, (CompletionPoster, Sinks)>>,
     /// The display colour's `DISPLAY_COLOR` parts staged since the last present, which the next
     /// one takes (`color`): on the presents' lane, in ring order with the presents.
     color: Mutex<ColorStaging>,
@@ -1323,6 +1345,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             let (dropped, closed) = decoder.close_tables(&self.device, context);
             self.pool.context_closed(context);
             self.presents.context_gone(context);
+            self.queue_sinks
+                .write()
+                .retain(|&queue, _| decode::context_of(queue) != context);
             let drain = decoder.drain_context(
                 context,
                 true,
@@ -1359,6 +1384,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     self.pool.context_closed(context);
                 }
                 self.presents.reset();
+                self.queue_sinks.write().clear();
                 self.color.lock().reset();
                 self.decoders.reset_done();
                 (contexts, dropped)
@@ -1657,8 +1683,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 if r#type == RGFX_CMD_OBJECT_DESTROY {
                     let (_, _, obj_id) = message_identity(message);
                     self.pending.cancel(obj_id);
-                    // A queue's destroy: nothing more of it finishes for a present to wait for.
+                    // A queue's destroy: nothing more of it finishes for a present to wait for,
+                    // and no more of its buffers is begun.
                     self.presents.queue_gone(obj_id);
+                    self.queue_sinks.write().remove(&obj_id);
                 }
                 let foreign = foreign_queue(poster, message);
                 // An ICB_WRITE's records and an ICB_SLOTS's slots run on the control ring, ahead
@@ -1757,6 +1785,29 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         }
     }
 
+    /// [`Self::sinks`] of a command queue's `poster`, for a buffer begun on the queue's service
+    /// thread ([`Self::begin_command_buffer`]): made at the queue's first buffer, and shared by
+    /// each buffer after it whose poster posts as theirs does ([`CompletionPoster::posts_as`]).
+    /// What sinks post depends on their poster and the presents alone, so shared ones post what
+    /// new ones would. Made at each begin, they cost the begin five closures and six posters
+    /// (measured: 0.30 us of a buffer's 14.9 us from its take to its begin on an Iris Xe's queue
+    /// thread, in Geekbench 7's Super Resolution), and its lane their release after the walk.
+    fn queue_sinks(&self, poster: &CompletionPoster) -> Sinks {
+        let Some(queue) = poster.queue_obj_id() else {
+            return self.sinks(poster);
+        };
+        if let Some((made_for, sinks)) = self.queue_sinks.read().get(&queue)
+            && made_for.posts_as(poster)
+        {
+            return sinks.clone();
+        }
+        let sinks = self.sinks(poster);
+        self.queue_sinks
+            .write()
+            .insert(queue, (poster.clone(), sinks.clone()));
+        sinks
+    }
+
     /// Logs a stage-3 `message` the decoder did not carry out (`outcome`), and posts its command
     /// buffer's failure onto its ring through `poster` where no stand-in (`stood_in`) posts it.
     fn report(
@@ -1824,8 +1875,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             if poster.stale() {
                 return;
             }
-            let mut decoder =
-                (self.decoders).sender(Some(sender_context(poster, &message)), self.sinks(poster));
+            let sinks = self.queue_sinks(poster);
+            let mut decoder = (self.decoders).sender(Some(sender_context(poster, &message)), sinks);
             let to_lane = self.goes_to_lane(&message);
             let queue = poster.queue_obj_id();
             let begun = refusing(|| decoder.begin_taken(&self.device, &message, queue, to_lane));

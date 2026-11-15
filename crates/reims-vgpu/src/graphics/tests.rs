@@ -1515,6 +1515,75 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
     assert!(gone, "the queue's destroy never ended it");
 }
 
+/// A queue's command buffers are begun with the sinks made at its first, which post each one's
+/// records onto the queue's own ring, in its order, as sinks made for each would: no begin after
+/// the first makes them. They go with the queue's destroy.
+#[test]
+fn a_queue_s_buffers_share_the_sinks_its_first_was_begun_with() {
+    let platform = Arc::new(FakePlatform::new());
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks::default(),
+        window: None,
+        memory_map: None,
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+    };
+    let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    let (context, mut guest) = (3, Guest::new(&device));
+    let queue = obj(context, 1);
+    assert_eq!(
+        create_queue(
+            &device,
+            &mut guest,
+            context,
+            1,
+            (SUBMIT_OFF, COMPLETE_OFF),
+            RING_DATA,
+            1
+        ),
+        RGFX_STATUS_OK
+    );
+    let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
+    let mut completed = |ring: &mut QueueRing, cb: u64| {
+        ring.send(&device, command_buffer(queue, cb));
+        eventually(|| {
+            platform.world().complete_all(CompleteOn::Caller);
+            ring.has_event()
+        });
+        let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+        assert_eq!(
+            (done.header.r#type, done.cb_obj_id),
+            (RGFX_EVT_CB_COMPLETE, cb)
+        );
+        assert_eq!(done.status, RGFX_CB_OK);
+        done.header.seqno
+    };
+    let first = completed(&mut ring, 100);
+    let sinks = device.queue_completion_sinks();
+    assert_eq!(sinks.len(), 1);
+    assert_eq!(sinks[0].0, queue);
+    assert_ne!(sinks[0].1, 0, "the queue's sinks post its completions");
+    let second = completed(&mut ring, 101);
+    let third = completed(&mut ring, 102);
+    assert_eq!(
+        device.queue_completion_sinks(),
+        sinks,
+        "a later begin made sinks of its own"
+    );
+    // Each buffer's scheduled record came ahead of its completion, on the queue's ring.
+    assert_eq!(ring.scheduled, [(first, 100), (second, 101), (third, 102)]);
+
+    guest.send(&device, object_destroy(queue));
+    let gone = eventually(|| {
+        device.graphics_queue_count() == 0 && device.queue_completion_sinks().is_empty()
+    });
+    assert!(gone, "the queue's sinks outlived its destroy");
+}
+
 /// A command buffer too large for its queue's ring, whose whole message lies in a block of its
 /// process's (`COMMAND_BUFFER_IN_REGION`), is copied out of the block once, by the queue's service
 /// thread, and walked and committed from that copy on its lane: no thread makes a second copy of

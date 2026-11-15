@@ -714,7 +714,7 @@ pub(crate) struct SurfacePresent<P: Platform> {
 }
 
 /// The context an object id lies in.
-fn context_of(obj_id: u64) -> u32 {
+pub(crate) fn context_of(obj_id: u64) -> u32 {
     (obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32
 }
 

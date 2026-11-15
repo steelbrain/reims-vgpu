@@ -1565,6 +1565,17 @@ impl CompletionPoster {
         self.queue.as_ref().map(|(_, obj_id)| *obj_id)
     }
 
+    /// Whether `other` posts as this does: onto the same ring of the same device, for work begun
+    /// at the same reset count. What either posts, and whether it is dropped, is then the same.
+    pub fn posts_as(&self, other: &CompletionPoster) -> bool {
+        let same_queue = match (&self.queue, &other.queue) {
+            (None, None) => true,
+            (Some((a, a_id)), Some((b, b_id))) => a_id == b_id && Weak::ptr_eq(a, b),
+            _ => false,
+        };
+        same_queue && self.epoch == other.epoch && Weak::ptr_eq(&self.shared, &other.shared)
+    }
+
     /// The highest `seqno` the guest has published on the submission ring of the queue this posts
     /// for, of a message the host has taken or of one it has yet to take: no command buffer of a
     /// greater seqno is on the ring. `None` for the control ring's poster, or where the device or
