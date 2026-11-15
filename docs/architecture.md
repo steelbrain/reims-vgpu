@@ -653,6 +653,7 @@ include/reims_vgpu.h                   the committed header
 lib/libreims_vgpu.a                    the staticlib
 lib/libreims_vgpu.dylib                the cdylib, on macOS: @rpath/libreims_vgpu.dylib, signed ad hoc
 lib/libreims_vgpu.so                   the cdylib, on Linux
+lib/libreims_vgpu.dll                  on Windows, linked from the archive: exports the C API alone
 lib/pkgconfig/reims-vgpu.pc            the package
 share/doc/reims-vgpu/                  the license: LICENSE and LICENSES/, as in the repository
 ```
@@ -675,6 +676,17 @@ On macOS the archive bundles SDL3 too (the window crate's `macos-sdl` feature), 
 the same way: one object (`ld -r -exported_symbols_list`) whose only globals are the C API's
 functions. SDL's Objective-C classes are registered by name whatever their symbols, so the build
 renames them through defines in the C flags SDL's CMake build takes (`xtask/src/dist/macos.rs`).
+
+On Windows `dist` runs in MSYS2's CLANG64 environment and builds for `x86_64-pc-windows-gnullvm`,
+the MinGW target whose archive QEMU's Windows build links (qemu.md, "Windows hosts"), and writes
+`Libs.private` as rustc prints it. COFF has no relocatable link that keeps the objects' COMDAT
+sections (lld makes none, and GNU `ld -r` leaves symbols lld refuses), so the archive's objects stay
+as built and `llvm-objcopy --redefine-syms` gives every global they define but the C API's functions
+the suffix `.rvg` (`SDL_Init.rvg`), with its `__imp_` name: a host's own SDL, or any C name, never
+binds to them, and `dist` fails where the objects define another global. rustc's raw-dylib import
+members, named after their DLL, stay as they were. The shared library is linked from the archive
+with a module-definition file that exports the C API's functions alone. No import library is
+installed, so `-lreims_vgpu` and meson's static lookup take the archive (`xtask/src/dist/windows.rs`).
 
 ### 11.4 The option ROM
 

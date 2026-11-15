@@ -19,6 +19,9 @@
 
 use std::path::{Path, PathBuf};
 
+use super::archive::{
+    LOCALIZED, api_functions, check_globals, defined_globals, native_static_libs, nm_args,
+};
 use super::{LIB, Options, c_api_args, install, layout, pc_file, strs, strs_with, write};
 use crate::tools::Tools;
 use crate::util::Res;
@@ -59,26 +62,6 @@ pub fn static_libs_args(o: &Options) -> Vec<String> {
     args
 }
 
-/// `Libs.private` from rustc's `native-static-libs: ...` note in `cargo`'s output, in rustc's
-/// order. A note that names none is refused: the archive always needs the C library.
-pub fn native_static_libs(cargo: &str) -> Res<Vec<String>> {
-    const NOTE: &str = "native-static-libs: ";
-    let Some(at) = cargo.find(NOTE) else {
-        return Err(format!(
-            "rustc printed no native-static-libs note:\n{}",
-            cargo.lines().rev().take(20).collect::<Vec<_>>().join("\n")
-        ));
-    };
-    let rest = &cargo[at + NOTE.len()..];
-    // The note ends its JSON string (`"`), or its line, before an escape (`\n`).
-    let end = rest.find(['"', '\\', '\n']).unwrap_or(rest.len());
-    let libs: Vec<String> = rest[..end].split_whitespace().map(str::to_owned).collect();
-    if libs.is_empty() {
-        return Err("rustc's native-static-libs note names no library".to_owned());
-    }
-    Ok(libs)
-}
-
 /// Builds and writes the tree with `tools`; `header` is the committed header. Returns the output
 /// directory.
 pub fn dist(tools: &mut dyn Tools, o: &Options, target_dir: &Path, header: &Path) -> Res<PathBuf> {
@@ -102,18 +85,11 @@ pub fn dist(tools: &mut dyn Tools, o: &Options, target_dir: &Path, header: &Path
     Ok(o.out.clone())
 }
 
-/// The directory under the target dir the archive is localized in ([`localize`]).
-const LOCALIZED: &str = "dist-localized";
-
-/// The prefix of every symbol the archive keeps global: the C API's functions.
-const API_PREFIX: &str = "rvg_";
-
 /// Writes `archive`, the archive installed, from `built`, Cargo's, in `work` (module doc): its
 /// members linked into one object, every global symbol but the C API's made local, archived
 /// alone in `work` with zero dates (`ar`'s `D`), and installed with mode 0644, so the same build
 /// gives the same bytes and leaves the installed archive as it was. Fails where the object
-/// defines no `rvg_` function, or where the archive written still defines another global
-/// ([`check_globals`]).
+/// defines no `rvg_` function, or where the archive written still defines another global.
 fn localize(tools: &mut dyn Tools, built: &Path, work: &Path, archive: &Path) -> Res<()> {
     std::fs::create_dir_all(work).map_err(|e| format!("{}: {e}", work.display()))?;
     let object = work.join(format!("{LIB}.o"));
@@ -121,16 +97,7 @@ fn localize(tools: &mut dyn Tools, built: &Path, work: &Path, archive: &Path) ->
     link.push(built.to_string_lossy().into_owned());
     link.extend(strs_with(&["-o"], &object));
     tools.run("ld", &link)?;
-    let api: Vec<String> = defined_globals(&tools.output("nm", &nm_args(&object))?)
-        .into_iter()
-        .filter(|name| name.starts_with(API_PREFIX))
-        .collect();
-    if api.is_empty() {
-        return Err(format!(
-            "{} defines no {API_PREFIX} function: nothing would stay global",
-            object.display()
-        ));
-    }
+    let api = api_functions(&tools.output("nm", &nm_args(&object))?, &object)?;
     let keep = work.join("keep-global-symbols");
     write(&keep, &(api.join("\n") + "\n"))?;
     let mut strip = vec![format!("--keep-global-symbols={}", keep.display())];
@@ -145,64 +112,19 @@ fn localize(tools: &mut dyn Tools, built: &Path, work: &Path, archive: &Path) ->
     pack.push(object.to_string_lossy().into_owned());
     tools.run("ar", &pack)?;
     install(&packed, archive, 0o644)?;
-    check_globals(&tools.output("nm", &nm_args(archive))?, archive)
-}
-
-/// `nm`'s arguments that list the global symbols `file` defines, one a line, in POSIX's format:
-/// the name, then its type.
-fn nm_args(file: &Path) -> Vec<String> {
-    strs_with(&["-g", "--defined-only", "-P"], file)
-}
-
-/// The names in `nm -g --defined-only -P`'s output, in its order: each line of a name and a
-/// one-letter type, past the lines that name an archive's member.
-fn defined_globals(nm: &str) -> Vec<String> {
-    nm.lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let name = fields.next()?;
-            let kind = fields.next()?;
-            (kind.len() == 1).then(|| name.to_owned())
-        })
-        .collect()
-}
-
-/// Fails where `nm`, the archive's globals, names any not of the C API, naming the first few.
-fn check_globals(nm: &str, archive: &Path) -> Res<()> {
-    let others: Vec<String> = defined_globals(nm)
-        .into_iter()
-        .filter(|name| !name.starts_with(API_PREFIX))
-        .collect();
-    if others.is_empty() {
-        return Ok(());
-    }
-    Err(format!(
-        "{} defines {} global symbols besides the C API's, such as {}: a host's own copies would \
-         clash with them",
-        archive.display(),
-        others.len(),
-        others
-            .iter()
-            .take(8)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ")
-    ))
+    check_globals(
+        archive,
+        defined_globals(&tools.output("nm", &nm_args(archive))?),
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::archive::tests::CARGO;
     use super::super::parse_args;
     use super::super::testing::{LONG_AGO, Log, age, mode, mtime, put, tmp};
     use super::*;
     use crate::tools::Profile;
-
-    /// What `cargo rustc --message-format json -- --print native-static-libs` prints: the note,
-    /// once as its message and once rendered, among the other messages.
-    const CARGO: &str = r#"{"reason":"compiler-artifact","package_id":"path+file:///r/crates/reims-vgpu-vulkan#0.1.0","filenames":["/t/release/deps/libreims_vgpu_vulkan.rlib"],"fresh":true}
-{"reason":"compiler-message","package_id":"path+file:///r/crates/reims-vgpu-c#0.1.0","message":{"rendered":"note: Link against the following native artifacts when linking against this static library. The order and any duplication can be significant on some platforms.\n\n","children":[],"level":"note","message":"Link against the following native artifacts when linking against this static library. The order and any duplication can be significant on some platforms.","spans":[]}}
-{"reason":"compiler-message","package_id":"path+file:///r/crates/reims-vgpu-c#0.1.0","message":{"rendered":"note: native-static-libs: -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc\n\n","children":[],"level":"note","message":"native-static-libs: -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc","spans":[]}}
-{"reason":"build-finished","success":true}"#;
 
     fn options(args: &[&str], target: &Path) -> Options {
         parse_args(&strs(args), target).unwrap()
@@ -231,35 +153,6 @@ mod tests {
             "rustc --profile dev -p reims-vgpu-c --lib \
              --crate-type staticlib --message-format json -- --print native-static-libs"
         );
-    }
-
-    #[test]
-    fn native_static_libs_reads_the_note_in_order() {
-        assert_eq!(
-            native_static_libs(CARGO).unwrap(),
-            strs(&[
-                "-lgcc_s",
-                "-lutil",
-                "-lrt",
-                "-lpthread",
-                "-lm",
-                "-ldl",
-                "-lc"
-            ])
-        );
-        // rustc's own text, as a terminal shows it.
-        assert_eq!(
-            native_static_libs("note: native-static-libs: -lgcc_s -lc\n\nwarning: x").unwrap(),
-            strs(&["-lgcc_s", "-lc"])
-        );
-    }
-
-    #[test]
-    fn native_static_libs_refuses_no_note_and_an_empty_one() {
-        let e = native_static_libs(r#"{"reason":"build-finished","success":true}"#).unwrap_err();
-        assert!(e.contains("no native-static-libs note"), "{e}");
-        let e = native_static_libs(r#"{"message":"native-static-libs: "}"#).unwrap_err();
-        assert!(e.contains("names no library"), "{e}");
     }
 
     #[test]
@@ -435,15 +328,5 @@ mod tests {
             tools.log.lines()
         );
         std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    /// nm's POSIX lines give their names, past an archive's member lines
-    #[test]
-    fn defined_globals_reads_nms_names() {
-        assert_eq!(
-            defined_globals(LOCALIZED_ARCHIVE),
-            strs(&["rvg_graphics_device_create", "rvg_status_message"])
-        );
-        assert_eq!(defined_globals(""), Vec::<String>::new());
     }
 }

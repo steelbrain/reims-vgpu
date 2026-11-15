@@ -777,6 +777,19 @@ and whpx. Without a `reims-vgpu.pc` on its `PKG_CONFIG_PATH`, configure finds
 no library ("Run-time dependency reims-vgpu found: NO") and leaves
 `reims-graphics-pci` out.
 
+The library builds there too: `cargo xtask dist`, run in CLANG64 with
+Rust's `x86_64-pc-windows-gnullvm` target, writes the dist tree
+([architecture.md](architecture.md) 11.3), and configure takes it as on
+Linux, with `PKG_CONFIG_PATH=<target>/dist-vulkan/lib/pkgconfig` and
+`--enable-reims-vgpu`. meson's static lookup links `libreims_vgpu.a` by its
+path, and the binary imports no DLL of the library. **Measured** on the
+mini (2026-11-15): the library's release build took 14 min 47 s from an
+empty target (`m3-max-32508`); renaming the archive's globals and linking
+the DLL then took 30 s, and a dist of the same build again 12 s, leaving
+the tree's files as they were (`m3-max-32649`). configure took 113 s with
+the library and `ninja -j12 qemu-system-x86_64.exe` 293 s, beside SDL
+2.32.10's DLL (`m3-max-32660`).
+
 - **CPUID leaf 4.** WHPX takes from QEMU's CPU model only the CPUID leaves
   in its exit list, and Hyper-V answers the rest. Before `cc128f0e` the list
   had no leaf 4, so the guest saw no cache levels: macOS counted 0 CPUs

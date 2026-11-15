@@ -11,10 +11,6 @@ pub struct Profile(pub String);
 
 impl Profile {
     /// The directory under the target dir the profile writes to (`dev` writes to `debug`).
-    #[cfg_attr(
-        all(windows, not(test)),
-        expect(dead_code, reason = "used by the Unix dists alone")
-    )]
     pub fn dir(&self) -> &str {
         match self.0.as_str() {
             "dev" | "test" => "debug",
@@ -28,7 +24,6 @@ impl Profile {
 /// the calls instead.
 pub trait Tools {
     /// Runs `program` with `args`, failing on a non-zero exit.
-    #[cfg_attr(windows, expect(dead_code, reason = "used by the Unix dists alone"))]
     fn run(&mut self, program: &str, args: &[String]) -> Res<()>;
     /// Runs `program` with `args` and returns its trimmed stdout.
     fn output(&mut self, program: &str, args: &[String]) -> Res<String>;

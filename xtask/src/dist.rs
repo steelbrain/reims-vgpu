@@ -3,9 +3,9 @@
 //! `<target>/dist-vulkan/` ([`DEFAULT_OUT`]) unless `--out` names another directory:
 //!
 //! - `lib/libreims_vgpu.a`, and the shared library beside it, built from `reims-vgpu-c`, the
-//!   crate of the C API: `lib/libreims_vgpu.dylib` on macOS, `lib/libreims_vgpu.so` on Linux.
-//!   How each OS builds and names them is its own module's: `macos`, `linux`. On Windows
-//!   (`windows`) no tree is made yet, and `dist` refuses.
+//!   crate of the C API: `lib/libreims_vgpu.dylib` on macOS, `lib/libreims_vgpu.so` on Linux,
+//!   `lib/libreims_vgpu.dll` on Windows. How each OS builds and names them is its own module's:
+//!   `macos`, `linux`, `windows`.
 //! - `include/reims_vgpu.h`, the committed header.
 //! - `lib/pkgconfig/reims-vgpu.pc`. Its `Libs.private` names every library a static link of the
 //!   archive needs.
@@ -25,6 +25,8 @@ use std::path::{Path, PathBuf};
 use crate::tools::{Profile, System, target_dir};
 use crate::util::{Res, repo_root};
 
+#[cfg(any(target_os = "linux", windows))]
+mod archive;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -38,7 +40,7 @@ use macos as native;
 #[cfg(windows)]
 use windows as native;
 
-/// The library's name: `lib/libreims_vgpu.{a,dylib,so}`, linked with `-lreims_vgpu`.
+/// The library's name: `lib/libreims_vgpu.{a,dylib,so,dll}`, linked with `-lreims_vgpu`.
 pub const LIB: &str = "reims_vgpu";
 /// The pkg-config package: `lib/pkgconfig/reims-vgpu.pc`, and `share/reims-vgpu`.
 pub const PACKAGE: &str = "reims-vgpu";
@@ -100,7 +102,6 @@ pub fn parse_args(args: &[String], target_dir: &Path) -> Res<Options> {
 
 /// The Cargo arguments every OS's build of the library starts its own with, after the
 /// subcommand: `reims-vgpu-c`'s libraries in the profile.
-#[cfg_attr(windows, expect(dead_code, reason = "used by the Unix dists alone"))]
 pub fn c_api_args(o: &Options) -> Vec<String> {
     strs(&[
         "--profile",
@@ -113,10 +114,6 @@ pub fn c_api_args(o: &Options) -> Vec<String> {
 
 /// `reims-vgpu.pc`. Its prefix is the file's grandparent directory (`${pcfiledir}`), so the tree
 /// can be moved.
-#[cfg_attr(
-    all(windows, not(test)),
-    expect(dead_code, reason = "used by the Unix dists alone")
-)]
 pub fn pc_file(version: &str, libs_private: &[String]) -> String {
     format!(
         "# Written by `cargo xtask dist`.\n\
@@ -196,15 +193,10 @@ pub fn cmd_dist(args: &[String]) -> Res<bool> {
     Ok(true)
 }
 
-#[cfg_attr(
-    all(windows, not(test)),
-    expect(dead_code, reason = "used by the Unix dists alone")
-)]
 fn strs(args: &[&str]) -> Vec<String> {
     args.iter().map(|s| (*s).to_owned()).collect()
 }
 
-#[cfg_attr(windows, expect(dead_code, reason = "used by the Unix dists alone"))]
 fn strs_with(args: &[&str], p: &Path) -> Vec<String> {
     let mut v = strs(args);
     v.push(p.to_string_lossy().into_owned());
@@ -219,7 +211,6 @@ fn mkdir_parent(p: &Path) -> Res<()> {
 }
 
 /// Writes `content` to `p` with mode 0644 ([`replace_if_changed`]).
-#[cfg_attr(windows, expect(dead_code, reason = "used by the Unix dists alone"))]
 fn write(p: &Path, content: &str) -> Res<()> {
     replace_if_changed(p, content.as_bytes(), 0o644).map(drop)
 }
@@ -276,7 +267,6 @@ mod testing {
     pub struct Log {
         pub calls: Vec<(String, Vec<String>)>,
         pub answer: String,
-        #[cfg_attr(windows, expect(dead_code, reason = "used by the Unix dists alone"))]
         pub fail: Option<&'static str>,
     }
 

@@ -253,7 +253,8 @@ target/dist-vulkan/
   include/reims_vgpu.h                   the committed header
   lib/libreims_vgpu.a                    the staticlib
   lib/libreims_vgpu.so                   the cdylib (on a Mac libreims_vgpu.dylib,
-                                         @rpath/libreims_vgpu.dylib, signed ad hoc)
+                                         @rpath/libreims_vgpu.dylib, signed ad hoc; on
+                                         Windows libreims_vgpu.dll, linked from the archive)
   lib/pkgconfig/reims-vgpu.pc            the package
   share/doc/reims-vgpu/                  the license: LICENSE and LICENSES/, as in the repository
 ```
