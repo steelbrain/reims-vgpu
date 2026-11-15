@@ -41,11 +41,16 @@ libc.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 
-# On Windows the OS services are this crate's own (`os/windows.rs`), as they are ported: the
-# clocks, threads, and the walk threads' scheduling hint.
+# On Windows the OS services are this crate's own (`os/windows.rs`): threads, clocks, and the
+# views of guest pages over pagefile-backed sections, with the exception handler that holds a
+# thread across a view's remap.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_Memory",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",

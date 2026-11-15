@@ -13,7 +13,7 @@
 //! its loader, and fetching an image's drawable ahead where the driver needs it
 //! (`Drawables`: MoltenVK's, on macOS).
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 mod files;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -27,6 +27,8 @@ mod wsi;
 use linux as host_os;
 #[cfg(target_os = "macos")]
 use macos as host_os;
+#[cfg(windows)]
+use windows as host_os;
 
 use std::sync::Arc;
 
@@ -87,10 +89,15 @@ pub use wsi::{add_window_extensions, present_fences};
 
 /// A file of the host's that memory is a shared mapping of, as the library holds it: an open
 /// descriptor on Linux and macOS.
+#[cfg(unix)]
 pub type HostFile = std::os::fd::OwnedFd;
+/// A file of the host's that memory is a shared mapping of, as the library holds it: a handle of
+/// a section on Windows (`CreateFileMappingW`), whose views the memory is.
+#[cfg(windows)]
+pub type HostFile = std::os::windows::io::OwnedHandle;
 
 /// One range of the guest's RAM as the host maps it, and the file behind it: `length` bytes at
-/// `host`, a shared mapping (`MAP_SHARED`) of `file` from byte `offset`. A device's lease of the
+/// `host`, a shared mapping (`MAP_SHARED`; a view on Windows) of `file` from byte `offset`. A device's lease of the
 /// guest's RAM ([`lease_guest_memory`]) is made of these.
 #[derive(Clone, Debug)]
 pub struct GuestRamFile {

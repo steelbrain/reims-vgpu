@@ -1,7 +1,10 @@
 //! The process's backing table: which file, from which offset, each byte of the memory the
 //! library may make a view of shows, so that a view is made by mapping files and never by
-//! remapping addresses, which Linux has no call for (Mach's `mach_vm_remap`). The OS's VM maps
-//! what it records: Linux's (`super::linux`'s `vm`) with `mmap` of memfds.
+//! remapping addresses, which Linux and Windows have no call for (Mach's `mach_vm_remap`). The
+//! OS's VM maps what it records: Linux's (`super::linux`'s `vm`) with `mmap` of memfds, and
+//! Windows's (`super::windows`'s `vm`) with views of pagefile-backed sections, a file here being
+//! the OS's ([`HostFile`]). The counts of the kernel's mappings and the runs mapped through
+//! dma-bufs are Linux's alone.
 //!
 //! Two kinds of entry:
 //! - **Registrations** of memory the library does not map itself: the guest's RAM, a shared
@@ -77,6 +80,7 @@ pub(crate) struct Through {
 
 impl Through {
     /// A number for a mapping of a new dma-buf, unique in the process.
+    #[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
     pub(crate) fn new_buf() -> u64 {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -138,6 +142,7 @@ fn joined(a_first: u64, a: &Run, b_first: u64, b: &Run) -> bool {
 
 impl Table {
     /// The kernel's mappings the runs take (module docs).
+    #[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
     fn mappings(&self) -> usize {
         self.runs.len() - self.joins
     }
@@ -178,6 +183,7 @@ impl Table {
 
     /// Where the byte at `offset` of the file `fd` lies in a range of the guest's RAM a lease
     /// registered: its host address there, and the bytes from it to the range's end.
+    #[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
     fn ram_at(&self, file: &Arc<HostFile>, offset: u64) -> Option<(u64, u64)> {
         (self.registered.iter())
             .filter(|r| r.ram > 0 && Arc::ptr_eq(&r.backing.file, file))
@@ -442,6 +448,7 @@ const READ_WRITE: VmProt = VmProt(VmProt::READ.raw() | VmProt::WRITE.raw());
 
 /// The kernel's mappings the table's runs take (module docs): every view the library made and
 /// every range a view can be made of.
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
 pub(crate) fn mappings() -> u64 {
     TABLE.lock().mappings().to_u64()
 }
@@ -449,6 +456,7 @@ pub(crate) fn mappings() -> u64 {
 /// The kernel's mappings the table's runs in `first..end` take, as [`mappings`] counts them:
 /// what a fold of them would free (`super::linux`'s `vm::fold_idle`), and in tests a range's
 /// count to set beside the kernel's.
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
 pub(crate) fn mappings_between(first: u64, end: u64) -> u64 {
     let table = TABLE.lock();
     let mut count = 0u64;
@@ -465,6 +473,7 @@ pub(crate) fn mappings_between(first: u64, end: u64) -> u64 {
 /// The spans of the table's runs mapped from their files, in order, each of such runs that follow
 /// one another in the address space with none through a dma-buf between: what a fold may map
 /// through dma-bufs instead (`super::linux`'s `vm::fold_idle`).
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
 pub(crate) fn file_spans() -> Vec<std::ops::Range<u64>> {
     let table = TABLE.lock();
     let mut spans: Vec<std::ops::Range<u64>> = Vec::new();
@@ -561,6 +570,7 @@ pub(crate) fn record_pieces(target: u64, pieces: Vec<Piece>) {
 
 /// As [`record_pieces`], for pieces mapped through dma-bufs, each where its [`Through`] says
 /// (module docs).
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
 pub(crate) fn record_through(target: u64, pieces: Vec<(Piece, Through)>) {
     let mut table = TABLE.lock();
     for (piece, through) in pieces {
@@ -572,6 +582,7 @@ pub(crate) fn record_through(target: u64, pieces: Vec<(Piece, Through)>) {
 
 /// The runs in `first..end` mapped through a dma-buf, cut to it, in order, as pieces from
 /// `first`: what an import's unfold maps from their files (`super::linux`'s `vm::unfold`).
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
 pub(crate) fn through_pieces(first: u64, end: u64) -> Vec<Piece> {
     let table = TABLE.lock();
     let from = table.run_at(first).map_or(first, |(at, _)| at);
@@ -709,6 +720,7 @@ impl Registration {
 /// library's own), shows nothing, or is mapped without
 /// write permission: a device pins imported pages for writing, so read-only memory keeps the
 /// imports it has (`super::linux`'s `import` module docs).
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
 pub(crate) fn guest_ram_runs(first: u64, length: u64) -> Option<Vec<(u64, u64)>> {
     let end = first.checked_add(length)?;
     let table = TABLE.lock();
@@ -765,7 +777,8 @@ impl Drop for Registration {
 pub(crate) mod tests {
     use super::*;
 
-    /// A file for the tests' backings.
+    /// A file for the tests' backings: a memfd.
+    #[cfg(target_os = "linux")]
     pub(crate) fn file() -> Arc<HostFile> {
         let name = c"rvg-files-test";
         // SAFETY: a NUL-terminated name; the descriptor is owned from here on.
@@ -773,6 +786,12 @@ pub(crate) mod tests {
         assert!(fd >= 0);
         // SAFETY: a descriptor this test just made, owned once.
         Arc::new(unsafe { <HostFile as std::os::fd::FromRawFd>::from_raw_fd(fd) })
+    }
+
+    /// A file for the tests' backings: a section of a page.
+    #[cfg(windows)]
+    pub(crate) fn file() -> Arc<HostFile> {
+        super::super::windows::section(0x1000).unwrap()
     }
 
     /// The pieces' (offset in the range, length, file offset).
@@ -1407,6 +1426,7 @@ pub(crate) mod tests {
     /// time (Linux's `vm`'s `deallocate`). Each step's user-space instructions and cycles a page,
     /// the median of the views, are printed.
     #[test]
+    #[cfg(target_os = "linux")]
     #[ignore = "a measurement: run it by name"]
     fn a_scattered_views_life_costs() {
         let env = |name: &str, default: u64| {

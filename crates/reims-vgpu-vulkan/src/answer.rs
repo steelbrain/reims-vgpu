@@ -2631,17 +2631,18 @@ pub fn relay_gap(sel: &'static str, e: &Error, descriptor: Option<&str>) -> bool
 }
 
 /// How many times this process answered a call as when memory runs out (`out_of_host_memory`,
-/// on Linux).
+/// on Linux and Windows).
 static OUT_OF_HOST_MEMORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A map, a file or memory that this platform's host refused at `call` for want of mappings
-/// (`vm.max_map_count`), of open files or of memory, where Metal's call needs none: in strict
+/// (Linux's `vm.max_map_count`), of open files, of memory or of commit charge (Windows's), where
+/// Metal's call needs none: in strict
 /// mode the process ends there, naming `detail`, as it did before; by default the caller answers
 /// as Metal's call does when memory runs out (`KERN_NO_SPACE`, no memory, a nil object), and the
 /// answer is counted ([`out_of_host_memory_count`], [`degradation_counts`]) and logged at the
 /// first, and at each power of two, at debug after the first (`core::logging`'s once per kind).
 /// `detail` is asked only for a line.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn out_of_host_memory(call: &'static str, detail: impl FnOnce() -> String) {
     use std::sync::atomic::Ordering;
     if strict() {
@@ -2665,7 +2666,7 @@ pub(crate) fn out_of_host_memory(call: &'static str, detail: impl FnOnce() -> St
 }
 
 /// How many times this process answered a call as when memory runs out (`out_of_host_memory`,
-/// on Linux; none on macOS).
+/// on Linux and Windows; none on macOS).
 pub fn out_of_host_memory_count() -> u64 {
     OUT_OF_HOST_MEMORY.load(std::sync::atomic::Ordering::Relaxed)
 }
