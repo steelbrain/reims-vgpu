@@ -41,9 +41,9 @@ mod tests {
 
     /// The user's cache directory is `reims-vgpu` in the user's local application data folder,
     /// the folder Windows names in the process's `LOCALAPPDATA` (a path is the same in any case),
-    /// and none of it under `HOME`, which MSYS2's shell sets and a process started outside it
-    /// lacks; the library's stores lie in it under the names they have under `~/.cache` on Linux
-    /// and macOS
+    /// and the library's stores lie in it under the names they have under `~/.cache` on Linux and
+    /// macOS. A process with no `HOME` finds the same directory
+    /// (`crate::platform`'s `a_translation_one_process_keeps_is_the_next_process_s`)
     #[test]
     fn the_cache_directory_is_reims_vgpu_in_the_local_application_data_folder() {
         let dir = cache_directory().expect("a local application data folder");
@@ -51,9 +51,6 @@ mod tests {
         let lower = |path: &std::path::Path| path.to_string_lossy().to_lowercase();
         assert_eq!(lower(&dir), lower(&folder.join("reims-vgpu")));
         assert_eq!(crate::os::user_cache_directory(), Some(dir.clone()));
-        if let Some(home) = std::env::var_os("HOME") {
-            assert!(!dir.starts_with(&home), "{} under HOME", dir.display());
-        }
         assert_eq!(
             crate::platform::cache_directory(),
             Some(dir.join("reims-vgpu-vulkan-tests"))
