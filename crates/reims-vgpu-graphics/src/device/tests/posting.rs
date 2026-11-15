@@ -131,7 +131,10 @@ fn a_full_queue_ring_tells_its_spell_and_its_waited_posts() {
     // One more waits for room, on a thread of its own: the spell is told, no waited post yet.
     let waiting = {
         let poster = poster.clone();
-        std::thread::spawn(move || poster.post(&record(HOLDS)))
+        std::thread::Builder::new()
+            .name("waiting-poster".into())
+            .spawn(move || poster.post(&record(HOLDS)))
+            .unwrap()
     };
     assert!(
         eventually(|| !host.degraded().is_empty()),
@@ -161,7 +164,10 @@ fn a_full_queue_ring_tells_its_spell_and_its_waited_posts() {
     );
     let waiting = {
         let poster = poster.clone();
-        std::thread::spawn(move || poster.post(&record(cb)))
+        std::thread::Builder::new()
+            .name("waiting-poster".into())
+            .spawn(move || poster.post(&record(cb)))
+            .unwrap()
     };
     assert!(
         eventually(|| host.degraded().len() == 3),
