@@ -64,9 +64,12 @@
  * pages is slower: 46 us for a 7296 KiB tile holding some. Every mapping lay in one of IOKit's
  * pageable maps, in one region, and every count counted; no page was compressed or paged out in
  * these runs. The longest counts, 1-9 ms, 0.2% of them, waited mostly in the mapping's making:
- * on 26.7.2 the longest, 9.1 ms, was for a 4 KiB surface. Under the contexts' lock, which every
- * process's block allocations, surface asks and releases, and context opens and closes take, such
- * a count held all of them that long: an ask counts out of it (RgfxAcceleratorContexts.cpp,
+ * on 26.7.2 the longest, 9.1 ms, was for a 4 KiB surface. A later cold boot of 26.7.2 on a Radeon
+ * 780M (Hawk Point) Linux host, its counts' times summed and their longest kept, met one of 81.8 ms
+ * before the desktop settled, the longest of its 4649 counts over the boot, Safari's scroll and
+ * Mission Control, 8 of which took 1 ms or more. Under the contexts' lock, which every process's
+ * block allocations, surface asks and releases, and context opens and closes take, such a count
+ * held all of them that long: an ask counts out of it (RgfxAcceleratorContexts.cpp,
  * acquireSurfaceBlock).
  *
  * Our own code; it names SDK-public IOKit calls and IOSurface's interface (RgfxIOSurfaceKPI.hpp).
@@ -815,8 +818,8 @@ RgfxSurfacePageCounts rgfxSurfaceLocksPageCounts(OSObject *surface)
 bool rgfxSurfaceLocksFresh(OSObject *surface, UInt64 length, uint64_t listed)
 {
 	// Called out of the contexts' lock (acquireSurfaceBlock), whose holder would hold every
-	// process's block allocations and surface asks for the count's mapping, which waited up to
-	// 9.1 ms (above). It takes no lock of the kext's: IOSurface's getters here load a field and
+	// process's block allocations and surface asks for the count, which took up to 81.8 ms
+	// (above). It takes no lock of the kext's: IOSurface's getters here load a field and
 	// take no lock (read from IOSurface's x86_64 code in macOS 26.6's KDK), and the count maps and
 	// walks the surface's memory through IOKit and the VM, never IOSurface.
 	const uint32_t seed = rgfxIOSurfaceLockSeed(surface);

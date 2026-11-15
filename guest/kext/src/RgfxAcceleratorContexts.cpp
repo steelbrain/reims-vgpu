@@ -1856,7 +1856,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		asker.object = rgfxSurfaceLocksLookup(this, task, surfaceId);
 	// Whether the asker's surface reads fresh (rgfxSurfaceLocksFresh), counted out of the contexts'
 	// lock, which every process's block allocations, surface asks and releases take: a count makes
-	// a mapping of the surface's memory, which waited up to 9.1 ms (RgfxAcceleratorLocks.cpp). The
+	// a mapping of the surface's memory and took up to 81.8 ms (RgfxAcceleratorLocks.cpp). The
 	// ask counts where a deferral is otherwise its, then takes the lock again and looks again;
 	// where it waits under the lock after the count, it counts again.
 	bool fresh = false, counted = false;
