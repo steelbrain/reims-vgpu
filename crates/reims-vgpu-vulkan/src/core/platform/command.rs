@@ -36,8 +36,8 @@ pub enum PartCut {
 /// Why a command buffer may not be cut into parts, but for how Metal's GPU fails it from an
 /// encoder on ([`PartCut::Fails`]), as the Vulkan platform keeps it whole ([`PartCut::Whole`];
 /// `gpu/command.rs`'s `CommandBufferObject::splits`): each set by the commands named, so a
-/// caller that walks a buffer in two ranges at once takes none whose commands set one
-/// (`reims-vgpu`'s `decode/cmdbuf.rs`, `two_ranges`, whose tests pin the two lists together).
+/// caller that walks a buffer's chunks on two threads at once takes none whose commands set one
+/// (`reims-vgpu`'s `decode/cmdbuf.rs`, `deal`, whose tests pin the two lists together).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeptWhole {
     /// An encoder is open.
@@ -319,9 +319,9 @@ pub trait CommandBuffer<P: Platform>: Handle {
         Ok(None)
     }
     /// The platform's own, no Metal call: a command buffer of the same queue, made now and not
-    /// committed, for the caller to encode a later range of this one's work into on another
-    /// thread while it encodes the rest of this one's, and to commit as its last part once this
-    /// one is committed as a part ([`Self::commit_part`]). `None` where this one may not be cut
+    /// committed, for the caller to encode a later range of this one's work into, on this thread
+    /// or another while this one's is encoded, and to commit after this one is committed as a
+    /// part ([`Self::commit_part`]), as a part itself or as the last. `None` where this one may not be cut
     /// now ([`Self::split`]'s refusals). Its make waits as `split`'s does; the caller leaves
     /// room.
     fn part(&self, on: OnFault) -> RaiseResult<Option<P::CommandBuffer>>;
@@ -334,8 +334,8 @@ pub trait CommandBuffer<P: Platform>: Handle {
     /// whole), and [`PartCut::Whole`] with its reason otherwise ([`KeptWhole`]).
     fn commit_part(&self, on: OnFault) -> RaiseResult<PartCut>;
     /// The platform's own, no Metal call: this command buffer, which fails from one of its
-    /// encoders on ([`PartCut::Fails`]), takes in what `later`, the command buffer [`Self::part`]
-    /// made for its later range and encoded, noted of how Metal's GPU fails it, as though its
+    /// encoders on ([`PartCut::Fails`]), takes in what `later`, a command buffer [`Self::part`]
+    /// made for a later range and encoded, noted of how Metal's GPU fails it, as though its
     /// encoders had been this one's, after this one's own; `later` is let go of uncommitted. Its
     /// encoders run nothing in either: they follow the one this fails from.
     fn fold(&self, later: P::CommandBuffer);

@@ -110,10 +110,10 @@ repeats the ones code cites.
     driver's message id names, and the reims-graphics device's completion
     rings' (`control-ring-full`, `control-ring-post-waited`,
     `vblank-dropped`, `queue-ring-full`, `queue-ring-post-waited`) and its
-    decoder's (`two-ranges-kept-whole`, a command buffer walked in two
-    ranges that the platform kept whole at the first range's end, which
-    fails at its stand-in); a boot's degradations are read from its last
-    such line. `reims-vgpu INFO reims_vgpu_vulkan::core::logging: lines
+    decoder's (`two-ranges-kept-whole`, a command buffer dealt to two
+    threads that the platform kept whole at a chunk's end, which fails at
+    its stand-in); a boot's degradations are read from its last such
+    line. `reims-vgpu INFO reims_vgpu_vulkan::core::logging: lines
     repeated since the last count: <n> more of <file>:<line>[ [<kind>]]
     (<target>: <the first line's message>); …` is how many lines of each
     kind the logger wrote at debug since its last such line.

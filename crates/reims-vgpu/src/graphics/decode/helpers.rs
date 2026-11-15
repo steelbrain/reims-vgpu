@@ -1,18 +1,22 @@
-//! The threads that walk a command buffer's later range beside the lane thread that walks the
-//! rest of it ([`super::split`], "Two ranges at once").
+//! The threads that walk chunks of a command buffer beside the lane thread that walks the rest
+//! of it ([`super::split`], "Two threads at once").
 //!
-//! - **Hands.** A walk hands its later range over as it starts ([`Helpers::hand`]): an idle
-//!   helper is woken for it, else one is started, up to [`HELPERS_MOST`] across the device. A
-//!   range no helper has started when the walk of the rest ends is taken back
-//!   ([`Hand::take_back`]) and walked there, as a buffer walked whole is: so a walk never waits
-//!   for a helper to come free, and one with none spare is walked as it was.
+//! - **Hands.** A walk hands its helper's chunks over as it starts, all at once
+//!   ([`Helpers::hand`]): an idle helper is woken for them, else one is started, up to
+//!   [`HELPERS_MOST`] across the device. Chunks no helper has started when the lane's thread first
+//!   needs one are taken back ([`Hand::take_back`]) and walked there, as a buffer walked whole is:
+//!   so a walk never waits for a helper to come free, and one with none spare is walked as it was.
+//! - **Chunks.** A helper publishes each chunk as it has walked it, to the chunk's slot
+//!   ([`Slots`]); the lane's thread takes them in the buffer's order, waiting for one only where
+//!   it is next to commit and not yet walked ([`Slots::wait_for`]), and may ask the helper to start
+//!   no chunk from one on ([`Slots::stop_at`]).
 //! - **Threads.** Each helper gives itself the walk hints as it starts, as a lane's thread does
 //!   ([`super::lane`]), takes the hands in the order they came, and goes once it has had none for
 //!   [`KEEP`], 10 s. A helper is no lane's thread: what a lane counts and starts, and every
 //!   turn, ticket and commit, is as it was. A helper walks and commits nothing; the lane's
 //!   thread commits what it walked, in the buffer's order.
-//! - **Entries.** A helper's walk is part of the entry of the lane's job that handed it over,
-//!   which waits for it, so it runs with no step of the exit gate of its own
+//! - **Entries.** A helper's walk of its chunks is part of the entry of the lane's job that handed
+//!   them over, which waits for it, so it runs with no step of the exit gate of its own
 //!   ([`crate::entry::run_within`]): one begun once the process's exit began would park the
 //!   helper for good, and the job and the exit with it.
 
@@ -24,11 +28,11 @@ use reims_vgpu_graphics::keep::KEEP;
 use reims_vgpu_vulkan::core::platform::os::Threads;
 use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
 
-/// The most helpers the device runs at once: each walks one buffer's later range, so as many
-/// buffers walk two ranges at once, the rest of them walked as before.
+/// The most helpers the device runs at once: each walks one buffer's chunks, so as many buffers
+/// are walked on two threads at once, the rest of them walked as before.
 pub(crate) const HELPERS_MOST: usize = 4;
 
-/// A range's walk, for a helper.
+/// A walk of a buffer's chunks, for a helper.
 pub(crate) type Job = Box<dyn FnOnce() + Send>;
 
 /// The device's helpers (the module doc).
@@ -53,8 +57,8 @@ struct State {
     idle: usize,
 }
 
-/// A range handed to the helpers: waiting for one, walked by one, or done (walked, or taken
-/// back).
+/// A buffer's chunks handed to the helpers: waiting for one, walked by one, or done (walked, or
+/// taken back).
 pub(crate) struct Hand {
     state: Mutex<HandState>,
     done: Condvar,
@@ -109,8 +113,8 @@ impl Helpers {
             self.state.lock().threads -= 1;
             log::warn!(
                 target: "reims_vgpu::graphics",
-                "no helper thread could be started: a command buffer's later range is walked with \
-                 the rest"
+                "no helper thread could be started: a command buffer's chunks are walked on one \
+                 thread"
             );
         }
         hand
@@ -169,6 +173,89 @@ impl Helpers {
             "every helper took a hand"
         );
         HeldAll { gate, hands }
+    }
+}
+
+/// The slots of a buffer's chunks a helper walks ([`Helpers::hand`]), one for each chunk of the
+/// buffer, each filled at most once, by the helper, and taken at most once, by the lane's thread,
+/// in the buffer's order: with the chunk the lane's thread asked the helper to start none from
+/// on, and whether the helper's walk ended.
+pub(crate) struct Slots<T> {
+    state: Mutex<SlotsState<T>>,
+    filled: Condvar,
+}
+
+struct SlotsState<T> {
+    items: Vec<Option<T>>,
+    /// The helper starts no chunk from this one on ([`Slots::stop_at`]).
+    stop_at: usize,
+    /// The helper's walk ended: no slot is filled from now on.
+    ended: bool,
+}
+
+/// The end of a helper's walk of its chunks, which ends it as it drops ([`Slots::ending`]).
+pub(crate) struct Ending<T>(Arc<Slots<T>>);
+
+impl<T> Drop for Ending<T> {
+    fn drop(&mut self) {
+        self.0.state.lock().ended = true;
+        self.0.filled.notify_all();
+    }
+}
+
+impl<T> Slots<T> {
+    /// The slots of a buffer of `n` chunks, none filled.
+    pub(crate) fn new(n: usize) -> Arc<Slots<T>> {
+        Arc::new(Slots {
+            state: Mutex::new(SlotsState {
+                items: (0..n).map(|_| None).collect(),
+                stop_at: n,
+                ended: false,
+            }),
+            filled: Condvar::new(),
+        })
+    }
+
+    /// The helper's walk, until the answer drops: its end, however the walk ends, lets a wait
+    /// for a slot it left empty go ([`Self::wait_for`]).
+    pub(crate) fn ending(self: &Arc<Self>) -> Ending<T> {
+        Ending(Arc::clone(self))
+    }
+
+    /// Fills chunk `at`'s slot with `item`, the helper's walk of it.
+    pub(crate) fn fill(&self, at: usize, item: T) {
+        self.state.lock().items[at] = Some(item);
+        self.filled.notify_all();
+    }
+
+    /// Whether the helper may start chunk `at`: the lane's thread asked it to start none from an
+    /// earlier one or from it on ([`Self::stop_at`]).
+    pub(crate) fn starts(&self, at: usize) -> bool {
+        at < self.state.lock().stop_at
+    }
+
+    /// Asks the helper to start no chunk from `at` on: those before it it still walks.
+    pub(crate) fn stop_at(&self, at: usize) {
+        let mut state = self.state.lock();
+        state.stop_at = state.stop_at.min(at);
+    }
+
+    /// Chunk `at`'s walk, taken, once the helper filled its slot, waiting with no lock of the
+    /// caller's held; and whether it waited. `None` where the helper's walk ended leaving it
+    /// empty.
+    pub(crate) fn wait_for(&self, at: usize) -> (Option<T>, bool) {
+        let mut state = self.state.lock();
+        let mut waited = false;
+        loop {
+            if let Some(item) = state.items[at].take() {
+                return (Some(item), waited);
+            }
+            if state.ended {
+                return (None, waited);
+            }
+            waited = true;
+            self.filled.wait(&mut state);
+        }
     }
 }
 
@@ -285,5 +372,39 @@ mod tests {
             crate::graphics::tests::eventually(|| helpers.threads() == 0),
             "idle helpers go"
         );
+    }
+
+    /// A chunk's slot is taken once it is filled, whichever comes first, waiting only where it is
+    /// empty; one the helper's walk ended leaving empty answers none; and the helper starts no
+    /// chunk from the first one it was asked to stop at on.
+    #[test]
+    fn a_chunk_s_slot_is_taken_once_filled_or_answers_none_once_the_walk_ended() {
+        let slots = Slots::<u32>::new(4);
+        slots.fill(0, 10);
+        assert_eq!(
+            slots.wait_for(0),
+            (Some(10), false),
+            "filled first: no wait"
+        );
+        assert!(slots.starts(3));
+        slots.stop_at(3);
+        slots.stop_at(4);
+        assert!(
+            slots.starts(2) && !slots.starts(3),
+            "the earliest stop holds"
+        );
+        let filler = Arc::clone(&slots);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let ending = filler.ending();
+                std::thread::sleep(Duration::from_millis(20));
+                filler.fill(1, 11);
+                std::thread::sleep(Duration::from_millis(20));
+                drop(ending);
+            });
+            assert_eq!(slots.wait_for(1).0, Some(11), "waited for its fill");
+            assert_eq!(slots.wait_for(2).0, None, "the walk ended leaving it empty");
+        });
+        assert_eq!(slots.wait_for(1), (None, false), "taken once");
     }
 }

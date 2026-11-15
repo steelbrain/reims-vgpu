@@ -802,8 +802,8 @@ pub(crate) struct Shared<P: Platform> {
     shares: Arc<shares::Shares<P>>,
     /// The budget of the queues' lanes' extra threads ([`lane`]).
     lanes: Arc<lane::Budget>,
-    /// The threads that walk a command buffer's later range beside the rest of its walk
-    /// ([`helpers`], [`split`]'s "Two ranges at once").
+    /// The threads that walk chunks of a command buffer beside the rest of its walk
+    /// ([`helpers`], [`split`]'s "Two threads at once").
     helpers: Arc<helpers::Helpers>,
     /// The listener the command buffers' notifications of the values they signal run on, made at
     /// the first ([`Shared::listener`]).
@@ -817,18 +817,25 @@ pub(crate) struct Shared<P: Platform> {
     /// The parts the walks committed before their buffers' last (for the benches).
     #[cfg(test)]
     parts_cut: std::sync::atomic::AtomicU64,
-    /// The tests' own least op bytes of a command buffer walked in two ranges at once, where one
-    /// is set ([`GraphicsDecoder::ranges_min_bytes`]).
+    /// The tests' own least op bytes of a command buffer dealt to two threads at once, where one
+    /// is set ([`GraphicsDecoder::deal_min_bytes`]).
     #[cfg(test)]
-    ranges_min_bytes: Mutex<Option<usize>>,
-    /// A walk in two ranges waits for a helper to start its later range before it walks its
-    /// first (for the tests: [`GraphicsDecoder::set_helper_first`]).
+    deal_min_bytes: Mutex<Option<usize>>,
+    /// The tests' own least op bytes of a chunk dealt to a thread, where one is set
+    /// ([`GraphicsDecoder::deal_chunk_bytes`]).
+    #[cfg(test)]
+    deal_chunk_bytes: Mutex<Option<usize>>,
+    /// A walk dealt to two threads waits for a helper to start its chunks before it walks its
+    /// own (for the tests: [`GraphicsDecoder::set_helper_first`]).
     #[cfg(test)]
     helper_first: AtomicBool,
-    /// The command buffers' walks begun, each once a buffer, whatever ranges it is walked in
-    /// (for the tests).
+    /// The command buffers' walks begun, each once a buffer, however many threads walk it (for
+    /// the tests).
     #[cfg(test)]
     walks_begun: std::sync::atomic::AtomicU64,
+    /// The helpers' chunks a dealt walk waited for at their commit (for the tests).
+    #[cfg(test)]
+    deal_waits: std::sync::atomic::AtomicU64,
     /// The device's BAR 2 region: the host memory the over-host-memory buffers
     /// and heaps are placed over. Held so it stays mapped while the decoder's
     /// objects live; declared last so the contexts drop before it (a buffer
@@ -1067,11 +1074,15 @@ impl<P: Platform> GraphicsDecoder<P> {
             #[cfg(test)]
             parts_cut: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
-            ranges_min_bytes: Mutex::new(None),
+            deal_min_bytes: Mutex::new(None),
+            #[cfg(test)]
+            deal_chunk_bytes: Mutex::new(None),
             #[cfg(test)]
             helper_first: AtomicBool::new(false),
             #[cfg(test)]
             walks_begun: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            deal_waits: std::sync::atomic::AtomicU64::new(0),
             region,
         });
         GraphicsDecoder::on(shared, None, Sinks::default())
@@ -1105,8 +1116,8 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
     }
 
-    /// A handle on this decoder's state for a range of its message's command buffer walked on
-    /// another thread beside the rest ([`split`], "Two ranges at once"): of the message's context,
+    /// A handle on this decoder's state for chunks of its message's command buffer walked on
+    /// another thread beside the rest ([`split`], "Two threads at once"): of the message's context,
     /// its records going to the message's sinks, and its views twins of the message's
     /// ([`View::twin`]), so it names what the message names; with nothing else of the message's
     /// (no turn, ticket or mark: it commits nothing).
@@ -2611,29 +2622,51 @@ impl<P: Platform> GraphicsDecoder<P> {
         split::SPLIT_AFTER
     }
 
-    /// Has the walks take a command buffer of `bytes` of ops at least in two ranges at once
-    /// ([`Self::ranges_min_bytes`]), or of [`cmdbuf::RANGES_MIN_BYTES`] where `None` (for the
-    /// tests).
+    /// Has the walks deal a command buffer of `bytes` of ops at least to two threads at once
+    /// ([`Self::deal_min_bytes`]), or of [`cmdbuf::DEAL_MIN_BYTES`] where `None` (for the tests).
     #[cfg(test)]
-    pub(crate) fn set_ranges_min_bytes(&self, bytes: Option<usize>) {
-        *self.shared.ranges_min_bytes.lock() = bytes;
+    pub(crate) fn set_deal_min_bytes(&self, bytes: Option<usize>) {
+        *self.shared.deal_min_bytes.lock() = bytes;
     }
 
-    /// The least op bytes of a command buffer walked in two ranges at once
-    /// ([`cmdbuf::RANGES_MIN_BYTES`]; the tests may set their own).
-    pub(crate) fn ranges_min_bytes(&self) -> usize {
+    /// The least op bytes of a command buffer dealt to two threads at once
+    /// ([`cmdbuf::DEAL_MIN_BYTES`]; the tests may set their own).
+    pub(crate) fn deal_min_bytes(&self) -> usize {
         #[cfg(test)]
-        if let Some(bytes) = *self.shared.ranges_min_bytes.lock() {
+        if let Some(bytes) = *self.shared.deal_min_bytes.lock() {
             return bytes;
         }
-        cmdbuf::RANGES_MIN_BYTES
+        cmdbuf::DEAL_MIN_BYTES
     }
 
-    /// Has a walk in two ranges wait for a helper to start its later range before it walks its
-    /// first, so the ranges are walked at once however fast the first is (for the tests).
+    /// Has the walks deal chunks of `bytes` of ops at least ([`Self::deal_chunk_bytes`]), or of
+    /// [`cmdbuf::DEAL_CHUNK_BYTES`] where `None` (for the tests).
+    #[cfg(test)]
+    pub(crate) fn set_deal_chunk_bytes(&self, bytes: Option<usize>) {
+        *self.shared.deal_chunk_bytes.lock() = bytes;
+    }
+
+    /// The least op bytes of a chunk dealt to a thread ([`cmdbuf::DEAL_CHUNK_BYTES`]; the tests
+    /// may set their own).
+    pub(crate) fn deal_chunk_bytes(&self) -> usize {
+        #[cfg(test)]
+        if let Some(bytes) = *self.shared.deal_chunk_bytes.lock() {
+            return bytes;
+        }
+        cmdbuf::DEAL_CHUNK_BYTES
+    }
+
+    /// Has a walk dealt to two threads wait for a helper to start its chunks before it walks its
+    /// own, so the chunks are walked at once however fast this thread's are (for the tests).
     #[cfg(test)]
     pub(crate) fn set_helper_first(&self, first: bool) {
         self.shared.helper_first.store(first, Ordering::Relaxed);
+    }
+
+    /// The helpers' chunks the dealt walks waited for at their commit so far (for the tests).
+    #[cfg(test)]
+    pub(crate) fn deal_waits(&self) -> u64 {
+        (self.shared.deal_waits).load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The command buffers' walks begun so far, once a buffer (for the tests).

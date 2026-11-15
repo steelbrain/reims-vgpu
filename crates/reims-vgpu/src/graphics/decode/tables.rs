@@ -631,8 +631,8 @@ impl<P: Platform> View<P> {
     }
 
     /// A view of the same table at this one's clock, with what this one found and the message's
-    /// own changes it holds: it names what this one names, for a range of the message's command
-    /// buffer walked on another thread beside the rest ([`super::split`], "Two ranges at once").
+    /// own changes it holds: it names what this one names, for chunks of the message's command
+    /// buffer walked on another thread beside the rest ([`super::split`], "Two threads at once").
     /// The entries it keeps are let go of once both have closed, as any open view's are.
     pub(crate) fn twin(&self) -> Self {
         {

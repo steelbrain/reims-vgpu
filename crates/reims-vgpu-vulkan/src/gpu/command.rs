@@ -37,7 +37,7 @@
 //!   buffer it never committed. Only invalid input reaches that.
 //!
 //!   A later range of a buffer's work may be encoded at once, on another thread
-//!   (`decode/split.rs`, "Two ranges at once"): `part` makes the command buffer it goes into on
+//!   (`decode/split.rs`, "Two threads at once"): `part` makes the command buffer it goes into on
 //!   the queue, uncommitted, where the buffer may be cut then, and at the end of the range before
 //!   it `commit_part` commits the buffer as a part where it may be cut, as `split` does, the later
 //!   one going on from it. Where only a way Metal's GPU fails it from an encoder on keeps it whole

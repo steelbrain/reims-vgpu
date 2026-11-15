@@ -105,40 +105,50 @@
 //! `Held`), and whose queue holds room for another command buffer, so the platform's make of the
 //! next part waits for none.
 //!
-//! **Two ranges at once.** A walk in parts still runs on one thread, and the runtime's lowering
+//! **Two threads at once.** A walk in parts still runs on one thread, and the runtime's lowering
 //! is most of it: WindowServer's frame in Launchpad's open view, one command buffer of about 107
 //! render passes, took a walk of 14.9 ms at the median, 91% of it in the runtime's calls, so its
 //! present was answered two refreshes on (an RTX 3090 host, every driver listed, metal2vulkan
 //! pin 92; m3-max-30753, measured). So a buffer that may be cut, of
-//! [`RANGES_MIN_BYTES`](super::cmdbuf::RANGES_MIN_BYTES) of ops and
-//! [`RANGES_MIN_ENCODERS`](super::cmdbuf::RANGES_MIN_ENCODERS) at least, all of them render and
+//! [`DEAL_MIN_BYTES`](super::cmdbuf::DEAL_MIN_BYTES) of ops and
+//! [`DEAL_MIN_ENCODERS`](super::cmdbuf::DEAL_MIN_ENCODERS) at least, all of them render and
 //! blit encoders that hold no event, rate map, indirect command buffer or residency of
-//! resources (`cmdbuf.rs`'s `two_ranges`), is cut at the encoder end nearest half its bytes into
-//! two ranges, walked at once: the platform makes the later range's command buffer on the
-//! buffer's queue as the walk starts (`CommandBuffer::part`), a helper thread
-//! ([`super::helpers`]) walks the later range into it on a handle whose view of the context's
-//! table is a twin of the buffer's (`View::twin`), so it names what the buffer names, and the
-//! lane's thread walks the first range, in parts as above. At the first range's end its last part
-//! is committed as a part (`CommandBuffer::commit_part`), once the later range is walked and every
-//! wait of the buffer's commit is met, and the later range's command buffer is the buffer's last
-//! part. The runtime takes command buffers of one queue encoded on several threads at once and
-//! committed in order from one (metal2vulkan's answer, 11-14).
+//! resources (`cmdbuf.rs`'s `deal`), is cut at encoder ends into chunks of
+//! [`DEAL_CHUNK_BYTES`](super::cmdbuf::DEAL_CHUNK_BYTES) of ops or more, dealt in turn to the
+//! lane's thread, the even ones, and a helper thread ([`super::helpers`]), the odd ones, handed
+//! over at once as the walk starts. Each chunk goes into a command buffer of its own on the
+//! buffer's queue, which the platform makes before any chunk is walked (`CommandBuffer::part`),
+//! each while the queue holds room, as a cut's make does, so no make waits on the queue's room
+//! while parts of the buffer wait uncommitted (where the room runs out first, the buffer is
+//! walked as a whole is); the first chunk goes into the buffer's own;
+//! the helper walks its chunks on a handle whose view of the context's table is a twin of the
+//! buffer's (`View::twin`), so it names what the buffer names. After each of its own chunks the
+//! lane's thread commits every chunk walked, in their order, each but the last as a part
+//! (`CommandBuffer::commit_part`), waiting for the helper only for the chunk it is to commit
+//! next, so the GPU runs each part while the rest is walked: a split into two ranges walked at
+//! once, the later range's work reaching the GPU only at their join, took the walk's end from
+//! 14.8 to 8.2 ms but left the later range's GPU work, 3.7 ms, after it (m3-max-31216 against
+//! m3-max-31226). A part goes where the whole buffer could be committed then, as a cut does; at
+//! the walk's end, once every wait of the buffer's commit is met. The last chunk's command buffer
+//! is the buffer's last part. The runtime takes command buffers of one queue encoded on several
+//! threads at once and committed in order from one (metal2vulkan's answer, 11-14).
 //!
 //! What stays as it was is what a walk in parts keeps (above): the parts run in their order on
 //! the queue, their outcome is all of theirs, the last part carries the buffer's handlers,
 //! records and tickets, and the context's gate is held from its first part's commit to its last.
-//! Neither range signals or waits for an event, so no value goes to the guest from a helper. A
-//! walk that faults or stops in either range answers as the first range's walk would, the first
-//! range's first, nothing of the later range committed: as a whole walk that faults there after
-//! its parts. Where the first range's last part fails from one of its encoders on (a draw of
-//! primitive type 9, a store into read-only memory), the platform keeps it whole and folds the
-//! later range's command buffer into it (`CommandBuffer::fold`): every encoder after the failing
-//! one runs nothing, in it as in a whole buffer, and its commit answers as one buffer's. A later
-//! range no helper has started by the first range's end is taken back and walked by the lane's
-//! thread into the buffer's current part, as a walk goes on, so a walk never waits for a helper
-//! to come free. Each op is walked once, on one thread or the other: what a walk does once a
-//! buffer (its names found, its uses of laid-out device caches told at the commit) is done once.
-//! A `cbpar` trace event gives each buffer's ranges and their walks.
+//! No chunk signals or waits for an event, so no value goes to the guest from a helper. A walk
+//! that faults or stops in a chunk answers as the first such chunk in their order does, as a
+//! whole walk that faults there after its parts: the parts committed before it ran, and nothing
+//! at or after it is committed. Where a part fails from one of its encoders on (a draw of
+//! primitive type 9, a store into read-only memory), the platform keeps it whole and every later
+//! chunk's command buffer is folded into it in their order (`CommandBuffer::fold`): every
+//! encoder after the failing one runs nothing, in it as in a whole buffer, and its commit answers
+//! as one buffer's. Chunks no helper has started by the end of the lane's first are taken back
+//! and walked by the lane's thread into the buffer's current part, as a walk goes on, so a walk
+//! never waits for a helper to come free. Each op is walked once, on one thread or the other:
+//! what a walk does once a buffer (its names found, its uses of laid-out device caches told at
+//! the commit, in the chunks' order) is done once. A `cbpar` trace event gives each buffer's
+//! chunks and their walks, and a `cbdeal` event each chunk's.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -238,10 +248,10 @@ impl SplitGate {
 
     /// The gate of `context` for a buffer's parts, once no buffer of the context has parts out
     /// and no commit or range message of it is under way: waits, with no lock of the caller's
-    /// held. Taken by a buffer walked in two ranges at once ("Two ranges at once") whose first
-    /// range could not take it as it ended ([`Self::try_split`]), once every wait of its commit
-    /// is met: a buffer whose parts are out commits its last part, and a commit or range message
-    /// under way ends, waiting for nothing of it.
+    /// held. Taken by a buffer dealt to two threads at once ("Two threads at once") whose parts
+    /// could not take it as they were walked ([`Self::try_split`]), at the walk's end, once every
+    /// wait of its commit is met: a buffer whose parts are out commits its last part, and a
+    /// commit or range message under way ends, waiting for nothing of it.
     pub(crate) fn split(self: &Arc<Self>, context: u32) -> SplitHold {
         let mut contexts = self.contexts.lock();
         loop {
