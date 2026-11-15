@@ -24,15 +24,16 @@
 //!   recorded later, by a host step on the runtime's scheduler once the work before them
 //!   completed, which delays the command buffer's completion: [`commit`] also writes a command
 //!   buffer that completes [`LATE_COMPLETION`] or more after its commit, with the times the
-//!   runtime kept of it. Its GPU times are the host's ([`crate::platform`]'s device options): it
-//!   "began" when its submission ended, or when its queue's command buffer before it "ended",
-//!   where later, and "ended" when the runtime saw it complete.
+//!   runtime kept of it. Its GPU times are its GPU's timestamps on the host's clock
+//!   ([`crate::platform`]'s device options), except on MoltenVK, where the runtime answers them
+//!   from the host's: it "began" when its submission ended, or when its queue's command buffer
+//!   before it "ended", where later, and "ended" when the runtime saw it complete.
 //! - **Every completion**: [`commit`] adds each command buffer's times to a summary of its queue's
 //!   (queues of one label are one), and the first completion [`SUMMARY_SPAN`] or more after the
 //!   summary's first writes a line of each queue, then starts the next: how many completed, and
 //!   the median, 95th percentile and most of each leg from the commit to the handler, in the
 //!   times above. A queue's command buffers do not overlap in them, so its GPU legs' sum is how
-//!   long it held the GPU, its completions' detection included.
+//!   long it held the GPU (on MoltenVK, its completions' detection included).
 //!
 //! **Measured** on the M3 Max (MoltenVK, runtime 60b8cadc9), a render state of the suite's
 //! `tri_vert` and `tri_frag` with one BGRA8 target, then three draws: with an empty shader cache
@@ -396,8 +397,8 @@ const LEGS: [&str; 6] = [
     "commit to submission",
     "submitting",
     "behind the queue",
-    "GPU until seen complete",
-    "seen complete to the handler",
+    "on the GPU",
+    "GPU end to the handler",
     "commit to the handler",
 ];
 
@@ -674,9 +675,9 @@ mod tests {
                  runtime's times",
                 "summary of queue \"b\" over 1.00 s: 2 command buffers completed, 0 without the \
                  runtime's times; ms p50/p95/max of commit to submission 1.00/1.00/1.00, \
-                 submitting 0.50/0.50/0.50, behind the queue 0.50/0.50/0.50, GPU until seen \
-                 complete 4.00/4.00/8.00, seen complete to the handler 0.50/0.50/0.50, commit to \
-                 the handler 6.50/6.50/10.50; GPU legs sum to 12.0 ms",
+                 submitting 0.50/0.50/0.50, behind the queue 0.50/0.50/0.50, on the GPU \
+                 4.00/4.00/8.00, GPU end to the handler 0.50/0.50/0.50, commit to the handler \
+                 6.50/6.50/10.50; GPU legs sum to 12.0 ms",
             ]
         );
         assert!(summary.queues.is_empty());
@@ -693,7 +694,7 @@ mod tests {
     /// Measured on the M3 Max (MoltenVK, a dev build, runtime a62e8a365f), at the median: 278 us
     /// from the commit to the handler through the platform and 269 us through the runtime, of
     /// which the commit to the submission 29 us and 20 us (the platform's submission check, on
-    /// the runtime's scheduler thread) and the GPU until seen complete 221 us and 222 us; the
+    /// the runtime's scheduler thread) and on the GPU (from the host there) 221 us and 222 us; the
     /// commit held its thread 13 us and 10 us; one handler thread woken a command buffer, and
     /// every transition to scheduled run where submitted, either way.
     #[test]

@@ -2093,6 +2093,63 @@ mod tests {
         assert!(plausible(vulkan), "{vulkan:?}");
     }
 
+    /// A command buffer's GPU times are its GPU's own timestamps, placed on the host's clock, on
+    /// a device whose driver's timestamps wait for no other queue's: the runtime announces no
+    /// `GpuTimesFromHost`. Where they wait for every queue's (the runtime's
+    /// `TimestampsWaitForEveryQueue`: MoltenVK on Apple's GPUs) it answers them from the host's
+    /// clock whatever [`crate::platform`]'s device options say, and announces so. Either way they
+    /// lie in the command buffer's life, from before its commit to its completed handler, within
+    /// what a calibration may state of its deviation
+    #[test]
+    fn gpu_times_are_the_gpus_where_its_timestamps_wait_for_no_other_queue() {
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::types::NsRange;
+
+        let d = dev();
+        let q = d.new_command_queue().unwrap();
+        let b = d
+            .new_buffer_of_length(OnFault::Return, 16, 0)
+            .unwrap()
+            .unwrap();
+        let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+        let blit = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+        for cmd in [
+            BlitCmd::FillBuffer {
+                buffer: &b,
+                range: NsRange::new(0, 16),
+                value: 0x5a,
+            },
+            BlitCmd::EndEncoding,
+        ] {
+            blit.encode(OnFault::Return, cmd).unwrap();
+        }
+        let (done, completed) = mpsc::channel();
+        let handler: CompletedHandler = Box::new(move |info| {
+            done.send((info.gpu_times_ns, rt::host_time())).unwrap();
+        });
+        cb.add_completed_handler(OnFault::Return, handler).unwrap();
+        let committed = rt::host_time();
+        cb.commit(OnFault::Return).unwrap();
+        let (times, handled) = completed
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let (start, end) = times.expect("the GPU times of a buffer that ran");
+        let (committed, handled) = CompletedInfo::gpu_times(committed, handled).unwrap();
+        // A calibration states up to about 125 us under full parallel suites (the runtime's
+        // `gpu_time.rs`); a reading further out is placed inside the life.
+        let slack = 5_000_000;
+        assert!(
+            committed.saturating_sub(slack) <= start && end <= handled + slack,
+            "GPU times {start}..{end} outside the life {committed}..{handled}"
+        );
+        let from_host = crate::answer::RELAYED
+            .lock()
+            .contains(&rt::Degradation::GpuTimesFromHost);
+        let waits = (d.raw.properties().description.driver_facts())
+            .contains(&metal2vulkan::device::DriverFact::TimestampsWaitForEveryQueue);
+        assert_eq!(from_host, waits, "{}", d.raw.name());
+    }
+
     /// Metal takes its own allocation for a command buffer's first work for its tiler as it
     /// submits that work (`vaprobe rendersubmit`): behind an event wait, once the wait is met,
     /// not at the commit

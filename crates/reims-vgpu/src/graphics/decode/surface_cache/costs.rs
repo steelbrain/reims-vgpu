@@ -20,12 +20,13 @@
 //!   since its last write, encodes and commits the write's early copy behind it, on the
 //!   decoder's thread (`SurfaceCaches::early_copies`); a case's first write takes none;
 //! - `record+commit`: the download's call, which records the copy and commits it;
-//! - `to submission`: from the call's return to the copy's `GPUStartTime`, the host time the
-//!   runtime called the driver's submission that carried it (the Vulkan platform's GPU times are
-//!   the host's: `reims_vgpu_vulkan::platform`, "GPU times from the host");
-//! - `submit to seen`: from `GPUStartTime` to `GPUEndTime`, the host time the runtime saw the
-//!   copy done: the GPU's run of the copy and what the driver and the runtime take around it,
-//!   whose fixed part the one-page case shows;
+//! - `to GPU start`: from the call's return to the copy's `GPUStartTime`, when the GPU began it
+//!   (the Vulkan platform's GPU times are the GPU's: `reims_vgpu_vulkan::platform`, "GPU times are
+//!   the GPU's"; on MoltenVK the host time the runtime called the driver's submission that
+//!   carried it);
+//! - `GPU start to end`: from `GPUStartTime` to `GPUEndTime`: the GPU's run of the copy (on
+//!   MoltenVK, to the host time the runtime saw the copy done, with what the driver and the
+//!   runtime take around it, whose fixed part the one-page case shows);
 //! - `answer`: from `GPUEndTime` to the answer;
 //! - `lock`: from the call to the answer, which a CPU lock of the surface waits for, past its
 //!   ring's messages.
@@ -400,19 +401,19 @@ fn lines(label: &str, what: &str, bytes: u64, timed: &[Timed]) {
     let lock = pick(&|t| Some(us(t.called, t.answered)));
     let (seen_p50, lock_p50) = (median(seen.clone()), median(lock.clone()));
     eprintln!(
-        "{label}: {what}: {bytes} bytes, n {}: {:.0} MB/s submit to seen, {:.0} MB/s lock",
+        "{label}: {what}: {bytes} bytes, n {}: {:.0} MB/s GPU start to end, {:.0} MB/s lock",
         timed.len(),
         rate(bytes, seen_p50),
         rate(bytes, lock_p50)
     );
     for (step, values) in [
         ("record+commit", commit),
-        ("to submission", submit),
-        ("submit to seen", seen),
+        ("to GPU start", submit),
+        ("GPU start to end", seen),
         ("answer", answer),
         ("lock", lock),
     ] {
-        eprintln!("{label}: {what}:   {step:<15} {}", spread(values));
+        eprintln!("{label}: {what}:   {step:<16} {}", spread(values));
     }
 }
 
@@ -517,7 +518,7 @@ fn measure<P: ApiPlatform>(label: &str) {
             let bytes = case.texels() * burst;
             eprintln!(
                 "{label}: {} burst of {burst}: {:.0} MB/s first call to last answer; \
-                 first call to last answer {}; each copy's submit to seen {}",
+                 first call to last answer {}; each copy's GPU start to end {}",
                 case.name,
                 rate(bytes, median(spans.clone())),
                 spread(spans),

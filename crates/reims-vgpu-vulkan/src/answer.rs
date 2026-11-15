@@ -3026,13 +3026,16 @@ mod tests {
         //   `GPUStartTime`, the end where the completion reached the guest), and debug lines read.
         //   `LooselyCalibratedGpuTimes` places both times by a calibration reading whose stated
         //   deviation stayed above 20 us, the duration between them exact, so the run's length
-        //   is unchanged. `gpu_times_from_host`
-        //   (`crate::platform`'s `device_options`) leaves the first three unreachable, and makes
-        //   the run's length the time from the end of its submission, or the end of its queue's
-        //   run before it, to the runtime's seeing it complete: within Metal's envelope of a
-        //   run's length, which counts from the GPU's start. VM boots relay `GpuTimesFromHost`,
-        //   which the runtime also takes on MoltenVK 1.4.1 whatever the option (its
-        //   `TimestampsWaitForEveryQueue`).
+        //   is unchanged. `UncalibratedGpuTimes` (a device without calibrated timestamps, or a
+        //   calibration that would place the times outside the buffer's life) places the end where
+        //   the runtime saw the buffer complete, the duration exact. `UntimedCommandBuffer` (every
+        //   slot of the device's timestamp pools held, and no pool more) answers no times, which
+        //   the device posts as 0. `GpuTimesFromHost`, which the runtime takes on MoltenVK 1.4.1
+        //   (its `TimestampsWaitForEveryQueue`), and on a queue family that writes no timestamps,
+        //   makes the run's length the time from the end of its submission, or the end of its
+        //   queue's run before it, to the runtime's seeing it complete: within Metal's envelope
+        //   of a run's length, which counts from the GPU's start. `crate::platform`'s
+        //   `device_options` leaves the runtime's default, the GPU's own timestamps.
         // - `UnmeasuredUniqueIdentifier`: the difference dies where it shows. The runtime
         //   announces it where a call answers an identifier it has not measured to be Metal's
         //   number: a state's with indirect command buffer support, which this platform reads as

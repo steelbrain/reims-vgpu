@@ -377,7 +377,7 @@ pub(crate) fn guest_texture_ids() -> Option<std::ops::RangeInclusive<u64>> {
 /// [`SHADER_CACHE_CAPACITY`], each pipeline state's
 /// record kept in the file beside it for later processes' warm passes ([`crate::records`]; none
 /// in a test build), a command buffer's
-/// GPU times answered from the host's clock (`gpu_times_from_host`), the runtime's device policy,
+/// GPU times its GPU's own timestamps (the runtime's default), the runtime's device policy,
 /// its fast native forms but its exact completion and heap textures and those `REIMS_VGPU_EXACT`
 /// names ([`exact_policy`]), and in a strict process ([`crate::answer::strict_process`]) its
 /// exact pipeline wait, under which a state's creation returns only once its predicted pipeline
@@ -398,24 +398,37 @@ pub(crate) fn guest_texture_ids() -> Option<std::ops::RangeInclusive<u64>> {
 /// supplies fails to make its pipeline as Metal's undefined symbols (code 2 of
 /// [`crate::gpu::states`]'s refusals).
 ///
-/// **GPU times from the host.** No command buffer writes GPU timestamps: its `GPUStartTime` is the
-/// host time the first driver submission that carried its work was called (its `kernelEndTime`
-/// where one submission carried it all, as most do; a rate-mapped pass's pieces are submissions
-/// of their own), or its queue's latest GPU end before it, where later, so a queue's command
-/// buffers do not overlap, and its `GPUEndTime` the host time
-/// the runtime saw it complete. On MoltenVK 1.4.1 the runtime answers so whatever the option, as
-/// its timestamps wait for every queue's (the runtime's `TimestampsWaitForEveryQueue`). A
+/// **GPU times are the GPU's.** Every command buffer with work writes two GPU timestamps, at the
+/// top of its work and after its end, which the runtime places on the host's clock by a
+/// calibration it reads as command buffers complete, at most every 100 ms: its `GPUStartTime`
+/// and `GPUEndTime` are when its GPU ran it, as Metal's are (the runtime's `gpu_time.rs`). A
 /// completed handler learns them (core's `CompletedInfo::gpu_times_ns`), and the reims-graphics
-/// device posts them to its guest, whose bundle answers the run's length from them; this
-/// platform's debug lines read them too ([`crate::gpu::timing`]). The timestamps cost latency:
-/// measured on the M3 Max (a release build, under a load average of 34), a command buffer of one
-/// blit fill completed a median of 283 to 309 us after its commit, against 356 to 399 us with
-/// them (`timing`'s `gpu_times_from_host_latency`).
+/// device posts them to its guest, whose bundle answers the run's length from them, which the
+/// guest's compositor reads; this platform's debug lines read them too ([`crate::gpu::timing`]).
+/// They also let the runtime share `VkQueue`s between command queues where its own check finds
+/// the GPU idle at each switch between queues (NVIDIA's), which it does only on a device whose
+/// command buffers write timestamps the host reads. On MoltenVK 1.4.1, whose timestamps wait for
+/// every queue's (the runtime's `TimestampsWaitForEveryQueue`), the runtime answers GPU times from
+/// the host's clock instead, whatever the options say: a command buffer's start is the host time
+/// the first driver submission that carried its work was called, or its queue's latest GPU end
+/// before it, where later, and its end the host time the runtime saw it complete. Off MoltenVK
+/// the timestamps cost a few microseconds: measured on 2026-11-15 (`timing`'s
+/// `gpu_times_from_host_latency`, a release build, runs of 1000 command buffers of one blit fill
+/// each way, interleaved), a command buffer completed a median of 2 to 7 us later after its commit
+/// than with GPU times from the host (`gpu_times_from_host`), within runs whose medians spanned 44
+/// to 292 us: RADV on an RX 7900 XTX (+4 us over 13 runs), a Radeon 780M (+4 us over 13 runs, and
+/// 0 to 3 us on another) and an RX 550 (+2.5 us over 10 runs), ANV on an Iris Xe (+4.5 us over 10
+/// runs), NVIDIA 620.70.06 on an RTX 3090 (+5 us over 10 runs) and an RTX 2080 (+7 us over 10
+/// runs). Walks of a macOS 26.7.2 guest's desktop and Launchpad on the RX 7900 XTX, a Radeon 780M,
+/// the Iris Xe and the RTX 3090 drew the same presents either way (Launchpad's later openings 54 a
+/// second on the RX 7900 XTX and the RTX 3090, 45 on the others), their take-to-show medians
+/// within the walks' own spread (the RTX 3090's 8.0 to 8.2 ms over eight walks, with `VkQueue`s
+/// shared or not). On the M3 Max, before the runtime answered from the host there, the timestamps cost 356
+/// to 399 us against 283 to 309 us.
 pub(crate) fn device_options() -> &'static rt::DeviceOptions {
     static OPTIONS: LazyLock<rt::DeviceOptions> = LazyLock::new(|| {
         let mut options = rt::DeviceOptions::default();
         crate::os::add_window_extensions(&mut options);
-        options.gpu_times_from_host = true;
         options.load_no_dynamic_library_file = true;
         options.mac_class = *MAC_CLASS.get_or_init(|| None);
         options.policy = exact_policy(std::env::var("REIMS_VGPU_EXACT").ok().as_deref());
