@@ -283,6 +283,34 @@ fn architecture_name(vendor: u32, device: u32, pipeline_cache: [u8; vk::UUID_SIZ
     format!("vulkan_{vendor:04x}_{device:04x}_{key}")
 }
 
+/// The bytes that decide the runtime's answers to a pipeline create on `device`
+/// (`GpuDevice::pipeline_answers_identity`): the fingerprint of its translation profile, which
+/// covers every field of the profile and the device policy, and which the runtime keys its own
+/// persisted artifacts on; its semantics, artifact format and runtime versions, which it bumps
+/// where an unchanged artifact's translation, encoding or run may answer otherwise; and the
+/// driver's version, which the profile may not reach (metal2vulkan's advice, 2026-11-14). The
+/// runtime's commit is not among them: a pin move that changes none of these keeps the answers.
+pub(crate) fn pipeline_answers_identity(device: &rt::Device) -> Vec<u8> {
+    let mut out = Vec::with_capacity(48);
+    out.extend_from_slice(&device.compile_device().profile_fingerprint());
+    out.extend_from_slice(&metal2vulkan::cache::SEMANTICS_VERSION.to_le_bytes());
+    out.extend_from_slice(&metal2vulkan::cache::ARTIFACT_FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&metal2vulkan::cache::RUNTIME_VERSION.to_le_bytes());
+    out.extend_from_slice(&driver_version(device).to_le_bytes());
+    out
+}
+
+/// `VkPhysicalDeviceProperties::driverVersion` of `device`.
+fn driver_version(device: &rt::Device) -> u32 {
+    // SAFETY: as `pipeline_cache_uuid`'s.
+    unsafe {
+        let raw = device.raw();
+        raw.instance
+            .get_physical_device_properties(raw.physical_device)
+            .driver_version
+    }
+}
+
 /// `VkPhysicalDeviceProperties::pipelineCacheUUID` of `device`.
 fn pipeline_cache_uuid(device: &rt::Device) -> [u8; vk::UUID_SIZE] {
     // SAFETY: the instance and physical device are the runtime's, read only, while `device`

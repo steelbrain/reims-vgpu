@@ -1530,6 +1530,10 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         true
     }
 
+    fn pipeline_answers_identity(&self) -> Option<Vec<u8>> {
+        Some(crate::gpu::identity::pipeline_answers_identity(&self.raw))
+    }
+
     /// The runtime's buffer descriptor of the value: zero bytes, a copy of the contents, or,
     /// with `no_copy`, the contents themselves with the deallocator, at the pinned address when
     /// there is one. Nil as `newBufferWithLength:options:` is, for a pinned address the space

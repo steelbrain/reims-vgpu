@@ -4480,6 +4480,11 @@ pub(crate) struct PipelineJob<P: Platform> {
 }
 
 impl<P: Platform> PipelineJob<P> {
+    /// The create's key, where it asked for one and could be keyed.
+    pub(crate) fn key(&self) -> Option<PipelineKey> {
+        self.key
+    }
+
     /// [`RGFX_PIPELINE_KIND_RENDER`], [`RGFX_PIPELINE_KIND_MESH`] or
     /// [`RGFX_PIPELINE_KIND_COMPUTE`].
     pub(crate) fn kind(&self) -> u32 {

@@ -354,6 +354,16 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// ([`FullComputePipelineDesc::open_cl_mode`]): on the Vulkan platform, whose runtime links
     /// such a kernel as Metal does. The graphics lane offers `OPENCL_MODE` where it does.
     fn makes_opencl_mode_pipelines(&self) -> bool;
+    /// The bytes that decide the platform's answers to a pipeline create of an unchanged
+    /// descriptor and unchanged functions: the identity the graphics lane keeps its pipeline
+    /// answers from one run of the host to the next under (`RGFX_FEATURE_PIPELINE_ANSWERS`), so
+    /// an answer kept under them is the one the platform gives such a create again. On the
+    /// Vulkan platform the runtime's translation profile's fingerprint, its semantics, artifact
+    /// and runtime versions, and the driver's version. `None` where the platform gives none: the
+    /// lane then keeps no answer past the device's life. The default gives none.
+    fn pipeline_answers_identity(&self) -> Option<Vec<u8>> {
+        None
+    }
     /// sel: newBufferWithDescriptor: SPI — from a private `MTLBufferDescriptor` made from
     /// `desc`.
     fn new_buffer(&self, desc: BufferDesc<'_>) -> RaiseResult<Option<P::Buffer>>;

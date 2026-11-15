@@ -6039,6 +6039,81 @@ fn a_keyed_pipeline_create_answers_its_pipeline_key() {
     );
 }
 
+/// The kext's `PIPELINE_ANSWERS` gets the device's kept answers of keyed creates, each a keyed
+/// reply of the query's seqno with what the device gives each create alone 0, newest first, then
+/// a `COMPLETE` of how many went: a refused create, one not keyed and a query past the last get
+/// none.
+#[test]
+fn the_kext_gets_the_kept_answers_of_keyed_creates() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let (bytes, key) = keyed_metallib();
+    let made = keyed_library_create(obj(1, 10), &bytes, Some(key));
+    assert_eq!(answered(&device, &mut guest, made), RGFX_STATUS_OK);
+    let keyed = |obj_id, library| {
+        let mut message = compute_pipeline_create(obj_id, library);
+        let at = std::mem::offset_of!(RgfxComputePipelineCreate, flags);
+        let flags = u32::from_le_bytes(message[at..at + 4].try_into().unwrap())
+            | RGFX_COMPUTE_PIPELINE_ANSWER_KEY;
+        message[at..at + 4].copy_from_slice(&flags.to_le_bytes());
+        message
+    };
+    guest.send(&device, keyed(obj(1, 12), obj(1, 10)));
+    let reply = next_event(&mut guest, RGFX_EVT_PIPELINE_REFLECTION);
+    let (made, _) = RgfxPipelineReflection::read_from_prefix(&reply).unwrap();
+    assert_ne!(made.flags & RGFX_PIPELINE_REFLECT_KEYED, 0);
+    let at = RGFX_PIPELINE_REFLECTION_KEY_OFFSET as usize;
+    let made_key = <[u8; 32]>::try_from(&reply[at..at + 32]).unwrap();
+    // Not keyed: kept by no one.
+    guest.send(&device, compute_pipeline_create(obj(1, 13), obj(1, 10)));
+    next_event(&mut guest, RGFX_EVT_PIPELINE_REFLECTION);
+
+    let query = |first: u32, most: u32| {
+        RgfxPipelineAnswersQuery {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_PIPELINE_ANSWERS,
+                size: size_of::<RgfxPipelineAnswersQuery>() as u32,
+                seqno: 0,
+            },
+            first,
+            most,
+        }
+        .as_bytes()
+        .to_vec()
+    };
+    guest.send(&device, query(0, 8));
+    let seqno = guest.seqno;
+    let kept = next_event(&mut guest, RGFX_EVT_PIPELINE_REFLECTION);
+    assert_eq!(kept.len(), at + 32);
+    let (answer, _) = RgfxPipelineReflection::read_from_prefix(&kept).unwrap();
+    assert_eq!(answer.header.seqno, seqno);
+    assert_eq!(answer.header.size as usize, at + 32);
+    assert_eq!(answer.status, RGFX_PIPELINE_OK);
+    assert_ne!(answer.flags & RGFX_PIPELINE_REFLECT_KEYED, 0);
+    assert_eq!(
+        (
+            answer.obj_id,
+            answer.gpu_resource_id,
+            answer.unique_identifier,
+            answer.resource_index
+        ),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(
+        answer.max_total_threads_per_threadgroup,
+        made.max_total_threads_per_threadgroup
+    );
+    assert_eq!(answer.thread_execution_width, made.thread_execution_width);
+    assert_eq!(&kept[at..], &made_key);
+    let done = next_event(&mut guest, RGFX_EVT_COMPLETE);
+    let done = RgfxComplete::read_from_bytes(&done).unwrap();
+    assert_eq!((done.header.seqno, done.status), (seqno, 1));
+    // Past the last: a COMPLETE of none.
+    assert_eq!(answered(&device, &mut guest, query(1, 8)), 0);
+}
+
 /// A create whose key is not the one the host computes from its bytes makes the library for its
 /// request, and keeps it under no key: neither key finds it
 #[test]
@@ -8979,8 +9054,9 @@ fn a_release_the_platform_dies_at_is_refused() {
 /// ring of the device's takes (`SUBMIT_ROOM`), reads indirect command buffers' CPU encodes from
 /// slots in the region (`ICB_SLOTS`), lets the guest read the clock its VBLANKs are stamped on
 /// (`HOST_TIME`), shows the display pipe's colour (`DISPLAY_COLOR`), posts a waited-for buffer's
-/// `CB_SCHEDULED` at a thread's ask (`SCHEDULED_ASK`, `FEATURES_HI` bit 1), and takes the guest's
-/// stamps of its command buffers (`GUEST_TIMES`, `FEATURES_HI` bit 12). The fake's GPU shares the
+/// `CB_SCHEDULED` at a thread's ask (`SCHEDULED_ASK`, `FEATURES_HI` bit 1), takes the guest's
+/// stamps of its command buffers (`GUEST_TIMES`, `FEATURES_HI` bit 12), and hands the kext the
+/// answers it kept of keyed pipeline creates (`PIPELINE_ANSWERS`, `FEATURES_HI` bit 15). The fake's GPU shares the
 /// CPU's memory, so a device with `SURFACE_PAGES` answers which surfaces need a device cache
 /// (`SURFACE_CACHE_REFUSED`), keeps none of the rest, defers a fresh one of those that would need
 /// one whatever its pages (`SURFACE_DEFERRED_ASK`), within a quarter of its GPU's own memory's
@@ -9074,6 +9150,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_FUNCTION_POINTERS
             | RGFX_FEATURE_DYNAMIC_LIBRARIES
             | RGFX_FEATURE_PIPELINE_KEYS
+            | RGFX_FEATURE_PIPELINE_ANSWERS
             | RGFX_FEATURE_GUEST_TIMES
             | slots_in_pages
             | sixteen_bit
@@ -9129,6 +9206,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
                 | RGFX_FEATURE_FUNCTION_POINTERS
                 | RGFX_FEATURE_DYNAMIC_LIBRARIES
                 | RGFX_FEATURE_PIPELINE_KEYS
+                | RGFX_FEATURE_PIPELINE_ANSWERS
                 | RGFX_FEATURE_GUEST_TIMES
                 | RGFX_FEATURE_ICB_SLOTS_IN_PAGES
                 | RGFX_FEATURE_READ_ONLY_PAGES
@@ -9172,6 +9250,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_FUNCTION_POINTERS
             | RGFX_FEATURE_DYNAMIC_LIBRARIES
             | RGFX_FEATURE_PIPELINE_KEYS
+            | RGFX_FEATURE_PIPELINE_ANSWERS
             | RGFX_FEATURE_GUEST_TIMES
     );
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);

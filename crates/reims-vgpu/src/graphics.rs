@@ -52,33 +52,34 @@ use reims_vgpu_graphics::wire::{
     RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_SLOTS,
     RGFX_CMD_ICB_SLOTS_IN_PAGES, RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE,
     RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE,
-    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_RATE_MAP_CREATE, RGFX_CMD_RATE_MAP_QUERY,
-    RGFX_CMD_RATE_MAP_RESET, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE,
-    RGFX_CMD_SHARED_EVENT_IMPORT, RGFX_CMD_SHARED_EVENT_NAME, RGFX_CMD_SHARED_EVENT_UNNAME,
-    RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_FUNCTION_POINTER_STATE,
-    RGFX_EVT_ICB_STATE, RGFX_EVT_RATE_MAP_ANSWER, RGFX_EVT_RATE_MAP_STATE, RGFX_EVT_SAMPLER_STATE,
-    RGFX_FEATURE_CB_SUBMITTED, RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_DISPLAY_COLOR,
-    RGFX_FEATURE_DISPLAY_POWER, RGFX_FEATURE_DISPLAY_SCALE, RGFX_FEATURE_DOORBELL_ASKS,
-    RGFX_FEATURE_DOORBELL_PAGES, RGFX_FEATURE_DYNAMIC_LIBRARIES, RGFX_FEATURE_FUNCTION_POINTERS,
-    RGFX_FEATURE_GUEST_TIMES, RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_HOST_TIME,
-    RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_ICB_SLOTS_IN_PAGES, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
+    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_PIPELINE_ANSWERS, RGFX_CMD_RATE_MAP_CREATE,
+    RGFX_CMD_RATE_MAP_QUERY, RGFX_CMD_RATE_MAP_RESET, RGFX_CMD_RENDER_PIPELINE_CREATE,
+    RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_IMPORT, RGFX_CMD_SHARED_EVENT_NAME,
+    RGFX_CMD_SHARED_EVENT_UNNAME, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET,
+    RGFX_EVT_FUNCTION_POINTER_STATE, RGFX_EVT_ICB_STATE, RGFX_EVT_RATE_MAP_ANSWER,
+    RGFX_EVT_RATE_MAP_STATE, RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED,
+    RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_DISPLAY_COLOR, RGFX_FEATURE_DISPLAY_POWER,
+    RGFX_FEATURE_DISPLAY_SCALE, RGFX_FEATURE_DOORBELL_ASKS, RGFX_FEATURE_DOORBELL_PAGES,
+    RGFX_FEATURE_DYNAMIC_LIBRARIES, RGFX_FEATURE_FUNCTION_POINTERS, RGFX_FEATURE_GUEST_TIMES,
+    RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_HOST_TIME, RGFX_FEATURE_ICB_SLOTS,
+    RGFX_FEATURE_ICB_SLOTS_IN_PAGES, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
     RGFX_FEATURE_MANAGED_AT_OFFSET, RGFX_FEATURE_MANAGED_BUFFER_SLABS,
     RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE,
-    RGFX_FEATURE_PAGES_16K, RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PIPELINE_KEYS,
-    RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_RATE_MAPS, RGFX_FEATURE_READ_ONLY_PAGES,
-    RGFX_FEATURE_SCHEDULED_ASK, RGFX_FEATURE_SHARED_EVENT_NAMES, RGFX_FEATURE_SMALL_ID_CHUNKS,
-    RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_CACHE_REFUSED,
-    RGFX_FEATURE_SURFACE_DEFERRED, RGFX_FEATURE_SURFACE_DEFERRED_ASK,
-    RGFX_FEATURE_SURFACE_DEFERRED_CARRY, RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES,
-    RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA, RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK,
-    RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_NOT_FOUND, RGFX_STATUS_OK,
-    RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET,
-    RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant, RgfxBlockRelease,
-    RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry,
-    RgfxDisplayColor, RgfxEventSignalled, RgfxFunctionPointerState, RgfxHeapOverPages,
-    RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxRateMapAnswer,
-    RgfxRateMapState, RgfxSamplerState, RgfxScheduledAsk, RgfxSharedEventName, RgfxSurfacePages,
-    RgfxSurfacePagesLayout, RgfxVideoCaps,
+    RGFX_FEATURE_PAGES_16K, RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PIPELINE_ANSWERS,
+    RGFX_FEATURE_PIPELINE_KEYS, RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_RATE_MAPS,
+    RGFX_FEATURE_READ_ONLY_PAGES, RGFX_FEATURE_SCHEDULED_ASK, RGFX_FEATURE_SHARED_EVENT_NAMES,
+    RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE,
+    RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
+    RGFX_FEATURE_SURFACE_DEFERRED_ASK, RGFX_FEATURE_SURFACE_DEFERRED_CARRY,
+    RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA,
+    RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
+    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_NOT_FOUND, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
+    RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED,
+    RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant, RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete,
+    RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled,
+    RgfxFunctionPointerState, RgfxHeapOverPages, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader,
+    RgfxPageRun, RgfxPipelineAnswersQuery, RgfxRateMapAnswer, RgfxRateMapState, RgfxSamplerState,
+    RgfxScheduledAsk, RgfxSharedEventName, RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
 use reims_vgpu_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, DoorbellAt, Host, Mode, PresentAnswer,
@@ -103,6 +104,7 @@ use crate::cursor::{CursorGlyph, CursorGlyphFn, CursorMoveFn, CursorShowFn};
 use crate::entry;
 use crate::entry::no_catch;
 use crate::error::Error;
+use crate::graphics::answers::PipelineAnswers;
 use crate::graphics::color::{ColorChange, ColorStaging, DisplayColor};
 use crate::graphics::compile::{CompileKind, CompileOf, CompilePool, Pending};
 use crate::graphics::completion::cb_failed;
@@ -121,6 +123,7 @@ use crate::memory::{GuestMemoryLease, MemoryMap};
 use crate::platform::{ApiPlatform, api_state};
 use crate::window::WindowLink;
 
+mod answers;
 mod color;
 mod compile;
 mod completion;
@@ -457,7 +460,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // device's. Every host takes the guest's stamps of its command buffers
             // (`GUEST_TIMES`), a diagnostic of the time before it takes each. A host that maps
             // BAR 4 has each process ring its queues on a doorbell page of its own
-            // (`DOORBELL_PAGES`).
+            // (`DOORBELL_PAGES`). Every host hands the kext the answers it kept of keyed
+            // pipeline creates from earlier runs (`PIPELINE_ANSWERS`, `answers`).
             let in_place = u64::from(RGFX_FEATURE_SURFACE_PAGES)
                 | u64::from(RGFX_FEATURE_PAGES_BUFFERS)
                 | u64::from(RGFX_FEATURE_HEAP_OVER_PAGES)
@@ -484,6 +488,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 | RGFX_FEATURE_FUNCTION_POINTERS
                 | RGFX_FEATURE_DYNAMIC_LIBRARIES
                 | RGFX_FEATURE_PIPELINE_KEYS
+                | RGFX_FEATURE_PIPELINE_ANSWERS
                 | RGFX_FEATURE_GUEST_TIMES
                 | if offers_doorbell_asks(&config.callbacks) {
                     RGFX_FEATURE_DOORBELL_ASKS
@@ -597,6 +602,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     presents.filled();
                 }
             }));
+            let answers = PipelineAnswers::open(gpu_device.pipeline_answers_identity().as_deref());
             let control = Arc::new(GraphicsControl {
                 decoders: decoder.decoders(),
                 device: gpu_device,
@@ -605,6 +611,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 color: Mutex::default(),
                 pool,
                 pending: Pending::default(),
+                answers,
                 region: Arc::clone(&region),
                 icb_worker: Worker::new("reims-vgpu.icb-create"),
                 icbs: Arc::default(),
@@ -863,6 +870,10 @@ struct GraphicsControl<P: ApiPlatform> {
     pool: CompilePool,
     /// The pipelines being compiled, which a command buffer naming one waits for.
     pending: Pending,
+    /// The answers it gave keyed pipeline creates, kept from one run of the host to the next
+    /// (`answers`): learnt as each compile ends ([`Self::compile`]), handed to the kext on
+    /// `PIPELINE_ANSWERS` ([`Self::pipeline_answers`]).
+    answers: PipelineAnswers,
     /// The device's region, where an `ICB_SLOTS` names the slots whose pipelines it waits for.
     region: Arc<Region>,
     /// The thread ring 0's `ICB_CREATE`s are made on, in the order their lanes hand them over, off
@@ -1571,6 +1582,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 self.argument_layout(poster, message);
                 return;
             }
+            RGFX_CMD_PIPELINE_ANSWERS => {
+                self.pipeline_answers(poster, message);
+                return;
+            }
             RGFX_CMD_RATE_MAP_CREATE | RGFX_CMD_RATE_MAP_RESET => {
                 self.rate_map_state(poster, message);
                 return;
@@ -2034,7 +2049,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// reflection, or a refusal) through `poster`.
     fn compile(&self, job: PipelineJob<P>, began: u64, poster: &CompletionPoster) {
         entry::run(|_| {
-            let (obj_id, seqno) = (job.obj_id, job.seqno);
+            let (obj_id, seqno, key) = (job.obj_id, job.seqno, job.key());
             let compiled = compile_refusing::<P>(&self.device, job);
             if let Some(reason) = compiled.refusal() {
                 log::warn!(
@@ -2043,6 +2058,12 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 );
             }
             let reply = compiled.reply();
+            // A keyed create's answer is kept for the next runs, or drops the kept one where it
+            // was refused or answered otherwise, before the guest has it.
+            if let Some(key) = key {
+                let made = (!compiled.is_refused()).then_some(&reply.reflection);
+                self.answers.observe(&key, made);
+            }
             // Stored where no destroy, close or reset cancelled it, under the lock of its table,
             // which its destroy removes from after cancelling it; a reset waits for the store.
             {
@@ -2545,6 +2566,29 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         if let Some(seqno) = seqno {
             poster.post(complete(seqno, status).as_bytes());
         }
+    }
+
+    /// A `PIPELINE_ANSWERS` from the kext, answered at once on the control ring: each kept answer
+    /// it asks for as a keyed `PIPELINE_REFLECTION` of the query's seqno, newest first, then a
+    /// `COMPLETE` of how many went.
+    fn pipeline_answers(&self, poster: &CompletionPoster, message: &[u8]) {
+        let (_, seqno, _) = message_identity(message);
+        let Ok((query, _)) = RgfxPipelineAnswersQuery::read_from_prefix(message) else {
+            poster.post(complete(seqno, RGFX_STATUS_INVALID_ARGUMENT).as_bytes());
+            return;
+        };
+        let replies = self.answers.replies(query.first, query.most, seqno);
+        for reply in &replies {
+            poster.post(reply);
+        }
+        log::debug!(
+            target: "reims_vgpu::graphics::answers",
+            "the kext took {} kept pipeline answers from the {}th",
+            replies.len(),
+            query.first
+        );
+        let count = u32::try_from(replies.len()).unwrap_or(u32::MAX);
+        poster.post(complete(seqno, count).as_bytes());
     }
 
     /// A library create from ring 0 (a `LIBRARY_CREATE`, or a `LIBRARY_FROM_REGION` chunk):
