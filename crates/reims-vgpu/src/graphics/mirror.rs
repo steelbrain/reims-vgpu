@@ -866,6 +866,7 @@ mod tests {
     }
 
     /// The sync of `mirror` to `surface`, on a thread of its own.
+    #[allow(clippy::disallowed_methods)] // test scaffolding: the sync blocks, so a thread runs it
     fn sync_on_a_thread(
         platform: &Arc<FakePlatform>,
         mirror: &Arc<Mirror<FakePlatform>>,
@@ -883,6 +884,7 @@ mod tests {
     }
 
     /// The committed command buffers not yet completed, once there are `count` of them.
+    #[allow(clippy::disallowed_methods)] // test scaffolding: real time bounds the wait for the thread
     fn committed(platform: &FakePlatform, count: usize) -> Vec<ObjId> {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
