@@ -1577,7 +1577,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         if let Some(reason) = self.kept_whole_by() {
             return Ok(PartCut::Whole(reason));
         }
-        if self.fails() {
+        if self.fails_from_an_encoder() {
             return Ok(PartCut::Fails);
         }
         self.commit(on)?;
