@@ -1076,6 +1076,33 @@ guest's `wav` capture starts with 2.5 s of it. `AppleUSBAudio`, which
 macOS does ship, drives a USB audio device on the xHCI controller above
 (`-device usb-audio,audiodev=snd0,bus=xhci.0`), output only.
 
+reims-ctl's default backend is `pa` where QEMU was built without PipeWire:
+QEMU's meson takes libpipewire-0.3 0.3.60 or later, and the installer
+leaves the feature to configure, so Ubuntu 22.04 (0.3.48) and Debian 11
+(0.3.19) get `pa`. Its capture voice keeps a record stream only while the
+voice is on (vendor/qemu 1f6f4ea4), so the host's sound server lists QEMU
+as a recording client only while the guest records. **Measured** with the
+26.7.2 guest on reims-ctl's two devices and `-audiodev pa`, on homelab-ms01's
+Iris Xe against pipewire-pulse 1.6.10, the capture named
+`auto_null.monitor` (that host has no default source), 2026-11-14
+(m3-max-30994):
+- No source output of QEMU's while the guest was idle, while it played an
+  output alone and after each recording.
+- Each of three recordings (3, 8 and 6 s, AVAudioRecorder over ssh) had one
+  source output, uncorked, made 2 to 4 ms after the input device's START
+  and removed 2 ms after its STOP. The guest sends that device's
+  SET_PARAMS, PREPARE and START together, and STOP with RELEASE.
+- The recording made during an output holds the guest's own speech from
+  the null sink's monitor (83.4% of its samples non-zero, in each second);
+  the one alone holds zeros, the monitor of a sink playing nothing.
+
+Before 1f6f4ea4 the record stream ran from the stream's PREPARE to its
+RELEASE (read from code). With this guest on the capture-only device that is
+the same window, to the millisecond. It is longer wherever the voice is off
+inside a prepared stream: while the guest posts no receive buffer
+(9a03bc4c), or while the VM is stopped, as the audio core turns voices off
+then.
+
 Without an output device, Safari's Media Source players fail. **Measured**
 with the 26.7.2 guest above with audio off (`audio.enabled = false`, no
 sound device):
