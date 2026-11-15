@@ -164,12 +164,6 @@ const WINDOWS_TARGET: &str = "x86_64-pc-windows-gnullvm";
 const CROSS_CHECK_FEATURES: &str = "reims-vgpu-vulkan/testkit,reims-vgpu/testkit,\
     reims-vgpu/vulkan,reims-vgpu-c/vulkan,reims-vgpu-window/sdl-no-link";
 
-/// The workspace member [`WINDOWS_TARGET`]'s type-check leaves out: the video crate, whose
-/// fuzz tests read the CPU time through `clock_gettime` (`codec/fuzz_support.rs`), which Windows
-/// lacks. Its library is still checked, as `reims-vgpu`'s dependency; its tests and examples are
-/// not.
-const WINDOWS_CHECK_EXCLUDED: &str = "reims-vgpu-video";
-
 /// The variable jemalloc's build script (`tikv-jemalloc-sys`, the C API's allocator on
 /// [`LINUX_TARGET`]) reads for that target as a library to link in place of the one it builds. A
 /// Mac's type-check of Linux sets it to an empty archive ([`empty_archive`]), as the Mac has no
@@ -244,8 +238,6 @@ fn cmd_check(args: &[String]) -> Res<bool> {
                 &[
                     "--target",
                     WINDOWS_TARGET,
-                    "--exclude",
-                    WINDOWS_CHECK_EXCLUDED,
                     "--features",
                     CROSS_CHECK_FEATURES,
                 ],

@@ -119,10 +119,9 @@ cargo xtask metallibs      # on a Mac: the Vulkan platform's metallibs and their
 Vulkan platform, and lints with every feature too. On a Mac it also clippy-checks the Linux target,
 and, where Rosetta is installed, runs core's tests (the Vulkan crate's unit tests below `core::`)
 as `x86_64-apple-darwin`. On the Mac and on Linux it clippy-checks the Windows target,
-`x86_64-pc-windows-gnullvm`, too, every crate but the video crate's own tests and examples, whose
-CPU-time clock is Unix's alone (the crate's library is checked as `reims-vgpu`'s dependency). Its
-cargo steps run in the environment it was started in, incremental as
-cargo's dev and test profiles are, so a check run again after a fix rebuilds what the fix changed.
+`x86_64-pc-windows-gnullvm`, too. Its cargo steps run in the environment it was started in,
+incremental as cargo's dev and test profiles are, so a check run again after a fix rebuilds what
+the fix changed.
 
 #### Building through kache
 
