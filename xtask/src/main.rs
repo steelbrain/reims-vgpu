@@ -46,7 +46,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "check",
-        about: "testkit, header --check, the records of the prebuilt option ROM and guest kexts (make -C firmware prebuilt-check, make -C guest prebuilt-check), rustfmt, clippy, cargo nextest and the doc-tests; on a Mac, also clippy for x86-64 Linux and, where Rosetta runs x86-64 code, core's tests as x86-64",
+        about: "testkit, header --check, the records of the prebuilt option ROM and guest kexts (make -C firmware prebuilt-check, make -C guest prebuilt-check), rustfmt, clippy, cargo nextest and the doc-tests; on a Mac, also clippy for x86-64 Linux and, where Rosetta runs x86-64 code, core's tests as x86-64; off Windows, clippy for x86-64 Windows",
         run: cmd_check,
     },
 ];
@@ -154,10 +154,21 @@ const TESTED_FEATURES: &str =
 /// The Linux the library ships for, which a Mac type-checks.
 const LINUX_TARGET: &str = "x86_64-unknown-linux-gnu";
 
-/// The features a Mac type-checks Linux with: [`TESTED_FEATURES`], and SDL's sources left
-/// unbuilt, as a Mac has no Linux C toolchain for them and nothing links.
-const LINUX_CHECK_FEATURES: &str = "reims-vgpu-vulkan/testkit,reims-vgpu/testkit,\
+/// The Windows the library is being brought up on (AGENTS.md), which every other OS
+/// type-checks.
+const WINDOWS_TARGET: &str = "x86_64-pc-windows-gnullvm";
+
+/// The features another OS's target is type-checked with ([`LINUX_TARGET`] on a Mac,
+/// [`WINDOWS_TARGET`] off Windows): [`TESTED_FEATURES`], and SDL's sources left unbuilt, as the
+/// host has no C toolchain for that target and nothing links.
+const CROSS_CHECK_FEATURES: &str = "reims-vgpu-vulkan/testkit,reims-vgpu/testkit,\
     reims-vgpu/vulkan,reims-vgpu-c/vulkan,reims-vgpu-window/sdl-no-link";
+
+/// The workspace member [`WINDOWS_TARGET`]'s type-check leaves out: the video crate, whose
+/// fuzz tests read the CPU time through `clock_gettime` (`codec/fuzz_support.rs`), which Windows
+/// lacks. Its library is still checked, as `reims-vgpu`'s dependency; its tests and examples are
+/// not.
+const WINDOWS_CHECK_EXCLUDED: &str = "reims-vgpu-video";
 
 /// The variable jemalloc's build script (`tikv-jemalloc-sys`, the C API's allocator on
 /// [`LINUX_TARGET`]) reads for that target as a library to link in place of the one it builds. A
@@ -222,8 +233,23 @@ fn cmd_check(args: &[String]) -> Res<bool> {
             // and nothing links.
             let jemalloc = empty_archive()?;
             ok &= clippy(
-                &["--target", LINUX_TARGET, "--features", LINUX_CHECK_FEATURES],
+                &["--target", LINUX_TARGET, "--features", CROSS_CHECK_FEATURES],
                 &[(LINUX_JEMALLOC_OVERRIDE, &jemalloc)],
+            )?;
+        }
+        if !cfg!(target_os = "windows") {
+            // Every Windows file, type-checked from the Mac or Linux as Linux's are from the
+            // Mac: nothing else here builds for Windows, which links no jemalloc.
+            ok &= clippy(
+                &[
+                    "--target",
+                    WINDOWS_TARGET,
+                    "--exclude",
+                    WINDOWS_CHECK_EXCLUDED,
+                    "--features",
+                    CROSS_CHECK_FEATURES,
+                ],
+                &[],
             )?;
         }
         ok &= cargo(&[
@@ -260,4 +286,27 @@ fn cmd_check(args: &[String]) -> Res<bool> {
     }
     println!("check: {}", if ok { "ok" } else { "FAILED" });
     Ok(ok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A target the check type-checks that the toolchain file does not install fails the check
+    /// on a host that never added it by hand.
+    #[test]
+    fn the_cross_checked_targets_are_in_the_toolchain_file() {
+        let toolchain = read(&repo_root().join("rust-toolchain.toml")).unwrap();
+        let targets = toolchain
+            .split_once("targets = [")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(list, _)| list)
+            .expect("rust-toolchain.toml lists its targets");
+        for target in [LINUX_TARGET, WINDOWS_TARGET, X86_64_MACOS_TARGET] {
+            assert!(
+                targets.contains(&format!("\"{target}\"")),
+                "{target} in {targets}"
+            );
+        }
+    }
 }

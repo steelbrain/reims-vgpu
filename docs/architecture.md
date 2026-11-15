@@ -825,7 +825,9 @@ tested features are every feature but the C API's `vulkan` (`TESTED_FEATURES` in
 Vulkan platform is the only one, it is among them. On a Mac the check also runs clippy for
 `x86_64-unknown-linux-gnu`, which type-checks every Linux file with SDL left unbuilt, and, where
 Rosetta runs x86-64 code, core's tests (the Vulkan crate's unit tests below `core::`) as
-`x86_64-apple-darwin`.
+`x86_64-apple-darwin`. On the Mac and on Linux it runs clippy for `x86_64-pc-windows-gnullvm` too,
+the Windows the library is being brought up on, which type-checks every Windows file the same way,
+with the video crate's own tests and examples left out (their CPU-time clock is Unix's alone).
 
 ### 13.2 The testkit
 
