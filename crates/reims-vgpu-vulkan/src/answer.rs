@@ -859,7 +859,11 @@ pub fn created_or_decided<T>(
 ///   format on one without ETC2, which the runtime holds in a carrier, its reads, samples and
 ///   gathers reading a decoded twin of compact codes: an ASTC channel the 8-bit code nearest
 ///   Metal's 12-bit value, at most 1/510 off it, an EAC 11-bit one the 16-bit normalized code
-///   nearest Metal's value, at most half a 16-bit step off it. Apple's GPUs have the formats, so no device on
+///   nearest Metal's value, at most half a 16-bit step off it; and on MoltenVK a `GBGR422` or
+///   `BGRG422` texture over a surface plane or a buffer, which takes the device's own Y'CbCr
+///   conversion, within a code of Metal's decode (metal2vulkan's measurement on the M3 Max),
+///   announced at the first dispatch that reads it, where other devices decode the pairs by
+///   Metal's rules. Apple's GPUs have the formats, so no device on
 ///   Metal announces it; a native device relays it, the runtime's default sampling off Apple's
 ///   GPUs, as the class of a native device's own maths and sampling
 ///   ([`native::NATIVE_RELAYED`]). Announced where the texture is made, inside its creator's
