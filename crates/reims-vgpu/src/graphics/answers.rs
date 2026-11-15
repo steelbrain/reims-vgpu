@@ -331,7 +331,12 @@ fn file_build(path: &Path) -> Option<Vec<u8>> {
     for word in [meta.dev(), meta.ino(), meta.len()] {
         build.extend_from_slice(&word.to_le_bytes());
     }
-    for word in [meta.mtime(), meta.mtime_nsec(), meta.ctime(), meta.ctime_nsec()] {
+    for word in [
+        meta.mtime(),
+        meta.mtime_nsec(),
+        meta.ctime(),
+        meta.ctime_nsec(),
+    ] {
         build.extend_from_slice(&word.to_le_bytes());
     }
     Some(build)
@@ -694,14 +699,26 @@ mod tests {
         let path = dir.0.join("qemu");
         std::fs::write(&path, [1; 64]).unwrap();
         let first = file_build(&path).unwrap();
-        assert_eq!(file_build(&path), Some(first.clone()), "untouched, the same");
+        assert_eq!(
+            file_build(&path),
+            Some(first.clone()),
+            "untouched, the same"
+        );
         let link = dir.0.join("current");
         std::os::unix::fs::symlink(&path, &link).unwrap();
-        assert_eq!(file_build(&link), Some(first.clone()), "through a link, the file's");
+        assert_eq!(
+            file_build(&link),
+            Some(first.clone()),
+            "through a link, the file's"
+        );
         let next = dir.0.join("qemu.new");
         std::fs::write(&next, [2; 64]).unwrap();
         std::fs::rename(&next, &path).unwrap();
-        assert_ne!(file_build(&path), Some(first), "a new file of the same size");
+        assert_ne!(
+            file_build(&path),
+            Some(first),
+            "a new file of the same size"
+        );
         assert_eq!(file_build(&dir.0.join("none")), None);
     }
 
