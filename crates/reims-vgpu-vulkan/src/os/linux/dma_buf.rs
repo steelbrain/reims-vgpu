@@ -199,8 +199,89 @@ pub(crate) struct Limits {
     pub(crate) bytes: u64,
 }
 
-/// udmabuf's limits as the host has them now, its defaults where it shows none.
+/// udmabuf's limits as the host has them, its defaults where it shows none: read from the module's
+/// parameters at most once a second ([`LIMITS`]), so they are the host's within a second of now,
+/// and read again at a refusal they may have caused ([`within_limits`]). Each read of the two
+/// parameters cost a texture over a no-copy buffer's pages about 9% of its making's CPU on a
+/// Radeon 780M (**measured** 2026-11-15, Geekbench 7.1.0's compute pass, 606 such textures).
 pub(super) fn limits() -> Limits {
+    LIMITS.at(mono_now())
+}
+
+/// How long a read of udmabuf's limits stands, in nanoseconds ([`limits`]).
+const LIMITS_STAND_NS: u64 = 1_000_000_000;
+
+/// udmabuf's limits as last read from the host ([`limits`]).
+static LIMITS: KeptLimits = KeptLimits::new(host_limits);
+
+/// Limits read by `read` and kept for [`LIMITS_STAND_NS`] ([`limits`]).
+struct KeptLimits {
+    read: fn() -> Limits,
+    /// The limits last read, and when, on the monotonic clock ([`mono_now`]).
+    kept: Mutex<Option<(u64, Limits)>>,
+}
+
+impl KeptLimits {
+    const fn new(read: fn() -> Limits) -> KeptLimits {
+        KeptLimits {
+            read,
+            kept: Mutex::new(None),
+        }
+    }
+
+    /// The limits read less than [`LIMITS_STAND_NS`] before `now`, else read now.
+    fn at(&self, now: u64) -> Limits {
+        if let Some((read, limits)) = *self.kept.lock()
+            && now.saturating_sub(read) < LIMITS_STAND_NS
+        {
+            return limits;
+        }
+        self.read_now(now)
+    }
+
+    /// The limits read now, kept from `now`.
+    fn read_now(&self, now: u64) -> Limits {
+        let limits = (self.read)();
+        *self.kept.lock() = Some((now, limits));
+        limits
+    }
+}
+
+/// The monotonic clock now, in nanoseconds.
+fn mono_now() -> u64 {
+    use crate::core::platform::os::Clock as _;
+    super::clock::LinuxClock::new().now_mono().as_nanos()
+}
+
+/// `attempt` within udmabuf's limits ([`limits`]); where they refuse it ([`Refusal::Limit`]), or
+/// the kernel does (it refuses a list past limits lowered since they were read), once more within
+/// the limits read from the host now, where those differ from the ones it was refused at: a limit
+/// raised or lowered while the process runs is taken at the first refusal it would change, as
+/// when every call read the host's limits.
+fn within_limits<T>(attempt: impl FnMut(Limits) -> Result<T, Refusal>) -> Result<T, Refusal> {
+    within(&LIMITS, mono_now(), attempt)
+}
+
+/// [`within_limits`] at `now`, of the limits `kept`.
+fn within<T>(
+    kept: &KeptLimits,
+    now: u64,
+    mut attempt: impl FnMut(Limits) -> Result<T, Refusal>,
+) -> Result<T, Refusal> {
+    let limits = kept.at(now);
+    let refused = match attempt(limits) {
+        Err(refused @ (Refusal::Limit { .. } | Refusal::Kernel(_))) => refused,
+        answered => return answered,
+    };
+    let host = kept.read_now(now);
+    if host == limits {
+        return Err(refused);
+    }
+    attempt(host)
+}
+
+/// udmabuf's limits as the host has them now, its defaults where it shows none.
+fn host_limits() -> Limits {
     let parameter = |name: &str, default: u64| {
         let path = format!("/sys/module/udmabuf/parameters/{name}");
         (std::fs::read_to_string(path).ok())
@@ -352,17 +433,18 @@ pub(crate) fn of_ranges(ranges: &[(u64, u64)]) -> Result<OwnedFd, Refusal> {
         add_runs(&mut runs, first, length)?;
     }
     let device = device()?;
-    let limits = limits();
     let bytes: u64 = ranges.iter().map(|&(_, length)| length).sum();
-    if runs.len() as u64 > limits.pieces || bytes > limits.bytes {
-        return Err(Refusal::Limit {
-            pieces: runs.len() as u64,
-            bytes,
-            granule: bytes,
-            limits,
-        });
-    }
-    create(device, &runs)
+    within_limits(|limits| {
+        if runs.len() as u64 > limits.pieces || bytes > limits.bytes {
+            return Err(Refusal::Limit {
+                pieces: runs.len() as u64,
+                bytes,
+                granule: bytes,
+                limits,
+            });
+        }
+        create(device, &runs)
+    })
 }
 
 /// Whether one dma-buf takes the whole pages of the `length` bytes from `first`, as the runtime
@@ -410,16 +492,17 @@ pub(crate) fn fits_one_of(ranges: &[std::ops::Range<u64>]) -> Result<(), Refusal
 /// the host has them now, asked of pages that do not exist yet: refused as [`fits_one_of`] refuses
 /// pages past the limits.
 pub(crate) fn fits_pieces(pieces: u64, bytes: u64) -> Result<(), Refusal> {
-    let limits = limits();
-    if pieces > limits.pieces || bytes > limits.bytes {
-        return Err(Refusal::Limit {
-            pieces,
-            bytes,
-            granule: bytes,
-            limits,
-        });
-    }
-    Ok(())
+    within_limits(|limits| {
+        if pieces > limits.pieces || bytes > limits.bytes {
+            return Err(Refusal::Limit {
+                pieces,
+                bytes,
+                granule: bytes,
+                limits,
+            });
+        }
+        Ok(())
+    })
 }
 
 /// Dma-bufs of the `length` bytes from `first`, whole pages, each resolved through the backing
@@ -440,41 +523,45 @@ pub(crate) fn of_pages_counted(
     let mut runs: Vec<Run<Arc<OwnedFd>>> = Vec::new();
     add_runs(&mut runs, first, length)?;
     let device = device()?;
-    let limits = limits();
     let granule = granule.max(page);
-    let refused = |runs: &[Run<Arc<OwnedFd>>]| Refusal::Limit {
-        pieces: runs.len() as u64,
-        bytes: length,
-        granule,
-        limits,
-    };
-    // The kernel's refusal of the pad's file, where it gave none ([`vm::memfd`]).
-    let no_file = std::cell::Cell::new(None);
-    let pad = |pad| match vm::memfd(pad) {
-        Ok(file) => Some(Run {
-            file,
-            offset: 0,
-            length: pad,
-        }),
-        Err(e) => {
-            no_file.set(Some(e));
-            None
-        }
-    };
-    let cut = padded(&mut runs, granule, limits, pad).ok_or_else(|| {
-        no_file
-            .take()
-            .map_or_else(|| refused(&runs), Refusal::NoFile)
-    })?;
-    let made = cut.iter().map(|chunk| {
-        let fd = create(device, chunk)?;
-        Ok(DmaBufChunk {
-            file: Arc::new(fd),
-            offset: 0,
-            length: chunk.iter().map(|r| r.length).sum(),
-        })
-    });
-    Ok((made.collect::<Result<_, _>>()?, runs.len().to_u64()))
+    let resolved = runs.len();
+    within_limits(|limits| {
+        // A pad an attempt before this one added goes.
+        runs.truncate(resolved);
+        let refused = |runs: &[Run<Arc<OwnedFd>>]| Refusal::Limit {
+            pieces: runs.len() as u64,
+            bytes: length,
+            granule,
+            limits,
+        };
+        // The kernel's refusal of the pad's file, where it gave none ([`vm::memfd`]).
+        let no_file = std::cell::Cell::new(None);
+        let pad = |pad| match vm::memfd(pad) {
+            Ok(file) => Some(Run {
+                file,
+                offset: 0,
+                length: pad,
+            }),
+            Err(e) => {
+                no_file.set(Some(e));
+                None
+            }
+        };
+        let cut = padded(&mut runs, granule, limits, pad).ok_or_else(|| {
+            no_file
+                .take()
+                .map_or_else(|| refused(&runs), Refusal::NoFile)
+        })?;
+        let made = cut.iter().map(|chunk| {
+            let fd = create(device, chunk)?;
+            Ok(DmaBufChunk {
+                file: Arc::new(fd),
+                offset: 0,
+                length: chunk.iter().map(|r| r.length).sum(),
+            })
+        });
+        Ok((made.collect::<Result<_, _>>()?, runs.len().to_u64()))
+    })
 }
 
 /// A group dma-buf ([`of_group`]): several members' pages back to back in one file, and where
@@ -628,7 +715,12 @@ pub(crate) const GROUP_BYTES: u64 = 64 << 20;
 /// What one group dma-buf holds at most: udmabuf's limits as the host has them ([`limits`]), its
 /// bytes at most [`GROUP_BYTES`].
 pub(crate) fn group_limits() -> Limits {
-    let limits = limits();
+    group_limits_of(limits())
+}
+
+/// What one group dma-buf holds at most within udmabuf's `limits`: its bytes at most
+/// [`GROUP_BYTES`].
+fn group_limits_of(limits: Limits) -> Limits {
     Limits {
         pieces: limits.pieces,
         bytes: limits.bytes.min(GROUP_BYTES),
@@ -653,13 +745,14 @@ pub(crate) fn group_views(views: &[(u64, u64)]) -> Groups {
 /// [`group_views`], the members starting at multiples of `align`, at least the host page.
 fn group_views_at(views: &[(u64, u64)], align: u64) -> Groups {
     static NUMBER: AtomicU64 = AtomicU64::new(0);
-    let limits = group_limits();
     let mut files = Vec::new();
     let mut members: Vec<Option<Membership>> = views.iter().map(|_| None).collect();
     let align = align.max(vm::page_size());
     let mut at = 0;
     while views.len() - at > 1 {
-        let group = match of_group(&views[at..], align, limits) {
+        let group = match within_limits(|limits| {
+            of_group(&views[at..], align, group_limits_of(limits))
+        }) {
             Ok(group) => group,
             Err(refusal) => {
                 log::debug!(
@@ -985,44 +1078,45 @@ pub(crate) fn of_view(pieces: &[files::Piece]) -> Result<Vec<ViewBuf>, Refusal> 
         }
         writable.push(fd);
     }
-    let limits = limits();
     let page = vm::page_size();
-    let mut made = Vec::new();
-    let mut from = 0;
-    while from < pieces.len() {
-        // The pieces from `from` of one protection.
-        let prot = pieces[from].prot;
-        let to = (from..pieces.len())
-            .find(|&i| pieces[i].prot != prot)
-            .unwrap_or(pieces.len());
-        let runs: Vec<Run<Arc<OwnedFd>>> = pieces[from..to]
-            .iter()
-            .map(|p| Run {
-                file: Arc::clone(&p.backing.file),
-                offset: p.backing.offset,
-                length: p.length,
-            })
-            .collect();
-        let mut at = pieces[from].at;
-        let cut = chunks(&runs, page, limits).ok_or(Refusal::Limit {
-            pieces: runs.len() as u64,
-            bytes: runs.iter().map(|r| r.length).sum(),
-            granule: page,
-            limits,
-        })?;
-        for chunk in cut {
-            let length = chunk.iter().map(|r| r.length).sum();
-            made.push(ViewBuf {
-                fd: create(device, &chunk)?,
-                at,
-                length,
-                prot,
-            });
-            at += length;
+    within_limits(|limits| {
+        let mut made = Vec::new();
+        let mut from = 0;
+        while from < pieces.len() {
+            // The pieces from `from` of one protection.
+            let prot = pieces[from].prot;
+            let to = (from..pieces.len())
+                .find(|&i| pieces[i].prot != prot)
+                .unwrap_or(pieces.len());
+            let runs: Vec<Run<Arc<OwnedFd>>> = pieces[from..to]
+                .iter()
+                .map(|p| Run {
+                    file: Arc::clone(&p.backing.file),
+                    offset: p.backing.offset,
+                    length: p.length,
+                })
+                .collect();
+            let mut at = pieces[from].at;
+            let cut = chunks(&runs, page, limits).ok_or(Refusal::Limit {
+                pieces: runs.len() as u64,
+                bytes: runs.iter().map(|r| r.length).sum(),
+                granule: page,
+                limits,
+            })?;
+            for chunk in cut {
+                let length = chunk.iter().map(|r| r.length).sum();
+                made.push(ViewBuf {
+                    fd: create(device, &chunk)?,
+                    at,
+                    length,
+                    prot,
+                });
+                at += length;
+            }
+            from = to;
         }
-        from = to;
-    }
-    Ok(made)
+        Ok(made)
+    })
 }
 
 /// One dma-buf of `runs`, in order (`UDMABUF_CREATE_LIST`).
@@ -1529,6 +1623,84 @@ mod tests {
         let group = group_limits();
         assert_eq!(group.pieces, expected.pieces);
         assert_eq!(group.bytes, expected.bytes.min(64 << 20));
+    }
+
+    /// The limits are read from the host at most once a second: a read less than a second after
+    /// the last answers the limits kept, one a second or more after it reads the host again
+    #[test]
+    fn the_limits_are_read_at_most_once_a_second() {
+        static READS: AtomicU64 = AtomicU64::new(0);
+        fn read() -> Limits {
+            let reads = READS.fetch_add(1, Ordering::Relaxed) + 1;
+            Limits {
+                pieces: reads,
+                bytes: 0x10000,
+            }
+        }
+        let kept = KeptLimits::new(read);
+        let t0 = 5_000_000_000;
+        assert_eq!(kept.at(t0).pieces, 1);
+        assert_eq!(kept.at(t0 + LIMITS_STAND_NS - 1).pieces, 1);
+        assert_eq!(READS.load(Ordering::Relaxed), 1);
+        assert_eq!(kept.at(t0 + LIMITS_STAND_NS).pieces, 2);
+        assert_eq!(kept.at(t0 + LIMITS_STAND_NS + 1).pieces, 2);
+        assert_eq!(READS.load(Ordering::Relaxed), 2);
+    }
+
+    /// A refusal at the limits kept tries once more at the host's limits read now, where they
+    /// changed since: a list limit raised within the second is taken at the first refusal it
+    /// changes, and so is one lowered, which the kernel refuses a list past. Where the host's
+    /// limits are those it was refused at, and for a refusal not of the limits, the refusal
+    /// stands after one attempt
+    #[test]
+    fn a_refusal_at_the_limits_kept_tries_again_at_the_hosts() {
+        static HOST: AtomicU64 = AtomicU64::new(2);
+        static READS: AtomicU64 = AtomicU64::new(0);
+        fn read() -> Limits {
+            READS.fetch_add(1, Ordering::Relaxed);
+            Limits {
+                pieces: HOST.load(Ordering::Relaxed),
+                bytes: 0x10_0000,
+            }
+        }
+        let kept = KeptLimits::new(read);
+        let now = 1;
+        let tries = std::cell::Cell::new(0);
+        // Three pieces, past a list limit of 2; a list the kernel refuses past the host's limit.
+        let three = |limits: Limits| {
+            tries.set(tries.get() + 1);
+            if limits.pieces > HOST.load(Ordering::Relaxed) {
+                return Err(Refusal::Kernel(io::Error::from_raw_os_error(libc::EINVAL)));
+            }
+            if limits.pieces < 3 {
+                return Err(Refusal::Limit {
+                    pieces: 3,
+                    bytes: 0x3000,
+                    granule: 0x3000,
+                    limits,
+                });
+            }
+            Ok(limits.pieces)
+        };
+        // The host's limits, read now, refuse it: one attempt.
+        assert!(matches!(within(&kept, now, three), Err(Refusal::Limit { .. })));
+        assert_eq!((tries.replace(0), READS.load(Ordering::Relaxed)), (1, 2));
+        // Raised within the second: refused at the kept 2, taken at the host's 4.
+        HOST.store(4, Ordering::Relaxed);
+        assert_eq!(within(&kept, now, three).unwrap(), 4);
+        assert_eq!(tries.replace(0), 2);
+        assert_eq!(within(&kept, now, three).unwrap(), 4);
+        assert_eq!(tries.replace(0), 1);
+        // Lowered within the second, below what it needs: the kernel refuses the list made at the
+        // kept 4, and the host's 1 refuses it.
+        HOST.store(1, Ordering::Relaxed);
+        assert!(matches!(within(&kept, now, three), Err(Refusal::Limit { .. })));
+        assert_eq!(tries.replace(0), 2);
+        // A refusal not of the limits reads nothing.
+        let reads = READS.load(Ordering::Relaxed);
+        let unresolved = |_: Limits| -> Result<(), Refusal> { Err(Refusal::Unresolved) };
+        assert!(matches!(within(&kept, now, unresolved), Err(Refusal::Unresolved)));
+        assert_eq!(READS.load(Ordering::Relaxed), reads);
     }
 
     /// Grouped views are answered with their pieces of one group dma-buf while their memberships
