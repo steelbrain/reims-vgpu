@@ -107,6 +107,7 @@ virtio device (`d151bcd9`, upstream's `b501f21312`).
 | a screendump waits for the console's read of the display at most 3 s from the read's start, then is answered with what the console shows, so QMP goes on while the GPU never answers the read | `fa600694` |
 | the device's realize warns where BAR 2 would get no address: on a PC machine with RAM at 1 GiB ("The reims-graphics device", below) | `b7d7fdaf` |
 | the window opens at the `resolution` property's size, 1920x1080 without it | `9bf62d84` |
+| the `displays` property, 1 to 4 (1 by default, others refused at realize): display i is head i, with a console, a window under `-display none` and a cursor of its own; console i reads display i (`rvg_graphics_device_read_display_at`), so QMP's `screendump` of head i saves it ("The reims-graphics device", below) | `010bf827` |
 | file-backed guest RAM (the memfd of `reims-ctl`'s VMs) mapped 2 MiB-aligned on Linux, as anonymous RAM is, so transparent huge pages can back it where the host allows them ("Linux hosts: huge pages for guest RAM", below) | `5e83e90dc2` |
 | `isa-applesmc` answers GET_KEY_BY_INDEX, listing its keys by name and 0xb8 past the last, so the key walk macOS 15.4 and later make at boot ends ("x86-64 macOS guests: the SMC", below) | `83de566436` |
 | QMP's `screendump` in PPM, its default format, writes rows of width × 3 bytes. Upstream's wrote each row with its line buffer's stride, which pixman rounds up to 4 bytes, so a display whose width is not a multiple of 4 (a window of 3662 × 2039 pixels) read back sheared, its colours rotating from row to row; PNG's rows were right. `tests/qtest/display-screendump-test.c` dumps `bochs-display` at widths of 64, 66 and 67 | `e1360002ad` |
@@ -202,8 +203,22 @@ is its transport:
   the vector's irqfd where KVM's in-kernel irqchip injects MSI-X through one
   and MSI-X is enabled, and KVM injects it on the raising thread; elsewhere
   (HVF, TCG) a BH sends it under the BQL. Neither waits for a lock.
-- Under `-display none` the library opens a window for the display, unless
-  `REIMS_VGPU_WINDOW` is `0`. It opens at the `resolution` property's size,
+- **Displays:** the `displays` property gives the device 1 to 4 displays
+  (`RvgGraphicsDeviceConfig`'s `display_count`), 1 by default; realize
+  refuses 0 and anything above 4. Display i is head i of QEMU's UI, with a
+  console, a window and a cursor of its own (below), each the same as display
+  0's. A guest whose driver takes `MULTI_DISPLAY`, which the device offers
+  only with two displays or more, drives them all. Other guests, and the
+  option ROM, drive display 0 alone, and the other displays show black
+  (docs/graphics-kext/design.md, "Multiple displays"). A window's pointer
+  goes to its own display's console in that display's pixels, and every
+  window's keys reach the one keyboard. A VM has one `usb-tablet`, so a
+  position over display 1's window reaches the guest as the same position
+  over display 0's would; how the guest should place it (the design's X1)
+  is still open. With `displays=1` QEMU makes the same console, window,
+  reads and callbacks as before.
+- Under `-display none` the library opens a window for each display, unless
+  `REIMS_VGPU_WINDOW` is `0`. Each opens at the `resolution` property's size,
   `<width>x<height>` (1920x1080 without it), a guest pixel per host point,
   shrunk to fit the screen; then the window keeps the size the person gives
   it, and the display offers the guest that size in pixels at the host
@@ -212,15 +227,16 @@ is its transport:
   macOS 26.7.2 guest ran 2688x1512; `2560x1440` and the default opened it
   shrunk to 1744x981 points, the guest at 3662x2039 (**measured**). Its
   input is queued for a BH and reaches the guest's tablet and keyboard
-  through the device's console. Closing the window powers the VM off.
-- **The console** shows what the display shows, with a window or without
-  one: at each of its updates (a display change listener's refresh, or a
-  screendump) a thread of the device's pool reads it back from the library
-  (`rvg_graphics_device_read_display`), the scanout or the IOSurface the
-  guest presents, through the display's colour, at the display's mode, and
-  a BH copies it into the console's surface and says the update is done. So
-  QMP's `screendump` saves the guest's frame. One read runs at a time; an
-  update that comes while one is under way is done with it. The read waits
+  through its display's console. Closing any window powers the VM off.
+- **The console** of each display shows what the display shows, with a
+  window or without one: at each of its updates (a display change listener's
+  refresh, or a screendump of its head) a thread of the device's pool reads
+  it back from the library (`rvg_graphics_device_read_display_at`), the
+  scanout or the IOSurface the guest presents, through the display's colour,
+  at the display's mode, and a BH copies it into the console's surface and
+  says the update is done. So QMP's `screendump` of head i saves display i's
+  frame (head 0 by default). One read of a display runs at a time; an update
+  that comes while one is under way is done with it. The read waits
   for its draw on the GPU, never under the BQL, and the guest sees nothing
   of it. A `screendump` answers once the read is done, and QMP runs its
   commands one at a time, on every monitor, so none answers meanwhile; HMP's
@@ -234,13 +250,15 @@ is its transport:
   (NVIDIA's Xid 109) held every QMP monitor to the quit, while HMP's `info
   status` answered in under 1 ms throughout a 150 s wait, the vCPUs ran and
   the guest answered ssh (**measured**, RTX 2080 and RTX 3090, 2026-11-12).
-- **The cursor** is the console's too: the library tells the device the
-  guest's cursor on its display thread (`cursor_glyph`, `cursor_show`,
-  `cursor_move` of `RvgGraphicsCallbacks`), and the BH, in order with the
-  window's input, gives the console its image and hot spot
+- **The cursor** is each console's too: the library tells the device each
+  display's guest cursor on its display thread (`cursor_glyph`,
+  `cursor_show` and `cursor_move` of `RvgGraphicsCallbacks` for display 0,
+  and for displays 1 and up `cursor_glyph_at`, `cursor_show_at` and
+  `cursor_move_at`, which name the display), and the BH, in order with the
+  windows' input, gives the display's console its image and hot spot
   (`qemu_console_set_cursor`) and its place and whether it shows
   (`qemu_console_set_mouse`). The library gives the hot spot's place
-  (`rvg_graphics_device_cursor_position`), and the console takes the image's
+  (`rvg_graphics_device_cursor_position_at`), and the console takes the image's
   top-left corner, as virtio-gpu gives it, so the device takes the hot spot
   off. QEMU's own displays (SPICE, VNC, GTK, D-Bus) draw the cursor from it.
   The image the console reads back has no
@@ -253,9 +271,10 @@ is its transport:
   GPU device before the process exits (docs/api.md, "The process's exit").
   A shutdown whose action pauses the VM (`-action shutdown=pause`,
   `-no-shutdown`), and a quit of a VM stopped before it, keep the device to
-  the exit, as before. So does a quit while a read of the display (the
+  the exit, as before. So does a quit while a read of a display (a
   console's, above) still waits for its draw on the GPU: the teardown waits
-  for the read at most 5 s, under the BQL, as the read uses the device. A
+  for every display's read at most 5 s, under the BQL, as the reads use the
+  device. A
   screendump still waiting for the read is answered first, with what the
   console last showed: QEMU's quit waits for QMP's dispatcher, which the
   screendump holds (`monitor_cleanup`), and a read that ends after the
