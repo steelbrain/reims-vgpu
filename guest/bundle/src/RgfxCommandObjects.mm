@@ -690,6 +690,11 @@ struct RgfxBarrierSlot {
 /// A drawable a posted buffer presents reports its present scheduled, or the buffer failed before
 /// presenting it: one signal of the present hold (PRESENT HOLD), which posts what it held.
 - (void)rgfxPresentScheduled;
+/// A buffer of the queue presents a drawable: from then on every buffer the queue commits asks
+/// for its submission where the device answers it (PRESENT HOLD).
+- (void)rgfxNotePresents;
+/// Whether a buffer of the queue has presented a drawable (rgfxNotePresents).
+- (BOOL)rgfxPresents;
 /// Before a buffer of the queue goes on its ring: the buffers of the process's other queues it
 /// is to be committed after (RgfxCommitOrder::name), none where the queue takes no part.
 - (std::vector<RgfxSurfaceOrderWait>)rgfxNameCommitOrder;
@@ -758,6 +763,8 @@ struct RgfxBarrierSlot {
 	// buffers posted so far owe, and those their drawables (or their failures) gave.
 	uint64_t _presentsOwed;
 	uint64_t _presentsSignalled;
+	// A buffer of the queue has presented a drawable (rgfxNotePresents).
+	std::atomic<bool> _presents;
 	std::recursive_mutex _postLock;
 	// Its process's commit order (rgfxJoinCommitOrder:), its slot there, and what its posts named
 	// last, which only its posts read and write, one at a time (`_postLock`).
@@ -1097,6 +1104,17 @@ struct RgfxBarrierSlot {
 // paces, so a GPU-bound app's frames reach the GPU as WindowServer takes them, not as fast as its
 // queue holds them. The post goes on another thread: a drawable may report inside the app's
 // nextDrawable, under the layer's lock.
+//
+// The hold makes the next frame wait for the report, and the report comes after the presenting
+// buffer is scheduled, where its scheduled handler presents. Metal schedules a buffer that waits
+// for nothing within a fraction of a millisecond of its commit, whatever its queue runs on the GPU
+// before it; the host schedules a buffer that does not ask for its submission at its platform's
+// submission, which can wait for the queue's earlier work on the GPU (measured on an RTX 3090 host,
+// the Modern Rendering sample: the presenting buffer behind the frame's 89 ms pass was scheduled
+// at the pass's end, 88.6 ms after its commit, and the GPU then stood idle 19 to 22 ms a frame
+// until the next frame came). So once a buffer of the queue presents, every buffer the queue
+// commits asks for its submission (RGFX_OP_SUBMITTED), and the host schedules each at its take
+// where it waits for nothing and none before it on its queue owes its scheduling.
 - (void)rgfxPresentScheduled
 {
 	{
@@ -1110,6 +1128,16 @@ struct RgfxBarrierSlot {
 	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
 		[queue rgfxPostReady];
 	});
+}
+
+- (void)rgfxNotePresents
+{
+	_presents.store(true, std::memory_order_release);
+}
+
+- (BOOL)rgfxPresents
+{
+	return _presents.load(std::memory_order_acquire);
 }
 
 - (RgfxCmdBuffer *)rgfxCommandBufferRetained:(BOOL)retained
@@ -1711,7 +1739,7 @@ enum RgfxStage : unsigned {
 	BOOL _retained;
 	BOOL _committed;
 	// Committed by commitAndWaitUntilSubmitted, so it asks for its submission where the host
-	// answers it.
+	// answers it, as a buffer of a queue that presents does (PRESENT HOLD).
 	BOOL _waitsSubmitted;
 	// It asks the host for its submission (RGFX_OP_SUBMITTED), so its post expects CB_SUBMITTED.
 	BOOL _asksSubmitted;
@@ -2220,8 +2248,9 @@ enum RgfxStage : unsigned {
 		// One commitAndWaitUntilSubmitted commits asks for its submission where the host
 		// answers it: the call then returns as the host takes it, or at the signal it or a
 		// buffer before it on its queue waits for, as Metal's does, not at its scheduling.
-		// Nothing else waits for a submission, so no other buffer asks.
-		_asksSubmitted = _waitsSubmitted && queue.asksSubmitted;
+		// So does every buffer of a queue that presents, so the host schedules it at its take
+		// where it waits for nothing, as Metal schedules it at its commit (PRESENT HOLD).
+		_asksSubmitted = (_waitsSubmitted || [queue rgfxPresents]) && queue.asksSubmitted;
 		if (_asksSubmitted)
 			_encoder->appendSubmitted();
 	}
@@ -3041,7 +3070,8 @@ static NSError *rgfxInvalidInputError()
 // As Metal's base buffer does (read from code, macOS 27 Metal.framework), the buffer then owes
 // its queue one present-scheduled signal, which the drawable gives once its present is scheduled
 // (addPresentScheduledHandler:, asked of every drawable as Metal asks it): the queue posts
-// nothing after the buffer until then (PRESENT HOLD). Where the buffer has failed by its
+// nothing after the buffer until then, and the buffer, as each the queue commits from now on, asks
+// for its submission (PRESENT HOLD). Where the buffer has failed by its
 // scheduling, the scheduled handler gives the signal instead, as Metal's does; the bundle's
 // buffers learn a failure at their completion, after their scheduled handlers, so they present.
 - (void)rgfxPresent:(id<MTLDrawable>)drawable with:(void (^)(id<MTLDrawable>))present
@@ -3049,6 +3079,7 @@ static NSError *rgfxInvalidInputError()
 	if (drawable == nil)
 		return;
 	RgfxCommandQueue *queue = _queue;
+	[queue rgfxNotePresents];
 	[self addScheduledHandler:^(id<MTLCommandBuffer> cb) {
 		if (cb.error == nil)
 			present(drawable);

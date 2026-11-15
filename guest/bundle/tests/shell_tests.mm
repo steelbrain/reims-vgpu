@@ -11616,6 +11616,82 @@ void test_a_present_holds_the_queue_s_later_buffers_until_it_is_scheduled()
 	}
 }
 
+// The next command buffer message `f`'s queue posts, waiting up to `ms` for it (past the other
+// messages of its ring): its seqno and how many RGFX_OP_SUBMITTED ops it holds; 0 and -1 where
+// none comes.
+std::pair<uint64_t, int> postedAsks(QueueFixture &f, int ms)
+{
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	for (int i = 0; i <= ms;) {
+		if (!f.submit.next(&h, &bytes)) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			i++;
+		} else if (h.type == RGFX_CMD_COMMAND_BUFFER) {
+			return {h.seqno, submittedOps(bytes)};
+		}
+	}
+	return {0, -1};
+}
+
+// Once a buffer of a queue presents a drawable, that buffer and every buffer the queue commits
+// after it ask for their submission (RGFX_OP_SUBMITTED, once each) where the device answers it,
+// so the host schedules them at their take where they wait for nothing, as Metal schedules such a
+// buffer at its commit (PRESENT HOLD, RgfxCommandObjects.mm). A buffer the queue committed before
+// asks nothing, and no buffer of a queue whose device does not answer it asks. One that asks and
+// gets no CB_SUBMITTED is submitted at its CB_SCHEDULED, which runs its present.
+void test_a_queue_that_presents_asks_for_its_buffers_submission()
+{
+	@autoreleasepool {
+	for (int answers = 0; answers < 2; answers++) {
+		QueueFixture f;
+		f.queue.asksSubmitted = answers == 1;
+		FakeKext *kext = new FakeKext();
+		RgfxCompletionThread thread(&FakeKext::wait, kext);
+		CHECK(thread.start());
+		thread.add([f.queue sharedReplyReader]);
+		auto finish = [&](uint64_t seqno, id<MTLCommandBuffer> cb) {
+			uint64_t cbObjId = ((RgfxResource *)cb).rgfxObjId;
+			RgfxCbScheduled scheduled = cbScheduled(seqno, cbObjId);
+			hostPost(f.completion, *kext, &scheduled, sizeof(scheduled));
+			[cb waitUntilScheduled];
+			CHECK(cb.status == MTLCommandBufferStatusScheduled);
+			RgfxCbComplete done = cbComplete(seqno, cbObjId);
+			hostPost(f.completion, *kext, &done, sizeof(done));
+			[cb waitUntilCompleted];
+			CHECK(cb.status == MTLCommandBufferStatusCompleted);
+		};
+
+		id<MTLCommandBuffer> before = [f.queue commandBuffer];
+		[before commit];
+		std::pair<uint64_t, int> first = postedAsks(f, 1000);
+		CHECK(first.first != 0 && first.second == 0);
+		finish(first.first, before);
+
+		TestDrawable *d = [TestDrawable new];
+		d.reports = TestDrawableReportsAtAdd; // reported before the post: holds nothing
+		id<MTLCommandBuffer> presenting = [f.queue commandBuffer];
+		[presenting presentDrawable:d];
+		[presenting commit];
+		std::pair<uint64_t, int> posted = postedAsks(f, 1000);
+		CHECK(posted.first > first.first && posted.second == answers);
+		finish(posted.first, presenting);
+		CHECK(d.seen.count == 1);
+
+		for (int i = 0; i < 2; i++) {
+			id<MTLCommandBuffer> later = [f.queue commandBuffer];
+			[later commit];
+			std::pair<uint64_t, int> next = postedAsks(f, 1000);
+			CHECK(next.first > posted.first && next.second == answers);
+			finish(next.first, later);
+			posted = next;
+		}
+		kext->close();
+		CHECK(eventually([&] { return !thread.running(); }));
+	}
+	}
+}
+
 // The host's side of a commitAndWaitUntilSubmitted: takes the buffer's message off `ring`,
 // counts its RGFX_OP_SUBMITTED ops into `asked`, and after 30 ms posts `type`'s record for it
 // (CB_SUBMITTED or CB_SCHEDULED) on `completion`. `seqno` gets the buffer's seqno.
@@ -20275,6 +20351,7 @@ int main(int argc, char **argv)
 		test_scheduled_before_completion();
 		test_present_drawable();
 		test_a_present_holds_the_queue_s_later_buffers_until_it_is_scheduled();
+		test_a_queue_that_presents_asks_for_its_buffers_submission();
 		test_submitted_before_scheduled();
 		test_waiting_asks_for_its_scheduling();
 		test_submitted_at_the_doorbell_wakes_no_thread();

@@ -3572,8 +3572,9 @@ opens the `Platform` command buffer and walks the ops:
   before the buffer's work where it holds an older count (Decided 14, "The
   device cache"). One naming a block with no cache does nothing.
 - `SUBMITTED` (no body), where the device has `CB_SUBMITTED`: the buffer is
-  committed by `commitAndWaitUntilSubmitted`, and asks for its `CB_SUBMITTED`
-  ("Submitted", below). The bundle puts it last, as it commits; the host reads
+  committed by `commitAndWaitUntilSubmitted`, or by a queue one of whose
+  buffers has presented a drawable ("Present hold", below), and asks for its
+  `CB_SUBMITTED` ("Submitted", below). The bundle puts it last, as it commits; the host reads
   it as it takes the buffer, before its other ops.
 - `GUEST_TIMES` (made, committed and posted, each the guest's clock), where
   the guest took `GUEST_TIMES`: first in the stream, once, a diagnostic the
@@ -3972,7 +3973,19 @@ layer on screen, which CoreAnimation reports at once, holds nothing. A
 CAMetalDrawable reports once its layer's image queue has taken the present,
 which WindowServer paces (CoreAnimation's `layer_collectable_signal`, the
 layer's next drawable or flush, or after 1.1 s, read from code), so a GPU-bound
-app's frames reach the GPU paced by what WindowServer takes.
+app's frames reach the GPU paced by what WindowServer takes. The report comes
+after the presenting buffer is scheduled, where its present is made, and the
+next frame waits for it. Metal schedules a buffer that waits for nothing within
+a fraction of a millisecond of its commit, whatever its queue runs before it
+("Scheduled", above); the host schedules a buffer that does not ask for its
+`CB_SUBMITTED` at its platform's submission, which can wait for the queue's
+earlier work on the GPU. On the RTX 3090 host, the Modern Rendering sample's
+presenting buffer behind its frame's 89 ms pass was scheduled at the pass's
+end, 88.6 ms after its commit, and the GPU stood idle 19 to 22 ms a frame
+until the next frame came. So once a buffer of a queue presents, it and every
+buffer the queue commits after it ask for their `CB_SUBMITTED` (`SUBMITTED`),
+and the host schedules each at its take where it waits for nothing and no
+buffer before it on its queue owes its scheduling.
 
 **Surface order**, where the guest took `SURFACE_ORDER` (`FEATURES_LO` bit 11).
 On a Mac, a GPU access to an IOSurface committed after another process's

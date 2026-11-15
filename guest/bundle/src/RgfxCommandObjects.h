@@ -43,7 +43,9 @@
  * ended), where the taker runs the record too.
  * `presentDrawable:` and its variants present the drawable from a scheduled handler,
  * unless the buffer failed by then, and the queue posts none of its later buffers until the
- * drawable reports its present scheduled, as Metal's queue submits none (PRESENT HOLD, the .mm).
+ * drawable reports its present scheduled, as Metal's queue submits none (PRESENT HOLD, the .mm);
+ * from then on each buffer the queue commits asks for its submission, so the host schedules it
+ * at its take where it waits for nothing.
  *
  * Our own ObjC++; the only Apple names are the real Metal protocols these conform to.
  */
@@ -123,9 +125,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// Null in a unit test without them: the chunks are then blocks of the region.
 @property(nonatomic, nullable) RgfxSlabs *slabs;
 
-/// Whether a command buffer of it that commitAndWaitUntilSubmitted commits asks the host for its
-/// submission (RGFX_OP_SUBMITTED), where the device has RGFX_FEATURE_CB_SUBMITTED: the call then
-/// returns at the host's RGFX_EVT_CB_SUBMITTED, else at the buffer's CB_SCHEDULED. NO by default.
+/// Whether a command buffer of it that commitAndWaitUntilSubmitted commits, or that it commits
+/// once one of its buffers has presented a drawable, asks the host for its submission
+/// (RGFX_OP_SUBMITTED), where the device has RGFX_FEATURE_CB_SUBMITTED: the call then returns at
+/// the host's RGFX_EVT_CB_SUBMITTED, else at the buffer's CB_SCHEDULED. NO by default.
 @property(nonatomic) BOOL asksSubmitted;
 
 /// Whether a thread that waits for a command buffer of it to be scheduled (waitUntilScheduled) asks
