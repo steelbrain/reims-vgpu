@@ -1,5 +1,7 @@
 //! `features.md`'s guards: every `test: <module>::<name>` it names is a test function in
-//! `src/<module>.rs` or under `src/<module>/`, so deleting a feature's test fails here.
+//! `src/<module>.rs` or under `src/<module>/`, and every `test: <crate>::<module>::<name>` one in
+//! that module of the workspace's crate in `crates/<crate>`, so deleting a feature's test fails
+//! here.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -37,6 +39,23 @@ fn guards(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Where a guard's `module` lies, from the crate's directory `dir`: the `src/` it is under and
+/// its module there. A module whose first segment has a hyphen, which no Rust module's name has,
+/// is in the crate of that directory beside this one (`reims-vgpu::graphics::tests`, the
+/// display's tests in `crates/reims-vgpu`); any other is this crate's.
+fn module_root(dir: &Path, module: &str) -> (PathBuf, String) {
+    match module.split_once("::") {
+        Some((krate, rest)) if krate.contains('-') => (
+            dir.parent()
+                .expect("the crate's directory is in crates/")
+                .join(krate)
+                .join("src"),
+            rest.to_owned(),
+        ),
+        _ => (dir.join("src"), module.to_owned()),
+    }
+}
+
 /// The Rust sources of `module`: `src/<module>.rs` and every file under `src/<module>/`.
 fn sources(src: &Path, module: &str) -> Vec<PathBuf> {
     let rel = module.replace("::", "/");
@@ -67,11 +86,11 @@ fn sources(src: &Path, module: &str) -> Vec<PathBuf> {
 fn features_md_guards_exist() {
     let dir = crate_dir();
     let text = std::fs::read_to_string(dir.join("features.md")).unwrap();
-    let src = dir.join("src");
     let mut missing = Vec::new();
     for (module, name) in guards(&text) {
         let wanted = format!("fn {name}(");
-        let found = sources(&src, &module).iter().any(|file| {
+        let (src, local) = module_root(&dir, &module);
+        let found = sources(&src, &local).iter().any(|file| {
             std::fs::read_to_string(file)
                 .unwrap()
                 .lines()
@@ -98,5 +117,23 @@ fn guards_parse() {
             ("geometry".to_owned(), "keeps_ratio".to_owned()),
             ("a::b".to_owned(), "c".to_owned()),
         ]
+    );
+}
+
+/// A guard's module is this crate's, or, where its first segment is a crate's directory, that
+/// crate's
+#[test]
+fn a_guard_names_another_crate_by_its_directory() {
+    let dir = Path::new("/w/crates/reims-vgpu-window");
+    assert_eq!(
+        module_root(dir, "native::macos::cursor"),
+        (dir.join("src"), "native::macos::cursor".to_owned())
+    );
+    assert_eq!(
+        module_root(dir, "reims-vgpu::graphics::tests"),
+        (
+            PathBuf::from("/w/crates/reims-vgpu/src"),
+            "graphics::tests".to_owned()
+        )
     );
 }

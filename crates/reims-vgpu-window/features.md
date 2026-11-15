@@ -6,9 +6,12 @@ it is done deliberately, in its own commit, with this file updated and the
 reason given.
 
 Each entry ends with its guard: `test: <module>::<name>`, a unit test in this
-crate (`features::features_md_guards_exist` fails when one is gone), or
-`manual`, a check on a VM boot. A change to this crate walks the `manual`
-entries it can reach. A bare `test` is a guard not yet written.
+crate; `test: <crate>::<module>::<name>`, a unit test in the workspace's crate
+in `crates/<crate>`, such as reims-vgpu's display tests, which drive the
+window from the guest's device; or `manual`, a check on a VM boot.
+`features::features_md_guards_exist` fails when a named test is gone. A change
+to this crate walks the `manual` entries it can reach. A bare `test` is a
+guard not yet written.
 
 The sections up to "On Linux" are the macOS window's, AppKit's. "On Linux"
 is the window on Linux, SDL3's on Wayland or X11, entry by entry against
