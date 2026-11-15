@@ -9224,6 +9224,7 @@ mod tests {
     /// bytes, which it does not read; a read of each op's header on a long one. Printed (run
     /// with `--no-capture`).
     #[test]
+    #[allow(clippy::disallowed_methods)] // a measurement: the wall clock's time
     fn two_ranges_reads_nothing_of_a_short_stream() {
         use std::hint::black_box;
         let short = passes(2);
