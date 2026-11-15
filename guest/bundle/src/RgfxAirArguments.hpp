@@ -278,6 +278,8 @@ bool rgfxReadAirVisible(const uint8_t *bitcode, size_t size, std::vector<RgfxAir
 //   same form (read: Metal's compiler on macOS 27.0.1, tools/oracle/oracle_reflection.metal's
 //   k_imageblock_explicit, k_imageblock_if, f_imageblock_data and f_imageblock_master, as LLVM's
 //   text form prints them);
+//   `air.raster_order_group` g after a texture's access: a fragment function's texture in raster
+//   order group g (`[[texture(n), raster_order_group(g)]]`; read: the same, f_rog_texture);
 //   `air.patch_control_point_input`, as its kind: a post-tessellation vertex function's control
 //   points (its `patch_control_point<T>` stage input, alone or a member of its stage input's
 //   struct), then a node of its control point function (`air.patch_control_point_function` and
@@ -355,7 +357,7 @@ struct RgfxAirNode {
 	// `air.render_target` n, its kind: a fragment function's input of colour attachment n's value;
 	// `renderTargetIsGlobal` where function constants compute n, which the module's initialiser
 	// stores in the global `renderTargetGlobal`, `renderTarget` then 0. `air.raster_order_group`:
-	// the input's raster order group.
+	// the input's raster order group, or a texture's.
 	bool hasRenderTarget = false, renderTargetIsGlobal = false, hasRasterOrderGroup = false;
 	uint32_t renderTarget = 0, rasterOrderGroup = 0;
 	uint64_t renderTargetGlobal = UINT64_MAX;

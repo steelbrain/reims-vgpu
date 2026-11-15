@@ -30,6 +30,7 @@
 //   r_imageblock_data  v_buffers and f_imageblock_data, which reads its tile's imageblock data
 //   r_imageblock_master  v_buffers and f_imageblock_master, whose imageblock data views a master
 //                struct
+//   r_rog_texture  v_buffers and f_rog_texture, which writes a texture in a raster order group
 //   c_atomic_texture  a texture of 64-bit atomics (its library, LIB, is
 //                tools/oracle/oracle_reflection_31.metal's)
 //   r_fetch      v_buffers and f_fetch, which reads its colour attachments (framebuffer fetch)
@@ -486,6 +487,10 @@ int main(int argc, char **argv)
 		const Fn imageblockMaster{"f_imageblock_master", {}};
 		if (CASE("r_imageblock_master"))
 			renderCase("r_imageblock_master", Fn{"v_buffers", {}}, &imageblockMaster, nil, MTLPixelFormatBGRA8Unorm,
+			           MTLPixelFormatInvalid);
+		const Fn rogTexture{"f_rog_texture", {}};
+		if (CASE("r_rog_texture"))
+			renderCase("r_rog_texture", Fn{"v_buffers", {}}, &rogTexture, nil, MTLPixelFormatBGRA8Unorm,
 			           MTLPixelFormatInvalid);
 		if (CASE("r_fetch_at"))
 			renderCase("r_fetch_at", Fn{"v_buffers", {}}, &fetchAt, nil, MTLPixelFormatBGRA8Unorm, MTLPixelFormatInvalid);

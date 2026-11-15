@@ -36,7 +36,8 @@
 //   - a fragment function's input of its tile's imageblock data (`[[imageblock_data]]`, and
 //     `[[imageblock_data(Master)]]`, a view of a master struct) is a binding in its place among the
 //     others, and so, on an Apple GPU, is a kernel's imageblock of an explicit layout, as the M3
-//     Max and the x86 Macs answer them (RgfxPipelineReflection.mm's imageblock);
+//     Max and the x86 Macs answer them (RgfxPipelineReflection.mm's imageblock); a texture in a
+//     raster order group (`[[texture(n), raster_order_group(g)]]`) is answered as one in none;
 //   - a descriptor's buffer is named `vertexBuffer.N` (`stageInBuffer.N` for a compute
 //     pipeline's), N its place among the descriptor's buffers in buffer index order (buffers 1, 4
 //     and 30 are `vertexBuffer.0`, `.1` and `.2`), at its buffer index, of its layout's stride,

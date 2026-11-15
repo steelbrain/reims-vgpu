@@ -6765,7 +6765,8 @@ void test_pipeline_reflection_from_air()
 	CHECK(shape(ask(RgfxRenderPipelineReflectionOf(fn(@"v_buffers"), nil, fn(@"f_imageblock_data"), both),
 	                @"fragmentBindings")) == "s:16 ");
 	// A view of a master struct: its master is its imageBlockMasterStructMembers, each member named by
-	// its user name (both x86 Macs make r_imageblock_master).
+	// its user name (both x86 Macs make r_imageblock_master). A texture in a raster order group is
+	// answered as one in none (r_rog_texture).
 	NSArray *view = ask(RgfxRenderPipelineReflectionOf(fn(@"v_buffers"), nil, fn(@"f_imageblock_master"), both),
 	                    @"fragmentBindings");
 	CHECK(shape(view) == "v:16 ");
@@ -6777,6 +6778,9 @@ void test_pipeline_reflection_from_air()
 		      [((MTLStructMember *)masterMembers[1]).name isEqualToString:@"user(colour)"] &&
 		      ((MTLStructMember *)masterMembers[1]).offset == 8);
 	}
+	NSArray *grouped = ask(RgfxRenderPipelineReflectionOf(fn(@"v_buffers"), nil, fn(@"f_rog_texture"), both),
+	                       @"fragmentBindings");
+	CHECK(shape(grouped) == "tex:2 " && grouped.count == 1 && number(grouped[0], @"index") == 3);
 	if (bindings.count == 9) {
 		id params = bindings[1];
 		CHECK(number(params, @"bufferAlignment") == 32 && number(params, @"bufferDataSize") == 192 &&

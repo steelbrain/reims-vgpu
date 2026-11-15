@@ -588,7 +588,7 @@ fragment half4 f_imageblock_data(VertexOut in [[stage_in]], Stack s [[imageblock
 }
 
 // Imageblock data that views a master struct of the tile's imageblock, its members named by their
-// user names.
+// user names; and a texture in a raster order group.
 struct Master {
 	half d [[user(depth), raster_order_group(0)]];
 	half4 c [[user(colour), raster_order_group(1)]];
@@ -601,6 +601,13 @@ struct DepthView {
 fragment half4 f_imageblock_master(VertexOut in [[stage_in]], DepthView v [[imageblock_data(Master)]])
 {
 	return half4(v.d) + half4(in.uv.x);
+}
+
+fragment half4 f_rog_texture(VertexOut in [[stage_in]],
+                             texture2d<half, access::write> tex [[texture(3), raster_order_group(0)]])
+{
+	tex.write(half4(in.uv.x), uint2(in.position.xy));
+	return half4(in.uv.y);
 }
 
 struct Fetched {

@@ -1765,6 +1765,10 @@ int main()
 		          view.imageblockMaster->at(1).hasRasterOrderGroup &&
 		          view.imageblockMaster->at(1).rasterOrderGroup == 1,
 		      "f_imageblock_master: a view of 16 bytes of a master of depth and colour");
+		const RgfxAirNode grouped = entriesOf("f_rog_texture").entries.at(0).arguments.at(2);
+		check(grouped.kind == "air.texture" && grouped.hasLocation && grouped.index == 3 &&
+		          grouped.hasRasterOrderGroup && grouped.rasterOrderGroup == 0,
+		      "f_rog_texture: a texture at 3 in raster order group 0");
 		// An argument buffer's struct of members is its first id and its layout, the layout's ids its
 		// own from 0; a C array of members is its node of count 1 and the member's array length.
 		const RgfxAirEntry nested = entriesOf("k_nested").entries.at(0);

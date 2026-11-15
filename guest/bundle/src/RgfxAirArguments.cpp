@@ -2095,8 +2095,8 @@ bool nodeKeys(const Module &m, uint64_t id, unsigned depth,
 				return false;
 			out.hasImageblockDataSize = true;
 			i += 1;
-		} else if (k == "air.raster_order_group" && out.kind == "air.render_target") {
-			// The colour attachment's input's raster order group.
+		} else if (k == "air.raster_order_group" && (out.kind == "air.render_target" || out.kind == "air.texture")) {
+			// The colour attachment's input's raster order group, or a texture's.
 			if (!mdUnsigned(m, *node, i + 1, out.rasterOrderGroup))
 				return false;
 			out.hasRasterOrderGroup = true;
