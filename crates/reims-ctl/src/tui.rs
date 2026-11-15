@@ -1431,7 +1431,8 @@ impl App {
         let help = if self.gpus.is_none() {
             "Looking for the host's GPUs…"
         } else {
-            "The GPU the library draws on. Automatic takes the first discrete GPU, then the first integrated one."
+            "The GPU the library draws on. Automatic takes the only GPU, or the one of several that \
+             runs a short workload fastest, timed once for each set of GPUs and drivers."
         };
         Field::choice("gpu", "GPU", options, &selected, help)
     }
@@ -2231,7 +2232,7 @@ fn gpu_id(g: &crate::vm::Gpu) -> String {
 }
 
 fn gpu_options(list: &[GpuInfo]) -> Vec<(String, String)> {
-    let mut v = vec![("auto".to_string(), "Automatic (discrete first)".to_string())];
+    let mut v = vec![("auto".to_string(), "Automatic (the fastest)".to_string())];
     for g in list {
         v.push((gpu_id(&g.to_config()), g.label()));
     }

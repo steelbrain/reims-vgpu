@@ -900,7 +900,7 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
             match (&c.gpu.name, &c.gpu.driver_file) {
                 (Some(n), _) => n.clone(),
                 (None, Some(f)) => paths::tilde(f),
-                _ => "automatic (discrete first)".into(),
+                _ => "automatic: the only GPU, or the fastest of several".into(),
             },
         );
     }
@@ -1161,7 +1161,10 @@ fn gpus(host: Host) {
         );
         return;
     }
-    println!("By default the library takes the first discrete GPU, then the first integrated one.");
+    println!(
+        "By default the library takes the only GPU, or the one of several that runs a short workload \
+         fastest, timed once for each set of GPUs and drivers."
+    );
     for (i, g) in list.iter().enumerate() {
         println!(
             "{:>2}. {}  [{:04x}:{:04x}]  {}",
