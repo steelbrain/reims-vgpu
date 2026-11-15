@@ -3193,7 +3193,8 @@ ids. The kext keeps the device's answer to every create it waited for that
 carries a key (`RgfxSharedPipelines.hpp`): the reflection with its header,
 object id, `gpuResourceID`, unique identifier and resource index zeroed, in a
 table of 2,048 answers (256 sets of 8, a full set replacing the answer found
-or learnt longest ago), empty at each start of the kext. The bundle computes
+or learnt longest ago), seeded at each start of the kext with the device's
+answers of earlier runs (below). The bundle computes
 the key of each create whose libraries all have content keys, and posts it
 with Submit's `kRgfxSubmitShared` flag and the key: where the kext keeps an
 answer of that key and has a slot left, it posts the create as a deferred one
@@ -3208,6 +3209,33 @@ process can place an answer for another's key; a process naming a key that is
 not its create's only takes a wrong reflection for its own pipeline. The
 bundle posts so only where the kext's feature word has
 `kRgfxKextFeatureSharedPipelines` and the device's has `PIPELINE_KEYS`.
+
+Across runs, the device keeps its answers to keyed creates
+(`PIPELINE_ANSWERS`, above), as a Mac's Metal keeps its compiled pipelines on
+disk. The host keeps each made pipeline's keyed answer, with the fields it
+gives each create alone zeroed, in a file of its own, under the identity of
+what decides its answers: the platform's translation profile (its
+fingerprint), its runtime's semantic, artifact and runtime versions, the
+driver's version, and the file's format (`crates/reims-vgpu/src/graphics/answers.rs`).
+A file of another identity is never read. The file is a header (its magic,
+format, record size and identity, with their checksum) and 128-byte records,
+each one key's answer or the drop of a key's answer, with its checksum over
+the identity and its bytes; a damaged or foreign file, or one holding an
+answer no create could be given, reads as none and is started again. It
+holds at most 8,192 records (1 MiB), and one past half of that is written
+again at the next open with its newest 2,048 answers, the kext table's size;
+the host keeps the 8 newest files. A refusal is never kept, and a create of a
+kept key that the device refuses or answers with other values drops the kept
+answer, the second a degradation logged once per boot. At its start, once the
+display is listed and before any process can make a pipeline, the kext asks
+for the kept answers, 64 a query, newest first, until the device has no more
+or it has asked 2,048, and seeds its table with them: a seed takes only a free
+entry of a key the table does not hold, so a full set keeps the newer seeds,
+and ranks below every answer the run learns or finds, the newer seed above
+the older. A create of a key the device accepted in an earlier run then takes
+its answer at once, as an equal create of another process does; its
+`gpuResourceID` still waits for its own answer. The kext seeds only where the
+host took `PIPELINE_KEYS` and `PIPELINE_ANSWERS`.
 
 Every reason the host refuses a pipeline create is either impossible for an
 equal create or known to the process when it posts:

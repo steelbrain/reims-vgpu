@@ -319,9 +319,11 @@ public:
 	// `replyCapacity`). Thread context only, never on the work loop.
 	static constexpr UInt32 kLifecycleMessageMax = RGFX_CONTROL_RING_DATA_SIZE / 2;
 	static constexpr UInt32 kLifecycleReplyMax = 128;
+	// Where `seedOrder` is not null, the waiter is a seed's (LifecycleWaiter), its first
+	// PIPELINE_REFLECTION the *seedOrder th newest.
 	IOReturn postLifecycle(UInt32 type, const void *message, UInt32 size, UInt32 replyType,
 	                       void *reply, UInt32 replyCapacity, UInt32 *replyLength, UInt64 *seqno,
-	                       UInt32 timeoutMs);
+	                       UInt32 timeoutMs, const UInt32 *seedOrder = nullptr);
 
 	// A pipeline create of context `context` posted without waiting for its answer, which the
 	// device's answer then waits for in a slot of the deferred answers (RgfxDeferredAnswers.hpp)
@@ -345,6 +347,10 @@ public:
 	// Keeps the device's answer to a pipeline create, the `length` bytes of `reply`, where it
 	// carries a made pipeline's key, for every process's equal creates.
 	void learnSharedPipeline(const UInt8 *reply, UInt32 length);
+	// Seeds the shared pipelines, where the host took PIPELINE_ANSWERS, with the answers the
+	// device kept of keyed creates of its earlier runs (RGFX_CMD_PIPELINE_ANSWERS), newest first,
+	// until the device has no more or the table's size is asked. Thread context only, at start.
+	void seedSharedPipelines();
 	// Frees the deferred slot of the create at `seqno`, posted after its context closed.
 	void forgetDeferred(UInt64 seqno);
 
@@ -412,12 +418,16 @@ private:
 	static constexpr UInt32 kControlWaiters = 8;
 
 	// A thread waiting for a lifecycle message's answer: free while replyType is 0; its seqno
-	// is 0 until the message is on the ring.
+	// is 0 until the message is on the ring. A seed's (`seed`, seedSharedPipelines) takes the
+	// PIPELINE_REFLECTIONs of its seqno before its answer into the shared pipelines, the next one
+	// the `order`th newest the device hands.
 	struct LifecycleWaiter {
 		UInt64 seqno;
 		UInt32 replyType;
 		UInt32 length;
 		bool done;
+		bool seed;
+		UInt32 order;
 		UInt8 reply[kLifecycleReplyMax];
 	};
 	static constexpr UInt32 kLifecycleWaiters = 32;
@@ -541,6 +551,9 @@ private:
 	// The host took DISPLAY_POWER: the work loop tells it the display's panel (panelWanted), set
 	// before `ready`.
 	bool displayPowerTaken;
+	// The host took PIPELINE_KEYS and PIPELINE_ANSWERS: the start seeds the shared pipelines
+	// (seedSharedPipelines), set before `ready`.
+	bool pipelineAnswersTaken;
 	// The sleeps for room (waitForRoom), under stateLock, and the SUBMIT_ROOM records the work
 	// loop took (atomic), for the log line waitForRoom writes at most every kRoomLogMs.
 	RgfxRingRoomStats roomStats;

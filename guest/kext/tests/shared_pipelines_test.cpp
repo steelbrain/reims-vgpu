@@ -3,6 +3,8 @@
 // stamped with its own seqno and object id, every field the device gives each create alone
 // zeroed; a refusal, a mesh answer and an answer with no key are not kept; a set full of other
 // keys replaces the one found or learnt longest ago, so the table never holds more than its size.
+// An answer seeded from an earlier run, handed newest first, takes only a free entry of a key not
+// kept, and ranks below every answer learnt or found since, the newer seed above the older.
 #include "RgfxSharedPipelines.hpp"
 
 #include <cstdio>
@@ -149,6 +151,68 @@ int main()
 	// A start forgets every answer.
 	t.clear();
 	check(t.size() == 0 && !t.find(a, 1, 1, &out), "cleared");
+
+	// Seeds, handed newest first: each takes a free entry, as an equal create's answer.
+	static_assert(Table::kSeeds == 4, "2 sets of 2");
+	answerOf(reply, a, 7, 8);
+	check(t.seed(reply, kBytes, 0), "the newest seed is kept");
+	check(t.find(a, 901, 31, &out) && out.header.seqno == 901 && out.obj_id == 31 &&
+	          out.header.size == sizeof(RgfxPipelineReflection) && out.gpu_resource_id == 0 &&
+	          out.unique_identifier == 0 && out.resource_index == 0 &&
+	          out.thread_execution_width == 32,
+	      "a seeded answer is found as a learnt one is");
+	t.clear();
+	answerOf(reply, a, 7, 8);
+	check(t.seed(reply, kBytes, 0), "a seeded");
+	answerOf(reply, b, 7, 8);
+	check(t.seed(reply, kBytes, 1), "b seeded");
+	answerOf(reply, c, 7, 8);
+	check(!t.seed(reply, kBytes, 2), "an older seed does not replace a newer one in a full set");
+	check(!t.find(c, 1, 1, &out) && t.size() == 2, "the full set keeps a and b");
+	answerOf(reply, a, 7, 8);
+	check(!t.seed(reply, kBytes, 3), "a key kept is not seeded again");
+	answerOf(reply, d, 7, 8);
+	check(!t.seed(reply, kBytes, Table::kSeeds), "no seed past the table's size");
+	std::memcpy(&r, reply, sizeof(r));
+	r.status = RGFX_PIPELINE_REFUSED;
+	std::memcpy(reply, &r, sizeof(r));
+	check(!t.seed(reply, kBytes, 2), "a refusal is not seeded");
+	check(t.size() == 2, "a and b alone");
+
+	// Every answer learnt since ranks above the seeds, the newer seed above the older: a full set
+	// of seeds replaces the oldest first.
+	answerOf(reply, c, 8, 9);
+	check(t.learn(reply, kBytes), "c learnt over the seeds");
+	check(t.find(a, 1, 1, &out) && t.find(c, 1, 1, &out) && !t.find(b, 1, 1, &out),
+	      "b, the older seed, replaced");
+	uint8_t e[32];
+	keyOf(e, 0xe0, 0);
+	answerOf(reply, e, 9, 10);
+	check(t.learn(reply, kBytes), "e learnt");
+	check(t.find(c, 1, 1, &out) && t.find(e, 1, 1, &out) && !t.find(a, 1, 1, &out),
+	      "then a, found before c was found again");
+
+	// A seed found ranks as found in this run.
+	t.clear();
+	answerOf(reply, a, 7, 8);
+	t.seed(reply, kBytes, 0);
+	answerOf(reply, b, 7, 8);
+	t.seed(reply, kBytes, 1);
+	check(t.find(b, 1, 1, &out), "b, the older seed, found");
+	answerOf(reply, c, 8, 9);
+	check(t.learn(reply, kBytes), "c learnt");
+	check(t.find(b, 1, 1, &out) && !t.find(a, 1, 1, &out), "a, not found since, replaced");
+
+	// A seed never replaces this run's answer of its key.
+	t.clear();
+	answerOf(reply, d, 5, 6);
+	std::memcpy(&r, reply, sizeof(r));
+	r.thread_execution_width = 64;
+	std::memcpy(reply, &r, sizeof(r));
+	check(t.learn(reply, kBytes), "d learnt");
+	answerOf(reply, d, 5, 6);
+	check(!t.seed(reply, kBytes, 0), "d's seed not kept");
+	check(t.find(d, 1, 1, &out) && out.thread_execution_width == 64, "this run's answer stays");
 
 	std::printf("shared_pipelines_test: %d checks passed\n", checks);
 	return 0;

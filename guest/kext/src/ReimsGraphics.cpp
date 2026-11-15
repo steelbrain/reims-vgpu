@@ -435,7 +435,8 @@ IOReturn ReimsGraphics::command(UInt32 type, const void *message, UInt32 size)
 
 IOReturn ReimsGraphics::postLifecycle(UInt32 type, const void *message, UInt32 size,
                                       UInt32 replyType, void *reply, UInt32 replyCapacity,
-                                      UInt32 *replyLength, UInt64 *seqno, UInt32 timeoutMs)
+                                      UInt32 *replyLength, UInt64 *seqno, UInt32 timeoutMs,
+                                      const UInt32 *seedOrder)
 {
 	if (replyLength)
 		*replyLength = 0;
@@ -465,6 +466,8 @@ IOReturn ReimsGraphics::postLifecycle(UInt32 type, const void *message, UInt32 s
 	w->replyType = replyType;
 	w->length = 0;
 	w->done = false;
+	w->seed = seedOrder != nullptr;
+	w->order = seedOrder ? *seedOrder : 0;
 	IOLockUnlock(stateLock);
 
 	UInt64 s = 0;
@@ -489,6 +492,7 @@ IOReturn ReimsGraphics::postLifecycle(UInt32 type, const void *message, UInt32 s
 	}
 	w->replyType = 0;
 	w->seqno = 0;
+	w->seed = false;
 	IOLockWakeup(stateLock, lifecycleWaiters, false);
 	IOLockUnlock(stateLock);
 	static char unanswered;
@@ -577,6 +581,43 @@ void ReimsGraphics::learnSharedPipeline(const UInt8 *reply, UInt32 length)
 	IOLockLock(stateLock);
 	sharedPipelines->learn(reply, length);
 	IOLockUnlock(stateLock);
+}
+
+void ReimsGraphics::seedSharedPipelines()
+{
+	if (!sharedPipelines || !pipelineAnswersTaken)
+		return;
+	// A query's answers fill at most a quarter of the completion ring, so its other events go on.
+	constexpr UInt32 kSeedBatch = 64;
+	static_assert(kSeedBatch * SharedPipelines::kKeyedReplyBytes <= kRingBytes / 4,
+	              "a seed's answers leave the completion ring room");
+	UInt32 handed = 0;
+	while (handed < SharedPipelines::kSeeds) {
+		RgfxPipelineAnswersQuery query;
+		bzero(&query, sizeof(query));
+		query.first = handed;
+		query.most = kSeedBatch;
+		RgfxComplete reply;
+		bzero(&reply, sizeof(reply));
+		UInt32 length = 0;
+		const UInt32 order = handed;
+		IOReturn r = postLifecycle(RGFX_CMD_PIPELINE_ANSWERS, &query, sizeof(query),
+		                           RGFX_EVT_COMPLETE, &reply, sizeof(reply), &length, nullptr,
+		                           kAnswerTimeoutMs, &order);
+		if (r != kIOReturnSuccess || length < sizeof(reply) || reply.status > kSeedBatch) {
+			IOLog("ReimsGraphics: the device's kept pipeline answers stop at %u (0x%x, %u)\n",
+			      handed, r, reply.status);
+			break;
+		}
+		handed += reply.status;
+		if (reply.status < kSeedBatch)
+			break;
+	}
+	IOLockLock(stateLock);
+	const UInt32 kept = sharedPipelines->size();
+	IOLockUnlock(stateLock);
+	IOLog("ReimsGraphics: %u pipeline answers of earlier runs from the device, %u kept\n", handed,
+	      kept);
 }
 
 void ReimsGraphics::kickWorkLoop()
@@ -1010,6 +1051,23 @@ bool ReimsGraphics::answerLifecycle(UInt32 type, UInt64 seqno, const volatile UI
 		return false;
 	bool found = false;
 	IOLockLock(stateLock);
+	// A seed's answers (seedSharedPipelines): into the shared pipelines, in the order they come.
+	for (UInt32 i = 0; type == RGFX_EVT_PIPELINE_REFLECTION && i < kLifecycleWaiters && !found;
+	     i++) {
+		LifecycleWaiter &w = lifecycleWaiters[i];
+		if (!w.seed || w.done || __atomic_load_n(&w.seqno, __ATOMIC_ACQUIRE) != seqno)
+			continue;
+		found = true;
+		UInt8 reply[SharedPipelines::kKeyedReplyBytes];
+		RgfxMsgHeader h = {type, size + kHeaderBytes, seqno};
+		UInt32 n = size + kHeaderBytes < sizeof(reply) ? size + kHeaderBytes : sizeof(reply);
+		memcpy(reply, &h, kHeaderBytes);
+		for (UInt32 b = kHeaderBytes; b < n; b++)
+			reply[b] = payload[b - kHeaderBytes];
+		if (sharedPipelines)
+			sharedPipelines->seed(reply, n, w.order);
+		w.order++;
+	}
 	for (UInt32 i = 0; i < kLifecycleWaiters && !found; i++) {
 		LifecycleWaiter &w = lifecycleWaiters[i];
 		if (w.replyType != type || w.done ||
@@ -1418,6 +1476,7 @@ bool ReimsGraphics::start(IOService *provider)
 	hostTime = false;
 	guestTimes = false;
 	displayPowerTaken = false;
+	pipelineAnswersTaken = false;
 	wranglerNotifier = nullptr;
 	wranglerInterest = nullptr;
 	// The device is lit from its reset (design.md, "The display's sleep").
@@ -1577,6 +1636,9 @@ bool ReimsGraphics::start(IOService *provider)
 		hostTime = (took & RGFX_FEATURE_HOST_TIME) != 0;
 		guestTimes = (took & RGFX_FEATURE_GUEST_TIMES) != 0;
 		displayPowerTaken = (took & RGFX_FEATURE_DISPLAY_POWER) != 0;
+		pipelineAnswersTaken =
+		    (took & (RGFX_FEATURE_PIPELINE_KEYS | RGFX_FEATURE_PIPELINE_ANSWERS)) ==
+		    (RGFX_FEATURE_PIPELINE_KEYS | RGFX_FEATURE_PIPELINE_ANSWERS);
 	}
 	produced = load64(ring(RGFX_CONTROL_SUBMIT_OFFSET) + kRingProducer);
 	consumed = load64(ring(RGFX_CONTROL_COMPLETE_OFFSET) + kRingConsumer);
@@ -1596,6 +1658,8 @@ bool ReimsGraphics::start(IOService *provider)
 		goto fail;
 	}
 	IOLog("ReimsGraphics: display %u, %u modes, region 0x%llx bytes\n", displayId, count, regionSize);
+	// Before any process can make a pipeline: the bundle loads once the accelerator is published.
+	seedSharedPipelines();
 
 	// The display's accelerator and pipe, which the wrangler, CoreDisplay and IOPresentment read
 	// off the framebuffer when it is published: our one display is pipe 0 of the accelerator on
