@@ -3052,12 +3052,13 @@ void test_argument_encoders_of_bindings()
 		      asker.asked.back().buffer_index == 2 &&
 		      asker.asked.back().library_obj_id == reflected.rgfxObjId);
 	}
+	// The encoder's reflection of buffer 2: the binding the function's pipelines reflect, built from
+	// its AIR, of the library's binding's name.
 	RgfxFunction *fn = (RgfxFunction *)[reflected newFunctionWithName:@"every_access"];
 	MTLArgument *of2 = [fn rgfxArgumentOfBufferAtIndex:2];
-	CHECK((of2 == nil) ==
-	      (reflectedBuffer == nil || ![(id)reflectedBuffer isKindOfClass:[MTLArgument class]]));
-	CHECK(of2 == nil || ([of2.name isEqualToString:reflectedBuffer.name] && of2.index == 2 &&
-	                     of2.type == MTLArgumentTypeBuffer && of2.bufferDataType == MTLDataTypeStruct));
+	CHECK(of2 != nil && [of2.name isEqualToString:@"writesOne"] && of2.index == 2 &&
+	      of2.type == MTLArgumentTypeBuffer && of2.bufferDataType == MTLDataTypeStruct);
+	CHECK(reflectedBuffer == nil || [of2.name isEqualToString:reflectedBuffer.name]);
 	CHECK([fn rgfxArgumentOfBufferAtIndex:7] == nil);
 	while (control.next(&h, &drained)) {
 	}

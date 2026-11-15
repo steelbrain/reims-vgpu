@@ -6805,6 +6805,18 @@ void test_pipeline_reflection_from_air()
 		      ((MTLStructMember *)members[4]).arrayType.elementType == MTLDataTypeTexture &&
 		      ((MTLStructMember *)members[5]).argumentIndex == 6);
 	}
+	// An argument encoder's reflection of the function's argument buffer is the binding its
+	// pipelines reflect, not its library's: the array of textures of stride 0, where the library's
+	// reflection gives it the element's size (measured: oracle_bundle argbuf.reflection, the x86
+	// Macs and the M3 Max alike). The library here keeps no reflection of its own.
+	MTLArgument *encoderBinding = [(RgfxFunction *)fn(@"k_argument_buffer") rgfxArgumentOfBufferAtIndex:0];
+	NSArray *encoderMembers = encoderBinding.bufferStructType.members;
+	CHECK(encoderBinding != nil && encoderBinding.index == 0 && encoderBinding.type == MTLArgumentTypeBuffer &&
+	      encoderMembers.count == 7);
+	if (encoderMembers.count == 7)
+		CHECK(((MTLStructMember *)encoderMembers[4]).arrayType.stride == 0 &&
+		      ((MTLStructMember *)encoderMembers[4]).arrayType.argumentIndexStride == 1);
+	CHECK([(RgfxFunction *)fn(@"k_argument_buffer") rgfxArgumentOfBufferAtIndex:7] == nil);
 	// k_nested's members (Metal's answers, measured on both x86 Macs), each its data type, its
 	// argument index, an array's element type, length, stride and index stride, and whether an
 	// array's elements' binding (its -elementIndirectArgumentType) or the member's own is given.

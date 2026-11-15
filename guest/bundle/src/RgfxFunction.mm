@@ -701,12 +701,14 @@ bool isRendererPluginData(NSData *data)
 	                                   serializer:[self serializer]];
 }
 
-// The encoder with the buffer's reflection: the binding of that buffer index in the function's
-// reflection, which its library answers from Metal's own over the same bytes, as both x86 Macs
-// answer one there, an MTLBufferBindingInternal (oracle_bundle argbuf.reflection: the AMD 5300M
-// and the Intel 630 under macOS 26.7.1). Their arrays' strides answer 0 there and the size of an
-// element in the library's reflection, which this answers. nil, logged, where the library keeps
-// no source to reflect.
+// The encoder with the buffer's reflection: the binding of that buffer index, an
+// MTLBufferBindingInternal, as a pipeline of the function reflects it, its argument buffer's
+// arrays of stride 0 where the library's reflection gives them their element's size (measured:
+// oracle_bundle argbuf.reflection against argbuf.binding and argbuf.binding.lib, the AMD 5300M and
+// the Intel 630 under macOS 26.7.1 and the M3 Max under macOS 27.0.1 alike). Built from the
+// function's AIR as its pipelines' reflection is (RgfxStageReflectionOf); the library's binding,
+// Metal's own over the same bytes, where that is not made; nil, logged, where the library keeps no
+// source to reflect either.
 - (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)bufferIndex
                                                  reflection:(MTLAutoreleasedArgument *)reflection
 {
@@ -718,6 +720,16 @@ bool isRendererPluginData(NSData *data)
 
 - (MTLArgument *)rgfxArgumentOfBufferAtIndex:(NSUInteger)bufferIndex
 {
+	RgfxStageReflection stage;
+	NSString *why = nil;
+	if (RgfxStageReflectionOf(self, @"stageInBuffer", {}, stage, &why)) {
+		for (id binding in stage.bindings) {
+			if ([binding isKindOfClass:[MTLArgument class]] &&
+			    ((MTLArgument *)binding).type == MTLArgumentTypeBuffer &&
+			    ((MTLArgument *)binding).index == bufferIndex)
+				return (MTLArgument *)binding;
+		}
+	}
 	RgfxResource *library = [self rgfxLibrary];
 	const char *entry = [self rgfxEntryPointUTF8];
 	NSString *name = entry != nullptr ? @(entry) : nil;
