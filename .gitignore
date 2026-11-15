@@ -19,3 +19,4 @@ __pycache__/
 # reims-ctl's, which is a workspace of its own.
 /target*/
 /crates/reims-ctl/target/
+/crates/reims-restore/target/

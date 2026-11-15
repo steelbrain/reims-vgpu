@@ -1,0 +1,30 @@
+# reims-apfs: reads files out of APFS containers (an IPSW's system image, a VM's disk), checking
+# every object it reads.
+[package]
+name = "reims-apfs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+publish = false
+license = "GPL-2.0-or-later OR LGPL-3.0-or-later"
+description = "A checked APFS reader: containers, volumes and files by path"
+
+[dependencies]
+# CRC-32C, the hash APFS keys directory entries by (names.rs).
+crc = "3.4.0"
+# LZVN and LZFSE, two of the encodings of compressed files (decmpfs.rs). BSD-3-Clause.
+ferrosys-lzfse = "0.8.0"
+# zlib, another (decmpfs.rs).
+flate2 = "1.1.11"
+# Unicode's decompositions, combining classes and case foldings, which APFS normalizes names with
+# before hashing them (names.rs). Unicode-3.0.
+ferrosys-ucd = "0.8.0"
+# The GUID partition table (gpt.rs).
+gptman = "3.1.1"
+# The SHA-256 a sealed volume checks its file-system tree's nodes by (read.rs).
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+
+[dev-dependencies]
+# An independent APFS writer: the tests read the containers it formats.
+ferrosys = { version = "0.8.0", default-features = false, features = ["apfs"] }

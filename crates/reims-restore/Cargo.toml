@@ -1,0 +1,70 @@
+# reims-restore: restores an IPSW onto an arm64 VM's disk without Apple's tools (docs/design.md).
+# Its own Cargo workspace, like reims-ctl, so it builds without the rest of the tree. reims-apfs
+# (apfs/) is the disk side: GPT and APFS.
+[package]
+name = "reims-restore"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+publish = false
+license = "GPL-2.0-or-later OR LGPL-3.0-or-later"
+description = "Restore macOS from an IPSW onto an arm64 VM's disk, without Apple's tools"
+
+[workspace]
+resolver = "3"
+members = ["apfs"]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "reims-restore"
+path = "src/main.rs"
+
+[dependencies]
+# The disk side: APFS containers and the GPT (apfs/, lane R2).
+reims-apfs = { path = "apfs" }
+# Apple Encrypted Archive decryption, given the archive's key (aea.rs).
+aea-tools = "0.1.1"
+anyhow = "1.0.104"
+# The base64 of an AEA's fcs-response (aea.rs).
+base64 = "0.22.1"
+# UDIF chunks compressed with bzip2 (udif.rs).
+bzip2 = "0.6.1"
+# The CRC-32 of each IPSW member it streams (ipsw.rs), and the ean storage's (aux.rs).
+crc32fast = "1.5.5"
+clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
+# UDIF chunks compressed with zlib, and the IPSW's deflated members (udif.rs, ipsw.rs).
+flate2 = "1.1.11"
+# Unwraps an AEA's key with the private key Apple's key service returns: HPKE, DHKEM(P-256), AES-GCM.
+hpke = { version = "0.15.1", default-features = false, features = ["alloc", "aes", "nistp"] }
+# UDIF chunks compressed with LZMA (xz), rare in IPSWs (udif.rs).
+lzma-rs = "0.3.0"
+# UDIF chunks compressed with LZFSE (udif.rs).
+lzfse_rust = "0.2.1"
+# The PEM private key Apple's key service returns for an AEA (aea.rs).
+p256 = { version = "0.14.0", features = ["pkcs8", "pem"] }
+# Signs the VM's LocalPolicies: ECDSA P-384 with SHA-384 (policy.rs).
+p384 = { version = "0.14.0", features = ["ecdsa", "pkcs8", "pem"] }
+# BuildManifest.plist, Restore.plist, the TSS request and response, UDIF's resource fork.
+plist = "1.10.3"
+getrandom = "0.4.3"
+# statvfs, for the space free where the VM goes (pipeline.rs), and the CLI's signal handler.
+libc = "0.2.191"
+# The SHA-1 Apple's catalog gives for an IPSW, checked as it downloads (download.rs).
+sha1 = "0.11.0"
+# The JSON of an AEA's fcs-response (aea.rs).
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+# HTTPS to Apple's TSS, key service and CDN, with rustls.
+ureq = "3.5.1"
+uuid = { version = "1.29.2", features = ["v4"] }
+# The IPSW is a zip (ipsw.rs).
+zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2"] }
+
+[dev-dependencies]
+# Writes the tests' synthetic IPSWs.
+zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2"] }
+
+[profile.release]
+debug = "line-tables-only"
