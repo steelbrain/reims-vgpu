@@ -44,8 +44,9 @@ enum Command {
         #[arg(long)]
         apfs: bool,
     },
-    /// Restore an IPSW into a new VM directory: disk.img, aux.img, aux.img.trimmed and
-    /// machine-identifier.bin, for QEMU's vmapple machine on Ambrosia.
+    /// Restore an IPSW into a new VM directory: disk.img, aux.img, aux.img.trimmed,
+    /// machine-identifier.bin and config.cpio, Ambrosia's bundle of the patches that swap the
+    /// guest's LocalPolicy anchors for the project's, for QEMU's vmapple machine on Ambrosia.
     Restore {
         /// The IPSW: a UniversalMac IPSW of macOS 14 or later.
         ipsw: PathBuf,
@@ -57,11 +58,6 @@ enum Command {
         /// The VM's ECID, in hex; random by default.
         #[arg(long, value_parser = parse_hex)]
         ecid: Option<u64>,
-        /// The directory of the project's LocalPolicy keys (root.key, int.key, leaf.key): swap
-        /// the guest's trust anchors for the project's chain, refuse its local policy nonce
-        /// updates, and write config.cpio, Ambrosia's bundle of the patches.
-        #[arg(long)]
-        lp_keys: Option<PathBuf>,
     },
     /// After a macOS 14 VM's first boot: macOS 14 makes its Data volume at that boot and resets
     /// the VM, which then doesn't start; this makes it bootable again, for Setup Assistant.
@@ -102,8 +98,7 @@ fn main() -> Result<()> {
             dir,
             disk_gib,
             ecid,
-            lp_keys,
-        } => restore(ipsw, dir, disk_gib, ecid, lp_keys),
+        } => restore(ipsw, dir, disk_gib, ecid),
         Command::FinishEacs { dir } => {
             reims_restore::pipeline::finish_eacs(&dir)?;
             println!(
@@ -121,13 +116,7 @@ fn parse_hex(s: &str) -> Result<u64, String> {
     u64::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|e| e.to_string())
 }
 
-fn restore(
-    ipsw: PathBuf,
-    dir: PathBuf,
-    disk_gib: u64,
-    ecid: Option<u64>,
-    lp_keys: Option<PathBuf>,
-) -> Result<()> {
+fn restore(ipsw: PathBuf, dir: PathBuf, disk_gib: u64, ecid: Option<u64>) -> Result<()> {
     use reims_restore::pipeline::{self, Event};
 
     let disk_size = disk_gib
@@ -139,7 +128,6 @@ fn restore(
         dir,
         disk_size,
         ecid,
-        lp_keys,
     };
     on_interrupt_cancel();
     let mut last = (String::new(), u64::MAX);

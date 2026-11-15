@@ -34,11 +34,6 @@ pub struct Restore {
     pub disk_size: u64,
     /// The VM's ECID; random when `None`.
     pub ecid: Option<u64>,
-    /// The directory of the project's LocalPolicy keys (`root.key`, `int.key`, `leaf.key`):
-    /// with them the restore swaps the guest's trust anchors for the project's chain and writes
-    /// Ambrosia's bundle of the patches, [`CONFIG`] ([`crate::anchors`]); without them it signs
-    /// with the built-in chain and writes no bundle.
-    pub lp_keys: Option<PathBuf>,
 }
 
 /// What a restore reports as it goes.
@@ -101,7 +96,7 @@ pub const AUX_TRIMMED: &str = "aux.img.trimmed";
 /// The ECID in Virtualization.framework's form, a binary plist `{ECID: n}`.
 pub const MACHINE_IDENTIFIER: &str = "machine-identifier.bin";
 /// Ambrosia's configuration bundle of the patches that swap the guest's LocalPolicy anchors for
-/// the project's, where the restore was given the project's keys.
+/// the project's and refuse its local policy nonce updates.
 pub const CONFIG: &str = "config.cpio";
 /// For [`FirstBoot::Eacs`], until [`finish_eacs`]: the iBoot system container's partition as the
 /// restore wrote it, sparse.
@@ -228,39 +223,31 @@ pub fn run(r: &Restore, events: &mut dyn FnMut(Event), cancel: &AtomicBool) -> R
     );
     cancelled(cancel)?;
 
+    // The project's chain, built at the guest's lengths, signs the policies, and Ambrosia's
+    // bundle swaps it in for the guest's anchors and refuses the guest's local policy nonce
+    // updates (crate::anchors, crate::policy_nonce).
     step(events, "Signing the VM's LocalPolicies");
-    let (signer, bundle) = match &r.lp_keys {
-        Some(dir) => {
-            let kernel = install
-                .component("KernelCache")?
-                .path()
-                .context("the manifest's KernelCache has no path")?;
-            let kc = kernelcache::decompress(&ipsw.read(kernel)?)
-                .with_context(|| format!("read {kernel}"))?;
-            let fs = kernelcache::FileSet::parse(&kc)?;
-            let guest = anchors::guest(&fs)
-                .with_context(|| format!("find the LocalPolicy anchors in {kernel}"))?;
-            let refusal = policy_nonce::refusal(&fs).with_context(|| {
-                format!("find the local policy nonce update's beginning in {kernel}")
-            })?;
-            drop(fs);
-            drop(kc);
-            let keys = anchors::Keys::load(dir)?;
-            let chain = anchors::chain(&guest, &keys)?;
-            let signer = policy::Signer::with_key(keys.leaf, &[&chain.intermediate, &chain.leaf])?;
-            let mut config = anchors::config(&guest, &chain);
-            policy_nonce::add_to(&mut config, &refusal);
-            let bundle = anchors::config_bundle(&config)?;
-            (signer, Some(bundle))
-        }
-        None => {
-            events(Event::Note(
-                "no LocalPolicy keys given: the policies carry the built-in chain, and no \
-                 anchor bundle is written"
-                    .into(),
-            ));
-            (policy::Signer::project(), None)
-        }
+    let (signer, bundle) = {
+        let kernel = install
+            .component("KernelCache")?
+            .path()
+            .context("the manifest's KernelCache has no path")?;
+        let kc = kernelcache::decompress(&ipsw.read(kernel)?)
+            .with_context(|| format!("read {kernel}"))?;
+        let fs = kernelcache::FileSet::parse(&kc)?;
+        let guest = anchors::guest(&fs)
+            .with_context(|| format!("find the LocalPolicy anchors in {kernel}"))?;
+        let refusal = policy_nonce::refusal(&fs).with_context(|| {
+            format!("find the local policy nonce update's beginning in {kernel}")
+        })?;
+        drop(fs);
+        drop(kc);
+        let keys = anchors::Keys::project();
+        let chain = anchors::chain(&guest, &keys)?;
+        let signer = policy::Signer::with_key(keys.leaf, &[&chain.intermediate, &chain.leaf])?;
+        let mut config = anchors::config(&guest, &chain);
+        policy_nonce::add_to(&mut config, &refusal);
+        (signer, anchors::config_bundle(&config)?)
     };
     let boot = img4::parse_im4m(&boot_manifest).context("read the boot manifest")?;
     let prop = |k: &str| {
@@ -328,7 +315,7 @@ pub fn run(r: &Restore, events: &mut dyn FnMut(Event), cancel: &AtomicBool) -> R
             Ok(())
         }
     });
-    match written.and_then(|()| files.finish(secrets.ecid, bundle.as_deref(), eacs)) {
+    match written.and_then(|()| files.finish(secrets.ecid, &bundle, eacs)) {
         Ok(()) => Ok(Restored {
             ecid: secrets.ecid,
             version,
@@ -542,13 +529,11 @@ impl Files {
         copy_sparse(&aux, 0, AUX_SIZE, &self.part(EACS_AUX), 0)
     }
 
-    /// Writes `aux.img`, the machine identifier and the anchor bundle (if any), and moves the
-    /// disks into place, and, for `eacs`, the copies [`finish_eacs`] puts back.
-    fn finish(&self, ecid: u64, bundle: Option<&[u8]>, eacs: bool) -> Result<()> {
-        if let Some(b) = bundle {
-            let p = self.part(CONFIG);
-            std::fs::write(&p, b).with_context(|| format!("write {}", p.display()))?;
-        }
+    /// Writes `aux.img`, the machine identifier and the anchor bundle, and moves the disks into
+    /// place, and, for `eacs`, the copies [`finish_eacs`] puts back.
+    fn finish(&self, ecid: u64, bundle: &[u8], eacs: bool) -> Result<()> {
+        let p = self.part(CONFIG);
+        std::fs::write(&p, bundle).with_context(|| format!("write {}", p.display()))?;
         let aux = self.part(AUX);
         {
             let mut out = File::create(&aux).with_context(|| format!("make {}", aux.display()))?;
@@ -570,10 +555,7 @@ impl Files {
         }
         // The machine identifier goes last; a failed move takes back those made before it.
         let mut moved = Vec::new();
-        let mut names = vec![DISK, AUX_TRIMMED, AUX];
-        if bundle.is_some() {
-            names.push(CONFIG);
-        }
+        let mut names = vec![DISK, AUX_TRIMMED, AUX, CONFIG];
         if eacs {
             names.extend([EACS_ISC, EACS_AUX]);
         }
@@ -741,9 +723,10 @@ mod tests {
         let f = Files::new(&d);
         f.make(1 << 20).unwrap();
         std::fs::write(f.part(AUX_TRIMMED), b"nvram").unwrap();
-        f.finish(0x1234_5678_9abc_def0, None, false).unwrap();
-        assert!(!d.join(CONFIG).exists(), "no bundle without the keys");
-        for n in [DISK, AUX, AUX_TRIMMED, MACHINE_IDENTIFIER] {
+        f.finish(0x1234_5678_9abc_def0, b"070701 a bundle", false)
+            .unwrap();
+        assert_eq!(std::fs::read(d.join(CONFIG)).unwrap(), b"070701 a bundle");
+        for n in [DISK, AUX, AUX_TRIMMED, CONFIG, MACHINE_IDENTIFIER] {
             assert!(d.join(n).is_file(), "{n}");
             assert!(!f.part(n).exists(), "{n}.part");
         }
@@ -814,7 +797,7 @@ mod tests {
         let a = aux::trimmed(&n, b"a ticket of the tests' own").unwrap();
         std::fs::write(f.part(AUX_TRIMMED), &a).unwrap();
         f.keep_for_eacs(&table).unwrap();
-        f.finish(7, None, true).unwrap();
+        f.finish(7, b"a bundle", true).unwrap();
         (d, table, n, a)
     }
 
@@ -915,17 +898,6 @@ mod tests {
     }
 
     #[test]
-    fn a_restore_with_the_keys_leaves_the_bundle() {
-        let d = temp_dir();
-        let f = Files::new(&d);
-        f.make(4096).unwrap();
-        f.finish(1, Some(b"070701 a bundle"), false).unwrap();
-        assert_eq!(std::fs::read(d.join(CONFIG)).unwrap(), b"070701 a bundle");
-        assert!(!f.part(CONFIG).exists());
-        std::fs::remove_dir_all(&d).unwrap();
-    }
-
-    #[test]
     fn a_failed_restore_leaves_nothing() {
         let d = temp_dir();
         let f = Files::new(&d);
@@ -944,7 +916,7 @@ mod tests {
         // The machine identifier's place is taken by a directory with a file in it.
         std::fs::create_dir(d.join(MACHINE_IDENTIFIER)).unwrap();
         std::fs::write(d.join(MACHINE_IDENTIFIER).join("x"), b"x").unwrap();
-        assert!(f.finish(1, Some(b"a bundle"), false).is_err());
+        assert!(f.finish(1, b"a bundle", false).is_err());
         for n in [DISK, AUX, AUX_TRIMMED, CONFIG] {
             assert!(!d.join(n).exists(), "{n} was left in place");
         }

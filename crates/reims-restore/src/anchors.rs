@@ -310,27 +310,37 @@ pub struct Keys {
 }
 
 impl Keys {
-    /// The keys in `dir`: `root.key`, `int.key` and `leaf.key`, each a P-384 private key in PEM
+    /// The project's keys, built in: one set for every VM, since whoever can write a VM's disk
+    /// can write its NVRAM and its bundle too, so a key per VM, or a secret one, would protect
+    /// nothing (docs/design.md, "The LocalPolicy"). `keys/make.sh` made them.
+    #[must_use]
+    pub fn project() -> Self {
+        Self::from_pem(
+            include_str!("../keys/project-root.key"),
+            include_str!("../keys/project-intermediate.key"),
+            include_str!("../keys/project-leaf.key"),
+        )
+        .expect("the built-in LocalPolicy keys are P-384 private keys in PEM")
+    }
+
+    /// The keys of the root, the intermediate and the leaf, each a P-384 private key in PEM
     /// (PKCS#8 or SEC1).
     ///
     /// # Errors
     ///
-    /// A file is missing or not such a key.
-    pub fn load(dir: &std::path::Path) -> Result<Self> {
-        let key = |name: &str| -> Result<SigningKey> {
+    /// One is not such a key.
+    pub fn from_pem(root: &str, intermediate: &str, leaf: &str) -> Result<Self> {
+        let key = |what: &str, pem: &str| -> Result<SigningKey> {
             use p384::pkcs8::DecodePrivateKey as _;
-            let p = dir.join(name);
-            let pem =
-                std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
-            let k = p384::SecretKey::from_pkcs8_pem(&pem)
-                .or_else(|_| p384::SecretKey::from_sec1_pem(&pem))
-                .with_context(|| format!("{} is not a P-384 private key in PEM", p.display()))?;
+            let k = p384::SecretKey::from_pkcs8_pem(pem)
+                .or_else(|_| p384::SecretKey::from_sec1_pem(pem))
+                .with_context(|| format!("the {what} key is not a P-384 private key in PEM"))?;
             Ok(SigningKey::from(k))
         };
         Ok(Self {
-            root: key("root.key")?,
-            intermediate: key("int.key")?,
-            leaf: key("leaf.key")?,
+            root: key("root", root)?,
+            intermediate: key("intermediate", intermediate)?,
+            leaf: key("leaf", leaf)?,
         })
     }
 }
@@ -674,6 +684,28 @@ mod tests {
             let s = p384::ecdsa::Signature::from_der(&sig.value[1..]).unwrap();
             vk.verify(tbs.raw, &s).unwrap();
         }
+    }
+
+    #[test]
+    fn the_project_keys_are_built_in_and_make_a_chain() {
+        let k = Keys::project();
+        let points = [&k.root, &k.intermediate, &k.leaf].map(point_of);
+        assert!(points.iter().all(|p| p.len() == 97 && p[0] == 4));
+        assert!(points[0] != points[1] && points[1] != points[2] && points[0] != points[2]);
+        let (g, _, _) = guest_chain();
+        let guest = Guest {
+            root: g.root,
+            intermediate: g.intermediate,
+            leaf: g.leaf,
+            point: g.point,
+            intermediate_img4: seq(&[&octets(b"img4")]),
+            leaf_img4: seq(&[&octets(b"img4")]),
+            root_kexts: Vec::new(),
+        };
+        let c = chain(&guest, &k).unwrap();
+        assert_eq!(c.leaf.len(), guest.leaf.len());
+        assert_eq!(c.point, points[2]);
+        assert!(Keys::from_pem("not a key", "", "").is_err());
     }
 
     /// A boot policy kext's constants as the guest's hold them, made here: other data, the

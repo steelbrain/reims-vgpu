@@ -273,10 +273,12 @@ later policy change, an in-guest update's or Startup Security's, fails at once r
 losing the next boot. On 27.2.1 the policy survives the first account and two restarts with SIP
 on, and the same disk without the patch loses it at the first restart **[measured]**.
 
-The chain's keys are the project's (`--lp-keys`, `root.key`, `int.key`, `leaf.key`): the root and
-the intermediate sign each install's certificates at its release's lengths. Whoever can write a
-VM's disk can write its NVRAM and its bundle too, so a key per VM would protect nothing. Without
-the keys the restore signs with the built-in chain (`keys/`) and writes no bundle.
+The chain's keys are the project's, built in (`keys/project-{root,intermediate,leaf}.key`, made
+once by `keys/make.sh`, `anchors::Keys::project`): the root and the intermediate sign each
+install's certificates at its release's lengths, and the leaf signs its policies. The private
+halves are committed: whoever can write a VM's disk can write its NVRAM and its bundle too, so a
+key per VM, or a secret one, would protect nothing, and the trust comes from the anchor swap, as
+the guest's own comes from Apple's Hacktivation key, which every restore OS carries.
 
 ## The auxiliary storage
 

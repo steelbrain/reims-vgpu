@@ -151,20 +151,6 @@ impl Signer {
         Ok(Self { key, chain })
     }
 
-    /// The project's signer, built in: one key for every VM, since whoever can write a VM's disk
-    /// can write its NVRAM too, so a key per VM would protect nothing (docs/design.md, "The
-    /// LocalPolicy"). `keys/make.sh` made it.
-    pub fn project() -> Self {
-        Self::new(
-            include_str!("../keys/policy-leaf.key"),
-            &[
-                include_bytes!("../keys/policy-intermediate.der"),
-                include_bytes!("../keys/policy-leaf.der"),
-            ],
-        )
-        .expect("the built-in LocalPolicy signer is a P-384 key and its chain")
-    }
-
     /// ECDSA P-384 with SHA-384 over `msg`, DER-encoded, as a manifest's signature is.
     fn sign(&self, msg: &[u8]) -> Vec<u8> {
         let s: p384::ecdsa::Signature = self.key.sign(msg);
@@ -273,36 +259,6 @@ mod tests {
         assert_eq!(
             b.file_name(Kind::Recovery),
             n.replace(".img4", ".recovery.img4")
-        );
-    }
-
-    #[test]
-    fn the_project_signer_signs_with_its_leaf() {
-        let s = Signer::project();
-        let b = binding();
-        let m = img4::parse_im4m(
-            img4::split_img4(&b.sign(Kind::MacOs, &s))
-                .unwrap()
-                .1
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            m.certs,
-            [
-                include_bytes!("../keys/policy-intermediate.der").to_vec(),
-                include_bytes!("../keys/policy-leaf.der").to_vec()
-            ]
-        );
-        let v = p384::ecdsa::VerifyingKey::from(&s.key);
-        let sig = p384::ecdsa::Signature::from_der(&m.signature).unwrap();
-        v.verify(&m.signed, &sig).unwrap();
-        // The leaf certificate is the key's.
-        let point = v.to_sec1_point(false);
-        assert!(
-            include_bytes!("../keys/policy-leaf.der")
-                .windows(97)
-                .any(|w| w == point.as_bytes())
         );
     }
 

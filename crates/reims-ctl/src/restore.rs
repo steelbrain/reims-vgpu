@@ -2,8 +2,10 @@
 //! (crates/reims-restore). The pipeline writes the disk itself, on any host: it reads the IPSW
 //! where it lies, has Apple's signing server (TSS) sign the VM's tickets, and leaves the VM's disk
 //! (`disk.img`), its auxiliary storage (`aux.img`) and its ECID (`machine-identifier.bin`) in the
-//! VM's directory, as a fresh restore by Virtualization.framework leaves them. No VM runs, and
-//! none of Apple's code. reims-ctl gives it the IPSW, the directory and the disk's size, shows
+//! VM's directory, as a fresh restore by Virtualization.framework leaves them, with the VM's
+//! LocalPolicies signed by the project's built-in keys, and `config.cpio` beside them, Ambrosia's
+//! bundle of the patches that swap the guest's anchors for the project's. No VM runs, and none of
+//! Apple's code. reims-ctl gives it the IPSW, the directory and the disk's size, shows
 //! its steps and their progress, and writes the VM's settings (create.rs). The pipeline's notes
 //! go only to the restore's log, `restore.log` in the VM's directory ([`LOG`]).
 //!
@@ -79,7 +81,6 @@ impl Restorer for Pipeline {
             dir: r.dir.to_path_buf(),
             disk_size: r.disk_size,
             ecid: None,
-            lp_keys: None,
         };
         let mut shown = Shown::default();
         let mut log = Log::create(&r.dir.join(LOG))?;
