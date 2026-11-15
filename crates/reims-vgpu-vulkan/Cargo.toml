@@ -42,7 +42,7 @@ libc.workspace = true
 libc.workspace = true
 
 # On Windows the OS services are this crate's own (`os/windows.rs`), as they are ported: the
-# clocks, and the walk threads' scheduling hint.
+# clocks, threads, and the walk threads' scheduling hint.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
