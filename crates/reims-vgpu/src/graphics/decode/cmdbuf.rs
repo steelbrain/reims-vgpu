@@ -131,7 +131,8 @@ use reims_vgpu_graphics::wire::{
 use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder};
 use reims_vgpu_vulkan::core::platform::caps::{DeviceCaps, SAMPLE_COUNTS};
 use reims_vgpu_vulkan::core::platform::command::{
-    CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo, PartCut, ScheduledHandler,
+    CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo, KeptWhole, PartCut,
+    ScheduledHandler,
 };
 use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder};
 use reims_vgpu_vulkan::core::platform::descriptor::RenderPassDescriptor;
@@ -2496,18 +2497,6 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(s) = split.as_mut() else {
             return Ok(Ok(()));
         };
-        // Kept whole at a cut in its first range ([`Self::split_here`]), whose handler sees its
-        // completion: it fails from an encoder there on.
-        if s.whole {
-            drop(place);
-            return match cb.commit_part(ON)? {
-                PartCut::Fails => {
-                    cb.fold(later);
-                    Ok(Ok(()))
-                }
-                PartCut::Cut | PartCut::Whole => Err(kept_whole()),
-            };
-        }
         // The first range's last part goes now where it could be committed now, as a cut does;
         // else once every wait of its commit is met, holding its context's gate then.
         let now = || {
@@ -2526,8 +2515,14 @@ impl<P: Platform> GraphicsDecoder<P> {
                 }
             },
         };
-        let parts = Arc::clone(s.parts.get_or_insert_with(Arc::default));
-        cb.add_completion_seen_handler(ON, parts.part_handler(place))?;
+        // Kept whole at a cut in its first range ([`Self::split_here`]), it holds a part's handler
+        // already, which sees its completion as a part's or as the whole's.
+        if s.whole {
+            drop(place);
+        } else {
+            let parts = Arc::clone(s.parts.get_or_insert_with(Arc::default));
+            cb.add_completion_seen_handler(ON, parts.part_handler(place))?;
+        }
         match cb.commit_part(ON)? {
             PartCut::Cut => {
                 *cb = later;
@@ -2545,7 +2540,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     s.hold = Some(hold);
                 }
             }
-            PartCut::Whole => return Err(kept_whole()),
+            PartCut::Whole(reason) => return Err(kept_whole(reason)),
         }
         Ok(Ok(()))
     }
@@ -3241,16 +3236,44 @@ fn next_op(ops: &[u8]) -> Option<(u16, &[u8], usize)> {
     Some((h.tag, &ops[RGFX_OP_BODY_OFFSET as usize..len], len))
 }
 
+/// The degradation a command buffer walked in two ranges counts where the platform keeps it whole
+/// at its first range's end for a reason of [`KeptWhole`] ([`kept_whole`]).
+pub(super) const KEPT_WHOLE: &str = "two-ranges-kept-whole";
+
+/// Whether this process logged a buffer kept whole for each reason of [`KeptWhole::ALL`], at the
+/// reason's place there: the line is logged the first time alone, the rest counted
+/// ([`KEPT_WHOLE`], docs/conventions.md).
+static KEPT_WHOLE_LOGGED: [AtomicBool; KeptWhole::ALL.len()] =
+    [const { AtomicBool::new(false) }; KeptWhole::ALL.len()];
+
 /// The fault of a command buffer walked in two ranges ([`GraphicsDecoder::walk_in_two`]) that the
-/// platform keeps whole at its first range's end, where no encoder fails it: its later range was
-/// walked into another command buffer, which runs nothing then. [`two_ranges`] takes no buffer
-/// whose ops keep it so (the Vulkan platform's `CommandBufferObject::splits`), so it is not
-/// reached; it fails the buffer rather than walk the later range again.
-fn kept_whole() -> Raise {
-    op_fault(
-        "the platform kept a command buffer walked in two ranges whole, with no encoder failing \
-         it: its later range is in another command buffer",
-    )
+/// platform keeps whole at its first range's end for `reason`, no encoder failing it: its later
+/// range was walked into another command buffer, which then runs nothing, so the buffer fails at
+/// its stand-in, where a walk of it whole would not. [`two_ranges`] takes no buffer with an op
+/// that sets any [`KeptWhole`] reason, and its tests pin the two lists together; so it is not
+/// reached, and where it is, it shows: counted as a degradation ([`KEPT_WHOLE`]) and logged once
+/// per reason (docs/conventions.md). It fails the buffer rather than walk the later range again.
+fn kept_whole(reason: KeptWhole) -> Raise {
+    reims_vgpu_vulkan::answer::count_kind(KEPT_WHOLE);
+    let at = KeptWhole::ALL
+        .iter()
+        .position(|&r| r == reason)
+        .unwrap_or(0);
+    if !KEPT_WHOLE_LOGGED[at].swap(true, Ordering::Relaxed) {
+        log::error!(
+            target: "reims_vgpu::graphics", kind:% = reason.code();
+            "a command buffer walked in two ranges at once was kept whole at its first range's \
+             end ({}), no encoder failing it: it fails, its later range being in another \
+             command buffer; the ranges' choice of buffers lets in an op that keeps one whole \
+             (logged once per reason, counted as {KEPT_WHOLE})",
+            reason.code()
+        );
+    }
+    op_fault(format_args!(
+        "the platform kept a command buffer walked in two ranges whole ({}): its later range is \
+         in another command buffer",
+        reason.code()
+    ))
 }
 
 /// The least op bytes of a command buffer walked in two ranges at once ([`two_ranges`]): one of
@@ -9043,6 +9066,158 @@ mod tests {
         let mut short = eight.clone();
         short.truncate(eight.len() - 4);
         assert_eq!(two_ranges(&short, 0), None, "a stream that does not parse");
+    }
+
+    /// The ops of the guest's whose commands keep a command buffer whole for `reason`, each with
+    /// the encoder it lies in, which [`two_ranges`] keeps out of a buffer walked in two ranges
+    /// ([`kept_whole`]): a match over every reason the platform keeps one whole for
+    /// ([`KeptWhole`]), so a new reason does not build until its ops are named here.
+    fn keeping_whole(reason: KeptWhole) -> Vec<Vec<u8>> {
+        use reims_vgpu_graphics::ops::render::{
+            RGFX_OP_RENDER_EXECUTE_COMMANDS_IN_BUFFER, RGFX_OP_RENDER_EXECUTE_COMMANDS_INDIRECT,
+            RGFX_OP_RENDER_USE_RESOURCES, RGFX_OP_RENDER_USE_RESOURCES_STAGES,
+        };
+        let compute = [
+            op(RGFX_OP_ENCODER_BEGIN_COMPUTE, &[]),
+            op(RGFX_OP_ENCODER_END, &[]),
+        ]
+        .concat();
+        let render_with = |tag: u16| {
+            [
+                op(RGFX_OP_ENCODER_BEGIN_RENDER, &begin_render_body()),
+                op(tag, &[0; 32]),
+                op(RGFX_OP_ENCODER_END, &[]),
+            ]
+            .concat()
+        };
+        let blit_with = |tag: u16| {
+            [
+                op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]),
+                op(tag, &[0; 32]),
+                op(RGFX_OP_ENCODER_END, &[]),
+            ]
+            .concat()
+        };
+        let rate_map = {
+            let mut body = begin_render_body();
+            let flags = RGFX_PASS_FLAG_RT_SIZE | RGFX_PASS_FLAG_RATE_MAP;
+            body[4..8].copy_from_slice(&flags.to_le_bytes());
+            [
+                op(RGFX_OP_ENCODER_BEGIN_RENDER, &body),
+                op(RGFX_OP_ENCODER_END, &[]),
+            ]
+            .concat()
+        };
+        let executions = [
+            render_with(RGFX_OP_RENDER_EXECUTE_COMMANDS_IN_BUFFER),
+            render_with(RGFX_OP_RENDER_EXECUTE_COMMANDS_INDIRECT),
+            compute.clone(),
+        ];
+        match reason {
+            // The ranges are cut at an encoder's end, and a walk ends each encoder it opens.
+            KeptWhole::OpenEncoder => vec![],
+            // No op of the guest's has the walk send `setProtectionOptions:` or
+            // `encodeSignalEventScheduled:value:`
+            // (`two_ranges_keep_out_every_op_that_keeps_a_buffer_whole`).
+            KeptWhole::ProtectionOptions | KeptWhole::ScheduledSignal => vec![],
+            KeptWhole::Execution => executions.to_vec(),
+            KeptWhole::Progress => [
+                vec![rate_map],
+                executions.to_vec(),
+                vec![
+                    render_with(RGFX_OP_RENDER_USE_RESOURCES),
+                    render_with(RGFX_OP_RENDER_USE_RESOURCES_STAGES),
+                    blit_with(RGFX_OP_BLIT_RESET_COMMANDS_IN_BUFFER),
+                    blit_with(RGFX_OP_BLIT_COPY_INDIRECT_COMMAND_BUFFER),
+                    blit_with(RGFX_OP_BLIT_OPTIMIZE_INDIRECT_COMMAND_BUFFER),
+                ],
+            ]
+            .concat(),
+            KeptWhole::Predication => vec![compute],
+            // The walk commits a buffer only at its cuts, each going on in a new command buffer.
+            KeptWhole::Committed => vec![],
+        }
+    }
+
+    /// Every reason the platform keeps a command buffer whole for, but how its GPU fails it, is
+    /// set only by ops [`two_ranges`] keeps out of a buffer walked in two ranges, so
+    /// [`kept_whole`] is not reached: each op [`keeping_whole`] names makes a stream it would cut
+    /// one it does not, and no walk of an op sends the two calls whose reasons name no op.
+    #[test]
+    fn two_ranges_keep_out_every_op_that_keeps_a_buffer_whole() {
+        assert!(two_ranges(&passes(8), 0).is_some());
+        for reason in KeptWhole::ALL {
+            for ops in keeping_whole(reason) {
+                let stream = [passes(4), ops, passes(4)].concat();
+                assert_eq!(two_ranges(&stream, 0), None, "{reason:?}");
+            }
+        }
+        let walk = [
+            include_str!("cmdbuf.rs"),
+            include_str!("render.rs"),
+            include_str!("blit.rs"),
+            include_str!("compute.rs"),
+            include_str!("video.rs"),
+            include_str!("managed.rs"),
+            include_str!("refused.rs"),
+            include_str!("surface_cache.rs"),
+            include_str!("icb.rs"),
+            include_str!("rate_map.rs"),
+            include_str!("argument.rs"),
+            include_str!("mod.rs"),
+        ]
+        .concat();
+        for call in ["set_protection_options", "encode_signal_when_scheduled"] {
+            assert!(
+                !walk.contains(&format!(".{call}(")),
+                "the decoder sends {call}"
+            );
+        }
+    }
+
+    /// A command buffer the platform keeps whole at its first range's end for a reason of its own
+    /// ([`PartCut::Whole`]) fails at its stand-in, counted as a degradation ([`KEPT_WHOLE`]), its
+    /// later range never walked again, and its context's gate let go; the line is logged for the
+    /// first buffer kept whole for its reason alone, each counted.
+    #[test]
+    fn a_buffer_kept_whole_at_its_first_range_s_end_is_counted() {
+        let Split {
+            p, mut dec, posted, ..
+        } = splitting();
+        let device = p.device();
+        dec.set_ranges_min_bytes(Some(0));
+        dec.set_helper_first(true);
+        let counted = || {
+            (reims_vgpu_vulkan::answer::degradation_counts().into_iter())
+                .find(|(code, _)| code == KEPT_WHOLE)
+                .map_or(0, |(_, n)| n)
+        };
+        let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
+        let before = counted();
+        for (n, seqno) in [395, 396].into_iter().enumerate() {
+            let whole = PartCut::Whole(KeptWhole::Progress);
+            p.script().push("commitPart", Step::value(whole));
+            let begun = dec.walks_begun();
+            let message = command_buffer_message(seqno, 120, &passes(8));
+            assert!(refusing(|| dec.decode(&device, &message)).is_err());
+            assert_eq!(counted(), before + n as u64 + 1);
+            assert_eq!(dec.walks_begun(), begun + 1, "its walk begun once");
+            assert!(dec.stand_in_for_failed(&device, &message).unwrap());
+            p.world().complete_all(CompleteOn::Caller);
+            assert_eq!(
+                posted.lock().split_off(0),
+                [(RGFX_EVT_CB_COMPLETE, seqno, RGFX_CB_INTERNAL)]
+            );
+            assert!(dec.shared.split_gate.try_split(0).is_some());
+        }
+        let lines = (logs.take().into_iter())
+            .filter(|(level, target, line)| {
+                *level == log::Level::Error
+                    && target == "reims_vgpu::graphics"
+                    && line.contains("was kept whole at its first range's end (progress)")
+            })
+            .count();
+        assert_eq!(lines, 1, "logged for the first alone");
     }
 
     /// What finding a cut costs ([`two_ranges`]): nothing measurable on a stream under the least

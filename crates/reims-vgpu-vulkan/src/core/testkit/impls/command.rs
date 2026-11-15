@@ -169,13 +169,14 @@ impl CommandBuffer<FakePlatform> for Fk<kind::CommandBuffer> {
     }
 
     /// Logged: as scripted ([`PartCut`], [`crate::core::testkit::script::Step::value`]), else
-    /// [`PartCut::Cut`] while the world splits command buffers and [`PartCut::Whole`] otherwise;
-    /// committed as at `commit` where it answers [`PartCut::Cut`].
+    /// [`PartCut::Cut`] while the world splits command buffers, and otherwise
+    /// [`PartCut::Whole`] as for a command buffer committed, where `part` makes none; committed
+    /// as at `commit` where it answers [`PartCut::Cut`].
     fn commit_part(&self, on: OnFault) -> RaiseResult<PartCut> {
         let splits = self.world().splits();
         let cut = self.thr(Policy::On(on), "commitPart", vec![], || match splits {
             true => PartCut::Cut,
-            false => PartCut::Whole,
+            false => PartCut::Whole(KeptWhole::Committed),
         })?;
         if cut == PartCut::Cut {
             super::super::objects::commit_obj(self.obj());

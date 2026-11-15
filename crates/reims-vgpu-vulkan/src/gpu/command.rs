@@ -185,8 +185,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::core::platform::Handle;
 use crate::core::platform::command::committing as committing_here;
 use crate::core::platform::command::{
-    CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo, PartCut, ScheduledHandler,
-    run_completed,
+    CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo, KeptWhole, PartCut,
+    ScheduledHandler, run_completed,
 };
 use crate::core::platform::event::EventRef;
 use crate::core::platform::types::{CommandBufferStatus, NsErrorText};
@@ -418,20 +418,38 @@ impl CommandBufferObject {
     /// ([`Predication::cuttable`]; a unit of compute encoders goes on in the next part); and no
     /// event signalled as it is scheduled. Not committed.
     fn splits(&self) -> bool {
+        !self.fails() && self.kept_whole_by().is_none()
+    }
+
+    /// Whether a way Metal's GPU fails it for what its encoders did is noted: a [`Failing`] of
+    /// its own, a draw of primitive type 9, a store into read-only memory, each from an encoder
+    /// on ([`CommandBufferObject::splits`]).
+    fn fails(&self) -> bool {
         plain(|| {
-            self.open_encoders.load(Ordering::SeqCst) == 0
-                && self.failing.lock().is_empty()
-                && self.by_runtime.lock().is_empty()
-                && self.stores.lock().is_empty()
-                && {
-                    let protection = self.protection.lock();
-                    protection.options == 0 && !protection.used
-                }
-                && self.executions.lock().is_empty()
-                && self.progress.lock().is_none()
-                && self.predication.cuttable()
-                && !self.signals_scheduled.load(Ordering::SeqCst)
-                && !self.committed.load(Ordering::SeqCst)
+            !self.failing.lock().is_empty()
+                || !self.by_runtime.lock().is_empty()
+                || !self.stores.lock().is_empty()
+        })
+    }
+
+    /// Why it may not be cut, but for how Metal's GPU fails it ([`CommandBufferObject::fails`]):
+    /// the first of [`KeptWhole::ALL`] that holds ([`CommandBufferObject::splits`]); `None` where
+    /// none does.
+    fn kept_whole_by(&self) -> Option<KeptWhole> {
+        plain(|| {
+            let protection = *self.protection.lock();
+            [
+                self.open_encoders.load(Ordering::SeqCst) != 0,
+                protection.options != 0 || protection.used,
+                !self.executions.lock().is_empty(),
+                self.progress.lock().is_some(),
+                !self.predication.cuttable(),
+                self.signals_scheduled.load(Ordering::SeqCst),
+                self.committed.load(Ordering::SeqCst),
+            ]
+            .into_iter()
+            .zip(KeptWhole::ALL)
+            .find_map(|(holds, reason)| holds.then_some(reason))
         })
     }
 
@@ -441,22 +459,7 @@ impl CommandBufferObject {
     /// encoders run nothing in it either, and need only what they noted of how they fail
     /// ([`CommandBufferObject::fold`]).
     fn fails_from_an_encoder(&self) -> bool {
-        plain(|| {
-            let fails = !self.failing.lock().is_empty()
-                || !self.by_runtime.lock().is_empty()
-                || !self.stores.lock().is_empty();
-            fails
-                && self.open_encoders.load(Ordering::SeqCst) == 0
-                && {
-                    let protection = self.protection.lock();
-                    protection.options == 0 && !protection.used
-                }
-                && self.executions.lock().is_empty()
-                && self.progress.lock().is_none()
-                && self.predication.cuttable()
-                && !self.signals_scheduled.load(Ordering::SeqCst)
-                && !self.committed.load(Ordering::SeqCst)
-        })
+        self.fails() && self.kept_whole_by().is_none()
     }
 
     /// Takes in what `later`, made for a later range of its work (`CommandBuffer::part`) and
@@ -1571,14 +1574,14 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// encoders on ([`CommandBufferObject::fails_from_an_encoder`]), every encoder after it
     /// running nothing.
     fn commit_part(&self, on: OnFault) -> RaiseResult<PartCut> {
-        if self.splits() {
-            self.commit(on)?;
-            return Ok(PartCut::Cut);
+        if let Some(reason) = self.kept_whole_by() {
+            return Ok(PartCut::Whole(reason));
         }
-        Ok(match self.fails_from_an_encoder() {
-            true => PartCut::Fails,
-            false => PartCut::Whole,
-        })
+        if self.fails() {
+            return Ok(PartCut::Fails);
+        }
+        self.commit(on)?;
+        Ok(PartCut::Cut)
     }
 
     /// Takes in how Metal's GPU fails `later`'s encoders, as though they had been made in this
@@ -3153,9 +3156,51 @@ mod tests {
         let cb = buffer(&q);
         let later = cb.part(OnFault::Return).unwrap().unwrap();
         cb.set_protection_options(OnFault::Return, 2).unwrap();
-        assert_eq!(cb.commit_part(OnFault::Return).unwrap(), PartCut::Whole);
+        let whole = PartCut::Whole(KeptWhole::ProtectionOptions);
+        assert_eq!(cb.commit_part(OnFault::Return).unwrap(), whole);
         assert!(cb.part(OnFault::Return).unwrap().is_none(), "no part made");
         drop(later);
+    }
+
+    /// Each reason a command buffer is kept whole for, but how Metal's GPU fails it, answers
+    /// [`PartCut::Whole`] with that reason at a range's end, ahead of a failure from an encoder
+    /// on, and commits nothing: an open encoder, protection options, progress kept to the
+    /// completion, a signal as it is scheduled, a commit. (An indirect command buffer's
+    /// execution and command predication's blocks keep it whole as `split`'s tests show.)
+    #[test]
+    fn a_buffer_kept_whole_answers_why_at_a_range_s_end() {
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        let q = dev().new_command_queue().unwrap();
+        let whole = |cb: &VulkanCommandBuffer, reason: KeptWhole| {
+            cb.fails_at_type_9(Failing {
+                code: rt::CommandBufferError::GpuHang.metal_code(),
+                from: 0,
+                signals: true,
+            });
+            assert_eq!(
+                cb.commit_part(OnFault::Return).unwrap(),
+                PartCut::Whole(reason),
+                "{reason:?}"
+            );
+        };
+        let cb = buffer(&q);
+        let blit = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+        whole(&cb, KeptWhole::OpenEncoder);
+        blit.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+        let cb = buffer(&q);
+        cb.set_protection_options(OnFault::Return, 0x10).unwrap();
+        whole(&cb, KeptWhole::ProtectionOptions);
+        let cb = buffer(&q);
+        drop(cb.progress("a test's command"));
+        whole(&cb, KeptWhole::Progress);
+        assert!(!cb.committed.load(Ordering::SeqCst), "nothing committed");
+        let cb = buffer(&q);
+        cb.signals_scheduled.store(true, Ordering::SeqCst);
+        whole(&cb, KeptWhole::ScheduledSignal);
+        let cb = buffer(&q);
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        whole(&cb, KeptWhole::Committed);
     }
 
     /// Where protection options are set in a command buffer of [`read_only_store_beside`]:
