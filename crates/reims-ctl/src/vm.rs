@@ -252,15 +252,41 @@ pub fn parse_resolution(s: &str) -> Result<(u32, u32)> {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Gpu {
-    /// The Vulkan driver's manifest (ICD JSON) the loader is limited to: `VK_DRIVER_FILES`.
+    /// The Vulkan driver's manifest (ICD JSON) that reaches the GPU. Where [`Gpu::select`] is
+    /// none, the loader is limited to it: `VK_DRIVER_FILES`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub driver_file: Option<PathBuf>,
-    /// The PCI device ID the loader keeps, where the driver drives several GPUs.
+    /// The GPU's PCI device ID, where its driver drives several GPUs: the loader keeps that GPU
+    /// alone of the driver's where it is limited to [`Gpu::driver_file`],
+    /// `VK_LOADER_DEVICE_ID_FILTER`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_id: Option<u32>,
+    /// The GPU's PCI vendor and device IDs in hex, `10de:2204`, which the loader lists first, its
+    /// other GPUs and every driver kept: `MESA_VK_DEVICE_SELECT` and `VK_LOADER_DEVICE_SELECT`
+    /// ([`crate::gpu`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub select: Option<String>,
     /// The GPU's name, for display.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+impl Gpu {
+    /// The vendor and device IDs [`Gpu::select`] names, where it names any.
+    pub fn selected(&self) -> Result<Option<(u32, u32)>> {
+        let Some(s) = self.select.as_deref() else {
+            return Ok(None);
+        };
+        let hex = |x: &str| {
+            (!x.is_empty() && x.len() <= 8 && x.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| u32::from_str_radix(x, 16).ok())
+                .flatten()
+        };
+        s.split_once(':')
+            .and_then(|(v, d)| Some((hex(v)?, hex(d)?)))
+            .map(Some)
+            .with_context(|| format!("the GPU's select is vendor:device in hex, not {s:?}"))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -466,6 +492,7 @@ impl VmConfig {
             bail!("memory must be at least 2 GiB, not {} MiB", self.memory_mib);
         }
         self.display.check()?;
+        self.gpu.selected()?;
         for k in self.extra_env.keys() {
             check_env_name(k)?;
         }
@@ -983,6 +1010,7 @@ mod tests {
             gpu: Gpu {
                 driver_file: Some("/usr/share/vulkan/icd.d/nvidia_icd.json".into()),
                 device_id: Some(0x2204),
+                select: Some("10de:2204".into()),
                 name: None,
             },
             audio: Audio::default(),
@@ -1184,6 +1212,32 @@ mod tests {
         c.q35 = None;
         let e = format!("{:#}", c.check().unwrap_err());
         assert!(e.contains("no [q35] settings"), "{e}");
+    }
+
+    /// A GPU's select names its vendor and device IDs in hex, as `MESA_VK_DEVICE_SELECT` takes
+    /// them; the check refuses anything else.
+    #[test]
+    fn a_gpu_s_select_is_its_vendor_and_device_in_hex() {
+        let mut c = x86_64_config();
+        assert_eq!(c.gpu.selected().unwrap(), Some((0x10de, 0x2204)));
+        c.gpu.select = Some("10005:0".into());
+        assert_eq!(c.gpu.selected().unwrap(), Some((0x10005, 0)));
+        for bad in [
+            "",
+            "10de",
+            "10de:",
+            ":2204",
+            "0x10de:0x2204",
+            "10de:2204!",
+            "10de:22g4",
+            "123456789:0",
+        ] {
+            c.gpu.select = Some(bad.into());
+            assert!(c.check().is_err(), "{bad:?}");
+        }
+        c.gpu.select = None;
+        assert_eq!(c.gpu.selected().unwrap(), None);
+        assert!(c.check().is_ok());
     }
 
     #[test]

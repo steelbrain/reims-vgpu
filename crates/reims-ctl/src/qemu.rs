@@ -136,16 +136,26 @@ pub fn invocation(vm: &Vm, ctx: &Ctx) -> Result<Invocation> {
     if library && c.display.borderless {
         env.push(("REIMS_VGPU_WINDOW_BORDERLESS".into(), "1".into()));
     }
-    if library
-        && c.profile.gpu_choice(ctx.host)
-        && let Some(f) = &c.gpu.driver_file
-    {
-        // The loader reads VK_DRIVER_FILES; loaders before 1.3.207 read VK_ICD_FILENAMES.
-        let f = f.to_string_lossy().into_owned();
-        env.push(("VK_DRIVER_FILES".into(), f.clone()));
-        env.push(("VK_ICD_FILENAMES".into(), f));
-        if let Some(id) = c.gpu.device_id {
-            env.push(("VK_LOADER_DEVICE_ID_FILTER".into(), format!("{id:#06x}")));
+    if library && c.profile.gpu_choice(ctx.host) {
+        if let Some((vendor, device)) = c.gpu.selected()? {
+            // The GPU first, every other GPU and driver kept: Mesa's device-select layer reads
+            // MESA_VK_DEVICE_SELECT, the loader VK_LOADER_DEVICE_SELECT (crate::gpu).
+            env.push((
+                "MESA_VK_DEVICE_SELECT".into(),
+                format!("{vendor:04x}:{device:04x}"),
+            ));
+            env.push((
+                "VK_LOADER_DEVICE_SELECT".into(),
+                format!("{vendor:#06x}:{device:#06x}"),
+            ));
+        } else if let Some(f) = &c.gpu.driver_file {
+            // The loader reads VK_DRIVER_FILES; loaders before 1.3.207 read VK_ICD_FILENAMES.
+            let f = f.to_string_lossy().into_owned();
+            env.push(("VK_DRIVER_FILES".into(), f.clone()));
+            env.push(("VK_ICD_FILENAMES".into(), f));
+            if let Some(id) = c.gpu.device_id {
+                env.push(("VK_LOADER_DEVICE_ID_FILTER".into(), format!("{id:#06x}")));
+            }
         }
     }
     for (k, v) in &c.extra_env {
@@ -761,7 +771,8 @@ mod tests {
         vm.config.gpu = Gpu {
             driver_file: Some("/icd/nvidia.json".into()),
             device_id: Some(0x2204),
-            name: None,
+            select: Some("10de:2204".into()),
+            name: Some("NVIDIA GeForce RTX 3090".into()),
         };
         vm.config
             .extra_env
@@ -770,11 +781,61 @@ mod tests {
         let env: BTreeMap<_, _> = inv.env.iter().cloned().collect();
         assert_eq!(env["REIMS_VGPU_LOG"], "trace");
         assert_eq!(env["REIMS_VGPU_WINDOW_BORDERLESS"], "1");
-        assert_eq!(env["VK_DRIVER_FILES"], "/icd/nvidia.json");
-        assert_eq!(env["VK_LOADER_DEVICE_ID_FILTER"], "0x2204");
+        // The GPU first, by its IDs, the loader limited to no driver.
+        assert_eq!(env["MESA_VK_DEVICE_SELECT"], "10de:2204");
+        assert_eq!(env["VK_LOADER_DEVICE_SELECT"], "0x10de:0x2204");
+        for limit in [
+            "VK_DRIVER_FILES",
+            "VK_ICD_FILENAMES",
+            "VK_LOADER_DEVICE_ID_FILTER",
+        ] {
+            assert!(!env.contains_key(limit), "{limit} in {env:?}");
+        }
         assert!(has(&inv.args, &["-serial", "file:/vms/t/logs/serial.log"]));
         assert!(has(&inv.args, &["-msg", "timestamp=on"]));
         assert!(!inv.unset.contains(&"REIMS_VGPU_LOG".to_string()));
+    }
+
+    /// A GPU its settings name by its driver's manifest alone (a CPU implementation, a GPU
+    /// another manifest reaches too, or a manifest given by its path; crate::gpu) limits the
+    /// loader to that driver, keeping the GPU's device ID where the driver drives several. A
+    /// select that names no IDs is refused; on the Mac no GPU is chosen.
+    #[test]
+    fn a_gpu_named_by_its_driver_alone_limits_the_loader_to_it() {
+        let mut vm = q35_vm();
+        vm.config.gpu = Gpu {
+            driver_file: Some("/icd/radeon.json".into()),
+            device_id: Some(0x744c),
+            select: None,
+            name: Some("AMD Radeon RX 7900 XTX (RADV NAVI31)".into()),
+        };
+        let env: BTreeMap<_, _> = invocation(&vm, &ctx(linux()))
+            .unwrap()
+            .env
+            .into_iter()
+            .collect();
+        assert_eq!(env["VK_DRIVER_FILES"], "/icd/radeon.json");
+        assert_eq!(env["VK_ICD_FILENAMES"], "/icd/radeon.json");
+        assert_eq!(env["VK_LOADER_DEVICE_ID_FILTER"], "0x744c");
+        assert!(!env.contains_key("MESA_VK_DEVICE_SELECT"), "{env:?}");
+        assert!(!env.contains_key("VK_LOADER_DEVICE_SELECT"), "{env:?}");
+        vm.config.gpu.device_id = None;
+        let env: BTreeMap<_, _> = invocation(&vm, &ctx(linux()))
+            .unwrap()
+            .env
+            .into_iter()
+            .collect();
+        assert_eq!(env["VK_DRIVER_FILES"], "/icd/radeon.json");
+        assert!(!env.contains_key("VK_LOADER_DEVICE_ID_FILTER"), "{env:?}");
+        vm.config.gpu.select = Some("radeon".into());
+        assert!(invocation(&vm, &ctx(linux())).is_err());
+        vm.config.gpu.select = Some("1002:744c".into());
+        let env = invocation(&vm, &ctx(mac())).unwrap().env;
+        assert!(
+            !env.iter()
+                .any(|(k, _)| k.starts_with("VK_") || k.starts_with("MESA_")),
+            "{env:?}"
+        );
     }
 
     #[test]

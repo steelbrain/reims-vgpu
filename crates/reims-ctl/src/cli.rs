@@ -631,6 +631,7 @@ pub fn resolve_gpu(arg: &str) -> Result<vm::Gpu> {
         return Ok(vm::Gpu {
             driver_file: Some(paths::absolute(a)),
             device_id: None,
+            select: None,
             name: None,
         });
     }

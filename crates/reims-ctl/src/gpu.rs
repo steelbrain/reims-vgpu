@@ -1,11 +1,33 @@
 //! The host's GPUs a VM can be given.
 //!
-//! On Linux the library runs on Vulkan, and picks the first discrete GPU, then the first
-//! integrated one, in the loader's order. A VM can name another: its Vulkan driver's manifest
-//! (an ICD JSON file, which `VK_DRIVER_FILES` limits the loader to) and, where that driver
-//! drives several GPUs, the PCI device ID (`VK_LOADER_DEVICE_ID_FILTER`). The list comes from
-//! asking each manifest's driver in a child process (`reims-ctl __vulkan-probe`), so a driver
-//! that hangs or crashes costs only that one.
+//! On Linux the library runs on Vulkan. Of the host's GPUs it opens the only one, or, of several,
+//! the one that ran a short workload fastest, timed once for each set of GPUs and drivers
+//! (reims-vgpu-vulkan's `device_choice`), unless the host's user picked one. The list comes from
+//! asking each driver's manifest (an ICD JSON file) in a child process (`reims-ctl
+//! __vulkan-probe`), so a driver that hangs or crashes costs only that one.
+//!
+//! **A VM's GPU.** A GPU picked from the list is named by its vendor and device IDs, in
+//! `MESA_VK_DEVICE_SELECT` and `VK_LOADER_DEVICE_SELECT` ([`crate::vm::Gpu::select`]): both list
+//! that GPU first without hiding the others, and the library opens the first. Every driver still
+//! loads, so the library also sees the GPU the desktop composites the window on, and where that
+//! is another GPU it presents the window from a device of its own there, instead of sending every
+//! frame across from the pick. Mesa's device-select layer reads the first; it sorts the GPUs after
+//! the loader does and puts its own default first, so the loader's variable alone leaves that
+//! default first. The loader reads the second, on a host without the layer. **Measured** on a host
+//! with an RTX 3090 and a Radeon 780M (loader 1.4.363, Mesa 26.2.6's layer, 2026-11-14): the
+//! loader's variable alone listed the 780M first, the layer's variable or both the 3090, and
+//! both `10005:0` lavapipe. **Read** in the loader's v1.3.204 source: it reads
+//! `VK_LOADER_DEVICE_SELECT`.
+//!
+//! The loader is limited to the GPU's driver's manifest instead (`VK_DRIVER_FILES`, and, where
+//! that driver drives several GPUs, the PCI device ID, `VK_LOADER_DEVICE_ID_FILTER`) where IDs
+//! cannot name the pick ([`GpuInfo::to_config`]):
+//! - a CPU implementation such as lavapipe, which keeps every GPU's driver out of the VM's
+//!   process;
+//! - a GPU another manifest reaches too (RADV and AMDVLK on one card): its IDs do not say which
+//!   driver;
+//! - a manifest given by its path (`--gpu FILE.json`), which may be a driver outside the
+//!   loader's search paths, or a second driver for a GPU the loader reaches by its own.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -21,6 +43,9 @@ pub struct GpuInfo {
     /// Whether another GPU shares the driver (the device ID then picks it).
     #[serde(default)]
     pub shares_driver: bool,
+    /// Whether another manifest reaches a GPU of the same vendor and device IDs.
+    #[serde(default)]
+    pub shares_ids: bool,
 }
 
 impl GpuInfo {
@@ -33,10 +58,15 @@ impl GpuInfo {
         format!("{} ({}, {file})", self.name, self.kind)
     }
 
+    /// The VM's settings for this GPU: named by its IDs, unless it is a CPU implementation or
+    /// another manifest reaches a GPU of the same IDs, which its driver's manifest names alone
+    /// (the module doc).
     pub fn to_config(&self) -> crate::vm::Gpu {
+        let by_ids = self.kind != "cpu" && !self.shares_ids;
         crate::vm::Gpu {
             driver_file: Some(self.driver_file.clone()),
             device_id: self.shares_driver.then_some(self.device_id),
+            select: by_ids.then(|| format!("{:04x}:{:04x}", self.vendor_id, self.device_id)),
             name: Some(self.name.clone()),
         }
     }
@@ -127,17 +157,7 @@ pub fn list() -> Vec<GpuInfo> {
             true
         }
     });
-    let counts: Vec<usize> = gpus
-        .iter()
-        .map(|g| {
-            gpus.iter()
-                .filter(|o| o.driver_file == g.driver_file)
-                .count()
-        })
-        .collect();
-    for (g, n) in gpus.iter_mut().zip(counts) {
-        g.shares_driver = n > 1;
-    }
+    mark_shared(&mut gpus);
     let rank = |k: &str| match k {
         "discrete" => 0,
         "integrated" => 1,
@@ -147,6 +167,28 @@ pub fn list() -> Vec<GpuInfo> {
     };
     gpus.sort_by_key(|g| rank(&g.kind));
     gpus
+}
+
+/// Marks each of `gpus` that shares its driver with another ([`GpuInfo::shares_driver`]), and each
+/// whose IDs another manifest reaches too ([`GpuInfo::shares_ids`]).
+fn mark_shared(gpus: &mut [GpuInfo]) {
+    let shared: Vec<(bool, bool)> = gpus
+        .iter()
+        .map(|g| {
+            let others = || gpus.iter().filter(|o| !std::ptr::eq(*o, g));
+            (
+                others().any(|o| o.driver_file == g.driver_file),
+                others().any(|o| {
+                    o.driver_file != g.driver_file
+                        && (o.vendor_id, o.device_id) == (g.vendor_id, g.device_id)
+                }),
+            )
+        })
+        .collect();
+    for (g, (driver, ids)) in gpus.iter_mut().zip(shared) {
+        g.shares_driver = driver;
+        g.shares_ids = ids;
+    }
 }
 
 fn probe(exe: &std::path::Path, file: &std::path::Path) -> Vec<GpuInfo> {
@@ -225,6 +267,7 @@ pub fn probe_main() -> i32 {
                     kind: kind.into(),
                     driver_file: PathBuf::new(),
                     shares_driver: false,
+                    shares_ids: false,
                 };
                 println!("{}", serde_json::to_string(&info).unwrap());
             }
@@ -237,4 +280,100 @@ pub fn probe_main() -> i32 {
 #[cfg(not(target_os = "linux"))]
 pub fn probe_main() -> i32 {
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gpu(name: &str, ids: (u32, u32), kind: &str, file: &str) -> GpuInfo {
+        GpuInfo {
+            name: name.into(),
+            vendor_id: ids.0,
+            device_id: ids.1,
+            kind: kind.into(),
+            driver_file: file.into(),
+            shares_driver: false,
+            shares_ids: false,
+        }
+    }
+
+    /// RADV drives two GPUs, and AMDVLK reaches one of them too; NVIDIA's driver and lavapipe
+    /// one each.
+    #[test]
+    fn a_shared_driver_and_shared_ids_are_marked() {
+        let mut gpus = vec![
+            gpu("RTX 3090", (0x10de, 0x2204), "discrete", "/icd/nvidia.json"),
+            gpu(
+                "XTX (RADV)",
+                (0x1002, 0x744c),
+                "discrete",
+                "/icd/radeon.json",
+            ),
+            gpu(
+                "780M (RADV)",
+                (0x1002, 0x15bf),
+                "integrated",
+                "/icd/radeon.json",
+            ),
+            gpu(
+                "XTX (AMDVLK)",
+                (0x1002, 0x744c),
+                "discrete",
+                "/icd/amd.json",
+            ),
+            gpu("llvmpipe", (0x10005, 0), "cpu", "/icd/lvp.json"),
+        ];
+        mark_shared(&mut gpus);
+        let marks: Vec<(bool, bool)> = gpus
+            .iter()
+            .map(|g| (g.shares_driver, g.shares_ids))
+            .collect();
+        assert_eq!(
+            marks,
+            [
+                (false, false),
+                (true, true),
+                (true, false),
+                (false, true),
+                (false, false)
+            ]
+        );
+    }
+
+    /// A GPU of the list is named by its IDs, its device ID kept where its driver drives several;
+    /// a CPU implementation and a GPU whose IDs another manifest reaches too, by their driver's
+    /// manifest alone (the module doc).
+    #[test]
+    fn a_pick_is_named_by_its_ids_where_they_name_it() {
+        let mut g = gpu(
+            "NVIDIA GeForce RTX 3090",
+            (0x10de, 0x2204),
+            "discrete",
+            "/icd/nvidia.json",
+        );
+        assert_eq!(
+            g.to_config(),
+            crate::vm::Gpu {
+                driver_file: Some("/icd/nvidia.json".into()),
+                device_id: None,
+                select: Some("10de:2204".into()),
+                name: Some("NVIDIA GeForce RTX 3090".into()),
+            }
+        );
+        g.shares_driver = true;
+        assert_eq!(g.to_config().device_id, Some(0x2204));
+        assert_eq!(g.to_config().select.as_deref(), Some("10de:2204"));
+        g.shares_ids = true;
+        assert_eq!(g.to_config().select, None);
+        assert_eq!(
+            g.to_config().driver_file.as_deref(),
+            Some(std::path::Path::new("/icd/nvidia.json"))
+        );
+        let lvp = gpu("llvmpipe", (0x10005, 0), "cpu", "/icd/lvp.json");
+        assert_eq!(lvp.to_config().select, None);
+        let small = gpu("virtio", (0x1af4, 0x50), "virtual", "/icd/virtio.json");
+        assert_eq!(small.to_config().select.as_deref(), Some("1af4:0050"));
+        assert_eq!(small.to_config().selected().unwrap(), Some((0x1af4, 0x50)));
+    }
 }

@@ -2252,6 +2252,7 @@ fn gpu_from_choice(id: &str, list: &[GpuInfo]) -> crate::vm::Gpu {
     crate::vm::Gpu {
         driver_file: Some(file.into()),
         device_id: dev,
+        select: None,
         name: None,
     }
 }
