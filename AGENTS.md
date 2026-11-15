@@ -24,6 +24,8 @@ The guest's Metal bundle serialises its Metal calls onto the device's rings,
 and the library carries them out on the host's GPU, on the Vulkan platform
 (`crates/reims-vgpu-vulkan`), over metal2vulkan's Metal-shaped runtime: on
 Linux, and on a Mac over MoltenVK, a build for development and tests.
+Windows is being brought up on homelab-mac-mini-2018; nothing ships for it
+yet.
 The device's video decodes run on the host's VA-API or NVDEC.
 
 [README.md](README.md) says what the project is, and
@@ -130,6 +132,7 @@ passes run again alone.
 | what the Vulkan platform ends the process on, or what device info, GPU families or feature queries answer | the library's checks, and a cold boot of each guest the change can reach before it merges ("A boot is the only check", below) |
 | a `.metal` source of the Vulkan crate, `shaders.metal` among them | `cargo xtask metallibs` on a Mac, committing the metallibs it writes with the change; then the library's checks |
 | the video crate (`crates/reims-vgpu-video`), or its arms in `reims-vgpu` | `cargo xtask check` on a Mac; the Linux tests on a VA-API host and on an NVIDIA host; and, where the `vaapi` module's decoders change, the conformance suite on a VA-API host ("The video crates' checks", below) |
+| Windows-only code (`cfg(windows)` files) | `cargo xtask check` on the Mac or Linux, which clippy-checks the Windows target; and the crate's tests on homelab-mac-mini-2018, `scripts/internal/windows-tests.sh -p <crate>`: two potluck jobs there, the build, then the tests holding its UHD 630 (`--gpu 8086:3e9b`; reims-vgpu and reims-vgpu-c's tests peaked at 12.3 GiB of commit charge) |
 | `xtask/` | `cargo test -p xtask`, rustfmt and clippy on it |
 | `crates/reims-ctl` | `cargo test`, `cargo fmt --check` and `cargo clippy --all-targets` in it (`cargo xtask check` does not reach it); a change to the QEMU command it builds, or to `scripts/install-ctl.sh`, also needs an install and a VM boot on each host it touches |
 | `guest/` (kext, bundle, rgfxgate, loader) | `make -C guest test` on a Mac; a change to a source the sets are built from also needs `make -C guest prebuilt KDK=<KDK Extensions dir>` and `make -C guest prebuilt-arm64e`, committing `guest/prebuilt` and `guest/prebuilt-arm64e` with it (`make -C guest prebuilt-check`, which checks both, fails otherwise) |
@@ -330,7 +333,9 @@ Three tiers:
   Rosetta is installed, runs core's tests (the Vulkan crate's unit tests
   below `core::`) as `x86_64-apple-darwin`, for the x86-64 guest's 4 KiB
   pages and instructions; it skips them, saying so, where Rosetta is not.
-  No x86-64 macOS binary ships.
+  No x86-64 macOS binary ships. On the Mac and on Linux the check also
+  clippy-checks `x86_64-pc-windows-gnullvm`, the Windows target the library
+  is being brought up on, built there under MSYS2 CLANG64.
 - **Run `cargo xtask check` once before a branch that changes the library
   merges**, not before each commit (Checking a change).
 - **Stage explicit paths, and never commit build output.** Before each

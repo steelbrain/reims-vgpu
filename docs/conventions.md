@@ -18,10 +18,12 @@ repeats the ones code cites.
   Objective-C class. One module style: `foo.rs` beside `foo/` (D44).
 - **Code for one OS** goes in files of its own (the window crate's
   `native/macos/`, `native/linux/` and `native/windows.rs`, the Vulkan
-  crate's `os/macos.rs` and `os/linux.rs`, the C API's
-  `ffi/catch/{macos,linux}.rs`, Linux's of which Windows takes), which the
-  module above them picks with `#[cfg(target_os = ...)]`, rather than in
-  `cfg`s spread through shared code. Code some OSes share and others do not
+  crate's `os/macos.rs`, `os/linux.rs` and `os/windows.rs`, the graphics
+  crate's `clock/`, `region/` and `wake/`, each `unix.rs` and `windows.rs`,
+  the C API's `ffi/catch/{macos,linux}.rs`, Linux's of which Windows
+  takes), which the module above them picks with `#[cfg(target_os = ...)]`
+  (or `unix` and `windows`), rather than in `cfg`s spread through shared
+  code. Code some OSes share and others do not
   goes in a module of its own that the index picks for those OSes (the
   window crate's `native/sdl_thread/`, SDL on the library's own thread, for
   Linux and Windows). It sits in the crates both OSes share: no crate is one
