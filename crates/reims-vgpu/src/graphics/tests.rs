@@ -347,6 +347,98 @@ fn on_vulkan_a_queue_before_the_graphics_device_takes_no_guest_texture_id() {
     drop(queue);
 }
 
+/// The variable that makes [`on_vulkan_a_cold_device_takes_no_guest_texture_id`]'s process the
+/// child, which runs in the new empty `HOME` its parent made.
+const COLD_HOME_CHILD: &str = "RVG_COLD_HOME_CHILD";
+
+/// On the Vulkan platform, a graphics device whose GPU device is made cold leaves every guest
+/// texture id to the guest. Cold is a user's first boot, or the first after a GPU driver or kernel
+/// update: nothing the library or the runtime keeps under `HOME` is found, so each check and probe
+/// whose verdict is kept there runs as the device is made. One of them is the fold probe, where
+/// the GPU's imports of views need their pages' files (NVIDIA, ANV). Its command queue came before
+/// the graphics device's reservation, and the host's textures then took the guest's ids from 1
+/// (a user's RTX 3060). The child runs in a new empty `HOME`, its graphics device the process's
+/// first, and names what was kept there once the device was made (the fold probe's verdict where
+/// it ran); the parent prints that
+#[test]
+fn on_vulkan_a_cold_device_takes_no_guest_texture_id() {
+    use reims_vgpu_vulkan::core::platform::resource::Texture as _;
+    use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+    const LINE: &str = "COLD-DEVICE: ";
+    if std::env::var_os(COLD_HOME_CHILD).is_none() {
+        let home = std::env::temp_dir().join(format!("rvg-cold-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "graphics::tests::on_vulkan_a_cold_device_takes_no_guest_texture_id",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(COLD_HOME_CHILD, "1")
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}{stderr}");
+        // The child's line follows libtest's own `test NAME ... ` on its line.
+        let ran = stdout.lines().find_map(|l| l.find(LINE).map(|at| &l[at..]));
+        let Some(ran) = ran else {
+            panic!("the child ran no device: {stdout}{stderr}");
+        };
+        println!("{ran}");
+        return;
+    }
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("the child's HOME"));
+    assert!(
+        std::fs::read_dir(&home).unwrap().next().is_none(),
+        "the child's HOME {} is not empty",
+        home.display()
+    );
+    let platform = crate::singleton::platform();
+    let _device =
+        GraphicsDevice::with_platform(Arc::clone(&platform), GraphicsConfig::default()).unwrap();
+    let gpu = platform.metal_device(None).unwrap();
+    let plain_desc = platform.texture_descriptor(&TextureDesc {
+        pixel_format: 80,
+        width: 4,
+        height: 4,
+        usage: 1,
+        resource_options: Some(0x20),
+        ..TextureDesc::default()
+    });
+    let plain: Vec<_> = (0..256)
+        .map(|_| {
+            gpu.new_texture(OnFault::Return, &plain_desc)
+                .unwrap()
+                .unwrap()
+        })
+        .collect();
+    let inside: Vec<u64> = plain
+        .iter()
+        .map(|t| t.gpu_resource_id())
+        .filter(|id| guest_texture_ids().contains(id))
+        .collect();
+    assert!(
+        inside.is_empty(),
+        "plain textures took the guest's ids {inside:?}"
+    );
+    let checks = reims_vgpu_vulkan::platform::cache_directory()
+        .map(|dir| dir.join("device-checks"))
+        .and_then(|dir| std::fs::read_dir(dir).ok());
+    let mut kept: Vec<String> = (checks.into_iter().flatten().flatten())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    kept.sort();
+    println!(
+        "{LINE}{}: the device checks kept in the empty HOME: {kept:?}",
+        gpu.raw.properties().name
+    );
+}
+
 /// The variable naming the guest architecture of [`the_guest_s_class_decides_the_answers`]'s
 /// child, `x86_64` or `arm64`.
 const GUEST_CLASS_CHILD: &str = "RVG_GUEST_CLASS_CHILD";
