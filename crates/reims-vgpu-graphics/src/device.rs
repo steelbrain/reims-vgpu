@@ -1308,14 +1308,24 @@ impl Device {
         self.shared.queues.lock().by_obj.len()
     }
 
-    /// Whether the control thread and every queue's service thread sleep with no wake pending
-    /// ([`Wake::parked`]), and no lane has a message to carry out: what they write of the rings
-    /// stays as it is until the guest acts.
+    /// Whether the control thread sleeps with no wake pending ([`Wake::parked`]): it takes no lock
+    /// until it is woken.
     #[cfg(test)]
-    pub(crate) fn parked(&self) -> bool {
+    pub(crate) fn control_parked(&self) -> bool {
         let doorbell = self.shared.doorbell.get().map(wake::raw);
         self.shared.wake.parked(doorbell)
-            && self.shared.lanes.idle()
+    }
+
+    /// Whether the control thread and every queue's service thread sleep with no wake pending
+    /// ([`Wake::parked`]), no lane has a message to carry out, and each of ring 0's threads waits
+    /// for a lane with the lanes' lock let go ([`Lanes::parked`]): what they write of the rings
+    /// stays as it is until the guest acts, and until then none takes a lock that a doorbell's
+    /// thread tries ([`Shared::download_on_doorbell`], [`Shared::answer_on_doorbell`]) but a ring-0
+    /// thread that has waited [`crate::keep::KEEP`] for a lane, and goes.
+    #[cfg(test)]
+    pub(crate) fn parked(&self) -> bool {
+        self.control_parked()
+            && self.shared.lanes.parked()
             && self
                 .shared
                 .queues

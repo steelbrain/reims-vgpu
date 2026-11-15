@@ -332,6 +332,10 @@ struct State {
     /// Ring 0's threads take no job while set ([`Lanes::hold_threads`], the tests).
     #[cfg(test)]
     held: bool,
+    /// How many of ring 0's threads wait for a lane inside [`Lanes::park`]'s wait, the lanes'
+    /// lock let go ([`Lanes::parked`], the tests).
+    #[cfg(test)]
+    parked: usize,
 }
 
 impl State {
@@ -964,7 +968,15 @@ impl Lanes {
                 }
                 return None;
             }
+            #[cfg(test)]
+            {
+                state.parked += 1;
+            }
             kept = self.keep.wait(&wake, &mut state, since);
+            #[cfg(test)]
+            {
+                state.parked -= 1;
+            }
         }
     }
 
@@ -1087,6 +1099,20 @@ impl Lanes {
             .lanes
             .values()
             .all(|lane| lane.unfinished(epoch).next().is_none())
+    }
+
+    /// Whether no lane has a job not yet carried out and each of ring 0's threads waits for a
+    /// lane inside [`Self::park`]'s wait, the lanes' lock let go: none takes the lock again until
+    /// a lane is given to it or it has waited [`KEEP`] (the tests). [`Self::idle`] holds from a
+    /// thread's [`Self::finished`] of its lane's last job, before the thread posts the job's
+    /// answer, and the thread takes the lock twice more before it waits ([`Self::next`], then
+    /// [`Self::park`]).
+    #[cfg(test)]
+    pub(super) fn parked(&self) -> bool {
+        let state = self.state.lock();
+        let epoch = state.epoch;
+        state.parked == state.threads.iter().flatten().count()
+            && (state.lanes.values()).all(|lane| lane.unfinished(epoch).next().is_none())
     }
 }
 

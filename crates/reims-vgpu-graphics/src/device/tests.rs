@@ -3418,6 +3418,7 @@ fn a_doorbell_write_answers_a_command_buffer_on_its_thread() {
         0,
         &[command_buffer(QUEUE, 100, 1), command_buffer(QUEUE, 101, 2)],
     );
+    wait_parked(&rig);
     rig.device
         .mmio_write_taking(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
     let here = thread_name();
@@ -3487,6 +3488,7 @@ fn an_answered_command_buffer_waits_for_no_later_ring_0_message() {
         (region.atomic_u64(RGFX_CONTROL_SUBMIT_OFFSET)).store(produced, Ordering::SeqCst);
     }));
     publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
+    wait_parked(&rig);
     rig.device
         .mmio_write_taking(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
     assert_eq!(*taking.answered.lock(), HashMap::from([(1, true)]));
@@ -3608,10 +3610,14 @@ fn a_doorbell_write_answers_a_command_buffer_behind_another_process_s_create() {
     taking.takes.store(true, Ordering::SeqCst);
     let mut rig = taking_rig(&taking, QUEUE);
     taking.hold_creates.store(true, Ordering::SeqCst);
+    wait_parked(&rig);
     rig.send(object_message(RGFX_CMD_BUFFER_CREATE, OTHER));
     let created = |taking: &Taking| taking.handed.lock().last() == Some(&RGFX_CMD_BUFFER_CREATE);
     eventually(|| created(&taking));
     assert!(created(&taking), "the create never reached the host");
+    // The create's lane's thread waits in the host, holding no lock of the device's; the rest
+    // parked before the create, and the control thread sleeps again past its hand of it.
+    wait_control_parked(&rig);
     publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
     rig.device
         .mmio_write_taking(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
@@ -3725,6 +3731,7 @@ fn only_an_asking_doorbell_write_is_answered_at_the_doorbell() {
     wait_queue_idle(&rig);
 
     publish_unrung(&rig, at, &[command_buffer(QUEUE, 101, 2)]);
+    wait_parked(&rig);
     rig.device.mmio_write_taking(
         RGFX_REG_DOORBELL.into(),
         QUEUE_SUBMIT as u32 | RGFX_DOORBELL_ASKS,
@@ -3758,6 +3765,7 @@ fn a_guest_without_doorbell_asks_is_answered_at_any_doorbell_and_not_routed() {
     assert!(taking.routes.lock().is_empty(), "a route was asked");
 
     publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
+    wait_parked(&rig);
     rig.device
         .mmio_write_taking(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
     assert_eq!(*taking.answered.lock(), HashMap::from([(1, true)]));
@@ -4795,11 +4803,26 @@ fn a_download_behind_its_block_s_pages_on_the_lane_is_carried_out_after_them_the
 }
 
 /// Waits, [`PATIENCE`] polls at most, for the control thread to sleep with nothing in flight
-/// (`Submit::asleep`).
-fn wait_control_asleep(rig: &Rig) {
+/// (`Submit::asleep`) and no wake pending ([`Device::control_parked`]): it takes no lock a
+/// doorbell's thread tries until it is woken. `asleep` alone is set before the thread's look at
+/// its wake, which may find one pending and wake it at once, its ring then held.
+fn wait_control_parked(rig: &Rig) {
     assert!(
-        eventually(|| rig.device.shared.submit.lock().asleep),
+        eventually(|| rig.device.shared.submit.lock().asleep && rig.device.control_parked()),
         "the control thread did not go to sleep"
+    );
+}
+
+/// Waits, [`PATIENCE`] polls at most, for the control thread to sleep with nothing in flight
+/// (`Submit::asleep`) and every thread of the device's to be parked ([`Device::parked`]): none
+/// takes a lock a doorbell's thread tries until the test acts, so the doorbell's thread finds each
+/// free. A lane's thread posts its answer, then takes the lanes' lock twice more before it waits
+/// for a lane ([`Lanes::parked`]), and the control thread sets `asleep` before its look at its
+/// wake: a write made as soon as an answer or `asleep` is seen may find a lock held, under load.
+fn wait_parked(rig: &Rig) {
+    assert!(
+        eventually(|| rig.device.shared.submit.lock().asleep && rig.device.parked()),
+        "the device's threads did not park"
     );
 }
 
@@ -4834,7 +4857,7 @@ fn a_landed_download_is_answered_on_its_doorbell_s_thread() {
     let pages = rig.send(surface_pages_message(5, BLOCK, RGFX_SURFACE_PAGES_CACHED));
     assert_eq!(rig.complete(), (pages, RGFX_STATUS_OK));
     wait_block_lane_idle(&rig, BLOCK);
-    wait_control_asleep(&rig);
+    wait_parked(&rig);
     let download = publish_next(&mut rig, download_message(BLOCK));
     rig.device
         .mmio_write_taking(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
@@ -4850,7 +4873,7 @@ fn a_landed_download_is_answered_on_its_doorbell_s_thread() {
     // plain write.
     let present = rig.send(present(0));
     assert_eq!(rig.complete(), (present, RGFX_STATUS_OK));
-    wait_control_asleep(&rig);
+    wait_parked(&rig);
     let plain = publish_next(&mut rig, download_message(BLOCK));
     rig.device
         .mmio_write(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
@@ -4872,7 +4895,7 @@ fn a_doorbell_s_thread_leaves_a_download_the_control_thread_must_take() {
     let control = Some("reims-vgpu.graphics-control".to_owned());
 
     // Not carried out yet.
-    wait_control_asleep(&rig);
+    wait_parked(&rig);
     let first = publish_next(&mut rig, download_message(BLOCK));
     rig.device
         .mmio_write_taking(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
@@ -4881,7 +4904,7 @@ fn a_doorbell_s_thread_leaves_a_download_the_control_thread_must_take() {
 
     // Behind a present at the head.
     seen.at_doorbell.store(true, Ordering::SeqCst);
-    wait_control_asleep(&rig);
+    wait_parked(&rig);
     let shown = publish_next(&mut rig, present(0));
     let behind = publish_next(&mut rig, download_message(BLOCK));
     rig.device
@@ -4894,7 +4917,7 @@ fn a_doorbell_s_thread_leaves_a_download_the_control_thread_must_take() {
     // The control thread awake in a download it was offered: the next waits for it.
     seen.at_doorbell.store(false, Ordering::SeqCst);
     seen.hold_here.store(true, Ordering::SeqCst);
-    wait_control_asleep(&rig);
+    wait_parked(&rig);
     let held = rig.send(download_message(BLOCK));
     eventually(|| !rig.device.shared.submit.lock().asleep);
     settle();

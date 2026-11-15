@@ -130,6 +130,7 @@ fn a_doorbell_page_wakes_only_the_rings_of_the_context_it_is_bound_to() {
 
     // Its own context's ring: taken, and answered on the writing thread.
     let first = publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
+    wait_parked(&rig);
     rig.device.doorbell_write(page_at(3), QUEUE_SUBMIT as u32);
     assert_eq!(taking.answered.lock().get(&1), Some(&true));
     assert_eq!(
@@ -166,6 +167,7 @@ fn a_doorbell_page_wakes_only_the_rings_of_the_context_it_is_bound_to() {
     rig.device.doorbell_write(page_at(3), QUEUE_SUBMIT as u32);
     assert_eq!(dropped(&rig), 3);
     assert!(!taking.answered.lock().contains_key(&2));
+    wait_parked(&rig);
     rig.device.doorbell_write(page_at(3), OTHER_SUBMIT as u32);
     assert_eq!(taking.answered.lock().get(&7), Some(&true));
     assert!(eventually(|| consumer(&rig, OTHER_SUBMIT) > 0));
@@ -186,6 +188,7 @@ fn a_doorbell_page_wakes_only_the_rings_of_the_context_it_is_bound_to() {
     );
 
     // Its own doorbell takes the buffer the dropped writes left.
+    wait_parked(&rig);
     rig.device
         .mmio_write_taking(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
     assert_eq!(taking.answered.lock().get(&2), Some(&true));
@@ -240,6 +243,7 @@ fn without_doorbell_pages_the_doorbells_are_the_register_s() {
         assert_eq!(*taking.routed_at.lock(), vec![DoorbellAt::Register]);
 
         publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
+        wait_parked(&rig);
         rig.device.mmio_write_taking(
             RGFX_REG_DOORBELL.into(),
             QUEUE_SUBMIT as u32 | RGFX_DOORBELL_ASKS,
