@@ -4819,6 +4819,7 @@ pub(crate) mod tests {
     }
 
     /// The least size of [`heap_over_pages`]' heaps ([`over_pages`]).
+    #[cfg(not(windows))]
     pub(crate) const OVER_PAGES: u64 = 0x10000;
 
     /// The size of [`heap_over_pages`]' heaps: [`OVER_PAGES`] where the test device answers two
@@ -4827,6 +4828,7 @@ pub(crate) mod tests {
     /// where they fit. A native device's image of such a texture can take more than Metal's
     /// (`heap-texture-larger-than-metal`, relayed there: RADV 26.0.8 answers 0x24008 bytes at an
     /// alignment of 0x10000), and a heap places the texture by the device's answer.
+    #[cfg(not(windows))]
     pub(crate) fn over_pages() -> u64 {
         static SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         *SIZE.get_or_init(|| {
@@ -4922,6 +4924,7 @@ pub(crate) mod tests {
 
     /// [`heap_over_pages`]' texture of the resource options `options`, the offset past its bytes
     /// at its alignment, and its size, as `d` answers them.
+    #[cfg(not(windows))]
     fn depth_stencil_with<P: Platform>(
         p: &P,
         d: &P::Device,

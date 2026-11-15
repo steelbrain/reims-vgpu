@@ -448,7 +448,7 @@ const READ_WRITE: VmProt = VmProt(VmProt::READ.raw() | VmProt::WRITE.raw());
 
 /// The kernel's mappings the table's runs take (module docs): every view the library made and
 /// every range a view can be made of.
-#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn mappings() -> u64 {
     TABLE.lock().mappings().to_u64()
 }
@@ -456,7 +456,7 @@ pub(crate) fn mappings() -> u64 {
 /// The kernel's mappings the table's runs in `first..end` take, as [`mappings`] counts them:
 /// what a fold of them would free (`super::linux`'s `vm::fold_idle`), and in tests a range's
 /// count to set beside the kernel's.
-#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn mappings_between(first: u64, end: u64) -> u64 {
     let table = TABLE.lock();
     let mut count = 0u64;
@@ -473,7 +473,7 @@ pub(crate) fn mappings_between(first: u64, end: u64) -> u64 {
 /// The spans of the table's runs mapped from their files, in order, each of such runs that follow
 /// one another in the address space with none through a dma-buf between: what a fold may map
 /// through dma-bufs instead (`super::linux`'s `vm::fold_idle`).
-#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn file_spans() -> Vec<std::ops::Range<u64>> {
     let table = TABLE.lock();
     let mut spans: Vec<std::ops::Range<u64>> = Vec::new();
@@ -570,7 +570,7 @@ pub(crate) fn record_pieces(target: u64, pieces: Vec<Piece>) {
 
 /// As [`record_pieces`], for pieces mapped through dma-bufs, each where its [`Through`] says
 /// (module docs).
-#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn record_through(target: u64, pieces: Vec<(Piece, Through)>) {
     let mut table = TABLE.lock();
     for (piece, through) in pieces {
@@ -582,7 +582,7 @@ pub(crate) fn record_through(target: u64, pieces: Vec<(Piece, Through)>) {
 
 /// The runs in `first..end` mapped through a dma-buf, cut to it, in order, as pieces from
 /// `first`: what an import's unfold maps from their files (`super::linux`'s `vm::unfold`).
-#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn through_pieces(first: u64, end: u64) -> Vec<Piece> {
     let table = TABLE.lock();
     let from = table.run_at(first).map_or(first, |(at, _)| at);
