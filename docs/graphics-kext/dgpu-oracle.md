@@ -740,11 +740,15 @@ an arm64 guest's device) the bundle answers nil past the M3's bound from arm64, 
 `resourceSize` (`rgfxAppleAllocation`), sending nothing; the x86 guest's device makes them, as
 the x86 Macs do, short of the host's platform's own bound above *(class 3 for each guest)*. The
 shell tests check both: `test_buffer_texture_copies_past_the_length_reach_the_tail` and
-`test_apple_textures_past_a_buffers_allocation_answer_nil`. Where the host's bound and the M3's
-part, over a buffer of 16 KiB or more, the host's is the stricter, and the bundle answers nil
-past it on either guest: the host counts a texture buffer's rows and a 2D texture's whole last
-row, where the M3 counts the last texel, and a heap's buffer's and a no-copy buffer's length
-rounded up to 16 KiB, where the M3 counts the heap's size and the pages the bytes meet.
+`test_apple_textures_past_a_buffers_allocation_answer_nil`. Over a buffer of 16 KiB or more the
+host's platform counts as the M3 does (metal2vulkan's `linear_plan.rs`, "Length"): a 2D
+texture's and a texture buffer's last texel, a 2D array's slices' end, against the length
+rounded up to 16 KiB, or a heap's buffer's heap's size. A buffer over pages, a no-copy buffer's
+or one over the device's region, it counts from the host pointer's offset in its 16 KiB page,
+which the guest does not know; the bundle counts the length rounded up to 16 KiB for those on
+either guest (`rgfxHostAllocation`), never past the host's bound, and so answers nil for a
+no-copy buffer's texture the M3 makes where its bytes start into a page and cross one more page
+than its length alone *(class 2)*.
 
 ## Q12: texture descriptors Metal's validation ends the process at
 

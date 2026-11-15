@@ -3358,9 +3358,11 @@ void test_buffer_texture_buffers()
 // A texture over a buffer's bytes whose texels end past an Apple GPU's allocation of a buffer of
 // 16 KiB or more, its length rounded up to 16 KiB, answers nil and posts nothing, by the public form
 // and the linear SPI, a 2D texture, a 2D array and a texture buffer alike, as the M3 Max answers it
-// and the host's platform answers it on every device (`tbpa`, docs/graphics-kext/dgpu-oracle.md
-// Q11, where the x86 Macs make them). One ending at the length, inside the allocation or past a
-// smaller buffer's bytes is made, posting its create.
+// and the host's platform answers it on every device (`tbpa`, `oracle_pastlen Apple limits`,
+// docs/graphics-kext/dgpu-oracle.md Q11, where the x86 Macs make them). A 2D texture and a texture
+// buffer end at their last texel, whatever the bytes per row past it, and a 2D array at its slices'
+// end. One ending at the length, inside the allocation or past a smaller buffer's bytes is made,
+// posting its create.
 void test_textures_past_a_buffers_allocation_answer_nil()
 {
 	Fixture fx;
@@ -3437,6 +3439,15 @@ void test_textures_past_a_buffers_allocation_answer_nil()
 			// from 16352, ending at 16416.
 			answers(16384, texels, 16320, 64, linear, true);
 			answers(16384, texels, 16352, 64, linear, false);
+			// Its last texel, not its row's bytes past it: from 32704 of 20000 bytes, rows 4096
+			// apart, ending at the allocation of 32768 though its row runs to 36800, and from
+			// 32720, ending at 32784.
+			answers(20000, texels, 32704, 4096, linear, true);
+			answers(20000, texels, 32720, 64, linear, false);
+			// A 2D texture from 256, rows 512 apart, over 20000 bytes: of 64 rows, its last texel
+			// ending at 32768 though its rows run to 33024, and of 65, ending at 33280.
+			answers(20000, rgba(MTLTextureType2D, 64, 1), 256, 512, linear, true);
+			answers(20000, rgba(MTLTextureType2D, 65, 1), 256, 512, linear, false);
 		}
 		// The linear SPI's 2D array of two slices, each its rows' bytes rounded up to 128 apart: of
 		// 64 x 32 ending at 16384 over 16384 bytes, and of 64 x 33 ending at 16896.
@@ -3564,7 +3575,8 @@ void test_apple_textures_past_a_buffers_allocation_answer_nil()
 			answers(noCopy, texels(end), 0, end, false, true);
 			answers(noCopy, texels(end + 1), 0, end + 1, false, false);
 		}
-		// A heap's buffer of 100 bytes: a texture buffer ending the heap's 64 KiB past the
+		// A heap's buffer of 100 bytes, and one of 16 KiB, past whose length rounded up the host's
+		// platform counts the heap's size too: a texture buffer ending the heap's 64 KiB past the
 		// buffer's start is made, wherever the buffer lies, and a byte past it nil.
 		MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
 		hd.size = 0x10000;
@@ -3576,8 +3588,8 @@ void test_apple_textures_past_a_buffers_allocation_answer_nil()
 		                                            serializer:&fx.ser];
 		CHECK(heap != nil && heap.size == 0x10000);
 		drainRing(fx.ring);
-		for (int i = 0; i < 2; i++) {
-			id<MTLBuffer> b = [heap newBufferWithLength:100 options:MTLResourceStorageModeShared];
+		for (const NSUInteger length : {NSUInteger{100}, NSUInteger{100}, NSUInteger{0x4000}}) {
+			id<MTLBuffer> b = [heap newBufferWithLength:length options:MTLResourceStorageModeShared];
 			CHECK(b != nil);
 			if (b != nil)
 				[kept addObject:b];

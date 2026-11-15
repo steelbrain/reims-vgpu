@@ -141,22 +141,22 @@ constexpr uint64_t kRgfxApplePool = 131072;
 
 /// Whether a texture over a buffer of `length` bytes, from `offset` with rows `bytesPerRow` apart,
 /// of `height` rows of `rowBytes` bytes of texels in each of `slices` slices (a 2D array's,
-/// `array`, rounded up to 128 bytes apart), is nil. On every device, where the host's platform
-/// answers it nil, as Metal does on the M3 Max under macOS 27.0.1 (metal2vulkan's linear_plan.rs
-/// "Length", and `tbpa`, dgpu-oracle.md Q11): its texels end past the length, the buffer is at
-/// least 16 KiB, and the slices, each its rows' whole pitch, end past the length rounded up to 16
-/// KiB, the buffer's allocation; the AMD 5300M and the Intel 630 make it past the allocation too
-/// (`tbpa`, macOS 26.7.1), but the host's platform refuses a create the bundle posts for one.
-/// And where `appleAllocation` is not 0, an Apple GPU's allocation of the buffer
-/// (rgfxAppleAllocation), where the texture ends past it from the buffer's start, as the M3 Max
-/// answers it nil (`oracle_pastlen Apple limits`): a 2D texture's last texel or a texture buffer's,
-/// whatever the bytes per row past them, and a 2D array's slices, each its rows' whole pitch, its
-/// texels inside the length or not (two slices of 64 x 16 R32Uint, rows 512 bytes apart, from 256
-/// over 16384 bytes: the last texel at the length, the slices' end 256 bytes past it). Short of
-/// both the texture is made over bytes past the length however far.
+/// `array`, rounded up to 128 bytes apart), is nil. Its end, counted from the buffer's start, is a
+/// 2D texture's or a texture buffer's last texel, whatever the bytes per row past it, and a 2D
+/// array's slices' end, each slice its rows' whole pitch, as the M3 Max counts it under macOS
+/// 27.0.1 (`oracle_pastlen Apple limits`, dgpu-oracle.md Q11). On every device, where the host's
+/// platform answers it nil (metal2vulkan's linear_plan.rs "Length"): its texels end past the
+/// length, the buffer is at least 16 KiB, and the end lies past `hostAllocation`
+/// (rgfxHostAllocation); the AMD 5300M and the Intel 630 make it past the allocation too (`tbpa`,
+/// macOS 26.7.1), but the host's platform refuses a create the bundle posts for one. And where
+/// `appleAllocation` is not 0, an Apple GPU's allocation of the buffer (rgfxAppleAllocation),
+/// where the end lies past it, as the M3 Max answers it nil, a 2D array's with its texels inside
+/// the length too (two slices of 64 x 16 R32Uint, rows 512 bytes apart, from 256 over 16384
+/// bytes: the last texel at the length, the slices' end 256 bytes past it). Short of both the
+/// texture is made over bytes past the length however far.
 bool rgfxTexelsPastAllocation(uint64_t length, uint64_t offset, uint64_t bytesPerRow,
                               uint64_t height, uint64_t rowBytes, uint64_t slices, bool array,
-                              uint64_t appleAllocation)
+                              uint64_t hostAllocation, uint64_t appleAllocation)
 {
 	using wide = unsigned __int128;
 	const wide rows = std::max<uint64_t>(1, height);
@@ -164,14 +164,12 @@ bool rgfxTexelsPastAllocation(uint64_t length, uint64_t offset, uint64_t bytesPe
 	const wide image = static_cast<wide>(bytesPerRow) * rows;
 	const wide pitch = array ? (image + 127) / 128 * 128 : image;
 	const wide texelsEnd = offset + pitch * (count - 1) + bytesPerRow * (rows - 1) + rowBytes;
-	if (appleAllocation != 0 && (array ? offset + pitch * count : texelsEnd) > appleAllocation)
+	const wide end = array ? offset + pitch * count : texelsEnd;
+	if (appleAllocation != 0 && end > appleAllocation)
 		return true;
 	if (texelsEnd <= length || length < kRgfxAllocationGranule)
 		return false;
-	const wide allocation =
-	    (static_cast<wide>(length) + kRgfxAllocationGranule - 1) / kRgfxAllocationGranule *
-	    kRgfxAllocationGranule;
-	return offset + pitch * count > allocation;
+	return end > hostAllocation;
 }
 } // namespace
 
@@ -797,6 +795,21 @@ RGFX_RESOURCE_SPI
 	return _noCopy;
 }
 
+// The bytes from the buffer's start the host's platform makes a texture over it end within, for a
+// buffer of 16 KiB or more (metal2vulkan's linear_plan.rs "Length", as the M3 Max counts them):
+// a heap's buffer's heap's size, and any other's length rounded up to 16 KiB. The platform counts
+// a buffer over pages, a no-copy buffer's or one over the device's region, from the host
+// pointer's offset in its 16 KiB page, which the guest does not know and which only adds to the
+// bound: the length rounded up never reaches past it.
+- (uint64_t)rgfxHostAllocation
+{
+	id<MTLHeap> heap = self.heap;
+	if (heap != nil)
+		return heap.size;
+	const uint64_t g = kRgfxAllocationGranule;
+	return (_length + g - 1) / g * g;
+}
+
 // The bytes from the buffer's start an Apple GPU makes a texture over it end within: its
 // allocation, the resourceSize (SPI) Metal answers for its buffer on the M3 Max under macOS
 // 27.0.1, wherever the buffer lies in it (`oracle_pastlen Apple limits`, dgpu-oracle.md Q11). A
@@ -817,8 +830,8 @@ RGFX_RESOURCE_SPI
 }
 
 // Whether a texture of `descriptor` over the buffer from `offset`, rows `bytesPerRow` apart, is
-// nil for its texels' end past an Apple GPU's allocation of the buffer (rgfxTexelsPastAllocation),
-// logged once: a 2D texture, a 2D array, its slices where the linear form lays them, or a texture
+// nil for its end past the host's platform's allocation of the buffer (rgfxHostAllocation), or an
+// Apple GPU's (rgfxAppleAllocation) under its rules (rgfxTexelsPastAllocation), logged once: a 2D texture, a 2D array, its slices where the linear form lays them, or a texture
 // buffer, of a format whose texture a buffer backs (another is answered on its own). The M3 Max
 // answers a 2D texture's nil there as a texture buffer's (64 x 65 RGBA8Unorm over 16384 bytes, 64
 // x 129 over 20000; `tbpa`, dgpu-oracle.md Q11), where the x86 Macs make both, and so it does past
@@ -838,7 +851,8 @@ RGFX_RESOURCE_SPI
 	const uint64_t rowBytes = static_cast<uint64_t>(descriptor.width) * block.bytes;
 	const uint64_t apple = rgfxAppleGPU(self.device) ? [self rgfxAppleAllocation] : 0;
 	if (!rgfxTexelsPastAllocation([self length], offset, bytesPerRow, descriptor.height, rowBytes,
-	                              array ? descriptor.arrayLength : 1, array, apple))
+	                              array ? descriptor.arrayLength : 1, array,
+	                              [self rgfxHostAllocation], apple))
 		return NO;
 	static std::atomic<bool> logged{false};
 	if (!logged.exchange(true)) {
