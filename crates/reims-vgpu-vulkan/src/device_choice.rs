@@ -10,10 +10,22 @@
 //!
 //! **The pick.**
 //! - Where the host's user picked a device, through `MESA_VK_DEVICE_SELECT` (with or without its
-//!   `!`), `DRI_PRIME` or `VK_LOADER_DEVICE_SELECT` ([`SELECTION_VARIABLES`]), the loader's first
-//!   candidate: Mesa's device-select layer and the loader list the device those name first. The
-//!   runtime alone ranks the candidates by kind first, so it opened a discrete GPU even where the
-//!   user's variable listed an integrated one first without its `!`.
+//!   `!`), `DRI_PRIME` or `VK_LOADER_DEVICE_SELECT` ([`SELECTION_VARIABLES`]), the candidate the
+//!   variable names ([`named`]): by its vendor and device IDs (`vendor:device` in hex, in any of
+//!   the three), or by its PCI address (`DRI_PRIME=pci-0000_03_00_0`); of two candidates of the
+//!   same IDs, the first in the loader's order. The variables are read in that order, and one
+//!   that names no candidate (no device of the host's, or one below Vulkan 1.2) is passed over
+//!   for the next. The loader's order is not the pick: Mesa's device-select layer sorts the
+//!   devices after the loader and lists its own default first unless its own variables name a
+//!   device, so with `VK_LOADER_DEVICE_SELECT` alone naming um870's RTX 3090, the loader's first
+//!   device was the layer's default, its Radeon 780M (**measured**, 2026-11-14, m3-max-30538,
+//!   Mesa 26.2.6 and the loader 1.4.363). `DRI_PRIME`'s index (`DRI_PRIME=1`, with or without
+//!   its `!`) selects the Nth GPU other than the layer's default, which the library cannot tell,
+//!   and the layer lists the GPU it selects first, so there the pick is the loader's first
+//!   candidate (read from Mesa's documentation of `DRI_PRIME`). Where no variable set names a
+//!   candidate, the pick is the loader's first candidate, and the log line says that none names
+//!   a device the runtime can use. The runtime alone ranks the candidates by kind first, so left
+//!   to itself it opens a discrete GPU even where the user's variable named an integrated one.
 //! - Otherwise, where one candidate is a GPU (any kind but a CPU implementation such as
 //!   llvmpipe), that GPU, never timed.
 //! - Where several are, the one that ran a fixed workload fastest ([`measured`]): the display's
@@ -62,11 +74,12 @@ use crate::core::platform::os::Clock as _;
 /// The log target of the choice's lines.
 const TARGET: &str = "reims_vgpu_vulkan::device_choice";
 
-/// The variables through which the host's user picks a Vulkan device, each of which reorders the
-/// loader's list so the device it names comes first: Mesa's device-select layer's
-/// `MESA_VK_DEVICE_SELECT` (`vendor:device`, with a `!` it lists that device alone) and
-/// `DRI_PRIME`, and the loader's `VK_LOADER_DEVICE_SELECT`. Measured: Mesa 26.2.6's layer and
-/// the loader 1.4.363 read these names.
+/// The variables through which the host's user picks a Vulkan device, in the order the pick
+/// reads them: Mesa's device-select layer's `MESA_VK_DEVICE_SELECT` (`vendor:device`, with a `!`
+/// it lists that device alone) and `DRI_PRIME` (`vendor:device`, `pci-DOMAIN_BUS_DEVICE_FUNCTION`
+/// or an index, each with or without a `!`), and the loader's `VK_LOADER_DEVICE_SELECT`
+/// (`vendor:device`), whose order the layer's sort comes after ([`named`]). Measured: Mesa
+/// 26.2.6's layer and the loader 1.4.363 read these names.
 pub(crate) const SELECTION_VARIABLES: [&str; 3] = [
     "MESA_VK_DEVICE_SELECT",
     "DRI_PRIME",
@@ -97,6 +110,72 @@ pub(crate) struct Seen {
     pub(crate) uuid: Option<[u8; 16]>,
     /// Its DRM nodes (`VK_EXT_physical_device_drm`); `None` where it does not list the extension.
     pub(crate) drm: Option<DrmNodes>,
+    /// Its PCI domain, bus, device and function (`VK_EXT_pci_bus_info`); `None` where it does not
+    /// list the extension.
+    pub(crate) pci: Option<(u32, u32, u32, u32)>,
+}
+
+/// The device a selection variable's value names ([`named`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Named {
+    /// The device of these PCI vendor and device IDs.
+    Ids(u32, u32),
+    /// The device at this PCI domain, bus, device and function.
+    Pci(u32, u32, u32, u32),
+    /// No device by itself: `DRI_PRIME`'s index, the Nth GPU other than Mesa's layer's default,
+    /// which the layer lists first.
+    Index,
+}
+
+impl fmt::Display for Named {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Named::Ids(vendor, device) => write!(f, "{vendor:04x}:{device:04x}"),
+            Named::Pci(domain, bus, device, function) => {
+                write!(f, "pci-{domain:04x}_{bus:02x}_{device:02x}_{function:x}")
+            }
+            Named::Index => f.write_str("an index"),
+        }
+    }
+}
+
+/// What `value`, the value of the selection variable `var`, names, in the forms Mesa's
+/// documentation of its layer's variables and the loader's code give: `vendor:device` in hex,
+/// each part with or without `0x`, in any of them, with `MESA_VK_DEVICE_SELECT`'s and
+/// `DRI_PRIME`'s `!` after it; and in `DRI_PRIME` also `pci-DOMAIN_BUS_DEVICE_FUNCTION` in hex,
+/// or a decimal index. `None` where it is none of these, which names no device.
+fn named(var: &str, value: &str) -> Option<Named> {
+    let hex = |x: &str| {
+        let x = (x.strip_prefix("0x").or_else(|| x.strip_prefix("0X"))).unwrap_or(x);
+        (!x.is_empty() && x.len() <= 8 && x.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| u32::from_str_radix(x, 16).ok())
+            .flatten()
+    };
+    let ids = |s: &str| {
+        let (vendor, device) = s.split_once(':')?;
+        Some(Named::Ids(hex(vendor)?, hex(device)?))
+    };
+    let value = value.trim();
+    match var {
+        "VK_LOADER_DEVICE_SELECT" => ids(value),
+        "DRI_PRIME" => {
+            let value = value.strip_suffix('!').unwrap_or(value);
+            if let Some(tag) = value.strip_prefix("pci-") {
+                let parts: Vec<u32> = tag.split('_').map(hex).collect::<Option<_>>()?;
+                match parts.as_slice() {
+                    &[domain, bus, device, function] => {
+                        Some(Named::Pci(domain, bus, device, function))
+                    }
+                    _ => None,
+                }
+            } else if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+                Some(Named::Index)
+            } else {
+                ids(value)
+            }
+        }
+        _ => ids(value.strip_suffix('!').unwrap_or(value)),
+    }
 }
 
 /// A physical device's DRM nodes, by major and minor number (`VkPhysicalDeviceDrmPropertiesEXT`):
@@ -155,6 +234,17 @@ fn compositor_gpu_of(
 }
 
 impl Seen {
+    /// Whether it is the device `named` names.
+    fn is(&self, named: Named) -> bool {
+        match named {
+            Named::Ids(vendor, device) => (self.vendor_id, self.device_id) == (vendor, device),
+            Named::Pci(domain, bus, device, function) => {
+                self.pci == Some((domain, bus, device, function))
+            }
+            Named::Index => false,
+        }
+    }
+
     /// Its registry ID, the runtime's for the physical device of its UUID
     /// ([`listed_registry_id`]), where it has a UUID the runtime lists.
     pub(crate) fn registry_id(&self) -> Option<u64> {
@@ -222,8 +312,14 @@ pub(crate) enum Why {
     Only,
     /// It is the only GPU among the candidates, the others CPU implementations.
     OnlyGpu,
-    /// The host's user picked it through this variable: the loader's first candidate.
-    UserChose(&'static str),
+    /// The host's user picked it through this variable, which names it so.
+    UserChose(&'static str, Named),
+    /// The host's user set this variable to an index, which names no device by itself: the
+    /// loader's first candidate, which Mesa's device-select layer lists first for it.
+    UserIndex(&'static str),
+    /// The host's user set selection variables, the first of them this one, and none names a
+    /// candidate: the loader's first candidate.
+    UserNamedNone(&'static str),
     /// It ran the workload fastest, timed now.
     Measured,
     /// It ran the workload fastest when the same GPUs on the same drivers were timed before.
@@ -242,9 +338,17 @@ impl Why {
             Why::Cached => "the fastest of the GPUs at the choice's workload, as measured \
                             before on the same GPUs and drivers"
                 .to_owned(),
-            Why::UserChose(var) => {
-                format!("{var} is set, so the loader's first device, as the host's user picked")
+            Why::UserChose(var, named) => {
+                format!("{var} names it ({named}), as the host's user picked")
             }
+            Why::UserIndex(var) => format!(
+                "{var} is an index, which names no device by itself, so the loader's first \
+                 device, which Mesa's device-select layer lists first for it"
+            ),
+            Why::UserNamedNone(var) => format!(
+                "{var} is set, but no selection variable set names a device the runtime can use \
+                 here, so the loader's first device"
+            ),
             Why::RuntimeOrder => {
                 "first in the runtime's own order (discrete, integrated, virtual, CPU)".to_owned()
             }
@@ -252,22 +356,37 @@ impl Why {
     }
 }
 
-/// The device of `seen` (the loader's order) the library opens, and why: the first candidate
-/// where `user` names the variable the host's user picked a device through; else the one GPU
+/// The device of `seen` (the loader's order) the library opens, and why: where `user` lists the
+/// selection variables the host's user set, with what each names ([`user_selection`]), the
+/// candidate the first of them to name one names, or the loader's first candidate where an index
+/// comes before it or none names one (the module doc); else the one GPU
 /// among the candidates; else, of several GPUs, the one `measure` answers for them (their
 /// indices in `seen`), or the first of the runtime's own order where it answers none (the module
 /// doc). `measure` is asked only of two GPUs or more. `None` where no device is a candidate.
 pub(crate) fn choose(
     seen: &[Seen],
-    user: Option<&'static str>,
+    user: &[(&'static str, Option<Named>)],
     measure: impl FnOnce(&[usize]) -> Option<(usize, Why)>,
 ) -> Option<(usize, Why)> {
     let candidates: Vec<usize> = (seen.iter().enumerate())
         .filter(|(_, s)| s.candidate())
         .map(|(at, _)| at)
         .collect();
-    if let Some(var) = user {
-        return candidates.first().map(|&at| (at, Why::UserChose(var)));
+    if let Some(&(first, _)) = user.first() {
+        let loaders_first = |why: Why| candidates.first().map(|&at| (at, why));
+        for &(var, named) in user {
+            match named {
+                Some(Named::Index) => return loaders_first(Why::UserIndex(var)),
+                Some(named) => {
+                    let listed = candidates.iter().find(|&&at| seen[at].is(named));
+                    if let Some(&at) = listed {
+                        return Some((at, Why::UserChose(var, named)));
+                    }
+                }
+                None => {}
+            }
+        }
+        return loaders_first(Why::UserNamedNone(first));
     }
     if candidates.len() == 1 {
         return runtime_first(seen).map(|at| (at, Why::Only));
@@ -375,11 +494,15 @@ fn to_open(seen: &[Seen], picked: Option<usize>) -> Option<usize> {
     (Some(at) != runtime_first(seen) && at < seen.len()).then_some(at)
 }
 
-/// The first of [`SELECTION_VARIABLES`] `var` answers a value that is not empty for.
-fn user_selection(var: impl Fn(&str) -> Option<OsString>) -> Option<&'static str> {
-    SELECTION_VARIABLES
-        .into_iter()
-        .find(|name| var(name).is_some_and(|value| !value.is_empty()))
+/// The [`SELECTION_VARIABLES`] `var` answers a value that is not empty for, in their order, each
+/// with what its value names ([`named`]).
+fn user_selection(var: impl Fn(&str) -> Option<OsString>) -> Vec<(&'static str, Option<Named>)> {
+    (SELECTION_VARIABLES.into_iter())
+        .filter_map(|name| {
+            let value = var(name).filter(|value| !value.is_empty())?;
+            Some((name, named(name, &value.to_string_lossy())))
+        })
+        .collect()
 }
 
 /// The registry ID of the device the process opens as its default device, where it is not the one
@@ -395,7 +518,7 @@ pub(crate) fn chosen() -> Option<u64> {
         let file = verdict_file();
         let picked = choose(
             seen,
-            user_selection(|name| std::env::var_os(name)),
+            &user_selection(|name| std::env::var_os(name)),
             |gpus| measured(seen, gpus, file.as_deref(), timing::time_on),
         );
         log_choice(seen, picked);
@@ -469,6 +592,7 @@ pub(crate) mod tests {
             device_local,
             uuid: Some(std::array::from_fn(|i| if i == 0 { id } else { 0 })),
             drm: None,
+            pci: None,
         }
     }
 
@@ -567,7 +691,7 @@ pub(crate) mod tests {
     fn several_gpus_are_measured_and_the_cpu_never() {
         let list = [integrated(11, 1), discrete(4, 2), cpu(3)];
         let mut asked = Vec::new();
-        let picked = choose(&list, None, |gpus| {
+        let picked = choose(&list, &[], |gpus| {
             asked = gpus.to_vec();
             Some((0, Why::Measured))
         });
@@ -582,7 +706,7 @@ pub(crate) mod tests {
     #[test]
     fn an_unmeasured_choice_keeps_the_runtimes_order() {
         let list = [integrated(11, 1), discrete(4, 2), cpu(3)];
-        assert_eq!(choose(&list, None, |_| None), Some((1, Why::RuntimeOrder)));
+        assert_eq!(choose(&list, &[], |_| None), Some((1, Why::RuntimeOrder)));
         assert_eq!(to_open(&list, Some(1)), None);
     }
 
@@ -591,43 +715,154 @@ pub(crate) mod tests {
     #[test]
     fn one_gpu_is_never_measured() {
         let list = [cpu(1), discrete(16, 2)];
-        assert_eq!(choose(&list, None, unasked), Some((1, Why::OnlyGpu)));
+        assert_eq!(choose(&list, &[], unasked), Some((1, Why::OnlyGpu)));
         assert_eq!(to_open(&list, Some(1)), None);
         let list = [cpu(1), cpu(2)];
-        assert_eq!(choose(&list, None, unasked), Some((0, Why::RuntimeOrder)));
+        assert_eq!(choose(&list, &[], unasked), Some((0, Why::RuntimeOrder)));
     }
 
     /// A host of one candidate opens it as the runtime does, with nothing to open by ID
     #[test]
     fn one_candidate_is_opened_as_before() {
         for list in [vec![discrete(4, 1)], vec![integrated(2, 1)], vec![cpu(1)]] {
-            assert_eq!(choose(&list, None, unasked), Some((0, Why::Only)));
+            assert_eq!(choose(&list, &[], unasked), Some((0, Why::Only)));
             assert_eq!(to_open(&list, Some(0)), None);
         }
-        assert_eq!(choose(&[], None, unasked), None);
+        assert_eq!(choose(&[], &[], unasked), None);
         assert_eq!(to_open(&[], None), None);
     }
 
-    /// Where the host's user picked a device, the loader's first candidate is opened, unmeasured:
-    /// by ID where the runtime alone would make another
-    #[test]
-    fn the_users_pick_is_the_loaders_first() {
-        let list = [integrated(11, 1), discrete(24, 2), cpu(3)];
-        let picked = choose(&list, Some("MESA_VK_DEVICE_SELECT"), unasked);
-        assert_eq!(picked, Some((0, Why::UserChose("MESA_VK_DEVICE_SELECT"))));
-        assert_eq!(to_open(&list, Some(0)), Some(0));
-        let not_usable = Seen {
-            api_version: vk::API_VERSION_1_1,
-            ..discrete(24, 9)
-        };
-        let list = [not_usable, discrete(4, 2), integrated(11, 1)];
-        let picked = choose(&list, Some("DRI_PRIME"), unasked);
-        assert_eq!(picked.map(|(at, _)| at), Some(1));
-        assert_eq!(to_open(&list, Some(1)), None);
+    /// `seen` with PCI vendor and device IDs `ids` at PCI bus `bus` (domain 0, device 0,
+    /// function 0).
+    fn with_ids(seen: Seen, ids: (u32, u32), bus: u32) -> Seen {
+        Seen {
+            vendor_id: ids.0,
+            device_id: ids.1,
+            pci: Some((0, bus, 0, 0)),
+            ..seen
+        }
     }
 
-    /// The user's pick is read from the first selection variable set to a value, in Mesa's
-    /// layer's, then the loader's; an empty value picks nothing
+    /// um870's devices in the order Mesa's device-select layer lists them with no variable of its
+    /// own set (m3-max-30538): the Radeon 780M, the RTX 3090, lavapipe.
+    fn um870() -> [Seen; 3] {
+        [
+            with_ids(integrated(11, 1), (0x1002, 0x1900), 0xc5),
+            with_ids(discrete(24, 2), (0x10de, 0x2204), 0x67),
+            Seen {
+                vendor_id: 0x10005,
+                ..cpu(3)
+            },
+        ]
+    }
+
+    /// The user's variable picks the candidate it names, wherever the loader lists it,
+    /// unmeasured: `VK_LOADER_DEVICE_SELECT`'s too, which Mesa's layer leaves behind its own
+    /// default; by ID where the runtime alone would make another
+    #[test]
+    fn the_users_pick_is_the_device_its_variable_names() {
+        let list = um870();
+        let ids = |v, d| Some(Named::Ids(v, d));
+        let loader = [("VK_LOADER_DEVICE_SELECT", ids(0x10de, 0x2204))];
+        let picked = choose(&list, &loader, unasked);
+        let named = Named::Ids(0x10de, 0x2204);
+        assert_eq!(
+            picked,
+            Some((1, Why::UserChose("VK_LOADER_DEVICE_SELECT", named)))
+        );
+        assert_eq!(to_open(&list, Some(1)), None);
+        let mesa = [("MESA_VK_DEVICE_SELECT", ids(0x1002, 0x1900))];
+        assert_eq!(choose(&list, &mesa, unasked).map(|(at, _)| at), Some(0));
+        assert_eq!(to_open(&list, Some(0)), Some(0));
+        let lavapipe = [("MESA_VK_DEVICE_SELECT", ids(0x10005, 0))];
+        assert_eq!(choose(&list, &lavapipe, unasked).map(|(at, _)| at), Some(2));
+        let pci = Named::Pci(0, 0x67, 0, 0);
+        let prime = [("DRI_PRIME", Some(pci))];
+        assert_eq!(
+            choose(&list, &prime, unasked),
+            Some((1, Why::UserChose("DRI_PRIME", pci)))
+        );
+        // Of two devices of the IDs, the first; a device the runtime cannot make is no pick.
+        let not_usable = Seen {
+            api_version: vk::API_VERSION_1_1,
+            ..with_ids(discrete(24, 9), (0x10de, 0x2204), 0x01)
+        };
+        let list = [
+            not_usable,
+            with_ids(integrated(11, 1), (0x1002, 0x1900), 0xc5),
+            with_ids(discrete(24, 2), (0x10de, 0x2204), 0x67),
+            with_ids(discrete(24, 4), (0x10de, 0x2204), 0x68),
+        ];
+        assert_eq!(choose(&list, &loader, unasked).map(|(at, _)| at), Some(2));
+    }
+
+    /// A variable that names no candidate is passed over for the next one set; where none names
+    /// one, the loader's first candidate, said so. An index names no device: the loader's first
+    /// candidate, which Mesa's layer lists first for it, even before a later variable that names
+    /// one
+    #[test]
+    fn a_variable_that_names_no_candidate_is_passed_over() {
+        let list = um870();
+        let nothing = Some(Named::Ids(0xdead, 0xbeef));
+        let pci = Named::Pci(0, 0x67, 0, 0);
+        let user = [("MESA_VK_DEVICE_SELECT", nothing), ("DRI_PRIME", Some(pci))];
+        assert_eq!(
+            choose(&list, &user, unasked),
+            Some((1, Why::UserChose("DRI_PRIME", pci)))
+        );
+        let user = [
+            ("MESA_VK_DEVICE_SELECT", nothing),
+            ("VK_LOADER_DEVICE_SELECT", None),
+        ];
+        assert_eq!(
+            choose(&list, &user, unasked),
+            Some((0, Why::UserNamedNone("MESA_VK_DEVICE_SELECT")))
+        );
+        let user = [
+            ("DRI_PRIME", Some(Named::Index)),
+            ("VK_LOADER_DEVICE_SELECT", Some(Named::Ids(0x10de, 0x2204))),
+        ];
+        assert_eq!(
+            choose(&list, &user, unasked),
+            Some((0, Why::UserIndex("DRI_PRIME")))
+        );
+        assert_eq!(choose(&[], &user, unasked), None);
+    }
+
+    /// A variable's value names a device by its IDs in hex, with or without `0x` and in either
+    /// case, `MESA_VK_DEVICE_SELECT`'s and `DRI_PRIME`'s with a `!` after them; `DRI_PRIME` also
+    /// by its PCI address, or an index; anything else names nothing
+    #[test]
+    fn a_variables_value_names_a_device_by_its_ids_its_address_or_an_index() {
+        let ids = |v, d| Some(Named::Ids(v, d));
+        for var in SELECTION_VARIABLES {
+            assert_eq!(named(var, "10de:2204"), ids(0x10de, 0x2204), "{var}");
+            assert_eq!(named(var, "0x10DE:0x2204"), ids(0x10de, 0x2204), "{var}");
+            assert_eq!(named(var, "10005:0"), ids(0x10005, 0), "{var}");
+            for nothing in ["", "10de", "10de:", ":2204", "nvidia", "10de:22g4"] {
+                assert_eq!(named(var, nothing), None, "{var} {nothing:?}");
+            }
+        }
+        assert_eq!(
+            named("MESA_VK_DEVICE_SELECT", "1002:15bf!"),
+            ids(0x1002, 0x15bf)
+        );
+        assert_eq!(named("DRI_PRIME", "1002:15bf!"), ids(0x1002, 0x15bf));
+        assert_eq!(named("VK_LOADER_DEVICE_SELECT", "1002:15bf!"), None);
+        assert_eq!(
+            named("DRI_PRIME", "pci-0000_c5_00_0"),
+            Some(Named::Pci(0, 0xc5, 0, 0))
+        );
+        assert_eq!(named("DRI_PRIME", "pci-0000_c5_00"), None);
+        assert_eq!(named("DRI_PRIME", "1"), Some(Named::Index));
+        assert_eq!(named("DRI_PRIME", "0"), Some(Named::Index));
+        assert_eq!(named("MESA_VK_DEVICE_SELECT", "1"), None);
+        assert_eq!(Named::Pci(0, 0xc5, 0, 0).to_string(), "pci-0000_c5_00_0");
+        assert_eq!(Named::Ids(0x8086, 0x46a6).to_string(), "8086:46a6");
+    }
+
+    /// The user's pick is read from every selection variable set to a value, in Mesa's layer's
+    /// order, then the loader's, each with what it names; an empty value is no pick
     #[test]
     fn the_users_pick_is_read_from_the_environment() {
         let env = |set: &'static [(&'static str, &'static str)]| {
@@ -637,24 +872,23 @@ pub(crate) mod tests {
                     .map(|(_, v)| OsString::from(v))
             }
         };
-        assert_eq!(user_selection(env(&[])), None);
-        assert_eq!(user_selection(env(&[("MESA_VK_DEVICE_SELECT", "")])), None);
+        assert!(user_selection(env(&[])).is_empty());
+        assert!(user_selection(env(&[("MESA_VK_DEVICE_SELECT", "")])).is_empty());
         assert_eq!(
             user_selection(env(&[("MESA_VK_DEVICE_SELECT", "1002:15bf!")])),
-            Some("MESA_VK_DEVICE_SELECT")
+            [("MESA_VK_DEVICE_SELECT", Some(Named::Ids(0x1002, 0x15bf)))]
         );
         assert_eq!(
             user_selection(env(&[
                 ("VK_LOADER_DEVICE_SELECT", "0x1002:0x699f"),
                 ("DRI_PRIME", "1")
             ])),
-            Some("DRI_PRIME")
+            [
+                ("DRI_PRIME", Some(Named::Index)),
+                ("VK_LOADER_DEVICE_SELECT", Some(Named::Ids(0x1002, 0x699f)))
+            ]
         );
-        assert_eq!(
-            user_selection(env(&[("VK_LOADER_DEVICE_SELECT", "0x1002:0x699f")])),
-            Some("VK_LOADER_DEVICE_SELECT")
-        );
-        assert_eq!(user_selection(env(&[("VK_LOADER_DEBUG", "all")])), None);
+        assert!(user_selection(env(&[("VK_LOADER_DEBUG", "all")])).is_empty());
     }
 
     /// A device below Vulkan 1.2, without a graphics and compute queue, or without a UUID is no
@@ -674,9 +908,9 @@ pub(crate) mod tests {
             ..discrete(24, 3)
         };
         let list = [old, no_queue, no_id, integrated(2, 4)];
-        assert_eq!(choose(&list, None, unasked), Some((3, Why::Only)));
+        assert_eq!(choose(&list, &[], unasked), Some((3, Why::Only)));
         assert_eq!(runtime_first(&list), Some(3));
-        assert_eq!(choose(&list[..3], None, unasked), None);
+        assert_eq!(choose(&list[..3], &[], unasked), None);
     }
 
     /// A timer of fixed times, in milliseconds by index in `seen`, counting its calls; a time of
@@ -756,7 +990,7 @@ pub(crate) mod tests {
             None
         );
         assert!(!file.exists());
-        let picked = choose(&list, None, |gpus| {
+        let picked = choose(&list, &[], |gpus| {
             measured(&list, gpus, Some(&file), timer(&[0, 40], &calls))
         });
         assert_eq!(picked, Some((1, Why::RuntimeOrder)));
@@ -834,7 +1068,7 @@ pub(crate) mod tests {
         let file = verdict_file();
         let picked = choose(
             seen,
-            user_selection(|name| std::env::var_os(name)),
+            &user_selection(|name| std::env::var_os(name)),
             |gpus| measured(seen, gpus, file.as_deref(), |_, _| None),
         );
         for (n, s) in seen.iter().enumerate() {

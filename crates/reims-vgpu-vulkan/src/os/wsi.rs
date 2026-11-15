@@ -342,10 +342,10 @@ fn probe(entry: &ash::Entry, listed: &[&CStr]) -> Probed {
             .iter()
             .zip(&extensions)
             .map(|(&device, names)| {
-                let drm = names
-                    .iter()
-                    .any(|n| n.as_c_str() == ash::ext::physical_device_drm::NAME);
-                seen(&instance, device, features2, drm)
+                let lists = |name: &CStr| names.iter().any(|n| n.as_c_str() == name);
+                let drm = lists(ash::ext::physical_device_drm::NAME);
+                let pci = lists(ash::ext::pci_bus_info::NAME);
+                seen(&instance, device, features2, drm, pci)
             })
             .collect();
         Probed {
@@ -361,8 +361,9 @@ fn probe(entry: &ash::Entry, listed: &[&CStr]) -> Probed {
 
 /// What the library's choice of device reads of `device` ([`Seen`]): its properties, its
 /// largest device-local heap, whether a queue family does graphics and compute work, and its UUID,
-/// read where the instance (`properties2`) and the device are at Vulkan 1.1 or later, and its DRM
-/// nodes where it also lists `VK_EXT_physical_device_drm` (`drm`).
+/// read where the instance (`properties2`) and the device are at Vulkan 1.1 or later, its DRM
+/// nodes where it also lists `VK_EXT_physical_device_drm` (`drm`), and its PCI address where it
+/// also lists `VK_EXT_pci_bus_info` (`pci`).
 ///
 /// # Safety
 ///
@@ -372,6 +373,7 @@ unsafe fn seen(
     device: vk::PhysicalDevice,
     properties2: bool,
     drm: bool,
+    pci: bool,
 ) -> Seen {
     // SAFETY: the caller's.
     let (properties, memory, families) = unsafe {
@@ -414,6 +416,18 @@ unsafe fn seen(
             )),
         }
     });
+    let pci = (pci && properties2 && properties.api_version >= vk::API_VERSION_1_1).then(|| {
+        let mut bus = vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
+        let mut asked = vk::PhysicalDeviceProperties2::default().push_next(&mut bus);
+        // SAFETY: the caller's; the device lists the extension whose structure this is.
+        unsafe { instance.get_physical_device_properties2(device, &mut asked) };
+        (
+            bus.pci_domain,
+            bus.pci_bus,
+            bus.pci_device,
+            bus.pci_function,
+        )
+    });
     let work = vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE;
     Seen {
         name: properties.device_name_as_c_str().map_or_else(
@@ -435,6 +449,7 @@ unsafe fn seen(
             .unwrap_or(0),
         uuid,
         drm,
+        pci,
     }
 }
 
