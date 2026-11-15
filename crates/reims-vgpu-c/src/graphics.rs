@@ -11,9 +11,10 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use reims_vgpu::{
-    GraphicsCallbacks, GraphicsConfig, GraphicsDevice, GraphicsRaiseFn, GraphicsRouteDoorbellFn,
-    GraphicsRouteDoorbellPageFn, GuestArch,
+    GraphicsCallbacks, GraphicsConfig, GraphicsDevice, GraphicsRaiseFn, GuestArch, RawDoorbell,
 };
+#[cfg(not(windows))]
+use reims_vgpu::{GraphicsRouteDoorbellFn, GraphicsRouteDoorbellPageFn};
 
 use crate::cursor::{
     RvgCursorGlyphFn, RvgCursorMoveFn, RvgCursorShowFn, RvgDisplayCoord, cursor_glyph, cursor_move,
@@ -142,8 +143,9 @@ pub type RvgGraphicsRaiseFn = Option<unsafe extern "C-unwind" fn(ctx: *mut c_voi
 /// writes all come through there. With `bell` -1, drop route `route` (of `ring_id`), whose queue
 /// ended, before returning: no write reaches the host's copy once the call returns, as the ring
 /// may be a later queue's; the answer is not read. The device offers the reims-graphics wire's
-/// DOORBELL_ASKS only where the host gives this function, on Linux (a host on macOS has no
-/// kernel ioeventfd, and its guest's doorbells stay as they were), and routes a queue only where
+/// DOORBELL_ASKS only where the host gives this function, on Linux (a host on macOS or Windows
+/// has no kernel ioeventfd, and its guest's doorbells stay as they were; a device on Windows
+/// calls neither route function), and routes a queue only where
 /// the guest's driver took it, whose write for a command buffer
 /// the device may answer at its doorbell holds bit 0 beside the ring's id and so matches no
 /// route; at most RVG_GRAPHICS_DOORBELL_ROUTES at once; and it drops none at its end: the host
@@ -278,7 +280,11 @@ pub struct RvgGraphicsDeviceConfig {
     /// without a map; an entry whose `fd` is below -1 or whose `flags` are not 0; for an `fd` of
     /// 0 or more, a file `fstat` cannot read, one holding fewer than its `offset` and the range's
     /// length in bytes, or an `offset` that is not a multiple of the host's page size; a file that
-    /// cannot be duplicated. A refusal logs a line saying which.
+    /// cannot be duplicated. A refusal logs a line saying which. On Windows each entry names a
+    /// section by its `handle`, NULL for none, and its `fd` checks are a `handle`'s: a handle of
+    /// which no view the library may write maps its `offset` and the range's length in bytes (one
+    /// that names no section, a section it may not map so, or one holding fewer bytes) is
+    /// refused where a file `fstat` cannot read or one holding fewer bytes is.
     pub memory_files: *const RvgMemoryRangeFile,
     /// The guest's architecture, RVG_GUEST_ARCH_*, which the device's answers to the guest's Metal
     /// follow where an Apple silicon Mac's GPU and an Intel or AMD Mac's answer apart: an arm64
@@ -422,6 +428,12 @@ unsafe fn create(
         });
         raise
     });
+    // A Windows device makes no bell to route a queue's doorbell into (the host has no kernel
+    // ioeventfd there; `reims-vgpu-graphics`'s `wake::bell`), so it calls neither route function,
+    // and none is handed to it.
+    #[cfg(windows)]
+    let (route_doorbell, route_doorbell_page) = (None, None);
+    #[cfg(not(windows))]
     let route_doorbell = callbacks.route_doorbell.map(|f| {
         let t = table.clone();
         let route: GraphicsRouteDoorbellFn = Arc::new(move |route, ring_id, bell| {
@@ -432,6 +444,7 @@ unsafe fn create(
         });
         route
     });
+    #[cfg(not(windows))]
     let route_doorbell_page = callbacks.route_doorbell_page.map(|f| {
         let t = table.clone();
         let route: GraphicsRouteDoorbellPageFn = Arc::new(move |route, page, ring_id, bell| {
@@ -615,6 +628,7 @@ pub unsafe extern "C" fn rvg_graphics_device_doorbell_write(
 ///
 /// # Safety
 /// `device` is a live graphics device handle.
+#[cfg(not(windows))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rvg_graphics_device_set_doorbell(
     device: *mut RvgGraphicsDevice,
@@ -622,13 +636,45 @@ pub unsafe extern "C" fn rvg_graphics_device_set_doorbell(
 ) -> RvgStatus {
     ffi::export(|| {
         // SAFETY: the caller's contract.
-        let d = unsafe { live(device, "rvg_graphics_device_set_doorbell") };
-        if d.device.set_doorbell(fd) {
-            RVG_OK
-        } else {
-            RVG_ERR_INVALID_ARGUMENT
-        }
+        unsafe { set_doorbell(device, fd) }
     })
+}
+
+/// Hands the device the host's doorbell for the control ring, on Windows: `event`, a handle to an
+/// event that is set once the guest writes RVG_GRAPHICS_DOORBELL_CONTROL to
+/// RVG_GRAPHICS_REG_DOORBELL (QEMU: the event of the EventNotifier of memory_region_add_eventfd,
+/// a manual-reset event, which QEMU sets for a write it matches). The device takes a copy of it
+/// (DuplicateHandle), waits for it, and resets it when it wakes; the host may close its own.
+/// RVG_ERR_INVALID_ARGUMENT where `event` is not a handle of this process or the device has one
+/// already. Calls back: never.
+///
+/// # Safety
+/// `device` is a live graphics device handle.
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvg_graphics_device_set_doorbell(
+    device: *mut RvgGraphicsDevice,
+    event: *mut c_void,
+) -> RvgStatus {
+    ffi::export(|| {
+        // SAFETY: the caller's contract.
+        unsafe { set_doorbell(device, event) }
+    })
+}
+
+/// The body of `rvg_graphics_device_set_doorbell` on each OS, inside its `ffi::export`:
+/// `doorbell` is its `fd`, or on Windows its `event`.
+///
+/// # Safety
+/// `device` is a live graphics device handle.
+unsafe fn set_doorbell(device: *mut RvgGraphicsDevice, doorbell: RawDoorbell) -> RvgStatus {
+    // SAFETY: the caller's contract.
+    let d = unsafe { live(device, "rvg_graphics_device_set_doorbell") };
+    if d.device.set_doorbell(doorbell) {
+        RVG_OK
+    } else {
+        RVG_ERR_INVALID_ARGUMENT
+    }
 }
 
 /// The guest's bus reset: as a write of 0 to STATUS, the device is as one just made. It takes no

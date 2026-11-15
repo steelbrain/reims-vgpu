@@ -42,6 +42,20 @@ tikv-jemallocator.workspace = true
 # `exception::catch` around every call of a host function (`ffi::host_call`, `ffi/catch/macos.rs`).
 objc2.workspace = true
 
+# On Windows, the sections behind a memory map's ranges: the host's page size, a view that checks
+# a section's size, and the duplicate of its handle (`memory/windows.rs`).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+# On Windows, the tests: the sections they make (`CreateFileMappingW`).
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_Memory"] }
+
 [dev-dependencies]
 reims-vgpu = { workspace = true, features = ["testkit"] }
 reims-vgpu-vulkan = { workspace = true, features = ["testkit"] }

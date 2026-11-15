@@ -45,6 +45,12 @@ header = """/*
 [parse]
 parse_deps = false
 
+# The items whose form is Windows's own (`cfg(windows)`: RvgMemoryRangeFile's section handle,
+# rvg_graphics_device_set_doorbell's event) and those of Linux and macOS (`cfg(not(windows))`),
+# each under the C compilers' own test of the target.
+[defines]
+"windows" = "_WIN32"
+
 [export]
 prefix = ""
 item_types = ["constants", "globals", "enums", "structs", "unions", "typedefs", "opaque", "functions"]

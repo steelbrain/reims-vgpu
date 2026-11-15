@@ -468,6 +468,7 @@ dependencies = [
  "reims-vgpu-graphics",
  "reims-vgpu-vulkan",
  "tikv-jemallocator",
+ "windows-sys",
 ]
 
 [[package]]

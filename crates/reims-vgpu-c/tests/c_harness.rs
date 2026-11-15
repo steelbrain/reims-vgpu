@@ -123,7 +123,7 @@ fn c_harness_null_handle_aborts() {
 fn c_harness_calls_every_function() {
     let header = std::fs::read_to_string(crate_dir().join("include/reims_vgpu.h")).unwrap();
     let harness = std::fs::read_to_string(crate_dir().join("tests/c/harness.c")).unwrap();
-    let declared: Vec<&str> = header
+    let mut declared: Vec<&str> = header
         .lines()
         .filter(|l| !l.starts_with("//") && !l.starts_with(' '))
         .filter_map(|l| {
@@ -133,6 +133,9 @@ fn c_harness_calls_every_function() {
             Some(&rest[..end])
         })
         .collect();
+    // A function with a form of each OS's (Windows's under `#if defined(_WIN32)`, the others'
+    // under `#if !defined(_WIN32)`) is declared once per form, one after the other.
+    declared.dedup();
     assert_eq!(declared.len(), 11, "{declared:?}");
     let missing: Vec<&str> = declared
         .iter()

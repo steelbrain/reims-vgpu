@@ -257,8 +257,9 @@ typedef void (*RvgCursorMoveFn)(void *ctx);
 // writes all come through there. With `bell` -1, drop route `route` (of `ring_id`), whose queue
 // ended, before returning: no write reaches the host's copy once the call returns, as the ring
 // may be a later queue's; the answer is not read. The device offers the reims-graphics wire's
-// DOORBELL_ASKS only where the host gives this function, on Linux (a host on macOS has no
-// kernel ioeventfd, and its guest's doorbells stay as they were), and routes a queue only where
+// DOORBELL_ASKS only where the host gives this function, on Linux (a host on macOS or Windows
+// has no kernel ioeventfd, and its guest's doorbells stay as they were; a device on Windows
+// calls neither route function), and routes a queue only where
 // the guest's driver took it, whose write for a command buffer
 // the device may answer at its doorbell holds bit 0 beside the ring's id and so matches no
 // route; at most RVG_GRAPHICS_DOORBELL_ROUTES at once; and it drops none at its end: the host
@@ -458,6 +459,7 @@ typedef struct {
   size_t range_count;
 } RvgMemoryMap;
 
+#if !defined(_WIN32)
 // The file behind one range of a memory map: the range's host memory is a shared mapping
 // (MAP_SHARED) of `fd` from byte `offset`. Plain data.
 typedef struct {
@@ -469,6 +471,23 @@ typedef struct {
   // The file offset of the range's first byte, a multiple of the host's page size.
   uint64_t offset;
 } RvgMemoryRangeFile;
+#endif
+
+#if defined(_WIN32)
+// The section behind one range of a memory map, on Windows: the range's host memory is a view
+// (MapViewOfFile) of the pagefile-backed section `handle` names (CreateFileMapping of
+// INVALID_HANDLE_VALUE), from byte `offset`. Plain data.
+typedef struct {
+  // A handle to the section, which the library may map for reading and writing
+  // (FILE_MAP_WRITE) and duplicates during the create (the host may close its own
+  // afterwards), or NULL for a range with no section.
+  void *handle;
+  // 0; other values are refused.
+  uint32_t flags;
+  // The section offset of the range's first byte, a multiple of the host's page size.
+  uint64_t offset;
+} RvgMemoryRangeFile;
+#endif
 
 // The architecture of the macOS guest a graphics device serves: one of RVG_GUEST_ARCH_*.
 typedef uint32_t RvgGuestArch;
@@ -502,7 +521,11 @@ typedef struct {
   // without a map; an entry whose `fd` is below -1 or whose `flags` are not 0; for an `fd` of
   // 0 or more, a file `fstat` cannot read, one holding fewer than its `offset` and the range's
   // length in bytes, or an `offset` that is not a multiple of the host's page size; a file that
-  // cannot be duplicated. A refusal logs a line saying which.
+  // cannot be duplicated. A refusal logs a line saying which. On Windows each entry names a
+  // section by its `handle`, NULL for none, and its `fd` checks are a `handle`'s: a handle of
+  // which no view the library may write maps its `offset` and the range's length in bytes (one
+  // that names no section, a section it may not map so, or one holding fewer bytes) is
+  // refused where a file `fstat` cannot read or one holding fewer bytes is.
   const RvgMemoryRangeFile *memory_files;
   // The guest's architecture, RVG_GUEST_ARCH_*, which the device's answers to the guest's Metal
   // follow where an Apple silicon Mac's GPU and an Intel or AMD Mac's answer apart: an arm64
@@ -622,6 +645,7 @@ void rvg_graphics_device_mmio_write_taking(RvgGraphicsDevice *device,
 // `device` is a live graphics device handle.
 void rvg_graphics_device_doorbell_write(RvgGraphicsDevice *device, uint64_t offset, uint32_t value);
 
+#if !defined(_WIN32)
 // Hands the device the host's doorbell for the control ring: `fd`, readable once the guest
 // writes RVG_GRAPHICS_DOORBELL_CONTROL to RVG_GRAPHICS_REG_DOORBELL (QEMU: the read side of
 // the EventNotifier of memory_region_add_eventfd, an eventfd, or a pipe where the host has
@@ -632,6 +656,21 @@ void rvg_graphics_device_doorbell_write(RvgGraphicsDevice *device, uint64_t offs
 // # Safety
 // `device` is a live graphics device handle.
 RvgStatus rvg_graphics_device_set_doorbell(RvgGraphicsDevice *device, int32_t fd);
+#endif
+
+#if defined(_WIN32)
+// Hands the device the host's doorbell for the control ring, on Windows: `event`, a handle to an
+// event that is set once the guest writes RVG_GRAPHICS_DOORBELL_CONTROL to
+// RVG_GRAPHICS_REG_DOORBELL (QEMU: the event of the EventNotifier of memory_region_add_eventfd,
+// a manual-reset event, which QEMU sets for a write it matches). The device takes a copy of it
+// (DuplicateHandle), waits for it, and resets it when it wakes; the host may close its own.
+// RVG_ERR_INVALID_ARGUMENT where `event` is not a handle of this process or the device has one
+// already. Calls back: never.
+//
+// # Safety
+// `device` is a live graphics device handle.
+RvgStatus rvg_graphics_device_set_doorbell(RvgGraphicsDevice *device, void *event);
+#endif
 
 // The guest's bus reset: as a write of 0 to STATUS, the device is as one just made. It takes no
 // command until the guest writes 1, its rings are as new, the display keeps its scanout but has

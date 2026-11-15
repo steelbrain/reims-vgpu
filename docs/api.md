@@ -179,6 +179,26 @@ Objective-C.
 | the device | `RvgGraphicsDeviceConfig`, `RvgGuestArch`, `RvgGraphicsCallbacks` and its function types, `RvgCursorGlyph`, `RvgDisplayCoord`, `RvgMemoryMap`, `RvgMemoryRange`, `RvgMemoryRangeFile`; `rvg_graphics_device_create`, `_release`, `_region`, `_mmio_read`, `_mmio_write_taking`, `_doorbell_write`, `_set_doorbell`, `_reset`, `_read_display`, `_cursor_position` |
 | its window | `RvgWindowConfig`, `RvgWindowCallbacks`, `RvgWindowPointerFn`, `RvgWindowWheelFn`, `RvgWindowKeyFn`, `RvgWindowCloseFn`, `RvgWindowScrollFn`, `RvgWindowScroll`; no function of its own: `RvgGraphicsDeviceConfig.window` carries it |
 
+### Windows forms
+
+Two items take the host's OS handles, and Windows has its own form of each, under
+`#if defined(_WIN32)`. Linux and macOS keep theirs, under `#if !defined(_WIN32)`. cbindgen's
+`[defines]` maps the crate's `cfg(windows)` to `_WIN32`.
+- **`RvgMemoryRangeFile`** names a section where Linux and macOS name a file:
+  `{void *handle; uint32_t flags; uint64_t offset;}`, 24 bytes, NULL for a range with none. The
+  range's host memory is a view of the pagefile-backed section `handle` names, from `offset`. The
+  create checks that a view the library may write maps the range's bytes from `offset`
+  (`MapViewOfFile` with `FILE_MAP_WRITE`, unmapped at once), where Linux and macOS check the
+  file's size with `fstat`. It then duplicates the handle (`DuplicateHandle`).
+- **`rvg_graphics_device_set_doorbell(device, void *event)`** takes an event's handle where Linux
+  and macOS take a file. On Windows, QEMU's `EventNotifier` is a manual-reset event, and its memory
+  core sets it for a write that matches a `memory_region_add_eventfd`, since only KVM matches
+  those in the kernel. The device duplicates the handle, waits for the event, and resets it when
+  it wakes.
+- **The route functions** (`route_doorbell`, `route_doorbell_page`) keep their form. A device on
+  Windows calls neither: with no kernel `ioeventfd` on the host, it makes no bell to route a
+  queue's doorbell into.
+
 ### Settings and the environment
 
 Everything a host can set that shapes what the library does, beside the guest's own input:
