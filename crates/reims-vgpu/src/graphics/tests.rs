@@ -2738,7 +2738,7 @@ fn the_host_is_told_no_cursor_while_the_display_s_panel_is_off() {
 #[test]
 fn the_window_draws_the_cursor_the_guest_moves_on_its_own() {
     let (device, _platform) = windowed();
-    let window = device.window.as_ref().expect("a window").window();
+    let window = device.windows.first().expect("a window").window();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
     let mut guest = Guest::new(&device);
     // The guest's mode, 64 x 32, from its scanout.
