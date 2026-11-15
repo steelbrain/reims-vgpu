@@ -23,7 +23,9 @@
 //! `posted` is mapped to the host's clock by the offset; while the guest holds no offset (its
 //! bound 0) only `encode` and `post_wait` are given. The offset is off by at most its bound, half
 //! a `HOST_TIME` read's round trip widened by the reading's age (microseconds), far under the
-//! millisecond spans it splits. A span the clocks' error would make negative is 0.
+//! millisecond spans it splits, as the host's clock runs at the guest's clock's rate (`clock`):
+//! the kext writes it only at a `VBLANK`'s reading, which may be seconds old. A span the clocks'
+//! error would make negative is 0.
 //!
 //! Each buffer's spans go to the host's trace ([`Host::trace`](super::Host::trace)) as
 //! `cbguest queue seqno encode post_wait queued transport bound held`, or

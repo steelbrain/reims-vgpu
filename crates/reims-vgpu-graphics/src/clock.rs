@@ -1,6 +1,7 @@
 //! The host's monotonic clock, in nanoseconds: what the guest reads through `HOST_TIME_LO` and
 //! `_HI`, and what each `VBLANK` and the device's other times are stamped on, each OS's own
-//! (`unix.rs`, `windows.rs`).
+//! (`unix.rs`, `windows.rs`). Each runs at the rate the guest's clock does, a counter's that
+//! nothing disciplines, so the kext's offset of the two clocks holds between its readings.
 
 #[cfg(unix)]
 mod unix;

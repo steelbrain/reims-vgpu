@@ -1545,7 +1545,7 @@ sit in BAR0 from 0x800.
 | 0x02c | `CONSUMED` | WO | writing a completion ring's offset wakes its producer waiting for room, under `CONSUMED_DOORBELL`; no host handles it yet, so it reads 0 and a write is ignored |
 | 0x030 | `DEFERRED_BUDGET_LO` | RO | under `SURFACE_DEFERRED` or `SURFACE_DEFERRED_ASK`, the bytes of the host GPU's memory deferred blocks' device caches may hold, low 32 bits: a quarter of the device-local heap's budget, the same for the device's life; 0 without either feature |
 | 0x034 | `DEFERRED_BUDGET_HI` | RO | its high 32 bits |
-| 0x038 | `HOST_TIME_LO` | RO | under `HOST_TIME`, the host's monotonic clock at the read in ns, low 32 bits: the clock `VBLANK`s are stamped on; nothing is latched, so the guest reads `HI`, `LO`, `HI` and takes the second `HI` where `LO` is below 2^31, else the first; 0 where the guest did not take the feature |
+| 0x038 | `HOST_TIME_LO` | RO | under `HOST_TIME`, the host's monotonic clock at the read in ns, low 32 bits, at the rate the guest's clock runs ("Refresh times"): the clock `VBLANK`s are stamped on; nothing is latched, so the guest reads `HI`, `LO`, `HI` and takes the second `HI` where `LO` is below 2^31, else the first; 0 where the guest did not take the feature |
 | 0x03c | `HOST_TIME_HI` | RO | its high 32 bits |
 | 0x040 | `DOORBELL_PAGE_BIND` | WO | under `DOORBELL_PAGES`, binds doorbell page `value & 0xff` of BAR4 to context `value >> 8`, or unbinds it for context 0 ("BAR4: the doorbell pages", below); a reset unbinds every page; reads 0 |
 
@@ -1662,7 +1662,8 @@ only where no negotiation can carry it.
   host offers it where it offers `SURFACE_CACHE`, with its budget in
   `DEFERRED_BUDGET_LO` and `_HI`.
 - Bit 20 is `HOST_TIME`: `HOST_TIME_LO` and `_HI` read the host's monotonic
-  clock, the one `VBLANK`s are stamped on, so the kext measures the two
+  clock, the one `VBLANK`s are stamped on, at the rate the guest's clock runs
+  ("Refresh times"), so the kext measures the two
   clocks' offset rather than infer it from the `VBLANK`s' delivery ("Refresh
   times", below). Every host offers it, and the kext takes it.
 - Bit 21 is `MANAGED_TEXTURE_SLABS`: a `MANAGED_TEXTURE_CREATE` may name any
@@ -2783,7 +2784,15 @@ is set, for a WindowServer that reads it mid-change
 device no longer shows it.
 
 **Refresh times.** The host stamps each `VBLANK` with its refresh's time on
-the display's grid, a period after the one before, on its monotonic clock. It
+the display's grid, a period after the one before, on its monotonic clock. That
+clock runs at the counter's own rate, as the guest's does (an x86-64 guest's
+`mach_absolute_time` counts its TSC, an arm64 guest's counter is the host's):
+`CLOCK_MONOTONIC_RAW` on Linux and macOS, whose `CLOCK_MONOTONIC` NTP
+disciplines (+45.1 ppm on homelab-um790-xtx-1, -30.1 ppm on homelab-gem10-1,
++3.9 ppm on the M3 Max, measured 2026-11-15), and the performance counter on
+Windows, whose frequency nothing changes (`reims-vgpu-graphics`'s `clock`). So
+the kext's offset of the two clocks holds between its readings, whatever the
+host's NTP does. It
 answers a `PRESENT_SURFACE` in the refresh that shows its surface, right after
 that refresh's `VBLANK`: the first refresh after the command buffers that write
 the surface have finished, whether or not the host's window has drawn it yet.
@@ -4257,7 +4266,15 @@ stamps each buffer so the host can split it:
   target `reims_vgpu_graphics::guest_times` gives the buffers' count, each
   span's sum and median and the longest transport.
 - The offset is off by at most its bound, microseconds, under the millisecond
-  spans it splits. The stamps cost three clock reads a buffer. Nothing else
+  spans it splits, as the host's clock runs at the guest's clock's rate
+  ("Refresh times"), though the kext reads it only at a `VBLANK`, seconds
+  apart while the display's `VBLANK`s are off. On `CLOCK_MONOTONIC`, which
+  NTP disciplines, the offset drifted between readings: homelab-um790-xtx-1's
+  +45 ppm showed in Geekbench 7.1's compute as a transport that climbed from
+  about 10 us to 230 us between readings 5 s apart (p50 128 us over 20,597
+  buffers), where a host trace of the same run placed each doorbell's write
+  13 us p50 before the take, and homelab-gem10-1's -30 ppm as a transport of
+  0. The stamps cost three clock reads a buffer. Nothing else
   the guest or the host observes changes: a guest that did not take the bit
   stamps nothing, and the host ignores the op.
 
