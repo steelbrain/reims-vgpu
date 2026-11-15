@@ -18,6 +18,10 @@
 // test reads (the build script's from its OUT_DIR), it printed each of the 197 answers the file
 // held, recorded from the Metal platform on 2026-11-07, and one more, the line of the display's
 // kernel `displayMirrorTile`, which was then added to the file from its output.
+// On 2026-11-14, on the same Mac and macOS, given the 52 metallibs the test then read (the build
+// script's 13 as their committed copies in crates/reims-vgpu-vulkan/metallibs), it printed each of
+// the file's 198 answers and two more, those of the test shaders' vertex function `render_small`
+// and fragment function `render_flat`, which were then added to the file from its output.
 //
 // Build and run on a Mac, from the repository's root, with Xcode's tools, giving each metallib
 // as `<key>=<path>`, the key the test names it by: a fixture of tests/shaders by its file name

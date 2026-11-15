@@ -27,7 +27,9 @@ rel.metallib rel	Some((1024, 32, 0, false))
 render_color.metallib render_color	None
 render_depth.metallib render_depth	None
 render_fbuf.metallib render_fbuf	None
+render_flat.metallib render_flat	None
 render_ftex.metallib render_ftex	None
+render_small.metallib render_small	None
 render_tess.metallib render_tess	None
 render_tilebuf.metallib render_tilebuf	None
 render_vbuf.metallib render_vbuf	None
