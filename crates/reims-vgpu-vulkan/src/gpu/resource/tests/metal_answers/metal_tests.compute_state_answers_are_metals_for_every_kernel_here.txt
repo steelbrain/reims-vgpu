@@ -40,6 +40,7 @@ two.metallib a	Some((1024, 32, 0, false))
 two.metallib b	Some((1024, 32, 0, false))
 vert.metallib tri_vert	None
 shaders displayMirrorTile	Some((1024, 32, 1040, false))
+shaders displayMirrorTileList	Some((1024, 32, 1040, false))
 shaders displayPipeColorFragment	None
 shaders displayPipeColorScanoutFragment	None
 shaders displayPipeLutFragment	None
