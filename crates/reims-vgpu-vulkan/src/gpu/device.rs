@@ -2569,10 +2569,6 @@ pub(crate) mod tests {
     /// (measured), and 73 (292 bytes) was the pitch of the device caches whose textures a macOS
     /// 14.8.9 guest's login had refused on Iris Xe
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "m2v: Intel's linear images outgrow their rows (ledger: UHD 630 linear image size)"
-    )]
     fn a_texture_at_the_device_s_pitch_of_a_plane_s_rows_lies_over_its_memory() {
         use crate::core::platform::Platform as _;
         use crate::core::platform::resource::Buffer as _;

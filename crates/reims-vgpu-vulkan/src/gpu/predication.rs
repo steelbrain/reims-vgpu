@@ -2682,10 +2682,6 @@ mod tests {
     /// While (b != 2) that counts b and t runs t six times; an If inside a DoWhile runs on the
     /// iteration where it holds
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "m2v: indirect work runs nothing on the UHD 630 (ledger: UHD 630 indirect work)"
-    )]
     fn loops_nest_and_hold_ifs() {
         let (inc, zero) = (kernel(INC, "inc_k"), kernel(DOUBLE, "double_gid"));
         let (a, b, t) = (shared(64), shared(64), shared(64));
@@ -3132,10 +3128,6 @@ mod tests {
     /// the indirect ones with the guest's arguments, the threads form's at an offset read
     /// rounded down to a multiple of 4
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "m2v: indirect work runs nothing on the UHD 630 (ledger: UHD 630 indirect work)"
-    )]
     fn every_dispatch_form_is_predicated() {
         let inc = kernel(INC, "inc_k");
         let args = holding(&[1, 1, 1, 0, 1, 1, 1, 1, 1, 1]);
@@ -3186,10 +3178,6 @@ mod tests {
     /// past 32 bits modulo `2^32`, and a threadgroup of more threads than the pipeline's most as
     /// running nothing
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "m2v: indirect work runs nothing on the UHD 630 (ledger: UHD 630 indirect work)"
-    )]
     fn predicated_sizes_are_taken_as_the_direct_forms_take_them() {
         let inc = kernel(INC, "inc_k");
         let cond = holding(&[0]);

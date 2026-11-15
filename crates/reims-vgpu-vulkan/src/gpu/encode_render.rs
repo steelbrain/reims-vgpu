@@ -5766,11 +5766,6 @@ pub(crate) mod tests {
     /// which the runtime stores as `DontCare`. Linux's and Windows's: on macOS it goes to Metal
     #[cfg(any(target_os = "linux", windows))]
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "m2v: a Stencil8 attachment in read-only memory is refused without S8_UINT \
-                  (ledger: UHD 630 Stencil8 in read-only memory)"
-    )]
     fn a_depth_or_stencil_store_into_read_only_memory_faults_its_command_buffer() {
         let kept = |stencil, store, late| ReadOnlyDepthStencil {
             stencil,
@@ -5819,11 +5814,6 @@ pub(crate) mod tests {
     /// store action or resolve texture. Linux's and Windows's: on macOS it goes to Metal
     #[cfg(any(target_os = "linux", windows))]
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "m2v: a Stencil8 attachment in read-only memory is refused without S8_UINT \
-                  (ledger: UHD 630 Stencil8 in read-only memory)"
-    )]
     fn a_depth_or_stencil_resolve_into_read_only_memory_faults_its_command_buffer() {
         let resolve = |stencil, store, late| ReadOnlyDepthStencil {
             stencil,
