@@ -2483,8 +2483,8 @@ pub(crate) mod tests {
     /// image of the cache's memory where the verdict for reads of texels on lines passed, which
     /// copies nothing, and else the shadow that verdict names, of texels on lines. The verdict is
     /// the device's record of its driver's check where one holds it (the shader cache's, the
-    /// tests' own under `HOME`), else the check's in this process; the report of it
-    /// (`Device::in_place_check_report`) says which the answer took. Made without the byte, as
+    /// tests' own in the user's cache directory), else the check's in this process; the report of
+    /// it (`Device::in_place_check_report`) says which the answer took. Made without the byte, as
     /// every exportable cache was, the planes lie 32 bytes past the runtime's boundary, off every
     /// linear image's alignment measured (128 on an RTX 5080 Laptop GPU, 256 on RADV, 64 on
     /// lavapipe), and their textures were shadows: that answer is printed, not checked. Linux's:

@@ -59,8 +59,9 @@ use metal2vulkan_runtime as rt;
 /// pass.
 pub(crate) const KEPT: bool = !cfg!(any(test, feature = "testkit"));
 
-/// The records file under `HOME`, beside the shader cache's directory.
-pub(crate) const RECORDS: &str = ".cache/reims-vgpu-vulkan-pipelines";
+/// The records file in the user's cache directory (`crate::os::user_cache_directory`), beside the
+/// shader cache's directory.
+pub(crate) const RECORDS: &str = "reims-vgpu-vulkan-pipelines";
 
 /// The most bytes the records file holds: past them, no record is appended.
 pub(crate) const CAPACITY: u64 = 64 << 20;
@@ -119,9 +120,9 @@ pub(crate) const UNFINISHED: &[u8] = b"reims-vgpu: unfinished warm making\0";
 /// The bytes of a frame before its record's.
 const FRAME_HEAD: usize = 12;
 
-/// The records file's path under `home`.
-pub(crate) fn path_in(home: &Path) -> PathBuf {
-    home.join(RECORDS)
+/// The records file's path in the user's cache directory `cache`.
+pub(crate) fn path_in(cache: &Path) -> PathBuf {
+    cache.join(RECORDS)
 }
 
 /// FNV-1a over `bytes`, 32 bits: each frame's check.
@@ -470,16 +471,19 @@ mod tests {
         const { assert!(4_565u64 * 1_853_000 <= rt::DEFAULT_CAPACITY / 2) };
     }
 
-    /// The records file lies beside the hosts' shader cache directory, under `HOME`, not in it:
-    /// the runtime's store keeps that directory to its capacity
+    /// The records file lies beside the hosts' shader cache directory, in the user's cache
+    /// directory, not in it: the runtime's store keeps that directory to its capacity
     #[test]
     fn the_file_lies_beside_the_shader_cache() {
-        let path = path_in(Path::new("/home/u"));
+        let path = path_in(Path::new("/home/u/.cache"));
         assert_eq!(
             path,
             Path::new("/home/u/.cache/reims-vgpu-vulkan-pipelines")
         );
         assert_eq!(path.parent(), Some(Path::new("/home/u/.cache")));
+        let cache = crate::os::user_cache_directory().expect("a user cache directory");
+        let shaders = crate::platform::cache_directory().expect("a shader cache directory");
+        assert_eq!(path_in(&cache).parent(), shaders.parent());
     }
 
     /// Frames read back as the records written, in order; a damaged or cut frame is skipped and

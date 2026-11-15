@@ -2,10 +2,11 @@
 //! VM's calls over views of pagefile-backed sections ([`WindowsVm`]), whose views of the guest's
 //! pages map the sections the backing table names (`crate::os`'s `files`), the runtime's imports of
 //! host memory (`import`), with the guest's RAM handed to the devices whole (`crate::os`'s
-//! `host_ram`), and what the window system's Vulkan extensions take here (`crate::os`'s
-//! `wsi`: the Win32 surface and the loader). No Objective-C runs here: core pushes no autorelease
-//! pool where none is installed.
+//! `host_ram`), what the window system's Vulkan extensions take here (`crate::os`'s `wsi`: the
+//! Win32 surface and the loader), and the user's cache directory (`app_data`). No Objective-C runs
+//! here: core pushes no autorelease pool where none is installed.
 
+mod app_data;
 mod clock;
 mod hints;
 mod import;
@@ -23,6 +24,7 @@ pub use lease::{GuestMemoryLease, lease_guest_memory};
 pub use threads::WindowsThreads;
 pub use vm::{RegionMemory, WindowsVm};
 
+pub(crate) use app_data::cache_directory;
 pub(crate) use import::{
     COPIES_READ_ONLY, ImportMade, dma_buf_refusal, host_memory, host_memory_vouched, import_view,
 };

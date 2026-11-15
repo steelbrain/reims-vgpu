@@ -11,10 +11,13 @@
 //! ([`crate::remap::VulkanVm`]), and a display's window presents through a swapchain over the
 //! window system's Vulkan extensions (`wsi.rs`), each OS naming its own surface extensions and
 //! its loader, and fetching an image's drawable ahead where the driver needs it
-//! (`Drawables`: MoltenVK's, on macOS).
+//! (`Drawables`: MoltenVK's, on macOS). The user's cache directory, where the library keeps what
+//! later processes reuse, is each OS's own too ([`user_cache_directory`]).
 
 #[cfg(any(target_os = "linux", windows))]
 mod files;
+#[cfg(unix)]
+mod home;
 #[cfg(any(target_os = "linux", windows))]
 mod host_ram;
 #[cfg(target_os = "linux")]
@@ -32,7 +35,13 @@ use macos as host_os;
 #[cfg(windows)]
 use windows as host_os;
 
+use std::path::PathBuf;
 use std::sync::Arc;
+
+#[cfg(unix)]
+use home::cache_directory as host_cache_directory;
+#[cfg(windows)]
+use host_os::cache_directory as host_cache_directory;
 
 use crate::core::platform::os::vm::{HostAddr, HostVm as _};
 
@@ -93,6 +102,28 @@ pub(crate) use macos::refusing_imports;
 /// library's choice of device reads (`crate::device_choice`).
 pub(crate) use wsi::seen_devices;
 pub use wsi::{add_window_extensions, present_fences};
+
+/// The user's cache directory, where the library keeps for the host's later processes what they
+/// would otherwise work out again: the shader cache and its device checks
+/// (`crate::platform::cache_directory`), the pipeline records (`crate::records`) and the
+/// reims-graphics device's kept answers, each in a directory of its own in it. `.cache` under
+/// `HOME` on Linux and macOS (`os/home.rs`), and none where `HOME` is not set; on Windows
+/// `reims-vgpu` in the user's local application data folder (`os/windows/app_data.rs`), which a
+/// process has whatever its environment, as a QEMU started outside MSYS2's shell has no `HOME`.
+/// In a test build, the directory [`TESTS_CACHE_DIRECTORY`] names where it is set.
+pub fn user_cache_directory() -> Option<PathBuf> {
+    #[cfg(any(test, feature = "testkit"))]
+    if let Some(dir) = std::env::var_os(TESTS_CACHE_DIRECTORY) {
+        return Some(PathBuf::from(dir));
+    }
+    host_cache_directory()
+}
+
+/// The variable that names a test build's user cache directory ([`user_cache_directory`]), for a
+/// test's child process that starts with nothing kept, as a user's first boot does: on Windows the
+/// directory is not under `HOME`, so a new `HOME` does not move it.
+#[cfg(any(test, feature = "testkit"))]
+pub const TESTS_CACHE_DIRECTORY: &str = "RVG_TESTS_CACHE_DIRECTORY";
 
 /// A file of the host's that memory is a shared mapping of, as the library holds it: an open
 /// descriptor on Linux and macOS.

@@ -333,18 +333,15 @@ mod tests {
         );
     }
 
-    /// A test build's shader cache is the tests' own, `~/.cache/reims-vgpu-vulkan-tests`: this
-    /// crate's tests turn on the Vulkan crate's `testkit` feature, which makes them a test build
-    /// there too, so no test reads or writes the cache the library's hosts share, nor the device
-    /// checks kept beside it
+    /// A test build's shader cache is the tests' own, `reims-vgpu-vulkan-tests` in the user's
+    /// cache directory (`~/.cache` on Linux and macOS): this crate's tests turn on the Vulkan
+    /// crate's `testkit` feature, which makes them a test build there too, so no test reads or
+    /// writes the cache the library's hosts share, nor the device checks kept beside it
     #[test]
     fn a_test_build_s_shader_cache_is_the_tests_own() {
-        let dir = reims_vgpu_vulkan::platform::cache_directory().expect("HOME is set");
-        assert!(
-            dir.ends_with(".cache/reims-vgpu-vulkan-tests"),
-            "{}",
-            dir.display()
-        );
+        let dir = reims_vgpu_vulkan::platform::cache_directory().expect("a shader cache directory");
+        let cache = reims_vgpu_vulkan::os::user_cache_directory().expect("a user cache directory");
+        assert_eq!(dir, cache.join("reims-vgpu-vulkan-tests"));
     }
 
     /// The Vulkan platform's lease of the guest's RAM lets views be made of the pages the host

@@ -348,18 +348,20 @@ fn on_vulkan_a_queue_before_the_graphics_device_takes_no_guest_texture_id() {
 }
 
 /// The variable that makes [`on_vulkan_a_cold_device_takes_no_guest_texture_id`]'s process the
-/// child, which runs in the new empty `HOME` its parent made.
+/// child, which runs in the new empty `HOME` its parent made, its user cache directory in it.
 const COLD_HOME_CHILD: &str = "RVG_COLD_HOME_CHILD";
 
 /// On the Vulkan platform, a graphics device whose GPU device is made cold leaves every guest
 /// texture id to the guest. Cold is a user's first boot, or the first after a GPU driver or kernel
-/// update: nothing the library or the runtime keeps under `HOME` is found, so each check and probe
-/// whose verdict is kept there runs as the device is made. One of them is the fold probe, where
+/// update: nothing the library or the runtime keeps in the user's cache directory, or a driver
+/// under `HOME`, is found, so each check and probe whose verdict is kept there runs as the device
+/// is made. One of them is the fold probe, where
 /// the GPU's imports of views need their pages' files (NVIDIA, ANV). Its command queue came before
 /// the graphics device's reservation, and the host's textures then took the guest's ids from 1
-/// (a user's RTX 3060). The child runs in a new empty `HOME`, its graphics device the process's
-/// first, and names what was kept there once the device was made (the fold probe's verdict where
-/// it ran); the parent prints that
+/// (a user's RTX 3060). The child runs in a new empty `HOME` that holds its user cache directory
+/// (`reims_vgpu_vulkan::os::TESTS_CACHE_DIRECTORY`, as Windows' is not under `HOME`), its graphics
+/// device the process's first, and names what was kept there once the device was made (the fold
+/// probe's verdict where it ran); the parent prints that
 #[test]
 fn on_vulkan_a_cold_device_takes_no_guest_texture_id() {
     use reims_vgpu_vulkan::core::platform::resource::Texture as _;
@@ -378,6 +380,10 @@ fn on_vulkan_a_cold_device_takes_no_guest_texture_id() {
             ])
             .env(COLD_HOME_CHILD, "1")
             .env("HOME", &home)
+            .env(
+                reims_vgpu_vulkan::os::TESTS_CACHE_DIRECTORY,
+                home.join(".cache"),
+            )
             .output()
             .unwrap();
         let _ = std::fs::remove_dir_all(&home);

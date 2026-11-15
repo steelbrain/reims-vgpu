@@ -275,9 +275,9 @@ pub fn adopt(raw: rt::Device) -> VulkanDevice {
     crate::os::hand_ram_to(&raw);
     let mut threads = crate::let_go::DeviceThreads::default();
     if crate::records::KEPT
-        && let Some(home) = std::env::var_os("HOME")
+        && let Some(cache) = crate::os::user_cache_directory()
     {
-        let path = crate::records::path_in(home.as_ref());
+        let path = crate::records::path_in(&cache);
         threads.keep(crate::records::warm(&raw, path, &threads.stop));
     }
     threads.keep(crate::work_log::start(&raw, &threads.stop));
@@ -2121,12 +2121,10 @@ pub(crate) mod tests {
     /// `metal_tests::device_with_own_cache` makes its device with.
     pub(crate) fn options_with_own_cache() -> (rt::DeviceOptions, OwnCache) {
         static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let home = std::env::var_os("HOME").expect("a home directory");
+        let cache = crate::os::user_cache_directory().expect("a user cache directory");
         let n = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::path::PathBuf::from(home).join(format!(
-            ".cache/reims-vgpu-vulkan-tests-own/{}-{n}",
-            std::process::id()
-        ));
+        let dir =
+            (cache.join("reims-vgpu-vulkan-tests-own")).join(format!("{}-{n}", std::process::id()));
         // One a process of the same ID left: this process's own, and emptied.
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

@@ -369,9 +369,11 @@ pub(crate) fn guest_texture_ids() -> Option<std::ops::RangeInclusive<u64>> {
 /// The options every device is made with: the runtime's defaults, whose loader search finds
 /// Homebrew's (`vulkan-loader`, beside its `molten-vk`), with the window system's extensions where
 /// a display's window presents through Vulkan (on Linux, [`crate::os::add_window_extensions`]), the
-/// shader cache in
-/// `~/.cache/reims-vgpu-vulkan` ([`SHADER_CACHE`]; the runtime's default directory when `HOME` is
-/// not set; a test build's own beside it), which every process shares, holding
+/// shader cache in [`SHADER_CACHE`] in the user's cache directory
+/// ([`crate::os::user_cache_directory`]: `~/.cache/reims-vgpu-vulkan`, or the runtime's default
+/// directory where `HOME` is not set, on Linux and macOS; `reims-vgpu\reims-vgpu-vulkan` in the
+/// user's local application data folder on Windows; a test build's own beside it), which every
+/// process shares, holding
 /// [`SHADER_CACHE_CAPACITY`], each pipeline state's
 /// record kept in the file beside it for later processes' warm passes ([`crate::records`]; none
 /// in a test build), a command buffer's
@@ -433,12 +435,10 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
                 options.announce_each = rt::Degradation::ALL.iter().copied().collect();
             }
         }
-        if let Some(home) = std::env::var_os("HOME") {
-            options.shader_cache =
-                rt::ShaderCacheOptions::in_directory(PathBuf::from(&home).join(SHADER_CACHE));
+        if let Some(cache) = crate::os::user_cache_directory() {
+            options.shader_cache = rt::ShaderCacheOptions::in_directory(cache.join(SHADER_CACHE));
             if crate::records::KEPT {
-                options.pipeline_records =
-                    crate::records::hook(crate::records::path_in(home.as_ref()));
+                options.pipeline_records = crate::records::hook(crate::records::path_in(&cache));
             }
         }
         options.shader_cache.capacity = SHADER_CACHE_CAPACITY;
@@ -622,12 +622,13 @@ fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
     policy
 }
 
-/// The shader cache's directory under `HOME`, which every process of the library shares. It
+/// The shader cache's directory in the user's cache directory
+/// ([`crate::os::user_cache_directory`]), which every process of the library shares. It
 /// holds the runtime's translations of the guest's functions and each pipeline's driver record
 /// (MoltenVK's included: about 1.7 MB for a macOS 26 guest's `Xgc` pipeline
 /// on NVIDIA), within [`SHADER_CACHE_CAPACITY`], the least recently used going first.
 #[cfg(not(any(test, feature = "testkit")))]
-const SHADER_CACHE: &str = ".cache/reims-vgpu-vulkan";
+const SHADER_CACHE: &str = "reims-vgpu-vulkan";
 
 /// The most bytes [`SHADER_CACHE`] holds: the runtime's default, 25 GiB (a test keeps it so). A
 /// macOS 26 guest's built-in apps, each launched once, need more than 1 GiB of translations and
@@ -644,20 +645,21 @@ pub(crate) const SHADER_CACHE_CAPACITY: u64 = rt::DEFAULT_CAPACITY;
 #[cfg(any(test, feature = "testkit"))]
 pub(crate) const SHADER_CACHE_CAPACITY: u64 = 1 << 30;
 
-/// A test build's shader cache directory under `HOME`, the tests' own: this crate's unit tests',
-/// and every crate's tests', which turn on its `testkit` feature (only dev-dependencies do, `cargo
-/// xtask testkit`). A test of what a device compiles runs on an empty one as on a full one, and
-/// the tests write nothing into the one the library's hosts share, nor read the device checks
-/// kept there.
+/// A test build's shader cache directory in the user's cache directory, the tests' own: this
+/// crate's unit tests', and every crate's tests', which turn on its `testkit` feature (only
+/// dev-dependencies do, `cargo xtask testkit`). A test of what a device compiles runs on an empty
+/// one as on a full one, and the tests write nothing into the one the library's hosts share, nor
+/// read the device checks kept there.
 #[cfg(any(test, feature = "testkit"))]
-const SHADER_CACHE: &str = ".cache/reims-vgpu-vulkan-tests";
+const SHADER_CACHE: &str = "reims-vgpu-vulkan-tests";
 
-/// The library's cache directory, [`SHADER_CACHE`] under `HOME`: the shader cache's, whose sweep
-/// touches only its `v1` (the runtime's), and the device checks' `device-checks` beside it
-/// (`crate::device_choice`'s verdict, and the host video's checks of its driver). `None` where
-/// `HOME` is not set.
+/// The library's cache directory, [`SHADER_CACHE`] in the user's cache directory
+/// ([`crate::os::user_cache_directory`]): the shader cache's, whose sweep touches only its `v1`
+/// (the runtime's), and the device checks' `device-checks` beside it (`crate::device_choice`'s
+/// verdict, and the host video's checks of its driver). `None` where the OS names no user cache
+/// directory (on Linux and macOS, where `HOME` is not set).
 pub fn cache_directory() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("HOME")?).join(SHADER_CACHE))
+    Some(crate::os::user_cache_directory()?.join(SHADER_CACHE))
 }
 
 /// The runtime's registry ID of the process's default device ([`default_device`]), read once:
@@ -1089,6 +1091,114 @@ pub(crate) mod tests {
     fn the_shader_cache_holds_25_gib() {
         assert_eq!(rt::DEFAULT_CAPACITY, 25 << 30);
         assert_eq!(device_options().shader_cache.capacity, 1 << 30);
+    }
+
+    /// The variable that makes [`a_translation_one_process_keeps_is_the_next_process_s`]'s
+    /// process a child: the value of the constant its kernel is specialised by.
+    const KEPT_ACROSS_CHILD: &str = "RVG_KEPT_ACROSS_CHILD";
+
+    /// A translation one process keeps in the shader cache, in the user's cache directory, is the
+    /// next process's: two children in turn make a device of the platform's options and a compute
+    /// state of `fc.metallib`'s kernel specialised by a constant this run drew, which no earlier
+    /// run's translation was keyed by. The first translates it, and the second reads the first's
+    /// translation from the directory and translates nothing. On Windows the children run with no
+    /// `HOME`, as a QEMU started outside MSYS2's shell does
+    #[test]
+    fn a_translation_one_process_keeps_is_the_next_process_s() {
+        use std::hash::{BuildHasher as _, Hasher as _};
+
+        use crate::core::num::Truncate as _;
+
+        const LINE: &str = "KEPT-ACROSS: ";
+        if let Some(constant) = std::env::var_os(KEPT_ACROSS_CHILD) {
+            let constant = constant.to_str().and_then(|c| c.parse().ok());
+            let (hits, misses, dir) = translate_specialised(constant.expect("a u32 constant"));
+            println!("{LINE}{hits} {misses} {}", dir.display());
+            return;
+        }
+        let constant = std::hash::RandomState::new()
+            .build_hasher()
+            .finish()
+            .low_u32();
+        let run = || {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "platform::tests::a_translation_one_process_keeps_is_the_next_process_s",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(KEPT_ACROSS_CHILD, constant.to_string())
+                .env_remove(crate::os::TESTS_CACHE_DIRECTORY);
+            if cfg!(windows) {
+                child.env_remove("HOME");
+            }
+            let out = child.output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{stdout}{stderr}");
+            let line = stdout
+                .lines()
+                .find_map(|l| l.find(LINE).map(|at| &l[at + LINE.len()..]));
+            let line = line.unwrap_or_else(|| panic!("the child made no state: {stdout}{stderr}"));
+            let mut fields = line.splitn(3, ' ');
+            let mut count = || fields.next().and_then(|n| n.parse::<u64>().ok()).unwrap();
+            let (hits, misses) = (count(), count());
+            (hits, misses, PathBuf::from(fields.next().unwrap()))
+        };
+        let dir = cache_directory().expect("a user cache directory");
+        let (_, first_misses, first_dir) = run();
+        let (second_hits, second_misses, second_dir) = run();
+        assert_eq!(
+            (&first_dir, &second_dir),
+            (&dir, &dir),
+            "the children's directories"
+        );
+        assert!(first_misses >= 1, "the first child translated nothing");
+        assert!(
+            second_hits >= 1 && second_misses == 0,
+            "the second child: {second_hits} hits, {second_misses} misses"
+        );
+    }
+
+    /// [`a_translation_one_process_keeps_is_the_next_process_s`]'s child: a device of the
+    /// platform's options (`window_device`'s, not adopted, so it goes with its last handle) and a
+    /// compute state of `fc_kernel` with its constant `constant`. The shader cache's function hits
+    /// and misses of the library's, function's and state's making, and its directory, answered
+    /// once the device went: its drop writes what its cache thread still held.
+    fn translate_specialised(constant: u32) -> (u64, u64, PathBuf) {
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::platform::resource::{FunctionConstant, Library as _};
+
+        let raw = rt::Device::system_default_with(device_options()).expect("a device");
+        let dir = raw.shader_cache_directory().to_owned();
+        let device = device::window_device(raw);
+        let before = device.raw.shader_cache_statistics();
+        let library = (device.new_library(include_bytes!("../../../tests/shaders/fc.metallib")))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut value = [0; FunctionConstant::MAX_BYTES];
+        value[..4].copy_from_slice(&constant.to_le_bytes());
+        let uint = FunctionConstant {
+            index: 0,
+            data_type: 33,
+            value,
+        };
+        let function = (library.new_function_with_constants(OnFault::Return, "fc_kernel", &[uint]))
+            .unwrap()
+            .unwrap();
+        let state = (device.new_compute_pipeline_state_for_function(Some(&function)))
+            .unwrap()
+            .unwrap();
+        let after = device.raw.shader_cache_statistics();
+        drop((state, function, library, device));
+        (
+            after.function_hits - before.function_hits,
+            after.function_misses - before.function_misses,
+            dir,
+        )
     }
 
     /// Every device opens no file a library's install names name, which come from the guest's

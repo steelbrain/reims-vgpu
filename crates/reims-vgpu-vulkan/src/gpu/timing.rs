@@ -7,7 +7,8 @@
 //! - **At the creation**, synchronously on the calling thread: each stage's translation into
 //!   SPIR-V, unless the runtime's memo, the creation's binary archives or its shader cache on disk
 //!   holds it, then the variant's shader modules and layouts. The cache on disk is this
-//!   platform's `~/.cache/reims-vgpu-vulkan` ([`crate::platform`]), under a directory of each
+//!   platform's `reims-vgpu-vulkan` in the user's cache directory (`~/.cache` on Linux and macOS,
+//!   [`crate::os::user_cache_directory`]), under a directory of each
 //!   runtime build: a new build of the runtime starts from an empty one. [`creation`] times each
 //!   creator: render and compute states, from a descriptor or a function, the display's present
 //!   pipelines, the predication step's pipeline, libraries and function lookups.

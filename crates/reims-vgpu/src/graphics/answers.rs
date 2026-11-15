@@ -17,7 +17,9 @@
 //!   platform's queries and its replies are that build's), and [`ANSWERS_FORMAT`], the file's
 //!   layout. Answers of another identity are never read, so an upgrade of the library starts
 //!   from none, as a driver's does.
-//! - **The file** (`~/.cache/reims-vgpu-pipeline-answers/<identity>`) is a header of
+//! - **The file** (`reims-vgpu-pipeline-answers/<identity>` in the user's cache directory,
+//!   `reims_vgpu_vulkan::os::user_cache_directory`: `~/.cache` on Linux and macOS, and
+//!   `reims-vgpu` in the user's local application data folder on Windows) is a header of
 //!   [`HEADER_BYTES`] (its magic, [`ANSWERS_FORMAT`], the record size, the identity and a
 //!   checksum of them) and then records of [`RECORD_BYTES`] each (kept or dropped, the key, the
 //!   answer and a checksum of them with the identity), appended in the order learnt and never
@@ -72,8 +74,8 @@ pub(crate) const ANSWERS_FORMAT: u32 = 1;
 /// Whether this build keeps the answers in a file: all but a test build's (the module docs).
 pub(crate) const KEPT: bool = !cfg!(any(test, feature = "testkit"));
 
-/// The directory of the files, under `HOME`.
-const DIR: &str = ".cache/reims-vgpu-pipeline-answers";
+/// The directory of the files, in the user's cache directory ([`directory`]).
+const DIR: &str = "reims-vgpu-pipeline-answers";
 
 /// The most records a file holds: past them, no record is appended (about 1 MiB).
 pub(crate) const CAPACITY: usize = 8192;
@@ -142,14 +144,13 @@ pub(crate) enum Observed {
 
 impl PipelineAnswers {
     /// The answers of `identity`, the platform's, of this library's build ([`answers_identity`],
-    /// [`library_build`]): read from its file under `HOME` where this build keeps them
+    /// [`library_build`]): read from its file in [`directory`] where this build keeps them
     /// ([`KEPT`]) and the platform and the build each give one; else kept in memory alone.
     pub(crate) fn open(identity: Option<&[u8]>) -> PipelineAnswers {
         let identity = identity
             .zip(library_build())
             .map(|(platform, build)| answers_identity(platform, &build));
-        let dir = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(DIR));
-        match (identity, dir) {
+        match (identity, directory()) {
             (Some(identity), Some(dir)) if KEPT => PipelineAnswers::open_in(&dir, identity),
             _ => PipelineAnswers::in_memory(),
         }
@@ -331,6 +332,13 @@ pub(crate) fn answers_identity(platform: &[u8], build: &[u8]) -> [u8; 32] {
 /// cannot be told: then nothing is kept past the device's life.
 pub(crate) fn library_build() -> Option<Vec<u8>> {
     file_build(&std::env::current_exe().ok()?)
+}
+
+/// The directory of the files, [`DIR`] in the user's cache directory
+/// (`reims_vgpu_vulkan::os::user_cache_directory`), beside the Vulkan platform's shader cache:
+/// `None` where the OS names no user cache directory (on Linux and macOS, where `HOME` is not set).
+fn directory() -> Option<PathBuf> {
+    Some(reims_vgpu_vulkan::os::user_cache_directory()?.join(DIR))
 }
 
 /// `reflection` as it is kept: a keyed reply's header (its size counting the key, its seqno 0),
@@ -546,6 +554,20 @@ mod tests {
 
     fn key(n: u8) -> AnswerKey {
         [n; 32]
+    }
+
+    /// The files lie in `reims-vgpu-pipeline-answers` in the user's cache directory, beside the
+    /// Vulkan platform's shader cache: `~/.cache/reims-vgpu-pipeline-answers` on Linux and macOS
+    #[test]
+    fn the_files_lie_in_the_user_s_cache_directory() {
+        let cache = reims_vgpu_vulkan::os::user_cache_directory().expect("a user cache directory");
+        assert_eq!(directory(), Some(cache.join("reims-vgpu-pipeline-answers")));
+        let shaders = reims_vgpu_vulkan::platform::cache_directory().expect("a shader cache");
+        assert_eq!(shaders.parent(), Some(cache.as_path()));
+        if cfg!(unix) {
+            let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+            assert_eq!(cache, home.join(".cache"));
+        }
     }
 
     /// A kept answer is read back by the next run of the same identity, as the kext takes it: a
