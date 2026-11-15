@@ -144,8 +144,14 @@ enum {
 	// of what the client is given lies at the base plus o, and nothing else of the region is
 	// mapped there (RgfxAcceleratorUserClient.hpp). A sixth output, where asked
 	// (kRgfxKextFeatureContextSpan), is the range's span in bytes, from the base; a client that
-	// asks for five holds RGFX_CONTEXT_VA_SPAN from the base. kIOReturnNoResources where the
-	// kext has no range left (RgfxContextSlots.hpp).
+	// asks for five holds RGFX_CONTEXT_VA_SPAN from the base. A seventh, where asked
+	// (kRgfxKextFeatureDoorbellPage), is the address in the process of the context's doorbell
+	// page (RGFX_FEATURE_DOORBELL_PAGES, RgfxDoorbellPages.hpp), mapped uncached for its whole
+	// RGFX_DOORBELL_PAGE_SIZE bytes, where a 32-bit store at its first byte of one of the
+	// context's queues' ring ids rings that ring as kRgfxAccelMethodDoorbell does; 0 where the
+	// context has none, and the process rings through kRgfxAccelMethodDoorbell. A context opened
+	// without asking for the seventh has no page. kIOReturnNoResources where the kext has no
+	// range left (RgfxContextSlots.hpp).
 	kRgfxAccelMethodOpenContext = 0x100,
 	// A region block: in size, align (a power of two); out: its region offset. A third input,
 	// where the kext's word holds kRgfxKextFeatureWriteCombined, is the byte of the block from
@@ -358,6 +364,8 @@ enum {
 	kRgfxKextFeatureSurfaceSeeds = 1 << 10,
 	// SubmitBatch's (5) publish of a queue's ring with the messages (RgfxQueuePublish.hpp).
 	kRgfxKextFeatureQueuePublish = 1 << 11,
+	// OpenContext's (0x100) seventh output, the context's doorbell page in the process.
+	kRgfxKextFeatureDoorbellPage = 1 << 12,
 };
 
 // Where a cached block's header holds its surface's CPU generation, a 64-bit count the kext

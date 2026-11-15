@@ -23,6 +23,11 @@
  * ordinary one: letting it go at the close (closeWindow) frees the whole range, every span in it
  * with it, before the context's blocks are freed.
  *
+ * The context's doorbell page (openDoorbellPage) lies apart from the window, mapped anywhere in
+ * the process, uncached: one page of BAR 4, not of the region, which holds nothing but the
+ * context's own doorbell (RgfxDoorbellPages.hpp). It goes at the release with the window, and is
+ * unbound before another context is given it.
+ *
  * Every failure fails the asking op with an IOReturn: nothing here panics or stops the device.
  *
  * Our own code; it names only SDK-public IOKit calls.
@@ -103,6 +108,34 @@ void RgfxAcceleratorUserClient::closeWindow()
 		IOLog("RgfxAccelerator: context %u's window: %llu spans mapped in (%llu us), %llu "
 		      "taken back (%llu us)\n",
 		      context, n, ns / 1000, r, rns / 1000);
+}
+
+void RgfxAcceleratorUserClient::openDoorbellPage()
+{
+	IOMemoryMap *map = nullptr;
+	const UInt32 page = owner ? owner->openDoorbellPage(context, task, &map) : kRgfxNoDoorbellPage;
+	IOLockLock(listLock);
+	doorbellPage = page;
+	doorbellMap = map;
+	doorbellAddress = map ? map->getAddress() : 0;
+	IOLockUnlock(listLock);
+}
+
+void RgfxAcceleratorUserClient::closeDoorbellPage()
+{
+	if (!listLock)
+		return;
+	IOLockLock(listLock);
+	const UInt32 page = doorbellPage;
+	IOMemoryMap *map = doorbellMap;
+	doorbellPage = kRgfxNoDoorbellPage;
+	doorbellMap = nullptr;
+	doorbellAddress = 0;
+	IOLockUnlock(listLock);
+	// Out of the process first; then unbound, and given back to the next context's open.
+	OSSafeReleaseNULL(map);
+	if (page != kRgfxNoDoorbellPage && owner)
+		owner->closeDoorbellPage(page);
 }
 
 IOReturn RgfxAcceleratorUserClient::mapSpan(UInt64 offset, UInt64 length, bool writeCombined)

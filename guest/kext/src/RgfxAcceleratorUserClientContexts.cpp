@@ -39,9 +39,11 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 	uint64_t *out = a->scalarOutput;
 	switch (selector) {
 	case kRgfxAccelMethodOpenContext: {
-		// Five outputs, or a sixth of the span (kRgfxKextFeatureContextSpan). A bundle that asks
-		// for five picks through RGFX_CONTEXT_VA_SPAN, so its context holds that span.
-		const bool spanAsked = a->scalarOutputCount == 6;
+		// Five outputs, a sixth of the span (kRgfxKextFeatureContextSpan), or with it a seventh
+		// of the doorbell page (kRgfxKextFeatureDoorbellPage). A bundle that asks for five picks
+		// through RGFX_CONTEXT_VA_SPAN, so its context holds that span.
+		const bool pageAsked = a->scalarOutputCount == 7;
+		const bool spanAsked = a->scalarOutputCount == 6 || pageAsked;
 		if (a->scalarOutputCount != 5 && !spanAsked)
 			return kIOReturnBadArgument;
 		IOLockLock(queueLock);
@@ -73,6 +75,10 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 			units = openedUnits;
 			hasContext = true;
 			IOLockUnlock(listLock);
+			// Bound to the context before the process learns of either; a context with none
+			// rings through the doorbell call.
+			if (pageAsked)
+				openDoorbellPage();
 		}
 		const uint64_t span = static_cast<uint64_t>(units) * RGFX_CONTEXT_VA_UNIT;
 		// A context opened with a span asked for, asked again for five: its span is less than
@@ -90,6 +96,11 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		IOLockUnlock(windowLock);
 		if (spanAsked)
 			out[5] = span;
+		if (pageAsked) {
+			IOLockLock(listLock);
+			out[6] = doorbellAddress;
+			IOLockUnlock(listLock);
+		}
 		IOLockUnlock(queueLock);
 		return kIOReturnSuccess;
 	}
@@ -896,7 +907,7 @@ struct KeptRing {
 bool RgfxAcceleratorUserClient::publishQueue(UInt64 objId, UInt64 producer, UInt64 flags)
 {
 	bool kept = false, ring = false;
-	UInt32 word = 0;
+	UInt32 word = 0, page = kRgfxNoDoorbellPage;
 	// Under the list lock, which every drop of a header takes, so the header is the queue's,
 	// in a block of the client's, for the whole publish.
 	IOLockLock(listLock);
@@ -904,11 +915,18 @@ bool RgfxAcceleratorUserClient::publishQueue(UInt64 objId, UInt64 producer, UInt
 		KeptRing r = {q->header};
 		kept = true;
 		ring = rgfxQueuePublish(r, q->ring, producer, flags, &word);
+		page = doorbellPage;
 	}
 	IOLockUnlock(listLock);
-	// The doorbell as the bundle's own call writes it (doorbellMethod), out of the lock.
-	if (ring)
-		owner->ringDoorbell(word);
+	// The doorbell as the bundle writes it, out of the lock: at the context's doorbell page,
+	// where the host routes the queue's plain doorbell then, or as its doorbell call does
+	// (doorbellMethod).
+	if (ring) {
+		if (page != kRgfxNoDoorbellPage)
+			owner->ringDoorbellPage(page, word);
+		else
+			owner->ringDoorbell(word);
+	}
 	return kept;
 }
 
@@ -1045,8 +1063,10 @@ void RgfxAcceleratorUserClient::releaseContext()
 	// The kext publishes on none of its rings from here (RgfxQueuePublish.hpp).
 	dropQueueHeaders(kDropAll, 0);
 	// The process reaches nothing of the region from here on: its window goes before anything
-	// it held is freed, and given to another process.
+	// it held is freed, and given to another process. Its doorbell page goes with it: no ring is
+	// published on from here.
 	closeWindow();
+	closeDoorbellPage();
 	RgfxAccelerator *accel = owner;
 	// Under the queue lock, which a QUEUE_CREATE watches its ring under, so none is left.
 	if (accel)

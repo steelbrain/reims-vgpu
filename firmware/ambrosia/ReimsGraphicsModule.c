@@ -5,8 +5,9 @@
   guest's firmware one through the Graphics Output Protocol.
 
   The entry point finds the device on bus 0, gives BAR 0 an address at the
-  PCIe window's start and BAR 2, the region, the first address after it
-  aligned to its size, and turns memory decoding on. Then it does what the
+  PCIe window's start, BAR 4, the doorbell pages, where the device has it, the
+  first address after it aligned to its size, and BAR 2, the region, the first
+  address after those aligned to its size, and turns memory decoding on. Then it does what the
   option ROM's Start and SetMode do: it resets the device, adopts the control
   rings' counters, asks the device for its displays, and points the preferred
   mode of the first connected display, or 1920x1080 when there is none, at the
@@ -809,8 +810,12 @@ ReimsGraphicsModuleEntry (
   uint16_t               Command;
   uint64_t               RegistersSize;
   uint64_t               RegionBarSize;
+  uint64_t               DoorbellsSize;
+  uint64_t               Doorbells;
+  uint64_t               RegionFrom;
   int                    RegistersWide;
   int                    RegionWide;
+  int                    DoorbellsWide;
   uint32_t               Version;
 
   if (Services->Revision < AMBROSIA_GRAPHICS_REVISION) {
@@ -824,27 +829,45 @@ ReimsGraphicsModuleEntry (
   }
 
   //
-  // Size both BARs with decoding off, then place BAR 0 at the window's start
-  // and BAR 2 at the first address after it aligned to its size, where the
-  // kernel keeps them. A BAR's size is a power of two.
+  // Size the BARs with decoding off, then place BAR 0 at the window's start,
+  // BAR 4 at the first address after it aligned to its size, and BAR 2 at the
+  // first address after those aligned to its size, where the kernel keeps
+  // them. A BAR's size is a power of two. BAR 4, which the device has where
+  // its host maps the doorbell pages, lies between the two others, so BAR 2
+  // keeps the address it has without it where its size aligns it past BAR 4
+  // (the region is far larger), and the window's end stays BAR 2's. A device
+  // without BAR 4 has its two BARs placed as before.
   //
   Command = Read16 (Config + PCI_COMMAND);
   Write16 (Config + PCI_COMMAND, (uint16_t)(Command & ~PCI_COMMAND_MEMORY));
   RegistersSize = BarSize (Config, RGFX_PCI_BAR_REGISTERS, &RegistersWide);
   RegionBarSize = BarSize (Config, RGFX_PCI_BAR_REGION, &RegionWide);
+  DoorbellsWide = 0;
+  DoorbellsSize = BarSize (Config, RGFX_PCI_BAR_DOORBELLS, &DoorbellsWide);
   if ((RegistersSize == 0) || (RegionBarSize == 0)) {
     SayText (Services, "BAR 0 or 2 is not memory");
     return 2;
   }
 
   Gfx.Registers = (Services->WindowBase + RegistersSize - 1) & ~(RegistersSize - 1);
-  Gfx.Region    = (Gfx.Registers + RegistersSize + RegionBarSize - 1) & ~(RegionBarSize - 1);
+  RegionFrom    = Gfx.Registers + RegistersSize;
+  Doorbells     = 0;
+  if (DoorbellsSize != 0) {
+    Doorbells  = (RegionFrom + DoorbellsSize - 1) & ~(DoorbellsSize - 1);
+    RegionFrom = Doorbells + DoorbellsSize;
+  }
+
+  Gfx.Region = (RegionFrom + RegionBarSize - 1) & ~(RegionBarSize - 1);
   if (Gfx.Region + RegionBarSize > Services->WindowBase + Services->WindowSize) {
     SayText (Services, "its BARs don't fit the PCIe window");
     return 2;
   }
 
   SetBar (Config, RGFX_PCI_BAR_REGISTERS, RegistersWide, Gfx.Registers);
+  if (DoorbellsSize != 0) {
+    SetBar (Config, RGFX_PCI_BAR_DOORBELLS, DoorbellsWide, Doorbells);
+  }
+
   SetBar (Config, RGFX_PCI_BAR_REGION, RegionWide, Gfx.Region);
   Write16 (Config + PCI_COMMAND, (uint16_t)(Command | PCI_COMMAND_MEMORY));
 

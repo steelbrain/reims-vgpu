@@ -136,7 +136,11 @@
 //    memory the process maps read-only too, wired for reading alone and marked so in their
 //    SURFACE_PAGES (RGFX_SURFACE_PAGES_READ_ONLY, rgfxPagesWiring), for the host to keep every
 //    object over them from writing their pages, and the bundle lays its no-copy buffers over
-//    read-only memory there with MTLResourceOptions bit 24, whose GPU writes the host drops.
+//    read-only memory there with MTLResourceOptions bit 24, whose GPU writes the host drops;
+//  - DOORBELL_PAGES (bit 46): the accelerator binds a doorbell page of BAR 4 to each context it
+//    opens for a bundle that asks for one (RgfxDoorbellPages.hpp) and maps it into the context's
+//    process, where the bundle writes its queues' ring ids with no call into the kext, and the
+//    kext's own publish of a queue's ring (RgfxQueuePublish.hpp) rings there too.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -176,7 +180,8 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA | RGFX_FEATURE_RATE_MAPS |
     RGFX_FEATURE_FUNCTION_POINTERS | RGFX_FEATURE_DYNAMIC_LIBRARIES | RGFX_FEATURE_PIPELINE_KEYS |
     RGFX_FEATURE_ICB_SLOTS_IN_PAGES | RGFX_FEATURE_DOORBELL_ASKS | RGFX_FEATURE_GUEST_TIMES |
-    RGFX_FEATURE_READ_ONLY_PAGES | (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K : RGFX_FEATURE_DISPLAY_POWER);
+    RGFX_FEATURE_READ_ONLY_PAGES | RGFX_FEATURE_DOORBELL_PAGES |
+    (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K : RGFX_FEATURE_DISPLAY_POWER);
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
 inline uint64_t rgfxDriverFeatures(uint64_t offered)

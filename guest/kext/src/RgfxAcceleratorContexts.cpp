@@ -163,6 +163,15 @@ struct ContextState {
 	// The region again, a descriptor of its own that only write-combined spans are mapped from
 	// (copyWriteCombinedRegion): null where it could not be made.
 	IODeviceMemory *combinedRegion;
+	// BAR 4's doorbell pages (RgfxDoorbellPages.hpp), where the kext took
+	// RGFX_FEATURE_DOORBELL_PAGES and the BAR is mapped, set at the state's start and kept for
+	// the kernel's life: the BAR's descriptor, which each process's page is mapped from, and its
+	// mapping in the kernel, which the kext's own doorbell writes go through, null where there
+	// are none; and under contextLock the pages held.
+	IODeviceMemory *doorbells;
+	IOMemoryMap *doorbellMap;
+	volatile UInt8 *doorbellBase;
+	RgfxDoorbellPages doorbellPages;
 };
 ContextState state = {nullptr,
                       kRgfxContextSlotsEmpty,
@@ -175,7 +184,11 @@ ContextState state = {nullptr,
                       0,
                       false,
                       nullptr,
-                      nullptr};
+                      nullptr,
+                      nullptr,
+                      nullptr,
+                      nullptr,
+                      {}};
 IOLock *&contextLock = state.contextLock;
 RgfxContextSlots &slots = state.slots;
 UInt32 &contextUnits = state.contextUnits;
@@ -855,6 +868,25 @@ bool RgfxAccelerator::startContexts()
 			map->release();
 		}
 		contextUnits = rgfxContextUnitsFor(maxBufferLength);
+		// The doorbell pages, where the kext took them and BAR 4 is mapped: every context rings
+		// through the kext's doorbell call otherwise, as before the pages.
+		if (featureWord() & RGFX_FEATURE_DOORBELL_PAGES) {
+			IODeviceMemory *bar = pci->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress4);
+			IOMemoryMap *map = bar && bar->getLength() >= RGFX_DOORBELLS_SIZE
+			                       ? pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress4)
+			                       : nullptr;
+			if (map) {
+				bar->retain();
+				rgfxDoorbellPagesInit(state.doorbellPages);
+				state.doorbells = bar;
+				state.doorbellMap = map;
+				state.doorbellBase = reinterpret_cast<volatile UInt8 *>(map->getVirtualAddress());
+			} else
+				IOLog("RgfxAccelerator: the device offers doorbell pages, but BAR 4 is %s: "
+				      "every context rings through the kext\n",
+				      !bar ? "not there" : bar->getLength() < RGFX_DOORBELLS_SIZE ? "too small"
+				                                                                 : "not mapped");
+		}
 		__atomic_store_n(&contextLock, lock, __ATOMIC_RELEASE);
 		IOLog("RgfxAccelerator: blocks 0x%llx-0x%llx, %u contexts of %u GiB of GPU addresses "
 		      "(maxBufferLength %llu MiB), surfaces %s, deferred blocks' budget %llu MiB; "
@@ -898,6 +930,64 @@ IODeviceMemory *RgfxAccelerator::copyWriteCombinedRegion() const
 	if (combined)
 		combined->retain();
 	return combined;
+}
+
+// MARK: - Doorbell pages
+
+UInt32 RgfxAccelerator::openDoorbellPage(UInt32 context, task_t task, IOMemoryMap **map)
+{
+	*map = nullptr;
+	// Set before contextLock is published, and kept for the kernel's life.
+	IOLock *lock = __atomic_load_n(&contextLock, __ATOMIC_ACQUIRE);
+	if (!lock || !state.doorbells)
+		return kRgfxNoDoorbellPage;
+	UInt32 page = kRgfxNoDoorbellPage;
+	IOLockLock(lock);
+	const bool taken = rgfxDoorbellPageTake(state.doorbellPages, context, &page);
+	const UInt32 held = rgfxDoorbellPagesHeld(state.doorbellPages);
+	IOLockUnlock(lock);
+	if (!taken) {
+		if (rgfxDoorbellPageContext(context))
+			IOLog("RgfxAccelerator: context %u: every doorbell page is held (%u): it rings "
+			      "through the kext\n",
+			      context, held);
+		return kRgfxNoDoorbellPage;
+	}
+	// Bound before the process can write it: the device takes the write before it returns.
+	writeRegister(RGFX_REG_DOORBELL_PAGE_BIND, rgfxDoorbellPageBind(page, context));
+	*map = state.doorbells->createMappingInTask(task, 0, kIOMapAnywhere | kIOMapInhibitCache,
+	                                            rgfxDoorbellPageOffset(page),
+	                                            RGFX_DOORBELL_PAGE_SIZE);
+	if (!*map) {
+		IOLog("RgfxAccelerator: context %u: doorbell page %u not mapped: it rings through the "
+		      "kext\n",
+		      context, page);
+		closeDoorbellPage(page);
+		return kRgfxNoDoorbellPage;
+	}
+	return page;
+}
+
+void RgfxAccelerator::closeDoorbellPage(UInt32 page)
+{
+	IOLock *lock = __atomic_load_n(&contextLock, __ATOMIC_ACQUIRE);
+	if (!lock || page >= RGFX_DOORBELL_PAGES)
+		return;
+	// Unbound before it is given back: from here the device wakes no ring at it, and drops what
+	// an alias of the process's mapping kept past its release writes there.
+	writeRegister(RGFX_REG_DOORBELL_PAGE_BIND, rgfxDoorbellPageBind(page, 0));
+	IOLockLock(lock);
+	rgfxDoorbellPageFree(state.doorbellPages, page);
+	IOLockUnlock(lock);
+}
+
+void RgfxAccelerator::ringDoorbellPage(UInt32 page, UInt32 ringId)
+{
+	// A page is given out only where the pages are mapped, which they stay for the kernel's life.
+	if (page >= RGFX_DOORBELL_PAGES || !state.doorbellBase)
+		return;
+	rgfxRegisterWriteBarrier();
+	rgfxRegisterWrite32(state.doorbellBase + rgfxDoorbellPageOffset(page), ringId);
 }
 
 // MARK: - Contexts

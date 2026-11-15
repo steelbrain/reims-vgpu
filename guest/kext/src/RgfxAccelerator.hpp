@@ -55,6 +55,7 @@
 #include "RgfxBlockTable.hpp"
 #include "RgfxDeferCarry.hpp"
 #include "RgfxDeviceName.hpp"
+#include "RgfxDoorbellPages.hpp"
 #include "RgfxMemorySize.hpp"
 #include "RgfxRegionMapping.hpp"
 #include "RgfxUserClientABI.hpp"
@@ -91,12 +92,13 @@ enum {
 // deferred and shared flags and TakeAnswers, OpenContext's span, shared events' ports and Alloc's
 // write-combined part, where the region's write-combined mappings are ordinary memory
 // (RgfxRegionMapping.hpp), SurfaceSeeds, which Features leaves out where IOSurface exports no
-// unlock seed (rgfxSurfaceUnlockSeedExported), and SubmitBatch's publish of a queue's ring. Each
-// bit is set by the change that lands its call.
+// unlock seed (rgfxSurfaceUnlockSeedExported), SubmitBatch's publish of a queue's ring, and
+// OpenContext's doorbell page. Each bit is set by the change that lands its call.
 constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeaturePagesChunked |
                                           kRgfxKextFeatureSubmitBatch |
                                           kRgfxKextFeatureQueuePublish |
+                                          kRgfxKextFeatureDoorbellPage |
                                           kRgfxKextFeatureDeferredAnswers |
                                           kRgfxKextFeatureSharedPipelines |
                                           kRgfxKextFeatureContextSpan |
@@ -358,6 +360,17 @@ public:
 	// releases, with *info its first byte; null where it cannot be mapped.
 	IOMemoryMap *mapDeviceInfo(UInt64 size, const void **info) const;
 	void ringDoorbell(UInt32 ringId);
+	// The doorbell pages of BAR 4 (RgfxDoorbellPages.hpp), defined with the contexts' state. A
+	// page bound to `context` and mapped into `task`, its mapping in *map, which the caller
+	// releases to unmap it: the page, or kRgfxNoDoorbellPage with no map where the context gets
+	// none (the kext took no RGFX_FEATURE_DOORBELL_PAGES or BAR 4 is not mapped, every page is
+	// held, the context is one the bind cannot name, or the mapping failed). A page whose
+	// process's mapping is gone is unbound and given back by closeDoorbellPage; ringDoorbellPage
+	// writes `ringId` at a page's doorbell through the kernel's mapping of BAR 4, as
+	// ringDoorbell writes DOORBELL.
+	UInt32 openDoorbellPage(UInt32 context, task_t task, IOMemoryMap **map);
+	void closeDoorbellPage(UInt32 page);
+	void ringDoorbellPage(UInt32 page, UInt32 ringId);
 	// BAR 2's size, as the device's REGION_SIZE registers give it (no more than the BAR's).
 	UInt64 getRegionSize() const { return regionSize; }
 	// The GPU memory the guest is told of, from the host's device info (RgfxMemorySize.hpp):

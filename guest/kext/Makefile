@@ -149,7 +149,7 @@ TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surf
 	$(BUILD)/tests/mobile_cursor_test $(BUILD)/tests/display_power_test \
 	$(BUILD)/tests/control_ring_test $(BUILD)/tests/control_ring_arm64_test \
 	$(BUILD)/tests/completion_arm_test $(BUILD)/tests/kept_service_test \
-	$(BUILD)/tests/queue_publish_test
+	$(BUILD)/tests/queue_publish_test $(BUILD)/tests/doorbell_pages_test
 
 $(BUILD)/tests/%: tests/%.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)

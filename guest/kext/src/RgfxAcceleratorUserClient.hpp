@@ -136,6 +136,12 @@ private:
 	// at the release, before the context's blocks go.
 	IOReturn openWindow();
 	void closeWindow();
+	// Binds a doorbell page of BAR 4 to the context and maps it into the task at the context's
+	// open, where the bundle asks for it (kRgfxAccelMethodOpenContext's seventh output);
+	// closeDoorbellPage unmaps it at the release, with the window, and then has it unbound and
+	// given back (RgfxDoorbellPages.hpp).
+	void openDoorbellPage();
+	void closeDoorbellPage();
 	IOReturn deviceInfoMethod(IOExternalMethodArguments *arguments);
 	// The surfaces a command buffer writes (kRgfxAccelMethodSurfaceWrites), and whether a queue is
 	// one of the client's open ones.
@@ -191,6 +197,11 @@ private:
 	// queues' kept at once; a queue made past them has its buffers published by the bundle.
 	static const UInt32 kQueueHeaders = 64;
 	RgfxQueueHeaders<IOMemoryMap, kQueueHeaders> queueHeaders;
+	// Under listLock: the context's doorbell page (kRgfxNoDoorbellPage for none), its mapping in
+	// the task and its address there (0 for none), which the kext's own publish rings at too.
+	UInt32 doorbellPage;
+	IOMemoryMap *doorbellMap;
+	UInt64 doorbellAddress;
 	IOLock *queueLock;
 	IOLock *listLock;
 

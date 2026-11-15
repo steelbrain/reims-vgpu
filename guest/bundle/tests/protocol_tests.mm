@@ -43,6 +43,7 @@
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
 
+#include "RgfxDoorbellPage.hpp"
 #include "RgfxHeapSizes.hpp"
 #include "RgfxObjectModel.hpp"
 #include "RgfxRegion.hpp"
@@ -737,6 +738,28 @@ struct PublishingKext {
 
 	static constexpr uint32_t kQueueRing = 0x40000;
 };
+
+// The doorbell page (RgfxDoorbellPage.hpp): the bundle asks OpenContext for seven outputs only
+// where the kext answers the span and the page, and for the six or five it asked before
+// otherwise; it takes the page from the seventh where it is not 0, and rings a ring there with one
+// 32-bit store of the ring's id at the page's first byte, touching nothing else of the page.
+void test_doorbell_page_rings_at_its_first_byte()
+{
+	CHECK(rgfxOpenContextOutputs(0) == 5);
+	CHECK(rgfxOpenContextOutputs(kRgfxKextFeatureDoorbellPage) == 5);
+	CHECK(rgfxOpenContextOutputs(kRgfxKextFeatureContextSpan) == 6);
+	CHECK(rgfxOpenContextOutputs(kRgfxKextFeatureContextSpan | kRgfxKextFeatureDoorbellPage) == 7);
+	std::vector<uint32_t> page(RGFX_DOORBELL_PAGE_SIZE / sizeof(uint32_t), 0xffffffffu);
+	uint64_t out[7] = {1, 2, 3, 4, 5, 6, reinterpret_cast<uintptr_t>(page.data())};
+	CHECK(rgfxDoorbellPageOf(out, 5) == nullptr);
+	CHECK(rgfxDoorbellPageOf(out, 6) == nullptr);
+	CHECK(rgfxDoorbellPageOf(out, 7) == page.data());
+	rgfxDoorbellPageRing(rgfxDoorbellPageOf(out, 7), 0x40000 | RGFX_DOORBELL_ASKS);
+	CHECK(page[0] == (0x40000u | RGFX_DOORBELL_ASKS));
+	CHECK(std::all_of(page.begin() + 1, page.end(), [](uint32_t w) { return w == 0xffffffffu; }));
+	out[6] = 0;
+	CHECK(rgfxDoorbellPageOf(out, 7) == nullptr);
+}
 
 // A command buffer committed behind held messages hands its publish to them where the kext takes
 // it (kRgfxKextFeatureQueuePublish): one call posts the held on the control ring and then publishes
@@ -3188,6 +3211,7 @@ void rgfxProtocolTests()
 	test_inline_bytes_without_region();
 	test_commit_behind_an_untaken_buffer_fails();
 	test_commit_hands_its_publish_to_the_held();
+	test_doorbell_page_rings_at_its_first_byte();
 	test_render_barriers();
 	test_compute_dispatch_type();
 	test_compute_function_table_bindings();

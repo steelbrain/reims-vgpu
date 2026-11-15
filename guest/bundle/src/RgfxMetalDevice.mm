@@ -48,6 +48,7 @@
 #include "../../kext/src/RgfxDeferCarry.hpp"
 #include "../../kext/src/RgfxQueuePublish.hpp"
 #include "../../kext/src/RgfxUserClientABI.hpp"
+#include "RgfxDoorbellPage.hpp"
 
 namespace {
 // The largest object-lifecycle message the kext takes (ReimsGraphics::kLifecycleMessageMax):
@@ -835,6 +836,9 @@ id rgfxTargetDeviceArchitecture()
 	std::unique_ptr<RgfxRingWriter> _controlRing; // the lifecycle, forwarded to the kext
 	mach_vm_address_t _mapBase;  // the window's base in this process (0 until the context opens)
 	mach_vm_size_t _mapSize;     // the window's size, the region's
+	// The context's doorbell page in this process (RgfxDoorbellPage.hpp): null where the kext
+	// mapped none, and the kext's doorbell call rings.
+	volatile uint32_t *_doorbellPage;
 	std::atomic<bool> _metalAssertions; // setMetalAssertionsEnabled:'s, read back
 	RgfxStateCache *_stateCache; // samplers and depth/stencil states; nil until the handshake
 	// The slabs Shared and Managed buffers lie in, and their sources: the region's, and the
@@ -870,6 +874,7 @@ RGFX_LOG_UNRECOGNIZED
 	_replyReader = nullptr;
 	_mapBase = 0;
 	_mapSize = 0;
+	_doorbellPage = nullptr;
 
 	// Wire transport handshake: open our own user client on the accelerator, take the kext's
 	// features and selector map, read the caps blob the host wrote, open the process's context,
@@ -956,9 +961,10 @@ RGFX_LOG_UNRECOGNIZED
 	// The process's context: its id and address ranges, its window, its blocks and its chunks
 	// of texture resource ids, from the kext, so no two processes' rings, blocks or numbers
 	// meet, and this one maps nothing of the region but its own. The span of its GPU addresses
-	// comes sixth where the kext answers it; a kext that does not gives RGFX_CONTEXT_VA_SPAN.
-	const uint32_t ctxWanted = (_caps.kextFeatures() & kRgfxKextFeatureContextSpan) ? 6 : 5;
-	uint64_t ctx[6] = {0, 0, 0, 0, 0, RGFX_CONTEXT_VA_SPAN};
+	// comes sixth where the kext answers it; a kext that does not gives RGFX_CONTEXT_VA_SPAN. Its
+	// doorbell page comes seventh where the kext answers that (RgfxDoorbellPage.hpp).
+	const uint32_t ctxWanted = rgfxOpenContextOutputs(_caps.kextFeatures());
+	uint64_t ctx[7] = {0, 0, 0, 0, 0, RGFX_CONTEXT_VA_SPAN, 0};
 	uint32_t ctxCount = ctxWanted;
 	kr = IOConnectCallScalarMethod(_conn, kRgfxAccelMethodOpenContext, nullptr, 0, ctx, &ctxCount);
 	if (kr == kIOReturnNoResources) {
@@ -986,6 +992,7 @@ RGFX_LOG_UNRECOGNIZED
 	const mach_vm_size_t mapSize = ctx[4];
 	_mapBase = addr;
 	_mapSize = mapSize;
+	_doorbellPage = rgfxDoorbellPageOf(ctx, ctxCount);
 	volatile uint8_t *base = reinterpret_cast<volatile uint8_t *>(addr);
 	_ids.setBases(ctx[1], ctx[2], ctx[5]);
 	// The kext's calls go through the link (rgfxKextConn), after the destroys the control ring
@@ -1280,13 +1287,20 @@ RGFX_LOG_UNRECOGNIZED
 
 - (void)rgfxRingDoorbell:(uint32_t)ringId
 {
-	// Ring the ring's doorbell through our accelerator user client: the kext writes `ringId`
-	// to RGFX_REG_DOORBELL in BAR 0, waking the host's consumer of that ring.
 	if (_conn == IO_OBJECT_NULL)
 		return;
+	// After the destroys the control ring holds, as every call of the process's into the kext.
+	const io_connect_t conn = rgfxKextConn(&_link);
+	// At the context's doorbell page, where the kext mapped one: a store the host takes, waking
+	// its consumer of the ring, with no call into the kext (RgfxDoorbellPage.hpp).
+	if (_doorbellPage != nullptr) {
+		rgfxDoorbellPageRing(_doorbellPage, ringId);
+		return;
+	}
+	// Else through our accelerator user client: the kext writes `ringId` to RGFX_REG_DOORBELL in
+	// BAR 0.
 	uint64_t scalar = ringId;
-	IOConnectCallScalarMethod(rgfxKextConn(&_link), kRgfxAccelMethodDoorbell, &scalar, 1, nullptr,
-	                          nullptr);
+	IOConnectCallScalarMethod(conn, kRgfxAccelMethodDoorbell, &scalar, 1, nullptr, nullptr);
 }
 
 // --- identity ----------------------------------------------------------------

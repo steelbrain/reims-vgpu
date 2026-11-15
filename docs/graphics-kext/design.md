@@ -1923,8 +1923,8 @@ only where no negotiation can carry it.
   offers it where it maps BAR4 and hands the device its writes: QEMU's
   `reims-graphics-pci` does, through the C API's `doorbell_pages` and
   `rvg_graphics_device_doorbell_write`
-  (`doorbell_pages_is_offered_only_where_the_host_maps_bar_4`). A guest that
-  does not take it, or a host that does not offer it, has
+  (`doorbell_pages_is_offered_only_where_the_host_maps_bar_4`). The kext takes
+  it. A guest that does not take it, or a host that does not offer it, has
   every doorbell on `DOORBELL` as before the bit: the device ignores
   `DOORBELL_PAGE_BIND` and drops every write to BAR4
   (`without_doorbell_pages_the_doorbells_are_the_register_s`).
@@ -1977,7 +1977,7 @@ queues and nothing else, never reset or reconfigure the device.
   with a write to `DOORBELL_PAGE_BIND` (the page in bits 0 to 7, the context
   from bit 8, so a context of 2^24 or more gets none), which the device takes
   before the write returns, and then maps the page into the context's
-  process, uncached. The context's
+  process, uncached (`guest/kext/src/RgfxDoorbellPages.hpp`). The context's
   close unmaps it, then unbinds it (context 0), then gives it back. Pages are
   taken round-robin, so a page given back is the last the next contexts take.
   A busy desktop held 74 contexts ("Contexts", below); a context past the 256,
@@ -4519,6 +4519,16 @@ commit. Each outcome the new design allows is one of those two:
   Where the guest took `DOORBELL_PAGES`, a queue of a context with a doorbell
   page is routed at the page's doorbell in BAR4 instead, and the page's
   routes count among the 128 ("BAR4: the doorbell pages").
+- **A process rings at its doorbell page.** Where the kext mapped the
+  context's doorbell page (`OpenContext`'s seventh output), the bundle rings
+  a queue with one 32-bit store of the ring's id at the page's first byte, a
+  DMB OSHST before it on arm64 and the store one STR of a W register, the one
+  form a hypervisor decodes from its abort's syndrome
+  (`guest/bundle/src/RgfxDoorbellPage.hpp`). The store exits to the
+  hypervisor as the kext's register write does, so what it saves is the call
+  into the kext: the Mach trap and IOUserClient's dispatch. The control
+  ring's held messages still go first, as before any call of the process's
+  into the kext. With no page the bundle calls `Doorbell`, as before.
 
 ## Stage 3 guest stack (from the prior-art study)
 
@@ -4864,7 +4874,7 @@ Map 1:
 | 11 | `Import`, on a shared event's port ('RGSE') | 1 << 6 `SharedEvents` | makes the caller's new shared event of the one the port names |
 | 12 | `PagesChunked` | 1 << 8 `PagesChunked` | a block of the runs of 64 KiB chunks of the kext's own, mapped into the process, for its slabs |
 | 13 | `SurfaceSeeds` | 1 << 10 `SurfaceSeeds` | an IOSurface's lock and unlock seeds, for a copy synced while a CPU held the surface locked for writing |
-| 0x100 | `OpenContext` | 1 << 5 `ContextSpan` (its sixth output) | the context and its window; five outputs, or six with its GPU addresses' span |
+| 0x100 | `OpenContext` | 1 << 5 `ContextSpan` (its sixth output), 1 << 12 `DoorbellPage` (its seventh) | the context and its window; five outputs, six with its GPU addresses' span, or seven with its doorbell page's address in the process, 0 for none ("BAR4: the doorbell pages") |
 | 0x101 | `Alloc` | 1 << 7 `WriteCombined` (its third input) | a region block; 2 inputs, or 3 with the byte its write-combined part starts at |
 | 0x102 | `Free` | | frees a block |
 | 0x103 | `QueueCreate` | | a command queue; 6 inputs, or 7 with the flags wanted |
@@ -4882,7 +4892,7 @@ the accelerator, which the bundle opens for each event it hands out: 10 and 11
 are its own selectors, numbered apart from the accelerator's own so that a call
 on a connection of another kind finds none of that number there.
 
-The kext sets 1 << 0 `PagesBlock`, 1 << 1 `SubmitBatch`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked`, 1 << 9 `SharedPipelines`, 1 << 10 `SurfaceSeeds` and 1 << 11 `QueuePublish`, `SurfaceSeeds` only where the release's IOSurface exports its unlock seed; no other bit yet.
+The kext sets 1 << 0 `PagesBlock`, 1 << 1 `SubmitBatch`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked`, 1 << 9 `SharedPipelines`, 1 << 10 `SurfaceSeeds`, 1 << 11 `QueuePublish` and 1 << 12 `DoorbellPage`, `SurfaceSeeds` only where the release's IOSurface exports its unlock seed; no other bit yet.
 
 **A GL window: the drawable (type 7) and the window surface (type 0x20).**
 These are IOGPU's types, not ours. The bundle leaves `newGLDrawable` to its
