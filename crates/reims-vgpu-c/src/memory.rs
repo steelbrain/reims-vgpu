@@ -103,7 +103,7 @@ pub(crate) unsafe fn memory_map(
         let file = match files.get(i) {
             Some(f) if f.fd >= 0 => match duplicate(f.fd) {
                 Ok(fd) => Some(MemoryFile {
-                    fd: Arc::new(fd),
+                    file: Arc::new(fd),
                     offset: f.offset,
                 }),
                 Err(e) => {

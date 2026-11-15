@@ -373,7 +373,7 @@ mod tests {
         let plain = vm.allocate_anywhere(LEN).unwrap();
         let mut map = MemoryMap::new();
         let file = MemoryFile {
-            fd: Arc::clone(&fd),
+            file: Arc::clone(&fd),
             offset: LEN,
         };
         // SAFETY: both ranges stay mapped while the lease lives, and no device is made over them.

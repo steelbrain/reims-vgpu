@@ -40,8 +40,9 @@ pub use graphics::{
     GraphicsRouteDoorbellPageFn, GraphicsVideo, GraphicsVideoSession, GuestArch, LET_GO_BOUND,
     PlanePages, VideoDecode, VideoPlane,
 };
-pub use memory::{MemoryFile, MemoryMap};
+pub use memory::{HostFile, MemoryFile, MemoryMap};
 pub use platform::ApiPlatform;
+pub use reims_vgpu_graphics::RawDoorbell;
 pub use reims_vgpu_vulkan::VulkanPlatform;
 
 /// The platform every handle is made on by default: `VulkanPlatform`.

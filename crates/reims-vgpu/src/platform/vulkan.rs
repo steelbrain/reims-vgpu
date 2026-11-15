@@ -133,7 +133,7 @@ impl ApiPlatform for VulkanPlatform {
                 host: range.host_address.addr().to_u64(),
                 guest: range.physical_address,
                 length: range.physical_length,
-                file: Arc::clone(&file.fd),
+                file: Arc::clone(&file.file),
                 offset: file.offset,
             })
         });

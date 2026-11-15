@@ -3,13 +3,13 @@
 //! range where the host names one, and the platform's lease on it ([`GuestMemoryLease`]).
 
 use std::any::Any;
-use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 use reims_vgpu_vulkan::core::host::HostPtr;
 use reims_vgpu_vulkan::core::memory::descriptor::{
     GuestPhysicalRange, MemoryMapDescriptor as CoreMemoryMap,
 };
+pub use reims_vgpu_vulkan::os::HostFile;
 
 /// Guest RAM and the host memory behind it, in order, with the file behind each range where the
 /// host names one. The ranges are copied into the device at its creation; nothing is checked
@@ -22,11 +22,13 @@ pub struct MemoryMap {
 }
 
 /// The file behind one range of a [`MemoryMap`]: the range's host memory is a shared mapping
-/// (`MAP_SHARED`) of `fd` from byte `offset`.
+/// (`MAP_SHARED`) of `file` from byte `offset` on Linux and macOS, and on Windows a view
+/// (`MapViewOfFile`) of the pagefile-backed section `file` names from that byte.
 #[derive(Clone, Debug)]
 pub struct MemoryFile {
-    /// The file, held open while any map or device holds it.
-    pub fd: Arc<OwnedFd>,
+    /// The file, held open while any map or device holds it: a descriptor on Linux and macOS
+    /// ([`HostFile`]), a section's handle on Windows.
+    pub file: Arc<HostFile>,
     /// The file offset of the range's first byte, a multiple of the host's page size.
     pub offset: u64,
 }
@@ -52,8 +54,8 @@ impl MemoryMap {
     /// `host .. host + length` is host memory (`mach_vm_allocate`d or equivalent) that stays
     /// mapped while any graphics device made over the map lives: the device remaps it and reads
     /// and writes the guest's memory through it. With `file`, that memory is a
-    /// shared mapping of `file.fd` from `file.offset`, and the file holds at least `length`
-    /// bytes from there.
+    /// shared mapping (on Windows a view) of `file.file` from `file.offset`, and the file holds at
+    /// least `length` bytes from there.
     pub unsafe fn push_with_file(
         &mut self,
         guest_physical_address: u64,

@@ -290,7 +290,10 @@ pub(in crate::graphics::decode) fn guest_ram(length: u64, touched: bool) -> Ram 
             // SAFETY: advice on the mapping just made.
             unsafe { libc::madvise(at, length.to_usize(), libc::MADV_HUGEPAGE) };
         }
-        let file = crate::memory::MemoryFile { fd, offset: 0 };
+        let file = crate::memory::MemoryFile {
+            file: fd,
+            offset: 0,
+        };
         (at.cast::<u8>(), file)
     };
     #[cfg(not(target_os = "linux"))]
@@ -316,7 +319,7 @@ pub(in crate::graphics::decode) fn guest_ram(length: u64, touched: bool) -> Ram 
     let mut map = MemoryMap::new();
     #[cfg(target_os = "linux")]
     {
-        let fd = Arc::clone(&file.fd);
+        let fd = Arc::clone(&file.file);
         // SAFETY: the RAM stays mapped until `Ram`'s drop, after every device and view made over
         // it.
         unsafe { map.push_with_file(RAM, length, at, Some(file)) };

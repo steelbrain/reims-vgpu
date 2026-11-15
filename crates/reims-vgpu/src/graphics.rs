@@ -37,7 +37,6 @@
 
 use std::borrow::Cow;
 use std::marker::PhantomData;
-use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
@@ -83,7 +82,7 @@ use reims_vgpu_graphics::wire::{
 };
 use reims_vgpu_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, DoorbellAt, Host, Mode, PresentAnswer,
-    QueueClaim, RingDegradation, Scanout, Screen,
+    QueueClaim, RawDoorbell, RingDegradation, Scanout, Screen,
 };
 use reims_vgpu_vulkan::core::host::HostQueue;
 use reims_vgpu_vulkan::core::memory::map::MemoryMap as CoreMemoryMap;
@@ -166,7 +165,7 @@ pub type GraphicsRaiseFn = Arc<dyn Fn(u32) + Send + Sync>;
 /// it may wait for a lock the host holds while it calls the device (QEMU's BQL); and with
 /// `None` also on the host's own inside a `STATUS` 0 write or [`GraphicsDevice::reset`], where
 /// it must not wait for a lock the host holds around that call.
-pub type GraphicsRouteDoorbellFn = Arc<dyn Fn(u64, u32, Option<RawFd>) -> bool + Send + Sync>;
+pub type GraphicsRouteDoorbellFn = Arc<dyn Fn(u64, u32, Option<RawDoorbell>) -> bool + Send + Sync>;
 
 /// `(route, page, ring_id, bell)`: [`GraphicsRouteDoorbellFn`], for a write of `ring_id` at the
 /// first byte of doorbell page `page` in BAR 4 (`page * RGFX_DOORBELL_PAGE_SIZE`) in place of
@@ -175,7 +174,7 @@ pub type GraphicsRouteDoorbellFn = Arc<dyn Fn(u64, u32, Option<RawFd>) -> bool +
 /// refuses it, the writes come through [`GraphicsDevice::doorbell_write`]. A route of a `ring_id`
 /// at `page` another route holds replaces that one. Called as [`GraphicsRouteDoorbellFn`] is.
 pub type GraphicsRouteDoorbellPageFn =
-    Arc<dyn Fn(u64, u32, u32, Option<RawFd>) -> bool + Send + Sync>;
+    Arc<dyn Fn(u64, u32, u32, Option<RawDoorbell>) -> bool + Send + Sync>;
 
 /// Whether the device offers `DOORBELL_ASKS`, on which it routes its queues' plain doorbells to
 /// the host ([`GraphicsCallbacks::route_doorbell`]): where the host gives the route function, on
@@ -768,10 +767,11 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
         entry::run(|_| self.device.doorbell_write(offset, value));
     }
 
-    /// Takes a copy of `fd`, the host's `ioeventfd` for `DOORBELL` with ring 0. False where `fd`
-    /// is not open or the device has one already.
-    pub fn set_doorbell(&self, fd: RawFd) -> bool {
-        entry::run(|_| self.device.set_doorbell(fd))
+    /// Takes a copy of `doorbell`, the host's `ioeventfd` for `DOORBELL` with ring 0: a file on
+    /// Linux and macOS, an event on Windows ([`RawDoorbell`]). False where `doorbell` is not open
+    /// or the device has one already.
+    pub fn set_doorbell(&self, doorbell: RawDoorbell) -> bool {
+        entry::run(|_| self.device.set_doorbell(doorbell))
     }
 
     /// The host's reset of the device (the guest's bus reset).
@@ -2773,7 +2773,7 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         }
     }
 
-    fn route_doorbell(&self, route: u64, at: DoorbellAt, ring_id: u32, bell: RawFd) -> bool {
+    fn route_doorbell(&self, route: u64, at: DoorbellAt, ring_id: u32, bell: RawDoorbell) -> bool {
         match at {
             DoorbellAt::Register => (self.callbacks.route_doorbell)
                 .as_ref()
