@@ -1601,7 +1601,12 @@ fn an_out_of_line_command_buffer_is_carried_out_from_one_copy() {
 /// `mmio_write_taking`, is answered on the ringing thread: its `CB_SUBMITTED` is on its queue's
 /// completion ring, the queue's vector raised on that thread, before the write returns; its
 /// queue's thread takes, walks and commits it, and it completes as one that thread answered. One
-/// that does not ask is left to the queue's thread, and completes as before
+/// that does not ask is left to the queue's thread, and completes as before.
+///
+/// The write answers a buffer only where no thread holds a lock it tries (`answer_on_doorbell`),
+/// which `consumer_idle` does not show alone (`a_doorbell_s_answer_allocates_nothing`): a buffer
+/// the write left is answered by the queue's thread, in order, as any is, and the next is rung, up
+/// to 64.
 #[test]
 fn a_doorbell_write_answers_a_command_buffer_on_its_thread() {
     let raised = Arc::new(super::Mutex::new(Vec::<(u32, Option<String>)>::new()));
@@ -1640,25 +1645,6 @@ fn a_doorbell_write_answers_a_command_buffer_on_its_thread() {
         RGFX_STATUS_OK
     );
     let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
-    // The queue's thread sleeps with the ring idle, as the guest rings for a buffer.
-    wait_idle(&device, SUBMIT_OFF);
-    ring.arm();
-
-    ring.publish(asking(queue, 100));
-    device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
-    assert!(
-        ring.has_event(),
-        "the CB_SUBMITTED is posted before the write returns"
-    );
-    let bytes = ring.event().unwrap();
-    let posted = RgfxCbSubmitted::read_from_bytes(&bytes).unwrap();
-    assert_eq!(
-        (posted.header.r#type, posted.cb_obj_id),
-        (RGFX_EVT_CB_SUBMITTED, 100)
-    );
-    let here = std::thread::current().name().map(str::to_owned);
-    assert_eq!(raised.lock().first(), Some(&(1, here)));
-
     let complete = |ring: &mut QueueRing| {
         eventually(|| {
             platform.world().complete_all(CompleteOn::Caller);
@@ -1666,14 +1652,47 @@ fn a_doorbell_write_answers_a_command_buffer_on_its_thread() {
         });
         RgfxCbComplete::read_from_bytes(&ring.event().expect("a CB_COMPLETE")).unwrap()
     };
-    let done = complete(&mut ring);
-    assert_eq!((done.cb_obj_id, done.status), (100, RGFX_CB_OK));
+    let here = std::thread::current().name().map(str::to_owned);
+    let mut rung = Vec::new();
+    let mut answered = false;
+    for cb in 100..164 {
+        // The queue's thread sleeps with the ring idle, as the guest rings for a buffer.
+        wait_idle(&device, SUBMIT_OFF);
+        ring.arm();
+        ring.publish(asking(queue, cb));
+        let raises = raised.lock().len();
+        device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
+        answered = ring.has_event();
+        if answered {
+            assert!(
+                raised.lock()[raises..].contains(&(1, here.clone())),
+                "no raise of buffer {cb}'s vector in the write: {:?}",
+                raised.lock()
+            );
+        }
+        // Posted before the write returned, or by the queue's thread where the write left it.
+        let bytes = ring.event().expect("a CB_SUBMITTED");
+        let posted = RgfxCbSubmitted::read_from_bytes(&bytes).unwrap();
+        assert_eq!(
+            (posted.header.r#type, posted.cb_obj_id),
+            (RGFX_EVT_CB_SUBMITTED, cb)
+        );
+        let done = complete(&mut ring);
+        assert_eq!((done.cb_obj_id, done.status), (cb, RGFX_CB_OK));
+        rung.push((0, cb));
+        if answered {
+            break;
+        }
+    }
+    assert!(answered, "no write of 64 answered its buffer");
 
-    ring.publish(command_buffer(queue, 101));
+    // One that does not ask, with an id the loop's buffers do not use.
+    ring.publish(command_buffer(queue, 164));
     device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
     let done = complete(&mut ring);
-    assert_eq!((done.cb_obj_id, done.status), (101, RGFX_CB_OK));
-    assert_eq!(ring.scheduled, [(0, 100), (0, 101)]);
+    assert_eq!((done.cb_obj_id, done.status), (164, RGFX_CB_OK));
+    rung.push((0, 164));
+    assert_eq!(ring.scheduled, rung);
 }
 
 /// A doorbell write's answer neither allocates nor frees on the ringing thread, the guest's vCPU,
@@ -2342,13 +2361,31 @@ fn a_raise_may_call_the_device_at_once() {
     );
     reset(&device);
 
-    // On the doorbell's thread, inside the write that takes the buffer.
-    let (device, returned, _guest, mut ring) = started();
-    ring.publish(asking(queue, 100));
-    device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
+    // On the doorbell's thread, inside the write that takes the buffer. The write answers it only
+    // where no thread holds a lock it tries, which `wait_idle` does not show alone
+    // (`a_doorbell_s_answer_allocates_nothing`): where the write left it, the queue's thread
+    // raised, and a new device's buffer is rung, up to 64.
     let here = std::thread::current().name().map(str::to_owned);
-    assert_eq!(returned.lock().first(), Some(&here));
-    reset(&device);
+    let mut in_write = false;
+    for _ in 0..64 {
+        let (device, returned, _guest, mut ring) = started();
+        ring.publish(asking(queue, 100));
+        device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
+        in_write = returned.lock().first() == Some(&here);
+        if !in_write {
+            let on = returned_on(&returned);
+            assert!(
+                on.as_deref()
+                    .is_some_and(|name| name.starts_with("reims-vgpu.graphics-queue-")),
+                "raised on {on:?}"
+            );
+        }
+        reset(&device);
+        if in_write {
+            break;
+        }
+    }
+    assert!(in_write, "no write of 64 answered its buffer");
 
     // On the presents' lane (one of ring 0's threads), at a present of the scanout, which the host
     // shows and answers at once.
@@ -5736,43 +5773,73 @@ fn a_long_buffer_wakes_its_idle_lane_s_thread_as_it_is_begun() {
 /// only at its take, after the walk and the commit before it; and once it let the claim go, it
 /// still kept the ring marked busy, so the guest rang no doorbell for a buffer it published
 /// during the walk, which was answered after it all the same: a guest's
-/// `commitAndWaitUntilSubmitted` behind a buffer of fills waited for them
+/// `commitAndWaitUntilSubmitted` behind a buffer of fills waited for them.
+///
+/// The write answers a buffer only where no thread holds a lock it tries (`answer_on_doorbell`),
+/// which the walk's start does not show alone (`a_doorbell_s_answer_allocates_nothing`): where
+/// the write left the buffer behind the walk, the service thread answers it after the walk, in
+/// order, and a new device's walk is tried, up to 64.
 #[test]
 fn a_buffer_that_asks_behind_a_walk_on_its_service_thread_is_answered_before_the_walk_ends() {
     let raised = Arc::new(AtomicU32::new(0));
     let ok = u64::from(RGFX_CB_OK);
     // Published, and rung for, during the walk.
-    let (device, platform, _guest, mut ring) = one_queue(&raised);
-    let gate = WalkGate::in_place(&device);
-    ring.send(&device, sampler_command_buffer(obj(1, 1), 100, obj(1, 4)));
-    assert!(gate.reached(), "the short buffer's walk did not start");
-    let walked_on = gate.taken_on().unwrap_or_default();
+    let mut answered = false;
+    for _ in 0..64 {
+        let (device, platform, _guest, mut ring) = one_queue(&raised);
+        let gate = WalkGate::in_place(&device);
+        ring.send(&device, sampler_command_buffer(obj(1, 1), 100, obj(1, 4)));
+        assert!(gate.reached(), "the short buffer's walk did not start");
+        let walked_on = gate.taken_on().unwrap_or_default();
+        assert!(
+            walked_on.starts_with("reims-vgpu.graphics-queue-"),
+            "the short buffer walked on {walked_on:?}"
+        );
+        assert!(
+            ring.send_as_guest(&device, asking(obj(1, 1), 101)),
+            "the ring was not marked walking during the walk: the guest rang no doorbell"
+        );
+        answered = ring.has_event();
+        if answered {
+            let posted = RgfxCbSubmitted::read_from_bytes(&ring.event().unwrap()).unwrap();
+            assert_eq!(
+                (posted.header.r#type, posted.cb_obj_id),
+                (RGFX_EVT_CB_SUBMITTED, 101)
+            );
+        }
+        gate.open();
+        if answered {
+            assert_eq!(
+                ring_events(&platform, &mut ring, 2),
+                [
+                    (RGFX_EVT_CB_COMPLETE, 100, ok),
+                    (RGFX_EVT_CB_COMPLETE, 101, ok)
+                ]
+            );
+        } else {
+            // Answered by the service thread once the walk ended: its `CB_SUBMITTED` before its
+            // `CB_COMPLETE`, which comes after the buffer before it's.
+            let events = ring_events(&platform, &mut ring, 3);
+            let at = |event: (u32, u64, u64)| events.iter().position(|&e| e == event);
+            let submitted = at((RGFX_EVT_CB_SUBMITTED, 101, 0));
+            let (before, behind) = (
+                at((RGFX_EVT_CB_COMPLETE, 100, ok)),
+                at((RGFX_EVT_CB_COMPLETE, 101, ok)),
+            );
+            assert!(
+                submitted.is_some() && before.is_some() && submitted < behind && before < behind,
+                "{events:?}"
+            );
+        }
+        assert_eq!(ring.scheduled, [(0, 100), (0, 101)]);
+        if answered {
+            break;
+        }
+    }
     assert!(
-        walked_on.starts_with("reims-vgpu.graphics-queue-"),
-        "the short buffer walked on {walked_on:?}"
+        answered,
+        "no write of 64 answered the buffer behind the walk"
     );
-    assert!(
-        ring.send_as_guest(&device, asking(obj(1, 1), 101)),
-        "the ring was not marked walking during the walk: the guest rang no doorbell"
-    );
-    assert!(
-        ring.has_event(),
-        "the write did not answer the buffer behind the walk"
-    );
-    let posted = RgfxCbSubmitted::read_from_bytes(&ring.event().unwrap()).unwrap();
-    assert_eq!(
-        (posted.header.r#type, posted.cb_obj_id),
-        (RGFX_EVT_CB_SUBMITTED, 101)
-    );
-    gate.open();
-    assert_eq!(
-        ring_events(&platform, &mut ring, 2),
-        [
-            (RGFX_EVT_CB_COMPLETE, 100, ok),
-            (RGFX_EVT_CB_COMPLETE, 101, ok)
-        ]
-    );
-    assert_eq!(ring.scheduled, [(0, 100), (0, 101)]);
 
     // Published, and rung for, before the service thread took the buffer before it.
     let (device, platform, _guest, mut ring) = one_queue(&raised);
@@ -7091,7 +7158,12 @@ fn last_commit(calls: &[reims_vgpu_vulkan::core::testkit::calllog::Call]) -> usi
 /// range's `didModifyRange:` is still being made, ring 0 is not carried out through it: the write
 /// answers nothing and nothing is committed, and the buffer is answered and committed after it.
 /// Once ring 0 is carried out through the next range, the write of a buffer that asks answers it
-/// at once, its ticket issued after the range, and its commit still comes after the range
+/// at once, its ticket issued after the range, and its commit still comes after the range.
+///
+/// The write answers a buffer only where no thread holds a lock it tries (`answer_on_doorbell`),
+/// which the range's answer does not show alone (`a_doorbell_s_answer_allocates_nothing`): a
+/// buffer the write left is answered, carried out and committed by the queue's thread, after its
+/// range all the same, and a next range and buffer are sent, up to 64.
 #[test]
 fn a_managed_range_comes_before_a_later_buffer_answered_at_its_doorbell() {
     let raised = Arc::new(AtomicU32::new(0));
@@ -7140,21 +7212,40 @@ fn a_managed_range_comes_before_a_later_buffer_answered_at_its_doorbell() {
     let calls = platform.call_log().calls();
     assert!(modified_at(&calls, 0x40) < last_commit(&calls));
 
-    guest.send(&device, modified_range(obj(1, 2), 0x80));
-    assert_eq!(
-        sampler_answered(&device, &mut guest, obj(1, 4)),
-        RGFX_STATUS_OK,
-        "ring 0 carried out through the range"
-    );
-    wait_idle(&device, SUBMIT);
-    assert!(
-        ring.send_as_guest(&device, asking(obj(1, 1), 101)),
-        "the guest rang no doorbell for an idle ring"
-    );
-    assert!(ring.has_event(), "the write did not answer the buffer");
-    committed(&platform, 1);
-    let calls = platform.call_log().calls();
-    assert!(modified_at(&calls, 0x80) < last_commit(&calls));
+    let mut answered = false;
+    for n in 0..64 {
+        // Ranges of their own, within the buffer's 0x1000 bytes, and samplers of their own.
+        let location = 0x80 + n * 0x20;
+        guest.send(&device, modified_range(obj(1, 2), location));
+        assert_eq!(
+            sampler_answered(&device, &mut guest, obj(1, 4 + n)),
+            RGFX_STATUS_OK,
+            "ring 0 carried out through the range"
+        );
+        wait_idle(&device, SUBMIT);
+        assert!(
+            ring.send_as_guest(&device, asking(obj(1, 1), 101 + n)),
+            "the guest rang no doorbell for an idle ring"
+        );
+        answered = ring.has_event();
+        if answered {
+            committed(&platform, 1);
+        } else {
+            assert_eq!(
+                ring_events(&platform, &mut ring, 2),
+                [
+                    (RGFX_EVT_CB_SUBMITTED, 101 + n, 0),
+                    (RGFX_EVT_CB_COMPLETE, 101 + n, u64::from(RGFX_CB_OK))
+                ]
+            );
+        }
+        let calls = platform.call_log().calls();
+        assert!(modified_at(&calls, location) < last_commit(&calls));
+        if answered {
+            break;
+        }
+    }
+    assert!(answered, "no write of 64 answered its buffer");
 }
 
 /// A `Managed` buffer's range on ring 0 reaches the platform before the commit of a command
