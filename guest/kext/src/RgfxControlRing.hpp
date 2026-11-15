@@ -76,6 +76,21 @@ inline void rgfxControlPublish(Words &w, uint64_t produced)
 	w.publish(produced);
 }
 
+// Publishes `produced` as rgfxControlPublish does, then, after a full fence (`Words::fullFence()`),
+// reads whether the host's consumer of the ring sleeps (`Words::consumerIdle()`, the header's
+// consumer_idle): whether ring 0's doorbell is to be rung. The caller rings it once it has let go
+// of the ring's lock (ReimsGraphics::tryPost): the doorbell's write exits to the host, and another
+// CPU's post would wait out that exit under the lock. The order of the ring's messages is the
+// producer's, which the lock keeps; a doorbell is only a wake, and two posts that both find the
+// consumer asleep ring it twice, as they did under the lock.
+template <class Words>
+inline bool rgfxControlPublishWantsBell(Words &w, uint64_t produced)
+{
+	rgfxControlPublish(w, produced);
+	w.fullFence();
+	return w.consumerIdle() == 1;
+}
+
 // The store fence the kext's Words take: on x86-64, SFENCE, which lands every store before it,
 // the write-combined ones among them, before any store after it. arm64 maps no write-combined
 // part (kRgfxControlWriteCombines), so it is never asked for there.

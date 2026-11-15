@@ -130,6 +130,8 @@ struct ControlWords {
 	}
 	void storeFence() { rgfxStoreFence(); }
 	void publish(UInt64 count) { store64(rings + RGFX_CONTROL_SUBMIT_OFFSET + kRingProducer, count); }
+	void fullFence() { ::fullFence(); }
+	UInt32 consumerIdle() { return load32(rings + RGFX_CONTROL_SUBMIT_OFFSET + kRingConsumerIdle); }
 };
 
 // A payload's 32-bit field, little-endian as x86-64 is.
@@ -239,9 +241,10 @@ bool ReimsGraphics::tryPost(UInt32 type, const void *message, UInt32 size, UInt6
 		return false;
 	IOSimpleLockLock(submitLock);
 	const bool written = writeLocked(type, message, size, seqno, waiterSeqno);
-	if (written)
-		publishLocked();
+	const bool bell = written && publishLocked();
 	IOSimpleLockUnlock(submitLock);
+	if (bell)
+		ringControl();
 	return written;
 }
 
@@ -280,16 +283,19 @@ bool ReimsGraphics::writeLocked(UInt32 type, const void *message, UInt32 size, U
 	return true;
 }
 
-// Publishes what writeLocked wrote, submitLock held, after it (RgfxControlRing.hpp): the doorbell
-// rings only when the host's consumer sleeps.
-void ReimsGraphics::publishLocked()
+// Publishes what writeLocked wrote, submitLock held, after it: whether the host's consumer sleeps,
+// and ringControl is to wake it once the lock is let go (rgfxControlPublishWantsBell).
+bool ReimsGraphics::publishLocked()
 {
-	volatile UInt8 *header = ring(RGFX_CONTROL_SUBMIT_OFFSET);
 	ControlWords words = {rings, controlData};
-	rgfxControlPublish(words, produced);
-	fullFence();
-	if (load32(header + kRingConsumerIdle) == 1)
-		writeRegister(RGFX_REG_DOORBELL, RGFX_CONTROL_RING_ID);
+	return rgfxControlPublishWantsBell(words, produced);
+}
+
+// Ring 0's doorbell, out of submitLock: its write exits to the host, which no other CPU's post
+// waits out.
+void ReimsGraphics::ringControl()
+{
+	writeRegister(RGFX_REG_DOORBELL, RGFX_CONTROL_RING_ID);
 }
 
 // Puts one command on ring 0, waiting for space (waitForRoom): thread context only. A message
@@ -2725,9 +2731,10 @@ IOReturn ReimsGraphics::postRun(UInt32 type, const void *messages, UInt32 size, 
 			next += m;
 			n++;
 		}
-		if (n)
-			publishLocked();
+		const bool bell = n && publishLocked();
 		IOSimpleLockUnlock(submitLock);
+		if (bell)
+			ringControl();
 		*posted += n;
 		return *posted == count;
 	};

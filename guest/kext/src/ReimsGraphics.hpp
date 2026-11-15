@@ -443,10 +443,12 @@ private:
 	IOReturn post(UInt32 type, const void *message, UInt32 size, UInt64 *seqno,
 	              UInt64 *waiterSeqno = nullptr);
 	// tryPost's halves, submitLock held: writeLocked writes one message where it fits, and
-	// publishLocked publishes what was written.
+	// publishLocked publishes what was written, answering whether ring 0's doorbell is to be
+	// rung, which ringControl does once the lock is let go.
 	bool writeLocked(UInt32 type, const void *message, UInt32 size, UInt64 *seqno,
 	                 UInt64 *waiterSeqno);
-	void publishLocked();
+	bool publishLocked();
+	void ringControl();
 	IOReturn command(UInt32 type, const void *message, UInt32 size);
 	void kickWorkLoop();
 

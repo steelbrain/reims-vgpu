@@ -25,7 +25,7 @@ void check(bool ok, const char *what)
 
 // The region's first ring span, and every access the writes made, in their order.
 struct Recorder {
-	enum Kind { kData, kFence, kPublish };
+	enum Kind { kData, kFence, kPublish, kFullFence, kIdleRead };
 	struct Access {
 		Kind kind;
 		uint32_t at;
@@ -42,6 +42,14 @@ struct Recorder {
 	}
 	void storeFence() { log.push_back({kFence, 0, 0, false}); }
 	void publish(uint64_t produced) { log.push_back({kPublish, 0, produced, false}); }
+	// The header's consumer_idle, as the host left it.
+	uint32_t idle = 0;
+	void fullFence() { log.push_back({kFullFence, 0, 0, false}); }
+	uint32_t consumerIdle()
+	{
+		log.push_back({kIdleRead, 0, idle, false});
+		return idle;
+	}
 };
 
 // Whether every data store comes before a fence (x86-64's rules) and the fence before the
@@ -136,6 +144,26 @@ int main()
 		uint64_t word = 0;
 		std::memcpy(&word, pad, sizeof(word));
 		check(r.log[0].value == word, "the pad's type and size, as the host reads them");
+	}
+
+	// The publish that answers whether to ring: the producer's publish as above, then a full
+	// fence, then the read of consumer_idle, last; the doorbell is wanted only where the host's
+	// consumer sleeps, and the publish writes none itself, so the caller rings it out of the
+	// ring's lock (ReimsGraphics::tryPost).
+	for (uint32_t idle : {0u, 1u, 2u}) {
+		Recorder r;
+		r.idle = idle;
+		const uint8_t message[32] = {1};
+		rgfxControlWrite(r, 0, message, sizeof(message));
+		const bool bell = rgfxControlPublishWantsBell(r, sizeof(message));
+		check(bell == (idle == 1), "the doorbell is wanted where the consumer sleeps alone");
+		const size_t n = r.log.size();
+		check(n >= 3 && r.log[n - 1].kind == Recorder::kIdleRead &&
+		          r.log[n - 2].kind == Recorder::kFullFence &&
+		          r.log[n - 3].kind == Recorder::kPublish && r.log[n - 3].value == sizeof(message),
+		      "published, then fenced, then consumer_idle read");
+		r.log.resize(n - 2);
+		publishedAfterData(r, "the producer is published after the message, fenced");
 	}
 
 	std::printf("control_ring_test: %d checks passed (%s)\n", checks,

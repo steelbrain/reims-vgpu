@@ -4529,6 +4529,14 @@ commit. Each outcome the new design allows is one of those two:
   into the kext: the Mach trap and IOUserClient's dispatch. The control
   ring's held messages still go first, as before any call of the process's
   into the kext. With no page the bundle calls `Doorbell`, as before.
+- **Ring 0's doorbell rings out of its lock.** The framebuffer publishes a
+  post on ring 0 under its submit lock and reads whether the host's consumer
+  sleeps there, and writes `DOORBELL` once it has let the lock go
+  (`rgfxControlPublishWantsBell`, `guest/kext/src/RgfxControlRing.hpp`): the
+  write exits to the host, and another CPU's post would wait that exit out
+  under the lock. The ring's order is its producer's, which the lock keeps; a
+  doorbell is a wake, and two posts that both find the consumer asleep ring
+  twice, as they did under the lock.
 
 ## Stage 3 guest stack (from the prior-art study)
 
