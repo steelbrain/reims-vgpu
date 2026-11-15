@@ -4720,11 +4720,17 @@ that answers none ("Unknown GPU!!"). Among what the settings decide:
   takes NVIDIA's settings (its class read on macOS 26.7.1, job m3-max-26630).
 - Whether GL's `GL_POINT` polygon mode goes to the encoder as
   `setTriangleFillMode:` 2, which no public `MTLTriangleFillMode` names. The
-  Apple and Intel settings send it. Measured with a triangle at mode 2: the M3
-  Max and the Intel 630 draw its three vertices' pixels, the 5300M fills it
-  (jobs m3-max-26654 and m3-max-26650). The Vulkan platform holds no such
-  mode and dies on it (read from its code: `metal_value` of the runtime's
-  `TriangleFillMode`), which only a guest given Intel's settings reaches.
+  Apple, AMD and Intel settings send it. Measured with a triangle at mode 2:
+  the M3 Max and the Intel 630 draw its three vertices' pixels, the 5300M
+  fills it (jobs m3-max-26654 and m3-max-26650).
+  The Vulkan platform draws them as the M3 Max does, as points of one pixel
+  (the runtime's `TriangleFillMode::Points`, `VK_POLYGON_MODE_POINT`), where
+  the device has `fillModeNonSolid`, and `pointPolygons` on a
+  portability-subset device; elsewhere, MoltenVK among them, the runtime
+  refuses the mode and the platform dies on the refusal
+  (`fill_mode_2_draws_a_triangles_vertices_as_points` in
+  `crates/reims-vgpu-vulkan/src/gpu/encode_render.rs`). A guest given Intel's
+  settings sends it.
 - Whether texture uploads and mipmap generation take the renderer's other
   path (`gldModifyTexSubImage`, `gldGenerateTexMipmaps`): the Apple settings
   alone.
@@ -4755,10 +4761,9 @@ hold tile shaders, imageblocks and nonsquare tile dispatch, which the device
 does not carry (no tile pipeline crosses the wire) and the Vulkan platform's
 runtime refuses on every device (its family audit, measured on an Iris Xe at
 metal2vulkan c796a88d6a: 26 rows of Apple5's block it, these four among
-them). And the Apple settings send `GL_POINT` polygon mode as
-`setTriangleFillMode:` 2, on which the platform dies. Apple5 without Apple7
-is also no Mac's answer, which is why the device claims no Apple family short
-of Apple7 (`FIRST_MAC_APPLE_FAMILY` in `device_info.rs`).
+them). Apple5 without Apple7 is also no Mac's answer, which is why the
+device claims no Apple family short of Apple7 (`FIRST_MAC_APPLE_FAMILY` in
+`device_info.rs`).
 
 **Registration waits for the bundle.** Where the accelerator is registered and
 its bundle is not on disk, every WindowServer aborts in CoreDisplay as it
