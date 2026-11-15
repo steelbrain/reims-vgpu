@@ -2,9 +2,10 @@
 //!
 //! A profile is one QEMU machine for one guest architecture: its binary, accelerator, devices
 //! and what it can attach. Each host supports the profiles [`Profile::supported_on`] lists, and
-//! only Linux on x86-64 has one: [`Profile::Q35X86_64`], `q35` on KVM, booted through OpenCore,
-//! with reims-vgpu's own GPU device. A Mac host runs none ([`UNSUPPORTED`]): reims-ctl makes no
-//! arm64 VMs, and an arm64 guest boots on Ambrosia without it (docs/qemu.md, "arm64 guests").
+//! only Linux and Windows on x86-64 have one: [`Profile::Q35X86_64`], `q35` booted through
+//! OpenCore, with reims-vgpu's own GPU device, on KVM on Linux and on the Windows Hypervisor
+//! Platform (WHPX) on Windows. A Mac host runs none ([`UNSUPPORTED`]): reims-ctl makes no arm64
+//! VMs, and an arm64 guest boots on Ambrosia without it (docs/qemu.md, "arm64 guests").
 //!
 //! Another host or guest architecture is another profile (x86-64 guests on an Intel Mac would be
 //! `q35` on HVF, without the memfd RAM only Linux has): add it here and in `qemu.rs`.
@@ -20,6 +21,7 @@ pub const UNSUPPORTED: &str = "reims-ctl runs VMs on Linux x86-64 hosts";
 pub enum Os {
     Mac,
     Linux,
+    Windows,
     Other,
 }
 
@@ -42,6 +44,8 @@ impl Host {
             Os::Mac
         } else if cfg!(target_os = "linux") {
             Os::Linux
+        } else if cfg!(windows) {
+            Os::Windows
         } else {
             Os::Other
         };
@@ -71,6 +75,7 @@ pub fn kvm_nested_vmx() -> bool {
 /// Whether a window can open for a QEMU run with `env` over this process's environment: it names
 /// a Wayland compositor or an X server. Without one, QEMU's GTK window ends QEMU as it starts,
 /// where the library's runs headless.
+#[cfg(unix)]
 pub fn has_screen(env: &BTreeMap<String, String>) -> bool {
     ["WAYLAND_DISPLAY", "DISPLAY"]
         .iter()
@@ -80,11 +85,19 @@ pub fn has_screen(env: &BTreeMap<String, String>) -> bool {
         })
 }
 
+/// Whether a window can open for a QEMU run: on Windows, this process's window station is the
+/// one a signed-in user's desktop shows, as it is not for a service's or an SSH login's.
+#[cfg(windows)]
+pub fn has_screen(_env: &BTreeMap<String, String>) -> bool {
+    crate::os::desktop_shown()
+}
+
 impl fmt::Display for Host {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let os = match self.os {
             Os::Mac => "macOS",
             Os::Linux => "Linux",
+            Os::Windows => "Windows",
             Os::Other => std::env::consts::OS,
         };
         let arch = match self.arch {
@@ -105,7 +118,7 @@ pub enum Profile {
 impl Profile {
     pub fn supported_on(host: Host) -> &'static [Profile] {
         match (host.os, host.arch) {
-            (Os::Linux, Arch::X86_64) => &[Profile::Q35X86_64],
+            (Os::Linux | Os::Windows, Arch::X86_64) => &[Profile::Q35X86_64],
             _ => &[],
         }
     }
@@ -116,23 +129,27 @@ impl Profile {
         }
     }
 
-    pub fn describe(self) -> &'static str {
-        match self {
-            Profile::Q35X86_64 => "x86-64 macOS guest (q35 and OpenCore, KVM)",
+    /// What it is, with its accelerator on `host`.
+    pub fn describe(self, host: Host) -> &'static str {
+        match (self, host.os) {
+            (Profile::Q35X86_64, Os::Windows) => "x86-64 macOS guest (q35 and OpenCore, WHPX)",
+            (Profile::Q35X86_64, _) => "x86-64 macOS guest (q35 and OpenCore, KVM)",
         }
     }
 
-    /// The QEMU binary's name in the install's `bin`.
+    /// The QEMU binary's name in the install's `bin`: with `.exe` on Windows.
     pub fn qemu_binary(self) -> &'static str {
         match self {
+            Profile::Q35X86_64 if cfg!(windows) => "qemu-system-x86_64.exe",
             Profile::Q35X86_64 => "qemu-system-x86_64",
         }
     }
 
-    /// The accelerator.
-    pub fn accel(self) -> &'static str {
-        match self {
-            Profile::Q35X86_64 => "kvm",
+    /// The accelerator on `host`: KVM, and on Windows the Windows Hypervisor Platform.
+    pub fn accel(self, host: Host) -> &'static str {
+        match (self, host.os) {
+            (Profile::Q35X86_64, Os::Windows) => "whpx",
+            (Profile::Q35X86_64, _) => "kvm",
         }
     }
 
@@ -142,9 +159,16 @@ impl Profile {
         host.os == Os::Linux
     }
 
-    /// Whether a Vulkan GPU can be chosen: the library runs on Vulkan on Linux.
+    /// Whether the guest's RAM must be shared memory of QEMU's RAM backend (`share=on`), which
+    /// reims-vgpu's QEMU makes a pagefile-backed section on Windows: the library maps its views
+    /// of guest pages from that section, as it does from the memfd on Linux.
+    pub fn section_ram(self, host: Host) -> bool {
+        host.os == Os::Windows
+    }
+
+    /// Whether a Vulkan GPU can be chosen: the library runs on Vulkan on Linux and Windows.
     pub fn gpu_choice(self, host: Host) -> bool {
-        host.os == Os::Linux
+        matches!(host.os, Os::Linux | Os::Windows)
     }
 }
 
@@ -158,7 +182,8 @@ impl fmt::Display for Profile {
 mod tests {
     use super::*;
 
-    /// Linux on x86-64 runs x86-64 guests; a Mac and any other host run none.
+    /// Linux on x86-64 runs x86-64 guests on KVM in memfd RAM; a Mac and any other host run
+    /// none.
     #[test]
     fn only_linux_on_x86_64_runs_vms() {
         let linux = Host {
@@ -170,12 +195,33 @@ mod tests {
             (Os::Mac, Arch::Aarch64),
             (Os::Mac, Arch::X86_64),
             (Os::Linux, Arch::Aarch64),
+            (Os::Windows, Arch::Aarch64),
         ] {
             assert_eq!(Host { os, arch }.default_profile(), None, "{os:?} {arch:?}");
         }
         assert!(Profile::Q35X86_64.memfd_ram(linux));
+        assert!(!Profile::Q35X86_64.section_ram(linux));
+        assert_eq!(Profile::Q35X86_64.accel(linux), "kvm");
     }
 
+    /// Windows on x86-64 runs x86-64 guests on WHPX, in RAM of a shared section rather than a
+    /// memfd, with a Vulkan GPU to choose.
+    #[test]
+    fn windows_on_x86_64_runs_vms_on_whpx() {
+        let windows = Host {
+            os: Os::Windows,
+            arch: Arch::X86_64,
+        };
+        let q35 = Profile::Q35X86_64;
+        assert_eq!(windows.default_profile(), Some(q35));
+        assert_eq!(q35.accel(windows), "whpx");
+        assert!(q35.section_ram(windows) && !q35.memfd_ram(windows));
+        assert!(q35.gpu_choice(windows));
+        assert!(q35.describe(windows).ends_with("WHPX)"));
+        assert_eq!(windows.to_string(), "Windows on x86-64");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn a_vms_environment_decides_its_screen_over_this_process() {
         let env = |v: &str| {

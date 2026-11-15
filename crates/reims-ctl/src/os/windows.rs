@@ -389,6 +389,186 @@ pub fn run_in_terminal(mut cmd: Command) -> io::Result<ExitStatus> {
     cmd.status()
 }
 
+/// Whether this process's window station is shown on a desktop (`WSF_VISIBLE`): an interactive
+/// sign-in's, where a window can open, and not a service's or an SSH login's.
+pub fn desktop_shown() -> bool {
+    use windows_sys::Win32::System::StationsAndDesktops::{
+        GetProcessWindowStation, GetUserObjectInformationW, UOI_FLAGS, USEROBJECTFLAGS,
+    };
+    /// winuser.h's flag of a window station a user sees.
+    const WSF_VISIBLE: u32 = 1;
+    // SAFETY: the process's window station handle is not to be closed; the call fills a
+    // USEROBJECTFLAGS of the size given.
+    unsafe {
+        let station = GetProcessWindowStation();
+        if station.is_null() {
+            return false;
+        }
+        let mut flags: USEROBJECTFLAGS = std::mem::zeroed();
+        let mut needed = 0u32;
+        GetUserObjectInformationW(
+            station,
+            UOI_FLAGS,
+            (&mut flags as *mut USEROBJECTFLAGS).cast(),
+            std::mem::size_of::<USEROBJECTFLAGS>() as u32,
+            &mut needed,
+        ) != 0
+            && flags.dwFlags & WSF_VISIBLE != 0
+    }
+}
+
+/// A registry key, open to read until it drops.
+struct Key(windows_sys::Win32::System::Registry::HKEY);
+
+impl Key {
+    /// `path` under `HKEY_LOCAL_MACHINE`.
+    fn local_machine(path: &str) -> Option<Key> {
+        use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, KEY_READ, RegOpenKeyExW};
+        let path = wide(path);
+        let mut key = std::ptr::null_mut();
+        // SAFETY: path is NUL-terminated, and the call fills `key`.
+        let r = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, path.as_ptr(), 0, KEY_READ, &mut key) };
+        (r == 0).then_some(Key(key))
+    }
+
+    /// The names of its subkeys.
+    fn subkeys(&self) -> Vec<String> {
+        use windows_sys::Win32::System::Registry::RegEnumKeyExW;
+        let mut names = Vec::new();
+        for i in 0.. {
+            let mut name = [0u16; 256];
+            let mut len = name.len() as u32;
+            // SAFETY: name holds `len` UTF-16 units; the rest is left out.
+            let r = unsafe {
+                RegEnumKeyExW(
+                    self.0,
+                    i,
+                    name.as_mut_ptr(),
+                    &mut len,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if r != 0 {
+                break;
+            }
+            names.push(String::from_utf16_lossy(&name[..len as usize]));
+        }
+        names
+    }
+
+    /// The strings of the value `value` of its subkey `sub`, a string or a list of strings.
+    fn strings(&self, sub: &str, value: &str) -> Vec<String> {
+        use windows_sys::Win32::System::Registry::{
+            RRF_RT_REG_MULTI_SZ, RRF_RT_REG_SZ, RegGetValueW,
+        };
+        let (sub, value) = (wide(sub), wide(value));
+        let mut data = vec![0u16; 4096];
+        let mut size = (data.len() * 2) as u32;
+        // SAFETY: sub and value are NUL-terminated; data holds `size` bytes.
+        let r = unsafe {
+            RegGetValueW(
+                self.0,
+                sub.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_SZ | RRF_RT_REG_MULTI_SZ,
+                std::ptr::null_mut(),
+                data.as_mut_ptr().cast(),
+                &mut size,
+            )
+        };
+        if r != 0 {
+            return Vec::new();
+        }
+        data.truncate(size as usize / 2);
+        data.split(|&c| c == 0)
+            .filter(|s| !s.is_empty())
+            .map(String::from_utf16_lossy)
+            .collect()
+    }
+
+    /// Its values that are numbers, each by its name.
+    fn numbers(&self) -> Vec<(String, u32)> {
+        use windows_sys::Win32::System::Registry::{REG_DWORD, RegEnumValueW};
+        let mut values = Vec::new();
+        for i in 0.. {
+            let mut name = vec![0u16; 1024];
+            let mut len = name.len() as u32;
+            let (mut kind, mut data, mut size) = (0u32, 0u32, 4u32);
+            // SAFETY: name holds `len` UTF-16 units and data `size` bytes.
+            let r = unsafe {
+                RegEnumValueW(
+                    self.0,
+                    i,
+                    name.as_mut_ptr(),
+                    &mut len,
+                    std::ptr::null(),
+                    &mut kind,
+                    (&mut data as *mut u32).cast(),
+                    &mut size,
+                )
+            };
+            // ERROR_MORE_DATA: a value too big for a number, which is no number.
+            if r == 234 {
+                continue;
+            }
+            if r != 0 {
+                break;
+            }
+            if kind == REG_DWORD {
+                values.push((String::from_utf16_lossy(&name[..len as usize]), data));
+            }
+        }
+        values
+    }
+}
+
+impl Drop for Key {
+    fn drop(&mut self) {
+        // SAFETY: the key is this Key's own, closed once.
+        unsafe { windows_sys::Win32::System::Registry::RegCloseKey(self.0) };
+    }
+}
+
+/// `s` in UTF-16, NUL-terminated.
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain([0]).collect()
+}
+
+/// The Vulkan driver manifests (ICD JSON files) the Vulkan loader reads on Windows, in its order,
+/// each once: the display adapters' (`VulkanDriverName` in each one's key of the display device
+/// class, where a driver package installs it), then those listed under
+/// `HKLM\SOFTWARE\Khronos\Vulkan\Drivers` (each a value named for its path, enabled at 0). A
+/// manifest whose file is gone, as an adapter removed leaves its key, is left out.
+pub fn vulkan_driver_files() -> Vec<std::path::PathBuf> {
+    const DISPLAY_CLASS: &str =
+        r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
+    let mut files = Vec::new();
+    if let Some(class) = Key::local_machine(DISPLAY_CLASS) {
+        for adapter in class.subkeys() {
+            files.extend(class.strings(&adapter, "VulkanDriverName"));
+        }
+    }
+    if let Some(drivers) = Key::local_machine(r"SOFTWARE\Khronos\Vulkan\Drivers") {
+        files.extend(
+            drivers
+                .numbers()
+                .into_iter()
+                .filter(|(_, enabled)| *enabled == 0)
+                .map(|(path, _)| path),
+        );
+    }
+    let mut seen = Vec::new();
+    for f in files.into_iter().map(std::path::PathBuf::from) {
+        if f.is_file() && !seen.contains(&f) {
+            seen.push(f);
+        }
+    }
+    seen
+}
+
 /// Discards what the console's input holds that was not read yet.
 pub fn flush_input() {
     use windows_sys::Win32::System::Console::{

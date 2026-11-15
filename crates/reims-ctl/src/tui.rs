@@ -295,7 +295,7 @@ impl App {
         if !app.rows.is_empty() {
             app.table.select(Some(0));
         }
-        if host.os == Os::Linux {
+        if matches!(host.os, Os::Linux | Os::Windows) {
             let tx = app.tx.clone();
             std::thread::spawn(move || {
                 let _ = tx.send(Msg::Gpus(crate::gpu::list()));
@@ -1980,7 +1980,7 @@ impl App {
         let profile = self
             .host
             .default_profile()
-            .map(|p| p.describe().to_string())
+            .map(|p| p.describe(self.host).to_string())
             .unwrap_or_else(|| "no VMs on this host".into());
         let qemu = match &self.qemu {
             Some(q) => Span::styled(q.clone(), Style::new().fg(Color::Green)),

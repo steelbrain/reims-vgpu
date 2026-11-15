@@ -1,10 +1,11 @@
 //! The host's GPUs a VM can be given.
 //!
-//! On Linux the library runs on Vulkan. Of the host's GPUs it opens the only one, or, of several,
-//! the one that ran a short workload fastest, timed once for each set of GPUs and drivers
-//! (reims-vgpu-vulkan's `device_choice`), unless the host's user picked one. The list comes from
-//! asking each driver's manifest (an ICD JSON file) in a child process (`reims-ctl
-//! __vulkan-probe`), so a driver that hangs or crashes costs only that one.
+//! On Linux and Windows the library runs on Vulkan. Of the host's GPUs it opens the only one, or,
+//! of several, the one that ran a short workload fastest, timed once for each set of GPUs and
+//! drivers (reims-vgpu-vulkan's `device_choice`), unless the host's user picked one. The list
+//! comes from asking each driver's manifest (an ICD JSON file) in a child process (`reims-ctl
+//! __vulkan-probe`), so a driver that hangs or crashes costs only that one. The manifests are
+//! the loader's: on Linux in its search paths, on Windows in the registry ([`icd_files`]).
 //!
 //! **A VM's GPU.** A GPU picked from the list is named by its vendor and device IDs, in
 //! `MESA_VK_DEVICE_SELECT` and `VK_LOADER_DEVICE_SELECT` ([`crate::vm::Gpu::select`]): both list
@@ -73,7 +74,15 @@ impl GpuInfo {
 }
 
 /// The Vulkan driver manifests the loader would read, in its search order (the Khronos loader's
+/// Windows registry keys, [`crate::os::vulkan_driver_files`]).
+#[cfg(windows)]
+pub fn icd_files() -> Vec<PathBuf> {
+    crate::os::vulkan_driver_files()
+}
+
+/// The Vulkan driver manifests the loader would read, in its search order (the Khronos loader's
 /// Linux search paths).
+#[cfg(not(windows))]
 pub fn icd_files() -> Vec<PathBuf> {
     let home = crate::paths::home();
     let env_list = |var: &str, default: &str| -> Vec<PathBuf> {
@@ -122,7 +131,7 @@ pub fn icd_files() -> Vec<PathBuf> {
 
 /// The host's GPUs, each with the driver manifest that reaches it.
 pub fn list() -> Vec<GpuInfo> {
-    if !cfg!(target_os = "linux") {
+    if !cfg!(any(target_os = "linux", windows)) {
         return Vec::new();
     }
     let Ok(exe) = std::env::current_exe() else {
@@ -233,7 +242,7 @@ fn probe(exe: &std::path::Path, file: &std::path::Path) -> Vec<GpuInfo> {
 }
 
 /// `reims-ctl __vulkan-probe`: one JSON line per physical device the loader finds.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub fn probe_main() -> i32 {
     use ash::vk;
     // SAFETY: loads the system's Vulkan loader; the calls below follow the API's rules.
@@ -277,7 +286,7 @@ pub fn probe_main() -> i32 {
     0
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 pub fn probe_main() -> i32 {
     1
 }

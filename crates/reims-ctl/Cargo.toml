@@ -46,11 +46,13 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Console",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    "Win32_System_Registry",
+    "Win32_System_StationsAndDesktops",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", windows))'.dependencies]
 # Lists the host's Vulkan GPUs; `loaded` opens the Vulkan loader at run time, so the binary
 # needs no Vulkan to start.
 ash = { version = "0.38", default-features = false, features = ["std", "loaded"] }

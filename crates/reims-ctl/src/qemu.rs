@@ -23,6 +23,10 @@
 //! - the library's log (`REIMS_VGPU_LOG`) in QEMU's: with logs on at their level, with the
 //!   serial console and timestamps; with logs off its warnings alone ([`LOGS_OFF`]).
 //!
+//! On Windows the machine runs on WHPX, the Windows Hypervisor Platform, and its RAM is shared
+//! memory of QEMU's RAM backend (`memory-backend-ram,share=on`), which reims-vgpu's QEMU makes a
+//! pagefile-backed section there, as the library needs; the rest of its command line is Linux's.
+//!
 //! The machine, `q35-x86_64`, follows the command line the x86-64 guests were measured on
 //! (docs/qemu.md): RAM as a shared memfd, which the library on Linux requires, allocated whole as
 //! QEMU starts (`prealloc`), so no guest-RAM fault runs on a vCPU: where the host backs shmem with
@@ -38,7 +42,8 @@
 //! VMX in the guest's CPU where the host's KVM offers it, for the guest's own VMs;
 //! `dump-guest-core=off`, which leaves guest RAM out of a core dump of QEMU: with it in, a
 //! crash's core takes the process tens of seconds to end. QEMU refuses the
-//! option where the OS cannot leave memory out of a core (macOS has no `MADV_DONTDUMP`); and no
+//! option where the OS cannot leave memory out of a core (macOS has no `MADV_DONTDUMP`, and
+//! QEMU on Windows says "Dumping guest memory cannot be disabled on this host"); and no
 //! ACPI S3 (`ICH9-LPC.disable_s3`): a guest in S3 never wakes again with its display. Only PS/2
 //! input wakes QEMU from S3, not the USB keyboard and tablet, and QEMU's wake resets every
 //! device, where the guest's GPU driver restores none of the device's state, so the display
@@ -186,6 +191,9 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     let mut machine = String::from("q35");
     if c.profile.memfd_ram(ctx.host) {
         machine.push_str(",memory-backend=ram,dump-guest-core=off");
+    } else if c.profile.section_ram(ctx.host) {
+        // QEMU on Windows leaves no memory out of a core and refuses `dump-guest-core=off`.
+        machine.push_str(",memory-backend=ram");
     }
     // Room below 4 GiB for reims-vgpu's 1 GiB BAR 2 (the module doc).
     if graphics == Graphics::ReimsVgpu {
@@ -200,8 +208,14 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
             c.cpus
         );
         push(&["-object", &backend]);
+    } else if c.profile.section_ram(ctx.host) {
+        // A pagefile-backed section in reims-vgpu's QEMU on Windows (the profile's section_ram).
+        push(&[
+            "-object",
+            &format!("memory-backend-ram,id=ram,size={mem},share=on"),
+        ]);
     }
-    push(&["-accel", c.profile.accel(), "-m", &mem]);
+    push(&["-accel", c.profile.accel(ctx.host), "-m", &mem]);
     let mut cpu = format!(
         "{},kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on",
         q.cpu_model
@@ -517,16 +531,130 @@ mod tests {
     }
 
     fn has(args: &[String], pair: &[&str]) -> bool {
-        // Windows joins the VM's paths with `\`, where these have `/`.
-        let unix = |a: &String| {
-            if cfg!(windows) {
-                a.replace('\\', "/")
-            } else {
-                a.clone()
-            }
-        };
+        let args = unix_paths(args);
         args.windows(pair.len())
-            .any(|w| w.iter().zip(pair).all(|(a, b)| unix(a) == *b))
+            .any(|w| w.iter().zip(pair).all(|(a, b)| a == b))
+    }
+
+    /// `args` with the `/` these tests' paths have where Windows joins the VM's paths with `\`.
+    fn unix_paths(args: &[String]) -> Vec<String> {
+        args.iter()
+            .map(|a| {
+                if cfg!(windows) {
+                    a.replace('\\', "/")
+                } else {
+                    a.clone()
+                }
+            })
+            .collect()
+    }
+
+    /// A q35 VM's whole command line on Linux, in order: what another host's profile leaves as
+    /// it is.
+    #[test]
+    fn q35_on_linux_is_this_command_line() {
+        let inv = invocation(&q35_vm(), &ctx(linux())).unwrap();
+        let osk = format!("isa-applesmc,osk={OSK}");
+        let want = [
+            "-name",
+            "t",
+            "-machine",
+            "q35,memory-backend=ram,dump-guest-core=off,max-ram-below-4g=1G",
+            "-object",
+            "memory-backend-memfd,id=ram,size=12288M,share=on,prealloc=on,prealloc-threads=6",
+            "-accel",
+            "kvm",
+            "-m",
+            "12288M",
+            "-cpu",
+            "Skylake-Client-noTSX-IBRS,kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,\
+             +ssse3,+sse4.2,+popcnt,+avx,+aes,+xsave,+xsaveopt,check",
+            "-smp",
+            "6,sockets=1,cores=6,threads=1",
+            "-global",
+            "ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off",
+            "-global",
+            "ICH9-LPC.disable_s3=1",
+            "-device",
+            "pcie-root-port,bus=pcie.0,addr=0x1,slot=1,speed=16,width=32",
+            "-device",
+            &osk,
+            "-drive",
+            "if=pflash,format=raw,readonly=on,file=/vms/t/OVMF_CODE.fd",
+            "-drive",
+            "if=pflash,format=raw,file=/vms/t/OVMF_VARS.fd",
+            "-smbios",
+            "type=2",
+            "-device",
+            "ich9-ahci,id=sata,addr=0x2",
+            "-drive",
+            "id=opencore,if=none,format=qcow2,file=/vms/t/opencore.qcow2",
+            "-device",
+            "ide-hd,bus=sata.2,drive=opencore,bootindex=1",
+            "-drive",
+            "id=disk,if=none,format=qcow2,file=/vms/t/disk.qcow2",
+            "-device",
+            "ide-hd,bus=sata.3,drive=disk,rotation_rate=1",
+            "-netdev",
+            "user,id=net0,ipv6=off,hostfwd=tcp:127.0.0.1:2326-:22",
+            "-device",
+            "virtio-net-pci,netdev=net0,id=net0,mac=52:54:00:aa:bb:cc,addr=0x3",
+            "-vga",
+            "none",
+            "-device",
+            "reims-graphics-pci,id=gfx,bus=pcie.0,addr=0x4,\
+             romfile=/d/firmware/ReimsGraphics-0123456789abcdef.rom",
+            "-device",
+            "qemu-xhci,id=xhci,addr=0x5,conditional-intr-mapping=on,p2=7,p3=7",
+            "-device",
+            "usb-kbd,id=kbd,bus=xhci.0",
+            "-device",
+            "usb-tablet,id=tablet,bus=xhci.0",
+            "-audiodev",
+            "pipewire,id=snd0",
+            "-device",
+            "virtio-sound-pci,id=audio,audiodev=snd0,addr=0x7,streams=1",
+            "-device",
+            "virtio-sound-pci,id=audioin,audiodev=snd0,addr=0x8,streams=1,input-streams=1",
+            "-device",
+            "ich9-intel-hda,id=hda,addr=0x1b",
+            "-device",
+            "hda-output,bus=hda.0,audiodev=snd0",
+            "-display",
+            "none",
+            "-serial",
+            "none",
+            "-monitor",
+            "none",
+            "-qmp",
+            "unix:/vms/t/qmp.sock,server=on,wait=off",
+            "-pidfile",
+            "/vms/t/qemu.pid",
+        ];
+        assert_eq!(unix_paths(&inv.args), want);
+    }
+
+    /// On Windows the machine runs on WHPX, its RAM shared memory of QEMU's RAM backend, which
+    /// reims-vgpu's QEMU makes a pagefile-backed section there, without `dump-guest-core=off`,
+    /// which QEMU on Windows refuses; the rest of the command line is Linux's.
+    #[test]
+    fn q35_on_windows_runs_on_whpx_in_shared_ram() {
+        let windows = Host {
+            os: Os::Windows,
+            arch: Arch::X86_64,
+        };
+        let w = unix_paths(&invocation(&q35_vm(), &ctx(windows)).unwrap().args);
+        let mut want = unix_paths(&invocation(&q35_vm(), &ctx(linux())).unwrap().args);
+        for (option, value) in [
+            ("-machine", "q35,memory-backend=ram,max-ram-below-4g=1G"),
+            ("-object", "memory-backend-ram,id=ram,size=12288M,share=on"),
+            ("-accel", "whpx"),
+        ] {
+            let i = want.iter().position(|a| a == option).unwrap();
+            want[i + 1] = value.to_string();
+        }
+        assert_eq!(w, want);
+        assert!(!w.iter().any(|a| a.contains("dump-guest-core")));
     }
 
     #[test]

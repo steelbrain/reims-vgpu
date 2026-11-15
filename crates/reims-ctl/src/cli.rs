@@ -851,7 +851,7 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
             None => "stopped".into(),
         },
     );
-    add("kind", c.profile.describe().into());
+    add("kind", c.profile.describe(host).into());
     add("directory", paths::tilde(&vm.dir));
     add("cpus", c.cpus.to_string());
     add("memory", format_mib(c.memory_mib));
@@ -1490,7 +1490,7 @@ fn doctor(host: Host) -> Result<i32> {
                 },
             );
         }
-        crate::host::Os::Mac | crate::host::Os::Other => {}
+        crate::host::Os::Mac | crate::host::Os::Windows | crate::host::Os::Other => {}
     }
     if profile == Profile::Q35X86_64 {
         // What makes a new VM's OpenCore image, with its OVMF, and downloads its installer.

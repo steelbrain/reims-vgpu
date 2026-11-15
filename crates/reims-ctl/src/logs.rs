@@ -210,7 +210,7 @@ pub fn system_info(host: Host, warnings: &[String]) -> String {
                 ),
             );
         }
-        Os::Other => {}
+        Os::Windows | Os::Other => {}
     }
     s
 }

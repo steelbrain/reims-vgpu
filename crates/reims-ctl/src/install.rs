@@ -73,7 +73,11 @@ pub fn qemu_binary_or_default(profile: Profile) -> PathBuf {
 /// `qemu-img`, beside the QEMU binary.
 pub fn qemu_img(profile: Profile) -> Result<PathBuf> {
     let bin = qemu_binary(profile)?;
-    let img = bin.with_file_name("qemu-img");
+    let img = bin.with_file_name(if cfg!(windows) {
+        "qemu-img.exe"
+    } else {
+        "qemu-img"
+    });
     if !img.exists() {
         bail!(
             "{} is missing: reinstall with scripts/install-ctl.sh",
@@ -144,16 +148,17 @@ pub fn has_device(qemu: &Path, name: &'static str) -> Option<bool> {
     has
 }
 
-/// The audio backend to use where the VM names none: the host's native one, among those built.
+/// The audio backend to use where the VM names none: the host's native one, among those built
+/// (DirectSound's on Windows).
 pub fn default_audio_backend(available: &[String]) -> String {
-    for w in ["pipewire", "pa", "alsa", "sdl"] {
+    for w in ["pipewire", "pa", "alsa", "dsound", "sdl"] {
         if available.iter().any(|a| a == w) {
             return w.into();
         }
     }
     if available.is_empty() {
         // QEMU could not be asked (not installed yet): its usual choice.
-        return "pipewire".into();
+        return if cfg!(windows) { "dsound" } else { "pipewire" }.into();
     }
     "none".into()
 }
