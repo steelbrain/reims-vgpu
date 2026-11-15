@@ -3018,6 +3018,23 @@ mod tests {
     /// eight syncs goes to the draw as a sync file
     #[test]
     fn on_vulkan_a_draw_from_the_mirror_draws_what_a_draw_from_the_texture_draws() {
+        mirror_draws_what_the_texture_draws(false);
+    }
+
+    /// On Vulkan, with the mirror's copies on a queue of their own (`mirror`, "On a copy
+    /// engine"), a draw from the mirror draws the pixels a draw from the presented texture
+    /// draws, at the same syncs as above: the compare's kernel lists the tiles that changed on
+    /// the GPU, and only those are copied into the mirror. The queue is one of the runtime's
+    /// own, the Vulkan platform giving no queue on a copy engine: what the copies write is the
+    /// same on either. A sync that lists no tile copies nothing and asks for no sync file
+    #[test]
+    fn on_vulkan_with_a_queue_for_copies_a_draw_from_the_mirror_draws_what_a_draw_from_the_texture_draws()
+     {
+        mirror_draws_what_the_texture_draws(true);
+    }
+
+    /// The tests above, the mirror's copies on a queue of their own where `copies`.
+    fn mirror_draws_what_the_texture_draws(copies: bool) {
         use reims_vgpu_vulkan::VulkanPlatform;
         let platform = Arc::new(VulkanPlatform::new());
         crate::entry::run(|_| {
@@ -3102,6 +3119,15 @@ mod tests {
                 bytes
             };
             let runtime = platform.metal_device(None).unwrap();
+            if copies {
+                let foreign = theirs.foreign.as_ref().unwrap();
+                let queue = runtime.new_command_queue();
+                let mirror = foreign
+                    .mirror
+                    .get_or_make(|| Mirror::with_copies(runtime.clone_ref(), queue))
+                    .unwrap();
+                assert!(mirror.copies_on_their_queue(), "the list's kernel's pipeline");
+            }
             // Whether the runtime exports a command buffer's completion as a sync file here.
             let exports = {
                 let queue = runtime.new_command_queue().unwrap();
@@ -3134,7 +3160,7 @@ mod tests {
                         .unwrap();
                     assert_eq!(
                         mirror.last_asked(),
-                        exports,
+                        exports && (tiles > 0 || !copies),
                         "format {format} {size:?}, {case}: the sync asked for its completion as \
                          a sync file"
                     );

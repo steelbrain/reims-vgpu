@@ -1,6 +1,6 @@
 # The metallibs beside this file and the sha256 of the commands and sources each was
 # built from (cargo xtask metallibs; reims-vgpu-vulkan/build.rs).
-"shaders.metallib" = "978394ee8129a79a2a3f4eab6268ffcb1f3e02fc545410d07448ec4f5d07f87b"
+"shaders.metallib" = "1bfb228aeebbe39583592d304b469887cb62b66868617199ff853a991bc88657"
 "predication.metallib" = "3d408cde1f3dafa068fc0fed8ed31e782bb61674ea77da6ce2a656e35c9a1d15"
 "no_draw.metallib" = "4aa72002de04f787ddfa645fe398fa5620126f6a7655e91474a0703ff7df2635"
 "icb_encode.metallib" = "354ca4fee482115b1cb9bbd867b10bb36c37828e7ef8ff404ebfcf9c78bf6e9d"

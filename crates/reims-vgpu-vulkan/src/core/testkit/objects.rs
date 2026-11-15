@@ -872,6 +872,11 @@ pub struct World {
     ///
     /// [`GpuDevice::copies_guest_ram`]: crate::core::platform::device::GpuDevice::copies_guest_ram
     guest_ram_copies: AtomicBool,
+    /// Whether the devices' [`GpuDevice::new_command_queue_for_copies`] gives a queue
+    /// ([`World::give_copy_queues`]).
+    ///
+    /// [`GpuDevice::new_command_queue_for_copies`]: crate::core::platform::device::GpuDevice::new_command_queue_for_copies
+    copy_queues: AtomicBool,
     /// What the devices' [`GpuDevice::recoveries`] answers ([`World::recover`]).
     ///
     /// [`GpuDevice::recoveries`]: crate::core::platform::device::GpuDevice::recoveries
@@ -941,6 +946,7 @@ impl World {
             notifications: Mutex::new(Vec::new()),
             splits: AtomicBool::new(false),
             guest_ram_copies: AtomicBool::new(false),
+            copy_queues: AtomicBool::new(false),
             recoveries: AtomicU64::new(0),
             linear_rows: AtomicU64::new(0),
             surface_pages: Mutex::new((PagesInPlace::Yes, Vec::new())),
@@ -1079,6 +1085,20 @@ impl World {
     /// [`GpuDevice::copies_guest_ram`]: crate::core::platform::device::GpuDevice::copies_guest_ram
     pub fn copies_guest_ram(&self) -> bool {
         self.guest_ram_copies.load(Ordering::SeqCst)
+    }
+
+    /// Has the devices give a queue for copies ([`GpuDevice::new_command_queue_for_copies`]),
+    /// logged under [`COPY_QUEUE`], or not, as the platform's default answers; not at first.
+    ///
+    /// [`GpuDevice::new_command_queue_for_copies`]: crate::core::platform::device::GpuDevice::new_command_queue_for_copies
+    /// [`COPY_QUEUE`]: super::impls::device::COPY_QUEUE
+    pub fn give_copy_queues(&self, on: bool) {
+        self.copy_queues.store(on, Ordering::SeqCst);
+    }
+
+    /// Whether the devices give a queue for copies ([`World::give_copy_queues`]).
+    pub fn gives_copy_queues(&self) -> bool {
+        self.copy_queues.load(Ordering::SeqCst)
     }
 
     /// Has the devices answer one recovery more ([`GpuDevice::recoveries`]), as a device whose

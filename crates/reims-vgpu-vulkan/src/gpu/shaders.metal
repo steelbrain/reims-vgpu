@@ -214,23 +214,16 @@ struct DisplayMirrorFrame {
 // The threads of a mirror tile's threadgroup.
 constant uint display_mirror_threads = 256;
 
-// Tile `tile` of the presented frame `now`: where any of its words differs from the frame the
-// mirror holds (`sent`, the frame its last sync copied), or every tile goes, all of its words are
-// copied into the mirror (`mirror`, in host memory) and `tiles` counts it. A tile that changed
-// nothing writes nothing.
-kernel void displayMirrorTile(device const uint *now [[buffer(0)]],
-                              device const uint *sent [[buffer(1)]],
-                              device uint *mirror [[buffer(2)]],
-                              constant DisplayMirrorFrame &frame [[buffer(3)]],
-                              device atomic_uint *tiles [[buffer(4)]],
-                              uint2 tile [[threadgroup_position_in_grid]],
-                              uint index [[thread_index_in_threadgroup]]) {
-    threadgroup uint differs[display_mirror_threads];
-    threadgroup uint changed;
-    uint x0 = tile.x * frame.tile_words;
-    uint y0 = tile.y * 64;
-    uint width = min(x0 + frame.tile_words, frame.row_words) - x0;
-    uint count = width * (min(y0 + 64, frame.rows) - y0);
+// Whether tile `tile` of the presented frame `now` differs in any of its words from the frame the
+// mirror holds (`sent`, the frame its last sync copied), or every tile goes, as each thread of
+// the tile's threadgroup (`index` among them) learns; `count` and `width` are the tile's words and
+// its words a row.
+static bool display_mirror_tile_changed(device const uint *now,
+                                        device const uint *sent,
+                                        constant DisplayMirrorFrame &frame,
+                                        uint x0, uint y0, uint width, uint count, uint index,
+                                        threadgroup uint *differs,
+                                        threadgroup uint &changed) {
     uint mine = 0;
     for (uint i = index; i < count; i += display_mirror_threads) {
         uint at = (y0 + i / width) * frame.words_per_row + x0 + i % width;
@@ -246,7 +239,27 @@ kernel void displayMirrorTile(device const uint *now [[buffer(0)]],
         changed = any;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (changed == 0) {
+    return changed != 0;
+}
+
+// Tile `tile` of the presented frame `now`: where it changed (`display_mirror_tile_changed`), all
+// of its words are copied into the mirror (`mirror`, in host memory) and `tiles` counts it. A tile
+// that changed nothing writes nothing.
+kernel void displayMirrorTile(device const uint *now [[buffer(0)]],
+                              device const uint *sent [[buffer(1)]],
+                              device uint *mirror [[buffer(2)]],
+                              constant DisplayMirrorFrame &frame [[buffer(3)]],
+                              device atomic_uint *tiles [[buffer(4)]],
+                              uint2 tile [[threadgroup_position_in_grid]],
+                              uint index [[thread_index_in_threadgroup]]) {
+    threadgroup uint differs[display_mirror_threads];
+    threadgroup uint changed;
+    uint x0 = tile.x * frame.tile_words;
+    uint y0 = tile.y * 64;
+    uint width = min(x0 + frame.tile_words, frame.row_words) - x0;
+    uint count = width * (min(y0 + 64, frame.rows) - y0);
+    if (!display_mirror_tile_changed(now, sent, frame, x0, y0, width, count, index, differs,
+                                     changed)) {
         return;
     }
     if (index == 0) {
@@ -256,4 +269,30 @@ kernel void displayMirrorTile(device const uint *now [[buffer(0)]],
         uint at = (y0 + i / width) * frame.words_per_row + x0 + i % width;
         mirror[at] = now[at];
     }
+}
+
+// Tile `tile` of the presented frame `now`, where the mirror's copies run on a copy engine: where
+// it changed (`display_mirror_tile_changed`), its number (`tile.y` times the tiles a row, plus
+// `tile.x`) is added to `list`, whose first word counts the numbers after it, in no order. It
+// writes nothing else: the copy engine copies the listed tiles out of `now` into the mirror.
+kernel void displayMirrorTileList(device const uint *now [[buffer(0)]],
+                                  device const uint *sent [[buffer(1)]],
+                                  device atomic_uint *list [[buffer(2)]],
+                                  constant DisplayMirrorFrame &frame [[buffer(3)]],
+                                  uint2 tile [[threadgroup_position_in_grid]],
+                                  uint index [[thread_index_in_threadgroup]]) {
+    threadgroup uint differs[display_mirror_threads];
+    threadgroup uint changed;
+    uint x0 = tile.x * frame.tile_words;
+    uint y0 = tile.y * 64;
+    uint width = min(x0 + frame.tile_words, frame.row_words) - x0;
+    uint count = width * (min(y0 + 64, frame.rows) - y0);
+    if (!display_mirror_tile_changed(now, sent, frame, x0, y0, width, count, index, differs,
+                                     changed) ||
+        index != 0) {
+        return;
+    }
+    uint across = (frame.row_words + frame.tile_words - 1) / frame.tile_words;
+    uint at = atomic_fetch_add_explicit(&list[0], 1u, memory_order_relaxed);
+    atomic_store_explicit(&list[1 + at], tile.y * across + tile.x, memory_order_relaxed);
 }
