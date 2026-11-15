@@ -2691,6 +2691,10 @@ mod tests {
     /// a reset; a blit's copy carries the command, its pipeline and barrier, to another buffer,
     /// whose execution runs it; a blit's reset leaves a fresh command
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "m2v: indirect work runs nothing on the UHD 630 (ledger: UHD 630 indirect work)"
+    )]
     fn commands_run_copy_and_reset() {
         let d = dev();
         let pipeline = icb_pipeline(&d);
@@ -3331,6 +3335,10 @@ mod tests {
     /// no error, as the M3 Max's does, and the device runs the next one. A death there is no Mac's
     /// answer
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "m2v: indirect work runs nothing on the UHD 630 (ledger: UHD 630 indirect work)"
+    )]
     fn released_command_states_are_relayed_by_default() {
         let d = dev();
         let released = rt::Degradation::ReleasedCommandState;
@@ -3354,6 +3362,10 @@ mod tests {
     /// and a buffer the GPU may write takes those at its first such write. Nothing is announced,
     /// and the command buffer completes with no error, as the M3 Max's does
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "m2v: indirect work runs nothing on the UHD 630 (ledger: UHD 630 indirect work)"
+    )]
     fn a_state_released_while_a_buffer_lives_runs_where_a_kernel_names_it() {
         let d = dev();
         let (ended, word) = crate::answer::relaxed_process(|| {
@@ -3425,6 +3437,10 @@ mod tests {
     /// lived, `released_command_states_are_relayed_by_default`). Metal's is the same
     /// (`metal_tests`)
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "m2v: indirect work runs nothing on the UHD 630 (ledger: UHD 630 indirect work)"
+    )]
     fn an_execution_of_a_record_the_gpu_wrote_naming_a_released_state_runs_it() {
         assert_eq!(released_state_marks::<VulkanPlatform>(&dev()), 1);
     }
@@ -3757,6 +3773,10 @@ mod tests {
     /// the device again and again, each time once every sender finished a round more. Each
     /// read-back, and each command at the end, holds the round last sent it.
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "m2v: indirect work runs nothing on the UHD 630 (ledger: UHD 630 indirect work)"
+    )]
     fn a_recovery_while_a_command_is_sent_in_one_call_loses_no_set() {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         const SENDERS: u64 = 4;
@@ -3863,6 +3883,10 @@ mod tests {
     /// are nil at offsets of its own (a nil buffer's address is its offset). A device of its own,
     /// as a recovery moves every user of the device.
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "m2v: indirect work runs nothing on the UHD 630 (ledger: UHD 630 indirect work)"
+    )]
     fn a_recovery_under_the_default_resets_every_command_where_an_import_taxes_submissions() {
         const COMMANDS: u64 = 64;
         let d = crate::gpu::device::tests::device_of_options(crate::platform::device_options());

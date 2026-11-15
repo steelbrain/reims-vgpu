@@ -1048,6 +1048,10 @@ mod tests {
     /// offset, threadgroups from an indirect buffer, threadgroup memory of the length set; with
     /// a barrier, a use and the reinterpretation flush between them
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "m2v: indirect work runs nothing on the UHD 630 (ledger: UHD 630 indirect work)"
+    )]
     fn dispatches_run_kernels() {
         let add = pipeline(ADD, "add_one");
         let input = holding(&(0..256).map(|i| i * 5).collect::<Vec<_>>());
