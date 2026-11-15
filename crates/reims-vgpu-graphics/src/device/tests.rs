@@ -1001,14 +1001,16 @@ fn a_new_scale_is_told_with_display_changed() {
 }
 
 /// A dropped device lets its region go once its threads see the end, though its refresh comes
-/// once in 1000 s ([`NEVER_MHZ`]): the refresh thread sleeps that wait in parts
-/// ([`REFRESH_SLEEP_PART`]). Windows charges each region to the host's commit limit whole while
-/// it lives, so a test that makes many devices would otherwise hold every region it made
+/// once in 1000 s ([`NEVER_MHZ`]) and its refresh thread was asleep for it: the thread sleeps
+/// that wait in parts ([`REFRESH_SLEEP_PART`]). Windows charges each region to the host's commit
+/// limit whole while it lives, so a test that makes many devices would otherwise hold every
+/// region it made. The device lives twice a part first, so the thread is asleep at its drop
 #[test]
 fn a_dropped_device_lets_its_region_go() {
     let rig = Rig::new();
     rig.start();
     let region = Arc::downgrade(&rig.device.shared.region);
+    std::thread::sleep(2 * REFRESH_SLEEP_PART);
     drop(rig);
     assert!(
         eventually(|| region.upgrade().is_none()),
