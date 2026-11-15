@@ -1548,7 +1548,7 @@ fn a_queue_s_buffers_share_the_sinks_its_first_was_begun_with() {
         RGFX_STATUS_OK
     );
     let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
-    let mut completed = |ring: &mut QueueRing, cb: u64| {
+    let completed = |ring: &mut QueueRing, cb: u64| {
         ring.send(&device, command_buffer(queue, cb));
         eventually(|| {
             platform.world().complete_all(CompleteOn::Caller);
