@@ -508,8 +508,9 @@ impl Window {
     }
 
     /// The cursor the render thread has the sink draw into the image: the guest's, where the
-    /// guest moves it on its own and shows it, once it has a glyph and a mode; else none.
-    pub(crate) fn drawn_cursor(&self) -> Option<DrawnCursor> {
+    /// guest moves it on its own and shows it, once it has a glyph and a mode; else none. Public
+    /// for the display's tests, which check what the window draws from the guest's cursor.
+    pub fn drawn_cursor(&self) -> Option<DrawnCursor> {
         let guest = self.guest.lock();
         if !(guest.lead.guest_leads() && guest.cursor_visible) {
             return None;
