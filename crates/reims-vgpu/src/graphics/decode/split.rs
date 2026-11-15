@@ -397,6 +397,33 @@ mod tests {
 
     use super::*;
 
+    /// A buffer's take of its context's gate for its parts waits while a commit of the context is
+    /// under way, and while another buffer of it has parts out, and takes the gate once that
+    /// ended; the gate's entry goes once it is let go.
+    #[test]
+    fn a_take_of_the_gate_waits_for_commits_under_way_and_parts_out() {
+        let gate = Arc::new(SplitGate::default());
+        for parts_out in [false, true] {
+            let commit = (!parts_out).then(|| gate.commit(1));
+            let hold = parts_out.then(|| gate.try_split(1).expect("the gate is free"));
+            let took = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let _hold = gate.split(1);
+                    took.store(true, Ordering::Release);
+                });
+                std::thread::sleep(Duration::from_millis(50));
+                assert!(
+                    !took.load(Ordering::Acquire),
+                    "taken early (parts out: {parts_out})"
+                );
+                drop((commit, hold));
+            });
+            assert!(took.load(Ordering::Acquire));
+            assert!(gate.contexts.lock().is_empty(), "its entry gone");
+        }
+    }
+
     /// A commit of a context waits while a buffer of it has parts out, and a commit of another
     /// context does not.
     #[test]
