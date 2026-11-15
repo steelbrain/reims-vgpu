@@ -18,7 +18,8 @@
 //!
 //! A present whose writers have all finished, with none before it waiting, is shown at once; the
 //! others wait in order, and each `CB_COMPLETE` shows those at the front that are ready, so a
-//! present never overtakes one made before it. A process publishes a buffer on its queue's ring
+//! present never overtakes one made before it. Each display's presents keep their own order: on
+//! a device of several displays a present of one display never waits for another's. A process publishes a buffer on its queue's ring
 //! before it names it a writer, so a writer whose seqno is past every seqno its queue's ring has
 //! published when the present comes names no buffer, and holds nothing: a seqno the guest wrote
 //! wrong never holds its display's presents. A failed buffer finishes as a completed one does
@@ -95,8 +96,9 @@ use super::{DisplayHold, Presented, ShownTexture, Shows};
 
 /// The presents waiting for their surfaces' writers, and how far each queue has finished.
 pub(crate) struct PresentQueue<P: Platform> {
-    /// What the display shows, which a present changes when it is shown.
-    presented: Arc<Presented<P>>,
+    /// What each display shows, display `i`'s at index `i`, which a present of it changes when it
+    /// is shown.
+    presented: Vec<Arc<Presented<P>>>,
     /// The queues' progress and the presents waiting, under one lock, so a completion and a
     /// present never miss each other.
     state: Mutex<State<P>>,
@@ -113,8 +115,8 @@ struct State<P: Platform> {
     /// finished, and says nothing of the buffers before it. They go as `finished` passes them, or
     /// with their queue.
     apart: HashMap<u64, BTreeSet<u64>>,
-    /// The presents not yet shown, oldest first.
-    waiting: VecDeque<Waiting<P>>,
+    /// By display, display `i`'s at index `i`: its presents not yet shown, oldest first.
+    waiting: Vec<VecDeque<Waiting<P>>>,
     /// By queue id: the poster onto its completion ring, through which what its submission ring
     /// has published is read.
     queues: HashMap<u64, CompletionPoster>,
@@ -138,13 +140,15 @@ struct Waiting<P: Platform> {
 }
 
 impl<P: Platform> PresentQueue<P> {
-    pub(crate) fn new(presented: Arc<Presented<P>>) -> Self {
+    /// The presents of the displays `presented` shows, display `i` by `presented[i]`.
+    pub(crate) fn new(presented: Vec<Arc<Presented<P>>>) -> Self {
+        let waiting = presented.iter().map(|_| VecDeque::new()).collect();
         PresentQueue {
             presented,
             state: Mutex::new(State {
                 finished: HashMap::new(),
                 apart: HashMap::new(),
-                waiting: VecDeque::new(),
+                waiting,
                 queues: HashMap::new(),
             }),
         }
@@ -156,14 +160,20 @@ impl<P: Platform> PresentQueue<P> {
         self.state.lock().queues.insert(queue, poster);
     }
 
-    /// Shows IOSurface `id`'s `texture` (`None`: the scanout), with the colour stages `color`
-    /// sets, once each command buffer in `writers` has finished, and `fill`, its surface's
-    /// device cache's fill, where it has one, and every present made before it is shown;
-    /// `answer` goes as [`Presented`] gives it. A writer of a queue the host does not hold, or
-    /// past what its queue's ring has published, holds nothing (the module doc). Called with no
-    /// lock of the decoder's held: what a ring has published is read with the ring held.
+    /// Shows IOSurface `id`'s `texture` (`None`: the scanout) on display `display`, with the
+    /// colour stages `color` sets, once each command buffer in `writers` has finished, and
+    /// `fill`, its surface's device cache's fill, where it has one, and every present of the
+    /// display made before it is shown; `answer` goes as [`Presented`] gives it. A writer of a
+    /// queue the host does not hold, or past what its queue's ring has published, holds nothing
+    /// (the module doc). Called with no lock of the decoder's held: what a ring has published is
+    /// read with the ring held. `display` is one the queue shows.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a present's parts, as the device hands them"
+    )]
     pub(crate) fn present(
         &self,
+        display: usize,
         id: u32,
         texture: Option<ShownTexture<P>>,
         color: Option<ColorChange>,
@@ -171,35 +181,57 @@ impl<P: Platform> PresentQueue<P> {
         writers: Vec<RgfxSurfaceWriter>,
         fill: Option<FillWait>,
     ) {
-        let taken = self.presented.answers.taken();
+        let Some(presented) = self.presented.get(display) else {
+            return;
+        };
+        let taken = presented.answers.taken();
         let writers = self.published(writers);
-        self.push(Waiting {
-            shows: Shows::Surface(id, texture),
-            color,
-            answer,
-            writers,
-            fill,
-            taken,
-        });
+        self.push(
+            display,
+            Waiting {
+                shows: Shows::Surface(id, texture),
+                color,
+                answer,
+                writers,
+                fill,
+                taken,
+            },
+        );
     }
 
-    /// A present that keeps what the display shows, with the colour stages `color` sets
-    /// (`RGFX_PRESENT_KEEP`): shown once every present made before it is.
-    pub(crate) fn present_kept(&self, color: Option<ColorChange>, answer: PresentAnswer) {
-        self.push(Waiting {
-            shows: Shows::Kept,
-            color,
-            answer,
-            writers: Vec::new(),
-            fill: None,
-            taken: self.presented.answers.taken(),
-        });
+    /// A present that keeps what display `display` shows, with the colour stages `color` sets
+    /// (`RGFX_PRESENT_KEEP`): shown once every present of the display made before it is.
+    /// `display` is one the queue shows.
+    pub(crate) fn present_kept(
+        &self,
+        display: usize,
+        color: Option<ColorChange>,
+        answer: PresentAnswer,
+    ) {
+        let Some(presented) = self.presented.get(display) else {
+            return;
+        };
+        let taken = presented.answers.taken();
+        self.push(
+            display,
+            Waiting {
+                shows: Shows::Kept,
+                color,
+                answer,
+                writers: Vec::new(),
+                fill: None,
+                taken,
+            },
+        );
     }
 
-    /// `waiting` joins the presents, which are shown as they are ready.
-    fn push(&self, waiting: Waiting<P>) {
+    /// `waiting` joins display `display`'s presents, which are shown as they are ready.
+    fn push(&self, display: usize, waiting: Waiting<P>) {
         let mut state = self.state.lock();
-        state.waiting.push_back(waiting);
+        let Some(presents) = state.waiting.get_mut(display) else {
+            return;
+        };
+        presents.push_back(waiting);
         let gone = self.show_ready(&mut state);
         drop(state);
         drop(gone);
@@ -209,7 +241,7 @@ impl<P: Platform> PresentQueue<P> {
     /// shown.
     pub(crate) fn filled(&self) {
         let mut state = self.state.lock();
-        if !state.waiting.is_empty() {
+        if state.waits() {
             let gone = self.show_ready(&mut state);
             drop(state);
             drop(gone);
@@ -238,7 +270,7 @@ impl<P: Platform> PresentQueue<P> {
                 state.apart.remove(&queue);
             }
         }
-        if !state.waiting.is_empty() {
+        if state.waits() {
             let gone = self.show_ready(&mut state);
             drop(state);
             drop(gone);
@@ -262,7 +294,7 @@ impl<P: Platform> PresentQueue<P> {
             return;
         }
         state.apart.entry(queue).or_default().insert(seqno);
-        if !state.waiting.is_empty() {
+        if state.waits() {
             let gone = self.show_ready(&mut state);
             drop(state);
             drop(gone);
@@ -336,7 +368,9 @@ impl<P: Platform> PresentQueue<P> {
             state.finished.clear();
             state.apart.clear();
             state.queues.clear();
-            std::mem::take(&mut state.waiting)
+            (state.waiting.iter_mut())
+                .map(std::mem::take)
+                .collect::<Vec<_>>()
         };
         if let Err(refusal) =
             reims_vgpu_vulkan::core::raise::refusals::refusing(move || drop(waiting))
@@ -355,7 +389,7 @@ impl<P: Platform> PresentQueue<P> {
         let mut state = self.state.lock();
         state.finished.retain(|&q, _| !gone(q));
         state.apart.retain(|&q, _| !gone(q));
-        for waiting in &mut state.waiting {
+        for waiting in state.waiting.iter_mut().flatten() {
             waiting.writers.retain(|w| !gone(w.queue_obj_id));
         }
         let let_go = self.show_ready(&mut state);
@@ -363,35 +397,51 @@ impl<P: Platform> PresentQueue<P> {
         drop(let_go);
     }
 
-    /// Shows the presents at the front whose writers have finished, oldest first. The holds of
-    /// the textures they replace are returned, for the caller to let go of once it has let go of
-    /// the state: a release waiting for one is answered there, off the present's path.
+    /// Shows each display's presents at its front whose writers have finished, oldest first. The
+    /// holds of the textures they replace are returned, for the caller to let go of once it has
+    /// let go of the state: a release waiting for one is answered there, off the present's path.
     #[must_use]
     fn show_ready(&self, state: &mut State<P>) -> Vec<Arc<DisplayHold>> {
         let mut gone = Vec::new();
-        loop {
-            let ready = state.waiting.front().is_some_and(|front| {
-                front.fill.as_ref().is_none_or(FillWait::done)
-                    && front.writers.iter().all(|w| {
-                        let queue = &w.queue_obj_id;
-                        (state.finished.get(queue)).is_some_and(|&done| done >= w.seqno)
-                            || (state.apart.get(queue)).is_some_and(|a| a.contains(&w.seqno))
-                    })
-            });
-            if !ready {
-                return gone;
+        let State {
+            finished,
+            apart,
+            waiting,
+            ..
+        } = state;
+        for (presents, presented) in waiting.iter_mut().zip(&self.presented) {
+            loop {
+                let ready = presents.front().is_some_and(|front| {
+                    front.fill.as_ref().is_none_or(FillWait::done)
+                        && front.writers.iter().all(|w| {
+                            let queue = &w.queue_obj_id;
+                            (finished.get(queue)).is_some_and(|&done| done >= w.seqno)
+                                || (apart.get(queue)).is_some_and(|a| a.contains(&w.seqno))
+                        })
+                });
+                if !ready {
+                    break;
+                }
+                let Some(shown) = presents.pop_front() else {
+                    break;
+                };
+                gone.extend(presented.show(shown.shows, shown.color, shown.answer, shown.taken));
             }
-            let Some(shown) = state.waiting.pop_front() else {
-                return gone;
-            };
-            gone.extend((self.presented).show(shown.shows, shown.color, shown.answer, shown.taken));
         }
+        gone
     }
 
-    /// The presents not yet shown (for the tests).
+    /// The presents not yet shown, of every display (for the tests).
     #[cfg(test)]
     pub(crate) fn waiting(&self) -> usize {
-        self.state.lock().waiting.len()
+        self.state.lock().waiting.iter().map(VecDeque::len).sum()
+    }
+}
+
+impl<P: Platform> State<P> {
+    /// Whether a present of any display waits.
+    fn waits(&self) -> bool {
+        self.waiting.iter().any(|presents| !presents.is_empty())
     }
 }
 

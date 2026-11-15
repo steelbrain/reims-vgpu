@@ -14,6 +14,7 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use super::*;
 
+mod displays;
 mod full_ring;
 
 /// A graphics device on the testkit's platform, with no window, raising through `raised`.
@@ -31,6 +32,7 @@ fn headless(raised: &Arc<AtomicU32>) -> GraphicsDevice<FakePlatform> {
         memory_map: None,
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap()
 }
@@ -151,6 +153,7 @@ fn on_vulkan_the_let_go_waits_for_a_callback_blocked_on_the_releasers_lock_only_
         memory_map: None,
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(crate::singleton::platform(), config).unwrap();
     let held = lock.lock();
@@ -200,6 +203,7 @@ fn headless_over(
         memory_map: None,
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     (device, platform)
@@ -252,6 +256,7 @@ fn on_vulkan_guest_texture_ids_are_kept_from_the_host_s() {
         memory_map: None,
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let _device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     let gpu = platform.metal_device(None).unwrap();
@@ -318,6 +323,7 @@ fn on_vulkan_a_queue_before_the_graphics_device_takes_no_guest_texture_id() {
         memory_map: None,
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let _device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     let plain_desc = platform.texture_descriptor(&TextureDesc {
@@ -1457,6 +1463,7 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
         memory_map: None,
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1527,6 +1534,7 @@ fn a_queue_s_buffers_share_the_sinks_its_first_was_begun_with() {
         memory_map: None,
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1602,6 +1610,7 @@ fn an_out_of_line_command_buffer_is_carried_out_from_one_copy() {
         memory_map: None,
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1699,6 +1708,7 @@ fn a_doorbell_write_answers_a_command_buffer_on_its_thread() {
         memory_map: None,
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1802,6 +1812,7 @@ fn a_doorbell_s_answer_allocates_nothing() {
         memory_map: None,
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1919,6 +1930,7 @@ fn a_landed_download_s_answer_at_its_doorbell_allocates_nothing() {
         memory_map: None,
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1999,6 +2011,7 @@ fn a_lone_buffer_s_doorbell_to_its_cb_submitted() {
         memory_map: None,
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -2376,6 +2389,7 @@ fn calling_back(ring: u64) -> (Arc<GraphicsDevice<FakePlatform>>, Returned) {
         memory_map: None,
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
     let device = Arc::new(device);
@@ -2554,6 +2568,7 @@ fn the_guest_s_cursor_reaches_the_host() {
         memory_map: None,
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
     let wait = |count: usize| {
@@ -2651,6 +2666,7 @@ fn the_host_is_told_no_cursor_while_the_display_s_panel_is_off() {
         memory_map: None,
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
     let wait = |count: usize| {
@@ -2878,6 +2894,7 @@ fn windowed() -> (GraphicsDevice<FakePlatform>, Arc<FakePlatform>) {
         memory_map: None,
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     (device, platform)
@@ -2899,7 +2916,7 @@ fn windowed_draw(
         Arc::clone(platform),
         &device.control.region,
         shown,
-        &device.control.presented,
+        &device.control.presented[0],
     )
     .unwrap();
     let drawable = platform.texture_descriptor(&TextureDesc {
@@ -2952,8 +2969,8 @@ fn draws_the_scanout(
 /// The frames `device`'s window was asked to draw so far.
 fn frames_asked(device: &GraphicsDevice<FakePlatform>) -> u64 {
     device
-        .window
-        .as_ref()
+        .windows
+        .first()
         .expect("a window")
         .window()
         .frames_asked()
@@ -3081,9 +3098,9 @@ fn a_reset_shows_the_scanout_in_place_of_the_surface_shown() {
 
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
     reset_done(&device);
-    eventually(|| device.control.presented.shown().is_none());
+    eventually(|| device.control.presented[0].shown().is_none());
     assert!(
-        device.control.presented.shown().is_none(),
+        device.control.presented[0].shown().is_none(),
         "the surface stayed"
     );
     assert!(
@@ -3192,7 +3209,7 @@ fn a_present_needs_the_surface_s_texture() {
         let done = RgfxComplete::read_from_bytes(&bytes).unwrap();
         assert_eq!(done.header.r#type, RGFX_EVT_COMPLETE);
         assert_eq!(done.status, status, "IOSurface {id}");
-        assert!(device.control.presented.texture.lock().is_none());
+        assert!(device.control.presented[0].texture.lock().is_none());
     }
 }
 
@@ -3263,7 +3280,7 @@ fn display_colors_take_effect_with_the_next_accepted_present() {
         RgfxComplete::read_from_bytes(&bytes).unwrap().status
     };
     let reds = |stage: u32| -> Option<Vec<f32>> {
-        let (_, color) = device.control.presented.color();
+        let (_, color) = device.control.presented[0].color();
         let table = color.stages[usize::try_from(stage).unwrap()].as_ref()?;
         Some(table.iter().map(|e| e[0]).collect())
     };
@@ -3277,7 +3294,7 @@ fn display_colors_take_effect_with_the_next_accepted_present() {
         RGFX_STATUS_INVALID_ARGUMENT
     );
     assert_eq!(reds(RGFX_COLOR_POST_GAMMA), None);
-    let (before, _) = device.control.presented.color();
+    let (before, _) = device.control.presented[0].color();
 
     // The kept present after it takes the staged table, and shows what it showed.
     assert_eq!(
@@ -3287,8 +3304,8 @@ fn display_colors_take_effect_with_the_next_accepted_present() {
     let table = reds(RGFX_COLOR_POST_GAMMA).expect("the post-gamma table");
     assert_eq!(table.len(), 300);
     assert_eq!((table[0], table[255], table[299]), (0.0, 255.0, 299.0));
-    assert_ne!(device.control.presented.color().0, before);
-    assert!(device.control.presented.texture.lock().is_none());
+    assert_ne!(device.control.presented[0].color().0, before);
+    assert!(device.control.presented[0].texture.lock().is_none());
 
     // A matrix of three rows, and the pre-gamma table turned off, with a present of the scanout:
     // the post-gamma table stays.
@@ -3309,8 +3326,8 @@ fn display_colors_take_effect_with_the_next_accepted_present() {
 
     // The reset, which the control thread tells the host: every stage off.
     device.reset();
-    eventually(|| device.control.presented.color().1.is_identity());
-    assert!(device.control.presented.color().1.is_identity());
+    eventually(|| device.control.presented[0].color().1.is_identity());
+    assert!(device.control.presented[0].color().1.is_identity());
 }
 
 /// A `DISPLAY_COLOR` of display 0's transaction 1 carrying all of `stage`'s entries, each red,
@@ -3374,7 +3391,7 @@ fn a_kept_present_s_table_reaches_the_next_drawn_frame() {
         Arc::clone(&platform),
         &device.control.region,
         &shown,
-        &device.control.presented,
+        &device.control.presented[0],
     )
     .unwrap();
     let drawable = platform.texture_descriptor(&TextureDesc {
@@ -8793,9 +8810,7 @@ fn presents_waiting(device: &GraphicsDevice<FakePlatform>, n: usize) {
 /// The width of the texture the display shows; `None` for the scanout.
 fn shown_width(device: &GraphicsDevice<FakePlatform>) -> Option<u64> {
     use reims_vgpu_vulkan::core::platform::resource::Texture as _;
-    device
-        .control
-        .presented
+    device.control.presented[0]
         .texture
         .lock()
         .as_ref()
@@ -8887,9 +8902,7 @@ fn a_present_shown_at_a_completion_lets_go_of_the_texture_before_off_the_handler
         answered(&device, &mut guest, present_surface(0x77)),
         RGFX_STATUS_OK
     );
-    let shown = device
-        .control
-        .presented
+    let shown = device.control.presented[0]
         .shown()
         .expect("the surface shown")
         .0
@@ -9054,13 +9067,15 @@ fn a_presented_surface_s_block_waits_for_the_display() {
         Arc::clone(&platform),
         &device.control.region,
         &Arc::new(Shown::default()),
-        &device.control.presented,
+        &device.control.presented[0],
     )
     .unwrap();
     // With no window, the present is answered as it is shown.
     let status = answered(&device, &mut guest, present_surface(0x77));
     assert_eq!(status, RGFX_STATUS_OK);
-    let (drawable, _) = device.control.presented.shown().expect("the surface shown");
+    let (drawable, _) = device.control.presented[0]
+        .shown()
+        .expect("the surface shown");
     let rect = reims_vgpu_window::PixelRect {
         x: 0,
         y: 0,
@@ -9090,7 +9105,7 @@ fn a_presented_surface_s_block_waits_for_the_display() {
         "the release was answered while a window draw reads the surface"
     );
     // A draw from here reads nothing of the block: the guest set no scanout either.
-    assert!(device.control.presented.shown().is_none());
+    assert!(device.control.presented[0].shown().is_none());
     assert!(draw.encode(&drawable, rect, None).is_none());
 
     let world = platform.world();
@@ -9455,6 +9470,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
         memory_map: Some(map),
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     let in_place = RGFX_FEATURE_SURFACE_PAGES
@@ -9640,6 +9656,7 @@ fn doorbell_asks_is_offered_only_where_the_host_routes_doorbells_on_linux() {
             memory_map: None,
             guest_arch: GuestArch::X86_64,
             doorbell_pages: false,
+            ..GraphicsConfig::default()
         };
         let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
         let word = u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32;
@@ -10751,6 +10768,7 @@ fn surface_device(
         memory_map: Some(map),
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -11490,6 +11508,7 @@ fn on_vulkan_an_identity_colour_matrix_reads_as_no_colour() {
         memory_map: None,
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(platform, config).unwrap();
     let (width, height, stride) = (256usize, 4usize, 1024usize);
@@ -11541,7 +11560,7 @@ fn on_vulkan_an_identity_colour_matrix_reads_as_no_colour() {
         ]),
     );
     assert_eq!(answered(&device, &mut guest, keep()), RGFX_STATUS_OK);
-    assert!(device.control.presented.color().1.is_identity());
+    assert!(device.control.presented[0].color().1.is_identity());
     assert_eq!(read(), guest_pixels, "with the identity matrix");
 
     guest.send(
@@ -11660,7 +11679,7 @@ fn a_read_of_the_display_draws_what_it_shows() {
         answered(&device, &mut guest, present_surface(0x77)),
         RGFX_STATUS_OK
     );
-    let surface = Handle::clone_ref(&device.control.presented.shown().unwrap().0);
+    let surface = Handle::clone_ref(&device.control.presented[0].shown().unwrap().0);
     let mark = log.mark();
     assert_eq!(device.read_display(&mut dst), (mode, Ok(())));
     let copies: Vec<_> = (log.since(mark).into_iter())
@@ -11747,6 +11766,7 @@ fn on_vulkan_a_read_of_the_display_gives_the_scanout_s_pixels() {
         memory_map: None,
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(platform, config).unwrap();
     let (width, height, stride) = (64usize, 32usize, 256usize);
@@ -11843,6 +11863,7 @@ fn on_vulkan_a_read_at_an_odd_width_gives_the_scanout_row_for_row() {
         memory_map: None,
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(platform, config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -11907,9 +11928,7 @@ fn on_vulkan_a_read_at_an_odd_width_gives_the_scanout_row_for_row() {
             refresh_mhz: 60_000,
             scale_120ths: 0,
         };
-        let read = device
-            .read
-            .at_screen(Arc::new(reims_vgpu_graphics::FixedScreen(mode)));
+        let read = device.reads[0].at_screen(Arc::new(reims_vgpu_graphics::FixedScreen(mode)));
         for (name, messages, want) in &colours {
             if !messages.is_empty() {
                 for m in messages {
@@ -11948,6 +11967,7 @@ fn on_vulkan_a_presented_surface_at_an_odd_width_reads_row_for_row() {
         memory_map: None,
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(platform, config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -12040,9 +12060,7 @@ fn on_vulkan_a_presented_surface_at_an_odd_width_reads_row_for_row() {
             refresh_mhz: 60_000,
             scale_120ths: 0,
         };
-        let read = device
-            .read
-            .at_screen(Arc::new(reims_vgpu_graphics::FixedScreen(mode)));
+        let read = device.reads[0].at_screen(Arc::new(reims_vgpu_graphics::FixedScreen(mode)));
         for (name, rows, swapped) in [
             ("no colour", identity, false),
             ("red and blue swapped", swap, true),
@@ -12090,6 +12108,7 @@ fn one_queue_raising(
         memory_map: None,
         guest_arch: GuestArch::X86_64,
         doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);

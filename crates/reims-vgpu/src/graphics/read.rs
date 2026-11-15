@@ -4,7 +4,9 @@
 //! **What a read draws.** The window's own draw ([`ScanoutDraw::encode_shown`]): the guest's
 //! scanout, or the IOSurface its display pipe presents, through the display's colour, into a
 //! texture of the display's mode, the size the guest is told (the window's size in pixels, or
-//! 1920 × 1080 without a window), placed and clipped as in a drawable of that size. Where the
+//! 1920 × 1080 without a window, sized to the display's scanout room on a device of several
+//! displays: `reims-vgpu-graphics`' `display::offered_in_room`), placed and clipped as in a
+//! drawable of that size. Where the
 //! guest has no scanout and presents no surface the display shows black, and so does the read.
 //! While the display's panel is off (the guest's display asleep) the draw clears the texture to
 //! black, and the read is black whatever the guest shows.
@@ -22,6 +24,7 @@
 use std::sync::{Arc, OnceLock};
 
 use reims_vgpu_graphics::Screen;
+use reims_vgpu_graphics::display::offered_in_room;
 use reims_vgpu_graphics::region::Region;
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::command::CommandBuffer as _;
@@ -67,6 +70,8 @@ pub(crate) struct DisplayRead<P: ApiPlatform> {
     presented: Arc<Presented<P>>,
     /// The screen, whose mode a read has.
     screen: Arc<dyn Screen>,
+    /// How many displays the device has, whose rooms the mode is sized to.
+    displays: u32,
     /// The reads' draw, made at the first; `None` inside where the platform refused it.
     draw: OnceLock<Option<ScanoutDraw<P>>>,
     /// The last read's texture and its size: held through a read, so reads run one at a time.
@@ -74,14 +79,16 @@ pub(crate) struct DisplayRead<P: ApiPlatform> {
 }
 
 impl<P: ApiPlatform> DisplayRead<P> {
-    /// Reads of the display `screen` shows, over `region`, the scanout `shown` keeps and the
-    /// surfaces `presented` shows; nothing is made until the first read.
+    /// Reads of the display `screen` shows on a device of `displays` displays, over `region`, the
+    /// scanout `shown` keeps and the surfaces `presented` shows; nothing is made until the first
+    /// read.
     pub(crate) fn new(
         platform: &Arc<P>,
         region: &Arc<Region>,
         shown: &Arc<Shown>,
         presented: &Arc<Presented<P>>,
         screen: Arc<dyn Screen>,
+        displays: u32,
     ) -> DisplayRead<P> {
         DisplayRead {
             platform: Arc::clone(platform),
@@ -89,6 +96,7 @@ impl<P: ApiPlatform> DisplayRead<P> {
             shown: Arc::clone(shown),
             presented: Arc::clone(presented),
             screen,
+            displays,
             draw: OnceLock::new(),
             texture: Mutex::new(None),
         }
@@ -104,6 +112,7 @@ impl<P: ApiPlatform> DisplayRead<P> {
             &self.shown,
             &self.presented,
             screen,
+            self.displays,
         )
     }
 
@@ -113,7 +122,7 @@ impl<P: ApiPlatform> DisplayRead<P> {
     /// where `dst` holds fewer bytes; [`Error::Metal`] where the platform refuses the texture or
     /// the draw; [`Error::Gpu`] where the draw ended with an error. Waits for the draw on the GPU.
     pub(crate) fn read(&self, dst: &mut [u8]) -> ((u32, u32), Result<(), Error>) {
-        let mode = self.screen.mode();
+        let mode = offered_in_room(self.screen.mode(), self.displays);
         let size = (mode.width, mode.height);
         (size, self.read_at(size, dst))
     }

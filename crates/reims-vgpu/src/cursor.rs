@@ -22,3 +22,9 @@ pub type CursorGlyphFn = Arc<dyn Fn(&CursorGlyph<'_>) + Send + Sync>;
 pub type CursorShowFn = Arc<dyn Fn(u8) + Send + Sync>;
 /// The guest moved the cursor.
 pub type CursorMoveFn = Arc<dyn Fn() + Send + Sync>;
+/// `cursor_glyph` of a display past 0: `(display, glyph)`.
+pub type CursorGlyphAtFn = Arc<dyn Fn(u32, &CursorGlyph<'_>) + Send + Sync>;
+/// `cursor_show` of a display past 0: `(display, show)`.
+pub type CursorShowAtFn = Arc<dyn Fn(u32, u8) + Send + Sync>;
+/// `cursor_move` of a display past 0: `(display)`.
+pub type CursorMoveAtFn = Arc<dyn Fn(u32) + Send + Sync>;

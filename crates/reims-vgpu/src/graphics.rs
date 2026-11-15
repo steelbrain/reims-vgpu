@@ -28,6 +28,14 @@
 //!
 //! **Without a window** the display offers 1920 × 1080 at 60 Hz and shows nothing.
 //!
+//! **Several displays** ([`GraphicsConfig::display_count`], docs/graphics-kext/design.md,
+//! "Multiple displays"): each display has what display 0 has, its own window (display `i`'s on the
+//! window crate's port `i`, titled and placed as that port's), or none where display 0 has none,
+//! its own presented surface, colour, host's reads and host cursor, and its mode sized to its
+//! scanout room (`reims-vgpu-graphics`' `display::offered_in_room`). The presents of all of them
+//! share one queue, each display's in its own order ([`PresentQueue`]). A device of one display
+//! is what a device was before the count.
+//!
 //! **The host is told the guest's cursor**, with a window or without one, where it takes it
 //! ([`GraphicsCallbacks`]' `cursor_*`, [`HostCursor`]): its image, whether it shows and where the
 //! guest put its hot spot, on the display thread. QEMU's console draws it for QEMU's own displays.
@@ -59,13 +67,13 @@ use reims_vgpu_graphics::wire::{
     RGFX_CMD_RATE_MAP_QUERY, RGFX_CMD_RATE_MAP_RESET, RGFX_CMD_RENDER_PIPELINE_CREATE,
     RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_IMPORT, RGFX_CMD_SHARED_EVENT_NAME,
     RGFX_CMD_SHARED_EVENT_UNNAME, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET,
-    RGFX_EVT_FUNCTION_POINTER_STATE, RGFX_EVT_ICB_STATE, RGFX_EVT_RATE_MAP_ANSWER,
-    RGFX_EVT_RATE_MAP_STATE, RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED,
-    RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_DISPLAY_COLOR, RGFX_FEATURE_DISPLAY_POWER,
-    RGFX_FEATURE_DISPLAY_SCALE, RGFX_FEATURE_DOORBELL_ASKS, RGFX_FEATURE_DOORBELL_PAGES,
-    RGFX_FEATURE_DYNAMIC_LIBRARIES, RGFX_FEATURE_FUNCTION_POINTERS, RGFX_FEATURE_GUEST_TIMES,
-    RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_HOST_TIME, RGFX_FEATURE_ICB_SLOTS,
-    RGFX_FEATURE_ICB_SLOTS_IN_PAGES, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
+    RGFX_DISPLAYS_MAX, RGFX_EVT_FUNCTION_POINTER_STATE, RGFX_EVT_ICB_STATE,
+    RGFX_EVT_RATE_MAP_ANSWER, RGFX_EVT_RATE_MAP_STATE, RGFX_EVT_SAMPLER_STATE,
+    RGFX_FEATURE_CB_SUBMITTED, RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_DISPLAY_COLOR,
+    RGFX_FEATURE_DISPLAY_POWER, RGFX_FEATURE_DISPLAY_SCALE, RGFX_FEATURE_DOORBELL_ASKS,
+    RGFX_FEATURE_DOORBELL_PAGES, RGFX_FEATURE_DYNAMIC_LIBRARIES, RGFX_FEATURE_FUNCTION_POINTERS,
+    RGFX_FEATURE_GUEST_TIMES, RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_HOST_TIME,
+    RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_ICB_SLOTS_IN_PAGES, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
     RGFX_FEATURE_MANAGED_AT_OFFSET, RGFX_FEATURE_MANAGED_BUFFER_SLABS,
     RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE,
     RGFX_FEATURE_PAGES_16K, RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PIPELINE_ANSWERS,
@@ -103,7 +111,10 @@ use reims_vgpu_window::{FrameSink, Window, WindowConfig, geometry};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::DefaultPlatform;
-use crate::cursor::{CursorGlyph, CursorGlyphFn, CursorMoveFn, CursorShowFn};
+use crate::cursor::{
+    CursorGlyph, CursorGlyphAtFn, CursorGlyphFn, CursorMoveAtFn, CursorMoveFn, CursorShowAtFn,
+    CursorShowFn,
+};
 use crate::entry;
 use crate::entry::no_catch;
 use crate::error::Error;
@@ -193,8 +204,8 @@ fn offers_doorbell_asks(callbacks: &GraphicsCallbacks) -> bool {
 /// A graphics device's callbacks. `raise_interrupt` is called on the thread that posts the event
 /// it raises for: the device's control thread (`reims-vgpu.graphics-control`), one of ring 0's
 /// threads (`reims-vgpu.graphics-ring0-<i>`), which carry out a guest process's control messages,
-/// its presents and a block's pages and downloads, each on its lane, its refresh thread, a command
-/// queue's service thread (`reims-vgpu.graphics-queue-<id>`) or one of its lane's threads
+/// its presents and a block's pages and downloads, each on its lane, a display's refresh thread, a
+/// command queue's service thread (`reims-vgpu.graphics-queue-<id>`) or one of its lane's threads
 /// (`reims-vgpu.graphics-lane-<id>`), a pipeline compile's thread
 /// (`reims-vgpu.graphics-compile-<n>`), the surface worker (`reims-vgpu.graphics-surfaces-<i>`),
 /// the indirect command buffers' worker (`reims-vgpu.icb-create-<i>`), the worker that lets go of
@@ -216,7 +227,8 @@ fn offers_doorbell_asks(callbacks: &GraphicsCallbacks) -> bool {
 /// `platform` module's), one at a time with every display callback of the process, in the order
 /// the device took the guest's cursor commands and resets (`HostCursor`): never inside a call of
 /// the host's, and the device never waits for them. The guest sees nothing of whether the host
-/// takes them.
+/// takes them. They are display 0's; the `_at` three are those of displays 1 and up, which name
+/// the display, called as they are, in order with them.
 #[derive(Clone, Default)]
 pub struct GraphicsCallbacks {
     /// Raises the device's interrupt. Without it the guest gets no interrupt.
@@ -229,6 +241,13 @@ pub struct GraphicsCallbacks {
     pub cursor_show: Option<CursorShowFn>,
     /// The guest moved its cursor: [`GraphicsDevice::cursor_position`] reads where.
     pub cursor_move: Option<CursorMoveFn>,
+    /// `cursor_glyph` of display 1 and up, `(display, glyph)`.
+    pub cursor_glyph_at: Option<CursorGlyphAtFn>,
+    /// `cursor_show` of display 1 and up, `(display, show)`.
+    pub cursor_show_at: Option<CursorShowAtFn>,
+    /// `cursor_move` of display 1 and up, `(display)`: [`GraphicsDevice::cursor_position_at`]
+    /// reads where.
+    pub cursor_move_at: Option<CursorMoveAtFn>,
     /// Routes a command queue's plain doorbell into its bell, or drops the route. Without it every
     /// doorbell write comes through [`GraphicsDevice::mmio_write_taking`].
     pub route_doorbell: Option<GraphicsRouteDoorbellFn>,
@@ -244,8 +263,17 @@ pub struct GraphicsConfig {
     /// Its callbacks.
     pub callbacks: GraphicsCallbacks,
     /// The display's window: its input callbacks and the mode it opens sized for; `None` is no
-    /// window. The window keeps its size whatever this says (the module doc).
+    /// window. The window keeps its size whatever this says (the module doc). Display 0's on a
+    /// device of several displays.
     pub window: Option<WindowConfig>,
+    /// How many displays the device has: 0 and 1 are one display, as a config made before the
+    /// field has; 2 to `RGFX_DISPLAYS_MAX` (4) make a device of that many, which offers the
+    /// guest `RGFX_FEATURE_MULTI_DISPLAY`. Any other count is [`Error::InvalidArgument`].
+    pub display_count: u32,
+    /// The windows of displays 1 to `display_count - 1`, given exactly where
+    /// [`Self::window`] is: `display_count - 1` of them with it, none without it; otherwise
+    /// [`Error::InvalidArgument`].
+    pub display_windows: Vec<WindowConfig>,
     /// The guest's RAM, with the files behind it, through which the GPU uses an IOSurface's own
     /// pages in place (`RGFX_FEATURE_SURFACE_PAGES`, where the host's page is the guest's 4 KiB, or
     /// 16 KiB for a guest that takes `RGFX_FEATURE_PAGES_16K`); `None` keeps each surface's GPU
@@ -318,23 +346,45 @@ const FALLBACK_MODE: Mode = Mode {
     scale_120ths: 0,
 };
 
+/// The displays `config` makes ([`GraphicsConfig::display_count`]): 0 and 1 are one;
+/// [`Error::InvalidArgument`] for a count past `RGFX_DISPLAYS_MAX`, or display windows that are
+/// not one for each display from 1 where display 0 has a window, and none where it has none.
+fn display_count(config: &GraphicsConfig) -> Result<usize, Error> {
+    let count = config.display_count.max(1);
+    if count > RGFX_DISPLAYS_MAX {
+        return Err(Error::InvalidArgument);
+    }
+    let count = count as usize;
+    let windows = if config.window.is_some() {
+        count - 1
+    } else {
+        0
+    };
+    if config.display_windows.len() != windows {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(count)
+}
+
 /// The reims-graphics device.
 pub struct GraphicsDevice<P: ApiPlatform = DefaultPlatform> {
-    /// The window, which closes when the link drops: before the device.
-    window: Option<WindowLink>,
+    /// The displays' windows, display `i`'s at index `i`, none without them, which close when
+    /// their links drop: before the device.
+    windows: Vec<WindowLink>,
     /// The device.
     device: reims_vgpu_graphics::Device,
-    /// The guest's cursor as the host is told it.
-    cursor: Arc<HostCursor>,
+    /// Each display's guest cursor as the host is told it, display `i`'s at index `i`.
+    cursors: Vec<Arc<HostCursor>>,
     /// The stage-3 decoder and the device handle it drives, shared with the device's [`Host`],
     /// which feeds it the control ring's stage-3 messages; held here for the tests' look at it.
     #[cfg(any(test, feature = "testkit"))]
     control: Arc<GraphicsControl<P>>,
-    /// What the window shows, where there is one: the tests draw it.
+    /// What display 0's window shows, where there is one: the tests draw it.
     #[cfg(test)]
     shown: Option<Arc<Shown>>,
-    /// The host's reads of what the display shows ([`GraphicsDevice::read_display`]).
-    read: DisplayRead<P>,
+    /// The host's reads of what each display shows ([`GraphicsDevice::read_display_at`]),
+    /// display `i`'s at index `i`.
+    reads: Vec<DisplayRead<P>>,
     /// The stage-3 decoder's state while it lives: once the device ended, what holds the GPU
     /// device until its threads, its objects and their GPU work let go ([`ENDING`]).
     ending: Weak<GraphicsControl<P>>,
@@ -358,7 +408,7 @@ impl<P: ApiPlatform> std::fmt::Debug for GraphicsDevice<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GraphicsDevice")
             .field("device", &self.device)
-            .field("window", &self.window.is_some())
+            .field("windows", &self.windows.len())
             .finish()
     }
 }
@@ -376,6 +426,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
     /// (none, or one its driver refused).
     pub fn with_platform(platform: Arc<P>, config: GraphicsConfig) -> Result<Self, Error> {
         entry::run(|_| {
+            let count = display_count(&config)?;
             let size = usize::try_from(reims_vgpu_graphics::REGION_SIZE)
                 .map_err(|_| Error::HostResources)?;
             let region = platform
@@ -595,9 +646,14 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 }
                 decoder.set_video(video);
             }
-            let clock = Arc::clone(&platform);
-            let presented = Arc::new(Presented::new(Box::new(move || clock.clock().now_mono())));
-            let presents = Arc::new(PresentQueue::new(Arc::clone(&presented)));
+            // Each display's presented surface, display `i`'s at index `i`.
+            let presented: Vec<Arc<Presented<P>>> = (0..count)
+                .map(|_| {
+                    let clock = Arc::clone(&platform);
+                    Arc::new(Presented::new(Box::new(move || clock.clock().now_mono())))
+                })
+                .collect();
+            let presents = Arc::new(PresentQueue::new(presented.clone()));
             // A present that waits for its surface's fill is shown as the fill finishes.
             let waiting = Arc::downgrade(&presents);
             decoder.on_fill_done(Arc::new(move || {
@@ -612,7 +668,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 presents,
                 queue_sinks: RwLock::default(),
                 presented,
-                color: Mutex::default(),
+                colors: (0..count).map(|_| Mutex::default()).collect(),
                 pool,
                 pending: Pending::default(),
                 answers,
@@ -623,7 +679,12 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 reset_gate: Arc::default(),
                 inline_walk_max: AtomicUsize::new(INLINE_WALK_MAX),
             });
-            let cursor = Arc::new(HostCursor::new(&platform, &config.callbacks));
+            let cursors: Vec<Arc<HostCursor>> = (0..count)
+                .map(|display| {
+                    let (glyph, show, moved) = display_cursor(&config.callbacks, display);
+                    Arc::new(HostCursor::new(&platform, glyph, show, moved))
+                })
+                .collect();
             let host = Box::new(CallbackHost {
                 callbacks: config.callbacks,
                 features,
@@ -631,52 +692,72 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 deferred_budget,
                 control: Arc::clone(&control),
             });
-            let (window, screen, shown): (Option<WindowLink>, Arc<dyn Screen>, Arc<Shown>) =
-                match config.window {
+            // Display 0's window, then those of displays 1 and up, or none.
+            let window_configs: Vec<Option<WindowConfig>> = match config.window {
+                Some(first) => std::iter::once(first)
+                    .chain(config.display_windows)
+                    .map(Some)
+                    .collect(),
+                None => (0..count).map(|_| None).collect(),
+            };
+            let displays = u32::try_from(count).unwrap_or(u32::MAX);
+            let mut windows = Vec::new();
+            let mut screens: Vec<Box<dyn Screen>> = Vec::with_capacity(count);
+            let mut reads = Vec::with_capacity(count);
+            let mut first_shown = None;
+            for (display, window_config) in window_configs.into_iter().enumerate() {
+                let (screen, shown): (Arc<dyn Screen>, Arc<Shown>) = match window_config {
                     Some(window_config) => {
                         let (link, screen) = WindowScreen::open(
                             &platform,
                             &region,
-                            &control.presented,
+                            &control.presented[display],
                             window_config,
+                            display.to_u64(),
                         );
+                        windows.push(link);
                         let shown = Arc::clone(&screen.shown);
-                        (Some(link), Arc::new(screen), shown)
+                        (Arc::new(screen), shown)
                     }
                     None => {
                         let shown = Arc::new(Shown::default());
                         let screen = HeadlessScreen {
                             shown: Arc::clone(&shown),
                         };
-                        (None, Arc::new(screen), shown)
+                        (Arc::new(screen), shown)
                     }
                 };
-            let read = DisplayRead::new(
-                &platform,
-                &region,
-                &shown,
-                &control.presented,
-                Arc::clone(&screen),
-            );
+                reads.push(DisplayRead::new(
+                    &platform,
+                    &region,
+                    &shown,
+                    &control.presented[display],
+                    Arc::clone(&screen),
+                    displays,
+                ));
+                first_shown.get_or_insert(shown);
+                screens.push(Box::new(SharedScreen {
+                    screen,
+                    cursor: Arc::clone(&cursors[display]),
+                }));
+            }
             #[cfg(test)]
-            let shown = window.is_some().then_some(shown);
-            let screen = SharedScreen {
-                screen,
-                cursor: Arc::clone(&cursor),
-            };
-            let device = reims_vgpu_graphics::Device::new(region, host, Box::new(screen))
+            let shown = first_shown.filter(|_| !windows.is_empty());
+            #[cfg(not(test))]
+            drop(first_shown);
+            let device = reims_vgpu_graphics::Device::with_screens(region, host, screens)
                 .ok_or(Error::HostResources)?;
             LIVE.fetch_add(1, Ordering::SeqCst);
             Ok(GraphicsDevice {
-                window,
+                windows,
                 device,
-                cursor,
+                cursors,
                 ending: Arc::downgrade(&control),
                 #[cfg(any(test, feature = "testkit"))]
                 control,
                 #[cfg(test)]
                 shown,
-                read,
+                reads,
                 platform: PhantomData,
             })
         })
@@ -751,7 +832,24 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
     /// on the GPU, and for no lock a callback of the device's may wait on; the guest sees
     /// nothing of it.
     pub fn read_display(&self, dst: &mut [u8]) -> ((u32, u32), Result<(), Error>) {
-        entry::run(|_| self.read.read(dst))
+        self.read_display_at(0, dst)
+    }
+
+    /// [`Self::read_display`] of display `display`, at its own mode, the one the guest is told
+    /// (sized to its scanout room on a device of several displays); display 0's is
+    /// `read_display`. [`Error::InvalidArgument`], with nothing written and a size of (0, 0),
+    /// for a display at or past the device's count.
+    pub fn read_display_at(&self, display: u32, dst: &mut [u8]) -> ((u32, u32), Result<(), Error>) {
+        entry::run(|_| match self.reads.get(display as usize) {
+            Some(read) => read.read(dst),
+            None => ((0, 0), Err(Error::InvalidArgument)),
+        })
+    }
+
+    /// How many displays the device has: 1 to `RGFX_DISPLAYS_MAX`
+    /// ([`GraphicsConfig::display_count`]).
+    pub fn display_count(&self) -> u32 {
+        u32::try_from(self.reads.len()).unwrap_or(u32::MAX)
     }
 
     /// A 32-bit read of BAR 0 at `offset`.
@@ -804,16 +902,26 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
     /// to 0 to 65535: (0, 0) before it moved it and after a reset. The host reads it at its
     /// `cursor_move` ([`GraphicsCallbacks`]).
     pub fn cursor_position(&self) -> (u16, u16) {
-        entry::run(|_| self.cursor.position())
+        self.cursor_position_at(0)
+    }
+
+    /// [`Self::cursor_position`] of display `display`, in its pixels, which the host reads at its
+    /// `cursor_move_at` ([`GraphicsCallbacks`]); display 0's is `cursor_position`. (0, 0) for a
+    /// display at or past the device's count.
+    pub fn cursor_position_at(&self, display: u32) -> (u16, u16) {
+        entry::run(|_| {
+            (self.cursors.get(display as usize)).map_or((0, 0), |cursor| cursor.position())
+        })
     }
 }
 
 impl<P: ApiPlatform> Drop for GraphicsDevice<P> {
-    /// The window closes, then the device ends; neither waits (`reims-vgpu-graphics`'s `device`).
-    /// The device no longer counts among those alive ([`GraphicsDevice::let_go_of_gpu`]).
+    /// The windows close, display 0's first, then the device ends; neither waits
+    /// (`reims-vgpu-graphics`'s `device`). The device no longer counts among those alive
+    /// ([`GraphicsDevice::let_go_of_gpu`]).
     fn drop(&mut self) {
         entry::run(|_| {
-            drop(self.window.take());
+            drop(std::mem::take(&mut self.windows));
         });
         let ending: Weak<dyn std::any::Any + Send + Sync> = self.ending.clone();
         let mut ended = ENDING.lock();
@@ -880,17 +988,19 @@ struct GraphicsControl<P: ApiPlatform> {
     decoders: Decoders<P>,
     /// The GPU device it drives.
     device: P::Device,
-    /// The surface the display pipe shows, shared with the window's sink.
-    presented: Arc<Presented<P>>,
+    /// The surface each display's pipe shows, shared with its window's sink, display `i`'s at
+    /// index `i`.
+    presented: Vec<Arc<Presented<P>>>,
     /// The presents waiting for the command buffers that write their surfaces.
     presents: Arc<PresentQueue<P>>,
     /// By queue id: the sinks a command queue's buffers are begun with, and the poster they were
     /// made for ([`Self::queue_sinks`]). An entry goes with its queue's destroy, its context's
     /// close or the device's reset.
     queue_sinks: RwLock<HashMap<u64, (CompletionPoster, Sinks)>>,
-    /// The display colour's `DISPLAY_COLOR` parts staged since the last present, which the next
-    /// one takes (`color`): on the presents' lane, in ring order with the presents.
-    color: Mutex<ColorStaging>,
+    /// Each display colour's `DISPLAY_COLOR` parts staged since the display's last present, which
+    /// its next one takes (`color`): on the presents' lane, in ring order with the presents.
+    /// Display `i`'s at index `i`.
+    colors: Vec<Mutex<ColorStaging>>,
     /// The threads ring 0's pipeline and library creates compile on (`compile`, `make`).
     pool: CompilePool,
     /// The pipelines being compiled, which a command buffer naming one waits for.
@@ -1388,11 +1498,15 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 }
                 self.presents.reset();
                 self.queue_sinks.write().clear();
-                self.color.lock().reset();
+                for color in &self.colors {
+                    color.lock().reset();
+                }
                 self.decoders.reset_done();
                 (contexts, dropped)
             };
-            self.presented.reset();
+            for presented in &self.presented {
+                presented.reset();
+            }
             log::info!(
                 target: "reims_vgpu::graphics",
                 "the device was reset: {dropped} objects of {} contexts dropped",
@@ -1425,11 +1539,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             answer.answer(RGFX_STATUS_REFUSED);
             return;
         }
-        let answer = self.presented.after_shown(
-            release.offset,
-            release.size,
-            Box::new(move || answer.answer(RGFX_STATUS_OK)),
-        );
+        // Once no display shows or draws a surface over the block.
+        let answer: DrainAnswer = Box::new(move || answer.answer(RGFX_STATUS_OK));
+        let answer = (self.presented.iter()).fold(answer, |answer, presented| {
+            presented.after_shown(release.offset, release.size, answer)
+        });
         let answer = decoder.after_unshares(release.offset, answer);
         let drain = decoder.drain_context(release.context, false, answer);
         // No buffer lies over the block's surface view any more: it goes with the block, and its
@@ -2739,16 +2853,29 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         });
     }
 
-    /// Shows the IOSurface `iosurface_id` (0: the scanout) once the command buffers committed that
-    /// write its copy have finished, after the presents before it ([`PresentQueue`]), with the
-    /// colour stages staged since the last present ([`ColorStaging::take`]), answering once the
-    /// window shows it; answered invalid at once, with nothing changed and the colour still
-    /// staged, where the decoder holds no texture over it.
-    fn present_surface(&self, iosurface_id: u32, generation: Option<u64>, answer: PresentAnswer) {
+    /// Shows the IOSurface `iosurface_id` (0: the scanout) on display `display` once the command
+    /// buffers committed that write its copy have finished, after the display's presents before
+    /// it ([`PresentQueue`]), with the colour stages staged for it since its last present
+    /// ([`ColorStaging::take`]), answering once its window shows it; answered invalid at once,
+    /// with nothing changed and the colour still staged, where the decoder holds no texture over
+    /// it, or the device has no such display (which the device never hands on).
+    fn present_surface(
+        &self,
+        display: usize,
+        iosurface_id: u32,
+        generation: Option<u64>,
+        answer: PresentAnswer,
+    ) {
+        let (Some(presented), Some(staging)) =
+            (self.presented.get(display), self.colors.get(display))
+        else {
+            answer.answer(RGFX_STATUS_INVALID_ARGUMENT);
+            return;
+        };
         if iosurface_id == 0 {
-            let color = self.color.lock().take();
+            let color = staging.lock().take();
             self.presents
-                .present(0, None, color, answer, Vec::new(), None);
+                .present(display, 0, None, color, answer, Vec::new(), None);
             return;
         }
         let decoder = self.decoder();
@@ -2780,27 +2907,42 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 self.pool.favour(owner);
                 // Its block is held from here, before the texture's destroy and the block's
                 // release can come: the present shows it later.
-                let shown = self.presented.hold(texture, span);
-                let color = self.color.lock().take();
-                self.presents
-                    .present(iosurface_id, Some(shown), color, answer, writers, fill);
+                let shown = presented.hold(texture, span);
+                let color = staging.lock().take();
+                self.presents.present(
+                    display,
+                    iosurface_id,
+                    Some(shown),
+                    color,
+                    answer,
+                    writers,
+                    fill,
+                );
             }
             None => answer.answer(RGFX_STATUS_INVALID_ARGUMENT),
         }
     }
 
-    /// A present that keeps what the display shows (`RGFX_PRESENT_KEEP`), with the colour stages
-    /// staged since the last present, after the presents before it, answered once the window
-    /// shows it.
-    fn present_kept(&self, answer: PresentAnswer) {
-        let color = self.color.lock().take();
-        self.presents.present_kept(color, answer);
+    /// A present that keeps what display `display` shows (`RGFX_PRESENT_KEEP`), with the colour
+    /// stages staged for it since its last present, after its presents before it, answered once
+    /// its window shows it; at once where the device has no such display (which the device never
+    /// hands on).
+    fn present_kept(&self, display: usize, answer: PresentAnswer) {
+        let Some(staging) = self.colors.get(display) else {
+            answer.answer(RGFX_STATUS_OK);
+            return;
+        };
+        let color = staging.lock().take();
+        self.presents.present_kept(display, color, answer);
     }
 
-    /// One `DISPLAY_COLOR` part, staged for the next present ([`ColorStaging::part`]); one the
-    /// staging refuses is logged.
+    /// One `DISPLAY_COLOR` part, staged for its display's next present ([`ColorStaging::part`]);
+    /// one the staging refuses is logged.
     fn display_color(&self, color: &RgfxDisplayColor, entries: &[RgfxColorEntry]) {
-        if let Err(dropped) = self.color.lock().part(color, entries) {
+        let Some(staging) = self.colors.get(color.display as usize) else {
+            return;
+        };
+        if let Err(dropped) = staging.lock().part(color, entries) {
             log::warn!(
                 target: "reims_vgpu::graphics", kind:? = dropped;
                 "a display colour part of transaction {} (stage {}, entries {} on of {}, {} \
@@ -2896,15 +3038,21 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         reims_vgpu_vulkan::answer::count_kind(kind.code());
     }
 
-    fn present_surface(&self, iosurface_id: u32, generation: Option<u64>, answer: PresentAnswer) {
+    fn present_surface(
+        &self,
+        display: u32,
+        iosurface_id: u32,
+        generation: Option<u64>,
+        answer: PresentAnswer,
+    ) {
         stepped(|| {
             self.control
-                .present_surface(iosurface_id, generation, answer);
+                .present_surface(display as usize, iosurface_id, generation, answer);
         });
     }
 
-    fn present_keep(&self, answer: PresentAnswer) {
-        stepped(|| self.control.present_kept(answer));
+    fn present_keep(&self, display: u32, answer: PresentAnswer) {
+        stepped(|| self.control.present_kept(display as usize, answer));
     }
 
     fn display_color(&self, color: &RgfxDisplayColor, entries: &[RgfxColorEntry]) {
@@ -2915,8 +3063,10 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         self.control.decoder().surface_textures(iosurface_id)
     }
 
-    fn refreshed(&self) {
-        stepped(|| self.control.presented.refreshed());
+    fn refreshed(&self, display: u32) {
+        if let Some(presented) = self.control.presented.get(display as usize) {
+            stepped(|| presented.refreshed());
+        }
     }
 
     fn context_closed(&self, context: u32, answer: CompleteAnswer) {
@@ -3179,17 +3329,54 @@ struct HostCursor {
     position: AtomicU32,
 }
 
+/// The host's cursor callbacks of display `display` among `callbacks`: display 0's
+/// `cursor_glyph`, `cursor_show` and `cursor_move`, and another display's the `_at` three, which
+/// name it.
+fn display_cursor(
+    callbacks: &GraphicsCallbacks,
+    display: usize,
+) -> (
+    Option<CursorGlyphFn>,
+    Option<CursorShowFn>,
+    Option<CursorMoveFn>,
+) {
+    if display == 0 {
+        return (
+            callbacks.cursor_glyph.clone(),
+            callbacks.cursor_show.clone(),
+            callbacks.cursor_move.clone(),
+        );
+    }
+    let at = u32::try_from(display).unwrap_or(u32::MAX);
+    let glyph = callbacks.cursor_glyph_at.clone().map(|f| {
+        let f: CursorGlyphFn = Arc::new(move |glyph: &CursorGlyph<'_>| f(at, glyph));
+        f
+    });
+    let show = callbacks.cursor_show_at.clone().map(|f| {
+        let f: CursorShowFn = Arc::new(move |show| f(at, show));
+        f
+    });
+    let moved = callbacks.cursor_move_at.clone().map(|f| {
+        let f: CursorMoveFn = Arc::new(move || f(at));
+        f
+    });
+    (glyph, show, moved)
+}
+
 impl HostCursor {
-    /// The host's cursor callbacks of `callbacks`, run on `platform`'s display thread, which is
-    /// made here where the host takes any.
-    fn new<P: ApiPlatform>(platform: &Arc<P>, callbacks: &GraphicsCallbacks) -> HostCursor {
-        let takes = callbacks.cursor_glyph.is_some()
-            || callbacks.cursor_show.is_some()
-            || callbacks.cursor_move.is_some();
+    /// A display's host cursor, with the host's callbacks `glyph`, `show` and `moved`, run on
+    /// `platform`'s display thread, which is made here where the host takes any.
+    fn new<P: ApiPlatform>(
+        platform: &Arc<P>,
+        glyph: Option<CursorGlyphFn>,
+        show: Option<CursorShowFn>,
+        moved: Option<CursorMoveFn>,
+    ) -> HostCursor {
+        let takes = glyph.is_some() || show.is_some() || moved.is_some();
         HostCursor {
-            glyph: callbacks.cursor_glyph.clone(),
-            show: callbacks.cursor_show.clone(),
-            moved: callbacks.cursor_move.clone(),
+            glyph,
+            show,
+            moved,
             queue: takes.then(|| api_state(platform).display_thread(platform)),
             state: Mutex::new(CursorState {
                 image: false,
@@ -3344,24 +3531,27 @@ impl Screen for SharedScreen {
 }
 
 impl WindowScreen {
-    /// The window of a display over `region`, opened with its sink on `platform` where the
-    /// platform draws one (no sink: the window never opens), and the screen over it.
+    /// The window of the display on `port` (its id) over `region`, opened with its sink on
+    /// `platform` where the platform draws one (no sink: the window never opens), and the screen
+    /// over it. The window is titled as the port's, and opens on the port's host screen
+    /// (`reims-vgpu-window`'s `handle::title` and `screens::screen_for_port`).
     fn open<P: ApiPlatform>(
         platform: &Arc<P>,
         region: &Arc<Region>,
         presented: &Arc<Presented<P>>,
         mut config: WindowConfig,
+        port: u64,
     ) -> (WindowLink, WindowScreen) {
         config.keeps_its_size = true;
         let first = config.mode.unwrap_or((1920, 1080));
-        let window = Window::new(config, 0, reims_vgpu_window::handle::title(0));
+        let window = Window::new(config, port, reims_vgpu_window::handle::title(port));
         window.offered_mode(first.0, first.1);
         // In the crate's tests the display runs at 60 Hz, asking the host for no screen: on Linux
         // the ask starts the windows' UI thread.
         let refresh_mhz = if cfg!(test) {
             FALLBACK_MODE.refresh_mhz
         } else {
-            reims_vgpu_window::screens::screen_for_port(0)
+            reims_vgpu_window::screens::screen_for_port(port)
                 .map_or(FALLBACK_MODE.refresh_mhz, |s| hz_to_mhz(s.refresh_hz))
         };
         let shown = Arc::new(Shown::default());

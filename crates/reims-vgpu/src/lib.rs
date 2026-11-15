@@ -33,7 +33,10 @@ pub mod singleton;
 mod video;
 mod window;
 
-pub use cursor::{CursorGlyph, CursorGlyphFn, CursorMoveFn, CursorShowFn};
+pub use cursor::{
+    CursorGlyph, CursorGlyphAtFn, CursorGlyphFn, CursorMoveAtFn, CursorMoveFn, CursorShowAtFn,
+    CursorShowFn,
+};
 pub use error::Error;
 pub use graphics::{
     GraphicsCallbacks, GraphicsConfig, GraphicsDevice, GraphicsRaiseFn, GraphicsRouteDoorbellFn,
