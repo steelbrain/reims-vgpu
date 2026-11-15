@@ -689,6 +689,63 @@ SPI makes a 2D array as the M3 does *(class 2)*, its slices where the M3 lays th
 (`rgfxBufferSlicePitch`), and a view of more than one of its slices answers nil, which Metal
 asserts at on the M3 Max and an M4 (`sliceRange.length == 1`, measured by metal2vulkan).
 
+
+**Texels past the buffer's length.** Probe: `oracle_pastlen DEVICE paths` and `oracle_pastlen
+DEVICE limits`, 11-15: the M3 Max under macOS 27.0.1 as arm64 (m3-max-32055, and its bounds
+m3-max-32081, 32093 and 32098) and as x86_64 under Rosetta (m3-max-32056), the AMD 5300M
+(m3-max-32058) and the Intel 630 (m3-max-32057) under macOS 26.7.1. Each `paths` texture is
+R32Uint over a buffer whose words name their offsets, made beside 128 neighbour buffers of 4096
+bytes whose words name theirs, so a texel read names the byte it came from. Each path runs in a
+process of its own: a kernel's `read()`, a blit to a buffer and `getBytes:`, and the writes a
+kernel's `write()`, a blit from a buffer and `replaceRegion:`, each write read back by the three
+reads.
+
+| texels past the length | AMD 5300M | Intel 630 | M3 Max |
+|---|---|---|---|
+| inside the buffer's allocation (the x86 GPUs' `allocatedSize`, the length rounded up to 4 KiB; the M3's `resourceSize`, the bounds below) | one memory: zero at first, and each read sees each write, a Managed buffer's two copies meeting at `synchronizeResource:` | the same | the same; past a 4096-byte buffer, whose `allocatedSize` is 4096, the next buffer's bytes in its pool, 4096 bytes on, which every path reads and writes alike; under Rosetta, where a buffer of 4096 bytes or more lies alone, zero |
+| past the allocation | the CPU's paths reach the next allocation of the process's memory (`contents` + 4096 in a 4096-byte buffer); the GPU's reads see zero, its own writes or a word an earlier process wrote, never the CPU's; a blit of a 2D texture there fails (`kIOAccelCommandBufferCallbackErrorTimeout`), and the queue's later command buffers are ignored, while a texture buffer's blits read and write as its kernels do | the CPU's as the AMD's; the GPU's reach a page every process shares, holding words earlier processes wrote, so a kernel reads a blit's or a kernel's write back, but not `replaceRegion:`'s, and `getBytes:` reads the next allocation, not the GPU's writes | no such texture is made (the bounds below) |
+| a no-copy buffer whose bytes end at the end of the process's mapping (the next page `PROT_NONE`) | the CPU's paths die on SIGBUS; the GPU's as past the allocation | the same | 4096 bytes at a 16 KiB page's end: the CPU's paths die on SIGBUS, and the GPU's read zero and lose their writes; under Rosetta, 4096 bytes at a 4 KiB page's end, the GPU's keep their own writes |
+
+Inside the allocation every GPU keeps one memory *(class 3)*. Past it the x86 Macs keep two that
+disagree, the CPU's another allocation's or a fault and the GPU's a page of their own, and the
+M3 makes no texture *(class 2)*. Past the process's mapping, inside a no-copy buffer's
+allocation, every GPU keeps two, the CPU's a fault *(class 3)*.
+
+| which such textures Metal makes (`limits`) | AMD 5300M | Intel 630 | M3 Max, arm64 | M3 Max, Rosetta |
+|---|---|---|---|---|
+| a texture buffer, a 2D texture by the public form and by the linear SPI, over a buffer of 16 bytes to 256 KiB by `newBufferWithLength:` (Shared, Managed, Private) or `newBufferWithBytes:`, at each position in its pool | made at every end bisected: 16 MiB from the buffer's start for a texture buffer, 4 MiB for a 2D texture | the same | nil past the buffer's `resourceSize` (SPI) from its start: 128 KiB for a buffer under 16 KiB, the length rounded up to 16 KiB for the rest | the same, but 128 KiB for a buffer under 4096 bytes alone, 16 KiB for one of 4096 to 16384 |
+| the same over a Shared heap's buffer, a heap of 4 MiB | no Shared heap ("Shared storage mode disallowed") | the same | nil past the heap's size from the buffer's start, wherever the buffer lies in it | the same |
+| the same over a no-copy buffer, at a page's start or 4096 bytes short of a page's end | made at every end bisected | the same | nil past `resourceSize` from the buffer's start, the size of the 16 KiB pages its bytes meet: 16 KiB for 4096 bytes at a page's end, so a texture over them is made 12 KiB into the next page, and 32 KiB for 4097 bytes there | the same |
+| what the end is | | | a 2D texture's and a texture buffer's last texel, whatever the rows' bytes past it (rows 4096 bytes past a texture buffer's texels; a 2D texture's rows 512 bytes apart from 256); a linear 2D array's last slice's end, each slice its rows' bytes rounded up to 128 apart, its last texel inside the bound or not (2 slices of 64 x 127 R32Uint rows 512 apart from 256 made in a 4096-byte buffer, of 64 x 128 nil) | the same |
+
+The AMD also answers nil for a 2D R32Uint texture 64 wide, rows 512 bytes apart, of 2 rows or more,
+over every buffer, inside its length too, which the Intel makes; that is not about the length,
+and the device makes it, as the Intel does *(class 2)*.
+
+Our stack: the host's platform keeps a texture's bytes past its buffer's length in a tail of the
+texture's own, zero when made, which every GPU path reads and writes (metal2vulkan's
+`linear_plan.rs`, "Length"), while the guest's memory past the buffer is another allocation's or
+none. The bundle's `getBytes:` and `replaceRegion:` copy the bytes inside the length in place,
+and those past it by a blit on the device's copy queue that the call waits for
+(`rgfxCopyRegion`), so every path sees one memory past the length: the M3's answer inside its
+allocation, and inside the envelope past the x86 Macs' allocations, where they differ *(class
+2)*. It costs one round trip to the host for each call whose region has a byte past the length,
+and nothing else. Before it the CPU's copies read and wrote the guest's memory past the buffer,
+another allocation's bytes, which no GPU path saw. A no-copy buffer's bytes past its length are
+the app's own memory, which Metal's CPU paths reach on all three, dying where the app's mapping
+ends *(class 3)*: the bundle copies them in place, as Metal does, and the GPU's paths there use
+the tail, as each GPU's read memory of its own past the app's mapping (the table's last row). Past
+the length inside the app's last page is not measured. Under an Apple GPU's rules (`rgfxAppleGPU`:
+an arm64 guest's device) the bundle answers nil past the M3's bound from arm64, the table's
+`resourceSize` (`rgfxAppleAllocation`), sending nothing; the x86 guest's device makes them, as
+the x86 Macs do, short of the host's platform's own bound above *(class 3 for each guest)*. The
+shell tests check both: `test_buffer_texture_copies_past_the_length_reach_the_tail` and
+`test_apple_textures_past_a_buffers_allocation_answer_nil`. Where the host's bound and the M3's
+part, over a buffer of 16 KiB or more, the host's is the stricter, and the bundle answers nil
+past it on either guest: the host counts a texture buffer's rows and a 2D texture's whole last
+row, where the M3 counts the last texel, and a heap's buffer's and a no-copy buffer's length
+rounded up to 16 KiB, where the M3 counts the heap's size and the pages the bytes meet.
+
 ## Q12: texture descriptors Metal's validation ends the process at
 
 Probe: a scratch probe, not kept, one case a process, with `MTL_DEBUG_LAYER` unset: a 64 x 64
@@ -1966,6 +2023,7 @@ below is the release Metal's, not the validation layer's.
 | a view in a format of another class, of levels or slices past the texture's, of a type of another family, or a cube of slices not a multiple of six (`view.class`, `.levels`, `.slices`, `.type`, `.slicecount`) | ends the process | ends the process, in the x86 Macs' words | unchanged |
 | `newHeapWithDescriptor:`, Shared, 4 MiB | ends the process ("Shared storage mode disallowed") | made (`AGXG15XFamilyHeap`); Shared buffers of 1 to 65537 bytes in it, each with contents; a Shared BGRA8Unorm texture in it | the M3's: a heap over a block of the device region (`heapForDeviceWithDescriptor:`) |
 | `minimumLinearTextureAlignmentForPixelFormat:`, every raw value from 0 to 799 and 1000, 1023, 4096 and 65535 | 64 values answered; ends at the rest | 175 values answered, 16 each: those the x86 Macs answer, those they lack but Invalid, D24S8 and X24S8 (B5G6R5, A1BGR5, ABGR4, sRGB R8 and RG8, Unspecialized, the two-plane and XR10 formats), and 26, 44, 66, 116, 501, 504, 521, 524, 546 to 548, 560, 562 to 613 and 615 to 629; ends as at a compressed format at 130 to 135, 140 to 143, 150 to 153, 160 to 167, 170, 172, 174, 176, 178 to 183, 185 to 200, 203 to 218, 221 to 236, 240 and 241; as at a depth or stencil one at 250, 252, 253, 260, 261, 651 and 652; as Invalid at every other | the M3's (`rgfxLinearAlignmentAnswer`); the alignment answered stays the host GPU's |
+| a texture buffer, a 2D texture by the public form or the linear SPI, or a linear 2D array, over a buffer, whose texels end past the buffer's length (`oracle_pastlen Apple limits`, m3-max-32081, 32093 and 32098, 11-15) | made at every end bisected, up to 16 MiB from the buffer's start (Q11) | nil past the buffer's `resourceSize` from its start: 128 KiB for a buffer under 16 KiB, a heap's size for a heap's buffer, the 16 KiB pages a no-copy buffer's bytes meet, and the length rounded up to 16 KiB for the rest (Q11) | the M3's (`rgfxAppleAllocation`, `rgfxPastAllocation:`) |
 | a depth or stencil texture (Depth16Unorm, Depth32Float, Stencil8, Depth32Float_Stencil8, X32_Stencil8) in Shared storage over a Shared buffer, by `newTextureWithDescriptor:offset:bytesPerRow:`, and Depth32Float by the linear SPI | ends the process at the descriptor's validation (the storage) | ends the process after the validation, which takes it: `_mtlValidateStrideTextureParameters`, "Linear texture: cannot create compressed, depth, or stencil textures, pixelFormat (...) disallowed" | the M3's (`rgfxEndAtLinearDepthStencil`) |
 | a depth/stencil state's `gpuResourceID`; an argument encoder's `setDepthStencilState:atIndex:` of a state or nil, at a depth/stencil descriptor's index, beside a texture and a pointer, on an encoder of one texture, and on one of a function's argument buffer (`argbuf.ds.*`) | raise an unrecognized selector, though each answers that it responds | `gpuResourceID` 0 for every state; the encoders write nothing and raise nothing | the M3's (`RgfxDepthStencilState`, `RgfxArgumentEncoder`) |
 | a depth/stencil state's `resourceIndex` and `uniqueIdentifier` (SPI; `ds.resourceIndex`, `ds.uniqueIdentifier`) | answer that they respond, and raise an unrecognized selector | the same | unchanged |
@@ -2000,7 +2058,8 @@ above, sending the host nothing for what ends the process or answers nil; an x86
 are unchanged. The shell tests check both: `test_surface_textures_as_an_apple_gpu`,
 `test_views_as_an_apple_gpu`, `test_shared_heaps_on_an_apple_gpu`,
 `test_linear_alignment_as_an_apple_gpu`, `test_depth_buffer_textures_as_an_apple_gpu`,
-`test_gl_renderer_spi`, `test_pipeline_reflection_from_air`, `test_function_pointers` and
+`test_apple_textures_past_a_buffers_allocation_answer_nil`, `test_gl_renderer_spi`,
+`test_pipeline_reflection_from_air`, `test_function_pointers` and
 `test_compute_pipeline_libraries`, and the protocol tests' `test_argument_encoder_members`, beside
 the x86 Macs' tests they keep.
 
