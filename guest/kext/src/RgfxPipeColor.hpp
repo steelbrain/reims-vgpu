@@ -14,11 +14,16 @@
 //   0x14  field_14, a float (CoreDisplay sends 1.0)
 //   0x18  n entries of 16 bytes: red, green and blue as floats, then a fourth word (0)
 // as macOS 26's IOAcceleratorFamily2 reads it (read). A structure shorter than its header or its
-// entries, or with more than 0x20000 entries, is refused kIOReturnBadArgument. One whose
-// transaction is not the one begun changes nothing and succeeds; for one that is, a plane past 1
-// is refused kIOReturnBadArgument. The table belongs to that transaction: its submit sets it on
-// the display, and a transaction begun after it without that submit drops it. A stage keeps its
-// table across transactions until one sets it again.
+// entries, or with more than 0x20000 entries, is refused kIOReturnBadArgument, and so is none at
+// all: macOS 12.7.6's and 26.7.2's display pipe clients send selector 7 with no structure before
+// some transactions that set an identity colour matrix (measured: two boots' kext logs on an Iris
+// Xe host, at login and at a screen saver's start), and macOS 26's IOAcceleratorFamily2 refuses it
+// kIOReturnBadArgument before it reads anything (read: its selector 7, of a structure of any size,
+// refuses one of no bytes or shorter than its header). A table that turns a stage off is a header
+// of no entries (n 0). One whose transaction is not the one begun changes nothing and succeeds;
+// for one that is, a plane past 1 is refused kIOReturnBadArgument. The table belongs to that
+// transaction: its submit sets it on the display, and a transaction begun after it without that
+// submit drops it. A stage keeps its table across transactions until one sets it again.
 //
 // The colour matrix: a transaction whose dirty mask has kRgfxDirtyMatrix carries it at
 // kRgfxTxnMatrix, three rows of four floats (out_i = row_i[0] * r + row_i[1] * g + row_i[2] * b +
