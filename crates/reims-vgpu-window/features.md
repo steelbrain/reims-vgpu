@@ -24,7 +24,8 @@ them; its `manual` checks are on a Linux host's guest boot.
 | `REIMS_VGPU_WINDOW=0` | QEMU stays headless under `-display none` (QEMU reads it) |
 | `REIMS_VGPU_WINDOW_BORDERLESS=1` | borderless windows that fill their screens |
 | `REIMS_VGPU_WINDOW_SCREENS=1,0` | display i opens on the host screen the list's i-th entry names |
-| `resolution=2560x1600` | the mode the window opens for, and the guest is offered until the window's pixels are known (QEMU's reims-graphics-pci property; 1920x1080 by default) |
+| `resolution=2560x1600` | the mode the window opens for, and the guest is offered until the window's pixels are known (QEMU's reims-graphics-pci property; 1920x1080 by default); with several displays, every window's |
+| `displays=2` | the reims-graphics device's displays, 1 to 4, a window each (QEMU's reims-graphics-pci property; 1 by default) |
 | `REIMS_VGPU_WINDOW_IMPL=sdl` | macOS, built with the `macos-sdl` feature (on by default): SDL3's window in place of AppKit's ("On macOS through SDL3" below) |
 
 Unset or unparsable values give the defaults below.
@@ -59,6 +60,25 @@ Unset or unparsable values give the defaults below.
   guest's mode. `test: native::macos::shell::windows_on_one_screen_cascade`,
   `test: native::macos::shell::a_cascade_stays_on_the_screen`,
   `test: native::macos::shell::a_cascaded_window_shrinks_rather_than_overlap`
+- With several reims-graphics displays, each window is its own display's:
+  its guest display is offered the window's mode, at the refresh rate and
+  scale of the screen the window is on, whatever the other windows are, and
+  a resize changes only its own display's mode. Each display is offered at
+  most the largest mode of its window's ratio that its share of the device's
+  128 MiB of scanout holds (64 MiB each with two displays, so an 8K window
+  is offered 5440 × 3060, which it shows scaled to fit; 32 MiB each with
+  four, 3840 × 2160 at 16:9), as reims-vgpu-graphics' tests
+  `display::tests::a_display_offers_the_largest_mode_of_its_ratio_its_room_holds`
+  and `device::tests::displays::a_guest_that_took_multi_display_is_told_every_display_s_own_mode`
+  hold. `manual` (a VM with two displays)
+- A window whose display the guest does not drive shows black, as a monitor
+  with no signal does, and so does QEMU's screendump of its head: a guest
+  whose driver does not take the device's `MULTI_DISPLAY` drives display 0
+  alone, and the option ROM drives only display 0, so during boot the other
+  windows stay black. reims-vgpu's test
+  `graphics::tests::displays::each_display_reads_back_and_one_past_the_count_is_refused`
+  holds the black read-back. `manual` (a VM with two displays and a kext
+  that drives one)
 
 ## The picture
 
@@ -383,6 +403,10 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `manual`
 - A window that keeps its size (the reims-graphics display's) never follows
   the guest's mode, as on macOS. `manual`
+- With several reims-graphics displays, each window is its own display's,
+  offered its own mode, rate and scale and capped by its share of the
+  scanout, and a window whose display the guest does not drive shows black,
+  as on macOS (Opening). `manual` (a VM with two displays)
 - Nothing is drawn while the window is hidden or minimized, nor before it
   and its layout exist; it redraws when it shows.
   `test: native::sdl_thread::render::a_hidden_window_is_drawn_when_it_shows`,
