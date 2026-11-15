@@ -19,6 +19,16 @@ impl ApiPlatform for VulkanPlatform {
         crate::singleton::platform()
     }
 
+    /// The runtime's own texture (`VulkanDevice::new_own_texture`): it takes no range of Metal's
+    /// space and no resource ID, so no address or ID the guest reads depends on it.
+    fn own_texture(
+        &self,
+        device: &<Self as Platform>::Device,
+        descriptor: &<Self as Platform>::TextureDescriptor,
+    ) -> Option<<Self as Platform>::Texture> {
+        device.new_own_texture(descriptor)
+    }
+
     /// The process's default device (`MTLCreateSystemDefaultDevice()`, the GPU the platform's
     /// choice of device picks where the host has more than one), or the device
     /// whose registry ID, as the platform answers it, is `id` (`Platform::open_device`): the

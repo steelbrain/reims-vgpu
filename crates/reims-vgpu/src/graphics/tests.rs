@@ -2714,6 +2714,95 @@ fn the_host_is_told_no_cursor_while_the_display_s_panel_is_off() {
     assert_eq!(wait(8)[7..], ["Show(1)"], "a reset left the panel off");
 }
 
+/// Where the guest moves its cursor on its own, with no pointer event of the window's (a mouse
+/// passed through to the guest with QEMU's `usb-host`, or a warp of the guest's own), the window
+/// draws the guest's cursor where `MOVE_CURSOR` puts its hot spot, in the guest's mode, with the
+/// guest's glyph (features.md, "Cursor"): the first position the window reads is no move, the
+/// next one is
+#[test]
+fn the_window_draws_the_cursor_the_guest_moves_on_its_own() {
+    let (device, _platform) = windowed();
+    let window = device.window.as_ref().expect("a window").window();
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    // The guest's mode, 64 x 32, from its scanout.
+    let scanout = RgfxSetScanout {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SET_SCANOUT,
+            size: 0,
+            seqno: 0,
+        },
+        display: 0,
+        width: 64,
+        height: 32,
+        stride: 256,
+        offset: RGFX_ALLOCATIONS_OFFSET,
+    }
+    .as_bytes()
+    .to_vec();
+    assert_eq!(
+        answered(&device, &mut guest, scanout.clone()),
+        RGFX_STATUS_OK
+    );
+    // The kext's cursor slot, at the region's end: one premultiplied BGRA pixel, its hot spot.
+    let slot = device.region_size() - RGFX_CURSOR_SPAN;
+    // SAFETY: the slot lies in the device's region, mapped while the device lives.
+    unsafe {
+        guest.write(slot as usize, &[10, 20, 30, 255]);
+    }
+    let set = RgfxSetCursor {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SET_CURSOR,
+            size: 0,
+            seqno: 0,
+        },
+        display: 0,
+        width: 1,
+        height: 1,
+        hot_x: 0,
+        hot_y: 0,
+        reserved_24: 0,
+        offset: slot,
+    };
+    assert_eq!(
+        answered(&device, &mut guest, set.as_bytes().to_vec()),
+        RGFX_STATUS_OK
+    );
+    let move_to = |x, y| {
+        RgfxMoveCursor {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_MOVE_CURSOR,
+                size: 0,
+                seqno: 0,
+            },
+            display: 0,
+            x,
+            y,
+            visible: 1,
+        }
+        .as_bytes()
+        .to_vec()
+    };
+    // `MOVE_CURSOR` is not answered: the control ring takes its commands in order, so the moves
+    // are taken once the scanout set after them is answered.
+    guest.send(&device, move_to(10, 20));
+    assert_eq!(
+        answered(&device, &mut guest, scanout.clone()),
+        RGFX_STATUS_OK
+    );
+    assert!(window.drawn_cursor().is_none(), "the first position moved");
+    guest.send(&device, move_to(11, 20));
+    assert_eq!(answered(&device, &mut guest, scanout), RGFX_STATUS_OK);
+    let drawn = window
+        .drawn_cursor()
+        .expect("the window draws no cursor where the guest moved it on its own");
+    assert_eq!((drawn.mode, drawn.at), ((64, 32), (11, 20)));
+    assert_eq!(
+        (drawn.glyph.width, drawn.glyph.height, drawn.glyph.hot_spot),
+        (1, 1, (0, 0))
+    );
+}
+
 /// The window's sink makes its queue unshared and imports nothing at its making, then only the
 /// host pages under the scanout it draws (to `stride × height` bytes on), again only when the
 /// scanout moves or changes size, and kept to the region
@@ -2850,7 +2939,8 @@ fn draws_the_scanout(
         width: drawable.width(),
         height: drawable.height(),
     };
-    if draw.encode(drawable, rect).is_none() || platform.call_log().count(SCANOUT_BLIT) != blits + 1
+    if draw.encode(drawable, rect, None).is_none()
+        || platform.call_log().count(SCANOUT_BLIT) != blits + 1
     {
         return false;
     }
@@ -3317,7 +3407,7 @@ fn a_kept_present_s_table_reaches_the_next_drawn_frame() {
     let drawn_table = || -> Vec<f32> {
         let log = platform.call_log();
         let mark = log.mark();
-        let _drawn = draw.encode(&drawable, rect).expect("a draw");
+        let _drawn = draw.encode(&drawable, rect, None).expect("a draw");
         let bound = log
             .since(mark)
             .into_iter()
@@ -8977,7 +9067,7 @@ fn a_presented_surface_s_block_waits_for_the_display() {
         width: 64,
         height: 64,
     };
-    let (command_buffer, presents) = draw.encode(&drawable, rect).expect("a draw of it");
+    let (command_buffer, presents) = draw.encode(&drawable, rect, None).expect("a draw of it");
     presents.after(&command_buffer);
     no_catch(command_buffer.commit(OnFault::Die));
     let drawing = committed(&platform, 1)[0];
@@ -9001,7 +9091,7 @@ fn a_presented_surface_s_block_waits_for_the_display() {
     );
     // A draw from here reads nothing of the block: the guest set no scanout either.
     assert!(device.control.presented.shown().is_none());
-    assert!(draw.encode(&drawable, rect).is_none());
+    assert!(draw.encode(&drawable, rect, None).is_none());
 
     let world = platform.world();
     assert!(world.complete(

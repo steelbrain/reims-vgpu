@@ -19,9 +19,12 @@
 //! the display's refreshes, at the screen's rate, while no presented surface shows in its place;
 //! the window draws it at the screen's pace. While a surface shows, a refresh draws nothing: the
 //! guest's presents draw it ([`Presented`]). The guest's cursor image is the host's cursor over
-//! the image, shown while the guest shows its cursor; the guest's cursor position moves nothing,
-//! since the host's pointer moves the guest's (the window never draws the cursor into the image
-//! itself).
+//! the image, shown while the guest shows its cursor, at the host's pointer, which moves the
+//! guest's. The window takes each place the guest puts its cursor's hot spot (`MOVE_CURSOR`):
+//! where the guest moves its cursor with no pointer event of the window's just before (a mouse
+//! passed through to the guest with QEMU's `usb-host`, or a warp of the guest's own), the window
+//! draws the guest's cursor into its image there itself, and the host's cursor is invisible over
+//! the image (`reims_vgpu_window::handle`'s module doc; `sink`, "The guest's cursor").
 //!
 //! **Without a window** the display offers 1920 × 1080 at 60 Hz and shows nothing.
 //!
@@ -3517,12 +3520,16 @@ impl Screen for WindowScreen {
         cursor.update(&self.window);
     }
 
-    /// The window shows or hides the guest's cursor as the guest does; the position is the
-    /// host's pointer's (the module doc).
-    fn cursor_moved(&self, _x: i32, _y: i32, visible: bool) {
+    /// The window shows or hides the guest's cursor as the guest does, and takes the place the
+    /// guest put its hot spot, each axis kept to 0 to 65535 (`Window::cursor_at`): where the
+    /// guest moved it on its own, the window draws it (the module doc).
+    fn cursor_moved(&self, x: i32, y: i32, visible: bool) {
         let mut cursor = self.cursor.lock();
         cursor.visible = visible;
         cursor.update(&self.window);
+        drop(cursor);
+        let axis = |v: i32| u16::try_from(v.max(0)).unwrap_or(u16::MAX);
+        self.window.cursor_at((axis(x), axis(y)));
     }
 
     /// The window shows black, and no guest cursor, while the panel is off, and what the guest

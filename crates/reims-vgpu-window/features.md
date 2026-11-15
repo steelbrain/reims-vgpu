@@ -300,6 +300,9 @@ QEMU's `usb-tablet`, for which the host gets each event's notches too,
   `test: handle::the_guest_leads_its_cursor_when_nothing_of_the_window_s_moved_it`,
   `test: handle::a_doorbell_reads_the_guest_s_cursor_through_the_sink`,
   `test: handle::a_cursor_the_guest_moves_on_its_own_is_the_window_s_to_draw`,
+  `test: reims-vgpu::graphics::tests::the_window_draws_the_cursor_the_guest_moves_on_its_own`,
+  `test: reims-vgpu::graphics::sink::the_guest_s_cursor_is_drawn_over_the_frame_in_a_pass_of_its_own`,
+  `test: reims-vgpu::graphics::sink::on_vulkan_the_cursor_s_pass_blends_the_glyph_over_the_frame`,
   `manual`
 - Over the bars and the title bar, it is the host's arrow. `manual`
 
@@ -449,6 +452,8 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `test: sdl::cursor::a_glyph_is_resampled_by_nearest_pixel`,
   `test: sdl::cursor::a_short_or_empty_glyph`,
   `test: handle::a_cursor_the_guest_moves_on_its_own_is_the_window_s_to_draw`,
+  `test: reims-vgpu::graphics::tests::the_window_draws_the_cursor_the_guest_moves_on_its_own`,
+  `test: reims-vgpu::graphics::sink::on_vulkan_the_cursor_s_pass_blends_the_glyph_over_the_frame`,
   `manual`
 - With several displays' windows open, the cursor is set only by the window
   the pointer is in: SDL's cursor is the process's, so another window's guest

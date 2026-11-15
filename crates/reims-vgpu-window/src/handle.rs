@@ -30,18 +30,18 @@
 //! state, so a refresh that found no window does not keep the next change from posting one.
 //!
 //! **Who moves the guest's cursor.** The window's pointer events move it, through the host, and
-//! over the image the host's cursor takes the guest's glyph, at the host's pointer. At each of
-//! the guest's cursor doorbells the window reads the guest's cursor position through its sink
-//! ([`Window::cursor_moved`]); a doorbell that leaves it where it was (one rung for a show or a
-//! hide, say) moves nothing, and so does the first position read. Where the guest moves its
-//! cursor with no pointer event of the window's in the [`POINTER_LEADS_FOR`] before, something
-//! else moves it: a mouse the host passed through to the guest, which the host's pointer never
-//! sees, or the guest placing its own. The window then draws the guest's cursor into its image
-//! itself, at the position it read ([`DrawnCursor`], which the render thread hands the sink with
-//! each draw), each move drawing again, and the host's cursor is invisible over the image. The
-//! window's next pointer event gives the cursor back to the host's pointer. A move the guest
-//! reports soon after a pointer event of the window's is the guest following it, however late its
-//! report comes within that time.
+//! over the image the host's cursor takes the guest's glyph, at the host's pointer. The display
+//! tells the window each place the guest puts its cursor ([`Window::cursor_at`]), or the window
+//! reads it through its sink at each of the guest's cursor doorbells ([`Window::cursor_moved`]);
+//! a place where it was (a show or a hide, say) moves nothing, and so does the first. Where the
+//! guest moves its cursor with no pointer event of the window's in the [`POINTER_LEADS_FOR`]
+//! before, something else moves it: a mouse the host passed through to the guest, which the
+//! host's pointer never sees, or the guest placing its own. The window then draws the guest's
+//! cursor into its image itself, at the place it was told ([`DrawnCursor`], which the render
+//! thread hands the sink with each draw), each move drawing again, and the host's cursor is
+//! invisible over the image. The window's next pointer event gives the cursor back to the host's
+//! pointer. A move the guest reports soon after a pointer event of the window's is the guest
+//! following it, however late its report comes within that time.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -392,10 +392,11 @@ impl Window {
         }
     }
 
-    /// The guest's cursor is at `at`: where it moved, with no pointer event of the window's in
-    /// the [`POINTER_LEADS_FOR`] before, the window draws the guest's cursor there, and hides the
+    /// The guest put its cursor's hot spot at `at`, in its mode's pixels (a display's move of the
+    /// guest's cursor): where it moved, with no pointer event of the window's in the
+    /// [`POINTER_LEADS_FOR`] before, the window draws the guest's cursor there, and hides the
     /// host's over the image (the module doc). Each move then draws again.
-    pub(crate) fn cursor_at(&self, at: (u16, u16)) {
+    pub fn cursor_at(&self, at: (u16, u16)) {
         let (changed, drawn) = {
             let mut guest = self.guest.lock();
             let Some(changed) = guest.lead.guest_at(native::now(), at) else {

@@ -250,9 +250,10 @@ struct ScanoutPresenter {
 }
 
 impl Presenter for ScanoutPresenter {
-    /// The next image, the scanout blitted into it, and its present once the runtime has
-    /// scheduled the blit; nothing, the image kept for the next draw, where the draw is refused
-    /// (`sink`'s module doc, "A refused draw"). `cursor` is never given (`graphics`'s module doc).
+    /// The next image, the scanout blitted into it, with `cursor` drawn over it where the window
+    /// draws the guest's cursor (`sink`'s module doc, "The guest's cursor"), and its present once
+    /// the runtime has scheduled the draw; nothing, the image kept for the next draw, where the
+    /// draw is refused (`sink`'s module doc, "A refused draw").
     /// On the compositor's GPU, a draw that meets a surface it cannot draw there ends the
     /// presenter, and the next is the runtime's device's (the module doc).
     fn draw(
@@ -260,7 +261,7 @@ impl Presenter for ScanoutPresenter {
         drawable: (u64, u64),
         scale: f64,
         region: PixelRect,
-        _cursor: Option<&DrawnCursor>,
+        cursor: Option<&DrawnCursor>,
     ) -> Drawn {
         entry::run(|_| {
             self.draw.drawn(drawable, scale);
@@ -275,7 +276,7 @@ impl Presenter for ScanoutPresenter {
             };
             let swapchain = &self.swapchain;
             let committed = self.draw.scoped(|| {
-                let (command_buffer, presents) = self.draw.encode(texture, region)?;
+                let (command_buffer, presents) = self.draw.encode(texture, region, cursor)?;
                 // A draw dropped here answers its presents at the next refresh.
                 if !swapchain.encode_ready(frame, &command_buffer) {
                     return None;
