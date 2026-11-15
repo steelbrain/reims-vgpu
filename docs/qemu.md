@@ -1500,6 +1500,44 @@ library's window shut, and QMP's `screendump` shows the display:
   `accel/hvf/hvf-all.c:74:do_hv_vm_protect: assertion failed:
   (!(size & ~page_mask))`.
 
+### arm64 guests: the Neural Engine
+
+`vmapple` gives a guest no Neural Engine. Virtualization.framework gives
+its macOS guests a virtio one: the guest's AppleNeuralEngine sends compile,
+load and evaluate requests to the host through
+`AppleVirtIONeuralEngineDevice.kext` (`_ANEVirtualClient`, read from
+AppleNeuralEngine's strings in macOS 27.0.1, which ships the kext), and the
+host's Neural Engine runs the models. `vendor/qemu` has no such device. A
+host with no Neural Engine would have to run the guest's models itself.
+
+**Measured** on the M3 Max under HVF on 2026-11-14 (development
+`51b141b58`'s arm64e set), with a probe that runs `VNRecognizeTextRequest`
+on a rendered line of text and VisionKit's `ImageAnalyzer`, the API Live
+Text uses:
+- macOS 14.6.1, 15.6.1 and 26.6.2 read the text at both recognition levels,
+  and so does `ImageAnalyzer`. TextRecognition runs Espresso models
+  (`cr_td_model_v3_eir` or `cr_td_model_v3`, `cr_tr_model_latincyrillic_v3`)
+  on the CPU (`eng=0`): on 15.6.1 and 26.6.2 Espresso logs `VM detected:
+  Adjusted requested context from (eng=5 dev=-1) to (eng=0 dev=-1)`, and on
+  14.6.1 it asks for the CPU from the start.
+- macOS 27.0.1 (26A434) and 27.2.1 (26B131) read the text at the fast level
+  only. At the accurate level, the default, `performRequests:error:` answers
+  NO with no error and no results, whatever compute device the request
+  names, and `ImageAnalyzer` finds no text. macOS 27 ships only E5 models
+  for Latin text (`cr_td_model_v3_e5`, `cr_tr_model_latincyrillic_v3_e5`),
+  and TextRecognition compiles them for the Neural Engine alone: Espresso
+  throws `No available backends on platform [universal] for compute units
+  ane`. Espresso compiles for nothing but the CPU in a VM (`On-device
+  compilation within a VM only supports CPU currently`), and through Core
+  ML the detector compiles for no CPU backend, in the guest or natively
+  (`Input, 'img_input' is not of type tensor`). Vision's
+  `VNDetectLensSmudgeRequest` refuses as well (`com.apple.Vision` error 22,
+  which names the Neural Engine). Each of Vision's 24 other image requests
+  answered as it does natively.
+- An x86-64 macOS 26.7.2 guest on a Linux host, on a Radeon 780M, reads the
+  text at both levels, and so does `ImageAnalyzer`: x86-64 macOS's
+  TextRecognition runs Espresso models on the GPU (`eng=5`), our device.
+
 ### arm64 guests: the boot check of our configuration
 
 Ambrosia's done list has 10 boots of our configuration: macOS 13.6, 14.6.1,
