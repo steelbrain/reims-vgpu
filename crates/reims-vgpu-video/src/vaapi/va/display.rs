@@ -88,6 +88,9 @@ impl From<crate::codec::hevc::Error> for Error {
 
 /// `Ok` for `VA_STATUS_SUCCESS`, else the error with libva's text.
 pub(crate) fn check(call: &'static str, status: ffi::VAStatus) -> Result<(), Error> {
+    // The session-start probe's timeline of the calls (`crate::probes::timeline`).
+    #[cfg(test)]
+    crate::probes::timeline::stamp(call);
     if status == ffi::VA_STATUS_SUCCESS {
         return Ok(());
     }

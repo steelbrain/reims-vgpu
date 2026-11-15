@@ -80,6 +80,9 @@ impl Cuda {
     /// `Ok` for `CUDA_SUCCESS`, else the error with the driver's name and
     /// text for the code.
     pub(crate) fn check(&self, call: &'static str, result: CUresult) -> Result<(), Error> {
+        // The session-start probe's timeline of the calls (`crate::probes::timeline`).
+        #[cfg(test)]
+        crate::probes::timeline::stamp(call);
         if result == ffi::CUDA_SUCCESS {
             return Ok(());
         }

@@ -18,7 +18,13 @@
 //! in `drmSyncobjWait`, and returned once the command, which the scheduler
 //! had held behind the unmap's page-table update and that update behind
 //! the JPEG decode, was done, 0.04 ms after it on the RX 7900 XTX
-//! (docs/video/bugs.md, B92). So a decoder's first `vaEndPicture` is a
+//! (docs/video/bugs.md, B92). With no unmap before it, the call waits for
+//! the create command alone: on a Radeon 780M (Hawk Point, Mesa 26.2.6,
+//! 2026-11-14), a new decoder's first `vaEndPicture` took 1.0 to 3.0 ms,
+//! and a later picture's 0.1 to 0.4 ms, while its config, surfaces and
+//! context took 0.04 ms at most together, radeonsi making a surface's
+//! memory and the decoder at their first use (the session-start probe,
+//! `crate::probes`). So a decoder's first `vaEndPicture` is a
 //! call that may wait for the GPU, made on the display's call thread by the
 //! frame's deadline ([`render_decode`], `super::calls`), and the decoder's
 //! later ones on the caller's thread, as every other submission is.
