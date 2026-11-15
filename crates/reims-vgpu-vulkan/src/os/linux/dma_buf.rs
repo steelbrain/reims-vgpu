@@ -400,26 +400,37 @@ fn padded<F: Clone>(
 
 /// The runs of file pages behind the `length` bytes from `first`, whole pages, each resolved
 /// through the backing table, added to `runs` in order: one for each run of a file's pages that
-/// follow on, the one before included.
+/// follow on, the one before included. Refused with `runs` as they were where a byte has no file
+/// behind it.
+///
+/// The table's stretches are joined here as they are walked ([`files::each_stretch`]), a file's
+/// `Arc` cloned only for a run that starts: resolved as pieces first, each holding a clone, and
+/// joined after, the runs took 42% of the CPU of a texture's making over a no-copy buffer's pages
+/// on a Radeon 780M (**measured** 2026-11-15, Geekbench 7.1.0's compute pass).
 fn add_runs(runs: &mut Vec<Run<Arc<OwnedFd>>>, first: u64, length: u64) -> Result<(), Refusal> {
     let page = vm::page_size();
     debug_assert!(first.is_multiple_of(page) && length.is_multiple_of(page));
-    let resolved = files::pieces(first, length).ok_or(Refusal::Unresolved)?;
-    for piece in resolved {
-        let (backing, bytes) = (piece.backing, piece.length);
-        match runs.last_mut() {
-            Some(last)
-                if Arc::ptr_eq(&last.file, &backing.file)
-                    && last.offset + last.length == backing.offset =>
-            {
-                last.length += bytes;
-            }
-            _ => runs.push(Run {
-                file: backing.file,
-                offset: backing.offset,
-                length: bytes,
-            }),
+    let (count, last_length) = (runs.len(), runs.last().map(|r| r.length));
+    let resolved = files::each_stretch(first, length, |file, offset, bytes| {
+        if let Some(last) = runs.last_mut()
+            && Arc::ptr_eq(&last.file, file)
+            && last.offset + last.length == offset
+        {
+            last.length += bytes;
+            return;
         }
+        runs.push(Run {
+            file: Arc::clone(file),
+            offset,
+            length: bytes,
+        });
+    });
+    if !resolved {
+        runs.truncate(count);
+        if let (Some(run), Some(length)) = (runs.last_mut(), last_length) {
+            run.length = length;
+        }
+        return Err(Refusal::Unresolved);
     }
     Ok(())
 }
@@ -528,6 +539,16 @@ pub(crate) fn of_pages_counted(
     within_limits(|limits| {
         // A pad an attempt before this one added goes.
         runs.truncate(resolved);
+        // Runs one dma-buf takes are one chunk of them all, as `chunks` cuts them, made of the
+        // runs themselves: a texture's pages, at a granule of their length, always are.
+        if !runs.is_empty() && resolved.to_u64() <= limits.pieces && length <= limits.bytes {
+            let chunk = DmaBufChunk {
+                file: Arc::new(create(device, &runs)?),
+                offset: 0,
+                length,
+            };
+            return Ok((vec![chunk], resolved.to_u64()));
+        }
         let refused = |runs: &[Run<Arc<OwnedFd>>]| Refusal::Limit {
             pieces: runs.len() as u64,
             bytes: length,
@@ -750,9 +771,8 @@ fn group_views_at(views: &[(u64, u64)], align: u64) -> Groups {
     let align = align.max(vm::page_size());
     let mut at = 0;
     while views.len() - at > 1 {
-        let group = match within_limits(|limits| {
-            of_group(&views[at..], align, group_limits_of(limits))
-        }) {
+        let made = within_limits(|limits| of_group(&views[at..], align, group_limits_of(limits)));
+        let group = match made {
             Ok(group) => group,
             Err(refusal) => {
                 log::debug!(
@@ -1125,7 +1145,8 @@ fn create(device: &OwnedFd, runs: &[Run<Arc<OwnedFd>>]) -> Result<OwnedFd, Refus
     // words: `flags` and `count`, then each `struct udmabuf_create_item`'s `memfd` and its
     // padding, `offset` and `size`.
     let count = u32::try_from(runs.len()).unwrap_or(u32::MAX);
-    let mut call = vec![u64::from(FLAGS_CLOEXEC) | (u64::from(count) << 32)];
+    let mut call = Vec::with_capacity(1 + 3 * runs.len());
+    call.push(u64::from(FLAGS_CLOEXEC) | (u64::from(count) << 32));
     for run in runs {
         let memfd = u32::try_from(run.file.as_raw_fd()).unwrap_or(u32::MAX);
         call.extend([u64::from(memfd), run.offset, run.length]);
@@ -1383,6 +1404,31 @@ mod tests {
             of_pages(private, page, page),
             Err(Refusal::Unresolved)
         ));
+    }
+
+    /// The runs of a range's file pages join as the table is walked, a range's first to the run
+    /// before it where its pages follow on in the file; a range a byte of which has no file behind
+    /// it adds none, and leaves the run it would have joined as it was. It needs no udmabuf
+    #[test]
+    fn runs_join_as_the_table_is_walked_and_a_refusal_adds_none() {
+        let page = vm::page_size();
+        let at = vm::allocate_aliasable(3 * page).unwrap().addr().to_u64();
+        let shape = |runs: &[Run<Arc<OwnedFd>>]| -> Vec<(u64, u64)> {
+            runs.iter().map(|r| (r.offset, r.length)).collect()
+        };
+        let mut runs = Vec::new();
+        add_runs(&mut runs, at, page).unwrap();
+        assert_eq!(runs.len(), 1);
+        let offset = runs[0].offset;
+        // The table forgets the third page: no file is behind it from now on.
+        files::forget(at + 2 * page, page);
+        assert!(matches!(
+            add_runs(&mut runs, at + page, 2 * page),
+            Err(Refusal::Unresolved)
+        ));
+        assert_eq!(shape(&runs), [(offset, page)]);
+        add_runs(&mut runs, at + page, page).unwrap();
+        assert_eq!(shape(&runs), [(offset, 2 * page)]);
     }
 
     /// One dma-buf takes the pages of a list of ranges where they are no more runs of file pages
@@ -1683,7 +1729,10 @@ mod tests {
             Ok(limits.pieces)
         };
         // The host's limits, read now, refuse it: one attempt.
-        assert!(matches!(within(&kept, now, three), Err(Refusal::Limit { .. })));
+        assert!(matches!(
+            within(&kept, now, three),
+            Err(Refusal::Limit { .. })
+        ));
         assert_eq!((tries.replace(0), READS.load(Ordering::Relaxed)), (1, 2));
         // Raised within the second: refused at the kept 2, taken at the host's 4.
         HOST.store(4, Ordering::Relaxed);
@@ -1694,12 +1743,18 @@ mod tests {
         // Lowered within the second, below what it needs: the kernel refuses the list made at the
         // kept 4, and the host's 1 refuses it.
         HOST.store(1, Ordering::Relaxed);
-        assert!(matches!(within(&kept, now, three), Err(Refusal::Limit { .. })));
+        assert!(matches!(
+            within(&kept, now, three),
+            Err(Refusal::Limit { .. })
+        ));
         assert_eq!(tries.replace(0), 2);
         // A refusal not of the limits reads nothing.
         let reads = READS.load(Ordering::Relaxed);
         let unresolved = |_: Limits| -> Result<(), Refusal> { Err(Refusal::Unresolved) };
-        assert!(matches!(within(&kept, now, unresolved), Err(Refusal::Unresolved)));
+        assert!(matches!(
+            within(&kept, now, unresolved),
+            Err(Refusal::Unresolved)
+        ));
         assert_eq!(READS.load(Ordering::Relaxed), reads);
     }
 

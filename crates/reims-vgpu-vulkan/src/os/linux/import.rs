@@ -1085,7 +1085,9 @@ unsafe fn host_memory_noting(
             // The trace's `dmabufsrc`: the source's number, the request's first byte, length and
             // granule, whether it takes shared files, the dma-bufs answered (0 where refused),
             // the runs of file pages they hold, and the nanoseconds the answer took.
-            let (chunks, runs) = made.as_ref().map_or((0, 0), |(c, r)| (c.len().to_u64(), *r));
+            let (chunks, runs) = made
+                .as_ref()
+                .map_or((0, 0), |(c, r)| (c.len().to_u64(), *r));
             let took = crate::core::trace::now().saturating_sub(began);
             let shared = u64::from(request.shared_files);
             let event = [number, first, length, granule, shared, chunks, runs, took];

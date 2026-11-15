@@ -514,6 +514,27 @@ pub(crate) fn pieces(first: u64, length: u64) -> Option<Vec<Piece>> {
         .then_some(pieces)
 }
 
+/// Calls `each` with the file behind each stretch of the `length` bytes from `first`, in order,
+/// through the runs and registrations over them, under one hold of the table's lock: its file,
+/// the file offset of its first byte, and its bytes. Stretches are not joined, nor is a piece
+/// made of each: a caller that joins its own (`super::linux`'s `dma_buf`) takes a clone of a file
+/// only where it starts a run of its own. False where a byte has no file behind it, after the
+/// stretches before it.
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+pub(crate) fn each_stretch(
+    first: u64,
+    length: u64,
+    mut each: impl FnMut(&Arc<HostFile>, u64, u64),
+) -> bool {
+    let Some(end) = first.checked_add(length) else {
+        return false;
+    };
+    TABLE.lock().walk(first, end, |file, offset, _, from, to| {
+        each(file, offset, to - from);
+        true
+    })
+}
+
 /// How many sources [`view_pieces`] resolves under one hold of the table's lock: a view of a
 /// surface's scattered pages has thousands, each one or two lookups, and the lock is taken by
 /// every import's resolve of its pages too.
