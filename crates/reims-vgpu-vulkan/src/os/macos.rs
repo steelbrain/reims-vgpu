@@ -250,6 +250,11 @@ pub(crate) fn import_view(at: std::ptr::NonNull<u8>, _length: u64) -> ImportView
     ImportView { at }
 }
 
+/// [`import_view`] of a heap's bytes: the same on macOS.
+pub(crate) fn import_heap_view(at: std::ptr::NonNull<u8>, length: u64) -> ImportView {
+    import_view(at, length)
+}
+
 /// The runtime's host memory at `at`, the first byte of an import ([`ImportView::at`]): the bytes
 /// alone, which MoltenVK imports as Metal does.
 ///

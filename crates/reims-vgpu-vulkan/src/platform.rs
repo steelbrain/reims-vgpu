@@ -292,8 +292,9 @@ pub(crate) fn take_answering_device() -> Option<rt::Device> {
 }
 
 /// The kinds the runtime announces at every occurrence (`DeviceOptions::announce_each`): those a
-/// call here hears ([`crate::answer::HEARD`]), `CopiedHostPages`, which the device's probe of its
-/// imports may meet unheard as it is made ([`crate::answer`]'s `unheard`, on Linux), and every
+/// call here hears ([`crate::answer::HEARD`]), `CopiedHostPages` and `ShadowedTexture`, which the
+/// device's probe of its imports may meet unheard as it is made ([`crate::answer`]'s `unheard`,
+/// on Linux: `crate::os`'s `learn_view_imports`), and every
 /// kind of [`crate::answer::DIES`] where `every_dies`, in strict and census mode, which die at or
 /// record each occurrence. Elsewhere the
 /// runtime announces such a kind once per device, its first occurrence, the only one the default
@@ -308,7 +309,10 @@ fn announced_each(every_dies: bool) -> std::collections::BTreeSet<rt::Degradatio
     };
     (dies.iter().copied())
         .chain(crate::answer::HEARD)
-        .chain([rt::Degradation::CopiedHostPages])
+        .chain([
+            rt::Degradation::CopiedHostPages,
+            rt::Degradation::ShadowedTexture,
+        ])
         .collect()
 }
 
@@ -837,18 +841,23 @@ pub(crate) mod tests {
     use super::*;
     use crate::gpu::device::tests::dev;
 
-    /// The kinds a call hears and `CopiedHostPages`, which the device's probe of its imports
-    /// meets unheard, are announced at every occurrence in every mode, and every kind of `DIES`
-    /// only in strict and census mode, none of which dies by default
+    /// The kinds a call hears, and `CopiedHostPages` and `ShadowedTexture`, which the device's
+    /// probe of its imports meets unheard, are announced at every occurrence in every mode, and
+    /// every kind of `DIES` only in strict and census mode, none of which dies by default
     #[test]
     fn only_strict_and_census_mode_hear_every_occurrence_of_every_kind_that_dies() {
         use crate::answer::{DIES, HEARD};
         let each = announced_each(true);
         assert!(DIES.iter().chain(&HEARD).all(|k| each.contains(k)));
         let by_default = announced_each(false);
-        let copied = rt::Degradation::CopiedHostPages;
-        assert!((HEARD.iter().chain([&copied])).all(|k| by_default.contains(k)));
-        let once = DIES.iter().filter(|k| !HEARD.contains(k) && **k != copied);
+        let probed = [
+            rt::Degradation::CopiedHostPages,
+            rt::Degradation::ShadowedTexture,
+        ];
+        assert!((HEARD.iter().chain(&probed)).all(|k| by_default.contains(k)));
+        let once = DIES
+            .iter()
+            .filter(|k| !HEARD.contains(k) && !probed.contains(k));
         assert!(once.clone().count() > 100, "most kinds of DIES");
         assert!(once.clone().all(|k| !by_default.contains(k)));
         let released = rt::Degradation::ReleasedCommandState;

@@ -55,7 +55,7 @@ pub(crate) use host_os::learn_view_imports;
 pub(crate) use host_os::thread_counts;
 pub(crate) use host_os::{
     COPIES_READ_ONLY, Drawables, ImportMade, allocate_aliasable, dma_buf_refusal, host_memory,
-    host_memory_vouched, import_view,
+    host_memory_vouched, import_heap_view, import_view,
 };
 /// Copies by the GPU of planes another driver wrote into dma-bufs into a runtime buffer, on Linux
 /// (`os/linux/plane_copy.rs`).
@@ -65,10 +65,10 @@ pub use host_os::{
     GuestMemoryLease, OsClock, OsThreads, OsVm, RegionMemory, default_driver_sizes,
     default_gpu_core_count, default_registry_id, install_process_services, lease_guest_memory,
 };
-/// Dma-bufs of host memory lent to a device outside the runtime, on Linux
-/// (`os/linux/device_lend.rs`).
+/// Dma-bufs of host memory lent to a device outside the runtime, and that memory mapped from its
+/// files for one that pins a pointer's pages, on Linux (`os/linux/device_lend.rs`).
 #[cfg(target_os = "linux")]
-pub use host_os::{LendRefusal, LentDmaBuf, dma_buf_of_host};
+pub use host_os::{LendRefusal, LentDmaBuf, dma_buf_of_host, map_for_pointer};
 #[cfg(test)]
 pub(crate) use host_os::{PAGE, mapped, writable};
 /// Whether one dma-buf takes the pages of a range, as the runtime asks for a texture's own, of a

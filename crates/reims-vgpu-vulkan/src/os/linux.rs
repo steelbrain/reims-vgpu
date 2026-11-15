@@ -25,7 +25,7 @@ use ash::vk;
 use metal2vulkan_runtime as rt;
 
 pub use clock::LinuxClock;
-pub use device_lend::{LendRefusal, LentDmaBuf, dma_buf_of_host};
+pub use device_lend::{LendRefusal, LentDmaBuf, dma_buf_of_host, map_for_pointer};
 pub use lease::{GuestMemoryLease, lease_guest_memory};
 pub use plane_copy::{CopyError, DmaBufPlane, PlaneCopier, PlaneCopy, PlaneFormat};
 pub use threads::LinuxThreads;
@@ -39,8 +39,8 @@ pub(crate) use dma_buf::{
 pub(crate) use host_ram::ram_has_sources;
 pub(crate) use host_ram::with_ram_sources;
 pub(crate) use import::{
-    COPIES_READ_ONLY, ImportMade, dma_buf_refusal, host_memory, host_memory_vouched, import_view,
-    learn_view_imports,
+    COPIES_READ_ONLY, ImportMade, dma_buf_refusal, host_memory, host_memory_vouched,
+    import_heap_view, import_view, learn_view_imports,
 };
 pub(crate) use vm::allocate_aliasable;
 #[cfg(test)]

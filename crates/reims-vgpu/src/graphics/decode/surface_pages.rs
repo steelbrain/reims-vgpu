@@ -398,10 +398,17 @@ impl<P: Platform> DeviceMemory for ViewMemory<P> {
     }
 
     /// The whole mapping, the surface's first byte its first, held mapped by the view's mapping
-    /// hold, which outlives the view while the caller keeps it.
+    /// hold, which outlives the view while the caller keeps it. On Linux its pages are mapped from
+    /// their files first, for the device that registers it, which pins a pointer's pages
+    /// (`reims_vgpu_vulkan::os::map_for_pointer`): a view one dma-buf holds is mapped through it
+    /// on a GPU whose imports need files.
     fn host_view(&self) -> Result<HostView, SurfaceError> {
         let first = NonNull::new(self.base.as_ptr::<u8>())
             .ok_or_else(|| SurfaceError::Unreachable("a view at no address".to_owned()))?;
+        // Past the views' budget the pages stay where they are, and the registration is refused
+        // as it is there.
+        #[cfg(target_os = "linux")]
+        let _ = reims_vgpu_vulkan::os::map_for_pointer(first, self.length.to_u64());
         Ok(HostView {
             first,
             size: self.length,

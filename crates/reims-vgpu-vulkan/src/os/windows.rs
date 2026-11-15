@@ -26,7 +26,8 @@ pub use vm::{RegionMemory, WindowsVm};
 
 pub(crate) use app_data::cache_directory;
 pub(crate) use import::{
-    COPIES_READ_ONLY, ImportMade, dma_buf_refusal, host_memory, host_memory_vouched, import_view,
+    COPIES_READ_ONLY, ImportMade, dma_buf_refusal, host_memory, host_memory_vouched,
+    import_heap_view, import_view,
 };
 pub(crate) use vm::allocate_aliasable;
 #[cfg(test)]

@@ -1156,9 +1156,15 @@ fn create(device: &OwnedFd, runs: &[Run<Arc<OwnedFd>>]) -> Result<OwnedFd, Refus
     if made < 0 {
         return Err(Refusal::Kernel(io::Error::last_os_error()));
     }
+    #[cfg(test)]
+    MADE.fetch_add(1, Ordering::Relaxed);
     // SAFETY: the dma-buf the call just made, owned from here on.
     Ok(unsafe { OwnedFd::from_raw_fd(made) })
 }
+
+/// How many dma-bufs the process made ([`create`]), for tests that count them.
+#[cfg(test)]
+pub(super) static MADE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 mod tests {

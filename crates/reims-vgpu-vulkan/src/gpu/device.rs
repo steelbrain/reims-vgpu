@@ -408,7 +408,7 @@ fn keep_unrun<D, T>(made: &RaiseResult<Option<T>>, slot: Option<Slot<D>>) {
 /// What the runtime is given for a no-copy buffer over the `length` bytes at `start`, which
 /// core's `HostRange` vouches for, with `run`, the runtime's form of core's deallocator: the first
 /// byte it imports (the bytes, read-only ones too, which the runtime copies,
-/// [`crate::os::import_view`]), the deallocator,
+/// [`crate::os::import_view`], a heap's [`crate::os::import_heap_view`]), the deallocator,
 /// which runs at Metal's moment, and the keep-alive, which the
 /// runtime drops once it freed its import: it holds what the view keeps of the pages
 /// (`os::ImportView::release`), and an unmap hold on the bytes' pages, so that core's
@@ -423,7 +423,10 @@ fn no_copy_release(
     run: Option<rt::Deallocator>,
     site: backing::ImportSite,
 ) -> NoCopyImport {
-    let view = crate::os::import_view(start, length);
+    let view = match site {
+        backing::ImportSite::Heap => crate::os::import_heap_view(start, length),
+        _ => crate::os::import_view(start, length),
+    };
     let imported = view.at();
     let (read_only, vouched) = (view.read_only(), view.vouched());
     let made = view.made();

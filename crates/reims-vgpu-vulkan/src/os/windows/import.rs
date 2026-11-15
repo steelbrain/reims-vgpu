@@ -174,6 +174,11 @@ pub(crate) fn import_view(at: NonNull<u8>, length: u64) -> ImportView {
     }
 }
 
+/// [`import_view`] of a heap's bytes: the same on Windows.
+pub(crate) fn import_heap_view(at: NonNull<u8>, length: u64) -> ImportView {
+    import_view(at, length)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::core::platform::os::vm::{HostVm as _, KernReturn, VmProt};

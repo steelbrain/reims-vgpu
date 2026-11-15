@@ -805,9 +805,12 @@ Stages:
       `RGFX_STATUS_CACHE` too, with no view made, where the platform has no
       room for the view's kernel mappings (`HostVm::view_room`; on Linux the
       views' budget short of its headroom, which Intel's ANV, importing a
-      view's pages only mapped from their files, reaches at a stock
-      `vm.max_map_count`): past that room the view's buffers would be copied
-      rather than imported. Such a cache's copies
+      view's pages only mapped from their files, a mapping a run, reaches at
+      a stock `vm.max_map_count`; a view one udmabuf holds, within 1,024
+      runs and 64 MiB at its stock limits, takes one mapping instead on a
+      device whose textures over it lie in place, `ONE_DMA_BUF_VIEWS`, ANV
+      at metal2vulkan fb33065288): past that room the view's buffers would
+      be copied rather than imported. Such a cache's copies
       into the pages copy the surface's texels alone, each plane's rows from
       the layout the ask gave, so the bytes between rows stay as the guest's
       CPU wrote them, whatever a render over the cache leaves in its own

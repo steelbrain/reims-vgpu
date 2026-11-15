@@ -484,10 +484,24 @@ through dma-bufs"). How the GPU then takes those pages depends on its driver:
     is made: it takes no mapping and asks no gate. A device without
     `VK_EXT_external_memory_host` is not handed the RAM, said once in the
     log, and its objects take the ways below.
-  - Views are mapped from their files while they fit 8,192 mappings short of
-    the budget (`budget.rs`, `HEADROOM`), and through dma-bufs past that. Any
-    other import of a view's pages (a no-copy buffer's or a heap's) maps
-    them from their files while they fit short of those 8,192 mappings too.
+  - Where the probe also found the device takes the pages one dma-buf holds
+    in the pointer's place (`import.rs`, `ONE_DMA_BUF`; NVIDIA's driver and
+    ANV) and makes textures over them in place (`ONE_DMA_BUF_VIEWS`; ANV at
+    metal2vulkan fb33065288, not NVIDIA's driver), a view one dma-buf holds (at
+    udmabuf's defaults 1,024 runs and 64 MiB) is mapped through that dma-buf
+    from the first, one mapping, and a no-copy buffer over the whole view is
+    imported through it, given a duplicate of its descriptor; a heap's
+    import, and CUDA's registration of a video surface, map its pages from
+    their files (`vm.rs`, "One dma-buf a view"). The device learns this once,
+    as it is made: in a host's first process after a driver update or a
+    change of the runtime's in-place check, before the runtime keeps the
+    check's verdicts, its views are mapped as below for that whole process,
+    and the route is taken from the next process on.
+  - Other views are mapped from their files while they fit 8,192 mappings
+    short of the budget (`budget.rs`, `HEADROOM`), and through dma-bufs past
+    that. Any other import of a view's pages (a no-copy buffer's or a heap's)
+    maps them from their files while they fit short of those 8,192 mappings
+    too.
     Past that line the library's import gate refuses the pages, and
     the runtime makes the object over a copy of them, which takes no mapping
     (metal2vulkan's `HostMemory::with_import_gate`, announced

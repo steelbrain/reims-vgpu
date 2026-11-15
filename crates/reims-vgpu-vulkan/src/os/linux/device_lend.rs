@@ -7,7 +7,8 @@
 //! udmabuf's `list_limit` takes, or more bytes than its `size_limit_mb`, is refused with both
 //! limits and its own count ([`LendRefusal::TooLarge`]), so that a device may ask for fewer pages
 //! at a time: nearly every page of a guest's buffer is a run of its own, so at the stock
-//! `list_limit` of 1,024 one dma-buf holds about 4 MiB of one.
+//! `list_limit` of 1,024 one dma-buf holds about 4 MiB of one. A device that pins a pointer's
+//! pages instead is given the memory's pages mapped from their files ([`map_for_pointer`]).
 
 use std::os::fd::OwnedFd;
 use std::ptr::NonNull;
@@ -85,6 +86,21 @@ pub fn dma_buf_of_host(
         }),
         Err(refusal) => Err(LendRefusal::Refused(refusal.to_string())),
     }
+}
+
+/// Maps what of the `length` bytes from `first` lies in views through dma-bufs from its files
+/// instead, for a device outside the runtime that pins a pointer's pages, as CUDA's registration
+/// of host memory does (NVIDIA's `cuMemHostRegister`), which no driver does of a dma-buf's
+/// mapping (`super::vm`'s module docs, "Imports of views"): a view one dma-buf holds is mapped
+/// through it from the first on a device that takes it so. True where every page of them is
+/// mapped from its file then; false where mapping them so would come within the headroom of the
+/// views' budget, and they are left as they were. The caller keeps the bytes mapped for the call.
+pub fn map_for_pointer(first: NonNull<u8>, length: u64) -> bool {
+    let page = vm::page_size();
+    let first = first.as_ptr().addr().to_u64();
+    let start = first & !(page - 1);
+    let end = first.saturating_add(length).next_multiple_of(page);
+    vm::unfold(start, end).is_ok()
 }
 
 /// The pages of some ranges ([`pages_of`]): each run of them a first byte and a length, and where

@@ -70,12 +70,34 @@ struct Run {
 }
 
 /// Where a run mapped through a dma-buf lies in it: the dma-buf, by a number of the process's
-/// own (one per mapping of one, never used again), and the offset of the run's first byte there
-/// (module docs).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// own (one per mapping of one, never used again), the offset of the run's first byte there, and
+/// the dma-buf itself where a view is mapped through it whole and it is kept for the view's
+/// imports ([`Kept`]; module docs).
+#[derive(Clone, Debug)]
 pub(crate) struct Through {
     pub(crate) buf: u64,
     pub(crate) offset: u64,
+    pub(crate) kept: Option<Arc<Kept>>,
+}
+
+/// Two places are the same where they are the same dma-buf's at the same offset: a dma-buf's
+/// number is its own, so its kept descriptor is the same too.
+impl PartialEq for Through {
+    fn eq(&self, other: &Through) -> bool {
+        self.buf == other.buf && self.offset == other.offset
+    }
+}
+
+/// A dma-buf a whole view is mapped through, kept open while a run of the table lies in it, so
+/// that an import of the view is given a duplicate of its descriptor and no dma-buf is made again
+/// (`super::linux`'s `vm` module docs, "Imports of views"): its descriptor and its bytes. It
+/// closes as the last run in it goes, before or as the view is unmapped, which holds the dma-buf
+/// until then. Dma-bufs are Linux's alone.
+#[derive(Debug)]
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) struct Kept {
+    pub(crate) fd: HostFile,
+    pub(crate) length: u64,
 }
 
 impl Through {
@@ -115,6 +137,10 @@ struct Table {
     runs: BTreeMap<u64, Run>,
     /// The pairs of neighbouring runs the kernel holds as one mapping ([`joined`]).
     joins: usize,
+    /// The kept dma-bufs of the runs dropped ([`Kept`]), let go of once the lock is (each public
+    /// call that drops runs takes them, [`Table::closing`]): where one is the last of its
+    /// dma-buf, its close releases the dma-buf's pages, which waits for nothing of the table.
+    closing: Vec<Arc<Kept>>,
 }
 
 /// The process's table.
@@ -122,6 +148,7 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
     registered: Vec::new(),
     runs: BTreeMap::new(),
     joins: 0,
+    closing: Vec::new(),
 });
 
 /// Whether the kernel holds the run `a` from `a_first` and the run `b` from `b_first` as one
@@ -129,7 +156,7 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
 /// offset `a` ends at, or through the same dma-buf at the offset `a` ends at there (module docs).
 fn joined(a_first: u64, a: &Run, b_first: u64, b: &Run) -> bool {
     let length = a.end - a_first;
-    let follows = match (a.through, b.through) {
+    let follows = match (&a.through, &b.through) {
         (None, None) => {
             Arc::ptr_eq(&a.backing.file, &b.backing.file)
                 && a.backing.offset + length == b.backing.offset
@@ -273,9 +300,9 @@ impl Table {
                 offset: run.backing.offset + (at - first),
             },
             prot: run.prot,
-            through: run.through.map(|t| Through {
-                buf: t.buf,
+            through: run.through.as_ref().map(|t| Through {
                 offset: t.offset + (at - first),
+                ..t.clone()
             }),
         };
         self.insert(first, Run { end: at, ..run });
@@ -306,7 +333,17 @@ impl Table {
             prior = Some((at, run));
         }
         self.joins -= gone;
-        self.runs.extract_if(first..end, |_, _| true).for_each(drop);
+        for (_, run) in self.runs.extract_if(first..end, |_, _| true) {
+            if let Some(kept) = run.through.and_then(|t| t.kept) {
+                self.closing.push(kept);
+            }
+        }
+    }
+
+    /// The kept dma-bufs of the runs dropped since the last call ([`Table::closing`]), for the
+    /// caller to let go of once the lock is.
+    fn closing(&mut self) -> Vec<Arc<Kept>> {
+        std::mem::take(&mut self.closing)
     }
 
     /// `first..end` shows `backing` with protection `prot` from now on, mapped through the
@@ -492,14 +529,20 @@ pub(crate) fn file_spans() -> Vec<std::ops::Range<u64>> {
 /// `length` bytes from `first` show `backing` from now on, with protection `prot`: what of
 /// another run they cover goes.
 pub(crate) fn record(first: u64, length: u64, backing: Backing, prot: VmProt) {
-    TABLE
-        .lock()
-        .record(first, first.saturating_add(length), backing, prot, None);
+    let mut table = TABLE.lock();
+    table.record(first, first.saturating_add(length), backing, prot, None);
+    let closing = table.closing();
+    drop(table);
+    drop(closing);
 }
 
 /// `length` bytes from `first` show no file from now on.
 pub(crate) fn forget(first: u64, length: u64) {
-    TABLE.lock().forget(first, first.saturating_add(length));
+    let mut table = TABLE.lock();
+    table.forget(first, first.saturating_add(length));
+    let closing = table.closing();
+    drop(table);
+    drop(closing);
 }
 
 /// The pieces of `length` bytes from `first`, in order, each bytes of one file that follow on in
@@ -587,6 +630,9 @@ pub(crate) fn record_pieces(target: u64, pieces: Vec<Piece>) {
         let end = first.saturating_add(piece.length);
         table.record(first, end, piece.backing, piece.prot, None);
     }
+    let closing = table.closing();
+    drop(table);
+    drop(closing);
 }
 
 /// As [`record_pieces`], for pieces mapped through dma-bufs, each where its [`Through`] says
@@ -599,6 +645,9 @@ pub(crate) fn record_through(target: u64, pieces: Vec<(Piece, Through)>) {
         let end = first.saturating_add(piece.length);
         table.record(first, end, piece.backing, piece.prot, Some(through));
     }
+    let closing = table.closing();
+    drop(table);
+    drop(closing);
 }
 
 /// The runs in `first..end` mapped through a dma-buf, cut to it, in order, as pieces from
@@ -622,6 +671,31 @@ pub(crate) fn through_pieces(first: u64, end: u64) -> Vec<Piece> {
             }
         })
         .collect()
+}
+
+/// The dma-buf a view is mapped through whole ([`Kept`]) where the `length` bytes from `first`
+/// are all of it, in order: each run there lies in that dma-buf at the offset of its first byte
+/// from `first`. None where a byte of them lies elsewhere, or the dma-buf holds more.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn kept_whole(first: u64, length: u64) -> Option<Arc<Kept>> {
+    let end = first.checked_add(length)?;
+    let table = TABLE.lock();
+    let (start, run) = table.run_at(first)?;
+    let through = run.through.as_ref()?;
+    let kept = through.kept.as_ref()?;
+    if start != first || through.offset != 0 || kept.length != length {
+        return None;
+    }
+    let mut at = first;
+    for (&from, run) in table.runs.range(first..end) {
+        let lies = (run.through.as_ref())
+            .is_some_and(|t| t.buf == through.buf && t.offset == from - first);
+        if from != at || !lies {
+            return None;
+        }
+        at = run.end;
+    }
+    (at == end).then(|| Arc::clone(kept))
 }
 
 /// Sets the protection of what of the runs lies in `length` bytes from `first` to `prot`,
@@ -1117,7 +1191,11 @@ pub(crate) mod tests {
             } else {
                 (two, (i - 4) * page)
             };
-            let through = Through { buf, offset };
+            let through = Through {
+                buf,
+                offset,
+                kept: None,
+            };
             t.record(at(i), at(i + 1), b(fd, (9 - i) * page), rw, Some(through));
         }
         assert_eq!(t.mappings(), 2);
@@ -1129,12 +1207,19 @@ pub(crate) mod tests {
         // A cut keeps the count, and the tail lies further into the dma-buf.
         t.cut(at(0) + page / 2);
         assert_eq!(t.mappings(), 2);
-        let tail = t.run_at(at(0) + page / 2).unwrap().1.through.unwrap();
+        let tail = t
+            .run_at(at(0) + page / 2)
+            .unwrap()
+            .1
+            .through
+            .clone()
+            .unwrap();
         assert_eq!(
             tail,
             Through {
                 buf: one,
-                offset: page / 2
+                offset: page / 2,
+                kept: None,
             }
         );
         // The third page unmapped, then mapped from its file at the offset that follows the
@@ -1322,6 +1407,7 @@ pub(crate) mod tests {
                     let through = (next(3) == 0).then(|| Through {
                         buf: next(2),
                         offset: next(8) * page,
+                        kept: None,
                     });
                     t.record(first, end, backing, prot, through);
                 }

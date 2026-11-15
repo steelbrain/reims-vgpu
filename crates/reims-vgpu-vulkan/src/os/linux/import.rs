@@ -264,16 +264,102 @@ pub(crate) fn imports_need_files() -> bool {
 /// takes a view of pages one dma-buf holds through that dma-buf, which its pointer's refusal
 /// leaves the runtime to import ([`learn_view_imports`]): so the gate lets such pages through
 /// though they lie in views through dma-bufs ([`import_gate`]), and they take no mapping of their
-/// own. NVIDIA's driver imports a dma-buf of scattered guest pages as an allocation dedicated to
-/// its buffer, one dma-buf a buffer (the runtime's `DmaBufFor::Buffer`), and refuses several
-/// under one buffer (no type its dma-bufs import as takes a sparse buffer): so it imports one
-/// udmabuf's pages, at most `list_limit` runs (1,024 by default, 4 MiB of scattered 4 KiB pages)
-/// and `size_limit_mb` MiB, and no more.
+/// own; and a view one dma-buf holds is mapped through it from the first, the dma-buf kept for
+/// its imports (`super::vm`'s module docs, "One dma-buf a view"). NVIDIA's driver imports a
+/// dma-buf of scattered guest pages as an allocation dedicated to its buffer, one dma-buf a
+/// buffer (the runtime's `DmaBufFor::Buffer`), and refuses several under one buffer (no type its
+/// dma-bufs import as takes a sparse buffer): so it imports one udmabuf's pages, at most
+/// `list_limit` runs (1,024 by default, 4 MiB of scattered 4 KiB pages) and `size_limit_mb` MiB,
+/// and no more. ANV on an Iris Xe (Linux 7.3.1, Mesa 26.2.6) took such a dma-buf too, not
+/// dedicated, and a linear texture over its buffer unshadowed (measured 2026-11-14, job
+/// m3-max-31193).
 static ONE_DMA_BUF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// [`ONE_DMA_BUF`].
 fn one_dma_buf_imports() -> bool {
     ONE_DMA_BUF.load(Ordering::Relaxed)
+}
+
+/// Whether a view one dma-buf holds is mapped through it from the first and its imports leave it
+/// there (`super::vm`'s module docs, "One dma-buf a view"): where the device takes such pages
+/// through the dma-buf ([`ONE_DMA_BUF`]) and the textures over a no-copy buffer of them lie in
+/// place, as over pages imported by their pointer, which [`learn_view_imports`]' probe learns
+/// ([`view_textures`]). Elsewhere a texture over such a view's buffer would be the runtime's
+/// shadow, copied in before each use and back after each write. **Measured** 2026-11-14: on an
+/// RTX 3090 (NVIDIA's driver 620.70.06, job m3-max-31400) a linear BGRA8 texture over a buffer
+/// one dma-buf holds was a shadow, the runtime's check having made no image over pages imported
+/// as dma-bufs, and the runtime's import of a view of 1,024 pages backwards through its dma-buf
+/// took 10.3-12.8 ms against 2.4-2.6 ms by its pointer (release build, three rounds, job
+/// m3-max-31405), so NVIDIA's driver does not take the route. **Measured** 2026-11-15 with
+/// metal2vulkan fb33065288: on homelab-ms01-1's Iris Xe (ANV, Linux 7.3.1, Mesa 26.2.6, job
+/// m3-max-33714) both textures of [`view_textures`] lie in place, the one whose rows are a texel
+/// short of a page too, so ANV takes the route. With metal2vulkan 9ce951f521 that one was a
+/// shadow there (job m3-max-33240): the runtime's check had found a render pass's load and store
+/// over pages imported as dma-bufs changing bytes the CPU wrote beside texels in the line of
+/// memory they share, which the runtime now takes in place where the buffer holds the texture's
+/// last row to its pitch (its `line-write-back` degradation).
+static ONE_DMA_BUF_VIEWS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`ONE_DMA_BUF_VIEWS`].
+pub(super) fn one_dma_buf_views() -> bool {
+    ONE_DMA_BUF_VIEWS.load(Ordering::Relaxed)
+}
+
+/// What [`view_textures`] found of the textures over a no-copy buffer of the pages one dma-buf
+/// holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewTextures {
+    /// None made: the buffer was not, or was not imported through its dma-buf.
+    Unmade,
+    /// Every one lay in place.
+    InPlace,
+    /// One was a shadow only as the device's check of such textures had not answered yet (a
+    /// driver's first process, before the runtime keeps its verdicts).
+    Pending,
+    /// One was a shadow for another cause, or was refused.
+    Shadowed,
+}
+
+/// Whether linear BGRA8 textures over `buffer`, a no-copy buffer of `page`-byte pages that one
+/// dma-buf holds, lie in place: two of 16 rows a page apart, one whose rows fill the page and one
+/// a texel short, so its rows' last texels share a line of memory with the bytes beside them
+/// (the runtime's checks tell the two apart), each sampled, written by a shader and rendered
+/// into (the accesses its checks give verdicts of). Made heard by no one, as the probe that makes
+/// the buffer is ([`crate::answer`]'s `unheard`; the runtime announces each shadow,
+/// [`crate::platform`]'s `announced_each`).
+fn view_textures(device: &rt::Device, buffer: &rt::Buffer, page: u64) -> ViewTextures {
+    use metal2vulkan::metal::{PixelFormat, TextureUsage};
+    let counts = || {
+        let counts = device.work_counts();
+        (
+            counts.shadowed_textures,
+            counts.host_texture_shadows_check_pending,
+        )
+    };
+    let before = counts();
+    for width in [page / 4, page / 4 - 1] {
+        let mut descriptor =
+            rt::TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, width, 16, false);
+        descriptor.usage =
+            TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE | TextureUsage::RENDER_TARGET;
+        if crate::answer::unheard(|| buffer.new_texture(&descriptor, 0, page)).is_err() {
+            return ViewTextures::Shadowed;
+        }
+    }
+    let after = counts();
+    let (shadows, pending) = (after.0 - before.0, after.1 - before.1);
+    match (shadows, pending) {
+        (0, _) => ViewTextures::InPlace,
+        (shadows, pending) if shadows > pending => ViewTextures::Shadowed,
+        _ => ViewTextures::Pending,
+    }
+}
+
+/// Whether the pages of `first..end` are ones one dma-buf holds, on a device that takes such a
+/// dma-buf in place of the pointer it refuses ([`ONE_DMA_BUF`]): the gate lets them through
+/// wherever they lie ([`gate`]), and an import leaves them where they are ([`import_view`]).
+fn one_dma_buf_holds(first: u64, end: u64) -> bool {
+    one_dma_buf_imports() && super::dma_buf::fits_one(first, end - first).is_ok()
 }
 
 /// Whether a device of the process took a view of guest pages through the dma-bufs its source
@@ -366,7 +452,7 @@ fn gate(first: u64, end: u64) -> bool {
     }
     // Pages one dma-buf holds, on devices that take such a dma-buf in place of the pointer: the
     // runtime imports them through it, which takes no mapping ([`ONE_DMA_BUF`]).
-    if one_dma_buf_imports() && super::dma_buf::fits_one(first, end - first).is_ok() {
+    if one_dma_buf_holds(first, end) {
         return true;
     }
     let adding = vm::mappings_added(&pieces);
@@ -412,8 +498,8 @@ pub(crate) fn learn_view_imports(device: &rt::Device) {
         return;
     }
     let limits = super::dma_buf::limits();
-    let Some((refused, through_dma_bufs)) =
-        probe_view(device, limits.pieces.saturating_add(1).min(1 << 16))
+    let Some((refused, through_dma_bufs, _)) =
+        probe_view(device, limits.pieces.saturating_add(1).min(1 << 16), false)
     else {
         return;
     };
@@ -444,7 +530,10 @@ pub(crate) fn learn_view_imports(device: &rt::Device) {
         let one = (limits.pieces)
             .min(limits.bytes / vm::page_size())
             .min(1 << 16);
-        let taken = matches!(probe_view(device, one), Some((false, true)));
+        let (taken, textures) = match probe_view(device, one, true) {
+            Some((false, true, textures)) => (true, textures),
+            _ => (false, ViewTextures::Unmade),
+        };
         let why = dma_buf_refusal();
         log::info!(
             target: "reims_vgpu_vulkan::os",
@@ -457,7 +546,29 @@ pub(crate) fn learn_view_imports(device: &rt::Device) {
         if let Some(why) = why {
             log::debug!(target: "reims_vgpu_vulkan::os", "the view's dma-buf source: {why}");
         }
+        if taken {
+            log::info!(
+                target: "reims_vgpu_vulkan::os",
+                "{name}: textures over such pages {}",
+                match textures {
+                    ViewTextures::InPlace => {
+                        "lie in place, so a view one dma-buf holds is mapped through it"
+                    }
+                    ViewTextures::Pending => {
+                        "wait on the device's check, which has not answered in this process, so \
+                         views stay mapped from their files in it"
+                    }
+                    ViewTextures::Shadowed | ViewTextures::Unmade => {
+                        "are shadows, so views stay mapped from their files"
+                    }
+                }
+            );
+        }
         ONE_DMA_BUF.store(taken, Ordering::Relaxed);
+        ONE_DMA_BUF_VIEWS.store(
+            taken && textures == ViewTextures::InPlace,
+            Ordering::Relaxed,
+        );
         IMPORTS_NEED_FILES.store(true, Ordering::Relaxed);
         learn_folds(device);
         budget::warn_if_imports_short();
@@ -636,7 +747,9 @@ fn probe_fold(device: &rt::Device) -> Result<(), &'static str> {
     let end = check.view + length;
     // Unmapped as they drop: once the runtime freed the probe's import, where it makes one.
     let pages = ProbePages::new(check.view, check.own, length);
-    if vm.remap_runs_shared_overwrite(view, &check.runs()).is_err()
+    // From its files, as a view of more runs than one dma-buf takes is (`super::vm`'s module
+    // docs, "One dma-buf a view").
+    if vm::from_files(|| vm.remap_runs_shared_overwrite(view, &check.runs())).is_err()
         || !files::through_pieces(check.view, end).is_empty()
     {
         return Err("its view was not mapped from its files");
@@ -686,7 +799,7 @@ fn probe_fold(device: &rt::Device) -> Result<(), &'static str> {
     }
     check.copied_in_view_order(copied)?;
     drop((out, other));
-    if vm.remap_runs_shared_overwrite(view, &check.runs()).is_err() {
+    if vm::from_files(|| vm.remap_runs_shared_overwrite(view, &check.runs())).is_err() {
         return Err("its view was not mapped from its files again");
     }
     if !vm::fold_held(check.view..end) {
@@ -727,7 +840,8 @@ struct FoldCheck {
 }
 
 impl FoldCheck {
-    /// The byte the GPU fills the first half of the view's pages with.
+    /// The byte the GPU fills the first half of the view's pages with, half its pages rounded
+    /// down (of an odd count the middle page keeps what was written).
     const FILL: u8 = 0xc3;
 
     /// The byte written through the pages' own mapping into its `i`th page.
@@ -770,9 +884,9 @@ impl FoldCheck {
     }
 
     /// One command buffer on `device` that copies `buffer`, over the view, into a buffer of the
-    /// device's own, then fills the first half of `buffer` with [`FoldCheck::FILL`]; then whether
-    /// the copy holds what was written through the pages' own mapping, in the view's order, and
-    /// the fill shows through the pages' own mapping and through the view.
+    /// device's own, then fills the first half of `buffer`'s pages with [`FoldCheck::FILL`]; then
+    /// whether the copy holds what was written through the pages' own mapping, in the view's
+    /// order, and the fill shows through the pages' own mapping and through the view.
     fn gpu(&self, device: &rt::Device, buffer: &rt::Buffer) -> Result<(), &'static str> {
         self.gpu_seen(device, buffer, Some(self.view))
     }
@@ -816,8 +930,8 @@ impl FoldCheck {
     }
 
     /// One command buffer on `device` that copies `buffer` into a buffer of the device's own, and
-    /// where `fill`, then fills the first half of `buffer` with [`FoldCheck::FILL`], completed:
-    /// the device's buffer, and the address of its contents.
+    /// where `fill`, then fills the first half of `buffer`'s pages with [`FoldCheck::FILL`],
+    /// completed: the device's buffer, and the address of its contents.
     fn run(
         &self,
         device: &rt::Device,
@@ -838,7 +952,7 @@ impl FoldCheck {
         let mut blit = cb.blit_command_encoder().map_err(|_| "no blit encoder")?;
         blit.copy_from_buffer_to_buffer(buffer, 0, &out, 0, length)
             .and_then(|()| match fill {
-                true => blit.fill_buffer(buffer, 0..length / 2, Self::FILL),
+                true => blit.fill_buffer(buffer, 0..self.pages / 2 * vm::page_size(), Self::FILL),
                 false => Ok(()),
             })
             .and_then(|()| blit.end_encoding())
@@ -861,9 +975,14 @@ impl FoldCheck {
 /// and released at once, its pages unmapped once the runtime freed its import ([`ProbePages`]).
 /// Whether the device refused it, or made a copy of the view in its place as its import failed
 /// (the runtime's `copied-host-pages`, which the probe's call hears unheard,
-/// `crate::answer::unheard`), and whether it took it through the dma-bufs its source makes;
-/// `None` where the view is not mapped through dma-bufs.
-fn probe_view(device: &rt::Device, count: u64) -> Option<(bool, bool)> {
+/// `crate::answer::unheard`), whether it took it through the dma-bufs its source makes, and,
+/// where `textures` and it did, whether textures over it lie in place ([`view_textures`]); `None`
+/// where the view is not mapped through dma-bufs.
+fn probe_view(
+    device: &rt::Device,
+    count: u64,
+    textures: bool,
+) -> Option<(bool, bool, ViewTextures)> {
     use crate::core::platform::os::vm::HostVm as _;
     let vm = super::LinuxVm::new();
     let page = vm::page_size();
@@ -897,8 +1016,13 @@ fn probe_view(device: &rt::Device, count: u64) -> Option<(bool, bool)> {
     let before = copies();
     let made = crate::answer::unheard(|| device.new_buffer_with_descriptor(descriptor));
     let refused = made.is_err() || copies() > before;
+    let through = !refused && asked.load(Ordering::Relaxed);
+    let made_textures = match &made {
+        Ok(buffer) if textures && through => view_textures(device, buffer, page),
+        _ => ViewTextures::Unmade,
+    };
     drop(made);
-    Some((refused, !refused && asked.load(Ordering::Relaxed)))
+    Some((refused, through, made_textures))
 }
 
 /// The pages of [`learn_view_imports`]' probe, its view and the file pages it shows, each
@@ -1079,6 +1203,19 @@ unsafe fn host_memory_noting(
                 drop(held);
                 return Ok(pieces);
             }
+        }
+        // A whole view's pages, where it is mapped through one dma-buf kept for its imports: a
+        // duplicate of that dma-buf's descriptor, the runtime's own (`super::vm`'s module docs,
+        // "Imports of views").
+        if let Some(file) = own_view_buf(first, length) {
+            log::debug!(
+                "{length:#x} bytes at {first:#x} as the dma-buf their view is mapped through"
+            );
+            return Ok(vec![rt::DmaBufChunk {
+                file: Arc::new(file),
+                offset: 0,
+                length,
+            }]);
         }
         let began = crate::core::trace::on().then(crate::core::trace::now);
         // A texture's own pages asked for again: the answer kept ([`Kept`]).
@@ -1306,6 +1443,16 @@ pub(crate) fn dma_buf_refusal() -> Option<String> {
     REFUSAL.with_borrow_mut(Option::take)
 }
 
+/// A duplicate of the descriptor of the dma-buf a view is mapped through whole, where the
+/// `length` bytes from `first` are all of it (`super::files`'s `kept_whole`): one dma-buf of
+/// exactly those pages, as [`host_memory`]'s source answers, made of none. None where they are
+/// not, or the kernel gives no descriptor (counted against the open-file limit), which leaves the
+/// source to make one.
+fn own_view_buf(first: u64, length: u64) -> Option<std::os::fd::OwnedFd> {
+    let kept = files::kept_whole(first, length)?;
+    kept.fd.try_clone().ok()
+}
+
 /// The memory the runtime imports for `length` bytes at `at`: those bytes, where every page of
 /// them is mapped writable or one has no file behind it (which the runtime then refuses as it
 /// refuses any import there), and where one is mapped read-only, which the gate refuses, so the
@@ -1313,8 +1460,26 @@ pub(crate) fn dma_buf_refusal() -> Option<String> {
 /// pages mapped from their files, what of writable bytes lies in views through dma-bufs is mapped
 /// from them, short of the headroom of the views' budget, past which the gate refuses the pages
 /// and the runtime copies them ([`import_gate`]): the runtime asks the gate about every import, a
-/// no-copy buffer's or heap's.
+/// no-copy buffer's or heap's. A no-copy buffer's pages one dma-buf holds, on a device that takes
+/// such a dma-buf and makes textures over its pages in place ([`ONE_DMA_BUF_VIEWS`]), are left
+/// where they lie: the runtime imports them through a dma-buf, the view's own where it is mapped
+/// through one whole ([`host_memory`]). A heap's are mapped from their files as any are
+/// ([`import_heap_view`]).
 pub(crate) fn import_view(at: NonNull<u8>, length: u64) -> ImportView {
+    import_view_as(at, length, true)
+}
+
+/// [`import_view`] of a heap's `length` bytes at `at`: what of them lies in views through
+/// dma-bufs is mapped from their files short of the headroom, though one dma-buf holds them, as
+/// before views were mapped through one: the runtime imports a heap's dma-buf only as memory
+/// dedicated to nothing (the runtime's `dma_buf.rs`, "Shared files"), which NVIDIA's driver
+/// refuses for small dma-bufs, and a heap over such pages on ANV was not measured.
+pub(crate) fn import_heap_view(at: NonNull<u8>, length: u64) -> ImportView {
+    import_view_as(at, length, false)
+}
+
+/// [`import_view`], leaving the pages one dma-buf holds where they lie where `leave_one`.
+fn import_view_as(at: NonNull<u8>, length: u64, leave_one: bool) -> ImportView {
     let plain = ImportView {
         at,
         pinned: None,
@@ -1334,8 +1499,11 @@ pub(crate) fn import_view(at: NonNull<u8>, length: u64) -> ImportView {
     if writable != Some(false) {
         // Recorded before its pages are mapped from their files, so no fold maps them back.
         let pinned = Pinned::new(first, end);
-        // Pages left in views through dma-bufs for want of room are refused at the gate.
-        if imports_need_files() {
+        // Pages left in views through dma-bufs for want of room are refused at the gate, but
+        // those one dma-buf holds, which a no-copy buffer's import leaves there.
+        if imports_need_files()
+            && !(leave_one && one_dma_buf_views() && one_dma_buf_holds(first, end))
+        {
             let _ = vm::unfold(first, end);
         }
         return ImportView {
@@ -1603,6 +1771,179 @@ mod tests {
         assert!(vm.deallocate(src, more * PAGE).is_success());
     }
 
+    /// Where the device that needs imported pages mapped from their files takes the pages one
+    /// dma-buf holds through it and makes textures over them in place ([`ONE_DMA_BUF_VIEWS`]), a
+    /// view one dma-buf holds is mapped through it with room in the
+    /// views' budget: one mapping, the dma-buf kept. A no-copy buffer's import leaves it so and
+    /// the gate lets it through; the source answers the whole view with a duplicate of the kept
+    /// dma-buf's descriptor, its bytes, making none, and part of the view not so. A device that
+    /// pins a pointer's pages is given them mapped from their files, which closes the kept dma-buf
+    /// as its last run goes, and so is a heap's import; a view through one dma-buf closes it as
+    /// the view goes. A view of one run more than one dma-buf takes is mapped from its files, and
+    /// one made inside `vm::from_files`. Where the device makes textures over such pages shadows,
+    /// a view one dma-buf holds is mapped from its files, and a no-copy buffer's import of one
+    /// mapped through it maps it from its files. The flags are the process's, which nextest runs
+    /// this test alone in.
+    #[test]
+    fn a_view_one_dma_buf_holds_is_mapped_through_it_kept_for_its_imports() {
+        if !super::super::dma_buf::opens() {
+            eprintln!("skipped: udmabuf does not open");
+            return;
+        }
+        IMPORTS_NEED_FILES.store(true, Ordering::Relaxed);
+        ONE_DMA_BUF.store(true, Ordering::Relaxed);
+        ONE_DMA_BUF_VIEWS.store(true, Ordering::Relaxed);
+        let vm = LinuxVm::new();
+        let copied = || COPIED.count.load(Ordering::Relaxed);
+        let made = || super::super::dma_buf::MADE.load(Ordering::Relaxed);
+        let n = 32u64;
+        let (src, view) = backwards(&vm, n);
+        let p = NonNull::new(view.as_ptr::<u8>()).unwrap();
+        let (first, end) = (addr(p), addr(p) + n * PAGE);
+        let mappings = || vm::tests::kernel_mappings(first, end);
+        assert_eq!(mappings(), 1, "through one dma-buf");
+        let kept = files::kept_whole(first, n * PAGE).expect("its dma-buf kept");
+        let closed = Arc::downgrade(&kept);
+        drop(kept);
+        write(first + 7, 0x77);
+        let before = copied();
+        let import = import_view(p, n * PAGE);
+        assert_eq!((import.at(), mappings()), (p, 1), "an import's, left");
+        assert!(gate(first, end), "let through");
+        assert_eq!(copied(), before, "uncounted");
+        let made_before = made();
+        let own = own_view_buf(first, n * PAGE).expect("a duplicate of the kept dma-buf");
+        assert_eq!(made(), made_before, "no dma-buf made");
+        // SAFETY: a seek of a descriptor of the test's own, which a dma-buf answers with its size.
+        let size = unsafe { libc::lseek(std::os::fd::AsRawFd::as_raw_fd(&own), 0, libc::SEEK_END) };
+        assert_eq!(u64::try_from(size), Ok(n * PAGE), "the view's bytes");
+        drop(own);
+        assert!(
+            own_view_buf(first + PAGE, (n - 1) * PAGE).is_none(),
+            "part of it"
+        );
+        assert!(own_view_buf(first, (n - 1) * PAGE).is_none(), "part of it");
+        drop(import);
+        assert!(
+            super::super::device_lend::map_for_pointer(p, n * PAGE),
+            "mapped from its files for a pointer"
+        );
+        assert_eq!(mappings(), n, "from its files");
+        assert_eq!(read(first + 7), 0x77, "the same pages");
+        assert!(
+            closed.upgrade().is_none(),
+            "its dma-buf closed with its last run"
+        );
+        assert!(vm.deallocate(view, n * PAGE).is_success());
+        // Through one dma-buf again: a heap's import maps it from its files.
+        let runs: Vec<_> = (0..n)
+            .map(|i| (src.wrapping_add((n - 1 - i) * PAGE), PAGE))
+            .collect();
+        let again = vm.allocate_anywhere(n * PAGE).unwrap();
+        vm.remap_runs_shared_overwrite(again, &runs).unwrap();
+        let a = again.addr().to_u64();
+        let closed = Arc::downgrade(&files::kept_whole(a, n * PAGE).expect("kept again"));
+        let heap = import_heap_view(NonNull::new(again.as_ptr::<u8>()).unwrap(), n * PAGE);
+        assert_eq!(
+            vm::tests::kernel_mappings(a, a + n * PAGE),
+            n,
+            "a heap's, from its files"
+        );
+        assert!(
+            closed.upgrade().is_none(),
+            "its dma-buf closed with its last run"
+        );
+        drop(heap);
+        assert!(vm.deallocate(again, n * PAGE).is_success());
+        // And once more, gone with the view.
+        let again = vm.allocate_anywhere(n * PAGE).unwrap();
+        vm.remap_runs_shared_overwrite(again, &runs).unwrap();
+        let a = again.addr().to_u64();
+        let closed = Arc::downgrade(&files::kept_whole(a, n * PAGE).expect("kept once more"));
+        assert!(vm.deallocate(again, n * PAGE).is_success());
+        assert_eq!(vm::tests::kernel_mappings(a, a + n * PAGE), 0, "unmapped");
+        assert!(
+            closed.upgrade().is_none(),
+            "its dma-buf closed with the view"
+        );
+        assert!(vm.deallocate(src, n * PAGE).is_success());
+        // One run more than one dma-buf takes: from its files, as before.
+        let more = past_one_dma_buf();
+        let (src, view) = backwards(&vm, more);
+        let m = view.addr().to_u64();
+        assert_eq!(
+            vm::tests::kernel_mappings(m, m + more * PAGE),
+            more,
+            "from its files"
+        );
+        assert!(files::through_pieces(m, m + more * PAGE).is_empty());
+        assert!(vm.deallocate(view, more * PAGE).is_success());
+        assert!(vm.deallocate(src, more * PAGE).is_success());
+        // A view the thread makes inside `from_files`: from its files.
+        let src = vm::allocate_aliasable(n * PAGE).unwrap();
+        let view = vm.allocate_anywhere(n * PAGE).unwrap();
+        let runs: Vec<_> = (0..n)
+            .map(|i| (src.wrapping_add((n - 1 - i) * PAGE), PAGE))
+            .collect();
+        vm::from_files(|| vm.remap_runs_shared_overwrite(view, &runs)).unwrap();
+        let v = view.addr().to_u64();
+        assert_eq!(
+            vm::tests::kernel_mappings(v, v + n * PAGE),
+            n,
+            "from its files"
+        );
+        assert!(vm.deallocate(view, n * PAGE).is_success());
+        assert!(vm.deallocate(src, n * PAGE).is_success());
+        // Textures over such pages shadows: a view from its files, and an import of one mapped
+        // through its dma-buf before maps it from its files.
+        let (src, through) = backwards(&vm, n);
+        ONE_DMA_BUF_VIEWS.store(false, Ordering::Relaxed);
+        let view = vm.allocate_anywhere(n * PAGE).unwrap();
+        let runs: Vec<_> = (0..n)
+            .map(|i| (src.wrapping_add((n - 1 - i) * PAGE), PAGE))
+            .collect();
+        vm.remap_runs_shared_overwrite(view, &runs).unwrap();
+        let v = view.addr().to_u64();
+        assert_eq!(
+            vm::tests::kernel_mappings(v, v + n * PAGE),
+            n,
+            "shadows: from its files"
+        );
+        assert!(files::kept_whole(v, n * PAGE).is_none(), "none kept");
+        let t = through.addr().to_u64();
+        assert_eq!(vm::tests::kernel_mappings(t, t + n * PAGE), 1);
+        let import = import_view(NonNull::new(through.as_ptr::<u8>()).unwrap(), n * PAGE);
+        assert_eq!(
+            vm::tests::kernel_mappings(t, t + n * PAGE),
+            n,
+            "shadows: an import's from its files"
+        );
+        drop(import);
+        for at in [view, through] {
+            assert!(vm.deallocate(at, n * PAGE).is_success());
+        }
+        assert!(vm.deallocate(src, n * PAGE).is_success());
+        ONE_DMA_BUF.store(false, Ordering::Relaxed);
+    }
+
+    /// [`view_textures`]' answer for `device` now, its checks answered: [`learn_view_imports`]'
+    /// probe of a view of 64 pages one dma-buf holds made again, as when the device was made.
+    fn settled_view_textures(device: &rt::Device) -> ViewTextures {
+        IMPORTS_NEED_FILES.store(false, Ordering::Relaxed);
+        let probed = probe_view(device, 64, true);
+        IMPORTS_NEED_FILES.store(true, Ordering::Relaxed);
+        probes_gone();
+        probed.map_or(ViewTextures::Unmade, |(_, _, textures)| textures)
+    }
+
+    /// One page more than one dma-buf takes, a run each, within udmabuf's limits as the host has
+    /// them: a view of so many pages backwards is mapped from its files on a device that takes
+    /// the pages one dma-buf holds through it (`super::vm`'s module docs, "One dma-buf a view").
+    fn past_one_dma_buf() -> u64 {
+        let limits = super::super::dma_buf::limits();
+        limits.pieces.min(limits.bytes / PAGE) + 1
+    }
+
     /// A view of `n` pages of a fresh range a view can be made of, backwards, mapped from their
     /// files where a device of the process needs imported pages so: the range and the view.
     fn backwards(vm: &LinuxVm, n: u64) -> (HostAddr, HostAddr) {
@@ -1673,15 +2014,15 @@ mod tests {
     }
 
     /// On a device whose imports' views are not folded once made, a no-copy buffer's view mapped
-    /// from its files, made, stays so through a fold, where the device needs imported pages so;
-    /// elsewhere views are mapped through dma-bufs, and nothing is folded or unfolded for an
-    /// import.
+    /// from its files, of more runs than one dma-buf takes ([`past_one_dma_buf`]), made, stays so
+    /// through a fold, where the device needs imported pages so; elsewhere views are mapped
+    /// through dma-bufs, and nothing is folded or unfolded for an import.
     fn fold_stays_off(d: &crate::gpu::device::VulkanDevice) {
         if !imports_need_files() {
             return;
         }
         let vm = LinuxVm::new();
-        let n = 64;
+        let n = past_one_dma_buf();
         let (src, view) = backwards(&vm, n);
         let (first, end) = (view.addr().to_u64(), view.addr().to_u64() + n * PAGE);
         let (buffer, gone) = no_copy(d, view, n);
@@ -1828,7 +2169,8 @@ mod tests {
 
     /// On a device whose imports' views are folded once made ([`folding_device`], NVIDIA's; on
     /// others the fold is checked off), a no-copy buffer's view made 100 times over pages of a
-    /// file of their own, folded into a dma-buf once made: the GPU
+    /// file of their own, of more runs than one dma-buf takes ([`past_one_dma_buf`]), so mapped
+    /// from its files, folded into a dma-buf once made: the GPU
     /// reads the bytes written through the pages' own mapping after the fold and its fill shows
     /// through both mappings, and the buffer's release gives everything back: the views' mappings,
     /// their records, the process's mappings, and the pages, which the kernel then lets the file
@@ -1840,7 +2182,7 @@ mod tests {
             return;
         };
         let vm = LinuxVm::new();
-        let n = 256;
+        let n = past_one_dma_buf();
         let before = (files::mappings(), PINNED.lock().len(), process_mappings());
         for round in 0..100 {
             let (src, view) = backwards(&vm, n);
@@ -1890,8 +2232,9 @@ mod tests {
     }
 
     /// On a device whose imports' views are folded once made ([`folding_device`], NVIDIA's; on
-    /// others the fold is checked off), a no-copy buffer whose view was folded into a dma-buf once
-    /// made keeps the pages it was made over when other pages are
+    /// others the fold is checked off), a no-copy buffer whose view, of more runs than one dma-buf
+    /// takes ([`past_one_dma_buf`]), was folded into a dma-buf once made keeps the pages it was
+    /// made over when other pages are
     /// mapped over its range, untold, as an import of a view mapped from its files keeps them
     /// (`tests/no_copy_remap_linux.rs`): the GPU reads the old pages and fills them, and the range
     /// shows the new pages, untouched.
@@ -1901,7 +2244,7 @@ mod tests {
             return;
         };
         let vm = LinuxVm::new();
-        let n = 64;
+        let n = past_one_dma_buf();
         let (src, view) = backwards(&vm, n);
         let check = FoldCheck {
             own: src.addr().to_u64(),
@@ -1989,6 +2332,197 @@ mod tests {
         assert!(vm.deallocate(other, n * PAGE).is_success());
         assert!(vm.deallocate(view, n * PAGE).is_success());
         assert!(vm.deallocate(src, n * PAGE).is_success());
+    }
+
+    /// On a device that needs imported pages mapped from their files, takes the pages one dma-buf
+    /// holds through it ([`ONE_DMA_BUF`]; ANV's and NVIDIA's) and makes textures over them in
+    /// place, its checks answered ([`view_textures`]; the flag set here), a no-copy buffer over a
+    /// view of 64 pages backwards, made with room in the views' budget: the view is one mapping,
+    /// the runtime imports it through the view's own dma-buf, by none made again, with no pointer
+    /// and no copy; the GPU reads what was written through the pages' own mapping, and its fill
+    /// shows there; a linear BGRA8 texture over the buffer, a page a row, is not shadowed, and the
+    /// GPU reads its texels from the pages and writes them there. Once the buffer goes and the view
+    /// is unmapped, the view's dma-buf is closed. On a device that takes such pages but makes
+    /// textures over them shadows (NVIDIA's) the view is mapped from its files. Which it
+    /// found is said on stderr. Elsewhere, said on stderr, nothing is checked.
+    #[test]
+    fn a_view_one_dma_buf_holds_is_imported_through_it() {
+        use metal2vulkan::metal::{PixelFormat, TextureUsage};
+        let d = crate::gpu::device::tests::dev();
+        crate::gpu::device::tests::settle_device_checks(&d);
+        probes_gone();
+        let name = &d.raw.properties().name;
+        if !(imports_need_files() && one_dma_buf_imports()) {
+            eprintln!(
+                "skipped: {name} takes views of pages mapped through dma-bufs, or refuses one \
+                 dma-buf's"
+            );
+            return;
+        }
+        let vm = LinuxVm::new();
+        let textures = settled_view_textures(&d.raw);
+        eprintln!("{name}: textures over the pages one dma-buf holds: {textures:?}");
+        ONE_DMA_BUF_VIEWS.store(textures == ViewTextures::InPlace, Ordering::Relaxed);
+        if textures != ViewTextures::InPlace {
+            let (src, view) = backwards(&vm, 64);
+            let v = view.addr().to_u64();
+            assert_eq!(
+                vm::tests::kernel_mappings(v, v + 64 * PAGE),
+                64,
+                "from its files"
+            );
+            assert!(vm.deallocate(view, 64 * PAGE).is_success());
+            assert!(vm.deallocate(src, 64 * PAGE).is_success());
+            return;
+        }
+        let n = 64;
+        let (src, view) = backwards(&vm, n);
+        let check = FoldCheck {
+            own: src.addr().to_u64(),
+            view: view.addr().to_u64(),
+            pages: n,
+            round: 3,
+        };
+        let (first, end) = (check.view, check.view + n * PAGE);
+        assert_eq!(vm::tests::kernel_mappings(first, end), 1, "one mapping");
+        let closed = Arc::downgrade(&files::kept_whole(first, n * PAGE).expect("kept"));
+        check.write();
+        let before = d.raw.work_counts();
+        let made = super::super::dma_buf::MADE.load(Ordering::Relaxed);
+        let (buffer, gone) = no_copy(&d, view, n);
+        let after = d.raw.work_counts();
+        assert_eq!(
+            (
+                after.dma_buf_imports - before.dma_buf_imports,
+                after.host_pointer_imports_made - before.host_pointer_imports_made,
+                after.copied_host_buffers_made - before.copied_host_buffers_made,
+                super::super::dma_buf::MADE.load(Ordering::Relaxed) - made,
+            ),
+            (1, 0, 0, 0),
+            "imported through the view's own dma-buf"
+        );
+        assert_eq!(vm::tests::kernel_mappings(first, end), 1, "left so");
+        assert_eq!(check.gpu(&d.raw, &buffer.raw), Ok(()));
+        let width = PAGE / 4;
+        let mut descriptor =
+            rt::TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, width, n, false);
+        descriptor.usage = TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE;
+        let shadows = d.raw.work_counts().shadowed_textures;
+        let texture = buffer
+            .raw
+            .new_texture(&descriptor, 0, PAGE)
+            .expect("a texture");
+        assert_eq!(
+            d.raw.work_counts().shadowed_textures,
+            shadows,
+            "not shadowed"
+        );
+        assert_eq!(texture_round_trip(&d.raw, &texture, &check, width), Ok(()));
+        drop(texture);
+        released(buffer, &gone, first, end);
+        assert!(vm.deallocate(view, n * PAGE).is_success());
+        assert!(closed.upgrade().is_none(), "its dma-buf closed");
+        assert!(vm.deallocate(src, n * PAGE).is_success());
+    }
+
+    /// [`a_view_one_dma_buf_holds_is_imported_through_it`]'s texture: its texels read by a GPU
+    /// copy into a buffer of the device's own and checked against what [`FoldCheck::write`] wrote
+    /// through the pages' own mapping in the view's order (after [`FoldCheck::gpu`]'s fill of the
+    /// first half), then every texel written by a GPU copy from a buffer of the device's own,
+    /// checked through the pages' own mapping.
+    fn texture_round_trip(
+        device: &rt::Device,
+        texture: &rt::Texture,
+        check: &FoldCheck,
+        width: u64,
+    ) -> Result<(), &'static str> {
+        let n = check.pages;
+        let length = n * PAGE;
+        let own = || {
+            let descriptor = rt::BufferDescriptor::new(
+                length,
+                rt::ResourceOptions::shared(),
+                rt::BufferContents::Zero,
+            )
+            .with_placement(rt::AddressPlacement::Outside);
+            crate::answer::unheard(|| device.new_buffer_with_descriptor(descriptor))
+                .map_err(|_| "no buffer of the device's own")
+        };
+        let (out, pattern) = (own()?, own()?);
+        let byte = |j: u64| u8::try_from((j * 7) % 256).unwrap_or(0) ^ 0x3c;
+        let at = pattern.contents().ok_or("no contents")?.as_ptr();
+        for j in 0..n {
+            // SAFETY: the device's own buffer of `length` bytes, mapped.
+            unsafe {
+                std::ptr::write_bytes(at.add((j * PAGE).to_usize()), byte(j), PAGE.to_usize())
+            };
+        }
+        let queue = device.new_command_queue().map_err(|_| "no command queue")?;
+        let size = rt::Size::new(width, n, 1);
+        let origin = rt::Origin::new(0, 0, 0);
+        let run = |to_buffer: bool| -> Result<(), &'static str> {
+            let cb = queue.command_buffer().map_err(|_| "no command buffer")?;
+            let mut blit = cb.blit_command_encoder().map_err(|_| "no blit encoder")?;
+            let encoded = match to_buffer {
+                true => blit.copy_from_texture_to_buffer(
+                    texture,
+                    0,
+                    0,
+                    origin,
+                    size,
+                    &out,
+                    0,
+                    PAGE,
+                    length,
+                    rt::BlitOption::None,
+                ),
+                false => blit.copy_from_buffer_to_texture(
+                    &pattern,
+                    0,
+                    PAGE,
+                    length,
+                    size,
+                    texture,
+                    0,
+                    0,
+                    origin,
+                    rt::BlitOption::None,
+                ),
+            };
+            encoded
+                .and_then(|()| blit.end_encoding())
+                .and_then(|()| cb.commit())
+                .map_err(|_| "its commands were refused")?;
+            cb.wait_until_completed_for(std::time::Duration::from_secs(10))
+                .map_err(|_| "its command buffer did not complete within 10 s")?;
+            match cb.status() == rt::CommandBufferStatus::Completed {
+                true => Ok(()),
+                false => Err("its command buffer failed"),
+            }
+        };
+        run(true)?;
+        let copied = out
+            .contents()
+            .ok_or("no contents")?
+            .as_ptr()
+            .addr()
+            .to_u64();
+        for j in 0..n {
+            let now = match j < n / 2 {
+                true => FoldCheck::FILL,
+                false => check.written(n - 1 - j),
+            };
+            if FoldCheck::ends(copied, j) != [now; 2] {
+                return Err("its GPU read of the texture is not the pages' bytes");
+            }
+        }
+        run(false)?;
+        for j in 0..n {
+            if FoldCheck::ends(check.own, n - 1 - j) != [byte(j); 2] {
+                return Err("its GPU write of the texture did not reach the pages");
+            }
+        }
+        Ok(())
     }
 
     /// Where views are imported through their dma-bufs and udmabuf opens ([`groups_views`],
