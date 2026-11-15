@@ -1048,6 +1048,28 @@
 // The device's MSI-X vectors: vector 0 is the control completion ring's.
 #define RGFX_MSIX_VECTORS 1
 
+// The BAR of the doorbell pages: 32-bit MMIO, not prefetchable, [`RGFX_DOORBELLS_SIZE`] bytes,
+// [`RGFX_DOORBELL_PAGES`] pages of [`RGFX_DOORBELL_PAGE_SIZE`] bytes each, where the host offers
+// [`RGFX_FEATURE_DOORBELL_PAGES`]. A page bound to a context ([`RGFX_REG_DOORBELL_PAGE_BIND`]) is
+// that context's own `DOORBELL`, which the kext maps into the context's process: a 32-bit write
+// at the page's first byte of a ring's id, with [`RGFX_DOORBELL_ASKS`] as `DOORBELL` takes it,
+// wakes that ring where it is one of the context's command queues' rings. Every other write (an
+// unbound page, another offset, ring 0, a ring of no queue of the context's) is dropped, and
+// every read answers 0: the page holds no register a process could reset or reconfigure the
+// device with.
+#define RGFX_PCI_BAR_DOORBELLS 4
+
+// The bytes of one doorbell page: 16 KiB, the largest page a guest maps (an arm64 guest's), so
+// a process's mapping of its page reaches no other page.
+#define RGFX_DOORBELL_PAGE_SIZE 16384
+
+// How many doorbell pages BAR 4 holds: a busy desktop holds 74 contexts at once, and a context
+// past them, or one whose page the kext could not map, rings through the kext's doorbell call.
+#define RGFX_DOORBELL_PAGES 256
+
+// The size of BAR 4: [`RGFX_DOORBELL_PAGES`] pages of [`RGFX_DOORBELL_PAGE_SIZE`] bytes, 4 MiB.
+#define RGFX_DOORBELLS_SIZE (RGFX_DOORBELL_PAGES * RGFX_DOORBELL_PAGE_SIZE)
+
 // `MAGIC`, RO: [`RGFX_MAGIC`].
 #define RGFX_REG_MAGIC 0
 
@@ -1078,7 +1100,8 @@
 // [`RGFX_FEATURE_RATE_MAPS`], [`RGFX_FEATURE_FUNCTION_POINTERS`],
 // [`RGFX_FEATURE_DYNAMIC_LIBRARIES`], [`RGFX_FEATURE_PIPELINE_KEYS`],
 // [`RGFX_FEATURE_ICB_SLOTS_IN_PAGES`], [`RGFX_FEATURE_DOORBELL_ASKS`],
-// [`RGFX_FEATURE_GUEST_TIMES`] and [`RGFX_FEATURE_READ_ONLY_PAGES`].
+// [`RGFX_FEATURE_GUEST_TIMES`], [`RGFX_FEATURE_READ_ONLY_PAGES`] and
+// [`RGFX_FEATURE_DOORBELL_PAGES`].
 // On a host that offers `PAGES_16K`, `FEATURES_LO` and `_HI` read the guest RAM features only
 // once the guest took it.
 #define RGFX_REG_FEATURES_HI 12
@@ -1445,6 +1468,15 @@
 // it offers [`RGFX_FEATURE_PAGES_BUFFERS`].
 #define RGFX_FEATURE_READ_ONLY_PAGES 35184372088832
 
+// `FEATURES_HI` bit 14, feature bit 46, `DOORBELL_PAGES`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_HI`]: BAR 4 ([`RGFX_PCI_BAR_DOORBELLS`]) holds the doorbell pages,
+// which the guest binds to its contexts with [`RGFX_REG_DOORBELL_PAGE_BIND`]. A page's write
+// wakes only the bound context's own rings, so the kext maps each context's page into its
+// process, which rings its queues there with no call into the kext. The host routes a queue's
+// plain doorbell on its context's page where the context has one, and on `DOORBELL` otherwise.
+// A host offers it where it maps BAR 4 and hands the device its writes.
+#define RGFX_FEATURE_DOORBELL_PAGES 70368744177664
+
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 #define RGFX_REG_STATUS 16
@@ -1505,6 +1537,17 @@
 // `HOST_TIME_HI`, RO: the host's monotonic clock at the read, its high 32 bits, as
 // [`RGFX_REG_HOST_TIME_LO`].
 #define RGFX_REG_HOST_TIME_HI 60
+
+// `DOORBELL_PAGE_BIND`, WO: where the guest took [`RGFX_FEATURE_DOORBELL_PAGES`], binds doorbell
+// page `value & 0xff` to context `value >> RGFX_DOORBELL_PAGE_BIND_CONTEXT_SHIFT`, or unbinds it
+// for context 0: from the write on, the page's writes wake the rings of that context's command
+// queues alone, and its queues made after it have their plain doorbells routed on the page. A
+// page past [`RGFX_DOORBELL_PAGES`] is ignored, and a reset unbinds every page. It reads 0.
+#define RGFX_REG_DOORBELL_PAGE_BIND 64
+
+// Where a [`RGFX_REG_DOORBELL_PAGE_BIND`] value's context starts: bits 8 to 31, so a context of
+// 2^24 or more (whose object ids would pass 64 bits) gets no page.
+#define RGFX_DOORBELL_PAGE_BIND_CONTEXT_SHIFT 8
 
 // What `MAGIC` reads: "RGFX", little-endian.
 #define RGFX_MAGIC 1481000786

@@ -30,6 +30,7 @@ fn headless(raised: &Arc<AtomicU32>) -> GraphicsDevice<FakePlatform> {
         window: None,
         memory_map: None,
         guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
     };
     GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap()
 }
@@ -149,6 +150,7 @@ fn on_vulkan_the_let_go_waits_for_a_callback_blocked_on_the_releasers_lock_only_
         window: None,
         memory_map: None,
         guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
     };
     let device = GraphicsDevice::with_platform(crate::singleton::platform(), config).unwrap();
     let held = lock.lock();
@@ -197,6 +199,7 @@ fn headless_over(
         window: None,
         memory_map: None,
         guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     (device, platform)
@@ -248,6 +251,7 @@ fn on_vulkan_guest_texture_ids_are_kept_from_the_host_s() {
         window: None,
         memory_map: None,
         guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
     };
     let _device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     let gpu = platform.metal_device(None).unwrap();
@@ -313,6 +317,7 @@ fn on_vulkan_a_queue_before_the_graphics_device_takes_no_guest_texture_id() {
         window: None,
         memory_map: None,
         guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
     };
     let _device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     let plain_desc = platform.texture_descriptor(&TextureDesc {
@@ -1353,6 +1358,7 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
         window: None,
         memory_map: None,
         guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1428,6 +1434,7 @@ fn an_out_of_line_command_buffer_is_carried_out_from_one_copy() {
         window: None,
         memory_map: None,
         guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1519,6 +1526,7 @@ fn a_doorbell_write_answers_a_command_buffer_on_its_thread() {
         window: None,
         memory_map: None,
         guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1605,6 +1613,7 @@ fn a_doorbell_s_answer_allocates_nothing() {
         window: None,
         memory_map: None,
         guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1721,6 +1730,7 @@ fn a_landed_download_s_answer_at_its_doorbell_allocates_nothing() {
         window: None,
         memory_map: None,
         guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
     };
     let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1800,6 +1810,7 @@ fn a_lone_buffer_s_doorbell_to_its_cb_submitted() {
         window: None,
         memory_map: None,
         guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -2176,6 +2187,7 @@ fn calling_back(ring: u64) -> (Arc<GraphicsDevice<FakePlatform>>, Returned) {
         window: None,
         memory_map: None,
         guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
     };
     let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
     let device = Arc::new(device);
@@ -2335,6 +2347,7 @@ fn the_guest_s_cursor_reaches_the_host() {
         window: None,
         memory_map: None,
         guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
     };
     let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
     let wait = |count: usize| {
@@ -2431,6 +2444,7 @@ fn the_host_is_told_no_cursor_while_the_display_s_panel_is_off() {
         window: None,
         memory_map: None,
         guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
     };
     let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
     let wait = |count: usize| {
@@ -2566,6 +2580,7 @@ fn windowed() -> (GraphicsDevice<FakePlatform>, Arc<FakePlatform>) {
         window: Some(WindowConfig::default()),
         memory_map: None,
         guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     (device, platform)
@@ -8996,6 +9011,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
         window: None,
         memory_map: Some(map),
         guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     let in_place = RGFX_FEATURE_SURFACE_PAGES
@@ -9177,6 +9193,7 @@ fn doorbell_asks_is_offered_only_where_the_host_routes_doorbells_on_linux() {
             window: None,
             memory_map: None,
             guest_arch: GuestArch::X86_64,
+            doorbell_pages: false,
         };
         let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
         let word = u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32;
@@ -9189,6 +9206,23 @@ fn doorbell_asks_is_offered_only_where_the_host_routes_doorbells_on_linux() {
         cfg!(target_os = "linux"),
         "offered to a host that routes, on Linux alone"
     );
+}
+
+/// The device offers `DOORBELL_PAGES` where the host maps BAR 4 and hands it its writes, on every
+/// OS, and not otherwise: a guest without it rings every doorbell as before the bit.
+#[test]
+fn doorbell_pages_is_offered_only_where_the_host_maps_bar_4() {
+    let offered = |doorbell_pages: bool| {
+        let config = GraphicsConfig {
+            doorbell_pages,
+            ..GraphicsConfig::default()
+        };
+        let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
+        let word = u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32;
+        word & RGFX_FEATURE_DOORBELL_PAGES != 0
+    };
+    assert!(!offered(false), "offered to a host that maps no BAR 4");
+    assert!(offered(true), "not offered to a host that maps BAR 4");
 }
 
 /// A device on a GPU of its own memory with a memory map on a guest-sized page offers the
@@ -10270,6 +10304,7 @@ fn surface_device(
         window: None,
         memory_map: Some(map),
         guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -11008,6 +11043,7 @@ fn on_vulkan_an_identity_colour_matrix_reads_as_no_colour() {
         window: None,
         memory_map: None,
         guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
     };
     let device = GraphicsDevice::with_platform(platform, config).unwrap();
     let (width, height, stride) = (256usize, 4usize, 1024usize);
@@ -11264,6 +11300,7 @@ fn on_vulkan_a_read_of_the_display_gives_the_scanout_s_pixels() {
         window: None,
         memory_map: None,
         guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
     };
     let device = GraphicsDevice::with_platform(platform, config).unwrap();
     let (width, height, stride) = (64usize, 32usize, 256usize);
@@ -11359,6 +11396,7 @@ fn on_vulkan_a_read_at_an_odd_width_gives_the_scanout_row_for_row() {
         window: None,
         memory_map: None,
         guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
     };
     let device = GraphicsDevice::with_platform(platform, config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -11463,6 +11501,7 @@ fn on_vulkan_a_presented_surface_at_an_odd_width_reads_row_for_row() {
         window: None,
         memory_map: None,
         guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
     };
     let device = GraphicsDevice::with_platform(platform, config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -11604,6 +11643,7 @@ fn one_queue_raising(
         window: None,
         memory_map: None,
         guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);

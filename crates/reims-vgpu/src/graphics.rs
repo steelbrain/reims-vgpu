@@ -59,9 +59,9 @@ use reims_vgpu_graphics::wire::{
     RGFX_EVT_ICB_STATE, RGFX_EVT_RATE_MAP_ANSWER, RGFX_EVT_RATE_MAP_STATE, RGFX_EVT_SAMPLER_STATE,
     RGFX_FEATURE_CB_SUBMITTED, RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_DISPLAY_COLOR,
     RGFX_FEATURE_DISPLAY_POWER, RGFX_FEATURE_DISPLAY_SCALE, RGFX_FEATURE_DOORBELL_ASKS,
-    RGFX_FEATURE_DYNAMIC_LIBRARIES, RGFX_FEATURE_FUNCTION_POINTERS, RGFX_FEATURE_GUEST_TIMES,
-    RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_HOST_TIME, RGFX_FEATURE_ICB_SLOTS,
-    RGFX_FEATURE_ICB_SLOTS_IN_PAGES, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
+    RGFX_FEATURE_DOORBELL_PAGES, RGFX_FEATURE_DYNAMIC_LIBRARIES, RGFX_FEATURE_FUNCTION_POINTERS,
+    RGFX_FEATURE_GUEST_TIMES, RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_HOST_TIME,
+    RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_ICB_SLOTS_IN_PAGES, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
     RGFX_FEATURE_MANAGED_AT_OFFSET, RGFX_FEATURE_MANAGED_BUFFER_SLABS,
     RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE,
     RGFX_FEATURE_PAGES_16K, RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PIPELINE_KEYS,
@@ -81,8 +81,8 @@ use reims_vgpu_graphics::wire::{
     RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
 use reims_vgpu_graphics::{
-    CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim,
-    RingDegradation, Scanout, Screen,
+    CompleteAnswer, CompletionPoster, CursorImage, DoorbellAt, Host, Mode, PresentAnswer,
+    QueueClaim, RingDegradation, Scanout, Screen,
 };
 use reims_vgpu_vulkan::core::host::HostQueue;
 use reims_vgpu_vulkan::core::memory::map::MemoryMap as CoreMemoryMap;
@@ -165,6 +165,15 @@ pub type GraphicsRaiseFn = Arc<dyn Fn(u32) + Send + Sync>;
 /// it must not wait for a lock the host holds around that call.
 pub type GraphicsRouteDoorbellFn = Arc<dyn Fn(u64, u32, Option<RawFd>) -> bool + Send + Sync>;
 
+/// `(route, page, ring_id, bell)`: [`GraphicsRouteDoorbellFn`], for a write of `ring_id` at the
+/// first byte of doorbell page `page` in BAR 4 (`page * RGFX_DOORBELL_PAGE_SIZE`) in place of
+/// `DOORBELL`: the route of a queue whose context has that page, which only a host that maps BAR 4
+/// ([`GraphicsConfig::doorbell_pages`]) is asked for. Until it takes the route, and where it
+/// refuses it, the writes come through [`GraphicsDevice::doorbell_write`]. A route of a `ring_id`
+/// at `page` another route holds replaces that one. Called as [`GraphicsRouteDoorbellFn`] is.
+pub type GraphicsRouteDoorbellPageFn =
+    Arc<dyn Fn(u64, u32, u32, Option<RawFd>) -> bool + Send + Sync>;
+
 /// Whether the device offers `DOORBELL_ASKS`, on which it routes its queues' plain doorbells to
 /// the host ([`GraphicsCallbacks::route_doorbell`]): where the host gives the route function, on
 /// Linux, whose eventfds the queues' threads sleep on and KVM's `ioeventfd` writes. A host on
@@ -217,6 +226,10 @@ pub struct GraphicsCallbacks {
     /// Routes a command queue's plain doorbell into its bell, or drops the route. Without it every
     /// doorbell write comes through [`GraphicsDevice::mmio_write_taking`].
     pub route_doorbell: Option<GraphicsRouteDoorbellFn>,
+    /// Routes the plain doorbell of a command queue whose context has a doorbell page into its
+    /// bell, at the page, or drops the route. Without it such a queue is not routed, and its
+    /// writes come through [`GraphicsDevice::doorbell_write`].
+    pub route_doorbell_page: Option<GraphicsRouteDoorbellPageFn>,
 }
 
 /// A graphics device's config.
@@ -239,6 +252,12 @@ pub struct GraphicsConfig {
     /// (`device_info`'s `lane_flags`), and the class of Mac whose answers the platform's devices
     /// give where a Mac's GPU decides them ([`GuestArch::mac_class`]).
     pub guest_arch: GuestArch,
+    /// The host maps BAR 4, the doorbell pages (`RGFX_PCI_BAR_DOORBELLS`, 32-bit and not
+    /// prefetchable, `RGFX_DOORBELLS_SIZE` bytes), and hands each of its writes to
+    /// [`GraphicsDevice::doorbell_write`], reading 0 for every read: the device then offers
+    /// `RGFX_FEATURE_DOORBELL_PAGES`, on which the kext maps each process's own page, which it
+    /// rings its queues' doorbells on with no call into the kext.
+    pub doorbell_pages: bool,
 }
 
 /// The architecture of the macOS guest a graphics device serves ([`GraphicsConfig::guest_arch`]).
@@ -436,7 +455,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // of a buffer that asks for its `CB_SUBMITTED` apart from the rest (`DOORBELL_ASKS`;
             // [`offers_doorbell_asks`]), so it may take the rest where it runs nothing of the
             // device's. Every host takes the guest's stamps of its command buffers
-            // (`GUEST_TIMES`), a diagnostic of the time before it takes each.
+            // (`GUEST_TIMES`), a diagnostic of the time before it takes each. A host that maps
+            // BAR 4 has each process ring its queues on a doorbell page of its own
+            // (`DOORBELL_PAGES`).
             let in_place = u64::from(RGFX_FEATURE_SURFACE_PAGES)
                 | u64::from(RGFX_FEATURE_PAGES_BUFFERS)
                 | u64::from(RGFX_FEATURE_HEAP_OVER_PAGES)
@@ -466,6 +487,11 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 | RGFX_FEATURE_GUEST_TIMES
                 | if offers_doorbell_asks(&config.callbacks) {
                     RGFX_FEATURE_DOORBELL_ASKS
+                } else {
+                    0
+                }
+                | if config.doorbell_pages {
+                    RGFX_FEATURE_DOORBELL_PAGES
                 } else {
                     0
                 }
@@ -722,6 +748,17 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
     /// lock but the queues' table, as `mmio_write`'s doorbell does.
     pub fn mmio_write_taking(&self, offset: u64, value: u32) {
         entry::run(|_| self.device.mmio_write_taking(offset, value));
+    }
+
+    /// A 32-bit write of BAR 4, the doorbell pages, at `offset`, where the host maps it
+    /// ([`GraphicsConfig::doorbell_pages`]) and no route took it: a write of a ring's id at a
+    /// page's first byte is that `DOORBELL` write through [`Self::mmio_write_taking`] for a ring of
+    /// the context the page is bound to, and may answer its next command buffer and call
+    /// `raise_interrupt` inside this call; every other is dropped and counted
+    /// (`reims-vgpu-graphics`'s `Device::doorbell_write`). It waits for no lock but the queues'
+    /// table.
+    pub fn doorbell_write(&self, offset: u64, value: u32) {
+        entry::run(|_| self.device.doorbell_write(offset, value));
     }
 
     /// Takes a copy of `fd`, the host's `ioeventfd` for `DOORBELL` with ring 0. False where `fd`
@@ -2692,15 +2729,33 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         }
     }
 
-    fn route_doorbell(&self, route: u64, ring_id: u32, bell: RawFd) -> bool {
-        (self.callbacks.route_doorbell)
-            .as_ref()
-            .is_some_and(|f| f(route, ring_id, Some(bell)))
+    fn route_doorbell(&self, route: u64, at: DoorbellAt, ring_id: u32, bell: RawFd) -> bool {
+        match at {
+            DoorbellAt::Register => (self.callbacks.route_doorbell)
+                .as_ref()
+                .is_some_and(|f| f(route, ring_id, Some(bell))),
+            DoorbellAt::Page(page) => (self.callbacks.route_doorbell_page)
+                .as_ref()
+                .is_some_and(|f| f(route, page, ring_id, Some(bell))),
+        }
     }
 
-    fn unroute_doorbell(&self, route: u64, ring_id: u32) {
-        if let Some(f) = &self.callbacks.route_doorbell {
-            f(route, ring_id, None);
+    fn routes_doorbell_pages(&self) -> bool {
+        self.callbacks.route_doorbell_page.is_some()
+    }
+
+    fn unroute_doorbell(&self, route: u64, at: DoorbellAt, ring_id: u32) {
+        match at {
+            DoorbellAt::Register => {
+                if let Some(f) = &self.callbacks.route_doorbell {
+                    f(route, ring_id, None);
+                }
+            }
+            DoorbellAt::Page(page) => {
+                if let Some(f) = &self.callbacks.route_doorbell_page {
+                    f(route, page, ring_id, None);
+                }
+            }
         }
     }
 

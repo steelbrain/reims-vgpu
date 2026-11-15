@@ -21,6 +21,7 @@ fn callbacks() -> RvgGraphicsCallbacks {
         cursor_show: None,
         cursor_move: None,
         route_doorbell: None,
+        route_doorbell_page: None,
     }
 }
 
@@ -32,6 +33,7 @@ fn config(callbacks: &RvgGraphicsCallbacks) -> RvgGraphicsDeviceConfig {
         memory_map: std::ptr::null(),
         memory_files: std::ptr::null(),
         guest_arch: RVG_GUEST_ARCH_X86_64,
+        doorbell_pages: 0,
     }
 }
 
@@ -217,6 +219,46 @@ fn a_callback_table_without_route_doorbell_is_taken() {
         assert_eq!(rvg_graphics_device_create(&c, &mut device), RVG_OK);
         rvg_graphics_device_release(device);
     }
+}
+
+/// The doorbell pages the host maps decide the wire's `DOORBELL_PAGES` (`FEATURES_HI` bit 14): a
+/// config with `doorbell_pages` 1 offers it, one with 0 does not, and so does a config whose
+/// `struct_size` ends before the field, whatever lies past it; any other value is refused. A
+/// write of BAR 4 that names no bound page is dropped. A callback table whose `struct_size` ends
+/// before `route_doorbell_page` is taken.
+#[test]
+fn the_doorbell_pages_the_host_maps_decide_the_feature() {
+    const PAGES: u32 = 1 << 14;
+    let offered = |c: &RvgGraphicsDeviceConfig| {
+        let mut device = std::ptr::null_mut();
+        // SAFETY: a live config and out-pointer; then a live device, released.
+        unsafe {
+            assert_eq!(rvg_graphics_device_create(c, &mut device), RVG_OK);
+            let hi = rvg_graphics_device_mmio_read(device, 0x00c);
+            rvg_graphics_device_doorbell_write(device, 0, 0x1000);
+            rvg_graphics_device_release(device);
+            hi & PAGES != 0
+        }
+    };
+    let cb = RvgGraphicsCallbacks {
+        struct_size: std::mem::offset_of!(RvgGraphicsCallbacks, route_doorbell_page) as u32,
+        destroy: None,
+        ..callbacks()
+    };
+    let mut c = config(&cb);
+    assert!(!offered(&c));
+    c.doorbell_pages = 1;
+    assert!(offered(&c));
+    c.struct_size = std::mem::offset_of!(RvgGraphicsDeviceConfig, doorbell_pages) as u32;
+    assert!(!offered(&c));
+    c.struct_size = size_of::<RvgGraphicsDeviceConfig>() as u32;
+    c.doorbell_pages = 2;
+    let mut device = std::ptr::null_mut();
+    // SAFETY: a live config and out-pointer.
+    assert_eq!(
+        unsafe { rvg_graphics_device_create(&c, &mut device) },
+        RVG_ERR_INVALID_ARGUMENT
+    );
 }
 
 static MOVES: AtomicUsize = AtomicUsize::new(0);

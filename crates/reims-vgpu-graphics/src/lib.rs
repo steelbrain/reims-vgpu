@@ -31,7 +31,7 @@ mod wake;
 pub mod wire;
 
 pub use device::{
-    CompleteAnswer, CompletionPoster, Device, Host, PresentAnswer, QueueClaim, REGION_SIZE,
-    RingDegradation, Then,
+    CompleteAnswer, CompletionPoster, Device, DoorbellAt, Host, PresentAnswer, QueueClaim,
+    REGION_SIZE, RingDegradation, Then,
 };
 pub use display::{CursorImage, FixedScreen, Mode, Scanout, Screen};

@@ -117,6 +117,19 @@
 //! queues are routed at once; a queue past them, a route the host refuses, and every write
 //! before the host takes the route, keep the device's write, as before.
 //!
+//! **Doorbell pages.** Where the host maps BAR 4 and the guest's driver took
+//! `RGFX_FEATURE_DOORBELL_PAGES`, the kext binds a doorbell page to each context it opens
+//! (`DOORBELL_PAGE_BIND`, a register write before the process learns of the page) and maps the
+//! page into the context's process, which writes its rings' ids there as it would hand them to
+//! the kext's doorbell call. A page's write ([`Device::doorbell_write`]) is that `DOORBELL` write
+//! through [`Device::mmio_write_taking`] for a ring of the bound context's queues, and is dropped
+//! and counted for any other (ring 0's, another context's, an unbound page's): the device trusts
+//! the page's address for the context, never the value written. A queue whose context has a
+//! page is routed there ([`DoorbellAt::Page`]), where the host routes pages; otherwise on
+//! `DOORBELL`, as before. A page rebound to another context reaches that context's rings from the
+//! bind on; a route of a queue of the context before stays the host's until the queue ends, and
+//! wakes only that queue. A reset unbinds every page.
+//!
 //! The host's route functions may wait for the host's own lock (QEMU's BQL), so the device calls
 //! them holding no lock of its own, and no function a host calls under that lock waits for a
 //! thread inside one. The calls, and what their thread holds:
@@ -302,7 +315,7 @@ impl Room {
 const MIN_QUEUE_RING_DATA: u64 = 4096;
 
 /// The feature bits whose meaning the host knows, which a `DRIVER_FEATURES` write may take:
-/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 43.
+/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 46.
 const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_CACHE
     | RGFX_FEATURE_CB_SUBMITTED
@@ -345,7 +358,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_ICB_SLOTS_IN_PAGES
     | RGFX_FEATURE_DOORBELL_ASKS
     | RGFX_FEATURE_GUEST_TIMES
-    | RGFX_FEATURE_READ_ONLY_PAGES;
+    | RGFX_FEATURE_READ_ONLY_PAGES
+    | RGFX_FEATURE_DOORBELL_PAGES;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
@@ -581,14 +595,17 @@ pub trait Host: Send + Sync + 'static {
     }
 
     /// Routes a command queue's plain doorbell into `bell`, a file its service thread sleeps on
-    /// (an eventfd): from then on the host takes a `DOORBELL` write of `ring_id` (the queue's
-    /// submission ring's region offset) where no thread of its runs the write, and makes `bell`
-    /// readable, which wakes the thread as the write through [`Device::mmio_write_taking`] would
-    /// (QEMU: a KVM `ioeventfd` that matches the value). A write of `ring_id` with
-    /// [`RGFX_DOORBELL_ASKS`], for a buffer the host may answer at its doorbell, matches no route
-    /// and reaches [`Device::mmio_write_taking`] as every write did. `route` names the route, a
-    /// number the device gives no other: [`Host::unroute_doorbell`] drops it, and a route of a
-    /// `ring_id` another route of the host's holds replaces that one. The host takes a copy of
+    /// (an eventfd): from then on the host takes a write of `ring_id` (the queue's submission
+    /// ring's region offset) at `at` where no thread of its runs the write, and makes `bell`
+    /// readable, which wakes the thread as the write through [`Device::mmio_write_taking`] or
+    /// [`Device::doorbell_write`] would (QEMU: a KVM `ioeventfd` that matches the value at the
+    /// address). `at` is `DOORBELL` ([`DoorbellAt::Register`]), or, for a queue whose context has a
+    /// doorbell page ([`RGFX_FEATURE_DOORBELL_PAGES`]), that page's first byte in BAR 4
+    /// ([`DoorbellAt::Page`]), which only the host's [`Host::routes_doorbell_pages`] is asked for.
+    /// A write of `ring_id` with [`RGFX_DOORBELL_ASKS`], for a buffer the host may answer at its
+    /// doorbell, matches no route and reaches the device's write as every write did. `route`
+    /// names the route, a number the device gives no other: [`Host::unroute_doorbell`] drops it,
+    /// and a route of a `ring_id` at `at` another route of the host's holds replaces that one. The host takes a copy of
     /// `bell` and may take the route after the call: until then, and where it refuses it, the
     /// writes reach the device's write. Whether it took the route, so the device
     /// counts it among its [`MAX_DOORBELL_ROUTES`]; false where it refuses it. Asked only where
@@ -597,12 +614,19 @@ pub trait Host: Send + Sync + 'static {
     /// started and before the create is answered, with no lock of the device's held: it may wait
     /// for a lock the host holds while it calls the device (the module doc, "Routed doorbells").
     /// The default takes none.
-    fn route_doorbell(&self, route: u64, ring_id: u32, bell: RawFd) -> bool {
-        let _ = (route, ring_id, bell);
+    fn route_doorbell(&self, route: u64, at: DoorbellAt, ring_id: u32, bell: RawFd) -> bool {
+        let _ = (route, at, ring_id, bell);
         false
     }
 
-    /// Drops the route [`Host::route_doorbell`] took as `route`, of ring `ring_id`, once its queue
+    /// Whether the host routes doorbells on the doorbell pages ([`Host::route_doorbell`] with
+    /// [`DoorbellAt::Page`]): where it does not, a queue whose context has a page gets no route,
+    /// and its plain doorbells reach [`Device::doorbell_write`]. The default is false.
+    fn routes_doorbell_pages(&self) -> bool {
+        false
+    }
+
+    /// Drops the route [`Host::route_doorbell`] took as `route`, of ring `ring_id` at `at`, once its queue
     /// has ended: once this returns no write reaches the file, as the ring may be a later
     /// queue's, and the host closes its copy. On the thread that ends the queue, with no lock of
     /// the device's held: the context's lane (an `OBJECT_DESTROY` of the queue, its context's
@@ -611,8 +635,8 @@ pub trait Host: Send + Sync + 'static {
     /// [`Device::mmio_write_taking`] (a `STATUS` 0 write) or [`Device::reset`], where it must not
     /// wait for a lock the host holds around that call. The routes the device holds at its end
     /// are the host's to drop: no call drops them. The default does nothing.
-    fn unroute_doorbell(&self, route: u64, ring_id: u32) {
-        let _ = (route, ring_id);
+    fn unroute_doorbell(&self, route: u64, at: DoorbellAt, ring_id: u32) {
+        let _ = (route, at, ring_id);
     }
 
     /// Hands a `COMMAND_BUFFER` from a command queue's own submission ring, or from the block a
@@ -748,6 +772,17 @@ pub trait Host: Send + Sync + 'static {
     }
 }
 
+/// Where the guest writes a command queue's doorbell, which the host routes there
+/// ([`Host::route_doorbell`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DoorbellAt {
+    /// `DOORBELL` in BAR 0 ([`RGFX_REG_DOORBELL`]).
+    Register,
+    /// The first byte of doorbell page `n` in BAR 4 ([`RGFX_PCI_BAR_DOORBELLS`]), at
+    /// `n * RGFX_DOORBELL_PAGE_SIZE`: the page bound to the queue's context.
+    Page(u32),
+}
+
 /// What the device tells its host of its completion rings ([`Host::ring_degraded`]). Every
 /// process's ring-0 answers, the `PRESENT_SURFACE` answers and the display's events share the
 /// control completion ring, which the guest's kext drains on its work loop; a command queue's
@@ -875,6 +910,12 @@ pub(crate) struct Shared {
     routes: AtomicU32,
     /// The last route's number: each route takes the next.
     last_route: AtomicU64,
+    /// The context each doorbell page is bound to ([`RGFX_REG_DOORBELL_PAGE_BIND`]), 0 for none:
+    /// [`RGFX_DOORBELL_PAGES`] of them, all 0 after a reset.
+    pages: Box<[AtomicU32]>,
+    /// How many doorbell page writes were dropped ([`Shared::page_doorbell`]): of an unbound page,
+    /// at another offset than a page's first byte, or of a ring not the page's context's.
+    pub(crate) pages_dropped: AtomicU64,
     /// A weak handle to this shared state, set at the device's make: a queue's service thread and
     /// its completion poster hold it, so neither keeps the device alive.
     weak_self: OnceLock<Weak<Shared>>,
@@ -990,6 +1031,9 @@ pub(crate) struct QueueShared {
     /// The route of its plain doorbell the host took ([`Host::route_doorbell`]), 0 where none:
     /// the queue's end takes it and drops it ([`Shared::unroute`]).
     route: AtomicU64,
+    /// Where that route is: `u32::MAX` for `DOORBELL`, else the doorbell page's index. Stored
+    /// before `route`, whose SeqCst store and swap order it for the queue's ender.
+    route_page: AtomicU32,
     /// Set when the queue is destroyed, or at a reset or the device's end.
     ending: AtomicBool,
 }
@@ -1200,6 +1244,10 @@ impl Device {
             queues: Mutex::new(Queues::default()),
             routes: AtomicU32::new(0),
             last_route: AtomicU64::new(0),
+            pages: (0..RGFX_DOORBELL_PAGES)
+                .map(|_| AtomicU32::new(0))
+                .collect(),
+            pages_dropped: AtomicU64::new(0),
             weak_self: OnceLock::new(),
             handed_over: AtomicU64::new(0),
             handed_logged_ns: AtomicU64::new(0),
@@ -1299,8 +1347,10 @@ impl Device {
 
     /// A 32-bit write of BAR 0 at `offset`: `STATUS` 0 resets the device and 1 starts it taking
     /// commands; `DRIVER_FEATURES_LO` and `_HI` take, before `STATUS` 1, the bits written that the
-    /// host offers and knows; `DOORBELL` with a ring's id wakes its consumer. Other values and
-    /// offsets (`CONSUMED` among them) are ignored. A reset waits for the message the control
+    /// host offers and knows; `DOORBELL` with a ring's id wakes its consumer;
+    /// `DOORBELL_PAGE_BIND` binds a doorbell page to a context where the driver took
+    /// [`RGFX_FEATURE_DOORBELL_PAGES`]. Other values and offsets (`CONSUMED` among them) are
+    /// ignored. A reset waits for the message the control
     /// thread is taking from the ring, and no write waits for the host's decoder.
     pub fn mmio_write(&self, offset: u64, value: u32) {
         match u32::try_from(offset).unwrap_or(u32::MAX) {
@@ -1317,6 +1367,7 @@ impl Device {
                 }
             }
             RGFX_REG_DOORBELL => self.shared.ring_doorbell(u64::from(value)),
+            RGFX_REG_DOORBELL_PAGE_BIND => self.shared.bind_page(value),
             _ => {}
         }
     }
@@ -1336,6 +1387,19 @@ impl Device {
             RGFX_REG_DOORBELL => self.shared.ring_taking(u64::from(value)),
             _ => self.mmio_write(offset, value),
         }
+    }
+
+    /// A 32-bit write of BAR 4, the doorbell pages ([`RGFX_PCI_BAR_DOORBELLS`]), at `offset`. A
+    /// write at a page's first byte of a ring of the command queues of the context the page is
+    /// bound to does what that `DOORBELL` write through [`Self::mmio_write_taking`] does: it wakes
+    /// the queue's thread, and where it asks, offers the queue's next `COMMAND_BUFFER` to the host
+    /// on the calling thread, which may raise inside this call. Any other write is dropped and
+    /// counted, logged once a kind: one of an unbound page or at another offset (`unbound`), and
+    /// one of ring 0's id or of another context's ring (`foreign`), so a process reaches no ring
+    /// but its own context's through its page. A ring of no queue is ignored, as at `DOORBELL`.
+    /// It waits for the queues' table where it is held, and for nothing else.
+    pub fn doorbell_write(&self, offset: u64, value: u32) {
+        self.shared.page_doorbell(offset, value);
     }
 
     /// Takes a copy of `fd`, the host's doorbell file for ring 0 (its `ioeventfd`'s, readable
@@ -1654,6 +1718,10 @@ impl Shared {
     fn reset(&self) {
         self.status.store(RGFX_STATUS_RESET, Ordering::Release);
         self.driver_features.store(0, Ordering::Release);
+        // No page is any context's: the kext binds them again as its contexts open.
+        for page in &self.pages {
+            page.store(0, Ordering::Release);
+        }
         let epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
         // Nothing the lanes were handed before it is begun now.
         self.lanes.reset(epoch);
@@ -2329,6 +2397,99 @@ impl Shared {
         }
     }
 
+    /// A `DOORBELL_PAGE_BIND` write of `value` ([`RGFX_REG_DOORBELL_PAGE_BIND`]): binds its page to
+    /// its context, or unbinds it for context 0, where the guest's driver took
+    /// [`RGFX_FEATURE_DOORBELL_PAGES`]; ignored otherwise.
+    fn bind_page(&self, value: u32) {
+        if !self.driver_took(RGFX_FEATURE_DOORBELL_PAGES) {
+            return;
+        }
+        let page = value & 0xff;
+        let context = value >> RGFX_DOORBELL_PAGE_BIND_CONTEXT_SHIFT;
+        let Some(bound) = self.pages.get(page as usize) else {
+            return;
+        };
+        // SeqCst, as a route's look at its page is ([`Self::route`]): a queue routed on the page
+        // meanwhile is seen below, or sees the page's new context and drops its route itself.
+        if bound.swap(context, Ordering::SeqCst) == context {
+            return;
+        }
+        // The routes on the page of a context it is no longer bound to go, so the host wakes no
+        // ring on the page but its new context's: the kext unbinds a page only once its context's
+        // queues are gone, and a page bound again under live queues of its old context leaves
+        // their doorbells to `DOORBELL`.
+        let moved: Vec<Arc<QueueShared>> = self
+            .queues
+            .lock()
+            .by_obj
+            .values()
+            .filter(|queue| {
+                queue.route.load(Ordering::SeqCst) != 0
+                    && queue.route_page.load(Ordering::Relaxed) == page
+                    && queue.context != context
+            })
+            .cloned()
+            .collect();
+        for queue in moved {
+            self.unroute(&queue);
+        }
+    }
+
+    /// The doorbell page bound to `context`, where one is: a queue of the context's is routed
+    /// there ([`Self::route`]).
+    fn page_of(&self, context: u32) -> Option<u32> {
+        if context == 0 || !self.driver_took(RGFX_FEATURE_DOORBELL_PAGES) {
+            return None;
+        }
+        self.pages
+            .iter()
+            .position(|bound| bound.load(Ordering::Acquire) == context)
+            .and_then(|page| u32::try_from(page).ok())
+    }
+
+    /// A write of `value` at `offset` in BAR 4 ([`Device::doorbell_write`]).
+    fn page_doorbell(&self, offset: u64, value: u32) {
+        let page_size = u64::from(RGFX_DOORBELL_PAGE_SIZE);
+        let page = offset / page_size;
+        let context = self
+            .pages
+            .get(usize::try_from(page).unwrap_or(usize::MAX))
+            .map_or(0, |bound| bound.load(Ordering::Acquire));
+        if context == 0 || offset % page_size != 0 {
+            self.pages_dropped.fetch_add(1, Ordering::Relaxed);
+            log::warn!(
+                target: "reims_vgpu_graphics", kind = "unbound";
+                "a doorbell page write at {offset:#x} names no bound page's doorbell: dropped"
+            );
+            return;
+        }
+        let (ring_id, asks) = self.doorbell_value(u64::from(value));
+        // The table tried first, as `ring_taking` tries it: held elsewhere, it is waited for, and
+        // nothing is offered.
+        let (queue, offer) = match self.queues.try_lock() {
+            Some(queues) => (queues.by_ring.get(&ring_id).cloned(), true),
+            None => (self.queues.lock().by_ring.get(&ring_id).cloned(), false),
+        };
+        let foreign = ring_id == u64::from(RGFX_CONTROL_RING_ID)
+            || queue.as_ref().is_some_and(|queue| queue.context != context);
+        if foreign {
+            self.pages_dropped.fetch_add(1, Ordering::Relaxed);
+            log::warn!(
+                target: "reims_vgpu_graphics", kind = "foreign";
+                "doorbell page {page}, context {context}'s: a write of ring {ring_id:#x}, not one \
+                 of the context's, is dropped"
+            );
+            return;
+        }
+        let Some(queue) = queue else {
+            return;
+        };
+        if asks && offer {
+            self.answer_on_doorbell(&queue);
+        }
+        queue.rung();
+    }
+
     /// Marks `queue`'s submission ring walking while its service thread works on something other
     /// than its take ([`QueueClaim::let_go`]), where the device is started, the ring is not broken
     /// and the queue lives: whether it was marked.
@@ -2631,6 +2792,7 @@ impl Shared {
             wake,
             bell,
             route: AtomicU64::new(0),
+            route_page: AtomicU32::new(u32::MAX),
             ending: AtomicBool::new(false),
         });
         let ended: Vec<Arc<QueueShared>> = {
@@ -2693,6 +2855,13 @@ impl Shared {
         let Ok(ring_id) = u32::try_from(queue.ring_id) else {
             return;
         };
+        // On its context's doorbell page where it has one, which its process writes: a host that
+        // routes no page leaves the queue's writes to the page's write.
+        let at = match self.page_of(queue.context) {
+            Some(page) if self.host.routes_doorbell_pages() => DoorbellAt::Page(page),
+            Some(_) => return,
+            None => DoorbellAt::Register,
+        };
         if self
             .routes
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -2708,7 +2877,10 @@ impl Shared {
             return;
         }
         let route = self.last_route.fetch_add(1, Ordering::AcqRel) + 1;
-        if !self.host.route_doorbell(route, ring_id, bell.as_raw_fd()) {
+        if !self
+            .host
+            .route_doorbell(route, at, ring_id, bell.as_raw_fd())
+        {
             self.routes.fetch_sub(1, Ordering::AcqRel);
             log::warn!(
                 target: "reims_vgpu_graphics", kind = "refused";
@@ -2717,10 +2889,24 @@ impl Shared {
             );
             return;
         }
-        // SeqCst, as the end's store is ([`QueueShared::end`]): a queue that ended meanwhile is
-        // seen here, or its ender sees the route.
+        queue.route_page.store(
+            match at {
+                DoorbellAt::Register => u32::MAX,
+                DoorbellAt::Page(page) => page,
+            },
+            Ordering::Relaxed,
+        );
+        // SeqCst, as the end's store is ([`QueueShared::end`]) and a bind's ([`Self::bind_page`]):
+        // a queue that ended meanwhile, or a page bound to another context, is seen here, or its
+        // ender or binder sees the route.
         queue.route.store(route, Ordering::SeqCst);
-        if queue.ending.load(Ordering::SeqCst) {
+        let moved = match at {
+            DoorbellAt::Register => false,
+            DoorbellAt::Page(page) => {
+                self.pages[page as usize].load(Ordering::SeqCst) != queue.context
+            }
+        };
+        if moved || queue.ending.load(Ordering::SeqCst) {
             self.unroute(queue);
         }
     }
@@ -2730,8 +2916,12 @@ impl Shared {
     fn unroute(&self, queue: &QueueShared) {
         let route = queue.route.swap(0, Ordering::SeqCst);
         if route != 0 {
+            let at = match queue.route_page.load(Ordering::Relaxed) {
+                u32::MAX => DoorbellAt::Register,
+                page => DoorbellAt::Page(page),
+            };
             // A routed ring's id is 32 bits ([`Self::route`]).
-            self.host.unroute_doorbell(route, queue.ring_id as u32);
+            self.host.unroute_doorbell(route, at, queue.ring_id as u32);
             self.routes.fetch_sub(1, Ordering::AcqRel);
         }
     }

@@ -150,6 +150,22 @@
 // control rings.
 #define RVG_GRAPHICS_ALLOCATIONS_OFFSET 4194304
 
+// The BAR of the graphics device's doorbell pages, where the host maps it
+// (RvgGraphicsDeviceConfig's `doorbell_pages`): 32-bit MMIO, not prefetchable,
+// RVG_GRAPHICS_DOORBELLS_SIZE bytes, whose 32-bit writes the host sends to
+// rvg_graphics_device_doorbell_write and whose reads it answers 0 itself.
+#define RVG_GRAPHICS_PCI_BAR_DOORBELLS 4
+
+// The size of BAR 4: RVG_GRAPHICS_DOORBELL_PAGES pages of RVG_GRAPHICS_DOORBELL_PAGE_SIZE bytes.
+#define RVG_GRAPHICS_DOORBELLS_SIZE 4194304
+
+// The bytes of one doorbell page; page `n`'s doorbell is its first byte, at
+// `n * RVG_GRAPHICS_DOORBELL_PAGE_SIZE` in BAR 4.
+#define RVG_GRAPHICS_DOORBELL_PAGE_SIZE 16384
+
+// How many doorbell pages BAR 4 holds.
+#define RVG_GRAPHICS_DOORBELL_PAGES 256
+
 // An x86-64 guest: the default, and what a host built before `guest_arch` serves.
 #define RVG_GUEST_ARCH_X86_64 0
 
@@ -259,6 +275,28 @@ typedef void (*RvgCursorMoveFn)(void *ctx);
 // comes through rvg_graphics_device_mmio_write_taking.
 typedef bool (*RvgGraphicsRouteDoorbellFn)(void *ctx, uint64_t route, uint32_t ring_id, int32_t bell);
 
+// `route_doorbell_page(ctx, route, page, ring_id, bell)`: as route_doorbell, for a write of
+// exactly `ring_id` at doorbell page `page`'s doorbell, `page * RVG_GRAPHICS_DOORBELL_PAGE_SIZE`
+// in BAR 4, in place of RVG_GRAPHICS_REG_DOORBELL (QEMU: memory_region_add_eventfd on BAR 4 at
+// that offset, matching `ring_id`): the route of a command queue whose guest process has that
+// page, which its process writes. Until the host takes the route, and where it refuses it, the
+// writes come through rvg_graphics_device_doorbell_write. A route of a `ring_id` at `page`
+// another route holds replaces that one. With `bell` -1, drop route `route` (of `ring_id` at
+// `page`), as route_doorbell does. The device asks it only of a host that maps BAR 4
+// (RvgGraphicsDeviceConfig's `doorbell_pages`), and routes a queue on its page only where the
+// host gives this function; it counts these routes among RVG_GRAPHICS_DOORBELL_ROUTES.
+//
+// Thread: as route_doorbell's, with `bell` -1 also inside rvg_graphics_device_mmio_write_taking
+// (a write of 0 to STATUS) or rvg_graphics_device_reset; never inside
+// rvg_graphics_device_doorbell_write. The library holds no lock around it that a function of
+// this header waits for, and it may call nothing of the library's. Without it the writes of a
+// queue whose process has a page all come through rvg_graphics_device_doorbell_write.
+typedef bool (*RvgGraphicsRouteDoorbellPageFn)(void *ctx,
+                                               uint64_t route,
+                                               uint32_t page,
+                                               uint32_t ring_id,
+                                               int32_t bell);
+
 // The graphics device's callbacks.
 //
 // The cursor's three tell the host the guest's cursor on the device's display, for a host that
@@ -289,6 +327,9 @@ typedef struct {
   // Routes a command queue's plain doorbell into its bell, or drops the route. A host built
   // before it, whose `struct_size` ends before it, gives none.
   RvgGraphicsRouteDoorbellFn route_doorbell;
+  // Routes a command queue's plain doorbell on its process's doorbell page into its bell, or
+  // drops the route. A host built before it, whose `struct_size` ends before it, gives none.
+  RvgGraphicsRouteDoorbellPageFn route_doorbell_page;
 } RvgGraphicsCallbacks;
 
 // `pointer(ctx, x, y, width, height, buttons)`: the pointer is at (`x`, `y`) in the guest's
@@ -475,6 +516,13 @@ typedef struct {
   // other value. A host built before this field, whose `struct_size` ends before it, serves an
   // x86-64 guest.
   RvgGuestArch guest_arch;
+  // 1 where the host maps BAR 4, the doorbell pages (RVG_GRAPHICS_PCI_BAR_DOORBELLS), and
+  // sends each 32-bit write of it to rvg_graphics_device_doorbell_write, answering its reads
+  // 0: the device then offers the wire's DOORBELL_PAGES, on which the guest's kext maps each
+  // process's own page into it, and the process rings its queues there with no call into the
+  // kext. 0 for none, as a host built before this field, whose `struct_size` ends before it,
+  // has. Refused (RVG_ERR_INVALID_ARGUMENT): any other value.
+  uint32_t doorbell_pages;
 } RvgGraphicsDeviceConfig;
 
 #ifdef __cplusplus
@@ -558,6 +606,21 @@ uint32_t rvg_graphics_device_mmio_read(RvgGraphicsDevice *device, uint64_t offse
 void rvg_graphics_device_mmio_write_taking(RvgGraphicsDevice *device,
                                            uint64_t offset,
                                            uint32_t value);
+
+// A 32-bit write of BAR 4, the doorbell pages, at `offset`, where the host maps it
+// (RvgGraphicsDeviceConfig's `doorbell_pages`) and no route_doorbell_page route took the write.
+// A write of a command queue's ring's id at a page's doorbell (`page *
+// RVG_GRAPHICS_DOORBELL_PAGE_SIZE`) does what that write to RVG_GRAPHICS_REG_DOORBELL through
+// rvg_graphics_device_mmio_write_taking does, where the ring is one of the queues of the guest
+// process the page is bound to: it wakes the queue's thread, and may answer its next command
+// buffer on the calling thread, calling raise_interrupt there inside this call. Every other
+// write is dropped and counted, logged once a kind: an unbound page's, one at another offset,
+// and one of the control ring's id or of another process's ring. On any thread, the vCPU's
+// included. Calls back: raise_interrupt, as rvg_graphics_device_mmio_write_taking does.
+//
+// # Safety
+// `device` is a live graphics device handle.
+void rvg_graphics_device_doorbell_write(RvgGraphicsDevice *device, uint64_t offset, uint32_t value);
 
 // Hands the device the host's doorbell for the control ring: `fd`, readable once the guest
 // writes RVG_GRAPHICS_DOORBELL_CONTROL to RVG_GRAPHICS_REG_DOORBELL (QEMU: the read side of

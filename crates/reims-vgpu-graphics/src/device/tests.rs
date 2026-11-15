@@ -3175,6 +3175,12 @@ struct Taking {
     asks: AtomicBool,
     /// Refuse every doorbell's route ([`Host::route_doorbell`]).
     refuses_routes: AtomicBool,
+    /// Offer `DOORBELL_PAGES`, the host mapping BAR 4.
+    pages: AtomicBool,
+    /// Route doorbells on the doorbell pages ([`Host::routes_doorbell_pages`]).
+    routes_pages: AtomicBool,
+    /// Where each route taken is, in the order of `routes`.
+    routed_at: Mutex<Vec<DoorbellAt>>,
     /// Each doorbell route taken: its number, its ring's id, and a copy of its bell, which the
     /// test writes as KVM's `ioeventfd` would.
     routes: Mutex<Vec<(u64, u32, OwnedFd)>>,
@@ -3257,24 +3263,37 @@ impl Host for TakingHost {
         self.0.raised.lock().push((vector, thread_name()));
     }
     fn features(&self) -> u64 {
-        if self.0.asks.load(Ordering::SeqCst) {
+        let asks = if self.0.asks.load(Ordering::SeqCst) {
             RGFX_FEATURE_DOORBELL_ASKS
         } else {
             0
-        }
+        };
+        let pages = if self.0.pages.load(Ordering::SeqCst) {
+            RGFX_FEATURE_DOORBELL_PAGES
+        } else {
+            0
+        };
+        asks | pages
     }
-    fn route_doorbell(&self, route: u64, ring_id: u32, bell: RawFd) -> bool {
+    fn route_doorbell(&self, route: u64, at: DoorbellAt, ring_id: u32, bell: RawFd) -> bool {
         let _host = self.0.host_locked();
         if self.0.refuses_routes.load(Ordering::SeqCst) {
             return false;
         }
         let copy = wake::duplicate(bell).expect("the bell is open");
         self.0.routes.lock().push((route, ring_id, copy));
+        self.0.routed_at.lock().push(at);
         true
     }
-    fn unroute_doorbell(&self, route: u64, ring_id: u32) {
+    fn routes_doorbell_pages(&self) -> bool {
+        self.0.routes_pages.load(Ordering::SeqCst)
+    }
+    fn unroute_doorbell(&self, route: u64, _at: DoorbellAt, ring_id: u32) {
         let _host = self.0.host_locked();
-        assert_eq!(ring_id, QUEUE_SUBMIT as u32, "the route's ring");
+        assert!(
+            ring_id == QUEUE_SUBMIT as u32 || ring_id == pages::OTHER_SUBMIT as u32,
+            "the route's ring"
+        );
         self.0.unrouted.lock().push(route);
     }
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {
@@ -3978,6 +3997,8 @@ mod guest_times;
 mod help;
 /// A fuzz of ring 0's lanes (`lanes_fuzz.rs`).
 mod lanes_fuzz;
+/// The doorbell pages: a page wakes only its context's rings (`pages.rs`).
+mod pages;
 /// The wire round trip with a fake peer (`peer.rs`).
 mod peer;
 /// What a synchronous create's round trip costs, measured by hand (`round_trip.rs`).

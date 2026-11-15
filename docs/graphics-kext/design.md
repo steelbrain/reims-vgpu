@@ -1488,6 +1488,7 @@ sit in BAR0 from 0x800.
 | 0x034 | `DEFERRED_BUDGET_HI` | RO | its high 32 bits |
 | 0x038 | `HOST_TIME_LO` | RO | under `HOST_TIME`, the host's monotonic clock at the read in ns, low 32 bits: the clock `VBLANK`s are stamped on; nothing is latched, so the guest reads `HI`, `LO`, `HI` and takes the second `HI` where `LO` is below 2^31, else the first; 0 where the guest did not take the feature |
 | 0x03c | `HOST_TIME_HI` | RO | its high 32 bits |
+| 0x040 | `DOORBELL_PAGE_BIND` | WO | under `DOORBELL_PAGES`, binds doorbell page `value & 0xff` of BAR4 to context `value >> 8`, or unbinds it for context 0 ("BAR4: the doorbell pages", below); a reset unbinds every page; reads 0 |
 
 **The wire's version.** `VERSION` reads `RGFX_VERSION`
 (`crates/reims-vgpu-graphics/src/wire.rs`), the version of the wire the host
@@ -1915,6 +1916,18 @@ only where no negotiation can carry it.
   and a kext on a host without it refuses read-only memory, which the bundle
   then copies ("No-copy buffers"). A host offers it where it offers
   `PAGES_BUFFERS`, and the kext takes it.
+- Bit 46, `FEATURES_HI`'s bit 14, is `DOORBELL_PAGES`: BAR4 holds the
+  doorbell pages, which the kext binds to its contexts with
+  `DOORBELL_PAGE_BIND` and maps into their processes, where the bundle rings
+  its queues with no call into the kext ("BAR4: the doorbell pages"). A host
+  offers it where it maps BAR4 and hands the device its writes: QEMU's
+  `reims-graphics-pci` does, through the C API's `doorbell_pages` and
+  `rvg_graphics_device_doorbell_write`
+  (`doorbell_pages_is_offered_only_where_the_host_maps_bar_4`). A guest that
+  does not take it, or a host that does not offer it, has
+  every doorbell on `DOORBELL` as before the bit: the device ignores
+  `DOORBELL_PAGE_BIND` and drops every write to BAR4
+  (`without_doorbell_pages_the_doorbells_are_the_register_s`).
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -1952,6 +1965,62 @@ framebuffer's ring lock. Every other ring is one command queue's own ring pair,
 in a block the accelerator kext handed to the queue's process, so each ring
 keeps a single producer and a single consumer however many processes run
 Metal.
+
+**BAR4: the doorbell pages.** A 32-bit, non-prefetchable memory BAR of 4 MiB:
+256 pages of 16 KiB, the largest page a guest maps (an arm64 guest's), so a
+process's mapping of one page reaches no other. QEMU's `reims-graphics-pci`
+always has it, and offers `DOORBELL_PAGES` with it. Every read answers 0, and
+a page holds no register: a process that writes its page can wake its own
+queues and nothing else, never reset or reconfigure the device.
+
+- **Binding.** The kext binds a free page to a context as the context opens,
+  with a write to `DOORBELL_PAGE_BIND` (the page in bits 0 to 7, the context
+  from bit 8, so a context of 2^24 or more gets none), which the device takes
+  before the write returns, and then maps the page into the context's
+  process, uncached. The context's
+  close unmaps it, then unbinds it (context 0), then gives it back. Pages are
+  taken round-robin, so a page given back is the last the next contexts take.
+  A busy desktop held 74 contexts ("Contexts", below); a context past the 256,
+  or whose page the kext could not map, has none, and its process rings
+  through the kext's `Doorbell` call, as before the pages.
+- **A page's write.** A 32-bit write at a bound page's first byte of a ring's
+  id, with `RGFX_DOORBELL_ASKS` as `DOORBELL` takes it, is that context's own
+  `DOORBELL`: it wakes the ring where it is one of the context's command
+  queues' rings, and an asking write is answered at the doorbell as there.
+  Every other write is dropped and counted, logged once per kind: at an
+  unbound page or another offset of a page (`unbound`), or of ring 0 or a
+  ring of another context's queue (`foreign`). A ring of no queue is ignored,
+  as at `DOORBELL`
+  (`a_doorbell_page_wakes_only_the_rings_of_the_context_it_is_bound_to`). A
+  reset unbinds every page (`a_reset_unbinds_every_doorbell_page`).
+- **Routes.** Where the guest took `DOORBELL_PAGES`, a queue whose context has
+  a page is routed on the page's doorbell, not `DOORBELL` (the C API's
+  `route_doorbell_page`): QEMU registers its ioeventfd at the page's first
+  byte, matching the ring's id ("Routed doorbells", below). A queue whose
+  context has none is routed on `DOORBELL` as before, and a host that routes
+  no page leaves a queue of a context with one unrouted, its writes taken by
+  the page's write (`a_queue_is_routed_on_its_context_s_doorbell_page`). The
+  kext's own publish of a queue's ring ("A commit behind held messages is one
+  call") rings at the context's page too, so its write meets the route. A
+  page bound to another context drops every route on it of its old context's
+  queues, so the host wakes no ring at a page but its context's
+  (`a_page_bound_again_drops_the_routes_of_its_old_context`); the kext
+  unbinds a page only once its process's mapping is gone, and its context's
+  queues are closed with it.
+- **Security.** The host trusts nothing a process writes but the ring's id:
+  the context is the page's, bound by the kext. A process maps only its own
+  page, and wakes, and asks the answer of, only its own context's queues, as
+  through the kext's `Doorbell` call, which writes any ring's id the process
+  names (ring 0's and other processes' included) and so allows more. The one
+  reach past a context: a process that makes an alias of its page's mapping
+  (`mach_vm_remap`) keeps it past its context's close, as the kext cannot
+  take an alias down, and its writes there reach the page's next context.
+  Their bound is what a page's write does: a wake of a ring of that
+  context's queues, which takes only what the context's process published
+  on it, and an asking write's answer, which goes into that context's own
+  completion ring. Never more than the `Doorbell` call allows any process
+  today. A storm of writes at a page costs the writing process a VM exit
+  each, as a storm of `Doorbell` calls does.
 
 **Contexts.** Each process that opens the accelerator's user client gets a
 context from the kext: a number `c`, handed out once from 1 (its object ids are
@@ -4447,6 +4516,9 @@ commit. Each outcome the new design allows is one of those two:
   for a lane
   (`the_host_s_lock_held_around_its_calls_while_a_route_waits_for_it_holds_up_nothing`). A route changes no order: the ring's records, its completions and
   interrupts are the thread's, as for a doorbell the host takes in the write.
+  Where the guest took `DOORBELL_PAGES`, a queue of a context with a doorbell
+  page is routed at the page's doorbell in BAR4 instead, and the page's
+  routes count among the 128 ("BAR4: the doorbell pages").
 
 ## Stage 3 guest stack (from the prior-art study)
 

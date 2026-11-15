@@ -3,8 +3,8 @@
 //! `rvg_graphics_device_*` functions.
 //!
 //! The host makes the device, maps its region into the guest as BAR 2 (64-bit, prefetchable),
-//! sends BAR 0's accesses to it, hands it the `ioeventfd` it registers on `DOORBELL`, and raises
-//! MSI-X vector 0 when it asks. The guest's protocol is the wire header's
+//! sends BAR 0's accesses to it, and BAR 4's (the doorbell pages) where it maps them, hands it the
+//! `ioeventfd` it registers on `DOORBELL`, and raises MSI-X vector 0 when it asks. The guest's protocol is the wire header's
 //! (`reims_graphics_wire.h`); this API needs none of it.
 
 use std::ffi::c_void;
@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use reims_vgpu::{
     GraphicsCallbacks, GraphicsConfig, GraphicsDevice, GraphicsRaiseFn, GraphicsRouteDoorbellFn,
-    GuestArch,
+    GraphicsRouteDoorbellPageFn, GuestArch,
 };
 
 use crate::cursor::{
@@ -70,6 +70,22 @@ pub const RVG_GRAPHICS_DOORBELL_ROUTES: u32 = 128;
 /// control rings.
 pub const RVG_GRAPHICS_ALLOCATIONS_OFFSET: u64 = 0x40_0000;
 
+/// The BAR of the graphics device's doorbell pages, where the host maps it
+/// (RvgGraphicsDeviceConfig's `doorbell_pages`): 32-bit MMIO, not prefetchable,
+/// RVG_GRAPHICS_DOORBELLS_SIZE bytes, whose 32-bit writes the host sends to
+/// rvg_graphics_device_doorbell_write and whose reads it answers 0 itself.
+pub const RVG_GRAPHICS_PCI_BAR_DOORBELLS: u32 = 4;
+
+/// The size of BAR 4: RVG_GRAPHICS_DOORBELL_PAGES pages of RVG_GRAPHICS_DOORBELL_PAGE_SIZE bytes.
+pub const RVG_GRAPHICS_DOORBELLS_SIZE: u32 = 0x40_0000;
+
+/// The bytes of one doorbell page; page `n`'s doorbell is its first byte, at
+/// `n * RVG_GRAPHICS_DOORBELL_PAGE_SIZE` in BAR 4.
+pub const RVG_GRAPHICS_DOORBELL_PAGE_SIZE: u32 = 0x4000;
+
+/// How many doorbell pages BAR 4 holds.
+pub const RVG_GRAPHICS_DOORBELL_PAGES: u32 = 256;
+
 const _: () = {
     use reims_vgpu_graphics::wire;
     assert!(RVG_GRAPHICS_PCI_VENDOR_ID == wire::RGFX_PCI_VENDOR_ID);
@@ -84,6 +100,10 @@ const _: () = {
     assert!(RVG_GRAPHICS_DOORBELL_CONTROL == wire::RGFX_CONTROL_RING_ID);
     assert!(RVG_GRAPHICS_DOORBELL_ROUTES == reims_vgpu_graphics::device::MAX_DOORBELL_ROUTES);
     assert!(RVG_GRAPHICS_ALLOCATIONS_OFFSET == wire::RGFX_ALLOCATIONS_OFFSET);
+    assert!(RVG_GRAPHICS_PCI_BAR_DOORBELLS == wire::RGFX_PCI_BAR_DOORBELLS);
+    assert!(RVG_GRAPHICS_DOORBELLS_SIZE == wire::RGFX_DOORBELLS_SIZE);
+    assert!(RVG_GRAPHICS_DOORBELL_PAGE_SIZE == wire::RGFX_DOORBELL_PAGE_SIZE);
+    assert!(RVG_GRAPHICS_DOORBELL_PAGES == wire::RGFX_DOORBELL_PAGES);
 };
 
 /// `raise_interrupt(ctx, vector)`: raise the device's MSI-X vector `vector` (0).
@@ -142,6 +162,32 @@ pub type RvgGraphicsRouteDoorbellFn = Option<
     unsafe extern "C-unwind" fn(ctx: *mut c_void, route: u64, ring_id: u32, bell: i32) -> bool,
 >;
 
+/// `route_doorbell_page(ctx, route, page, ring_id, bell)`: as route_doorbell, for a write of
+/// exactly `ring_id` at doorbell page `page`'s doorbell, `page * RVG_GRAPHICS_DOORBELL_PAGE_SIZE`
+/// in BAR 4, in place of RVG_GRAPHICS_REG_DOORBELL (QEMU: memory_region_add_eventfd on BAR 4 at
+/// that offset, matching `ring_id`): the route of a command queue whose guest process has that
+/// page, which its process writes. Until the host takes the route, and where it refuses it, the
+/// writes come through rvg_graphics_device_doorbell_write. A route of a `ring_id` at `page`
+/// another route holds replaces that one. With `bell` -1, drop route `route` (of `ring_id` at
+/// `page`), as route_doorbell does. The device asks it only of a host that maps BAR 4
+/// (RvgGraphicsDeviceConfig's `doorbell_pages`), and routes a queue on its page only where the
+/// host gives this function; it counts these routes among RVG_GRAPHICS_DOORBELL_ROUTES.
+///
+/// Thread: as route_doorbell's, with `bell` -1 also inside rvg_graphics_device_mmio_write_taking
+/// (a write of 0 to STATUS) or rvg_graphics_device_reset; never inside
+/// rvg_graphics_device_doorbell_write. The library holds no lock around it that a function of
+/// this header waits for, and it may call nothing of the library's. Without it the writes of a
+/// queue whose process has a page all come through rvg_graphics_device_doorbell_write.
+pub type RvgGraphicsRouteDoorbellPageFn = Option<
+    unsafe extern "C-unwind" fn(
+        ctx: *mut c_void,
+        route: u64,
+        page: u32,
+        ring_id: u32,
+        bell: i32,
+    ) -> bool,
+>;
+
 /// The graphics device's callbacks.
 ///
 /// The cursor's three tell the host the guest's cursor on the device's display, for a host that
@@ -178,6 +224,9 @@ pub struct RvgGraphicsCallbacks {
     /// Routes a command queue's plain doorbell into its bell, or drops the route. A host built
     /// before it, whose `struct_size` ends before it, gives none.
     pub route_doorbell: RvgGraphicsRouteDoorbellFn,
+    /// Routes a command queue's plain doorbell on its process's doorbell page into its bell, or
+    /// drops the route. A host built before it, whose `struct_size` ends before it, gives none.
+    pub route_doorbell_page: RvgGraphicsRouteDoorbellPageFn,
 }
 
 // SAFETY: repr(C), a u32 first; a pointer and optional function pointers.
@@ -243,9 +292,16 @@ pub struct RvgGraphicsDeviceConfig {
     /// other value. A host built before this field, whose `struct_size` ends before it, serves an
     /// x86-64 guest.
     pub guest_arch: RvgGuestArch,
+    /// 1 where the host maps BAR 4, the doorbell pages (RVG_GRAPHICS_PCI_BAR_DOORBELLS), and
+    /// sends each 32-bit write of it to rvg_graphics_device_doorbell_write, answering its reads
+    /// 0: the device then offers the wire's DOORBELL_PAGES, on which the guest's kext maps each
+    /// process's own page into it, and the process rings its queues there with no call into the
+    /// kext. 0 for none, as a host built before this field, whose `struct_size` ends before it,
+    /// has. Refused (RVG_ERR_INVALID_ARGUMENT): any other value.
+    pub doorbell_pages: u32,
 }
 
-// SAFETY: repr(C), a u32 first; pointers and a u32.
+// SAFETY: repr(C), a u32 first; pointers and u32s.
 unsafe impl HostStruct for RvgGraphicsDeviceConfig {
     /// The first version ended before `guest_arch`.
     const V1_SIZE: usize = std::mem::offset_of!(RvgGraphicsDeviceConfig, guest_arch);
@@ -348,6 +404,11 @@ unsafe fn create(
         RVG_GUEST_ARCH_ARM64 => GuestArch::Arm64,
         _ => return refuse(RVG_ERR_INVALID_ARGUMENT),
     };
+    let doorbell_pages = match c.doorbell_pages {
+        0 => false,
+        1 => true,
+        _ => return refuse(RVG_ERR_INVALID_ARGUMENT),
+    };
     // SAFETY: the config's contract: NULL or a live map, and NULL or its files.
     let memory_map = match unsafe { memory_map(c.memory_map, c.memory_files) } {
         Ok(m) => m,
@@ -371,6 +432,16 @@ unsafe fn create(
         });
         route
     });
+    let route_doorbell_page = callbacks.route_doorbell_page.map(|f| {
+        let t = table.clone();
+        let route: GraphicsRouteDoorbellPageFn = Arc::new(move |route, page, ring_id, bell| {
+            // SAFETY: the host's function over its ctx.
+            ffi::host_call("route_doorbell_page", || unsafe {
+                f(t.ctx(), route, page, ring_id, bell.unwrap_or(-1))
+            })
+        });
+        route
+    });
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
             raise_interrupt,
@@ -378,6 +449,7 @@ unsafe fn create(
             cursor_show: cursor_show(&table, callbacks.cursor_show),
             cursor_move: cursor_move(&table, callbacks.cursor_move),
             route_doorbell,
+            route_doorbell_page,
         },
         window: match (&window, &window_table) {
             (Some((w, wc)), Some(t)) => Some(w.to_config(window_callbacks(t, wc))),
@@ -385,6 +457,7 @@ unsafe fn create(
         },
         memory_map,
         guest_arch,
+        doorbell_pages,
     };
     match GraphicsDevice::with_platform(<Plat as reims_vgpu::ApiPlatform>::process(), config) {
         Ok(d) => {
@@ -503,6 +576,33 @@ pub unsafe extern "C" fn rvg_graphics_device_mmio_write_taking(
         unsafe { live(device, "rvg_graphics_device_mmio_write_taking") }
             .device
             .mmio_write_taking(offset, value);
+    })
+}
+
+/// A 32-bit write of BAR 4, the doorbell pages, at `offset`, where the host maps it
+/// (RvgGraphicsDeviceConfig's `doorbell_pages`) and no route_doorbell_page route took the write.
+/// A write of a command queue's ring's id at a page's doorbell (`page *
+/// RVG_GRAPHICS_DOORBELL_PAGE_SIZE`) does what that write to RVG_GRAPHICS_REG_DOORBELL through
+/// rvg_graphics_device_mmio_write_taking does, where the ring is one of the queues of the guest
+/// process the page is bound to: it wakes the queue's thread, and may answer its next command
+/// buffer on the calling thread, calling raise_interrupt there inside this call. Every other
+/// write is dropped and counted, logged once a kind: an unbound page's, one at another offset,
+/// and one of the control ring's id or of another process's ring. On any thread, the vCPU's
+/// included. Calls back: raise_interrupt, as rvg_graphics_device_mmio_write_taking does.
+///
+/// # Safety
+/// `device` is a live graphics device handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvg_graphics_device_doorbell_write(
+    device: *mut RvgGraphicsDevice,
+    offset: u64,
+    value: u32,
+) {
+    ffi::export(|| {
+        // SAFETY: the caller's contract.
+        unsafe { live(device, "rvg_graphics_device_doorbell_write") }
+            .device
+            .doorbell_write(offset, value);
     })
 }
 

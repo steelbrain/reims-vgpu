@@ -91,6 +91,7 @@ merge into staging of 2026-06-19), and upstream master is merged into it
 | a command buffer is taken, and answered, on the vCPU that rings its queue's doorbell, with the plain register write | `f2c7e2a5`, `67cc08ad`, `5f459785` |
 | a command queue's plain doorbell, which the library routes where the guest took `DOORBELL_ASKS` (`route_doorbell`), is an ioeventfd matching the ring's id that signals the queue's eventfd, added and dropped under the BQL as the library asks, at most 128 at once | `d81bcaac` |
 | at QEMU's quit the device's release runs with the BQL let go, so a `route_doorbell` waiting for it finds the routes closed and returns, holding the release up no more | `104d7b18` |
+| BAR 4, the doorbell pages: 4 MiB of 32-bit MMIO, 256 pages of 16 KiB, whose writes go to the library (`rvg_graphics_device_doorbell_write`) and whose reads answer 0; the device offers them (`doorbell_pages`), and a queue of a context with a page has its plain doorbell's ioeventfd at the page's first byte (`route_doorbell_page`), not on DOORBELL | `b4771167` |
 | the console shows the display (`rvg_graphics_device_read_display`), so QMP's `screendump` saves the guest's frame, and has the guest's cursor | `70a9a466`, `c119b802` |
 | a screendump waits for the console's read of the display at most 3 s from the read's start, then is answered with what the console shows, so QMP goes on while the GPU never answers the read | `17098f76` |
 | the device's realize warns where BAR 2 would get no address: on a PC machine with RAM at 1 GiB ("The reims-graphics device", below) | `22ae1fd1` |
@@ -150,6 +151,15 @@ is its transport:
   queue's next command buffer on the vCPU, posting its `CB_SUBMITTED` and
   raising the interrupt inside the call, and wakes the queue's thread, which
   takes the buffer either way.
+- **BAR 4**, 4 MiB of 32-bit MMIO: the doorbell pages, 256 of 16 KiB, which
+  the guest's kext binds to its contexts and maps into their processes
+  (design.md, "BAR4: the doorbell pages"). Reads answer 0, and every write
+  goes to the library (`rvg_graphics_device_doorbell_write`), on the vCPU
+  with no BQL, but a write the library routes: a command queue whose context
+  has a page has its plain doorbell's ioeventfd at the page's first byte
+  (`route_doorbell_page`), matching the ring's id, in place of DOORBELL's.
+  The device always has it and offers the pages (`doorbell_pages`), and the
+  routes on the pages count among the 128.
 - **BAR 2**, 64-bit and prefetchable: the library's region
   (`rvg_graphics_device_region`), 1 GiB of memory of QEMU's process (on
   Linux a shared mapping of a memfd of the library's, on macOS private
