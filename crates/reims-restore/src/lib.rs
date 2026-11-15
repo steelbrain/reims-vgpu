@@ -20,6 +20,7 @@ pub mod mtree;
 pub mod pipeline;
 pub mod plan;
 pub mod policy;
+pub mod policy_nonce;
 pub mod source;
 pub mod tss;
 pub mod udif;

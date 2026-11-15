@@ -58,8 +58,8 @@ enum Command {
         #[arg(long, value_parser = parse_hex)]
         ecid: Option<u64>,
         /// The directory of the project's LocalPolicy keys (root.key, int.key, leaf.key): swap
-        /// the guest's trust anchors for the project's chain and write config.cpio, Ambrosia's
-        /// bundle of the patches.
+        /// the guest's trust anchors for the project's chain, refuse its local policy nonce
+        /// updates, and write config.cpio, Ambrosia's bundle of the patches.
         #[arg(long)]
         lp_keys: Option<PathBuf>,
     },

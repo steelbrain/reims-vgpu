@@ -170,7 +170,10 @@ lane reads it).
 
 The cost: an in-guest update that patches the system volume (a delta) checks the running seal
 against Apple's root hash, so it doesn't apply to our seal; such updates fall back to a full
-install at best. Ambrosia already can't re-sign the LocalPolicy in-guest (it runs no SEP).
+install at best. The LocalPolicy has a backstop the seal does not: the guest re-signs it in-guest
+on a nonce update but can't decode the project's chain, so the anchor bundle refuses the update
+("The LocalPolicy" above) and the writer's policy is kept; a system-volume delta has no such
+refusal.
 
 ## Tickets
 
@@ -249,6 +252,26 @@ still need Apple's signatures. With the swap, the 27.2.1 kernel checks the polic
 and its bindings (`nsih`, the nonces, the Cryptex1 ticket) as it would Apple's, with SIP on
 **[measured by Ambrosia's lane]**; patching out the check itself (`boop.c:7620`) proved
 infeasible there.
+
+The guest can't keep such a policy through a change of its own (`policy_nonce.rs`). At the first
+account (opendirectoryd's PlistFile module, when AppleVPKeyStore reports no owners), and at any
+later LocalPolicy change, the guest begins a local policy nonce update, decodes the current
+policy in libbootpolicy to re-sign it for the new nonce, and ends the update, which blesses the
+new nonce and removes the policies named for the old **[read from code, 27.0.1 and 27.2.1]**.
+libbootpolicy checks the policy's chain against Apple's roots alone (production, QA and the
+Hacktivation one), compiled into it in the OS cryptex's dyld shared cache, which the project
+can't change; it skips a policy it can't decode, the update still ends, and the next boot stops
+in Ambrosia with no policy **[measured, 27.2.1]**. So the bundle also has Ambrosia make the boot
+policy kext refuse every local nonce update at its start, as it refuses one while another,
+uninterruptible, runs: the first `b.ne` of the update's state checks becomes a `nop`, the update's
+first step fails ("Nonce creation failed: 16" in the guest's log), and nothing is rolled or
+removed. The restore finds the checks by their shape in the boot policy kext of the IPSW's own
+collection (one place on each of the five releases **[ipsw]**), checks their 24 bytes occur once
+in the kext, and writes the patch after the anchors', expecting one replacement. The guest then
+never records its first owner in the policy (the first unlock verifier and KEK group), and any
+later policy change, an in-guest update's or Startup Security's, fails at once rather than
+losing the next boot. On 27.2.1 the policy survives the first account and two restarts with SIP
+on, and the same disk without the patch loses it at the first restart **[measured]**.
 
 The chain's keys are the project's (`--lp-keys`, `root.key`, `int.key`, `leaf.key`): the root and
 the intermediate sign each install's certificates at its release's lengths. Whoever can write a

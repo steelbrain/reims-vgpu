@@ -21,7 +21,7 @@ use crate::gpt::Table;
 use crate::ipsw::Ipsw;
 use crate::manifest::{BuildManifest, VARIANT_ERASE, VARIANT_INSTALL};
 use crate::tss::{self, ApNonces, ApTicket, TssClient};
-use crate::{anchors, containers, image, img4, kernelcache, plan, policy};
+use crate::{anchors, containers, image, img4, kernelcache, plan, policy, policy_nonce};
 
 /// A restore to run.
 #[derive(Debug, Clone)]
@@ -237,13 +237,20 @@ pub fn run(r: &Restore, events: &mut dyn FnMut(Event), cancel: &AtomicBool) -> R
                 .context("the manifest's KernelCache has no path")?;
             let kc = kernelcache::decompress(&ipsw.read(kernel)?)
                 .with_context(|| format!("read {kernel}"))?;
-            let guest = anchors::guest(&kernelcache::FileSet::parse(&kc)?)
+            let fs = kernelcache::FileSet::parse(&kc)?;
+            let guest = anchors::guest(&fs)
                 .with_context(|| format!("find the LocalPolicy anchors in {kernel}"))?;
+            let refusal = policy_nonce::refusal(&fs).with_context(|| {
+                format!("find the local policy nonce update's beginning in {kernel}")
+            })?;
+            drop(fs);
             drop(kc);
             let keys = anchors::Keys::load(dir)?;
             let chain = anchors::chain(&guest, &keys)?;
             let signer = policy::Signer::with_key(keys.leaf, &[&chain.intermediate, &chain.leaf])?;
-            let bundle = anchors::config_bundle(&anchors::config(&guest, &chain))?;
+            let mut config = anchors::config(&guest, &chain);
+            policy_nonce::add_to(&mut config, &refusal);
+            let bundle = anchors::config_bundle(&config)?;
             (signer, Some(bundle))
         }
         None => {
