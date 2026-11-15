@@ -28,12 +28,14 @@
 //!   last record, the order the next run reads, so it ages from the last run that used it. Any
 //!   record whose checksum or kind does not read, bytes past the last whole record, or a
 //!   header that is not this identity's, and the whole file reads as none and is started again:
-//!   the kext takes what the device hands it, so no damaged or foreign answer reaches it. At most
-//!   [`CAPACITY`] records are appended; past half of them the file is written again at its next
-//!   open with the newest answers kept, a quarter of the capacity at most (the 2,048 answers the
-//!   kext's table holds). As each run appends a record of each key it uses, a host whose runs each
-//!   use all 2,048 writes its file again at every second open. The newest [`KEEP_FILES`] files of
-//!   the directory are kept, and the rest removed.
+//!   the kext takes what the device hands it, so no damaged or foreign answer reaches it. A file
+//!   holds at most [`CAPACITY`] records: past half of them it is written again at its next open,
+//!   and at all of them before the run appends another, with the newest answers kept, a quarter of
+//!   the capacity at most (the 2,048 answers the kext's table holds), in memory as in the file. As
+//!   each run appends a record of each key it uses, a host whose runs each use all 2,048 writes
+//!   its file again at every second open. A drop that cannot be written removes the file, so no
+//!   answer the device dropped reaches a later run. The newest [`KEEP_FILES`] files of the
+//!   directory are kept, and the rest removed.
 //! - A test build keeps no file ([`KEPT`]): its answers are kept in memory for the device's life
 //!   alone, so no test's pipelines reach a host's later guests.
 
@@ -81,7 +83,8 @@ pub(crate) const KEPT: bool = !cfg!(any(test, feature = "testkit"));
 /// The directory of the files, in the user's cache directory ([`directory`]).
 const DIR: &str = "reims-vgpu-pipeline-answers";
 
-/// The most records a file holds: past them, no record is appended (about 1 MiB).
+/// The most records a file holds (about 1 MiB): at them, it is written again before the next
+/// record (the module docs).
 pub(crate) const CAPACITY: usize = 8192;
 
 /// How many files of the directory are kept, the newest: one for each identity a host ran lately.
@@ -120,6 +123,9 @@ pub(crate) struct PipelineAnswers {
 struct State {
     /// The identity, where answers are kept in a file.
     identity: Option<[u8; 32]>,
+    /// The file's path, where answers are kept in a file and none of this run's drops failed to
+    /// reach it ([`State::discard`]).
+    path: Option<PathBuf>,
     /// The answers, each with its last record's place (the newer the larger).
     kept: HashMap<AnswerKey, (RgfxPipelineReflection, u64)>,
     /// The keys whose answers were dropped for answering otherwise, which this run learns no more.
@@ -175,6 +181,7 @@ impl PipelineAnswers {
         let path = dir.join(hex(&identity));
         let mut state = State {
             identity: Some(identity),
+            path: Some(path.clone()),
             ..State::default()
         };
         let read = std::fs::read(&path)
@@ -193,17 +200,12 @@ impl PipelineAnswers {
         state.run_start = state.next;
         // A missing, damaged or foreign file is started again, and one past half its capacity
         // written again with its newest answers: as many as the kext's table holds.
-        let rewrite = unread || records > CAPACITY / 2;
-        state.file = if rewrite {
-            state.records = 0;
-            let newest = newest(&state.kept, CAPACITY / 4);
-            let keys: HashSet<AnswerKey> = newest.iter().map(|(key, _)| *key).collect();
-            state.kept.retain(|key, _| keys.contains(key));
-            rewrite_file(dir, &path, &identity, &newest).inspect(|_| state.records = newest.len())
+        if unread || records > CAPACITY / 2 {
+            state.rewrite();
         } else {
             state.records = records;
-            OpenOptions::new().append(true).open(&path).ok()
-        };
+            state.file = OpenOptions::new().append(true).open(&path).ok();
+        }
         prune(dir, &path);
         log::info!(
             target: "reims_vgpu::graphics::answers",
@@ -315,26 +317,77 @@ impl State {
         }
     }
 
-    /// Appends a record of `kind` to the file, where one is written and has room.
+    /// Appends a record of `kind` to the file, where one is written: one at its capacity is
+    /// written again first. A drop that cannot be written removes the file ([`State::discard`]).
     fn append(&mut self, kind: u32, key: &AnswerKey, answer: &RgfxPipelineReflection) {
-        let (Some(identity), Some(file)) = (self.identity, self.file.as_mut()) else {
+        let Some(identity) = self.identity else {
             return;
         };
-        if self.records >= CAPACITY {
+        let in_file = self.file.is_some();
+        if in_file && self.records >= CAPACITY {
+            self.rewrite();
+        }
+        let appended = self.file.as_mut().is_some_and(|file| {
+            file.write_all(&record(&identity, kind, key, answer))
+                .is_ok()
+        });
+        if appended {
+            self.records += 1;
             return;
         }
-        if file
-            .write_all(&record(&identity, kind, key, answer))
-            .is_ok()
-        {
-            self.records += 1;
-        } else {
+        if in_file {
+            self.file = None;
             log::warn!(
                 target: "reims_vgpu::graphics::answers",
                 "the pipeline answers' file took no more records: this run's answers are kept \
                  in memory alone"
             );
-            self.file = None;
+        }
+        if kind == DROPPED_RECORD {
+            self.discard();
+        }
+    }
+
+    /// Writes the file again with its newest answers, a quarter of the capacity at most (as many
+    /// as the kext's table holds), and keeps only those in memory too: the file is written from
+    /// then on where that succeeds, and no more in this run where it does not.
+    fn rewrite(&mut self) {
+        let newest = newest(&self.kept, CAPACITY / 4);
+        let keys: HashSet<AnswerKey> = newest.iter().map(|(key, _)| *key).collect();
+        self.kept.retain(|key, _| keys.contains(key));
+        // The handle to the file it replaces goes first: a file open on Windows can refuse a
+        // rename over it.
+        self.file = None;
+        self.records = 0;
+        if let (Some(identity), Some(path)) = (self.identity, self.path.as_deref()) {
+            self.file = rewrite_file(path, &identity, &newest);
+        }
+        if self.file.is_some() {
+            self.records = newest.len();
+        }
+    }
+
+    /// Removes the file, as a drop that cannot be written to it leaves it: the next run then
+    /// starts from none, and no answer the device dropped reaches it. Once a run, since none of
+    /// its records is written after.
+    fn discard(&mut self) {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        match std::fs::remove_file(&path) {
+            Ok(()) => log::warn!(
+                target: "reims_vgpu::graphics::answers",
+                "a dropped pipeline answer could not be written to its file: {} is removed, \
+                 and the next run starts from none",
+                path.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!(
+                target: "reims_vgpu::graphics::answers",
+                "a dropped pipeline answer could not be written to its file, which could not \
+                 be removed either ({e}): the next run of {} may take the dropped answer",
+                path.display()
+            ),
         }
     }
 }
@@ -469,15 +522,14 @@ fn newest(
     all.into_iter().map(|(_, k, a)| (k, a)).collect()
 }
 
-/// Writes the file at `path` again, in `dir`: its header and a record of each of `answers`, through
-/// a file beside it renamed over it; the file opened to append, or `None` where it could not be.
+/// Writes the file at `path` again: its header and a record of each of `answers`, through a file
+/// beside it renamed over it; the file opened to append, or `None` where it could not be.
 fn rewrite_file(
-    dir: &Path,
     path: &Path,
     identity: &[u8; 32],
     answers: &[(AnswerKey, RgfxPipelineReflection)],
 ) -> Option<File> {
-    std::fs::create_dir_all(dir).ok()?;
+    std::fs::create_dir_all(path.parent()?).ok()?;
     let mut bytes = header(identity).to_vec();
     for (key, answer) in answers {
         bytes.extend_from_slice(&record(identity, KEPT_RECORD, key, answer));
@@ -909,31 +961,83 @@ mod tests {
         }
     }
 
-    /// A file holds at most its capacity of records; one past half of it is written again at its
-    /// next open with its newest answers, a quarter of the capacity.
+    /// A file past half its capacity is written again at its next open with its newest answers, a
+    /// quarter of the capacity.
     #[test]
-    fn the_file_is_capped_and_written_again_with_its_newest_answers() {
+    fn the_file_past_half_its_capacity_is_written_again_at_its_next_open() {
         let dir = Scratch::new("cap");
         let answers = PipelineAnswers::open_in(&dir.0, IDENTITY);
-        for n in 0..CAPACITY + 10 {
-            let mut k = [0u8; 32];
-            k[..8].copy_from_slice(&(n as u64).to_le_bytes());
-            answers.observe(&k, Some(&made(1, 1, n as u64)));
+        for n in 0..CAPACITY / 2 + 10 {
+            answers.observe(&many_key(n), Some(&made(1, 1, n as u64)));
         }
         drop(answers);
-        let len = std::fs::metadata(dir.file(&IDENTITY)).unwrap().len() as usize;
-        assert_eq!(len, HEADER_BYTES + CAPACITY * RECORD_BYTES);
+        assert_eq!(records(&dir), CAPACITY / 2 + 10);
         let answers = PipelineAnswers::open_in(&dir.0, IDENTITY);
         assert_eq!(answers.len(), CAPACITY / 4);
-        let newest = answers.replies(0, 1, 0);
-        let (reply, _) = RgfxPipelineReflection::read_from_prefix(&newest[0]).unwrap();
         assert_eq!(
-            reply.max_total_threads_per_threadgroup,
-            (CAPACITY - 1) as u64
+            threads(answers.replies(0, 1, 0)),
+            [(CAPACITY / 2 + 9) as u64]
         );
         drop(answers);
-        let len = std::fs::metadata(dir.file(&IDENTITY)).unwrap().len() as usize;
-        assert_eq!(len, HEADER_BYTES + CAPACITY / 4 * RECORD_BYTES);
+        assert_eq!(records(&dir), CAPACITY / 4);
+    }
+
+    /// A file at its capacity is written again with its newest answers before the run's next
+    /// record, so every record a run appends past it reaches the file, a drop's above all: the
+    /// next run never takes an answer the device dropped.
+    #[test]
+    fn a_drop_at_the_capacity_reaches_the_file() {
+        let dir = Scratch::new("cap-drop");
+        let answers = PipelineAnswers::open_in(&dir.0, IDENTITY);
+        for n in 0..CAPACITY {
+            answers.observe(&many_key(n), Some(&made(1, 1, n as u64)));
+        }
+        assert_eq!(records(&dir), CAPACITY);
+        // The newest answer refused: the file is written again with the newest 2,048 left, in
+        // memory too, and then takes the drop.
+        let newest = many_key(CAPACITY - 1);
+        assert_eq!(answers.observe(&newest, None), Observed::Refused);
+        assert_eq!(answers.len(), CAPACITY / 4);
+        assert_eq!(records(&dir), CAPACITY / 4 + 1);
+        // And what the run learns after.
+        assert_eq!(
+            answers.observe(&key(1), Some(&made(1, 1, 7))),
+            Observed::New
+        );
+        drop(answers);
+        let answers = PipelineAnswers::open_in(&dir.0, IDENTITY);
+        assert_eq!(answers.len(), CAPACITY / 4 + 1);
+        assert_eq!(
+            threads(answers.replies(0, 2, 0)),
+            [7, (CAPACITY - 2) as u64]
+        );
+        assert_eq!(
+            answers.observe(&newest, Some(&made(2, 2, (CAPACITY - 1) as u64))),
+            Observed::New
+        );
+    }
+
+    /// A drop that cannot be written to the file removes it, so the next run starts from none and
+    /// takes no answer the device dropped; a kept answer that cannot be written leaves it.
+    #[test]
+    fn a_drop_that_cannot_be_written_removes_the_file() {
+        let dir = Scratch::new("lost-drop");
+        let answers = PipelineAnswers::open_in(&dir.0, IDENTITY);
+        answers.observe(&key(1), Some(&made(1, 1, 64)));
+        answers.observe(&key(2), Some(&made(1, 1, 128)));
+        drop(answers);
+        let answers = PipelineAnswers::open_in(&dir.0, IDENTITY);
+        // The file takes no more records, as after a write that failed.
+        answers.state.lock().file = None;
+        assert_eq!(
+            answers.observe(&key(3), Some(&made(1, 1, 256))),
+            Observed::New
+        );
+        assert!(dir.file(&IDENTITY).exists());
+        assert_eq!(answers.observe(&key(1), None), Observed::Refused);
+        assert!(!dir.file(&IDENTITY).exists());
+        drop(answers);
+        assert_eq!(PipelineAnswers::open_in(&dir.0, IDENTITY).len(), 0);
     }
 
     /// Answers kept in memory alone, as a test build's device keeps them, write no file.

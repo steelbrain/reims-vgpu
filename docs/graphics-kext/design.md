@@ -3293,11 +3293,13 @@ answer no create could be given, reads as none and is started again. A
 record is appended when an answer is learnt or dropped, and the kept record
 again at a run's first create of a key an earlier run kept, so an answer is
 as new as the last run that used it. The file holds at most 8,192 records
-(1 MiB), and one past half of that is written again at the next open with its
-newest 2,048 answers, the kext table's size; the host keeps the 8 newest
-files. A refusal is never kept, and a create of a
-kept key that the device refuses or answers with other values drops the kept
-answer, the second a degradation logged once per boot. At its start, once the
+(1 MiB): one past half of that is written again at the next open, and one at
+all of them before the run's next record, with its newest 2,048 answers, the
+kext table's size. A drop that cannot be written removes the file, so no
+dropped answer reaches a later run. The host keeps the 8 newest files. A
+refusal is never kept, and a create of a kept key that the device refuses or
+answers with other values drops the kept answer, the second a degradation
+logged once per boot. At its start, once the
 display is listed and before any process can make a pipeline, the kext asks
 for the kept answers, 64 a query, newest first, until the device has no more
 or it has asked 2,048, and seeds its table with them: a seed takes only a free
