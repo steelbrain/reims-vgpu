@@ -9986,7 +9986,12 @@ mod tests {
         let parts = p.world().committed();
         assert_eq!(parts.len(), 8, "a chunk a pass, each a part");
         let in_order: Vec<&(ObjId, bool, Vec<Shape>)> = (parts.iter())
-            .map(|cb| chunk_of.iter().find(|c| c.0 == *cb).expect("a chunk walked"))
+            .map(|cb| {
+                chunk_of
+                    .iter()
+                    .find(|c| c.0 == *cb)
+                    .expect("a chunk walked")
+            })
             .collect();
         assert_eq!(
             in_order.iter().map(|c| c.1).collect::<Vec<_>>(),
@@ -9994,7 +9999,10 @@ mod tests {
             "the longest chunk the helper's alone"
         );
         assert_eq!(
-            in_order.iter().flat_map(|c| c.2.iter().cloned()).collect::<Vec<_>>(),
+            in_order
+                .iter()
+                .flat_map(|c| c.2.iter().cloned())
+                .collect::<Vec<_>>(),
             whole,
             "each op walked once, its chunks committed in their order"
         );
@@ -10006,7 +10014,11 @@ mod tests {
             "at its take"
         );
         p.world().complete_all(CompleteOn::Caller);
-        assert_eq!(answered(&posted), answered_whole[1..], "completed as a whole walk");
+        assert_eq!(
+            answered(&posted),
+            answered_whole[1..],
+            "completed as a whole walk"
+        );
     }
 
     /// The chunks of a dealt buffer no helper has taken by the end of this thread's first are
