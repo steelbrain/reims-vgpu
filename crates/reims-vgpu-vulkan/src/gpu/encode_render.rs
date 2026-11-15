@@ -399,11 +399,8 @@ pub struct RenderEncoderObject {
     /// holds it ([`RenderEncoder::encoding`]), so each command's take inside the run is this
     /// thread's again, which no atomic operation takes.
     drawing: ReentrantMutex<RefCell<Drawing>>,
-    /// The pass the runtime's encoder was made of: the descriptor as core set it, with the rate
-    /// map [`open`] took, without the colour resolves [`untouched_resolves`] dropped and the
-    /// unused depth and stencil resolve textures [`without_unused_resolves`] removes. Its
-    /// attachments' store actions and resolve textures decide what a late setter does.
-    pass: rt::RenderPassDescriptor,
+    /// What a late setter reads of the pass the runtime's encoder was made of ([`PassStores`]).
+    pass: PassStores,
     /// The colour attachments whose resolves [`untouched_resolves`] dropped: a late resolve
     /// setter of one dies, and a late store action is compared with the descriptor's own; where
     /// there is one, a late depth or stencil resolve texture that may resolve dies
@@ -439,6 +436,50 @@ pub struct RenderEncoderObject {
     /// The pass's bfloat colour attachment it loads and stores, where it has one: a draw, an
     /// execution of render commands or a tile dispatch in the pass dies ([`bfloat_loaded`]).
     bfloat_loaded: Option<String>,
+}
+
+/// What the late setters of an encoder read of the pass it was made of, the descriptor as core
+/// set it, with the rate map [`open`] took, without the colour resolves [`untouched_resolves`]
+/// dropped and the unused depth and stencil resolve textures [`without_unused_resolves`]
+/// removes: each attachment's store action and options where it has a texture
+/// ([`VulkanRenderEncoder::stored`]), and whether each colour attachment has a resolve texture.
+/// The encoder holds no copy of the descriptor: the runtime's encoder holds its own, and with it
+/// the attachments' textures.
+#[derive(Debug, Clone, Copy)]
+struct PassStores {
+    /// The colour attachments' store actions and options, `None` for one without a texture.
+    color: [Option<(rt::StoreAction, rt::StoreActionOptions)>; rt::MAX_COLOR_ATTACHMENTS],
+    /// The depth attachment's.
+    depth: Option<(rt::StoreAction, rt::StoreActionOptions)>,
+    /// The stencil attachment's.
+    stencil: Option<(rt::StoreAction, rt::StoreActionOptions)>,
+    /// Whether each colour attachment has a resolve texture.
+    color_resolves: [bool; rt::MAX_COLOR_ATTACHMENTS],
+}
+
+impl PassStores {
+    /// What `d`'s late setters read.
+    fn of(d: &rt::RenderPassDescriptor) -> PassStores {
+        let stores =
+            |t: &Option<rt::Texture>, action, options| t.as_ref().map(|_| (action, options));
+        PassStores {
+            color: std::array::from_fn(|i| {
+                let c = &d.color_attachments[i];
+                stores(&c.texture, c.store_action, c.store_action_options)
+            }),
+            depth: {
+                let a = &d.depth_attachment;
+                stores(&a.texture, a.store_action, a.store_action_options)
+            },
+            stencil: {
+                let a = &d.stencil_attachment;
+                stores(&a.texture, a.store_action, a.store_action_options)
+            },
+            color_resolves: std::array::from_fn(|i| {
+                d.color_attachments[i].resolve_texture.is_some()
+            }),
+        }
+    }
 }
 
 /// What a render pipeline state tells the encoder that sets it of how its draws draw, read from
@@ -572,7 +613,7 @@ fn may_resolve(store: rt::StoreAction) -> bool {
     )
 }
 
-/// `d` without the depth and stencil resolve textures of an attachment without a texture whose
+/// Takes from `d` the depth and stencil resolve textures of an attachment without a texture whose
 /// store action leaves them unused: Metal resolves nothing into them (`render_pass_memoryless`'s
 /// unused resolve textures on depth and stencil), where the runtime refuses a resolve texture of
 /// an attachment without a texture as unmeasured. One beside a texture goes to the runtime,
@@ -580,7 +621,7 @@ fn may_resolve(store: rt::StoreAction) -> bool {
 /// (`unused_depth_and_stencil_resolves_leave_their_textures`), and so does a colour
 /// attachment's. Nothing else of the pass reads them: what Metal aborts at reads a depth or
 /// stencil resolve texture only under a store action that resolves ([`metal_aborts_at`]).
-fn without_unused_resolves(mut d: rt::RenderPassDescriptor) -> rt::RenderPassDescriptor {
+fn without_unused_resolves(d: &mut rt::RenderPassDescriptor) {
     let unused = |a: &Option<rt::Texture>, store| a.is_none() && !may_resolve(store);
     if unused(&d.depth_attachment.texture, d.depth_attachment.store_action) {
         d.depth_attachment.resolve_texture = None;
@@ -591,7 +632,6 @@ fn without_unused_resolves(mut d: rt::RenderPassDescriptor) -> rt::RenderPassDes
     ) {
         d.stencil_attachment.resolve_texture = None;
     }
-    d
 }
 
 /// Whether the colour resolve of an attachment of `from` into a texture of `into` is the
@@ -939,24 +979,23 @@ struct Dropped {
     into: PixelFormat,
 }
 
-/// `d` without the colour resolves plain Metal leaves untouched ([`Fate::Dropped`], `sources`
+/// Takes from `d` the colour resolves plain Metal leaves untouched ([`Fate::Dropped`], `sources`
 /// holding the textures as core set them and `mapped` being the rate map the pass takes), and
-/// those attachments: each stores as its action does without the resolve, as plain Metal was
-/// measured to (`MultisampleResolve` as `DontCare`, which leaves the samples as they were, the
-/// pass drawn or not, and `StoreAndMultisampleResolve` as `Store`), and the resolve texture
-/// keeps its texels ([`unmeasured_shape`]). A late resolve setter of such an attachment dies, a
-/// late store action is compared with the descriptor's own ([`Dropped`]), and a late depth or
-/// stencil resolve texture of the pass that may resolve dies
+/// answers those attachments: each stores as its action does without the resolve, as plain
+/// Metal was measured to (`MultisampleResolve` as `DontCare`, which leaves the samples as they
+/// were, the pass drawn or not, and `StoreAndMultisampleResolve` as `Store`), and the resolve
+/// texture keeps its texels ([`unmeasured_shape`]). A late resolve setter of such an attachment
+/// dies, a late store action is compared with the descriptor's own ([`Dropped`]), and a late
+/// depth or stencil resolve texture of the pass that may resolve dies
 /// ([`VulkanRenderEncoder::resolves_beside_dropped`]). Each attachment's fate is decided on `d`
 /// as it is given, before any resolve is dropped.
 fn untouched_resolves(
-    mut d: rt::RenderPassDescriptor,
+    d: &mut rt::RenderPassDescriptor,
     sources: &Sources,
     mapped: PassMap,
-) -> (rt::RenderPassDescriptor, Vec<Dropped>) {
-    let drops: Vec<bool> = (0..d.color_attachments.len())
-        .map(|i| matches!(fate(&d, i, sources, mapped), Fate::Dropped))
-        .collect();
+) -> Vec<Dropped> {
+    let drops: [bool; rt::MAX_COLOR_ATTACHMENTS] =
+        std::array::from_fn(|i| matches!(fate(d, i, sources, mapped), Fate::Dropped));
     let mut dropped = Vec::new();
     for ((index, a), drop) in (0u32..).zip(&mut d.color_attachments).zip(drops) {
         if !drop {
@@ -975,7 +1014,7 @@ fn untouched_resolves(
             _ => rt::StoreAction::DontCare,
         };
     }
-    (d, dropped)
+    dropped
 }
 
 /// The first colour resolve of the pass `d` that dies ([`Fate::Dies`]), named, if any, `sources`
@@ -1151,14 +1190,12 @@ fn stopped_default_samples(count: u64) -> String {
 /// `render_pass_memoryless_stencil_resolve`), and more programmable sample positions than a
 /// multisampled pass's samples (`render_pass_msaa`: 8 on a 4-sample pass).
 fn metal_aborts_at(d: &rt::RenderPassDescriptor) -> Option<&'static str> {
-    let textures: Vec<&rt::Texture> = d
-        .color_attachments
-        .iter()
+    let first = (d.color_attachments.iter())
         .filter_map(|c| c.texture.as_ref())
         .chain(d.depth_attachment.texture.as_ref())
         .chain(d.stencil_attachment.texture.as_ref())
-        .collect();
-    if textures.is_empty()
+        .next();
+    if first.is_none()
         && d.render_target_width != 0
         && d.render_target_height != 0
         && d.default_raster_sample_count == 0
@@ -1187,9 +1224,7 @@ fn metal_aborts_at(d: &rt::RenderPassDescriptor) -> Option<&'static str> {
             "a memoryless depth or stencil attachment resolving at one sample with no resolve texture",
         );
     }
-    let samples = textures
-        .first()
-        .map_or(d.default_raster_sample_count, |t| t.sample_count());
+    let samples = first.map_or(d.default_raster_sample_count, |t| t.sample_count());
     let positions = u64::try_from(d.sample_positions.len()).unwrap_or(u64::MAX);
     if samples > 1 && positions > samples {
         return Some("more programmable sample positions than the pass's samples");
@@ -1243,7 +1278,7 @@ pub(crate) fn open(
             ),
         );
     }
-    let (d, map) = descriptor.pass();
+    let (mut d, map) = descriptor.pass();
     let sources = descriptor.sources();
     if crate::os::COPIES_READ_ONLY
         && let Some(what) = kept_attachment(&d, &sources)
@@ -1252,16 +1287,16 @@ pub(crate) fn open(
     }
     // The colour resolves into a texture of another format, decided by the rate map the pass
     // takes, as it takes it.
-    let settled = |d: rt::RenderPassDescriptor, mapped: PassMap| {
-        if let Some(what) = refused_resolve_format(&d, &sources, mapped) {
+    let settled = |d: &mut rt::RenderPassDescriptor, mapped: PassMap| {
+        if let Some(what) = refused_resolve_format(d, &sources, mapped) {
             unrepresentable("renderCommandEncoderWithDescriptor:", &what);
         }
         untouched_resolves(d, &sources, mapped)
     };
     let made = match map {
         None => {
-            let (d, dropped) = settled(d, PassMap::Unmapped);
-            make(command_buffer, d, dropped, Taken::UNMAPPED)
+            let dropped = settled(&mut d, PassMap::Unmapped);
+            make(command_buffer, &mut d, dropped, Taken::UNMAPPED)
         }
         Some(map) => map.for_pass(command_buffer, |raw, class| {
             let mapped = match class {
@@ -1269,13 +1304,13 @@ pub(crate) fn open(
                 Class::NoLayers | Class::Identity => PassMap::Identity,
                 Class::Varying => PassMap::Varying,
             };
-            let (mut d, dropped) = settled(d, mapped);
+            let dropped = settled(&mut d, mapped);
             d.rasterization_rate_map = Some(raw);
             let taken = Taken {
                 class: Some(class),
                 mutable: map.is_mutable(),
             };
-            make(command_buffer, d, dropped, taken)
+            make(command_buffer, &mut d, dropped, taken)
         }),
     };
     if let Ok(Some(e)) = &made {
@@ -1349,13 +1384,14 @@ impl Taken {
 /// work for Metal's tiler ([`crate::gpu::command::CommandBufferObject::tiler_work`]).
 fn make(
     command_buffer: &VulkanCommandBuffer,
-    d: rt::RenderPassDescriptor,
+    d: &mut rt::RenderPassDescriptor,
     dropped: Vec<Dropped>,
     taken: Taken,
 ) -> RaiseResult<Option<VulkanRenderEncoder>> {
     let sel = "renderCommandEncoderWithDescriptor:";
-    let d = without_unused_resolves(d);
-    match plain_at(sel, || command_buffer.raw.render_command_encoder(&d)) {
+    without_unused_resolves(d);
+    let d = &*d;
+    match plain_at(sel, || command_buffer.raw.render_command_encoder(d)) {
         Ok(raw) => {
             command_buffer.tiler_work(sel, crate::gpu::metal_space::FirstUse::RenderEncoder);
             opened(command_buffer, raw, (d, dropped), taken).map(Some)
@@ -1363,14 +1399,14 @@ fn make(
         Err(rt::Error::Nil(n))
             if n.problem == rt::Problem::RenderPass(rt::RenderPassProblem::NoTargets) =>
         {
-            debug_assert!(answers_nil(&d), "a nil pass answers_nil missed");
+            debug_assert!(answers_nil(d), "a nil pass answers_nil missed");
             Ok(None)
         }
         Err(rt::Error::Invalid(i)) if i.problem == rt::Problem::EncoderOpen => metal_aborts(
             sel,
             "a command buffer with an open encoder (\"with uncommitted encoder\")",
         ),
-        Err(e) => match metal_aborts_at(&d) {
+        Err(e) => match metal_aborts_at(d) {
             Some(what) => metal_aborts(sel, what),
             None => match e {
                 // What plain Metal answers its encoder nil for: a tile size, per-sample storage,
@@ -1409,7 +1445,7 @@ fn make(
                 }
                 e => {
                     if crate::gpu::desc::is_format_refusal(&e) {
-                        crate::gpu::ycbcr::pass_refused(sel, &d, &e);
+                        crate::gpu::ycbcr::pass_refused(sel, d, &e);
                     }
                     decide(sel, Policy::Dies, e)
                 }
@@ -1424,15 +1460,16 @@ fn make(
 fn opened(
     command_buffer: &VulkanCommandBuffer,
     raw: rt::RenderCommandEncoder,
-    (d, dropped): (rt::RenderPassDescriptor, Vec<Dropped>),
+    (d, dropped): (&rt::RenderPassDescriptor, Vec<Dropped>),
     taken: Taken,
 ) -> RaiseResult<VulkanRenderEncoder> {
     let sel = "renderCommandEncoderWithDescriptor:";
-    let aborts = metal_aborts_at(&d);
+    let aborts = metal_aborts_at(d);
+    let pass = PassStores::of(d);
     let e = Obj::new(RenderEncoderObject {
         encoder: EncoderObject::new(raw, command_buffer),
         drawing: ReentrantMutex::new(RefCell::new(Drawing::default())),
-        undecided: Mutex::new(undecided(&d)),
+        undecided: Mutex::new(undecided(d)),
         read_only_undecided: Mutex::new(Vec::new()),
         late_stores: Mutex::new(Vec::new()),
         no_layers: taken.class == Some(Class::NoLayers),
@@ -1440,8 +1477,8 @@ fn opened(
         rasterizes: taken.class != Some(Class::Unset),
         varying_rates: taken.class == Some(Class::Varying),
         undrawn: AtomicBool::new(taken.mutable),
-        bfloat_loaded: bfloat_loaded(&d),
-        pass: d,
+        bfloat_loaded: bfloat_loaded(d),
+        pass,
     });
     if let Some(what) = aborts {
         metal_aborts(sel, what);
@@ -2542,9 +2579,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                     });
                     return self.encoder.nothing(sel);
                 }
-                if self.pass.color_attachments[at].resolve_texture.is_none()
-                    || self.resolve_unused(Attachment::Color(index))
-                {
+                if !self.pass.color_resolves[at] || self.resolve_unused(Attachment::Color(index)) {
                     return self.encoder.nothing(sel);
                 }
                 let at = (slice, depth_plane, level);
@@ -3236,22 +3271,15 @@ impl VulkanRenderEncoder {
     /// colour attachment.
     fn stored(&self, attachment: Attachment) -> Option<(rt::StoreAction, rt::StoreActionOptions)> {
         let p = &self.pass;
-        let (texture, action, options) = match attachment {
+        match attachment {
             Attachment::Color(i) => {
-                let c = p.color_attachments.get(usize::try_from(i).ok()?)?;
-                let action = self.dropped_resolve(i).map_or(c.store_action, |d| d.store);
-                (&c.texture, action, c.store_action_options)
+                let (action, options) = (*p.color.get(usize::try_from(i).ok()?)?)?;
+                let action = self.dropped_resolve(i).map_or(action, |d| d.store);
+                Some((action, options))
             }
-            Attachment::Depth => {
-                let a = &p.depth_attachment;
-                (&a.texture, a.store_action, a.store_action_options)
-            }
-            Attachment::Stencil => {
-                let a = &p.stencil_attachment;
-                (&a.texture, a.store_action, a.store_action_options)
-            }
-        };
-        texture.as_ref().map(|_| (action, options))
+            Attachment::Depth => p.depth,
+            Attachment::Stencil => p.stencil,
+        }
     }
 
     /// The colour attachment at `index` whose resolve [`untouched_resolves`] dropped, if it is
@@ -3727,6 +3755,19 @@ pub(crate) mod tests {
             vertex_count: 0,
         };
         assert_eq!(draw.selector(), DRAW_PRIMITIVES);
+    }
+
+    /// A render encoder keeps what its late setters read of its pass ([`super::PassStores`]),
+    /// not a copy of the runtime's descriptor, whose bytes every pass's open would move into it
+    /// and whose textures its drop would let go of again.
+    #[test]
+    fn render_encoders_keep_no_copy_of_their_pass() {
+        assert!(
+            size_of::<super::RenderEncoderObject>() < size_of::<rt::RenderPassDescriptor>(),
+            "an encoder of {} bytes, a descriptor of {}",
+            size_of::<super::RenderEncoderObject>(),
+            size_of::<rt::RenderPassDescriptor>()
+        );
     }
 
     /// What a test records of the runtime calls of draws' two commands ([`sent`]).
