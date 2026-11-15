@@ -916,6 +916,9 @@ pub(crate) struct Shared {
     /// How many doorbell page writes were dropped ([`Shared::page_doorbell`]): of an unbound page,
     /// at another offset than a page's first byte, or of a ring not the page's context's.
     pub(crate) pages_dropped: AtomicU64,
+    /// Whether the guest bound a doorbell page yet: its first bind is logged, a diagnostic that
+    /// says the guest's processes ring at their pages.
+    pages_bound: AtomicBool,
     /// A weak handle to this shared state, set at the device's make: a queue's service thread and
     /// its completion poster hold it, so neither keeps the device alive.
     weak_self: OnceLock<Weak<Shared>>,
@@ -1248,6 +1251,7 @@ impl Device {
                 .map(|_| AtomicU32::new(0))
                 .collect(),
             pages_dropped: AtomicU64::new(0),
+            pages_bound: AtomicBool::new(false),
             weak_self: OnceLock::new(),
             handed_over: AtomicU64::new(0),
             handed_logged_ns: AtomicU64::new(0),
@@ -2413,6 +2417,13 @@ impl Shared {
         // meanwhile is seen below, or sees the page's new context and drops its route itself.
         if bound.swap(context, Ordering::SeqCst) == context {
             return;
+        }
+        if context != 0 && !self.pages_bound.swap(true, Ordering::Relaxed) {
+            log::info!(
+                target: "reims_vgpu_graphics",
+                "the guest binds its first doorbell page, {page}, to context {context}: its \
+                 processes ring their queues at their pages"
+            );
         }
         // The routes on the page of a context it is no longer bound to go, so the host wakes no
         // ring on the page but its new context's: the kext unbinds a page only once its context's
