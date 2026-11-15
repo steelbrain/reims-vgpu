@@ -3750,12 +3750,12 @@ mod tests {
     /// them and ends no run, where the records lie where a recovery keeps them
     /// ([`carried_records_device`]; under the default, a device whose held pointer import costs
     /// every submission lays them in pooled memory, whose recovery resets every command:
-    /// `a_recovery_under_the_default_keeps_every_command_or_resets_every_one`): [`SENDERS`] threads
-    /// each send their own commands' vertex and fragment buffers, nil at offsets of the round and
-    /// the command (a nil buffer's address is its offset), one call a command, then read their
-    /// commands back, round after round, while another thread recovers the device again and
-    /// again, each time once every sender finished a round more. Each read-back, and each command
-    /// at the end, holds the round last sent it.
+    /// `a_recovery_under_the_default_resets_every_command_where_an_import_taxes_submissions`):
+    /// [`SENDERS`] threads each send their own commands' vertex and fragment buffers, nil at
+    /// offsets of the round and the command (a nil buffer's address is its offset), one call a
+    /// command, then read their commands back, round after round, while another thread recovers
+    /// the device again and again, each time once every sender finished a round more. Each
+    /// read-back, and each command at the end, holds the round last sent it.
     #[test]
     fn a_recovery_while_a_command_is_sent_in_one_call_loses_no_set() {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -3849,19 +3849,28 @@ mod tests {
     }
 
     /// A recovery of the device under the platform's own options, the runtime's default
-    /// `IndirectRecordsPolicy::Untaxed`, keeps every command of an indirect command buffer as the
-    /// CPU left it, or resets every one, on a device whose check found that a held pointer import
-    /// costs every submission (RADV; ANV on i915), where the runtime lays the records in pooled
-    /// memory, which the recovery loses with the `VkDevice` and writes again as a new buffer's,
-    /// where Metal keeps them (docs/accuracy-ledger.md): never some commands and not others, nor
-    /// some fields of a command. Either way the buffer goes on: commands sent after the recovery
-    /// read back as sent. Each command's vertex and fragment buffers 0 and 1 are nil at offsets
-    /// of its own (a nil buffer's address is its offset). A device of its own, as a recovery moves
-    /// every user of the device.
+    /// `IndirectRecordsPolicy::Untaxed`, resets every command of an indirect command buffer on a
+    /// device whose check found that a held pointer import costs every submission (RADV; ANV on
+    /// i915: `rt::Device::releases_idle_pointer_imports`), where the runtime lays the records in
+    /// pooled memory, which the recovery loses with the `VkDevice` and writes again as a new
+    /// buffer's, where Metal keeps them (docs/accuracy-ledger.md); elsewhere, where they lie in
+    /// the runtime's own pages imported by their pointer, it keeps every command as the CPU left
+    /// it. The buffer is made once the check answered (before, the records lie in the runtime's
+    /// own pages whatever it will answer), and the commands are sent and read with no recovery
+    /// under way: one that came during a read of a command's four fields, or during a call's
+    /// four sets, would come between two of them. Either way the buffer goes on: commands sent
+    /// after the recovery read back as sent. Each command's vertex and fragment buffers 0 and 1
+    /// are nil at offsets of its own (a nil buffer's address is its offset). A device of its own,
+    /// as a recovery moves every user of the device.
     #[test]
-    fn a_recovery_under_the_default_keeps_every_command_or_resets_every_one() {
+    fn a_recovery_under_the_default_resets_every_command_where_an_import_taxes_submissions() {
         const COMMANDS: u64 = 64;
         let d = crate::gpu::device::tests::device_of_options(crate::platform::device_options());
+        let answered = d
+            .raw
+            .settle_submit_checks(std::time::Duration::from_secs(60));
+        assert!(answered, "the device's submission checks answered");
+        let pooled = d.raw.releases_idle_pointer_imports();
         let icb = make::<VulkanPlatform>(&d, &render_desc(), COMMANDS);
         // The four addresses of command `i` before the recovery (`round` 0) and after it (1).
         let at = |round: u64, i: u64| {
@@ -3909,14 +3918,12 @@ mod tests {
         send(0);
         assert_eq!(read(), sent(0), "before the recovery");
         d.raw.recover_for_test().expect("the recovery");
-        let after = read();
-        let kept = after == sent(0);
-        let reset = after.iter().all(|command| *command == [0; 4]);
-        assert!(kept || reset, "after the recovery: {after:?}");
-        eprintln!(
-            "the recovery {} every command",
-            if kept { "kept" } else { "reset" }
-        );
+        let expected = match pooled {
+            true => vec![[0; 4]; COMMANDS as usize],
+            false => sent(0),
+        };
+        let taxed = format!("after the recovery, a held import taxing submissions: {pooled}");
+        assert_eq!(read(), expected, "{taxed}");
         send(1);
         assert_eq!(read(), sent(1), "sent after the recovery");
     }
