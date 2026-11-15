@@ -694,13 +694,17 @@ impl<P: ApiPlatform> Mirror<P> {
             let bytes_per_row = (width * bytes).checked_next_multiple_of(align.max(4))?;
             let length = bytes_per_row.checked_mul(height)?;
             let span = length.checked_next_multiple_of(OsVm::new().page_size())?;
+            // The buffer's deallocator: it owns the pages, and drops them as it runs.
+            fn owner<T: Send + 'static>(pages: T) -> Box<dyn FnOnce() + Send> {
+                Box::new(move || drop(pages))
+            }
             // The platform's memory, a memfd's mapping where the host gives one, whose unmap waits
             // for the runtime's free of every import of its pages (the module doc, "Its pages").
-            let (base, pages): (*mut u8, Box<dyn FnOnce() + Send>) = match RegionMemory::new(span) {
-                Some(pages) => (pages.base(), Box::new(move || drop(pages))),
+            let (base, pages) = match RegionMemory::new(span) {
+                Some(pages) => (pages.base(), owner(pages)),
                 None => {
                     let pages = PrivateMemory::new(span)?;
-                    (pages.base(), Box::new(move || drop(pages)))
+                    (pages.base(), owner(pages))
                 }
             };
             // SAFETY: the memory's `span` bytes, whole pages from a page, are mapped from here
