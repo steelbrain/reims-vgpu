@@ -56,11 +56,22 @@ vendor/qemu/configure:
 # 310 s for a clean build where ninja's default took 59 s (docs/qemu.md).
 # ninja has meson regenerate build.ninja where a meson file changed, as
 # install-ctl.sh's build relies on.
+#
+# vendor/qemu at another commit than the one build/qemu was configured from
+# builds in an empty directory, as install-ctl.sh's does: meson, configuring
+# or regenerating in place, deletes each file the last build made that the new
+# build.ninja does not name, even one it has just written at configure
+# (qemu-version.h of QEMU of 2026-11-13, docs/lessons.md). A clean build takes
+# about a minute, and edits not yet committed keep the directory.
 QEMU_PKG_CONFIG := $(RUST_DIST)/lib/pkgconfig
 QEMU_PC_READ := $(QEMU_BUILD)/reims-vgpu.pc.configured
 QEMU_CONFIGURE_INPUTS := configure scripts/meson-buildoptions.sh pythondeps.toml VERSION
 
 qemu: all vendor/qemu/configure
+	@src=$$(git -C "$(QEMU_SRC)" rev-parse HEAD 2>/dev/null); \
+		if [ -n "$$src" ] && [ "$$(cat "$(QEMU_BUILD)/qemu-source" 2>/dev/null)" != "$$src" ]; then \
+			rm -rf "$(QEMU_BUILD)"; \
+		fi
 	@mkdir -p "$(QEMU_BUILD)"
 	@if [ ! -f "$(QEMU_BUILD)/build.ninja" ] || [ -n "$(QEMU_CONFIGURE)" ] \
 			|| ! grep -qF -- "exec '$(QEMU_SRC)/configure'" "$(QEMU_BUILD)/config.status" 2>/dev/null \
@@ -73,6 +84,7 @@ qemu: all vendor/qemu/configure
 			--disable-docs $(QEMU_CONFIGURE) \
 			&& cp "$(QEMU_PKG_CONFIG)/reims-vgpu.pc" "$(QEMU_PC_READ)"; \
 	fi
+	@git -C "$(QEMU_SRC)" rev-parse HEAD >"$(QEMU_BUILD)/qemu-source" 2>/dev/null || rm -f "$(QEMU_BUILD)/qemu-source"
 	ninja -C "$(QEMU_BUILD)" $(filter-out -j,$(filter -j%,$(MAKEFLAGS))) qemu-system-x86_64
 
 clean:

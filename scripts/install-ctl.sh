@@ -412,6 +412,15 @@ if [[ $SKIP_QEMU == 0 ]]; then
   # QEMU's install prefix: never used where it is, since QEMU finds its files
   # relative to its binary; the build is staged with DESTDIR and moved.
   PREFIX=/reims-ctl-qemu
+  # QEMU of another commit builds in an empty directory. meson, configuring
+  # or regenerating in place, deletes each file the directory's last build made
+  # that the new build.ninja does not name (ninja -t cleandead), even one it
+  # has just written at configure: QEMU of 2026-11-13 writes qemu-version.h
+  # there where its source has no version tag, as this shallow fetch's has
+  # none, where the QEMU before made it in the build, and the build then
+  # stopped on the missing header (docs/lessons.md).
+  QEMU_SOURCE=$(git -C "$ROOT/vendor/qemu" rev-parse HEAD) || die "could not read vendor/qemu's commit"
+  [[ "$(cat "$BUILD/qemu-source" 2>/dev/null)" == "$QEMU_SOURCE" ]] || rm -rf "$BUILD"
   mkdir -p "$BUILD"
   # No docs and no test suite: users run QEMU, not its tests.
   CONFIGURE=("$ROOT/vendor/qemu/configure" --prefix="$PREFIX" "${QEMU_CONFIGURE[@]}"
@@ -429,6 +438,7 @@ if [[ $SKIP_QEMU == 0 ]]; then
     (cd "$BUILD" && PKG_CONFIG_PATH="$PC" "${CONFIGURE[@]}")
     cp "$PC/reims-vgpu.pc" "$BUILD/reims-vgpu.pc.configured"
     printf '%s\n' "$CONFIGURED" >"$BUILD/configured-with"
+    printf '%s\n' "$QEMU_SOURCE" >"$BUILD/qemu-source"
   fi
   say "Building QEMU"
   # A build that stops configures again on the next run: when ninja has meson
