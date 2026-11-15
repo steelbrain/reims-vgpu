@@ -747,6 +747,54 @@ pub(crate) fn guest_ram_runs(first: u64, length: u64) -> Option<Vec<(u64, u64)>>
     all.then_some(runs)
 }
 
+/// The pieces of `length` bytes from `first`, as [`pieces`] gives them, where every byte shows a
+/// page of the guest's RAM, as the leases registered it, mapped with write permission: the file
+/// pages a dma-buf of the RAM's own holds them in (`super::linux`'s `dma_buf`, "Regions"). `None`
+/// where a byte shows memory of the library's own, shows nothing, or is mapped without write
+/// permission, as [`guest_ram_runs`] refuses them.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn guest_ram_pieces(first: u64, length: u64) -> Option<Vec<Piece>> {
+    let end = first.checked_add(length)?;
+    let table = TABLE.lock();
+    let mut pieces: Vec<Piece> = Vec::new();
+    let all = table.walk(first, end, |file, offset, prot, from, to| {
+        if prot.raw() & VmProt::WRITE.raw() == 0 {
+            return false;
+        }
+        // Every byte of the stretch in a range of the RAM: a stretch may run past the range its
+        // offset starts in.
+        let (mut at, mut into) = (from, offset);
+        while at < to {
+            let Some((_, room)) = table.ram_at(file, into) else {
+                return false;
+            };
+            let take = (to - at).min(room);
+            at += take;
+            into += take;
+        }
+        match pieces.last_mut() {
+            Some(last)
+                if Arc::ptr_eq(&last.backing.file, file)
+                    && last.backing.offset + last.length == offset
+                    && last.prot == prot =>
+            {
+                last.length += to - from;
+            }
+            _ => pieces.push(Piece {
+                at: from - first,
+                length: to - from,
+                backing: Backing {
+                    file: Arc::clone(file),
+                    offset,
+                },
+                prot,
+            }),
+        }
+        true
+    });
+    all.then_some(pieces)
+}
+
 impl Registered {
     /// Whether this registers `first..end` over `backing`.
     fn is(&self, first: u64, end: u64, backing: &Backing) -> bool {

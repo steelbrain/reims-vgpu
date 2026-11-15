@@ -17,8 +17,9 @@
 //! import otherwise, so every device that imports host memory imports as it did. A buffer's or a
 //! heap's request over a view in a group dma-buf is answered with the view's piece of the group's
 //! file (`super::dma_buf`'s module docs, "Groups"), where that piece's offset is a multiple of the
-//! alignment the request asks; a texture's and any other request with a dma-buf of its own, as
-//! before.
+//! alignment the request asks; one over the guest's RAM with pieces of the RAM's region dma-bufs,
+//! where they fit the request ("Regions"); a texture's and any other request with a dma-buf of
+//! its own, as before.
 //!
 //! And every import carries the views' gate ([`import_gate`]), which the runtime asks before it
 //! imports a no-copy buffer's or heap's pages, or a buffer's new pages, by their pointer: where
@@ -1032,6 +1033,11 @@ unsafe fn host_memory_noting(
 ) -> rt::HostMemory {
     // An earlier import's refusal is not this one's.
     REFUSAL.with_borrow_mut(|kept| *kept = None);
+    // The region dma-bufs the source answered with, held while the runtime keeps the source (with
+    // the imports it made of them): the runtime takes a chunk at offset 0 whose `Arc` it alone holds
+    // once the source returns as a dma-buf of its own, and a region's file, which the table of
+    // regions holds weakly, would be that at its first piece from its first page.
+    let answered: Mutex<Vec<Arc<std::os::fd::OwnedFd>>> = Mutex::new(Vec::new());
     let source: rt::DmaBufSource = Arc::new(move |request: rt::DmaBufRequest| {
         if let Some(asked) = &asked {
             asked.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1039,7 +1045,8 @@ unsafe fn host_memory_noting(
         let first = addr_of(request.start);
         let (length, granule) = (request.length, request.granule);
         // A buffer's or a heap's import of a grouped view's pages: a piece of the group's file
-        // (`super::dma_buf`'s module docs, "Groups").
+        // (`super::dma_buf`'s module docs, "Groups"); else, of the guest's RAM, pieces of its
+        // regions' files ("Regions").
         if request.shared_files {
             let alignment = request.alignment;
             super::dma_buf::asked_alignment(alignment);
@@ -1052,6 +1059,21 @@ unsafe fn host_memory_noting(
                     offset,
                     length,
                 }]);
+            }
+            if let Some(pieces) = super::dma_buf::ram_pieces(first, length, granule, alignment) {
+                log::debug!(
+                    "{length:#x} bytes at {first:#x} as {} pieces of the guest RAM's region \
+                     dma-bufs",
+                    pieces.len()
+                );
+                let mut held = answered.lock();
+                for piece in &pieces {
+                    if !held.iter().any(|f| Arc::ptr_eq(f, &piece.file)) {
+                        held.push(Arc::clone(&piece.file));
+                    }
+                }
+                drop(held);
+                return Ok(pieces);
             }
         }
         match super::dma_buf::of_pages(first, length, granule) {
@@ -1870,5 +1892,112 @@ mod tests {
             assert!(vm.deallocate(view, n * PAGE).is_success());
             assert!(vm.deallocate(src, n * PAGE).is_success());
         }
+    }
+
+    /// Where views are imported through their dma-bufs and udmabuf opens (RADV's), no-copy
+    /// buffers over the guest's RAM in one region of its file are imported as pieces of the
+    /// region's dma-buf (`super::dma_buf`'s module docs, "Regions"): the device imports the file
+    /// at the first piece and the other joins that import; the GPU reads each buffer's own pages
+    /// and its fill reaches them; once the buffers go, so does the file's import. Elsewhere, said
+    /// on stderr, nothing is checked.
+    #[test]
+    fn buffers_over_the_guests_ram_are_pieces_of_its_region() {
+        let d = crate::gpu::device::tests::dev();
+        crate::gpu::device::tests::settle_device_checks(&d);
+        probes_gone();
+        if !groups_views() {
+            eprintln!(
+                "skipped: {} takes no view through its dma-bufs here, or udmabuf does not open",
+                d.raw.properties().name
+            );
+            return;
+        }
+        let length: u64 = 8 << 20;
+        let file = vm::memfd(length).unwrap();
+        // SAFETY: a fresh shared mapping of the file, which the test unmaps after the lease and
+        // every buffer over it.
+        let start = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length.to_usize(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                std::os::fd::AsRawFd::as_raw_fd(&*file),
+                0,
+            )
+        };
+        assert_ne!(start, libc::MAP_FAILED);
+        let at = start.addr().to_u64();
+        let lease = super::super::lease_guest_memory([crate::os::GuestRamFile {
+            host: at,
+            guest: 0,
+            length,
+            file,
+            offset: 0,
+        }]);
+        let pages = 16;
+        let before = d.raw.work_counts();
+        let mut buffers = Vec::new();
+        for (round, first) in [at, at + (1 << 20)].into_iter().enumerate() {
+            let check = FoldCheck {
+                own: first,
+                view: first,
+                pages,
+                round: round.to_u64(),
+            };
+            check.write();
+            let (buffer, gone) = no_copy(&d, HostAddr::from_addr(first.to_usize()), pages);
+            let (_out, copied) = check.run(&d.raw, &buffer.raw, true).unwrap();
+            for i in 0..pages {
+                assert_eq!(
+                    FoldCheck::ends(copied, i),
+                    [check.written(i); 2],
+                    "buffer {round} read its own pages"
+                );
+                let now = match i < pages / 2 {
+                    true => FoldCheck::FILL,
+                    false => check.written(i),
+                };
+                assert_eq!(
+                    FoldCheck::ends(first, i),
+                    [now; 2],
+                    "buffer {round}'s fill reached its pages"
+                );
+            }
+            buffers.push((buffer, gone));
+        }
+        let after = d.raw.work_counts();
+        assert_eq!(
+            (
+                after.dma_buf_imports - before.dma_buf_imports,
+                after.dma_buf_pieces_joined - before.dma_buf_pieces_joined,
+                after.dma_buf_shared_imports_live,
+            ),
+            (1, 1, before.dma_buf_shared_imports_live + 1),
+            "the region's file imported once, the other piece joining it"
+        );
+        let wait = std::time::Duration::from_secs(10);
+        for (buffer, gone) in buffers {
+            drop(buffer);
+            assert_eq!(gone.recv_timeout(wait), Ok(()), "the deallocator ran");
+        }
+        let live = || d.raw.work_counts().dma_buf_shared_imports_live;
+        for _ in 0..wait.as_millis() {
+            if live() == before.dma_buf_shared_imports_live {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            live(),
+            before.dma_buf_shared_imports_live,
+            "the file's import freed"
+        );
+        drop(lease);
+        let unmapped =
+            crate::remap::wait_unimported(NonNull::new(start.cast::<u8>()).unwrap(), length, wait);
+        assert!(unmapped, "the RAM's imports went");
+        // SAFETY: the mapping made above, which nothing imports any more.
+        assert_eq!(unsafe { libc::munmap(start, length.to_usize()) }, 0);
     }
 }
