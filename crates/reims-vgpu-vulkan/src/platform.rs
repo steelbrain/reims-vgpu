@@ -1172,7 +1172,10 @@ pub(crate) mod tests {
         use crate::core::platform::resource::{FunctionConstant, Library as _};
 
         let raw = rt::Device::system_default_with(device_options()).expect("a device");
-        let dir = raw.shader_cache_directory().to_owned();
+        let dir = raw
+            .shader_cache_directory()
+            .expect("the shader cache's directory")
+            .to_owned();
         let device = device::window_device(raw);
         let before = device.raw.shader_cache_statistics();
         let library = (device.new_library(include_bytes!("../../../tests/shaders/fc.metallib")))
