@@ -5370,6 +5370,9 @@ fn copy<P: Platform>(
 }
 
 #[cfg(test)]
+mod costs;
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicBool;
 

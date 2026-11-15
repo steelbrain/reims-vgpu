@@ -32,7 +32,7 @@ const ROUNDS: usize = 2000;
 const WARM: usize = 100;
 
 /// The host's clock, in nanoseconds: the one the platform gives GPU times in.
-fn host_ns() -> u64 {
+pub(super) fn host_ns() -> u64 {
     #[cfg(target_os = "macos")]
     let clock = libc::CLOCK_UPTIME_RAW;
     #[cfg(not(target_os = "macos"))]

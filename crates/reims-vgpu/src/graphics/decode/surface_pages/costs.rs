@@ -125,7 +125,7 @@ fn cases(page: u64) -> Vec<Case> {
     ]
 }
 
-fn env_u64(name: &str, default: u64) -> u64 {
+pub(in crate::graphics::decode) fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
         .and_then(|v| v.parse().ok())
@@ -133,10 +133,10 @@ fn env_u64(name: &str, default: u64) -> u64 {
 }
 
 /// A small PRNG, so each run picks the same surfaces.
-struct XorShift(u64);
+pub(in crate::graphics::decode) struct XorShift(pub(in crate::graphics::decode) u64);
 
 impl XorShift {
-    fn next(&mut self) -> u64 {
+    pub(in crate::graphics::decode) fn next(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x << 13;
         x ^= x >> 7;
@@ -148,7 +148,12 @@ impl XorShift {
 
 /// `length` bytes of the RAM's `ram` bytes as runs of `run` bytes (the last one shorter), each at
 /// a slot of the RAM picked at random, in the order picked.
-fn surface_runs(rng: &mut XorShift, ram: u64, length: u64, run: u64) -> Vec<RgfxPageRun> {
+pub(in crate::graphics::decode) fn surface_runs(
+    rng: &mut XorShift,
+    ram: u64,
+    length: u64,
+    run: u64,
+) -> Vec<RgfxPageRun> {
     let slots = ram / run;
     let count = length.div_ceil(run);
     assert!(
