@@ -434,8 +434,10 @@ Stages:
       over every plane (the base is a page's, each plane's offset from it and
       its rows are multiples of the host's linear texture alignment, every
       plane lies in the allocation), the bundle asks the kext for the surface's shared
-      block in place. The kext wires the surface's whole allocation, writes
-      its page runs into the block past the part the processes map, and
+      block in place. The kext wires the surface's whole allocation (on
+      x86-64 it first faults in the pages from the last down, so that the
+      kernel lays them out in runs of a 16 KiB clump: `RgfxTopDown.hpp`),
+      writes its page runs into the block past the part the processes map, and
       hands them to the host (`SURFACE_PAGES`, answered), which maps them as
       one view. Each process's buffer lies over the view
       (`BUFFER_OVER_SURFACE_PAGES`), and each texture over its plane's own

@@ -60,6 +60,7 @@
 #include "RgfxSurfaceCaches.hpp"
 #include "RgfxLatency.hpp"
 #include "RgfxPagesBlock.hpp"
+#include "RgfxTopDown.hpp"
 #include "RgfxIdChunks.hpp"
 #include "RgfxTrace.hpp"
 #include "RgfxReleaseTable.hpp"
@@ -73,6 +74,9 @@
 #include <libkern/libkern.h>
 #include <sys/proc.h>
 #include <sys/sysctl.h>
+#if defined(__x86_64__)
+#include <sys/systm.h>
+#endif
 
 namespace {
 // The most blocks handed out at once, and WindowServer's reserve of them (RgfxBlockTable.hpp).
@@ -118,6 +122,57 @@ UInt64 alignUp(UInt64 value, UInt64 align)
 {
 	return (value + (align - 1)) & ~(align - 1);
 }
+
+#if defined(__x86_64__)
+// The `length` bytes at `address` in `task`, the current task, faulted in from the last page down
+// before a wire takes them, so that the pages the kernel gives them run in the guest's RAM's order
+// (RgfxTopDown.hpp): one byte of each page read through the task's own mapping, until one is not
+// readable. Nothing where `task` is not the current task.
+//
+// It faults in only pages the wire faults in anyway: a wire (prepare) takes every page of the
+// range, faulting in each that is not resident, allocated and zero-filled or paged in; the read's
+// fault does that for the page first, and the wire then finds it resident. A resident page is only
+// read. No byte the process reads changes: nothing is written. Two cases do more than the wire
+// alone, both rare and bounded:
+// (i) a writable private range that is copy-on-write (a fork's), a page of which is in no object
+//     yet: the read zero-fills the page in the object the range shares, and the wire, which writes,
+//     copies it into the range's own: a page and a copy of its zeros more than the wire alone,
+//     which zero-fills one page in the range's own;
+// (ii) a range the wire refuses for a page it cannot take: the readable pages above that page are
+//     faulted in, which the wire, from the first page up, does not reach before it refuses.
+void faultTopDown(task_t task, UInt64 address, UInt64 length)
+{
+	if (task != current_task())
+		return;
+	rgfxTopDown(address, length, kPage, [](uint64_t at) {
+		UInt8 byte = 0;
+		return copyin(static_cast<user_addr_t>(at), &byte, 1) == 0;
+	});
+}
+
+// The first `length` bytes of `memory`, faulted in from the last page down before a wire takes
+// them, as faultTopDown faults a task's: through a read-only mapping of them in the kernel's map,
+// made and let go of here, so that no process's map shows them. Nothing where every page of the
+// memory is resident already, which a new mapping would fault in one by one for nothing, or where
+// the memory is not mapped. Its pages are the memory's own, shared by every mapping of it, so the
+// read's faults are the wire's, with no copy-on-write.
+void faultTopDown(IOMemoryDescriptor *memory, UInt64 length)
+{
+	IOByteCount resident = 0, dirty = 0;
+	if (length == 0 || (memory->getPageCounts(&resident, &dirty) == kIOReturnSuccess &&
+	                    resident >= alignUp(memory->getLength(), kPage) / kPage))
+		return;
+	IOMemoryMap *map =
+	    memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly, 0, length);
+	if (!map)
+		return;
+	rgfxTopDown(map->getAddress(), length, kPage, [](uint64_t at) {
+		(void)*reinterpret_cast<const volatile UInt8 *>(at);
+		return true;
+	});
+	map->release();
+}
+#endif
 } // namespace
 
 // The device's contexts and blocks: one accelerator per device, one device per guest. Made at
@@ -1421,6 +1476,9 @@ IOMemoryDescriptor *wirePlane(task_t task, UInt64 address, UInt64 length, RgfxPa
 	    IOMemoryDescriptor::withAddressRange(address, length, kIODirectionOutIn, task);
 	if (!md)
 		return nullptr;
+#if defined(__x86_64__)
+	faultTopDown(task, address, length);
+#endif
 	if (md->prepare(kIODirectionOutIn) != kIOReturnSuccess) {
 		md->release();
 		return nullptr;
@@ -2575,7 +2633,12 @@ RgfxPagesNaming RgfxAccelerator::attachSurfacePages(UInt32 context, UInt64 offse
                                                     bool *inPlace,
                                                     const RgfxSurfacePagesLayout *carriedLayout)
 {
-	if (length > memory->getLength() || memory->prepare(kIODirectionOutIn) != kIOReturnSuccess)
+	if (length > memory->getLength())
+		return kRgfxPagesNotNamed;
+#if defined(__x86_64__)
+	faultTopDown(memory, length);
+#endif
+	if (memory->prepare(kIODirectionOutIn) != kIOReturnSuccess)
 		return kRgfxPagesNotNamed;
 	UInt32 count = 0;
 	RgfxPageRun *runs = walkRuns(memory, 0, length, &count);
@@ -2754,6 +2817,9 @@ IOReturn RgfxAccelerator::pagesBlock(RgfxAcceleratorUserClient *client, UInt32 c
 	    IOMemoryDescriptor::withAddressRange(range.base, range.length, direction, task);
 	if (!md)
 		return kIOReturnNoMemory;
+#if defined(__x86_64__)
+	faultTopDown(task, range.base, range.length);
+#endif
 	if (md->prepare(direction) != kIOReturnSuccess) {
 		md->release();
 		return kIOReturnBadArgument;
