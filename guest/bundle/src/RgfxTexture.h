@@ -50,6 +50,15 @@ RgfxTextureDescriptor rgfxTextureDescriptorFromMTL(MTLTextureDescriptor *_Nonnul
 /// past it are nil there and here; the AMD 5300M makes one of 16 GiB and none of 20 GiB, its
 /// maxBufferLength 3.2 GB (docs/graphics-kext/dgpu-oracle.md, Q24).
 bool rgfxTexturePastLength(MTLTextureDescriptor *_Nonnull d, uint64_t maxLength);
+
+/// The widest texture buffer (MTLTextureTypeTextureBuffer) Metal's descriptor validation takes, in
+/// elements of any format: 268435456 (2^28), what the AMD 5300M and the Intel 630 under macOS
+/// 26.7.1 and the M3 Max under macOS 27.0.1 answer to the device's maxTextureBufferWidth (SPI) and
+/// take at the device's, a Private heap's and a Shared buffer's creators, 1-, 2-, 4-, 8- and
+/// 16-byte formats alike, ending the process one element past it with the width line every type
+/// gives (oracle_texdesc --texbuf, docs/graphics-kext/dgpu-oracle.md, Q24). MoltenVK makes a
+/// texel buffer view's texture so, its width the view's elements.
+constexpr uint64_t kRgfxMaxTextureBufferWidth = uint64_t{1} << 28;
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
@@ -143,7 +152,8 @@ NS_ASSUME_NONNULL_BEGIN
 /// Intel 630 under macOS 26.7.1 end it at every texture creator (oracle_texdesc at the device's, a
 /// Private heap's and a Shared buffer's; oracle_surftex over an IOSurface; Q12; Q20): one
 /// assertion listing every rule broken, a line each: a width, height, depth or array length of 0
-/// or past what the type takes (16384 a side, 2048 for a 3D texture's and an array's), a format
+/// or past what the type takes (16384 a side, 2048 for a 3D texture's and an array's, and a
+/// texture buffer's width kRgfxMaxTextureBufferWidth, at every creator alike), a format
 /// the device lacks (Invalid, the three-channel formats, the packed 16-bit ones, sRGB R8 and RG8,
 /// ASTC, ETC2, EAC, PVRTC, the XR10 formats, Unspecialized, every two-plane one, and
 /// Depth24Unorm_Stencil8 and X24_Stencil8 as the lane answers no Depth24Stencil8, as the Intel 630

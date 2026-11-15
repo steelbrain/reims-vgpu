@@ -1907,6 +1907,25 @@ static const DescriptorCase kDescriptorCases[] = {
     {"texbuf.h4", 80, 9, 64, 4, 1, 1, 1, 1, 0x1, 2,
      RGFX_VALIDATE "MTLTextureDescriptor has height (4) greater than the maximum allowed size of "
                    "1.\n'"},
+    // Texture buffers past 16384 wide, as oracle_texdesc --texbuf asked them of the device's, a
+    // Private heap's and a Shared buffer's creators, alike on the AMD 5300M and the Intel 630 under
+    // macOS 26.7.1 and the M3 Max under 27.0.1: made up to 2^28 elements of any format, and one
+    // element more ends the process with the width line (Q24). The 46626-wide R8Sint one is a
+    // guest MoltenVK's texel buffer view's.
+    {"texbuf.w16385", 14, 9, 16385, 1, 1, 1, 1, 1, 0x1, 2, nullptr},
+    {"texbuf.r8sint.w46626", 14, 9, 46626, 1, 1, 1, 1, 1, 0x1, 0, nullptr},
+    {"texbuf.rgba32f.w2^27", 125, 9, 134217728, 1, 1, 1, 1, 1, 0x1, 2, nullptr},
+    {"texbuf.w2^28", 14, 9, 268435456, 1, 1, 1, 1, 1, 0x1, 2, nullptr},
+    {"texbuf.rgba32f.w2^28", 125, 9, 268435456, 1, 1, 1, 1, 1, 0x1, 0, nullptr},
+    {"texbuf.w2^28+1", 14, 9, 268435457, 1, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has width (268435457) greater than the maximum allowed "
+                   "size of 268435456.\n'"},
+    {"texbuf.rgba32f.w2^28+1", 125, 9, 268435457, 1, 1, 1, 1, 1, 0x1, 0,
+     RGFX_VALIDATE "MTLTextureDescriptor has width (268435457) greater than the maximum allowed "
+                   "size of 268435456.\n'"},
+    {"texbuf.w2^32", 70, 9, 4294967296, 1, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has width (4294967296) greater than the maximum allowed "
+                   "size of 268435456.\n'"},
     {"1darray.h2", 80, 1, 64, 2, 1, 2, 1, 1, 0x1, 2,
      RGFX_VALIDATE "MTLTextureDescriptor has height (2) greater than the maximum allowed size of "
                    "1.\nMTLTextureDescriptor requests a height of 2 but the texture type "
@@ -2555,6 +2574,25 @@ static int dies_case(const char *name)
 		                                                           usage:MTLTextureUsageShaderRead];
 		(void)[buf newTextureWithDescriptor:desc offset:0 bytesPerRow:0];
 	}
+	// buffer-texture-buffer-wide: a texture buffer of 2^28 + 1 R8Sint texels over a 4096-byte buffer,
+	// by the public form.
+	if (std::strcmp(name, "buffer-texture-buffer-wide") == 0) {
+		std::vector<uint8_t> memory(4096, 0);
+		RgfxBuffer *buf =
+		    [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+		                                    regionOffset:0x10000
+		                                          length:memory.size()
+		                                         options:MTLResourceStorageModeShared
+		                                     deallocator:nil
+		                                          device:nil
+		                                      serializer:&fx.ser];
+		MTLTextureDescriptor *desc =
+		    [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:MTLPixelFormatR8Sint
+		                                                           width:268435457
+		                                                 resourceOptions:MTLResourceStorageModeShared
+		                                                           usage:MTLTextureUsageShaderRead];
+		(void)[buf newTextureWithDescriptor:desc offset:0 bytesPerRow:268435712];
+	}
 	// buffer-texture-type-N and linear-texture-type-N: a texture of MTLTextureType N over a
 	// buffer, by the public form or the linear SPI.
 	const bool linearForm = std::strncmp(name, "linear-texture-type-", 20) == 0;
@@ -3033,8 +3071,42 @@ void test_buffer_texture_buffers()
 	checkDies("buffer-texture-buffer-rows-0",
 	          "_mtlValidateStrideTextureParameters: failed assertion `Texture Descriptor Validation\nLinear "
 	          "texture: bytesPerRow (0) must be greater or equal to (64) bytes\n'");
+	// Past 2^28 texels it ends the process at the descriptor's validation, as every Mac measured
+	// does at each creator (oracle_texdesc --texbuf, Q24).
+	checkDies("buffer-texture-buffer-wide",
+	          "-[MTLTextureDescriptorInternal validateWithDevice:]: failed assertion `Texture "
+	          "Descriptor Validation\nMTLTextureDescriptor has width (268435457) greater than the "
+	          "maximum allowed size of 268435456.\n'");
 	Fixture fx;
 	@autoreleasepool {
+		// A guest MoltenVK's texel buffer view: 46626 R8Sint texels over a Shared buffer of rows
+		// 46848 bytes, which all three Macs make, wider than any 2D texture's 16384; its create
+		// carries its width to the host.
+		std::vector<uint8_t> view(46848, 0);
+		RgfxBuffer *viewBuf = [RgfxBuffer bufferOverHostMemoryWithContents:view.data()
+		                                                      regionOffset:0x10000
+		                                                            length:view.size()
+		                                                           options:MTLResourceStorageModeShared
+		                                                       deallocator:nil
+		                                                            device:nil
+		                                                        serializer:&fx.ser];
+		CHECK(viewBuf != nil);
+		drainRing(fx.ring);
+		MTLTextureDescriptor *wide =
+		    [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:MTLPixelFormatR8Sint
+		                                                           width:46626
+		                                                 resourceOptions:MTLResourceStorageModeShared
+		                                                           usage:MTLTextureUsageShaderRead];
+		id<MTLTexture> texels = [viewBuf newTextureWithDescriptor:wide offset:0 bytesPerRow:46848];
+		CHECK(texels != nil && texels.textureType == MTLTextureTypeTextureBuffer &&
+		      texels.width == 46626 && texels.height == 1);
+		auto wm = expectMessage<RgfxTextureFromBuffer>(fx.ring, RGFX_CMD_TEXTURE_FROM_BUFFER);
+		CHECK(wm.buffer_obj_id == viewBuf.rgfxObjId && wm.offset == 0 && wm.bytes_per_row == 46848);
+		CHECK(wm.desc.texture_type == MTLTextureTypeTextureBuffer && wm.desc.width == 46626 &&
+		      wm.desc.pixel_format == MTLPixelFormatR8Sint);
+		texels = nil;
+		viewBuf = nil;
+		drainRing(fx.ring);
 		std::vector<uint8_t> memory(0x10000, 0);
 		for (const MTLResourceOptions storage : {MTLResourceStorageModeShared, MTLResourceStorageModeManaged}) {
 			RgfxBuffer *buf = [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()

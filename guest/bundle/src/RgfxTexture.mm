@@ -840,10 +840,13 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLD
 	                (format >= 150 && format <= 153) || subsampled ||
 	                (apple && rgfxAppleCompressedFormat(format)));
 	const bool depthOrStencil = !lacked && rgfxDepthStencilBytes(format) != 0;
-	// The largest side each type takes (measured: 16384 wide, 2048 for a 3D texture's sides; one
-	// row for the 1D types and a texture buffer, one slice for every type but 3D, one element for
-	// every type but the arrays, 2048 elements for an array).
-	const uint64_t maxWidth = threeD ? 2048 : 16384;
+	// The largest side each type takes (measured: 16384 wide, 2048 for a 3D texture's sides, and
+	// a texture buffer 268435456 (2^28) elements wide, of any format, kRgfxMaxTextureBufferWidth;
+	// one row for the 1D types and a texture buffer, one slice for every type but 3D, one element
+	// for every type but the arrays, 2048 elements for an array).
+	const uint64_t maxWidth = threeD                               ? 2048
+	                          : type == MTLTextureTypeTextureBuffer ? kRgfxMaxTextureBufferWidth
+	                                                                : 16384;
 	const uint64_t maxHeight =
 	    (oneD || type == MTLTextureTypeTextureBuffer) ? 1 : threeD ? 2048 : 16384;
 	const uint64_t maxDepth = threeD ? 2048 : 1;
