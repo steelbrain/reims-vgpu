@@ -229,7 +229,10 @@ fn device_local_bytes(device: &rt::Device) -> u64 {
 /// The bytes of `device`'s device-local memory heaps the process may hold now
 /// ([`GpuDevice::own_memory_budget`]): the heaps' budgets (`VK_EXT_memory_budget`) where the
 /// physical device lists the extension, which a physical-device query may chain without the device
-/// enabling it, else the heaps' sizes ([`device_local_bytes`]).
+/// enabling it, each no more than its heap's size, else the heaps' sizes ([`device_local_bytes`]).
+/// A driver may answer a budget past its heap's size, which the extension bounds it by: Intel's
+/// 101.2145 driver for the UHD Graphics 630, on Windows 11, answers 47.10 GiB for its one heap of
+/// 31.92 GiB with nothing used (measured with `vulkaninfo`, 2026-11-15).
 ///
 /// [`GpuDevice::own_memory_budget`]: crate::core::platform::device::GpuDevice::own_memory_budget
 pub(crate) fn device_local_budget(device: &rt::Device) -> u64 {
@@ -258,7 +261,9 @@ pub(crate) fn device_local_budget(device: &rt::Device) -> u64 {
     (properties.memory_heaps_as_slice().iter())
         .zip(budget.heap_budget)
         .filter(|(heap, _)| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
-        .fold(0u64, |sum, (_, budget)| sum.saturating_add(budget))
+        .fold(0u64, |sum, (heap, budget)| {
+            sum.saturating_add(budget.min(heap.size))
+        })
 }
 
 /// `maxArgumentBufferSamplerCount` of `device`: how many sampler states an argument buffer can
