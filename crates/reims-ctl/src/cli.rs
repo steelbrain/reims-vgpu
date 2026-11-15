@@ -470,8 +470,7 @@ pub fn main(cli: Cli) -> Result<i32> {
             match output {
                 Some(p) => {
                     std::fs::write(&p, script)?;
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))?;
+                    crate::os::set_mode(&p, 0o755)?;
                     println!("wrote {}", p.display());
                 }
                 None => print!("{script}"),
@@ -1541,6 +1540,8 @@ mod tests {
         reg.save().unwrap();
     }
 
+    // Windows: with its process handling (os/windows.rs).
+    #[cfg(unix)]
     #[test]
     fn a_running_vm_whose_settings_do_not_read_is_not_deleted() {
         let env = Env::new("delete-running");
@@ -1587,7 +1588,7 @@ mod tests {
         register(
             "c",
             &env.root.join("c"),
-            &config("c", &shared.to_string_lossy()),
+            &config("c", &crate::testenv::toml_path(&shared)),
         );
 
         let e = format!("{:#}", delete_vm("a", false).unwrap_err());

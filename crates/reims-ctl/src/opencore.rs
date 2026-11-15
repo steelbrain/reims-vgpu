@@ -11,12 +11,12 @@
 //! An image is read as reims-util writes it: qcow2 (or raw), a GPT, and a FAT32 EFI system
 //! partition holding EFI/OC/config.plist.
 
+use crate::os::FileExt;
 use crate::prebuilt::Kext;
 use crate::vm::{Graphics, ImageFormat, Vm};
 use crate::{paths, prebuilt, reims_util, runtime};
 use anyhow::{Context, Result, bail, ensure};
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 /// Lilu, the old graphics loader and its two shims, which the guest's set loaded through before
@@ -879,7 +879,6 @@ pub(crate) mod tests {
     /// while reims-util made it stays.
     #[test]
     fn renew_keeps_settings_saved_while_the_image_is_made() {
-        use std::os::unix::fs::PermissionsExt;
         let env = crate::testenv::Env::new("renew");
         let dir = env.root.join("vm");
         std::fs::create_dir_all(&dir).unwrap();
@@ -913,8 +912,7 @@ pub(crate) mod tests {
             toml = dir.join(crate::vm::CONFIG_FILE).display(),
             config = config(8192),
         );
-        std::fs::write(&util, script).unwrap();
-        std::fs::set_permissions(&util, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let util = crate::testenv::program(&util, &script);
         env.set("REIMS_CTL_UTIL", &util);
 
         let said = renew(&mut vm, None, &mut |_| {}).unwrap();
@@ -936,7 +934,6 @@ pub(crate) mod tests {
     /// the new image.
     #[test]
     fn renew_deletes_no_file_but_an_old_one_in_the_vms_directory() {
-        use std::os::unix::fs::PermissionsExt;
         let env = crate::testenv::Env::new("renew-outside");
         let made = env.root.join("made.img");
         std::fs::write(&made, qcow2(&image(plist("").as_bytes()))).unwrap();
@@ -946,8 +943,7 @@ pub(crate) mod tests {
              echo '{{\"event\":\"done\",\"result\":{{}}}}'\n",
             made.display()
         );
-        std::fs::write(&util, script).unwrap();
-        std::fs::set_permissions(&util, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let util = crate::testenv::program(&util, &script);
         env.set("REIMS_CTL_UTIL", &util);
         let renewed = |vm_dir: &str, opencore: &str, old: &Path| {
             let dir = env.root.join(vm_dir);
@@ -995,7 +991,6 @@ pub(crate) mod tests {
     /// tests carry, in their order, written to the data directory; on VMware SVGA with none.
     #[test]
     fn renew_makes_the_image_for_the_vms_graphics() {
-        use std::os::unix::fs::PermissionsExt;
         let env = crate::testenv::Env::new("renew-graphics");
         let dir = env.root.join("vm");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1011,8 +1006,7 @@ pub(crate) mod tests {
             args = args.display(),
             made = made.display(),
         );
-        std::fs::write(&util, script).unwrap();
-        std::fs::set_permissions(&util, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let util = crate::testenv::program(&util, &script);
         env.set("REIMS_CTL_UTIL", &util);
         let config = |graphics: &str| {
             format!(
@@ -1041,14 +1035,15 @@ pub(crate) mod tests {
             .filter(|w| w[0] == "--add-kext")
             .map(|w| w[1])
             .collect();
-        let kexts = env.root.join("data/prebuilt");
+        let kexts = env.root.join("data").join("prebuilt");
         assert_eq!(added.len(), 2, "{given:?}");
+        let sep = std::path::MAIN_SEPARATOR;
         assert!(
             added[0].starts_with(kexts.to_str().unwrap())
-                && added[0].ends_with("/A.kext,25.4.0,25.99.99"),
+                && added[0].ends_with(&format!("{sep}A.kext,25.4.0,25.99.99")),
             "{added:?}"
         );
-        assert!(added[1].ends_with("/B.kext"), "{added:?}");
+        assert!(added[1].ends_with(&format!("{sep}B.kext")), "{added:?}");
         let a = added[0].split(',').next().unwrap();
         assert!(Path::new(a).join("Contents/MacOS/A").is_file());
         assert!(!given.contains(&"--no-kexts"), "{given:?}");
@@ -1117,7 +1112,6 @@ pub(crate) mod tests {
     /// them be, which its warnings tell of.
     #[test]
     fn a_start_makes_an_image_without_the_guest_kexts_for_other_graphics() {
-        use std::os::unix::fs::PermissionsExt;
         let env = crate::testenv::Env::new("start-follow");
         let dir = env.root.join("vm");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1139,8 +1133,7 @@ pub(crate) mod tests {
             args = args.display(),
             made = made.display(),
         );
-        std::fs::write(&util, script).unwrap();
-        std::fs::set_permissions(&util, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let util = crate::testenv::program(&util, &script);
         env.set("REIMS_CTL_UTIL", &util);
         let vm = |graphics: &str, kexts: &str| {
             std::fs::write(dir.join("opencore.img"), image(plist(kexts).as_bytes())).unwrap();
@@ -1202,7 +1195,6 @@ pub(crate) mod tests {
     /// first; one lacking them stays.
     #[test]
     fn a_start_makes_an_image_with_the_guest_kexts_carried_for_other_builds() {
-        use std::os::unix::fs::PermissionsExt;
         let env = crate::testenv::Env::new("start-builds");
         let dir = env.root.join("vm");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1224,8 +1216,7 @@ pub(crate) mod tests {
             args = args.display(),
             made = made.display(),
         );
-        std::fs::write(&util, script).unwrap();
-        std::fs::set_permissions(&util, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let util = crate::testenv::program(&util, &script);
         env.set("REIMS_CTL_UTIL", &util);
         let config = r#"
             name = "t"

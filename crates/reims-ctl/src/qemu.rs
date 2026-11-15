@@ -517,8 +517,16 @@ mod tests {
     }
 
     fn has(args: &[String], pair: &[&str]) -> bool {
+        // Windows joins the VM's paths with `\`, where these have `/`.
+        let unix = |a: &String| {
+            if cfg!(windows) {
+                a.replace('\\', "/")
+            } else {
+                a.clone()
+            }
+        };
         args.windows(pair.len())
-            .any(|w| w.iter().zip(pair).all(|(a, b)| a == b))
+            .any(|w| w.iter().zip(pair).all(|(a, b)| unix(a) == *b))
     }
 
     #[test]

@@ -78,26 +78,14 @@ pub fn query(timeout: Duration) -> Caps {
         if left.is_zero() {
             break;
         }
-        let mut pfd = libc::pollfd {
-            fd: 0,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one pollfd, for stdin.
-        let n = unsafe { libc::poll(&mut pfd, 1, left.as_millis().max(1) as libc::c_int) };
-        if n <= 0 {
-            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            break;
-        }
         let mut chunk = [0u8; 1024];
-        // SAFETY: chunk holds its length in bytes.
-        let r = unsafe { libc::read(0, chunk.as_mut_ptr().cast(), chunk.len()) };
-        if r <= 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..r as usize]);
+        let r = match crate::os::read_terminal(&mut chunk, left) {
+            Ok(0) => break,
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        buf.extend_from_slice(&chunk[..r]);
         if parse(&buf).answered {
             break;
         }

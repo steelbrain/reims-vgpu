@@ -41,7 +41,6 @@ use crate::{host::Profile, paths, runtime};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 /// The migrations this reims-ctl carries: 1 to this.
@@ -94,8 +93,7 @@ fn lock() -> Option<File> {
     let file = paths::config_dir().join("migrations.lock");
     std::fs::create_dir_all(file.parent()?).ok()?;
     let f = File::create(&file).ok()?;
-    // SAFETY: flock on a descriptor this File owns.
-    (unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0).then_some(f)
+    f.lock().is_ok().then_some(f)
 }
 
 /// What a migration does to a VM.
@@ -488,8 +486,9 @@ fn backup_of(image: &Path, n: u32) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::opencore::tests::{image as oc_image, plist, qcow2};
-    use std::os::unix::fs::PermissionsExt;
 
+    // Windows: with its process handling (os/windows.rs).
+    #[cfg(unix)]
     /// A stand-in for a running VM's QEMU: a shell whose command line names `pidfile`, as QEMU's
     /// does, and which writes its own pid there, as QEMU does. Only then can runtime::pid_at take
     /// it for running: until then its pid holds the test's command line, then `sh`'s, which may
@@ -563,8 +562,7 @@ mod tests {
                 made = made.display(),
             )
         };
-        std::fs::write(&util, script).unwrap();
-        std::fs::set_permissions(&util, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let util = crate::testenv::program(&util, &script);
         env.set("REIMS_CTL_UTIL", &util);
     }
 
@@ -988,6 +986,8 @@ mod tests {
         }
     }
 
+    // Windows: with its process handling (os/windows.rs).
+    #[cfg(unix)]
     #[test]
     fn migration_4_defers_a_running_vm_and_runs_at_its_next_start() {
         let env = crate::testenv::Env::new("migrate-graft-running");
@@ -1212,6 +1212,8 @@ mod tests {
 
     /// The first run records the migrations, and later ones do nothing; a VM running then waits
     /// for its next start, which migrates it once.
+    // Windows: with its process handling (os/windows.rs).
+    #[cfg(unix)]
     #[test]
     fn migrations_run_once_and_a_running_vm_waits_for_its_start() {
         let env = crate::testenv::Env::new("migrate-run");

@@ -320,18 +320,10 @@ impl Zip {
 }
 
 fn dos_now() -> (u16, u16) {
-    // SAFETY: as in runtime::now_stamp.
-    unsafe {
-        let t = libc::time(std::ptr::null_mut());
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&t, &mut tm);
-        let time =
-            ((tm.tm_hour as u16) << 11) | ((tm.tm_min as u16) << 5) | ((tm.tm_sec as u16) / 2);
-        let date = (((tm.tm_year - 80).max(0) as u16) << 9)
-            | (((tm.tm_mon + 1) as u16) << 5)
-            | tm.tm_mday as u16;
-        (time, date)
-    }
+    let t = crate::os::local_now();
+    let time = ((t.hour as u16) << 11) | ((t.minute as u16) << 5) | ((t.second as u16) / 2);
+    let date = (((t.year - 1980).max(0) as u16) << 9) | ((t.month as u16) << 5) | t.day as u16;
+    (time, date)
 }
 
 #[cfg(test)]

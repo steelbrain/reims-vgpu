@@ -20,7 +20,6 @@ use crate::vm::{DEFAULT_STOP_TIMEOUT, DiskController, Graphics, Vm};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -33,69 +32,18 @@ pub fn pid(vm: &Vm) -> Option<i32> {
 /// settings may not read.
 pub fn pid_at(pidfile: &Path) -> Option<i32> {
     let pid: i32 = std::fs::read_to_string(pidfile).ok()?.trim().parse().ok()?;
-    if pid <= 0 || !alive(pid) {
+    if pid <= 0 || !alive(pid) || !crate::os::may_be_qemu(pid) {
         return None;
     }
     let needle = pidfile.as_os_str().as_encoded_bytes();
-    let cmd = cmdline(pid)?;
+    let cmd = crate::os::cmdline(pid)?;
     cmd.windows(needle.len())
         .any(|w| w == needle)
         .then_some(pid)
 }
 
 fn alive(pid: i32) -> bool {
-    // SAFETY: signal 0 only checks the pid.
-    let r = unsafe { libc::kill(pid, 0) };
-    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(target_os = "linux")]
-fn cmdline(pid: i32) -> Option<Vec<u8>> {
-    let b = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    // A zombie's command line is empty.
-    (!b.is_empty()).then_some(b)
-}
-
-#[cfg(target_os = "macos")]
-fn cmdline(pid: i32) -> Option<Vec<u8>> {
-    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
-    let mut size: libc::size_t = 0;
-    // SAFETY: a size query; mib names a valid sysctl.
-    if unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            3,
-            std::ptr::null_mut(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    } != 0
-    {
-        return None;
-    }
-    let mut buf = vec![0u8; size];
-    // SAFETY: buf holds size bytes.
-    if unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            3,
-            buf.as_mut_ptr().cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    } != 0
-    {
-        return None;
-    }
-    buf.truncate(size);
-    Some(buf)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn cmdline(_pid: i32) -> Option<Vec<u8>> {
-    None
+    crate::os::alive(pid)
 }
 
 pub fn running(vm: &Vm) -> bool {
@@ -222,14 +170,15 @@ pub fn max_map_count(memory_mib: u64) -> (u64, u64) {
 /// kernel mapping per 4 KiB page, past `vm.max_map_count` at 3840 x 2160 even at the guest's
 /// desktop (docs/qemu.md, "Linux hosts: vm.max_map_count"). None where it opens.
 pub fn udmabuf_problem() -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
     const NODE: &str = "/dev/udmabuf";
     let e = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(NODE)
         .err()?;
-    let group = std::fs::metadata(NODE).ok().map(|m| m.gid());
+    let group = std::fs::metadata(NODE)
+        .ok()
+        .and_then(|m| crate::os::gid(&m));
     let over_ssh = std::env::var_os("SSH_CONNECTION").is_some();
     Some(udmabuf_message(
         &e,
@@ -462,17 +411,9 @@ pub fn invocation_for_print(vm: &Vm, host: Host) -> Result<Invocation> {
     qemu::invocation(vm, &ctx)
 }
 
+/// The local time now in `fmt`, strftime(3)'s form.
 pub fn now_stamp(fmt: &str) -> String {
-    // SAFETY: time and localtime_r fill the structs given; strftime writes at most buf's size.
-    unsafe {
-        let t = libc::time(std::ptr::null_mut());
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&t, &mut tm);
-        let mut buf = [0u8; 64];
-        let f = std::ffi::CString::new(fmt).unwrap();
-        let n = libc::strftime(buf.as_mut_ptr().cast(), buf.len(), f.as_ptr(), &tm);
-        String::from_utf8_lossy(&buf[..n]).into_owned()
-    }
+    crate::os::now_stamp(fmt)
 }
 
 /// Another VM that runs on `vm`'s disk, which both use in place. QEMU on Linux would refuse the
@@ -512,28 +453,10 @@ fn prepare_run(vm: &Vm) -> Result<std::path::PathBuf> {
     Ok(sock)
 }
 
-/// Makes `d`, a directory for QMP sockets outside the VMs' own, the user's alone (0700) where it
-/// is new, and refuses one that is not a directory, another user owns, or others may write into:
-/// whoever could write there could put a socket of theirs in QMP's place and drive the VM. Some
-/// of them are under `/tmp`, which every user writes into (`paths::short_runtime_dir`).
+/// Makes `d`, a directory for QMP sockets outside the VMs' own, and refuses one others could put
+/// a socket in ([`crate::os::private_dir`]).
 fn private_dir(d: &Path) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(d)
-        .with_context(|| format!("create {}", d.display()))?;
-    let m = std::fs::symlink_metadata(d).with_context(|| format!("read {}", d.display()))?;
-    // SAFETY: getuid has no preconditions.
-    let uid = unsafe { libc::getuid() };
-    if !m.is_dir() || m.uid() != uid || m.mode() & 0o022 != 0 {
-        bail!(
-            "{} is not a directory of this user's that others cannot write into, so it holds no \
-             QMP socket: remove it, or make it so",
-            d.display()
-        );
-    }
-    Ok(())
+    crate::os::private_dir(d)
 }
 
 /// What a start of a stopped VM does to its settings and OpenCore image first, before [`start`]:
@@ -605,10 +528,15 @@ pub struct UserManager {
 impl UserManager {
     /// This host's, read now: on Linux by `systemctl --user` and `loginctl`, and none
     /// elsewhere.
+    #[cfg(not(target_os = "linux"))]
     pub fn current() -> UserManager {
-        if !cfg!(target_os = "linux") {
-            return UserManager::default();
-        }
+        UserManager::default()
+    }
+
+    /// This host's, read now: on Linux by `systemctl --user` and `loginctl`, and none
+    /// elsewhere.
+    #[cfg(target_os = "linux")]
+    pub fn current() -> UserManager {
         let ok = |program: &str, args: &[&str]| {
             std::process::Command::new(program)
                 .args(args)
@@ -625,8 +553,7 @@ impl UserManager {
                 &["--user", "show", "--property=Version", "--value"],
             )
             .is_some_and(|v| !v.is_empty());
-        // SAFETY: getuid has no preconditions.
-        let uid = unsafe { libc::getuid() };
+        let uid = crate::os::uid();
         let caller_inside = std::fs::read_to_string("/proc/self/cgroup")
             .is_ok_and(|c| c.contains(&format!("/user@{uid}.service/")));
         let lingers = ok(
@@ -795,23 +722,7 @@ pub fn start(vm: &Vm, host: Host) -> Result<Started> {
         .stdin(std::process::Stdio::null())
         .stdout(log)
         .stderr(err);
-    // SAFETY: only async-signal-safe calls between fork and exec: setsid, fork, _exit.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            match libc::fork() {
-                -1 => Err(std::io::Error::last_os_error()),
-                0 => Ok(()),
-                _ => libc::_exit(0),
-            }
-        });
-    }
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("run {}", run.program.display()))?;
-    let _ = child.wait();
+    crate::os::spawn_detached(cmd).with_context(|| format!("run {}", run.program.display()))?;
     let started = |pid| Started {
         pid,
         note: note.clone(),
@@ -927,17 +838,12 @@ fn power_off(vm: &Vm, p: i32, progress: &mut impl FnMut(&str)) -> Result<()> {
         progress("powered off");
         return Ok(());
     }
-    // SAFETY: p is our QEMU's pid, checked by pid().
-    unsafe { libc::kill(p, libc::SIGTERM) };
-    if wait_gone(p, Duration::from_secs(5)) {
-        progress("powered off (SIGTERM)");
-        return Ok(());
-    }
-    // SAFETY: as above.
-    unsafe { libc::kill(p, libc::SIGKILL) };
-    if wait_gone(p, Duration::from_secs(5)) {
-        progress("killed (SIGKILL)");
-        return Ok(());
+    for (end, ended) in crate::os::ENDS {
+        end(p);
+        if wait_gone(p, Duration::from_secs(5)) {
+            progress(ended);
+            return Ok(());
+        }
     }
     bail!("QEMU (pid {p}) did not exit")
 }
@@ -1003,7 +909,7 @@ pub fn tail(path: &Path, n: usize) -> String {
 /// pid file names it. A pid file the test wrote itself after `spawn` could name a process
 /// whose command line still reads empty: Linux wakes the parent once the child's exec has
 /// replaced its memory, and sets the new program's command line after that.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn test_qemu(pidfile: &Path, secs: u32) -> std::process::Child {
     let mut qemu = std::process::Command::new("sh")
         .args(["-c", &format!("echo $$ > \"$0\"; sleep {secs}; :")])
@@ -1117,7 +1023,10 @@ mod tests {
         );
         let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
         assert!(udmabuf_message(&missing, None, false).contains("modprobe udmabuf"));
+        #[cfg(unix)]
         let no_module = std::io::Error::from_raw_os_error(libc::ENODEV);
+        #[cfg(windows)]
+        let no_module = std::io::Error::other("no such device");
         let m = udmabuf_message(&no_module, Some((992, "kvm".into())), false);
         assert!(
             m.contains("doesn't open") && m.contains("modprobe udmabuf"),
@@ -1244,6 +1153,8 @@ mod tests {
         }
     }
 
+    // Windows: with its process handling (os/windows.rs).
+    #[cfg(unix)]
     /// A VM does not start on a disk another VM, using it in place too, runs on.
     #[test]
     fn a_vm_does_not_start_on_a_disk_another_runs_on() {
@@ -1319,6 +1230,7 @@ mod tests {
 
     /// A QMP server at `sock` that greets, answers every command, and records each command but
     /// qmp_capabilities.
+    #[cfg(unix)]
     fn fake_qmp(sock: &Path) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
         use std::io::BufRead;
         let listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
@@ -1346,6 +1258,7 @@ mod tests {
     /// ends with an error rather than wait for good.
     /// A QMP socket's directory is made the user's alone, and one others may write into is
     /// refused: one made 0755 by an earlier reims-ctl is taken as it is
+    #[cfg(unix)]
     #[test]
     fn a_qmp_socket_directory_others_may_write_into_is_refused() {
         use std::os::unix::fs::PermissionsExt;
@@ -1371,6 +1284,8 @@ mod tests {
         assert!(not_dir.is_err(), "{not_dir:?}");
     }
 
+    // Windows: with its QMP connection (os/windows.rs).
+    #[cfg(unix)]
     #[test]
     fn a_stop_timeout_of_0_waits_for_the_guest() {
         let d = std::env::temp_dir().join(format!("reims-ctl-stop-{}", std::process::id()));

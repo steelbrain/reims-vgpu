@@ -57,7 +57,7 @@ pub fn binary() -> Result<PathBuf> {
     let on_path: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| {
             std::env::split_paths(&p)
-                .map(|d| d.join("reims-util"))
+                .map(|d| d.join(UTIL_FILE))
                 .collect()
         })
         .unwrap_or_default();
@@ -68,11 +68,18 @@ pub fn binary() -> Result<PathBuf> {
         .context("reims-util is not installed: run reims-ctl update, which installs it")
 }
 
+/// reims-util's file name: `reims-util`, and `reims-util.exe` on Windows.
+const UTIL_FILE: &str = if cfg!(windows) {
+    "reims-util.exe"
+} else {
+    "reims-util"
+};
+
 /// The reims-util beside the running reims-ctl, in the bin directory cargo installed both into.
 pub fn beside() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
-        .and_then(|e| e.parent().map(|d| d.join("reims-util")))
+        .and_then(|e| e.parent().map(|d| d.join(UTIL_FILE)))
         .filter(|p| p.is_file())
 }
 
@@ -551,7 +558,6 @@ struct Lock {
 }
 
 fn lock(dir: &Path, progress: &mut dyn FnMut(&str)) -> Result<Lock> {
-    use std::os::fd::AsRawFd;
     let path = dir.join(".lock");
     let f = std::fs::OpenOptions::new()
         .create(true)
@@ -559,16 +565,10 @@ fn lock(dir: &Path, progress: &mut dyn FnMut(&str)) -> Result<Lock> {
         .write(true)
         .open(&path)
         .with_context(|| format!("open {}", path.display()))?;
-    // SAFETY: flock on a descriptor this function holds open.
-    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    if f.try_lock().is_err() {
         progress("waiting for another download of a macOS installer to end");
-        // SAFETY: as above.
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            bail!(
-                "lock {}: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            );
+        if let Err(e) = f.lock() {
+            bail!("lock {}: {e}", path.display());
         }
     }
     Ok(Lock { _file: f })
@@ -706,15 +706,10 @@ mod tests {
 
     /// A stand-in for reims-util that prints `lines` and exits with `code`.
     fn fake(dir: &Path, lines: &str, code: i32) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let p = dir.join("reims-util");
-        std::fs::write(
-            &p,
-            format!("#!/bin/sh\ncat <<'EOF'\n{lines}\nEOF\necho oops >&2\nexit {code}\n"),
+        crate::testenv::program(
+            &dir.join("reims-util"),
+            &format!("#!/bin/sh\ncat <<'EOF'\n{lines}\nEOF\necho oops >&2\nexit {code}\n"),
         )
-        .unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        p
     }
 
     #[test]

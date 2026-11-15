@@ -58,7 +58,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -97,8 +97,7 @@ pub fn run(vm: &Vm, opts: &Options) -> Result<Option<String>> {
     if runtime::pid(vm).is_none() {
         bail!("{name} is not running: reims-ctl start {name}");
     }
-    // SAFETY: isatty only reads its descriptor's state.
-    if unsafe { libc::isatty(0) == 0 || libc::isatty(1) == 0 } {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("reims-ctl view draws in a terminal: run it in one");
     }
     let target = Target::for_vm(vm);
@@ -219,7 +218,6 @@ struct FrameDir(PathBuf);
 
 impl FrameDir {
     fn new() -> Result<FrameDir> {
-        use std::os::unix::fs::DirBuilderExt;
         let base = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .filter(|p| p.is_dir())
@@ -228,10 +226,7 @@ impl FrameDir {
         sweep_frame_dirs(&base);
         let dir = base.join(format!("{FRAME_DIR_PREFIX}{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&dir)
-            .with_context(|| format!("create {}", dir.display()))?;
+        crate::os::create_private_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
         Ok(FrameDir(dir))
     }
 }
@@ -248,28 +243,25 @@ const FRAME_DIR_PREFIX: &str = "reims-ctl-view-";
 /// Removes the frame directories in `base` that viewers which no longer run left: those of this
 /// user's named for a pid no process has. A running viewer's stays, as does any other entry.
 fn sweep_frame_dirs(base: &Path) {
-    use std::os::unix::fs::MetadataExt;
     let Ok(entries) = std::fs::read_dir(base) else {
         return;
     };
-    // SAFETY: getuid has no preconditions.
-    let uid = unsafe { libc::getuid() };
     for e in entries.flatten() {
         let pid = e.file_name().to_str().and_then(|n| {
             n.strip_prefix(FRAME_DIR_PREFIX)
-                .and_then(|p| p.parse::<libc::pid_t>().ok())
+                .and_then(|p| p.parse::<i32>().ok())
         });
         let Some(pid) = pid.filter(|p| *p > 0) else {
             continue;
         };
         // The entry itself, not what a link names.
-        if !e.metadata().is_ok_and(|m| m.is_dir() && m.uid() == uid) {
+        if !e
+            .metadata()
+            .is_ok_and(|m| m.is_dir() && crate::os::owned_by_me(&m))
+        {
             continue;
         }
-        // SAFETY: signal 0 sends nothing; it asks only whether the process exists.
-        let gone = unsafe { libc::kill(pid, 0) } == -1
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-        if gone {
+        if crate::os::gone(pid) {
             let _ = std::fs::remove_dir_all(e.path());
         }
     }
@@ -355,8 +347,7 @@ impl Drop for TermGuard {
         }
         let _ = out.flush();
         // Reports that came in before the terminal stopped sending them go unread.
-        // SAFETY: tcflush only discards stdin's queued input.
-        unsafe { libc::tcflush(0, libc::TCIFLUSH) };
+        crate::os::flush_input();
         ratatui::restore();
     }
 }

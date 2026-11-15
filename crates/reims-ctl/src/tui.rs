@@ -79,9 +79,8 @@ fn run_update(channel: Option<Channel>) -> Result<()> {
     println!("Updating reims-ctl and its QEMU…\n");
     update::update(channel)?;
     println!("\nUpdated. Starting the new reims-ctl…");
-    use std::os::unix::process::CommandExt;
     let exe = update::restart_path(std::env::current_exe()?);
-    let err = std::process::Command::new(&exe).exec();
+    let err = crate::os::exec(std::process::Command::new(&exe));
     Err(err).with_context(|| format!("run {}", exe.display()))
 }
 
@@ -812,10 +811,8 @@ impl App {
                         .find(|r| &r.name == vm)
                         .map(|r| r.dir.join("launch.sh"));
                     if let Some(p) = r {
-                        use std::os::unix::fs::PermissionsExt;
-                        let res = std::fs::write(&p, script).and_then(|_| {
-                            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
-                        });
+                        let res =
+                            std::fs::write(&p, script).and_then(|_| crate::os::set_mode(&p, 0o755));
                         match res {
                             Ok(()) => self.say(&format!("wrote {}", paths::tilde(&p)), Level::Ok),
                             Err(e) => self.say(&format!("{}: {e}", p.display()), Level::Error),
@@ -2389,34 +2386,11 @@ fn ssh_port_field(f: &Form) -> Result<Option<u16>> {
     Ok(crate::vm::ssh_port(p))
 }
 
-/// Runs less on `files`, each at its end, as system(3) runs a command: Ctrl+C and Ctrl+\ reach
-/// the terminal's whole foreground process group, so reims-ctl ignores them until less exits,
-/// and less gets them as it would from a shell.
+/// Runs less on `files`, each at its end, in the terminal ([`crate::os::run_in_terminal`]).
 fn run_less(files: &[PathBuf]) -> std::io::Result<std::process::ExitStatus> {
-    use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new("less");
     cmd.arg("++G").args(files);
-    // SAFETY: only signal, which is async-signal-safe, between fork and exec.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::signal(libc::SIGINT, libc::SIG_DFL);
-            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
-            Ok(())
-        });
-    }
-    // SAFETY: dispositions set to ignore, then back to what they were.
-    let (int, quit) = unsafe {
-        (
-            libc::signal(libc::SIGINT, libc::SIG_IGN),
-            libc::signal(libc::SIGQUIT, libc::SIG_IGN),
-        )
-    };
-    let status = cmd.status();
-    unsafe {
-        libc::signal(libc::SIGINT, int);
-        libc::signal(libc::SIGQUIT, quit);
-    }
-    status
+    crate::os::run_in_terminal(cmd)
 }
 
 /// Has the terminal report the mouse's buttons and wheel, or stop: X11's reports (mode 1000)

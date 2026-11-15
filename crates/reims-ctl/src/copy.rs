@@ -10,15 +10,24 @@
 //! 7.3.1, 2026-11-08): a reflink took 119 ms where it had 11,477 extents, and 785 ms where it had
 //! 110,874.
 
+use crate::os::FileExt;
 use crate::paths;
 use crate::reims_util::size;
 use anyhow::{Context, Result};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+use unix::{APART, UNSUPPORTED, clone, create, data_ranges, file_system};
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows::{APART, UNSUPPORTED, clone, create, data_ranges, file_system};
 
 /// A full copy of more data than this says so first, and then how far it is: at an NVMe drive's
 /// 2 GB/s, a gigabyte takes half a second. An OpenCore image or OVMF, a few megabytes, copies
@@ -75,78 +84,6 @@ fn copy(src: &Path, dst: &Path, long: u64, progress: &mut dyn FnMut(&str)) -> Re
         }
     })
     .with_context(fail)
-}
-
-/// `dst`, made empty, with the permissions of `from`, as `cp` makes its copy.
-fn create(from: &File, dst: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(from.metadata()?.mode() & 0o7777)
-        .open(dst)
-}
-
-/// Makes `dst` a reflink of `src`, or returns the file system's refusal.
-#[cfg(target_os = "linux")]
-fn clone(src: &Path, dst: &Path) -> io::Result<()> {
-    let from = File::open(src)?;
-    let to = create(&from, dst)?;
-    // SAFETY: FICLONE takes the source's descriptor; both are open for the call.
-    if unsafe { libc::ioctl(to.as_raw_fd(), libc::FICLONE, from.as_raw_fd()) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-/// Makes `dst` a clone of `src`, or returns the file system's refusal.
-#[cfg(target_os = "macos")]
-fn clone(src: &Path, dst: &Path) -> io::Result<()> {
-    let (s, d) = (c_path(src)?, c_path(dst)?);
-    // SAFETY: both are NUL-terminated paths, alive for the call.
-    if unsafe { libc::clonefile(s.as_ptr(), d.as_ptr(), 0) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn c_path(p: &Path) -> io::Result<std::ffi::CString> {
-    use std::os::unix::ffi::OsStrExt;
-    std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(io::Error::other)
-}
-
-/// The parts of `f`, `len` bytes long, that hold data, as `[start, end)`: all of it where the file
-/// system tells no holes.
-fn data_ranges(f: &File, len: u64) -> Vec<(u64, u64)> {
-    let seek = |at: u64, whence| {
-        // SAFETY: lseek on an open descriptor.
-        let r = unsafe { libc::lseek(f.as_raw_fd(), at as libc::off_t, whence) };
-        if r < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(r as u64)
-        }
-    };
-    let mut ranges = Vec::new();
-    let mut at = 0;
-    while at < len {
-        let start = match seek(at, libc::SEEK_DATA) {
-            Ok(s) => s,
-            // No data after `at`.
-            Err(e) if e.raw_os_error() == Some(libc::ENXIO) => break,
-            Err(_) => at,
-        };
-        let end = seek(start, libc::SEEK_HOLE).unwrap_or(len).min(len);
-        if end <= start {
-            break;
-        }
-        ranges.push((start, end));
-        at = end;
-    }
-    ranges
 }
 
 /// Copies `ranges` of `from` to `to`, then makes `to` `len` bytes long; `copied` hears how many
@@ -215,12 +152,8 @@ impl Why {
     /// From `e`, how a reflink of a file on `from` to one on `to` ended.
     fn from_error(e: &io::Error, from: String, to: String) -> Why {
         match e.raw_os_error() {
-            Some(libc::EXDEV) => Why::Apart(from, to),
-            Some(c)
-                if [libc::EOPNOTSUPP, libc::ENOTSUP, libc::ENOTTY, libc::ENOSYS].contains(&c) =>
-            {
-                Why::Unsupported(from)
-            }
+            Some(c) if APART.contains(&c) => Why::Apart(from, to),
+            Some(c) if UNSUPPORTED.contains(&c) => Why::Unsupported(from),
             _ => Why::Refused(from, e.to_string()),
         }
     }
@@ -248,27 +181,6 @@ impl Why {
             Why::Refused(fs, _) => format!("{fs} refused a reflink"),
         }
     }
-}
-
-/// The type of the file system `dir` is on: btrfs, ext4, tmpfs.
-#[cfg(target_os = "linux")]
-fn file_system(dir: &Path) -> Option<String> {
-    let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-    mount_type(&mounts, &std::fs::canonicalize(dir).ok()?)
-}
-
-/// The type of the file system `dir` is on: apfs, hfs, exfat.
-#[cfg(target_os = "macos")]
-fn file_system(dir: &Path) -> Option<String> {
-    let p = c_path(dir).ok()?;
-    // SAFETY: statfs fills the struct it is given; all zeros is a valid one.
-    let mut s: libc::statfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statfs(p.as_ptr(), &mut s) } != 0 {
-        return None;
-    }
-    // SAFETY: f_fstypename is NUL-terminated.
-    let name = unsafe { std::ffi::CStr::from_ptr(s.f_fstypename.as_ptr()) };
-    Some(name.to_string_lossy().into_owned())
 }
 
 /// The type of the mount `path`, absolute and with no symbolic links, is on, by `mountinfo`, as
@@ -328,14 +240,13 @@ mod tests {
 
     /// A file of `len` bytes: data at 0, a run of zeros, then a hole to the end.
     fn sparse_file(p: &Path, len: u64) -> Vec<u8> {
-        use std::os::unix::fs::PermissionsExt;
         let f = File::create(p).unwrap();
         let data: Vec<u8> = (0..300_000u32).map(|i| (i * 7 + 1) as u8).collect();
         f.write_all_at(&data, 0).unwrap();
         f.write_all_at(&[0u8; 65536], data.len() as u64).unwrap();
         f.write_all_at(b"tail", len / 2).unwrap();
         f.set_len(len).unwrap();
-        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o640)).unwrap();
+        crate::os::set_mode(p, 0o640).unwrap();
         std::fs::read(p).unwrap()
     }
 
@@ -350,7 +261,7 @@ mod tests {
             paths::home().join("vms/old/disk.qcow2"),
             paths::home().join(".local/share/reims-ctl/vms/mac/disk.qcow2"),
         );
-        let apart = why(libc::EXDEV, "ext4", "btrfs");
+        let apart = why(APART[0], "ext4", "btrfs");
         assert_eq!(apart, Why::Apart("ext4".into(), "btrfs".into()));
         assert_eq!(
             apart.note(&src, &dst),
@@ -358,7 +269,7 @@ mod tests {
              and btrfs), and a reflink is made within one"
         );
         assert_eq!(apart.short(), "different file systems");
-        for code in [libc::EOPNOTSUPP, libc::ENOTTY] {
+        for &code in UNSUPPORTED {
             let none = why(code, "ext4", "ext4");
             assert_eq!(none, Why::Unsupported("ext4".into()));
             assert_eq!(
@@ -367,8 +278,13 @@ mod tests {
             );
             assert_eq!(none.short(), "ext4 makes no reflinks");
         }
-        let refused = why(libc::EINVAL, "btrfs", "btrfs");
-        let e = io::Error::from_raw_os_error(libc::EINVAL).to_string();
+        #[cfg(unix)]
+        let other = libc::EINVAL;
+        // ERROR_INVALID_PARAMETER.
+        #[cfg(windows)]
+        let other = 87;
+        let refused = why(other, "btrfs", "btrfs");
+        let e = io::Error::from_raw_os_error(other).to_string();
         assert_eq!(refused, Why::Refused("btrfs".into(), e.clone()));
         assert_eq!(refused.note(&src, &dst), format!("btrfs refused one: {e}"));
         assert_eq!(refused.short(), "btrfs refused a reflink");
@@ -407,13 +323,17 @@ mod tests {
         let mut seen = Vec::new();
         full(&from, &to, &ranges, len, &mut |n| seen.push(n)).unwrap();
         assert_eq!(std::fs::read(d.join("dst")).unwrap(), bytes);
-        let meta = std::fs::metadata(d.join("dst")).unwrap();
-        assert_eq!(meta.mode() & 0o777, 0o640);
-        assert!(
-            meta.blocks() * 512 < 8 << 20,
-            "{} bytes",
-            meta.blocks() * 512
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::metadata(d.join("dst")).unwrap();
+            assert_eq!(meta.mode() & 0o777, 0o640);
+            assert!(
+                meta.blocks() * 512 < 8 << 20,
+                "{} bytes",
+                meta.blocks() * 512
+            );
+        }
         let total: u64 = ranges.iter().map(|(a, b)| b - a).sum();
         assert_eq!(seen.first(), Some(&0));
         assert_eq!(seen.last(), Some(&total));
@@ -427,8 +347,11 @@ mod tests {
     /// copies within and between the temporary directory, the test's own and, on Linux,
     /// /dev/shm: one APFS volume on a Mac, and btrfs and tmpfs on the Linux hosts that check
     /// it.
+    // Windows: with its block clones (copy/windows.rs).
+    #[cfg(unix)]
     #[test]
     fn a_copy_is_a_reflink_where_it_can_be_and_says_why_where_not() {
+        use std::os::unix::fs::MetadataExt;
         let exe = std::env::current_exe().unwrap();
         let mut dirs = vec![
             dir(&std::env::temp_dir(), "tmp"),

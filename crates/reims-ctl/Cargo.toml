@@ -18,7 +18,6 @@ anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env", "wrap_help"] }
 crc32fast = "1.5.2"
 flate2 = "1.1.10"
-libc = "0.2.190"
 # An x86-64 VM's OpenCore config.plist, for the Mac it presents (opencore.rs).
 plist = "1.10.1"
 # The viewer's frames for the kitty and iTerm2 image protocols (view/encode.rs).
@@ -32,6 +31,20 @@ toml = "1.1.2"
 [build-dependencies]
 # Reads guest/prebuilt/set.toml, the guest's kexts build.rs embeds.
 toml = "1.1.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.190"
+
+# The host's process, console and time services on Windows (src/os/windows.rs), as the library's
+# workspace takes them.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Lists the host's Vulkan GPUs; `loaded` opens the Vulkan loader at run time, so the binary

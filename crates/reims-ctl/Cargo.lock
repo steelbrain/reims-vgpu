@@ -1365,6 +1365,7 @@ dependencies = [
  "serde_json",
  "shlex",
  "toml",
+ "windows-sys",
 ]
 
 [[package]]

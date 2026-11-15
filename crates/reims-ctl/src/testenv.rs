@@ -3,7 +3,7 @@
 //! run at once.
 
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 static LOCK: Mutex<()> = Mutex::new(());
@@ -66,4 +66,50 @@ impl Drop for Env {
         }
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+/// `p` as the inside of a TOML string: Windows' `\` escaped.
+pub fn toml_path(p: &Path) -> String {
+    p.display().to_string().replace('\\', "\\\\")
+}
+
+/// A stand-in program at `path` that runs `script`, a POSIX shell script, and the path to run it
+/// by: `path` itself, made executable. On Windows, which runs no script by its `#!` line, `path`
+/// holds the script and `path.cmd` runs it in MSYS2's or Git's `sh`, the path returned.
+#[cfg(unix)]
+pub fn program(path: &Path, script: &str) -> PathBuf {
+    std::fs::write(path, script).unwrap();
+    crate::os::set_mode(path, 0o755).unwrap();
+    path.to_path_buf()
+}
+
+/// A stand-in program at `path` that runs `script`, a POSIX shell script, and the path to run it
+/// by: `path` itself, made executable. On Windows, which runs no script by its `#!` line, `path`
+/// holds the script and `path.cmd` runs it in MSYS2's or Git's `sh`, the path returned.
+#[cfg(windows)]
+pub fn program(path: &Path, script: &str) -> PathBuf {
+    let on_path: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join("sh.exe"))
+                .collect()
+        })
+        .unwrap_or_default();
+    let sh = on_path
+        .into_iter()
+        .chain([
+            PathBuf::from(r"C:\msys64\usr\bin\sh.exe"),
+            PathBuf::from(r"C:\Program Files\Git\usr\bin\sh.exe"),
+        ])
+        .find(|p| p.is_file())
+        .expect("the tests' stand-in programs are sh scripts: install MSYS2 or Git for Windows");
+    std::fs::write(path, script).unwrap();
+    let name = path.file_name().unwrap().to_string_lossy();
+    let cmd = path.with_file_name(format!("{name}.cmd"));
+    std::fs::write(
+        &cmd,
+        format!("@\"{}\" \"%~dp0{name}\" %*\r\n", sh.display()),
+    )
+    .unwrap();
+    cmd
 }

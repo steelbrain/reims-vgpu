@@ -928,6 +928,8 @@ mod tests {
     /// Every VM name has a QMP socket that binds, with a runtime directory as long as macOS's
     /// `$TMPDIR/reims-ctl-<uid>` and a VM directory too long for its own; and a VM keeps the
     /// socket earlier reims-ctl gave it wherever that fits.
+    // Windows: with its QMP connection (os/windows.rs).
+    #[cfg(unix)]
     #[test]
     fn every_name_has_a_qmp_socket_that_binds() {
         let dir = Path::new("/Users/someone/VMs").join("d".repeat(80));
@@ -986,6 +988,7 @@ mod tests {
             qmp_socket_in(&dir, &"n".repeat(64), &fits, short).parent(),
             Some(fits.as_path())
         );
+        #[cfg(unix)]
         assert!(
             paths::short_runtime_dir()
                 .join("0123456789abcdef.qmp")

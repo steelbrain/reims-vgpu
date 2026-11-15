@@ -110,38 +110,7 @@ pub fn host_cpus() -> u32 {
 
 /// The host's RAM in MiB.
 pub fn host_memory_mib() -> u64 {
-    #[cfg(target_os = "macos")]
-    {
-        let mut v: u64 = 0;
-        let mut size = std::mem::size_of::<u64>();
-        let name = c"hw.memsize";
-        // SAFETY: hw.memsize is a u64.
-        if unsafe {
-            libc::sysctlbyname(
-                name.as_ptr(),
-                (&mut v as *mut u64).cast(),
-                &mut size,
-                std::ptr::null_mut(),
-                0,
-            )
-        } == 0
-        {
-            return v / (1024 * 1024);
-        }
-        16 * 1024
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        std::fs::read_to_string("/proc/meminfo")
-            .ok()
-            .and_then(|m| {
-                m.lines()
-                    .find(|l| l.starts_with("MemTotal:"))
-                    .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
-            })
-            .map(|kib| kib / 1024)
-            .unwrap_or(16 * 1024)
-    }
+    crate::os::memory_mib().unwrap_or(16 * 1024)
 }
 
 pub fn default_cpus() -> u32 {
@@ -517,7 +486,7 @@ fn make_q35(
         copy::file(&vars, &dir.join("OVMF_VARS.fd"), progress)?;
     }
     // A read-only source's copy is read-only too; the variables are written.
-    let _ = make_writable(&dir.join("OVMF_VARS.fd"));
+    let _ = crate::os::make_writable(&dir.join("OVMF_VARS.fd"));
 
     let installer = match spec.installer.clone() {
         Some(i) => Some(installer_media(&i, dir, progress)?),
@@ -543,13 +512,6 @@ fn make_q35(
     })
 }
 
-fn make_writable(p: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perm = std::fs::metadata(p)?.permissions();
-    perm.set_mode(perm.mode() | 0o600);
-    std::fs::set_permissions(p, perm)
-}
-
 fn import_disk(
     src: &Path,
     mode: ImportMode,
@@ -573,7 +535,7 @@ fn import_disk(
             };
             let name = format!("{stem}.{ext}");
             copy::file(&src, &dir.join(&name), progress)?;
-            let _ = make_writable(&dir.join(&name));
+            let _ = crate::os::make_writable(&dir.join(&name));
             (PathBuf::from(name), format)
         }
     })
@@ -861,7 +823,6 @@ mod tests {
     fn a_disk_keeps_the_mac_of_the_image_beside_it() {
         use crate::host::{Arch, Os};
         use crate::opencore::tests::{image, plist, qcow2};
-        use std::os::unix::fs::PermissionsExt;
         let env = crate::testenv::Env::new("create-disks-mac");
         let args = env.root.join("args");
         let made = env.root.join("made.qcow2");
@@ -874,8 +835,7 @@ mod tests {
             args = args.display(),
             made = made.display(),
         );
-        std::fs::write(&util, script).unwrap();
-        std::fs::set_permissions(&util, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let util = crate::testenv::program(&util, &script);
         env.set("REIMS_CTL_UTIL", &util);
         let host = Host {
             os: Os::Linux,
@@ -995,7 +955,6 @@ mod tests {
     #[test]
     fn a_create_finds_its_directory_taken_during_its_download() {
         use crate::host::{Arch, Os};
-        use std::os::unix::fs::PermissionsExt;
         let env = crate::testenv::Env::new("create-taken");
         let dir = env.root.join("vms/b");
         // reims-util's download, during which another create makes its VM there.
@@ -1005,8 +964,7 @@ mod tests {
             "#!/bin/sh\nmkdir -p '{d}' && echo theirs > '{d}/disk.qcow2'\necho '{done}'\n",
             d = dir.display()
         );
-        std::fs::write(&util, script).unwrap();
-        std::fs::set_permissions(&util, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let util = crate::testenv::program(&util, &script);
         env.set("REIMS_CTL_UTIL", &util);
         let mut spec = Spec::new("a");
         spec.dir = Some(dir.clone());

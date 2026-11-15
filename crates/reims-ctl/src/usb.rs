@@ -67,12 +67,7 @@ impl HostDevice {
     /// Whether this process may open its file to drive it, as QEMU, which runs as this user,
     /// opens it.
     pub fn usable(&self) -> bool {
-        use std::os::unix::ffi::OsStrExt;
-        let Ok(f) = std::ffi::CString::new(self.file().as_os_str().as_bytes()) else {
-            return false;
-        };
-        // SAFETY: f is a NUL-terminated path; access only reads it.
-        unsafe { libc::access(f.as_ptr(), libc::R_OK | libc::W_OK) == 0 }
+        crate::os::may_read_write(&self.file())
     }
 
     /// Whether `u` names it.
@@ -565,8 +560,10 @@ mod tests {
 
     /// A sysfs of USB devices in a temporary directory, as Linux lists them: each a directory
     /// of its attributes, its interfaces beside it.
+    #[cfg(unix)]
     struct Sysfs(PathBuf);
 
+    #[cfg(unix)]
     impl Sysfs {
         fn new(tag: &str) -> Sysfs {
             let d =
@@ -613,6 +610,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for Sysfs {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
@@ -629,6 +627,8 @@ mod tests {
 
     /// The host's devices: hubs and root hubs left out, each named from its own strings or
     /// else lsusb's, and what its interfaces say it is; in port order.
+    // sysfs's names hold `:`, which Windows refuses in a file's.
+    #[cfg(unix)]
     #[test]
     fn host_devices_are_read_from_sysfs() {
         let s = Sysfs::new("read");

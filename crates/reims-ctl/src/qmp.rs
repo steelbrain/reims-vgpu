@@ -1,8 +1,11 @@
 //! A QMP client: one command at a time over the VM's Unix socket, events skipped.
 
+#[cfg(windows)]
+use crate::os::UnixStream;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;

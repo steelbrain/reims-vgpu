@@ -12,13 +12,27 @@
 //!   a short socket name does not fit there, `/tmp/reims-ctl-<uid>` (`short_runtime_dir`).
 //!
 //! `REIMS_CTL_CONFIG_DIR` and `REIMS_CTL_DATA_DIR` replace the first two (tests use them).
+//!
+//! On Windows the layout is the same, in the user's profile (`%USERPROFILE%`), and the runtime
+//! directory is `reims-ctl` in the user's own temporary directory (`%TEMP%`), short enough for
+//! any socket's name.
 
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
 pub fn home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// The user's profile: `%USERPROFILE%`, which a shell's `HOME` (MSYS2's, Git's) does not replace,
+/// so reims-ctl finds the same files from every shell.
+#[cfg(windows)]
+pub fn home() -> PathBuf {
+    std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("\\"))
 }
 
 fn xdg(var: &str, fallback: &str) -> PathBuf {
@@ -66,6 +80,7 @@ pub fn install_file() -> PathBuf {
     config_dir().join("install.toml")
 }
 
+#[cfg(unix)]
 pub fn runtime_dir() -> PathBuf {
     if let Some(v) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| Path::new(v).is_absolute()) {
         return PathBuf::from(v).join("reims-ctl");
@@ -73,15 +88,26 @@ pub fn runtime_dir() -> PathBuf {
     let tmp = std::env::var_os("TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
-    // SAFETY: getuid has no preconditions.
-    tmp.join(format!("reims-ctl-{}", unsafe { libc::getuid() }))
+    tmp.join(format!("reims-ctl-{}", crate::os::uid()))
 }
 
 /// The runtime directory for a socket that a long `$XDG_RUNTIME_DIR` or `$TMPDIR` leaves no
 /// room for: `/tmp/reims-ctl-<uid>`, at most 46 bytes with its socket's name.
+#[cfg(unix)]
 pub fn short_runtime_dir() -> PathBuf {
-    // SAFETY: getuid has no preconditions.
-    PathBuf::from(format!("/tmp/reims-ctl-{}", unsafe { libc::getuid() }))
+    PathBuf::from(format!("/tmp/reims-ctl-{}", crate::os::uid()))
+}
+
+/// `reims-ctl` in the user's own temporary directory, `%TEMP%`.
+#[cfg(windows)]
+pub fn runtime_dir() -> PathBuf {
+    std::env::temp_dir().join("reims-ctl")
+}
+
+/// The runtime directory, whose sockets' paths fit (`vm::qmp_socket_in`).
+#[cfg(windows)]
+pub fn short_runtime_dir() -> PathBuf {
+    runtime_dir()
 }
 
 /// Where a bug report's zip goes: `$XDG_DOWNLOAD_DIR`, else `~/Downloads`, else the home.
