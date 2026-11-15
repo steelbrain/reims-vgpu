@@ -455,15 +455,16 @@ fn read_exact_at(file: &File, mut buf: &mut [u8], mut off: u64) -> std::io::Resu
     Ok(())
 }
 
-/// The signal a child's exit status says it died of; `None` for an exit.
+/// The signal a child's exit status says it died of; `None` for an exit. Other crates' tests of
+/// a child's end read it here, so one assertion holds on every OS.
 #[cfg(unix)]
-fn exit_signal(status: std::process::ExitStatus) -> Option<c_int> {
+pub fn exit_signal(status: std::process::ExitStatus) -> Option<c_int> {
     status.signal()
 }
 
 /// [`exit_signal`] on Windows: the signal a Unix child would have died of (`sys::exit_signal`).
 #[cfg(windows)]
-fn exit_signal(status: std::process::ExitStatus) -> Option<c_int> {
+pub fn exit_signal(status: std::process::ExitStatus) -> Option<c_int> {
     sys::exit_signal(status)
 }
 

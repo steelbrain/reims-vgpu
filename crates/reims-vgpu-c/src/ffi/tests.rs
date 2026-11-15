@@ -1,14 +1,14 @@
 //! The boundary's tests on every OS; each OS's own catch has its tests beside them.
 
-use std::os::unix::process::ExitStatusExt as _;
 use std::process::Command;
 
 use reims_vgpu_vulkan::core::raise::death::{DeathKind, DeathSite};
 use reims_vgpu_vulkan::core::rt::is_our_thread;
+use reims_vgpu_vulkan::core::testkit::death::exit_signal;
 
 use super::*;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -77,7 +77,7 @@ fn a_panic_under_an_export_aborts_before_unwinding() {
         "ffi::tests::a_panic_under_an_export_aborts_before_unwinding",
         "RVG_FFI_PANIC_CHILD",
     );
-    assert_eq!(out.status.signal(), Some(6), "{out:?}");
+    assert_eq!(exit_signal(out.status), Some(6), "{out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!stdout.contains("DROPPED"), "{stdout}");
@@ -127,7 +127,7 @@ fn a_panic_in_a_callback_of_the_first_export_ends_in_the_hook() {
         "ffi::tests::a_panic_in_a_callback_of_the_first_export_ends_in_the_hook",
         "RVG_FFI_CALLBACK_CHILD",
     );
-    assert_eq!(out.status.signal(), Some(6), "{out:?}");
+    assert_eq!(exit_signal(out.status), Some(6), "{out:?}");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("reims-vgpu: panic: ") && stderr.contains("in the host's destroy"),

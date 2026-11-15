@@ -61,8 +61,9 @@ pub fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
 
-    use std::os::unix::process::ExitStatusExt as _;
     use std::process::Command;
+
+    use reims_vgpu_vulkan::core::testkit::death::exit_signal;
 
     use super::*;
 
@@ -96,7 +97,7 @@ mod tests {
             "RVG_SCOPED_PANIC_CHILD",
         );
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.signal(), Some(6), "{out:?}");
+        assert_eq!(exit_signal(out.status), Some(6), "{out:?}");
         let refused = stderr
             .find("reims-vgpu: panic: ")
             .expect("the refused panic's line");
@@ -125,7 +126,7 @@ mod tests {
             "singleton::tests::one_platform_per_process",
             "RVG_PLATFORM_CHILD",
         );
-        assert_eq!(out.status.signal(), Some(6), "{out:?}");
+        assert_eq!(exit_signal(out.status), Some(6), "{out:?}");
         assert!(String::from_utf8_lossy(&out.stderr).contains("reims-vgpu: "));
     }
 
@@ -155,7 +156,7 @@ mod tests {
             "singleton::tests::panic_on_our_thread_aborts_before_unwinding",
             "RVG_HOOK_OURS_CHILD",
         );
-        assert_eq!(out.status.signal(), Some(6), "{out:?}");
+        assert_eq!(exit_signal(out.status), Some(6), "{out:?}");
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(!stdout.contains("DROPPED"), "{stdout}");
@@ -185,7 +186,7 @@ mod tests {
             "singleton::tests::panic_elsewhere_defers_to_the_previous_hook",
             "RVG_HOOK_OTHER_CHILD",
         );
-        assert_eq!(out.status.signal(), None, "{out:?}");
+        assert_eq!(exit_signal(out.status), None, "{out:?}");
         assert!(!out.status.success());
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);

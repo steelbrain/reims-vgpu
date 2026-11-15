@@ -1,5 +1,5 @@
-//! The catch on Linux: a Rust unwind out of the host's code that no panic hook ended first ends
-//! the process at the call.
+//! The catch on Linux, and on Windows, which takes Linux's: a Rust unwind out of the host's code
+//! that no panic hook ended first ends the process at the call.
 
 use reims_vgpu_vulkan::core::testkit::capture::catch_death;
 
