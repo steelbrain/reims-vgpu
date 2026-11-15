@@ -329,9 +329,11 @@ public:
 	// device's answer then waits for in a slot of the deferred answers (RgfxDeferredAnswers.hpp)
 	// until takeDeferred takes it: as postLifecycle with `replyType` 0, but for its slot.
 	// kIOReturnNoResources, posting nothing, where no slot is free: the caller posts the create
-	// as postLifecycle does, and waits. Thread context only.
+	// as postLifecycle does, and waits. `key`, where not null, is the pipeline key whose kept
+	// answer answered the create (findSharedPipeline): where the device does not make its
+	// pipeline, that answer is forgotten. Thread context only.
 	IOReturn postDeferred(UInt32 context, UInt32 type, const void *message, UInt32 size,
-	                      UInt64 *seqno);
+	                      UInt64 *seqno, const UInt8 *key = nullptr);
 	// Copies context `context`'s answers to its deferred creates into the `capacity` bytes at
 	// `out`, each whole, in their seqnos' order, while they fit, and frees their slots: the bytes
 	// in `*length`, the answers in `*count`. Where `waitFor` is the seqno of one of its creates

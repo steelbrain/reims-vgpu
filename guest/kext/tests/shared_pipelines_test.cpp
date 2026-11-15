@@ -4,7 +4,8 @@
 // zeroed; a refusal, a mesh answer and an answer with no key are not kept; a set full of other
 // keys replaces the one found or learnt longest ago, so the table never holds more than its size.
 // An answer seeded from an earlier run, handed newest first, takes only a free entry of a key not
-// kept, and ranks below every answer learnt or found since, the newer seed above the older.
+// kept, and ranks below every answer learnt or found since, the newer seed above the older. A
+// forgotten key finds nothing until its answer is learnt again.
 #include "RgfxSharedPipelines.hpp"
 
 #include <cstdio>
@@ -213,6 +214,15 @@ int main()
 	answerOf(reply, d, 5, 6);
 	check(!t.seed(reply, kBytes, 0), "d's seed not kept");
 	check(t.find(d, 1, 1, &out) && out.thread_execution_width == 64, "this run's answer stays");
+
+	// A forgotten key: found by none, its entry free for another, learnt again by its answer.
+	check(t.forget(d), "d's answer forgotten");
+	check(!t.find(d, 1, 1, &out) && t.size() == 0, "d finds nothing");
+	check(!t.forget(d), "a key not kept is not forgotten");
+	answerOf(reply, d, 5, 6);
+	check(t.seed(reply, kBytes, 0), "d's entry is free: a seed takes it");
+	check(t.forget(d) && t.learn(reply, kBytes) && t.find(d, 1, 1, &out),
+	      "learnt again after its forget");
 
 	std::printf("shared_pipelines_test: %d checks passed\n", checks);
 	return 0;

@@ -1,7 +1,8 @@
 // The native test of RgfxDeferredAnswers.hpp: a deferred pipeline create's answer is kept in the
 // slot reserved for it, whatever order answers come in, until its context takes it; a context
 // holds at most its share of the slots, the table at most its size; a cancelled or dropped slot is
-// free again, and an answer no slot waits for is not kept.
+// free again, and an answer no slot waits for is not kept. A slot posted for a kept answer's key
+// hands the key back where the device did not make the pipeline.
 #include "RgfxDeferredAnswers.hpp"
 
 #include <cstdio>
@@ -29,18 +30,20 @@ void stamp(Answers &a, int slot, uint64_t seqno)
 	__atomic_store_n(a.seqnoOf(slot), seqno, __ATOMIC_RELEASE);
 }
 
-// The reflection answering the create at `seqno` with resource id `id`, given to `a`.
-bool answer(Answers &a, uint64_t seqno, uint64_t id, uint32_t type = RGFX_EVT_PIPELINE_REFLECTION)
+// The reflection answering the create at `seqno` with resource id `id`, given to `a`, of status
+// `status`: where the slot names a key the answer hands back, *refused and `key`.
+bool answer(Answers &a, uint64_t seqno, uint64_t id, uint32_t type = RGFX_EVT_PIPELINE_REFLECTION,
+            uint32_t status = RGFX_PIPELINE_OK, bool *refused = nullptr, uint8_t *key = nullptr)
 {
 	RgfxPipelineReflection r = {};
 	r.header.type = type;
 	r.header.size = sizeof(r);
 	r.header.seqno = seqno;
 	r.gpu_resource_id = id;
-	r.status = RGFX_PIPELINE_OK;
+	r.status = status;
 	const auto *bytes = reinterpret_cast<const uint8_t *>(&r);
 	return a.answer(r.header, bytes + sizeof(RgfxMsgHeader),
-	                static_cast<uint32_t>(sizeof(r) - sizeof(RgfxMsgHeader)));
+	                static_cast<uint32_t>(sizeof(r) - sizeof(RgfxMsgHeader)), refused, key);
 }
 
 // The answers `out` holds, `length` bytes of whole reflections: their seqnos and ids.
@@ -158,6 +161,40 @@ int main()
 	uint64_t obj = 0;
 	std::memcpy(&obj, out + sizeof(h), sizeof(obj));
 	check(length == 24 && h.size == 24 && obj == 0x77, "cut to the slot, its size the cut");
+
+	// A slot posted for a kept answer's key: a refusal hands the key back, a made pipeline does
+	// not, and a slot of no key hands none back.
+	static Answers k;
+	uint8_t kept[Answers::kKeyBytes], back[Answers::kKeyBytes];
+	std::memset(kept, 0x5a, sizeof(kept));
+	bool refused = true;
+	int keyed = k.reserve(4, kept);
+	stamp(k, keyed, 40);
+	check(answer(k, 40, 0, RGFX_EVT_PIPELINE_REFLECTION, RGFX_PIPELINE_OK, &refused, back) &&
+	          !refused,
+	      "a made pipeline's answer hands no key back");
+	keyed = k.reserve(4, kept);
+	stamp(k, keyed, 41);
+	std::memset(back, 0, sizeof(back));
+	check(answer(k, 41, 0, RGFX_EVT_PIPELINE_REFLECTION, RGFX_PIPELINE_REFUSED, &refused, back) &&
+	          refused && std::memcmp(back, kept, sizeof(kept)) == 0,
+	      "a refusal hands the slot's key back");
+	check(k.state(4, 41) == Answers::kAnswered, "the refusal is kept for its process as any");
+	const int plain = k.reserve(4);
+	stamp(k, plain, 42);
+	check(answer(k, 42, 0, RGFX_EVT_PIPELINE_REFLECTION, RGFX_PIPELINE_REFUSED, &refused, back) &&
+	          !refused,
+	      "a slot of no key hands none back");
+	keyed = k.reserve(4, kept);
+	stamp(k, keyed, 43);
+	RgfxPipelineReflection shortOne = {};
+	shortOne.header.type = RGFX_EVT_PIPELINE_REFLECTION;
+	shortOne.header.seqno = 43;
+	check(k.answer(shortOne.header,
+	               reinterpret_cast<const uint8_t *>(&shortOne) + sizeof(RgfxMsgHeader), 8,
+	               &refused, back) &&
+	          refused,
+	      "an answer too short to say it made the pipeline hands the key back");
 
 	std::printf("deferred_answers_test: %d checks passed\n", checks);
 	return 0;

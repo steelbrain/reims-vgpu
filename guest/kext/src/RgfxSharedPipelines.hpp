@@ -17,6 +17,8 @@
 // earlier runs (RGFX_CMD_PIPELINE_ANSWERS), which the device hands newest first: a seeded answer
 // takes only a free entry, so a full set keeps the newer ones, and ranks below every answer this
 // run learnt or found, the newer seed above the older, so a set full of seeds replaces its oldest.
+// The kext forgets a key's answer where the device refuses a create the kept answer answered
+// (forget), so the next equal create waits for its own.
 // Header-only and free of the kernel's headers, so its native test
 // (tests/shared_pipelines_test.cpp) builds it as the kext does.
 //
@@ -96,6 +98,16 @@ public:
 			return true;
 		}
 		return false;
+	}
+
+	// Forgets the answer kept for `key` (kKeyBytes): true where one was kept.
+	bool forget(const uint8_t *key)
+	{
+		Entry *e = same(setOf(key), key);
+		if (e == nullptr)
+			return false;
+		e->used = false;
+		return true;
 	}
 
 	// Forgets every answer: the kext's start, which may take the table from a run before.

@@ -493,7 +493,7 @@ static bool lastLibraryChunk(const UInt8 *message, UInt64 size)
 // kRgfxAccelMethodTakeAnswers; one with kRgfxSubmitShared is so posted where the kext keeps an
 // equal create's answer by its pipeline key (RgfxSharedPipelines.hpp), which it answers at once.
 // Every answer to a pipeline create the kext waited for that carries a made pipeline's key is
-// kept so.
+// kept so, and a kept answer whose equal create the device then refuses is forgotten.
 IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 {
 	// The context as it is now, read under the list lock that releaseContext closes it under,
@@ -611,7 +611,8 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	if (sharedAsked)
 		memcpy(key, &a->scalarInput[1], sizeof(key));
 	if (checked && (deferAsked || (sharedAsked && owner->findSharedPipeline(key, 0, objId, &kept)))) {
-		r = owner->postDeferred(ctx, type, message, static_cast<UInt32>(size), &seqno);
+		r = owner->postDeferred(ctx, type, message, static_cast<UInt32>(size), &seqno,
+		                        sharedAsked ? key : nullptr);
 		deferred = r == kIOReturnSuccess;
 		if (r == kIOReturnNoResources)
 			r = kIOReturnSuccess;

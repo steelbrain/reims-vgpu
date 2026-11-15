@@ -560,7 +560,7 @@ public:
 	// The deferred pipeline creates (ReimsGraphics::postDeferred, takeDeferred, dropDeferred,
 	// forgetDeferred).
 	IOReturn postDeferred(UInt32 context, UInt32 type, const void *message, UInt32 size,
-	                      UInt64 *seqno);
+	                      UInt64 *seqno, const UInt8 *key = nullptr);
 	IOReturn takeDeferred(UInt32 context, UInt64 waitFor, UInt32 timeoutMs, UInt8 *out,
 	                      UInt32 capacity, UInt32 *length, UInt32 *count);
 	void dropDeferred(UInt32 context);

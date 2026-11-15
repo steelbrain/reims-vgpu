@@ -504,10 +504,10 @@ IOReturn ReimsGraphics::postLifecycle(UInt32 type, const void *message, UInt32 s
 }
 
 IOReturn ReimsGraphics::postDeferred(UInt32 context, UInt32 type, const void *message,
-                                     UInt32 size, UInt64 *seqno)
+                                     UInt32 size, UInt64 *seqno, const UInt8 *key)
 {
 	IOLockLock(stateLock);
-	const int slot = deferredAnswers.reserve(context);
+	const int slot = deferredAnswers.reserve(context, key);
 	IOLockUnlock(stateLock);
 	if (slot < 0)
 		return kIOReturnNoResources;
@@ -1086,10 +1086,15 @@ bool ReimsGraphics::answerLifecycle(UInt32 type, UInt64 seqno, const volatile UI
 		IOLockWakeup(stateLock, &w.done, true);
 	}
 	// Else a deferred create's (postDeferred), kept for its process to take; its waiters, if any,
-	// look again.
+	// look again. One posted for a kept answer whose pipeline the device did not make: the kept
+	// answer is forgotten, so the next equal create waits for its own.
+	bool refused = false;
+	UInt8 refusedKey[DeferredAnswers::kKeyBytes];
 	if (!found && deferredAnswers.answer(RgfxMsgHeader{type, size + kHeaderBytes, seqno},
-	                                     payload, size)) {
+	                                     payload, size, &refused, refusedKey)) {
 		found = true;
+		if (refused && sharedPipelines)
+			sharedPipelines->forget(refusedKey);
 		IOLockWakeup(stateLock, &deferredAnswers, false);
 	}
 	IOLockUnlock(stateLock);

@@ -11,6 +11,10 @@
 // the kext posts the create as it posts any other, and waits for its answer. A context's slots are
 // dropped at its close, and the answers in them with them.
 //
+// A create posted so because the kext keeps an equal create's answer by its pipeline key
+// (kRgfxSubmitShared, RgfxSharedPipelines.hpp) holds that key in its slot: where the device does
+// not make its pipeline, answer hands the key back, for the kext to forget its kept answer.
+//
 // The caller holds the framebuffer's state lock around every call; a slot's seqno is read and
 // written atomically, as the post stamps it outside the lock. Header-only and free of the
 // kernel's headers, so its native test (tests/deferred_answers_test.cpp) builds it as the kext does.
@@ -19,6 +23,7 @@
 #ifndef RGFX_DEFERRED_ANSWERS_HPP_
 #define RGFX_DEFERRED_ANSWERS_HPP_
 
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -37,9 +42,10 @@ public:
 		kAnswered,
 	};
 
-	// A free slot for a create of context `context` (never 0), or -1 where every slot is held or
+	// A free slot for a create of context `context` (never 0), posted for the kept answer of
+	// pipeline key `key` (kKeyBytes) where `key` is not null, or -1 where every slot is held or
 	// the context holds PerContext of them.
-	int reserve(uint32_t context)
+	int reserve(uint32_t context, const uint8_t *key = nullptr)
 	{
 		if (context == 0 || held(context) >= PerContext)
 			return -1;
@@ -51,6 +57,9 @@ public:
 			__atomic_store_n(&s.seqno, uint64_t{0}, __ATOMIC_RELEASE);
 			s.answered = false;
 			s.length = 0;
+			s.keyed = key != nullptr;
+			if (key != nullptr)
+				memcpy(s.key, key, kKeyBytes);
 			return static_cast<int>(i);
 		}
 		return -1;
@@ -64,9 +73,14 @@ public:
 
 	// Takes the answer to the create at `seqno`: its `header` (type, size and seqno) and the
 	// `size` payload bytes at `payload` (the ring's; read once each), kept whole up to ReplyMax
-	// bytes. True where a slot waits for it.
-	bool answer(const RgfxMsgHeader &header, const volatile uint8_t *payload, uint32_t size)
+	// bytes. True where a slot waits for it. Where the slot holds a pipeline key and the answer
+	// is not a made pipeline's (its status not RGFX_PIPELINE_OK, or too short to say), the key
+	// into `refusedKey` (kKeyBytes) and *refused true, where they are not null.
+	bool answer(const RgfxMsgHeader &header, const volatile uint8_t *payload, uint32_t size,
+	            bool *refused = nullptr, uint8_t *refusedKey = nullptr)
 	{
+		if (refused != nullptr)
+			*refused = false;
 		if (header.seqno == 0 || header.type != RGFX_EVT_PIPELINE_REFLECTION)
 			return false;
 		for (uint32_t i = 0; i < N; i++) {
@@ -83,6 +97,11 @@ public:
 				s.reply[b] = payload[b - head];
 			s.length = n;
 			s.answered = true;
+			if (s.keyed && refused != nullptr && refusedKey != nullptr &&
+			    !made(payload, size)) {
+				*refused = true;
+				memcpy(refusedKey, s.key, kKeyBytes);
+			}
 			return true;
 		}
 		return false;
@@ -155,7 +174,23 @@ public:
 		return n;
 	}
 
+	// A pipeline key's bytes.
+	static constexpr uint32_t kKeyBytes = 32;
+
 private:
+	// Whether the `size` payload bytes at `payload` answer a made pipeline.
+	static bool made(const volatile uint8_t *payload, uint32_t size)
+	{
+		const uint32_t at = static_cast<uint32_t>(offsetof(RgfxPipelineReflection, status) -
+		                                          sizeof(RgfxMsgHeader));
+		if (size < at + sizeof(uint32_t))
+			return false;
+		uint32_t status = 0;
+		for (uint32_t b = 0; b < sizeof(status); b++)
+			status |= static_cast<uint32_t>(payload[at + b]) << (8 * b);
+		return status == RGFX_PIPELINE_OK;
+	}
+
 	struct Slot {
 		// The context the slot is held for; 0 while it is free.
 		uint32_t context;
@@ -163,6 +198,9 @@ private:
 		// The create's seqno, 0 until its post stamps it.
 		uint64_t seqno;
 		bool answered;
+		// Posted for the kept answer of `key` (reserve's).
+		bool keyed;
+		uint8_t key[kKeyBytes];
 		uint8_t reply[ReplyMax];
 	};
 	Slot m_slots[N] = {};
