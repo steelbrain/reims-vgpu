@@ -46,6 +46,17 @@ use reims_vgpu_vulkan::core::sync::Mutex;
 use sha2::{Digest, Sha256};
 use zerocopy::{FromBytes, IntoBytes};
 
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
+
+// A file's build ([`library_build`]), each OS's own.
+#[cfg(unix)]
+use unix::file_build;
+#[cfg(windows)]
+use windows::file_build;
+
 /// A pipeline create's key ([`RGFX_PIPELINE_REFLECT_KEYED`]).
 pub(crate) type AnswerKey = [u8; 32];
 
@@ -316,30 +327,6 @@ pub(crate) fn answers_identity(platform: &[u8], build: &[u8]) -> [u8; 32] {
 /// cannot be told: then nothing is kept past the device's life.
 pub(crate) fn library_build() -> Option<Vec<u8>> {
     file_build(&std::env::current_exe().ok()?)
-}
-
-/// The file at `path`, as a build: its path with every link resolved (each of reims-ctl's QEMU
-/// installs is a directory of its own, named for its time and commit, which `qemu/current` links
-/// to), its device and inode, its size, and its modification and change times to the nanosecond
-/// the filesystem keeps. A file written again in place differs in its change time, which no copy
-/// or archive keeps; one renamed over it differs in its inode too.
-fn file_build(path: &Path) -> Option<Vec<u8>> {
-    use std::os::unix::fs::MetadataExt;
-    let path = std::fs::canonicalize(path).ok()?;
-    let meta = std::fs::metadata(&path).ok()?;
-    let mut build = path.as_os_str().as_encoded_bytes().to_vec();
-    for word in [meta.dev(), meta.ino(), meta.len()] {
-        build.extend_from_slice(&word.to_le_bytes());
-    }
-    for word in [
-        meta.mtime(),
-        meta.mtime_nsec(),
-        meta.ctime(),
-        meta.ctime_nsec(),
-    ] {
-        build.extend_from_slice(&word.to_le_bytes());
-    }
-    Some(build)
 }
 
 /// `reflection` as it is kept: a keyed reply's header (its size counting the key, its seqno 0),

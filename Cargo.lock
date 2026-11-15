@@ -452,6 +452,7 @@ dependencies = [
  "reims-vgpu-vulkan",
  "reims-vgpu-window",
  "sha2 0.10.9",
+ "windows-sys",
  "zerocopy",
 ]
 

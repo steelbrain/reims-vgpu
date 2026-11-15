@@ -43,6 +43,10 @@ parking_lot = { workspace = true, features = ["arc_lock", "send_guard"] }
 reims-vgpu-vulkan.workspace = true
 metal2vulkan-runtime.workspace = true
 
+# On Windows, a file's ID and times, which name the library's build (`graphics/answers/windows.rs`).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 reims-vgpu-vulkan = { workspace = true, features = ["testkit"] }
 # The tests' host calls: on Linux the guest's RAM as a host maps it (`platform::tests`), whether a
