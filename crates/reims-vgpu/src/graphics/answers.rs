@@ -310,21 +310,30 @@ pub(crate) fn answers_identity(platform: &[u8], build: &[u8]) -> [u8; 32] {
 }
 
 /// The build of this library that runs: the file its code runs from, the host's executable, which
-/// links the library statically (QEMU's `reims-graphics-pci`), by its path, size and modification
-/// time. A new build of the library, or of its host, is another identity's, so no answer a build
-/// gave reaches a guest of another, whatever its decode, platform or replies changed. `None` where
-/// the file cannot be told: then nothing is kept past the device's life.
+/// links the library statically (QEMU's `reims-graphics-pci`), as [`file_build`] tells it. A new
+/// build of the library, or of its host, is another identity's, so no answer a build gave reaches
+/// a guest of another, whatever its decode, platform or replies changed. `None` where the file
+/// cannot be told: then nothing is kept past the device's life.
 pub(crate) fn library_build() -> Option<Vec<u8>> {
-    let path = std::env::current_exe().ok()?;
+    file_build(&std::env::current_exe().ok()?)
+}
+
+/// The file at `path`, as a build: its path with every link resolved (each of reims-ctl's QEMU
+/// installs is a directory of its own, named for its time and commit, which `qemu/current` links
+/// to), its device and inode, its size, and its modification and change times to the nanosecond
+/// the filesystem keeps. A file written again in place differs in its change time, which no copy
+/// or archive keeps; one renamed over it differs in its inode too.
+fn file_build(path: &Path) -> Option<Vec<u8>> {
+    use std::os::unix::fs::MetadataExt;
+    let path = std::fs::canonicalize(path).ok()?;
     let meta = std::fs::metadata(&path).ok()?;
-    let modified = meta
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?;
     let mut build = path.as_os_str().as_encoded_bytes().to_vec();
-    build.extend_from_slice(&meta.len().to_le_bytes());
-    build.extend_from_slice(&modified.as_nanos().to_le_bytes());
+    for word in [meta.dev(), meta.ino(), meta.len()] {
+        build.extend_from_slice(&word.to_le_bytes());
+    }
+    for word in [meta.mtime(), meta.mtime_nsec(), meta.ctime(), meta.ctime_nsec()] {
+        build.extend_from_slice(&word.to_le_bytes());
+    }
     Some(build)
 }
 
@@ -672,9 +681,28 @@ mod tests {
         );
         let build = library_build().expect("the test binary's build is told");
         assert_eq!(library_build(), Some(build.clone()));
-        let exe = std::env::current_exe().unwrap();
+        let exe = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
         assert!(build.starts_with(exe.as_os_str().as_encoded_bytes()));
-        assert_eq!(build.len(), exe.as_os_str().len() + 8 + 16);
+        assert_eq!(build.len(), exe.as_os_str().len() + 3 * 8 + 4 * 8);
+    }
+
+    /// Another file of the same size at the same path, renamed over it as a link or an install
+    /// writes one, is another build; the file untouched, or named through a link, is the same.
+    #[test]
+    fn a_file_renamed_over_is_another_build() {
+        let dir = Scratch::new("build");
+        let path = dir.0.join("qemu");
+        std::fs::write(&path, [1; 64]).unwrap();
+        let first = file_build(&path).unwrap();
+        assert_eq!(file_build(&path), Some(first.clone()), "untouched, the same");
+        let link = dir.0.join("current");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert_eq!(file_build(&link), Some(first.clone()), "through a link, the file's");
+        let next = dir.0.join("qemu.new");
+        std::fs::write(&next, [2; 64]).unwrap();
+        std::fs::rename(&next, &path).unwrap();
+        assert_ne!(file_build(&path), Some(first), "a new file of the same size");
+        assert_eq!(file_build(&dir.0.join("none")), None);
     }
 
     /// Any damage reads the whole file as none, and it is started again: a flipped byte of a
