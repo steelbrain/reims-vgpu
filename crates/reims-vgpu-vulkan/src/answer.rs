@@ -3015,11 +3015,14 @@ mod tests {
         // A recorded near-equivalent of Metal's answer (`rt::Exactness::NearEquivalent`), or work
         // the runtime fails instead (`FailsInstead`): relayed and logged, each for one of the
         // module's reasons, named below.
-        // - `UncalibratedGpuTimes`, `UntimedCommandBuffer` and `GpuTimesFromHost`: a command
-        //   buffer's GPU times, which only the graphics lane's guest sees, as the length of the
-        //   buffer's run (its bundle's `GPUEndTime` less `GPUStartTime`, the end where the
-        //   completion reached the guest), and debug lines read. `gpu_times_from_host`
-        //   (`crate::platform`'s `device_options`) leaves the first two unreachable, and makes
+        // - `UncalibratedGpuTimes`, `LooselyCalibratedGpuTimes`, `UntimedCommandBuffer` and
+        //   `GpuTimesFromHost`: a command buffer's GPU times, which only the graphics lane's guest
+        //   sees, as the length of the buffer's run (its bundle's `GPUEndTime` less
+        //   `GPUStartTime`, the end where the completion reached the guest), and debug lines read.
+        //   `LooselyCalibratedGpuTimes` places both times by a calibration reading whose stated
+        //   deviation stayed above 20 us, the duration between them exact, so the run's length
+        //   is unchanged. `gpu_times_from_host`
+        //   (`crate::platform`'s `device_options`) leaves the first three unreachable, and makes
         //   the run's length the time from the end of its submission, or the end of its queue's
         //   run before it, to the runtime's seeing it complete: within Metal's envelope of a
         //   run's length, which counts from the GPU's start. VM boots relay `GpuTimesFromHost`,
@@ -3168,8 +3171,9 @@ mod tests {
         //   drawn content a buffer's fill over its bytes covered and the fill's bytes where it held
         //   only a clear (the runtime's measurement), and Apple documents no layout of a texture's
         //   bytes in a heap. Announced inside the heap's creator of the texture.
-        const PRECISION: [D; 15] = [
+        const PRECISION: [D; 16] = [
             D::UncalibratedGpuTimes,
+            D::LooselyCalibratedGpuTimes,
             D::UntimedCommandBuffer,
             D::GpuTimesFromHost,
             D::DontCareLoadTiles,
