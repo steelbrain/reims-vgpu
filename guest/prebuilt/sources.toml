@@ -8,7 +8,7 @@ sdk = "MacOSX27.2.sdk"
 clang = "Apple clang version 21.0.0 (clang-2100.4.1.1)"
 
 [sources]
-"crates/reims-vgpu-graphics/include/reims_graphics_wire.h" = "64493da2cd596b4fcb50f87e9dc1a4338d6ebee66a108eebfd0076629ffba678"
+"crates/reims-vgpu-graphics/include/reims_graphics_wire.h" = "d6fbb04fc8941f70e4587c31862fd1f0ffffcae767a7516e9c649a06e2c1b6ad"
 "guest/Makefile" = "bbdfa453570a31c5470eda1e171606337f278e97151cede4e37b105103235d6d"
 "guest/bundle/Info.plist" = "573c1f2fca18f70c3311818493247c3a6843cee92554a6ceffce042e476c1a97"
 "guest/bundle/Makefile" = "4382d067555e270fd1aa1a3cc93957eb3bb76712d27e8c71a260effbc1499db4"
