@@ -4,6 +4,8 @@
 use std::sync::Arc;
 
 use reims_vgpu_video::core::device_memory::MemoryLife;
+use reims_vgpu_video::core::runtime::{ExitStep, MonoTime, Rings, TimedOut};
+use reims_vgpu_video::core::sync::{Condvar, MutexGuard};
 use reims_vgpu_video::nvidia::{
     EncodeParams, EncodeProfile, EncodeRateControl, NvencEncoder, RawFrame, Tuning,
 };
@@ -27,6 +29,31 @@ fn frame(width: usize, height: usize, n: u64) -> (Vec<u8>, Vec<u8>) {
         .map(|i| u8::try_from((i % width / 4 + i / width + shift) % 256).expect("a byte"))
         .collect();
     (luma, chroma)
+}
+
+/// NVENC's settings for `profile` at `width` by `height`: constant QP, low latency, no B-frames.
+fn params(profile: EncodeProfile, width: u32, height: u32) -> EncodeParams {
+    EncodeParams {
+        profile,
+        width,
+        height,
+        frame_rate: (30, 1),
+        rate_control: EncodeRateControl::ConstantQp {
+            intra: 22,
+            predicted: 24,
+            bidirectional: 26,
+        },
+        buffer_milliseconds: 1000,
+        gop_length: Some(30),
+        b_frames: 0,
+        level: None,
+        cabac: None,
+        full_range: false,
+        colour: None,
+        display_aspect: None,
+        preset: 4,
+        tuning: Tuning::LowLatency,
+    }
 }
 
 /// Copies `length` bytes of `from` into `to` on `queue`, and waits for the copy.
@@ -104,27 +131,7 @@ fn a_picture_lands_in_an_imported_device_cache_as_it_reads_back() {
             (EncodeProfile::H264High, AnnexBCodec::H264),
             (EncodeProfile::HevcMain, AnnexBCodec::Hevc),
         ] {
-            let params = EncodeParams {
-                profile,
-                width,
-                height,
-                frame_rate: (30, 1),
-                rate_control: EncodeRateControl::ConstantQp {
-                    intra: 22,
-                    predicted: 24,
-                    bidirectional: 26,
-                },
-                buffer_milliseconds: 1000,
-                gop_length: Some(30),
-                b_frames: 0,
-                level: None,
-                cabac: None,
-                full_range: false,
-                colour: None,
-                display_aspect: None,
-                preset: 4,
-                tuning: Tuning::LowLatency,
-            };
+            let params = params(profile, width, height);
             let mut encoder =
                 NvencEncoder::new(Arc::clone(&video.gpu), &params).expect("an NVENC session");
             let mut decoder = AnnexBDecoder::new(&video.gpu, codec, &runtime);
@@ -200,4 +207,97 @@ fn a_picture_lands_in_an_imported_device_cache_as_it_reads_back() {
         drop(imported);
         drop(life);
     });
+}
+
+/// A runtime that records the name of each thread it starts, over the platform's.
+struct Naming {
+    platform: Arc<dyn Runtime>,
+    started: Mutex<Vec<&'static str>>,
+}
+
+impl Runtime for Naming {
+    fn spawn(&self, name: &'static str, body: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+        self.started.lock().push(name);
+        self.platform.spawn(name, body)
+    }
+
+    fn now(&self) -> MonoTime {
+        self.platform.now()
+    }
+
+    fn wait_until(
+        &self,
+        cv: &Condvar,
+        rings: &mut MutexGuard<'_, Rings>,
+        deadline: MonoTime,
+    ) -> TimedOut {
+        self.platform.wait_until(cv, rings, deadline)
+    }
+
+    fn exit_step(&self) -> Option<ExitStep> {
+        self.platform.exit_step()
+    }
+
+    fn arm_exit(&self) {
+        self.platform.arm_exit();
+    }
+}
+
+/// The child's role in [`an_encode_first_processs_waits_run_on_the_arms_runtime`].
+const ENCODE_FIRST_CHILD: &str = "RVG_TEST_NVIDIA_ENCODE_FIRST_CHILD";
+
+/// An encode made before any decode in a process, as a guest's first use of NVIDIA's video may
+/// be, waits on the runtime the arm opened with: the open hands it to the NVIDIA crate, so the
+/// thread NVENC's locks are made on is the runtime's, with its exit gate. Handed by the Annex B
+/// decoder alone, an encode-first process's waits ran on std's runtime, with no gate. Run in a
+/// child process of its own, in which nothing made the crate's runtime before the open.
+#[test]
+#[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
+fn an_encode_first_processs_waits_run_on_the_arms_runtime() {
+    if std::env::var_os(ENCODE_FIRST_CHILD).is_some() {
+        let platform = Arc::new(VulkanPlatform::new());
+        crate::entry::run(|_| {
+            let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
+            let naming = Arc::new(Naming {
+                platform: crate::video::runtime::PlatformRuntime::of(&platform),
+                started: Mutex::new(Vec::new()),
+            });
+            let runtime: Arc<dyn Runtime> = Arc::<Naming>::clone(&naming);
+            let video = NvidiaVideo::new(&device, &runtime).expect("NVDEC on the device's GPU");
+            let params = params(EncodeProfile::H264High, 1920, 1080);
+            let mut encoder =
+                NvencEncoder::new(Arc::clone(&video.gpu), &params).expect("an NVENC session");
+            let (luma, chroma) = frame(1920, 1080, 0);
+            let packets = (encoder.encode(&RawFrame {
+                luma: (&luma, 1920),
+                chroma: (&chroma, 1920),
+                index: 0,
+                force_idr: true,
+            }))
+            .expect("a frame NVENC takes");
+            assert!(!packets.is_empty(), "no access unit for the IDR picture");
+            for packet in packets {
+                packet.expect("a packet");
+            }
+            let started = naming.started.lock().clone();
+            assert!(
+                started.contains(&"reims-vgpu-video.nvenc-locks"),
+                "NVENC's lock thread was not the arm's runtime's: it started {started:?}"
+            );
+        });
+        return;
+    }
+    let name = "graphics::nvidia::tests::an_encode_first_processs_waits_run_on_the_arms_runtime";
+    let status = std::process::Command::new(std::env::current_exe().expect("the test"))
+        .args([
+            "--exact",
+            name,
+            "--nocapture",
+            "--test-threads=1",
+            "--ignored",
+        ])
+        .env(ENCODE_FIRST_CHILD, "1")
+        .status()
+        .expect("a child");
+    assert!(status.success(), "the child's encode: {status:?}");
 }

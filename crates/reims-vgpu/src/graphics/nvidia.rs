@@ -108,9 +108,9 @@ const MOST_IMPORTS: usize = 64;
 type MadeVideos = Vec<(u64, Weak<NvidiaVideo>)>;
 
 /// NVDEC's video for `device`'s sessions: the one they share, made on first use, the NVIDIA
-/// crate's threads and waits `runtime`'s unless its decoders made before took another's; `None`,
-/// with a line at info, where the device is not an NVIDIA GPU CUDA opens, or NVDEC decodes and
-/// NVENC encodes neither H.264 nor HEVC there.
+/// crate's threads and waits `runtime`'s, every session kind's, unless a video opened before
+/// handed it another; `None`, with a line at info, where the device is not an NVIDIA GPU CUDA
+/// opens, or NVDEC decodes and NVENC encodes neither H.264 nor HEVC there.
 pub(crate) fn open(
     device: &VulkanDevice,
     runtime: &Arc<dyn Runtime>,
@@ -170,6 +170,10 @@ impl NvidiaVideo {
             return None;
         };
         let address = format!("{domain:04x}:{bus:02x}:{slot:02x}.{function:x}");
+        // Every session kind's threads and waits in the NVIDIA crate run on `runtime`, an
+        // encoder's made before any decoder's too, and the crate arms the runtime's exit gate as
+        // CUDA loads, as a VA display takes its runtime as it opens.
+        reims_vgpu_video::nvidia::use_runtime(runtime);
         let gpu = match Gpu::open(&GpuSelector::PciBusId(address.clone())) {
             Ok(gpu) => Arc::new(gpu),
             Err(error) => {

@@ -60,9 +60,11 @@ fn fallback() -> Arc<dyn Runtime> {
     Arc::new(crate::vaapi::gated::GatedRuntime)
 }
 
-/// Makes `runtime` the one the crate's waits run on, where none was made
-/// yet: the backend's opening calls it.
-pub(crate) fn use_runtime(runtime: &Arc<dyn Runtime>) {
+/// Makes `runtime` the one the NVIDIA crate's threads and waits run on, decode's and encode's
+/// alike, where none was made yet in the process: the backend's opening calls it, before the
+/// first GPU it opens, so that an encoder made before any decoder runs on it too; an
+/// [`super::AnnexBDecoder`] hands its own where nothing did before.
+pub fn use_runtime(runtime: &Arc<dyn Runtime>) {
     RUNTIME.get_or_init(|| Arc::clone(runtime));
     // After the libraries loaded before it, as after each later ([`arm_exit`]).
     arm_exit();

@@ -89,7 +89,8 @@ impl AnnexBDecoder {
     /// A decoder of `codec` on `gpu`, with no parameter sets yet. The
     /// process's registrations of memory pictures are written into drop on
     /// a thread of `runtime`'s, and the crate's waits on the GPU run on its
-    /// clock, unless decoders made before this one made them.
+    /// clock, unless the crate was handed a runtime before ([`crate::nvidia::use_runtime`],
+    /// which the backend's opening calls, or a decoder made before).
     pub fn new(gpu: &Arc<Gpu>, codec: AnnexBCodec, runtime: &Arc<dyn Runtime>) -> Self {
         crate::nvidia::wait::use_runtime(runtime);
         crate::nvidia::zero_copy::make_registrations(runtime);

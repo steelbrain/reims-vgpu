@@ -333,11 +333,14 @@ unmapped, freed or destroyed until it has.
   - `what_each_lock_returns` and
     `a_lock_past_its_deadline_stalls_the_session_until_nvenc_is_done`
     (`src/nvidia/nvenc/encoder.rs`): NVENC's locks ([bugs.md](bugs.md), U19).
-- **reims-vgpu's NVDEC arm**, on the NVIDIA host:
-  `a_picture_lands_in_an_imported_device_cache_as_it_reads_back`
-  (`crates/reims-vgpu/src/graphics/nvidia/tests.rs`, ignored), a picture
+- **reims-vgpu's NVDEC arm**, on the NVIDIA host
+  (`crates/reims-vgpu/src/graphics/nvidia/tests.rs`, ignored):
+  `a_picture_lands_in_an_imported_device_cache_as_it_reads_back`, a picture
   copied within the GPU into a device cache CUDA imported, read through the
-  runtime as NVDEC's own read back of it.
+  runtime as NVDEC's own read back of it; and
+  `an_encode_first_processs_waits_run_on_the_arms_runtime`, an encode made
+  before any decode waiting on the runtime the arm opened with, which the open
+  hands the module (`use_runtime`).
 
 The module has no conformance suite of its own: the `vaapi` module's
 ([backends.md](backends.md), "The conformance suite").

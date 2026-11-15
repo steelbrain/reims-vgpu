@@ -7,6 +7,7 @@
 //! declarations are ours, checked against NVIDIA's headers on the test host
 //! (`layout`'s test).
 //!
+//! - [`use_runtime`] hands the crate the threads and the clock it runs on.
 //! - [`Gpu`] is a GPU and its CUDA context; [`devices`] lists the host's.
 //! - [`decode_capabilities`] and [`encoder_report`] say what NVDEC and
 //!   NVENC answer.
@@ -53,6 +54,7 @@ pub use nvenc::encoder::{
 };
 pub use nvenc::max_api_version;
 pub use probe::{EncodeCodecReport, EncoderReport, encoder_report};
+pub use wait::use_runtime;
 
 /// The host's NVIDIA GPUs, as CUDA lists them; an error where the host has
 /// no NVIDIA driver.
