@@ -21,7 +21,8 @@
 //   => case N died on signal X | exited X
 //
 // Texture buffers (MTLTextureTypeTextureBuffer, 11-14), each step a child process of its own:
-//   oracle_texdesc DEVICE CREATOR --texbuf [fixed|max]   fixed widths, then bisection (or one)
+//   oracle_texdesc DEVICE CREATOR --texbuf [fixed|max|all [F]]  fixed widths, then bisection
+//                                                     (or one), of every format (or F alone)
 //   oracle_texdesc DEVICE CREATOR --tb F W [LEN]    one texture buffer (what the children run)
 //   oracle_texdesc DEVICE CREATOR --tbread F W      one, filled and read back by kernels
 // The descriptor is MTLTextureDescriptor's textureBufferDescriptorWithPixelFormat:width:
@@ -684,10 +685,10 @@ static unsigned long long tbBisect(const char *argv0, const char *device, const 
 }
 
 static int tbSweep(const char *argv0, const char *device, id<MTLDevice> d, int creator,
-                   const char *creatorName, const char *part)
+                   const char *creatorName, const char *part, unsigned long only)
 {
-	const bool fixed = part == NULL || !strcmp(part, "fixed");
-	const bool bisect = part == NULL || !strcmp(part, "max");
+	const bool fixed = part == NULL || !strcmp(part, "fixed") || !strcmp(part, "all");
+	const bool bisect = part == NULL || !strcmp(part, "max") || !strcmp(part, "all");
 	oracle_header("oracle_texdesc --texbuf", d);
 	printf("# maxBufferLength %llu, recommendedMaxWorkingSetSize %llu", (unsigned long long)d.maxBufferLength,
 	       (unsigned long long)d.recommendedMaxWorkingSetSize);
@@ -706,6 +707,8 @@ static int tbSweep(const char *argv0, const char *device, id<MTLDevice> d, int c
 	static char words[8192];
 	for (size_t fi = 0; fixed && fi < sizeof kTbFormats / sizeof kTbFormats[0]; fi++) {
 		const MTLPixelFormat format = kTbFormats[fi].format;
+		if (only != 0 && format != only)
+			continue;
 		for (int wi = 0; wi < kTbWidthCount; wi++) {
 			enum TbOutcome o = tbStep(argv0, device, creatorName, format, kTbWidths[wi], 0, words,
 			                          sizeof words, true);
@@ -723,6 +726,8 @@ static int tbSweep(const char *argv0, const char *device, id<MTLDevice> d, int c
 	for (size_t fi = 0; bisect && fi < sizeof kTbFormats / sizeof kTbFormats[0]; fi++) {
 		const MTLPixelFormat format = kTbFormats[fi].format;
 		const unsigned bytes = kTbFormats[fi].bytes;
+		if (only != 0 && format != only)
+			continue;
 		for (int made = 1; made >= 0; made--) {
 			const enum TbOutcome atTop =
 			    tbStep(argv0, device, creatorName, format, kTbBisectTop, 0, words, sizeof words, false);
@@ -748,7 +753,7 @@ int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	if (argc < 3 || creatorOf(argv[2]) < 0) {
-		fprintf(stderr, "usage: %s DEVICE device|heap|buffer [--case N | --list | --texbuf [fixed|max] | --tb "
+		fprintf(stderr, "usage: %s DEVICE device|heap|buffer [--case N | --list | --texbuf [fixed|max|all [F]] | --tb "
 		                "FORMAT WIDTH [LEN] | --tbread FORMAT WIDTH]\n",
 		        argv[0]);
 		return 2;
@@ -756,7 +761,7 @@ int main(int argc, char **argv)
 	const int creator = creatorOf(argv[2]);
 	if (argc > 3 && !strcmp(argv[3], "--texbuf"))
 		return tbSweep(argv[0], argv[1], oracle_device(argv[1]), creator, argv[2],
-		               argc > 4 ? argv[4] : NULL);
+		               argc > 4 ? argv[4] : NULL, argc > 5 ? strtoul(argv[5], NULL, 10) : 0);
 	if (argc > 5 && !strcmp(argv[3], "--tb")) {
 		alarm(120);
 		return tbOne(oracle_device(argv[1]), creator, argv[2], (MTLPixelFormat)strtoul(argv[4], NULL, 10),
