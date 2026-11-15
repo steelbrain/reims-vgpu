@@ -14,6 +14,8 @@
 //! (`Drawables`: MoltenVK's, on macOS).
 
 #[cfg(target_os = "linux")]
+mod files;
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -24,7 +26,6 @@ use linux as host_os;
 #[cfg(target_os = "macos")]
 use macos as host_os;
 
-use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 use crate::core::platform::os::vm::{HostAddr, HostVm as _};
@@ -82,8 +83,12 @@ pub(crate) use macos::refusing_imports;
 pub(crate) use wsi::seen_devices;
 pub use wsi::{add_window_extensions, present_fences};
 
+/// A file of the host's that memory is a shared mapping of, as the library holds it: an open
+/// descriptor on Linux and macOS.
+pub type HostFile = std::os::fd::OwnedFd;
+
 /// One range of the guest's RAM as the host maps it, and the file behind it: `length` bytes at
-/// `host`, a shared mapping (`MAP_SHARED`) of `fd` from byte `offset`. A device's lease of the
+/// `host`, a shared mapping (`MAP_SHARED`) of `file` from byte `offset`. A device's lease of the
 /// guest's RAM ([`lease_guest_memory`]) is made of these.
 #[derive(Clone, Debug)]
 pub struct GuestRamFile {
@@ -94,7 +99,7 @@ pub struct GuestRamFile {
     /// The range's length in bytes.
     pub length: u64,
     /// The file.
-    pub fd: Arc<OwnedFd>,
+    pub file: Arc<HostFile>,
     /// The file offset of the range's first byte.
     pub offset: u64,
 }

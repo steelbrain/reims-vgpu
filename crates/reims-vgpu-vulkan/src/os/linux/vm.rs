@@ -139,7 +139,7 @@ use crate::core::platform::os::vm::{
 use crate::core::sync::{ReadGuard, WriterPrefRwLock};
 
 use super::budget;
-use super::files::{self, Backing, Through};
+use crate::os::files::{self, Backing, Through};
 
 /// `KERN_INVALID_ADDRESS`.
 const INVALID_ADDRESS: KernReturn = KernReturn(1);
@@ -507,7 +507,7 @@ pub(super) fn file(
     at: Option<u64>,
     length: u64,
     backing: &Backing,
-    prot: i32,
+    prot: VmProt,
 ) -> Result<u64, KernReturn> {
     let fixed = if at.is_some() { libc::MAP_FIXED } else { 0 };
     let offset = libc::off_t::try_from(backing.offset).map_err(|_| INVALID_ARGUMENT)?;
@@ -517,9 +517,9 @@ pub(super) fn file(
         libc::mmap(
             ptr(at.unwrap_or(0)),
             length.to_usize(),
-            prot,
+            prot_bits(prot),
             libc::MAP_SHARED | fixed,
-            backing.fd.as_raw_fd(),
+            backing.file.as_raw_fd(),
             offset,
         )
     };
@@ -544,8 +544,11 @@ pub(crate) fn allocate_aliasable(len: u64) -> Result<HostAddr, KernReturn> {
             return Err(NO_SPACE);
         }
         let fd = memfd(length).map_err(|_| NO_SPACE)?;
-        let backing = Backing { fd, offset: 0 };
-        let prot = libc::PROT_READ | libc::PROT_WRITE;
+        let backing = Backing {
+            file: fd,
+            offset: 0,
+        };
+        let prot = VmProt::READ | VmProt::WRITE;
         let at = file(None, length, &backing, prot)?;
         files::record(at, length, backing, prot);
         Ok(HostAddr::from_addr(at.to_usize()))
@@ -577,10 +580,10 @@ impl OwnMemory {
                 return None;
             }
             let backing = Backing {
-                fd: memfd(length).ok()?,
+                file: memfd(length).ok()?,
                 offset: 0,
             };
-            let first = file(None, length, &backing, libc::PROT_READ | libc::PROT_WRITE).ok()?;
+            let first = file(None, length, &backing, VmProt::READ | VmProt::WRITE).ok()?;
             Some((first, backing))
         })?;
         budget::own_hold(1, true);
@@ -766,7 +769,7 @@ fn put_back(at: u64, length: u64) {
 /// where the view cuts a run of its target in two.
 pub(super) fn mappings_added(pieces: &[files::Piece]) -> u64 {
     let follows = |a: &files::Piece, b: &files::Piece| {
-        Arc::ptr_eq(&a.backing.fd, &b.backing.fd)
+        Arc::ptr_eq(&a.backing.file, &b.backing.file)
             && a.backing.offset + a.length == b.backing.offset
             && a.prot == b.prot
     };
@@ -836,7 +839,7 @@ fn trace_view(target: u64, pieces: &[files::Piece]) {
         let follows = after
             .iter()
             .take_while(|p| {
-                let on = Arc::ptr_eq(&p.backing.fd, &first.backing.fd)
+                let on = Arc::ptr_eq(&p.backing.file, &first.backing.file)
                     && p.at == first.at + length
                     && p.backing.offset == first.backing.offset + length;
                 if on {
@@ -916,7 +919,7 @@ fn through(
             libc::mmap(
                 ptr(target + buf.at),
                 buf.length.to_usize(),
-                buf.prot,
+                prot_bits(buf.prot),
                 libc::MAP_SHARED | libc::MAP_FIXED,
                 buf.fd.as_raw_fd(),
                 0,
@@ -956,7 +959,7 @@ fn through(
                 at: piece.at + take,
                 length: piece.length - take,
                 backing: Backing {
-                    fd: Arc::clone(&piece.backing.fd),
+                    file: Arc::clone(&piece.backing.file),
                     offset: piece.backing.offset + take,
                 },
                 prot: piece.prot,
@@ -1234,10 +1237,12 @@ impl HostVm for LinuxVm {
         }
         let (first, length) = pages(addr, len).ok_or(INVALID_ARGUMENT)?;
         let bits = prot_bits(prot);
+        // The table holds the protection as the kernel has it: the same bits.
+        let held = VmProt(bits);
         let _views = views();
         // Core protects each mapping it made once its views are in, read and write as the views
         // already are unless it is read-only: no call where the views have the protection.
-        if files::protected(first, length, bits) {
+        if files::protected(first, length, held) {
             return Ok(());
         }
         // SAFETY: lowering or raising a range's protection is the caller's decision; a later
@@ -1245,7 +1250,7 @@ impl HostVm for LinuxVm {
         if unsafe { libc::mprotect(ptr(first), length.to_usize(), bits) } != 0 {
             return Err(refused("protect_max", true));
         }
-        files::protect(first, length, bits);
+        files::protect(first, length, held);
         Ok(())
     }
 
@@ -1877,10 +1882,10 @@ pub(crate) mod tests {
             None,
             page(),
             &Backing {
-                fd: Arc::clone(&fd),
+                file: Arc::clone(&fd),
                 offset: 0,
             },
-            libc::PROT_READ | libc::PROT_WRITE,
+            VmProt::READ | VmProt::WRITE,
         )
         .unwrap();
         // SAFETY: the page just mapped writable, unmapped right after.
@@ -1906,22 +1911,22 @@ pub(crate) mod tests {
     fn a_remap_that_fails_part_way_changes_nothing() {
         let v = vm();
         let p = page();
-        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        let rw = VmProt::READ | VmProt::WRITE;
         // The source: a run of a file of 0x11s, then a registration of a file of 0x22s whose
         // descriptor is read-only, which the kernel refuses to map shared and writable.
         let src = v.allocate_anywhere(2 * p).unwrap();
         let first = src.addr().to_u64();
         let ones = Backing {
-            fd: page_file(0x11, false),
+            file: page_file(0x11, false),
             offset: 0,
         };
         file(Some(first), p, &ones, rw).unwrap();
         files::record(first, p, ones, rw);
         let twos = Backing {
-            fd: page_file(0x22, true),
+            file: page_file(0x22, true),
             offset: 0,
         };
-        file(Some(first + p), p, &twos, libc::PROT_READ).unwrap();
+        file(Some(first + p), p, &twos, VmProt::READ).unwrap();
         let held = files::Registration::new(first + p, p, twos);
         assert_eq!(files::pieces(first, 2 * p).map(|ps| ps.len()), Some(2));
 
@@ -1999,13 +2004,20 @@ pub(crate) mod tests {
             None,
             page(),
             &Backing {
-                fd: Arc::clone(&fd),
+                file: Arc::clone(&fd),
                 offset: 0,
             },
-            3,
+            VmProt::READ | VmProt::WRITE,
         )
         .unwrap();
-        let held = files::Registration::new(at, page(), Backing { fd, offset: 0 });
+        let held = files::Registration::new(
+            at,
+            page(),
+            Backing {
+                file: fd,
+                offset: 0,
+            },
+        );
         let ram = HostAddr::from_addr(at.to_usize());
         assert_eq!(v.deallocate(ram, page()), INVALID_ARGUMENT);
         assert!(mapped(ram));

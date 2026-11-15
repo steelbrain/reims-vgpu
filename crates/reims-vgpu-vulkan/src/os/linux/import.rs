@@ -90,8 +90,8 @@ use crate::core::sync::Mutex;
 use metal2vulkan_runtime as rt;
 
 use super::budget;
-use super::files;
 use super::vm;
+use crate::os::files;
 
 /// Whether the runtime makes read-only memory, and memory made with `MTLResourceOptions` bit 24, over a copy of it whose GPU writes it drops, where Metal's GPU
 /// keeps them from the memory itself: on Linux, where the runtime's device answers no to
@@ -1640,7 +1640,7 @@ mod tests {
                 round,
             };
             let (first, end) = (check.view, check.view + n * PAGE);
-            let file = Arc::clone(&files::pieces(check.own, n * PAGE).unwrap()[0].backing.fd);
+            let file = Arc::clone(&files::pieces(check.own, n * PAGE).unwrap()[0].backing.file);
             assert!(
                 files::through_pieces(first, end).is_empty(),
                 "mapped from its files"

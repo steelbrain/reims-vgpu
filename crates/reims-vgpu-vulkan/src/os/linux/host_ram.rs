@@ -66,7 +66,7 @@ use crate::core::num::ToU64 as _;
 use crate::core::sync::Mutex;
 use metal2vulkan_runtime as rt;
 
-use super::files;
+use crate::os::files;
 
 /// One lease's RAM as the devices are handed it: the runtime's RAM of its ranges (`None` where
 /// the runtime refused them), and each device's use of it, which ends with the lease, before the
@@ -434,7 +434,7 @@ mod tests {
             host: at,
             guest: 0,
             length,
-            fd,
+            file: fd,
             offset: 0,
         }]);
         let over = |offset: u64, length: u64| {
@@ -554,7 +554,7 @@ mod tests {
             host: at,
             guest: 0,
             length,
-            fd,
+            file: fd,
             offset: 0,
         }]);
         let q = device.new_command_queue().unwrap();
@@ -663,7 +663,7 @@ mod tests {
             host: at,
             guest: 0,
             length,
-            fd,
+            file: fd,
             offset: 0,
         }]);
         // SAFETY: the RAM's first pages, mapped until the end, which no GPU work uses now.
@@ -788,7 +788,7 @@ mod tests {
             host: at,
             guest: 0,
             length,
-            fd,
+            file: fd,
             offset: 0,
         }]);
         // SAFETY: the RAM's first pages, mapped until the end, which no GPU work uses now.
@@ -916,7 +916,7 @@ mod tests {
             host: at,
             guest: 0,
             length,
-            fd: std::sync::Arc::clone(&fd),
+            file: std::sync::Arc::clone(&fd),
             offset: 0,
         }]);
         let counts = || {
@@ -1176,7 +1176,7 @@ mod tests {
             host: at,
             guest: 0,
             length,
-            fd: std::sync::Arc::clone(&fd),
+            file: std::sync::Arc::clone(&fd),
             offset: 0,
         }]);
         let counts = || {
@@ -1378,7 +1378,7 @@ mod tests {
             host: at,
             guest: 0,
             length,
-            fd,
+            file: fd,
             offset: 0,
         }]);
         let ram =
@@ -1493,7 +1493,7 @@ mod tests {
             host: at,
             guest: 0,
             length,
-            fd,
+            file: fd,
             offset: 0,
         }]);
         let ram =

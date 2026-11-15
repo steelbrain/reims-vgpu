@@ -1,18 +1,18 @@
 //! The process's backing table: which file, from which offset, each byte of the memory the
 //! library may make a view of shows, so that a view is made by mapping files and never by
-//! remapping addresses, which Linux has no call for (Mach's `mach_vm_remap`).
+//! remapping addresses, which Linux has no call for (Mach's `mach_vm_remap`). The OS's VM maps
+//! what it records: Linux's (`super::linux`'s `vm`) with `mmap` of memfds.
 //!
 //! Two kinds of entry:
 //! - **Registrations** of memory the library does not map itself: the guest's RAM, a shared
 //!   mapping of the files the host names in its memory map (the `guest_memory` lease of the
-//!   memory map's device), and memory of the library's own (`super::vm::OwnMemory`). One
-//!   registered again over the
-//!   same descriptor and offset is counted, and goes with the last. The C API duplicates the
-//!   host's descriptors for each device it makes, so devices over the same RAM register it each
-//!   under its own: a byte resolves through the first registration that holds it, and every one
-//!   shows the same file pages.
-//! - **Runs** the library mapped: every view [`super::vm::LinuxVm`] made, and every range of
-//!   [`super::vm::allocate_aliasable`]. A run shows `end - first` bytes of its file from its
+//!   memory map's device), and memory of the library's own (`super::linux`'s `vm::OwnMemory`).
+//!   One registered again over the same descriptor and offset is counted, and goes with the
+//!   last. The C API duplicates the host's descriptors for each device it makes, so devices over
+//!   the same RAM register it each under its own: a byte resolves through the first registration
+//!   that holds it, and every one shows the same file pages.
+//! - **Runs** the library mapped: every view [`super::linux::LinuxVm`] made, and every range of
+//!   [`super::linux::allocate_aliasable`]. A run shows `end - first` bytes of its file from its
 //!   offset, with the protection last set on it. Runs never overlap: a new run replaces what of
 //!   another it covers, and an unmap or an overwrite drops what of the runs it covers.
 //!
@@ -28,9 +28,9 @@
 //! its runs, so the count follows every view, protect and unmap. Registrations map nothing.
 //!
 //! **Runs mapped through a dma-buf.** A view of many runs of file pages may be mapped as a few
-//! dma-bufs of those pages instead, one mapping each whatever the pages' order
-//! ([`super::vm`]'s module docs, "Views through dma-bufs"). Each of its runs still names the file
-//! and offset it shows, which is what a view of it or a dma-buf of its pages is made of, and also
+//! dma-bufs of those pages instead, one mapping each whatever the pages' order (`super::linux`'s
+//! `vm` module docs, "Views through dma-bufs"). Each of its runs still names the file and offset
+//! it shows, which is what a view of it or a dma-buf of its pages is made of, and also
 //! the dma-buf it is mapped through and its offset there ([`Through`]): two such neighbours are
 //! one mapping where they lie in the same dma-buf, the second at the offset the first ends at,
 //! with the same protection, whatever their files; a run mapped through a dma-buf and one mapped
@@ -39,30 +39,30 @@
 //! The table is a leaf lock: nothing is called under it.
 
 use std::collections::BTreeMap;
-use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 use crate::core::num::ToU64 as _;
+use crate::core::platform::os::vm::VmProt;
 use crate::core::sync::Mutex;
 
-use crate::os::GuestRamFile;
+use crate::os::HostFile;
 
 /// The file behind a range: an open descriptor, and the file offset of the range's first byte.
 #[derive(Clone, Debug)]
 pub(crate) struct Backing {
     /// The file, held while any entry or view names it.
-    pub(crate) fd: Arc<OwnedFd>,
+    pub(crate) file: Arc<HostFile>,
     /// The file offset of the range's first byte.
     pub(crate) offset: u64,
 }
 
-/// A run of the library's own mapping: its end, its file, the protection set on it (`PROT_*`),
-/// and the dma-buf it is mapped through, if it is (module docs).
+/// A run of the library's own mapping: its end, its file, the protection set on it (core's
+/// `VmProt`), and the dma-buf it is mapped through, if it is (module docs).
 #[derive(Clone, Debug)]
 struct Run {
     end: u64,
     backing: Backing,
-    prot: i32,
+    prot: VmProt,
     through: Option<Through>,
 }
 
@@ -84,7 +84,7 @@ impl Through {
 }
 
 /// A registration: `first..end` shows `backing`, read and write, `count` times registered, `ram`
-/// of them as the guest's RAM ([`lease_guest_memory`]).
+/// of them as the guest's RAM ([`Registration::guest_ram`]).
 #[derive(Debug)]
 struct Registered {
     first: u64,
@@ -101,7 +101,7 @@ pub(crate) struct Piece {
     pub(crate) at: u64,
     pub(crate) length: u64,
     pub(crate) backing: Backing,
-    pub(crate) prot: i32,
+    pub(crate) prot: VmProt,
 }
 
 /// The table (module docs).
@@ -127,7 +127,7 @@ fn joined(a_first: u64, a: &Run, b_first: u64, b: &Run) -> bool {
     let length = a.end - a_first;
     let follows = match (a.through, b.through) {
         (None, None) => {
-            Arc::ptr_eq(&a.backing.fd, &b.backing.fd)
+            Arc::ptr_eq(&a.backing.file, &b.backing.file)
                 && a.backing.offset + length == b.backing.offset
         }
         (Some(a), Some(b)) => a.buf == b.buf && a.offset + length == b.offset,
@@ -178,9 +178,9 @@ impl Table {
 
     /// Where the byte at `offset` of the file `fd` lies in a range of the guest's RAM a lease
     /// registered: its host address there, and the bytes from it to the range's end.
-    fn ram_at(&self, fd: &Arc<OwnedFd>, offset: u64) -> Option<(u64, u64)> {
+    fn ram_at(&self, file: &Arc<HostFile>, offset: u64) -> Option<(u64, u64)> {
         (self.registered.iter())
-            .filter(|r| r.ram > 0 && Arc::ptr_eq(&r.backing.fd, fd))
+            .filter(|r| r.ram > 0 && Arc::ptr_eq(&r.backing.file, file))
             .find_map(|r| {
                 let into = offset.checked_sub(r.backing.offset)?;
                 let length = r.end - r.first;
@@ -202,7 +202,7 @@ impl Table {
         &self,
         first: u64,
         end: u64,
-        mut each: impl FnMut(&Arc<OwnedFd>, u64, i32, u64, u64) -> bool,
+        mut each: impl FnMut(&Arc<HostFile>, u64, VmProt, u64, u64) -> bool,
     ) -> bool {
         if first >= end {
             return true;
@@ -221,7 +221,7 @@ impl Table {
             }
             let to = run.end.min(end);
             let offset = run.backing.offset + (at - start);
-            if !each(&run.backing.fd, offset, run.prot, at, to) {
+            if !each(&run.backing.file, offset, run.prot, at, to) {
                 return false;
             }
             at = to;
@@ -235,7 +235,7 @@ impl Table {
         &self,
         at: &mut u64,
         to: u64,
-        each: &mut impl FnMut(&Arc<OwnedFd>, u64, i32, u64, u64) -> bool,
+        each: &mut impl FnMut(&Arc<HostFile>, u64, VmProt, u64, u64) -> bool,
     ) -> bool {
         while *at < to {
             let Some(r) = self.registered_at(*at) else {
@@ -243,7 +243,7 @@ impl Table {
             };
             let stop = r.end.min(to);
             let offset = r.backing.offset + (*at - r.first);
-            if !each(&r.backing.fd, offset, READ_WRITE, *at, stop) {
+            if !each(&r.backing.file, offset, READ_WRITE, *at, stop) {
                 return false;
             }
             *at = stop;
@@ -263,7 +263,7 @@ impl Table {
         let tail = Run {
             end: run.end,
             backing: Backing {
-                fd: Arc::clone(&run.backing.fd),
+                file: Arc::clone(&run.backing.file),
                 offset: run.backing.offset + (at - first),
             },
             prot: run.prot,
@@ -310,7 +310,7 @@ impl Table {
         first: u64,
         end: u64,
         backing: Backing,
-        prot: i32,
+        prot: VmProt,
         through: Option<Through>,
     ) {
         self.forget(first, end);
@@ -335,10 +335,10 @@ impl Table {
         let Some(end) = first.checked_add(length) else {
             return false;
         };
-        self.walk(first, end, |fd, offset, prot, from, to| {
+        self.walk(first, end, |file, offset, prot, from, to| {
             match into.last_mut() {
                 Some(last)
-                    if Arc::ptr_eq(&last.backing.fd, fd)
+                    if Arc::ptr_eq(&last.backing.file, file)
                         && last.backing.offset + last.length == offset
                         && last.prot == prot =>
                 {
@@ -348,7 +348,7 @@ impl Table {
                     at: at + (from - first),
                     length: to - from,
                     backing: Backing {
-                        fd: Arc::clone(fd),
+                        file: Arc::clone(file),
                         offset,
                     },
                     prot,
@@ -402,7 +402,7 @@ impl Table {
     /// Sets the protection of what of the runs lies in `first..end` (`protect`), cutting a run it
     /// changes where the range ends inside it. A run that has the protection already stays as it
     /// is, as the kernel leaves a mapping that a protect does not change.
-    fn protect(&mut self, first: u64, end: u64, prot: i32) {
+    fn protect(&mut self, first: u64, end: u64, prot: VmProt) {
         if first >= end {
             return;
         }
@@ -425,12 +425,12 @@ impl Table {
         }
     }
 
-    /// Whether every byte of `first..end` has `bit` (`PROT_*`) in its protection: `None` where
+    /// Whether every byte of `first..end` has `bit` in its protection: `None` where
     /// a byte lies in neither a run nor a registration.
-    fn all_have(&self, first: u64, end: u64, bit: i32) -> Option<bool> {
+    fn all_have(&self, first: u64, end: u64, bit: VmProt) -> Option<bool> {
         let mut all = true;
         let known = self.walk(first, end, |_, _, prot, _, _| {
-            all &= prot & bit != 0;
+            all &= prot.raw() & bit.raw() != 0;
             true
         });
         known.then_some(all)
@@ -438,7 +438,7 @@ impl Table {
 }
 
 /// The protection of a registration's bytes: read and write.
-const READ_WRITE: i32 = libc::PROT_READ | libc::PROT_WRITE;
+const READ_WRITE: VmProt = VmProt(VmProt::READ.raw() | VmProt::WRITE.raw());
 
 /// The kernel's mappings the table's runs take (module docs): every view the library made and
 /// every range a view can be made of.
@@ -447,8 +447,8 @@ pub(crate) fn mappings() -> u64 {
 }
 
 /// The kernel's mappings the table's runs in `first..end` take, as [`mappings`] counts them:
-/// what a fold of them would free (`super::vm::fold_idle`), and in tests a range's count to set
-/// beside the kernel's.
+/// what a fold of them would free (`super::linux`'s `vm::fold_idle`), and in tests a range's
+/// count to set beside the kernel's.
 pub(crate) fn mappings_between(first: u64, end: u64) -> u64 {
     let table = TABLE.lock();
     let mut count = 0u64;
@@ -464,7 +464,7 @@ pub(crate) fn mappings_between(first: u64, end: u64) -> u64 {
 
 /// The spans of the table's runs mapped from their files, in order, each of such runs that follow
 /// one another in the address space with none through a dma-buf between: what a fold may map
-/// through dma-bufs instead (`super::vm::fold_idle`).
+/// through dma-bufs instead (`super::linux`'s `vm::fold_idle`).
 pub(crate) fn file_spans() -> Vec<std::ops::Range<u64>> {
     let table = TABLE.lock();
     let mut spans: Vec<std::ops::Range<u64>> = Vec::new();
@@ -482,7 +482,7 @@ pub(crate) fn file_spans() -> Vec<std::ops::Range<u64>> {
 
 /// `length` bytes from `first` show `backing` from now on, with protection `prot`: what of
 /// another run they cover goes.
-pub(crate) fn record(first: u64, length: u64, backing: Backing, prot: i32) {
+pub(crate) fn record(first: u64, length: u64, backing: Backing, prot: VmProt) {
     TABLE
         .lock()
         .record(first, first.saturating_add(length), backing, prot, None);
@@ -571,7 +571,7 @@ pub(crate) fn record_through(target: u64, pieces: Vec<(Piece, Through)>) {
 }
 
 /// The runs in `first..end` mapped through a dma-buf, cut to it, in order, as pieces from
-/// `first`: what an import's unfold maps from their files (`super::vm::unfold`).
+/// `first`: what an import's unfold maps from their files (`super::linux`'s `vm::unfold`).
 pub(crate) fn through_pieces(first: u64, end: u64) -> Vec<Piece> {
     let table = TABLE.lock();
     let from = table.run_at(first).map_or(first, |(at, _)| at);
@@ -583,7 +583,7 @@ pub(crate) fn through_pieces(first: u64, end: u64) -> Vec<Piece> {
                 at: start - first,
                 length: run.end.min(end) - start,
                 backing: Backing {
-                    fd: Arc::clone(&run.backing.fd),
+                    file: Arc::clone(&run.backing.file),
                     offset: run.backing.offset + (start - at),
                 },
                 prot: run.prot,
@@ -594,7 +594,7 @@ pub(crate) fn through_pieces(first: u64, end: u64) -> Vec<Piece> {
 
 /// Sets the protection of what of the runs lies in `length` bytes from `first` to `prot`,
 /// cutting a run it changes at its ends.
-pub(crate) fn protect(first: u64, length: u64, prot: i32) {
+pub(crate) fn protect(first: u64, length: u64, prot: VmProt) {
     TABLE
         .lock()
         .protect(first, first.saturating_add(length), prot);
@@ -604,7 +604,7 @@ pub(crate) fn protect(first: u64, length: u64, prot: i32) {
 /// already, so a protect of them to `prot` changes no mapping: the table's runs have the
 /// protections the kernel's mappings of them have, as each map and protect of them records what
 /// it set. Bytes of a registration, which the table does not map, never are.
-pub(crate) fn protected(first: u64, length: u64, prot: i32) -> bool {
+pub(crate) fn protected(first: u64, length: u64, prot: VmProt) -> bool {
     let Some(end) = first.checked_add(length) else {
         return false;
     };
@@ -631,13 +631,13 @@ pub(crate) fn protected(first: u64, length: u64, prot: i32) -> bool {
 /// lies in neither.
 pub(crate) fn readable(first: u64, length: u64) -> Option<bool> {
     let end = first.checked_add(length)?;
-    TABLE.lock().all_have(first, end, libc::PROT_READ)
+    TABLE.lock().all_have(first, end, VmProt::READ)
 }
 
 /// As [`readable`], for write access.
 pub(crate) fn writable(first: u64, length: u64) -> Option<bool> {
     let end = first.checked_add(length)?;
-    TABLE.lock().all_have(first, end, libc::PROT_WRITE)
+    TABLE.lock().all_have(first, end, VmProt::WRITE)
 }
 
 /// Whether a byte of `length` bytes from `first` lies in a registration.
@@ -657,7 +657,7 @@ pub(crate) struct Registration {
     first: u64,
     end: u64,
     backing: Backing,
-    /// Whether it registers a range of the guest's RAM ([`lease_guest_memory`]).
+    /// Whether it registers a range of the guest's RAM ([`Registration::guest_ram`]).
     ram: bool,
 }
 
@@ -668,8 +668,9 @@ impl Registration {
         Registration::made(first, length, backing, false)
     }
 
-    /// [`Registration::new`], of a range of the guest's RAM.
-    fn guest_ram(first: u64, length: u64, backing: Backing) -> Registration {
+    /// [`Registration::new`], of a range of the guest's RAM (the OS's lease of it, Linux's
+    /// `super::linux::lease`).
+    pub(crate) fn guest_ram(first: u64, length: u64, backing: Backing) -> Registration {
         Registration::made(first, length, backing, true)
     }
 
@@ -707,19 +708,19 @@ impl Registration {
 /// follow on joined; `None` where a byte shows no page of the guest's RAM (memory of the
 /// library's own), shows nothing, or is mapped without
 /// write permission: a device pins imported pages for writing, so read-only memory keeps the
-/// imports it has (`super::import`'s module docs).
+/// imports it has (`super::linux`'s `import` module docs).
 pub(crate) fn guest_ram_runs(first: u64, length: u64) -> Option<Vec<(u64, u64)>> {
     let end = first.checked_add(length)?;
     let table = TABLE.lock();
     let mut runs: Vec<(u64, u64)> = Vec::new();
-    let all = table.walk(first, end, |fd, mut offset, prot, mut at, to| {
-        if prot & libc::PROT_WRITE == 0 {
+    let all = table.walk(first, end, |file, mut offset, prot, mut at, to| {
+        if prot.raw() & VmProt::WRITE.raw() == 0 {
             return false;
         }
         // A stretch may run past the end of the range of the RAM its offset starts in, into
         // another's, or none.
         while at < to {
-            let Some((host, room)) = table.ram_at(fd, offset) else {
+            let Some((host, room)) = table.ram_at(file, offset) else {
                 return false;
             };
             let take = (to - at).min(room);
@@ -735,49 +736,11 @@ pub(crate) fn guest_ram_runs(first: u64, length: u64) -> Option<Vec<(u64, u64)>>
     all.then_some(runs)
 }
 
-/// The guest's RAM registered while a device made over it lives: the `guest_memory` lease its
-/// device holds, made of the host's memory map, and dropped after core's teardown. Views of the
-/// guest's pages are made of these files.
-#[derive(Debug)]
-pub struct GuestMemoryLease {
-    /// The RAM as the devices that take it whole are handed it (`super::host_ram`), let go of
-    /// first.
-    _ram: Arc<super::host_ram::LeasedRam>,
-    _registrations: Vec<Registration>,
-}
-
-/// Registers each range of the guest's RAM the host names a file behind: counted where the same
-/// range was registered already over the same descriptor (module docs). Warns where the views'
-/// budget of mappings is short of the guest's RAM (the `budget` module).
-pub fn lease_guest_memory(ranges: impl IntoIterator<Item = GuestRamFile>) -> GuestMemoryLease {
-    let ranges: Vec<GuestRamFile> = ranges.into_iter().collect();
-    let ram: Vec<(u64, u64)> = ranges.iter().map(|r| (r.host, r.length)).collect();
-    let registrations: Vec<Registration> = ranges
-        .into_iter()
-        .map(|r| {
-            let backing = Backing {
-                fd: r.fd,
-                offset: r.offset,
-            };
-            Registration::guest_ram(r.host, r.length, backing)
-        })
-        .collect();
-    let guest_ram = registrations
-        .iter()
-        .map(|r| r.end - r.first)
-        .fold(0u64, u64::saturating_add);
-    super::budget::warn_if_short(guest_ram);
-    GuestMemoryLease {
-        _ram: super::host_ram::lease(&ram),
-        _registrations: registrations,
-    }
-}
-
 impl Registered {
     /// Whether this registers `first..end` over `backing`.
     fn is(&self, first: u64, end: u64, backing: &Backing) -> bool {
         (self.first, self.end, self.backing.offset) == (first, end, backing.offset)
-            && Arc::ptr_eq(&self.backing.fd, &backing.fd)
+            && Arc::ptr_eq(&self.backing.file, &backing.file)
     }
 }
 
@@ -799,21 +762,21 @@ impl Drop for Registration {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A file for the tests' backings.
-    fn file() -> Arc<OwnedFd> {
+    pub(crate) fn file() -> Arc<HostFile> {
         let name = c"rvg-files-test";
         // SAFETY: a NUL-terminated name; the descriptor is owned from here on.
         let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
         assert!(fd >= 0);
         // SAFETY: a descriptor this test just made, owned once.
-        Arc::new(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) })
+        Arc::new(unsafe { <HostFile as std::os::fd::FromRawFd>::from_raw_fd(fd) })
     }
 
     /// The pieces' (offset in the range, length, file offset).
-    fn shape(pieces: &[Piece]) -> Vec<(u64, u64, u64)> {
+    pub(crate) fn shape(pieces: &[Piece]) -> Vec<(u64, u64, u64)> {
         pieces
             .iter()
             .map(|p| (p.at, p.length, p.backing.offset))
@@ -829,11 +792,11 @@ mod tests {
         let f = file();
         let base = 0x7a00_0000_0000;
         let backing = |offset| Backing {
-            fd: Arc::clone(&f),
+            file: Arc::clone(&f),
             offset,
         };
         let held = Registration::new(base, 0x10_000, backing(0x100_000));
-        record(base + 0x20_000, 0x2000, backing(0x5000), libc::PROT_READ);
+        record(base + 0x20_000, 0x2000, backing(0x5000), VmProt::READ);
         assert_eq!(
             shape(&pieces(base + 0x1000, 0x2000).unwrap()),
             [(0, 0x2000, 0x101_000)]
@@ -846,7 +809,7 @@ mod tests {
         assert!(pieces(base + 0x1f_000, 0x2000).is_none());
         assert_eq!(readable(base + 0x20_000, 0x2000), Some(true));
         assert_eq!(readable(base, 0x10_000), Some(true));
-        protect(base + 0x21_000, 0x1000, libc::PROT_NONE);
+        protect(base + 0x21_000, 0x1000, VmProt::NONE);
         assert_eq!(readable(base + 0x20_000, 0x1000), Some(true));
         assert_eq!(readable(base + 0x20_000, 0x2000), Some(false));
         assert_eq!(
@@ -866,16 +829,11 @@ mod tests {
         let f = file();
         let base = 0x7b00_0000_0000;
         let backing = |offset| Backing {
-            fd: Arc::clone(&f),
+            file: Arc::clone(&f),
             offset,
         };
-        record(
-            base,
-            0x4000,
-            backing(0x10_000),
-            libc::PROT_READ | libc::PROT_WRITE,
-        );
-        record(base + 0x1000, 0x1000, backing(0x90_000), libc::PROT_READ);
+        record(base, 0x4000, backing(0x10_000), READ_WRITE);
+        record(base + 0x1000, 0x1000, backing(0x90_000), VmProt::READ);
         assert_eq!(
             shape(&pieces(base, 0x4000).unwrap()),
             [
@@ -894,58 +852,27 @@ mod tests {
         assert!(pieces(base, 1).is_none());
     }
 
-    /// A lease registers each range of the guest's RAM at its file offset, until it drops
-    #[test]
-    fn a_lease_registers_the_guests_ram_while_held() {
-        let f = file();
-        let base = 0x7d00_0000_0000;
-        let ram = |host, length, offset| GuestRamFile {
-            host,
-            guest: offset,
-            length,
-            fd: Arc::clone(&f),
-            offset,
-        };
-        let lease =
-            lease_guest_memory([ram(base, 0x4000, 0), ram(base + 0x10_000, 0x2000, 0x4000)]);
-        assert_eq!(
-            shape(&pieces(base + 0x1000, 0x1000).unwrap()),
-            [(0, 0x1000, 0x1000)]
-        );
-        assert_eq!(
-            shape(&pieces(base + 0x11_000, 0x1000).unwrap()),
-            [(0, 0x1000, 0x5000)]
-        );
-        assert!(pieces(base + 0x4000, 0x1000).is_none());
-        drop(lease);
-        assert!(pieces(base, 0x1000).is_none());
-        assert!(pieces(base + 0x10_000, 0x1000).is_none());
-    }
-
-    /// The guest's RAM behind a view resolves to the leased ranges' own addresses, a run per stretch
-    /// that follows on in one range, in the view's order; bytes of other memory resolve to none
+    /// The guest's RAM behind a view resolves to the registered ranges' own addresses, a run per
+    /// stretch that follows on in one range, in the view's order; bytes of other memory resolve
+    /// to none
     #[test]
     fn a_views_bytes_resolve_to_the_guests_ram() {
         let f = file();
         let other = file();
         let base = 0x7e00_0000_0000;
-        let ram = |host, length, offset| GuestRamFile {
-            host,
-            guest: offset,
-            length,
-            fd: Arc::clone(&f),
-            offset,
-        };
-        let lease =
-            lease_guest_memory([ram(base, 0x4000, 0), ram(base + 0x10_000, 0x4000, 0x4000)]);
         let backing = |offset| Backing {
-            fd: Arc::clone(&f),
+            file: Arc::clone(&f),
             offset,
         };
+        // The two ranges a lease of the guest's RAM registers (Linux's `lease`).
+        let lease = [
+            Registration::guest_ram(base, 0x4000, backing(0)),
+            Registration::guest_ram(base + 0x10_000, 0x4000, backing(0x4000)),
+        ];
         // A view of five pages: the second range's first two, then the first range's last page,
         // then its first two backwards.
         let view = base + 0x40_000;
-        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        let rw = READ_WRITE;
         record(view, 0x2000, backing(0x4000), rw);
         record(view + 0x2000, 0x1000, backing(0x3000), rw);
         record(view + 0x3000, 0x1000, backing(0x1000), rw);
@@ -965,14 +892,14 @@ mod tests {
             Some(vec![(base + 0xff0, 0x20)])
         );
         // A read-only page of the RAM is left out, as is a page of another file, or of nothing.
-        protect(view + 0x2000, 0x1000, libc::PROT_READ);
+        protect(view + 0x2000, 0x1000, VmProt::READ);
         assert_eq!(guest_ram_runs(view, 0x3000), None);
         protect(view + 0x2000, 0x1000, rw);
         record(
             view + 0x5000,
             0x1000,
             Backing {
-                fd: Arc::clone(&other),
+                file: Arc::clone(&other),
                 offset: 0,
             },
             rw,
@@ -984,7 +911,7 @@ mod tests {
             base + 0x80_000,
             0x1000,
             Backing {
-                fd: Arc::clone(&other),
+                file: Arc::clone(&other),
                 offset: 0,
             },
         );
@@ -1004,10 +931,10 @@ mod tests {
         let mut t = Table::default();
         let base = 0x1000_0000;
         let page = 0x1000;
-        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        let rw = READ_WRITE;
         let at = |i: u64| base + i * page;
-        let b = |fd: &Arc<OwnedFd>, offset| Backing {
-            fd: Arc::clone(fd),
+        let b = |fd: &Arc<HostFile>, offset| Backing {
+            file: Arc::clone(fd),
             offset,
         };
         // Four pages of one file in order: one mapping.
@@ -1020,7 +947,7 @@ mod tests {
         t.record(at(5), at(6), b(&g, 0xa000), rw, None);
         assert_eq!(t.mappings(), 3);
         // The second page read-only cuts the first mapping in three; read and write again, one.
-        t.protect(at(1), at(2), libc::PROT_READ);
+        t.protect(at(1), at(2), VmProt::READ);
         assert_eq!(t.mappings(), 5);
         t.protect(at(1), at(2), rw);
         assert_eq!(t.mappings(), 3);
@@ -1045,9 +972,9 @@ mod tests {
         let mut t = Table::default();
         let page = 0x1000;
         let at = |i: u64| 0x3000_0000 + i * page;
-        let rw = libc::PROT_READ | libc::PROT_WRITE;
-        let b = |fd: &Arc<OwnedFd>, offset| Backing {
-            fd: Arc::clone(fd),
+        let rw = READ_WRITE;
+        let b = |fd: &Arc<HostFile>, offset| Backing {
+            file: Arc::clone(fd),
             offset,
         };
         // Pages of two files backwards, through one dma-buf, then through a second: two mappings.
@@ -1064,7 +991,7 @@ mod tests {
         }
         assert_eq!(t.mappings(), 2);
         // Its second page read-only: three more; read and write again, as before.
-        t.protect(at(1), at(2), libc::PROT_READ);
+        t.protect(at(1), at(2), VmProt::READ);
         assert_eq!(t.mappings(), 4);
         t.protect(at(1), at(2), rw);
         assert_eq!(t.mappings(), 2);
@@ -1096,19 +1023,19 @@ mod tests {
         let f = file();
         let mut t = Table::default();
         let at = |i: u64| 0x2000_0000 + i * 0x1000;
-        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        let rw = READ_WRITE;
         let backing = Backing {
-            fd: Arc::clone(&f),
+            file: Arc::clone(&f),
             offset: 0,
         };
         t.record(at(0), at(4), backing, rw, None);
         t.protect(at(1), at(3), rw);
         assert_eq!((t.runs.len(), t.mappings()), (1, 1), "unchanged");
-        t.protect(at(1), at(2), libc::PROT_READ);
+        t.protect(at(1), at(2), VmProt::READ);
         assert_eq!((t.runs.len(), t.mappings()), (3, 3), "its second page");
-        t.protect(at(0), at(4), libc::PROT_READ);
+        t.protect(at(0), at(4), VmProt::READ);
         assert_eq!(t.mappings(), 1, "all of it read-only: one mapping");
-        assert!(t.runs.values().all(|run| run.prot == libc::PROT_READ));
+        assert!(t.runs.values().all(|run| run.prot == VmProt::READ));
         t.forget(at(0), at(4));
         assert_eq!((t.mappings(), t.joins, t.runs.len()), (0, 0, 0));
     }
@@ -1119,9 +1046,9 @@ mod tests {
     fn runs_that_follow_on_resolve_as_one_piece() {
         let (f, g) = (file(), file());
         let base = 0x7e00_0000_0000;
-        let rw = libc::PROT_READ | libc::PROT_WRITE;
-        let backing = |fd: &Arc<OwnedFd>, offset| Backing {
-            fd: Arc::clone(fd),
+        let rw = READ_WRITE;
+        let backing = |fd: &Arc<HostFile>, offset| Backing {
+            file: Arc::clone(fd),
             offset,
         };
         for i in 0..4 {
@@ -1136,7 +1063,7 @@ mod tests {
             shape(&pieces(base + 0x800, 0x3000).unwrap()),
             [(0, 0x3000, 0x8800)]
         );
-        protect(base + 0x2000, 0x1000, libc::PROT_READ);
+        protect(base + 0x2000, 0x1000, VmProt::READ);
         record(base + 0x3000, 0x1000, backing(&g, 0xb000), rw);
         assert_eq!(
             shape(&pieces(base, 0x4000).unwrap()),
@@ -1155,20 +1082,20 @@ mod tests {
     fn protected_is_runs_of_the_protection_alone() {
         let f = file();
         let base = 0x7f00_0000_0000;
-        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        let rw = READ_WRITE;
         let backing = || Backing {
-            fd: Arc::clone(&f),
+            file: Arc::clone(&f),
             offset: 0,
         };
         record(base, 0x2000, backing(), rw);
         record(base + 0x2000, 0x1000, backing(), rw);
         assert!(protected(base, 0x3000, rw));
-        assert!(!protected(base, 0x3000, libc::PROT_READ));
+        assert!(!protected(base, 0x3000, VmProt::READ));
         assert!(!protected(base, 0x4000, rw), "a byte of no run");
         let held = Registration::new(base + 0x3000, 0x1000, backing());
         assert!(!protected(base, 0x4000, rw), "a byte of a registration");
         assert_eq!(writable(base, 0x4000), Some(true));
-        protect(base + 0x1000, 0x1000, libc::PROT_READ);
+        protect(base + 0x1000, 0x1000, VmProt::READ);
         assert_eq!(
             (readable(base, 0x4000), writable(base, 0x4000)),
             (Some(true), Some(false))
@@ -1185,7 +1112,7 @@ mod tests {
         let f = file();
         let base = 0x7c00_0000_0000;
         let backing = || Backing {
-            fd: Arc::clone(&f),
+            file: Arc::clone(&f),
             offset: 0,
         };
         let first = Registration::new(base, 0x1000, backing());
@@ -1211,7 +1138,7 @@ mod tests {
             first: at(8),
             end: at(64),
             backing: Backing {
-                fd: Arc::clone(&f),
+                file: Arc::clone(&f),
                 offset: 0x1000 * page,
             },
             count: 1,
@@ -1220,14 +1147,16 @@ mod tests {
         let alone = |t: &Table, a: u64| {
             let run = (t.runs.iter()).find(|&(&s, r)| s <= a && a < r.end);
             match run {
-                Some((&s, r)) => {
-                    Some((Arc::as_ptr(&r.backing.fd), r.backing.offset + a - s, r.prot))
-                }
+                Some((&s, r)) => Some((
+                    Arc::as_ptr(&r.backing.file),
+                    r.backing.offset + a - s,
+                    r.prot,
+                )),
                 None => (t.registered.iter())
                     .find(|r| r.first <= a && a < r.end)
                     .map(|r| {
                         (
-                            Arc::as_ptr(&r.backing.fd),
+                            Arc::as_ptr(&r.backing.file),
                             r.backing.offset + a - r.first,
                             READ_WRITE,
                         )
@@ -1247,16 +1176,16 @@ mod tests {
             seed ^= seed << 17;
             seed % n
         };
-        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        let rw = READ_WRITE;
         for _ in 0..4000 {
             let first = next(72);
             let (first, end) = (at(first), at(first + 1 + next(6)));
-            let prot = if next(4) == 0 { libc::PROT_READ } else { rw };
+            let prot = if next(4) == 0 { VmProt::READ } else { rw };
             match next(5) {
                 0..=2 => {
                     let fd = if next(4) == 0 { &g } else { &f };
                     let backing = Backing {
-                        fd: Arc::clone(fd),
+                        file: Arc::clone(fd),
                         offset: (0x1000 + next(80)) * page,
                     };
                     let through = (next(3) == 0).then(|| Through {
@@ -1305,18 +1234,18 @@ mod tests {
         let (f, g) = (file(), file());
         let page = 0x1000;
         let at = |i: u64| 0x5000_0000 + i * page;
-        let rw = libc::PROT_READ | libc::PROT_WRITE;
-        let b = |fd: &Arc<OwnedFd>, offset| Backing {
-            fd: Arc::clone(fd),
+        let rw = READ_WRITE;
+        let b = |fd: &Arc<HostFile>, offset| Backing {
+            file: Arc::clone(fd),
             offset,
         };
         let shape = |t: &Table| {
-            let runs: Vec<(u64, u64, bool, u64, i32)> = (t.runs.iter())
+            let runs: Vec<(u64, u64, bool, u64, VmProt)> = (t.runs.iter())
                 .map(|(&first, r)| {
                     (
                         first,
                         r.end,
-                        Arc::ptr_eq(&r.backing.fd, &f),
+                        Arc::ptr_eq(&r.backing.file, &f),
                         r.backing.offset,
                         r.prot,
                     )
@@ -1343,7 +1272,7 @@ mod tests {
                     0 => offset,
                     _ => next(0x40) * page,
                 };
-                let prot = if next(6) == 0 { libc::PROT_READ } else { rw };
+                let prot = if next(6) == 0 { VmProt::READ } else { rw };
                 pieces.push(Piece {
                     at: (page_at - 2) * page,
                     length: pages * page,
@@ -1369,8 +1298,20 @@ mod tests {
             let mut fresh = Table::default();
             for t in [&mut one, &mut fresh] {
                 t.record(at(0), at(1), b(&g, 0xa0 * page), rw, None);
-                t.record(at(1), at(2), b(&first.backing.fd, before), first.prot, None);
-                t.record(at(30), at(31), b(&last.backing.fd, after), last.prot, None);
+                t.record(
+                    at(1),
+                    at(2),
+                    b(&first.backing.file, before),
+                    first.prot,
+                    None,
+                );
+                t.record(
+                    at(30),
+                    at(31),
+                    b(&last.backing.file, after),
+                    last.prot,
+                    None,
+                );
             }
             assert!(fresh.holds_none(at(2), at(30)));
             for piece in pieces.clone() {
@@ -1392,7 +1333,7 @@ mod tests {
         let base = 0x7980_0000_0000;
         let page = 0x1000;
         let backing = |offset| Backing {
-            fd: Arc::clone(&f),
+            file: Arc::clone(&f),
             offset,
         };
         let held = Registration::new(base, 0x10 * page, backing(0x100 * page));
@@ -1460,10 +1401,10 @@ mod tests {
     /// (default 8) of `FILES_COST_PAGES` pages (default 16,384, 64 MiB) goes through what a
     /// buffer over a pages block's view asks of the table on a device that imports views
     /// mapped from their files (Iris Xe's ANV): the resolve of its sources and the record of
-    /// its pieces (`super::vm`'s `remap_runs_shared_overwrite`), the import's write check, the
-    /// gate's write check and dma-buf pieces (`super::import`), the runs of the guest's RAM the
-    /// runtime asks for (`super::host_ram::runs`), and the teardown's forget, a mebibyte at a
-    /// time (`super::vm`'s `deallocate`). Each step's user-space instructions and cycles a page,
+    /// its pieces (Linux's `vm`'s `remap_runs_shared_overwrite`), the import's write check, the
+    /// gate's write check and dma-buf pieces (Linux's `import`), the runs of the guest's RAM the
+    /// runtime asks for (Linux's `host_ram::runs`), and the teardown's forget, a mebibyte at a
+    /// time (Linux's `vm`'s `deallocate`). Each step's user-space instructions and cycles a page,
     /// the median of the views, are printed.
     #[test]
     #[ignore = "a measurement: run it by name"]
@@ -1487,7 +1428,7 @@ mod tests {
             ram_first,
             ram_pages * page,
             Backing {
-                fd: Arc::clone(&f),
+                file: Arc::clone(&f),
                 offset: 0,
             },
         );
@@ -1500,11 +1441,11 @@ mod tests {
         };
         // Other views' runs, one page each, none following on in the file.
         let others_first = 0x7300_0000_0000u64;
-        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        let rw = READ_WRITE;
         for i in 0..others {
             let offset = 2 * next(ram_pages / 2) * page;
             let backing = Backing {
-                fd: Arc::clone(&f),
+                file: Arc::clone(&f),
                 offset,
             };
             record(others_first + i * page, page, backing, rw);
@@ -1530,9 +1471,9 @@ mod tests {
             let end = target + length;
             let mut step = [[0u64; 2]; 8];
             let mut timed = |i: usize, f: &mut dyn FnMut()| {
-                let before = super::super::thread_counts::now();
+                let before = crate::os::thread_counts::now();
                 f();
-                let after = super::super::thread_counts::now();
+                let after = crate::os::thread_counts::now();
                 for k in 0..2 {
                     step[i][k] += after[k] - before[k];
                     step[7][k] += after[k] - before[k];

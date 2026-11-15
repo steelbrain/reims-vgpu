@@ -9,10 +9,10 @@ mod budget;
 mod clock;
 mod device_lend;
 mod dma_buf;
-mod files;
 mod hints;
 mod host_ram;
 mod import;
+mod lease;
 mod plane_copy;
 #[cfg(test)]
 pub(crate) mod thread_counts;
@@ -26,7 +26,7 @@ use metal2vulkan_runtime as rt;
 
 pub use clock::LinuxClock;
 pub use device_lend::{LendRefusal, LentDmaBuf, dma_buf_of_host};
-pub use files::{GuestMemoryLease, lease_guest_memory};
+pub use lease::{GuestMemoryLease, lease_guest_memory};
 pub use plane_copy::{CopyError, DmaBufPlane, PlaneCopier, PlaneCopy, PlaneFormat};
 pub use threads::LinuxThreads;
 pub use vm::{LinuxVm, RegionMemory};

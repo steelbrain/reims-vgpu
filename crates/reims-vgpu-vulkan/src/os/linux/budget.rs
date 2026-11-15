@@ -70,7 +70,7 @@
 use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::files;
+use crate::os::files;
 
 /// The mappings left to the rest of the process: QEMU's own, the C library's, the GPU driver's
 /// and the runtime's (device memory maps), threads' stacks, and the library's anonymous

@@ -77,11 +77,12 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
+use crate::core::platform::os::vm::VmProt;
 use crate::core::sync::Mutex;
 use metal2vulkan_runtime::DmaBufChunk;
 
-use super::files;
 use super::vm;
+use crate::os::files;
 
 /// `UDMABUF_FLAGS_CLOEXEC`.
 const FLAGS_CLOEXEC: u32 = 0x01;
@@ -290,13 +291,13 @@ fn add_runs(runs: &mut Vec<Run<Arc<OwnedFd>>>, first: u64, length: u64) -> Resul
         let (backing, bytes) = (piece.backing, piece.length);
         match runs.last_mut() {
             Some(last)
-                if Arc::ptr_eq(&last.file, &backing.fd)
+                if Arc::ptr_eq(&last.file, &backing.file)
                     && last.offset + last.length == backing.offset =>
             {
                 last.length += bytes;
             }
             _ => runs.push(Run {
-                file: backing.fd,
+                file: backing.file,
                 offset: backing.offset,
                 length: bytes,
             }),
@@ -354,14 +355,14 @@ pub(crate) fn fits_one_of(ranges: &[std::ops::Range<u64>]) -> Result<(), Refusal
         for piece in resolved {
             let follows = matches!(
                 &last,
-                Some((fd, end)) if Arc::ptr_eq(fd, &piece.backing.fd)
+                Some((fd, end)) if Arc::ptr_eq(fd, &piece.backing.file)
                     && *end == piece.backing.offset
             );
             if !follows {
                 pieces += 1;
             }
             let end = piece.backing.offset + piece.length;
-            last = Some((piece.backing.fd, end));
+            last = Some((piece.backing.file, end));
         }
         bytes = bytes.saturating_add(length);
     }
@@ -678,7 +679,7 @@ pub(crate) struct ViewBuf {
     pub(crate) fd: OwnedFd,
     pub(crate) at: u64,
     pub(crate) length: u64,
-    pub(crate) prot: i32,
+    pub(crate) prot: VmProt,
 }
 
 /// Dma-bufs of the pages `pieces` show, in order, which mapped one after another are those pages
@@ -691,8 +692,11 @@ pub(crate) struct ViewBuf {
 pub(crate) fn of_view(pieces: &[files::Piece]) -> Result<Vec<ViewBuf>, Refusal> {
     let device = device()?;
     let mut writable: Vec<&Arc<OwnedFd>> = Vec::new();
-    for piece in pieces.iter().filter(|p| p.prot & libc::PROT_WRITE != 0) {
-        let fd = &piece.backing.fd;
+    for piece in pieces
+        .iter()
+        .filter(|p| p.prot.raw() & libc::PROT_WRITE != 0)
+    {
+        let fd = &piece.backing.file;
         if writable.iter().any(|w| Arc::ptr_eq(w, fd)) {
             continue;
         }
@@ -716,7 +720,7 @@ pub(crate) fn of_view(pieces: &[files::Piece]) -> Result<Vec<ViewBuf>, Refusal> 
         let runs: Vec<Run<Arc<OwnedFd>>> = pieces[from..to]
             .iter()
             .map(|p| Run {
-                file: Arc::clone(&p.backing.fd),
+                file: Arc::clone(&p.backing.file),
                 offset: p.backing.offset,
                 length: p.length,
             })
