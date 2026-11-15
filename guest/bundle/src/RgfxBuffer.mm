@@ -11,6 +11,7 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -127,6 +128,36 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 	[words appendFormat:@"Linear texture: must be of type %@, textureType (%@) disallowed\n",
 	                    allowed, type];
 	RgfxMetalAssertionFailed("_mtlValidateStrideTextureParameters", words);
+}
+
+/// The granule an Apple GPU's buffer allocation is rounded up to, by which it answers a texture
+/// over a buffer of at least that many bytes whose texels end past its allocation.
+constexpr uint64_t kRgfxAllocationGranule = 16384;
+
+/// Whether a texture over a buffer of `length` bytes, from `offset` with rows `bytesPerRow` apart,
+/// of `height` rows of `rowBytes` bytes of texels in each of `slices` slices (a 2D array's,
+/// `array`, rounded up to 128 bytes apart), is nil, as Metal answers it on the M3 Max under macOS
+/// 27.0.1 (metal2vulkan's linear_plan.rs "Length", and `tbpa`, dgpu-oracle.md Q11): its texels
+/// end past the length, the buffer is at least 16 KiB, and the slices, each its rows' whole pitch,
+/// end past the length rounded up to 16 KiB, the buffer's allocation. Short of that the texture is
+/// made over bytes past the length however far. The AMD 5300M and the Intel 630 make it past the
+/// allocation too (`tbpa`, macOS 26.7.1), but the host's platform answers the M3's nil on every
+/// device, and refuses a create the bundle posts for one.
+bool rgfxTexelsPastAllocation(uint64_t length, uint64_t offset, uint64_t bytesPerRow,
+                              uint64_t height, uint64_t rowBytes, uint64_t slices, bool array)
+{
+	using wide = unsigned __int128;
+	const wide rows = std::max<uint64_t>(1, height);
+	const wide count = std::max<uint64_t>(1, slices);
+	const wide image = static_cast<wide>(bytesPerRow) * rows;
+	const wide pitch = array ? (image + 127) / 128 * 128 : image;
+	const wide texelsEnd = offset + pitch * (count - 1) + bytesPerRow * (rows - 1) + rowBytes;
+	if (texelsEnd <= length || length < kRgfxAllocationGranule)
+		return false;
+	const wide allocation =
+	    (static_cast<wide>(length) + kRgfxAllocationGranule - 1) / kRgfxAllocationGranule *
+	    kRgfxAllocationGranule;
+	return offset + pitch * count > allocation;
 }
 } // namespace
 
@@ -793,8 +824,12 @@ RGFX_RESOURCE_SPI
 // probe, dgpu-oracle.md Q11), which the host's platform makes by this form too. Rows of 0 bytes
 // end the process with the words both say; fewer than its texels' bytes the AMD answers nil, and
 // so does the bundle, where the Intel GPU ends the process. One whose texels lie past the
-// buffer's bytes both make, and the host's platform refuses: the bundle answers nil. A
-// block-compressed format answers nil (below). One off the device's linear texture alignment is nil (rgfxAtLinearAlignment:).
+// buffer's bytes is made, as both make it and the M3 Max does (4 RGBA32Float texels at offset
+// 4064 of a 4096-byte buffer; dgpu-oracle.md Q11), and so does the host's platform, its texels
+// past the buffer's bytes in a tail of the texture's own; one past an Apple GPU's allocation of
+// the buffer is nil, as the M3's and the host's (rgfxTexelsPastAllocation). A block-compressed
+// format answers nil (below). One off the device's linear texture alignment is nil
+// (rgfxAtLinearAlignment:).
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                     offset:(NSUInteger)offset
                                bytesPerRow:(NSUInteger)bytesPerRow
@@ -834,16 +869,16 @@ RGFX_RESOURCE_SPI
 			}
 			return nil;
 		}
-		// Texels past the buffer's bytes: both Macs make the texture (measured: 4 RGBA32Float
-		// texels at offset 4064 of a 4096-byte buffer), and the host's platform refuses it, which
-		// would end the host's process; the bundle answers nil, logged once, and sends nothing.
-		if (static_cast<unsigned __int128>(offset) + rowBytes > [self length]) {
+		// Texels past the buffer's bytes are made, but where they end past an Apple GPU's
+		// allocation of the buffer (rgfxTexelsPastAllocation), whose nil the host's platform
+		// answers on every device: the bundle answers nil, logged once, and sends nothing.
+		if (rgfxTexelsPastAllocation([self length], offset, bytesPerRow, 1, rowBytes, 1, false)) {
 			static std::atomic<bool> logged{false};
 			if (!logged.exchange(true)) {
-				NSLog(@"RGFX: a texture buffer past buffer 0x%llx's %lu bytes (offset %lu, %llu "
-				      @"bytes of texels), which the host does not carry: answered nil",
+				NSLog(@"RGFX: a texture buffer past buffer 0x%llx's allocation of %lu bytes "
+				      @"(offset %lu, %lu bytes a row), which the host does not carry: answered nil",
 				      (unsigned long long)[self rgfxObjId], (unsigned long)[self length],
-				      (unsigned long)offset, (unsigned long long)rowBytes);
+				      (unsigned long)offset, (unsigned long)bytesPerRow);
 			}
 			return nil;
 		}

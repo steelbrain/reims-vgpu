@@ -664,7 +664,8 @@ Validation".
 | tiled SPI: 1D, 1D array, 2D array, cube, cube array, 3D | made | the same | the buffer does not answer the selector |
 | a texture buffer, 4 rows high, by any form | the descriptor's validation asserts first: 4 rows past its 1 | the same | the same, by the forms it has |
 | public: a texture buffer, 4 RGBA32Float or 16 RGBA8Unorm texels | made over a Shared or Managed buffer at offsets 0, 4, 16, 64, 100 and 256, rows 64 or 4096 bytes apart; a kernel reads the buffer's bytes from the offset | the same | not measured |
-| public: a texture buffer, its texels past the buffer's 4096 bytes (offset 4064) | made | the same | not measured |
+| public: a texture buffer, its texels past the buffer's 4096 bytes (offset 4064) | made | the same | made (metal2vulkan's `probes/texture_buffer_past_length.m`: 64 RGBA8Unorm texels from 3968, 3976 and 4096) |
+| public: a texture buffer of 4 RGBA32Float texels, rows 64, past a buffer of 16 KiB or more: from 16352 and 16576 of 16384 bytes (ending at 16416 and 16640), from 32736 of 20000 bytes (ending at 32800) | made | the same | nil; made ending at the length (from 16320 of 16384), from 19968 of 20000 and from 12288 of 4096 |
 | public: a texture buffer, rows fewer than its texels' 64 bytes | nil at 1; asserts at 0 "Linear texture: bytesPerRow (0) must be greater or equal to (64) bytes" | asserts at 1 and at 0, at 0 with the AMD's words | not measured |
 
 *(class 3 for the type lines the three share; class 2 for the rest.)* Our stack: the public form
@@ -673,9 +674,13 @@ share or, at a 3D or multisample type, the M3's, sending nothing, since the host
 the host's process at a texture over a buffer it does not make. A texture buffer by the public
 form is made, at any offset, which the host's platform makes by that form; rows of 0 bytes end the
 process with the words the two say, and fewer than its texels' bytes answer nil, the AMD's answer
-*(class 2)*. One whose texels lie past the buffer's bytes answers nil where the two make it: the
-host's platform refuses it, which would end the host's process (the texture buffer rows and ends:
-a scratch probe, `tbprobe`, not kept, macOS 26.7.1). The tiled SPI answers nil for every type but 2D,
+*(class 2)*. One whose texels lie past the buffer's bytes is made, as the three make it *(class
+3)*, and the host's platform makes it, its texels past the length in a tail of the texture's own.
+One past the M3's allocation of a buffer of 16 KiB or more, its length rounded up to 16 KiB,
+answers nil, as the M3's and as the host's platform answers it on every device, where the two x86
+GPUs make it *(class 2)* (the texture buffer rows and ends: a scratch probe, `tbprobe`, not kept,
+macOS 26.7.1; past the allocation `tbpa`, a scratch probe, jobs m3-max-30900 to 30902, the M3
+under macOS 27.0.1). The tiled SPI answers nil for every type but 2D,
 logged once, as it does for more than one level: the host does not carry the others. The linear
 SPI makes a 2D array as the M3 does *(class 2)*, its slices where the M3 lays them
 (`rgfxBufferSlicePitch`), and a view of more than one of its slices answers nil, which Metal

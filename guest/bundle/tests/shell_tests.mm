@@ -2990,9 +2990,10 @@ void test_buffer_texture_types_end_the_process()
 // A texture buffer over a buffer's bytes by the public form is made, at any offset, with rows of at
 // least its texels' bytes, its create carrying its type, offset and rows to the host; fewer bytes
 // a row answer nil, posting nothing, and none end the process with Metal's words, as the AMD 5300M
-// answers (measured under macOS 26.7.1, a scratch probe; dgpu-oracle.md Q11). Texels past the
-// buffer's bytes answer nil, posting nothing, where both Macs make the texture: the host's
-// platform refuses it.
+// answers (measured under macOS 26.7.1, a scratch probe; dgpu-oracle.md Q11). One whose texels run
+// past the buffer's bytes is made and posts its create, as both Macs and the M3 Max make it, and
+// the host's platform makes it too; one past an Apple GPU's allocation of a buffer of 16 KiB or
+// more is nil, posting nothing, as the M3 Max and the host's platform answer it.
 void test_buffer_texture_buffers()
 {
 	checkDies("buffer-texture-buffer-rows-0",
@@ -3031,12 +3032,49 @@ void test_buffer_texture_buffers()
 			drainRing(fx.ring);
 			CHECK([buf newTextureWithDescriptor:desc offset:0 bytesPerRow:63] == nil);
 			CHECK([buf newTextureWithDescriptor:desc offset:0 bytesPerRow:1] == nil);
-			// At the buffer's end it is made; past it, nil, which the host's platform refuses.
+			// At the buffer's end it is made; past its 64 KiB, its allocation, nil.
 			CHECK([made count] == 3);
 			id<MTLTexture> last = [buf newTextureWithDescriptor:desc offset:memory.size() - 64 bytesPerRow:64];
 			CHECK(last != nil);
 			drainRing(fx.ring);
 			CHECK([buf newTextureWithDescriptor:desc offset:memory.size() - 32 bytesPerRow:64] == nil);
+			CHECK([buf newTextureWithDescriptor:desc offset:memory.size() bytesPerRow:64] == nil);
+			CHECK(ringEmpty(fx.ring));
+			// Past a smaller buffer's bytes it is made: over 4096 bytes from 4064 (the measured
+			// shape, 32 of its 64 bytes past the buffer's) and from 12288, and over 20000 bytes
+			// from 19968, inside its allocation of 32768. Past that allocation it is nil, from 32736
+			// of 20000 bytes and from 16352 of 16384.
+			struct Past {
+				NSUInteger length, offset;
+				bool made;
+			};
+			for (const Past p : {Past{4096, 4064, true}, Past{4096, 12288, true}, Past{20000, 19968, true},
+			                     Past{20000, 32736, false}, Past{16384, 16352, false}}) {
+				RgfxBuffer *over = [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+				                                                   regionOffset:0x10000
+				                                                         length:p.length
+				                                                        options:storage
+				                                                    deallocator:nil
+				                                                         device:nil
+				                                                     serializer:&fx.ser];
+				CHECK(over != nil);
+				if (over != nil)
+					[made addObject:over];
+				drainRing(fx.ring);
+				id<MTLTexture> past = [over newTextureWithDescriptor:desc offset:p.offset bytesPerRow:64];
+				if (!p.made) {
+					CHECK(past == nil);
+					CHECK(ringEmpty(fx.ring));
+					continue;
+				}
+				if (past != nil)
+					[made addObject:past];
+				CHECK(past != nil && past.textureType == MTLTextureTypeTextureBuffer && past.width == 4);
+				CHECK(past.buffer == over && past.bufferOffset == p.offset && past.bufferBytesPerRow == 64);
+				auto m = expectMessage<RgfxTextureFromBuffer>(fx.ring, RGFX_CMD_TEXTURE_FROM_BUFFER);
+				CHECK(m.buffer_obj_id == over.rgfxObjId && m.offset == p.offset && m.bytes_per_row == 64);
+				CHECK(m.desc.texture_type == MTLTextureTypeTextureBuffer && m.desc.width == 4);
+			}
 			CHECK(ringEmpty(fx.ring));
 		}
 	}

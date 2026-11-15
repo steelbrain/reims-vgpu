@@ -3167,6 +3167,230 @@ pub(crate) mod tests {
         assert_eq!(texel_bytes(&array, (0, 256), 1500), 0..1500);
     }
 
+    /// A texture buffer over a Shared buffer whose texels run past the buffer's length is made, as
+    /// Metal makes it on the AMD 5300M and the Intel 630 (4 `RGBA32Float` texels at offset 4064
+    /// of a 4096-byte buffer, macOS 26.7.1: docs/graphics-kext/dgpu-oracle.md, Q11) and on the
+    /// M3 Max (macOS 27.0.1, metal2vulkan's `probes/texture_buffer_past_length.m`), here over the
+    /// first 4096 bytes of host memory, as the guest's Shared buffers lie over its memory. Its two
+    /// texels inside the length are the buffer's bytes, in place: a kernel's `read()` and a blit
+    /// out of it read them, a CPU write of the buffer reaches the next read, and a blit into it
+    /// writes them. Its two past the length lie in the runtime's tail of the texture's own, zero
+    /// when made, as Metal's texels past a buffer's length inside its allocation read (the M3's
+    /// over a 4096-byte buffer read the buffer allocated next, which no program can count on): a
+    /// blit into them writes them and every path then reads them, and no byte past the buffer
+    /// changes
+    #[test]
+    fn a_texture_buffer_past_its_buffers_length_is_made_as_metals() {
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+        use crate::core::platform::resource::{Buffer as _, Library as _, Texture as _};
+
+        /// `rgbx.metal`'s library, whose `rgbx_read_buffer_float` writes thread `i`'s `read(i)`
+        /// of a float texture buffer into element `i` of buffer 0, in a grid one row high.
+        const LIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rgbx.metallib"));
+        const MEMORY: usize = 0x8000;
+        const LENGTH: u64 = 4096;
+        const OFFSET: u64 = 4064;
+        const TEXELS: u64 = 4;
+        const TEXEL: u64 = 16;
+        let span = usize::try_from(TEXELS * TEXEL).unwrap();
+        let inside = usize::try_from(LENGTH - OFFSET).unwrap();
+        let at = usize::try_from(OFFSET).unwrap();
+        let words = |tag: u32, n: usize| -> Vec<u8> {
+            (0..u32::try_from(n / 4).unwrap())
+                .flat_map(|i| (tag | i).to_le_bytes())
+                .collect()
+        };
+
+        let d = dev();
+        let layout = Layout::from_size_align(MEMORY, 0x4000).unwrap();
+        // SAFETY: a nonzero size.
+        let memory = unsafe { alloc_zeroed(layout) };
+        let host = |range: std::ops::Range<usize>| -> Vec<u8> {
+            // SAFETY: inside the memory, read while no GPU work uses it.
+            unsafe { std::slice::from_raw_parts(memory.add(range.start), range.len()) }.to_vec()
+        };
+        // Every word of the memory names its place, past the buffer's bytes too.
+        let laid = words(0xa000_0000, MEMORY);
+        // SAFETY: the memory's `MEMORY` bytes, which no GPU work uses yet.
+        unsafe { std::ptr::copy_nonoverlapping(laid.as_ptr(), memory, MEMORY) };
+        // SAFETY: the memory outlives the buffer, which is dropped before it is freed.
+        let bytes = unsafe { HostRange::new(HostPtr::from_ptr(memory), LENGTH) };
+        let b = d
+            .new_buffer_over_host_memory(OnFault::Die, bytes, 0, None)
+            .unwrap()
+            .unwrap();
+        let desc = platform().texture_descriptor(&TextureDesc {
+            texture_type: 9,
+            pixel_format: 125,
+            width: TEXELS,
+            usage: 0x1,
+            resource_options: Some(0),
+            ..TextureDesc::default()
+        });
+        let t = b
+            .new_texture(OnFault::Die, &desc, OFFSET, TEXELS * TEXEL)
+            .unwrap()
+            .expect("a texture buffer past its buffer's length, as Metal makes");
+        assert_eq!((t.texture_type(), t.width()), (9, TEXELS));
+
+        let q = d.new_command_queue().unwrap();
+        let run = |encode: &dyn Fn(&<VulkanPlatform as Platform>::CommandBuffer)| {
+            let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+            encode(&cb);
+            cb.commit(OnFault::Die).unwrap();
+            cb.wait_until_completed(OnFault::Die).unwrap();
+            assert!(cb.error().is_none(), "{:?}", cb.error());
+        };
+        let shared = |held: &[u8]| {
+            let s = d
+                .new_buffer_of_length(OnFault::Die, held.len().to_u64(), 0)
+                .unwrap()
+                .unwrap();
+            // SAFETY: a Shared buffer of `held.len()` bytes, which no command uses yet.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    held.as_ptr(),
+                    s.contents().as_ptr::<u8>(),
+                    held.len(),
+                );
+            }
+            s
+        };
+        let contents = |s: &VulkanBuffer| -> Vec<u8> {
+            // SAFETY: a Shared buffer of `span` bytes, read after its work completed.
+            unsafe { std::slice::from_raw_parts(s.contents().as_ptr::<u8>(), span) }.to_vec()
+        };
+        let lib = d.new_library(LIB).unwrap().unwrap().unwrap();
+        let f = lib
+            .new_function(OnFault::Die, "rgbx_read_buffer_float")
+            .unwrap()
+            .unwrap();
+        let state = d
+            .new_compute_pipeline_state_for_function(Some(&f))
+            .unwrap()
+            .unwrap();
+        // What a kernel's read() of each texel gives.
+        let kernel_read = || {
+            let out = shared(&vec![0; span]);
+            let bound = [Some(&out)];
+            run(&|cb| {
+                let e = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
+                for cmd in [
+                    ComputeCmd::SetComputePipelineState {
+                        state: Some(&state),
+                    },
+                    ComputeCmd::SetBuffers {
+                        buffers: &bound,
+                        offsets: &[0],
+                        range: NsRange::new(0, 1),
+                    },
+                    ComputeCmd::SetTexture {
+                        texture: Some(&t),
+                        index: 0,
+                    },
+                    ComputeCmd::DispatchThreads {
+                        threads_per_grid: MtlSize::new(TEXELS, 1, 1),
+                        threads_per_threadgroup: MtlSize::new(TEXELS, 1, 1),
+                    },
+                    ComputeCmd::EndEncoding,
+                ] {
+                    e.encode(OnFault::Die, cmd).unwrap();
+                }
+            });
+            contents(&out)
+        };
+        let whole = MtlSize::new(TEXELS, 1, 1);
+        // What a blit out of the texture into a buffer gives.
+        let blit_read = || {
+            let out = shared(&vec![0; span]);
+            run(&|cb| {
+                let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+                let copy = BlitCmd::CopyTextureToBuffer {
+                    source_texture: &t,
+                    source_slice: 0,
+                    source_level: 0,
+                    source_origin: MtlOrigin::new(0, 0, 0),
+                    source_size: whole,
+                    destination_buffer: &out,
+                    destination_offset: 0,
+                    destination_bytes_per_row: TEXELS * TEXEL,
+                    destination_bytes_per_image: TEXELS * TEXEL,
+                };
+                e.encode(OnFault::Die, copy).unwrap();
+                e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+            });
+            contents(&out)
+        };
+
+        // As made: the buffer's bytes, then the tail's zeros.
+        let mut made = host(at..at + inside);
+        made.resize(span, 0);
+        assert_eq!(kernel_read(), made, "a kernel's read as made");
+        assert_eq!(blit_read(), made, "a blit's read as made");
+
+        // A CPU write of the buffer's bytes under the texels inside the length reaches the next
+        // read.
+        let cpu = words(0xd000_0000, inside);
+        // SAFETY: inside the buffer's bytes, which no GPU work uses now.
+        unsafe { std::ptr::copy_nonoverlapping(cpu.as_ptr(), memory.add(at), inside) };
+        let mut rewritten = cpu.clone();
+        rewritten.resize(span, 0);
+        assert_eq!(kernel_read(), rewritten, "a kernel's read after a CPU write");
+
+        // A blit into every texel writes the buffer's bytes inside the length and the tail past
+        // it, which every path then reads, and no other byte of the memory changes.
+        let written = words(0xc000_0000, span);
+        let source = shared(&written);
+        run(&|cb| {
+            let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+            let copy = BlitCmd::CopyBufferToTexture {
+                source_buffer: &source,
+                source_offset: 0,
+                source_bytes_per_row: TEXELS * TEXEL,
+                source_bytes_per_image: TEXELS * TEXEL,
+                source_size: whole,
+                destination_texture: &t,
+                destination_slice: 0,
+                destination_level: 0,
+                destination_origin: MtlOrigin::new(0, 0, 0),
+            };
+            e.encode(OnFault::Die, copy).unwrap();
+            e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+        });
+        assert_eq!(kernel_read(), written, "a kernel's read after a blit's write");
+        assert_eq!(blit_read(), written, "a blit's read after a blit's write");
+        assert_eq!(host(at..at + inside), written[..inside], "the buffer's bytes");
+        assert_eq!(host(0..at), laid[..at], "the bytes before the texels");
+        assert_eq!(
+            host(at + inside..MEMORY),
+            laid[at + inside..],
+            "the bytes past the buffer"
+        );
+
+        // Over a buffer of 16 KiB, one ending past its allocation, the length rounded up to 16 KiB,
+        // is nil, as Metal answers it on the M3 Max (metal2vulkan's measurement), which the
+        // bundle answers too (`rgfxTexelsPastAllocation`); one ending at the length is made. The
+        // buffer lies over the memory's second 16 KiB, no page of the first buffer's.
+        let second = memory.wrapping_add(0x4000);
+        // SAFETY: inside the memory, which outlives the buffer, dropped before it is freed.
+        let bytes = unsafe { HostRange::new(HostPtr::from_ptr(second), 16384) };
+        let big = d
+            .new_buffer_over_host_memory(OnFault::Die, bytes, 0, None)
+            .unwrap()
+            .unwrap();
+        let over_big = |offset| big.new_texture(OnFault::Die, &desc, offset, TEXELS * TEXEL);
+        assert!(over_big(16352).unwrap().is_none(), "past the allocation");
+        assert!(over_big(16320).unwrap().is_some(), "at the length");
+
+        drop((t, b, big, state, f, lib));
+        // SAFETY: allocated above with `layout`; the buffer over it and its import are gone.
+        crate::remap::free_unimported(memory, MEMORY.to_u64(), || unsafe {
+            dealloc(memory, layout)
+        });
+    }
+
     /// What a 2D array texture over a no-copy buffer of 64 KiB of host memory shows on `P`, made
     /// by `newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:` where `linear`,
     /// else by `newTextureWithDescriptor:offset:bytesPerRow:`: three slices of 60 by 3
