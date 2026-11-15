@@ -29,6 +29,7 @@
 //! - A test build keeps no file ([`KEPT`]): its answers are kept in memory for the device's life
 //!   alone, so no test's pipelines reach a host's later guests.
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -171,10 +172,7 @@ impl PipelineAnswers {
             let newest = newest(&state.kept, CAPACITY / 4);
             let keys: HashSet<AnswerKey> = newest.iter().map(|(key, _)| *key).collect();
             state.kept.retain(|key, _| keys.contains(key));
-            rewrite_file(dir, &path, &identity, &newest).map(|file| {
-                state.records = newest.len();
-                file
-            })
+            rewrite_file(dir, &path, &identity, &newest).inspect(|_| state.records = newest.len())
         } else {
             state.records = records;
             OpenOptions::new().append(true).open(&path).ok()
@@ -242,7 +240,7 @@ impl PipelineAnswers {
         let state = self.state.lock();
         let mut all: Vec<(&AnswerKey, &(RgfxPipelineReflection, u64))> =
             state.kept.iter().collect();
-        all.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+        all.sort_by_key(|(_, (_, stamp))| Reverse(*stamp));
         all.into_iter()
             .skip(first.to_usize())
             .take(most.to_usize())
@@ -257,6 +255,7 @@ impl PipelineAnswers {
     }
 
     /// How many answers are kept.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.state.lock().kept.len()
     }
@@ -373,7 +372,9 @@ fn read(
     if head != header(identity) || !body.len().is_multiple_of(RECORD_BYTES) {
         return None;
     }
-    body.chunks_exact(RECORD_BYTES)
+    body.as_chunks::<RECORD_BYTES>()
+        .0
+        .iter()
         .map(|r| {
             let kind = u32::from_le_bytes(r[..4].try_into().ok()?);
             let sum = u64::from_le_bytes(r[120..].try_into().ok()?);
@@ -397,7 +398,7 @@ fn newest(
     most: usize,
 ) -> Vec<(AnswerKey, RgfxPipelineReflection)> {
     let mut all: Vec<_> = kept.iter().map(|(k, (a, s))| (*s, *k, *a)).collect();
-    all.sort_by(|a, b| b.0.cmp(&a.0));
+    all.sort_by_key(|(stamp, _, _)| Reverse(*stamp));
     all.truncate(most);
     all.reverse();
     all.into_iter().map(|(_, k, a)| (k, a)).collect()
@@ -435,7 +436,7 @@ fn prune(dir: &Path, keep: &Path) {
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .filter(|(_, path)| path != keep && path.is_file())
         .collect();
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|(modified, _)| Reverse(*modified));
     for (_, path) in files.into_iter().skip(KEEP_FILES.saturating_sub(1)) {
         let _ = std::fs::remove_file(path);
     }
@@ -715,6 +716,6 @@ mod tests {
             Observed::New
         );
         assert_eq!(answers.replies(0, 4, 1).len(), 1);
-        assert!(!KEPT);
+        const { assert!(!KEPT) };
     }
 }
