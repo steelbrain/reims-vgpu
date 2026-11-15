@@ -37,9 +37,9 @@ pub const RVG_WINDOW_BUTTON_EXTRA: u32 = 16;
 /// `x` is below `width` and `y` below `height`: over the window but off the image, and outside
 /// the window during a drag, the pointer holds at the image's nearest edge.
 ///
-/// Thread: on macOS the process's main thread, on Linux the library's thread reims-vgpu.ui;
-/// either runs every window callback of the process one at a time, in the order the events
-/// arrived, never inside a call of the host's.
+/// Thread: on macOS the process's main thread, on Linux and Windows the library's thread
+/// reims-vgpu.ui; either runs every window callback of the process one at a time, in the order the
+/// events arrived, never inside a call of the host's.
 /// May call: every function of this header. It must not block: until it returns, no window of
 /// the process takes input or redraws its frame.
 /// Without it, the pointer goes nowhere.

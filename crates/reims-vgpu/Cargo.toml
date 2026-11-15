@@ -11,7 +11,7 @@ license.workspace = true
 default = ["macos-sdl"]
 # SDL3's window on macOS, the window crate's `macos-sdl`, which `REIMS_VGPU_WINDOW_IMPL=sdl` opens
 # in place of AppKit's. Without it the macOS library has no SDL, and its windows are AppKit's.
-# Linux's window is SDL3's whatever this says.
+# Linux's and Windows's window is SDL3's whatever this says.
 macos-sdl = ["reims-vgpu-window/macos-sdl"]
 # Tests: the core objects behind the public handles (`core()`), and core's testkit.
 testkit = ["reims-vgpu-vulkan/testkit"]

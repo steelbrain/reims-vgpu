@@ -13,7 +13,7 @@ The header, `crates/reims-vgpu-c/include/reims_vgpu.h`, is the reference. Sectio
 the rules, and the header repeats each rule where it applies. The C API has no Objective-C types,
 dispatch queues or blocks, and takes no Metal object from the host. Callbacks arrive on the
 library's threads, and a window's on the window's thread: the process's main thread on macOS, the
-library's `reims-vgpu.ui` on Linux.
+library's `reims-vgpu.ui` on Linux and Windows.
 
 ## 1. Principles
 
@@ -23,7 +23,7 @@ library's `reims-vgpu.ui` on Linux.
 |---|---|---|
 | core | `reims-vgpu-vulkan`'s `core` | the platform traits, the runtime (threads, queues, holds), raises and deaths, the display's present pipeline, guest memory and the fake platform the tests run on |
 | platform | `reims-vgpu-vulkan` | core's `Platform`: `VulkanPlatform`, over metal2vulkan's runtime, on Linux, and on macOS over MoltenVK, a build for development and tests |
-| window | `reims-vgpu-window` | a display's own window (AppKit's or SDL3's on macOS, SDL3's on Linux), its input and the host's screens; it knows nothing of devices |
+| window | `reims-vgpu-window` | a display's own window (AppKit's or SDL3's on macOS, SDL3's on Linux and Windows), its input and the host's screens; it knows nothing of devices |
 | device | `reims-vgpu-graphics` | the wire: the records, rings and registers the guest and the host share, and the C header the guest's kexts and the option ROM compile |
 | Rust API | `reims-vgpu` | the graphics device over the platform: its rings, decoder, display and window, and owned Rust types for its config and callbacks |
 | C API | `reims-vgpu-c` | a thin FFI layer over the Rust API; cbindgen writes `include/reims_vgpu.h` from it |
@@ -281,12 +281,12 @@ returns. The library logs through the `log` crate; a Rust host installs its own 
 | `raise_interrupt` | the thread that posts the event it raises for: the device's control thread, `reims-vgpu.graphics-control`; one of ring 0's threads, `reims-vgpu.graphics-ring0-<i>`, which carry out a guest process's control messages, its presents and a block's pages and downloads, each on its lane; its refresh thread, `reims-vgpu.graphics-refresh`; a command queue's service thread, `reims-vgpu.graphics-queue-<id>`, or one of its lane's threads, which walk and commit its command buffers, `reims-vgpu.graphics-lane-<id>`; a pipeline compile's thread, `reims-vgpu.graphics-compile-<n>`; a thread that makes IOSurfaces' and pages blocks' views, `reims-vgpu.graphics-surfaces-<i>`; a thread that makes indirect command buffers, `reims-vgpu.icb-create-<i>`; a thread that lets go of a closed process's objects and answers its close, `reims-vgpu.graphics-closes-<i>`; or the platform's thread that runs a command buffer's scheduled or completed handler; or the host's own, inside `rvg_graphics_device_mmio_write_taking` or `rvg_graphics_device_doorbell_write`. Never inside another call of the host's | nothing: they may call at once | each after the completion ring's message it raises for is published |
 | `route_doorbell`, `route_doorbell_page` (the route of a queue whose process has a doorbell page, at that page's doorbell in BAR 4) | one of ring 0's threads, `reims-vgpu.graphics-ring0-<i>`, or the control thread, `reims-vgpu.graphics-control`, as a command queue is made, destroyed or its process closed, with no lock of the library's held, where it may wait for a lock the host holds while it calls the device (QEMU's BQL), since no function the host calls under it waits for a thread inside the callback but the release of the process's last device, at most 5 s; dropping a route, also the host's own inside `rvg_graphics_device_mmio_write_taking` (a STATUS write of 0, or a `DOORBELL_PAGE_BIND` write that binds a page to another context) or `rvg_graphics_device_reset`, where it must not wait for a lock the host holds around that call | nothing: they may call at once | a queue's route before its create is answered, and its drop once its queue has ended and before its destroy, its process's close or the reset is answered; a dropped route takes no write once the call returns |
 | `cursor_glyph`, `cursor_show`, `cursor_move` | the display thread: one serial worker for the whole process (after 5 s idle it exits, and the next callback starts a new one) | every display callback of the process: one at a time | the order the device's control thread took the guest's cursor and display power commands, and its resets |
-| a window's `pointer`, `wheel`, `key`, `close`, `scroll` | on macOS the process's main thread, where AppKit runs; on Linux the library's thread `reims-vgpu.ui`; never inside a call of the host's | every window callback of the process: one at a time | the order the events arrived |
+| a window's `pointer`, `wheel`, `key`, `close`, `scroll` | on macOS the process's main thread, where AppKit runs; on Linux and Windows the library's thread `reims-vgpu.ui`; never inside a call of the host's | every window callback of the process: one at a time | the order the events arrived |
 | `destroy` (each table) | the device's: once its threads have ended, after their last callback, possibly on one of them after the release has returned; the window's: once the release has closed the window, on the releasing thread or, while a window callback runs, the window's thread once it returns; either, on the caller's thread, in a refused create | nothing | once, after every call of its table |
 
 Threads are named `reims-vgpu.<role>`: those above, `reims-vgpu.display` (the display thread),
-`reims-vgpu.window` (a window's drawing thread), `reims-vgpu.ui` (on Linux, the thread every
-window's events and callbacks run on), and `reims-vgpu.graphics-video-<i>` and
+`reims-vgpu.window` (a window's drawing thread), `reims-vgpu.ui` (on Linux and Windows, the thread
+every window's events and callbacks run on), and `reims-vgpu.graphics-video-<i>` and
 `reims-vgpu.graphics-event-waits` (a graphics device's). The names are diagnostics, not contract.
 A queue's worker, the display thread among them, has core's `WORKER_STACK`, 512 KiB.
 
@@ -326,9 +326,9 @@ BQL, and may call any function; the next display callback waits behind it.
 
 A window's callbacks run one at a time across every window of the process, in the order the events
 arrived, and never inside a call of the host's: on macOS on the process's main thread, where AppKit
-runs, and on Linux on the library's own thread `reims-vgpu.ui`. On Linux nothing of the library
-runs on or waits for the process's main thread, and what follows about the run loop and the
-application is macOS's.
+runs, and on Linux and Windows on the library's own thread `reims-vgpu.ui`. On Linux and Windows
+nothing of the library runs on or waits for the process's main thread, and what follows about the
+run loop and the application is macOS's.
 - **They must not block.** Until one returns, no window of the process takes input or redraws its
   frame. The main thread is the host's too: QEMU parks it in its run loop, and a callback that waits
   for something that thread would do never returns. QEMU's queue their event for its BQL and return.
