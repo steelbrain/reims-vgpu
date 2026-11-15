@@ -1900,7 +1900,7 @@ below is the release Metal's, not the validation layer's.
 | the same of options holding bit 17 or 19 | made | bit 17: buffers made, then a Shared texture of the same process ends it in `IOGPUMetalSuballocatorAllocate` ("Different MTLResourceOptions used for the same heap index, this is not supported"); bit 19: buffers nil, the texture ends it the same | unchanged; not measured one call a process |
 | `newBufferWithIOSurface:` (SPI) over 64 x 64 and 100 x 7 BGRA surfaces and a 420v one | nil | a buffer (`AGXG15XFamilyBuffer`) of the surface's allocation size, options 0x200, contents NULL, `iosurface` the surface, a GPU write through it reaching the surface's pages | unchanged: nil; a buffer over a surface is a feature the device lacks |
 | a buffer's tiled texture SPI, `newTiledTextureWithDescriptor:offset:bytesPerRow:` | answered | not answered by the M3's buffers in any storage mode (the linear SPI is); the device answers `newTiledTextureWithBytesNoCopy:` in both forms | unchanged: the bundle's buffers answer it |
-| the members `tests/protocol_members.txt` gives the x86 Macs' verdicts for (`%spi-both`, `%spi-neither`, `%spi-differ`), by `respondsToSelector:` | the bundle answers each as they do | of the 67 the probe asks, the M3's objects answer 50 (44 selectors) the bundle's do not: 49 of the `%spi-neither` ones (a buffer's backing SPI such as `detachBacking` and `parentGPUAddress`, a command buffer's resource groups and `encodeSignalEventScheduled:value:`, a compute encoder's virtual substreams, a render encoder's resolve textures and tile dispatches, a texture's `compressionMetadata` and `generateMipmapLevel:slice:`), and `copyFromTexture:...options:`, a `%spi-differ` one | unchanged: SPI members, not rules |
+| the members `tests/protocol_members.txt` gives the x86 Macs' verdicts for (`%spi-both`, `%spi-neither`, `%spi-differ`), by `respondsToSelector:` | the bundle answers each as they do | of the 67 the probe asks, the M3's objects answer 50 (44 selectors) the bundle's do not: 49 of the `%spi-neither` ones (a buffer's backing SPI such as `detachBacking` and `parentGPUAddress`, a command buffer's resource groups and `encodeSignalEventScheduled:value:` (which an arm64 guest's buffers answer since 11-14, Q43), a compute encoder's virtual substreams, a render encoder's resolve textures and tile dispatches, a texture's `compressionMetadata` and `generateMipmapLevel:slice:`), and `copyFromTexture:...options:`, a `%spi-differ` one | unchanged: SPI members, not rules |
 
 The M3 answers the rest of what this section asked as the x86 Macs do (the surface cases of Q20
 it shares with them, the views' rules, a BC1 texture over a buffer's bytes answered nil, rows
@@ -2294,6 +2294,65 @@ What our stack does (metal2vulkan ce54ad8b25): the runtime makes such a buffer a
 relayed (`private-resource-option`), dying in strict mode: the CPU's commands run, every Mac's
 answer, and a kernel's records land, the x86 Macs' *(class 2)*. The M3 Max's drop of the GPU's
 writes is the runtime's to build, for an arm64 guest's frameworks.
+
+## Q45: a command buffer's scheduled signal, `encodeSignalEventScheduled:value:`
+
+Probe: `oracle_cmdbuf Apple schedsig` and its child cases `schedsig_open`, `schedsig_late`,
+`schedsig_nil`, `schedsig_nil_unretained`, `schedsig_plain` and `schedsig_plain_unretained`, 11-14,
+on the M3 Max under macOS 27.0.1 (26A434): m3-max-30621 and m3-max-30629. The x86 Macs' buffers
+do not answer the member (`%spi-neither`, Q34), so it is the M3's alone. Its command buffer
+(`AGXG15XFamilyCommandBuffer`) answers it from `IOGPUMetalCommandBuffer`, retaining its
+references or not. Times are ms from the commit, medians of 5 runs; a kernel ran 92 ms.
+
+| what | M3 Max |
+|---|---|
+| on an idle queue, the signal of 1 encoded before a kernel: `signaledValue` reads 1 (a polling thread); a listener's block for 1; the scheduled handler; `GPUStartTime` | 0.044; 0.061; 0.114; 0.638. The scheduled handler reads 1 in 5 of 5 |
+| the same, the signal encoded after the kernel | 0.090; 0.104; 0.109; 0.606. The handler reads 1 in 5 of 5, the listener's block before it in 2 of 5: the signal waits for none of the buffer's GPU work |
+| behind a 185 ms buffer of its queue: the value read; the buffer's scheduled handler; its `GPUStartTime`; a buffer of a second queue that waits for the value completes | 0.092; 0.138; 19.97; 20.45, before the first buffer's `GPUEndTime` (184.98) in 5 of 5 |
+| an event at 5: a scheduled signal of 3; of 7; of 6 then 8; of 8 then 6; against a GPU signal of 3 and a CPU set of 3 | 5; 7; 8; 8; 5 and 5: the value only rises, as a GPU signal and a CPU set leave it |
+| a kernel, a GPU signal of 2, a scheduled signal of 1 | 1 at 0.117 (the scheduled handler reads 1), 2 at 46.78, as the kernel ends (`GPUEndTime` 46.66) |
+| a scheduled signal of 2, a kernel, a GPU signal of 1 | 2 at 0.062, a listener for 1 at 0.059; 2 at the end |
+| a wait for another shared event W at 1, then the signal; the CPU sets W at 200 ms (3 runs) | the buffer Committed at 200 ms; the value reads 1 0.04 ms after the set, the scheduled handler 0.1 ms later |
+| the signal, then the wait for W | the value reads 1 at 0.03 to 0.07 ms, while the buffer stays Committed until W is set |
+| a kernel, the wait for W, the signal | the value reads 1 0.04 ms after the set |
+| the signal, a kernel, the wait for W | at 0.03 to 0.04 ms |
+| behind an earlier buffer of its queue that waits for W | 0.06 to 0.17 ms after the set |
+| a wait for 1 on its own event, then the signal of 1, nothing else setting it | the value stays 0; the buffer fails at 5.0 s with Metal's timeout (`MTLCommandBufferErrorDomain` 2, "Caused GPU Timeout Error (00000002:kIOGPUCommandBufferCallbackErrorTimeout)") |
+| the signal of 1, then a wait for 1 on its own event | the buffer completes (10.7 ms) |
+| a listener's block, a default listener and one of a queue of its own | on the listener's queue (`MTLSharedEventListener`, and its own) |
+| with an encoder open | ends the process: "-[IOGPUMetalCommandBuffer encodeSignalEventScheduled:value:]:468: failed assertion `encodeSignalEventScheduled:value: with uncommitted encoder'" |
+| after the commit | returns; the event keeps its value, and the buffer completes |
+| a nil event, on a buffer that retains its references | raises `NSInvalidArgumentException`, "*** -[__NSArrayM insertObject:atIndex:]: object cannot be nil" |
+| a nil event, on one that retains none | returns; the buffer fails: `MTLCommandBufferErrorDomain` 1, "Invalid Input (0000000a:kIOGPUCommandBufferCallbackErrorInvalidInput)" |
+| a plain event (`newEvent`), either buffer | logs "MTLEvent passed to API expecting MTLSharedEvent" and ends the process (SIGABRT) |
+
+So the call writes a command into the buffer's stream for the kernel, which sets the shared event
+as its queue's submission reaches it: in the stream's order, behind every wait before it on the
+queue, the buffer's own and an earlier buffer's, and ahead of the buffer's GPU work, its
+scheduling and any wait after it (read from code: macOS 27.0.1's IOGPU, which reserves a kernel
+command for it in the buffer's storage, where a wait is one too).
+
+Who sends it (read from code, macOS 27.0.1's shared cache): MPSGraph, from one place,
+`GPU::ANERegionCallOpHandler::encodeAsynchronousWithSharedEvents`, the op that runs a graph's
+region on the Neural Engine, with no `respondsToSelector:` check. An arm64 guest has no Neural
+Engine (docs/qemu.md, "arm64 guests: the Neural Engine"), so no recorded run reached it. CMImaging
+and PhotosensitivityProcessing carry the member only in their copies of the `MTLCommandBufferSPI`
+protocol: neither has a call site of it.
+
+What our stack does *(class 3, the arm64 guest's reference GPU's)*: an x86 guest's buffers answer
+no such member, as the x86 Macs' do. An arm64 guest's buffers answer it, and the bundle sets the
+event as the CPU's set does (the host first, `SHARED_EVENT_SET_VALUE`, then the process's
+listeners and waits): at the buffer's post, where no buffer of its queue is held at a wait and
+every wait the buffer encoded before the call is met as the process knows it; else at the
+buffer's scheduling, before its scheduled handlers. Later than Metal's *(class 2)*: a signal
+behind a wait met on the host before the process knows it, and one held that a wait after it on
+its buffer holds too, as Metal's is not; a buffer that holds a signal behind an earlier buffer's
+wait and then waits for that signal's value never runs, where Metal's does. The plain event's
+end, the nil event's exception and its failed buffer, and the call after the commit are the
+M3's. The open encoder's end is not carried: the bundle keeps no record of an open encoder for any
+command-buffer call. The tests are `test_a_scheduled_signal_is_set_as_its_queue_submits_it`,
+`test_a_scheduled_signal_behind_a_wait_is_set_at_its_scheduling` and
+`test_a_scheduled_signal_takes_only_a_shared_event` (tests/queue_tests.mm, arm64).
 
 ## Not measured
 
