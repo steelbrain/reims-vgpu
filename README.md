@@ -152,7 +152,7 @@ resize it. [docs/api.md](docs/api.md) section 2 lists every setting and variable
   guest's Metal calls into its command stream. `guest/prebuilt` holds the built set, which
   reims-ctl puts in each VM's OpenCore image.
 - QEMU: `vendor/qemu` tracks
-  [`steelbrain/qemu-reims-vgpu@steelbrain/reims-vgpu`](https://github.com/steelbrain/qemu-reims-vgpu/tree/steelbrain/reims-vgpu):
+  [`steelbrain/qemu-reims-vgpu@steelbrain/reims-vgpu-rebase-2`](https://github.com/steelbrain/qemu-reims-vgpu/tree/steelbrain/reims-vgpu-rebase-2):
   `reims-graphics-pci` in C on the C API, which finds the library through pkg-config and links it
   statically.
 - The option ROM: `firmware/`, the device's UEFI driver, in C, which the guest's firmware runs.

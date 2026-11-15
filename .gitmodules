@@ -1,4 +1,4 @@
 [submodule "vendor/qemu"]
 	path = vendor/qemu
 	url = https://github.com/steelbrain/qemu-reims-vgpu
-	branch = steelbrain/reims-vgpu
+	branch = steelbrain/reims-vgpu-rebase-2
