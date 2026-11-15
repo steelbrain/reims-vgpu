@@ -1,6 +1,6 @@
-// The tests' kernel that reaches a buffer through an address it loads from another
-// (`tests/client_direction.rs`, `src/gpu/resource/tests/metal_tests.rs`), naming nothing of it: it
-// reads the word there into `words[0]`, and writes `words[1]` to the word after it.
+// The tests' kernel that reaches a buffer through an address it loads from another, naming
+// nothing of it: it reads the word there into `words[0]`, and writes `words[1]` to the word after
+// it (`src/gpu/resource/tests/metal_tests.rs` makes its compute pipeline state).
 #include <metal_stdlib>
 using namespace metal;
 
