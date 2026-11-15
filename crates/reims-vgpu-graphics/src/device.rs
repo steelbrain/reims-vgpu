@@ -221,6 +221,7 @@ use std::time::Duration;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use zerocopy::{FromBytes, IntoBytes};
 
+use crate::clock::now_ns;
 use crate::control;
 use crate::device::backlog::Backlog;
 use crate::device::gate::{Gate, Look, Offer, Waited};
@@ -3967,19 +3968,6 @@ fn event_header(r#type: u32) -> RgfxMsgHeader {
 /// A `SUBMIT_ROOM` record: its header alone, `seqno` 0.
 fn submit_room() -> Vec<u8> {
     sized(&event_header(RGFX_EVT_SUBMIT_ROOM))
-}
-
-/// The host's monotonic clock, in nanoseconds.
-fn now_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `clock_gettime` writes the timespec.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    let secs = u64::try_from(ts.tv_sec).unwrap_or(0);
-    let nanos = u64::try_from(ts.tv_nsec).unwrap_or(0);
-    secs.saturating_mul(1_000_000_000).saturating_add(nanos)
 }
 
 #[cfg(test)]

@@ -18,6 +18,7 @@
 //! - [`keep`] is how long the device's pools of threads, and the host's, keep a thread with
 //!   nothing to do.
 
+mod clock;
 mod control;
 pub mod device;
 pub mod display;
