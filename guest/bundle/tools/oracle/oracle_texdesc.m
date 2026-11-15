@@ -32,7 +32,8 @@
 // of the texture's bytes rounded up to 64 KiB plus 64 KiB, at least 1 MiB and at most
 // maxBufferLength; `buffer` a Shared buffer's newTextureWithDescriptor:offset:bytesPerRow: at
 // offset 0, bytesPerRow the texture's bytes rounded up to 256, over a buffer of LEN bytes (default
-// those bytes, at most maxBufferLength rounded down to 4096). --texbuf runs the formats R8Sint (1
+// those bytes, at most maxBufferLength rounded down to 4096); ORACLE_TB_CAP, where set, caps the
+// heap's and the buffer's bytes below maxBufferLength. --texbuf runs the formats R8Sint (1
 // byte), RG8Unorm (2), RGBA8Unorm (4), RG32Float (8) and RGBA32Float (16) at the widths kTbWidths
 // lists (over a buffer, also over one of 4096 bytes), then, for each format, the largest width
 // made and the largest width that does not end the process, by bisection from 1 to 2^36. Lines:
@@ -394,7 +395,12 @@ static id<MTLTexture> tbMake(id<MTLDevice> d, int creator, const char *creatorNa
 	       (unsigned long)td.arrayLength, (unsigned long)td.mipmapLevelCount,
 	       (unsigned long)td.sampleCount, (unsigned long)td.usage, (unsigned long)td.storageMode);
 	id<MTLTexture> t = nil;
-	const unsigned long long maxLength = d.maxBufferLength;
+	// ORACLE_TB_CAP caps the heap's and the buffer's bytes below maxBufferLength, for a run whose
+	// host holds less than the device answers (a guest's).
+	unsigned long long maxLength = d.maxBufferLength;
+	const char *cap = getenv("ORACLE_TB_CAP");
+	if (cap != NULL && strtoull(cap, NULL, 10) != 0 && strtoull(cap, NULL, 10) < maxLength)
+		maxLength = strtoull(cap, NULL, 10);
 	switch (creator) {
 	case kDevice:
 		printf("\n");
