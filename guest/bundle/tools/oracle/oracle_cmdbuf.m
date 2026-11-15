@@ -53,8 +53,8 @@
 //             buffer of a second queue waits for the value; the value it leaves on an event at 5
 //             (3, 7, two signals in either order) against a GPU signal and a CPU set of 3; the
 //             order against GPU signals of the buffer; against a wait of the buffer on another
-//             event, encoded before and after it, and behind a kernel; against a wait on the same
-//             event; and the queue of a listener's block. Times are ms from the commit.
+//             event, encoded before and after it, and behind a kernel, and of an earlier buffer of
+//             its queue; against a wait on the same event; and the queue of a listener's block. Times are ms from the commit.
 //   schedsig_open, schedsig_late, schedsig_nil, schedsig_nil_unretained, schedsig_plain,
 //   schedsig_plain_unretained
 //             the same call with a blit encoder open, after the commit, with a nil event and with
@@ -1226,6 +1226,33 @@ static void case_schedsig(void)
 			printf("\n");
 		}
 	}
+
+	printf("    e. buffer A waits W 1, tiny blit; buffer B behind it on the queue: scheduled signal 1, tiny blit "
+	       "(ms from B's commit):");
+	for (int k = 0; k < 3; k++) {
+		id<MTLSharedEvent> ev = [D newSharedEvent], w = [D newSharedEvent];
+		id<MTLCommandBuffer> a = [Q commandBuffer];
+		[a encodeWaitForEvent:w value:1];
+		enc_tiny(a, small);
+		id<MTLCommandBuffer> b = [Q commandBuffer];
+		sched_signal(b, ev, 1);
+		enc_tiny(b, small);
+		__block volatile double tp = 0, t0 = 0;
+		dispatch_group_t g = dispatch_group_create();
+		poll_event(g, ev, 1, &t0, &tp);
+		[a commit];
+		double c = oracle_now_ms();
+		t0 = c;
+		[b commit];
+		usleep(200000);
+		double set = oracle_now_ms() - c;
+		w.signaledValue = 1;
+		[b waitUntilCompleted];
+		dispatch_group_wait(g, dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC));
+		printf(" [set at %.1f; 1 read at %.2f; %s]", set, tp ? tp - c : -1, status_name(b.status));
+		usleep(5000);
+	}
+	printf("\n");
 
 	printf("  8. the same event: a scheduled signal and a wait on it in one buffer, no CPU set (up to 8 s)\n");
 	{
