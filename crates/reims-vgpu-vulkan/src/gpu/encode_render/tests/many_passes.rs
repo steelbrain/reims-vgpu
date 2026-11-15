@@ -423,7 +423,7 @@ fn many_passes(over: Backed, width: u64) {
     let (p, d) = (platform(), dev());
     // Until the device's in-place check answers, a target over guest pages is shadowed, and each
     // pass's shadow grows the device's memory: settle it, so the count is of the passes alone.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     crate::gpu::device::tests::settle_device_checks(&d);
     let row = 4 * width;
     let len = row * H;

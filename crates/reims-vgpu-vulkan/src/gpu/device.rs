@@ -2042,8 +2042,9 @@ pub(crate) mod tests {
     /// is adopted: its in-place, queue-switch and submission checks. They make, import and submit
     /// through the program's paths, the runtime counts their imports with the program's, and the
     /// device's first makings and imports can wait behind them. A test that counts the device's
-    /// work, or waits for the runtime's thread, settles them first. Linux's, as are those tests.
-    #[cfg(target_os = "linux")]
+    /// work, or waits for the runtime's thread, settles them first. Linux's and Windows's, as are
+    /// those tests.
+    #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn settle_device_checks(d: &VulkanDevice) {
         let wait = std::time::Duration::from_secs(60);
         let _ = d.raw.settle_in_place_checks(wait);
@@ -2486,7 +2487,7 @@ pub(crate) mod tests {
         let (width, height, pitch) = (align / 4 + 1, 8, 2 * align);
         // The checks the device starts make images of their own: they end before the counts are
         // read, so only this test's textures move them.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         settle_device_checks(&d);
         let desc = platform().texture_descriptor(&TextureDesc {
             pixel_format: 80,
@@ -2578,7 +2579,7 @@ pub(crate) mod tests {
 
         const PRIVATE: u64 = 0x20;
         let d = dev();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         settle_device_checks(&d);
         let counts = || {
             let counts = d.raw.work_counts();
@@ -2680,7 +2681,7 @@ pub(crate) mod tests {
 
         const PRIVATE: u64 = 0x20;
         let d = dev();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         settle_device_checks(&d);
         let line = d.raw.in_place_check_line();
         let align = d.linear_row_alignment();
