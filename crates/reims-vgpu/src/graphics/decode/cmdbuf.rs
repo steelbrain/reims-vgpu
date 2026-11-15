@@ -493,11 +493,25 @@ impl Line {
     }
 
     /// Notes `askable`, a buffer just begun whose `CB_SCHEDULED` an ask may post, last in the
-    /// queue's order; those whose records went, or that ended uncommitted, leave.
+    /// queue's order; those at the front whose records went, or that ended uncommitted, leave
+    /// first. A queue's records are posted in its order, so its asks close in it, but for a buffer
+    /// that ends uncommitted, which leaves once those before it have: an ask of one that closed
+    /// does nothing, here or gone ([`Askable::ask`]). Only the front is looked at: the retain over
+    /// every open ask, which took each one's lock (and its record's) on every begin, took 0.47 µs
+    /// of a Super Resolution buffer's begin on the Iris Xe host (**measured** 2026-11-14, laps of
+    /// the begin, gpre m3-max-31335).
     fn askable(&self, askable: Arc<Askable>) {
         let mut asks = self.asks.lock();
-        asks.retain(|a| a.open());
+        while asks.front().is_some_and(|a| !a.open()) {
+            asks.pop_front();
+        }
         asks.push_back(askable);
+    }
+
+    /// How many asks the queue keeps (for the tests).
+    #[cfg(test)]
+    fn asks_kept(&self) -> usize {
+        self.asks.lock().len()
     }
 
     /// The buffer at `seqno`, `cb_obj_id`, where an ask may still post its `CB_SCHEDULED`.
@@ -5704,6 +5718,60 @@ mod tests {
 
     /// The records a decoder of [`posting`] posted: each one's type, buffer and seqno.
     type Posted = Arc<Mutex<Vec<(u32, u64, u64)>>>;
+
+    /// A queue's asks leave from the front, once closed, at a begin: one that closes behind an
+    /// open one (a buffer that ended uncommitted) waits there, and an ask of it posts nothing, as
+    /// an ask of one gone does; once those before it close, the next begin lets them all go. An
+    /// ask of a buffer committed and posted posts nothing again.
+    #[test]
+    fn closed_asks_leave_from_the_front() {
+        let line = Line::default();
+        let sequencer = Arc::new(super::super::sequencer::Sequencer::default());
+        let posted = Arc::new(Mutex::new(Vec::new()));
+        let sink: ScheduledSink = {
+            let posted = Arc::clone(&posted);
+            Arc::new(move |r: RgfxCbScheduled| posted.lock().push(r.cb_obj_id))
+        };
+        // A buffer at `seqno` begun on the queue, its `CB_SCHEDULED` an ask may post.
+        let begin = |seqno: u64| {
+            let scheduled = Arc::new(Scheduled {
+                sink: Arc::clone(&sink),
+                record: scheduled_record(100 + seqno, seqno),
+                posted: Mutex::new(false),
+                owed: None,
+            });
+            let askable = Arc::new(Askable {
+                seqno,
+                cb_obj_id: 100 + seqno,
+                context: None,
+                state: Mutex::new(Asking::Begun(Arc::clone(&scheduled))),
+            });
+            line.askable(Arc::clone(&askable));
+            (askable, scheduled)
+        };
+        let (first, first_scheduled) = begin(1);
+        let (second, _) = begin(2);
+        second.end(false);
+        let _third = begin(3);
+        assert_eq!(line.asks_kept(), 3, "the second waits behind the first");
+        line.asked(2, 102).expect("kept").ask(&sequencer);
+        assert!(
+            posted.lock().is_empty(),
+            "an ask of the ended buffer posts nothing"
+        );
+        first.end(true);
+        first_scheduled.post();
+        assert_eq!(*posted.lock(), [101]);
+        let _fourth = begin(4);
+        assert_eq!(
+            line.asks_kept(),
+            2,
+            "the first two left: the third and the fourth"
+        );
+        assert!(line.asked(1, 101).is_none() && line.asked(2, 102).is_none());
+        first.ask(&sequencer);
+        assert_eq!(*posted.lock(), [101], "posted once");
+    }
 
     /// A command buffer that asks for its `CB_SUBMITTED` gets it once, ahead of its
     /// `CB_SCHEDULED` and `CB_COMPLETE`, at its seqno; one that does not ask gets none.
