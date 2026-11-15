@@ -383,14 +383,14 @@ fn writes_over_surface_planes_are_stored() {
 /// Metal's GPU drops on this host, leaves them as they were. A `BGRA8Unorm` texture over a buffer
 /// written so completes, its bytes written.
 ///
-/// 500's is checked as the process runs by default, not strict. Where the device's own sampler
-/// Y′CbCr conversion reads 500's planes (Iris Xe; the Mac's runtime reads them in place), the
-/// dispatch announces `ycbcr-filter-not-exact` for the texture the argument buffer holds, though
-/// the kernel only writes it: strict, that dies at the dispatch, and the test takes that death
-/// and no other.
+/// A kernel that only writes 500's texture announces nothing, so strict too it completes, where
+/// the device's own sampler Y′CbCr conversion reads 500's planes (Iris Xe) as where the runtime
+/// reads them in place (the Mac): the runtime converts the planes of such a texture only for a
+/// command that reads it (its RUNTIME 2312).
 #[test]
 fn writes_through_argument_buffers_of_two_plane_ycbcr_textures_are_the_slots() {
     for (format, ostype, stored) in [
+        (500, b"420v", false),
         (503, b"444v", true),
         (523, b"444v", true),
         (542, b"444v", true),
@@ -400,20 +400,6 @@ fn writes_through_argument_buffers_of_two_plane_ycbcr_textures_are_the_slots() {
     ] {
         let got = changed(Op::Held, format, ostype, HELD);
         assert_eq!(got, Ok(stored), "{format}");
-    }
-    let got = crate::answer::relaxed(|| changed(Op::Held, 500, b"420v", HELD));
-    assert_eq!(got, Ok(false), "500");
-    match changed(Op::Held, 500, b"420v", HELD) {
-        Ok(changed) => assert!(!changed, "500 strict"),
-        Err((site, line)) => {
-            assert_eq!(
-                site, "dispatchThreads:threadsPerThreadgroup:",
-                "500 strict: {line}"
-            );
-            let named =
-                "the Vulkan runtime degraded it (metal2vulkan-degrade-ycbcr-filter-not-exact)";
-            assert!(line.starts_with(named), "500 strict: {line}");
-        }
     }
     let (w, h) = HELD;
     let row = 256;

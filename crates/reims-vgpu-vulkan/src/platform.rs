@@ -497,13 +497,19 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
 /// so a CPU write after the commit never reaches a command buffer committed before it, as on the
 /// Radeon Pro 5300M, where the default has the GPU copy the range from the host copy as the
 /// submission runs, so such a write may be read, as on the UHD 630 (`managed_copy_in`,
-/// `ManagedCopyInPolicy::AtCommit`). [`EXACT_ALL`] names every one. The
+/// `ManagedCopyInPolicy::AtCommit`), and an indirect command buffer's records in the runtime's
+/// own pages imported by their pointer wherever the device imports host pointers, so a recovery
+/// of the device keeps them as the CPU and the GPU left them, as Metal does, where the default
+/// lays them in pooled host-visible memory on a device where a held pointer import costs every
+/// submission (RADV; ANV on i915), whose recovery loses them and writes them again as a new
+/// buffer's (`indirect_records`, `IndirectRecordsPolicy::Carried`). [`EXACT_ALL`] names every
+/// one. The
 /// policy's `completion` is no name of these: every device takes its exact form
 /// ([`exact_policy`]). Nor is its `heap_compression`, whose uncompressed form [`EXACT_ALL`]
 /// alone takes. The rest of Metal's values the runtime answers with the
 /// device's own arithmetic, sampling and conversions, each difference a precision note it
 /// records, with no exact form to name.
-pub const EXACT_FORMS: [&str; 13] = [
+pub const EXACT_FORMS: [&str; 14] = [
     "batch_order",
     "host_page_textures",
     "half_chains",
@@ -517,6 +523,7 @@ pub const EXACT_FORMS: [&str; 13] = [
     "heap_answers",
     "rate_map_regions",
     "managed_copy_in",
+    "indirect_records",
 ];
 
 /// The name `REIMS_VGPU_EXACT` takes for the runtime's `DevicePolicy::exact_answers()`: every
@@ -574,8 +581,9 @@ fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
     use metal2vulkan::device::{
         BatchOrderPolicy, CompletionPolicy, DevicePolicy, DontCareColorPolicy,
         ExtendedRangeBlitPolicy, HalfChainPolicy, HeapAnswerPolicy, HostPageTexturePolicy,
-        ManagedCopyInPolicy, PipelineWaitPolicy, QueueSharingPolicy, RateMapRegionPolicy,
-        UnstoredDontCarePolicy, VertexReachPolicy, WideLinePolicy, YCbCrInPlacePolicy,
+        IndirectRecordsPolicy, ManagedCopyInPolicy, PipelineWaitPolicy, QueueSharingPolicy,
+        RateMapRegionPolicy, UnstoredDontCarePolicy, VertexReachPolicy, WideLinePolicy,
+        YCbCrInPlacePolicy,
     };
     let mut policy = DevicePolicy::default();
     policy.completion = CompletionPolicy::Exact;
@@ -600,6 +608,7 @@ fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
             "heap_answers" => policy.heap_answers = HeapAnswerPolicy::Metal,
             "rate_map_regions" => policy.rate_map_regions = RateMapRegionPolicy::Exact,
             "managed_copy_in" => policy.managed_copy_in = ManagedCopyInPolicy::AtCommit,
+            "indirect_records" => policy.indirect_records = IndirectRecordsPolicy::Carried,
             other => {
                 let line = format!(
                     "reims-vgpu: REIMS_VGPU_EXACT names {other:?}, none of {EXACT_ALL}, {}: \
@@ -873,9 +882,9 @@ pub(crate) mod tests {
         use metal2vulkan::device::{
             BatchOrderPolicy, CompletionPolicy, DevicePolicy, DontCareColorPolicy,
             ExtendedRangeBlitPolicy, HalfChainPolicy, HeapAnswerPolicy, HeapCompressionPolicy,
-            HostPageTexturePolicy, ManagedCopyInPolicy, PipelineWaitPolicy, QueueSharingPolicy,
-            RateMapRegionPolicy, UnstoredDontCarePolicy, VertexReachPolicy, WideLinePolicy,
-            YCbCrInPlacePolicy,
+            HostPageTexturePolicy, IndirectRecordsPolicy, ManagedCopyInPolicy, PipelineWaitPolicy,
+            QueueSharingPolicy, RateMapRegionPolicy, UnstoredDontCarePolicy, VertexReachPolicy,
+            WideLinePolicy, YCbCrInPlacePolicy,
         };
         let runtimes = DevicePolicy::default();
         assert_eq!(runtimes.completion, CompletionPolicy::Grouped);
@@ -900,6 +909,7 @@ pub(crate) mod tests {
         assert_eq!(fast.vertex_reach, VertexReachPolicy::Bounded);
         assert_eq!(fast.rate_map_regions, RateMapRegionPolicy::FanOut);
         assert_eq!(fast.managed_copy_in, ManagedCopyInPolicy::AtSubmission);
+        assert_eq!(fast.indirect_records, IndirectRecordsPolicy::Untaxed);
         for unchanged in [
             None,
             Some(""),
@@ -915,7 +925,7 @@ pub(crate) mod tests {
         }
         let one = |name| exact_policy(Some(name));
         type Set = fn(&mut DevicePolicy);
-        let alone: [(&str, Set); 13] = [
+        let alone: [(&str, Set); 14] = [
             ("batch_order", |p| p.batch_order = BatchOrderPolicy::Exact),
             ("host_page_textures", |p| {
                 p.host_page_textures = HostPageTexturePolicy::Shadow;
@@ -949,6 +959,9 @@ pub(crate) mod tests {
             ("managed_copy_in", |p| {
                 p.managed_copy_in = ManagedCopyInPolicy::AtCommit;
             }),
+            ("indirect_records", |p| {
+                p.indirect_records = IndirectRecordsPolicy::Carried;
+            }),
         ];
         assert_eq!(alone.map(|(name, _)| name), EXACT_FORMS);
         let mut every = fast;
@@ -961,7 +974,7 @@ pub(crate) mod tests {
         }
         let named = " half_chains,wide_lines,pipeline_waits,host_page_textures , batch_order,\
                      queue_sharing,extended_range_blits,dont_care_colors,unstored_dont_care_loads,\
-                     vertex_reach,heap_answers,rate_map_regions,managed_copy_in";
+                     vertex_reach,heap_answers,rate_map_regions,managed_copy_in,indirect_records";
         assert_eq!(exact_policy(Some(named)), every);
         assert_eq!(exact_policy(Some(&EXACT_FORMS.join(","))), every);
         assert_eq!(every.heap_compression, HeapCompressionPolicy::Compressed);
