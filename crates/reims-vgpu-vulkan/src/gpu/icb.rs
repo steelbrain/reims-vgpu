@@ -3274,6 +3274,7 @@ mod tests {
             .unwrap();
         let made = || {
             let icb = make::<P>(d, &compute_desc(), 1);
+            // The command borrows the buffer: it goes before the buffer moves out.
             let command = icb.compute_command(0).unwrap().unwrap();
             command
                 .encode(IcbComputeCmd::SetKernelBuffer {
@@ -3282,6 +3283,7 @@ mod tests {
                     index: 0,
                 })
                 .unwrap();
+            drop(command);
             icb
         };
         let first = buffer_first.then(&made);
