@@ -155,6 +155,39 @@ impl CommandBuffer<FakePlatform> for Fk<kind::CommandBuffer> {
         Ok(next)
     }
 
+    /// `None`, logging nothing, until the world splits command buffers, as [`Self::split`]; then
+    /// logged, and a new command buffer answered, uncommitted.
+    fn part(&self, on: OnFault) -> RaiseResult<Option<<FakePlatform as Platform>::CommandBuffer>> {
+        if !self.world().splits() {
+            return Ok(None);
+        }
+        self.make(Policy::On(on), "part", vec![], |w| {
+            Some(w.new_obj::<kind::CommandBuffer>(Model::CommandBuffer(
+                CommandBufferModel::default(),
+            )))
+        })
+    }
+
+    /// Logged: as scripted ([`PartCut`], [`crate::core::testkit::script::Step::value`]), else
+    /// [`PartCut::Cut`] while the world splits command buffers and [`PartCut::Whole`] otherwise;
+    /// committed as at `commit` where it answers [`PartCut::Cut`].
+    fn commit_part(&self, on: OnFault) -> RaiseResult<PartCut> {
+        let splits = self.world().splits();
+        let cut = self.thr(Policy::On(on), "commitPart", vec![], || match splits {
+            true => PartCut::Cut,
+            false => PartCut::Whole,
+        })?;
+        if cut == PartCut::Cut {
+            super::super::objects::commit_obj(self.obj());
+        }
+        Ok(cut)
+    }
+
+    /// Logged, with `later`'s id; `later` let go of.
+    fn fold(&self, later: <FakePlatform as Platform>::CommandBuffer) {
+        fatal(self.act(Policy::Fatal, "fold", vec![Arg::obj(&later)]));
+    }
+
     fn encode_signal(
         &self,
         event: Option<EventRef<'_, FakePlatform>>,

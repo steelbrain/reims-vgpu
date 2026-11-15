@@ -35,6 +35,15 @@
 //!   so a guest whose walk faults after a part was committed has that part's work run, as for a
 //!   buffer of render passes (`reims-vgpu`'s `decode/split.rs`); Metal would have run none of a
 //!   buffer it never committed. Only invalid input reaches that.
+//!
+//!   A later range of a buffer's work may be encoded at once, on another thread
+//!   (`decode/split.rs`, "Two ranges at once"): `part` makes the command buffer it goes into on
+//!   the queue, uncommitted, where the buffer may be cut then, and at the end of the range before
+//!   it `commit_part` commits the buffer as a part where it may be cut, as `split` does, the later
+//!   one going on from it. Where only a way Metal's GPU fails it from an encoder on keeps it whole
+//!   ([`CommandBufferObject::fails_from_an_encoder`]), `commit_part` commits nothing and answers
+//!   so, and `fold` takes the later one's ways of failing into it, as though its encoders had
+//!   been made there, and lets the later one go uncommitted: its encoders run nothing either way.
 //! - **The records of an indirect command buffer an execution runs** are checked by the runtime
 //!   as they stand at commit, or, where the GPU may have written them, once the work before the
 //!   execution completed. A refusal at commit dies there naming the runtime's refusal, and says
@@ -176,7 +185,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::core::platform::Handle;
 use crate::core::platform::command::committing as committing_here;
 use crate::core::platform::command::{
-    CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo, ScheduledHandler, run_completed,
+    CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo, PartCut, ScheduledHandler,
+    run_completed,
 };
 use crate::core::platform::event::EventRef;
 use crate::core::platform::types::{CommandBufferStatus, NsErrorText};
@@ -423,6 +433,94 @@ impl CommandBufferObject {
                 && !self.signals_scheduled.load(Ordering::SeqCst)
                 && !self.committed.load(Ordering::SeqCst)
         })
+    }
+
+    /// Whether it is kept whole ([`CommandBufferObject::splits`]) only by how Metal's GPU fails it
+    /// for what its encoders did, a draw of primitive type 9 or a store into read-only memory,
+    /// each from an encoder on, every encoder after it running nothing: then a later range's
+    /// encoders run nothing in it either, and need only what they noted of how they fail
+    /// ([`CommandBufferObject::fold`]).
+    fn fails_from_an_encoder(&self) -> bool {
+        plain(|| {
+            let fails = !self.failing.lock().is_empty()
+                || !self.by_runtime.lock().is_empty()
+                || !self.stores.lock().is_empty();
+            fails
+                && self.open_encoders.load(Ordering::SeqCst) == 0
+                && {
+                    let protection = self.protection.lock();
+                    protection.options == 0 && !protection.used
+                }
+                && self.executions.lock().is_empty()
+                && self.progress.lock().is_none()
+                && self.predication.cuttable()
+                && !self.signals_scheduled.load(Ordering::SeqCst)
+                && !self.committed.load(Ordering::SeqCst)
+        })
+    }
+
+    /// Takes in what `later`, made for a later range of its work (`CommandBuffer::part`) and
+    /// encoded, noted of how Metal's GPU fails it, each failing encoder's place counted after
+    /// this one's encoders, and the encoders it made; and the tiler's submission handler, where
+    /// `later` took it and this one did not ([`CommandBufferObject::tiler_work`]): so its commit
+    /// answers as it would had `later`'s encoders been made in it ([`CommandBufferObject::failure`]),
+    /// a way of failing of `later`'s beside its own dying where two would. Called where it fails
+    /// from an encoder on ([`CommandBufferObject::fails_from_an_encoder`]), before every one of
+    /// `later`'s, which run nothing.
+    fn fold(&self, later: &CommandBufferObject) {
+        let base = self.made.load(Ordering::SeqCst);
+        let after = |ways: &Mutex<Vec<Failing>>| -> Vec<Failing> {
+            (ways.lock().iter())
+                .map(|w| Failing {
+                    from: w.from + base,
+                    ..*w
+                })
+                .collect()
+        };
+        plain(|| {
+            let (failing, by_runtime, stores) = (
+                after(&later.failing),
+                after(&later.by_runtime),
+                after(&later.stores),
+            );
+            self.failing.lock().extend(failing);
+            self.by_runtime.lock().extend(by_runtime);
+            self.stores.lock().extend(stores);
+        });
+        (self.made).fetch_add(later.made.load(Ordering::SeqCst), Ordering::SeqCst);
+        if later.tiler.load(Ordering::SeqCst) && !self.tiler.swap(true, Ordering::SeqCst) {
+            get("commit", || {
+                self.raw.add_submission_handler(tiler_handler())
+            });
+        }
+    }
+
+    /// The next part of it, made on its queue ([`CommandBuffer::split`], `CommandBuffer::part`):
+    /// a command buffer of no encoder yet, its predication going on from this one's, as the unit
+    /// of compute encoders open at a cut goes on in the next part. Its make waits while the
+    /// queue holds 64 uncompleted command buffers, as `commandBuffer` does.
+    fn next_part(&self) -> RaiseResult<VulkanCommandBuffer> {
+        let raw = waiting("commandBuffer", || {
+            self.raw.command_queue().command_buffer()
+        })?;
+        let predication = Predication::new(&self.device);
+        predication.go_on(&self.predication);
+        Ok(Obj::new(CommandBufferObject {
+            raw,
+            device: self.device.clone_ref(),
+            open_encoders: Arc::default(),
+            progress: Mutex::new(None),
+            predication,
+            committed: AtomicBool::new(false),
+            made: AtomicUsize::new(0),
+            failing: Mutex::new(Vec::new()),
+            by_runtime: Mutex::new(Vec::new()),
+            stores: Mutex::new(Vec::new()),
+            protection: Mutex::new(Protection::default()),
+            tiler: AtomicBool::new(false),
+            executions: Mutex::new(Vec::new()),
+            signals_scheduled: AtomicBool::new(false),
+        }))
     }
 
     /// Records `failing`, which its commit fails it with ([`CommandBufferObject::failure`]).
@@ -1451,30 +1549,42 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         if !self.splits() {
             return Ok(None);
         }
-        let raw = waiting("commandBuffer", || {
-            self.raw.command_queue().command_buffer()
-        })?;
-        let predication = Predication::new(&self.device);
-        // The unit of compute encoders open at the cut goes on in the next part.
-        predication.go_on(&self.predication);
-        let next = Obj::new(CommandBufferObject {
-            raw,
-            device: self.device.clone_ref(),
-            open_encoders: Arc::default(),
-            progress: Mutex::new(None),
-            predication,
-            committed: AtomicBool::new(false),
-            made: AtomicUsize::new(0),
-            failing: Mutex::new(Vec::new()),
-            by_runtime: Mutex::new(Vec::new()),
-            stores: Mutex::new(Vec::new()),
-            protection: Mutex::new(Protection::default()),
-            tiler: AtomicBool::new(false),
-            executions: Mutex::new(Vec::new()),
-            signals_scheduled: AtomicBool::new(false),
-        });
+        let next = self.next_part()?;
         self.commit(on)?;
         Ok(Some(next))
+    }
+
+    /// The command buffer of its queue a later range of its work is encoded into while the rest
+    /// of its own is (`CommandBuffer::part`), made now where it may be cut now
+    /// ([`CommandBufferObject::splits`]), as `split` makes the next part, its predication going
+    /// on from this one's; `None` otherwise. The range before it holds no compute encoder, so
+    /// the unit carried is the one at the make.
+    fn part(&self, _on: OnFault) -> RaiseResult<Option<VulkanCommandBuffer>> {
+        if !self.splits() {
+            return Ok(None);
+        }
+        self.next_part().map(Some)
+    }
+
+    /// Commits it as a part where it may be cut ([`CommandBufferObject::splits`]); else nothing,
+    /// [`PartCut::Fails`] where it is kept whole only by how Metal's GPU fails it from one of its
+    /// encoders on ([`CommandBufferObject::fails_from_an_encoder`]), every encoder after it
+    /// running nothing.
+    fn commit_part(&self, on: OnFault) -> RaiseResult<PartCut> {
+        if self.splits() {
+            self.commit(on)?;
+            return Ok(PartCut::Cut);
+        }
+        Ok(match self.fails_from_an_encoder() {
+            true => PartCut::Fails,
+            false => PartCut::Whole,
+        })
+    }
+
+    /// Takes in how Metal's GPU fails `later`'s encoders, as though they had been made in this
+    /// one after its own ([`CommandBufferObject::fold`]).
+    fn fold(&self, later: VulkanCommandBuffer) {
+        CommandBufferObject::fold(self, &later);
     }
 
     /// The runtime's, but once an encoder made under protection options failed it, after which

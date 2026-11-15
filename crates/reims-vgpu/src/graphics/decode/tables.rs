@@ -630,6 +630,22 @@ impl<P: Platform> View<P> {
         }
     }
 
+    /// A view of the same table at this one's clock, with what this one found and the message's
+    /// own changes it holds: it names what this one names, for a range of the message's command
+    /// buffer walked on another thread beside the rest ([`super::split`], "Two ranges at once").
+    /// The entries it keeps are let go of once both have closed, as any open view's are.
+    pub(crate) fn twin(&self) -> Self {
+        {
+            let mut t = self.context.tables.write();
+            *t.views.entry(self.at).or_default() += 1;
+        }
+        View {
+            context: Arc::clone(&self.context),
+            at: self.at,
+            seen: RefCell::new(self.seen.borrow().clone()),
+        }
+    }
+
     /// The table's clock at the view's taking.
     pub(crate) fn at(&self) -> u64 {
         self.at

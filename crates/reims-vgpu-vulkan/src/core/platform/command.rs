@@ -21,6 +21,17 @@ pub struct CompletedInfo {
     pub gpu_times_ns: Option<(u64, u64)>,
 }
 
+/// What [`CommandBuffer::commit_part`] made of a command buffer at the end of a range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartCut {
+    /// Committed as a part: the rest goes on in the command buffer [`CommandBuffer::part`] made.
+    Cut,
+    /// Not committed: it fails from one of its encoders on, every one after it running nothing.
+    Fails,
+    /// Not committed: it may not be cut, and runs every encoder encoded into it.
+    Whole,
+}
+
 /// The domain of the error a command buffer completes with where the platform's read of it, as
 /// its completed handler ran, died in the refusal scope the handler's registration carried
 /// ([`crate::core::raise::refusals::carry`]): the platform failed it there, where outside every scope
@@ -243,6 +254,36 @@ pub trait CommandBuffer<P: Platform>: Handle {
     fn split(&self, on: OnFault) -> RaiseResult<Option<P::CommandBuffer>> {
         let _ = on;
         Ok(None)
+    }
+    /// The platform's own, no Metal call: a command buffer of the same queue, made now and not
+    /// committed, for the caller to encode a later range of this one's work into on another
+    /// thread while it encodes the rest of this one's, and to commit as its last part once this
+    /// one is committed as a part ([`Self::commit_part`]). `None` where this one may not be cut
+    /// now ([`Self::split`]'s refusals): the default. Its make waits as `split`'s does; the
+    /// caller leaves room.
+    fn part(&self, on: OnFault) -> RaiseResult<Option<P::CommandBuffer>> {
+        let _ = on;
+        Ok(None)
+    }
+    /// The platform's own, no Metal call, at the end of the range encoded into this one before
+    /// the one [`Self::part`] made, no encoder open: commits this one as a part, as
+    /// [`Self::split`] does, where it may be cut ([`PartCut::Cut`]); else commits nothing, and
+    /// answers [`PartCut::Fails`] where it fails from one of its encoders on, every encoder
+    /// after it running nothing, as Metal's GPU fails a command buffer for what its encoders did
+    /// (the caller then folds the later one into it, [`Self::fold`], and commits it as the
+    /// whole), and [`PartCut::Whole`] otherwise. The default: [`PartCut::Whole`].
+    fn commit_part(&self, on: OnFault) -> RaiseResult<PartCut> {
+        let _ = on;
+        Ok(PartCut::Whole)
+    }
+    /// The platform's own, no Metal call: this command buffer, which fails from one of its
+    /// encoders on ([`PartCut::Fails`]), takes in what `later`, the command buffer [`Self::part`]
+    /// made for its later range and encoded, noted of how Metal's GPU fails it, as though its
+    /// encoders had been this one's, after this one's own; `later` is let go of uncommitted. Its
+    /// encoders run nothing in either: they follow the one this fails from. The default: `later`
+    /// let go of.
+    fn fold(&self, later: P::CommandBuffer) {
+        drop(later);
     }
     /// The platform's own, no Metal call: asked before the commit, the buffer's completion is
     /// exported as a sync file once it is committed ([`Self::export_completion_sync_file`]).

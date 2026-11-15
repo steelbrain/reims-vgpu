@@ -99,8 +99,14 @@ use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use reims_vgpu_graphics::ops::blit::{
+    RGFX_OP_BLIT_COPY_INDIRECT_COMMAND_BUFFER, RGFX_OP_BLIT_OPTIMIZE_INDIRECT_COMMAND_BUFFER,
+    RGFX_OP_BLIT_RESET_COMMANDS_IN_BUFFER,
+};
 use reims_vgpu_graphics::ops::render::{
-    RGFX_OP_RENDER_DRAW_PRIMITIVES, RGFX_OP_RENDER_SET_VERTEX_BUFFER, RgfxOpDrawPrimitives,
+    RGFX_OP_RENDER_DRAW_PRIMITIVES, RGFX_OP_RENDER_EXECUTE_COMMANDS_IN_BUFFER,
+    RGFX_OP_RENDER_EXECUTE_COMMANDS_INDIRECT, RGFX_OP_RENDER_SET_VERTEX_BUFFER,
+    RGFX_OP_RENDER_USE_RESOURCES, RGFX_OP_RENDER_USE_RESOURCES_STAGES, RgfxOpDrawPrimitives,
     RgfxOpSetVertexBuffer,
 };
 use reims_vgpu_graphics::ops::{
@@ -125,7 +131,7 @@ use reims_vgpu_graphics::wire::{
 use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder};
 use reims_vgpu_vulkan::core::platform::caps::{DeviceCaps, SAMPLE_COUNTS};
 use reims_vgpu_vulkan::core::platform::command::{
-    CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo, ScheduledHandler,
+    CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo, PartCut, ScheduledHandler,
 };
 use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder};
 use reims_vgpu_vulkan::core::platform::descriptor::RenderPassDescriptor;
@@ -641,6 +647,21 @@ struct Splitting {
     parts: Option<Arc<Parts>>,
     /// The platform keeps it whole from now on.
     whole: bool,
+}
+
+/// A command buffer's later range, walked by a helper ([`GraphicsDecoder::walk_in_two`]).
+struct Later<P: Platform> {
+    /// The command buffer it was walked into.
+    cb: P::CommandBuffer,
+    /// The walk's outcome.
+    outcome: RaiseResult<Result<(), DecodeError>>,
+    /// The blocks the walk saw written through textures over laid-out device caches or their
+    /// wide homes ([`GraphicsDecoder::reconcile_laid`]).
+    written: Vec<u64>,
+    /// From the hand-over to the helper's start.
+    waited: std::time::Duration,
+    /// The helper's walk.
+    walk: std::time::Duration,
 }
 
 /// The op stream of the `COMMAND_BUFFER` `message` whose fixed part is `m`: all of the message's
@@ -1761,7 +1782,23 @@ impl<P: Platform> GraphicsDecoder<P> {
                 whole: false,
             });
         let mut cb = cb;
-        if let Err(e) = self.walk_ops(ops, &mut cb, &mut events, &mut split)? {
+        // In two ranges at once, where it may be cut and its queue holds room for another command
+        // buffer ([`super::split`], "Two ranges at once").
+        let cut = (split.as_ref())
+            .filter(|s| s.in_flight.load(Ordering::Acquire) < TAKE_IN_FLIGHT_MAX)
+            .and_then(|_| two_ranges(ops, self.ranges_min_bytes()));
+        let walked = match cut {
+            Some(cut) => self.walk_in_two(
+                ops,
+                cut,
+                (queue_obj_id, seqno),
+                &mut cb,
+                &mut events,
+                &mut split,
+            )?,
+            None => self.walk_ops(ops, &mut cb, &mut events, &mut split)?,
+        };
+        if let Err(e) = walked {
             return Ok(Err(e));
         }
         // Its parts' gate, held to its last commit, and their outcome, which its last part's
@@ -2297,15 +2334,219 @@ impl<P: Platform> GraphicsDecoder<P> {
         events: &mut EventOps,
         split: &mut Option<Splitting>,
     ) -> RaiseResult<Result<(), DecodeError>> {
-        let mut encoder: Option<OpenEncoder<P>> = None;
+        self.walk_begins(ops);
+        self.walk_range(ops, cb, events, split)
+    }
+
+    /// What a command buffer's walk does once, before its first op, whatever ranges it is
+    /// walked in: finds the names of its op stream `ops` ([`Self::find_named`]), and forgets
+    /// what an earlier walk on the handle noted of laid-out device caches.
+    fn walk_begins(&self, ops: &[u8]) {
+        #[cfg(test)]
+        (self.shared.walks_begun).fetch_add(1, Ordering::Relaxed);
         self.find_named(ops);
         self.laid_uses.borrow_mut().clear();
         self.laid_written.borrow_mut().clear();
+    }
+
+    /// [`Self::walk_ops`]' walk of `ops`, the whole of a command buffer's op stream or a range
+    /// of it that starts at an encoder's begin, after what it does once ([`Self::walk_begins`]).
+    fn walk_range(
+        &self,
+        ops: &[u8],
+        cb: &mut P::CommandBuffer,
+        events: &mut EventOps,
+        split: &mut Option<Splitting>,
+    ) -> RaiseResult<Result<(), DecodeError>> {
+        let mut encoder: Option<OpenEncoder<P>> = None;
         let walked = refusing(|| self.walk(ops, cb, &mut encoder, events, split));
         if let Some(open) = encoder.take() {
             end_abandoned(open);
         }
         walked
+    }
+
+    /// [`Self::walk_ops`] for a command buffer cut at `cut` bytes of its op stream `ops` into two
+    /// ranges walked at once ([`super::split`], "Two ranges at once"), `queue` and `seqno` its
+    /// queue and its message's, for the trace: the platform makes the command buffer the later
+    /// range goes into now ([`CommandBuffer::part`]), and a helper walks that range into it on a
+    /// handle of its own ([`GraphicsDecoder::twin`], [`super::helpers`]) while this thread walks
+    /// the first range into `cb`, cutting it into parts as a whole walk does
+    /// ([`Self::split_here`]). Then `cb` is committed as a part, waiting where its commit would
+    /// wait ([`Self::wait_to_commit`]) and its context's gate is held ([`SplitGate::split`]),
+    /// and the later range's command buffer is `cb` from then on, the last part, which its
+    /// handlers and records go on. A later range no helper started by the end of the first is
+    /// taken back and walked here, into `cb`, as a whole walk goes on. A walk that faults or
+    /// stops in either range answers as the first does, the first range's first: nothing of the
+    /// later range is committed. Where `cb` fails from one of its encoders on ([`PartCut::Fails`])
+    /// it is kept whole, the later range's command buffer folded into it ([`CommandBuffer::fold`]):
+    /// its encoders, after the failing one, run nothing either way. Each op is walked once, on one
+    /// handle or the other.
+    ///
+    /// [`SplitGate::split`]: super::split::SplitGate::split
+    fn walk_in_two(
+        &self,
+        ops: &[u8],
+        cut: usize,
+        (queue, seqno): (u64, u64),
+        cb: &mut P::CommandBuffer,
+        events: &mut EventOps,
+        split: &mut Option<Splitting>,
+    ) -> RaiseResult<Result<(), DecodeError>> {
+        if split.is_none() {
+            return self.walk_ops(ops, cb, events, split);
+        }
+        let Some(later) = cb.part(ON)? else {
+            return self.walk_ops(ops, cb, events, split);
+        };
+        let place = split.as_ref().map(|s| InFlight::new(&s.in_flight));
+        self.walk_begins(ops);
+        let (first, rest) = ops.split_at(cut);
+        let clock = self.shared.platform.clock();
+        let handed = clock.now_mono();
+        let walked: Arc<Mutex<Option<Later<P>>>> = Arc::default();
+        let job = {
+            let twin = self.twin();
+            let rest = rest.to_vec();
+            let walked = Arc::clone(&walked);
+            let platform = Arc::clone(&self.shared.platform);
+            move || {
+                crate::entry::run(|_| {
+                    let clock = platform.clock();
+                    let started = clock.now_mono();
+                    let mut cb = later;
+                    let mut events = EventOps::default();
+                    let outcome = twin.walk_range(&rest, &mut cb, &mut events, &mut None);
+                    let written = std::mem::take(&mut *twin.laid_written.borrow_mut());
+                    let ended = clock.now_mono();
+                    *walked.lock() = Some(Later {
+                        cb,
+                        outcome,
+                        written,
+                        waited: started.saturating_duration_since(handed),
+                        walk: ended.saturating_duration_since(started),
+                    });
+                    drop(twin);
+                });
+            }
+        };
+        let hand = self.shared.helpers.hand(Box::new(job));
+        #[cfg(test)]
+        if self.shared.helper_first.load(Ordering::Relaxed) {
+            hand.wait_started();
+        }
+        let first_walked = self.walk_range(first, cb, events, split);
+        let first_walk = clock.now_mono().saturating_duration_since(handed);
+        let ns = |d: std::time::Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        // cbpar: queue, seqno, the first range's op bytes, the later range's, 1 where the later
+        // range was taken back (else 0), the first range's walk, the later range's wait for a
+        // helper, its walk, and the first range's wait for it at its end, each in ns
+        let traced = |back: u64, waited: u64, walk: u64, joined: u64| {
+            reims_vgpu_vulkan::core::trace::event(
+                "cbpar",
+                &[
+                    queue,
+                    seqno,
+                    cut as u64,
+                    rest.len() as u64,
+                    back,
+                    ns(first_walk),
+                    waited,
+                    walk,
+                    joined,
+                ],
+            );
+        };
+        // No helper took it: walked here, as a whole walk goes on from the first range's last
+        // encoder's end, where it may cut a part.
+        if let Some(job) = hand.take_back() {
+            drop((job, place));
+            traced(1, 0, 0, 0);
+            if let Err(e) = first_walked? {
+                return Ok(Err(e));
+            }
+            self.split_here(cb, split)?;
+            return self.walk_range(rest, cb, events, split);
+        }
+        // Waited for as a walk, not as a wait of the lane's ([`Lane::waiting`]): it is the walk's.
+        let joining = clock.now_mono();
+        hand.wait();
+        let joined = clock.now_mono().saturating_duration_since(joining);
+        let Some(Later {
+            cb: later,
+            outcome,
+            written,
+            waited,
+            walk,
+        }) = walked.lock().take()
+        else {
+            return Err(op_fault(
+                "a command buffer's later range was walked by no helper",
+            ));
+        };
+        traced(0, ns(waited), ns(walk), ns(joined));
+        if let Err(e) = first_walked? {
+            return Ok(Err(e));
+        }
+        if let Err(e) = outcome? {
+            return Ok(Err(e));
+        }
+        self.laid_written.borrow_mut().extend(written);
+        let Some(s) = split.as_mut() else {
+            return Ok(Ok(()));
+        };
+        // Kept whole at a cut in its first range ([`Self::split_here`]), whose handler sees its
+        // completion: it fails from an encoder there on.
+        if s.whole {
+            drop(place);
+            return match cb.commit_part(ON)? {
+                PartCut::Fails => {
+                    cb.fold(later);
+                    Ok(Ok(()))
+                }
+                PartCut::Cut | PartCut::Whole => Err(kept_whole()),
+            };
+        }
+        // The first range's last part goes now where it could be committed now, as a cut does;
+        // else once every wait of its commit is met, holding its context's gate then.
+        let now = || {
+            (self.may_commit_now())
+                .then(|| self.shared.split_gate.try_split(s.context))
+                .flatten()
+        };
+        let parts_out = s.hold.is_some();
+        let hold = match s.hold.take() {
+            Some(hold) => hold,
+            None => match now() {
+                Some(hold) => hold,
+                None => {
+                    self.wait_to_commit();
+                    self.waiting(|| self.shared.split_gate.split(s.context))
+                }
+            },
+        };
+        let parts = Arc::clone(s.parts.get_or_insert_with(Arc::default));
+        cb.add_completion_seen_handler(ON, parts.part_handler(place))?;
+        match cb.commit_part(ON)? {
+            PartCut::Cut => {
+                *cb = later;
+                s.hold = Some(hold);
+                s.since = clock.now_mono();
+                self.note_part_cut();
+            }
+            PartCut::Fails => {
+                // Kept whole, as a cut the platform refuses keeps it ([`Self::split_here`]): the
+                // handler just added sees its completion, and the gate stays held only where
+                // parts are out.
+                cb.fold(later);
+                s.whole = true;
+                if parts_out {
+                    s.hold = Some(hold);
+                }
+            }
+            PartCut::Whole => return Err(kept_whole()),
+        }
+        Ok(Ok(()))
     }
 
     /// Finds the first [`NAMES_AT_ONCE`] objects of the current context the compute ops of the
@@ -2997,6 +3238,85 @@ fn next_op(ops: &[u8]) -> Option<(u16, &[u8], usize)> {
         return None;
     }
     Some((h.tag, &ops[RGFX_OP_BODY_OFFSET as usize..len], len))
+}
+
+/// The fault of a command buffer walked in two ranges ([`GraphicsDecoder::walk_in_two`]) that the
+/// platform keeps whole at its first range's end, where no encoder fails it: its later range was
+/// walked into another command buffer, which runs nothing then. [`two_ranges`] takes no buffer
+/// whose ops keep it so (the Vulkan platform's `CommandBufferObject::splits`), so it is not
+/// reached; it fails the buffer rather than walk the later range again.
+fn kept_whole() -> Raise {
+    op_fault(
+        "the platform kept a command buffer walked in two ranges whole, with no encoder failing \
+         it: its later range is in another command buffer",
+    )
+}
+
+/// The least op bytes of a command buffer walked in two ranges at once ([`two_ranges`]): one of
+/// fewer walks in a fraction of a millisecond, as long as handing a range over takes on the
+/// walk's thread and the helper's wake.
+pub(super) const RANGES_MIN_BYTES: usize = 16 * 1024;
+
+/// The least encoders of a command buffer walked in two ranges at once ([`two_ranges`]): the
+/// runtime's costs a buffer is cut for come by the encoder (its pass ends, [`super::split`]).
+pub(super) const RANGES_MIN_ENCODERS: usize = 8;
+
+/// Where a command buffer's op stream `ops` is cut to be walked in two ranges at once
+/// ([`super::split`], "Two ranges at once"): the end of the encoder nearest half its bytes, before
+/// its last op, where it holds [`RANGES_MIN_ENCODERS`] encoders and `min_bytes` of ops at least,
+/// every one of them a render or blit encoder or an op the walk reads before it starts
+/// (`SURFACE_USE`, `SUBMITTED`, `SURFACE_ORDER`, `COMMIT_ORDER`, `GUEST_TIMES`), and none of
+/// them a pass of a rasterization rate map, an indirect command buffer's execution, reset, copy
+/// or optimization, or a residency of resources (`useResource:`, which may name an indirect
+/// command buffer): what each of those does keeps the platform's progress of the command buffer,
+/// or commands read at its commit, which keep it whole (the Vulkan platform's
+/// `CommandBufferObject::splits`). So no event's signal or wait, compute or video encoder,
+/// rate map or indirect command buffer lies in either range, and the platform cuts the buffer at
+/// the end of the first, or keeps it whole only where it fails from an encoder in it on
+/// ([`PartCut`]). `None` otherwise, and for a stream that does not parse, which the walk then
+/// faults at. Reads each op's header, and a render pass's flags; a stream shorter than
+/// `min_bytes` is not read.
+fn two_ranges(ops: &[u8], min_bytes: usize) -> Option<usize> {
+    if ops.len() < min_bytes {
+        return None;
+    }
+    let half = ops.len() / 2;
+    let (mut at, mut encoders, mut cut) = (0, 0, None::<usize>);
+    while at < ops.len() {
+        let (tag, body, len) = next_op(&ops[at..])?;
+        match tag {
+            RGFX_OP_ENCODER_BEGIN_RENDER => {
+                let pass = read::<RgfxRenderPassDesc>(body)?;
+                if pass.flags & RGFX_PASS_FLAG_RATE_MAP != 0 {
+                    return None;
+                }
+                encoders += 1;
+            }
+            RGFX_OP_ENCODER_BEGIN_BLIT => encoders += 1,
+            RGFX_OP_ENCODER_END => {
+                let end = at + len;
+                if end < ops.len() && cut.is_none_or(|c| end.abs_diff(half) < c.abs_diff(half)) {
+                    cut = Some(end);
+                }
+            }
+            RGFX_OP_SURFACE_USE
+            | RGFX_OP_SUBMITTED
+            | RGFX_OP_SURFACE_ORDER
+            | RGFX_OP_COMMIT_ORDER
+            | RGFX_OP_GUEST_TIMES => {}
+            RGFX_OP_RENDER_EXECUTE_COMMANDS_IN_BUFFER
+            | RGFX_OP_RENDER_EXECUTE_COMMANDS_INDIRECT
+            | RGFX_OP_RENDER_USE_RESOURCES
+            | RGFX_OP_RENDER_USE_RESOURCES_STAGES
+            | RGFX_OP_BLIT_COPY_INDIRECT_COMMAND_BUFFER
+            | RGFX_OP_BLIT_OPTIMIZE_INDIRECT_COMMAND_BUFFER
+            | RGFX_OP_BLIT_RESET_COMMANDS_IN_BUFFER => return None,
+            tag if matches!(op_group(tag), RGFX_OP_GROUP_RENDER | RGFX_OP_GROUP_BLIT) => {}
+            _ => return None,
+        }
+        at += len;
+    }
+    cut.filter(|_| encoders >= RANGES_MIN_ENCODERS)
 }
 
 /// Calls `found` with each object id (not nil) the compute ops of the op stream `ops` name, read
@@ -8600,5 +8920,445 @@ mod tests {
         posted.lock().clear();
         p.world().complete_all(CompleteOn::Caller);
         assert_eq!(*posted.lock(), [(RGFX_EVT_CB_COMPLETE, 350, RGFX_CB_OK)]);
+    }
+
+    /// `n` passes of [`render_ops`].
+    fn passes(n: usize) -> Vec<u8> {
+        (0..n).map(|_| render_ops()).collect::<Vec<_>>().concat()
+    }
+
+    /// The calls a walk made since `mark`, each with whether a helper made it ([`super::super::helpers`]):
+    /// every call of the platform's but the command buffers' makes, commits, parts and handlers,
+    /// which a walk in two ranges makes otherwise than a whole one.
+    fn walk_calls(p: &FakePlatform, mark: u64) -> Vec<(bool, &'static str)> {
+        const NOT_THE_WALK: [&str; 6] = [
+            "commandBuffer",
+            "commit",
+            "split",
+            "part",
+            "commitPart",
+            "fold",
+        ];
+        (p.call_log().since(mark).into_iter())
+            .filter(|c| !NOT_THE_WALK.contains(&c.sel) && !c.sel.contains("Handler"))
+            .map(|c| {
+                (
+                    c.thread.as_deref() == Some("reims-vgpu.graphics-helper"),
+                    c.sel,
+                )
+            })
+            .collect()
+    }
+
+    /// The selectors of `calls`, those of this thread first, then the helper's, each in their
+    /// order: a whole walk's, where each op of a buffer walked in two ranges was walked once, the
+    /// first range here and the later one on a helper.
+    fn in_order(calls: &[(bool, &'static str)]) -> Vec<&'static str> {
+        let here = calls.iter().filter(|(helper, _)| !helper);
+        let helper = calls.iter().filter(|(helper, _)| *helper);
+        here.chain(helper).map(|(_, sel)| *sel).collect()
+    }
+
+    /// Each record [`splitting`]'s sinks were handed since they were last emptied, by its type and
+    /// status, emptied.
+    fn answered(posted: &Sunk<(u32, u64, u32)>) -> Vec<(u32, u32)> {
+        let taken = std::mem::take(&mut *posted.lock());
+        taken
+            .into_iter()
+            .map(|(kind, _, status)| (kind, status))
+            .collect()
+    }
+
+    /// Where an op stream is cut into two ranges walked at once: at the encoder end nearest half
+    /// its bytes, where it holds 8 render or blit encoders and the least bytes at least; never
+    /// where it holds an event's signal or wait, a compute or video encoder, a rasterization rate
+    /// map's pass, an indirect command buffer's command or a residency of resources.
+    #[test]
+    fn two_ranges_cut_only_streams_of_render_and_blit_encoders() {
+        use reims_vgpu_graphics::ops::render::RGFX_OP_RENDER_USE_RESOURCES;
+        let pass = render_ops();
+        let eight = passes(8);
+        assert_eq!(two_ranges(&eight, 0), Some(4 * pass.len()), "nearest half");
+        assert_eq!(two_ranges(&eight, eight.len()), Some(4 * pass.len()));
+        assert_eq!(
+            two_ranges(&eight, eight.len() + 1),
+            None,
+            "under the least bytes"
+        );
+        assert_eq!(two_ranges(&passes(7), 0), None, "7 encoders");
+        let blits = (0..8).map(|_| blit_ops()).collect::<Vec<_>>().concat();
+        assert_eq!(
+            two_ranges(&blits, 0),
+            Some(4 * blit_ops().len()),
+            "blit encoders"
+        );
+        let with = |extra: Vec<u8>| [passes(4), extra, passes(4)].concat();
+        let compute = [
+            op(RGFX_OP_ENCODER_BEGIN_COMPUTE, &[]),
+            op(RGFX_OP_ENCODER_END, &[]),
+        ]
+        .concat();
+        assert_eq!(two_ranges(&with(compute), 0), None, "a compute encoder");
+        assert_eq!(
+            two_ranges(&with(event_op(RGFX_OP_SIGNAL_EVENT, 7, 3)), 0),
+            None,
+            "a signal"
+        );
+        assert_eq!(
+            two_ranges(&with(event_op(RGFX_OP_WAIT_EVENT, 7, 3)), 0),
+            None,
+            "a wait"
+        );
+        let resident = {
+            let begin = op(RGFX_OP_ENCODER_BEGIN_RENDER, &begin_render_body());
+            let mut ops = begin;
+            ops.extend(op(RGFX_OP_RENDER_USE_RESOURCES, &[0; 16]));
+            ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+            ops
+        };
+        assert_eq!(two_ranges(&with(resident), 0), None, "a residency");
+        let reset = [
+            op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]),
+            op(RGFX_OP_BLIT_RESET_COMMANDS_IN_BUFFER, &[0; 24]),
+            op(RGFX_OP_ENCODER_END, &[]),
+        ]
+        .concat();
+        assert_eq!(
+            two_ranges(&with(reset), 0),
+            None,
+            "an indirect command buffer's reset"
+        );
+        let rate_map = {
+            let mut body = begin_render_body();
+            let flags = RGFX_PASS_FLAG_RT_SIZE | RGFX_PASS_FLAG_RATE_MAP;
+            body[4..8].copy_from_slice(&flags.to_le_bytes());
+            [
+                op(RGFX_OP_ENCODER_BEGIN_RENDER, &body),
+                op(RGFX_OP_ENCODER_END, &[]),
+            ]
+            .concat()
+        };
+        assert_eq!(two_ranges(&with(rate_map), 0), None, "a rate map's pass");
+        let mut short = eight.clone();
+        short.truncate(eight.len() - 4);
+        assert_eq!(two_ranges(&short, 0), None, "a stream that does not parse");
+    }
+
+    /// What finding a cut costs ([`two_ranges`]): nothing measurable on a stream under the least
+    /// bytes, which it does not read; a read of each op's header on a long one. Printed (run
+    /// with `--no-capture`).
+    #[test]
+    fn two_ranges_reads_nothing_of_a_short_stream() {
+        use std::hint::black_box;
+        let short = passes(2);
+        let long = passes(107);
+        let each = |ops: &[u8], runs: u32| {
+            let start = std::time::Instant::now();
+            for _ in 0..runs {
+                black_box(two_ranges(black_box(ops), RANGES_MIN_BYTES));
+            }
+            start.elapsed().as_nanos() as f64 / f64::from(runs)
+        };
+        assert!(short.len() < RANGES_MIN_BYTES && long.len() >= RANGES_MIN_BYTES);
+        assert!(two_ranges(&long, RANGES_MIN_BYTES).is_some());
+        let (short_ns, long_ns) = (each(&short, 1_000_000), each(&long, 1_000));
+        let ops = op_bodies(&long).count();
+        eprintln!(
+            "two_ranges: {short_ns:.2} ns a stream of {} bytes; {long_ns:.0} ns one of {} bytes, \
+             {ops} ops",
+            short.len(),
+            long.len()
+        );
+        assert!(short_ns < 50.0, "{short_ns} ns a short stream");
+    }
+
+    /// A command buffer walked in two ranges at once answers as one walked whole: each op walked
+    /// once, its first range here and its later one on a helper, in their order; its walk begun
+    /// once; one `CB_SCHEDULED` and one `CB_COMPLETE`, after its last part; and the error of a
+    /// part that failed, the first range's last among them.
+    #[test]
+    fn a_buffer_walked_in_two_ranges_at_once_answers_as_walked_whole() {
+        use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, NsErrorText};
+        let Split {
+            p, mut dec, posted, ..
+        } = splitting();
+        let device = p.device();
+        let ops = passes(8);
+        let mark = p.call_log().mark();
+        assert_eq!(
+            dec.decode(&device, &command_buffer_message(360, 90, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        let whole = walk_calls(&p, mark);
+        assert!(
+            whole.iter().all(|(helper, _)| !helper),
+            "under the least bytes: whole"
+        );
+        p.world().complete_all(CompleteOn::Caller);
+        let answered_whole = answered(&posted);
+
+        dec.set_ranges_min_bytes(Some(0));
+        dec.set_helper_first(true);
+        let (begun, mark) = (dec.walks_begun(), p.call_log().mark());
+        assert_eq!(
+            dec.decode(&device, &command_buffer_message(361, 91, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(dec.walks_begun(), begun + 1, "its walk begun once");
+        let two = walk_calls(&p, mark);
+        assert!(
+            two.iter().any(|(helper, _)| *helper),
+            "its later range on a helper"
+        );
+        assert_eq!(
+            in_order(&two),
+            in_order(&whole),
+            "each op walked once, in its order"
+        );
+        assert_eq!(
+            p.call_log()
+                .since(mark)
+                .iter()
+                .filter(|c| c.sel == "part")
+                .count(),
+            1
+        );
+        assert_eq!(
+            p.call_log()
+                .since(mark)
+                .iter()
+                .filter(|c| c.sel == "commitPart")
+                .count(),
+            1
+        );
+        let parts = p.world().committed();
+        assert_eq!(
+            parts.len(),
+            5,
+            "the first range in 4 parts, the later range the last"
+        );
+        assert_eq!(
+            answered(&posted),
+            [(RGFX_EVT_CB_SCHEDULED, RGFX_CB_OK)],
+            "at its take"
+        );
+        for part in &parts[..4] {
+            let ok = CommandBufferStatus::COMPLETED;
+            assert!(p.world().complete(*part, ok, None, CompleteOn::Caller));
+        }
+        assert!(posted.lock().is_empty(), "completed before its last part");
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(answered(&posted), [(RGFX_EVT_CB_COMPLETE, RGFX_CB_OK)]);
+        assert_eq!(
+            answered_whole,
+            [
+                (RGFX_EVT_CB_SCHEDULED, RGFX_CB_OK),
+                (RGFX_EVT_CB_COMPLETE, RGFX_CB_OK)
+            ]
+        );
+
+        // The first range's last part fails: the buffer's error, as a part's of a whole walk.
+        assert_eq!(
+            dec.decode(&device, &command_buffer_message(362, 92, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        let parts = p.world().committed();
+        let error = NsErrorText {
+            domain: "MTLCommandBufferErrorDomain".to_owned(),
+            code: 3,
+            description: "Page Fault".to_owned(),
+        };
+        let failed = CommandBufferStatus::ERROR;
+        assert!(
+            p.world()
+                .complete(parts[3], failed, Some(error), CompleteOn::Caller)
+        );
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(
+            answered(&posted),
+            [
+                (RGFX_EVT_CB_SCHEDULED, RGFX_CB_OK),
+                (
+                    RGFX_EVT_CB_COMPLETE,
+                    reims_vgpu_graphics::wire::RGFX_CB_PAGE_FAULT
+                )
+            ]
+        );
+    }
+
+    /// A later range no helper has taken by the first range's end is taken back and walked here,
+    /// as a whole walk goes on: each op once, the walk begun once, the later range's command
+    /// buffer let go of unused, and the buffer's records as a whole walk's.
+    #[test]
+    fn a_later_range_no_helper_takes_is_walked_with_the_first() {
+        let Split {
+            p, mut dec, posted, ..
+        } = splitting();
+        let device = p.device();
+        let ops = passes(8);
+        let mark = p.call_log().mark();
+        assert_eq!(
+            dec.decode(&device, &command_buffer_message(370, 100, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        let whole = walk_calls(&p, mark);
+        let parts_whole = p.world().complete_all(CompleteOn::Caller);
+        let answered_whole = answered(&posted);
+
+        dec.set_ranges_min_bytes(Some(0));
+        let held = dec.shared.helpers.hold_all();
+        let (begun, mark) = (dec.walks_begun(), p.call_log().mark());
+        assert_eq!(
+            dec.decode(&device, &command_buffer_message(371, 101, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        drop(held);
+        assert_eq!(dec.walks_begun(), begun + 1, "its walk begun once");
+        let back = walk_calls(&p, mark);
+        assert!(back.iter().all(|(helper, _)| !helper), "walked here");
+        assert_eq!(
+            in_order(&back),
+            in_order(&whole),
+            "each op walked once, in its order"
+        );
+        let sels = p.call_log().sels_since(mark);
+        assert_eq!(sels.iter().filter(|s| **s == "part").count(), 1);
+        assert!(!sels.contains(&"commitPart"), "cut as a whole walk is");
+        assert_eq!(
+            p.world().complete_all(CompleteOn::Caller),
+            parts_whole,
+            "its parts"
+        );
+        assert_eq!(answered(&posted), answered_whole);
+    }
+
+    /// A first range whose last part fails from one of its encoders on keeps the buffer whole, as
+    /// a whole walk's cut would: the later range's command buffer folded into it, never committed,
+    /// each op walked once, and the buffer's records as a whole walk's.
+    #[test]
+    fn a_first_range_that_fails_from_an_encoder_on_keeps_the_buffer_whole() {
+        let Split {
+            p,
+            mut dec,
+            posted,
+            records,
+        } = splitting();
+        let device = p.device();
+        let ops = passes(8);
+        let mark = p.call_log().mark();
+        assert_eq!(
+            dec.decode(&device, &command_buffer_message(380, 110, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        let whole = walk_calls(&p, mark);
+        p.world().complete_all(CompleteOn::Caller);
+        let answered_whole = answered(&posted);
+
+        dec.set_ranges_min_bytes(Some(0));
+        dec.set_helper_first(true);
+        p.script().push("commitPart", Step::value(PartCut::Fails));
+        let (begun, mark) = (dec.walks_begun(), p.call_log().mark());
+        assert_eq!(
+            dec.decode(&device, &command_buffer_message(381, 111, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(dec.walks_begun(), begun + 1, "its walk begun once");
+        let kept = walk_calls(&p, mark);
+        assert_eq!(
+            in_order(&kept),
+            in_order(&whole),
+            "each op walked once, in its order"
+        );
+        let folds = p.call_log().calls_to("fold");
+        assert_eq!(folds.len(), 1);
+        let later = folds[0].args[0].as_obj().unwrap();
+        let parts = p.world().committed();
+        assert!(
+            !parts.contains(&later),
+            "the later range's command buffer never committed"
+        );
+        assert_eq!(
+            parts.len(),
+            4,
+            "the first range's parts, its last the whole's"
+        );
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(answered(&posted), answered_whole);
+
+        // Kept whole at a cut in its first range: its one part's handler sees the whole's
+        // completion, its GPU times counted once.
+        p.script().push("split", Step::Nil);
+        p.script().push("commitPart", Step::value(PartCut::Fails));
+        let mark = p.call_log().mark();
+        assert_eq!(
+            dec.decode(&device, &command_buffer_message(382, 112, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(in_order(&walk_calls(&p, mark)), in_order(&whole));
+        assert_eq!(p.call_log().calls_to("fold").len(), 2);
+        let parts = p.world().committed();
+        assert_eq!(parts.len(), 1, "whole");
+        assert!(p.world().set_gpu_times(parts[0], 10, 30));
+        records.lock().clear();
+        p.world().complete_all(CompleteOn::Caller);
+        let r = records.lock()[0];
+        assert_eq!((r.cb_obj_id, r.gpu_start_ns, r.gpu_end_ns), (382, 10, 30));
+        assert_eq!(answered(&posted), answered_whole);
+    }
+
+    /// A walk that faults in either range has its failure at its stand-in's completion alone, as
+    /// one whose walk faults whole: nothing of the later range committed, the first range's fault
+    /// the one where both fault, and its context's gate let go.
+    #[test]
+    fn a_buffer_walked_in_two_ranges_that_faults_fails_at_its_stand_in() {
+        let Split {
+            p, mut dec, posted, ..
+        } = splitting();
+        let device = p.device();
+        dec.set_ranges_min_bytes(Some(0));
+        dec.set_helper_first(true);
+        // A draw with no open encoder faults the walk.
+        let bad = op(
+            RGFX_OP_RENDER_DRAW_PRIMITIVES,
+            RgfxOpDrawPrimitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+            }
+            .as_bytes(),
+        );
+        let later = [passes(8), bad.clone()].concat();
+        let first = [passes(1), bad.clone(), passes(7)].concat();
+        let both = [passes(1), bad.clone(), passes(7), bad].concat();
+        for (cb, ops) in [(390, later), (391, first), (392, both)] {
+            assert!(two_ranges(&ops, 0).is_some());
+            let mark = p.call_log().mark();
+            let message = command_buffer_message(cb, cb - 300, &ops);
+            assert!(refusing(|| dec.decode(&device, &message)).is_err());
+            let sels = p.call_log().sels_since(mark);
+            assert!(
+                !sels.contains(&"commitPart"),
+                "nothing of the later range committed"
+            );
+            assert!(dec.stand_in_for_failed(&device, &message).unwrap());
+            p.world().complete_all(CompleteOn::Caller);
+            assert_eq!(
+                *posted.lock(),
+                [(RGFX_EVT_CB_COMPLETE, cb, RGFX_CB_INTERNAL)]
+            );
+            posted.lock().clear();
+            assert!(
+                dec.shared.split_gate.try_split(0).is_some(),
+                "the gate held after the walk"
+            );
+        }
     }
 }

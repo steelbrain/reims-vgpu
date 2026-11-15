@@ -184,6 +184,7 @@ mod function_table;
 mod fuzz;
 #[cfg(test)]
 mod handler_cost;
+mod helpers;
 mod icb;
 #[cfg(test)]
 mod icb_slots_cost;
@@ -801,6 +802,9 @@ pub(crate) struct Shared<P: Platform> {
     shares: Arc<shares::Shares<P>>,
     /// The budget of the queues' lanes' extra threads ([`lane`]).
     lanes: Arc<lane::Budget>,
+    /// The threads that walk a command buffer's later range beside the rest of its walk
+    /// ([`helpers`], [`split`]'s "Two ranges at once").
+    helpers: Arc<helpers::Helpers>,
     /// The listener the command buffers' notifications of the values they signal run on, made at
     /// the first ([`Shared::listener`]).
     listener: OnceLock<P::SharedEventListener>,
@@ -813,6 +817,18 @@ pub(crate) struct Shared<P: Platform> {
     /// The parts the walks committed before their buffers' last (for the benches).
     #[cfg(test)]
     parts_cut: std::sync::atomic::AtomicU64,
+    /// The tests' own least op bytes of a command buffer walked in two ranges at once, where one
+    /// is set ([`GraphicsDecoder::ranges_min_bytes`]).
+    #[cfg(test)]
+    ranges_min_bytes: Mutex<Option<usize>>,
+    /// A walk in two ranges waits for a helper to start its later range before it walks its
+    /// first (for the tests: [`GraphicsDecoder::set_helper_first`]).
+    #[cfg(test)]
+    helper_first: AtomicBool,
+    /// The command buffers' walks begun, each once a buffer, whatever ranges it is walked in
+    /// (for the tests).
+    #[cfg(test)]
+    walks_begun: std::sync::atomic::AtomicU64,
     /// The device's BAR 2 region: the host memory the over-host-memory buffers
     /// and heaps are placed over. Held so it stays mapped while the decoder's
     /// objects live; declared last so the contexts drop before it (a buffer
@@ -1010,6 +1026,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         work::start(&platform);
         let made_at = platform.clock().now_mono();
         let lanes = lane::Budget::of_host(platform.threads().handle());
+        let helpers = helpers::Helpers::new(Some(platform.threads().handle()));
         let shared = Arc::new(Shared {
             waits: waits::WaitWatch::new(Arc::clone(&platform)),
             platform,
@@ -1042,12 +1059,19 @@ impl<P: Platform> GraphicsDecoder<P> {
             release_queue: OnceLock::new(),
             shares: Arc::default(),
             lanes,
+            helpers,
             #[cfg(test)]
             walk_hook: Mutex::new(None),
             #[cfg(test)]
             split_after: Mutex::new(None),
             #[cfg(test)]
             parts_cut: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            ranges_min_bytes: Mutex::new(None),
+            #[cfg(test)]
+            helper_first: AtomicBool::new(false),
+            #[cfg(test)]
+            walks_begun: std::sync::atomic::AtomicU64::new(0),
             region,
         });
         GraphicsDecoder::on(shared, None, Sinks::default())
@@ -1079,6 +1103,17 @@ impl<P: Platform> GraphicsDecoder<P> {
             laid_written: RefCell::new(Vec::new()),
             laid_blit: Cell::new(false),
         }
+    }
+
+    /// A handle on this decoder's state for a range of its message's command buffer walked on
+    /// another thread beside the rest ([`split`], "Two ranges at once"): of the message's context,
+    /// its records going to the message's sinks, and its views twins of the message's
+    /// ([`View::twin`]), so it names what the message names; with nothing else of the message's
+    /// (no turn, ticket or mark: it commits nothing).
+    pub(crate) fn twin(&self) -> Self {
+        let twin = GraphicsDecoder::on(Arc::clone(&self.shared), self.context, self.sinks.clone());
+        *twin.views.borrow_mut() = self.views.borrow().iter().map(View::twin).collect();
+        twin
     }
 
     /// A handle on this decoder's state for a message from `context`, its records going to
@@ -2574,6 +2609,37 @@ impl<P: Platform> GraphicsDecoder<P> {
             return after;
         }
         split::SPLIT_AFTER
+    }
+
+    /// Has the walks take a command buffer of `bytes` of ops at least in two ranges at once
+    /// ([`Self::ranges_min_bytes`]), or of [`cmdbuf::RANGES_MIN_BYTES`] where `None` (for the
+    /// tests).
+    #[cfg(test)]
+    pub(crate) fn set_ranges_min_bytes(&self, bytes: Option<usize>) {
+        *self.shared.ranges_min_bytes.lock() = bytes;
+    }
+
+    /// The least op bytes of a command buffer walked in two ranges at once
+    /// ([`cmdbuf::RANGES_MIN_BYTES`]; the tests may set their own).
+    pub(crate) fn ranges_min_bytes(&self) -> usize {
+        #[cfg(test)]
+        if let Some(bytes) = *self.shared.ranges_min_bytes.lock() {
+            return bytes;
+        }
+        cmdbuf::RANGES_MIN_BYTES
+    }
+
+    /// Has a walk in two ranges wait for a helper to start its later range before it walks its
+    /// first, so the ranges are walked at once however fast the first is (for the tests).
+    #[cfg(test)]
+    pub(crate) fn set_helper_first(&self, first: bool) {
+        self.shared.helper_first.store(first, Ordering::Relaxed);
+    }
+
+    /// The command buffers' walks begun so far, once a buffer (for the tests).
+    #[cfg(test)]
+    pub(crate) fn walks_begun(&self) -> u64 {
+        (self.shared.walks_begun).load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Notes a part a walk committed before its buffer's last, which `parts_cut` counts in tests.

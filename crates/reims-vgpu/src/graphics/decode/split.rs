@@ -104,6 +104,41 @@
 //! is), that waits for no event and is behind no buffer of its queue that does ([`super::cmdbuf`]'s
 //! `Held`), and whose queue holds room for another command buffer, so the platform's make of the
 //! next part waits for none.
+//!
+//! **Two ranges at once.** A walk in parts still runs on one thread, and the runtime's lowering
+//! is most of it: WindowServer's frame in Launchpad's open view, one command buffer of about 107
+//! render passes, took a walk of 14.9 ms at the median, 91% of it in the runtime's calls, so its
+//! present was answered two refreshes on (an RTX 3090 host, every driver listed, metal2vulkan
+//! pin 92; m3-max-30753, measured). So a buffer that may be cut, of
+//! [`RANGES_MIN_BYTES`](super::cmdbuf::RANGES_MIN_BYTES) of ops and
+//! [`RANGES_MIN_ENCODERS`](super::cmdbuf::RANGES_MIN_ENCODERS) at least, all of them render and
+//! blit encoders that hold no event, rate map, indirect command buffer or residency of
+//! resources (`cmdbuf.rs`'s `two_ranges`), is cut at the encoder end nearest half its bytes into
+//! two ranges, walked at once: the platform makes the later range's command buffer on the
+//! buffer's queue as the walk starts (`CommandBuffer::part`), a helper thread
+//! ([`super::helpers`]) walks the later range into it on a handle whose view of the context's
+//! table is a twin of the buffer's (`View::twin`), so it names what the buffer names, and the
+//! lane's thread walks the first range, in parts as above. At the first range's end its last part
+//! is committed as a part (`CommandBuffer::commit_part`), once the later range is walked and every
+//! wait of the buffer's commit is met, and the later range's command buffer is the buffer's last
+//! part. The runtime takes command buffers of one queue encoded on several threads at once and
+//! committed in order from one (metal2vulkan's answer, 11-14).
+//!
+//! What stays as it was is what a walk in parts keeps (above): the parts run in their order on
+//! the queue, their outcome is all of theirs, the last part carries the buffer's handlers,
+//! records and tickets, and the context's gate is held from its first part's commit to its last.
+//! Neither range signals or waits for an event, so no value goes to the guest from a helper. A
+//! walk that faults or stops in either range answers as the first range's walk would, the first
+//! range's first, nothing of the later range committed: as a whole walk that faults there after
+//! its parts. Where the first range's last part fails from one of its encoders on (a draw of
+//! primitive type 9, a store into read-only memory), the platform keeps it whole and folds the
+//! later range's command buffer into it (`CommandBuffer::fold`): every encoder after the failing
+//! one runs nothing, in it as in a whole buffer, and its commit answers as one buffer's. A later
+//! range no helper has started by the first range's end is taken back and walked by the lane's
+//! thread into the buffer's current part, as a walk goes on, so a walk never waits for a helper
+//! to come free. Each op is walked once, on one thread or the other: what a walk does once a
+//! buffer (its names found, its uses of laid-out device caches told at the commit) is done once.
+//! A `cbpar` trace event gives each buffer's ranges and their walks.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -141,6 +176,8 @@ struct Gate {
     deferred: Vec<RangeOp>,
     /// The commits waiting for `split`'s end.
     waiting: usize,
+    /// The buffers waiting to take the gate for their parts ([`SplitGate::split`]).
+    splitting: usize,
 }
 
 impl SplitGate {
@@ -199,10 +236,37 @@ impl SplitGate {
         })
     }
 
+    /// The gate of `context` for a buffer's parts, once no buffer of the context has parts out
+    /// and no commit or range message of it is under way: waits, with no lock of the caller's
+    /// held. Taken by a buffer walked in two ranges at once ("Two ranges at once") whose first
+    /// range could not take it as it ended ([`Self::try_split`]), once every wait of its commit
+    /// is met: a buffer whose parts are out commits its last part, and a commit or range message
+    /// under way ends, waiting for nothing of it.
+    pub(crate) fn split(self: &Arc<Self>, context: u32) -> SplitHold {
+        let mut contexts = self.contexts.lock();
+        loop {
+            let gate = contexts.entry(context).or_default();
+            if !gate.split && gate.under_way == 0 {
+                gate.split = true;
+                return SplitHold {
+                    gate: Arc::clone(self),
+                    context,
+                };
+            }
+            gate.splitting += 1;
+            self.changed.wait(&mut contexts);
+            contexts.entry(context).or_default().splitting -= 1;
+        }
+    }
+
     /// The gate of `context` is free and holds nothing, so its entry goes.
     fn prune(contexts: &mut HashMap<u32, Gate>, context: u32) {
         if contexts.get(&context).is_some_and(|g| {
-            !g.split && g.under_way == 0 && g.deferred.is_empty() && g.waiting == 0
+            !g.split
+                && g.under_way == 0
+                && g.deferred.is_empty()
+                && g.waiting == 0
+                && g.splitting == 0
         }) {
             contexts.remove(&context);
         }
@@ -223,10 +287,15 @@ pub(crate) struct UnderWay {
 }
 
 impl Drop for UnderWay {
+    /// The last commit or range message under way lets a buffer waiting to take the gate go
+    /// ([`SplitGate::split`]).
     fn drop(&mut self) {
         let mut contexts = self.gate.contexts.lock();
         if let Some(g) = contexts.get_mut(&self.context) {
             g.under_way -= 1;
+            if g.under_way == 0 && g.splitting > 0 {
+                self.gate.changed.notify_all();
+            }
         }
         SplitGate::prune(&mut contexts, self.context);
     }
