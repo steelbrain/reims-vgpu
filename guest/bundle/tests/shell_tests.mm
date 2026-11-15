@@ -12419,6 +12419,78 @@ void test_buffer_texture_replace_region_tells_the_host()
 	drainRing(fx.ring);
 }
 
+// replaceRegion: of a texture over a Managed buffer whose rows run past the buffer's length tells
+// the host the span of its rows up to the length (BUFFER_DID_MODIFY_RANGE), so the bytes inside the
+// length reach the GPU's copy, where a range past the buffer the host refuses whole: a texture
+// buffer of 4 RGBA32Float texels from 32 bytes short of the length, and a 2D texture whose rows
+// written cross it. Its texels past the length lie in the host's tail of the texture, which no
+// range of the buffer names: one wholly past the length tells nothing.
+void test_buffer_texture_replace_region_past_the_length_tells_the_length()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(0x800000, 0); // past the region's reserved head
+	RgfxRegion region(mem.data(), mem.size());
+	const NSUInteger length = 0x1000;
+	@autoreleasepool {
+		// The block runs on past the buffer, so the rows' bytes past it land in the block.
+		RgfxRegion::Block block = region.allocate(2 * length);
+		CHECK(block.ok);
+		uint8_t *bytes = const_cast<uint8_t *>(block.ptr);
+		std::memset(bytes, 0, 2 * length);
+		RgfxBuffer *managed = [RgfxBuffer bufferOverHostMemoryWithContents:bytes
+		                                                      regionOffset:block.offset
+		                                                            length:length
+		                                                           options:MTLResourceStorageModeManaged
+		                                                       deallocator:nil
+		                                                            device:nil
+		                                                        serializer:&fx.ser];
+		CHECK(managed != nil);
+		drainRing(fx.ring);
+		uint8_t in[64];
+		for (size_t i = 0; i < sizeof in; i++)
+			in[i] = static_cast<uint8_t>(0xa0 + i);
+		auto told = [&](uint64_t location, uint64_t span) {
+			auto range =
+			    expectMessage<RgfxBufferDidModifyRange>(fx.ring, RGFX_CMD_BUFFER_DID_MODIFY_RANGE);
+			CHECK(range.obj_id == managed.rgfxObjId && range.location == location &&
+			      range.length == span);
+			CHECK(ringEmpty(fx.ring));
+		};
+		MTLTextureDescriptor *texels =
+		    [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+		                                                           width:4
+		                                                 resourceOptions:MTLResourceStorageModeManaged
+		                                                           usage:MTLTextureUsageShaderRead];
+		id<MTLTexture> across = [managed newTextureWithDescriptor:texels offset:length - 32 bytesPerRow:64];
+		CHECK(across != nil);
+		drainRing(fx.ring);
+		[across replaceRegion:MTLRegionMake1D(0, 4) mipmapLevel:0 withBytes:in bytesPerRow:64];
+		CHECK(std::memcmp(bytes + length - 32, in, 32) == 0);
+		told(length - 32, 32);
+		id<MTLTexture> past = [managed newTextureWithDescriptor:texels offset:length bytesPerRow:64];
+		CHECK(past != nil);
+		drainRing(fx.ring);
+		[past replaceRegion:MTLRegionMake1D(0, 4) mipmapLevel:0 withBytes:in bytesPerRow:64];
+		CHECK(ringEmpty(fx.ring));
+		// A 2D texture of 8 x 4 BGRA8Unorm, rows 0x100 apart from 0x200 short of the length: its
+		// rows 1 and 2, texels 2 to 4, from 0xf08 to 0x1014, told to the length.
+		MTLTextureDescriptor *rows =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:8
+		                                                      height:4
+		                                                   mipmapped:NO];
+		rows.storageMode = MTLStorageModeManaged;
+		rows.usage = MTLTextureUsageShaderRead;
+		id<MTLTexture> plane = [managed newTextureWithDescriptor:rows offset:length - 0x200 bytesPerRow:0x100];
+		CHECK(plane != nil);
+		drainRing(fx.ring);
+		[plane replaceRegion:MTLRegionMake2D(2, 1, 3, 2) mipmapLevel:0 withBytes:in bytesPerRow:12];
+		CHECK(std::memcmp(bytes + length - 0x100 + 8, in, 12) == 0);
+		told(length - 0x100 + 8, 0x100 - 8);
+	}
+	drainRing(fx.ring);
+}
+
 // replaceRegion: and getBytes: of each slice of a linear 2D array over a buffer reach that slice's
 // rows in the buffer, each slice its rows' bytes rounded up to 128 after the one before, whatever
 // the bytesPerImage the texture was made with, as the host lays the array out; through a view of
@@ -19946,6 +20018,7 @@ int main(int argc, char **argv)
 		test_managed_layout();
 		test_managed_buffer_range();
 		test_buffer_texture_replace_region_tells_the_host();
+		test_buffer_texture_replace_region_past_the_length_tells_the_length();
 		test_buffer_texture_slices();
 		test_buffer_texture_did_modify_data_tells_the_host();
 		test_buffer_texture_linear_alignment();

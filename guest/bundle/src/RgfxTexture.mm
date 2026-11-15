@@ -2279,10 +2279,15 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 			// The rows' span, from the first row's first byte written to the last row's last,
 			// told as the buffer's didModifyRange: tells it: a Managed buffer's GPU copy takes
 			// it (BUFFER_DID_MODIFY_RANGE, a no-copy one's block first taking the app's bytes),
-			// and a Shared buffer's posts nothing.
+			// and a Shared buffer's posts nothing. The span told stops at the buffer's length:
+			// texels past it lie in the host's tail of the texture, which no range of the buffer
+			// names, and the host refuses a range past the buffer whole, which would keep the
+			// bytes inside the length from the GPU's copy too.
 			const uint64_t first = static_cast<uint64_t>(at - contents);
 			const uint64_t span = (shape.rows - 1) * _bufferBytesPerRow + shape.rowBytes;
-			[_buffer didModifyRange:NSMakeRange(first, span)];
+			const uint64_t length = [_buffer length];
+			if (first < length)
+				[_buffer didModifyRange:NSMakeRange(first, std::min(span, length - first))];
 			// A tiled texture's copy of the bytes takes them again at its next use, as after its
 			// didModifyData (didModifyData, below): Metal's getBytes: and replaceRegion: of a tiled
 			// texture's level 0 read and write the buffer's bytes, not the copy, and the next GPU
