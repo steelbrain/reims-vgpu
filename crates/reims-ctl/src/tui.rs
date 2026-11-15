@@ -2272,7 +2272,8 @@ fn displays_field(current: u32) -> Field {
         options,
         &current.to_string(),
         "How many displays the guest has, each in a window of its own; closing any of the \
-         windows powers the VM off. VMware SVGA has one.",
+         windows powers the VM off. For now macOS uses only the first: the other windows stay \
+         black, and the pointer works in the first window. VMware SVGA has one.",
     )
 }
 

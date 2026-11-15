@@ -94,9 +94,9 @@ pins, and Cargo fetches metal2vulkan from its public repository, at the commit t
 
 `reims-ctl` with no command opens its interactive interface: create a VM, start it (each of its
 displays opens in a window), stop it (the guest shuts down, or is powered off after a timeout),
-edit its CPUs, memory, displays (up to four), resolution, borderless windows, GPU, audio and logs,
-change its installer, print the exact QEMU command it runs, and zip its logs with the host's
-details into Downloads for a bug report.
+edit its CPUs, memory, displays (up to four, though for now macOS uses only the first), resolution,
+borderless windows, GPU, audio and logs, change its installer, print the exact QEMU command it
+runs, and zip its logs with the host's details into Downloads for a bug report.
 
 ```sh
 reims-ctl list                  # the VMs and whether they run
