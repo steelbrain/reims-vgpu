@@ -37,9 +37,6 @@ log.workspace = true
 # lets go (`graphics`'s take on a doorbell): `arc_lock`'s owned guard, and `send_guard`, which lets
 # it cross threads.
 parking_lot = { workspace = true, features = ["arc_lock", "send_guard"] }
-# The host's page size, which the window's import of the scanout's pages is aligned to
-# (`graphics::sink`); on Linux, the guest's RAM as a host maps it in the tests (`platform::tests`).
-libc.workspace = true
 
 # The Vulkan platform (architecture 2.2), the library's only one: natively on Linux, and over
 # MoltenVK on macOS, a build for development and tests.
@@ -48,6 +45,9 @@ metal2vulkan-runtime.workspace = true
 
 [dev-dependencies]
 reims-vgpu-vulkan = { workspace = true, features = ["testkit"] }
+# The tests' host calls: on Linux the guest's RAM as a host maps it (`platform::tests`), whether a
+# page is mapped, and the cost measurements' clocks and threads.
+libc.workspace = true
 
 # The decoder's tests of Metal's own stitched functions (`graphics::decode`); `entry`'s tests read
 # retain counts with `objc2`.

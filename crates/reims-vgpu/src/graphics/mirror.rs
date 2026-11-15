@@ -73,12 +73,13 @@ use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueu
 use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
 use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
+use reims_vgpu_vulkan::core::platform::os::vm::HostVm as _;
 use reims_vgpu_vulkan::core::platform::resource::{Buffer as _, Library as _, Texture as _};
 use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, MtlOrigin, MtlSize, NsRange};
 use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_vulkan::core::raise::{OnFault, RaiseResult};
 use reims_vgpu_vulkan::core::sync::Mutex;
-use reims_vgpu_vulkan::os::PrivateMemory;
+use reims_vgpu_vulkan::os::{OsVm, PrivateMemory};
 
 use super::sink::{Open, end_blit};
 use crate::entry::no_catch;
@@ -667,9 +668,7 @@ impl<P: ApiPlatform> Mirror<P> {
         let made = (|| {
             let bytes_per_row = (width * bytes).checked_next_multiple_of(align.max(4))?;
             let length = bytes_per_row.checked_mul(height)?;
-            // SAFETY: sysconf reads a constant of the host's.
-            let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
-            let span = length.checked_next_multiple_of(page)?;
+            let span = length.checked_next_multiple_of(OsVm::new().page_size())?;
             // The platform's memory, whose unmap waits for the runtime's free of every import of
             // its pages (the module doc, "Its pages").
             let pages = PrivateMemory::new(span)?;

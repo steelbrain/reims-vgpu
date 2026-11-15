@@ -115,6 +115,7 @@ use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueu
 use reims_vgpu_vulkan::core::platform::descriptor::RenderPassDescriptor as _;
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
 use reims_vgpu_vulkan::core::platform::os::clock::Clock as _;
+use reims_vgpu_vulkan::core::platform::os::vm::HostVm as _;
 use reims_vgpu_vulkan::core::platform::render::{RenderCmd, RenderEncoder as _};
 use reims_vgpu_vulkan::core::platform::resource::Texture as _;
 use reims_vgpu_vulkan::core::platform::types::{
@@ -124,6 +125,7 @@ use reims_vgpu_vulkan::core::platform::values::{ColorAttachmentSet, TextureDesc}
 use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_vulkan::core::raise::{OnFault, RaiseResult, refusals};
 use reims_vgpu_vulkan::core::sync::Mutex;
+use reims_vgpu_vulkan::os::OsVm;
 use reims_vgpu_window::PixelRect;
 
 use reims_vgpu_vulkan::core::display::pipeline::{DisplayPipelineCache, PipelineKey};
@@ -608,11 +610,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         shown: &Arc<Shown>,
         presented: &Arc<Presented<P>>,
     ) -> ScanoutDraw<P> {
-        // SAFETY: sysconf reads a constant of the host's.
-        let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
-            .ok()
-            .filter(|p| p.is_power_of_two())
-            .unwrap_or(0x4000);
+        let page = OsVm::new().page_size();
         let made_at = AtomicU64::new(device.recoveries());
         ScanoutDraw {
             platform,
