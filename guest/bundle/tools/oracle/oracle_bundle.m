@@ -93,7 +93,9 @@
 //   argbuf.ds.tex  setDepthStencilState:atIndex: of a state, and (.texnil) of nil, on an encoder of
 //                one texture; argbuf.ds.nil, of nil on one holding a depth/stencil state
 //   libforms3    a function array's library: which functions it answers, by name, with values and
-//                by descriptor, its names' order, label, device, reflection and serialization
+//                by descriptor, its names' order, label, device, reflection and serialization;
+//                libforms.order, its names' order for each order of three functions and four of
+//                five, each made twice
 //   classes.spi  which classes of the device's, its shared event's and its buffer's (and
 //                IOGPU's base classes) define the SPI the cases above call
 //   libforms2    newLibraryWithFunctionArray:error: of two functions, of one twice, and the
@@ -2470,6 +2472,40 @@ static void case_libforms3(id<MTLDevice> d)
 	printf("libforms3 reversed functionNames=%s\n", [other.functionNames componentsJoinedByString:@","].UTF8String);
 }
 
+// The order of a function array's functionNames against the array's: each of the six orders of
+// three functions, then five functions in four orders, each order twice (two libraries).
+static void case_libforms_order(id<MTLDevice> d)
+{
+	NSError *e = nil;
+	id<MTLLibrary> lib = [d newLibraryWithURL:beside(@"oracle_bundle.metallib") error:&e];
+	id<MTLFunction> v = [lib newFunctionWithName:@"div_visible"];
+	id<MTLFunction> s = [lib newFunctionWithName:@"div_stitchable"];
+	id<MTLFunction> k = [lib newFunctionWithName:@"div_kernel" constantValues:kernel_values(2.0f) error:&e];
+	id<MTLFunction> vx = [lib newFunctionWithName:@"div_vertex"];
+	id<MTLFunction> fr = [lib newFunctionWithName:@"div_fragment"];
+	if (v == nil || s == nil || k == nil || vx == nil || fr == nil) {
+		printf("libforms.order no functions error=%s\n", err_text(e));
+		return;
+	}
+	NSArray<NSArray *> *orders = @[
+		@[ v, s, k ], @[ v, k, s ], @[ s, v, k ], @[ s, k, v ], @[ k, v, s ], @[ k, s, v ],
+		@[ vx, fr, k, v, s ], @[ s, v, k, fr, vx ], @[ k, vx, s, fr, v ], @[ fr, s, vx, v, k ]
+	];
+	SEL arr = sel_registerName("newLibraryWithFunctionArray:error:");
+	for (NSArray *order in orders) {
+		NSMutableArray<NSString *> *given = [NSMutableArray array];
+		for (id<MTLFunction> fn in order)
+			[given addObject:fn.name];
+		for (int twice = 0; twice < 2; twice++) {
+			e = nil;
+			id<MTLLibrary> l = ((id(*)(id, SEL, id, NSError **))objc_msgSend)(d, arr, order, &e);
+			printf("libforms.order given=%s functionNames=%s error=%s\n",
+			       [given componentsJoinedByString:@","].UTF8String,
+			       [l.functionNames componentsJoinedByString:@","].UTF8String, err_text(e));
+		}
+	}
+}
+
 // --- who answers the SPI (classes.spi) ---------------------------------------------------
 
 // Whether `c` itself (not a superclass) has an instance method `sel`.
@@ -2819,7 +2855,7 @@ static const char *const kCases[] = {
     "heap.shared",      "bit17",            "bit18",         "bit19",         "tiled.responds",
     "buftex.depth16",   "buftex.stencil8",  "buftex.d32s8",  "buftex.x32s8",  "linear.depth",
     "ds.queries",       "ds.resourceIndex", "ds.uniqueIdentifier", "tiled.bytes", "tiled.buffer",
-    "ds.grid",          "purgeable.kinds",
+    "ds.grid",          "purgeable.kinds", "libforms.order",
 };
 
 static int run_case(id<MTLDevice> d, const char *c)
@@ -3020,6 +3056,8 @@ static int run_case(id<MTLDevice> d, const char *c)
 		case_argbuf_ds_nil(d);
 	else if (!strcmp(c, "libforms3"))
 		case_libforms3(d);
+	else if (!strcmp(c, "libforms.order"))
+		case_libforms_order(d);
 	else if (!strcmp(c, "ds.queries"))
 		case_ds_queries(d);
 	else if (!strcmp(c, "ds.grid"))
