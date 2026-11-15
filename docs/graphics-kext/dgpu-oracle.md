@@ -1204,6 +1204,29 @@ control points (`air.patch_control_point_input`), and the patch cases answer as 
 difference on the AMD GPU, the Intel GPU's stride 4 less, and on the M3 only its constant buffer
 alignment and `_flags`, as everywhere.
 
+**Deep argument buffers, colour inputs, imageblocks** (11-14, `pipeline_reflection_check`'s
+c_deep_ab, an argument buffer of structs nested 6 deep; r_fetch_group and r_fetch_at, colour
+attachment inputs in a raster order group and at an index a function constant gives; and
+c_imageblock_explicit, c_imageblock_late, c_imageblock_on, c_imageblock_off, r_imageblock_data,
+r_imageblock_master and r_rog_texture: m3-max-31129 and 31135 on the M3, 31132 and 31210 on the
+AMD, 31133 and 31211 on the Intel). The deep argument buffer and the colour inputs answer as the
+rest on all three (the colour inputs listed nowhere). A kernel's explicit imageblock
+(`imageblock<T, imageblock_layout_explicit>`) is a binding in its place on the M3, an
+`MTLImageBlockArgument` of binding type 17 and `imageBlockKind` 1, read-only, at index 0 wherever
+the argument is, of its data's size and its struct's type, of no master struct, aliasing no
+implicit imageblock (`aliasImplicitImageBlockRenderTarget` 0xFFFFFFFF); a false function constant
+leaves it out. Neither x86 GPU makes a pipeline of one (AMD: its compiler's connection drops at
+each try; Intel: "AIR builtin function was called but no definition was found"), and the M3 makes
+none of an implicit one in a kernel (c_imageblock: "Encountered unlowered function call to
+air.load.implicit_imageblock.v4f32"). A fragment function's imageblock data (`[[imageblock_data]]`)
+is a fragment binding on the M3 and the Intel GPU, an `MTLImageBlockDataArgument` of binding type
+16, of the same fields; one that views a master struct (`[[imageblock_data(Master)]]`, its members
+named by their `user(...)` names, as the AIR names them) holds the master as its
+`imageBlockMasterStructMembers`, and the AMD GPU and the Intel GPU make it, where the AMD GPU makes
+no pipeline of plain imageblock data. A texture in a raster order group
+(`[[texture(n), raster_order_group(g)]]`) answers as one in none on the AMD and Intel GPUs. Ours
+answers each so *(class 3)*: AMD no difference, Intel only its stride.
+
 ## Q22: mesh render pipelines and their draws
 
 Probe: `oracle_mesh DEVICE`, 11-05, each step in a child process of its own, without and with
@@ -2361,6 +2384,40 @@ M3's. The open encoder's end is not carried: the bundle keeps no record of an op
 command-buffer call. The tests are `test_a_scheduled_signal_is_set_as_its_queue_submits_it`,
 `test_a_scheduled_signal_behind_a_wait_is_set_at_its_scheduling` and
 `test_a_scheduled_signal_takes_only_a_shared_event` (tests/queue_tests.mm, arm64).
+
+## Q46: an argument encoder's reflection, and a function array's names
+
+Probes, 11-14: `oracle_bundle DEVICE` argbuf.reflection, argbuf.binding, argbuf.binding.lib,
+libforms3 and libforms.order, on the M3 Max under macOS 27.0.1 (m3-max-31079) and on the AMD
+Radeon Pro 5300M and the Intel UHD Graphics 630 under macOS 26.7.1 (m3-max-31082 and 31083), as
+on 11-05 for argbuf.* (the x86 Macs) and 11-13 for libforms3 (the M3).
+
+**An argument encoder's reflection.** `newArgumentEncoderWithBufferIndex:reflection:` of a
+kernel's argument buffer answers, in its out-parameter, the buffer's binding as the function's
+pipelines' reflection answers it: of the argument buffer's members, a `metal::array` of textures
+of stride 0. A library's reflection of the same function (`reflectionForFunctionWithName:`)
+answers that array's stride as its element's size, 8. AMD, Intel and the M3 agree *(class 3)*.
+Ours (`RgfxFunction.mm`, `rgfxArgumentOfBufferAtIndex:`) answers the pipelines' binding
+(`RgfxStageReflectionOf`), and the library's reflection where that makes none
+(`test_pipeline_reflection_from_air`'s encoder binding, tests/shell_tests.mm).
+
+**A function array's names.** A library made of functions (`newLibraryWithFunctions:` and the
+stitched forms, libforms3) answers `functionNames` in an order of its own, which follows the order
+the functions were given without reversing it, alike on AMD, Intel and the M3 *(class 3)*:
+libforms.order's 6 orders of div_kernel, div_visible and div_stitchable and 4 orders of five
+(adding div_vertex and div_fragment), and a probe's 60 orders of two, three and four of
+div_visible, div_stitchable, div_vertex and div_fragment (m3-max-31122 on the M3, 31123 and 31124
+on AMD and Intel, the same 60 answers). Given div_visible first, the three answer div_kernel,
+div_stitchable, div_visible whatever follows; given div_stitchable first, div_kernel, div_visible,
+div_stitchable; given div_kernel first, div_stitchable, div_visible, div_kernel. The given order
+reversed is the answer for 3 of libforms.order's 6 orders of three and 2 of its 4 of five, and for
+28 of the probe's 60: all 12 of two, 12 of the 24 of three and 4 of the 24 of four. No container
+of the names gives it: `NSMutableDictionary` (with and without a capacity), `NSDictionary`,
+`NSMutableSet`, `NSMapTable` and `CFMutableDictionary`, filled in the given order or reversed and
+read by their keys, matched at best 10 of the 60 (m3-max-31104 and the probe above), and libc++'s
+`std::unordered_map` and `std::unordered_set` of the names 44 of 70 orders (m3-max-31128): it is
+a hash structure of Metal's own. Ours (`RgfxLibrary.mm`, `functionNames`) answers the given order
+reversed *(class 2: Metal's for every array of two and for some longer ones)*.
 
 ## Not measured
 
