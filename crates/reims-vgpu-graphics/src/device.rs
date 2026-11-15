@@ -1,6 +1,6 @@
 //! [`Device`]: the device's host side, as the host's process runs it. It owns the region (BAR 2),
 //! answers the registers (BAR 0), takes the guest's control commands on a thread of its own,
-//! carries each process's out on a thread of the process's, and sends the display's events on
+//! carries each process's out on a thread of the process's, and sends each display's events on
 //! another.
 //!
 //! **Threads.** `reims-vgpu.graphics-control` takes the control submission ring: woken by a
@@ -29,7 +29,10 @@
 //! completion ring has no room for), sends
 //! `DISPLAY_CHANGED` once the display's mode is not the one the guest was last told, and then
 //! tells the host of the refresh ([`Host::refreshed`]), which answers there the presents the
-//! display first shows at it.
+//! display first shows at it. A device of several displays has a refresh thread for each, on a
+//! grid of its own at its own screen's rate (`reims-vgpu.graphics-refresh-<i>` for display `i`
+//! from 1), whose events name the display, and go only to a guest that took
+//! `RGFX_FEATURE_MULTI_DISPLAY` (`crate::display`'s module doc, "Several displays").
 //!
 //! **Per-queue rings.** A `QUEUE_CREATE` on ring 0, where its ring parameters are valid (each
 //! ring whole in one block its process holds, among them), makes the
@@ -185,7 +188,7 @@
 //! device's function reset does: no command is taken until the guest writes `STATUS` 1, the
 //! guest's driver has taken no feature (`DRIVER_FEATURES` reads 0), both rings are as nothing
 //! had passed through them (the submission ring's `consumer_idle` 1, so the guest rings for its
-//! first message), the display keeps its scanout (below) but has no cursor image (and shows its
+//! first message), each display keeps its scanout (below) but has no cursor image (and shows its
 //! cursor once it has one) and no `VBLANK`, and its refresh count is 0. Every command queue ends,
 //! and once a take of its ring or a post onto it under way has finished nothing touches its rings
 //! again; no block is any process's (the kext grants them again), and the host drops everything
@@ -226,7 +229,7 @@ use crate::control;
 use crate::device::backlog::Backlog;
 use crate::device::gate::{Gate, Look, Offer, Waited};
 use crate::device::lanes::{Hand, Key, Lanes};
-use crate::display::{Mode, Scanout, Screen};
+use crate::display::{Mode, Scanout, Screen, offered_in_room, scanout_room, scanout_room_at};
 use crate::ops::RgfxCommandBuffer;
 use crate::region::Region;
 use crate::ring::{Consumer, Message, Posted, Producer, RingAt, sized};
@@ -326,7 +329,7 @@ impl Room {
 const MIN_QUEUE_RING_DATA: u64 = 4096;
 
 /// The feature bits whose meaning the host knows, which a `DRIVER_FEATURES` write may take:
-/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 47.
+/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 48.
 const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_CACHE
     | RGFX_FEATURE_CB_SUBMITTED
@@ -371,7 +374,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_GUEST_TIMES
     | RGFX_FEATURE_READ_ONLY_PAGES
     | RGFX_FEATURE_DOORBELL_PAGES
-    | RGFX_FEATURE_PIPELINE_ANSWERS;
+    | RGFX_FEATURE_PIPELINE_ANSWERS
+    | RGFX_FEATURE_MULTI_DISPLAY;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
@@ -713,13 +717,16 @@ pub trait Host: Send + Sync + 'static {
         Vec::new()
     }
 
-    /// A refresh of display 0, on the refresh thread, after its `VBLANK` (while the guest has
-    /// them on): the vblank at which the presents the window has shown since the last one are
-    /// first on the display, which the host answers here ([`Host::present_surface`]). The default
-    /// does nothing.
-    fn refreshed(&self) {}
+    /// A refresh of display `display`, on its refresh thread, after its `VBLANK` (while the guest
+    /// has them on): the vblank at which the presents the window has shown on it since the last
+    /// one are first on the display, which the host answers here ([`Host::present_surface`]). The
+    /// default does nothing.
+    fn refreshed(&self, display: u32) {
+        let _ = display;
+    }
 
-    /// Shows the IOSurface of global ID `iosurface_id` on display 0 in place of the scanout
+    /// Shows the IOSurface of global ID `iosurface_id` on display `display` (one the guest sees,
+    /// below the device's count) in place of its scanout
     /// (`PRESENT_SURFACE`; 0 shows the scanout again), on the presents' lane, in ring order, once
     /// the lanes have carried out the messages before it that change the textures over the
     /// surface ([`Host::surface_textures`]), and gives `answer`
@@ -730,8 +737,14 @@ pub trait Host: Send + Sync + 'static {
     /// surface ([`RgfxPresentSurfaceGen`]): a surface with a device cache shows its pages as of
     /// it. The default shows nothing and answers at once, refusing every surface but 0, for a
     /// host with no stage-3 decoder.
-    fn present_surface(&self, iosurface_id: u32, generation: Option<u64>, answer: PresentAnswer) {
-        let _ = generation;
+    fn present_surface(
+        &self,
+        display: u32,
+        iosurface_id: u32,
+        generation: Option<u64>,
+        answer: PresentAnswer,
+    ) {
+        let _ = (display, generation);
         answer.answer(if iosurface_id == 0 {
             RGFX_STATUS_OK
         } else {
@@ -739,19 +752,21 @@ pub trait Host: Send + Sync + 'static {
         });
     }
 
-    /// A present that keeps what display 0 shows (`PRESENT_SURFACE` with [`RGFX_PRESENT_KEEP`]),
-    /// on the presents' lane, in ring order: the colour staged since the last present
-    /// ([`Host::display_color`]) applies as the display shows it, and `answer` is given then, as
-    /// [`Host::present_surface`] gives its. The default answers [`RGFX_STATUS_OK`] at once.
-    fn present_keep(&self, answer: PresentAnswer) {
+    /// A present that keeps what display `display` shows (`PRESENT_SURFACE` with
+    /// [`RGFX_PRESENT_KEEP`]), on the presents' lane, in ring order: the colour staged for it since
+    /// its last present ([`Host::display_color`]) applies as the display shows it, and `answer` is
+    /// given then, as [`Host::present_surface`] gives its. The default answers [`RGFX_STATUS_OK`]
+    /// at once.
+    fn present_keep(&self, display: u32, answer: PresentAnswer) {
+        let _ = display;
         answer.answer(RGFX_STATUS_OK);
     }
 
-    /// Part of one colour stage of display 0 (`DISPLAY_COLOR`), its fields and the entries it
-    /// carries, on the presents' lane, in ring order with the presents: the host stages it, and
-    /// the next present ([`Host::present_surface`], [`Host::present_keep`]) sets the stages staged
-    /// whole, as the display shows that present. Not answered. The default drops it, for a host
-    /// with no window.
+    /// Part of one colour stage of display `color.display` (`DISPLAY_COLOR`, of a display the
+    /// guest sees), its fields and the entries it carries, on the presents' lane, in ring order
+    /// with the presents: the host stages it, and that display's next present
+    /// ([`Host::present_surface`], [`Host::present_keep`]) sets the stages staged whole, as the
+    /// display shows that present. Not answered. The default drops it, for a host with no window.
     fn display_color(&self, color: &RgfxDisplayColor, entries: &[RgfxColorEntry]) {
         let _ = (color, entries);
     }
@@ -864,9 +879,9 @@ impl std::fmt::Debug for Device {
 pub(crate) struct Shared {
     /// The host's callbacks.
     pub(crate) host: Box<dyn Host>,
-    /// What shows the display.
-    pub(crate) screen: Box<dyn Screen>,
-    /// BAR 2, which what shows the display may hold too.
+    /// The displays, display `i` at index `i`: 1 to [`RGFX_DISPLAYS_MAX`], fixed at the make.
+    pub(crate) displays: Box<[Display]>,
+    /// BAR 2, which what shows the displays may hold too.
     pub(crate) region: Arc<Region>,
     /// `STATUS`.
     status: AtomicU32,
@@ -887,8 +902,6 @@ pub(crate) struct Shared {
     doorbell: OnceLock<Doorbell>,
     /// The control submission ring, held while the control thread takes a message.
     submit: Mutex<Submit>,
-    /// The display, as the guest has set it.
-    pub(crate) display: Mutex<DisplayState>,
     /// The control completion ring.
     completion: Mutex<Producer>,
     /// Where posts onto the control completion ring wait for room.
@@ -1187,7 +1200,15 @@ struct Submit {
     asleep: bool,
 }
 
-/// The display, as the guest has set it, and what the device has told it.
+/// One of the device's displays: what shows it, and what the guest set of it.
+pub(crate) struct Display {
+    /// What shows it.
+    pub(crate) screen: Box<dyn Screen>,
+    /// What the guest set of it, and what the device told it.
+    pub(crate) state: Mutex<DisplayState>,
+}
+
+/// A display, as the guest has set it, and what the device has told it.
 #[derive(Debug, Default)]
 pub(crate) struct DisplayState {
     /// The pixels it shows.
@@ -1205,36 +1226,59 @@ pub(crate) struct DisplayState {
 }
 
 impl Device {
-    /// A device over `region` (BAR 2: [`REGION_SIZE`] bytes, of which what shows the display
-    /// may hold a reference to read the scanout from), `host` and `screen`, with its two threads
-    /// started; `None` where the region is smaller than the rings and a page of allocations, or
-    /// the host refuses a pipe or a thread.
+    /// A device of one display over `region` (BAR 2: [`REGION_SIZE`] bytes, of which what shows
+    /// the display may hold a reference to read the scanout from), `host` and `screen`, with its
+    /// threads started; `None` where the region is smaller than the rings and a page of
+    /// allocations, or the host refuses a pipe or a thread.
     pub fn new(
         region: Arc<Region>,
         host: Box<dyn Host>,
         screen: Box<dyn Screen>,
     ) -> Option<Device> {
-        Device::with_lanes(region, host, screen, Lanes::default())
+        Device::with_screens(region, host, vec![screen])
     }
 
-    /// [`Self::new`], over `lanes`, whose threads wait as long as they keep (the tests; else
-    /// [`crate::keep::KEEP`]).
+    /// [`Self::new`], for a device of `screens.len()` displays, display `i` shown by `screens[i]`
+    /// (docs/graphics-kext/design.md, "Multiple displays"): `None` also where there are none or
+    /// more than [`RGFX_DISPLAYS_MAX`]. A device of two or more offers
+    /// [`RGFX_FEATURE_MULTI_DISPLAY`]; one of one is what a device was before displays had
+    /// rooms of their own.
+    pub fn with_screens(
+        region: Arc<Region>,
+        host: Box<dyn Host>,
+        screens: Vec<Box<dyn Screen>>,
+    ) -> Option<Device> {
+        Device::with_lanes(region, host, screens, Lanes::default())
+    }
+
+    /// [`Self::with_screens`], over `lanes`, whose threads wait as long as they keep (the tests;
+    /// else [`crate::keep::KEEP`]).
     fn with_lanes(
         region: Arc<Region>,
         host: Box<dyn Host>,
-        screen: Box<dyn Screen>,
+        screens: Vec<Box<dyn Screen>>,
         lanes: Lanes,
     ) -> Option<Device> {
-        if region.size() < RGFX_ALLOCATIONS_OFFSET + 4096 {
+        if region.size() < RGFX_ALLOCATIONS_OFFSET + 4096
+            || screens.is_empty()
+            || screens.len() > RGFX_DISPLAYS_MAX as usize
+        {
             return None;
         }
+        let displays = screens
+            .into_iter()
+            .map(|screen| Display {
+                screen,
+                state: Mutex::new(DisplayState::default()),
+            })
+            .collect();
         let mut consumer = Consumer::new(SUBMIT);
         consumer.reset(&region);
         let mut producer = Producer::new(COMPLETE);
         producer.reset(&region);
         let shared = Arc::new(Shared {
             host,
-            screen,
+            displays,
             region,
             status: AtomicU32::new(RGFX_STATUS_RESET),
             driver_features: AtomicU64::new(0),
@@ -1249,7 +1293,6 @@ impl Device {
                 backlog: Backlog::with_room(),
                 asleep: false,
             }),
-            display: Mutex::new(DisplayState::default()),
             completion: Mutex::new(producer),
             room: Room::default(),
             room_poll_ns: AtomicU64::new(u64::try_from(ROOM_POLL.as_nanos()).unwrap_or(u64::MAX)),
@@ -1282,13 +1325,19 @@ impl Device {
             .name("reims-vgpu.graphics-control".to_owned())
             .spawn(move || control.control_thread())
             .ok()?;
-        let refresh = Arc::clone(&shared);
-        let started = std::thread::Builder::new()
-            .name("reims-vgpu.graphics-refresh".to_owned())
-            .spawn(move || refresh.refresh_thread());
-        if started.is_err() {
-            shared.end();
-            return None;
+        for display in 0..shared.display_count() {
+            let refresh = Arc::clone(&shared);
+            let name = match display {
+                0 => "reims-vgpu.graphics-refresh".to_owned(),
+                _ => format!("reims-vgpu.graphics-refresh-{display}"),
+            };
+            let started = std::thread::Builder::new()
+                .name(name)
+                .spawn(move || refresh.refresh_thread(display));
+            if started.is_err() {
+                shared.end();
+                return None;
+            }
         }
         Some(Device { shared })
     }
@@ -1767,23 +1816,30 @@ impl Shared {
         // Nothing the lanes were handed before it is begun now.
         self.lanes.reset(epoch);
         let mut submit = self.submit.lock();
-        let mut display = self.display.lock();
+        let mut states: Vec<MutexGuard<'_, DisplayState>> =
+            self.displays.iter().map(|d| d.state.lock()).collect();
         let mut completion = self.completion.lock();
         submit.consumer.reset(&self.region);
         submit.broken = false;
         submit.backlog.clear();
         self.control_done.store(0, Ordering::Release);
         completion.reset(&self.region);
-        // The scanout stays (the module doc): the screen is told nothing of it. The panel is on.
-        let woken = display.asleep;
-        *display = DisplayState {
-            scanout: display.scanout,
-            ..DisplayState::default()
-        };
+        // Each display's scanout stays (the module doc): its screen is told nothing of it. Its
+        // panel is on.
+        let woken: Vec<bool> = (states.iter_mut())
+            .map(|state| {
+                let woken = state.asleep;
+                **state = DisplayState {
+                    scanout: state.scanout,
+                    ..DisplayState::default()
+                };
+                woken
+            })
+            .collect();
         // With the ring held: the control thread tells the host before any message after this.
         self.reset_owed.store(true, Ordering::Release);
         drop(completion);
-        drop(display);
+        drop(states);
         drop(submit);
         // The per-queue rings are the guest's to make again after a reset: end their services.
         let ended: Vec<Arc<QueueShared>> = {
@@ -1804,18 +1860,27 @@ impl Shared {
         self.gate.every();
         self.room.wake();
         self.wake.wake();
-        self.screen.cursor_image(None);
-        self.screen.cursor_moved(0, 0, true);
-        if woken {
-            self.screen.power(true);
+        for (display, woken) in self.displays.iter().zip(woken) {
+            display.screen.cursor_image(None);
+            display.screen.cursor_moved(0, 0, true);
+            if woken {
+                display.screen.power(true);
+            }
         }
     }
 
     /// The feature bits the device offers a guest whose driver took `taken`: the host's
-    /// ([`Host::features`]), and where `taken` holds [`RGFX_FEATURE_PAGES_16K`] and the host
-    /// offers it, those it offers only then ([`Host::features_with_16k_pages`]).
+    /// ([`Host::features`]), [`RGFX_FEATURE_MULTI_DISPLAY`] on a device of two displays or more
+    /// (the device's to offer, whatever the host's answer), and where `taken` holds
+    /// [`RGFX_FEATURE_PAGES_16K`] and the host offers it, those it offers only then
+    /// ([`Host::features_with_16k_pages`]).
     fn offered_to(&self, taken: u64) -> u64 {
-        let features = self.host.features();
+        let features = (self.host.features() & !RGFX_FEATURE_MULTI_DISPLAY)
+            | if self.display_count() > 1 {
+                RGFX_FEATURE_MULTI_DISPLAY
+            } else {
+                0
+            };
         if taken & features & RGFX_FEATURE_PAGES_16K != 0 {
             features | self.host.features_with_16k_pages()
         } else {
@@ -1832,6 +1897,50 @@ impl Shared {
     /// Whether the guest's driver took `feature`.
     pub(crate) fn driver_took(&self, feature: u64) -> bool {
         self.driver_features.load(Ordering::Acquire) & feature != 0
+    }
+
+    /// How many displays the device has: 1 to [`RGFX_DISPLAYS_MAX`], fixed at its make.
+    pub(crate) fn display_count(&self) -> u32 {
+        u32::try_from(self.displays.len()).unwrap_or(RGFX_DISPLAYS_MAX)
+    }
+
+    /// How many displays the guest sees: every one where its driver took
+    /// [`RGFX_FEATURE_MULTI_DISPLAY`], else display 0 alone, as on a device of one display.
+    pub(crate) fn displays_seen(&self) -> u32 {
+        if self.driver_took(RGFX_FEATURE_MULTI_DISPLAY) {
+            self.display_count()
+        } else {
+            1
+        }
+    }
+
+    /// Display `id`, where the guest sees it ([`Self::displays_seen`]): a command naming any other
+    /// is refused `NO_DISPLAY`, as by a device without it.
+    pub(crate) fn seen_display(&self, id: u32) -> Option<&Display> {
+        (id < self.displays_seen())
+            .then(|| self.displays.get(id as usize))
+            .flatten()
+    }
+
+    /// The mode `display` offers its guest now: its screen's ([`Screen::mode`]), sized to its
+    /// scanout room on a device of more than one display ([`offered_in_room`]).
+    pub(crate) fn offered_mode(&self, display: &Display) -> Mode {
+        offered_in_room(display.screen.mode(), self.display_count())
+    }
+
+    /// Whether `len` bytes at `offset` lie in display `id`'s scanout room
+    /// ([`scanout_room_at`]: the whole of [`RGFX_SCANOUT_SPAN`] at [`RGFX_ALLOCATIONS_OFFSET`] on
+    /// a device of one display), before the next display's room or the accelerator kext's blocks
+    /// ([`RGFX_CONTEXT_ALLOCATIONS_OFFSET`]), and in the region, `offset` a multiple of 4. A
+    /// scanout past its room would show another display's, or the processes' blocks.
+    pub(crate) fn in_scanout_room(&self, id: u32, offset: u64, len: u64) -> bool {
+        let count = self.display_count();
+        let (start, room) = (scanout_room_at(id, count), scanout_room(count));
+        offset.is_multiple_of(4)
+            && offset >= start
+            && len <= room
+            && offset - start <= room - len
+            && self.region.contains(offset, len)
     }
 
     /// What `DEFERRED_BUDGET_LO` and `_HI` read: the host's budget where the device offers a
@@ -3495,14 +3604,17 @@ impl Shared {
         Post::Done
     }
 
-    /// The refresh thread (the module doc): a refresh at each tick of its grid
+    /// Display `display`'s refresh thread (the module doc): a refresh at each tick of its grid
     /// ([`RefreshGrid`]), stamped with the tick's time however late the thread woke for it.
-    fn refresh_thread(&self) {
+    fn refresh_thread(&self, display: u32) {
+        let Some(screen) = self.displays.get(display as usize).map(|d| &d.screen) else {
+            return;
+        };
         let mut grid = RefreshGrid::new(now_ns());
         let part = u64::try_from(REFRESH_SLEEP_PART.as_nanos()).unwrap_or(u64::MAX);
         while !self.ending() {
             let now = now_ns();
-            let tick = grid.next(self.screen.mode().period_ns(), now);
+            let tick = grid.next(screen.mode().period_ns(), now);
             let mut left = tick.saturating_sub(now);
             while left > part {
                 std::thread::sleep(REFRESH_SLEEP_PART);
@@ -3517,16 +3629,22 @@ impl Shared {
             if self.ending() {
                 break;
             }
-            self.refresh(tick);
+            self.refresh(display, tick);
         }
     }
 
-    /// One refresh, at `now` on the monotonic clock.
-    pub(crate) fn refresh(&self, now: u64) {
+    /// One refresh of display `id`, at `now` on the monotonic clock. Its events go to a guest
+    /// that sees it ([`Self::displays_seen`]) alone: a guest that did not take
+    /// [`RGFX_FEATURE_MULTI_DISPLAY`] gets none of a display but 0's.
+    pub(crate) fn refresh(&self, id: u32, now: u64) {
+        let Some(display) = self.displays.get(id as usize) else {
+            return;
+        };
         let epoch = self.epoch.load(Ordering::Acquire);
-        let mode = self.screen.mode();
+        let mode = self.offered_mode(display);
+        let seen = id < self.displays_seen();
         let (scanout, vblank, changed) = {
-            let mut display = self.display.lock();
+            let mut display = display.state.lock();
             display.refreshes = display.refreshes.wrapping_add(1);
             if display.told.is_some_and(|told| told != mode) {
                 display.told = Some(mode);
@@ -3534,17 +3652,17 @@ impl Shared {
             }
             (
                 display.scanout,
-                display.vblank.then_some(display.refreshes),
-                display.changed,
+                (display.vblank && seen).then_some(display.refreshes),
+                display.changed && seen,
             )
         };
         if scanout.is_some() {
-            self.screen.present();
+            display.screen.present();
         }
         if let Some(count) = vblank {
             let event = RgfxVblank {
                 header: event_header(RGFX_EVT_VBLANK),
-                display: 0,
+                display: id,
                 reserved_14: 0,
                 count,
                 host_time_ns: now,
@@ -3568,17 +3686,17 @@ impl Shared {
         if changed {
             let event = RgfxDisplayChanged {
                 header: event_header(RGFX_EVT_DISPLAY_CHANGED),
-                display: 0,
+                display: id,
                 reserved_14: 0,
             };
             // Told again at the next refresh where answers handed over wait before it.
             if !self.control_handing.load(Ordering::Acquire)
                 && self.post(&sized(&event), epoch) == Post::Done
             {
-                self.display.lock().changed = false;
+                display.state.lock().changed = false;
             }
         }
-        self.host.refreshed();
+        self.host.refreshed(id);
     }
 }
 

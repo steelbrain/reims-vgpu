@@ -116,7 +116,13 @@ impl Host for FuzzHost {
         self.surface_download(block_offset, answer);
         Ok(())
     }
-    fn present_surface(&self, iosurface_id: u32, _generation: Option<u64>, answer: PresentAnswer) {
+    fn present_surface(
+        &self,
+        _display: u32,
+        iosurface_id: u32,
+        _generation: Option<u64>,
+        answer: PresentAnswer,
+    ) {
         let mut shown = iosurface_id == 0;
         self.carry_out(answer.seqno, |seen| {
             shown |= seen.named.get(&iosurface_id).is_some_and(|t| !t.is_empty());

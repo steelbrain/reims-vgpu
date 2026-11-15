@@ -3,7 +3,9 @@
 //! for `GET_DISPLAYS`; `MOVE_CURSOR` is not answered. A command that is refused changes nothing.
 //! A message of a type the device has no command for is answered
 //! [`RGFX_STATUS_UNKNOWN_COMMAND`], and one shorter than its command
-//! [`RGFX_STATUS_INVALID_ARGUMENT`].
+//! [`RGFX_STATUS_INVALID_ARGUMENT`]. A display command naming a display the guest does not see
+//! (`Shared::seen_display`: past the device's count, or past display 0 where the guest did not
+//! take [`RGFX_FEATURE_MULTI_DISPLAY`]) is refused [`RGFX_STATUS_NO_DISPLAY`].
 
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -26,9 +28,9 @@ pub(crate) fn answer(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
         }),
         RGFX_CMD_MOVE_CURSOR => {
             if let Some(command) = read::<RgfxMoveCursor>(message)
-                && command.display == 0
+                && let Some(display) = shared.seen_display(command.display)
             {
-                shared
+                display
                     .screen
                     .cursor_moved(command.x, command.y, command.visible != 0);
             }
@@ -219,13 +221,13 @@ pub(crate) fn complete(seqno: u64, status: u32) -> Vec<u8> {
     })
 }
 
-/// `GET_DISPLAYS`' answer: display 0, connected, with the screen's mode as its one mode, which
-/// it prefers, and, where the guest took [`RGFX_FEATURE_DISPLAY_SCALE`], the screen's scale
-/// between the display's record and its mode. The guest is told that mode from now on
-/// (`device`'s refresh).
+/// `GET_DISPLAYS`' answer: each display the guest sees (`Shared::displays_seen`: display 0
+/// alone where it did not take [`RGFX_FEATURE_MULTI_DISPLAY`]), in order of id, connected, with
+/// the mode it offers (`Shared::offered_mode`) as its one mode, which it prefers, and, where the
+/// guest took [`RGFX_FEATURE_DISPLAY_SCALE`], its screen's scale between the display's record and
+/// its mode. The guest is told each display's mode from now on (`device`'s refresh).
 fn displays(shared: &Shared, seqno: u64) -> Vec<u8> {
-    let mode = shared.screen.mode();
-    shared.display.lock().told = Some(mode);
+    let seen = shared.displays_seen();
     let mut bytes = RgfxMsgHeader {
         r#type: RGFX_EVT_DISPLAYS,
         size: 0,
@@ -233,27 +235,31 @@ fn displays(shared: &Shared, seqno: u64) -> Vec<u8> {
     }
     .as_bytes()
     .to_vec();
-    bytes.extend_from_slice(&RGFX_DISPLAY_COUNT.to_le_bytes());
-    let entry = RgfxDisplayEntry {
-        id: 0,
-        connected: 1,
-        preferred_mode: 0,
-        mode_count: 1,
-    };
-    bytes.extend_from_slice(entry.as_bytes());
-    if shared.driver_took(RGFX_FEATURE_DISPLAY_SCALE) {
-        let scale = RgfxDisplayScale {
-            scale_120ths: mode.scale_120ths,
-            reserved_4: 0,
+    bytes.extend_from_slice(&seen.to_le_bytes());
+    for (id, display) in (0..seen).zip(shared.displays.iter()) {
+        let mode = shared.offered_mode(display);
+        display.state.lock().told = Some(mode);
+        let entry = RgfxDisplayEntry {
+            id,
+            connected: 1,
+            preferred_mode: 0,
+            mode_count: 1,
         };
-        bytes.extend_from_slice(scale.as_bytes());
+        bytes.extend_from_slice(entry.as_bytes());
+        if shared.driver_took(RGFX_FEATURE_DISPLAY_SCALE) {
+            let scale = RgfxDisplayScale {
+                scale_120ths: mode.scale_120ths,
+                reserved_4: 0,
+            };
+            bytes.extend_from_slice(scale.as_bytes());
+        }
+        let mode = RgfxModeEntry {
+            width: mode.width,
+            height: mode.height,
+            refresh_mhz: mode.refresh_mhz,
+        };
+        bytes.extend_from_slice(mode.as_bytes());
     }
-    let mode = RgfxModeEntry {
-        width: mode.width,
-        height: mode.height,
-        refresh_mhz: mode.refresh_mhz,
-    };
-    bytes.extend_from_slice(mode.as_bytes());
     bytes.resize(bytes.len().next_multiple_of(8), 0);
     set_size(&mut bytes);
     bytes
@@ -266,26 +272,14 @@ fn in_allocations(shared: &Shared, offset: u64, len: u64) -> bool {
         && shared.region.contains(offset, len)
 }
 
-/// Whether `len` bytes at `offset` lie in the scanout's room: the [`RGFX_SCANOUT_SPAN`] bytes at
-/// [`RGFX_ALLOCATIONS_OFFSET`], before the accelerator kext's blocks
-/// ([`RGFX_CONTEXT_ALLOCATIONS_OFFSET`]), `offset` a multiple of 4. A scanout past the room would
-/// show the processes' blocks on the display.
-fn in_scanout_room(shared: &Shared, offset: u64, len: u64) -> bool {
-    offset.is_multiple_of(4)
-        && offset >= RGFX_ALLOCATIONS_OFFSET
-        && len <= RGFX_SCANOUT_SPAN
-        && offset - RGFX_ALLOCATIONS_OFFSET <= RGFX_SCANOUT_SPAN - len
-        && shared.region.contains(offset, len)
-}
-
-/// `SET_SCANOUT`: the scanout lies in its room ([`in_scanout_room`]).
+/// `SET_SCANOUT`: the scanout lies in its display's room (`Shared::in_scanout_room`).
 fn set_scanout(shared: &Shared, command: &RgfxSetScanout) -> u32 {
-    if command.display != 0 {
+    let Some(display) = shared.seen_display(command.display) else {
         return RGFX_STATUS_NO_DISPLAY;
-    }
+    };
     if command.width == 0 {
-        shared.display.lock().scanout = None;
-        shared.screen.scanout(None);
+        display.state.lock().scanout = None;
+        display.screen.scanout(None);
         return RGFX_STATUS_OK;
     }
     let row = u64::from(command.width) * u64::from(RGFX_SCANOUT_BYTES_PER_PIXEL);
@@ -298,22 +292,22 @@ fn set_scanout(shared: &Shared, command: &RgfxSetScanout) -> u32 {
         stride: command.stride,
         offset: command.offset,
     };
-    if !in_scanout_room(shared, scanout.offset, scanout.span()) {
+    if !shared.in_scanout_room(command.display, scanout.offset, scanout.span()) {
         return RGFX_STATUS_INVALID_ARGUMENT;
     }
-    shared.display.lock().scanout = Some(scanout);
-    shared.screen.scanout(Some(scanout));
+    display.state.lock().scanout = Some(scanout);
+    display.screen.scanout(Some(scanout));
     RGFX_STATUS_OK
 }
 
 /// `SET_CURSOR`: the image is copied out of the region now; the guest may reuse its bytes once
 /// it has the answer.
 fn set_cursor(shared: &Shared, command: &RgfxSetCursor) -> u32 {
-    if command.display != 0 {
+    let Some(display) = shared.seen_display(command.display) else {
         return RGFX_STATUS_NO_DISPLAY;
-    }
+    };
     if command.width == 0 {
-        shared.screen.cursor_image(None);
+        display.screen.cursor_image(None);
         return RGFX_STATUS_OK;
     }
     let (width, height) = (command.width, command.height);
@@ -332,7 +326,7 @@ fn set_cursor(shared: &Shared, command: &RgfxSetCursor) -> u32 {
     let Some(bgra) = shared.region.read(command.offset, len as usize) else {
         return RGFX_STATUS_INVALID_ARGUMENT;
     };
-    shared.screen.cursor_image(Some(CursorImage {
+    display.screen.cursor_image(Some(CursorImage {
         width,
         height,
         hot_spot: (command.hot_x, command.hot_y),
@@ -353,16 +347,17 @@ fn present(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> {
         {
             RGFX_STATUS_INVALID_ARGUMENT
         }
-        Some(command) if command.display == 0 => {
+        Some(command) if shared.seen_display(command.display).is_some() => {
             if command.flags & RGFX_PRESENT_KEEP != 0 {
                 log::trace!(
                     target: "reims_vgpu_graphics",
-                    "PRESENT_SURFACE of transaction {}: the display keeps what it shows",
-                    command.transaction_id
+                    "PRESENT_SURFACE of transaction {}: display {} keeps what it shows",
+                    command.transaction_id,
+                    command.display
                 );
                 shared
                     .host
-                    .present_keep(shared.complete_answer(seqno, epoch));
+                    .present_keep(command.display, shared.complete_answer(seqno, epoch));
                 return None;
             }
             let generation =
@@ -378,8 +373,9 @@ fn present(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> {
 }
 
 /// `DISPLAY_COLOR`, on the presents' lane: its fields and entries to the host, which stages them
-/// (`Host::display_color`). Not answered: one for another display, or shorter than the entries it
-/// names, or naming more than [`RGFX_COLOR_PART_ENTRIES`], is logged and dropped.
+/// (`Host::display_color`). Not answered: one for a display the guest does not see, or shorter
+/// than the entries it names, or naming more than [`RGFX_COLOR_PART_ENTRIES`], is logged and
+/// dropped.
 fn display_color(shared: &Shared, message: &Message) {
     let Some(color) = read::<RgfxDisplayColor>(message) else {
         log::warn!(
@@ -402,7 +398,9 @@ fn display_color(shared: &Shared, message: &Message) {
         })
         .flatten();
     match entries {
-        Some(entries) if color.display == 0 => shared.host.display_color(&color, &entries),
+        Some(entries) if shared.seen_display(color.display).is_some() => {
+            shared.host.display_color(&color, &entries);
+        }
         Some(_) => log::warn!(
             target: "reims_vgpu_graphics",
             "a DISPLAY_COLOR of display {} (transaction {}) was dropped: there is no such display",
@@ -419,8 +417,8 @@ fn display_color(shared: &Shared, message: &Message) {
     }
 }
 
-/// `PRESENT_SURFACE` on display 0: the host answers once it shows the surface, or refuses it
-/// (`Host::present_surface`), at once or from any thread.
+/// `PRESENT_SURFACE` on a display the guest sees: the host answers once it shows the surface, or
+/// refuses it (`Host::present_surface`), at once or from any thread.
 fn present_surface(
     shared: &Shared,
     command: &RgfxPresentSurface,
@@ -430,11 +428,13 @@ fn present_surface(
 ) {
     log::trace!(
         target: "reims_vgpu_graphics",
-        "PRESENT_SURFACE of transaction {}: IOSurface {}",
+        "PRESENT_SURFACE of transaction {}: IOSurface {} on display {}",
         command.transaction_id,
-        command.iosurface_id
+        command.iosurface_id,
+        command.display
     );
     shared.host.present_surface(
+        command.display,
         command.iosurface_id,
         generation,
         shared.complete_answer(seqno, epoch),
@@ -443,32 +443,42 @@ fn present_surface(
 
 /// `SET_VBLANK`.
 fn set_vblank(shared: &Shared, command: &RgfxSetVblank) -> u32 {
-    if command.display != 0 {
+    let Some(display) = shared.seen_display(command.display) else {
         return RGFX_STATUS_NO_DISPLAY;
-    }
-    shared.display.lock().vblank = command.enabled != 0;
+    };
+    display.state.lock().vblank = command.enabled != 0;
     RGFX_STATUS_OK
 }
 
 /// `SET_DISPLAY_POWER`: the screen is told where the panel's state changes. The display's
 /// scanout, presents and `VBLANK`s go on either way (`display`'s module doc).
 fn set_display_power(shared: &Shared, command: &RgfxSetDisplayPower) -> u32 {
-    if command.display != 0 {
+    let Some(display) = shared.seen_display(command.display) else {
         return RGFX_STATUS_NO_DISPLAY;
-    }
+    };
     let asleep = command.on == 0;
     let changed = {
-        let mut display = shared.display.lock();
-        std::mem::replace(&mut display.asleep, asleep) != asleep
+        let mut state = display.state.lock();
+        std::mem::replace(&mut state.asleep, asleep) != asleep
     };
     if changed {
-        log::info!(
-            target: "reims_vgpu_graphics",
-            "the display's panel is {}: the guest's display {}",
-            if asleep { "off" } else { "on" },
-            if asleep { "sleeps" } else { "woke" }
-        );
-        shared.screen.power(!asleep);
+        if command.display == 0 {
+            log::info!(
+                target: "reims_vgpu_graphics",
+                "the display's panel is {}: the guest's display {}",
+                if asleep { "off" } else { "on" },
+                if asleep { "sleeps" } else { "woke" }
+            );
+        } else {
+            log::info!(
+                target: "reims_vgpu_graphics",
+                "display {}'s panel is {}: the guest's display {}",
+                command.display,
+                if asleep { "off" } else { "on" },
+                if asleep { "sleeps" } else { "woke" }
+            );
+        }
+        display.screen.power(!asleep);
     }
     RGFX_STATUS_OK
 }

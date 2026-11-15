@@ -381,7 +381,13 @@ struct AnsweringHost {
 
 impl Host for AnsweringHost {
     fn raise_interrupt(&self, _vector: u32) {}
-    fn present_surface(&self, _iosurface_id: u32, _generation: Option<u64>, answer: PresentAnswer) {
+    fn present_surface(
+        &self,
+        _display: u32,
+        _iosurface_id: u32,
+        _generation: Option<u64>,
+        answer: PresentAnswer,
+    ) {
         self.answers.lock().push(answer);
     }
     fn ring_degraded(&self, kind: RingDegradation) {

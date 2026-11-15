@@ -11,6 +11,7 @@ use zerocopy::{FromBytes, FromZeros, IntoBytes};
 use super::*;
 use crate::display::CursorImage;
 
+mod displays;
 mod posting;
 
 /// How many times [`eventually`] polls, a millisecond's sleep apart, for a state the device's own
@@ -95,7 +96,12 @@ struct TestHost {
     refreshes: Arc<AtomicU32>,
     seen: Arc<Mutex<Vec<Seen>>>,
     degraded: Arc<Mutex<Vec<RingDegradation>>>,
+    by_display: ByDisplay,
 }
+
+/// What a host was handed, by display: each present, kept present and colour part
+/// (`Some`), and each refresh (`None`), with the display it names.
+type ByDisplay = Arc<Mutex<Vec<(u32, Option<Seen>)>>>;
 
 /// The one IOSurface the test host holds a texture over.
 const HELD_SURFACE: u32 = 0x77;
@@ -105,40 +111,58 @@ impl Host for TestHost {
         assert_eq!(vector, 0);
         self.interrupts.fetch_add(1, Ordering::SeqCst);
     }
-    fn refreshed(&self) {
+    fn refreshed(&self, display: u32) {
         self.refreshes.fetch_add(1, Ordering::SeqCst);
+        self.by_display.lock().push((display, None));
     }
     fn ring_degraded(&self, kind: RingDegradation) {
         self.degraded.lock().push(kind);
     }
-    fn present_surface(&self, iosurface_id: u32, generation: Option<u64>, answer: PresentAnswer) {
+    fn present_surface(
+        &self,
+        display: u32,
+        iosurface_id: u32,
+        generation: Option<u64>,
+        answer: PresentAnswer,
+    ) {
         self.presented.lock().push((iosurface_id, generation));
         self.seen.lock().push(Seen::Present(iosurface_id));
+        (self.by_display.lock()).push((display, Some(Seen::Present(iosurface_id))));
         answer.answer(if iosurface_id == 0 || iosurface_id == HELD_SURFACE {
             RGFX_STATUS_OK
         } else {
             RGFX_STATUS_INVALID_ARGUMENT
         });
     }
-    fn present_keep(&self, answer: PresentAnswer) {
+    fn present_keep(&self, display: u32, answer: PresentAnswer) {
         self.seen.lock().push(Seen::Keep);
+        self.by_display.lock().push((display, Some(Seen::Keep)));
         answer.answer(RGFX_STATUS_OK);
     }
     fn display_color(&self, color: &RgfxDisplayColor, entries: &[RgfxColorEntry]) {
-        self.seen.lock().push(Seen::Color {
+        let seen = Seen::Color {
             stage: color.stage,
             first: color.first_entry,
             entries: entries.len(),
             red: entries.first().map_or(0, |e| e.x),
-        });
+        };
+        self.seen.lock().push(seen);
+        self.by_display.lock().push((color.display, Some(seen)));
     }
 }
 
-/// A device, its stand-in guest, and what its host and screen saw.
+/// A test screen's mode, and what it was told.
+type ScreenRecord = (Arc<Mutex<Mode>>, Arc<Mutex<Vec<Told>>>);
+
+/// A device, its stand-in guest, and what its host and screens saw.
 struct Rig {
     device: Device,
+    /// Display 0's screen's mode.
     mode: Arc<Mutex<Mode>>,
+    /// What display 0's screen was told.
     told: Arc<Mutex<Vec<Told>>>,
+    /// The screens of displays 1 and up, on a device of more than one display.
+    more: Vec<ScreenRecord>,
     interrupts: Arc<AtomicU32>,
     presented: Presented,
     /// The refreshes the host was told of.
@@ -147,6 +171,8 @@ struct Rig {
     seen: Arc<Mutex<Vec<Seen>>>,
     /// What the device told the host of the control completion ring.
     degraded: Arc<Mutex<Vec<RingDegradation>>>,
+    /// What the host was handed, by display.
+    by_display: ByDisplay,
     /// The guest's count of the submission ring.
     produced: u64,
     /// The guest's count of the completion ring.
@@ -163,24 +189,32 @@ const MODE: Mode = Mode {
 
 impl Rig {
     fn new() -> Rig {
+        Rig::of_displays(1)
+    }
+
+    /// [`Self::new`], for a device of `count` displays.
+    fn of_displays(count: usize) -> Rig {
         let interrupts = Arc::new(AtomicU32::new(0));
         let presented = Arc::new(Mutex::new(Vec::new()));
         let refreshes = Arc::new(AtomicU32::new(0));
         let seen = Arc::new(Mutex::new(Vec::new()));
         let degraded = Arc::new(Mutex::new(Vec::new()));
+        let by_display = Arc::new(Mutex::new(Vec::new()));
         let host = TestHost {
             interrupts: Arc::clone(&interrupts),
             presented: Arc::clone(&presented),
             refreshes: Arc::clone(&refreshes),
             seen: Arc::clone(&seen),
             degraded: Arc::clone(&degraded),
+            by_display: Arc::clone(&by_display),
         };
-        let mut rig = Rig::with_host(Box::new(host));
+        let mut rig = Rig::with_displays(Box::new(host), Lanes::default(), count);
         rig.interrupts = interrupts;
         rig.presented = presented;
         rig.refreshes = refreshes;
         rig.seen = seen;
         rig.degraded = degraded;
+        rig.by_display = by_display;
         rig
     }
 
@@ -191,30 +225,39 @@ impl Rig {
 
     /// [`Self::with_host`], the device's ring 0's lanes `lanes`.
     fn with_lanes(host: Box<dyn Host>, lanes: Lanes) -> Rig {
-        let mode = Arc::new(Mutex::new(MODE));
-        let told = Arc::new(Mutex::new(Vec::new()));
+        Rig::with_displays(host, lanes, 1)
+    }
+
+    /// [`Self::with_lanes`], for a device of `count` displays, each screen's mode [`MODE`].
+    fn with_displays(host: Box<dyn Host>, lanes: Lanes, count: usize) -> Rig {
+        let mut screens: Vec<ScreenRecord> = (0..count)
+            .map(|_| (Arc::new(Mutex::new(MODE)), Arc::new(Mutex::new(Vec::new()))))
+            .collect();
         let interrupts = Arc::new(AtomicU32::new(0));
         let presented = Arc::new(Mutex::new(Vec::new()));
         let region = Arc::new(Region::new(REGION_SIZE as usize).unwrap());
-        let device = Device::with_lanes(
-            region,
-            host,
-            Box::new(TestScreen {
-                mode: Arc::clone(&mode),
-                told: Arc::clone(&told),
-            }),
-            lanes,
-        )
-        .unwrap();
+        let boxed = (screens.iter())
+            .map(|(mode, told)| {
+                let screen: Box<dyn Screen> = Box::new(TestScreen {
+                    mode: Arc::clone(mode),
+                    told: Arc::clone(told),
+                });
+                screen
+            })
+            .collect();
+        let device = Device::with_lanes(region, host, boxed, lanes).unwrap();
+        let (mode, told) = screens.remove(0);
         Rig {
             device,
             mode,
             told,
+            more: screens,
             interrupts,
             presented,
             refreshes: Arc::new(AtomicU32::new(0)),
             seen: Arc::new(Mutex::new(Vec::new())),
             degraded: Arc::new(Mutex::new(Vec::new())),
+            by_display: Arc::new(Mutex::new(Vec::new())),
             produced: 0,
             consumed: 0,
             seqno: 0,
@@ -363,7 +406,7 @@ impl Rig {
     }
 
     fn refresh(&self) {
-        self.device.shared.refresh(1234);
+        self.device.shared.refresh(0, 1234);
     }
 }
 
@@ -572,7 +615,13 @@ impl Host for ResettingHost {
             self.resets.fetch_add(1, Ordering::SeqCst);
         }
     }
-    fn present_surface(&self, _iosurface_id: u32, _generation: Option<u64>, answer: PresentAnswer) {
+    fn present_surface(
+        &self,
+        _display: u32,
+        _iosurface_id: u32,
+        _generation: Option<u64>,
+        answer: PresentAnswer,
+    ) {
         answer.answer(RGFX_STATUS_OK);
     }
 }
@@ -779,7 +828,10 @@ fn set_scanout_checks_its_range() {
     let s = rig.send(bytes);
     assert_eq!(rig.complete(), (s, RGFX_STATUS_NO_DISPLAY));
     assert_eq!(rig.told(), []);
-    assert_eq!(rig.device.shared.display.lock().scanout, Some(shown));
+    assert_eq!(
+        rig.device.shared.displays[0].state.lock().scanout,
+        Some(shown)
+    );
     let s = rig.send(scanout(0, 0, 0, 0));
     assert_eq!(rig.complete(), (s, RGFX_STATUS_OK));
     assert_eq!(rig.told(), [Told::Scanout(None)]);
@@ -813,7 +865,10 @@ fn set_scanout_keeps_to_the_scanout_s_room() {
         assert_eq!(rig.complete(), (s, RGFX_STATUS_INVALID_ARGUMENT));
     }
     assert_eq!(rig.told(), []);
-    assert_eq!(rig.device.shared.display.lock().scanout, Some(shown));
+    assert_eq!(
+        rig.device.shared.displays[0].state.lock().scanout,
+        Some(shown)
+    );
 }
 
 /// `SET_CURSOR` hands the screen the guest's image as straight RGBA, and `MOVE_CURSOR` its
@@ -1047,7 +1102,7 @@ fn a_reset_puts_the_device_back_as_new() {
         .load(Ordering::SeqCst);
     assert_eq!(idle, 1, "the guest rings for its first message");
     assert_eq!(
-        rig.device.shared.display.lock().scanout,
+        rig.device.shared.displays[0].state.lock().scanout,
         Some(Scanout {
             width: 16,
             height: 4,
@@ -1083,7 +1138,7 @@ fn set_display_power_turns_the_panel_off_and_on() {
     let s = rig.send(display_power(0, 0));
     assert_eq!(rig.complete(), (s, RGFX_STATUS_OK));
     assert_eq!(rig.told(), [Told::Power(false)]);
-    assert!(rig.device.shared.display.lock().asleep);
+    assert!(rig.device.shared.displays[0].state.lock().asleep);
     let s = rig.send(display_power(0, 0));
     assert_eq!(rig.complete(), (s, RGFX_STATUS_OK));
     assert_eq!(
@@ -1108,7 +1163,7 @@ fn set_display_power_turns_the_panel_off_and_on() {
     let s = rig.send(display_power(0, 1));
     assert_eq!(rig.complete(), (s, RGFX_STATUS_OK));
     assert_eq!(rig.told(), [Told::Power(true)]);
-    assert!(!rig.device.shared.display.lock().asleep);
+    assert!(!rig.device.shared.displays[0].state.lock().asleep);
 }
 
 /// A reset turns an off panel on, telling the screen after the cursor's removal; a reset of a
@@ -1130,7 +1185,7 @@ fn a_reset_turns_an_off_panel_on() {
             Told::Power(true)
         ]
     );
-    assert!(!rig.device.shared.display.lock().asleep);
+    assert!(!rig.device.shared.displays[0].state.lock().asleep);
     (rig.produced, rig.consumed, rig.seqno) = (0, 0, 0);
     rig.start();
     rig.device
@@ -1171,9 +1226,8 @@ fn a_reset_keeps_the_scanout_and_what_the_guest_writes_there_shows() {
     rig.refresh();
     assert_eq!(rig.told(), [Told::Present]);
     assert_eq!(
-        rig.device
-            .shared
-            .display
+        rig.device.shared.displays[0]
+            .state
             .lock()
             .scanout
             .map(|s| (s.offset, s.span())),
@@ -1191,9 +1245,8 @@ fn a_reset_keeps_the_scanout_and_what_the_guest_writes_there_shows() {
     rig.refresh();
     assert_eq!(rig.told(), [Told::Present]);
     assert_eq!(
-        rig.device
-            .shared
-            .display
+        rig.device.shared.displays[0]
+            .state
             .lock()
             .scanout
             .map(|s| (s.offset, s.span())),
@@ -4233,7 +4286,13 @@ impl Host for OrderHost {
         self.downloaded_on.lock().push(thread);
         true
     }
-    fn present_surface(&self, _iosurface_id: u32, _generation: Option<u64>, answer: PresentAnswer) {
+    fn present_surface(
+        &self,
+        _display: u32,
+        _iosurface_id: u32,
+        _generation: Option<u64>,
+        answer: PresentAnswer,
+    ) {
         self.record(RGFX_CMD_PRESENT_SURFACE);
         answer.answer(RGFX_STATUS_OK);
     }
