@@ -30,9 +30,11 @@
 //!   allocation granularity (64 KiB) alone, so a run that starts inside such a block is refused,
 //!   as are bytes in use outside the VM, with nothing changed.
 //! - **While a call makes room**, the bytes of the Windows views it meets are unmapped for a
-//!   moment. A thread that touches one then faults, and the VM's exception handler holds it until
-//!   the call is done, then runs the access again where the page now allows it ([`transit`]): no
-//!   thread sees the gap, as none sees one on Mach or under Linux's `MAP_FIXED`.
+//!   moment. A thread that touches one then faults, and the VM's exception handler holds it while
+//!   a call has the page in transit, then runs the access again where the page now allows it,
+//!   looking again where a call began or ended while it looked ([`transit`]): no thread sees the
+//!   gap, as none sees one on Mach or under Linux's `MAP_FIXED`, however many calls come between
+//!   its fault and its handler.
 //! - **`remap_shared_overwrite`** fails with `KERN_INVALID_ADDRESS` where a byte of the source has
 //!   no section behind it, or a byte of the target lies outside the VM's views, before it changes
 //!   anything. A piece Windows refuses fails the call with nothing changed: the pieces mapped
@@ -351,11 +353,16 @@ fn remap_remainder(at: u64, length: u64, backing: &Backing) -> Result<(), KernRe
     Ok(())
 }
 
-/// The bytes of the Windows views a call is making room in ([`make_room`]), while it does, and
-/// the last such bytes: the exception handler's ([`transit`]).
+/// The bytes of the Windows views a call is making room in ([`make_room`]), while it does: the
+/// exception handler's ([`transit`]).
 static TRANSIT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-/// The bytes of the last call's room, kept after it ends ([`transit`]).
-static LAST_TRANSIT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// The calls' transits begun and ended, one count each: odd while a call holds [`TRANSIT`], which
+/// it sets before its count and clears after its end's ([`transit`]). The calls make room one at a
+/// time, under [`VIEWS`].
+static TRANSITS: AtomicU64 = AtomicU64::new(0);
+/// The lowest first byte and the highest end of every call's transit so far, each widened before
+/// the call sets [`TRANSIT`]: the bytes whose access violations the handler takes.
+static TRANSIT_BOUNDS: [AtomicU64; 2] = [AtomicU64::new(u64::MAX), AtomicU64::new(0)];
 
 /// The bytes `first..end` in transit until the answer drops (module docs): a thread whose access
 /// faults inside them waits for the drop, then runs the access again where the page allows it
@@ -377,21 +384,19 @@ fn transit(first: u64, end: u64) -> Transit {
             );
         }
     });
-    TRANSIT[0].store(first, Ordering::Release);
-    TRANSIT[1].store(end, Ordering::Release);
+    TRANSIT_BOUNDS[0].fetch_min(first, Ordering::SeqCst);
+    TRANSIT_BOUNDS[1].fetch_max(end, Ordering::SeqCst);
+    TRANSIT[0].store(first, Ordering::SeqCst);
+    TRANSIT[1].store(end, Ordering::SeqCst);
+    TRANSITS.fetch_add(1, Ordering::SeqCst);
     Transit
 }
 
 impl Drop for Transit {
     fn drop(&mut self) {
-        let (first, end) = (
-            TRANSIT[0].load(Ordering::Acquire),
-            TRANSIT[1].load(Ordering::Acquire),
-        );
-        LAST_TRANSIT[0].store(first, Ordering::Release);
-        LAST_TRANSIT[1].store(end, Ordering::Release);
-        TRANSIT[1].store(0, Ordering::Release);
-        TRANSIT[0].store(0, Ordering::Release);
+        TRANSITS.fetch_add(1, Ordering::SeqCst);
+        TRANSIT[1].store(0, Ordering::SeqCst);
+        TRANSIT[0].store(0, Ordering::SeqCst);
     }
 }
 
@@ -409,9 +414,13 @@ fn allows(protection: PAGE_PROTECTION_FLAGS, access: usize) -> bool {
     }
 }
 
-/// The VM's exception handler (module docs): an access violation inside the bytes a call is making
-/// room in, or made room in last, waits for that call to end, then runs again where the page now
-/// allows the access; any other goes on to the next handler.
+/// The VM's exception handler (module docs): an access violation inside the bytes calls have made
+/// room in ([`TRANSIT_BOUNDS`]) waits while a call has its page in transit, then runs again where
+/// the page now allows the access. Where it does not, and no call began or ended while the
+/// handler looked ([`TRANSITS`]), the access violation goes on to the next handler, as does any
+/// outside those bytes; else the handler looks again. So a thread whose access faulted while a
+/// call unmapped its page for a moment runs on however many calls began and ended before its
+/// handler ran, or between the handler's wait and its look.
 unsafe extern "system" fn held_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: Windows hands the handler a live record of the exception.
     let record = unsafe { &*(*info).ExceptionRecord };
@@ -422,24 +431,31 @@ unsafe extern "system" fn held_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
         record.ExceptionInformation[0],
         record.ExceptionInformation[1].to_u64(),
     );
-    let inside = |range: &[AtomicU64; 2]| {
-        let end = range[1].load(Ordering::Acquire);
-        end != 0 && range[0].load(Ordering::Acquire) <= at && at < end
-    };
-    if !inside(&TRANSIT) && !inside(&LAST_TRANSIT) {
+    if at < TRANSIT_BOUNDS[0].load(Ordering::SeqCst)
+        || at >= TRANSIT_BOUNDS[1].load(Ordering::SeqCst)
+    {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    while inside(&TRANSIT) {
-        std::thread::yield_now();
-    }
-    let mut info = MEMORY_BASIC_INFORMATION::default();
-    let size = std::mem::size_of::<MEMORY_BASIC_INFORMATION>();
-    // SAFETY: a query of the faulting page into a live buffer of its size.
-    let read = unsafe { VirtualQuery(ptr(at), &mut info, size) };
-    if read == size && info.State == MEM_COMMIT && allows(info.Protect, access) {
-        EXCEPTION_CONTINUE_EXECUTION
-    } else {
-        EXCEPTION_CONTINUE_SEARCH
+    let in_transit = || {
+        let end = TRANSIT[1].load(Ordering::SeqCst);
+        end != 0 && TRANSIT[0].load(Ordering::SeqCst) <= at && at < end
+    };
+    loop {
+        let transits = TRANSITS.load(Ordering::SeqCst);
+        if transits % 2 == 1 && in_transit() {
+            std::thread::yield_now();
+            continue;
+        }
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        let size = std::mem::size_of::<MEMORY_BASIC_INFORMATION>();
+        // SAFETY: a query of the faulting page into a live buffer of its size.
+        let read = unsafe { VirtualQuery(ptr(at), &mut info, size) };
+        if read == size && info.State == MEM_COMMIT && allows(info.Protect, access) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if TRANSITS.load(Ordering::SeqCst) == transits {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
     }
 }
 
@@ -1347,6 +1363,58 @@ pub(crate) mod tests {
             assert_eq!(v.deallocate(range, 2 * p), KernReturn::SUCCESS);
         }
         assert_eq!(v.deallocate(other, p), KernReturn::SUCCESS);
+    }
+
+    /// An access that faulted while a call unmapped its page for a moment runs again once the
+    /// page allows it, though calls over other bytes began and ended before its handler ran, as a
+    /// thread the host's scheduler held between its fault and its handler meets them; an access
+    /// its page does not allow, with no call under way, goes on to the next handler
+    #[test]
+    fn a_fault_handled_after_calls_elsewhere_runs_again_where_its_page_allows_it() {
+        use windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_RECORD;
+        let v = vm();
+        let p = page();
+        let a = v.allocate_anywhere(2 * p).unwrap();
+        let b = v.allocate_anywhere(2 * p).unwrap();
+        let other = v.allocate_anywhere(p).unwrap();
+        // A call that makes room over `a`'s view, its first page among the bytes in transit, then
+        // two over `b`'s alone.
+        let a1 = a.wrapping_add(p);
+        assert_eq!(v.remap_shared_overwrite(a1, other, p), Ok(a1));
+        let b1 = b.wrapping_add(p);
+        for _ in 0..2 {
+            assert_eq!(v.remap_shared_overwrite(b1, other, p), Ok(b1));
+        }
+        let handled = |at: HostAddr, access: usize| {
+            let mut record = EXCEPTION_RECORD {
+                ExceptionCode: EXCEPTION_ACCESS_VIOLATION,
+                NumberParameters: 2,
+                ..EXCEPTION_RECORD::default()
+            };
+            record.ExceptionInformation[0] = access;
+            record.ExceptionInformation[1] = at.addr();
+            let mut info = EXCEPTION_POINTERS {
+                ExceptionRecord: &raw mut record,
+                ContextRecord: std::ptr::null_mut(),
+            };
+            // SAFETY: a live record of an access violation, which the handler only reads.
+            unsafe { held_fault(&raw mut info) }
+        };
+        assert_eq!(handled(a, 0), EXCEPTION_CONTINUE_EXECUTION, "a read of `a`");
+        assert_eq!(v.protect_max(a, p, VmProt::READ), Ok(()));
+        assert_eq!(
+            handled(a, 1),
+            EXCEPTION_CONTINUE_SEARCH,
+            "a write of `a`, read-only"
+        );
+        assert_eq!(
+            handled(a, 0),
+            EXCEPTION_CONTINUE_EXECUTION,
+            "a read of `a`, read-only"
+        );
+        for (range, len) in [(a, 2 * p), (b, 2 * p), (other, p)] {
+            assert_eq!(v.deallocate(range, len), KernReturn::SUCCESS);
+        }
     }
 
     /// Registered memory is never deallocated
