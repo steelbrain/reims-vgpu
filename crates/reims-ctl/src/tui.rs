@@ -2396,6 +2396,7 @@ fn run_less(files: &[PathBuf]) -> std::io::Result<std::process::ExitStatus> {
 /// Has the terminal report the mouse's buttons and wheel, or stop: X11's reports (mode 1000)
 /// in SGR's form (1006), which holds any column. Not the mouse moving, which nothing here
 /// reads.
+#[cfg(unix)]
 fn report_mouse(on: bool) -> std::io::Result<()> {
     use std::io::Write;
     let mut out = std::io::stdout();
@@ -2405,6 +2406,21 @@ fn report_mouse(on: bool) -> std::io::Result<()> {
         b"\x1b[?1006l\x1b[?1000l"
     })?;
     out.flush()
+}
+
+/// Has the console report the mouse, or stop: on Windows crossterm reads the mouse from the
+/// console's mouse records, which come only while its mouse input is on (crossterm's mouse
+/// capture), the mouse moving among them. A stop where it was never on fails, which is no
+/// matter.
+#[cfg(windows)]
+fn report_mouse(on: bool) -> std::io::Result<()> {
+    use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+    if on {
+        execute!(std::io::stdout(), EnableMouseCapture)
+    } else {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        Ok(())
+    }
 }
 
 /// Has a terminal that speaks kitty's keyboard protocol report keys its way, or stop: pushes

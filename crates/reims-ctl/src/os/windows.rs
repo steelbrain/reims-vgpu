@@ -375,18 +375,32 @@ fn terminate(pid: i32) {
     }
 }
 
-/// Runs `cmd` to its end, then ends this process with its exit code: Windows replaces no
-/// running program with another. Returns only why `cmd` could not run.
-pub fn exec(mut cmd: Command) -> io::Error {
-    match cmd.status() {
+/// Runs `cmd` to its end in the console ([`run_in_terminal`]), then ends this process with its
+/// exit code: Windows replaces no running program with another. Returns only why `cmd` could
+/// not run.
+pub fn exec(cmd: Command) -> io::Error {
+    match run_in_terminal(cmd) {
         Ok(s) => std::process::exit(s.code().unwrap_or(1)),
         Err(e) => e,
     }
 }
 
-/// Runs `cmd` in the console to its end.
+/// Runs `cmd` in the console to its end. Ctrl+C and Ctrl+Break reach every process attached to
+/// the console, so this one takes them as handled until `cmd` exits, and `cmd` gets them as it
+/// would from a shell: a handler is not inherited, as ignoring them would be.
 pub fn run_in_terminal(mut cmd: Command) -> io::Result<ExitStatus> {
-    cmd.status()
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler,
+    };
+    unsafe extern "system" fn handled(ctrl: u32) -> windows_sys::core::BOOL {
+        (ctrl == CTRL_C_EVENT || ctrl == CTRL_BREAK_EVENT).into()
+    }
+    // SAFETY: handled is a function for the process's life, removed again below.
+    unsafe { SetConsoleCtrlHandler(Some(handled), 1) };
+    let status = cmd.status();
+    // SAFETY: as above.
+    unsafe { SetConsoleCtrlHandler(Some(handled), 0) };
+    status
 }
 
 /// Whether this process's window station is shown on a desktop (`WSF_VISIBLE`): an interactive
@@ -579,9 +593,99 @@ pub fn flush_input() {
     unsafe { FlushConsoleInputBuffer(GetStdHandle(STD_INPUT_HANDLE)) };
 }
 
-/// Reads what the terminal sends. Not on Windows yet: nothing.
-pub fn read_terminal(_buf: &mut [u8], _timeout: std::time::Duration) -> io::Result<usize> {
-    Ok(0)
+/// While it lives, the console gives what the terminal sends as the terminal sent it, escape
+/// sequences and all (`ENABLE_VIRTUAL_TERMINAL_INPUT`), for [`read_terminal`]; where it drops,
+/// the console's mode as it found it, in which crossterm reads the console's key records. It
+/// does nothing where stdin is no console.
+pub struct TerminalAnswers(Option<(windows_sys::Win32::Foundation::HANDLE, u32)>);
+
+/// [`TerminalAnswers`], from now.
+pub fn terminal_answers() -> TerminalAnswers {
+    use windows_sys::Win32::System::Console::{
+        ENABLE_VIRTUAL_TERMINAL_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE,
+        SetConsoleMode,
+    };
+    let mut mode = 0;
+    // SAFETY: GetStdHandle has no preconditions; the mode calls fail on a handle that is no
+    // console's.
+    let set = unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        (GetConsoleMode(h, &mut mode) != 0
+            && SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_INPUT) != 0)
+            .then_some((h, mode))
+    };
+    TerminalAnswers(set)
+}
+
+impl Drop for TerminalAnswers {
+    fn drop(&mut self) {
+        if let Some((h, mode)) = self.0 {
+            // SAFETY: h is stdin's console handle, which the process keeps.
+            unsafe { windows_sys::Win32::System::Console::SetConsoleMode(h, mode) };
+        }
+    }
+}
+
+/// Reads what the terminal sends into `buf`, waiting at most `timeout` for it: the characters of
+/// the console's key-press records, in UTF-8, its other records (focus, the mouse, the window's
+/// size) skipped. Ok(0) where it sent none in that time, or stdin is no console. Under
+/// [`terminal_answers`] the console gives the terminal's escape sequences as their characters.
+pub fn read_terminal(buf: &mut [u8], timeout: std::time::Duration) -> io::Result<usize> {
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, INPUT_RECORD, KEY_EVENT, ReadConsoleInputW, STD_INPUT_HANDLE,
+    };
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    let mut mode = 0;
+    // SAFETY: GetStdHandle has no preconditions; GetConsoleMode fails on a handle that is no
+    // console's.
+    let h = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if unsafe { GetConsoleMode(h, &mut mode) } == 0 {
+        return Ok(0);
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    let mut records = [INPUT_RECORD::default(); 64];
+    // A record's character is one UTF-16 unit, at most three bytes of UTF-8. A character of two
+    // units split between two reads is lost; the terminal's answers are ASCII.
+    let room = (buf.len() / 3).clamp(1, records.len()) as u32;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        // SAFETY: h is stdin's console handle.
+        match unsafe { WaitForSingleObject(h, left.as_millis().clamp(1, 1 << 30) as u32) } {
+            WAIT_OBJECT_0 => {}
+            WAIT_TIMEOUT => return Ok(0),
+            _ => return Err(io::Error::last_os_error()),
+        }
+        let mut got = 0u32;
+        // SAFETY: records holds at least `room` records, the most the call writes; the wait
+        // above saw one queued, so it does not block.
+        if unsafe { ReadConsoleInputW(h, records.as_mut_ptr(), room, &mut got) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let units: Vec<u16> = records[..got as usize]
+            .iter()
+            .filter(|r| u32::from(r.EventType) == KEY_EVENT)
+            .filter_map(|r| {
+                // SAFETY: a KEY_EVENT record holds a key event, whose character is UTF-16.
+                let (down, c) = unsafe {
+                    (
+                        r.Event.KeyEvent.bKeyDown,
+                        r.Event.KeyEvent.uChar.UnicodeChar,
+                    )
+                };
+                (down != 0 && c != 0).then_some(c)
+            })
+            .collect();
+        if !units.is_empty() {
+            let s = String::from_utf16_lossy(&units);
+            let n = s.len().min(buf.len());
+            buf[..n].copy_from_slice(&s.as_bytes()[..n]);
+            return Ok(n);
+        }
+        if left.is_zero() {
+            return Ok(0);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -616,5 +720,179 @@ mod tests {
             second: 0,
         };
         assert_eq!(epoch_secs(&epoch), 0);
+    }
+
+    /// The argument that has [`console_child`] run, with the file it writes what it read to.
+    const CONSOLE_CHILD: &str = "reims-ctl-console-child=";
+
+    /// What [`a_terminals_answer_reaches_read_terminal_as_sent`] runs in a pseudoconsole: asks
+    /// the terminal its device attributes (DA1) under [`terminal_answers`], as `view::term`
+    /// asks it, and writes what [`read_terminal`] gives back into the file its argument names;
+    /// in a run of the tests, nothing.
+    #[test]
+    fn console_child() {
+        use std::io::Write;
+        let Some(out) =
+            std::env::args().find_map(|a| a.strip_prefix(CONSOLE_CHILD).map(String::from))
+        else {
+            return;
+        };
+        let _answers = terminal_answers();
+        let mut stdout = std::io::stdout();
+        stdout
+            .write_all(b"\x1b[c")
+            .and_then(|_| stdout.flush())
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut got = Vec::new();
+        while !da1_answer(&got) {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let mut buf = [0u8; 256];
+            match read_terminal(&mut buf, left).unwrap() {
+                0 => break,
+                n => got.extend_from_slice(&buf[..n]),
+            }
+        }
+        std::fs::write(out, &got).unwrap();
+    }
+
+    /// Whether `b` holds an answer to DA1: `ESC [ ?`, its attributes, `c`.
+    fn da1_answer(b: &[u8]) -> bool {
+        b.windows(3)
+            .position(|w| w == b"\x1b[?")
+            .is_some_and(|i| b[i..].contains(&b'c'))
+    }
+
+    /// The answer a terminal sends to a query reaches [`read_terminal`] as the terminal sent it,
+    /// escape sequence and all, under [`terminal_answers`]: in a pseudoconsole, whose console
+    /// answers the device attributes query itself or passes it on to this test, which answers as
+    /// a terminal does.
+    #[test]
+    fn a_terminals_answer_reaches_read_terminal_as_sent() {
+        use std::io::{Read, Write};
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Console::{
+            COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON,
+        };
+        use windows_sys::Win32::System::Threading::{
+            CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+            GetExitCodeProcess, InitializeProcThreadAttributeList,
+            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+            STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+        };
+        let out = std::env::temp_dir().join(format!("reims-ctl-console-{}", std::process::id()));
+        let (in_read, mut in_write) = std::io::pipe().unwrap();
+        let (mut out_read, out_write) = std::io::pipe().unwrap();
+        let mut pc: HPCON = 0;
+        // SAFETY: both pipe ends are open; the console duplicates them.
+        let hr = unsafe {
+            CreatePseudoConsole(
+                COORD { X: 80, Y: 25 },
+                in_read.as_raw_handle(),
+                out_write.as_raw_handle(),
+                0,
+                &mut pc,
+            )
+        };
+        assert_eq!(hr, 0, "CreatePseudoConsole");
+        drop((in_read, out_write));
+        // The terminal: takes all the console writes, and answers each DA1 it passes on.
+        let terminal = std::thread::spawn(move || {
+            let count = |b: &[u8], q: &[u8]| b.windows(q.len()).filter(|w| *w == q).count();
+            let (mut seen, mut answered, mut chunk) = (Vec::new(), 0, [0u8; 4096]);
+            while let Ok(n @ 1..) = out_read.read(&mut chunk) {
+                seen.extend_from_slice(&chunk[..n]);
+                let asked = count(&seen, b"\x1b[c") + count(&seen, b"\x1b[0c");
+                for _ in answered..asked {
+                    let _ = in_write.write_all(b"\x1b[?62;4c");
+                }
+                answered = asked;
+            }
+            seen
+        });
+        let mut size = 0usize;
+        // SAFETY: a size query, with no list.
+        unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) };
+        let mut list = vec![0usize; size.div_ceil(size_of::<usize>())];
+        let attrs = list.as_mut_ptr().cast();
+        // SAFETY: list holds `size` bytes, aligned for the pointers the list holds; the
+        // pseudoconsole's attribute is its handle itself.
+        unsafe {
+            assert_ne!(InitializeProcThreadAttributeList(attrs, 1, 0, &mut size), 0);
+            assert_ne!(
+                UpdateProcThreadAttribute(
+                    attrs,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+                    pc as *const std::ffi::c_void,
+                    size_of::<HPCON>(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                ),
+                0
+            );
+        }
+        let mut si = STARTUPINFOEXW::default();
+        si.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        // The child's standard handles are its console's, not this process's, which a test
+        // harness may have made pipes.
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+        si.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+        si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
+        si.lpAttributeList = attrs;
+        let exe = std::env::current_exe().unwrap();
+        let mut line = wide(&format!(
+            "\"{}\" --exact os::windows::tests::console_child \"{CONSOLE_CHILD}{}\"",
+            exe.display(),
+            out.display()
+        ));
+        let mut pi = PROCESS_INFORMATION::default();
+        // SAFETY: line is NUL-terminated and writable; si and its list live past the call.
+        let ok = unsafe {
+            CreateProcessW(
+                std::ptr::null(),
+                line.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                EXTENDED_STARTUPINFO_PRESENT,
+                std::ptr::null(),
+                std::ptr::null(),
+                &si.StartupInfo,
+                &mut pi,
+            )
+        };
+        assert_ne!(ok, 0, "CreateProcessW: {}", io::Error::last_os_error());
+        let mut code = 0u32;
+        // SAFETY: pi's handles are the child's, closed once here; the list and the console are
+        // this test's, ended once the child has.
+        let waited = unsafe {
+            let waited = WaitForSingleObject(pi.hProcess, 30_000);
+            if waited != WAIT_OBJECT_0 {
+                TerminateProcess(pi.hProcess, 1);
+            }
+            GetExitCodeProcess(pi.hProcess, &mut code);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            DeleteProcThreadAttributeList(attrs);
+            ClosePseudoConsole(pc);
+            waited
+        };
+        let seen = terminal.join().unwrap();
+        let got = std::fs::read(&out).unwrap_or_default();
+        let _ = std::fs::remove_file(&out);
+        let console = String::from_utf8_lossy(&seen);
+        assert_eq!(
+            (waited, code),
+            (WAIT_OBJECT_0, 0),
+            "the console wrote {console:?}"
+        );
+        assert!(
+            da1_answer(&got),
+            "read {:?}; the console wrote {console:?}",
+            String::from_utf8_lossy(&got)
+        );
     }
 }

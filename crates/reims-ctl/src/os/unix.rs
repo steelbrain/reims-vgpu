@@ -304,6 +304,15 @@ pub fn flush_input() {
     unsafe { libc::tcflush(0, libc::TCIFLUSH) };
 }
 
+/// While it lives, [`read_terminal`] reads what the terminal sends as the terminal sent it, as
+/// stdin always gives it here.
+pub struct TerminalAnswers;
+
+/// [`TerminalAnswers`], from now.
+pub fn terminal_answers() -> TerminalAnswers {
+    TerminalAnswers
+}
+
 /// Reads what the terminal on stdin sends into `buf`, waiting at most `timeout` for it: Ok(0)
 /// where it sent nothing in that time, or stdin ended or could not be read; the wait's error,
 /// [`io::ErrorKind::Interrupted`] where a signal cut it short.

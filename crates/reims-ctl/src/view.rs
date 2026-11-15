@@ -115,8 +115,11 @@ pub fn run(vm: &Vm, opts: &Options) -> Result<Option<String>> {
         .unwrap_or_else(|| term::choose(&caps, |k| std::env::var(k).ok()));
     let (cols, rows) = ratatui::crossterm::terminal::size()?;
     let measured = term::cell_size(&caps, cols, rows);
-    let pixel_mouse = caps.sgr_pixels && measured.is_some();
-    tg.enable(caps.kitty_keyboard, pixel_mouse, proto == Protocol::Kitty)?;
+    // On Windows crossterm reads the console's records, which give the mouse in cells and keys
+    // without kitty's protocol, whatever the terminal could send.
+    let pixel_mouse = cfg!(unix) && caps.sgr_pixels && measured.is_some();
+    let keyboard = cfg!(unix) && caps.kitty_keyboard;
+    tg.enable(keyboard, pixel_mouse, proto == Protocol::Kitty)?;
 
     let sh = Arc::new(Shared {
         stop: AtomicBool::new(false),
