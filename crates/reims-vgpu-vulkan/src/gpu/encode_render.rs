@@ -6264,6 +6264,68 @@ pub(crate) mod tests {
         e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
     }
 
+    /// `setTriangleFillMode:` 2, which no SDK header names and Apple's GL renderer sends for
+    /// `glPolygonMode(GL_POINT)` under its Apple, AMD and Intel settings, draws a triangle's three
+    /// vertices as points of one pixel, as the M3 Max and the Intel UHD Graphics 630 draw them
+    /// (the runtime's `set_triangle_fill_mode`: `VK_POLYGON_MODE_POINT`), under a state whose
+    /// vertex function writes no `[[point_size]]`, where the device draws point polygons
+    /// (`fillModeNonSolid`, and `pointPolygons` on a portability-subset device). Elsewhere,
+    /// MoltenVK among them, the runtime refuses the mode, and the test draws nothing. Every
+    /// vertex is white: which vertex's flat value a point takes is not measured on Metal
+    #[test]
+    fn fill_mode_2_draws_a_triangles_vertices_as_points() {
+        use metal2vulkan::device::{VkExtension, VkFeature};
+        let (p, d) = (platform(), dev());
+        let desc = &d.raw.properties().description;
+        let draws = desc.features.contains(&VkFeature::FillModeNonSolid)
+            && (!desc.extensions.contains(&VkExtension::KhrPortabilitySubset)
+                || desc.features.contains(&VkFeature::PointPolygons));
+        if !draws {
+            return;
+        }
+        // Three pixels of the 16 by 16 target, each vertex at its centre in clip space.
+        let pixels: [(u8, u8); 3] = [(2, 3), (12, 4), (6, 13)];
+        let centre = |(x, y): (u8, u8)| {
+            let at = |v: u8| (f32::from(v) + 0.5) / 8.0 - 1.0;
+            [at(x), -at(y), 0.0, 1.0]
+        };
+        let pos: Vec<f32> = pixels.into_iter().flat_map(centre).collect();
+        let state = fixture_state::<VulkanPlatform>(&d, FLAT.0, FLAT.1);
+        let pos = buffer::<VulkanPlatform>(&d, 48, 0, &bytes(&pos));
+        let white = buffer::<VulkanPlatform>(&d, 48, 0, &bytes(&[1.0; 12]));
+        let drawn = pass_pixels(
+            &p,
+            &d,
+            vec![
+                RenderCmd::SetRenderPipelineState {
+                    pipeline_state: Some(&state),
+                },
+                RenderCmd::SetVertexBuffer {
+                    buffer: Some(&pos),
+                    offset: 0,
+                    index: 0,
+                },
+                RenderCmd::SetVertexBuffer {
+                    buffer: Some(&white),
+                    offset: 0,
+                    index: 1,
+                },
+                RenderCmd::SetTriangleFillMode { fill_mode: 2 },
+                RenderCmd::DrawPrimitivesInstances {
+                    primitive_type: 3,
+                    vertex_start: 0,
+                    vertex_count: 3,
+                    instance_count: 1,
+                },
+            ],
+        );
+        let mut want = vec![[0, 0, 0, 0xff]; 256];
+        for (x, y) in pixels {
+            want[usize::from(y) * 16 + usize::from(x)] = [0xff; 4];
+        }
+        assert_eq!(drawn, want);
+    }
+
     /// A draw of no primitive draws nothing whatever the private setters left, as on Metal: of
     /// too few vertices or indices for one, and an execution of no command, after a restart, a
     /// line width of 2, triangles filled as lines and the last vertex provoking under a state
