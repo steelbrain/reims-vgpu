@@ -45,6 +45,23 @@ pub(crate) fn run<T>(body: impl for<'u> FnOnce(Hold<'u>) -> T) -> T {
     r
 }
 
+/// Runs `body` on this thread as a part of an entry in progress on another, which waits for it
+/// to end (a helper's walk of a range of the command buffer a lane's job walks,
+/// `graphics/decode/helpers.rs`): marked as ours, inside a real pool and with a holder, as
+/// [`run`] does, but no step of the exit gate of its own. The entry it is part of holds one
+/// until `body` ends, so no work of `body`'s runs beside the driver's destructors; one of its
+/// own, begun once the process's exit began, would park this thread for good, and the entry
+/// waiting for it, and so the exit, would never end.
+pub(crate) fn run_within<T>(body: impl for<'u> FnOnce(Hold<'u>) -> T) -> T {
+    let _ours = enter_ours();
+    let pool = Pool::here();
+    let held = Held::new();
+    let r = body(Hold::of(&held));
+    drop(held);
+    drop(pool);
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -78,6 +95,22 @@ mod tests {
         assert_eq!(got, 7);
         assert!(!is_our_thread());
         assert_eq!(*log.lock(), ["body", "release second", "release first"]);
+    }
+
+    /// Work within another entry runs marked as ours, and what it holds to its holder is released
+    /// before it returns, as in an entry.
+    #[test]
+    fn work_within_an_entry_releases_what_it_holds_before_it_returns() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let got = run_within(|hold| {
+            assert!(is_our_thread());
+            hold.keep(Rel("held", log.clone()));
+            log.lock().push("body".into());
+            3
+        });
+        assert_eq!(got, 3);
+        assert!(!is_our_thread());
+        assert_eq!(*log.lock(), ["body", "release held"]);
     }
 
     /// With the real pool: what the body autoreleases goes when the pool pops, after the holder

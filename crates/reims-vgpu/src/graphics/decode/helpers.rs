@@ -11,6 +11,10 @@
 //!   [`KEEP`], 10 s. A helper is no lane's thread: what a lane counts and starts, and every
 //!   turn, ticket and commit, is as it was. A helper walks and commits nothing; the lane's
 //!   thread commits what it walked, in the buffer's order.
+//! - **Entries.** A helper's walk is part of the entry of the lane's job that handed it over,
+//!   which waits for it, so it runs with no step of the exit gate of its own
+//!   ([`crate::entry::run_within`]): one begun once the process's exit began would park the
+//!   helper for good, and the job and the exit with it.
 
 use std::collections::VecDeque;
 use std::sync::Arc;

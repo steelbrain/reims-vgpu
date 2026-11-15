@@ -2410,8 +2410,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             let rest = rest.to_vec();
             let walked = Arc::clone(&walked);
             let platform = Arc::clone(&self.shared.platform);
+            // Part of this walk's entry, which waits for it ([`crate::entry::run_within`]).
             move || {
-                crate::entry::run(|_| {
+                crate::entry::run_within(|_| {
                     let clock = platform.clock();
                     let started = clock.now_mono();
                     let mut cb = later;
