@@ -29,6 +29,15 @@
 //! draws come one at a time on the window's thread, so the last draw was committed or dropped by
 //! then, and it waited for the sync before it.
 //!
+//! **Its pages.** The mirror's host memory is the platform's
+//! (`reims_vgpu_vulkan::os::PrivateMemory`), whose unmap waits until the runtime has freed every
+//! import of its pages. The runtime runs a no-copy buffer's deallocator at the buffer's release,
+//! Metal's moment, and frees the buffer's import after it, on a handler thread: the old mirror's
+//! release, as a mirror is made again, runs its deallocator on the window's thread just before
+//! the draw's commit. An unmap of the OS's there takes the pages from under a live import, and
+//! RADV, which hands every pointer import of its device to each submission, rejected the draw's
+//! submission (`-EFAULT`), losing the device (`docs/lessons.md`).
+//!
 //! **What it refuses.** A surface of a pixel format the mirror does not carry (not 4 or 8 bytes a
 //! pixel), and any object the runtime refuses to make or a sync that fails, answer `None`: the
 //! window then presents from the runtime's GPU.
@@ -47,6 +56,7 @@ use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, MtlOrigin, M
 use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_vulkan::core::raise::{OnFault, RaiseResult};
 use reims_vgpu_vulkan::core::sync::Mutex;
+use reims_vgpu_vulkan::os::PrivateMemory;
 
 use super::sink::{Open, end_blit};
 use crate::entry::no_catch;
@@ -157,40 +167,6 @@ pub(crate) struct Completion<P: Platform> {
     /// The sync, which the window's thread waits for where the draw's device cannot wait for the
     /// file.
     pub(crate) sync: P::CommandBuffer,
-}
-
-/// Host memory of the mirror's own, anonymous pages, unmapped at its drop.
-struct HostPages {
-    base: *mut libc::c_void,
-    length: usize,
-}
-
-// SAFETY: anonymous pages of the process's, which the owner alone unmaps.
-unsafe impl Send for HostPages {}
-
-impl HostPages {
-    /// `length` bytes of fresh zeroed pages; `None` where the host refuses them.
-    fn new(length: usize) -> Option<HostPages> {
-        // SAFETY: a fresh anonymous private mapping, of no file.
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                length,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        (base != libc::MAP_FAILED).then_some(HostPages { base, length })
-    }
-}
-
-impl Drop for HostPages {
-    fn drop(&mut self) {
-        // SAFETY: the mapping `new` made, unmapped once, after every buffer over it has gone.
-        unsafe { libc::munmap(self.base, self.length) };
-    }
 }
 
 /// A compute encoder's end.
@@ -467,10 +443,13 @@ impl<P: ApiPlatform> Mirror<P> {
             // SAFETY: sysconf reads a constant of the host's.
             let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
             let span = length.checked_next_multiple_of(page)?;
-            let pages = HostPages::new(usize::try_from(span).ok()?)?;
-            // SAFETY: the pages are mapped from here until the deallocator, which owns them,
-            // runs once the buffer has gone.
-            let range = unsafe { HostRange::new(HostPtr::from_ptr(pages.base), span) };
+            // The platform's memory, whose unmap waits for the runtime's free of every import of
+            // its pages (the module doc, "Its pages").
+            let pages = PrivateMemory::new(span)?;
+            // SAFETY: the memory's `span` bytes, whole pages from a page, are mapped from here
+            // until the deallocator, which owns them, drops them once the buffer has gone, and
+            // past that until the runtime freed the buffer's import.
+            let range = unsafe { HostRange::new(HostPtr::from_ptr(pages.base()), span) };
             let mirror = no_catch(self.device.new_buffer_over_host_memory(
                 OnFault::Die,
                 range,
@@ -541,5 +520,96 @@ impl<P: ApiPlatform> Mirror<P> {
                 ..Counts::default()
             };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ptr::NonNull;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use reims_vgpu_vulkan::VulkanPlatform;
+    use reims_vgpu_vulkan::core::platform::os::clock::Clock as _;
+    use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+
+    use super::*;
+
+    /// On Vulkan, a mirror made again while an import of the old mirror's pages lives leaves each
+    /// of those pages mapped, holding what it held, until the runtime has freed the import: the
+    /// old mirror's deallocator runs at the old buffer's release, before that free (the module
+    /// doc, "Its pages"). A buffer over the old mirror's first page, made while the mirror lived,
+    /// lies in its import and holds the import until it goes
+    #[test]
+    fn on_vulkan_a_mirror_made_again_keeps_the_old_pages_mapped_while_their_import_lives() {
+        let platform = Arc::new(VulkanPlatform::new());
+        crate::entry::run(|_| {
+            // Whether the page at `at` is mapped, read without touching it.
+            let mapped = |at: HostPtr| {
+                // SAFETY: `msync` of the page at `at`, which reads no byte and fails where no
+                // page is mapped.
+                unsafe { libc::msync(at.as_ptr(), 1, libc::MS_ASYNC) == 0 }
+            };
+            // SAFETY: sysconf reads a constant of the host's.
+            let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+            let device = platform.metal_device(None).unwrap();
+            let mirror = Mirror::new(device.clone_ref()).expect("the mirror");
+            let surface = |side: u64| {
+                let descriptor = platform.texture_descriptor(&TextureDesc {
+                    pixel_format: 80,
+                    width: side,
+                    height: side,
+                    usage: 0x1,
+                    resource_options: Some(0),
+                    ..TextureDesc::default()
+                });
+                no_catch(device.new_texture(OnFault::Die, &descriptor)).unwrap()
+            };
+            // The mirror brought up to a `side` by `side` surface, its sync finished: the
+            // mirror's first byte and length.
+            let sync = |side: u64| {
+                let synced = (mirror.sync(&surface(side), 256, &|| platform.clock().now_mono()))
+                    .expect("a sync");
+                if let Some(completion) = &synced.completion {
+                    no_catch(completion.sync.wait_until_completed(OnFault::Die));
+                }
+                (synced.buffer.contents(), synced.buffer.length())
+            };
+            // 128 x 128 pixels of 4 bytes: 64 KiB, four pages of 16 KiB or sixteen of 4 KiB.
+            let (old, length) = sync(128);
+            let pages = length / page;
+            assert!(pages > 1, "the old mirror is {length:#x} bytes");
+            let at = |p: u64| old.wrapping_add(p * page);
+            let mark = |p: u64| 0xa0 | u8::try_from(p & 0xf).unwrap();
+            for p in 0..pages {
+                // SAFETY: a byte of the old mirror's pages, which no GPU work reaches now.
+                unsafe { at(p).as_ptr::<u8>().write_volatile(mark(p)) };
+            }
+            // SAFETY: the old mirror's first page, mapped while an import of it lives.
+            let bytes = unsafe { HostRange::new(old, page) };
+            let held = no_catch(device.new_buffer_over_host_memory(OnFault::Die, bytes, 0, None))
+                .expect("a buffer over the old mirror's first page");
+            // A frame of another size: the mirror is made again, and the old one goes.
+            let (new, _) = sync(32);
+            assert_ne!(new.addr(), old.addr(), "the mirror made again");
+            for p in 0..pages {
+                assert!(
+                    mapped(at(p)),
+                    "page {p} of the old mirror's {pages} stays mapped while the import lives"
+                );
+                // SAFETY: a byte of the old mirror's pages, mapped (above).
+                let byte = unsafe { at(p).as_ptr::<u8>().read_volatile() };
+                assert_eq!(byte, mark(p), "page {p} holds what it held");
+            }
+            drop(held);
+            assert!(
+                reims_vgpu_vulkan::remap::wait_unimported(
+                    NonNull::new(old.as_ptr::<u8>()).unwrap(),
+                    length,
+                    Duration::from_secs(30)
+                ),
+                "the runtime freed the import of the old mirror's pages"
+            );
+        });
     }
 }
