@@ -1,6 +1,6 @@
 //! [`super`]'s file system calls on Windows: a block clone (FSCTL_DUPLICATE_EXTENTS_TO_FILE)
 //! where the file system makes them, as ReFS does (a Dev Drive among it), and sparse files for
-//! the holes of a full copy, which NTFS copies make.
+//! the holes of a full copy, which NTFS keeps.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -17,9 +17,6 @@ pub(super) const UNSUPPORTED: &[i32] = &[1, 50];
 
 /// A volume's flag for block clones (winnt.h).
 const FILE_SUPPORTS_BLOCK_REFCOUNTING: u32 = 0x0800_0000;
-
-/// What DeviceIoControl fails with where its answer goes on past the buffer: ERROR_MORE_DATA.
-const ERROR_MORE_DATA: i32 = 234;
 
 /// The most one clone call takes: a gigabyte, a whole number of any volume's clusters.
 const CLONE_CHUNK: u64 = 1 << 30;
@@ -154,45 +151,13 @@ pub(super) fn clone(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// The parts of `f`, `len` bytes long, that hold data, as `[start, end)`: its allocated ranges
-/// (FSCTL_QUERY_ALLOCATED_RANGES), all of it for a file that is not sparse, or where the file
-/// system tells none.
-pub(super) fn data_ranges(f: &File, len: u64) -> Vec<(u64, u64)> {
-    use windows_sys::Win32::System::Ioctl::{
-        FILE_ALLOCATED_RANGE_BUFFER, FSCTL_QUERY_ALLOCATED_RANGES,
-    };
-    let all = || if len == 0 { Vec::new() } else { vec![(0, len)] };
-    let mut ranges = Vec::new();
-    let mut from = 0;
-    while from < len {
-        let query = FILE_ALLOCATED_RANGE_BUFFER {
-            FileOffset: from as i64,
-            Length: (len - from) as i64,
-        };
-        let mut out = [FILE_ALLOCATED_RANGE_BUFFER {
-            FileOffset: 0,
-            Length: 0,
-        }; 256];
-        let (got, more) = match control(f, FSCTL_QUERY_ALLOCATED_RANGES, Some(&query), &mut out) {
-            Ok(n) => (n, false),
-            Err(e) if e.raw_os_error() == Some(ERROR_MORE_DATA) => {
-                (std::mem::size_of_val(&out), true)
-            }
-            Err(_) => return all(),
-        };
-        let n = got / std::mem::size_of::<FILE_ALLOCATED_RANGE_BUFFER>();
-        for r in &out[..n] {
-            let (start, end) = (r.FileOffset as u64, (r.FileOffset + r.Length) as u64);
-            if end.min(len) > start {
-                ranges.push((start, end.min(len)));
-            }
-        }
-        match ranges.last() {
-            Some(&(_, end)) if more && n > 0 => from = end,
-            _ => break,
-        }
-    }
-    ranges
+/// The parts of `f`, `len` bytes long, that a full copy reads: all of it. NTFS's allocated ranges
+/// (FSCTL_QUERY_ALLOCATED_RANGES) left out data just written: a test's sparse source, asked
+/// just after it was written, came back without the range written first, so its copy was zeros
+/// there (job m3-max-32291 on the mini, 2026-11-15; job 32290 of the same code got the range).
+/// [`super::full`] leaves the blocks of zeros it reads holes, so a copy is as sparse either way.
+pub(super) fn data_ranges(_f: &File, len: u64) -> Vec<(u64, u64)> {
+    if len == 0 { Vec::new() } else { vec![(0, len)] }
 }
 
 /// The type of the file system `dir` is on: NTFS, ReFS, exFAT.

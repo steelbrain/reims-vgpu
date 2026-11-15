@@ -406,11 +406,22 @@ mod tests {
                 } else if i == j && ["btrfs", "apfs", "ReFS"].contains(&a.as_str()) {
                     assert!(seen.is_empty(), "{a}: {seen:?}");
                 } else if i == j && ["tmpfs", "NTFS"].contains(&a.as_str()) {
+                    // What it reads: the data, and on Windows all of it (windows::data_ranges).
+                    let total = if cfg!(windows) {
+                        size(4 << 20)
+                    } else {
+                        size(1)
+                    };
                     assert!(said.ends_with("makes none"), "{seen:?}");
-                    assert!(said.starts_with("copying src in full, 1 MB, not as a reflink"));
+                    assert!(
+                        said.starts_with(&format!(
+                            "copying src in full, {total}, not as a reflink"
+                        )),
+                        "{said}"
+                    );
                     assert_eq!(
                         seen.last().unwrap(),
-                        &format!("copying src in full ({a} makes no reflinks): 100% of 1 MB")
+                        &format!("copying src in full ({a} makes no reflinks): 100% of {total}")
                     );
                 }
                 std::fs::remove_file(&dst).unwrap();
