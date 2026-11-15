@@ -879,7 +879,14 @@ mod tests {
         let lane = Lane::with_spin(14, Budget::new(LANE_THREADS), Duration::from_millis(1));
         let first = ran_on(&lane, 1);
         lane.expect();
-        assert_eq!(lane.wakes(), (0, 1, 0));
+        // The woken thread may already be idle again here: its 1 ms spin can pass before this
+        // line runs on a loaded host, so only the wakes are certain at this point.
+        let (by_job, by_expectation, _) = lane.wakes();
+        assert_eq!(
+            (by_job, by_expectation),
+            (0, 1),
+            "(woken by a job, by an expectation)"
+        );
         assert!(
             until(|| lane.counts().0 == 1),
             "the thread did not wait for a job again once its spin had passed"
