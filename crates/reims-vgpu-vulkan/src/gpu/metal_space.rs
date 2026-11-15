@@ -1,9 +1,8 @@
 //! Metal's GPU address space as this process's Metal lays it out: the model this platform
-//! places guest-visible buffers, heaps and textures by, so that every address the guest reads (a
-//! placement entry's first word, the replies to the info commands 461 and 463, the buffer
-//! addresses an indirect command buffer's write-back holds) is the one Metal hands out. The
-//! runtime's own choice starts at 2^32 and packs ranges page after page, which no recording
-//! shows.
+//! places the buffers, heaps and textures it makes by, so that each is made at the GPU address
+//! Metal would give it, or at the one its pin asks for where Metal makes a buffer there
+//! ([`placing`]). The runtime's own choice starts at 2^32 and packs ranges page after page, which
+//! no recording of Metal shows.
 //!
 //! Every buffer and heap a creator of the platform makes that Metal gives a range of its own takes
 //! its range here and is made at it (`AddressPlacement::At`): plain ones where the space places
