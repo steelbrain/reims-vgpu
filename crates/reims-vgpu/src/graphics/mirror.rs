@@ -1062,9 +1062,12 @@ mod tests {
             }
             let made = committed(&platform, 1)[0];
             let calls = log.since(mark);
+            // From the sync's command buffer on: the first sync makes the frame's buffers
+            // before it.
             let sels: Vec<_> = (calls.iter())
                 .map(|c| c.sel)
-                .filter(|s| !s.starts_with("waitUntil") && *s != "status")
+                .skip_while(|s| *s != "commandBuffer")
+                .filter(|s| !s.starts_with("waitUntil"))
                 .collect();
             let expected = [
                 "commandBuffer",
