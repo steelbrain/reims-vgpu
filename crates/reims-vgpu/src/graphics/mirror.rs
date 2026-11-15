@@ -52,9 +52,27 @@
 //! platform gives no such queue (the Vulkan platform's runtime gives a program none), or the
 //! runtime refuses the list's kernel, the sync writes the tiles itself, as above.
 //!
-//! **Its pages.** The mirror's host memory is the platform's
-//! (`reims_vgpu_vulkan::os::PrivateMemory`), whose unmap waits until the runtime has freed every
-//! import of its pages. The runtime runs a no-copy buffer's deallocator at the buffer's release,
+//! **Its pages.** The mirror's host memory is the platform's. On Linux it is a shared mapping of a
+//! memfd of its own (`reims_vgpu_vulkan::os::RegionMemory`), as a graphics device's region is:
+//! RADV takes no pointer to such pages and imports dma-bufs of them (udmabufs, pinned), where it
+//! imports private memory by its pointer as an amdgpu userptr, whose every page amdgpu gets again
+//! at each of the device's submissions, and whose page that compaction moves stalls the next one.
+//! With the mirror in private memory, a Radeon 780M's syncs of a 3648 x 2038 frame took 17.5 ms
+//! from submission to end in a walk, where the sync's work alone took 3.4 ms. NVIDIA's driver
+//! imports the pointer of either. Where the host gives no such file, and on macOS, the mirror is
+//! private memory (`reims_vgpu_vulkan::os::PrivateMemory`), which every GPU imports by its
+//! pointer.
+//!
+//! The runtime's device writes the mirror through a buffer over it, and the compositor's device
+//! reads it through a buffer over it and a texture over that buffer (`sink`, `foreign_texture`).
+//! Up to 64 MiB (udmabuf's `size_limit_mb` as the kernel ships it), the memfd is one udmabuf,
+//! and both are in place, one import each. Past it (a 6K frame of 4 bytes a pixel, a 5K or 6K one
+//! of 8), the buffers stay in place over several udmabufs, one listed import each in RADV's
+//! submissions, and a texture over such a buffer is a shadow of its bytes, on a device that
+//! imports dma-bufs.
+//!
+//! Either memory's unmap waits until the runtime has freed every import of its pages. The
+//! runtime runs a no-copy buffer's deallocator at the buffer's release,
 //! Metal's moment, and frees the buffer's import after it, on a handler thread: the old mirror's
 //! release, as a mirror is made again, runs its deallocator on the window's thread just before
 //! the draw's commit. An unmap of the OS's there takes the pages from under a live import, and
@@ -79,7 +97,7 @@ use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, MtlOrigin, M
 use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_vulkan::core::raise::{OnFault, RaiseResult};
 use reims_vgpu_vulkan::core::sync::Mutex;
-use reims_vgpu_vulkan::os::{OsVm, PrivateMemory};
+use reims_vgpu_vulkan::os::{OsVm, PrivateMemory, RegionMemory};
 
 use super::sink::{Open, end_blit};
 use crate::entry::no_catch;
@@ -676,18 +694,24 @@ impl<P: ApiPlatform> Mirror<P> {
             let bytes_per_row = (width * bytes).checked_next_multiple_of(align.max(4))?;
             let length = bytes_per_row.checked_mul(height)?;
             let span = length.checked_next_multiple_of(OsVm::new().page_size())?;
-            // The platform's memory, whose unmap waits for the runtime's free of every import of
-            // its pages (the module doc, "Its pages").
-            let pages = PrivateMemory::new(span)?;
+            // The platform's memory, a memfd's mapping where the host gives one, whose unmap waits
+            // for the runtime's free of every import of its pages (the module doc, "Its pages").
+            let (base, pages): (*mut u8, Box<dyn FnOnce() + Send>) = match RegionMemory::new(span) {
+                Some(pages) => (pages.base(), Box::new(move || drop(pages))),
+                None => {
+                    let pages = PrivateMemory::new(span)?;
+                    (pages.base(), Box::new(move || drop(pages)))
+                }
+            };
             // SAFETY: the memory's `span` bytes, whole pages from a page, are mapped from here
             // until the deallocator, which owns them, drops them once the buffer has gone, and
             // past that until the runtime freed the buffer's import.
-            let range = unsafe { HostRange::new(HostPtr::from_ptr(pages.base()), span) };
+            let range = unsafe { HostRange::new(HostPtr::from_ptr(base), span) };
             let mirror = no_catch(self.device.new_buffer_over_host_memory(
                 OnFault::Die,
                 range,
                 0,
-                Some(Box::new(move || drop(pages))),
+                Some(pages),
             ))?;
             let private = |length| {
                 no_catch(
@@ -1203,6 +1227,113 @@ mod tests {
                     Duration::from_secs(30)
                 ),
                 "the runtime freed the import of the old mirror's pages"
+            );
+        });
+    }
+
+    /// On Vulkan, a frame's mirror past 64 MiB, udmabuf's `size_limit_mb` as the kernel ships it
+    /// (the module doc, "Its pages"), holds the frame's bytes once its sync has finished, at the
+    /// mirror's pitch: 4096 x 2304 pixels of RGBA16Unorm, 8 bytes each, 72 MiB
+    #[test]
+    fn on_vulkan_a_mirror_past_udmabufs_size_limit_holds_the_frame() {
+        let platform = Arc::new(VulkanPlatform::new());
+        crate::entry::run(|_| {
+            let (width, height, pixel) = (4096u64, 2304u64, 8u64);
+            let device = platform.metal_device(None).unwrap();
+            let mirror = Mirror::<VulkanPlatform>::new(device.clone_ref()).expect("the mirror");
+            let descriptor = platform.texture_descriptor(&TextureDesc {
+                pixel_format: 110,
+                width,
+                height,
+                usage: 0x1,
+                resource_options: Some(0),
+                ..TextureDesc::default()
+            });
+            let surface = no_catch(device.new_texture(OnFault::Die, &descriptor)).unwrap();
+            let row = width * pixel;
+            let bytes: Vec<u8> = (0..row * height)
+                .map(|i| ((i * 2654435761) >> 11) as u8)
+                .collect();
+            // SAFETY: the bytes live across the call, which copies them out.
+            let range = unsafe {
+                HostRange::new(HostPtr::from_ptr(bytes.as_ptr().cast_mut()), row * height)
+            };
+            surface
+                .replace_region(
+                    reims_vgpu_vulkan::core::platform::types::MtlRegion {
+                        origin: MtlOrigin::new(0, 0, 0),
+                        size: MtlSize::new(width, height, 1),
+                    },
+                    0,
+                    0,
+                    range,
+                    row,
+                    row * height,
+                )
+                .unwrap();
+            let synced =
+                (mirror.sync(&surface, 256, &|| platform.clock().now_mono())).expect("a sync");
+            if let Some(completion) = &synced.completion {
+                no_catch(completion.sync.wait_until_completed(OnFault::Die));
+            }
+            assert!(
+                synced.buffer.length() > 64 << 20,
+                "{:#x}",
+                synced.buffer.length()
+            );
+            let first = synced.buffer.contents().as_ptr::<u8>();
+            for y in 0..height {
+                // SAFETY: the mirror's row `y`, which the finished sync wrote.
+                let mirrored = unsafe {
+                    std::slice::from_raw_parts(
+                        first.add((y * synced.bytes_per_row) as usize),
+                        row as usize,
+                    )
+                };
+                let want = &bytes[(y * row) as usize..((y + 1) * row) as usize];
+                assert!(mirrored == want, "row {y} of the mirror differs");
+            }
+        });
+    }
+
+    /// On Linux, the mirror lies in a shared mapping of a memfd of the library's own, which RADV
+    /// imports as dma-bufs of its pages, not by its pointer (the module doc, "Its pages")
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn on_linux_the_mirror_lies_in_a_memfd_mapping() {
+        let platform = Arc::new(VulkanPlatform::new());
+        crate::entry::run(|_| {
+            let device = platform.metal_device(None).unwrap();
+            let mirror = Mirror::<VulkanPlatform>::new(device.clone_ref()).expect("the mirror");
+            let descriptor = platform.texture_descriptor(&TextureDesc {
+                pixel_format: 80,
+                width: 256,
+                height: 128,
+                usage: 0x1,
+                resource_options: Some(0),
+                ..TextureDesc::default()
+            });
+            let surface = no_catch(device.new_texture(OnFault::Die, &descriptor)).unwrap();
+            let synced =
+                (mirror.sync(&surface, 256, &|| platform.clock().now_mono())).expect("a sync");
+            if let Some(completion) = &synced.completion {
+                no_catch(completion.sync.wait_until_completed(OnFault::Die));
+            }
+            let at = synced.buffer.contents().addr() as u64;
+            let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+            let mapping = (maps.lines())
+                .find(|l| {
+                    let range = l.split(' ').next().unwrap_or("");
+                    let (lo, hi) = range.split_once('-').unwrap_or(("0", "0"));
+                    let lo = u64::from_str_radix(lo, 16).unwrap_or(0);
+                    let hi = u64::from_str_radix(hi, 16).unwrap_or(0);
+                    lo <= at && at < hi
+                })
+                .expect("the mirror's mapping");
+            assert!(mapping.contains("memfd:reims-vgpu"), "{mapping}");
+            assert!(
+                mapping.split_whitespace().nth(1).unwrap().ends_with('s'),
+                "{mapping}"
             );
         });
     }
