@@ -19,9 +19,37 @@
 // heapTextureSizeAndAlignWithDescriptor: answers;
 // and, where the case ends the process, Metal's words (its stderr is the child's stdout), then
 //   => case N died on signal X | exited X
+//
+// Texture buffers (MTLTextureTypeTextureBuffer, 11-14), each step a child process of its own:
+//   oracle_texdesc DEVICE CREATOR --texbuf [fixed|max]   fixed widths, then bisection (or one)
+//   oracle_texdesc DEVICE CREATOR --tb F W [LEN]    one texture buffer (what the children run)
+//   oracle_texdesc DEVICE CREATOR --tbread F W      one, filled and read back by kernels
+// The descriptor is MTLTextureDescriptor's textureBufferDescriptorWithPixelFormat:width:
+// resourceOptions:usage: of format F, width W, usage ShaderRead (and ShaderWrite for --tbread),
+// Shared over a buffer and Private otherwise, as MoltenVK makes a texel buffer view's texture.
+// CREATOR `device` is the device's newTextureWithDescriptor:; `heap` a Private heap's, the heap
+// of the texture's bytes rounded up to 64 KiB plus 64 KiB, at least 1 MiB and at most
+// maxBufferLength; `buffer` a Shared buffer's newTextureWithDescriptor:offset:bytesPerRow: at
+// offset 0, bytesPerRow the texture's bytes rounded up to 256, over a buffer of LEN bytes (default
+// those bytes, at most maxBufferLength rounded down to 4096). --texbuf runs the formats R8Sint (1
+// byte), RG8Unorm (2), RGBA8Unorm (4), RG32Float (8) and RGBA32Float (16) at the widths kTbWidths
+// lists (over a buffer, also over one of 4096 bytes), then, for each format, the largest width
+// made and the largest width that does not end the process, by bisection from 1 to 2^36. Lines:
+//   tb fmt F (B bytes) CREATOR width W | asked: ... [| buffer L bytes, bpr R | heap H bytes]
+//   tb fmt F (B bytes) CREATOR width W => made: type T width W ... | nil | no heap | no buffer
+// (a child's own), and the parent's
+//   tbstep fmt F CREATOR width W [buffer L]: made | nil | no heap | no buffer | died: WORDS
+//   tbmax fmt F (B bytes) CREATOR made|alive W (W*B bytes); at W+1: OUTCOME
+// where WORDS are what Metal wrote before the child ended, its lines joined by " / ".
+// --tbread takes a signed integer format, R8Sint, R16Sint, R32Sint, RG32Sint or RGBA32Sint: over a
+// buffer the CPU writes element i's channels as (i * 37 + 11) % 251 - 125, elsewhere a kernel
+// writes them; then a kernel reads elements 0, 1, W / 2, W - 2 and W - 1 (texture_buffer read), and
+// the line says what each held against what was written:
+//   tbread fmt F CREATOR width W: element E read V want V' ... => ok | WRONG
 // Build: see README.md.
 #import "oracle_common.h"
 #include <mach/mach.h>
+#include <objc/message.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -303,14 +331,442 @@ static int runCase(id<MTLDevice> d, int creator, const char *creatorName, int n)
 	return 0;
 }
 
+// --- texture buffers ------------------------------------------------------------------------
+
+struct TbFormat {
+	MTLPixelFormat format;
+	unsigned bytes;
+};
+static const struct TbFormat kTbFormats[] = {
+    {MTLPixelFormatR8Sint, 1},     {MTLPixelFormatRG8Unorm, 2},     {MTLPixelFormatRGBA8Unorm, 4},
+    {MTLPixelFormatRG32Float, 8},  {MTLPixelFormatRGBA32Float, 16},
+};
+static const struct TbFormat kTbReadFormats[] = {
+    {MTLPixelFormatR8Sint, 1},  {MTLPixelFormatR16Sint, 2},     {MTLPixelFormatR32Sint, 4},
+    {MTLPixelFormatRG32Sint, 8}, {MTLPixelFormatRGBA32Sint, 16},
+};
+static const unsigned long long kTbWidths[] = {
+    16384,           16385,           46626,           1ull << 20,      1ull << 24,
+    1ull << 26,      (1ull << 26) + 1, 1ull << 27,     (1ull << 27) + 1, 1ull << 28,
+    (1ull << 28) + 1, 1ull << 29,     1ull << 30,      1ull << 31,      1ull << 32,
+    (1ull << 32) + 46626, 1ull << 33,
+};
+enum { kTbWidthCount = sizeof kTbWidths / sizeof kTbWidths[0] };
+static const unsigned long long kTbBisectTop = 1ull << 36;
+
+static unsigned tbBytes(MTLPixelFormat f)
+{
+	for (size_t i = 0; i < sizeof kTbFormats / sizeof kTbFormats[0]; i++)
+		if (kTbFormats[i].format == f)
+			return kTbFormats[i].bytes;
+	for (size_t i = 0; i < sizeof kTbReadFormats / sizeof kTbReadFormats[0]; i++)
+		if (kTbReadFormats[i].format == f)
+			return kTbReadFormats[i].bytes;
+	return 0;
+}
+
+static unsigned long long tbRound(unsigned long long n, unsigned long long to)
+{
+	return (n + to - 1) / to * to;
+}
+
+// The texture buffer of FORMAT and WIDTH at CREATOR (the buffer LEN bytes, 0 for the default),
+// or nil with the line saying why. `write` adds ShaderWrite. `*bufferOut` keeps the buffer.
+static id<MTLTexture> tbMake(id<MTLDevice> d, int creator, const char *creatorName,
+                             MTLPixelFormat format, unsigned long long width,
+                             unsigned long long len, bool write, id<MTLBuffer> *bufferOut)
+{
+	const unsigned bytes = tbBytes(format);
+	const unsigned long long texBytes = width * bytes;
+	MTLTextureUsage usage = MTLTextureUsageShaderRead | (write ? MTLTextureUsageShaderWrite : 0);
+	MTLResourceOptions options =
+	    creator == kBuffer ? MTLResourceStorageModeShared : MTLResourceStorageModePrivate;
+	MTLTextureDescriptor *td =
+	    [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:format
+	                                                           width:(NSUInteger)width
+	                                                 resourceOptions:options
+	                                                           usage:usage];
+	printf("tb fmt %lu (%u bytes) %s width %llu | asked: type %lu %lux%lux%lu a %lu m %lu s %lu "
+	       "usage 0x%lx storage %lu",
+	       (unsigned long)format, bytes, creatorName, width, (unsigned long)td.textureType,
+	       (unsigned long)td.width, (unsigned long)td.height, (unsigned long)td.depth,
+	       (unsigned long)td.arrayLength, (unsigned long)td.mipmapLevelCount,
+	       (unsigned long)td.sampleCount, (unsigned long)td.usage, (unsigned long)td.storageMode);
+	id<MTLTexture> t = nil;
+	const unsigned long long maxLength = d.maxBufferLength;
+	switch (creator) {
+	case kDevice:
+		printf("\n");
+		fflush(stdout);
+		t = [d newTextureWithDescriptor:td];
+		break;
+	case kHeap: {
+		unsigned long long size = tbRound(texBytes, 65536) + 65536;
+		if (size < (1u << 20))
+			size = 1u << 20;
+		if (size > maxLength)
+			size = maxLength / 65536 * 65536;
+		printf(" | heap %llu bytes\n", size);
+		fflush(stdout);
+		MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+		hd.size = (NSUInteger)size;
+		hd.storageMode = MTLStorageModePrivate;
+		id<MTLHeap> heap = [d newHeapWithDescriptor:hd];
+		if (heap == nil) {
+			printf("tb fmt %lu %s width %llu => no heap\n", (unsigned long)format, creatorName,
+			       width);
+			return nil;
+		}
+		t = [heap newTextureWithDescriptor:td];
+		break;
+	}
+	case kBuffer: {
+		const unsigned long long bpr = tbRound(texBytes, 256);
+		if (len == 0)
+			len = bpr < maxLength ? bpr : maxLength / 4096 * 4096;
+		printf(" | buffer %llu bytes, bpr %llu\n", len, bpr);
+		fflush(stdout);
+		id<MTLBuffer> buffer = [d newBufferWithLength:(NSUInteger)len
+		                                      options:MTLResourceStorageModeShared];
+		if (buffer == nil) {
+			printf("tb fmt %lu %s width %llu => no buffer\n", (unsigned long)format,
+			       creatorName, width);
+			return nil;
+		}
+		*bufferOut = buffer;
+		t = [buffer newTextureWithDescriptor:td offset:0 bytesPerRow:(NSUInteger)bpr];
+		break;
+	}
+	}
+	if (t == nil) {
+		printf("tb fmt %lu %s width %llu => nil\n", (unsigned long)format, creatorName, width);
+		return nil;
+	}
+	task_vm_info_data_t vm;
+	mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+	const unsigned long long footprint =
+	    task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count) == KERN_SUCCESS
+	        ? vm.phys_footprint
+	        : 0;
+	printf("tb fmt %lu %s width %llu => made: type %lu width %lu height %lu storage %lu usage "
+	       "0x%lx allocatedSize %llu footprint %llu\n",
+	       (unsigned long)format, creatorName, width, (unsigned long)t.textureType,
+	       (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.storageMode,
+	       (unsigned long)t.usage, (unsigned long long)t.allocatedSize, footprint);
+	fflush(stdout);
+	return t;
+}
+
+static int tbOne(id<MTLDevice> d, int creator, const char *creatorName, MTLPixelFormat format,
+                 unsigned long long width, unsigned long long len)
+{
+	if (tbBytes(format) == 0) {
+		printf("tb fmt %lu: not a format of this probe\n", (unsigned long)format);
+		return 2;
+	}
+	id<MTLBuffer> buffer = nil;
+	id<MTLTexture> t = tbMake(d, creator, creatorName, format, width, len, false, &buffer);
+	(void)t;
+	return 0;
+}
+
+static int tbValue(unsigned long long i)
+{
+	return (int)((i * 37 + 11) % 251) - 125;
+}
+
+static NSString *const kTbKernels =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "kernel void tb_fill(texture_buffer<int, access::write> t [[texture(0)]],\n"
+     "                    uint i [[thread_position_in_grid]]) {\n"
+     "  if (i >= t.get_width()) return;\n"
+     "  int v = int((ulong(i) * 37 + 11) % 251) - 125;\n"
+     "  t.write(int4(v), i);\n"
+     "}\n"
+     "kernel void tb_read(texture_buffer<int, access::read> t [[texture(0)]],\n"
+     "                    device const uint *at [[buffer(0)]], device int *out [[buffer(1)]],\n"
+     "                    device uint *width [[buffer(2)]], uint i [[thread_position_in_grid]]) {\n"
+     "  out[i] = t.read(at[i]).r;\n"
+     "  if (i == 0) width[0] = t.get_width();\n"
+     "}\n";
+
+// Makes the texture buffer, fills it (the CPU over a buffer, a kernel elsewhere), and reads five
+// elements back by a kernel.
+static int tbRead(id<MTLDevice> d, int creator, const char *creatorName, MTLPixelFormat format,
+                  unsigned long long width)
+{
+	unsigned bytes = 0;
+	for (size_t i = 0; i < sizeof kTbReadFormats / sizeof kTbReadFormats[0]; i++)
+		if (kTbReadFormats[i].format == format)
+			bytes = kTbReadFormats[i].bytes;
+	if (bytes == 0 || width < 2) {
+		printf("tbread fmt %lu: not a signed integer format of this probe, or under 2 wide\n",
+		       (unsigned long)format);
+		return 2;
+	}
+	NSError *err = nil;
+	id<MTLLibrary> lib = [d newLibraryWithSource:kTbKernels options:nil error:&err];
+	if (lib == nil) {
+		printf("tbread: library: %s\n", err ? err.description.UTF8String : "nil");
+		return 1;
+	}
+	id<MTLComputePipelineState> fill =
+	    [d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"tb_fill"] error:&err];
+	id<MTLComputePipelineState> read =
+	    [d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"tb_read"] error:&err];
+	if (fill == nil || read == nil) {
+		printf("tbread: pipeline: %s\n", err ? err.description.UTF8String : "nil");
+		return 1;
+	}
+	id<MTLBuffer> buffer = nil;
+	id<MTLTexture> t = tbMake(d, creator, creatorName, format, width, 0, true, &buffer);
+	if (t == nil)
+		return 0;
+	const unsigned channels = format == MTLPixelFormatRG32Sint ? 2 : format == MTLPixelFormatRGBA32Sint ? 4 : 1;
+	const unsigned channelBytes = bytes / channels;
+	id<MTLCommandQueue> q = [d newCommandQueue];
+	if (creator == kBuffer) {
+		uint8_t *p = (uint8_t *)buffer.contents;
+		const unsigned long long fit = buffer.length / bytes < width ? buffer.length / bytes : width;
+		for (unsigned long long i = 0; i < fit; i++) {
+			const int v = tbValue(i);
+			for (unsigned c = 0; c < channels; c++) {
+				uint8_t *e = p + i * bytes + c * channelBytes;
+				if (channelBytes == 1)
+					*(int8_t *)e = (int8_t)v;
+				else if (channelBytes == 2)
+					*(int16_t *)e = (int16_t)v;
+				else
+					*(int32_t *)e = v;
+			}
+		}
+	} else {
+		id<MTLCommandBuffer> cb = [q commandBuffer];
+		id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+		[ce setComputePipelineState:fill];
+		[ce setTexture:t atIndex:0];
+		const NSUInteger tg = fill.maxTotalThreadsPerThreadgroup < 256 ? fill.maxTotalThreadsPerThreadgroup : 256;
+		[ce dispatchThreadgroups:MTLSizeMake((NSUInteger)((width + tg - 1) / tg), 1, 1)
+		   threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+		[ce endEncoding];
+		oracle_commit_wait(cb, NULL, NULL);
+	}
+	const uint32_t at[5] = {0, 1, (uint32_t)(width / 2), (uint32_t)(width - 2), (uint32_t)(width - 1)};
+	id<MTLBuffer> atBuf = [d newBufferWithBytes:at length:sizeof at options:MTLResourceStorageModeShared];
+	id<MTLBuffer> out = [d newBufferWithLength:5 * sizeof(int32_t) options:MTLResourceStorageModeShared];
+	id<MTLBuffer> w = [d newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+	memset(out.contents, 0x7f, 5 * sizeof(int32_t));
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+	[ce setComputePipelineState:read];
+	[ce setTexture:t atIndex:0];
+	[ce setBuffer:atBuf offset:0 atIndex:0];
+	[ce setBuffer:out offset:0 atIndex:1];
+	[ce setBuffer:w offset:0 atIndex:2];
+	[ce dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(5, 1, 1)];
+	[ce endEncoding];
+	oracle_commit_wait(cb, NULL, NULL);
+	const int32_t *o = (const int32_t *)out.contents;
+	bool ok = true;
+	printf("tbread fmt %lu %s width %llu: get_width %u;", (unsigned long)format, creatorName,
+	       width, *(const uint32_t *)w.contents);
+	for (int i = 0; i < 5; i++) {
+		const int want = tbValue(at[i]);
+		printf(" element %u read %d want %d;", at[i], o[i], want);
+		if (o[i] != want)
+			ok = false;
+	}
+	printf(" => %s\n", ok ? "ok" : "WRONG");
+	return 0;
+}
+
+enum TbOutcome { kTbMade, kTbNil, kTbNoResource, kTbDied, kTbOther };
+
+// Runs one --tb step in a child, its output (stdout and stderr) into `text`; returns its class,
+// and in `words` what the child wrote that is not a `tb ` line of its own, joined by " / ".
+static enum TbOutcome tbStep(const char *argv0, const char *device, const char *creatorName,
+                             MTLPixelFormat format, unsigned long long width,
+                             unsigned long long len, char *words, size_t wordsSize, bool echo)
+{
+	char f[24], w[32], l[32];
+	snprintf(f, sizeof f, "%lu", (unsigned long)format);
+	snprintf(w, sizeof w, "%llu", width);
+	snprintf(l, sizeof l, "%llu", len);
+	char *args[] = {(char *)argv0, (char *)device, (char *)creatorName, "--tb", f, w, l, NULL};
+	int fds[2];
+	if (pipe(fds) != 0)
+		return kTbOther;
+	posix_spawn_file_actions_t fa;
+	posix_spawn_file_actions_init(&fa);
+	posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
+	posix_spawn_file_actions_adddup2(&fa, fds[1], STDERR_FILENO);
+	posix_spawn_file_actions_addclose(&fa, fds[0]);
+	pid_t pid;
+	const int sp = posix_spawn(&pid, argv0, &fa, NULL, args, environ);
+	posix_spawn_file_actions_destroy(&fa);
+	close(fds[1]);
+	if (sp != 0) {
+		close(fds[0]);
+		return kTbOther;
+	}
+	NSMutableData *all = [NSMutableData data];
+	char buf[4096];
+	ssize_t n;
+	while ((n = read(fds[0], buf, sizeof buf)) > 0)
+		[all appendBytes:buf length:(NSUInteger)n];
+	close(fds[0]);
+	int st = 0;
+	waitpid(pid, &st, 0);
+	NSString *text = [[NSString alloc] initWithData:all encoding:NSUTF8StringEncoding] ?: @"";
+	if (echo) {
+		for (NSString *line in [text componentsSeparatedByString:@"\n"])
+			if (line.length > 0)
+				printf("  %s\n", line.UTF8String);
+	}
+	NSMutableArray<NSString *> *other = [NSMutableArray array];
+	for (NSString *line in [text componentsSeparatedByString:@"\n"])
+		if (line.length > 0 && ![line hasPrefix:@"tb "])
+			[other addObject:line];
+	snprintf(words, wordsSize, "%s", [other componentsJoinedByString:@" / "].UTF8String);
+	if (WIFSIGNALED(st) || WEXITSTATUS(st) != 0) {
+		const size_t at = strlen(words);
+		snprintf(words + at, wordsSize - at, "%s(%s %d)", at ? " " : "",
+		         WIFSIGNALED(st) ? "signal" : "exit",
+		         WIFSIGNALED(st) ? WTERMSIG(st) : WEXITSTATUS(st));
+		return kTbDied;
+	}
+	if ([text containsString:@"=> made:"])
+		return kTbMade;
+	if ([text containsString:@"=> nil"])
+		return kTbNil;
+	if ([text containsString:@"=> no heap"] || [text containsString:@"=> no buffer"])
+		return kTbNoResource;
+	return kTbOther;
+}
+
+static const char *tbName(enum TbOutcome o)
+{
+	switch (o) {
+	case kTbMade: return "made";
+	case kTbNil: return "nil";
+	case kTbNoResource: return "no heap or buffer";
+	case kTbDied: return "died";
+	default: return "other";
+	}
+}
+
+static void tbStepLine(MTLPixelFormat format, const char *creatorName, unsigned long long width,
+                       enum TbOutcome o, const char *words)
+{
+	printf("tbstep fmt %lu %s width %llu: %s%s%.600s\n", (unsigned long)format, creatorName,
+	       width, tbName(o), *words ? ": " : "", words);
+}
+
+// The largest width in [lo, hi) for which `want` (made, or not died) holds, given that it holds
+// at lo and not at hi.
+static unsigned long long tbBisect(const char *argv0, const char *device, const char *creatorName,
+                                   MTLPixelFormat format, unsigned long long lo,
+                                   unsigned long long hi, bool made)
+{
+	static char words[8192];
+	while (hi - lo > 1) {
+		const unsigned long long mid = lo + (hi - lo) / 2;
+		const enum TbOutcome o =
+		    tbStep(argv0, device, creatorName, format, mid, 0, words, sizeof words, false);
+		tbStepLine(format, creatorName, mid, o, words);
+		if (made ? o == kTbMade : o != kTbDied)
+			lo = mid;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+static int tbSweep(const char *argv0, const char *device, id<MTLDevice> d, int creator,
+                   const char *creatorName, const char *part)
+{
+	const bool fixed = part == NULL || !strcmp(part, "fixed");
+	const bool bisect = part == NULL || !strcmp(part, "max");
+	oracle_header("oracle_texdesc --texbuf", d);
+	printf("# maxBufferLength %llu, recommendedMaxWorkingSetSize %llu", (unsigned long long)d.maxBufferLength,
+	       (unsigned long long)d.recommendedMaxWorkingSetSize);
+	SEL mtbw = NSSelectorFromString(@"maxTextureBufferWidth");
+	if ([d respondsToSelector:mtbw])
+		printf(", maxTextureBufferWidth (SPI) %llu",
+		       (unsigned long long)((NSUInteger(*)(id, SEL))objc_msgSend)(d, mtbw));
+	else
+		printf(", maxTextureBufferWidth (SPI) not answered");
+	printf("\n# minimumTextureBufferAlignmentForPixelFormat:");
+	for (size_t i = 0; i < sizeof kTbFormats / sizeof kTbFormats[0]; i++)
+		printf(" %lu=%lu", (unsigned long)kTbFormats[i].format,
+		       (unsigned long)[d minimumTextureBufferAlignmentForPixelFormat:kTbFormats[i].format]);
+	printf("\n");
+	fflush(stdout);
+	static char words[8192];
+	for (size_t fi = 0; fixed && fi < sizeof kTbFormats / sizeof kTbFormats[0]; fi++) {
+		const MTLPixelFormat format = kTbFormats[fi].format;
+		for (int wi = 0; wi < kTbWidthCount; wi++) {
+			enum TbOutcome o = tbStep(argv0, device, creatorName, format, kTbWidths[wi], 0, words,
+			                          sizeof words, true);
+			tbStepLine(format, creatorName, kTbWidths[wi], o, words);
+			if (creator == kBuffer) {
+				o = tbStep(argv0, device, creatorName, format, kTbWidths[wi], 4096, words,
+				           sizeof words, true);
+				printf("tbstep fmt %lu %s width %llu buffer 4096: %s%s%.600s\n",
+				       (unsigned long)format, creatorName, kTbWidths[wi], tbName(o),
+				       *words ? ": " : "", words);
+			}
+			fflush(stdout);
+		}
+	}
+	for (size_t fi = 0; bisect && fi < sizeof kTbFormats / sizeof kTbFormats[0]; fi++) {
+		const MTLPixelFormat format = kTbFormats[fi].format;
+		const unsigned bytes = kTbFormats[fi].bytes;
+		for (int made = 1; made >= 0; made--) {
+			const enum TbOutcome atTop =
+			    tbStep(argv0, device, creatorName, format, kTbBisectTop, 0, words, sizeof words, false);
+			if (made ? atTop == kTbMade : atTop != kTbDied) {
+				printf("tbmax fmt %lu (%u bytes) %s %s: past %llu\n", (unsigned long)format,
+				       bytes, creatorName, made ? "made" : "alive", kTbBisectTop);
+				continue;
+			}
+			const unsigned long long w =
+			    tbBisect(argv0, device, creatorName, format, 1, kTbBisectTop, made);
+			const enum TbOutcome next =
+			    tbStep(argv0, device, creatorName, format, w + 1, 0, words, sizeof words, false);
+			printf("tbmax fmt %lu (%u bytes) %s %s %llu (%llu bytes); at %llu: %s%s%.1200s\n",
+			       (unsigned long)format, bytes, creatorName, made ? "made" : "alive", w,
+			       w * bytes, w + 1, tbName(next), *words ? ": " : "", words);
+			fflush(stdout);
+		}
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	if (argc < 3 || creatorOf(argv[2]) < 0) {
-		fprintf(stderr, "usage: %s DEVICE device|heap|buffer [--case N | --list]\n", argv[0]);
+		fprintf(stderr, "usage: %s DEVICE device|heap|buffer [--case N | --list | --texbuf [fixed|max] | --tb "
+		                "FORMAT WIDTH [LEN] | --tbread FORMAT WIDTH]\n",
+		        argv[0]);
 		return 2;
 	}
 	const int creator = creatorOf(argv[2]);
+	if (argc > 3 && !strcmp(argv[3], "--texbuf"))
+		return tbSweep(argv[0], argv[1], oracle_device(argv[1]), creator, argv[2],
+		               argc > 4 ? argv[4] : NULL);
+	if (argc > 5 && !strcmp(argv[3], "--tb")) {
+		alarm(120);
+		return tbOne(oracle_device(argv[1]), creator, argv[2], (MTLPixelFormat)strtoul(argv[4], NULL, 10),
+		             strtoull(argv[5], NULL, 10), argc > 6 ? strtoull(argv[6], NULL, 10) : 0);
+	}
+	if (argc > 5 && !strcmp(argv[3], "--tbread")) {
+		oracle_header("oracle_texdesc --tbread", oracle_device(argv[1]));
+		return tbRead(oracle_device(argv[1]), creator, argv[2], (MTLPixelFormat)strtoul(argv[4], NULL, 10),
+		              strtoull(argv[5], NULL, 10));
+	}
 	if (argc > 3 && !strcmp(argv[3], "--list")) {
 		for (int n = 0; n < kCaseCount; n++)
 			printf("%d %s\n", n, kCases[n].name);
