@@ -208,8 +208,11 @@ pub(crate) fn close(id: u64) {
 
 /// Window `id`'s render thread let its surface go: SDL's window goes where the display has ended.
 #[cfg_attr(
-    not(target_os = "linux"),
-    expect(dead_code, reason = "only Linux's render thread holds SDL's window")
+    not(any(target_os = "linux", target_os = "windows")),
+    expect(
+        dead_code,
+        reason = "only the SDL thread's render thread holds SDL's window (Linux, Windows)"
+    )
 )]
 pub(crate) fn released(id: u64) {
     let gone = with_shell(id, |shell| {
@@ -226,8 +229,11 @@ pub(crate) fn released(id: u64) {
 /// has ended, the old one is kept and the window forgotten; where SDL makes no new one, the old
 /// one stays as it is, drawn no more.
 #[cfg_attr(
-    not(target_os = "linux"),
-    expect(dead_code, reason = "only Linux's render thread holds SDL's window")
+    not(any(target_os = "linux", target_os = "windows")),
+    expect(
+        dead_code,
+        reason = "only the SDL thread's render thread holds SDL's window (Linux, Windows)"
+    )
 )]
 pub(crate) fn park(id: u64) {
     let Some((window, closed)) = with_shell(id, |s| (Arc::clone(&s.window), s.closed)) else {

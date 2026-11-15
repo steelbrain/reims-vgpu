@@ -1,18 +1,18 @@
-//! The SDL window's Linux side ([`crate::sdl::os`]): Wayland's or X11's window, drawn through
-//! Vulkan, on the library's UI thread.
+//! The SDL window's side on Linux and Windows ([`crate::sdl::os`]): Wayland's or X11's window, or
+//! Win32's, drawn through Vulkan, on the library's UI thread.
 //!
 //! **The screen.** The screen a window opens on is SDL's display of that ID (the host's screens
-//! are SDL's on Linux, `super::ui`), else SDL's primary display. Wayland lets no client place a
-//! windowed window: the compositor puts it where it likes, and only a borderless window is sure to
-//! be on its screen. SDL's answer to which screen a window is on is not used: on Wayland it names
+//! are SDL's on Linux and Windows, `super::ui`), else SDL's primary display. Wayland lets no
+//! client place a windowed window: the compositor puts it where it likes, and only a borderless
+//! window is sure to be on its screen. SDL's answer to which screen a window is on is not used: on Wayland it names
 //! the first screen for a window the compositor shows on another. A window resized for a guest's
 //! mode fits the screen it opened on.
 //!
 //! **Windowed**: decorated and resizable, centred on its screen where the window system lets it
-//! be placed, its content shrunk to fit the screen's usable area less [`TITLE_ROOM`] for the title
-//! bar and a panel, which Wayland does not tell a client. Its size and its smallest are asked for
-//! in SDL's sizes (`crate::sdl::units`): points on Wayland, and on X11 pixels, the desktop's
-//! content scale of them to the point.
+//! be placed (X11, Windows), its content shrunk to fit the screen's usable area less
+//! [`TITLE_ROOM`] for the title bar and a panel, which Wayland does not tell a client. Its size
+//! and its smallest are asked for in SDL's sizes (`crate::sdl::units`): points on Wayland, and on
+//! X11 and Windows pixels, the desktop's content scale of them to the point.
 //!
 //! **Borderless**: through the compositor's own full screen on its screen, over its panels.
 //!
@@ -30,7 +30,9 @@
 //! cosmic-comp 1.9.0, nested: through either route, while captured, its shortcuts (Super alone,
 //! Super+Q, Super+A, Alt+Tab) stay unused and their keys reach the guest, a click that focuses the
 //! window included; not captured, Super+Q closes the window. Each capture and release is logged
-//! with whether SDL holds the grab ([`grab_keyboard`]).
+//! with whether SDL holds the grab ([`grab_keyboard`]). On Windows the grab is a low-level keyboard
+//! hook on this thread, which takes the system's shortcuts while the window has the keyboard
+//! (`super::super::windows`).
 
 use std::sync::Arc;
 
@@ -47,19 +49,20 @@ use crate::sdl::shell::{self, DEFAULT_MODE, Opened, Shell};
 use crate::sdl::units::{self, Units};
 
 /// Points of a screen's height kept for a window's title bar and a panel: Wayland gives a client
-/// no work area, nor the size of the compositor's decorations.
+/// no work area, nor the size of the compositor's decorations, and Windows's work area leaves out
+/// the task bar but not a window's title bar.
 pub(crate) const TITLE_ROOM: f64 = 48.0;
 
-/// Where an open window is, for placing others: nothing on Linux, where the window system places
-/// them.
+/// Where an open window is, for placing others: nothing here, where each window is centred on its
+/// screen or placed by the window system.
 pub(crate) type Frame = std::convert::Infallible;
 
-/// Where `shell`'s window is: nothing on Linux.
+/// Where `shell`'s window is: nothing here.
 pub(crate) fn frame_of(_shell: &Shell) -> Option<Frame> {
     None
 }
 
-/// What Linux keeps of a window.
+/// What this side keeps of a window.
 pub(crate) struct State {
     /// The screen it opened on: SDL's answer to which screen a window is on is not used (the
     /// module doc).
@@ -314,8 +317,8 @@ pub(crate) fn grab_keyboard(shell: &Shell, captured: bool) {
 
 /// Nothing: the window stays resizable while captured. The hold keeps the pointer on the window's
 /// own surface, and the window's resize edges lie outside it, the compositor's (xdg-decoration's
-/// decorations, libdecor's frame, an X11 window manager's frame window), where the pointer held
-/// over the image cannot go. A window SDL made not resizable would also be held on X11 at its
+/// decorations, libdecor's frame, an X11 window manager's frame window, Windows's non-client
+/// frame), where the pointer held over the image cannot go. A window SDL made not resizable would also be held on X11 at its
 /// size from before it was maximized or tiled (`X11_SetWindowMinMax`, read from SDL 3.4.18's
 /// code).
 pub(crate) fn hold_size(_shell: &Shell) {}
@@ -350,7 +353,7 @@ pub(crate) fn close(shell: &mut Shell) -> bool {
     false
 }
 
-/// The window goes: nothing of Linux's stays.
+/// The window goes: nothing of this side's stays.
 pub(crate) fn destroy(_shell: Shell) {}
 
 #[cfg(test)]

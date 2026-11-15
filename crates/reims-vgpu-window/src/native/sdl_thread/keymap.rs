@@ -1,9 +1,9 @@
 //! SDL's scancodes to the USB HID keyboard usages (page 0x07) the guest's keyboard sends.
 //!
-//! SDL names a key by its position (its scancode, from the host's evdev code on Linux), and its
-//! scancodes up to 0xE7 are the USB usages themselves: a key reaches the guest by position, so
-//! the guest's own layout applies, and the ISO key left of 1 and the one right of left Shift are
-//! the guest's own. The scancodes past 0xE7 (media and application keys) are SDL's own, with no
+//! SDL names a key by its position (its scancode, from the host's evdev code on Linux and from the
+//! keyboard's scan code on Windows), and its scancodes up to 0xE7 are the USB usages themselves: a
+//! key reaches the guest by position, so the guest's own layout applies, and the ISO key left of 1
+//! and the one right of left Shift are the guest's own. The scancodes past 0xE7 (media and application keys) are SDL's own, with no
 //! usage on the keyboard page: they are dropped, as are 0 to 3, which name no key.
 
 /// The first usage of a key (`a`).

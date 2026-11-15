@@ -3,14 +3,15 @@
 //! guest's cursor, and gives the surface the window is drawn into, so this crate speaks no window
 //! system's protocol of its own but where an OS's extension does ([`os`]).
 //!
-//! - **Linux** (`native/sdl_thread/sdl.rs`, the only window there): Wayland's or X11's window,
-//!   presented through Vulkan on the runtime's own device. SDL runs on a thread of the library's
-//!   own, `reims-vgpu.ui` (`native/sdl_thread/ui.rs`), started with the first window or the first look
-//!   at the host's screens: QEMU's main thread is never taken nor waited on. Work for it is posted
-//!   and runs between its events; the window's input reaches the host's callbacks there, one at a
-//!   time, in the order the events came (`native/sdl_thread/input.rs`, `native/sdl_thread/keymap.rs`). Each
-//!   window has a render thread too, `reims-vgpu.window` (`native/sdl_thread/render.rs`), which draws
-//!   the display's current frame into the window's swapchain through the display's sink.
+//! - **Linux and Windows** (`native/sdl_thread/sdl.rs`, the only window there): Wayland's or
+//!   X11's window, or Win32's, presented through Vulkan on the runtime's own device. SDL runs on a
+//!   thread of the library's own, `reims-vgpu.ui` (`native/sdl_thread/ui.rs`), started with the
+//!   first window or the first look at the host's screens: QEMU's main thread is never taken nor
+//!   waited on. Work for it is posted and runs between its events; the window's input reaches the
+//!   host's callbacks there, one at a time, in the order the events came
+//!   (`native/sdl_thread/input.rs`, `native/sdl_thread/keymap.rs`). Each window has a render
+//!   thread too, `reims-vgpu.window` (`native/sdl_thread/render.rs`), which draws the display's
+//!   current frame into the window's swapchain through the display's sink.
 //! - **macOS** (`native/macos/sdl.rs`, with `REIMS_VGPU_WINDOW_IMPL=sdl`): Cocoa's window, drawn
 //!   into a `CAMetalLayer` in SDL's Metal view by the same render thread as AppKit's window
 //!   (`native/macos/render.rs`). SDL runs on the main thread, which AppKit needs, inside the

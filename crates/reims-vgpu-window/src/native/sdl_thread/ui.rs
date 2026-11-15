@@ -1,5 +1,5 @@
-//! The UI thread on Linux, `reims-vgpu.ui`: SDL's thread, the work posted to it, and the host's
-//! screens as SDL lists them.
+//! The UI thread on Linux and Windows, `reims-vgpu.ui`: SDL's thread, the work posted to it, and
+//! the host's screens as SDL lists them.
 //!
 //! It starts at the first window's opening or the first look at the host's screens, and runs for
 //! the process: SDL's video is initialized there (so SDL takes it for its main thread) and every
@@ -10,12 +10,14 @@
 //!
 //! **SDL's settings**, before its video starts: no signal handlers of its own (the host's stay
 //! the host's), the screen saver allowed (the windows keep the host from sleeping no more than
-//! any other window), `reims-vgpu` the windows' application ID (the task bar's entry on Wayland),
+//! any other window), `reims-vgpu` the windows' application ID (the task bar's entry on Wayland;
+//! SDL 3.4.18's Windows driver does not read it),
 //! cursors given for the screen's scale ([`crate::sdl::cursor`]), and no quit event when the last
 //! window closes, as the windows' end is the display's.
 //!
-//! Where SDL's video does not start (no Wayland compositor and no X server to reach), the reason
-//! is logged once, no window opens, the work posted is dropped, and the host's screens are none.
+//! Where SDL's video does not start (no Wayland compositor and no X server to reach on Linux), the
+//! reason is logged once, no window opens, the work posted is dropped, and the host's screens are
+//! none.
 //!
 //! **The host's screens** ([`screens`]): a snapshot the UI thread takes once SDL's video starts
 //! and again when SDL reports a screen added, removed, moved or changed. The main screen (SDL's

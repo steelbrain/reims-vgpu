@@ -1,9 +1,9 @@
 //! The host's screens, which the OS's side lists (`native`): "screen i" is the i-th of them, the
 //! main one first, and the window of the display on port i opens on screen i
 //! ([`screen_for_port`]). On macOS they come from CoreGraphics, which answers on any thread; on
-//! Linux from SDL, on the library's UI thread, which takes a snapshot of them
-//! (`native/sdl_thread/ui.rs`). Where there are none (no window system to reach), there is no screen
-//! to open on ([`screen_for_port`]).
+//! Linux and Windows from SDL, on the library's UI thread, which takes a snapshot of them
+//! (`native/sdl_thread/ui.rs`). Where there are none (no window system to reach), there is no
+//! screen to open on ([`screen_for_port`]).
 //!
 //! A screen's refresh rate is the one it runs at ([`screen_refresh`]): its current mode's, so a
 //! screen the person set below its highest rate gives the guest the rate it was set to, as the
@@ -18,7 +18,7 @@ const DEFAULT_REFRESH_HZ: f64 = 60.0;
 /// A host screen.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HostScreen {
-    /// Its display ID: CoreGraphics' on macOS, SDL's on Linux.
+    /// Its display ID: CoreGraphics' on macOS, SDL's on Linux and Windows.
     pub id: u32,
     /// Its current mode's size in pixels, width then height.
     pub pixels: (u32, u32),

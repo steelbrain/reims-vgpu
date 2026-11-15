@@ -107,8 +107,8 @@ pub trait VulkanTarget {
 
     /// The GPU the host's compositor composites the window on, as its DRM node's major and minor
     /// numbers: on Linux under Wayland the main device of the window's surface's dma-buf feedback
-    /// (`native/linux/feedback.rs`). `None` where the window system does not say, as on X11 and
-    /// macOS: the window then presents from the runtime's own GPU.
+    /// (`native/linux/feedback.rs`). `None` where the window system does not say, as on X11,
+    /// Windows and macOS: the window then presents from the runtime's own GPU.
     fn compositor_device(&self) -> Option<(u32, u32)> {
         None
     }
@@ -139,8 +139,11 @@ impl Presenting {
     /// Whether the last presenter was parked, once: the render thread then has a new window
     /// opened, over which the next presenter is made (the module doc, "A parked presenter").
     #[cfg_attr(
-        all(not(target_os = "linux"), not(test)),
-        expect(dead_code, reason = "only Linux's render thread opens a new window")
+        all(not(any(target_os = "linux", target_os = "windows")), not(test)),
+        expect(
+            dead_code,
+            reason = "only the SDL thread's render thread opens a new window (Linux, Windows)"
+        )
     )]
     pub(crate) fn take_parked(&mut self) -> bool {
         std::mem::take(&mut self.parked)

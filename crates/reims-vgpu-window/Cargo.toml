@@ -1,6 +1,6 @@
 [package]
 name = "reims-vgpu-window"
-description = "A guest display's own window: on macOS AppKit (or SDL3) and a CAMetalLayer, on Linux SDL3 and Vulkan; input and the host's screens"
+description = "A guest display's own window: on macOS AppKit (or SDL3) and a CAMetalLayer, on Linux and Windows SDL3 and Vulkan; input and the host's screens"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,23 +9,26 @@ license.workspace = true
 
 [dependencies]
 log.workspace = true
-# ash's Vulkan types for a window's surface (`present`): SDL's on Linux, the layer's on macOS.
+# ash's Vulkan types for a window's surface (`present`): SDL's on Linux and Windows, the layer's
+# on macOS.
 ash.workspace = true
 # The Vulkan crate: core's threads and holds (`reims_vgpu_vulkan::core`), and its OS layer: its
 # threads, and on macOS its clock and the message layer the AppKit side sends through
 # (`reims_vgpu_vulkan::os`).
 reims-vgpu-vulkan.workspace = true
 
-# The window on Linux (`sdl`): SDL3 for the window, its input and its Vulkan surface.
-[target.'cfg(target_os = "linux")'.dependencies]
+# The window on Linux and Windows (`sdl`): SDL3 for the window, its input and its Vulkan surface.
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 sdl3-sys.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
 # libwayland-client's calls, looked up in the library SDL opened (`native/linux/feedback.rs`).
 libc.workspace = true
 
 [features]
 default = ["macos-sdl"]
-# SDL's library left unbuilt and unlinked: for a check of the Linux target on another OS, which
-# compiles but never links (`cargo xtask check`'s clippy of the Linux target on a Mac).
+# SDL's library left unbuilt and unlinked: for a check of the Linux or Windows target on another
+# OS, which compiles but never links (`cargo xtask check`'s clippy of the Linux target on a Mac).
 sdl-no-link = ["sdl3-sys?/no-link"]
 # SDL3's window on macOS (`sdl`, `native/macos/sdl.rs`), which `REIMS_VGPU_WINDOW_IMPL=sdl` opens
 # in place of AppKit's. `cargo xtask dist` keeps SDL's symbols out of the archive's globals and

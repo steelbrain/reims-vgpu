@@ -1,12 +1,13 @@
-//! The window through SDL3 on a thread of the library's own: Linux's, on Wayland or X11, drawn
-//! through Vulkan. The window's shell and cursor are SDL's shared ones (`crate::sdl`), and what
-//! the SDL thread does its own way is here: SDL runs on the library's UI thread (`ui`), where the
-//! window opens, changes and ends, as `sdl` places, sizes and ends it, and its events become the
-//! host's input (`input`, `keymap`); each window's render thread draws into its swapchain
-//! (`render`). What the OS under it adds is its own file (`super::linux`: the GPU a Wayland
-//! compositor composites on). This file is what the shared window code asks of it: the render
-//! thread (`render`, through the display's [`FrameSink`](crate::FrameSink)), the window's
-//! opening, changes and end, posted to the UI thread, and the host's screens as SDL lists them.
+//! The window through SDL3 on a thread of the library's own: Linux's, on Wayland or X11, and
+//! Windows's, drawn through Vulkan. The window's shell and cursor are SDL's shared ones
+//! (`crate::sdl`), and what the SDL thread does its own way is here: SDL runs on the library's UI
+//! thread (`ui`), where the window opens, changes and ends, as `sdl` places, sizes and ends it,
+//! and its events become the host's input (`input`, `keymap`); each window's render thread draws
+//! into its swapchain (`render`). What the OS under it adds is its own file (`super::linux`: the
+//! GPU a Wayland compositor composites on; `super::windows`). This file is what the shared window
+//! code asks of it: the render thread (`render`, through the display's
+//! [`FrameSink`](crate::FrameSink)), the window's opening, changes and end, posted to the UI
+//! thread, and the host's screens as SDL lists them.
 
 mod input;
 mod keymap;

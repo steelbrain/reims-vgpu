@@ -4,12 +4,16 @@
 //! size asked for in pixels, its display bounds and usable bounds are pixels, its modes have a
 //! pixel density of 1, and the content scale is the desktop's (`Xft.dpi` over 96, else GDK's
 //! scale). Wayland's modes have the output's scale as their density, with SDL's sizes in points.
+//! Windows's are as X11's, in a process SDL declares per-monitor DPI aware (`native/windows.rs`):
+//! read from SDL 3.4.18's code, its windows driver makes a window's client area of the size asked
+//! for in pixels, its display bounds and usable bounds (the monitor's work area) are pixels, its
+//! modes have a pixel density of 1, and the content scale is the monitor's effective DPI over 96.
 //!
-//! Linux sizes its windows here (`native/sdl_thread/sdl.rs`); macOS's SDL windows open in the frames
-//! AppKit's window takes, in points.
+//! Linux and Windows size their windows here (`native/sdl_thread/sdl.rs`); macOS's SDL windows
+//! open in the frames AppKit's window takes, in points.
 
 #![cfg_attr(
-    all(not(target_os = "linux"), not(test)),
+    all(not(any(target_os = "linux", target_os = "windows")), not(test)),
     expect(dead_code, reason = "macOS's SDL windows open in AppKit's frames")
 )]
 
