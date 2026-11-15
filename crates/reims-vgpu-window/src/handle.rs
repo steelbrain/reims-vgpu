@@ -31,17 +31,16 @@
 //!
 //! **Who moves the guest's cursor.** The window's pointer events move it, through the host, and
 //! over the image the host's cursor takes the guest's glyph, at the host's pointer. The display
-//! tells the window each place the guest puts its cursor ([`Window::cursor_at`]), or the window
-//! reads it through its sink at each of the guest's cursor doorbells ([`Window::cursor_moved`]);
-//! a place where it was (a show or a hide, say) moves nothing, and so does the first. Where the
-//! guest moves its cursor with no pointer event of the window's in the [`POINTER_LEADS_FOR`]
-//! before, something else moves it: a mouse the host passed through to the guest, which the
-//! host's pointer never sees, or the guest placing its own. The window then draws the guest's
-//! cursor into its image itself, at the place it was told ([`DrawnCursor`], which the render
-//! thread hands the sink with each draw), each move drawing again, and the host's cursor is
-//! invisible over the image. The window's next pointer event gives the cursor back to the host's
-//! pointer. A move the guest reports soon after a pointer event of the window's is the guest
-//! following it, however late its report comes within that time.
+//! tells the window each place the guest puts its cursor ([`Window::cursor_at`]); a place where
+//! it was (a show or a hide, say) moves nothing, and so does the first. Where the guest moves its
+//! cursor with no pointer event of the window's in the [`POINTER_LEADS_FOR`] before, something
+//! else moves it: a mouse the host passed through to the guest, which the host's pointer never
+//! sees, or the guest placing its own. The window then draws the guest's cursor into its image
+//! itself, at the place it was told ([`DrawnCursor`], which the render thread hands the sink with
+//! each draw), each move drawing again, and the host's cursor is invisible over the image. The
+//! window's next pointer event gives the cursor back to the host's pointer. A move the guest
+//! reports soon after a pointer event of the window's is the guest following it, however late its
+//! report comes within that time.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -378,17 +377,6 @@ impl Window {
         self.post_cursor_refresh();
         if drawn {
             self.surface.request_draw();
-        }
-    }
-
-    /// The guest rang the doorbell that reports its cursor's moves: the window reads its cursor
-    /// position through the sink ([`FrameSink::guest_cursor_position`]), on this thread, and
-    /// takes it as `Window::cursor_at` does. Nothing before the sink is attached, after the
-    /// display has ended, without a guest display, or while it is paused.
-    pub fn cursor_moved(&self) {
-        let sink = self.sink.lock().clone();
-        if let Some(at) = sink.and_then(|sink| sink.guest_cursor_position()) {
-            self.cursor_at(at);
         }
     }
 
@@ -755,7 +743,7 @@ mod tests {
         assert_eq!(
             lead.guest_at(idle, (8, 5)),
             None,
-            "a doorbell that moves nothing"
+            "a place that moves nothing"
         );
         assert!(!lead.guest_leads());
         assert_eq!(
@@ -766,41 +754,6 @@ mod tests {
         assert!(lead.guest_leads());
     }
 
-    /// A sink that answers only the guest's cursor position, as the test sets it.
-    struct PositionSink(Mutex<Option<(u16, u16)>>);
-
-    impl FrameSink for PositionSink {
-        fn presenter(
-            &self,
-            _target: &dyn crate::VulkanTarget,
-        ) -> Option<Box<dyn crate::Presenter>> {
-            None
-        }
-
-        fn guest_cursor_position(&self) -> Option<(u16, u16)> {
-            *self.0.lock()
-        }
-    }
-
-    /// At each doorbell the window reads the guest's cursor position through its sink: none
-    /// reads nothing, the first position is no move, and a new one is
-    #[test]
-    fn a_doorbell_reads_the_guest_s_cursor_through_the_sink() {
-        let window = Window::new(WindowConfig::default(), 0, title(0));
-        let sink = Arc::new(PositionSink(Mutex::new(None)));
-        *window.sink.lock() = Some(Arc::clone(&sink) as Arc<dyn FrameSink>);
-        window.cursor_moved();
-        assert_eq!(window.guest().lead.at(), None);
-        *sink.0.lock() = Some((3, 4));
-        window.cursor_moved();
-        assert_eq!(window.guest().lead.at(), Some((3, 4)));
-        assert!(!window.guest().lead.guest_leads());
-        *sink.0.lock() = Some((5, 4));
-        window.cursor_moved();
-        assert!(window.guest().lead.guest_leads());
-        window.close();
-    }
-
     /// While the guest moves its cursor on its own, the window draws it, with its glyph, in the
     /// guest's mode, and the host's cursor is invisible over the image; a hidden guest cursor is
     /// drawn by neither; the window's pointer event gives it back to the host's cursor
@@ -809,8 +762,6 @@ mod tests {
         let window = Window::new(WindowConfig::default(), 0, title(0));
         let g = glyph(4);
         window.cursor_show(true);
-        window.cursor_moved();
-        assert_eq!(window.guest().lead.at(), None, "no sink, no position");
         window.cursor_at((10, 20));
         window.cursor_at((11, 20));
         assert!(window.drawn_cursor().is_none(), "no glyph or mode yet");

@@ -298,7 +298,6 @@ QEMU's `usb-tablet`, for which the host gets each event's notches too,
   cursor where it was moves nothing. The window's next pointer move gives the
   cursor back to the host's pointer.
   `test: handle::the_guest_leads_its_cursor_when_nothing_of_the_window_s_moved_it`,
-  `test: handle::a_doorbell_reads_the_guest_s_cursor_through_the_sink`,
   `test: handle::a_cursor_the_guest_moves_on_its_own_is_the_window_s_to_draw`,
   `test: reims-vgpu::graphics::tests::the_window_draws_the_cursor_the_guest_moves_on_its_own`,
   `test: reims-vgpu::graphics::sink::the_guest_s_cursor_is_drawn_over_the_frame_in_a_pass_of_its_own`,
