@@ -69,6 +69,14 @@ fn writer() -> Option<&'static Mutex<Writer>> {
         .as_ref()
 }
 
+/// Writes events to the file at `path`, created afresh, in place of the one the variable names,
+/// for a test of a site's events; `false` where the process chose its file already (nextest runs
+/// each test in a process of its own). The clock is still the one installed ([`set_clock`]).
+#[cfg(any(test, feature = "testkit"))]
+pub fn to_file(path: &std::path::Path) -> bool {
+    WRITER.set(open(path.as_os_str())).is_ok()
+}
+
 /// The file at `path`, created afresh; `None`, with a warning, where it is refused.
 fn open(path: &OsStr) -> Option<Mutex<Writer>> {
     let file = File::create(path)
@@ -182,7 +190,7 @@ mod tests {
     fn a_line_per_event() {
         // nextest runs each test in a process of its own, where the file is this one
         let path = std::env::temp_dir().join(format!("rvg-trace-{}.txt", std::process::id()));
-        assert!(WRITER.set(open(path.as_os_str())).is_ok());
+        assert!(to_file(&path));
         set_clock(|| 7);
         assert!(on());
         event("imp", &[6, 0x4000, 64, 0x4000]);

@@ -130,6 +130,7 @@ use reims_vgpu_graphics::wire::{
     RGFX_EVT_CB_SCHEDULED, RGFX_EVT_CB_SUBMITTED, RGFX_EVT_EVENT_SIGNALLED, RgfxCbScheduled,
     RgfxCbSubmitted, RgfxEventSignalled, RgfxMsgHeader,
 };
+use reims_vgpu_vulkan::core::num::ToU64 as _;
 use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder};
 use reims_vgpu_vulkan::core::platform::caps::{DeviceCaps, SAMPLE_COUNTS};
 use reims_vgpu_vulkan::core::platform::command::{
@@ -1826,6 +1827,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             counts.line.askable(Arc::clone(&askable));
             *self.asked.borrow_mut() = Some(askable);
         }
+        // cbbegun: queue, seqno: its begin is done, on the thread that began it (its queue's
+        // service thread), before its walk there or on its lane (`cenc`)
+        reims_vgpu_vulkan::core::trace::event("cbbegun", &[m.queue_obj_id, m.header.seqno]);
         Ok(Ok(begun))
     }
 
@@ -1862,6 +1866,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(ops) = read::<RgfxCommandBuffer>(message).and_then(|m| ops_of(message, &m)) else {
             return Ok(Err(DecodeError::Malformed));
         };
+        // cenc: queue, seqno, its op bytes: its walk's start, on the thread that walks it and
+        // commits it, whose `cbcommit`s up to its `cbwalked` are its parts'
+        reims_vgpu_vulkan::core::trace::event("cenc", &[queue_obj_id, seqno, ops.len().to_u64()]);
         // A structural malformation in the stream stops the walk and is reported;
         // everything else faults the exec and propagates.
         let mut events = EventOps::default();
@@ -1997,6 +2004,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                 line.post_through(&scheduled);
             }
         }
+        // cbwalked: queue, seqno: its walk and its last commit are done (`cenc`)
+        reims_vgpu_vulkan::core::trace::event("cbwalked", &[queue_obj_id, seqno]);
         Ok(Ok(()))
     }
 
@@ -7782,6 +7791,56 @@ mod tests {
             p.world().complete_all(CompleteOn::Caller);
             assert_eq!(p.call_log().sels_since(mark), without, "case {i}");
         }
+    }
+
+    /// With the trace on, a command buffer's begin's end, its walk's start (with its op bytes) and
+    /// its end after its commit are each an event of its queue and seqno, in that order, on the
+    /// thread that carries it out; a buffer whose walk faults has no end.
+    #[test]
+    fn a_traced_buffer_marks_its_begin_walk_and_end() {
+        use reims_vgpu_vulkan::core::trace;
+        // nextest runs each test in a process of its own, whose trace file is this one
+        let path = std::env::temp_dir().join(format!("rvg-cbtrace-{}.txt", std::process::id()));
+        assert!(trace::to_file(&path));
+        trace::set_clock(|| 5);
+        let (p, mut dec) = setup();
+        let device = p.device();
+        let mut blit = op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]);
+        blit.extend(op(RGFX_OP_ENCODER_END, &[]));
+        let message = command_buffer_message(310, 7, &blit);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let mut faults = op(RGFX_OP_ENCODER_BEGIN_RENDER, &begin_render_body());
+        faults.extend(op(0x1fff, &[0u8; 8]));
+        let message = command_buffer_message(311, 8, &faults);
+        assert!(dec.decode(&device, &message).is_err());
+        trace::flush_before_death();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let events: Vec<(&str, &str)> = text
+            .lines()
+            .filter_map(|l| {
+                let mut fields = l.splitn(3, ' ');
+                let (_, thread, rest) = (fields.next()?, fields.next()?, fields.next()?);
+                let kind = rest.split(' ').next()?;
+                ["cbbegun", "cenc", "cbwalked"]
+                    .contains(&kind)
+                    .then_some((thread, rest))
+            })
+            .collect();
+        let thread = events[0].0;
+        assert!(events.iter().all(|(t, _)| *t == thread), "{events:?}");
+        let rests: Vec<&str> = events.iter().map(|(_, rest)| *rest).collect();
+        let faulted = format!("cenc 1 8 {}", faults.len());
+        assert_eq!(
+            rests,
+            [
+                "cbbegun 1 7",
+                "cenc 1 7 16",
+                "cbwalked 1 7",
+                "cbbegun 1 8",
+                faulted.as_str()
+            ]
+        );
     }
 
     /// A render op with no open encoder faults the exec.
