@@ -8,8 +8,8 @@
 //! A command buffer is one render pass of draws, or, in a compositor's frame, many ([`Shape`],
 //! [`Stream`]). In `draws.10k`'s stream
 //! each draw of 3 vertices comes after a `setVertexBuffer:` at index 0 of an upload chunk at its
-//! next 256-byte offset, as the bundle sends `setVertexBytes:` (a 64 KiB
-//! `BUFFER_OVER_HOST_MEMORY` chunk of the region, 256 draws a chunk). In a compositor's, each
+//! next 256-byte offset, as the bundle sends `setVertexBytes:` (a 64 KiB chunk, 256 draws a
+//! chunk, [`Chunks`]). In a compositor's, each
 //! draw of a 4-vertex strip binds a texture of 16 and its own vertex and fragment bytes, under one
 //! of 4 pipelines that change every 4 draws with the sampler set again. The command buffers go
 //! back to back and are then waited for, as `draws.10k` commits them. Each path's figures are
@@ -24,8 +24,10 @@
 //! draws of a compositor's stream; `mc`, 8 of WindowServer's Mission Control composites, each of
 //! 92 render passes of 3 draws; or `mc1`, the same ops in one pass a command buffer, whose gap to
 //! `mc` is what 91 more passes cost), `DRAW_COST_RUNS` the runs (9), `DRAW_COST_ONLY` one path, for
-//! a profile of it (`decoder`, `platform` or `runtime`, the runtime alone), and
-//! `DRAW_COST_SECONDS` a time to keep running that path for, so a sampling profiler can attach.
+//! a profile of it (`decoder`, `platform` or `runtime`, the runtime alone),
+//! `DRAW_COST_SECONDS` a time to keep running that path for, so a sampling profiler can attach,
+//! and `DRAW_COST_CHUNKS` where the upload chunks lie: `pages`, the default where the host maps
+//! the guest's pages, else `heap`; or `buffer` ([`Chunks`]).
 
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -45,10 +47,14 @@ use reims_vgpu_graphics::ops::{
     RgfxRenderPassDesc,
 };
 use reims_vgpu_graphics::wire::{
-    RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_QUEUE_CREATE,
-    RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN, RgfxBufferOverHostMemory, RgfxMsgHeader,
-    RgfxQueueCreate,
+    RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_COMMAND_BUFFER,
+    RGFX_CMD_HEAP_OVER_HOST_MEMORY, RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_QUEUE_CREATE,
+    RGFX_CMD_SURFACE_PAGES, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN, RGFX_STATUS_OK,
+    RGFX_SURFACE_PAGES_PRIVATE, RgfxBufferAtOffset, RgfxBufferOverHostMemory,
+    RgfxHeapOverHostMemory, RgfxHeapOverPages, RgfxMsgHeader, RgfxPageRun, RgfxQueueCreate,
+    RgfxSurfacePages,
 };
+use reims_vgpu_vulkan::core::memory::map::MemoryMap as CoreMemoryMap;
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
 use reims_vgpu_vulkan::core::platform::descriptor::RenderPassDescriptor as _;
@@ -62,6 +68,8 @@ use reims_vgpu_vulkan::core::platform::values::{
 use reims_vgpu_vulkan::core::raise::OnFault;
 use zerocopy::IntoBytes;
 
+use super::surface_pages::costs::{RAM, Ram, guest_ram};
+use super::surface_pages::{GUEST_PAGE, Lease};
 use super::{GraphicsDecoder, ObjHandle};
 use crate::platform::ApiPlatform;
 
@@ -147,9 +155,14 @@ impl Shape {
         (self.draws as u64 * self.slots() * ALIGN).div_ceil(CHUNK)
     }
 
-    /// The chunks the region holds: a repetition's command buffers each take their own.
+    /// The chunks a repetition's command buffers take, each its own.
     fn chunks(self) -> u64 {
         self.chunks_a_cb() * self.cbs as u64
+    }
+
+    /// The slabs the chunks lie in.
+    fn slabs(self) -> u64 {
+        self.chunks().div_ceil(CHUNKS_A_SLAB)
     }
 
     /// The shape `DRAW_COST_SHAPE` names: `many`, `ws`, `mc`, `mc1` or, by default, `10k`.
@@ -177,16 +190,45 @@ const WARM: usize = 2;
 /// `kUploadChunkSize` and `kUploadAlign`).
 const CHUNK: u64 = 0x1_0000;
 const ALIGN: u64 = 256;
+/// A slab of the bundle's that holds chunks, and the chunks it holds: 2 MiB, as its pages slab
+/// source takes them (`RgfxPagesSlabSource::kUnit`).
+const SLAB: u64 = 2 << 20;
+const CHUNKS_A_SLAB: u64 = SLAB / CHUNK;
+/// A pages slab's block: a page, then the pages its runs ([`RgfxPageRun`]) take, one for each
+/// chunk of the slab's pages, as the kext's 64 KiB chunks make a slab.
+const PAGES_BLOCK: u64 =
+    GUEST_PAGE + (CHUNKS_A_SLAB * size_of::<RgfxPageRun>() as u64).next_multiple_of(GUEST_PAGE);
+/// The GPU address the first slab's heap is pinned at, each next one a slab further: the guest
+/// picks a heap's address.
+const SLAB_ADDRESS: u64 = 0x2_0000_0000;
+/// `MTLResourceHazardTrackingModeTracked`, which the bundle resolves a slab's `Default` mode to
+/// and gives its heap, as Metal resolves a buffer's.
+const TRACKED: u32 = 2 << 8;
+/// `MTLHeapTypePlacement`.
+const PLACEMENT: i32 = 1;
+
+/// Where the upload chunks lie, as the bundle takes them (`RgfxUploadPool::take`): each chunk a
+/// buffer of the slabs, a `BUFFER_AT_OFFSET` in a slab's placement heap; the slab is 2 MiB of the
+/// process's own pages, a `HEAP_OVER_PAGES` over a pages block of 32 runs of 64 KiB, where the
+/// host maps the guest's pages (`Pages`), else a block of the region, a `HEAP_OVER_HOST_MEMORY`
+/// (`Heap`). With no slabs, a chunk is a `BUFFER_OVER_HOST_MEMORY` of the region (`Buffer`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Chunks {
+    Pages,
+    Heap,
+    Buffer,
+}
 
 /// The object ids: the queue, the target, the per-draw constant buffers (vertex 1 and fragment
-/// 0), the pipelines from [`PIPELINE_ID`], the textures from [`TEXTURE_ID`], the sampler, then
-/// the chunks from [`CHUNK_ID`].
+/// 0), the pipelines from [`PIPELINE_ID`], the textures from [`TEXTURE_ID`], the sampler, the
+/// slabs' heaps from [`HEAP_ID`], then the chunks from [`CHUNK_ID`].
 const QUEUE_ID: u64 = 1;
 const TARGET_ID: u64 = 2;
 const CONSTANTS_ID: u64 = 4;
 const PIPELINE_ID: u64 = 0x10;
 const TEXTURE_ID: u64 = 0x20;
 const SAMPLER_ID: u64 = 0x40;
+const HEAP_ID: u64 = 0x80;
 const CHUNK_ID: u64 = 0x100;
 /// A compositor's pipelines: a fragment buffer's colour and a texture's, each opaque and blended
 /// over (`draws.10k`'s is the first); its textures; and the draws a pipeline runs for.
@@ -543,22 +585,134 @@ pub(super) fn fixture<P: Platform>(d: &P::Device, name: &str) -> P::Function {
     library.new_function(OnFault::Die, name).unwrap().unwrap()
 }
 
+/// The guest's RAM `shape`'s pages slabs lie in, as `decoder`'s guest memory, and the holds on
+/// it: for each slab 32 runs of 64 KiB, a run's gap apart so no two make one, every page touched
+/// as a running guest's RAM is.
+fn guest_pages<P: ApiPlatform>(
+    platform: &Arc<P>,
+    decoder: &mut GraphicsDecoder<P>,
+    shape: Shape,
+) -> (Arc<CoreMemoryMap<P>>, Lease, Ram) {
+    let ram = guest_ram(shape.slabs() * SLAB * 2, true);
+    let lease: Lease = Arc::from(platform.guest_memory(&ram.map));
+    let core = CoreMemoryMap::new(Arc::clone(platform), &ram.map.to_core()).expect("a memory map");
+    decoder.set_guest_memory(Arc::clone(&core), Arc::clone(&lease));
+    (core, lease, ram)
+}
+
+/// The guest's pages of pages slab `slab`: 32 runs of 64 KiB, as the kext's chunks make a slab,
+/// each a run's gap past the one before, so no two make one run.
+fn slab_runs(slab: u64) -> Vec<RgfxPageRun> {
+    (0..CHUNKS_A_SLAB)
+        .map(|r| RgfxPageRun {
+            address: RAM + (slab * CHUNKS_A_SLAB + r) * 2 * CHUNK,
+            length: CHUNK,
+        })
+        .collect()
+}
+
+/// Makes `shape`'s upload chunks of kind `chunks` on `decoder` ([`Chunks`]), whose guest memory
+/// holds the pages slabs' ([`guest_pages`]).
+fn make_chunks<P: ApiPlatform>(
+    device: &P::Device,
+    decoder: &mut GraphicsDecoder<P>,
+    shape: Shape,
+    chunks: Chunks,
+) {
+    let header = |r#type| RgfxMsgHeader {
+        r#type,
+        size: 0,
+        seqno: 0,
+    };
+    let made = |decoder: &mut GraphicsDecoder<P>, m: &[u8]| {
+        assert_eq!(decoder.decode(device, m).unwrap(), Ok(()));
+    };
+    if chunks == Chunks::Buffer {
+        for n in 0..shape.chunks() {
+            let chunk = RgfxBufferOverHostMemory {
+                header: header(RGFX_CMD_BUFFER_OVER_HOST_MEMORY),
+                obj_id: CHUNK_ID + n,
+                region_offset: RGFX_CONTEXT_ALLOCATIONS_OFFSET + n * CHUNK,
+                length: CHUNK,
+                ..RgfxBufferOverHostMemory::default()
+            };
+            made(decoder, chunk.as_bytes());
+        }
+        return;
+    }
+    for slab in 0..shape.slabs() {
+        let gpu_address = SLAB_ADDRESS + slab * SLAB;
+        if chunks == Chunks::Heap {
+            let heap = RgfxHeapOverHostMemory {
+                header: header(RGFX_CMD_HEAP_OVER_HOST_MEMORY),
+                obj_id: HEAP_ID + slab,
+                gpu_address,
+                region_offset: RGFX_CONTEXT_ALLOCATIONS_OFFSET + slab * SLAB,
+                size_bytes: SLAB,
+                options: TRACKED,
+                heap_type: PLACEMENT,
+            };
+            made(decoder, heap.as_bytes());
+            continue;
+        }
+        let block = RGFX_CONTEXT_ALLOCATIONS_OFFSET + slab * PAGES_BLOCK;
+        let runs = slab_runs(slab);
+        let pages = RgfxSurfacePages {
+            header: header(RGFX_CMD_SURFACE_PAGES),
+            context: 0,
+            run_count: runs.len() as u32,
+            block_offset: block,
+            block_size: PAGES_BLOCK,
+            runs_offset: block + GUEST_PAGE,
+            length: SLAB,
+        };
+        let status = decoder.surface_pages(device, &pages, &runs, RGFX_SURFACE_PAGES_PRIVATE);
+        assert_eq!(status, RGFX_STATUS_OK, "slab {slab}'s SURFACE_PAGES");
+        let heap = RgfxHeapOverPages {
+            header: header(RGFX_CMD_HEAP_OVER_PAGES),
+            obj_id: HEAP_ID + slab,
+            gpu_address,
+            block_offset: block,
+            block_size: PAGES_BLOCK,
+            size_bytes: SLAB,
+            options: TRACKED,
+            heap_type: PLACEMENT,
+        };
+        made(decoder, heap.as_bytes());
+    }
+    for n in 0..shape.chunks() {
+        let chunk = RgfxBufferAtOffset {
+            header: header(RGFX_CMD_BUFFER_AT_OFFSET),
+            obj_id: CHUNK_ID + n,
+            heap_obj_id: HEAP_ID + n / CHUNKS_A_SLAB,
+            offset: n % CHUNKS_A_SLAB * CHUNK,
+            length: CHUNK,
+            options: 0,
+            reserved_34: 0,
+        };
+        made(decoder, chunk.as_bytes());
+    }
+}
+
 /// A decoder on `P`'s system device, holding the objects [`command_buffer`] names, and the
 /// channel its completions come on.
 struct Bench<P: ApiPlatform> {
     shape: Shape,
+    chunks: Chunks,
     platform: Arc<P>,
     device: P::Device,
     decoder: GraphicsDecoder<P>,
     completed: mpsc::Receiver<u64>,
+    /// The guest's RAM the pages slabs lie in, and the holds on it, let go after the decoder.
+    _guest: Option<(Arc<CoreMemoryMap<P>>, Lease, Ram)>,
 }
 
 impl<P: ApiPlatform> Bench<P> {
     fn new(shape: Shape) -> Bench<P> {
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
-        let region_size =
-            RGFX_CONTEXT_ALLOCATIONS_OFFSET + shape.chunks() * CHUNK + RGFX_CURSOR_SPAN;
+        // Room for the chunks of any kind: a slab of the region a heap, or its pages block.
+        let region_size = RGFX_CONTEXT_ALLOCATIONS_OFFSET + shape.slabs() * SLAB + RGFX_CURSOR_SPAN;
         let region = crate::platform::test_region(&*platform, region_size as usize);
         let mut decoder = GraphicsDecoder::<P>::new(Arc::clone(&platform), Arc::new(region));
         let (tx, completed) = mpsc::channel();
@@ -576,20 +730,18 @@ impl<P: ApiPlatform> Bench<P> {
             ..RgfxQueueCreate::default()
         };
         assert_eq!(decoder.decode(&device, queue.as_bytes()).unwrap(), Ok(()));
-        for n in 0..shape.chunks() {
-            let chunk = RgfxBufferOverHostMemory {
-                header: RgfxMsgHeader {
-                    r#type: RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
-                    size: size_of::<RgfxBufferOverHostMemory>() as u32,
-                    seqno: 0,
-                },
-                obj_id: CHUNK_ID + n,
-                region_offset: RGFX_CONTEXT_ALLOCATIONS_OFFSET + n * CHUNK,
-                length: CHUNK,
-                ..RgfxBufferOverHostMemory::default()
-            };
-            assert_eq!(decoder.decode(&device, chunk.as_bytes()).unwrap(), Ok(()));
-        }
+        let asked = std::env::var("DRAW_COST_CHUNKS").ok();
+        let guest = match asked.as_deref() {
+            Some("heap" | "buffer") => None,
+            _ => Some(guest_pages(&platform, &mut decoder, shape)),
+        };
+        let chunks = match asked.as_deref() {
+            Some("buffer") => Chunks::Buffer,
+            Some("heap") => Chunks::Heap,
+            _ if decoder.surface_pages_available() => Chunks::Pages,
+            _ => Chunks::Heap,
+        };
+        make_chunks(&device, &mut decoder, shape, chunks);
         let target = platform.texture_descriptor(&TextureDesc {
             pixel_format: BGRA8,
             width: SIDE,
@@ -651,10 +803,12 @@ impl<P: ApiPlatform> Bench<P> {
         }
         Bench {
             shape,
+            chunks,
             platform,
             device,
             decoder,
             completed,
+            _guest: guest,
         }
     }
 
@@ -1017,8 +1171,9 @@ fn measure<P: ApiPlatform>(
         let [ns, instructions, cycles] = a_draw(spent, reps);
         println!(
             "{name}: {} for {seconds} s: {reps} repetitions, a draw {ns:.1} ns, {instructions:.0} \
-             instructions, {cycles:.0} cycles",
+             instructions, {cycles:.0} cycles, the upload chunks {:?}",
             only.unwrap_or("decoder"),
+            bench.chunks,
         );
         return;
     }
@@ -1053,8 +1208,8 @@ fn measure<P: ApiPlatform>(
     println!(
         "{name}: a draw on the decoding thread, median [lowest, highest] of {runs} runs of {REPS} \
          repetitions of {} command buffers of {} draws of {:?} in {} passes, {ops} ops (a command \
-         buffer's: {} times as much)",
-        shape.cbs, shape.draws, shape.stream, shape.passes, shape.draws
+         buffer's: {} times as much), the upload chunks {:?}",
+        shape.cbs, shape.draws, shape.stream, shape.passes, shape.draws, bench.chunks
     );
     for (f, figure) in FIGURES.iter().enumerate() {
         let mut medians = [0.0f64; 3];
@@ -1101,6 +1256,33 @@ fn the_mc_shapes_cut_their_draws_into_passes() {
         let one = steps(shape, 0);
         assert_eq!(one.len(), 1);
         assert_eq!(draws(&one[0]), shape.draws);
+    }
+}
+
+/// A pages slab is 32 runs of 64 KiB of the guest's RAM, as the kext's chunks make the bundle's
+/// 2 MiB slab, no two of them one run, inside the RAM [`guest_pages`] maps; its block holds their
+/// list after its first page; and each command buffer's chunks lie in the shape's slabs, 32 a
+/// slab, at their 64 KiB offsets.
+#[test]
+fn pages_slabs_are_the_bundle_s() {
+    for shape in [Shape::TEN_K, Shape::MANY, Shape::WS, Shape::MC] {
+        let ram = shape.slabs() * SLAB * 2;
+        for slab in 0..shape.slabs() {
+            let runs = slab_runs(slab);
+            assert_eq!(runs.len() as u64, CHUNKS_A_SLAB);
+            assert_eq!(runs.iter().map(|r| r.length).sum::<u64>(), SLAB);
+            for pair in runs.windows(2) {
+                assert!(
+                    pair[0].address + pair[0].length < pair[1].address,
+                    "{pair:?}"
+                );
+            }
+            let last = runs.last().unwrap();
+            assert!(last.address + last.length <= RAM + ram);
+        }
+        assert!(GUEST_PAGE + CHUNKS_A_SLAB * size_of::<RgfxPageRun>() as u64 <= PAGES_BLOCK);
+        assert!(shape.chunks() <= shape.slabs() * CHUNKS_A_SLAB);
+        assert!(shape.slabs() * PAGES_BLOCK <= shape.slabs() * SLAB);
     }
 }
 
