@@ -427,3 +427,143 @@ fn writes_through_argument_buffers_of_two_plane_ycbcr_textures_are_the_slots() {
         "a BGRA8Unorm texture over a buffer"
     );
 }
+
+/// The bars of the camera probe's frames, each `(Y, Cb, Cr)`, 4 pairs (8 texels) wide.
+const BARS: [[u8; 3]; 4] = [
+    [180, 128, 128],
+    [65, 100, 212],
+    [112, 72, 58],
+    [35, 212, 114],
+];
+
+/// Every texel of `t`, of `size`, as a kernel's `read()` into floats answers it
+/// (`read_texels_float`), in rows, once the work completed.
+fn read_texels(t: &VulkanTexture, (width, height): (u64, u64)) -> Vec<[f32; 4]> {
+    let d = dev();
+    let library = d.new_library(PROBE).unwrap().unwrap().unwrap();
+    let function = library.new_function(OnFault::Die, "read_texels_float");
+    let function = function.unwrap().unwrap();
+    let state = d.new_compute_pipeline_state_for_function(Some(&function));
+    let state = state.unwrap().unwrap();
+    let length = width * height * 16;
+    let out = d.new_buffer_of_length(OnFault::Die, length, 0);
+    let out = out.unwrap().unwrap();
+    let q = d.new_command_queue().unwrap();
+    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+    let e = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
+    for cmd in [
+        ComputeCmd::SetComputePipelineState {
+            state: Some(&state),
+        },
+        ComputeCmd::SetTextures {
+            textures: &[Some(t)],
+            range: NsRange::new(0, 1),
+        },
+        ComputeCmd::SetBuffers {
+            buffers: &[Some(&out)],
+            offsets: &[0],
+            range: NsRange::new(0, 1),
+        },
+        ComputeCmd::DispatchThreads {
+            threads_per_grid: MtlSize::new(width, height, 1),
+            threads_per_threadgroup: MtlSize::new(8, 4, 1),
+        },
+        ComputeCmd::EndEncoding,
+    ] {
+        e.encode(OnFault::Die, cmd).unwrap();
+    }
+    cb.commit(OnFault::Die).unwrap();
+    cb.wait_until_completed(OnFault::Die).unwrap();
+    assert_eq!(cb.error(), None);
+    let n = usize::try_from(width * height).unwrap();
+    // SAFETY: the buffer's float4s, read after its command buffer completed.
+    unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<[f32; 4]>(), n) }.to_vec()
+}
+
+/// A `BGRG422` (241) or `GBGR422` (240) texture of 32 x 4 over plane 0 of a '2vuy' or 'yuvs'
+/// surface (one plane, 2 bytes a texel, its pairs `Cb Y0 Cr Y1` or `Y0 Cb Y1 Cr`), over a
+/// `Shared` buffer or over host pages in place, as the reims-graphics device makes one for
+/// CoreVideo's texture cache over a camera's frame, read by a kernel: Metal's `read()` of a texel
+/// inside a bar answers its codes `(Cr, Y, Cb)` over 255 and alpha 1 (an M3 Max under macOS
+/// 27.0.1).
+#[test]
+fn four_two_two_textures_over_surface_planes_read() {
+    use crate::core::host::HostPtr;
+    use crate::core::platform::HostRange;
+    let (width, height, row, length) = (32u64, 4u64, 64u64, 16384u64);
+    for (format, ostype) in [(241u64, *b"2vuy"), (240, *b"yuvs")] {
+        for in_place in [false, true] {
+            let mut bytes = vec![0u8; usize::try_from(length).unwrap()];
+            for y in 0..height {
+                for pair in 0..width / 2 {
+                    let [l, cb, cr] = BARS[usize::try_from(pair / 4).unwrap()];
+                    let at = usize::try_from(y * row + pair * 4).unwrap();
+                    let codes = match &ostype {
+                        b"2vuy" => [cb, l, cr, l],
+                        _ => [l, cb, l, cr],
+                    };
+                    bytes[at..at + 4].copy_from_slice(&codes);
+                }
+            }
+            let buffer = if in_place {
+                let address = crate::gpu::resource::tests::guest_pages_of(length);
+                let address = usize::try_from(address).unwrap();
+                // SAFETY: pages of the test's own, left mapped until the process ends.
+                let range = unsafe { HostRange::new(HostPtr::from_addr(address), length) };
+                (dev().new_buffer_over_host_memory(OnFault::Die, range, 0, None))
+                    .unwrap()
+                    .unwrap()
+            } else {
+                (dev().new_buffer_of_length(OnFault::Die, length, 0))
+                    .unwrap()
+                    .unwrap()
+            };
+            // SAFETY: the buffer's `length` bytes, which no command uses yet.
+            unsafe {
+                let to = buffer.contents().as_ptr::<u8>();
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), to, bytes.len());
+            }
+            let facts = SurfaceFacts {
+                pixel_format: u32::from_be_bytes(ostype),
+                plane_count: 0,
+                width,
+                height,
+                chroma_offset: 0,
+                chroma_bytes_per_row: 0,
+                ycbcr_matrix: None,
+            };
+            let plane = SurfacePlane {
+                plane: 0,
+                offset: 0,
+                bytes_per_row: row,
+                planar: false,
+                facts: Some(facts),
+            };
+            let t = texture(&buffer, plane, format, (width, height), 0x1);
+            let what = format!(
+                "{format} over '{}' ({})",
+                String::from_utf8_lossy(&ostype),
+                if in_place { "host pages" } else { "Shared" }
+            );
+            let read = outcome(|| read_texels(&t, (width, height)));
+            if cfg!(target_os = "macos") {
+                // Every device runs on Metal there, and MoltenVK takes the device's own Y'CbCr
+                // conversion, within a code of Metal's decode, which the runtime announces as
+                // `DecodedTexelPrecision` at the first dispatch that reads the texture: a kind
+                // of `DIES`, so the run dies there, as it died at the runtime's refusal before.
+                let (_, line) = read.expect_err(&what);
+                assert!(line.contains("decoded-texel-precision"), "{what}: {line}");
+                continue;
+            }
+            // Elsewhere the runtime decodes the pairs by Metal's rules: exact.
+            let texels = read.unwrap_or_else(|(site, line)| panic!("{what}: {site}: {line}"));
+            for (b, [l, cb, cr]) in BARS.iter().enumerate() {
+                let x = b * 8 + 3;
+                let got = texels[usize::try_from(width).unwrap() + x];
+                let want = [cr, l, cb].map(|c| f32::from(*c) / 255.0);
+                let want = [want[0], want[1], want[2], 1.0];
+                assert_eq!(got, want, "{what}: bar {b}, texel ({x}, 1)");
+            }
+        }
+    }
+}
