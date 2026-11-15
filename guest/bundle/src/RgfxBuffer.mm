@@ -778,6 +778,38 @@ RGFX_RESOURCE_SPI
 
 // --- what a buffer that is not sparse or remote answers ------------------------------
 
+// Whether a texture of `descriptor` over the buffer from `offset`, rows `bytesPerRow` apart, is
+// nil for its texels' end past an Apple GPU's allocation of the buffer (rgfxTexelsPastAllocation),
+// logged once: a 2D texture, a 2D array, its slices where the linear form lays them, or a texture
+// buffer, of a format whose texture a buffer backs (another is answered on its own). The M3 Max
+// answers a 2D texture's nil there as a texture buffer's (64 x 65 RGBA8Unorm over 16384 bytes, 64
+// x 129 over 20000; `tbpa`, dgpu-oracle.md Q11), where the x86 Macs make both.
+- (BOOL)rgfxPastAllocation:(MTLTextureDescriptor *)descriptor
+                    offset:(NSUInteger)offset
+               bytesPerRow:(NSUInteger)bytesPerRow
+{
+	RgfxFormatBlock block = {};
+	if (descriptor == nil ||
+	    !rgfxPixelFormatBlock(static_cast<uint32_t>(descriptor.pixelFormat), &block) ||
+	    !block.linear)
+		return NO;
+	const bool array = descriptor.textureType == MTLTextureType2DArray;
+	const uint64_t rowBytes = static_cast<uint64_t>(descriptor.width) * block.bytes;
+	if (!rgfxTexelsPastAllocation([self length], offset, bytesPerRow, descriptor.height, rowBytes,
+	                              array ? descriptor.arrayLength : 1, array))
+		return NO;
+	static std::atomic<bool> logged{false};
+	if (!logged.exchange(true)) {
+		NSLog(@"RGFX: a texture of type %lu over buffer 0x%llx past its allocation of %lu bytes "
+		      @"(offset %lu, %lu bytes a row, %lu x %lu), which the host does not carry: "
+		      @"answered nil",
+		      (unsigned long)descriptor.textureType, (unsigned long long)[self rgfxObjId],
+		      (unsigned long)[self length], (unsigned long)offset, (unsigned long)bytesPerRow,
+		      (unsigned long)descriptor.width, (unsigned long)descriptor.height);
+	}
+	return YES;
+}
+
 // Whether a texture of `descriptor` over the buffer from `offset`, rows `bytesPerRow` apart, lies
 // at the device's linear texture alignment for its format
 // (minimumLinearTextureAlignmentForPixelFormat:): Metal's rule for both forms of a 2D texture over
@@ -826,10 +858,10 @@ RGFX_RESOURCE_SPI
 // so does the bundle, where the Intel GPU ends the process. One whose texels lie past the
 // buffer's bytes is made, as both make it and the M3 Max does (4 RGBA32Float texels at offset
 // 4064 of a 4096-byte buffer; dgpu-oracle.md Q11), and so does the host's platform, its texels
-// past the buffer's bytes in a tail of the texture's own; one past an Apple GPU's allocation of
-// the buffer is nil, as the M3's and the host's (rgfxTexelsPastAllocation). A block-compressed
-// format answers nil (below). One off the device's linear texture alignment is nil
-// (rgfxAtLinearAlignment:).
+// past the buffer's bytes in a tail of the texture's own. A block-compressed format answers nil
+// (below). A texture buffer or 2D texture past an Apple GPU's allocation of the buffer is nil, as
+// the M3's and the host's (rgfxPastAllocation:). One off the device's linear texture alignment is
+// nil (rgfxAtLinearAlignment:).
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                     offset:(NSUInteger)offset
                                bytesPerRow:(NSUInteger)bytesPerRow
@@ -869,19 +901,6 @@ RGFX_RESOURCE_SPI
 			}
 			return nil;
 		}
-		// Texels past the buffer's bytes are made, but where they end past an Apple GPU's
-		// allocation of the buffer (rgfxTexelsPastAllocation), whose nil the host's platform
-		// answers on every device: the bundle answers nil, logged once, and sends nothing.
-		if (rgfxTexelsPastAllocation([self length], offset, bytesPerRow, 1, rowBytes, 1, false)) {
-			static std::atomic<bool> logged{false};
-			if (!logged.exchange(true)) {
-				NSLog(@"RGFX: a texture buffer past buffer 0x%llx's allocation of %lu bytes "
-				      @"(offset %lu, %lu bytes a row), which the host does not carry: answered nil",
-				      (unsigned long long)[self rgfxObjId], (unsigned long)[self length],
-				      (unsigned long)offset, (unsigned long)bytesPerRow);
-			}
-			return nil;
-		}
 	} else if (descriptor != nil && descriptor.textureType != MTLTextureType2D) {
 		NSString *type = rgfxLinearTypeName(descriptor.textureType);
 		if (type != nil)
@@ -914,6 +933,11 @@ RGFX_RESOURCE_SPI
 			return nil;
 		}
 	}
+	// Texels past the buffer's bytes are made, but where they end past an Apple GPU's allocation
+	// of the buffer, whose nil the host's platform answers on every device: the bundle answers
+	// nil, logged once, and sends nothing.
+	if ([self rgfxPastAllocation:descriptor offset:offset bytesPerRow:bytesPerRow])
+		return nil;
 	if (![self rgfxAtLinearAlignment:descriptor offset:offset bytesPerRow:bytesPerRow])
 		return nil;
 	return [RgfxTexture textureWithDescriptor:descriptor
@@ -1044,8 +1068,9 @@ RGFX_RESOURCE_SPI
 // texture buffer: with the same words on the three GPUs for a 1D, 1D array, cube or cube array
 // type, which the bundle ends it with, and with the M3's for a 3D or multisample one
 // (rgfxLinearTypeDies, Q11). It ends it too at more than one level, which the bundle answers nil,
-// logged, as it answers a view Metal ends the process at. One past the buffer's bytes Metal
-// answers nil, and the host refuses; one off the device's linear texture alignment is nil
+// logged, as it answers a view Metal ends the process at. One whose texels run past the buffer's
+// bytes is made, as by the public form, and one whose texels end past an Apple GPU's allocation of
+// the buffer is nil (rgfxPastAllocation:); one off the device's linear texture alignment is nil
 // (rgfxAtLinearAlignment:).
 - (id<MTLTexture>)newLinearTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                           offset:(NSUInteger)offset
@@ -1076,6 +1101,8 @@ RGFX_RESOURCE_SPI
 		}
 		return nil;
 	}
+	if ([self rgfxPastAllocation:descriptor offset:offset bytesPerRow:bytesPerRow])
+		return nil;
 	if (![self rgfxAtLinearAlignment:descriptor offset:offset bytesPerRow:bytesPerRow])
 		return nil;
 	return [RgfxTexture linearTextureWithDescriptor:descriptor

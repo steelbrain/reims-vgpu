@@ -3391,6 +3391,71 @@ pub(crate) mod tests {
         });
     }
 
+    /// A texture over a buffer of 16 KiB or more whose texels end past the buffer's allocation,
+    /// its length rounded up to 16 KiB, is nil, by `newTextureWithDescriptor:offset:bytesPerRow:`
+    /// and by the linear form alike, as Metal answers it on the M3 Max (a 2D texture of 64 × 65
+    /// `RGBA8Unorm` texels over 16384 bytes and of 64 × 129 over 20000, `tbpa`,
+    /// docs/graphics-kext/dgpu-oracle.md Q11; metal2vulkan's measurement of arrays), and as the
+    /// bundle answers it (`rgfxTexelsPastAllocation`), which posts no create for one: a 2D texture,
+    /// a 2D array of two slices whose second ends at 16896 and a texture buffer ending at 16416.
+    /// Those ending at the length, inside the allocation or past a smaller buffer's bytes are
+    /// made
+    #[test]
+    fn textures_past_their_buffers_allocation_are_nil_as_the_m3s() {
+        use crate::core::platform::resource::Buffer as _;
+
+        let d = dev();
+        let buffer = |length| {
+            d.new_buffer_of_length(OnFault::Die, length, 0)
+                .unwrap()
+                .unwrap()
+        };
+        let p = platform();
+        let rgba = |texture_type, height, array_length| {
+            p.texture_descriptor(&TextureDesc {
+                texture_type,
+                pixel_format: 70,
+                width: 64,
+                height,
+                array_length,
+                usage: 0x1,
+                resource_options: Some(0),
+                ..TextureDesc::default()
+            })
+        };
+        let texels = p.texture_descriptor(&TextureDesc {
+            texture_type: 9,
+            pixel_format: 125,
+            width: 4,
+            usage: 0x1,
+            resource_options: Some(0),
+            ..TextureDesc::default()
+        });
+        let public = |length, height| {
+            buffer(length)
+                .new_texture(OnFault::Die, &rgba(2, height, 1), 0, 256)
+                .unwrap()
+                .is_some()
+        };
+        assert!(public(4096, 17), "past a 4096-byte buffer");
+        assert!(public(16384, 64), "at the length");
+        assert!(public(20000, 80), "inside the allocation");
+        assert!(!public(16384, 65), "past the allocation of 16384");
+        assert!(!public(20000, 129), "past the allocation of 32768");
+        let linear = |desc: &VulkanTextureDescriptor, offset, row| {
+            buffer(16384)
+                .new_linear_texture(desc, offset, row, 0)
+                .unwrap()
+                .is_some()
+        };
+        assert!(linear(&rgba(2, 64, 1), 0, 256), "a 2D texture at the length");
+        assert!(!linear(&rgba(2, 65, 1), 0, 256), "a 2D texture past the allocation");
+        assert!(linear(&rgba(3, 32, 2), 0, 256), "an array at the length");
+        assert!(!linear(&rgba(3, 33, 2), 0, 256), "an array past the allocation");
+        assert!(linear(&texels, 16320, 64), "a texture buffer at the length");
+        assert!(!linear(&texels, 16352, 64), "a texture buffer past the allocation");
+    }
+
     /// What a 2D array texture over a no-copy buffer of 64 KiB of host memory shows on `P`, made
     /// by `newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:` where `linear`,
     /// else by `newTextureWithDescriptor:offset:bytesPerRow:`: three slices of 60 by 3

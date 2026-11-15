@@ -3081,6 +3081,98 @@ void test_buffer_texture_buffers()
 	drainRing(fx.ring);
 }
 
+// A texture over a buffer's bytes whose texels end past an Apple GPU's allocation of a buffer of
+// 16 KiB or more, its length rounded up to 16 KiB, answers nil and posts nothing, by the public form
+// and the linear SPI, a 2D texture, a 2D array and a texture buffer alike, as the M3 Max answers it
+// and the host's platform answers it on every device (`tbpa`, docs/graphics-kext/dgpu-oracle.md
+// Q11, where the x86 Macs make them). One ending at the length, inside the allocation or past a
+// smaller buffer's bytes is made, posting its create.
+void test_textures_past_a_buffers_allocation_answer_nil()
+{
+	Fixture fx;
+	@autoreleasepool {
+		std::vector<uint8_t> memory(0x10000, 0);
+		NSMutableArray *kept = [NSMutableArray array]; // kept, so no destroy posts between
+		auto over = [&](NSUInteger length) {
+			RgfxBuffer *b = [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+			                                                regionOffset:0x10000
+			                                                      length:length
+			                                                     options:MTLResourceStorageModeShared
+			                                                 deallocator:nil
+			                                                      device:nil
+			                                                  serializer:&fx.ser];
+			CHECK(b != nil);
+			if (b != nil)
+				[kept addObject:b];
+			drainRing(fx.ring);
+			return b;
+		};
+		auto rgba = [](MTLTextureType type, NSUInteger height, NSUInteger slices) {
+			MTLTextureDescriptor *d =
+			    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+			                                                       width:64
+			                                                      height:height
+			                                                   mipmapped:NO];
+			d.textureType = type;
+			d.arrayLength = slices;
+			d.storageMode = MTLStorageModeShared;
+			return d;
+		};
+		MTLTextureDescriptor *texels =
+		    [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+		                                                           width:4
+		                                                 resourceOptions:MTLResourceStorageModeShared
+		                                                           usage:MTLTextureUsageShaderRead];
+		// What a form answers over a buffer of `length` bytes: made, posting its create, or nil,
+		// posting nothing.
+		auto answers = [&](NSUInteger length, MTLTextureDescriptor *d, NSUInteger offset,
+		                   NSUInteger rows, bool linear, bool made) {
+			RgfxBuffer *b = over(length);
+			id<MTLTexture> t =
+			    linear ? [(id<RgfxMetalBufferInternals>)b newLinearTextureWithDescriptor:d
+			                                                                      offset:offset
+			                                                                 bytesPerRow:rows
+			                                                               bytesPerImage:0]
+			           : [b newTextureWithDescriptor:d offset:offset bytesPerRow:rows];
+			if (t != nil)
+				[kept addObject:t];
+			if (!made) {
+				CHECK(t == nil);
+				CHECK(ringEmpty(fx.ring));
+				return;
+			}
+			CHECK(t != nil && t.textureType == d.textureType && t.height == d.height);
+			if (linear) {
+				auto m = expectMessage<RgfxLinearTextureFromBuffer>(fx.ring,
+				                                                    RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER);
+				CHECK(m.buffer_obj_id == b.rgfxObjId && m.offset == offset && m.bytes_per_row == rows);
+			} else {
+				auto m = expectMessage<RgfxTextureFromBuffer>(fx.ring, RGFX_CMD_TEXTURE_FROM_BUFFER);
+				CHECK(m.buffer_obj_id == b.rgfxObjId && m.offset == offset && m.bytes_per_row == rows);
+			}
+		};
+		for (const bool linear : {false, true}) {
+			// A 2D texture, rows 256 bytes apart: past 4096 bytes, at 16384, inside 20000's
+			// allocation of 32768; past 16384's allocation and past 20000's.
+			answers(4096, rgba(MTLTextureType2D, 17, 1), 0, 256, linear, true);
+			answers(16384, rgba(MTLTextureType2D, 64, 1), 0, 256, linear, true);
+			answers(20000, rgba(MTLTextureType2D, 80, 1), 0, 256, linear, true);
+			answers(16384, rgba(MTLTextureType2D, 65, 1), 0, 256, linear, false);
+			answers(20000, rgba(MTLTextureType2D, 129, 1), 0, 256, linear, false);
+			// A texture buffer of 64 bytes: from 16320 of 16384 bytes, ending at the length, and
+			// from 16352, ending at 16416.
+			answers(16384, texels, 16320, 64, linear, true);
+			answers(16384, texels, 16352, 64, linear, false);
+		}
+		// The linear SPI's 2D array of two slices, each its rows' bytes rounded up to 128 apart: of
+		// 64 x 32 ending at 16384 over 16384 bytes, and of 64 x 33 ending at 16896.
+		answers(16384, rgba(MTLTextureType2DArray, 32, 2), 0, 256, true, true);
+		answers(16384, rgba(MTLTextureType2DArray, 33, 2), 0, 256, true, false);
+		CHECK(ringEmpty(fx.ring));
+	}
+	drainRing(fx.ring);
+}
+
 // A texture over a buffer's bytes of a block-compressed format is nil and posts nothing, by the
 // public form, as the AMD 5300M answers it over a Shared buffer (oracle_texdesc buffer bc1.*,
 // docs/graphics-kext/dgpu-oracle.md, Q24); a plain format's beside it is made.
@@ -19752,6 +19844,7 @@ int main(int argc, char **argv)
 		test_buffer_texture_types_end_the_process();
 		test_compressed_buffer_textures_answer_nil();
 		test_buffer_texture_buffers();
+		test_textures_past_a_buffers_allocation_answer_nil();
 		test_invalid_texture_descriptors_end_the_process();
 		test_texture_descriptor_validation_as_the_x86_macs();
 		test_texture_descriptor_validation_as_an_apple_gpu();
