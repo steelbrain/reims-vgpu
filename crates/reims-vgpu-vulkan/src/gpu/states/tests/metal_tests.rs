@@ -875,7 +875,10 @@ fn refusals_metal_answers_are_its_nserror_codes() {
 /// name's file, with no file opened: the guest's bundle reads the file in its own process and
 /// hands its library in (`DynamicLibrariesDesc::loaded`), here the library made of the exporting
 /// dynamic library's bytes. With none handed in it is code 2
-/// (`refusals_metal_answers_are_its_nserror_codes`).
+/// (`refusals_metal_answers_are_its_nserror_codes`). The importer records the path the build
+/// script wrote the library at, which is where `OUT_DIR` leads: through kache's hermetic run of
+/// the script, a directory in its store that the target directory's `OUT_DIR` links to
+/// (docs/development.md, "Building through kache"), so the name handed in is that path resolved.
 #[test]
 fn a_kernel_links_the_dynamic_library_handed_in_under_its_install_name() {
     use crate::core::platform::values::FullComputePipelineDesc;
@@ -898,7 +901,7 @@ fn a_kernel_links_the_dynamic_library_handed_in_under_its_install_name() {
         .new_function(OnFault::Return, "k_import")
         .unwrap()
         .unwrap();
-    let install_name = dir.join("librefused_link_ext.metallib");
+    let install_name = std::fs::canonicalize(dir.join("librefused_link_ext.metallib")).unwrap();
     let mut desc = FullComputePipelineDesc::new(&kernel);
     desc.libraries
         .loaded
