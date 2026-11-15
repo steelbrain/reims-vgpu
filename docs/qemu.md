@@ -901,6 +901,29 @@ kernel 7.3.1, a Core i9-13900H and Iris Xe graphics):
 - The IOProc ran 390, 472 and 471 times before, its first stream
   restarting, and 458, 471 and 470 times after.
 
+**Measured** with the same guest, given a USB Video Class camera served on
+the host's `vhci_hcd` (1d6b:0102, high speed, YUY2 at 320x240 and 30 fps,
+its streaming interface's alternate settings an isochronous IN endpoint of
+one to three packets of 1024 bytes each microframe, each frame's number
+drawn in its first rows):
+- macOS queues each of the endpoint's TDs that crosses a page as an Isoch
+  TRB with ISP and Chain, then a Normal TRB with ISP and IOC, and a frame's
+  packets end short: the header-only packets between frames, and its last.
+  Before `ae97f3f5`, `qemu-xhci` posted the short packet's event at the
+  Isoch TRB and none for the Normal TRB (`usb_xhci_queue_event`, m3-max-31655).
+  AppleUSBXHCIIsochronousRequest logged `mismatched event TRB` for each later
+  event of the endpoint, its requests never completed, and the stream
+  stopped within about 100 ms: AVCaptureSession gave no frame in any
+  format, on an Iris Xe host (kernel 7.3.1) and with a real high speed
+  camera (5986:1193, MJPEG and YUY2) on the RTX 5080 Laptop host.
+- After, at `1890afed` on homelab-gem10 (kernel 7.3.3, Ryzen 7 7840HS;
+  m3-max-31888), four captures of 4 s each gave 117 to 122 frames, 30 a
+  second, none dropped, on `vmware-svga` and on `reims-graphics-pci` (its
+  Radeon 780M). Of the frames in the device's own format ('yuvs'), 117 of
+  117 and 117 of 118 held their numbers in order, none missed; of the
+  frames macOS converted to '2vuy' and '420v', every one but the first,
+  which was black on both. The guest logged no `mismatched event TRB`.
+
 **Unknown**: a guest's view of a device on a USB 3 port; whether macOS
 guests before 26 drive the controller with 14 ports as with 8.
 
