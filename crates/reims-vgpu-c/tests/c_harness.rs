@@ -1,12 +1,14 @@
 //! Builds `tests/c/harness.c` against the committed `include/reims_vgpu.h`, links it to this
 //! crate's dynamic library, and runs it. The harness uses the platform the library is built on, as
-//! a C host does: `VulkanPlatform`, over MoltenVK on macOS.
+//! a C host does: `VulkanPlatform`, over MoltenVK on macOS. On Windows it links the DLL's import
+//! library.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
+
+use reims_vgpu_vulkan::core::testkit::death::exit_signal;
 
 #[path = "support/cdylib.rs"]
 mod cdylib;
@@ -19,22 +21,28 @@ fn crate_dir() -> PathBuf {
         .expect("CARGO_MANIFEST_DIR: run the tests with cargo or nextest")
 }
 
+/// The C compiler: `cc`, and on Windows `clang`, MSYS2 CLANG64's, the toolchain the library is
+/// built with there.
+const CC: &str = if cfg!(windows) { "clang" } else { "cc" };
+
 /// Compiles `source` into `out`; panics with the compiler's output.
 fn compile(source: &Path, out: &Path) {
     let deps = cdylib::dir();
-    let status = Command::new("cc")
-        .args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic"])
+    let mut cc = Command::new(CC);
+    cc.args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic"])
         .arg("-I")
         .arg(crate_dir().join("include"))
-        .arg(source)
-        .arg("-L")
-        .arg(&deps)
-        .arg("-lreims_vgpu_c")
-        .arg(format!("-Wl,-rpath,{}", deps.display()))
-        .arg("-o")
-        .arg(out)
-        .output()
-        .unwrap();
+        .arg(source);
+    if cfg!(windows) {
+        // The DLL's import library, beside it; the harness finds the DLL on its PATH (`run`).
+        cc.arg(deps.join("libreims_vgpu_c.dll.a"));
+    } else {
+        cc.arg("-L")
+            .arg(&deps)
+            .arg("-lreims_vgpu_c")
+            .arg(format!("-Wl,-rpath,{}", deps.display()));
+    }
+    let status = cc.arg("-o").arg(out).output().unwrap();
     assert!(
         status.status.success(),
         "cc failed:\n{}",
@@ -61,16 +69,29 @@ fn harness(name: &str) -> Harness {
     let dir = std::env::temp_dir().join(format!("rvg-api-harness-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let bin = dir.join("harness");
+    let bin = dir.join(format!("harness{}", std::env::consts::EXE_SUFFIX));
     compile(&crate_dir().join("tests/c/harness.c"), &bin);
     Harness { dir, bin }
+}
+
+/// Runs the harness with `args`. Windows has no rpath: the DLL's directory leads the harness's
+/// PATH, where the loader looks for it.
+fn run(h: &Harness, args: &[&str]) -> Output {
+    let mut command = Command::new(&h.bin);
+    command.args(args);
+    if cfg!(windows) {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let dirs = std::iter::once(cdylib::dir()).chain(std::env::split_paths(&path));
+        command.env("PATH", std::env::join_paths(dirs).unwrap());
+    }
+    command.output().unwrap()
 }
 
 /// The C API from C, end to end on the library's platform — every check of tests/c/harness.c passes
 #[test]
 fn c_harness_passes() {
     let h = harness("run");
-    let out = Command::new(&h.bin).output().unwrap();
+    let out = run(&h, &[]);
     assert!(
         out.status.success(),
         "{}\n{}",
@@ -109,12 +130,13 @@ fn the_dylib_is_found_by_rpath() {
     );
 }
 
-/// A NULL handle given to a function without a status ends the process (SIGABRT)
+/// A NULL handle given to a function without a status ends the process (SIGABRT; on Windows the
+/// fast fail an abort is)
 #[test]
 fn c_harness_null_handle_aborts() {
     let h = harness("die");
-    let out = Command::new(&h.bin).arg("die-null").output().unwrap();
-    assert_eq!(out.status.signal(), Some(6), "{out:?}");
+    let out = run(&h, &["die-null"]);
+    assert_eq!(exit_signal(out.status), Some(6), "{out:?}");
     assert!(!String::from_utf8_lossy(&out.stdout).contains("survived"));
 }
 
@@ -151,7 +173,7 @@ fn header_compiles_as_cxx_and_objc() {
     let include = crate_dir().join("include");
     let objc = cfg!(target_os = "macos").then_some(("objective-c", "-std=c11"));
     for (lang, std) in std::iter::once(("c++", "-std=c++17")).chain(objc) {
-        let out = Command::new("cc")
+        let out = Command::new(CC)
             .args(["-x", lang, std, "-fsyntax-only", "-Wall", "-Werror", "-I"])
             .arg(&include)
             .arg("-")

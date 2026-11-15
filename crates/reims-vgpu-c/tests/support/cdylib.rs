@@ -3,7 +3,8 @@
 use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
 use std::path::{Path, PathBuf};
 
-/// The library's file name: `libreims_vgpu_c.dylib` on macOS, `libreims_vgpu_c.so` on Linux.
+/// The library's file name: `libreims_vgpu_c.dylib` on macOS, `libreims_vgpu_c.so` on Linux,
+/// `reims_vgpu_c.dll` on Windows.
 pub fn file_name() -> String {
     format!("{DLL_PREFIX}reims_vgpu_c{DLL_SUFFIX}")
 }

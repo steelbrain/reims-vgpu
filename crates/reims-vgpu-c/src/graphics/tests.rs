@@ -37,12 +37,35 @@ fn config(callbacks: &RvgGraphicsCallbacks) -> RvgGraphicsDeviceConfig {
     }
 }
 
+/// A doorbell no host has open, and one it has, which the test owns: on Linux and macOS -1 and
+/// stdin's descriptor.
+#[cfg(not(windows))]
+fn doorbells() -> (i32, i32, ()) {
+    (-1, 0, ())
+}
+
+/// [`doorbells`] on Windows: NULL, which names no handle, and a manual-reset event, as QEMU's
+/// EventNotifier makes one, closed with the handle the test keeps.
+#[cfg(windows)]
+fn doorbells() -> (*mut c_void, *mut c_void, std::os::windows::io::OwnedHandle) {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+
+    use windows_sys::Win32::System::Threading::CreateEventW;
+    // SAFETY: a new unnamed manual-reset event, not set.
+    let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+    assert!(!event.is_null(), "{}", std::io::Error::last_os_error());
+    // SAFETY: `CreateEventW` made it, and nothing else owns it.
+    let event = unsafe { OwnedHandle::from_raw_handle(event) };
+    (std::ptr::null_mut(), event.as_raw_handle(), event)
+}
+
 /// A headless device: its region is mapped, its registers answer, a second doorbell or a closed
-/// descriptor is refused, and its table's destroy runs once its threads end after the release
+/// one is refused, and its table's destroy runs once its threads end after the release
 #[test]
 fn a_headless_graphics_device_lives_and_ends() {
     let cb = callbacks();
     let c = config(&cb);
+    let (closed, open, _kept) = doorbells();
     let mut device = std::ptr::null_mut();
     // SAFETY: a live config and out-pointer.
     assert_eq!(
@@ -65,12 +88,12 @@ fn a_headless_graphics_device_lives_and_ends() {
         rvg_graphics_device_reset(device);
         assert_eq!(rvg_graphics_device_mmio_read(device, 0x10), 0);
         assert_eq!(
-            rvg_graphics_device_set_doorbell(device, -1),
+            rvg_graphics_device_set_doorbell(device, closed),
             RVG_ERR_INVALID_ARGUMENT
         );
-        assert_eq!(rvg_graphics_device_set_doorbell(device, 0), RVG_OK);
+        assert_eq!(rvg_graphics_device_set_doorbell(device, open), RVG_OK);
         assert_eq!(
-            rvg_graphics_device_set_doorbell(device, 0),
+            rvg_graphics_device_set_doorbell(device, open),
             RVG_ERR_INVALID_ARGUMENT
         );
     }
@@ -133,7 +156,10 @@ fn refused_graphics_configs() {
         );
         // Files without a map are refused, after the tables are the library's.
         let file = RvgMemoryRangeFile {
+            #[cfg(not(windows))]
             fd: -1,
+            #[cfg(windows)]
+            handle: std::ptr::null_mut(),
             flags: 0,
             offset: 0,
         };

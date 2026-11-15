@@ -31,7 +31,10 @@ reims-vgpu-graphics.workspace = true
 reims-vgpu-vulkan.workspace = true
 # A refusal of a memory map's files.
 log.workspace = true
-# `fstat` and the host's page size, for the files behind a memory map's ranges.
+
+# On Linux and macOS, `fstat` and the host's page size, for the files behind a memory map's
+# ranges (Windows's sections take `windows-sys`, below).
+[target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [target.'cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))'.dependencies]

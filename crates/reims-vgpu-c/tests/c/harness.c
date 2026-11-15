@@ -7,6 +7,8 @@
  *
  * Every rvg_ function the header declares is called at least once (tests/c_harness.rs checks
  * that). The device checks need a GPU the Vulkan platform runs on (over MoltenVK on a Mac).
+ * On Windows the host's doorbell is an event and the guest's RAM a pagefile-backed section, as
+ * QEMU makes them there; elsewhere a pipe and a shared mapping of a file.
  *
  * Usage: harness             run every check; exit 0 on success
  *        harness die-null    a NULL device given to a function without a status (the process
@@ -22,9 +24,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
+#endif
 
 static int failures;
 
@@ -49,11 +56,36 @@ static int failures;
 /* Waits up to 10 s for `*n` to reach `want`: a callback that runs on a library thread. */
 static int wait_for(_Atomic int *n, int want) {
     for (int i = 0; i < 10000 && *n < want; i++) {
+#if defined(_WIN32)
+        Sleep(1);
+#else
         struct timespec ms = {0, 1000000};
         nanosleep(&ms, NULL);
+#endif
     }
     return *n == want;
 }
+
+#if defined(_WIN32)
+/* The host's side of the control ring's doorbell on Windows: QEMU's manual-reset event, which
+ * the device holds a copy of. */
+typedef HANDLE Doorbell;
+
+/* Rings `bell` as QEMU does for the guest's write to the doorbell register: sets the event. */
+static int ring(Doorbell bell) {
+    return SetEvent(bell) != 0;
+}
+#else
+/* The host's side of the control ring's doorbell: a pipe's write side, whose read side the
+ * device holds a copy of. */
+typedef int Doorbell;
+
+/* Rings `bell` as a host does for the guest's write to the doorbell register: 8 bytes, as an
+ * eventfd takes them. */
+static int ring(Doorbell bell) {
+    return write(bell, "\1\0\0\0\0\0\0\0", 8) == 8;
+}
+#endif
 
 static void check_status(void) {
     CHECK(strcmp(rvg_status_message(RVG_OK), "success") == 0);
@@ -126,12 +158,22 @@ static void check_graphics(void) {
     /* FEATURES_HI offers DOORBELL_PAGES, bit 46, where the host maps BAR 4. */
     CHECK((rvg_graphics_device_mmio_read(d, 0x00c) >> 14) & 1);
 
+#if defined(_WIN32)
+    /* NULL names no handle; the device takes a copy of the event, and refuses a second. */
+    Doorbell bell = CreateEventW(NULL, TRUE, FALSE, NULL);
+    CHECK(bell != NULL);
+    CHECK_STATUS(rvg_graphics_device_set_doorbell(d, NULL), RVG_ERR_INVALID_ARGUMENT);
+    CHECK_STATUS(rvg_graphics_device_set_doorbell(d, bell), RVG_OK);
+    CHECK_STATUS(rvg_graphics_device_set_doorbell(d, bell), RVG_ERR_INVALID_ARGUMENT);
+#else
     int doorbell[2];
     CHECK(pipe(doorbell) == 0);
     CHECK_STATUS(rvg_graphics_device_set_doorbell(d, -1), RVG_ERR_INVALID_ARGUMENT);
     CHECK_STATUS(rvg_graphics_device_set_doorbell(d, doorbell[0]), RVG_OK);
     CHECK_STATUS(rvg_graphics_device_set_doorbell(d, doorbell[0]), RVG_ERR_INVALID_ARGUMENT);
     close(doorbell[0]);
+    Doorbell bell = doorbell[1];
+#endif
 
     /* The guest starts the device, arms the completion ring (at 0x10000, its armed word 0xc0
      * in), writes GET_DISPLAYS (type 1, 16 bytes, seqno 1) at the submission ring's data, 256
@@ -142,7 +184,7 @@ static void check_graphics(void) {
     uint32_t command[4] = {1, 16, 1, 0};
     memcpy(region + 256, command, sizeof command);
     atomic_store((_Atomic uint64_t *)(void *)region, 16);
-    CHECK(write(doorbell[1], "\1\0\0\0\0\0\0\0", 8) == 8);
+    CHECK(ring(bell));
     CHECK(wait_for(&graphics_raised, 1));
     /* The completion ring, at 0x10000: DISPLAYS (0x101) answering seqno 1. */
     uint64_t produced = atomic_load((_Atomic uint64_t *)(void *)(region + 0x10000));
@@ -155,7 +197,7 @@ static void check_graphics(void) {
     uint32_t move[8] = {4, 32, 2, 0, 0, 300, 200, 1};
     memcpy(region + 256 + 16, move, sizeof move);
     atomic_store((_Atomic uint64_t *)(void *)region, 48);
-    CHECK(write(doorbell[1], "\1\0\0\0\0\0\0\0", 8) == 8);
+    CHECK(ring(bell));
     CHECK(wait_for(&graphics_moved, 1));
     RvgDisplayCoord at = rvg_graphics_device_cursor_position(d);
     CHECK(at.x == 300 && at.y == 200);
@@ -186,28 +228,101 @@ static void check_graphics(void) {
     at = rvg_graphics_device_cursor_position(d);
     CHECK(at.x == 0 && at.y == 0);
     rvg_graphics_device_release(d);
-    close(doorbell[1]);
+#if defined(_WIN32)
+    CloseHandle(bell);
+#else
+    close(bell);
+#endif
     CHECK(wait_for(&graphics_destroyed, 2));
     rvg_graphics_device_release(NULL);
 }
 
+#if defined(_WIN32)
+/* The file behind a range on Windows, as the header's RvgMemoryRangeFile names it: a section's
+ * handle; NULL for none. */
+typedef HANDLE RamFile;
+#define FILE_OF(entry) ((entry).handle)
+#define NO_FILE NULL
+
+/* `length` bytes of guest RAM as QEMU makes it on Windows, in `*file`: a view of a new
+ * pagefile-backed section; NULL where Windows refuses. */
+static void *ram_map(uint64_t length, RamFile *file) {
+    *file = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE | SEC_COMMIT,
+                               (DWORD)(length >> 32), (DWORD)length, NULL);
+    if (*file == NULL) {
+        return NULL;
+    }
+    return MapViewOfFile(*file, FILE_MAP_ALL_ACCESS, 0, 0, (SIZE_T)length);
+}
+
+static void ram_unmap(void *shared, uint64_t length, RamFile file) {
+    (void)length;
+    UnmapViewOfFile(shared);
+    CloseHandle(file);
+}
+
+/* A handle of the process that names no section: an event, which the refusal closes. */
+static RamFile not_a_file(void) {
+    return CreateEventW(NULL, TRUE, FALSE, NULL);
+}
+
+static void not_a_file_close(RamFile file) {
+    CloseHandle(file);
+}
+#else
+/* The file behind a range, as the header's RvgMemoryRangeFile names it: a descriptor; -1 for
+ * none. */
+typedef int RamFile;
+#define FILE_OF(entry) ((entry).fd)
+#define NO_FILE (-1)
+
+/* `length` bytes of guest RAM as a host maps it, in `*file`: a shared mapping of a new file;
+ * NULL where the host refuses. */
+static void *ram_map(uint64_t length, RamFile *file) {
+    char path[] = "/tmp/rvg-harness-ram.XXXXXX";
+    *file = mkstemp(path);
+    if (*file < 0) {
+        return NULL;
+    }
+    unlink(path);
+    if (ftruncate(*file, (off_t)length) != 0) {
+        return NULL;
+    }
+    void *shared = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, *file, 0);
+    return shared == MAP_FAILED ? NULL : shared;
+}
+
+static void ram_unmap(void *shared, uint64_t length, RamFile file) {
+    munmap(shared, length);
+    close(file);
+}
+
+/* A descriptor the library refuses: one below -1. */
+static RamFile not_a_file(void) {
+    return -2;
+}
+
+static void not_a_file_close(RamFile file) {
+    (void)file;
+}
+#endif
+
 /* The files behind the memory map's ranges: a device over guest RAM that is a shared mapping of
- * a file, named in memory_files, and the refusals of the files, each with its table's one
- * destroy. */
+ * a file (on Windows a view of a section), named in memory_files, and the refusals of the files,
+ * each with its table's one destroy. */
 static _Atomic int files_destroyed;
 
 static void check_memory_files(void) {
     const uint64_t length = 16ull << 20;
-    char path[] = "/tmp/rvg-harness-ram.XXXXXX";
-    int fd = mkstemp(path);
-    CHECK(fd >= 0);
-    unlink(path);
-    CHECK(ftruncate(fd, (off_t)length) == 0);
-    void *shared = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    CHECK(shared != MAP_FAILED);
+    RamFile ram_file;
+    void *shared = ram_map(length, &ram_file);
+    CHECK(shared != NULL);
+    if (!shared) {
+        return;
+    }
     RvgMemoryRange range = {0x40000000ull, length, shared};
     RvgMemoryMap map = {&range, 1};
-    RvgMemoryRangeFile file = {fd, 0, 0};
+    RvgMemoryRangeFile file = {ram_file, 0, 0};
 
     RvgGraphicsCallbacks cb;
     memset(&cb, 0, sizeof cb);
@@ -226,9 +341,11 @@ static void check_memory_files(void) {
     c.memory_map = NULL;
     CHECK_STATUS(rvg_graphics_device_create(&c, &d), RVG_ERR_INVALID_ARGUMENT);
     c.memory_map = &map;
-    file.fd = -2;
+    RamFile refused = not_a_file();
+    FILE_OF(file) = refused;
     CHECK_STATUS(rvg_graphics_device_create(&c, &d), RVG_ERR_INVALID_ARGUMENT);
-    file.fd = fd;
+    not_a_file_close(refused);
+    FILE_OF(file) = ram_file;
     file.flags = 1;
     CHECK_STATUS(rvg_graphics_device_create(&c, &d), RVG_ERR_INVALID_ARGUMENT);
     file.flags = 0;
@@ -242,13 +359,12 @@ static void check_memory_files(void) {
     CHECK(d == (RvgGraphicsDevice *)0x1);
 
     /* A range with no file. */
-    file.fd = -1;
+    FILE_OF(file) = NO_FILE;
     CHECK_STATUS(rvg_graphics_device_create(&c, &d), RVG_OK);
     rvg_graphics_device_release(d);
     CHECK(wait_for(&files_destroyed, 7));
 
-    munmap(shared, length);
-    close(fd);
+    ram_unmap(shared, length, ram_file);
 }
 
 int main(int argc, char **argv) {
