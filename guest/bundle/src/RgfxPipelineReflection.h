@@ -33,6 +33,10 @@
 //     Apple GPU (rgfxAppleGPU, the arm64 guest's device) a constant buffer's is its pointee's too,
 //     but at least 4, the M3 Max's answer (tools/pipeline_reflection_check Apple, macOS 27.0.1),
 //     which differs from an x86 Mac's there and nowhere else a getter reaches;
+//   - a fragment function's input of its tile's imageblock data (`[[imageblock_data]]`, and
+//     `[[imageblock_data(Master)]]`, a view of a master struct) is a binding in its place among the
+//     others, and so, on an Apple GPU, is a kernel's imageblock of an explicit layout, as the M3
+//     Max and the x86 Macs answer them (RgfxPipelineReflection.mm's imageblock);
 //   - a descriptor's buffer is named `vertexBuffer.N` (`stageInBuffer.N` for a compute
 //     pipeline's), N its place among the descriptor's buffers in buffer index order (buffers 1, 4
 //     and 30 are `vertexBuffer.0`, `.1` and `.2`), at its buffer index, of its layout's stride,
@@ -70,8 +74,9 @@
 //   - an argument at a binding index or of a count function constants compute, or under a
 //     predicate, where the function has no value of a constant it needs, or the module's code is
 //     not one the reader follows;
-//   - a binding, member, built-in or type of a kind no x86 Mac's answer was measured for, an
-//     imageblock among them (neither x86 Mac makes a pipeline of one).
+//   - a binding, member, built-in or type of a kind no x86 Mac's answer was measured for, a
+//     kernel's imageblock among them on an x86 Mac's device (neither x86 Mac makes a pipeline of
+//     one), and on an Apple GPU's one of an implicit layout (the M3 Max makes no pipeline of it).
 // Where the module's code is not one the reader follows, an argument the AIR marks used whose only
 // reads are in code the function's constants remove is answered used, where Metal answers it
 // unused (it reflects the specialised code).

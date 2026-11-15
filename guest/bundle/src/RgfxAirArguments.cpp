@@ -2049,6 +2049,12 @@ bool nodeKeys(const Module &m, uint64_t id, unsigned depth,
 			if (i + 1 >= node->ops.size() || !layoutOf(m, node->ops[i + 1], depth + 1, layouts, out.layout))
 				return false;
 			i += 1;
+		} else if (k == "air.imageblock_master" && out.kind == "air.imageblock_data") {
+			// The master struct of the tile's imageblock a fragment function's imageblock data views.
+			if (i + 1 >= node->ops.size() ||
+			    !layoutOf(m, node->ops[i + 1], depth + 1, layouts, out.imageblockMaster))
+				return false;
+			i += 1;
 		} else if (k == "air.arg_type_name" || k == "air.arg_name") {
 			if (!mdText(m, *node, i + 1, k == "air.arg_name" ? out.name : out.typeName))
 				return false;
@@ -2079,6 +2085,15 @@ bool nodeKeys(const Module &m, uint64_t id, unsigned depth,
 				return false;
 			}
 			out.hasRenderTarget = true;
+			i += 1;
+		} else if ((k == "explicit" || k == "implicit") && out.kind == "air.imageblock" &&
+		           out.imageblockLayout.empty()) {
+			out.imageblockLayout = k;
+		} else if (k == "air.imageblock_data_size") {
+			// An imageblock's or a fragment function's imageblock data's size.
+			if (!mdUnsigned(m, *node, i + 1, out.imageblockDataSize))
+				return false;
+			out.hasImageblockDataSize = true;
 			i += 1;
 		} else if (k == "air.raster_order_group" && out.kind == "air.render_target") {
 			// The colour attachment's input's raster order group.

@@ -119,7 +119,10 @@ static bool operator==(const RgfxAirNode &a, const RgfxAirNode &b)
 	       a.indexGlobal == b.indexGlobal && a.countGlobal == b.countGlobal && a.hasRenderTarget == b.hasRenderTarget &&
 	       a.renderTarget == b.renderTarget && a.renderTargetIsGlobal == b.renderTargetIsGlobal &&
 	       a.renderTargetGlobal == b.renderTargetGlobal && a.hasRasterOrderGroup == b.hasRasterOrderGroup &&
-	       a.rasterOrderGroup == b.rasterOrderGroup && a.hasMesh == b.hasMesh && a.meshVertexData == b.meshVertexData &&
+	       a.rasterOrderGroup == b.rasterOrderGroup && a.imageblockLayout == b.imageblockLayout &&
+	       a.hasImageblockDataSize == b.hasImageblockDataSize && a.imageblockDataSize == b.imageblockDataSize &&
+	       sameValue(a.imageblockMaster, b.imageblockMaster) && a.hasMesh == b.hasMesh &&
+	       a.meshVertexData == b.meshVertexData &&
 	       a.meshPrimitiveData == b.meshPrimitiveData && a.meshVertices == b.meshVertices &&
 	       a.meshPrimitives == b.meshPrimitives && a.meshTopology == b.meshTopology &&
 	       a.controlPoints == b.controlPoints;
@@ -1737,6 +1740,31 @@ int main()
 		check(at.kind == "air.render_target" && at.hasRenderTarget && at.renderTargetIsGlobal &&
 		          at.renderTargetGlobal != UINT64_MAX && !at.hasRasterOrderGroup && at.name == "last",
 		      "f_fetch_at: a colour attachment's read at an index kFetchAt computes");
+		// An imageblock of an explicit layout, and a fragment function's input of its imageblock
+		// data: each its size and its layout.
+		const RgfxAirNode block = entriesOf("k_imageblock_explicit").entries.at(0).arguments.at(0);
+		check(block.kind == "air.imageblock" && block.imageblockLayout == "explicit" && block.hasImageblockDataSize &&
+		          block.imageblockDataSize == 8 && block.layout != nullptr && block.layout->size() == 1 &&
+		          block.layout->at(0).name == "v" && block.layout->at(0).typeName == "half4" && !block.hasLocation,
+		      "k_imageblock_explicit: an explicit imageblock of 8 bytes, its Pixel");
+		check(entriesOf("k_imageblock_if").entries.at(0).arguments.at(0).predicate == "kBlocks",
+		      "k_imageblock_if: the imageblock under kBlocks");
+		const RgfxAirNode data = entriesOf("f_imageblock_data").entries.at(0).arguments.at(2);
+		check(data.kind == "air.imageblock_data" && data.hasImageblockDataSize && data.imageblockDataSize == 16 &&
+		          data.layout != nullptr && data.layout->size() == 2 && data.layout->at(1).name == "hi" &&
+		          data.layout->at(1).hasRasterOrderGroup && data.layout->at(1).rasterOrderGroup == 0,
+		      "f_imageblock_data: its imageblock data of 16 bytes, both members in raster order group 0");
+		// Imageblock data that views a master struct: its own layout and the master's, each member
+		// named by its user name, the master's in their raster order groups.
+		const RgfxAirNode view = entriesOf("f_imageblock_master").entries.at(0).arguments.at(2);
+		check(view.kind == "air.imageblock_data" && view.imageblockDataSize == 16 && view.layout != nullptr &&
+		          view.layout->size() == 1 && view.layout->at(0).name == "user(depth)" &&
+		          view.imageblockMaster != nullptr && view.imageblockMaster->size() == 2 &&
+		          view.imageblockMaster->at(1).name == "user(colour)" &&
+		          view.imageblockMaster->at(1).typeName == "half4" && view.imageblockMaster->at(1).offset == 8 &&
+		          view.imageblockMaster->at(1).hasRasterOrderGroup &&
+		          view.imageblockMaster->at(1).rasterOrderGroup == 1,
+		      "f_imageblock_master: a view of 16 bytes of a master of depth and colour");
 		// An argument buffer's struct of members is its first id and its layout, the layout's ids its
 		// own from 0; a C array of members is its node of count 1 and the member's array length.
 		const RgfxAirEntry nested = entriesOf("k_nested").entries.at(0);
@@ -2037,17 +2065,13 @@ int main()
 	// sources) is found by the read the device makes for its kind: an entry point's arguments and
 	// nodes, a visible function's signature, a mesh or object function's nodes. Core Image's
 	// kernels (TYPE 5) and intersection functions get no read. kernel_trunc.metallib, which the
-	// suite's build.sh cuts to 1000 bytes on purpose, has no bitcode for its function. The nodes
-	// of the entry points below do not read: each has an explicit imageblock, an argument of a
-	// kind the node reader does not follow, so each is listed with no nodes and their pipelines
-	// answer no reflection (RgfxPipelineReflectionOf.mm). A fragment function's framebuffer-fetch input (`[[color(0)]]`,
-	// `air.render_target`) reads, so rounding's fetch fragments are not listed.
+	// suite's build.sh cuts to 1000 bytes on purpose, has no bitcode for its function. Every entry
+	// point's nodes read: an explicit imageblock (`air.imageblock_data_size`, mutdec_imageblock's
+	// and slice_write_repro's kernels) and a fragment function's framebuffer-fetch input
+	// (`[[color(0)]]`, `air.render_target`, rounding's fetch fragments) among them, so none is
+	// listed as unread.
 	{
-		const std::vector<std::string> nodesUnread = {
-		    "mutdec_imageblock.metallib mutdec_imageblock",
-		    "slice_write_repro.metallib slice_write",
-		    "slice_write_repro.metallib slice_write_l0",
-		};
+		const std::vector<std::string> nodesUnread = {};
 		size_t unreadNodes = 0;
 		const char *dirs = std::getenv("RGFX_COMMITTED_METALLIBS");
 		check(dirs != nullptr, "RGFX_COMMITTED_METALLIBS names the committed metallibs' directories");

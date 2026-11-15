@@ -24,6 +24,12 @@
 //   c_ab_tables  the same, as an argument buffer's members
 //   c_more_textures  textures of further shapes, sample types and access
 //   c_imageblock an imageblock
+//   c_imageblock_explicit  an imageblock of an explicit layout
+//   c_imageblock_late  the same as the kernel's second argument
+//   c_imageblock_on, c_imageblock_off  the same under kBlocks, true and false
+//   r_imageblock_data  v_buffers and f_imageblock_data, which reads its tile's imageblock data
+//   r_imageblock_master  v_buffers and f_imageblock_master, whose imageblock data views a master
+//                struct
 //   c_atomic_texture  a texture of 64-bit atomics (its library, LIB, is
 //                tools/oracle/oracle_reflection_31.metal's)
 //   r_fetch      v_buffers and f_fetch, which reads its colour attachments (framebuffer fetch)
@@ -419,7 +425,8 @@ int main(int argc, char **argv)
 		                {"k_builtins", "k_builtins"}, {"c_nested", "k_nested"},
 		                {"c_nested_more", "k_nested_more"}, {"c_tables", "k_tables"},
 		                {"c_ab_tables", "k_ab_tables"}, {"c_more_textures", "k_more_textures"},
-		                {"c_imageblock", "k_imageblock"}, {"c_deep_ab", "k_deep_ab"}};
+		                {"c_imageblock", "k_imageblock"}, {"c_deep_ab", "k_deep_ab"},
+		                {"c_imageblock_explicit", "k_imageblock_explicit"}, {"c_imageblock_late", "k_imageblock_late"}};
 		for (const auto &k : kKernels)
 			if (CASE(k.name))
 				computeCase(k.name, Fn{k.kernel, {}}, nil, false);
@@ -428,6 +435,10 @@ int main(int argc, char **argv)
 		                                                  constant(2, MTLDataTypeInt, 5)};
 		if (CASE("c_constants"))
 			computeCase("c_constants", Fn{"k_constants", values}, nil, false);
+		if (CASE("c_imageblock_on"))
+			computeCase("c_imageblock_on", Fn{"k_imageblock_if", {constant(6, MTLDataTypeBool, 1)}}, nil, false);
+		if (CASE("c_imageblock_off"))
+			computeCase("c_imageblock_off", Fn{"k_imageblock_if", {constant(6, MTLDataTypeBool, 0)}}, nil, false);
 		if (only != nullptr && strcmp(only, "c_atomic_texture") == 0)
 			computeCase("c_atomic_texture", Fn{"k_atomic_texture", {}}, nil, false);
 		const std::vector<RgfxFunctionConstant> on = {constant(0, MTLDataTypeBool, 1), constant(1, MTLDataTypeBool, 0),
@@ -467,6 +478,14 @@ int main(int argc, char **argv)
 		const Fn fetchGroup{"f_fetch_group", {}}, fetchAt{"f_fetch_at", {constant(5, MTLDataTypeUInt, 0)}};
 		if (CASE("r_fetch_group"))
 			renderCase("r_fetch_group", Fn{"v_buffers", {}}, &fetchGroup, nil, MTLPixelFormatBGRA8Unorm,
+			           MTLPixelFormatInvalid);
+		const Fn imageblockData{"f_imageblock_data", {}};
+		if (CASE("r_imageblock_data"))
+			renderCase("r_imageblock_data", Fn{"v_buffers", {}}, &imageblockData, nil, MTLPixelFormatBGRA8Unorm,
+			           MTLPixelFormatInvalid);
+		const Fn imageblockMaster{"f_imageblock_master", {}};
+		if (CASE("r_imageblock_master"))
+			renderCase("r_imageblock_master", Fn{"v_buffers", {}}, &imageblockMaster, nil, MTLPixelFormatBGRA8Unorm,
 			           MTLPixelFormatInvalid);
 		if (CASE("r_fetch_at"))
 			renderCase("r_fetch_at", Fn{"v_buffers", {}}, &fetchAt, nil, MTLPixelFormatBGRA8Unorm, MTLPixelFormatInvalid);

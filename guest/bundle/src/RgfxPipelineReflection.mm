@@ -83,6 +83,28 @@ NS_ASSUME_NONNULL_BEGIN
              elementIsIndirectArgumentBuffer:(BOOL)elementIsIndirectArgumentBuffer
                             isConstantBuffer:(BOOL)isConstantBuffer
                                     doRetain:(BOOL)doRetain;
+// An Apple GPU's imageblock and imageblock data arguments' (measured: macOS 27.0.1 on the M3
+// Max, the classes' method lists, `@80@0:8@16Q24Q32B40Q44Q52I60@64B72I76` and
+// `@72@0:8@16Q24Q32B40Q44I52@56B64I68`).
+- (nullable instancetype)initWithName:(NSString *)name
+                                 type:(NSUInteger)type
+                               access:(NSUInteger)access
+                             isActive:(BOOL)isActive
+                                index:(NSUInteger)index
+                                 kind:(NSUInteger)kind
+                             dataSize:(uint32_t)dataSize
+                  masterStructMembers:(nullable id)masterStructMembers
+              aliasImplicitImageBlock:(BOOL)aliasImplicitImageBlock
+  aliasImplicitImageBlockRenderTarget:(uint32_t)aliasImplicitImageBlockRenderTarget;
+- (nullable instancetype)initWithName:(NSString *)name
+                                 type:(NSUInteger)type
+                               access:(NSUInteger)access
+                             isActive:(BOOL)isActive
+                                index:(NSUInteger)index
+                             dataSize:(uint32_t)dataSize
+                  masterStructMembers:(nullable id)masterStructMembers
+              aliasImplicitImageBlock:(BOOL)aliasImplicitImageBlock
+  aliasImplicitImageBlockRenderTarget:(uint32_t)aliasImplicitImageBlockRenderTarget;
 // A struct type's before macOS 12, of no type name (measured: macOS 11.7.11).
 - (nullable instancetype)initWithMembers:(__unsafe_unretained id _Nonnull const *_Nullable)members
                                    count:(NSUInteger)count;
@@ -120,6 +142,11 @@ constexpr NSUInteger kAppleConstantBufferMinAlignment = 4;
 constexpr NSUInteger kDescriptorBufferAlignment = 4;
 // What a vertex function's post-vertex dump stride adds to its outputs' size (the AMD GPU's).
 constexpr uint64_t kPostVertexDumpPadding = 12;
+// An explicit imageblock's kind (imageBlockKind), and the index an imageblock and a fragment
+// function's imageblock data are at, whatever the argument's place (measured: c_imageblock_explicit,
+// c_imageblock_late and r_imageblock_data on the M3 Max under macOS 27.0.1).
+constexpr NSUInteger kExplicitImageblockKind = 1;
+constexpr NSUInteger kImageblockIndex = 0;
 // The print style a vertex pipeline's reflection is of, and a mesh pipeline's.
 constexpr NSUInteger kVertexPrintStyle = 3;
 constexpr NSUInteger kMeshPrintStyle = 26;
@@ -198,6 +225,7 @@ bool usesDescriptorBuffer(const std::string &kind)
 struct Classes {
 	Class type, structType, arrayType, pointerType, textureType, member, binding, bufferBinding, textureBinding,
 	    threadgroupBinding, builtIn, indirectConstant, payload, meshBuiltIn, compute, render;
+	Class imageblock = Nil, imageblockData = Nil; // an Apple GPU's, Nil where missing (no reflection of one)
 	bool legacy = false;      // no binding classes: the bindings are the release's arguments
 	bool namedStructs = true; // the struct type's initialiser takes a type name
 	NSString *missing;        // the first class or initialiser that is not there, or nil
@@ -304,6 +332,20 @@ Classes lookUpClasses(NSDictionary<NSString *, id> *standIns)
 	}
 	find(kBindings, std::size(kBindings)) && find(kArguments, std::size(kArguments)) &&
 	    find(kMeshes, std::size(kMeshes)) && find(kPipelines, std::size(kPipelines));
+	// Only a pipeline of an imageblock needs these: one the release lacks makes no reflection of it.
+	const Needed kImageblocks[] = {
+	    {&c.imageblock, "MTLImageBlockArgument",
+	     @selector(initWithName:type:access:isActive:index:kind:dataSize:masterStructMembers:aliasImplicitImageBlock:
+	                   aliasImplicitImageBlockRenderTarget:)},
+	    {&c.imageblockData, "MTLImageBlockDataArgument",
+	     @selector(initWithName:type:access:isActive:index:dataSize:masterStructMembers:aliasImplicitImageBlock:
+	                   aliasImplicitImageBlockRenderTarget:)},
+	};
+	for (const Needed &n : kImageblocks) {
+		*n.cls = classNamed(standIns, n.name);
+		if (*n.cls != Nil && ![*n.cls instancesRespondToSelector:n.init])
+			*n.cls = Nil;
+	}
 	return c;
 }
 
@@ -999,6 +1041,70 @@ struct Maker {
 		return b;
 	}
 
+	// An Apple GPU's kernel's explicit imageblock (`air.imageblock`), or a fragment function's input
+	// of its tile's imageblock data (`air.imageblock_data`), as Metal answers them (measured:
+	// pipeline_reflection_check's c_imageblock_explicit, c_imageblock_late, c_imageblock_on,
+	// r_imageblock_data and r_imageblock_master, the M3 Max under macOS 27.0.1, and the AMD Radeon
+	// Pro 5300M and the Intel UHD Graphics 630 under macOS 26.7.1): an MTLImageBlockArgument of binding
+	// type 17, kind 1 (explicit), or an MTLImageBlockDataArgument of binding type 16; read-only, at
+	// index 0 wherever the argument is, of the data's size and of its struct's type (a nameless struct
+	// of its members, their raster order groups among them), the data's master struct, where it views
+	// one, its masterStructMembers (a struct of the same form), and aliasing no implicit imageblock
+	// (its render target 0xFFFFFFFF). Neither x86 Mac makes a pipeline of a kernel's imageblock: there
+	// one makes no reflection, as an implicit imageblock does on any GPU (the M3 Max makes no pipeline
+	// of c_imageblock's). Imageblock data is answered on every GPU: the Intel GPU makes both render
+	// cases' pipelines, the AMD GPU r_imageblock_master's and none of r_imageblock_data's (its compiler
+	// dies), and each answers them so.
+	id imageblock(const RgfxAirNode &n)
+	{
+		const bool data = n.kind == "air.imageblock_data";
+		if (!appleGPU && !data) {
+			fail(@"a kernel's imageblock, of which no x86 Mac's Metal makes a pipeline");
+			return nil;
+		}
+		if (!data && n.imageblockLayout != "explicit") {
+			fail(@"an imageblock of an implicit layout was not measured");
+			return nil;
+		}
+		if (!n.hasImageblockDataSize || n.layout == nullptr) {
+			fail(@"an imageblock of no size or struct");
+			return nil;
+		}
+		Class cls = data ? c.imageblockData : c.imageblock;
+		if (cls == Nil) {
+			fail(data ? @"Metal has no MTLImageBlockDataArgument" : @"Metal has no MTLImageBlockArgument");
+			return nil;
+		}
+		id st = structType(*n.layout, false);
+		id master = data && n.imageblockMaster != nullptr ? structType(*n.imageblockMaster, false) : nil;
+		if (st == nil || (n.imageblockMaster != nullptr && master == nil))
+			return nil;
+		NSString *name = @(n.name.c_str());
+		const BOOL used = !n.unused;
+		id b = data ? [make(cls) initWithName:name
+		                                 type:MTLBindingTypeImageblockData
+		                               access:MTLBindingAccessReadOnly
+		                             isActive:used
+		                                index:kImageblockIndex
+		                             dataSize:n.imageblockDataSize
+		                  masterStructMembers:master
+		              aliasImplicitImageBlock:NO
+		  aliasImplicitImageBlockRenderTarget:static_cast<uint32_t>(kNoIndex)]
+		            : [make(cls) initWithName:name
+		                                 type:MTLBindingTypeImageblock
+		                               access:MTLBindingAccessReadOnly
+		                             isActive:used
+		                                index:kImageblockIndex
+		                                 kind:kExplicitImageblockKind
+		                             dataSize:n.imageblockDataSize
+		                  masterStructMembers:nil
+		              aliasImplicitImageBlock:NO
+		  aliasImplicitImageBlockRenderTarget:static_cast<uint32_t>(kNoIndex)];
+		if (b == nil || !setObject(b, "_typeInfo", st))
+			return nil;
+		return argument(b, used);
+	}
+
 	// A built-in argument, or a mesh; nil with `*listed` false for one Metal lists nowhere.
 	id builtIn(const RgfxAirNode &n, bool *listed)
 	{
@@ -1392,6 +1498,15 @@ bool RgfxStageReflectionOfEntry(const RgfxAirEntries &module, const RgfxAirEntry
 	for (const RgfxAirNode &n : nodes) {
 		if (isStageInput(n.kind))
 			continue;
+		if (n.kind == "air.imageblock" || n.kind == "air.imageblock_data") {
+			id b = m.imageblock(n);
+			if (b == nil) {
+				*why = m.why ?: @"Metal's imageblock was not made";
+				return false;
+			}
+			[bindings addObject:b];
+			continue;
+		}
 		const bool resource = n.kind == "air.buffer" || n.kind == "air.indirect_buffer" || n.kind == "air.texture" ||
 		                      n.kind == "air.sampler" || n.kind == "air.payload" || n.kind == "air.constant" ||
 		                      tableType(n.kind);

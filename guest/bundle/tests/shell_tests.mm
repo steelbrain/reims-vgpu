@@ -6717,6 +6717,65 @@ void test_pipeline_reflection_from_air()
 			CHECK([ask(appleMore[6], @"name") isEqualToString:@"oneChar"] &&
 			      number(appleMore[6], @"bufferAlignment") == 4 && number(appleMore[7], @"bufferAlignment") == 4 &&
 			      number(appleMore[8], @"bufferAlignment") == 8);
+		// A kernel's explicit imageblock is a binding in its place, of binding type 17, kind 1, its
+		// data's size and its struct, at index 0 wherever it is (the M3 Max's answer,
+		// tools/pipeline_reflection_check Apple's c_imageblock_explicit and c_imageblock_late); a false
+		// function constant leaves it out; a fragment function's imageblock data is a binding of type
+		// 16 (r_imageblock_data).
+		auto appleFn = [&](NSString *name) { return [appleLib newFunctionWithName:name]; };
+		NSArray *block =
+		    ask(RgfxComputePipelineReflectionOf(appleFn(@"k_imageblock_explicit"), nil, both), @"bindings");
+		CHECK(shape(block) == "block:17 out:2 ");
+		if (block.count == 2) {
+			NSArray *members = [ask(block[0], @"dataTypeDescription") members];
+			CHECK([NSStringFromClass([block[0] class]) isEqualToString:@"MTLImageBlockArgument"] &&
+			      number(block[0], @"imageBlockKind") == 1 && number(block[0], @"imageBlockDataSize") == 8 &&
+			      number(block[0], @"index") == 0 && number(block[0], @"access") == 0 &&
+			      ask(block[0], @"imageBlockMasterStructMembers") == nil &&
+			      !flag(block[0], @"aliasImplicitImageBlock") &&
+			      number(block[0], @"aliasImplicitImageBlockRenderTarget") == 0xFFFFFFFF && members.count == 1 &&
+			      [((MTLStructMember *)members[0]).name isEqualToString:@"v"] &&
+			      ((MTLStructMember *)members[0]).dataType == MTLDataTypeHalf4);
+		}
+		NSArray *late = ask(RgfxComputePipelineReflectionOf(appleFn(@"k_imageblock_late"), nil, both), @"bindings");
+		CHECK(shape(late) == "out:2 block:17 " && late.count == 2 && number(late[1], @"index") == 0);
+		MTLFunctionConstantValues *blocksOff = [MTLFunctionConstantValues new];
+		const bool off = false;
+		[blocksOff setConstantValue:&off type:MTLDataTypeBool withName:@"kBlocks"];
+		NSError *blocksError = nil;
+		id<MTLFunction> unblocked = [appleLib newFunctionWithName:@"k_imageblock_if"
+		                                           constantValues:blocksOff
+		                                                    error:&blocksError];
+		CHECK(shape(ask(RgfxComputePipelineReflectionOf(unblocked, nil, both), @"bindings")) == "out:2 ");
+		id dataReflection =
+		    RgfxRenderPipelineReflectionOf(appleFn(@"v_buffers"), nil, appleFn(@"f_imageblock_data"), both);
+		NSArray *data = ask(dataReflection, @"fragmentBindings");
+		CHECK(shape(data) == "s:16 ");
+		if (data.count == 1) {
+			NSArray *members = [ask(data[0], @"dataTypeDescription") members];
+			CHECK([NSStringFromClass([data[0] class]) isEqualToString:@"MTLImageBlockDataArgument"] &&
+			      number(data[0], @"imageBlockDataSize") == 16 && number(data[0], @"index") == 0 &&
+			      members.count == 2 && ((MTLStructMember *)members[1]).offset == 8);
+		}
+	}
+	// Neither x86 Mac's Metal makes a pipeline of a kernel's imageblock: none is answered. The Intel
+	// GPU makes one of a fragment function's imageblock data, answered as the M3 Max answers it
+	// (r_imageblock_data), and so is ours; the AMD GPU makes none.
+	CHECK(RgfxComputePipelineReflectionOf(fn(@"k_imageblock_explicit"), nil, both) == nil);
+	CHECK(shape(ask(RgfxRenderPipelineReflectionOf(fn(@"v_buffers"), nil, fn(@"f_imageblock_data"), both),
+	                @"fragmentBindings")) == "s:16 ");
+	// A view of a master struct: its master is its imageBlockMasterStructMembers, each member named by
+	// its user name (both x86 Macs make r_imageblock_master).
+	NSArray *view = ask(RgfxRenderPipelineReflectionOf(fn(@"v_buffers"), nil, fn(@"f_imageblock_master"), both),
+	                    @"fragmentBindings");
+	CHECK(shape(view) == "v:16 ");
+	if (view.count == 1) {
+		NSArray *viewMembers = [ask(view[0], @"dataTypeDescription") members];
+		NSArray *masterMembers = [ask(view[0], @"imageBlockMasterStructMembers") members];
+		CHECK(viewMembers.count == 1 && masterMembers.count == 2 &&
+		      [((MTLStructMember *)viewMembers[0]).name isEqualToString:@"user(depth)"] &&
+		      [((MTLStructMember *)masterMembers[1]).name isEqualToString:@"user(colour)"] &&
+		      ((MTLStructMember *)masterMembers[1]).offset == 8);
 	}
 	if (bindings.count == 9) {
 		id params = bindings[1];

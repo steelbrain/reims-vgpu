@@ -537,6 +537,72 @@ kernel void k_imageblock(imageblock<Block, imageblock_layout_implicit> block, de
 	out[0] = block.read(lid).c.x;
 }
 
+// An imageblock of an explicit layout, as Apple GPUs' compute kernels take one, alone and under a
+// function constant; and a fragment function's input of its tile's imageblock data.
+struct Pixel {
+	half4 v;
+};
+
+kernel void k_imageblock_explicit(imageblock<Pixel, imageblock_layout_explicit> block,
+                                  texture2d<half, access::write> out [[texture(0)]],
+                                  ushort2 lid [[thread_position_in_threadgroup]], uint2 gid [[thread_position_in_grid]])
+{
+	block.data(lid)->v = half4(gid.x, gid.y, 0, 1);
+	threadgroup_barrier(mem_flags::mem_threadgroup_imageblock);
+	out.write(block.data(lid ^ ushort2(1))->v, gid);
+}
+
+// The same imageblock as the kernel's second argument, the texture its first.
+kernel void k_imageblock_late(texture2d<half, access::write> out [[texture(1)]],
+                              imageblock<Pixel, imageblock_layout_explicit> block,
+                              ushort2 lid [[thread_position_in_threadgroup]], uint2 gid [[thread_position_in_grid]])
+{
+	block.data(lid)->v = half4(0, gid.y, 0, 1);
+	threadgroup_barrier(mem_flags::mem_threadgroup_imageblock);
+	out.write(block.data(lid ^ ushort2(1, 0))->v, gid);
+}
+
+constant bool kBlocks [[function_constant(6)]];
+
+kernel void k_imageblock_if(imageblock<Pixel, imageblock_layout_explicit> block [[function_constant(kBlocks)]],
+                            texture2d<half, access::write> out [[texture(0)]],
+                            ushort2 lid [[thread_position_in_threadgroup]], uint2 gid [[thread_position_in_grid]])
+{
+	half4 v = half4(1);
+	if (kBlocks) {
+		block.data(lid)->v = half4(gid.x, 0, 0, 1);
+		threadgroup_barrier(mem_flags::mem_threadgroup_imageblock);
+		v = block.data(lid)->v;
+	}
+	out.write(v, gid);
+}
+
+struct Stack {
+	half4 lo [[raster_order_group(0)]];
+	half4 hi [[raster_order_group(0)]];
+};
+
+fragment half4 f_imageblock_data(VertexOut in [[stage_in]], Stack s [[imageblock_data]])
+{
+	return s.lo + s.hi + half4(in.uv.x);
+}
+
+// Imageblock data that views a master struct of the tile's imageblock, its members named by their
+// user names.
+struct Master {
+	half d [[user(depth), raster_order_group(0)]];
+	half4 c [[user(colour), raster_order_group(1)]];
+};
+
+struct DepthView {
+	half d [[user(depth)]];
+};
+
+fragment half4 f_imageblock_master(VertexOut in [[stage_in]], DepthView v [[imageblock_data(Master)]])
+{
+	return half4(v.d) + half4(in.uv.x);
+}
+
 struct Fetched {
 	float4 color [[color(0)]];
 	half4 extra [[color(1)]];

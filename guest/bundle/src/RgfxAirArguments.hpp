@@ -269,6 +269,15 @@ bool rgfxReadAirVisible(const uint8_t *bitcode, size_t size, std::vector<RgfxAir
 //   raster order group g (`[[color(0), raster_order_group(g)]]`; read: Metal's compiler on macOS
 //   27.0.1, tools/oracle/oracle_reflection.metal's f_fetch_at and f_fetch_group, as LLVM's text form
 //   prints them);
+//   `air.imageblock`, as its kind, then its layout (`explicit`, `implicit`): an imageblock (an
+//   Apple GPU's kernel's `imageblock<T, imageblock_layout_explicit>`); `air.imageblock_data`, as
+//   its kind: a fragment function's input of its tile's imageblock data (`[[imageblock_data]]`);
+//   either then `air.imageblock_data_size` n, its data's size in bytes, and its layout as
+//   `air.struct_type_info`; imageblock data that views a master struct
+//   (`[[imageblock_data(Master)]]`) then `air.imageblock_master` and the master's layout, of the
+//   same form (read: Metal's compiler on macOS 27.0.1, tools/oracle/oracle_reflection.metal's
+//   k_imageblock_explicit, k_imageblock_if, f_imageblock_data and f_imageblock_master, as LLVM's
+//   text form prints them);
 //   `air.patch_control_point_input`, as its kind: a post-tessellation vertex function's control
 //   points (its `patch_control_point<T>` stage input, alone or a member of its stage input's
 //   struct), then a node of its control point function (`air.patch_control_point_function` and
@@ -350,6 +359,12 @@ struct RgfxAirNode {
 	bool hasRenderTarget = false, renderTargetIsGlobal = false, hasRasterOrderGroup = false;
 	uint32_t renderTarget = 0, rasterOrderGroup = 0;
 	uint64_t renderTargetGlobal = UINT64_MAX;
+	// `air.imageblock`: its layout's name (`explicit`, `implicit`); `air.imageblock_data_size`: its
+	// data's size in bytes; `air.imageblock_master`: the master struct imageblock data views.
+	std::string imageblockLayout;
+	bool hasImageblockDataSize = false;
+	uint32_t imageblockDataSize = 0;
+	std::shared_ptr<const std::vector<RgfxAirMember>> imageblockMaster;
 	// `air.mesh`: its vertex and primitive data, its vertex and primitive counts and its topology's
 	// name.
 	bool hasMesh = false;
