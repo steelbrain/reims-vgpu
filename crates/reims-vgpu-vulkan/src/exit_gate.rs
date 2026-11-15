@@ -3,7 +3,10 @@
 //!
 //! A process exits (`exit`, or the end of `main`) on one thread, which runs the exit handlers
 //! and the loaded libraries' destructors in the reverse order of their registration, while every
-//! other thread goes on. A call into what a driver's destructors freed ends the process: on the
+//! other thread goes on. On Windows the C library's `exit` and the end of `main` run the exit
+//! handlers too, before the system ends the other threads, but `std::process::exit` is
+//! `ExitProcess` there, which runs none of them: a process that ends through it never runs the
+//! hook (QEMU ends through the C library's). A call into what a driver's destructors freed ends the process: on the
 //! RTX 5080 Laptop GPU (NVIDIA 615.71.09), the awake thread's touches segfaulted 79 times in a
 //! six-minute run of the workspace's tests, in processes whose tests had passed (`crate::awake`),
 //! and test processes ended with `SIGSEGV` inside `libnvidia-glvkspirv.so`, the driver's SPIR-V
@@ -244,6 +247,13 @@ mod tests {
         std::env::var("RVG_EXIT_CHILD").as_deref() == Ok(test)
     }
 
+    unsafe extern "C" {
+        /// The C library's `exit`, which runs the exit handlers, as a host's exit does: what
+        /// `std::process::exit` calls on Unix, where on Windows it calls `ExitProcess`, which runs
+        /// none (the module docs).
+        fn exit(status: i32) -> !;
+    }
+
     /// Writes `line` to standard error at once.
     fn say(line: &str) {
         let _ = writeln!(std::io::stderr(), "{line}");
@@ -285,7 +295,8 @@ mod tests {
                 })
                 .unwrap();
             at_begin.recv().unwrap();
-            std::process::exit(0);
+            // SAFETY: the C library's exit, which never returns.
+            unsafe { exit(0) }
         }
         let out = child(TEST);
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -329,7 +340,8 @@ mod tests {
             EXITED_AT.store(clock.now_mono().as_nanos(), Ordering::SeqCst);
             // The exit runs no destructor: the step stays in progress.
             let _kept = outer;
-            std::process::exit(0);
+            // SAFETY: the C library's exit, which never returns.
+            unsafe { exit(0) }
         }
         for inside in [true, false] {
             let mut command = Command::new(std::env::current_exe().unwrap());
