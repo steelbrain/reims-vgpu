@@ -1038,6 +1038,9 @@ unsafe fn host_memory_noting(
     // once the source returns as a dma-buf of its own, and a region's file, which the table of
     // regions holds weakly, would be that at its first piece from its first page.
     let answered: Mutex<Vec<Arc<std::os::fd::OwnedFd>>> = Mutex::new(Vec::new());
+    // The source's number in the trace's `dmabufsrc` (below): a diagnostic.
+    static SOURCES: AtomicU64 = AtomicU64::new(0);
+    let number = SOURCES.fetch_add(1, Ordering::Relaxed);
     let source: rt::DmaBufSource = Arc::new(move |request: rt::DmaBufRequest| {
         if let Some(asked) = &asked {
             asked.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1076,8 +1079,20 @@ unsafe fn host_memory_noting(
                 return Ok(pieces);
             }
         }
-        match super::dma_buf::of_pages(first, length, granule) {
-            Ok(chunks) => {
+        let began = crate::core::trace::on().then(crate::core::trace::now);
+        let made = super::dma_buf::of_pages_counted(first, length, granule);
+        if let Some(began) = began {
+            // The trace's `dmabufsrc`: the source's number, the request's first byte, length and
+            // granule, whether it takes shared files, the dma-bufs answered (0 where refused),
+            // the runs of file pages they hold, and the nanoseconds the answer took.
+            let (chunks, runs) = made.as_ref().map_or((0, 0), |(c, r)| (c.len().to_u64(), *r));
+            let took = crate::core::trace::now().saturating_sub(began);
+            let shared = u64::from(request.shared_files);
+            let event = [number, first, length, granule, shared, chunks, runs, took];
+            crate::core::trace::event("dmabufsrc", &event);
+        }
+        match made {
+            Ok((chunks, _)) => {
                 log::debug!(
                     "{length:#x} bytes at {first:#x} as {} dma-bufs at a granule of {granule:#x}",
                     chunks.len()

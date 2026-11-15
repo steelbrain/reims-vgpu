@@ -426,6 +426,16 @@ pub(crate) fn fits_pieces(pieces: u64, bytes: u64) -> Result<(), Refusal> {
 /// table, which in order are those bytes ([`add_runs`]), cut into chunks within udmabuf's limits
 /// at multiples of `granule` from `first` (module docs).
 pub(crate) fn of_pages(first: u64, length: u64, granule: u64) -> Result<Vec<DmaBufChunk>, Refusal> {
+    of_pages_counted(first, length, granule).map(|(chunks, _)| chunks)
+}
+
+/// [`of_pages`], and the runs of file pages the chunks hold, the pad's among them: what the
+/// import source's trace event writes (`super::import`'s `host_memory`).
+pub(crate) fn of_pages_counted(
+    first: u64,
+    length: u64,
+    granule: u64,
+) -> Result<(Vec<DmaBufChunk>, u64), Refusal> {
     let page = vm::page_size();
     let mut runs: Vec<Run<Arc<OwnedFd>>> = Vec::new();
     add_runs(&mut runs, first, length)?;
@@ -464,7 +474,7 @@ pub(crate) fn of_pages(first: u64, length: u64, granule: u64) -> Result<Vec<DmaB
             length: chunk.iter().map(|r| r.length).sum(),
         })
     });
-    made.collect()
+    Ok((made.collect::<Result<_, _>>()?, runs.len().to_u64()))
 }
 
 /// A group dma-buf ([`of_group`]): several members' pages back to back in one file, and where
