@@ -20,6 +20,13 @@ libc.workspace = true
 parking_lot.workspace = true
 log.workspace = true
 
-# On Windows: the monotonic clock (the performance counter).
+# On Windows: the monotonic clock (the performance counter) and the region's memory.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_System_Performance"] }
+windows-sys = { workspace = true, features = ["Win32_System_Memory", "Win32_System_Performance"] }
+
+# On Windows, the tests: the process's peak working set.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }

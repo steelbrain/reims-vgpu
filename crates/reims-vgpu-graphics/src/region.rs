@@ -5,11 +5,12 @@
 //! ([`Region::over`]; the Vulkan platform's, which it frees once the runtime holds no import of
 //! its pages: on Linux a shared mapping of a memfd of the library's, which every GPU imports,
 //! RADV through dma-bufs of its pages, and on macOS, or where the host gives no memfd, private
-//! memory of the library's), else private anonymous memory (`mmap` with
-//! `MAP_PRIVATE | MAP_ANONYMOUS`, [`Region::new`]), which its drop unmaps. Either is handed out
-//! zeroed and commits a page only when something first touches it, so a page neither the guest
-//! nor the host has used costs no host memory; a GPU import that pins the region commits what it
-//! pins. The host maps it into the guest once, at the device's start, and it stays mapped, at the
+//! memory of the library's), else memory of its own ([`Region::new`]), which its drop frees:
+//! private anonymous memory on Linux and macOS (`mmap` with `MAP_PRIVATE | MAP_ANONYMOUS`,
+//! `region/unix.rs`), committed private memory on Windows (`VirtualAlloc`, `region/windows.rs`).
+//! Either is handed out zeroed and takes a physical page only when something first touches it, so
+//! a page neither the guest nor the host has used costs no host memory; a GPU import that pins the
+//! region commits what it pins. The host maps it into the guest once, at the device's start, and it stays mapped, at the
 //! same address, until the device's end.
 //!
 //! **Guest writes.** The guest writes the region while the host reads it. The host reads the
@@ -31,6 +32,16 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use parking_lot::Mutex;
 
 use crate::wire::{RgfxSurfaceWriter, RgfxSurfaceWriters};
+
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
+
+#[cfg(unix)]
+use unix as pages;
+#[cfg(windows)]
+use windows as pages;
 
 /// The region's memory.
 pub struct Region {
@@ -72,28 +83,15 @@ impl std::fmt::Debug for Region {
 }
 
 impl Region {
-    /// `len` bytes of private anonymous memory, which read as zero and are committed as they are
-    /// first touched. `None` where the host refuses the mapping, or `len` is 0.
+    /// `len` bytes of memory of its own, which read as zero and take a physical page as each is
+    /// first touched. `None` where the host refuses the memory, or `len` is 0.
     pub fn new(len: usize) -> Option<Region> {
         if len == 0 {
             return None;
         }
-        // SAFETY: a fresh anonymous mapping, at an address the kernel picks.
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        if base == libc::MAP_FAILED {
-            return None;
-        }
+        let base = pages::map(len)?;
         Some(Region {
-            base: base.cast::<u8>(),
+            base,
             len,
             blocks: Mutex::new(BTreeMap::new()),
             memory: None,
@@ -438,10 +436,8 @@ impl Drop for Region {
         match self.memory.take() {
             // The platform's memory, which its holder frees.
             Some(memory) => drop(memory),
-            // SAFETY: the mapping `new` made, which nothing reaches after this.
-            None => unsafe {
-                libc::munmap(self.base.cast(), self.len);
-            },
+            // SAFETY: the memory `new` made, which nothing reaches after this.
+            None => unsafe { pages::unmap(self.base, self.len) },
         }
     }
 }
@@ -492,24 +488,13 @@ mod tests {
         }
         impl Drop for Holder {
             fn drop(&mut self) {
-                // SAFETY: the test's own mapping, which nothing reaches after the region drops.
-                unsafe { libc::munmap(std::ptr::with_exposed_provenance_mut(self.at), self.len) };
+                // SAFETY: the test's own memory, which nothing reaches after the region drops.
+                unsafe { pages::unmap(std::ptr::with_exposed_provenance_mut(self.at), self.len) };
                 self.freed.store(true, Ordering::Relaxed);
             }
         }
         let len = 64 * 1024;
-        // SAFETY: a fresh anonymous mapping, at an address the kernel picks.
-        let at = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(at, libc::MAP_FAILED);
+        let at = pages::map(len).unwrap();
         let freed = Arc::new(AtomicBool::new(false));
         let holder = Holder {
             at: at.expose_provenance(),
@@ -644,30 +629,16 @@ mod tests {
         assert_eq!(region.revoke(0x3_0000), [3]);
     }
 
-    /// The process's peak resident size in bytes: `ru_maxrss` is in bytes on macOS and in KiB
-    /// on Linux.
-    fn peak_resident() -> u64 {
-        // SAFETY: getrusage writes the struct it is given.
-        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-        assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
-        let maxrss = u64::try_from(usage.ru_maxrss).unwrap();
-        if cfg!(target_os = "macos") {
-            maxrss
-        } else {
-            maxrss * 1024
-        }
-    }
-
     /// A region costs host memory only for the pages that are touched: making a 1 GiB one does
     /// not raise the process's peak resident size by anything near its size.
     #[test]
     fn a_region_commits_only_the_pages_that_are_touched() {
         const LEN: usize = 1 << 30;
-        let before = peak_resident();
+        let before = pages::peak_resident();
         let region = Region::new(LEN).unwrap();
         assert!(region.write(0, &[1]));
         assert_eq!(region.read(LEN as u64 - 4096, 4096).unwrap(), vec![0; 4096]);
-        let grown = peak_resident().saturating_sub(before);
+        let grown = pages::peak_resident().saturating_sub(before);
         assert!(
             grown < (LEN as u64) / 4,
             "a 1 GiB region raised the peak by {grown} bytes"
