@@ -57,8 +57,9 @@
 //! RADV takes no pointer to such pages and imports dma-bufs of them (udmabufs, pinned), where it
 //! imports private memory by its pointer as an amdgpu userptr, whose every page amdgpu gets again
 //! at each of the device's submissions, and whose page that compaction moves stalls the next one.
-//! With the mirror in private memory, a Radeon 780M's syncs of a 3648 x 2038 frame took 17.5 ms
-//! from submission to end in a walk, where the sync's work alone took 3.4 ms. NVIDIA's driver
+//! In a walk on a Radeon 780M, a 3648 x 2038 frame and the compositor on an RTX 3090, the syncs
+//! took as long in either memory, 17.7 to 18.2 ms from submission to end at the median, where a
+//! sync's work alone takes 3.4 ms: what holds them there is not the import. NVIDIA's driver
 //! imports the pointer of either. Where the host gives no such file, and on macOS, the mirror is
 //! private memory (`reims_vgpu_vulkan::os::PrivateMemory`), which every GPU imports by its
 //! pointer.
