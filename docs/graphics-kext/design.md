@@ -3289,10 +3289,13 @@ never read, so an upgrade of the library or of its host starts from none. The fi
 format, record size and identity, with their checksum) and 128-byte records,
 each one key's answer or the drop of a key's answer, with its checksum over
 the identity and its bytes; a damaged or foreign file, or one holding an
-answer no create could be given, reads as none and is started again. It
-holds at most 8,192 records (1 MiB), and one past half of that is written
-again at the next open with its newest 2,048 answers, the kext table's size;
-the host keeps the 8 newest files. A refusal is never kept, and a create of a
+answer no create could be given, reads as none and is started again. A
+record is appended when an answer is learnt or dropped, and the kept record
+again at a run's first create of a key an earlier run kept, so an answer is
+as new as the last run that used it. The file holds at most 8,192 records
+(1 MiB), and one past half of that is written again at the next open with its
+newest 2,048 answers, the kext table's size; the host keeps the 8 newest
+files. A refusal is never kept, and a create of a
 kept key that the device refuses or answers with other values drops the kept
 answer, the second a degradation logged once per boot. At its start, once the
 display is listed and before any process can make a pipeline, the kext asks

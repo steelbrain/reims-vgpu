@@ -22,14 +22,18 @@
 //!   `reims-vgpu` in the user's local application data folder on Windows) is a header of
 //!   [`HEADER_BYTES`] (its magic, [`ANSWERS_FORMAT`], the record size, the identity and a
 //!   checksum of them) and then records of [`RECORD_BYTES`] each (kept or dropped, the key, the
-//!   answer and a checksum of them with the identity), appended in the order learnt and never
-//!   rewritten in place. Any record whose checksum or kind does not read, bytes past the last whole
-//!   record, or a header that is not this identity's, and the whole file reads as none and is
-//!   started again: the kext takes what the device hands it, so no damaged or foreign answer
-//!   reaches it. At most [`CAPACITY`] records are appended; past half of them the file is written
-//!   again at its next open with the newest answers kept, a quarter of the capacity at most (the
-//!   2,048 answers the kext's table holds). The newest
-//!   [`KEEP_FILES`] files of the directory are kept, and the rest removed.
+//!   answer and a checksum of them with the identity), appended and never rewritten in place: a
+//!   record of an answer when it is learnt or dropped, and the kept record again at the first
+//!   create of its key in a run that read it from an earlier one. An answer is as new as its key's
+//!   last record, the order the next run reads, so it ages from the last run that used it. Any
+//!   record whose checksum or kind does not read, bytes past the last whole record, or a
+//!   header that is not this identity's, and the whole file reads as none and is started again:
+//!   the kext takes what the device hands it, so no damaged or foreign answer reaches it. At most
+//!   [`CAPACITY`] records are appended; past half of them the file is written again at its next
+//!   open with the newest answers kept, a quarter of the capacity at most (the 2,048 answers the
+//!   kext's table holds). As each run appends a record of each key it uses, a host whose runs each
+//!   use all 2,048 writes its file again at every second open. The newest [`KEEP_FILES`] files of
+//!   the directory are kept, and the rest removed.
 //! - A test build keeps no file ([`KEPT`]): its answers are kept in memory for the device's life
 //!   alone, so no test's pipelines reach a host's later guests.
 
@@ -116,12 +120,15 @@ pub(crate) struct PipelineAnswers {
 struct State {
     /// The identity, where answers are kept in a file.
     identity: Option<[u8; 32]>,
-    /// The answers, each with when it was learnt (the newer the larger).
+    /// The answers, each with its last record's place (the newer the larger).
     kept: HashMap<AnswerKey, (RgfxPipelineReflection, u64)>,
     /// The keys whose answers were dropped for answering otherwise, which this run learns no more.
     unsteady: HashSet<AnswerKey>,
-    /// The next answer's stamp.
+    /// The last stamp given.
     next: u64,
+    /// The last stamp of the records of earlier runs: a key stamped past it was learnt or used in
+    /// this run, and its record appended in it.
+    run_start: u64,
     /// The file, where it is written, and the records it holds.
     file: Option<File>,
     records: usize,
@@ -183,6 +190,7 @@ impl PipelineAnswers {
                 state.kept.remove(&key);
             }
         }
+        state.run_start = state.next;
         // A missing, damaged or foreign file is started again, and one past half its capacity
         // written again with its newest answers: as many as the kext's table holds.
         let rewrite = unread || records > CAPACITY / 2;
@@ -213,7 +221,8 @@ impl PipelineAnswers {
     /// where it was refused. A refusal drops the kept answer. A made answer is kept where none is;
     /// one whose values differ from the kept answer drops it (the platform answers otherwise
     /// under one identity: a degradation, its line once per boot), and the key is kept no more in
-    /// this run.
+    /// this run. One equal to an answer an earlier run kept makes it the newest, in the file too,
+    /// at the first such create in this run.
     pub(crate) fn observe(
         &self,
         key: &AnswerKey,
@@ -228,7 +237,10 @@ impl PipelineAnswers {
                 Observed::Refused
             }
             (None, None) => Observed::Nothing,
-            (Some(answer), Some(kept)) if answer == kept => Observed::Same,
+            (Some(answer), Some(kept)) if answer == kept => {
+                state.renew(key, &answer);
+                Observed::Same
+            }
             (Some(_), Some(_)) => {
                 state.drop_answer(key);
                 state.unsteady.insert(*key);
@@ -253,8 +265,8 @@ impl PipelineAnswers {
         }
     }
 
-    /// The keyed replies of the kept answers, newest first, from the `first`th, at most `most` of
-    /// them, each stamped with `seqno` ([`KEYED_REPLY_BYTES`] each).
+    /// The keyed replies of the kept answers, newest first (the module docs), from the `first`th,
+    /// at most `most` of them, each stamped with `seqno` ([`KEYED_REPLY_BYTES`] each).
     pub(crate) fn replies(&self, first: u32, most: u32, seqno: u64) -> Vec<Vec<u8>> {
         let state = self.state.lock();
         let mut all: Vec<(&AnswerKey, &(RgfxPipelineReflection, u64))> =
@@ -281,6 +293,21 @@ impl PipelineAnswers {
 }
 
 impl State {
+    /// Makes the kept `answer` of `key` the newest, in memory and in the file, where no record of
+    /// it was appended in this run yet.
+    fn renew(&mut self, key: &AnswerKey, answer: &RgfxPipelineReflection) {
+        let run_start = self.run_start;
+        let Some((_, stamp)) = self.kept.get_mut(key) else {
+            return;
+        };
+        if *stamp > run_start {
+            return;
+        }
+        self.next += 1;
+        *stamp = self.next;
+        self.append(KEPT_RECORD, key, answer);
+    }
+
     /// Drops the answer of `key`, in memory and in the file.
     fn drop_answer(&mut self, key: &AnswerKey) {
         if let Some((answer, _)) = self.kept.remove(key) {
@@ -556,6 +583,32 @@ mod tests {
         [n; 32]
     }
 
+    /// The `n`th of many keys, none of them a [`key`].
+    fn many_key(n: usize) -> AnswerKey {
+        let mut k = [0xfe; 32];
+        k[..8].copy_from_slice(&(n as u64).to_le_bytes());
+        k
+    }
+
+    /// The threads of each of `replies`, in their order.
+    fn threads(replies: Vec<Vec<u8>>) -> Vec<u64> {
+        replies
+            .iter()
+            .map(|r| {
+                RgfxPipelineReflection::read_from_prefix(r)
+                    .unwrap()
+                    .0
+                    .max_total_threads_per_threadgroup
+            })
+            .collect()
+    }
+
+    /// The records of the file of [`IDENTITY`] in `dir`.
+    fn records(dir: &Scratch) -> usize {
+        let len = std::fs::metadata(dir.file(&IDENTITY)).unwrap().len() as usize;
+        (len - HEADER_BYTES) / RECORD_BYTES
+    }
+
     /// The files lie in `reims-vgpu-pipeline-answers` in the user's cache directory, beside the
     /// Vulkan platform's shader cache: `~/.cache/reims-vgpu-pipeline-answers` on Linux and macOS
     #[test]
@@ -610,21 +663,94 @@ mod tests {
         for n in 1..=5u8 {
             answers.observe(&key(n), Some(&made(1, 1, u64::from(n))));
         }
-        let threads = |replies: Vec<Vec<u8>>| -> Vec<u64> {
-            replies
-                .iter()
-                .map(|r| {
-                    RgfxPipelineReflection::read_from_prefix(r)
-                        .unwrap()
-                        .0
-                        .max_total_threads_per_threadgroup
-                })
-                .collect()
-        };
         assert_eq!(threads(answers.replies(0, 2, 1)), [5, 4]);
         assert_eq!(threads(answers.replies(2, 2, 1)), [3, 2]);
         assert_eq!(threads(answers.replies(4, 2, 1)), [1]);
         assert!(answers.replies(5, 2, 1).is_empty());
+    }
+
+    /// The answers go newest first by the last run that used each: a run's first create of a key
+    /// an earlier run kept makes its answer the newest, in the file too, so the next run reads the
+    /// same order. A later create of the key in the run, or one of a key the run learnt, appends
+    /// nothing and moves nothing.
+    #[test]
+    fn replies_follow_the_last_run_that_used_each_answer() {
+        let dir = Scratch::new("last-use");
+        let answers = PipelineAnswers::open_in(&dir.0, IDENTITY);
+        for n in 1..=5u8 {
+            answers.observe(&key(n), Some(&made(1, 1, u64::from(n))));
+        }
+        assert_eq!(
+            answers.observe(&key(2), Some(&made(2, 2, 2))),
+            Observed::Same
+        );
+        assert_eq!(threads(answers.replies(0, 8, 1)), [5, 4, 3, 2, 1]);
+        drop(answers);
+        assert_eq!(records(&dir), 5);
+        let answers = PipelineAnswers::open_in(&dir.0, IDENTITY);
+        assert_eq!(threads(answers.replies(0, 8, 1)), [5, 4, 3, 2, 1]);
+        for n in [2, 4, 2] {
+            assert_eq!(
+                answers.observe(&key(n), Some(&made(3, 3, u64::from(n)))),
+                Observed::Same
+            );
+        }
+        assert_eq!(threads(answers.replies(0, 8, 1)), [4, 2, 5, 3, 1]);
+        drop(answers);
+        assert_eq!(records(&dir), 5 + 2);
+        let answers = PipelineAnswers::open_in(&dir.0, IDENTITY);
+        assert_eq!(threads(answers.replies(0, 8, 1)), [4, 2, 5, 3, 1]);
+    }
+
+    /// An answer an earlier run kept and each later run uses stays among the newest: the file
+    /// written again past half its capacity, with more newer answers learnt since it was kept
+    /// than the kext's table holds, still keeps it, as a pipeline a guest makes on every boot.
+    #[test]
+    fn an_answer_used_on_every_run_outlives_newer_answers_at_a_rewrite() {
+        let dir = Scratch::new("every-run");
+        let every_run = key(1);
+        let answers = PipelineAnswers::open_in(&dir.0, IDENTITY);
+        assert_eq!(
+            answers.observe(&every_run, Some(&made(1, 1, 1024))),
+            Observed::New
+        );
+        drop(answers);
+        // Five runs, each using it and then learning 1,000 answers: 5,000 newer than its keeping,
+        // 1,000 newer than its last use, and one record of it a run.
+        let mut n = 0;
+        for _ in 0..5 {
+            let answers = PipelineAnswers::open_in(&dir.0, IDENTITY);
+            assert_eq!(
+                answers.observe(&every_run, Some(&made(2, 7, 1024))),
+                Observed::Same
+            );
+            for _ in 0..1000 {
+                n += 1;
+                answers.observe(&many_key(n), Some(&made(1, 1, 64)));
+            }
+            drop(answers);
+        }
+        const { assert!(5000 > CAPACITY / 4) };
+        assert_eq!(records(&dir), 1 + 5 * 1001);
+        assert!(records(&dir) > CAPACITY / 2);
+        // This open writes the file again with its newest quarter of the capacity.
+        let answers = PipelineAnswers::open_in(&dir.0, IDENTITY);
+        assert_eq!(answers.len(), CAPACITY / 4);
+        let keys: Vec<AnswerKey> = answers
+            .replies(0, CAPACITY as u32, 0)
+            .iter()
+            .map(|r| {
+                let (_, key) = RgfxPipelineReflection::read_from_prefix(r).unwrap();
+                key.try_into().unwrap()
+            })
+            .collect();
+        assert_eq!(keys.iter().position(|k| *k == every_run), Some(1000));
+        drop(answers);
+        assert_eq!(records(&dir), CAPACITY / 4);
+        assert_eq!(
+            PipelineAnswers::open_in(&dir.0, IDENTITY).observe(&every_run, Some(&made(3, 9, 1024))),
+            Observed::Same
+        );
     }
 
     /// A refused create is never kept, and drops the kept answer of its key, in the file too.
