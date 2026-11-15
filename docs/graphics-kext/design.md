@@ -3206,7 +3206,12 @@ reflection at once, its own `gpuResourceID` at the first read, and a refusal
 at the create only where no process's equal create was accepted. Where the
 device refuses a create a kept answer answered, the kext forgets that answer
 (the deferred slot holds the key), so the next equal create of any process
-waits for its own answer and takes the refusal at the create. The kext
+waits for its own answer and takes the refusal at the create. And the kext
+keeps the device's own answer to every create posted so that made a keyed
+pipeline, so a kept answer the device answers otherwise, which only a seed of
+an earlier run can be (below), answers no later create. The create it
+answered keeps the kept values: a state takes its reflection once, and only
+its `gpuResourceID` from its own answer. The kext
 learns only answers the device gave, whose key the host computed, so no
 process can place an answer for another's key; a process naming a key that is
 not its create's only takes a wrong reflection for its own pipeline. The

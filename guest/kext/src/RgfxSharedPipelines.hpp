@@ -18,7 +18,9 @@
 // takes only a free entry, so a full set keeps the newer ones, and ranks below every answer this
 // run learnt or found, the newer seed above the older, so a set full of seeds replaces its oldest.
 // The kext forgets a key's answer where the device refuses a create the kept answer answered
-// (forget), so the next equal create waits for its own.
+// (forget), so the next equal create waits for its own, and keeps the device's own answer to every
+// create it posted without waiting (answered), so a kept answer the device now answers otherwise,
+// a seed of an earlier run among them, gives way to the device's for every later create.
 // Header-only and free of the kernel's headers, so its native test
 // (tests/shared_pipelines_test.cpp) builds it as the kext does.
 //
@@ -98,6 +100,18 @@ public:
 			return true;
 		}
 		return false;
+	}
+
+	// Takes the device's answer to a create posted without waiting, the `length` bytes of `reply`
+	// as learn takes them: where `refusedKey` is not null (the create was posted for that key's
+	// kept answer, and the device did not make its pipeline) the key's answer is forgotten, and
+	// else a made pipeline's keyed answer is kept as learn keeps it.
+	void answered(const uint8_t *reply, uint32_t length, const uint8_t *refusedKey)
+	{
+		if (refusedKey != nullptr)
+			forget(refusedKey);
+		else
+			learn(reply, length);
 	}
 
 	// Forgets the answer kept for `key` (kKeyBytes): true where one was kept.

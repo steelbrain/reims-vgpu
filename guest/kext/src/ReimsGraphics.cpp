@@ -1086,15 +1086,25 @@ bool ReimsGraphics::answerLifecycle(UInt32 type, UInt64 seqno, const volatile UI
 		IOLockWakeup(stateLock, &w.done, true);
 	}
 	// Else a deferred create's (postDeferred), kept for its process to take; its waiters, if any,
-	// look again. One posted for a kept answer whose pipeline the device did not make: the kept
-	// answer is forgotten, so the next equal create waits for its own.
+	// look again. The shared pipelines take the device's own answer (RgfxSharedPipelines::
+	// answered): one posted for a kept answer whose pipeline the device did not make forgets the
+	// kept answer, so the next equal create waits for its own, and a made pipeline's keyed answer
+	// replaces the kept one, so a kept answer the device answers otherwise (a seed of an earlier
+	// run) answers no later create.
 	bool refused = false;
 	UInt8 refusedKey[DeferredAnswers::kKeyBytes];
 	if (!found && deferredAnswers.answer(RgfxMsgHeader{type, size + kHeaderBytes, seqno},
 	                                     payload, size, &refused, refusedKey)) {
 		found = true;
-		if (refused && sharedPipelines)
-			sharedPipelines->forget(refusedKey);
+		if (sharedPipelines) {
+			UInt8 reply[SharedPipelines::kKeyedReplyBytes];
+			RgfxMsgHeader h = {type, size + kHeaderBytes, seqno};
+			UInt32 n = size + kHeaderBytes < sizeof(reply) ? size + kHeaderBytes : sizeof(reply);
+			memcpy(reply, &h, kHeaderBytes);
+			for (UInt32 b = kHeaderBytes; b < n; b++)
+				reply[b] = payload[b - kHeaderBytes];
+			sharedPipelines->answered(reply, n, refused ? refusedKey : nullptr);
+		}
 		IOLockWakeup(stateLock, &deferredAnswers, false);
 	}
 	IOLockUnlock(stateLock);

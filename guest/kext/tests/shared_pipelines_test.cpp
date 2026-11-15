@@ -5,7 +5,9 @@
 // keys replaces the one found or learnt longest ago, so the table never holds more than its size.
 // An answer seeded from an earlier run, handed newest first, takes only a free entry of a key not
 // kept, and ranks below every answer learnt or found since, the newer seed above the older. A
-// forgotten key finds nothing until its answer is learnt again.
+// forgotten key finds nothing until its answer is learnt again. The device's own answer to a create
+// posted without waiting replaces the kept one, a seed's among them, and a refusal of one posted
+// for a kept answer forgets it.
 #include "RgfxSharedPipelines.hpp"
 
 #include <cstdio>
@@ -223,6 +225,34 @@ int main()
 	check(t.seed(reply, kBytes, 0), "d's entry is free: a seed takes it");
 	check(t.forget(d) && t.learn(reply, kBytes) && t.find(d, 1, 1, &out),
 	      "learnt again after its forget");
+
+	// A seed the device answers otherwise: its answer replaces the seed for every later create.
+	t.clear();
+	answerOf(reply, a, 7, 8);
+	check(t.seed(reply, kBytes, 0) && t.find(a, 1, 1, &out) && out.thread_execution_width == 32,
+	      "a seeded");
+	answerOf(reply, a, 50, 51);
+	std::memcpy(&r, reply, sizeof(r));
+	r.thread_execution_width = 64;
+	r.max_total_threads_per_threadgroup = 512;
+	std::memcpy(reply, &r, sizeof(r));
+	t.answered(reply, kBytes, nullptr);
+	check(t.find(a, 52, 53, &out) && out.thread_execution_width == 64 &&
+	          out.max_total_threads_per_threadgroup == 512 && out.header.seqno == 52 &&
+	          out.obj_id == 53 && out.gpu_resource_id == 0,
+	      "the device's answer replaced the seed, as an equal create's");
+	check(t.size() == 1, "one entry");
+	// A refusal of a create posted for a kept answer forgets it; one no key names keeps it.
+	answerOf(reply, a, 54, 55);
+	std::memcpy(&r, reply, sizeof(r));
+	r.status = RGFX_PIPELINE_REFUSED;
+	std::memcpy(reply, &r, sizeof(r));
+	t.answered(reply, kBytes, nullptr);
+	check(t.find(a, 1, 1, &out) && out.thread_execution_width == 64,
+	      "a refusal named by no key forgets nothing and is not kept");
+	t.answered(reply, kBytes, a);
+	check(!t.find(a, 1, 1, &out) && t.size() == 0,
+	      "a refusal of the kept answer's create forgets it");
 
 	std::printf("shared_pipelines_test: %d checks passed\n", checks);
 	return 0;
