@@ -2876,7 +2876,7 @@ mod tests {
         for (shown, at) in [(&surface, quarter), (&srgb, region)] {
             show(shown);
             let mark = log.mark();
-            let _ = draw.encode(&drawable, at).unwrap();
+            let _ = draw.encode(&drawable, at, None).unwrap();
             assert_eq!(count_since(&platform, mark, DRAW), 1);
             assert_eq!(fragment_textures(&platform, mark), [(shown.id(), 0)]);
         }
