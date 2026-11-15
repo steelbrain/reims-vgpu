@@ -1398,8 +1398,9 @@ Descriptor Validation", lists every rule the descriptor breaks, a line each, in 
 both x86 Macs *(class 3)*:
 1. A width, height, depth or array length of 0, or past what the type takes ("has height (2)
    greater than the maximum allowed size of 1."): 16384 a side, 2048 for a 3D texture's sides,
-   one row for the 1D types and a TextureBuffer, one slice for every type but 3D, one element
-   for every type but the arrays, and 2048 for an array.
+   268435456 (2^28) elements for a TextureBuffer's width (below), one row for the 1D types and a
+   TextureBuffer, one slice for every type but 3D, one element for every type but the arrays, and
+   2048 for an array.
 2. A format the device lacks, by number ("has invalid pixelFormat (40)."): Invalid, B5G6R5,
    A1BGR5, ABGR4, sRGB R8 and RG8, the XR10 formats, ASTC, ETC2, EAC, PVRTC, Unspecialized
    (263), the two-plane ones (500), and, on the Intel only, Depth24Unorm_Stencil8 and
@@ -1463,6 +1464,50 @@ the AMD makes one of 16 GiB, just over 4 times its working set, and none of 20 G
 under macOS 27.0.1 answers nil for the 8 TiB and the 128 GiB textures (the smaller ones were not
 asked of it, as its memory is the desktop's).
 
+**Texture buffers** (`oracle_texdesc DEVICE CREATOR --texbuf` and `--tbread`, 11-14, the AMD and
+the Intel under macOS 26.7.1 and the M3 Max under 27.0.1, each step in a child process of its
+own; jobs m3-max-31563, 31564 and 31565). The descriptor was
+`textureBufferDescriptorWithPixelFormat:width:resourceOptions:usage:`, as MoltenVK makes a texel
+buffer view's texture, of R8Sint, RG8Unorm, RGBA8Unorm, RG32Float and RGBA32Float (1 to 16 bytes),
+usage ShaderRead. It was Private at the device's creator and a Private heap's (the heap of the
+texture's bytes, at most `maxBufferLength`), and Shared over a Shared buffer by the public form, at
+offset 0. The rows there were the texture's bytes rounded up to 256, over a buffer of those bytes
+(at most `maxBufferLength`) and over one of 4096 bytes. The widths ran from 16384 to 2^33, and
+each format's largest width made and largest width that does not end the process were bisected
+from 1 to 2^36:
+
+| | AMD | Intel 630 | M3 Max |
+|---|---|---|---|
+| `maxTextureBufferWidth` (SPI) | 268435456 | 268435456 | 268435456 |
+| `minimumTextureBufferAlignmentForPixelFormat:` | the format's bytes | the format's bytes | 16 |
+| up to 2^28 elements, every format and creator | made | made, but nil past 2 GiB at the device's and the heap's (16 bytes past 2^27) | made |
+| 2^28 + 1 elements and more, to 2^33, every format and creator | ends the process at the validation | the same | the same |
+| over a 4096-byte buffer, its texels past the buffer's end | made, to 2^28 R8Sint texels | made | nil past 128 KiB (46626 R8Sint made, 46626 RGBA8Unorm nil) |
+| over a buffer, 16-byte texels, rows of 2^32 bytes (2^28 wide) | made | ends the process (SIGFPE), over either buffer | made |
+| a kernel's reads of elements 0, 1, W / 2, W - 2 and W - 1, R8Sint and RGBA32Sint, 46626 and 2^24 wide, every creator | right | right | right |
+
+So the limit counts elements, not bytes, and it is the device's `maxTextureBufferWidth`. One
+element past it, every creator ends the process with the width line every type gives:
+"MTLTextureDescriptor has width (268435457) greater than the maximum allowed size of
+268435456." *(class 3)*. Below it, the bytes decide as they do for any texture: the Intel's
+device's and heap's creators answer nil past its `maxBufferLength`. A texture buffer over a buffer
+is made with its texels past the buffer's end on the x86 Macs, and is nil past its allocation on
+the M3 *(class 2)*. The Intel's death at rows of 2^32 bytes is a third answer there *(class 2)*.
+
+In a guest (macOS 26.7.2 on our device over the Iris Xe of Raptor Lake-P, which answers
+`maxTextureBufferWidth` 268435456, `maxBufferLength` 4294967296 and
+`minimumTextureBufferAlignmentForPixelFormat:` 16 for each of the five formats), the same cases of
+R8Sint and RGBA8Unorm at each creator, with heaps and buffers of at most 256 MiB and 64 KiB
+(`ORACLE_TB_CAP`): development's set before 11-14 (52caf9a57) ended the process one element past
+16384 at every creator, 46626 included, in the 2D words ("MTLTextureDescriptor has width (16385)
+greater than the maximum allowed size of 16384.", job m3-max-31642). The fixed set (5e75bfa39) makes
+them up to 268435456 elements at every creator, the largest width R8Sint makes and the largest it
+lives at, bisected, and ends the process at every width past it, to 2^35, in the measured words, as
+the x86 Macs do. A kernel reads elements 0, 1, W / 2, W - 2 and W - 1 right, R8Sint 46626 and 2^24
+wide and RGBA32Sint 46626 wide, at every creator (job m3-max-31664, no fatal line). RGBA8Unorm 2^27
+and 2^28 wide answer nil at the heap's and the buffer's creators, past the cap: the heap has no
+room, and the bundle answers nil past a buffer's allocation.
+
 What our stack does:
 - *(class 2)* The device's creator answers nil for a texture of more bytes than the device's
   `maxBufferLength`, every level of every slice and sample, sending nothing
@@ -1470,6 +1515,16 @@ What our stack does:
   and a heap past it. Until 11-07 the bundle sent it, posted, and answered a texture whose
   create the host's platform could refuse for its size: a texture the app held, whose command
   buffers' draws the host would then drop (`refused.rs`).
+- *(class 3)* A texture buffer takes up to `kRgfxMaxTextureBufferWidth` (2^28) elements under the
+  x86 Macs' rules and an Apple GPU's alike, ending the process past it in the measured words. Until
+  11-14 the bundle gave it the 2D limit, 16384, and a guest's MoltenVK died at a texel buffer view
+  46626 elements wide. The host's Vulkan devices take a texel buffer view of at most
+  `maxTexelBufferElements`: 2^29 on RADV (the RX 7900 XTX and both 780Ms, Mesa 26.2.6), 2^28 on
+  NVIDIA's 620.70.06 (the RTX 3090 and 2080) and on the RTX 5080 (metal2vulkan's profile), and 2^27
+  on ANV (the Iris Xe of Raptor Lake-P, Mesa 26.2.6), below Metal's 2^28. On ANV, metal2vulkan
+  refuses a binding of one past 2^27 elements (`TexelBufferTooLarge`), which is metal2vulkan's to
+  carry. Over a buffer, its rules past the buffer's end stay as they were (`rgfxPastAllocation:`,
+  RgfxBuffer.mm), and at rows of 2^32 bytes it takes the AMD's answer, sending the create.
 - *(class 3)* Every texture creator runs one copy of the validation before it sends the host
   anything (`rgfxEndAtInvalidTextureDescriptor`, RgfxTexture.h): the device's, both of a heap's,
   a buffer's public form and its linear and tiled SPI, and the creator over an IOSurface (Q20).
