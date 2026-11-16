@@ -1,0 +1,15 @@
+# Every checkout holds each file's committed bytes, whatever core.autocrlf says. Git for Windows'
+# installer sets core.autocrlf=true, which writes text files out with CRLF line ends where no
+# attribute says otherwise, and the build and its checks read some of them byte for byte:
+# reims-vgpu-vulkan's build script hashes the .metal sources for metallibs/metallibs.toml, the
+# option ROM's and the guest's prebuilt records hash the files they were built from, `cargo xtask
+# header --check` compares the C header with cbindgen's, and reims-ctl embeds the guest's
+# Info.plist files. Text is committed with LF line ends, and checked out with them.
+* text=auto eol=lf
+
+# The committed build outputs and data, which are not text whatever their first bytes look like.
+*.metallib binary
+*.rom binary
+*.xz binary
+*.png binary
+guest/**/Contents/MacOS/* binary
