@@ -81,9 +81,14 @@
 //! limits ([`extent_for`]): during a resize the window's size can be a step behind the
 //! surface's. One the compositor reports out of date or suboptimal is made again at the next
 //! draw. Making a new one waits for the old one's frames to complete, then passes the old one as
-//! `oldSwapchain` and retires it (below). A swapchain the surface refuses for now (it has no
-//! pixels, as a minimized window's may) is tried again at the next draw; only a lost surface, or
-//! the device's recovery (below), ends the swapchain's draws ([`Acquired::Failed`]).
+//! `oldSwapchain` and retires it (below), whether or not the create makes the new one: Vulkan
+//! retires it either way. A make refused before the create (the surface has no pixels for now,
+//! as a minimized window's may, or refuses its capabilities) hands Vulkan nothing, so the old
+//! one stays the current one, stale, and the next draw hands it over: Vulkan refuses a create
+//! with no `oldSwapchain` while the window has a swapchain (`VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`,
+//! read from the specification of `vkCreateSwapchainKHR`). A swapchain the surface refuses for
+//! now is tried again at the next draw ([`remake`]); only a lost surface, or the device's
+//! recovery (below), ends the swapchain's draws ([`Acquired::Failed`]).
 //!
 //! **Retiring one, with no wait on the queue.** A retired swapchain, its images' textures and
 //! their semaphores are destroyed once nothing uses them: its frames' command buffers have
@@ -607,6 +612,80 @@ enum Unmade {
     Asked(Refused),
 }
 
+/// The steps of a remake ([`remake`]), apart from the swapchain, so that their order is tested
+/// without a window system.
+trait Remaking {
+    /// A swapchain.
+    type Chain;
+    /// Takes the current swapchain out, once its frames have completed.
+    fn take_current(&mut self) -> Option<Self::Chain>;
+    /// A new swapchain, with `old` as its `oldSwapchain`.
+    fn make(&mut self, old: Option<&Self::Chain>) -> Result<Self::Chain, Unmade>;
+    /// Retires `chain`: it is destroyed once its presents are complete.
+    fn retire(&mut self, chain: Self::Chain);
+    /// Makes `chain` the current swapchain, stale or not.
+    fn set_current(&mut self, chain: Option<Self::Chain>, stale: bool);
+}
+
+/// Makes the swapchain again (the module doc, "Size"). A make refused before the create leaves
+/// the old swapchain current, stale, since Vulkan was never handed it: retired there, it would
+/// live on as the window's, and every later create, with none to hand over, would be refused
+/// (`VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`). One the create refused, or the wrap of its images,
+/// retired the old one all the same.
+fn remake<R: Remaking>(r: &mut R) -> Result<(), Refused> {
+    let old = r.take_current();
+    match r.make(old.as_ref()) {
+        Ok(chain) => {
+            if let Some(old) = old {
+                r.retire(old);
+            }
+            r.set_current(Some(chain), false);
+            Ok(())
+        }
+        Err(Unmade::Unasked(e)) => {
+            r.set_current(old, true);
+            Err(e)
+        }
+        Err(Unmade::Asked(e)) => {
+            if let Some(old) = old {
+                r.retire(old);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// A remake of `swapchain` at `size` pixels ([`remake`]).
+struct Remake<'a> {
+    /// The swapchain.
+    swapchain: &'a mut Swapchain,
+    /// The window's size in pixels.
+    size: (u64, u64),
+}
+
+impl Remaking for Remake<'_> {
+    type Chain = Chain;
+
+    fn take_current(&mut self) -> Option<Chain> {
+        self.swapchain.retire()
+    }
+
+    fn make(&mut self, old: Option<&Chain>) -> Result<Chain, Unmade> {
+        let old = old.map_or(vk::SwapchainKHR::null(), |c| c.raw);
+        self.swapchain.make(self.size, old)
+    }
+
+    fn retire(&mut self, chain: Chain) {
+        self.swapchain.retired.push(chain);
+        self.swapchain.collect();
+    }
+
+    fn set_current(&mut self, chain: Option<Chain>, stale: bool) {
+        self.swapchain.chain = chain;
+        self.swapchain.stale = stale;
+    }
+}
+
 /// A refusal naming `what` failed with `result`.
 fn refused(what: &str, result: vk::Result) -> Refused {
     Refused(format!("{what}: {result}"))
@@ -1117,37 +1196,13 @@ impl Swapchain {
         chain.images.get(usize::try_from(frame.index).ok()?)
     }
 
-    /// Makes the swapchain again at `size` pixels, after the old one's frames (the module doc).
+    /// Makes the swapchain again at `size` pixels, after the old one's frames (the module doc,
+    /// [`remake`]).
     fn remake(&mut self, size: (u64, u64)) -> Result<(), Refused> {
-        let old = self.retire();
-        let made = self.make(
+        remake(&mut Remake {
+            swapchain: self,
             size,
-            old.as_ref().map_or(vk::SwapchainKHR::null(), |c| c.raw),
-        );
-        match made {
-            Ok(chain) => {
-                self.retired.extend(old);
-                self.collect();
-                self.chain = Some(chain);
-                self.stale = false;
-                Ok(())
-            }
-            // Vulkan was never handed the old swapchain, so it is still the window's: it stays the
-            // current one, stale, and the next remake hands it over as `oldSwapchain`. Retired
-            // here, the next create would pass none while it lives, which Windows refuses
-            // (`VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`) at every draw from then on.
-            Err(Unmade::Unasked(e)) => {
-                self.chain = old;
-                self.stale = true;
-                Err(e)
-            }
-            // A create that refused retired the old swapchain all the same.
-            Err(Unmade::Asked(e)) => {
-                self.retired.extend(old);
-                self.collect();
-                Err(e)
-            }
-        }
+        })
     }
 
     /// Takes the swapchain out once its frames have completed, waiting on nothing else; its
@@ -1837,5 +1892,99 @@ mod tests {
             assert_eq!(taken, answer);
             assert_eq!(asked, [TAKE_NS]);
         }
+    }
+
+    /// A window system as a remake meets it ([`Remaking`]), where nothing tells that a retired
+    /// swapchain's presents are complete (a device without present fences, the window drawing
+    /// nothing new): its swapchains are numbers, and its create keeps Vulkan's rule that a window
+    /// with a swapchain, a retired one included, refuses a create with no `oldSwapchain`
+    #[derive(Default)]
+    struct Window {
+        /// Whether the surface has pixels for now.
+        pixels: bool,
+        /// Whether the create refuses (as for want of memory).
+        refusing: bool,
+        /// The swapchains the window has: made and not destroyed.
+        live: Vec<u32>,
+        /// The current swapchain.
+        current: Option<u32>,
+        /// Whether it is stale.
+        stale: bool,
+        /// The retired swapchains.
+        retired: Vec<u32>,
+        /// Each create's `oldSwapchain`.
+        creates: Vec<Option<u32>>,
+        /// The last swapchain made.
+        made: u32,
+    }
+
+    impl Remaking for Window {
+        type Chain = u32;
+
+        fn take_current(&mut self) -> Option<u32> {
+            self.current.take()
+        }
+
+        fn make(&mut self, old: Option<&u32>) -> Result<u32, Unmade> {
+            if !self.pixels {
+                return Err(Unmade::Unasked(Refused("no pixels for now".to_owned())));
+            }
+            self.creates.push(old.copied());
+            let refusal = if old.is_none() && !self.live.is_empty() {
+                Some(vk::Result::ERROR_NATIVE_WINDOW_IN_USE_KHR)
+            } else {
+                self.refusing
+                    .then_some(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+            };
+            if let Some(result) = refusal {
+                return Err(Unmade::Asked(refused("vkCreateSwapchainKHR", result)));
+            }
+            self.made += 1;
+            self.live.push(self.made);
+            Ok(self.made)
+        }
+
+        fn retire(&mut self, chain: u32) {
+            self.retired.push(chain);
+        }
+
+        fn set_current(&mut self, chain: Option<u32>, stale: bool) {
+            self.current = chain;
+            self.stale = stale;
+        }
+    }
+
+    /// A window whose first swapchain is made, its surface with pixels.
+    fn window() -> Window {
+        let mut w = Window {
+            pixels: true,
+            ..Window::default()
+        };
+        assert_eq!(remake(&mut w), Ok(()));
+        assert_eq!((w.current, &w.creates[..]), (Some(1), &[None][..]));
+        w
+    }
+
+    /// A make refused before the create (a surface with no pixels for now) keeps the old
+    /// swapchain current and stale, so the next make hands it over as `oldSwapchain`: retired
+    /// there, it stayed the window's, and every later create, with none to hand over, was refused
+    /// (`VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`), the window keeping its last frame for good
+    #[test]
+    fn a_make_refused_before_the_create_keeps_the_old_swapchain_to_hand_over() {
+        let mut w = window();
+        w.pixels = false;
+        for _ in 0..3 {
+            assert!(remake(&mut w).is_err());
+            assert_eq!((w.current, w.stale), (Some(1), true));
+            assert!(w.retired.is_empty());
+        }
+        assert_eq!(w.creates, [None], "no create was asked");
+        w.pixels = true;
+        assert_eq!(remake(&mut w), Ok(()));
+        assert_eq!(w.creates, [None, Some(1)]);
+        assert_eq!(
+            (w.current, w.stale, &w.retired[..]),
+            (Some(2), false, &[1][..])
+        );
     }
 }
