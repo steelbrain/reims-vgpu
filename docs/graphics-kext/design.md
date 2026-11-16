@@ -2033,6 +2033,12 @@ only where no negotiation can carry it.
   it beside the two, only on a device of two displays or more, and carries
   the pointer past an edge only for a guest that took all three. The x86-64
   kext takes it; the arm64e kext and the firmware drivers do not.
+- Bit 51, `FEATURES_HI`'s bit 19, is `POINTER_MOTION`: the guest publishes a
+  mouse of its own, which the event `POINTER_MOTION` drives, and the host's
+  captured pointer drives it while the guest hides its cursor ("A pointer for
+  games", below). The device offers it where the host made it with a window,
+  on a device of one display as of several, and sends the event only to a
+  guest that took it. Both kexts take it; the firmware drivers do not.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -2753,6 +2759,7 @@ stage 2.
 | 0x102 | `DISPLAY_CHANGED` | display u32; the guest asks `GET_DISPLAYS` again |
 | 0x103 | `VBLANK` | display u32, count u64, host time in ns u64 |
 | 0x104 | `POINTER_OVER` | display u32, x i32, y i32, buttons u32 (`RGFX_POINTER_BUTTON_*`); only to a guest that took `POINTER_OVER` |
+| 0x105 | `POINTER_MOTION` | dx i32, dy i32 (right, down), wheel i32 (notches up), buttons u32 (`RGFX_POINTER_BUTTON_*`, held after it); only to a guest that took `POINTER_MOTION` |
 
 **Display.** The modes offered are the host window's size, its width rounded
 down to a multiple of 16 pixels and its height to even, and its screen's
@@ -3488,6 +3495,70 @@ displays get `VBLANK`s, the cursor shows on the display it is on, no
 `reims-vgpu: fatal` line is logged, and the boot's usual checks pass; one at
 `displays` 1 passes the usual checks with the feature words of a boot before
 the change.
+
+## A pointer for games
+
+A VM's pointer is QEMU's USB tablet: absolute, a position in the display's
+range. Captured, the host's pointer is held over the window's image, and the
+tablet at the image's edge (features.md, "Pointer"). A game that hides the
+cursor and turns its camera by the mouse's motion (a cursor disassociated
+from the mouse, `CGAssociateMouseAndMouseCursorPosition(false)`, read
+through NSEvent's or CGEvent's deltas, an event tap, or GCMouse) gets no
+motion once the tablet reaches the edge: the tablet stays where it is.
+Measured (lane gamemouse, potluck job m3-max-35167, x86-64 26.7.2 on a
+780M, a probe app of our own pushing right in ten chunks of 200 counts): all
+four sources gave +669 points over the first four chunks and exactly 0 over
+the next six, the tablet at the last column; GCMouse listed one mouse, the
+tablet. So the guest gets a mouse of its own, whose motion has no edge:
+- **The guest's mouse.** A guest that took `POINTER_MOTION` publishes a
+  mouse: the kext's `RgfxPointerDevice` (`guest/kext/src`), an IOHIDDevice
+  named "Reims vGPU Mouse" by "Reims vGPU", vendor 0x1234 and product 0x5247
+  (the device's own PCI IDs), a report of five buttons,
+  16-bit relative X and Y and an 8-bit wheel (`RgfxPointerMotion.hpp`), with
+  no resolution of its own. IOHIDFamily's event driver makes it a mouse for
+  WindowServer, NSEvent, CGEvent, event taps, GCMouse and IOHIDManager. Display
+  0's driver starts it once its own start is done, only where the guest took
+  the bit, so a guest without it sees no new device, and stops it at its stop.
+  Each `POINTER_MOTION` (0x105, `RgfxPointerMotion`) becomes one report, or
+  several where its motion or wheel passes a report's range, the buttons in
+  each.
+- **The device.** The device tracks the guest's cursor on each display from
+  `MOVE_CURSOR`'s `visible`: the cursor is hidden while no display the guest
+  has moved it on shows it, counted from the hide that made it so
+  (`PointerLink::cursor_hidden_for`, `None` for a guest that did not take the
+  bit). A window's motion (`PointerLink::motion`) is owed as a
+  `POINTER_MOTION` and posted at once; while the completion ring is held,
+  full or behind answers handed over, the owed wait in order for the next
+  refresh, a motion of the same buttons joining the last owed and a change of
+  buttons owed after it, so a press or a release is never merged into a move;
+  past 64 owed, the last takes the new buttons. A reset forgets the hidden
+  cursor and the owed motion.
+- **The window.** Captured, once the guest's cursor has stayed hidden for 50
+  ms (`reims_vgpu_window::game::SETTLE_NS`: past WindowServer's dozen hides
+  and shows as it starts, and the hide and show of the cursor crossing
+  displays), the window's next move locks the host's pointer where it is and
+  hands its motion to the guest's mouse in the device's own counts,
+  unaccelerated, so the guest accelerates it once, as its mouse settings say:
+  SDL's relative mode with `SDL_MOUSE_RELATIVE_SYSTEM_SCALE` 0 on Linux, and
+  on macOS `CGAssociateMouseAndMouseCursorPosition(false)` with the events'
+  `kCGEventUnacceleratedPointerMovementX` and `Y`. Buttons pressed meanwhile
+  and a mouse wheel's notches go to the guest's mouse too. At the guest's next
+  show of its cursor (the game's menu, or a move after typing hid it, where
+  the guest shows the cursor where its mouse moved it), the pointer is the
+  tablet's again, the host's pointer let go over the guest's cursor where it
+  shows on the window's display, else where it was held; releasing capture,
+  losing the keyboard and closing let it go where it was held. A button comes
+  up by the route it went down by, the tablet or the guest's mouse, so one
+  held across either switch never stays down. On a device of several
+  displays, a pointer gone past a shared edge ("A drag across displays")
+  drives the guest's mouse from there once the guest hides its cursor.
+- **Compatibility.** Nothing changes on the C API, in QEMU or in reims-ctl:
+  the tablet stays the guest's pointer, and the guest's mouse rides the
+  device. A guest that did not take `POINTER_MOTION` (a kext built before it,
+  the option ROM, Ambrosia's module) publishes no mouse and is sent no
+  event, its hidden cursor drives nothing, and the window's pointer is the
+  tablet's only, as before. A kext that does not know the event passes over
+  it (`handleEvent`'s default).
 
 ## Stage 3 wire protocol: the Metal-call stream
 
