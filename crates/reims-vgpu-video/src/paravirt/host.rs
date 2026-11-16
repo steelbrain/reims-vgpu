@@ -1,9 +1,15 @@
 //! The host's side of the guest's messages: what each is answered with, and what the host sends
 //! the guest for it.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::core::fourcc::FourCc;
+use crate::core::runtime::Runtime;
+use crate::core::sync::Mutex;
+use crate::paravirt::decoder::{Backend, LentSurface, Link, Session, surface_release};
 use crate::paravirt::lists::{self, MotionEstimationAnswer};
-use crate::paravirt::message::{Message, read_header};
+use crate::paravirt::message::{GuestUuid, Message, read_header};
 use crate::paravirt::names::{self, HostMessage};
 use crate::paravirt::status::{self, OsStatus};
 
@@ -23,6 +29,13 @@ impl Codec {
             Self::H264 => *b"avc1",
             Self::Hevc => *b"hvc1",
         })
+    }
+
+    /// The codec the CoreMedia codec type `fourcc` names, where the host decodes it.
+    pub fn from_fourcc(fourcc: FourCc) -> Option<Self> {
+        [Self::H264, Self::Hevc]
+            .into_iter()
+            .find(|codec| codec.fourcc() == fourcc)
     }
 }
 
@@ -65,17 +78,48 @@ impl Answer {
     }
 }
 
-/// The host's side: the decoders the host's video arm runs, and the answers the module doc of
-/// [`crate::paravirt`] lists. It keeps no session.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// The host's side: the decoders the host's video arm runs, the answers the module doc of
+/// [`crate::paravirt`] lists, and the decoder sessions, by UUID, where it has a backend
+/// ([`Host::with_backend`]).
+#[derive(Default)]
 pub struct Host {
     decoders: Vec<Decoder>,
+    /// The backend the sessions decode on, and the runtime their threads run on; none refuses
+    /// every create.
+    backend: Option<(Arc<dyn Backend>, Arc<dyn Runtime>)>,
+    sessions: Mutex<HashMap<GuestUuid, Session>>,
+}
+
+impl std::fmt::Debug for Host {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Host")
+            .field("decoders", &self.decoders)
+            .field("backend", &self.backend.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Host {
-    /// A host whose decoder list holds `decoders`.
+    /// A host whose decoder list holds `decoders`, and which opens no session.
     pub fn new(decoders: Vec<Decoder>) -> Self {
-        Self { decoders }
+        Self {
+            decoders,
+            ..Self::default()
+        }
+    }
+
+    /// A host whose decoder list holds `decoders`, each of whose sessions decodes on `backend`,
+    /// on a thread of `runtime`'s.
+    pub fn with_backend(
+        decoders: Vec<Decoder>,
+        backend: Arc<dyn Backend>,
+        runtime: Arc<dyn Runtime>,
+    ) -> Self {
+        Self {
+            decoders,
+            backend: Some((backend, runtime)),
+            sessions: Mutex::default(),
+        }
     }
 
     /// The decoders the list holds.
@@ -83,12 +127,46 @@ impl Host {
         &self.decoders
     }
 
-    /// Answers the guest's message `bytes`, as the kext took it from its client: a message that
-    /// does not read is malformed, and one for a session is answered as for a UUID with none.
+    /// [`Self::deliver_lending`] of a message that lends nothing, with no link for sessions.
     pub fn deliver(&self, bytes: &[u8]) -> Answer {
-        if let Err(error) = read_header(bytes, 0) {
-            return Answer::status(error.status());
+        self.deliver_lending(bytes, Vec::new(), None)
+    }
+
+    /// Answers the guest's message `bytes`, as the kext took it from its client, with the
+    /// surfaces it lent and the link the host's later messages go on: a message that does not
+    /// read is malformed, one for a session goes to it (noErr, its replies sent on the link
+    /// later), and one for a UUID with none is answered so. A surface lent with a message that
+    /// keeps none is let go of at once.
+    pub fn deliver_lending(
+        &self,
+        bytes: &[u8],
+        surfaces: Vec<Arc<dyn LentSurface>>,
+        link: Option<Arc<dyn Link>>,
+    ) -> Answer {
+        let header = match read_header(bytes, 0).and_then(|_| Message::parse(bytes)) {
+            Ok(message) => message.header(),
+            Err(error) => {
+                let_go(link.as_deref(), &surfaces);
+                return Answer::status(error.status());
+            }
+        };
+        if HostMessage::from_fourcc(header.message_type).is_none() {
+            // Under the sessions' lock: a session's deliver queues the message or hands the reply
+            // over, and waits for nothing.
+            let sessions = self.sessions.lock();
+            if let Some(session) = sessions.get(&header.guest_uuid) {
+                return Answer::status(session.deliver(&header, bytes, surfaces, link));
+            }
+            drop(sessions);
+            let_go(link.as_deref(), &surfaces);
+            return Answer::status(status::SESSION_NOT_FOUND);
         }
+        let_go(link.as_deref(), &surfaces);
+        self.answer(bytes, link)
+    }
+
+    /// Answers a message the host answers itself.
+    fn answer(&self, bytes: &[u8], link: Option<Arc<dyn Link>>) -> Answer {
         let message = match Message::parse(bytes) {
             Ok(message) => message,
             Err(error) => return Answer::status(error.status()),
@@ -117,12 +195,12 @@ impl Host {
                 // Apple's create reads them.
                 match (message.s32(names::CODEC), message.u32(names::VERSION)) {
                     (Ok(Some(codec)), Ok(_)) if codec != 0 => {
-                        let refused = if kind == HostMessage::CreateDecoder {
-                            status::COULD_NOT_FIND_VIDEO_DECODER
+                        let status = if kind == HostMessage::CreateDecoder {
+                            self.create_decoder(header.guest_uuid, codec, link)
                         } else {
                             status::COULD_NOT_FIND_VIDEO_ENCODER
                         };
-                        Answer::reply(lists::create_reply(&message, refused))
+                        Answer::reply(lists::create_reply(&message, status))
                     }
                     (Err(error), _) | (_, Err(error)) => Answer::status(error.status()),
                     _ => Answer::status(status::MALFORMED_MESSAGE),
@@ -135,12 +213,62 @@ impl Host {
                 )),
                 Err(error) => Answer::status(error.status()),
             },
-            // The host keeps no session, so a close finds none to end.
-            HostMessage::Destroy => Answer::status(status::NO_ERROR),
+            // `-all` ends every session, any other close the one of its UUID, where there is
+            // one.
+            HostMessage::Destroy => {
+                let ended = if header.message_type == FourCc::new(*b"-all") {
+                    std::mem::take(&mut *self.sessions.lock())
+                        .into_values()
+                        .collect()
+                } else {
+                    self.sessions
+                        .lock()
+                        .remove(&header.guest_uuid)
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                };
+                drop(ended);
+                Answer::status(status::NO_ERROR)
+            }
             HostMessage::Jpeg => {
                 Answer::reply(lists::jpeg_reply(&message, status::NO_JPEG_HARDWARE))
             }
         }
+    }
+
+    /// Opens a decoder session of the codec type `codec` for `uuid`, replacing one it had: noErr,
+    /// or kVTCouldNotFindVideoDecoderErr where the host has no backend or no decoder of it.
+    fn create_decoder(&self, uuid: GuestUuid, codec: i32, link: Option<Arc<dyn Link>>) -> OsStatus {
+        let codec = Codec::from_fourcc(FourCc(u32::from_be_bytes(codec.to_be_bytes())))
+            .filter(|codec| self.decoders.iter().any(|d| d.codec == *codec));
+        let (Some(codec), Some((backend, runtime))) = (codec, &self.backend) else {
+            return status::COULD_NOT_FIND_VIDEO_DECODER;
+        };
+        match Session::start(uuid, codec, Arc::clone(backend), Arc::clone(runtime), link) {
+            Ok(session) => {
+                let replaced = self.sessions.lock().insert(uuid, session);
+                drop(replaced);
+                status::NO_ERROR
+            }
+            Err(error) => {
+                log::warn!("hardware video: a decoder session's thread did not start: {error}");
+                status::COULD_NOT_FIND_VIDEO_DECODER
+            }
+        }
+    }
+}
+
+/// Lets go of `surfaces` on `link`: a `rels` of their IDs, where there are any.
+fn let_go(link: Option<&dyn Link>, surfaces: &[Arc<dyn LentSurface>]) {
+    if surfaces.is_empty() {
+        return;
+    }
+    let ids: Vec<u64> = surfaces.iter().map(|surface| surface.id()).collect();
+    if !link.is_some_and(|link| link.send(&surface_release(&ids))) {
+        log::warn!(
+            "hardware video: a release of {} lent surfaces was not sent",
+            ids.len()
+        );
     }
 }
 

@@ -2,12 +2,14 @@
 //! 17): the `vtpv` messages an arm64 guest's VideoToolbox sends its host, which the arm64e kext
 //! carries to the device as `VT_MESSAGE`s, and the host's answers.
 //!
-//! - [`atom`] and [`message`] read and write the messages, and [`plist`] writes the property
-//!   lists they carry.
+//! - [`atom`] and [`message`] read and write the messages, [`plist`] the property lists they
+//!   carry, and [`image_description`] and [`sample_buffer`] the format descriptions and samples a
+//!   decoder session's carry.
 //! - [`Host`] answers them: the decoder list (`decs`) and a decoder's capabilities (`dcap`) from
 //!   the decoders the host's video arm runs ([`Decoder`]), no encoder (`encs`) and no
-//!   motion-estimation processor (`meps`), a create of any session refused, as for a codec the
-//!   host lacks, and its close taken.
+//!   motion-estimation processor (`meps`). A decoder create (`+dec`) of a codec the list holds
+//!   opens a session ([`decoder`]) where the host has a [`Backend`] to decode on; any other
+//!   create is refused, as for a codec the host lacks. A close ends its session.
 //! - [`status`] is the statuses the guest sees.
 
 // The library's lint set, as `core`'s: no unsafe code, no indexing that can panic, and no silent
@@ -25,13 +27,18 @@
 )]
 
 pub mod atom;
+pub mod decoder;
 mod host;
+pub mod image_description;
+mod known_keys;
 mod lists;
 pub mod message;
 mod names;
 pub mod plist;
+pub mod sample_buffer;
 pub mod status;
 
+pub use decoder::{Backend, BackendDecoder, Decoded, DecoderConfig, LentSurface, Link};
 pub use host::{Answer, Codec, Decoder, Host};
 
 /// Why guest bytes could not be read.
