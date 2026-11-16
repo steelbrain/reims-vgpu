@@ -5,8 +5,9 @@
 //! - the SFR manifest, from the erase identity: iSCPreboot's `/SFR/current/apticket.der`, the
 //!   ticket the restore OS itself boots with;
 //! - the Cryptex1 ticket, for the OS, app and Rosetta cryptexes: Preboot's
-//!   `/<G>/cryptex1/current/apticket.vma2macosap.<ECID>.im4m`, whose signature and UDID the
-//!   guest's kernel checks at every boot. Its unpersonalized sibling beside it,
+//!   `/<G>/cryptex1/current/apticket.vma2macosap.<ECID>.im4m` (`plan::personalized_ticket`),
+//!   whose signature and UDID the guest's kernel checks at every boot. Its unpersonalized sibling
+//!   beside it,
 //!   `apticket.vma2macosap.im4m`, is not TSS's: it is the IPSW's
 //!   `Firmware/Manifests/restore/cryptex1/macOS Customer/apticket.vma2macosap.im4m` as it is
 //!   (the same bytes on 27.2.1);

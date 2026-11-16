@@ -89,7 +89,9 @@ case-insensitive. A fresh restore has these, in this order **[vz]**:
       boot manifest, except `root_hash.img4`, whose IM4P is ours ("The system volume's seal");
     - `cryptex1/current/`: the cryptexes' images (`os.dmg`, its clone `os.clone.dmg`, `app.dmg`
       and, where the build has it, `rosetta.dmg`) with their `.root_hash` and `.trustcache`, the
-      Cryptex1 ticket (`apticket.vma2macosap.<ECID>.im4m`), the IPSW's unpersonalized one beside
+      Cryptex1 ticket (`apticket.vma2macosap.<ECID>.im4m`, the ECID in upper-case hex with no
+      leading zeros, the name the guest looks for: a padded name stops its boot at "missing
+      personalized manifest in full security" **[measured]**), the IPSW's unpersonalized one beside
       it, `BuildManifest.plist`, `RestoreVersion.plist` and `SystemVersion.plist`;
     - `restore/`: the restore bundle, `BuildManifest.plist`, both tickets, the restore kernel,
       device tree and iBoot IM4Ps, the images' `.root_hash` and `.trustcache`, the

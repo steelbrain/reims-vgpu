@@ -184,6 +184,15 @@ pub fn eacs_cookie(group: Uuid, store: Uuid) -> Arc<[u8]> {
     xml_plist::to_xml(&Value::Dictionary(d)).into()
 }
 
+/// The name of a personalized ticket in Preboot's `cryptex1/current` and `restore`: the ECID in
+/// upper-case hex with no leading zeros. The guest looks for that name and doesn't boot without
+/// it: for ECID 0x094757D0A5F45ECD, "object not present: name =
+/// apticket.vma2macosap.94757D0A5F45ECD.im4m", then "missing personalized manifest in full
+/// security" and a recovery boot **[measured, 14.6.1]**.
+pub fn personalized_ticket(ecid: u64) -> String {
+    format!("apticket.vma2macosap.{ecid:X}.im4m")
+}
+
 /// SHA-384 in upper-case hex: the name of a boot directory, from its manifest.
 pub fn hash_name(manifest: &[u8]) -> String {
     img4::sha384(manifest)
@@ -508,7 +517,7 @@ pub fn plan(i: &Inputs<'_>) -> Result<Plan> {
         }
     }
     pb.bytes(
-        &format!("{cx}/apticket.vma2macosap.{:016X}.im4m", i.ecid),
+        &format!("{cx}/{}", personalized_ticket(i.ecid)),
         &i.cryptex1_ticket,
         0o666,
     );
@@ -539,7 +548,7 @@ pub fn plan(i: &Inputs<'_>) -> Result<Plan> {
         0o666,
     );
     pb.bytes(
-        &format!("{rs}/apticket.vma2macosap.{:016X}.im4m", i.ecid),
+        &format!("{rs}/{}", personalized_ticket(i.ecid)),
         &i.boot_manifest,
         0o666,
     );
@@ -951,9 +960,14 @@ mod tests {
             pb[&format!("{g}/cryptex1/current/os.clone.dmg")].node,
             Node::Clone(format!("{g}/cryptex1/current/os.dmg"))
         );
-        assert!(pb.contains_key(&format!(
-            "{g}/cryptex1/current/apticket.vma2macosap.0123456789ABCDEF.im4m"
-        )));
+        for dir in ["cryptex1/current", "restore"] {
+            assert!(pb.contains_key(&format!(
+                "{g}/{dir}/apticket.vma2macosap.123456789ABCDEF.im4m"
+            )));
+            assert!(!pb.contains_key(&format!(
+                "{g}/{dir}/apticket.vma2macosap.0123456789ABCDEF.im4m"
+            )));
+        }
         // Every entry's parent comes before it.
         for v in p.isc.iter().chain(&p.main).chain(&p.recovery) {
             if let Content::Entries(e) = &v.content {
