@@ -445,6 +445,20 @@ void ReimsGraphics::attachMobileNode()
 	      attached ? "attached" : "could not attach", name, kDisplayNodeType);
 }
 
+UInt32 ReimsGraphics::countMobileNodes()
+{
+	UInt32 n = 0;
+	for (; n < RGFX_DISPLAYS_MAX; n++) {
+		char path[48];
+		snprintf(path, sizeof(path), "/arm-io/reims-display%u", n);
+		IORegistryEntry *node = IORegistryEntry::fromPath(path, gIODTPlane);
+		if (!node)
+			break;
+		node->release();
+	}
+	return n;
+}
+
 void ReimsGraphics::detachMobileNode()
 {
 	if (!mobileNode)

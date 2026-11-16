@@ -65,6 +65,15 @@ int main()
 	check(rgfxDisplaysDriven(true, 4) == 4, "four displays with the bit");
 	check(rgfxDisplaysDriven(true, 9) == RGFX_DISPLAYS_MAX, "never past RGFX_DISPLAYS_MAX");
 	check(rgfxDisplaysDriven(true, 0) == 1, "a device that lists none is display 0's");
+
+	// The framebuffers of the displays driven: every one with a node, display 0's always.
+	check(rgfxFramebuffersOf(1, RGFX_DISPLAYS_MAX) == 1, "one display, one framebuffer");
+	check(rgfxFramebuffersOf(1, 0) == 1, "display 0's framebuffer with no node");
+	check(rgfxFramebuffersOf(2, 1) == 1, "two driven, display 0's node alone: display 0's");
+	check(rgfxFramebuffersOf(2, 2) == 2, "two driven, two nodes: two framebuffers");
+	check(rgfxFramebuffersOf(4, 2) == 2, "four driven, two nodes: two framebuffers");
+	check(rgfxFramebuffersOf(3, 4) == 3, "three driven, four nodes: three framebuffers");
+	check(rgfxFramebuffersOf(4, RGFX_DISPLAYS_MAX) == 4, "x86-64: every display driven");
 	check(RGFX_FEATURE_MULTI_DISPLAY == (1ull << 48), "MULTI_DISPLAY is bit 48");
 	check(RGFX_DISPLAYS_MAX == 4, "four displays at most");
 

@@ -1797,7 +1797,15 @@ bool ReimsGraphics::start(IOService *provider)
 			offered = (static_cast<uint64_t>(readRegister(RGFX_REG_FEATURES_HI)) << 32) |
 			          readRegister(RGFX_REG_FEATURES_LO);
 		}
+#if defined(__arm64e__)
+		// MULTI_DISPLAY only where the firmware placed display 1's node as well as display 0's
+		// (RgfxFeatures.hpp): a process expects a service for each node it counts.
+		mobileNodes = countMobileNodes();
+		IOLog("ReimsGraphics: the firmware placed display nodes for %u displays\n", mobileNodes);
+		const uint64_t wanted = rgfxDriverFeatures(offered, mobileNodes);
+#else
 		const uint64_t wanted = rgfxDriverFeatures(offered);
+#endif
 		writeRegister(RGFX_REG_DRIVER_FEATURES_LO, static_cast<UInt32>(wanted));
 		writeRegister(RGFX_REG_DRIVER_FEATURES_HI, static_cast<UInt32>(wanted >> 32));
 		const uint64_t took =
@@ -1878,7 +1886,7 @@ bool ReimsGraphics::start(IOService *provider)
 		clock_interval_to_deadline(static_cast<uint32_t>(kRgfxRegisterHoldNs / 1000000),
 		                           kMillisecondScale, &due);
 		IOLockLock(stateLock);
-		registerHold.open(displayCount, due);
+		registerHold.open(rgfxFramebuffersOf(displayCount, mobileNodes), due);
 		IOLockUnlock(stateLock);
 	}
 #endif
@@ -2134,7 +2142,15 @@ void ReimsGraphics::publishFramebuffer()
 // black; the others go on.
 void ReimsGraphics::startHeads()
 {
+#if defined(__arm64e__)
+	// On arm64, a framebuffer for each display with a node the firmware placed
+	// (rgfxFramebuffersOf).
+	const UInt32 count = rgfxFramebuffersOf(displayCount, mobileNodes);
+	for (UInt32 i = count; i < displayCount && i < RGFX_DISPLAYS_MAX; i++)
+		IOLog("ReimsGraphics: display %u has no node under /arm-io, so no framebuffer\n", i);
+#else
 	const UInt32 count = displayCount;
+#endif
 	for (UInt32 i = 1; i < count && i < RGFX_DISPLAYS_MAX; i++) {
 		const bool headStarted = startHeadAt(i);
 #if defined(__arm64e__)

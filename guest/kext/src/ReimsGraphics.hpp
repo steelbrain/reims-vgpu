@@ -847,6 +847,12 @@ private:
 	RgfxRegisterHold registerHold;
 	bool holdRegistration(UInt32 display, IOOptionBits options);
 	void releaseRegistrations();
+	// The displays whose node the firmware placed under /arm-io, counted from display 0 to the
+	// first without one (countMobileNodes, as display 0's start takes the device): MULTI_DISPLAY
+	// is taken only where display 1 has one (RgfxFeatures.hpp), and only displays with one get a
+	// framebuffer (rgfxFramebuffersOf). Display 0's alone.
+	static UInt32 countMobileNodes();
+	UInt32 mobileNodes;
 #endif
 
 	bool ready;

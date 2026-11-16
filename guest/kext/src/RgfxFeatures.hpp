@@ -145,11 +145,14 @@
 //    seeds the answers it keeps for every process (RgfxSharedPipelines.hpp) with those the device
 //    kept of keyed creates of its earlier runs (RGFX_CMD_PIPELINE_ANSWERS), so a create of a key
 //    an earlier boot made need not wait either;
-//  - MULTI_DISPLAY (bit 48), the x86-64 kext alone for now: where the device has two displays or
-//    more, its DISPLAYS answer lists them all and it sends each one's events, and the framebuffer
-//    drives each display with an IOFramebuffer of its own (ReimsGraphics.hpp, RgfxDisplayTable.hpp),
-//    which needs nothing of the bundle. The arm64e kext drives display 0 alone until its
-//    framebuffers for the others land (design.md, "Multiple displays");
+//  - MULTI_DISPLAY (bit 48): where the device has two displays or more, its DISPLAYS answer lists
+//    them all and it sends each one's events, and the framebuffer drives each display with a
+//    framebuffer of its own (ReimsGraphics.hpp, RgfxDisplayTable.hpp), which needs nothing of the
+//    bundle: an IOFramebuffer on x86-64, an IOMobileFramebuffer on arm64. The arm64e kext takes it
+//    only where the firmware placed a node under /arm-io for display 1 as well as display 0
+//    (rgfxDriverFeatures' `mobileNodes`): a process waits for a service of each display node it
+//    counts, and counts nodes before the kext can add any (design.md, "Multiple displays"). With
+//    display 0's node alone, the arm64e kext drives display 0 alone, as before the bit;
 //  - POINTER_OVER (bit 49), the x86-64 kext alone, meaningful only with MULTI_DISPLAY: on the
 //    device's POINTER_OVER the framebuffer moves the cursor onto the display the host's pointer
 //    is over (ReimsGraphicsPointer.cpp, RgfxPointerOver.hpp), which needs nothing of the bundle;
@@ -201,15 +204,20 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_FUNCTION_POINTERS | RGFX_FEATURE_DYNAMIC_LIBRARIES | RGFX_FEATURE_PIPELINE_KEYS |
     RGFX_FEATURE_ICB_SLOTS_IN_PAGES | RGFX_FEATURE_DOORBELL_ASKS | RGFX_FEATURE_GUEST_TIMES |
     RGFX_FEATURE_READ_ONLY_PAGES | RGFX_FEATURE_DOORBELL_PAGES | RGFX_FEATURE_PIPELINE_ANSWERS |
-    RGFX_FEATURE_POINTER_MOTION |
+    RGFX_FEATURE_POINTER_MOTION | RGFX_FEATURE_MULTI_DISPLAY |
     (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K
-                      : RGFX_FEATURE_DISPLAY_POWER | RGFX_FEATURE_MULTI_DISPLAY |
-                            RGFX_FEATURE_POINTER_OVER | RGFX_FEATURE_DISPLAY_BOUNDS);
+                      : RGFX_FEATURE_DISPLAY_POWER | RGFX_FEATURE_POINTER_OVER |
+                            RGFX_FEATURE_DISPLAY_BOUNDS);
 
-// What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
-inline uint64_t rgfxDriverFeatures(uint64_t offered)
+// What the framebuffer writes to DRIVER_FEATURES, given the host's offer and, on arm64, the
+// displays whose node the firmware placed under /arm-io, counted from display 0 (`mobileNodes`):
+// MULTI_DISPLAY only where display 1 has one too. The x86-64 kext reads no nodes.
+inline uint64_t rgfxDriverFeatures(uint64_t offered, uint32_t mobileNodes = RGFX_DISPLAYS_MAX)
 {
-	return offered & kRgfxCarriedFeatures;
+	uint64_t carried = kRgfxCarriedFeatures;
+	if (RGFX_GUEST_ARM64 && mobileNodes < 2)
+		carried &= ~RGFX_FEATURE_MULTI_DISPLAY;
+	return offered & carried;
 }
 
 // What the framebuffer writes to DRIVER_FEATURES_HI before it reads the offer again, given the

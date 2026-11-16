@@ -30,6 +30,17 @@ inline uint32_t rgfxDisplaysDriven(bool taken, uint32_t listed)
 	return listed < RGFX_DISPLAYS_MAX ? listed : RGFX_DISPLAYS_MAX;
 }
 
+// The displays that get a framebuffer, display 0 to the count less one, of the `driven`
+// (rgfxDisplaysDriven): on arm64 only those whose node the firmware placed under /arm-io, `nodes`
+// of them counted from display 0, since a process expects a service for each node it counts and
+// drives no service past them; display 0's always. The rooms stay those of the `driven`, as the
+// host lays them out; a display past the framebuffers stays undriven, its window black.
+inline uint32_t rgfxFramebuffersOf(uint32_t driven, uint32_t nodes)
+{
+	const uint32_t n = driven < nodes ? driven : nodes;
+	return n ? n : 1;
+}
+
 // Each display's scanout room on a device of `count` displays: RGFX_SCANOUT_SPAN / count, rounded
 // down to a multiple of RGFX_SCANOUT_ROOM_ALIGN (the host's display::scanout_room): 128 MiB for
 // one display, 64 MiB each for two, 0x2aa_0000 bytes each for three and 32 MiB each for four.

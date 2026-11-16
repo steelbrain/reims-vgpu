@@ -78,10 +78,10 @@ constexpr uint64_t k16KCarried = RGFX_GUEST_ARM64 ? k16K : 0;
 // display's panel goes dark and lights, and the arm64e kext does not.
 constexpr uint64_t kDisplayPower = RGFX_FEATURE_DISPLAY_POWER;
 constexpr uint64_t kDisplayPowerCarried = RGFX_GUEST_ARM64 ? 0 : kDisplayPower;
-// MULTI_DISPLAY, which the x86-64 kext carries, a framebuffer of its own driving each display the
-// device lists, and the arm64e kext does not yet.
+// MULTI_DISPLAY, which both kexts carry, a framebuffer of its own driving each display the device
+// lists; the arm64e kext only where the firmware placed a node for display 1 too.
 constexpr uint64_t kMultiDisplay = RGFX_FEATURE_MULTI_DISPLAY;
-constexpr uint64_t kMultiDisplayCarried = RGFX_GUEST_ARM64 ? 0 : kMultiDisplay;
+constexpr uint64_t kMultiDisplayCarried = kMultiDisplay;
 // POINTER_OVER, which the x86-64 kext carries, moving the cursor onto the display the host's
 // pointer is over, and the arm64e kext does not.
 constexpr uint64_t kPointerOver = RGFX_FEATURE_POINTER_OVER;
@@ -189,7 +189,7 @@ int main()
 	// SURFACE_DEFERRED_ASK, SURFACE_DEFERRED_CARRY, SCHEDULED_ASK, DISPLAY_SCALE,
 	// TEXTURE_DID_MODIFY_DATA, RATE_MAPS, FUNCTION_POINTERS, DYNAMIC_LIBRARIES, PIPELINE_KEYS,
 	// ICB_SLOTS_IN_PAGES, DOORBELL_ASKS, GUEST_TIMES, READ_ONLY_PAGES, DOORBELL_PAGES,
-	// PIPELINE_ANSWERS, POINTER_MOTION and, the x86-64 kext, DISPLAY_POWER, MULTI_DISPLAY,
+	// PIPELINE_ANSWERS, POINTER_MOTION, MULTI_DISPLAY and, the x86-64 kext, DISPLAY_POWER,
 	// POINTER_OVER and DISPLAY_BOUNDS, and writes each only where offered.
 	check(kRgfxCarriedFeatures == kCarried,
 	      "the kext takes PAGES_BUFFERS, SURFACE_ORDER, ICBs, UNSHARED_QUEUES, MANAGED_AT_OFFSET, "
@@ -199,8 +199,8 @@ int main()
 	      "SURFACE_CACHE_REFUSED, SURFACE_DEFERRED_ASK, SURFACE_DEFERRED_CARRY, SCHEDULED_ASK, "
 	      "DISPLAY_SCALE, TEXTURE_DID_MODIFY_DATA, RATE_MAPS, FUNCTION_POINTERS, DYNAMIC_LIBRARIES, "
 	      "PIPELINE_KEYS, ICB_SLOTS_IN_PAGES, DOORBELL_ASKS, GUEST_TIMES, READ_ONLY_PAGES, "
-	      "DOORBELL_PAGES, PIPELINE_ANSWERS, POINTER_MOTION and, on x86-64, DISPLAY_POWER, "
-	      "MULTI_DISPLAY, POINTER_OVER and DISPLAY_BOUNDS from bit 3");
+	      "DOORBELL_PAGES, PIPELINE_ANSWERS, POINTER_MOTION, MULTI_DISPLAY and, on x86-64, "
+	      "DISPLAY_POWER, POINTER_OVER and DISPLAY_BOUNDS from bit 3");
 	check(RGFX_FEATURE_PAGES_BUFFERS == (1u << 7), "PAGES_BUFFERS is bit 7");
 	check(RGFX_FEATURE_SURFACE_ORDER == (1u << 11), "SURFACE_ORDER is bit 11");
 	check(RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS == (1u << 12), "INDIRECT_COMMAND_BUFFERS is bit 12");
@@ -394,7 +394,23 @@ int main()
 	check(RGFX_FEATURE_MULTI_DISPLAY == (1ull << 48), "MULTI_DISPLAY is bit 48");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kMultiDisplay) ==
 	          kMultiDisplayCarried,
-	      "MULTI_DISPLAY offered, written by the x86-64 kext alone");
+	      "MULTI_DISPLAY offered, written");
+	// On arm64, only where the firmware placed nodes for displays 0 and 1: with display 0's alone,
+	// or none, the word written is the one before the arm64e kext carried the bit. The x86-64 kext
+	// counts no nodes and writes it wherever offered.
+	{
+		const uint64_t offered = kRgfxOfferedFeatures | kNotCarried | kMultiDisplay | kScheduledAsk;
+		const uint64_t before = kScheduledAsk;
+		const uint64_t lone = RGFX_GUEST_ARM64 ? before : before | kMultiDisplay;
+		check(rgfxDriverFeatures(offered, 0) == lone, "no display node: MULTI_DISPLAY on x86-64 alone");
+		check(rgfxDriverFeatures(offered, 1) == lone,
+		      "display 0's node alone: MULTI_DISPLAY on x86-64 alone, the arm64 word as before");
+		for (uint32_t nodes = 2; nodes <= RGFX_DISPLAYS_MAX; nodes++)
+			check(rgfxDriverFeatures(offered, nodes) == (before | kMultiDisplay),
+			      "nodes for displays 0 and 1: MULTI_DISPLAY written");
+		check(rgfxDriverFeatures(offered & ~kMultiDisplay, 2) == before,
+		      "MULTI_DISPLAY not offered: not written, whatever the nodes");
+	}
 	check(rgfxFeatureWord(kRgfxOfferedFeatures | kMultiDisplay, kMultiDisplay) ==
 	          (kRgfxOfferedFeatures | kMultiDisplayCarried),
 	      "MULTI_DISPLAY taken is in the word where carried");
