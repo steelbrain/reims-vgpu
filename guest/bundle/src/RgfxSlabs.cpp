@@ -97,7 +97,7 @@ bool RgfxRegionSlabSource::heaped(uint32_t options) const
 	return storage == kStorageShared || (storage == kStorageManaged && m_managedAtOffset);
 }
 
-bool RgfxRegionSlabSource::take(uint64_t size, Memory *out)
+bool RgfxRegionSlabSource::take(uint64_t size, bool heap, Memory *out)
 {
 	RgfxRegion::Block block = m_region.allocate(size, kUnit);
 	if (!block.ok)
@@ -180,20 +180,34 @@ RgfxPagesSlabSource::RgfxPagesSlabSource(RgfxRegion &region, RgfxSerializer &ser
 {
 }
 
-bool RgfxPagesSlabSource::serves(uint32_t options, uint64_t size) const
+bool RgfxPagesSlabSource::serves(uint32_t options, uint64_t size, bool dedicated) const
 {
-	// A 2 MiB slab for any heaped class; a larger one only for a Shared buffer of its own, which
-	// BUFFER_OVER_PAGES makes over the view.
+	// A class's slab of any heaped class, up to slabMax(); a buffer's own of 2 MiB, or a larger
+	// one only for a Shared buffer, which BUFFER_OVER_PAGES makes over the view.
 	const bool shared = ((options & kStorageMask) >> kStorageShift) == kStorageShared;
-	return heaped(options) && (size == kUnit || shared);
+	if (!heaped(options) || size == 0 || size % kUnit != 0)
+		return false;
+	return dedicated ? size == kUnit || shared : size <= slabMax();
 }
 
-bool RgfxPagesSlabSource::heapedSlab(const Memory &memory, uint32_t options) const
+uint64_t RgfxPagesSlabSource::smallMax() const
 {
-	return memory.size == kUnit && heaped(options);
+	return m_region.hasChunkedPages() ? kChunkedSmallMax : RgfxSlabSource::kSmallMax;
 }
 
-bool RgfxPagesSlabSource::take(uint64_t size, Memory *out)
+uint64_t RgfxPagesSlabSource::slabMax() const
+{
+	return m_region.hasChunkedPages() ? kChunkedSlabMax : kUnit;
+}
+
+bool RgfxPagesSlabSource::heapedSlab(uint64_t size, uint32_t options, bool dedicated) const
+{
+	// A class's slabs, and a buffer's own of 2 MiB, are heaps; a larger buffer's own is the
+	// buffer over the block's view.
+	return heaped(options) && (!dedicated || size == kUnit);
+}
+
+bool RgfxPagesSlabSource::take(uint64_t size, bool heap, Memory *out)
 {
 	if (size == 0 || size % kUnit != 0)
 		return false;
@@ -210,6 +224,10 @@ bool RgfxPagesSlabSource::take(uint64_t size, Memory *out)
 		out->chunked = true;
 		return true;
 	}
+	// A heap of plain pages is 2 MiB at most, 512 runs of the guest's RAM, which one dma-buf of
+	// the host's holds; a larger class's slab is chunks or nothing (CHUNKED SLABS GROW).
+	if (heap && size > kUnit)
+		return false;
 	uint8_t *bytes = nullptr;
 	if (m_memory.pages == nullptr ||
 	    m_memory.pages(m_memory.context, size, &bytes) != KERN_SUCCESS)
@@ -410,10 +428,11 @@ RgfxSlabs::Slab *RgfxSlabs::makeSlab(RgfxSlabSource &source, uint64_t size, uint
                                      bool dedicated, bool *refused)
 {
 	RgfxSlabSource::Memory memory;
-	if (!source.take(size, &memory))
+	const bool heaped = source.heapedSlab(size, options, dedicated);
+	if (!source.take(size, heaped, &memory))
 		return nullptr;
 	RgfxSlabSource::Heap heap;
-	if (source.heapedSlab(memory, options) && !source.makeHeap(memory, options, &heap)) {
+	if (heaped && !source.makeHeap(memory, options, &heap)) {
 		source.give(memory);
 		*refused = true; // the device never got the heap: no smaller slab gets one either
 		return nullptr;
@@ -469,7 +488,11 @@ bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *ou
 		return false;
 	const uint64_t size = roundUp(length, kGranule);
 	keep = std::min(keep, size);
-	const bool dedicated = size > kSmallMax;
+	// The first source's limits where it says larger (CHUNKED SLABS GROW); the region's slabs keep
+	// theirs.
+	const uint64_t smallMax = first != nullptr ? std::max(kSmallMax, first->smallMax()) : kSmallMax;
+	const uint64_t slabMax = first != nullptr ? std::max(kSlabMax, first->slabMax()) : kSlabMax;
+	const bool dedicated = size > smallMax;
 	const uint64_t unit = m_source.unit();
 	std::vector<std::pair<uint64_t, uint64_t>> zero;
 	Slab *in = nullptr;
@@ -508,7 +531,7 @@ bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *ou
 			}
 			if (in == nullptr) {
 				want = std::max(cls.nextSize, powerOfTwoAtLeast(2 * size));
-				want = std::max(std::min(want, kSlabMax), roundUp(size, unit));
+				want = std::max(std::min(want, slabMax), roundUp(size, unit));
 				want = roundUp(want, unit);
 			}
 		}
@@ -518,12 +541,13 @@ bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *ou
 		// one, the process's own room given back and the slab asked again; then, for a small
 		// buffer, region slabs half as large down to the buffer's size.
 		const uint64_t least = roundUp(size, unit);
-		uint64_t ask = dedicated ? least : want;
+		// The region's slab of a class is kSlabMax at most, however large the first source's.
+		uint64_t ask = dedicated ? least : std::max(std::min(want, kSlabMax), least);
 		bool refused = false;
 		auto fromEither = [&]() -> Slab * {
 			const uint64_t firstSize =
-			    first != nullptr ? roundUp(dedicated ? size : ask, first->unit()) : 0;
-			if (first != nullptr && first->serves(options, firstSize)) {
+			    first != nullptr ? roundUp(dedicated ? size : want, first->unit()) : 0;
+			if (first != nullptr && first->serves(options, firstSize, dedicated)) {
 				bool firstRefused = false; // the region's slab is asked all the same
 				Slab *slab = makeSlab(*first, firstSize, options, dedicated, &firstRefused);
 				if (slab != nullptr)
@@ -537,8 +561,10 @@ bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *ou
 			waitForDrops();
 			made = fromEither();
 		}
+		bool halved = false;
 		while (made == nullptr && !refused && !dedicated && ask > least) {
 			ask = std::max(roundUp(ask / 2, unit), least);
+			halved = true;
 			made = makeSlab(m_source, ask, options, dedicated, &refused);
 		}
 		if (made == nullptr)
@@ -556,8 +582,8 @@ bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *ou
 			cls.slabs.push_back(made);
 			if (made->free.bytes != 0)
 				cls.open.insert(made);
-			if (ask == want)
-				cls.nextSize = std::min(want * 2, kSlabMax);
+			if (!halved)
+				cls.nextSize = std::min(want * 2, slabMax);
 		}
 		in = made;
 	}

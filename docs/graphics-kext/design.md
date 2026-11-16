@@ -4374,7 +4374,14 @@ the host's import, and the kext's block table holds one entry per slab:
   for, wired into a pages block and made one `HEAP_OVER_PAGES`, its buffers
   placed in it as in a region slab's heap. The host makes the heap over the
   block's view, which it makes off ring 0 as a `BUFFER_OVER_PAGES`'s, or over
-  the run where the guest's RAM is mapped where the block is one run. A larger
+  the run where the guest's RAM is mapped where the block is one run. Where
+  the kext gives chunks, a class's slabs grow past 2 MiB, doubling, to 16 MiB,
+  each one heap, and a buffer of up to 4 MiB lies in them, where past 1 MiB it
+  would take a slab of its own: the host maps one view a slab and imports it
+  once, and a device that lists every import in every submission (RADV, and
+  ANV on i915) lists one a slab, whatever the buffers in it. Such a slab is
+  256 chunks at most, which one dma-buf holds at udmabuf's stock limits; a
+  class's slab past 2 MiB is never plain pages. A larger
   dedicated Shared slab is plain pages too, with no heap: its one buffer is a
   `BUFFER_OVER_PAGES` over the block's view, or a Managed buffer's CPU copy. A
   larger Managed slab of a class of its own (no `MANAGED_BUFFER_SLABS`) is the

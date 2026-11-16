@@ -38,7 +38,18 @@
  * the buffer that makes one. A larger buffer takes a slab of its own (dedicated), its length
  * rounded up to the source's unit; once freed, that slab is cached for a later buffer of the same
  * class that needs at least half of it, oldest let go first past a sixteenth of the source's
- * capacity, and let go after kCacheIdleMs unused.
+ * capacity, and let go after kCacheIdleMs unused. A first source may say larger limits of its
+ * own (smallMax, slabMax), which hold for its slabs; the region's slabs keep these.
+ *
+ * CHUNKED SLABS GROW. Where the kext gives chunks, a class's slabs of the process's own pages
+ * grow past 2 MiB, doubling, to kChunkedSlabMax (16 MiB), each one heap over its block, and a
+ * buffer of up to kChunkedSmallMax (4 MiB) lies in them: the host maps one view a slab and makes
+ * one import of it, which every submission of a device that lists its imports lists (RADV, and
+ * ANV on i915), whatever the buffers in it; a slab of their own each would be an import each.
+ * Such a slab is 256 chunks at most, one dma-buf of the host's at udmabuf's stock limits (1,024
+ * runs, 64 MiB). A class's slab past 2 MiB is the kext's chunks or none, never plain pages, which
+ * no one dma-buf holds past 2 MiB: where the kext gives no chunks it is the region's, of 2 MiB at
+ * most.
  *
  * ZEROING. A freed range, and a slab the source did not zero, are dirty. A create zeroes only
  * the dirty part of its range, past the bytes its caller writes itself; the background thread
@@ -132,8 +143,18 @@ public:
 	virtual uint64_t unit() const = 0;
 
 	/// Whether this source makes a slab of `size` bytes (a multiple of unit()) for buffers of
-	/// `options`: a first source that does not leaves it to the region's (RgfxSlabs::setFirst).
-	virtual bool serves(uint32_t options, uint64_t size) const { return true; }
+	/// `options`, one buffer's own where `dedicated`, else its class's: a first source that does
+	/// not leaves it to the region's (RgfxSlabs::setFirst).
+	virtual bool serves(uint32_t options, uint64_t size, bool dedicated) const { return true; }
+
+	/// The largest buffer that shares a slab of its class from this source, where it is the
+	/// first (a larger one takes a slab of its own), and the largest slab of a class it makes.
+	virtual uint64_t smallMax() const { return kSmallMax; }
+	virtual uint64_t slabMax() const { return kSlabMax; }
+
+	/// What smallMax() and slabMax() answer unless a source says otherwise: 1 MiB and 2 MiB.
+	static constexpr uint64_t kSmallMax = 1ull << 20;
+	static constexpr uint64_t kSlabMax = 2ull << 20;
 
 	/// The most bytes this source's slabs could ever hold, which sizes the cache of slabs.
 	virtual uint64_t capacity() const = 0;
@@ -142,16 +163,17 @@ public:
 	/// its own range.
 	virtual bool heaped(uint32_t options) const = 0;
 
-	/// Whether the slab over `memory`, of a class of `options`, has a heap its buffers lie in
-	/// (makeHeap), else each buffer over its own range: its class's answer (heaped) unless the
-	/// source says otherwise of a slab.
-	virtual bool heapedSlab(const Memory &memory, uint32_t options) const
+	/// Whether a slab of `size` bytes, of a class of `options`, one buffer's own where
+	/// `dedicated`, has a heap its buffers lie in (makeHeap), else each buffer over its own
+	/// range: its class's answer (heaped) unless the source says otherwise of a slab.
+	virtual bool heapedSlab(uint64_t size, uint32_t options, bool dedicated) const
 	{
 		return heaped(options);
 	}
 
-	/// The memory of a slab of `size` bytes (a multiple of unit()), or false where it has none.
-	virtual bool take(uint64_t size, Memory *out) = 0;
+	/// The memory of a slab of `size` bytes (a multiple of unit()), which has a heap where
+	/// `heap` (heapedSlab), or false where it has none.
+	virtual bool take(uint64_t size, bool heap, Memory *out) = 0;
 
 	/// Gives a slab's memory back, once no buffer lies in it and its heap is dropped.
 	virtual void give(const Memory &memory) = 0;
@@ -205,7 +227,7 @@ public:
 	uint64_t unit() const override { return kUnit; }
 	uint64_t capacity() const override;
 	bool heaped(uint32_t options) const override;
-	bool take(uint64_t size, Memory *out) override;
+	bool take(uint64_t size, bool heap, Memory *out) override;
 	void give(const Memory &memory) override;
 	bool makeHeap(const Memory &memory, uint32_t options, Heap *out) override;
 	void dropHeap(const Heap &heap) override;
@@ -241,11 +263,13 @@ struct RgfxPagesMemory {
 /// Slabs of the process's own pages: the kext's chunks of 64 KiB where it gives them
 /// (RgfxRegion::acquireChunkedPages), else plain pages, wired into a pages block of the kext's
 /// (RgfxRegion::acquirePages; RGFX_FEATURE_PAGES_BUFFERS), so their buffers' memory is the guest's
-/// RAM, not the device region's, for the classes whose buffers lie in heaps. A slab of 2 MiB is a
+/// RAM, not the device region's, for the classes whose buffers lie in heaps. A class's slab (2 MiB,
+/// or of chunks up to 16 MiB: CHUNKED SLABS GROW) and a buffer's own slab of 2 MiB are each a
 /// heap the host makes over the block's view of its runs (HEAP_OVER_PAGES;
 /// RGFX_FEATURE_HEAP_OVER_PAGES), its buffers placed there as in a region slab's heap. A larger
-/// slab holds one dedicated Shared buffer, a BUFFER_OVER_PAGES over the block's view, or a Managed
-/// buffer over such a Shared copy (MANAGED OVER A COPY); a larger Managed one of a class of its
+/// slab of a buffer's own holds one dedicated Shared buffer, a BUFFER_OVER_PAGES over the block's
+/// view, or a Managed buffer over such a Shared copy (MANAGED OVER A COPY); a larger Managed one
+/// of a class of its
 /// own, and a slab where the kernel has no pages to give or the kext no pages block, are the
 /// region's. A slab goes with its heap's destroy, then its block's release (the kext's Free, which
 /// waits for the device's answer), then its plain pages; chunks go with the release.
@@ -280,17 +304,23 @@ public:
 	                    bool managedAtOffset = false, bool managedOverCopy = false);
 
 	uint64_t unit() const override { return kUnit; }
-	bool serves(uint32_t options, uint64_t size) const override;
-	bool heapedSlab(const Memory &memory, uint32_t options) const override;
+	bool serves(uint32_t options, uint64_t size, bool dedicated) const override;
+	uint64_t smallMax() const override;
+	uint64_t slabMax() const override;
+	bool heapedSlab(uint64_t size, uint32_t options, bool dedicated) const override;
 	uint64_t capacity() const override { return m_capacity; }
-	bool take(uint64_t size, Memory *out) override;
+	bool take(uint64_t size, bool heap, Memory *out) override;
 	void give(const Memory &memory) override;
 	bool makeHeap(const Memory &memory, uint32_t options, Heap *out) override;
 	bool makeBuffer(const Memory &memory, const Heap &heap, uint64_t offset, uint64_t length,
 	                uint32_t options, Made *out) override;
 
-	/// The size of a slab with a heap.
+	/// The size of a slab with a heap, and what every slab's size is a multiple of.
 	static constexpr uint64_t kUnit = 2ull << 20;
+	/// Where the kext gives chunks: the largest buffer that shares a slab of its class, and the
+	/// largest such slab, a heap over 256 chunks (CHUNKED SLABS GROW).
+	static constexpr uint64_t kChunkedSmallMax = 4ull << 20;
+	static constexpr uint64_t kChunkedSlabMax = 16ull << 20;
 
 private:
 	RgfxPagesMemory m_memory;
@@ -380,11 +410,12 @@ public:
 
 	/// A buffer's page: what its range is a multiple of, and its offset in its slab.
 	static constexpr uint64_t kGranule = 0x1000;
-	/// The largest buffer a class's slabs hold; a larger one takes a slab of its own.
-	static constexpr uint64_t kSmallMax = 1ull << 20;
-	/// A class's first slab, and its largest.
+	/// The largest buffer a class's slabs hold, a larger one taking a slab of its own, and a
+	/// class's largest slab, unless the first source says otherwise (RgfxSlabSource::smallMax,
+	/// slabMax); and its first slab.
+	static constexpr uint64_t kSmallMax = RgfxSlabSource::kSmallMax;
+	static constexpr uint64_t kSlabMax = RgfxSlabSource::kSlabMax;
 	static constexpr uint64_t kSlabFirst = 128ull << 10;
-	static constexpr uint64_t kSlabMax = 2ull << 20;
 	/// The most bytes the background zeroes at a time.
 	static constexpr uint64_t kZeroPiece = 256ull << 10;
 	/// How long a cached slab is kept unused.

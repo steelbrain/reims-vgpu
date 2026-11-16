@@ -73,7 +73,7 @@ struct Source : RgfxSlabSource {
 	{
 		return heapedClasses && ((options >> 4) & 0xf) == 0;
 	}
-	bool take(uint64_t size, Memory *out) override
+	bool take(uint64_t size, bool heap, Memory *out) override
 	{
 		std::lock_guard<std::mutex> hold(lock);
 		uint64_t at = 0;
@@ -1076,8 +1076,11 @@ void test_pages_slab_source()
 	RgfxRegionSlabSource regionSource(region, ser);
 	RgfxPagesSlabSource pages(region, ser, calls, 16ull << 30);
 	CHECK(pages.unit() == 2 * kMiB && pages.heaped(kShared) && !pages.heaped(kManaged));
-	CHECK(pages.serves(kShared, 2 * kMiB) && pages.serves(kSharedUntracked, 2 * kMiB));
-	CHECK(pages.serves(kShared, 4 * kMiB) && !pages.serves(kManaged, 2 * kMiB));
+	CHECK(pages.serves(kShared, 2 * kMiB, false) && pages.serves(kSharedUntracked, 2 * kMiB, false));
+	CHECK(pages.serves(kShared, 4 * kMiB, true) && !pages.serves(kManaged, 2 * kMiB, false));
+	// Without the kext's chunks a class's slab is 2 MiB, and a buffer past 1 MiB has its own.
+	CHECK(!pages.serves(kShared, 4 * kMiB, false) && pages.slabMax() == 2 * kMiB);
+	CHECK(pages.smallMax() == kMiB);
 	RgfxSlabs slabs(regionSource);
 	slabs.setFirst(&pages);
 	RgfxMsgHeader h = {};
@@ -1163,7 +1166,7 @@ void test_pages_slab_source()
 	// With MANAGED_AT_OFFSET, a Managed slab is the process's pages too, its buffers' CPU copies
 	// placed in its heap.
 	RgfxPagesSlabSource managed(region, ser, calls, 16ull << 30, true);
-	CHECK(managed.serves(kManaged, 2 * kMiB) && !managed.serves(kManaged, 4 * kMiB));
+	CHECK(managed.serves(kManaged, 2 * kMiB, true) && !managed.serves(kManaged, 4 * kMiB, true));
 	CHECK(managed.heaped(kManaged));
 	RgfxRegionSlabSource managedRegion(region, ser, true);
 	RgfxSlabs both(managedRegion);
@@ -1233,13 +1236,14 @@ void test_pages_slab_source_chunks()
 	CHECK(slabs.makeBuffer(a, 0x100, kShared, &made));
 	auto at = expectMessage<RgfxBufferAtOffset>(ring, RGFX_CMD_BUFFER_AT_OFFSET);
 	CHECK(at.heap_obj_id == heap.obj_id && at.offset == 0);
-	// A large Shared slab: chunks too, its buffer over their block's view.
+	// A large Shared slab, of a buffer past 4 MiB (CHUNKED SLABS GROW): chunks too, its buffer over
+	// their block's view.
 	RgfxSlabs::Range big;
-	CHECK(slabs.take(3 * kMiB, kShared, 0, &big) && big.offset == 0);
-	CHECK(endsWith(log, {"chunked 4194304"}) && kext.chunks.size() == 2 && vm.held.empty());
-	CHECK(slabs.makeBuffer(big, 3 * kMiB, kShared, &made));
+	CHECK(slabs.take(5 * kMiB, kShared, 0, &big) && big.offset == 0);
+	CHECK(endsWith(log, {"chunked 6291456"}) && kext.chunks.size() == 2 && vm.held.empty());
+	CHECK(slabs.makeBuffer(big, 5 * kMiB, kShared, &made));
 	auto over = expectMessage<RgfxBufferOverPages>(ring, RGFX_CMD_BUFFER_OVER_PAGES);
-	CHECK(over.block_offset == kext.chunks.rbegin()->first && over.length == 3 * kMiB);
+	CHECK(over.block_offset == kext.chunks.rbegin()->first && over.length == 5 * kMiB);
 	CHECK(made.ownsAddress && made.objId == over.obj_id);
 	// No chunks from the kext: plain pages, wired into a pages block.
 	kext.refuseChunks = true;
@@ -1260,6 +1264,92 @@ void test_pages_slab_source_chunks()
 	CHECK(log.size() == 4 && std::count(log.begin(), log.end(), "release chunked") == 2);
 	const auto released = std::find(log.begin(), log.end(), "release pages");
 	CHECK(released != log.end() && released + 1 != log.end() && released[1] == "unmap 2097152");
+}
+
+// Where the kext gives chunks, a class's slabs of the process's pages grow from 2 MiB, doubling, to
+// 16 MiB, each one heap over its block, and a buffer of up to 4 MiB lies in them (CHUNKED SLABS
+// GROW): the host imports one view a slab, whatever the buffers in it. A buffer past 4 MiB takes a
+// slab of its own, as past 1 MiB without chunks; a class's slab past 2 MiB that the kext gives no
+// chunks for is no plain pages, but the region's slab of at most 2 MiB that holds the buffer.
+void test_chunked_slabs_grow()
+{
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 16 * kMiB, 0xee);
+	TestRing ring(0x10000);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	RgfxRegion region(mem.data(), mem.size());
+	std::vector<std::string> log;
+	PagesKext kext(16 * kMiB, &log);
+	region.setBlockSource(&PagesKext::alloc, &PagesKext::release, &kext);
+	region.setPagesBlockSource(&PagesKext::pagesBlock, &kext);
+	region.setChunkedPagesSource(&PagesKext::chunked, &kext);
+	PagesVm vm(&log);
+	RgfxPagesMemory calls;
+	calls.context = &vm;
+	calls.pages = &PagesVm::pages;
+	calls.unmap = &PagesVm::unmap;
+	RgfxRegionSlabSource regionSource(region, ser);
+	RgfxPagesSlabSource pages(region, ser, calls, 16ull << 30);
+	CHECK(pages.smallMax() == 4 * kMiB && pages.slabMax() == 16 * kMiB);
+	CHECK(pages.serves(kShared, 16 * kMiB, false) && !pages.serves(kShared, 18 * kMiB, false));
+	CHECK(!pages.serves(kManaged, 2 * kMiB, false));
+	RgfxSlabs slabs(regionSource);
+	slabs.setFirst(&pages);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+
+	// Buffers of 1 MiB: each new slab of the class twice the last, up to 16 MiB, each a heap.
+	std::vector<RgfxSlabs::Range> held;
+	std::vector<uint64_t> heaps;
+	while (heaps.size() < 6) {
+		RgfxSlabs::Range r;
+		CHECK(slabs.take(kMiB, kShared, 0, &r));
+		held.push_back(r);
+		while (ring.next(&h, &bytes)) {
+			if (h.type == RGFX_CMD_HEAP_OVER_PAGES) {
+				RgfxHeapOverPages m;
+				std::memcpy(&m, bytes.data(), sizeof(m));
+				heaps.push_back(m.size_bytes);
+			}
+		}
+	}
+	CHECK(heaps == std::vector<uint64_t>({2 * kMiB, 4 * kMiB, 8 * kMiB, 16 * kMiB, 16 * kMiB,
+	                                      16 * kMiB}));
+	CHECK(std::count(log.begin(), log.end(), "chunked 16777216") == 3 && vm.held.empty());
+	// A buffer of 4 MiB lies in its class's slab, placed in its heap; one past it has a slab of
+	// its own, its buffer over the block's view.
+	RgfxSlabs::Range four, five;
+	CHECK(slabs.take(4 * kMiB, kShared, 0, &four) && four.slab == held.back().slab);
+	RgfxSlabSource::Made made;
+	CHECK(slabs.makeBuffer(four, 4 * kMiB, kShared, &made));
+	CHECK(expectMessage<RgfxBufferAtOffset>(ring, RGFX_CMD_BUFFER_AT_OFFSET).length == 4 * kMiB);
+	CHECK(slabs.take(5 * kMiB, kShared, 0, &five) && five.offset == 0 && five.slab != four.slab);
+	CHECK(endsWith(log, {"chunked 6291456"}));
+	CHECK(slabs.makeBuffer(five, 5 * kMiB, kShared, &made));
+	CHECK(expectMessage<RgfxBufferOverPages>(ring, RGFX_CMD_BUFFER_OVER_PAGES).length == 5 * kMiB);
+	// No chunks for another class's slab of 4 MiB: no plain pages, but the region's heaped slab,
+	// of 2 MiB at most and at least the buffer.
+	kext.refuseChunks = true;
+	RgfxSlabs::Range c1, c2;
+	CHECK(slabs.take(kMiB, kSharedUntracked, 0, &c1));
+	CHECK(endsWith(log, {"chunked 2097152 refused", "pages 2097152"}));
+	CHECK(slabs.take(3 * kMiB / 2, kSharedUntracked, 0, &c2) && c2.slab != c1.slab);
+	CHECK(endsWith(log, {"chunked 4194304 refused"}) && vm.held.size() == 1);
+	RgfxHeapOverHostMemory region2 = {};
+	while (ring.next(&h, &bytes)) {
+		if (h.type == RGFX_CMD_HEAP_OVER_HOST_MEMORY)
+			std::memcpy(&region2, bytes.data(), sizeof(region2));
+	}
+	CHECK(region2.size_bytes == 2 * kMiB);
+	kext.refuseChunks = false;
+	for (auto &r : held)
+		slabs.give(r);
+	for (RgfxSlabs::Range *r : {&four, &five, &c1, &c2})
+		slabs.give(*r);
+	CHECK(slabs.reclaim() && slabs.stats().slabs == 0);
+	CHECK(kext.chunks.empty() && kext.pages.empty() && vm.held.empty());
 }
 
 // Where the device took MANAGED_BUFFER_SLABS, a Managed buffer lies in its Shared class: a range
@@ -1420,5 +1510,6 @@ void rgfxSlabTests()
 	test_region_reclaim_waits_for_slabs_given_back();
 	test_pages_slab_source();
 	test_pages_slab_source_chunks();
+	test_chunked_slabs_grow();
 	test_managed_buffers_over_shared_copies();
 }
