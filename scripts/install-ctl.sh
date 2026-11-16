@@ -233,10 +233,11 @@ pacman_pkgs=(base-devel git curl python ninja pkgconf flex bison bzip2 cmake
   libx11 libxext libxrandr libxcursor libxi libxfixes libxss libxtst libxkbcommon
   wayland libdecor mesa libdrm dbus systemd-libs gtk3)
 dnf_pkgs=()
-# Windows: MSYS2's own git and curl, and CLANG64's clang and lld, which build the
-# library (x86_64-pc-windows-gnullvm) and QEMU, QEMU's build tools and the
-# libraries it links.
-msys2_pkgs=(git curl diffutils
+# Windows: MSYS2's own git and curl, make (the cmake crate, building SDL3, looks
+# for it to choose CMake's generator, and stops without it), and CLANG64's clang
+# and lld, which build the library (x86_64-pc-windows-gnullvm) and QEMU, QEMU's
+# build tools and the libraries it links.
+msys2_pkgs=(git curl diffutils make
   mingw-w64-clang-x86_64-{clang,lld,pkgconf,meson,ninja,cmake,python,glib2,pixman,libslirp,gtk3,libusb,zstd})
 if [[ $BUILDS_QEMU == 0 ]]; then
   # reims-ctl alone, for arm64 Linux: a C compiler and linker for Rust's
