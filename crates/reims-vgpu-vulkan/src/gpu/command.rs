@@ -3059,6 +3059,85 @@ mod tests {
         assert_eq!(event.signaled_value(), 1);
     }
 
+    /// A part marked to join the next one's completion (`set_completion_joins_next`) that
+    /// updates a fence, as the graphics lane's parts of WindowServer's buffers do at each
+    /// encoder: a buffer of another queue that waits for the fence, committed after the part and
+    /// before the buffer's last part, completes and reads the part's writes, whether the last
+    /// part is committed only once it completed or right behind it; the last part completes too.
+    /// Under the exact completion the runtime keeps no group past the pass that found it, so a
+    /// marked part's fence update waits for no later commit, and a wait for it is met no earlier
+    /// than the part's work.
+    #[test]
+    fn a_fence_a_marked_part_updates_meets_another_queue_s_wait() {
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::types::NsRange;
+        let d = dev();
+        let (a, b) = (d.new_command_queue().unwrap(), d.new_command_queue().unwrap());
+        let fence = d.new_fence().unwrap().expect("a fence");
+        let done = |cb: &VulkanCommandBuffer| {
+            let (tx, rx) = mpsc::channel();
+            let sent = Box::new(move |info: CompletedInfo| tx.send(info.status).unwrap());
+            cb.add_completed_handler(OnFault::Return, sent).unwrap();
+            rx
+        };
+        let within = std::time::Duration::from_secs(20);
+        for last_after_wait in [true, false] {
+            let part = buffer(&a);
+            let written = crate::gpu::resource::tests::shared(16);
+            let blit = part.blit_encoder(OnFault::Return).unwrap().unwrap();
+            let fill = BlitCmd::FillBuffer {
+                buffer: &written,
+                range: NsRange::new(0, 16),
+                value: 0x5a,
+            };
+            blit.encode(OnFault::Return, fill).unwrap();
+            blit.encode(OnFault::Return, BlitCmd::UpdateFence { fence: &fence })
+                .unwrap();
+            blit.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+            assert!(part.set_completion_joins_next(true), "marked before its commit");
+            let last = part.split(OnFault::Return).unwrap().expect("a part");
+            assert!(!part.set_completion_joins_next(false), "refused once committed");
+            let read = crate::gpu::resource::tests::shared(16);
+            let waiting = buffer(&b);
+            let blit = waiting.blit_encoder(OnFault::Return).unwrap().unwrap();
+            blit.encode(OnFault::Return, BlitCmd::WaitForFence { fence: &fence })
+                .unwrap();
+            let copy = BlitCmd::CopyBufferToBuffer {
+                source_buffer: Some(&written),
+                source_offset: 0,
+                destination_buffer: Some(&read),
+                destination_offset: 0,
+                size: 16,
+            };
+            blit.encode(OnFault::Return, copy).unwrap();
+            blit.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+            let waited = done(&waiting);
+            waiting.commit(OnFault::Return).unwrap();
+            let ended = filled(&last, 0x6b);
+            let last_done = done(&last);
+            if !last_after_wait {
+                last.commit(OnFault::Return).unwrap();
+            }
+            assert_eq!(
+                waited.recv_timeout(within),
+                Ok(CommandBufferStatus::COMPLETED),
+                "the waiting buffer (last part after it: {last_after_wait})"
+            );
+            if last_after_wait {
+                last.commit(OnFault::Return).unwrap();
+            }
+            assert_eq!(
+                last_done.recv_timeout(within),
+                Ok(CommandBufferStatus::COMPLETED)
+            );
+            assert_eq!(part.status(), CommandBufferStatus::COMPLETED);
+            assert_eq!(
+                (sixteen(&read), sixteen(&ended)),
+                (vec![0x5a; 16], vec![0x6b; 16])
+            );
+        }
+    }
+
     /// Under protection options 1, 3 and 7 a compute or render encoder's creation dies, and so
     /// does a blit encoder's first command, as Metal ends the process there; with no encoder the
     /// command buffer completes. Other options once an encoder was made under some, or after
