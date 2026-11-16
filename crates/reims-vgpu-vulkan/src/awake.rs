@@ -666,8 +666,11 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(touches(), 0, "no touch while power/control reads on");
         std::fs::write(&control, "auto\n").unwrap();
-        let until = std::time::Instant::now() + Duration::from_secs(10);
-        while touches() == 0 && std::time::Instant::now() < until {
+        // Up to 10 s, in steps of 5 ms.
+        for _ in 0..2000 {
+            if touches() > 0 {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(touches() > 0, "touches once power/control reads auto");
