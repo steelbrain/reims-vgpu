@@ -1825,6 +1825,21 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/target/ambrosia.bin \
   the four displays a device can have, so one bundle serves every count, and
   Ambrosia adds those of the displays the module reports, logging none past
   them.
+- **Measured at two displays and one.** On Ambrosia 0.1.3's image
+  (`ambrosia.bin` 617ac54c) with our bundle, arm64 14.6.1, 15.6.1 and 26.6.2
+  under TCG on homelab-um870-1's Radeon 780M, and 27.0.1 under HVF on the M3
+  with no window, each booted at `displays=2` to the desktop on both heads:
+  Ambrosia logged a node for display 0 and display 1, WindowServer logged
+  `FB Count = 2`, CoreGraphics listed two displays with display 0 the main
+  one at (0, 0) and display 1 at (1920, 0), and no `reims-vgpu: fatal` line
+  came (potluck jobs m3-max-35037 and m3-max-35038, 15.6.1 twice). At
+  `displays=1` each booted with one node, one display and the feature word
+  of a boot before multiple displays (m3-max-35037, 35039, 35254, 35255).
+  Before the release registered the displays in turn, 15.6.1's WindowServer
+  took one of two services in one boot (m3-max-34657, `Timeout: expect: 2
+  current: 1`) and made display 1 the main one in another (m3-max-34945).
+  `system_profiler SPDisplaysDataType` lists no display on an arm64 guest at
+  either count, so the boots count displays through CoreGraphics.
 - **The boot.** The script boots APFS clones of the guest's disks (`cp -c`;
   `cp --reflink=always` on Linux) in its log directory and removes them at
   the end, with 8 GiB, 4 CPUs, the device, `REIMS_VGPU_WINDOW=0` and
