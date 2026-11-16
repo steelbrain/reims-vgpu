@@ -191,7 +191,23 @@ const struct {
     {"air.quadgroup_index_in_threadgroup", 0},
     {"air.quadgroups_per_threadgroup", 0},
     {"air.dispatch_threads_per_threadgroup", 0},
+    // A kernel's (measured: tools/pipeline_reflection_check's c_dispatch_groups on the AMD Radeon Pro
+    // 5300M under macOS 26.7.1, m3-max-37031; its thread_execution_width is threads_per_simdgroup).
+    {"air.dispatch_simdgroups_per_threadgroup", 0},
+    {"air.dispatch_quadgroups_per_threadgroup", 0},
+    // Vertex amplification's, of uint (measured: r_amplification, as c_dispatch_groups).
+    {"air.amplification_id", 21},
+    {"air.amplification_count", 22},
 };
+
+// A fragment function's built-ins its own reflection lists, as a vertex function's, where its
+// pipeline's lists them nowhere: vertex amplification's (measured: f_amplification's
+// functionReflection, oracle_fnreflect as c_dispatch_groups, where f_more's front_facing and
+// sample_id are listed nowhere).
+bool fragmentFunctionLists(const std::string &kind)
+{
+	return kind == "air.amplification_id" || kind == "air.amplification_count";
+}
 
 // A stage's nodes that are no binding and no built-in: a kernel's and a vertex function's stage
 // input attributes, and a post-tessellation vertex function's patch input attributes and its
@@ -1525,8 +1541,8 @@ bool RgfxStageReflectionOfEntry(const RgfxAirEntries &module, const RgfxAirEntry
 			continue;
 		}
 		// A fragment function's built-ins and inputs Metal lists nowhere, the colour attachments it
-		// reads among them (measured: f_fetch's).
-		if (entry.stage == RgfxAirEntryStage::Fragment) {
+		// reads among them (measured: f_fetch's), but those its own reflection lists.
+		if (entry.stage == RgfxAirEntryStage::Fragment && !fragmentFunctionLists(n.kind)) {
 			if (n.hasLocation) {
 				*why = [NSString stringWithFormat:@"a fragment binding of %s was not measured", n.kind.c_str()];
 				return false;

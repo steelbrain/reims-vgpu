@@ -7450,6 +7450,12 @@ void test_pipeline_reflection_from_air()
 	// and dispatch_threads_per_threadgroup.
 	NSArray *more = ask(RgfxComputePipelineReflectionOf(fn(@"k_builtins"), nil, both), @"builtInArguments");
 	CHECK(shape(more) == "inGroup:15 groups:15 width:15 inQuad:15 gid:15 tid:15 ");
+	// Nor dispatch_simdgroups_per_threadgroup and dispatch_quadgroups_per_threadgroup; and
+	// thread_execution_width is threads_per_simdgroup (c_dispatch_groups, measured on the 5300M).
+	NSArray *dispatchGroups = ask(RgfxComputePipelineReflectionOf(fn(@"k_dispatch_groups"), nil, both), @"builtInArguments");
+	CHECK(shape(dispatchGroups) == "width:15 tid:15 ");
+	if (dispatchGroups.count == 2)
+		CHECK(number(dispatchGroups[0], @"builtInType") == 20 && number(dispatchGroups[1], @"builtInType") == 8);
 	if (more.count == 6) {
 		const NSUInteger kTypes[] = {7, 11, 20, 17, 5, 8};
 		for (NSUInteger i = 0; i < 6; i++)
@@ -7698,6 +7704,28 @@ void test_pipeline_reflection_from_air()
 	if (vertexBuiltIns.count == 3)
 		CHECK(number(vertexBuiltIns[1], @"builtInType") == 3 && number(vertexBuiltIns[2], @"builtInType") == 4);
 	CHECK(number(moreOut, @"postVertexDumpStride") == 68 && ask(moreOut, @"fragmentArguments") == nil);
+
+	// Vertex amplification's built-ins, amplification_id and amplification_count, are built-ins 21
+	// and 22 of uint, listed among a vertex function's in its pipeline's reflection and in its own,
+	// and in a fragment function's own reflection alone, where front_facing and sample_id are listed
+	// nowhere (pipeline_reflection_check's r_amplification and oracle_fnreflect's v_amplification,
+	// f_amplification and f_more, measured on the 5300M).
+	id amplified = RgfxRenderPipelineReflectionOf(fn(@"v_amplification"), nil, fn(@"f_amplification"), both);
+	CHECK(shape(ask(amplified, @"vertexBuiltInArguments")) == "vid:15 view:15 views:15 ");
+	NSArray *amplifiedBuiltIns = ask(amplified, @"vertexBuiltInArguments");
+	if (amplifiedBuiltIns.count == 3)
+		CHECK(number(amplifiedBuiltIns[1], @"builtInType") == 21 && number(amplifiedBuiltIns[2], @"builtInType") == 22 &&
+		      number(amplifiedBuiltIns[1], @"builtInDataType") == MTLDataTypeUInt &&
+		      number(amplifiedBuiltIns[2], @"builtInDataType") == MTLDataTypeUInt);
+	CHECK(amplified != nil && ask(amplified, @"fragmentArguments") == nil);
+	CHECK(shape(ask(RgfxFunctionReflectionOf(fn(@"v_amplification")), @"builtInArguments")) ==
+	      "vid:15 view:15 views:15 ");
+	NSArray *fragmentAmplified = ask(RgfxFunctionReflectionOf(fn(@"f_amplification")), @"builtInArguments");
+	CHECK(shape(fragmentAmplified) == "view:15 views:15 ");
+	if (fragmentAmplified.count == 2)
+		CHECK(number(fragmentAmplified[0], @"builtInType") == 21 && number(fragmentAmplified[1], @"builtInType") == 22);
+	id fragmentMore = RgfxFunctionReflectionOf(fn(@"f_more"));
+	CHECK(fragmentMore != nil && ask(fragmentMore, @"builtInArguments") == nil);
 
 	// Post-tessellation vertex functions, of a descriptor of their control points' attributes 0 to 2
 	// in buffer 0, stepping per control point, and their patch's attribute 3 in buffer 1, stepping
