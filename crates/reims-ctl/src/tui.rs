@@ -74,11 +74,14 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// Runs the update in the plain terminal, then the new reims-ctl in this process's place.
+/// Runs the update in the plain terminal, then reims-ctl again in this process's place: the new
+/// one, or the same where the install was already up to date.
 fn run_update(channel: Option<Channel>) -> Result<()> {
     println!("Updating reims-ctl and its QEMU…\n");
-    update::update(channel)?;
-    println!("\nUpdated. Starting the new reims-ctl…");
+    match update::update(channel)? {
+        update::Outcome::Updated => println!("\nUpdated. Starting the new reims-ctl…"),
+        update::Outcome::Current => println!("\nStarting reims-ctl again…"),
+    }
     let exe = update::restart_path(std::env::current_exe()?);
     let err = crate::os::exec(std::process::Command::new(&exe));
     Err(err).with_context(|| format!("run {}", exe.display()))

@@ -61,14 +61,34 @@ pub fn following(repo: &Path) -> String {
     }
 }
 
-/// Updates from the checkout, first switching it to `channel`'s branch where one is given.
-pub fn update(channel: Option<Channel>) -> Result<()> {
+/// What an update did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// It built and installed the checkout's commit.
+    Updated,
+    /// The install was already the latest commit of the branch the checkout follows: it built
+    /// nothing ([`current`]).
+    Current,
+}
+
+/// Updates from the checkout, first switching it to `channel`'s branch where one is given. Where
+/// the install is already the latest commit of that branch ([`current`]), it says so and builds
+/// nothing; scripts/install-ctl.sh run by hand builds it again.
+pub fn update(channel: Option<Channel>) -> Result<Outcome> {
     let i = Install::load().context(
         "no install record: run scripts/install-ctl.sh in your reims-vgpu checkout once, and \
          reims-ctl update can use it from then on",
     )?;
     if let Some(c) = channel {
         switch(&i.repo, c)?;
+    }
+    if let Some(commit) = current(&i) {
+        println!(
+            "reims-ctl is up to date: it and its QEMU were installed from {commit}, the latest \
+             commit of {}. Nothing to build.",
+            following(&i.repo)
+        );
+        return Ok(Outcome::Current);
     }
     let script = i.repo.join("scripts/install-ctl.sh");
     if !script.is_file() {
@@ -87,7 +107,47 @@ pub fn update(channel: Option<Channel>) -> Result<()> {
     if !status.success() {
         bail!("the update failed (exit {})", status.code().unwrap_or(-1));
     }
-    Ok(())
+    Ok(Outcome::Updated)
+}
+
+/// The install's commit, as recorded, where an update would build it again and change nothing:
+/// the checkout's HEAD is the commit the install was built from, its QEMU build is that commit's
+/// (an install with --skip-qemu keeps an older one, named for the commit it was built at), and
+/// the remote branch the checkout's branch tracks is at HEAD now. The remote's branch is read
+/// with `git ls-remote`, which moves no ref, so the script's pull sees the remote-tracking ref as
+/// it was. None wherever one of those does not hold or cannot be read: a detached HEAD, a branch
+/// that tracks none, a remote that does not answer. The script then runs as before.
+fn current(i: &Install) -> Option<String> {
+    let repo = &i.repo;
+    if i.commit.is_empty() {
+        return None;
+    }
+    let head = git_output(repo, &["rev-parse", "--verify", "-q", "HEAD^{commit}"])?;
+    let installed = git_output(
+        repo,
+        &["rev-parse", "--verify", "-q", &format!("{}^{{commit}}", i.commit)],
+    )?;
+    let qemu_of_it = i.qemu.is_dir()
+        && i.qemu
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(&format!("-{}", i.commit)));
+    if installed != head || !qemu_of_it {
+        return None;
+    }
+    let branch = current_branch(repo)?;
+    let remote = git_output(repo, &["config", &format!("branch.{branch}.remote")])?;
+    let latest = if remote == "." {
+        git_output(repo, &["rev-parse", "--verify", "-q", "@{u}"])?
+    } else {
+        let merge = git_output(repo, &["config", &format!("branch.{branch}.merge")])?;
+        let listed = git_output(repo, &["ls-remote", &remote, &merge])?;
+        listed
+            .lines()
+            .find_map(|l| l.split_once('\t').filter(|(_, r)| *r == merge))
+            .map(|(sha, _)| sha.to_string())?
+    };
+    (latest == head).then(|| i.commit.clone())
 }
 
 /// Checks out `c`'s branch in `repo`, fetched from the remote the current branch tracks (origin
@@ -289,6 +349,62 @@ mod tests {
         assert_eq!(Channel::of("master"), Some(Channel::Stable));
         assert_eq!(Channel::of("development"), Some(Channel::Development));
         assert_eq!(Channel::of("steelbrain/feature"), None);
+    }
+
+    /// An update builds nothing only where the checkout's HEAD, the remote branch it tracks, the
+    /// install's commit and its QEMU build's commit are one: a commit on the remote, a checkout
+    /// moved past the install, a QEMU kept from another commit (--skip-qemu) and a detached HEAD
+    /// each build.
+    #[test]
+    fn an_update_builds_nothing_where_the_install_is_the_remotes_latest_commit() {
+        let d = std::env::temp_dir().join(format!("reims-ctl-current-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let (origin, clone) = (d.join("origin"), d.join("clone"));
+        std::fs::create_dir_all(&origin).unwrap();
+        run(&origin, &["init", "-q", "-b", "master"]);
+        run(&origin, &["config", "user.name", "t"]);
+        run(&origin, &["config", "user.email", "t@t"]);
+        let commit_on = |dir: &Path, s: &str| {
+            std::fs::write(dir.join("file"), s).unwrap();
+            run(dir, &["add", "file"]);
+            run(dir, &["commit", "-q", "-m", s]);
+        };
+        commit_on(&origin, "one");
+        run(
+            &d,
+            &["clone", "-q", origin.to_str().unwrap(), clone.to_str().unwrap()],
+        );
+        let short = || git_output(&clone, &["rev-parse", "--short", "HEAD"]).unwrap();
+        // As install-ctl.sh names a QEMU build: its time, then the commit it was built at.
+        let qemu_at = |c: &str| {
+            let q = d.join(format!("qemu/20261116-010203-{c}"));
+            std::fs::create_dir_all(&q).unwrap();
+            q
+        };
+        let install = |commit: &str, qemu: PathBuf| Install {
+            repo: clone.clone(),
+            commit: commit.into(),
+            qemu,
+            installed_at: String::new(),
+        };
+        let first = short();
+        assert_eq!(current(&install(&first, qemu_at(&first))), Some(first.clone()));
+        // A commit on the remote: the update builds it.
+        commit_on(&origin, "two");
+        assert_eq!(current(&install(&first, qemu_at(&first))), None);
+        // The checkout pulled it, and the install is still the first commit's.
+        run(&clone, &["pull", "-q", "--ff-only"]);
+        let second = short();
+        assert_eq!(current(&install(&first, qemu_at(&first))), None);
+        // reims-ctl installed from it, with the first commit's QEMU kept.
+        assert_eq!(current(&install(&second, qemu_at(&first))), None);
+        assert_eq!(current(&install(&second, d.join("qemu/gone"))), None);
+        assert_eq!(current(&install(&second, qemu_at(&second))), Some(second.clone()));
+        // No record of a commit, and a detached HEAD, which follows no remote branch.
+        assert_eq!(current(&install("", qemu_at(&second))), None);
+        run(&clone, &["switch", "-q", "--detach"]);
+        assert_eq!(current(&install(&second, qemu_at(&second))), None);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

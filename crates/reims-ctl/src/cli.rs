@@ -165,6 +165,10 @@ Ctrl-] disconnects; the VM keeps running. Alt+key is Cmd+key. The Cmd, Opt, Ctrl
 buttons on the top row hold that key for the next key or click.";
 
 const UPDATE_HELP: &str = "\
+Where the checkout is already at the latest commit of the branch it follows, and reims-ctl and \
+its QEMU were installed from that commit, update builds nothing and says so; \
+scripts/install-ctl.sh in the checkout builds them again anyway.
+
 After an update, the new reims-ctl's first run (its restart from the interface, or the next \
 command) updates the VMs an older reims-ctl made, once, with a line for each VM. A VM whose \
 settings name no graphics, as those a reims-ctl from before reims-vgpu's own GPU device made, \
@@ -536,7 +540,9 @@ pub fn main(cli: Cli) -> Result<i32> {
                 );
             }
         }
-        Cmd::Update { channel } => update::update(channel)?,
+        Cmd::Update { channel } => {
+            update::update(channel)?;
+        }
         Cmd::Doctor => return doctor(host),
         Cmd::Tui => unreachable!(),
         Cmd::VulkanProbe => return Ok(gpu::probe_main()),
