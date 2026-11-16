@@ -60,7 +60,8 @@ fn copied(image: &Sparse) -> Sparse {
         next_obj_id: out.next_obj_id,
         seal: None,
     };
-    let formed = write::container(BLOCKS, [0x55; 16], T, vec![def]).expect("form the container");
+    let formed = write::container(BLOCKS, [0x55; 16], T, 0x1747_005d, vec![def])
+        .expect("form the container");
     let mut disk = Sparse::new(BLOCKS * 4096);
     for (addr, b) in &formed.blocks {
         disk.seek(SeekFrom::Start(addr * 4096)).unwrap();

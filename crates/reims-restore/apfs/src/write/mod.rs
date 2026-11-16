@@ -96,9 +96,30 @@ pub struct Formed {
     pub stream_blocks: Vec<Vec<u64>>,
 }
 
+/// The OS version a volume's meta-crypto state records, from a macOS build such as `23G93`: its
+/// major number in the top byte, its letter in the next, its number in the low half (`23G93` is
+/// `0x1747_005d`). A restore of macOS records the build it restores **[measured, 14.6.1: a
+/// Virtualization.framework restore]**. `None` for a build not of that form.
+pub fn key_os_version(build: &str) -> Option<u32> {
+    let major_len = build.bytes().take_while(u8::is_ascii_digit).count();
+    let letter = *build.as_bytes().get(major_len)?;
+    if major_len == 0 || !letter.is_ascii_uppercase() {
+        return None;
+    }
+    let rest = &build[major_len + 1..];
+    let num_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if num_len == 0 {
+        return None;
+    }
+    let major: u8 = build[..major_len].parse().ok()?;
+    let num: u16 = rest[..num_len].parse().ok()?;
+    Some(u32::from(major) << 24 | u32::from(letter) << 16 | u32::from(num))
+}
+
 /// A container of `block_count` 4 KiB blocks holding `volumes`, each placed past the container's
 /// object map in the order given, and recording `t` (nanoseconds since 1970) as when each volume
-/// was formatted and last changed.
+/// was formatted and last changed, and `key_os_version` ([`key_os_version`]) as the OS version of
+/// each volume's meta-crypto state.
 ///
 /// # Errors
 ///
@@ -107,6 +128,7 @@ pub fn container(
     block_count: u64,
     uuid: [u8; 16],
     t: u64,
+    key_os_version: u32,
     volumes: Vec<VolumeDef>,
 ) -> Result<Formed, tree::TreeError> {
     // A container is given at least as many volume slots as it holds, which sizes its checkpoint
@@ -133,6 +155,7 @@ pub fn container(
                     features,
                     group: def.group,
                     t,
+                    key_os_version,
                     counts: def.counts,
                     seal,
                 },
@@ -156,6 +179,7 @@ pub fn container(
                 next_obj_id: def.next_obj_id,
                 group: def.group,
                 t,
+                key_os_version,
                 records: def.records,
                 streams: &def.streams,
                 counts: def.counts,
@@ -206,6 +230,22 @@ mod tests {
     use super::records::{self, DT_DIR, InodeBuilder, name_xfield};
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    /// The OS version the tests' volumes record: 23G93's.
+    const OS: u32 = 0x1747_005d;
+
+    #[test]
+    fn a_build_is_read_as_the_os_version_its_volumes_record() {
+        assert_eq!(super::key_os_version("23G93"), Some(0x1747_005d));
+        assert_eq!(super::key_os_version("26A434"), Some(0x1a41_01b2));
+        assert_eq!(super::key_os_version("26B131"), Some(0x1a42_0083));
+        assert_eq!(super::key_os_version("24A5264n"), Some(0x1841_1490));
+        assert_eq!(super::key_os_version(""), None);
+        assert_eq!(super::key_os_version("G93"), None);
+        assert_eq!(super::key_os_version("23g93"), None);
+        assert_eq!(super::key_os_version("23G"), None);
+        assert_eq!(super::key_os_version("23\u{e9}93"), None);
+    }
 
     /// A container held as only the blocks written to it, the rest zero — so a reader touches a
     /// handful of blocks without the whole container existing in memory.
@@ -277,7 +317,19 @@ mod tests {
                 empty(),
             ),
         ];
-        let formed = super::container(block_count, [0x33; 16], super::FORMAT_TIME, vols).unwrap();
+        let formed =
+            super::container(block_count, [0x33; 16], super::FORMAT_TIME, OS, vols).unwrap();
+        // Each volume's meta-crypto state records the OS version it is formed for.
+        let stamps: Vec<&[u8]> = formed
+            .blocks
+            .iter()
+            .filter(|(_, b)| {
+                u32::from_le_bytes(b[24..28].try_into().unwrap()) & crate::ondisk::obj::TYPE_MASK
+                    == crate::ondisk::obj::FS
+            })
+            .map(|(_, b)| &b[crate::ondisk::apfs::META_CRYPTO + 12..][..4])
+            .collect();
+        assert_eq!(stamps, [OS.to_le_bytes(); 2]);
         let src = Arc::new(SparseBlocks::of(block_count, formed.blocks));
         let c = crate::open(src).expect("open the container");
         let names: Vec<String> = c
@@ -363,7 +415,7 @@ mod tests {
         let stream_items = built.stream_items.clone();
         let def = super::VolumeDef::of("Files", [0x44; 16], crate::ondisk::apfs::ROLE_NONE, built);
         let formed =
-            super::container(block_count, [0x55; 16], super::FORMAT_TIME, vec![def]).unwrap();
+            super::container(block_count, [0x55; 16], super::FORMAT_TIME, OS, vec![def]).unwrap();
         let mut blocks: HashMap<u64, Vec<u8>> = formed.blocks.into_iter().collect();
         for (s, &first) in formed.stream_blocks[0].iter().enumerate() {
             let data = &bytes[stream_items[s]];
@@ -469,7 +521,7 @@ mod tests {
         let def =
             super::VolumeDef::sealed("Macintosh HD", [0x44; 16], [0x77; 16], built.counts, seal);
         let formed =
-            super::container(block_count, [0x55; 16], super::FORMAT_TIME, vec![def]).unwrap();
+            super::container(block_count, [0x55; 16], super::FORMAT_TIME, OS, vec![def]).unwrap();
         let mut blocks: HashMap<u64, Vec<u8>> = formed.blocks.into_iter().collect();
         for (s, &first) in formed.stream_blocks[0].iter().enumerate() {
             for (k, chunk) in bytes[built.stream_items[s]].chunks(4096).enumerate() {

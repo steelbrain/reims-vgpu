@@ -101,7 +101,8 @@ case-insensitive. A fresh restore has these, in this order **[vz]**:
   - **Recovery**: `/<G>/boot/<H>/` with the same stitched objects, and
     `/<G>/usr/standalone/firmware/arm64eBaseSystem.dmg`, the IPSW's BaseSystem, which the boot
     directory links to.
-  - **Update**: the directories `Firmware`, `Hardware`, `Controller` and `db`.
+  - **Update**: the directories `Firmware`, `Hardware`, `Hardware/Battery`, `Controller` and
+    `db`, as a restore of macOS leaves them.
   - **Data**: none. The guest's first boot makes it by EACS, from the system volume's data
     template, and Preboot holds the cookie that asks for that ("The Data volume, by EACS").
 - **RecoveryOSContainer:** one Recovery volume: `/3D3287DE-280D-4619-AAAB-D97469CA9C71/boot/<SFR

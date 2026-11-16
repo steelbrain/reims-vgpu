@@ -622,6 +622,8 @@ pub fn plan(i: &Inputs<'_>) -> Result<Plan> {
     ] {
         update.dirs(d, mode);
     }
+    // As a restore of macOS leaves it **[measured, 14.6.1: a Virtualization.framework restore]**.
+    update.dirs("Hardware/Battery", 0o700);
 
     // The recoveryOS container.
     let mut recos = Tree::default();

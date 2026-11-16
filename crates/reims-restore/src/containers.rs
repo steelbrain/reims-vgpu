@@ -28,6 +28,9 @@ pub struct Sources<'a> {
     /// When every volume records it was formatted and changed, and every entry made, in
     /// nanoseconds since 1970.
     pub t: u64,
+    /// The OS version every volume's meta-crypto state records: the restored build's
+    /// ([`reims_apfs::write::key_os_version`]).
+    pub key_os_version: u32,
 }
 
 /// One file's bytes, ready to stream into its blocks: held, or read front to back, `len` bytes.
@@ -297,8 +300,14 @@ pub fn write_container(
             }
         }
     }
-    let formed = apfs_write::container(block_count, *Uuid::new_v4().as_bytes(), src.t, defs)
-        .context("lay out the container")?;
+    let formed = apfs_write::container(
+        block_count,
+        *Uuid::new_v4().as_bytes(),
+        src.t,
+        src.key_os_version,
+        defs,
+    )
+    .context("lay out the container")?;
     let base = part.offset();
     for (addr, b) in &formed.blocks {
         disk.seek(SeekFrom::Start(base + addr * block))?;

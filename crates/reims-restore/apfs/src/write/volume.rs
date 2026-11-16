@@ -18,10 +18,15 @@ use super::space::{XID, omap_record};
 use super::tree::{self, Alloc, TreeError, TreeKind};
 
 const BLOCK: usize = BLOCK_SIZE as usize;
-/// The meta-crypto state a volume without encryption records: version 5, class 6, revision 1.
-const META_CRYPTO: [u8; 20] = [
-    0x05, 0, 0, 0, 0, 0, 0, 0, 0x06, 0, 0, 0, 0xb2, 0x01, 0x41, 0x1a, 0x01, 0, 0, 0,
-];
+/// The meta-crypto state a volume without encryption records: version 5, class 6, the OS
+/// version `key_os_version` (see [`super::key_os_version`]), revision 1.
+fn meta_crypto(key_os_version: u32) -> [u8; 20] {
+    let mut m = [
+        0x05, 0, 0, 0, 0, 0, 0, 0, 0x06, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0,
+    ];
+    m[12..16].copy_from_slice(&key_os_version.to_le_bytes());
+    m
+}
 /// A physical extent's kind: a new extent, as every extent a format writes is.
 const PEXT_KIND_NEW: u64 = 1;
 
@@ -61,6 +66,8 @@ pub struct VolumeSpec<'a> {
     pub group: [u8; 16],
     /// The instant the volume records as its own.
     pub t: u64,
+    /// The OS version its meta-crypto state records ([`super::key_os_version`]).
+    pub key_os_version: u32,
     /// The file-system records but file extents, in any order.
     pub records: Vec<(Vec<u8>, Vec<u8>)>,
     /// The data streams, each given blocks of its own.
@@ -262,6 +269,7 @@ pub fn volume(
         data_blocks,
         group: spec.group,
         t: spec.t,
+        key_os_version: spec.key_os_version,
     });
     b.header(sb_oid, XID, obj::FS, 0);
     blocks.push((sb, b.seal()));
@@ -296,6 +304,7 @@ pub(super) struct Super<'a> {
     pub data_blocks: u64,
     pub group: [u8; 16],
     pub t: u64,
+    pub key_os_version: u32,
 }
 
 /// A volume superblock of `s`, its object header left for the caller.
@@ -306,7 +315,7 @@ pub(super) fn superblock(s: &Super) -> Block {
     b.u64(apfs::FEATURES, s.features);
     b.u64(apfs::INCOMPAT, s.incompat);
     b.u64(apfs::ALLOC_COUNT, s.alloc_count);
-    b.bytes(apfs::META_CRYPTO, &META_CRYPTO);
+    b.bytes(apfs::META_CRYPTO, &meta_crypto(s.key_os_version));
     b.u32(apfs::ROOT_TREE_TYPE, obj::BTREE); // virtual
     b.u32(apfs::EXTENTREF_TREE_TYPE, obj::PHYSICAL | obj::BTREE);
     b.u32(apfs::SNAP_META_TREE_TYPE, obj::PHYSICAL | obj::BTREE);

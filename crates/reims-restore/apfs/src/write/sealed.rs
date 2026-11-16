@@ -70,6 +70,8 @@ pub struct SealedSpec<'a> {
     pub features: u64,
     pub group: [u8; 16],
     pub t: u64,
+    /// The OS version its meta-crypto state records ([`super::key_os_version`]).
+    pub key_os_version: u32,
     pub counts: Counts,
     pub seal: Seal,
 }
@@ -331,6 +333,7 @@ pub fn sealed_volume(
         data_blocks,
         group: spec.group,
         t: spec.t,
+        key_os_version: spec.key_os_version,
     };
     let sealed = |b: &mut Block, snapshot: bool| {
         b.u64(crate::ondisk::apfs::NUM_SNAPSHOTS, u64::from(!snapshot));

@@ -272,6 +272,8 @@ pub fn run(r: &Restore, events: &mut dyn FnMut(Event), cancel: &AtomicBool) -> R
         keys: &keys,
         root_hash: None,
         t: nanos(SystemTime::now()),
+        key_os_version: reims_apfs::write::key_os_version(&build)
+            .with_context(|| format!("macOS {version}'s build {build} is not of the form 23G93"))?,
     };
     let written = write(&files, &table, &aux, &the_plan, src, events, cancel)
         .and_then(|()| files.keep_for_eacs(&table));
