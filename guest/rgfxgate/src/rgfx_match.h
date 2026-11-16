@@ -61,3 +61,28 @@ static inline bool rgfx_sibling_path(const char *path, const char *suffix,
 	out[pl + sl] = '\0';
 	return true;
 }
+
+// The signature hook's answer where the real policies refused a code signature
+// (`refusal`, nonzero): 0 for our bundle's executable (`ours`: one of the
+// allowed cdhashes, under the bundles directory), the refusal for anything else.
+// A refusal can be fatal: AMFI hands back a description (`*desc`, `*desc_len`
+// bytes), and the dispatcher (mac_vnode_check_signature) panics where the hook
+// answers 0 with one set. arm64's BaseSystem allows only platform binaries and
+// refuses our ad-hoc signed bundle so. Admitting our bundle drops the
+// description: the length and the pointer are cleared, and the buffer is left
+// as it is, never freed here (RgfxGateHooks.cpp). Returns the answer;
+// `*dropped` says whether a description was dropped. Anything not ours keeps
+// its refusal and its description.
+static inline int rgfx_vsig_answer(int refusal, bool ours, char **desc, size_t *desc_len,
+                                   bool *dropped) {
+	*dropped = false;
+	if (!ours)
+		return refusal;
+	if (desc_len != NULL && *desc_len != 0) {
+		*desc_len = 0;
+		if (desc != NULL)
+			*desc = NULL;
+		*dropped = true;
+	}
+	return 0;
+}

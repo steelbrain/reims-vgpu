@@ -67,6 +67,32 @@ int main() {
 	assert(!rgfx_sibling_path(bundle, ".new", nullptr, sizeof(buf)));
 	assert(!rgfx_sibling_path(bundle, ".new", buf, 0));
 
+	// --- the signature hook's answer (rgfx_vsig_answer) -------------------
+	// Our bundle with a fatal refusal (arm64's BaseSystem, platform binaries
+	// only): admitted, and the description dropped without touching its buffer.
+	char fatalBuf[1024] = "When validating ...: The system only allows platform binaries";
+	char *desc = fatalBuf;
+	size_t descLen = sizeof(fatalBuf);
+	bool dropped = false;
+	assert(rgfx_vsig_answer(1, true, &desc, &descLen, &dropped) == 0);
+	assert(dropped && desc == nullptr && descLen == 0);
+	assert(strncmp(fatalBuf, "When validating", 15) == 0);
+	// Our bundle with a refusal that is not fatal (a full system): admitted,
+	// nothing to drop.
+	desc = nullptr;
+	descLen = 0;
+	assert(rgfx_vsig_answer(1, true, &desc, &descLen, &dropped) == 0);
+	assert(!dropped && desc == nullptr && descLen == 0);
+	// Anything else keeps its refusal and its fatal description, for the
+	// dispatcher to report and free.
+	desc = fatalBuf;
+	descLen = sizeof(fatalBuf);
+	assert(rgfx_vsig_answer(1, false, &desc, &descLen, &dropped) == 1);
+	assert(!dropped && desc == fatalBuf && descLen == sizeof(fatalBuf));
+	// No out-parameters given: admitted all the same.
+	assert(rgfx_vsig_answer(1, true, nullptr, nullptr, &dropped) == 0);
+	assert(!dropped);
+
 	printf("rgfxgate match_test: all assertions passed\n");
 	return 0;
 }

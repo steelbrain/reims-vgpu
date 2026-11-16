@@ -150,9 +150,19 @@ static int wrapVSig(vnode_t vp, void *label, cpu_type_t cpu_type, void *cs_blob,
 	if (r == 0)
 		return 0; // already trusted; leave everything to the real policies
 	const uint8_t *cd = (gCsblobGetCdhash && cs_blob) ? gCsblobGetCdhash(cs_blob) : nullptr;
-	if (cd && rgfx_cdhash_allowed(cd, kRgfxCDHashLen, kAllowed, kAllowedCount) &&
-	    vnodeUnderBundles(vp))
-		return 0; // trust our bundle's own ad-hoc signature, nothing more
+	// Our bundle's own ad-hoc signature is trusted, nothing more. arm64's BaseSystem allows
+	// only platform binaries and makes its refusal fatal; admitting our bundle there drops the
+	// fatal description, whose buffer (1024 bytes on 26.6.2) is left allocated, not freed: the
+	// heap it comes from is AMFI's choice, which no header states, and a free into the wrong
+	// heap panics the kernel. It is one buffer each time a process there adds the bundle's
+	// signature: the few processes of a BaseSystem boot that load Metal (rgfx_vsig_answer).
+	const bool ours = cd && rgfx_cdhash_allowed(cd, kRgfxCDHashLen, kAllowed, kAllowedCount) &&
+	                  vnodeUnderBundles(vp);
+	bool dropped = false;
+	r = rgfx_vsig_answer(r, ours, fatal_failure_desc, fatal_failure_desc_len, &dropped);
+	if (dropped)
+		graft_client_log(kClientID, "the bundle admitted past a fatal signature refusal "
+		                            "(the BaseSystem's platform-binary rule)");
 	return r;
 }
 
