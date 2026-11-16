@@ -1,11 +1,13 @@
 //! The device caches of IOSurfaces (`RGFX_FEATURE_SURFACE_CACHE`; docs/graphics-kext/design.md,
 //! Decided 14, "The device cache", which says each choice's class).
 //!
-//! A GPU that does not share the CPU's memory keeps the GPU's copy of an IOSurface in its own
-//! memory, the surface's device cache, and moves bytes between it and the surface's pages only
-//! where IOSurface's locking asks it to. A block the kext marks cached
-//! ([`RGFX_SURFACE_PAGES_CACHED`]) gets one here: on a host whose GPU is such a GPU, any surface's
-//! block the kext caches; on one whose GPU shares the CPU's memory, only a block the device
+//! A GPU keeps its copy of an IOSurface in its own memory, the surface's device cache, and moves
+//! bytes between it and the surface's pages only where IOSurface's locking asks it to, as a Mac's
+//! GPU does: one of its own memory in that memory, and an Intel GPU, which shares the CPU's, in a
+//! copy of its own too, written into the pages at a CPU lock after a GPU write (**measured** on a
+//! MacBook Pro's UHD 630 under macOS 26.7, jobs m3-max-37817 and 37822). A block the kext marks
+//! cached ([`RGFX_SURFACE_PAGES_CACHED`]) gets one here, on any host; on a device that answers
+//! which blocks need one (`SURFACE_CACHE_REFUSED`, which no host offers now), only a block it
 //! answered needs one, its textures unable to lie in place over its pages
 //! ([`super::surface_pages`], "Device caches where the pages cannot serve"). A cache is a Private
 //! buffer of the surface's bytes, which every `BUFFER_OVER_SURFACE_PAGES` buffer of the block is,
@@ -232,6 +234,18 @@
 //!   for a block refused past the budget: the pages then decide, as on a device that defers
 //!   nothing.
 //!
+//! - **Within a budget.** On a GPU that shares the CPU's memory a cache is host RAM beside the
+//!   guest's pages, so the device bounds them all ([`SurfaceCaches::set_cache_budget`]): every
+//!   cache, deferred or not, fits the deferred blocks' budget together, a quarter of the GPU's
+//!   memory's budget as the platform answers it at the device's start
+//!   ([`GpuDevice::own_memory_budget`]). A cached block past it gets no cache, counted, and lies in
+//!   place in its pages, as where the platform makes none: it takes its view where it was named by
+//!   its runs, and its buffers lie over the view, its textures the runtime's over the pages. A
+//!   deferral past it is refused as past the deferred budget, and the kext names its pages. So
+//!   the copies stay bounded on a small host, and only their speed is lost past the budget. A
+//!   GPU of its own memory sets none: its own memory bounds them, and a cache it does not make
+//!   lies in place alike.
+//!
 //! - **By runs or by a view.** A cache's copies go between it and the pages' runs in the guest's
 //!   RAM where the platform copies by them ([`GpuDevice::copies_guest_ram`]; the block takes no
 //!   view, [`super::surface_pages`]), else through a buffer over the surface's view. A copy by
@@ -241,6 +255,7 @@
 //!   mapping of the pages, so the two never share a command buffer: each copy has a transfer
 //!   command buffer of its own, and a refused copy by runs encodes nothing in it.
 //!
+//! [`GpuDevice::own_memory_budget`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::own_memory_budget
 //! [`GpuDevice::copies_guest_ram`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::copies_guest_ram
 //! [`GpuDevice::recoveries`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::recoveries
 //! [`GpuDevice::linear_rows_pitch`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::linear_rows_pitch
@@ -1089,6 +1104,12 @@ pub(crate) struct CacheCounts {
     /// nanoseconds, where the platform gave it ([`CopyGpu`]).
     pub(crate) fill_gpu_ns: u64,
     pub(crate) out_gpu_ns: u64,
+    /// Blocks given no cache past the caches' budget, which lie in place in their pages, and
+    /// their surfaces' bytes (the module doc, "Within a budget"); the most bytes every cache held
+    /// at once.
+    pub(crate) past_budget: u64,
+    pub(crate) past_budget_bytes: u64,
+    pub(crate) held_most: u64,
 }
 
 /// One cache's pages, host addresses in the guest's RAM, and how many times a device of the host
@@ -1193,6 +1214,12 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// bytes they hold.
     deferred_budget: u64,
     deferred_bytes: u64,
+    /// The bytes every cache may hold at once, deferred or not, on a device whose GPU shares the
+    /// CPU's memory ([`Self::set_cache_budget`]; the module doc, "Within a budget"), `None` on any
+    /// other; the bytes every cache holds, and the most they held at once.
+    cache_budget: Option<u64>,
+    cache_bytes: u64,
+    cache_bytes_most: u64,
     /// The device offers `SURFACE_DEFERRED_ASK`: a deferred block asks with its surface's layout
     /// ([`Self::set_deferred_asks`]).
     deferred_asks: bool,
@@ -1379,6 +1406,9 @@ impl<P: Platform> SurfaceCaches<P> {
             on_fill_done,
             deferred_budget: 0,
             deferred_bytes: 0,
+            cache_budget: None,
+            cache_bytes: 0,
+            cache_bytes_most: 0,
             deferred_asks: false,
             deferred_carries: false,
             into_pages: Vec::new(),
@@ -1473,6 +1503,7 @@ impl<P: Platform> SurfaceCaches<P> {
         CacheCounts {
             fill_gpu_ns: self.copy_gpu.fills.load(Ordering::Relaxed),
             out_gpu_ns: self.copy_gpu.out.load(Ordering::Relaxed),
+            held_most: self.cache_bytes_most,
             ..self.counts
         }
     }
@@ -1508,7 +1539,9 @@ impl<P: Platform> SurfaceCaches<P> {
     /// any other cache it had goes as at a release ([`SurfaceCaches::released`]), and the cache
     /// `made` with the lock let go of ([`CacheMaker::make`]) is taken, its first fill owed as of
     /// `generation`. What is not taken stays in `made`, for the caller to let go of with the lock
-    /// let go of.
+    /// let go of. Past the caches' budget ([`Self::cache_room`]), `made` being `None` as the
+    /// make was not tried, or a cache made larger than the room, nothing is taken and the block
+    /// has no cache, counted: its buffers lie over its pages.
     #[allow(clippy::too_many_arguments)] // make's, and what was made
     fn make_with(
         &mut self,
@@ -1526,6 +1559,19 @@ impl<P: Platform> SurfaceCaches<P> {
         }
         if self.by_block.contains_key(&block) {
             self.released(device, block, 0, None, None, Box::new(|| {}), None)?;
+        }
+        // Past the caches' budget the block lies in place in its pages, as where the platform
+        // makes no cache: the make was not tried, or its cache is let go of by the caller.
+        let room = self.cache_room(block);
+        let past = match made.as_ref() {
+            None => true,
+            Some(Ok(m)) => m.cache.bytes_or(length) > room,
+            Some(Err(_)) => false,
+        };
+        if past {
+            self.counts.past_budget += 1;
+            self.counts.past_budget_bytes += length;
+            return Ok(false);
         }
         let Some(made) = made.take() else {
             return Ok(false);
@@ -1579,6 +1625,7 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         self.watched.0.lock().insert(block, pages);
         self.owed.insert(block);
+        self.hold_bytes(bytes);
         self.counts.made += 1;
         Ok(true)
     }
@@ -1749,7 +1796,7 @@ impl<P: Platform> SurfaceCaches<P> {
         if self.by_block.contains_key(&block) {
             self.released(device, block, 0, None, None, Box::new(|| {}), None)?;
         }
-        let room = self.deferred_budget.saturating_sub(self.deferred_bytes);
+        let room = self.deferred_room(block);
         let made =
             match made.take_if(|new| new.as_ref().map_or(length, |n| n.bytes_or(length)) <= room) {
                 Some(new) => new?.take(&mut self.counts),
@@ -1807,6 +1854,7 @@ impl<P: Platform> SurfaceCaches<P> {
             self.counts.carried += 1;
         }
         self.deferred_bytes += bytes;
+        self.hold_bytes(bytes);
         self.counts.made += 1;
         self.counts.deferred += 1;
         Ok(true)
@@ -1973,6 +2021,29 @@ impl<P: Platform> SurfaceCaches<P> {
         self.deferred_budget = budget;
     }
 
+    /// Sets the bytes every cache may hold at once, deferred or not (the module doc, "Within a
+    /// budget").
+    pub(crate) fn set_cache_budget(&mut self, budget: u64) {
+        self.cache_budget = Some(budget);
+    }
+
+    /// The room the caches' budget has for the block at `block`'s cache, the cache the block has
+    /// going first ([`Self::make_with`], [`Self::make_deferred`]): all there is where the device
+    /// sets no budget ([`Self::set_cache_budget`]).
+    fn cache_room(&self, block: u64) -> u64 {
+        let Some(budget) = self.cache_budget else {
+            return u64::MAX;
+        };
+        let going = self.by_block.get(&block).map_or(0, |cache| cache.bytes);
+        budget.saturating_sub(self.cache_bytes.saturating_sub(going))
+    }
+
+    /// A cache of `bytes` taken: the bytes every cache holds, and the most they held.
+    fn hold_bytes(&mut self, bytes: u64) {
+        self.cache_bytes += bytes;
+        self.cache_bytes_most = self.cache_bytes_most.max(self.cache_bytes);
+    }
+
     /// Has a deferred block ask with its surface's layout from now on, as the device offers
     /// `SURFACE_DEFERRED_ASK` (a device whose GPU shares the CPU's memory).
     pub(crate) fn set_deferred_asks(&mut self) {
@@ -2037,13 +2108,16 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 
     /// The room the deferred caches' budget has for the deferred block at `block`'s cache, the
-    /// cache the block has going first ([`Self::make_deferred`]).
+    /// cache the block has going first ([`Self::make_deferred`]), within the room the caches'
+    /// budget has ([`Self::cache_room`]).
     fn deferred_room(&self, block: u64) -> u64 {
         let going = (self.by_block.get(&block))
             .filter(|cache| cache.deferred.is_some())
             .map_or(0, |cache| cache.bytes);
         let held = self.deferred_bytes.saturating_sub(going);
-        self.deferred_budget.saturating_sub(held)
+        self.deferred_budget
+            .saturating_sub(held)
+            .min(self.cache_room(block))
     }
 
     /// Whether the block at `block` has a cache.
@@ -3231,6 +3305,9 @@ impl<P: Platform> SurfaceCaches<P> {
         }
         let gone = self.by_block.remove(&block);
         self.owed.remove(&block);
+        if let Some(cache) = &gone {
+            self.cache_bytes = self.cache_bytes.saturating_sub(cache.bytes);
+        }
         if let Some(cache) = gone.as_ref().filter(|c| c.deferred.is_some()) {
             self.deferred_bytes = self.deferred_bytes.saturating_sub(cache.bytes);
             if cache.pages.is_none() {
@@ -3492,6 +3569,7 @@ impl<P: Platform> SurfaceCaches<P> {
         self.gone.clear();
         self.owed.clear();
         self.deferred_bytes = 0;
+        self.cache_bytes = 0;
         self.watched.0.lock().clear();
         // What waits for a deferred copy, on the GPU or for a present, waits for it no more.
         for d in deferred.values().flatten() {
@@ -4146,6 +4224,12 @@ impl<P: Platform> Caches<P> {
         self.state.lock().set_deferred_budget(budget);
     }
 
+    /// Sets the bytes every cache may hold at once, deferred or not, on a device whose GPU shares
+    /// the CPU's memory (the module doc, "Within a budget"): set once, at the device's make.
+    pub(crate) fn set_cache_budget(&self, budget: u64) {
+        self.state.lock().set_cache_budget(budget);
+    }
+
     /// Has a deferred block ask with its surface's layout from now on
     /// ([`SurfaceCaches::set_deferred_asks`]): set once, at the device's make.
     pub(crate) fn set_deferred_asks(&self) {
@@ -4707,18 +4791,20 @@ impl<P: Platform> Caches<P> {
         if state.keeps(block, length, &host_pages) {
             return state.named_again(device, block, generation);
         }
-        let maker = state.maker();
+        let (room, maker) = (state.cache_room(block), state.maker());
         drop(state);
         let layout = layout.into_planes();
-        let made = maker.make::<P>(device, length, layout.as_deref());
-        let made = made.and_then(|cache| {
-            let pages = match cache.made.is_some() {
-                true => pages()?,
-                false => None,
-            };
-            Ok(Made { cache, pages })
+        // None past the caches' budget, which the make under the lock counts.
+        let mut made = (length <= room).then(|| {
+            let made = maker.make::<P>(device, length, layout.as_deref());
+            made.and_then(|cache| {
+                let pages = match cache.made.is_some() {
+                    true => pages()?,
+                    false => None,
+                };
+                Ok(Made { cache, pages })
+            })
         });
-        let mut made = Some(made);
         let mut state = self.state.lock();
         self.wait_copies(&mut state, block);
         let taken = state.make_with(
@@ -11100,6 +11186,69 @@ mod tests {
 
         let mut none = deferring(0);
         assert_eq!(defer(&mut none, BLOCK, page), refused, "no budget");
+    }
+
+    /// Where the device sets a budget for every cache (a GPU that shares the CPU's memory), the
+    /// caches fit it together, deferred or not: a cached block past it gets no cache, counted,
+    /// and takes its view, its buffers lying over its pages as a block's whose cache the platform
+    /// does not make; a deferral past it is refused, as past the deferred blocks' budget, so the
+    /// kext names its pages. A release gives the room back. The most the caches held is counted
+    #[test]
+    fn every_cache_fits_the_caches_budget_where_the_device_sets_one() {
+        let mut r = deferring(8);
+        let page = r.page;
+        r.p.world().copy_guest_ram(true);
+        r.dec.set_cache_budget(3 * page);
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(0, 2)], 2 * page, true),
+            RGFX_STATUS_OK
+        );
+        assert!(r.dec.caches().has(BLOCK), "within the budget");
+        let other = BLOCK + 0x8000;
+        assert_eq!(
+            r.pages_cached(other, &[(4, 2)], 2 * page, true),
+            RGFX_STATUS_OK
+        );
+        assert!(!r.dec.caches().has(other), "past the budget");
+        assert_eq!(r.dec.views_of_surfaces().len().0, 1, "its view");
+        assert_eq!(r.buffer(10, other, 2 * page), Ok(()));
+        let third = BLOCK + 0x10000;
+        assert_eq!(
+            defer(&mut r, third, 2 * page),
+            RGFX_STATUS_REFUSED,
+            "a deferral past the caches' budget"
+        );
+        assert!(!r.dec.caches().has(third));
+        let counts = r.dec.caches().counts();
+        assert_eq!(
+            (
+                counts.past_budget,
+                counts.past_budget_bytes,
+                counts.deferred_refused
+            ),
+            (1, 2 * page, 1)
+        );
+
+        assert!(release(&r, BLOCK).load(Ordering::SeqCst));
+        assert_eq!(
+            defer(&mut r, third, 2 * page),
+            RGFX_STATUS_OK,
+            "the room is back"
+        );
+        assert!(r.dec.caches().has(third));
+        assert_eq!(r.dec.caches().counts().held_most, 2 * page);
+
+        let mut unbounded = deferring(8);
+        unbounded.p.world().copy_guest_ram(true);
+        for (i, first) in [0, 2, 4].into_iter().enumerate() {
+            let block = BLOCK + 0x8000 * i as u64;
+            assert_eq!(
+                unbounded.pages_cached(block, &[(first, 2)], 2 * page, true),
+                RGFX_STATUS_OK
+            );
+            assert!(unbounded.dec.caches().has(block), "no budget set");
+        }
+        assert_eq!(unbounded.dec.caches().counts().past_budget, 0);
     }
 
     /// The live Shared buffer `id`'s bytes, each set to `with` first where given.

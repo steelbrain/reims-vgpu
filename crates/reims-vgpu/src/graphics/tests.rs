@@ -9525,11 +9525,12 @@ fn a_release_the_platform_dies_at_is_refused() {
 /// `CB_SCHEDULED` at a thread's ask (`SCHEDULED_ASK`, `FEATURES_HI` bit 1), takes the guest's
 /// stamps of its command buffers (`GUEST_TIMES`, `FEATURES_HI` bit 12), and hands the kext the
 /// answers it kept of keyed pipeline creates (`PIPELINE_ANSWERS`, `FEATURES_HI` bit 15). The fake's GPU shares the
-/// CPU's memory, so a device with `SURFACE_PAGES` answers which surfaces need a device cache
-/// (`SURFACE_CACHE_REFUSED`), keeps none of the rest, defers a fresh one of those that would need
-/// one whatever its pages (`SURFACE_DEFERRED_ASK`), within a quarter of its GPU's own memory's
-/// budget, the few pages a process wrote of it without a lock carried in
-/// (`SURFACE_DEFERRED_CARRY`, `FEATURES_HI` bit 0), and has the guest align the surfaces' rows as
+/// CPU's memory, and a device with `SURFACE_PAGES` keeps a device cache of each surface the kext
+/// caches all the same (`SURFACE_CACHE`), as a Mac on an Intel GPU keeps its own copy of each
+/// surface, never answering which need one (no `SURFACE_CACHE_REFUSED`); defers fresh ones
+/// (`SURFACE_DEFERRED`, never `SURFACE_DEFERRED_ASK`) within a quarter of its GPU's own memory's
+/// budget, the few pages a process wrote of one without a lock carried in
+/// (`SURFACE_DEFERRED_CARRY`, `FEATURES_HI` bit 0); and has the guest align the surfaces' rows as
 /// its GPU's images take them in place (the device info's `linear_row_alignment`), which a device
 /// of no surface pages leaves as they were
 #[test]
@@ -9562,8 +9563,8 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     let in_place = RGFX_FEATURE_SURFACE_PAGES
         | RGFX_FEATURE_PAGES_BUFFERS
         | RGFX_FEATURE_HEAP_OVER_PAGES
-        | RGFX_FEATURE_SURFACE_CACHE_REFUSED
-        | RGFX_FEATURE_SURFACE_DEFERRED_ASK;
+        | RGFX_FEATURE_SURFACE_CACHE
+        | RGFX_FEATURE_SURFACE_DEFERRED;
     let page = platform.vm().page_size();
     assert!(
         page == 4096 || page == 16384,
@@ -9603,7 +9604,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_MESH_PIPELINES
             | RGFX_FEATURE_SHARED_EVENT_NAMES
     );
-    let carries = want & RGFX_FEATURE_SURFACE_DEFERRED_ASK != 0;
+    let carries = want & RGFX_FEATURE_SURFACE_DEFERRED != 0;
     let slots_in_pages = if want != 0 {
         RGFX_FEATURE_ICB_SLOTS_IN_PAGES | RGFX_FEATURE_READ_ONLY_PAGES
     } else {
@@ -9629,8 +9630,8 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
                 0
             }
     );
-    // The fake's GPU shares the CPU's memory: deferred blocks only where they ask.
-    let budget = if want & RGFX_FEATURE_SURFACE_DEFERRED_ASK != 0 {
+    // The fake's GPU shares the CPU's memory, and defers blocks as a GPU of its own memory does.
+    let budget = if want & RGFX_FEATURE_SURFACE_DEFERRED != 0 {
         FAKE_OWN_MEMORY / 4
     } else {
         0

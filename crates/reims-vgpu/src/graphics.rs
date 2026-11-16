@@ -482,11 +482,12 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     .ok_or(Error::InvalidArgument)?;
                 decoder.set_guest_memory(memory, lease);
             }
-            // A GPU of its own memory keeps IOSurfaces' device caches where the kext asks, and
-            // places its `Managed` buffers' CPU copies in the guest's heaps; a GPU that shares the
-            // CPU's memory keeps them only for the surfaces whose pages its textures cannot use
-            // in place, which it answers the kext surface by surface (`SURFACE_CACHE_REFUSED`,
-            // `decode::surface_pages`). Every host answers a
+            // Every host keeps IOSurfaces' device caches where the kext asks (`SURFACE_CACHE`), as
+            // a Mac's GPU keeps its own copy of each surface it uses, synced with the pages at the
+            // CPU's locks; a GPU that shares the CPU's memory keeps them within a budget, past
+            // which a surface lies in place in its pages (`decode::surface_cache`). A GPU of its
+            // own memory places its `Managed` buffers' CPU copies in the guest's heaps. Every host
+            // answers a
             // command buffer's ask for its submission, and a waiting thread's for its scheduling
             // (`SCHEDULED_ASK`), orders command buffers of different queues
             // over the IOSurfaces they share where the guest names the order, commits a process's
@@ -588,26 +589,21 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 } else {
                     0
                 };
-            let pages_features = match (decoder.surface_pages_available(), unified_memory) {
-                (false, _) => 0,
-                // A host whose GPU shares the CPU's memory keeps a device cache only of the
-                // surfaces whose pages its textures cannot use in place, where the kext asks,
-                // and keeps a fresh one of those in its cache alone where the kext defers it,
-                // asking, the few pages a process wrote of it without a lock carried in.
-                (true, true) => {
-                    in_place
-                        | u64::from(RGFX_FEATURE_SURFACE_CACHE_REFUSED)
-                        | u64::from(RGFX_FEATURE_SURFACE_DEFERRED_ASK)
-                        | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
-                }
-                // A host that keeps caches keeps fresh surfaces in them alone where the kext
-                // defers their pages, the few a process wrote without a lock carried in.
-                (true, false) => {
-                    in_place
-                        | u64::from(RGFX_FEATURE_SURFACE_CACHE)
-                        | u64::from(RGFX_FEATURE_SURFACE_DEFERRED)
-                        | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
-                }
+            // Every host that maps the surfaces' pages keeps a device cache of each surface the
+            // kext caches, and keeps fresh surfaces in them alone where the kext defers their
+            // pages, the few a process wrote without a lock carried in. A GPU that shares the
+            // CPU's memory does so too, as a Mac on an Intel GPU keeps its own copy of each
+            // surface the GPU uses and copies it into the pages at a CPU lock after a GPU write
+            // (**measured** on a MacBook Pro's UHD 630, docs/graphics-kext/design.md, Decided
+            // 14): its textures over the surfaces the GPU draws and the CPU never locks (the
+            // compositor's) lie in its own memory rather than over the guest's pages.
+            let pages_features = if decoder.surface_pages_available() {
+                in_place
+                    | u64::from(RGFX_FEATURE_SURFACE_CACHE)
+                    | u64::from(RGFX_FEATURE_SURFACE_DEFERRED)
+                    | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
+            } else {
+                0
             };
             // A host of 16 KiB pages offers the guest RAM's features only to a guest that takes
             // `PAGES_16K`, whose runs are whole 16 KiB pages: the device reads them in
@@ -625,6 +621,19 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             let offerable = features | features_16k;
             let deferred_budget = deferred_budget(offerable, gpu_device.own_memory_budget());
             decoder.set_deferred_budget(deferred_budget);
+            // A GPU that shares the CPU's memory holds every device cache in the host's RAM
+            // beside the guest's pages: they all fit the deferred blocks' budget together, past
+            // which a surface lies in place, so the copies stay bounded on a small host.
+            if unified_memory {
+                decoder.set_cache_budget(deferred_budget);
+            }
+            if unified_memory && deferred_budget != 0 {
+                log::info!(
+                    target: "reims_vgpu::graphics",
+                    "IOSurface device caches: {} MiB at most, the GPU sharing the CPU's memory",
+                    deferred_budget >> 20
+                );
+            }
             if offerable & u64::from(RGFX_FEATURE_SURFACE_DEFERRED_ASK) != 0 {
                 decoder.set_deferred_asks();
             }

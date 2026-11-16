@@ -1258,6 +1258,13 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.surface_caches.set_deferred_budget(budget);
     }
 
+    /// Sets the bytes every device cache may hold at once, deferred or not ([`surface_cache`],
+    /// "Within a budget"), on a device whose GPU shares the CPU's memory: set once, at the
+    /// device's make; without it the caches hold what the platform makes.
+    pub(crate) fn set_cache_budget(&self, budget: u64) {
+        self.surface_caches.set_cache_budget(budget);
+    }
+
     /// Has a deferred block ask with its surface's layout from now on, as the device offers
     /// `SURFACE_DEFERRED_ASK` ([`Self::deferred_surface_pages`]): set once, at the device's make.
     pub(crate) fn set_deferred_asks(&self) {
@@ -1501,7 +1508,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                      host's video, {} not; {} made a dma-buf for the host's video to decode \
                      into, {} not; {} made with their surface's first plane on 256 bytes of \
                      their memory; {} laid out at the GPU's pitch; the GPU's time in the \
-                     fills {} ms, in the copies out {} ms",
+                     fills {} ms, in the copies out {} ms; {} MiB held at most, {} blocks of {} \
+                     MiB in place past the caches' budget",
                     d.made, d.fills, d.filled_bytes >> 20, d.made_fills, d.decode_firsts,
                     d.downloads,
                     d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread,
@@ -1513,7 +1521,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                     self.shared.slow_answers.load(Ordering::Relaxed), SLOW_ANSWER.as_millis(),
                     d.fills_deferred, d.cpu_waits, d.doorbell_free, d.doorbell_waits,
                     d.exportable, d.unexportable, d.dma_buf, d.no_dma_buf, d.aligned,
-                    d.repitched, d.fill_gpu_ns / 1_000_000, d.out_gpu_ns / 1_000_000
+                    d.repitched, d.fill_gpu_ns / 1_000_000, d.out_gpu_ns / 1_000_000,
+                    d.held_most >> 20, d.past_budget, d.past_budget_bytes >> 20
                 );
             }
         }
@@ -2046,8 +2055,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             Ok(true) => {}
             Ok(false) => log::warn!(
                 target: "reims_vgpu::graphics",
-                "the IOSurface block at {block:#x}: the platform made no device cache of its \
-                 {length:#x} bytes; its buffers lie over its pages"
+                "the IOSurface block at {block:#x}: no device cache of its {length:#x} bytes \
+                 (none made, or past the caches' budget); its buffers lie over its pages"
             ),
             Err(raise) => log::warn!(
                 target: "reims_vgpu::graphics", kind:% = raise;
