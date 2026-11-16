@@ -447,6 +447,227 @@ void test_inline_bytes_parallel()
 	} // @autoreleasepool
 }
 
+// Where the device keeps a GPU copy of a Managed buffer (uploadsManaged), the chunks are Managed,
+// and each commit tells the host what its encoders wrote in each chunk it used: one
+// BUFFER_DID_MODIFY_RANGE a chunk, from its start to the end of the last bytes put there, on the
+// control ring before the buffer goes on its own ring. A command buffer committed while an
+// earlier one is in flight takes a chunk of its own, and a chunk the host completed is reused
+// with the extent of its new bytes alone. With Shared chunks a commit tells nothing.
+void test_inline_bytes_managed()
+{
+	MTLTextureDescriptor *shape =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:64
+	                                                      height:64
+	                                                   mipmapped:NO];
+	RgfxMsgHeader none = {};
+	std::vector<uint8_t> noneBytes;
+	const uint32_t a[4] = {0x11111111, 0x22222222, 0x33333333, 0x44444444};
+	const uint8_t t[8] = {9, 8, 7, 6, 5, 4, 3, 2};
+	{
+		QueueFixture fx;
+		@autoreleasepool {
+		fx.queue.uploadsManaged = YES;
+		RgfxTexture *target = shapeTexture(shape, 0x42);
+
+		// Two encoders fill one chunk: the render encoder's 16 bytes at 0, the compute
+		// encoder's 8 at 256.
+		id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
+		id<MTLRenderCommandEncoder> renc = [cb renderCommandEncoderWithDescriptor:onePass(target)];
+		[renc setVertexBytes:a length:sizeof(a) atIndex:1];
+		[renc endEncoding];
+		id<MTLComputeCommandEncoder> cenc = [cb computeCommandEncoder];
+		[cenc setBytes:t length:sizeof(t) atIndex:5];
+		[cenc endEncoding];
+		auto chunk =
+		    expectMessage<RgfxBufferOverHostMemory>(fx.control, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		CHECK(chunk.length == RgfxUploadArena::kUploadChunkSize);
+		CHECK(chunk.options == MTLResourceStorageModeManaged);
+		// Nothing is told before the commit.
+		CHECK(!fx.control.next(&none, &noneBytes));
+		[cb commit];
+		// The range is on the control ring by the time the buffer is on its own.
+		auto range =
+		    expectMessage<RgfxBufferDidModifyRange>(fx.control, RGFX_CMD_BUFFER_DID_MODIFY_RANGE);
+		CHECK(range.obj_id == chunk.obj_id && range.location == 0 && range.length == 256 + 8);
+		CHECK(!fx.control.next(&none, &noneBytes));
+		uint64_t seqno = 0;
+		std::vector<Op> ops = fx.nextOps(&seqno);
+		auto cse = findOp(ops, RGFX_OP_COMPUTE_SET_BUFFERS)
+		               ->elem<RgfxComputeOpSetBuffers, RgfxComputeBufferBinding>(0);
+		CHECK(cse.buffer_obj_id == chunk.obj_id && cse.offset == 256);
+		CHECK(std::memcmp(fx.regionAt(chunk.region_offset, 256), t, sizeof(t)) == 0);
+
+		// In flight still: the next buffer's bytes go in a chunk of their own, told alone.
+		id<MTLCommandBuffer> cb2 = [fx.queue commandBuffer];
+		id<MTLComputeCommandEncoder> cenc2 = [cb2 computeCommandEncoder];
+		[cenc2 setBytes:a length:12 atIndex:0];
+		[cenc2 endEncoding];
+		auto chunk2 =
+		    expectMessage<RgfxBufferOverHostMemory>(fx.control, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		CHECK(chunk2.obj_id != chunk.obj_id && chunk2.options == MTLResourceStorageModeManaged);
+		[cb2 commit];
+		auto range2 =
+		    expectMessage<RgfxBufferDidModifyRange>(fx.control, RGFX_CMD_BUFFER_DID_MODIFY_RANGE);
+		CHECK(range2.obj_id == chunk2.obj_id && range2.location == 0 && range2.length == 12);
+		uint64_t seqno2 = 0;
+		(void)fx.nextOps(&seqno2);
+		// The first chunk's bytes are still the first buffer's.
+		CHECK(std::memcmp(fx.regionAt(chunk.region_offset, 0), a, sizeof(a)) == 0);
+
+		// Once the host completed the first buffer, its chunk is reused from its start, and the
+		// next commit tells the new bytes' extent alone.
+		fx.complete(cb, seqno);
+		id<MTLCommandBuffer> cb3 = [fx.queue commandBuffer];
+		id<MTLComputeCommandEncoder> cenc3 = [cb3 computeCommandEncoder];
+		[cenc3 setBytes:t length:4 atIndex:0];
+		[cenc3 endEncoding];
+		CHECK(!fx.control.next(&none, &noneBytes));
+		[cb3 commit];
+		auto range3 =
+		    expectMessage<RgfxBufferDidModifyRange>(fx.control, RGFX_CMD_BUFFER_DID_MODIFY_RANGE);
+		CHECK(range3.obj_id == chunk.obj_id && range3.location == 0 && range3.length == 4);
+		uint64_t seqno3 = 0;
+		std::vector<Op> ops3 = fx.nextOps(&seqno3);
+		auto cse3 = findOp(ops3, RGFX_OP_COMPUTE_SET_BUFFERS)
+		                ->elem<RgfxComputeOpSetBuffers, RgfxComputeBufferBinding>(0);
+		CHECK(cse3.buffer_obj_id == chunk.obj_id && cse3.offset == 0);
+		CHECK(std::memcmp(fx.regionAt(chunk.region_offset, 0), t, 4) == 0);
+
+		// Bytes past the run's room take the next chunk: each chunk's extent is told, the first
+		// up to the run it left.
+		std::vector<uint8_t> most(RgfxUploadArena::kUploadChunkSize - 0x80, 0x3c);
+		fx.complete(cb2, seqno2);
+		fx.complete(cb3, seqno3);
+		id<MTLCommandBuffer> cb4 = [fx.queue commandBuffer];
+		id<MTLComputeCommandEncoder> cenc4 = [cb4 computeCommandEncoder];
+		[cenc4 setBytes:a length:sizeof(a) atIndex:0];
+		[cenc4 setBytes:most.data() length:most.size() atIndex:1];
+		[cenc4 endEncoding];
+		CHECK(!fx.control.next(&none, &noneBytes));
+		[cb4 commit];
+		auto r4a =
+		    expectMessage<RgfxBufferDidModifyRange>(fx.control, RGFX_CMD_BUFFER_DID_MODIFY_RANGE);
+		auto r4b =
+		    expectMessage<RgfxBufferDidModifyRange>(fx.control, RGFX_CMD_BUFFER_DID_MODIFY_RANGE);
+		CHECK(r4a.obj_id != r4b.obj_id && r4a.location == 0 && r4b.location == 0);
+		CHECK((r4a.length == sizeof(a) && r4b.length == most.size()) ||
+		      (r4b.length == sizeof(a) && r4a.length == most.size()));
+		CHECK(!fx.control.next(&none, &noneBytes));
+		uint64_t seqno4 = 0;
+		(void)fx.nextOps(&seqno4);
+		fx.complete(cb4, seqno4);
+		} // @autoreleasepool
+	}
+	{
+		// Shared chunks: the host reads them in place, and a commit tells nothing.
+		QueueFixture fx;
+		@autoreleasepool {
+		id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
+		id<MTLComputeCommandEncoder> cenc = [cb computeCommandEncoder];
+		[cenc setBytes:t length:sizeof(t) atIndex:5];
+		[cenc endEncoding];
+		auto chunk =
+		    expectMessage<RgfxBufferOverHostMemory>(fx.control, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		CHECK(chunk.options == MTLResourceStorageModeShared);
+		[cb commit];
+		CHECK(!fx.control.next(&none, &noneBytes));
+		uint64_t seqno = 0;
+		(void)fx.nextOps(&seqno);
+		fx.complete(cb, seqno);
+		} // @autoreleasepool
+	}
+}
+
+// A parallel pass's sub-encoders fill Managed chunks from threads of their own: each chunk's
+// told extent holds every binding's bytes in it.
+void test_inline_bytes_managed_parallel()
+{
+	QueueFixture fx;
+	@autoreleasepool {
+	fx.queue.uploadsManaged = YES;
+	RgfxTexture *target = shapeTexture(
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:64
+	                                                      height:64
+	                                                   mipmapped:NO],
+	    0x42);
+	constexpr uint32_t kSubs = 4, kPuts = 40;
+	id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
+	id<MTLParallelRenderCommandEncoder> par =
+	    [cb parallelRenderCommandEncoderWithDescriptor:onePass(target)];
+	std::vector<id<MTLRenderCommandEncoder>> subs;
+	for (uint32_t i = 0; i < kSubs; i++)
+		subs.push_back([par renderCommandEncoder]);
+	std::vector<std::thread> threads;
+	for (uint32_t i = 0; i < kSubs; i++) {
+		id<MTLRenderCommandEncoder> sub = subs[i];
+		threads.emplace_back([sub, i] {
+			@autoreleasepool {
+				for (uint32_t j = 0; j < kPuts; j++) {
+					const uint32_t v[4] = {i, j, 0, 0};
+					[sub setVertexBytes:v length:sizeof(v) atIndex:0];
+				}
+				[sub endEncoding];
+			}
+		});
+	}
+	for (std::thread &t : threads)
+		t.join();
+	[par endEncoding];
+	id<MTLComputeCommandEncoder> cenc = [cb computeCommandEncoder];
+	const uint32_t last[4] = {9, 8, 7, 6};
+	[cenc setBytes:last length:sizeof(last) atIndex:0];
+	[cenc endEncoding];
+	std::vector<uint64_t> chunkIds;
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	while (fx.control.next(&h, &bytes)) {
+		CHECK(h.type == RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		RgfxBufferOverHostMemory c = {};
+		std::memcpy(&c, bytes.data(), sizeof(c));
+		CHECK(c.options == MTLResourceStorageModeManaged);
+		chunkIds.push_back(c.obj_id);
+	}
+	CHECK(!chunkIds.empty());
+	[cb commit];
+	std::vector<std::pair<uint64_t, uint64_t>> told; // chunk, extent
+	while (fx.control.next(&h, &bytes)) {
+		CHECK(h.type == RGFX_CMD_BUFFER_DID_MODIFY_RANGE);
+		RgfxBufferDidModifyRange r = {};
+		std::memcpy(&r, bytes.data(), sizeof(r));
+		CHECK(r.location == 0);
+		CHECK(std::find_if(told.begin(), told.end(),
+		                   [&](const auto &p) { return p.first == r.obj_id; }) == told.end());
+		told.emplace_back(r.obj_id, r.length);
+	}
+	CHECK(told.size() == chunkIds.size());
+	auto extentOf = [&](uint64_t objId) -> uint64_t {
+		for (const auto &p : told) {
+			if (p.first == objId)
+				return p.second;
+		}
+		return 0;
+	};
+	uint64_t seqno = 0;
+	std::vector<Op> ops = fx.nextOps(&seqno);
+	uint32_t bound = 0;
+	for (const Op &op : ops) {
+		if (op.tag == RGFX_OP_RENDER_SET_VERTEX_BUFFER) {
+			auto vb = op.as<RgfxOpSetVertexBuffer>();
+			CHECK(vb.offset + 16 <= extentOf(vb.buffer_obj_id));
+			bound++;
+		} else if (op.tag == RGFX_OP_COMPUTE_SET_BUFFERS) {
+			auto cse = op.elem<RgfxComputeOpSetBuffers, RgfxComputeBufferBinding>(0);
+			CHECK(cse.offset + sizeof(last) <= extentOf(cse.buffer_obj_id));
+			bound++;
+		}
+	}
+	CHECK(bound == kSubs * kPuts + 1);
+	fx.complete(cb, seqno);
+	} // @autoreleasepool
+}
+
 // Without a region the bytes have nowhere to go: no binding is made (and it is logged), and the
 // command buffer fails with MTLCommandBufferErrorOutOfMemory.
 void test_inline_bytes_without_region()
@@ -3209,6 +3430,8 @@ void rgfxProtocolTests()
 {
 	test_inline_bytes();
 	test_inline_bytes_parallel();
+	test_inline_bytes_managed();
+	test_inline_bytes_managed_parallel();
 	test_inline_bytes_without_region();
 	test_commit_behind_an_untaken_buffer_fails();
 	test_commit_hands_its_publish_to_the_held();

@@ -4538,8 +4538,14 @@ the host's import, and the kext's block table holds one entry per slab:
   region's, as is a slab where the kernel gives no pages or the kext gives no
   pages block. Why the process's own pages: in the region the guest's stores
   ran at 13 MB/s (Decided 5, "The guest maps host memory only"). A queue's
-  upload chunks, the bytes `set*Bytes:` hands in, are Shared buffers of the
-  slabs too. A slab let go destroys its heap, releases its pages block (the
+  upload chunks, the bytes `set*Bytes:` hands in, are buffers of the slabs
+  too: Shared where the device answers `hasUnifiedMemory` YES, so the GPU
+  reads them in place, and Managed where it answers NO, each commit sending a
+  `BUFFER_DID_MODIFY_RANGE` of each chunk's written bytes ahead of the
+  command buffer, so the host copies them into the GPU's own memory before
+  the buffer runs, as Metal's driver copies `setBytes:` data into its own
+  memory on the AMD 5300M (`guest/bundle/src/RgfxUploads.h`). A slab let go
+  destroys its heap, releases its pages block (the
   kext answers once the host let go of it, and unwires the pages), then
   deallocates its pages.
 - The kext's chunks first (selector 12, `PagesChunked`, where the kext's word

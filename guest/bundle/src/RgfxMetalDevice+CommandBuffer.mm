@@ -111,6 +111,10 @@ constexpr uint32_t kQueueCompleteDataSize = 32768;
 	// Its command buffers that commitAndWaitUntilSubmitted commits ask for their submission
 	// where the host answers it.
 	const RgfxCaps *caps = [self caps];
+	// Its set*Bytes bytes lie in Managed chunks, which the host copies into its GPU's memory at
+	// each commit, where that GPU has memory of its own, as a discrete Mac's driver copies them
+	// into its own; else in Shared chunks the GPU reads in place (RgfxUploads.h).
+	queue.uploadsManaged = caps != nullptr && caps->valid() && ![self hasUnifiedMemory];
 	queue.asksSubmitted = caps != nullptr && (caps->features() & RGFX_FEATURE_CB_SUBMITTED) != 0;
 	// A thread that waits for one of them to be scheduled asks for its record where the host
 	// answers that.

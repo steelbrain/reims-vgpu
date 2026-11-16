@@ -2,11 +2,12 @@
  * RgfxUploads: where the bytes an encoder's set*Bytes:length:atIndex: hands in go, so the host
  * reads them as a buffer bound at an offset (the wire carries no inline constant data).
  *
- * A queue holds one RgfxUploadPool: chunks, each a Shared buffer of the device's slabs
+ * A queue holds one RgfxUploadPool: chunks, each a buffer of the device's slabs
  * (RgfxSlabs.hpp), which lie in the process's own pages where the device maps them, or, where
- * the pool has no slabs, a Shared buffer over a block of the device region (one
- * BUFFER_OVER_HOST_MEMORY on ring 0 when the chunk is made, none after). The host sees either in
- * place, so the bytes are copied once, into the chunk, and never again. The pages first: the
+ * the pool has no slabs, a buffer over a block of the device region (one
+ * BUFFER_OVER_HOST_MEMORY on ring 0 when the chunk is made, none after); Shared, or Managed on a
+ * GPU of its own memory (below). The host sees a Shared chunk in place, so the bytes are copied
+ * once, into the chunk, and never again. The pages first: the
  * region is mapped uncached in the guest, which an AMD host applies (RgfxRegion.hpp). A command
  * buffer holds one RgfxUploadArena: it takes chunks from its queue's pool as its encoders need
  * room, packs each call's bytes at the next 256-byte boundary (the largest constant-buffer
@@ -23,6 +24,18 @@
  * 100 ns in a macOS 26.7.2 x86 guest on a Radeon 780M host and on an RTX 3090 host, against 12 ns
  * for Metal's on an AMD 5300M and an Intel 630, and `sample` put 89% of it in
  * os_unfair_lock_unlock (measured with tools/encode_probe.m, 2026-11-12).
+ *
+ * Where the device keeps a GPU copy of a Managed buffer (it answers hasUnifiedMemory NO: a GPU
+ * of its own memory), the chunks are Managed buffers, and the commit tells the host the bytes
+ * its encoders wrote in each (tellWritten: a didModifyRange: of each chunk's written extent), so
+ * the GPU reads them from its own memory, as Metal's driver copies set*Bytes data into its own
+ * memory on the AMD 5300M (1.00x of a Private buffer's reads, where a Shared buffer's over the
+ * bus read 1.05x at 4 KiB and up to 1.5x at 64 KiB on a dependent chain; measured with a
+ * constant-read probe under macOS 26.7.1, 2026-11-16). The range message goes ahead of the
+ * command buffer on the control ring, as an app's does, and the host copies the range into the
+ * GPU's copy before the buffer's commands. A chunk goes back to its pool only once the host has
+ * completed the command buffer, so no command buffer in flight reads a chunk a later one writes.
+ * Where the GPU shares the CPU's memory the chunks are Shared, and the host reads them in place.
  *
  * Thread safety: one thread puts through a cursor at a time, as Metal's encoders are used; the
  * arena's chunks, its spare run and the pool are each locked: runs are taken and handed back on
@@ -51,21 +64,24 @@ class RgfxRegion;
 class RgfxSerializer;
 class RgfxSlabs;
 
-/// One chunk: its buffer (a Shared RgfxBuffer of the slabs, or over a region block), CPU pointer
-/// and size.
+/// One chunk: its buffer (an RgfxBuffer of the slabs, or over a region block, Shared or
+/// Managed as its pool's), CPU pointer and size, and, while a command buffer holds it, the bytes
+/// from its start the command buffer's puts wrote (RgfxUploadArena::tellWritten).
 struct RgfxUploadChunk {
 	id<MTLBuffer> buffer;
 	uint8_t *bytes;
 	uint64_t size;
+	uint64_t written = 0;
 };
 
 class RgfxUploadPool {
 public:
 	/// A pool over `slabs` where given, else over `region`, its chunks' buffers created through
-	/// `serializer` for `device` (weak; nil in a unit test). The pointers are borrowed and outlive
-	/// the pool's queue.
+	/// `serializer` for `device` (weak; nil in a unit test), Managed where `managed` (the
+	/// device keeps a GPU copy of a Managed buffer), else Shared. The pointers are borrowed and
+	/// outlive the pool's queue.
 	RgfxUploadPool(RgfxRegion *region, RgfxSerializer *serializer, id<MTLDevice> device,
-	               RgfxSlabs *slabs = nullptr);
+	               RgfxSlabs *slabs = nullptr, bool managed = false);
 
 	/// A free chunk of at least `size` bytes, made where none is free. `ok` false (no chunk)
 	/// where the region has no room or the pool has no region or route.
@@ -77,10 +93,14 @@ public:
 	/// How many chunks the pool has made (diagnostics and tests).
 	uint64_t made() const;
 
+	/// Whether its chunks are Managed buffers, whose written bytes a commit tells the host.
+	bool managed() const { return m_managed; }
+
 private:
 	RgfxRegion *m_region;
 	RgfxSerializer *m_serializer;
 	RgfxSlabs *m_slabs;
+	const bool m_managed;
 	__weak id<MTLDevice> m_device;
 	mutable std::mutex m_lock;
 	std::vector<RgfxUploadChunk> m_free;
@@ -131,14 +151,16 @@ private:
 };
 
 /// The run of an arena's chunk one encoder fills (RgfxUploadArena::put): the chunk's buffer and
-/// bytes, its size, the next free byte, and the arena's generation when it was taken. Empty
-/// (no bytes) until the encoder's first put, and once handed back (RgfxUploadArena::release).
+/// bytes, its size, the next free byte, the arena's generation when it was taken, and which of
+/// the arena's chunks it is. Empty (no bytes) until the encoder's first put, and once handed
+/// back (RgfxUploadArena::release).
 struct RgfxUploadCursor {
 	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint8_t *bytes = nullptr;
 	uint64_t size = 0;
 	uint64_t at = 0;
 	uint64_t generation = 0;
+	size_t chunk = 0;
 };
 
 class RgfxUploadArena {
@@ -176,6 +198,12 @@ public:
 	/// handed back).
 	void release(RgfxUploadCursor &cursor);
 
+	/// At the command buffer's commit, once its encoders have ended: where the pool's chunks are
+	/// Managed, a didModifyRange: of each chunk's bytes the puts wrote, from its start to the end
+	/// of the last run's bytes, so the host's copy of them in the GPU's memory holds them before
+	/// the buffer runs. Nothing where they are Shared, or nothing was put.
+	void tellWritten();
+
 	/// Gives every chunk taken back to the pool: the host is done reading them. A cursor's run
 	/// taken before it is the pool's again, and the cursor's next put takes another.
 	void giveBack();
@@ -195,6 +223,9 @@ private:
 	/// the lock, then copies there.
 	bool refill(RgfxUploadCursor &cursor, const void *bytes, uint64_t length,
 	            __unsafe_unretained id<MTLBuffer> *buffer, uint64_t *offset);
+	/// Notes the bytes `cursor`'s run wrote in its chunk, where it holds a run of this
+	/// generation's, as it leaves the run. Under the lock.
+	void noteWritten(const RgfxUploadCursor &cursor);
 
 	std::shared_ptr<RgfxUploadPool> m_pool;
 	os_unfair_lock m_lock = OS_UNFAIR_LOCK_INIT; // a run's take is a few stores: no sleeping lock

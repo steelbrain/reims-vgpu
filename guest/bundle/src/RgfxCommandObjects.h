@@ -121,9 +121,15 @@ NS_ASSUME_NONNULL_BEGIN
 /// one: such a buffer then completes with an out-of-memory error.
 @property(nonatomic, nullable) RgfxRegion *region;
 
-/// The device's slabs (borrowed) the queue's upload chunks are Shared buffers of (RgfxUploads.h).
+/// The device's slabs (borrowed) the queue's upload chunks are buffers of (RgfxUploads.h).
 /// Null in a unit test without them: the chunks are then blocks of the region.
 @property(nonatomic, nullable) RgfxSlabs *slabs;
+
+/// Whether the queue's upload chunks are Managed buffers, whose bytes each commit tells the host
+/// (RgfxUploads.h): where the device keeps a GPU copy of a Managed buffer, which it answers
+/// hasUnifiedMemory NO for. Set before the queue's first command buffer; NO by default, Shared
+/// chunks.
+@property(nonatomic) BOOL uploadsManaged;
 
 /// Whether a command buffer of it that commitAndWaitUntilSubmitted commits, or that it commits
 /// once one of its buffers has presented a drawable, asks the host for its submission

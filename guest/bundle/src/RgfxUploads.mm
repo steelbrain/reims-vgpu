@@ -6,7 +6,9 @@
 
 #import "RgfxBuffer.h"
 
+#include <algorithm>
 #include <cstring>
+#include <utility>
 
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
@@ -21,8 +23,9 @@ uint64_t alignUp(uint64_t v, uint64_t a)
 } // namespace
 
 RgfxUploadPool::RgfxUploadPool(RgfxRegion *region, RgfxSerializer *serializer,
-                               id<MTLDevice> device, RgfxSlabs *slabs)
-    : m_region(region), m_serializer(serializer), m_slabs(slabs), m_device(device)
+                               id<MTLDevice> device, RgfxSlabs *slabs, bool managed)
+    : m_region(region), m_serializer(serializer), m_slabs(slabs), m_managed(managed),
+      m_device(device)
 {
 }
 
@@ -45,10 +48,12 @@ bool RgfxUploadPool::take(uint64_t size, RgfxUploadChunk *chunk)
 	                             ? size
 	                             : RgfxUploadArena::kUploadChunkSize,
 	                         RgfxRegion::kDefaultBlockAlign);
-	// A Shared buffer of the slabs, in the process's own pages where the device maps them.
+	const MTLResourceOptions options =
+	    m_managed ? MTLResourceStorageModeManaged : MTLResourceStorageModeShared;
+	// A buffer of the slabs, in the process's own pages where the device maps them.
 	if (m_slabs != nullptr) {
 		RgfxBuffer *buffer = [RgfxBuffer bufferForDeviceWithLength:static_cast<NSUInteger>(bytes)
-		                                                   options:MTLResourceStorageModeShared
+		                                                   options:options
 		                                                     bytes:nullptr
 		                                                 maxLength:0
 		                                                     slabs:m_slabs
@@ -73,12 +78,13 @@ bool RgfxUploadPool::take(uint64_t size, RgfxUploadChunk *chunk)
 		return false;
 	}
 	uint8_t *ptr = const_cast<uint8_t *>(block.ptr);
-	// A Shared buffer over the block: the host reads the bytes in place.
+	// A buffer over the block: the host reads a Shared one's bytes in place, and a Managed one's
+	// CPU copy is them.
 	RgfxBuffer *buffer =
 	    [RgfxBuffer bufferOverHostMemoryWithContents:ptr
 	                                    regionOffset:block.offset
 	                                          length:static_cast<NSUInteger>(bytes)
-	                                         options:MTLResourceStorageModeShared
+	                                         options:options
 	                                     deallocator:nil
 	                                          device:m_device
 	                                      serializer:m_serializer];
@@ -100,6 +106,7 @@ void RgfxUploadPool::giveBack(std::vector<RgfxUploadChunk> &chunks)
 {
 	std::lock_guard<std::mutex> hold(m_lock);
 	for (RgfxUploadChunk &c : chunks) {
+		c.written = 0;
 		m_free.push_back(c);
 	}
 	chunks.clear();
@@ -203,6 +210,7 @@ bool RgfxUploadArena::refill(RgfxUploadCursor &cursor, const void *bytes, uint64
 	}
 	uint64_t at = alignUp(cursor.at);
 	if (cursor.bytes == nullptr || at > cursor.size || length > cursor.size - at) {
+		noteWritten(cursor); // the run it leaves
 		RgfxUploadChunk chunk = {};
 		// Rare: a chunk a 64 KiB of bytes, from the pool, which may make one.
 		if (!m_pool->take(length == 0 ? 1 : length, &chunk)) {
@@ -216,6 +224,7 @@ bool RgfxUploadArena::refill(RgfxUploadCursor &cursor, const void *bytes, uint64
 		cursor.bytes = chunk.bytes;
 		cursor.size = chunk.size;
 		cursor.generation = generation;
+		cursor.chunk = m_chunks.size() - 1;
 		at = 0;
 	}
 	os_unfair_lock_unlock(&m_lock);
@@ -237,11 +246,40 @@ void RgfxUploadArena::release(RgfxUploadCursor &cursor)
 		return at < c.size ? c.size - at : 0;
 	};
 	os_unfair_lock_lock(&m_lock);
+	noteWritten(cursor);
 	if (cursor.generation == m_generation.load(std::memory_order_relaxed) &&
 	    (m_spare.bytes == nullptr || room(cursor) > room(m_spare)))
 		m_spare = cursor;
 	os_unfair_lock_unlock(&m_lock);
 	cursor = {};
+}
+
+void RgfxUploadArena::noteWritten(const RgfxUploadCursor &cursor)
+{
+	// A run of an older generation's lies in a chunk given back: nothing of this buffer's.
+	if (cursor.bytes == nullptr || cursor.generation != m_generation.load(std::memory_order_relaxed) ||
+	    cursor.chunk >= m_chunks.size())
+		return;
+	RgfxUploadChunk &chunk = m_chunks[cursor.chunk];
+	chunk.written = std::max(chunk.written, std::min(cursor.at, chunk.size));
+}
+
+void RgfxUploadArena::tellWritten()
+{
+	if (m_pool == nullptr || !m_pool->managed())
+		return;
+	// Each chunk's extent is noted as its runs end (release, refill): its encoders have ended.
+	std::vector<std::pair<id<MTLBuffer>, uint64_t>> written;
+	os_unfair_lock_lock(&m_lock);
+	written.reserve(m_chunks.size());
+	for (const RgfxUploadChunk &c : m_chunks) {
+		if (c.written != 0)
+			written.emplace_back(c.buffer, c.written);
+	}
+	os_unfair_lock_unlock(&m_lock);
+	// The chunks are the arena's until giveBack, after the host completed the buffer.
+	for (const auto &[buffer, length] : written)
+		[buffer didModifyRange:NSMakeRange(0, static_cast<NSUInteger>(length))];
 }
 
 void RgfxUploadArena::giveBack()
