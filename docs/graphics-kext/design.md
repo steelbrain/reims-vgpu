@@ -4344,7 +4344,15 @@ granularity. The host preserves it so IOGPU error reporting lines up.
 command-buffer `ObjId`, status, GPU start/end time, and on error the
 `CommandBufferError` the host maps 1:1 from the IOGPU code the runtime returns
 (page fault, hang/timeout, recovery victim, access revoked, invalid resource —
-the map m2v gave). The ring's armed/interrupt handshake is the stage-2 one.
+the map m2v gave). The guest takes the GPU times as the run's length alone,
+the device's clock being the host's: the bundle answers `GPUEndTime` with the
+guest's own clock as it takes the record, and `GPUStartTime` with the record's
+end less its start before that, no earlier than the buffer's post
+(`rgfxNoteGPUTimes:`, held by `test_reply_reader_completion`); a buffer with
+no times (a failed one) starts as it ends. A buffer committed in parts sends
+its first part's start and its parts' GPU time summed, so its record's end
+can fall before its last part's end ("A command buffer in parts").
+The ring's armed/interrupt handshake is the stage-2 one.
 The buffer's completion-seen handler posts it, with the values of the shared
 events it signalled ahead of it: on metal2vulkan the runtime's thread that saw
 the buffer complete runs it, in its queue's commit order, and with no
@@ -5188,7 +5196,13 @@ commit. Each outcome the new design allows is one of those two:
   times": the GPU's waits between parts are for the host's walk, which a
   Mac's GPU, handed the whole buffer at its commit, never has; one buffer on
   both x86 Macs spans its encoders' GPU time summed, and macOS's compositor
-  reads a buffer's GPU times). While a buffer's parts are
+  reads a buffer's GPU times). The record's end so falls before the last
+  part's own end by those waits (2.3 to 2.6 ms at the median in steady
+  Launchpad on a Radeon 780M, 11-16), and the guest never reads it as a time:
+  its `GPUEndTime` is when it took the record and its `GPUStartTime` the
+  record's span before that ("Completion", below), so it sees the parts' GPU
+  time summed as the run, ending after the last part's end by the record's
+  delivery, as a whole buffer's does. While a buffer's parts are
   out, from its first part's commit to its last, no other command buffer of
   its context is committed (each waits at its commit, never at its walk), and
   the context's range messages that come are carried out after its last

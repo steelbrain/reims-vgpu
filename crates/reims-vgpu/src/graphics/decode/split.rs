@@ -92,6 +92,21 @@
 //! whole answers it. It never ends after the last part's end, where parts that overlap on the GPU
 //! sum to more.
 //!
+//! So the record's end (`gpu_end_ns`) falls before the last part's own end by the GPU's waits
+//! between parts, and no guest code reads it as a time: the bundle answers `GPUEndTime` with the
+//! guest's own clock as it takes the record, and `GPUStartTime` with the record's end less its
+//! start before that, no earlier than the buffer's post (`rgfxNoteGPUTimes:`, held by the bundle's
+//! `test_reply_reader_completion`). The guest so sees the parts' GPU time summed as the buffer's
+//! run, ending after its last part's end by the record's delivery, as a buffer committed whole
+//! does. In steady Launchpad on a Radeon 780M (macOS 26.7.2, metal2vulkan 574223a971, 11-16), 63%
+//! of the guest's command buffers, all WindowServer's, were committed in parts (16 at the median,
+//! 28 at most). Their gaps came to 2.3 to 2.6 ms at the median, and their records were posted 79
+//! to 80 us after the last part's own end at the median and 0.44 to 0.95 ms at the 99th
+//! percentile, against 66 to 69 and 115 us for a buffer committed whole (measured, lane splitend's
+//! walk sb-base1, m3-max-35830). Of the readers of these times in macOS 27's frameworks
+//! (QuartzCore's `CA::OGL::MetalContext` completed handlers, SkyLight's hitch telemetry and debug
+//! HUD, RenderBox's frame statistics), none paces frames from them (read from their code).
+//!
 //! **What another message sees** ([`SplitGate`]). While a buffer of a context has parts out, from
 //! its first part's commit to its last, no other command buffer of the context is committed, and
 //! the context's range messages that come are carried out after its last commit: each other
