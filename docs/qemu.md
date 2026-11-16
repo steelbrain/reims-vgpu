@@ -142,6 +142,7 @@ virtio device (`d151bcd9`, upstream's `b501f21312`).
 | on Windows, shared RAM (`memory-backend-ram,share=on`, any RAM_SHARED block) is a view of a section the paging file backs, whose handle the RAMBlock keeps (`qemu_ram_get_section`); `qemu_win32_map_alloc` passes a size's high 32 bits ("Windows hosts: guest RAM in a section", below) | `6c2cae16` |
 | `reims-graphics-pci` on Windows: meson looks for the library there too, the memory walk passes each range of RAM that is a view of a section with the section's handle and the range's offset in it, and the control ring's doorbell is the EventNotifier's event | `a86885f8` |
 | the `dsound` audiodev plays where Windows has no recording device: its capture object is optional, where realize failed without one and QEMU exited ("Could not initialize DirectSoundCapture"); an input voice then fails to initialize, and reims-ctl gives such a host's input device a `none` audiodev of its own ("Windows hosts: sound", below) | `e435673c` |
+| WHPX on a host that is not Intel's intercepts the #GP of an MSR access (`intercept-msr-gp`, on by default there), and keeps an Intel guest's IA32_SYSENTER_ESP and _EIP at 64 bits, giving Hyper-V their low 32, and its MISC_ENABLE, FEATURE_CONTROL and PLATFORM_INFO, which Hyper-V on AMD answers with #GP: macOS panicked on the first two at boot ("Windows hosts", below) | `40257041` |
 
 The branch's other commits are the apple-gfx work `96e1b470` removes, and
 `cfaadbfa09`, an HVF workaround that `478c28ff70` reverts, upstream having
@@ -886,6 +887,27 @@ the library and `ninja -j12 qemu-system-x86_64.exe` 293 s, beside SDL
 - **No `dump-guest-core=off`.** QEMU refuses it on Windows ("Dumping guest
   memory cannot be disabled on this host") and exits, so a Windows host's
   `-machine` leaves it out.
+- **An AMD host.** Hyper-V on a Ryzen 5 5600G (Windows 11 Pro 26200, an
+  RTX 3060 beside its Radeon iGPU) answers with #GP what an Intel guest
+  does there that AMD's CPU does not, and macOS stopped at the Apple logo
+  with no progress bar (**measured** 2026-11-16, Tahoe's recovery, Darwin
+  25.6.0, on reims-ctl's Skylake-Client-noTSX-IBRS):
+  - the TSC deadline timer: QEMU's every register sync logs
+    `WHPX: Failed to set register 00002095, hr=c0350005`
+    (`WHvX64RegisterTscDeadline`), and the guest's kernel, which takes the
+    timer where CPUID offers it, waits for interrupts that never come. The
+    VM's CPU flags drop it (`-tsc-deadline` in `vm.toml`'s `cpu_flags`), and
+    the kernel takes the local APIC's timer; reims-ctl does not do so yet.
+  - the kernel's `wrmsr` of a 64-bit address to IA32_SYSENTER_EIP (0x176:
+    AMD's SYSENTER MSRs hold 32 bits), then its `rdmsr` of IA32_MISC_ENABLE
+    (0x1a0, in `commpage_post_ucode_update`): "Kernel trap ... type =
+    13=general protection" each time, before the console was up, read from
+    the stack over QMP with `debug=0x100` in the boot-args. From `40257041`
+    WHPX intercepts such a #GP by default on a host that is not Intel's
+    (`intercept-msr-gp`) and keeps those MSRs as KVM keeps them for an
+    Intel guest on AMD. The guest then reached Recovery, installed 26 and
+    reached Setup Assistant. A further MSR Hyper-V refuses shows as
+    `WHPX: unknown msr 0x...` in the QEMU log.
 
 ### Windows hosts: installing
 
