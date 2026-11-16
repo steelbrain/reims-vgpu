@@ -1783,7 +1783,7 @@ const _: () = {
     assert!(offset_of!(RgfxRingHeader, raise_all) == 0xc4);
     assert!(size_of::<RgfxMsgHeader>() == 16);
     assert!(size_of::<RgfxVtMessage>() == RGFX_VT_MESSAGE_RUNS_OFFSET as usize);
-    assert!(size_of::<RgfxVtSurface>() == 96);
+    assert!(size_of::<RgfxVtSurface>() == 88);
     assert!(size_of::<RgfxVtSurfacePlane>() == 24);
     assert!(size_of::<RgfxVtStatus>() == 24);
     assert!(size_of::<RgfxVtHostMessage>() == RGFX_VT_HOST_MESSAGE_BYTES_OFFSET as usize);
