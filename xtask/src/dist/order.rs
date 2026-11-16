@@ -12,7 +12,7 @@
 //! that the archive no longer has is skipped: a stale list places fewer functions, and fails
 //! nothing.
 //!
-//! `cargo xtask link-order BINARY CALL_GRAPH` writes the list ([`cmd_link_order`]): the functions
+//! `cargo xtask link-order BINARY CALL_GRAPH` writes the list (`cmd_link_order`): the functions
 //! of this tree's archive that `CALL_GRAPH` names (lld's `--call-graph-ordering-file`, a profile's
 //! calls), in their address order in `BINARY`, a QEMU lld linked with that file, which clusters
 //! callers with their callees (docs/development.md, "The link order").
