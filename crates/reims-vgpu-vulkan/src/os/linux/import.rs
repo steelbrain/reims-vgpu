@@ -3319,8 +3319,10 @@ mod tests {
     /// buffers over a view of the guest's RAM in two runs inside one region, each 16 pages at an
     /// offset in the file 64 KiB divides (a slab of the bundle's 64 KiB chunks), are bound plainly
     /// in one import of the view's dma-buf: the first, over the whole view, imports it, and the
-    /// second, over 16 pages across both runs, joins it; no sparse buffer and no piece of the
-    /// region's file (`super::dma_buf`'s module docs, "Several pieces" and "Views"). The GPU reads
+    /// second, over 16 pages across both runs, is bound inside the first's import, which holds all
+    /// of its pages (the runtime's bind in an import dedicated to nothing, metal2vulkan 9dc0a6a6ef);
+    /// no sparse buffer, no second import and no piece of the region's file (`super::dma_buf`'s
+    /// module docs, "Several pieces" and "Views"). The GPU reads
     /// the view's pages in its order through each. Elsewhere, said on stderr, nothing is checked.
     #[test]
     fn buffers_over_one_view_of_guest_ram_in_several_runs_share_its_dma_buf() {
@@ -3382,6 +3384,7 @@ mod tests {
                 to.dma_buf_imports - from.dma_buf_imports,
                 to.dma_buf_pieces_joined - from.dma_buf_pieces_joined,
                 to.dma_buf_sparse_buffers - from.dma_buf_sparse_buffers,
+                to.object_churn.buffers_bound_in_import - from.object_churn.buffers_bound_in_import,
             )
         };
         let before = d.raw.work_counts();
@@ -3389,15 +3392,15 @@ mod tests {
         let after = d.raw.work_counts();
         assert_eq!(
             counts(&before, &after),
-            (1, 0, 0),
+            (1, 0, 0, 0),
             "the view's dma-buf imported, bound plainly"
         );
         let inside = HostAddr::from_addr(view.addr() + (8 * PAGE).to_usize());
         let (part, part_gone) = no_copy(&d, inside, pages / 2);
         assert_eq!(
             counts(&after, &d.raw.work_counts()),
-            (0, 1, 0),
-            "a piece of it joined, bound plainly"
+            (0, 0, 0, 1),
+            "bound inside the first buffer's import"
         );
         let part_check = FoldCheck {
             own: at,
