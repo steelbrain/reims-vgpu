@@ -107,9 +107,21 @@ if ($whp -eq 1) {
 
 # 3. The checkout: this script's own, else a clone.
 $here = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { "" }
+# QEMU's build refuses a source directory whose path holds a space, and a user's folder can hold
+# one (C:\Users\First Last): there the default is reims-vgpu at the system drive's root, which a
+# user may make a folder in without an administrator.
 if ($Checkout -eq "") {
     if ($here -and (Test-Path (Join-Path $here "scripts\install-ctl.sh"))) { $Checkout = $here }
-    else { $Checkout = Join-Path $env:USERPROFILE "reims-vgpu" }
+    else {
+        $Checkout = Join-Path $env:USERPROFILE "reims-vgpu"
+        if ($Checkout -match "\s") {
+            $Checkout = Join-Path "$env:SystemDrive\" "reims-vgpu"
+            Say "Your user folder's path has a space, which QEMU's build refuses: the checkout goes in $Checkout"
+        }
+    }
+}
+if ($Checkout -match "\s") {
+    Die "$Checkout has a space in its path, which QEMU's build refuses: give a folder without spaces with -Checkout, such as $(Join-Path "$env:SystemDrive\" "reims-vgpu")"
 }
 $branch = if ($Channel -eq "development") { "development" } else { "master" }
 if (Test-Path (Join-Path $Checkout "scripts\install-ctl.sh")) {

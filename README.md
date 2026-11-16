@@ -60,7 +60,8 @@ irm https://raw.githubusercontent.com/steelbrain/reims-vgpu/master/scripts/insta
 
 It installs MSYS2 and Git for Windows with winget if you don't have them, turns on the Windows
 Hypervisor Platform that VMs run on (Windows asks for an administrator for that step alone, and you
-restart once before your first VM), clones the repository into your user folder, and runs
+restart once before your first VM), clones the repository into your user folder (or into
+`C:\reims-vgpu` if your user folder's path has a space, since QEMU's build can't take one), and runs
 `scripts/install-ctl.sh` in MSYS2's CLANG64 shell. That builds the library and QEMU with MSYS2's
 clang, with the Rust toolchain that goes with it: it installs Rust if you don't have it, and adds
 that toolchain beside yours if your Rust is set up for Visual Studio, so you don't need Visual

@@ -226,6 +226,25 @@ if [[ $WINDOWS == 1 ]]; then
   rewrite_crlf || die "could not write the checkout's CRLF text files out again from its commit"
 fi
 
+# ------------------------------------------------------------------ paths
+
+# QEMU's configure refuses a source or build directory whose path holds a space
+# ("main directory cannot contain spaces nor colons"), and sdl3-sys, which
+# builds SDL3 under cargo's target directory and then reads SDL3's pkg-config
+# file, finds no library where a space splits that file's -L path ("could not
+# find native static library SDL3"). A Windows user's folder can hold a space
+# (C:\Users\First Last): the checkout and the target directory must be outside
+# one, and QEMU builds beside the library in the target directory where the
+# cache directory is in one (QEMU_BUILDS below). Measured on the mini with a
+# profile named "Test User", 2026-11-16: QEMU's configure stopped on the cache,
+# and SDL3 on a checkout in the profile.
+if [[ $WINDOWS == 1 && $BUILDS_QEMU == 1 && $SKIP_QEMU == 0 ]]; then
+  [[ $ROOT != *[[:space:]]* ]] ||
+    die "the checkout's path, $(cygpath -w "$ROOT"), has a space, which QEMU's build and SDL3's refuse: clone the repository into a folder without spaces (install.ps1 -Checkout C:\\reims-vgpu), and run it there"
+  [[ ${CARGO_TARGET_DIR:-} != *[[:space:]]* ]] ||
+    die "CARGO_TARGET_DIR, $CARGO_TARGET_DIR, has a space, which SDL3's build refuses: give it a folder without spaces, or unset it"
+fi
+
 # ------------------------------------------------------------------ dependencies
 
 missing=()
@@ -555,13 +574,17 @@ kept_qemu() {
 COMMIT="$(git -C "$ROOT" rev-parse --short HEAD)"
 TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
 DIST="$TARGET/dist-vulkan"
+# Where QEMU builds and is staged: the cache directory, else, where its path
+# holds a space (a Windows user's folder: "paths" above), the target directory.
+QEMU_BUILDS="$CACHE"
+[[ $WINDOWS == 1 && $CACHE == *[[:space:]]* ]] && QEMU_BUILDS="$TARGET"
 
 if [[ $BUILDS_QEMU == 1 && $SKIP_QEMU == 0 ]]; then
   say "Building the library (cargo xtask dist --platform vulkan)"
   (cd "$ROOT" && CARGO_TARGET_DIR="$TARGET" cargo xtask dist --platform vulkan)
   [[ -f "$DIST/lib/pkgconfig/reims-vgpu.pc" ]] || die "cargo xtask dist wrote no $DIST/lib/pkgconfig/reims-vgpu.pc"
 
-  BUILD="$CACHE/qemu-build-$PLATFORM"
+  BUILD="$QEMU_BUILDS/qemu-build-$PLATFORM"
   PC="$DIST/lib/pkgconfig"
   # QEMU's install prefix: never used where it is, since QEMU finds its files
   # relative to its binary; the build is staged with DESTDIR and moved.
@@ -599,7 +622,7 @@ if [[ $BUILDS_QEMU == 1 && $SKIP_QEMU == 0 ]]; then
   # regenerate build.ninja, meson reuses the dependencies it found before, a
   # removed one too, which the dry run above does not catch.
   ninja -C "$BUILD" || { rm -f "$BUILD/configured-with"; die "QEMU's build stopped; the next run configures it again"; }
-  STAGE="$CACHE/qemu-stage"
+  STAGE="$QEMU_BUILDS/qemu-stage"
   rm -rf "$STAGE"
   if [[ $WINDOWS == 1 ]]; then
     # QEMU's meson, a Windows program, gets the prefix as MSYS2 hands it a path,
