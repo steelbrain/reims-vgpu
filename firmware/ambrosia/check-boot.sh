@@ -97,6 +97,10 @@
 #              failure.
 #   ax-matrix  WindowServer set the display's accessibility matrix: this boot's log has no "not able
 #              to set accessibility matrix" line (ReimsGraphics' colour filter, its set_parameter).
+#   icc        WindowServer's ICC chain took (ReimsGraphics' set_block, RgfxMobileICC.hpp): this
+#              boot's log has no "Failed to set ICC curve" line and at most one "Failed to set ICC
+#              matrix" line, the cursor's layer 1, whose standard-sRGB source the display's blend
+#              space does not invert.
 #   amfi-refuse
 #              AMFI refuses a signature it rejects, through RgfxGate's signature hook, with the
 #              guest up: a copy of /usr/bin/true signed ad hoc with com.apple.rootless.install, an
@@ -336,7 +340,7 @@ qpid=$!
 # --- the checks ---------------------------------------------------------------------------------
 
 names=(firmware console ssh sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map page-count ax-matrix
-  amfi-refuse screen no-fatal)
+  icc amfi-refuse screen no-fatal)
 # What a check reports beside its verdict, printed under it: neither a pass nor a failure.
 findings=()
 # The guest's kern.bootsessionuuid at the login and after the Metal work, the panic reports
@@ -613,6 +617,22 @@ if [[ -n $ssh_s ]]; then
     verdict ax-matrix FAIL "$ax_n \"not able to set accessibility matrix\" lines this boot"
   fi
 
+  # The ICC chain, read so too: WindowServer logs each block of its colour spaces it cannot set.
+  # The log's header line says it was read, as an empty read counts no line.
+  icc=$(G 120 "/usr/bin/log show --last boot --style compact --predicate 'eventMessage CONTAINS \"Failed to set ICC\"' 2>/dev/null > /tmp/check-boot-icc; echo \"check-boot-read \$(grep -c '^Timestamp' /tmp/check-boot-icc) \$(grep -c 'Failed to set ICC curve' /tmp/check-boot-icc) \$(grep -c 'Failed to set ICC matrix' /tmp/check-boot-icc)\"")
+  icc_n=$(echo "$icc" | sed -n 's/^check-boot-read [1-9][0-9]* \([0-9]*\) \([0-9]*\)$/\1 \2/p' | tail -1)
+  if [[ -z $icc_n ]]; then
+    verdict icc FAIL "unread: this boot's log not read in time"
+  else
+    icc_curves=${icc_n% *} icc_matrices=${icc_n#* }
+    icc_said="$icc_curves \"Failed to set ICC curve\" and $icc_matrices \"Failed to set ICC matrix\" lines this boot"
+    if ((icc_curves == 0 && icc_matrices <= 1)); then
+      verdict icc PASS "$icc_said"
+    else
+      verdict icc FAIL "$icc_said"
+    fi
+  fi
+
   # AMFI's refusal, last: an ad hoc signature with an entitlement only Apple's may carry. AMFI
   # kills the copy, and the guest keeps its boot session.
   sig=$(G 60 "cp /usr/bin/true /tmp/check-boot-sigfail && printf '%s' '<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>com.apple.rootless.install</key><true/></dict></plist>' > /tmp/check-boot-sigfail.plist && /usr/bin/codesign -f -s - --entitlements /tmp/check-boot-sigfail.plist /tmp/check-boot-sigfail > /dev/null 2>&1; /tmp/check-boot-sigfail; echo \"check-boot-sigfail \$?\"")
@@ -631,12 +651,12 @@ if [[ -n $ssh_s ]]; then
     verdict amfi-refuse FAIL "the ad hoc signed copy exited ${sig_rc:-unread}, not 137 (killed)"
   fi
 elif [[ $(state firmware) == FAIL ]]; then
-  for n in ssh sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map page-count ax-matrix amfi-refuse; do
+  for n in ssh sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map page-count ax-matrix icc amfi-refuse; do
     verdict "$n" FAIL "not run: the firmware check failed"
   done
 else
   verdict ssh FAIL "no SSH login in $limit s"
-  for n in sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map page-count ax-matrix amfi-refuse; do
+  for n in sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map page-count ax-matrix icc amfi-refuse; do
     verdict "$n" FAIL "not run: no SSH login"
   done
 fi
