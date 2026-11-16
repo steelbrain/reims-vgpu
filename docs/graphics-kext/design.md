@@ -1696,12 +1696,18 @@ Stages:
       the surface the guest lent for each (`crates/reims-vgpu/src/graphics/vt.rs`;
       on VA-API, written there by the driver's video processing where it
       takes the surface's layout, on NVDEC by the GPU into the surface's
-      pages registered with CUDA, else copied by the CPU). `encs` lists no
-      encoder and `meps` no processor, and an encoder's create is answered
-      with a refusal in its reply's `,err`, as for a codec the host lacks:
-      `paravirt`'s encoder sessions (`encoder`, which encode the source
-      frames the guest lends and emit their samples) list encoders only
-      for a host given an encoder backend, and the device gives it none.
+      pages registered with CUDA, else copied by the CPU). `encs` lists one
+      encoder for each codec the arm encodes the guest's frames of (on
+      VA-API, each codec it encodes a profile of), and a create of a listed
+      encoder, by this host's ID, by Apple's hardware encoder's (which the
+      guest's own paravirtual encoders send) or by none, starts an encoder
+      session (`paravirt`'s `encoder`): the arm encodes each source frame
+      from the surface the guest lent for it, read through the host's view
+      of its pages, and the session emits the samples, asking the guest
+      for the stream's format description first (`Efds`), then lets go of
+      the surface. `meps` lists no processor; a create of an encoder not
+      listed is answered with a refusal in its reply's `,err`, as for a
+      codec the host lacks.
       A host with no arm offers no caps and the kext publishes no service:
       the guest's VideoToolbox is then not a guest's.
     - **The host offers `VT_MESSAGES` where its arm lands decodes in the

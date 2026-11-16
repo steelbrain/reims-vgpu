@@ -679,6 +679,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 region.write(RGFX_VIDEO_CAPS_OFFSET, caps.as_bytes());
                 // VideoToolbox's decoders are listed where the arm lands their pictures in the
                 // surfaces the guest lends: each session decodes on the arm.
+                // Its encoders, where the arm encodes the source frames the guest lends.
                 if video.guest_decodes() {
                     let backend = vt::VtBackend::new(Arc::clone(&video), decoder.lent_views());
                     vt = paravirt::Host::with_backend(
@@ -686,6 +687,16 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                         Arc::new(backend),
                         crate::video::runtime::PlatformRuntime::of(&platform),
                     );
+                    let encoders = video.guest_encoders();
+                    if !encoders.is_empty() {
+                        let backend =
+                            vt::VtEncoderBackend::new(Arc::clone(&video), decoder.lent_views());
+                        vt = vt.with_encoders(
+                            encoders,
+                            Arc::new(backend),
+                            crate::video::runtime::PlatformRuntime::of(&platform),
+                        );
+                    }
                 }
                 if cached && video.imports_device_caches() {
                     decoder.set_exportable_caches();

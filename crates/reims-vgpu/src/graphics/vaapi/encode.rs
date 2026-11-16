@@ -24,6 +24,13 @@
 //!   uploads. Its sample, NAL units behind four-byte lengths, is written as Annex B: a keyframe's
 //!   parameter sets first, from the encoder's configuration record (`avcC`, `hvcC`). One that
 //!   does not fit the capacity is not written, and the next frame is made a keyframe.
+//! - **VideoToolbox's paravirtual encoders** (`VaGuestEncoder`, `super::super::vt`): an arm64
+//!   guest's encoders, one for each codec the driver encodes a profile of ([`guest_encoders`]),
+//!   whose settings the guest's session properties make, `Quality` onto the quality levels as
+//!   `quality` maps. Each source frame is read from the host's view of the IOSurface the guest
+//!   lent, which the VA crate's encoder uploads. A change of the bitrate, frame rate or
+//!   key-frame interval goes to the encoder from the next frame; one that makes a new sequence
+//!   makes a new encoder before the first frame and is refused after it.
 
 use std::sync::Arc;
 
@@ -38,14 +45,19 @@ use reims_vgpu_graphics::wire::{
     RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps, RgfxVideoEncodeCaps,
 };
 use reims_vgpu_video::codec::encode::{
-    Coded, ColourDescription, EncoderSettings, Entropy, FrameRate, FrameType, InputFrame, Plane,
-    Profile as EncodeProfile, RateControl,
+    Codec as EncodeCodec, Coded, ColourDescription, EncoderSettings, Entropy, FailedSample,
+    FrameRate, FrameType, InputFormat, InputFrame, Plane, Profile as EncodeProfile, RateControl,
 };
+use reims_vgpu_video::core::backend::BackendError as VideoError;
 use reims_vgpu_video::core::backend::DeviceWrite;
+use reims_vgpu_video::core::surfaces::PlaneLayout;
+use reims_vgpu_video::paravirt::{Codec, Encoder, EncoderConfig, SourceFrame};
 use reims_vgpu_video::vaapi::{Capabilities, Display, EncoderSupport, InputSurface, VideoEncoder};
+use reims_vgpu_vulkan::core::num::ToUsize as _;
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::sync::Mutex;
 
+use super::super::decode::{GuestEncoder, GuestOutput};
 use super::super::video_host::{
     BackendError, EncodeFrame, EncodeSource, Encoded, FrameSource, HostEncodedFrame, HostEncoder,
     SourcePlane,
@@ -684,6 +696,229 @@ pub(super) fn annex_b(
         rest = &after[len..];
     }
     Ok(au)
+}
+
+/// VideoToolbox's paravirtual encoders the driver's profiles make (module doc): one for each
+/// codec of which it encodes a profile, with those profiles and the largest picture any of them
+/// takes.
+pub(super) fn guest_encoders(supports: &[EncoderSupport]) -> Vec<Encoder> {
+    let mut encoders: Vec<Encoder> = Vec::new();
+    for support in supports {
+        let codec = match support.profile.codec() {
+            EncodeCodec::H264 => Codec::H264,
+            EncodeCodec::Hevc => Codec::Hevc,
+        };
+        match encoders.iter_mut().find(|e| e.codec == codec) {
+            Some(encoder) => {
+                encoder.profiles.push(support.profile);
+                encoder.max_width = encoder.max_width.max(support.max_width);
+                encoder.max_height = encoder.max_height.max(support.max_height);
+            }
+            None => encoders.push(Encoder {
+                codec,
+                profiles: vec![support.profile],
+                max_width: support.max_width,
+                max_height: support.max_height,
+            }),
+        }
+    }
+    encoders
+}
+
+/// A VideoToolbox paravirtual encoder on the VA crate's `VideoEncoder` (module doc), its source
+/// frames read from the surfaces the guest lends.
+pub(super) struct VaGuestEncoder {
+    display: Display,
+    /// The quality range of each profile the driver encodes.
+    ranges: Vec<(EncodeProfile, Option<u32>)>,
+    encoder: VideoEncoder,
+    settings: EncoderSettings,
+    /// Whether a frame was encoded: until then, settings that make a new sequence make a new
+    /// encoder.
+    encoded: bool,
+}
+
+impl VaGuestEncoder {
+    /// An encoder of `config` on `display`, whose driver encodes `supports`.
+    pub(super) fn new(
+        display: &Display,
+        supports: &[EncoderSupport],
+        config: &EncoderConfig,
+    ) -> Result<Self, VideoError> {
+        let ranges: Vec<_> = (supports.iter())
+            .map(|s| (s.profile, s.capabilities.quality_range))
+            .collect();
+        let settings = guest_settings(config, &ranges);
+        let encoder = VideoEncoder::new(display, settings.clone()).map_err(super::video_error)?;
+        Ok(Self {
+            display: display.clone_ref(),
+            ranges,
+            encoder,
+            settings,
+            encoded: false,
+        })
+    }
+}
+
+/// The VA crate's settings of `config`: its settings, `Quality` (0 to 1) onto the profile's
+/// quality levels as the device's `quality` (0 to 100) maps onto them.
+fn guest_settings(
+    config: &EncoderConfig,
+    ranges: &[(EncodeProfile, Option<u32>)],
+) -> EncoderSettings {
+    let mut settings = config.settings.clone();
+    let range = (ranges.iter())
+        .find(|(profile, _)| *profile == settings.profile)
+        .and_then(|(_, range)| *range);
+    settings.quality_level =
+        (config.quality).and_then(|quality| quality_level(percent(quality), range));
+    settings
+}
+
+/// `quality`, 0 to 1, as a whole percentage.
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a float within 0 to 100 to an integer: `as` saturates, NaN to 0"
+)]
+fn percent(quality: f32) -> u32 {
+    (quality.clamp(0.0, 1.0) * 100.0).round() as u32
+}
+
+/// `coded`'s errors as a guest's session sees them.
+fn guest_coded(coded: Vec<Coded<reims_vgpu_video::vaapi::Error>>) -> Vec<Coded<VideoError>> {
+    (coded.into_iter())
+        .map(|coded| {
+            coded.map_err(|failed| FailedSample {
+                id: failed.id,
+                error: failed.error.map(super::video_error),
+            })
+        })
+        .collect()
+}
+
+impl GuestEncoder for VaGuestEncoder {
+    fn encode(
+        &mut self,
+        source: &GuestOutput<'_>,
+        frame: &SourceFrame,
+    ) -> Result<Vec<Coded<VideoError>>, VideoError> {
+        let layout = &source.layout;
+        let format = match &layout.pixel_format.to_be_bytes() {
+            b"420v" | b"420f" => InputFormat::Nv12,
+            b"x420" | b"xf20" => InputFormat::P010,
+            _ => {
+                return Err(VideoError::Unsupported(format!(
+                    "a source frame in '{}'",
+                    layout.pixel_format
+                )));
+            }
+        };
+        if format != self.settings.input_format() {
+            return Err(VideoError::Unsupported(format!(
+                "a source frame in '{}' for a {:?} stream",
+                layout.pixel_format, self.settings.profile
+            )));
+        }
+        let [luma, chroma] = layout.planes[..] else {
+            return Err(VideoError::Unsupported(format!(
+                "a source of {} planes",
+                layout.planes.len()
+            )));
+        };
+        let view = (source.memory.host_view())
+            .map_err(|error| VideoError::Malfunction(error.to_string()))?;
+        // Luma's bytes run to chroma's first, chroma's to the view's end: each plane the
+        // encoder's rows of at least the stream's size, at the plane's pitch.
+        let sample = format.bytes_per_sample();
+        let holds = |plane: &PlaneLayout, bytes: usize, rows: u32, row_bytes: usize| {
+            let rows = rows.to_usize();
+            rows <= plane.height.to_usize()
+                && row_bytes <= plane.bytes_per_row
+                && (plane.bytes_per_row.checked_mul(rows.saturating_sub(1)))
+                    .and_then(|n| n.checked_add(row_bytes))
+                    .is_some_and(|n| n <= bytes)
+        };
+        let (width, height) = (self.settings.width.to_usize(), self.settings.height);
+        let y_at = view.offset.checked_add(luma.offset);
+        let uv_at = view.offset.checked_add(chroma.offset);
+        let (Some(y_at), Some(uv_at)) = (y_at, uv_at) else {
+            return Err(VideoError::Unsupported("planes past the view".to_owned()));
+        };
+        if !(y_at < uv_at && uv_at < view.size)
+            || !holds(&luma, uv_at - y_at, height, width * sample)
+            || !holds(&chroma, view.size - uv_at, height / 2, width * sample)
+        {
+            return Err(VideoError::Unsupported(
+                "a source whose planes do not hold the stream's picture".to_owned(),
+            ));
+        }
+        // SAFETY: the view's `size` bytes from `first` are the host's mapping of the surface's
+        // pages, which `view.hold` keeps mapped until it drops after the encode; the guest's
+        // kext holds the surface lent, its pages wired, until the host's `rels`, sent once the
+        // frame is encoded and emitted. Both planes lie inside the view (checked above).
+        let all = unsafe { std::slice::from_raw_parts(view.first.as_ptr(), view.size) };
+        let (Some(y), Some(uv)) = (all.get(y_at..uv_at), all.get(uv_at..)) else {
+            return Err(VideoError::Unsupported("planes past the view".to_owned()));
+        };
+        let input = InputFrame {
+            planes: [
+                Plane {
+                    data: y,
+                    bytes_per_row: luma.bytes_per_row,
+                },
+                Plane {
+                    data: uv,
+                    bytes_per_row: chroma.bytes_per_row,
+                },
+            ],
+            pts: frame.pts,
+            duration: frame.duration,
+            force_key_frame: frame.force_key_frame,
+            id: frame.id,
+        };
+        let coded = self.encoder.encode(&input).map_err(super::video_error)?;
+        drop(view);
+        self.encoded = true;
+        Ok(guest_coded(coded))
+    }
+
+    fn flush(&mut self) -> Result<Vec<Coded<VideoError>>, VideoError> {
+        Ok(guest_coded(self.encoder.flush()))
+    }
+
+    /// The bitrate, the frame rate and the key-frame interval go to the encoder from the next
+    /// frame; anything else makes a new encoder before the first frame, and is refused after it.
+    fn reconfigure(&mut self, config: &EncoderConfig) -> Result<(), VideoError> {
+        let new = guest_settings(config, &self.ranges);
+        let mut same_sequence = new.clone();
+        same_sequence.rate_control = self.settings.rate_control;
+        same_sequence.frame_rate = self.settings.frame_rate;
+        same_sequence.key_frame_interval = self.settings.key_frame_interval;
+        same_sequence.key_frame_interval_duration = self.settings.key_frame_interval_duration;
+        if same_sequence != self.settings {
+            if self.encoded {
+                return Err(VideoError::Unsupported(
+                    "a setting that makes a new sequence, after the first frame".to_owned(),
+                ));
+            }
+            self.encoder =
+                VideoEncoder::new(&self.display, new.clone()).map_err(super::video_error)?;
+            self.settings = new;
+            return Ok(());
+        }
+        if new.rate_control != self.settings.rate_control {
+            (self.encoder.set_rate_control(new.rate_control)).map_err(super::video_error)?;
+        }
+        if new.frame_rate != self.settings.frame_rate {
+            (self.encoder.set_frame_rate(new.frame_rate)).map_err(super::video_error)?;
+        }
+        (self.encoder)
+            .set_key_frame_interval(new.key_frame_interval, new.key_frame_interval_duration);
+        self.settings = new;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

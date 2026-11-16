@@ -1,5 +1,9 @@
 use reims_vgpu_graphics::wire::RGFX_VIDEO_DECODE;
+use std::ptr::NonNull;
+
+use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryIdentity, MemoryLife};
 use reims_vgpu_video::core::runtime::StdRuntime;
+use reims_vgpu_video::core::surfaces::{SurfaceError, SurfaceLayout};
 use reims_vgpu_video::vaapi::{H264Decoder, HevcDecoder, encoder_support};
 
 use reims_vgpu_vulkan::VulkanPlatform;
@@ -685,4 +689,254 @@ fn made_sample(settings: &RgfxVideoEncodeSettings) -> u64 {
     } else {
         1
     }
+}
+
+/// A guest surface's memory in host bytes, which a [`HostView`] reaches.
+struct HostSurface {
+    life: MemoryLife,
+    bytes: Box<[u8]>,
+}
+
+impl DeviceMemory for HostSurface {
+    fn identity(&self) -> MemoryIdentity {
+        self.life.identity()
+    }
+
+    fn length(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn host_view(&self) -> Result<HostView, SurfaceError> {
+        Ok(HostView {
+            first: NonNull::from(&self.bytes[0]),
+            size: self.bytes.len(),
+            offset: 0,
+            hold: Box::new(()),
+        })
+    }
+}
+
+/// A 66x50 `420v` surface laid out as CoreVideo lays out a pool's buffer, rows 128 bytes apart
+/// and chroma from byte 8192, holding frame `index` of a moving picture.
+fn guest_surface(index: usize) -> (SurfaceLayout, HostSurface) {
+    let (w, h, pitch, chroma_at) = (66, 50, 128, 8192);
+    let mut bytes = vec![0u8; chroma_at + pitch * h / 2].into_boxed_slice();
+    for y in 0..h {
+        for x in 0..w {
+            bytes[y * pitch + x] = ((x + y + index * 4) % 220 + 16) as u8;
+        }
+    }
+    for y in 0..h / 2 {
+        for x in 0..w {
+            bytes[chroma_at + y * pitch + x] = 128 + (x % 32) as u8;
+        }
+    }
+    let plane = |offset, width, height| PlaneLayout {
+        offset,
+        bytes_per_row: pitch,
+        width,
+        height,
+    };
+    let layout = SurfaceLayout {
+        pixel_format: reims_vgpu_video::core::fourcc::FourCc::new(*b"420v"),
+        width: w as u32,
+        height: h as u32,
+        planes: vec![
+            plane(0, w as u32, h as u32),
+            plane(chroma_at, w as u32 / 2, h as u32 / 2),
+        ],
+        bytes_per_row: 0,
+    };
+    let life = MemoryLife::new();
+    (layout, HostSurface { life, bytes })
+}
+
+/// On the driver, each guest encoder it answers (`guest_encoders`), at its first profile: 8
+/// frames read from a guest surface wider and taller than the 64x48 stream come out as 8
+/// samples, the first a sync sample with the configuration record, and the driver's own decoder
+/// decodes each to a 64x48 picture; a reconfigure of the bitrate is taken after a frame, and one
+/// of the profile is not.
+#[test]
+#[ignore = "needs a VA-API GPU: run on the VA-API host"]
+fn a_guest_encoder_encodes_the_frames_of_the_surfaces_it_is_lent() {
+    let display = display();
+    let supports: Arc<[EncoderSupport]> = encoder_support(&display).into();
+    let encoders = guest_encoders(&supports);
+    assert!(
+        !encoders.is_empty(),
+        "the driver encodes neither H.264 nor HEVC"
+    );
+    for encoder in &encoders {
+        let profile = encoder.profiles[0];
+        let mut settings = EncoderSettings::new(profile, 64, 48);
+        settings.timescale = 90_000;
+        let config = EncoderConfig {
+            settings,
+            quality: Some(0.5),
+        };
+        let mut guest = VaGuestEncoder::new(&display, &supports, &config).unwrap();
+        let mut samples = Vec::new();
+        for index in 0..8 {
+            let (layout, memory) = guest_surface(index);
+            let source = GuestOutput {
+                layout,
+                memory: &memory,
+            };
+            let frame = SourceFrame {
+                id: index as u64,
+                pts: index as i64 * 3000,
+                duration: 3000,
+                force_key_frame: false,
+            };
+            samples.extend(guest.encode(&source, &frame).unwrap());
+            if index == 0 {
+                let mut faster = config.clone();
+                faster.settings.rate_control = RateControl::VariableBitRate {
+                    average_bits_per_second: 1_000_000,
+                    peak_bits_per_second: 1_500_000,
+                };
+                guest.reconfigure(&faster).unwrap();
+                let mut other = faster.clone();
+                other.settings.profile = *encoder.profiles.last().unwrap();
+                if other.settings.profile != profile {
+                    assert!(matches!(
+                        guest.reconfigure(&other),
+                        Err(VideoError::Unsupported(_))
+                    ));
+                }
+            }
+        }
+        samples.extend(guest.flush().unwrap());
+        let samples: Vec<_> = samples.into_iter().map(Result::unwrap).collect();
+        assert_eq!(samples.len(), 8, "{profile:?}");
+        assert!(
+            samples[0].is_sync && samples[0].configuration.is_some(),
+            "{profile:?}"
+        );
+        let codec = match encoder.codec {
+            Codec::H264 => RGFX_VIDEO_CODEC_H264,
+            Codec::Hevc => RGFX_VIDEO_CODEC_HEVC,
+        };
+        let units: Vec<Vec<u8>> = (samples.iter())
+            .map(|s| annex_b(codec, s.configuration.as_deref(), &s.data).unwrap())
+            .collect();
+        let mut sizes = Vec::new();
+        if codec == RGFX_VIDEO_CODEC_H264 {
+            let mut decoder = H264Decoder::new_annex_b(&display);
+            for (id, au) in units.iter().enumerate() {
+                sizes.extend(
+                    decoder
+                        .decode(au, id as u64)
+                        .unwrap()
+                        .iter()
+                        .map(|f| (f.width(), f.height())),
+                );
+            }
+            sizes.extend(
+                decoder
+                    .flush()
+                    .unwrap()
+                    .iter()
+                    .map(|f| (f.width(), f.height())),
+            );
+        } else {
+            let mut decoder = HevcDecoder::new_annex_b(&display);
+            for (id, au) in units.iter().enumerate() {
+                sizes.extend(
+                    decoder
+                        .decode(au, id as u64)
+                        .unwrap()
+                        .iter()
+                        .map(|f| (f.width(), f.height())),
+                );
+            }
+            sizes.extend(
+                decoder
+                    .flush()
+                    .unwrap()
+                    .iter()
+                    .map(|f| (f.width(), f.height())),
+            );
+        }
+        assert_eq!(sizes, vec![(64, 48); 8], "{profile:?}");
+    }
+}
+
+/// A driver's answer for `profile` up to `max_width` by `max_height`, with no attribute but its
+/// quality range.
+fn support(profile: EncodeProfile, max_width: u32, max_height: u32) -> EncoderSupport {
+    use reims_vgpu_video::vaapi::{EncoderCapabilities, Entrypoint, Profile};
+    EncoderSupport {
+        profile,
+        capabilities: EncoderCapabilities {
+            profile: Profile(0),
+            entrypoint: Entrypoint(0),
+            rt_formats: None,
+            rate_control: None,
+            packed_headers: None,
+            max_ref_frames: None,
+            max_slices: None,
+            slice_structure: None,
+            quality_range: Some(7),
+            intra_refresh: None,
+            skip_frame: None,
+            roi: None,
+            rate_control_ext: None,
+            max_frame_size: None,
+            prediction_direction: None,
+            max_width: None,
+            max_height: None,
+            hevc_features: None,
+            hevc_block_sizes: None,
+        },
+        max_width,
+        max_height,
+    }
+}
+
+/// The guest's encoder list has one encoder for each codec the driver encodes a profile of, with
+/// its profiles in the driver's order and the largest picture any of them takes; `Quality` maps
+/// onto the profile's levels as `quality` does.
+#[test]
+fn the_guest_encoders_are_the_drivers_codecs() {
+    let supports = [
+        support(EncodeProfile::H264Main, 4096, 2304),
+        support(EncodeProfile::H264High, 4096, 4096),
+        support(EncodeProfile::HevcMain, 8192, 4352),
+    ];
+    assert_eq!(
+        guest_encoders(&supports),
+        vec![
+            Encoder {
+                codec: Codec::H264,
+                profiles: vec![EncodeProfile::H264Main, EncodeProfile::H264High],
+                max_width: 4096,
+                max_height: 4096,
+            },
+            Encoder {
+                codec: Codec::Hevc,
+                profiles: vec![EncodeProfile::HevcMain],
+                max_width: 8192,
+                max_height: 4352,
+            },
+        ]
+    );
+    let ranges = vec![(EncodeProfile::H264High, Some(7))];
+    let config = |quality| EncoderConfig {
+        settings: EncoderSettings::new(EncodeProfile::H264High, 64, 48),
+        quality,
+    };
+    assert_eq!(guest_settings(&config(None), &ranges).quality_level, None);
+    assert_eq!(
+        guest_settings(&config(Some(1.0)), &ranges).quality_level,
+        Some(1)
+    );
+    assert_eq!(
+        guest_settings(&config(Some(0.0)), &ranges).quality_level,
+        Some(7)
+    );
+    assert_eq!(
+        guest_settings(&config(Some(0.5)), &ranges).quality_level,
+        quality_level(50, Some(7))
+    );
 }

@@ -60,6 +60,9 @@
 //!   decode lands in the IOSurface its kext lent, written there by the driver's video processing
 //!   (`Frame::write_to_guest`, the first way above) where the import check takes the surface's
 //!   layout and memory, else read back and copied by the CPU into the surface's pages.
+//! - **VideoToolbox's paravirtual encoders** (`encode::VaGuestEncoder`, `super::vt`): an arm64
+//!   guest's encoder reads each source frame from the IOSurface its kext lent, through the host's
+//!   view of its pages, and the VA crate's encoder uploads it.
 //! - **The layout** ([`layout`]) is granularity [2, 2], so that each plane holds the crop's
 //!   even rows and columns, and the alignment the import check found for the codec's formats;
 //!   all zero where it found none.
@@ -95,7 +98,10 @@ use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
 use reims_vgpu_vulkan::core::raise::OnFault;
 use reims_vgpu_vulkan::core::sync::Mutex;
 
-use super::decode::{GraphicsVideo, GraphicsVideoSession, GuestDecoder, GuestOutput, PlanePages};
+use super::decode::{
+    GraphicsVideo, GraphicsVideoSession, GuestDecoder, GuestEncoder, GuestOutput, PlanePages,
+};
+use reims_vgpu_video::paravirt::{Encoder, EncoderConfig};
 use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::gpu::device::VulkanDevice;
 
@@ -323,6 +329,16 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
     /// VA-API's decoders land in any memory: by the driver's video processing, or the CPU.
     fn guest_decodes(&self) -> bool {
         true
+    }
+
+    /// One for each codec the driver encodes a profile of (`encode::guest_encoders`).
+    fn guest_encoders(&self) -> Vec<Encoder> {
+        encode::guest_encoders(&self.encoders)
+    }
+
+    fn guest_encoder(&self, config: &EncoderConfig) -> Result<Box<dyn GuestEncoder>, VideoError> {
+        let encoder = encode::VaGuestEncoder::new(&self.display, &self.encoders, config)?;
+        Ok(Box::new(encoder))
     }
 
     fn guest_decoder(&self, codec: u32) -> Option<Box<dyn GuestDecoder>> {

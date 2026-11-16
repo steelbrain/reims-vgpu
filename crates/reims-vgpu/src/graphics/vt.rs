@@ -7,10 +7,15 @@
 //! answers once the picture is there; the session then emits the frame, and lets go of the
 //! surface with a `rels`.
 //!
-//! A decoder keeps the views of the last [`VIEWS_KEPT`] surfaces it landed in, by their runs, as
-//! VideoToolbox's pool lends the same few surfaces again and again: a view maps the guest's RAM,
-//! so a kept one never goes stale, and what the arm made of its memory (the driver's import of
-//! it) is kept with it.
+//! Its paravirtual encoders are the arm's too ([`VtEncoderBackend`]): each session's encoder is
+//! one of the arm's [`GuestEncoder`]s, which reads each source frame from the IOSurface the guest
+//! lent for it, through a view of its pages laid out as the kext read the surface; the session
+//! emits the samples, and lets go of each frame's surface once it is encoded and emitted.
+//!
+//! A decoder or encoder keeps the views of the last [`VIEWS_KEPT`] surfaces it used, by their
+//! runs, as VideoToolbox's pool lends the same few surfaces again and again: a view maps the
+//! guest's RAM, so a kept one never goes stale, and what the arm made of its memory (the driver's
+//! import of it) is kept with it.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -18,18 +23,20 @@ use std::sync::Arc;
 use reims_vgpu_graphics::wire::{
     RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VT_SURFACE_PLANES, RgfxVtSurface,
 };
+use reims_vgpu_video::codec::encode::{Coded, FailedSample};
 use reims_vgpu_video::core::backend::BackendError as VideoError;
 use reims_vgpu_video::core::fourcc::FourCc;
 use reims_vgpu_video::core::surfaces::{PlaneLayout, SurfaceLayout};
 use reims_vgpu_video::paravirt::status::{self, OsStatus};
 use reims_vgpu_video::paravirt::{
-    Backend, BackendDecoder, Codec, Decoded, DecoderConfig, LentSurface,
+    Backend, BackendDecoder, BackendEncoder, Codec, Decoded, DecoderConfig, EncoderBackend,
+    EncoderConfig, LentSurface, SourceFrame,
 };
 use reims_vgpu_vulkan::core::num::ToUsize as _;
 use reims_vgpu_vulkan::core::platform::Platform;
 
 use super::GuestSurface;
-use super::decode::{GraphicsVideo, GuestDecoder, GuestOutput, LentView, LentViews};
+use super::decode::{GraphicsVideo, GuestDecoder, GuestEncoder, GuestOutput, LentView, LentViews};
 
 /// The views a decoder keeps, of the surfaces it landed in last.
 const VIEWS_KEPT: usize = 8;
@@ -155,6 +162,141 @@ impl<P: Platform> BackendDecoder for VtDecoder<P> {
     }
 }
 
+/// The host's hardware video as VideoToolbox's encoder sessions take it.
+pub(super) struct VtEncoderBackend<P: Platform> {
+    video: Arc<dyn GraphicsVideo<P>>,
+    views: LentViews<P>,
+}
+
+impl<P: Platform> VtEncoderBackend<P> {
+    /// The backend of `video`'s guest encoders, reading source frames through views `views`
+    /// makes.
+    pub(super) fn new(video: Arc<dyn GraphicsVideo<P>>, views: LentViews<P>) -> Self {
+        Self { video, views }
+    }
+}
+
+/// The status a VideoToolbox encoder answers for `error`: a source or setting the encoder does
+/// not take is `kVTParameterErr`, anything else its malfunction.
+fn encoder_status(error: &VideoError) -> OsStatus {
+    match error {
+        VideoError::Unsupported(_) | VideoError::BadData(_) => status::PARAMETER,
+        VideoError::Malfunction(_) | VideoError::SkippedLeadingPicture(_) => {
+            status::VIDEO_ENCODER_MALFUNCTION
+        }
+    }
+}
+
+impl<P: Platform> EncoderBackend for VtEncoderBackend<P> {
+    fn open(&self, config: &EncoderConfig) -> Result<Box<dyn BackendEncoder>, OsStatus> {
+        let encoder = self.video.guest_encoder(config).map_err(|error| {
+            log::warn!(
+                target: "reims_vgpu::graphics::vt",
+                "hardware video: no VideoToolbox encoder of {:?} at {}x{}: {error}",
+                config.settings.profile,
+                config.settings.width,
+                config.settings.height
+            );
+            encoder_status(&error)
+        })?;
+        Ok(Box::new(VtEncoder {
+            encoder,
+            views: self.views.clone(),
+            kept: VecDeque::new(),
+            said: Vec::new(),
+        }))
+    }
+}
+
+/// One session's encoder, and the views of the surfaces it read last.
+struct VtEncoder<P: Platform> {
+    encoder: Box<dyn GuestEncoder>,
+    views: LentViews<P>,
+    kept: Kept,
+    /// The reasons an encode failed, each logged once.
+    said: Vec<String>,
+}
+
+impl<P: Platform> VtEncoder<P> {
+    /// Logs why `error` failed an encode, once an encoder for each reason, and its status.
+    fn failed(&mut self, error: &VideoError) -> OsStatus {
+        let why = error.to_string();
+        if !self.said.contains(&why) {
+            log::warn!(
+                target: "reims_vgpu::graphics::vt",
+                "hardware video: a VideoToolbox encode failed: {why}"
+            );
+            self.said.push(why);
+        }
+        encoder_status(error)
+    }
+
+    /// `coded` as the session takes it: each failed frame with its status.
+    fn statuses(&mut self, coded: Vec<Coded<VideoError>>) -> Vec<Coded<OsStatus>> {
+        (coded.into_iter())
+            .map(|coded| {
+                coded.map_err(|failed| FailedSample {
+                    id: failed.id,
+                    error: failed.error.map(|error| self.failed(&error)),
+                })
+            })
+            .collect()
+    }
+}
+
+impl<P: Platform> BackendEncoder for VtEncoder<P> {
+    fn encode(
+        &mut self,
+        source: &dyn LentSurface,
+        frame: &SourceFrame,
+    ) -> Result<Vec<Coded<OsStatus>>, OsStatus> {
+        let Some(GuestSurface(surface)) = source.as_any().downcast_ref::<GuestSurface>() else {
+            return Err(self.failed(&VideoError::Malfunction(
+                "a source no guest lent".to_owned(),
+            )));
+        };
+        let layout = layout_of(&surface.surface)
+            .map_err(|why| self.failed(&VideoError::Unsupported(why)))?;
+        let view = view_of(
+            &mut self.kept,
+            &self.views,
+            &surface.runs,
+            surface.surface.length,
+        )
+        .map_err(VideoError::Malfunction);
+        let coded = match view {
+            Ok(view) => {
+                let source = GuestOutput {
+                    layout,
+                    memory: &**view.memory(),
+                };
+                self.encoder.encode(&source, frame)
+            }
+            Err(error) => Err(error),
+        };
+        match coded {
+            Ok(coded) => Ok(self.statuses(coded)),
+            Err(error) => Err(self.failed(&error)),
+        }
+    }
+
+    fn flush(&mut self) -> Result<Vec<Coded<OsStatus>>, OsStatus> {
+        match self.encoder.flush() {
+            Ok(coded) => Ok(self.statuses(coded)),
+            Err(error) => Err(self.failed(&error)),
+        }
+    }
+
+    fn reconfigure(&mut self, config: &EncoderConfig) -> Result<(), OsStatus> {
+        self.encoder
+            .reconfigure(config)
+            .map_err(|error| match error {
+                VideoError::Unsupported(_) => status::PROPERTY_NOT_SUPPORTED,
+                error => self.failed(&error),
+            })
+    }
+}
+
 /// The layout of the surface `record` describes, as the kext read it of the IOSurface: its
 /// format, size and two planes, each from its offset at its own pitch. `Err` says why a surface
 /// is not one a picture lands in: not of two planes.
@@ -241,6 +383,19 @@ mod tests {
                     height: 24,
                 },
             ]
+        );
+    }
+
+    /// An encode the arm refuses for its source or settings is a parameter error to the guest,
+    /// any other failure the encoder's malfunction.
+    #[test]
+    fn an_encode_failure_is_a_parameter_error_or_a_malfunction() {
+        let error = |make: fn(String) -> VideoError| encoder_status(&make(String::new()));
+        assert_eq!(error(VideoError::Unsupported), status::PARAMETER);
+        assert_eq!(error(VideoError::BadData), status::PARAMETER);
+        assert_eq!(
+            error(VideoError::Malfunction),
+            status::VIDEO_ENCODER_MALFUNCTION
         );
     }
 

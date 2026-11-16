@@ -33,10 +33,13 @@ use reims_vgpu_graphics::wire::{
     RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RgfxSurfaceFacts,
     RgfxVideoCodecCaps, RgfxVideoDecodeCaps, RgfxVideoEncodeCaps, RgfxVideoOutputLayout,
 };
+use reims_vgpu_video::codec::encode::Coded;
+use reims_vgpu_video::core::backend::BackendError as VideoError;
 use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryIdentity};
 #[cfg(target_os = "linux")]
 use reims_vgpu_video::core::device_memory::{DmaBufError, SurfaceDmaBuf};
 use reims_vgpu_video::core::surfaces::{SurfaceError, SurfaceLayout};
+use reims_vgpu_video::paravirt::{Encoder, EncoderConfig, SourceFrame};
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::command::CommandBuffer as _;
 use reims_vgpu_vulkan::core::platform::event::EventRef;
@@ -91,6 +94,19 @@ pub trait GraphicsVideo<P: Platform>: Send + Sync {
     fn guest_decodes(&self) -> bool {
         false
     }
+    /// The encoders VideoToolbox's paravirtual encoder list names, whose source frames come in
+    /// surfaces the guest lends ([`GuestEncoder`]): one for each codec the arm encodes so; none
+    /// where it encodes none.
+    fn guest_encoders(&self) -> Vec<Encoder> {
+        Vec::new()
+    }
+    /// An encoder of `config`, its codec one of [`Self::guest_encoders`]'; the error the guest's
+    /// session is refused with where the arm cannot make it.
+    fn guest_encoder(&self, _config: &EncoderConfig) -> Result<Box<dyn GuestEncoder>, VideoError> {
+        Err(VideoError::Unsupported(
+            "the arm encodes no guest's frames".to_owned(),
+        ))
+    }
     /// Whether a decode lands its picture in an output surface's device cache, where the
     /// surface's block has one, as well as in its pages
     /// ([`RGFX_VIDEO_CAPS_OUTPUT_CACHED`](reims_vgpu_graphics::wire::RGFX_VIDEO_CAPS_OUTPUT_CACHED)).
@@ -127,7 +143,25 @@ pub trait GuestDecoder: Send {
     ) -> Result<bool, reims_vgpu_video::core::backend::BackendError>;
 }
 
-/// A surface the guest lent, as a [`GuestDecoder`] lands a picture in it.
+/// An encoder of one codec whose source frames come in surfaces the guest lent: VideoToolbox's
+/// paravirtual encoders' (`super::super::vt`), one call at a time.
+pub trait GuestEncoder: Send {
+    /// Encodes `frame` from `source`, whose top left holds the picture at the stream's size, and
+    /// returns each frame that comes out, in decode order, with its own result: none while the
+    /// encoder holds it back. `Err` is a frame not taken.
+    fn encode(
+        &mut self,
+        source: &GuestOutput<'_>,
+        frame: &SourceFrame,
+    ) -> Result<Vec<Coded<VideoError>>, VideoError>;
+    /// Encodes the frames it holds back, and returns each with its own result.
+    fn flush(&mut self) -> Result<Vec<Coded<VideoError>>, VideoError>;
+    /// Takes `config` from the next frame on; [`VideoError::Unsupported`] where it cannot now.
+    fn reconfigure(&mut self, config: &EncoderConfig) -> Result<(), VideoError>;
+}
+
+/// A surface the guest lent, as a [`GuestDecoder`] lands a picture in it, or a [`GuestEncoder`]
+/// reads a frame from it.
 pub struct GuestOutput<'a> {
     /// Its layout: its CoreVideo format, its size and its two planes.
     pub layout: SurfaceLayout,
