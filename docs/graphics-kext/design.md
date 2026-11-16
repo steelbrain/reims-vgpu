@@ -2008,7 +2008,14 @@ only where no negotiation can carry it.
 - Bit 48, `FEATURES_HI`'s bit 16, is `MULTI_DISPLAY`: the device has two
   displays or more, and a guest that takes it drives each ("Multiple
   displays", below). A host offers it only on a device of two displays or
-  more; no host offers it yet, and no kext takes it.
+  more, and the x86-64 kext takes it.
+- Bit 49, `FEATURES_HI`'s bit 17, is `POINTER_OVER`, meaningful only with
+  `MULTI_DISPLAY`: the guest moves its cursor onto the display the host's
+  pointer is over when the event `POINTER_OVER` says so ("The pointer across
+  displays", below). The device offers it beside `MULTI_DISPLAY`, only on a
+  device of two displays or more, and sends the event only to a guest that
+  took both. The x86-64 kext takes it; the arm64e kext and the firmware
+  drivers do not.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -2727,6 +2734,7 @@ stage 2.
 | 0x101 | `DISPLAYS` | count u32, then per display: id u32, connected u32, preferred mode index u32, mode count u32, where the guest took `DISPLAY_SCALE` its host screen's scale in 120ths u32 and a reserved u32, then per mode: width u32, height u32, refresh in mHz u32 |
 | 0x102 | `DISPLAY_CHANGED` | display u32; the guest asks `GET_DISPLAYS` again |
 | 0x103 | `VBLANK` | display u32, count u64, host time in ns u64 |
+| 0x104 | `POINTER_OVER` | display u32, x i32, y i32, buttons u32 (`RGFX_POINTER_BUTTON_*`); only to a guest that took `POINTER_OVER` |
 
 **Display.** The modes offered are the host window's size, its width rounded
 down to a multiple of 16 pixels and its height to even, and its screen's
@@ -2964,8 +2972,9 @@ on x86-64 macOS 11 to 26 and arm64 macOS from 14). The wire's definitions are
 in `wire.rs` (`RGFX_FEATURE_MULTI_DISPLAY`, `RGFX_DISPLAYS_MAX`,
 `RGFX_SCANOUT_ROOM_ALIGN`, `RGFX_SCANOUT_STRIDE_ALIGN`); a host of two
 displays or more offers the feature (lane mmhost), and the x86-64 kext takes it
-(lane mmx86). The pointer crossing, reims-ctl's setting and the arm64e kext,
-lanes at the end of this section, are still to build.
+(lane mmx86). reims-ctl's setting is built (lane mmctl), and so is the pointer
+crossing on x86-64 (lane ptrcross: `POINTER_OVER`, below); the arm64e kext, a
+lane at the end of this section, is still to build.
 
 **A device of one display is what it was.** A device has 1 to
 `RGFX_DISPLAYS_MAX` (4) displays, 1 by default, fixed when it is made. With
@@ -3113,11 +3122,55 @@ changes.
 console, in that display's pixels, and keys from every window reach the one
 keyboard. A VM has one USB tablet, which reports a position in its range with
 no display in it. The guest scales it over the display its cursor is on (X1,
-below), so a pointer over display 1's window reaches the guest's display 1
-once a crossing has moved the cursor there: the pointer crossing lane's. Until
-it lands, every window's pointer moves the cursor over the display it is on,
-display 0 from the guest's start, and reims-ctl offers no setting for it (its
-lane lands last).
+below), so a pointer over display i's window reaches the guest's display i
+once the guest's cursor is there. The device moves it there with the event
+`POINTER_OVER` (0x104, `RgfxPointerOver`: display, x, y in the display's
+pixels of its mode, and the buttons held):
+- **The host's side.** Each window's pointer callback, on a device of two
+  displays or more, first tells the device the pointer is over the window's
+  display at the event's point with its buttons
+  (`reims_vgpu_graphics::PointerLink::pointer_at`, wired in
+  `crates/reims-vgpu/src/window.rs`), then hands the event to the host, which
+  moves the tablet. So the event is in the completion ring before the
+  tablet's report of the same position is queued. The device sends it where
+  the guest took `POINTER_OVER` and `MULTI_DISPLAY`, the guest's cursor shows
+  on another display (the display of its latest `MOVE_CURSOR` with `visible`
+  set, display 0 from a reset), and the guest was not already told this
+  display while the cursor is on that one: once per crossing, and again only
+  after the cursor has shown on another display. A crossing that finds the
+  ring held, full or behind answers handed over is posted at the next
+  refresh of any display. A reset forgets it all.
+- **The x86-64 kext.** On the event, display 0's framebuffer takes the
+  display's mode and its rectangle in WindowServer's global space (its
+  framebuffer's `getBoundingRect`, the bounds WindowServer gave it), places the
+  pixel in that rectangle, scaled from the mode's pixels to the rectangle's
+  size, and on a thread call posts IOHIDSystem's own move there:
+  `IOHIDSystem::extPostEvent` with `kIOHIDSetCursorPosition`, a mouse-moved,
+  or the drag of the button held (left, then right, then any other), so a
+  move told while a button is held stays a drag: one after the guest moved
+  its cursor to another display during a drag in a window, say
+  (`ReimsGraphicsPointer.cpp`, `RgfxPointerOver.hpp`). The kext links IOHIDFamily, where IOHIDSystem
+  lives on 11 to 26.
+- **Compatibility.** The device sends `POINTER_OVER` only to a guest that
+  took its own feature bit, `POINTER_OVER` (49), not to every taker of
+  `MULTI_DISPLAY`: development's kext before this event, the arm64e kext and
+  the firmware drivers take `MULTI_DISPLAY` without it (or will), and are
+  never sent it. Each would drop it in any case: the kext's completion ring
+  service passes over an event type it does not know (`handleEvent`'s
+  default), and the option ROM's and Ambrosia's module's waits pass over every
+  event but the answer they wait for.
+- **A drag stays on its display.** The click that begins a drag captures
+  input in its window, and capture holds the host's pointer over that
+  window's image (features.md, "Capture"), so a drag stays on the display it
+  began on: the guest's cursor is held there, and a window dragged toward
+  another display stays on its own. The pointer reaches another display's
+  window once capture is released (⌃⌥⌘, Ctrl+Alt+Super off macOS, or the
+  window losing the keyboard). Measured on x86-64 macOS 11.7.11, 15.8.2 and
+  26.7.2 with KWin on Wayland (lane ptrcross, potluck jobs m3-max-34847 to
+  34849, 34851 and 34870): a Finder window's title bar dragged from display
+  0's window toward display 1's moved the Finder window on display 0 alone,
+  and after Ctrl+Alt+Super the pointer into display 1's window put the
+  cursor on display 1.
 
 **The windows.** One window per display, as the window crate already makes
 them (`Window::new(config, port, title(port))`, `screens::screen_for_port`):
@@ -3139,7 +3192,8 @@ share a screen. In features.md:
   window the pointer is in (`manual (a VM with two displays)`);
 - new entries, in a commit of their own: each window offers its display its
   own mode, rate and scale; a window whose display the guest does not drive
-  shows black; and the pointer's, once X1 settles it.
+  shows black; and the pointer's, which `POINTER_OVER` gives each window
+  (features.md, "Pointer").
 
 **The x86-64 kext.** `ReimsGraphics` stays the device's driver and display
 0's IOFramebuffer. Where it took `MULTI_DISPLAY` and `DISPLAYS` lists more
@@ -3229,14 +3283,25 @@ it.
   crossing is a lane of its own, after mmx86 ("pointer crossing" below): an
   event under `MULTI_DISPLAY`, added to the wire before a kext that takes the
   bit ships, says the pointer is over display i at x, y, and the kext moves
-  the cursor there. Its lead, read from IOHIDFamily's public source:
-  `IOHIDSystem::extSetMouseLocation` (`IOHIDSystem.cpp`, a public virtual of
-  `IOHIDSystem::instance()`, selector 4 of its user client in
-  `IOHIDUserClient.cpp`), which sets the desktop location and calls
-  `_setCursorPosition`. Whether WindowServer on 11 to 26 follows a location
-  set there is that lane's first measurement. mmx86's boot matrix repeated
-  both sweeps on 11.7.11, 12.7.6, 13.7.8, 14.8.9 and 15.8.2, with the same
-  reading on each as on 26.7.2.
+  the cursor there. mmx86's boot matrix repeated both sweeps on 11.7.11,
+  12.7.6, 13.7.8, 14.8.9 and 15.8.2, with the same reading on each as on
+  26.7.2.
+  - Which move WindowServer follows, measured by lane ptrcross on x86-64
+    11.7.11, 15.8.2 and 26.7.2 with two displays (potluck jobs m3-max-34584,
+    34585 and 34583; a scratch kext that never landed, our CoreGraphics tool
+    reading the cursor): from the kernel, `IOHIDSystem::extPostEvent` of a
+    mouse-moved at (2880, 540) with `kIOHIDSetCursorPosition` puts the cursor
+    at (2880, 540) on display 1, and the tablet's next position (8192, 8192)
+    lands at (2400, 270) on display 1. `IOHIDSystem::extSetMouseLocation` to
+    the same point answers success and leaves the cursor on display 0, and so
+    does the tablet after it. From a process, `IOHIDSetMouseLocation` and
+    `IOHIDPostEvent` are refused (`kIOReturnNotPermitted`, the HID control
+    check) and `CGEventPost` is dropped; `CGWarpMouseCursorPosition` moves the
+    cursor. Each framebuffer's `getBoundingRect` equals its display's
+    `CGDisplayBounds` (0, 0 to 1920, 1080 and 1920, 0 to 3840, 1080).
+    IOHIDSystem's class lives in IOHIDFamily on those releases: a kext naming
+    `com.apple.iokit.IOHIDSystem` as a library is not injected
+    (m3-max-34528), one naming `com.apple.iokit.IOHIDFamily` is.
 - X2, the second display's connection. Whether macOS 11 to 26 runs two
   displays that both say they are built in (`kIOConnectionBuiltIn`, which
   display 0 says so that its HiDPI start follows its density): booted with
