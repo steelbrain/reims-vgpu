@@ -26,8 +26,9 @@ and runs macOS VMs for you.
 We don't ship disk images: macOS comes straight from Apple. `reims-ctl` downloads the installer
 from Apple and sets the VM up for you, or uses a disk that already has macOS on it.
 
-You need an x86-64 Linux host. Our drivers load on macOS 26.4 and later for now; we've tested
-macOS 26 on an RTX 5080 laptop GPU and a Radeon 780M.
+You need an x86-64 Linux host or an x86-64 Windows PC. Our drivers load on macOS 26.4 and later
+for now; we've tested macOS 26 on an RTX 5080 laptop GPU and a Radeon 780M on Linux, and on an Intel
+UHD 630 on Windows 11.
 
 On an Apple silicon Mac, arm64 macOS 14 to 27 runs on QEMU with Ambrosia, our own arm64 firmware,
 and the same virtual GPU. `reims-ctl` doesn't set these VMs up: you install macOS with a tool
@@ -36,7 +37,8 @@ to the guest as it starts. [docs/qemu.md](docs/qemu.md), "arm64 guests", has the
 
 ### Install reims-ctl
 
-Clone the repository (without `--recursive`: QEMU's own submodules are not needed) and run:
+On Linux, clone the repository (without `--recursive`: QEMU's own submodules are not needed) and
+run:
 
 ```sh
 scripts/install-ctl.sh
@@ -49,6 +51,22 @@ QEMU into `~/.local/share/reims-ctl/qemu`, and `reims-ctl` into `~/.cargo/bin`, 
 fetched from its public repository (`steelbrain/qemu-reims-vgpu`), at the commit this checkout
 pins, and Cargo fetches metal2vulkan from its public repository, at the commit the workspace's
 `Cargo.toml` names. `reims-ctl doctor` checks the host and the install.
+
+On Windows, open PowerShell and run:
+
+```powershell
+irm https://raw.githubusercontent.com/steelbrain/reims-vgpu/master/scripts/install.ps1 | iex
+```
+
+It installs MSYS2 and Git for Windows with winget if you don't have them, turns on the Windows
+Hypervisor Platform that VMs run on (Windows asks for an administrator for that step alone, and you
+restart once before your first VM), clones the repository into your user folder, and runs
+`scripts/install-ctl.sh` in MSYS2's CLANG64 shell. That builds the library and QEMU with MSYS2's
+clang, installing Rust for the same toolchain if you don't have it, so you don't need Visual
+Studio, and installs `reims-ctl` into `%USERPROFILE%\.cargo\bin`. On an Intel Core i7-8700B a
+first install took about 20 minutes, and running it again about a minute. From a clone,
+`powershell -ExecutionPolicy Bypass -File scripts\install.ps1` does the same. Windows support is
+newer than Linux's: the guest gets no hardware video decoding there yet.
 
 ### Set up a VM
 
@@ -63,6 +81,9 @@ pins, and Cargo fetches metal2vulkan from its public repository, at the commit t
    copies of the guest's memory instead of the memory itself. `reims-ctl doctor` and the
    installer tell you the value that avoids the copies, if yours is lower. It's optional: the
    guest works at your distribution's default.
+
+   On Windows there's nothing to prepare once the installer has turned on the Windows Hypervisor
+   Platform and you've restarted.
 
 2. **Create a VM.** Run `reims-ctl`, press `n`, pick a macOS version and press Ctrl-S. It downloads
    the installer from Apple and makes the VM's OpenCore image and disk; then press `s` to start it.

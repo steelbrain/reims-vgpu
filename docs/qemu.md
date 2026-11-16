@@ -842,8 +842,9 @@ CPUID after 2 ms 4.1 µs.
 ## Windows hosts
 
 Windows hosts are being brought up on homelab-mac-mini-2018 (Windows 11
-26H2, i7-8700B, 64 GiB, Intel UHD 630); nothing ships for them yet. QEMU
-builds there in MSYS2's CLANG64 environment (clang and lld; QEMU builds on
+26H2, i7-8700B, 64 GiB, Intel UHD 630), where `scripts/install.ps1`
+installs reims-ctl as README.md says ("Windows hosts: installing", below).
+QEMU builds there in MSYS2's CLANG64 environment (clang and lld; QEMU builds on
 Windows only with MinGW, `vendor/qemu/docs/about/build-platforms.rst`), and
 runs x86-64 guests under WHPX, the Windows Hypervisor Platform
 (`-accel whpx`):
@@ -885,6 +886,50 @@ the library and `ninja -j12 qemu-system-x86_64.exe` 293 s, beside SDL
 - **No `dump-guest-core=off`.** QEMU refuses it on Windows ("Dumping guest
   memory cannot be disabled on this host") and exits, so a Windows host's
   `-machine` leaves it out.
+
+### Windows hosts: installing
+
+A Windows user runs `scripts/install.ps1` in PowerShell, from GitHub
+(`irm .../install.ps1 | iex`) or from a clone. It installs MSYS2 and Git
+for Windows with winget where they are missing, turns the Windows
+Hypervisor Platform on from an elevated PowerShell where it is off (Windows
+then needs a restart), clones the repository into `%USERPROFILE%\reims-vgpu`
+where it runs from no checkout, brings MSYS2's packages up to date
+(`pacman -Syuu`, twice), and runs `scripts/install-ctl.sh --yes` in MSYS2's
+CLANG64 shell. That installs its MSYS2 packages with pacman and, where
+there is no rustup, rustup with the `x86_64-pc-windows-gnullvm` host, whose
+builds link with CLANG64's clang and lld; it builds the library's dist tree
+and QEMU (WHPX, GTK, slirp, libusb, no guest agent), copies the CLANG64
+DLLs QEMU and qemu-img load beside them, and installs reims-ctl and
+reims-util into `%USERPROFILE%\.cargo\bin`. `install.toml` records the
+MSYS2 bash the install ran in, and `reims-ctl update` runs the script there,
+with `MSYSTEM=CLANG64`. A host whose rustup is already there with another
+default host builds with that host's toolchain, which nothing here has
+tested.
+
+**Measured** on the mini (2026-11-16, `m3-max-36191`), in a scratch MSYS2
+extracted from MSYS2's base archive (its package list of 2026-09-27, so the
+update step had work to do) and a scratch user profile with rustup's
+`rustup-init` run there beforehand:
+- MSYS2's extraction and first login took 40 s, `rustup-init` 29 s, and
+  install.ps1 1,083 s: 19 min in all. Of install.ps1's time, the library's
+  release build took 6 min 4 s. QEMU's install has 68 CLANG64 DLLs beside
+  it.
+- install.ps1 again took 62 s, and `reims-ctl update` from PowerShell, with
+  the checkout unchanged, 52 s, replacing its own running binary.
+- `doctor` then passed every line: the hypervisor platform on and a
+  hypervisor running, the UHD 630, no recording device, a signed-in
+  desktop.
+- The user's PATH and rustup's uninstall entry in the registry were as
+  before.
+- Before the Windows build turned QEMU's guest agent off, its configure
+  stopped there for want of `windmc` (`m3-max-36094`); before install-ctl.sh
+  tried it for a minute, the move of QEMU's staged install failed once with
+  "Permission denied" (`m3-max-36159`).
+
+install.ps1's winget and hypervisor-platform steps ran only as dry runs
+(`-DryRun`, with `REIMS_INSTALL_PRETEND_MISSING` naming each step's check as
+failed): no clean PC has run them.
 
 ### Windows hosts: guest RAM in a section
 
@@ -943,6 +988,11 @@ as `waveOutGetNumDevs` and `waveInGetNumDevs` do at each start
 `audioin`, gets an audiodev of its own, `none`, and the guest records
 silence; with no output device the VM's sound is all `none`. The start
 says so, and `doctor` says which devices there are.
+**Measured** on the mini (2026-11-16, `m3-max-36258`, QEMU at
+`e435673c`): the three runs above that exited all realized, and a VM on
+`dsound` started with its input device on `none`, the start warning so. The
+guest listed an output and an input "Apple Virtual Sound Device", and
+`afplay` of a system sound exited 0 (no one listened at the host).
 
 ## x86-64 macOS guests
 
