@@ -9673,6 +9673,58 @@ void test_function_stage_attributes_as_metal()
 	CHECK([fn.ours newFunctionWithName:@"v_order"].vertexAttributes.count == 4);
 }
 
+// A render pipeline's imageblockSampleLength is the host's answer on an Apple GPU's device, and 0 on
+// any other, as the x86 Macs' devices answer (the AMD 5300M's and the Intel 630's, where the M3 Max
+// answers 4 for one BGRA8 colour attachment; tools/oracle/oracle_fnreflect, r_plain).
+void test_imageblock_sample_length_on_apple_gpus_alone()
+{
+	Fixture fx(0x80000); // the library's bytes fit
+	const char *path = getenv("RGFX_ORACLE_FNREFLECT");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	uint32_t status = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.bytes
+	                                         length:bytes.length
+	                                            key:nullptr
+	                                         device:nil
+	                                     serializer:&fx.ser
+	                                         status:&status];
+	CHECK(lib != nil);
+	drainRing(fx.ring);
+	MTLRenderPipelineDescriptor *desc = [MTLRenderPipelineDescriptor new];
+	desc.vertexFunction = [lib newFunctionWithName:@"v_plain"];
+	desc.fragmentFunction = [lib newFunctionWithName:@"f_in"];
+	desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	TestRing completion(0x8000);
+	RgfxReplyReader reader(completion.base(), completion.dataSize);
+	id apple = [RgfxAppleFamilyDevice new];
+	for (id device : {(id)nil, apple}) {
+		NSError *err = nil;
+		RgfxRenderPipelineState *ps =
+		    [RgfxRenderPipelineState renderPipelineStateWithDescriptor:desc
+		                                                       device:(id<MTLDevice>)device
+		                                                   serializer:&fx.ser
+		                                                        error:&err];
+		CHECK(ps != nil && err == nil);
+		drainRing(fx.ring);
+		[ps rgfxRegisterWithReplyReader:&reader];
+		RgfxPipelineReflection refl = {};
+		refl.header.type = RGFX_EVT_PIPELINE_REFLECTION;
+		refl.header.size = sizeof(refl);
+		refl.header.seqno = ps.rgfxSeqno;
+		refl.obj_id = ps.rgfxObjId;
+		refl.imageblock_sample_length = 4;
+		refl.status = RGFX_PIPELINE_OK;
+		refl.kind = RGFX_PIPELINE_KIND_RENDER;
+		CHECK(completion.postFromHost(&refl, sizeof(refl)));
+		CHECK(reader.pump() == 1);
+		CHECK(![ps rgfxRefused]);
+		CHECK(ps.imageblockSampleLength == (device == apple ? 4u : 0u));
+	}
+}
+
 // A Core Image kernel library's extern functions come from its shadow, Metal's own library over
 // the same bytes: their names, each a function of functionType 4 that holds Metal's own, and nil
 // for a name the shadow does not hold; functionNames leaves them out, as Metal's does. Core
@@ -21069,6 +21121,7 @@ int main(int argc, char **argv)
 		test_core_image_extern_functions();
 		test_function_patch_answers();
 		test_function_stage_attributes_as_metal();
+		test_imageblock_sample_length_on_apple_gpus_alone();
 		test_overlapping_arguments_refused_as_metal();
 		test_function_constants_make_follows_no_body();
 		test_stitched_library_over_shadows();

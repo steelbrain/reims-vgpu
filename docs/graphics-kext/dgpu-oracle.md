@@ -1320,7 +1320,9 @@ reflection. With reflection options, the error form answers a reflection with on
 and three object bindings where the pipeline has an object function. Ours answers each limit as
 the host's platform answers it (`RgfxRenderPipelineState.mm`; on the M3, its numbers), the
 required sizes as the descriptor's *(class 3)*, and the grid's `NSUIntegerMax` where the platform's
-answer passes 32 bits *(class 2)*.
+answer passes 32 bits *(class 2)*. `imageblockSampleLength` is the platform's answer on an Apple
+GPU's device, the arm64 guest's, and 0 on the x86 guest's, as the AMD and the Intel 630 answer for
+a vertex and fragment pipeline too.
 
 **What ends the process, and what is refused.** The same with and without the validation layer,
 except where the table says so:

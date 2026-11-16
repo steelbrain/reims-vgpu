@@ -14,6 +14,7 @@
 
 #import "RgfxFunction.h"
 #import "RgfxMetalError.h"
+#import "RgfxTexture.h" // rgfxAppleGPU
 
 #include "RgfxKnownPipelines.hpp"
 #include "RgfxReplyReader.hpp"
@@ -816,9 +817,14 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 	return NO;
 }
 
+// An Apple GPU's tile memory a sample of the pipeline's colour attachments takes: the host's answer
+// on an Apple GPU's device (rgfxAppleGPU, the arm64 guest's: the M3 Max answers 4 for a pipeline of
+// one BGRA8 attachment), and 0 on any other, as the x86 Macs' devices answer for every pipeline,
+// having no tile memory (measured: tools/oracle/oracle_fnreflect, the AMD 5300M and the Intel 630 on
+// macOS 26.7.1, r_plain, r_mixed and r_mesh).
 - (NSUInteger)imageblockSampleLength
 {
-	if (_haveReflection) {
+	if (_haveReflection && rgfxAppleGPU(self.device)) {
 		return _reflection.imageblock_sample_length;
 	}
 	return 0;
