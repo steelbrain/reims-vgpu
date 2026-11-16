@@ -47,9 +47,9 @@ constexpr uint64_t rgfxPhysicalMaskAlignment(uint64_t mask, uint64_t page)
 
 // The physical mask of the chunks of a chunked pages block (kRgfxAccelMethodPagesChunked): guest
 // RAM below 2^48, each chunk at a multiple of its own bytes, so a block of chunks is runs of
-// guest RAM that start and end at multiples of 64 KiB, the granule at which the host binds a
-// buffer over several pieces of its import of guest RAM (a sparse buffer's alignment on RADV),
-// rather than importing the block's pages apart.
+// guest RAM that start and end at multiples of 64 KiB, one run a chunk at most: a host that
+// imports pages as dma-bufs imports a block's view as one dma-buf of its runs, which a block of
+// up to 1,024 chunks fits at udmabuf's stock limits (1,024 runs, 64 MiB).
 constexpr uint64_t kRgfxPagesChunkMask = 0x0000'FFFF'FFFF'0000ull;
 static_assert(rgfxPhysicalMaskAlignment(kRgfxPagesChunkMask, 0x1000) == kRgfxPagesChunk,
               "each chunk at a multiple of its own bytes");
