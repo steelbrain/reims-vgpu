@@ -1,9 +1,10 @@
 // The native test of RgfxDisplayPlaces.hpp, against a model of WindowServer: each display a
 // rectangle of the global space, a posted point held at the edge of the display the cursor is on
-// where it lies past every display, and the cursor shown on the display holding it at its pixel.
-// Displays side by side, left, below and above, one at 2x, one in a scaled mode, a rearrangement
-// mid-session, a display never entered, the cursor's image over an edge, and the crossing's
-// limits: its posts, its hold and a landing that never comes.
+// where it lies past every display, and the cursor shown on the display holding it at its pixel,
+// where it moved. Displays side by side, left, below and above, one at 2x, one in a scaled mode,
+// a rearrangement mid-session, a display never entered, the tablet's move while a post is out,
+// the cursor's image over an edge, a post held where the cursor was, and the crossing's limits:
+// its posts, a slow guest and a landing that never comes.
 #include "RgfxDisplayPlaces.hpp"
 
 #include <cstdio>
@@ -33,10 +34,13 @@ struct Desktop {
 	RgfxPlaceMode modes[RGFX_DISPLAYS_MAX];
 	uint32_t count;
 	mutable uint32_t on;
+	mutable bool shown; // the cursor's pixel on `on`, once shown
+	mutable int32_t ax, ay;
 
 	// The display a point posted shows the cursor on, and its pixel there: the display holding
-	// it, or, where none does, the one the cursor is on, the point held at its edge.
-	void land(int32_t gx, int32_t gy, uint32_t *display, int32_t *x, int32_t *y) const
+	// it, or, where none does, the one the cursor is on, the point held at its edge. False where
+	// the cursor did not move, which shows nothing.
+	bool land(int32_t gx, int32_t gy, uint32_t *display, int32_t *x, int32_t *y) const
 	{
 		uint32_t d = on < count ? on : 0;
 		for (uint32_t i = 0; i < count; i++)
@@ -46,11 +50,17 @@ struct Desktop {
 		const RgfxGlobalRect &r = rects[d];
 		const int32_t cx = gx < r.minx ? r.minx : gx > r.maxx - 1 ? r.maxx - 1 : gx;
 		const int32_t cy = gy < r.miny ? r.miny : gy > r.maxy - 1 ? r.maxy - 1 : gy;
-		on = *display = d;
+		*display = d;
 		*x = static_cast<int32_t>(static_cast<int64_t>(cx - r.minx) * modes[d].width /
 		                          (r.maxx - r.minx));
 		*y = static_cast<int32_t>(static_cast<int64_t>(cy - r.miny) * modes[d].height /
 		                          (r.maxy - r.miny));
+		const bool moved = !shown || d != on || *x != ax || *y != ay;
+		on = d;
+		ax = *x;
+		ay = *y;
+		shown = true;
+		return moved;
 	}
 };
 
@@ -63,7 +73,8 @@ struct Crossed {
 	int32_t x, y;
 };
 
-// The kext's crossing onto `display` at pixel `x`, `y`, each post landing at once, `step` ns apart.
+// The kext's crossing onto `display` at pixel `x`, `y`, each post's move shown `step` ns after it;
+// a post that shows nothing, or is held, waited for until its deadline.
 Crossed cross(RgfxDisplayPlaces *places, RgfxCrossing *c, const Desktop &desk, uint32_t display,
               int32_t x, int32_t y, uint64_t *now, uint64_t step = 16000000)
 {
@@ -73,18 +84,29 @@ Crossed cross(RgfxDisplayPlaces *places, RgfxCrossing *c, const Desktop &desk, u
 	int32_t gx = 0, gy = 0;
 	while (rgfxCrossingNext(*places, c, *now, &gx, &gy)) {
 		out.posts++;
-		*now += step;
-		desk.land(gx, gy, &out.display, &out.x, &out.y);
-		bool confirmed = false;
-		const RgfxCrossingStep s =
-		    rgfxCrossingLanded(places, c, out.display, out.x, out.y, &confirmed);
-		out.confirmations += confirmed;
+		uint32_t d = 0;
+		int32_t lx = 0, ly = 0;
+		RgfxCrossingStep s = RgfxCrossingStep::none;
+		if (desk.land(gx, gy, &d, &lx, &ly)) {
+			*now += step;
+			bool confirmed = false;
+			s = rgfxCrossingLanded(places, c, d, lx, ly, *now, &confirmed);
+			out.confirmations += confirmed;
+		}
+		if (s == RgfxCrossingStep::none || s == RgfxCrossingStep::held) {
+			check(c->waiting, "a post that shows nothing, or is held, is waited for");
+			*now = rgfxCrossingDeadline(*c);
+			s = rgfxCrossingWaited(c, *now);
+		}
 		if (s == RgfxCrossingStep::arrived) {
 			out.arrived = true;
 			break;
 		}
-		check(s == RgfxCrossingStep::again, "a landing elsewhere posts again");
+		check(s == RgfxCrossingStep::again, "the cursor not on the display posts again");
 	}
+	out.display = desk.on;
+	out.x = desk.ax;
+	out.y = desk.ay;
 	check(!c->active && !c->waiting, "a crossing ends with no post out");
 	*now += 1000000000;
 	return out;
@@ -173,8 +195,8 @@ int main()
 	}
 
 	// Display 1 left of display 0: the first post is held at display 0's right edge; the next,
-	// beside display 0's left, lands on display 1, which is learned there, and confirmed by the
-	// next crossing.
+	// beside display 0's left, lands on display 1 where that placement puts it, which confirms
+	// the placement as its rectangle.
 	{
 		Desktop desk = twoSideBySide();
 		desk.rects[1] = {-1920, 0, 0, 1080};
@@ -183,15 +205,17 @@ int main()
 		Crossed r = cross(&places, &c, desk, 0, 900, 400, &now);
 		check(r.arrived && places.at[0].state == RgfxPlaceState::confirmed, "display 0 confirmed");
 		r = cross(&places, &c, desk, 1, 1915, 300, &now);
-		check(r.arrived && r.display == 1 && r.posts == 2, "left: onto display 1 in two posts");
-		check(same(places.at[1].rect, -1920, 0, 0, 1080) &&
-		          places.at[1].state == RgfxPlaceState::learned && confirmedCount(places) == 1,
-		      "display 1 learned left of display 0, not yet told");
-		r = cross(&places, &c, desk, 0, 10, 300, &now);
+		check(r.arrived && r.display == 1 && r.posts == 2 && r.x == 1915 && r.y == 300,
+		      "left: onto display 1 at its pixel in two posts");
+		check(same(places.at[1].rect, -1920, 0, 0, 1080) && r.confirmations == 1 &&
+		          confirmedCount(places) == 2,
+		      "display 1 confirmed left of display 0, and told");
+		check(same(places.at[0].rect, 0, 0, 1920, 1080) &&
+		          places.at[0].state == RgfxPlaceState::confirmed,
+		      "display 0, where the first post was held, keeps its place");
+		cross(&places, &c, desk, 0, 10, 300, &now);
 		r = cross(&places, &c, desk, 1, 1915, 600, &now);
-		check(r.arrived && r.posts == 1 && r.confirmations == 1, "the next crossing confirms it");
-		check(same(places.at[1].rect, -1920, 0, 0, 1080) && confirmedCount(places) == 2,
-		      "and it is told");
+		check(r.arrived && r.posts == 1, "the next crossing takes one post");
 	}
 
 	// Display 1 below display 0, and above it, offset sideways.
@@ -204,9 +228,9 @@ int main()
 		Crossed r = cross(&places, &c, desk, 1, 800, 3, &now);
 		check(r.arrived && r.display == 1 && r.posts <= kRgfxCrossingPosts,
 		      "below: onto display 1");
-		check(same(places.at[1].rect, 0, 1080, 1920, 2160), "learned below display 0");
-		r = cross(&places, &c, desk, 1, 900, 40, &now); // already there: a landing that agrees
-		check(places.at[1].state == RgfxPlaceState::confirmed, "and confirmed");
+		check(same(places.at[1].rect, 0, 1080, 1920, 2160) &&
+		          places.at[1].state == RgfxPlaceState::confirmed,
+		      "confirmed below display 0");
 
 		desk.rects[1] = {300, -1080, 2220, 0};
 		RgfxDisplayPlaces above = {};
@@ -280,6 +304,7 @@ int main()
 		desk.rects[1] = {-1920, 200, 0, 1280};
 		Crossed r = cross(&places, &c, desk, 1, 1915, 600, &now);
 		check(r.arrived && r.display == 1 && r.posts == 2, "moved: onto display 1 in two posts");
+		check(same(places.at[0].rect, 0, 0, 1920, 1080), "display 0 keeps its place");
 		check(same(places.at[1].rect, -1920, 200, 0, 1280), "its new place learned");
 		check(places.at[1].state == RgfxPlaceState::learned,
 		      "and no longer told as it was confirmed");
@@ -311,8 +336,63 @@ int main()
 		check(places.at[2].state == RgfxPlaceState::guessed, "it keeps its guess");
 	}
 
-	// The cursor near display 0's right edge shows on display 1 too, its image over the edge, its
-	// hot spot past display 1's left: no landing, and the crossing waits for display 0's.
+	// A post out while the host's tablet moves the cursor on the display it is on (its hold over,
+	// a slow guest's landing not yet shown): the tablet's pixel is no landing, and the display it
+	// showed on keeps its place.
+	{
+		Desktop desk = twoSideBySide();
+		RgfxDisplayPlaces places = {};
+		RgfxCrossing c = {};
+		cross(&places, &c, desk, 1, 10, 400, &now);
+		cross(&places, &c, desk, 0, 1900, 400, &now);
+		cross(&places, &c, desk, 1, 500, 500, &now);
+		check(confirmedCount(places) == 2, "both confirmed, the cursor on display 1");
+		rgfxCrossingStart(&c, 0, 756, 472, now);
+		int32_t gx = 0, gy = 0;
+		check(rgfxCrossingNext(places, &c, now, &gx, &gy) && gx == 756 && gy == 472,
+		      "a post onto display 0");
+		bool confirmed = true;
+		check(rgfxCrossingLanded(&places, &c, 1, 756, 472, now + 100000000, &confirmed) ==
+		              RgfxCrossingStep::none &&
+		          c.waiting && !confirmed,
+		      "the tablet's move on display 1 is no landing");
+		check(same(places.at[1].rect, 1920, 0, 3840, 1080) &&
+		          places.at[1].state == RgfxPlaceState::confirmed,
+		      "and display 1 keeps its place");
+		check(rgfxCrossingLanded(&places, &c, 0, 756, 472, now + 120000000, &confirmed) ==
+		              RgfxCrossingStep::arrived &&
+		          confirmed && c.landedAfter == 120000000,
+		      "display 0's is the landing");
+		now += 1000000000;
+
+		// Rearranged, display 1 left: the tablet's move on display 0, then the post held at its
+		// right edge, far past it, which posts again at once.
+		desk.rects[1] = {-1920, 0, 0, 1080};
+		rgfxCrossingStart(&c, 1, 500, 500, now);
+		check(rgfxCrossingNext(places, &c, now, &gx, &gy) && gx == 2420, "a post right of 0");
+		check(rgfxCrossingLanded(&places, &c, 0, 500, 500, now + 100000000, &confirmed) ==
+		              RgfxCrossingStep::none &&
+		          c.waiting,
+		      "the tablet's move on display 0 is no landing");
+		check(rgfxCrossingLanded(&places, &c, 0, 1919, 500, now + 110000000, &confirmed) ==
+		              RgfxCrossingStep::again &&
+		          !c.waiting,
+		      "held at display 0's right edge, far past it: posted again");
+		check(rgfxCrossingNext(places, &c, now + 110000000, &gx, &gy) && gx == -1420 && gy == 500,
+		      "left of display 0");
+		check(rgfxCrossingLanded(&places, &c, 1, 500, 500, now + 130000000, &confirmed) ==
+		              RgfxCrossingStep::arrived &&
+		          confirmed && same(places.at[1].rect, -1920, 0, 0, 1080),
+		      "onto display 1, confirmed there");
+		check(same(places.at[0].rect, 0, 0, 1920, 1080) &&
+		          places.at[0].state == RgfxPlaceState::confirmed,
+		      "display 0 keeps its place");
+		now += 1000000000;
+	}
+
+	// The cursor near display 0's right edge shows on display 1 too, its image over the edge: its
+	// hot spot past display 1's left is no landing; at display 1's first pixel, where the post's
+	// point is held at that edge, the crossing waits for display 0's landing.
 	{
 		const Desktop side = twoSideBySide();
 		RgfxDisplayPlaces places = {};
@@ -322,16 +402,82 @@ int main()
 		int32_t gx = 0, gy = 0;
 		check(rgfxCrossingNext(places, &c, now, &gx, &gy) && gx == 1915 && gy == 600, "a post");
 		bool confirmed = true;
-		check(rgfxCrossingLanded(&places, &c, 1, -5, 600, &confirmed) == RgfxCrossingStep::none &&
+		check(rgfxCrossingLanded(&places, &c, 1, -5, 600, now, &confirmed) ==
+		              RgfxCrossingStep::none &&
 		          !confirmed && c.waiting && c.active,
 		      "display 1's image over the edge is no landing");
-		check(rgfxCrossingLanded(&places, &c, 1, 3, 1080, &confirmed) == RgfxCrossingStep::none &&
+		check(rgfxCrossingLanded(&places, &c, 1, 3, 1080, now, &confirmed) ==
+		              RgfxCrossingStep::none &&
 		          c.waiting,
 		      "nor one past its bottom edge");
-		check(rgfxCrossingLanded(&places, &c, 0, 1915, 600, &confirmed) ==
+		check(rgfxCrossingLanded(&places, &c, 1, 0, 600, now + 1000, &confirmed) ==
+		              RgfxCrossingStep::held &&
+		          c.waiting && c.held && rgfxCrossingDeadline(c) == now + 1000 + kRgfxSpillWaitNs,
+		      "its hot spot at display 1's first pixel holds the crossing a while");
+		check(rgfxCrossingLanded(&places, &c, 1, 0, 600, now + 2000, &confirmed) ==
+		              RgfxCrossingStep::none,
+		      "once");
+		check(rgfxCrossingLanded(&places, &c, 0, 1915, 600, now + 3000, &confirmed) ==
 		              RgfxCrossingStep::arrived &&
 		          confirmed && !c.waiting,
 		      "display 0's is the landing");
+		check(same(places.at[1].rect, 1920, 0, 3840, 1080) &&
+		          places.at[1].state == RgfxPlaceState::guessed,
+		      "display 1 learned nothing");
+		now += 1000000000;
+	}
+
+	// Rearranged, display 1 left: a post just past display 0's right edge is held there, the
+	// crossing waits kRgfxSpillWaitNs for a landing on display 1, then posts again.
+	{
+		Desktop desk = twoSideBySide();
+		RgfxDisplayPlaces places = {};
+		RgfxCrossing c = {};
+		cross(&places, &c, desk, 1, 10, 400, &now);
+		cross(&places, &c, desk, 0, 1000, 500, &now);
+		desk.rects[1] = {-1920, 0, 0, 1080};
+		rgfxCrossingStart(&c, 1, 3, 500, now);
+		int32_t gx = 0, gy = 0;
+		check(rgfxCrossingNext(places, &c, now, &gx, &gy) && gx == 1923, "a post right of 0");
+		bool confirmed = true;
+		check(rgfxCrossingLanded(&places, &c, 0, 1919, 500, now + 10000000, &confirmed) ==
+		              RgfxCrossingStep::held,
+		      "held at display 0's edge, within a cursor's reach: waited on");
+		check(rgfxCrossingWaited(&c, now + 10000000 + kRgfxSpillWaitNs - 1) ==
+		              RgfxCrossingStep::none &&
+		          c.waiting,
+		      "for kRgfxSpillWaitNs");
+		check(rgfxCrossingWaited(&c, now + 10000000 + kRgfxSpillWaitNs) ==
+		              RgfxCrossingStep::again &&
+		          !c.waiting,
+		      "then posted again");
+		check(rgfxCrossingNext(places, &c, now + 70000000, &gx, &gy) && gx == -1917,
+		      "left of display 0");
+		check(rgfxCrossingLanded(&places, &c, 1, 3, 500, now + 80000000, &confirmed) ==
+		              RgfxCrossingStep::arrived &&
+		          confirmed && same(places.at[1].rect, -1920, 0, 0, 1080),
+		      "onto display 1, confirmed there");
+		now += 1000000000;
+	}
+
+	// Rearranged, display 1 left, the cursor at display 0's right edge (a captured pointer pushed
+	// past its window's edge): the post right of display 0 is held at the very pixel the cursor
+	// is at, which shows nothing; after kRgfxLandingWaitNs the crossing posts again.
+	{
+		Desktop desk = twoSideBySide();
+		RgfxDisplayPlaces places = {};
+		RgfxCrossing c = {};
+		cross(&places, &c, desk, 1, 10, 400, &now);
+		cross(&places, &c, desk, 0, 1919, 600, &now);
+		desk.rects[1] = {-1920, 0, 0, 1080};
+		const uint64_t before = now;
+		Crossed r = cross(&places, &c, desk, 1, 0, 600, &now);
+		check(r.arrived && r.posts == 2 && r.display == 1 && r.x == 0 && r.y == 600,
+		      "onto display 1 at its first pixel in two posts");
+		check(now - 1000000000 - before >= kRgfxLandingWaitNs, "after the first post's wait");
+		check(same(places.at[1].rect, -1920, 0, 0, 1080) &&
+		          places.at[1].state == RgfxPlaceState::confirmed,
+		      "the placement it landed by is confirmed, and told");
 	}
 
 	// The crossing's limits.
@@ -345,15 +491,17 @@ int main()
 		RgfxCrossing c = {};
 		cross(&places, &c, desk, 0, 100, 100, &now);
 		Crossed r = cross(&places, &c, desk, 1, 10, 10, &now);
-		check(!r.arrived && r.posts <= kRgfxCrossingPosts, "posts at most kRgfxCrossingPosts");
-		// The hold: no post again past it.
+		check(!r.arrived && r.posts == kRgfxCrossingPosts && r.display == 0,
+		      "posts kRgfxCrossingPosts, the cursor left on display 0");
+		// A slow guest, each move shown 150 ms after its post (past the host's hold): the
+		// crossing still posts again, and arrives.
 		RgfxDisplayPlaces slow = {};
 		desk.rects[1] = {-1920, 0, 0, 1080};
 		cross(&slow, &c, desk, 0, 100, 100, &now);
-		r = cross(&slow, &c, desk, 1, 1910, 300, &now, kRgfxCrossingHoldNs);
-		check(!r.arrived && r.posts == 1, "past the hold, no post again");
-		// A landing that never comes: the crossing ends after kRgfxLandingWaitNs; a landing after
-		// that is no crossing's.
+		r = cross(&slow, &c, desk, 1, 1910, 300, &now, 150000000);
+		check(r.arrived && r.posts == 2 && r.display == 1, "a slow guest crosses in two posts");
+		// A post that never shows the cursor: posted again after each kRgfxLandingWaitNs, at
+		// most kRgfxCrossingPosts, then over; a landing after that is no crossing's.
 		RgfxCrossing w = {};
 		rgfxPlacesFit(&slow, desk.modes);
 		rgfxCrossingStart(&w, 1, 5, 5, now);
@@ -361,15 +509,26 @@ int main()
 		check(rgfxCrossingNext(slow, &w, now, &gx, &gy), "a post");
 		check(!rgfxCrossingNext(slow, &w, now + 1000, &gx, &gy) && w.active,
 		      "none while one is out");
-		check(!rgfxCrossingExpired(&w, now + kRgfxLandingWaitNs - 1), "waited for");
-		check(rgfxCrossingExpired(&w, now + kRgfxLandingWaitNs) && !w.active && !w.waiting,
-		      "then given up, the crossing over");
+		check(rgfxCrossingWaited(&w, now + kRgfxLandingWaitNs - 1) == RgfxCrossingStep::none &&
+		          w.waiting,
+		      "waited for");
+		uint64_t t = now + kRgfxLandingWaitNs;
+		uint32_t posts = 1;
+		check(rgfxCrossingWaited(&w, t) == RgfxCrossingStep::again && !w.waiting && w.active,
+		      "then posted again");
+		while (rgfxCrossingNext(slow, &w, t, &gx, &gy)) {
+			posts++;
+			t = rgfxCrossingDeadline(w);
+			check(rgfxCrossingWaited(&w, t) == RgfxCrossingStep::again, "and again");
+		}
+		check(posts == kRgfxCrossingPosts && !w.active && !w.waiting,
+		      "at most kRgfxCrossingPosts, then over");
 		bool confirmed = true;
-		check(rgfxCrossingLanded(&slow, &w, 1, 5, 5, &confirmed) == RgfxCrossingStep::none &&
+		check(rgfxCrossingLanded(&slow, &w, 1, 5, 5, t, &confirmed) == RgfxCrossingStep::none &&
 		          !confirmed,
 		      "a late landing is no crossing's");
 		// A new crossing while a post is out: that post's landing is taken first, for its own
-		// point, and the new crossing posts after it.
+		// display, and the new crossing posts after it.
 		RgfxDisplayPlaces two = {};
 		const Desktop side = twoSideBySide();
 		rgfxPlacesFit(&two, side.modes);
@@ -378,7 +537,8 @@ int main()
 		check(rgfxCrossingNext(two, &n, now, &gx, &gy) && gx == 1923, "a post onto display 1");
 		rgfxCrossingStart(&n, 0, 700, 500, now + 1000);
 		check(!rgfxCrossingNext(two, &n, now + 1000, &gx, &gy), "waits for the post out");
-		check(rgfxCrossingLanded(&two, &n, 1, 3, 500, &confirmed) == RgfxCrossingStep::again &&
+		check(rgfxCrossingLanded(&two, &n, 1, 3, 500, now + 2000, &confirmed) ==
+		              RgfxCrossingStep::again &&
 		          confirmed,
 		      "whose landing confirms display 1, and the new crossing goes on");
 		check(rgfxCrossingNext(two, &n, now + 2000, &gx, &gy) && gx == 700 && gy == 500,

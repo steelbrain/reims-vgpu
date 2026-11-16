@@ -15,16 +15,17 @@
 // with the cursor on display 0 of two side by side held it at display 0's right edge, on 27.0.1,
 // job m3-max-35450).
 //
-// So each driven display's rectangle is held here, and each landing of a move the kext posted
-// checks it:
+// So each driven display's rectangle is held here, and each landing of a move the kext posted at
+// it checks it, by the placement the move was posted by (the rectangle held, or one beside
+// another display):
 //  - a display starts from a guess, WindowServer's own arrangement of new displays: side by side
 //    in their order, tops at 0 (measured on 27.0.1's first boot at two displays), each its mode's
 //    size at 1x on a 1x screen and half that above 1x, as arm64's WindowServer runs a display
 //    HiDPI above 1x (design.md, "The display's density"); a display's new mode keeps its corner
 //    and takes the guessed size;
-//  - a landing whose pixel lies where the rectangle puts the posted point, on both axes, with the
-//    pixel far enough from the corner to show a wrong size, confirms the rectangle, and only a
-//    confirmed one is told the host (DISPLAY_BOUNDS);
+//  - a landing whose pixel lies where the placement puts the posted point, on both axes, with
+//    the pixel far enough from the corner to show a wrong size, confirms the placement as the
+//    rectangle, and only a confirmed one is told the host (DISPLAY_BOUNDS);
 //  - a landing that disagrees moves the rectangle's corner on each axis where the pixel lies
 //    inside the display, so the point was not held at an edge, and leaves an axis held at an edge
 //    as it was; the rectangle so moved is learned, and confirmed by a later landing that agrees;
@@ -33,15 +34,34 @@
 //    them over the pixels between them, the other axis alike.
 //
 // A crossing is the moves that put the cursor on the display the host's pointer is over, for its
-// pixel there: first at that pixel of the display's rectangle; and, where the cursor landed on
-// another display, at that pixel of the display placed beside each other display in turn (right,
+// pixel there: first at that pixel of the display's rectangle; and, where the cursor did not reach
+// the display, at that pixel of the display placed beside each other display in turn (right,
 // left, below and above it, top or left edges aligned), each placement that overlaps no learned
 // display's. A crossing ends once the cursor lands on its display, wherever on it (the host's
 // tablet then puts it at its pixel, scaled over the display the cursor is on), and with the
-// cursor where it is after kRgfxCrossingPosts posts, or once a post has waited
-// kRgfxLandingWaitNs for its landing, or once the host's hold of the pointer's positions for that
-// display is over (kRgfxCrossingHoldNs, the device's CROSSING_HOLD_NS), so a guest never sees the
-// cursor jump on.
+// cursor where it is after kRgfxCrossingPosts posts, so a guest never sees the cursor jump on.
+//
+// Only the display a post aims at learns from its landing: a post lands on the display holding
+// its point, or, where none does, on the display the cursor was on, held at that display's edge,
+// which is never the display aimed at. What else shows the cursor while a post is out is not
+// taken for its landing:
+//  - on another display, a pixel other than the one the post's point lies at, or is held at, is
+//    the tablet's move or the user's: the host passes the pointer's positions on to the tablet
+//    once its hold is over (the device's CROSSING_HOLD_NS, 100 ms), and an arm64 guest under
+//    TCG shows a post's landing 18 to 153 ms after the POINTER_OVER (host log, 14.6.1 at two
+//    displays, potluck job m3-max-35541), so the tablet can move the cursor on the display it is
+//    on before the post lands; taken for a landing there, it placed that display over the other;
+//  - on another display, the pixel the post's point is held at, where the point lies within a
+//    cursor's reach (RGFX_CURSOR_MAX_SIZE points) past that display's edge, is the cursor held
+//    there, or its image reaching over the edge from the display beside it, whose hot spot was
+//    shown at the edge's pixel too (measured on arm64 27.0.1: a post at 1915,650 of display 0,
+//    1920 wide, showed the cursor on display 1 at 0,650 before display 0's landing; job
+//    m3-max-35515): the crossing waits kRgfxSpillWaitNs for the landing on the display aimed at
+//    before it posts again;
+//  - a hot spot past the display's edge is the image over it alone.
+// A post that shows no move in kRgfxLandingWaitNs left the cursor where it was: its point was
+// held at the very pixel the cursor was at (a captured pointer pushed past its window's edge
+// after the displays were rearranged), and the crossing posts again.
 //
 // Header-only and free of the kernel's headers, so its native test (tests/display_places_test.cpp)
 // builds it as the kext does.
@@ -57,11 +77,13 @@
 
 // A crossing's posts: the first, and at most three more.
 constexpr uint32_t kRgfxCrossingPosts = 4;
-// How long a crossing posts again after its first: the host's hold of the positions for the
-// display (CROSSING_HOLD_NS).
-constexpr uint64_t kRgfxCrossingHoldNs = 100000000;
-// How long a post waits for its landing before its crossing ends.
+// How long a post waits for its landing: past it, the cursor is taken to have stayed where it was.
 constexpr uint64_t kRgfxLandingWaitNs = 250000000;
+// How long a landing that may be the cursor's image over another display's edge waits for the
+// landing on the display aimed at.
+constexpr uint64_t kRgfxSpillWaitNs = 50000000;
+// How far past a display's edge, in points, the cursor's image may reach over it.
+constexpr int64_t kRgfxSpillReach = RGFX_CURSOR_MAX_SIZE;
 // How far from the rectangle's corner, in pixels on either axis, a landing shows its size.
 constexpr int32_t kRgfxPlaceProof = 16;
 // How far apart two landings are, in pixels, to size a display by.
@@ -174,23 +196,31 @@ inline bool rgfxPlaceInside(int64_t span, int64_t pixels, int64_t pixel)
 
 inline int64_t rgfxPlaceAbs(int64_t v) { return v < 0 ? -v : v; }
 
-// Display `display`'s rectangle checked by a landing: `landing`'s point posted, and the cursor
-// shown on the display at its pixel. True where it confirmed the rectangle (which the host is
-// then told, where it differs from the one last told).
+inline bool rgfxPlaceSame(const RgfxGlobalRect &a, const RgfxGlobalRect &b)
+{
+	return a.minx == b.minx && a.miny == b.miny && a.maxx == b.maxx && a.maxy == b.maxy;
+}
+
+// Display `display`'s rectangle checked by the landing of a post aimed at it: `landing`'s point
+// posted, placed by `aimed` (the rectangle held for the display, or a placement beside another),
+// and the cursor shown on the display at its pixel. The landing is checked against `aimed`, which
+// the rectangle becomes where the landing agrees with it. True where it confirmed the rectangle
+// (which the host is then told, where it differs from the one last told).
 inline bool rgfxPlacesLanded(RgfxDisplayPlaces *places, uint32_t display,
-                             const RgfxPlaceLanding &landing)
+                             const RgfxPlaceLanding &landing, const RgfxGlobalRect &aimed)
 {
 	if (display >= RGFX_DISPLAYS_MAX)
 		return false;
 	RgfxDisplayPlace &p = places->at[display];
-	if (p.state == RgfxPlaceState::none || !p.width || !p.height)
+	if (p.state == RgfxPlaceState::none || !p.width || !p.height || aimed.maxx <= aimed.minx ||
+	    aimed.maxy <= aimed.miny)
 		return false;
 	const int64_t pixels[2] = {p.width, p.height};
 	const int64_t posted[2] = {landing.gx, landing.gy};
 	const int64_t pixel[2] = {landing.lx, landing.ly};
-	int64_t corner[2] = {p.rect.minx, p.rect.miny};
-	int64_t span[2] = {static_cast<int64_t>(p.rect.maxx) - p.rect.minx,
-	                   static_cast<int64_t>(p.rect.maxy) - p.rect.miny};
+	int64_t corner[2] = {aimed.minx, aimed.miny};
+	int64_t span[2] = {static_cast<int64_t>(aimed.maxx) - aimed.minx,
+	                   static_cast<int64_t>(aimed.maxy) - aimed.miny};
 	auto agrees = [&](int a) {
 		const int64_t tolerance = 1 + span[a] / pixels[a];
 		return rgfxPlaceAbs(rgfxPlacePoint(corner[a], span[a], pixels[a], pixel[a]) - posted[a]) <=
@@ -232,17 +262,19 @@ inline bool rgfxPlacesLanded(RgfxDisplayPlaces *places, uint32_t display,
 		corner[a] += posted[a] - rgfxPlacePoint(corner[a], span[a], pixels[a], pixel[a]);
 		moved++;
 	}
-	const bool resized = span[0] != static_cast<int64_t>(p.rect.maxx) - p.rect.minx ||
-	                     span[1] != static_cast<int64_t>(p.rect.maxy) - p.rect.miny;
-	p.rect = {static_cast<int32_t>(corner[0]), static_cast<int32_t>(corner[1]),
-	          static_cast<int32_t>(corner[0] + span[0]), static_cast<int32_t>(corner[1] + span[1])};
-	if (agreed == 2 && !resized) {
-		if (landing.lx < kRgfxPlaceProof && landing.ly < kRgfxPlaceProof)
-			return false;
+	const bool resized = span[0] != static_cast<int64_t>(aimed.maxx) - aimed.minx ||
+	                     span[1] != static_cast<int64_t>(aimed.maxy) - aimed.miny;
+	const RgfxGlobalRect rect = {
+	    static_cast<int32_t>(corner[0]), static_cast<int32_t>(corner[1]),
+	    static_cast<int32_t>(corner[0] + span[0]), static_cast<int32_t>(corner[1] + span[1])};
+	const bool placed = !rgfxPlaceSame(rect, p.rect);
+	p.rect = rect;
+	if (agreed == 2 && !resized &&
+	    (landing.lx >= kRgfxPlaceProof || landing.ly >= kRgfxPlaceProof)) {
 		p.state = RgfxPlaceState::confirmed;
 		return true;
 	}
-	if (moved || resized)
+	if (moved || resized || placed)
 		p.state = RgfxPlaceState::learned;
 	return false;
 }
@@ -269,16 +301,25 @@ struct RgfxCrossing {
 	uint64_t startedAt;
 	// The post out, whose landing is not yet seen: it may be an earlier crossing's.
 	bool waiting;
+	uint32_t aimedAt;     // the display it is aimed at
+	RgfxGlobalRect aimed; // that display's placement it is posted by
 	int32_t gx;
 	int32_t gy;
 	uint64_t postedAt;
+	// Another display showed the cursor where the post's point is held at its edge, within a
+	// cursor's reach of it, at `heldAt`: the landing aimed at is waited for kRgfxSpillWaitNs.
+	bool held;
+	uint64_t heldAt;
+	// How long after its post the last landing on the display aimed at came.
+	uint64_t landedAfter;
 };
 
-// What a landing does to the crossing.
+// What a landing, or a wait for one, does to the crossing.
 enum class RgfxCrossingStep {
-	none,    // no post was out
+	none,    // nothing: no post was out, or it is still waited for
 	arrived, // the cursor is on the crossing's display: it is over
-	again,   // on another display: post again (rgfxCrossingNext)
+	again,   // the cursor is not on it: post again (rgfxCrossingNext)
+	held,    // wait for the landing aimed at until rgfxCrossingDeadline
 };
 
 inline void rgfxCrossingStart(RgfxCrossing *c, uint32_t display, int32_t x, int32_t y, uint64_t now)
@@ -295,11 +336,6 @@ inline void rgfxCrossingStart(RgfxCrossing *c, uint32_t display, int32_t x, int3
 inline bool rgfxPlaceOverlaps(const RgfxGlobalRect &a, const RgfxGlobalRect &b)
 {
 	return a.minx < b.maxx && b.minx < a.maxx && a.miny < b.maxy && b.miny < a.maxy;
-}
-
-inline bool rgfxPlaceSame(const RgfxGlobalRect &a, const RgfxGlobalRect &b)
-{
-	return a.minx == b.minx && a.miny == b.miny && a.maxx == b.maxx && a.maxy == b.maxy;
 }
 
 // The next placement of the crossing's display beside another, from `c->candidate` on: for each
@@ -357,8 +393,8 @@ inline bool rgfxCrossingCandidate(const RgfxDisplayPlaces &places, RgfxCrossing 
 }
 
 // The point of the crossing's next post at `now`, which is then out: false, with the crossing
-// over, where it posted kRgfxCrossingPosts, its hold is over, or no placement is left; false with
-// it going on while a post is out.
+// over, where it posted kRgfxCrossingPosts or no placement is left; false with it going on while
+// a post is out.
 inline bool rgfxCrossingNext(const RgfxDisplayPlaces &places, RgfxCrossing *c, uint64_t now,
                              int32_t *gx, int32_t *gy)
 {
@@ -366,7 +402,7 @@ inline bool rgfxCrossingNext(const RgfxDisplayPlaces &places, RgfxCrossing *c, u
 		return false;
 	const RgfxDisplayPlace &k = places.at[c->display < RGFX_DISPLAYS_MAX ? c->display : 0];
 	if (c->display >= RGFX_DISPLAYS_MAX || k.state == RgfxPlaceState::none ||
-	    c->posts >= kRgfxCrossingPosts || (c->posts && now - c->startedAt >= kRgfxCrossingHoldNs)) {
+	    c->posts >= kRgfxCrossingPosts) {
 		c->active = false;
 		return false;
 	}
@@ -382,52 +418,105 @@ inline bool rgfxCrossingNext(const RgfxDisplayPlaces &places, RgfxCrossing *c, u
 	}
 	c->posts++;
 	c->waiting = true;
+	c->aimedAt = c->display;
+	c->aimed = rect;
+	c->held = false;
 	c->gx = *gx = px;
 	c->gy = *gy = py;
 	c->postedAt = now;
 	return true;
 }
 
-// The cursor shown on `display` with its hot spot at pixel `x`, `y` (a MOVE_CURSOR with the cursor
-// visible): where a post was out, its landing, which checks the display's rectangle (`*confirmed`
-// where it confirmed it), and the crossing's step. A hot spot past the display's edge is no
-// landing: the cursor lies on the display beside it, and shows on this one only as the part of
-// its image that reaches over the edge (measured on arm64 27.0.1: a post at 1915,600 of display 0,
-// 1920 wide, showed the cursor on display 1 too, before display 0's landing; job m3-max-35450).
-inline RgfxCrossingStep rgfxCrossingLanded(RgfxDisplayPlaces *places, RgfxCrossing *c,
-                                           uint32_t display, int32_t x, int32_t y, bool *confirmed)
+// The pixel of `pixels` a display spanning `span` points from `corner` shows the cursor at for a
+// point `g` on one axis: the point's, or, where it lies past the display (`*past`), the edge's;
+// and how far past (`*by`, in points).
+inline int64_t rgfxPlaceHeld(int64_t corner, int64_t span, int64_t pixels, int64_t g, bool *past,
+                             int64_t *by)
 {
-	*confirmed = false;
-	if (!c->waiting)
-		return RgfxCrossingStep::none;
-	if (display < RGFX_DISPLAYS_MAX) {
-		const RgfxDisplayPlace &p = places->at[display];
-		if (p.width && p.height &&
-		    (x < 0 || y < 0 || static_cast<uint32_t>(x) >= p.width ||
-		     static_cast<uint32_t>(y) >= p.height))
-			return RgfxCrossingStep::none;
+	int64_t at = g - corner;
+	if (at < 0) {
+		*past = true;
+		if (-at > *by)
+			*by = -at;
+		at = 0;
+	} else if (at > span - 1) {
+		*past = true;
+		if (at - (span - 1) > *by)
+			*by = at - (span - 1);
+		at = span - 1;
 	}
-	c->waiting = false;
-	*confirmed = rgfxPlacesLanded(places, display, {c->gx, c->gy, x, y});
-	if (!c->active)
-		return RgfxCrossingStep::none;
-	if (display == c->display) {
-		c->active = false;
-		return RgfxCrossingStep::arrived;
-	}
-	return RgfxCrossingStep::again;
+	return at * pixels / span;
 }
 
-// At `now`, a post out for kRgfxLandingWaitNs with no landing: no longer waited for, and the
-// crossing that posted it over. True where it was.
-inline bool rgfxCrossingExpired(RgfxCrossing *c, uint64_t now)
+// The cursor shown on `display` with its hot spot at pixel `x`, `y` (a MOVE_CURSOR with the cursor
+// visible) at `now`, while a post is out: on the display aimed at, the post's landing, which
+// checks the display's rectangle (`*confirmed` where it confirmed it); on another display at the
+// pixel the post's point lies at or is held at, the cursor not where it was aimed; anything else
+// no landing (the header's comment). The crossing's step.
+inline RgfxCrossingStep rgfxCrossingLanded(RgfxDisplayPlaces *places, RgfxCrossing *c,
+                                           uint32_t display, int32_t x, int32_t y, uint64_t now,
+                                           bool *confirmed)
 {
-	if (!c->waiting || now - c->postedAt < kRgfxLandingWaitNs)
-		return false;
+	*confirmed = false;
+	if (!c->waiting || display >= RGFX_DISPLAYS_MAX)
+		return RgfxCrossingStep::none;
+	const RgfxDisplayPlace &p = places->at[display];
+	if (p.state == RgfxPlaceState::none || !p.width || !p.height || x < 0 || y < 0 ||
+	    static_cast<uint32_t>(x) >= p.width || static_cast<uint32_t>(y) >= p.height)
+		return RgfxCrossingStep::none;
+	if (display == c->aimedAt || (c->active && display == c->display)) {
+		c->waiting = false;
+		c->held = false;
+		if (display == c->aimedAt) {
+			c->landedAfter = now - c->postedAt;
+			*confirmed = rgfxPlacesLanded(places, display, {c->gx, c->gy, x, y}, c->aimed);
+		}
+		if (!c->active)
+			return RgfxCrossingStep::none;
+		if (display == c->display) {
+			c->active = false;
+			return RgfxCrossingStep::arrived;
+		}
+		return RgfxCrossingStep::again;
+	}
+	const int64_t spanX = static_cast<int64_t>(p.rect.maxx) - p.rect.minx;
+	const int64_t spanY = static_cast<int64_t>(p.rect.maxy) - p.rect.miny;
+	if (spanX <= 0 || spanY <= 0)
+		return RgfxCrossingStep::none;
+	bool past = false;
+	int64_t by = 0;
+	const int64_t hx = rgfxPlaceHeld(p.rect.minx, spanX, p.width, c->gx, &past, &by);
+	const int64_t hy = rgfxPlaceHeld(p.rect.miny, spanY, p.height, c->gy, &past, &by);
+	if (rgfxPlaceAbs(x - hx) > 1 + p.width / spanX || rgfxPlaceAbs(y - hy) > 1 + p.height / spanY)
+		return RgfxCrossingStep::none;
+	if (c->held)
+		return RgfxCrossingStep::none;
+	if (past && by <= kRgfxSpillReach) {
+		c->held = true;
+		c->heldAt = now;
+		return RgfxCrossingStep::held;
+	}
 	c->waiting = false;
-	if (c->posts)
-		c->active = false;
-	return true;
+	return c->active ? RgfxCrossingStep::again : RgfxCrossingStep::none;
+}
+
+// When the post out is no longer waited for: kRgfxLandingWaitNs after it, or kRgfxSpillWaitNs
+// after a landing held it.
+inline uint64_t rgfxCrossingDeadline(const RgfxCrossing &c)
+{
+	return c.held ? c.heldAt + kRgfxSpillWaitNs : c.postedAt + kRgfxLandingWaitNs;
+}
+
+// At `now`, the post out waited for until its deadline with no landing on the display aimed at:
+// the cursor is not there, and the crossing, where one goes on, posts again (`again`); `none`
+// before the deadline or with no post out.
+inline RgfxCrossingStep rgfxCrossingWaited(RgfxCrossing *c, uint64_t now)
+{
+	if (!c->waiting || now < rgfxCrossingDeadline(*c))
+		return RgfxCrossingStep::none;
+	c->waiting = false;
+	c->held = false;
+	return c->active ? RgfxCrossingStep::again : RgfxCrossingStep::none;
 }
 
 #endif // RGFX_DISPLAY_PLACES_HPP_

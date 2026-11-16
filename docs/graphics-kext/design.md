@@ -3277,40 +3277,58 @@ pixels of its mode, and the buttons held):
   WindowServer follows as x86-64's does (A3, below). But no framebuffer holds
   its display's rectangle on arm64, so the kext learns where WindowServer
   placed each display from its own moves (`RgfxDisplayPlaces.hpp`): each
-  post's landing, the first `MOVE_CURSOR` after it that shows the cursor's
-  hot spot on a display, names the display the cursor went to and its pixel
-  there, which checks the rectangle held for that display. A cursor near an
-  edge shows on the display beside it too, the part of its image that
-  reaches over, its hot spot past that display's edge: that is no landing.
+  post aims at a display, and its landing, the `MOVE_CURSOR` that shows the
+  cursor's hot spot on that display, gives the cursor's pixel there, which
+  checks the rectangle the post was placed by. A post lands on the display
+  holding its point, or, where none does, is held at the edge of the display
+  the cursor was on, which is never the one aimed at; so only the display
+  aimed at learns from a landing.
+  - **What is no landing.** While a post is out the host's tablet can move
+    the cursor on the display it is on: the host passes positions on once its
+    hold is over, and an arm64 guest under TCG shows a post's landing 18 to
+    153 ms after the `POINTER_OVER` (14.6.1 at two displays, potluck job
+    m3-max-35541). Taken for a landing there, the tablet's pixel placed that
+    display over the other. So on another display only the pixel where the
+    post's point lies, or is held at its edge, counts: the cursor went there
+    and not where it was aimed. A cursor near an edge also shows on the
+    display beside it, the part of its image that reaches over, its hot spot
+    past that display's edge or at its first pixel (27.0.1, job
+    m3-max-35515): that is no landing, and a pixel at the edge where the
+    post's point lies within a cursor's reach (256 points) past it is waited
+    on for 50 ms for the landing aimed at before the crossing posts again.
   - **The guess.** A display starts where WindowServer places a new one:
     side by side in their order, tops at 0, each its mode's size at 1x on a
     1x screen and half of it above 1x, as arm64's WindowServer runs it ("The
     display's density", above).
   - **A crossing.** On the event, display 0's framebuffer posts at the
-    display's pixel of the rectangle held for it. Where the cursor lands on
-    another display, it posts again at that pixel of the display placed
-    beside each other display in turn (right of it, left, below, above, top
-    or left edges aligned), until the cursor lands on its display, wherever
-    on it, as the tablet's next position puts it at its pixel. At most four
-    posts, and none again past the host's hold (100 ms) or after a post's
-    landing waited 250 ms: the cursor then stays where it is, counted in the
-    framebuffer's `RgfxCrossingsMissed` and logged the first time.
-  - **Learning a place.** A landing whose pixel lies where the rectangle
-    puts the posted point, 16 pixels or more from the corner on an axis,
-    confirms it. One that disagrees moves the rectangle's corner on each
-    axis where the pixel lies inside the display (a point past every display
-    is held at the edge of the display the cursor is on, and says nothing of
-    that axis), and
-    the rectangle is learned, to be confirmed by a later landing that
-    agrees; two landings 64 pixels apart or more size a display the guess
-    sized wrong (a mode the guest's user scaled), to within a few points.
+    display's pixel of the rectangle held for it. Where the cursor shows on
+    another display instead, or shows no move in 250 ms (its point held at
+    the very pixel the cursor was at, as a captured pointer pushed past its
+    window's edge is after the displays were rearranged), it posts again at
+    that pixel of the display placed beside each other display in turn
+    (right of it, left, below, above, top or left edges aligned), until the
+    cursor lands on its display, wherever on it, as the tablet's next
+    position puts it at its pixel. At most four posts: the cursor then stays
+    where it is, counted in the framebuffer's `RgfxCrossingsMissed` and
+    logged the first time. The posts are bounded by their count, not by the
+    host's hold: a guest under TCG shows even a first post's landing after
+    the hold, and a crossing cut off there would learn nothing of a moved
+    display, so every later crossing onto it would miss too.
+  - **Learning a place.** A landing whose pixel lies where the post's
+    placement puts the posted point, 16 pixels or more from the corner on an
+    axis, confirms that placement as the display's rectangle. One that
+    disagrees moves the placement's corner on each axis where the pixel lies
+    inside the display, off its edges, and the rectangle is learned, to be
+    confirmed by a later landing that agrees; two landings 64 pixels apart
+    or more size a display the guess sized wrong (a mode the guest's user
+    scaled), to within a few points.
   - **What the host is told.** Each confirmed rectangle, in
     `DISPLAY_BOUNDS`, as the x86-64 kext tells its own ("A drag across
     displays", below), after each move of the cursor where it changed. A
     display the cursor never went to has none told, so a captured drag
     stays at the edge it meets; after the guest's displays are rearranged,
     the first crossing onto a moved display lands as before, posts again,
-    and the next confirms its new place.
+    and its landing beside the other display confirms the new place.
 - **Compatibility.** The device sends `POINTER_OVER` only to a guest that
   took its own feature bit, `POINTER_OVER` (49), not to every taker of
   `MULTI_DISPLAY`: a kext built before this event, and the firmware drivers,
@@ -3716,7 +3734,13 @@ it.
     with the cursor on display 0, held at its right edge, job m3-max-35450).
     A cursor near display 0's right edge shows on display 1 too, the part of
     its image over the edge (the same job: display 1's `MOVE_CURSOR` came
-    first, its hot spot at x -5).
+    first, its hot spot at x -5; at x 0 for a post at 1915,650, job
+    m3-max-35515).
+  - Under TCG (14.6.1 at two displays, job m3-max-35541) the guest showed
+    a crossing's landing 18 to 153 ms after the `POINTER_OVER` (the
+    device's debug log), past the host's 100 ms hold more than once, so
+    the tablet's positions reach the guest before the landing and move the
+    cursor on the display it is on.
   - WindowServer tells the kernel nothing of where it placed each display:
     it registers none with IOHIDSystem (its screen count stayed 0, and its
     work bounds 0,0 to 1920,1080 in every arrangement), an

@@ -28,10 +28,10 @@
  *    that changed (tellBounds);
  *  - on arm64, WindowServer tells the displays nothing of where it placed them, so the kext
  *    learns it from its own posts: a crossing posts at the display's pixel of the rectangle held
- *    for it, and again beside the other displays where the cursor landed elsewhere, at most
- *    kRgfxCrossingPosts in the host's hold, each landing (the first MOVE_CURSOR that shows the
- *    cursor after a post) checking the rectangle of the display it showed on; a rectangle a
- *    landing confirmed is told the host, as x86-64's are (RgfxDisplayPlaces.hpp).
+ *    for it, and again beside the other displays where the cursor did not reach it, at most
+ *    kRgfxCrossingPosts, each landing (the MOVE_CURSOR that shows the cursor on the display a
+ *    post aimed at) checking that display's rectangle; a rectangle a landing confirmed is told
+ *    the host, as x86-64's are (RgfxDisplayPlaces.hpp).
  */
 
 #include "ReimsGraphics.hpp"
@@ -97,6 +97,14 @@ uint64_t nowNs()
 	uint64_t ns = 0;
 	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
 	return ns;
+}
+
+// `call` made at `ns` of nowNs's clock, or at once where that is past.
+void callAt(thread_call_t call, uint64_t ns)
+{
+	uint64_t deadline = 0;
+	nanoseconds_to_absolutetime(ns, &deadline);
+	thread_call_enter_delayed(call, deadline);
 }
 #endif
 
@@ -232,7 +240,7 @@ void ReimsGraphics::displayPlaces(RgfxGlobalRect *rects, bool *placed)
 #if defined(__arm64e__)
 // A crossing's next post: a POINTER_OVER the thread call has not taken begins one onto its display
 // at its pixel; the places are brought to the displays' modes; and the crossing's next point, if
-// it has one, is posted, its landing waited for kRgfxLandingWaitNs (landingWaited).
+// it has one, is posted, its landing waited for until its deadline (landingWaited).
 void ReimsGraphics::movePointer(thread_call_param_t self, thread_call_param_t)
 {
 	ReimsGraphics *me = static_cast<ReimsGraphics *>(self);
@@ -266,6 +274,7 @@ void ReimsGraphics::movePointer(thread_call_param_t self, thread_call_param_t)
 	const UInt32 posts = me->crossing.posts;
 	const RgfxPlaceState state =
 	    target < RGFX_DISPLAYS_MAX ? me->places.at[target].state : RgfxPlaceState::none;
+	const uint64_t deadline = rgfxCrossingDeadline(me->crossing);
 	IOSimpleLockUnlock(me->interruptLock);
 	if (missed)
 		me->crossingMissed(target, posts);
@@ -280,10 +289,7 @@ void ReimsGraphics::movePointer(thread_call_param_t self, thread_call_param_t)
 		me->crossing.active = false;
 		IOSimpleLockUnlock(me->interruptLock);
 	} else if (thread_call_t landing = __atomic_load_n(&me->landingCall, __ATOMIC_ACQUIRE)) {
-		uint64_t deadline = 0;
-		clock_interval_to_deadline(static_cast<uint32_t>(kRgfxLandingWaitNs / 1000000),
-		                           kMillisecondScale, &deadline);
-		thread_call_enter_delayed(landing, deadline);
+		callAt(landing, deadline);
 	}
 	// The first four of each display's, and of its refused ones.
 	static char moved;
@@ -299,24 +305,23 @@ void ReimsGraphics::movePointer(thread_call_param_t self, thread_call_param_t)
 		      posted);
 }
 
-// A post's landing not seen in kRgfxLandingWaitNs: its crossing is over, or, where a new one began
-// while it was out, that one goes on.
+// A post's landing not seen by its deadline: the cursor is not on the display aimed at, and the
+// crossing, where one goes on, posts again; called early, it waits on.
 void ReimsGraphics::landingWaited(thread_call_param_t self, thread_call_param_t)
 {
 	ReimsGraphics *me = static_cast<ReimsGraphics *>(self);
 	IOSimpleLockLock(me->interruptLock);
-	const bool going = me->crossing.active;
-	const bool expired = rgfxCrossingExpired(&me->crossing, nowNs());
-	const bool missed = expired && going && !me->crossing.active;
-	const bool again = expired && me->crossing.active;
-	const UInt32 target = me->crossing.display;
-	const UInt32 posts = me->crossing.posts;
+	const RgfxCrossingStep step = rgfxCrossingWaited(&me->crossing, nowNs());
+	const bool waiting = me->crossing.waiting;
+	const uint64_t deadline = rgfxCrossingDeadline(me->crossing);
 	IOSimpleLockUnlock(me->interruptLock);
-	if (missed)
-		me->crossingMissed(target, posts);
-	if (again)
+	if (step == RgfxCrossingStep::again) {
 		if (thread_call_t call = __atomic_load_n(&me->pointerCall, __ATOMIC_ACQUIRE))
 			thread_call_enter(call);
+	} else if (waiting) {
+		if (thread_call_t call = __atomic_load_n(&me->landingCall, __ATOMIC_ACQUIRE))
+			callAt(call, deadline);
+	}
 }
 
 // A crossing over with the cursor not on its display, which stays where it is: the first logged,
@@ -332,8 +337,9 @@ void ReimsGraphics::crossingMissed(UInt32 display, UInt32 posts)
 }
 
 // Display `display`'s MOVE_CURSOR with the cursor shown at pixel `x`, `y`, from its swap: where a
-// post is out, its landing, which checks the display's place; the crossing goes on where the
-// cursor is on another display than its own.
+// post is out, maybe its landing (rgfxCrossingLanded), which checks the place of the display it
+// aimed at; the crossing posts again where the cursor is on another display than its own, or
+// waits a little longer for its landing.
 void ReimsGraphics::cursorLanded(UInt32 display, int32_t x, int32_t y)
 {
 	if (!interruptLock || !__atomic_load_n(&pointerCall, __ATOMIC_ACQUIRE))
@@ -341,25 +347,39 @@ void ReimsGraphics::cursorLanded(UInt32 display, int32_t x, int32_t y)
 	bool confirmed = false;
 	IOSimpleLockLock(interruptLock);
 	const int32_t gx = crossing.gx, gy = crossing.gy;
-	const RgfxCrossingStep step = rgfxCrossingLanded(&places, &crossing, display, x, y, &confirmed);
+	const RgfxCrossingStep step =
+	    rgfxCrossingLanded(&places, &crossing, display, x, y, nowNs(), &confirmed);
 	const RgfxGlobalRect rect =
 	    display < RGFX_DISPLAYS_MAX ? places.at[display].rect : RgfxGlobalRect{};
 	const RgfxPlaceState state =
 	    display < RGFX_DISPLAYS_MAX ? places.at[display].state : RgfxPlaceState::none;
+	const uint64_t after = crossing.landedAfter;
+	const uint64_t deadline = rgfxCrossingDeadline(crossing);
 	IOSimpleLockUnlock(interruptLock);
-	if (step == RgfxCrossingStep::again)
+	if (step == RgfxCrossingStep::again) {
 		if (thread_call_t call = __atomic_load_n(&pointerCall, __ATOMIC_ACQUIRE))
 			thread_call_enter(call);
+	} else if (step == RgfxCrossingStep::held) {
+		if (thread_call_t call = __atomic_load_n(&landingCall, __ATOMIC_ACQUIRE))
+			callAt(call, deadline);
+	}
 	// The first four landings on each display.
 	static char landed;
 	if (step != RgfxCrossingStep::none && rgfxFirstCalls(&landed, display, 4))
-		IOLog("ReimsGraphics: the post at %d,%d landed on display %u at %d,%d: its place %d,%d to "
-		      "%d,%d, %s%s\n",
-		      gx, gy, display, x, y, rect.minx, rect.miny, rect.maxx, rect.maxy,
+		IOLog("ReimsGraphics: the post at %d,%d showed the cursor on display %u at %d,%d%s: "
+		      "its place %d,%d to %d,%d, %s%s\n",
+		      gx, gy, display, x, y,
+		      step == RgfxCrossingStep::arrived ? ", its landing" : "", rect.minx, rect.miny,
+		      rect.maxx, rect.maxy,
 		      state == RgfxPlaceState::confirmed ? "confirmed"
 		      : state == RgfxPlaceState::learned ? "learned"
 		                                         : "guessed",
-		      step == RgfxCrossingStep::again ? "; posting again" : "");
+		      step == RgfxCrossingStep::again  ? "; posting again"
+		      : step == RgfxCrossingStep::held ? "; waiting for its landing"
+		                                       : "");
+	static char took;
+	if (step == RgfxCrossingStep::arrived && rgfxFirstCalls(&took, 0, 4))
+		IOLog("ReimsGraphics: a crossing's landing came %llu us after its post\n", after / 1000);
 }
 
 // Each display's place a landing confirmed.
