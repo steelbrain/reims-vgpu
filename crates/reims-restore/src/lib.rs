@@ -5,6 +5,9 @@
 
 pub mod aea;
 pub mod anchors;
+// The file is not `aux.rs`: AUX is a device name Windows keeps, which no file there takes, so git
+// for Windows checks out no tree holding it.
+#[path = "aux_storage.rs"]
 pub mod aux;
 pub mod catalog;
 pub mod containers;

@@ -287,8 +287,8 @@ size) triples, the same in every supported release **[ipsw]**:
 | 5 | 0x1500000 | 5 MiB | |
 | 6 | 0x1A00000 | 6 MiB | the ean storage |
 
-The restore writes regions 2 and 6 (`aux.rs`). In VZ's guests region 7 starts `UMPv`, u32 1,
-then u32 3 (14.6.1 to 26.6.2) or 4 (27.0.1, 27.2.1) **[vz]**; the restore leaves it empty.
+The restore writes regions 2 and 6 (`aux_storage.rs`). In VZ's guests region 7 starts `UMPv`,
+u32 1, then u32 3 (14.6.1 to 26.6.2) or 4 (27.0.1, 27.2.1) **[vz]**; the restore leaves it empty.
 
 NVRAM is two banks of 512 KiB, each a 32-byte header (a CHRP partition header named `nvram`, then
 the Adler-32 of the bank from +0x14 at +0x10, and the generation at +0x14) and two CHRP

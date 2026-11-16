@@ -31,7 +31,7 @@ anyhow = "1.0.104"
 base64 = "0.22.1"
 # UDIF chunks compressed with bzip2 (udif.rs).
 bzip2 = "0.6.1"
-# The CRC-32 of each IPSW member it streams (ipsw.rs), and the ean storage's (aux.rs).
+# The CRC-32 of each IPSW member it streams (ipsw.rs), and the ean storage's (aux_storage.rs).
 crc32fast = "1.5.5"
 clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
 # UDIF chunks compressed with zlib, and the IPSW's deflated members (udif.rs, ipsw.rs).
