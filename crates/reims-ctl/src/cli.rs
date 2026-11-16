@@ -319,8 +319,8 @@ pub struct CreateArgs {
     #[arg(long)]
     pub graphics: Option<String>,
     /// How many displays the guest has on reims-vgpu, 1 to 4 (default 1), each in a window of
-    /// its own. For now macOS uses only the first: the other windows stay black, and the
-    /// pointer works in the first window. VMware SVGA has one
+    /// its own, where macOS shows its desktop. For now the pointer stays on the first display,
+    /// even where you point in another display's window. VMware SVGA has one
     #[arg(long, value_name = "N")]
     pub displays: Option<u32>,
     /// The size each of reims-vgpu's windows opens at, WIDTHxHEIGHT in the desktop's points,
@@ -368,9 +368,9 @@ pub struct SetArgs {
     /// display with no GPU acceleration, in QEMU's own window
     #[arg(long)]
     pub graphics: Option<String>,
-    /// How many displays the guest has on reims-vgpu, 1 to 4, each in a window of its own. For
-    /// now macOS uses only the first: the other windows stay black, and the pointer works in the
-    /// first window. VMware SVGA has one
+    /// How many displays the guest has on reims-vgpu, 1 to 4, each in a window of its own, where
+    /// macOS shows its desktop. For now the pointer stays on the first display, even where you
+    /// point in another display's window. VMware SVGA has one
     #[arg(long, value_name = "N")]
     pub displays: Option<u32>,
     /// The system disk's controller: ahci (SATA) or nvme. Once macOS is installed, eject the
