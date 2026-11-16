@@ -28,10 +28,15 @@ encodes every other session in software, as on a Mac without hardware video.
 
 An arm64 guest is offered no codec on any host: the arm64e kext names AppleGVA no video driver
 and publishes no HEVC decode or H.264 encode, whatever the caps list, and VideoToolbox answers
-as above. The route our video driver serves, AppleGVA's vendor driver, is x86-64's: with the
-keys an arm64 macOS 14.6.1 guest on a VA-API host answered `VTIsHardwareDecodeSupported` true
-for HEVC, while a session requiring a hardware HEVC decoder failed −17692, one requiring H.264
-−12906, and no session reached the host (measured 2026-11-16).
+as above for decoders. Its encoders are the OS's own: arm64 macOS 27.0.1 lists no hardware
+encoder and refuses a session that requires one (−12908), while arm64 macOS 26 lists Apple's
+AVE encoders (`com.apple.videotoolbox.videoencoder.ave.avc` and `.ave.hevc`) as hardware, which
+have no encoder behind them in a VM, and fails such a session −12903, with the kexts' video keys
+or without them (measured under TCG on a 780M host, 2026-11-16). The route our video driver
+serves, AppleGVA's vendor driver, is x86-64's: with the keys an arm64 macOS 14.6.1 guest on a
+VA-API host answered `VTIsHardwareDecodeSupported` true for HEVC, while a session requiring a
+hardware HEVC decoder failed −17692, one requiring H.264 −12906, and no session reached the
+host (measured 2026-11-16).
 
 ## The caps
 
