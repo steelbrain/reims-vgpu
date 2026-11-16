@@ -4,12 +4,17 @@
 // x86-64's rules map the data's page so (never the header's page, never on arm64), and no store
 // of the producer comes before a store of the data it covers: on x86-64 a store fence lies between
 // the last word and the publish, on arm64 the publish is the release store after the last word.
+// Raced against the host's look before it sleeps (ring_wakeups.hpp), the publish never leaves the
+// host asleep with a message it was not rung for; `--control` races it without its full fence
+// instead, which loses wakes.
 #include "RgfxControlRing.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+
+#include "ring_wakeups.hpp"
 
 namespace {
 int checks = 0;
@@ -73,10 +78,78 @@ void publishedAfterData(const Recorder &r, const char *what)
 	else
 		check(!anyFence, what);
 }
+
+// Ring 0's submit ring as the kext's ControlWords writes it (ReimsGraphics.cpp), over the race's
+// ring, both mappings the same memory; without `Fenced`, the full fence left out, the control.
+template <bool Fenced>
+struct RacedWords {
+	volatile uint8_t *rings;
+	void data(uint32_t at, uint64_t word, bool)
+	{
+		*reinterpret_cast<volatile uint64_t *>(rings + at) = word;
+	}
+	void storeFence() { rgfxStoreFence(); }
+	void publish(uint64_t count)
+	{
+		__atomic_store_n(reinterpret_cast<volatile uint64_t *>(
+		                     rings + RGFX_CONTROL_SUBMIT_OFFSET +
+		                     __builtin_offsetof(RgfxRingHeader, producer)),
+		                 count, __ATOMIC_RELEASE);
+	}
+	void fullFence()
+	{
+		if (Fenced)
+			__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	}
+	uint32_t consumerIdle()
+	{
+		return __atomic_load_n(reinterpret_cast<const volatile uint32_t *>(
+		                           rings + RGFX_CONTROL_SUBMIT_OFFSET +
+		                           __builtin_offsetof(RgfxRingHeader, consumer_idle)),
+		                       __ATOMIC_ACQUIRE);
+	}
+};
+
+// The race of rgfxControlPublishWantsBell on ring 0's submit ring: each message written by
+// rgfxControlWrite, then published.
+template <bool Fenced>
+RingWakeups raceControlPublish()
+{
+	RingWakeupsMemory *memory = new RingWakeupsMemory();
+	RacedWords<Fenced> w{memory->bytes};
+	const RingWakeups raced = ringWakeupsRace(
+	    memory->bytes + RGFX_CONTROL_SUBMIT_OFFSET, RGFX_CONTROL_RING_DATA_SIZE,
+	    [&](uint32_t at, uint64_t produced) {
+		    const RgfxMsgHeader message = ringWakeupsMessage(produced / sizeof(RgfxMsgHeader));
+		    rgfxControlWrite(w, at, &message, sizeof(message));
+		    return rgfxControlPublishWantsBell(w, produced);
+	    },
+	    1000000, 1000);
+	delete memory;
+	return raced;
+}
+
+void printRace(const char *what, const RingWakeups &raced)
+{
+	std::printf("control_ring_test: %s (%s): %llu published, %llu rung, %llu looks found the "
+	            "message, %llu wakes lost\n",
+	            what, RGFX_GUEST_ARM64 ? "arm64" : "x86-64",
+	            static_cast<unsigned long long>(raced.published),
+	            static_cast<unsigned long long>(raced.rung),
+	            static_cast<unsigned long long>(raced.looked),
+	            static_cast<unsigned long long>(raced.lost));
+}
 } // namespace
 
-int main()
+int main(int argc, char **argv)
 {
+	if (argc > 1 && std::strcmp(argv[1], "--control") == 0) {
+		// The control: the publish without its full fence loses wakes where the CPU reorders.
+		const RingWakeups raced = raceControlPublish<false>();
+		printRace("the race without the fence", raced);
+		return raced.lost > 0 ? 0 : 1;
+	}
+
 	// The span: the data's whole 4 KiB pages past the header's, on x86-64's rules alone.
 	check(kRgfxControlWcFrom == 0x1000 && kRgfxControlWcTo == 0x9000,
 	      "the span is the data's pages past the header's");
@@ -165,6 +238,11 @@ int main()
 		r.log.resize(n - 2);
 		publishedAfterData(r, "the producer is published after the message, fenced");
 	}
+
+	// The publish raced against the host's look before it sleeps.
+	const RingWakeups raced = raceControlPublish<true>();
+	printRace("the race", raced);
+	check(raced.lost == 0, "no message is left without its doorbell");
 
 	std::printf("control_ring_test: %d checks passed (%s)\n", checks,
 	            RGFX_GUEST_ARM64 ? "arm64" : "x86-64");

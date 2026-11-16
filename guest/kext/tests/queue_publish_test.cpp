@@ -1,12 +1,17 @@
 // The native test of RgfxQueuePublish.hpp: the kext's publish of a queue's submission ring is the
 // bundle's own (RgfxRingWriter::tryPost), step for step and word for word, and the client's table
 // of its queues' ring headers lets go of each at the queue's destroy, at its block's free and at the
-// context's close, after which the kext publishes on none of them.
+// context's close, after which the kext publishes on none of them. Raced against the host's look
+// before it sleeps (ring_wakeups.hpp), the publish never leaves the host asleep with a buffer it
+// was not rung for; `--control` races it without its full fence instead, which loses wakes.
 #include "RgfxQueuePublish.hpp"
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
+
+#include "ring_wakeups.hpp"
 
 namespace {
 int checks = 0;
@@ -51,10 +56,73 @@ bool bundleRings(uint32_t idle, bool answered, bool asks, uint32_t ring, uint32_
 struct Map {
 	int id;
 };
+
+// A kept submission ring header's fields as the kext's KeptRing touches them
+// (RgfxAcceleratorUserClientContexts.cpp), over the race's ring; without `Fenced`, its full fence
+// left out, the control.
+template <bool Fenced>
+struct RacedRing {
+	volatile uint8_t *header;
+	void storeProducer(uint64_t producer)
+	{
+		__atomic_store_n(reinterpret_cast<volatile uint64_t *>(
+		                     header + __builtin_offsetof(RgfxRingHeader, producer)),
+		                 producer, __ATOMIC_RELEASE);
+	}
+	void fullFence()
+	{
+		if (Fenced)
+			__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	}
+	uint32_t consumerIdle()
+	{
+		return __atomic_load_n(reinterpret_cast<const volatile uint32_t *>(
+		                           header + __builtin_offsetof(RgfxRingHeader, consumer_idle)),
+		                       __ATOMIC_ACQUIRE);
+	}
+};
+
+// The race of rgfxQueuePublish, on a queue ring of 256 bytes: the bundle's write of each buffer's
+// message, then the kext's publish of it.
+template <bool Fenced>
+RingWakeups raceQueuePublish()
+{
+	RingWakeupsMemory *memory = new RingWakeupsMemory();
+	volatile uint8_t *header = memory->bytes;
+	RacedRing<Fenced> r{header};
+	const RingWakeups raced = ringWakeupsRace(
+	    header, 256,
+	    [&](uint32_t at, uint64_t produced) {
+		    const RgfxMsgHeader message = ringWakeupsMessage(produced / sizeof(RgfxMsgHeader));
+		    std::memcpy(memory->bytes + RGFX_RING_HEADER_SIZE + at, &message, sizeof(message));
+		    uint32_t word = 0;
+		    return rgfxQueuePublish(r, 0x40000, produced, 0, &word);
+	    },
+	    1000000, 1000);
+	delete memory;
+	return raced;
+}
+
+void printRace(const char *what, const RingWakeups &raced)
+{
+	std::printf("queue_publish_test: %s: %llu published, %llu rung, %llu looks found the buffer, "
+	            "%llu wakes lost\n",
+	            what, static_cast<unsigned long long>(raced.published),
+	            static_cast<unsigned long long>(raced.rung),
+	            static_cast<unsigned long long>(raced.looked),
+	            static_cast<unsigned long long>(raced.lost));
+}
 } // namespace
 
-int main()
+int main(int argc, char **argv)
 {
+	if (argc > 1 && std::strcmp(argv[1], "--control") == 0) {
+		// The control: the publish without its full fence loses wakes where the CPU reorders.
+		const RingWakeups raced = raceQueuePublish<false>();
+		printRace("the race without the fence", raced);
+		return raced.lost > 0 ? 0 : 1;
+	}
+
 	// The publish, for every consumer state and flag the bundle passes.
 	const uint32_t ringId = 0x40000;
 	const uint32_t states[] = {0, RGFX_CONSUMER_ASLEEP, RGFX_CONSUMER_WALKING, 3};
@@ -113,6 +181,11 @@ int main()
 	check(rgfxQueueHeaderDropAll(t, out) == 2 && t.count == 0, "the close drops every one");
 	check(!rgfxQueueHeaderFind(t, 0x20) && !rgfxQueueHeaderFind(t, 0x21), "and finds none");
 	check(rgfxQueueHeaderAdd(t, {0x22, 0x700000, 0x700000, &c, hdr[2]}), "room again after");
+
+	// The publish raced against the host's look before it sleeps.
+	const RingWakeups raced = raceQueuePublish<true>();
+	printRace("the race", raced);
+	check(raced.lost == 0, "no buffer is left without its doorbell");
 
 	std::printf("queue_publish_test: %d checks passed\n", checks);
 	return 0;
