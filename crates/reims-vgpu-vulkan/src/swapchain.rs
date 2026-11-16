@@ -84,9 +84,12 @@
 //! `oldSwapchain` and retires it (below), whether or not the create makes the new one: Vulkan
 //! retires it either way. A make refused before the create (the surface has no pixels for now,
 //! as a minimized window's may, or refuses its capabilities) hands Vulkan nothing, so the old
-//! one stays the current one, stale, and the next draw hands it over: Vulkan refuses a create
-//! with no `oldSwapchain` while the window has a swapchain (`VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`,
-//! read from the specification of `vkCreateSwapchainKHR`). A swapchain the surface refuses for
+//! one stays the current one, stale, and the next draw hands it over. With none to hand over
+//! (the first make, or the one after a refused create), the retired swapchains are destroyed
+//! first, waited for as at the swapchain's end (below): Vulkan refuses a create with no
+//! `oldSwapchain` while the window has a swapchain, and a retired one is the window's until it
+//! is destroyed (`VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`, read from the specification of
+//! `vkCreateSwapchainKHR` and `VkSwapchainCreateInfoKHR`). A swapchain the surface refuses for
 //! now is tried again at the next draw ([`remake`]); only a lost surface, or the device's
 //! recovery (below), ends the swapchain's draws ([`Acquired::Failed`]).
 //!
@@ -619,6 +622,10 @@ trait Remaking {
     type Chain;
     /// Takes the current swapchain out, once its frames have completed.
     fn take_current(&mut self) -> Option<Self::Chain>;
+    /// Whether a retired swapchain lives.
+    fn has_retired(&self) -> bool;
+    /// Destroys every retired swapchain, once its presents are complete.
+    fn end_retired(&mut self);
     /// A new swapchain, with `old` as its `oldSwapchain`.
     fn make(&mut self, old: Option<&Self::Chain>) -> Result<Self::Chain, Unmade>;
     /// Retires `chain`: it is destroyed once its presents are complete.
@@ -627,13 +634,17 @@ trait Remaking {
     fn set_current(&mut self, chain: Option<Self::Chain>, stale: bool);
 }
 
-/// Makes the swapchain again (the module doc, "Size"). A make refused before the create leaves
-/// the old swapchain current, stale, since Vulkan was never handed it: retired there, it would
-/// live on as the window's, and every later create, with none to hand over, would be refused
-/// (`VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`). One the create refused, or the wrap of its images,
-/// retired the old one all the same.
+/// Makes the swapchain again (the module doc, "Size"). With no current swapchain to hand over,
+/// the retired ones go first: a create that passes no `oldSwapchain` is refused while one lives
+/// (`VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`). A make refused before the create leaves the old
+/// swapchain current, stale, since Vulkan was never handed it: retired there, it would live on
+/// as the window's, and every later create, with none to hand over, would be refused. One the
+/// create refused, or the wrap of its images, retired the old one all the same.
 fn remake<R: Remaking>(r: &mut R) -> Result<(), Refused> {
     let old = r.take_current();
+    if old.is_none() && r.has_retired() {
+        r.end_retired();
+    }
     match r.make(old.as_ref()) {
         Ok(chain) => {
             if let Some(old) = old {
@@ -668,6 +679,15 @@ impl Remaking for Remake<'_> {
 
     fn take_current(&mut self) -> Option<Chain> {
         self.swapchain.retire()
+    }
+
+    fn has_retired(&self) -> bool {
+        !self.swapchain.retired.is_empty()
+    }
+
+    fn end_retired(&mut self) {
+        self.swapchain
+            .end_retired("a swapchain made with none to hand over");
     }
 
     fn make(&mut self, old: Option<&Chain>) -> Result<Chain, Unmade> {
@@ -1205,6 +1225,21 @@ impl Swapchain {
         })
     }
 
+    /// Destroys every retired swapchain once its presents are known complete, waiting for their
+    /// fences, or where they do not tell it, for the presenting queue to idle (the module doc);
+    /// `why` is logged where it waits for the queue.
+    fn end_retired(&mut self, why: &str) {
+        let newest = self.retired.iter().map(Chain::last_present).max();
+        if let Some(newest) = newest
+            && !self.wait_fences(newest)
+        {
+            self.wait_idle(why);
+        }
+        for chain in std::mem::take(&mut self.retired) {
+            self.destroy(chain);
+        }
+    }
+
     /// Takes the swapchain out once its frames have completed, waiting on nothing else; its
     /// images' textures and semaphores stay until [`Swapchain::destroy`].
     fn retire(&mut self) -> Option<Chain> {
@@ -1611,15 +1646,7 @@ impl Drop for Swapchain {
         self.retired.extend(last);
         // An image pending with no swapchain left: its fence is settled before it goes.
         let _ = self.settle_fence();
-        let newest = self.retired.iter().map(Chain::last_present).max();
-        if let Some(newest) = newest
-            && !self.wait_fences(newest)
-        {
-            self.wait_idle("the window's end");
-        }
-        for chain in std::mem::take(&mut self.retired) {
-            self.destroy(chain);
-        }
+        self.end_retired("the window's end");
         let _wsi = WSI.lock();
         // SAFETY: every present is complete, so nothing waits on a fence any more, nor uses the
         // surface.
@@ -1925,6 +1952,16 @@ mod tests {
             self.current.take()
         }
 
+        fn has_retired(&self) -> bool {
+            !self.retired.is_empty()
+        }
+
+        fn end_retired(&mut self) {
+            for chain in std::mem::take(&mut self.retired) {
+                self.live.retain(|&c| c != chain);
+            }
+        }
+
         fn make(&mut self, old: Option<&u32>) -> Result<u32, Unmade> {
             if !self.pixels {
                 return Err(Unmade::Unasked(Refused("no pixels for now".to_owned())));
@@ -1986,5 +2023,28 @@ mod tests {
             (w.current, w.stale, &w.retired[..]),
             (Some(2), false, &[1][..])
         );
+    }
+
+    /// A refused create retires the old swapchain all the same, and a retired swapchain is the
+    /// window's until it is destroyed: the next make, with none to hand over, destroys the
+    /// retired ones first, so its create is not refused for them
+    #[test]
+    fn a_make_after_a_refused_create_ends_the_retired_swapchains_first() {
+        let mut w = window();
+        w.refusing = true;
+        let out_of_memory = vk::Result::ERROR_OUT_OF_DEVICE_MEMORY;
+        assert_eq!(
+            remake(&mut w),
+            Err(refused("vkCreateSwapchainKHR", out_of_memory))
+        );
+        assert_eq!(
+            (w.current, &w.retired[..], &w.live[..]),
+            (None, &[1][..], &[1][..])
+        );
+        w.refusing = false;
+        assert_eq!(remake(&mut w), Ok(()));
+        assert_eq!(w.creates, [None, Some(1), None]);
+        assert_eq!((w.current, &w.live[..]), (Some(2), &[2][..]));
+        assert!(w.retired.is_empty());
     }
 }
