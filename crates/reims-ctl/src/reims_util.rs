@@ -68,6 +68,9 @@ pub fn binary() -> Result<PathBuf> {
         .context("reims-util is not installed: run reims-ctl update, which installs it")
 }
 
+/// cargo's file name: `cargo`, and `cargo.exe` on Windows.
+const CARGO_FILE: &str = if cfg!(windows) { "cargo.exe" } else { "cargo" };
+
 /// reims-util's file name: `reims-util`, and `reims-util.exe` on Windows.
 const UTIL_FILE: &str = if cfg!(windows) {
     "reims-util.exe"
@@ -137,12 +140,12 @@ pub fn version(bin: &Path) -> Option<String> {
 /// whose rust-toolchain.toml picks the toolchain. One from another commit or source is replaced,
 /// and one at [`REV`] is left as it is (the module doc).
 pub fn install(repo: &Path) -> Result<()> {
-    let cargo = which("cargo")
+    let cargo = which(CARGO_FILE)
         .or_else(|| {
             let home = std::env::var_os("CARGO_HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| paths::home().join(".cargo"));
-            Some(home.join("bin/cargo")).filter(|p| p.is_file())
+            Some(home.join("bin").join(CARGO_FILE)).filter(|p| p.is_file())
         })
         .context("cargo is not installed")?;
     // An earlier commit's build there would be installed as this one's (the module's doc).
