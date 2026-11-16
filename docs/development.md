@@ -27,7 +27,11 @@ tests/
                             build and tools name
 scripts/                    what a person installing reims-ctl runs
   install-ctl.sh            builds and installs reims-ctl and its QEMU (and
-                            reims-util, on Linux)
+                            reims-util, on Linux and Windows); on Windows,
+                            in MSYS2's CLANG64 shell
+  install.ps1               on Windows: installs MSYS2 and Git for Windows
+                            with winget, turns on the Windows Hypervisor
+                            Platform, then runs install-ctl.sh in CLANG64
 scripts/internal/           what developing the project runs
   dev-env.sh                the environment a developer's builds run in,
                             through kache where it is installed (below)

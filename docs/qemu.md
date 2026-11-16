@@ -3,9 +3,10 @@
 `vendor/qemu` is QEMU with `reims-graphics-pci`, the GPU device our own
 kexts drive (`guest/`), in C on this library's C API. `make qemu` builds
 its `qemu-system-x86_64` on the checkout's library, linked statically
-through pkg-config. On Linux it runs x86-64 macOS guests under KVM, and
-users run them with `reims-ctl`, whose installer,
-`scripts/install-ctl.sh`, builds the same QEMU on the library's Vulkan
+through pkg-config. On Linux it runs x86-64 macOS guests under KVM, and on
+Windows under WHPX ("Windows hosts", below), and users run them with
+`reims-ctl`, whose installer, `scripts/install-ctl.sh` (on Windows run by
+`scripts/install.ps1`), builds the same QEMU on the library's Vulkan
 platform. This file says how QEMU is built and uses the library, and the
 measured facts QEMU's side and the guests rely on.
 

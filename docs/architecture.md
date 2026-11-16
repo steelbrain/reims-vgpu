@@ -128,7 +128,8 @@ firmware/               the device's option ROM: its UEFI driver, in C, and the 
                         firmware/ambrosia, its driver module for Ambrosia, the arm64 guests' firmware (11.5)
 guest/                  the guest's kexts, loader and Metal bundle, and the prebuilt kext set
 tests/shaders/          the tests' metallibs and their sources
-scripts/                install-ctl.sh: installs reims-ctl and its QEMU
+scripts/                install-ctl.sh: installs reims-ctl and its QEMU; install.ps1: what Windows
+                        lacks for it (MSYS2, Git, the hypervisor platform), then install-ctl.sh
 scripts/internal/       the developer's scripts (development.md)
 vendor/qemu             QEMU, whose reims-graphics-pci is C on the C API
 ```
