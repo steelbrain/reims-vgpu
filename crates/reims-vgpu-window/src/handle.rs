@@ -379,6 +379,13 @@ impl Window {
     pub fn cursor_show(&self, show: bool) {
         let drawn = {
             let mut guest = self.guest.lock();
+            if guest.cursor_visible != show {
+                log::debug!(
+                    target: "reims_vgpu_window",
+                    "the guest {} its cursor",
+                    if show { "shows" } else { "hides" }
+                );
+            }
             guest.cursor_visible = show;
             guest.lead.guest_leads()
         };
