@@ -4148,10 +4148,13 @@ the host's import, and the kext's block table holds one entry per slab:
   (the physical mask `0x0000FFFFFFFF0000`), zero-filled, maps them into the
   process in order and makes the pages block of their runs, so a 2 MiB slab is
   32 runs of guest RAM at most, where plain pages are up to 512. Each run
-  starts and ends at a multiple of 64 KiB, the granule at which the host binds
-  a buffer over several pieces of its import of guest RAM (RADV's sparse
-  buffer alignment), so such a buffer lies in the guest RAM's import rather
-  than in an import of its own on every submission's list. The host maps each
+  starts and ends at a multiple of 64 KiB. On RADV the host binds a buffer
+  over a slab of several runs as a piece of one dma-buf of the runs of the
+  host's view of those pages, which the view's other buffers share, one import
+  on every submission's list: bound as pieces of the guest RAM's import in a
+  sparse buffer, it cost a GPU page-table update of each piece at its bind and
+  again at its release (`crates/reims-vgpu-vulkan/src/os/linux/dma_buf.rs`,
+  "Several pieces" and "Views"). The host maps each
   run of a view apart, against a budget of mappings per process
   (`vm.max_map_count` on Linux, 65530 by default): on NVIDIA, views of
   scattered pages, slabs' among them, used it up, and the buffers made after

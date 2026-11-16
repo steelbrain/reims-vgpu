@@ -60,13 +60,24 @@ pub(crate) struct Backing {
 }
 
 /// A run of the library's own mapping: its end, its file, the protection set on it (core's
-/// `VmProt`), and the dma-buf it is mapped through, if it is (module docs).
+/// `VmProt`), the dma-buf it is mapped through, if it is (module docs), and the view it is of.
 #[derive(Clone, Debug)]
 struct Run {
     end: u64,
     backing: Backing,
     prot: VmProt,
     through: Option<Through>,
+    /// The number of the record that made it ([`next_view`]): the runs of one view, recorded at
+    /// once, share it, and a run cut or protected keeps it. A run's file and offset never change
+    /// under its number, so bytes of runs of one number show the pages they showed as the view
+    /// was recorded ([`view_of`]).
+    view: u64,
+}
+
+/// A number for a new record of runs ([`Run::view`]), unique in the process.
+fn next_view() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Where a run mapped through a dma-buf lies in it: the dma-buf, by a number of the process's
@@ -304,6 +315,7 @@ impl Table {
                 offset: t.offset + (at - first),
                 ..t.clone()
             }),
+            view: run.view,
         };
         self.insert(first, Run { end: at, ..run });
         self.insert(at, tail);
@@ -347,7 +359,7 @@ impl Table {
     }
 
     /// `first..end` shows `backing` with protection `prot` from now on, mapped through the
-    /// dma-buf `through` names where it does (`record`).
+    /// dma-buf `through` names where it does (`record`), a record of its own ([`Run::view`]).
     fn record(
         &mut self,
         first: u64,
@@ -355,6 +367,19 @@ impl Table {
         backing: Backing,
         prot: VmProt,
         through: Option<Through>,
+    ) {
+        self.record_of(first, end, backing, prot, through, next_view());
+    }
+
+    /// [`Self::record`], as a run of the record numbered `view`.
+    fn record_of(
+        &mut self,
+        first: u64,
+        end: u64,
+        backing: Backing,
+        prot: VmProt,
+        through: Option<Through>,
+        view: u64,
     ) {
         self.forget(first, end);
         if first < end {
@@ -365,6 +390,7 @@ impl Table {
                     backing,
                     prot,
                     through,
+                    view,
                 },
             );
         }
@@ -411,8 +437,8 @@ impl Table {
     /// holds ([`Self::holds_none`]), in order: nothing of another run to cut or drop, and each
     /// piece joins only the one before it, the first the run before the range and the last the
     /// run after it, as [`Self::insert`] counts them, counted from the pieces themselves before
-    /// they go in.
-    fn record_fresh(&mut self, target: u64, pieces: Vec<Piece>) {
+    /// they go in. The runs are of the record numbered `view`.
+    fn record_fresh(&mut self, target: u64, pieces: Vec<Piece>, view: u64) {
         let runs: Vec<(u64, Run)> = (pieces.into_iter())
             .filter_map(|piece| {
                 let first = target.saturating_add(piece.at);
@@ -424,6 +450,7 @@ impl Table {
                         backing: piece.backing,
                         prot: piece.prot,
                         through: None,
+                        view,
                     },
                 ))
             })
@@ -613,6 +640,8 @@ pub(crate) fn view_pieces(sources: &[(u64, u64)]) -> Result<Vec<Piece>, (usize, 
 /// Over bytes no run holds, as a view's over core's fresh reservation, the pieces in order are
 /// added as they are, with no run to cut ([`Table::record_fresh`]).
 pub(crate) fn record_pieces(target: u64, pieces: Vec<Piece>) {
+    // One view's runs, one record's number.
+    let view = next_view();
     let mut table = TABLE.lock();
     let end = (pieces.iter())
         .map(|p| target.saturating_add(p.at).saturating_add(p.length))
@@ -622,13 +651,13 @@ pub(crate) fn record_pieces(target: u64, pieces: Vec<Piece>) {
         && in_order
         && table.holds_none(target, end)
     {
-        table.record_fresh(target, pieces);
+        table.record_fresh(target, pieces, view);
         return;
     }
     for piece in pieces {
         let first = target.saturating_add(piece.at);
         let end = first.saturating_add(piece.length);
-        table.record(first, end, piece.backing, piece.prot, None);
+        table.record_of(first, end, piece.backing, piece.prot, None, view);
     }
     let closing = table.closing();
     drop(table);
@@ -639,11 +668,12 @@ pub(crate) fn record_pieces(target: u64, pieces: Vec<Piece>) {
 /// (module docs).
 #[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn record_through(target: u64, pieces: Vec<(Piece, Through)>) {
+    let view = next_view();
     let mut table = TABLE.lock();
     for (piece, through) in pieces {
         let first = target.saturating_add(piece.at);
         let end = first.saturating_add(piece.length);
-        table.record(first, end, piece.backing, piece.prot, Some(through));
+        table.record_of(first, end, piece.backing, piece.prot, Some(through), view);
     }
     let closing = table.closing();
     drop(table);
@@ -671,6 +701,59 @@ pub(crate) fn through_pieces(first: u64, end: u64) -> Vec<Piece> {
             }
         })
         .collect()
+}
+
+/// The view the `length` bytes from `first` lie in: the number of the record whose runs hold
+/// every byte of them, one run after another ([`Run::view`]); `None` where a byte lies in no
+/// run, or in a run of another record.
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+pub(crate) fn view_of(first: u64, length: u64) -> Option<u64> {
+    let end = first.checked_add(length)?;
+    let table = TABLE.lock();
+    let (start, run) = table.run_at(first)?;
+    let view = run.view;
+    let mut at = start;
+    for (&from, run) in table.runs.range(start..end) {
+        if from != at || run.view != view {
+            return None;
+        }
+        at = run.end;
+    }
+    (at >= end).then_some(view)
+}
+
+/// The runs of the record numbered `view` around the byte `at` that follow on from one another
+/// with no byte between ([`Run::view`]), as pieces from the first of them ([`pieces`]): its
+/// first byte, and the pieces. `None` where `at` lies in no run of that record, or where they
+/// are more than `most` runs.
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+pub(crate) fn view_runs(view: u64, at: u64, most: usize) -> Option<(u64, Vec<Piece>)> {
+    let table = TABLE.lock();
+    let (start, run) = table.run_at(at)?;
+    if run.view != view {
+        return None;
+    }
+    let (mut first, mut end, mut runs) = (start, run.end, 1usize);
+    for (&from, run) in table.runs.range(..start).rev() {
+        if run.end != first || run.view != view {
+            break;
+        }
+        (first, runs) = (from, runs + 1);
+        if runs > most {
+            return None;
+        }
+    }
+    for (&from, run) in table.runs.range(end..) {
+        if from != end || run.view != view {
+            break;
+        }
+        (end, runs) = (run.end, runs + 1);
+        if runs > most {
+            return None;
+        }
+    }
+    let mut pieces = Vec::new();
+    (table.pieces_into(first, end - first, 0, &mut pieces)).then_some((first, pieces))
 }
 
 /// The dma-buf a view is mapped through whole ([`Kept`]) where the `length` bytes from `first`
@@ -1286,6 +1369,82 @@ pub(crate) mod tests {
         assert_eq!((t.mappings(), t.joins, t.runs.len()), (0, 0, 0));
     }
 
+    /// A view's runs, recorded at once, are one record's: a range in them answers its number,
+    /// and its runs around a byte resolve as its pieces, after a protect cut one; a range that
+    /// reaches a gap, another view or a run recorded over part of the view answers none, nor do
+    /// more runs than asked for
+    #[test]
+    fn a_views_runs_are_one_records() {
+        let (f, g) = (file(), file());
+        let base = 0x7d00_0000_0000;
+        let page = 0x1000;
+        let at = |i: u64| base + i * page;
+        let piece = |i: u64, fd: &Arc<HostFile>, offset| Piece {
+            at: i * page,
+            length: page,
+            backing: Backing {
+                file: Arc::clone(fd),
+                offset,
+            },
+            prot: READ_WRITE,
+        };
+        // A view of four pages, backwards in `f`, and another of two of `g` after a gap.
+        let view: Vec<Piece> = (0..4).map(|i| piece(i, &f, (9 - i) * page)).collect();
+        record_pieces(at(0), view);
+        record_pieces(at(5), vec![piece(0, &g, 0), piece(1, &g, 4 * page)]);
+        let one = view_of(at(0), 4 * page).expect("the first view's");
+        assert_eq!(view_of(at(1), 2 * page), Some(one));
+        let two = view_of(at(5), 2 * page).expect("the second's");
+        assert_ne!(one, two);
+        assert_eq!(view_of(at(3), 2 * page), None, "into the gap");
+        assert_eq!(view_of(at(4), page), None, "the gap");
+        let (first, pieces) = view_runs(one, at(2), 4).unwrap();
+        assert_eq!(first, at(0));
+        assert_eq!(
+            shape(&pieces),
+            [
+                (0, page, 9 * page),
+                (page, page, 8 * page),
+                (2 * page, page, 7 * page),
+                (3 * page, page, 6 * page)
+            ]
+        );
+        assert!(
+            view_runs(one, at(2), 3).is_none(),
+            "four runs, three asked for"
+        );
+        assert!(view_runs(two, at(2), 4).is_none(), "not the second view's");
+        protect(at(1), page, VmProt::READ);
+        assert_eq!(
+            view_of(at(0), 4 * page),
+            Some(one),
+            "a protect keeps the number"
+        );
+        let (first, pieces) = view_runs(one, at(3), 4).unwrap();
+        assert_eq!((first, pieces.len()), (at(0), 4));
+        let over = Backing {
+            file: Arc::clone(&g),
+            offset: 8 * page,
+        };
+        record(at(2), page, over, READ_WRITE);
+        assert_eq!(
+            view_of(at(0), 4 * page),
+            None,
+            "a run recorded over the view"
+        );
+        assert_eq!(view_of(at(0), 2 * page), Some(one));
+        let (first, pieces) = view_runs(one, at(0), 4).unwrap();
+        assert_eq!(
+            (first, shape(&pieces).len()),
+            (at(0), 2),
+            "the runs before it"
+        );
+        let (first, pieces) = view_runs(one, at(3), 4).unwrap();
+        assert_eq!((first, shape(&pieces)), (at(3), vec![(0, page, 6 * page)]));
+        forget(at(0), 7 * page);
+        assert_eq!(view_of(at(0), page), None);
+    }
+
     /// Runs that follow on in one file with one protection resolve as one piece, as the kernel
     /// maps them as one; a protection or a file apart cuts it
     #[test]
@@ -1565,7 +1724,7 @@ pub(crate) mod tests {
                 let start = at(2) + piece.at;
                 one.record(start, start + piece.length, piece.backing, piece.prot, None);
             }
-            fresh.record_fresh(at(2), pieces);
+            fresh.record_fresh(at(2), pieces, next_view());
             assert_eq!(shape(&fresh), shape(&one));
         }
     }

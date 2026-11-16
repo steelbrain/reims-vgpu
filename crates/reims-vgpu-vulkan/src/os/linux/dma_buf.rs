@@ -47,20 +47,21 @@
 //! [`GROUP_BYTES`], 64 MiB, whatever udmabuf takes.
 //!
 //! **Regions.** A buffer's or a heap's request over no grouped view, whose pages are the guest's
-//! RAM mapped writable (the leases' registrations, `crate::os::files`), is answered with pieces of
-//! the RAM's region dma-bufs where they fit the request ([`ram_pieces`]): each file of the RAM is
-//! cut into regions of [`REGION_BYTES`], 64 MiB at multiples of it in the file (udmabuf's
-//! `size_limit_mb`, down to a power of two, where a host has it lower), each one dma-buf of its
-//! one run of pages, made at its first piece and shared by its `Arc`, so a device that lists
-//! every import in every submission (RADV) lists one a region whatever objects lie in it. A
-//! request takes one piece where its pages are one run of the file inside one region, at an
-//! offset its one-chunk alignment divides (the host page on RADV, whatever its granule): a heap
-//! over a pages block of one run, which lies in the RAM
-//! itself, a buffer over the RAM, a view of one run. Pages across two regions, or several runs,
-//! take a piece of each where the runtime binds several chunks (each at an offset its alignment
-//! divides, each boundary a multiple of its granule from the start, and the bytes whole granules,
-//! as a pad would be a region's other pages). Everything else, a view of scattered pages among it (4 KiB runs against RADV's 64 KiB
-//! granule), takes a dma-buf of its own, as memory of the library's own and read-only pages do.
+//! RAM mapped writable (the leases' registrations, `crate::os::files`) and one run of the RAM's
+//! file inside one region, is answered with that piece of the region's dma-buf ([`ram_piece`]):
+//! each file of the RAM is cut into regions of [`REGION_BYTES`], 64 MiB at multiples of it in the
+//! file (udmabuf's `size_limit_mb`, down to a power of two, where a host has it lower), each one
+//! dma-buf of its one run of pages, made at its first piece and shared by its `Arc`, so a device
+//! that lists every import in every submission (RADV) lists one a region whatever objects lie in
+//! it. The piece lies at an offset its one-chunk alignment divides (the host page on RADV,
+//! whatever its granule), where the runtime binds a plain buffer: a heap over a pages block of
+//! one run, which lies in the RAM itself, a buffer over the RAM, a view of one run. Pages in
+//! several runs, or across two regions, take a piece of their view's dma-buf (below, "Views"),
+//! else a dma-buf of their own, one list of their runs (`UDMABUF_CREATE_LIST` takes the runs of
+//! several files in one list), cut into chunks only past udmabuf's limits ([`of_pages`]), as
+//! memory of the library's own and read-only pages do: a piece of each region would be bound in a
+//! sparse buffer, a GPU page-table update of each piece at the bind and again at the release
+//! (below, "Several pieces").
 //! The table of regions ([`REGIONS`]) holds each file weakly: the runtime's imports of it hold
 //! it, and so does each import source that answered with a piece of it, which the runtime keeps
 //! with the imports it made (`super::import`'s `host_memory`), and so do the imports of it the
@@ -83,6 +84,44 @@
 //! 53.6) and their take to show (a median of 12.4 to 12.7 ms) as before. A walk made 61 to 67
 //! region dma-bufs, at most 31 alive at once: 1.9 GiB of the guest's 8 GiB pinned, none of it
 //! memory the RAM did not already hold.
+//!
+//! **Several pieces.** RADV binds each chunk of a sparse buffer as a GPU VA operation of its own,
+//! and amdgpu updates its page tables for each, at the bind and again at the release; and each
+//! import the device holds is in every submission's list ("Costs", above). **Measured**
+//! 2026-11-16 on the RX 7900 XTX (RADV of Mesa 26.2.6, Linux 7.3.3), Geekbench 7.1.0's Metal
+//! compute pass on a 26.7.2 guest, whose slabs are runs of 64 KiB chunks of guest RAM, the timed
+//! pass of a traced warm run (jobs m3-max-36097, then two each: 36148 and 36149, 36273 and 36274):
+//! - a piece of each region, bound in a sparse buffer: the kernel's own SDMA jobs came to 181,391
+//!   (3.62 s of SDMA time), 137,742 of them its page tables' (an earlier trace of the same pass
+//!   had 937 such requests bound as 73,976 pieces), and the pass took 1.258 times its native time
+//!   (a geometric mean), Video Filter 1.17;
+//! - a dma-buf of each request's own: 51,020 to 54,829 (1.98 to 2.08 s), but the device held
+//!   about three times the imports (Super Resolution's mean 121 to 122 against 41, its submissions
+//!   taking 961 to 975 ms against 545): 1.259 to 1.279, Super Resolution 1.40 against 1.36;
+//! - a piece of the view's dma-buf (below, "Views"): 12,583 to 15,030 (0.46 to 0.56 s), 2,172 to
+//!   2,386 of them the page tables', Super Resolution's mean 99 (757 to 765 ms): 1.236 to 1.242,
+//!   Video Filter 1.06, against 1.256 and 1.10 before the regions (development d5dbecbda).
+//!
+//! **Views.** A buffer's or a heap's request in the runs of one of the library's views (one
+//! record of the backing table, `files::view_of`) that no group or region answers is answered
+//! with that piece of the view's dma-buf ([`view_piece`]): one list of the view's runs that follow
+//! on around the request, made at the first such request while none is alive and shared by its
+//! `Arc`, so the view's buffers and heaps are bound plainly in one import of it, as a region's
+//! are in the region's. The table of views' dma-bufs ([`VIEW_FILES`]) holds each file weakly, the
+//! runtime's imports of it and the sources that answered with it strongly, so it lives while an
+//! object over a piece of it does, with no linger. A record's runs never show other pages (a run
+//! recorded over part of a view is another record's), so a piece shows the pages its request's
+//! bytes show. A view of more runs than one dma-buf takes (udmabuf's limits as the host has them),
+//! or of more than [`GROUP_BYTES`], gives no piece, and its requests take dma-bufs of their own.
+//! While it lives the dma-buf pins every page of those runs and maps them in the device's GPU
+//! address space, the pages no object covers too: at most 64 MiB a view, of the guest's RAM
+//! (resident from the start, as above) or of the library's own memory. On the Radeon 780M
+//! (**measured** 2026-11-16, RADV of Mesa 26.2.6, Linux 7.3.3, the desktop walk above, two walks
+//! each: jobs m3-max-36128 and 36129, 36150 and 36151, 36227 and 36228) Launchpad's last steps
+//! ended with 225 to 234 imports held with pieces of regions, 242 to 251 with a dma-buf each, and
+//! 234 to 242 with pieces of views, at 54.2 to 54.6 presents a second and 5.9 to 6.9 ms of
+//! submissions a present in all three; Geekbench's pass there took 1.033 times its native time
+//! with pieces of views (job m3-max-36229), against 1.062 before the regions.
 //!
 //! **Kept imports.** Each region a no-copy buffer's or heap's source answered with is kept
 //! imported on the device that made the object ([`keep_regions`], on the thread that made it,
@@ -932,7 +971,7 @@ struct Region {
 /// writes as each is made.
 static REGIONS_MADE: AtomicU64 = AtomicU64::new(0);
 
-/// A source's use of a region's dma-buf ([`ram_pieces`]): the dma-buf held, and the region counted
+/// A source's use of a region's dma-buf ([`ram_piece`]): the dma-buf held, and the region counted
 /// in use ([`Region::users`]) while it lives. The import source keeps one for each region it
 /// answered with (`super::import`'s `host_memory`), and the runtime keeps the source while an
 /// import made through it lives, so a region is in use while an object over a piece of it lives.
@@ -986,177 +1025,175 @@ pub(crate) struct RegionRef {
     file: Weak<OwnedFd>,
 }
 
-/// What [`ram_pieces`] answers: the pieces, in order, and a use of each region they lie in.
+/// What [`ram_piece`] answers: the piece, and a use of the region it lies in.
 #[derive(Debug)]
-pub(crate) struct RegionPieces {
-    pub(crate) chunks: Vec<DmaBufChunk>,
-    pub(crate) uses: Vec<RegionUse>,
+pub(crate) struct RegionPiece {
+    pub(crate) chunk: DmaBufChunk,
+    pub(crate) region: RegionUse,
 }
 
-/// Pieces of the guest RAM's region dma-bufs that hold the `length` bytes from `first` (whole
-/// pages) in order, as a no-copy buffer's or heap's request at `granule`, `alignment` and
-/// `one_chunk_alignment` takes them (module docs, "Regions"): each piece one run of a file's pages
-/// inside one region, at its offset in the region's dma-buf, made at the region's first piece, with
-/// a use of each region ([`RegionUse`]). `None` where a byte shows no page of the guest's RAM
-/// mapped writable, where the pieces break the request's rules (one piece at an offset
-/// `one_chunk_alignment` does not divide; several, where one lies at an offset `alignment` does not
-/// divide, a boundary between two lies off the granule, or the length is not whole granules, which
-/// would take a pad of other pages), or where udmabuf makes no region's dma-buf: the request is
-/// answered as before then.
-pub(crate) fn ram_pieces(
-    first: u64,
-    length: u64,
-    granule: u64,
-    alignment: u64,
-    one_chunk_alignment: u64,
-) -> Option<RegionPieces> {
-    ram_pieces_in(
-        first,
-        length,
-        granule,
-        alignment,
-        one_chunk_alignment,
-        region_bytes()?,
-    )
+/// The piece of a guest RAM region's dma-buf that holds the `length` bytes from `first` (whole
+/// pages), as a no-copy buffer's or heap's request at `one_chunk_alignment` takes it (module docs,
+/// "Regions"): where the bytes are one run of a file's pages inside one region, at their offset in
+/// the region's dma-buf, made at the region's first piece, with a use of the region
+/// ([`RegionUse`]). `None` where a byte shows no page of the guest's RAM mapped writable, where
+/// the pages are several runs or cross into another region (a piece of each would be bound in a
+/// sparse buffer: module docs, "Several pieces"), where the piece's offset is one
+/// `one_chunk_alignment` does not divide, or where udmabuf makes no region's dma-buf: the request
+/// is answered as before then, with a dma-buf of its own.
+pub(crate) fn ram_piece(first: u64, length: u64, one_chunk_alignment: u64) -> Option<RegionPiece> {
+    ram_piece_in(first, length, one_chunk_alignment, region_bytes()?)
 }
 
-/// Why [`ram_pieces`] answered none.
+/// Why [`ram_piece`] answered none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NoPieces {
+enum NoPiece {
     /// A byte shows no page of the guest's RAM mapped writable.
     NotRam,
-    /// The pieces break the request's rules.
-    Rules,
+    /// The piece lies at an offset the request's one-chunk alignment does not divide.
+    Alignment,
     /// udmabuf made no region's dma-buf.
     Made,
+    /// The pages are several runs of the RAM's files, or one run across two regions.
+    Runs,
 }
 
-impl NoPieces {
+impl NoPiece {
     /// Its number in the trace's `rampiece` event.
     fn code(self) -> u64 {
         match self {
-            NoPieces::NotRam => 1,
-            NoPieces::Rules => 2,
-            NoPieces::Made => 3,
+            NoPiece::NotRam => 1,
+            NoPiece::Alignment => 2,
+            NoPiece::Made => 3,
+            NoPiece::Runs => 4,
         }
     }
 }
 
-/// [`ram_pieces`] in regions of `region` bytes, a power of two of whole pages.
-fn ram_pieces_in(
+/// [`ram_piece`] in regions of `region` bytes, a power of two of whole pages.
+fn ram_piece_in(
     first: u64,
     length: u64,
-    granule: u64,
-    alignment: u64,
     one_chunk_alignment: u64,
     region: u64,
-) -> Option<RegionPieces> {
-    let answer = cut_in_regions(
-        first,
-        length,
-        granule,
-        alignment,
-        one_chunk_alignment,
-        region,
-    );
-    // The trace's `rampiece`: the request's first byte, its length, the pieces answered, and
-    // why none were where none were.
+) -> Option<RegionPiece> {
+    let answer = piece_in_region(first, length, one_chunk_alignment, region);
+    // The trace's `rampiece`: the request's first byte, its length, the pieces answered (1, or 0),
+    // and why none was where none was.
     let (count, why) = match &answer {
-        Ok(pieces) => (pieces.chunks.len().to_u64(), 0),
+        Ok(_) => (1, 0),
         Err(no) => (0, no.code()),
     };
     crate::core::trace::event("rampiece", &[first, length, count, why]);
     answer.ok()
 }
 
-/// The pieces [`ram_pieces_in`] answers, or why there are none.
-fn cut_in_regions(
+/// The piece [`ram_piece_in`] answers, or why there is none.
+fn piece_in_region(
     first: u64,
     length: u64,
-    granule: u64,
-    alignment: u64,
     one_chunk_alignment: u64,
     region: u64,
-) -> Result<RegionPieces, NoPieces> {
+) -> Result<RegionPiece, NoPiece> {
     debug_assert!(region.is_power_of_two() && region.is_multiple_of(vm::page_size()));
-    let pieces = files::guest_ram_pieces(first, length).ok_or(NoPieces::NotRam)?;
-    // Each piece cut where its pages cross into another region: (the RAM's file, the region's
-    // index, the offset in the region, the bytes).
-    let mut cut: Vec<(Arc<OwnedFd>, u64, u64, u64)> = Vec::new();
-    for piece in &pieces {
-        let (mut offset, mut left) = (piece.backing.offset, piece.length);
-        while left > 0 {
-            let into = offset % region;
-            let take = left.min(region - into);
-            cut.push((Arc::clone(&piece.backing.file), offset / region, into, take));
-            offset += take;
-            left -= take;
-        }
+    let pieces = files::guest_ram_pieces(first, length).ok_or(NoPiece::NotRam)?;
+    let [piece] = pieces.as_slice() else {
+        return Err(NoPiece::Runs);
+    };
+    let (offset, bytes) = (piece.backing.offset, piece.length);
+    let (index, into) = (offset / region, offset % region);
+    if bytes != length || into + bytes > region {
+        return Err(NoPiece::Runs);
     }
-    let shape: Vec<(u64, u64)> = cut.iter().map(|&(_, _, into, n)| (into, n)).collect();
-    if !takes(&shape, length, granule, alignment, one_chunk_alignment) {
-        return Err(NoPieces::Rules);
+    if !into.is_multiple_of(one_chunk_alignment.max(1)) {
+        return Err(NoPiece::Alignment);
     }
-    let device = device().map_err(|_| NoPieces::Made)?;
-    let mut uses: Vec<RegionUse> = Vec::new();
-    let mut chunks = Vec::with_capacity(cut.len());
-    for (ram, index, into, bytes) in cut {
-        let key = (Arc::as_ptr(&ram).addr(), region, index);
-        let file = match uses.iter().find(|u| u.key == key) {
-            Some(used) => Arc::clone(&used.file),
-            None => {
-                let used = region_use(device, &ram, index, region).ok_or(NoPieces::Made)?;
-                let file = Arc::clone(&used.file);
-                uses.push(used);
-                file
-            }
-        };
-        chunks.push(DmaBufChunk {
-            file,
-            offset: into,
-            length: bytes,
-        });
-    }
-    Ok(RegionPieces { chunks, uses })
+    let device = device().map_err(|_| NoPiece::Made)?;
+    let used = region_use(device, &piece.backing.file, index, region).ok_or(NoPiece::Made)?;
+    let chunk = DmaBufChunk {
+        file: Arc::clone(&used.file),
+        offset: into,
+        length: bytes,
+    };
+    Ok(RegionPiece {
+        chunk,
+        region: used,
+    })
 }
 
-/// Whether pieces of `shape`, each an offset in its file and a length, in order, answer a request
-/// of `length` bytes at `granule`, `alignment` and `one_chunk_alignment` as the runtime's contract
-/// allows (`metal2vulkan_runtime::DmaBufSource`): one piece at a multiple of
-/// `one_chunk_alignment`, which the runtime binds to a plain buffer, the request's bytes; several,
-/// which it binds to a sparse buffer, each at a multiple of `alignment`, every boundary between two
-/// a multiple of `granule` from the start, and the bytes whole granules, as the runtime binds
-/// several in whole granules and a pad would be a region's other pages.
-fn takes(
-    shape: &[(u64, u64)],
+/// The views' dma-bufs ([`view_piece`]), by the number of the view's record
+/// ([`files::view_of`]), each weakly: the runtime's imports of pieces of it hold it, and so does
+/// each import source that answered with one, which the runtime keeps with the imports it made
+/// (`super::import`'s `host_memory`).
+static VIEW_FILES: Mutex<BTreeMap<u64, ViewFile>> = Mutex::new(BTreeMap::new());
+
+/// A view's dma-buf in [`VIEW_FILES`]: the first byte of the view's runs it holds, their bytes,
+/// and the file.
+#[derive(Debug)]
+struct ViewFile {
+    first: u64,
     length: u64,
-    granule: u64,
-    alignment: u64,
-    one_chunk_alignment: u64,
-) -> bool {
-    let granule = granule.max(1);
-    let alignment = match shape.len() {
-        1 => one_chunk_alignment.max(1),
-        _ => alignment.max(1),
+    file: Weak<OwnedFd>,
+}
+
+/// The piece of its view's dma-buf that holds the `length` bytes from `first` (whole pages), as a
+/// no-copy buffer's or heap's request at `one_chunk_alignment` takes it (module docs, "Views"):
+/// where the bytes lie in the runs of one view ([`files::view_of`]), at their offset in a dma-buf
+/// of all the view's runs that follow on around them, made at the view's first such piece while
+/// none is alive and shared by its `Arc`. `None` where they do not, where those runs are more than
+/// one dma-buf takes (udmabuf's limits as the host has them, at most [`GROUP_BYTES`]), where the
+/// offset is one `one_chunk_alignment` does not divide, or where udmabuf makes none: the request
+/// is answered with a dma-buf of its own then.
+pub(crate) fn view_piece(first: u64, length: u64, one_chunk_alignment: u64) -> Option<DmaBufChunk> {
+    let view = files::view_of(first, length)?;
+    let piece = |at: u64, file: Arc<OwnedFd>, made: u64| {
+        let offset = first - at;
+        // The trace's `viewpiece`: the request's first byte and length, the first byte of the
+        // view's runs the dma-buf holds, and whether it was made for it (1) or joined (0).
+        crate::core::trace::event("viewpiece", &[first, length, at, made]);
+        (offset.is_multiple_of(one_chunk_alignment.max(1))).then_some(DmaBufChunk {
+            file,
+            offset,
+            length,
+        })
     };
-    if shape.is_empty() || !shape.iter().all(|&(at, _)| at.is_multiple_of(alignment)) {
-        return false;
+    let alive =
+        (VIEW_FILES.lock().get(&view)).and_then(|v| Some((v.first, v.length, v.file.upgrade()?)));
+    if let Some((at, bytes, file)) = alive
+        && at <= first
+        && first + length <= at + bytes
+    {
+        return piece(at, file, 0);
     }
-    let total: u64 = shape.iter().map(|&(_, n)| n).sum();
-    if total != length {
-        return false;
+    let limits = limits();
+    let most = usize::try_from(limits.pieces).unwrap_or(usize::MAX);
+    let (at, pieces) = files::view_runs(view, first, most)?;
+    let bytes: u64 = pieces.iter().map(|p| p.length).sum();
+    let fits = pieces.len().to_u64() <= limits.pieces && bytes <= limits.bytes.min(GROUP_BYTES);
+    if !fits || !(first - at).is_multiple_of(one_chunk_alignment.max(1)) {
+        return None;
     }
-    if shape.len() == 1 {
-        return true;
-    }
-    let mut end = 0u64;
-    for &(_, n) in &shape[..shape.len() - 1] {
-        end += n;
-        if !end.is_multiple_of(granule) {
-            return false;
-        }
-    }
-    length.is_multiple_of(granule)
+    let runs: Vec<Run<Arc<OwnedFd>>> = (pieces.into_iter())
+        .map(|p| Run {
+            file: p.backing.file,
+            offset: p.backing.offset,
+            length: p.length,
+        })
+        .collect();
+    let file = Arc::new(create(device().ok()?, &runs).ok()?);
+    let mut files = VIEW_FILES.lock();
+    // The entries of views whose dma-buf went go with this one's entry.
+    files.retain(|_, v| v.file.strong_count() > 0);
+    files.insert(
+        view,
+        ViewFile {
+            first: at,
+            length: bytes,
+            file: Arc::downgrade(&file),
+        },
+    );
+    drop(files);
+    piece(at, file, 1)
 }
 
 /// A use of region `index` of the RAM's file `ram`, `region` bytes from `index * region` (fewer at
@@ -2251,100 +2288,12 @@ mod tests {
         assert!(files.is_empty() && members[0].is_none(), "one view alone");
     }
 
-    /// Pieces of every region's file the way the runtime takes them: one piece at an offset the
-    /// one-chunk alignment divides, whatever the granule and the alignment several take; several
-    /// only each at an offset the alignment divides, with each boundary on the granule and whole
-    /// granules, as a pad would be a region's other pages
-    #[test]
-    fn region_pieces_keep_the_runtimes_rules() {
-        let page = 0x1000;
-        // One piece: any page, where its one-chunk alignment divides its offset.
-        assert!(takes(
-            &[(3 * page, 2 * page)],
-            2 * page,
-            2 * page,
-            page,
-            page
-        ));
-        assert!(!takes(
-            &[(3 * page, 2 * page)],
-            2 * page,
-            2 * page,
-            2 * page,
-            2 * page
-        ));
-        // One piece of a request that would split at 16 pages: the page alone, as a plain buffer
-        // binds it (DmaBufRequest::one_chunk_alignment), not the sparse buffer's 16 pages.
-        assert!(
-            takes(
-                &[(3 * page, 32 * page)],
-                32 * page,
-                16 * page,
-                16 * page,
-                page
-            ),
-            "one piece at the one-chunk alignment"
-        );
-        assert!(
-            !takes(
-                &[(3 * page, 32 * page)],
-                32 * page,
-                16 * page,
-                16 * page,
-                2 * page
-            ),
-            "one piece off the one-chunk alignment"
-        );
-        // Two pieces across a region's end: each at the alignment, the boundary on the granule,
-        // whole granules.
-        let across = [(12 * page, 4 * page), (0, 4 * page)];
-        assert!(takes(&across, 8 * page, 4 * page, 4 * page, page));
-        assert!(
-            !takes(&across, 8 * page, 8 * page, 8 * page, 8 * page),
-            "a granule of its length"
-        );
-        assert!(
-            !takes(
-                &[(13 * page, 4 * page), (0, 4 * page)],
-                8 * page,
-                4 * page,
-                4 * page,
-                page
-            ),
-            "several, one off the alignment, though the one-chunk alignment divides it"
-        );
-        assert!(
-            !takes(
-                &[(12 * page, 4 * page), (0, 3 * page)],
-                7 * page,
-                4 * page,
-                4 * page,
-                page
-            ),
-            "a pad past the bytes"
-        );
-        assert!(
-            !takes(
-                &[(13 * page, 3 * page), (0, 5 * page)],
-                8 * page,
-                4 * page,
-                page,
-                page
-            ),
-            "a boundary off the granule"
-        );
-        assert!(!takes(&[], 0, page, page, page));
-        assert!(
-            !takes(&[(0, page)], 2 * page, page, page, page),
-            "short of the bytes"
-        );
-    }
-
     /// A range of the guest's RAM for a test: a memfd of `pages` pages mapped shared, each page's
-    /// first byte its number, and registered as the guest's RAM while it lives.
+    /// first byte its number (modulo 256), and registered as the guest's RAM while it lives.
     struct TestRam {
         at: u64,
         length: u64,
+        file: Arc<OwnedFd>,
         _registration: files::Registration,
     }
 
@@ -2368,11 +2317,7 @@ mod tests {
             let at = start.addr().to_u64();
             for i in 0..pages {
                 // SAFETY: a page of the mapping above.
-                unsafe {
-                    vm::ptr(at + i * page)
-                        .cast::<u8>()
-                        .write_volatile(u8::try_from(i).unwrap())
-                };
+                unsafe { vm::ptr(at + i * page).cast::<u8>().write_volatile(i as u8) };
             }
             let backing = files::Backing {
                 file: Arc::clone(&file),
@@ -2382,6 +2327,7 @@ mod tests {
             TestRam {
                 at,
                 length,
+                file,
                 _registration: registration,
             }
         }
@@ -2389,6 +2335,99 @@ mod tests {
 
     impl Drop for TestRam {
         fn drop(&mut self) {
+            // SAFETY: the mapping `new` made.
+            unsafe { libc::munmap(vm::ptr(self.at), self.length.to_usize()) };
+        }
+    }
+
+    /// A view of [`TestRam`] pages for a test: its runs, each a RAM, its first page and its
+    /// pages, mapped shared one after another from the RAM's files and registered as showing them
+    /// while it lives, or recorded as one view's runs ([`TestView::recorded`]), as the library's
+    /// views of the guest's pages are.
+    struct TestView {
+        at: u64,
+        length: u64,
+        registrations: Vec<files::Registration>,
+        recorded: bool,
+    }
+
+    impl TestView {
+        fn new(runs: &[(&TestRam, u64, u64)]) -> TestView {
+            TestView::made(runs, false)
+        }
+
+        /// [`TestView::new`], its runs recorded in the backing table at once, one view's
+        /// (`files::record_pieces`), until it drops.
+        fn recorded(runs: &[(&TestRam, u64, u64)]) -> TestView {
+            TestView::made(runs, true)
+        }
+
+        fn made(runs: &[(&TestRam, u64, u64)], recorded: bool) -> TestView {
+            let page = vm::page_size();
+            let length: u64 = runs.iter().map(|&(_, _, n)| n * page).sum();
+            // SAFETY: a fresh reservation, which the runs are mapped over and the view unmaps.
+            let start = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    length.to_usize(),
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(start, libc::MAP_FAILED);
+            let at = start.addr().to_u64();
+            let mut registrations = Vec::new();
+            let mut pieces = Vec::new();
+            let mut to = at;
+            for &(ram, first, n) in runs {
+                // SAFETY: a shared mapping of the RAM's file over the view's own reservation.
+                let mapped = unsafe {
+                    libc::mmap(
+                        vm::ptr(to),
+                        (n * page).to_usize(),
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED | libc::MAP_FIXED,
+                        ram.file.as_raw_fd(),
+                        libc::off_t::try_from(first * page).unwrap(),
+                    )
+                };
+                assert_eq!(mapped.addr().to_u64(), to);
+                let backing = files::Backing {
+                    file: Arc::clone(&ram.file),
+                    offset: first * page,
+                };
+                match recorded {
+                    true => pieces.push(files::Piece {
+                        at: to - at,
+                        length: n * page,
+                        backing,
+                        prot: VmProt::READ | VmProt::WRITE,
+                    }),
+                    false => registrations.push(files::Registration::new(to, n * page, backing)),
+                }
+                to += n * page;
+            }
+            if recorded {
+                files::record_pieces(at, pieces);
+            }
+            TestView {
+                at,
+                length,
+                registrations,
+                recorded,
+            }
+        }
+    }
+
+    impl Drop for TestView {
+        fn drop(&mut self) {
+            // Its registrations, or its runs, go before its pages are unmapped.
+            self.registrations.clear();
+            if self.recorded {
+                files::forget(self.at, self.length);
+            }
             // SAFETY: the mapping `new` made.
             unsafe { libc::munmap(vm::ptr(self.at), self.length.to_usize()) };
         }
@@ -2426,8 +2465,8 @@ mod tests {
         let region = 16 * page;
         let ram = TestRam::new(32);
         let made = || REGIONS_MADE.load(Ordering::Relaxed);
-        let one = ram_pieces_in(ram.at, page, page, page, page, region).unwrap();
-        let file = Arc::clone(&one.chunks[0].file);
+        let one = ram_piece_in(ram.at, page, page, region).unwrap();
+        let file = Arc::clone(&one.chunk.file);
         keep_regions(&d.raw, refs_of(&one));
         if region_of(&file) != Some((1, 1)) {
             eprintln!(
@@ -2439,7 +2478,7 @@ mod tests {
         }
         keep_regions(&d.raw, refs_of(&one));
         assert_eq!(region_of(&file), Some((1, 1)), "kept once a device");
-        let two = ram_pieces_in(ram.at + page, page, page, page, page, region).unwrap();
+        let two = ram_piece_in(ram.at + page, page, page, region).unwrap();
         assert_eq!(region_of(&file), Some((2, 1)));
         drop((one, two));
         assert_eq!(region_of(&file), Some((0, 1)), "kept past its last use");
@@ -2448,9 +2487,9 @@ mod tests {
         assert!(gone.is_empty(), "lingering still");
         assert_eq!(next, Some(since + LINGER_NS));
         let before = made();
-        let three = ram_pieces_in(ram.at + 2 * page, page, page, page, page, region).unwrap();
+        let three = ram_piece_in(ram.at + 2 * page, page, page, region).unwrap();
         assert!(
-            Arc::ptr_eq(&three.chunks[0].file, &file),
+            Arc::ptr_eq(&three.chunk.file, &file),
             "its own dma-buf again"
         );
         assert_eq!(made(), before, "none made");
@@ -2464,16 +2503,16 @@ mod tests {
         drop(file);
         assert!(held.upgrade().is_none(), "the dma-buf went with its keep");
         // A region whose last use went before the object's making returned is not kept.
-        let four = ram_pieces_in(ram.at + 17 * page, page, page, page, page, region).unwrap();
-        let (file, refs) = (Arc::clone(&four.chunks[0].file), refs_of(&four));
+        let four = ram_piece_in(ram.at + 17 * page, page, page, region).unwrap();
+        let (file, refs) = (Arc::clone(&four.chunk.file), refs_of(&four));
         drop(four);
         keep_regions(&d.raw, refs);
         assert_eq!(region_of(&file), Some((0, 0)), "not kept");
     }
 
-    /// The regions `pieces` lie in, weakly ([`RegionUse::region`]).
-    fn refs_of(pieces: &RegionPieces) -> Vec<RegionRef> {
-        pieces.uses.iter().map(RegionUse::region).collect()
+    /// The region `piece` lies in, weakly ([`RegionUse::region`]).
+    fn refs_of(piece: &RegionPiece) -> Vec<RegionRef> {
+        vec![piece.region.region()]
     }
 
     /// Two requests in one region of the guest's RAM are pieces of one file, at their pages'
@@ -2491,143 +2530,266 @@ mod tests {
         let ram = TestRam::new(64);
         let made = || REGIONS_MADE.load(Ordering::Relaxed);
         let before = made();
-        let one = ram_pieces_in(ram.at + 2 * page, 3 * page, 3 * page, page, page, region).unwrap();
-        let two = ram_pieces_in(ram.at + 9 * page, page, page, page, page, region).unwrap();
-        assert_eq!((one.chunks.len(), two.chunks.len()), (1, 1));
-        assert!(
-            Arc::ptr_eq(&one.chunks[0].file, &two.chunks[0].file),
-            "one file"
-        );
-        assert_eq!(
-            (one.chunks[0].offset, one.chunks[0].length),
-            (2 * page, 3 * page)
-        );
-        assert_eq!(
-            (two.chunks[0].offset, two.chunks[0].length),
-            (9 * page, page)
-        );
+        let one = ram_piece_in(ram.at + 2 * page, 3 * page, page, region).unwrap();
+        let two = ram_piece_in(ram.at + 9 * page, page, page, region).unwrap();
+        assert!(Arc::ptr_eq(&one.chunk.file, &two.chunk.file), "one file");
+        assert_eq!((one.chunk.offset, one.chunk.length), (2 * page, 3 * page));
+        assert_eq!((two.chunk.offset, two.chunk.length), (9 * page, page));
         assert_eq!(made() - before, 1, "made once");
         assert_eq!(
-            region_of(&one.chunks[0].file),
+            region_of(&one.chunk.file),
             Some((2, 0)),
             "a use of it each answer, kept nowhere"
         );
         assert_eq!(
-            read_file(&one.chunks[0].file, 2 * page),
+            read_file(&one.chunk.file, 2 * page),
             2,
             "the region's own pages"
         );
-        assert_eq!(read_file(&one.chunks[0].file, 9 * page), 9);
-        let other = ram_pieces_in(ram.at + 17 * page, page, page, page, page, region).unwrap();
+        assert_eq!(read_file(&one.chunk.file, 9 * page), 9);
+        let other = ram_piece_in(ram.at + 17 * page, page, page, region).unwrap();
         assert!(
-            !Arc::ptr_eq(&one.chunks[0].file, &other.chunks[0].file),
+            !Arc::ptr_eq(&one.chunk.file, &other.chunk.file),
             "another region"
         );
-        assert_eq!(other.chunks[0].offset, page);
-        assert_eq!(read_file(&other.chunks[0].file, page), 17);
+        assert_eq!(other.chunk.offset, page);
+        assert_eq!(read_file(&other.chunk.file, page), 17);
         assert_eq!(made() - before, 2);
         // The first region's pieces let go of: its file goes, and the next request makes it again.
-        let held = Arc::downgrade(&one.chunks[0].file);
+        let held = Arc::downgrade(&one.chunk.file);
         drop((one, two));
         assert!(
             held.upgrade().is_none(),
             "the file went with its last piece"
         );
-        let again = ram_pieces_in(ram.at + 4 * page, page, page, page, page, region).unwrap();
+        let again = ram_piece_in(ram.at + 4 * page, page, page, region).unwrap();
         assert_eq!(made() - before, 3, "made again");
-        assert_eq!(read_file(&again.chunks[0].file, 4 * page), 4);
+        assert_eq!(read_file(&again.chunk.file, 4 * page), 4);
         drop((again, other));
     }
 
-    /// A request whose pages cross into the next region takes a piece of each region's file
-    /// where the runtime binds several chunks at a granule the crossing lies on, and none where
-    /// it takes one chunk alone (its granule its length), or the bytes are not whole granules;
-    /// memory of the library's own and an offset the alignment does not divide take none
+    /// A request takes a piece of a region's file only where its pages are one run of the RAM's
+    /// file inside one region, at an offset its one-chunk alignment divides: one whose pages cross
+    /// into the next region or lie in several runs takes none, though each run is whole granules
+    /// at offsets every alignment divides (a piece of each would be bound in a sparse buffer, a
+    /// page-table update each: module docs, "Several pieces"), and nor does memory of the
+    /// library's own. The file's last region is cut at its end
     #[test]
-    fn requests_across_regions_and_off_the_ram() {
+    fn a_region_piece_is_one_run_inside_one_region() {
         if !udmabuf() {
             return;
         }
         let page = vm::page_size();
         let region = 16 * page;
         let ram = TestRam::new(64);
-        let across = ram_pieces_in(
-            ram.at + 12 * page,
-            8 * page,
-            4 * page,
-            4 * page,
-            4 * page,
-            region,
-        );
-        let across = across.expect("a piece of each region");
-        assert_eq!(
-            (across.chunks.len(), across.uses.len()),
-            (2, 2),
-            "a use of each"
-        );
-        assert_eq!(
-            (across.chunks[0].offset, across.chunks[0].length),
-            (12 * page, 4 * page)
-        );
-        assert_eq!(
-            (across.chunks[1].offset, across.chunks[1].length),
-            (0, 4 * page)
-        );
-        assert!(!Arc::ptr_eq(&across.chunks[0].file, &across.chunks[1].file));
-        assert_eq!(read_file(&across.chunks[1].file, 3 * page), 19);
-        assert!(
-            ram_pieces_in(ram.at + 12 * page, 8 * page, 8 * page, page, page, region).is_none(),
-            "one chunk alone"
-        );
-        assert!(
-            ram_pieces_in(
-                ram.at + 12 * page,
-                7 * page,
-                4 * page,
-                4 * page,
-                4 * page,
-                region
-            )
-            .is_none(),
-            "a pad past the bytes"
-        );
-        assert!(
-            ram_pieces_in(ram.at + 2 * page, page, page, 4 * page, 4 * page, region).is_none(),
-            "off the alignment"
-        );
-        // One piece of a request that would split at 4 pages, at 2 pages into its region: taken
-        // where the one-chunk alignment, a plain buffer's, divides its offset.
-        let lone = ram_pieces_in(
-            ram.at + 2 * page,
-            8 * page,
-            4 * page,
-            4 * page,
-            page,
-            region,
-        );
-        let lone = lone.expect("one piece at the one-chunk alignment");
-        assert_eq!(
-            (
-                lone.chunks.len(),
-                lone.chunks[0].offset,
-                lone.chunks[0].length
-            ),
-            (1, 2 * page, 8 * page)
-        );
+        let lone = ram_piece_in(ram.at + 2 * page, 8 * page, page, region);
+        let lone = lone.expect("one run inside one region");
+        assert_eq!((lone.chunk.offset, lone.chunk.length), (2 * page, 8 * page));
+        assert_eq!(read_file(&lone.chunk.file, 9 * page), 9);
         drop(lone);
+        assert!(
+            ram_piece_in(ram.at + 2 * page, page, 4 * page, region).is_none(),
+            "off the one-chunk alignment"
+        );
+        assert!(
+            ram_piece_in(ram.at + 12 * page, 8 * page, page, region).is_none(),
+            "one run across a region's end"
+        );
+        let view = TestView::new(&[(&ram, 8, 4), (&ram, 0, 4)]);
+        assert!(
+            ram_piece_in(view.at, 8 * page, page, region).is_none(),
+            "two runs inside one region"
+        );
+        drop(view);
         let own = vm::allocate_aliasable(4 * page).unwrap().addr().to_u64();
         assert!(
-            ram_pieces_in(own, page, page, page, page, region).is_none(),
+            ram_piece_in(own, page, page, region).is_none(),
             "memory of the library's own"
         );
         // The file's last region is cut at its end: 24 pages in regions of 16.
         let short = TestRam::new(24);
-        let tail =
-            ram_pieces_in(short.at + 18 * page, 2 * page, 2 * page, page, page, region).unwrap();
-        assert_eq!(tail.chunks[0].offset, 2 * page);
+        let tail = ram_piece_in(short.at + 18 * page, 2 * page, page, region).unwrap();
+        assert_eq!(tail.chunk.offset, 2 * page);
         // SAFETY: a dma-buf answers `SEEK_END` with its size.
-        let bytes = unsafe { libc::lseek(tail.chunks[0].file.as_raw_fd(), 0, libc::SEEK_END) };
+        let bytes = unsafe { libc::lseek(tail.chunk.file.as_raw_fd(), 0, libc::SEEK_END) };
         assert_eq!(u64::try_from(bytes).unwrap(), 8 * page);
-        assert_eq!(read_file(&tail.chunks[0].file, 3 * page), 19);
+        assert_eq!(read_file(&tail.chunk.file, 3 * page), 19);
+    }
+
+    /// A buffer's or heap's pages in several runs, of one file or of several, take one dma-buf of
+    /// their own, one list of their runs (`UDMABUF_CREATE_LIST` takes runs of several memfds) at
+    /// offset 0, whatever the granule a split would take, which shows the pages in their order:
+    /// the runtime binds a plain buffer to it, with no sparse binding. So does one run across a
+    /// region's end (module docs, "Regions")
+    #[test]
+    fn pages_in_several_runs_take_one_dma_buf_of_their_own() {
+        if !udmabuf() {
+            return;
+        }
+        let page = vm::page_size();
+        let ram = TestRam::new(32);
+        let other = TestRam::new(8);
+        let view = TestView::new(&[(&ram, 16, 16), (&ram, 0, 16), (&other, 3, 2)]);
+        let length = 34 * page;
+        let (chunks, runs) = of_pages_counted(view.at, length, 16 * page).unwrap();
+        assert_eq!(
+            (chunks.len(), runs),
+            (1, 3),
+            "one dma-buf of the three runs"
+        );
+        assert_eq!((chunks[0].offset, chunks[0].length), (0, length));
+        assert_eq!(
+            Arc::strong_count(&chunks[0].file),
+            1,
+            "a dma-buf of its own"
+        );
+        let shown: Vec<u8> = [0, 15, 16, 31, 32, 33]
+            .iter()
+            .map(|&i| read_through(&chunks[0], i * page))
+            .collect();
+        assert_eq!(
+            shown,
+            [16, 31, 0, 15, 3, 4],
+            "the pages in the view's order"
+        );
+        drop(view);
+        let (across, runs) = of_pages_counted(ram.at + 12 * page, 8 * page, 4 * page).unwrap();
+        assert_eq!(
+            (across.len(), runs),
+            (1, 1),
+            "one run across a region's end"
+        );
+        assert_eq!(read_through(&across[0], 7 * page), 19);
+    }
+
+    /// Requests in one view's runs take pieces of one dma-buf of the view's runs, made at the
+    /// first and shared by its `Arc` while one lives, each at its offset in the view and showing
+    /// its pages in the view's order; one made again once none lives. A run recorded over part of
+    /// the view leaves its other runs' requests to the dma-buf alive, and to one of the runs
+    /// around them once none is. A piece at an offset its alignment does not divide, or a request
+    /// past the view's runs, takes none (module docs, "Views")
+    #[test]
+    fn pages_in_one_views_runs_share_its_dma_buf() {
+        if !udmabuf() {
+            return;
+        }
+        let page = vm::page_size();
+        let ram = TestRam::new(32);
+        let other = TestRam::new(4);
+        let view = TestView::recorded(&[(&ram, 16, 16), (&ram, 0, 16)]);
+        let made = || MADE.load(Ordering::Relaxed);
+        let before = made();
+        let whole = view_piece(view.at, 32 * page, page).expect("the whole view");
+        assert_eq!((whole.offset, whole.length), (0, 32 * page));
+        assert_eq!(made() - before, 1, "the view's dma-buf made");
+        let part = view_piece(view.at + 8 * page, 16 * page, page).expect("a part across its runs");
+        assert!(Arc::ptr_eq(&whole.file, &part.file), "the same file");
+        assert_eq!((part.offset, part.length), (8 * page, 16 * page));
+        assert_eq!(made() - before, 1, "none made for the part");
+        let shown: Vec<u8> = [0, 7, 8, 15]
+            .iter()
+            .map(|&i| read_file(&part.file, part.offset + i * page))
+            .collect();
+        assert_eq!(
+            shown,
+            [24, 31, 0, 7],
+            "the part's pages in the view's order"
+        );
+        assert!(
+            view_piece(view.at + page, page, 2 * page).is_none(),
+            "off its alignment"
+        );
+        assert!(
+            view_piece(view.at + 31 * page, 2 * page, page).is_none(),
+            "past the view"
+        );
+        drop((whole, part));
+        let again = view_piece(view.at + page, 2 * page, page).expect("made again");
+        assert_eq!((again.offset, made() - before), (page, 2));
+        // A run of another record over the view's fifth page.
+        let over = files::Backing {
+            file: Arc::clone(&other.file),
+            offset: 0,
+        };
+        files::record(view.at + 4 * page, page, over, VmProt::READ | VmProt::WRITE);
+        assert!(
+            view_piece(view.at, 8 * page, page).is_none(),
+            "across the run over it"
+        );
+        let after = view_piece(view.at + 5 * page, 4 * page, page).expect("after the run");
+        assert!(Arc::ptr_eq(&again.file, &after.file), "the file alive");
+        assert_eq!(
+            read_file(&after.file, after.offset),
+            21,
+            "the view's sixth page"
+        );
+        drop((again, after));
+        let around = view_piece(view.at + 5 * page, 4 * page, page).expect("its runs around");
+        assert_eq!(
+            (around.offset, made() - before),
+            (0, 3),
+            "the runs from the sixth page"
+        );
+        let shown: Vec<u8> = [0, 10, 11, 26]
+            .iter()
+            .map(|&i| read_file(&around.file, i * page))
+            .collect();
+        assert_eq!(shown, [21, 31, 0, 15], "the view's pages from its sixth");
+    }
+
+    /// A view of more runs than one dma-buf takes (udmabuf's `list_limit` as the host has it)
+    /// gives no piece of a dma-buf of its own: its requests take dma-bufs of their own. Where
+    /// the limits take more runs than the test makes, it says so and checks nothing
+    #[test]
+    fn a_view_past_one_dma_buf_gives_no_piece() {
+        if !udmabuf() {
+            return;
+        }
+        let page = vm::page_size();
+        let limits = limits();
+        let n = limits.pieces + 1;
+        if n > 4096 || n * page > limits.bytes.min(GROUP_BYTES) {
+            eprintln!(
+                "skipped: udmabuf takes {} runs of {:#x} bytes",
+                limits.pieces, limits.bytes
+            );
+            return;
+        }
+        let ram = TestRam::new(2 * n);
+        let runs: Vec<(&TestRam, u64, u64)> = (0..n).map(|i| (&ram, 2 * i, 1)).collect();
+        let view = TestView::recorded(&runs);
+        assert!(view_piece(view.at, 2 * page, page).is_none());
+    }
+
+    /// A buffer's or heap's pages in more runs than one dma-buf takes (udmabuf's `list_limit` as
+    /// the host has it) take chunks, the fewest within the limits, each a dma-buf of its own: the
+    /// only requests the runtime binds in several chunks. Where the limits take more runs than the
+    /// test makes, it says so and checks nothing
+    #[test]
+    fn pages_past_the_list_limit_take_chunks() {
+        if !udmabuf() {
+            return;
+        }
+        let page = vm::page_size();
+        let limits = limits();
+        let n = limits.pieces + 1;
+        if n > 4096 || n * page > limits.bytes {
+            eprintln!(
+                "skipped: udmabuf takes {} runs of {:#x} bytes",
+                limits.pieces, limits.bytes
+            );
+            return;
+        }
+        let ram = TestRam::new(2 * n);
+        let runs: Vec<(&TestRam, u64, u64)> = (0..n).map(|i| (&ram, 2 * i, 1)).collect();
+        let view = TestView::new(&runs);
+        let (chunks, made) = of_pages_counted(view.at, n * page, page).unwrap();
+        assert_eq!((chunks.len(), made), (2, n), "two chunks");
+        assert_eq!(
+            (chunks[0].length, chunks[1].length),
+            (limits.pieces * page, page)
+        );
+        assert!(chunks.iter().all(|c| c.offset == 0));
+        assert_eq!(read_through(&chunks[1], 0), (2 * (n - 1)) as u8);
     }
 }
