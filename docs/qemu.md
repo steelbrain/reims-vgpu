@@ -145,11 +145,12 @@ virtio device (`d151bcd9`, upstream's `b501f21312`).
 | on Windows, shared RAM (`memory-backend-ram,share=on`, any RAM_SHARED block) is a view of a section the paging file backs, whose handle the RAMBlock keeps (`qemu_ram_get_section`); `qemu_win32_map_alloc` passes a size's high 32 bits ("Windows hosts: guest RAM in a section", below) | `6c2cae16` |
 | `reims-graphics-pci` on Windows: meson looks for the library there too, the memory walk passes each range of RAM that is a view of a section with the section's handle and the range's offset in it, and the control ring's doorbell is the EventNotifier's event | `a86885f8` |
 | the `dsound` audiodev plays where Windows has no recording device: its capture object is optional, where realize failed without one and QEMU exited ("Could not initialize DirectSoundCapture"); an input voice then fails to initialize, and reims-ctl gives such a host's input device a `none` audiodev of its own ("Windows hosts: sound", below) | `e435673c` |
-| WHPX on a host that is not Intel's intercepts the #GP of an MSR access (`intercept-msr-gp`, on by default there), and keeps an Intel guest's IA32_SYSENTER_ESP and _EIP at 64 bits, giving Hyper-V their low 32, and its MISC_ENABLE, FEATURE_CONTROL and PLATFORM_INFO, which Hyper-V on AMD answers with #GP: macOS panicked on the first two at boot ("Windows hosts", below) | `40257041` |
+| WHPX on a host that is not Intel's intercepts the #GP of an MSR access (`intercept-msr-gp`, on by default there): an Intel guest's write of a 64-bit IA32_SYSENTER_ESP or _EIP gives Hyper-V the low 32 bits (QEMU's CPU state keeps all 64 until the vCPU's next full register read, and a read Hyper-V answers itself gives the low 32), and QEMU answers MISC_ENABLE, FEATURE_CONTROL and PLATFORM_INFO, which Hyper-V on AMD answers with #GP: macOS panicked on the first two at boot ("Windows hosts", below) | `40257041` |
+| WHPX offers the guest no TSC deadline timer where Hyper-V refuses its register (`WHvX64RegisterTscDeadline`), asked of a vCPU made for the question at init: the CPU model's `tsc-deadline` is filtered out as a feature the host lacks, and a macOS guest arms the local APIC's timer ("Windows hosts", below) | `c3704402` |
 
 The branch's other commits are the apple-gfx work `96e1b470` removes, and
 `cfaadbfa09`, an HVF workaround that `478c28ff70` reverts, upstream having
-fixed the same assertion, and `2c9e6ed5` and `fa464041`, which correct
+fixed the same assertion, and `2c9e6ed5`, `fa464041` and `f56d36ff`, which correct
 comments and the machine's guide. `docs/system/arm/vmapple.rst` describes the
 machine and how to run it on Ambrosia.
 
@@ -920,20 +921,29 @@ the library and `ninja -j12 qemu-system-x86_64.exe` 293 s, beside SDL
   does there that AMD's CPU does not, and macOS stopped at the Apple logo
   with no progress bar (**measured** 2026-11-16, Tahoe's recovery, Darwin
   25.6.0, on reims-ctl's Skylake-Client-noTSX-IBRS):
-  - the TSC deadline timer: QEMU's every register sync logs
+  - the TSC deadline timer: the reset of each vCPU logs
     `WHPX: Failed to set register 00002095, hr=c0350005`
-    (`WHvX64RegisterTscDeadline`), and the guest's kernel, which takes the
-    timer where CPUID offers it, waits for interrupts that never come. The
-    VM's CPU flags drop it (`-tsc-deadline` in `vm.toml`'s `cpu_flags`), and
-    the kernel takes the local APIC's timer; reims-ctl does not do so yet.
+    (`WHvX64RegisterTscDeadline`, which only the reset sets), while
+    Hyper-V's CPUID offers the timer, and the guest's kernel, which takes
+    the timer where CPUID offers it, waits for interrupts that never come.
+    With `-tsc-deadline` in `vm.toml`'s `cpu_flags` the kernel took the
+    local APIC's timer. From `c3704402` WHPX asks Hyper-V for the register
+    at its init and, where it is refused, offers no TSC deadline timer, so
+    the CPU model's `tsc-deadline` is dropped with `check`'s warning
+    (`host doesn't support requested feature: CPUID[eax=01h].ECX.tsc-deadline
+    [bit 24]`) and no flag is needed (read from code; no AMD host has run
+    it). The Mac mini 2018's Hyper-V takes the register, and its guests keep
+    the timer (**measured** 2026-11-16: a macOS 26.7.2 boot on `c3704402`
+    lists `TSCTMR` in `machdep.cpu.features`, and QEMU logs no refusal).
   - the kernel's `wrmsr` of a 64-bit address to IA32_SYSENTER_EIP (0x176:
     AMD's SYSENTER MSRs hold 32 bits), then its `rdmsr` of IA32_MISC_ENABLE
     (0x1a0, in `commpage_post_ucode_update`): "Kernel trap ... type =
     13=general protection" each time, before the console was up, read from
     the stack over QMP with `debug=0x100` in the boot-args. From `40257041`
     WHPX intercepts such a #GP by default on a host that is not Intel's
-    (`intercept-msr-gp`) and keeps those MSRs as KVM keeps them for an
-    Intel guest on AMD. The guest then reached Recovery, installed 26 and
+    (`intercept-msr-gp`): Hyper-V gets the SYSENTER MSRs' low 32 bits, and
+    QEMU answers MISC_ENABLE (the table above). The guest then reached
+    Recovery, installed 26 and
     reached Setup Assistant. A further MSR Hyper-V refuses shows as
     `WHPX: unknown msr 0x...` in the QEMU log.
 
