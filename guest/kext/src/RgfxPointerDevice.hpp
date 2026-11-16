@@ -48,6 +48,16 @@ public:
 	OSNumber *newProductIDNumber() const override;
 	OSNumber *newPrimaryUsageNumber() const override;
 	OSNumber *newPrimaryUsagePageNumber() const override;
+#if defined(__arm64e__)
+	// Its HID transport, "Virtual" (kIOHIDTransportVirtualValue), on arm64 alone. There display
+	// 0's framebuffer, its provider, carries IOMobileFramebuffer's own "Transport", a dictionary
+	// (ReimsGraphicsMobile.cpp), which a lookup of the mouse's transport through its parents finds
+	// where the mouse names none: macOS 26.6.2's ReportIntervalServiceFilter took it for a string,
+	// and WindowServer died of the exception at each start, so no desktop came (lane a64ptr,
+	// potluck job m3-max-35949). The x86-64 kext's framebuffer has no "Transport", so its mouse
+	// names none, as before.
+	OSString *newTransportString() const override;
+#endif
 
 	// IOHIDDevice's own methods that an older release's IOHIDDevice does not define, each called
 	// through IOHIDDevice's vtable (above). willTerminate and didTerminate are IOService's slots:

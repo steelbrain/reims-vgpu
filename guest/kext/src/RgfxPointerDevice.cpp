@@ -5,6 +5,7 @@
 #include "RgfxPointerDevice.hpp"
 
 #include <IOKit/IOLib.h>
+#include <IOKit/hid/IOHIDKeys.h>
 #include <IOKit/hid/IOHIDUsageTables.h>
 
 OSDefineMetaClassAndFinalStructors(RgfxPointerDevice, IOHIDDevice);
@@ -83,6 +84,13 @@ OSNumber *RgfxPointerDevice::newPrimaryUsagePageNumber() const
 {
 	return OSNumber::withNumber(static_cast<unsigned long long>(kHIDPage_GenericDesktop), 32);
 }
+
+#if defined(__arm64e__)
+OSString *RgfxPointerDevice::newTransportString() const
+{
+	return OSString::withCString(kIOHIDTransportVirtualValue);
+}
+#endif
 
 bool RgfxPointerDevice::willTerminate(IOService *provider, IOOptionBits options)
 {
