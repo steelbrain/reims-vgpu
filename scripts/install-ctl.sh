@@ -463,6 +463,17 @@ if [[ $WINDOWS == 1 ]]; then
   export RUSTUP_TOOLCHAIN="$CHANNEL-x86_64-pc-windows-gnullvm"
   rustup toolchain install --profile minimal "$RUSTUP_TOOLCHAIN" ||
     die "rustup could not install $RUSTUP_TOOLCHAIN, the toolchain the build runs on Windows"
+  # Every C and C++ build below runs CLANG64's clang and llvm-ar, whatever
+  # compiler the environment names. A user's CC named Visual Studio's cl.exe:
+  # cc-rs gave SDL3's CMake build (sdl3-sys, through the cmake crate) MSVC's C
+  # flags, and CMake, which reads CC itself, took cl.exe, whose test compile
+  # failed. cc-rs takes CC_<target> before HOST_CC and CC; CMake, QEMU's
+  # configure and meson read CC, CXX and AR; the cmake crate takes
+  # CMAKE_GENERATOR_<target> before CMAKE_GENERATOR, and chooses MSYS Makefiles
+  # itself where neither is set. CLANG64's ar is llvm-ar.
+  export CC=clang CXX=clang++ AR=llvm-ar CMAKE_GENERATOR="MSYS Makefiles"
+  export CC_x86_64_pc_windows_gnullvm=clang CXX_x86_64_pc_windows_gnullvm=clang++ \
+    AR_x86_64_pc_windows_gnullvm=llvm-ar CMAKE_GENERATOR_x86_64_pc_windows_gnullvm="MSYS Makefiles"
 fi
 
 # ------------------------------------------------------------------ sources
