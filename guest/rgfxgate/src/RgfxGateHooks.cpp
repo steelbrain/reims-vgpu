@@ -144,9 +144,10 @@ static int wrapSandboxMmap(void *cred, void *fg, void *label, int prot, int flag
 // Sandbox policy through mac_syscall(2), call 2. macOS 27 answers "not trusted" for the bundle
 // on the BaseSystem's tmpfs Data volume, so WindowServer finds no Metal device and FileVault's
 // unlock screen is never drawn; 14, 15 and 26 answer "trusted" for the same tagged file. While
-// the BaseSystem is the root (gBaseSystemRoot), this hook answers "trusted" for exactly that
-// query on a path under our bundle, and passes every other call, and every call on a full
-// system, to the Sandbox policy's own handler. arg is a user address: eight words, with the
+// the BaseSystem is the root (gBaseSystemRoot, which each install pass clears and the
+// BaseSystem's pass sets), this hook answers "trusted" for exactly that query on a path under
+// our bundle, and passes every other call, and every call once the full system's pass has run,
+// to the Sandbox policy's own handler. arg is a user address: eight words, with the
 // answer's address at +0, the operation string's at +0x10, the subject selector at +0x18 (1 for
 // a path), the path's at +0x20 and the storage class's at +0x38 (rgfx_match.h). A failed copy
 // passes the call on rather than answering.

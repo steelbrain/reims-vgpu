@@ -596,6 +596,12 @@ static constexpr bool kInstallsInBaseSystem = false;
 #endif
 
 static void doInstall() {
+#if defined(__arm64e__)
+	// Each pass starts with the trust answer off and turns it on only on the BaseSystem (below):
+	// the pass the watch runs once FileVault's unlock has moved the boot to the full system, with
+	// the kernel and this kext still loaded, leaves the Sandbox policy's own answer standing there.
+	gBaseSystemRoot = false;
+#endif
 	vfs_context_t ctx = vfs_context_create(nullptr);
 	if (ctx == nullptr) {
 		recordInstallState("refused", "no VFS context for the install");
@@ -633,7 +639,7 @@ static void doInstall() {
 		graft_client_log(kClientID, "BaseSystem: the bundle goes into its temporary Data volume");
 #if defined(__arm64e__)
 		// The Sandbox policy_syscall hook answers the rootless trust query only
-		// here, on the BaseSystem; a normal full-system boot leaves it chained.
+		// here, on the BaseSystem; a full system's pass leaves it chained.
 		gBaseSystemRoot = true;
 #endif
 	}

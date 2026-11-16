@@ -5899,9 +5899,11 @@ registers only once its bundle is on disk:
     while the root is the BaseSystem, answers yes for exactly that query on a
     path under the bundle; every other call, and every call on a full system,
     goes to the Sandbox policy's own handler (`wrapSandboxPolicySyscall`,
-    `rgfx_rootless_trust_ours`). With it the 27.2.1 unlock screen draws and
-    the password unlocks (m3-max-35954, on a development build of Graft with
-    the same route).
+    `rgfx_rootless_trust_ours`). Each install pass clears the answer and only
+    the BaseSystem's pass sets it, so the full system's pass after the unlock
+    hands the query back to the Sandbox policy. With it the 27.2.1 unlock
+    screen draws and the password unlocks (m3-max-35954, on a development
+    build of Graft with the same route).
   - After that pass RgfxGate watches the Data volume (the file system of
     `/Library/Preferences`, every 100 ms) and passes again on each one the boot
     moves to without restarting the kernel: the full system's, once the
