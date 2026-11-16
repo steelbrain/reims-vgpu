@@ -200,6 +200,32 @@ if [[ $UPDATE == 1 ]]; then
   fi
 fi
 
+# ------------------------------------------------------------------ line ends
+
+# rewrite_crlf: writes each text file of the checkout whose working copy differs
+# from its commit only in CRLF line ends out again from the commit. Git for
+# Windows' installer sets core.autocrlf=true, and a checkout it made before the
+# repository had .gitattributes holds every text file so, while the build reads
+# some of them byte for byte (.gitattributes). git keeps such a file as it is:
+# .gitattributes has it compare the file as LF, so it finds nothing to write,
+# and a pull leaves each file the pull does not change as it was (measured: a
+# clone at core.autocrlf=true moved to the commit that added .gitattributes
+# kept all 1730 text files CRLF). A file with changes of its own is kept.
+rewrite_crlf() {
+  local crlf own redo
+  crlf="$(git -C "$ROOT" -c core.quotePath=false ls-files --eol |
+    awk -F '\t' '$1 ~ /^i\/lf +w\/(crlf|mixed) / { print $2 }')"
+  [[ -n $crlf ]] || return 0
+  own="$(git -C "$ROOT" -c core.quotePath=false diff --name-only)"
+  redo="$(grep -vxF -f <(printf '%s\n' "$own") <<<"$crlf" || true)"
+  [[ -n $redo ]] || return 0
+  say "Writing $(wc -l <<<"$redo" | tr -d ' ') text files out again with the LF line ends they were committed with"
+  (cd "$ROOT" && tr '\n' '\0' <<<"$redo" | xargs -0 rm -f && git checkout-index -u --stdin <<<"$redo")
+}
+if [[ $WINDOWS == 1 ]]; then
+  rewrite_crlf || die "could not write the checkout's CRLF text files out again from its commit"
+fi
+
 # ------------------------------------------------------------------ dependencies
 
 missing=()
