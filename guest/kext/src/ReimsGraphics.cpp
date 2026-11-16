@@ -25,6 +25,7 @@
 #include <libkern/libkern.h>
 #include <libkern/OSKextLib.h>
 
+#include "RgfxAccelTypes.hpp"
 #include "RgfxDisplayIdentity.hpp"
 #include "RgfxTrace.hpp"
 
@@ -233,10 +234,13 @@ volatile UInt8 *ReimsGraphics::ring(UInt32 offset) const
 }
 
 // Puts one command on ring 0 if it fits, without blocking: callable with a
-// spin lock held. The doorbell rings only when the host's consumer sleeps.
+// spin lock held. The doorbell rings only when the host's consumer sleeps. A head's
+// commands go on display 0's ring, as do all of the ring's calls below.
 bool ReimsGraphics::tryPost(UInt32 type, const void *message, UInt32 size, UInt64 *seqno,
                             UInt64 *waiterSeqno)
 {
+	if (isHead())
+		return device->tryPost(type, message, size, seqno, waiterSeqno);
 	if (size < kHeaderBytes || size % kMsgAlign || size > kLifecycleMessageMax || !ready)
 		return false;
 	IOSimpleLockLock(submitLock);
@@ -303,6 +307,8 @@ void ReimsGraphics::ringControl()
 IOReturn ReimsGraphics::post(UInt32 type, const void *message, UInt32 size, UInt64 *seqno,
                              UInt64 *waiterSeqno)
 {
+	if (isHead())
+		return device->post(type, message, size, seqno, waiterSeqno);
 	if (size < kHeaderBytes || size % kMsgAlign || size > kLifecycleMessageMax)
 		return kIOReturnBadArgument;
 	uint64_t deadline = 0;
@@ -327,11 +333,13 @@ IOReturn ReimsGraphics::post(UInt32 type, const void *message, UInt32 size, UInt
 
 UInt64 ReimsGraphics::roomMark() const
 {
-	return rgfxRingRoomMark(room);
+	return rgfxRingRoomMark(isHead() ? device->room : room);
 }
 
 bool ReimsGraphics::askForRoom()
 {
+	if (isHead())
+		return device->askForRoom();
 	if (!submitRoom)
 		return false;
 	store32(ring(RGFX_CONTROL_SUBMIT_OFFSET) + kRingProducerWaiting, 1);
@@ -341,6 +349,8 @@ bool ReimsGraphics::askForRoom()
 
 bool ReimsGraphics::waitForRoom(UInt64 mark, uint64_t deadline)
 {
+	if (isHead())
+		return device->waitForRoom(mark, deadline);
 	uint64_t backstop = 0;
 	nanoseconds_to_absolutetime(static_cast<uint64_t>(rgfxRingRoomBackstopUs(submitRoom)) * 1000,
 	                            &backstop);
@@ -374,6 +384,8 @@ bool ReimsGraphics::waitForRoom(UInt64 mark, uint64_t deadline)
 // work loop hands over: thread context only, never on the work loop.
 IOReturn ReimsGraphics::command(UInt32 type, const void *message, UInt32 size)
 {
+	if (isHead())
+		return device->command(type, message, size);
 	uint64_t deadline = 0;
 	clock_interval_to_deadline(kAnswerTimeoutMs, kMillisecondScale, &deadline);
 	// Take a waiter first, so the answer finds this thread by seqno once the message is on the
@@ -622,6 +634,10 @@ void ReimsGraphics::seedSharedPipelines()
 
 void ReimsGraphics::kickWorkLoop()
 {
+	if (isHead()) {
+		device->kickWorkLoop();
+		return;
+	}
 	if (kick)
 		kick->interruptOccurred(nullptr, nullptr, 0);
 }
@@ -721,11 +737,18 @@ IOReturn ReimsGraphics::wranglerMessage(void *target, void *, UInt32 type, IOSer
 	return kIOReturnSuccess;
 }
 
+// The wrangler's power is every display's: display 0's framebuffer sets each head's panel too.
 bool ReimsGraphics::wantPanel(bool lit)
 {
 	IOSimpleLockLock(interruptLock);
-	const bool changed = panelWanted != lit;
+	bool changed = panelWanted != lit;
 	panelWanted = lit;
+	for (UInt32 i = 1; i < RGFX_DISPLAYS_MAX; i++) {
+		if (ReimsGraphics *head = heads[i]) {
+			changed = changed || head->panelWanted != lit;
+			head->panelWanted = lit;
+		}
+	}
 	IOSimpleLockUnlock(interruptLock);
 	if (changed)
 		kickWorkLoop();
@@ -768,37 +791,85 @@ void ReimsGraphics::service()
 		queues->release();
 	}
 
+	// Each display's, display 0's first.
+	ReimsGraphics *fbs[RGFX_DISPLAYS_MAX];
+	const UInt32 n = copyDisplays(fbs);
+	for (UInt32 i = 0; i < n; i++)
+		serviceDisplay(fbs[i]);
+	releaseDisplays(fbs, n);
+	if (refreshes.wanted()) {
+		UInt64 seqno = 0;
+		RgfxGetDisplays getDisplays = {};
+		if (tryPost(RGFX_CMD_GET_DISPLAYS, &getDisplays, sizeof(getDisplays), &seqno))
+			refreshes.posted(seqno);
+	}
+}
+
+void ReimsGraphics::serviceDisplay(ReimsGraphics *fb)
+{
 	IOSimpleLockLock(interruptLock);
 	Interrupt late = {};
-	if (displayChange.armed(connect.enabled && connect.proc))
-		late = connect;
-	bool want = vblankWanted || pipes.anyVblank();
-	const bool panel = panelWanted;
+	if (fb->displayChange.armed(fb->connect.enabled && fb->connect.proc))
+		late = fb->connect;
+	bool want = fb->vblankWanted || fb->pipes.anyVblank();
+	const bool panel = fb->panelWanted;
 	IOSimpleLockUnlock(interruptLock);
 	if (late.proc)
 		late.proc(late.target, late.ref);
-	if (want != vblankSent) {
+	if (want != fb->vblankSent) {
 		RgfxSetVblank v = {};
-		v.display = displayId;
+		v.display = fb->displayId;
 		v.enabled = want ? 1u : 0u;
 		if (tryPost(RGFX_CMD_SET_VBLANK, &v, sizeof(v), nullptr))
-			vblankSent = want;
+			fb->vblankSent = want;
 	}
-	if (rgfxPanelToSend(displayPowerTaken, panel, panelTold)) {
+	if (rgfxPanelToSend(displayPowerTaken, panel, fb->panelTold)) {
 		RgfxSetDisplayPower p = {};
-		p.display = displayId;
+		p.display = fb->displayId;
 		p.on = panel ? 1u : 0u;
 		if (tryPost(RGFX_CMD_SET_DISPLAY_POWER, &p, sizeof(p), nullptr))
-			panelTold = panel;
+			fb->panelTold = panel;
 	}
-	if (refreshWanted) {
-		UInt64 seqno = 0;
-		RgfxGetDisplays getDisplays = {};
-		if (tryPost(RGFX_CMD_GET_DISPLAYS, &getDisplays, sizeof(getDisplays), &seqno)) {
-			refreshWanted = false;
-			refreshSeqno = seqno;
+}
+
+UInt32 ReimsGraphics::copyDisplays(ReimsGraphics **out)
+{
+	UInt32 n = 0;
+	retain();
+	out[n++] = this;
+	IOSimpleLockLock(interruptLock);
+	for (UInt32 i = 1; i < RGFX_DISPLAYS_MAX; i++) {
+		if (ReimsGraphics *head = heads[i]) {
+			head->retain();
+			out[n++] = head;
 		}
 	}
+	IOSimpleLockUnlock(interruptLock);
+	return n;
+}
+
+void ReimsGraphics::releaseDisplays(ReimsGraphics **fbs, UInt32 n)
+{
+	for (UInt32 i = 0; i < n; i++)
+		fbs[i]->release();
+}
+
+ReimsGraphics *ReimsGraphics::copyDisplay(UInt32 display)
+{
+	if (isHead())
+		return device->copyDisplay(display);
+	if (display == 0) {
+		retain();
+		return this;
+	}
+	if (display >= RGFX_DISPLAYS_MAX || !interruptLock)
+		return nullptr;
+	IOSimpleLockLock(interruptLock);
+	ReimsGraphics *head = heads[display];
+	if (head)
+		head->retain();
+	IOSimpleLockUnlock(interruptLock);
+	return head;
 }
 
 // The completion ring drained, then its interrupt armed and the ring looked at again, so an event
@@ -906,7 +977,6 @@ void ReimsGraphics::drainEvents(UInt64 end)
 
 void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 *payload, UInt32 size)
 {
-	Interrupt fire = {};
 	switch (type) {
 	case RGFX_EVT_COMPLETE: {
 		if (answerLifecycle(type, seqno, payload, size))
@@ -926,21 +996,28 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 				return;
 		}
 		answer(seqno, status);
-		// Every pipe client: the one whose transaction this answers takes it, at the time of
-		// the refresh the host answered in.
-		UInt64 shown = clockAbsolute(vblankClock.shownAt(clockNs(mach_absolute_time())));
-		OSObject *clients[kMaxPipeClients];
-		IOSimpleLockLock(interruptLock);
-		UInt32 n = pipes.all(clients);
-		PipePresentHook hook = pipePresentHook;
-		for (UInt32 i = 0; i < n; i++)
-			clients[i]->retain();
-		IOSimpleLockUnlock(interruptLock);
-		for (UInt32 i = 0; i < n; i++) {
-			if (hook)
-				hook(clients[i], seqno, status, shown);
-			clients[i]->release();
+		// Every pipe client of every display: the one whose transaction this answers takes it,
+		// at the time of the refresh of its display the host answered in.
+		const UInt64 nowNs = clockNs(mach_absolute_time());
+		ReimsGraphics *fbs[RGFX_DISPLAYS_MAX];
+		const UInt32 displays = copyDisplays(fbs);
+		for (UInt32 d = 0; d < displays; d++) {
+			ReimsGraphics *fb = fbs[d];
+			UInt64 shown = clockAbsolute(fb->vblankClock.shownAt(nowNs));
+			OSObject *clients[kMaxPipeClients];
+			IOSimpleLockLock(interruptLock);
+			UInt32 n = fb->pipes.all(clients);
+			PipePresentHook hook = fb->pipePresentHook;
+			for (UInt32 i = 0; i < n; i++)
+				clients[i]->retain();
+			IOSimpleLockUnlock(interruptLock);
+			for (UInt32 i = 0; i < n; i++) {
+				if (hook)
+					hook(clients[i], seqno, status, shown);
+				clients[i]->release();
+			}
 		}
+		releaseDisplays(fbs, displays);
 		// The display shows a surface from this answer: the boot screen under it, black, once.
 		if (status == RGFX_STATUS_OK && !bootScreenCleared &&
 		    seqno == __atomic_load_n(&bootScreenSeqno, __ATOMIC_ACQUIRE)) {
@@ -951,12 +1028,13 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 	}
 	case RGFX_EVT_DISPLAYS: {
 		answer(seqno, parseDisplays(payload, size));
-		if (seqno != refreshSeqno)
+		const UInt32 refreshed = refreshes.answered(seqno);
+		if (!refreshed)
 			return;
 		// The refresh a DISPLAY_CHANGED asked for: now IOFramebuffer
 		// senses the connection again, or once it has its connect interrupt
-		// registered and on (RgfxDisplayModes.hpp, RgfxConnectChange).
-		refreshSeqno = 0;
+		// registered and on (RgfxDisplayModes.hpp, RgfxConnectChange), on
+		// each display the refresh was for.
 #if defined(__arm64e__)
 		// On arm64 a list that changed the modes is republished, off this work loop, and the
 		// processes told (republishMobileDisplay).
@@ -964,14 +1042,28 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		    hasStarted())
 			thread_call_enter(mobileChangeCall);
 #endif
+		ReimsGraphics *fbs[RGFX_DISPLAYS_MAX];
+		const UInt32 displays = copyDisplays(fbs);
+		Interrupt fires[RGFX_DISPLAYS_MAX] = {};
 		IOSimpleLockLock(interruptLock);
-		if (displayChange.changed(connect.enabled && connect.proc))
-			fire = connect;
+		for (UInt32 d = 0; d < displays; d++) {
+			ReimsGraphics *fb = fbs[d];
+			const UInt32 index = fb == this ? 0 : fb->displayId;
+			if ((refreshed & (1u << index)) &&
+			    fb->displayChange.changed(fb->connect.enabled && fb->connect.proc))
+				fires[d] = fb->connect;
+		}
 		IOSimpleLockUnlock(interruptLock);
-		break;
+		for (UInt32 d = 0; d < displays; d++) {
+			if (fires[d].enabled && fires[d].proc)
+				fires[d].proc(fires[d].target, fires[d].ref);
+		}
+		releaseDisplays(fbs, displays);
+		return;
 	}
 	case RGFX_EVT_DISPLAY_CHANGED:
-		refreshWanted = true;
+		// A refresh for the display it names (rgfxEventDisplay).
+		refreshes.changed(drivenIndex(rgfxEventDisplay(payload, size)));
 		return;
 	case RGFX_EVT_SUBMIT_ROOM:
 		// The host took from the control ring after a post set its producer_waiting: the pass
@@ -989,11 +1081,15 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		answerLifecycle(type, seqno, payload, size);
 		return;
 	case RGFX_EVT_VBLANK: {
+		// The refresh of the display it names (rgfxEventDisplay): its framebuffer's.
+		ReimsGraphics *fb = copyDisplay(drivenIndex(rgfxEventDisplay(payload, size)));
+		if (!fb)
+			return;
 		OSObject *clients[kMaxPipeClients];
 		IOSimpleLockLock(interruptLock);
-		fire = vblank;
-		UInt32 n = pipes.wantingVblank(clients);
-		PipeVblankHook hook = pipeVblankHook;
+		const Interrupt fire = fb->vblank;
+		UInt32 n = fb->pipes.wantingVblank(clients);
+		PipeVblankHook hook = fb->pipeVblankHook;
 		for (UInt32 i = 0; i < n; i++)
 			clients[i]->retain();
 		IOSimpleLockUnlock(interruptLock);
@@ -1009,37 +1105,38 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 			UInt32 lo = readRegister(RGFX_REG_HOST_TIME_LO);
 			UInt64 after = clockNs(mach_absolute_time());
 			UInt32 hiAgain = readRegister(RGFX_REG_HOST_TIME_HI);
-			vblankClock.reading(before, RgfxVblankClock::hostTime(hi, lo, hiAgain), after);
+			fb->vblankClock.reading(before, RgfxVblankClock::hostTime(hi, lo, hiAgain), after);
 			// Where the bundle stamps its command buffers (GUEST_TIMES), the held reading's
 			// offset and bound go in ring 0's header for the host: the offset, then the bound
 			// with release, which the host reads first.
 			int64_t offset = 0;
 			uint64_t bound = 0;
-			if (guestTimes && vblankClock.offsetAt(after, &offset, &bound)) {
+			if (guestTimes && fb->vblankClock.offsetAt(after, &offset, &bound)) {
 				volatile UInt8 *header = ring(RGFX_CONTROL_SUBMIT_OFFSET);
 				store64(header + kRingGuestClockOffset, static_cast<UInt64>(offset));
 				store32(header + kRingGuestClockBound, RgfxVblankClock::headerBound(bound));
 			}
 		}
 		UInt64 time = clockAbsolute(
-		    size >= 24 ? vblankClock.vblank(count,
-		                                    *reinterpret_cast<const volatile UInt64 *>(payload + 16),
-		                                    now)
+		    size >= 24 ? fb->vblankClock.vblank(count,
+		                                        *reinterpret_cast<const volatile UInt64 *>(payload + 16),
+		                                        now)
 		               : now);
-		UInt64 next =
-		    clockAbsolute(size >= 24 ? vblankClock.next() : now + RgfxVblankClock::kDefaultPeriodNs);
+		UInt64 next = clockAbsolute(size >= 24 ? fb->vblankClock.next()
+		                                       : now + RgfxVblankClock::kDefaultPeriodNs);
 		for (UInt32 i = 0; i < n; i++) {
 			if (hook)
 				hook(clients[i], count, time, next);
 			clients[i]->release();
 		}
-		break;
+		if (fire.enabled && fire.proc)
+			fire.proc(fire.target, fire.ref);
+		fb->release();
+		return;
 	}
 	default:
 		return;
 	}
-	if (fire.enabled && fire.proc)
-		fire.proc(fire.target, fire.ref);
 }
 
 // Hands a lifecycle message's answer to its waiting thread, or keeps a deferred create's for its
@@ -1132,85 +1229,72 @@ void ReimsGraphics::answer(UInt64 seqno, UInt32 status)
 	IOLockUnlock(stateLock);
 }
 
-// Takes the display's modes from a DISPLAYS answer, and where the host took
-// DISPLAY_SCALE its screen's scale, the record after the display's. The
-// driver's display is the first listed when it starts, and the display of
-// that id after; a list without it leaves the display disconnected with its
-// modes. Modes the scanout space cannot hold are left out. A list that
-// changes the modes or the scale makes the next server connection drop the
-// mode configuration the last one left (newUserClient), and on arm64 the
-// display published again, its density with it. Returns the answer's status.
+// Takes the displays' modes from a DISPLAYS answer (RgfxDisplayTable.hpp, rgfxListDisplays), and
+// where the host took DISPLAY_SCALE each one's host screen's scale, the record after its own, into
+// display 0's framebuffer and each head's (takeListing). Where the framebuffer took MULTI_DISPLAY,
+// the start's first answer fixes how many displays the kext drives. Returns the answer's status.
 UInt32 ReimsGraphics::parseDisplays(const volatile UInt8 *payload, UInt32 size)
 {
-	if (size < sizeof(uint32_t))
+	RgfxListedDisplay listed[RGFX_DISPLAYS_MAX];
+	UInt32 count = 0, stored = 0;
+	if (!rgfxListDisplays(payload, size, displayScaleTaken, listed, RGFX_DISPLAYS_MAX, &count,
+	                      &stored))
 		return kStatusUnreadable;
-	UInt32 count = field32(payload, 0);
-	// The first display record follows count, past the message header.
-	UInt32 offset = RGFX_DISPLAYS_ENTRIES_OFFSET - kHeaderBytes;
-
+	ReimsGraphics *fbs[RGFX_DISPLAYS_MAX];
+	const UInt32 n = copyDisplays(fbs);
 	IOLockLock(stateLock);
-	bool found = false;
-	UInt32 id = 0, isConnected = 0, preferred = 0, listed = 0, listAt = 0, scale = 0;
-	const UInt32 scaleBytes = displayScaleTaken ? sizeof(RgfxDisplayScale) : 0;
-	for (UInt32 i = 0; i < count; i++) {
-		if (size - offset < sizeof(RgfxDisplayEntry) + scaleBytes) {
-			IOLockUnlock(stateLock);
-			return kStatusUnreadable;
-		}
-		UInt32 did = field32(payload, offset);
-		UInt32 n = field32(payload, offset + 12);
-		UInt32 at = offset + sizeof(RgfxDisplayEntry) + scaleBytes;
-		if (static_cast<UInt64>(n) * sizeof(RgfxModeEntry) > size - at) {
-			IOLockUnlock(stateLock);
-			return kStatusUnreadable;
-		}
-		if (!found && (!haveDisplay || did == displayId)) {
-			found = true;
-			id = did;
-			isConnected = field32(payload, offset + 4);
-			preferred = field32(payload, offset + 8);
-			listed = n;
-			listAt = at;
-			if (scaleBytes)
-				scale = field32(payload, offset + sizeof(RgfxDisplayEntry));
-		}
-		offset = at + n * sizeof(RgfxModeEntry);
-	}
-	if (!found) {
-		connected = false;
-		IOLockUnlock(stateLock);
-		return 0;
-	}
+	if (!displayCount)
+		displayCount = rgfxDisplaysDriven(multiDisplayTaken, count);
+	for (UInt32 i = 0; i < n; i++)
+		fbs[i]->takeListing(listed, stored, payload);
+	IOLockUnlock(stateLock);
+	releaseDisplays(fbs, n);
+	return 0;
+}
 
+// This framebuffer's display of those listed: display 0's is the first listed when it starts,
+// and the display of that id after; a head's, its display's id. A list without it leaves the
+// display disconnected with its modes. Modes its scanout room cannot hold are left out. A list
+// that changes the modes or the scale makes the next server connection drop the mode
+// configuration the last one left (newUserClient), and on arm64 the display published again,
+// its density with it.
+void ReimsGraphics::takeListing(const RgfxListedDisplay *listed, UInt32 n,
+                                const volatile UInt8 *payload)
+{
+	const int at = haveDisplay || isHead() ? rgfxFindListed(listed, n, displayId) : (n ? 0 : -1);
+	if (at < 0) {
+		connected = false;
+		return;
+	}
+	const RgfxListedDisplay &d = listed[at];
 	Mode fresh[kMaxModes];
 	UInt32 freshCount = 0, freshPreferred = kMaxModes;
 	UInt64 limit = scanoutLimit();
-	for (UInt32 j = 0; j < listed && freshCount < kMaxModes; j++) {
-		UInt32 at = listAt + j * sizeof(RgfxModeEntry);
-		Mode m = {0, field32(payload, at), field32(payload, at + 4), field32(payload, at + 8)};
+	for (UInt32 j = 0; j < d.modeCount && freshCount < kMaxModes; j++) {
+		UInt32 entry = d.modesAt + j * sizeof(RgfxModeEntry);
+		Mode m = {0, field32(payload, entry), field32(payload, entry + 4),
+		          field32(payload, entry + 8)};
 		if (!m.width || !m.height || m.width > kMaxDimension || m.height > kMaxDimension ||
 		    static_cast<UInt64>(strideFor(m.width)) * m.height > limit) {
 			IOLog("ReimsGraphics: display %u: mode %ux%u left out: the region cannot hold it\n",
-			      id, m.width, m.height);
+			      d.id, m.width, m.height);
 			continue;
 		}
-		if (j == preferred)
+		if (j == d.preferred)
 			freshPreferred = freshCount;
 		fresh[freshCount++] = m;
 	}
 	haveDisplay = true;
-	displayId = id;
-	connected = isConnected != 0;
-	const bool rescaled = scale != displayScale;
-	displayScale = scale;
+	displayId = d.id;
+	connected = d.connected != 0;
+	const bool rescaled = d.scale != displayScale;
+	displayScale = d.scale;
 	const bool changed = modeSet.take(fresh, freshCount, freshPreferred) || rescaled;
 	if (changed)
 		modeConfig.listChanged();
 #if defined(__arm64e__)
 	mobileListChanged = changed;
 #endif
-	IOLockUnlock(stateLock);
-	return 0;
 }
 
 // MARK: - Modes and scanout
@@ -1267,10 +1351,16 @@ UInt32 ReimsGraphics::strideFor(UInt32 width)
 }
 
 // The scanout buffer's room: RGFX_SCANOUT_SPAN at the guest's allocations, before the
-// accelerator's blocks (RgfxScanoutOwner.hpp), so no mode reaches a process's memory.
+// accelerator's blocks (RgfxScanoutOwner.hpp), so no mode reaches a process's memory; with several
+// displays, this framebuffer's display's share of it (RgfxDisplayTable.hpp, rgfxDisplayRoom).
+RgfxRoom ReimsGraphics::scanoutRoom() const
+{
+	return rgfxDisplayRoom(regionSize, kCursorSlot, isHead() ? displayId : 0, drivenDisplays());
+}
+
 UInt64 ReimsGraphics::scanoutLimit() const
 {
-	return rgfxScanoutRoom(regionSize, kCursorSlot);
+	return scanoutRoom().length;
 }
 
 // The boot screen, black: the logo and progress bar the firmware and the kernel's console drew
@@ -1306,14 +1396,15 @@ void ReimsGraphics::clearBootScreen()
 IOReturn ReimsGraphics::setScanout(const Mode &mode)
 {
 	UInt32 stride = strideFor(mode.width);
-	if (static_cast<UInt64>(stride) * mode.height > scanoutLimit())
+	const RgfxRoom own = scanoutRoom();
+	if (static_cast<UInt64>(stride) * mode.height > own.length)
 		return kIOReturnNoSpace;
 	RgfxSetScanout s = {};
 	s.display = displayId;
 	s.width = mode.width;
 	s.height = mode.height;
 	s.stride = stride;
-	s.offset = RGFX_ALLOCATIONS_OFFSET;
+	s.offset = own.offset;
 	IOReturn r = command(RGFX_CMD_SET_SCANOUT, &s, sizeof(s));
 	if (r != kIOReturnSuccess)
 		return r;
@@ -1353,7 +1444,7 @@ bool ReimsGraphics::currentScanout(UInt32 *width, UInt32 *height, UInt32 *bytesP
 	*width = m.width;
 	*height = m.height;
 	*bytesPerRow = strideFor(m.width);
-	*offset = RGFX_ALLOCATIONS_OFFSET;
+	*offset = scanoutRoom().offset;
 	return true;
 }
 
@@ -1460,6 +1551,10 @@ extern "C" void rgfxAssignedGPUVirtualAddressLength()
 
 bool ReimsGraphics::start(IOService *provider)
 {
+	// A head (startHeads) starts on display 0's device.
+	if (isHead())
+		return startHead(provider);
+	device = this;
 	pci = OSDynamicCast(IOPCIDevice, provider);
 	if (!pci)
 		return false;
@@ -1469,7 +1564,8 @@ bool ReimsGraphics::start(IOService *provider)
 	interruptLock = IOSimpleLockAlloc();
 	stateLock = IOLockAlloc();
 	presentsLock = IOLockAlloc();
-	if (!submitLock || !interruptLock || !stateLock || !presentsLock)
+	cursorLock = IOLockAlloc();
+	if (!submitLock || !interruptLock || !stateLock || !presentsLock || !cursorLock)
 		return false;
 	// The answers kept by pipeline key, empty at each start. Without the table, none is kept and
 	// every create waits.
@@ -1492,6 +1588,9 @@ bool ReimsGraphics::start(IOService *provider)
 	guestTimes = false;
 	displayPowerTaken = false;
 	pipelineAnswersTaken = false;
+	multiDisplayTaken = false;
+	displayCount = 0;
+	refreshes = {};
 	wranglerNotifier = nullptr;
 	wranglerInterest = nullptr;
 	// The device is lit from its reset (design.md, "The display's sleep").
@@ -1654,6 +1753,7 @@ bool ReimsGraphics::start(IOService *provider)
 		pipelineAnswersTaken =
 		    (took & (RGFX_FEATURE_PIPELINE_KEYS | RGFX_FEATURE_PIPELINE_ANSWERS)) ==
 		    (RGFX_FEATURE_PIPELINE_KEYS | RGFX_FEATURE_PIPELINE_ANSWERS);
+		multiDisplayTaken = (took & RGFX_FEATURE_MULTI_DISPLAY) != 0;
 	}
 	produced = load64(ring(RGFX_CONTROL_SUBMIT_OFFSET) + kRingProducer);
 	consumed = load64(ring(RGFX_CONTROL_COMPLETE_OFFSET) + kRingConsumer);
@@ -1673,95 +1773,23 @@ bool ReimsGraphics::start(IOService *provider)
 		goto fail;
 	}
 	IOLog("ReimsGraphics: display %u, %u modes, region 0x%llx bytes\n", displayId, count, regionSize);
+	if (displayCount > 1) {
+		const RgfxRoom own = scanoutRoom();
+		IOLog("ReimsGraphics: %u displays, each a framebuffer of its own; display 0's scanout room "
+		      "0x%llx bytes at 0x%llx\n",
+		      displayCount, own.length, own.offset);
+		// The display count the accelerator states (DisplayPortCount), before it can register.
+		if (RgfxAccelerator *accelerator = copyAccelerator()) {
+			accelerator->setProperty("DisplayPortCount", static_cast<unsigned long long>(displayCount),
+			                         64);
+			accelerator->release();
+		}
+	}
 	// Before any process can make a pipeline: the bundle loads once the accelerator is published.
 	seedSharedPipelines();
 
-	// The display's accelerator and pipe, which the wrangler, CoreDisplay and IOPresentment read
-	// off the framebuffer when it is published: our one display is pipe 0 of the accelerator on
-	// the same PCI device, named by its service-plane path, which is the PCI device's path and
-	// the accelerator's class name whichever of the two starts first. An accelerator that starts
-	// after renames the PCI device (GFX0) and names itself again by its new path
-	// (RgfxAccelerator::copyFramebuffer).
-	{
-		char path[512];
-		int length = sizeof(path) - sizeof("/RgfxAccelerator");
-		if (pci->getPath(path, &length, gIOServicePlane)) {
-			strlcat(path, "/RgfxAccelerator", sizeof(path));
-			setProperty("IOAccelTypes", path);
-		}
-	}
-	setProperty("IOAccelIndex", 0ull, 32);
-
-#if defined(__x86_64__)
-	// The framebuffer is its own controller's one dependent (index 0), named by its own registry
-	// ID. IOFramebuffer finishes a framebuffer's open (postOpen, in IOGraphics' open source) only
-	// for one with a dependent ID: there it publishes kIOFBNeedsRefreshKey, initialises the
-	// scanout (initFB) and tests the hardware cursor, which publishes kIOFBCursorInfoKey.
-	setProperty(kIOFBDependentIDKey, getRegistryEntryID(), 64);
-	setProperty(kIOFBDependentIndexKey, 0ull, 32);
-
-	// The timings the OS may program (validateDetailedTiming takes only the device's modes
-	// among them). The scanout has no signal of its own, so any sync and level goes, and
-	// nothing optional (interlace, DSC: a version 1 range); no link limits are given, as no
-	// link carries the pixels. RGB at 8 bits, in one-pixel steps.
-	{
-		IODisplayTimingRange range;
-		bzero(&range, sizeof(range));
-		range.version = kIOTimingRangeV1;
-		range.minPixelClock = 1000000;
-		range.maxPixelClock = 100000000000ull;
-		range.supportedSyncFlags = kIORangeSupportsSeparateSyncs | kIORangeSupportsSyncOnGreen |
-		                           kIORangeSupportsCompositeSync | kIORangeSupportsVSyncSerration;
-		range.supportedSignalLevels = kIORangeSupportsSignal_0700_0300 | kIORangeSupportsSignal_0714_0286 |
-		                              kIORangeSupportsSignal_1000_0400 | kIORangeSupportsSignal_0700_0000;
-		range.minFrameRate = 1;
-		range.maxFrameRate = 1000;
-		range.minLineRate = 1;
-		range.maxLineRate = 100000000;
-		range.maxHorizontalTotal = 2 * kMaxDimension;
-		range.maxVerticalTotal = 2 * kMaxDimension;
-		range.charSizeHorizontalActive = 1;
-		range.charSizeHorizontalBlanking = 1;
-		range.charSizeHorizontalSyncOffset = 1;
-		range.charSizeHorizontalSyncPulse = 1;
-		range.charSizeVerticalActive = 1;
-		range.charSizeVerticalBlanking = 1;
-		range.charSizeVerticalSyncOffset = 1;
-		range.charSizeVerticalSyncPulse = 1;
-		range.charSizeHorizontalBorderLeft = 1;
-		range.charSizeHorizontalBorderRight = 1;
-		range.charSizeVerticalBorderTop = 1;
-		range.charSizeVerticalBorderBottom = 1;
-		range.charSizeHorizontalTotal = 1;
-		range.charSizeVerticalTotal = 1;
-		range.minHorizontalActiveClocks = 1;
-		range.maxHorizontalActiveClocks = kMaxDimension;
-		range.maxHorizontalBlankingClocks = kMaxDimension;
-		range.maxHorizontalSyncOffsetClocks = kMaxDimension;
-		range.maxHorizontalPulseWidthClocks = kMaxDimension;
-		range.minVerticalActiveClocks = 1;
-		range.maxVerticalActiveClocks = kMaxDimension;
-		range.maxVerticalBlankingClocks = kMaxDimension;
-		range.maxVerticalSyncOffsetClocks = kMaxDimension;
-		range.maxVerticalPulseWidthClocks = kMaxDimension;
-		range.supportedPixelEncoding = kIORangePixelEncodingRGB444;
-		range.supportedBitsPerColorComponent = kIORangeBitsPerColorComponent8;
-		range.supportedColorimetryModes = kIORangeColorimetryNativeRGB | kIORangeColorimetrysRGB;
-		range.supportedDynamicRangeModes = kIORangeDynamicRangeSDR;
-		OSData *data = OSData::withBytes(&range, sizeof(range));
-		if (data) {
-			setProperty(kIOFBTimingRangeKey, data);
-			data->release();
-		}
-	}
-
-	// The class name user space reads for the framebuffer: IOObjectCopyClass and IOObjectGetClass
-	// answer this property where the service carries it. CoreDisplay takes the display's GPU
-	// vendor from that name, searching it for the vendor names it knows, and keeps WindowServer's
-	// accelerated, transactional display model (kIOWindowServerActiveAttribute) off for a name in
-	// which it finds none, as it does for "ReimsGraphics".
-	setProperty("IOClassNameOverride", "ReimsGraphicsAMD");
-#else
+	publishFramebuffer();
+#if defined(__arm64e__)
 	if (!startMobile())
 		goto fail;
 #endif
@@ -1770,8 +1798,11 @@ bool ReimsGraphics::start(IOService *provider)
 	// The device is ours and its rings are up: contexts may open from here, as the class's start
 	// can register the framebuffer and WindowServer open it before it returns.
 	__atomic_store_n(&started, true, __ATOMIC_RELEASE);
-	if (super::start(provider))
+	if (super::start(provider)) {
+		// The other displays' framebuffers, registered after this one.
+		startHeads();
 		return true;
+	}
 fail:
 	__atomic_store_n(&started, false, __ATOMIC_RELEASE);
 	stopDisplayPower();
@@ -1788,7 +1819,12 @@ fail:
 
 void ReimsGraphics::stop(IOService *provider)
 {
+	if (isHead()) {
+		stopHead(provider);
+		return;
+	}
 	__atomic_store_n(&started, false, __ATOMIC_RELEASE);
+	stopHeads();
 	stopDisplayPower();
 #if defined(__arm64e__)
 	stopMobile();
@@ -1881,8 +1917,269 @@ void ReimsGraphics::teardown()
 	registers = nullptr;
 }
 
+void ReimsGraphics::publishFramebuffer()
+{
+	// The display's accelerator and pipe, which the wrangler, CoreDisplay and IOPresentment read
+	// off the framebuffer when it is published: every display is a pipe of the one accelerator on
+	// the same PCI device, named by its service-plane path, which is the PCI device's path and
+	// the accelerator's class name whichever of the two starts first. An accelerator that starts
+	// after renames the PCI device (GFX0) and names itself again by its new path
+	// (RgfxAccelerator::copyFramebuffer, nameAccelerator). A head takes display 0's name of it.
+	// IOAccelIndex is the display's pipe of that accelerator, its id, which IOPresentment
+	// associates the display's pipe client with (RgfxDisplayPipeUserClient's associate), as a
+	// Mac's GPU numbers the framebuffers it drives: a MacBook Pro 2019's Radeon Pro 5300M gives
+	// its five IOAccelIndex 0 to 4, each its IOFBDependentIndex (measured on macOS 26.7.1).
+	if (isHead()) {
+		if (OSObject *named = device->copyProperty("IOAccelTypes")) {
+			setProperty("IOAccelTypes", named);
+			named->release();
+		}
+	} else {
+		char path[512];
+		int length = sizeof(path) - sizeof("/RgfxAccelerator");
+		if (pci->getPath(path, &length, gIOServicePlane)) {
+			strlcat(path, "/RgfxAccelerator", sizeof(path));
+			setProperty("IOAccelTypes", path);
+		}
+	}
+	setProperty("IOAccelIndex", isHead() ? displayId : 0u, 32);
+
+#if defined(__x86_64__)
+	// Display 0's framebuffer is its controller's first dependent (index 0), named by its own
+	// registry ID, and each head the dependent of that ID at its display's index: IOGraphics makes
+	// one controller of the framebuffers of a dependent ID, each at its index, and the first of
+	// them to open links every one started (IOGraphics' open source, IOFBController). IOFramebuffer
+	// finishes a framebuffer's open (postOpen) only for one with a dependent ID: there it publishes
+	// kIOFBNeedsRefreshKey, initialises the scanout (initFB) and tests the hardware cursor, which
+	// publishes kIOFBCursorInfoKey.
+	setProperty(kIOFBDependentIDKey, device->getRegistryEntryID(), 64);
+	setProperty(kIOFBDependentIndexKey, isHead() ? displayId : 0u, 32);
+
+	// The timings the OS may program (validateDetailedTiming takes only the device's modes
+	// among them). The scanout has no signal of its own, so any sync and level goes, and
+	// nothing optional (interlace, DSC: a version 1 range); no link limits are given, as no
+	// link carries the pixels. RGB at 8 bits, in one-pixel steps.
+	{
+		IODisplayTimingRange range;
+		bzero(&range, sizeof(range));
+		range.version = kIOTimingRangeV1;
+		range.minPixelClock = 1000000;
+		range.maxPixelClock = 100000000000ull;
+		range.supportedSyncFlags = kIORangeSupportsSeparateSyncs | kIORangeSupportsSyncOnGreen |
+		                           kIORangeSupportsCompositeSync | kIORangeSupportsVSyncSerration;
+		range.supportedSignalLevels = kIORangeSupportsSignal_0700_0300 | kIORangeSupportsSignal_0714_0286 |
+		                              kIORangeSupportsSignal_1000_0400 | kIORangeSupportsSignal_0700_0000;
+		range.minFrameRate = 1;
+		range.maxFrameRate = 1000;
+		range.minLineRate = 1;
+		range.maxLineRate = 100000000;
+		range.maxHorizontalTotal = 2 * kMaxDimension;
+		range.maxVerticalTotal = 2 * kMaxDimension;
+		range.charSizeHorizontalActive = 1;
+		range.charSizeHorizontalBlanking = 1;
+		range.charSizeHorizontalSyncOffset = 1;
+		range.charSizeHorizontalSyncPulse = 1;
+		range.charSizeVerticalActive = 1;
+		range.charSizeVerticalBlanking = 1;
+		range.charSizeVerticalSyncOffset = 1;
+		range.charSizeVerticalSyncPulse = 1;
+		range.charSizeHorizontalBorderLeft = 1;
+		range.charSizeHorizontalBorderRight = 1;
+		range.charSizeVerticalBorderTop = 1;
+		range.charSizeVerticalBorderBottom = 1;
+		range.charSizeHorizontalTotal = 1;
+		range.charSizeVerticalTotal = 1;
+		range.minHorizontalActiveClocks = 1;
+		range.maxHorizontalActiveClocks = kMaxDimension;
+		range.maxHorizontalBlankingClocks = kMaxDimension;
+		range.maxHorizontalSyncOffsetClocks = kMaxDimension;
+		range.maxHorizontalPulseWidthClocks = kMaxDimension;
+		range.minVerticalActiveClocks = 1;
+		range.maxVerticalActiveClocks = kMaxDimension;
+		range.maxVerticalBlankingClocks = kMaxDimension;
+		range.maxVerticalSyncOffsetClocks = kMaxDimension;
+		range.maxVerticalPulseWidthClocks = kMaxDimension;
+		range.supportedPixelEncoding = kIORangePixelEncodingRGB444;
+		range.supportedBitsPerColorComponent = kIORangeBitsPerColorComponent8;
+		range.supportedColorimetryModes = kIORangeColorimetryNativeRGB | kIORangeColorimetrysRGB;
+		range.supportedDynamicRangeModes = kIORangeDynamicRangeSDR;
+		OSData *data = OSData::withBytes(&range, sizeof(range));
+		if (data) {
+			setProperty(kIOFBTimingRangeKey, data);
+			data->release();
+		}
+	}
+
+	// The class name user space reads for the framebuffer: IOObjectCopyClass and IOObjectGetClass
+	// answer this property where the service carries it. CoreDisplay takes the display's GPU
+	// vendor from that name, searching it for the vendor names it knows, and keeps WindowServer's
+	// accelerated, transactional display model (kIOWindowServerActiveAttribute) off for a name in
+	// which it finds none, as it does for "ReimsGraphics".
+	setProperty("IOClassNameOverride", "ReimsGraphicsAMD");
+#endif
+}
+
+// MARK: - The other displays' framebuffers
+
+// Each display from 1 gets a framebuffer of this class, a head, attached to the PCI device as
+// display 0's is, at its display's location, and started there: its start (startHead) reads its
+// modes from the device and registers it, after display 0's, before WindowServer opens any of them
+// (IOGraphics links the framebuffers of a dependent ID that have started as the first one opens).
+// A head that does not start leaves its display undriven, its window black; the others go on.
+void ReimsGraphics::startHeads()
+{
+	const UInt32 count = displayCount;
+	for (UInt32 i = 1; i < count && i < RGFX_DISPLAYS_MAX; i++) {
+		ReimsGraphics *head = OSTypeAlloc(ReimsGraphics);
+		if (!head || !head->init()) {
+			OSSafeReleaseNULL(head);
+			IOLog("ReimsGraphics: display %u: no framebuffer for it: no memory\n", i);
+			continue;
+		}
+		retain();
+		head->device = this;
+		head->displayId = i;
+		char location[8];
+		snprintf(location, sizeof(location), "%u", i);
+		head->setLocation(location);
+		// The table holds the allocation's reference.
+		IOSimpleLockLock(interruptLock);
+		heads[i] = head;
+		IOSimpleLockUnlock(interruptLock);
+		const bool attached = head->attach(pci);
+		if (!attached || !head->start(pci)) {
+			IOLog("ReimsGraphics: display %u: its framebuffer did not start\n", i);
+			if (attached)
+				head->detach(pci);
+			dropHead(head);
+			continue;
+		}
+		IOLog("ReimsGraphics: display %u: its framebuffer started\n", i);
+	}
+}
+
+// The heads go as display 0's framebuffer stops: out of the table, so the work loop hands them
+// nothing more, then terminated, which stops each (stopHead).
+void ReimsGraphics::stopHeads()
+{
+	for (UInt32 i = 1; i < RGFX_DISPLAYS_MAX; i++) {
+		IOSimpleLockLock(interruptLock);
+		ReimsGraphics *head = heads[i];
+		heads[i] = nullptr;
+		IOSimpleLockUnlock(interruptLock);
+		if (!head)
+			continue;
+		static_cast<IOService *>(head)->terminate();
+		head->release();
+	}
+}
+
+void ReimsGraphics::dropHead(ReimsGraphics *head)
+{
+	bool held = false;
+	IOSimpleLockLock(interruptLock);
+	for (UInt32 i = 1; i < RGFX_DISPLAYS_MAX; i++) {
+		if (heads[i] == head) {
+			heads[i] = nullptr;
+			held = true;
+		}
+	}
+	IOSimpleLockUnlock(interruptLock);
+	if (held)
+		head->release();
+}
+
+// A head's start: display 0's device, rings, locks and features, its own display's modes from a
+// GET_DISPLAYS of its own (parseDisplays hands each framebuffer its display), then IOFramebuffer's
+// start, which registers it.
+bool ReimsGraphics::startHead(IOService *provider)
+{
+	pci = OSDynamicCast(IOPCIDevice, provider);
+	if (!pci || !device->region || !device->ready)
+		return false;
+	stateLock = device->stateLock;
+	interruptLock = device->interruptLock;
+	presentsLock = device->presentsLock;
+	region = device->region;
+	region->retain();
+	regionSize = device->regionSize;
+	cursorPixels = device->cursorPixels;
+	displayColorTaken = device->displayColorTaken;
+	displayScaleTaken = device->displayScaleTaken;
+	displayPowerTaken = device->displayPowerTaken;
+	assignedLength = device->assignedLength;
+	started = false;
+	modeSet.reset();
+	largestScanout = 0;
+	// The boot screen is display 0's alone (clearBootScreen).
+	bootScreenCleared = true;
+	IOSimpleLockLock(interruptLock);
+	panelWanted = device->panelWanted;
+	IOSimpleLockUnlock(interruptLock);
+	panelTold = true;
+
+	RgfxGetDisplays getDisplays = {};
+	IOReturn r = command(RGFX_CMD_GET_DISPLAYS, &getDisplays, sizeof(getDisplays));
+	IOLockLock(stateLock);
+	const UInt32 count = haveDisplay ? modeSet.modeCount : 0;
+	IOLockUnlock(stateLock);
+	const RgfxRoom own = scanoutRoom();
+	if (r != kIOReturnSuccess || !count) {
+		IOLog("ReimsGraphics: display %u: the device lists no usable modes for it (0x%x)\n",
+		      displayId, r);
+		OSSafeReleaseNULL(region);
+		return false;
+	}
+	IOLog("ReimsGraphics: display %u, %u modes, scanout room 0x%llx bytes at 0x%llx\n", displayId,
+	      count, own.length, own.offset);
+	publishFramebuffer();
+	__atomic_store_n(&started, true, __ATOMIC_RELEASE);
+	if (super::start(provider))
+		return true;
+	__atomic_store_n(&started, false, __ATOMIC_RELEASE);
+	OSSafeReleaseNULL(region);
+	return false;
+}
+
+// A head's stop: out of display 0's table first, so the work loop hands it nothing more.
+void ReimsGraphics::stopHead(IOService *provider)
+{
+	__atomic_store_n(&started, false, __ATOMIC_RELEASE);
+	device->dropHead(this);
+	super::stop(provider);
+	OSSafeReleaseNULL(region);
+}
+
+void ReimsGraphics::nameAccelerator(const char *path)
+{
+	if (isHead()) {
+		device->nameAccelerator(path);
+		return;
+	}
+	ReimsGraphics *fbs[RGFX_DISPLAYS_MAX];
+	const UInt32 n = copyDisplays(fbs);
+	for (UInt32 i = 0; i < n; i++) {
+		OSString *named = OSDynamicCast(OSString, fbs[i]->getProperty("IOAccelTypes"));
+		if (rgfxAccelTypesStale(named ? named->getCStringNoCopy() : nullptr, path))
+			fbs[i]->setProperty("IOAccelTypes", path);
+	}
+	releaseDisplays(fbs, n);
+}
+
 void ReimsGraphics::free()
 {
+	// A head's locks are display 0's, which frees them; it lets display 0's framebuffer go.
+	if (isHead()) {
+		interruptLock = nullptr;
+		stateLock = presentsLock = nullptr;
+		ReimsGraphics *owner = device;
+		device = nullptr;
+		owner->release();
+	}
+	device = nullptr;
+	if (cursorLock)
+		IOLockFree(cursorLock);
+	cursorLock = nullptr;
 	if (submitLock)
 		IOSimpleLockFree(submitLock);
 	if (interruptLock)
@@ -1946,7 +2243,7 @@ IODeviceMemory *ReimsGraphics::getApertureRange(IOPixelAperture aperture)
 		return nullptr;
 	UInt64 length = round_page_64(static_cast<UInt64>(strideFor(m.width)) * m.height);
 	FBTRACE(8, "getApertureRange: %ux%u, 0x%llx bytes", m.width, m.height, length);
-	return IODeviceMemory::withSubRange(region, RGFX_ALLOCATIONS_OFFSET, length);
+	return IODeviceMemory::withSubRange(region, scanoutRoom().offset, length);
 }
 
 // The scanout's room. IOFramebuffer maps it into the task that asks for it on a user client (its
@@ -1980,7 +2277,8 @@ IODeviceMemory *ReimsGraphics::getVRAMRange()
 		      given ? "goes to the scanout's owner" : "is refused to", caller.name, caller.pid);
 	if (!given)
 		return nullptr;
-	return IODeviceMemory::withSubRange(region, RGFX_ALLOCATIONS_OFFSET, scanoutLimit());
+	const RgfxRoom own = scanoutRoom();
+	return IODeviceMemory::withSubRange(region, own.offset, own.length);
 }
 
 // IOFramebuffer's setup for the current mode: the thread that runs it is marked while it runs, so
@@ -2521,10 +2819,11 @@ IOReturn ReimsGraphics::getDDCBlock(IOIndex connectIndex, UInt32 blockNumber, IO
 // IOFramebuffer converts the image into the slot as packed little-endian
 // 0xAARRGGBB words, premultiplied: BGRA8 in memory, the format SET_CURSOR
 // takes. The command's answer means the host has the image, so the slot is
-// free for the next one.
+// free for the next one: every display's framebuffer holds the slot's lock
+// from its convert to that answer (lockCursorSlot).
 IOReturn ReimsGraphics::setCursorImage(void *cursorImage)
 {
-	if (!ready)
+	if (!device || !device->ready)
 		return kIOReturnNotReady;
 	IOHardwareCursorDescriptor desc;
 	bzero(&desc, sizeof(desc));
@@ -2538,8 +2837,11 @@ IOReturn ReimsGraphics::setCursorImage(void *cursorImage)
 	info.majorVersion = kHardwareCursorInfoMajorVersion;
 	info.minorVersion = kHardwareCursorInfoMinorVersion;
 	info.hardwareCursorData = cursorPixels;
-	if (!convertCursorImage(cursorImage, &desc, &info) || !info.cursorWidth || !info.cursorHeight)
+	lockCursorSlot();
+	if (!convertCursorImage(cursorImage, &desc, &info) || !info.cursorWidth || !info.cursorHeight) {
+		unlockCursorSlot();
 		return kIOReturnUnsupported;
+	}
 	RgfxSetCursor c = {};
 	c.display = displayId;
 	c.width = info.cursorWidth;
@@ -2548,6 +2850,7 @@ IOReturn ReimsGraphics::setCursorImage(void *cursorImage)
 	c.hot_y = info.cursorHotSpotY;
 	c.offset = regionSize - kCursorSlot;
 	IOReturn r = command(RGFX_CMD_SET_CURSOR, &c, sizeof(c));
+	unlockCursorSlot();
 	if (r == kIOReturnSuccess) {
 		hotX = info.cursorHotSpotX;
 		hotY = info.cursorHotSpotY;
@@ -2644,14 +2947,15 @@ IOReturn ReimsGraphics::postPresent(UInt32 surfaceId, UInt32 transactionId, UInt
 	// Until the boot screen is cleared, a surface's present takes the clear's seqno, written
 	// before the host can answer it (handleEvent).
 	UInt64 *clearsBootScreen =
-	    !kept && surfaceId != 0 && !__atomic_load_n(&bootScreenCleared, __ATOMIC_ACQUIRE)
+	    !isHead() && !kept && surfaceId != 0 &&
+	            !__atomic_load_n(&bootScreenCleared, __ATOMIC_ACQUIRE)
 	        ? &bootScreenSeqno
 	        : nullptr;
 	// Never waits for room: the caller does, with its lock let go (waitForRoom).
 	IOReturn r = kIOReturnSuccess;
 	if (!tryPost(RGFX_CMD_PRESENT_SURFACE, &p, cached ? sizeof(p) : sizeof(p.present), seqno,
 	             clearsBootScreen))
-		r = ready ? kIOReturnNoSpace : kIOReturnNotReady;
+		r = device && device->ready ? kIOReturnNoSpace : kIOReturnNotReady;
 	if (r == kIOReturnSuccess && !kept) {
 		IOSimpleLockLock(interruptLock);
 		pipes.shows(surfaceId);
@@ -2867,26 +3171,26 @@ IOReturn ReimsGraphics::setGammaTable(UInt32 channelCount, UInt32 dataCount, UIn
 	return r;
 }
 
-IOReturn ReimsGraphics::setPowerState(unsigned long powerStateOrdinal, IOService *device)
+IOReturn ReimsGraphics::setPowerState(unsigned long powerStateOrdinal, IOService *whatDevice)
 {
-	IOReturn r = super::setPowerState(powerStateOrdinal, device);
+	IOReturn r = super::setPowerState(powerStateOrdinal, whatDevice);
 	FBTRACE(16, "setPowerState %lu -> 0x%x", powerStateOrdinal, r);
 	return r;
 }
 
 IOReturn ReimsGraphics::powerStateWillChangeTo(IOPMPowerFlags flags, unsigned long state,
-                                               IOService *device)
+                                               IOService *whatDevice)
 {
-	IOReturn r = super::powerStateWillChangeTo(flags, state, device);
+	IOReturn r = super::powerStateWillChangeTo(flags, state, whatDevice);
 	FBTRACE(16, "powerStateWillChangeTo flags 0x%lx state %lu -> 0x%x",
 	        static_cast<unsigned long>(flags), state, r);
 	return r;
 }
 
 IOReturn ReimsGraphics::powerStateDidChangeTo(IOPMPowerFlags flags, unsigned long state,
-                                              IOService *device)
+                                              IOService *whatDevice)
 {
-	IOReturn r = super::powerStateDidChangeTo(flags, state, device);
+	IOReturn r = super::powerStateDidChangeTo(flags, state, whatDevice);
 	FBTRACE(16, "powerStateDidChangeTo flags 0x%lx state %lu -> 0x%x",
 	        static_cast<unsigned long>(flags), state, r);
 	return r;

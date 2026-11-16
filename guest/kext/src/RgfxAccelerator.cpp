@@ -494,6 +494,10 @@ bool RgfxAccelerator::start(IOService *provider)
 		keptLock = IOLockAlloc();
 	OSSafeReleaseNULL(fb);
 	fb = copyFramebuffer();
+	// The display count, where the framebuffer drives more than one (ReimsGraphics' start sets it
+	// too, where it starts after).
+	if (fb && fb->drivenDisplays() > 1)
+		setProperty("DisplayPortCount", static_cast<unsigned long long>(fb->drivenDisplays()), 64);
 	// Without the check (no bundle named, no memory for it) the accelerator stays unregistered,
 	// as without the bundle.
 	if (watchBundle())
@@ -702,26 +706,26 @@ ReimsGraphics *RgfxAccelerator::copyFramebuffer()
 	ReimsGraphics *found = nullptr;
 	OSIterator *clients = pci->getClientIterator();
 	if (clients) {
+		// Display 0's, which owns the device: the other displays' framebuffers (heads) are the
+		// PCI device's clients too.
 		while (OSObject *o = clients->getNextObject()) {
 			found = OSDynamicCast(ReimsGraphics, o);
-			if (found) {
+			if (found && !found->isHead()) {
 				found->retain();
 				break;
 			}
+			found = nullptr;
 		}
 		clients->release();
 	}
-	// Named by this accelerator's path as it stands (RgfxAccelTypes.hpp): the framebuffer, started
-	// first, named it through the PCI device's name before nameProviderForVideo renamed the device
-	// GFX0, a path that no longer leads anywhere.
+	// Named by this accelerator's path as it stands (RgfxAccelTypes.hpp), on every display's
+	// framebuffer: the framebuffer, started first, named it through the PCI device's name before
+	// nameProviderForVideo renamed the device GFX0, a path that no longer leads anywhere.
 	if (found) {
 		char path[512];
 		int length = sizeof(path);
-		if (getPath(path, &length, gIOServicePlane)) {
-			OSString *named = OSDynamicCast(OSString, found->getProperty("IOAccelTypes"));
-			if (rgfxAccelTypesStale(named ? named->getCStringNoCopy() : nullptr, path))
-				found->setProperty("IOAccelTypes", path);
-		}
+		if (getPath(path, &length, gIOServicePlane))
+			found->nameAccelerator(path);
 	}
 	// Kept once it is live, as named: the rename is this accelerator's own, at its start, before
 	// any lookup (nameProviderForVideo), so the path stays as it stands now.
@@ -731,6 +735,16 @@ ReimsGraphics *RgfxAccelerator::copyFramebuffer()
 		IOLockUnlock(keptLock);
 	}
 	return found;
+}
+
+ReimsGraphics *RgfxAccelerator::copyDisplay(UInt32 display)
+{
+	ReimsGraphics *fb = copyFramebuffer();
+	if (!fb)
+		return nullptr;
+	ReimsGraphics *driver = fb->copyDisplay(display);
+	fb->release();
+	return driver;
 }
 
 bool RgfxAccelerator::framebufferStarted()

@@ -240,6 +240,14 @@ IOReturn RgfxSurfaceUserClient::setShape(IOExternalMethodArguments *a, bool with
 			return kIOReturnBadArgument;
 		rowBytes = static_cast<UInt32>(a->scalarInput[3]);
 	}
+	// Which framebuffer index a display's surfaces name, once per index a boot
+	// (RgfxAccelerator::surfaceDisplay).
+	static char site;
+	if (a->scalarInput[1] != 0 && rgfxFirstCalls(&site, a->scalarInput[1], 1)) {
+		RgfxCaller caller;
+		IOLog("RGFX surface: %s[%d] shapes a %dx%d surface on framebuffer index %llu\n",
+		      caller.name, caller.pid, shape.w, shape.h, a->scalarInput[1]);
+	}
 	IOLockLock(stateLock);
 	haveShape = true;
 	framebufferIndex = static_cast<UInt32>(a->scalarInput[1]);
@@ -262,10 +270,18 @@ bool RgfxSurfaceUserClient::hasBacking()
 	return has;
 }
 
-bool RgfxSurfaceUserClient::isScanout(UInt32 width, UInt32 height)
+UInt32 RgfxSurfaceUserClient::framebuffer()
 {
 	IOLockLock(stateLock);
-	bool scanout = haveShape && !backing && framebufferIndex == 0 && bounds.x == 0 &&
+	const UInt32 index = framebufferIndex;
+	IOLockUnlock(stateLock);
+	return index;
+}
+
+bool RgfxSurfaceUserClient::isScanout(UInt32 display, UInt32 width, UInt32 height)
+{
+	IOLockLock(stateLock);
+	bool scanout = haveShape && !backing && framebufferIndex == display && bounds.x == 0 &&
 	               bounds.y == 0 && static_cast<UInt32>(bounds.w) == width &&
 	               static_cast<UInt32>(bounds.h) == height;
 	IOLockUnlock(stateLock);
@@ -278,9 +294,11 @@ IOReturn RgfxSurfaceUserClient::lock(IOExternalMethodArguments *a)
 	bzero(&info, sizeof(info));
 
 	RgfxAccelerator::Scanout scanout = {};
-	bool haveScanout = owner->currentScanout(&scanout);
+	// The scanout of the display the surface is drawn for (RgfxAccelerator::surfaceDisplay).
+	const UInt32 display = owner->surfaceDisplay(framebuffer());
+	bool haveScanout = owner->currentScanout(&scanout, display);
 	// The scanout is its owner's alone (RgfxScanoutOwner.hpp).
-	bool ownsScanout = owner->ownsScanout(task);
+	bool ownsScanout = owner->ownsScanout(task, display);
 	IOLockLock(stateLock);
 	if (!haveShape) {
 		IOLockUnlock(stateLock);
@@ -313,7 +331,7 @@ IOReturn RgfxSurfaceUserClient::lock(IOExternalMethodArguments *a)
 	}
 	// The scanout's pixels under the shape (RgfxSurfacePlace.hpp).
 	uint64_t at = 0;
-	bool onScanout = haveScanout && framebufferIndex == 0 &&
+	bool onScanout = haveScanout && framebufferIndex == display &&
 	                 rgfxSurfaceInScanout(bounds.x, bounds.y, bounds.w, bounds.h, scanout.width,
 	                                      scanout.height, scanout.rowBytes, &at);
 	bool current = scanoutMap && scanoutOffset == scanout.offset &&

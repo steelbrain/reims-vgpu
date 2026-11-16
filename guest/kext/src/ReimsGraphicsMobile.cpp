@@ -818,6 +818,8 @@ IOReturn ReimsGraphics::setMobileCursorImage(OSObject *surface, const RgfxMobile
 		map->release();
 		return kIOReturnBadArgument;
 	}
+	// The slot is every display's: held from the copy to the command's answer (lockCursorSlot).
+	lockCursorSlot();
 	rgfxMobileCursorCopy(image, bytesPerRow,
 	                     reinterpret_cast<const uint8_t *>(map->getVirtualAddress()) + offset,
 	                     cursorPixels);
@@ -829,7 +831,9 @@ IOReturn ReimsGraphics::setMobileCursorImage(OSObject *surface, const RgfxMobile
 	c.hot_x = image.hotX;
 	c.hot_y = image.hotY;
 	c.offset = regionSize - kCursorSlot;
-	return command(RGFX_CMD_SET_CURSOR, &c, sizeof(c));
+	const IOReturn r = command(RGFX_CMD_SET_CURSOR, &c, sizeof(c));
+	unlockCursorSlot();
+	return r;
 }
 
 // MOVE_CURSOR where the cursor's place or visibility changes: the hot spot at the swap's position

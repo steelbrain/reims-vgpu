@@ -6,6 +6,7 @@
 #include "RgfxDisplayPipeUserClient.hpp"
 
 #include "ReimsGraphics.hpp"
+#include "RgfxDisplayTable.hpp"
 #include "RgfxAccelerator.hpp"
 #include "RgfxPipeColor.hpp"
 #include "RgfxPipeNotifications.hpp"
@@ -241,9 +242,13 @@ IOReturn RgfxDisplayPipeUserClient::sAssociate(OSObject *target, void *,
 	if (!self || !self->owner)
 		return kIOReturnNotAttached;
 	UInt32 index = static_cast<UInt32>(a->scalarInput[0]);
-	// Our one display is pipe 0. A framebuffer that IOPresentment found without IOAccelIndex
-	// comes as -1: it is the same display, the only one there is.
-	if (index != 0 && index != 0xffffffffu) {
+	// Each display is the pipe of its index (rgfxPipeDisplay). A framebuffer that IOPresentment
+	// found without IOAccelIndex comes as -1: display 0's.
+	ReimsGraphics *device = self->owner->copyFramebuffer();
+	const UInt32 displays = device && device->drivenDisplays() ? device->drivenDisplays() : 1;
+	OSSafeReleaseNULL(device);
+	const int display = rgfxPipeDisplay(index, displays);
+	if (display < 0) {
 		IOLog("RGFX pipe: associate: no pipe %u\n", index);
 		return kIOReturnBadArgument;
 	}
@@ -254,9 +259,9 @@ IOReturn RgfxDisplayPipeUserClient::sAssociate(OSObject *target, void *,
 		IOLog("RGFX pipe: associate: the client lacks %s\n", kEntitlement);
 		return kIOReturnExclusiveAccess;
 	}
-	ReimsGraphics *fb = self->owner->copyFramebuffer();
+	ReimsGraphics *fb = self->owner->copyDisplay(static_cast<UInt32>(display));
 	if (!fb) {
-		IOLog("RGFX pipe: associate: no framebuffer yet\n");
+		IOLog("RGFX pipe: associate: no framebuffer yet for display %d\n", display);
 		return kIOReturnNotReady;
 	}
 	OSSafeReleaseNULL(self->framebuffer);
@@ -270,8 +275,8 @@ IOReturn RgfxDisplayPipeUserClient::sAssociate(OSObject *target, void *,
 		return kIOReturnNoResources;
 	}
 	a->scalarOutput[0] = kAcceleratorId;
-	IOLog("RGFX pipe: associated index %d with accelerator %llu\n", static_cast<int>(index),
-	      kAcceleratorId);
+	IOLog("RGFX pipe: associated index %d (display %d) with accelerator %llu\n",
+	      static_cast<int>(index), display, kAcceleratorId);
 	return kIOReturnSuccess;
 }
 

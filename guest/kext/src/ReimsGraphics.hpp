@@ -9,6 +9,17 @@
  * touches pixels. Everything else is the control ring: modes, scanout,
  * cursor, vblank and display changes.
  *
+ * Several displays (design.md, "Multiple displays"; RgfxDisplayTable.hpp): the
+ * framebuffer the kext's personality starts owns the device and drives display
+ * 0. Where it took MULTI_DISPLAY and the device lists more displays, its start
+ * makes a framebuffer of this class for each display from 1, a head, attached
+ * to the PCI device and registered after display 0's, all of one GPU
+ * (IOFBDependentID display 0's registry ID, IOFBDependentIndex the display's):
+ * each with its own modes, timings, EDID, cursor, interrupts, scanout room and
+ * server connection, posting on display 0's control ring under its lock and
+ * handed its display's events by display 0's work loop. Display 0's is the
+ * device (`device` is itself); a head's `device` is display 0's.
+ *
  * Threads: IOFramebuffer calls in on its own threads. Commands with an answer
  * wait for it, and commands without one (MOVE_CURSOR, SET_VBLANK) never
  * block, since IOFramebuffer may move the cursor with a spin lock held. The
@@ -47,6 +58,7 @@ typedef graft_iomfb_word RgfxIOMFBWord;
 #include "RgfxBootConsole.hpp"
 #include "RgfxDeferredAnswers.hpp"
 #include "RgfxDisplayModes.hpp"
+#include "RgfxDisplayTable.hpp"
 #include "RgfxPipeClients.hpp"
 #include "RgfxRingRoom.hpp"
 #include "RgfxScanoutOwner.hpp"
@@ -146,11 +158,11 @@ public:
 	IOReturn setGammaTable(UInt32 channelCount, UInt32 dataCount, UInt32 dataWidth,
 	                       void *data) override;
 #pragma clang diagnostic pop
-	IOReturn setPowerState(unsigned long powerStateOrdinal, IOService *device) override;
+	IOReturn setPowerState(unsigned long powerStateOrdinal, IOService *whatDevice) override;
 	IOReturn powerStateWillChangeTo(IOPMPowerFlags flags, unsigned long state,
-	                                IOService *device) override;
+	                                IOService *whatDevice) override;
 	IOReturn powerStateDidChangeTo(IOPMPowerFlags flags, unsigned long state,
-	                               IOService *device) override;
+	                               IOService *whatDevice) override;
 	IOReturn requestProbe(IOOptionBits options) override;
 	IOReturn message(UInt32 type, IOService *provider, void *argument = 0) override;
 	bool isConsoleDevice() override;
@@ -238,6 +250,18 @@ public:
 	// device) and from the stop on (which resets it at its end), the device holds nothing of any
 	// process's context (design.md, "Reset").
 	bool hasStarted() const { return __atomic_load_n(&started, __ATOMIC_ACQUIRE); }
+	// Whether this framebuffer is a head: it drives a display past display 0, and display 0's
+	// framebuffer owns the device for it.
+	bool isHead() const { return device && device != this; }
+	// The displays the device's framebuffers drive (rgfxDisplaysDriven): 1 where the framebuffer
+	// did not take MULTI_DISPLAY; 0 before display 0's start has read the device's displays.
+	UInt32 drivenDisplays() const { return (isHead() ? device : this)->displayCount; }
+	// The framebuffer that drives display `display` (0 is display 0's, the device's), retained for
+	// the caller, or nullptr where none does.
+	ReimsGraphics *copyDisplay(UInt32 display);
+	// Names the accelerator by its service-plane `path` (IOAccelTypes) on display 0's framebuffer
+	// and every head, where the name each holds is stale (rgfxAccelTypesStale).
+	void nameAccelerator(const char *path);
 
 	typedef void (*PipeVblankHook)(OSObject *client, UInt64 count, UInt64 time, UInt64 next);
 	typedef void (*PipePresentHook)(OSObject *client, UInt64 seqno, UInt32 status, UInt64 time);
@@ -262,6 +286,10 @@ public:
 	// Thread context only; the work loop never takes it.
 	void lockPresents() { IOLockLock(presentsLock); }
 	void unlockPresents() { IOLockUnlock(presentsLock); }
+	// The cursor slot's lock, display 0's (`cursorLock`): held from a framebuffer's write of its
+	// cursor image into the one slot to its SET_CURSOR's answer. Thread context only.
+	void lockCursorSlot() { IOLockLock((isHead() ? device : this)->cursorLock); }
+	void unlockCursorSlot() { IOLockUnlock((isHead() ? device : this)->cursorLock); }
 	// Room on the control ring for a post that found it full (RgfxRingRoom.hpp): roomMark, read
 	// before the post's look, is the work loop's passes so far; waitForRoom sleeps until a pass
 	// after `mark` (each device interrupt makes one: the host has moved on), its backstop or
@@ -467,6 +495,16 @@ private:
 	// The work loop: the completion ring and what follows from it.
 	static void serviceAction(OSObject *owner, IOInterruptEventSource *sender, int count);
 	void service();
+	// What service() sends for one display's framebuffer `fb`: the connect interrupt a change
+	// waited with, its SET_VBLANK and its SET_DISPLAY_POWER.
+	void serviceDisplay(ReimsGraphics *fb);
+	// Display 0's framebuffer and the heads, each retained, into `out` (RGFX_DISPLAYS_MAX of room),
+	// by display: their count. releaseDisplays lets them go.
+	UInt32 copyDisplays(ReimsGraphics **out);
+	static void releaseDisplays(ReimsGraphics **fbs, UInt32 n);
+	// The driven display an event's display id names: the id itself where several are driven, and
+	// display 0 where one is, whatever id the device gives it.
+	UInt32 drivenIndex(UInt32 id) const { return displayCount > 1 ? id : 0; }
 	void takeCompletions();
 	static IOReturn takeAction(OSObject *owner, void *, void *, void *, void *);
 	void lookForAnswer(const LifecycleWaiter *w);
@@ -475,6 +513,9 @@ private:
 	void drainEvents(UInt64 end);
 	void handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 *payload, UInt32 size);
 	UInt32 parseDisplays(const volatile UInt8 *payload, UInt32 size);
+	// This framebuffer's display from the `n` displays a DISPLAYS answer listed (payload
+	// `payload`), with stateLock held: its modes, connection and scale.
+	void takeListing(const RgfxListedDisplay *listed, UInt32 n, const volatile UInt8 *payload);
 	void answer(UInt64 seqno, UInt32 status);
 	bool answerLifecycle(UInt32 type, UInt64 seqno, const volatile UInt8 *payload, UInt32 size);
 
@@ -485,8 +526,22 @@ private:
 	// The boot framebuffer the OS had at the start, published (RgfxBootConsole.hpp).
 	void publishBootConsole();
 
+	// The heads (display 0's): made, attached to the PCI device and started once display 0's
+	// framebuffer has started (startHeads), and terminated as it stops (stopHeads). A head's own
+	// start and stop (startHead, stopHead); dropHead takes `head` out of display 0's table.
+	void startHeads();
+	void stopHeads();
+	bool startHead(IOService *provider);
+	void stopHead(IOService *provider);
+	void dropHead(ReimsGraphics *head);
+	// The framebuffer's properties, display 0's and each head's: the accelerator it names, and on
+	// x86-64 its dependent ID and index, the timings the OS may program and its class name.
+	void publishFramebuffer();
+
 	// Modes and scanout.
 	static UInt32 strideFor(UInt32 width);
+	// This framebuffer's display's scanout room (rgfxDisplayRoom), and its length.
+	RgfxRoom scanoutRoom() const;
 	UInt64 scanoutLimit() const;
 	IOReturn setScanout(const Mode &mode);
 	// The boot screen in the scanout, black, once the display first shows a surface (handleEvent).
@@ -626,14 +681,28 @@ private:
 	static IOReturn wranglerMessage(void *target, void *refCon, UInt32 type, IOService *wrangler,
 	                                void *argument, vm_size_t size);
 
-	// The work loop's alone: what SET_VBLANK last asked, what SET_DISPLAY_POWER last told, the
-	// refreshes' times, and a display refresh after DISPLAY_CHANGED, waiting to be sent or
-	// answered.
+	// The work loop's alone, each framebuffer's for its display: what SET_VBLANK last asked, what
+	// SET_DISPLAY_POWER last told and the refreshes' times; and, display 0's, the displays whose
+	// DISPLAY_CHANGED asked for a refresh, waiting to be sent or answered (RgfxDisplayRefresh).
 	bool vblankSent;
 	bool panelTold;
 	RgfxVblankClock vblankClock;
-	bool refreshWanted;
-	UInt64 refreshSeqno;
+	RgfxDisplayRefresh refreshes;
+
+	// Several displays (the file's head; design.md, "Multiple displays"). `device` is the
+	// framebuffer that owns the device: this one on display 0's, set at its start, and display 0's,
+	// retained, on a head, set before the head is attached. Display 0's alone: the heads by display
+	// (heads[0] unused; each retained, under interruptLock), the displays driven (displayCount: 1
+	// without MULTI_DISPLAY, the device's count with it, fixed at the start's first DISPLAYS
+	// answer), whether the host took MULTI_DISPLAY, and the cursor slot's lock, which a framebuffer
+	// holds from its write into the slot to its SET_CURSOR's answer, as the host copies the image
+	// before it answers (design.md, "One cursor slot"). A head shares display 0's stateLock,
+	// interruptLock and presentsLock, and frees none of them.
+	ReimsGraphics *device;
+	ReimsGraphics *heads[RGFX_DISPLAYS_MAX];
+	UInt32 displayCount;
+	bool multiDisplayTaken;
+	IOLock *cursorLock;
 
 	// The boot screen the scanout holds until clearBootScreen: the boot framebuffer the OS had at
 	// the start (publishBootConsole); the largest span a mode's scanout has had (setScanout, under

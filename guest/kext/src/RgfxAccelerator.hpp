@@ -394,6 +394,9 @@ public:
 	// started keeps it, and the lookups after take the kept one while it has started and is not
 	// terminated, else look it up again (RgfxKeptService.hpp).
 	ReimsGraphics *copyFramebuffer();
+	// The framebuffer that drives display `display` (ReimsGraphics::copyDisplay; 0 is the one
+	// copyFramebuffer finds, which owns the device), retained for the caller, or nullptr.
+	ReimsGraphics *copyDisplay(UInt32 display);
 	// Whether that framebuffer has started (ReimsGraphics::hasStarted): before, and once its stop
 	// has begun, the device holds nothing of any context, and no message of one reaches it.
 	bool framebufferStarted();
@@ -632,10 +635,15 @@ public:
 		UInt32 height;
 		UInt32 rowBytes;
 	};
-	bool currentScanout(Scanout *scanout);
-	// Whether `task` owns the framebuffer's scanout (ReimsGraphics::ownsScanout): only the owner
-	// locks a surface over it or is granted it.
-	bool ownsScanout(task_t task);
+	// Of display `display`'s framebuffer (copyDisplay); false where no framebuffer drives it.
+	bool currentScanout(Scanout *scanout, UInt32 display = 0);
+	// Whether `task` owns the scanout of display `display`'s framebuffer
+	// (ReimsGraphics::ownsScanout), or of display 0's where none drives it: only the owner locks a
+	// surface over it or is granted it.
+	bool ownsScanout(task_t task, UInt32 display = 0);
+	// The display an IOAccel surface of framebuffer index `index` is drawn for: the display of
+	// that index where a framebuffer drives it, else display 0, as before several displays.
+	UInt32 surfaceDisplay(UInt32 index);
 	// For our user client `client` in `task`, of context `context`: the scanout surface
 	// `surfaceId` of that task is drawn into, whose span `client` may name from then on
 	// (grantedRange) until revokeGrants or the surface goes. The device is told the span is

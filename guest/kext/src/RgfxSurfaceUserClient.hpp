@@ -63,9 +63,12 @@ public:
 	task_t owningTask() const { return task; }
 	// Whether the client gave the surface memory of its own (SetShapeBackingAndLength).
 	bool hasBacking();
-	// Whether the surface's memory is the framebuffer's scanout of `width` x `height`: on
-	// framebuffer 0, no backing of the client's, its shape the whole `width` x `height`.
-	bool isScanout(UInt32 width, UInt32 height);
+	// Whether the surface's memory is the scanout of display `display`'s framebuffer, of `width`
+	// x `height`: on that framebuffer's index, no backing of the client's, its shape the whole
+	// `width` x `height`.
+	bool isScanout(UInt32 display, UInt32 width, UInt32 height);
+	// The framebuffer index its shape names (0 before a shape).
+	UInt32 framebuffer();
 	// The scanout's mapping in the task, which a lock made, goes (the scanout's owner moved to
 	// another task, RgfxAccelerator::scanoutOwnerMoved): true where there was one.
 	bool dropScanoutMap();

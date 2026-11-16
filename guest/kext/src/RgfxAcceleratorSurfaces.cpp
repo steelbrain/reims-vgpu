@@ -149,9 +149,11 @@ void RgfxAccelerator::unregisterSurface(RgfxSurfaceUserClient *surface)
 	OSSafeReleaseNULL(gone);
 }
 
-bool RgfxAccelerator::ownsScanout(task_t task)
+bool RgfxAccelerator::ownsScanout(task_t task, UInt32 display)
 {
-	ReimsGraphics *fb = copyFramebuffer();
+	ReimsGraphics *fb = copyDisplay(display);
+	if (!fb)
+		fb = copyFramebuffer();
 	if (!fb)
 		return false;
 	bool owns = fb->ownsScanout(task);
@@ -159,9 +161,20 @@ bool RgfxAccelerator::ownsScanout(task_t task)
 	return owns;
 }
 
-bool RgfxAccelerator::currentScanout(Scanout *scanout)
+UInt32 RgfxAccelerator::surfaceDisplay(UInt32 index)
 {
-	ReimsGraphics *fb = copyFramebuffer();
+	if (index == 0)
+		return 0;
+	ReimsGraphics *fb = copyDisplay(index);
+	if (!fb)
+		return 0;
+	fb->release();
+	return index;
+}
+
+bool RgfxAccelerator::currentScanout(Scanout *scanout, UInt32 display)
+{
+	ReimsGraphics *fb = copyDisplay(display);
 	if (!fb)
 		return false;
 	bool ok = fb->currentScanout(&scanout->width, &scanout->height, &scanout->rowBytes,
@@ -178,8 +191,20 @@ bool RgfxAccelerator::currentScanout(Scanout *scanout)
 IOReturn RgfxAccelerator::grantSurfaceScanout(RgfxAcceleratorUserClient *client, UInt32 context,
                                               task_t task, UInt32 surfaceId, Scanout *scanout)
 {
+	IOLock *lock = __atomic_load_n(&surfaceState.lock, __ATOMIC_ACQUIRE);
+	// The display the surface is drawn for, its framebuffer index's (surfaceDisplay).
+	UInt32 index = 0;
+	if (lock) {
+		IOLockLock(lock);
+		for (UInt32 i = 0; i < surfaceState.count; i++) {
+			if (surfaceState.ids[i] == surfaceId && surfaceState.surfaces[i]->owningTask() == task)
+				index = surfaceState.surfaces[i]->framebuffer();
+		}
+		IOLockUnlock(lock);
+	}
+	const UInt32 display = surfaceDisplay(index);
 	// The display's pixels are its owner's alone (RgfxScanoutOwner.hpp).
-	if (!ownsScanout(task)) {
+	if (!ownsScanout(task, display)) {
 		static char site;
 		RgfxCaller caller;
 		if (rgfxFirstCalls(&site, static_cast<UInt64>(caller.pid), 2))
@@ -187,9 +212,8 @@ IOReturn RgfxAccelerator::grantSurfaceScanout(RgfxAcceleratorUserClient *client,
 			      caller.name, caller.pid);
 		return kIOReturnNotPermitted;
 	}
-	if (!currentScanout(scanout))
+	if (!currentScanout(scanout, display))
 		return kIOReturnNotReady;
-	IOLock *lock = __atomic_load_n(&surfaceState.lock, __ATOMIC_ACQUIRE);
 	if (!lock)
 		return kIOReturnNotFound;
 	IOLockLock(lock);
@@ -201,7 +225,7 @@ IOReturn RgfxAccelerator::grantSurfaceScanout(RgfxAcceleratorUserClient *client,
 	IOReturn r = kIOReturnSuccess;
 	if (!surface || surface->owningTask() != task)
 		r = kIOReturnNotFound;
-	else if (!surface->isScanout(scanout->width, scanout->height))
+	else if (!surface->isScanout(display, scanout->width, scanout->height))
 		r = kIOReturnUnsupported;
 	if (r == kIOReturnSuccess) {
 		// The client's grant, made again for this surface and the scanout as it is now.
