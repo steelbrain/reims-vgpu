@@ -233,6 +233,19 @@
 // the walk steps past it: it changes nothing the buffer does.
 #define RGFX_OP_GUEST_TIMES 14
 
+// Op `UPLOADS_WRITTEN` (as many [`RgfxUploadWritten`]s as its `len` holds, none among them),
+// where the guest took
+// [`RGFX_FEATURE_UPLOADS_WRITTEN`](crate::wire::RGFX_FEATURE_UPLOADS_WRITTEN): the bytes the
+// command buffer's encoders put, from its start, in each `Managed` buffer its body names, the
+// bundle's chunks of the bytes `set*Bytes:` hands in, which a
+// [`RGFX_CMD_BUFFER_DID_MODIFY_RANGE`](crate::wire::RGFX_CMD_BUFFER_DID_MODIFY_RANGE) of each
+// would tell. The host carries each out as the platform's `didModifyRange:` as it begins the
+// buffer, so the range reaches the buffer's GPU copy before the buffer's work with no message on
+// ring 0 for the buffer to wait for. No command buffer committed before it uses a buffer it
+// names: the bundle gives a chunk back to its pool only once the buffer that used it has
+// completed. Before its first encoder, once.
+#define RGFX_OP_UPLOADS_WRITTEN 15
+
 // [`RgfxOpSurfaceUse::flags`]: the command buffer may write the surface.
 #define RGFX_SURFACE_USE_WRITES (1 << 0)
 
@@ -1530,6 +1543,15 @@
 // (docs/graphics-kext/design.md, "Decided", 17). The arm64e kext takes it where it publishes the
 // paravirtual VideoToolbox service; the device sends `VT_MESSAGE` only to a guest that took it.
 #define RGFX_FEATURE_VT_MESSAGES 4503599627370496
+
+// `FEATURES_HI` bit 21, feature bit 53, `UPLOADS_WRITTEN`: a command buffer's stream may carry
+// [`RGFX_OP_UPLOADS_WRITTEN`](crate::ops::RGFX_OP_UPLOADS_WRITTEN), the bytes its encoders wrote
+// in the `Managed` chunks of its `set*Bytes:` data, which the host brings to their GPU copies as
+// it begins the buffer (docs/graphics-kext/design.md, bit 53). Every host offers it, and both
+// kexts take it; the bundle names the bytes there where its chunks are `Managed` (its device
+// answers `hasUnifiedMemory` NO), and a guest that did not take it tells the host each chunk's
+// bytes with a [`RGFX_CMD_BUFFER_DID_MODIFY_RANGE`] on ring 0 instead.
+#define RGFX_FEATURE_UPLOADS_WRITTEN 9007199254740992
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -7759,6 +7781,15 @@ typedef struct {
   // [`RGFX_TEXTURE_VIEW_SWIZZLE`]; 0 without it.
   uint32_t swizzle;
 } RgfxTextureView;
+
+// One `Managed` buffer an [`RGFX_OP_UPLOADS_WRITTEN`] names, and the bytes its command buffer
+// wrote there from its start.
+typedef struct {
+  // The buffer's id.
+  uint64_t buffer_obj_id;
+  // The bytes written, from the buffer's byte 0.
+  uint64_t length;
+} RgfxUploadWritten;
 
 // `VBLANK`: the display's host screen refreshed.
 typedef struct {

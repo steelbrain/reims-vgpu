@@ -7392,6 +7392,144 @@ fn a_managed_range_behind_an_answered_walk_holds_up_nothing_on_ring_0() {
     );
 }
 
+/// The bytes a command buffer's `UPLOADS_WRITTEN` names in a `Managed` buffer reach the platform
+/// as its `didModifyRange:` from the buffer's start, as the buffer begins, before its commit, with
+/// no message on ring 0; the walk steps past the op, and the buffer completes
+#[test]
+fn uploads_written_are_carried_out_before_their_command_buffer_s_commit() {
+    use reims_vgpu_graphics::ops::{RGFX_OP_UPLOADS_WRITTEN, RgfxUploadWritten};
+
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    let mut guest = Guest::new(&device);
+    assert_eq!(
+        create_queue(&device, &mut guest, 1, 1, (SUBMIT, COMPLETE), RING_DATA, 0),
+        RGFX_STATUS_OK
+    );
+    guest.send(&device, block_grant(1, BLOCK, 0x1_0000));
+    let options = std::mem::offset_of!(RgfxBufferOverHostMemory, options);
+    for (n, at) in [(2, BLOCK), (3, BLOCK + 0x1000)] {
+        let mut managed = buffer_over_host_memory(obj(1, n), at, 0x1000);
+        managed[options..options + 4].copy_from_slice(&(1u32 << 4).to_le_bytes());
+        guest.send(&device, managed);
+    }
+    let written = [
+        RgfxUploadWritten {
+            buffer_obj_id: obj(1, 2),
+            length: 0x110,
+        },
+        RgfxUploadWritten {
+            buffer_obj_id: obj(1, 3),
+            length: 0x1000,
+        },
+    ];
+    let mut ring = QueueRing::new(&device, SUBMIT, COMPLETE, u64::from(RING_DATA));
+    ring.send(
+        &device,
+        command_buffer_of(
+            obj(1, 1),
+            100,
+            &[(RGFX_OP_UPLOADS_WRITTEN, written.as_bytes())],
+        ),
+    );
+    committed(&platform, 1);
+    let calls = platform.call_log().calls();
+    let at = |sel: &str, arg: Option<Arg>| {
+        calls
+            .iter()
+            .position(|c| c.sel == sel && arg.as_ref().is_none_or(|a| c.args.first() == Some(a)))
+            .unwrap_or_else(|| panic!("no {sel}"))
+    };
+    let range = |length| {
+        Some(Arg::val(
+            &reims_vgpu_vulkan::core::platform::types::NsRange::new(0, length),
+        ))
+    };
+    let commit = at("commit", None);
+    assert!(at("didModifyRange:", range(0x110)) < commit);
+    assert!(at("didModifyRange:", range(0x1000)) < commit);
+    assert!(complete_until_event(&platform, &mut ring), "no completion");
+    let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+    assert_eq!((done.cb_obj_id, done.status), (100, RGFX_CB_OK));
+}
+
+/// A command buffer whose `UPLOADS_WRITTEN` names an object that is no `Managed` buffer, or bytes
+/// past one, fails, and nothing it names is carried out; the queue's next buffer completes
+#[test]
+fn uploads_written_of_no_managed_buffer_fail_their_command_buffer() {
+    use reims_vgpu_graphics::ops::{RGFX_OP_UPLOADS_WRITTEN, RgfxUploadWritten};
+
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    let mut guest = Guest::new(&device);
+    assert_eq!(
+        create_queue(&device, &mut guest, 1, 1, (SUBMIT, COMPLETE), RING_DATA, 0),
+        RGFX_STATUS_OK
+    );
+    guest.send(&device, block_grant(1, BLOCK, 0x1_0000));
+    let mut managed = buffer_over_host_memory(obj(1, 2), BLOCK, 0x1000);
+    let options = std::mem::offset_of!(RgfxBufferOverHostMemory, options);
+    managed[options..options + 4].copy_from_slice(&(1u32 << 4).to_le_bytes());
+    guest.send(&device, managed);
+    guest.send(
+        &device,
+        buffer_over_host_memory(obj(1, 3), BLOCK + 0x1000, 0x1000),
+    );
+    let mut ring = QueueRing::new(&device, SUBMIT, COMPLETE, u64::from(RING_DATA));
+    let cases = [
+        (obj(1, 3), 0x10, "a Shared buffer"),
+        (obj(1, 9), 0x10, "no object"),
+        (obj(1, 2), 0x1001, "past the buffer"),
+    ];
+    for (n, (buffer_obj_id, length, what)) in (100..).zip(cases) {
+        // The Managed buffer's bytes first, which a failing record after them keeps back too.
+        let written = [
+            RgfxUploadWritten {
+                buffer_obj_id: obj(1, 2),
+                length: 0x20,
+            },
+            RgfxUploadWritten {
+                buffer_obj_id,
+                length,
+            },
+        ];
+        ring.send(
+            &device,
+            command_buffer_of(
+                obj(1, 1),
+                n,
+                &[(RGFX_OP_UPLOADS_WRITTEN, written.as_bytes())],
+            ),
+        );
+        assert!(
+            complete_until_event(&platform, &mut ring),
+            "{what}: no completion"
+        );
+        let failed = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+        assert_eq!(failed.cb_obj_id, n, "{what}");
+        assert_ne!(failed.status, RGFX_CB_OK, "{what}");
+    }
+    let calls = platform.call_log().calls();
+    assert!(
+        !calls.iter().any(|c| c.sel == "didModifyRange:"),
+        "carried out"
+    );
+    ring.send(&device, command_buffer(obj(1, 1), 110));
+    assert!(complete_until_event(&platform, &mut ring), "no completion");
+    let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+    assert_eq!((done.cb_obj_id, done.status), (110, RGFX_CB_OK));
+}
+
 /// A process's queue rings at `submit`, `complete` (data `RING_DATA`), queue `n` of context 1,
 /// on `device`, after the guest granted their blocks.
 fn managed_order_queue(
@@ -9622,6 +9760,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_PIPELINE_KEYS
             | RGFX_FEATURE_PIPELINE_ANSWERS
             | RGFX_FEATURE_GUEST_TIMES
+            | RGFX_FEATURE_UPLOADS_WRITTEN
             | slots_in_pages
             | sixteen_bit
             | if carries {
@@ -9678,6 +9817,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
                 | RGFX_FEATURE_PIPELINE_KEYS
                 | RGFX_FEATURE_PIPELINE_ANSWERS
                 | RGFX_FEATURE_GUEST_TIMES
+                | RGFX_FEATURE_UPLOADS_WRITTEN
                 | RGFX_FEATURE_ICB_SLOTS_IN_PAGES
                 | RGFX_FEATURE_READ_ONLY_PAGES
                 | RGFX_FEATURE_PAGES_16K
@@ -9722,6 +9862,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_PIPELINE_KEYS
             | RGFX_FEATURE_PIPELINE_ANSWERS
             | RGFX_FEATURE_GUEST_TIMES
+            | RGFX_FEATURE_UPLOADS_WRITTEN
     );
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);

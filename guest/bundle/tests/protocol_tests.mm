@@ -579,6 +579,111 @@ void test_inline_bytes_managed()
 	}
 }
 
+// Where the device takes them in the buffer's stream too (uploadsWritten), a commit names the
+// bytes its encoders wrote in each Managed chunk in one RGFX_OP_UPLOADS_WRITTEN before its first
+// encoder, a record a chunk from its start, and posts no range message on the control ring; a
+// buffer that put no bytes carries no such op.
+void test_inline_bytes_written()
+{
+	MTLTextureDescriptor *shape =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:64
+	                                                      height:64
+	                                                   mipmapped:NO];
+	RgfxMsgHeader none = {};
+	std::vector<uint8_t> noneBytes;
+	const uint32_t a[4] = {0x11111111, 0x22222222, 0x33333333, 0x44444444};
+	const uint8_t t[8] = {9, 8, 7, 6, 5, 4, 3, 2};
+	// The records of the stream's UPLOADS_WRITTEN, which lies before its first encoder; none
+	// where it holds none.
+	auto writtenOf = [](const std::vector<Op> &ops) {
+		std::vector<RgfxUploadWritten> written;
+		bool seen = false, encoder = false;
+		for (const Op &op : ops) {
+			if (op.tag == RGFX_OP_ENCODER_BEGIN_RENDER || op.tag == RGFX_OP_ENCODER_BEGIN_COMPUTE ||
+			    op.tag == RGFX_OP_ENCODER_BEGIN_BLIT)
+				encoder = true;
+			if (op.tag != RGFX_OP_UPLOADS_WRITTEN)
+				continue;
+			CHECK(!seen && !encoder);
+			seen = true;
+			CHECK(op.body.size() % sizeof(RgfxUploadWritten) == 0);
+			for (size_t at = 0; at + sizeof(RgfxUploadWritten) <= op.body.size();
+			     at += sizeof(RgfxUploadWritten)) {
+				RgfxUploadWritten w = {};
+				std::memcpy(&w, op.body.data() + at, sizeof(w));
+				written.push_back(w);
+			}
+		}
+		return written;
+	};
+	QueueFixture fx;
+	@autoreleasepool {
+	fx.queue.uploadsManaged = YES;
+	fx.queue.uploadsWritten = YES;
+	RgfxTexture *target = shapeTexture(shape, 0x42);
+
+	// Two encoders fill one chunk: 16 bytes at 0, 8 at 256.
+	id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
+	id<MTLRenderCommandEncoder> renc = [cb renderCommandEncoderWithDescriptor:onePass(target)];
+	[renc setVertexBytes:a length:sizeof(a) atIndex:1];
+	[renc endEncoding];
+	id<MTLComputeCommandEncoder> cenc = [cb computeCommandEncoder];
+	[cenc setBytes:t length:sizeof(t) atIndex:5];
+	[cenc endEncoding];
+	auto chunk =
+	    expectMessage<RgfxBufferOverHostMemory>(fx.control, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+	CHECK(chunk.options == MTLResourceStorageModeManaged);
+	[cb commit];
+	CHECK(!fx.control.next(&none, &noneBytes));
+	uint64_t seqno = 0;
+	std::vector<Op> ops = fx.nextOps(&seqno);
+	std::vector<RgfxUploadWritten> written = writtenOf(ops);
+	CHECK(written.size() == 1);
+	if (written.size() == 1)
+		CHECK(written[0].buffer_obj_id == chunk.obj_id && written[0].length == 256 + 8);
+	auto cse = findOp(ops, RGFX_OP_COMPUTE_SET_BUFFERS)
+	               ->elem<RgfxComputeOpSetBuffers, RgfxComputeBufferBinding>(0);
+	CHECK(cse.buffer_obj_id == chunk.obj_id && cse.offset == 256);
+	fx.complete(cb, seqno);
+
+	// Bytes past the run's room take the next chunk: a record each, the first up to the run it
+	// left.
+	std::vector<uint8_t> most(RgfxUploadArena::kUploadChunkSize - 0x80, 0x3c);
+	id<MTLCommandBuffer> cb2 = [fx.queue commandBuffer];
+	id<MTLComputeCommandEncoder> cenc2 = [cb2 computeCommandEncoder];
+	[cenc2 setBytes:a length:sizeof(a) atIndex:0];
+	[cenc2 setBytes:most.data() length:most.size() atIndex:1];
+	[cenc2 endEncoding];
+	auto chunk2 =
+	    expectMessage<RgfxBufferOverHostMemory>(fx.control, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+	[cb2 commit];
+	CHECK(!fx.control.next(&none, &noneBytes));
+	uint64_t seqno2 = 0;
+	written = writtenOf(fx.nextOps(&seqno2));
+	CHECK(written.size() == 2);
+	if (written.size() == 2) {
+		const bool inOrder = written[0].buffer_obj_id == chunk.obj_id;
+		const RgfxUploadWritten &first = inOrder ? written[0] : written[1];
+		const RgfxUploadWritten &second = inOrder ? written[1] : written[0];
+		CHECK(first.buffer_obj_id == chunk.obj_id && first.length == sizeof(a));
+		CHECK(second.buffer_obj_id == chunk2.obj_id && second.length == most.size());
+	}
+	fx.complete(cb2, seqno2);
+
+	// No bytes put: no record.
+	id<MTLCommandBuffer> cb3 = [fx.queue commandBuffer];
+	id<MTLComputeCommandEncoder> cenc3 = [cb3 computeCommandEncoder];
+	[cenc3 endEncoding];
+	[cb3 commit];
+	CHECK(!fx.control.next(&none, &noneBytes));
+	uint64_t seqno3 = 0;
+	std::vector<Op> ops3 = fx.nextOps(&seqno3);
+	CHECK(findOp(ops3, RGFX_OP_UPLOADS_WRITTEN) == nullptr);
+	fx.complete(cb3, seqno3);
+	} // @autoreleasepool
+}
+
 // A parallel pass's sub-encoders fill Managed chunks from threads of their own: each chunk's
 // told extent holds every binding's bytes in it.
 void test_inline_bytes_managed_parallel()
@@ -3431,6 +3536,7 @@ void rgfxProtocolTests()
 	test_inline_bytes();
 	test_inline_bytes_parallel();
 	test_inline_bytes_managed();
+	test_inline_bytes_written();
 	test_inline_bytes_managed_parallel();
 	test_inline_bytes_without_region();
 	test_commit_behind_an_untaken_buffer_fails();

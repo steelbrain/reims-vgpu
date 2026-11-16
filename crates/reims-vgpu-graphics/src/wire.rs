@@ -480,6 +480,14 @@ pub const RGFX_FEATURE_POINTER_MOTION: u64 = 0x8_0000_0000_0000;
 /// (docs/graphics-kext/design.md, "Decided", 17). The arm64e kext takes it where it publishes the
 /// paravirtual VideoToolbox service; the device sends `VT_MESSAGE` only to a guest that took it.
 pub const RGFX_FEATURE_VT_MESSAGES: u64 = 0x10_0000_0000_0000;
+/// `FEATURES_HI` bit 21, feature bit 53, `UPLOADS_WRITTEN`: a command buffer's stream may carry
+/// [`RGFX_OP_UPLOADS_WRITTEN`](crate::ops::RGFX_OP_UPLOADS_WRITTEN), the bytes its encoders wrote
+/// in the `Managed` chunks of its `set*Bytes:` data, which the host brings to their GPU copies as
+/// it begins the buffer (docs/graphics-kext/design.md, bit 53). Every host offers it, and both
+/// kexts take it; the bundle names the bytes there where its chunks are `Managed` (its device
+/// answers `hasUnifiedMemory` NO), and a guest that did not take it tells the host each chunk's
+/// bytes with a [`RGFX_CMD_BUFFER_DID_MODIFY_RANGE`] on ring 0 instead.
+pub const RGFX_FEATURE_UPLOADS_WRITTEN: u64 = 0x20_0000_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;

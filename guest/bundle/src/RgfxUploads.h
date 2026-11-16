@@ -31,10 +31,17 @@
  * the GPU reads them from its own memory, as Metal's driver copies set*Bytes data into its own
  * memory on the AMD 5300M (1.00x of a Private buffer's reads, where a Shared buffer's over the
  * bus read 1.05x at 4 KiB and up to 1.5x at 64 KiB on a dependent chain; measured with a
- * constant-read probe under macOS 26.7.1, 2026-11-16). The range message goes ahead of the
- * command buffer on the control ring, as an app's does, and the host copies the range into the
- * GPU's copy before the buffer's commands. A chunk goes back to its pool only once the host has
- * completed the command buffer, so no command buffer in flight reads a chunk a later one writes.
+ * constant-read probe under macOS 26.7.1, 2026-11-16). Where the device's word holds
+ * RGFX_FEATURE_UPLOADS_WRITTEN, the extents ride the command buffer's own stream
+ * (RGFX_OP_UPLOADS_WRITTEN), which the host carries out as it begins the buffer; else a range
+ * message of each goes ahead of the command buffer on the control ring, as an app's does. Either
+ * way the host copies the range into the GPU's copy before the buffer's commands. The stream's
+ * record waits for nothing on ring 0, where a range message costs the commit a held message's
+ * timer and kext call, and the buffer a wait at the host's gate for the lane that carries the
+ * message out (traced on an RX 7900 XTX host, 2026-11-16: medians of 12 and 11 us more before
+ * the host took a one-dispatch buffer, and 18 to 26 us more at the gate). A chunk goes back to its pool only once the host has completed the command buffer,
+ * so no command buffer in flight reads a chunk a later one writes, and none committed before the
+ * buffer uses a chunk it names.
  * Where the GPU shares the CPU's memory the chunks are Shared, and the host reads them in place.
  *
  * Thread safety: one thread puts through a cursor at a time, as Metal's encoders are used; the
@@ -199,10 +206,13 @@ public:
 	void release(RgfxUploadCursor &cursor);
 
 	/// At the command buffer's commit, once its encoders have ended: where the pool's chunks are
-	/// Managed, a didModifyRange: of each chunk's bytes the puts wrote, from its start to the end
-	/// of the last run's bytes, so the host's copy of them in the GPU's memory holds them before
-	/// the buffer runs. Nothing where they are Shared, or nothing was put.
-	void tellWritten();
+	/// Managed, tells the host each chunk's bytes the puts wrote, from its start to the end of the
+	/// last run's bytes, so the host's copy of them in the GPU's memory holds them before the
+	/// buffer runs: as records of the buffer's RGFX_OP_UPLOADS_WRITTEN appended to `stream`, where
+	/// given (the device's word holds RGFX_FEATURE_UPLOADS_WRITTEN), else, and for a chunk whose
+	/// buffer names no range itself (RgfxBuffer's rgfxRangeObjId), by its didModifyRange:.
+	/// Nothing where they are Shared, or nothing was put.
+	void tellWritten(std::vector<RgfxUploadWritten> *stream = nullptr);
 
 	/// Gives every chunk taken back to the pool: the host is done reading them. A cursor's run
 	/// taken before it is the pool's again, and the cursor's next put takes another.

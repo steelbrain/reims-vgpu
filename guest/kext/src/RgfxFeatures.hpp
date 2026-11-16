@@ -169,7 +169,11 @@
 //  - VT_MESSAGES (bit 52), the arm64e kext alone: the framebuffer publishes the VideoToolbox
 //    service where the host's caps list a decoder, carries its clients' messages to the host as
 //    VT_MESSAGEs and hands them the host's VT_MESSAGE events (RgfxVtService.hpp), which needs
-//    nothing of the bundle; an x86-64 guest's hardware video is AppleGVA's (RgfxVideoCodecs.hpp).
+//    nothing of the bundle; an x86-64 guest's hardware video is AppleGVA's (RgfxVideoCodecs.hpp);
+//  - UPLOADS_WRITTEN (bit 53), both kexts: where the bundle's upload chunks are Managed (its
+//    device answers hasUnifiedMemory NO), each command buffer names the bytes its encoders wrote
+//    in them in its own stream (RGFX_OP_UPLOADS_WRITTEN, RgfxUploads.h), in place of a
+//    BUFFER_DID_MODIFY_RANGE of each on ring 0, which needs nothing of the kext.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -211,7 +215,7 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_ICB_SLOTS_IN_PAGES | RGFX_FEATURE_DOORBELL_ASKS | RGFX_FEATURE_GUEST_TIMES |
     RGFX_FEATURE_READ_ONLY_PAGES | RGFX_FEATURE_DOORBELL_PAGES | RGFX_FEATURE_PIPELINE_ANSWERS |
     RGFX_FEATURE_POINTER_MOTION | RGFX_FEATURE_MULTI_DISPLAY |
-    RGFX_FEATURE_POINTER_OVER | RGFX_FEATURE_DISPLAY_BOUNDS |
+    RGFX_FEATURE_POINTER_OVER | RGFX_FEATURE_DISPLAY_BOUNDS | RGFX_FEATURE_UPLOADS_WRITTEN |
     (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K | RGFX_FEATURE_VT_MESSAGES
                       : RGFX_FEATURE_DISPLAY_POWER);
 

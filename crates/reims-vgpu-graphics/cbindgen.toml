@@ -339,6 +339,7 @@ include = [
     "RgfxTextureFromIOSurface",
     "RgfxTextureReplaceRegion",
     "RgfxTextureView",
+    "RgfxUploadWritten",
     "RgfxVblank",
     "RgfxVertexAttribute",
     "RgfxVertexBufferLayout",

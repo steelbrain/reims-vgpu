@@ -131,6 +131,13 @@ NS_ASSUME_NONNULL_BEGIN
 /// chunks.
 @property(nonatomic) BOOL uploadsManaged;
 
+/// Whether its command buffers name the bytes their encoders wrote in its Managed upload chunks
+/// in their own streams (RGFX_OP_UPLOADS_WRITTEN), which the host carries out as it begins each,
+/// where the device's word holds RGFX_FEATURE_UPLOADS_WRITTEN; else each commit tells them with a
+/// didModifyRange: of each chunk, a range message on the control ring (RgfxUploads.h). Meaningful
+/// only with uploadsManaged; NO by default.
+@property(nonatomic) BOOL uploadsWritten;
+
 /// Whether a command buffer of it that commitAndWaitUntilSubmitted commits, or that it commits
 /// once one of its buffers has presented a drawable, asks the host for its submission
 /// (RGFX_OP_SUBMITTED), where the device has RGFX_FEATURE_CB_SUBMITTED: the call then returns at

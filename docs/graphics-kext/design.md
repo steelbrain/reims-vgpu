@@ -2267,6 +2267,21 @@ only where no negotiation can carry it.
   service only where the caps list a decoder; the x86-64 kext and the firmware
   drivers do not. The host offers it where its video arm lands VideoToolbox's
   decodes in the guest's surfaces (item 17).
+- Bit 53, `FEATURES_HI`'s bit 21, is `UPLOADS_WRITTEN`: a command buffer's
+  stream may carry `UPLOADS_WRITTEN` (0x000f, before its first encoder, once:
+  as many `RgfxUploadWritten` records, `buffer_obj_id` and `length`, as its
+  `len` holds), the bytes its encoders wrote from the start of each Managed
+  upload chunk it used. The host carries each out as the platform's
+  `didModifyRange:` of that range as it begins the buffer, before its commit,
+  so the buffer waits at the gate for no range message on ring 0: no command
+  buffer committed before it uses a chunk it names, as the bundle gives a
+  chunk back only once the buffer that used it has completed. A record of an
+  object that is no Managed buffer, or of bytes past one, fails the buffer,
+  and none of its records is carried out. Every host offers it, and both kexts
+  take it; the bundle names the bytes there where its chunks are Managed (the
+  device answers `hasUnifiedMemory` NO), and else, on a host that did not
+  offer it, sends a `BUFFER_DID_MODIFY_RANGE` of each chunk ahead of the
+  buffer, as before the bit.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -4540,11 +4555,12 @@ the host's import, and the kext's block table holds one entry per slab:
   ran at 13 MB/s (Decided 5, "The guest maps host memory only"). A queue's
   upload chunks, the bytes `set*Bytes:` hands in, are buffers of the slabs
   too: Shared where the device answers `hasUnifiedMemory` YES, so the GPU
-  reads them in place, and Managed where it answers NO, each commit sending a
-  `BUFFER_DID_MODIFY_RANGE` of each chunk's written bytes ahead of the
-  command buffer, so the host copies them into the GPU's own memory before
-  the buffer runs, as Metal's driver copies `setBytes:` data into its own
-  memory on the AMD 5300M (`guest/bundle/src/RgfxUploads.h`). A slab let go
+  reads them in place, and Managed where it answers NO, each commit naming
+  each chunk's written bytes in the buffer's own stream (`UPLOADS_WRITTEN`,
+  bit 53), or, on a host without the bit, in a `BUFFER_DID_MODIFY_RANGE` of
+  each ahead of the command buffer, so the host copies them into the GPU's
+  own memory before the buffer runs, as Metal's driver copies `setBytes:` data
+  into its own memory on the AMD 5300M (`guest/bundle/src/RgfxUploads.h`). A slab let go
   destroys its heap, releases its pages block (the
   kext answers once the host let go of it, and unwires the pages), then
   deallocates its pages.

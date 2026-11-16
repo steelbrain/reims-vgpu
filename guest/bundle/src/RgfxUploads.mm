@@ -264,7 +264,7 @@ void RgfxUploadArena::noteWritten(const RgfxUploadCursor &cursor)
 	chunk.written = std::max(chunk.written, std::min(cursor.at, chunk.size));
 }
 
-void RgfxUploadArena::tellWritten()
+void RgfxUploadArena::tellWritten(std::vector<RgfxUploadWritten> *stream)
 {
 	if (m_pool == nullptr || !m_pool->managed())
 		return;
@@ -278,8 +278,15 @@ void RgfxUploadArena::tellWritten()
 	}
 	os_unfair_lock_unlock(&m_lock);
 	// The chunks are the arena's until giveBack, after the host completed the buffer.
-	for (const auto &[buffer, length] : written)
-		[buffer didModifyRange:NSMakeRange(0, static_cast<NSUInteger>(length))];
+	for (const auto &[buffer, length] : written) {
+		const uint64_t objId = stream != nullptr && [buffer isKindOfClass:[RgfxBuffer class]]
+		                           ? [static_cast<RgfxBuffer *>(buffer) rgfxRangeObjId]
+		                           : 0;
+		if (objId != 0)
+			stream->push_back(RgfxUploadWritten{objId, length});
+		else
+			[buffer didModifyRange:NSMakeRange(0, static_cast<NSUInteger>(length))];
+	}
 }
 
 void RgfxUploadArena::giveBack()

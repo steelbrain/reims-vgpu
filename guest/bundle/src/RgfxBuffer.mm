@@ -790,6 +790,15 @@ RGFX_RESOURCE_SPI
 	_serializer->bufferDidModifyRange([self rgfxObjId], range.location, range.length);
 }
 
+- (uint64_t)rgfxRangeObjId
+{
+	// As didModifyRange: tells the host, with no shadow to sync in first.
+	if ([self storageMode] != MTLStorageModeManaged || _ownsContents || _serializer == nullptr ||
+	    _shadow != nullptr)
+		return 0;
+	return [self rgfxObjId];
+}
+
 // --- what a buffer that is not sparse or remote answers ------------------------------
 
 - (BOOL)rgfxOverCallerBytes

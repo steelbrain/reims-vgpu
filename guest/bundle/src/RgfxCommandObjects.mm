@@ -2223,9 +2223,17 @@ enum RgfxStage : unsigned {
 	// So do the copies of app memory it uses, which take the bytes the CPU wrote since.
 	_shadowWrites = rgfxShadowsSyncIn(_encoder->takeShadowUses());
 	// Its encoders' inline bytes reach the GPU's copy of their chunks before it runs, where the
-	// chunks are Managed: the range messages go on the control ring ahead of it (RgfxUploads.h).
-	if (_uploads != nullptr)
-		_uploads->tellWritten();
+	// chunks are Managed: named in its own stream, where its queue's device carries that out, else
+	// in range messages on the control ring ahead of it (RgfxUploads.h).
+	if (_uploads != nullptr) {
+		if ([_queue uploadsWritten]) {
+			std::vector<RgfxUploadWritten> written;
+			_uploads->tellWritten(&written);
+			_encoder->prependUploadsWritten(written.data(), written.size());
+		} else {
+			_uploads->tellWritten();
+		}
+	}
 	// With no handler to run and nothing to write back, its records run on the thread that takes
 	// them off the ring, where nothing of the queue's waits on the completion queue: no handler
 	// can be added after the commit, so the lists are final here.

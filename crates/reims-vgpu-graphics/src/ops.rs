@@ -149,6 +149,18 @@ pub const RGFX_OP_COMMIT_ORDER: u16 = 0x000d;
 /// [`RGFX_GUEST_TIMES_POSTED_OFFSET`] in the message. The host reads it as it takes the buffer, and
 /// the walk steps past it: it changes nothing the buffer does.
 pub const RGFX_OP_GUEST_TIMES: u16 = 0x000e;
+/// Op `UPLOADS_WRITTEN` (as many [`RgfxUploadWritten`]s as its `len` holds, none among them),
+/// where the guest took
+/// [`RGFX_FEATURE_UPLOADS_WRITTEN`](crate::wire::RGFX_FEATURE_UPLOADS_WRITTEN): the bytes the
+/// command buffer's encoders put, from its start, in each `Managed` buffer its body names, the
+/// bundle's chunks of the bytes `set*Bytes:` hands in, which a
+/// [`RGFX_CMD_BUFFER_DID_MODIFY_RANGE`](crate::wire::RGFX_CMD_BUFFER_DID_MODIFY_RANGE) of each
+/// would tell. The host carries each out as the platform's `didModifyRange:` as it begins the
+/// buffer, so the range reaches the buffer's GPU copy before the buffer's work with no message on
+/// ring 0 for the buffer to wait for. No command buffer committed before it uses a buffer it
+/// names: the bundle gives a chunk back to its pool only once the buffer that used it has
+/// completed. Before its first encoder, once.
+pub const RGFX_OP_UPLOADS_WRITTEN: u16 = 0x000f;
 
 /// [`RgfxOpSurfaceUse::flags`]: the command buffer may write the surface.
 pub const RGFX_SURFACE_USE_WRITES: u32 = 1 << 0;
@@ -226,6 +238,19 @@ pub struct RgfxSurfaceOrderWait {
     pub queue_obj_id: u64,
     /// The buffer's `seqno` on the queue's submission ring.
     pub seqno: u64,
+}
+
+/// One `Managed` buffer an [`RGFX_OP_UPLOADS_WRITTEN`] names, and the bytes its command buffer
+/// wrote there from its start.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxUploadWritten {
+    /// The buffer's id.
+    pub buffer_obj_id: u64,
+    /// The bytes written, from the buffer's byte 0.
+    pub length: u64,
 }
 
 /// The body of [`RGFX_OP_SIGNAL_EVENT`] and [`RGFX_OP_WAIT_EVENT`].
@@ -559,6 +584,8 @@ const _: () = {
                 + core::mem::offset_of!(RgfxOpGuestTimes, posted_ns)
     );
     assert!(size_of::<RgfxSurfaceOrderWait>() == 16);
+    assert!(op_group(RGFX_OP_UPLOADS_WRITTEN) == RGFX_OP_GROUP_FRAMING);
+    assert!(size_of::<RgfxUploadWritten>() == 16);
     assert!(op_group(RGFX_OP_ENCODER_BEGIN_VIDEO) == RGFX_OP_GROUP_FRAMING);
     assert!(op_group(RGFX_OP_SURFACE_USE) == RGFX_OP_GROUP_FRAMING);
     // Each group's tag range maps to its own `op_group`.

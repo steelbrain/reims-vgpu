@@ -151,6 +151,12 @@ static inline BOOL RgfxMakesNoResourceOf(MTLResourceOptions options)
 /// the length is the caller's own.
 - (BOOL)rgfxOverCallerBytes;
 
+/// The id a didModifyRange: of the buffer names to the host where it names one with nothing to
+/// do first: a Managed buffer whose CPU copy is the device's memory, neither pages of its own
+/// (the host holds none of it) nor app memory a shadow copies in. 0 for any other, whose
+/// didModifyRange: tells the host what it must, or nothing.
+- (uint64_t)rgfxRangeObjId;
+
 /// Designated initialiser: wraps an already-created host buffer. `objId` and
 /// `gpuAddress` are the guest-picked values the create returned; `length` and
 /// `options` are the buffer's. Allocates the CPU-visible backing `contents` vends,

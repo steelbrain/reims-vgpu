@@ -151,6 +151,16 @@ void RgfxEncoder::prependCommitOrder(const RgfxSurfaceOrderWait *waits, size_t c
 	std::memcpy(at + RGFX_OP_BODY_OFFSET, waits, count * sizeof(RgfxSurfaceOrderWait));
 }
 
+void RgfxEncoder::prependUploadsWritten(const RgfxUploadWritten *written, size_t count)
+{
+	if (count == 0)
+		return;
+	const size_t len = RGFX_OP_BODY_OFFSET + count * sizeof(RgfxUploadWritten);
+	uint8_t *at = prependRoom(len);
+	putHeader(at, RGFX_OP_UPLOADS_WRITTEN, len);
+	std::memcpy(at + RGFX_OP_BODY_OFFSET, written, count * sizeof(RgfxUploadWritten));
+}
+
 bool RgfxEncoder::prependGuestTimes()
 {
 	if (!m_timesPending)

@@ -96,8 +96,11 @@ constexpr uint64_t kPointerMotion = RGFX_FEATURE_POINTER_MOTION;
 // the x86-64 kext does not.
 constexpr uint64_t kVtMessages = RGFX_FEATURE_VT_MESSAGES;
 constexpr uint64_t kVtMessagesCarried = RGFX_GUEST_ARM64 ? kVtMessages : 0;
+// UPLOADS_WRITTEN, which both kexts carry, their bundle naming its Managed upload chunks' bytes in
+// each command buffer's stream.
+constexpr uint64_t kUploadsWritten = RGFX_FEATURE_UPLOADS_WRITTEN;
 // A bit the wire does not name.
-constexpr uint64_t kUnnamed = 1ull << 53;
+constexpr uint64_t kUnnamed = 1ull << 54;
 // Every bit the wire names from bit 3 that the kext does not carry out yet.
 constexpr uint64_t kNotCarried = RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_CONSUMED_DOORBELL |
                                  RGFX_FEATURE_QUEUE_BARRIER | RGFX_FEATURE_CB_PARTS |
@@ -181,7 +184,7 @@ constexpr uint64_t kCarried = kPages | kOrder | kIcb | kUnshared | kManaged | kH
                               kSlotsInPages | kDoorbellAsks | kGuestTimes | kReadOnlyPages |
                               kDoorbellPages | kPipelineAnswers | kDisplayPowerCarried |
                               kMultiDisplayCarried | kPointerOverCarried | kDisplayBoundsCarried |
-                              kPointerMotion | k16KCarried | kVtMessagesCarried;
+                              kPointerMotion | k16KCarried | kVtMessagesCarried | kUploadsWritten;
 // Every bit the wire names from bit 3.
 constexpr uint64_t kNew = kNotCarried | kCarried;
 } // namespace
@@ -196,9 +199,9 @@ int main()
 	// SURFACE_DEFERRED_ASK, SURFACE_DEFERRED_CARRY, SCHEDULED_ASK, DISPLAY_SCALE,
 	// TEXTURE_DID_MODIFY_DATA, RATE_MAPS, FUNCTION_POINTERS, DYNAMIC_LIBRARIES, PIPELINE_KEYS,
 	// ICB_SLOTS_IN_PAGES, DOORBELL_ASKS, GUEST_TIMES, READ_ONLY_PAGES, DOORBELL_PAGES,
-	// PIPELINE_ANSWERS, POINTER_MOTION, MULTI_DISPLAY, POINTER_OVER, DISPLAY_BOUNDS and, the x86-64
-	// kext, DISPLAY_POWER, or, the arm64e kext, PAGES_16K and VT_MESSAGES, and writes each only
-	// where offered.
+	// PIPELINE_ANSWERS, POINTER_MOTION, MULTI_DISPLAY, POINTER_OVER, DISPLAY_BOUNDS,
+	// UPLOADS_WRITTEN and, the x86-64 kext, DISPLAY_POWER, or, the arm64e kext, PAGES_16K and
+	// VT_MESSAGES, and writes each only where offered.
 	check(kRgfxCarriedFeatures == kCarried,
 	      "the kext takes PAGES_BUFFERS, SURFACE_ORDER, ICBs, UNSHARED_QUEUES, MANAGED_AT_OFFSET, "
 	      "HEAP_OVER_PAGES, SUBMIT_ROOM, ICB slots, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, "
@@ -208,8 +211,8 @@ int main()
 	      "DISPLAY_SCALE, TEXTURE_DID_MODIFY_DATA, RATE_MAPS, FUNCTION_POINTERS, DYNAMIC_LIBRARIES, "
 	      "PIPELINE_KEYS, ICB_SLOTS_IN_PAGES, DOORBELL_ASKS, GUEST_TIMES, READ_ONLY_PAGES, "
 	      "DOORBELL_PAGES, PIPELINE_ANSWERS, POINTER_MOTION, MULTI_DISPLAY, POINTER_OVER, "
-	      "DISPLAY_BOUNDS and, on x86-64, DISPLAY_POWER, on arm64e PAGES_16K and VT_MESSAGES, "
-	      "from bit 3");
+	      "DISPLAY_BOUNDS, UPLOADS_WRITTEN and, on x86-64, DISPLAY_POWER, on arm64e PAGES_16K and "
+	      "VT_MESSAGES, from bit 3");
 	check(RGFX_FEATURE_PAGES_BUFFERS == (1u << 7), "PAGES_BUFFERS is bit 7");
 	check(RGFX_FEATURE_SURFACE_ORDER == (1u << 11), "SURFACE_ORDER is bit 11");
 	check(RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS == (1u << 12), "INDIRECT_COMMAND_BUFFERS is bit 12");
@@ -458,6 +461,15 @@ int main()
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kVtMessages) ==
 	          kVtMessagesCarried,
 	      "VT_MESSAGES offered, written by the arm64e kext alone");
+	check(RGFX_FEATURE_UPLOADS_WRITTEN == (1ull << 53), "UPLOADS_WRITTEN is bit 53");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kUploadsWritten) ==
+	          kUploadsWritten,
+	      "UPLOADS_WRITTEN offered, written by both kexts");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kUploadsWritten, 0) == kRgfxOfferedFeatures,
+	      "UPLOADS_WRITTEN offered but not taken is not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kUploadsWritten, kUploadsWritten) ==
+	          (kRgfxOfferedFeatures | kUploadsWritten),
+	      "UPLOADS_WRITTEN taken is in the word");
 	// PAGES_16K: the arm64e kext writes it first where offered, and then with the rest; the
 	// x86-64 kext never writes it, and writes nothing first.
 	check(rgfxDriverFeaturesFirst(~0ull) == k16KCarried, "PAGES_16K first where carried");

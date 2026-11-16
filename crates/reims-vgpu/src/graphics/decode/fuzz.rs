@@ -31,8 +31,8 @@ use reims_vgpu_graphics::ops::{
     RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_COMMIT_ORDER, RGFX_OP_ENCODER_BEGIN_BLIT,
     RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_END,
     RGFX_OP_GUEST_TIMES, RGFX_OP_SIGNAL_EVENT, RGFX_OP_SUBMITTED, RGFX_OP_SURFACE_ORDER,
-    RGFX_OP_SURFACE_USE, RGFX_OP_WAIT_EVENT, RGFX_PASS_FLAG_RT_SIZE, RgfxCommandBuffer,
-    RgfxOpHeader, RgfxRenderPassColorAttachment, RgfxRenderPassDesc,
+    RGFX_OP_SURFACE_USE, RGFX_OP_UPLOADS_WRITTEN, RGFX_OP_WAIT_EVENT, RGFX_PASS_FLAG_RT_SIZE,
+    RgfxCommandBuffer, RgfxOpHeader, RgfxRenderPassColorAttachment, RgfxRenderPassDesc,
 };
 use reims_vgpu_graphics::region::Region;
 use reims_vgpu_graphics::wire::{
@@ -854,7 +854,8 @@ fn an_answer_at_the_doorbell_keeps_the_order_of_a_take() {
 
 /// The tags the fuzz counts as known are the wire's own ([`last_tags`]): each group holds some, the
 /// tag past each group's last is unknown, and framing's reaches the ops the walk takes or steps
-/// past after `ENCODER_BEGIN_VIDEO` (`SURFACE_ORDER`, `COMMIT_ORDER`, `GUEST_TIMES`).
+/// past after `ENCODER_BEGIN_VIDEO` (`SURFACE_ORDER`, `COMMIT_ORDER`, `GUEST_TIMES`,
+/// `UPLOADS_WRITTEN`).
 #[test]
 fn the_known_tags_are_the_wire_s() {
     let last = last_tags();
@@ -866,6 +867,7 @@ fn the_known_tags_are_the_wire_s() {
         RGFX_OP_SURFACE_ORDER,
         RGFX_OP_COMMIT_ORDER,
         RGFX_OP_GUEST_TIMES,
+        RGFX_OP_UPLOADS_WRITTEN,
     ] {
         assert!(!unknown(tag), "{tag:#x}");
     }

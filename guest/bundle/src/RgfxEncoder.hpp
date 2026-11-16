@@ -633,6 +633,10 @@ public:
 	/// Puts one RGFX_OP_COMMIT_ORDER naming `waits` (`count` of them) before the op stream's first
 	/// op, as prependSurfaceOrder does; nothing where `count` is 0.
 	void prependCommitOrder(const RgfxSurfaceOrderWait *waits, size_t count);
+	/// Puts one RGFX_OP_UPLOADS_WRITTEN of the `count` records `written` (the bytes the buffer's
+	/// encoders wrote in each Managed upload chunk, RgfxUploadArena::tellWritten) before the op
+	/// stream's first op, as prependCommitOrder does; nothing where `count` is 0.
+	void prependUploadsWritten(const RgfxUploadWritten *written, size_t count);
 	/// Where the device's word holds RGFX_FEATURE_GUEST_TIMES: the finished stream starts with
 	/// RGFX_OP_GUEST_TIMES (the last op put first, by finish), the buffer made at `beganNs`, the
 	/// guest's clock (rgfxGuestClockNs), committed as noteCommitted says, and posted as its message

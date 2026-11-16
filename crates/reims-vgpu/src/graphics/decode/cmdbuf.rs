@@ -122,14 +122,14 @@ use reims_vgpu_graphics::ops::{
     RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_BEGIN_VIDEO, RGFX_OP_ENCODER_END,
     RGFX_OP_GROUP_BLIT, RGFX_OP_GROUP_COMPUTE, RGFX_OP_GROUP_FRAMING, RGFX_OP_GROUP_RENDER,
     RGFX_OP_GROUP_VIDEO, RGFX_OP_GUEST_TIMES, RGFX_OP_SIGNAL_EVENT, RGFX_OP_SUBMITTED,
-    RGFX_OP_SURFACE_ORDER, RGFX_OP_SURFACE_USE, RGFX_OP_WAIT_EVENT,
+    RGFX_OP_SURFACE_ORDER, RGFX_OP_SURFACE_USE, RGFX_OP_UPLOADS_WRITTEN, RGFX_OP_WAIT_EVENT,
     RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT, RGFX_PASS_FLAG_RATE_MAP,
     RGFX_PASS_FLAG_RT_ARRAY_LENGTH, RGFX_PASS_FLAG_RT_SIZE, RGFX_PASS_FLAG_SAMPLE_POSITIONS,
     RGFX_PASS_FLAG_VISIBILITY_RESULT, RGFX_PASS_MAX_SAMPLE_POSITIONS,
     RGFX_RENDER_PASS_COLOR_OFFSET, RgfxCommandBuffer, RgfxComputePassDesc, RgfxOpEvent,
     RgfxOpHeader, RgfxOpSurfaceUse, RgfxOpVideoPass, RgfxRenderPassColorAttachment,
     RgfxRenderPassDesc, RgfxRenderPassRateMap, RgfxRenderPassSamplePositions,
-    RgfxRenderPassVisibility, RgfxSurfaceOrderWait, op_group,
+    RgfxRenderPassVisibility, RgfxSurfaceOrderWait, RgfxUploadWritten, op_group,
 };
 use reims_vgpu_graphics::wire::{
     RGFX_EVT_CB_SCHEDULED, RGFX_EVT_CB_SUBMITTED, RGFX_EVT_EVENT_SIGNALLED, RgfxCbScheduled,
@@ -1099,6 +1099,10 @@ struct Take {
     predicates: bool,
     /// The luma and chroma textures of each of its decodes, in stream order.
     decodes: Vec<(u64, u64)>,
+    /// The `Managed` buffers its first `UPLOADS_WRITTEN` names, with the bytes the buffer wrote
+    /// in each, which its begin brings to their GPU copies ([`GraphicsDecoder::uploads_written`]);
+    /// empty where it holds none.
+    written: Vec<RgfxUploadWritten>,
 }
 
 /// Whether the op stream `ops` ends in a `SUBMITTED`, where the bundle puts it: appended as the
@@ -1143,6 +1147,13 @@ fn take(mut ops: &[u8]) -> Take {
             RGFX_OP_COMMIT_ORDER if out.commit_after.is_empty() => {
                 let body = &ops[RGFX_OP_BODY_OFFSET as usize..len];
                 out.commit_after = Glance::order_waits(body).collect();
+            }
+            RGFX_OP_UPLOADS_WRITTEN if out.written.is_empty() => {
+                let body = &ops[RGFX_OP_BODY_OFFSET as usize..len];
+                let (written, _) = body.as_chunks::<{ size_of::<RgfxUploadWritten>() }>();
+                out.written = (written.iter())
+                    .filter_map(|w| RgfxUploadWritten::read_from_bytes(w).ok())
+                    .collect();
             }
             RGFX_OP_ENCODER_BEGIN_VIDEO => out.video = true,
             RGFX_OP_ENCODER_BEGIN_RENDER
@@ -1786,6 +1797,11 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(counts) = self.queue_counts(m.queue_obj_id) else {
             return Ok(Err(DecodeError::BadReference));
         };
+        // The bytes it wrote in its `Managed` chunks reach their GPU copies by its commit, before
+        // its work, as a range message of each before it would bring them.
+        if let Err(e) = self.uploads_written(&take.written) {
+            return Ok(Err(e));
+        }
         let Some(cb) = queue.command_buffer(ON)? else {
             return Ok(Err(DecodeError::Refused));
         };
@@ -3460,13 +3476,14 @@ impl<P: Platform> GraphicsDecoder<P> {
                     events.waits.push((op.event_obj_id, op.value));
                 }
             }
-            // Carried out before the walk, wherever they lie ([`take`]); the guest's times are
-            // the device's, read as it took the buffer.
+            // Carried out before the walk, wherever they lie ([`take`]), the bytes its uploads
+            // wrote at its begin; the guest's times are the device's, read as it took the buffer.
             RGFX_OP_SURFACE_USE
             | RGFX_OP_SUBMITTED
             | RGFX_OP_SURFACE_ORDER
             | RGFX_OP_COMMIT_ORDER
-            | RGFX_OP_GUEST_TIMES => {}
+            | RGFX_OP_GUEST_TIMES
+            | RGFX_OP_UPLOADS_WRITTEN => {}
             _ => return Err(unknown_op(tag)),
         }
         Ok(())
@@ -3827,7 +3844,8 @@ fn deal(ops: &[u8], min_bytes: usize, chunk_bytes: usize, most: usize) -> Option
             | RGFX_OP_SUBMITTED
             | RGFX_OP_SURFACE_ORDER
             | RGFX_OP_COMMIT_ORDER
-            | RGFX_OP_GUEST_TIMES => {}
+            | RGFX_OP_GUEST_TIMES
+            | RGFX_OP_UPLOADS_WRITTEN => {}
             RGFX_OP_RENDER_EXECUTE_COMMANDS_IN_BUFFER
             | RGFX_OP_RENDER_EXECUTE_COMMANDS_INDIRECT
             | RGFX_OP_RENDER_USE_RESOURCES

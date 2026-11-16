@@ -34,7 +34,13 @@
 //! out once the process's command buffers answered `CB_SUBMITTED` before it are committed, with no
 //! wait on ring 0 ([`GraphicsDecoder::after_submitted`]); every command buffer of the process
 //! begun after it, on any queue, is committed after it, so it is ordered before every command
-//! buffer committed after it, as Metal promises.
+//! buffer committed after it, as Metal promises. The bytes a command buffer wrote in its own
+//! `Managed` chunks of `set*Bytes:` data ride its stream instead (`RGFX_OP_UPLOADS_WRITTEN`, where
+//! the guest took `RGFX_FEATURE_UPLOADS_WRITTEN`), each the platform's `didModifyRange:` from the
+//! buffer's start as the buffer begins, on its thread, before its commit
+//! ([`GraphicsDecoder::uploads_written`]): no command buffer committed before it uses a chunk it
+//! names, as the bundle gives a chunk back to its pool only once the buffer that used it has
+//! completed, so the buffer waits for no message on ring 0 for them.
 //!
 //! A shape the platform cannot make in place takes the two copies on any GPU: more than one level,
 //! a cube, a 3D texture, a block-compressed format. No creator of a texture over a buffer makes
@@ -71,6 +77,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use reims_vgpu_graphics::managed::LinearLayout;
+use reims_vgpu_graphics::ops::RgfxUploadWritten;
 use reims_vgpu_graphics::region::Region;
 use reims_vgpu_graphics::wire::{
     RGFX_MANAGED_BUFFER_ZERO_OFFSET, RGFX_MANAGED_TEXTURE_LINEAR, RgfxBufferDidModifyRange,
@@ -554,6 +561,46 @@ impl<P: Platform> GraphicsDecoder<P> {
             buffer.did_modify_range(OnFault::Return, NsRange::new(m.location, m.length))
         });
         Ok(Ok(()))
+    }
+
+    /// A command buffer's `UPLOADS_WRITTEN` records, `written`, as it begins: the platform's
+    /// `didModifyRange:` of each buffer's bytes from its start, which brings them to its GPU copy
+    /// by the buffer's commit, at once, as the buffer's own chunks are used by no command buffer
+    /// committed before it (the module doc). A buffer whose create the host refused holds
+    /// nothing to bring over ([`super::refused`]). A bad reference for an object that is no
+    /// `Managed` buffer, malformed for bytes past it, each before any is carried out; a raise of
+    /// the platform's is logged, and the rest are carried out, as a range message's is.
+    pub(super) fn uploads_written(&self, written: &[RgfxUploadWritten]) -> Result<(), DecodeError> {
+        let mut buffers = Vec::with_capacity(written.len());
+        for w in written {
+            if let Some(ObjHandle::Refused(r)) = self.named(w.buffer_obj_id) {
+                r.used(w.buffer_obj_id);
+                continue;
+            }
+            let (Some(ObjHandle::Buffer(buffer)), Some(copy)) = (
+                self.named(w.buffer_obj_id),
+                self.managed_copy(w.buffer_obj_id),
+            ) else {
+                return Err(DecodeError::BadReference);
+            };
+            if copy.layout.is_some() || w.length > copy.length {
+                return Err(DecodeError::Malformed);
+            }
+            if w.length != 0 {
+                buffers.push((w.buffer_obj_id, buffer.clone_ref(), w.length));
+            }
+        }
+        for (obj_id, buffer, length) in buffers {
+            let range = NsRange::new(0, length);
+            if let Err(raise) = refusing(|| buffer.did_modify_range(OnFault::Return, range)) {
+                log::warn!(
+                    target: "reims_vgpu::graphics", kind:% = raise;
+                    "UPLOADS_WRITTEN of object {obj_id:#x} was not carried out: the platform \
+                     raised ({raise:?})"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Whether a `Managed` object `name` makes may take the CPU copy that lies over `span` (its
