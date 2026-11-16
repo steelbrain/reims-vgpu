@@ -292,9 +292,10 @@ pub(crate) fn take_answering_device() -> Option<rt::Device> {
 }
 
 /// The kinds the runtime announces at every occurrence (`DeviceOptions::announce_each`): those a
-/// call here hears ([`crate::answer::HEARD`]), `CopiedHostPages` and `ShadowedTexture`, which the
-/// device's probe of its imports may meet unheard as it is made ([`crate::answer`]'s `unheard`,
-/// on Linux: `crate::os`'s `learn_view_imports`), and every
+/// call here hears ([`crate::answer::HEARD`]), `CopiedHostPages` and `ShadowedTexture`
+/// ([`crate::answer::PROBED`]), which the device's probe of its imports may meet unheard as it is
+/// made ([`crate::answer`]'s `unheard`, on Linux: `crate::os`'s `learn_view_imports`), each
+/// relayed the first time alone and counted after, and every
 /// kind of [`crate::answer::DIES`] where `every_dies`, in strict and census mode, which die at or
 /// record each occurrence. Elsewhere the
 /// runtime announces such a kind once per device, its first occurrence, the only one the default
@@ -309,10 +310,7 @@ fn announced_each(every_dies: bool) -> std::collections::BTreeSet<rt::Degradatio
     };
     (dies.iter().copied())
         .chain(crate::answer::HEARD)
-        .chain([
-            rt::Degradation::CopiedHostPages,
-            rt::Degradation::ShadowedTexture,
-        ])
+        .chain(crate::answer::PROBED)
         .collect()
 }
 
@@ -862,10 +860,7 @@ pub(crate) mod tests {
         let each = announced_each(true);
         assert!(DIES.iter().chain(&HEARD).all(|k| each.contains(k)));
         let by_default = announced_each(false);
-        let probed = [
-            rt::Degradation::CopiedHostPages,
-            rt::Degradation::ShadowedTexture,
-        ];
+        let probed = crate::answer::PROBED;
         assert!((HEARD.iter().chain(&probed)).all(|k| by_default.contains(k)));
         let once = DIES
             .iter()

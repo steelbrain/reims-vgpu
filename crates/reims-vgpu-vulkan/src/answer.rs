@@ -1595,6 +1595,16 @@ pub const HEARD: [rt::Degradation; 7] = [
     rt::Degradation::HalfOutputPrecision,
 ];
 
+/// The kinds besides [`HEARD`] the runtime announces at every occurrence
+/// (`DeviceOptions::announce_each`, `crate::platform`'s `announced_each`): the device's probe of
+/// its imports may meet them unheard as it is made (`crate::os`'s `learn_view_imports`, on
+/// Linux). Each is relayed the first time alone and counted, as without the probe: one of
+/// [`DIES`] by its fate, the other as a kind of no list ([`notice`]).
+pub(crate) const PROBED: [rt::Degradation; 2] = [
+    rt::Degradation::CopiedHostPages,
+    rt::Degradation::ShadowedTexture,
+];
+
 /// The kinds the runtime would announce once per device but for `announce_each`, which asks for
 /// each occurrence only so a call here can hear it: every kind of [`HEARD`], relayed the first
 /// time alone, as without a sink, so a guest's every pass or texture does not log one, and
@@ -1616,17 +1626,29 @@ fn first_relayed_once(kind: rt::Degradation) -> Option<bool> {
 }
 
 /// The kinds neither of [`DIES`] nor of [`HEARD`] the runtime announced in this process, each
-/// with how many times: once per device, as the runtime announces them, but in the modes that
-/// announce each occurrence ([`notice`]).
+/// with how many times: once per device, as the runtime announces them, but `ShadowedTexture`,
+/// which it announces at every occurrence for the device's probe of its imports
+/// (`crate::platform`'s `announced_each`), and every kind in the modes that announce each
+/// occurrence ([`notice`]).
 static ANNOUNCED: crate::core::sync::Mutex<Vec<(rt::Degradation, u64)>> =
     crate::core::sync::Mutex::new(Vec::new());
 
-/// Counts a notice of `kind`, neither of [`DIES`] nor of [`HEARD`] ([`ANNOUNCED`]).
-fn count_announced(kind: rt::Degradation) {
+/// Counts a notice of `kind`, neither of [`DIES`] nor of [`HEARD`] ([`ANNOUNCED`]): whether it is
+/// the process's first of its kind, which alone is relayed (docs/conventions.md, each
+/// degradation logged once per boot, then counted): relayed at every notice, a 26.7.2 guest's
+/// boot to Geekbench 7.1.0's compute passes on an RX 7900 XTX wrote 116 and 121 lines of
+/// `ShadowedTexture` in two boots (**measured** 2026-11-16), each other kind one.
+fn count_announced(kind: rt::Degradation) -> bool {
     let mut announced = ANNOUNCED.lock();
     match announced.iter_mut().find(|(k, _)| *k == kind) {
-        Some((_, n)) => *n += 1,
-        None => announced.push((kind, 1)),
+        Some((_, n)) => {
+            *n += 1;
+            false
+        }
+        None => {
+            announced.push((kind, 1));
+            true
+        }
     }
 }
 
@@ -1994,8 +2016,8 @@ static TRACED_KINDS: crate::core::sync::Mutex<Vec<rt::Degradation>> =
 /// of [`HEARD`] is kept for the
 /// [`hearing`] it was announced inside; every other message, and every one of [`HEARD`] too,
 /// goes to [`relay`], to stderr (a `Verbose` one of the runtime's own to the log at debug), but
-/// a kind of [`RELAYED_ONCE`] after its first. Each degradation relayed is counted
-/// ([`degradation_counts`]).
+/// a degradation of [`RELAYED_ONCE`] or of no list after the first of its kind. Each degradation
+/// relayed is counted ([`degradation_counts`]).
 pub fn notice(message: &rt::DebugMessage) {
     let Some(notice) = &message.degradation else {
         relay(message);
@@ -2012,7 +2034,7 @@ pub fn notice(message: &rt::DebugMessage) {
         // deg: an occurrence of a degradation, its code
         crate::core::trace::event_text("deg", &[], kind.code());
         // A kind announced once without the trace goes on only at its first occurrence.
-        if !DIES.contains(&kind) && !HEARD.contains(&kind) {
+        if !DIES.contains(&kind) && !HEARD.contains(&kind) && !PROBED.contains(&kind) {
             let mut seen = TRACED_KINDS.lock();
             if seen.contains(&kind) {
                 return;
@@ -2029,7 +2051,11 @@ pub fn notice(message: &rt::DebugMessage) {
         match first_relayed_once(notice.degradation) {
             Some(false) => return,
             Some(true) => {}
-            None => count_announced(notice.degradation),
+            None => {
+                if !count_announced(notice.degradation) {
+                    return;
+                }
+            }
         }
         relay(message);
         return;
@@ -2922,6 +2948,24 @@ mod tests {
             .as_deref(),
             Some("reims-vgpu: degradation counts: inexact-heap-layout 3, out-of-host-memory 1\n")
         );
+    }
+
+    /// A kind of no list, `ShadowedTexture` among them, which the runtime announces at every
+    /// occurrence for the device's probe ([`PROBED`]), is relayed the first time alone and each
+    /// notice counted: the counts name it by its code with every occurrence
+    #[test]
+    fn announced_kinds_are_relayed_once_and_counted() {
+        let kind = rt::Degradation::ShadowedTexture;
+        assert!(PROBED.contains(&kind));
+        assert!(!DIES.contains(&kind) && !HEARD.contains(&kind));
+        let before = (degradation_counts().into_iter())
+            .find(|(c, _)| c == kind.code())
+            .map_or(0, |(_, n)| n);
+        assert_eq!(count_announced(kind), before == 0, "relayed as the first");
+        assert!(!count_announced(kind), "not relayed again");
+        assert!(!count_announced(kind));
+        let after = (degradation_counts().into_iter()).find(|(c, _)| c == kind.code());
+        assert_eq!(after, Some((kind.code().to_owned(), before + 3)));
     }
 
     /// A kind counted outside this crate by its code ([`count_kind`]) is in the degradation
