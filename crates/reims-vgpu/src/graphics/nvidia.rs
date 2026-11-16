@@ -45,6 +45,14 @@
 //!   picture of the decoder; its copy keeps the planes' mappings and CUDA's registrations of them
 //!   until the GPU is done, but not the guest's buffers, so a copy that ends that late may write
 //!   pages the guest has used again since.
+//! - **VideoToolbox's paravirtual decoders** (`NvGuestDecoder`, `super::vt`): an arm64 guest's
+//!   decode, on a decoder of whole access units of its own, lands in the IOSurface its kext lent,
+//!   laid out as the kext read the surface and checked against its memory
+//!   ([`GuestTarget`](reims_vgpu_video::core::device_memory::GuestTarget)): written there by the
+//!   GPU, one `cuMemcpy2D` a plane into the view of its pages registered with CUDA, as into an
+//!   output's pages above, else read back and copied by the CPU, each reason logged once a
+//!   decoder. So every decode codec of the caps has one, and the device offers `VT_MESSAGES`
+//!   where NVDEC decodes H.264 or HEVC.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
@@ -55,7 +63,10 @@ use reims_vgpu_graphics::wire::{
     RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps,
     RgfxVideoEncodeCaps,
 };
-use reims_vgpu_video::core::device_memory::{DeviceImports, MemoryIdentity};
+use reims_vgpu_video::core::backend::BackendError as VideoError;
+use reims_vgpu_video::core::device_memory::{
+    DeviceImports, GuestTarget, MemoryIdentity, TargetPlane,
+};
 use reims_vgpu_video::core::runtime::Runtime;
 use reims_vgpu_video::nvidia::{
     AnnexBCodec, AnnexBDecoder, AnnexBPicture, ChromaFormat, DecodeCapabilities, DevicePlane,
@@ -71,7 +82,7 @@ use reims_vgpu_vulkan::core::sync::Mutex;
 use reims_vgpu_vulkan::gpu::device::VulkanDevice;
 use reims_vgpu_vulkan::gpu::resource::VulkanBuffer;
 
-use super::decode::{GraphicsVideo, GraphicsVideoSession, PlanePages};
+use super::decode::{GraphicsVideo, GraphicsVideoSession, GuestDecoder, GuestOutput, PlanePages};
 use super::video_host::{
     BackendError, DecodeOutput, HostDecoder, HostEncodeSession, HostPicture, HostVideoSession,
     Landing, OutputPlane, SourcePlane,
@@ -420,6 +431,25 @@ impl GraphicsVideo<VulkanPlatform> for Shared {
     fn imports_device_caches(&self) -> bool {
         self.0.imports.is_some()
     }
+
+    /// NVDEC's decoders land in any memory: by the GPU, into its view registered with CUDA, or
+    /// by the CPU.
+    fn guest_decodes(&self) -> bool {
+        true
+    }
+
+    fn guest_decoder(&self, codec: u32) -> Option<Box<dyn GuestDecoder>> {
+        let video = &self.0;
+        let annex_b = match codec {
+            RGFX_VIDEO_CODEC_H264 if video.h264.is_some() => AnnexBCodec::H264,
+            RGFX_VIDEO_CODEC_HEVC if video.hevc.is_some() => AnnexBCodec::Hevc,
+            _ => return None,
+        };
+        Some(Box::new(NvGuestDecoder {
+            decoder: AnnexBDecoder::new(&video.gpu, annex_b, &video.runtime),
+            said: Vec::new(),
+        }))
+    }
 }
 
 /// One session's decoder.
@@ -655,6 +685,156 @@ impl HostPicture<VulkanPlatform> for NvdecPicture {
         // SAFETY: each plane's rows lie in the decoder's staging memory, packed, which `read`
         // holds through the copy and which lies apart from the output's planes.
         unsafe { to.copy_rows(source(&luma), source(&chroma)) }
+    }
+}
+
+/// A decoder of VideoToolbox's paravirtual path ([`GuestDecoder`]), whose pictures land in the
+/// surface the guest lent (module doc): written there by the GPU where CUDA registers the view of
+/// its pages, else read back and copied by the CPU.
+struct NvGuestDecoder {
+    decoder: AnnexBDecoder,
+    /// The reasons its pictures were copied by the CPU, each logged once.
+    said: Vec<String>,
+}
+
+impl NvGuestDecoder {
+    /// Logs, once a decoder, why a picture was copied by the CPU.
+    fn copied_because(&mut self, why: String) {
+        if !self.said.contains(&why) {
+            log::info!(
+                kind:% = why;
+                "hardware video: {NAME}: a VideoToolbox picture copied by the CPU: {why}"
+            );
+            self.said.push(why);
+        }
+    }
+}
+
+impl GuestDecoder for NvGuestDecoder {
+    fn decode(
+        &mut self,
+        parameter_sets: &[u8],
+        au: &[u8],
+        output: &GuestOutput<'_>,
+    ) -> Result<bool, VideoError> {
+        if !parameter_sets.is_empty() {
+            (self.decoder.parameter_sets(parameter_sets)).map_err(video_error)?;
+        }
+        let Some(picture) = self.decoder.decode(au).map_err(video_error)? else {
+            return Ok(false);
+        };
+        let target =
+            GuestTarget::new(&output.layout, output.memory).map_err(VideoError::Unsupported)?;
+        let sample = picture.bytes_per_sample();
+        if target.pixel_format().bytes_per_sample() != sample {
+            return Err(VideoError::Unsupported(format!(
+                "a picture of {sample}-byte samples for a '{}' surface",
+                output.layout.pixel_format
+            )));
+        }
+        let size = (target.width(), target.height());
+        let planes = target.planes();
+        let [luma, chroma] = planes.map(|plane| MemoryPlane {
+            memory: target.memory(),
+            offset: plane.offset,
+            bytes_per_row: plane.bytes_per_row,
+            row_bytes: plane.row_bytes,
+            rows: plane.rows,
+        });
+        // SAFETY: the planes are the surface's (`GuestTarget`'s check: apart, in order, each
+        // inside its memory), which the guest's kext holds lent, its pages wired, until the
+        // host's `rels`, sent once this returns, and which nothing of the host's writes
+        // meanwhile; the registration the write keeps holds the view of its pages mapped.
+        let written = unsafe { picture.write_into(size, luma, chroma, Box::new(())) };
+        match written.map_err(video_error)? {
+            Ok(()) => return Ok(true),
+            Err(why) => self.copied_because(why),
+        }
+        let read = picture.read_back(size).map_err(video_error)?;
+        let view = (output.memory.host_view())
+            .map_err(|error| VideoError::Malfunction(error.to_string()))?;
+        let length = output.memory.length();
+        if (view.offset.checked_add(length)).is_none_or(|end| end > view.size) {
+            return Err(VideoError::Malfunction(
+                "the host's view is shorter than the surface".to_owned(),
+            ));
+        }
+        // SAFETY: the view's `size` bytes from `first` are the host's mapping of the surface's
+        // pages, which `view.hold` keeps mapped until it drops after the copy, and the surface's
+        // `length` bytes from `offset` lie inside them (checked above); the guest's kext holds
+        // the surface lent, its pages wired, until the host's `rels`, sent once this returns.
+        let surface =
+            unsafe { std::slice::from_raw_parts_mut(view.first.as_ptr().add(view.offset), length) };
+        copy_planes(&read.planes(), &planes, surface).map_err(VideoError::Malfunction)?;
+        drop(view);
+        Ok(true)
+    }
+}
+
+impl Drop for NvGuestDecoder {
+    fn drop(&mut self) {
+        let sent = self.decoder.bitstreams();
+        log::info!(
+            "hardware video: {NAME}: a VideoToolbox session's access units: {} sent in place, {} \
+             gathered",
+            sent.in_place,
+            sent.gathered
+        );
+    }
+}
+
+/// Copies the rows `read` holds, luma then chroma, into `planes` of `surface`, the surface's
+/// bytes from its first: each row as far as the plane's rows hold it, as many rows as both have.
+/// `Err` says where a plane's rows lie past the surface; nothing is written then.
+fn copy_planes(
+    read: &[ReadPlane<'_>; 2],
+    planes: &[TargetPlane; 2],
+    surface: &mut [u8],
+) -> Result<(), String> {
+    let span = |read: &ReadPlane<'_>, plane: &TargetPlane| {
+        let rows = usize::try_from(read.rows.min(plane.rows)).unwrap_or(usize::MAX);
+        let row_bytes = read.bytes_per_row.min(plane.row_bytes);
+        let end = match rows.checked_sub(1) {
+            None => Some(plane.offset),
+            Some(past) => (past.checked_mul(plane.bytes_per_row))
+                .and_then(|bytes| bytes.checked_add(plane.offset))
+                .and_then(|bytes| bytes.checked_add(row_bytes)),
+        };
+        let sourced = rows
+            .checked_mul(read.bytes_per_row)
+            .is_some_and(|bytes| bytes <= read.bytes.len());
+        match end {
+            Some(end) if end <= surface.len() && sourced => Ok((rows, row_bytes)),
+            _ => Err(format!(
+                "a plane at {} of {rows} rows {} bytes apart past the surface's {} bytes",
+                plane.offset,
+                plane.bytes_per_row,
+                surface.len()
+            )),
+        }
+    };
+    let spans = [span(&read[0], &planes[0])?, span(&read[1], &planes[1])?];
+    for ((read, plane), (rows, row_bytes)) in read.iter().zip(planes).zip(spans) {
+        for row in 0..rows {
+            let from = &read.bytes[row * read.bytes_per_row..][..row_bytes];
+            surface[plane.offset + row * plane.bytes_per_row..][..row_bytes].copy_from_slice(from);
+        }
+    }
+    Ok(())
+}
+
+/// What a VideoToolbox decoder sees of `error`: a stream that does not decode, or whose picture
+/// NVDEC failed, as bad data; one NVDEC cannot decode as unsupported; a leading picture the
+/// stream's random access skips as skipped; and the rest as the decoder's malfunction, a
+/// picture smaller than NVDEC decodes among them, as Apple's decoders answer a size they do not
+/// decode.
+fn video_error(error: reims_vgpu_video::nvidia::Error) -> VideoError {
+    use reims_vgpu_video::nvidia::Error;
+    match error {
+        Error::Bitstream(_) | Error::DecodeFailed(_) => VideoError::BadData(error.to_string()),
+        Error::Unsupported(why) => VideoError::Unsupported(why),
+        Error::SkippedLeadingPicture(why) => VideoError::SkippedLeadingPicture(why),
+        error => VideoError::Malfunction(error.to_string()),
     }
 }
 

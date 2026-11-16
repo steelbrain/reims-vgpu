@@ -1662,7 +1662,8 @@ Stages:
       `decoder`), whose pictures the host's video arm decodes and lands in
       the surface the guest lent for each (`crates/reims-vgpu/src/graphics/vt.rs`;
       on VA-API, written there by the driver's video processing where it
-      takes the surface's layout, else copied by the CPU). `encs` lists no
+      takes the surface's layout, on NVDEC by the GPU into the surface's
+      pages registered with CUDA, else copied by the CPU). `encs` lists no
       encoder and `meps` no processor, and an encoder's create is answered
       with a refusal in its reply's `,err`, as for a codec the host lacks:
       `paravirt`'s encoder sessions (`encoder`, which encode the source
@@ -1671,8 +1672,8 @@ Stages:
       A host with no arm offers no caps and the kext publishes no service:
       the guest's VideoToolbox is then not a guest's.
     - **The host offers `VT_MESSAGES` where its arm lands decodes in the
-      guest's surfaces**: on VA-API. An NVIDIA host offers it not yet, and
-      lists no decoder. The arm64e kext publishes the service on macOS 26
+      guest's surfaces**: on VA-API and on NVDEC, each where it decodes
+      H.264 or HEVC. The arm64e kext publishes the service on macOS 26
       and later alone (`rgfxVtServesRelease`); macOS 14 and 15 decode in
       software, as before the bit.
     - **A lend locks the surface first.** Before it lends a surface, the

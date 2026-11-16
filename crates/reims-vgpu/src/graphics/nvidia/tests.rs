@@ -1,10 +1,17 @@
 //! The NVIDIA arm on the NVIDIA host: a picture written by a copy within the GPU into a device
-//! cache CUDA imported reads, through the runtime, as NVDEC's own read back of it.
+//! cache CUDA imported reads, through the runtime, as NVDEC's own read back of it; and
+//! VideoToolbox's decoders of the arm land each picture in a lent surface's pages as NVDEC reads
+//! it back. Off it: the CPU's copy of a picture read back into a surface's planes, and what a
+//! VideoToolbox decoder sees of NVIDIA's errors.
 
+use std::alloc::Layout;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
-use reims_vgpu_video::core::device_memory::MemoryLife;
+use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryLife};
+use reims_vgpu_video::core::fourcc::FourCc;
 use reims_vgpu_video::core::runtime::{ExitStep, MonoTime, Rings, TimedOut};
+use reims_vgpu_video::core::surfaces::{PlaneLayout, SurfaceError, SurfaceLayout};
 use reims_vgpu_video::core::sync::{Condvar, MutexGuard};
 use reims_vgpu_video::nvidia::{
     EncodeParams, EncodeProfile, EncodeRateControl, NvencEncoder, RawFrame, Tuning,
@@ -300,4 +307,344 @@ fn an_encode_first_processs_waits_run_on_the_arms_runtime() {
         .status()
         .expect("a child");
     assert!(status.success(), "the child's encode: {status:?}");
+}
+
+/// The alignment of a test surface's memory: whole pages on every host's page size.
+const PAGE: usize = 64 << 10;
+
+/// Whole pages of host memory, as the view of a surface the guest lent.
+struct Pages {
+    first: NonNull<u8>,
+    len: usize,
+}
+
+// SAFETY: the memory is the test's own allocation, which any thread may reach; the test reads it
+// only once the GPU's writes into it are done.
+unsafe impl Send for Pages {}
+// SAFETY: as above.
+unsafe impl Sync for Pages {}
+
+impl Pages {
+    fn layout(len: usize) -> Layout {
+        Layout::from_size_align(len, PAGE).expect("a layout")
+    }
+
+    fn new(len: usize) -> Arc<Self> {
+        // SAFETY: the layout's size is not zero.
+        let at = unsafe { std::alloc::alloc(Self::layout(len)) };
+        Arc::new(Self {
+            first: NonNull::new(at).expect("the test's memory"),
+            len,
+        })
+    }
+
+    /// Sets every byte to `byte`, with no write of the GPU's in flight.
+    fn fill(&self, byte: u8) {
+        // SAFETY: `len` bytes allocated from `first`, which nothing borrows and the GPU does not
+        // write meanwhile.
+        unsafe { std::ptr::write_bytes(self.first.as_ptr(), byte, self.len) };
+    }
+
+    /// Its bytes, which nothing writes while they are borrowed: a decode's writes are done when
+    /// it returns.
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: `len` bytes allocated from `first`, initialised by `fill` first, with no write
+        // in flight while borrowed.
+        unsafe { std::slice::from_raw_parts(self.first.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for Pages {
+    fn drop(&mut self) {
+        // SAFETY: allocated by `new` with this layout, freed once, after the registration that
+        // held the view went.
+        unsafe { std::alloc::dealloc(self.first.as_ptr(), Self::layout(self.len)) };
+    }
+}
+
+/// The pages as the host's video takes a lent surface's: their identity lives as long as this.
+struct PagesMemory {
+    life: MemoryLife,
+    pages: Arc<Pages>,
+}
+
+impl DeviceMemory for PagesMemory {
+    fn identity(&self) -> MemoryIdentity {
+        self.life.identity()
+    }
+
+    fn length(&self) -> usize {
+        self.pages.len
+    }
+
+    fn host_view(&self) -> Result<HostView, SurfaceError> {
+        Ok(HostView {
+            first: self.pages.first,
+            size: self.pages.len,
+            offset: 0,
+            hold: Box::new(Arc::clone(&self.pages)),
+        })
+    }
+}
+
+/// A `width` by `height` surface of `format` in two planes, luma at `luma_at` and chroma on the
+/// next 4 KiB, each row `pitch` bytes apart: as CoreVideo lays out a pool's IOSurface.
+fn surface_layout(
+    format: [u8; 4],
+    (width, height): (u32, u32),
+    luma_at: usize,
+    pitch: usize,
+) -> SurfaceLayout {
+    let rows = usize::try_from(height).expect("rows");
+    let chroma_at = (luma_at + pitch * rows).next_multiple_of(0x1000);
+    SurfaceLayout {
+        pixel_format: FourCc::new(format),
+        width,
+        height,
+        planes: vec![
+            PlaneLayout {
+                offset: luma_at,
+                bytes_per_row: pitch,
+                width,
+                height,
+            },
+            PlaneLayout {
+                offset: chroma_at,
+                bytes_per_row: pitch,
+                width: width / 2,
+                height: height / 2,
+            },
+        ],
+        bytes_per_row: 0,
+    }
+}
+
+/// Each picture of NVENC's H.264 and HEVC lands, through a VideoToolbox decoder of the arm, in a
+/// lent `420v` surface's pages at CoreVideo's pitches, its planes past the surface's first byte,
+/// by the GPU into the pages registered with CUDA, with no picture copied by the CPU: at 1080p
+/// with 1984-byte rows, and at 640x360 with rows of 640 bytes, the pitch radeonsi's import check
+/// refuses (`graphics::vaapi`), each a pitch not a multiple of 256. Each row is as a decoder of
+/// the same access units reads its picture back, and the bytes before the planes, past each row
+/// and past the chroma are as they were. The arm has a decoder of each codec it decodes and of
+/// no other, and a picture of 8-bit samples takes no 10-bit surface.
+#[test]
+#[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
+fn a_videotoolbox_picture_lands_in_the_lent_surfaces_pages_as_it_reads_back() {
+    let platform = Arc::new(VulkanPlatform::new());
+    crate::entry::run(|_| {
+        let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
+        let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
+        let video =
+            Arc::new(NvidiaVideo::new(&device, &runtime).expect("NVDEC on the device's GPU"));
+        let shared = Shared(Arc::clone(&video));
+        assert!(shared.guest_decodes());
+        assert!(shared.guest_decoder(RGFX_VIDEO_CODEC_H264).is_some());
+        assert!(shared.guest_decoder(RGFX_VIDEO_CODEC_HEVC).is_some());
+        assert!(
+            shared.guest_decoder(0x7f).is_none(),
+            "a codec NVDEC has not"
+        );
+        for (width, height, pitch) in [(1920u32, 1080u32, 1984usize), (640, 360, 640)] {
+            let luma_at = 0x400;
+            let (columns, rows) = (
+                usize::try_from(width).expect("columns"),
+                usize::try_from(height).expect("rows"),
+            );
+            let layout = surface_layout(*b"420v", (width, height), luma_at, pitch);
+            let [luma, chroma] = [layout.planes[0], layout.planes[1]];
+            let wide = surface_layout(*b"x420", (width, height), luma_at, 2 * pitch);
+            let len = (wide.planes[1].offset + pitch * rows).next_multiple_of(PAGE);
+            for (profile, codec) in [
+                (EncodeProfile::H264High, AnnexBCodec::H264),
+                (EncodeProfile::HevcMain, AnnexBCodec::Hevc),
+            ] {
+                let at = format!("{codec:?} at {width}x{height}, {pitch}-byte rows");
+                let params = params(profile, width, height);
+                let mut encoder =
+                    NvencEncoder::new(Arc::clone(&video.gpu), &params).expect("an NVENC session");
+                let mut guest = NvGuestDecoder {
+                    decoder: AnnexBDecoder::new(&video.gpu, codec, &runtime),
+                    said: Vec::new(),
+                };
+                let mut reference = AnnexBDecoder::new(&video.gpu, codec, &runtime);
+                reference
+                    .parameter_sets(encoder.sequence_parameters())
+                    .expect("the parameter sets");
+                let memory = PagesMemory {
+                    life: MemoryLife::new(),
+                    pages: Pages::new(len),
+                };
+                let output = GuestOutput {
+                    layout: layout.clone(),
+                    memory: &memory,
+                };
+                let mut pictures = 0;
+                for n in 0..7 {
+                    let (y, uv) = frame(columns, rows, n);
+                    let packets = (encoder.encode(&RawFrame {
+                        luma: (&y, columns),
+                        chroma: (&uv, columns),
+                        index: n,
+                        force_idr: n == 0,
+                    }))
+                    .expect("a frame NVENC takes");
+                    for packet in packets {
+                        let packet = packet.expect("a packet");
+                        let sets: &[u8] = if pictures == 0 {
+                            encoder.sequence_parameters()
+                        } else {
+                            &[]
+                        };
+                        if n == 6 {
+                            let output = GuestOutput {
+                                layout: wide.clone(),
+                                memory: &memory,
+                            };
+                            let refused = guest.decode(sets, &packet.data, &output);
+                            let said = match &refused {
+                                Err(VideoError::Unsupported(why)) => why.as_str(),
+                                _ => "",
+                            };
+                            assert!(
+                                said.contains("1-byte samples for a 'x420' surface"),
+                                "{at}: an 8-bit picture in an x420 surface: {refused:?}"
+                            );
+                            continue;
+                        }
+                        memory.pages.fill(UNTOUCHED);
+                        let landed = guest.decode(sets, &packet.data, &output);
+                        assert_eq!(landed, Ok(true), "{at}: picture {n}");
+                        let picture = (reference.decode(&packet.data))
+                            .expect("a decode")
+                            .expect("a picture");
+                        let read = picture.read_back((width, height)).expect("a read back");
+                        let bytes = memory.pages.bytes();
+                        assert!(
+                            bytes[..luma_at].iter().all(|&b| b == UNTOUCHED),
+                            "{at}: picture {n}: the bytes before the planes"
+                        );
+                        for (read, plane) in read.planes().iter().zip([luma, chroma]) {
+                            assert_eq!(read.bytes_per_row, columns, "{at}");
+                            for row in 0..usize::try_from(read.rows).expect("rows") {
+                                let first = plane.offset + row * pitch;
+                                assert_eq!(
+                                    &bytes[first..][..columns],
+                                    &read.bytes[row * columns..][..columns],
+                                    "{at}: picture {n}, row {row} of the plane at {}",
+                                    plane.offset
+                                );
+                                assert!(
+                                    bytes[first + columns..first + pitch]
+                                        .iter()
+                                        .all(|&b| b == UNTOUCHED),
+                                    "{at}: picture {n}: bytes past row {row} of the plane at {}",
+                                    plane.offset
+                                );
+                            }
+                        }
+                        let chroma_end = chroma.offset + pitch * rows / 2;
+                        assert!(
+                            bytes[chroma_end..].iter().all(|&b| b == UNTOUCHED),
+                            "{at}: picture {n}: the bytes past the chroma"
+                        );
+                        pictures += 1;
+                    }
+                }
+                assert_eq!(pictures, 6, "{at}");
+                assert_eq!(
+                    guest.said,
+                    Vec::<String>::new(),
+                    "{at}: pictures copied by the CPU"
+                );
+            }
+        }
+    });
+}
+
+/// The CPU's copy of a picture read back lands each plane's rows at the surface's offset and
+/// pitch, as many of each row's bytes as the plane's rows hold, and as many rows as both have,
+/// leaving the bytes past each row as they were; a plane whose rows lie past the surface is
+/// refused, with nothing written.
+#[test]
+fn a_read_back_picture_is_copied_into_the_surfaces_planes_at_their_pitch() {
+    let (luma, chroma): (Vec<u8>, Vec<u8>) = ((0..6 * 4).collect(), (100..100 + 6 * 2).collect());
+    let read = [
+        ReadPlane {
+            bytes: &luma,
+            bytes_per_row: 6,
+            rows: 4,
+        },
+        ReadPlane {
+            bytes: &chroma,
+            bytes_per_row: 6,
+            rows: 2,
+        },
+    ];
+    let planes = [
+        TargetPlane {
+            offset: 2,
+            bytes_per_row: 8,
+            rows: 4,
+            row_bytes: 6,
+        },
+        TargetPlane {
+            offset: 40,
+            bytes_per_row: 8,
+            rows: 3,
+            row_bytes: 4,
+        },
+    ];
+    let mut surface = vec![UNTOUCHED; 64];
+    copy_planes(&read, &planes, &mut surface).expect("a copy");
+    let mut expected = vec![UNTOUCHED; 64];
+    for row in 0..4 {
+        expected[2 + row * 8..][..6].copy_from_slice(&luma[row * 6..][..6]);
+    }
+    for row in 0..2 {
+        expected[40 + row * 8..][..4].copy_from_slice(&chroma[row * 6..][..4]);
+    }
+    assert_eq!(surface, expected);
+    let mut short = vec![UNTOUCHED; 49];
+    let refused = copy_planes(&read, &planes, &mut short);
+    assert_eq!(
+        refused,
+        Err("a plane at 40 of 2 rows 8 bytes apart past the surface's 49 bytes".to_owned())
+    );
+    assert!(
+        short.iter().all(|&b| b == UNTOUCHED),
+        "written when refused"
+    );
+}
+
+/// A VideoToolbox decoder sees a stream that does not decode, or a picture NVDEC failed, as bad
+/// data; what NVDEC does not decode as unsupported; a skipped leading picture as skipped; and the
+/// rest, a picture too small among them, as its malfunction.
+#[test]
+fn nvidia_errors_reach_videotoolbox_as_their_kind() {
+    use reims_vgpu_video::nvidia::Error;
+    let said = |what: &str| what.to_owned();
+    assert_eq!(
+        video_error(Error::Bitstream(said("a short slice"))),
+        VideoError::BadData("bad bitstream: a short slice".to_owned())
+    );
+    assert_eq!(
+        video_error(Error::DecodeFailed(said("slice data"))),
+        VideoError::BadData("slice data".to_owned())
+    );
+    assert_eq!(
+        video_error(Error::Unsupported(said("4:4:4"))),
+        VideoError::Unsupported("4:4:4".to_owned())
+    );
+    assert_eq!(
+        video_error(Error::SkippedLeadingPicture(said("RASL"))),
+        VideoError::SkippedLeadingPicture("RASL".to_owned())
+    );
+    assert_eq!(
+        video_error(Error::TooSmall(said("16x16"))),
+        VideoError::Malfunction("too small: 16x16".to_owned())
+    );
+    assert_eq!(
+        video_error(Error::OutOfSurfaces),
+        VideoError::Malfunction("every decode surface is held".to_owned())
+    );
 }
