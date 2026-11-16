@@ -107,6 +107,7 @@ virtio device (`d151bcd9`, upstream's `b501f21312`).
 | the device gives the library the guest RAM's map and the files behind it | `e3e5ef1d` |
 | the device tells the library the guest's architecture (`guest_arch`: arm64 where `target_aarch64()`, else x86-64), which the device's `isFramebufferReadSupported` answer follows, and the class of Mac whose GPU results the library's devices give (`GuestArch::mac_class`) | `308b5fc6` |
 | the device raises its interrupt through an irqfd where KVM's in-kernel irqchip takes MSI-X through one | `967400b3` |
+| on WHPX with the hypervisor's APIC (kernel-irqchip), the raising thread asks the hypervisor for the vector's MSI itself (`whpx_send_msi_direct`), with no BQL, so a hold of the main loop (a PNG screendump's 120 ms) no longer holds the guest's completions back | `243971f2` |
 | a command buffer is taken, and answered, on the vCPU that rings its queue's doorbell, with the plain register write | `945a86b7`, `f16ca588`, `142c8e72` |
 | a command queue's plain doorbell, which the library routes where the guest took `DOORBELL_ASKS` (`route_doorbell`), is an ioeventfd matching the ring's id that signals the queue's eventfd, added and dropped under the BQL as the library asks, at most 128 at once | `db9cb35f` |
 | at QEMU's quit the device's release runs with the BQL let go, so a `route_doorbell` waiting for it finds the routes closed and returns, holding the release up no more | `92db49c1` |
@@ -210,8 +211,16 @@ is its transport:
   copies it saved.
 - An interrupt the library raises, on a thread of its own, is written to
   the vector's irqfd where KVM's in-kernel irqchip injects MSI-X through one
-  and MSI-X is enabled, and KVM injects it on the raising thread; elsewhere
-  (HVF, TCG) a BH sends it under the BQL. Neither waits for a lock.
+  and MSI-X is enabled, and KVM injects it on the raising thread. On WHPX
+  with the hypervisor's APIC (kernel-irqchip) the raising thread requests the
+  enabled, unmasked vector's MSI from the hypervisor itself
+  (`whpx_send_msi_direct`, WHvRequestInterrupt). Elsewhere (HVF, TCG, a
+  masked vector, WHPX without kernel-irqchip) a BH sends it under the BQL.
+  The BH waits for the main loop, which a PNG screendump of 2880x1620 holds
+  for about 120 ms. Before the direct request, that was a 7-refresh gap in
+  an on-screen app's frames on a Mac mini 2018 under WHPX, in every run
+  (measured 11-15). Under KVM the same screendump costs no frame (ms01's
+  Iris Xe, measured 11-16).
 - **Displays:** the `displays` property gives the device 1 to 4 displays
   (`RvgGraphicsDeviceConfig`'s `display_count`), 1 by default; realize
   refuses 0 and anything above 4. Display i is head i of QEMU's UI, with a
