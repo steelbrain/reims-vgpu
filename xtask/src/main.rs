@@ -25,6 +25,11 @@ type Runner = fn(&[String]) -> Res<bool>;
 
 const COMMANDS: &[Command] = &[
     Command {
+        name: "paths",
+        about: "every path git tracks checks out on Windows: no device name Windows keeps (aux.rs), no character it refuses, no name ending in a dot or a space, no two paths that differ only by case",
+        run: cmd_paths,
+    },
+    Command {
         name: "testkit",
         about: "core's testkit module is gated, and only dev-dependencies turn its feature on (D50)",
         run: cmd_testkit,
@@ -46,7 +51,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "check",
-        about: "testkit, header --check, the records of the prebuilt option ROM and guest kexts (make -C firmware prebuilt-check, make -C guest prebuilt-check), rustfmt, clippy, cargo nextest and the doc-tests; on a Mac, also clippy for x86-64 Linux and, where Rosetta runs x86-64 code, core's tests as x86-64; off Windows, clippy for x86-64 Windows",
+        about: "paths, testkit, header --check, the records of the prebuilt option ROM and guest kexts (make -C firmware prebuilt-check, make -C guest prebuilt-check), rustfmt, clippy, cargo nextest and the doc-tests; on a Mac, also clippy for x86-64 Linux and, where Rosetta runs x86-64 code, core's tests as x86-64; off Windows, clippy for x86-64 Windows",
         run: cmd_check,
     },
 ];
@@ -99,6 +104,28 @@ fn show(name: &str, rep: &lint::Report) -> bool {
 }
 
 // ---------------------------------------------------------------------------------------------
+
+/// The paths git tracks in the whole tree, reims-ctl's and reims-restore's workspaces among them,
+/// checked for what a Windows checkout refuses ([`lint::windows_paths`]).
+fn cmd_paths(_args: &[String]) -> Res<bool> {
+    let out = std::process::Command::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(repo_root())
+        .output()
+        .map_err(|e| format!("git ls-files: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git ls-files: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let paths: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect();
+    Ok(show("paths", &lint::windows_paths(&paths)))
+}
 
 fn cmd_testkit(_args: &[String]) -> Res<bool> {
     let root = repo_root();
@@ -200,6 +227,8 @@ fn runs_x86_64() -> bool {
 
 fn cmd_check(args: &[String]) -> Res<bool> {
     let mut ok = true;
+    // First, as the cheapest: a path Windows refuses stops every checkout there.
+    ok &= cmd_paths(&[])?;
     ok &= cmd_testkit(&[])?;
     ok &= header::cmd_header(&["--check".to_owned()])?;
     // The option ROM and the guest's kexts reims-ctl carries are built from the tree's sources:

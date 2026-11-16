@@ -123,7 +123,7 @@ crates/
   reims-vgpu-c/         the C API (cdylib, staticlib, rlib) and include/reims_vgpu.h
   reims-vgpu-video-*/   the host's video decoders and encoders (docs/video)
   reims-ctl/            the VM manager, a workspace of its own
-xtask/                  testkit, header, dist, metallibs, check
+xtask/                  paths, testkit, header, dist, metallibs, check
 firmware/               the device's option ROM: its UEFI driver, in C, and the prebuilt ROM (11.4);
                         firmware/ambrosia, its driver module for Ambrosia, the arm64 guests' firmware (11.5)
 guest/                  the guest's kexts, loader and Metal bundle, and the prebuilt kext set
@@ -825,8 +825,11 @@ everything its predecessor passed. [testing.md](testing.md) says how the code is
 
 ### 13.1 `cargo xtask check`
 
-Before a branch merges: the testkit manifest check (D50), `header --check` (11.2), the prebuilt
-records' checks (the option ROM's and the guest's kext set's), `cargo fmt --check`,
+Before a branch merges: the paths' check (`cargo xtask paths`: every path `git ls-files` lists, the
+reims-ctl and reims-restore workspaces' among them, checks out on Windows, with no device name
+Windows keeps, such as `aux.rs`, no character it refuses, no name ending in a dot or a space and no
+two paths that differ only by case), the testkit manifest check (D50), `header --check` (11.2),
+the prebuilt records' checks (the option ROM's and the guest's kext set's), `cargo fmt --check`,
 `clippy -D warnings` over every target, once with every feature and once with the tested features
 without the default ones, `cargo nextest run --workspace --no-fail-fast` (each test in its own
 process, in the order `.config/nextest.toml` sets on a Mac: the tests that act on the whole GPU
