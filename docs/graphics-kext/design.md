@@ -3277,9 +3277,11 @@ pixels of its mode, and the buttons held):
   WindowServer follows as x86-64's does (A3, below). But no framebuffer holds
   its display's rectangle on arm64, so the kext learns where WindowServer
   placed each display from its own moves (`RgfxDisplayPlaces.hpp`): each
-  post's landing, the first `MOVE_CURSOR` that shows the cursor after it,
-  names the display the cursor went to and its pixel there, which checks the
-  rectangle held for that display.
+  post's landing, the first `MOVE_CURSOR` after it that shows the cursor's
+  hot spot on a display, names the display the cursor went to and its pixel
+  there, which checks the rectangle held for that display. A cursor near an
+  edge shows on the display beside it too, the part of its image that
+  reaches over, its hot spot past that display's edge: that is no landing.
   - **The guess.** A display starts where WindowServer places a new one:
     side by side in their order, tops at 0, each its mode's size at 1x on a
     1x screen and half of it above 1x, as arm64's WindowServer runs it ("The
@@ -3297,7 +3299,8 @@ pixels of its mode, and the buttons held):
     puts the posted point, 16 pixels or more from the corner on an axis,
     confirms it. One that disagrees moves the rectangle's corner on each
     axis where the pixel lies inside the display (a point past every display
-    is held at the nearest one's edge, and says nothing of that axis), and
+    is held at the edge of the display the cursor is on, and says nothing of
+    that axis), and
     the rectangle is learned, to be confirmed by a later landing that
     agrees; two landings 64 pixels apart or more size a display the guess
     sized wrong (a mode the guest's user scaled), to within a few points.
@@ -3708,8 +3711,12 @@ it.
     its 960,540 in the three arrangements, and display 1's swap showed it
     there (its `MOVE_CURSOR`). A drag (`NX_LMOUSEDRAGGED`) moves it as a
     move does, and the tablet's next position scales over the display the
-    cursor went to. A point past every display is held at the nearest
-    display's edge (2880,540 with one 1920-wide display).
+    cursor went to. A point past every display is held at the edge of the
+    display the cursor is on (2880,540 with one 1920-wide display; 5755,600
+    with the cursor on display 0, held at its right edge, job m3-max-35450).
+    A cursor near display 0's right edge shows on display 1 too, the part of
+    its image over the edge (the same job: display 1's `MOVE_CURSOR` came
+    first, its hot spot at x -5).
   - WindowServer tells the kernel nothing of where it placed each display:
     it registers none with IOHIDSystem (its screen count stayed 0, and its
     work bounds 0,0 to 1920,1080 in every arrangement), an

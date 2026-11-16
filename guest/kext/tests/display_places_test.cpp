@@ -1,9 +1,9 @@
 // The native test of RgfxDisplayPlaces.hpp, against a model of WindowServer: each display a
-// rectangle of the global space, a posted point held at the nearest display's edge where it lies
-// past every display, and the cursor shown on the display holding it at its pixel. Displays side
-// by side, left, below and above, one at 2x, one in a scaled mode, a rearrangement mid-session, a
-// display never entered, and the crossing's limits: its posts, its hold and a landing that never
-// comes.
+// rectangle of the global space, a posted point held at the edge of the display the cursor is on
+// where it lies past every display, and the cursor shown on the display holding it at its pixel.
+// Displays side by side, left, below and above, one at 2x, one in a scaled mode, a rearrangement
+// mid-session, a display never entered, the cursor's image over an edge, and the crossing's
+// limits: its posts, its hold and a landing that never comes.
 #include "RgfxDisplayPlaces.hpp"
 
 #include <cstdio>
@@ -26,30 +26,31 @@ bool same(const RgfxGlobalRect &a, int32_t minx, int32_t miny, int32_t maxx, int
 	return a.minx == minx && a.miny == miny && a.maxx == maxx && a.maxy == maxy;
 }
 
-// WindowServer, as the kext sees it: each display's rectangle and mode.
+// WindowServer, as the kext sees it: each display's rectangle and mode, and the display the cursor
+// is on.
 struct Desktop {
 	RgfxGlobalRect rects[RGFX_DISPLAYS_MAX];
 	RgfxPlaceMode modes[RGFX_DISPLAYS_MAX];
 	uint32_t count;
+	mutable uint32_t on;
 
-	// The display a point posted shows the cursor on, and its pixel there.
+	// The display a point posted shows the cursor on, and its pixel there: the display holding
+	// it, or, where none does, the one the cursor is on, the point held at its edge.
 	void land(int32_t gx, int32_t gy, uint32_t *display, int32_t *x, int32_t *y) const
 	{
-		int64_t best = -1;
-		for (uint32_t d = 0; d < count; d++) {
-			const RgfxGlobalRect &r = rects[d];
-			const int32_t cx = gx < r.minx ? r.minx : gx > r.maxx - 1 ? r.maxx - 1 : gx;
-			const int32_t cy = gy < r.miny ? r.miny : gy > r.maxy - 1 ? r.maxy - 1 : gy;
-			const int64_t dx = cx - gx, dy = cy - gy, far = dx * dx + dy * dy;
-			if (best >= 0 && far >= best)
-				continue;
-			best = far;
-			*display = d;
-			*x = static_cast<int32_t>(static_cast<int64_t>(cx - r.minx) * modes[d].width /
-			                          (r.maxx - r.minx));
-			*y = static_cast<int32_t>(static_cast<int64_t>(cy - r.miny) * modes[d].height /
-			                          (r.maxy - r.miny));
-		}
+		uint32_t d = on < count ? on : 0;
+		for (uint32_t i = 0; i < count; i++)
+			if (gx >= rects[i].minx && gx < rects[i].maxx && gy >= rects[i].miny &&
+			    gy < rects[i].maxy)
+				d = i;
+		const RgfxGlobalRect &r = rects[d];
+		const int32_t cx = gx < r.minx ? r.minx : gx > r.maxx - 1 ? r.maxx - 1 : gx;
+		const int32_t cy = gy < r.miny ? r.miny : gy > r.maxy - 1 ? r.maxy - 1 : gy;
+		on = *display = d;
+		*x = static_cast<int32_t>(static_cast<int64_t>(cx - r.minx) * modes[d].width /
+		                          (r.maxx - r.minx));
+		*y = static_cast<int32_t>(static_cast<int64_t>(cy - r.miny) * modes[d].height /
+		                          (r.maxy - r.miny));
 	}
 };
 
@@ -310,12 +311,36 @@ int main()
 		check(places.at[2].state == RgfxPlaceState::guessed, "it keeps its guess");
 	}
 
+	// The cursor near display 0's right edge shows on display 1 too, its image over the edge, its
+	// hot spot past display 1's left: no landing, and the crossing waits for display 0's.
+	{
+		const Desktop side = twoSideBySide();
+		RgfxDisplayPlaces places = {};
+		RgfxCrossing c = {};
+		rgfxPlacesFit(&places, side.modes);
+		rgfxCrossingStart(&c, 0, 1915, 600, now);
+		int32_t gx = 0, gy = 0;
+		check(rgfxCrossingNext(places, &c, now, &gx, &gy) && gx == 1915 && gy == 600, "a post");
+		bool confirmed = true;
+		check(rgfxCrossingLanded(&places, &c, 1, -5, 600, &confirmed) == RgfxCrossingStep::none &&
+		          !confirmed && c.waiting && c.active,
+		      "display 1's image over the edge is no landing");
+		check(rgfxCrossingLanded(&places, &c, 1, 3, 1080, &confirmed) == RgfxCrossingStep::none &&
+		          c.waiting,
+		      "nor one past its bottom edge");
+		check(rgfxCrossingLanded(&places, &c, 0, 1915, 600, &confirmed) ==
+		              RgfxCrossingStep::arrived &&
+		          confirmed && !c.waiting,
+		      "display 0's is the landing");
+	}
+
 	// The crossing's limits.
 	{
 		// No placement lands on the display (it is not where any is tried): at most
 		// kRgfxCrossingPosts posts, and the cursor left where the last one put it.
 		Desktop desk = twoSideBySide();
 		desk.rects[1] = {1920, 5000, 3840, 6080}; // apart, as WindowServer never places one
+		desk.on = 0;
 		RgfxDisplayPlaces places = {};
 		RgfxCrossing c = {};
 		cross(&places, &c, desk, 0, 100, 100, &now);

@@ -10,8 +10,10 @@
 // puts WindowServer's cursor at that point, and the swap that shows it there names the display and
 // the pixel (its MOVE_CURSOR): in the same job, posts at 2880,540, -960,540 and 960,1620 showed the
 // cursor on display 1 at 960,540, with display 1 right of, left of and below display 0. A point
-// past every display is held at the nearest display's edge (2880,540 with one 1920-wide display
-// showed the cursor at its right edge, on 14.6.1, job m3-max-35287).
+// past every display is held at the edge of the display the cursor is on (2880,540 with one
+// 1920-wide display showed the cursor at its right edge, on 14.6.1, job m3-max-35287; 5755,600
+// with the cursor on display 0 of two side by side held it at display 0's right edge, on 27.0.1,
+// job m3-max-35450).
 //
 // So each driven display's rectangle is held here, and each landing of a move the kext posted
 // checks it:
@@ -386,15 +388,25 @@ inline bool rgfxCrossingNext(const RgfxDisplayPlaces &places, RgfxCrossing *c, u
 	return true;
 }
 
-// The cursor shown on `display` at pixel `x`, `y` (a MOVE_CURSOR with the cursor visible): where a
-// post was out, its landing, which checks the display's rectangle (`*confirmed` where it confirmed
-// it), and the crossing's step.
+// The cursor shown on `display` with its hot spot at pixel `x`, `y` (a MOVE_CURSOR with the cursor
+// visible): where a post was out, its landing, which checks the display's rectangle (`*confirmed`
+// where it confirmed it), and the crossing's step. A hot spot past the display's edge is no
+// landing: the cursor lies on the display beside it, and shows on this one only as the part of
+// its image that reaches over the edge (measured on arm64 27.0.1: a post at 1915,600 of display 0,
+// 1920 wide, showed the cursor on display 1 too, before display 0's landing; job m3-max-35450).
 inline RgfxCrossingStep rgfxCrossingLanded(RgfxDisplayPlaces *places, RgfxCrossing *c,
                                            uint32_t display, int32_t x, int32_t y, bool *confirmed)
 {
 	*confirmed = false;
 	if (!c->waiting)
 		return RgfxCrossingStep::none;
+	if (display < RGFX_DISPLAYS_MAX) {
+		const RgfxDisplayPlace &p = places->at[display];
+		if (p.width && p.height &&
+		    (x < 0 || y < 0 || static_cast<uint32_t>(x) >= p.width ||
+		     static_cast<uint32_t>(y) >= p.height))
+			return RgfxCrossingStep::none;
+	}
 	c->waiting = false;
 	*confirmed = rgfxPlacesLanded(places, display, {c->gx, c->gy, x, y});
 	if (!c->active)
