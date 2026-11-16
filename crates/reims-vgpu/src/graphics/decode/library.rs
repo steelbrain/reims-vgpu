@@ -69,6 +69,10 @@ const KEY_PIECE: usize = 256 << 10;
 /// for that key of no larger one (its `kRgfxWholeKeyMost`).
 const WHOLE_KEY_MOST: usize = 4 << 20;
 
+/// The fewest bytes of a library whose key is hashed on a thread of its own beside the platform's
+/// make of it ([`make_library`]): below them, the hash takes less time than starting the thread.
+pub(crate) const KEY_BESIDE_MIN: usize = 64 << 10;
+
 /// The most bytes of keyed libraries the cache keeps once no id names them.
 pub(crate) const RELEASED_BUDGET: u64 = 64 << 20;
 
@@ -441,23 +445,39 @@ impl<P: Platform> MadeLibrary<P> {
 }
 
 /// The middle step of a library create, with no lock held: the key checked and the library made
-/// from the bytes, unchanged. A platform raise propagates; the caller then stores
+/// from the bytes, unchanged. The platform's make needs nothing of the key, so the key is hashed
+/// beside it, on a thread of its own, where the bytes are at least [`KEY_BESIDE_MIN`], and
+/// joined before this returns: the library is stored, and its create answered, with its key
+/// known, as when the key is hashed first. A platform raise propagates; the caller then stores
 /// [`MadeLibrary::refused`].
 pub(crate) fn make_library<P: Platform>(
     device: &P::Device,
     job: &LibraryJob<P>,
 ) -> RaiseResult<MadeLibrary<P>> {
-    // Under the guest's key where the host vouches for it, else, where it cannot, under the key of
-    // the whole bytes.
-    let key = job.guest_key.and_then(|guest| {
-        let key = match verified_key(&job.bytes) {
-            Some(host) => (host == guest).then_some(host)?,
-            None => whole_key(&job.bytes)?,
-        };
-        Some((key, job.bytes.len() as u64))
-    });
+    let bytes = job.bytes.as_slice();
+    let (key, made) = match job.guest_key {
+        Some(guest) if bytes.len() >= KEY_BESIDE_MIN => std::thread::scope(|scope| {
+            let hashing = std::thread::Builder::new()
+                .name("reims-vgpu.graphics-key".into())
+                .spawn_scoped(scope, move || library_key(guest, bytes));
+            let made = device.new_library(bytes);
+            let key = match hashing {
+                // The hash panics nowhere; a panic there unwinds here, as it would inline.
+                Ok(hashing) => hashing
+                    .join()
+                    .unwrap_or_else(|p| std::panic::resume_unwind(p)),
+                // No thread to hash on: the key is hashed after the make.
+                Err(_) => library_key(guest, bytes),
+            };
+            (key, made)
+        }),
+        guest => (
+            guest.and_then(|guest| library_key(guest, bytes)),
+            device.new_library(bytes),
+        ),
+    };
     // A nil library and a build failure both mean no usable library.
-    let (library, refusal) = match device.new_library(&job.bytes)? {
+    let (library, refusal) = match made? {
         Ok(Some(library)) => (Some(library), None),
         Ok(None) => (None, Some("the platform answered nil".to_owned())),
         Err(e) => (
@@ -473,6 +493,18 @@ pub(crate) fn make_library<P: Platform>(
         resets: job.resets,
         refusal,
     })
+}
+
+/// The key a library of `bytes`, which the guest sent with key `guest`, is kept under, and the
+/// bytes' length: the guest's key where the host vouches for it ([`verified_key`]), else, where it
+/// cannot vouch for any, the key of the whole bytes ([`whole_key`]); none where the host vouches
+/// for another key than the guest's, or for none and the bytes have no whole key.
+fn library_key(guest: LibraryKey, bytes: &[u8]) -> Option<(LibraryKey, u64)> {
+    let key = match verified_key(bytes) {
+        Some(host) => (host == guest).then_some(host)?,
+        None => whole_key(bytes)?,
+    };
+    Some((key, bytes.len() as u64))
 }
 
 /// A `COMPLETE` for the create at `seqno`.

@@ -6509,6 +6509,92 @@ fn a_library_with_a_wrong_key_is_not_kept() {
     assert_eq!(library_makes(&platform), 2);
 }
 
+/// A library of at least `KEY_BESIDE_MIN` bytes has its key hashed on a thread of its own beside
+/// the platform's make of it, and is stored and answered once both are done, as one hashed first
+/// is: sent as the bundle sends a large library, in a chunk from its process's block, it is kept
+/// under its key by the time its create is answered, so another process's lookup right after
+/// finds it with nothing made again; one sent with another key is made and kept under none.
+#[test]
+fn a_large_library_keyed_beside_its_make_is_kept_under_its_key_when_answered() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let bitcode: Vec<u8> = (0..decode::TEST_KEY_BESIDE_MIN + 4096)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let half = bitcode.len() / 2;
+    let len = |n: usize| u64::try_from(n).expect("a length");
+    let bytes = decode::test_metallib(
+        &bitcode,
+        &[
+            (0, len(half), decode::test_sha(&bitcode[..half])),
+            (
+                len(half),
+                len(bitcode.len() - half),
+                decode::test_sha(&bitcode[half..]),
+            ),
+        ],
+    );
+    assert!(bytes.len() >= decode::TEST_KEY_BESIDE_MIN);
+    let key = decode::test_key(&bytes).expect("the large library's key");
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const AT: u64 = BLOCK + 0x1000;
+    // SAFETY: as `Guest`'s helpers; the span lies in the region.
+    unsafe { guest.write(AT as usize, &bytes) };
+    guest.send(&device, block_grant(1, BLOCK, 0x4_0000));
+    let create = |obj_id: u64, key: [u8; 32]| {
+        RgfxLibraryFromRegion {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_LIBRARY_FROM_REGION,
+                size: 0,
+                seqno: 0,
+            },
+            obj_id,
+            region_offset: AT,
+            byte_length: len(bytes.len()),
+            total_length: len(bytes.len()),
+            chunk_offset: 0,
+            ack_offset: BLOCK,
+            ack_value: 7,
+            flags: RGFX_LIBRARY_FLAG_KEYED,
+            key,
+            ..RgfxLibraryFromRegion::default()
+        }
+        .as_bytes()
+        .to_vec()
+    };
+    assert_eq!(
+        answered(&device, &mut guest, create(obj(1, 10), key)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            library_lookup(obj(2, 10), bytes.len(), key)
+        ),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(library_makes(&platform), 1);
+    // Another key: made, and kept under neither.
+    let mut wrong = key;
+    wrong[0] ^= 1;
+    assert_eq!(
+        answered(&device, &mut guest, create(obj(1, 11), wrong)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            library_lookup(obj(2, 11), bytes.len(), wrong)
+        ),
+        RGFX_STATUS_NOT_FOUND
+    );
+    assert_eq!(library_makes(&platform), 2);
+}
+
 /// A library whose tags the host cannot vouch for (Core Image's: they are no SHA-256 of their
 /// bitcode) is kept under the key of its whole bytes instead of the guest's: a lookup of the
 /// guest's key misses, one of the whole bytes' key, from another process, finds it with nothing

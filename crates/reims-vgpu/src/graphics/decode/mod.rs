@@ -219,6 +219,8 @@ pub(crate) use function_table::named_pipeline as function_table_pipeline;
 pub(crate) use lane::{LANE_MOST, LANE_THREADS};
 use lane::{Lane, Turn};
 #[cfg(test)]
+pub(crate) use library::KEY_BESIDE_MIN as TEST_KEY_BESIDE_MIN;
+#[cfg(test)]
 pub(crate) use library::tests::{metallib as test_metallib, sha as test_sha};
 #[cfg(test)]
 pub(crate) use library::verified_key as test_key;
