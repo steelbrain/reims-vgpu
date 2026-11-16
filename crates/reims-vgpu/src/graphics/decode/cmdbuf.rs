@@ -2424,7 +2424,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         // buffer's goes on to its last part.
         let part = parts.part_handler(InFlight::new(&s.in_flight));
         cb.add_completion_seen_handler(ON, part)?;
-        let joins = joins_next(cb, s);
+        let joins = joins_next::<P>(cb, s);
         match cb.split(ON)? {
             Some(next) => {
                 *cb = next;
@@ -2902,7 +2902,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     let parts = Arc::clone(s.parts.get_or_insert_with(Arc::default));
                     let committing = part.as_ref().unwrap_or(&*cb);
                     committing.add_completion_seen_handler(ON, parts.part_handler(place))?;
-                    let joins = joins_next(committing, s);
+                    let joins = joins_next::<P>(committing, s);
                     match committing.commit_part(ON)? {
                         PartCut::Cut => {
                             deal.parts_out = true;

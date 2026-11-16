@@ -202,7 +202,7 @@ impl CommandBuffer<FakePlatform> for Fk<kind::CommandBuffer> {
         ));
         // A buffer the world holds unsubmitted still reads `NotEnqueued`, so its commit is read
         // from the world's list.
-        let committed = self.world().committed().contains(&self.id());
+        let committed = self.world().committed().contains(&self.obj().id());
         match &mut self.state().model {
             Model::CommandBuffer(m)
                 if m.status == CommandBufferStatus::NOT_ENQUEUED && !committed =>
