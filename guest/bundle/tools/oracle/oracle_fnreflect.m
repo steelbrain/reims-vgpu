@@ -22,7 +22,7 @@
 // and for a name the library does not hold, `LIB/nosuch.reflection = VALUE`. Then functions
 // specialised by constant values, the same getters under `S NAME`: v_gated of kOffset true and
 // kColor false (`v_gated.offset`), of both true (`v_gated.both`) and of both false
-// (`v_gated.none`), v_deadread of kColor false and true (`.off`, `.on`), and oracle_reflection's
+// (`v_gated.none`), v_deadread and v_deadfold of kColor false and true (`.off`, `.on`), and oracle_reflection's
 // k_constants of kOn true, kOff false and kIndex 5 and v_specialised of kMode 1, 0 and 2.
 // Then pipeline states, `P CASE made|nil error=...`, then each property of the state's protocol
 // and of the protocols it adopts (allocatedSize is MTLAllocation's) that gives an object or a
@@ -265,6 +265,12 @@ static void specialisations(id<MTLLibrary> fnreflect, id<MTLLibrary> reflection)
 	v = [MTLFunctionConstantValues new];
 	[v setConstantValue:&yes type:MTLDataTypeBool withName:@"kColor"];
 	specialised(fnreflect, @"v_deadread.on", @"v_deadread", v);
+	v = [MTLFunctionConstantValues new];
+	[v setConstantValue:&no type:MTLDataTypeBool withName:@"kColor"];
+	specialised(fnreflect, @"v_deadfold.off", @"v_deadfold", v);
+	v = [MTLFunctionConstantValues new];
+	[v setConstantValue:&yes type:MTLDataTypeBool withName:@"kColor"];
+	specialised(fnreflect, @"v_deadfold.on", @"v_deadfold", v);
 	v = [MTLFunctionConstantValues new];
 	int index = 5;
 	[v setConstantValue:&yes type:MTLDataTypeBool withName:@"kOn"];

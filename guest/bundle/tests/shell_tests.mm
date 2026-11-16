@@ -9782,13 +9782,13 @@ void test_function_stage_attributes_as_metal()
 	CHECK([fn.ours newFunctionWithName:@"v_order"].vertexAttributes.count == 4);
 }
 
-// A function whose library's metadata declares no stage input attributes answers those of Metal's
-// own function of the same constant values in the library Metal compiled, its library's adopted
-// shadow (RgfxStageAttributesOf): the libraries Metal compiles from tests/stage_attributes.metal and
-// the oracle probe's oracle_fnreflect.metal, their bytes made ours without their VATT and VATY
-// tags, as macOS 11.7.11 on x86-64 writes none for a library it compiles, answer Metal's own for
-// every function and for values that specialise them, each specialisation asked of the shadow.
-// With the tags, the shadow is never asked of a function that declares attributes.
+// A function whose library has Metal's own library answers the stage input attributes of Metal's
+// own function of the same constant values, whether or not its library's metadata declares them
+// (RgfxStageAttributesOf): the libraries Metal compiles from tests/stage_attributes.metal and the
+// oracle probe's oracle_fnreflect.metal, their bytes made ours with their VATT and VATY tags and
+// without them, as macOS 11.7.11 on x86-64 writes none for a library it compiles, answer Metal's own
+// for every function and for values that specialise them, each asked of the shadow; v_deadfold's
+// attributes whose reads only Metal's folding of the values makes dead among them.
 void test_function_stage_attributes_from_the_shadow()
 {
 	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
@@ -9808,7 +9808,9 @@ void test_function_stage_attributes_from_the_shadow()
 	     {{"v_gated", {{"kOffset", MTLDataTypeBool, 1}, {"kColor", MTLDataTypeBool, 0}}},
 	      {"v_gated", {{"kOffset", MTLDataTypeBool, 0}, {"kColor", MTLDataTypeBool, 0}}},
 	      {"v_deadread", {{"kColor", MTLDataTypeBool, 0}}},
-	      {"v_deadread", {{"kColor", MTLDataTypeBool, 1}}}}},
+	      {"v_deadread", {{"kColor", MTLDataTypeBool, 1}}},
+	      {"v_deadfold", {{"kColor", MTLDataTypeBool, 0}}},
+	      {"v_deadfold", {{"kColor", MTLDataTypeBool, 1}}}}},
 	};
 	size_t attributes = 0, functions = 0, renamed = 0, declaring = 0;
 	for (const Source &src : sources) {
@@ -9870,10 +9872,12 @@ void test_function_stage_attributes_from_the_shadow()
 				                    [NSString stringWithFormat:@"%s %@%s", src.env, name, strip ? " untagged" : ""],
 				                    attributes);
 				functions++;
-				if (!strip && theirs.stageInputAttributes.count > 0) {
-					CHECK(![shadow.asked containsObject:name]);
+				// A vertex function or a kernel asks; a function of another stage answers none.
+				const MTLFunctionType type = theirs.functionType;
+				CHECK([shadow.asked containsObject:name] ==
+				      (type == MTLFunctionTypeVertex || type == MTLFunctionTypeKernel));
+				if (!strip && theirs.stageInputAttributes.count > 0)
 					declaring++;
-				}
 			}
 			for (const auto &[function, values] : src.cases) {
 				NSMutableString *what = [NSMutableString stringWithFormat:@"%s%s", function, strip ? " untagged" : ""];
@@ -9885,7 +9889,7 @@ void test_function_stage_attributes_from_the_shadow()
 				[shadow.asked removeAllObjects];
 				sameStageAttributes(mine, theirs, what, attributes);
 				functions++;
-				CHECK([shadow.asked containsObject:@(function)] == (strip != 0));
+				CHECK([shadow.asked containsObject:@(function)]);
 			}
 		}
 	}

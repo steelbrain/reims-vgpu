@@ -135,6 +135,26 @@ vertex Out v_deadread(DeadRead in [[stage_in]])
 	return o;
 }
 
+// Attributes read under no function constant whose reads are dead only once the values are folded
+// as Metal's compiler folds them: one read through a select on a constant, one through a loop the
+// values give no trips.
+struct DeadFold {
+	float4 position [[attribute(0)]];
+	float4 tint [[attribute(5)]];
+	float4 extra [[attribute(6)]];
+};
+
+vertex Out v_deadfold(DeadFold in [[stage_in]])
+{
+	Out o;
+	const float4 tint = in.tint * in.position.w;
+	o.position = in.position;
+	for (int i = 0; i < (kColor ? 3 : 0); i++)
+		o.position += in.extra * float(i);
+	o.color = kColor ? tint : float4(1);
+	return o;
+}
+
 // A stage input beside built-ins and buffers.
 struct Mixed {
 	float3 position [[attribute(0)]];

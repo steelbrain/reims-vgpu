@@ -224,12 +224,14 @@ id _Nullable RgfxRenderPipelineReflectionOf(id<MTLFunction> _Nullable vertex,
 // Metal has those; nil goes back to Metal's own.
 void RgfxPipelineReflectionUseClassesForTests(NSDictionary<NSString *, id> *_Nullable standIns);
 
-// The stage input attributes `function`, one of our libraries' (RgfxFunction), answers: those its
-// library declares for it, as its constant values specialise them (RgfxSpecialiseStageAttributes),
-// or where its library's metadata declares none, those of Metal's own function of the same values
-// in the library Metal compiled, linked or stitched (the library's adopted shadow); in Metal's
-// objects (RgfxStageAttributesMake, of MTLVertexAttributeInternal for a vertex function); nil
-// where neither declares any, and nil, logged once per reason, where they are not made.
+// The stage input attributes `function`, one of our libraries' (RgfxFunction), answers: those of
+// Metal's own function of the same name and constant values, where its library has Metal's own
+// library (the one Metal compiled, linked or stitched, or one made over the library's bytes) and
+// Metal makes the function; else those its library declares for it, or where it declares none
+// those of Metal's own unspecialised function in the library Metal compiled, as its constant values
+// specialise them (RgfxSpecialiseStageAttributes). In Metal's objects (RgfxStageAttributesMake, of
+// MTLVertexAttributeInternal for a vertex function); nil where Metal's function answers nil or
+// none are declared, and nil, logged once per reason, where they are not made.
 NSArray *_Nullable RgfxStageAttributesOf(id<MTLFunction> function);
 
 // The reflection a function answers by itself (RgfxFunctionReflectionMake): nil, logged once per
