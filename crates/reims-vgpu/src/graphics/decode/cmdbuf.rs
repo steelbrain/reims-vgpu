@@ -106,6 +106,8 @@ use reims_vgpu_graphics::ops::blit::{
     RGFX_OP_BLIT_RESET_COMMANDS_IN_BUFFER, RGFX_OP_BLIT_UPDATE_FENCE, RGFX_OP_BLIT_WAIT_FOR_FENCE,
 };
 use reims_vgpu_graphics::ops::compute::{
+    RGFX_OP_COMPUTE_ENCODE_START_DO_WHILE, RGFX_OP_COMPUTE_ENCODE_START_ELSE,
+    RGFX_OP_COMPUTE_ENCODE_START_IF, RGFX_OP_COMPUTE_ENCODE_START_WHILE,
     RGFX_OP_COMPUTE_UPDATE_FENCE, RGFX_OP_COMPUTE_WAIT_FOR_FENCE,
 };
 use reims_vgpu_graphics::ops::render::{
@@ -1091,6 +1093,10 @@ struct Take {
     video: bool,
     /// The stream holds a render, compute or blit encoder, or an op of one.
     work: bool,
+    /// The stream holds a record of command predication (an `ENCODE_START_*` op), the only ones
+    /// the walk sends: where it holds none, its command buffer is told so before any encoder
+    /// (`CommandBuffer::holds_no_predication`), and keeps nothing for one.
+    predicates: bool,
     /// The luma and chroma textures of each of its decodes, in stream order.
     decodes: Vec<(u64, u64)>,
 }
@@ -1142,6 +1148,13 @@ fn take(mut ops: &[u8]) -> Take {
             RGFX_OP_ENCODER_BEGIN_RENDER
             | RGFX_OP_ENCODER_BEGIN_COMPUTE
             | RGFX_OP_ENCODER_BEGIN_BLIT => out.work = true,
+            RGFX_OP_COMPUTE_ENCODE_START_IF
+            | RGFX_OP_COMPUTE_ENCODE_START_WHILE
+            | RGFX_OP_COMPUTE_ENCODE_START_ELSE
+            | RGFX_OP_COMPUTE_ENCODE_START_DO_WHILE => {
+                out.work = true;
+                out.predicates = true;
+            }
             // The device's diagnostic, read as it took the buffer: no work, and nothing taken.
             RGFX_OP_GUEST_TIMES => {}
             tag => match op_group(tag) {
@@ -1776,6 +1789,11 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(cb) = queue.command_buffer(ON)? else {
             return Ok(Err(DecodeError::Refused));
         };
+        // Its walk sends no record of command predication where its stream holds none, before
+        // any encoder of it or of a part cut from it ([`Take::predicates`]).
+        if !take.predicates {
+            cb.holds_no_predication();
+        }
         super::work::command_buffer(self.context);
         let in_flight = InFlight::new(&counts.in_flight, &counts.out);
         // Its queue's commit marks rise to it, where its begin on a queue's service thread did
@@ -10842,5 +10860,33 @@ mod tests {
         reims_vgpu_vulkan::exit_gate::arm();
         drop(walker);
         crate::graphics::tests::host_exit(0);
+    }
+
+    /// A stream holds a record of command predication where it holds an `ENCODE_START_*` op, and
+    /// only then ([`Take::predicates`]): its command buffer is told before its walk that it holds
+    /// none otherwise (`CommandBuffer::holds_no_predication`).
+    #[test]
+    fn a_stream_predicates_only_where_it_holds_a_start_record() {
+        use reims_vgpu_graphics::ops::compute::RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS;
+        let begin = op(RGFX_OP_ENCODER_BEGIN_COMPUTE, &[0; 8]);
+        let end = op(RGFX_OP_ENCODER_END, &[]);
+        let plain = [
+            begin.clone(),
+            op(RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS, &[0; 48]),
+            end.clone(),
+        ]
+        .concat();
+        let taken = take(&plain);
+        assert!(taken.work && !taken.predicates);
+        for (tag, body) in [
+            (RGFX_OP_COMPUTE_ENCODE_START_IF, &[0u8; 24][..]),
+            (RGFX_OP_COMPUTE_ENCODE_START_WHILE, &[0; 24]),
+            (RGFX_OP_COMPUTE_ENCODE_START_ELSE, &[]),
+            (RGFX_OP_COMPUTE_ENCODE_START_DO_WHILE, &[]),
+        ] {
+            let ops = [begin.clone(), op(tag, body), end.clone()].concat();
+            let taken = take(&ops);
+            assert!(taken.work && taken.predicates, "{tag:#x}");
+        }
     }
 }

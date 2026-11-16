@@ -118,6 +118,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, Range};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use crate::core::num::Truncate;
@@ -1292,6 +1293,9 @@ fn overruns(state: &rt::Buffer, loops: &Mutex<Vec<(&'static str, String)>>) {
 pub struct Predication {
     unit: Mutex<Unit>,
     device: VulkanDevice,
+    /// The caller's word that no record comes ([`Self::hold_none`]): its encoders keep nothing
+    /// for one.
+    none: AtomicBool,
 }
 
 impl std::fmt::Debug for Predication {
@@ -1306,7 +1310,29 @@ impl Predication {
         Arc::new(Predication {
             unit: Mutex::new(Unit::default()),
             device: device.clone_ref(),
+            none: AtomicBool::new(false),
         })
+    }
+
+    /// The caller's word that no record of command predication comes to the command buffer's
+    /// compute encoders, nor to the parts cut from it ([`Self::go_on`]): taken before any
+    /// encoder (`CommandBuffer::holds_no_predication`). From then on [`observe`] keeps nothing of
+    /// a command, and a direct dispatch takes no hold of the unit ([`work`]). What a record reads
+    /// is all the encoders keep (the open encoder's bindings, the resources it made resident, the
+    /// log of an open loop's body, the block structure), so with none to come the guest's work is
+    /// what it was; a record that comes all the same dies, as its bindings were not kept.
+    ///
+    /// **Measured** (`reims-vgpu`'s `dispatch_cost`, the decoding thread under perf with frame
+    /// pointers, Radeon 780M, metal2vulkan 0b674f2c1e): [`observe`] and the bindings it keeps
+    /// took 2.6% of the decoder's time in the small shape and 4.0% in the fluid shape, an
+    /// atomic count of each bound object's taken and let go of each time.
+    pub(crate) fn hold_none(&self) {
+        self.none.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the caller's word is that no record comes ([`Self::hold_none`]).
+    fn holds_none(&self) -> bool {
+        self.none.load(Ordering::Relaxed)
     }
 
     /// Whether the command buffer may be cut here into parts, its work so far committed and a
@@ -1332,6 +1358,9 @@ impl Predication {
     /// first. Its steps use GPU objects of the next part's own, its counter reset at its first
     /// step.
     pub(crate) fn go_on(&self, cut: &Predication) {
+        if cut.holds_none() {
+            self.hold_none();
+        }
         let before = cut.unit.lock();
         let mut u = self.unit.lock();
         u.first_type = before.first_type;
@@ -1720,9 +1749,25 @@ fn open(enc: &VulkanComputeEncoder, sel: &'static str) {
     plain(|| enc.with(sel, |_| ()));
 }
 
+/// [`open`], for the record `sel`; in a command buffer whose caller said no record would come
+/// ([`Predication::hold_none`]) it dies, as its encoders kept nothing a record reads.
+fn recorded(enc: &VulkanComputeEncoder, sel: &'static str) {
+    open(enc, sel);
+    if enc.predication.holds_none() {
+        dies(
+            sel,
+            "a record of command predication in a command buffer whose decoder said it held \
+             none: its encoders kept no bindings for it",
+        );
+    }
+}
+
 /// Every command core sends `enc`, before it is encoded: the bindings it sets, and the log of an
 /// open loop's body. A fence inside a block dies.
 pub fn observe(enc: &VulkanComputeEncoder, cmd: &ComputeCmd<'_, VulkanPlatform>) {
+    if enc.predication.holds_none() {
+        return;
+    }
     let mut u = enc.predication.unit.lock();
     if u.encoder != Some(enc.number) {
         return;
@@ -2000,6 +2045,15 @@ impl Work<'_> {
 /// and not at all in a unit an unbalanced record emptied, as Metal drops it there.
 pub fn work(enc: &VulkanComputeEncoder, sel: &'static str, work: Work<'_>) -> RaiseResult<()> {
     open(enc, sel);
+    // With no record to come ([`Predication::hold_none`]), a direct dispatch reads nothing of the
+    // unit: no block opens, no record empties it and no step leaves a pipeline the guest did not
+    // set. An indirect one still meets the unit's first dispatch type, and an execution its
+    // inherited pipeline.
+    if enc.predication.holds_none()
+        && matches!(work, Work::Threadgroups { .. } | Work::Threads { .. })
+    {
+        return send(sel, Policy::Dies, || enc.with(sel, |e| work.direct(e)));
+    }
     let indirect = matches!(
         work,
         Work::ThreadgroupsIndirect { .. } | Work::ThreadsIndirect { .. }
@@ -2057,7 +2111,7 @@ pub fn start_if(
     comparison: u64,
     reference: u32,
 ) -> RaiseResult<()> {
-    open(enc, sel);
+    recorded(enc, sel);
     let predication = &*enc.predication;
     let mut u = predication.unit.lock();
     let Some(buffer) = buffer else {
@@ -2079,7 +2133,7 @@ pub fn start_if(
 
 /// `encodeStartElse`: with no open If it empties the unit.
 pub fn start_else(enc: &VulkanComputeEncoder, sel: &'static str) -> RaiseResult<()> {
-    open(enc, sel);
+    recorded(enc, sel);
     let predication = &*enc.predication;
     let mut u = predication.unit.lock();
     let emptied = u.emptied;
@@ -2113,7 +2167,7 @@ pub fn start_else(enc: &VulkanComputeEncoder, sel: &'static str) -> RaiseResult<
 
 /// `encodeEndIf`: YES where it closes an If; with none open it empties the unit, and answers NO.
 pub fn end_if(enc: &VulkanComputeEncoder, sel: &'static str) -> RaiseResult<bool> {
-    open(enc, sel);
+    recorded(enc, sel);
     let predication = &*enc.predication;
     let mut u = predication.unit.lock();
     if u.recording() {
@@ -2232,7 +2286,7 @@ pub fn start_while(
     comparison: u64,
     reference: u32,
 ) -> RaiseResult<()> {
-    open(enc, sel);
+    recorded(enc, sel);
     let Some(buffer) = buffer else {
         enc.predication.unit.lock().empty(sel);
         return Ok(());
@@ -2244,7 +2298,7 @@ pub fn start_while(
 
 /// `encodeStartDoWhile`.
 pub fn start_do_while(enc: &VulkanComputeEncoder, sel: &'static str) -> RaiseResult<()> {
-    open(enc, sel);
+    recorded(enc, sel);
     start_loop(
         enc,
         sel,
@@ -2342,7 +2396,7 @@ fn lay_down(
 /// `encodeEndWhile`: YES where it closes a While; with none open it empties the unit, and
 /// answers NO.
 pub fn end_while(enc: &VulkanComputeEncoder, sel: &'static str) -> RaiseResult<bool> {
-    open(enc, sel);
+    recorded(enc, sel);
     let predication = &*enc.predication;
     let (end, cond) = {
         let mut u = predication.unit.lock();
@@ -2384,7 +2438,7 @@ pub fn end_do_while(
     comparison: u64,
     reference: u32,
 ) -> RaiseResult<bool> {
-    open(enc, sel);
+    recorded(enc, sel);
     let predication = &*enc.predication;
     let (end, cond) = {
         let mut u = predication.unit.lock();
@@ -3403,4 +3457,88 @@ mod tests {
             );
         }
     );
+
+    /// A command buffer whose caller said no record of command predication comes keeps nothing
+    /// for one ([`Predication::hold_none`]): its encoder's sets leave its bindings empty, where by
+    /// default they are kept, and its dispatches, and those of a part cut from it, which carries
+    /// the word on, run as before.
+    #[test]
+    fn a_command_buffer_holding_no_predication_keeps_nothing_for_it() {
+        let inc = kernel(INC, "inc_k");
+        let w = shared(64);
+        let cb = command_buffer();
+        let e = compute(&cb);
+        encode_all(&e, [set(&inc), bind(&[Some(&w)], &[0]), one()]);
+        {
+            let u = cb.predication.unit.lock();
+            assert!(u.bindings.pipeline.is_some() && !u.bindings.buffers.is_empty());
+        }
+        e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
+        completes(&cb);
+
+        let cb = command_buffer();
+        cb.holds_no_predication();
+        let e = compute(&cb);
+        encode_all(&e, [set(&inc), bind(&[Some(&w)], &[0]), one()]);
+        {
+            let u = cb.predication.unit.lock();
+            assert!(u.bindings.pipeline.is_none() && u.bindings.buffers.is_empty());
+        }
+        e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
+        let next = cb.split(OnFault::Return).unwrap().expect("a part");
+        assert!(next.predication.holds_none());
+        let e = compute(&next);
+        encode_all(
+            &e,
+            [
+                set(&inc),
+                bind(&[Some(&w)], &[0]),
+                one(),
+                ComputeCmd::EndEncoding,
+            ],
+        );
+        completes(&next);
+        assert_eq!(words(&w)[0], 3);
+    }
+
+    /// Each record sent all the same to a command buffer whose caller said none comes dies at
+    /// the record: its encoders kept no bindings for it.
+    #[test]
+    fn a_record_after_holding_no_predication_dies() {
+        let c = holding(&[1, 0]);
+        type Record = fn(&VulkanComputeEncoder, &VulkanBuffer);
+        let records: [(&str, Record); 7] = [
+            ("encodeStartIf:offset:comparison:referenceValue:", |e, c| {
+                encode_all(e, [start_if(c, 0, 0, 1)])
+            }),
+            ("encodeStartElse", |e, _| {
+                encode_all(e, [ComputeCmd::EncodeStartElse]);
+            }),
+            (
+                "encodeStartWhile:offset:comparison:referenceValue:",
+                |e, c| encode_all(e, [start_while(c, 0, 1, 0)]),
+            ),
+            ("encodeStartDoWhile", |e, _| {
+                encode_all(e, [ComputeCmd::EncodeStartDoWhile]);
+            }),
+            ("encodeEndIf", |e, _| {
+                e.encode_end_if().unwrap();
+            }),
+            ("encodeEndWhile", |e, _| {
+                e.encode_end_while().unwrap();
+            }),
+            (
+                "encodeEndDoWhile:offset:comparison:referenceValue:",
+                |e, c| {
+                    e.encode_end_do_while(Some(c), 0, 0, 0).unwrap();
+                },
+            ),
+        ];
+        for (sel, record) in records {
+            let cb = command_buffer();
+            cb.holds_no_predication();
+            let e = compute(&cb);
+            dies_at(sel, || record(&e, &c));
+        }
+    }
 }

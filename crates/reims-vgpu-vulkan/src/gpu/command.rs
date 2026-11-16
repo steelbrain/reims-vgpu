@@ -1552,6 +1552,12 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         crate::gpu::sync_file::encode_wait(&self.raw, file)
     }
 
+    /// Its compute encoders keep no bindings for command predication, and its dispatches take
+    /// no hold of its predication's state ([`Predication::hold_none`]).
+    fn holds_no_predication(&self) {
+        self.predication.hold_none();
+    }
+
     fn split(&self, on: OnFault) -> RaiseResult<Option<VulkanCommandBuffer>> {
         if !self.splits() {
             return Ok(None);

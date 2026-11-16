@@ -377,4 +377,11 @@ pub trait CommandBuffer<P: Platform>: Handle {
     fn encode_wait_for_sync_file(&self, _file: SyncFile) -> bool {
         false
     }
+    /// The platform's own, no Metal call: before any encoder, the caller's word that no
+    /// compute encoder of the buffer, nor of the parts cut from it ([`Self::split`],
+    /// [`Self::part`]), is sent a command predication record (`encodeStartIf:...`,
+    /// `encodeStartElse`, `encodeStartWhile:...`, `encodeStartDoWhile`, or an End of one), so the
+    /// platform keeps nothing for one. A record sent after it dies. Nothing by default: the
+    /// platform then keeps what a record would need, as before.
+    fn holds_no_predication(&self) {}
 }
