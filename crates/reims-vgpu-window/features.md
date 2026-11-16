@@ -193,6 +193,19 @@ Unset or unparsable values give the defaults below.
   `test: native::macos::input::a_drag_keeps_going_outside_the_window`
 - The click that brings the window forward is not sent to the guest.
   `test: native::macos::input::the_click_that_makes_the_window_key_is_not_sent`, `manual`
+- With several reims-graphics displays, the pointer over a window reaches
+  that window's display: moving the host's pointer from one window into
+  another moves the guest's cursor onto that window's display, where the
+  pointer is, and the pointer then drives the cursor over that display.
+  macOS scales the one USB tablet over the display its cursor is on, so the
+  window has the guest move its cursor first (`POINTER_OVER`,
+  docs/graphics-kext/design.md, "Multiple displays"). Captured, the pointer
+  is held over its window's image (Capture), so a drag stays on the display
+  it began on, and the pointer reaches another display's window once capture
+  is released.
+  `test: reims-vgpu::graphics::tests::displays::a_window_s_pointer_tells_the_guest_its_display_before_the_host`,
+  `test: reims-vgpu-graphics::device::tests::displays::the_pointer_over_another_display_tells_the_guest_once`,
+  `manual` (a VM with two displays)
 
 ## Keyboard
 
@@ -434,6 +447,10 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `test: native::sdl_thread::input::the_click_that_focuses_the_window_is_not_sent`,
   `test: native::sdl_thread::input::before_the_guest_has_a_mode_the_pointer_sends_nothing`,
   `test: native::sdl_thread::input::moves_are_sent_where_the_guest_pixel_changes`
+- With several reims-graphics displays, the pointer over a window reaches
+  that window's display, as on macOS.
+  `test: reims-vgpu::graphics::tests::displays::a_window_s_pointer_tells_the_guest_its_display_before_the_host`,
+  `manual` (a VM with two displays)
 - Keys by position, as evdev reports them, so the guest's layout applies and
   ISO keys arrive as on a real ISO keyboard; media keys are dropped.
   `test: native::sdl_thread::keymap::scancodes_are_usb_usages`,
