@@ -448,6 +448,7 @@ fn run(args: &[&OsStr], progress: &mut dyn FnMut(&str)) -> Result<serde_json::Va
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     end_with_parent(&mut cmd);
+    cache_where_reims_ctl_does(&mut cmd);
     let mut child = cmd
         .spawn()
         .with_context(|| format!("run {}", bin.display()))?;
@@ -553,6 +554,19 @@ fn end_with_parent(cmd: &mut Command) {
     let _ = cmd;
 }
 
+/// On Windows, gives reims-util the cache root reims-ctl's own cache is in, in the user's profile
+/// ([`crate::paths::cache_dir`]): reims-util keeps its downloads under `XDG_CACHE_HOME`, else
+/// under `HOME`'s `.cache`, and stops with "HOME is not set" where neither is, as in a
+/// PowerShell window; an MSYS2 or Git shell's `HOME` is not the profile.
+fn cache_where_reims_ctl_does(cmd: &mut Command) {
+    #[cfg(windows)]
+    if let Some(root) = crate::paths::cache_dir().parent() {
+        cmd.env("XDG_CACHE_HOME", root);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
 /// The installers directory's lock, held while it lives: two VMs made from the same macOS at
 /// once share one download, rather than both writing its file. The lock goes with reims-ctl,
 /// and reims-util, which does not inherit it, ends with reims-ctl ([`end_with_parent`]).
@@ -580,6 +594,25 @@ fn lock(dir: &Path, progress: &mut dyn FnMut(&str)) -> Result<Lock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On Windows reims-util caches where reims-ctl does, in the user's profile, whatever `HOME`
+    /// a shell set or left unset; elsewhere its environment is the user's.
+    #[test]
+    fn reims_util_caches_where_reims_ctl_does() {
+        let mut cmd = Command::new("reims-util");
+        cache_where_reims_ctl_does(&mut cmd);
+        let set: Vec<_> = cmd
+            .get_envs()
+            .filter(|(k, _)| *k == "XDG_CACHE_HOME")
+            .map(|(_, v)| v.map(PathBuf::from))
+            .collect();
+        if cfg!(windows) {
+            let root = crate::paths::cache_dir().parent().unwrap().to_path_buf();
+            assert_eq!(set, [Some(root)]);
+        } else {
+            assert!(set.is_empty(), "{set:?}");
+        }
+    }
 
     /// cargo's record of what it installed, beside `bin/`, gives the commit of a reims-util
     /// installed from its repository; one at another commit than [`REV`] is stale, and one from
