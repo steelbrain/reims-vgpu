@@ -1,10 +1,11 @@
 //! VideoToolbox's paravirtual decoders on the host's hardware video ([`VtBackend`]): the backend
-//! of [`paravirt::Host`]'s decoder sessions, which an arm64 guest's VideoToolbox runs over the
-//! device's `VT_MESSAGE`s. Each session's decoder is one of the video arm's [`GuestDecoder`]s,
-//! and each of its pictures lands in the IOSurface the guest's kext lent for it
-//! ([`GuestSurface`]), through a view of the surface's guest RAM pages ([`LentViews::view`]),
-//! laid out as the kext read the surface ([`layout_of`]). The arm's decoder answers once the
-//! picture is there; the session then emits the frame, and lets go of the surface with a `rels`.
+//! of the decoder sessions of [`Host`](reims_vgpu_video::paravirt::Host), which an arm64 guest's
+//! VideoToolbox runs over the device's `VT_MESSAGE`s. Each session's decoder is one of the video
+//! arm's [`GuestDecoder`]s, and each of its pictures lands in the IOSurface the guest's kext lent
+//! for it ([`GuestSurface`]), through a view of the surface's guest RAM pages
+//! ([`LentViews::view`]), laid out as the kext read the surface ([`layout_of`]). The arm's decoder
+//! answers once the picture is there; the session then emits the frame, and lets go of the
+//! surface with a `rels`.
 //!
 //! A decoder keeps the views of the last [`VIEWS_KEPT`] surfaces it landed in, by their runs, as
 //! VideoToolbox's pool lends the same few surfaces again and again: a view maps the guest's RAM,
