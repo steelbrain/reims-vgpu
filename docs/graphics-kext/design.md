@@ -5824,6 +5824,22 @@ registers only once its bundle is on disk:
     with its other properties, made on any other root until the pass of that
     root has ended, up to 10 s (`rgfxMetalNameWaits`). A read in the kernel,
     and every read on a boot that starts in its full system, goes on at once.
+  - Measured on clones of FileVault guests whose Data volume held an older
+    build's bundle. On 26.6.2 (m3-max-35539) the unlock screen draws, the
+    password unlocks, and the full system's pass replaces the bundle, ending
+    0.35 s after launchd commits the full system's boot; WindowServer starts
+    after it, and the desktop comes up on our GPU. A second unlock cycle in
+    the same VM finds the bundle current. On 15.6.1 (m3-max-35462, before the
+    hold) the pass ends 0.42 s after that commit. With the full system's pass
+    held back 8 s by a probe build (26.6.2, m3-max-35615), WindowServer read
+    `MetalPluginName` before the pass ended, was held 5.1 s until it had, and
+    then loaded the new bundle, with no abort.
+  - Of the boots that stay in the BaseSystem, an arm64 guest on Ambrosia meets
+    FileVault's unlock and the obliteration boot, not Recovery: Ambrosia boots
+    no recoveryOS (its README and `docs/internals/replacing-iboot.md`), and the
+    guest's `nvram recovery-boot-mode=unused` sets nothing (measured on
+    26.6.2, m3-max-35539: the variable reads back as absent, and the restart
+    is FileVault's unlock again).
   - x86-64 is unchanged: its RgfxGate and ReimsGraphics binaries are
     byte-identical to the build without these.
 - Unregistered, the accelerator refuses every user client
