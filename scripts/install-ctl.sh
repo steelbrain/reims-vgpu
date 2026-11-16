@@ -103,9 +103,11 @@ case "$OS/$ARCH" in
     [[ ${MSYSTEM:-} == CLANG64 ]] || die "on Windows, run this in MSYS2's CLANG64 shell (\"MSYS2 CLANG64\" in the Start menu), whose clang builds the library and QEMU; this is its ${MSYSTEM:-MSYS} shell"
     PLATFORM=windows-x86_64
     # WHPX, the Windows Hypervisor Platform, in place of KVM; the binaries in
-    # the prefix's bin, as reims-ctl runs them (qemu/current/bin).
+    # the prefix's bin, as reims-ctl runs them (qemu/current/bin); and no
+    # guest agent, which reims-ctl does not use and whose Windows build needs
+    # windmc, which none of the packages below provides.
     QEMU_CONFIGURE=(--target-list=x86_64-softmmu --enable-whpx --disable-sdl --enable-gtk --enable-slirp
-      --enable-libusb --bindir=bin)
+      --enable-libusb --disable-guest-agent --bindir=bin)
     QEMU_BINARY=qemu-system-x86_64.exe
     ;;
   Darwin/arm64 | Linux/aarch64) BUILDS_QEMU=0 ;;
