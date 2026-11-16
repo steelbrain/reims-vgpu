@@ -3278,7 +3278,11 @@ pixels of its mode, and the buttons held):
   would land on display 0 at x 100. So once a crossing is told, the window's
   positions for that display are held (`pointer_at` answers false, and the
   window does not hand them to the host) until the guest's `MOVE_CURSOR`
-  shows its cursor on that display, for at most `CROSSING_HOLD_NS` (100 ms),
+  shows its cursor on that display, for at most `CROSSING_HOLD_NS` (a second,
+  the arm64e kext's longest crossing: under TCG a guest had not shown it
+  100 ms after the `POINTER_OVER` while the pointer went on over the new
+  display's window, and positions handed on then left the cursor at their
+  mirror on the display it was on, potluck job m3-max-37089),
   after which they go on as before, so a guest that never moves its cursor
   loses nothing for longer. A position whose buttons changed always goes on:
   no click or release is held or lost. The device logs, at debug, how long
@@ -3363,9 +3367,11 @@ pixels of its mode, and the buttons held):
     held, and taken for that post's outcome, the crossing's next post and
     the first post's late landing placed display 0 right of display 1
     (potluck job m3-max-36173).
-    A landing 100 ms or more after the `POINTER_OVER`, the host's hold
-    (`CROSSING_HOLD_NS`), comes once the host passes its pointer's
-    positions on to the tablet again, so it may show the tablet's move: it
+    A landing 100 ms or more after the `POINTER_OVER` (the kext's
+    `kRgfxCrossingHoldNs`) may come after the host passed a position on to
+    the tablet: one whose buttons changed, which goes on at once, or any on
+    a host that holds them for 100 ms alone. So it may show the tablet's
+    move: it
     confirms the placement it was posted by where it agrees with it on both
     axes, and otherwise teaches nothing, neither a corner nor a size. On
     15.6.1 under TCG a captured drag back onto display 0 posted at its
@@ -3802,9 +3808,9 @@ it.
     m3-max-35515).
   - Under TCG (14.6.1 at two displays, job m3-max-35541) the guest showed
     a crossing's landing 18 to 153 ms after the `POINTER_OVER` (the
-    device's debug log), past the host's 100 ms hold more than once, so
-    the tablet's positions reach the guest before the landing and move the
-    cursor on the display it is on.
+    device's debug log), past 100 ms more than once, so on a host that
+    holds its positions for 100 ms alone the tablet's positions reach the
+    guest before the landing and move the cursor on the display it is on.
   - WindowServer tells the kernel nothing of where it placed each display:
     it registers none with IOHIDSystem (its screen count stayed 0, and its
     work bounds 0,0 to 1920,1080 in every arrangement), an

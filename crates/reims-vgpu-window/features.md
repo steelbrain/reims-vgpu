@@ -201,7 +201,7 @@ Unset or unparsable values give the defaults below.
   window has the guest move its cursor first (`POINTER_OVER`,
   docs/graphics-kext/design.md, "Multiple displays"), and holds the
   pointer's positions over the new display until the guest's cursor is
-  there, for at most 100 ms, so none lands on the display the cursor left; a
+  there, for at most a second, so none lands on the display the cursor left; a
   button going down or up is sent at once. The cursor is on the display that
   shows its hot spot: the part of its image another display shows over a
   shared edge (an arm64 guest's WindowServer gives each display its part)

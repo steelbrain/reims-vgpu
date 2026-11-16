@@ -1017,8 +1017,14 @@ impl Queues {
 /// How long a crossing holds the pointer's positions back from the guest's pointing device
 /// ([`Shared::pointer_at`]), in nanoseconds: until the guest's cursor shows on the pointer's
 /// display, or this long after the `POINTER_OVER` that moves it there, should the guest not show
-/// it (a hidden cursor) or be slow to.
-const CROSSING_HOLD_NS: u64 = 100_000_000;
+/// it (a hidden cursor) or be slow to. A position handed on before the cursor shows there lands at
+/// its mirror on the display the cursor is on, and the arm64e kext's crossing takes up to four
+/// posts 250 ms apart (its `kRgfxCrossingPosts` and `kRgfxLandingWaitNs`): an arm64 guest under
+/// TCG had not shown the cursor on display 1 100 ms after the `POINTER_OVER` while the pointer
+/// went on over display 1's window, and the positions handed on then put the cursor at their
+/// mirror on display 0, where it stayed (macOS 26.6.2 at two displays, lane a64ptr, potluck job
+/// m3-max-37089).
+const CROSSING_HOLD_NS: u64 = 1_000_000_000;
 
 /// How long after a `POINTER_OVER` the guest's cursor hidden on every display, while the guest has
 /// yet to show it on the pointer's display, is taken for the cursor going there

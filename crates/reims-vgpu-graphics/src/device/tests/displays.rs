@@ -782,7 +782,7 @@ fn a_pointer_over_the_full_ring_has_no_room_for_goes_at_the_next_refresh() {
 /// guest's cursor shows on the pointer's display, so that the guest never takes one as a place
 /// on the display its cursor is still on, where its tablet's place would land at the same spot
 /// of that display: the position after the cursor came is handed on; so is one whose buttons
-/// changed, and any once 100 ms have gone with no cursor there
+/// changed, and any once a second has gone with no cursor there
 #[test]
 fn a_crossing_holds_the_pointer_until_the_guest_s_cursor_is_there() {
     let mut rig = Rig::of_displays(2);
@@ -808,10 +808,16 @@ fn a_crossing_holds_the_pointer_until_the_guest_s_cursor_is_there() {
     assert!(!link.pointer_at(1, 102, 202, RGFX_POINTER_BUTTON_LEFT));
     moved(&mut rig, move_on(1, 102, 202));
     assert!(link.pointer_at(1, 103, 203, RGFX_POINTER_BUTTON_LEFT));
-    // Back to display 0, the guest never showing its cursor there: held 100 ms at most.
+    // Back to display 0, the guest never showing its cursor there: held a second at most, past
+    // the 100 ms an arm64 guest under TCG may take to show it.
     assert!(!link.pointer_at(0, 5, 5, RGFX_POINTER_BUTTON_LEFT));
     assert_eq!(pointer_over(&mut rig), (0, 5, 5, RGFX_POINTER_BUTTON_LEFT));
     std::thread::sleep(Duration::from_millis(110));
+    assert!(
+        !link.pointer_at(0, 6, 6, RGFX_POINTER_BUTTON_LEFT),
+        "held past 100 ms"
+    );
+    std::thread::sleep(Duration::from_millis(900));
     assert!(link.pointer_at(0, 6, 6, RGFX_POINTER_BUTTON_LEFT));
     assert!(rig.quiet_for(100), "told once");
     // A device of one display, and a guest that did not take POINTER_OVER, hold nothing.

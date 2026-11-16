@@ -51,7 +51,7 @@
 // taken for its landing:
 //  - on another display, a pixel other than the one the post's point lies at, or is held at, is
 //    the tablet's move or the user's: the host passes the pointer's positions on to the tablet
-//    once its hold is over (the device's CROSSING_HOLD_NS, 100 ms), and an arm64 guest under
+//    once its hold is over (kRgfxCrossingHoldNs at the least), and an arm64 guest under
 //    TCG shows a post's landing 18 to 153 ms after the POINTER_OVER (host log, 14.6.1 at two
 //    displays, potluck job m3-max-35541), so the tablet can move the cursor on the display it is
 //    on before the post lands; taken for a landing there, it placed that display over the other;
@@ -111,7 +111,7 @@
 #include "reims_graphics_wire.h"
 
 // A crossing's posts: the first, and at most three more. The count is the crossing's one bound,
-// with no cutoff at the host's hold (the device's CROSSING_HOLD_NS, 100 ms): an arm64 guest under
+// with no cutoff at the host's hold (kRgfxCrossingHoldNs at the least): an arm64 guest under
 // TCG shows even a first post's landing 18 to 153 ms after the POINTER_OVER (14.6.1 at two
 // displays, potluck job m3-max-35541), so a crossing cut off at the hold would end before its
 // landing showed that a display had moved. Under HVF a whole crossing ends inside the hold (27.0.1:
@@ -129,9 +129,11 @@ constexpr int64_t kRgfxSpillReach = RGFX_CURSOR_MAX_SIZE;
 constexpr int32_t kRgfxPlaceProof = 16;
 // How far apart two landings are, in pixels, to size a display by.
 constexpr int32_t kRgfxPlaceSpan = 64;
-// How long the host holds its pointer's positions back from the guest's tablet after a
-// POINTER_OVER (the device's CROSSING_HOLD_NS), where the cursor does not show on the pointer's
-// display before: a landing after it may show the tablet's move of the cursor.
+// How long after a POINTER_OVER a landing is taken to show its post alone: the host holds its
+// pointer's positions back from the guest's tablet until the cursor shows on the pointer's display
+// (for the device's CROSSING_HOLD_NS at most), but hands on at once a position whose buttons
+// changed, and a guest set may run on a host that holds them for 100 ms alone, so a landing after
+// this may show the tablet's move of the cursor.
 constexpr uint64_t kRgfxCrossingHoldNs = 100000000;
 
 enum class RgfxPlaceState : uint8_t {
