@@ -192,6 +192,33 @@ impl fmt::Display for Refusal {
     }
 }
 
+impl Refusal {
+    /// Whether every range of pages that holds the one refused, asked for as one dma-buf, is
+    /// refused too while the pages stay mapped as they are, as the runtime's standing refusal
+    /// asks (`rt::DmaBufStandingRefusal`, which the import source answers for a texture's pages,
+    /// `super::import`'s `host_memory`):
+    /// - a byte with no file behind it ([`Refusal::Unresolved`]) lies in every such range;
+    /// - `/dev/udmabuf` not opening ([`Refusal::Device`]) is the process's, opened once;
+    /// - a range one dma-buf cannot hold ([`Refusal::Limit`] at a granule of its length, a
+    ///   texture's) is as many runs of file pages and bytes in a wider range, or more: a range
+    ///   only gains runs and bytes as it widens. Cut at a granule shorter than the range, a wider
+    ///   range is cut elsewhere, so it may fit;
+    /// - a writable piece of a file open read-only ([`Refusal::ReadOnlyFile`]) is in every such
+    ///   range.
+    ///
+    /// The kernel's refusal ([`Refusal::Kernel`]) does not stand: it answers `EINVAL` for a list
+    /// past limits lowered since they were read as for a file it takes no pages of, and `ENOMEM`
+    /// for pages it could not pin now. Nor does the kernel giving no file for a pad's zeros
+    /// ([`Refusal::NoFile`]), the host's memory running out now.
+    pub(crate) fn holds_wider(&self) -> bool {
+        match self {
+            Refusal::Unresolved | Refusal::Device(_) | Refusal::ReadOnlyFile => true,
+            Refusal::Limit { bytes, granule, .. } => granule >= bytes,
+            Refusal::Kernel(_) | Refusal::NoFile(_) => false,
+        }
+    }
+}
+
 /// What one dma-buf may hold: pieces, and bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Limits {
@@ -1476,6 +1503,40 @@ mod tests {
             Err(Refusal::Limit { pieces, .. }) => assert_eq!(pieces, count),
             other => panic!("one past the limit: {other:?}"),
         }
+    }
+
+    /// A refusal holds for every range that holds the one refused ([`Refusal::holds_wider`]) by
+    /// its class: pages with no file behind them, as a request of them is refused, a range past
+    /// one dma-buf's runs at a granule of its length, udmabuf not opening, and a writable piece of
+    /// a file open read-only do; the same range cut at a shorter granule, the kernel's refusals and
+    /// a pad's missing file do not. It needs no udmabuf
+    #[test]
+    fn refusals_hold_for_wider_ranges_by_their_class() {
+        let page = vm::page_size();
+        let private = vm::anonymous(None, 2 * page, "a test's private pages").unwrap();
+        let unresolved = of_pages_counted(private, 2 * page, 2 * page).unwrap_err();
+        assert!(
+            matches!(unresolved, Refusal::Unresolved) && unresolved.holds_wider(),
+            "{unresolved}"
+        );
+        let limits = Limits {
+            pieces: 1024,
+            bytes: 64 << 20,
+        };
+        let past = |granule| Refusal::Limit {
+            pieces: 1025,
+            bytes: 1025 * page,
+            granule,
+            limits,
+        };
+        assert!(past(1025 * page).holds_wider(), "one dma-buf of the range");
+        assert!(!past(16 * page).holds_wider(), "cut at a shorter granule");
+        let error = |code| io::Error::from_raw_os_error(code);
+        assert!(Refusal::Device(Arc::new(error(libc::ENOENT))).holds_wider());
+        assert!(Refusal::ReadOnlyFile.holds_wider());
+        assert!(!Refusal::Kernel(error(libc::EINVAL)).holds_wider());
+        assert!(!Refusal::Kernel(error(libc::ENOMEM)).holds_wider());
+        assert!(!Refusal::NoFile(error(libc::ENOMEM)).holds_wider());
     }
 
     /// A view of more scattered pages than one dma-buf may hold is made of several, in order,

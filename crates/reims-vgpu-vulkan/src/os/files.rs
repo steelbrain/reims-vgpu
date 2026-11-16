@@ -698,6 +698,36 @@ pub(crate) fn kept_whole(first: u64, length: u64) -> Option<Arc<Kept>> {
     (at == end).then(|| Arc::clone(kept))
 }
 
+/// Whether a view mapped through one dma-buf kept whole ([`Kept`]) holds the `length` bytes from
+/// `first`: the view the run at `first` lies in, where [`kept_whole`] answers its own bytes and
+/// they reach past these.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn kept_whole_holds(first: u64, length: u64) -> bool {
+    let Some(end) = first.checked_add(length) else {
+        return false;
+    };
+    let view = {
+        let table = TABLE.lock();
+        let Some((start, run)) = table.run_at(first) else {
+            return false;
+        };
+        let Some(through) = run.through.as_ref() else {
+            return false;
+        };
+        let Some(kept) = through.kept.as_ref() else {
+            return false;
+        };
+        start
+            .checked_sub(through.offset)
+            .map(|at| (at, kept.length))
+    };
+    view.is_some_and(|(at, bytes)| {
+        at.checked_add(bytes)
+            .is_some_and(|view_end| end <= view_end)
+            && kept_whole(at, bytes).is_some()
+    })
+}
+
 /// Sets the protection of what of the runs lies in `length` bytes from `first` to `prot`,
 /// cutting a run it changes at its ends.
 pub(crate) fn protect(first: u64, length: u64, prot: VmProt) {

@@ -1112,7 +1112,8 @@ impl ImportView {
 /// makes a texture over it. The source answers dma-bufs that are the window's pages in order, each
 /// within udmabuf's limits (`super::dma_buf`), which the runtime imports. A call that makes none keeps its refusal on its thread for the death there ([`dma_buf_refusal`]), as
 /// the runtime then refuses the import as it would have, or makes the texture as it does where
-/// it cannot alias the memory.
+/// it cannot alias the memory. A texture's request refused for every range that holds its pages
+/// is refused as standing ([`SourceRefusal::stands`]), so the runtime asks for no wider one.
 ///
 /// # Safety
 ///
@@ -1231,9 +1232,12 @@ unsafe fn host_memory_noting(
                 if !request.shared_files {
                     kept.lock().keep(first, length, granule, &made);
                 }
-                made.map_err(|refusal| refusal.to_string())
+                made.map_err(|refusal| SourceRefusal::of(&refusal))
             }
         };
+        // A texture's request refused for every range that holds its pages (`SourceRefusal::stands`).
+        let stands = (made.as_ref().err())
+            .is_some_and(|refused| refused.stands(first, length, request.shared_files));
         if !request.shared_files {
             let answers = match from_kept {
                 true => &TEXTURE_ANSWERS_KEPT,
@@ -1244,8 +1248,8 @@ unsafe fn host_memory_noting(
         if let Some(began) = began {
             // The trace's `dmabufsrc`: the source's number, the request's first byte, length and
             // granule, whether it takes shared files, the dma-bufs answered (0 where refused),
-            // the runs of file pages they hold, the nanoseconds the answer took, and whether it
-            // was an answer the source kept.
+            // the runs of file pages they hold, the nanoseconds the answer took, whether it was
+            // an answer the source kept, and whether its refusal stands.
             let (chunks, runs) = made
                 .as_ref()
                 .map_or((0, 0), |(c, r)| (c.len().to_u64(), *r));
@@ -1253,7 +1257,16 @@ unsafe fn host_memory_noting(
             let shared = u64::from(request.shared_files);
             let again = u64::from(from_kept);
             let event = [
-                number, first, length, granule, shared, chunks, runs, took, again,
+                number,
+                first,
+                length,
+                granule,
+                shared,
+                chunks,
+                runs,
+                took,
+                again,
+                u64::from(stands),
             ];
             crate::core::trace::event("dmabufsrc", &event);
         }
@@ -1265,11 +1278,15 @@ unsafe fn host_memory_noting(
                 );
                 Ok(chunks)
             }
-            Err(refusal) => {
-                let line = format!("no dma-buf of its {length:#x} bytes at {first:#x}: {refusal}");
+            Err(SourceRefusal { text, .. }) => {
+                let line = format!("no dma-buf of its {length:#x} bytes at {first:#x}: {text}");
                 log::debug!("{line}");
                 REFUSAL.with_borrow_mut(|kept| *kept = Some(line));
-                Err(std::io::Error::other(refusal))
+                if stands {
+                    STANDING_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                    return Err(std::io::Error::other(rt::DmaBufStandingRefusal::new(text)));
+                }
+                Err(std::io::Error::other(text))
             }
         }
     });
@@ -1292,6 +1309,40 @@ unsafe fn host_memory_noting(
 /// tests read.
 static TEXTURE_ANSWERS_MADE: AtomicU64 = AtomicU64::new(0);
 static TEXTURE_ANSWERS_KEPT: AtomicU64 = AtomicU64::new(0);
+
+/// How many of those answers were refusals that stand (`rt::DmaBufStandingRefusal`,
+/// [`SourceRefusal::stands`]): a diagnostic, which the tests read.
+static STANDING_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// A source's refusal of a request ([`host_memory`]): its text, and whether it holds for every
+/// range of pages that holds the one refused (`super::dma_buf::Refusal::holds_wider`).
+#[derive(Clone, Debug)]
+struct SourceRefusal {
+    text: String,
+    wider: bool,
+}
+
+impl SourceRefusal {
+    /// `refusal`'s text, and whether it holds for wider ranges.
+    fn of(refusal: &super::dma_buf::Refusal) -> SourceRefusal {
+        SourceRefusal {
+            text: refusal.to_string(),
+            wider: refusal.holds_wider(),
+        }
+    }
+
+    /// Whether the refusal of the `length` bytes from `first` stands for every range of pages that
+    /// holds them while the texture that asked is made (`rt::DmaBufStandingRefusal`): where the
+    /// request was a texture's (it takes no shared files, and one dma-buf of its pages, at a
+    /// granule of their length), the refusal holds for wider ranges, and no view mapped through
+    /// one dma-buf kept whole holds the pages, whose own bytes the source answers with that
+    /// dma-buf (`own_view_buf`) whatever their runs. The runtime then asks for no range that holds
+    /// these: a texture over a no-copy buffer's pages past udmabuf's `list_limit` runs is asked
+    /// for once, where each of its image's plans asked before.
+    fn stands(&self, first: u64, length: u64, shared_files: bool) -> bool {
+        !shared_files && self.wider && !files::kept_whole_holds(first, length)
+    }
+}
 
 /// How many answers to requests of a texture's own pages a source keeps ([`Kept`]): of the 4,500
 /// such requests of a guest's boot to its desktop and Geekbench 7.1.0's compute passes, warm and
@@ -1347,15 +1398,15 @@ enum Answer {
         files: Vec<(std::os::fd::OwnedFd, u64)>,
         runs: u64,
     },
-    /// A refusal for udmabuf's limits, as they were then, and the refusal's text.
+    /// A refusal for udmabuf's limits, as they were then, and the refusal.
     Refused {
         limits: super::dma_buf::Limits,
-        refusal: String,
+        refusal: SourceRefusal,
     },
 }
 
-/// A source's answer: dma-bufs and the runs of file pages they hold, or a refusal's text.
-type SourceAnswer = Result<(Vec<rt::DmaBufChunk>, u64), String>;
+/// A source's answer: dma-bufs and the runs of file pages they hold, or a refusal.
+type SourceAnswer = Result<(Vec<rt::DmaBufChunk>, u64), SourceRefusal>;
 
 impl Kept {
     /// The answer kept for the request of `length` bytes from `first` at `granule`, again: each
@@ -1410,7 +1461,7 @@ impl Kept {
             }
             Err(refusal @ super::dma_buf::Refusal::Limit { limits, .. }) => Some(Answer::Refused {
                 limits: *limits,
-                refusal: refusal.to_string(),
+                refusal: SourceRefusal::of(refusal),
             }),
             Err(_) => None,
         };
@@ -2681,7 +2732,11 @@ mod tests {
             .again(0x2000, 0x7d_0000, 0x7d_0000)
             .unwrap()
             .unwrap_err();
-        assert!(refusal.contains("2000 pieces"), "{refusal}");
+        assert!(refusal.text.contains("2000 pieces"), "{}", refusal.text);
+        assert!(
+            refusal.wider,
+            "a refusal past the limits holds for wider ranges"
+        );
         let other = Limits {
             pieces: limits.pieces + 1,
             ..limits
@@ -2875,6 +2930,212 @@ mod tests {
         released(buffer, &gone, first, first + PAGES * PAGE);
         assert!(vm.deallocate(view, PAGES * PAGE).is_success());
         assert!(vm.deallocate(src, PAGES * PAGE).is_success());
+    }
+
+    /// A texture's request refused for every range that holds its pages stands
+    /// ([`SourceRefusal::stands`]), but where a view mapped through one dma-buf kept whole holds them,
+    /// whose own bytes the source answers with that dma-buf: inside the view, and the view's own
+    /// bytes, it does not, and a range reaching past the view does. A buffer's or heap's request
+    /// (shared files) never stands, nor a refusal that holds for no wider range. The flags are the
+    /// process's, which nextest runs this test alone in
+    #[test]
+    fn a_refusal_stands_where_no_wider_range_is_answered() {
+        let wider = SourceRefusal {
+            text: "past the limits".to_owned(),
+            wider: true,
+        };
+        let narrow = SourceRefusal {
+            wider: false,
+            ..wider.clone()
+        };
+        let vm = LinuxVm::new();
+        let n = 32u64;
+        let (src, plain) = backwards(&vm, n);
+        let p = plain.addr().to_u64();
+        assert!(files::kept_whole(p, n * PAGE).is_none() || !super::super::dma_buf::opens());
+        assert!(wider.stands(p, n * PAGE, false), "a texture's pages");
+        assert!(!wider.stands(p, n * PAGE, true), "a buffer's pages");
+        assert!(
+            !narrow.stands(p, n * PAGE, false),
+            "a refusal of these pages alone"
+        );
+        assert!(vm.deallocate(plain, n * PAGE).is_success());
+        assert!(vm.deallocate(src, n * PAGE).is_success());
+        if !super::super::dma_buf::opens() {
+            eprintln!("skipped the kept view: udmabuf does not open");
+            return;
+        }
+        IMPORTS_NEED_FILES.store(true, Ordering::Relaxed);
+        ONE_DMA_BUF.store(true, Ordering::Relaxed);
+        ONE_DMA_BUF_VIEWS.store(true, Ordering::Relaxed);
+        let (src, view) = backwards(&vm, n);
+        let v = view.addr().to_u64();
+        assert!(files::kept_whole(v, n * PAGE).is_some(), "its dma-buf kept");
+        assert!(!wider.stands(v + PAGE, 2 * PAGE, false), "inside the view");
+        assert!(!wider.stands(v, n * PAGE, false), "the view's own bytes");
+        assert!(
+            !wider.stands(v + (n - 1) * PAGE, PAGE, false),
+            "its last page"
+        );
+        assert!(
+            wider.stands(v + (n - 1) * PAGE, 2 * PAGE, false),
+            "past the view"
+        );
+        assert!(vm.deallocate(view, n * PAGE).is_success());
+        assert!(vm.deallocate(src, n * PAGE).is_success());
+        ONE_DMA_BUF.store(false, Ordering::Relaxed);
+    }
+
+    /// Where the device makes a texture over a no-copy buffer's pages through a dma-buf of those
+    /// pages (RADV's in-place image), a texture over more runs of file pages than one dma-buf
+    /// takes is refused once, as standing ([`SourceRefusal::stands`]): the runtime asks the source for
+    /// none of its other plans' pages, which hold the refused ones, and makes the texture a
+    /// shadow, which reads the pages as the CPU wrote them and whose blit reaches them. Elsewhere,
+    /// said on stderr, nothing is checked
+    #[test]
+    fn a_texture_past_one_dma_buf_is_refused_once() {
+        use crate::core::platform::Platform as _;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::platform::resource::Buffer as _;
+        use crate::core::platform::types::{MtlOrigin, MtlSize};
+        use crate::core::platform::values::TextureDesc;
+        use crate::core::raise::OnFault;
+
+        let d = crate::gpu::device::tests::dev();
+        crate::gpu::device::tests::settle_device_checks(&d);
+        probes_gone();
+        if !super::super::dma_buf::opens() {
+            eprintln!("skipped: udmabuf does not open");
+            return;
+        }
+        // A view of scattered pages, a run of file pages each, one more than one dma-buf takes:
+        // a texture over all of it, a page a row of RGBA8 texels.
+        let pages = past_one_dma_buf();
+        let width = PAGE / 4;
+        let vm = LinuxVm::new();
+        let (src, view) = backwards(&vm, pages);
+        let first = view.addr().to_u64();
+        let laid = |i: u64| (i.wrapping_mul(13) ^ (i >> 12)) as u8;
+        for row in 0..pages {
+            write(first + row * PAGE, laid(row));
+            write(first + row * PAGE + PAGE - 1, laid(row) ^ 0xff);
+        }
+        let (buffer, gone) = no_copy(&d, view, pages);
+        let desc = crate::platform::tests::platform().texture_descriptor(&TextureDesc {
+            texture_type: 2,
+            pixel_format: 70,
+            width,
+            height: pages,
+            usage: 0x1,
+            resource_options: Some(0),
+            ..TextureDesc::default()
+        });
+        let asked = || {
+            (
+                TEXTURE_ANSWERS_MADE.load(Ordering::Relaxed)
+                    + TEXTURE_ANSWERS_KEPT.load(Ordering::Relaxed),
+                STANDING_REFUSALS.load(Ordering::Relaxed),
+            )
+        };
+        let (asks, stood) = asked();
+        let texture = (buffer.new_texture(OnFault::Die, &desc, 0, PAGE))
+            .unwrap()
+            .unwrap();
+        let (asks_now, stood_now) = asked();
+        if asks_now == asks {
+            eprintln!(
+                "skipped: {} makes no texture over a no-copy buffer's pages through a dma-buf of \
+                 them",
+                d.raw.properties().name
+            );
+        } else {
+            assert_eq!(
+                (asks_now - asks, stood_now - stood),
+                (1, 1),
+                "asked once, refused as standing"
+            );
+        }
+
+        let q = d.new_command_queue().unwrap();
+        let run = |encode: &dyn Fn(&crate::gpu::command::VulkanCommandBuffer)| {
+            let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+            encode(&cb);
+            cb.commit(OnFault::Die).unwrap();
+            cb.wait_until_completed(OnFault::Die).unwrap();
+            assert!(cb.error().is_none(), "{:?}", cb.error());
+        };
+        let bytes = pages * PAGE;
+        let whole = MtlSize::new(width, pages, 1);
+        let shared = || {
+            d.new_buffer_of_length(OnFault::Die, bytes, 0)
+                .unwrap()
+                .unwrap()
+        };
+        let out = shared();
+        run(&|cb| {
+            let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+            let copy = BlitCmd::CopyTextureToBuffer {
+                source_texture: &texture,
+                source_slice: 0,
+                source_level: 0,
+                source_origin: MtlOrigin::new(0, 0, 0),
+                source_size: whole,
+                destination_buffer: &out,
+                destination_offset: 0,
+                destination_bytes_per_row: PAGE,
+                destination_bytes_per_image: bytes,
+            };
+            e.encode(OnFault::Die, copy).unwrap();
+            e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+        });
+        let copied = out.contents().as_ptr::<u8>().addr().to_u64();
+        for row in 0..pages {
+            let ends = [
+                read(copied + row * PAGE),
+                read(copied + row * PAGE + PAGE - 1),
+            ];
+            assert_eq!(ends, [laid(row), laid(row) ^ 0xff], "row {row}'s texels");
+        }
+        // A blit into the texture reaches the pages.
+        let source = shared();
+        let at = source.contents().as_ptr::<u8>().addr().to_u64();
+        for row in 0..pages {
+            write(at + row * PAGE, laid(row) ^ 0x5a);
+            write(at + row * PAGE + PAGE - 1, laid(row) ^ 0xa5);
+        }
+        run(&|cb| {
+            let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+            let copy = BlitCmd::CopyBufferToTexture {
+                source_buffer: &source,
+                source_offset: 0,
+                source_bytes_per_row: PAGE,
+                source_bytes_per_image: bytes,
+                source_size: whole,
+                destination_texture: &texture,
+                destination_slice: 0,
+                destination_level: 0,
+                destination_origin: MtlOrigin::new(0, 0, 0),
+            };
+            e.encode(OnFault::Die, copy).unwrap();
+            e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+        });
+        for row in 0..pages {
+            let ends = [
+                read(first + row * PAGE),
+                read(first + row * PAGE + PAGE - 1),
+            ];
+            assert_eq!(
+                ends,
+                [laid(row) ^ 0x5a, laid(row) ^ 0xa5],
+                "row {row} in the pages"
+            );
+        }
+        drop(texture);
+        released(buffer, &gone, first, first + pages * PAGE);
+        assert!(vm.deallocate(view, pages * PAGE).is_success());
+        assert!(vm.deallocate(src, pages * PAGE).is_success());
     }
 
     /// Where views are imported through their dma-bufs and udmabuf opens (RADV's), no-copy
