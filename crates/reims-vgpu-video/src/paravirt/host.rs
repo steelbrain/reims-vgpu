@@ -316,8 +316,8 @@ impl Host {
 impl Host {
     /// Opens an encoder session of the codec type `codec` for `uuid`, replacing one it had:
     /// noErr, or kVTCouldNotFindVideoEncoderErr where the host has no encoder of it, or `asked`
-    /// names neither this host's encoder of it nor Apple's hardware encoder of it, which the
-    /// guest's own paravirtual encoders name.
+    /// names another than the ID its encoder of it is listed by, Apple's hardware encoder's
+    /// ([`lists::apple_encoder_id`]).
     fn create_encoder(
         &self,
         uuid: GuestUuid,
@@ -329,11 +329,7 @@ impl Host {
         let codec = Codec::from_fourcc(FourCc(u32::from_be_bytes(codec.to_be_bytes())));
         let encoder = codec.and_then(|codec| self.encoders().iter().find(|e| e.codec == codec));
         let named = |encoder: &Encoder| {
-            asked.is_none_or(|asked| {
-                let id = asked.as_str();
-                id == Some(lists::encoder_id(encoder.codec))
-                    || id == Some(lists::apple_encoder_id(encoder.codec))
-            })
+            asked.is_none_or(|asked| asked.as_str() == Some(lists::apple_encoder_id(encoder.codec)))
         };
         let (Some(encoder), Some((backend, runtime))) =
             (encoder.filter(|e| named(e)), &self.encoder_backend)

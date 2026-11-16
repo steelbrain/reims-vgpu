@@ -19,7 +19,8 @@ const RECORD: [u8; 7] = [1, 0x64, 0, 0x0b, 0xff, 0xe0, 0];
 /// An IDR slice's first bytes, behind its 4-byte length.
 const SLICE: [u8; 6] = [0, 0, 0, 2, 0x65, 0x88];
 
-const OURS: &str = "reims-vgpu-video.videoencoder.avc";
+/// The ID this host's AVC encoder is listed by: Apple's hardware encoder's.
+const LISTED: &str = "com.apple.videotoolbox.videoencoder.ave.avc";
 
 struct FakeLink(Mutex<mpsc::Sender<Vec<u8>>>);
 
@@ -182,7 +183,7 @@ impl Guest {
             uuid: GuestUuid([0x5e; 16]),
             calls,
         };
-        assert_eq!(guest.create(Some(OURS)), 0, "the create is taken");
+        assert_eq!(guest.create(Some(LISTED)), 0, "the create is taken");
         guest
     }
 
@@ -635,15 +636,13 @@ fn a_set_reaches_the_running_encoder_and_a_refused_one_is_undone() {
 }
 
 #[test]
-fn a_create_takes_this_hosts_encoder_apples_or_none_and_refuses_another() {
+fn a_create_takes_the_listed_id_or_none_and_refuses_another() {
     let guest = Guest::new(Mode::AtOnce(0), Ok(()));
-    assert_eq!(
-        guest.create(Some("com.apple.videotoolbox.videoencoder.ave.avc")),
-        0
-    );
+    assert_eq!(guest.create(Some(LISTED)), 0);
     assert_eq!(guest.create(None), 0);
     for other in [
         "com.apple.videotoolbox.videoencoder.ave.hevc",
+        "reims-vgpu-video.videoencoder.avc",
         "another.encoder",
     ] {
         assert_eq!(
@@ -673,7 +672,7 @@ fn the_encoder_list_names_each_encoder_and_none_without_a_backend() {
                 "CMClassImplementationName",
                 Value::string("reims-vgpu-video Encoder - AVC")
             ),
-            ("CMClassImplementationID", Value::string(OURS)),
+            ("CMClassImplementationID", Value::string(LISTED)),
         ])])
     );
     assert!(Host::new(Vec::new()).encoders().is_empty());

@@ -4,9 +4,9 @@
 //! The lists say what the guest may ask for. The decoder list holds one decoder for each codec the
 //! host's video arm decodes, with the profiles and the level the arm answers: the guest's
 //! VideoToolbox registers each as `paravirtualized:<ID>`, hardware-accelerated. The encoder list
-//! holds one encoder for each codec the host's video arm encodes, and none where it has no
-//! encoder backend; the motion-estimation list holds none, as Apple's host answers where it has
-//! none.
+//! holds one encoder for each codec the host's video arm encodes, by the ID of Apple's hardware
+//! encoder of the codec ([`apple_encoder_id`]), and none where it has no encoder backend; the
+//! motion-estimation list holds none, as Apple's host answers where it has none.
 
 use crate::paravirt::message::{Message, MessageFlags, MessageWriter};
 use crate::paravirt::names;
@@ -161,18 +161,14 @@ pub(crate) fn decoder_capabilities(
     Ok(reply.finish())
 }
 
-/// The `CMClassImplementationID` of this host's encoder for `codec`, which the guest registers
-/// as `paravirtualized:<ID>` and sends back as `,cid` when it opens one. The IDs and names are
-/// ours.
-pub(crate) fn encoder_id(codec: Codec) -> &'static str {
-    match codec {
-        Codec::H264 => "reims-vgpu-video.videoencoder.avc",
-        Codec::Hevc => "reims-vgpu-video.videoencoder.hevc",
-    }
-}
-
-/// The `CMClassImplementationID` of Apple's hardware encoder for `codec`, which the guest's own
-/// two paravirtual encoders send as `,cid`.
+/// The `CMClassImplementationID` of Apple's hardware encoder for `codec`, which this host's
+/// encoder of it is listed by. The guest registers the entry as `paravirtualized:<ID>`; its own
+/// two paravirtual encoders, the hardware encoders its apps get
+/// (`VTVPParavirtualizedH264VideoEncoder` and its HEVC twin), open the one of this ID, sending
+/// it as `,cid`, and fail (`kVTInvalidSessionErr`) where the host lists none (read from code,
+/// VideoToolbox of macOS 27, 2026-11-16; seen on a macOS 26.6.2 guest: a session that requires
+/// a hardware encoder fails so, and one that allows one is given a software encoder, while the
+/// list names this host's encoders by IDs of its own).
 pub(crate) fn apple_encoder_id(codec: Codec) -> &'static str {
     match codec {
         Codec::H264 => "com.apple.videotoolbox.videoencoder.ave.avc",
@@ -189,7 +185,7 @@ fn encoder_name(codec: Codec) -> &'static str {
 
 /// One entry of the encoder list, in the keys Apple's hardware encoders' entries have (measured
 /// on macOS 27, 2026-10-24): the codec type as a number, the codec's name, the encoder's name
-/// and ID, and the rating.
+/// (ours) and ID (Apple's, [`apple_encoder_id`]), and the rating.
 fn encoder_entry(encoder: &Encoder) -> Value {
     let codec = encoder.codec;
     Value::dictionary([
@@ -206,7 +202,10 @@ fn encoder_entry(encoder: &Encoder) -> Value {
             "CMClassImplementationName",
             Value::string(encoder_name(codec)),
         ),
-        ("CMClassImplementationID", Value::string(encoder_id(codec))),
+        (
+            "CMClassImplementationID",
+            Value::string(apple_encoder_id(codec)),
+        ),
     ])
 }
 
