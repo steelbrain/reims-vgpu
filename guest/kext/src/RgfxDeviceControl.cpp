@@ -4,6 +4,8 @@
  */
 
 #include "RgfxDeviceControl.hpp"
+#include "ReimsGraphics.hpp"
+#include "RgfxAgdcDisplays.hpp"
 #include "RgfxGammaCapability.hpp"
 
 #include <IOKit/IOLib.h>
@@ -37,10 +39,6 @@ constexpr UInt16 kDescriptionDevice = 0x5247;
 // to IOPresentment.
 constexpr UInt32 kDescriptionKind = 2;
 
-// The one display the device drives, and its framebuffer's index, by which
-// the display's attributes name it.
-constexpr UInt32 kDisplayCount = 1;
-constexpr UInt32 kDisplayIndex = 0;
 
 constexpr SInt32 kLoggedCalls = 256;
 
@@ -52,18 +50,6 @@ struct Description {
 	UInt32 field_28;     // kDescriptionKind
 };
 static_assert(sizeof(Description) == 0x2c, "attribute 1 is 0x2c bytes");
-
-// Attribute 0x980, IOPresentment's "AGDC GPU capabilities": without it, it
-// builds no pipe. Four masks of the display ports (bit 1 + i for display i),
-// the display count five times, the control's provider, and each display's
-// framebuffer.
-struct __attribute__((packed)) Displays {
-	UInt64 field_00[4];
-	UInt32 field_20[5];
-	UInt64 field_34;
-	UInt64 field_3c[20];
-};
-static_assert(sizeof(Displays) == 0xdc, "attribute 0x980 is 0xdc bytes");
 
 // Attribute 0x921, 0xb0 bytes, which IOPresentment reads once it has a pipe.
 // What its words mean is not known; these are the values a display device
@@ -205,7 +191,7 @@ IOReturn RgfxDeviceControl::vendor_doDeviceAttribute(UInt32 attribute, uintptr_t
 	return r;
 }
 
-IOFramebuffer *RgfxDeviceControl::copyFramebuffer() const
+ReimsGraphics *RgfxDeviceControl::copyDevice() const
 {
 	IOService *provider = getProvider();
 	if (!provider)
@@ -213,16 +199,39 @@ IOFramebuffer *RgfxDeviceControl::copyFramebuffer() const
 	OSIterator *children = provider->getChildIterator(gIOServicePlane);
 	if (!children)
 		return nullptr;
-	IOFramebuffer *found = nullptr;
+	// Display 0's, which owns the device: the other displays' framebuffers
+	// (heads) are the PCI device's children too.
+	ReimsGraphics *found = nullptr;
 	while (OSObject *child = children->getNextObject()) {
-		found = OSDynamicCast(IOFramebuffer, child);
-		if (found) {
+		found = OSDynamicCast(ReimsGraphics, child);
+		if (found && !found->isHead()) {
 			found->retain();
 			break;
 		}
+		found = nullptr;
 	}
 	children->release();
 	return found;
+}
+
+IOFramebuffer *RgfxDeviceControl::copyFramebuffer(UInt32 display) const
+{
+	ReimsGraphics *device = copyDevice();
+	if (!device)
+		return nullptr;
+	ReimsGraphics *fb = device->copyDisplay(display);
+	device->release();
+	return fb;
+}
+
+UInt32 RgfxDeviceControl::displays() const
+{
+	ReimsGraphics *device = copyDevice();
+	if (!device)
+		return 1;
+	const UInt32 n = device->drivenDisplays();
+	device->release();
+	return n ? n : 1;
 }
 
 // `output` is null for a call without one, else `outputSize` bytes.
@@ -267,20 +276,20 @@ IOReturn RgfxDeviceControl::answer(UInt32 attribute, const void *input, size_t i
 		return kIOReturnSuccess;
 	}
 	case kAttributeDisplays: {
-		if (!output || outputSize != sizeof(Displays))
+		// Every display the framebuffers drive (RgfxAgdcDisplays.hpp).
+		if (!output || outputSize != sizeof(RgfxAgdcDisplays))
 			return kIOReturnUnsupported;
-		Displays d = {};
-		UInt64 ports = ((1ULL << kDisplayCount) - 1) << 1;
-		for (auto &mask : d.field_00)
-			mask = ports;
-		for (auto &count : d.field_20)
-			count = kDisplayCount;
-		d.field_34 = reinterpret_cast<uintptr_t>(getProvider());
-		// The pointer names the framebuffer; the reference is not kept.
-		if (IOFramebuffer *fb = copyFramebuffer()) {
-			d.field_3c[kDisplayIndex] = reinterpret_cast<uintptr_t>(fb);
-			fb->release();
+		const UInt32 count = displays();
+		uint64_t fbs[kRgfxAgdcDisplaysMax] = {};
+		// Each pointer names a framebuffer; the reference is not kept.
+		for (UInt32 i = 0; i < count && i < kRgfxAgdcDisplaysMax; i++) {
+			if (IOFramebuffer *fb = copyFramebuffer(i)) {
+				fbs[i] = reinterpret_cast<uintptr_t>(fb);
+				fb->release();
+			}
 		}
+		const RgfxAgdcDisplays d =
+		    rgfxAgdcDisplays(count, reinterpret_cast<uintptr_t>(getProvider()), fbs);
 		memcpy(output, &d, sizeof d);
 		return kIOReturnSuccess;
 	}
@@ -295,7 +304,7 @@ IOReturn RgfxDeviceControl::answer(UInt32 attribute, const void *input, size_t i
 	}
 }
 
-// Success for a request naming the display, whatever the output: an output of
+// Success for a request naming a display, whatever the output: an output of
 // at least 12 bytes gets the connection in its third word, and nothing else.
 IOReturn RgfxDeviceControl::answerConnection(const void *input, size_t inputSize, void *output,
                                              size_t outputSize)
@@ -304,12 +313,13 @@ IOReturn RgfxDeviceControl::answerConnection(const void *input, size_t inputSize
 	if (inputSize != sizeof request)
 		return kIOReturnError;
 	memcpy(&request, input, sizeof request);
-	if (request.field_00 != kDisplayIndex + 1)
+	const int display = rgfxAgdcDisplay(request.field_00, kRgfxAgdcNamedFromOne, displays());
+	if (display < 0)
 		return kIOReturnError;
 	if (!output || outputSize < sizeof(Connection))
 		return kIOReturnSuccess;
 	uintptr_t connected = 0;
-	if (IOFramebuffer *fb = copyFramebuffer()) {
+	if (IOFramebuffer *fb = copyFramebuffer(static_cast<UInt32>(display))) {
 		if (fb->getAttributeForConnection(0, kConnectionCheckEnable, &connected) != kIOReturnSuccess)
 			connected = 0;
 		fb->release();
@@ -319,8 +329,8 @@ IOReturn RgfxDeviceControl::answerConnection(const void *input, size_t inputSize
 	return kIOReturnSuccess;
 }
 
-// An unknown request is unsupported; a known one for another display, or
-// without the whole output, is an error. The answer's first two words stay as
+// An unknown request is unsupported; a known one for a display past the
+// device's, or without the whole output, is an error. The answer's first two words stay as
 // the caller left them; the rest is the answer.
 IOReturn RgfxDeviceControl::answerQuery(const void *input, size_t inputSize, void *output,
                                         size_t outputSize)
@@ -330,16 +340,17 @@ IOReturn RgfxDeviceControl::answerQuery(const void *input, size_t inputSize, voi
 	if (inputSize != sizeof(Query))
 		return kIOReturnError;
 	memcpy(head, input, sizeof head);
-	UInt32 display = head[0], request = head[1];
+	UInt32 request = head[1];
 	if (!request || (request & (request - 1)) || !(request & kQueryRequests))
 		return kIOReturnUnsupported;
-	if (display != kDisplayIndex || !reply || outputSize != sizeof(Query))
+	const int display = rgfxAgdcDisplay(head[0], kRgfxAgdcNamedFromZero, displays());
+	if (display < 0 || !reply || outputSize != sizeof(Query))
 		return kIOReturnError;
 
 	// The mode's size first: the answer's bytes may be the request's.
 	QueryModeSize size = {};
 	if (request == kQueryMode) {
-		IOFramebuffer *fb = copyFramebuffer();
+		IOFramebuffer *fb = copyFramebuffer(static_cast<UInt32>(display));
 		if (!fb)
 			return kIOReturnError;
 		IODisplayModeID mode = 0;
@@ -392,8 +403,8 @@ IOReturn RgfxDeviceControl::answerQuery(const void *input, size_t inputSize, voi
 	return kIOReturnSuccess;
 }
 
-// The block, from the framebuffer's getDDCBlock (whose blocks count from 1),
-// for a request naming the display and an output of at least 0x90 bytes.
+// The block, from the display's framebuffer's getDDCBlock (whose blocks count
+// from 1), for a request naming a display and an output of at least 0x90 bytes.
 IOReturn RgfxDeviceControl::answerEdid(const void *input, size_t inputSize, void *output,
                                        size_t outputSize)
 {
@@ -401,9 +412,10 @@ IOReturn RgfxDeviceControl::answerEdid(const void *input, size_t inputSize, void
 	if (inputSize != sizeof(Edid))
 		return kIOReturnError;
 	memcpy(head, input, sizeof head);
-	if (head[0] != kDisplayIndex + 1 || !output || outputSize < sizeof(Edid) || head[2] >= 0xff)
+	const int display = rgfxAgdcDisplay(head[0], kRgfxAgdcNamedFromOne, displays());
+	if (display < 0 || !output || outputSize < sizeof(Edid) || head[2] >= 0xff)
 		return kIOReturnError;
-	IOFramebuffer *fb = copyFramebuffer();
+	IOFramebuffer *fb = copyFramebuffer(static_cast<UInt32>(display));
 	if (!fb)
 		return kIOReturnError;
 	UInt8 block[sizeof(Edid::field_0c)];

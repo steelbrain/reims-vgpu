@@ -25,13 +25,18 @@
  *   RgfxAccelerator match the device on their own.
  * - 0x980, the displays, 0xdc bytes: AGDC's start and IOPresentment read it,
  *   and IOPresentment builds no pipe without it ("Unable to get AGDC GPU
- *   capabilities").
+ *   capabilities"). It lists every display the framebuffers drive, each by
+ *   its framebuffer: IOPresentment builds a pipe only for a framebuffer listed
+ *   there, and CoreDisplay shows nothing on one without a pipe ("Unable to
+ *   find display pipe for IOFB service"; RgfxAgdcDisplays.hpp).
  * - 0x921, 0xb0 bytes, which IOPresentment reads once it has a pipe.
  *
- * The display's attributes, answered from the framebuffer's state through
- * IOFramebuffer's own interface, so they follow what ReimsGraphics tells
- * IOFramebuffer. IOPresentment asks them once it has the pipe, naming the
- * display by its index (0, the one framebuffer) or that index plus 1:
+ * The displays' attributes, each answered from its display's framebuffer's
+ * state through IOFramebuffer's own interface, so they follow what
+ * ReimsGraphics tells IOFramebuffer. IOPresentment asks them once it has a
+ * pipe, naming the display by its index (0 for display 0, the device's
+ * framebuffer, 1 to 3 for the heads) or that index plus 1; one past the
+ * displays driven is an error:
  * - 0x925, 12 bytes each way: whether the display is connected.
  * - 0x711, 0x196c bytes each way: one query about the display's
  *   capabilities, by a request bit. Request 2 answers its gamma: plane 0
@@ -54,6 +59,7 @@
 #include "AppleGraphicsDeviceControl.hpp"
 
 class IOFramebuffer;
+class ReimsGraphics;
 
 class RgfxDeviceControl : public AppleGraphicsDeviceControl {
 	OSDeclareDefaultStructors(RgfxDeviceControl);
@@ -67,8 +73,15 @@ public:
 	using AppleGraphicsDeviceControl::vendor_doDeviceAttribute;
 
 private:
-	// The provider's framebuffer, retained, or null before it attaches.
-	IOFramebuffer *copyFramebuffer() const;
+	// Display 0's framebuffer, the device's, retained, or null before it
+	// attaches.
+	ReimsGraphics *copyDevice() const;
+	// Display `display`'s framebuffer, retained, or null where none drives it.
+	IOFramebuffer *copyFramebuffer(UInt32 display) const;
+	// The displays the framebuffers drive (ReimsGraphics::drivenDisplays): 1
+	// before display 0's framebuffer has read the device's displays, as without
+	// MULTI_DISPLAY.
+	UInt32 displays() const;
 	IOReturn answer(UInt32 attribute, const void *input, size_t inputSize, void *output,
 	                size_t outputSize);
 	IOReturn answerConnection(const void *input, size_t inputSize, void *output,
