@@ -131,11 +131,12 @@ kernel functions this way.
 
 Kernel text and a MAC policy's table are read-only when Graft starts, so
 Graft routes by shadowing the policy. A route names a MAC policy operation,
-one of `file_check_mmap`, `file_check_library_validation` and
-`vnode_check_signature`. The replacement and original have the operation's
-`mpo_*_t` prototype from XNU's `security/mac_policy.h`, and the original is
-the policy's handler for the operation. The operation is AMFI's by default.
-The macOS SDK does not ship that header, so declare the prototype yourself:
+one of `file_check_mmap`, `file_check_library_validation`,
+`vnode_check_signature` and `policy_syscall`. The replacement and original have
+the operation's `mpo_*_t` prototype from XNU's `security/mac_policy.h`, and the
+original is the policy's handler for the operation. The operation is AMFI's by
+default. The macOS SDK does not ship that header, so declare the prototype
+yourself:
 
 ```cpp
 #include <sys/kauth.h>
@@ -191,15 +192,24 @@ A client that routes the same operation on two policies, as here, holds a
 separate original for each. Every route in one `graft_route_kernel` call names
 one policy; route a second policy in a second call.
 
+`policy_syscall` is the policy's `mac_syscall(2)` entry, not an admission hook:
+its `mpo_policy_syscall_t` prototype is `int(struct proc *p, int call,
+user_addr_t arg)`, and `arg` is a user-space address, not a kernel object. A
+client that routes it reads the argument and writes the answer with
+`copyin`/`copyout` against the calling task, decides only the calls it owns, and
+passes every other `call` on to the original. A route that only inspects kernel
+objects, such as `file_check_mmap` above, needs none of this.
+
 [tests/kexts/route-probe](../../tests/kexts/README.md#route-probe) routes all
-three AMFI operations, and the Sandbox policy's `file_check_mmap`.
+three AMFI operations, and the Sandbox policy's `file_check_mmap` and
+`policy_syscall`.
 
 ## Limits
 
 - One call installs at most sixteen routes, all of them or none, and names one
   policy. On x86-64 Graft has room for 32 routes per boot, shared first come
   first served: two of its own, and up to 30 more across every client. On arm64e
-  each client routes at most one of each of the three operations per policy, and
+  each client routes at most one of each of the four operations per policy, and
   several clients route one after another; an operation on a policy that one
   client holds is refused to the next.
 - On x86-64, routes must be installed before BSD starts, so install them from

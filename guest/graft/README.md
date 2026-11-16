@@ -42,11 +42,22 @@ own.
 
 ## Status
 
-This is release 0.3.1. It passes the host tests and the build checks
-([CONTRIBUTING.md](CONTRIBUTING.md#checks)). On x86-64 it binds a consumer whose
-call cannot reach its import with the call's 32-bit displacement, by writing the
-call to a branch island ([docs/design.md](docs/design.md#branch-islands)). A
-call in reach is written as before, and arm64e is unchanged.
+This is release 0.4.0. It passes the host tests and the build checks
+([CONTRIBUTING.md](CONTRIBUTING.md#checks)). On arm64e a client can now route a
+MAC policy's `policy_syscall`, the policy's `mac_syscall(2)` entry, beside the
+three admission operations it could already route; a client can answer or
+observe the queries a policy serves through that syscall and pass every other
+call to the policy. The SDK's `IOMobileFramebufferLegacy` stand-in also declares
+`set_block`, so a synthesized arm64 display can override the framebuffer call
+that carries a display's ICC curves and colour matrices — the colour profile,
+Night Shift and True Tone — which the live class otherwise refuses. The arm64e
+kext gains the one operation; the x86-64 kext is byte for byte release 0.3.1's
+but for the version it carries.
+
+Release 0.3.1 binds, on x86-64, a consumer whose call cannot reach its import
+with the call's 32-bit displacement, by writing the call to a branch island
+([docs/design.md](docs/design.md#branch-islands)). A call in reach is written as
+before, and arm64e is unchanged.
 
 reims-vgpu, a paravirtual GPU for macOS virtual machines, verified the branch
 islands in its guests, with SIP on and no boot-arg. In Apple's macOS 15.4 and
@@ -67,7 +78,8 @@ profile otherwise refuses to map executable then loaded, so Safari's WebGL ran
 where it had been dead, and a control mapping the profile denies stayed denied.
 
 Release 0.2.0's kexts, which later releases leave unchanged but for 0.3.0's route
-layer, 0.3.1's branch islands and the version they carry, passed the boots
+layer, 0.3.1's branch islands, 0.4.0's arm64e `policy_syscall` operation and the
+version they carry, passed the boots
 below, with SIP on (`csr-active-config`
 0) and no boot-arg for Graft or the kexts it serves. Several used the guest
 kexts of reims-vgpu: its display and Metal driver is a bound consumer, and the

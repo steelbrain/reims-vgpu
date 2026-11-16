@@ -167,9 +167,13 @@ the core probe ([tests/kexts/](../tests/kexts/README.md)).
 read-only by the time Graft starts. Graft routes by shadowing the policy
 instead of patching code. Each route names a MAC policy operation, such as
 `vnode_check_signature`, and the replacement and original have that
-operation's `mpo_*_t` prototype from XNU's `security/mac_policy.h`. Three
-operations are routable: `file_check_mmap`, `file_check_library_validation`
-and `vnode_check_signature`. The operation is AMFI's by default; to route
+operation's `mpo_*_t` prototype from XNU's `security/mac_policy.h`. Four
+operations are routable: the admission hooks `file_check_mmap`,
+`file_check_library_validation` and `vnode_check_signature`, and
+`policy_syscall`, the policy's `mac_syscall(2)` entry. The first three are
+called with kernel objects; `policy_syscall`'s argument is a user-space
+address, so a client that routes it copies the argument in and the answer out
+from the calling task itself. The operation is AMFI's by default; to route
 another policy's operation, the symbol carries a `<policy>:` prefix, as in
 `Sandbox:file_check_mmap`. Every route in one call names the same policy,
 since the install swaps that policy's one list element. To install the

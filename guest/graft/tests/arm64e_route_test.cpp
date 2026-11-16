@@ -48,25 +48,30 @@ void stage(uint8_t *ops, const uint64_t *originals) {
 }
 
 void shadowBuilt() {
-    uint64_t originals[arm64::OperationCount] = {TextLo + 0x1000, TextLo + 0x2000, TextLo + 0x3000};
+    uint64_t originals[arm64::OperationCount] = {TextLo + 0x1000, TextLo + 0x2000, TextLo + 0x3000,
+                                                 TextLo + 0x4000};
     uint8_t ops[arm64::OpsSize];
     stage(ops, originals);
 
-    // Route all three, in an order different from the table's, to a set of
-    // replacement targets (raw addresses, as a client's stripped pointers).
+    // Route every routable operation, in an order different from the table's, to a
+    // set of replacement targets (raw addresses, as a client's stripped pointers).
     const char *names[] = {"vnode_check_signature", "file_check_mmap",
-                           "file_check_library_validation"};
-    uint64_t targets[] = {0xFFFFFE0008000000ULL, 0xFFFFFE0008001000ULL, 0xFFFFFE0008002000ULL};
-    arm64::Slot slots[3]{};
+                           "file_check_library_validation", "policy_syscall"};
+    uint64_t targets[] = {0xFFFFFE0008000000ULL, 0xFFFFFE0008001000ULL, 0xFFFFFE0008002000ULL,
+                          0xFFFFFE0008003000ULL};
+    static_assert(sizeof(names) / sizeof(names[0]) == arm64::OperationCount,
+                  "route every operation");
+    arm64::Slot slots[arm64::OperationCount]{};
 
     // A sentinel slot that no operation names, to confirm it is left untouched.
     uint64_t before8;
     memcpy(&before8, ops + 0x8, sizeof(before8));
 
-    auto f = arm64::buildShadowOps(ops, sizeof(ops), names, targets, 3, TextLo, TextHi, slots);
+    auto f = arm64::buildShadowOps(ops, sizeof(ops), names, targets, arm64::OperationCount, TextLo,
+                                   TextHi, slots);
     CHECK(f.error == Error::None);
 
-    for (size_t i = 0; i < 3; ++i) {
+    for (size_t i = 0; i < arm64::OperationCount; ++i) {
         const arm64::Operation *op = arm64::operationFor(names[i]);
         CHECK(op != nullptr);
         CHECK(slots[i].offset == op->offset);
@@ -86,7 +91,7 @@ void shadowBuilt() {
         // The discriminator is actually used: signing the same target under a
         // different operation's discriminator yields a different slot value. (We
         // never authenticate with a wrong discriminator -- that traps under FPAC.)
-        uint64_t other = arm64::Operations[(i + 1) % 3].discriminator;
+        uint64_t other = arm64::Operations[(i + 1) % arm64::OperationCount].discriminator;
         CHECK(value != refSignIA(targets[i], other));
     }
 
@@ -97,7 +102,8 @@ void shadowBuilt() {
 }
 
 void guards() {
-    uint64_t originals[arm64::OperationCount] = {TextLo + 0x1000, TextLo + 0x2000, TextLo + 0x3000};
+    uint64_t originals[arm64::OperationCount] = {TextLo + 0x1000, TextLo + 0x2000, TextLo + 0x3000,
+                                                 TextLo + 0x4000};
     uint8_t ops[arm64::OpsSize];
     arm64::Slot slots[3]{};
     uint64_t targets[] = {0xFFFFFE0008000000ULL, 0xFFFFFE0008001000ULL, 0xFFFFFE0008002000ULL};
@@ -113,7 +119,7 @@ void guards() {
     // offset is wrong or the table was mis-read, so refuse rather than mis-swap.
     {
         uint64_t strayed[arm64::OperationCount] = {TextLo + 0x1000, TextHi + 0x4000,
-                                                   TextLo + 0x3000};
+                                                   TextLo + 0x3000, TextLo + 0x5000};
         stage(ops, strayed);
         const char *names[] = {"file_check_mmap", "file_check_library_validation"};
         auto f = arm64::buildShadowOps(ops, sizeof(ops), names, targets, 2, TextLo, TextHi, slots);
@@ -165,7 +171,8 @@ void chainedShadows() {
     // The live chaining -- the swap from the current conf, the routed-operation
     // bookkeeping -- is in src/arm64e/Route.cpp and proven by booting the route
     // probe; here the ops-carrying property and the re-route guard are checked.
-    uint64_t originals[arm64::OperationCount] = {TextLo + 0x1000, TextLo + 0x2000, TextLo + 0x3000};
+    uint64_t originals[arm64::OperationCount] = {TextLo + 0x1000, TextLo + 0x2000, TextLo + 0x3000,
+                                                 TextLo + 0x4000};
     uint8_t ops[arm64::OpsSize];
     stage(ops, originals);
 
@@ -381,9 +388,11 @@ void constants() {
     CHECK(arm64::operationFor("file_check_mmap")->discriminator == 0x438d);
     CHECK(arm64::operationFor("file_check_library_validation")->discriminator == 0x9e37);
     CHECK(arm64::operationFor("vnode_check_signature")->discriminator == 0xcbd2);
+    CHECK(arm64::operationFor("policy_syscall")->discriminator == 0xfee3);
     CHECK(arm64::operationFor("file_check_mmap")->offset == 0x120);
     CHECK(arm64::operationFor("file_check_library_validation")->offset == 0x200);
     CHECK(arm64::operationFor("vnode_check_signature")->offset == 0x980);
+    CHECK(arm64::operationFor("policy_syscall")->offset == 0x3a8);
     CHECK(arm64::OpsSize == 0xa78);
     CHECK(arm64::ConfSize == 0x50);
     CHECK(arm64::ConfNameOffset == 0x0);

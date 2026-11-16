@@ -29,6 +29,13 @@
 // not all name one policy. The separator never appears in an x86-64 kernel symbol,
 // so x86-64 is unaffected.
 //
+// Most arm64e operations are admission hooks the MAC framework calls with kernel
+// objects. "policy_syscall" is the exception: it is the policy's mac_syscall(2)
+// entry (mpo_policy_syscall_t, int(struct proc *, int call, user_addr_t arg)),
+// and `arg` is a user-space address. A replacement for it copies the argument in
+// and the answer out against the calling task, and passes every call it does not
+// handle to the original.
+//
 // Graft writes the original as a void *. Keep it in a void * and convert it to
 // the prototype where you call it, on both architectures. Do not point
 // `original` at a typed function-pointer variable: an arm64e kext built with

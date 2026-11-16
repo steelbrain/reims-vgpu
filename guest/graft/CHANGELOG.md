@@ -5,6 +5,39 @@ Each release of Graft, newest first. A version is the kext's
 that lists `ai.aneesiqbal.graft` 0.1.0 in its `OSBundleLibraries` loads with
 each later release that keeps it.
 
+## 0.4.0
+
+**Upgrading**
+
+- No consumer or client needs a rebuild, and no existing route or override
+  changes. Graft still declares `OSBundleCompatibleVersion` 0.1.0, and `Graft.h`
+  and the manifest format are unchanged. To route `policy_syscall`, a client
+  names it in a route symbol, such as `Sandbox:policy_syscall`; to override
+  `set_block`, a synthesized display declares it against this release's SDK.
+- The arm64 boot firmware hands over nothing new.
+
+**The kext**
+
+- On arm64e, a client can route a MAC policy's `policy_syscall` beside the three
+  admission operations. It is the policy's `mac_syscall(2)` entry, so a client
+  can answer or observe the queries a policy serves through it, such as a
+  rootless-trust query, and pass every other call to the policy. Unlike the
+  admission hooks, whose arguments are kernel objects, its argument is a
+  user-space address, so a replacement copies the argument in and the answer out
+  from the calling task. Graft routes it by the same ABI rule as the other
+  operations, deriving its slot and discriminator from `mpo_policy_syscall_t` in
+  the public `security/mac_policy.h`. x86-64 is unchanged.
+
+**The SDK**
+
+- The `IOMobileFramebufferLegacy` stand-in declares `set_block`, so a
+  synthesized display can override it. A display's user client passes it the
+  block calls its clients make, such as the ICC curves and colour matrices
+  WindowServer sets for a colour profile, Night Shift and True Tone. The live
+  class's own `set_block` answers them unsupported. Its symbol is the same on
+  macOS 13.6 to 27.2.1, and Graft places the override on its live slot as it
+  does each other method's.
+
 ## 0.3.1
 
 **Upgrading**

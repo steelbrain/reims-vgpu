@@ -149,6 +149,9 @@ public:
                                                    uint32_t field_2);
     virtual graft_iomfb_word set_parameter(IOMFBParameterName name, const uint64_t *values,
                                            uint32_t count);
+    virtual graft_iomfb_word set_block(task *owner, uint32_t type, uint32_t offset,
+                                       const uint64_t *scalars, uint32_t count, const uint8_t *data,
+                                       size_t size);
     virtual graft_iomfb_word do_power_state_change_gated();
 
     // A non-virtual method a consumer may call. Graft resolves its symbol in the

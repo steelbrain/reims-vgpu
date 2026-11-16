@@ -5,10 +5,14 @@
 // argument types and proves two things on a real boot: that Graft resolves AMFI,
 // builds the shadow policy and repoints the list entry ("routed"), and that the
 // shadow sits in the live MAC dispatch path (every routed op is entered). It then
-// routes the Sandbox policy's own file_check_mmap the same way, naming the policy,
-// to exercise a second policy's shadow in one boot and hold its original apart
-// from AMFI's; that leg reports on its own GraftRouteProbeSandbox* keys. arm64e
-// only; the x86-64 owned-client probe is tests/kexts/core-probe/CoreProbe.cpp.
+// routes two of the Sandbox policy's own operations the same way, naming the
+// policy: file_check_mmap, an admission hook, and policy_syscall, the policy's
+// mac_syscall(2) entry. This exercises a second policy's shadow in one boot,
+// holds its originals apart from AMFI's, and covers policy_syscall, whose live
+// slot and discriminator differ from the admission hooks'. The wrappers only
+// count and tail-branch the original, so the probe never touches policy_syscall's
+// user-space argument. That leg reports on its own GraftRouteProbeSandbox* keys.
+// arm64e only; the x86-64 owned-client probe is tests/kexts/core-probe/CoreProbe.cpp.
 #include <IOKit/IOLib.h>
 #include <IOKit/IORegistryEntry.h>
 #include <IOKit/IOService.h>
@@ -22,8 +26,8 @@ class GraftRouteProbe final : public IOService {
 OSDefineMetaClassAndStructors(GraftRouteProbe, IOService);
 
 extern "C" {
-void *graft_route_probe_originals[4]{};
-alignas(8) uint64_t graft_route_probe_calls[4]{};
+void *graft_route_probe_originals[5]{};
+alignas(8) uint64_t graft_route_probe_calls[5]{};
 }
 
 // Each wrapper increments its call counter, then tail-branches to the original
@@ -52,6 +56,7 @@ ROUTE_WRAPPER(0) // file_check_mmap (AMFI)
 ROUTE_WRAPPER(1) // file_check_library_validation (AMFI)
 ROUTE_WRAPPER(2) // vnode_check_signature (AMFI)
 ROUTE_WRAPPER(3) // file_check_mmap (Sandbox)
+ROUTE_WRAPPER(4) // policy_syscall (Sandbox)
 #undef ROUTE_WRAPPER
 
 namespace {
@@ -70,8 +75,12 @@ void state(const char *value) {
 
 // The Sandbox leg's own state, kept apart from the AMFI legs so its outcome does
 // not gate theirs. Set true when the Sandbox route installs, so lateCheck knows
-// to look for its call.
+// to look for its calls. The Sandbox operations, routed together in one call,
+// with originals and wrappers at indices 3 and 4.
 bool sandboxRouted;
+const char *const sandboxOperations[] = {"Sandbox:file_check_mmap", "Sandbox:policy_syscall"};
+constexpr unsigned SandboxBase = 3;
+constexpr unsigned SandboxCount = 2;
 
 void sandboxState(const char *value) {
     IOLog("graft route probe (Sandbox): %s\n", value);
@@ -98,12 +107,21 @@ void lateCheck(void *, wait_result_t) {
     }
     state(observed ? "passed" : "refused: a routed op was never entered");
     // The Sandbox leg, if it installed: file_check_mmap fires as soon as code is
-    // mapped, so its counter is non-zero on a live boot. Reported on its own key.
+    // mapped, and policy_syscall on every sandbox mac_syscall, so both counters
+    // are non-zero on a live boot. Each is reported on its own key, and the leg
+    // passes only when every Sandbox op was entered through its shadow.
     if (sandboxRouted) {
-        uint64_t count = __atomic_load_n(graft_route_probe_calls + 3, __ATOMIC_RELAXED);
-        if (root)
-            root->setProperty("GraftRouteProbeCalls.Sandbox.file_check_mmap", count, 64);
-        sandboxState(count ? "passed" : "refused: the Sandbox route was never entered");
+        bool sandboxObserved = true;
+        for (unsigned i = 0; i < SandboxCount; ++i) {
+            uint64_t count =
+                    __atomic_load_n(graft_route_probe_calls + SandboxBase + i, __ATOMIC_RELAXED);
+            sandboxObserved = count != 0 && sandboxObserved;
+            char key[96];
+            snprintf(key, sizeof(key), "GraftRouteProbeCalls.%s", sandboxOperations[i]);
+            if (root)
+                root->setProperty(key, count, 64);
+        }
+        sandboxState(sandboxObserved ? "passed" : "refused: a Sandbox route was never entered");
     }
     thread_terminate(current_thread());
 }
@@ -123,13 +141,16 @@ void graft_client_initialize() {
         state("refused: routes");
         return;
     }
-    // Also route the Sandbox policy's own file_check_mmap, naming the policy in a
-    // second call. Its original is held apart from AMFI's, in its own slot. The
-    // leg reports on its own keys and does not gate the AMFI result.
-    graft_route_request sandbox{"Sandbox:file_check_mmap",
-                                reinterpret_cast<void *>(graft_route_probe_3),
-                                graft_route_probe_originals + 3};
-    sandboxRouted = graft_route_kernel(Client, &sandbox, 1);
+    // Also route two of the Sandbox policy's own operations, naming the policy, in
+    // a second call: file_check_mmap and policy_syscall. Their originals are held
+    // apart from AMFI's, in their own slots. The leg reports on its own keys and
+    // does not gate the AMFI result.
+    void (*sandboxWrappers[])() = {graft_route_probe_3, graft_route_probe_4};
+    graft_route_request sandbox[SandboxCount]{};
+    for (unsigned i = 0; i < SandboxCount; ++i)
+        sandbox[i] = {sandboxOperations[i], reinterpret_cast<void *>(sandboxWrappers[i]),
+                      graft_route_probe_originals + SandboxBase + i};
+    sandboxRouted = graft_route_kernel(Client, sandbox, SandboxCount);
     sandboxState(sandboxRouted ? "waiting: route-entry check" : "refused: route");
     state("waiting: route-entry check");
     thread_t thread = THREAD_NULL;

@@ -35,10 +35,12 @@ wrappers that count the call and tail-branch the authenticated original. It
 verifies that Graft resolves AMFI, builds the shadow policy and repoints the list
 entry, and that the shadow sits in the live dispatch path, so every routed
 operation is entered. A wrong original faults under pointer authentication, so
-the branch also checks the handed-back pointer. It then routes the Sandbox
-policy's own `file_check_mmap` by naming the policy (`Sandbox:file_check_mmap`),
-to exercise a second policy's shadow in one boot and hold its original apart from
-AMFI's; that leg reports under its own `GraftRouteProbeSandbox*` registry keys.
+the branch also checks the handed-back pointer. It then routes two of the Sandbox
+policy's own operations by naming the policy, `Sandbox:file_check_mmap` and
+`Sandbox:policy_syscall`, to exercise a second policy's shadow in one boot, hold
+its originals apart from AMFI's, and cover `policy_syscall`, whose live slot and
+discriminator differ from the admission hooks'; that leg reports under its own
+`GraftRouteProbeSandbox*` registry keys.
 
 It is built by the top Makefile for arm64e:
 

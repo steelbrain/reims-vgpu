@@ -224,7 +224,7 @@ arm64e route refusals, in the order Graft checks:
 | `mac_policy_register is not resolvable`, `mac_policy_list is not resolvable`, `mac_policy_list is not in the kernel's data segments`, `mac_policy_list entries pointer is invalid` | Graft could not find the kernel's list of MAC policies. The list must lie in a segment the kernel maps writable, and its entries pointer must be a canonical, 8-byte aligned kernel address |
 | `<policy> policy not found in the list`, `<policy> policy ambiguous in the list (N matches)` | Graft could not find the policy's one registered element: AMFI by its admission ops, any other by its `mpc_name` within its image |
 | `<name>: route input` | Graft could not build its copy of the current ops table |
-| `<name>: operation not routable on arm64` | the request names an operation other than `file_check_mmap`, `file_check_library_validation` or `vnode_check_signature` |
+| `<name>: operation not routable on arm64` | the request names an operation other than `file_check_mmap`, `file_check_library_validation`, `vnode_check_signature` or `policy_syscall` |
 | `<name>: staged copy too small for the structure` | the operation's slot lies past the end of Graft's copy of the policy's ops table |
 | `<name>: operation routed twice in one request` | two requests name the same operation |
 | `<name>: live ops slot does not point into the policy's text` | the slot Graft would replace in the policy's table does not hold a pointer into the policy's code, so Graft does not trust the table |

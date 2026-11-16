@@ -26,7 +26,7 @@
 namespace graft {
 namespace arm64 {
 
-// The three mac_policy_ops entries an owned client may route on arm64, named by
+// The mac_policy_ops entries an owned client may route on arm64, named by
 // operation (not by a policy's local, unstable op symbols). The arm64e ABI signs
 // each ops slot with key IA, the slot type's function-pointer discriminator and
 // no address diversity -- AMFI's table and any other policy's alike; the
@@ -37,18 +37,29 @@ namespace arm64 {
 // against the live slot's signature before routing. The prototypes are written
 // with pointer parameters standing in for the kernel struct types, since the
 // function-pointer type discriminator ignores pointee types; they are the
-// prototypes of mpo_file_check_mmap_t, mpo_file_check_library_validation_t and
-// mpo_vnode_check_signature_t in XNU's public security/mac_policy.h.
+// prototypes of mpo_file_check_mmap_t, mpo_file_check_library_validation_t,
+// mpo_vnode_check_signature_t and mpo_policy_syscall_t in XNU's public
+// security/mac_policy.h.
+//
+// The first three are admission hooks the MAC framework calls with kernel
+// objects. policy_syscall is different in kind: it is the policy's mac_syscall(2)
+// entry (reached by policy name), and its `arg` is a user-space address, not a
+// kernel object. A client that routes it copies the argument in and the answer
+// out itself, from the calling task, and chains every call it does not handle to
+// the original. Graft routes it the same way regardless, by the one ABI rule
+// above; what the call carries is the client's to interpret.
 using FileCheckMmapFn = int(void *, void *, void *, int, int, uint64_t, int *);
 using FileCheckLibraryValidationFn = int(void *, void *, long long, long long, unsigned long);
 using VnodeCheckSignatureFn = int(void *, void *, int, void *, unsigned *, unsigned *, int,
                                   unsigned, char **, unsigned long *);
+using PolicySyscallFn = int(void *, int, uint64_t);
 
 // Field indices in struct mac_policy_ops (security/mac_policy.h). Every field is
 // a pointer, so a field's byte offset in the table is its index times 8.
 inline constexpr uint32_t FileCheckMmapIndex = 36;
 inline constexpr uint32_t FileCheckLibraryValidationIndex = 64;
 inline constexpr uint32_t VnodeCheckSignatureIndex = 304;
+inline constexpr uint32_t PolicySyscallIndex = 117;
 
 struct Operation {
     const char *name;
@@ -64,6 +75,8 @@ inline constexpr Operation Operations[] = {
          __builtin_ptrauth_type_discriminator(FileCheckLibraryValidationFn)},
         {"vnode_check_signature", VnodeCheckSignatureIndex * 8, 0,
          __builtin_ptrauth_type_discriminator(VnodeCheckSignatureFn)},
+        {"policy_syscall", PolicySyscallIndex * 8, 0,
+         __builtin_ptrauth_type_discriminator(PolicySyscallFn)},
 };
 inline constexpr size_t OperationCount = sizeof(Operations) / sizeof(Operations[0]);
 
