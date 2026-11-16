@@ -101,6 +101,8 @@ pub struct Ctx {
     pub qemu: PathBuf,
     /// The audio backend for a VM that names none.
     pub audio_backend: String,
+    /// The host's sound devices ([`sound_routing`]).
+    pub sound: crate::os::SoundDevices,
     /// Whether the host's KVM offers VMX to guests ([`crate::host::kvm_nested_vmx`]).
     pub nested_vmx: bool,
     /// Whether QEMU's own window can open ([`crate::host::has_screen`]).
@@ -356,12 +358,20 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         push(&["-device", &crate::usb::device_arg(u)?]);
     }
     if c.audio.enabled {
-        push(&["-audiodev", &audiodev(vm, ctx)]);
+        let (backend, input_apart) = sound_routing(audio_backend(vm, ctx), ctx.sound);
+        push(&["-audiodev", &format!("{},id=snd0", opt(backend))]);
+        if input_apart {
+            push(&["-audiodev", "none,id=sndin"]);
+        }
         push(&[
             "-device",
             "virtio-sound-pci,id=audio,audiodev=snd0,addr=0x7,streams=1",
             "-device",
-            "virtio-sound-pci,id=audioin,audiodev=snd0,addr=0x8,streams=1,input-streams=1",
+            if input_apart {
+                "virtio-sound-pci,id=audioin,audiodev=sndin,addr=0x8,streams=1,input-streams=1"
+            } else {
+                "virtio-sound-pci,id=audioin,audiodev=snd0,addr=0x8,streams=1,input-streams=1"
+            },
         ]);
         // At ICH9's own slot for it.
         push(&["-device", "ich9-intel-hda,id=hda,addr=0x1b"]);
@@ -378,14 +388,43 @@ fn netdev(vm: &Vm) -> String {
     n
 }
 
-fn audiodev(vm: &Vm, ctx: &Ctx) -> String {
-    let backend = vm
-        .config
+/// The VM's audio backend: its own, else the host's default.
+fn audio_backend<'a>(vm: &'a Vm, ctx: &'a Ctx) -> &'a str {
+    vm.config
         .audio
         .backend
         .as_deref()
-        .unwrap_or(&ctx.audio_backend);
-    format!("{},id=snd0", opt(backend))
+        .unwrap_or(&ctx.audio_backend)
+}
+
+/// QEMU's DirectSound (`dsound`) opens Windows' output and recording devices as QEMU starts, and
+/// QEMU ends where there is no output device. Where Windows has none, the VM's sound goes to
+/// `none`; where it has no recording device, the input device alone gets an audiodev of its own,
+/// `none`, so the guest records silence. What it returns: the backend of `snd0`, and whether the
+/// input device is apart. Every other backend is as the VM names it.
+pub fn sound_routing(backend: &str, devices: crate::os::SoundDevices) -> (&str, bool) {
+    match backend {
+        "dsound" if !devices.output => ("none", false),
+        "dsound" => (backend, !devices.input),
+        _ => (backend, false),
+    }
+}
+
+/// What a start says of the VM's sound where [`sound_routing`] changes it.
+pub fn sound_note(backend: &str, devices: crate::os::SoundDevices) -> Option<String> {
+    match sound_routing(backend, devices) {
+        ("none", _) if backend != "none" => Some(
+            "this PC has no sound output device, so the VM runs without sound: connect speakers \
+             or headphones and start it again for sound"
+                .into(),
+        ),
+        (_, true) => Some(
+            "this PC has no recording device (a microphone), so the VM's microphone records \
+             silence"
+                .into(),
+        ),
+        _ => None,
+    }
 }
 
 fn common(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
@@ -532,6 +571,10 @@ mod tests {
             host,
             qemu: "/q/bin/qemu".into(),
             audio_backend: "pipewire".into(),
+            sound: crate::os::SoundDevices {
+                output: true,
+                input: true,
+            },
             nested_vmx: false,
             screen: true,
             graphics_rom: "/d/firmware/ReimsGraphics-0123456789abcdef.rom".into(),
@@ -845,6 +888,66 @@ mod tests {
             );
         }
         assert!(!inv.args.iter().any(|a| a.contains("virtio-sound")));
+    }
+
+    /// On DirectSound, which opens Windows' devices as QEMU starts: with no recording device the
+    /// input device records from an audiodev of its own, `none`, and with no output device the
+    /// VM's sound is all `none`, each said at the start; the other backends, and `none` itself,
+    /// are as the VM names them whatever the host has.
+    #[test]
+    fn dsound_goes_to_none_where_windows_has_no_sound_device() {
+        let devices = |output, input| crate::os::SoundDevices { output, input };
+        let mut vm = q35_vm();
+        vm.config.audio.backend = Some("dsound".into());
+        let args = |sound| {
+            invocation(
+                &vm,
+                &Ctx {
+                    sound,
+                    ..ctx(linux())
+                },
+            )
+            .unwrap()
+            .args
+        };
+        let a = args(devices(true, true));
+        assert!(has(&a, &["-audiodev", "dsound,id=snd0"]), "{a:?}");
+        assert!(!a.iter().any(|x| x.contains("sndin")), "{a:?}");
+        let a = args(devices(true, false));
+        assert!(has(&a, &["-audiodev", "dsound,id=snd0"]), "{a:?}");
+        assert!(has(&a, &["-audiodev", "none,id=sndin"]), "{a:?}");
+        assert!(has(
+            &a,
+            &[
+                "-device",
+                "virtio-sound-pci,id=audioin,audiodev=sndin,addr=0x8,streams=1,input-streams=1"
+            ]
+        ));
+        assert!(has(
+            &a,
+            &[
+                "-device",
+                "virtio-sound-pci,id=audio,audiodev=snd0,addr=0x7,streams=1"
+            ]
+        ));
+        let a = args(devices(false, false));
+        assert!(has(&a, &["-audiodev", "none,id=snd0"]), "{a:?}");
+        assert!(!a.iter().any(|x| x.contains("sndin")), "{a:?}");
+        assert!(sound_note("dsound", devices(true, true)).is_none());
+        assert!(
+            sound_note("dsound", devices(true, false))
+                .unwrap()
+                .contains("records silence")
+        );
+        assert!(
+            sound_note("dsound", devices(false, true))
+                .unwrap()
+                .contains("without sound")
+        );
+        for other in ["pipewire", "wav", "none"] {
+            assert_eq!(sound_routing(other, devices(false, false)), (other, false));
+            assert!(sound_note(other, devices(false, false)).is_none());
+        }
     }
 
     /// A disk moved to NVMe is on a controller of its own, off the AHCI controller.

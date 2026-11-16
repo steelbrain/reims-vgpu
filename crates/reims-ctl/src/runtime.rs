@@ -338,6 +338,17 @@ pub fn install_steps(vm: &Vm) -> Option<String> {
 /// about the library, which a VM on VMware SVGA does not run.
 pub fn warnings(vm: &Vm, host: Host) -> Vec<String> {
     let mut w = Vec::new();
+    if vm.config.audio.enabled
+        && let Ok(qemu) = crate::install::qemu_binary(vm.config.profile)
+    {
+        let backend = vm.config.audio.backend.clone().unwrap_or_else(|| {
+            crate::install::default_audio_backend(&crate::install::audio_backends(&qemu))
+        });
+        w.extend(crate::qemu::sound_note(
+            &backend,
+            crate::os::sound_devices(),
+        ));
+    }
     let graphics = vm.config.graphics();
     if !graphics.library() {
         return w;
@@ -401,6 +412,7 @@ pub fn context(vm: &Vm, host: Host) -> Result<Ctx> {
         host,
         qemu,
         audio_backend,
+        sound: crate::os::sound_devices(),
         nested_vmx: crate::host::kvm_nested_vmx(),
         screen,
         graphics_rom: graphics_rom(vm)?,
@@ -425,6 +437,7 @@ pub fn invocation_for_print(vm: &Vm, host: Host) -> Result<Invocation> {
             host,
             qemu,
             audio_backend: crate::install::default_audio_backend(&[]),
+            sound: crate::os::sound_devices(),
             nested_vmx: crate::host::kvm_nested_vmx(),
             screen: crate::host::has_screen(&vm.config.extra_env),
             graphics_rom: graphics_rom(vm).unwrap_or_else(|_| crate::prebuilt::graphics_rom_path()),

@@ -278,6 +278,15 @@ pub fn install_script(_shell: &Path, script: &Path) -> Result<Command> {
     Ok(c)
 }
 
+/// Both: the backend [`crate::qemu::sound_routing`] routes by the host's devices, DirectSound, is
+/// Windows's.
+pub fn sound_devices() -> super::SoundDevices {
+    super::SoundDevices {
+        output: true,
+        input: true,
+    }
+}
+
 /// Nothing: on Windows this keeps an MSYS2 program from expanding wildcards in the arguments
 /// reims-ctl gives it, which a Unix program never does itself.
 pub fn no_glob(_c: &mut Command) {}

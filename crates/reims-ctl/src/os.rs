@@ -13,6 +13,13 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
+/// Whether the host has a sound output device and a recording device (`sound_devices`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SoundDevices {
+    pub output: bool,
+    pub input: bool,
+}
+
 /// A way to end a process, by its pid, with what a stop says once it has ended (`ENDS`).
 pub type End = (fn(i32), &'static str);
 

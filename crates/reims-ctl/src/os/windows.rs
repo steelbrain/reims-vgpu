@@ -443,6 +443,19 @@ pub fn install_script(shell: &Path, script: &Path) -> Result<Command> {
     Ok(c)
 }
 
+/// Whether Windows has a sound output device and a recording device, as waveOut and waveIn count
+/// them. QEMU's DirectSound opens the default of each as it starts.
+pub fn sound_devices() -> super::SoundDevices {
+    use windows_sys::Win32::Media::Audio::{waveInGetNumDevs, waveOutGetNumDevs};
+    // SAFETY: neither takes an argument.
+    unsafe {
+        super::SoundDevices {
+            output: waveOutGetNumDevs() > 0,
+            input: waveInGetNumDevs() > 0,
+        }
+    }
+}
+
 /// Keeps `c`, where it is an MSYS2 program (MSYS2's git, its bash), from expanding wildcards
 /// and braces in its arguments, which MSYS2's runtime does for a program a Windows program
 /// starts, as a shell would: `@{u}` reached MSYS2's git as `@u`. `noglob` in `MSYS` turns that

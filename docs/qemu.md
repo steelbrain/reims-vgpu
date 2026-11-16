@@ -141,6 +141,7 @@ virtio device (`d151bcd9`, upstream's `b501f21312`).
 | WHPX answers CPUID leaf 4 from the CPU model: its exit list lacked the leaf, so Hyper-V answered it with no cache levels, and macOS panicked 1.3 s into boot ("Windows hosts", below) | `cc128f0e` |
 | on Windows, shared RAM (`memory-backend-ram,share=on`, any RAM_SHARED block) is a view of a section the paging file backs, whose handle the RAMBlock keeps (`qemu_ram_get_section`); `qemu_win32_map_alloc` passes a size's high 32 bits ("Windows hosts: guest RAM in a section", below) | `6c2cae16` |
 | `reims-graphics-pci` on Windows: meson looks for the library there too, the memory walk passes each range of RAM that is a view of a section with the section's handle and the range's offset in it, and the control ring's doorbell is the EventNotifier's event | `a86885f8` |
+| the `dsound` audiodev plays where Windows has no recording device: its capture object is optional, where realize failed without one and QEMU exited ("Could not initialize DirectSoundCapture"); an input voice then fails to initialize, and reims-ctl gives such a host's input device a `none` audiodev of its own ("Windows hosts: sound", below) | `e435673c` |
 
 The branch's other commits are the apple-gfx work `96e1b470` removes, and
 `cfaadbfa09`, an HVF workaround that `478c28ff70` reverts, upstream having
@@ -915,6 +916,33 @@ to itself, QMP screendumps every 15 s, then QEMU's CPU time and memory read
   4.27 GB. Private bytes were 0.78 GB with share=on, where the section holds
   the guest's RAM, and 5.03 GB without.
 - QEMU quit over QMP and exited 0 both ways.
+
+### Windows hosts: sound
+
+Of the Windows build's audio backends (none, dbus, dsound, wav, as
+`reims-ctl doctor` lists them), `dsound` plays on the host's own devices,
+and is reims-ctl's default there. Its realize, as QEMU starts, opens
+Windows' default output and recording devices; QEMU exits where the output
+device fails, and before `e435673c` where the recording device fails too
+(read from code: `audio/dsoundaudio.c`, `audio_dsound_realize`).
+**Measured** on the mini (2026-11-16, `m3-max-36142`, QEMU at `979d171c`,
+realized paused): it has two output devices and no recording device
+(`waveOutGetNumDevs` 2, `waveInGetNumDevs` 0), and QEMU exited with "Could
+not initialize DirectSoundCapture" on `dsound`, on `dsound` with
+`in.voices=0`, and on `dsound` beside a `none` audiodev for the input
+device alike; on `none` it realized. So none of these options avoided it,
+and the walk's VM started only on `wav` (`m3-max-35999`, where three
+`afplay` pings in the guest grew `qemu.wav` from 442 KB to 1.66 MB).
+
+From `e435673c` the recording device is optional: where it can't be
+opened, `dsound` plays and logs the failure, and an input voice on it then
+fails to initialize (read from code). `reims-ctl` counts Windows' devices
+as `waveOutGetNumDevs` and `waveInGetNumDevs` do at each start
+(`os::sound_devices`), and routes a VM on `dsound` by them
+(`qemu::sound_routing`): with no recording device the input device,
+`audioin`, gets an audiodev of its own, `none`, and the guest records
+silence; with no output device the VM's sound is all `none`. The start
+says so.
 
 ## x86-64 macOS guests
 
