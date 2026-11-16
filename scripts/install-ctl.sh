@@ -426,6 +426,18 @@ if ! command -v rustup >/dev/null 2>&1; then
   fi
   export PATH="$CARGO_BIN:$PATH"
 fi
+# On Windows the build runs rust-toolchain.toml's channel for the x86_64-pc-windows-gnullvm host
+# whatever rustup's default host is, as a rustup this script installs has it: its builds link
+# with CLANG64's clang and lld. One whose default host is x86_64-pc-windows-msvc would build
+# xtask, the build scripts, reims-ctl and reims-util for it, which link only with Visual Studio's
+# link.exe. RUSTUP_TOOLCHAIN reaches every cargo run below, reims-util's install among them.
+if [[ $WINDOWS == 1 ]]; then
+  CHANNEL="$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' "$ROOT/rust-toolchain.toml")"
+  [[ -n $CHANNEL ]] || die "$ROOT/rust-toolchain.toml names no channel"
+  export RUSTUP_TOOLCHAIN="$CHANNEL-x86_64-pc-windows-gnullvm"
+  rustup toolchain install --profile minimal "$RUSTUP_TOOLCHAIN" ||
+    die "rustup could not install $RUSTUP_TOOLCHAIN, the toolchain the build runs on Windows"
+fi
 
 # ------------------------------------------------------------------ sources
 
