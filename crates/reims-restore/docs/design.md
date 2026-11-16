@@ -9,7 +9,8 @@ arm64 Linux and macOS among them. What it copies onto the disk is the IPSW's own
 system volume, the boot objects, the cryptexes, BaseSystem), as an install does.
 
 The result is the raw disk image, the auxiliary storage (`aux.img`) and the ECID. A guest boots
-from them under QEMU's `vmapple` on Ambrosia.
+from them under QEMU's `vmapple` on Ambrosia; its first boot makes the Data volume and resets the
+VM ("The Data volume, by EACS").
 
 Facts tagged **[vz]** come from guests VZ installed: a fresh 27.2.1 (26B131) restore, never
 booted, and the set-up 14.6.1, 15.6.1, 26.6.2 and 27.0.1 guests, all read through APFS clones or
@@ -75,8 +76,7 @@ case-insensitive. A fresh restore has these, in this order **[vz]**:
   this one doesn't make.
 - **Container:** `Macintosh HD` (role System), Preboot, Recovery, Update and Data (role Data).
   System and Data form the volume group G, whose UUID is the Data volume's. There is no VM volume:
-  the first boot makes it. For macOS 14 there is no Data volume either ("macOS 14's Data
-  volume").
+  the first boot makes it, and the Data volume too ("The Data volume, by EACS").
   - **The system volume** is the IPSW's OS image's volume, sealed by reims-apfs with its own
     node layout, so its root hash is ours, not the one the IPSW's signed `root_hash` carries
     ("The system volume's seal"). Its snapshot is `com.apple.os.update-<root hash>`.
@@ -334,15 +334,25 @@ made **[measured]**. With `aptk` alone, 14.6.1's keystore makes the D-key and th
 `xrtC` and `xrtP` after `aptk`, a page each, raising the count to 3 and the end to 0x5000, with
 `field_0c` 8 for both **[measured]**. What `field_0c` means is not known.
 
-## macOS 14's Data volume
+## The Data volume, by EACS
 
-macOS 14's kernel refuses an unencrypted Data volume: its first boot panics, "unencrypted data
-volume is not allowed" (`apfs_vfsops.c:2276`), in the BaseSystem environment before macOS
-**[measured]**. VZ's 14.6.1 restore leaves Data encrypted (fs flags 0x100, keybags), and those of
-15.6.1, 26.6.2 and 27.2.1 leave it unencrypted, as this restore writes it **[vz]**. Only the
-guest's keystore can make an encrypted Data volume, so for macOS 14 (`pipeline::data_by_eacs`)
-the restore leaves Data out and has the first boot make it, by EACS (erase all content and
-settings):
+Every release's first boot makes its Data volume itself (`pipeline::data_by_eacs`), for two
+reasons:
+- The guest's keystore makes its D-key, under which an encrypted volume's keys are wrapped, only
+  when EACS (erase all content and settings) makes Data. A 15.6.1, 26.6.2 or 27.0.1 VM restored
+  with Data unencrypted, as Virtualization.framework's restores of 15.6.1 and later leave it
+  **[vz]**, logs "no D-key present" and "D-key is not set yet, cant derive key" at every boot.
+  FileVault still turns on in System Settings, which Setup Assistant offers at every first boot,
+  but `fdesetup authrestart` is refused ("AKS failed to prepare for authrestart, error =
+  0xe00002e6"), and the next boot can't unwrap Data's key ("kek failed to unwrap vek;
+  mix-n-match?", "Failed to unwrap metadata crypto state"), shows no unlock screen and never
+  reaches macOS **[measured, 26.6.2 and 27.0.1]**.
+- macOS 14's kernel refuses an unencrypted Data volume: its first boot panics, "unencrypted data
+  volume is not allowed" (`apfs_vfsops.c:2276`), in the BaseSystem environment before macOS
+  **[measured]**. VZ's 14.6.1 restore leaves Data encrypted (fs flags 0x100, keybags).
+
+Only the guest's keystore can make an encrypted Data volume and its keys, so the restore leaves
+Data out and has the first boot make it, by EACS:
 - Preboot gets `/<G>/var/db/.com.apple.eacs`, an XML plist: `MigrationMode` 2 and
   `MobileObliterationOptions` {`ObliterationType` `ObliterateDataPartition`,
   `PreservedVolumeGroupUUID` G, `boot-physical-store-UUID` the main container's partition GUID,
@@ -361,18 +371,17 @@ settings):
   ean storage holds only `aptk`. The next boot unwraps the D-key, unlocks Data (boot mode
   `_autounlock`) and goes to Setup Assistant **[measured]**.
 
-So a macOS 14 VM takes one boot of the guest before it is ready (`pipeline::FirstBoot::Eacs`):
+So every VM takes one boot of the guest before it is ready (`pipeline::FirstBoot::Eacs`):
 reims-ctl's `create` and the CLI's `restore` end by naming that boot and the step after it,
-`reims-restore finish-eacs DIR`. On a
-host, that boot needs what any boot does: QEMU's `vmapple` with Ambrosia, under HVF on a Mac or
-KVM on arm64 Linux. Every later release restores without booting.
+`reims-restore finish-eacs DIR`. On a host, that boot needs what any boot does: QEMU's `vmapple`
+with Ambrosia, under HVF on a Mac or KVM on arm64 Linux.
 
 ## The ECID and the result
 
 The tool writes into the VM's directory `disk.img`, `aux.img`, `aux.img.trimmed`, and
 `machine-identifier.bin`: VZ's form, a binary plist `{ECID: n}`. The ECID is random unless one is
-given. Every ticket and policy is bound to it. For macOS 14 it also writes `isc.pre-eacs` and
-`aux.pre-eacs` until `finish_eacs`.
+given. Every ticket and policy is bound to it. It also writes `isc.pre-eacs` and `aux.pre-eacs`,
+which `finish_eacs` consumes.
 
 ## Reading the IPSW
 

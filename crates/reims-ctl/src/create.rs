@@ -415,14 +415,14 @@ fn make_vmapple(
     })
 }
 
-/// What the VM's first boot asks of the create after the restore. For macOS 14
-/// ([`restore::FirstBoot::Eacs`]) that is one boot, in which macOS makes its Data volume and
-/// resets the VM, and then reims-restore's finish step; reims-ctl starts no arm64 VM yet, so it
-/// names the step left.
+/// What the VM's first boot asks of the create after the restore. For EACS
+/// ([`restore::FirstBoot::Eacs`], every release) that is one boot, in which macOS makes its Data
+/// volume and resets the VM, and then reims-restore's finish step; reims-ctl starts no arm64 VM
+/// yet, so it names the step left.
 fn first_boot(first: restore::FirstBoot, dir: &Path, progress: &mut dyn FnMut(&str)) {
     if first == restore::FirstBoot::Eacs {
         progress(&format!(
-            "one step is left: macOS 14 makes its Data volume at the VM's first boot and then \
+            "one step is left: macOS makes its Data volume at the VM's first boot and then \
              resets the VM, which doesn't start again until it is finished; after that boot, \
              run `reims-restore finish-eacs {}`, and the next boot goes to Setup Assistant",
             paths::tilde(dir)

@@ -59,8 +59,8 @@ enum Command {
         #[arg(long, value_parser = parse_hex)]
         ecid: Option<u64>,
     },
-    /// After a macOS 14 VM's first boot: macOS 14 makes its Data volume at that boot and resets
-    /// the VM, which then doesn't start; this makes it bootable again, for Setup Assistant.
+    /// After a VM's first boot: macOS makes its Data volume at that boot and resets the VM, which
+    /// then doesn't start; this makes it bootable again, for Setup Assistant.
     FinishEacs {
         /// The VM's directory.
         dir: PathBuf,

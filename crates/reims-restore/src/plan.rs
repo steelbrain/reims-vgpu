@@ -170,8 +170,8 @@ pub const EACS_COOKIE: &str = "var/db/.com.apple.eacs";
 /// finds it, BaseSystem's `migrationModeSwitcher` reads `MigrationMode` (2 starts EACS) and
 /// `obliterationKickStarter` hands `MobileObliterationOptions` to `mobile_obliterator`, which,
 /// for `ObliterateDataPartition`, makes the Data volume of `PreservedVolumeGroupUUID`, encrypted,
-/// and the keystore's keys for it, then resets the VM **[measured]** (docs/design.md, "macOS 14's
-/// Data volume").
+/// and the keystore's keys for it, then resets the VM **[measured]** (docs/design.md, "The Data
+/// volume, by EACS").
 pub fn eacs_cookie(group: Uuid, store: Uuid) -> Arc<[u8]> {
     let mut o = Dictionary::new();
     o.insert(
@@ -913,7 +913,7 @@ mod tests {
         }
     }
 
-    /// For macOS 14: no Data volume, and the cookie that has the first boot make it, naming the
+    /// For EACS: no Data volume, and the cookie that has the first boot make it, naming the
     /// group and the main container's partition as the obliterator read them **[measured]**.
     #[test]
     fn a_data_volume_made_by_eacs_is_left_out_for_the_cookie() {

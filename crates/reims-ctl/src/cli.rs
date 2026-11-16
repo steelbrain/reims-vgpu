@@ -284,7 +284,7 @@ const CREATE_EXAMPLES: &str = r"
     reims-ctl create mac --ipsw latest
 
     # An IPSW of your own, read where it is: Apple offers only the current macOS to download.
-    # macOS 14 makes its Data volume at the VM's first boot and then resets the VM: after that
+    # macOS makes its Data volume at the VM's first boot and then resets the VM: after that
     # boot, reims-restore finish-eacs DIR makes it ready for Setup Assistant
     reims-ctl create mac --ipsw ~/Downloads/UniversalMac_14.6.1_23G93_Restore.ipsw";
 
@@ -397,8 +397,8 @@ pub struct CreateArgs {
     pub installer: Option<PathBuf>,
     /// On an arm64 Mac or arm64 Linux: the IPSW to restore an arm64 VM's macOS from: latest,
     /// the current macOS, downloaded from Apple once and kept (reims-ctl downloads lists it),
-    /// or an IPSW's path, read where it is. A macOS 14 VM needs one boot, which makes its Data
-    /// volume, and then `reims-restore finish-eacs DIR`
+    /// or an IPSW's path, read where it is. The VM needs one boot, which makes its Data volume,
+    /// and then `reims-restore finish-eacs DIR`
     #[arg(long, value_name = "latest|PATH", conflicts_with_all = ["macos", "installer", "disk", "opencore"])]
     pub ipsw: Option<String>,
     /// An OpenCore image of your own to copy, with OVMF_CODE.fd and OVMF_VARS.fd beside it

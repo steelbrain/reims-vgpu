@@ -15,11 +15,11 @@ without the Apple paravirtualized GPU it once had, builds again in an
 firmware ("arm64 guests", below). On an arm64 Mac or arm64 Linux,
 `reims-ctl` makes arm64 VMs by restoring macOS from an IPSW onto their disk
 (`crates/reims-restore`), which runs no QEMU, and doesn't start them;
-`scripts/install-ctl.sh` builds no QEMU there. A macOS 14 VM needs one boot
-before it is ready: macOS 14 makes its Data volume at its first boot and
-resets the VM, and `reims-restore finish-eacs DIR` then makes it bootable for
-Setup Assistant (`crates/reims-restore/docs/design.md`, "macOS 14's Data
-volume").
+`scripts/install-ctl.sh` builds no QEMU there. Each VM needs one boot
+before it is ready: macOS makes its Data volume at its first boot and resets
+the VM, and `reims-restore finish-eacs DIR` then makes it bootable for Setup
+Assistant (`crates/reims-restore/docs/design.md`, "The Data volume, by
+EACS").
 
 No test runs QEMU, so a VM boot is the only check of QEMU's side of the
 API ([lessons.md](lessons.md)). Each measurement below names its host and

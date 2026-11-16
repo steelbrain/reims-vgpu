@@ -72,19 +72,19 @@ pub struct Restored {
 pub enum FirstBoot {
     /// It goes to Setup Assistant.
     SetupAssistant,
-    /// macOS 14 ([`data_by_eacs`]): it makes the Data volume by EACS and resets the VM, and then
-    /// Ambrosia finds no LocalPolicy and stops. [`finish_eacs`] on the VM's directory then makes
+    /// Every release ([`data_by_eacs`]): it makes the Data volume by EACS and resets the VM, and
+    /// then Ambrosia finds no LocalPolicy and stops. [`finish_eacs`] on the VM's directory then makes
     /// it bootable, and the next boot goes to Setup Assistant.
     Eacs,
 }
 
 /// Whether macOS `version`'s first boot makes its Data volume itself, by EACS, with the restore
-/// leaving it out: macOS 14. Its kernel refuses an unencrypted Data volume ("unencrypted data
-/// volume is not allowed") **[measured]**, and Virtualization.framework's 14.6.1 restore leaves
-/// Data encrypted where those of 15.6.1 and later leave it unencrypted **[vz]**; only the guest's
-/// keystore can make an encrypted one (docs/design.md, "macOS 14's Data volume").
-pub fn data_by_eacs(version: &str) -> bool {
-    version.split('.').next() == Some("14")
+/// leaving it out: every release. The guest's keystore makes its D-key only there, and with none,
+/// once FileVault is on, no boot unwraps Data's key again **[measured, 27.0.1]**; and macOS 14's
+/// kernel refuses an unencrypted Data volume **[measured]** (docs/design.md, "The Data volume, by
+/// EACS").
+pub fn data_by_eacs(_version: &str) -> bool {
+    true
 }
 
 /// The files a restore leaves in the VM's directory.
@@ -148,7 +148,7 @@ pub fn run(r: &Restore, events: &mut dyn FnMut(Event), cancel: &AtomicBool) -> R
     let eacs = data_by_eacs(&version);
     if eacs {
         events(Event::Note(
-            "macOS 14 makes its Data volume at its first boot: the restore leaves it out".into(),
+            "macOS makes its Data volume at its first boot: the restore leaves it out".into(),
         ));
     }
 
@@ -745,14 +745,9 @@ mod tests {
     }
 
     #[test]
-    fn only_macos_14_makes_its_data_volume_by_eacs() {
-        for v in ["14.0", "14.6.1", "14"] {
+    fn every_release_makes_its_data_volume_by_eacs() {
+        for v in ["14.6.1", "15.6.1", "26.6.2", "27.0.1", "27.2.1"] {
             assert!(data_by_eacs(v), "{v}");
-        }
-        for v in [
-            "15.0", "15.6.1", "26.6.2", "27.0.1", "27.2.1", "140.1", "4.1",
-        ] {
-            assert!(!data_by_eacs(v), "{v}");
         }
     }
 

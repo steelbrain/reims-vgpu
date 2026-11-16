@@ -38,8 +38,8 @@ pub struct Restored {
     /// The macOS restored: its version and build, such as 27.2.1 and 26B131.
     pub version: String,
     pub build: String,
-    /// What the VM's first boot does: for macOS 14, it makes the Data volume, and reims-restore
-    /// finishes the VM after it.
+    /// What the VM's first boot does: it makes the Data volume, and reims-restore finishes the
+    /// VM after it.
     pub first_boot: FirstBoot,
 }
 
