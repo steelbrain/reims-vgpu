@@ -3072,7 +3072,10 @@ mod tests {
         use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
         use crate::core::platform::types::NsRange;
         let d = dev();
-        let (a, b) = (d.new_command_queue().unwrap(), d.new_command_queue().unwrap());
+        let (a, b) = (
+            d.new_command_queue().unwrap(),
+            d.new_command_queue().unwrap(),
+        );
         let fence = d.new_fence().unwrap().expect("a fence");
         let done = |cb: &VulkanCommandBuffer| {
             let (tx, rx) = mpsc::channel();
@@ -3094,9 +3097,15 @@ mod tests {
             blit.encode(OnFault::Return, BlitCmd::UpdateFence { fence: &fence })
                 .unwrap();
             blit.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
-            assert!(part.set_completion_joins_next(true), "marked before its commit");
+            assert!(
+                part.set_completion_joins_next(true),
+                "marked before its commit"
+            );
             let last = part.split(OnFault::Return).unwrap().expect("a part");
-            assert!(!part.set_completion_joins_next(false), "refused once committed");
+            assert!(
+                !part.set_completion_joins_next(false),
+                "refused once committed"
+            );
             let read = crate::gpu::resource::tests::shared(16);
             let waiting = buffer(&b);
             let blit = waiting.blit_encoder(OnFault::Return).unwrap().unwrap();
