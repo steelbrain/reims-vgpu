@@ -27,8 +27,12 @@
 //    the pixel far enough from the corner to show a wrong size, confirms the placement as the
 //    rectangle, and only a confirmed one is told the host (DISPLAY_BOUNDS);
 //  - a landing that disagrees moves the rectangle's corner on each axis where the pixel lies
-//    inside the display, so the point was not held at an edge, and leaves an axis held at an edge
-//    as it was; the rectangle so moved is learned, and confirmed by a later landing that agrees;
+//    inside the display, so the point was not held at an edge; on an axis held at an edge the
+//    point lay past the display, so the placement the move was posted by is not the display's
+//    there, and the rectangle keeps its own (measured on 27.0.1: a post beside display 1 for
+//    display 0, which the cursor was on, held the cursor at display 0's edge; taking that
+//    placement on the axis put display 0 past display 1, potluck job m3-max-35865); the
+//    rectangle so moved is learned, and confirmed by a later landing that agrees;
 //  - two landings on a display, the second disagreeing with its size, each inside it at the size
 //    held and at the size they give, and 64 pixels apart or more, size it by the points between
 //    them over the pixels between them, the other axis alike.
@@ -63,7 +67,12 @@
 // aimed at already, where the crossing's display last showed the cursor there (the host told the
 // crossing before it saw the cursor there), which ends the crossing; otherwise its point was held
 // at the very pixel the cursor was at (a captured pointer pushed past its window's edge after the
-// displays were rearranged), and the crossing posts again.
+// displays were rearranged), and the crossing posts again. Where no display shows the cursor where
+// that post's point lies or is held at, the post's landing may yet come (measured on 27.0.1: a
+// post 2 s after the displays were rearranged showed nothing in kRgfxLandingWaitNs, potluck job
+// m3-max-35865), at the very pixel each later post of the crossing aims at, where it cannot be
+// told from theirs: the crossing still ends on its display's landing, and learns no place from
+// one after it.
 //
 // Header-only and free of the kernel's headers, so its native test (tests/display_places_test.cpp)
 // builds it as the kext does.
@@ -264,8 +273,14 @@ inline bool rgfxPlacesLanded(RgfxDisplayPlaces *places, uint32_t display,
 			agreed++;
 			continue;
 		}
-		if (!rgfxPlaceInside(span[a], pixels[a], pixel[a]))
-			continue; // held at an edge: this axis says nothing
+		if (!rgfxPlaceInside(span[a], pixels[a], pixel[a])) {
+			// Held at an edge: the point lay past the display on this axis, so the placement
+			// is not the display's there; the rectangle keeps its own.
+			corner[a] = a == 0 ? p.rect.minx : p.rect.miny;
+			span[a] = a == 0 ? static_cast<int64_t>(p.rect.maxx) - p.rect.minx
+			                 : static_cast<int64_t>(p.rect.maxy) - p.rect.miny;
+			continue;
+		}
 		corner[a] += posted[a] - rgfxPlacePoint(corner[a], span[a], pixels[a], pixel[a]);
 		moved++;
 	}
@@ -319,6 +334,10 @@ struct RgfxCrossing {
 	uint64_t heldAt;
 	// How long after its post the last landing on the display aimed at came.
 	uint64_t landedAfter;
+	// A post of this crossing showed nothing by its deadline, with no display showing the cursor
+	// where its point lies or is held at: its landing may yet come, so no later one teaches a
+	// place.
+	bool unsure;
 };
 
 // What a landing, or a wait for one, does to the crossing.
@@ -338,6 +357,7 @@ inline void rgfxCrossingStart(RgfxCrossing *c, uint32_t display, int32_t x, int3
 	c->posts = 0;
 	c->candidate = 0;
 	c->startedAt = now;
+	c->unsure = false;
 }
 
 inline bool rgfxPlaceOverlaps(const RgfxGlobalRect &a, const RgfxGlobalRect &b)
@@ -476,7 +496,8 @@ inline RgfxCrossingStep rgfxCrossingLanded(RgfxDisplayPlaces *places, RgfxCrossi
 		c->held = false;
 		if (display == c->aimedAt) {
 			c->landedAfter = now - c->postedAt;
-			*confirmed = rgfxPlacesLanded(places, display, {c->gx, c->gy, x, y}, c->aimed);
+			if (!c->unsure)
+				*confirmed = rgfxPlacesLanded(places, display, {c->gx, c->gy, x, y}, c->aimed);
 		}
 		if (!c->active)
 			return RgfxCrossingStep::none;
@@ -522,37 +543,60 @@ struct RgfxCursorShown {
 	int32_t y;
 };
 
-// At `now`, the post out waited for until its deadline with no landing on the display aimed at:
-// where the crossing's display shows the cursor at the pixel the post aimed at (`shown`, that
-// display's last MOVE_CURSOR), the cursor was there already, and the post, which moved it
+// Each display's, by its id.
+struct RgfxCursorsShown {
+	RgfxCursorShown at[RGFX_DISPLAYS_MAX];
+};
+
+// Whether display `d` shows the cursor where the post out's point lies or is held at, by the
+// placement it was aimed by (the display aimed at) or the display's rectangle (another); `*past`
+// where the point lies past it.
+inline bool rgfxCrossingShownAt(const RgfxDisplayPlaces &places, const RgfxCrossing &c,
+                                uint32_t d, const RgfxCursorShown &shown, bool *past)
+{
+	*past = false;
+	const RgfxDisplayPlace &p = places.at[d];
+	const RgfxGlobalRect &r = d == c.aimedAt ? c.aimed : p.rect;
+	const int64_t spanX = static_cast<int64_t>(r.maxx) - r.minx;
+	const int64_t spanY = static_cast<int64_t>(r.maxy) - r.miny;
+	if (!shown.visible || p.state == RgfxPlaceState::none || !p.width || !p.height ||
+	    spanX <= 0 || spanY <= 0)
+		return false;
+	int64_t by = 0;
+	const int64_t hx = rgfxPlaceHeld(r.minx, spanX, p.width, c.gx, past, &by);
+	const int64_t hy = rgfxPlaceHeld(r.miny, spanY, p.height, c.gy, past, &by);
+	return rgfxPlaceAbs(shown.x - hx) <= 1 + p.width / spanX &&
+	       rgfxPlaceAbs(shown.y - hy) <= 1 + p.height / spanY;
+}
+
+// At `now`, the post out waited for until its deadline with no landing on the display aimed at,
+// given each display's last MOVE_CURSOR (`shown`): where the crossing's display shows the cursor
+// at the pixel the post aimed at, the cursor was there already, and the post, which moved it
 // nowhere, showed nothing: the crossing is over (`arrived`); otherwise the cursor is not there,
-// and the crossing, where one goes on, posts again (`again`). `none` before the deadline or with
-// no post out.
+// and the crossing, where one goes on, posts again (`again`), unsure of its places where no
+// display showed the cursor where the post's point lies or is held at (the header's comment).
+// `none` before the deadline or with no post out.
 inline RgfxCrossingStep rgfxCrossingWaited(const RgfxDisplayPlaces &places, RgfxCrossing *c,
-                                           uint64_t now, const RgfxCursorShown &shown)
+                                           uint64_t now, const RgfxCursorsShown &shown)
 {
 	if (!c->waiting || now < rgfxCrossingDeadline(*c))
 		return RgfxCrossingStep::none;
+	const bool held = c->held;
 	c->waiting = false;
 	c->held = false;
 	if (!c->active)
 		return RgfxCrossingStep::none;
-	if (shown.visible && c->aimedAt == c->display && c->display < RGFX_DISPLAYS_MAX) {
-		const RgfxDisplayPlace &p = places.at[c->display];
-		const int64_t spanX = static_cast<int64_t>(c->aimed.maxx) - c->aimed.minx;
-		const int64_t spanY = static_cast<int64_t>(c->aimed.maxy) - c->aimed.miny;
-		if (p.width && p.height && spanX > 0 && spanY > 0) {
-			bool past = false;
-			int64_t by = 0;
-			const int64_t hx = rgfxPlaceHeld(c->aimed.minx, spanX, p.width, c->gx, &past, &by);
-			const int64_t hy = rgfxPlaceHeld(c->aimed.miny, spanY, p.height, c->gy, &past, &by);
-			if (!past && rgfxPlaceAbs(shown.x - hx) <= 1 + p.width / spanX &&
-			    rgfxPlaceAbs(shown.y - hy) <= 1 + p.height / spanY) {
-				c->active = false;
-				return RgfxCrossingStep::arrived;
-			}
-		}
+	bool past = false;
+	if (c->aimedAt == c->display && c->display < RGFX_DISPLAYS_MAX &&
+	    rgfxCrossingShownAt(places, *c, c->display, shown.at[c->display], &past) && !past) {
+		c->active = false;
+		return RgfxCrossingStep::arrived;
 	}
+	bool seen = held;
+	for (uint32_t d = 0; d < RGFX_DISPLAYS_MAX && !seen; d++)
+		seen = rgfxCrossingShownAt(places, *c, d, shown.at[d], &past);
+	if (!seen)
+		c->unsure = true;
 	return RgfxCrossingStep::again;
 }
 

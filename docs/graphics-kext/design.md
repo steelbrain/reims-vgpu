@@ -3334,14 +3334,27 @@ pixels of its mode, and the buttons held):
     host's hold: a guest under TCG shows even a first post's landing after
     the hold, and a crossing cut off there would learn nothing of a moved
     display, so every later crossing onto it would miss too.
+  - **A post that may land late.** A post that shows no move in 250 ms with
+    no display showing the cursor where its point lies or is held at may
+    still land: on 27.0.1 the first post 2 s after the displays were
+    rearranged showed nothing in 250 ms (potluck job m3-max-35865), and its
+    move can then show with a later post's. Every post of a crossing aims
+    at the same pixel of its display, so such a landing cannot be told from
+    the later post's: the crossing ends on its display's landing, as any
+    does, and learns no place from a landing after that post.
   - **Learning a place.** A landing whose pixel lies where the post's
     placement puts the posted point, 16 pixels or more from the corner on an
     axis, confirms that placement as the display's rectangle. One that
     disagrees moves the placement's corner on each axis where the pixel lies
     inside the display, off its edges, and the rectangle is learned, to be
-    confirmed by a later landing that agrees; two landings 64 pixels apart
-    or more size a display the guess sized wrong (a mode the guest's user
-    scaled), to within a few points.
+    confirmed by a later landing that agrees. On an axis where the landing
+    is held at the display's edge, the post's point lay past the display,
+    so the placement is not the display's there and the rectangle keeps its
+    own: in the job above, the cursor already on display 0, the post beside
+    display 1 held it at display 0's edge, and taking that placement put
+    display 0 past display 1, so each later crossing missed. Two landings 64
+    pixels apart or more size a display the guess sized wrong (a mode the
+    guest's user scaled), to within a few points.
   - **What the host is told.** Each confirmed rectangle, in
     `DISPLAY_BOUNDS`, as the x86-64 kext tells its own ("A drag across
     displays", below), after each move of the cursor where it changed. A

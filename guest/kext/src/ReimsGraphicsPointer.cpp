@@ -307,25 +307,23 @@ void ReimsGraphics::movePointer(thread_call_param_t self, thread_call_param_t)
 
 // A post's landing not seen by its deadline: the crossing is over where its display last showed
 // the cursor at the pixel the post aimed at; otherwise the cursor is not there, and the crossing,
-// where one goes on, posts again. Called early, it waits on. Each display's last MOVE_CURSOR is
-// read outside its gate: a swap racing it leaves it a frame old.
+// where one goes on, posts again, learning no place where no display showed the cursor where the
+// post's point lies or is held at (RgfxDisplayPlaces.hpp). Called early, it waits on. Each
+// display's last MOVE_CURSOR is read outside its gate: a swap racing it leaves it a frame old.
 void ReimsGraphics::landingWaited(thread_call_param_t self, thread_call_param_t)
 {
 	ReimsGraphics *me = static_cast<ReimsGraphics *>(self);
-	RgfxCursorShown shown[RGFX_DISPLAYS_MAX] = {};
+	RgfxCursorsShown shown = {};
 	ReimsGraphics *fbs[RGFX_DISPLAYS_MAX];
 	const UInt32 n = me->copyDisplays(fbs);
 	for (UInt32 i = 0; i < n; i++) {
 		const RgfxMobileCursor &cursor = fbs[i]->mobileCursor;
 		if (fbs[i]->displayId < RGFX_DISPLAYS_MAX)
-			shown[fbs[i]->displayId] = {cursor.moved && cursor.visible, cursor.x, cursor.y};
+			shown.at[fbs[i]->displayId] = {cursor.moved && cursor.visible, cursor.x, cursor.y};
 	}
 	releaseDisplays(fbs, n);
 	IOSimpleLockLock(me->interruptLock);
-	const UInt32 display = me->crossing.display;
-	const RgfxCrossingStep step =
-	    rgfxCrossingWaited(me->places, &me->crossing, nowNs(),
-	                       display < RGFX_DISPLAYS_MAX ? shown[display] : RgfxCursorShown{});
+	const RgfxCrossingStep step = rgfxCrossingWaited(me->places, &me->crossing, nowNs(), shown);
 	const bool waiting = me->crossing.waiting;
 	const uint64_t deadline = rgfxCrossingDeadline(me->crossing);
 	IOSimpleLockUnlock(me->interruptLock);
