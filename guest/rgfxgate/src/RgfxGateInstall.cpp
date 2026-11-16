@@ -349,11 +349,30 @@ static void removeDir(const char *path, vfs_context_t ctx) {
 	vnode_put(vp);
 }
 
+// The VFS's record of a renamed vnode's name and parent, which vn_rename updates
+// after the file system's rename and a VNOP called directly does not: without
+// it the vnode keeps its old name, so every path the kernel builds for it and
+// for what lies under it (vn_getpath, fcntl(F_GETPATH)) names the old path. The
+// flags are vn_rename's: the name where it changed, the parent where it moved.
+static void renameIdentity(vnode_t vp, vnode_t olddvp, const char *oldleaf, vnode_t newdvp,
+                           const char *newleaf) {
+	int flags = 0;
+	if (strcmp(oldleaf, newleaf) != 0)
+		flags |= VNODE_UPDATE_NAME;
+	if (olddvp != newdvp)
+		flags |= VNODE_UPDATE_PARENT;
+	if (flags != 0)
+		vnode_update_identity(vp, newdvp, newleaf, (int)strlen(newleaf), 0, flags);
+}
+
 // Rename `from` onto `to`, below the vn_* MAC layer as the directory creates
 // use VNOP_MKDIR, so the container's restricted flag does not block it. With
 // swap (both ends must exist), the two are exchanged atomically
 // (VFS_RENAME_SWAP): a reader of `to` always sees one whole tree, never a
 // half-swapped one. Without swap, `from` replaces `to`, which need not exist.
+// Each renamed vnode then takes its new name and parent (renameIdentity), as
+// after vn_rename: the installed bundle's vnodes would otherwise keep the
+// staging name, reims-graphics.bundle.new.
 // Shared with the AppleGVA preference's atomic write (RgfxGatePrefs.cpp).
 bool rgfxRenameNode(const char *from, const char *to, bool swap,
                     vfs_context_t ctx) {
@@ -375,6 +394,11 @@ bool rgfxRenameNode(const char *from, const char *to, bool swap,
 			ok = err == 0;
 			if (!ok)
 				graft_client_log(kClientID, "rename %s -> %s failed (%d)", from, to, err);
+			if (ok) {
+				renameIdentity(fvp, fdvp, fleaf, tdvp, tleaf);
+				if (swap)
+					renameIdentity(tvp, tdvp, tleaf, fdvp, fleaf);
+			}
 		}
 		if (tdvp)
 			vnode_put(tdvp);
