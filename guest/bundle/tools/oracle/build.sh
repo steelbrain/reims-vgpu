@@ -63,6 +63,8 @@ xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework 
 	-framework IOSurface -framework CoreVideo -framework Foundation "$here/oracle_surfresolve.m" \
 	-o "$out/oracle_surfresolve"
 cp "$here/oracle_surfresolve.sh" "$out/"
+xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal \
+	-framework IOSurface -framework Foundation "$here/oracle_allocsize.m" -o "$out/oracle_allocsize"
 for m in oracle_bundle oracle_bundle_mesh oracle_bundle_rt oracle_bundle_args; do
 	xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 "$here/$m.metal" \
 		-o "$out/$m.metallib" || echo "oracle_bundle: $m.metallib not built"
