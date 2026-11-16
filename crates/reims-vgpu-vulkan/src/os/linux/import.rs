@@ -3288,6 +3288,163 @@ mod tests {
         assert_eq!(unsafe { libc::munmap(start, length.to_usize()) }, 0);
     }
 
+    /// A `Managed` no-copy buffer over the guest's RAM made with the word that its bytes read
+    /// zero from an offset (`BufferDesc::zero_from`), in a region whose import the device keeps
+    /// with no buffer bound in it (`super::dma_buf`'s module docs, "Kept imports"), joins that
+    /// import and keeps the runtime's promise of its zero bytes
+    /// (`rt::HostMemory::with_zero_from`): on a GPU of its own memory its GPU copy takes the
+    /// bytes before the offset from the pages and zeros the device writes from it, though the
+    /// kept import maps the file's pages there, which hold other bytes; on one that shares the
+    /// CPU's memory it lies in the pages, and the word changes nothing. Elsewhere (no view
+    /// through its dma-bufs, or udmabuf does not open), said on stderr, nothing is checked
+    #[test]
+    fn a_managed_buffer_joining_a_kept_region_keeps_its_zero_bytes() {
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::platform::resource::Buffer as _;
+        use crate::core::platform::values::{BufferDesc, OptionSet};
+        use crate::core::raise::OnFault;
+
+        let d = crate::gpu::device::tests::dev();
+        crate::gpu::device::tests::settle_device_checks(&d);
+        probes_gone();
+        if !groups_views() {
+            eprintln!(
+                "skipped: {} takes no view through its dma-bufs here, or udmabuf does not open",
+                d.raw.properties().name
+            );
+            return;
+        }
+        let length: u64 = 8 << 20;
+        let file = vm::memfd(length).unwrap();
+        // SAFETY: a fresh shared mapping of the file, which the test unmaps after the lease and
+        // every buffer over it.
+        let start = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length.to_usize(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                std::os::fd::AsRawFd::as_raw_fd(&*file),
+                0,
+            )
+        };
+        assert_ne!(start, libc::MAP_FAILED);
+        let at = start.addr().to_u64();
+        let lease = super::super::lease_guest_memory([crate::os::GuestRamFile {
+            host: at,
+            guest: 0,
+            length,
+            file,
+            offset: 0,
+        }]);
+        let wait = std::time::Duration::from_secs(10);
+        let before = d.raw.work_counts();
+        // A buffer elsewhere in the region makes its import, which the device keeps past it.
+        let (first, gone) = no_copy(&d, HostAddr::from_addr((at + (4 << 20)).to_usize()), 16);
+        drop(first);
+        assert_eq!(gone.recv_timeout(wait), Ok(()), "the deallocator ran");
+        let kept = d.raw.work_counts();
+        assert_eq!(
+            (
+                kept.dma_buf_shared_imports_kept - before.dma_buf_shared_imports_kept,
+                kept.dma_buf_shared_imports_live - before.dma_buf_shared_imports_live,
+            ),
+            (1, 1),
+            "the region's import kept past its one buffer"
+        );
+        let size = 4 * PAGE;
+        // SAFETY: the test's own pages of the lease, which no buffer lies in yet.
+        unsafe { std::ptr::write_bytes(start.cast::<u8>(), 0x5a, size.to_usize()) };
+        // SAFETY: the pages stay mapped until the buffer is dropped, before the lease and the
+        // unmap below.
+        let bytes = unsafe {
+            crate::core::platform::HostRange::new(HostAddr::from_addr(at.to_usize()), size)
+        };
+        let b = d
+            .new_buffer(BufferDesc {
+                length: size,
+                options: vec![OptionSet::ResourceOptions(0x10)],
+                pinned_gpu_address: None,
+                contents: Some(bytes),
+                no_copy: true,
+                deallocator: None,
+                zero_from: Some(PAGE),
+            })
+            .unwrap()
+            .expect("a Managed buffer over the pages");
+        let made = d.raw.work_counts();
+        let two_copies = !d.raw.properties().has_unified_memory;
+        assert_eq!(
+            (
+                made.dma_buf_imports - kept.dma_buf_imports,
+                made.dma_buf_pieces_joined - kept.dma_buf_pieces_joined,
+            ),
+            (0, 1),
+            "the buffer's pages join the kept import (two copies: {two_copies})"
+        );
+        let zeroed = match two_copies {
+            true => (1, size - PAGE),
+            false => (0, 0),
+        };
+        assert_eq!(
+            (
+                made.managed_device_copies_zeroed - kept.managed_device_copies_zeroed,
+                made.managed_bytes_zeroed - kept.managed_bytes_zeroed,
+            ),
+            zeroed,
+            "two copies: {two_copies}"
+        );
+        let out = crate::gpu::resource::tests::shared(size);
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        let copy = BlitCmd::CopyBufferToBuffer {
+            source_buffer: Some(&b),
+            source_offset: 0,
+            destination_buffer: Some(&out),
+            destination_offset: 0,
+            size,
+        };
+        e.encode(OnFault::Die, copy).unwrap();
+        e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert!(cb.error().is_none(), "{:?}", cb.error());
+        let read = crate::gpu::resource::tests::host_bytes_at(out.contents(), size.to_usize());
+        let (before_offset, from_offset) = read.split_at(PAGE.to_usize());
+        assert!(before_offset.iter().all(|&byte| byte == 0x5a));
+        let past = match two_copies {
+            true => 0,
+            false => 0x5a,
+        };
+        assert!(
+            from_offset.iter().all(|&byte| byte == past),
+            "two copies: {two_copies}"
+        );
+        drop((cb, e, b));
+        super::super::dma_buf::end_lingers();
+        let live = || d.raw.work_counts().dma_buf_shared_imports_live;
+        for _ in 0..wait.as_millis() {
+            if live() == before.dma_buf_shared_imports_live {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            live(),
+            before.dma_buf_shared_imports_live,
+            "the file's import freed as its linger ended"
+        );
+        drop(lease);
+        let unmapped =
+            crate::remap::wait_unimported(NonNull::new(start.cast::<u8>()).unwrap(), length, wait);
+        assert!(unmapped, "the RAM's imports went");
+        // SAFETY: the mapping made above, which nothing imports any more.
+        assert_eq!(unsafe { libc::munmap(start, length.to_usize()) }, 0);
+    }
+
     /// A no-copy buffer over the guest's RAM whose region the device keeps imported
     /// (`super::dma_buf`'s module docs, "Kept imports") goes on through the device's recovery as
     /// the same buffer: at the same GPU address, its GPU reading its pages and its fill reaching
