@@ -408,26 +408,23 @@ fn make_vmapple(
         "restored macOS {} ({})",
         restored.version, restored.build
     ));
-    first_boot(restored.first_boot, dir, progress);
+    first_boot(dir, progress);
     Ok(Vm {
         dir: dir.to_path_buf(),
         config: c,
     })
 }
 
-/// What the VM's first boot asks of the create after the restore. For EACS
-/// ([`restore::FirstBoot::Eacs`], every release) that is one boot, in which macOS makes its Data
-/// volume and resets the VM, and then reims-restore's finish step; reims-ctl starts no arm64 VM
-/// yet, so it names the step left.
-fn first_boot(first: restore::FirstBoot, dir: &Path, progress: &mut dyn FnMut(&str)) {
-    if first == restore::FirstBoot::Eacs {
-        progress(&format!(
-            "one step is left: macOS makes its Data volume at the VM's first boot and then \
-             resets the VM, which doesn't start again until it is finished; after that boot, \
-             run `reims-restore finish-eacs {}`, and the next boot goes to Setup Assistant",
-            paths::tilde(dir)
-        ));
-    }
+/// What the VM's first boot asks of the create after the restore: one boot, in which macOS makes
+/// its Data volume by EACS and resets the VM, and then reims-restore's finish step; reims-ctl
+/// starts no arm64 VM yet, so it names the step left.
+fn first_boot(dir: &Path, progress: &mut dyn FnMut(&str)) {
+    progress(&format!(
+        "one step is left: macOS makes its Data volume at the VM's first boot and then resets \
+         the VM, which doesn't start again until it is finished; after that boot, run \
+         `reims-restore finish-eacs {}`, and the next boot goes to Setup Assistant",
+        paths::tilde(dir)
+    ));
 }
 
 /// Marks a directory a VM is being made in, until its vm.toml is written.
@@ -1230,8 +1227,6 @@ mod tests {
     /// ECID past TOML's integers, fail, or wait for its cancel.
     enum Fake {
         Succeeds,
-        /// Restores macOS 14, whose first boot makes its Data volume.
-        SucceedsForEacs,
         Fails,
         WaitsForCancel,
         /// Its download waits for the cancel.
@@ -1305,16 +1300,6 @@ mod tests {
                         ecid: 0xc208_f7ea_febd_c581,
                         version: "27.2.1".into(),
                         build: "26B131".into(),
-                        first_boot: restore::FirstBoot::SetupAssistant,
-                    })
-                }
-                Fake::SucceedsForEacs => {
-                    std::fs::rename(r.dir.join("disk.img.part"), r.dir.join("disk.img")).unwrap();
-                    Ok(restore::Restored {
-                        ecid: 0x1234,
-                        version: "14.6.1".into(),
-                        build: "23G93".into(),
-                        first_boot: restore::FirstBoot::Eacs,
                     })
                 }
                 Fake::Fails => {
@@ -1357,10 +1342,9 @@ mod tests {
         }
     }
 
-    /// A macOS 14 VM is made, and the create names the one step left: its first boot, then
-    /// reims-restore's finish.
+    /// The create names the one step left: the VM's first boot, then reims-restore's finish.
     #[test]
-    fn an_arm64_create_of_macos_14_names_the_step_left() {
+    fn an_arm64_create_names_the_step_left() {
         let env = crate::testenv::Env::new("create-arm64-eacs");
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let mut steps = Vec::new();
@@ -1368,7 +1352,7 @@ mod tests {
             arm64_spec(&env),
             arm64(),
             &mut |p| steps.push(p.to_string()),
-            &Fake::SucceedsForEacs,
+            &Fake::Succeeds,
             &cancel,
         )
         .unwrap();
@@ -1385,28 +1369,12 @@ mod tests {
         );
         let at = steps
             .iter()
-            .position(|s| s == "restored macOS 14.6.1 (23G93)");
+            .position(|s| s == "restored macOS 27.2.1 (26B131)");
         assert_eq!(
             at.map(|i| i + 1),
             steps.iter().position(|s| s.starts_with("one step is left"))
         );
         assert!(Registry::load().unwrap().open("t").is_ok());
-    }
-
-    #[test]
-    fn an_arm64_create_of_a_later_macos_has_no_step_left() {
-        let env = crate::testenv::Env::new("create-arm64-no-step");
-        let cancel = std::sync::atomic::AtomicBool::new(false);
-        let mut steps = Vec::new();
-        create_with(
-            arm64_spec(&env),
-            arm64(),
-            &mut |p| steps.push(p.to_string()),
-            &Fake::Succeeds,
-            &cancel,
-        )
-        .unwrap();
-        assert!(!steps.iter().any(|s| s.starts_with("one step is left")));
     }
 
     #[test]

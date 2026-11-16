@@ -85,7 +85,6 @@ fn main() -> Result<()> {
     let install = bm.vma2_identity(VARIANT_INSTALL)?;
     let erase = bm.vma2_identity(VARIANT_ERASE)?;
     let keys = AppleKeyService::default();
-    let os = install.component("OS")?.path().context("OS")?.to_owned();
     // A stand-in for the seal's root hash: Apple's, so that a listing with a restored disk's
     // tickets matches that disk's root_hash.img4 byte for byte.
     let seal = img4::RootHash::parse(
@@ -99,9 +98,6 @@ fn main() -> Result<()> {
         )?
         .payload,
     )?;
-    let patterns = image::open_container(&ipsw, &os, &keys)?
-        .system_volume()?
-        .read_file("/System/Library/Templates/Data.symlink-patterns")?;
     let b = |s: &str| -> Arc<[u8]> { s.as_bytes().into() };
     let ticket = |name: &str, placeholder: &str| -> Result<Arc<[u8]>> {
         Ok(match &args.tickets {
@@ -128,13 +124,7 @@ fn main() -> Result<()> {
         policy_recovery: ("POLICY.recovery.img4".into(), b("policy recovery")),
         recovery_os_policy: b("recovery os policy"),
         ronh: "RONH".into(),
-        receipt: plan::receipt(
-            bm.product_version()?,
-            bm.build_version()?,
-            &String::from_utf8_lossy(&patterns),
-            std::time::SystemTime::now(),
-        ),
-        eacs_store: None,
+        eacs_store: Uuid::nil(),
     })?;
     let masks = [
         (args.group.to_string().to_uppercase(), "<G>"),
@@ -157,14 +147,6 @@ fn main() -> Result<()> {
             println!("== {container} {} {:?}", v.name, v.role);
             let entries = match &v.content {
                 Content::Entries(e) => e,
-                Content::DataTemplate { image, receipt } => {
-                    println!(
-                        "   (the data template of {image}, and a receipt of {} bytes, {})",
-                        receipt.len(),
-                        hex16(receipt)
-                    );
-                    continue;
-                }
                 other => {
                     println!("   ({other:?})");
                     continue;

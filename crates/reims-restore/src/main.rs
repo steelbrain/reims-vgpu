@@ -153,15 +153,13 @@ fn restore(ipsw: PathBuf, dir: PathBuf, disk_gib: u64, ecid: Option<u64>) -> Res
         job.dir.display(),
         done.ecid
     );
-    if done.first_boot == pipeline::FirstBoot::Eacs {
-        println!(
-            "macOS {} makes its Data volume at the VM's first boot, then resets the VM, which \
-             then doesn't start. Once it has, run `reims-restore finish-eacs {}`; the next boot \
-             goes to Setup Assistant.",
-            done.version,
-            job.dir.display()
-        );
-    }
+    println!(
+        "macOS {} makes its Data volume at the VM's first boot, then resets the VM, which \
+         then doesn't start. Once it has, run `reims-restore finish-eacs {}`; the next boot \
+         goes to Setup Assistant.",
+        done.version,
+        job.dir.display()
+    );
     Ok(())
 }
 

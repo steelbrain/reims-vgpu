@@ -63,28 +63,6 @@ pub struct Restored {
     pub version: String,
     /// Its build, such as `24G90`.
     pub build: String,
-    /// What the VM's first boot does.
-    pub first_boot: FirstBoot,
-}
-
-/// What a restored VM's first boot does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FirstBoot {
-    /// It goes to Setup Assistant.
-    SetupAssistant,
-    /// Every release ([`data_by_eacs`]): it makes the Data volume by EACS and resets the VM, and
-    /// then Ambrosia finds no LocalPolicy and stops. [`finish_eacs`] on the VM's directory then makes
-    /// it bootable, and the next boot goes to Setup Assistant.
-    Eacs,
-}
-
-/// Whether macOS `version`'s first boot makes its Data volume itself, by EACS, with the restore
-/// leaving it out: every release. The guest's keystore makes its D-key only there, and with none,
-/// once FileVault is on, no boot unwraps Data's key again **[measured, 27.0.1]**; and macOS 14's
-/// kernel refuses an unencrypted Data volume **[measured]** (docs/design.md, "The Data volume, by
-/// EACS").
-pub fn data_by_eacs(_version: &str) -> bool {
-    true
 }
 
 /// The files a restore leaves in the VM's directory.
@@ -98,10 +76,10 @@ pub const MACHINE_IDENTIFIER: &str = "machine-identifier.bin";
 /// Ambrosia's configuration bundle of the patches that swap the guest's LocalPolicy anchors for
 /// the project's and refuse its local policy nonce updates.
 pub const CONFIG: &str = "config.cpio";
-/// For [`FirstBoot::Eacs`], until [`finish_eacs`]: the iBoot system container's partition as the
+/// Until [`finish_eacs`]: the iBoot system container's partition as the
 /// restore wrote it, sparse.
 pub const EACS_ISC: &str = "isc.pre-eacs";
-/// For [`FirstBoot::Eacs`], until [`finish_eacs`]: the auxiliary storage as the restore wrote it.
+/// Until [`finish_eacs`]: the auxiliary storage as the restore wrote it.
 pub const EACS_AUX: &str = "aux.pre-eacs";
 
 /// The auxiliary storage's size as QEMU attaches it.
@@ -145,12 +123,9 @@ pub fn run(r: &Restore, events: &mut dyn FnMut(Event), cancel: &AtomicBool) -> R
         ),
     };
     events(Event::Note(format!("macOS {version} ({build})")));
-    let eacs = data_by_eacs(&version);
-    if eacs {
-        events(Event::Note(
-            "macOS makes its Data volume at its first boot: the restore leaves it out".into(),
-        ));
-    }
+    events(Event::Note(
+        "macOS makes its Data volume at its first boot: the restore leaves it out".into(),
+    ));
 
     check_dir(&r.dir)?;
     ensure!(
@@ -163,7 +138,7 @@ pub fn run(r: &Restore, events: &mut dyn FnMut(Event), cancel: &AtomicBool) -> R
     let secrets = Secrets::generate(r.ecid, &table)?;
     cancelled(cancel)?;
 
-    step(events, "Reading the system image's data template");
+    step(events, "Reading the system image");
     let keys = AppleKeyService::default();
     let os = install
         .component("OS")?
@@ -181,15 +156,6 @@ pub fn run(r: &Restore, events: &mut dyn FnMut(Event), cancel: &AtomicBool) -> R
         images,
     );
     check_space(&r.dir, free_space(&r.dir)?, need)?;
-    let patterns = system
-        .read_file(DATA_PATTERNS)
-        .with_context(|| format!("read {DATA_PATTERNS} from {os}"))?;
-    let receipt = plan::receipt(
-        &version,
-        &build,
-        &String::from_utf8_lossy(&patterns),
-        SystemTime::now(),
-    );
     cancelled(cancel)?;
 
     step(events, "Asking Apple to sign the VM's tickets");
@@ -290,8 +256,7 @@ pub fn run(r: &Restore, events: &mut dyn FnMut(Event), cancel: &AtomicBool) -> R
         ),
         recovery_os_policy: recovery_os_policy.into(),
         ronh: ronh.iter().map(|b| format!("{b:02X}")).collect(),
-        receipt,
-        eacs_store: eacs.then_some(table.main().guid),
+        eacs_store: table.main().guid,
     })?;
     cancelled(cancel)?;
 
@@ -308,23 +273,13 @@ pub fn run(r: &Restore, events: &mut dyn FnMut(Event), cancel: &AtomicBool) -> R
         root_hash: None,
         t: nanos(SystemTime::now()),
     };
-    let written = write(&files, &table, &aux, &the_plan, src, events, cancel).and_then(|()| {
-        if eacs {
-            files.keep_for_eacs(&table)
-        } else {
-            Ok(())
-        }
-    });
-    match written.and_then(|()| files.finish(secrets.ecid, &bundle, eacs)) {
+    let written = write(&files, &table, &aux, &the_plan, src, events, cancel)
+        .and_then(|()| files.keep_for_eacs(&table));
+    match written.and_then(|()| files.finish(secrets.ecid, &bundle)) {
         Ok(()) => Ok(Restored {
             ecid: secrets.ecid,
             version,
             build,
-            first_boot: if eacs {
-                FirstBoot::Eacs
-            } else {
-                FirstBoot::SetupAssistant
-            },
         }),
         Err(e) => {
             files.discard();
@@ -332,10 +287,6 @@ pub fn run(r: &Restore, events: &mut dyn FnMut(Event), cancel: &AtomicBool) -> R
         }
     }
 }
-
-/// Where the system image keeps the patterns of its data template's paths that the Data volume
-/// links to instead of copying.
-const DATA_PATTERNS: &str = "/System/Library/Templates/Data.symlink-patterns";
 
 impl Secrets {
     /// Draws them, with `ecid` when given, for a disk of `table`.
@@ -420,8 +371,8 @@ fn cancelled(cancel: &AtomicBool) -> Result<()> {
 }
 
 /// What a restore writes beyond the system volume and the images it copies: the plan's own files
-/// (86 MB on 14.6.1), the Data volume's copy of the data template (the Data volume a restore of
-/// 14.6.1 by Apple's restore OS made took 207 MB) and APFS's metadata, with room to spare.
+/// (86 MB on 14.6.1), the copies kept for [`finish_eacs`] and APFS's metadata, with room to
+/// spare.
 const SLACK: u64 = 2 << 30;
 
 /// The space a restore writes: the system volume as the OS image allocates it (`system` bytes),
@@ -519,8 +470,8 @@ impl Files {
         Ok(())
     }
 
-    /// For [`FirstBoot::Eacs`]: keeps the iBoot system container's partition of the disk and the
-    /// auxiliary storage as written, for [`finish_eacs`].
+    /// Keeps the iBoot system container's partition of the disk and the auxiliary storage as
+    /// written, for [`finish_eacs`].
     fn keep_for_eacs(&self, table: &Table) -> Result<()> {
         let disk = File::open(self.part(DISK)).context("open the disk")?;
         let isc = table.isc();
@@ -530,8 +481,8 @@ impl Files {
     }
 
     /// Writes `aux.img`, the machine identifier and the anchor bundle, and moves the disks into
-    /// place, and, for `eacs`, the copies [`finish_eacs`] puts back.
-    fn finish(&self, ecid: u64, bundle: &[u8], eacs: bool) -> Result<()> {
+    /// place, with the copies [`finish_eacs`] puts back.
+    fn finish(&self, ecid: u64, bundle: &[u8]) -> Result<()> {
         let p = self.part(CONFIG);
         std::fs::write(&p, bundle).with_context(|| format!("write {}", p.display()))?;
         let aux = self.part(AUX);
@@ -555,12 +506,15 @@ impl Files {
         }
         // The machine identifier goes last; a failed move takes back those made before it.
         let mut moved = Vec::new();
-        let mut names = vec![DISK, AUX_TRIMMED, AUX, CONFIG];
-        if eacs {
-            names.extend([EACS_ISC, EACS_AUX]);
-        }
-        names.push(MACHINE_IDENTIFIER);
-        for name in names {
+        for name in [
+            DISK,
+            AUX_TRIMMED,
+            AUX,
+            CONFIG,
+            EACS_ISC,
+            EACS_AUX,
+            MACHINE_IDENTIFIER,
+        ] {
             let to = self.dir.join(name);
             if let Err(e) = std::fs::rename(self.part(name), &to) {
                 for m in moved {
@@ -617,7 +571,7 @@ fn copy_sparse(from: &File, at: u64, len: u64, to: &Path, to_at: u64) -> Result<
     Ok(())
 }
 
-/// Makes a VM whose restore left its Data volume to EACS ([`FirstBoot::Eacs`]) bootable, after
+/// Makes a VM whose restore left its Data volume to EACS bootable, after
 /// its first boot made the Data volume and reset: puts the iBoot system container back as the
 /// restore wrote it (EACS deleted the macOS LocalPolicy, which only the restore can sign) and the
 /// policy nonces back into NVRAM ([`aux::put_back_policy_entries`]), keeping what the guest
@@ -723,10 +677,19 @@ mod tests {
         let f = Files::new(&d);
         f.make(1 << 20).unwrap();
         std::fs::write(f.part(AUX_TRIMMED), b"nvram").unwrap();
-        f.finish(0x1234_5678_9abc_def0, b"070701 a bundle", false)
-            .unwrap();
+        std::fs::write(f.part(EACS_ISC), b"isc").unwrap();
+        std::fs::write(f.part(EACS_AUX), b"aux").unwrap();
+        f.finish(0x1234_5678_9abc_def0, b"070701 a bundle").unwrap();
         assert_eq!(std::fs::read(d.join(CONFIG)).unwrap(), b"070701 a bundle");
-        for n in [DISK, AUX, AUX_TRIMMED, CONFIG, MACHINE_IDENTIFIER] {
+        for n in [
+            DISK,
+            AUX,
+            AUX_TRIMMED,
+            CONFIG,
+            EACS_ISC,
+            EACS_AUX,
+            MACHINE_IDENTIFIER,
+        ] {
             assert!(d.join(n).is_file(), "{n}");
             assert!(!f.part(n).exists(), "{n}.part");
         }
@@ -742,13 +705,6 @@ mod tests {
         assert_eq!(ecid, Some(0x1234_5678_9abc_def0));
         assert!(check_dir(&d).is_err());
         std::fs::remove_dir_all(&d).unwrap();
-    }
-
-    #[test]
-    fn every_release_makes_its_data_volume_by_eacs() {
-        for v in ["14.6.1", "15.6.1", "26.6.2", "27.0.1", "27.2.1"] {
-            assert!(data_by_eacs(v), "{v}");
-        }
     }
 
     fn write_at(p: &Path, at: u64, b: &[u8]) {
@@ -792,7 +748,7 @@ mod tests {
         let a = aux::trimmed(&n, b"a ticket of the tests' own").unwrap();
         std::fs::write(f.part(AUX_TRIMMED), &a).unwrap();
         f.keep_for_eacs(&table).unwrap();
-        f.finish(7, b"a bundle", true).unwrap();
+        f.finish(7, b"a bundle").unwrap();
         (d, table, n, a)
     }
 
@@ -911,8 +867,10 @@ mod tests {
         // The machine identifier's place is taken by a directory with a file in it.
         std::fs::create_dir(d.join(MACHINE_IDENTIFIER)).unwrap();
         std::fs::write(d.join(MACHINE_IDENTIFIER).join("x"), b"x").unwrap();
-        assert!(f.finish(1, b"a bundle", false).is_err());
-        for n in [DISK, AUX, AUX_TRIMMED, CONFIG] {
+        std::fs::write(f.part(EACS_ISC), b"isc").unwrap();
+        std::fs::write(f.part(EACS_AUX), b"aux").unwrap();
+        assert!(f.finish(1, b"a bundle").is_err());
+        for n in [DISK, AUX, AUX_TRIMMED, CONFIG, EACS_ISC, EACS_AUX] {
             assert!(!d.join(n).exists(), "{n} was left in place");
         }
         std::fs::remove_dir_all(d.join(MACHINE_IDENTIFIER)).unwrap();

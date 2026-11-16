@@ -4,8 +4,7 @@
 //! from where the source keeps them.
 //!
 //! A caller may replace any entry with a symbolic link (nothing below a replaced directory is
-//! copied), and add files of its own in directories the copy holds. This is how a restore makes
-//! the Data volume from the system image's data template (docs/design.md, "The disk").
+//! copied), and add files of its own in directories the copy holds.
 //!
 //! The records copied are those a data template holds: inodes (with their name and data-stream
 //! fields), directory entries, attributes (held in their record, or in a data stream such as a

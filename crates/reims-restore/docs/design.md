@@ -74,9 +74,9 @@ case-insensitive. A fresh restore has these, in this order **[vz]**:
   Hardware holds the directories `FactoryData/System/Library/Caches/com.apple.factorydata` and
   `MobileActivation`; VZ's restore also leaves the logs of an activation request there, which
   this one doesn't make.
-- **Container:** `Macintosh HD` (role System), Preboot, Recovery, Update and Data (role Data).
-  System and Data form the volume group G, whose UUID is the Data volume's. There is no VM volume:
-  the first boot makes it, and the Data volume too ("The Data volume, by EACS").
+- **Container:** `Macintosh HD` (role System), Preboot, Recovery and Update. The system volume
+  is in the volume group G, whose UUID the Data volume the first boot makes takes ("The Data
+  volume, by EACS"). There is no VM volume: the first boot makes it too.
   - **The system volume** is the IPSW's OS image's volume, sealed by reims-apfs with its own
     node layout, so its root hash is ours, not the one the IPSW's signed `root_hash` carries
     ("The system volume's seal"). Its snapshot is `com.apple.os.update-<root hash>`.
@@ -102,26 +102,8 @@ case-insensitive. A fresh restore has these, in this order **[vz]**:
     `/<G>/usr/standalone/firmware/arm64eBaseSystem.dmg`, the IPSW's BaseSystem, which the boot
     directory links to.
   - **Update**: the directories `Firmware`, `Hardware`, `Controller` and `db`.
-  - **Data**: the system volume's data template, `/System/Library/Templates/Data`, copied as
-    it is (modes, owners, flags, extended attributes, its own links, and the times the OS image
-    holds before it is sealed), except where the 9 patterns of
-    `/System/Library/Templates/Data.symlink-patterns` match **[vz]**. Each pattern is a glob from
-    the template's root, `*` within one component and `**` any depth:
-    - one ending in `/` matches a directory, which becomes a symbolic link to
-      `<one ../ per component of its parent>System/Library/Templates/Data/<path>/`, the target
-      ending in `/`; nothing below it is copied;
-    - any other matches files, each a link of the same form without the final `/`
-      (`Library/User Pictures/**` links every file below and keeps its directories).
-
-    A link keeps the permissions, owner and flags of the entry it replaces (`SF_RESTRICTED` on
-    the asset directories, 0644 on the pictures), as VZ's do **[vz]**.
-
-    The volume also gets the template's receipt,
-    `Library/Apple/System/Library/Receipts/com.apple.files.data-template.plist` (XML, mode
-    0666, `SF_RESTRICTED`), listing the patterns without their final `/` (`plan::receipt`). On
-    27.2.1 this predicts the 12,796 entries of VZ's Data volume path for path, link for link. VZ's
-    restore also rewrites the template's `com.apple.files.data-template.bom` (2,944,805 bytes to
-    2,716,958); this restore copies the template's as it is.
+  - **Data**: none. The guest's first boot makes it by EACS, from the system volume's data
+    template, and Preboot holds the cookie that asks for that ("The Data volume, by EACS").
 - **RecoveryOSContainer:** one Recovery volume: `/3D3287DE-280D-4619-AAAB-D97469CA9C71/boot/<SFR
   hash>/` with `BuildManifest.plist`, the SFR manifest, the stitched objects and
   `arm64eBaseSystem.dmg`.
@@ -336,7 +318,7 @@ made **[measured]**. With `aptk` alone, 14.6.1's keystore makes the D-key and th
 
 ## The Data volume, by EACS
 
-Every release's first boot makes its Data volume itself (`pipeline::data_by_eacs`), for two
+Every release's first boot makes its Data volume itself (`plan::eacs_cookie`), for two
 reasons:
 - The guest's keystore makes its D-key, under which an encrypted volume's keys are wrapped, only
   when EACS (erase all content and settings) makes Data. A 15.6.1, 26.6.2 or 27.0.1 VM restored
@@ -371,7 +353,7 @@ Data out and has the first boot make it, by EACS:
   ean storage holds only `aptk`. The next boot unwraps the D-key, unlocks Data (boot mode
   `_autounlock`) and goes to Setup Assistant **[measured]**.
 
-So every VM takes one boot of the guest before it is ready (`pipeline::FirstBoot::Eacs`):
+So every VM takes one boot of the guest before it is ready (`pipeline::finish_eacs` after it):
 reims-ctl's `create` and the CLI's `restore` end by naming that boot and the step after it,
 `reims-restore finish-eacs DIR`. On a host, that boot needs what any boot does: QEMU's `vmapple`
 with Ambrosia, under HVF on a Mac or KVM on arm64 Linux.
@@ -413,8 +395,8 @@ Each image is read where it lies, as the disk is written: nothing is unpacked to
 - Before it writes, a restore needs the space it writes free where the VM goes: the system
   volume as the OS image allocates it, the images it copies whole as the IPSW stores them (the
   BaseSystem twice, the Cryptex1 images), 2 GiB for the rest (the plan's own files, 86 MB on
-  14.6.1; the Data volume's template, 207 MB there **[measured]**; APFS's metadata), and the
-  auxiliary storage twice. Every file is written uncompressed, so this is more than a restore by
+  14.6.1 **[measured]**; the copies kept for `finish_eacs`; APFS's metadata), and the auxiliary
+  storage twice. Every file is written uncompressed, so this is more than a restore by
   Virtualization.framework takes, which compresses some (a 27.2.1 restore took 25.1 GiB from a
   23.8 GiB IPSW **[measured]**). The disk is at least 32 GiB.
 - SIGINT or SIGTERM cancels a restore from the CLI between steps, and the temporary files are

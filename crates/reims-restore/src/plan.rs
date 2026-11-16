@@ -25,7 +25,6 @@ pub enum Role {
     Preboot,
     Recovery,
     Update,
-    Data,
     Xart,
     Hardware,
 }
@@ -37,7 +36,6 @@ impl Role {
             Role::System => 0x1,
             Role::Recovery => 0x4,
             Role::Preboot => 0x10,
-            Role::Data => 0x40,
             Role::Update => 0xc0,
             Role::Xart => 0x100,
             Role::Hardware => 0x140,
@@ -106,10 +104,6 @@ pub enum Content {
         mtree: String,
         root_hash: String,
     },
-    /// The Data volume: the OS image's `/System/Library/Templates/Data`, with the paths its
-    /// `Data.symlink-patterns` names made links into the template, and `receipt` (the template's
-    /// receipt plist) added.
-    DataTemplate { image: String, receipt: Arc<[u8]> },
 }
 
 /// One volume.
@@ -153,12 +147,9 @@ pub struct Inputs<'a> {
     /// The recoveryOS container's LocalPolicy, from TSS, and its `ronh` in upper-case hex.
     pub recovery_os_policy: Arc<[u8]>,
     pub ronh: String,
-    /// The data template's receipt.
-    pub receipt: Arc<[u8]>,
-    /// Where the guest's first boot makes the Data volume itself, by EACS ([`eacs_cookie`]): the
-    /// main container's partition GUID, which the cookie names. `None` lays the Data volume out
-    /// from the data template.
-    pub eacs_store: Option<Uuid>,
+    /// The main container's partition GUID, which EACS's cookie names: the guest's first boot
+    /// makes the Data volume itself ([`eacs_cookie`]).
+    pub eacs_store: Uuid,
 }
 
 /// Where a restore that leaves the Data volume out puts EACS's cookie, under the volume group's
@@ -591,14 +582,12 @@ pub fn plan(i: &Inputs<'_>) -> Result<Plan> {
         pb.dirs(&format!("Cryptexes/{d}"), 0o777);
     }
     pb.dirs(&format!("staging/{g}/boot/{boot_dir}"), 0o755);
-    if let Some(store) = i.eacs_store {
-        pb.dirs(&format!("{g}/var/db"), 0o755);
-        pb.bytes(
-            &format!("{g}/{EACS_COOKIE}"),
-            &eacs_cookie(i.group, store),
-            0o644,
-        );
-    }
+    pb.dirs(&format!("{g}/var/db"), 0o755);
+    pb.bytes(
+        &format!("{g}/{EACS_COOKIE}"),
+        &eacs_cookie(i.group, i.eacs_store),
+        0o644,
+    );
 
     // The main container's Recovery.
     let mut rec = Tree::default();
@@ -658,7 +647,7 @@ pub fn plan(i: &Inputs<'_>) -> Result<Plan> {
         group,
         content,
     };
-    let mut main = vec![
+    let main = vec![
         vol(
             "Macintosh HD",
             Role::System,
@@ -673,18 +662,6 @@ pub fn plan(i: &Inputs<'_>) -> Result<Plan> {
         vol("Recovery", Role::Recovery, None, entries(rec)),
         vol("Update", Role::Update, None, entries(update)),
     ];
-    if i.eacs_store.is_none() {
-        main.push(Volume {
-            name: "Data",
-            role: Role::Data,
-            uuid: i.group,
-            group: Some(i.group),
-            content: Content::DataTemplate {
-                image: os,
-                receipt: i.receipt.clone(),
-            },
-        });
-    }
     Ok(Plan {
         isc: vec![
             vol("iSCPreboot", Role::Preboot, None, entries(isc)),
@@ -749,54 +726,6 @@ fn bootability(t: &mut Tree, at: &str, names: &[String]) {
     add(t, "Restore/Bootability/", None);
 }
 
-/// The data template's receipt, as the restore leaves it in
-/// `Library/Apple/System/Library/Receipts/com.apple.files.data-template.plist` **[vz]**.
-pub fn receipt(
-    version: &str,
-    build: &str,
-    patterns: &str,
-    now: std::time::SystemTime,
-) -> Arc<[u8]> {
-    let (mut dirs, mut files) = (Vec::new(), Vec::new());
-    for p in patterns.lines().map(str::trim).filter(|p| !p.is_empty()) {
-        match p.strip_suffix('/') {
-            Some(d) => dirs.push(Value::String(d.into())),
-            None => files.push(Value::String(p.into())),
-        }
-    }
-    let mut info = Dictionary::new();
-    info.insert("SymlinkedDirectoryPatterns".into(), Value::Array(dirs));
-    info.insert("SymlinkedFilePatterns".into(), Value::Array(files));
-    info.insert("SystemBuild".into(), Value::String(build.into()));
-    info.insert("SystemVersion".into(), Value::String(version.into()));
-    let mut d = Dictionary::new();
-    d.insert("AdditionalInformation".into(), Value::Dictionary(info));
-    // The install date in whole seconds, as VZ's restore writes it **[vz]**.
-    let secs = now
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
-    d.insert("InstallDate".into(), Value::Date(now.into()));
-    d.insert("InstallPrefixPath".into(), Value::String("/".into()));
-    d.insert(
-        "InstallProcessName".into(),
-        Value::String("restored_external".into()),
-    );
-    d.insert(
-        "PackageGroups".into(),
-        Value::Array(vec![
-            Value::String("com.apple.FindSystemFiles.pkg-group".into()),
-            Value::String("com.apple.OSTemplate.pkg-group".into()),
-        ]),
-    );
-    d.insert(
-        "PackageIdentifier".into(),
-        Value::String("com.apple.files.data-template".into()),
-    );
-    d.insert("PackageVersion".into(), Value::String(version.into()));
-    xml_plist::to_xml(&Value::Dictionary(d)).into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -822,8 +751,7 @@ mod tests {
             policy_recovery: ("P.recovery.img4".into(), b("policy recovery")),
             recovery_os_policy: b("recovery os policy"),
             ronh: "RONH".into(),
-            receipt: b("receipt"),
-            eacs_store: None,
+            eacs_store: Uuid::from_u128(0x2471_2d74_0861_48b6_96ce_8cf3_1423_da73),
         }
     }
 
@@ -913,20 +841,15 @@ mod tests {
         }
     }
 
-    /// For EACS: no Data volume, and the cookie that has the first boot make it, naming the
-    /// group and the main container's partition as the obliterator read them **[measured]**.
+    /// No Data volume, and the cookie that has the first boot make it by EACS, naming the group
+    /// and the main container's partition as the obliterator read them **[measured]**.
     #[test]
-    fn a_data_volume_made_by_eacs_is_left_out_for_the_cookie() {
+    fn the_data_volume_is_left_to_eacs_by_the_cookie() {
         let bm = BuildManifest::parse(&manifest()).unwrap();
         let names = names();
         let has = |_: &str| true;
-        let mut i = inputs(&bm, &names, &has);
+        let i = inputs(&bm, &names, &has);
         let cookie = format!("{}/{EACS_COOKIE}", i.group.to_string().to_uppercase());
-        let with_data = plan(&i).unwrap();
-        assert!(with_data.main.iter().any(|v| v.role == Role::Data));
-        assert!(!by_path(&with_data.main[1]).contains_key(&cookie));
-        let store = Uuid::from_u128(0x2471_2d74_0861_48b6_96ce_8cf3_1423_da73);
-        i.eacs_store = Some(store);
         let p = plan(&i).unwrap();
         let roles: Vec<_> = p.main.iter().map(|v| v.role).collect();
         assert_eq!(
@@ -940,7 +863,7 @@ mod tests {
         let Node::File(Data::Bytes(b)) = &e.node else {
             panic!("{:?}", e.node)
         };
-        assert_eq!(&b[..], &eacs_cookie(i.group, store)[..]);
+        assert_eq!(&b[..], &eacs_cookie(i.group, i.eacs_store)[..]);
         let v = Value::from_reader_xml(&b[..]).unwrap();
         let d = v.as_dictionary().unwrap();
         assert_eq!(d.get("MigrationMode"), Some(&Value::Integer(2.into())));
@@ -959,12 +882,9 @@ mod tests {
             "24712D74-0861-48B6-96CE-8CF31423DA73"
         );
         assert_eq!(o.get("DisplayProgressBar"), Some(&Value::Boolean(true)));
-        // Preboot gains only the cookie and its directories.
+        // Under the group's `var`, Preboot holds only the cookie and its directories.
         let var = format!("{}/var", i.group.to_string().to_uppercase());
-        let rest: Vec<&String> = pb.keys().filter(|k| !k.starts_with(&var)).collect();
-        let before = by_path(&with_data.main[1]);
-        assert_eq!(rest, before.keys().collect::<Vec<_>>());
-        assert_eq!(pb.len(), before.len() + 3);
+        assert_eq!(pb.keys().filter(|k| k.starts_with(&var)).count(), 3);
     }
 
     #[test]
@@ -989,13 +909,11 @@ mod tests {
                 ("Macintosh HD", Role::System),
                 ("Preboot", Role::Preboot),
                 ("Recovery", Role::Recovery),
-                ("Update", Role::Update),
-                ("Data", Role::Data)
+                ("Update", Role::Update)
             ]
         );
         let g = "00000000-0000-0000-0000-0000BF304653";
-        assert_eq!(p.main[4].uuid.to_string().to_uppercase(), g);
-        assert_eq!(p.main[0].group, Some(p.main[4].uuid));
+        assert_eq!(p.main[0].group.unwrap().to_string().to_uppercase(), g);
 
         let pb = by_path(&p.main[1]);
         let h = hash_name(b"boot manifest");
@@ -1126,35 +1044,5 @@ mod tests {
             .map(|(p, d)| ((*p).to_owned(), *d, (501, 20)))
             .collect();
         assert_eq!(got, want);
-    }
-
-    #[test]
-    fn the_receipt_lists_the_patterns_without_their_slashes() {
-        let r = receipt(
-            "27.2.1",
-            "26B131",
-            "A/*.x/Contents/\nB/**\n",
-            std::time::UNIX_EPOCH + std::time::Duration::new(1_794_457_782, 955_767_000),
-        );
-        let v = Value::from_reader_xml(std::io::Cursor::new(&r[..])).unwrap();
-        let d = v.as_dictionary().unwrap();
-        let info = d["AdditionalInformation"].as_dictionary().unwrap();
-        assert_eq!(
-            info["SymlinkedDirectoryPatterns"],
-            Value::Array(vec![Value::String("A/*.x/Contents".into())])
-        );
-        assert_eq!(
-            info["SymlinkedFilePatterns"],
-            Value::Array(vec![Value::String("B/**".into())])
-        );
-        assert_eq!(
-            d["InstallProcessName"],
-            Value::String("restored_external".into())
-        );
-        assert!(
-            std::str::from_utf8(&r)
-                .unwrap()
-                .contains("<date>2026-11-12T04:29:42Z</date>")
-        );
     }
 }
