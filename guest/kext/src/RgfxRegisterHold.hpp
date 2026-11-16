@@ -16,6 +16,19 @@
 // head's start keeps display 0's service from registering for long. With one display the hold is
 // never opened, and display 0's service registers within the class's start, as before the hold.
 //
+// Registering back to back is not enough on its own. A process takes the services of one batch of
+// notifications: the first service registered sends the batch, and the batch holds every service
+// registered before the process has read its last one. Each registration matches on a thread of
+// its own, so a second service can come after a process has read the first and found no more (an
+// arm64 15.6.1 guest under TCG: its WindowServer took display 1's service alone, and gave up on
+// display 0's). So the release opens a window (RgfxRegisterWindow) until every service released
+// has matched, its notifications delivered, or the window's deadline has passed, and in the window
+// a process's read of one of the properties the framework reads of each service it takes, before
+// it asks for the next (read from macOS 27.0.1's iomfb_match_callback: "dfr", "AppleTV" and
+// "external"), waits for the window to close, so the services it has not read yet are in its batch
+// by then. The kernel's own reads, the services' matching among them, never wait, nor does a read
+// of any other key, which a process's matching may make with the registry's notification lock held.
+//
 // Header-only and free of the kernel's headers, so its native test (tests/register_hold_test.cpp)
 // builds it as the kext does.
 //
@@ -74,6 +87,28 @@ struct RgfxRegisterHold {
 		held = 0;
 		return out;
 	}
+};
+
+// How long the window after the release lasts at most, in nanoseconds: a process's property read
+// waits no longer than this for the released services to match.
+constexpr uint64_t kRgfxRegisterWindowNs = 5000000000ull;
+
+struct RgfxRegisterWindow {
+	// Whether the window is open: from the release to the services' matching or the deadline.
+	bool open = false;
+	// When the window closes at the latest, in the caller's clock.
+	uint64_t deadline = 0;
+
+	void begin(uint64_t due)
+	{
+		open = true;
+		deadline = due;
+	}
+	void end() { open = false; }
+
+	// Whether a read of a framebuffer's property waits at `now`: the window is open and before its
+	// deadline, and the read is a process's (`byProcess`): the kernel's never waits.
+	bool waits(bool byProcess, uint64_t now) const { return open && byProcess && now < deadline; }
 };
 
 #endif // RGFX_REGISTER_HOLD_HPP_

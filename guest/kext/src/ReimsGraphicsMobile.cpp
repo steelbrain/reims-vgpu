@@ -49,6 +49,7 @@
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOLib.h>
 #include <kern/clock.h>
+#include <kern/task.h>
 #include <libkern/libkern.h>
 
 #include "RgfxDisplayIdentity.hpp"
@@ -320,6 +321,25 @@ void ReimsGraphics::releaseRegistrations()
 	IOLockUnlock(stateLock);
 	if (!held)
 		return;
+	// The window opens before the first service registers, so no process can read a property of
+	// one between its notification and the others' (RgfxRegisterHold.hpp).
+	if (registerLock && registerCall) {
+		uint64_t due = 0;
+		clock_interval_to_deadline(static_cast<uint32_t>(kRgfxRegisterWindowNs / 1000000),
+		                           kMillisecondScale, &due);
+		IOLockLock(registerLock);
+		releasedDisplays |= held;
+		for (UInt32 d = 0; d < RGFX_DISPLAYS_MAX; d++)
+			if (held & (1u << d))
+				releasedOptions[d] = options[d];
+		registerWindow.begin(due);
+		IOLockUnlock(registerLock);
+		// The call holds display 0's framebuffer; one pending already takes these too.
+		retain();
+		if (thread_call_enter(registerCall))
+			release();
+		return;
+	}
 	UInt32 registered = 0;
 	for (UInt32 d = 0; d < RGFX_DISPLAYS_MAX; d++) {
 		if (!(held & (1u << d)))
@@ -331,7 +351,114 @@ void ReimsGraphics::releaseRegistrations()
 		fb->release();
 		registered++;
 	}
-	IOLog("ReimsGraphics: %u displays' services registered together\n", registered);
+	IOLog("ReimsGraphics: %u displays' services registered together, with no window\n",
+	      registered);
+}
+
+void ReimsGraphics::registrationsReleased(thread_call_param_t self, thread_call_param_t)
+{
+	ReimsGraphics *fb = static_cast<ReimsGraphics *>(self);
+	fb->registerReleased();
+	fb->release();
+}
+
+// The released services registered, display 0's first, and waited for until each has matched (its
+// busy state back to 0, its notifications delivered) or the window's deadline has passed; then the
+// window closes and the reads waiting in it go on.
+void ReimsGraphics::registerReleased()
+{
+	IOLockLock(registerLock);
+	const uint32_t held = releasedDisplays;
+	releasedDisplays = 0;
+	uint32_t options[RGFX_DISPLAYS_MAX];
+	for (UInt32 d = 0; d < RGFX_DISPLAYS_MAX; d++)
+		options[d] = releasedOptions[d];
+	const uint64_t deadline = registerWindow.deadline;
+	IOLockUnlock(registerLock);
+	ReimsGraphics *fbs[RGFX_DISPLAYS_MAX];
+	UInt32 n = 0;
+	for (UInt32 d = 0; d < RGFX_DISPLAYS_MAX; d++) {
+		if (!(held & (1u << d)))
+			continue;
+		ReimsGraphics *fb = copyDisplay(d);
+		if (!fb)
+			continue;
+		fb->IOMobileFramebufferLegacy::registerService(options[d]);
+		fbs[n++] = fb;
+	}
+	UInt32 matched = 0;
+	for (UInt32 i = 0; i < n; i++) {
+		const uint64_t now = mach_absolute_time();
+		uint64_t ns = 0;
+		if (now < deadline)
+			absolutetime_to_nanoseconds(deadline - now, &ns);
+		if (ns && fbs[i]->waitQuiet(ns) == kIOReturnSuccess)
+			matched++;
+		fbs[i]->release();
+	}
+	IOLockLock(registerLock);
+	registerWindow.end();
+	IOLockWakeup(registerLock, &registerWindow, false);
+	IOLockUnlock(registerLock);
+	IOLog("ReimsGraphics: %u displays' services registered together, %u matched in the window\n",
+	      n, matched);
+}
+
+// A process's read waits for the window to close (RgfxRegisterWindow::waits): no longer than its
+// deadline.
+void ReimsGraphics::waitRegistrations()
+{
+	if (!registerLock)
+		return;
+	IOLockLock(registerLock);
+	while (registerWindow.waits(true, mach_absolute_time())) {
+		if (IOLockSleepDeadline(registerLock, &registerWindow, registerWindow.deadline,
+		                        THREAD_UNINT) == THREAD_TIMED_OUT)
+			break;
+	}
+	IOLockUnlock(registerLock);
+}
+
+// The keys IOMobileFramebuffer.framework reads of each service it takes, before it asks for the
+// next (read from macOS 27.0.1's iomfb_match_callback): "dfr", "AppleTV" and "external". Only a read
+// of one of these waits: a matching dictionary names none of them, so no process's matching, which
+// reads properties with the registry's notification lock held, waits on the services' own.
+static bool rgfxFrameworkKey(const char *key)
+{
+	return key && (!strcmp(key, "dfr") || !strcmp(key, "AppleTV") || !strcmp(key, "external"));
+}
+
+// A process reads a service's property through io_registry_entry_get_property_bin_buf, which asks
+// the service for the key by its C string, copyProperty(const char *), before any other overload
+// (read from macOS 14.6.1's and 27.0.1's kernels); IORegistryEntry's C-string overload reads its
+// table itself, not through the OSSymbol one, so this is the overload that waits.
+OSObject *ReimsGraphics::copyProperty(const char *aKey) const
+{
+	const ReimsGraphics *owner = isHead() ? device : this;
+	if (__atomic_load_n(&owner->registerWindow.open, __ATOMIC_ACQUIRE) &&
+	    current_task() != kernel_task && rgfxFrameworkKey(aKey))
+		const_cast<ReimsGraphics *>(owner)->waitRegistrations();
+	return IOMobileFramebufferLegacy::copyProperty(aKey);
+}
+
+// Display 0's, as its framebuffer stops or its start fails: the release's thread call waited for
+// and let go, the reads waiting in its window let go, and the lock freed once nothing can sleep on
+// it.
+void ReimsGraphics::freeRegistrations()
+{
+	if (thread_call_t call = registerCall) {
+		registerCall = nullptr;
+		if (thread_call_cancel_wait(call))
+			release();
+		thread_call_free(call);
+	}
+	if (registerLock) {
+		IOLockLock(registerLock);
+		registerWindow.end();
+		releasedDisplays = 0;
+		IOLockWakeup(registerLock, &registerWindow, false);
+		IOLockUnlock(registerLock);
+	}
 }
 
 // MARK: - The display as a process finds it

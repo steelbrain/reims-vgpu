@@ -93,6 +93,10 @@ public:
 	// registration until the heads have started, so every display's service registers together
 	// (RgfxRegisterHold.hpp, holdRegistration).
 	void registerService(IOOptionBits options = 0) override;
+	// IORegistryEntry: a process's read of a property waits while the released services match
+	// (RgfxRegisterWindow, waitRegistrations); the kernel's reads never wait. A process's read
+	// asks for its key by its C string first (ReimsGraphicsMobile.cpp, copyProperty).
+	OSObject *copyProperty(const char *aKey) const override;
 #endif
 
 #if defined(__x86_64__)
@@ -847,6 +851,20 @@ private:
 	RgfxRegisterHold registerHold;
 	bool holdRegistration(UInt32 display, IOOptionBits options);
 	void releaseRegistrations();
+	// What the release hands its thread call (registerCall, display 0's, made in start): the
+	// displays released and their options, and the window from the release until their services
+	// have matched (RgfxRegisterWindow), under registerLock, which waitRegistrations sleeps on.
+	// registerReleased registers them, waits for their matching, then closes the window. With no
+	// thread call, the release registers them itself, with no window.
+	IOLock *registerLock;
+	thread_call_t registerCall;
+	uint32_t releasedDisplays;
+	uint32_t releasedOptions[RGFX_DISPLAYS_MAX];
+	RgfxRegisterWindow registerWindow;
+	static void registrationsReleased(thread_call_param_t self, thread_call_param_t);
+	void registerReleased();
+	void waitRegistrations();
+	void freeRegistrations();
 	// The displays whose node the firmware placed under /arm-io, counted from display 0 to the
 	// first without one (countMobileNodes, as display 0's start takes the device): MULTI_DISPLAY
 	// is taken only where display 1 has one (RgfxFeatures.hpp), and only displays with one get a

@@ -1,6 +1,7 @@
 // The native test of RgfxRegisterHold.hpp: the arm64e framebuffers' registrations, held while
 // display 0's start starts the heads, with one display as before the hold, every display starting,
-// a head that fails to start and a hold past its deadline.
+// a head that fails to start and a hold past its deadline; and the window after the release, in
+// which a process's property reads wait for the services to match.
 #include "RgfxRegisterHold.hpp"
 
 #include <cstdio>
@@ -135,6 +136,22 @@ int main()
 
 	// The deadline leaves a process's 30 second wait room.
 	check(kRgfxRegisterHoldNs < 30000000000ull, "the hold ends well inside a process's wait");
+
+	// The window after the release: a process's read waits while it is open and before its
+	// deadline; the kernel's reads never wait; a closed window, or one past its deadline, keeps no
+	// read waiting.
+	{
+		RgfxRegisterWindow w;
+		check(!w.waits(true, 0), "no window before a release: no read waits");
+		w.begin(100);
+		check(w.waits(true, 50), "an open window: a process's read waits");
+		check(!w.waits(false, 50), "an open window: the kernel's read never waits");
+		check(!w.waits(true, 100), "at the deadline no read waits");
+		w.end();
+		check(!w.waits(true, 50), "a closed window: no read waits");
+		check(kRgfxRegisterHoldNs + kRgfxRegisterWindowNs < 30000000000ull,
+		      "the hold and the window end inside a process's wait");
+	}
 
 	std::printf("register_hold_test: %d checks passed\n", checks);
 	return 0;

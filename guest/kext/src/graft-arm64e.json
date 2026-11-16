@@ -74,6 +74,7 @@
         "stop": {},
         "free": {},
         "registerService": {},
+        "copyProperty": {},
         "start_hardware": {},
         "stop_hardware_gated": {},
         "swap_begin_gated": {},

@@ -1880,7 +1880,15 @@ bool ReimsGraphics::start(IOService *provider)
 	startDisplayPower();
 #if defined(__arm64e__)
 	// Where the heads start too, the class's start holds this display's registration, and each
-	// head's start its own, until the heads have started or the hold is due (RgfxRegisterHold.hpp).
+	// head's start its own, until the heads have started or the hold is due, and the release
+	// registers them on a thread call that keeps processes' reads waiting until they have matched
+	// (RgfxRegisterHold.hpp). Without the lock or the call, the release registers them at once.
+	if (!registerLock)
+		registerLock = IOLockAlloc();
+	if (registerLock && !registerCall)
+		registerCall = thread_call_allocate(registrationsReleased, this);
+	releasedDisplays = 0;
+	registerWindow.end();
 	{
 		uint64_t due = 0;
 		clock_interval_to_deadline(static_cast<uint32_t>(kRgfxRegisterHoldNs / 1000000),
@@ -1912,6 +1920,7 @@ fail:
 		registerHold.release();
 		IOLockUnlock(stateLock);
 	}
+	freeRegistrations();
 	stopMobile();
 #endif
 	quiesce();
@@ -1931,6 +1940,9 @@ void ReimsGraphics::stop(IOService *provider)
 		return;
 	}
 	__atomic_store_n(&started, false, __ATOMIC_RELEASE);
+#if defined(__arm64e__)
+	freeRegistrations();
+#endif
 	stopHeads();
 	stopDisplayPower();
 #if defined(__arm64e__)
@@ -2369,6 +2381,14 @@ void ReimsGraphics::free()
 #if defined(__arm64e__)
 	OSSafeReleaseNULL(mobileSwapAnswer);
 	OSSafeReleaseNULL(mobileSwapLoop);
+	// Its call let go in stop, or where the start failed; none is pending, as a pending call holds
+	// the framebuffer.
+	if (registerCall)
+		thread_call_free(registerCall);
+	registerCall = nullptr;
+	if (registerLock)
+		IOLockFree(registerLock);
+	registerLock = nullptr;
 #endif
 	super::free();
 }
