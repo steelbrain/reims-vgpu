@@ -749,15 +749,12 @@ pub fn start(vm: &Vm, host: Host) -> Result<Started> {
     }
     log.write_all(inv.shell_script("the command").as_bytes())?;
     writeln!(log, "----")?;
-    let err = log.try_clone()?;
 
     let run = launched(inv, vm.name(), &launch);
     let mut cmd = run.command();
-    cmd.current_dir(&vm.dir)
-        .stdin(std::process::Stdio::null())
-        .stdout(log)
-        .stderr(err);
-    crate::os::spawn_detached(cmd).with_context(|| format!("run {}", run.program.display()))?;
+    cmd.current_dir(&vm.dir);
+    crate::os::spawn_detached(cmd, log)
+        .with_context(|| format!("run {}", run.program.display()))?;
     let started = |pid| Started {
         pid,
         note: note.clone(),

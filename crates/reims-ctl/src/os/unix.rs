@@ -224,11 +224,15 @@ pub fn may_be_qemu(_pid: i32) -> bool {
     true
 }
 
-/// Runs `cmd` detached, and returns once it runs: in a session of its own, so closing the
-/// terminal does not end it, and reparented away from this process by a double fork, so a
-/// process that stays open never holds it as a zombie once it exits.
-pub fn spawn_detached(mut cmd: Command) -> io::Result<()> {
+/// Runs `cmd` detached, its standard input empty and its output and errors into `log`, and
+/// returns once it runs: in a session of its own, so closing the terminal does not end it, and
+/// reparented away from this process by a double fork, so a process that stays open never holds
+/// it as a zombie once it exits.
+pub fn spawn_detached(mut cmd: Command, log: std::fs::File) -> io::Result<()> {
     use std::os::unix::process::CommandExt;
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
     // SAFETY: only async-signal-safe calls between fork and exec: setsid, fork, _exit.
     unsafe {
         cmd.pre_exec(|| {

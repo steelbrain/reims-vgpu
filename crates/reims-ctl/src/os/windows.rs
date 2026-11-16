@@ -340,62 +340,246 @@ pub fn may_be_qemu(pid: i32) -> bool {
         .is_some_and(|n| n.to_ascii_lowercase().starts_with("qemu-system"))
 }
 
-/// Runs `cmd` detached, and returns once it runs: with no console (`DETACHED_PROCESS`), so
-/// closing the terminal does not end it, in a process group of its own, and out of this
-/// process's job where the job lets it go (`CREATE_BREAKAWAY_FROM_JOB`), as one an SSH login
-/// runs in, which ends its processes when the login does. Windows keeps nothing of a process
-/// that ended for its parent to collect. `cmd` is given its own standard handles: this
-/// process's are not inherited ([`without_inherited_stdio`]).
-pub fn spawn_detached(mut cmd: Command) -> io::Result<()> {
-    use std::os::windows::process::CommandExt;
+/// Runs `cmd` detached, its standard input empty and its output and errors into `log`, and
+/// returns once it runs: with no console (`DETACHED_PROCESS`), so closing the terminal does not
+/// end it, in a process group of its own, and out of this process's job where the job lets it go
+/// (`CREATE_BREAKAWAY_FROM_JOB`), as one an SSH login runs in, which ends its processes when the
+/// login does. Windows keeps nothing of a process that ended for its parent to collect.
+///
+/// It inherits those standard handles and no other (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`). A new
+/// process otherwise inherits every inheritable handle of its parent, so a QEMU would hold the
+/// pipe `reims-ctl start | tee` writes to, or any handle reims-ctl's own starter left it
+/// inheritable, and their readers would wait for the VM to end. std's `Command` takes no such
+/// list, so the process is made here from `cmd`'s program, arguments, environment changes and
+/// directory ([`command_line`], [`environment`]); its standard I/O settings are not read, nor an
+/// `env_clear`, which reims-ctl does not use.
+pub fn spawn_detached(cmd: Command, log: std::fs::File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
     use windows_sys::Win32::System::Threading::{
         CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
     };
-    let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
-    cmd.creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB);
-    without_inherited_stdio(|| match cmd.spawn() {
-        // A job that keeps its processes refuses the breakaway.
-        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
-            cmd.creation_flags(flags);
-            cmd.spawn().map(drop)
+    let null = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("NUL")?;
+    // The handles a process is given must be inheritable; these two close once it runs.
+    for h in [null.as_raw_handle(), log.as_raw_handle()] {
+        // SAFETY: both files are open.
+        if unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
+            return Err(io::Error::last_os_error());
         }
-        r => r.map(drop),
-    })
+    }
+    let line = command_line(&cmd)?;
+    let env = environment(&cmd)?;
+    let dir = cmd.get_current_dir().map(|d| wide_os(d.as_os_str()));
+    let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    let create = |flags| {
+        create_process(
+            line.clone(),
+            env.as_deref(),
+            dir.as_deref(),
+            flags,
+            null.as_raw_handle(),
+            log.as_raw_handle(),
+        )
+    };
+    match create(flags | CREATE_BREAKAWAY_FROM_JOB) {
+        // A job that keeps its processes refuses the breakaway.
+        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => create(flags),
+        r => r,
+    }
 }
 
-/// Runs `f` with this process's standard handles made uninheritable, then puts them back as they
-/// were. A new process inherits every inheritable handle of its parent, whatever standard handles
-/// it is given, so a detached QEMU would hold the pipe `reims-ctl start | tee` writes to, and
-/// the reader would wait for the VM to end.
-fn without_inherited_stdio<T>(f: impl FnOnce() -> T) -> T {
-    use windows_sys::Win32::Foundation::{
-        GetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+/// Makes the process `line` runs, with `flags`, the environment block `env` (this process's
+/// where None) and the directory `dir` (this process's where None), its standard input `stdin`
+/// and its output and errors `out`, which are the only handles it inherits.
+fn create_process(
+    mut line: Vec<u16>,
+    env: Option<&[u16]>,
+    dir: Option<&[u16]>,
+    flags: u32,
+    stdin: windows_sys::Win32::Foundation::HANDLE,
+    out: windows_sys::Win32::Foundation::HANDLE,
+) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Threading::{
+        CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+        EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList,
+        LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
+        STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
     };
-    use windows_sys::Win32::System::Console::{
-        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-    };
-    let mut inheritable = Vec::new();
-    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-        // SAFETY: the process's own standard handles, which stay open; flags are read into a u32.
-        unsafe {
-            let h = GetStdHandle(id);
-            let mut flags = 0u32;
-            if !h.is_null()
-                && h != INVALID_HANDLE_VALUE
-                && GetHandleInformation(h, &mut flags) != 0
-                && flags & HANDLE_FLAG_INHERIT != 0
-                && SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) != 0
-            {
-                inheritable.push(h);
-            }
+    /// An attribute list, deleted where it drops; its memory is the caller's.
+    struct List(LPPROC_THREAD_ATTRIBUTE_LIST);
+    impl Drop for List {
+        fn drop(&mut self) {
+            // SAFETY: a list InitializeProcThreadAttributeList made, deleted once.
+            unsafe { DeleteProcThreadAttributeList(self.0) };
         }
     }
-    let r = f();
-    for h in inheritable {
-        // SAFETY: as above.
-        unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
+    // The list holds the handles' address: the array lives past CreateProcessW.
+    let handles: Vec<HANDLE> = if stdin == out {
+        vec![stdin]
+    } else {
+        vec![stdin, out]
+    };
+    let mut size = 0usize;
+    // SAFETY: a size query, with no list.
+    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) };
+    let mut memory = vec![0usize; size.div_ceil(size_of::<usize>())];
+    let attrs: LPPROC_THREAD_ATTRIBUTE_LIST = memory.as_mut_ptr().cast();
+    // SAFETY: memory holds `size` bytes, aligned for the pointers a list holds.
+    if unsafe { InitializeProcThreadAttributeList(attrs, 1, 0, &mut size) } == 0 {
+        return Err(io::Error::last_os_error());
     }
-    r
+    let list = List(attrs);
+    // SAFETY: the list is initialized with room for one attribute; the handle list's value is
+    // the array of handles, which outlives the list's use.
+    let updated = unsafe {
+        UpdateProcThreadAttribute(
+            list.0,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            handles.as_ptr().cast(),
+            size_of_val(handles.as_slice()),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    };
+    if updated == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut si = STARTUPINFOEXW::default();
+    si.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = stdin;
+    si.StartupInfo.hStdOutput = out;
+    si.StartupInfo.hStdError = out;
+    si.lpAttributeList = list.0;
+    let mut pi = PROCESS_INFORMATION::default();
+    // SAFETY: line is NUL-terminated and writable; env is a Unicode environment block and dir
+    // NUL-terminated where given; si and its list, and the handles it names, live past the call.
+    let ok = unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+            flags | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+            env.map_or(std::ptr::null(), |e| e.as_ptr().cast()),
+            dir.map_or(std::ptr::null(), <[u16]>::as_ptr),
+            &si.StartupInfo,
+            &mut pi,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the new process's handles, this function's own, closed once.
+    unsafe {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    drop(list);
+    Ok(())
+}
+
+/// `cmd`'s program and arguments as a command line, NUL-terminated, written as std's `Command`
+/// writes one: the program in quotes, and an argument in quotes where it is empty or holds a space
+/// or a tab, the backslashes before each of its quotes and before the closing quote doubled and
+/// each quote escaped, so the C runtime's parser, QEMU's and Rust's, reads back the arguments
+/// given. The program is found as CreateProcessW finds it: by its path, as reims-ctl gives
+/// QEMU's.
+fn command_line(cmd: &Command) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    const QUOTE: u16 = b'"' as u16;
+    const BACKSLASH: u16 = b'\\' as u16;
+    let invalid = |what: &str| io::Error::new(io::ErrorKind::InvalidInput, what.to_string());
+    let program = cmd.get_program();
+    if program.encode_wide().any(|c| c == QUOTE || c == 0) {
+        return Err(invalid("a program's path with a quote or a NUL"));
+    }
+    let mut line = vec![QUOTE];
+    line.extend(program.encode_wide());
+    line.push(QUOTE);
+    for arg in cmd.get_args() {
+        line.push(u16::from(b' '));
+        let quote = arg.is_empty()
+            || arg
+                .encode_wide()
+                .any(|c| c == u16::from(b' ') || c == u16::from(b'\t'));
+        if quote {
+            line.push(QUOTE);
+        }
+        let mut backslashes = 0;
+        for c in arg.encode_wide() {
+            match c {
+                0 => return Err(invalid("an argument with a NUL")),
+                BACKSLASH => backslashes += 1,
+                _ => {
+                    if c == QUOTE {
+                        line.extend(std::iter::repeat_n(BACKSLASH, backslashes + 1));
+                    }
+                    backslashes = 0;
+                }
+            }
+            line.push(c);
+        }
+        if quote {
+            line.extend(std::iter::repeat_n(BACKSLASH, backslashes));
+            line.push(QUOTE);
+        }
+    }
+    line.push(0);
+    Ok(line)
+}
+
+/// The environment block `cmd` runs with, for CreateProcessW's `CREATE_UNICODE_ENVIRONMENT`:
+/// None, this process's own, where `cmd` changes none; else this process's with `cmd`'s changes,
+/// each name once whatever its case, as Windows matches names, in the order of their names in
+/// capitals, as Windows sorts a block.
+fn environment(cmd: &Command) -> io::Result<Option<Vec<u16>>> {
+    use std::ffi::{OsStr, OsString};
+    use std::os::windows::ffi::OsStrExt;
+    if cmd.get_envs().len() == 0 {
+        return Ok(None);
+    }
+    let key = |k: &OsStr| k.to_string_lossy().to_uppercase();
+    let mut env: std::collections::BTreeMap<String, (OsString, OsString)> = std::env::vars_os()
+        .map(|(k, v)| (key(&k), (k, v)))
+        .collect();
+    for (k, v) in cmd.get_envs() {
+        match v {
+            Some(v) => env.insert(key(k), (k.to_owned(), v.to_owned())),
+            None => env.remove(&key(k)),
+        };
+    }
+    let mut block = Vec::new();
+    for (k, v) in env.values() {
+        let start = block.len();
+        block.extend(k.encode_wide());
+        block.push(u16::from(b'='));
+        block.extend(v.encode_wide());
+        if block[start..].contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an environment variable with a NUL",
+            ));
+        }
+        block.push(0);
+    }
+    if block.is_empty() {
+        block.push(0);
+    }
+    block.push(0);
+    Ok(Some(block))
+}
+
+/// `s` in UTF-16, NUL-terminated.
+fn wide_os(s: &std::ffi::OsStr) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    s.encode_wide().chain([0]).collect()
 }
 
 /// The ways a stop ends a QEMU that QMP's `quit` did not: TerminateProcess. Windows has no
@@ -862,19 +1046,200 @@ pub fn set_at_interrupt(flag: &'static std::sync::atomic::AtomicBool) {
 mod tests {
     use super::*;
 
+    /// A process that lives about `secs` seconds: cmd.exe's ping of this host.
+    fn sleeper(secs: u32) -> Command {
+        let cmd = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
+        let mut c = Command::new(cmd);
+        c.args(["/c", &format!("ping -n {} 127.0.0.1", secs + 1)]);
+        c
+    }
+
+    /// The null device, as a detached process's log.
+    fn null_log() -> std::fs::File {
+        std::fs::OpenOptions::new().write(true).open("NUL").unwrap()
+    }
+
     /// What the stdio test runs as reims-ctl: starts a detached process that lives about 5 s,
     /// as a start does QEMU, and returns.
     #[test]
     fn start_a_detached_process() {
         if std::env::var_os("REIMS_CTL_TEST_DETACH").is_some() {
-            let mut sleeper = Command::new("cmd");
-            sleeper
-                .args(["/c", "ping -n 6 127.0.0.1"])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            spawn_detached(sleeper).unwrap();
+            spawn_detached(sleeper(5), null_log()).unwrap();
         }
+    }
+
+    /// A detached process inherits no handle but its standard ones: the reader of a pipe whose
+    /// write end its starter holds inheritable, as a starter's own starter can leave one, sees
+    /// the pipe's end once the starter closes its end, while the detached process still runs.
+    #[test]
+    fn a_detached_process_inherits_no_other_handle() {
+        use std::io::Read;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        // SAFETY: the write end is open.
+        let set = unsafe {
+            SetHandleInformation(
+                writer.as_raw_handle(),
+                HANDLE_FLAG_INHERIT,
+                HANDLE_FLAG_INHERIT,
+            )
+        };
+        assert_ne!(set, 0, "{}", io::Error::last_os_error());
+        spawn_detached(sleeper(10), null_log()).unwrap();
+        drop(writer);
+        let t = std::time::Instant::now();
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).unwrap();
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "the pipe stayed open {:?}",
+            t.elapsed()
+        );
+    }
+
+    /// The variable that has [`echo_child`] write what it was given into the file it names.
+    const ECHO: &str = "REIMS_CTL_TEST_ECHO";
+
+    /// What [`a_detached_process_runs_with_its_commands_arguments_environment_and_directory`]
+    /// runs detached: writes its arguments, a line each, then `REIMS_CTL_TEST_ECHO_VALUE`,
+    /// whether `USERPROFILE` is set, and its directory into the file `REIMS_CTL_TEST_ECHO`
+    /// names, through a file beside it, renamed once written; in a run of the tests, nothing.
+    #[test]
+    fn echo_child() {
+        let Some(out) = std::env::var_os(ECHO) else {
+            return;
+        };
+        let mut text: Vec<String> = std::env::args().skip(1).collect();
+        text.push(std::env::var("REIMS_CTL_TEST_ECHO_VALUE").unwrap_or_default());
+        text.push(std::env::var_os("USERPROFILE").is_some().to_string());
+        text.push(std::env::current_dir().unwrap().display().to_string());
+        let out = std::path::PathBuf::from(out);
+        let part = out.with_extension("part");
+        std::fs::write(&part, text.join("\n")).unwrap();
+        std::fs::rename(&part, &out).unwrap();
+    }
+
+    /// A detached process runs with its command's arguments as given, spaces, quotes and
+    /// backslashes in them included, its command's environment changes on this process's
+    /// environment, a name in any case, in its command's directory, and with its output in the
+    /// log.
+    #[test]
+    fn a_detached_process_runs_with_its_commands_arguments_environment_and_directory() {
+        let dir = std::env::temp_dir().join(format!("reims-ctl-echo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let work = dir.join("work dir");
+        std::fs::create_dir_all(&work).unwrap();
+        let out = dir.join("echo.txt");
+        let log_path = dir.join("echo.log");
+        let given = [
+            "plain",
+            "two words",
+            "",
+            "a \"quoted\" word",
+            r"C:\a\b\",
+            r#"back\"slash"#,
+            "tab\there",
+        ];
+        let mut c = Command::new(std::env::current_exe().unwrap());
+        c.args(["--exact", "os::windows::tests::echo_child"])
+            .args(given)
+            .env(ECHO, &out)
+            .env("Reims_Ctl_Test_Echo_Value", "a value, with spaces")
+            .env_remove("userprofile")
+            .current_dir(&work);
+        let log = std::fs::File::create(&log_path).unwrap();
+        spawn_detached(c, log).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let done = || {
+            std::fs::read_to_string(&log_path).is_ok_and(|l| l.contains("test result"))
+                && out.exists()
+        };
+        while !done() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let text = std::fs::read_to_string(&out).unwrap_or_default();
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut want: Vec<String> = ["--exact", "os::windows::tests::echo_child"]
+            .into_iter()
+            .chain(given)
+            .map(String::from)
+            .collect();
+        want.extend([
+            "a value, with spaces".to_string(),
+            "false".to_string(),
+            work.display().to_string(),
+        ]);
+        assert_eq!(text.split('\n').collect::<Vec<_>>(), want, "log: {log}");
+        assert!(log.contains("1 passed"), "{log}");
+    }
+
+    /// A command line quotes the program, and an argument only where it is empty or holds a space
+    /// or a tab, escaping its quotes and the backslashes before them and before its closing
+    /// quote, as std's `Command` writes them.
+    #[test]
+    fn a_command_line_quotes_as_std_does() {
+        let mut c = Command::new(r"C:\q\qemu-system-x86_64.exe");
+        c.args([
+            "-name",
+            "",
+            "a b",
+            r"C:\x\",
+            r"C:\x y\",
+            "say \"hi\"",
+            r#"a\"b"#,
+        ]);
+        let line = command_line(&c).unwrap();
+        assert_eq!(line.last(), Some(&0));
+        assert_eq!(
+            String::from_utf16(&line[..line.len() - 1]).unwrap(),
+            r#""C:\q\qemu-system-x86_64.exe" -name "" "a b" C:\x\ "C:\x y\\" "say \"hi\"" a\\\"b"#
+        );
+        let mut bad = Command::new("q");
+        bad.arg("a\0b");
+        assert_eq!(
+            command_line(&bad).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    /// A command with no environment changes runs in this process's environment; with changes,
+    /// its block holds this process's variables with them, each name once whatever its case,
+    /// sorted by name in capitals, and ends in two NULs.
+    #[test]
+    fn an_environment_block_has_each_name_once() {
+        assert_eq!(environment(&Command::new("q")).unwrap(), None);
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut c = Command::new("q");
+        c.env("path", &path)
+            .env("REIMS_CTL_TEST_NEW", "x")
+            .env_remove("UserProfile");
+        let block = environment(&c).unwrap().unwrap();
+        assert_eq!(&block[block.len() - 2..], &[0, 0]);
+        let entries: Vec<String> = block[..block.len() - 1]
+            .split(|&u| u == 0)
+            .filter(|e| !e.is_empty())
+            .map(String::from_utf16_lossy)
+            .collect();
+        let names: Vec<String> = entries
+            .iter()
+            .map(|e| {
+                let at = e[1..].find('=').map_or(e.len(), |i| i + 1);
+                e[..at].to_uppercase()
+            })
+            .collect();
+        assert_eq!(
+            names.iter().filter(|n| *n == "PATH").count(),
+            1,
+            "{names:?}"
+        );
+        assert!(entries.contains(&format!("path={}", path.to_string_lossy())));
+        assert!(entries.contains(&"REIMS_CTL_TEST_NEW=x".to_string()));
+        assert!(!names.contains(&"USERPROFILE".to_string()), "{names:?}");
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
     }
 
     /// A detached process holds no handle of its starter's standard output: a reader of the pipe
