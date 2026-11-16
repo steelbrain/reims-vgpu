@@ -108,3 +108,34 @@ pub(crate) const SUPPORTED_PROPERTIES: FourCc = FourCc::new(*b",sup");
 pub(crate) const PROPERTIES: FourCc = FourCc::new(*b",pro");
 /// `,can`: whether the decoder goes on with a format description, `=s32`.
 pub(crate) const CAN_ACCEPT: FourCc = FourCc::new(*b",can");
+
+/// `,cid`: the encoder the guest asks for, its `CMClassImplementationID`, `=pls`.
+pub(crate) const CODEC_ID: FourCc = FourCc::new(*b",cid");
+/// `,gin`: the guest's info, `=pls`.
+pub(crate) const GUEST_INFO: FourCc = FourCc::new(*b",gin");
+/// `Epba`: the attributes the guest's source buffers are to have.
+pub(crate) const SET_SOURCE_PIXEL_BUFFER_ATTRIBUTES: FourCc = FourCc::new(*b"Epba");
+/// `Efds`: ask the guest to make the stream's format description.
+pub(crate) const CREATE_VIDEO_FORMAT_DESCRIPTION: FourCc = FourCc::new(*b"Efds");
+/// `Eemt`: emit an encoded frame.
+pub(crate) const EMIT_ENCODED_FRAME: FourCc = FourCc::new(*b"Eemt");
+/// `,vdi`: the source frames' dimensions, `=wxh`.
+pub(crate) const DIMENSIONS: FourCc = FourCc::new(*b",vdi");
+/// `,pts`: a presentation time stamp, `=tim`.
+pub(crate) const PRESENTATION_TIME: FourCc = FourCc::new(*b",pts");
+/// `,dur`: a duration, `=tim`.
+pub(crate) const DURATION: FourCc = FourCc::new(*b",dur");
+/// `,fpr`: a frame's properties, `=pls`.
+pub(crate) const FRAME_PROPERTIES: FourCc = FourCc::new(*b",fpr");
+/// `,pat`: a source pixel buffer's attachments, `=pls`.
+pub(crate) const PIXEL_BUFFER_ATTACHMENTS: FourCc = FourCc::new(*b",pat");
+/// `,efl`: the encode info flags, `=u32`.
+pub(crate) const ENCODE_INFO_FLAGS: FourCc = FourCc::new(*b",efl");
+/// `,wdt`: a width, `=s32`.
+pub(crate) const WIDTH: FourCc = FourCc::new(*b",wdt");
+/// `,hgt`: a height, `=s32`.
+pub(crate) const HEIGHT: FourCc = FourCc::new(*b",hgt");
+/// `,ext`: a format description's extensions, `=pls`.
+pub(crate) const EXTENSIONS: FourCc = FourCc::new(*b",ext");
+/// `=fds`: the format description the guest made, as an ImageDescription.
+pub(crate) const CREATED_FORMAT_DESCRIPTION: FourCc = FourCc::new(*b"=fds");

@@ -6,10 +6,13 @@
 //!   carry, and [`image_description`] and [`sample_buffer`] the format descriptions and samples a
 //!   decoder session's carry.
 //! - [`Host`] answers them: the decoder list (`decs`) and a decoder's capabilities (`dcap`) from
-//!   the decoders the host's video arm runs ([`Decoder`]), no encoder (`encs`) and no
-//!   motion-estimation processor (`meps`). A decoder create (`+dec`) of a codec the list holds
-//!   opens a session ([`decoder`]) where the host has a [`Backend`] to decode on; any other
-//!   create is refused, as for a codec the host lacks. A close ends its session.
+//!   the decoders the host's video arm runs ([`Decoder`]), the encoder list (`encs`) from its
+//!   encoders ([`Encoder`]), none without an [`EncoderBackend`], and no motion-estimation
+//!   processor (`meps`). A decoder create (`+dec`) of a codec the list holds opens a session
+//!   ([`decoder`]) where the host has a [`Backend`] to decode on, and an encoder create (`+enc`)
+//!   of a listed encoder one ([`encoder`]) on its encoder backend; any other create is refused,
+//!   as for a codec the host lacks. A close ends its session. What the two kinds of session
+//!   share is the `session` module's.
 //! - [`status`] is the statuses the guest sees.
 
 // The library's lint set, as `core`'s: no unsafe code, no indexing that can panic, and no silent
@@ -28,6 +31,7 @@
 
 pub mod atom;
 pub mod decoder;
+pub mod encoder;
 mod host;
 pub mod image_description;
 mod known_keys;
@@ -36,10 +40,13 @@ pub mod message;
 mod names;
 pub mod plist;
 pub mod sample_buffer;
+mod session;
 pub mod status;
 
-pub use decoder::{Backend, BackendDecoder, Decoded, DecoderConfig, LentSurface, Link};
+pub use decoder::{Backend, BackendDecoder, Decoded, DecoderConfig};
+pub use encoder::{BackendEncoder, Encoder, EncoderBackend, EncoderConfig, SourceFrame};
 pub use host::{Answer, Codec, Decoder, Host};
+pub use session::{LentSurface, Link, surface_release};
 
 /// Why guest bytes could not be read.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

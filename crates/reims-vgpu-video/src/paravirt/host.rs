@@ -7,10 +7,13 @@ use std::sync::Arc;
 use crate::core::fourcc::FourCc;
 use crate::core::runtime::Runtime;
 use crate::core::sync::Mutex;
-use crate::paravirt::decoder::{Backend, LentSurface, Link, Session, surface_release};
+use crate::paravirt::decoder::{self, Backend};
+use crate::paravirt::encoder::{self, Encoder, EncoderBackend};
 use crate::paravirt::lists::{self, MotionEstimationAnswer};
 use crate::paravirt::message::{GuestUuid, Message, read_header};
 use crate::paravirt::names::{self, HostMessage};
+use crate::paravirt::plist::{self, Value};
+use crate::paravirt::session::{LentSurface, Link, Session, surface_release};
 use crate::paravirt::status::{self, OsStatus};
 
 /// A codec the host's decoders decode.
@@ -78,15 +81,19 @@ impl Answer {
     }
 }
 
-/// The host's side: the decoders the host's video arm runs, the answers the module doc of
-/// [`crate::paravirt`] lists, and the decoder sessions, by UUID, where it has a backend
-/// ([`Host::with_backend`]).
+/// The host's side: the decoders and encoders the host's video arm runs, the answers the module
+/// doc of [`crate::paravirt`] lists, and the sessions, by UUID, where it has a backend
+/// ([`Host::with_backend`], [`Host::with_encoders`]).
 #[derive(Default)]
 pub struct Host {
     decoders: Vec<Decoder>,
-    /// The backend the sessions decode on, and the runtime their threads run on; none refuses
-    /// every create.
+    /// The backend the decoder sessions decode on, and the runtime their threads run on; none
+    /// refuses every decoder create.
     backend: Option<(Arc<dyn Backend>, Arc<dyn Runtime>)>,
+    encoders: Vec<Encoder>,
+    /// The backend the encoder sessions encode on, and the runtime their threads run on; none
+    /// lists no encoder and refuses every encoder create.
+    encoder_backend: Option<(Arc<dyn EncoderBackend>, Arc<dyn Runtime>)>,
     sessions: Mutex<HashMap<GuestUuid, Session>>,
 }
 
@@ -95,6 +102,7 @@ impl std::fmt::Debug for Host {
         f.debug_struct("Host")
             .field("decoders", &self.decoders)
             .field("backend", &self.backend.is_some())
+            .field("encoders", &self.encoders)
             .finish_non_exhaustive()
     }
 }
@@ -118,13 +126,37 @@ impl Host {
         Self {
             decoders,
             backend: Some((backend, runtime)),
-            sessions: Mutex::default(),
+            ..Self::default()
+        }
+    }
+
+    /// This host, its encoder list holding `encoders`, each of whose sessions encodes on
+    /// `backend`, on a thread of `runtime`'s.
+    pub fn with_encoders(
+        self,
+        encoders: Vec<Encoder>,
+        backend: Arc<dyn EncoderBackend>,
+        runtime: Arc<dyn Runtime>,
+    ) -> Self {
+        Self {
+            encoders,
+            encoder_backend: Some((backend, runtime)),
+            ..self
         }
     }
 
     /// The decoders the list holds.
     pub fn decoders(&self) -> &[Decoder] {
         &self.decoders
+    }
+
+    /// The encoders the list holds: none without an encoder backend.
+    pub fn encoders(&self) -> &[Encoder] {
+        if self.encoder_backend.is_some() {
+            &self.encoders
+        } else {
+            &[]
+        }
     }
 
     /// [`Self::deliver_lending`] of a message that lends nothing, with no link for sessions.
@@ -184,25 +216,48 @@ impl Host {
             HostMessage::DecoderCapabilities => {
                 replied(lists::decoder_capabilities(&message, &self.decoders))
             }
-            HostMessage::EncoderList => replied(lists::encoder_list(&message)),
+            HostMessage::EncoderList => replied(lists::encoder_list(&message, self.encoders())),
             HostMessage::MotionEstimationList => match lists::motion_estimation_list(&message) {
                 Ok(MotionEstimationAnswer::Reply(reply)) => Answer::reply(reply),
                 Ok(MotionEstimationAnswer::Refused(status)) => Answer::status(status),
                 Err(error) => Answer::status(error.status()),
             },
-            HostMessage::CreateDecoder | HostMessage::CreateEncoder => {
-                // A decoder or encoder create needs a nonzero `,cod` and reads `,ver`, as
-                // Apple's create reads them.
+            HostMessage::CreateDecoder => {
+                // A decoder create needs a nonzero `,cod` and reads `,ver`, as Apple's create
+                // reads them.
                 match (message.s32(names::CODEC), message.u32(names::VERSION)) {
                     (Ok(Some(codec)), Ok(_)) if codec != 0 => {
-                        let status = if kind == HostMessage::CreateDecoder {
-                            self.create_decoder(header.guest_uuid, codec, link)
-                        } else {
-                            status::COULD_NOT_FIND_VIDEO_ENCODER
-                        };
+                        let status = self.create_decoder(header.guest_uuid, codec, link);
                         Answer::reply(lists::create_reply(&message, status))
                     }
                     (Err(error), _) | (_, Err(error)) => Answer::status(error.status()),
+                    _ => Answer::status(status::MALFORMED_MESSAGE),
+                }
+            }
+            HostMessage::CreateEncoder => {
+                // An encoder create needs a nonzero `,cod` and reads `,ver`, `,cid` and `,gin`.
+                let read = || -> Result<_, crate::paravirt::WireError> {
+                    let codec = message.s32(names::CODEC)?;
+                    let version = message.u32(names::VERSION)?;
+                    let asked = match message.property_list_bytes(names::CODEC_ID)? {
+                        Some(bytes) if !bytes.is_empty() => Some(plist::decode(bytes)?),
+                        _ => None,
+                    };
+                    message.property_list_bytes(names::GUEST_INFO)?;
+                    Ok((codec, version, asked))
+                };
+                match read() {
+                    Ok((Some(codec), version, asked)) if codec != 0 => {
+                        let status = self.create_encoder(
+                            header.guest_uuid,
+                            codec,
+                            version.unwrap_or(0),
+                            asked.as_ref(),
+                            link,
+                        );
+                        Answer::reply(lists::create_reply(&message, status))
+                    }
+                    Err(error) => Answer::status(error.status()),
                     _ => Answer::status(status::MALFORMED_MESSAGE),
                 }
             }
@@ -244,7 +299,7 @@ impl Host {
         let (Some(codec), Some((backend, runtime))) = (codec, &self.backend) else {
             return status::COULD_NOT_FIND_VIDEO_DECODER;
         };
-        match Session::start(uuid, codec, Arc::clone(backend), Arc::clone(runtime), link) {
+        match decoder::start(uuid, codec, Arc::clone(backend), Arc::clone(runtime), link) {
             Ok(session) => {
                 let replaced = self.sessions.lock().insert(uuid, session);
                 drop(replaced);
@@ -253,6 +308,55 @@ impl Host {
             Err(error) => {
                 log::warn!("hardware video: a decoder session's thread did not start: {error}");
                 status::COULD_NOT_FIND_VIDEO_DECODER
+            }
+        }
+    }
+}
+
+impl Host {
+    /// Opens an encoder session of the codec type `codec` for `uuid`, replacing one it had:
+    /// noErr, or kVTCouldNotFindVideoEncoderErr where the host has no encoder of it, or `asked`
+    /// names neither this host's encoder of it nor Apple's hardware encoder of it, which the
+    /// guest's own paravirtual encoders name.
+    fn create_encoder(
+        &self,
+        uuid: GuestUuid,
+        codec: i32,
+        version: u32,
+        asked: Option<&Value>,
+        link: Option<Arc<dyn Link>>,
+    ) -> OsStatus {
+        let codec = Codec::from_fourcc(FourCc(u32::from_be_bytes(codec.to_be_bytes())));
+        let encoder = codec.and_then(|codec| self.encoders().iter().find(|e| e.codec == codec));
+        let named = |encoder: &Encoder| {
+            asked.is_none_or(|asked| {
+                let id = asked.as_str();
+                id == Some(lists::encoder_id(encoder.codec))
+                    || id == Some(lists::apple_encoder_id(encoder.codec))
+            })
+        };
+        let (Some(encoder), Some((backend, runtime))) =
+            (encoder.filter(|e| named(e)), &self.encoder_backend)
+        else {
+            return status::COULD_NOT_FIND_VIDEO_ENCODER;
+        };
+        let started = encoder::start(
+            uuid,
+            encoder.clone(),
+            version,
+            Arc::clone(backend),
+            Arc::clone(runtime),
+            link,
+        );
+        match started {
+            Ok(session) => {
+                let replaced = self.sessions.lock().insert(uuid, session);
+                drop(replaced);
+                status::NO_ERROR
+            }
+            Err(error) => {
+                log::warn!("hardware video: an encoder session's thread did not start: {error}");
+                status::COULD_NOT_FIND_VIDEO_ENCODER
             }
         }
     }

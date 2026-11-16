@@ -229,9 +229,23 @@ pub fn key_at(index: u16) -> Option<&'static str> {
     KNOWN_KEYS.get(usize::from(index)).copied()
 }
 
+/// The index a writer names `key` by: its first in the table, if it is there.
+pub fn index_of(key: &str) -> Option<u16> {
+    let at = KNOWN_KEYS.iter().position(|known| *known == key)?;
+    u16::try_from(at).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_repeated_key_is_written_at_its_first_index() {
+        assert_eq!(index_of("Width"), Some(46));
+        assert_eq!(index_of("Height"), Some(47));
+        assert_eq!(index_of("SampleDescriptionExtensionAtoms"), Some(49));
+        assert_eq!(index_of("no such key"), None);
+    }
 
     #[test]
     fn a_repeated_key_reads_at_each_index() {

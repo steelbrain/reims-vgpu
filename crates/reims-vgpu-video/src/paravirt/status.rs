@@ -14,6 +14,8 @@ pub const PROPERTY_NOT_SUPPORTED: OsStatus = -12900;
 pub const PROPERTY_READ_ONLY: OsStatus = -12901;
 /// `kVTParameterErr`.
 pub const PARAMETER: OsStatus = -12902;
+/// `kVTInvalidSessionErr`: a frame for an encoder session not started.
+pub const INVALID_SESSION: OsStatus = -12903;
 /// `kVTCouldNotFindVideoDecoderErr`: a decoder create for a codec the host has no decoder of.
 pub const COULD_NOT_FIND_VIDEO_DECODER: OsStatus = -12906;
 /// `kVTCouldNotFindVideoEncoderErr`: likewise, an encoder create.
@@ -24,8 +26,13 @@ pub const VIDEO_DECODER_BAD_DATA: OsStatus = -12909;
 pub const VIDEO_DECODER_UNSUPPORTED_DATA_FORMAT: OsStatus = -12910;
 /// `kVTVideoDecoderMalfunctionErr`.
 pub const VIDEO_DECODER_MALFUNCTION: OsStatus = -12911;
+/// `kVTVideoEncoderMalfunctionErr`.
+pub const VIDEO_ENCODER_MALFUNCTION: OsStatus = -12912;
 /// `kVTUnimplementedErr`: a request the decoder does not carry out.
 pub const UNIMPLEMENTED: OsStatus = -12782;
+/// What Apple's host answers `esta` with for a size its hardware encoder does not take, before
+/// any `Epba` (measured on macOS 27, 2026-10-24). The name is ours.
+pub const ENCODER_SIZE_UNSUPPORTED: OsStatus = -19354;
 /// A message that does not parse, or that the receiver cannot take (kVTPVMalformedMessageErr).
 pub const MALFORMED_MESSAGE: OsStatus = -19093;
 /// A message for a UUID with no session.

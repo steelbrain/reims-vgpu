@@ -3,24 +3,28 @@
 //!
 //! The lists say what the guest may ask for. The decoder list holds one decoder for each codec the
 //! host's video arm decodes, with the profiles and the level the arm answers: the guest's
-//! VideoToolbox registers each as `paravirtualized:<ID>`, hardware-accelerated. The encoder and
-//! motion-estimation lists hold none, as Apple's host answers where it has none.
+//! VideoToolbox registers each as `paravirtualized:<ID>`, hardware-accelerated. The encoder list
+//! holds one encoder for each codec the host's video arm encodes, and none where it has no
+//! encoder backend; the motion-estimation list holds none, as Apple's host answers where it has
+//! none.
 
 use crate::paravirt::message::{Message, MessageFlags, MessageWriter};
 use crate::paravirt::names;
 use crate::paravirt::plist::Value;
 use crate::paravirt::status::OsStatus;
-use crate::paravirt::{Codec, Decoder, WireError};
+use crate::paravirt::{Codec, Decoder, Encoder, WireError};
 
 /// The protocol version each list and create reply carries: 6, for the decoders, the encoders
 /// (`kVTVESHostProtocolVersion`), motion estimation and the capabilities
 /// (`kVTVDCapabilitesHostProtocolVersion`) alike.
 pub(crate) const PROTOCOL_VERSION: u32 = 6;
 
-/// The rating each listed decoder carries. Apple's hardware decoders carry 400 (measured on macOS
-/// 27, 26A434, 2026-10-24: `decs` lists `com.apple.videotoolbox.videodecoder.avd.avc` with
-/// VTRating 400); the guest prefers the higher-rated of two decoders for a codec.
-const DECODER_RATING: i64 = 400;
+/// The rating each listed decoder and encoder carries. Apple's hardware decoders and encoders
+/// carry 400 (measured on macOS 27, 26A434, 2026-10-24: `decs` lists
+/// `com.apple.videotoolbox.videodecoder.avd.avc` and `encs`
+/// `com.apple.videotoolbox.videoencoder.ave.avc` with VTRating 400); the guest prefers the
+/// higher-rated of two for a codec.
+const RATING: i64 = 400;
 
 /// What `,hin`'s `VTHostBuildVersion` says of this host. Apple's says the host's macOS build; the
 /// guest only logs it. The value is ours.
@@ -90,7 +94,7 @@ fn decoder_entry(decoder: &Decoder) -> Value {
             "VTCodecType",
             Value::Array(vec![fourcc_string(decoder.codec)]),
         ),
-        ("VTRating", Value::Integer(DECODER_RATING)),
+        ("VTRating", Value::Integer(RATING)),
         (
             "VTDecoderCapabilities",
             Value::dictionary([
@@ -157,11 +161,64 @@ pub(crate) fn decoder_capabilities(
     Ok(reply.finish())
 }
 
-/// `encs`: no encoder, then the version. The request's `,ver` is read but not checked.
-pub(crate) fn encoder_list(request: &Message<'_>) -> Result<Vec<u8>, WireError> {
+/// The `CMClassImplementationID` of this host's encoder for `codec`, which the guest registers
+/// as `paravirtualized:<ID>` and sends back as `,cid` when it opens one. The IDs and names are
+/// ours.
+pub(crate) fn encoder_id(codec: Codec) -> &'static str {
+    match codec {
+        Codec::H264 => "reims-vgpu-video.videoencoder.avc",
+        Codec::Hevc => "reims-vgpu-video.videoencoder.hevc",
+    }
+}
+
+/// The `CMClassImplementationID` of Apple's hardware encoder for `codec`, which the guest's own
+/// two paravirtual encoders send as `,cid`.
+pub(crate) fn apple_encoder_id(codec: Codec) -> &'static str {
+    match codec {
+        Codec::H264 => "com.apple.videotoolbox.videoencoder.ave.avc",
+        Codec::Hevc => "com.apple.videotoolbox.videoencoder.ave.hevc",
+    }
+}
+
+fn encoder_name(codec: Codec) -> &'static str {
+    match codec {
+        Codec::H264 => "reims-vgpu-video Encoder - AVC",
+        Codec::Hevc => "reims-vgpu-video Encoder - HEVC",
+    }
+}
+
+/// One entry of the encoder list, in the keys Apple's hardware encoders' entries have (measured
+/// on macOS 27, 2026-10-24): the codec type as a number, the codec's name, the encoder's name
+/// and ID, and the rating.
+fn encoder_entry(encoder: &Encoder) -> Value {
+    let codec = encoder.codec;
+    Value::dictionary([
+        ("VTCodecType", Value::Integer(i64::from(codec.fourcc().0))),
+        ("VTRating", Value::Integer(RATING)),
+        (
+            "VTCodecName",
+            Value::string(match codec {
+                Codec::H264 => "H.264",
+                Codec::Hevc => "HEVC",
+            }),
+        ),
+        (
+            "CMClassImplementationName",
+            Value::string(encoder_name(codec)),
+        ),
+        ("CMClassImplementationID", Value::string(encoder_id(codec))),
+    ])
+}
+
+/// `encs`: the encoders, then the version. The request's `,ver` is read but not checked.
+pub(crate) fn encoder_list(
+    request: &Message<'_>,
+    encoders: &[Encoder],
+) -> Result<Vec<u8>, WireError> {
     request.u32(names::VERSION)?;
+    let entries = encoders.iter().map(encoder_entry).collect();
     let mut reply = reply(request);
-    reply.property_list(names::ENCODERS, Some(&Value::Array(Vec::new())));
+    reply.property_list(names::ENCODERS, Some(&Value::Array(entries)));
     reply.u32(names::VERSION, PROTOCOL_VERSION);
     Ok(reply.finish())
 }

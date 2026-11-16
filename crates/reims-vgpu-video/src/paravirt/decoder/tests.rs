@@ -6,10 +6,12 @@ use std::sync::mpsc;
 
 use super::*;
 use crate::core::runtime::StdRuntime;
+use crate::core::sync::Mutex;
 use crate::paravirt::host::Decoder;
 use crate::paravirt::image_description::tests::hand_written;
 use crate::paravirt::message::read_header;
 use crate::paravirt::sample_buffer::tests::one_sample;
+use crate::paravirt::session::surface_release;
 use crate::paravirt::{Answer, Host, plist};
 
 /// A 64x48 baseline SPS (`profile_idc` 66, level 3.0): `frame_mbs_only_flag` 1, no VUI.

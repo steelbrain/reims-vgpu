@@ -36,9 +36,8 @@
 //! takes none, is let go of at once (`rels`): the guest's kext holds each surface it lent until
 //! the host lets go of it.
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use crate::codec::h264::avcc;
@@ -48,8 +47,7 @@ use crate::codec::hevc::hvcc;
 use crate::codec::hevc::nal::nal_type;
 use crate::codec::hevc::sps::Sps as HevcSps;
 use crate::core::fourcc::FourCc;
-use crate::core::runtime::{self, Answerer, Runtime};
-use crate::core::sync::Mutex;
+use crate::core::runtime::Runtime;
 use crate::paravirt::WireError;
 use crate::paravirt::host::Codec;
 use crate::paravirt::image_description::{AVC_CONFIGURATION, HEVC_CONFIGURATION, ImageDescription};
@@ -57,6 +55,7 @@ use crate::paravirt::message::{GuestUuid, Message, MessageFlags, MessageHeader, 
 use crate::paravirt::names;
 use crate::paravirt::plist::Value;
 use crate::paravirt::sample_buffer::{SampleBuffer, SerializedFormatDescription};
+use crate::paravirt::session::{GuestReply, Job, LentSurface, Link, Session, Shared};
 use crate::paravirt::status::{self, OsStatus};
 
 /// How long a `Dbuf` waits for the guest's buffer.
@@ -92,21 +91,6 @@ const THREAD_NAME: &str = "reims-vgpu-video.vt-decoder";
 
 /// The four-byte start code an Annex-B NAL unit follows.
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
-
-/// A guest surface a message lent the host, as the device resolved it: held by the host until it
-/// lets go of it with a `rels` of [`LentSurface::id`].
-pub trait LentSurface: Send + Sync + std::fmt::Debug {
-    /// The name the guest's kext gives the surface, which a `rels` names it by.
-    fn id(&self) -> u64;
-    /// The device's own type, for its backend to read.
-    fn as_any(&self) -> &dyn std::any::Any;
-}
-
-/// The way the host's messages reach the guest's VideoToolbox, from any thread.
-pub trait Link: Send + Sync {
-    /// Sends `message`, a `vtpv` message or a `rels` box; false where it was not sent.
-    fn send(&self, message: &[u8]) -> bool;
-}
 
 /// A decoder's configuration, from a `dsta`'s format description or a sample's.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,88 +134,21 @@ pub trait BackendDecoder: Send {
     ) -> Result<Decoded, OsStatus>;
 }
 
-/// The guest's reply to a host request, with the surfaces it lent.
-pub(crate) struct GuestReply {
-    bytes: Vec<u8>,
-    surfaces: Vec<Arc<dyn LentSurface>>,
-}
-
-/// What a session's handle and its thread share.
-struct Shared {
+/// Starts a decoder session of `codec` for `uuid`, its thread on `runtime`, decoding on
+/// `backend`.
+pub(crate) fn start(
     uuid: GuestUuid,
-    /// The last link a message came with.
-    link: Mutex<Option<Arc<dyn Link>>>,
-    /// The host's requests waiting for the guest's reply, by reply identifier.
-    waiting: Mutex<HashMap<u64, Answerer<GuestReply>>>,
-}
-
-impl Shared {
-    fn send(&self, message: &[u8]) -> bool {
-        let link = self.link.lock().clone();
-        link.is_some_and(|link| link.send(message))
-    }
-
-    /// Lets go of `surfaces`, where there are any: a `rels` of their IDs.
-    fn let_go(&self, surfaces: &[Arc<dyn LentSurface>]) {
-        if surfaces.is_empty() {
-            return;
-        }
-        let ids: Vec<u64> = surfaces.iter().map(|surface| surface.id()).collect();
-        if !self.send(&surface_release(&ids)) {
-            log::warn!(
-                "hardware video: a release of {} lent surfaces was not sent",
-                ids.len()
-            );
-        }
-    }
-}
-
-/// The `rels` box that tells the guest the host holds these surfaces no longer: a big-endian size
-/// of 8 plus 8 an ID, the type, then each ID big-endian. It travels alone, not inside a `vtpv`
-/// message.
-pub fn surface_release(ids: &[u64]) -> Vec<u8> {
-    let size = u32::try_from(8 + 8 * ids.len()).unwrap_or(u32::MAX);
-    let mut bytes = Vec::with_capacity(8 + 8 * ids.len());
-    bytes.extend_from_slice(&size.to_be_bytes());
-    bytes.extend_from_slice(b"rels");
-    for id in ids {
-        bytes.extend_from_slice(&id.to_be_bytes());
-    }
-    bytes
-}
-
-/// A message for the session's thread.
-struct Job {
-    bytes: Vec<u8>,
-    surfaces: Vec<Arc<dyn LentSurface>>,
-}
-
-/// A decoder session's handle, which the host keeps by its UUID. Dropping it ends the session's
-/// thread once its current message is done.
-pub(crate) struct Session {
-    queue: Sender<Job>,
-    shared: Arc<Shared>,
-}
-
-impl Session {
-    /// A session of `codec` for `uuid`, its thread started on `runtime`.
-    pub(crate) fn start(
-        uuid: GuestUuid,
-        codec: Codec,
-        backend: Arc<dyn Backend>,
-        runtime: Arc<dyn Runtime>,
-        link: Option<Arc<dyn Link>>,
-    ) -> std::io::Result<Self> {
-        let shared = Arc::new(Shared {
-            uuid,
-            link: Mutex::new(link),
-            waiting: Mutex::new(HashMap::new()),
-        });
-        let (queue, jobs) = channel();
-        let worker = Worker {
-            shared: Arc::clone(&shared),
+    codec: Codec,
+    backend: Arc<dyn Backend>,
+    runtime: Arc<dyn Runtime>,
+    link: Option<Arc<dyn Link>>,
+) -> std::io::Result<Session> {
+    let thread_runtime = Arc::clone(&runtime);
+    Session::start(uuid, THREAD_NAME, &*runtime, link, move |shared, jobs| {
+        Worker {
+            shared,
             jobs,
-            runtime: Arc::clone(&runtime),
+            runtime: thread_runtime,
             backend,
             codec,
             decoder: None,
@@ -242,50 +159,9 @@ impl Session {
             properties: Vec::new(),
             fragments: Vec::new(),
             discarding: false,
-            next_request: 1,
-        };
-        runtime.spawn(THREAD_NAME, Box::new(move || worker.run()))?;
-        Ok(Self { queue, shared })
-    }
-
-    /// Takes the guest's message `bytes` for the session, with the surfaces it lent and the link
-    /// it came on: a reply to a host request goes to the request, any other message to the
-    /// session's queue. noErr, or [`status::SESSION_NOT_FOUND`] where the session's thread has
-    /// ended.
-    pub(crate) fn deliver(
-        &self,
-        header: &MessageHeader,
-        bytes: &[u8],
-        surfaces: Vec<Arc<dyn LentSurface>>,
-        link: Option<Arc<dyn Link>>,
-    ) -> OsStatus {
-        if let Some(link) = link {
-            *self.shared.link.lock() = Some(link);
         }
-        if header.flags.contains(MessageFlags::REPLY_TO_HOST) {
-            let waiting = self.shared.waiting.lock().remove(&header.reply_id);
-            match waiting {
-                Some(answerer) => answerer.give(GuestReply {
-                    bytes: bytes.to_vec(),
-                    surfaces,
-                }),
-                // A reply past its request's wait: what it lent goes back.
-                None => self.shared.let_go(&surfaces),
-            }
-            return status::NO_ERROR;
-        }
-        let job = Job {
-            bytes: bytes.to_vec(),
-            surfaces,
-        };
-        match self.queue.send(job) {
-            Ok(()) => status::NO_ERROR,
-            Err(std::sync::mpsc::SendError(job)) => {
-                self.shared.let_go(&job.surfaces);
-                status::SESSION_NOT_FOUND
-            }
-        }
-    }
+        .run();
+    })
 }
 
 /// A frame's `dfrm` reply, sent once.
@@ -325,8 +201,6 @@ struct Worker {
     fragments: Vec<u8>,
     /// Whether the fragments of a `dfrm` past [`MAX_FRAME_MESSAGE_BYTES`] are being dropped.
     discarding: bool,
-    /// The next host request's reply identifier.
-    next_request: u64,
 }
 
 impl Worker {
@@ -579,34 +453,13 @@ impl Worker {
     /// A host request of type `kind`, filled by `fill`, and the guest's reply, waited for `wait`;
     /// `kVTParameterErr` where it was not sent or not answered in time.
     fn request(
-        &mut self,
+        &self,
         kind: FourCc,
         wait: Duration,
         fill: impl FnOnce(&mut MessageWriter),
     ) -> Result<GuestReply, OsStatus> {
-        let id = self.next_request;
-        self.next_request = self.next_request.wrapping_add(1).max(1);
-        let (answerer, answer) = runtime::answer();
-        self.shared.waiting.lock().insert(id, answerer);
-        let mut message = MessageWriter::new(
-            kind,
-            MessageFlags::HOST_EXPECTS_REPLY,
-            Some(self.shared.uuid),
-            id,
-        );
-        fill(&mut message);
-        if !self.shared.send(&message.finish()) {
-            self.shared.waiting.lock().remove(&id);
-            return Err(status::PARAMETER);
-        }
-        let deadline = self.runtime.deadline_in(wait);
-        answer
-            .wait_until(&*self.runtime, deadline)
-            .map_err(|unanswered| {
-                self.shared.waiting.lock().remove(&id);
-                log::warn!("hardware video: no answer to {kind} in {wait:?}: {unanswered:?}");
-                status::PARAMETER
-            })
+        let (id, message) = self.shared.request_message(kind, fill);
+        (self.shared).request(&*self.runtime, id, &[], &message.finish(), wait)
     }
 
     /// `Dbuf`: the buffer the guest lends for frame `frame`, or the guest's status, or ours.

@@ -1664,7 +1664,10 @@ Stages:
       on VA-API, written there by the driver's video processing where it
       takes the surface's layout, else copied by the CPU). `encs` lists no
       encoder and `meps` no processor, and an encoder's create is answered
-      with a refusal in its reply's `,err`, as for a codec the host lacks.
+      with a refusal in its reply's `,err`, as for a codec the host lacks:
+      `paravirt`'s encoder sessions (`encoder`, which encode the source
+      frames the guest lends and emit their samples) list encoders only
+      for a host given an encoder backend, and the device gives it none.
       A host with no arm offers no caps and the kext publishes no service:
       the guest's VideoToolbox is then not a guest's.
     - **The host offers `VT_MESSAGES` where its arm lands decodes in the

@@ -13,7 +13,7 @@
 
 use crate::core::fourcc::FourCc;
 use crate::paravirt::WireError;
-use crate::paravirt::atom::{Atom, siblings};
+use crate::paravirt::atom::{Atom, AtomWriter, siblings};
 use crate::paravirt::known_keys;
 use crate::paravirt::message::MediaTime;
 use crate::paravirt::plist::{self, Budget, Value};
@@ -146,6 +146,15 @@ impl SampleTiming {
             presentation: MediaTime::from_native(bytes.get(24..48)?)?,
             decode: MediaTime::from_native(bytes.get(48..72)?)?,
         })
+    }
+
+    /// The timing's 72 native bytes, as a `stia` entry holds it.
+    fn to_native(self) -> [u8; TIMING_SIZE] {
+        let mut bytes = [0; TIMING_SIZE];
+        bytes[..24].copy_from_slice(&self.duration.to_native());
+        bytes[24..48].copy_from_slice(&self.presentation.to_native());
+        bytes[48..].copy_from_slice(&self.decode.to_native());
+        bytes
     }
 }
 
@@ -490,6 +499,141 @@ impl SampleBuffer {
     }
 }
 
+impl SampleBuffer {
+    /// The buffer's serialization, as CoreMedia's writer orders it: the output time stamp where
+    /// valid, the timings, the data, the count where nonzero and the sizes, the format
+    /// description, then the three attachment atoms. Empty dictionaries and arrays are left out,
+    /// as the writer leaves them out; [`Self::parse`] reads it back.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut writer = AtomWriter::new();
+        writer.begin(SAMPLE_BUFFER);
+        if let Some(time) = self.output_presentation_time.filter(|time| time.is_valid()) {
+            writer.atom(OUTPUT_PRESENTATION_TIME, &time.to_native());
+        }
+        if !self.timings.is_empty() {
+            let timings: Vec<u8> = self.timings.iter().flat_map(|t| t.to_native()).collect();
+            writer.atom(TIMING, &timings);
+        }
+        if let Some(data) = &self.data {
+            writer.atom(DATA, data);
+        }
+        if self.sample_count != 0 {
+            writer.atom(SAMPLE_COUNT, &self.sample_count.to_le_bytes());
+        }
+        if !self.sizes.is_empty() {
+            let sizes: Vec<u8> = (self.sizes.iter()).flat_map(|n| n.to_le_bytes()).collect();
+            writer.atom(SIZES, &sizes);
+        }
+        if let Some(description) = &self.format_description {
+            write_format_description(&mut writer, description);
+        }
+        for (kind, attachments) in [
+            (PROPAGATED_ATTACHMENTS, &self.propagated_attachments),
+            (OTHER_ATTACHMENTS, &self.other_attachments),
+        ] {
+            if let Some(attachments) = attachments {
+                writer.begin(kind);
+                write_dictionary(&mut writer, attachments, false);
+                writer.end();
+            }
+        }
+        if let Some(attachments) = &self.sample_attachments {
+            writer.begin(SAMPLE_ATTACHMENTS);
+            write_array(&mut writer, attachments);
+            writer.end();
+        }
+        writer.end();
+        writer.finish()
+    }
+}
+
+/// Writes a property list leaf as an atom of `kind`.
+fn write_property_list(writer: &mut AtomWriter, kind: FourCc, value: &Value) {
+    writer.atom(kind, &plist::encode(value));
+}
+
+/// Writes a value by its type; `keep_empty` keeps an empty dictionary.
+fn write_value(writer: &mut AtomWriter, value: &SerializedValue, keep_empty: bool) {
+    match value {
+        SerializedValue::Dictionary(entries) => write_dictionary(writer, entries, keep_empty),
+        SerializedValue::Array(values) => write_array(writer, values),
+        SerializedValue::PropertyList(leaf) => {
+            let kind = match leaf {
+                Value::Boolean(_) => BOOLEAN,
+                Value::String(_) => STRING,
+                Value::Data(_) => BYTES,
+                Value::Date(_) => DATE,
+                _ => NUMBER,
+            };
+            write_property_list(writer, kind, leaf);
+        }
+        SerializedValue::Null => {
+            writer.atom(NULL, &[]);
+        }
+        SerializedValue::ColorSpace(leaf) => write_property_list(writer, COLOR_SPACE, leaf),
+        SerializedValue::Url(url) => {
+            write_property_list(writer, URL, &Value::String(url.clone()));
+        }
+        SerializedValue::FormatDescription(description) => {
+            write_format_description(writer, description);
+        }
+    }
+}
+
+/// Writes a `dict`, or nothing where it is empty and `keep_empty` is false; its entries pass
+/// `keep_empty` on to their values. A key the table knows is written by its index.
+fn write_dictionary(
+    writer: &mut AtomWriter,
+    entries: &[(String, SerializedValue)],
+    keep_empty: bool,
+) {
+    if entries.is_empty() && !keep_empty {
+        return;
+    }
+    writer.begin(DICTIONARY);
+    for (key, value) in entries {
+        writer.begin(ENTRY);
+        match known_keys::index_of(key) {
+            Some(index) => {
+                writer.atom(KEY_INDEX, &index.to_le_bytes());
+            }
+            None => write_property_list(writer, STRING, &Value::String(key.clone())),
+        }
+        write_value(writer, value, keep_empty);
+        writer.end();
+    }
+    writer.end();
+}
+
+/// Writes an `aray`, or nothing where it is empty; its elements keep their empty dictionaries.
+fn write_array(writer: &mut AtomWriter, values: &[SerializedValue]) {
+    if values.is_empty() {
+        return;
+    }
+    writer.begin(ARRAY);
+    for value in values {
+        write_value(writer, value, true);
+    }
+    writer.end();
+}
+
+/// Writes an `fdsc`.
+fn write_format_description(writer: &mut AtomWriter, description: &SerializedFormatDescription) {
+    writer.begin(FORMAT_DESCRIPTION);
+    writer.atom(MEDIA_TYPE, &description.media_type.0.to_le_bytes());
+    let mut dimensions = [0; 8];
+    dimensions[..4].copy_from_slice(&description.width.to_le_bytes());
+    dimensions[4..].copy_from_slice(&description.height.to_le_bytes());
+    writer.atom(DIMENSIONS, &dimensions);
+    writer.atom(CODEC, &description.codec.0.to_le_bytes());
+    if let Some(extensions) = &description.extensions {
+        writer.begin(EXTENSIONS);
+        write_dictionary(writer, extensions, false);
+        writer.end();
+    }
+    writer.end();
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -576,6 +720,46 @@ pub(crate) mod tests {
             sample.sample_attachment("NotSync"),
             Some(&SerializedValue::PropertyList(Value::Boolean(true)))
         );
+        Ok(())
+    }
+
+    /// The writer names every key the table knows by its index, `avcC` among them, where the
+    /// hand-written sample spells it: what it writes reads back as the same sample.
+    #[test]
+    fn a_sample_read_and_written_reads_back_the_same() -> Result<(), WireError> {
+        let record = [1, 0x64, 0, 0x0b, 0xff, 0xe0, 0];
+        let sample =
+            SampleBuffer::parse(&one_sample(&[0, 0, 0, 2, 0x65, 0x88], Some(&record), true))?;
+        assert_eq!(SampleBuffer::parse(&sample.serialize())?, sample);
+        Ok(())
+    }
+
+    #[test]
+    fn an_encoded_sample_written_reads_back() -> Result<(), WireError> {
+        let time = |value| MediaTime {
+            value,
+            timescale: 30,
+            flags: MediaTime::FLAG_VALID,
+            epoch: 0,
+        };
+        let no = SerializedValue::PropertyList(Value::Boolean(false));
+        let sample = SampleBuffer {
+            sample_count: 1,
+            timings: vec![SampleTiming {
+                duration: time(1),
+                presentation: time(4),
+                decode: time(4),
+            }],
+            sizes: vec![6],
+            data: Some(vec![0, 0, 0, 2, 0x65, 0x88]),
+            output_presentation_time: Some(time(4)),
+            sample_attachments: Some(vec![SerializedValue::Dictionary(vec![
+                ("DependsOnOthers".to_owned(), no.clone()),
+                ("EarlierDisplayTimesAllowed".to_owned(), no),
+            ])]),
+            ..SampleBuffer::default()
+        };
+        assert_eq!(SampleBuffer::parse(&sample.serialize())?, sample);
         Ok(())
     }
 

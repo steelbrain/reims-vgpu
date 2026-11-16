@@ -3284,7 +3284,7 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
             );
             if !lent.is_empty() {
                 let lends: Vec<u64> = lent.iter().map(|surface| surface.id()).collect();
-                link.send(&paravirt::decoder::surface_release(&lends));
+                link.send(&paravirt::surface_release(&lends));
             }
             answer.answer(RGFX_VT_STATUS_MALFORMED);
             return;
