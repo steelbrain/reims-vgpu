@@ -1817,6 +1817,18 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/target/ambrosia.bin \
   starts, after WindowServer has counted the displays, so WindowServer
   counts none and stays headless, while the processes that start later find
   the display.
+- **Several displays need Ambrosia 0.1.3.** On a device of two displays or
+  more (`reims-graphics-pci,displays=N`), the module takes `MULTI_DISPLAY`
+  where Ambrosia gives its graphics driver interface's revision 2, which
+  Ambrosia 0.1.3 is the first release to give, and reports the count; Ambrosia
+  then adds a node for each display `Graphics` > `DisplayNode` names, and the
+  arm64e kext drives each display with a node ([graphics-kext/design.md](graphics-kext/design.md),
+  "Multiple displays", A1 and A2). Our configuration names display 0's node
+  alone until Ambrosia 0.1.3 is released, since an earlier Ambrosia refuses a
+  list (`Graphics.DisplayNode is not a string`): with one name, Ambrosia
+  0.1.3 adds display 0's node and logs `graphics driver: N displays, but
+  Graphics.DisplayNode names nodes for only 1`, and the guest drives display 0
+  alone, the other windows black, as on Ambrosia 0.1.1 and 0.1.2.
 - **The boot.** The script boots APFS clones of the guest's disks (`cp -c`;
   `cp --reflink=always` on Linux) in its log directory and removes them at
   the end, with 8 GiB, 4 CPUs, the device, `REIMS_VGPU_WINDOW=0` and

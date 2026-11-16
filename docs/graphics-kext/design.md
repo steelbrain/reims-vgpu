@@ -3023,8 +3023,9 @@ boot before the change logged (`RgfxFeaturesOffered`, `RgfxFeaturesWanted`,
 or more. A guest that takes it, as it takes any bit ("Negotiated features"),
 is answered `DISPLAYS` with every display, ids 0 to count − 1, each connected,
 and gets each display's events. One that does not (the option ROM, Ambrosia's
-module as it is, a kext built before the bit, the arm64e kext until its lane
-lands) is answered display 0 alone, as by a device of one display: its
+module under Ambrosia's interface revision 1, a kext built before the bit, the
+arm64e kext where the firmware placed display 0's node alone) is answered
+display 0 alone, as by a device of one display: its
 commands for another display are refused `NO_DISPLAY`, as now, and the host
 sends it no `VBLANK` or `DISPLAY_CHANGED` of another display, since today's
 framebuffer reads neither event's display (`ReimsGraphics.cpp`, the completion
@@ -3095,9 +3096,10 @@ ratio that fits, in the same steps of 16 and 2, which the window draws as it
 draws any mode of other pixels (the window crate's `geometry`). So four
 displays take up to 3840 × 2160 each (31.6 MiB of 32), and two up to
 5120 × 2880 each (56.3 MiB of 64). With one display the host offers what it
-offers today. The option ROM and Ambrosia's module, which take no feature,
-scan out display 0 at `RGFX_ALLOCATIONS_OFFSET` in display 0's preferred mode,
-which the host's sizing keeps inside display 0's room.
+offers today. The option ROM and Ambrosia's module scan out display 0 at
+`RGFX_ALLOCATIONS_OFFSET` in display 0's preferred mode, which the host's
+sizing keeps inside display 0's room. The module, where it takes the bit (A1),
+also fits its mode to display 0's share of the span, as the host splits it.
 
 **One cursor slot.** The region keeps one cursor slot (`RGFX_CURSOR_SPAN` at
 its end). The host copies a `SET_CURSOR`'s image out of the region before it
@@ -3341,17 +3343,32 @@ where the bit was taken (X4). The x86-64 build carries the bit
 its own lane lands.
 
 **The arm64e kext.** `ReimsGraphics` stays display 0's IOMobileFramebuffer, on
-`/arm-io/reims-display0`. Each display i from 1 needs an IOMobileFramebuffer
-service of its own, on a node `/arm-io/reims-display<i>` that the firmware
-placed before the kernel started, with its own attributes (`IOMFBUUID` and
-`DisplayAttributes` carry the display's serial), timings, swaps (layer 0 its
-surface, layer 1 its cursor, `RgfxMobileCursor.hpp`), `VBLANK`s and
-republished modes. A1 and A2 (below) settle its shape before it is built.
+`/arm-io/reims-display0`, and each display i from 1 gets a head of the same
+class, as on x86-64, attached to the PCI device and started by display 0's
+start: an IOMobileFramebuffer service of its own on the node
+`/arm-io/reims-display<i>` the firmware placed, with its own attributes
+(`IOMFBUUID` and `DisplayAttributes` carry the display's serial), timings,
+swaps (layer 0 its surface, layer 1 its cursor, `RgfxMobileCursor.hpp`),
+`VBLANK`s and republished modes (`ReimsGraphicsMobile.cpp`). The kext takes the
+bit only where the firmware placed a node for display 1 as well as display 0
+(`RgfxFeatures.hpp`), and only displays with a node get a framebuffer
+(`rgfxFramebuffersOf`), since a process expects a service for each node it
+counts and the nodes are counted before the kext loads (A2). With display 0's
+node alone the kext writes the feature word it wrote before the bit and drives
+display 0 alone. The services register together (A2): the class's start
+registers its service as it ends, so the arm64e class overrides
+`registerService` (a Graft synthesized override, `graft-arm64e.json`), and
+display 0's start holds each display's registration while it starts the heads,
+then registers them back to back, display 0's first (`RgfxRegisterHold.hpp`).
+A head that fails to start, or a hold past 10 seconds, ends the hold at once,
+so display 0's service always registers; with one display nothing is held.
 
 **The option ROM** drives display 0 alone, unchanged: it takes no feature, so
 it sees one display, and its GOP framebuffer lies in display 0's room. Its
 bytes do not change. Displays 1 and up show black until the kext drives them.
-Ambrosia's module likewise brings up display 0 alone.
+Ambrosia's module likewise brings up display 0 alone; under Ambrosia's
+interface revision 2 it takes the bit only to count the displays for
+Ambrosia's nodes (A1).
 
 **reims-ctl.** A VM's `[display]` takes `count`, 1 to 4, saved only above 1,
 so a one-display VM's file is unchanged. It is the key reims-ctl saved for
@@ -3465,14 +3482,49 @@ it.
   `MULTI_DISPLAY`), and Ambrosia adds that many nodes from a list in the
   configuration; or `DisplayNode` takes a list, and each configuration bundle
   is made for one count. The first leaves no bundle that disagrees with its
-  device.
+  device. Answered by the first: Ambrosia's interface revision 2 (Ambrosia
+  0.1.3) turns the framebuffer's reserved word into `Displays`, and
+  `DisplayNode` takes a list of names, display 0's first, of which Ambrosia
+  adds a node for each display the module reports, as far as the names go.
+  The module takes `MULTI_DISPLAY` only under revision 2 and reports the count
+  (architecture.md 11.5). A single name still makes display 0's node alone,
+  which every Ambrosia from 0.1.1 takes; a list is refused before 0.1.3. So
+  our configuration gives the list (`reims-display0` to `reims-display3`, one
+  bundle for every count) once Ambrosia 0.1.3 is released, and the single
+  name until then, with which an arm64 guest drives display 0 alone.
 - A2, the arm64 services. How IOMobileFramebuffer.framework pairs the displays
   it counted with services, and what a second service of one kext needs for
   WindowServer to drive it (its index, its UUID, its swaps and cursor): read
   from macOS 14.6.1's and 27.0.1's framework (`iomfb_populate_all_display_infos`
   and the service matching) and from how AppleParavirtGPU publishes a display
   per port, kept local and never committed, then checked by a boot of arm64 14
-  with two displays under TCG.
+  with two displays under TCG. Read from 27.0.1 (the framework, and the kernel
+  collection's IOMobileGraphicsFamily and AppleParavirtGPU):
+  - The framework pairs by count alone. It counts the children of `/arm-io`
+    whose `device_type` is `display-subsystem` or `ext-display-subsystem`,
+    with an AppleParavirtGPU's `DisplayPortCount` where a child's
+    `compatible` names Apple's paravirtual GPU, and never compares a node's
+    name with a service. It then asks for the IOMobileFramebuffer services
+    by a first-match notification and takes those registered already; where
+    it has fewer than it counted, it runs its run loop once, for at most 30
+    seconds and returning after one source is handled, takes what that one
+    batch of notifications brought, and goes on with what it has. Each
+    service it takes is an entry of its display list (at most 16), named
+    `external-N` for an external display, numbered in the order taken. So a
+    service registered after that one batch is never driven by the process,
+    and the kext registers every display's service together.
+  - AppleParavirtGPU starts every display of its ports first (for each, an
+    AppleParavirtDisplay made, attached to the GPU and started) and registers
+    the GPU's service after them. IOMobileFramebufferLegacy's start takes the
+    display a framebuffer ID and an index of its own, from counts every
+    instance shares (at most 16), fails unless `start_hardware` answers true,
+    and registers the service as its last step, a virtual `registerService`
+    call, which a subclass can hold.
+  - A second service of one kext is a second instance of the class: its own
+    index, its UUID from its own display's serial, its own swap queue and
+    clients (the class's, per instance) and its own cursor plane, layer 1.
+  The reading of 14.6.1's framework is checked against this at the boot of
+  arm64 14 (below).
 - A3, the pointer on arm64: X1's question on an arm64 guest, found on mma64's
   first boot of arm64 14 with two displays, as X1 is.
 
