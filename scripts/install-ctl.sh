@@ -573,7 +573,16 @@ if [[ $BUILDS_QEMU == 1 && $SKIP_QEMU == 0 ]]; then
   "$STAGE$PREFIX/bin/$QEMU_BINARY" -device help 2>/dev/null | grep -q '"reims-graphics-pci"' || die "QEMU's install has no reims-graphics-pci: was it configured with reims-vgpu?"
   ID="$(date +%Y%m%d-%H%M%S)-$COMMIT"
   mkdir -p "$DATA/qemu"
-  mv "$STAGE$PREFIX" "$DATA/qemu/$ID"
+  if [[ $WINDOWS == 1 ]]; then
+    # Windows refuses to move a folder while a file in it is open, and just
+    # after the stage was written something held one: the move failed with
+    # "Permission denied", and the same move succeeded minutes later (measured
+    # on the mini, m3-max-36159 and m3-max-36188). Tried for a minute.
+    for _ in $(seq 60); do mv "$STAGE$PREFIX" "$DATA/qemu/$ID" 2>/dev/null && break; sleep 1; done
+    [[ -d $DATA/qemu/$ID ]] || mv "$STAGE$PREFIX" "$DATA/qemu/$ID"
+  else
+    mv "$STAGE$PREFIX" "$DATA/qemu/$ID"
+  fi
   rm -rf "$STAGE"
   if [[ $WINDOWS == 1 ]]; then
     # A junction, which needs no administrator, where MSYS2's ln -s copies.
