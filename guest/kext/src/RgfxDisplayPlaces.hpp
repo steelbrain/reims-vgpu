@@ -73,6 +73,14 @@
 // m3-max-35865), at the very pixel each later post of the crossing aims at, where it cannot be
 // told from theirs: the crossing still ends on its display's landing, and learns no place from
 // one after it.
+// Only a MOVE_CURSOR posted after the post shows what the post did: a display that showed the
+// cursor where the post's point is held at before the post went out showed nothing of it
+// (measured on arm64 15.6.1 under TCG, at two displays side by side in a 2x mode: a captured
+// drag left the cursor at display 1's left edge, the crossing onto display 0 posted there, and
+// at its deadline, the post not yet shown, display 1 still showed the cursor at the very pixel
+// that post's point was held at; taken for its outcome, the crossing posted beside display 1,
+// and the first post's late landing, taken for that one's, placed display 0 right of display 1,
+// potluck job m3-max-36173).
 //
 // Header-only and free of the kernel's headers, so its native test (tests/display_places_test.cpp)
 // builds it as the kext does.
@@ -338,6 +346,9 @@ struct RgfxCrossing {
 	// where its point lies or is held at: its landing may yet come, so no later one teaches a
 	// place.
 	bool unsure;
+	// The count of MOVE_CURSORs the kext had posted when the post out went out
+	// (RgfxCursorShown::seq): a display's last one at or below it is from before the post.
+	uint64_t postSeq;
 };
 
 // What a landing, or a wait for one, does to the crossing.
@@ -541,6 +552,8 @@ struct RgfxCursorShown {
 	bool visible;
 	int32_t x;
 	int32_t y;
+	// The count of MOVE_CURSORs the kext had posted, every display's, with that one.
+	uint64_t seq;
 };
 
 // Each display's, by its id.
@@ -574,8 +587,8 @@ inline bool rgfxCrossingShownAt(const RgfxDisplayPlaces &places, const RgfxCross
 // at the pixel the post aimed at, the cursor was there already, and the post, which moved it
 // nowhere, showed nothing: the crossing is over (`arrived`); otherwise the cursor is not there,
 // and the crossing, where one goes on, posts again (`again`), unsure of its places where no
-// display showed the cursor where the post's point lies or is held at (the header's comment).
-// `none` before the deadline or with no post out.
+// display showed the cursor where the post's point lies or is held at with a MOVE_CURSOR after
+// the post (the header's comment). `none` before the deadline or with no post out.
 inline RgfxCrossingStep rgfxCrossingWaited(const RgfxDisplayPlaces &places, RgfxCrossing *c,
                                            uint64_t now, const RgfxCursorsShown &shown)
 {
@@ -594,7 +607,8 @@ inline RgfxCrossingStep rgfxCrossingWaited(const RgfxDisplayPlaces &places, Rgfx
 	}
 	bool seen = held;
 	for (uint32_t d = 0; d < RGFX_DISPLAYS_MAX && !seen; d++)
-		seen = rgfxCrossingShownAt(places, *c, d, shown.at[d], &past);
+		seen = shown.at[d].seq > c->postSeq &&
+		       rgfxCrossingShownAt(places, *c, d, shown.at[d], &past);
 	if (!seen)
 		c->unsure = true;
 	return RgfxCrossingStep::again;

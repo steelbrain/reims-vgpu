@@ -782,11 +782,14 @@ private:
 	// thread call began a crossing for (pointerCrossed). landingCall gives up a post's landing
 	// after kRgfxLandingWaitNs. cursorLanded takes each display's MOVE_CURSOR that shows the
 	// cursor, from the swap, in the class's gate. Crossings that ended with the cursor elsewhere
-	// are counted (crossingsMissed), the first logged.
+	// are counted (crossingsMissed), the first logged. cursorMoves counts the MOVE_CURSORs every
+	// display posted (each display's last numbered in its mobileCursor.seq), so a post's deadline
+	// tells the cursor shown after the post from the cursor shown before it (crossing.postSeq).
 	RgfxDisplayPlaces places;
 	RgfxCrossing crossing;
 	UInt64 pointerTold;
 	UInt64 pointerCrossed;
+	UInt64 cursorMoves;
 	UInt32 crossingsMissed;
 	thread_call_t landingCall;
 	static void landingWaited(thread_call_param_t self, thread_call_param_t);

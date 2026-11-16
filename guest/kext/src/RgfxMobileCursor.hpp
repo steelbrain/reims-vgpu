@@ -142,6 +142,9 @@ struct RgfxMobileCursor {
 	int32_t x;
 	int32_t y;
 	bool visible;
+	// The count of MOVE_CURSORs the kext had posted, every display's, with the one posted last
+	// (RgfxCursorShown::seq).
+	uint64_t seq;
 
 	// Whether a swap's surface of `surfaceId` and `seed` is the one taken last, so that what was
 	// found of it stands.

@@ -1090,6 +1090,7 @@ bool ReimsGraphics::postMobileCursorMove(int32_t x, int32_t y, bool visible)
 		return false;
 	mobileCursor.posted(mx, my, visible);
 	ReimsGraphics *owner = isHead() ? device : this;
+	mobileCursor.seq = __atomic_add_fetch(&owner->cursorMoves, 1, __ATOMIC_ACQ_REL);
 	if (visible)
 		owner->cursorLanded(displayId, mx, my);
 	owner->tellBounds();

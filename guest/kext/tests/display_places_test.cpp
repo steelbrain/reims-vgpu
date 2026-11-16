@@ -98,7 +98,7 @@ Crossed cross(RgfxDisplayPlaces *places, RgfxCrossing *c, const Desktop &desk, u
 			*now = rgfxCrossingDeadline(*c);
 			RgfxCursorsShown shown = {};
 			if (desk.shown && desk.on < RGFX_DISPLAYS_MAX)
-				shown.at[desk.on] = {true, desk.ax, desk.ay};
+				shown.at[desk.on] = {true, desk.ax, desk.ay, c->postSeq + 1};
 			s = rgfxCrossingWaited(*places, c, *now, shown);
 		}
 		if (s == RgfxCrossingStep::arrived) {
@@ -129,11 +129,12 @@ Desktop twoSideBySide()
 // The cursor shown on no display.
 const RgfxCursorsShown kNoCursor = {};
 
-// The cursor shown on display `d` alone, at pixel `x`, `y`.
-RgfxCursorsShown shownOn(uint32_t d, int32_t x, int32_t y)
+// The cursor shown on display `d` alone, at pixel `x`, `y`, by a MOVE_CURSOR numbered `seq` (by
+// default after any post, whose crossing's postSeq stays 0).
+RgfxCursorsShown shownOn(uint32_t d, int32_t x, int32_t y, uint64_t seq = 1)
 {
 	RgfxCursorsShown s = {};
-	s.at[d] = {true, x, y};
+	s.at[d] = {true, x, y, seq};
 	return s;
 }
 
@@ -622,6 +623,50 @@ int main()
 		// The next crossing is sure again.
 		rgfxCrossingStart(&c, 1, 1910, 500, now);
 		check(!c.unsure, "a new crossing is sure");
+	}
+
+	// A display that showed the cursor where the post's point is held at before the post went out
+	// shows nothing of it (measured on 15.6.1 under TCG: a captured drag left the cursor at display
+	// 1's left edge, and the crossing onto display 0 posted at display 0's own place; at the
+	// deadline, that post not yet shown, display 1 still showed the cursor there). Both displays
+	// confirmed side by side; a crossing onto display 0 at 1900,300; the cursor on display 1 at
+	// pixel 0,300, where that post's point is held at display 1's left edge.
+	{
+		Desktop desk = twoSideBySide();
+		RgfxDisplayPlaces places = {};
+		RgfxCrossing c = {};
+		cross(&places, &c, desk, 1, 10, 400, &now);
+		cross(&places, &c, desk, 0, 959, 174, &now);
+		check(confirmedCount(places) == 2, "both confirmed");
+		bool confirmed = true;
+		int32_t gx = 0, gy = 0;
+		for (int fresh = 0; fresh < 2; fresh++) {
+			RgfxDisplayPlaces p = places;
+			rgfxCrossingStart(&c, 0, 1900, 300, now);
+			check(rgfxCrossingNext(p, &c, now, &gx, &gy) && gx == 1900 && gy == 300,
+			      "a post at display 0's own place");
+			c.postSeq = 40;
+			const RgfxCrossingStep s =
+			    rgfxCrossingWaited(p, &c, now + kRgfxLandingWaitNs, shownOn(1, 0, 300, 40 + fresh));
+			check(s == RgfxCrossingStep::again && c.unsure == !fresh,
+			      fresh ? "shown there after the post: its outcome, sure"
+			            : "shown there before the post: nothing of it, unsure");
+			check(rgfxCrossingNext(p, &c, now + kRgfxLandingWaitNs, &gx, &gy) && gx == 5740,
+			      "posted again beside display 1, right of it");
+			c.postSeq = 41 + fresh;
+			// The first post's landing, late, at the pixel both aim at.
+			check(rgfxCrossingLanded(&p, &c, 0, 1900, 300, now + kRgfxLandingWaitNs + 90000000,
+			                         &confirmed) == RgfxCrossingStep::arrived,
+			      "on display 0: arrived");
+			if (!fresh)
+				check(!confirmed && same(p.at[0].rect, 0, 0, 1920, 1080) &&
+				          p.at[0].state == RgfxPlaceState::confirmed,
+				      "unsure: display 0 keeps its confirmed place");
+			else
+				check(same(p.at[0].rect, 3840, 0, 5760, 1080),
+				      "sure: taken for the second post's landing, display 0 placed right of 1");
+			now += 1000000000;
+		}
 	}
 
 	std::printf("display_places_test: %d checks passed\n", checks);

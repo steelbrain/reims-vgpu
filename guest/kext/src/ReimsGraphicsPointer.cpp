@@ -269,6 +269,8 @@ void ReimsGraphics::movePointer(thread_call_param_t self, thread_call_param_t)
 	rgfxPlacesFit(&me->places, modes);
 	const bool going = me->crossing.active;
 	const bool posting = rgfxCrossingNext(me->places, &me->crossing, now, &gx, &gy);
+	if (posting)
+		me->crossing.postSeq = __atomic_load_n(&me->cursorMoves, __ATOMIC_ACQUIRE);
 	const bool missed = going && !me->crossing.active;
 	const UInt32 target = me->crossing.display;
 	const UInt32 posts = me->crossing.posts;
@@ -319,7 +321,8 @@ void ReimsGraphics::landingWaited(thread_call_param_t self, thread_call_param_t)
 	for (UInt32 i = 0; i < n; i++) {
 		const RgfxMobileCursor &cursor = fbs[i]->mobileCursor;
 		if (fbs[i]->displayId < RGFX_DISPLAYS_MAX)
-			shown.at[fbs[i]->displayId] = {cursor.moved && cursor.visible, cursor.x, cursor.y};
+			shown.at[fbs[i]->displayId] = {cursor.moved && cursor.visible, cursor.x, cursor.y,
+			                               cursor.seq};
 	}
 	releaseDisplays(fbs, n);
 	IOSimpleLockLock(me->interruptLock);

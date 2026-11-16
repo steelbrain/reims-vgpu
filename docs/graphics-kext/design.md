@@ -3342,6 +3342,13 @@ pixels of its mode, and the buttons held):
     at the same pixel of its display, so such a landing cannot be told from
     the later post's: the crossing ends on its display's landing, as any
     does, and learns no place from a landing after that post.
+    Only a MOVE_CURSOR posted after the post counts as what it did: the
+    kext numbers each one, and a display whose last one came before the
+    post shows nothing of it. On 15.6.1 under TCG a captured drag had left
+    the cursor at display 1's left edge, where the post onto display 0 is
+    held, and taken for that post's outcome, the crossing's next post and
+    the first post's late landing placed display 0 right of display 1
+    (potluck job m3-max-36173).
   - **Learning a place.** A landing whose pixel lies where the post's
     placement puts the posted point, 16 pixels or more from the corner on an
     axis, confirms that placement as the display's rectangle. One that
