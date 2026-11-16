@@ -144,7 +144,12 @@
 //  - PIPELINE_ANSWERS (bit 47), meaningful only with PIPELINE_KEYS: the framebuffer's start
 //    seeds the answers it keeps for every process (RgfxSharedPipelines.hpp) with those the device
 //    kept of keyed creates of its earlier runs (RGFX_CMD_PIPELINE_ANSWERS), so a create of a key
-//    an earlier boot made need not wait either.
+//    an earlier boot made need not wait either;
+//  - MULTI_DISPLAY (bit 48), the x86-64 kext alone for now: where the device has two displays or
+//    more, its DISPLAYS answer lists them all and it sends each one's events, and the framebuffer
+//    drives each display with an IOFramebuffer of its own (ReimsGraphics.hpp, RgfxDisplayTable.hpp),
+//    which needs nothing of the bundle. The arm64e kext drives display 0 alone until its
+//    framebuffers for the others land (design.md, "Multiple displays").
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -185,7 +190,8 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_FUNCTION_POINTERS | RGFX_FEATURE_DYNAMIC_LIBRARIES | RGFX_FEATURE_PIPELINE_KEYS |
     RGFX_FEATURE_ICB_SLOTS_IN_PAGES | RGFX_FEATURE_DOORBELL_ASKS | RGFX_FEATURE_GUEST_TIMES |
     RGFX_FEATURE_READ_ONLY_PAGES | RGFX_FEATURE_DOORBELL_PAGES | RGFX_FEATURE_PIPELINE_ANSWERS |
-    (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K : RGFX_FEATURE_DISPLAY_POWER);
+    (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K
+                      : RGFX_FEATURE_DISPLAY_POWER | RGFX_FEATURE_MULTI_DISPLAY);
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
 inline uint64_t rgfxDriverFeatures(uint64_t offered)
