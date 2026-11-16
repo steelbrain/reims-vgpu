@@ -3311,7 +3311,16 @@ pixels of its mode, and the buttons held):
     past that display's edge or at its first pixel (27.0.1, job
     m3-max-35515): that is no landing, and a pixel at the edge where the
     post's point lies within a cursor's reach (256 points) past it is waited
-    on for 50 ms for the landing aimed at before the crossing posts again.
+    on for the landing aimed at as long as any post's landing is, 250 ms
+    after the post, and 50 ms after the image at the least, before the
+    crossing posts again. Under TCG that landing can come well after the
+    image: on 15.6.1 a captured drag back onto display 0 posted at its
+    right edge showed the image at display 1's first pixel 7 ms after the
+    post; after a wait of 50 ms alone the crossing posted again beside
+    display 1, and display 0's landing, 139 ms after the first post, was
+    taken for the second's (potluck job m3-max-36695). In job m3-max-36608
+    the host was then told display 0 right of display 1, by its log, and
+    sent its pointer back onto display 1.
   - **The guess.** A display starts where WindowServer places a new one:
     side by side in their order, tops at 0, each its mode's size at 1x on a
     1x screen and half of it above 1x, as arm64's WindowServer runs it ("The

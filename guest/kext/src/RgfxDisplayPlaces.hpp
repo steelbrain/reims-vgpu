@@ -60,8 +60,15 @@
 //    there, or its image reaching over the edge from the display beside it, whose hot spot was
 //    shown at the edge's pixel too (measured on arm64 27.0.1: a post at 1915,650 of display 0,
 //    1920 wide, showed the cursor on display 1 at 0,650 before display 0's landing; job
-//    m3-max-35515): the crossing waits kRgfxSpillWaitNs for the landing on the display aimed at
-//    before it posts again;
+//    m3-max-35515): the crossing waits for the landing on the display aimed at as long as for
+//    any post's, and kRgfxSpillWaitNs after the image at the least, before it posts again, as
+//    under TCG that landing may come well after the image (measured on arm64 15.6.1, at two
+//    displays side by side in a 2x mode: a captured drag back onto display 0 posted at its right
+//    edge, 1007,64, showed the image at display 1's first pixel 7 ms after the post, and after
+//    a wait of kRgfxSpillWaitNs alone the crossing posted again beside display 1, where display
+//    0's landing, 139 ms after the first post, was taken for the second's, potluck job
+//    m3-max-36695; in job m3-max-36608 the host was then told display 0 right of display 1, by
+//    its log, and sent its pointer back onto display 1);
 //  - a hot spot past the display's edge is the image over it alone.
 // A post that shows no move in kRgfxLandingWaitNs left the cursor where it was: at the pixel it
 // aimed at already, where the crossing's display last showed the cursor there (the host told the
@@ -112,8 +119,9 @@
 constexpr uint32_t kRgfxCrossingPosts = 4;
 // How long a post waits for its landing: past it, the cursor is taken to have stayed where it was.
 constexpr uint64_t kRgfxLandingWaitNs = 250000000;
-// How long a landing that may be the cursor's image over another display's edge waits for the
-// landing on the display aimed at.
+// How long after a landing that may be the cursor's image over another display's edge the post
+// waits for the landing on the display aimed at, at the least: it waits kRgfxLandingWaitNs after
+// the post in any case.
 constexpr uint64_t kRgfxSpillWaitNs = 50000000;
 // How far past a display's edge, in points, the cursor's image may reach over it.
 constexpr int64_t kRgfxSpillReach = RGFX_CURSOR_MAX_SIZE;
@@ -356,7 +364,8 @@ struct RgfxCrossing {
 	uint64_t postedAt;
 	uint64_t postStartedAt; // the startedAt of the crossing it was posted for
 	// Another display showed the cursor where the post's point is held at its edge, within a
-	// cursor's reach of it, at `heldAt`: the landing aimed at is waited for kRgfxSpillWaitNs.
+	// cursor's reach of it, at `heldAt`: the landing aimed at is waited for still
+	// (rgfxCrossingDeadline).
 	bool held;
 	uint64_t heldAt;
 	// How long after its post the last landing on the display aimed at came.
@@ -562,11 +571,13 @@ inline RgfxCrossingStep rgfxCrossingLanded(RgfxDisplayPlaces *places, RgfxCrossi
 	return c->active ? RgfxCrossingStep::again : RgfxCrossingStep::none;
 }
 
-// When the post out is no longer waited for: kRgfxLandingWaitNs after it, or kRgfxSpillWaitNs
-// after a landing held it.
+// When the post out is no longer waited for: kRgfxLandingWaitNs after it, and, where a landing
+// held it, kRgfxSpillWaitNs after that at the earliest.
 inline uint64_t rgfxCrossingDeadline(const RgfxCrossing &c)
 {
-	return c.held ? c.heldAt + kRgfxSpillWaitNs : c.postedAt + kRgfxLandingWaitNs;
+	const uint64_t posted = c.postedAt + kRgfxLandingWaitNs;
+	const uint64_t held = c.heldAt + kRgfxSpillWaitNs;
+	return c.held && held > posted ? held : posted;
 }
 
 // The cursor as a display's last MOVE_CURSOR showed it: whether it is shown, and its hot spot's
