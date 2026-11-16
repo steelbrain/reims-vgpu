@@ -1094,6 +1094,9 @@ Stages:
           the runtime's own GPU, no second device or swapchain, a surface
           the mirror does not carry (not 4 or 8 bytes a pixel), or a
           mirror, sync, import or texture refused.
+        - *um870's compositor.* Since 2026-11-15 um870's KWin composites on
+          its RTX 3090 (DRM 226:129, `renderD129`, 0000:67:00.0), not on its
+          Radeon 780M as in the measurements of 2026-11-13 and 11-14 below.
         - *Measured 2026-11-13: route 1 against today.* The walk above on
           um870's RTX 3090, whose compositor composites on its Radeon 780M,
           with every GPU's driver listed to QEMU and the 3090 picked: route
