@@ -36,7 +36,7 @@
 //!
 //! On Windows the scratch file is a shared view of it (`CreateFileMapping`), whose writes reach
 //! the file however the child ends. An abort there is a fast fail no handler sees, so core's death
-//! marks itself on the dying thread before it aborts ([`dying`]), and a fault is marked by the
+//! marks itself on the dying thread before it aborts (`dying`), and a fault is marked by the
 //! child's unhandled-exception filter on the faulting thread (`sys::arm`). A death's record carries
 //! the signal a Unix child would have died of. The body shares no memory in place there
 //! ([`Child::share_ram`] and [`Child::share_region`] are Linux's and macOS's): heap pages cannot be
