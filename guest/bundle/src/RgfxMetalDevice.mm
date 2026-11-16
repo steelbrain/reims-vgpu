@@ -586,9 +586,9 @@ void rgfxKextSurfaceWrites(void *context, uint64_t queue, uint64_t seqno, const 
 	// A refusal leaves the surfaces' CPU locks waiting for nothing; the kext logs it too.
 	static std::atomic<int> refusals{0};
 	if (r != KERN_SUCCESS && refusals.fetch_add(1) < 4)
-		NSLog(@"RGFX: the kext refused the naming of %u surface writes of queue %llu's buffer %llu "
-		      @"(0x%x)",
-		      count, (unsigned long long)queue, (unsigned long long)seqno, r);
+		rgfxLogLine(@"RGFX: the kext refused the naming of %u surface writes of queue %llu's buffer %llu "
+		            @"(0x%x)",
+		            count, (unsigned long long)queue, (unsigned long long)seqno, r);
 }
 
 void rgfxKextSurfaceRetire(void *context, uint64_t queue, uint64_t seqno)
@@ -1206,10 +1206,10 @@ RGFX_LOG_UNRECOGNIZED
 	    rgfxKextConn(&_link), kRgfxAccelMethodSurfaceScanout, in, 2, out, &outCount);
 	static std::atomic<int> logged{0};
 	if (logged.fetch_add(1) < 8) {
-		NSLog(@"RGFX: newTextureWithSurface:0x%lx buffer:%lu -> 0x%x: offset 0x%llx, %llu bytes, "
-		      @"%llux%llu, %llu bytes a row",
-		      static_cast<unsigned long>(surfaceId), static_cast<unsigned long>(buffer), kr,
-		      out[0], out[1], out[2], out[3], out[4]);
+		rgfxLogLine(@"RGFX: newTextureWithSurface:0x%lx buffer:%lu -> 0x%x: offset 0x%llx, %llu bytes, "
+		            @"%llux%llu, %llu bytes a row",
+		            static_cast<unsigned long>(surfaceId), static_cast<unsigned long>(buffer), kr,
+		            out[0], out[1], out[2], out[3], out[4]);
 	}
 	if (kr != KERN_SUCCESS || outCount != 5) {
 		return nil;
@@ -2063,9 +2063,9 @@ RGFX_LOG_UNRECOGNIZED
 	const uint64_t profile = rgfx_profile::forGuest(metalHasArchitecture);
 	static std::atomic<bool> logged{false};
 	if (!logged.exchange(true)) {
-		NSLog(@"RGFX: feature profile %llu: the guest's Metal %s the MTLArchitecture class "
-		      @"(logged once a process)",
-		      (unsigned long long)profile, metalHasArchitecture ? "has" : "lacks");
+		rgfxLogLine(@"RGFX: feature profile %llu: the guest's Metal %s the MTLArchitecture class "
+		            @"(logged once a process)",
+		            (unsigned long long)profile, metalHasArchitecture ? "has" : "lacks");
 	}
 	return profile;
 }

@@ -143,8 +143,10 @@ repeats the ones code cites.
     The bundle's os_log lines go to its own subsystem,
     `ai.aneesiqbal.reims-graphics`, category `bundle` (`RgfxLog.hpp`), so
     `log config --subsystem ai.aneesiqbal.reims-graphics` sets the level
-    they are kept and persisted at; its NSLog lines are at the default
-    level, which the log store keeps, and carry no subsystem. Both start
+    they are kept and persisted at. Its Objective-C sources log through
+    `rgfxLogLine`, at the default level, which the log store keeps, with
+    the whole line public: an NSLog argument that is an object or a string
+    made at run time reads `<private>` in macOS 26's log. Its lines start
     `RGFX:`.
 - Tests sit in `mod tests` beside the code and are named by behaviour.
 - **Integers**: std spells wrapping, overflowing, widening and sign

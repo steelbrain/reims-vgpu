@@ -9,6 +9,7 @@
 #import "RgfxGLFunction.h"
 #import "RgfxLibrary.h"
 #import "RgfxTexture.h" // rgfxAppleGPU
+#include "RgfxLog.hpp"
 
 #include <mutex>
 #include <set>
@@ -24,7 +25,7 @@ void logOnce(NSString *what, NSString *why)
 	static std::set<std::string> said;
 	std::lock_guard<std::mutex> hold(lock);
 	if (said.insert(why.UTF8String).second)
-		NSLog(@"RGFX: %@: no reflection (%@); answered nil", what, why);
+		rgfxLogLine(@"RGFX: %@: no reflection (%@); answered nil", what, why);
 }
 
 // A kernel's entry as its pipeline of OpenCL mode binds it (RgfxClMode.hpp; measured: macOS

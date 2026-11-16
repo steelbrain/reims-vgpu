@@ -12,6 +12,7 @@
 #import "RgfxBuffer.h"
 #include "RgfxLogOnce.hpp"
 #include "RgfxSerializer.hpp"
+#include "RgfxLog.hpp"
 
 namespace {
 
@@ -46,7 +47,7 @@ float floatOf(uint64_t bits)
 // creation, and compiles a Mutable map at its creation, so no answer of its is the host's.
 [[noreturn]] void endsTheProcess(const char *call)
 {
-	NSLog(@"RGFX: -[RgfxRasterizationRateMap %s] ends the process, as Metal's map does", call);
+	rgfxLogLine(@"RGFX: -[RgfxRasterizationRateMap %s] ends the process, as Metal's map does", call);
 	abort();
 }
 
@@ -54,8 +55,8 @@ void noteNoAnswer(const char *call, uint32_t status)
 {
 	static char site;
 	if (rgfxLogFirst(&site, rgfxLogKindOf(call) ^ status))
-		NSLog(@"RGFX: rasterization rate map %s: the host answered nothing (status 0x%x)", call,
-		      status);
+		rgfxLogLine(@"RGFX: rasterization rate map %s: the host answered nothing (status 0x%x)", call,
+		            status);
 }
 
 } // namespace
@@ -129,8 +130,8 @@ float RgfxRateMapMinFactorOf(MTLRasterizationRateMapDescriptor *d)
 	if (serializer->refused(created) || created.status != RGFX_STATUS_OK) {
 		static char site;
 		if (rgfxLogFirst(&site, created.status))
-			NSLog(@"RGFX: newRasterizationRateMapWithDescriptor: no map (status 0x%x)",
-			      created.status);
+			rgfxLogLine(@"RGFX: newRasterizationRateMapWithDescriptor: no map (status 0x%x)",
+			            created.status);
 		return nil;
 	}
 	RgfxRasterizationRateMap *map = [[RgfxRasterizationRateMap alloc] initWithObjId:created.obj_id

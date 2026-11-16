@@ -21,6 +21,7 @@
 #include "RgfxRegion.hpp"
 #include "../../kext/src/RgfxUserClientABI.hpp" // kRgfxPagesChunk
 #include "RgfxSerializer.hpp"
+#include "RgfxLog.hpp"
 
 namespace {
 
@@ -222,9 +223,9 @@ NSRange RgfxIcbClamp(id icb, NSRange range)
 	if (serializer->refused(created) || created.status != RGFX_STATUS_OK) {
 		static char site;
 		if (rgfxLogFirst(&site, created.status))
-			NSLog(@"RGFX: newIndirectCommandBufferWithDescriptor: no buffer of %lu commands "
-			      @"(status 0x%x)",
-			      (unsigned long)maxCount, created.status);
+			rgfxLogLine(@"RGFX: newIndirectCommandBufferWithDescriptor: no buffer of %lu commands "
+			            @"(status 0x%x)",
+			            (unsigned long)maxCount, created.status);
 		return nil;
 	}
 	RgfxIndirectCommandBuffer *icb = [[RgfxIndirectCommandBuffer alloc] initWithObjId:created.obj_id

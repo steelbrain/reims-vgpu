@@ -16,6 +16,7 @@
 
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
+#include "RgfxLog.hpp"
 
 namespace {
 
@@ -189,7 +190,7 @@ NSArray<MTLArgumentDescriptor *> *RgfxDescriptorsOfArguments(MTLStructType *type
 	if (region == nullptr || serializer == nullptr || arguments.count > UINT32_MAX) {
 		static char site;
 		if (rgfxLogFirst(&site))
-			NSLog(@"RGFX: newArgumentEncoderWithArguments: no encoder: no device region");
+			rgfxLogLine(@"RGFX: newArgumentEncoderWithArguments: no encoder: no device region");
 		return nil;
 	}
 	std::vector<RgfxArgumentDescriptor> wire;
@@ -208,8 +209,8 @@ NSArray<MTLArgumentDescriptor *> *RgfxDescriptorsOfArguments(MTLStructType *type
 	if (!layout) {
 		static char site;
 		if (rgfxLogFirst(&site, rgfxLogKindOf(why)))
-			NSLog(@"RGFX: newArgumentEncoderWithArguments: (%lu arguments): no encoder: %s",
-			      static_cast<unsigned long>(arguments.count), why);
+			rgfxLogLine(@"RGFX: newArgumentEncoderWithArguments: (%lu arguments): no encoder: %s",
+			            static_cast<unsigned long>(arguments.count), why);
 		return nil;
 	}
 	return [[self alloc] initWithLayout:layout device:device serializer:serializer];
@@ -241,9 +242,9 @@ NSArray<MTLArgumentDescriptor *> *RgfxDescriptorsOfArguments(MTLStructType *type
 	    function.rgfxLibraryObjId == RGFX_OBJ_NONE) {
 		static char site;
 		if (rgfxLogFirst(&site))
-			NSLog(@"RGFX: newArgumentEncoderWithBufferIndex:%lu: no encoder: no device region or "
-			      @"library",
-			      static_cast<unsigned long>(bufferIndex));
+			rgfxLogLine(@"RGFX: newArgumentEncoderWithBufferIndex:%lu: no encoder: no device region or "
+			            @"library",
+			            static_cast<unsigned long>(bufferIndex));
 		return nil;
 	}
 	const char *why = "";
@@ -259,8 +260,8 @@ NSArray<MTLArgumentDescriptor *> *RgfxDescriptorsOfArguments(MTLStructType *type
 	if (!layout) {
 		static char site;
 		if (rgfxLogFirst(&site, rgfxLogKindOf(why)))
-			NSLog(@"RGFX: newArgumentEncoderWithBufferIndex:%lu of %s: no encoder: %s",
-			      static_cast<unsigned long>(bufferIndex), function.rgfxEntryPointUTF8, why);
+			rgfxLogLine(@"RGFX: newArgumentEncoderWithBufferIndex:%lu of %s: no encoder: %s",
+			            static_cast<unsigned long>(bufferIndex), function.rgfxEntryPointUTF8, why);
 		return nil;
 	}
 	return [[self alloc] initWithLayout:layout device:device serializer:serializer];
@@ -285,9 +286,9 @@ NSArray<MTLArgumentDescriptor *> *RgfxDescriptorsOfArguments(MTLStructType *type
 	if (arguments == nil) {
 		static char site;
 		if (rgfxLogFirst(&site))
-			NSLog(@"RGFX: newArgumentEncoderWithBufferBinding: %@: no encoder: a member is a "
-			      @"struct, which no argument descriptor names",
-			      binding.name);
+			rgfxLogLine(@"RGFX: newArgumentEncoderWithBufferBinding: %@: no encoder: a member is a "
+			            @"struct, which no argument descriptor names",
+			            binding.name);
 		return nil;
 	}
 	return [self encoderOfArguments:arguments region:region device:device serializer:serializer];
@@ -333,8 +334,8 @@ NSArray<MTLArgumentDescriptor *> *RgfxDescriptorsOfArguments(MTLStructType *type
 	if (_argumentBuffer == nil) {
 		static char site;
 		if (rgfxLogFirst(&site, reinterpret_cast<uintptr_t>(cmd)))
-			NSLog(@"RGFX: -[MTLArgumentEncoder %s]: no argument buffer set; nothing written",
-			      sel_getName(cmd));
+			rgfxLogLine(@"RGFX: -[MTLArgumentEncoder %s]: no argument buffer set; nothing written",
+			            sel_getName(cmd));
 		return nullptr;
 	}
 	uint8_t *contents = static_cast<uint8_t *>(_argumentBuffer.contents);
@@ -347,9 +348,9 @@ NSArray<MTLArgumentDescriptor *> *RgfxDescriptorsOfArguments(MTLStructType *type
 	    start + size > _argumentBuffer.length) {
 		static char site;
 		if (rgfxLogFirst(&site, reinterpret_cast<uintptr_t>(cmd)))
-			NSLog(@"RGFX: -[MTLArgumentEncoder %s]: index %lu lies past the argument buffer, "
-			      @"or in one the CPU cannot write; nothing written",
-			      sel_getName(cmd), static_cast<unsigned long>(index));
+			rgfxLogLine(@"RGFX: -[MTLArgumentEncoder %s]: index %lu lies past the argument buffer, "
+			            @"or in one the CPU cannot write; nothing written",
+			            sel_getName(cmd), static_cast<unsigned long>(index));
 		return nullptr;
 	}
 	return contents + start;

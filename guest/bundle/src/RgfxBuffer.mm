@@ -858,12 +858,12 @@ RGFX_RESOURCE_SPI
 		return NO;
 	static std::atomic<bool> logged{false};
 	if (!logged.exchange(true)) {
-		NSLog(@"RGFX: a texture of type %lu over buffer 0x%llx of %lu bytes past its allocation "
-		      @"(offset %lu, %lu bytes a row, %lu x %lu%s): answered nil",
-		      (unsigned long)descriptor.textureType, (unsigned long long)[self rgfxObjId],
-		      (unsigned long)[self length], (unsigned long)offset, (unsigned long)bytesPerRow,
-		      (unsigned long)descriptor.width, (unsigned long)descriptor.height,
-		      apple != 0 ? ", an Apple GPU's rules" : "");
+		rgfxLogLine(@"RGFX: a texture of type %lu over buffer 0x%llx of %lu bytes past its allocation "
+		            @"(offset %lu, %lu bytes a row, %lu x %lu%s): answered nil",
+		            (unsigned long)descriptor.textureType, (unsigned long long)[self rgfxObjId],
+		            (unsigned long)[self length], (unsigned long)offset, (unsigned long)bytesPerRow,
+		            (unsigned long)descriptor.width, (unsigned long)descriptor.height,
+		            apple != 0 ? ", an Apple GPU's rules" : "");
 	}
 	return YES;
 }
@@ -952,10 +952,10 @@ RGFX_RESOURCE_SPI
 		if (bytesPerRow < rowBytes) {
 			static std::atomic<bool> logged{false};
 			if (!logged.exchange(true)) {
-				NSLog(@"RGFX: a texture buffer over buffer 0x%llx of %lu bytes a row, fewer than its "
-				      @"%llu texels' bytes: answered nil",
-				      (unsigned long long)[self rgfxObjId], (unsigned long)bytesPerRow,
-				      (unsigned long long)rowBytes);
+				rgfxLogLine(@"RGFX: a texture buffer over buffer 0x%llx of %lu bytes a row, fewer than its "
+				            @"%llu texels' bytes: answered nil",
+				            (unsigned long long)[self rgfxObjId], (unsigned long)bytesPerRow,
+				            (unsigned long long)rowBytes);
 			}
 			return nil;
 		}
@@ -965,9 +965,9 @@ RGFX_RESOURCE_SPI
 			rgfxLinearTypeDies(descriptor, type, @"MTLTextureType2D");
 		static std::atomic<bool> logged{false};
 		if (!logged.exchange(true)) {
-			NSLog(@"RGFX: a texture over buffer 0x%llx of type %lu, not 2D, which the host does "
-			      @"not carry: answered nil",
-			      (unsigned long long)[self rgfxObjId], (unsigned long)descriptor.textureType);
+			rgfxLogLine(@"RGFX: a texture over buffer 0x%llx of type %lu, not 2D, which the host does "
+			            @"not carry: answered nil",
+			            (unsigned long long)[self rgfxObjId], (unsigned long)descriptor.textureType);
 		}
 		return nil;
 	}
@@ -984,9 +984,9 @@ RGFX_RESOURCE_SPI
 		    rgfxDeviceMakesNoTextureOf(descriptor, self.device, /*overBuffer=*/true)) {
 			static std::atomic<bool> logged{false};
 			if (!logged.exchange(true)) {
-				NSLog(@"RGFX: a texture over buffer 0x%llx of format %llu, which "
-				      @"the host does not carry: answered nil",
-				      (unsigned long long)[self rgfxObjId], (unsigned long long)f);
+				rgfxLogLine(@"RGFX: a texture over buffer 0x%llx of format %llu, which "
+				            @"the host does not carry: answered nil",
+				            (unsigned long long)[self rgfxObjId], (unsigned long long)f);
 			}
 			return nil;
 		}
@@ -1046,27 +1046,27 @@ RGFX_RESOURCE_SPI
 	if (descriptor.storageMode != MTLStorageModeManaged) {
 		static std::atomic<bool> logged{false};
 		if (!logged.exchange(true)) {
-			NSLog(@"RGFX: a tiled texture over buffer 0x%llx with descriptor storage %lu, not "
-			      @"Managed, which Metal's validation asserts at: answered nil",
-			      (unsigned long long)[self rgfxObjId], (unsigned long)descriptor.storageMode);
+			rgfxLogLine(@"RGFX: a tiled texture over buffer 0x%llx with descriptor storage %lu, not "
+			            @"Managed, which Metal's validation asserts at: answered nil",
+			            (unsigned long long)[self rgfxObjId], (unsigned long)descriptor.storageMode);
 		}
 		return nil;
 	}
 	if ([self storageMode] != MTLStorageModeShared) {
 		static std::atomic<bool> logged{false};
 		if (!logged.exchange(true)) {
-			NSLog(@"RGFX: a tiled texture over buffer 0x%llx of storage %lu, not Shared, which "
-			      @"Metal's validation asserts at: answered nil",
-			      (unsigned long long)[self rgfxObjId], (unsigned long)[self storageMode]);
+			rgfxLogLine(@"RGFX: a tiled texture over buffer 0x%llx of storage %lu, not Shared, which "
+			            @"Metal's validation asserts at: answered nil",
+			            (unsigned long long)[self rgfxObjId], (unsigned long)[self storageMode]);
 		}
 		return nil;
 	}
 	if (descriptor.textureType != MTLTextureType2D) {
 		static std::atomic<bool> logged{false};
 		if (!logged.exchange(true)) {
-			NSLog(@"RGFX: a tiled texture over buffer 0x%llx of type %lu, not 2D, which the host "
-			      @"does not carry: answered nil",
-			      (unsigned long long)[self rgfxObjId], (unsigned long)descriptor.textureType);
+			rgfxLogLine(@"RGFX: a tiled texture over buffer 0x%llx of type %lu, not 2D, which the host "
+			            @"does not carry: answered nil",
+			            (unsigned long long)[self rgfxObjId], (unsigned long)descriptor.textureType);
 		}
 		return nil;
 	}
@@ -1080,12 +1080,12 @@ RGFX_RESOURCE_SPI
 		if (needs > [self length]) {
 			static std::atomic<bool> logged{false};
 			if (!logged.exchange(true)) {
-				NSLog(@"RGFX: a tiled texture past buffer 0x%llx's %lu bytes (offset %lu, "
-				      @"%lu bytes a row, %lu x %lu), which Metal's validation asserts at: "
-				      @"answered nil",
-				      (unsigned long long)[self rgfxObjId], (unsigned long)[self length],
-				      (unsigned long)offset, (unsigned long)bytesPerRow,
-				      (unsigned long)descriptor.width, (unsigned long)descriptor.height);
+				rgfxLogLine(@"RGFX: a tiled texture past buffer 0x%llx's %lu bytes (offset %lu, "
+				            @"%lu bytes a row, %lu x %lu), which Metal's validation asserts at: "
+				            @"answered nil",
+				            (unsigned long long)[self rgfxObjId], (unsigned long)[self length],
+				            (unsigned long)offset, (unsigned long)bytesPerRow,
+				            (unsigned long)descriptor.width, (unsigned long)descriptor.height);
 			}
 			return nil;
 		}
@@ -1103,13 +1103,13 @@ RGFX_RESOURCE_SPI
 	if (descriptor.mipmapLevelCount > 1) {
 		static std::atomic<bool> logged{false};
 		if (!logged.exchange(true)) {
-			NSLog(@"RGFX: a tiled texture over buffer 0x%llx of %lu mipmap levels (%lu x %lu, "
-			      @"format %lu, offset %lu, %lu bytes a row): %@ (logged once a process)",
-			      (unsigned long long)[self rgfxObjId],
-			      (unsigned long)descriptor.mipmapLevelCount, (unsigned long)descriptor.width,
-			      (unsigned long)descriptor.height, (unsigned long)descriptor.pixelFormat,
-			      (unsigned long)offset, (unsigned long)bytesPerRow,
-			      texture != nil ? @"made" : @"answered nil");
+			rgfxLogLine(@"RGFX: a tiled texture over buffer 0x%llx of %lu mipmap levels (%lu x %lu, "
+			            @"format %lu, offset %lu, %lu bytes a row): %@ (logged once a process)",
+			            (unsigned long long)[self rgfxObjId],
+			            (unsigned long)descriptor.mipmapLevelCount, (unsigned long)descriptor.width,
+			            (unsigned long)descriptor.height, (unsigned long)descriptor.pixelFormat,
+			            (unsigned long)offset, (unsigned long)bytesPerRow,
+			            texture != nil ? @"made" : @"answered nil");
 		}
 	}
 	return texture;
@@ -1152,10 +1152,10 @@ RGFX_RESOURCE_SPI
 	if (!made || descriptor.mipmapLevelCount != 1) {
 		static std::atomic<bool> logged{false};
 		if (!logged.exchange(true)) {
-			NSLog(@"RGFX: a linear texture over buffer 0x%llx of type %lu and %lu levels, which "
-			      @"Metal's validation ends the process at: answered nil",
-			      (unsigned long long)[self rgfxObjId], (unsigned long)type,
-			      (unsigned long)descriptor.mipmapLevelCount);
+			rgfxLogLine(@"RGFX: a linear texture over buffer 0x%llx of type %lu and %lu levels, which "
+			            @"Metal's validation ends the process at: answered nil",
+			            (unsigned long long)[self rgfxObjId], (unsigned long)type,
+			            (unsigned long)descriptor.mipmapLevelCount);
 		}
 		return nil;
 	}

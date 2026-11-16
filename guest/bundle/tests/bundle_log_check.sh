@@ -4,7 +4,8 @@
 # (docs/lessons.md), so the bundle's executable imports no _os_log_default, the object
 # OS_LOG_DEFAULT names; it links its log object (src/RgfxLog.cpp) rather than importing it, which
 # its -undefined dynamic_lookup would let through to fail in the guest; and the subsystem HEADER
-# names is PLIST's CFBundleIdentifier, the name `log config --subsystem` takes. Part of
+# names is PLIST's CFBundleIdentifier, the name `log config --subsystem` takes; and it calls no
+# NSLog, whose object and run-time string arguments macOS 26's log shows as <private>. Part of
 # `make test`.
 set -euo pipefail
 exe=$1
@@ -13,6 +14,11 @@ fails=0
 imports=$(nm -u "$exe")
 if grep -qx '__os_log_default' <<<"$imports"; then
 	echo "bundle_log_check: FAIL: $exe logs on OS_LOG_DEFAULT (it imports _os_log_default)"
+	fails=1
+fi
+if grep -qx '_NSLog' <<<"$imports"; then
+	echo "bundle_log_check: FAIL: $exe calls NSLog, whose arguments read <private> in macOS 26's" \
+		"log: its lines go through rgfxLogLine (src/RgfxLog.hpp)"
 	fails=1
 fi
 if grep -q 'rgfxLog' <<<"$imports"; then
@@ -28,4 +34,4 @@ if [ "$subsystem" != "$id" ]; then
 	fails=1
 fi
 [ $fails = 0 ] || exit 1
-echo "bundle_log_check: $exe logs on subsystem $id, not on OS_LOG_DEFAULT"
+echo "bundle_log_check: $exe logs on subsystem $id, not on OS_LOG_DEFAULT nor through NSLog"

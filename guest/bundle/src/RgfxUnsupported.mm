@@ -3,6 +3,7 @@
  */
 
 #import "RgfxUnsupported.h"
+#include "RgfxLog.hpp"
 
 #import <objc/runtime.h>
 
@@ -30,8 +31,8 @@ bool firstAsk(Class cls, SEL cmd)
 void RgfxLogUnsupported(Class cls, SEL cmd, const char *what)
 {
 	if (firstAsk(cls, cmd)) {
-		NSLog(@"RGFX: unsupported: -[%s %s]: %s",
-		      class_getName(cls), sel_getName(cmd), what);
+		rgfxLogLine(@"RGFX: unsupported: -[%s %s]: %s",
+		            class_getName(cls), sel_getName(cmd), what);
 	}
 }
 

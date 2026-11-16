@@ -15,6 +15,7 @@
 #import "RgfxUnsupported.h"
 
 #include "RgfxGLLowering.hpp"
+#include "RgfxLog.hpp"
 
 #import <objc/runtime.h>
 
@@ -38,7 +39,7 @@ void logOnce(const char *what, const std::string &why)
 		if (!said.insert(std::string(what) + why).second)
 			return;
 	}
-	NSLog(@"RGFX: %s: %s", what, why.c_str());
+	rgfxLogLine(@"RGFX: %s: %s", what, why.c_str());
 }
 
 void logOnce(const std::string &why)

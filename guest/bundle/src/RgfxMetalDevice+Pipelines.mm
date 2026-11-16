@@ -23,6 +23,7 @@
 #include "RgfxMetallibWriter.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
+#include "RgfxLog.hpp"
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -212,8 +213,8 @@ bool fileIdentity(const char *path, RgfxFileIdentity &out)
 	id<MTLLibrary> lib = [super newLibraryWithData:data error:&error];
 	static char site;
 	if (lib == nil && rgfxLogFirst(&site, static_cast<uint64_t>(error.code)))
-		NSLog(@"RGFX: Metal's own library over %zu bytes: %@", dispatch_data_get_size(data),
-		      error.localizedDescription);
+		rgfxLogLine(@"RGFX: Metal's own library over %zu bytes: %@", dispatch_data_get_size(data),
+		            error.localizedDescription);
 	return lib;
 }
 

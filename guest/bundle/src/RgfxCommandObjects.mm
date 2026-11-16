@@ -75,6 +75,7 @@
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
 #include "reims_graphics_wire.h"
+#include "RgfxLog.hpp"
 
 namespace {
 
@@ -136,9 +137,9 @@ bool rgfxPutBytes(RgfxUploadArena *uploads, RgfxUploadCursor &cursor, const void
 	}
 	uint64_t n = 0;
 	if (logEventOp(g_bytesDropped, &n)) {
-		NSLog(@"RGFX: %lu inline bytes have no upload chunk (no region room): their binding is "
-		      @"not made, and the command buffer fails",
-		      (unsigned long)length);
+		rgfxLogLine(@"RGFX: %lu inline bytes have no upload chunk (no region room): their binding is "
+		            @"not made, and the command buffer fails",
+		            (unsigned long)length);
 	}
 	return false;
 }
@@ -353,8 +354,8 @@ void rgfxNoteIcbFlush(const RgfxIcbFlush &flush)
 	                                                std::memory_order_relaxed))) {
 	}
 	if (logged.fetch_add(1, std::memory_order_relaxed) < 16 || longer) {
-		NSLog(@"RGFX: ICB_WRITE flush: %u messages, %llu bytes, %llu us", flush.messages,
-		      (unsigned long long)flush.bytes, (unsigned long long)(flush.nanoseconds / 1000));
+		rgfxLogLine(@"RGFX: ICB_WRITE flush: %u messages, %llu bytes, %llu us", flush.messages,
+		            (unsigned long long)flush.bytes, (unsigned long long)(flush.nanoseconds / 1000));
 	}
 }
 
@@ -479,9 +480,9 @@ bool rgfxTakesSamplePositions(id<MTLDevice> device, const RgfxRenderPassSamplePo
 		return true;
 	static std::atomic<bool> logged{false};
 	if (!logged.exchange(true))
-		NSLog(@"RGFX: a render pass of %u sample positions, a sample count the device does not "
-		      @"make: answered no encoder",
-		      p.count);
+		rgfxLogLine(@"RGFX: a render pass of %u sample positions, a sample count the device does not "
+		            @"make: answered no encoder",
+		            p.count);
 	return false;
 }
 
@@ -2440,13 +2441,13 @@ enum RgfxStage : unsigned {
 		// thread.
 		static char site, heldSite;
 		if (!heldPosted && rgfxLogFirst(&heldSite))
-			NSLog(@"RGFX: command buffer 0x%llx: an object made before it never reached the "
-			      @"device: it fails with MTLCommandBufferErrorInternal",
-			      (unsigned long long)[self rgfxObjId]);
+			rgfxLogLine(@"RGFX: command buffer 0x%llx: an object made before it never reached the "
+			            @"device: it fails with MTLCommandBufferErrorInternal",
+			            (unsigned long long)[self rgfxObjId]);
 		else if (heldPosted && rgfxLogFirst(&site))
-			NSLog(@"RGFX: command buffer 0x%llx: no region block for its %llu bytes: it fails "
-			      @"with MTLCommandBufferErrorOutOfMemory",
-			      (unsigned long long)[self rgfxObjId], (unsigned long long)messageBytes);
+			rgfxLogLine(@"RGFX: command buffer 0x%llx: no region block for its %llu bytes: it fails "
+			            @"with MTLCommandBufferErrorOutOfMemory",
+			            (unsigned long long)[self rgfxObjId], (unsigned long long)messageBytes);
 		RgfxCbComplete failed = {};
 		failed.header.type = RGFX_EVT_CB_COMPLETE;
 		failed.cb_obj_id = [self rgfxObjId];
@@ -2796,8 +2797,8 @@ static NSError *rgfxInvalidInputError()
 		// It ran without some of its bindings, so it fails as Metal's does when memory runs out.
 		static char site;
 		if (rgfxLogFirst(&site))
-			NSLog(@"RGFX: a command buffer's inline bytes (set*Bytes:) found no room in the "
-			      @"device's memory; it fails as out of memory");
+			rgfxLogLine(@"RGFX: a command buffer's inline bytes (set*Bytes:) found no room in the "
+			            @"device's memory; it fails as out of memory");
 		_cbError = rgfxCommandBufferError(MTLCommandBufferErrorOutOfMemory);
 		_status.store(MTLCommandBufferStatusError);
 	} else if (msg->status == RGFX_CB_OK) {
@@ -3029,9 +3030,9 @@ static NSError *rgfxInvalidInputError()
 		return rgfxNamed(_encoder, event);
 	uint64_t n = 0;
 	if (logEventOp(g_foreignEvents, &n)) {
-		NSLog(@"RGFX: command buffer 0x%llx: %s an event %@ that no device of ours made, value "
-		      @"%llu: not carried",
-		      (unsigned long long)[self rgfxObjId], op, event, (unsigned long long)value);
+		rgfxLogLine(@"RGFX: command buffer 0x%llx: %s an event %@ that no device of ours made, value "
+		            @"%llu: not carried",
+		            (unsigned long long)[self rgfxObjId], op, event, (unsigned long long)value);
 	}
 	return 0;
 }
@@ -3194,9 +3195,9 @@ static NSError *rgfxInvalidInputError()
 	_protectionOptions = options;
 	static std::atomic<bool> logged{false};
 	if (options != 0 && !logged.exchange(true)) {
-		NSLog(@"RGFX: a command buffer asks for protection options 0x%llx; the device protects "
-		      @"no content",
-		      static_cast<unsigned long long>(options));
+		rgfxLogLine(@"RGFX: a command buffer asks for protection options 0x%llx; the device protects "
+		            @"no content",
+		            static_cast<unsigned long long>(options));
 	}
 }
 
@@ -3314,7 +3315,7 @@ static NSError *rgfxInvalidInputError()
 - (void)encodeSignalEventScheduled:(id<MTLEvent>)event value:(uint64_t)value
 {
 	if ([(id)event isKindOfClass:[RgfxEvent class]]) {
-		NSLog(@"MTLEvent passed to API expecting MTLSharedEvent");
+		rgfxLogLine(@"MTLEvent passed to API expecting MTLSharedEvent");
 		abort();
 	}
 	if (event == nil && _retained)

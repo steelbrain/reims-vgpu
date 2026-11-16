@@ -19,6 +19,7 @@
 #include "RgfxKnownPipelines.hpp"
 #include "RgfxReplyReader.hpp"
 #include "RgfxSerializer.hpp"
+#include "RgfxLog.hpp"
 
 // The reflection-fill entry the reader's handler calls (defined below); declared here
 // so the lambda in rgfxRegisterWithReplyReader: sees its signature.
@@ -345,7 +346,7 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 		                     foreign.name, NSStringFromClass([(id)foreign class])];
 		static char site;
 		if (rgfxLogFirst(&site))
-			NSLog(@"RGFX: %@", msg);
+			rgfxLogLine(@"RGFX: %@", msg);
 		if (error)
 			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor, msg);
 		return nil;
@@ -365,7 +366,7 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 		                     foreignLinked.name, NSStringFromClass([(id)foreignLinked class])];
 		static char site;
 		if (rgfxLogFirst(&site))
-			NSLog(@"RGFX: %@", msg);
+			rgfxLogLine(@"RGFX: %@", msg);
 		if (error)
 			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor, msg);
 		return nil;
@@ -547,7 +548,7 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 		                     foreign.name, NSStringFromClass([(id)foreign class])];
 		static char site;
 		if (rgfxLogFirst(&site))
-			NSLog(@"RGFX: %@", msg);
+			rgfxLogLine(@"RGFX: %@", msg);
 		if (error)
 			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor, msg);
 		return nil;
@@ -575,7 +576,7 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 		                     foreignLinked.name, NSStringFromClass([(id)foreignLinked class])];
 		static char site;
 		if (rgfxLogFirst(&site))
-			NSLog(@"RGFX: %@", msg);
+			rgfxLogLine(@"RGFX: %@", msg);
 		if (error)
 			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor, msg);
 		return nil;
@@ -774,8 +775,8 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 	_answer.take(*r);
 	static char site;
 	if (r->status != RGFX_PIPELINE_OK && rgfxLogFirst(&site, r->status))
-		NSLog(@"RGFX: the device refused render pipeline %llu, made as an equal one it accepted",
-		      static_cast<unsigned long long>(self.rgfxObjId));
+		rgfxLogLine(@"RGFX: the device refused render pipeline %llu, made as an equal one it accepted",
+		            static_cast<unsigned long long>(self.rgfxObjId));
 }
 
 // Stores the host's reflection, and a mesh render pipeline's limits after it; the getters below

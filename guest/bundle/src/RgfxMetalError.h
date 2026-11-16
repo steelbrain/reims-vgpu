@@ -17,6 +17,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "RgfxLog.hpp"
+
 NS_ASSUME_NONNULL_BEGIN
 
 /// The bundle's NSError domain.
@@ -53,7 +55,7 @@ __attribute__((noreturn)) static inline void RgfxMetalAssertionFailed(const char
                                                                       NSString *message)
 {
 	fprintf(stderr, "%s: failed assertion `%s'\n", function, message.UTF8String);
-	NSLog(@"RGFX: %s ends the process, as Metal's validation does: %@", function, message);
+	rgfxLogLine(@"RGFX: %s ends the process, as Metal's validation does: %@", function, message);
 	abort();
 }
 

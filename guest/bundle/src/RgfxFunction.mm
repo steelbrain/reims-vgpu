@@ -13,6 +13,7 @@
 #import "RgfxMetalError.h"
 #import "RgfxPipelineReflection.h"
 #import "RgfxReflection.h"
+#include "RgfxLog.hpp"
 
 #import <objc/message.h>
 #import <objc/runtime.h>
@@ -39,7 +40,7 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 		if (!logged.insert({cls, cmd}).second)
 			return;
 	}
-	NSLog(@"RGFX: answered by Metal's own function: -[%s %s]", class_getName(cls), sel_getName(cmd));
+	rgfxLogLine(@"RGFX: answered by Metal's own function: -[%s %s]", class_getName(cls), sel_getName(cmd));
 }
 
 // Logs, once per reason, that a kernel's function of OpenCL mode was not made.
@@ -52,7 +53,7 @@ void logClOnce(const std::string &why)
 		if (!said.insert(why).second)
 			return;
 	}
-	NSLog(@"RGFX: an OpenCL kernel's function was not made: %s; answered nil", why.c_str());
+	rgfxLogLine(@"RGFX: an OpenCL kernel's function was not made: %s; answered nil", why.c_str());
 }
 
 NSArray<NSNumber *> *numbersOf(const std::vector<uint32_t> &values)
@@ -425,9 +426,9 @@ bool isRendererPluginData(NSData *data)
 	if (_shadow == nil) {
 		static std::once_flag logged;
 		std::call_once(logged, [&] {
-			NSLog(@"RGFX: %s: Metal's own library made no function of its constant values: %@ "
-			      @"(logged once a process)",
-			      _name.c_str(), error.localizedDescription);
+			rgfxLogLine(@"RGFX: %s: Metal's own library made no function of its constant values: %@ "
+			            @"(logged once a process)",
+			            _name.c_str(), error.localizedDescription);
 		});
 	}
 	return _shadow;
@@ -493,9 +494,9 @@ bool isRendererPluginData(NSData *data)
 		if (!rgfxStitchableReflection(*_visible, &returnType, &arguments, &why)) {
 			static std::once_flag logged;
 			std::call_once(logged, [&] {
-				NSLog(@"RGFX: %s: no reflection made (%@): Metal's own function answers it (logged "
-				      @"once a process)",
-				      _name.c_str(), why);
+				rgfxLogLine(@"RGFX: %s: no reflection made (%@): Metal's own function answers it (logged "
+				            @"once a process)",
+				            _name.c_str(), why);
 			});
 			return;
 		}
@@ -666,8 +667,8 @@ bool isRendererPluginData(NSData *data)
 - (void)setPluginData:(id)pluginData
 {
 	(void)pluginData;
-	NSLog(@"RGFX: -[%s setPluginData:] ends the process, as Metal's function does",
-	      class_getName([self class]));
+	rgfxLogLine(@"RGFX: -[%s setPluginData:] ends the process, as Metal's function does",
+	            class_getName([self class]));
 	abort();
 }
 

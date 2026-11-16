@@ -39,6 +39,7 @@
 #include "RgfxMetallibWriter.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
+#include "RgfxLog.hpp"
 
 namespace {
 
@@ -754,9 +755,9 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 			air = std::shared_ptr<const RgfxAirFunction>(module, named);
 	}
 	if (air == nullptr && why != nullptr && rgfxAirUnreadFirstLog(name))
-		NSLog(@"RGFX: %s: no arguments read (%s): the textures it binds are taken as written "
-		      @"where their usage has ShaderWrite (logged once a process)",
-		      name.c_str(), why);
+		rgfxLogLine(@"RGFX: %s: no arguments read (%s): the textures it binds are taken as written "
+		            @"where their usage has ShaderWrite (logged once a process)",
+		            name.c_str(), why);
 	_air.emplace(name, air);
 	return air;
 }
@@ -794,8 +795,8 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 	}
 	static char site;
 	if (entries == nullptr && why != nullptr && rgfxLogFirst(&site, rgfxLogKindOf(why)))
-		NSLog(@"RGFX: %s: its nodes were not read (%s): pipelines of it answer no reflection",
-		      name.c_str(), why);
+		rgfxLogLine(@"RGFX: %s: its nodes were not read (%s): pipelines of it answer no reflection",
+		            name.c_str(), why);
 	_entries.emplace(name, entries);
 	return entries;
 }
@@ -827,9 +828,9 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 		why = "it has a type the reader does not know";
 	if ((visible == nullptr || visible->signature == RgfxAirVisible::Signature::Unknown) && why != nullptr &&
 	    rgfxAirUnreadFirstLog(name))
-		NSLog(@"RGFX: %s: no signature read (%s): Metal's own function answers its reflection "
-		      @"(logged once a process)",
-		      name.c_str(), why);
+		rgfxLogLine(@"RGFX: %s: no signature read (%s): Metal's own function answers its reflection "
+		            @"(logged once a process)",
+		            name.c_str(), why);
 	_visible.emplace(name, visible);
 	return visible;
 }
@@ -1054,8 +1055,8 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 		if (overlap != nil) {
 			static char site;
 			if (rgfxLogFirst(&site))
-				NSLog(@"RGFX: function %@ refused, as Metal refuses it: %@ (logged once a process)", name,
-				      overlap.localizedDescription);
+				rgfxLogLine(@"RGFX: function %@ refused, as Metal refuses it: %@ (logged once a process)", name,
+				            overlap.localizedDescription);
 			if (error)
 				*error = overlap;
 			return nil;

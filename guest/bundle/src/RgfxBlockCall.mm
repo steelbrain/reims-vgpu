@@ -3,6 +3,7 @@
  */
 
 #import "RgfxBlockCall.h"
+#include "RgfxLog.hpp"
 
 #include <cstdint>
 #include <mutex>
@@ -68,9 +69,9 @@ void logUncalled(SEL cmd, id handler)
 			return;
 	}
 	const char *signature = signatureOf(handler);
-	NSLog(@"RGFX: %s: a completion handler of signature %s, neither (object, error) nor (object, "
-	      @"reflection, error): not called",
-	      sel_getName(cmd), signature != nullptr ? signature : "(none)");
+	rgfxLogLine(@"RGFX: %s: a completion handler of signature %s, neither (object, error) nor (object, "
+	            @"reflection, error): not called",
+	            sel_getName(cmd), signature != nullptr ? signature : "(none)");
 }
 
 } // namespace

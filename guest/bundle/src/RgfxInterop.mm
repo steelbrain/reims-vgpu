@@ -3,6 +3,7 @@
  */
 
 #import "RgfxInterop.h"
+#include "RgfxLog.hpp"
 
 #import <objc/runtime.h>
 
@@ -35,7 +36,7 @@ void RgfxLogUnrecognized(Class cls, SEL sel)
 		first = g_unrecognized->insert({(__bridge const void *)cls, (const void *)sel}).second;
 	}
 	if (first)
-		NSLog(@"RGFX: unrecognized: -[%s %s]", class_getName(cls), sel_getName(sel));
+		rgfxLogLine(@"RGFX: unrecognized: -[%s %s]", class_getName(cls), sel_getName(sel));
 }
 
 BOOL RgfxUnrecognizedWasLogged(Class cls, SEL sel)

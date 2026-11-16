@@ -11,6 +11,7 @@
 #import "RgfxTexture.h" // rgfxAppleGPU
 #include "RgfxLogOnce.hpp"
 #include "RgfxSerializer.hpp"
+#include "RgfxLog.hpp"
 
 namespace {
 
@@ -18,7 +19,7 @@ void noteNoAnswer(const char *what, uint32_t status)
 {
 	static char site;
 	if (rgfxLogFirst(&site, rgfxLogKindOf(what) ^ status))
-		NSLog(@"RGFX: %s: the host made none (status 0x%x)", what, status);
+		rgfxLogLine(@"RGFX: %s: the host made none (status 0x%x)", what, status);
 }
 
 } // namespace
@@ -171,10 +172,10 @@ void noteNoAnswer(const char *what, uint32_t status)
 	if (range.location > _count || range.length > _count - range.location) {
 		static char site;
 		if (rgfxLogFirst(&site))
-			NSLog(@"RGFX: -[MTLVisibleFunctionTable setFunctions:withRange:] range {%lu, %lu} "
-			      @"past the table's %lu entries: none set",
-			      (unsigned long)range.location, (unsigned long)range.length,
-			      (unsigned long)_count);
+			rgfxLogLine(@"RGFX: -[MTLVisibleFunctionTable setFunctions:withRange:] range {%lu, %lu} "
+			            @"past the table's %lu entries: none set",
+			            (unsigned long)range.location, (unsigned long)range.length,
+			            (unsigned long)_count);
 		return;
 	}
 	std::vector<RgfxObjId> ids(range.length, 0);
@@ -184,9 +185,9 @@ void noteNoAnswer(const char *what, uint32_t status)
 		if (h != nil && ![(id)h isKindOfClass:[RgfxFunctionHandle class]]) {
 			static char site;
 			if (rgfxLogFirst(&site))
-				NSLog(@"RGFX: -[MTLVisibleFunctionTable setFunctions:withRange:] a handle of "
-				      @"another device (%@): its entry set nil",
-				      NSStringFromClass([(id)h class]));
+				rgfxLogLine(@"RGFX: -[MTLVisibleFunctionTable setFunctions:withRange:] a handle of "
+				            @"another device (%@): its entry set nil",
+				            NSStringFromClass([(id)h class]));
 			h = nil;
 		}
 		ids[i] = h != nil ? ((RgfxFunctionHandle *)h).rgfxObjId : 0;
@@ -196,8 +197,8 @@ void noteNoAnswer(const char *what, uint32_t status)
 	    !_serializer->setFunctionTable(_objId, range.location, ids.data(), ids.size())) {
 		static char site;
 		if (rgfxLogFirst(&site))
-			NSLog(@"RGFX: -[MTLVisibleFunctionTable setFunctions:withRange:] did not reach the "
-			      @"host");
+			rgfxLogLine(@"RGFX: -[MTLVisibleFunctionTable setFunctions:withRange:] did not reach the "
+			            @"host");
 	}
 }
 

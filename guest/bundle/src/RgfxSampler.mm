@@ -8,6 +8,7 @@
 #import "RgfxMetalPrivate.h"
 
 #include "RgfxSerializer.hpp" // RgfxSerializer, RgfxSamplerParams
+#include "RgfxLog.hpp"
 
 // Each enum is carried as its Metal raw value; the LOD clamps and bias travel as floats (the
 // serialiser stores their bits); the three booleans pack into `flags`. lodBias and reductionMode
@@ -64,8 +65,8 @@ RgfxSamplerParams RgfxSamplerParamsOf(MTLSamplerDescriptor *d)
 	if (serializer->refused(created) || created.status != RGFX_STATUS_OK) {
 		static char site;
 		if (rgfxLogFirst(&site, created.status))
-			NSLog(@"RGFX: newSamplerStateWithDescriptor: no sampler (status 0x%x)",
-			      created.status);
+			rgfxLogLine(@"RGFX: newSamplerStateWithDescriptor: no sampler (status 0x%x)",
+			            created.status);
 		return nil;
 	}
 	RgfxSampler *sampler = [[RgfxSampler alloc] initWithObjId:created.obj_id

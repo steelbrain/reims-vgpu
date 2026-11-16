@@ -18,6 +18,7 @@
 #include "RgfxManagedLayout.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp" // RgfxSerializer, RgfxTextureDescriptor (wire)
+#include "RgfxLog.hpp"
 
 #import <objc/runtime.h>
 
@@ -251,9 +252,9 @@ bool rgfxCopyShapeOf(MTLPixelFormat format, MTLRegion region, RgfxCopyShape *out
 void rgfxNoteCopyRefused(std::atomic<bool> &logged, NSString *what, RgfxTexture *t)
 {
 	if (!logged.exchange(true)) {
-		NSLog(@"RGFX: texture 0x%llx (format %lu, storage mode %lu): %@; nothing is copied",
-		      (unsigned long long)[t rgfxObjId], (unsigned long)t.pixelFormat,
-		      (unsigned long)t.storageMode, what);
+		rgfxLogLine(@"RGFX: texture 0x%llx (format %lu, storage mode %lu): %@; nothing is copied",
+		            (unsigned long long)[t rgfxObjId], (unsigned long)t.pixelFormat,
+		            (unsigned long)t.storageMode, what);
 	}
 }
 
@@ -809,7 +810,7 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLD
 	// A type past MTLTextureTypeTextureBuffer ends the process with no words, at each creator of
 	// both x86 Macs (oracle_texdesc type10).
 	if (type > MTLTextureTypeTextureBuffer) {
-		NSLog(@"RGFX: texture type %llu ends the process, as Metal's creators do", ull(type));
+		rgfxLogLine(@"RGFX: texture type %llu ends the process, as Metal's creators do", ull(type));
 		abort();
 	}
 	NSString *typeName = rgfxTextureTypeName(type);
@@ -1015,14 +1016,14 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLD
 		long long compression = -1;
 		if ([descriptor respondsToSelector:@selector(compressionType)])
 			compression = static_cast<long long>(descriptor.compressionType);
-		NSLog(@"RGFX: texture descriptor of format %llu, type %llu, %llux%llux%llu, %llu slices, "
-		      @"%llu levels, %llu samples, usage 0x%llx, storage %llu, CPU cache %llu, hazard "
-		      @"tracking %llu, options 0x%llx, GPU-optimized %d, compression %lld, on %s rules",
-		      ull(format), ull(type), ull(width), ull(height), ull(depth), ull(arrayLength),
-		      ull(levels), ull(samples), ull(usage), ull(storage), ull(descriptor.cpuCacheMode),
-		      ull(descriptor.hazardTrackingMode), ull(descriptor.resourceOptions),
-		      descriptor.allowGPUOptimizedContents ? 1 : 0, compression,
-		      apple ? "an Apple GPU's" : "the x86 Macs'");
+		rgfxLogLine(@"RGFX: texture descriptor of format %llu, type %llu, %llux%llux%llu, %llu slices, "
+		            @"%llu levels, %llu samples, usage 0x%llx, storage %llu, CPU cache %llu, hazard "
+		            @"tracking %llu, options 0x%llx, GPU-optimized %d, compression %lld, on %s rules",
+		            ull(format), ull(type), ull(width), ull(height), ull(depth), ull(arrayLength),
+		            ull(levels), ull(samples), ull(usage), ull(storage), ull(descriptor.cpuCacheMode),
+		            ull(descriptor.hazardTrackingMode), ull(descriptor.resourceOptions),
+		            descriptor.allowGPUOptimizedContents ? 1 : 0, compression,
+		            apple ? "an Apple GPU's" : "the x86 Macs'");
 		RgfxMetalAssertionFailed("-[MTLTextureDescriptorInternal validateWithDevice:]",
 		                         [@"Texture Descriptor Validation\n" stringByAppendingString:rules]);
 	}
@@ -1697,11 +1698,11 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 		    @"of a slice count its type does not take",
 		    @"of more than one slice of an array over a buffer"};
 		if (!logged[refusal].exchange(true)) {
-			NSLog(@"RGFX: a view of texture 0x%llx (format %lu, type %lu) %@ (format %lu, type "
-			      @"%lu): answered nil",
-			      (unsigned long long)[self rgfxObjId], (unsigned long)self.pixelFormat,
-			      (unsigned long)parentType, what[refusal], (unsigned long)format,
-			      (unsigned long)type);
+			rgfxLogLine(@"RGFX: a view of texture 0x%llx (format %lu, type %lu) %@ (format %lu, type "
+			            @"%lu): answered nil",
+			            (unsigned long long)[self rgfxObjId], (unsigned long)self.pixelFormat,
+			            (unsigned long)parentType, what[refusal], (unsigned long)format,
+			            (unsigned long)type);
 		}
 		return nil;
 	}
@@ -1824,9 +1825,9 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	if ([descriptor respondsToSelector:@selector(minLOD)] && descriptor.minLOD != 0.0f) {
 		static std::atomic<bool> logged{false};
 		if (!logged.exchange(true)) {
-			NSLog(@"RGFX: a view of texture 0x%llx with a lowest level of detail of %f: answered "
-			      @"nil (the device carries none)",
-			      (unsigned long long)[self rgfxObjId], descriptor.minLOD);
+			rgfxLogLine(@"RGFX: a view of texture 0x%llx with a lowest level of detail of %f: answered "
+			            @"nil (the device carries none)",
+			            (unsigned long long)[self rgfxObjId], descriptor.minLOD);
 		}
 		return nil;
 	}

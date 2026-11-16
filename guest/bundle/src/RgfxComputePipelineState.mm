@@ -29,6 +29,7 @@
 #include "RgfxKnownPipelines.hpp"
 #include "RgfxReplyReader.hpp"
 #include "RgfxSerializer.hpp"
+#include "RgfxLog.hpp"
 
 namespace {
 
@@ -76,7 +77,7 @@ NSError *foreignFunctionError(NSString *what, id<MTLFunction> fn)
 	                                           what, fn.name, NSStringFromClass([(id)fn class])];
 	static char site;
 	if (rgfxLogFirst(&site))
-		NSLog(@"RGFX: %@", msg);
+		rgfxLogLine(@"RGFX: %@", msg);
 	return RgfxMakeError(RgfxMetalErrorInvalidDescriptor, msg);
 }
 
@@ -121,7 +122,7 @@ NSError *unresolvedLibraryError(const std::string &name)
 {
 	static char site;
 	if (rgfxLogFirst(&site))
-		NSLog(@"RGFX: compute pipeline: the dynamic library %s loads from no file", name.c_str());
+		rgfxLogLine(@"RGFX: compute pipeline: the dynamic library %s loads from no file", name.c_str());
 	return [NSError errorWithDomain:@"CompilerError"
 	                           code:2
 	                       userInfo:@{NSLocalizedDescriptionKey : @"Error creating compute variant"}];
@@ -569,8 +570,8 @@ NSError *RgfxComputeProgressError(BOOL hasProgress, NSInteger progress, BOOL has
 	if (refusal != nil) {
 		static char site;
 		if (rgfxLogFirst(&site))
-			NSLog(@"RGFX: compute pipeline of %s refused, as Metal refuses it: %@", entryName ?: "",
-			      refusal.localizedDescription);
+			rgfxLogLine(@"RGFX: compute pipeline of %s refused, as Metal refuses it: %@", entryName ?: "",
+			            refusal.localizedDescription);
 		if (error)
 			*error = refusal;
 		return nil;
@@ -745,8 +746,8 @@ NSError *RgfxComputeProgressError(BOOL hasProgress, NSInteger progress, BOOL has
 	_answer.take(*r);
 	static char site;
 	if (r->status != RGFX_PIPELINE_OK && rgfxLogFirst(&site, r->status))
-		NSLog(@"RGFX: the device refused compute pipeline %llu, made as an equal one it accepted",
-		      static_cast<unsigned long long>(self.rgfxObjId));
+		rgfxLogLine(@"RGFX: the device refused compute pipeline %llu, made as an equal one it accepted",
+		            static_cast<unsigned long long>(self.rgfxObjId));
 }
 
 - (void)rgfxFillReflection:(const RgfxPipelineReflection *)r

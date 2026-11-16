@@ -282,7 +282,7 @@ void logNoTexture(IOSurfaceRef surface, const char *cause, const std::string &de
 	static char site;
 	const uint32_t format = surface != nullptr ? IOSurfaceGetPixelFormat(surface) : 0;
 	if (rgfxLogFirst(&site, rgfxLogKindOf(cause) ^ format))
-		NSLog(@"RGFX: %s", line.c_str());
+		rgfxLogLine(@"RGFX: %s", line.c_str());
 }
 
 /// The surface's YCbCr matrix as one of RGFX_YCBCR_MATRIX_*. CoreVideo keeps a pixel buffer's
@@ -599,9 +599,9 @@ struct RgfxSurfaceShadow {
 		    !takeOver(writers, slotQueue, slotOwner, queue, queueId, seqno, named)) {
 			static std::atomic<bool> logged{false};
 			if (!logged.exchange(true)) {
-				NSLog(@"RGFX: IOSurface %u: no writer slot left for queue 0x%llx: a present of "
-				      @"the surface may show it before the queue's command buffers finish",
-				      surfaceId, (unsigned long long)queueId);
+				rgfxLogLine(@"RGFX: IOSurface %u: no writer slot left for queue 0x%llx: a present of "
+				            @"the surface may show it before the queue's command buffers finish",
+				            surfaceId, (unsigned long long)queueId);
 			}
 		}
 	}
@@ -624,9 +624,9 @@ struct RgfxSurfaceShadow {
 			return;
 		static std::atomic<bool> logged{false};
 		if (!logged.exchange(true)) {
-			NSLog(@"RGFX: IOSurface %u: no reader or writer slot left for queue 0x%llx: a later "
-			      @"write of the surface by another queue may not wait for its reads",
-			      surfaceId, (unsigned long long)queueId);
+			rgfxLogLine(@"RGFX: IOSurface %u: no reader or writer slot left for queue 0x%llx: a later "
+			            @"write of the surface by another queue may not wait for its reads",
+			            surfaceId, (unsigned long long)queueId);
 		}
 	}
 
