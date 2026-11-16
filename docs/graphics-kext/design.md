@@ -2994,17 +2994,18 @@ device").
 
 ## Multiple displays
 
-Status: the host's side and the x86-64 kext are built (the owner's decision
+Status: the host's side and both kexts are built (the owner's decision
 of 2026-11-15: several displays on this device, each in a window of its own,
 on x86-64 macOS 11 to 26 and arm64 macOS from 14). The wire's definitions are
 in `wire.rs` (`RGFX_FEATURE_MULTI_DISPLAY`, `RGFX_DISPLAYS_MAX`,
 `RGFX_SCANOUT_ROOM_ALIGN`, `RGFX_SCANOUT_STRIDE_ALIGN`); a host of two
-displays or more offers the feature (lane mmhost), and the x86-64 kext takes it
-(lane mmx86). reims-ctl's setting is built (lane mmctl), and so are the
-pointer crossing on x86-64 (lane ptrcross: `POINTER_OVER`, below) and a
-captured drag across displays from Linux's windows (lane dragcross:
-`DISPLAY_BOUNDS`, below); the arm64e kext, a lane at the end of this section,
-is still to build.
+displays or more offers the feature (lane mmhost), the x86-64 kext takes it
+(lane mmx86), and the arm64e kext takes it where the firmware placed a node
+for each display (lane mma64), which our configuration asks of Ambrosia once
+Ambrosia 0.1.3 is released (A1); reims-ctl sets the count (lane mmctl). The
+pointer crossing and a captured drag across displays from Linux's windows are
+built on x86-64 (lanes ptrcross and dragcross: `POINTER_OVER` and
+`DISPLAY_BOUNDS`, below); on arm64 they are still to build (A3).
 
 **A device of one display is what it was.** A device has 1 to
 `RGFX_DISPLAYS_MAX` (4) displays, 1 by default, fixed when it is made. With
@@ -3362,6 +3363,20 @@ display 0's start holds each display's registration while it starts the heads,
 then registers them back to back, display 0's first (`RgfxRegisterHold.hpp`).
 A head that fails to start, or a hold past 10 seconds, ends the hold at once,
 so display 0's service always registers; with one display nothing is held.
+Back to back is not enough on its own: each registration matches on a thread
+of its own, so a process can read the first service and find no other before
+the second's notification comes (arm64 15.6.1 under TCG, potluck job
+m3-max-34657: its WindowServer took one of two services and gave up on the
+other after its one batch). So the release registers the services on a thread
+call and opens a window until each has matched or 5 seconds have passed. In
+the window a process's read of a key the framework reads of each service it
+takes before it asks for the next (`dfr`, `AppleTV` and `external`) waits for
+the window to close, so the services it has not read yet are in its batch by
+then. The arm64e class overrides `copyProperty(const char *)` for it, the
+overload a process's property read asks first (read from 14.6.1's and
+27.0.1's kernels). The kernel's own reads never wait, nor does a read of any
+other key; the hold and the window together end well inside the process's 30
+seconds.
 
 **The option ROM** drives display 0 alone, unchanged: it takes no feature, so
 it sees one display, and its GOP framebuffer lies in display 0's room. Its
@@ -3523,10 +3538,31 @@ it.
   - A second service of one kext is a second instance of the class: its own
     index, its UUID from its own display's serial, its own swap queue and
     clients (the class's, per instance) and its own cursor plane, layer 1.
-  The reading of 14.6.1's framework is checked against this at the boot of
-  arm64 14 (below).
+  On 14.6.1, IOMobileFramebufferLegacy's start ends with the same virtual
+  `registerService(0)` (read from its kernel collection), and WindowServer
+  logs the same steps of the framework's wait: a populate thread that waits
+  for as many framebuffers as it counted (`pthread_dependency_wait_np expect:
+  1`) and runs its run loop "for 30 seconds" (a boot of arm64 14.6.1 at two
+  displays with display 0's node alone, potluck job m3-max-34581). The guest's
+  `dyld_info` has no disassembler there, so the framework's code itself was
+  read on 27.0.1 alone.
 - A3, the pointer on arm64: X1's question on an arm64 guest, found on mma64's
-  first boot of arm64 14 with two displays, as X1 is.
+  first boot of arm64 14 with two displays, as X1 is. Measured on arm64 14.6.1
+  under TCG with two displays, display 1 at (1920, 0) of the guest's
+  arrangement (potluck job m3-max-34656, on homelab-um870-1's Radeon 780M:
+  QMP's `input-send-event` to `usb-vmapple-tablet`, the pointing device
+  Virtualization.framework gives a macOS guest, on `qemu-xhci`, then the same
+  tool of ours reading CoreGraphics' displays and cursor): it reads as X1 does.
+  - With the cursor on display 0, x 3276, 16384 and 32700 (y 16384) put it at
+    192, 960 and 1916, y 540, of display 0, and no position reached display 1.
+  - With the cursor moved onto display 1 first (`CGWarpMouseCursorPosition`
+    to 2880, 540), x 16384, 8192 (y 8192) and 32700 put it at 2880, 2400
+    (y 270) and 3836, all on display 1.
+
+  So the arm64 pointer needs the same crossing as x86-64's: the arm64e kext
+  taking `POINTER_OVER` and moving the cursor onto the display the event
+  names. Until it does, it does not take the bit, so the device sends it no
+  `POINTER_OVER`, and the cursor stays on the display it is on.
 
 **The lanes**, in the order they land:
 
