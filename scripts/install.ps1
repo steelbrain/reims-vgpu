@@ -34,7 +34,8 @@ $Repo = "https://github.com/steelbrain/reims-vgpu"
 
 function Say($m) { Write-Host "==> $m" -ForegroundColor White }
 function Warn($m) { Write-Host "warning: $m" -ForegroundColor Yellow }
-function Die($m) { Write-Host "error: $m" -ForegroundColor Red; exit 1 }
+# A stop throws rather than exits: under `irm ... | iex`, exit would close the user's window.
+function Die($m) { throw "install.ps1: $m" }
 function Ask($q) {
     if ($Yes) { return $true }
     $a = Read-Host "$q [Y/n]"
@@ -58,7 +59,6 @@ $bash = Join-Path $Msys2 "usr\bin\bash.exe"
 $haveMsys2 = (Test-Path $bash) -and -not ($pretend -contains "msys2")
 $gitCmd = Get-Command git.exe -ErrorAction SilentlyContinue
 $haveGit = ($null -ne $gitCmd) -and ($gitCmd.Source -notlike "$Msys2*") -and -not ($pretend -contains "git")
-$freshMsys2 = $false
 foreach ($p in @(@{ name = "MSYS2"; id = "MSYS2.MSYS2"; have = $haveMsys2 }, @{ name = "Git for Windows"; id = "Git.Git"; have = $haveGit })) {
     if ($p.have) { Say "$($p.name) is installed"; continue }
     if (-not $DryRun -and -not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
@@ -69,7 +69,6 @@ foreach ($p in @(@{ name = "MSYS2"; id = "MSYS2.MSYS2"; have = $haveMsys2 }, @{ 
         winget install --id $p.id -e --accept-source-agreements --accept-package-agreements
         if ($LASTEXITCODE -ne 0) { Die "winget could not install $($p.name) (exit $LASTEXITCODE)" }
     }
-    if ($p.id -eq "MSYS2.MSYS2") { $freshMsys2 = $true }
 }
 if (-not $DryRun) {
     # The PATH winget's installers set, for git in this window.
@@ -89,12 +88,20 @@ if ($whp -eq 1) {
         Warn "VMs don't start until the Windows Hypervisor Platform is on: turn it on in Windows Features (optionalfeatures), then restart"
     } else {
         Step "turn on the Windows Hypervisor Platform, as an administrator: Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All -NoRestart" {
-            $p = Start-Process powershell.exe -Verb RunAs -Wait -PassThru -ArgumentList @(
-                "-NoProfile", "-Command",
-                "Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All -NoRestart | Out-Null; exit 0")
-            if ($p.ExitCode -ne 0) { Die "turning on the Windows Hypervisor Platform failed (exit $($p.ExitCode))" }
+            # Only this step runs elevated; declining Windows' prompt leaves the feature off and
+            # the install going on.
+            try {
+                $p = Start-Process powershell.exe -Verb RunAs -Wait -PassThru -ArgumentList @(
+                    "-NoProfile", "-Command",
+                    "try { Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All -NoRestart -ErrorAction Stop | Out-Null; exit 0 } catch { exit 1 }")
+                $script:restart = ($p.ExitCode -eq 0)
+            } catch {
+                $script:restart = $false
+            }
+            if (-not $script:restart) {
+                Warn "the Windows Hypervisor Platform is still off, and VMs don't start until it is on: turn it on in Windows Features (optionalfeatures), then restart"
+            }
         }
-        $restart = $true
     }
 }
 
@@ -116,15 +123,14 @@ if (Test-Path (Join-Path $Checkout "scripts\install-ctl.sh")) {
 }
 
 # 4. install-ctl.sh in CLANG64: a login shell, which puts CLANG64's tools first on PATH, in the
-# checkout (CHERE_INVOKING). An MSYS2 that has never fetched CLANG64's package list, as a new one
-# hasn't, brings its packages up to date first, twice: the first update can replace pacman and
-# MSYS2's runtime themselves, and then ends every MSYS2 program, as MSYS2 does.
+# checkout (CHERE_INVOKING). MSYS2's packages come up to date first, as MSYS2 asks before any
+# install: a new MSYS2 holds the package lists of the day its archive was made, whose packages its
+# mirrors drop. Twice: an update that replaces pacman or MSYS2's runtime ends every MSYS2 program,
+# and the second run does the rest.
 $env:MSYSTEM = "CLANG64"
 $env:CHERE_INVOKING = "1"
-if ($freshMsys2 -or -not (Test-Path (Join-Path $Msys2 "var\lib\pacman\sync\clang64.db"))) {
-    Step "bring the new MSYS2 up to date: pacman -Syuu, twice" {
-        foreach ($i in 1, 2) { & $bash -lc "pacman -Syuu --noconfirm" }
-    }
+Step "bring MSYS2's packages up to date: pacman -Syuu, twice" {
+    foreach ($i in 1, 2) { & $bash -lc "pacman -Syuu --noconfirm" }
 }
 $unix = if ($DryRun) { $Checkout } else { (& $bash -lc "cygpath -u '$Checkout'").Trim() }
 $flags = if ($Yes) { " --yes" } else { "" }
@@ -133,7 +139,7 @@ Step "run scripts/install-ctl.sh$flags in MSYS2's CLANG64 shell, in $Checkout" {
     try { & $bash -lc "cd '$unix' && scripts/install-ctl.sh$flags" } finally { Pop-Location }
     if ($LASTEXITCODE -ne 0) { Die "scripts/install-ctl.sh failed (exit $LASTEXITCODE)" }
 }
-if ($DryRun) { exit 0 }
+if ($DryRun) { return }
 Write-Host ""
 Write-Host "reims-ctl is installed. Open a new PowerShell or Windows Terminal window and run reims-ctl." -ForegroundColor Green
 if ($restart) {
