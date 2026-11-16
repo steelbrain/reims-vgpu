@@ -163,12 +163,15 @@ pub struct VtSurface {
     pub runs: Vec<(u64, u64)>,
 }
 
+/// Runs of guest RAM, `(address, length)`, in order.
+type Runs = Vec<(u64, u64)>;
+
 /// `count` runs from the start of `bytes`, and what follows them; `None` where `bytes` holds
 /// fewer, or they hold fewer than `length` bytes.
-fn read_runs(bytes: &[u8], count: u32, length: u64) -> Option<(Vec<(u64, u64)>, &[u8])> {
+fn read_runs(bytes: &[u8], count: u32, length: u64) -> Option<(Runs, &[u8])> {
     let (runs, rest) =
         bytes.split_at_checked((count as usize).checked_mul(size_of::<RgfxPageRun>())?)?;
-    let runs: Vec<(u64, u64)> = runs
+    let runs: Runs = runs
         .as_chunks::<{ size_of::<RgfxPageRun>() }>()
         .0
         .iter()
