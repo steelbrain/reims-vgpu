@@ -36,9 +36,8 @@
 //! with no wait for the compositor's GPU, its link or any other work there: on a Radeon 780M
 //! with the compositor on an RTX 3090 behind PCIe 3.0 x4, the draws there ran 16.5 ms on the
 //! GPU on average and up to 228 ms, where the syncs ran 3.35 ms and none over 30 ms (a traced
-//! boot, 2026-11-15). The import is made once a
-//! mirror, its deallocator holding the
-//! runtime's buffer over the mirror, so the mirror's pages stay mapped while it lives. A
+//! boot, 2026-11-15). The import is made once a mirror, its deallocator holding the runtime's
+//! buffer over the mirror, so the mirror's pages stay mapped while it lives. A
 //! presented surface the mirror cannot carry, or whose mirror, import or texture is refused,
 //! cannot be drawn there: the draw draws nothing, says so ([`ScanoutDraw::foreign_refused`]),
 //! and the window presents from the runtime's GPU from then on. The scanout is imported from the

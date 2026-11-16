@@ -1082,6 +1082,12 @@ Stages:
           before the export looked, or the compositor's device imports
           none, the window's thread waits for the sync before it encodes
           the draw.
+        - A present drawn this way is answered, and its surface's block let
+          go of, once the sync has copied the surface: the draw reads only
+          the mirror, which the next sync writes only after the draw has
+          finished. On um870's Radeon 780M, with the compositor on its RTX
+          3090, the draws there ran 16.5 ms on the GPU on average and up to
+          228 ms, the syncs 3.35 ms (a traced boot, 2026-11-15).
         - It touches the window's path alone: no guest, kext or placement
           change. Its fallback, at each refusal on every driver, is the
           window's present from the runtime's GPU, as before: no feedback,
@@ -2812,8 +2818,11 @@ answers a `PRESENT_SURFACE` in the refresh that shows its surface, right after
 that refresh's `VBLANK`: the first refresh after the command buffers that write
 the surface have finished, whether or not the host's window has drawn it yet.
 An answer frees the surfaces of the presents before it, never its own, so the
-host holds it only while a window draw still running may read one of those
-(`crates/reims-vgpu/src/graphics/present.rs`). The kext maps each `VBLANK`'s
+host holds it only while a read still running may read one of those: the
+window's draw, or, where the window draws on the compositor's GPU, the sync
+that copies the surface into the window's mirror (Decided 14, "the window
+shown by the compositor's GPU"; `crates/reims-vgpu/src/graphics/present.rs`
+and `sink.rs`). The kext maps each `VBLANK`'s
 host time into the guest's `mach_absolute_time` by the clocks' offset
 (`guest/kext/src/RgfxVblankClock.hpp`). Where it took `HOST_TIME`, it reads
 the host's clock at each `VBLANK`, `HOST_TIME_LO` between two reads of its
