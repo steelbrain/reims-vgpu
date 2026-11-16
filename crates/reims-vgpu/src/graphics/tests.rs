@@ -12264,8 +12264,9 @@ fn submitted_then_scheduled(ring: &mut QueueRing, cb_obj_id: u64) {
 }
 
 /// A decoder's command buffer whose submission handler runs inside a commit on a thread the
-/// header names for no raise, as the Vulkan platform's runtime runs every ready buffer's in a
-/// commit, posts nothing there: here the window's render thread commits a draw of its own, holding
+/// header names for no raise, as a platform may run every ready buffer's in a commit (the
+/// testkit's does; the Vulkan platform's runtime runs only the committed buffer's own there),
+/// posts nothing there: here the window's render thread commits a draw of its own, holding
 /// a lock of its own as a host's thread holds QEMU's BQL, and its commit takes the buffer held
 /// before it. The buffer's `CB_SUBMITTED` and `CB_SCHEDULED` reach the guest from the queue's
 /// service thread, which raises there and may wait there for the lock the render thread holds

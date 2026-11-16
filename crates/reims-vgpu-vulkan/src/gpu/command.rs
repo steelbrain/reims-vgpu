@@ -285,17 +285,18 @@ pub struct CommandBufferObject {
 /// allocation for the first such work in the process as it submits it to the GPU
 /// ([`FirstUse::TilerSubmission`]; `vaprobe rendersubmit`, plain Metal, M3 Max: none of it at the
 /// commit of a render pass behind an event wait, all of it by the command buffer's completion).
-/// The runtime runs the handler as the command buffer's last batch reaches its queue, on the
-/// thread that submits it, before the command buffer reads scheduled, before
+/// The runtime runs the handler as the command buffer's last batch reaches its queue, before the
+/// command buffer reads scheduled, before
 /// `waitUntilScheduled` returns and before any scheduled or completed handler runs. A command
 /// buffer encoded once the process took the allocation carries none: the allocation is held for
 /// good, and a submission handler makes the runtime run the command buffer's transition to
 /// scheduled on a handler thread, woken for it, where it runs it on its scheduler thread as it
-/// submits the command buffer (`rt::WorkCounts::scheduled_where_submitted`). The thread that
-/// submits it, once its waits are met and the work ahead of it on its queue is submitted, is the
-/// committing thread, inside `commit`, where that thread makes the submission pass
-/// ([`CommandBuffer::commit`]), else the runtime's scheduler thread after `commit` returns, as
-/// Metal submits on a thread of its own and tells the program
+/// submits the command buffer (`rt::WorkCounts::scheduled_where_submitted`). The thread that runs
+/// the handler, once the command buffer's waits are met and the work ahead of it on its queue is
+/// submitted, is the committing thread, inside `commit`, where that thread makes the submission
+/// pass that takes the command buffer's last batch ([`CommandBuffer::commit`]), else one of the
+/// device's handler threads, which the runtime's scheduler thread hands it to as its pass goes on,
+/// after `commit` returns, as Metal submits on a thread of its own and tells the program
 /// only through scheduled (the runtime's measurement on an M4). A range placed between the commit
 /// and the submission lies by the threads' timing, on Metal as here. A command buffer the runtime
 /// fails before its submission takes nothing.
@@ -1475,11 +1476,11 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// hangs at is in flight runs nothing and completes without an error, as on Metal, as the
     /// runtime commits it (the module docs). It is committed through the runtime's
     /// `commit_and_submit`, which, where no other submission pass is under way, submits on this
-    /// thread the device's ready batches committed first, this one's among them, and runs their
-    /// submission handlers here, inside the call, of whichever command buffer, queue or thread
-    /// they are; a batch that waits for another submission's GPU signal to land, and what is
-    /// behind it, is the scheduler thread's. So no submission handler of the process takes a lock
-    /// a caller holds across a commit: the tiler's handler takes the process's space
+    /// thread the device's ready batches committed first, this one's among them, runs this one's
+    /// submission handlers here, inside the call, and hands the other command buffers' to the
+    /// device's handler threads; a batch that waits for another submission's GPU signal to land,
+    /// and what is behind it, is the scheduler thread's. So no submission handler of the process
+    /// takes a lock a caller holds across a commit: the tiler's handler takes the process's space
     /// ([`tiler_handler`]), and the decoder's handlers their records' locks and the completion
     /// ring's. The call is marked as one that runs submission handlers inside it
     /// (`crate::core::platform::command::committing`), so a handler of a buffer whose records

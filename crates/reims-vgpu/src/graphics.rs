@@ -3209,12 +3209,15 @@ fn stepped<T>(f: impl FnOnce() -> T) -> T {
 /// vector there, else handed to the queue's service thread
 /// (`CompletionPoster::post_unwaiting`); handed to it always, which posts it and raises there,
 /// where a submission handler runs inside a commit on any other thread ([`foreign_committer`]).
-/// The platform's runtime runs submission handlers on its scheduler thread, and may run every
-/// ready buffer's inside one commit (`reims_vgpu_vulkan::core::platform::command::committing`):
-/// a lane's of any queue, the window's render thread, the host's thread inside
-/// `rvg_graphics_device_read_display`, or another device's. A wait for room on any of them would
-/// hold up every queue's submissions, and the record's mutex, which the buffer's completion
-/// handler takes, across the wait: none waits.
+/// The Vulkan platform's runtime runs submission handlers on the device's handler threads, which
+/// its scheduler thread hands them to as each pass goes on, and runs a buffer's own inside the
+/// commit whose submission pass takes its last batch
+/// (`reims_vgpu_vulkan::core::platform::command::committing`): on a lane's thread of any queue,
+/// the window's render thread, or the host's thread inside `rvg_graphics_device_read_display`.
+/// A platform may also run other buffers' handlers inside a commit, as the testkit's does. A
+/// buffer's transition to scheduled, and every later one of its queue, waits for its submission
+/// handlers, and a wait for room on any of those threads would hold the record's mutex, which the
+/// buffer's completion handler takes, across the wait: none waits.
 fn post_from_handler(poster: &CompletionPoster, record: &[u8]) {
     if foreign_committer() {
         poster.post_elsewhere(record);
