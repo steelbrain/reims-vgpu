@@ -455,7 +455,7 @@ pub const RGFX_FEATURE_MULTI_DISPLAY: u64 = 0x1_0000_0000_0000;
 /// display the host's pointer is over when [`RGFX_EVT_POINTER_OVER`] says so. The device offers
 /// it beside [`RGFX_FEATURE_MULTI_DISPLAY`], only where its host made it with two displays or
 /// more, and sends `POINTER_OVER` only to a guest that took both: one that took `MULTI_DISPLAY`
-/// alone (a kext built before this bit, the arm64e kext, Ambrosia's module) is never sent it.
+/// alone (a kext built before this bit, Ambrosia's module) is never sent it.
 pub const RGFX_FEATURE_POINTER_OVER: u64 = 0x2_0000_0000_0000;
 /// `FEATURES_HI` bit 18, feature bit 50, `DISPLAY_BOUNDS`: ring 0 carries
 /// [`RGFX_CMD_DISPLAY_BOUNDS`], each display's rectangle in the guest's desktop, by which the
