@@ -75,7 +75,11 @@ LICENSE                     the license, and LICENSES/ its texts (README.md, Lic
   against the oldest release of each set, x86-64 11.7.11 and arm64 14.6.1, and the newest. It
   fails where a kext imports a name that release's kernel collection does not define, which the
   newest SDK's headers make easy and a boot of only the newest releases does not see
-  ([lessons.md](lessons.md)). The collections are the guests' own, read from a VM and kept local,
+  ([lessons.md](lessons.md)). 11.7.11 stands for 12 here: 12.7.6's IOHIDDevice defines every name
+  11.7.11's does and lacks the same ones (measured 2026-11-16). 12.7.6 is not a superset in
+  general: it drops other names 11.7.11 defines, none that the sets import today, so a set that
+  starts importing from another class runs the check on 12.7.6 too. The collections are the
+  guests' own, read from a VM and kept local,
   never committed: an x86-64 guest's `/System/Library/KernelCollections/BootKernelExtensions.kc`
   (`scp` from the running guest), and an arm64 guest's kernelcache, from its Preboot volume's
   `<volume UUID>/boot/<hash>/System/Library/Caches/com.apple.kernelcaches/kernelcache` (on an APFS
