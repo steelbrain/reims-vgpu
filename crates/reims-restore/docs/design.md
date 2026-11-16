@@ -375,6 +375,13 @@ Data out and has the first boot make it, by EACS:
   the auxiliary storage back as the restore left them, counts the failed boot in `eacs-tries`
   and asks for one more first boot; after 3 failed boots it leaves the VM as it is and asks for
   a new restore. Finishing removes both files.
+- From QEMU's start to the reset, the first boot took 95 s on 14.6.1, 105 s on 15.6.1 and 96 s
+  on 26.6.2 and 27.2.1, on the M3 Max under HVF with Ambrosia 0.1.3; each VM then went through
+  Setup Assistant, its first account and two restarts, and with FileVault turned on, restarted
+  by `fdesetup authrestart` with FileVault still on and its keychain item kept **[measured]**.
+  27.0.1 (26A434) never completes it: its template migration failed in 5 of 5 first boots, 3 of
+  them `finish_eacs`'s retries, with network access and without, from volumes laid out as
+  27.2.1's are but for their release's names **[measured]**. Its cause is not known.
 
 So every VM takes one boot of the guest before it is ready (`pipeline::finish_eacs` after it):
 reims-ctl's `create` and the CLI's `restore` end by naming that boot and the step after it,
