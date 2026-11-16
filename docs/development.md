@@ -70,6 +70,17 @@ LICENSE                     the license, and LICENSES/ its texts (README.md, Lic
   ([testing.md](testing.md)).
 - **VM boots** are the only check of what a guest's frameworks choose and of QEMU's side of the C
   API ([qemu.md](qemu.md), "Booting a guest to check a change").
+- **The guest's kext sets against old releases**: a rebuild of `guest/prebuilt` or
+  `guest/prebuilt-arm64e` runs `make -C guest kc-check KC=<Boot KC> KC64=<kernelcache>` on a Mac
+  against the oldest release of each set, x86-64 11.7.11 and arm64 14.6.1, and the newest. It
+  fails where a kext imports a name that release's kernel collection does not define, which the
+  newest SDK's headers make easy and a boot of only the newest releases does not see
+  ([lessons.md](lessons.md)). The collections are the guests' own, read from a VM and kept local,
+  never committed: an x86-64 guest's `/System/Library/KernelCollections/BootKernelExtensions.kc`
+  (`scp` from the running guest), and an arm64 guest's kernelcache, from its Preboot volume's
+  `<volume UUID>/boot/<hash>/System/Library/Caches/com.apple.kernelcaches/kernelcache` (on an APFS
+  clone of the VM's `disk.img`, attached with `hdiutil attach -nomount -readonly -imagekey
+  diskimage-class=CRawDiskImage` and the Preboot volume mounted read-only).
 
 A change that means to alter behaviour changes the tests that hold it in the same commit, so the
 diff shows exactly what changed for the guest and the host.

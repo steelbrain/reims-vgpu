@@ -33,6 +33,17 @@
 #       Kernel > Add order; check every kext injects and every name
 #       resolves, and that ReimsGraphics stays bindable by Graft
 #       (tools/oc-link-set.sh)
+#   make kc-check KC=<an x86-64 guest's BootKernelExtensions.kc>
+#                 KC64=<an arm64 guest's kernelcache> [SET=prebuilt] [SET64=prebuilt-arm64e]
+#       check that a release's kernel collection defines every name the set
+#       it boots imports (tools/kc-imports.py): SET against KC, SET64 against
+#       KC64, each where it is given. After `make prebuilt` and `make
+#       prebuilt-arm64e`, run it against the oldest release of each set
+#       (x86-64 11.7.11, arm64 14.6.1) and the newest: the SDK's headers are
+#       the newest release's, and an import an older release lacks keeps the
+#       set off it (Ambrosia refuses the boot). The collections are the
+#       guests' own, copied out of a guest, kept local and never committed
+#       (docs/development.md, Testing)
 #   make test   the parts' own tests: kext/, rgfxgate/ and bundle/
 #   make clean  remove build/
 #
@@ -43,18 +54,21 @@
 OUT ?= build/set
 OUT64 ?= build/set-arm64e
 SET ?= prebuilt
+SET64 ?= prebuilt-arm64e
 WORK = $(abspath build/set-work)
 WORK64 = $(abspath build/set-work-arm64e)
 BUNDLE = $(WORK)/bundle/package/reims-graphics.bundle
 BUNDLE64 = $(WORK64)/bundle/package/reims-graphics.bundle
 KEXTINJECT ?=
 BOOT_KC ?=
+KC ?=
+KC64 ?=
 
 # The parts' Makefiles get only the variables given them below, not this
 # command line's (OUT would set theirs).
 MAKEOVERRIDES =
 
-.PHONY: set prebuilt set-arm64e prebuilt-arm64e prebuilt-check set-check test clean
+.PHONY: set prebuilt set-arm64e prebuilt-arm64e prebuilt-check set-check kc-check test clean
 set:
 	$(MAKE) -C kext BUILD=$(WORK)/kext
 	$(MAKE) -C bundle BUILD=$(WORK)/bundle package
@@ -85,6 +99,11 @@ prebuilt-check:
 
 set-check:
 	bash tools/oc-link-set.sh "$(KEXTINJECT)" "$(BOOT_KC)" $(SET) build/set-check
+
+kc-check:
+	@[ -n "$(KC)$(KC64)" ] || { echo "kc-check: give KC (an x86-64 guest's Boot KC), KC64 (an arm64 guest's kernelcache) or both" >&2; exit 2; }
+	$(if $(KC),python3 -I -B tools/kc-imports.py "$(KC)" $(SET))
+	$(if $(KC64),python3 -I -B tools/kc-imports.py "$(KC64)" $(SET64))
 
 test:
 	$(MAKE) -C kext test
