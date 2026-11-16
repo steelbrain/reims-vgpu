@@ -244,7 +244,7 @@ mod guest_times;
 mod lanes;
 mod vt;
 
-pub use vt::{VtAnswer, VtLink, VtMessage};
+pub use vt::{VtAnswer, VtLink, VtMessage, VtSurface};
 pub(crate) use vt::{read_message as vt_read, vt_status};
 
 /// How many of ring 0's messages a doorbell's take reads ([`Backlog::read`]) before it leaves the
@@ -608,9 +608,10 @@ pub trait Host: Send + Sync + 'static {
         let _ = (completion, message);
     }
 
-    /// A `VT_MESSAGE` of the guest's VideoToolbox ([`RGFX_FEATURE_VT_MESSAGES`]), its runs and
-    /// length checked ([`VtMessage`]): the host reads its bytes from guest RAM, hands them to its
-    /// side of VideoToolbox's paravirtual protocol, and gives `answer` the status that side
+    /// A `VT_MESSAGE` of the guest's VideoToolbox ([`RGFX_FEATURE_VT_MESSAGES`]), its runs,
+    /// length and lent surfaces checked ([`VtMessage`]): the host reads its bytes from guest RAM,
+    /// hands them and the surfaces to its side of VideoToolbox's paravirtual protocol, which lets
+    /// go of each surface with a `rels` sent on `link`, and gives `answer` the status that side
     /// returns, from any thread; `link` sends that side's messages to the guest, from any thread,
     /// while no reset has come since. Called on the control thread with no lock of the device's
     /// held, so the host carries the message out on a thread of its own where it waits for

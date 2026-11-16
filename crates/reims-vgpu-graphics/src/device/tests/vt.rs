@@ -39,7 +39,8 @@ fn take_and_start(rig: &Rig, bits: u64) {
     rig.start();
 }
 
-/// A `VT_MESSAGE` of `length` bytes in `runs`, lending the mappings `surfaces`.
+/// A `VT_MESSAGE` of `length` bytes in `runs`, lending a surface of one page for each of the
+/// lends `surfaces`.
 fn vt_message(length: u64, runs: &[(u64, u64)], surfaces: &[u64]) -> Vec<u8> {
     let mut command = RgfxVtMessage {
         header: RgfxMsgHeader {
@@ -55,6 +56,22 @@ fn vt_message(length: u64, runs: &[(u64, u64)], surfaces: &[u64]) -> Vec<u8> {
     let mut bytes = command.as_bytes().to_vec();
     for &(address, length) in runs {
         bytes.extend_from_slice(RgfxPageRun { address, length }.as_bytes());
+    }
+    for &lend in surfaces {
+        let surface = RgfxVtSurface {
+            lend,
+            length: 0x4000,
+            run_count: 1,
+            ..RgfxVtSurface::default()
+        };
+        bytes.extend_from_slice(surface.as_bytes());
+        bytes.extend_from_slice(
+            RgfxPageRun {
+                address: 0x40000 * lend,
+                length: 0x4000,
+            }
+            .as_bytes(),
+        );
     }
     bytes
 }
@@ -92,7 +109,9 @@ fn a_vt_message_reaches_the_host_and_is_answered_in_order() {
     let handed = handed.lock();
     let (message, _) = &handed[0];
     assert_eq!(message.runs, vec![(0x4000, 64), (0x8000, 0x4000)]);
-    assert_eq!(message.surfaces(), &[3, 4]);
+    let lends: Vec<u64> = message.surfaces.iter().map(|s| s.surface.lend).collect();
+    assert_eq!(lends, [3, 4]);
+    assert_eq!(message.surfaces[1].runs, vec![(0x100000, 0x4000)]);
 }
 
 /// A `VT_MESSAGE` from a guest that did not take `VT_MESSAGES`, or one whose runs do not hold its

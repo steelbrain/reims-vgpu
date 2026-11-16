@@ -356,6 +356,8 @@ include = [
     "RgfxVtHostMessage",
     "RgfxVtMessage",
     "RgfxVtStatus",
+    "RgfxVtSurface",
+    "RgfxVtSurfacePlane",
 ]
 
 [struct]

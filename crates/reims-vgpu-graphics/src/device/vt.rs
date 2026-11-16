@@ -141,7 +141,7 @@ pub(crate) fn host_message(message: &[u8]) -> Option<Vec<u8>> {
     Some(event)
 }
 
-/// A `VT_MESSAGE`, checked: its struct, and its runs.
+/// A `VT_MESSAGE`, checked: its struct, its runs, and the surfaces it lends.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VtMessage {
     /// The message as the guest posted it.
@@ -149,29 +149,25 @@ pub struct VtMessage {
     /// Its runs of guest RAM, `(address, length)`, in order, which hold its `length` bytes from
     /// the first run's first byte.
     pub runs: Vec<(u64, u64)>,
+    /// The surfaces it lends, in order.
+    pub surfaces: Vec<VtSurface>,
 }
 
-impl VtMessage {
-    /// The IDs of the IOSurfaces the message lends, in order.
-    pub fn surfaces(&self) -> &[u64] {
-        let count = (self.message.surface_count as usize).min(RGFX_VT_MESSAGE_SURFACES);
-        &self.message.surfaces[..count]
-    }
+/// One surface a `VT_MESSAGE` lends: its record, and its runs of guest RAM, `(address, length)`,
+/// in order, which hold its `length` bytes from the first run's first byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VtSurface {
+    /// The record as the guest posted it.
+    pub surface: RgfxVtSurface,
+    /// Its runs.
+    pub runs: Vec<(u64, u64)>,
 }
 
-/// `message` as a `VT_MESSAGE`, checked: `None` where it is shorter than its struct and runs,
-/// names more surfaces than it holds, or its `length` is under a `vtpv` header's 48 bytes, over
-/// [`RGFX_VT_MESSAGE_MAX`] or more than its runs hold.
-pub(crate) fn read_message(message: &Message) -> Option<VtMessage> {
-    let (command, rest) = RgfxVtMessage::read_from_prefix(&message.bytes).ok()?;
-    let length = command.length;
-    if !(48..=RGFX_VT_MESSAGE_MAX).contains(&length)
-        || command.surface_count as usize > RGFX_VT_MESSAGE_SURFACES
-    {
-        return None;
-    }
-    let count = command.run_count as usize;
-    let runs = rest.get(..count.checked_mul(size_of::<RgfxPageRun>())?)?;
+/// `count` runs from the start of `bytes`, and what follows them; `None` where `bytes` holds
+/// fewer, or they hold fewer than `length` bytes.
+fn read_runs(bytes: &[u8], count: u32, length: u64) -> Option<(Vec<(u64, u64)>, &[u8])> {
+    let (runs, rest) =
+        bytes.split_at_checked((count as usize).checked_mul(size_of::<RgfxPageRun>())?)?;
     let runs: Vec<(u64, u64)> = runs
         .as_chunks::<{ size_of::<RgfxPageRun>() }>()
         .0
@@ -182,9 +178,37 @@ pub(crate) fn read_message(message: &Message) -> Option<VtMessage> {
     let held = runs
         .iter()
         .try_fold(0u64, |sum, &(_, l)| sum.checked_add(l))?;
-    (held >= length).then_some(VtMessage {
+    (held >= length).then_some((runs, rest))
+}
+
+/// `message` as a `VT_MESSAGE`, checked: `None` where it is shorter than its struct and runs,
+/// lends more surfaces than [`RGFX_VT_MESSAGE_SURFACES`] or more than its records hold, a record's
+/// lend is not the one `surfaces` names for it, its own runs do not hold its `length`, or the
+/// message's `length` is under a `vtpv` header's 48 bytes, over [`RGFX_VT_MESSAGE_MAX`] or more
+/// than its runs hold.
+pub(crate) fn read_message(message: &Message) -> Option<VtMessage> {
+    let (command, rest) = RgfxVtMessage::read_from_prefix(&message.bytes).ok()?;
+    let length = command.length;
+    if !(48..=RGFX_VT_MESSAGE_MAX).contains(&length)
+        || command.surface_count as usize > RGFX_VT_MESSAGE_SURFACES
+    {
+        return None;
+    }
+    let (runs, mut rest) = read_runs(rest, command.run_count, length)?;
+    let mut surfaces = Vec::with_capacity(command.surface_count as usize);
+    for &lend in command.surfaces.iter().take(command.surface_count as usize) {
+        let (surface, after) = RgfxVtSurface::read_from_prefix(rest).ok()?;
+        if surface.lend != lend || lend == 0 {
+            return None;
+        }
+        let (runs, after) = read_runs(after, surface.run_count, surface.length)?;
+        surfaces.push(VtSurface { surface, runs });
+        rest = after;
+    }
+    Some(VtMessage {
         message: command,
         runs,
+        surfaces,
     })
 }
 
@@ -249,12 +273,68 @@ mod tests {
                 length: 0x4000,
             },
         ];
-        let mut c = command(0x5000, 2);
-        c.surface_count = 1;
-        c.surfaces[0] = 9;
-        let read = read_message(&message(c, &runs)).unwrap();
+        let read = read_message(&message(command(0x5000, 2), &runs)).unwrap();
         assert_eq!(read.runs, vec![(0x4000, 0x4000), (0x10000, 0x4000)]);
-        assert_eq!(read.surfaces(), &[9]);
+        assert!(read.surfaces.is_empty());
+    }
+
+    /// A message of 64 bytes in one run, lending `lent` surfaces of one run of `length` bytes
+    /// each, lend 9 and up, its `surfaces` naming `names`.
+    fn lending(lent: u32, length: u64, names: &[u64]) -> Message {
+        let mut c = command(64, 1);
+        c.surface_count = lent;
+        c.surfaces[..names.len()].copy_from_slice(names);
+        let mut bytes = c.as_bytes().to_vec();
+        bytes.extend_from_slice(
+            RgfxPageRun {
+                address: 0x4000,
+                length: 0x4000,
+            }
+            .as_bytes(),
+        );
+        for i in 0..u64::from(lent) {
+            let mut surface = RgfxVtSurface {
+                lend: 9 + i,
+                length,
+                surface_id: 0x40 + i as u32,
+                pixel_format: u32::from_be_bytes(*b"420v"),
+                width: 64,
+                height: 48,
+                plane_count: 2,
+                run_count: 1,
+                ..RgfxVtSurface::default()
+            };
+            surface.planes[1].offset = 0x1000;
+            bytes.extend_from_slice(surface.as_bytes());
+            bytes.extend_from_slice(
+                RgfxPageRun {
+                    address: 0x20000 * (i + 1),
+                    length: 0x4000,
+                }
+                .as_bytes(),
+            );
+        }
+        Message {
+            header: c.header,
+            bytes,
+        }
+    }
+
+    #[test]
+    fn the_surfaces_a_message_lends_are_read_with_their_runs() {
+        let read = read_message(&lending(2, 0x4000, &[9, 10])).unwrap();
+        assert_eq!(read.surfaces.len(), 2);
+        assert_eq!(read.surfaces[0].surface.lend, 9);
+        assert_eq!(read.surfaces[0].surface.planes[1].offset, 0x1000);
+        assert_eq!(read.surfaces[1].runs, vec![(0x40000, 0x4000)]);
+        // A record whose lend is not the one `surfaces` names, or which is missing.
+        assert!(read_message(&lending(2, 0x4000, &[9, 11])).is_none());
+        assert!(read_message(&lending(1, 0x4000, &[9, 10])).is_some());
+        let mut short = lending(2, 0x4000, &[9, 10]);
+        short.bytes.truncate(short.bytes.len() - 8);
+        assert!(read_message(&short).is_none());
+        // A surface whose runs do not hold its length.
+        assert!(read_message(&lending(1, 0x4001, &[9])).is_none());
     }
 
     #[test]

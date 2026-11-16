@@ -111,6 +111,56 @@ int main()
 		check(rgfxVtMessageRuns(buffer, 2, 0x5000, out, 1) == 0, "more runs than fit");
 	}
 
+	// A host `rels` names the lends it lets go of, each big-endian.
+	{
+		const uint8_t rels[24] = {0, 0, 0, 24, 'r', 'e', 'l', 's', 0, 0, 0, 0, 0, 0, 0, 7,
+		                          0, 0, 0, 1, 0, 0, 0, 2};
+		uint64_t out[2] = {};
+		check(rgfxVtReleasedLends(rels, sizeof(rels), out, 2) == 2 && out[0] == 7 &&
+		          out[1] == 0x100000002ull,
+		      "a rels of two lends");
+		check(rgfxVtReleasedLends(rels, sizeof(rels), out, 1) == 1 && out[0] == 7,
+		      "at most what fits");
+		check(rgfxVtReleasedLends(rels, 20, out, 2) == 0, "a box its size does not span");
+		check(rgfxVtReleasedLends(rels, 8, out, 2) == 0, "a box of no lend");
+	}
+
+	// A VT_MESSAGE that lends surfaces: its struct, its runs, then each surface's record and runs.
+	{
+		const RgfxPageRun runs[1] = {{0x10000, 0x200}};
+		const RgfxPageRun first[2] = {{0x80000, 0x1000}, {0x90000, 0x2000}};
+		const RgfxPageRun second[1] = {{0xa0000, 0x3000}};
+		RgfxVtLent lent[2] = {};
+		lent[0].record.lend = 3;
+		lent[0].record.run_count = 2;
+		lent[0].runs = first;
+		lent[1].record.lend = 4;
+		lent[1].record.run_count = 1;
+		lent[1].runs = second;
+		uint8_t out[512];
+		const uint32_t size = rgfxVtPackMessage(0x200, runs, 1, lent, 2, out, sizeof(out));
+		const uint32_t expected = RGFX_VT_MESSAGE_RUNS_OFFSET + 16 + 2 * sizeof(RgfxVtSurface) +
+		                          3 * 16;
+		RgfxVtMessage head;
+		std::memcpy(&head, out, sizeof(head));
+		check(size == expected && head.length == 0x200 && head.run_count == 1 &&
+		          head.surface_count == 2 && head.surfaces[0] == 3 && head.surfaces[1] == 4 &&
+		          head.surfaces[2] == 0,
+		      "the struct names the lends");
+		RgfxVtSurface record;
+		RgfxPageRun run;
+		const uint32_t second_at = RGFX_VT_MESSAGE_RUNS_OFFSET + 16 + sizeof(RgfxVtSurface) + 32;
+		std::memcpy(&record, out + second_at, sizeof(record));
+		std::memcpy(&run, out + second_at + sizeof(record), sizeof(run));
+		check(record.lend == 4 && run.address == 0xa0000 && run.length == 0x3000,
+		      "the second surface's record and run follow the first's");
+		check(rgfxVtPackMessage(0x200, runs, 1, lent, 2, out, expected - 1) == 0,
+		      "a message that does not fit");
+		RgfxVtLent six[6] = {};
+		check(rgfxVtPackMessage(0x200, runs, 1, six, 6, out, sizeof(out)) == 0,
+		      "more surfaces than a message names");
+	}
+
 	// The service serves a host whose caps list a decode entry of H.264 or HEVC with a profile.
 	{
 		RgfxVideoCaps caps = {};

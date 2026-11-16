@@ -57,6 +57,8 @@ CHECK(RGFX_FEATURE_VT_MESSAGES == (1ULL << 52));
 CHECK(RGFX_CMD_VT_MESSAGE == 0x2fa);
 CHECK(sizeof(RgfxVtMessage) == RGFX_VT_MESSAGE_RUNS_OFFSET);
 CHECK(offsetof(RgfxVtMessage, surfaces) == 32);
+CHECK(sizeof(RgfxVtSurface) == 96 && offsetof(RgfxVtSurface, planes) == 48);
+CHECK(sizeof(RgfxVtSurfacePlane) == 24 && RGFX_VT_SURFACE_PLANES == 2);
 CHECK(RGFX_EVT_VT_STATUS == 0x40d && sizeof(RgfxVtStatus) == 24);
 CHECK(offsetof(RgfxVtStatus, status) == 16);
 CHECK(RGFX_EVT_VT_MESSAGE == 0x40e);

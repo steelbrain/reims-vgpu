@@ -1624,16 +1624,18 @@ Stages:
       the buffer and of the host-message queue, an IOSharedDataQueue the
       kext maps into the process; 1 and 2 register and deregister a 16-byte
       session UUID for the client; 3 sends the buffer's first `length`
-      bytes, with up to five IOSurface IDs, and answers the host's status
-      for it, as its output and as its return (the kext answers a message
-      that names a surface `kVTParameterErr` for now: nothing the host
-      answers yet takes one); 4 moves the host messages kept while the
-      queue was full into it. The notification port is type
+      bytes, lending the host the IOSurfaces of up to five IDs, and answers
+      the host's status for it, as its output and as its return (a surface
+      the client's task cannot see answers `kVTParameterErr`, posting
+      nothing); 4 moves the host messages kept while the queue was full
+      into it. The notification port is type
       0. Apple's kext of that class binds only to Apple's VM device
       (106b:1a03), which no VM of ours has, so it never loads beside ours.
     - **The wire:** `VT_MESSAGE` on ring 0 carries one message: its length,
       the guest RAM runs of the client's message buffer that hold it, and
-      the IDs of the IOSurfaces it lends. It waits for no
+      each IOSurface it lends as a record (`RgfxVtSurface`: the kext's name
+      for the lend, the surface's ID, pixel format, size and planes) and the
+      runs of its pages. It waits for no
       command buffer and no buffer waits for it. The host reads the message
       from guest RAM, hands it to its session layer, and answers
       `VT_STATUS` with the status VideoToolbox's host side would return. A
@@ -1644,6 +1646,14 @@ Stages:
       each UUID written in, as Apple's kext does. A deregistration of a
       UUID the client registered sends the host `-uui` for it, and so does
       a client's close for each UUID it holds, as Apple's kext does.
+    - **A lent surface is the host's until its `rels`.** The kext holds
+      each surface it lends, retained and its memory wired, from the send
+      until the host's `rels` names its lend (a `VT_MESSAGE` event of the
+      box alone: its size, `rels`, then each lend, big-endian), whatever
+      becomes of the client; the service's stop lets go of every lend. The
+      host lets go of a message's surfaces at once where no session takes
+      the message, and of a decoder's output once it has emitted the frame
+      written into its pages.
     - **The answers are the host's arms'.** `decs` lists one decoder for
       each codec the caps decode, `dcap` its profiles and level from the
       caps' entry; a codec the host lacks is not listed, so VideoToolbox
@@ -2185,8 +2195,9 @@ only where no negotiation can carry it.
   on a device of one display as of several, and sends the event only to a
   guest that took it. Both kexts take it; the firmware drivers do not.
 - Bit 52, `FEATURES_HI`'s bit 20, is `VT_MESSAGES`: ring 0 carries the arm64e
-  kext's `VT_MESSAGE` (0x2fa, `RgfxVtMessage`, then its runs: one message of
-  the guest's VideoToolbox to its host side), which the host answers
+  kext's `VT_MESSAGE` (0x2fa, `RgfxVtMessage`, then its runs, then each
+  surface it lends as an `RgfxVtSurface` and its runs: one message of the
+  guest's VideoToolbox to its host side), which the host answers
   `VT_STATUS` (0x40d, `RgfxVtStatus`: the status VideoToolbox's host side
   returns for it), and the control completion ring carries the host's side's
   messages to the guest's as the event `VT_MESSAGE` (0x40e,

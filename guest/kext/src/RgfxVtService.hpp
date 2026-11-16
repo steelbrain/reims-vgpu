@@ -15,12 +15,17 @@
  *    buffer and of its host-message queue, an IOSharedDataQueue of kRgfxVtQueueBytes;
  *  - 1 and 2, a 16-byte structure in: register and deregister a session UUID for the client;
  *  - 3, the message's length and up to five IOSurface IDs in, one scalar out: sends the buffer's
- *    first `length` bytes, and answers the host's status for it, as its output and its return. A
- *    message that names a surface is answered kVTParameterErr, posting nothing: nothing the host
- *    answers yet takes one;
+ *    first `length` bytes, lending the host the IOSurfaces of the IDs (looked up in the client's
+ *    task), and answers the host's status for it, as its output and its return. A surface the
+ *    task cannot see, or more lends than the service holds, answers kVTParameterErr, posting
+ *    nothing;
  *  - 4: moves the host messages kept while the queue was full into it.
- * Its notification port, type 0, is the queue's. Apple's kext of the class binds only to Apple's
- * VM device (106b:1a03), which no VM of ours has, so the two never load together.
+ * Its notification port, type 0, is the queue's.
+ *
+ * A lent surface is held, retained and its memory wired, from the send until the host's `rels`
+ * names its lend, whatever becomes of the client, and is let go of at the service's stop. The
+ * host writes a decoded picture into its pages meanwhile. Apple's kext of the class binds only to
+ * Apple's VM device (106b:1a03), which no VM of ours has, so the two never load together.
  *
  * Our own code; it names only SDK-public IOKit classes.
  */
@@ -63,11 +68,30 @@ public:
 	// Sends the message of `length` bytes in the guest RAM runs `runs` (`count` of them) as a
 	// VT_MESSAGE, and waits for its VT_STATUS, its status into *status. Thread context only.
 	IOReturn send(const RgfxPageRun *runs, uint32_t count, uint64_t length, int32_t *status);
+	// The same, lending the `lentCount` surfaces of `lent`, each lent already (lend); *posted
+	// says whether the message reached the ring, after which the host lets go of the lends.
+	IOReturn send(const RgfxPageRun *runs, uint32_t count, uint64_t length, const RgfxVtLent *lent,
+	              uint32_t lentCount, int32_t *status, bool *posted);
 	// handleEvent's VT_MESSAGE, on the device's work loop: the `length` bytes of the host's
-	// message, to the clients RgfxVtRoutes.hpp routes it to.
+	// message, to the clients RgfxVtRoutes.hpp routes it to, or the lends a `rels` lets go of.
 	void deliver(const volatile uint8_t *message, uint32_t length);
+	// Lends the host the IOSurface `surfaceId` as `task` sees it: held, its memory wired, its
+	// record, named by its new lend, into *record and its runs into `runs` (at most `max`).
+	// kIOReturnSuccess, or why not, with nothing held.
+	IOReturn lend(task_t task, uint32_t surfaceId, RgfxVtSurface *record, RgfxPageRun *runs,
+	              uint32_t max);
+	// Lets go of the lend `name`, where the service holds it.
+	void letGoLend(uint64_t name);
 
 private:
+	// One lend the service holds.
+	struct Lend {
+		uint64_t name;
+		OSObject *surface;
+		IOMemoryDescriptor *memory;
+	};
+	// Lets go of every lend.
+	void letGoLends();
 	// Sends the host `-uui` of `uuid`, from forgetBuffer.
 	void sendForget(const uint8_t *uuid);
 
@@ -82,6 +106,12 @@ private:
 	IOLock *forgetLock;
 	// The work loop's copy of the host message it routes, RGFX_VT_HOST_MESSAGE_MAX bytes.
 	uint8_t *delivered;
+	// IOSurfaceRoot, retained, which surfaces are looked up in.
+	IOService *surfaceRoot;
+	// Under lock: the lends held, kRgfxVtLendsMax of them IOMalloc'd, and the last lend's name.
+	Lend *lends;
+	uint32_t lendCount;
+	uint64_t lastLend;
 };
 
 class RgfxVtUserClient : public IOUserClient {

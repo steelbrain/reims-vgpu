@@ -7,6 +7,7 @@
 #include "RgfxVtService.hpp"
 
 #include "ReimsGraphics.hpp"
+#include "RgfxIOSurfaceKPI.hpp"
 #include "RgfxSurfaceBlocks.hpp"
 #include "RgfxTrace.hpp"
 
@@ -27,6 +28,15 @@ enum : uint32_t {
 };
 // The most scalars a send takes: its length and five IOSurface IDs.
 constexpr uint32_t kVtSendScalarsMax = 1 + RGFX_VT_MESSAGE_SURFACES;
+// The most runs one VT_MESSAGE carries, its own and its surfaces': what its bytes hold.
+constexpr uint32_t kVtRunsMax = ReimsGraphics::kLifecycleMessageMax / sizeof(RgfxPageRun);
+
+// Whether `surface` is an IOSurface, as IOSurfaceRoot hands out.
+bool isSurface(const OSObject *surface)
+{
+	const OSMetaClass *meta = surface->getMetaClass();
+	return meta && strcmp(meta->getClassName(), "IOSurface") == 0;
+}
 } // namespace
 
 // MARK: - The service
@@ -48,6 +58,10 @@ AppleVideoToolboxParavirtualizationDriver::withFramebuffer(ReimsGraphics *fb)
 	service->forgetRun = {};
 	service->forgetLock = nullptr;
 	service->delivered = nullptr;
+	service->surfaceRoot = nullptr;
+	service->lends = nullptr;
+	service->lendCount = 0;
+	service->lastLend = 0;
 	if (!service->init(nullptr) || !service->attach(fb)) {
 		service->release();
 		return nullptr;
@@ -74,6 +88,12 @@ bool AppleVideoToolboxParavirtualizationDriver::start(IOService *provider)
 	if (routes)
 		bzero(routes, sizeof(RgfxVtRoutes));
 	delivered = static_cast<uint8_t *>(IOMalloc(RGFX_VT_HOST_MESSAGE_MAX));
+	lends = static_cast<Lend *>(IOMalloc(kRgfxVtLendsMax * sizeof(Lend)));
+	// IOSurfaceRoot starts with IOSurface.kext, before any display's framebuffer.
+	if (OSDictionary *matching = IOService::serviceMatching("IOSurfaceRoot")) {
+		surfaceRoot = IOService::copyMatchingService(matching);
+		matching->release();
+	}
 	// The page of the kext's own `-uui`s, in one run of guest RAM.
 	forgetBuffer = IOBufferMemoryDescriptor::withOptions(
 	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, PAGE_SIZE, PAGE_SIZE);
@@ -84,7 +104,10 @@ bool AppleVideoToolboxParavirtualizationDriver::start(IOService *provider)
 	} else {
 		OSSafeReleaseNULL(forgetBuffer);
 	}
-	if (!lock || !forgetLock || !routes || !delivered || !forgetBuffer || !forgetRun.address) {
+	if (!surfaceRoot)
+		IOLog("RgfxVtService: no IOSurfaceRoot: the service lends the host no surface\n");
+	if (!lock || !forgetLock || !routes || !delivered || !lends || !forgetBuffer ||
+	    !forgetRun.address) {
 		IOLog("RgfxVtService: no memory for the VideoToolbox service\n");
 		super::stop(provider);
 		return false;
@@ -95,6 +118,8 @@ bool AppleVideoToolboxParavirtualizationDriver::start(IOService *provider)
 
 void AppleVideoToolboxParavirtualizationDriver::stop(IOService *provider)
 {
+	// The device stops with the framebuffer: what the host held of the guest's goes with it.
+	letGoLends();
 	super::stop(provider);
 }
 
@@ -105,6 +130,12 @@ void AppleVideoToolboxParavirtualizationDriver::free()
 		forgetBuffer->release();
 		forgetBuffer = nullptr;
 	}
+	if (lends && lock)
+		letGoLends();
+	if (lends)
+		IOFree(lends, kRgfxVtLendsMax * sizeof(Lend));
+	lends = nullptr;
+	OSSafeReleaseNULL(surfaceRoot);
 	if (routes)
 		IOFree(routes, sizeof(RgfxVtRoutes));
 	routes = nullptr;
@@ -196,24 +227,35 @@ void AppleVideoToolboxParavirtualizationDriver::sendForget(const uint8_t *uuid)
 IOReturn AppleVideoToolboxParavirtualizationDriver::send(const RgfxPageRun *runs, uint32_t count,
                                                          uint64_t length, int32_t *status)
 {
+	bool posted = false;
+	return send(runs, count, length, nullptr, 0, status, &posted);
+}
+
+IOReturn AppleVideoToolboxParavirtualizationDriver::send(const RgfxPageRun *runs, uint32_t count,
+                                                         uint64_t length, const RgfxVtLent *lent,
+                                                         uint32_t lentCount, int32_t *status,
+                                                         bool *posted)
+{
 	*status = kRgfxVtParameterErr;
-	const uint32_t size = RGFX_VT_MESSAGE_RUNS_OFFSET + count * sizeof(RgfxPageRun);
-	if (count == 0 || size > ReimsGraphics::kLifecycleMessageMax)
+	*posted = false;
+	if (count == 0)
 		return kIOReturnNoSpace;
-	uint8_t *message = static_cast<uint8_t *>(IOMalloc(size));
+	constexpr uint32_t kMax = ReimsGraphics::kLifecycleMessageMax;
+	uint8_t *message = static_cast<uint8_t *>(IOMalloc(kMax));
 	if (!message)
 		return kIOReturnNoMemory;
-	bzero(message, size);
-	RgfxVtMessage head = {};
-	head.length = length;
-	head.run_count = count;
-	memcpy(message, &head, sizeof(head));
-	memcpy(message + RGFX_VT_MESSAGE_RUNS_OFFSET, runs, count * sizeof(RgfxPageRun));
+	const uint32_t size = rgfxVtPackMessage(length, runs, count, lent, lentCount, message, kMax);
+	if (!size) {
+		IOFree(message, kMax);
+		return kIOReturnNoSpace;
+	}
 	UInt8 reply[ReimsGraphics::kLifecycleReplyMax];
 	UInt32 replied = 0;
 	IOReturn r = fb->postLifecycle(RGFX_CMD_VT_MESSAGE, message, size, RGFX_EVT_VT_STATUS, reply,
 	                               sizeof(reply), &replied, nullptr, kRgfxVtAnswerMs);
-	IOFree(message, size);
+	IOFree(message, kMax);
+	// On the ring, the message is the host's, answered or not.
+	*posted = r == kIOReturnSuccess || r == kIOReturnTimeout;
 	if (r == kIOReturnSuccess && replied >= sizeof(RgfxVtStatus)) {
 		RgfxVtStatus answer;
 		memcpy(&answer, reply, sizeof(answer));
@@ -233,11 +275,21 @@ void AppleVideoToolboxParavirtualizationDriver::deliver(const volatile uint8_t *
 		delivered[i] = message[i];
 	uint8_t uuid[kRgfxVtUuidBytes];
 	const RgfxVtHostKind kind = rgfxVtHostMessage(delivered, length, uuid);
-	if (kind == kRgfxVtReleases || kind == kRgfxVtUnreadable) {
+	if (kind == kRgfxVtReleases) {
+		uint64_t released[kRgfxVtLendsMax];
+		const uint32_t n = rgfxVtReleasedLends(delivered, length, released, kRgfxVtLendsMax);
+		static char unread;
+		if (!n && rgfxFirstCalls(&unread, 0, 1))
+			IOLog("RgfxVtService: a host rels of %u bytes names no lend\n", length);
+		for (uint32_t i = 0; i < n; i++)
+			letGoLend(released[i]);
+		return;
+	}
+	if (kind == kRgfxVtUnreadable) {
 		static char dropped;
-		if (rgfxFirstCalls(&dropped, kind, 1))
-			IOLog("RgfxVtService: a host message of %u bytes goes to no client (%s)\n", length,
-			      kind == kRgfxVtReleases ? "rels" : "unreadable");
+		if (rgfxFirstCalls(&dropped, 0, 1))
+			IOLog("RgfxVtService: a host message of %u bytes goes to no client (unreadable)\n",
+			      length);
 		return;
 	}
 	if (kind == kRgfxVtForUuid) {
@@ -274,6 +326,112 @@ void AppleVideoToolboxParavirtualizationDriver::deliver(const volatile uint8_t *
 		client->release();
 	}
 	IOFree(all, sizeof(RgfxVtRoutes::Route) * kRgfxVtRoutesMax);
+}
+
+
+IOReturn AppleVideoToolboxParavirtualizationDriver::lend(task_t task, uint32_t surfaceId,
+                                                         RgfxVtSurface *record, RgfxPageRun *runs,
+                                                         uint32_t max)
+{
+	if (!surfaceRoot)
+		return kIOReturnNotReady;
+	OSObject *surface = rgfxIOSurfaceRootLookupSurface(surfaceRoot, surfaceId, task);
+	if (!surface)
+		return kIOReturnNotFound;
+	IOMemoryDescriptor *memory =
+	    isSurface(surface) ? OSDynamicCast(IOMemoryDescriptor, rgfxIOSurfaceMemory(surface))
+	                       : nullptr;
+	const uint64_t base = memory ? rgfxIOSurfaceBaseOffset(surface) : 0;
+	const uint64_t length = memory ? rgfxIOSurfaceAllocSize(surface) : 0;
+	if (!memory || !length || base + length > memory->getLength()) {
+		surface->release();
+		return kIOReturnBadArgument;
+	}
+	memory->retain();
+	if (memory->prepare(kIODirectionInOut) != kIOReturnSuccess) {
+		memory->release();
+		surface->release();
+		return kIOReturnNoMemory;
+	}
+	uint32_t n = 0;
+	bool walked = true;
+	for (uint64_t at = base; walked && at < base + length;) {
+		IOByteCount segment = 0;
+		const addr64_t phys = memory->getPhysicalSegment(at, &segment, kIOMemoryMapperNone);
+		const uint64_t take = segment < base + length - at ? segment : base + length - at;
+		walked = phys && segment && rgfxSurfaceAppendRun(runs, &n, max, phys, take);
+		at += take;
+	}
+	*record = {};
+	record->length = length;
+	record->surface_id = rgfxIOSurfaceID(surface);
+	record->pixel_format = rgfxIOSurfacePixelFormat(surface);
+	record->width = rgfxIOSurfaceWidth(surface);
+	record->height = rgfxIOSurfaceHeight(surface);
+	record->plane_count = rgfxIOSurfacePlaneCount(surface);
+	record->run_count = n;
+	if (record->plane_count == 0) {
+		record->planes[0].bytes_per_row = rgfxIOSurfaceBytesPerRow(surface);
+		record->planes[0].width = record->width;
+		record->planes[0].height = record->height;
+	}
+	for (uint32_t p = 0; p < record->plane_count && p < RGFX_VT_SURFACE_PLANES; p++) {
+		record->planes[p].offset = rgfxIOSurfacePlaneOffset(surface, p);
+		record->planes[p].bytes_per_row = rgfxIOSurfacePlaneBytesPerRow(surface, p);
+		record->planes[p].width = rgfxIOSurfacePlaneWidth(surface, p);
+		record->planes[p].height = rgfxIOSurfacePlaneHeight(surface, p);
+	}
+	IOLockLock(lock);
+	const bool held = walked && lendCount < kRgfxVtLendsMax;
+	if (held) {
+		lastLend = lastLend + 1 ? lastLend + 1 : 1;
+		record->lend = lastLend;
+		lends[lendCount++] = {lastLend, surface, memory};
+	}
+	IOLockUnlock(lock);
+	if (!held) {
+		static char refused;
+		if (rgfxFirstCalls(&refused, walked, 1))
+			IOLog("RgfxVtService: IOSurface %u is not lent: %s\n", surfaceId,
+			      walked ? "the service holds the most lends it holds"
+			             : "its runs are more than a message carries");
+		memory->complete(kIODirectionInOut);
+		memory->release();
+		surface->release();
+		return walked ? kIOReturnNoResources : kIOReturnNoSpace;
+	}
+	return kIOReturnSuccess;
+}
+
+void AppleVideoToolboxParavirtualizationDriver::letGoLend(uint64_t name)
+{
+	Lend gone = {};
+	IOLockLock(lock);
+	for (uint32_t i = 0; i < lendCount; i++) {
+		if (lends[i].name != name)
+			continue;
+		gone = lends[i];
+		lends[i] = lends[--lendCount];
+		break;
+	}
+	IOLockUnlock(lock);
+	if (!gone.surface)
+		return;
+	gone.memory->complete(kIODirectionInOut);
+	gone.memory->release();
+	gone.surface->release();
+}
+
+void AppleVideoToolboxParavirtualizationDriver::letGoLends()
+{
+	for (;;) {
+		IOLockLock(lock);
+		const uint64_t name = lendCount ? lends[lendCount - 1].name : 0;
+		IOLockUnlock(lock);
+		if (!name)
+			return;
+		letGoLend(name);
+	}
 }
 
 #undef super
@@ -496,35 +654,59 @@ IOReturn RgfxVtUserClient::sizeBuffer(IOExternalMethodArguments *a)
 	return r;
 }
 
-// Selector 3: the buffer's first `length` bytes to the host, and its status back.
+// Selector 3: the buffer's first `length` bytes to the host, lending it the surfaces of the IDs
+// that follow, and its status back.
 IOReturn RgfxVtUserClient::sendMessage(IOExternalMethodArguments *a)
 {
 	const uint64_t length = a->scalarInput[0];
 	int32_t status = kRgfxVtParameterErr;
 	IOReturn r = kIOReturnSuccess;
-	bool surfaces = false;
-	for (uint32_t i = 1; i < a->scalarInputCount; i++)
-		surfaces = surfaces || a->scalarInput[i] != 0;
-	if (surfaces) {
-		static char lent;
-		if (rgfxFirstCalls(&lent, 0, 1))
-			IOLog("RgfxVtService: a message that lends a surface is not sent: the host takes "
-			      "none yet\n");
+	IOLockLock(sendLock);
+	RgfxPageRun *message = static_cast<RgfxPageRun *>(IOMalloc(kVtRunsMax * sizeof(RgfxPageRun)));
+	RgfxPageRun *surfaceRuns =
+	    static_cast<RgfxPageRun *>(IOMalloc(kVtRunsMax * sizeof(RgfxPageRun)));
+	RgfxVtLent lent[RGFX_VT_MESSAGE_SURFACES] = {};
+	uint32_t lentCount = 0;
+	if (!buffer || length > capacity) {
+		r = kIOReturnBadArgument;
+	} else if (!message || !surfaceRuns) {
+		r = kIOReturnNoMemory;
 	} else {
-		IOLockLock(sendLock);
-		if (!buffer || length > capacity) {
-			r = kIOReturnBadArgument;
-		} else {
-			RgfxPageRun *message =
-			    static_cast<RgfxPageRun *>(IOMalloc(runCapacity * sizeof(RgfxPageRun)));
-			const uint32_t n =
-			    message ? rgfxVtMessageRuns(runs, runCount, length, message, runCapacity) : 0;
-			r = n ? service->send(message, n, length, &status) : kIOReturnNoMemory;
-			if (message)
-				IOFree(message, runCapacity * sizeof(RgfxPageRun));
+		const uint32_t n = rgfxVtMessageRuns(runs, runCount, length, message,
+		                                     runCapacity < kVtRunsMax ? runCapacity : kVtRunsMax);
+		uint32_t used = 0;
+		bool lending = n != 0;
+		bool posted = false;
+		for (uint32_t i = 1; lending && i < a->scalarInputCount; i++) {
+			const uint32_t id = static_cast<uint32_t>(a->scalarInput[i]);
+			if (!id)
+				continue;
+			RgfxVtLent &l = lent[lentCount];
+			lending = service->lend(task, id, &l.record, surfaceRuns + used, kVtRunsMax - used) ==
+			          kIOReturnSuccess;
+			if (lending) {
+				l.runs = surfaceRuns + used;
+				used += l.record.run_count;
+				lentCount++;
+			}
 		}
-		IOLockUnlock(sendLock);
+		if (!n) {
+			r = kIOReturnNoMemory;
+		} else if (lending) {
+			r = service->send(message, n, length, lent, lentCount, &status, &posted);
+		}
+		// What was lent of a message never posted goes back at once; once posted, the host lets
+		// go of each with a `rels`.
+		if (!posted) {
+			for (uint32_t i = 0; i < lentCount; i++)
+				service->letGoLend(lent[i].record.lend);
+		}
 	}
+	if (message)
+		IOFree(message, kVtRunsMax * sizeof(RgfxPageRun));
+	if (surfaceRuns)
+		IOFree(surfaceRuns, kVtRunsMax * sizeof(RgfxPageRun));
+	IOLockUnlock(sendLock);
 	a->scalarOutput[0] = static_cast<uint64_t>(static_cast<int64_t>(status));
 	a->scalarOutputCount = 1;
 	return r != kIOReturnSuccess ? r : static_cast<IOReturn>(status);

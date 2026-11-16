@@ -641,6 +641,24 @@ fn a_late_reply_gives_back_what_it_lent_and_a_close_ends_the_session() {
         |_| {},
     );
     assert_eq!(answer.status, status::SESSION_NOT_FOUND);
+    assert!(
+        guest.quiet(),
+        "a message that lends nothing is let go of with nothing"
+    );
+
+    let answer = guest.send(
+        b"Dbuf",
+        MessageFlags::REPLY_TO_HOST,
+        14,
+        vec![Arc::new(Surface(22))],
+        |_| {},
+    );
+    assert_eq!(answer.status, status::SESSION_NOT_FOUND);
+    assert_eq!(
+        guest.next(),
+        surface_release(&[22]),
+        "a surface lent to no session goes back"
+    );
 }
 
 #[test]

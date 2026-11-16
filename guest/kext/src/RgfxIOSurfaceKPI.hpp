@@ -178,6 +178,44 @@ void rgfxIOSurfaceRootUpdateLimits(void *root, uint32_t planeMask, uint32_t rowM
     __asm__("__ZN13IOSurfaceRoot12updateLimitsEjjjjj");
 }
 
+// The facts of a surface the VideoToolbox service lends the host (RgfxVtService.cpp), each one
+// of IOSurface's const getters, which IOSurface.kext exports on every arm64 release the arm64e
+// set serves (14 to 27, kc-check). Each returns its value in 32 bits; IOSurface's sizes and
+// offsets fit.
+extern "C" {
+// IOSurface::getSurfaceID() const.
+uint32_t rgfxIOSurfaceID(const OSObject *surface) __asm__("__ZNK9IOSurface12getSurfaceIDEv");
+// IOSurface::getPixelFormat() const: its OSType.
+uint32_t rgfxIOSurfacePixelFormat(const OSObject *surface)
+    __asm__("__ZNK9IOSurface14getPixelFormatEv");
+// IOSurface::getWidth() const and getHeight() const: plane 0's size.
+uint32_t rgfxIOSurfaceWidth(const OSObject *surface) __asm__("__ZNK9IOSurface8getWidthEv");
+uint32_t rgfxIOSurfaceHeight(const OSObject *surface) __asm__("__ZNK9IOSurface9getHeightEv");
+// IOSurface::getBytesPerRow() const: plane 0's, or a surface's without planes.
+uint32_t rgfxIOSurfaceBytesPerRow(const OSObject *surface)
+    __asm__("__ZNK9IOSurface14getBytesPerRowEv");
+// IOSurface::getPlaneCount() const: 0 for a surface without planes.
+uint32_t rgfxIOSurfacePlaneCount(const OSObject *surface)
+    __asm__("__ZNK9IOSurface13getPlaneCountEv");
+// IOSurface::getPlaneOffset(unsigned int) const: the plane's first byte in the surface.
+uint32_t rgfxIOSurfacePlaneOffset(const OSObject *surface, uint32_t plane)
+    __asm__("__ZNK9IOSurface14getPlaneOffsetEj");
+// IOSurface::getPlaneBytesPerRow(unsigned int) const.
+uint32_t rgfxIOSurfacePlaneBytesPerRow(const OSObject *surface, uint32_t plane)
+    __asm__("__ZNK9IOSurface19getPlaneBytesPerRowEj");
+// IOSurface::getPlaneWidth(unsigned int) const and getPlaneHeight(unsigned int) const.
+uint32_t rgfxIOSurfacePlaneWidth(const OSObject *surface, uint32_t plane)
+    __asm__("__ZNK9IOSurface13getPlaneWidthEj");
+uint32_t rgfxIOSurfacePlaneHeight(const OSObject *surface, uint32_t plane)
+    __asm__("__ZNK9IOSurface14getPlaneHeightEj");
+// IOSurface::getAllocSize() const: the surface's bytes.
+uint32_t rgfxIOSurfaceAllocSize(const OSObject *surface)
+    __asm__("__ZNK9IOSurface12getAllocSizeEv");
+// IOSurface::getBaseOffset() const: where the surface's bytes start in its memory.
+uint32_t rgfxIOSurfaceBaseOffset(const OSObject *surface)
+    __asm__("__ZNK9IOSurface13getBaseOffsetEv");
+}
+
 // What IOSurfaceRoot starts its three other limits at, which updateLimits lowers no further.
 constexpr uint32_t kRgfxIOSurfaceNoLimit = 0x7fffffff;
 

@@ -98,6 +98,7 @@ use reims_vgpu_graphics::wire::{
 use reims_vgpu_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, DoorbellAt, Host, Mode, PresentAnswer,
     QueueClaim, RawDoorbell, RingDegradation, Scanout, Screen, VtAnswer, VtLink, VtMessage,
+    VtSurface,
 };
 use reims_vgpu_video::paravirt;
 use reims_vgpu_vulkan::core::host::HostQueue;
@@ -3203,15 +3204,25 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
 
     fn vt_message(&self, message: VtMessage, answer: VtAnswer, link: VtLink) {
         let length = message.message.length;
+        let lent: Vec<Arc<dyn paravirt::LentSurface>> = message
+            .surfaces
+            .into_iter()
+            .map(|surface| Arc::new(GuestSurface(surface)) as Arc<dyn paravirt::LentSurface>)
+            .collect();
+        let guest: Arc<dyn paravirt::Link> = Arc::new(GuestLink(link.clone()));
         let Some(bytes) = self.control.decoder().guest_bytes(&message.runs, length) else {
             log::warn!(
                 target: "reims_vgpu::graphics",
                 "a VT_MESSAGE of {length} bytes: its runs lie outside the guest RAM the host maps"
             );
+            if !lent.is_empty() {
+                let lends: Vec<u64> = lent.iter().map(|surface| surface.id()).collect();
+                link.send(&paravirt::decoder::surface_release(&lends));
+            }
             answer.answer(RGFX_VT_STATUS_MALFORMED);
             return;
         };
-        let answered = self.vt.deliver(&bytes);
+        let answered = self.vt.deliver_lending(&bytes, lent, Some(guest));
         for reply in &answered.replies {
             if !link.send(reply) {
                 log::warn!(
@@ -3222,6 +3233,30 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
             }
         }
         answer.answer(answered.status);
+    }
+}
+
+/// A surface a `VT_MESSAGE` lent, as the device read it: its record and its runs of guest RAM,
+/// which the host may write until it lets go of the lend.
+#[derive(Debug)]
+struct GuestSurface(VtSurface);
+
+impl paravirt::LentSurface for GuestSurface {
+    fn id(&self) -> u64 {
+        self.0.surface.lend
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// The device's link, as VideoToolbox's paravirtual host sends on it.
+struct GuestLink(VtLink);
+
+impl paravirt::Link for GuestLink {
+    fn send(&self, message: &[u8]) -> bool {
+        self.0.send(message)
     }
 }
 

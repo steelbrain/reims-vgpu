@@ -1186,12 +1186,17 @@ pub const RGFX_CMD_SURFACE_DOWNLOAD: u32 = 0x2f7;
 /// [`RGFX_VT_MESSAGE_RUNS_OFFSET`]), on ring 0 from the arm64e kext, where the guest took
 /// [`RGFX_FEATURE_VT_MESSAGES`]: one message of the guest's VideoToolbox to its host side, a `vtpv`
 /// message as VideoToolbox writes it (docs/graphics-kext/design.md, "Decided", 17), its `length`
-/// bytes in the guest RAM the runs name, in order, from the first run's first byte. The surfaces
-/// the message lends are named by their IOSurface IDs, in `surfaces`, the used ones first and the
-/// rest 0. No command buffer waits for it, and it waits for none. Answered [`RGFX_EVT_VT_STATUS`] with
-/// its `seqno`: the status VideoToolbox's host side returns for the message, or
-/// [`RGFX_VT_STATUS_MALFORMED`] where the runs do not hold `length` bytes of guest RAM, or
-/// `length` is under the 48 bytes of a `vtpv` header or over [`RGFX_VT_MESSAGE_MAX`].
+/// bytes in the guest RAM the runs name, in order, from the first run's first byte. The
+/// IOSurfaces the message lends follow its runs, `surface_count` of them, each an
+/// [`RgfxVtSurface`] and then its own `run_count` runs, which hold its `length` bytes; `surfaces`
+/// names each by its lend, in the same order, the rest 0. The kext holds each lent surface, its
+/// pages wired, until the host lets go of it with a `rels` naming its lend (the `VT_MESSAGE`
+/// event), and the host writes its pages only meanwhile. No command buffer waits for it, and it
+/// waits for none. Answered [`RGFX_EVT_VT_STATUS`] with its `seqno`: the status VideoToolbox's host
+/// side returns for the message, or [`RGFX_VT_STATUS_MALFORMED`] where the runs do not hold
+/// `length` bytes of guest RAM, `length` is under the 48 bytes of a `vtpv` header or over
+/// [`RGFX_VT_MESSAGE_MAX`], or the surfaces' records do not read; the host lets go of the
+/// surfaces of a message it does not take.
 pub const RGFX_CMD_VT_MESSAGE: u32 = 0x2fa;
 /// Where a `VT_MESSAGE`'s runs start: right after its [`RgfxVtMessage`].
 pub const RGFX_VT_MESSAGE_RUNS_OFFSET: u32 = 72;
@@ -1778,6 +1783,8 @@ const _: () = {
     assert!(offset_of!(RgfxRingHeader, raise_all) == 0xc4);
     assert!(size_of::<RgfxMsgHeader>() == 16);
     assert!(size_of::<RgfxVtMessage>() == RGFX_VT_MESSAGE_RUNS_OFFSET as usize);
+    assert!(size_of::<RgfxVtSurface>() == 96);
+    assert!(size_of::<RgfxVtSurfacePlane>() == 24);
     assert!(size_of::<RgfxVtStatus>() == 24);
     assert!(size_of::<RgfxVtHostMessage>() == RGFX_VT_HOST_MESSAGE_BYTES_OFFSET as usize);
     assert!(size_of::<RgfxGetDisplays>() == 16);
@@ -2373,7 +2380,8 @@ pub struct RgfxSurfaceDownload {
 }
 
 /// `VT_MESSAGE`: one message of the guest's VideoToolbox, `length` bytes in the guest RAM of the
-/// `run_count` [`RgfxPageRun`]s that follow, lending the IOSurfaces of the IDs in `surfaces`.
+/// `run_count` [`RgfxPageRun`]s that follow, lending the `surface_count` IOSurfaces whose
+/// [`RgfxVtSurface`]s follow the runs.
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
@@ -2385,11 +2393,63 @@ pub struct RgfxVtMessage {
     pub length: u64,
     /// How many runs follow, at [`RGFX_VT_MESSAGE_RUNS_OFFSET`].
     pub run_count: u32,
-    /// How many of `surfaces` are used, from the first.
+    /// How many surfaces the message lends, at most [`RGFX_VT_MESSAGE_SURFACES`].
     pub surface_count: u32,
-    /// The IDs of the IOSurfaces the message lends, each one its sender's process looks up, the
-    /// used ones first, the rest 0.
+    /// The lends of the surfaces the message lends ([`RgfxVtSurface::lend`]), in their records'
+    /// order, the rest 0.
     pub surfaces: [u64; RGFX_VT_MESSAGE_SURFACES],
+}
+
+/// The planes an [`RgfxVtSurface`] describes: a 4:2:0 picture's two.
+pub const RGFX_VT_SURFACE_PLANES: usize = 2;
+
+/// One IOSurface a `VT_MESSAGE` lends, as the kext reads it of the surface: then its `run_count`
+/// [`RgfxPageRun`]s, which hold its `length` bytes from its first.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxVtSurface {
+    /// The lend's name, which a `rels` names it by: the kext's own, nonzero, never the same as
+    /// another lend's it holds.
+    pub lend: u64,
+    /// The surface's bytes, `IOSurface::getAllocSize`.
+    pub length: u64,
+    /// `IOSurface::getSurfaceID`.
+    pub surface_id: u32,
+    /// `IOSurface::getPixelFormat`: the surface's OSType, its four characters big-endian.
+    pub pixel_format: u32,
+    /// `IOSurface::getWidth`.
+    pub width: u32,
+    /// `IOSurface::getHeight`.
+    pub height: u32,
+    /// `IOSurface::getPlaneCount`: 0 for a surface without planes, whose plane 0 describes it
+    /// whole.
+    pub plane_count: u32,
+    /// How many runs follow.
+    pub run_count: u32,
+    /// Its planes, those past `plane_count` (past 1 for a surface without planes) zero.
+    pub planes: [RgfxVtSurfacePlane; RGFX_VT_SURFACE_PLANES],
+}
+
+/// One plane of an [`RgfxVtSurface`].
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxVtSurfacePlane {
+    /// The plane's first byte in the surface, `IOSurface::getPlaneOffset`; 0 for a surface
+    /// without planes.
+    pub offset: u64,
+    /// Bytes from one of its rows to the next, `IOSurface::getPlaneBytesPerRow` (the surface's
+    /// `getBytesPerRow` for one without planes).
+    pub bytes_per_row: u32,
+    /// Its width in pixels, `IOSurface::getPlaneWidth`.
+    pub width: u32,
+    /// Its height in pixels, `IOSurface::getPlaneHeight`.
+    pub height: u32,
+    /// Zero.
+    pub reserved_14: u32,
 }
 
 /// `VT_STATUS`: a `VT_MESSAGE`'s answer.

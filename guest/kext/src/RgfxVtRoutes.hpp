@@ -10,6 +10,10 @@
  * client once for each UUID it registered, that UUID written in; each deregistration of a UUID the
  * client registered, and each UUID a closing client holds, sends the host a `-uui` of it.
  *
+ * A message lends the host IOSurfaces by record (RgfxVtSurface, rgfxVtPackMessage), each named by
+ * a lend of the kext's, which the host's `rels` names as it lets go of the surface
+ * (rgfxVtReleasedLends).
+ *
  * Header-only and free of kernel types, so tests/vt_routes_test.cpp checks it on the Mac.
  */
 
@@ -26,10 +30,12 @@ constexpr uint32_t kRgfxVtUuidBytes = 16;
 constexpr uint32_t kRgfxVtHeaderBytes = 48;
 // The capacity of a client's host-message queue, an IOSharedDataQueue: Apple's kext's.
 constexpr uint32_t kRgfxVtQueueBytes = 0x8014;
-// The (UUID, client) pairs the service routes at once, and the host messages a client keeps while
-// its queue is full: ours, past anything a process's sessions hold.
+// The (UUID, client) pairs the service routes at once, the host messages a client keeps while
+// its queue is full, and the surfaces the service holds lent: ours, past anything a process's
+// sessions hold (a decoder holds a frame's buffer, lent, until the host emits it).
 constexpr uint32_t kRgfxVtRoutesMax = 256;
 constexpr uint32_t kRgfxVtPendingMax = 256;
+constexpr uint32_t kRgfxVtLendsMax = 64;
 
 // Where a `vtpv` header keeps its message type and its UUID.
 constexpr uint32_t kRgfxVtTypeAt = 8;
@@ -56,7 +62,7 @@ enum RgfxVtHostKind : uint8_t {
 	kRgfxVtForUuid,
 	// A `Bye!`: for every client, once for each UUID it registered.
 	kRgfxVtByeAll,
-	// A `rels` box: the host lets go of surfaces the guest lent it, which the kext lends none of.
+	// A `rels` box: the host lets go of surfaces the kext lent it (rgfxVtReleasedLends).
 	kRgfxVtReleases,
 	// Neither: too short, or not a `vtpv` atom.
 	kRgfxVtUnreadable,
@@ -87,6 +93,64 @@ static inline void rgfxVtForgetMessage(uint8_t out[kRgfxVtHeaderBytes],
 	memset(out, 0, kRgfxVtHeaderBytes);
 	memcpy(out, head, sizeof(head));
 	memcpy(out + kRgfxVtUuidAt, uuid, kRgfxVtUuidBytes);
+}
+
+// The lends a host `rels` box of `length` bytes names, into `out`, at most `max`: how many; 0 for
+// bytes that are no such box. A box is its big-endian size, 8 and 8 a lend, `rels`, then each
+// lend big-endian, and spans the message.
+static inline uint32_t rgfxVtReleasedLends(const uint8_t *message, uint32_t length, uint64_t *out,
+                                           uint32_t max)
+{
+	if (length < 16 || rgfxVtBe32(message + 4) != rgfxVtFourCc("rels") ||
+	    rgfxVtBe32(message) != length || (length - 8) % 8)
+		return 0;
+	const uint32_t count = (length - 8) / 8;
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < count && n < max; i++) {
+		const uint8_t *at = message + 8 + 8 * i;
+		out[n++] = static_cast<uint64_t>(rgfxVtBe32(at)) << 32 | rgfxVtBe32(at + 4);
+	}
+	return n;
+}
+
+// One surface a message lends, as the kext read it of its IOSurface, and its runs.
+struct RgfxVtLent {
+	RgfxVtSurface record;
+	const RgfxPageRun *runs;
+};
+
+// The bytes of a VT_MESSAGE of a message of `length` bytes in `runs` (`count` of them), lending
+// `lentCount` surfaces, into `out` of `max` bytes: its struct, its runs, then each surface's record
+// and runs, `surfaces` naming each surface's lend. Its size, or 0 where it does not fit.
+static inline uint32_t rgfxVtPackMessage(uint64_t length, const RgfxPageRun *runs, uint32_t count,
+                                         const RgfxVtLent *lent, uint32_t lentCount, uint8_t *out,
+                                         uint32_t max)
+{
+	if (lentCount > RGFX_VT_MESSAGE_SURFACES)
+		return 0;
+	uint64_t size = RGFX_VT_MESSAGE_RUNS_OFFSET + uint64_t(count) * sizeof(RgfxPageRun);
+	for (uint32_t i = 0; i < lentCount; i++)
+		size += sizeof(RgfxVtSurface) + uint64_t(lent[i].record.run_count) * sizeof(RgfxPageRun);
+	if (size > max)
+		return 0;
+	RgfxVtMessage head = {};
+	head.length = length;
+	head.run_count = count;
+	head.surface_count = lentCount;
+	for (uint32_t i = 0; i < lentCount; i++)
+		head.surfaces[i] = lent[i].record.lend;
+	uint8_t *at = out;
+	memcpy(at, &head, sizeof(head));
+	at += sizeof(head);
+	memcpy(at, runs, count * sizeof(RgfxPageRun));
+	at += count * sizeof(RgfxPageRun);
+	for (uint32_t i = 0; i < lentCount; i++) {
+		memcpy(at, &lent[i].record, sizeof(RgfxVtSurface));
+		at += sizeof(RgfxVtSurface);
+		memcpy(at, lent[i].runs, lent[i].record.run_count * sizeof(RgfxPageRun));
+		at += lent[i].record.run_count * sizeof(RgfxPageRun);
+	}
+	return static_cast<uint32_t>(size);
 }
 
 // The service's routes: each UUID a client registered, with the client, in the order registered.
