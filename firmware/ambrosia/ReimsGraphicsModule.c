@@ -15,6 +15,16 @@
   is the framebuffer the module returns, which Ambrosia draws its log on and
   hands to the kernel. A command polls the completion ring for its answer.
 
+  Where Ambrosia gives revision 2 of its interface or later and the device
+  offers MULTI_DISPLAY (a device of two displays or more), the module takes
+  the feature, so DISPLAYS lists every display, and returns their count in the
+  framebuffer's Displays: Ambrosia then adds a display-subsystem node for each
+  display its configuration names a node for (Graphics > DisplayNode), and the
+  arm64e kext publishes a framebuffer service for each display that has one
+  (docs/graphics-kext/design.md, "Multiple displays"). The scanout stays
+  display 0's, in display 0's room. Under revision 1, or on a device of one
+  display, the module takes no feature, as before.
+
   The PCIe window is device memory to the module, so it reads and writes the
   rings 8 bytes at a time with plain loads and stores, ordered by barriers,
   where the option ROM uses acquire and release atomics.
@@ -68,6 +78,12 @@ typedef struct {
   uint64_t                   Registers;   // BAR 0's address
   uint64_t                   Region;      // BAR 2's address
   uint64_t                   RegionSize;  // the size the device gives
+  //
+  // Whether the module took MULTI_DISPLAY, and the displays the device drives:
+  // 1 until a DISPLAYS answer listed more with the feature taken.
+  //
+  int                        MultiDisplay;
+  uint32_t                   Displays;
   //
   // The control rings: the guest's producer count of the submission ring, its
   // consumer count of the completion ring, and the last command's number.
@@ -638,16 +654,32 @@ AnswerU32 (
 }
 
 /**
-  Reset the device, adopt the control rings' counters and tell the device the
-  driver is ready.
+  Reset the device, take MULTI_DISPLAY where Ambrosia's revision lets the
+  module say how many displays the device drives and the device offers it,
+  adopt the control rings' counters and tell the device the driver is ready.
+  The take is written between the reset and DRIVER_READY, as the kext writes
+  its features, and read back.
 **/
 static void
 OpenRings (
-  REIMS_GRAPHICS  *Gfx
+  const AMBROSIA_SERVICES  *Services,
+  REIMS_GRAPHICS           *Gfx
   )
 {
+  uint32_t  Multi;
+
   Write32 (Gfx->Registers + RGFX_REG_STATUS, RGFX_STATUS_RESET);
   Barrier ();
+  Gfx->MultiDisplay = 0;
+  Gfx->Displays     = 1;
+  Multi             = (uint32_t)(RGFX_FEATURE_MULTI_DISPLAY >> 32);
+  if ((Services->Revision >= 2) && ((Read32 (Gfx->Registers + RGFX_REG_FEATURES_HI) & Multi) != 0)) {
+    Write32 (Gfx->Registers + RGFX_REG_DRIVER_FEATURES_LO, 0);
+    Write32 (Gfx->Registers + RGFX_REG_DRIVER_FEATURES_HI, Multi);
+    Barrier ();
+    Gfx->MultiDisplay = (Read32 (Gfx->Registers + RGFX_REG_DRIVER_FEATURES_HI) & Multi) != 0;
+  }
+
   Gfx->SubmitProducer = Read64 (Gfx->Region + RGFX_CONTROL_SUBMIT_OFFSET + RING_PRODUCER_OFFSET);
   Gfx->EventConsumer  = Read64 (Gfx->Region + RGFX_CONTROL_COMPLETE_OFFSET + RING_CONSUMER_OFFSET);
   Gfx->Seqno          = 0;
@@ -658,7 +690,8 @@ OpenRings (
 /**
   Ask GET_DISPLAYS for the first connected display and its preferred mode.
   The display stays the first one named, or 0, and the mode 0x0 when the
-  answer names none.
+  answer names none. Where the module took MULTI_DISPLAY, the answer's count
+  is the displays the device drives, at most RGFX_DISPLAYS_MAX.
 **/
 static void
 ChooseMode (
@@ -699,6 +732,10 @@ ChooseMode (
   }
 
   Count  = AnswerU32 (&Answer, 0);
+  if (Gfx->MultiDisplay && (Count > 1)) {
+    Gfx->Displays = (Count < RGFX_DISPLAYS_MAX) ? Count : RGFX_DISPLAYS_MAX;
+  }
+
   Offset = RGFX_DISPLAYS_ENTRIES_OFFSET - sizeof (RgfxMsgHeader);
   for (Index = 0; Index < Count && Offset + sizeof (RgfxDisplayEntry) <= Size; Index++) {
     Display   = Offset;
@@ -730,7 +767,9 @@ ChooseMode (
 
 /**
   The mode's row bytes, and whether its framebuffer fits the scanout's room in
-  the region, from RGFX_ALLOCATIONS_OFFSET.
+  the region, from RGFX_ALLOCATIONS_OFFSET: display 0's room, the scanout
+  span's share of each of the displays the device drives, rounded down to
+  RGFX_SCANOUT_ROOM_ALIGN, as the host splits it.
 **/
 static int
 ModeFits (
@@ -739,11 +778,18 @@ ModeFits (
 {
   uint64_t  Stride;
   uint64_t  Room;
+  uint64_t  Share;
 
   Stride = ((uint64_t)Gfx->Width * 4 + REIMS_GRAPHICS_STRIDE_ALIGN - 1) &
            ~(uint64_t)(REIMS_GRAPHICS_STRIDE_ALIGN - 1);
   Room = Gfx->RegionSize - RGFX_ALLOCATIONS_OFFSET;
   Room = (Room < RGFX_SCANOUT_SPAN) ? Room : RGFX_SCANOUT_SPAN;
+  if (Gfx->Displays > 1) {
+    Share = RGFX_SCANOUT_SPAN / Gfx->Displays;
+    Share = Share - Share % RGFX_SCANOUT_ROOM_ALIGN;
+    Room  = (Room < Share) ? Room : Share;
+  }
+
   if ((Gfx->Width == 0) || (Gfx->Height == 0) || (Stride * Gfx->Height > Room)) {
     return 0;
   }
@@ -818,7 +864,10 @@ ReimsGraphicsModuleEntry (
   int                    DoorbellsWide;
   uint32_t               Version;
 
-  if (Services->Revision < AMBROSIA_GRAPHICS_REVISION) {
+  //
+  // Every revision from 1 on: revision 2 adds only Framebuffer's Displays.
+  //
+  if (Services->Revision < 1) {
     return 2;
   }
 
@@ -904,7 +953,7 @@ ReimsGraphicsModuleEntry (
     return 2;
   }
 
-  OpenRings (&Gfx);
+  OpenRings (Services, &Gfx);
   ChooseMode (&Gfx);
   if (!ModeFits (&Gfx)) {
     Gfx.Width  = REIMS_GRAPHICS_FALLBACK_WIDTH;
@@ -937,12 +986,24 @@ ReimsGraphicsModuleEntry (
   AppendHex (&Line, Gfx.Region + RGFX_ALLOCATIONS_OFFSET, 1);
   Append (&Line, ", registers 0x");
   AppendHex (&Line, Gfx.Registers, 1);
+  if (Gfx.Displays > 1) {
+    Append (&Line, ", ");
+    AppendDecimal (&Line, Gfx.Displays);
+    Append (&Line, " displays");
+  }
+
   Say (Services, &Line);
 
   Framebuffer->Base     = Gfx.Region + RGFX_ALLOCATIONS_OFFSET;
   Framebuffer->Width    = Gfx.Width;
   Framebuffer->Height   = Gfx.Height;
   Framebuffer->Stride   = Gfx.Stride;
-  Framebuffer->Reserved = 0;
+  //
+  // Revision 2's word; under revision 1 it stays 0, as Ambrosia zeroed it.
+  //
+  if (Services->Revision >= 2) {
+    Framebuffer->Displays = Gfx.Displays;
+  }
+
   return 0;
 }

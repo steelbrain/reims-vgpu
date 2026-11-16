@@ -1,5 +1,5 @@
 /** @file
-  Ambrosia's graphics driver interface, revision 1, in C: what Ambrosia, the
+  Ambrosia's graphics driver interface, revision 2, in C: what Ambrosia, the
   boot firmware of arm64 macOS guests on QEMU's vmapple machine, gives a
   graphics driver module, and what the module gives back. Ambrosia's
   docs/graphics-drivers.md and docs/how-to/write-a-graphics-driver.md are the
@@ -22,9 +22,12 @@
 
 //
 // The revision AMBROSIA_SERVICES.Revision carries. A later revision only adds
-// fields at the end of AMBROSIA_SERVICES.
+// fields at the end of AMBROSIA_SERVICES, or gives a field that was zero a
+// meaning in which zero means what it did before: revision 2 gave
+// AMBROSIA_FRAMEBUFFER.Displays its meaning. Ambrosia 0.1.1 and 0.1.2 give
+// revision 1.
 //
-#define AMBROSIA_GRAPHICS_REVISION  1
+#define AMBROSIA_GRAPHICS_REVISION  2
 
 typedef struct AMBROSIA_SERVICES AMBROSIA_SERVICES;
 
@@ -46,7 +49,7 @@ void
 // module's pointers.
 //
 struct AMBROSIA_SERVICES {
-  uint32_t        Revision;      // AMBROSIA_GRAPHICS_REVISION or later
+  uint32_t        Revision;      // 1 or later; AMBROSIA_GRAPHICS_REVISION is this file's
   uint32_t        Reserved;      // 0
   //
   // The PCIe ECAM: a function's configuration space is 4 KiB at
@@ -69,12 +72,18 @@ struct AMBROSIA_SERVICES {
 // zeroes it before the call. Its pixels are 32 bits, 0x00RRGGBB
 // little-endian: blue is the first byte in memory.
 //
+// Displays is how many displays the device drives, the framebuffer's being
+// display 0; Ambrosia counts 0 as 1. It adds a device tree node under /arm-io
+// for each display its configuration names one for (Graphics > DisplayNode),
+// up to this many. A module sets it only where Services->Revision is 2 or
+// later: Ambrosia before revision 2 never reads it.
+//
 typedef struct {
   uint64_t    Base;       // physical, in one of the device's BARs, in the window
   uint32_t    Width;      // pixels
   uint32_t    Height;     // rows
   uint32_t    Stride;     // bytes from one row to the next: a multiple of 4, at least 4 * Width
-  uint32_t    Reserved;   // 0
+  uint32_t    Displays;   // revision 2: the displays the device drives; 0 counts as 1
 } AMBROSIA_FRAMEBUFFER;
 
 /**

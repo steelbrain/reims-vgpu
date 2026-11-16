@@ -735,16 +735,18 @@ guests on QEMU's `vmapple` machine: what the option ROM is to an x86-64 guest's 
 loads the module from its configuration bundle, whose `config.plist` names it (`Graphics` >
 `Driver`), and calls its entry point once, before it reads the guest's disks. It draws its log on
 the framebuffer the module returns, as an early console, and hands the framebuffer to the kernel in
-the boot arguments, whose console draws there in turn. The interface is revision 1 of Ambrosia's
+the boot arguments, whose console draws there in turn. The interface is revision 2 of Ambrosia's
 graphics driver interface, which `AmbrosiaGraphics.h` declares; Ambrosia's own repository
-documents it.
+documents it. Revision 2 adds only the framebuffer's `Displays`, how many displays the device
+drives, which revision 1 kept zero; the module runs on Ambrosia's revision 1 too, as before, and
+sets the word only where Ambrosia gives revision 2 or later.
 
 ```
 Makefile                 clang and lld: the module, build/ReimsGraphics.elf, and a bundle that starts it,
                          build/ReimsGraphics.cpio (make bundle); our configuration's bundle,
                          build/Config.cpio (make config-bundle); the guest probes (make guest-tools)
 ReimsGraphicsModule.c    the entry point: the device's BARs, its control ring and its mode
-AmbrosiaGraphics.h       Ambrosia's graphics driver interface, revision 1
+AmbrosiaGraphics.h       Ambrosia's graphics driver interface, revision 2
 config.plist             the bundle's configuration: the module, and the vtables of IOMobileFramebufferLegacy
                          and its superclasses, IOMobileFramebufferService and IOMobileFramebuffer, whose
                          slots' pointer-authentication discriminators Ambrosia reads from the Boot KC and
@@ -767,6 +769,14 @@ takes the preferred mode of the first connected display, or 1920 × 1080, with r
 returns. It turns on neither bus mastering nor MSI-X, and leaves the scanout set, for the kernel.
 It returns 1 where bus 0 has no device, and 2, saying why in Ambrosia's log, where the device can't
 be driven; Ambrosia then boots with no console but the UART.
+
+**Its displays.** Where Ambrosia gives revision 2 or later and the device offers `MULTI_DISPLAY`
+(a device of two displays or more), the module takes the feature between the reset and
+`DRIVER_READY`, as the kexts write their features, so the `DISPLAYS` answer lists every display.
+It returns their count, at most four, in the framebuffer's `Displays`, and fits its mode to display
+0's scanout room, the span's share of each display rounded down to `RGFX_SCANOUT_ROOM_ALIGN`, as
+the host splits it; its log line ends `, N displays`. The console stays display 0's. Under
+revision 1, or on a device of one display, it takes no feature and sets no count, as before.
 
 **The display's node.** IOMobileFramebuffer.framework finds an arm64 guest's displays by counting
 the children of `IODeviceTree:/arm-io` whose `device_type` is `display-subsystem`, once in a process,
