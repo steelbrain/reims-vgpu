@@ -31,6 +31,11 @@ extern t_csfg_get_cdhash gCsfgGetCdhash;
 // the vnode write hooks admit only that write to the bundle path.
 extern volatile bool gInstalling;
 extern thread_t gInstallThread;
+// Set true once the install has confirmed it is running on arm64's BaseSystem
+// (RgfxGateInstall.cpp). The Sandbox policy_syscall hook answers the rootless
+// trust query for our bundle only while this holds, so a normal full-system
+// boot is untouched (RgfxGateHooks.cpp).
+extern volatile bool gBaseSystemRoot;
 
 // True when the fileglob's cdhash is the embedded bundle executable's.
 bool cdhashIsOurs(void *fg, uint64_t offset);

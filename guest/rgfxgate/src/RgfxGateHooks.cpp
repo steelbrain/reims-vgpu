@@ -46,6 +46,7 @@ static const char kGpuBundlesDir[] = "/Library/GPUBundles";
 // The same directory as a vnode's path names it in arm64's BaseSystem, where /Library is a
 // symbolic link to the temporary Data volume's Library, not a firmlink (rgfx_pass.h).
 static const char kGpuBundlesDataDir[] = "/System/Volumes/Data/Library/GPUBundles";
+volatile bool gBaseSystemRoot = false;
 #endif
 
 bool cdhashIsOurs(void *fg, uint64_t offset) {
@@ -137,6 +138,50 @@ static int wrapSandboxMmap(void *cred, void *fg, void *label, int prot, int flag
 	return admitMmap(orgSandboxMmap, cred, fg, label, prot, flags, file_pos, maxprot);
 }
 
+// The rootless trust query (the Sandbox policy's policy_syscall, mpo_policy_syscall_t: proc,
+// call, arg). On arm64's BaseSystem, IOGPU asks libsystem_sandbox whether our GPU bundle's path
+// is trusted for the storage class KernelExtensionManagement, and libsystem_sandbox asks the
+// Sandbox policy through mac_syscall(2), call 2. macOS 27 answers "not trusted" for the bundle
+// on the BaseSystem's tmpfs Data volume, so WindowServer finds no Metal device and FileVault's
+// unlock screen is never drawn; 14, 15 and 26 answer "trusted" for the same tagged file. While
+// the BaseSystem is the root (gBaseSystemRoot), this hook answers "trusted" for exactly that
+// query on a path under our bundle, and passes every other call, and every call on a full
+// system, to the Sandbox policy's own handler. arg is a user address: eight words, with the
+// answer's address at +0, the operation string's at +0x10, the subject selector at +0x18 (1 for
+// a path), the path's at +0x20 and the storage class's at +0x38 (rgfx_match.h). A failed copy
+// passes the call on rather than answering.
+using MpoPolicySyscall = int(void *p, int call, uint64_t arg);
+static void *orgSandboxPolicySyscall;
+static int wrapSandboxPolicySyscall(void *p, int call, uint64_t arg) {
+	MpoPolicySyscall *original = reinterpret_cast<MpoPolicySyscall *>(orgSandboxPolicySyscall);
+	if (!gBaseSystemRoot || call != RGFX_ROOTLESS_CALL)
+		return original(p, call, arg);
+	uint64_t a[8];
+	if (copyin(arg, a, sizeof(a)) != 0)
+		return original(p, call, arg);
+	const uint64_t outPtr = a[0], opPtr = a[2], selector = a[3], pathPtr = a[4], clsPtr = a[7];
+	if (selector != RGFX_ROOTLESS_SELECTOR_PATH || outPtr == 0 || opPtr == 0 || pathPtr == 0 ||
+	    clsPtr == 0)
+		return original(p, call, arg);
+	char op[64], cls[64], path[1024];
+	size_t done = 0;
+	if (copyinstr(opPtr, op, sizeof(op), &done) != 0 ||
+	    copyinstr(clsPtr, cls, sizeof(cls), &done) != 0 ||
+	    copyinstr(pathPtr, path, sizeof(path), &done) != 0)
+		return original(p, call, arg);
+	if (!rgfx_rootless_trust_ours(call, selector, op, cls, path))
+		return original(p, call, arg);
+	const uint64_t trusted = 1;
+	if (copyout(&trusted, outPtr, sizeof(trusted)) != 0)
+		return original(p, call, arg);
+	static volatile bool logged = false;
+	if (!logged) {
+		logged = true;
+		graft_client_log(kClientID, "answered the BaseSystem's rootless trust query for the bundle");
+	}
+	return 0;
+}
+
 // code-signature trust (wall B, before library validation):
 // mpo_vnode_check_signature_t, (vp, label, cpu_type, cs_blob, cs_flags,
 // signer_type, flags, platform, fatal_failure_desc, fatal_failure_desc_len):
@@ -186,6 +231,9 @@ static_assert(__builtin_ptrauth_type_discriminator(decltype(wrapMmap)) ==
 static_assert(__builtin_ptrauth_type_discriminator(decltype(wrapSandboxMmap)) ==
                   kRgfxAmfiDiscFileCheckMmap,
               "wrapSandboxMmap has file_check_mmap's mpo shape");
+static_assert(__builtin_ptrauth_type_discriminator(decltype(wrapSandboxPolicySyscall)) ==
+                  kRgfxAmfiDiscPolicySyscall,
+              "wrapSandboxPolicySyscall has policy_syscall's mpo shape");
 static_assert(__builtin_ptrauth_type_discriminator(decltype(wrapVSig)) ==
                   kRgfxAmfiDiscVnodeCheckSignature,
               "wrapVSig has vnode_check_signature's mpo shape");
@@ -227,8 +275,20 @@ bool installHooks() {
 		                            "process) cannot map the bundle");
 		return true;
 	}
-	graft_client_log(kClientID,
-	                 "hooks installed (3 AMFI ops, Sandbox's file_check_mmap; writes below MAC)");
+	// The rootless trust query goes in a call of its own, so a Graft that cannot route it (one
+	// before 0.4.0) leaves the routes above in place: only macOS 27's BaseSystem needs it.
+	const graft_route_request trust[] = {
+	    {RGFX_OP_SANDBOX_POLICY_SYSCALL, reinterpret_cast<void *>(wrapSandboxPolicySyscall),
+	     &orgSandboxPolicySyscall},
+	};
+	if (!graft_route_kernel(kClientID, trust, sizeof(trust) / sizeof(trust[0]))) {
+		graft_client_log(kClientID, "hooks installed (3 AMFI ops, Sandbox's file_check_mmap; "
+		                            "writes below MAC); Sandbox's policy_syscall not routed: "
+		                            "macOS 27's BaseSystem will not trust the bundle");
+		return true;
+	}
+	graft_client_log(kClientID, "hooks installed (3 AMFI ops, Sandbox's file_check_mmap and "
+	                            "policy_syscall; writes below MAC)");
 	return true;
 }
 

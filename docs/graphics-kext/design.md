@@ -5886,6 +5886,22 @@ registers only once its bundle is on disk:
     answer of 0 that leaves one set (measured on 26.6.2:
     `mac_vnode_check_signature: MAC hook returned no error, but status is
     claimed to be fatal`, then a reset at every boot).
+  - macOS 27's BaseSystem does not trust the bundle on that tmpfs by itself.
+    IOGPU loads a GPU bundle only from a trusted path, and with SIP on
+    libsystem_sandbox's `gpu_bundle_is_path_trusted` asks the Sandbox policy,
+    through `mac_syscall(2)` call 2, whether writing the path is rootless
+    protected for the storage class `KernelExtensionManagement`. 14, 15 and 26
+    answer yes for the tagged bundle on the tmpfs; 27 answers no (measured on
+    27.2.1, m3-max-35795: the bundle written and tagged, the accelerator
+    registered, WindowServer reading `MetalPluginName`, then aborting every
+    30 s with the unlock screen black). RgfxGate's arm64e build routes the
+    Sandbox policy's `policy_syscall` through Graft (0.4.0 and later) and,
+    while the root is the BaseSystem, answers yes for exactly that query on a
+    path under the bundle; every other call, and every call on a full system,
+    goes to the Sandbox policy's own handler (`wrapSandboxPolicySyscall`,
+    `rgfx_rootless_trust_ours`). With it the 27.2.1 unlock screen draws and
+    the password unlocks (m3-max-35954, on a development build of Graft with
+    the same route).
   - After that pass RgfxGate watches the Data volume (the file system of
     `/Library/Preferences`, every 100 ms) and passes again on each one the boot
     moves to without restarting the kernel: the full system's, once the

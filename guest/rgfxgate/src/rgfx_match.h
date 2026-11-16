@@ -62,6 +62,39 @@ static inline bool rgfx_sibling_path(const char *path, const char *suffix,
 	return true;
 }
 
+// The rootless trusted-class query RgfxGate answers on arm64's BaseSystem, so
+// macOS 27 loads our GPU bundle from the BaseSystem's tmpfs Data volume. It is
+// the Sandbox policy's mac_syscall(2) call 2, operation "file-write-data",
+// storage class "KernelExtensionManagement", with a path subject (the selector
+// field is 1, not 0xf0 for an fd), and the path under our bundle. True only on
+// that exact shape; anything else the hook chains to the Sandbox policy's own
+// handler untouched (RgfxGateHooks.cpp).
+#define RGFX_ROOTLESS_CALL 2
+#define RGFX_ROOTLESS_OP "file-write-data"
+#define RGFX_ROOTLESS_CLASS "KernelExtensionManagement"
+#define RGFX_ROOTLESS_SELECTOR_PATH 1
+#define RGFX_ROOTLESS_BUNDLE "/Library/GPUBundles/reims-graphics.bundle"
+
+// strcmp built from strlen + strncmp (both in libkern and <string.h>), so the
+// kext needs no strcmp symbol.
+static inline bool rgfx_streq(const char *a, const char *b) {
+	if (a == NULL || b == NULL)
+		return false;
+	size_t bl = strlen(b);
+	return strncmp(a, b, bl) == 0 && a[bl] == '\0';
+}
+
+static inline bool rgfx_rootless_trust_ours(int call, unsigned long long selector,
+                                            const char *op, const char *cls, const char *path) {
+	if (call != RGFX_ROOTLESS_CALL || selector != RGFX_ROOTLESS_SELECTOR_PATH)
+		return false;
+	if (op == NULL || cls == NULL || path == NULL)
+		return false;
+	if (!rgfx_streq(op, RGFX_ROOTLESS_OP) || !rgfx_streq(cls, RGFX_ROOTLESS_CLASS))
+		return false;
+	return rgfx_path_under(path, RGFX_ROOTLESS_BUNDLE);
+}
+
 // The signature hook's answer where the real policies refused a code signature
 // (`refusal`, nonzero): 0 for our bundle's executable (`ours`: one of the
 // allowed cdhashes, under the bundles directory), the refusal for anything else.

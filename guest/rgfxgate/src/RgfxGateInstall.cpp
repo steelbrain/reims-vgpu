@@ -631,6 +631,11 @@ static void doInstall() {
 		}
 #endif
 		graft_client_log(kClientID, "BaseSystem: the bundle goes into its temporary Data volume");
+#if defined(__arm64e__)
+		// The Sandbox policy_syscall hook answers the rootless trust query only
+		// here, on the BaseSystem; a normal full-system boot leaves it chained.
+		gBaseSystemRoot = true;
+#endif
 	}
 
 #if defined(__arm64e__)

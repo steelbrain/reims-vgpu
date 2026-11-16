@@ -102,6 +102,36 @@ int main() {
 	assert(rgfx_vsig_answer(1, true, nullptr, nullptr, &dropped) == 0);
 	assert(!dropped);
 
+	// --- rootless trusted-class classifier (the Sandbox policy_syscall hook) --
+	const char *OP = RGFX_ROOTLESS_OP;        // "file-write-data"
+	const char *CLS = RGFX_ROOTLESS_CLASS;    // "KernelExtensionManagement"
+	const char *P = "/Library/GPUBundles/reims-graphics.bundle";
+	// The exact query for our bundle is answered.
+	assert(rgfx_rootless_trust_ours(2, 1, OP, CLS, P));
+	// A deeper path under the bundle is answered too (IOGPU also checks files in it).
+	assert(rgfx_rootless_trust_ours(2, 1, OP, CLS,
+	                                "/Library/GPUBundles/reims-graphics.bundle/Contents/MacOS/reims-graphics"));
+	// Each field wrong in turn is chained (returns false).
+	assert(!rgfx_rootless_trust_ours(3, 1, OP, CLS, P));              // wrong call
+	assert(!rgfx_rootless_trust_ours(2, 0xf0, OP, CLS, P));           // fd selector, not a path
+	assert(!rgfx_rootless_trust_ours(2, 0, OP, CLS, P));              // selector 0
+	assert(!rgfx_rootless_trust_ours(2, 1, "file-read-data", CLS, P)); // wrong operation
+	assert(!rgfx_rootless_trust_ours(2, 1, "file-write-dat", CLS, P)); // operation a prefix
+	assert(!rgfx_rootless_trust_ours(2, 1, OP, "KernelExtensionManagemen", P)); // class a prefix
+	assert(!rgfx_rootless_trust_ours(2, 1, OP, "SystemPolicy", P));   // wrong class
+	assert(!rgfx_rootless_trust_ours(2, 1, OP, CLS, "/Library/GPUBundles/other.bundle")); // other bundle
+	assert(!rgfx_rootless_trust_ours(2, 1, OP, CLS, "/Library/GPUBundles")); // the container, not the bundle
+	assert(!rgfx_rootless_trust_ours(2, 1, OP, CLS,
+	                                "/Library/GPUBundles/reims-graphics.bundleX")); // shared-prefix sibling
+	// Any null string is chained.
+	assert(!rgfx_rootless_trust_ours(2, 1, nullptr, CLS, P));
+	assert(!rgfx_rootless_trust_ours(2, 1, OP, nullptr, P));
+	assert(!rgfx_rootless_trust_ours(2, 1, OP, CLS, nullptr));
+	// rgfx_streq is exact (neither a prefix nor an extension matches).
+	assert(rgfx_streq("abc", "abc"));
+	assert(!rgfx_streq("abc", "ab"));
+	assert(!rgfx_streq("ab", "abc"));
+
 	printf("rgfxgate match_test: all assertions passed\n");
 	return 0;
 }

@@ -33,8 +33,18 @@
 // holds the same mpo type as AMFI's, so the same discriminator.
 #define RGFX_OP_SANDBOX_FILE_CHECK_MMAP "Sandbox:file_check_mmap"
 
+// The Sandbox policy's policy_syscall, its mac_syscall(2) entry (Graft 0.4.0).
+// libsystem_sandbox's rootless trusted-class check asks it whether a path is
+// trusted, and on arm64's macOS 27 BaseSystem it answers "not trusted" for our
+// bundle on the tmpfs Data volume, where 14, 15 and 26 trust it. Unlike the
+// admission hooks it is not called with kernel objects: its argument is a user
+// address the hook reads with copyin (Graft.h). Graft derives its slot and
+// discriminator from mpo_policy_syscall_t and checks them against the live slot.
+#define RGFX_OP_SANDBOX_POLICY_SYSCALL "Sandbox:policy_syscall"
+
 // The ptrauth discriminator (key IA, addrDiv 0) each operation's mpo pointer is
 // signed with, which each replacement's type must have.
 static const uint16_t kRgfxAmfiDiscFileCheckMmap = 0x438d;
 static const uint16_t kRgfxAmfiDiscLibraryValidation = 0x9e37;
 static const uint16_t kRgfxAmfiDiscVnodeCheckSignature = 0xcbd2;
+static const uint16_t kRgfxAmfiDiscPolicySyscall = 0xfee3;
