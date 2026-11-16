@@ -1151,13 +1151,11 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		// The host's pointer drives the guest's own mouse (RgfxPointerDevice.hpp).
 		pointerMotion(payload, size);
 		return;
-#if defined(__x86_64__)
 	case RGFX_EVT_POINTER_OVER:
 		// The host's pointer is over another display: the cursor goes there
 		// (ReimsGraphicsPointer.cpp).
 		pointerOver(payload, size);
 		return;
-#endif
 	default:
 		return;
 	}
@@ -1654,10 +1652,8 @@ bool ReimsGraphics::start(IOService *provider)
 	pipelineAnswersTaken = false;
 	multiDisplayTaken = false;
 	pointerMotionTaken = false;
-#if defined(__x86_64__)
 	displayBoundsTaken = false;
 	boundsTold = {};
-#endif
 	displayCount = 0;
 	refreshes = {};
 	wranglerNotifier = nullptr;
@@ -1832,11 +1828,9 @@ bool ReimsGraphics::start(IOService *provider)
 		    (RGFX_FEATURE_PIPELINE_KEYS | RGFX_FEATURE_PIPELINE_ANSWERS);
 		multiDisplayTaken = (took & RGFX_FEATURE_MULTI_DISPLAY) != 0;
 		pointerMotionTaken = (took & RGFX_FEATURE_POINTER_MOTION) != 0;
-#if defined(__x86_64__)
 		constexpr uint64_t kCarriesPast = RGFX_FEATURE_MULTI_DISPLAY | RGFX_FEATURE_POINTER_OVER |
 		                                  RGFX_FEATURE_DISPLAY_BOUNDS;
 		displayBoundsTaken = (took & kCarriesPast) == kCarriesPast;
-#endif
 	}
 	produced = load64(ring(RGFX_CONTROL_SUBMIT_OFFSET) + kRingProducer);
 	consumed = load64(ring(RGFX_CONTROL_COMPLETE_OFFSET) + kRingConsumer);
@@ -1875,10 +1869,9 @@ bool ReimsGraphics::start(IOService *provider)
 #if defined(__arm64e__)
 	if (!startMobile())
 		goto fail;
-#else
+#endif
 	if (!startPointer())
 		goto fail;
-#endif
 
 	startDisplayPower();
 #if defined(__arm64e__)
@@ -1929,9 +1922,8 @@ fail:
 	quiesce();
 #if defined(__arm64e__)
 	freeMobileChanges();
-#else
-	freePointer();
 #endif
+	freePointer();
 	teardown();
 	return false;
 }
@@ -1955,9 +1947,8 @@ void ReimsGraphics::stop(IOService *provider)
 	stopPointerDevice();
 #if defined(__arm64e__)
 	freeMobileChanges();
-#else
-	freePointer();
 #endif
+	freePointer();
 	super::stop(provider);
 	teardown();
 }

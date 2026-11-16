@@ -1,12 +1,13 @@
-// RgfxDisplayBounds: which displays' rectangles the x86-64 kext tells the host in DISPLAY_BOUNDS
-// (design.md, "Multiple displays", "A drag across displays"). Each framebuffer holds its display's
-// rectangle in WindowServer's global space as WindowServer placed it (IOFBSetBounds, which
-// IOFramebuffer::getBoundingRect reads; RgfxPointerOver.hpp), and the host carries its captured
-// pointer past one display's edge onto the display whose rectangle meets it there. Each move of the
-// cursor, on any display, tells the host every display's rectangle that differs from the one the
-// host was last told, so a rearrangement in System Settings reaches the host with the next move. A
-// rectangle is counted told only once its command is on the ring, and the kext forgets them all at
-// each reset of the device, which forgets them too.
+// RgfxDisplayBounds: which displays' rectangles the kext tells the host in DISPLAY_BOUNDS
+// (design.md, "Multiple displays", "A drag across displays"). On x86-64 each framebuffer holds its
+// display's rectangle in WindowServer's global space as WindowServer placed it (IOFBSetBounds,
+// which IOFramebuffer::getBoundingRect reads; RgfxPointerOver.hpp), and on arm64 the kext holds
+// each one a landing of its own moves of the cursor confirmed (RgfxDisplayPlaces.hpp); the host
+// carries its captured pointer past one display's edge onto the display whose rectangle meets it
+// there. Each move of the cursor, on any display, tells the host every display's rectangle that
+// differs from the one the host was last told, so a rearrangement in System Settings reaches the
+// host with the next move. A rectangle is counted told only once its command is on the ring, and
+// the kext forgets them all at each reset of the device, which forgets them too.
 //
 // Header-only and free of the kernel's headers, so its native test (tests/display_bounds_test.cpp)
 // builds it as the kext does.

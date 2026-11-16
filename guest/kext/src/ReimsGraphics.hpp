@@ -61,6 +61,7 @@ typedef graft_iomfb_word RgfxIOMFBWord;
 #include "RgfxDeferredAnswers.hpp"
 #include "RgfxDisplayBounds.hpp"
 #include "RgfxDisplayModes.hpp"
+#include "RgfxDisplayPlaces.hpp"
 #include "RgfxDisplayTable.hpp"
 #include "RgfxPipeClients.hpp"
 #include "RgfxPointerOver.hpp"
@@ -748,7 +749,6 @@ private:
 	UInt64 bootScreenSeqno;
 	bool bootScreenCleared;
 
-#if defined(__x86_64__)
 	// The host's pointer over another display (POINTER_OVER, ReimsGraphicsPointer.cpp), display
 	// 0's alone: the latest display, point and buttons the work loop took, under interruptLock,
 	// and the thread call that moves the cursor there, off the work loop, as IOHIDSystem's
@@ -760,6 +760,11 @@ private:
 	void freePointer();
 	void pointerOver(const volatile UInt8 *payload, UInt32 size);
 	static void movePointer(thread_call_param_t self, thread_call_param_t);
+	// Each driven display's rectangle in WindowServer's global space that the host may be told,
+	// by display id (`placed`): on x86-64 each framebuffer's bounding rectangle, where WindowServer
+	// placed it; on arm64 each one a landing of the cursor confirmed (RgfxDisplayPlaces.hpp).
+	// Display 0's.
+	void displayPlaces(RgfxGlobalRect *rects, bool *placed);
 
 	// Each display's rectangle in the global space, told the host (DISPLAY_BOUNDS,
 	// RgfxDisplayBounds.hpp), display 0's alone: whether the host took DISPLAY_BOUNDS with
@@ -769,6 +774,24 @@ private:
 	bool displayBoundsTaken;
 	RgfxBoundsTold boundsTold;
 	void tellBounds();
+	void tellPlaces(const RgfxGlobalRect *rects, const bool *placed);
+#if defined(__arm64e__)
+	// The arm64 crossing (ReimsGraphicsPointer.cpp, RgfxDisplayPlaces.hpp), display 0's alone,
+	// under interruptLock: each display's place as the cursor's landings showed it, the crossing
+	// under way, and the count of POINTER_OVERs the work loop took (pointerTold) and of those the
+	// thread call began a crossing for (pointerCrossed). landingCall gives up a post's landing
+	// after kRgfxLandingWaitNs. cursorLanded takes each display's MOVE_CURSOR that shows the
+	// cursor, from the swap, in the class's gate. Crossings that ended with the cursor elsewhere
+	// are counted (crossingsMissed), the first logged.
+	RgfxDisplayPlaces places;
+	RgfxCrossing crossing;
+	UInt64 pointerTold;
+	UInt64 pointerCrossed;
+	UInt32 crossingsMissed;
+	thread_call_t landingCall;
+	static void landingWaited(thread_call_param_t self, thread_call_param_t);
+	void crossingMissed(UInt32 display, UInt32 posts);
+	void cursorLanded(UInt32 display, int32_t x, int32_t y);
 #endif
 
 #if defined(__arm64e__)

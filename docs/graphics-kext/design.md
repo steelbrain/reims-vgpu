@@ -2099,16 +2099,18 @@ only where no negotiation can carry it.
   pointer is over when the event `POINTER_OVER` says so ("The pointer across
   displays", below). The device offers it beside `MULTI_DISPLAY`, only on a
   device of two displays or more, and sends the event only to a guest that
-  took both. The x86-64 kext takes it; the arm64e kext and the firmware
-  drivers do not.
+  took both. Both kexts take it, the arm64e kext with `MULTI_DISPLAY` alone
+  (where the firmware placed a node for display 1 too); the firmware drivers
+  do not.
 - Bit 50, `FEATURES_HI`'s bit 18, is `DISPLAY_BOUNDS`, meaningful only with
   `MULTI_DISPLAY` and `POINTER_OVER`: the guest tells the host each display's
   rectangle in its desktop with the command `DISPLAY_BOUNDS`, by which the
   host carries its captured pointer past one display's edge onto the display
   the guest placed there ("A drag across displays", below). The device offers
   it beside the two, only on a device of two displays or more, and carries
-  the pointer past an edge only for a guest that took all three. The x86-64
-  kext takes it; the arm64e kext and the firmware drivers do not.
+  the pointer past an edge only for a guest that took all three. Both kexts
+  take it, the arm64e kext with `MULTI_DISPLAY` alone; the firmware drivers
+  do not.
 - Bit 51, `FEATURES_HI`'s bit 19, is `POINTER_MOTION`: the guest publishes a
   mouse of its own, which the event `POINTER_MOTION` drives, and the host's
   captured pointer drives it while the guest hides its cursor ("A pointer for
@@ -3080,8 +3082,8 @@ displays or more offers the feature (lane mmhost), the x86-64 kext takes it
 for each display (lane mma64), which our configuration asks of Ambrosia 0.1.3
 or later (A1); reims-ctl sets the count (lane mmctl). The pointer crossing and
 a captured drag across displays from Linux's windows are built on x86-64
-(lanes ptrcross and dragcross: `POINTER_OVER` and `DISPLAY_BOUNDS`, below); on
-arm64 they are still to build (A3).
+(lanes ptrcross and dragcross: `POINTER_OVER` and `DISPLAY_BOUNDS`, below) and
+on arm64 (lane a64ptr, A3).
 
 **A device of one display is what it was.** A device has 1 to
 `RGFX_DISPLAYS_MAX` (4) displays, 1 by default, fixed when it is made. With
@@ -3271,11 +3273,45 @@ pixels of its mode, and the buttons held):
   its cursor to another display during a drag in a window, say
   (`ReimsGraphicsPointer.cpp`, `RgfxPointerOver.hpp`). The kext links IOHIDFamily, where IOHIDSystem
   lives on 11 to 26.
+- **The arm64e kext.** The same move, IOHIDSystem's own post, which arm64's
+  WindowServer follows as x86-64's does (A3, below). But no framebuffer holds
+  its display's rectangle on arm64, so the kext learns where WindowServer
+  placed each display from its own moves (`RgfxDisplayPlaces.hpp`): each
+  post's landing, the first `MOVE_CURSOR` that shows the cursor after it,
+  names the display the cursor went to and its pixel there, which checks the
+  rectangle held for that display.
+  - **The guess.** A display starts where WindowServer places a new one:
+    side by side in their order, tops at 0, each its mode's size at 1x on a
+    1x screen and half of it above 1x, as arm64's WindowServer runs it ("The
+    display's density", above).
+  - **A crossing.** On the event, display 0's framebuffer posts at the
+    display's pixel of the rectangle held for it. Where the cursor lands on
+    another display, it posts again at that pixel of the display placed
+    beside each other display in turn (right of it, left, below, above, top
+    or left edges aligned), until the cursor lands on its display, wherever
+    on it, as the tablet's next position puts it at its pixel. At most four
+    posts, and none again past the host's hold (100 ms) or after a post's
+    landing waited 250 ms: the cursor then stays where it is, counted in the
+    framebuffer's `RgfxCrossingsMissed` and logged the first time.
+  - **Learning a place.** A landing whose pixel lies where the rectangle
+    puts the posted point, 16 pixels or more from the corner on an axis,
+    confirms it. One that disagrees moves the rectangle's corner on each
+    axis where the pixel lies inside the display (a point past every display
+    is held at the nearest one's edge, and says nothing of that axis), and
+    the rectangle is learned, to be confirmed by a later landing that
+    agrees; two landings 64 pixels apart or more size a display the guess
+    sized wrong (a mode the guest's user scaled), to within a few points.
+  - **What the host is told.** Each confirmed rectangle, in
+    `DISPLAY_BOUNDS`, as the x86-64 kext tells its own ("A drag across
+    displays", below), after each move of the cursor where it changed. A
+    display the cursor never went to has none told, so a captured drag
+    stays at the edge it meets; after the guest's displays are rearranged,
+    the first crossing onto a moved display lands as before, posts again,
+    and the next confirms its new place.
 - **Compatibility.** The device sends `POINTER_OVER` only to a guest that
   took its own feature bit, `POINTER_OVER` (49), not to every taker of
-  `MULTI_DISPLAY`: development's kext before this event, the arm64e kext and
-  the firmware drivers take `MULTI_DISPLAY` without it (or will), and are
-  never sent it. Each would drop it in any case: the kext's completion ring
+  `MULTI_DISPLAY`: a kext built before this event, and the firmware drivers,
+  take `MULTI_DISPLAY` without it (or will), and are never sent it. Each would drop it in any case: the kext's completion ring
   service passes over an event type it does not know (`handleEvent`'s
   default), and the option ROM's and Ambrosia's module's waits pass over every
   event but the answer they wait for.
@@ -3298,7 +3334,9 @@ pixels of its mode, and the buttons held):
     ptrcross measured), after each move of the cursor, for each display
     whose rectangle differs from the one last told (`RgfxDisplayBounds.hpp`,
     `ReimsGraphics::tellBounds`), and forgets them at each start. So a
-    rearrangement reaches the host with the cursor's next move. The device
+    rearrangement reaches the host with the cursor's next move. The arm64e
+    kext posts the rectangles its own moves of the cursor confirmed, after
+    each move where one changed ("The arm64e kext", above). The device
     keeps the latest of each display until a reset; it drops a rectangle of
     no area or of a display the guest does not see.
   - **Leaving the image.** The window, captured, with its pointer moving
@@ -3336,9 +3374,10 @@ pixels of its mode, and the buttons held):
     again. Releasing capture (Ctrl+Alt+Super), losing the keyboard or the
     window's end let the host's pointer go where it was held. Buttons
     pressed and released while away go to the display the pointer is on.
-  - **Compatibility.** A guest that did not take `DISPLAY_BOUNDS` (the
-    arm64e kext, a kext built before it), or told no rectangles, keeps the
-    pointer held at the image's edge, as before; so does a compositor that
+  - **Compatibility.** A guest that did not take `DISPLAY_BOUNDS` (a kext
+    built before it), or told no rectangles (the arm64e kext before the
+    cursor went to the display past the edge), keeps the pointer held at the
+    image's edge, as before; so does a compositor that
     refuses the lock. The macOS window keeps it so too: the logic is the
     window crate's, free of the OS (`beyond.rs`), and the SDL window on Linux
     and Windows drives it; on macOS a captured drag stays on its display
@@ -3656,10 +3695,27 @@ it.
     to 2880, 540), x 16384, 8192 (y 8192) and 32700 put it at 2880, 2400
     (y 270) and 3836, all on display 1.
 
-  So the arm64 pointer needs the same crossing as x86-64's: the arm64e kext
-  taking `POINTER_OVER` and moving the cursor onto the display the event
-  names. Until it does, it does not take the bit, so the device sends it no
-  `POINTER_OVER`, and the cursor stays on the display it is on.
+  So the arm64 pointer needs the same crossing as x86-64's, built by lane
+  a64ptr ("The arm64e kext", in "The pointer across displays"). Measured on
+  arm64 27.0.1 under HVF with two displays, display 1 placed in turn right
+  of, left of and below display 0 (`CGConfigureDisplayOrigin`), with a test
+  kext of ours posting IOHIDSystem's moves from a kernel thread call
+  (potluck job m3-max-35345), and on 14.6.1 under TCG with one (job
+  m3-max-35287):
+  - IOHIDSystem's own post, `extPostEvent` with `kIOHIDSetCursorPosition`,
+    answers success in 15 to 23 us. WindowServer puts its cursor at the
+    point posted: 2880,540, -960,540 and 960,1620 put it on display 1 at
+    its 960,540 in the three arrangements, and display 1's swap showed it
+    there (its `MOVE_CURSOR`). A drag (`NX_LMOUSEDRAGGED`) moves it as a
+    move does, and the tablet's next position scales over the display the
+    cursor went to. A point past every display is held at the nearest
+    display's edge (2880,540 with one 1920-wide display).
+  - WindowServer tells the kernel nothing of where it placed each display:
+    it registers none with IOHIDSystem (its screen count stayed 0, and its
+    work bounds 0,0 to 1920,1080 in every arrangement), an
+    IOMobileFramebuffer has no bounds, and IOHIDSystem's `DisplayState`
+    property is compiled out of IOHIDFamily (read from its source). So the
+    kext learns each display's place from its own posts' landings.
 
 **The lanes**, in the order they land:
 
@@ -3670,6 +3726,7 @@ it.
 | mma64 | the arm64e framebuffers per display (`ReimsGraphicsMobile.cpp`), `firmware/ambrosia`'s nodes, A1 to A3 | mmhost; mmx86's shared code; Ambrosia's nodes (A1) | `make -C guest test`; `make -C guest prebuilt` and `prebuilt-arm64e` committed (each set's record lists every kext source); `make -C firmware/ambrosia bundle` and `config-bundle`; boots of arm64 14, 15 and 26 under TCG and 27 under HVF on the M3 at `displays` 2 and 1 |
 | pointer crossing | the event that says the pointer is over display i at x, y (`wire.rs`, the host's side in the window and the library, with the ROM's and both sets' records), and the x86-64 kext's move of the cursor onto display i (X1) | mmx86 | as mmhost's and mmx86's, for what it touches; boots at `displays` 2 where a pointer over each window moves the guest's cursor on that window's display |
 | mmctl | `crates/reims-ctl`: the setting, the QEMU command, the terminal UI and the command line | mmhost's `displays` landed, and the pointer reaching display 1 (X1) | `cargo test`, `cargo fmt --check` and `cargo clippy --all-targets` in it; an install and a boot at `displays` 2 on a Linux host |
+| a64ptr | the arm64e kext's crossing and its displays' places (A3: `ReimsGraphicsPointer.cpp` on arm64, `RgfxDisplayPlaces.hpp`), and both sets | mma64; the pointer crossing and dragcross | `make -C guest test`; `make -C guest prebuilt` and `prebuilt-arm64e` committed; boots of arm64 27 under HVF on the M3 and 14, 15 and 26 under TCG at `displays` 2, each with crossings and a captured drag onto display 1 and back with display 1 right and left of display 0, and at `displays` 1 with the feature words of a boot before it; a boot of x86-64 26.7 at `displays` 2 |
 
 mmhost, mmctl and the reading for X2 to X5, A1 and A2 start at once; mmx86
 builds and unit-tests its framebuffers at once and boots them on mmhost's

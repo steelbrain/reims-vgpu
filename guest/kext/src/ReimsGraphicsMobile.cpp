@@ -1073,7 +1073,9 @@ IOReturn ReimsGraphics::setMobileCursorImage(OSObject *surface, const RgfxMobile
 
 // MOVE_CURSOR where the cursor's place or visibility changes: the hot spot at the swap's position
 // plus the image's hot spot in its surface. Never waits: a post the ring has no room for is
-// left, and the next swap's layer 1 posts it again.
+// left, and the next swap's layer 1 posts it again. Once posted, the cursor shown is the landing
+// of display 0's post of a move, if one is out, and each display's place that changed is told
+// the host (ReimsGraphicsPointer.cpp).
 bool ReimsGraphics::postMobileCursorMove(int32_t x, int32_t y, bool visible)
 {
 	int32_t mx = 0, my = 0;
@@ -1087,6 +1089,10 @@ bool ReimsGraphics::postMobileCursorMove(int32_t x, int32_t y, bool visible)
 	if (!tryPost(RGFX_CMD_MOVE_CURSOR, &m, sizeof(m), nullptr))
 		return false;
 	mobileCursor.posted(mx, my, visible);
+	ReimsGraphics *owner = isHead() ? device : this;
+	if (visible)
+		owner->cursorLanded(displayId, mx, my);
+	owner->tellBounds();
 	return true;
 }
 

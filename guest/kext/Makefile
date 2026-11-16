@@ -82,12 +82,12 @@ HEADERS = $(wildcard src/*.hpp src/shim/*/*.h src/shim/*/*/*.h)
 
 # The Stage-2 framebuffer (ReimsGraphics), the Stage-3 Metal accelerator
 # (RgfxAccelerator) and its region-map + doorbell user client, the guest's own mouse for
-# POINTER_MOTION (RgfxPointerDevice), and on x86-64 the device control (RgfxDeviceControl)
-# and the pointer's moves (ReimsGraphicsPointer), all one kext:
-# the objects both architectures build, with each architecture's own (OBJECTS_x86_64,
+# POINTER_MOTION (RgfxPointerDevice), the pointer's moves (ReimsGraphicsPointer), on x86-64 the
+# device control (RgfxDeviceControl) and on arm64e the front end (ReimsGraphicsMobile), all one
+# kext: the objects both architectures build, with each architecture's own (OBJECTS_x86_64,
 # OBJECTS_arm64e) third in the link.
 OBJECTS_x86_64 = $(BUILD)/obj/RgfxDeviceControl.o $(BUILD)/obj/ReimsGraphicsPointer.o
-OBJECTS_arm64e = $(BUILD)/obj/ReimsGraphicsMobile.o
+OBJECTS_arm64e = $(BUILD)/obj/ReimsGraphicsMobile.o $(BUILD)/obj/ReimsGraphicsPointer.o
 OBJECTS = $(BUILD)/obj/ReimsGraphics.o \
 	$(BUILD)/obj/RgfxAccelerator.o \
 	$(OBJECTS_$(ARCH_NAME)) \
@@ -162,7 +162,7 @@ TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surf
 	$(BUILD)/tests/completion_arm_test $(BUILD)/tests/kept_service_test \
 	$(BUILD)/tests/queue_publish_test $(BUILD)/tests/doorbell_pages_test $(BUILD)/tests/top_down_test \
 	$(BUILD)/tests/display_table_test $(BUILD)/tests/agdc_displays_test \
-	$(BUILD)/tests/pointer_over_test $(BUILD)/tests/display_bounds_test \
+	$(BUILD)/tests/pointer_over_test $(BUILD)/tests/display_bounds_test $(BUILD)/tests/display_places_test \
 	$(BUILD)/tests/pointer_motion_test $(BUILD)/tests/register_hold_test
 
 $(BUILD)/tests/%: tests/%.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile

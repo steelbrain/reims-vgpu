@@ -4,10 +4,11 @@
 // the display its cursor is on, so the kext moves the cursor onto that display, at that point,
 // before the tablet's next position comes (ReimsGraphicsPointer.cpp).
 //
-// The point is in WindowServer's global space, in which it placed each display: each framebuffer
-// holds its display's rectangle there as WindowServer gave it (IOFBSetBounds, which
+// The point is in WindowServer's global space, in which it placed each display: on x86-64 each
+// framebuffer holds its display's rectangle there as WindowServer gave it (IOFBSetBounds, which
 // IOFramebuffer::getBoundingRect reads), the space the cursor's moves arrive in
-// (IOFramebuffer::extSetCursorPosition). The display's pixel lies in that rectangle as the pixel
+// (IOFramebuffer::extSetCursorPosition); on arm64 the kext learns each one from its own moves
+// (RgfxDisplayPlaces.hpp). The display's pixel lies in that rectangle as the pixel
 // lies in the display's mode, scaled from the mode's pixels to the rectangle's size. Measured on
 // x86-64 macOS 11.7.11, 15.8.2 and 26.7.2 with two 1920 x 1080 displays side by side: each
 // framebuffer's rectangle is the display's CGDisplayBounds, and IOHIDSystem's mouse-moved posted

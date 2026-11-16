@@ -153,14 +153,16 @@
 //    (rgfxDriverFeatures' `mobileNodes`): a process waits for a service of each display node it
 //    counts, and counts nodes before the kext can add any (design.md, "Multiple displays"). With
 //    display 0's node alone, the arm64e kext drives display 0 alone, as before the bit;
-//  - POINTER_OVER (bit 49), the x86-64 kext alone, meaningful only with MULTI_DISPLAY: on the
-//    device's POINTER_OVER the framebuffer moves the cursor onto the display the host's pointer
-//    is over (ReimsGraphicsPointer.cpp, RgfxPointerOver.hpp), which needs nothing of the bundle;
-//  - DISPLAY_BOUNDS (bit 50), the x86-64 kext alone, meaningful only with POINTER_OVER: each
-//    framebuffer's move of the cursor tells the host every display's rectangle in WindowServer's
-//    global space that changed (RgfxDisplayBounds.hpp), by which the host carries its captured
-//    pointer past one display's edge onto the display the guest placed there, which needs
-//    nothing of the bundle;
+//  - POINTER_OVER (bit 49), meaningful only with MULTI_DISPLAY, and taken by the arm64e kext only
+//    with it: on the device's POINTER_OVER the framebuffer moves the cursor onto the display the
+//    host's pointer is over (ReimsGraphicsPointer.cpp, RgfxPointerOver.hpp; on arm64 by the
+//    places its own moves showed, RgfxDisplayPlaces.hpp), which needs nothing of the bundle;
+//  - DISPLAY_BOUNDS (bit 50), meaningful only with POINTER_OVER, and taken by the arm64e kext only
+//    with MULTI_DISPLAY: each framebuffer's move of the cursor tells the host every display's
+//    rectangle in WindowServer's global space that changed (RgfxDisplayBounds.hpp; on arm64 each
+//    one a landing of its own moves confirmed), by which the host carries its captured pointer
+//    past one display's edge onto the display the guest placed there, which needs nothing of the
+//    bundle;
 //  - POINTER_MOTION (bit 51), both kexts: the framebuffer publishes the guest's own mouse
 //    (RgfxPointerDevice.hpp) and hands it each POINTER_MOTION's reports
 //    (RgfxPointerMotion.hpp), which needs nothing of the bundle.
@@ -205,18 +207,19 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_ICB_SLOTS_IN_PAGES | RGFX_FEATURE_DOORBELL_ASKS | RGFX_FEATURE_GUEST_TIMES |
     RGFX_FEATURE_READ_ONLY_PAGES | RGFX_FEATURE_DOORBELL_PAGES | RGFX_FEATURE_PIPELINE_ANSWERS |
     RGFX_FEATURE_POINTER_MOTION | RGFX_FEATURE_MULTI_DISPLAY |
-    (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K
-                      : RGFX_FEATURE_DISPLAY_POWER | RGFX_FEATURE_POINTER_OVER |
-                            RGFX_FEATURE_DISPLAY_BOUNDS);
+    RGFX_FEATURE_POINTER_OVER | RGFX_FEATURE_DISPLAY_BOUNDS |
+    (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K : RGFX_FEATURE_DISPLAY_POWER);
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer and, on arm64, the
 // displays whose node the firmware placed under /arm-io, counted from display 0 (`mobileNodes`):
-// MULTI_DISPLAY only where display 1 has one too. The x86-64 kext reads no nodes.
+// MULTI_DISPLAY, and POINTER_OVER and DISPLAY_BOUNDS, which mean nothing without it, only where
+// display 1 has one too. The x86-64 kext reads no nodes.
 inline uint64_t rgfxDriverFeatures(uint64_t offered, uint32_t mobileNodes = RGFX_DISPLAYS_MAX)
 {
 	uint64_t carried = kRgfxCarriedFeatures;
 	if (RGFX_GUEST_ARM64 && mobileNodes < 2)
-		carried &= ~static_cast<uint64_t>(RGFX_FEATURE_MULTI_DISPLAY);
+		carried &= ~static_cast<uint64_t>(RGFX_FEATURE_MULTI_DISPLAY | RGFX_FEATURE_POINTER_OVER |
+		                                  RGFX_FEATURE_DISPLAY_BOUNDS);
 	return offered & carried;
 }
 

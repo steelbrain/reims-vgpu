@@ -82,14 +82,14 @@ constexpr uint64_t kDisplayPowerCarried = RGFX_GUEST_ARM64 ? 0 : kDisplayPower;
 // lists; the arm64e kext only where the firmware placed a node for display 1 too.
 constexpr uint64_t kMultiDisplay = RGFX_FEATURE_MULTI_DISPLAY;
 constexpr uint64_t kMultiDisplayCarried = kMultiDisplay;
-// POINTER_OVER, which the x86-64 kext carries, moving the cursor onto the display the host's
-// pointer is over, and the arm64e kext does not.
+// POINTER_OVER, which both kexts carry, moving the cursor onto the display the host's pointer is
+// over; the arm64e kext only with MULTI_DISPLAY.
 constexpr uint64_t kPointerOver = RGFX_FEATURE_POINTER_OVER;
-constexpr uint64_t kPointerOverCarried = RGFX_GUEST_ARM64 ? 0 : kPointerOver;
-// DISPLAY_BOUNDS, which the x86-64 kext carries, telling the host where each display lies in
-// WindowServer's global space, and the arm64e kext does not.
+constexpr uint64_t kPointerOverCarried = kPointerOver;
+// DISPLAY_BOUNDS, which both kexts carry, telling the host where each display lies in
+// WindowServer's global space; the arm64e kext only with MULTI_DISPLAY.
 constexpr uint64_t kDisplayBounds = RGFX_FEATURE_DISPLAY_BOUNDS;
-constexpr uint64_t kDisplayBoundsCarried = RGFX_GUEST_ARM64 ? 0 : kDisplayBounds;
+constexpr uint64_t kDisplayBoundsCarried = kDisplayBounds;
 // POINTER_MOTION, which both kexts carry, publishing the guest's own mouse for it.
 constexpr uint64_t kPointerMotion = RGFX_FEATURE_POINTER_MOTION;
 // Every bit the wire names from bit 3 that the kext does not carry out yet.
@@ -189,8 +189,8 @@ int main()
 	// SURFACE_DEFERRED_ASK, SURFACE_DEFERRED_CARRY, SCHEDULED_ASK, DISPLAY_SCALE,
 	// TEXTURE_DID_MODIFY_DATA, RATE_MAPS, FUNCTION_POINTERS, DYNAMIC_LIBRARIES, PIPELINE_KEYS,
 	// ICB_SLOTS_IN_PAGES, DOORBELL_ASKS, GUEST_TIMES, READ_ONLY_PAGES, DOORBELL_PAGES,
-	// PIPELINE_ANSWERS, POINTER_MOTION, MULTI_DISPLAY and, the x86-64 kext, DISPLAY_POWER,
-	// POINTER_OVER and DISPLAY_BOUNDS, and writes each only where offered.
+	// PIPELINE_ANSWERS, POINTER_MOTION, MULTI_DISPLAY, POINTER_OVER, DISPLAY_BOUNDS and, the x86-64
+	// kext, DISPLAY_POWER, and writes each only where offered.
 	check(kRgfxCarriedFeatures == kCarried,
 	      "the kext takes PAGES_BUFFERS, SURFACE_ORDER, ICBs, UNSHARED_QUEUES, MANAGED_AT_OFFSET, "
 	      "HEAP_OVER_PAGES, SUBMIT_ROOM, ICB slots, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, "
@@ -199,8 +199,8 @@ int main()
 	      "SURFACE_CACHE_REFUSED, SURFACE_DEFERRED_ASK, SURFACE_DEFERRED_CARRY, SCHEDULED_ASK, "
 	      "DISPLAY_SCALE, TEXTURE_DID_MODIFY_DATA, RATE_MAPS, FUNCTION_POINTERS, DYNAMIC_LIBRARIES, "
 	      "PIPELINE_KEYS, ICB_SLOTS_IN_PAGES, DOORBELL_ASKS, GUEST_TIMES, READ_ONLY_PAGES, "
-	      "DOORBELL_PAGES, PIPELINE_ANSWERS, POINTER_MOTION, MULTI_DISPLAY and, on x86-64, "
-	      "DISPLAY_POWER, POINTER_OVER and DISPLAY_BOUNDS from bit 3");
+	      "DOORBELL_PAGES, PIPELINE_ANSWERS, POINTER_MOTION, MULTI_DISPLAY, POINTER_OVER, "
+	      "DISPLAY_BOUNDS and, on x86-64, DISPLAY_POWER from bit 3");
 	check(RGFX_FEATURE_PAGES_BUFFERS == (1u << 7), "PAGES_BUFFERS is bit 7");
 	check(RGFX_FEATURE_SURFACE_ORDER == (1u << 11), "SURFACE_ORDER is bit 11");
 	check(RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS == (1u << 12), "INDIRECT_COMMAND_BUFFERS is bit 12");
@@ -417,16 +417,34 @@ int main()
 	check(RGFX_FEATURE_POINTER_OVER == (1ull << 49), "POINTER_OVER is bit 49");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kPointerOver) ==
 	          kPointerOverCarried,
-	      "POINTER_OVER offered, written by the x86-64 kext alone");
+	      "POINTER_OVER offered, written");
 	check(RGFX_FEATURE_DISPLAY_BOUNDS == (1ull << 50), "DISPLAY_BOUNDS is bit 50");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kDisplayBounds) ==
 	          kDisplayBoundsCarried,
-	      "DISPLAY_BOUNDS offered, written by the x86-64 kext alone");
+	      "DISPLAY_BOUNDS offered, written");
 	check(RGFX_FEATURE_POINTER_MOTION == (1ull << 51), "POINTER_MOTION is bit 51");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kPointerMotion) == kPointerMotion,
 	      "POINTER_MOTION offered, written by both kexts");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried) == 0,
 	      "POINTER_MOTION not offered, not written: the guest publishes no mouse");
+	// On arm64, POINTER_OVER and DISPLAY_BOUNDS go with MULTI_DISPLAY: with display 0's node
+	// alone, or none, none of the three is written, so the word is the one before the arm64e kext
+	// carried them. The x86-64 kext writes them wherever offered.
+	{
+		const uint64_t pointer = kMultiDisplay | kPointerOver | kDisplayBounds;
+		const uint64_t offered = kRgfxOfferedFeatures | kNotCarried | pointer | kScheduledAsk;
+		const uint64_t lone = RGFX_GUEST_ARM64 ? kScheduledAsk : kScheduledAsk | pointer;
+		check(rgfxDriverFeatures(offered, 0) == lone,
+		      "no display node: the pointer's bits on x86-64 alone");
+		check(rgfxDriverFeatures(offered, 1) == lone,
+		      "display 0's node alone: the pointer's bits on x86-64 alone");
+		for (uint32_t nodes = 2; nodes <= RGFX_DISPLAYS_MAX; nodes++)
+			check(rgfxDriverFeatures(offered, nodes) == (kScheduledAsk | pointer),
+			      "nodes for displays 0 and 1: MULTI_DISPLAY, POINTER_OVER and "
+			      "DISPLAY_BOUNDS written");
+		check(rgfxDriverFeatures(kRgfxOfferedFeatures | kScheduledAsk, 2) == kScheduledAsk,
+		      "none of them offered (a device of one display): the word as before");
+	}
 	// PAGES_16K: the arm64e kext writes it first where offered, and then with the rest; the
 	// x86-64 kext never writes it, and writes nothing first.
 	check(rgfxDriverFeaturesFirst(~0ull) == k16KCarried, "PAGES_16K first where carried");

@@ -509,8 +509,9 @@ runtime's own device. The switches above apply, and `resolution=` too.
   (Ctrl+Alt+Super), losing the keyboard or closing lets the host's pointer
   go where it was held. Where the compositor
   refuses the lock, and with a guest that does not place its displays
-  (`DISPLAY_BOUNDS`: the arm64e kext, a kext built before it), the pointer
-  stays held at the edge, as on macOS.
+  (`DISPLAY_BOUNDS`: a kext built before it, or an arm64 guest before its
+  cursor first went to the display past the edge), the pointer stays held
+  at the edge, as on macOS.
   `test: reims-vgpu::graphics::tests::displays::a_captured_pointer_past_the_shared_edge_goes_on_through_the_other_display_s_window`,
   `test: reims-vgpu-graphics::device::tests::displays::a_pointer_past_a_shared_edge_goes_onto_the_display_there`,
   `test: reims-vgpu-graphics::device::tests::displays::the_guest_s_arrangement_decides_which_edge_meets_which_display`,
