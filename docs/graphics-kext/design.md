@@ -3349,6 +3349,16 @@ pixels of its mode, and the buttons held):
     held, and taken for that post's outcome, the crossing's next post and
     the first post's late landing placed display 0 right of display 1
     (potluck job m3-max-36173).
+    A landing 100 ms or more after the `POINTER_OVER`, the host's hold
+    (`CROSSING_HOLD_NS`), comes once the host passes its pointer's
+    positions on to the tablet again, so it may show the tablet's move: it
+    confirms the placement it was posted by where it agrees with it on both
+    axes, and otherwise teaches nothing, neither a corner nor a size. On
+    15.6.1 under TCG a captured drag back onto display 0 posted at its
+    right edge showed the cursor 130 ms later, 26 points short in the
+    drag's direction; taken for the post's landing, it sized display 0 1005
+    by 628 points, which a later landing confirmed and the host was told
+    (potluck job m3-max-36292).
   - **Learning a place.** A landing whose pixel lies where the post's
     placement puts the posted point, 16 pixels or more from the corner on an
     axis, confirms that placement as the display's rectangle. One that

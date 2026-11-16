@@ -778,9 +778,10 @@ private:
 #if defined(__arm64e__)
 	// The arm64 crossing (ReimsGraphicsPointer.cpp, RgfxDisplayPlaces.hpp), display 0's alone,
 	// under interruptLock: each display's place as the cursor's landings showed it, the crossing
-	// under way, and the count of POINTER_OVERs the work loop took (pointerTold) and of those the
-	// thread call began a crossing for (pointerCrossed). landingCall gives up a post's landing
-	// after kRgfxLandingWaitNs. cursorLanded takes each display's MOVE_CURSOR that shows the
+	// under way, and the count of POINTER_OVERs the work loop took (pointerTold), when it took the
+	// last (pointerToldAt, after the host's hold began), and of those the thread call began a
+	// crossing for (pointerCrossed), which is dated from pointerToldAt. landingCall gives up a
+	// post's landing after kRgfxLandingWaitNs. cursorLanded takes each display's MOVE_CURSOR that shows the
 	// cursor, from the swap, in the class's gate. Crossings that ended with the cursor elsewhere
 	// are counted (crossingsMissed), the first logged. cursorMoves counts the MOVE_CURSORs every
 	// display posted (each display's last numbered in its mobileCursor.seq), so a post's deadline
@@ -788,6 +789,7 @@ private:
 	RgfxDisplayPlaces places;
 	RgfxCrossing crossing;
 	UInt64 pointerTold;
+	UInt64 pointerToldAt;
 	UInt64 pointerCrossed;
 	UInt64 cursorMoves;
 	UInt32 crossingsMissed;

@@ -122,6 +122,7 @@ bool ReimsGraphics::startPointer()
 	places = {};
 	crossing = {};
 	pointerTold = 0;
+	pointerToldAt = 0;
 	pointerCrossed = 0;
 	crossingsMissed = 0;
 	landingCall = thread_call_allocate(landingWaited, this);
@@ -169,6 +170,7 @@ void ReimsGraphics::pointerOver(const volatile UInt8 *payload, UInt32 size)
 	pointerAt = at;
 #if defined(__arm64e__)
 	pointerTold++;
+	pointerToldAt = nowNs();
 #endif
 	IOSimpleLockUnlock(interruptLock);
 	thread_call_enter(pointerCall);
@@ -264,7 +266,7 @@ void ReimsGraphics::movePointer(thread_call_param_t self, thread_call_param_t)
 	const RgfxPointerAt at = me->pointerAt;
 	if (me->pointerCrossed != me->pointerTold) {
 		me->pointerCrossed = me->pointerTold;
-		rgfxCrossingStart(&me->crossing, at.display, at.x, at.y, now);
+		rgfxCrossingStart(&me->crossing, at.display, at.x, at.y, me->pointerToldAt);
 	}
 	rgfxPlacesFit(&me->places, modes);
 	const bool going = me->crossing.active;

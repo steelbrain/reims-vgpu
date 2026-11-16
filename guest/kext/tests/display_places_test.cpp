@@ -3,8 +3,8 @@
 // where it lies past every display, and the cursor shown on the display holding it at its pixel,
 // where it moved. Displays side by side, left, below and above, one at 2x, one in a scaled mode,
 // a rearrangement mid-session, a display never entered, the tablet's move while a post is out,
-// the cursor's image over an edge, a post held where the cursor was, and the crossing's limits:
-// its posts, a slow guest and a landing that never comes.
+// the cursor's image over an edge, a post held where the cursor was, a landing past the host's
+// hold, and the crossing's limits: its posts, a slow guest and a landing that never comes.
 #include "RgfxDisplayPlaces.hpp"
 
 #include <cstdio>
@@ -616,7 +616,8 @@ int main()
 		}
 		// A landing held at the display's edge, on the axis of the placement it was posted by:
 		// the point lay past the display there, so the rectangle keeps its own on that axis.
-		check(!rgfxPlacesLanded(&places, 0, {4240, 300, 1919, 300}, {3840, 0, 5760, 1080}) &&
+		check(!rgfxPlacesLanded(&places, 0, {4240, 300, 1919, 300}, {3840, 0, 5760, 1080},
+		                        false) &&
 		          same(places.at[0].rect, 0, 0, 1920, 1080) &&
 		          places.at[0].state == RgfxPlaceState::confirmed,
 		      "held at an edge: the axis keeps the display's own place");
@@ -665,6 +666,58 @@ int main()
 			else
 				check(same(p.at[0].rect, 3840, 0, 5760, 1080),
 				      "sure: taken for the second post's landing, display 0 placed right of 1");
+			now += 1000000000;
+		}
+	}
+
+	// A landing kRgfxCrossingHoldNs or more after the POINTER_OVER, once the host passes its
+	// pointer's positions on to the tablet again, may show the tablet's move (measured on 15.6.1
+	// under TCG, at two displays side by side in a 2x mode, 2016 x 1260 pixels showing 1008 x 630
+	// points: a captured drag back onto display 0 posted at its right edge, 1007,64, and the cursor
+	// showed 130 ms later at pixel 1962,126, 26 points short in the drag's direction). Both
+	// displays confirmed, display 0's last landing 969,315 at pixel 1938,630.
+	{
+		Desktop desk = {};
+		desk.count = 2;
+		desk.rects[0] = {0, 0, 1008, 630};
+		desk.rects[1] = {1008, 0, 2016, 630};
+		desk.modes[0] = {2016, 1260, 240};
+		desk.modes[1] = {2016, 1260, 240};
+		RgfxDisplayPlaces places = {};
+		RgfxCrossing c = {};
+		cross(&places, &c, desk, 1, 8, 128, &now);
+		cross(&places, &c, desk, 0, 1938, 630, &now);
+		check(confirmedCount(places) == 2 && places.at[0].last.lx == 1938,
+		      "both confirmed, display 0's last landing at 1938,630");
+		bool confirmed = true;
+		int32_t gx = 0, gy = 0;
+		for (int early = 0; early < 2; early++) {
+			RgfxDisplayPlaces p = places;
+			rgfxCrossingStart(&c, 0, 2014, 128, now);
+			check(rgfxCrossingNext(p, &c, now + 2000000, &gx, &gy) && gx == 1007 && gy == 64,
+			      "a post at display 0's right edge");
+			const uint64_t at = early ? now + kRgfxCrossingHoldNs - 1 : now + kRgfxCrossingHoldNs;
+			check(rgfxCrossingLanded(&p, &c, 0, 1962, 126, at, &confirmed) ==
+			              RgfxCrossingStep::arrived &&
+			          !confirmed,
+			      "shown 26 points short: arrived, nothing confirmed");
+			if (!early) {
+				check(same(p.at[0].rect, 0, 0, 1008, 630) &&
+				          p.at[0].state == RgfxPlaceState::confirmed && p.at[0].last.lx == 1938,
+				      "past the hold: display 0 keeps its place, its size and its last landing");
+				check(rgfxPlacesLanded(&p, 0, {967, 279, 1934, 558}, p.at[0].rect, false) &&
+				          same(p.at[0].rect, 0, 0, 1008, 630),
+				      "and the next landing finds it so");
+				// One that agrees with the placement it was posted by still confirms it.
+				p.at[0].state = RgfxPlaceState::learned;
+				check(rgfxPlacesLanded(&p, 0, {967, 279, 1934, 558}, p.at[0].rect, true) &&
+				          p.at[0].state == RgfxPlaceState::confirmed,
+				      "past the hold, a landing that agrees confirms");
+			} else {
+				check(p.at[0].state == RgfxPlaceState::learned &&
+				          same(p.at[0].rect, 29, 2, 1034, 630),
+				      "within the hold: taken for the post's, it sizes and moves display 0");
+			}
 			now += 1000000000;
 		}
 	}
