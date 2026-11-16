@@ -853,9 +853,10 @@ private:
 	void releaseRegistrations();
 	// What the release hands its thread call (registerCall, display 0's, made in start): the
 	// displays released and their options, and the window from the release until their services
-	// have matched (RgfxRegisterWindow), under registerLock, which waitRegistrations sleeps on.
-	// registerReleased registers them, waits for their matching, then closes the window. With no
-	// thread call, the release registers them itself, with no window.
+	// have matched (RgfxRegisterWindow), under registerLock, which waitRegistrations and
+	// registerReleased sleep on. registerReleased registers them one at a time, each once a
+	// process has taken the one before, then closes the window. With no thread call, the release
+	// registers them itself, with no window.
 	IOLock *registerLock;
 	thread_call_t registerCall;
 	uint32_t releasedDisplays;
@@ -863,7 +864,7 @@ private:
 	RgfxRegisterWindow registerWindow;
 	static void registrationsReleased(thread_call_param_t self, thread_call_param_t);
 	void registerReleased();
-	void waitRegistrations();
+	void waitRegistrations(UInt32 display);
 	void freeRegistrations();
 	// The displays whose node the firmware placed under /arm-io, counted from display 0 to the
 	// first without one (countMobileNodes, as display 0's start takes the device): MULTI_DISPLAY

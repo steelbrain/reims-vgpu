@@ -22,12 +22,22 @@
 // its own, so a second service can come after a process has read the first and found no more (an
 // arm64 15.6.1 guest under TCG: its WindowServer took display 1's service alone, and gave up on
 // display 0's). So the release opens a window (RgfxRegisterWindow) until every service released
-// has matched, its notifications delivered, or the window's deadline has passed, and in the window
-// a process's read of one of the properties the framework reads of each service it takes, before
-// it asks for the next (read from macOS 27.0.1's iomfb_match_callback: "dfr", "AppleTV" and
-// "external"), waits for the window to close, so the services it has not read yet are in its batch
-// by then. The kernel's own reads, the services' matching among them, never wait, nor does a read
-// of any other key, which a process's matching may make with the registry's notification lock held.
+// has matched, its notifications delivered, or the window's deadline has passed. In the window a
+// process's read of one of the properties the framework reads of each service it takes, before it
+// asks for the next (read from macOS 27.0.1's iomfb_match_callback: "dfr", "AppleTV" and
+// "external"), waits until the next display's service has matched, so it is in the process's
+// batch by the time the process asks for it. The kernel's own reads, the services' matching among
+// them, never wait, nor does a read of any other key, which a process's matching may make with the
+// registry's notification lock held.
+//
+// The window also keeps the order. A process's notifications hand it the services waiting for it
+// last first (read from macOS 27.0.1's kernel: the user notification's next object is the last its
+// handler added), so with two waiting it takes display 1's before display 0's, and the first it
+// takes is its main display (an arm64 15.6.1 guest under TCG with the window alone: display 1
+// main, at the left). So the release registers one display at a time: the next display's service only once
+// a process has taken the one before (read one of the keys of it), or the window's deadline has
+// passed. A process waiting for the services then finds one at a time, in display order, and takes
+// display 0's first.
 //
 // Header-only and free of the kernel's headers, so its native test (tests/register_hold_test.cpp)
 // builds it as the kext does.
@@ -98,17 +108,61 @@ struct RgfxRegisterWindow {
 	bool open = false;
 	// When the window closes at the latest, in the caller's clock.
 	uint64_t deadline = 0;
+	// The displays the release registers in the window, a bit each, by display; those whose
+	// service has matched, its notifications delivered; and those a process has taken.
+	uint32_t displays = 0;
+	uint32_t matched = 0;
+	uint32_t taken = 0;
 
-	void begin(uint64_t due)
+	// Opens the window for the displays `released`, a bit each, due at `due`.
+	void begin(uint64_t due, uint32_t released)
 	{
 		open = true;
 		deadline = due;
+		displays = released;
+		matched = 0;
+		taken = 0;
 	}
 	void end() { open = false; }
 
-	// Whether a read of a framebuffer's property waits at `now`: the window is open and before its
-	// deadline, and the read is a process's (`byProcess`): the kernel's never waits.
+	// Whether the window holds a process's read at `now`: open and before its deadline, and the
+	// read a process's (`byProcess`): the kernel's never waits.
 	bool waits(bool byProcess, uint64_t now) const { return open && byProcess && now < deadline; }
+
+	// The display the window registers after `display`, or RGFX_DISPLAYS_MAX where none is.
+	uint32_t next(uint32_t display) const
+	{
+		for (uint32_t d = display + 1; d < RGFX_DISPLAYS_MAX; d++)
+			if (displays & (1u << d))
+				return d;
+		return RGFX_DISPLAYS_MAX;
+	}
+
+	// A process's read of one of the framework's keys of display `display`'s service: the display
+	// is taken.
+	void take(uint32_t display)
+	{
+		if (display < RGFX_DISPLAYS_MAX)
+			taken |= 1u << display;
+	}
+
+	// Whether that read waits at `now`: in the window, for a display of the window, until the
+	// display after it has matched. A read of the last display's never waits.
+	bool readWaits(uint32_t display, bool byProcess, uint64_t now) const
+	{
+		if (!waits(byProcess, now) || display >= RGFX_DISPLAYS_MAX || !(displays & (1u << display)))
+			return false;
+		const uint32_t after = next(display);
+		return after < RGFX_DISPLAYS_MAX && !(matched & (1u << after));
+	}
+
+	// Whether the release waits at `now`, its display `display` matched, before it registers the
+	// next: open, before the deadline, a display after it, and `display` not yet taken.
+	bool registerWaits(uint32_t display, uint64_t now) const
+	{
+		return open && now < deadline && display < RGFX_DISPLAYS_MAX &&
+		       next(display) < RGFX_DISPLAYS_MAX && !(taken & (1u << display));
+	}
 };
 
 #endif // RGFX_REGISTER_HOLD_HPP_

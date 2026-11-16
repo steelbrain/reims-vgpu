@@ -332,7 +332,7 @@ void ReimsGraphics::releaseRegistrations()
 		for (UInt32 d = 0; d < RGFX_DISPLAYS_MAX; d++)
 			if (held & (1u << d))
 				releasedOptions[d] = options[d];
-		registerWindow.begin(due);
+		registerWindow.begin(due, releasedDisplays);
 		IOLockUnlock(registerLock);
 		// The call holds display 0's framebuffer; one pending already takes these too.
 		retain();
@@ -362,9 +362,10 @@ void ReimsGraphics::registrationsReleased(thread_call_param_t self, thread_call_
 	fb->release();
 }
 
-// The released services registered, display 0's first, and waited for until each has matched (its
-// busy state back to 0, its notifications delivered) or the window's deadline has passed; then the
-// window closes and the reads waiting in it go on.
+// The released services registered one at a time, by display: each waited for until it has matched
+// (its busy state back to 0, its notifications delivered), and the next registered only once a
+// process has taken it or the window's deadline has passed (RgfxRegisterWindow::registerWaits);
+// then the window closes and the reads waiting in it go on.
 void ReimsGraphics::registerReleased()
 {
 	IOLockLock(registerLock);
@@ -375,43 +376,60 @@ void ReimsGraphics::registerReleased()
 		options[d] = releasedOptions[d];
 	const uint64_t deadline = registerWindow.deadline;
 	IOLockUnlock(registerLock);
-	ReimsGraphics *fbs[RGFX_DISPLAYS_MAX];
-	UInt32 n = 0;
+	UInt32 n = 0, nMatched = 0, nTaken = 0;
 	for (UInt32 d = 0; d < RGFX_DISPLAYS_MAX; d++) {
 		if (!(held & (1u << d)))
 			continue;
 		ReimsGraphics *fb = copyDisplay(d);
+		if (fb) {
+			fb->IOMobileFramebufferLegacy::registerService(options[d]);
+			n++;
+			const uint64_t now = mach_absolute_time();
+			uint64_t ns = 0;
+			if (now < deadline)
+				absolutetime_to_nanoseconds(deadline - now, &ns);
+			if (ns && fb->waitQuiet(ns) == kIOReturnSuccess)
+				nMatched++;
+			fb->release();
+		}
+		// A display that could not be had counts as matched and taken, so neither the reads of
+		// the one before nor the next registration waits on it.
+		IOLockLock(registerLock);
+		registerWindow.matched |= 1u << d;
 		if (!fb)
-			continue;
-		fb->IOMobileFramebufferLegacy::registerService(options[d]);
-		fbs[n++] = fb;
-	}
-	UInt32 matched = 0;
-	for (UInt32 i = 0; i < n; i++) {
-		const uint64_t now = mach_absolute_time();
-		uint64_t ns = 0;
-		if (now < deadline)
-			absolutetime_to_nanoseconds(deadline - now, &ns);
-		if (ns && fbs[i]->waitQuiet(ns) == kIOReturnSuccess)
-			matched++;
-		fbs[i]->release();
+			registerWindow.take(d);
+		IOLockWakeup(registerLock, &registerWindow, false);
+		while (registerWindow.registerWaits(d, mach_absolute_time())) {
+			if (IOLockSleepDeadline(registerLock, &registerWindow.taken, deadline, THREAD_UNINT) ==
+			    THREAD_TIMED_OUT)
+				break;
+		}
+		if (fb && (registerWindow.taken & (1u << d)))
+			nTaken++;
+		IOLockUnlock(registerLock);
 	}
 	IOLockLock(registerLock);
 	registerWindow.end();
 	IOLockWakeup(registerLock, &registerWindow, false);
 	IOLockUnlock(registerLock);
-	IOLog("ReimsGraphics: %u displays' services registered together, %u matched in the window\n",
-	      n, matched);
+	IOLog("ReimsGraphics: %u displays' services registered in turn, %u matched and %u taken in the "
+	      "window\n",
+	      n, nMatched, nTaken);
 }
 
-// A process's read waits for the window to close (RgfxRegisterWindow::waits): no longer than its
-// deadline.
-void ReimsGraphics::waitRegistrations()
+// A process's read of a key of display `display`'s service: the display taken, the release
+// waiting to register the next woken, and the read held until the next display's service has
+// matched (RgfxRegisterWindow::readWaits), no longer than the window's deadline.
+void ReimsGraphics::waitRegistrations(UInt32 display)
 {
 	if (!registerLock)
 		return;
 	IOLockLock(registerLock);
-	while (registerWindow.waits(true, mach_absolute_time())) {
+	if (registerWindow.waits(true, mach_absolute_time())) {
+		registerWindow.take(display);
+		IOLockWakeup(registerLock, &registerWindow.taken, false);
+	}
+	while (registerWindow.readWaits(display, true, mach_absolute_time())) {
 		if (IOLockSleepDeadline(registerLock, &registerWindow, registerWindow.deadline,
 		                        THREAD_UNINT) == THREAD_TIMED_OUT)
 			break;
@@ -437,7 +455,7 @@ OSObject *ReimsGraphics::copyProperty(const char *aKey) const
 	const ReimsGraphics *owner = isHead() ? device : this;
 	if (__atomic_load_n(&owner->registerWindow.open, __ATOMIC_ACQUIRE) &&
 	    current_task() != kernel_task && rgfxFrameworkKey(aKey))
-		const_cast<ReimsGraphics *>(owner)->waitRegistrations();
+		const_cast<ReimsGraphics *>(owner)->waitRegistrations(isHead() ? displayId : 0);
 	return IOMobileFramebufferLegacy::copyProperty(aKey);
 }
 
@@ -457,6 +475,7 @@ void ReimsGraphics::freeRegistrations()
 		registerWindow.end();
 		releasedDisplays = 0;
 		IOLockWakeup(registerLock, &registerWindow, false);
+		IOLockWakeup(registerLock, &registerWindow.taken, false);
 		IOLockUnlock(registerLock);
 	}
 }

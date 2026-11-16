@@ -3370,13 +3370,23 @@ m3-max-34657: its WindowServer took one of two services and gave up on the
 other after its one batch). So the release registers the services on a thread
 call and opens a window until each has matched or 5 seconds have passed. In
 the window a process's read of a key the framework reads of each service it
-takes before it asks for the next (`dfr`, `AppleTV` and `external`) waits for
-the window to close, so the services it has not read yet are in its batch by
-then. The arm64e class overrides `copyProperty(const char *)` for it, the
-overload a process's property read asks first (read from 14.6.1's and
-27.0.1's kernels). The kernel's own reads never wait, nor does a read of any
+takes before it asks for the next (`dfr`, `AppleTV` and `external`) waits until
+the next display's service has matched, so it is in the process's batch by
+the time the process asks for it. The arm64e class overrides
+`copyProperty(const char *)` for it, the overload a process's property read
+asks first (read from 14.6.1's and 27.0.1's kernels). The kernel's own reads never wait, nor does a read of any
 other key; the hold and the window together end well inside the process's 30
 seconds. The window opens only where heads started, at two displays or more.
+
+The window also keeps the displays' order. A process's notification hands it
+the services waiting for it last first (read from 27.0.1's kernel), and the
+first service a process takes is its main display, the one with the menu bar
+and the Dock, at the left. With both services waiting, an arm64 15.6.1 guest
+took display 1's first in one of two boots (m3-max-34945). So the release
+registers one display at a time: the next display's service registers only
+once a process has read one of those keys of the one before, or the window's
+deadline has passed. A process waiting for the services then finds them one
+at a time, in display order, and display 0 is its main display, as on x86-64.
 
 The window rests on the order in which WindowServer reads those keys: of each
 service it takes, before it asks for the next. That order was read from
@@ -3387,7 +3397,8 @@ service gets nothing from the window: it can take fewer services than it
 counted nodes in its one batch, and then drives those displays and leaves the
 others black. It never hangs, as each read waits only until the window's
 deadline, and the hold and the window end inside the 30 seconds. So a new
-release's boot at two displays checks the desktop on every head.
+release's boot at two displays checks the desktop on every head, and that
+display 0 is the main display.
 
 **The option ROM** drives display 0 alone, unchanged: it takes no feature, so
 it sees one display, and its GOP framebuffer lies in display 0's room. Its
