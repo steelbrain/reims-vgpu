@@ -75,10 +75,13 @@ pub enum Outcome {
 /// the install is already the latest commit of that branch ([`current`]), it says so and builds
 /// nothing; scripts/install-ctl.sh run by hand builds it again.
 pub fn update(channel: Option<Channel>) -> Result<Outcome> {
-    let i = Install::load().context(
-        "no install record: run scripts/install-ctl.sh in your reims-vgpu checkout once, and \
-         reims-ctl update can use it from then on",
-    )?;
+    let i = Install::load().with_context(|| {
+        format!(
+            "no install record: run {} in your reims-vgpu checkout once, and reims-ctl update \
+             can use it from then on",
+            crate::install::INSTALL_SCRIPT
+        )
+    })?;
     if let Some(c) = channel {
         switch(&i.repo, c)?;
     }
@@ -90,7 +93,7 @@ pub fn update(channel: Option<Channel>) -> Result<Outcome> {
         );
         return Ok(Outcome::Current);
     }
-    let script = i.repo.join("scripts/install-ctl.sh");
+    let script = i.repo.join("scripts").join("install-ctl.sh");
     if !script.is_file() {
         bail!("{} is missing: was the checkout moved?", script.display());
     }

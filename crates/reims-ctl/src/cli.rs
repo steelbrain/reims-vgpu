@@ -9,6 +9,15 @@ use clap::{Args, Parser, Subcommand};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// What `reims-ctl --help` ends with: where VMs live, in the host's own form (paths.rs).
+const AFTER_HELP: &str = if cfg!(windows) {
+    "VMs live in ~\\.local\\share\\reims-ctl\\vms unless created elsewhere (--dir); \
+     `reims-ctl command NAME` prints the QEMU command a VM runs, for scripts of your own."
+} else {
+    "VMs live in ~/.local/share/reims-ctl/vms unless created elsewhere (--dir); \
+     `reims-ctl command NAME` prints the QEMU command a VM runs, for scripts of your own."
+};
+
 #[derive(Parser)]
 #[command(
     name = "reims-ctl",
@@ -17,8 +26,7 @@ use std::path::{Path, PathBuf};
     long_about = "Create, boot and manage macOS VMs on QEMU with reims-vgpu.\n\n\
         Run with no command for the interactive interface. Every option takes its value as \
         `--name value` or `--name=value`; yes/no options also take a bare `--name` for yes.",
-    after_help = "VMs live in ~/.local/share/reims-ctl/vms unless created elsewhere (--dir); \
-        `reims-ctl command NAME` prints the QEMU command a VM runs, for scripts of your own."
+    after_help = AFTER_HELP
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -130,7 +138,7 @@ pub enum Cmd {
     /// Zip a VM's logs, settings and the host's details into Downloads, for a bug report
     Report { name: String },
     /// Update reims-ctl and its QEMU from the checkout it was installed from
-    #[command(after_help = UPDATE_HELP)]
+    #[command(after_help = update_help())]
     Update {
         /// Switch the checkout to this channel first; later updates stay on it
         #[arg(long, value_enum)]
@@ -174,11 +182,17 @@ first.
 Ctrl-] disconnects; the VM keeps running. Alt+key is Cmd+key. The Cmd, Opt, Ctrl and Shift \
 buttons on the top row hold that key for the next key or click.";
 
-const UPDATE_HELP: &str = "\
-Where the checkout is already at the latest commit of the branch it follows, and reims-ctl and \
-its QEMU were installed from that commit, update builds nothing and says so; \
-scripts/install-ctl.sh in the checkout builds them again anyway.
+/// What `reims-ctl update --help` ends with: when it builds, then [`UPDATE_MIGRATIONS`].
+fn update_help() -> String {
+    format!(
+        "Where the checkout is already at the latest commit of the branch it follows, and \
+         reims-ctl and its QEMU were installed from that commit, update builds nothing and says \
+         so; {} in the checkout builds them again anyway.\n\n{UPDATE_MIGRATIONS}",
+        install::INSTALL_SCRIPT
+    )
+}
 
+const UPDATE_MIGRATIONS: &str = "\
 After an update, the new reims-ctl's first run (its restart from the interface, or the next \
 command) updates the VMs an older reims-ctl made, once, with a line for each VM. A VM whose \
 settings name no graphics, as those a reims-ctl from before reims-vgpu's own GPU device made, \
@@ -1535,7 +1549,10 @@ fn doctor(host: Host) -> Result<i32> {
         None => line(
             false,
             "checkout",
-            "no install record: reims-ctl update needs scripts/install-ctl.sh to have run".into(),
+            format!(
+                "no install record: reims-ctl update needs {} to have run",
+                install::INSTALL_SCRIPT
+            ),
         ),
     }
     // KVM and the library's needs, for the x86-64 VMs Linux runs.

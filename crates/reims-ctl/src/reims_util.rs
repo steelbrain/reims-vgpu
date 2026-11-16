@@ -51,7 +51,7 @@ pub const REV: &str = "84e5c98ae7fa6b0b68e7be690525dda29697ab34";
 /// installed, else the first on PATH.
 pub fn binary() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("REIMS_CTL_UTIL") {
-        return Ok(PathBuf::from(p));
+        return Ok(paths::native(PathBuf::from(p)));
     }
     let beside = beside();
     let on_path: Vec<PathBuf> = std::env::var_os("PATH")
@@ -120,10 +120,11 @@ pub fn stale(bin: &Path) -> Option<String> {
     (commit != REV).then(|| {
         format!(
             "{} is reims-util's commit {}, not {}, the one this reims-ctl runs: reims-ctl update \
-             installs it (or scripts/install-ctl.sh, where reims-ctl was installed without it)",
+             installs it (or {}, where reims-ctl was installed without it)",
             bin.display(),
             &commit[..commit.len().min(7)],
-            &REV[..7]
+            &REV[..7],
+            crate::install::INSTALL_SCRIPT
         )
     })
 }

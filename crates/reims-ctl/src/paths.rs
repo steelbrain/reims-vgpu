@@ -15,7 +15,9 @@
 //!
 //! On Windows the layout is the same, in the user's profile (`%USERPROFILE%`), and the runtime
 //! directory is `reims-ctl` in the user's own temporary directory (`%TEMP%`), short enough for
-//! any socket's name.
+//! any socket's name. Paths there are in Windows' own form, `\` between their parts: those
+//! reims-ctl makes, those a variable above or the user gives it ([`native`]), and those it
+//! prints with the home as `~` ([`tilde`]).
 
 use std::path::{Path, PathBuf};
 
@@ -35,29 +37,42 @@ pub fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("\\"))
 }
 
-fn xdg(var: &str, fallback: &str) -> PathBuf {
+/// `p` in the host's own form: on Windows with `\` for each `/` between its parts, as a path a
+/// user or a Unix-like shell gives (`C:/vms`) has them, which a part joined to it would print
+/// after a `\`; elsewhere as it is.
+pub fn native(p: PathBuf) -> PathBuf {
+    if cfg!(windows) {
+        p.components().collect()
+    } else {
+        p
+    }
+}
+
+/// The directory the XDG variable `var` names where it is absolute, else `fallback`'s parts in
+/// the home.
+fn xdg(var: &str, fallback: &[&str]) -> PathBuf {
     match std::env::var_os(var) {
-        Some(v) if Path::new(&v).is_absolute() => PathBuf::from(v),
-        _ => home().join(fallback),
+        Some(v) if Path::new(&v).is_absolute() => native(PathBuf::from(v)),
+        _ => fallback.iter().fold(home(), |p, part| p.join(part)),
     }
 }
 
 pub fn config_dir() -> PathBuf {
     match std::env::var_os("REIMS_CTL_CONFIG_DIR") {
-        Some(v) => PathBuf::from(v),
-        None => xdg("XDG_CONFIG_HOME", ".config").join("reims-ctl"),
+        Some(v) => native(PathBuf::from(v)),
+        None => xdg("XDG_CONFIG_HOME", &[".config"]).join("reims-ctl"),
     }
 }
 
 pub fn data_dir() -> PathBuf {
     match std::env::var_os("REIMS_CTL_DATA_DIR") {
-        Some(v) => PathBuf::from(v),
-        None => xdg("XDG_DATA_HOME", ".local/share").join("reims-ctl"),
+        Some(v) => native(PathBuf::from(v)),
+        None => xdg("XDG_DATA_HOME", &[".local", "share"]).join("reims-ctl"),
     }
 }
 
 pub fn cache_dir() -> PathBuf {
-    xdg("XDG_CACHE_HOME", ".cache").join("reims-ctl")
+    xdg("XDG_CACHE_HOME", &[".cache"]).join("reims-ctl")
 }
 
 pub fn installers_dir() -> PathBuf {
@@ -113,22 +128,26 @@ pub fn short_runtime_dir() -> PathBuf {
 /// Where a bug report's zip goes: `$XDG_DOWNLOAD_DIR`, else `~/Downloads`, else the home.
 pub fn downloads_dir() -> PathBuf {
     if let Some(v) = std::env::var_os("XDG_DOWNLOAD_DIR").filter(|v| Path::new(v).is_absolute()) {
-        return PathBuf::from(v);
+        return native(PathBuf::from(v));
     }
     let d = home().join("Downloads");
     if d.is_dir() { d } else { home() }
 }
 
-/// `~` and `~/...` expanded, the rest as given.
+/// `~` and `~/...` expanded (on Windows `~\...` too), the rest as given, in the host's own form
+/// ([`native`]).
 pub fn expand(p: &str) -> PathBuf {
     let p = p.trim();
-    if p == "~" {
+    let rest = p
+        .strip_prefix("~/")
+        .or_else(|| p.strip_prefix("~\\").filter(|_| cfg!(windows)));
+    native(if p == "~" {
         home()
-    } else if let Some(rest) = p.strip_prefix("~/") {
+    } else if let Some(rest) = rest {
         home().join(rest)
     } else {
         PathBuf::from(p)
-    }
+    })
 }
 
 /// `p` made absolute against the current directory, `~` expanded, without resolving links.
@@ -141,7 +160,8 @@ pub fn absolute(p: &str) -> PathBuf {
     }
 }
 
-/// `p` with the home shown as `~`, for display.
+/// `p` with the home shown as `~`, for display, in the host's own form ([`native`]): `~/a/b`, and
+/// on Windows `~\a\b`.
 pub fn tilde(p: &Path) -> String {
     let h = home();
     match p.strip_prefix(&h) {
@@ -149,10 +169,14 @@ pub fn tilde(p: &Path) -> String {
             if rest.as_os_str().is_empty() {
                 "~".into()
             } else {
-                format!("~/{}", rest.display())
+                format!(
+                    "~{}{}",
+                    std::path::MAIN_SEPARATOR,
+                    native(rest.to_path_buf()).display()
+                )
             }
         }
-        _ => p.display().to_string(),
+        _ => native(p.to_path_buf()).display().to_string(),
     }
 }
 
@@ -172,7 +196,46 @@ mod tests {
     #[test]
     fn tilde_shows_paths_under_home() {
         let h = home();
-        assert_eq!(tilde(&h.join("a/b")), "~/a/b");
-        assert_eq!(tilde(Path::new("/elsewhere/x")), "/elsewhere/x");
+        assert_eq!(tilde(&h.join("a").join("b")), format!("~{SEP}a{SEP}b"));
+        let elsewhere = Path::new(SEP).join("elsewhere").join("x");
+        assert_eq!(tilde(&elsewhere), format!("{SEP}elsewhere{SEP}x"));
+    }
+
+    use std::path::MAIN_SEPARATOR_STR as SEP;
+
+    /// On Windows, the paths reims-ctl makes and prints have `\` alone between their parts:
+    /// those of its own directories, a path with `/` a user or a variable gives, and one the home
+    /// as `~` starts; and `~\` expands as `~/` does.
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_have_backslashes_alone() {
+        let h = home();
+        let shown = |p: &Path| p.display().to_string();
+        for p in [
+            config_dir(),
+            data_dir(),
+            cache_dir(),
+            qemu_root(),
+            default_vms_dir(),
+        ] {
+            assert!(!shown(&p).contains('/'), "{}", shown(&p));
+        }
+        assert_eq!(shown(&expand("C:/vms/a")), r"C:\vms\a");
+        assert_eq!(shown(&expand("~/vms/a")), format!(r"{}\vms\a", shown(&h)));
+        assert_eq!(shown(&expand(r"~\vms\a")), format!(r"{}\vms\a", shown(&h)));
+        assert_eq!(
+            tilde(&h.join(".local/share").join("reims-ctl")),
+            r"~\.local\share\reims-ctl"
+        );
+        assert_eq!(tilde(Path::new("C:/vms/a")), r"C:\vms\a");
+    }
+
+    /// Elsewhere a path is printed as given, and `~\` is a name like any other.
+    #[cfg(unix)]
+    #[test]
+    fn unix_paths_are_kept_as_given() {
+        assert_eq!(native(PathBuf::from("a//b/./c")), PathBuf::from("a//b/./c"));
+        assert_eq!(expand(r"~\vms"), PathBuf::from(r"~\vms"));
+        assert_eq!(tilde(&home().join(".local/share")), "~/.local/share");
     }
 }

@@ -264,20 +264,20 @@ mod tests {
             paths::home().join("vms/old/disk.qcow2"),
             paths::home().join(".local/share/reims-ctl/vms/mac/disk.qcow2"),
         );
+        // The paths as the host writes them (paths::tilde).
+        let host = |s: &str| s.replace('/', std::path::MAIN_SEPARATOR_STR);
         let apart = why(APART[0], "ext4", "btrfs");
         assert_eq!(apart, Why::Apart("ext4".into(), "btrfs".into()));
-        assert_eq!(
-            apart.note(&src, &dst),
-            "~/vms/old and ~/.local/share/reims-ctl/vms/mac are different file systems (ext4 \
-             and btrfs), and a reflink is made within one"
-        );
+        let note = "~/vms/old and ~/.local/share/reims-ctl/vms/mac are different file systems \
+                    (ext4 and btrfs), and a reflink is made within one";
+        assert_eq!(apart.note(&src, &dst), host(note));
         assert_eq!(apart.short(), "different file systems");
         for &code in UNSUPPORTED {
             let none = why(code, "ext4", "ext4");
             assert_eq!(none, Why::Unsupported("ext4".into()));
             assert_eq!(
                 none.note(&src, &dst),
-                "ext4, which ~/vms/old is on, makes none"
+                host("ext4, which ~/vms/old is on, makes none")
             );
             assert_eq!(none.short(), "ext4 makes no reflinks");
         }

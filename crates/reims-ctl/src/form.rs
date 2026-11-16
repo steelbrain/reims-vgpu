@@ -487,12 +487,13 @@ fn wrap_count(s: &str, width: u16) -> usize {
 }
 
 /// `text` completed as a path, as a shell's Tab would: the one match whole (a directory with
-/// its `/`), or the matches' longest common prefix. None when nothing would change.
+/// its separator, `/`, on Windows `\`), or the matches' longest common prefix. None when nothing
+/// would change.
 pub fn complete(text: &str) -> Option<String> {
     let typed = text.to_string();
     let expanded = crate::paths::expand(&typed);
     let exp = expanded.to_string_lossy().into_owned();
-    let (dir, prefix) = if exp.ends_with('/') {
+    let (dir, prefix) = if typed.ends_with('/') || typed.ends_with(std::path::MAIN_SEPARATOR) {
         (PathBuf::from(&exp), String::new())
     } else {
         let p = Path::new(&exp);
@@ -523,7 +524,14 @@ pub fn complete(text: &str) -> Option<String> {
     matches.sort();
     let completion = if matches.len() == 1 {
         let (name, is_dir) = &matches[0];
-        format!("{name}{}", if *is_dir { "/" } else { "" })
+        format!(
+            "{name}{}",
+            if *is_dir {
+                std::path::MAIN_SEPARATOR_STR
+            } else {
+                ""
+            }
+        )
     } else {
         let first = &matches[0].0;
         let mut n = first.len();
@@ -555,7 +563,8 @@ mod tests {
         std::fs::create_dir_all(d.join("opencore-dir")).unwrap();
         std::fs::write(d.join("opencore.qcow2"), b"").unwrap();
         std::fs::write(d.join("other.img"), b"").unwrap();
-        let base = format!("{}/", d.display());
+        let sep = std::path::MAIN_SEPARATOR;
+        let base = format!("{}{sep}", d.display());
         assert_eq!(
             complete(&format!("{base}ot")),
             Some(format!("{base}other.img"))
@@ -566,9 +575,21 @@ mod tests {
         );
         assert_eq!(
             complete(&format!("{base}opencore-")),
-            Some(format!("{base}opencore-dir/"))
+            Some(format!("{base}opencore-dir{sep}"))
         );
         assert_eq!(complete(&format!("{base}zz")), None);
+        // A directory typed with its separator lists what it holds.
+        assert_eq!(
+            complete(&format!("{base}opencore-dir{sep}")),
+            None,
+            "an empty directory completes nothing"
+        );
+        // On Windows a path typed with `/` completes there too, adding `\` after a directory.
+        #[cfg(windows)]
+        assert_eq!(
+            complete(&format!("{}/opencore-", d.display())),
+            Some(format!("{}/opencore-dir\\", d.display()))
+        );
         std::fs::remove_dir_all(&d).unwrap();
     }
 

@@ -353,7 +353,10 @@ impl App {
             );
         } else if app.qemu.is_none() && host.default_profile().is_some_and(Profile::starts) {
             app.say(
-                "QEMU is not installed: run scripts/install-ctl.sh in your reims-vgpu checkout",
+                &format!(
+                    "QEMU is not installed: run {} in your reims-vgpu checkout",
+                    install::INSTALL_SCRIPT
+                ),
                 Level::Warn,
             );
         }
@@ -1193,7 +1196,10 @@ impl App {
     fn ask_update(&mut self) {
         let Some(i) = install::Install::load() else {
             self.say(
-                "no install record: run scripts/install-ctl.sh in your reims-vgpu checkout once",
+                &format!(
+                    "no install record: run {} in your reims-vgpu checkout once",
+                    install::INSTALL_SCRIPT
+                ),
                 Level::Error,
             );
             return;
@@ -3239,7 +3245,7 @@ mod tests {
         app.macos_versions = Some(Ok(Vec::new()));
         app.open_create();
         let name = format!("form-test-{}", std::process::id());
-        let disk = std::env::temp_dir().join(format!("{name}/disk.qcow2"));
+        let disk = std::env::temp_dir().join(&name).join("disk.qcow2");
         let disk = disk.to_string_lossy().into_owned();
         press(&mut app, name.chars().map(KeyCode::Char));
         press(

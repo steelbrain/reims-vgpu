@@ -141,7 +141,7 @@ impl Log {
 /// Where the logs of failed restores are kept, a directory for each VM: the cache directory's
 /// `restore/logs`.
 pub fn logs_dir() -> PathBuf {
-    paths::cache_dir().join("restore/logs")
+    paths::cache_dir().join("restore").join("logs")
 }
 
 /// A progress line for each whole percent, so a long step doesn't print a line per read.

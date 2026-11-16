@@ -15,6 +15,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+/// The script that installs reims-ctl and its QEMU, by its path in the checkout, for the messages
+/// that send the user there: on Windows scripts\install.ps1, which runs scripts/install-ctl.sh in
+/// MSYS2's CLANG64 shell.
+pub const INSTALL_SCRIPT: &str = if cfg!(windows) {
+    r"scripts\install.ps1"
+} else {
+    "scripts/install-ctl.sh"
+};
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Install {
     /// The reims-vgpu checkout the install built from, which `update` pulls.
@@ -54,14 +63,15 @@ impl Install {
 /// The QEMU binary for `profile`.
 pub fn qemu_binary(profile: Profile) -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("REIMS_CTL_QEMU") {
-        return Ok(PathBuf::from(p));
+        return Ok(paths::native(PathBuf::from(p)));
     }
     let bin = paths::qemu_root()
-        .join("current/bin")
+        .join("current")
+        .join("bin")
         .join(profile.qemu_binary());
     if !bin.exists() {
         bail!(
-            "QEMU is not installed ({} is missing): run scripts/install-ctl.sh in your reims-vgpu \
+            "QEMU is not installed ({} is missing): run {INSTALL_SCRIPT} in your reims-vgpu \
              checkout, or set REIMS_CTL_QEMU to a qemu-system binary",
             bin.display()
         );
@@ -73,7 +83,8 @@ pub fn qemu_binary(profile: Profile) -> Result<PathBuf> {
 pub fn qemu_binary_or_default(profile: Profile) -> PathBuf {
     qemu_binary(profile).unwrap_or_else(|_| {
         paths::qemu_root()
-            .join("current/bin")
+            .join("current")
+            .join("bin")
             .join(profile.qemu_binary())
     })
 }
@@ -88,7 +99,7 @@ pub fn qemu_img(profile: Profile) -> Result<PathBuf> {
     });
     if !img.exists() {
         bail!(
-            "{} is missing: reinstall with scripts/install-ctl.sh",
+            "{} is missing: reinstall with {INSTALL_SCRIPT}",
             img.display()
         );
     }
