@@ -445,10 +445,10 @@ constexpr unsigned long long kVideoRendererID = 0x1020004ull;
 // Metal the bundle and the class it makes the device of (MetalPluginName, MetalPluginClassName),
 // OpenGL its renderer (IOGLBundleName), the display pipe's capabilities (AcceleratorProperties),
 // and the display count (DisplayPortCount); the same on x86-64 and arm64. AppleGVA's video driver
-// is named where the host decodes video (publishVideoCodecs). The personality holds only what
-// matches the provider and names the driver: Graft records the rest of a personality as the
-// provider's matching. Set at the start of start, before registerService lets any process find
-// the accelerator and before the bundle's check reads MetalPluginName.
+// is named where the host decodes video, on x86-64 (publishVideoCodecs). The personality holds
+// only what matches the provider and names the driver: Graft records the rest of a personality as
+// the provider's matching. Set at the start of start, before registerService lets any process
+// find the accelerator and before the bundle's check reads MetalPluginName.
 bool setDriverKeys(IOService *service)
 {
 	OSDictionary *pipe = OSDictionary::withCapacity(2);
@@ -967,6 +967,13 @@ void RgfxAccelerator::publishVideoCodecs()
 {
 	static_assert(RGFX_VIDEO_CAPS_OFFSET == RGFX_DEVICE_INFO_OFFSET + sizeof(RgfxDeviceInfo),
 	              "the video caps follow the device info");
+	// An arm64 guest's AppleGVA takes no session to our video driver: named, VideoToolbox would
+	// answer hardware HEVC decode that no session can have (RgfxVideoCodecs.hpp).
+	if (!kRgfxGuestVideoDriver) {
+		IOLog("RgfxAccelerator: an arm64 guest takes no GPU video driver: no video driver for "
+		      "AppleGVA\n");
+		return;
+	}
 	const void *info = nullptr;
 	IOMemoryMap *map = mapDeviceInfo(sizeof(RgfxDeviceInfo) + sizeof(RgfxVideoCaps), &info);
 	if (!map)

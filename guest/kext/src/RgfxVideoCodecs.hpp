@@ -22,7 +22,18 @@
  * Picture where Main is, whose decoder takes its streams. Elsewhere it publishes none, and HEVC
  * decodes in software, as on a GPU without it.
  *
- * Header-only and free of kernel types, so tests/video_codecs_test.cpp checks it on the Mac.
+ * AppleGVA's vendor-driver route, which our bundle's video driver serves, is x86-64's. On an arm64
+ * guest the keys bring no session to it: with them, on a host that decodes H.264 and HEVC,
+ * VideoToolbox answered VTIsHardwareDecodeSupported true for HEVC, yet a session requiring a
+ * hardware HEVC decoder failed -17692 and one requiring H.264 -12906, no encoder was hardware
+ * and one requiring a hardware encoder failed -12903, and every session that allowed hardware
+ * decoded in software (measured on an arm64 macOS 14.6.1 guest on a VA-API host, 2026-11-16). So
+ * the arm64e kext (RGFX_GUEST_ARM64) publishes none of them, whatever the host's caps list
+ * (kRgfxGuestVideoDriver), and VideoToolbox answers no hardware decoder or encoder for any codec,
+ * as on a host with no video arm.
+ *
+ * Header-only and free of kernel types, so tests/video_codecs_test.cpp checks it on the Mac, as
+ * each kext builds it (video_codecs_test, and video_codecs_arm64_test with RGFX_GUEST_ARM64 set).
  */
 
 #ifndef RGFX_VIDEO_CODECS_HPP_
@@ -31,6 +42,14 @@
 #include <stdint.h>
 
 #include "reims_graphics_wire.h"
+
+#ifndef RGFX_GUEST_ARM64
+#define RGFX_GUEST_ARM64 0
+#endif
+
+// Whether the guest's AppleGVA takes our bundle as a GPU's video driver: the x86-64 guest's.
+// The arm64e kext publishes no video key.
+constexpr bool kRgfxGuestVideoDriver = !RGFX_GUEST_ARM64;
 
 // What the accelerator publishes for HEVC decode.
 struct RgfxHevcDecode {
@@ -42,11 +61,11 @@ struct RgfxHevcDecode {
 };
 
 // Whether `caps` lists a decoder: a decode entry of H.264 or HEVC with a profile, for its
-// accelerator to name AppleGVA its video driver. False for an older host's caps, and for a host
-// with no video arm, which writes none.
+// accelerator to name AppleGVA its video driver. False for an older host's caps, for a host
+// with no video arm, which writes none, and on an arm64 guest.
 static inline bool rgfxDecodesVideo(const RgfxVideoCaps &caps)
 {
-	if (caps.version < RGFX_VIDEO_CAPS_VERSION)
+	if (!kRgfxGuestVideoDriver || caps.version < RGFX_VIDEO_CAPS_VERSION)
 		return false;
 	const uint32_t n = caps.codec_count < RGFX_VIDEO_CAPS_CODECS ? caps.codec_count
 	                                                             : RGFX_VIDEO_CAPS_CODECS;
@@ -60,10 +79,11 @@ static inline bool rgfxDecodesVideo(const RgfxVideoCaps &caps)
 }
 
 // The HEVC decode `caps` answers, for its accelerator to publish: false where the host's caps
-// list none (an older host's, or no hardware for it), or list no profile of it.
+// list none (an older host's, or no hardware for it), or list no profile of it, and on an arm64
+// guest.
 static inline bool rgfxHevcDecode(const RgfxVideoCaps &caps, RgfxHevcDecode *out)
 {
-	if (caps.version < RGFX_VIDEO_CAPS_VERSION)
+	if (!kRgfxGuestVideoDriver || caps.version < RGFX_VIDEO_CAPS_VERSION)
 		return false;
 	const uint32_t n = caps.codec_count < RGFX_VIDEO_CAPS_CODECS ? caps.codec_count
 	                                                             : RGFX_VIDEO_CAPS_CODECS;

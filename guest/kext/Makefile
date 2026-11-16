@@ -145,7 +145,7 @@ TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surf
 	$(BUILD)/tests/features_test $(BUILD)/tests/latency_test $(BUILD)/tests/release_table_test \
 	$(BUILD)/tests/answer_look_test \
 	$(BUILD)/tests/deferred_answers_test $(BUILD)/tests/shared_pipelines_test \
-	$(BUILD)/tests/video_codecs_test \
+	$(BUILD)/tests/video_codecs_test $(BUILD)/tests/video_codecs_arm64_test \
 	$(BUILD)/tests/ring_room_test $(BUILD)/tests/context_slots_test $(BUILD)/tests/pages_block_test \
 	$(BUILD)/tests/close_table_test $(BUILD)/tests/ask_gate_test \
 	$(BUILD)/tests/pipe_color_test $(BUILD)/tests/id_chunks_test $(BUILD)/tests/boot_console_test \
@@ -181,6 +181,11 @@ $(BUILD)/tests/control_ring_arm64_test: tests/control_ring_test.cpp $(HEADERS) .
 
 # The features as the arm64e kext takes them (RgfxFeatures.hpp's PAGES_16K).
 $(BUILD)/tests/features_arm64_test: tests/features_test.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
+	@mkdir -p $(@D)
+	xcrun clang++ -std=c++17 -Wall -Wextra -Werror -DRGFX_GUEST_ARM64=1 -Isrc -I../../crates/reims-vgpu-graphics/include $< -o $@
+
+# What the arm64e kext publishes of the host's video (RgfxVideoCodecs.hpp): nothing.
+$(BUILD)/tests/video_codecs_arm64_test: tests/video_codecs_test.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)
 	xcrun clang++ -std=c++17 -Wall -Wextra -Werror -DRGFX_GUEST_ARM64=1 -Isrc -I../../crates/reims-vgpu-graphics/include $< -o $@
 

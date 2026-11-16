@@ -26,6 +26,13 @@ codec: the kext names AppleGVA no video driver (`publishVideoCodecs`,
 hardware (`kVTCouldNotFindVideoDecoderErr`, `kVTCouldNotFindVideoEncoderErr`), and decodes and
 encodes every other session in software, as on a Mac without hardware video.
 
+An arm64 guest is offered no codec on any host: the arm64e kext names AppleGVA no video driver
+and publishes no HEVC decode, whatever the caps list, and VideoToolbox answers as above. The
+route our video driver serves, AppleGVA's vendor driver, is x86-64's: with the keys an arm64
+macOS 14.6.1 guest on a VA-API host answered `VTIsHardwareDecodeSupported` true for HEVC, while
+a session requiring a hardware HEVC decoder failed −17692, one requiring H.264 −12906, and no
+session reached the host (measured 2026-11-16).
+
 ## The caps
 
 At the device's init, the host writes an `RgfxVideoCaps` at `RGFX_VIDEO_CAPS_OFFSET`, after

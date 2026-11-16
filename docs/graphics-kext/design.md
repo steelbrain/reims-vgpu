@@ -1350,7 +1350,11 @@ Stages:
       encode); without them it answers false and lists no hardware encoder,
       and sessions requiring hardware fail as on a Mac without it (−12906,
       −12908) (**measured**, macOS 26.7.2 guest, Windows host with a UHD
-      630, 2026-11-16). AppleGVA drives an AMD driver
+      630, 2026-11-16). The arm64e kext names none on any host, nor HEVC
+      decode: the route is x86-64's, and with the keys an arm64 guest
+      answered hardware HEVC decode true while a session requiring it failed
+      −17692 and none reached the host (**measured**, arm64 macOS 14.6.1
+      guest, VA-API host, 2026-11-16). AppleGVA drives an AMD driver
       through high-level commands (picture parameters and slice data;
       rate-control settings), which map onto Vulkan Video. The driver decodes
       H.264 and HEVC, each where the host's caps list it; HEVC in the profiles

@@ -1,5 +1,7 @@
 // video_codecs_test: what the accelerator publishes of the host's video: its video driver, and
-// HEVC decode (RgfxVideoCodecs.hpp).
+// HEVC decode (RgfxVideoCodecs.hpp). Built with each architecture's rules (the Makefile's
+// video_codecs_test, and video_codecs_arm64_test with RGFX_GUEST_ARM64=1): the x86-64 kext
+// publishes what the host's caps list, the arm64e kext nothing.
 #include <cstdio>
 #include <cstdlib>
 
@@ -32,8 +34,10 @@ static RgfxVideoCaps caps(uint32_t profiles, uint32_t level)
 	return c;
 }
 
-int main()
+// The x86-64 kext's rules: what the caps list.
+static void x86Rules()
 {
+	CHECK(kRgfxGuestVideoDriver);
 	RgfxHevcDecode d;
 	// Main and Main 10: Main Still Picture rides with Main.
 	CHECK(rgfxHevcDecode(caps(RGFX_VIDEO_HEVC_MAIN | RGFX_VIDEO_HEVC_MAIN_10, 186), &d));
@@ -84,6 +88,37 @@ int main()
 	RgfxVideoCaps counted = caps(RGFX_VIDEO_HEVC_MAIN, 153);
 	counted.codec_count = 0;
 	CHECK(!rgfxDecodesVideo(counted));
-	std::printf("video_codecs_test: OK (%d checks)\n", checks);
+}
+
+// The arm64e kext's rules: no video driver and no HEVC decode, whatever the caps list.
+static void arm64Rules()
+{
+	CHECK(!kRgfxGuestVideoDriver);
+	RgfxHevcDecode d = {};
+	// H.264 and HEVC Main and Main 10, H.264 alone, HEVC alone: nothing.
+	const RgfxVideoCaps both = caps(RGFX_VIDEO_HEVC_MAIN | RGFX_VIDEO_HEVC_MAIN_10, 186);
+	CHECK(!rgfxDecodesVideo(both));
+	CHECK(!rgfxHevcDecode(both, &d));
+	RgfxVideoCaps h264 = both;
+	h264.codec_count = 1;
+	CHECK(!rgfxDecodesVideo(h264));
+	CHECK(!rgfxHevcDecode(h264, &d));
+	RgfxVideoCaps hevcOnly = both;
+	hevcOnly.codecs[0] = hevcOnly.codecs[1];
+	hevcOnly.codec_count = 1;
+	CHECK(!rgfxDecodesVideo(hevcOnly));
+	CHECK(!rgfxHevcDecode(hevcOnly, &d));
+	// Nothing written to the answer.
+	CHECK(d.count == 0 && d.maxLevel == 0);
+}
+
+int main()
+{
+	if (RGFX_GUEST_ARM64)
+		arm64Rules();
+	else
+		x86Rules();
+	std::printf("video_codecs_test (%s): OK (%d checks)\n", RGFX_GUEST_ARM64 ? "arm64" : "x86-64",
+	            checks);
 	return 0;
 }
