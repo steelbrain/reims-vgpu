@@ -1807,9 +1807,9 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/target/ambrosia.bin \
   `ai.aneesiqbal.RgfxGate`) and that its executable has an arm64e slice,
   and names every kext that is not given or fails, writing no bundle.
 - **The Ambrosia it needs.** `Graphics` > `DisplayNode` as a list needs
-  Ambrosia 0.1.3 or later (Ambrosia's `docs/configuration.md`, "Graphics >
-  DisplayNode"); Ambrosia 0.1.1 and 0.1.2 refuse the bundle
-  (`Graphics.DisplayNode is not a string`). Where the module drives a
+  Ambrosia 0.1.3 (tag `v0.1.3`, commit `1b924d9`) or later (Ambrosia's
+  `docs/configuration.md`, "Graphics > DisplayNode"); an older Ambrosia
+  refuses the bundle (`Graphics.DisplayNode is not a string`). Where the module drives a
   display, Ambrosia adds `/arm-io/reims-display0`, a `display-subsystem`
   node, to the device tree before the kernel starts, and one for each other
   display the module reports, and logs `ambrosia: display node

@@ -3001,11 +3001,11 @@ in `wire.rs` (`RGFX_FEATURE_MULTI_DISPLAY`, `RGFX_DISPLAYS_MAX`,
 `RGFX_SCANOUT_ROOM_ALIGN`, `RGFX_SCANOUT_STRIDE_ALIGN`); a host of two
 displays or more offers the feature (lane mmhost), the x86-64 kext takes it
 (lane mmx86), and the arm64e kext takes it where the firmware placed a node
-for each display (lane mma64), which our configuration asks of Ambrosia once
-Ambrosia 0.1.3 is released (A1); reims-ctl sets the count (lane mmctl). The
-pointer crossing and a captured drag across displays from Linux's windows are
-built on x86-64 (lanes ptrcross and dragcross: `POINTER_OVER` and
-`DISPLAY_BOUNDS`, below); on arm64 they are still to build (A3).
+for each display (lane mma64), which our configuration asks of Ambrosia 0.1.3
+or later (A1); reims-ctl sets the count (lane mmctl). The pointer crossing and
+a captured drag across displays from Linux's windows are built on x86-64
+(lanes ptrcross and dragcross: `POINTER_OVER` and `DISPLAY_BOUNDS`, below); on
+arm64 they are still to build (A3).
 
 **A device of one display is what it was.** A device has 1 to
 `RGFX_DISPLAYS_MAX` (4) displays, 1 by default, fixed when it is made. With
@@ -3376,7 +3376,18 @@ then. The arm64e class overrides `copyProperty(const char *)` for it, the
 overload a process's property read asks first (read from 14.6.1's and
 27.0.1's kernels). The kernel's own reads never wait, nor does a read of any
 other key; the hold and the window together end well inside the process's 30
-seconds.
+seconds. The window opens only where heads started, at two displays or more.
+
+The window rests on the order in which WindowServer reads those keys: of each
+service it takes, before it asks for the next. That order was read from
+27.0.1's framework alone; 14.6.1's framework was not read (its guest has no
+disassembler), only its kernel's read path and WindowServer's log. A release
+whose framework reads none of the three keys before it asks for the next
+service gets nothing from the window: it can take fewer services than it
+counted nodes in its one batch, and then drives those displays and leaves the
+others black. It never hangs, as each read waits only until the window's
+deadline, and the hold and the window end inside the 30 seconds. So a new
+release's boot at two displays checks the desktop on every head.
 
 **The option ROM** drives display 0 alone, unchanged: it takes no feature, so
 it sees one display, and its GOP framebuffer lies in display 0's room. Its
