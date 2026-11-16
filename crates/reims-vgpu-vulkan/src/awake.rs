@@ -35,9 +35,22 @@
 //!   4 KiB fill alike, and the GPU suspended every 42 to 47 s, each time for about 1.2 s until the
 //!   next submission resumed it (a guest's frame in that window waits for the resume); one every
 //!   500 ms, and it did not suspend in 400 s; every 250 ms, not in 60 s.
-//! - **On every GPU.** No driver or GPU kind is told apart: a GPU without runtime suspend, or
-//!   one that drives the host's display, gets one small command buffer per look while the guest
-//!   is idle, and none while it draws.
+//! - **Where the kernel keeps the GPU up.** A look that would submit first reads the device's
+//!   `power/control` in sysfs. `on` is the kernel's runtime suspend forbidden for the device, so
+//!   the GPU stays up without work, and the look submits nothing. The file is read at each such
+//!   look, so a policy turned to `auto` meanwhile is kept to from the next look. Measured on the
+//!   Radeon 780M (Phoenix 1002:15bf on two hosts, Hawk Point 1002:1900 on a third; amdgpu, Linux
+//!   7.3.3, `amdgpu.runpm` at its default, -1): `control` read `on`, `autosuspend_delay_ms`
+//!   answered EIO, and `runtime_suspended_time` read 0 after 26 to 29 h up. Before this read, the
+//!   thread submitted there at every [`UNREAD_LOOK`] of the guest's idle, and took 0.38 to 0.53
+//!   CPU-s a pass of Geekbench 7.1.0's compute benchmark (166 s timed), against 0.03 to 0.05 on
+//!   the RX 7900 XTX, which it looks at every 1.25 s.
+//! - **On every GPU.** No driver or GPU kind is told apart: the device's own runtime power
+//!   management, as sysfs gives it, decides. A GPU whose `control` reads anything else (`auto`, the
+//!   RX 7900 XTX's, the RX 550's, the Iris Xe's and the NVIDIA cards' on the same hosts), or that
+//!   has no file to read (no PCI address, or an OS without sysfs), gets one small command buffer
+//!   per look while the guest is idle, and none while it draws, whether or not it drives the
+//!   host's display.
 //! - **Nothing the guest sees.** The thread's objects are raw Vulkan objects of its own, made at
 //!   its first submission: a command pool and its one command buffer, a query pool of one
 //!   timestamp, and a fence; and a runtime queue of its own, whose `VkQueue` it borrows for each
@@ -73,6 +86,7 @@
 //!   destroyed in a step of its own, and waits for it: the thread holds a handle of the runtime
 //!   device, which then goes before the device's own.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::Thread;
@@ -124,22 +138,27 @@ struct Shared {
     thread: OnceLock<Thread>,
     /// Whether the thread is to end ([`Awake::stop`]).
     stop: AtomicBool,
+    /// How many looks went to the toucher: those that found the device idle where it may suspend.
+    touches: AtomicU64,
 }
 
 impl Awake {
     /// Starts `device`'s thread (the module docs), parked until the device's first commit.
     pub(crate) fn start(device: &rt::Device) -> Awake {
-        Awake::looking(device, look(delay_text(device).as_deref()))
+        let power = power_dir(device);
+        let look = look(read(power.as_deref(), "autosuspend_delay_ms").as_deref());
+        Awake::looking(device, look, power)
     }
 
-    /// Starts `device`'s thread, looking every `look`, parked until the device's first commit.
-    fn looking(device: &rt::Device, look: Duration) -> Awake {
+    /// Starts `device`'s thread, looking every `look`, parked until the device's first commit;
+    /// `power` is the device's runtime power management directory in sysfs, where it has one.
+    fn looking(device: &rt::Device, look: Duration, power: Option<PathBuf>) -> Awake {
         crate::exit_gate::arm();
         let shared = Arc::new(Shared::default());
         let (device, kept) = (device.clone(), Arc::clone(&shared));
         let spawned = std::thread::Builder::new()
             .name("reims-vgpu.gpu-awake".into())
-            .spawn(move || keep(&device, &kept, look));
+            .spawn(move || keep(&device, &kept, look, power.as_deref()));
         match spawned {
             Ok(thread) => Awake {
                 shared: Some(shared),
@@ -199,14 +218,24 @@ pub(crate) fn look(delay_ms: Option<&str>) -> Duration {
         })
 }
 
-/// The text of `device`'s `power/autosuspend_delay_ms` in sysfs, where it has a PCI address and
-/// the file can be read.
-fn delay_text(device: &rt::Device) -> Option<String> {
+/// Whether the device may suspend, by its `power/control` as sysfs writes it (`control`): not
+/// where it reads `on`, the kernel's runtime suspend forbidden for the device; elsewhere (`auto`,
+/// or no file to read) it may, as far as the thread can tell (the module docs).
+pub(crate) fn may_suspend(control: Option<&str>) -> bool {
+    control.map(str::trim) != Some("on")
+}
+
+/// `device`'s runtime power management directory in sysfs, by its PCI address, where it has one.
+fn power_dir(device: &rt::Device) -> Option<PathBuf> {
     let (domain, bus, slot, function) = device.properties().pci_bus?;
-    let path = format!(
-        "/sys/bus/pci/devices/{domain:04x}:{bus:02x}:{slot:02x}.{function:x}/power/autosuspend_delay_ms"
-    );
-    std::fs::read_to_string(path).ok()
+    let dir = format!("/sys/bus/pci/devices/{domain:04x}:{bus:02x}:{slot:02x}.{function:x}/power");
+    Some(PathBuf::from(dir))
+}
+
+/// The text of `file` in the device's power directory `power`, where there is one and the file
+/// can be read.
+fn read(power: Option<&Path>, file: &str) -> Option<String> {
+    std::fs::read_to_string(power?.join(file)).ok()
 }
 
 /// What a look of the thread does.
@@ -249,12 +278,15 @@ impl Keep {
 }
 
 /// The thread: looks every `look` (the module docs) until a submission fails or the device ends
-/// ([`Awake::stop`]).
-fn keep(device: &rt::Device, shared: &Shared, look: Duration) {
+/// ([`Awake::stop`]), submitting only where the device's power directory `power` lets it suspend.
+fn keep(device: &rt::Device, shared: &Shared, look: Duration, power: Option<&Path>) {
     let _ = shared.thread.set(std::thread::current());
+    let control = read(power, "control");
     log::debug!(
         target: TARGET,
-        "the GPU is kept awake {AWAKE_FOR:?} after the last commit, looked at every {look:?}"
+        "the GPU is kept awake {AWAKE_FOR:?} after the last commit, looked at every {look:?}, \
+         where it may suspend (power/control now {:?})",
+        control.as_deref().map(str::trim)
     );
     let clock = crate::os::OsClock::new();
     let mut keep = Keep::default();
@@ -286,7 +318,10 @@ fn keep(device: &rt::Device, shared: &Shared, look: Duration) {
                 drop(held);
             }
             Look::Busy => {}
+            // The kernel keeps the GPU up: nothing to submit (the module docs).
+            Look::Touch if !may_suspend(read(power, "control").as_deref()) => {}
             Look::Touch => {
+                shared.touches.fetch_add(1, Ordering::SeqCst);
                 let Some(held) = crate::exit_gate::step() else {
                     stay(toucher);
                 };
@@ -601,6 +636,45 @@ mod tests {
         assert_eq!(look(Some("0\n")), UNREAD_LOOK);
     }
 
+    /// A device whose `power/control` reads `on` may not suspend, and one whose file reads
+    /// anything else, or that has none, may (the module docs, "Where the kernel keeps the GPU
+    /// up").
+    #[test]
+    fn a_device_whose_power_control_reads_on_may_not_suspend() {
+        assert!(!may_suspend(Some("on\n")));
+        assert!(!may_suspend(Some("on")));
+        assert!(may_suspend(Some("auto\n")));
+        assert!(may_suspend(Some("")));
+        assert!(may_suspend(None));
+    }
+
+    /// While the device's `power/control` reads `on`, the thread's looks of the idle device go to
+    /// no toucher; once it reads `auto`, the next looks do, without a commit between.
+    #[test]
+    fn the_thread_touches_only_while_the_device_may_suspend() {
+        let device = crate::gpu::device::tests::dev();
+        let power = std::env::temp_dir().join(format!("rvg-awake-power-{}", std::process::id()));
+        std::fs::create_dir_all(&power).unwrap();
+        let control = power.join("control");
+        std::fs::write(&control, "on\n").unwrap();
+        let mut awake = Awake::looking(&device.raw, Duration::from_millis(1), Some(power.clone()));
+        let touches = || {
+            let shared = awake.shared.as_ref().expect("the thread started");
+            shared.touches.load(Ordering::SeqCst)
+        };
+        awake.touch();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(touches(), 0, "no touch while power/control reads on");
+        std::fs::write(&control, "auto\n").unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while touches() == 0 && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(touches() > 0, "touches once power/control reads auto");
+        awake.stop();
+        std::fs::remove_dir_all(&power).unwrap();
+    }
+
     /// The submission runs on the device: its fence signals, and the buffer, recorded once, is
     /// submitted again after it.
     #[test]
@@ -663,7 +737,7 @@ mod tests {
         const TEST: &str = "awake::tests::an_exit_amid_touches_ends_with_its_status";
         if std::env::var("RVG_CHILD").as_deref() == Ok(TEST) {
             let device = crate::gpu::device::tests::dev();
-            let awake = Awake::looking(&device.raw, Duration::from_millis(1));
+            let awake = Awake::looking(&device.raw, Duration::from_millis(1), None);
             awake.touch();
             std::thread::sleep(Duration::from_millis(50));
             std::process::exit(0);
@@ -699,7 +773,7 @@ mod tests {
             (hour, true),
             (Duration::from_millis(1), true),
         ] {
-            let mut awake = Awake::looking(&device.raw, look);
+            let mut awake = Awake::looking(&device.raw, look, None);
             if touched {
                 awake.touch();
                 std::thread::sleep(Duration::from_millis(50));
