@@ -176,6 +176,12 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLD
 /// False for nil.
 bool rgfxAppleGPU(id<MTLDevice> _Nullable device);
 
+/// Whether `device` responds to gpuCoreCount (MTLDeviceSPI): only an Apple GPU's (rgfxAppleGPU)
+/// does, as the M3 Max's answers its 40 cores; the AMD Radeon Pro 5300M's and the Intel UHD 630's
+/// devices do not respond to it (measured: macOS 26.7.1, oracle_caps), so neither does an x86-64
+/// guest's. False for nil.
+bool rgfxAnswersGpuCoreCount(id<MTLDevice> _Nullable device);
+
 /// Ends the process, with the M3 Max's words, at a texture of a depth or stencil format over a
 /// buffer's bytes, by the public newTextureWithDescriptor:offset:bytesPerRow: and the linear SPI,
 /// where `device` is an Apple GPU (rgfxAppleGPU): the M3 Max under macOS 27.0.1 with no validation

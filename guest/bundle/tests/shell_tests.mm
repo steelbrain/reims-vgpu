@@ -4142,6 +4142,21 @@ void test_texture_descriptor_validation_as_the_x86_macs()
 		checkDies(c.name, c.words);
 }
 
+// gpuCoreCount is answered by an Apple GPU's device alone, as the M3 Max answers it: an arm64
+// guest's device (its Apple GPU rules) responds to it, and an x86-64 guest's, which answers no Apple
+// family, does not, as the AMD 5300M's and the Intel 630's devices do not (oracle_caps, macOS
+// 26.7.1).
+void test_gpu_core_count_is_an_apple_gpus()
+{
+	CHECK(rgfxAnswersGpuCoreCount((id<MTLDevice>)[RgfxAppleFamilyDevice new]));
+	CHECK(!rgfxAnswersGpuCoreCount(nil) && !rgfxAnswersGpuCoreCount((id<MTLDevice>)[NSObject new]));
+#if defined(__arm64__)
+	CHECK(rgfxAnswersGpuCoreCount((id<MTLDevice>)[RgfxGuestRulesDevice new]));
+#else
+	CHECK(!rgfxAnswersGpuCoreCount((id<MTLDevice>)[RgfxGuestRulesDevice new]));
+#endif
+}
+
 // On a device that answers as an Apple GPU, every texture creator ends the process at Metal's
 // descriptor validation as the M3 Max under macOS 27.0.1 ends it, and goes on at what it makes or
 // answers nil for (kAppleDescriptorCases over kDescriptorCases); the device's and a heap's
@@ -21320,6 +21335,7 @@ int main(int argc, char **argv)
 		test_invalid_texture_descriptors_end_the_process();
 		test_texture_descriptor_validation_as_the_x86_macs();
 		test_texture_descriptor_validation_as_an_apple_gpu();
+		test_gpu_core_count_is_an_apple_gpus();
 		test_invalid_surface_textures_end_the_process();
 		test_surface_textures_as_an_apple_gpu();
 		test_unalignable_linear_formats_end_the_process();

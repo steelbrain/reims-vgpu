@@ -2151,10 +2151,24 @@ RGFX_LOG_UNRECOGNIZED
 	return _caps.size(kRgfxSizeDoubleFpConfig);
 }
 
-// `unsigned int`, as Metal's (`I16@0:8`).
+// `unsigned int`, as Metal's (`I16@0:8`): the host's count, 0 where it has none, on an Apple GPU,
+// an arm64 guest's device. Elsewhere, an x86-64 guest's, the device does not respond to it
+// (rgfxAnswersGpuCoreCount), as the AMD 5300M's and the Intel 630's do not, and a call raises an
+// unrecognized selector, as it does there.
 - (unsigned int)gpuCoreCount
 {
+	if (!rgfxAnswersGpuCoreCount(self)) {
+		[self doesNotRecognizeSelector:_cmd];
+		return 0;
+	}
 	return static_cast<unsigned int>(_caps.gpuCoreCount());
+}
+
+- (BOOL)respondsToSelector:(SEL)selector
+{
+	if (selector == @selector(gpuCoreCount))
+		return rgfxAnswersGpuCoreCount(self);
+	return [super respondsToSelector:selector];
 }
 
 // As supportsTextureSampleCount: (the same for each count from 1 to 16).

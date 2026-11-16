@@ -494,6 +494,7 @@ Probe: `oracle_caps DEVICE`. Where the x86 GPUs' answers differ from the M3's or
 | `supportsTextureSampleCount:(8)` | 1 | 1 | 0 | 0 |
 | barycentrics | 1 | 0 | 1 | 1 |
 | `supportsRaytracing`, `supportsFunctionPointers`, `supportsDynamicLibraries` | 1 | 1 | 1 | 0 (lane) |
+| `gpuCoreCount` (SPI; oracle_caps 11-16, m3-max-37201 and 37202) | does not respond | does not respond | 40 | an x86-64 guest's device does not respond, and a call raises; an arm64 guest's answers the host's count, 0 where the driver has none (Intel's) |
 | `supportsPlacementSparse` | raises (not implemented) | raises | 1 | 0 |
 | sparse tile sizes | 0x0x0 | n/r | 64x64 and up | 64x64 and up |
 | families | Mac2, Common1-3, Metal3; no Apple | the same | Apple1-9, Metal4 too | as AMD |

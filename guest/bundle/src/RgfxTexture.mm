@@ -759,6 +759,11 @@ bool rgfxAppleGPU(id<MTLDevice> device)
 	       [device supportsFamily:MTLGPUFamilyApple7];
 }
 
+bool rgfxAnswersGpuCoreCount(id<MTLDevice> device)
+{
+	return rgfxAppleGPU(device);
+}
+
 bool rgfxBlockCompressedFormat(uint64_t format, id<MTLDevice> device)
 {
 	return (format >= 130 && format <= 135) || (format >= 140 && format <= 143) ||
