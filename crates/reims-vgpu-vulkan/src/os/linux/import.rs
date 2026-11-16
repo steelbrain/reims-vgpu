@@ -1198,7 +1198,10 @@ unsafe fn host_memory_noting(
                     length,
                 }]);
             }
-            if let Some(pieces) = super::dma_buf::ram_pieces(first, length, granule, alignment) {
+            let one_chunk = request.one_chunk_alignment;
+            if let Some(pieces) =
+                super::dma_buf::ram_pieces(first, length, granule, alignment, one_chunk)
+            {
                 log::debug!(
                     "{length:#x} bytes at {first:#x} as {} pieces of the guest RAM's region \
                      dma-bufs",

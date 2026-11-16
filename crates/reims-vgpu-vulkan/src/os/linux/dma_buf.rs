@@ -54,11 +54,12 @@
 //! one run of pages, made at its first piece and shared by its `Arc`, so a device that lists
 //! every import in every submission (RADV) lists one a region whatever objects lie in it. A
 //! request takes one piece where its pages are one run of the file inside one region, at an
-//! offset its alignment divides: a heap over a pages block of one run, which lies in the RAM
+//! offset its one-chunk alignment divides (the host page on RADV, whatever its granule): a heap
+//! over a pages block of one run, which lies in the RAM
 //! itself, a buffer over the RAM, a view of one run. Pages across two regions, or several runs,
-//! take a piece of each where the runtime binds several chunks (each boundary a multiple of its
-//! granule from the start, and the bytes whole granules, as a pad would be a region's other
-//! pages). Everything else, a view of scattered pages among it (4 KiB runs against RADV's 64 KiB
+//! take a piece of each where the runtime binds several chunks (each at an offset its alignment
+//! divides, each boundary a multiple of its granule from the start, and the bytes whole granules,
+//! as a pad would be a region's other pages). Everything else, a view of scattered pages among it (4 KiB runs against RADV's 64 KiB
 //! granule), takes a dma-buf of its own, as memory of the library's own and read-only pages do.
 //! The table of regions ([`REGIONS`]) holds each file weakly: the runtime's imports of it hold
 //! it, and so does each import source that answered with a piece of it, which the runtime keeps
@@ -993,12 +994,13 @@ pub(crate) struct RegionPieces {
 }
 
 /// Pieces of the guest RAM's region dma-bufs that hold the `length` bytes from `first` (whole
-/// pages) in order, as a no-copy buffer's or heap's request at `granule` and `alignment` takes
-/// them (module docs, "Regions"): each piece one run of a file's pages inside one region, at its
-/// offset in the region's dma-buf, made at the region's first piece, with a use of each region
-/// ([`RegionUse`]). `None` where a byte shows no page of the guest's RAM mapped writable, where the
-/// pieces break the request's rules (a piece at an offset its alignment does not divide; several,
-/// where a boundary between two lies off the granule, or the length is not whole granules, which
+/// pages) in order, as a no-copy buffer's or heap's request at `granule`, `alignment` and
+/// `one_chunk_alignment` takes them (module docs, "Regions"): each piece one run of a file's pages
+/// inside one region, at its offset in the region's dma-buf, made at the region's first piece, with
+/// a use of each region ([`RegionUse`]). `None` where a byte shows no page of the guest's RAM
+/// mapped writable, where the pieces break the request's rules (one piece at an offset
+/// `one_chunk_alignment` does not divide; several, where one lies at an offset `alignment` does not
+/// divide, a boundary between two lies off the granule, or the length is not whole granules, which
 /// would take a pad of other pages), or where udmabuf makes no region's dma-buf: the request is
 /// answered as before then.
 pub(crate) fn ram_pieces(
@@ -1006,8 +1008,16 @@ pub(crate) fn ram_pieces(
     length: u64,
     granule: u64,
     alignment: u64,
+    one_chunk_alignment: u64,
 ) -> Option<RegionPieces> {
-    ram_pieces_in(first, length, granule, alignment, region_bytes()?)
+    ram_pieces_in(
+        first,
+        length,
+        granule,
+        alignment,
+        one_chunk_alignment,
+        region_bytes()?,
+    )
 }
 
 /// Why [`ram_pieces`] answered none.
@@ -1038,9 +1048,17 @@ fn ram_pieces_in(
     length: u64,
     granule: u64,
     alignment: u64,
+    one_chunk_alignment: u64,
     region: u64,
 ) -> Option<RegionPieces> {
-    let answer = cut_in_regions(first, length, granule, alignment, region);
+    let answer = cut_in_regions(
+        first,
+        length,
+        granule,
+        alignment,
+        one_chunk_alignment,
+        region,
+    );
     // The trace's `rampiece`: the request's first byte, its length, the pieces answered, and
     // why none were where none were.
     let (count, why) = match &answer {
@@ -1057,6 +1075,7 @@ fn cut_in_regions(
     length: u64,
     granule: u64,
     alignment: u64,
+    one_chunk_alignment: u64,
     region: u64,
 ) -> Result<RegionPieces, NoPieces> {
     debug_assert!(region.is_power_of_two() && region.is_multiple_of(vm::page_size()));
@@ -1075,7 +1094,7 @@ fn cut_in_regions(
         }
     }
     let shape: Vec<(u64, u64)> = cut.iter().map(|&(_, _, into, n)| (into, n)).collect();
-    if !takes(&shape, length, granule, alignment) {
+    if !takes(&shape, length, granule, alignment, one_chunk_alignment) {
         return Err(NoPieces::Rules);
     }
     let device = device().map_err(|_| NoPieces::Made)?;
@@ -1102,13 +1121,24 @@ fn cut_in_regions(
 }
 
 /// Whether pieces of `shape`, each an offset in its file and a length, in order, answer a request
-/// of `length` bytes at `granule` and `alignment` as the runtime's contract allows
-/// (`metal2vulkan_runtime::DmaBufSource`): each piece at a multiple of `alignment`; one piece the
-/// request's bytes; several, every boundary between two a multiple of `granule` from the start,
-/// and the bytes whole granules, as the runtime binds several in whole granules and a pad would
-/// be a region's other pages.
-fn takes(shape: &[(u64, u64)], length: u64, granule: u64, alignment: u64) -> bool {
-    let (granule, alignment) = (granule.max(1), alignment.max(1));
+/// of `length` bytes at `granule`, `alignment` and `one_chunk_alignment` as the runtime's contract
+/// allows (`metal2vulkan_runtime::DmaBufSource`): one piece at a multiple of
+/// `one_chunk_alignment`, which the runtime binds to a plain buffer, the request's bytes; several,
+/// which it binds to a sparse buffer, each at a multiple of `alignment`, every boundary between two
+/// a multiple of `granule` from the start, and the bytes whole granules, as the runtime binds
+/// several in whole granules and a pad would be a region's other pages.
+fn takes(
+    shape: &[(u64, u64)],
+    length: u64,
+    granule: u64,
+    alignment: u64,
+    one_chunk_alignment: u64,
+) -> bool {
+    let granule = granule.max(1);
+    let alignment = match shape.len() {
+        1 => one_chunk_alignment.max(1),
+        _ => alignment.max(1),
+    };
     if shape.is_empty() || !shape.iter().all(|&(at, _)| at.is_multiple_of(alignment)) {
         return false;
     }
@@ -2222,32 +2252,74 @@ mod tests {
     }
 
     /// Pieces of every region's file the way the runtime takes them: one piece at an offset the
-    /// alignment divides; several only with each boundary on the granule and whole granules, as a
-    /// pad would be a region's other pages
+    /// one-chunk alignment divides, whatever the granule and the alignment several take; several
+    /// only each at an offset the alignment divides, with each boundary on the granule and whole
+    /// granules, as a pad would be a region's other pages
     #[test]
     fn region_pieces_keep_the_runtimes_rules() {
         let page = 0x1000;
-        // One piece: any page, where its alignment divides its offset.
-        assert!(takes(&[(3 * page, 2 * page)], 2 * page, 2 * page, page));
+        // One piece: any page, where its one-chunk alignment divides its offset.
+        assert!(takes(
+            &[(3 * page, 2 * page)],
+            2 * page,
+            2 * page,
+            page,
+            page
+        ));
         assert!(!takes(
             &[(3 * page, 2 * page)],
             2 * page,
             2 * page,
+            2 * page,
             2 * page
         ));
-        // Two pieces across a region's end: the boundary on the granule, whole granules.
-        let across = [(12 * page, 4 * page), (0, 4 * page)];
-        assert!(takes(&across, 8 * page, 4 * page, 4 * page));
+        // One piece of a request that would split at 16 pages: the page alone, as a plain buffer
+        // binds it (DmaBufRequest::one_chunk_alignment), not the sparse buffer's 16 pages.
         assert!(
-            !takes(&across, 8 * page, 8 * page, 8 * page),
+            takes(
+                &[(3 * page, 32 * page)],
+                32 * page,
+                16 * page,
+                16 * page,
+                page
+            ),
+            "one piece at the one-chunk alignment"
+        );
+        assert!(
+            !takes(
+                &[(3 * page, 32 * page)],
+                32 * page,
+                16 * page,
+                16 * page,
+                2 * page
+            ),
+            "one piece off the one-chunk alignment"
+        );
+        // Two pieces across a region's end: each at the alignment, the boundary on the granule,
+        // whole granules.
+        let across = [(12 * page, 4 * page), (0, 4 * page)];
+        assert!(takes(&across, 8 * page, 4 * page, 4 * page, page));
+        assert!(
+            !takes(&across, 8 * page, 8 * page, 8 * page, 8 * page),
             "a granule of its length"
+        );
+        assert!(
+            !takes(
+                &[(13 * page, 4 * page), (0, 4 * page)],
+                8 * page,
+                4 * page,
+                4 * page,
+                page
+            ),
+            "several, one off the alignment, though the one-chunk alignment divides it"
         );
         assert!(
             !takes(
                 &[(12 * page, 4 * page), (0, 3 * page)],
                 7 * page,
                 4 * page,
-                4 * page
+                4 * page,
+                page
             ),
             "a pad past the bytes"
         );
@@ -2256,13 +2328,14 @@ mod tests {
                 &[(13 * page, 3 * page), (0, 5 * page)],
                 8 * page,
                 4 * page,
+                page,
                 page
             ),
             "a boundary off the granule"
         );
-        assert!(!takes(&[], 0, page, page));
+        assert!(!takes(&[], 0, page, page, page));
         assert!(
-            !takes(&[(0, page)], 2 * page, page, page),
+            !takes(&[(0, page)], 2 * page, page, page, page),
             "short of the bytes"
         );
     }
@@ -2353,7 +2426,7 @@ mod tests {
         let region = 16 * page;
         let ram = TestRam::new(32);
         let made = || REGIONS_MADE.load(Ordering::Relaxed);
-        let one = ram_pieces_in(ram.at, page, page, page, region).unwrap();
+        let one = ram_pieces_in(ram.at, page, page, page, page, region).unwrap();
         let file = Arc::clone(&one.chunks[0].file);
         keep_regions(&d.raw, refs_of(&one));
         if region_of(&file) != Some((1, 1)) {
@@ -2366,7 +2439,7 @@ mod tests {
         }
         keep_regions(&d.raw, refs_of(&one));
         assert_eq!(region_of(&file), Some((1, 1)), "kept once a device");
-        let two = ram_pieces_in(ram.at + page, page, page, page, region).unwrap();
+        let two = ram_pieces_in(ram.at + page, page, page, page, page, region).unwrap();
         assert_eq!(region_of(&file), Some((2, 1)));
         drop((one, two));
         assert_eq!(region_of(&file), Some((0, 1)), "kept past its last use");
@@ -2375,7 +2448,7 @@ mod tests {
         assert!(gone.is_empty(), "lingering still");
         assert_eq!(next, Some(since + LINGER_NS));
         let before = made();
-        let three = ram_pieces_in(ram.at + 2 * page, page, page, page, region).unwrap();
+        let three = ram_pieces_in(ram.at + 2 * page, page, page, page, page, region).unwrap();
         assert!(
             Arc::ptr_eq(&three.chunks[0].file, &file),
             "its own dma-buf again"
@@ -2391,7 +2464,7 @@ mod tests {
         drop(file);
         assert!(held.upgrade().is_none(), "the dma-buf went with its keep");
         // A region whose last use went before the object's making returned is not kept.
-        let four = ram_pieces_in(ram.at + 17 * page, page, page, page, region).unwrap();
+        let four = ram_pieces_in(ram.at + 17 * page, page, page, page, page, region).unwrap();
         let (file, refs) = (Arc::clone(&four.chunks[0].file), refs_of(&four));
         drop(four);
         keep_regions(&d.raw, refs);
@@ -2418,8 +2491,8 @@ mod tests {
         let ram = TestRam::new(64);
         let made = || REGIONS_MADE.load(Ordering::Relaxed);
         let before = made();
-        let one = ram_pieces_in(ram.at + 2 * page, 3 * page, 3 * page, page, region).unwrap();
-        let two = ram_pieces_in(ram.at + 9 * page, page, page, page, region).unwrap();
+        let one = ram_pieces_in(ram.at + 2 * page, 3 * page, 3 * page, page, page, region).unwrap();
+        let two = ram_pieces_in(ram.at + 9 * page, page, page, page, page, region).unwrap();
         assert_eq!((one.chunks.len(), two.chunks.len()), (1, 1));
         assert!(
             Arc::ptr_eq(&one.chunks[0].file, &two.chunks[0].file),
@@ -2445,7 +2518,7 @@ mod tests {
             "the region's own pages"
         );
         assert_eq!(read_file(&one.chunks[0].file, 9 * page), 9);
-        let other = ram_pieces_in(ram.at + 17 * page, page, page, page, region).unwrap();
+        let other = ram_pieces_in(ram.at + 17 * page, page, page, page, page, region).unwrap();
         assert!(
             !Arc::ptr_eq(&one.chunks[0].file, &other.chunks[0].file),
             "another region"
@@ -2460,7 +2533,7 @@ mod tests {
             held.upgrade().is_none(),
             "the file went with its last piece"
         );
-        let again = ram_pieces_in(ram.at + 4 * page, page, page, page, region).unwrap();
+        let again = ram_pieces_in(ram.at + 4 * page, page, page, page, page, region).unwrap();
         assert_eq!(made() - before, 3, "made again");
         assert_eq!(read_file(&again.chunks[0].file, 4 * page), 4);
         drop((again, other));
@@ -2478,7 +2551,14 @@ mod tests {
         let page = vm::page_size();
         let region = 16 * page;
         let ram = TestRam::new(64);
-        let across = ram_pieces_in(ram.at + 12 * page, 8 * page, 4 * page, 4 * page, region);
+        let across = ram_pieces_in(
+            ram.at + 12 * page,
+            8 * page,
+            4 * page,
+            4 * page,
+            4 * page,
+            region,
+        );
         let across = across.expect("a piece of each region");
         assert_eq!(
             (across.chunks.len(), across.uses.len()),
@@ -2496,25 +2576,54 @@ mod tests {
         assert!(!Arc::ptr_eq(&across.chunks[0].file, &across.chunks[1].file));
         assert_eq!(read_file(&across.chunks[1].file, 3 * page), 19);
         assert!(
-            ram_pieces_in(ram.at + 12 * page, 8 * page, 8 * page, page, region).is_none(),
+            ram_pieces_in(ram.at + 12 * page, 8 * page, 8 * page, page, page, region).is_none(),
             "one chunk alone"
         );
         assert!(
-            ram_pieces_in(ram.at + 12 * page, 7 * page, 4 * page, 4 * page, region).is_none(),
+            ram_pieces_in(
+                ram.at + 12 * page,
+                7 * page,
+                4 * page,
+                4 * page,
+                4 * page,
+                region
+            )
+            .is_none(),
             "a pad past the bytes"
         );
         assert!(
-            ram_pieces_in(ram.at + 2 * page, page, page, 4 * page, region).is_none(),
+            ram_pieces_in(ram.at + 2 * page, page, page, 4 * page, 4 * page, region).is_none(),
             "off the alignment"
         );
+        // One piece of a request that would split at 4 pages, at 2 pages into its region: taken
+        // where the one-chunk alignment, a plain buffer's, divides its offset.
+        let lone = ram_pieces_in(
+            ram.at + 2 * page,
+            8 * page,
+            4 * page,
+            4 * page,
+            page,
+            region,
+        );
+        let lone = lone.expect("one piece at the one-chunk alignment");
+        assert_eq!(
+            (
+                lone.chunks.len(),
+                lone.chunks[0].offset,
+                lone.chunks[0].length
+            ),
+            (1, 2 * page, 8 * page)
+        );
+        drop(lone);
         let own = vm::allocate_aliasable(4 * page).unwrap().addr().to_u64();
         assert!(
-            ram_pieces_in(own, page, page, page, region).is_none(),
+            ram_pieces_in(own, page, page, page, page, region).is_none(),
             "memory of the library's own"
         );
         // The file's last region is cut at its end: 24 pages in regions of 16.
         let short = TestRam::new(24);
-        let tail = ram_pieces_in(short.at + 18 * page, 2 * page, 2 * page, page, region).unwrap();
+        let tail =
+            ram_pieces_in(short.at + 18 * page, 2 * page, 2 * page, page, page, region).unwrap();
         assert_eq!(tail.chunks[0].offset, 2 * page);
         // SAFETY: a dma-buf answers `SEEK_END` with its size.
         let bytes = unsafe { libc::lseek(tail.chunks[0].file.as_raw_fd(), 0, libc::SEEK_END) };
