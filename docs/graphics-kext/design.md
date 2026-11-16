@@ -2025,6 +2025,14 @@ only where no negotiation can carry it.
   device of two displays or more, and sends the event only to a guest that
   took both. The x86-64 kext takes it; the arm64e kext and the firmware
   drivers do not.
+- Bit 50, `FEATURES_HI`'s bit 18, is `DISPLAY_BOUNDS`, meaningful only with
+  `MULTI_DISPLAY` and `POINTER_OVER`: the guest tells the host each display's
+  rectangle in its desktop with the command `DISPLAY_BOUNDS`, by which the
+  host carries its captured pointer past one display's edge onto the display
+  the guest placed there ("A drag across displays", below). The device offers
+  it beside the two, only on a device of two displays or more, and carries
+  the pointer past an edge only for a guest that took all three. The x86-64
+  kext takes it; the arm64e kext and the firmware drivers do not.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -2731,6 +2739,7 @@ named.
 | 4 | `MOVE_CURSOR` | display u32, x i32, y i32, visible u32 | none |
 | 5 | `SET_VBLANK` | display u32, enabled u32 | `COMPLETE` |
 | 8 | `SET_DISPLAY_POWER` | display u32, on u32; 0 turns the display's panel off (`DISPLAY_POWER`) | `COMPLETE` |
+| 9 | `DISPLAY_BOUNDS` | display u32, min_x i32, min_y i32, max_x i32, max_y i32, a reserved u32: the display's rectangle in the guest's desktop, in points (`DISPLAY_BOUNDS`) | none |
 
 Scanout pixels are 32-bit BGRA8 (`kIO32BGRAPixelFormat`), the one format in
 stage 2.
@@ -2984,9 +2993,11 @@ on x86-64 macOS 11 to 26 and arm64 macOS from 14). The wire's definitions are
 in `wire.rs` (`RGFX_FEATURE_MULTI_DISPLAY`, `RGFX_DISPLAYS_MAX`,
 `RGFX_SCANOUT_ROOM_ALIGN`, `RGFX_SCANOUT_STRIDE_ALIGN`); a host of two
 displays or more offers the feature (lane mmhost), and the x86-64 kext takes it
-(lane mmx86). reims-ctl's setting is built (lane mmctl), and so is the pointer
-crossing on x86-64 (lane ptrcross: `POINTER_OVER`, below); the arm64e kext, a
-lane at the end of this section, is still to build.
+(lane mmx86). reims-ctl's setting is built (lane mmctl), and so are the
+pointer crossing on x86-64 (lane ptrcross: `POINTER_OVER`, below) and a
+captured drag across displays from Linux's windows (lane dragcross:
+`DISPLAY_BOUNDS`, below); the arm64e kext, a lane at the end of this section,
+is still to build.
 
 **A device of one display is what it was.** A device has 1 to
 `RGFX_DISPLAYS_MAX` (4) displays, 1 by default, fixed when it is made. With
@@ -3152,6 +3163,17 @@ pixels of its mode, and the buttons held):
   after the cursor has shown on another display. A crossing that finds the
   ring held, full or behind answers handed over is posted at the next
   refresh of any display. A reset forgets it all.
+- **The crossing's hold.** Until the guest's cursor shows on the new display,
+  the tablet would scale a position over the display the cursor left, and a
+  position sent then lands at its mirror there: a click on display 1 at x 100
+  would land on display 0 at x 100. So once a crossing is told, the window's
+  positions for that display are held (`pointer_at` answers false, and the
+  window does not hand them to the host) until the guest's `MOVE_CURSOR`
+  shows its cursor on that display, for at most `CROSSING_HOLD_NS` (100 ms),
+  after which they go on as before, so a guest that never moves its cursor
+  loses nothing for longer. A position whose buttons changed always goes on:
+  no click or release is held or lost. The device logs, at debug, how long
+  each crossing took the guest.
 - **The x86-64 kext.** On the event, display 0's framebuffer takes the
   display's mode and its rectangle in WindowServer's global space (its
   framebuffer's `getBoundingRect`, the bounds WindowServer gave it), places the
@@ -3171,18 +3193,84 @@ pixels of its mode, and the buttons held):
   service passes over an event type it does not know (`handleEvent`'s
   default), and the option ROM's and Ambrosia's module's waits pass over every
   event but the answer they wait for.
-- **A drag stays on its display.** The click that begins a drag captures
-  input in its window, and capture holds the host's pointer over that
-  window's image (features.md, "Capture"), so a drag stays on the display it
-  began on: the guest's cursor is held there, and a window dragged toward
-  another display stays on its own. The pointer reaches another display's
-  window once capture is released (⌃⌥⌘, Ctrl+Alt+Super off macOS, or the
-  window losing the keyboard). Measured on x86-64 macOS 11.7.11, 15.8.2 and
-  26.7.2 with KWin on Wayland (lane ptrcross, potluck jobs m3-max-34847 to
-  34849, 34851 and 34870): a Finder window's title bar dragged from display
-  0's window toward display 1's moved the Finder window on display 0 alone,
-  and after Ctrl+Alt+Super the pointer into display 1's window put the
-  cursor on display 1.
+- **A drag across displays.** The click that begins a drag captures input
+  in its window, and capture holds the host's pointer over that window's
+  image (features.md, "Capture"). On a Mac with two displays, a window
+  dragged past the edge where the displays meet goes on onto the other one.
+  The host's two windows may sit anywhere on its desktop, on one screen or
+  two, in any order, so the host cannot hand the pointer from one window to
+  the other by where they lie: what decides is the guest's arrangement
+  (System Settings, Displays, Arrange). And Wayland lets no client warp the
+  pointer into another window or know where its windows lie, so the drag
+  cannot move the host's pointer across either. The drag goes on in the
+  guest's desktop instead:
+  - **The guest's arrangement.** The x86-64 kext, where it took
+    `DISPLAY_BOUNDS`, `POINTER_OVER` and `MULTI_DISPLAY`, posts
+    `DISPLAY_BOUNDS` (9, `RgfxDisplayBounds`) with each driven display's
+    rectangle in WindowServer's global space (its framebuffer's
+    `getBoundingRect`, which is the display's `CGDisplayBounds`, as lane
+    ptrcross measured), after each move of the cursor, for each display
+    whose rectangle differs from the one last told (`RgfxDisplayBounds.hpp`,
+    `ReimsGraphics::tellBounds`), and forgets them at each start. So a
+    rearrangement reaches the host with the cursor's next move. The device
+    keeps the latest of each display until a reset; it drops a rectangle of
+    no area or of a display the guest does not see.
+  - **Leaving the image.** The window, captured, with its pointer moving
+    toward an image edge and within 32 points of it (`beyond::REACH`), asks
+    the device whether a display meets the display's edge there: a point
+    half a pixel past it lies in another display's rectangle
+    (`PointerLink::adjoins`). Not at the edge alone: KWin keeps a confined
+    pointer where it was when a move would take it out of the region, so a
+    push stops short of the edge by up to a move's length (measured on KWin
+    at a scale of 1.9: a mouse pushed left at about 5 points a move stopped
+    2.6 points short of the edge and stayed there, potluck job
+    m3-max-35056, and a pointer that had to come within a point of the edge
+    never left).
+    Where one does, the pointer leaves: the window locks the host's pointer
+    where it is (SDL's relative mode: on Wayland the compositor's
+    `zwp_locked_pointer_v1`, its motion from `zwp_relative_pointer_v1`, at
+    the desktop's own acceleration, `SDL_MOUSE_RELATIVE_SYSTEM_SCALE`), and
+    each motion, scaled to the display's pixels, moves the pointer in the
+    guest's desktop from where it left (`PointerLink::away_moved`), points
+    per pixel by the display's rectangle over its scanout, so the guest's
+    cursor crosses at the edge itself.
+  - **Where it lands.** A point the rectangle of a display holds goes onto
+    that display; one no rectangle holds slides along the edge it met where
+    the move across or down alone lands on another display, else is held at
+    the display's own edge, as a Mac holds its cursor where no display meets
+    it (`device/desktop.rs`). Each position goes to its display's own window,
+    which tells the device and hands it to the host as its own pointer's
+    (`Window::pointer_from_beyond`, the bridge in
+    `crates/reims-vgpu/src/window.rs`): the crossing and its hold are the
+    uncaptured pointer's, the buttons held make the kext's move a drag, and
+    that window draws the guest's cursor, as no pointer of its own moves it.
+  - **Coming back.** A position back on the window's own display, out of
+    reach of the shared edge, ends it: the window lets the host's pointer go at the
+    guest's cursor's place in its image, and the pointer is the window's
+    again. Releasing capture (Ctrl+Alt+Super), losing the keyboard or the
+    window's end let the host's pointer go where it was held. Buttons
+    pressed and released while away go to the display the pointer is on.
+  - **Compatibility.** A guest that did not take `DISPLAY_BOUNDS` (the
+    arm64e kext, a kext built before it), or told no rectangles, keeps the
+    pointer held at the image's edge, as before; so does a compositor that
+    refuses the lock. The macOS window keeps it so too: the logic is the
+    window crate's, free of the OS (`beyond.rs`), and the SDL window on Linux
+    and Windows drives it; on macOS a captured drag stays on its display
+    (features.md). A device of one display offers no bit and sends nothing
+    new.
+  - **What QEMU sees.** Nothing new: each position is window k's pointer
+    callback, which QEMU scales over console k by the width and height it
+    gives, and the buttons are the one tablet's.
+  - **Walked** on x86-64 macOS 26.7.2, 15.8.2 and 11.7.11 at two displays,
+    with KWin on Wayland at a scale of 2.1 (lane dragcross, potluck jobs
+    m3-max-35149 to 35151), and on 26.6.1 at a scale of 1.9 (job
+    m3-max-35092). A Finder window's title bar, pressed in display 0's
+    window and pushed with a mouse past the edge display 1 meets, went onto
+    display 1, the cursor and the window, and back again, both with display
+    1 right of display 0 and, rearranged in the guest, left of it. The
+    uncaptured crossings landed where the pointer was, and the guest's
+    cursor showed on the new display 126 to 744 us after its `POINTER_OVER`
+    (medians 267 to 358 us a walk), well inside the hold.
 
 **The windows.** One window per display, as the window crate already makes
 them (`Window::new(config, port, title(port))`, `screens::screen_for_port`):
@@ -3194,7 +3282,9 @@ share a screen. In features.md:
   "Cursor" for its own display ("Pointer"'s first entry, the guest's pointer
   under the host's, waits on X1 for displays 1 and up). A capture holds the
   pointer over its own window's image, so reaching another display's window
-  takes a release (⌃⌥⌘) or a move uncaptured;
+  takes a release (⌃⌥⌘) or a move uncaptured, but for a captured pointer on
+  Linux pushed past an edge where the guest placed another display ("A drag
+  across displays");
 - "The VM is an app", the switches and "Leaving" (closing any window powers the
   VM off) are the process's;
 - the entries written for several windows were never walked with a second
