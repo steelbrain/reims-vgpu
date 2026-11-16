@@ -5751,10 +5751,10 @@ registers only once its bundle is on disk:
 - **A bundle installed later takes effect at the next boot**: a running
   WindowServer never sees a GPU appear under it. The guest's install puts the
   bundle in place and reboots.
-- **Recovery and the installer composite in software.** RgfxGate installs
-  nothing where `/System/Installation` exists, so the accelerator stays
-  unregistered there and WindowServer draws Recovery's and the installer's
-  windows on the framebuffer, at our mode. The bundle could not give them Metal
+- **x86-64's Recovery and installer composite in software.** RgfxGate's
+  x86-64 build installs nothing where `/System/Installation` exists, so the
+  accelerator stays unregistered there and WindowServer draws Recovery's and
+  the installer's windows on the framebuffer, at our mode. The bundle could not give them Metal
   anyway. Recovery's base system ships no `IOGPU.framework`, and our device
   subclasses that framework's `IOGPUMetalDevice`. Measured on the x86-64 15.4
   and 26.6.2 recovery images: neither has the framework in
@@ -5777,6 +5777,55 @@ registers only once its bundle is on disk:
   WindowServer, no type 5 user client, and WindowServer aborted at every launch
   with the screen black. With today's set, the accelerator stays unregistered
   there and the stage's progress screen draws. So the skip stays.
+- **arm64's BaseSystem draws through Metal, so the bundle goes there too.**
+  On arm64 the kernel roots from the system volume and pivots onto the paired
+  Recovery volume's `arm64eBaseSystem.dmg` on every boot
+  (`imageboot_pivot_image`). launchd's `select-boot-mode` then leaves for the
+  full system by a userspace reboot, which keeps the kernel and its kexts, or
+  stays: for FileVault's unlock (`fvunlock`: every cold start of a FileVault
+  guest, and every restart but `fdesetup authrestart`'s), for Recovery, and
+  for the obliteration boot (`eacs`). That BaseSystem ships `IOGPU.framework`
+  and Apple's GPU bundles, and its WindowServer composites with Metal only:
+  with no Metal device it aborts 30 s after it starts, in SkyLight's
+  `WSSystemCanCompositeWithMetal`, and launchd starts another, the screen
+  black (measured on 15.6.1 with no RgfxGate: four aborts in four minutes,
+  each at 30 s). So RgfxGate's arm64e build installs there as well. In the
+  BaseSystem `/Library` is a link to `System/Volumes/Data/Library` on the tmpfs
+  `rc.temporaryDataVolume` mounts from `/System/Library/Templates/Data`, whose
+  `Library/GPUBundles` carries the rootless class. The pass first checks that
+  volume takes writes (`vfs_isrdonly`, as the writes go below the VFS), then
+  writes and tags the bundle there (3.7 ms on 26.6.2), and the accelerator
+  registers as on a full system's boot.
+  - AMFI refuses all but platform code in the BaseSystem, with a fatal
+    description ("The system only allows platform binaries"). RgfxGate's
+    signature hook admits the embedded bundle's cdhashes under
+    `/Library/GPUBundles` or, as a BaseSystem's vnode path names it,
+    `/System/Volumes/Data/Library/GPUBundles`. Where it admits the bundle past
+    AMFI's refusal it drops that description: XNU's dispatcher panics on an
+    answer of 0 that leaves one set (measured on 26.6.2:
+    `mac_vnode_check_signature: MAC hook returned no error, but status is
+    claimed to be fatal`, then a reset at every boot).
+  - After that pass RgfxGate watches the Data volume (the file system of
+    `/Library/Preferences`, every 100 ms) and passes again on each one the boot
+    moves to without restarting the kernel: the full system's, once the
+    password unlocks it (`rgfx_pass.h`). The watch ends once the root is a full
+    system whose Data volume has had its pass. A boot that starts in its full
+    system has no watch: RgfxGate starts after its userspace reboot.
+  - The accelerator stays registered across the userspace reboot, so the full
+    system's WindowServer finds a GPU before that system's Data volume has had
+    its pass, and that volume can hold another build's bundle, which RgfxGate's
+    hooks do not admit. Metal reads the accelerator's `MetalPluginName` before
+    it loads the bundle (IOGPU's `+[IOGPUMetalDevice
+    registerAcceleratorService:]`, from Metal's `IOServicePublish`
+    notification on `IOAccelerator`), so that read is the order: while the
+    watch runs, each of its passes publishes the id of the root file system it
+    ended under as `RgfxGatePassRoot` on IOResources, false once the watch ends,
+    and the accelerator holds a process's read of `MetalPluginName`, alone or
+    with its other properties, made on any other root until the pass of that
+    root has ended, up to 10 s (`rgfxMetalNameWaits`). A read in the kernel,
+    and every read on a boot that starts in its full system, goes on at once.
+  - x86-64 is unchanged: its RgfxGate and ReimsGraphics binaries are
+    byte-identical to the build without these.
 - Unregistered, the accelerator refuses every user client
   (`kIOReturnNotReady`): a task can still reach it by the framebuffer's
   `IOAccelTypes` path.

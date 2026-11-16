@@ -39,8 +39,10 @@ bool cdhashIsOurs(void *fg, uint64_t offset);
 bool installHooks();
 
 // Run once at boot: wait for the Data volume, then install/replace the bundle
-// in kernel context if missing or different. No-op in the installer/Recovery.
-// It publishes the pass on IOResources as kInstallDoneKey: false from its start,
+// in kernel context if missing or different. No-op in x86-64's installer and
+// Recovery; in arm64's BaseSystem it installs into the temporary Data volume and
+// passes again on each Data volume the boot moves to (rgfx_pass.h).
+// It publishes each pass on IOResources as kInstallDoneKey: false from its start,
 // true once the pass has ended, on every path, so the accelerator registers
 // only for a bundle the pass has finished with (RgfxAccelerator.cpp, "the
 // bundle").
@@ -50,6 +52,14 @@ void startInstaller();
 // accelerator's kRgfxGateInstallDoneKey (RgfxBundlePaths.hpp), kept in step by
 // hand.
 static constexpr const char *kInstallDoneKey = "RgfxGateInstallDone";
+
+// The IOResources property arm64's watch publishes (rgfx_pass.h): from the end
+// of the BaseSystem's pass until the watch ends, the id of the root file system
+// the last pass ended under; false once the watch has ended. A boot that starts
+// in its full system has none. The accelerator holds a process's read of its
+// MetalPluginName while the property names a root other than the reader's
+// (RgfxBundlePaths.hpp, kRgfxGatePassRootKey, kept in step by hand).
+static constexpr const char *kPassRootKey = "RgfxGatePassRoot";
 
 // Rename `from` onto `to` below the vn_* MAC layer (RgfxGateInstall.cpp). With
 // swap, both must exist and are exchanged atomically (VFS_RENAME_SWAP);

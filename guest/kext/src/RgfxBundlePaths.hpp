@@ -71,4 +71,24 @@ inline bool rgfxBundleRegisters(RgfxGatePass gate, bool ours, bool framebuffer)
 	return gate != kRgfxGateInstalling && ours && framebuffer;
 }
 
+// The IOResources property arm64's RgfxGate publishes while it watches the Data volumes a boot that
+// started in its BaseSystem moves to (guest/rgfxgate, RgfxGate.hpp's kPassRootKey and rgfx_pass.h,
+// kept in step by hand): the id of the root file system its last pass ended under, then false
+// once the watch has ended. A boot that starts in its full system, and x86-64, have none.
+#define kRgfxGatePassRootKey "RgfxGatePassRoot"
+
+// Whether a process's read of the accelerator's MetalPluginName waits: RgfxGate's watch runs
+// (`watching`, its property a root's id, `passRoot`) and the root the reader is on (`root`, where
+// there is one, `haveRoot`) is not the one its last pass ended under. A boot that leaves arm64's
+// BaseSystem for its full system keeps the kernel, and the accelerator the BaseSystem's pass
+// registered, so the full system's WindowServer finds a registered accelerator before its own
+// Data volume has had a pass; that volume may hold another build's bundle, which RgfxGate's
+// hooks do not admit. Metal reads the name before it loads the bundle, so holding the read
+// until the pass for the reader's root has ended keeps every load after that pass.
+inline bool rgfxMetalNameWaits(bool watching, unsigned long long passRoot, bool haveRoot,
+                               unsigned long long root)
+{
+	return watching && haveRoot && passRoot != root;
+}
+
 #endif // RGFX_BUNDLE_PATHS_HPP_

@@ -15,6 +15,8 @@
 #include <IOKit/graphics/IOGraphicsInterfaceTypes.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
+#include <sys/mount.h>
+#include <sys/proc.h>
 #include <sys/vnode.h>
 
 #include "RgfxAccelTypes.hpp"
@@ -90,6 +92,12 @@ struct KeptOps {
 // settling connection waits up to kGatePassWaitMs for a pass under way; one still under way then
 // leaves the accelerator unregistered for the boot. Without RgfxGate there is no property, and
 // the check registers for what it finds.
+//
+// On arm64 every boot starts in the paired recoveryOS's BaseSystem, and one that stays there
+// (FileVault's unlock, Recovery) registers the accelerator for the bundle RgfxGate's pass puts
+// into the BaseSystem's temporary Data volume. Leaving for the full system keeps the kernel and
+// the registration, so there a process's read of MetalPluginName waits for RgfxGate's pass of the
+// full system's Data volume instead (holdMetalName).
 namespace {
 // How often the check repeats until the bundle is found or WindowServer settles it.
 constexpr UInt32 kBundleCheckMs = 100;
@@ -321,6 +329,84 @@ void RgfxAccelerator::settleBundle()
 	     waited++)
 		IOSleep(1);
 }
+
+#if defined(__arm64e__)
+namespace {
+// How long a process's read of MetalPluginName waits for RgfxGate's pass of its root, and how
+// often it looks.
+constexpr UInt32 kMetalNameHoldMs = 10000;
+constexpr UInt32 kMetalNameLookMs = 10;
+
+// The root file system's id (RgfxGate's rootId, RgfxGateInstall.cpp, kept in step by hand); false
+// before there is a root.
+bool rootId(unsigned long long *id)
+{
+	vnode_t root = vfs_rootvnode();
+	if (!root)
+		return false;
+	mount_t mp = vnode_mount(root);
+	struct vfsstatfs *st = mp ? vfs_statfs(mp) : nullptr;
+	if (st)
+		*id = (static_cast<unsigned long long>(static_cast<uint32_t>(st->f_fsid.val[0])) << 32) |
+		      static_cast<uint32_t>(st->f_fsid.val[1]);
+	vnode_put(root);
+	return st != nullptr;
+}
+
+// Whether a read of MetalPluginName on the current root waits (rgfxMetalNameWaits), from
+// RgfxGate's property on IOResources and the root.
+bool metalNameWaits()
+{
+	IOService *resources = IOService::getResourceService();
+	OSObject *value = resources ? resources->copyProperty(kRgfxGatePassRootKey) : nullptr;
+	OSNumber *number = OSDynamicCast(OSNumber, value);
+	const bool watching = number != nullptr;
+	const unsigned long long passRoot = number ? number->unsigned64BitValue() : 0;
+	if (value)
+		value->release();
+	unsigned long long root = 0;
+	const bool haveRoot = watching && rootId(&root);
+	return rgfxMetalNameWaits(watching, passRoot, haveRoot, root);
+}
+
+bool isMetalName(const char *key)
+{
+	return key && !strcmp(key, "MetalPluginName");
+}
+
+// A boot that starts in arm64's BaseSystem (FileVault's unlock, Recovery) registers the
+// accelerator there, once RgfxGate's pass has put the bundle into the BaseSystem's temporary Data
+// volume. The unlock then leaves for the full system by a userspace reboot that keeps the kernel,
+// and the accelerator stays registered: the full system's WindowServer finds it at once, while
+// RgfxGate's pass of the full system's Data volume, whose bundle may be another build's, has not
+// run yet. Metal reads MetalPluginName before it loads the bundle the name names, so a process's
+// read waits here, with no lock held, until the pass of its root has ended (RgfxGate publishes the
+// root each pass ends under), up to kMetalNameHoldMs. A read in the kernel, and every read on a
+// boot that starts in its full system, where RgfxGate publishes no root, goes on at once.
+void holdMetalName(const char *what)
+{
+	if (proc_selfpid() == 0 || !metalNameWaits())
+		return;
+	UInt32 waited = 0;
+	bool waits = true;
+	while (waits && waited < kMetalNameHoldMs) {
+		IOSleep(kMetalNameLookMs);
+		waited += kMetalNameLookMs;
+		waits = metalNameWaits();
+	}
+	char name[64] = {};
+	proc_selfname(name, sizeof(name));
+	if (waits)
+		IOLog("RgfxAccelerator: %s (pid %d) read %s on a root RgfxGate's pass has not reached in "
+		      "%u ms: answered without it\n",
+		      name, proc_selfpid(), what, waited);
+	else
+		IOLog("RgfxAccelerator: %s (pid %d) read %s on a root RgfxGate's pass had not reached: "
+		      "held %u ms, until the pass ended\n",
+		      name, proc_selfpid(), what, waited);
+}
+} // namespace
+#endif
 
 // MARK: - Registers
 
@@ -930,27 +1016,56 @@ void RgfxAccelerator::ringDoorbell(UInt32 ringId)
 	writeRegister(RGFX_REG_DOORBELL, ringId);
 }
 
-#if RGFX_FB_TRACE
-// MARK: - Trace: the properties processes read
+#if RGFX_FB_TRACE || defined(__arm64e__)
+// MARK: - The properties processes read
+//
+// A trace build logs them. On arm64 a read of MetalPluginName waits for RgfxGate's pass of the
+// reader's root first (holdMetalName, "the bundle").
 
 OSObject *RgfxAccelerator::copyProperty(const OSSymbol *aKey) const
 {
+#if defined(__arm64e__)
+	if (aKey && isMetalName(aKey->getCStringNoCopy()))
+		holdMetalName("MetalPluginName");
+#endif
 	OSObject *o = super::copyProperty(aKey);
+#if RGFX_FB_TRACE
 	rgfxTracePropertyRead("accel", aKey ? aKey->getCStringNoCopy() : nullptr, o != nullptr);
+#endif
 	return o;
 }
 
 OSObject *RgfxAccelerator::copyProperty(const OSString *aKey) const
 {
+#if defined(__arm64e__)
+	if (aKey && isMetalName(aKey->getCStringNoCopy()))
+		holdMetalName("MetalPluginName");
+#endif
 	OSObject *o = super::copyProperty(aKey);
+#if RGFX_FB_TRACE
 	rgfxTracePropertyRead("accel", aKey ? aKey->getCStringNoCopy() : nullptr, o != nullptr);
+#endif
 	return o;
 }
 
 OSObject *RgfxAccelerator::copyProperty(const char *aKey) const
 {
+#if defined(__arm64e__)
+	if (isMetalName(aKey))
+		holdMetalName("MetalPluginName");
+#endif
 	OSObject *o = super::copyProperty(aKey);
+#if RGFX_FB_TRACE
 	rgfxTracePropertyRead("accel", aKey, o != nullptr);
+#endif
 	return o;
+}
+#endif
+
+#if defined(__arm64e__)
+bool RgfxAccelerator::serializeProperties(OSSerialize *s) const
+{
+	holdMetalName("its properties");
+	return super::serializeProperties(s);
 }
 #endif

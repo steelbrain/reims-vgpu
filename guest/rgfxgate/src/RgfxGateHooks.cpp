@@ -42,6 +42,11 @@ static constexpr size_t kAllowedCount = 1;
 
 // The directory every install write stays under (the SIP-restricted path).
 static const char kGpuBundlesDir[] = "/Library/GPUBundles";
+#if defined(__arm64e__)
+// The same directory as a vnode's path names it in arm64's BaseSystem, where /Library is a
+// symbolic link to the temporary Data volume's Library, not a firmlink (rgfx_pass.h).
+static const char kGpuBundlesDataDir[] = "/System/Volumes/Data/Library/GPUBundles";
+#endif
 
 bool cdhashIsOurs(void *fg, uint64_t offset) {
 	if (gCsfgGetCdhash == nullptr || fg == nullptr)
@@ -54,7 +59,8 @@ bool cdhashIsOurs(void *fg, uint64_t offset) {
 extern "C" thread_t current_thread(void);
 extern "C" int vn_getpath(struct vnode *vp, char *pathbuf, int *len);
 
-// True when vp's path is under /Library/GPUBundles. Used to pin both the
+// True when vp's path is under /Library/GPUBundles (on arm64 also under its
+// BaseSystem's form of that path, kGpuBundlesDataDir). Used to pin both the
 // install writes and the signature-trust exemption to the installed bundle's
 // own directory, so neither is granted anywhere else on the system.
 static bool vnodeUnderBundles(vnode_t vp) {
@@ -64,7 +70,11 @@ static bool vnodeUnderBundles(vnode_t vp) {
 	int len = (int)sizeof(path);
 	if (vn_getpath(vp, path, &len) != 0)
 		return false;
+#if defined(__arm64e__)
+	return rgfx_path_under(path, kGpuBundlesDir) || rgfx_path_under(path, kGpuBundlesDataDir);
+#else
 	return rgfx_path_under(path, kGpuBundlesDir);
+#endif
 }
 
 #if defined(__arm64e__)

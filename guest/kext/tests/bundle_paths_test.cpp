@@ -55,6 +55,19 @@ int main()
 	CHECK(!rgfxBundleRegisters(kRgfxGateInstalling, true, false));
 	CHECK(!rgfxBundleRegisters(kRgfxGateDone, false, false));
 	CHECK(!std::strcmp(kRgfxGateInstallDoneKey, "RgfxGateInstallDone"));
+	// A read of MetalPluginName waits only while RgfxGate's watch runs and its last pass ended
+	// under another root than the reader's: the full system's root, just after FileVault's unlock
+	// left the BaseSystem whose pass registered the accelerator.
+	const unsigned long long baseRoot = 0x1000000041ull, fullRoot = 0x1000000013ull;
+	CHECK(rgfxMetalNameWaits(true, baseRoot, true, fullRoot));
+	CHECK(!rgfxMetalNameWaits(true, fullRoot, true, fullRoot));
+	CHECK(!rgfxMetalNameWaits(true, baseRoot, true, baseRoot));
+	// No watch (a boot that starts in its full system, the watch over, no RgfxGate): no wait.
+	CHECK(!rgfxMetalNameWaits(false, baseRoot, true, fullRoot));
+	CHECK(!rgfxMetalNameWaits(false, 0, true, fullRoot));
+	// No root to compare: no wait.
+	CHECK(!rgfxMetalNameWaits(true, baseRoot, false, 0));
+	CHECK(!std::strcmp(kRgfxGatePassRootKey, "RgfxGatePassRoot"));
 	std::printf("bundle_paths_test: OK (%d checks)\n", checks);
 	return 0;
 }

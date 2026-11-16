@@ -659,12 +659,18 @@ public:
 	// lock of the framebuffer's held.
 	void scanoutOwnerMoved(task_t owner);
 
-#if RGFX_FB_TRACE
-	// A trace build logs the properties processes read of the accelerator.
+#if RGFX_FB_TRACE || defined(__arm64e__)
+	// A trace build logs the properties processes read of the accelerator. On arm64 a process's
+	// read of MetalPluginName, alone or with the other properties, waits for RgfxGate's pass of
+	// the root it is on (RgfxAccelerator.cpp, "the bundle"; RgfxBundlePaths.hpp,
+	// rgfxMetalNameWaits).
 	using IOAccelerator::copyProperty;
 	OSObject *copyProperty(const OSSymbol *aKey) const override;
 	OSObject *copyProperty(const OSString *aKey) const override;
 	OSObject *copyProperty(const char *aKey) const override;
+#endif
+#if defined(__arm64e__)
+	bool serializeProperties(OSSerialize *s) const override;
 #endif
 
 private:

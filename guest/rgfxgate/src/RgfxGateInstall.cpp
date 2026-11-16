@@ -16,17 +16,24 @@
 // place without a rewrite. The staging writes are admitted by the vnode hooks
 // (RgfxGateHooks.cpp) only while gInstalling is set on this thread and the
 // target is under the bundle path; the tags, the renames and the removes run
-// below the MAC layer, as the directory creates do. In the installer/Recovery
-// the kext does nothing. The pass is published on IOResources from its start to
-// its end (RgfxGate.hpp), and the accelerator registers only once it has ended.
+// below the MAC layer, as the directory creates do. In x86-64's installer and
+// Recovery the kext does nothing. In arm64's BaseSystem (FileVault's unlock,
+// Recovery, the obliteration boots) it installs the bundle into the BaseSystem's
+// temporary Data volume, then passes again on each Data volume the boot moves to
+// without restarting the kernel (rgfx_pass.h). The pass is published on
+// IOResources from its start to its end (RgfxGate.hpp), and the accelerator
+// registers only once it has ended.
 #include "RgfxGateFile.hpp"
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
+#include <kern/clock.h>
 #include <kern/thread.h>
+#include <libkern/c++/OSNumber.h>
 #include <libkern/libkern.h>
 #include <mach/thread_act.h>
 #include <sys/fcntl.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/dirent.h>
 #include <sys/uio.h>
@@ -38,6 +45,7 @@
 #include "RgfxGatePrefs.hpp"
 #include "RgfxGateVnop.hpp"
 #include "rgfx_match.h"
+#include "rgfx_pass.h"
 #include "rgfx_tree.h"
 
 namespace rgfxgate {
@@ -555,6 +563,14 @@ static inline void recordInstallState(const char *state, const char *reason) {
 #define recordInstallState(state, reason) ((void)0)
 #endif
 
+// Whether this build installs into a base system's Data volume (rgfx_pass.h):
+// arm64e's BaseSystem draws through Metal, x86-64's Recovery and installer do not.
+#if defined(__arm64e__)
+static constexpr bool kInstallsInBaseSystem = true;
+#else
+static constexpr bool kInstallsInBaseSystem = false;
+#endif
+
 static void doInstall() {
 	vfs_context_t ctx = vfs_context_create(nullptr);
 	if (ctx == nullptr) {
@@ -562,13 +578,35 @@ static void doInstall() {
 		return;
 	}
 
-	// Installer/Recovery: do nothing.
+	// A base system (rgfx_pass.h): x86-64's installer and Recovery, where nothing
+	// is written; arm64's BaseSystem, where the bundle goes into its temporary
+	// Data volume.
 	vnode_t inst = nullptr;
 	if (vnode_lookup("/System/Installation", 0, &inst, ctx) == 0) {
 		vnode_put(inst);
-		recordInstallState("skipped", "installer or Recovery environment");
-		vfs_context_rele(ctx);
-		return;
+		if (rgfx_pass_kind(true, kInstallsInBaseSystem) == kRgfxPassSkip) {
+			recordInstallState("skipped", "installer or Recovery environment");
+			vfs_context_rele(ctx);
+			return;
+		}
+#if defined(__arm64e__)
+		// The install writes below the VFS, which skips its read-only check (lessons.md): the
+		// volume /Library resolves to, the BaseSystem's Data volume, must be one that takes
+		// writes, its temporary one.
+		vnode_t lib = nullptr;
+		bool writable = vnode_lookup("/Library", 0, &lib, ctx) == 0;
+		if (writable) {
+			writable = !vfs_isrdonly(vnode_mount(lib));
+			vnode_put(lib);
+		}
+		if (!writable) {
+			graft_client_log(kClientID, "BaseSystem: its Data volume is read-only; no install");
+			recordInstallState("skipped", "the BaseSystem's Data volume is read-only");
+			vfs_context_rele(ctx);
+			return;
+		}
+#endif
+		graft_client_log(kClientID, "BaseSystem: the bundle goes into its temporary Data volume");
 	}
 
 #if defined(__arm64e__)
@@ -640,6 +678,120 @@ static void publishPass(bool done) {
 	IOService::publishResource(kInstallDoneKey, done ? kOSBooleanTrue : kOSBooleanFalse);
 }
 
+#if defined(__arm64e__)
+// The wall-clock time, for log lines read beside launchd's.
+static void logAt(const char *what) {
+	clock_sec_t secs = 0;
+	clock_usec_t usecs = 0;
+	clock_get_calendar_microtime(&secs, &usecs);
+	graft_client_log(kClientID, "%s at %lu.%06u", what, (unsigned long)secs, (unsigned)usecs);
+}
+
+// Whether the root is a base system: the pass's own test (doInstall).
+static bool inBaseSystem() {
+	vfs_context_t ctx = vfs_context_create(nullptr);
+	if (ctx == nullptr)
+		return false;
+	vnode_t vp = nullptr;
+	bool base = vnode_lookup("/System/Installation", 0, &vp, ctx) == 0;
+	if (base)
+		vnode_put(vp);
+	vfs_context_rele(ctx);
+	return base;
+}
+
+// The Data volume /Library/Preferences is on, by its file system's id; false where that
+// directory is not there.
+static bool dataVolumeId(uint64_t *id) {
+	vfs_context_t ctx = vfs_context_create(nullptr);
+	if (ctx == nullptr)
+		return false;
+	vnode_t vp = nullptr;
+	bool have = false;
+	if (vnode_lookup("/Library/Preferences", 0, &vp, ctx) == 0) {
+		mount_t mp = vnode_mount(vp);
+		struct vfsstatfs *st = mp != nullptr ? vfs_statfs(mp) : nullptr;
+		if (st != nullptr) {
+			*id = (static_cast<uint64_t>(static_cast<uint32_t>(st->f_fsid.val[0])) << 32) |
+			      static_cast<uint32_t>(st->f_fsid.val[1]);
+			have = true;
+		}
+		vnode_put(vp);
+	}
+	vfs_context_rele(ctx);
+	return have;
+}
+
+// The root file system's id, as the accelerator reads it to hold a read of its MetalPluginName
+// (RgfxAccelerator.cpp, rootId, kept in step by hand); false before there is a root.
+static bool rootId(uint64_t *id) {
+	vnode_t root = vfs_rootvnode();
+	if (root == nullptr)
+		return false;
+	mount_t mp = vnode_mount(root);
+	struct vfsstatfs *st = mp != nullptr ? vfs_statfs(mp) : nullptr;
+	if (st != nullptr)
+		*id = (static_cast<uint64_t>(static_cast<uint32_t>(st->f_fsid.val[0])) << 32) |
+		      static_cast<uint32_t>(st->f_fsid.val[1]);
+	vnode_put(root);
+	return st != nullptr;
+}
+
+// Publishes the root the pass that just ran ended under (RgfxGate.hpp, kPassRootKey), before the
+// pass itself is published as ended: from then on a read of the accelerator's MetalPluginName on
+// that root goes on, where one on any other root waits for its own pass.
+static void publishPassRoot() {
+	uint64_t root = 0;
+	if (!rootId(&root))
+		return;
+	OSNumber *n = OSNumber::withNumber(root, 64);
+	if (n == nullptr)
+		return;
+	IOService::publishResource(kPassRootKey, n);
+	n->release();
+}
+
+// How often the watch looks for the next Data volume.
+static constexpr uint32_t kDataWatchMs = 100;
+
+// After a pass in arm64's BaseSystem, the boot leaves it by a userspace reboot that keeps the
+// kernel, and with it this kext and the accelerator the bundle registered: to the full system
+// once FileVault's password unlocks its Data volume, where WindowServer loads the bundle from
+// that volume's /Library/GPUBundles, or to another BaseSystem, whose rc.temporaryDataVolume
+// makes a new temporary Data volume, without the bundle. So each Data volume the boot moves to
+// gets a pass of its own, published as the first was: the full system's bundle is then the
+// kext's, as on a boot that starts there. The accelerator stays registered across that reboot,
+// so what orders the full system's WindowServer after the pass is the root each pass publishes
+// (publishPassRoot): Metal reads the accelerator's MetalPluginName before it loads the bundle,
+// and the accelerator holds a read made on a root no pass has ended under yet. The watch ends
+// once the root is a full system whose Data volume has had its pass (rgfx_pass.h), and says so
+// with the property's false.
+static void watchDataVolumes(uint64_t last) {
+	for (;;) {
+		IOSleep(kDataWatchMs);
+		uint64_t id = 0;
+		const bool have = dataVolumeId(&id);
+		const bool base = inBaseSystem();
+		if (rgfx_watch_passes(have, id, last)) {
+			last = id;
+			logAt(base ? "a new Data volume in the BaseSystem: the pass again"
+			           : "the full system's Data volume: the pass again");
+			publishPass(false);
+			doInstall();
+			publishPassRoot();
+			publishPass(true);
+			keepVideoPreference();
+			logAt("the pass ended");
+		}
+		if (rgfx_watch_ends(base, have, id, last)) {
+			IOService::publishResource(kPassRootKey, kOSBooleanFalse);
+			logAt("the full system's Data volume has had its pass: the watch ends");
+			return;
+		}
+	}
+}
+#endif
+
 static void installEntry(void *, wait_result_t) {
 	// Wait for the Data volume to mount, then install. /Library/Preferences only
 	// exists once Data is up, so waiting on it (rather than /Library, a firmlink
@@ -673,15 +825,34 @@ static void installEntry(void *, wait_result_t) {
 	}
 	if (ctx)
 		vfs_context_rele(ctx);
+#if defined(__arm64e__)
+	// The Data volume the first pass runs on, and whether the watch follows it.
+	uint64_t firstData = 0;
+	const bool watch = ready && dataVolumeId(&firstData) &&
+	                   rgfx_pass_kind(inBaseSystem(), kInstallsInBaseSystem) ==
+	                       kRgfxPassInstallThenWatch;
+	if (watch)
+		logAt("BaseSystem: the pass");
+#endif
 	if (ready)
 		doInstall();
 	else {
 		graft_client_log(kClientID, "Data volume never appeared; no install");
 		recordInstallState("refused", "Data volume never mounted");
 	}
+#if defined(__arm64e__)
+	if (watch)
+		publishPassRoot();
+#endif
 	publishPass(true);
 	if (ready)
 		keepVideoPreference();
+#if defined(__arm64e__)
+	if (watch) {
+		logAt("the pass ended");
+		watchDataVolumes(firstData);
+	}
+#endif
 	thread_terminate(current_thread());
 }
 

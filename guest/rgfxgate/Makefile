@@ -6,7 +6,8 @@
 #
 #   make BUNDLE_DIR=<signed reims-graphics.bundle dir>   build/RgfxGate.kext
 #   make test                                            native tests of the matching and preference logic,
-#                                                        the tree removal, and when the payload is made again
+#                                                        the tree removal, the pass's decisions, and when
+#                                                        the payload is made again
 #   make clean
 #
 # BUNDLE_DIR is the signed bundle to embed; packaging reads its cdhash with
@@ -82,7 +83,7 @@ $(BUILD)/obj/RgfxGateHooks.o: src/RgfxGateHooks.cpp src/RgfxGate.hpp src/rgfx_ma
 	@mkdir -p $(BUILD)/obj
 	xcrun --sdk macosx clang++ $(CXXFLAGS) -c $< -o $@
 
-$(BUILD)/obj/RgfxGateInstall.o: src/RgfxGateInstall.cpp src/RgfxGate.hpp src/RgfxGatePrefs.hpp src/RgfxGateFile.hpp src/rgfx_tree.h $(PAYLOAD)
+$(BUILD)/obj/RgfxGateInstall.o: src/RgfxGateInstall.cpp src/RgfxGate.hpp src/RgfxGatePrefs.hpp src/RgfxGateFile.hpp src/rgfx_tree.h src/rgfx_pass.h $(PAYLOAD)
 	@mkdir -p $(BUILD)/obj
 	xcrun --sdk macosx clang++ $(CXXFLAGS) -c $< -o $@
 
@@ -115,6 +116,8 @@ test:
 	$(BUILD)/obj/gva_pref_test
 	xcrun --sdk macosx clang++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/tree_test.cpp -o $(BUILD)/obj/tree_test
 	$(BUILD)/obj/tree_test
+	xcrun --sdk macosx clang++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/pass_test.cpp -o $(BUILD)/obj/pass_test
+	$(BUILD)/obj/pass_test
 	bash tests/payload_test.sh $(BUILD)/payload-test
 
 clean:

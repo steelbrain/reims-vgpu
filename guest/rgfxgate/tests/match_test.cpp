@@ -42,6 +42,15 @@ int main() {
 	assert(!rgfx_path_under("/Library", root));
 	assert(!rgfx_path_under(nullptr, root));
 	assert(!rgfx_path_under("/Library/GPUBundles", ""));
+	// arm64's BaseSystem names the bundle by its temporary Data volume's path
+	// (RgfxGateHooks.cpp, kGpuBundlesDataDir): under that form, not under the
+	// firmlinked one, and a sibling of it is not under it.
+	const char *dataRoot = "/System/Volumes/Data/Library/GPUBundles";
+	const char *dataExec = "/System/Volumes/Data/Library/GPUBundles/reims-graphics.bundle/Contents/MacOS/reims-graphics";
+	assert(rgfx_path_under(dataExec, dataRoot));
+	assert(!rgfx_path_under(dataExec, root));
+	assert(!rgfx_path_under("/System/Volumes/Data/Library/GPUBundlesX/x", dataRoot));
+	assert(!rgfx_path_under("/System/Volumes/Data/Library/Extensions/x.bundle", dataRoot));
 
 	// --- staging sibling path -----------------------------------------------
 	const char *bundle = "/Library/GPUBundles/reims-graphics.bundle";
