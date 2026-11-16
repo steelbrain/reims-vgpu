@@ -19,11 +19,11 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 /// What reims-ctl tells a host it runs no VMs on, for a create or a start there.
-pub const UNSUPPORTED: &str = "reims-ctl runs VMs on Linux x86-64 hosts, and makes arm64 VMs from \
-                               an IPSW on arm64 Macs and arm64 Linux";
+pub const UNSUPPORTED: &str = "reims-ctl runs VMs on Linux and Windows x86-64 hosts, and \
+                               makes arm64 VMs from an IPSW on arm64 Macs and arm64 Linux";
 
 /// What reims-ctl tells an arm64 host of the work only x86-64 VMs have (GPUs, USB devices).
-pub const X86_64_ONLY: &str = "that's for x86-64 VMs, which run on Linux x86-64 hosts";
+pub const X86_64_ONLY: &str = "that's for x86-64 VMs, which run on Linux and Windows x86-64 hosts";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Os {

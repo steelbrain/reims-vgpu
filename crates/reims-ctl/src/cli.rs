@@ -151,6 +151,9 @@ pub enum Cmd {
         qemu: Option<PathBuf>,
         #[arg(long, default_value = "")]
         commit: String,
+        /// The bash that ran the install, which `update` runs it in again: on Windows, MSYS2's.
+        #[arg(long)]
+        shell: Option<PathBuf>,
     },
 }
 
@@ -641,12 +644,18 @@ pub fn main(cli: Cli) -> Result<i32> {
         Cmd::Doctor => return doctor(host),
         Cmd::Tui => unreachable!(),
         Cmd::VulkanProbe => return Ok(gpu::probe_main()),
-        Cmd::RecordInstall { repo, qemu, commit } => {
+        Cmd::RecordInstall {
+            repo,
+            qemu,
+            commit,
+            shell,
+        } => {
             install::Install {
                 repo: repo.clone(),
                 commit,
                 qemu: qemu.unwrap_or_default(),
                 installed_at: runtime::now_stamp("%Y-%m-%d %H:%M:%S %z"),
+                shell: shell.unwrap_or_default(),
             }
             .save()?;
             // What makes a new x86-64 VM's OpenCore image and installer, and on any host one

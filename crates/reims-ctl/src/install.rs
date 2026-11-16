@@ -27,6 +27,14 @@ pub struct Install {
     pub qemu: PathBuf,
     #[serde(default)]
     pub installed_at: String,
+    /// The bash that runs the install script on Windows, MSYS2's (`os::install_script`); empty
+    /// elsewhere, where `bash` is on PATH.
+    #[serde(default, skip_serializing_if = "is_empty")]
+    pub shell: PathBuf,
+}
+
+fn is_empty(p: &Path) -> bool {
+    p.as_os_str().is_empty()
 }
 
 impl Install {
@@ -271,6 +279,90 @@ mod tests {
         assert_eq!(left, [&builds[0], &builds[2], &builds[3], &builds[4]]);
     }
 
+    /// On Windows the installer's prune removes no build while a QEMU runs from the QEMU
+    /// directory, as reims-ctl starts it, through `qemu/current`, a junction there: Windows names
+    /// a running program by the path it started from, which a newer build then took. With none
+    /// running it keeps the newest three.
+    #[cfg(windows)]
+    #[test]
+    fn the_installers_prune_keeps_every_build_while_a_qemu_runs_on_windows() {
+        let dir = std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR: run the tests with cargo");
+        let script = Path::new(&dir).join("../../scripts/install-ctl.sh");
+        let text = std::fs::read_to_string(&script).unwrap();
+        let functions: String = ["qemu_executables", "prune_qemu"]
+            .iter()
+            .map(|f| script_function(&text, f))
+            .collect();
+        let root = std::env::temp_dir().join(format!("reims-ctl-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let qemu = root.join("qemu");
+        let builds = [
+            "20260101-000000-a",
+            "20260102-000000-b",
+            "20260103-000000-c",
+            "20260104-000000-d",
+            "20260105-000000-e",
+        ];
+        for b in &builds {
+            std::fs::create_dir_all(qemu.join(b).join("bin")).unwrap();
+        }
+        let bin = "bin/qemu-system-test.exe";
+        std::fs::copy(
+            std::env::current_exe().unwrap(),
+            qemu.join(builds[2]).join(bin),
+        )
+        .unwrap();
+        let current = qemu.join("current");
+        let link = |b: &str| {
+            let _ = std::process::Command::new("cmd")
+                .args(["/c", "rmdir"])
+                .arg(&current)
+                .output();
+            let made = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(&current)
+                .arg(qemu.join(b))
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "{made:?}");
+        };
+        link(builds[2]);
+        let mut running = std::process::Command::new(current.join(bin))
+            .args(["--exact", "install::tests::idle_as_a_qemu"])
+            .env("REIMS_CTL_TEST_IDLE", "1")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        link(builds[4]);
+        let prune = || {
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!(
+                    "set -euo pipefail\nWINDOWS=1\n{functions}prune_qemu \"$(cygpath -u \"$1\")\""
+                ))
+                .arg("prune")
+                .arg(&qemu)
+                .env("MSYSTEM", "CLANG64")
+                .status()
+        };
+        let pruned_running = prune();
+        let left_running: Vec<_> = builds.iter().filter(|b| qemu.join(b).exists()).collect();
+        let _ = running.kill();
+        let _ = running.wait();
+        let pruned = prune();
+        let left: Vec<_> = builds.iter().filter(|b| qemu.join(b).exists()).collect();
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", "rmdir"])
+            .arg(&current)
+            .output();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(pruned_running.unwrap().success());
+        assert_eq!(left_running, builds.iter().collect::<Vec<_>>());
+        assert!(pruned.unwrap().success());
+        assert_eq!(left, [&builds[2], &builds[3], &builds[4]]);
+    }
+
     /// The installer's --skip-qemu keeps the installed QEMU: with none installed it ends at
     /// once, before it builds or installs anything, saying what to do, as it does on an arm64
     /// host, which has no QEMU. On a host reims-ctl has no VMs for (an Intel Mac) it ends before
@@ -288,13 +380,18 @@ mod tests {
             .arg("--skip-qemu")
             .env("XDG_DATA_HOME", root.join("data"))
             .env("XDG_CACHE_HOME", root.join("cache"))
+            // On Windows the script runs in MSYS2's CLANG64 shell, which builds QEMU there.
+            .env("MSYSTEM", "CLANG64")
             .stdin(std::process::Stdio::null())
             .output()
             .unwrap();
         let _ = std::fs::remove_dir_all(&root);
         let err = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(1), "{err}");
-        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        if cfg!(all(
+            any(target_os = "linux", windows),
+            target_arch = "x86_64"
+        )) {
             assert!(
                 err.contains("--skip-qemu keeps the installed QEMU, and none is installed")
                     && err.contains("run this without --skip-qemu, which builds it"),

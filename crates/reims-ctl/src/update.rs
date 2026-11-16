@@ -94,16 +94,15 @@ pub fn update(channel: Option<Channel>) -> Result<Outcome> {
     if !script.is_file() {
         bail!("{} is missing: was the checkout moved?", script.display());
     }
-    let mut bash = Command::new("bash");
+    let mut bash = crate::os::install_script(&i.shell, &script)?;
     for v in GIT_REPOSITORY_ENV {
         bash.env_remove(v);
     }
     let status = bash
-        .arg(&script)
         .arg("--update")
         .current_dir(&i.repo)
         .status()
-        .context("run bash")?;
+        .with_context(|| format!("run {}", bash.get_program().to_string_lossy()))?;
     if !status.success() {
         bail!("the update failed (exit {})", status.code().unwrap_or(-1));
     }
@@ -235,6 +234,7 @@ pub(crate) fn git_command(repo: &Path) -> Command {
     for v in GIT_REPOSITORY_ENV {
         c.env_remove(v);
     }
+    crate::os::no_glob(&mut c);
     c
 }
 
@@ -396,6 +396,7 @@ mod tests {
             commit: commit.into(),
             qemu,
             installed_at: String::new(),
+            shell: PathBuf::new(),
         };
         let first = short();
         assert_eq!(

@@ -270,6 +270,18 @@ pub fn exec(mut cmd: Command) -> io::Error {
     cmd.exec()
 }
 
+/// The command that runs the install script `script`, scripts/install-ctl.sh: `bash`, from PATH,
+/// as its `#!/usr/bin/env bash` would. The install records no shell here.
+pub fn install_script(_shell: &Path, script: &Path) -> Result<Command> {
+    let mut c = Command::new("bash");
+    c.arg(script);
+    Ok(c)
+}
+
+/// Nothing: on Windows this keeps an MSYS2 program from expanding wildcards in the arguments
+/// reims-ctl gives it, which a Unix program never does itself.
+pub fn no_glob(_c: &mut Command) {}
+
 /// Runs `cmd` in the terminal to its end, as system(3) runs a command: Ctrl+C and Ctrl+\ reach
 /// the terminal's whole foreground process group, so this process ignores them until `cmd`
 /// exits, and `cmd` gets them as it would from a shell.

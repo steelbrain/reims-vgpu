@@ -385,6 +385,43 @@ pub fn exec(cmd: Command) -> io::Error {
     }
 }
 
+/// The command that runs the install script `script`, scripts/install-ctl.sh: `shell`, the
+/// MSYS2 bash the install ran in, by its path (a `bash` on PATH can be WSL's), as a login shell
+/// of MSYS2's CLANG64, whose PATH has CLANG64's clang, in the directory it starts in
+/// (`CHERE_INVOKING`). The script's path has `/` for `\`: the script finds its checkout with
+/// `dirname`, which splits at `/` alone.
+pub fn install_script(shell: &Path, script: &Path) -> Result<Command> {
+    if shell.as_os_str().is_empty() {
+        anyhow::bail!(
+            "the install record names no MSYS2 bash to run {} in: install again with \
+             scripts\\install.ps1",
+            script.display()
+        );
+    }
+    let mut c = Command::new(shell);
+    c.arg("-l")
+        .arg(script.to_string_lossy().replace('\\', "/"))
+        .env("MSYSTEM", "CLANG64")
+        .env("CHERE_INVOKING", "1");
+    no_glob(&mut c);
+    Ok(c)
+}
+
+/// Keeps `c`, where it is an MSYS2 program (MSYS2's git, its bash), from expanding wildcards
+/// and braces in its arguments, which MSYS2's runtime does for a program a Windows program
+/// starts, as a shell would: `@{u}` reached MSYS2's git as `@u`. `noglob` in `MSYS` turns that
+/// off; a Windows program ignores it.
+pub fn no_glob(c: &mut Command) {
+    let mut msys = std::env::var("MSYS").unwrap_or_default();
+    if !msys.split_whitespace().any(|w| w == "noglob") {
+        if !msys.is_empty() {
+            msys.push(' ');
+        }
+        msys.push_str("noglob");
+    }
+    c.env("MSYS", msys);
+}
+
 /// Runs `cmd` in the console to its end. Ctrl+C and Ctrl+Break reach every process attached to
 /// the console, so this one takes them as handled until `cmd` exits, and `cmd` gets them as it
 /// would from a shell: a handler is not inherited, as ignoring them would be.
@@ -740,6 +777,34 @@ pub fn set_at_interrupt(flag: &'static std::sync::atomic::AtomicBool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An update runs the install script in the MSYS2 bash the install recorded, as a CLANG64
+    /// login shell, the script's path with `/` for `\`, and with no wildcard expansion; a record
+    /// that names no bash stops it, saying what to do.
+    #[test]
+    fn the_install_script_runs_in_the_recorded_msys2_bash() {
+        let c = install_script(
+            Path::new("C:\\msys64\\usr\\bin\\bash.exe"),
+            Path::new("C:\\Users\\u\\reims-vgpu\\scripts\\install-ctl.sh"),
+        )
+        .unwrap();
+        assert_eq!(c.get_program(), "C:\\msys64\\usr\\bin\\bash.exe");
+        let args: Vec<_> = c.get_args().collect();
+        assert_eq!(args, ["-l", "C:/Users/u/reims-vgpu/scripts/install-ctl.sh"]);
+        let env = |k: &str| {
+            c.get_envs()
+                .find(|(n, _)| *n == k)
+                .and_then(|(_, v)| v)
+                .map(|v| v.to_string_lossy().into_owned())
+        };
+        assert_eq!(env("MSYSTEM").as_deref(), Some("CLANG64"));
+        assert_eq!(env("CHERE_INVOKING").as_deref(), Some("1"));
+        assert!(env("MSYS").unwrap().split(' ').any(|w| w == "noglob"));
+        let e = install_script(Path::new(""), Path::new("C:\\r\\scripts\\install-ctl.sh"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("install again with scripts\\install.ps1"), "{e}");
+    }
 
     /// A stamp is strftime's for its fields, the offset as `+hhmm`, and the seconds since 1970
     /// count the calendar's days.

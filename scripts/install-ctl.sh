@@ -7,7 +7,9 @@
 #
 # Linux on x86-64 (Ubuntu or Debian, Arch or CachyOS; other distributions get
 # the list of what to install), where the library runs on Vulkan and VMs run;
-# and arm64 Macs and arm64 Linux (Ubuntu or Debian, Arch, Fedora), where
+# Windows on x86-64, in MSYS2's CLANG64 shell, whose clang builds the library
+# and QEMU (QEMU builds on Windows only with MinGW), where VMs run on the
+# Windows Hypervisor Platform; and arm64 Macs and arm64 Linux (Ubuntu or Debian, Arch, Fedora), where
 # reims-ctl makes arm64 VMs by restoring macOS from an IPSW, which runs no
 # QEMU: there it installs reims-ctl alone (step 4). It:
 #   1. checks the build's dependencies, and offers to install those missing
@@ -97,15 +99,31 @@ case "$OS/$ARCH" in
       --enable-libusb --enable-spice)
     QEMU_BINARY=qemu-system-x86_64
     ;;
+  MINGW*/x86_64 | MSYS*/x86_64)
+    [[ ${MSYSTEM:-} == CLANG64 ]] || die "on Windows, run this in MSYS2's CLANG64 shell (\"MSYS2 CLANG64\" in the Start menu), whose clang builds the library and QEMU; this is its ${MSYSTEM:-MSYS} shell"
+    PLATFORM=windows-x86_64
+    # WHPX, the Windows Hypervisor Platform, in place of KVM; the binaries in
+    # the prefix's bin, as reims-ctl runs them (qemu/current/bin).
+    QEMU_CONFIGURE=(--target-list=x86_64-softmmu --enable-whpx --disable-sdl --enable-gtk --enable-slirp
+      --enable-libusb --bindir=bin)
+    QEMU_BINARY=qemu-system-x86_64.exe
+    ;;
   Darwin/arm64 | Linux/aarch64) BUILDS_QEMU=0 ;;
-  *) die "reims-ctl runs VMs on Linux x86-64 hosts, and makes arm64 VMs from an IPSW on arm64 Macs and arm64 Linux; this is $OS on $ARCH" ;;
+  *) die "reims-ctl runs VMs on Linux and Windows x86-64 hosts, and makes arm64 VMs from an IPSW on arm64 Macs and arm64 Linux; this is $OS on $ARCH" ;;
 esac
+# WINDOWS: in MSYS2 on Windows, whose own HOME is not the user's profile, where
+# reims-ctl keeps its files (%USERPROFILE%, as rustup and cargo do).
+WINDOWS=0 USER_HOME=$HOME
+if [[ ${PLATFORM:-} == windows-* ]]; then
+  WINDOWS=1 USER_HOME="$(cygpath -u "$USERPROFILE")"
+fi
 
 # The XDG directory VAR names, else ~/FALLBACK: ignored unless absolute (as
 # reims-ctl does).
 xdg() { # VAR FALLBACK
   local v="${!1:-}"
-  if [[ $v == /* ]]; then printf '%s' "$v"; else printf '%s' "$HOME/$2"; fi
+  [[ $WINDOWS == 1 && $v == [A-Za-z]:* ]] && v="$(cygpath -u "$v")"
+  if [[ $v == /* ]]; then printf '%s' "$v"; else printf '%s' "$USER_HOME/$2"; fi
 }
 DATA="$(xdg XDG_DATA_HOME .local/share)/reims-ctl"
 CACHE="$(xdg XDG_CACHE_HOME .cache)/reims-ctl"
@@ -215,6 +233,11 @@ pacman_pkgs=(base-devel git curl python ninja pkgconf flex bison bzip2 cmake
   libx11 libxext libxrandr libxcursor libxi libxfixes libxss libxtst libxkbcommon
   wayland libdecor mesa libdrm dbus systemd-libs gtk3)
 dnf_pkgs=()
+# Windows: MSYS2's own git and curl, and CLANG64's clang and lld, which build the
+# library (x86_64-pc-windows-gnullvm) and QEMU, QEMU's build tools and the
+# libraries it links.
+msys2_pkgs=(git curl diffutils
+  mingw-w64-clang-x86_64-{clang,lld,pkgconf,meson,ninja,cmake,python,glib2,pixman,libslirp,gtk3,libusb,zstd})
 if [[ $BUILDS_QEMU == 0 ]]; then
   # reims-ctl alone, for arm64 Linux: a C compiler and linker for Rust's
   # builds, git, and curl for rustup. Fedora is Asahi Linux's own distribution.
@@ -224,6 +247,16 @@ if [[ $BUILDS_QEMU == 0 ]]; then
 fi
 case "$OS $distro_id $distro_like " in
   Darwin*) ;;
+  MINGW* | MSYS*)
+    for p in "${msys2_pkgs[@]}"; do
+      pacman -Qq "$p" >/dev/null 2>&1 || missing+=("$p")
+    done
+    if ((${#missing[@]})); then
+      say "Missing packages: ${missing[*]}"
+      ask "Install them with pacman?" || die "install them (pacman -S --needed ${missing[*]}), then run this again"
+      pacman -S --needed --noconfirm "${missing[@]}"
+    fi
+    ;;
   *" debian "* | *" ubuntu "*)
     for p in "${apt_pkgs[@]}"; do
       dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'install ok installed' || missing+=("$p")
@@ -263,9 +296,15 @@ case "$OS $distro_id $distro_like " in
     warn "$distro_id is neither Debian/Ubuntu nor Arch/CachyOS: install the equivalents of these Ubuntu packages yourself if the build stops: ${apt_pkgs[*]}"
     ;;
 esac
-# The rest of the host's checks are for the VMs it runs: KVM, the library's
+# On Windows, VMs run on the Windows Hypervisor Platform, an optional feature of
+# Windows: Win32_OptionalFeature's InstallState is 1 where it is on.
+if [[ $WINDOWS == 1 ]]; then
+  whp="$(powershell -NoProfile -Command "(Get-CimInstance Win32_OptionalFeature -Filter \"Name='HypervisorPlatform'\").InstallState" 2>/dev/null | tr -d '\r')"
+  [[ $whp == 1 ]] || warn "the Windows Hypervisor Platform is off, and VMs run on it: turn it on in Windows Features (run optionalfeatures, tick Windows Hypervisor Platform), then restart Windows"
+fi
+# The rest of the host's checks are for the VMs Linux runs: KVM, the library's
 # GPU access to the guest's memory, and USB passthrough.
-if [[ $BUILDS_QEMU == 1 ]]; then
+if [[ $BUILDS_QEMU == 1 && $WINDOWS == 0 ]]; then
   if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
     warn "/dev/kvm is not usable by you: enable virtualization in the firmware and add yourself to the kvm group (sudo usermod -aG kvm \$USER; log in again), or VMs will not start"
   fi
@@ -361,7 +400,12 @@ fi
 # home, so they come first on PATH here: a shell that sourced no Cargo env has none on it, and
 # another cargo found first, a distribution's (Arch's rust, which its cargo-nextest pulls in),
 # builds with its own release.
-CARGO_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
+CARGO_BIN="${CARGO_HOME:-$USER_HOME/.cargo}/bin"
+[[ $WINDOWS == 1 ]] && CARGO_BIN="$(cygpath -u "$CARGO_BIN")"
+# On Windows, rustup's host is x86_64-pc-windows-gnullvm, whose builds link with
+# CLANG64's clang, so the build needs no Visual Studio.
+RUSTUP_ARGS=()
+[[ $WINDOWS == 1 ]] && RUSTUP_ARGS=(--default-host x86_64-pc-windows-gnullvm)
 if [[ -x "$CARGO_BIN/rustup" ]]; then
   export PATH="$CARGO_BIN:$PATH"
 fi
@@ -373,9 +417,9 @@ if ! command -v rustup >/dev/null 2>&1; then
   fi
   ask "Install rustup from https://rustup.rs?" || die "install rustup (https://rustup.rs), then run this again"
   if [[ $YES == 1 ]]; then
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y ${RUSTUP_ARGS[@]+"${RUSTUP_ARGS[@]}"}
   else
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- ${RUSTUP_ARGS[@]+"${RUSTUP_ARGS[@]}"}
   fi
   export PATH="$CARGO_BIN:$PATH"
 fi
@@ -414,6 +458,12 @@ fi
 # from, where its command line, and ps, show only qemu/current, through which
 # reims-ctl runs QEMU, and which a new build moves.
 qemu_executables() {
+  if [[ ${WINDOWS:-0} == 1 ]]; then
+    # Windows' own list, as MSYS2 paths: there is no /proc/PID/exe for a Windows program.
+    powershell -NoProfile -Command '(Get-CimInstance Win32_Process).ExecutablePath' 2>/dev/null |
+      tr -d '\r' | grep . | cygpath -u -f - 2>/dev/null || true
+    return 0
+  fi
   readlink /proc/[0-9]*/exe 2>/dev/null || true
 }
 
@@ -423,6 +473,11 @@ prune_qemu() {
   local real in_use old
   real="$(cd "$1" && pwd -P)"
   in_use="$(qemu_executables)"
+  # Windows names a running QEMU's executable by the path it started from,
+  # qemu/current's, not the build behind it: while one runs from DIR, none goes.
+  if [[ ${WINDOWS:-0} == 1 ]] && grep -qiF "$real/" <<<"$in_use"; then
+    return 0
+  fi
   ls -1d "$1/"[0-9]*/ 2>/dev/null | sort -r | tail -n +4 | while read -r old; do
     old="${old%/}"
     grep -qF "$real/${old##*/}/" <<<"$in_use" || rm -rf "$old"
@@ -494,14 +549,37 @@ if [[ $BUILDS_QEMU == 1 && $SKIP_QEMU == 0 ]]; then
   ninja -C "$BUILD" || { rm -f "$BUILD/configured-with"; die "QEMU's build stopped; the next run configures it again"; }
   STAGE="$CACHE/qemu-stage"
   rm -rf "$STAGE"
-  DESTDIR="$STAGE" ninja -C "$BUILD" install >/dev/null
+  if [[ $WINDOWS == 1 ]]; then
+    # QEMU's meson, a Windows program, gets the prefix as MSYS2 hands it a path,
+    # under MSYS2's own folder (C:/msys64/reims-ctl-qemu), which the stage holds
+    # without its drive.
+    DESTDIR="$(cygpath -w "$STAGE")" ninja -C "$BUILD" install >/dev/null
+    staged="$(find "$STAGE" -path "*/bin/$QEMU_BINARY" -print -quit)"
+    [[ -n $staged ]] || die "QEMU's install has no bin/$QEMU_BINARY"
+    PREFIX="${staged%/bin/*}" PREFIX="${PREFIX#"$STAGE"}"
+    # The CLANG64 DLLs QEMU and qemu-img load, copied beside them: reims-ctl
+    # starts QEMU outside MSYS2, and an update of MSYS2's packages then changes
+    # no build a VM runs.
+    for exe in "$QEMU_BINARY" qemu-img.exe; do
+      ldd "$STAGE$PREFIX/bin/$exe" | awk '$3 ~ "^/clang64/" { print $3 }'
+    done | sort -u | while read -r dll; do cp "$dll" "$STAGE$PREFIX/bin/"; done
+  else
+    DESTDIR="$STAGE" ninja -C "$BUILD" install >/dev/null
+  fi
   [[ -x "$STAGE$PREFIX/bin/$QEMU_BINARY" ]] || die "QEMU's install has no bin/$QEMU_BINARY"
   "$STAGE$PREFIX/bin/$QEMU_BINARY" -device help 2>/dev/null | grep -q '"reims-graphics-pci"' || die "QEMU's install has no reims-graphics-pci: was it configured with reims-vgpu?"
   ID="$(date +%Y%m%d-%H%M%S)-$COMMIT"
   mkdir -p "$DATA/qemu"
   mv "$STAGE$PREFIX" "$DATA/qemu/$ID"
   rm -rf "$STAGE"
-  ln -sfn "$ID" "$DATA/qemu/current"
+  if [[ $WINDOWS == 1 ]]; then
+    # A junction, which needs no administrator, where MSYS2's ln -s copies.
+    current="$(cygpath -w "$DATA/qemu/current")"
+    [[ -e "$DATA/qemu/current" || -L "$DATA/qemu/current" ]] && cmd //c rmdir "$current"
+    cmd //c mklink //J "$current" "$(cygpath -w "$DATA/qemu/$ID")" >/dev/null
+  else
+    ln -sfn "$ID" "$DATA/qemu/current"
+  fi
   prune_qemu "$DATA/qemu"
   QEMU_DIR="$DATA/qemu/$ID"
 elif [[ $BUILDS_QEMU == 1 ]]; then
@@ -516,8 +594,18 @@ fi
 say "Installing reims-ctl (cargo install)"
 (cd "$ROOT" && CARGO_TARGET_DIR="$CACHE/ctl-target" cargo install --locked --force --quiet --path crates/reims-ctl)
 BIN="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin/reims-ctl"
+if [[ $WINDOWS == 1 ]]; then
+  BIN="$(cygpath -u "${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$USER_HOME/.cargo}}")/bin/reims-ctl.exe"
+fi
 [[ -x "$BIN" ]] || die "cargo install left no $BIN"
-"$BIN" __record-install --repo "$ROOT" ${QEMU_DIR:+--qemu "$QEMU_DIR"} --commit "$COMMIT"
+if [[ $WINDOWS == 1 ]]; then
+  # reims-ctl, a Windows program, takes Windows paths; its update runs this
+  # script in this bash.
+  "$BIN" __record-install --repo "$(cygpath -w "$ROOT")" ${QEMU_DIR:+--qemu "$(cygpath -w "$QEMU_DIR")"} \
+    --commit "$COMMIT" --shell "$(cygpath -w "$BASH")"
+else
+  "$BIN" __record-install --repo "$ROOT" ${QEMU_DIR:+--qemu "$QEMU_DIR"} --commit "$COMMIT"
+fi
 
 echo
 printf '%sreims-ctl is installed.%s\n' "$green$bold" "$off"
@@ -529,6 +617,12 @@ fi
 echo "  reims-ctl help       the same from a shell"
 [[ -z $QEMU_DIR ]] || echo "  QEMU                 $QEMU_DIR"
 echo
+if [[ $WINDOWS == 1 ]]; then
+  # rustup put cargo's bin on the user's PATH, which a new window has.
+  echo "Check this host, in a new PowerShell or Windows Terminal window:"
+  echo "  reims-ctl doctor"
+  exit 0
+fi
 # By its full path, which works before PATH finds reims-ctl.
 echo "Check this host:"
 printf '  %q doctor\n' "$BIN"
