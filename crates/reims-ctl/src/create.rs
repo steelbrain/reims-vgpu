@@ -1437,12 +1437,12 @@ mod tests {
         )
         .unwrap_err();
         // It names the log where it is kept, not in the directory that went.
-        let kept = paths::tilde(&env.root.join("cache/reims-ctl/restore/logs/t"));
+        let kept = paths::tilde(&restore::logs_dir().join("t").join(restore::LOG));
         assert_eq!(
             format!("{e:#}"),
             format!(
-                "the restore failed: its log is {kept}/restore.log: Apple's TSS doesn't sign \
-                 this build for VirtualMac2,1\nThe restore's log is kept in {kept}/restore.log"
+                "the restore failed: its log is {kept}: Apple's TSS doesn't sign this build for \
+                 VirtualMac2,1\nThe restore's log is kept in {kept}"
             )
         );
         assert!(!dir.exists());
