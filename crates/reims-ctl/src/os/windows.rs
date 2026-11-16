@@ -344,7 +344,8 @@ pub fn may_be_qemu(pid: i32) -> bool {
 /// closing the terminal does not end it, in a process group of its own, and out of this
 /// process's job where the job lets it go (`CREATE_BREAKAWAY_FROM_JOB`), as one an SSH login
 /// runs in, which ends its processes when the login does. Windows keeps nothing of a process
-/// that ended for its parent to collect.
+/// that ended for its parent to collect. `cmd` is given its own standard handles: this
+/// process's are not inherited ([`without_inherited_stdio`]).
 pub fn spawn_detached(mut cmd: Command) -> io::Result<()> {
     use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::Threading::{
@@ -352,14 +353,49 @@ pub fn spawn_detached(mut cmd: Command) -> io::Result<()> {
     };
     let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
     cmd.creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB);
-    match cmd.spawn() {
+    without_inherited_stdio(|| match cmd.spawn() {
         // A job that keeps its processes refuses the breakaway.
         Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
             cmd.creation_flags(flags);
             cmd.spawn().map(drop)
         }
         r => r.map(drop),
+    })
+}
+
+/// Runs `f` with this process's standard handles made uninheritable, then puts them back as they
+/// were. A new process inherits every inheritable handle of its parent, whatever standard handles
+/// it is given, so a detached QEMU would hold the pipe `reims-ctl start | tee` writes to, and
+/// the reader would wait for the VM to end.
+fn without_inherited_stdio<T>(f: impl FnOnce() -> T) -> T {
+    use windows_sys::Win32::Foundation::{
+        GetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    let mut inheritable = Vec::new();
+    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: the process's own standard handles, which stay open; flags are read into a u32.
+        unsafe {
+            let h = GetStdHandle(id);
+            let mut flags = 0u32;
+            if !h.is_null()
+                && h != INVALID_HANDLE_VALUE
+                && GetHandleInformation(h, &mut flags) != 0
+                && flags & HANDLE_FLAG_INHERIT != 0
+                && SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) != 0
+            {
+                inheritable.push(h);
+            }
+        }
     }
+    let r = f();
+    for h in inheritable {
+        // SAFETY: as above.
+        unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
+    }
+    r
 }
 
 /// The ways a stop ends a QEMU that QMP's `quit` did not: TerminateProcess. Windows has no
@@ -777,6 +813,48 @@ pub fn set_at_interrupt(flag: &'static std::sync::atomic::AtomicBool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A detached process holds no handle of this one's standard output: a reader of the pipe
+    /// that output is sees its end once this process closes it, not once the detached one ends.
+    #[test]
+    fn a_detached_process_holds_no_pipe_of_this_ones_output() {
+        use std::io::Read;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE, SetStdHandle};
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        // SAFETY: the pipe's write end, open until `writer` drops; this process's standard
+        // output is put back before then. nextest runs each test in a process of its own.
+        let stdout = unsafe {
+            SetHandleInformation(
+                writer.as_raw_handle(),
+                HANDLE_FLAG_INHERIT,
+                HANDLE_FLAG_INHERIT,
+            );
+            let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+            SetStdHandle(STD_OUTPUT_HANDLE, writer.as_raw_handle());
+            stdout
+        };
+        let mut sleeper = Command::new("cmd");
+        sleeper
+            .args(["/c", "ping -n 6 127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let spawned = spawn_detached(sleeper);
+        // SAFETY: as above.
+        unsafe { SetStdHandle(STD_OUTPUT_HANDLE, stdout) };
+        drop(writer);
+        spawned.unwrap();
+        let t = std::time::Instant::now();
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(3),
+            "{:?}",
+            t.elapsed()
+        );
+    }
 
     /// An update runs the install script in the MSYS2 bash the install recorded, as a CLANG64
     /// login shell, the script's path with `/` for `\`, and with no wildcard expansion; a record
