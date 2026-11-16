@@ -1673,6 +1673,10 @@ fn doctor(host: Host) -> Result<i32> {
                 },
             );
         }
+        // The Windows Hypervisor Platform, the GPUs, the sound devices and the desktop, for the
+        // x86-64 VMs Windows runs.
+        #[cfg(windows)]
+        crate::host::Os::Windows if profile == Profile::Q35X86_64 => windows_checks(&mut line),
         crate::host::Os::Linux
         | crate::host::Os::Mac
         | crate::host::Os::Windows
@@ -1701,6 +1705,60 @@ fn doctor(host: Host) -> Result<i32> {
         }
     }
     Ok(if bad == 0 { 0 } else { 1 })
+}
+
+/// doctor's checks of a Windows host, each a `line`.
+#[cfg(windows)]
+fn windows_checks(line: &mut dyn FnMut(bool, &str, String)) {
+    let whpx = crate::os::whpx_present();
+    line(
+        whpx == Some(true),
+        "hypervisor platform",
+        match whpx {
+            Some(true) => "on, with a hypervisor running".into(),
+            Some(false) => "on, but it answers that no hypervisor runs: turn virtualization \
+                            (VT-x or AMD-V) on in the PC's firmware settings"
+                .into(),
+            None => "off, and VMs need it: run scripts\\install.ps1, or turn on Windows \
+                     Hypervisor Platform in Windows Features (optionalfeatures), then restart"
+                .into(),
+        },
+    );
+    let gpus = gpu::list();
+    line(
+        !gpus.is_empty(),
+        "vulkan",
+        if gpus.is_empty() {
+            "no GPU found: install your GPU's own driver, whose Vulkan the VMs use".into()
+        } else {
+            gpus.iter()
+                .map(|g| g.label())
+                .collect::<Vec<_>>()
+                .join("; ")
+        },
+    );
+    let sound = crate::os::sound_devices();
+    line(
+        true,
+        "sound",
+        match (sound.output, sound.input) {
+            (true, true) => "an output device and a recording device".into(),
+            (true, false) => "no recording device (a microphone): VMs record silence".into(),
+            (false, _) => "no output device: VMs run without sound".into(),
+        },
+    );
+    let desktop = crate::host::has_screen(&Default::default());
+    line(
+        desktop,
+        "desktop",
+        if desktop {
+            "a signed-in desktop, where a VM's window opens".into()
+        } else {
+            "this is no signed-in desktop's session (a service's or an SSH login's): a VM's \
+             window opens only on one"
+                .into()
+        },
+    );
 }
 
 /// `n` of `what`: 1 device, 2 devices.

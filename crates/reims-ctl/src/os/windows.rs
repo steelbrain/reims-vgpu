@@ -443,6 +443,41 @@ pub fn install_script(shell: &Path, script: &Path) -> Result<Command> {
     Ok(c)
 }
 
+/// Whether the Windows Hypervisor Platform answers that a hypervisor runs, as QEMU's WHPX asks it
+/// (`WHvGetCapability`, `WHvCapabilityCodeHypervisorPresent`); None where the platform's DLL,
+/// WinHvPlatform.dll, is missing, as it is until the feature is turned on. The DLL is loaded
+/// here, not linked: a binary that imports it does not start without it.
+pub fn whpx_present() -> Option<bool> {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+    };
+    type GetCapability =
+        unsafe extern "system" fn(u32, *mut core::ffi::c_void, u32, *mut u32) -> i32;
+    let name: Vec<u16> = "WinHvPlatform.dll\0".encode_utf16().collect();
+    // SAFETY: a NUL-terminated name; the module stays loaded for the process's life.
+    let module = unsafe {
+        LoadLibraryExW(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    };
+    if module.is_null() {
+        return None;
+    }
+    // SAFETY: a NUL-terminated name in a loaded module.
+    let f = unsafe { GetProcAddress(module, c"WHvGetCapability".as_ptr().cast()) }?;
+    // SAFETY: WinHvPlatform.h's signature of WHvGetCapability.
+    let get: GetCapability = unsafe { std::mem::transmute(f) };
+    // WHV_CAPABILITY, a union whose first member, HypervisorPresent, is a BOOL; the buffer has
+    // room for the union's largest member.
+    let mut buf = [0u8; 256];
+    let mut written = 0u32;
+    // SAFETY: the buffer and its size, and a u32 for what was written.
+    let hr = unsafe { get(0, buf.as_mut_ptr().cast(), buf.len() as u32, &mut written) };
+    Some(hr >= 0 && u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) != 0)
+}
+
 /// Whether Windows has a sound output device and a recording device, as waveOut and waveIn count
 /// them. QEMU's DirectSound opens the default of each as it starts.
 pub fn sound_devices() -> super::SoundDevices {

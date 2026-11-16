@@ -942,7 +942,7 @@ as `waveOutGetNumDevs` and `waveInGetNumDevs` do at each start
 (`qemu::sound_routing`): with no recording device the input device,
 `audioin`, gets an audiodev of its own, `none`, and the guest records
 silence; with no output device the VM's sound is all `none`. The start
-says so.
+says so, and `doctor` says which devices there are.
 
 ## x86-64 macOS guests
 
