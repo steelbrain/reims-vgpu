@@ -5,7 +5,7 @@
 //! bytes between it and the surface's pages only where IOSurface's locking asks it to, as a Mac's
 //! GPU does: one of its own memory in that memory, and an Intel GPU, which shares the CPU's, in a
 //! copy of its own too, written into the pages at a CPU lock after a GPU write (**measured** on a
-//! MacBook Pro's UHD 630 under macOS 26.7, jobs m3-max-37817 and 37822). A block the kext marks
+//! MacBook Pro's UHD 630 under macOS 26.7.1, jobs m3-max-37817 and 37822). A block the kext marks
 //! cached ([`RGFX_SURFACE_PAGES_CACHED`]) gets one here, on any host; on a device that answers
 //! which blocks need one (`SURFACE_CACHE_REFUSED`, which no host offers now), only a block it
 //! answered needs one, its textures unable to lie in place over its pages

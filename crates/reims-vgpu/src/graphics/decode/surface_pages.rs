@@ -185,7 +185,9 @@
 //!
 //! [`GpuDevice::copies_guest_ram`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::copies_guest_ram
 //!
-//! **Device caches where the pages cannot serve** (`RGFX_FEATURE_SURFACE_CACHE_REFUSED`). On a
+//! **Device caches where the pages cannot serve** (`RGFX_FEATURE_SURFACE_CACHE_REFUSED`, which no
+//! device offers now: one whose GPU shares the CPU's memory offers `SURFACE_CACHE`, and caches
+//! every surface the kext caches within a budget, `super::surface_cache`, "Within a budget"). On a
 //! device whose GPU shares the CPU's memory a surface's textures lie in its pages, but not every
 //! surface's can: the platform takes its own copy of the pages instead (a shadow) where the GPU
 //! cannot place a texture over them as the guest laid them out (rows that end inside the cache

@@ -560,9 +560,10 @@ Stages:
       completion ring's `completed_seqno` reaches the buffer, whichever comes
       first. A lock still waiting after 2 s goes on with an "RGFX: WARN" line
       (`guest/kext/src/RgfxAcceleratorLocks.cpp`).
-    - **The device cache:** where the host's GPU does not share the CPU's
-      memory, the device has `RGFX_FEATURE_SURFACE_CACHE`, and a block the
-      kext marks cached (`RGFX_SURFACE_PAGES_CACHED`) gets a device cache on
+    - **The device cache:** every host that maps the surfaces' pages has
+      `RGFX_FEATURE_SURFACE_CACHE`, one whose GPU shares the CPU's memory
+      within a budget (*Device caches on a GPU that shares the CPU's memory*,
+      below), and a block the kext marks cached (`RGFX_SURFACE_PAGES_CACHED`) gets a device cache on
       the host: a Private buffer of the surface's bytes, which every buffer
       over the block is, so every texture over the surface, of any shape,
       plane or format, lies over the same bytes. The
@@ -652,9 +653,8 @@ Stages:
         texels are the kernel's zero-filled pages unless its client wrote them
         under a lock, which moves the count and has the decode's use fill the
         cache); and a host whose GPU shares
-        the CPU's memory keeps a cache only of a surface whose textures
-        cannot lie in place over its pages (below), the rest in place as
-        above.
+        the CPU's memory keeps no cache of a surface past its caches'
+        budget, which lies in place as above (below).
       - *Which surfaces are cached:* the guest's choice, and the host's
         invalidation. The bundle asks every block in place cached, of any
         planes and format, as a GPU of its own memory keeps a copy of each
@@ -668,8 +668,8 @@ Stages:
         `RGFX_VIDEO_CAPS_OUTPUT_CACHED`, item 16), its decode writing their
         pages: their textures ask under `RgfxAskUncachedScope`. A host
         whose hardware video lands pictures in device caches says the flag
-        wherever the kext makes them, on a GPU of its own memory
-        (`SURFACE_CACHE`) or one that shares the CPU's
+        wherever the kext makes them, of every surface (`SURFACE_CACHE`, on
+        every host) or of those the host answers need one
         (`SURFACE_CACHE_REFUSED`), where the outputs then ask with their
         layout as any other surface does. Correctness
         does not rest on that choice:
@@ -812,7 +812,35 @@ Stages:
         blocks fit the host's budget (`DEFERRED_BUDGET_LO` and `_HI`), held
         and dormant, and dormant ones are let go past half of it, the oldest
         first (`guest/kext/src/RgfxSurfaceBlocks.hpp`).
-    - **Device caches on a GPU that shares the CPU's memory:** there a
+    - **Device caches on a GPU that shares the CPU's memory:** such a host
+      offers `SURFACE_CACHE`, `SURFACE_DEFERRED` and `SURFACE_DEFERRED_CARRY`,
+      as a GPU of its own memory does, so the kext caches every surface it
+      asks cached and defers the fresh ones. A Mac on an Intel GPU, whose
+      GPU shares the CPU's memory, does the same: it keeps a GPU copy of
+      each IOSurface the GPU uses, in the GPU's own tiled layout, made with
+      the first texture over it, and copies it into the pages at a CPU lock
+      after a GPU write, so a surface both drawn and locked costs twice its
+      bytes (**measured** on a MacBook Pro's UHD 630 under macOS 26.7.1,
+      jobs m3-max-37817 and 37822: a 4K read-only lock after a GPU write
+      took 2.2 ms warm and 6.7 ms clocked down, and the GPU's fills of the copy ran at 1.0 to
+      1.8 times those of a Private texture, where ours over the guest's
+      pages on the Iris Xe run at 4.1 times). On the Iris, 96.5% of
+      Launchpad's GPU writes land in three compositor surfaces the CPU never
+      locks, which a cache keeps in the GPU's memory (lane tiledlock, jobs
+      m3-max-37869 and 37870). The caches are host RAM beside the guest's
+      pages there, so they fit one budget together, deferred or not: the
+      deferred blocks' budget, a quarter of the GPU's memory budget as the
+      platform answers it at the device's start. A cached block past it gets
+      no cache and lies in place in its pages, its buffers over its view, as
+      where the platform makes no cache; a deferral past it is refused, and
+      the kext names its pages (`reims-vgpu`'s `decode/surface_cache.rs`,
+      "Within a budget"). The device's summary of its caches counts the
+      blocks past the budget and the most bytes the caches held.
+
+      Before 2026-11-16 such a host offered the mode below instead, which
+      the kext and the host still carry out and no host offers now:
+      `SURFACE_CACHE_REFUSED`, a cache only of the surfaces whose pages its
+      textures could not use in place. There a
       surface's textures use its pages in place, but not every surface's
       can. The runtime makes a texture over pages it cannot place one over
       (rows that end inside the line of memory the GPU writes back whole, on
@@ -999,8 +1027,9 @@ Stages:
         the guest. The host sees a CPU write as the surface's CPU generation
         moving in the block's header (`surface_cache::cpu_generation`), the
         count the kext moves at each read-write lock in its op 2. IOSurface
-        calls op 2 only for a surface with a device cache, and a block in
-        place has none today, so the proposal gives each block in place a
+        calls op 2 only for a surface with a device cache, and a block the
+        kext names in place, not cached (on a host that offers no
+        `SURFACE_CACHE`), has none, so the proposal gives each block in place a
         device cache that copies nothing, for op 2's count alone. Whether
         such a cache changes IOSurface's lock path in any other way is to
         be checked (`RgfxIOSurfaceKPI.hpp`). A block read by N command
@@ -1947,9 +1976,10 @@ only where no negotiation can carry it.
   "Device caches on a GPU that shares the CPU's memory"). The kext asks at a
   new cacheable block in place (`RGFX_SURFACE_PAGES_ASK_CACHE`, with the
   surface's `RgfxSurfacePagesLayout` after the cache part), and posts the
-  block again cached where the host answers `RGFX_STATUS_CACHE`. A host
-  offers it where it offers `SURFACE_PAGES` and its GPU shares the CPU's
-  memory, where it offers neither `SURFACE_CACHE` nor `SURFACE_DEFERRED`.
+  block again cached where the host answers `RGFX_STATUS_CACHE`. No host
+  offers it now: one whose GPU shares the CPU's memory offers
+  `SURFACE_CACHE` and `SURFACE_DEFERRED` (Decided 14), and a host never
+  offers it beside them.
 - Bit 30 is `SURFACE_DEFERRED_ASK`, which means nothing without
   `SURFACE_CACHE_REFUSED`: a fresh surface that would need a device cache
   whatever its pages gets none until a CPU lock needs them, as under
@@ -1957,8 +1987,8 @@ only where no negotiation can carry it.
   surface's layout; the host defers only such a surface and refuses the
   rest, whose pages the kext then names asking (Decided 14, "Device caches
   on a GPU that shares the CPU's memory"). A host offers it where it offers
-  `SURFACE_CACHE_REFUSED`, with its budget in `DEFERRED_BUDGET_LO` and
-  `_HI`.
+  `SURFACE_CACHE_REFUSED` (none now), with its budget in `DEFERRED_BUDGET_LO`
+  and `_HI`.
 - Bit 32, `FEATURES_HI`'s bit 0, is `SURFACE_DEFERRED_CARRY`, which means
   nothing without `SURFACE_DEFERRED` or `SURFACE_DEFERRED_ASK`: a deferral
   may carry the few resident pages of a surface no CPU lock touched, its

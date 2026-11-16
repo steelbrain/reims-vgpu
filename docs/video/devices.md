@@ -50,9 +50,10 @@ the device info (`GraphicsDevice::with_platform`, in `graphics.rs`):
   size, kept under the 65,535 macroblocks its drivers decode: radeonsi's 4096x4096 and iHD's
   8192x8192 are answered as 4096x4080 ([bugs.md](bugs.md), U28).
 - **The flags**: `RGFX_VIDEO_CAPS_OUTPUT_CACHED` where the kext makes device caches, of every
-  surface it asks one for (`RGFX_FEATURE_SURFACE_CACHE`, a GPU of its own memory) or of those
-  whose textures would not lie in place in their pages (`RGFX_FEATURE_SURFACE_CACHE_REFUSED`, a
-  GPU that shares the CPU's memory), and the arm lands pictures in them: NVDEC by its own GPU
+  surface it asks one for (`RGFX_FEATURE_SURFACE_CACHE`, every host now, a GPU that shares the
+  CPU's memory within a budget) or of those whose textures would not lie in place in their pages
+  (`RGFX_FEATURE_SURFACE_CACHE_REFUSED`, which no host offers now), and the arm lands pictures in
+  them: NVDEC by its own GPU
   work, where CUDA imports the device's exportable buffers ([nvidia.md](nvidia.md)), the
   device's caches of surfaces of two planes (the outputs' NV12 and P010, as the layout a cached
   block's `SURFACE_PAGES` carries gives them) then made exportable as they are made, and every
