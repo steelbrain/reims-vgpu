@@ -199,12 +199,16 @@ Unset or unparsable values give the defaults below.
   pointer is, and the pointer then drives the cursor over that display.
   macOS scales the one USB tablet over the display its cursor is on, so the
   window has the guest move its cursor first (`POINTER_OVER`,
-  docs/graphics-kext/design.md, "Multiple displays"). Captured, the pointer
-  is held over its window's image (Capture), so a drag stays on the display
+  docs/graphics-kext/design.md, "Multiple displays"), and holds the
+  pointer's positions over the new display until the guest's cursor is
+  there, for at most 100 ms, so none lands on the display the cursor left; a
+  button going down or up is sent at once. Captured, the pointer is held
+  over its window's image (Capture), so on macOS a drag stays on the display
   it began on, and the pointer reaches another display's window once capture
-  is released.
-  `test: reims-vgpu::graphics::tests::displays::a_window_s_pointer_tells_the_guest_its_display_before_the_host`,
+  is released (on Linux it goes on past the edge: "On Linux").
+  `test: reims-vgpu::graphics::tests::displays::a_window_s_pointer_tells_the_guest_its_display_and_waits_for_its_cursor`,
   `test: reims-vgpu-graphics::device::tests::displays::the_pointer_over_another_display_tells_the_guest_once`,
+  `test: reims-vgpu-graphics::device::tests::displays::a_crossing_holds_the_pointer_until_the_guest_s_cursor_is_there`,
   `manual` (a VM with two displays)
 
 ## Keyboard
@@ -449,8 +453,39 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `test: native::sdl_thread::input::moves_are_sent_where_the_guest_pixel_changes`
 - With several reims-graphics displays, the pointer over a window reaches
   that window's display, as on macOS.
-  `test: reims-vgpu::graphics::tests::displays::a_window_s_pointer_tells_the_guest_its_display_before_the_host`,
+  `test: reims-vgpu::graphics::tests::displays::a_window_s_pointer_tells_the_guest_its_display_and_waits_for_its_cursor`,
+  `test: reims-vgpu-graphics::device::tests::displays::a_crossing_holds_the_pointer_until_the_guest_s_cursor_is_there`,
   `manual` (a VM with two displays)
+- With several reims-graphics displays, a captured pointer moving toward an
+  edge of the image where the guest placed another display (System
+  Settings, Displays, Arrange), within 32 points of it, goes on onto that
+  display, as a Mac's cursor does, so a drag carries a guest window across
+  with its button held. It leaves before the edge, as KWin holds a confined
+  pointer short of it, and the guest's cursor goes on from where it is. The
+  window locks the host's pointer where it was (SDL's relative mode,
+  the compositor's pointer lock on Wayland), and its motion, at the
+  desktop's own acceleration, moves the guest's cursor across the guest's
+  desktop, onto whichever display it reaches, through that display's window,
+  which draws the guest's cursor. The pointer is the window's again where it
+  comes back over the window's own display, out of reach of that edge, the
+  host's pointer let go there, over the guest's cursor. Releasing capture
+  (Ctrl+Alt+Super), losing the keyboard or closing lets the host's pointer
+  go where it was held. Where the compositor
+  refuses the lock, and with a guest that does not place its displays
+  (`DISPLAY_BOUNDS`: the arm64e kext, a kext built before it), the pointer
+  stays held at the edge, as on macOS.
+  `test: reims-vgpu::graphics::tests::displays::a_captured_pointer_past_the_shared_edge_goes_on_through_the_other_display_s_window`,
+  `test: reims-vgpu-graphics::device::tests::displays::a_pointer_past_a_shared_edge_goes_onto_the_display_there`,
+  `test: reims-vgpu-graphics::device::tests::displays::the_guest_s_arrangement_decides_which_edge_meets_which_display`,
+  `test: reims-vgpu-graphics::device::tests::displays::only_a_guest_that_placed_its_displays_carries_the_pointer_past_an_edge`,
+  `test: beyond::the_pointer_near_a_shared_edge_goes_on_onto_the_other_display`,
+  `test: beyond::letting_go_while_away_gives_the_pointer_back_where_it_was_held`,
+  `test: beyond::the_edge_is_within_reach_of_its_last_pixel`,
+  `test: native::sdl_thread::input::the_captured_pointer_at_a_shared_edge_goes_on_past_it`,
+  `test: native::sdl_thread::input::letting_go_while_away_gives_the_pointer_back_where_it_was_held`,
+  `test: handle::a_pointer_from_beyond_reaches_the_host_and_the_window_draws_the_cursor`,
+  `manual` (a VM with two displays: a Finder window dragged across and back,
+  display 1 right of display 0 and left of it)
 - Keys by position, as evdev reports them, so the guest's layout applies and
   ISO keys arrive as on a real ISO keyboard; media keys are dropped.
   `test: native::sdl_thread::keymap::scancodes_are_usb_usages`,
@@ -468,7 +503,8 @@ runtime's own device. The switches above apply, and `resolution=` too.
   on macOS: SDL's mouse rect, in whole points rounded out, which the
   compositor's pointer constraints keep on Wayland and XFixes barriers on
   X11 (where SDL has no mouse rect, its mouse grab holds the pointer in the
-  whole window); the window stays resizable, its resize edges being the
+  whole window), except past an edge where the guest placed another display
+  (Pointer, above); the window stays resizable, its resize edges being the
   compositor's, outside its surface and beyond the hold; Ctrl+Alt+Super
   releases both; losing the keyboard releases; the window's end releases
   both, and the grab and the hold go with the capture before it hides; the
