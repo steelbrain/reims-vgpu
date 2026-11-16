@@ -3297,8 +3297,9 @@ where
 }
 
 /// Each texture's `uniqueIdentifier` and `gpuResourceID` on `d`, over releases in several
-/// orders, a release while a command buffer holds the texture, a view's release, and textures
-/// placed at an index and forced to one.
+/// orders, a release while a command buffer holds the texture (in flight, waiting on a shared
+/// event that is signalled after the release), a view's release, and textures placed at an index
+/// and forced to one.
 fn texture_reuse_on<P: Platform>(
     d: &P::Device,
     desc: &dyn Fn(&TextureDesc) -> P::TextureDescriptor,
@@ -3306,6 +3307,7 @@ fn texture_reuse_on<P: Platform>(
     use crate::core::platform::blit::BlitCmd;
     use crate::core::platform::blit::BlitEncoder as _;
     use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::event::{EventRef, SharedEvent as _};
     use crate::core::platform::resource::Texture as _;
     use crate::core::platform::types::{ClearColor, MtlRegion};
     let private = desc(&TextureDesc {
@@ -3345,34 +3347,37 @@ fn texture_reuse_on<P: Platform>(
     let q = d.new_command_queue().unwrap();
     let held = texture();
     note("held by a command buffer", &held);
+    // The command buffer waits on an event signalled only once the texture is released, so it
+    // is still in flight at the release however long the release waits for this thread's turn.
+    let event = d.new_shared_event().unwrap();
     let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+    cb.encode_wait(Some(EventRef::Shared(&event)), 1).unwrap();
     let en = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
-    for _ in 0..2000 {
-        en.encode(
-            OnFault::Return,
-            BlitCmd::FillTextureColor {
-                texture: &held,
-                level: 0,
-                slice: 0,
-                region: MtlRegion {
-                    origin: crate::core::platform::types::MtlOrigin { x: 0, y: 0, z: 0 },
-                    size: crate::core::platform::types::MtlSize {
-                        width: 4,
-                        height: 4,
-                        depth: 1,
-                    },
+    en.encode(
+        OnFault::Return,
+        BlitCmd::FillTextureColor {
+            texture: &held,
+            level: 0,
+            slice: 0,
+            region: MtlRegion {
+                origin: crate::core::platform::types::MtlOrigin { x: 0, y: 0, z: 0 },
+                size: crate::core::platform::types::MtlSize {
+                    width: 4,
+                    height: 4,
+                    depth: 1,
                 },
-                color: ClearColor::default(),
-                pixel_format: 80,
             },
-        )
-        .unwrap();
-    }
+            color: ClearColor::default(),
+            pixel_format: 80,
+        },
+    )
+    .unwrap();
     en.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
     cb.commit(OnFault::Return).unwrap();
     drop(held);
     let h = texture();
     note("after releasing it in flight", &h);
+    event.set_signaled_value(1).unwrap();
     cb.wait_until_completed(OnFault::Return).unwrap();
     let_go::<P>(&q);
     let i = texture();
@@ -3429,7 +3434,11 @@ fn texture_identifiers_are_metals() {
 /// Texture identifiers are reused as Metal reuses them, from a process's start: the lowest
 /// free first, over releases in several orders; one released while a command buffer holds the
 /// texture once it completed; a view's at its release; and a texture placed at an index or
-/// forced to one takes it, the next plain one going on below. Metal's answers were recorded in
+/// forced to one takes it, the next plain one going on below. The command buffer waits on a
+/// shared event that is signalled only after the release, so the texture is in flight at its
+/// release whatever the load: with no wait, in a run beside the workspace's other tests on the M3
+/// Max, its work (2000 fills) had completed by the time the next texture was made, which took the
+/// ID at once. Metal's answers, which hold it there, were recorded in
 /// a process where nothing else had used Metal's device yet: there a texture a command buffer
 /// held is free when
 /// `waitUntilCompleted` returns (measured on the M3 Max: 5 runs of 5, with and without an
