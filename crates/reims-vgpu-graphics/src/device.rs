@@ -1055,6 +1055,11 @@ struct Pointer {
     /// Each display's cursor as the guest's last `MOVE_CURSOR` of it left it: shown, hidden, or
     /// `None` before the guest moved it ([`Shared::cursor_hidden_for`]).
     shown: [Option<bool>; RGFX_DISPLAYS_MAX as usize],
+    /// Each display's cursor image, its size and hot spot, as its last `SET_CURSOR` gave them.
+    shapes: [Option<CursorShape>; RGFX_DISPLAYS_MAX as usize],
+    /// Each display whose last `MOVE_CURSOR` that showed its cursor showed only the part of the
+    /// image over its edge ([`CursorShape::over_edge`]).
+    over_edge: [bool; RGFX_DISPLAYS_MAX as usize],
     /// Since when, on the device's clock, the guest has hidden its cursor on every display it
     /// sees, while it has.
     hidden_since: Option<u64>,
@@ -1062,6 +1067,34 @@ struct Pointer {
     /// another thread, full, or behind answers handed over goes at the next motion or the next
     /// refresh of any display ([`Shared::pointer_motion`]).
     motion: VecDeque<RgfxPointerMotion>,
+}
+
+/// A display's cursor image as `SET_CURSOR` gave it: its size and its hot spot, in pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CursorShape {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) hot_spot: (u32, u32),
+}
+
+impl CursorShape {
+    /// Whether this image with its hot spot at pixel (`x`, `y`) of a scanout of `pixels` is the
+    /// part of the cursor over the scanout's edge from the display beside it, not its hot spot:
+    /// the hot spot on the image's first column (or row) at the scanout's first, or on its last
+    /// at the scanout's last. An arm64 guest's WindowServer gives each display a cursor near
+    /// their edge the part of the image on it, and the display not holding the hot spot one whose
+    /// hot spot is held to the image's column at that edge (measured on arm64 macOS 27.0.1, the
+    /// 28 x 40 arrow, hot spot 5,5, at 1915 of display 0, 1920 wide: display 1 showed its last 18
+    /// columns at pixel 0, hot spot 0,5, 17 ms after display 0's; lane a64ptr, potluck job
+    /// m3-max-35746). A hot spot exactly at the edge shows the same on both displays.
+    pub(crate) fn over_edge(&self, at: (i32, i32), pixels: (u32, u32)) -> bool {
+        let held = |at: i32, hot: u32, extent: u32, pixels: u32| {
+            (hot == 0 && at == 0)
+                || (hot + 1 == extent && pixels > 0 && i64::from(at) == i64::from(pixels) - 1)
+        };
+        held(at.0, self.hot_spot.0, self.width, pixels.0)
+            || held(at.1, self.hot_spot.1, self.height, pixels.1)
+    }
 }
 
 /// A window's captured pointer gone past the image's edge onto the guest's desktop
@@ -2135,14 +2168,44 @@ impl Shared {
             .flatten()
     }
 
-    /// The guest's `MOVE_CURSOR` showed its cursor on display `id`, one it sees: the display
-    /// `POINTER_OVER` follows ([`Self::pointer_at`]).
-    pub(crate) fn cursor_shown_on(&self, id: u32) {
+    /// `SET_CURSOR`: display `id`'s cursor image is `shape`, or there is none.
+    pub(crate) fn cursor_shape(&self, id: u32, shape: Option<CursorShape>) {
+        let epoch = self.epoch.load(Ordering::Acquire);
+        if let Some(slot) = self.pointer.lock().at(epoch).shapes.get_mut(id as usize) {
+            *slot = shape;
+        }
+    }
+
+    /// The guest's `MOVE_CURSOR` showed its cursor's hot spot at pixel (`x`, `y`) of display
+    /// `id`, one it sees: the display `POINTER_OVER` follows ([`Self::pointer_at`]). A display that
+    /// shows only the part of the image over its edge from the display beside it
+    /// ([`CursorShape::over_edge`]) leaves the cursor on the display it is on while that one shows
+    /// it: on its hot spot, or, where both show the image's edge (a hot spot exactly at the edge),
+    /// unless a crossing told the guest the pointer is over this one.
+    pub(crate) fn cursor_shown_on(&self, id: u32, x: i32, y: i32) {
+        let pixels = self
+            .seen_display(id)
+            .and_then(|display| display.state.lock().scanout)
+            .map(|scanout| (scanout.width, scanout.height));
         let epoch = self.epoch.load(Ordering::Acquire);
         let mut pointer = self.pointer.lock();
         let pointer = pointer.at(epoch);
+        let Some(&shape) = pointer.shapes.get(id as usize) else {
+            return;
+        };
+        let over_edge = matches!((shape, pixels), (Some(shape), Some(pixels)) if shape.over_edge((x, y), pixels));
+        pointer.over_edge[id as usize] = over_edge;
+        let on = pointer.cursor as usize;
+        let told_here = pointer.told.is_some_and(|(over, _)| over == id);
+        if over_edge
+            && on != id as usize
+            && pointer.shown.get(on).copied().flatten() == Some(true)
+            && (!pointer.over_edge[on] || !told_here)
+        {
+            return;
+        }
         pointer.cursor = id;
-        if pointer.told.is_some_and(|(over, _)| over == id) {
+        if told_here {
             // The guest moved its cursor where it was told: a later move elsewhere is told anew.
             log::debug!(
                 target: "reims_vgpu_graphics",

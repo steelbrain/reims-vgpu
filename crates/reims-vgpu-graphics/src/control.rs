@@ -9,7 +9,7 @@
 
 use zerocopy::{FromBytes, IntoBytes};
 
-use crate::device::Shared;
+use crate::device::{CursorShape, Shared};
 use crate::display::{CursorImage, Scanout, straight_rgba};
 use crate::ring::{Message, set_size, sized};
 use crate::wire::*;
@@ -37,7 +37,7 @@ pub(crate) fn answer(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
                     .screen
                     .cursor_moved(command.x, command.y, command.visible != 0);
                 if command.visible != 0 {
-                    shared.cursor_shown_on(command.display);
+                    shared.cursor_shown_on(command.display, command.x, command.y);
                 }
             }
             return None;
@@ -320,6 +320,7 @@ fn set_cursor(shared: &Shared, command: &RgfxSetCursor) -> u32 {
     };
     if command.width == 0 {
         display.screen.cursor_image(None);
+        shared.cursor_shape(command.display, None);
         return RGFX_STATUS_OK;
     }
     let (width, height) = (command.width, command.height);
@@ -344,6 +345,14 @@ fn set_cursor(shared: &Shared, command: &RgfxSetCursor) -> u32 {
         hot_spot: (command.hot_x, command.hot_y),
         rgba: straight_rgba(&bgra),
     }));
+    shared.cursor_shape(
+        command.display,
+        Some(CursorShape {
+            width,
+            height,
+            hot_spot: (command.hot_x, command.hot_y),
+        }),
+    );
     RGFX_STATUS_OK
 }
 

@@ -40,6 +40,25 @@ fn cursor_on(display: u32, offset: u64) -> Vec<u8> {
     .to_vec()
 }
 
+/// A `SET_CURSOR` of `display`: a `width` x `height` image at `offset`, its hot spot at `hot`.
+fn shape_on(display: u32, width: u32, height: u32, hot: (u32, u32), offset: u64) -> Vec<u8> {
+    RgfxSetCursor {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SET_CURSOR,
+            ..Default::default()
+        },
+        display,
+        width,
+        height,
+        hot_x: hot.0,
+        hot_y: hot.1,
+        reserved_24: 0,
+        offset,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
 /// A `MOVE_CURSOR` of `display` to (`x`, `y`), shown.
 fn move_on(display: u32, x: i32, y: i32) -> Vec<u8> {
     RgfxMoveCursor {
@@ -535,6 +554,79 @@ fn the_pointer_over_another_display_tells_the_guest_once() {
         rig.quiet_for(200),
         "told once while the cursor shows on display 0"
     );
+}
+
+/// A cursor near the edge between two displays shows on both on an arm64 guest, each display
+/// given the part of its image on it, the one not holding the hot spot a part whose hot spot is
+/// held to the image's column at the display's edge (measured on arm64 macOS 27.0.1, potluck job
+/// m3-max-35746): that display's `MOVE_CURSOR` leaves the cursor on the display showing the hot
+/// spot, so the pointer over the other display is told the guest; where both show the image's
+/// edge (a hot spot exactly at it), a crossing's own display takes the cursor; and the part over
+/// the edge takes it once the display it was on hides it
+#[test]
+fn the_image_over_the_edge_leaves_the_cursor_on_the_display_of_its_hot_spot() {
+    let mut rig = Rig::of_displays(2);
+    take_pointer_over(&rig);
+    rig.start();
+    rig.send(get_displays());
+    rig.event().unwrap();
+    for display in 0..2 {
+        let at = RGFX_ALLOCATIONS_OFFSET + u64::from(display) * ROOM_OF_TWO;
+        let s = rig.send(scanout_on(display, 1920, 1080, 1920 * 4, at));
+        assert_eq!(rig.complete(), (s, RGFX_STATUS_OK));
+    }
+    let image = RGFX_ALLOCATIONS_OFFSET + 0x1000;
+    rig.region().write(image, &[0; 28 * 40 * 4]);
+    let shape = |rig: &mut Rig, display: u32, width: u32, hot: (u32, u32)| {
+        let s = rig.send(shape_on(display, width, 40, hot, image));
+        assert_eq!(rig.complete(), (s, RGFX_STATUS_OK));
+    };
+    let link = rig.device.pointer_link();
+    // The arrow at 1915 of display 0: its left 10 columns there, holding the hot spot, its right
+    // 18 on display 1, the hot spot held to their first column, at pixel 0.
+    shape(&mut rig, 0, 10, (5, 5));
+    moved(&mut rig, move_on(0, 1915, 650));
+    shape(&mut rig, 1, 18, (0, 5));
+    moved(&mut rig, move_on(1, 0, 650));
+    assert!(
+        link.pointer_at(0, 1915, 650, 0),
+        "the cursor is on display 0"
+    );
+    assert!(rig.quiet_for(100), "nothing told");
+    assert!(
+        !link.pointer_at(1, 0, 650, 0),
+        "the crossing onto display 1"
+    );
+    assert_eq!(pointer_over(&mut rig), (1, 0, 650, 0));
+    // The crossing's post at display 1's pixel 0: display 0 shows the arrow's first 5 columns at
+    // its 1919, the hot spot held to their last; display 1 the rest, the hot spot on their first.
+    shape(&mut rig, 0, 5, (4, 5));
+    moved(&mut rig, move_on(0, 1919, 650));
+    shape(&mut rig, 1, 23, (0, 5));
+    moved(&mut rig, move_on(1, 0, 650));
+    assert!(
+        link.pointer_at(1, 1, 650, 0),
+        "display 1, told, took the cursor"
+    );
+    moved(&mut rig, move_on(0, 1919, 651));
+    assert!(
+        link.pointer_at(1, 2, 650, 0),
+        "display 0's part over the edge left it there"
+    );
+    // The arrow whole on display 1, then its part over the edge on display 0 once display 1
+    // hides it: display 0 takes the cursor.
+    shape(&mut rig, 1, 28, (5, 5));
+    moved(&mut rig, move_on(1, 700, 500));
+    let mut hidden = RgfxMoveCursor::read_from_bytes(&move_on(1, 700, 500)).unwrap();
+    hidden.visible = 0;
+    moved(&mut rig, hidden.as_bytes().to_vec());
+    shape(&mut rig, 0, 4, (3, 5));
+    moved(&mut rig, move_on(0, 1919, 500));
+    assert!(
+        link.pointer_at(0, 1919, 500, 0),
+        "the cursor is on display 0"
+    );
+    assert!(rig.quiet_for(100), "nothing told");
 }
 
 /// The guest's cursor moved off the pointer's display by the guest itself, while the pointer

@@ -202,13 +202,17 @@ Unset or unparsable values give the defaults below.
   docs/graphics-kext/design.md, "Multiple displays"), and holds the
   pointer's positions over the new display until the guest's cursor is
   there, for at most 100 ms, so none lands on the display the cursor left; a
-  button going down or up is sent at once. Captured, the pointer is held
+  button going down or up is sent at once. The cursor is on the display that
+  shows its hot spot: the part of its image another display shows over a
+  shared edge (an arm64 guest's WindowServer gives each display its part)
+  does not count. Captured, the pointer is held
   over its window's image (Capture), so on macOS a drag stays on the display
   it began on, and the pointer reaches another display's window once capture
   is released (on Linux it goes on past the edge: "On Linux").
   `test: reims-vgpu::graphics::tests::displays::a_window_s_pointer_tells_the_guest_its_display_and_waits_for_its_cursor`,
   `test: reims-vgpu-graphics::device::tests::displays::the_pointer_over_another_display_tells_the_guest_once`,
   `test: reims-vgpu-graphics::device::tests::displays::a_crossing_holds_the_pointer_until_the_guest_s_cursor_is_there`,
+  `test: reims-vgpu-graphics::device::tests::displays::the_image_over_the_edge_leaves_the_cursor_on_the_display_of_its_hot_spot`,
   `manual` (a VM with two displays)
 - In a game: captured, once the guest has hidden its cursor on every display
   for 50 ms, as a game does that turns its camera by the mouse's motion, the
@@ -492,6 +496,7 @@ runtime's own device. The switches above apply, and `resolution=` too.
   that window's display, as on macOS.
   `test: reims-vgpu::graphics::tests::displays::a_window_s_pointer_tells_the_guest_its_display_and_waits_for_its_cursor`,
   `test: reims-vgpu-graphics::device::tests::displays::a_crossing_holds_the_pointer_until_the_guest_s_cursor_is_there`,
+  `test: reims-vgpu-graphics::device::tests::displays::the_image_over_the_edge_leaves_the_cursor_on_the_display_of_its_hot_spot`,
   `manual` (a VM with two displays)
 - With several reims-graphics displays, a captured pointer moving toward an
   edge of the image where the guest placed another display (System

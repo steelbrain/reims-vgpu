@@ -3251,6 +3251,22 @@ pixels of its mode, and the buttons held):
   after the cursor has shown on another display. A crossing that finds the
   ring held, full or behind answers handed over is posted at the next
   refresh of any display. A reset forgets it all.
+- **The image over an edge.** On an arm64 guest a cursor near the edge
+  between two displays shows on both: WindowServer gives each display the
+  part of the image on it, and the display not holding the hot spot a part
+  whose hot spot is held to the image's column (or row) at that edge, with
+  the hot spot at the display's edge pixel (27.0.1, the 28 x 40 arrow, hot
+  spot 5,5, at 1915 of display 0: display 1 showed its last 18 columns at
+  pixel 0, hot spot 0,5, 17 ms after display 0's `MOVE_CURSOR`; lane
+  a64ptr, potluck job m3-max-35746). Taken as where the cursor is, that
+  `MOVE_CURSOR` kept the next crossing onto the display beside it from being
+  told, and the tablet then put the cursor at its mirror on the display it
+  was on. So the device takes such a `MOVE_CURSOR` (its image's hot spot on
+  the image's first or last column or row, at the scanout's first or last
+  pixel on that axis, by the display's last `SET_CURSOR`) as where the
+  cursor is only while the display the cursor is on hides it, or where that
+  display shows the image's edge too (a hot spot exactly at the edge) and a
+  crossing told the guest the pointer is over this one.
 - **The crossing's hold.** Until the guest's cursor shows on the new display,
   the tablet would scale a position over the display the cursor left, and a
   position sent then lands at its mirror there: a click on display 1 at x 100
