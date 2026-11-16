@@ -236,12 +236,14 @@
 //!
 //! - **Within a budget.** On a GPU that shares the CPU's memory a cache is host RAM beside the
 //!   guest's pages, so the device bounds them all ([`SurfaceCaches::set_cache_budget`]): every
-//!   cache, deferred or not, fits the deferred blocks' budget together, a quarter of the GPU's
-//!   memory's budget as the platform answers it at the device's start
-//!   ([`GpuDevice::own_memory_budget`]). A cached block past it gets no cache, counted, and lies in
-//!   place in its pages, as where the platform makes none: it takes its view where it was named by
-//!   its runs, and its buffers lie over the view, its textures the runtime's over the pages. A
-//!   deferral past it is refused as past the deferred budget, and the kext names its pages. So
+//!   cache, deferred or not, fits one budget together, half of the GPU's memory's budget as the
+//!   platform answers it at the device's start ([`GpuDevice::own_memory_budget`]), twice the
+//!   deferred blocks' (a quarter, measured too tight: on a Radeon 780M it held a WebGL page's
+//!   surfaces in place, and its frames fell by a quarter). A cached block past it gets no cache,
+//!   counted, and lies in place in its pages, as where the platform makes none: it takes its view
+//!   where it was named by its runs, and its buffers lie over the view, its textures the
+//!   runtime's over the pages. A deferral past either budget is refused, and the kext names its
+//!   pages. So
 //!   the copies stay bounded on a small host, and only their speed is lost past the budget. A
 //!   GPU of its own memory sets none: its own memory bounds them, and a cache it does not make
 //!   lies in place alike.

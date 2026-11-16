@@ -828,11 +828,15 @@ Stages:
       Launchpad's GPU writes land in three compositor surfaces the CPU never
       locks, which a cache keeps in the GPU's memory (lane tiledlock, jobs
       m3-max-37869 and 37870). The caches are host RAM beside the guest's
-      pages there, so they fit one budget together, deferred or not: the
-      deferred blocks' budget, a quarter of the GPU's memory budget as the
-      platform answers it at the device's start. A cached block past it gets
-      no cache and lies in place in its pages, its buffers over its view, as
-      where the platform makes no cache; a deferral past it is refused, and
+      pages there, so they fit one budget together, deferred or not: half of
+      the GPU's memory budget as the platform answers it at the device's
+      start, twice the deferred blocks' (a quarter held a WebGL page's
+      surfaces in place on a Radeon 780M with an 8 GiB guest, at 1385 MiB,
+      and its frames fell from 33.0 to 24.6 a second; unbounded, the caches
+      held 1762 MiB at most, jobs m3-max-38033 and 38034). A cached block
+      past it gets no cache and lies in place in its pages, its buffers over
+      its view, as where the platform makes no cache; a deferral past it is
+      refused, and
       the kext names its pages (`reims-vgpu`'s `decode/surface_cache.rs`,
       "Within a budget"). The device's summary of its caches counts the
       blocks past the budget and the most bytes the caches held.

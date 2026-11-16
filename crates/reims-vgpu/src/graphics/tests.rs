@@ -9867,6 +9867,20 @@ fn the_deferred_budget_is_a_quarter_of_the_gpus_own_memory() {
     assert_eq!(super::deferred_budget(refused, 16 << 30), 0);
 }
 
+/// Every device cache on a GPU that shares the CPU's memory fits half of the GPU's own memory's
+/// budget, twice the deferred blocks' budget
+#[test]
+fn the_caches_budget_is_half_of_the_gpus_own_memory() {
+    assert_eq!(super::cache_budget(16 << 30), 8 << 30);
+    assert_eq!(super::cache_budget(0x1_5a80_0000), 0x1_5a80_0000 / 2);
+    assert_eq!(super::cache_budget(0), 0);
+    let deferred = u64::from(RGFX_FEATURE_SURFACE_CACHE | RGFX_FEATURE_SURFACE_DEFERRED);
+    assert_eq!(
+        super::cache_budget(16 << 30),
+        2 * super::deferred_budget(deferred, 16 << 30)
+    );
+}
+
 /// What the poison-fill tests write over the guest's memory before the host answers into it: a
 /// 32-bit word no field the host writes holds.
 const POISON: u32 = 0xa5a5_dead;
