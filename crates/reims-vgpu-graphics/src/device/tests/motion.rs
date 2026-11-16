@@ -1,7 +1,7 @@
 //! A pointer for games (docs/graphics-kext/design.md, "A pointer for games"): the offer of
-//! `POINTER_MOTION`, the guest's cursor hidden on every display it sees, and the
-//! `POINTER_MOTION`s a window's captured pointer sends, in their order, joined while the ring has
-//! no room, a press or a release never lost.
+//! `POINTER_MOTION`, the guest's cursor hidden on every display it sees (but on its way to the
+//! next), and the `POINTER_MOTION`s a window's captured pointer sends, in their order, joined
+//! while the ring has no room, a press or a release never lost.
 
 use super::*;
 
@@ -135,6 +135,56 @@ fn the_cursor_is_hidden_once_every_display_it_sees_hides_it() {
     moved(&mut rig, cursor_of(0, 1, 1, false));
     let again = link.cursor_hidden_for().expect("hidden on both again");
     assert!(again < hidden, "counted from the new hide: {again} ns");
+}
+
+/// A crossing's hide is the cursor going from one display to the next: while a `POINTER_OVER`
+/// has yet to show the cursor on the pointer's display, the cursor hidden on every display counts
+/// from a second after it at the earliest, so a slow guest's crossing (an arm64 guest under TCG
+/// shows it up to half a second later) never drives the guest's mouse mid-drag; once the cursor
+/// shows there, a hide counts from itself again; and a crossing that never shows it holds the
+/// count off for that second alone
+#[test]
+fn a_crossing_s_hide_is_not_a_game_s() {
+    let mut rig = motion_rig(2);
+    take_and_start(
+        &rig,
+        RGFX_FEATURE_POINTER_MOTION | RGFX_FEATURE_MULTI_DISPLAY | RGFX_FEATURE_POINTER_OVER,
+    );
+    let link = rig.device.pointer_link();
+    moved(&mut rig, cursor_of(0, 10, 10, true));
+    let over = |rig: &mut Rig| {
+        let event = rig.event().expect("a POINTER_OVER");
+        let p = RgfxPointerOver::read_from_bytes(&event).unwrap();
+        assert_eq!(p.header.r#type, RGFX_EVT_POINTER_OVER);
+    };
+    // The pointer over display 1: the guest hides its cursor on display 0 on its way there.
+    assert!(!link.pointer_at(1, 5, 5, 0), "held for the crossing");
+    over(&mut rig);
+    moved(&mut rig, cursor_of(0, 10, 10, false));
+    std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(
+        link.cursor_hidden_for(),
+        Some(0),
+        "hidden, but on its way to display 1"
+    );
+    moved(&mut rig, cursor_of(1, 5, 5, true));
+    assert_eq!(link.cursor_hidden_for(), None, "shown on display 1");
+    // A game hides it there, no crossing under way: counted from the hide.
+    moved(&mut rig, cursor_of(1, 5, 5, false));
+    std::thread::sleep(Duration::from_millis(60));
+    assert!(
+        link.cursor_hidden_for().unwrap() >= 60_000_000,
+        "a game's hide counts from itself"
+    );
+    // A crossing onto display 0 that never shows the cursor there: the count waits a second.
+    assert!(!link.pointer_at(0, 7, 7, 0), "held for the crossing");
+    over(&mut rig);
+    assert_eq!(link.cursor_hidden_for(), Some(0), "a crossing under way");
+    std::thread::sleep(Duration::from_millis(1060));
+    assert!(
+        link.cursor_hidden_for().unwrap() >= 50_000_000,
+        "counted from a second after the POINTER_OVER"
+    );
 }
 
 /// A guest that sees display 0 alone (it did not take `MULTI_DISPLAY`) hides its cursor where

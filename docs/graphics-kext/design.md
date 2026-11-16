@@ -3849,7 +3849,13 @@ tablet. So the guest gets a mouse of its own, whose motion has no edge:
   `MOVE_CURSOR`'s `visible`: the cursor is hidden while no display the guest
   has moved it on shows it, counted from the hide that made it so
   (`PointerLink::cursor_hidden_for`, `None` for a guest that did not take the
-  bit). A window's motion (`PointerLink::motion`) is owed as a
+  bit), or, while a `POINTER_OVER` has yet to show the cursor on the
+  pointer's display, from a second after it at the earliest
+  (`CROSSING_HIDE_NS`): the guest hides the cursor on the display it leaves
+  before it shows it on the next, and an arm64 guest under TCG showed it
+  there up to 491 ms after the `POINTER_OVER`, so that hide, counted as a
+  game's, drove the guest's mouse in the middle of captured drags across
+  displays (potluck jobs m3-max-36283, m3-max-36434, m3-max-36435). A window's motion (`PointerLink::motion`) is owed as a
   `POINTER_MOTION` and posted at once; while the completion ring is held,
   full or behind answers handed over, the owed wait in order for the next
   refresh, a motion of the same buttons joining the last owed and a change of
@@ -3859,7 +3865,7 @@ tablet. So the guest gets a mouse of its own, whose motion has no edge:
 - **The window.** Captured, once the guest's cursor has stayed hidden for 50
   ms (`reims_vgpu_window::game::SETTLE_NS`: past WindowServer's dozen hides
   and shows as it starts, and the hide and show of the cursor crossing
-  displays), the window's next move locks the host's pointer where it is and
+  displays, which the device counts from a second after its `POINTER_OVER`), the window's next move locks the host's pointer where it is and
   hands its motion to the guest's mouse in the device's own counts,
   unaccelerated, so the guest accelerates it once, as its mouse settings say:
   SDL's relative mode with `SDL_MOUSE_RELATIVE_SYSTEM_SCALE` 0 on Linux, and

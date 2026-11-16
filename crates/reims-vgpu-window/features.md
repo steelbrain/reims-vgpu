@@ -215,7 +215,9 @@ Unset or unparsable values give the defaults below.
   `test: reims-vgpu-graphics::device::tests::displays::the_image_over_the_edge_leaves_the_cursor_on_the_display_of_its_hot_spot`,
   `manual` (a VM with two displays)
 - In a game: captured, once the guest has hidden its cursor on every display
-  for 50 ms, as a game does that turns its camera by the mouse's motion, the
+  for 50 ms (a hide while the guest has yet to show the cursor on the display
+  a crossing moves it to counts from a second after the crossing began), as
+  a game does that turns its camera by the mouse's motion, the
   pointer drives the guest's own mouse (`POINTER_MOTION`,
   docs/graphics-kext/design.md, "A pointer for games"), so the camera turns
   however far the mouse moves, past the image's edge. The window holds the
@@ -241,6 +243,7 @@ Unset or unparsable values give the defaults below.
   `test: native::macos::input::a_button_held_across_the_switch_comes_up_by_its_own_route`,
   `test: native::macos::input::letting_go_of_a_game_gives_the_pointer_back_where_it_was_held`,
   `test: reims-vgpu::graphics::tests::displays::a_window_s_device_offers_pointer_motion_and_drives_the_guest_s_mouse`,
+  `test: reims-vgpu-graphics::device::tests::motion::a_crossing_s_hide_is_not_a_game_s`,
   `test: reims-vgpu-graphics::device::tests::motion::a_guest_that_did_not_take_pointer_motion_gets_none`,
   `test: reims-vgpu-graphics::device::tests::motion::the_cursor_is_hidden_once_every_display_it_sees_hides_it`,
   `test: reims-vgpu-graphics::device::tests::motion::owed_motion_joins_and_a_press_never_does`,
@@ -545,6 +548,7 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `test: native::sdl_thread::input::a_button_held_across_the_switch_comes_up_by_its_own_route`,
   `test: native::sdl_thread::input::letting_go_of_a_game_gives_the_pointer_back_where_it_was_held`,
   `test: reims-vgpu-graphics::device::tests::motion::motion_reaches_a_guest_that_took_it`,
+  `test: reims-vgpu-graphics::device::tests::motion::a_crossing_s_hide_is_not_a_game_s`,
   `manual` (as on macOS, on a Linux host's guest boot)
 - Keys by position, as evdev reports them, so the guest's layout applies and
   ISO keys arrive as on a real ISO keyboard; media keys are dropped.

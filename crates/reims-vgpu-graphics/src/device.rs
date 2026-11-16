@@ -1020,6 +1020,17 @@ impl Queues {
 /// it (a hidden cursor) or be slow to.
 const CROSSING_HOLD_NS: u64 = 100_000_000;
 
+/// How long after a `POINTER_OVER` the guest's cursor hidden on every display, while the guest has
+/// yet to show it on the pointer's display, is taken for the cursor going there
+/// ([`Shared::cursor_hidden_for`]), in nanoseconds: the guest hides it on the display it leaves
+/// before it shows it on the next. An arm64 guest under TCG showed it there up to 491 ms after
+/// the `POINTER_OVER`, and its crossing gives up after four posts 250 ms apart (the arm64e kext's
+/// `kRgfxCrossingPosts` and `kRgfxLandingWaitNs`); counted as a game's hide, that hide passed
+/// the window's 50 ms in captured drags across displays of arm64 14 and 15.6.1 under TCG, and
+/// the drag drove the guest's mouse, which the guest accelerates, instead of going on (lane
+/// a64ptr, potluck jobs m3-max-36283, m3-max-36434 and m3-max-36435).
+const CROSSING_HIDE_NS: u64 = 1_000_000_000;
+
 /// The most `POINTER_MOTION`s owed at once ([`Pointer::motion`]): each press or release makes
 /// one, and motion joins the last. A guest that takes none for that long has the last take the
 /// next buttons too, so that what it is sent once it takes them again ends where the host's
@@ -1218,8 +1229,11 @@ impl PointerLink {
     /// last `MOVE_CURSOR` of each that it moved said hidden), where it took
     /// [`RGFX_FEATURE_POINTER_MOTION`]: a window's captured pointer then drives the guest's
     /// relative pointing device ([`Self::motion`]), as a game that hides the cursor reads its
-    /// motion. `None` where the cursor shows on a display, the guest has yet to move it since its
-    /// start, did not take the feature or is not started, and once the device has ended.
+    /// motion. While a `POINTER_OVER` has yet to show the cursor on the pointer's display, it is
+    /// counted from a second after that at the earliest: the guest hides it on the display it
+    /// leaves before it shows it there. `None` where the cursor shows on a display,
+    /// the guest has yet to move it since its start, did not take the feature or is not started,
+    /// and once the device has ended.
     pub fn cursor_hidden_for(&self) -> Option<u64> {
         self.shared.upgrade()?.cursor_hidden_for()
     }
@@ -2384,13 +2398,20 @@ impl Shared {
         }
     }
 
-    /// [`PointerLink::cursor_hidden_for`].
+    /// [`PointerLink::cursor_hidden_for`]: counted from the hide, or, while a `POINTER_OVER` told
+    /// has yet to show the cursor on the pointer's display, from [`CROSSING_HIDE_NS`] after it at
+    /// the earliest, the cursor hidden as it goes from one display to the next.
     pub(crate) fn cursor_hidden_for(&self) -> Option<u64> {
         if !self.driver_took(RGFX_FEATURE_POINTER_MOTION) || !self.started() {
             return None;
         }
         let epoch = self.epoch.load(Ordering::Acquire);
-        let since = self.pointer.lock().at(epoch).hidden_since?;
+        let mut pointer = self.pointer.lock();
+        let pointer = pointer.at(epoch);
+        let mut since = pointer.hidden_since?;
+        if pointer.told.is_some() {
+            since = since.max(pointer.told_at.saturating_add(CROSSING_HIDE_NS));
+        }
         Some(now_ns().saturating_sub(since))
     }
 
