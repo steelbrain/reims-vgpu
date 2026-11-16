@@ -97,7 +97,9 @@ pub(crate) fn unheld(shared: &Shared, message: &Message, epoch: u64) -> Option<V
 /// `BLOCK_UNSHARE` (`Region::share`, `Region::unshare`); a `SURFACE_PAGES` hands its block's runs
 /// to the host (`Shared::surface_pages`), which answers with whether it mapped them; a
 /// `SURFACE_DOWNLOAD` the host answers once the surface's pages hold its device cache
-/// (`Host::surface_download`). Every other message goes to the host's decoder.
+/// (`Host::surface_download`); a `VT_MESSAGE`, its runs and length checked, goes to the host's
+/// side of VideoToolbox's protocol, which answers it (`Host::vt_message`). Every other message goes
+/// to the host's decoder.
 fn lifecycle(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> {
     let seqno = message.header.seqno;
     match message.header.r#type {
@@ -156,6 +158,25 @@ fn lifecycle(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> 
                 }
             };
             status.map(|status| complete(seqno, status))
+        }
+        RGFX_CMD_VT_MESSAGE => {
+            // A guest that took no VT_MESSAGES sends none; one it sends anyway is answered as
+            // one the device could not read, as is one whose runs or length do not hold.
+            let read = shared
+                .driver_took(RGFX_FEATURE_VT_MESSAGES)
+                .then(|| crate::device::vt_read(message))
+                .flatten();
+            match read {
+                Some(vt) => {
+                    shared.host.vt_message(
+                        vt,
+                        shared.vt_answer(seqno, epoch),
+                        shared.vt_link(epoch),
+                    );
+                    None
+                }
+                None => Some(crate::device::vt_status(seqno, RGFX_VT_STATUS_MALFORMED)),
+            }
         }
         RGFX_CMD_SURFACE_DOWNLOAD => match read::<RgfxSurfaceDownload>(message) {
             Some(download) => {

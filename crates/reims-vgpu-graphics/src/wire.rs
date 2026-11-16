@@ -473,6 +473,13 @@ pub const RGFX_FEATURE_DISPLAY_BOUNDS: u64 = 0x4_0000_0000_0000;
 /// pointer for games"): a guest that did not take it (a kext built before this bit, the option ROM,
 /// Ambrosia's module) publishes no device and is never sent it.
 pub const RGFX_FEATURE_POINTER_MOTION: u64 = 0x8_0000_0000_0000;
+/// `FEATURES_HI` bit 20, feature bit 52, `VT_MESSAGES`: ring 0 carries
+/// [`RGFX_CMD_VT_MESSAGE`], a message of the guest's VideoToolbox to its host side, which the host
+/// answers [`RGFX_EVT_VT_STATUS`], and the control completion ring carries
+/// [`RGFX_EVT_VT_MESSAGE`], a message of the host's side to the guest's VideoToolbox
+/// (docs/graphics-kext/design.md, "Decided", 17). The arm64e kext takes it where it publishes the
+/// paravirtual VideoToolbox service; the device sends `VT_MESSAGE` only to a guest that took it.
+pub const RGFX_FEATURE_VT_MESSAGES: u64 = 0x10_0000_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -1175,6 +1182,30 @@ pub const RGFX_CMD_SURFACE_PAGES: u32 = 0x2f6;
 /// [`RGFX_STATUS_OK`] once the pages hold it: at once where no command buffer wrote the cache
 /// since it was last copied either way, or the block has no cache.
 pub const RGFX_CMD_SURFACE_DOWNLOAD: u32 = 0x2f7;
+/// `VT_MESSAGE` ([`RgfxVtMessage`], then its `run_count` [`RgfxPageRun`]s at
+/// [`RGFX_VT_MESSAGE_RUNS_OFFSET`]), on ring 0 from the arm64e kext, where the guest took
+/// [`RGFX_FEATURE_VT_MESSAGES`]: one message of the guest's VideoToolbox to its host side, a `vtpv`
+/// message as VideoToolbox writes it (docs/graphics-kext/design.md, "Decided", 17), its `length`
+/// bytes in the guest RAM the runs name, in order, from the first run's first byte. The surfaces
+/// the message lends are named by their IOSurface IDs, in `surfaces`, the used ones first and the
+/// rest 0. No command buffer waits for it, and it waits for none. Answered [`RGFX_EVT_VT_STATUS`] with
+/// its `seqno`: the status VideoToolbox's host side returns for the message, or
+/// [`RGFX_VT_STATUS_MALFORMED`] where the runs do not hold `length` bytes of guest RAM, or
+/// `length` is under the 48 bytes of a `vtpv` header or over [`RGFX_VT_MESSAGE_MAX`].
+pub const RGFX_CMD_VT_MESSAGE: u32 = 0x2fa;
+/// Where a `VT_MESSAGE`'s runs start: right after its [`RgfxVtMessage`].
+pub const RGFX_VT_MESSAGE_RUNS_OFFSET: u32 = 72;
+/// The most surfaces a `VT_MESSAGE` lends: VideoToolbox's five.
+pub const RGFX_VT_MESSAGE_SURFACES: usize = 5;
+/// The longest message a `VT_MESSAGE` carries: 10 MiB, the most the kext's message buffer holds,
+/// as Apple's kext of the service sizes its own.
+pub const RGFX_VT_MESSAGE_MAX: u64 = 0xa0_0000;
+/// The longest message a [`RGFX_EVT_VT_MESSAGE`] carries: 16 KiB, the buffer VideoToolbox's
+/// guest side takes each host message into.
+pub const RGFX_VT_HOST_MESSAGE_MAX: u32 = 0x4000;
+/// [`RgfxVtStatus::status`] for a `VT_MESSAGE` the device could not read: VideoToolbox's
+/// `kVTParameterErr`, as the guest's support framework answers a message it cannot send.
+pub const RGFX_VT_STATUS_MALFORMED: i32 = -12902;
 
 /// Command `COMMAND_BUFFER` (a per-queue submission ring): one command buffer,
 /// its `obj_id` followed by the encoder-op byte stream. Struct and op stream in
@@ -1264,6 +1295,17 @@ pub const RGFX_EVT_RATE_MAP_ANSWER: u32 = 0x40b;
 /// Event `FUNCTION_POINTER_STATE` ([`RgfxFunctionPointerState`], on the control completion
 /// ring): a `FUNCTION_HANDLE_CREATE`'s or `FUNCTION_TABLE_CREATE`'s answer.
 pub const RGFX_EVT_FUNCTION_POINTER_STATE: u32 = 0x40c;
+/// Event `VT_STATUS` ([`RgfxVtStatus`], on the control completion ring): a `VT_MESSAGE`'s
+/// answer, with its `seqno`.
+pub const RGFX_EVT_VT_STATUS: u32 = 0x40d;
+/// Event `VT_MESSAGE` ([`RgfxVtHostMessage`], then its `length` bytes at
+/// [`RGFX_VT_HOST_MESSAGE_BYTES_OFFSET`], on the control completion ring), `seqno` 0, sent only to
+/// a guest that took [`RGFX_FEATURE_VT_MESSAGES`]: one message of VideoToolbox's host side to the
+/// guest's, of at most [`RGFX_VT_HOST_MESSAGE_MAX`] bytes, a `vtpv` message or a `rels` box. The
+/// message's `size` is rounded up to a multiple of 8 after its bytes.
+pub const RGFX_EVT_VT_MESSAGE: u32 = 0x40e;
+/// Where a `VT_MESSAGE` event's bytes start: right after its [`RgfxVtHostMessage`].
+pub const RGFX_VT_HOST_MESSAGE_BYTES_OFFSET: u32 = 24;
 
 /// A command buffer's status in [`RgfxCbComplete`]: finished with no error.
 pub const RGFX_CB_OK: u32 = 0;
@@ -1735,6 +1777,9 @@ const _: () = {
     assert!(offset_of!(RgfxRingHeader, guest_clock_bound_ns) == 0x20);
     assert!(offset_of!(RgfxRingHeader, raise_all) == 0xc4);
     assert!(size_of::<RgfxMsgHeader>() == 16);
+    assert!(size_of::<RgfxVtMessage>() == RGFX_VT_MESSAGE_RUNS_OFFSET as usize);
+    assert!(size_of::<RgfxVtStatus>() == 24);
+    assert!(size_of::<RgfxVtHostMessage>() == RGFX_VT_HOST_MESSAGE_BYTES_OFFSET as usize);
     assert!(size_of::<RgfxGetDisplays>() == 16);
     assert!(size_of::<RgfxSetScanout>() == 40);
     assert!(size_of::<RgfxSetCursor>() == 48);
@@ -2325,6 +2370,56 @@ pub struct RgfxSurfaceDownload {
     pub header: RgfxMsgHeader,
     /// The surface's shared block's region offset.
     pub block_offset: u64,
+}
+
+/// `VT_MESSAGE`: one message of the guest's VideoToolbox, `length` bytes in the guest RAM of the
+/// `run_count` [`RgfxPageRun`]s that follow, lending the IOSurfaces of the IDs in `surfaces`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxVtMessage {
+    /// [`RGFX_CMD_VT_MESSAGE`].
+    pub header: RgfxMsgHeader,
+    /// The message's bytes.
+    pub length: u64,
+    /// How many runs follow, at [`RGFX_VT_MESSAGE_RUNS_OFFSET`].
+    pub run_count: u32,
+    /// How many of `surfaces` are used, from the first.
+    pub surface_count: u32,
+    /// The IDs of the IOSurfaces the message lends, each one its sender's process looks up, the
+    /// used ones first, the rest 0.
+    pub surfaces: [u64; RGFX_VT_MESSAGE_SURFACES],
+}
+
+/// `VT_STATUS`: a `VT_MESSAGE`'s answer.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxVtStatus {
+    /// [`RGFX_EVT_VT_STATUS`], with the message's `seqno`.
+    pub header: RgfxMsgHeader,
+    /// The status VideoToolbox's host side returns for the message (an `OSStatus`: 0 for one it
+    /// took), or [`RGFX_VT_STATUS_MALFORMED`].
+    pub status: i32,
+    /// Pads the message to a multiple of 8; 0.
+    pub reserved_14: u32,
+}
+
+/// The `VT_MESSAGE` event: one message of VideoToolbox's host side, its `length` bytes after
+/// this struct.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxVtHostMessage {
+    /// [`RGFX_EVT_VT_MESSAGE`], `seqno` 0.
+    pub header: RgfxMsgHeader,
+    /// The message's bytes, at most [`RGFX_VT_HOST_MESSAGE_MAX`].
+    pub length: u32,
+    /// Pads the bytes to a multiple of 8; 0.
+    pub reserved_14: u32,
 }
 
 /// `BUFFER_OVER_SURFACE_PAGES`: a Shared buffer of `length` bytes over the IOSurface pages the

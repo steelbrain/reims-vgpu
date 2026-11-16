@@ -73,6 +73,7 @@ typedef graft_iomfb_word RgfxIOMFBWord;
 
 class RgfxAccelerator;
 class RgfxPointerDevice;
+class AppleVideoToolboxParavirtualizationDriver;
 
 // The display front end each architecture's WindowServer drives: an IOFramebuffer on x86-64, and
 // on arm64, where WindowServer opens no IOFramebuffer, an IOMobileFramebuffer, the subclass of
@@ -739,6 +740,19 @@ private:
 	void startPointerDevice();
 	void stopPointerDevice();
 	void pointerMotion(const volatile UInt8 *payload, UInt32 size);
+#if defined(__arm64e__)
+	// The arm64e kext's VideoToolbox service (RgfxVtService.hpp), display 0's alone: whether the
+	// host took VT_MESSAGES, set at the start's features; the service, published once the
+	// framebuffer has started where it took it and the caps list a decoder (startVtService), and
+	// stopped in the stop once the work loop hands it nothing more (stopVtService); and
+	// handleEvent's VT_MESSAGE, which hands it the host's message on the work loop. The service
+	// is stored and read atomically, as the mouse is.
+	bool vtMessagesTaken;
+	AppleVideoToolboxParavirtualizationDriver *vtService;
+	void startVtService();
+	void stopVtService();
+	void vtMessage(const volatile UInt8 *payload, UInt32 size);
+#endif
 
 	// The boot screen the scanout holds until clearBootScreen: the boot framebuffer the OS had at
 	// the start (publishBootConsole); the largest span a mode's scanout has had (setScanout, under

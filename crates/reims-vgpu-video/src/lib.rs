@@ -5,6 +5,8 @@
 //!   guest surface's memory as a device reaches it, and its bounded waits on the hardware.
 //! - [`codec`] is H.264's and HEVC's syntax and decoding processes above the slice data, and the
 //!   encoders' portable half, in plain Rust.
+//! - [`paravirt`] is VideoToolbox's paravirtual protocol, the host's side: the messages an arm64
+//!   guest's VideoToolbox sends, and the host's answers.
 //! - `vaapi` is VA-API through libva, and `nvidia` NVDEC and NVENC over the CUDA driver API, each
 //!   with its libraries loaded at run time: Linux's alone.
 
@@ -12,6 +14,7 @@ pub mod codec;
 pub mod core;
 #[cfg(target_os = "linux")]
 pub mod nvidia;
+pub mod paravirt;
 #[cfg(all(test, target_os = "linux"))]
 mod probes;
 #[cfg(target_os = "linux")]

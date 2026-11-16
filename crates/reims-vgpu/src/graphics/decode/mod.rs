@@ -2723,6 +2723,36 @@ impl<P: Platform> GraphicsDecoder<P> {
             .map(|present| present.texture)
     }
 
+    /// The first `length` bytes the guest RAM runs `runs` hold, `(address, length)` in order, as
+    /// the host's mapping of the guest's RAM reads them now: a `VT_MESSAGE`'s message. `None`
+    /// where the host has no mapping of the guest's RAM, a byte of them lies outside it, or the
+    /// runs hold fewer bytes.
+    pub(crate) fn guest_bytes(&self, runs: &[(u64, u64)], length: u64) -> Option<Vec<u8>> {
+        let runs: Vec<RgfxPageRun> = runs
+            .iter()
+            .map(|&(address, length)| RgfxPageRun { address, length })
+            .collect();
+        use reims_vgpu_vulkan::core::num::{ToU64 as _, ToUsize as _};
+        let pages = self
+            .shared
+            .surface_views
+            .lock()
+            .host_pages_in_order(&runs)?;
+        let mut bytes = Vec::with_capacity(length.to_usize());
+        for (host, n) in pages {
+            let left = length.to_usize().saturating_sub(bytes.len());
+            if left == 0 {
+                break;
+            }
+            let n = n.to_usize().min(left);
+            // SAFETY: `n` bytes of the host's mapping of the guest's RAM, which the memory map's
+            // lease keeps mapped for the device's life; the guest may write them as they are
+            // read, which gives it back garbage, as a write of its own message would.
+            bytes.extend_from_slice(unsafe { std::slice::from_raw_parts(host.as_ptr::<u8>(), n) });
+        }
+        (bytes.len().to_u64() == length).then_some(bytes)
+    }
+
     /// The textures IOSurface `iosurface_id` is named by, oldest first: those over its plane 0,
     /// the newest of which a present of it shows ([`Self::surface_present`]).
     pub(crate) fn surface_textures(&self, iosurface_id: u32) -> Vec<u64> {

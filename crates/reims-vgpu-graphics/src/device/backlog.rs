@@ -70,7 +70,8 @@ pub(super) fn whose(r#type: u32, field: Option<u64>) -> Whose {
         (
             RGFX_CMD_GET_DISPLAYS..=RGFX_CMD_SET_DISPLAY_POWER
             | RGFX_CMD_SURFACE_DOWNLOAD
-            | RGFX_CMD_PIPELINE_ANSWERS,
+            | RGFX_CMD_PIPELINE_ANSWERS
+            | RGFX_CMD_VT_MESSAGE,
             _,
         ) => Whose::NoOne,
         (RGFX_CMD_QUEUE_CREATE..RGFX_CMD_CONTEXT_CLOSE, Some(obj_id)) => {
@@ -248,12 +249,13 @@ mod tests {
             RGFX_CMD_SET_DISPLAY_POWER,
             RGFX_CMD_SURFACE_DOWNLOAD,
             RGFX_CMD_PIPELINE_ANSWERS,
+            RGFX_CMD_VT_MESSAGE,
         ] {
             assert_eq!(whose(r#type, field), Whose::NoOne);
         }
         assert_eq!(whose(RGFX_CMD_BUFFER_CREATE, None), Whose::Every);
         assert_eq!(whose(RGFX_CMD_SET_DISPLAY_POWER + 1, obj(5)), Whose::Every);
-        assert_eq!(whose(RGFX_CMD_PIPELINE_ANSWERS + 1, obj(5)), Whose::Every);
+        assert_eq!(whose(RGFX_CMD_VT_MESSAGE + 1, obj(5)), Whose::Every);
         assert_eq!(whose(RGFX_CMD_COMMAND_BUFFER, obj(5)), Whose::Every);
     }
 }

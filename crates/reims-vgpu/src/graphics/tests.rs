@@ -13248,3 +13248,78 @@ fn a_group_closes_at_its_limits() {
         );
     }
 }
+
+/// VideoToolbox's paravirtual path lists a decoder for each decode entry of the caps of H.264 or
+/// HEVC with a profile, its profiles as VideoToolbox numbers them and its level the caps': no
+/// encode entry, no entry with no profile, and no codec past the caps' count.
+#[test]
+fn vt_decoders_are_the_caps_decode_entries() {
+    let entry = |codec, direction, profiles, max_level| RgfxVideoCodecCaps {
+        codec,
+        direction,
+        profiles,
+        max_level,
+        ..RgfxVideoCodecCaps::default()
+    };
+    let mut caps = RgfxVideoCaps {
+        version: RGFX_VIDEO_CAPS_VERSION,
+        codec_count: 4,
+        ..RgfxVideoCaps::default()
+    };
+    caps.codecs[0] = entry(
+        RGFX_VIDEO_CODEC_H264,
+        RGFX_VIDEO_DECODE,
+        RGFX_VIDEO_H264_BASELINE | RGFX_VIDEO_H264_MAIN | RGFX_VIDEO_H264_HIGH,
+        52,
+    );
+    caps.codecs[1] = entry(
+        RGFX_VIDEO_CODEC_H264,
+        RGFX_VIDEO_ENCODE,
+        RGFX_VIDEO_H264_HIGH,
+        51,
+    );
+    caps.codecs[2] = entry(
+        RGFX_VIDEO_CODEC_HEVC,
+        RGFX_VIDEO_DECODE,
+        RGFX_VIDEO_HEVC_MAIN | RGFX_VIDEO_HEVC_MAIN_10,
+        153,
+    );
+    caps.codecs[3] = entry(RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, 0, 153);
+    // Past the count: not listed.
+    caps.codecs[4] = entry(
+        RGFX_VIDEO_CODEC_H264,
+        RGFX_VIDEO_DECODE,
+        RGFX_VIDEO_H264_MAIN,
+        40,
+    );
+    assert_eq!(
+        vt_decoders(&caps),
+        vec![
+            paravirt::Decoder {
+                codec: paravirt::Codec::H264,
+                profiles: vec![66, 77, 100],
+                max_level: 52,
+            },
+            paravirt::Decoder {
+                codec: paravirt::Codec::Hevc,
+                profiles: vec![1, 2, 3],
+                max_level: 153,
+            },
+        ]
+    );
+    let main10 = RgfxVideoCaps {
+        codec_count: 1,
+        codecs: {
+            let mut codecs = [RgfxVideoCodecCaps::default(); RGFX_VIDEO_CAPS_CODECS];
+            codecs[0] = entry(
+                RGFX_VIDEO_CODEC_HEVC,
+                RGFX_VIDEO_DECODE,
+                RGFX_VIDEO_HEVC_MAIN_10,
+                120,
+            );
+            codecs
+        },
+        ..caps
+    };
+    assert_eq!(vt_decoders(&main10)[0].profiles, vec![2]);
+}

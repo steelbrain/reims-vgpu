@@ -1599,6 +1599,64 @@ Stages:
       of decodes alone; a CPU lock downloads it in 1 to 5 ms. Where the GPU
       shares the CPU's memory, the copy writes the surface's pages, on the
       decode queue.
+17. **An arm64 guest's hardware video is VideoToolbox's paravirtual path,
+    over the arm64e kext.** AppleGVA's vendor-driver route is x86-64's
+    (item 16). An arm64 guest's VideoToolbox has the path Apple's VMs use
+    instead: where VideoToolboxParavirtualizationSupport finds a service of
+    class `AppleVideoToolboxParavirtualizationDriver` and opens it, the
+    guest's VideoToolbox counts itself as running in a guest, asks the host
+    for its decoders and encoders, and registers each one the host lists as
+    `paravirtualized:<ID>`, hardware-accelerated; its own
+    `ParavirtualizedVideoDecoder` and `ParavirtualizedVideoEncoder` then run
+    each session as messages to the host (read from VideoToolbox and the
+    support framework, macOS 27.0.1 arm64e; [the old protocol's
+    doc](../video/devices.md) at tag `arm64-last-capable` lists the messages,
+    which Apple's VMs carry over a virtio device of their own).
+    - **The guest's side is the arm64e kext's.** Where the guest took
+      `RGFX_FEATURE_VT_MESSAGES` and the caps list a decoder, display 0's
+      framebuffer publishes a service of that class (`RgfxVtService.hpp`),
+      whose user client answers
+      the framework's five selectors as Apple's kext of that class does
+      (read from `AppleVideoToolboxParavirtualization.kext` 15.0.0, the
+      macOS 27.2.1 arm64e VM kernel collection): 0 sizes the message buffer
+      (at most 10 MiB) and answers its capacity and the user addresses of
+      the buffer and of the host-message queue, an IOSharedDataQueue the
+      kext maps into the process; 1 and 2 register and deregister a 16-byte
+      session UUID for the client; 3 sends the buffer's first `length`
+      bytes, with up to five IOSurface IDs, and answers the host's status
+      for it, as its output and as its return (the kext answers a message
+      that names a surface `kVTParameterErr` for now: nothing the host
+      answers yet takes one); 4 moves the host messages kept while the
+      queue was full into it. The notification port is type
+      0. Apple's kext of that class binds only to Apple's VM device
+      (106b:1a03), which no VM of ours has, so it never loads beside ours.
+    - **The wire:** `VT_MESSAGE` on ring 0 carries one message: its length,
+      the guest RAM runs of the client's message buffer that hold it, and
+      the IDs of the IOSurfaces it lends. It waits for no
+      command buffer and no buffer waits for it. The host reads the message
+      from guest RAM, hands it to its session layer, and answers
+      `VT_STATUS` with the status VideoToolbox's host side would return. A
+      message from the host (a reply, a request, an emitted frame; 16 KiB
+      at most, the framework's dequeue buffer) comes as `VT_MESSAGE` on the
+      control completion ring, its bytes inline; the kext gives it to every
+      client that registered its UUID, and a `Bye!` to every client with
+      each UUID written in, as Apple's kext does. A deregistration of a
+      UUID the client registered sends the host `-uui` for it, and so does
+      a client's close for each UUID it holds, as Apple's kext does.
+    - **The answers are the host's arms'.** `decs` lists one decoder for
+      each codec the caps decode, `dcap` its profiles and level from the
+      caps' entry; a codec the host lacks is not listed, so VideoToolbox
+      decodes it in software as on a Mac without it. `encs` lists no
+      encoder and `meps` no processor, and every create is answered with a
+      refusal in its reply's `,err`, as for a codec the host lacks
+      (`reims_vgpu_video::paravirt`). A host with no arm offers no caps and
+      the kext publishes no service: the guest's VideoToolbox is then not a
+      guest's.
+    - **No host offers `VT_MESSAGES` yet.** A guest's VideoToolbox would
+      list our decoders as hardware while no session of one can run, so
+      the host offers the bit once its decode sessions do; until then the
+      arm64e kext publishes no service, and the guest answers no hardware
+      decoder for any codec, as before the bit.
 
 ## What metal2vulkan adds in stage 3
 
@@ -2125,6 +2183,18 @@ only where no negotiation can carry it.
   games", below). The device offers it where the host made it with a window,
   on a device of one display as of several, and sends the event only to a
   guest that took it. Both kexts take it; the firmware drivers do not.
+- Bit 52, `FEATURES_HI`'s bit 20, is `VT_MESSAGES`: ring 0 carries the arm64e
+  kext's `VT_MESSAGE` (0x2fa, `RgfxVtMessage`, then its runs: one message of
+  the guest's VideoToolbox to its host side), which the host answers
+  `VT_STATUS` (0x40d, `RgfxVtStatus`: the status VideoToolbox's host side
+  returns for it), and the control completion ring carries the host's side's
+  messages to the guest's as the event `VT_MESSAGE` (0x40e,
+  `RgfxVtHostMessage`, its bytes inline, `seqno` 0), sent only to a guest that
+  took the bit (item 17 of "Decided", above). The device refuses a
+  `VT_MESSAGE` of a guest that did not take it as one it could not read
+  (`RGFX_VT_STATUS_MALFORMED`). The arm64e kext takes it, and publishes the
+  service only where the caps list a decoder; the x86-64 kext and the firmware
+  drivers do not. No host offers it yet (item 17).
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed

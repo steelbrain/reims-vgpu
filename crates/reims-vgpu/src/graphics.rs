@@ -86,16 +86,20 @@ use reims_vgpu_graphics::wire::{
     RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
     RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_NOT_FOUND, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
     RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED,
-    RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant, RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete,
-    RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled,
-    RgfxFunctionPointerState, RgfxHeapOverPages, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader,
-    RgfxPageRun, RgfxPipelineAnswersQuery, RgfxRateMapAnswer, RgfxRateMapState, RgfxSamplerState,
-    RgfxScheduledAsk, RgfxSharedEventName, RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
+    RGFX_VIDEO_CAPS_VERSION, RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE,
+    RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH, RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN,
+    RGFX_VIDEO_HEVC_MAIN_10, RGFX_VT_STATUS_MALFORMED, RgfxBlockGrant, RgfxBlockRelease,
+    RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry,
+    RgfxDisplayColor, RgfxEventSignalled, RgfxFunctionPointerState, RgfxHeapOverPages,
+    RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxPipelineAnswersQuery,
+    RgfxRateMapAnswer, RgfxRateMapState, RgfxSamplerState, RgfxScheduledAsk, RgfxSharedEventName,
+    RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
 use reims_vgpu_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, DoorbellAt, Host, Mode, PresentAnswer,
-    QueueClaim, RawDoorbell, RingDegradation, Scanout, Screen,
+    QueueClaim, RawDoorbell, RingDegradation, Scanout, Screen, VtAnswer, VtLink, VtMessage,
 };
+use reims_vgpu_video::paravirt;
 use reims_vgpu_vulkan::core::host::HostQueue;
 use reims_vgpu_vulkan::core::memory::map::MemoryMap as CoreMemoryMap;
 use reims_vgpu_vulkan::core::num::ToU64;
@@ -640,13 +644,16 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             }
             region.write(RGFX_DEVICE_INFO_OFFSET, info.as_bytes());
             // The host's hardware video, whose codecs the video caps after the device info list
-            // for the guest's video driver.
+            // for the guest's video driver, and whose decoders VideoToolbox's paravirtual path
+            // lists for an arm64 guest's.
+            let mut vt = paravirt::Host::default();
             let video_runtime = crate::video::runtime::PlatformRuntime::of(&platform);
             if let Some(video) = platform.graphics_video(&gpu_device, video_runtime) {
                 let caps = video_caps(features, &*video);
                 let cached = caps.flags & RGFX_VIDEO_CAPS_OUTPUT_CACHED != 0;
                 debug_assert!(caps.codec_count as usize <= RGFX_VIDEO_CAPS_CODECS);
                 region.write(RGFX_VIDEO_CAPS_OFFSET, caps.as_bytes());
+                vt = paravirt::Host::new(vt_decoders(&caps));
                 if cached && video.imports_device_caches() {
                     decoder.set_exportable_caches();
                 } else if cached && video.decodes_into_device_caches() {
@@ -699,6 +706,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 features_16k,
                 deferred_budget,
                 control: Arc::clone(&control),
+                vt,
             });
             // Display 0's window, then those of displays 1 and up, or none.
             let window_configs: Vec<Option<WindowConfig>> = match config.window {
@@ -3026,6 +3034,9 @@ struct CallbackHost<P: ApiPlatform> {
     deferred_budget: u64,
     /// The stage-3 decoder, fed the stage-3 messages of ring 0 and of the queues' rings.
     control: Arc<GraphicsControl<P>>,
+    /// The host's side of VideoToolbox's paravirtual messages ([`paravirt`]), over the decoders
+    /// of the host's hardware video.
+    vt: paravirt::Host,
 }
 
 impl<P: ApiPlatform> Host for CallbackHost<P> {
@@ -3189,6 +3200,83 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
     fn scheduled_ask(&self, completion: &CompletionPoster, message: &[u8]) {
         stepped(|| self.control.scheduled_ask(completion, message));
     }
+
+    fn vt_message(&self, message: VtMessage, answer: VtAnswer, link: VtLink) {
+        let length = message.message.length;
+        let Some(bytes) = self.control.decoder().guest_bytes(&message.runs, length) else {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "a VT_MESSAGE of {length} bytes: its runs lie outside the guest RAM the host maps"
+            );
+            answer.answer(RGFX_VT_STATUS_MALFORMED);
+            return;
+        };
+        let answered = self.vt.deliver(&bytes);
+        for reply in &answered.replies {
+            if !link.send(reply) {
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "a {}-byte VideoToolbox message to the guest was not sent",
+                    reply.len()
+                );
+            }
+        }
+        answer.answer(answered.status);
+    }
+}
+
+/// The decoders VideoToolbox's paravirtual path lists ([`paravirt::Host`]): one for each decode
+/// entry of `caps` of H.264 or HEVC with a profile, its profiles as VideoToolbox numbers them
+/// (H.264's `profile_idc`; HEVC's `general_profile_idc`, Main Still Picture where Main is, whose
+/// decoder takes its streams) and its level the caps'.
+fn vt_decoders(caps: &RgfxVideoCaps) -> Vec<paravirt::Decoder> {
+    let count = usize::try_from(caps.codec_count)
+        .unwrap_or(usize::MAX)
+        .min(RGFX_VIDEO_CAPS_CODECS);
+    let numbered = |bits: u32, numbers: &[(u32, u32)]| -> Vec<u32> {
+        numbers
+            .iter()
+            .filter(|&&(bit, _)| bits & bit != 0)
+            .map(|&(_, number)| number)
+            .collect()
+    };
+    caps.codecs
+        .iter()
+        .take(count)
+        .filter(|c| c.direction == RGFX_VIDEO_DECODE)
+        .filter_map(|c| {
+            let (codec, profiles) = match c.codec {
+                RGFX_VIDEO_CODEC_H264 => (
+                    paravirt::Codec::H264,
+                    numbered(
+                        c.profiles,
+                        &[
+                            (RGFX_VIDEO_H264_BASELINE, 66),
+                            (RGFX_VIDEO_H264_MAIN, 77),
+                            (RGFX_VIDEO_H264_HIGH, 100),
+                        ],
+                    ),
+                ),
+                RGFX_VIDEO_CODEC_HEVC => (
+                    paravirt::Codec::Hevc,
+                    numbered(
+                        c.profiles,
+                        &[
+                            (RGFX_VIDEO_HEVC_MAIN, 1),
+                            (RGFX_VIDEO_HEVC_MAIN_10, 2),
+                            (RGFX_VIDEO_HEVC_MAIN, 3),
+                        ],
+                    ),
+                ),
+                _ => return None,
+            };
+            (!profiles.is_empty()).then_some(paravirt::Decoder {
+                codec,
+                profiles,
+                max_level: c.max_level,
+            })
+        })
+        .collect()
 }
 
 /// Runs `f`, a callback of the device's that may call the GPU's driver, as a step of the exit

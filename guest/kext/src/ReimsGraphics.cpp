@@ -1151,6 +1151,16 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		// The host's pointer drives the guest's own mouse (RgfxPointerDevice.hpp).
 		pointerMotion(payload, size);
 		return;
+#if defined(__arm64e__)
+	case RGFX_EVT_VT_STATUS:
+		// A VT_MESSAGE's answer, for the thread that sent it (RgfxVtService.hpp).
+		answerLifecycle(type, seqno, payload, size);
+		return;
+	case RGFX_EVT_VT_MESSAGE:
+		// The host's side's message, for the guest's VideoToolbox (RgfxVtService.hpp).
+		vtMessage(payload, size);
+		return;
+#endif
 	case RGFX_EVT_POINTER_OVER:
 		// The host's pointer is over another display: the cursor goes there
 		// (ReimsGraphicsPointer.cpp).
@@ -1652,6 +1662,10 @@ bool ReimsGraphics::start(IOService *provider)
 	pipelineAnswersTaken = false;
 	multiDisplayTaken = false;
 	pointerMotionTaken = false;
+#if defined(__arm64e__)
+	vtMessagesTaken = false;
+	vtService = nullptr;
+#endif
 	displayBoundsTaken = false;
 	boundsTold = {};
 	displayCount = 0;
@@ -1828,6 +1842,9 @@ bool ReimsGraphics::start(IOService *provider)
 		    (RGFX_FEATURE_PIPELINE_KEYS | RGFX_FEATURE_PIPELINE_ANSWERS);
 		multiDisplayTaken = (took & RGFX_FEATURE_MULTI_DISPLAY) != 0;
 		pointerMotionTaken = (took & RGFX_FEATURE_POINTER_MOTION) != 0;
+#if defined(__arm64e__)
+		vtMessagesTaken = (took & RGFX_FEATURE_VT_MESSAGES) != 0;
+#endif
 		constexpr uint64_t kCarriesPast = RGFX_FEATURE_MULTI_DISPLAY | RGFX_FEATURE_POINTER_OVER |
 		                                  RGFX_FEATURE_DISPLAY_BOUNDS;
 		displayBoundsTaken = (took & kCarriesPast) == kCarriesPast;
@@ -1904,6 +1921,9 @@ bool ReimsGraphics::start(IOService *provider)
 		releaseRegistrations();
 #endif
 		startPointerDevice();
+#if defined(__arm64e__)
+		startVtService();
+#endif
 		return true;
 	}
 fail:
@@ -1946,6 +1966,7 @@ void ReimsGraphics::stop(IOService *provider)
 	quiesce();
 	stopPointerDevice();
 #if defined(__arm64e__)
+	stopVtService();
 	freeMobileChanges();
 #endif
 	freePointer();

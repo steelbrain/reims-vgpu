@@ -242,6 +242,10 @@ mod desktop;
 mod gate;
 mod guest_times;
 mod lanes;
+mod vt;
+
+pub use vt::{VtAnswer, VtLink, VtMessage};
+pub(crate) use vt::{read_message as vt_read, vt_status};
 
 /// How many of ring 0's messages a doorbell's take reads ([`Backlog::read`]) before it leaves the
 /// buffer to its queue's thread.
@@ -380,7 +384,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_MULTI_DISPLAY
     | RGFX_FEATURE_POINTER_OVER
     | RGFX_FEATURE_DISPLAY_BOUNDS
-    | RGFX_FEATURE_POINTER_MOTION;
+    | RGFX_FEATURE_POINTER_MOTION
+    | RGFX_FEATURE_VT_MESSAGES;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
@@ -601,6 +606,20 @@ pub trait Host: Send + Sync + 'static {
     /// default does nothing, for a host with no stage-3 decoder.
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {
         let _ = (completion, message);
+    }
+
+    /// A `VT_MESSAGE` of the guest's VideoToolbox ([`RGFX_FEATURE_VT_MESSAGES`]), its runs and
+    /// length checked ([`VtMessage`]): the host reads its bytes from guest RAM, hands them to its
+    /// side of VideoToolbox's paravirtual protocol, and gives `answer` the status that side
+    /// returns, from any thread; `link` sends that side's messages to the guest, from any thread,
+    /// while no reset has come since. Called on the control thread with no lock of the device's
+    /// held, so the host carries the message out on a thread of its own where it waits for
+    /// anything, the guest's own messages among them. The default answers
+    /// [`RGFX_VT_STATUS_MALFORMED`], for a host with no such side, which offers no
+    /// `VT_MESSAGES`.
+    fn vt_message(&self, message: VtMessage, answer: VtAnswer, link: VtLink) {
+        let _ = (message, link);
+        answer.answer(RGFX_VT_STATUS_MALFORMED);
     }
 
     /// A `QUEUE_CREATE` made the command queue `completion` posts for: its rings and its service

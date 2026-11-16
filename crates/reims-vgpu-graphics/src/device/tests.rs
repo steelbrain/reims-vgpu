@@ -14,6 +14,7 @@ use crate::display::CursorImage;
 mod displays;
 mod motion;
 mod posting;
+mod vt;
 
 /// How many times [`eventually`] polls, a millisecond's sleep apart, for a state the device's own
 /// threads reach: a minute at least, as a loaded host starves those threads for seconds. A test

@@ -353,6 +353,9 @@ include = [
     "RgfxVideoSessionCreate",
     "RgfxViewMapping",
     "RgfxViewportElem",
+    "RgfxVtHostMessage",
+    "RgfxVtMessage",
+    "RgfxVtStatus",
 ]
 
 [struct]
