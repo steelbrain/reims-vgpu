@@ -65,6 +65,14 @@ xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework 
 cp "$here/oracle_surfresolve.sh" "$out/"
 xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal \
 	-framework IOSurface -framework Foundation "$here/oracle_allocsize.m" -o "$out/oracle_allocsize"
+# oracle_fnreflect runs on every release the guests run (macOS 11 on), and its library is built for
+# macOS 26 and for macOS 11.
+xcrun clang -arch "$arch" -mmacosx-version-min=11.0 -fobjc-arc -Wall -framework Metal \
+	-framework Foundation "$here/oracle_fnreflect.m" -o "$out/oracle_fnreflect"
+xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 "$here/oracle_fnreflect.metal" \
+	-o "$out/oracle_fnreflect.metallib"
+xcrun -sdk macosx metal -std=macos-metal2.3 -mmacosx-version-min=11.0 "$here/oracle_fnreflect.metal" \
+	-o "$out/oracle_fnreflect_11.metallib"
 for m in oracle_bundle oracle_bundle_mesh oracle_bundle_rt oracle_bundle_args; do
 	xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 "$here/$m.metal" \
 		-o "$out/$m.metallib" || echo "oracle_bundle: $m.metallib not built"
