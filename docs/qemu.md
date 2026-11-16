@@ -625,6 +625,46 @@ macOS 26 guest's boot logo, Dock icons and widgets (**measured**).
 metal2vulkan keeps a host-copied texture out of memory the host maps without
 coherence (since `edb5ffd8cc`), and the guest draws them whole.
 
+### Linux hosts: Intel GPUs on i915: a reset of QEMU's context
+
+i915 resets a context on the render engine (`rcs0`) that the GPU does not
+preempt within the engine's `preempt_timeout_ms`, 7500 ms on Gen12 (Linux's
+`CONFIG_DRM_I915_PREEMPT_TIMEOUT_COMPUTE`: Gen12 has no mid-thread
+preemption), and logs `qemu-system-x86[PID] context reset due to GPU hang`.
+With GuC submission, i915's default on Alder Lake-P, Raptor Lake-S and later
+(`intel_uc.c`), GuC applies that timeout, which a context takes into its GuC
+policy when it registers (`register_context`). The heartbeat
+(`heartbeat_interval_ms`, 2500) raises its pulse's priority each interval
+and waits twice the preempt timeout at the highest before i915 resets the
+engine itself. The GPU preempts between commands and thread groups: i915
+sets Gen12's compute preemption to thread groups
+(`WaDisableGPGPUMidThreadPreemption:gen12`), and ANV (Mesa 26.0.8 and
+26.2.6, `init_render_queue_state`) keeps compute there, sets 3D preemption
+to mid-command-buffer, and on Gen12.0 turns preemption off during a draw. So
+one draw or one thread group that runs past the timeout is reset, where a
+command buffer of many runs on (**read from code**, Linux 7.0).
+
+**Measured** on `homelab-ms01-1` (Raptor Lake-P's Iris Xe, 96 EUs, GuC
+70.49.4, Linux 7.3.1, Mesa 26.2.6, iHD 26.3.5; KDE Plasma on the same GPU),
+2026-11-16, x86-64 macOS 26.7.2 booted cold at master 818868564 with 8 vCPUs
+and 8 GiB, through Safari's scroll, WebGL and video pages, H.264 and HEVC in
+QuickTime Player, and three idle minutes (jobs m3-max-35697, m3-max-35741):
+- with i915's defaults, nothing was reset. The longest runtime command buffer
+  took 128 ms of GPU time (a render pass of Safari's scroll), and the two of
+  452 and 794 dispatches media analysis sends at boot
+  ([video/bugs.md](video/bugs.md), B26) 102 and 98 ms;
+- with `rcs0`'s `preempt_timeout_ms` at 50 while QEMU made its contexts (set
+  before QEMU started, restored at the QuickTime step), through the boot and
+  Safari's pages, nothing was reset either;
+- a reset of the whole GT through debugfs (`i915_wedged`, `rcs0`'s mask:
+  with GuC, i915 resets the whole GT) while QuickTime played logged QEMU's
+  context reset as above. The runtime made its `VkDevice` again in 209 ms
+  (one command buffer failed as `GpuHang`), and the guest ran on with no
+  fatal: QuickTime's decode session landed all its 1171 pictures, the next one
+  1162. The desktop picture showed flat green from then to the run's end; the
+  recovery's notice counted 449 textures whose contents were lost, 421 of them
+  `Private`. KWin kept compositing.
+
 ### Linux hosts: NVIDIA's pipeline import budget
 
 **Measured** on an RTX 3090 and an RTX 5080 Laptop GPU, NVIDIA driver
