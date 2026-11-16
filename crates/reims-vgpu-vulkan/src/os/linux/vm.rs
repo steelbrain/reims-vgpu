@@ -1434,6 +1434,21 @@ impl HostVm for LinuxVm {
                 .collect(),
         }
     }
+
+    /// One dma-buf's limits, its bytes at most a group's ([`super::dma_buf::group_limits`]),
+    /// where udmabuf is the process's and its devices take a view through its dma-bufs: RADV's,
+    /// through its source's ([`super::import::groups_views`]), or one dma-buf's in place of the
+    /// pointer they refuse ([`super::import::one_dma_buf_views`]), as ANV's on i915 does.
+    fn regroup_limits(&self) -> Option<GroupLimits> {
+        let takes = super::import::groups_views() || super::import::one_dma_buf_views();
+        (takes && super::dma_buf::opens()).then(|| {
+            let limits = super::dma_buf::group_limits();
+            GroupLimits {
+                runs: limits.pieces,
+                bytes: limits.bytes,
+            }
+        })
+    }
 }
 
 #[cfg(test)]

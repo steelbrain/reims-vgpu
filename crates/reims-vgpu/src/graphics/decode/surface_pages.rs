@@ -163,7 +163,16 @@
 //! `GROUP_BYTES`; CachyOS's 7.3 kernels boot with udmabuf's `size_limit_mb` at 2147483647). They
 //! are the guest's RAM, resident anyway; the guest reuses them once the kext unwires them.
 //!
+//! **Regroups.** A context that makes its views one at a time, each followed by a ring-0 message
+//! that waits for it, forms groups of one, and most such views live long: once a second, the lone
+//! views of several runs that are 2 s old or older are moved into regroups, one view of all their
+//! pages per context within the platform's limits ([`HostVm::regroup_limits`]), its import made
+//! on the surface worker, each member's buffers moved there on its context's ring-0 lane, a few
+//! members at each of its messages ([`regroup`], which holds the measurements). A regroup holds
+//! its members gone as a group does, so a view of more than 1 MiB stays alone.
+//!
 //! [`HostVm::view_groups`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::view_groups
+//! [`HostVm::regroup_limits`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::regroup_limits
 //! [`HostVm::group_views`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::group_views
 //!
 //! **By runs.** A cached block (`RGFX_SURFACE_PAGES_CACHED`) on a device that copies the guest's
@@ -436,6 +445,23 @@ impl<P: Platform> SurfaceView<P> {
                 teardown,
                 here: AtomicBool::new(false),
             }),
+            life: MemoryLife::new(),
+            group: Mutex::new(None),
+        }
+    }
+
+    /// The `length` bytes at `offset` in `whole` as a view of their own, which holds `whole`'s
+    /// mapping while it lives: a pages block's place in a regroup's view ("Regroups").
+    fn slice(whole: &SurfaceView<P>, offset: u64, length: u64) -> Self {
+        debug_assert!(
+            offset
+                .checked_add(length)
+                .is_some_and(|end| end <= whole.length)
+        );
+        SurfaceView {
+            base: whole.base.wrapping_add(offset),
+            length,
+            held: Arc::clone(&whole.held),
             life: MemoryLife::new(),
             group: Mutex::new(None),
         }
@@ -813,6 +839,24 @@ pub(crate) struct Private<P: Platform> {
     /// Pages its process maps read-only (`RGFX_SURFACE_PAGES_READ_ONLY`): only a buffer whose GPU
     /// writes are dropped lies over the block (`GraphicsDecoder::read_only_pages_admit`).
     read_only: bool,
+    /// When its view was made, which a regroup takes only once old enough ("Regroups").
+    made: Option<MonoTime>,
+    /// The objects its `BUFFER_OVER_PAGES` made, by id, which a regroup moves into its view
+    /// (each looked up again then: one since destroyed, or an id given to another object, is
+    /// left out).
+    buffers: Vec<u64>,
+    /// A heap lies over its view, which no regroup moves.
+    heaped: bool,
+    /// The platform refused to move its view's import buffer into a regroup's view: no regroup
+    /// takes it again ("Regroups").
+    stays: bool,
+    /// A member of a regroup made and not yet moved to: no other pass takes it ("Regroups").
+    queued: bool,
+    /// Its place in a regroup's view, once its buffers moved there ("Regroups"), and the views
+    /// it lay in before, kept mapped while it lives: what its objects' entries name as their
+    /// bytes.
+    regrouped: Option<regroup::Member>,
+    retired: Vec<Arc<SurfaceView<P>>>,
 }
 
 /// What makes the view of a block named by its runs (the module doc): its runs, checked, the
@@ -903,6 +947,8 @@ pub(crate) struct SurfaceViews<P: Platform> {
     /// By context, its ring-0 messages that wait for its no-copy buffers being made
     /// ([`WaitsForViews`]).
     waiting: HashMap<u32, u64>,
+    /// The regroups of lone views ("Regroups", [`regroup`]).
+    regroups: regroup::Regroups<P>,
 }
 
 /// What a `SURFACE_PAGES` found under the views' lock ([`SurfaceViews::surface_pages`]).
@@ -949,6 +995,7 @@ impl<P: Platform> SurfaceViews<P> {
             group_changed: Arc::new(Condvar::new()),
             handed: HashMap::new(),
             waiting: HashMap::new(),
+            regroups: regroup::Regroups::default(),
         }
     }
 
@@ -1184,6 +1231,13 @@ impl<P: Platform> SurfaceViews<P> {
                         mapped: None,
                         ram,
                         read_only,
+                        made: None,
+                        buffers: Vec::new(),
+                        heaped: false,
+                        stays: false,
+                        queued: false,
+                        regrouped: None,
+                        retired: Vec::new(),
                     },
                 );
                 Ok(())
@@ -1615,6 +1669,7 @@ impl<P: Platform> SurfaceViews<P> {
             return Ok(None);
         };
         p.view = Some((Arc::clone(&view), import));
+        p.made = Some(clock.now_mono());
         v.counts.private += 1;
         Ok(Some(view))
     }
@@ -2059,7 +2114,8 @@ impl<P: Platform> SurfaceViews<P> {
             && let Some((made, import)) = p.view.take()
         {
             let cached = (self.cache.iter()).any(|c| Arc::ptr_eq(&c.view, &made));
-            if cached || made.length() > CACHED_PAGES_BYTES {
+            // A regroup's slice goes with its block: its pages lie in the regroup's import.
+            if cached || made.length() > CACHED_PAGES_BYTES || p.regrouped.is_some() {
                 p.view = Some((made, import));
             } else {
                 evicted = self.cache_view(p.runs.clone(), made, import, idle_mappings);
@@ -2098,10 +2154,13 @@ impl<P: Platform> SurfaceViews<P> {
         let cache = std::mem::take(&mut self.cache);
         // The groups being formed make nothing: their views and messages go.
         let forming = std::mem::take(&mut self.forming);
+        // So do the regroups made and not yet moved ("Regroups").
+        let regroups = self.regroups_reset();
         self.group_changed.notify_all();
         self.by_runs.clear();
         self.laid_out.clear();
-        if let Err(refusal) = refusals::refusing(move || drop((views, private, cache, forming))) {
+        let all = (views, private, cache, forming, regroups);
+        if let Err(refusal) = refusals::refusing(move || drop(all)) {
             log::warn!(
                 target: "reims_vgpu::graphics", kind:% = refusal;
                 "the IOSurface views were let go of at the device's reset, and a release was \
@@ -2442,6 +2501,7 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             .over(Some((m.block_offset, m.block_size)))
             .with_bytes(Some(bytes));
         self.store(m.obj_id, entry);
+        (self.shared.surface_views.lock()).buffer_made(m.block_offset, m.obj_id);
         Ok(Ok(()))
     }
 
@@ -2577,7 +2637,11 @@ impl<P: Platform> super::GraphicsDecoder<P> {
                 m.block_size,
                 self.context,
             )?
-            .map(|view| (view.base(), view.length())),
+            .map(|view| {
+                // A heap over the view: no regroup moves the block ("Regroups").
+                (self.shared.surface_views.lock()).heap_made(m.block_offset);
+                (view.base(), view.length())
+            }),
         };
         let Some((at, length)) = pages.and_then(|(at, room)| {
             let length = m.size_bytes.checked_next_multiple_of(super::HEAP_PAGE)?;
@@ -2707,6 +2771,7 @@ impl<P: Platform> OwnPages<P> {
 
 #[cfg(test)]
 pub(super) mod costs;
+pub(crate) mod regroup;
 
 #[cfg(test)]
 pub(super) mod tests {

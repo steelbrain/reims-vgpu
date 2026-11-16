@@ -6,6 +6,7 @@ use std::ptr::NonNull;
 use std::sync::{Arc, Weak};
 
 use crate::core::host::HostPtr;
+use crate::core::platform::device::NoCopyDeallocator;
 #[cfg(unix)]
 use crate::core::platform::resource::ExportedMemory;
 use crate::core::platform::resource::{
@@ -1035,6 +1036,63 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
     #[cfg(unix)]
     fn external_write_done(&self) -> Result<(), String> {
         plain(|| self.raw.external_write_done()).map_err(|error| error.to_string())
+    }
+
+    /// The runtime's `rebind_bytes_no_copy`, given the new bytes as a no-copy buffer's are at
+    /// its making (`no_copy_release`: the import source's view of them, the keep-alive that
+    /// holds them mapped until the runtime freed its import of them). New bytes the process maps
+    /// read-only are refused, as the buffer's GPU writes would then be dropped where they reached
+    /// the pages before; so is a buffer over pages read-only or made with bit 24.
+    fn rebind_no_copy(
+        &self,
+        bytes: HostRange<'_>,
+        deallocator: Option<NoCopyDeallocator>,
+    ) -> Result<(), String> {
+        use crate::gpu::device::{NoCopyImport, no_copy_release, runtime_deallocator};
+        if self.backing.read_only_now() {
+            return Err("a buffer whose GPU writes are dropped".to_owned());
+        }
+        if bytes.len() != plain(|| self.raw.length()) {
+            return Err("new bytes of another length".to_owned());
+        }
+        let Some(start) = NonNull::new(bytes.ptr().as_ptr::<u8>()) else {
+            return Err("new bytes at no address".to_owned());
+        };
+        let slot = deallocator.map(|d| Arc::new(Mutex::new(Some(d))));
+        let run = slot
+            .as_ref()
+            .map(|slot| runtime_deallocator(slot, |d: NoCopyDeallocator, _, _| d()));
+        let NoCopyImport {
+            at,
+            run,
+            keep,
+            read_only,
+            vouched,
+            made,
+        } = no_copy_release(
+            start,
+            bytes.len(),
+            run,
+            crate::gpu::backing::ImportSite::NoCopyDescriptor,
+        );
+        if read_only {
+            return Err("new bytes mapped read-only".to_owned());
+        }
+        // SAFETY: `HostRange::new`'s contract keeps the bytes mapped until the deallocator runs,
+        // and the keep-alive holds the import's pages mapped until the runtime freed it. The
+        // runtime's rebind allows encodes and commits of the buffer on other threads; the trait's
+        // caller moves no other of its bytes and makes no texture over them meanwhile.
+        let rebound = plain(|| unsafe {
+            let memory = crate::os::host_memory_vouched(at, vouched);
+            self.raw.rebind_bytes_no_copy(memory, run, Some(keep))
+        });
+        match rebound {
+            Ok(()) => {
+                made.made(&self.device.raw);
+                Ok(())
+            }
+            Err(error) => Err(error.to_string()),
+        }
     }
 }
 

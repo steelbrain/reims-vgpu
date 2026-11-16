@@ -693,6 +693,10 @@ impl HostVm for VulkanVm {
         self.vm.group_views(views)
     }
 
+    fn regroup_limits(&self) -> Option<GroupLimits> {
+        self.vm.regroup_limits()
+    }
+
     fn deallocate(&self, addr: HostAddr, len: u64) -> KernReturn {
         // At the unmap (module docs).
         let pages = self.changed(pages(addr, len, self.page_size()));

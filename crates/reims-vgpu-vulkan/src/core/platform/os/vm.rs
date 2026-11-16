@@ -155,6 +155,16 @@ pub trait HostVm: Send + Sync {
             members: views.iter().map(|_| None).collect(),
         }
     }
+    /// No Metal counterpart: where the devices of the process import a view of guest pages as
+    /// one file while it fits these limits, and every file imported costs every submission
+    /// (RADV's views through their sources' dma-bufs, ANV's views one dma-buf holds,
+    /// `os::linux::import`), the most runs and bytes such a view holds: the most a regroup of
+    /// lone views into one view of all their pages takes (the graphics lane's
+    /// `decode::surface_pages`, "Regroups"). `None`, the default, where a view's import is made
+    /// otherwise, and one view of many gains nothing.
+    fn regroup_limits(&self) -> Option<GroupLimits> {
+        None
+    }
 }
 
 /// What one shared file of views takes at most ([`HostVm::view_groups`]): runs of pages, and bytes.

@@ -387,11 +387,11 @@ pub(crate) fn host_range_remapped(bytes: HostPtr, length: u64) {
 
 /// A deallocator of core's the runtime may run, once, or drop unrun when it refuses the buffer:
 /// whichever comes first takes it from the slot.
-type Slot<D> = Arc<Mutex<Option<D>>>;
+pub(crate) type Slot<D> = Arc<Mutex<Option<D>>>;
 
 /// The runtime's deallocator over `slot`: it takes core's and runs it, marked ours, with the
 /// buffer's pointer and length.
-fn runtime_deallocator<D: Send + 'static>(
+pub(crate) fn runtime_deallocator<D: Send + 'static>(
     slot: &Slot<D>,
     run: impl FnOnce(D, NonNull<u8>, u64) + Send + 'static,
 ) -> rt::Deallocator {
@@ -427,7 +427,7 @@ fn keep_unrun<D, T>(made: &RaiseResult<Option<T>>, slot: Option<Slot<D>>) {
 /// ([`Backing::imported`]); whether the runtime may be told the pages are writable
 /// (`os::ImportView::vouched`); and the word that the import was made, which the caller
 /// gives once the runtime's call returned ([`crate::os::ImportMade`]).
-fn no_copy_release(
+pub(crate) fn no_copy_release(
     start: NonNull<u8>,
     length: u64,
     run: Option<rt::Deallocator>,
@@ -454,20 +454,20 @@ fn no_copy_release(
 }
 
 /// What [`no_copy_release`] gives the runtime for a no-copy object.
-struct NoCopyImport {
+pub(crate) struct NoCopyImport {
     /// The first byte the runtime imports.
-    at: NonNull<u8>,
+    pub(crate) at: NonNull<u8>,
     /// The runtime's deallocator.
-    run: Option<rt::Deallocator>,
+    pub(crate) run: Option<rt::Deallocator>,
     /// What keeps the import's pages mapped until the runtime freed it.
-    keep: rt::KeepAlive,
+    pub(crate) keep: rt::KeepAlive,
     /// The pages are mapped read-only (`os::ImportView::read_only`).
-    read_only: bool,
+    pub(crate) read_only: bool,
     /// The runtime may be told the pages are writable.
-    vouched: bool,
+    pub(crate) vouched: bool,
     /// The word that the runtime's import was made, given once its call returned
     /// ([`crate::os::ImportMade`]).
-    made: crate::os::ImportMade,
+    pub(crate) made: crate::os::ImportMade,
 }
 
 /// [`create`] of a buffer, its nil answer logged with its reason, once ([`no_buffer`]): `pinned`

@@ -1745,6 +1745,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         // A message of a context whose no-copy buffer is being made on the surface worker, which
         // it may name, is carried out after it.
         self.wait_for_pages_buffers(poster, message);
+        if poster.queue_obj_id().is_none() {
+            self.regroup_step(poster, message);
+        }
         match r#type {
             RGFX_CMD_RENDER_PIPELINE_CREATE
             | RGFX_CMD_MESH_RENDER_PIPELINE_CREATE
@@ -2655,6 +2658,56 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             }),
         );
         true
+    }
+
+    /// At a ring-0 message, before it is carried out (`decode::surface_pages`, "Regroups"): the
+    /// regroups of its context made ready, their members' buffers moved into their views here, on
+    /// the context's lane, as many as the message's budget takes, what that did logged and traced
+    /// (`regroup`: the context, the microseconds, the moves asked, the members taken up and those
+    /// left for its next messages); and where a pass is due, the pass handed to the surface
+    /// worker, under the reset gate, held shared recursively, as its other jobs are, where the
+    /// regroups' views are mapped and their imports made, off the lanes.
+    fn regroup_step(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) {
+        let context = sender_context(poster, message);
+        let decoder = self.decoder();
+        let (ready, due) = decoder.regroup_step(context, self.pool.now());
+        if ready {
+            let mover = (self.decoders).sender(Some(context), Sinks::default());
+            if let Some(moves) = mover.move_regroups() {
+                let us = u64::try_from(moves.took.as_micros()).unwrap_or(u64::MAX);
+                reims_vgpu_vulkan::core::trace::event(
+                    "regroup",
+                    &[
+                        u64::from(context),
+                        us,
+                        moves.rebinds,
+                        moves.handled,
+                        moves.left,
+                    ],
+                );
+                log::debug!(
+                    target: "reims_vgpu::graphics::surface_pages",
+                    "context {context}'s regroups: {} moves asked on its lane in {us} us, {} \
+                     members taken up, {} left for its next messages",
+                    moves.rebinds, moves.handled, moves.left
+                );
+            }
+        }
+        if due {
+            let me = Arc::clone(self);
+            decoder.on_surface_worker(
+                REGROUP_KEY,
+                Box::new(move || {
+                    let _carried = me.reset_gate.read_recursive();
+                    if let Err(raise) = me.decoder().regroup_pass(&me.device) {
+                        log::debug!(
+                            target: "reims_vgpu::graphics::surface_pages",
+                            "a regroups' pass ended at a raise: {raise:?}"
+                        );
+                    }
+                }),
+            );
+        }
     }
 
     /// The carrying out of a `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` handed to the surface
@@ -4018,6 +4071,10 @@ fn pages_context(context: u32) -> u64 {
 fn group_key(context: u32) -> u64 {
     0xffff_fffe_0000_0000 | u64::from(context)
 }
+
+/// The surface worker's key of the regroups' passes (`decode::surface_pages`, "Regroups"): one at
+/// a time, apart from every block's and group's jobs.
+const REGROUP_KEY: u64 = 0xffff_fffd_0000_0000;
 
 /// The name of the `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` `message`, and its pages block's
 /// offset; `None` for any other message.

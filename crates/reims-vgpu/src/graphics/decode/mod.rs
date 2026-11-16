@@ -758,6 +758,9 @@ pub(crate) struct Shared<P: Platform> {
     unified_memory: AtomicBool,
     /// The views of the IOSurfaces whose blocks name their own guest pages ([`surface_pages`]).
     surface_views: Mutex<surface_pages::SurfaceViews<P>>,
+    /// Held while a context's lane moves buffers into regroups' views, so that one context's
+    /// moves run at a time (`surface_pages::regroup`, "One move at a time").
+    regroup_moves: Mutex<()>,
     /// The life of each block of the region a video decode's output lay in, by its offset, as the
     /// host's video devices take its memory: made at the first such decode and ended at the
     /// block's `BLOCK_RELEASE` ([`video`]).
@@ -1056,6 +1059,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             closed: ClosedContexts::default(),
             unified_memory: AtomicBool::new(false),
             surface_views: Mutex::new(surface_pages::SurfaceViews::new(None, None)),
+            regroup_moves: Mutex::new(()),
             block_lives: Mutex::new(HashMap::new()),
             views_logged_at: AtomicU64::new(made_at.as_nanos()),
             slow_answers: Arc::default(),
@@ -1408,6 +1412,24 @@ impl<P: Platform> GraphicsDecoder<P> {
                 c.bad_runs, c.not_mapped, c.asked_in_place, c.asked_pending, c.asked_cache,
                 c.asked_room, c.grouped, c.groups
             );
+            let (r, held) = {
+                let mut v = views.lock();
+                (v.regroup_counts(), v.regroups_held())
+            };
+            if r.passes != 0 {
+                log::info!(
+                    target: "reims_vgpu::graphics",
+                    "regroups of lone pages blocks' views: {} passes, {} made, {} blocks moved \
+                     ({} buffers, {} refused, {} retried, {} left out as their block changed), at \
+                     most {} us on a lane; live: {} regroups of {} KiB, {} KiB of them members gone",
+                    r.passes, r.made, r.members, r.moved, r.refused, r.retried, r.left, r.most_us,
+                    held.regroups, held.bytes >> 10, held.gone >> 10
+                );
+                reims_vgpu_vulkan::core::trace::event(
+                    "regroups",
+                    &[held.regroups, held.bytes, held.gone, r.members, r.refused],
+                );
+            }
             if d.made != 0 {
                 log::info!(
                     target: "reims_vgpu::graphics",
@@ -2874,7 +2896,10 @@ impl<P: Platform> GraphicsDecoder<P> {
         // Let go of with no lock held: a view may hold the last of an import of the guest's
         // pages, which the platform may take long to let go of, and every context's surface
         // pages take the views' lock.
-        let views = self.shared.surface_views.lock().context_closed(context);
+        let (views, regroups) = {
+            let mut v = self.shared.surface_views.lock();
+            (v.context_closed(context), v.regroups_closed(context))
+        };
         let libraries = self.shared.libraries.lock().ids_of(context);
         for id in libraries {
             if let Err(refusal) = refusals::refusing(|| self.forget_library(id)) {
@@ -2885,6 +2910,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             context,
             objects,
             views,
+            regroups,
         };
         (dropped, closed)
     }
@@ -5720,6 +5746,8 @@ pub(crate) struct Closed<P: Platform> {
     objects: Vec<tables::Removed<P>>,
     /// Its pages blocks' views ([`surface_pages`]).
     views: Vec<surface_pages::Private<P>>,
+    /// Its regroups made and not yet moved (`surface_pages::regroup`).
+    regroups: Vec<surface_pages::regroup::Prepared<P>>,
 }
 
 impl<P: Platform> Closed<P> {
@@ -5732,6 +5760,7 @@ impl<P: Platform> Closed<P> {
             context,
             objects,
             views,
+            regroups,
         } = self;
         let mut copies = Vec::new();
         for r in objects {
@@ -5747,8 +5776,8 @@ impl<P: Platform> Closed<P> {
         for (id, copy) in copies {
             drop_refused(id, copy);
         }
-        if !views.is_empty()
-            && let Err(refusal) = refusals::refusing(move || drop(views))
+        if !(views.is_empty() && regroups.is_empty())
+            && let Err(refusal) = refusals::refusing(move || drop((views, regroups)))
         {
             log::warn!(
                 target: "reims_vgpu::graphics", kind:% = refusal;

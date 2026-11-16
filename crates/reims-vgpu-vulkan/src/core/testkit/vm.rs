@@ -154,6 +154,8 @@ struct VmState {
     view_groups: Option<GroupLimits>,
     /// [`HostVm::group_views`] leaves every view alone ([`FakeVm::refuse_view_groups`]).
     groups_refused: bool,
+    /// What [`HostVm::regroup_limits`] answers ([`FakeVm::set_regroup_limits`]).
+    regroup_limits: Option<GroupLimits>,
     /// The groups made so far.
     groups_made: u64,
     /// Each grouped view whose membership lives, by first byte: its group and its offset there.
@@ -224,6 +226,11 @@ impl FakeVm {
     /// [`HostVm::group_views`] group views within them.
     pub fn set_view_groups(&self, limits: Option<GroupLimits>) {
         self.state.lock().view_groups = limits;
+    }
+
+    /// Has [`HostVm::regroup_limits`] answer `limits` from now on (`None` at first, as Mach's).
+    pub fn set_regroup_limits(&self, limits: Option<GroupLimits>) {
+        self.state.lock().regroup_limits = limits;
     }
 
     /// Has [`HostVm::group_views`] leave every view alone from now on, as a host that makes no
@@ -546,6 +553,11 @@ impl HostVm for FakeVm {
     /// As set ([`FakeVm::set_view_groups`]); unlogged, as no Mach call answers it.
     fn view_groups(&self) -> Option<GroupLimits> {
         self.state.lock().view_groups
+    }
+
+    /// As set ([`FakeVm::set_regroup_limits`]); unlogged, as no Mach call answers it.
+    fn regroup_limits(&self) -> Option<GroupLimits> {
+        self.state.lock().regroup_limits
     }
 
     /// Where views are grouped ([`FakeVm::set_view_groups`]) and not refused

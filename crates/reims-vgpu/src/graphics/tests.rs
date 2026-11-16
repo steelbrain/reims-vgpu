@@ -12819,6 +12819,338 @@ fn a_burst_of_pages_buffers_of_one_context_shares_one_group() {
     assert_eq!(decoder.views_of_surfaces().forming(), (0, 0));
 }
 
+/// A device of [`surface_device`]'s whose platform regroups lone views
+/// (`decode::surface_pages::regroup`), with context 1's three pages blocks of
+/// [`grouped_blocks`], each with a buffer over its view, in no group; then a ring-0 message, the
+/// first that asks whether a pass is due (`SURFACE_PAGES` and the views' first
+/// `BUFFER_OVER_PAGES` are carried out on the surface worker), which sets the first a second on;
+/// then the platform's clock moved on by `age`, and a pass found due at a ring-0 message and
+/// carried out on the surface worker. Its fields drop in their order: the device before the
+/// guest's RAM.
+struct Regrouping {
+    device: GraphicsDevice<FakePlatform>,
+    platform: Arc<FakePlatform>,
+    _ram: reims_vgpu_vulkan::core::testkit::GuestRam,
+    guest: Guest,
+    blocks: Vec<u64>,
+    page: u64,
+    /// The call log's mark after the pass, before the message that moves the regroup.
+    mark: u64,
+    /// The next event's object id.
+    next: u64,
+}
+
+impl Regrouping {
+    fn after(age: Duration) -> Regrouping {
+        let runs = |at: u64| vec![(at, 1), (at + 2, 1)];
+        Regrouping::of(age, 16, &[runs(0), runs(4), runs(8)])
+    }
+
+    /// As [`Regrouping::after`], with a block of each of `runs`, given as (page, pages) of
+    /// `pages` pages of guest RAM, in place of [`grouped_blocks`]'.
+    fn of(age: Duration, pages: u64, runs: &[Vec<(u64, u64)>]) -> Regrouping {
+        let (device, platform, ram, page) = surface_device(pages);
+        platform.fake_vm().set_regroup_limits(Some(GROUP_LIMITS));
+        let mut guest = Guest::new(&device);
+        let blocks: Vec<u64> = (0..runs.len() as u64)
+            .map(|i| SURFACE_BLOCK + i * 0x4000)
+            .collect();
+        for (&block, runs) in blocks.iter().zip(runs) {
+            pages_block(&device, &mut guest, 1, block, page, runs);
+        }
+        device.control.decoder().surface_worker().flush();
+        for (i, (&block, runs)) in blocks.iter().zip(runs).enumerate() {
+            let length = runs.iter().map(|r| r.1).sum::<u64>() * page;
+            guest.send(
+                &device,
+                buffer_over_pages_of(obj(1, 11 + i as u64), block, length),
+            );
+        }
+        assert!(objects_become(&device, blocks.len()), "the buffers");
+        let mut r = Regrouping {
+            device,
+            platform,
+            _ram: ram,
+            guest,
+            blocks,
+            page,
+            mark: 0,
+            next: 20,
+        };
+        r.message();
+        r.platform.virtual_clock().advance(age);
+        r.message();
+        r.device.control.decoder().surface_worker().flush();
+        r.mark = r.platform.call_log().mark();
+        r
+    }
+
+    /// A ring-0 message of context 1's, carried out.
+    fn message(&mut self) {
+        let made = self.device.decoder_object_count() + 1;
+        self.guest
+            .send(&self.device, event_create(obj(1, self.next)));
+        self.next += 1;
+        assert!(objects_become(&self.device, made));
+    }
+
+    /// The rebinds the platform was asked for since the pass (`Buffer::rebind_no_copy`).
+    fn rebinds(&self) -> usize {
+        (self.platform.call_log().sels_since(self.mark).iter())
+            .filter(|&&s| s == "rebindNoCopy")
+            .count()
+    }
+}
+
+/// Lone pages blocks' views of one context, 2 s old or older, are moved into one regroup's view
+/// at a pass (`decode::surface_pages::regroup`): the surface worker maps the view of their pages
+/// one after another and imports it, and the context's next ring-0 message moves each block's
+/// buffers there on its lane, the view's import buffer and the buffer over it, so each block's
+/// view is its place in the regroup's, the blocks' pages one after another
+#[test]
+fn old_lone_views_of_a_context_move_into_one_regroup() {
+    let mut r = Regrouping::after(Duration::from_secs(3));
+    r.message();
+    assert_eq!(
+        r.rebinds(),
+        6,
+        "each block's import buffer and the buffer over it"
+    );
+    let bases: Vec<u64> = {
+        let decoder = r.device.control.decoder();
+        let views = decoder.views_of_surfaces();
+        (r.blocks.iter())
+            .map(|&b| views.private_view_base(b).expect("a view").addr().to_u64())
+            .collect()
+    };
+    assert_eq!(bases[1], bases[0] + 2 * r.page, "{bases:x?}");
+    assert_eq!(bases[2], bases[1] + 2 * r.page, "{bases:x?}");
+    let c = r
+        .device
+        .control
+        .decoder()
+        .views_of_surfaces()
+        .regroup_counts();
+    assert_eq!(
+        (c.made, c.members, c.moved, c.refused, c.left),
+        (1, 3, 6, 0, 0)
+    );
+}
+
+/// A lone view younger than 2 s stays where it is: a pass takes no view younger
+/// (`decode::surface_pages::regroup`)
+#[test]
+fn lone_views_younger_than_two_seconds_stay_alone() {
+    let mut r = Regrouping::after(Duration::from_millis(1500));
+    r.message();
+    assert_eq!(r.rebinds(), 0);
+    let c = r
+        .device
+        .control
+        .decoder()
+        .views_of_surfaces()
+        .regroup_counts();
+    assert_eq!((c.passes, c.made, c.members), (1, 0, 0));
+}
+
+/// A buffer the platform refuses to move into a regroup's view (one a command buffer not yet
+/// committed used, or one a dispatch left to the host's step binds, a GPU-written indirect one
+/// among them, until it completed: the runtime's `EncodedUses`) stays over its block's view, and
+/// is asked again at its context's first ring-0 message a second or more later, and moves then
+/// (`decode::surface_pages::regroup`)
+#[test]
+fn a_buffer_refused_a_move_is_asked_again_a_second_later() {
+    let mut r = Regrouping::after(Duration::from_secs(3));
+    // The first block's view's import buffer moves, then the buffer over it is refused.
+    (r.platform.script()).after("rebindNoCopy", 1, encoded_uses());
+    r.message();
+    assert_eq!(r.rebinds(), 6, "every buffer asked once");
+    let c = r
+        .device
+        .control
+        .decoder()
+        .views_of_surfaces()
+        .regroup_counts();
+    assert_eq!((c.members, c.moved, c.refused, c.retried), (3, 5, 1, 0));
+    r.platform
+        .virtual_clock()
+        .advance(Duration::from_millis(500));
+    r.message();
+    assert_eq!(r.rebinds(), 6, "not asked again within the second");
+    r.platform
+        .virtual_clock()
+        .advance(Duration::from_millis(600));
+    r.message();
+    assert_eq!(r.rebinds(), 7, "asked again");
+    let c = r
+        .device
+        .control
+        .decoder()
+        .views_of_surfaces()
+        .regroup_counts();
+    assert_eq!((c.moved, c.refused, c.retried, c.stayed), (5, 1, 1, 0));
+    r.platform.virtual_clock().advance(Duration::from_secs(2));
+    r.message();
+    assert_eq!(r.rebinds(), 7, "nothing left to ask");
+}
+
+/// A buffer the platform refuses every move is asked eight times in all, a second or more apart,
+/// then stays over its block's view (`decode::surface_pages::regroup`)
+#[test]
+fn a_buffer_refused_eight_moves_stays() {
+    let mut r = Regrouping::after(Duration::from_secs(3));
+    (r.platform.script()).after("rebindNoCopy", 1, encoded_uses());
+    r.message();
+    assert_eq!(r.rebinds(), 6);
+    (r.platform.script()).push_n("rebindNoCopy", 7, encoded_uses());
+    for _ in 0..10 {
+        r.platform
+            .virtual_clock()
+            .advance(Duration::from_millis(1100));
+        r.message();
+    }
+    assert_eq!(
+        r.rebinds(),
+        6 + 7,
+        "the refused buffer asked eight times in all"
+    );
+    let c = r
+        .device
+        .control
+        .decoder()
+        .views_of_surfaces()
+        .regroup_counts();
+    assert_eq!((c.moved, c.refused, c.retried, c.stayed), (5, 8, 0, 1));
+}
+
+/// A block whose view's import buffer the platform refuses to move into a regroup's view stays
+/// as it was, none of its buffers asked, and no later pass takes it again
+/// (`decode::surface_pages::regroup`)
+#[test]
+fn a_block_whose_import_buffer_is_refused_stays_out_of_regroups() {
+    let mut r = Regrouping::after(Duration::from_secs(3));
+    (r.platform.script()).push("rebindNoCopy", encoded_uses());
+    r.message();
+    assert_eq!(
+        r.rebinds(),
+        5,
+        "the first block's import buffer, then the other two blocks'"
+    );
+    let c = r
+        .device
+        .control
+        .decoder()
+        .views_of_surfaces()
+        .regroup_counts();
+    assert_eq!((c.members, c.moved, c.refused, c.left), (2, 4, 1, 1));
+    for _ in 0..3 {
+        r.platform
+            .virtual_clock()
+            .advance(Duration::from_millis(1100));
+        r.message();
+        r.device.control.decoder().surface_worker().flush();
+    }
+    assert_eq!(r.rebinds(), 5, "no pass takes the block again");
+    let c = r
+        .device
+        .control
+        .decoder()
+        .views_of_surfaces()
+        .regroup_counts();
+    assert_eq!(c.made, 1);
+}
+
+/// A message moves a regroup's members until its time for moves is spent, at least one, the rest
+/// left for the context's next ring-0 messages, each taking up where the last left off
+/// (`decode::surface_pages::regroup`, "A few members a message")
+#[test]
+fn a_message_moves_regroup_members_until_its_budget_is_spent() {
+    let mut r = Regrouping::after(Duration::from_secs(3));
+    (r.device.control.decoder().views_of_surfaces()).set_regroup_budget(Duration::ZERO);
+    let mut rebinds = Vec::new();
+    for _ in 0..4 {
+        r.message();
+        rebinds.push(r.rebinds());
+    }
+    assert_eq!(
+        rebinds,
+        [2, 4, 6, 6],
+        "a block's import buffer and the buffer over it at each message"
+    );
+    let c = r
+        .device
+        .control
+        .decoder()
+        .views_of_surfaces()
+        .regroup_counts();
+    assert_eq!((c.made, c.members, c.moved, c.left), (1, 3, 6, 0));
+}
+
+/// A pass takes no view of a context whose regroups wait for its lane, those of the regroups'
+/// members included, so no view is in two regroups (`decode::surface_pages::regroup`, "What a pass
+/// does")
+#[test]
+fn a_pass_takes_no_view_of_a_context_whose_regroups_wait() {
+    let mut r = Regrouping::after(Duration::from_secs(3));
+    (r.device.control.decoder().views_of_surfaces()).set_regroup_budget(Duration::ZERO);
+    r.message();
+    r.platform
+        .virtual_clock()
+        .advance(Duration::from_millis(1100));
+    r.message();
+    r.device.control.decoder().surface_worker().flush();
+    r.message();
+    assert_eq!(r.rebinds(), 6, "each member moved once");
+    let c = r
+        .device
+        .control
+        .decoder()
+        .views_of_surfaces()
+        .regroup_counts();
+    assert_eq!((c.passes, c.made, c.members, c.left), (2, 1, 3, 0));
+}
+
+/// A view of more than 1 MiB stays alone: a pass takes only the smaller ones
+/// (`decode::surface_pages::regroup`, "What it costs")
+#[test]
+fn a_view_of_more_than_a_mib_stays_alone() {
+    let page = FakePlatform::new().vm().page_size();
+    let half = (1 << 20) / page / 2 + 1;
+    let runs = [
+        vec![(0, 1), (2, 1)],
+        vec![(4, half), (5 + half, half)],
+        vec![(6 + 2 * half, 1), (8 + 2 * half, 1)],
+    ];
+    let mut r = Regrouping::of(Duration::from_secs(3), 10 + 2 * half, &runs);
+    r.message();
+    assert_eq!(r.rebinds(), 4, "the two small blocks' buffers");
+    let base = |r: &Regrouping, i: usize| {
+        let decoder = r.device.control.decoder();
+        let views = decoder.views_of_surfaces();
+        views
+            .private_view_base(r.blocks[i])
+            .expect("a view")
+            .addr()
+            .to_u64()
+    };
+    assert_eq!(base(&r, 2), base(&r, 0) + 2 * page, "one after another");
+    let c = r
+        .device
+        .control
+        .decoder()
+        .views_of_surfaces()
+        .regroup_counts();
+    assert_eq!((c.made, c.members, c.moved), (1, 2, 4));
+}
+
+/// The refusal a scripted rebind meets in the regroup tests.
+fn encoded_uses() -> reims_vgpu_vulkan::core::testkit::Step {
+    reims_vgpu_vulkan::core::testkit::Step::raise(
+        "NSInternalInconsistencyException",
+        "encoded uses",
+    )
+}
+
 /// A lone no-copy buffer's view takes no window: the context's next message on ring 0, which waits
 /// for it on the context's lane, so that no later view can join its group, closes the group of one
 /// at once, and is answered with the platform's clock where it was; the view, alone in its group,
