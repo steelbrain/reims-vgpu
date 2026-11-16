@@ -556,6 +556,50 @@ fn the_pointer_over_another_display_tells_the_guest_once() {
     );
 }
 
+/// A crossing the guest did not carry out, its cursor left on display 0, is over once the host's
+/// pointer is over display 0 again: the pointer over display 1 next is told anew, and a crossing
+/// still owed then is not sent (on 15.6.1 under TCG a missed crossing kept left every later one
+/// onto its display untold, lane a64ptr, potluck job m3-max-36608)
+#[test]
+fn a_missed_crossing_is_over_once_the_pointer_is_back_over_the_cursor() {
+    let mut rig = Rig::of_displays(2);
+    take_pointer_over(&rig);
+    rig.start();
+    rig.send(get_displays());
+    rig.event().unwrap();
+    let link = rig.device.pointer_link();
+    assert!(
+        !link.pointer_at(1, 100, 200, 0),
+        "the crossing's own position"
+    );
+    assert_eq!(pointer_over(&mut rig), (1, 100, 200, 0));
+    assert!(
+        link.pointer_at(0, 10, 20, 0),
+        "the cursor stayed on display 0"
+    );
+    assert!(rig.quiet_for(200), "nothing told over the cursor's display");
+    assert!(!link.pointer_at(1, 101, 201, 0), "a crossing again");
+    assert_eq!(pointer_over(&mut rig), (1, 101, 201, 0));
+    // Owed, the ring full, then the pointer back over display 0 before the next refresh.
+    assert!(link.pointer_at(0, 11, 21, 0));
+    let count = 1400u64;
+    for _ in 0..count {
+        rig.send(vblank_on(0, 0));
+    }
+    assert!(
+        eventually(|| !rig.degraded.lock().is_empty()),
+        "the ring never filled"
+    );
+    assert!(!link.pointer_at(1, 102, 202, 0));
+    assert!(link.pointer_at(0, 12, 22, 0));
+    let first = rig.seqno - count + 1;
+    for seqno in first..=rig.seqno {
+        assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    }
+    rig.refresh();
+    assert!(rig.quiet_for(200), "the owed crossing was over: not sent");
+}
+
 /// A cursor near the edge between two displays shows on both on an arm64 guest, each display
 /// given the part of its image on it, the one not holding the hot spot a part whose hot spot is
 /// held to the image's column at the display's edge (measured on arm64 macOS 27.0.1, potluck job

@@ -3248,9 +3248,14 @@ pixels of its mode, and the buttons held):
   on another display (the display of its latest `MOVE_CURSOR` with `visible`
   set, display 0 from a reset), and the guest was not already told this
   display while the cursor is on that one: once per crossing, and again only
-  after the cursor has shown on another display. A crossing that finds the
-  ring held, full or behind answers handed over is posted at the next
-  refresh of any display. A reset forgets it all.
+  after the cursor has shown on another display or the pointer has been over
+  the cursor's display again. A crossing the guest did not carry out is over
+  then: kept, it left every later crossing onto its display untold, the
+  tablet putting the cursor at the pointer's spot of the display it stayed on
+  (15.6.1 under TCG, lane a64ptr, potluck job m3-max-36608). A crossing that
+  finds the ring held, full or behind answers handed over is posted at the
+  next refresh of any display, unless the pointer is over the cursor's
+  display again by then. A reset forgets it all.
 - **The image over an edge.** On an arm64 guest a cursor near the edge
   between two displays shows on both: WindowServer gives each display the
   part of the image on it, and the display not holding the hot spot a part

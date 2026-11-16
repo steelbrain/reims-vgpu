@@ -1048,7 +1048,8 @@ struct Pointer {
     /// The display of the guest's last `MOVE_CURSOR` that showed its cursor.
     cursor: u32,
     /// The (pointer's display, cursor's display) the guest was last told the pointer is over the
-    /// first while its cursor is on the second, until the cursor shows on the pointer's display.
+    /// first while its cursor is on the second, until the cursor shows on the pointer's display
+    /// or the pointer is over the cursor's display again.
     told: Option<(u32, u32)>,
     /// When it was told, on the device's clock: the pointer's positions over that display are
     /// held back until the cursor shows there, or [`CROSSING_HOLD_NS`] after.
@@ -1163,7 +1164,8 @@ impl PointerLink {
     /// display (its window), with the `RGFX_POINTER_BUTTON_*` `buttons` held: where the guest took
     /// [`RGFX_FEATURE_POINTER_OVER`] and [`RGFX_FEATURE_MULTI_DISPLAY`] and its cursor shows on
     /// another display, the guest is sent `POINTER_OVER`, once for that display and the display
-    /// the cursor is on ([`RgfxPointerOver`]). Call it before the position goes to the guest's
+    /// the cursor is on, until the pointer is over the cursor's display again
+    /// ([`RgfxPointerOver`]). Call it before the position goes to the guest's
     /// pointing device, so the guest moves its cursor onto the display first. Waits for no other
     /// thread: a `POINTER_OVER` that finds the ring held or full goes at the next refresh. Does
     /// nothing on a device of one display, for a guest that sees one or did not take
@@ -2504,6 +2506,11 @@ impl Shared {
             let pointer = pointer.at(epoch);
             let buttons_changed = std::mem::replace(&mut pointer.buttons, buttons) != buttons;
             if pointer.cursor == id {
+                // Over the display the cursor is on: a crossing told of another display, which
+                // the guest has not carried out, is over, and the pointer over that display is
+                // told anew.
+                pointer.told = None;
+                pointer.owed = None;
                 return true;
             }
             if pointer.told == Some((id, pointer.cursor)) {
