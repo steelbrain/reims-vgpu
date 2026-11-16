@@ -5308,6 +5308,32 @@ registers only once its bundle is on disk:
 - **A bundle installed later takes effect at the next boot**: a running
   WindowServer never sees a GPU appear under it. The guest's install puts the
   bundle in place and reboots.
+- **Recovery and the installer composite in software.** RgfxGate installs
+  nothing where `/System/Installation` exists, so the accelerator stays
+  unregistered there and WindowServer draws Recovery's and the installer's
+  windows on the framebuffer, at our mode. The bundle could not give them Metal
+  anyway. Recovery's base system ships no `IOGPU.framework`, and our device
+  subclasses that framework's `IOGPUMetalDevice`. Measured on the x86-64 15.4
+  and 26.6.2 recovery images: neither has the framework in
+  `/System/Library/PrivateFrameworks`, and 26.6.2's dyld cache names no
+  `IOGPUMetalDevice`. In 26.6.2's Recovery, `/Library` is a link to
+  `System/Volumes/Data/Library`, a tmpfs that `rc.temporaryDataVolume` mounts. A
+  probe build of RgfxGate wrote and tagged the bundle there and the accelerator
+  registered. WindowServer then opened the bundle's executable and mapped it
+  through RgfxGate's checks, but never opened the user client `IOGPUMetalDevice`
+  opens (type 5), and it aborted at every launch with the screen black. In
+  15.4's Recovery, `/Library` is a directory on the read-only HFS root,
+  `/Library/GPUBundles` stays on that root all boot (Recovery's RAM disks cover
+  only other directories), and `kernel_mount` is not in the kernel symbol table
+  Graft resolves. The installer's second stage, the boot after a Reinstall from
+  26.6.2's Recovery, is no full system either: it roots from the base system it
+  copied into `macOS Install Data`
+  (`auth-root-dmg=file:///macOS%20Install%20Data/BaseSystem.dmg` in its
+  boot-args), a read-only APFS volume, with `/Library` on the same tmpfs. The
+  probe build failed there as it did in 26.6.2's Recovery: registered, mapped by
+  WindowServer, no type 5 user client, and WindowServer aborted at every launch
+  with the screen black. With today's set, the accelerator stays unregistered
+  there and the stage's progress screen draws. So the skip stays.
 - Unregistered, the accelerator refuses every user client
   (`kIOReturnNotReady`): a task can still reach it by the framebuffer's
   `IOAccelTypes` path.
