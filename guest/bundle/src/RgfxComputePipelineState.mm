@@ -991,10 +991,11 @@ NSError *RgfxComputeProgressError(BOOL hasProgress, NSInteger progress, BOOL has
 		RGFX_UNSUPPORTED("function pointers");
 		return nil;
 	}
-	return [RgfxVisibleFunctionTable tableOfPipeline:_objId
-	                                           count:descriptor.functionCount
-	                                          device:self.device
-	                                      serializer:_serializer];
+	id<MTLDevice> device = self.device;
+	return RgfxCounted(device, [RgfxVisibleFunctionTable tableOfPipeline:_objId
+	                                                               count:descriptor.functionCount
+	                                                              device:device
+	                                                          serializer:_serializer]);
 }
 
 // --- unsupported: binary functions --------------------------------------------------

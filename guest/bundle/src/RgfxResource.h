@@ -38,8 +38,10 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <objc/runtime.h>
 
+class RgfxAllocationCount;
 class RgfxSerializer;
 #endif
 
@@ -152,6 +154,18 @@ NS_ASSUME_NONNULL_BEGIN
 @end
 
 #ifdef __cplusplus
+/// What holds a device's allocation count (RgfxAllocationCount.hpp): the device shell, or a
+/// test's stand-in for it.
+@protocol RgfxAllocationCountHolder
+- (std::shared_ptr<RgfxAllocationCount>)rgfxAllocationCount;
+@end
+
+/// Counts `object` in the allocation count `device` holds until it deallocs, and answers it: a heap
+/// by its size, any other resource of ours by its allocatedSize (RgfxAllocationCount.hpp). An
+/// object counts once, however many creates hand it on. Nothing for nil, an object not of ours, or
+/// a device that holds no count.
+id _Nullable RgfxCounted(id _Nullable device, id _Nullable object);
+
 /// Whether `obj` is one of ours (an RgfxResource), with no message: its class is looked up in a
 /// small table of classes found to be ours, and only a class not yet there asks isKindOfClass:.
 /// A class never leaves the table: classes are not unloaded.

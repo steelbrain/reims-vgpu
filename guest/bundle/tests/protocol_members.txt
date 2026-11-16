@@ -439,7 +439,7 @@ convertSparsePixelRegions:toTileRegions:withTileSize:alignmentMode:numRegions: b
 convertSparseTileRegions:toPixelRegions:withTileSize:numRegions: base %base-spi
 copyIOSurfaceSharedTextureProperties: implemented
 counterSets base %base-spi
-currentAllocatedSize unsupported the device's allocation count (answers 0)
+currentAllocatedSize implemented
 currentCommandQueueCount base %base-spi
 currentPerformanceState base %base-spi
 dedicatedMemorySize base %base-spi

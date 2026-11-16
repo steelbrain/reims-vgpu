@@ -17,6 +17,7 @@
 #include <mutex>
 #include <unistd.h>
 
+#include "RgfxAllocationCount.hpp"
 #include "RgfxLog.hpp"
 #include "RgfxSerializer.hpp"
 
@@ -149,6 +150,10 @@ BOOL RgfxResourcesAlias(RgfxResource *a, id b)
 	uint64_t _rangeSize;
 	std::atomic<bool> _rangeHeld;
 	uint64_t _allocationId; // taken as it was made (rgfxAllocationId)
+	// The device's allocation count the object counts in (RgfxCounted), and the bytes it counts
+	// there; null for one counted nowhere.
+	std::shared_ptr<RgfxAllocationCount> _allocationCount;
+	uint64_t _allocationCounted;
 }
 
 - (instancetype)initWithObjId:(uint64_t)objId
@@ -170,9 +175,37 @@ BOOL RgfxResourcesAlias(RgfxResource *a, id b)
 
 RGFX_LOG_UNRECOGNIZED
 
+- (void)dealloc
+{
+	// Out of its device's count as the app lets it go, as Metal's leave it (RgfxAllocationCount.hpp).
+	if (_allocationCount)
+		_allocationCount->remove(_allocationCounted);
+}
+
 - (uint64_t)rgfxObjId
 {
 	return _objId;
+}
+
+id RgfxCounted(id device, id object)
+{
+	if (object == nil || ![object isKindOfClass:[RgfxResource class]] ||
+	    ![device conformsToProtocol:@protocol(RgfxAllocationCountHolder)])
+		return object;
+	std::shared_ptr<RgfxAllocationCount> count =
+	    [(id<RgfxAllocationCountHolder>)device rgfxAllocationCount];
+	RgfxResource *r = object;
+	if (!count || r->_allocationCount)
+		return object;
+	uint64_t bytes = 0;
+	if ([object isKindOfClass:[RgfxHeap class]])
+		bytes = [(RgfxHeap *)object size];
+	else if ([object respondsToSelector:@selector(allocatedSize)])
+		bytes = [(id<MTLResource>)object allocatedSize];
+	r->_allocationCounted = bytes;
+	r->_allocationCount = std::move(count);
+	r->_allocationCount->add(bytes);
+	return object;
 }
 
 std::atomic<uintptr_t> gRgfxResourceClasses[32];

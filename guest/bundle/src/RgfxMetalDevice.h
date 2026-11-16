@@ -71,8 +71,8 @@ class RgfxSlabs;
 
 NS_ASSUME_NONNULL_BEGIN
 
-@interface RgfxMetalDevice
-    : IOGPUMetalDevice <MTLDevice, MTLDeviceSPI, RgfxRegionHolder, RgfxLinearAlignmentSource>
+@interface RgfxMetalDevice : IOGPUMetalDevice <MTLDevice, MTLDeviceSPI, RgfxRegionHolder,
+                                               RgfxLinearAlignmentSource, RgfxAllocationCountHolder>
 
 /// Metal's entry point: `[super initWithAcceleratorPort:]` identifies the GPU, then the
 /// wire handshake maps the process's window of the device region, reads the caps blob, and

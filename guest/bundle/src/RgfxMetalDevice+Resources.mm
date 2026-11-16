@@ -113,7 +113,7 @@ const char *bufferCause(NSUInteger length, MTLResourceOptions options, NSUIntege
 	if (buffer == nil)
 		noteNil("newBufferWithLength:options:",
 		        bufferCause(length, options, [self maxBufferLength]), bufferAsked(length, options));
-	return buffer;
+	return RgfxCounted(self, buffer);
 }
 
 - (id<MTLBuffer>)newBufferWithBytes:(const void *)pointer
@@ -140,7 +140,7 @@ const char *bufferCause(NSUInteger length, MTLResourceOptions options, NSUIntege
 		            ? "bytes for a Private buffer"
 		            : bufferCause(length, options, [self maxBufferLength]),
 		        bufferAsked(length, options));
-	return buffer;
+	return RgfxCounted(self, buffer);
 }
 
 - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer
@@ -161,7 +161,7 @@ const char *bufferCause(NSUInteger length, MTLResourceOptions options, NSUIntege
 	if (buffer == nil)
 		noteNil("newBufferWithBytesNoCopy:length:options:deallocator:",
 		        "the buffer's factory made none", bufferAsked(length, options));
-	return buffer;
+	return RgfxCounted(self, buffer);
 }
 
 // --- textures ----------------------------------------------------------------
@@ -203,7 +203,7 @@ const char *bufferCause(NSUInteger length, MTLResourceOptions options, NSUIntege
 		                                                          device:self
 		                                                      serializer:[self serializer]];
 		if (managed != nil) {
-			return managed;
+			return RgfxCounted(self, managed);
 		}
 	}
 	RgfxTexture *texture = [RgfxTexture textureWithDescriptor:descriptor
@@ -214,7 +214,7 @@ const char *bufferCause(NSUInteger length, MTLResourceOptions options, NSUIntege
 	if (texture == nil)
 		noteNil(creator, "no route, no resource id left, or the device never got the create",
 		        textureAsked(descriptor));
-	return texture;
+	return RgfxCounted(self, texture);
 }
 
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
@@ -233,12 +233,12 @@ const char *bufferCause(NSUInteger length, MTLResourceOptions options, NSUIntege
 		        textureAsked(descriptor));
 		return nil;
 	}
-	return [RgfxIOSurfaceTexture textureWithDescriptor:descriptor
-	                                         iosurface:iosurface
-	                                             plane:plane
-	                                            region:[self region]
-	                                            device:self
-	                                        serializer:[self serializer]];
+	return RgfxCounted(self, [RgfxIOSurfaceTexture textureWithDescriptor:descriptor
+	                                                           iosurface:iosurface
+	                                                               plane:plane
+	                                                              region:[self region]
+	                                                              device:self
+	                                                          serializer:[self serializer]]);
 }
 
 // The same with a slice (measured: _MTLDevice's on macOS 27's x86-64 slice,
@@ -368,7 +368,7 @@ const char *bufferCause(NSUInteger length, MTLResourceOptions options, NSUIntege
 	                                    slotsInPages:(features & RGFX_FEATURE_ICB_SLOTS_IN_PAGES) != 0];
 	if (icb == nil)
 		noteNil(creator, "the factory made none", asked);
-	return icb;
+	return RgfxCounted(self, icb);
 }
 
 // --- rasterization rate maps -------------------------------------------------
@@ -460,7 +460,7 @@ const char *bufferCause(NSUInteger length, MTLResourceOptions options, NSUIntege
 		         (unsigned long)descriptor.storageMode);
 		noteNil("newHeapWithDescriptor:", "the factory made none", asked);
 	}
-	return heap;
+	return RgfxCounted(self, heap);
 }
 
 @end

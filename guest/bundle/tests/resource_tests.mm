@@ -26,12 +26,14 @@
 #import "RgfxHeap.h"
 #import "RgfxIOSurface.h"
 #import "RgfxMetalPrivate.h"
+#import "RgfxResource.h"
 #import "RgfxSampler.h"
 #import "RgfxSharedEvent.h"
 #import "RgfxStateCache.h"
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
 
+#include "RgfxAllocationCount.hpp"
 #include "RgfxObjectModel.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxRingWriter.hpp"
@@ -44,6 +46,27 @@ void rgfxResourceTests();
 // shell_tests.mm's control ring helpers.
 bool ringEmpty(TestRing &ring);
 void drainRing(TestRing &ring);
+
+// A device's stand-in that holds an allocation count, as RgfxMetalDevice does.
+@interface CountingDevice : NSObject <RgfxAllocationCountHolder>
+@end
+
+@implementation CountingDevice {
+	std::shared_ptr<RgfxAllocationCount> _count;
+}
+
+- (instancetype)init
+{
+	if ((self = [super init]))
+		_count = std::make_shared<RgfxAllocationCount>();
+	return self;
+}
+
+- (std::shared_ptr<RgfxAllocationCount>)rgfxAllocationCount
+{
+	return _count;
+}
+@end
 
 namespace {
 
@@ -1687,6 +1710,63 @@ void test_surface_texture_destroys_go_at_once()
 	CHECK(at(held) >= 0 && at(over) > at(held));
 }
 
+// The device's count, which its currentAllocatedSize answers, as a Mac's (RgfxAllocationCount.hpp):
+// each resource counts its allocatedSize while it lives, a heap its size, each once, and leaves
+// the count as it deallocs, after its device too; an object not ours, or a device with no
+// count, counts nothing.
+void test_device_counts_its_resources()
+{
+	Fixture fx;
+	CountingDevice *device = [CountingDevice new];
+	const std::shared_ptr<RgfxAllocationCount> count = [device rgfxAllocationCount];
+	@autoreleasepool {
+		RgfxBuffer *buffer = RgfxCounted(
+		    device, [RgfxBuffer bufferForDeviceWithLength:100
+		                                          options:MTLResourceStorageModePrivate
+		                                            bytes:nullptr
+		                                        maxLength:0
+		                                            slabs:nullptr
+		                                           device:nil
+		                                       serializer:&fx.ser]);
+		CHECK(buffer != nil && buffer.allocatedSize == 0x1000 && count->bytes() == 0x1000);
+		CHECK(RgfxCounted(device, buffer) == buffer && count->bytes() == 0x1000);
+		@autoreleasepool {
+			RgfxHeap *heap = RgfxCounted(
+			    device, [RgfxHeap heapWithDescriptor:heapDescriptor(MTLStorageModePrivate,
+			                                                        MTLHeapTypePlacement)
+			                                  device:nil
+			                              serializer:&fx.ser]);
+			CHECK(heap != nil && count->bytes() == 0x1000 + 0x100000);
+			RgfxTexture *texture = RgfxCounted(
+			    device, [RgfxTexture textureWithDescriptor:texture2D(MTLPixelFormatBGRA8Unorm, 64,
+			                                                         64, MTLTextureUsageShaderRead)
+			                                          heap:RGFX_OBJ_NONE
+			                                    heapOffset:0
+			                                        device:nil
+			                                    serializer:&fx.ser]);
+			CHECK(texture != nil && texture.allocatedSize == 0x4000);
+			CHECK(count->bytes() == 0x1000 + 0x100000 + 0x4000);
+		}
+		CHECK(count->bytes() == 0x1000);
+		// Counted nowhere: by no device, a device with no count, or an object not ours.
+		@autoreleasepool {
+			RgfxBuffer *loose = [RgfxBuffer bufferWithLength:0x1000
+			                                         options:MTLResourceStorageModePrivate
+			                                          device:nil
+			                                      serializer:&fx.ser];
+			CHECK(RgfxCounted(nil, loose) == loose && RgfxCounted([NSObject new], loose) == loose);
+			CHECK(RgfxCounted(device, loose) == loose && count->bytes() == 0x2000);
+			NSObject *other = [NSObject new];
+			CHECK(RgfxCounted(device, other) == other && RgfxCounted(device, nil) == nil);
+			CHECK(count->bytes() == 0x2000);
+		}
+		CHECK(count->bytes() == 0x1000);
+		device = nil;
+	}
+	CHECK(count->bytes() == 0);
+	drainRing(fx.ring);
+}
+
 void rgfxResourceTests()
 {
 	test_heap_answers();
@@ -1708,4 +1788,5 @@ void rgfxResourceTests()
 	test_shared_event_answers();
 	test_held_destroys_change_nothing_seen();
 	test_surface_texture_destroys_go_at_once();
+	test_device_counts_its_resources();
 }

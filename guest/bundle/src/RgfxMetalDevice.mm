@@ -32,6 +32,7 @@
 #include <mutex>
 #include <vector>
 
+#include "RgfxAllocationCount.hpp"
 #include "RgfxCommitOrder.hpp"
 #include "RgfxCompletionThread.hpp"
 #include "RgfxFeatureProfile.hpp"
@@ -852,6 +853,8 @@ id rgfxTargetDeviceArchitecture()
 	RgfxEventShareLink _shareLink;
 	std::mutex _listenLock;
 	id<MTLCommandQueue> _listenQueue;
+	// The bytes its resources take in this process (currentAllocatedSize), made with it.
+	std::shared_ptr<RgfxAllocationCount> _allocationCount;
 }
 
 RGFX_LOG_UNRECOGNIZED
@@ -868,6 +871,7 @@ RGFX_LOG_UNRECOGNIZED
 		return nil;
 	}
 	_acceleratorPort = port;
+	_allocationCount = std::make_shared<RgfxAllocationCount>();
 	_conn = IO_OBJECT_NULL;
 	_serializer = nullptr;
 	_region = nullptr;
@@ -1446,12 +1450,16 @@ RGFX_LOG_UNRECOGNIZED
 	return static_cast<uint32_t>(_caps.size(kRgfxSizePeerCount));
 }
 
-// The bytes the device has allocated for this process. The bundle keeps no count of its
-// allocations, so it answers 0, as a device that has made nothing does, and logs the ask.
+// The bytes the device's resources take in this process: each one it makes counts its
+// allocatedSize while it lives, a heap its size (RgfxAllocationCount.hpp, RgfxCounted).
 - (NSUInteger)currentAllocatedSize
 {
-	RGFX_UNSUPPORTED("the device's allocation count (answers 0)");
-	return 0;
+	return _allocationCount ? static_cast<NSUInteger>(_allocationCount->bytes()) : 0;
+}
+
+- (std::shared_ptr<RgfxAllocationCount>)rgfxAllocationCount
+{
+	return _allocationCount;
 }
 
 - (uint64_t)recommendedMaxWorkingSetSize
