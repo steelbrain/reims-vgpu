@@ -415,6 +415,43 @@ Stages:
       preferred mode where the device no longer lists the one shown, and
       tells WindowServer through the class's hot-plug notice
       (`hotPlug_notify`) and `kIOMessageServicePropertyChange`.
+    - The arm64 display's colour. WindowServer sets its accessibility
+      matrix with each swap until the call succeeds
+      (`swap_set_color_matrix`, function 2), and the display shows it as
+      the device's `DISPLAY_COLOR` matrix stage, applied to the surface's
+      encoded values (RgfxMobileColor.hpp). WindowServer also sets an ICC
+      chain by `set_block`: per layer, a Src2XYZ curve and matrix and an
+      XYZ2Blend matrix and curve; for the display, after the layers are
+      blended, a Blend2XYZ curve and matrix and an XYZ2Device matrix and
+      curve; and tone map, user gamma and black point stages between. The
+      blocks' numbers are the release's: 26.6.2 and 14.6.1 number each
+      block one below 27.0.1 (matrix 0x32 and curve 0x33, against 0x33 and
+      0x34), 14.6.1's curve block is 0x248 bytes where the others' are
+      0x290, and its curve stages from Blend2XYZ on sit one lower. The
+      display reads each block in its release's numbering, by the kernel's
+      major version, for the releases measured, and refuses every block of
+      another release and every location not measured on its own. The
+      class answers every block `kIOReturnUnsupported`, and WindowServer
+      logs "Failed to set ICC matrix" or "curve" for each refused block of
+      the four colour-space locations. In every burst measured on 27.0.1
+      (three at login, and one after each switch of the display's profile
+      to Generic RGB, to Display P3 and back), layer 0's half and the
+      display's half are each the identity: WindowServer composites in the
+      profile's own space. The display applies no chain. It takes a block
+      only where the chain the block leaves is the identity, and so is what
+      the display shows. The halves are judged as pairs, because
+      WindowServer sends each half's first block before its second: the
+      first is held, and the second is taken where it inverts the first
+      (matrices' product, and curves' composition at 1025 inputs, within
+      2^-14). It refuses the rest, as the class does: user gamma (the
+      curves CG's transfer formulas and tables set), the cursor's
+      layer 1, whose standard-sRGB source the display's blend space does
+      not invert (0.0024 off at login, from the published white, and 0.25
+      to 0.35 after a switch to Generic RGB or Display P3), and what it
+      cannot read (RgfxMobileICC.hpp). So a login logs one "Failed to set
+      ICC matrix", the cursor's, where it logged 32 lines before, and the
+      host's colour stages stay off: the accessibility matrix stays alone in
+      the matrix stage.
 14. **IOSurfaces follow the discrete model.** IOSurface.kext allocates
     surfaces in guest RAM, CAMetalLayer drawables and window backing stores
     included. The accelerator gets a per-surface device cache with a sync

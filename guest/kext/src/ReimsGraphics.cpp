@@ -2392,6 +2392,12 @@ void ReimsGraphics::free()
 	if (registerLock)
 		IOLockFree(registerLock);
 	registerLock = nullptr;
+	if (mobileICC)
+		IOFree(mobileICC, sizeof(RgfxICCState));
+	mobileICC = nullptr;
+	if (mobileICCLock)
+		IOLockFree(mobileICCLock);
+	mobileICCLock = nullptr;
 #endif
 	super::free();
 }

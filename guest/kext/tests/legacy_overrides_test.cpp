@@ -14,6 +14,12 @@
 // release: the vendored SDK stand-in declares each method, ReimsGraphics overrides it, and
 // graft-arm64e.json requires it, so a release without the method refuses the bind rather than keep
 // the class's own.
+//
+// set_block, whose ICC blocks the display takes where they leave its chain the identity
+// (RgfxMobileICC.hpp, tests/mobile_icc_test.cpp), is the one override graft-arm64e.json does not
+// require: the class's own answers every block kIOReturnUnsupported, so a release without the
+// method keeps what every release did before the override, and the display binds. kOptional
+// records its slot on each release.
 #include "RgfxDisplayIdentity.hpp"
 
 #include <cstdio>
@@ -87,6 +93,26 @@ constexpr Release kReleases[] = {
 	{"27.2.1", 0x1de0, 0x1b80, {294, 291, 343, 344}},
 };
 
+// An override graft-arm64e.json does not require, and its vtable slot on each release, in
+// kReleases' order.
+struct OptionalMethod {
+	Method method;
+	uint32_t slots[sizeof(kReleases) / sizeof(kReleases[0])];
+};
+
+constexpr OptionalMethod kOptional[] = {
+	{{"set_block",
+	  "virtual graft_iomfb_word set_block(task *owner, uint32_t type, uint32_t offset,\n"
+	  "                                       const uint64_t *scalars, uint32_t count, const uint8_t "
+	  "*data,\n"
+	  "                                       size_t size);",
+	  "RgfxIOMFBWord set_block(task *owner, uint32_t type, uint32_t offset, const uint64_t "
+	  "*scalars,\n"
+	  "\t                        uint32_t count, const uint8_t *data, size_t size) override;",
+	  "__ZN25IOMobileFramebufferLegacy9set_blockEP4taskjjPKyjPKhm"},
+	 {327, 330, 331, 332, 332}},
+};
+
 // The SDK stand-in's virtual slots past its own: GRAFT_IOMFB_VTABLE_RESERVE.
 constexpr uint32_t kStandInSlots = 512;
 
@@ -132,6 +158,23 @@ void releases()
 	}
 }
 
+// An optional override's slots lie inside the stand-in's vtable and never move down.
+void optionalSlots()
+{
+	constexpr size_t releases = sizeof(kReleases) / sizeof(kReleases[0]);
+	for (const OptionalMethod &o : kOptional) {
+		uint32_t last = 0;
+		for (size_t r = 0; r < releases; r++) {
+			if (!o.slots[r])
+				continue;
+			check(o.slots[r] < kStandInSlots, "the slot is inside the stand-in's vtable",
+			      kReleases[r].name);
+			check(o.slots[r] >= last, "a method's slot never moves down", kReleases[r].name);
+			last = o.slots[r];
+		}
+	}
+}
+
 void declarations()
 {
 	const std::string standIn = readFile("../graft/sdk/include/graft/IOMobileFramebufferLegacy.h");
@@ -144,6 +187,16 @@ void declarations()
 		const std::string spec = object(overrides, m.name);
 		check(spec.find("\"required\": true") != std::string::npos,
 		      "graft-arm64e.json requires the override", m.name);
+		check(std::string(m.mangled).find(std::string(m.name) + "E") != std::string::npos,
+		      "the Itanium name is the method's", m.name);
+	}
+	for (const OptionalMethod &o : kOptional) {
+		const Method &m = o.method;
+		check(standIn.find(m.standIn) != std::string::npos, "the SDK stand-in declares it", m.name);
+		check(header.find(m.override) != std::string::npos, "ReimsGraphics overrides it", m.name);
+		const std::string spec = object(overrides, m.name);
+		check(spec.find("\"required\"") == std::string::npos,
+		      "graft-arm64e.json does not require the override", m.name);
 		check(std::string(m.mangled).find(std::string(m.name) + "E") != std::string::npos,
 		      "the Itanium name is the method's", m.name);
 	}
@@ -180,9 +233,11 @@ void dotPitch()
 int main()
 {
 	releases();
+	optionalSlots();
 	declarations();
 	dotPitch();
-	std::printf("legacy_overrides_test: %d checks passed (%zu releases, %zu methods)\n", checks,
-	            sizeof(kReleases) / sizeof(kReleases[0]), kMethodCount);
+	std::printf("legacy_overrides_test: %d checks passed (%zu releases, %zu methods, %zu optional)\n",
+	            checks, sizeof(kReleases) / sizeof(kReleases[0]), kMethodCount,
+	            sizeof(kOptional) / sizeof(kOptional[0]));
 	return 0;
 }

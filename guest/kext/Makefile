@@ -156,7 +156,7 @@ TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surf
 	$(BUILD)/tests/defer_carry_test $(BUILD)/tests/arm64_region_test $(BUILD)/tests/features_arm64_test \
 	$(BUILD)/tests/legacy_overrides_test $(BUILD)/tests/legacy_swap_queue_test \
 	$(BUILD)/tests/mobile_modes_test $(BUILD)/tests/swap_rate_test \
-	$(BUILD)/tests/legacy_swap_info_test $(BUILD)/tests/mobile_color_test \
+	$(BUILD)/tests/legacy_swap_info_test $(BUILD)/tests/mobile_color_test $(BUILD)/tests/mobile_icc_test \
 	$(BUILD)/tests/mobile_cursor_test $(BUILD)/tests/display_power_test \
 	$(BUILD)/tests/control_ring_test $(BUILD)/tests/control_ring_arm64_test \
 	$(BUILD)/tests/completion_arm_test $(BUILD)/tests/kept_service_test \

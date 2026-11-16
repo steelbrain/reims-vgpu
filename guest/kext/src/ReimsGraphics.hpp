@@ -51,6 +51,7 @@ typedef graft_iomfb_word RgfxIOMFBWord;
 #include "RgfxLegacySwapInfo.hpp"
 #include "RgfxLegacySwapLayout.hpp"
 #include "RgfxMobileCursor.hpp"
+#include "RgfxMobileICC.hpp"
 #include "RgfxRegisterHold.hpp"
 #include "RgfxSwapRate.hpp"
 #endif
@@ -230,6 +231,11 @@ public:
 	// go to the class.
 	RgfxIOMFBWord set_parameter(IOMFBParameterName name, const uint64_t *values,
 	                            uint32_t count) override;
+	// And the ICC blocks WindowServer sets (ReimsGraphicsMobile.cpp, RgfxMobileICC.hpp), which the
+	// class answers kIOReturnUnsupported: the display takes those that leave its chain the
+	// identity.
+	RgfxIOMFBWord set_block(task *owner, uint32_t type, uint32_t offset, const uint64_t *scalars,
+	                        uint32_t count, const uint8_t *data, size_t size) override;
 #endif
 
 	// The display pipe (RgfxDisplayPipeUserClient, on the accelerator) presents through the
@@ -844,6 +850,11 @@ private:
 	// as the paravirtual display records it; and the timing the display shows (setMobileMode).
 	bool mobileHotPlugged;
 	uint32_t mobileTimingId;
+	// The ICC pairs set_block holds (RgfxMobileICC.hpp), the framebuffer's own, under
+	// mobileICCLock: both allocated in startMobile and let go in free; null where they could not
+	// be, and then every block is refused.
+	RgfxICCState *mobileICC;
+	IOLock *mobileICCLock;
 	// The registrations display 0's start holds while it starts the heads (RgfxRegisterHold.hpp),
 	// display 0's alone, under stateLock: holdRegistration records display `display`'s where the
 	// hold is open, and answers whether it did; releaseRegistrations ends the hold and registers

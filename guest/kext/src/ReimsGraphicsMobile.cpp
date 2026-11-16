@@ -37,7 +37,9 @@
  * WindowServer reads its modes, and sets one, at its start and at each change (start_hardware).
  * And it overrides swap_set_color_matrix, which the class answers kIOReturnUnsupported, so
  * WindowServer, which sets its accessibility matrix at each swap until the call succeeds, sets it
- * once: it answers 0 and the display shows the matrix (RgfxMobileColor.hpp).
+ * once: it answers 0 and the display shows the matrix (RgfxMobileColor.hpp). And it overrides
+ * set_block, which the class answers kIOReturnUnsupported, to take the ICC blocks that leave the
+ * display's colour chain the identity, the chain it shows (RgfxMobileICC.hpp).
  *
  * A process finds the display as IOMobileFramebuffer.framework counts displays: by a node of the
  * device tree (attachMobileNode), then the framebuffer's service and the properties it publishes
@@ -51,10 +53,12 @@
 #include <kern/clock.h>
 #include <kern/task.h>
 #include <libkern/libkern.h>
+#include <libkern/version.h>
 
 #include "RgfxDisplayIdentity.hpp"
 #include "RgfxIOSurfaceKPI.hpp"
 #include "RgfxMobileColor.hpp"
+#include "RgfxMobileICC.hpp"
 #include "RgfxMobileModes.hpp"
 
 #if defined(__arm64e__)
@@ -182,6 +186,7 @@ enum MobileCall : unsigned {
 	kSetDigitalOutMode,
 	kSwapSetColorMatrix,
 	kSetParameter,
+	kSetBlock,
 	kVblank,
 	kPresented,
 	kSwapShown,
@@ -222,6 +227,24 @@ bool ReimsGraphics::startMobile()
 	mobileListChanged = false;
 	mobileHotPlugged = false;
 	mobileTimingId = 0;
+	// The ICC pairs, held from nothing at each start, with the release's numbering of the blocks
+	// by the kernel's major version; without them every block is refused.
+	if (!mobileICCLock)
+		mobileICCLock = IOLockAlloc();
+	if (!mobileICC)
+		mobileICC = static_cast<RgfxICCState *>(IOMalloc(sizeof(RgfxICCState)));
+	RgfxICCRelease iccRelease{};
+	const bool iccKnown = rgfxICCReleaseOf(version_major, &iccRelease);
+	if (mobileICC && mobileICCLock) {
+		IOLockLock(mobileICCLock);
+		*mobileICC = RgfxICCState();
+		if (iccKnown)
+			mobileICC->release = iccRelease;
+		IOLockUnlock(mobileICCLock);
+	}
+	if (!iccKnown)
+		IOLog("ReimsGraphics: no ICC numbering for Darwin %d: every colour block is refused\n",
+		      version_major);
 	mobileChangeCall = thread_call_allocate(mobileDisplayChanged, this);
 	if (!mobileChangeCall) {
 		IOLog("ReimsGraphics: no thread call for the display's changes\n");
@@ -1462,6 +1485,32 @@ RgfxIOMFBWord ReimsGraphics::set_parameter(IOMFBParameterName name, const uint64
 		      count, (values && count) ? static_cast<unsigned long long>(values[0]) : 0ull,
 		      static_cast<uint32_t>(answer), one ? "" : ", the class's answer");
 	return answer;
+}
+
+// The ICC matrices and curves WindowServer sets by IOMobileFramebufferSetBlock (RgfxMobileICC.hpp):
+// a block that leaves the display's chain the identity, which is what the display shows, is
+// answered 0, and the rest kIOReturnUnsupported, as the class answers every block. Nothing is
+// posted: the host's colour stages stay as they are. The user client calls it ungated, in
+// WindowServer's thread, as it calls swap_set_color_matrix (measured on 27.0.1); the pairs it
+// holds are the framebuffer's, under their lock, and a framebuffer without them refuses every
+// block.
+RgfxIOMFBWord ReimsGraphics::set_block(task *owner, uint32_t type, uint32_t offset,
+                                       const uint64_t *scalars, uint32_t count, const uint8_t *data,
+                                       size_t size)
+{
+	bool took = false;
+	if (mobileICC && mobileICCLock) {
+		IOLockLock(mobileICCLock);
+		took = rgfxICCTake(mobileICC, type, offset, scalars, count, data, size);
+		IOLockUnlock(mobileICCLock);
+	}
+	if (logged(kSetBlock))
+		IOLog("ReimsGraphics: set_block(0x%x, offset %u, %u scalars: 0x%llx 0x%llx 0x%llx 0x%llx, "
+		      "%zu bytes) %s\n",
+		      type, offset, count, (scalars && count > 0) ? scalars[0] : 0ull,
+		      (scalars && count > 1) ? scalars[1] : 0ull, (scalars && count > 2) ? scalars[2] : 0ull,
+		      (scalars && count > 3) ? scalars[3] : 0ull, size, took ? "taken" : "refused");
+	return word(took ? kIOReturnSuccess : kIOReturnUnsupported);
 }
 
 IOReturn ReimsGraphics::setMobileMode(uint32_t colorId, uint32_t timingId, Mode *shown)

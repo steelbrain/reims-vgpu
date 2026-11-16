@@ -85,7 +85,8 @@
         "get_dot_pitch": { "required": true },
         "set_digital_out_mode": { "required": true },
         "swap_set_color_matrix": { "required": true },
-        "set_parameter": { "required": true }
+        "set_parameter": { "required": true },
+        "set_block": {}
       }
     }
   ],
