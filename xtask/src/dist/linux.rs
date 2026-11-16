@@ -16,12 +16,19 @@
 //! other one local ([`localize`]). `dist` then checks the archive installed: any other global it
 //! defines fails the build. The shared library needs none of this: rustc's version script
 //! exports the C API's functions alone.
+//!
+//! **The archive's order.** The same `objcopy` renames the section of each function the
+//! link order lists (`crates/reims-vgpu-c/link-order.txt`, [`order`]) to `.text.sorted.NNNNNN`
+//! in the list's order, which GNU ld lays out ahead of the rest of `.text` when QEMU links the
+//! archive. `dist` prints how many of the list's functions it placed; one the archive no longer
+//! has is skipped. The shared library keeps rustc's order.
 
 use std::path::{Path, PathBuf};
 
 use super::archive::{
     LOCALIZED, api_functions, check_globals, defined_globals, native_static_libs, nm_args,
 };
+use super::order;
 use super::{LIB, Options, c_api_args, install, layout, pc_file, strs, strs_with, write};
 use crate::tools::Tools;
 use crate::util::Res;
@@ -75,6 +82,7 @@ pub fn dist(tools: &mut dyn Tools, o: &Options, target_dir: &Path, header: &Path
         &built.join("libreims_vgpu_c.a"),
         &target_dir.join(LOCALIZED),
         &archive,
+        &o.link_order,
     )?;
     install(&built.join("libreims_vgpu_c.so"), &shared, 0o755)?;
     install(header, &include, 0o644)?;
@@ -86,11 +94,18 @@ pub fn dist(tools: &mut dyn Tools, o: &Options, target_dir: &Path, header: &Path
 }
 
 /// Writes `archive`, the archive installed, from `built`, Cargo's, in `work` (module doc): its
-/// members linked into one object, every global symbol but the C API's made local, archived
-/// alone in `work` with zero dates (`ar`'s `D`), and installed with mode 0644, so the same build
-/// gives the same bytes and leaves the installed archive as it was. Fails where the object
-/// defines no `rvg_` function, or where the archive written still defines another global.
-fn localize(tools: &mut dyn Tools, built: &Path, work: &Path, archive: &Path) -> Res<()> {
+/// members linked into one object, every global symbol but the C API's made local and the
+/// functions `link_order` lists laid out first ([`order_renames`]), archived alone in `work`
+/// with zero dates (`ar`'s `D`), and installed with mode 0644, so the same build gives the
+/// same bytes and leaves the installed archive as it was. Fails where the object defines no
+/// `rvg_` function, or where the archive written still defines another global.
+fn localize(
+    tools: &mut dyn Tools,
+    built: &Path,
+    work: &Path,
+    archive: &Path,
+    link_order: &Path,
+) -> Res<()> {
     std::fs::create_dir_all(work).map_err(|e| format!("{}: {e}", work.display()))?;
     let object = work.join(format!("{LIB}.o"));
     let mut link = strs(&["-r", "--whole-archive"]);
@@ -101,6 +116,9 @@ fn localize(tools: &mut dyn Tools, built: &Path, work: &Path, archive: &Path) ->
     let keep = work.join("keep-global-symbols");
     write(&keep, &(api.join("\n") + "\n"))?;
     let mut strip = vec![format!("--keep-global-symbols={}", keep.display())];
+    if let Some(renames) = order_renames(tools, &object, link_order, work)? {
+        strip.push(format!("@{}", renames.display()));
+    }
     strip.push(object.to_string_lossy().into_owned());
     tools.run("objcopy", &strip)?;
     // `ar r` adds to an archive that is there: the one packed starts empty.
@@ -118,6 +136,40 @@ fn localize(tools: &mut dyn Tools, built: &Path, work: &Path, archive: &Path) ->
     )
 }
 
+/// The `objcopy` response file, written in `work`, that renames the sections of `object`'s
+/// functions `link_order` lists to [`order::SORTED`] sections in its order ([`order::renames`]), and
+/// prints how many of them it placed. None where the list is missing or empty, or names none of
+/// `object`'s functions: the archive then keeps rustc's order.
+fn order_renames(
+    tools: &mut dyn Tools,
+    object: &Path,
+    link_order: &Path,
+    work: &Path,
+) -> Res<Option<PathBuf>> {
+    let Ok(text) = std::fs::read_to_string(link_order) else {
+        println!("dist: no link order at {}", link_order.display());
+        return Ok(None);
+    };
+    let wanted = order::entries(&text);
+    if wanted.is_empty() {
+        return Ok(None);
+    }
+    let raw = tools.output("nm", &order::nm_args(object, false))?;
+    let demangled = tools.output("nm", &order::nm_args(object, true))?;
+    let (args, placed) = order::renames(&wanted, &order::functions(&raw, &demangled)?);
+    println!(
+        "dist: link order: {placed} of the {} functions {} lists placed",
+        wanted.len(),
+        link_order.display()
+    );
+    if args.is_empty() {
+        return Ok(None);
+    }
+    let file = work.join("link-order-renames");
+    write(&file, &(args.join("\n") + "\n"))?;
+    Ok(Some(file))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::archive::tests::CARGO;
@@ -126,8 +178,13 @@ mod tests {
     use super::*;
     use crate::tools::Profile;
 
+    /// The options of `args`, with no link order: `target`'s `link-order.txt`, which a test
+    /// writes where it wants one.
     fn options(args: &[&str], target: &Path) -> Options {
-        parse_args(&strs(args), target).unwrap()
+        Options {
+            link_order: target.join("link-order.txt"),
+            ..parse_args(&strs(args), target).unwrap()
+        }
     }
 
     #[test]
@@ -172,10 +229,12 @@ mod tests {
     }
 
     /// The programs as `dist` runs them: each call recorded; `ar` writes the archive it names,
-    /// and `nm` lists `object` for the linked object and `archive` for the archive.
+    /// and `nm` lists `object` for the linked object's globals, `listing` for its every symbol
+    /// (`-p`: as named, then demangled with `-C`), and `archive` for the archive.
     struct Programs {
         log: Log,
         object: String,
+        listing: (String, String),
         archive: String,
     }
 
@@ -187,6 +246,7 @@ mod tests {
                     ..Log::default()
                 },
                 object: object.to_owned(),
+                listing: Default::default(),
                 archive: archive.to_owned(),
             }
         }
@@ -202,7 +262,10 @@ mod tests {
         fn output(&mut self, program: &str, args: &[String]) -> Res<String> {
             let answer = self.log.output(program, args)?;
             let last = args.last().map_or("", String::as_str);
+            let has = |flag: &str| args.iter().any(|a| a == flag);
             Ok(match program {
+                "nm" if has("-p") && has("-C") => self.listing.1.clone(),
+                "nm" if has("-p") => self.listing.0.clone(),
                 "nm" if last.ends_with(".o") => self.object.clone(),
                 "nm" => self.archive.clone(),
                 _ => answer,
@@ -297,6 +360,80 @@ mod tests {
         for p in layout() {
             assert_eq!(mtime(&o.out.join(&p)), LONG_AGO, "{p}");
         }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The object's listing of every symbol: two functions and a datum, as named and as `nm -C`
+    /// prints them.
+    fn listing() -> (String, String) {
+        (
+            "0000000000001000 t _RNvCs1_1a1f\n0000000000002000 t _RNvCs1_1b1g.llvm.7\n\
+             0000000000003000 d _RNvCs1_1a4DATA\n"
+                .to_owned(),
+            "0000000000001000 t a[0123456789abcdef]::f\n0000000000002000 t b[0123456789abcdef]::g\n\
+             0000000000003000 d a[0123456789abcdef]::DATA\n"
+                .to_owned(),
+        )
+    }
+
+    /// The functions the link order lists get sections that sort in its order, renamed in the
+    /// `objcopy` call that localizes the object; one the object lacks is skipped
+    #[test]
+    fn dist_lays_out_the_link_orders_functions_in_its_order() {
+        let (root, target, header) = built("order");
+        let o = options(&[], &target);
+        put(&o.link_order, "# a comment\nb::g\ngone::x\na::f\n");
+        let mut tools = Programs::new(OBJECT, LOCALIZED_ARCHIVE);
+        tools.listing = listing();
+        dist(&mut tools, &o, &target, &header).unwrap();
+        let work = target.join("dist-localized");
+        let renames = work.join("link-order-renames");
+        assert_eq!(
+            std::fs::read_to_string(&renames).unwrap(),
+            "--rename-section\n.text._RNvCs1_1b1g.llvm.7=.text.sorted.000000\n\
+             --rename-section\n.text._RNvCs1_1a1f=.text.sorted.000002\n"
+        );
+        let object = work.join("reims_vgpu.o");
+        let calls = tools.log.lines();
+        assert_eq!(
+            calls[2..6],
+            [
+                format!("nm -g --defined-only -P {}", object.display()),
+                format!("nm -p --defined-only {}", object.display()),
+                format!("nm -p --defined-only -C {}", object.display()),
+                format!(
+                    "objcopy --keep-global-symbols={} @{} {}",
+                    work.join("keep-global-symbols").display(),
+                    renames.display(),
+                    object.display()
+                ),
+            ]
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A link order that names none of the object's functions localizes it as without one: a
+    /// stale list costs the order, never the build
+    #[test]
+    fn dist_with_a_stale_link_order_keeps_rustcs_order() {
+        let (root, target, header) = built("stale");
+        let o = options(&[], &target);
+        put(&o.link_order, "gone::x\ngone::y\n");
+        let mut tools = Programs::new(OBJECT, LOCALIZED_ARCHIVE);
+        tools.listing = listing();
+        dist(&mut tools, &o, &target, &header).unwrap();
+        let work = target.join("dist-localized");
+        assert!(!work.join("link-order-renames").exists());
+        let object = work.join("reims_vgpu.o");
+        let calls = tools.log.lines();
+        assert_eq!(
+            calls[5],
+            format!(
+                "objcopy --keep-global-symbols={} {}",
+                work.join("keep-global-symbols").display(),
+                object.display()
+            )
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 

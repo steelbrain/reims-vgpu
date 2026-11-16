@@ -44,6 +44,12 @@ const COMMANDS: &[Command] = &[
         about: "the library as a plain library in target/dist-vulkan: libreims_vgpu.a and the shared library, reims_vgpu.h and reims-vgpu.pc; --profile <p>, --out DIR, --platform vulkan (the only platform, kept for the builds that name it)",
         run: dist::cmd_dist,
     },
+    #[cfg(target_os = "linux")]
+    Command {
+        name: "link-order",
+        about: "rewrite crates/reims-vgpu-c/link-order.txt, the order Linux's archive lays the library's functions out in: BINARY CALL_GRAPH, a QEMU lld linked with --call-graph-ordering-file=CALL_GRAPH, after this tree's dist (docs/development.md, \"The link order\")",
+        run: dist::order::cmd_link_order,
+    },
     Command {
         name: "metallibs",
         about: "the Vulkan platform's metallibs and their record, metallibs.toml, compiled on a Mac into crates/reims-vgpu-vulkan/metallibs, which a build elsewhere takes them from, or into <dir> (RVG_METALLIB_DIR=<dir>)",

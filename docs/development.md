@@ -288,6 +288,23 @@ The library is built on the Vulkan platform, its only one (architecture 11.3); `
 names it for the builds that pass it, and any other platform is refused. `CARGO_TARGET_DIR` moves
 every output, the dist tree included, out of `target`.
 
+#### The link order
+
+On Linux the archive lays out the library's functions that `crates/reims-vgpu-c/link-order.txt`
+lists ahead of the rest of its code, in the list's order: `dist` renames each one's section to
+`.text.sorted.NNNNNN`, which GNU ld's default script sorts by name ahead of `.text`, and prints how
+many of the list's functions it placed (`xtask/src/dist/order.rs`). The list names functions as GNU
+`nm -C` prints them, without crate disambiguators, so a new metal2vulkan pin keeps it; a function
+renamed or removed since is skipped, and a stale list costs only the order's speed, never the
+build. To refresh it, on a Linux host: build the tree's dist and QEMU linked by lld (`make qemu
+QEMU_CONFIGURE=--extra-ldflags=-fuse-ld=lld`); record QEMU's threads with the LBR's taken branches
+while the guest's desktop works (`perf record -e cycles:u -j any,u,save_type -p <QEMU>` over window
+drags and Apps opening and closing); count each call or jump between two of the binary's functions
+into a call graph, one `caller callee count` a line, which lld reads; link QEMU again with
+`-Wl,--call-graph-ordering-file=<graph>`, so lld clusters callers with their callees; then
+`cargo xtask link-order <that qemu-system-x86_64> <graph>` rewrites the list from that binary's
+order.
+
 ### Profiles
 
 Set in `Cargo.toml` (architecture 2.3):

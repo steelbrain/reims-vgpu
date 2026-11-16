@@ -12,6 +12,9 @@
 //! - `share/doc/reims-vgpu/`: the license, `LICENSE` and the texts in `LICENSES/` it points at,
 //!   copied from the repository under the same names ([`install_license`]).
 //!
+//! On Linux the archive lays out the functions [`order::ORDER_FILE`] lists first, in its order
+//! ([`order`]).
+//!
 //! QEMU (`make qemu`) links the archive; the C API's tests link the shared library. A file whose
 //! bytes are those the tree already holds is left as it was, mtime included
 //! ([`replace_if_changed`]), so a dist of an unchanged build has QEMU's build do nothing.
@@ -31,6 +34,7 @@ mod archive;
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+pub mod order;
 #[cfg(windows)]
 mod windows;
 #[cfg(target_os = "linux")]
@@ -61,6 +65,10 @@ pub struct Options {
     pub profile: Profile,
     /// The directory the tree is written into.
     pub out: PathBuf,
+    /// The list of the library's functions Linux's archive lays out first, in its order
+    /// ([`order`]): the repository's [`order::ORDER_FILE`].
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub link_order: PathBuf,
 }
 
 /// The usage line.
@@ -97,6 +105,7 @@ pub fn parse_args(args: &[String], target_dir: &Path) -> Res<Options> {
     Ok(Options {
         profile,
         out: out.unwrap_or_else(|| target_dir.join(DEFAULT_OUT)),
+        link_order: repo_root().join(order::ORDER_FILE),
     })
 }
 
