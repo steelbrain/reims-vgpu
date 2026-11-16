@@ -1609,9 +1609,10 @@ Stages:
     `paravirtualized:<ID>`, hardware-accelerated; its own
     `ParavirtualizedVideoDecoder` and `ParavirtualizedVideoEncoder` then run
     each session as messages to the host (read from VideoToolbox and the
-    support framework, macOS 27.0.1 arm64e; [the old protocol's
-    doc](../video/devices.md) at tag `arm64-last-capable` lists the messages,
-    which Apple's VMs carry over a virtio device of their own).
+    support framework, macOS 27.0.1 arm64e). Apple's VMs carry those
+    messages over a virtio device of their own; ours carry them over the
+    device's rings, and `reims_vgpu_video::paravirt` reads and writes them
+    on the host.
     - **The guest's side is the arm64e kext's.** Where the guest took
       `RGFX_FEATURE_VT_MESSAGES` and the caps list a decoder, display 0's
       framebuffer publishes a service of that class (`RgfxVtService.hpp`),
