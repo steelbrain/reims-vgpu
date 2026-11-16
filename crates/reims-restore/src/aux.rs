@@ -275,6 +275,54 @@ pub fn put_back_policy_entries(aux: &mut [u8], restored: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Whether the newest valid NVRAM bank of `aux` holds `recovery-boot-mode` in its `system`
+/// partition. A first boot whose EACS failed leaves it there: its template migration writes it
+/// before it restarts the VM, asking the next boot for recoveryOS, and a first boot whose EACS
+/// completed leaves none **[measured, 14.6.1, 15.6.1, 26.6.2, 27.0.1 and 27.2.1, M3 Max under
+/// HVF]**.
+pub fn recovery_boot_mode(aux: &[u8]) -> bool {
+    (0..2)
+        .filter_map(|i| {
+            let b = aux.get(NVRAM_AT + i * BANK..NVRAM_AT + (i + 1) * BANK)?;
+            Some((
+                u32::from_le_bytes(b[0x14..0x18].try_into().ok()?),
+                read_bank(b)?,
+            ))
+        })
+        .max_by_key(|(g, _)| *g)
+        .is_some_and(|(_, parts)| {
+            parts
+                .iter()
+                .any(|(n, e)| n == "system" && e.iter().any(|(k, _)| k == "recovery-boot-mode"))
+        })
+}
+
+/// Adds `key=value` to the `system` partition of bank `i` (0 the newer of a restore's) of `aux`
+/// and checksums the bank again, as a guest's NVRAM write leaves it: for the tests.
+#[cfg(test)]
+pub(crate) fn add_system_entry(aux: &mut [u8], i: usize, key: &str, value: &[u8]) {
+    let bank = &mut aux[NVRAM_AT + i * BANK..NVRAM_AT + (i + 1) * BANK];
+    let parts = read_bank(bank).unwrap();
+    let mut o = COMMON_AT;
+    for (name, mut entries) in parts {
+        let len = usize::from(u16::from_le_bytes([bank[o + 2], bank[o + 3]])) * 16;
+        if name == "system" {
+            let sig = bank[o];
+            entries.push((key.to_owned(), value.to_vec()));
+            let refs: Vec<(&str, Vec<u8>)> = entries
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.clone()))
+                .collect();
+            let at = &mut bank[o..o + len];
+            at.fill(0);
+            partition(at, sig, "system", &refs);
+        }
+        o += len;
+    }
+    let sum = adler32(&bank[0x14..]);
+    bank[0x10..0x14].copy_from_slice(&sum.to_le_bytes());
+}
+
 /// Virtualization.framework's header for `aux.img`.
 pub fn vz_header() -> Vec<u8> {
     let mut h = vec![0u8; HEADER_LEN];
@@ -409,6 +457,19 @@ pub fn read_bank(bank: &[u8]) -> Option<Vec<Partition>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_boot_mode_is_read_from_the_newest_bank() {
+        let a = trimmed(&nvram(), b"a ticket").unwrap();
+        assert!(!recovery_boot_mode(&a), "a restore's NVRAM");
+        let mut failed = a.clone();
+        add_system_entry(&mut failed, 0, "recovery-boot-mode", b"unused-by-the-check");
+        assert!(recovery_boot_mode(&failed), "the newer bank holds it");
+        let mut older = a;
+        add_system_entry(&mut older, 1, "recovery-boot-mode", b"x");
+        assert!(!recovery_boot_mode(&older), "only the older bank holds it");
+        assert!(!recovery_boot_mode(&failed[..NVRAM_AT]), "no NVRAM region");
+    }
 
     fn nvram() -> Nvram {
         let mut n = [[0u8; 16]; 7];

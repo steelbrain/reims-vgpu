@@ -578,7 +578,8 @@ fn copy_sparse(from: &File, at: u64, len: u64, to: &Path, to_at: u64) -> Result<
 /// restore wrote it (EACS deleted the macOS LocalPolicy, which only the restore can sign) and the
 /// policy nonces back into NVRAM ([`aux::put_back_policy_entries`]), keeping what the guest
 /// wrote in the auxiliary storage, its keys in the ean storage among it; then removes the copies.
-/// Refuses before the guest's keystore has made its keys. A run cut short can run again.
+/// Refuses after a first boot whose EACS failed ([`aux::recovery_boot_mode`]), and before the
+/// guest's keystore has made its keys. A run cut short can run again.
 pub fn finish_eacs(dir: &Path) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
     let (isc, pre_aux) = (dir.join(EACS_ISC), dir.join(EACS_AUX));
@@ -593,6 +594,11 @@ pub fn finish_eacs(dir: &Path) -> Result<()> {
         a.len() == aux::SIZE,
         "{AUX_TRIMMED} is not {} bytes",
         aux::SIZE
+    );
+    ensure!(
+        !aux::recovery_boot_mode(&a),
+        "macOS's first boot failed to make its Data volume (its installer asked for recoveryOS): \
+         restore the VM again"
     );
     ensure!(
         aux::ean_entries(&a[aux::EAN_AT..]).is_some_and(|n| n > 1),
@@ -845,6 +851,28 @@ mod tests {
         assert_eq!(
             read_at(&d.join(DISK), t.isc().offset() + 0x1000, 17),
             b"the restore's iSC"
+        );
+        assert!(d.join(EACS_ISC).exists() && d.join(EACS_AUX).exists());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn finishing_eacs_refuses_after_a_failed_first_boot() {
+        let (d, t, n, _) = restored_for_eacs();
+        boot_by_eacs(&d, &t, &n);
+        let mut a = std::fs::read(d.join(AUX_TRIMMED)).unwrap();
+        aux::add_system_entry(&mut a, 0, "recovery-boot-mode", b"the guest's");
+        std::fs::write(d.join(AUX_TRIMMED), &a).unwrap();
+        let e = finish_eacs(&d).unwrap_err().to_string();
+        assert!(e.contains("failed to make its Data volume"), "{e}");
+        assert_eq!(
+            std::fs::read(d.join(AUX_TRIMMED)).unwrap(),
+            a,
+            "left as it is"
+        );
+        assert_eq!(
+            read_at(&d.join(DISK), t.main().offset(), 16),
+            b"the guest's Data"
         );
         assert!(d.join(EACS_ISC).exists() && d.join(EACS_AUX).exists());
         std::fs::remove_dir_all(&d).unwrap();
