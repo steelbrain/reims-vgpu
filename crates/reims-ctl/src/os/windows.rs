@@ -814,41 +814,37 @@ pub fn set_at_interrupt(flag: &'static std::sync::atomic::AtomicBool) {
 mod tests {
     use super::*;
 
-    /// A detached process holds no handle of this one's standard output: a reader of the pipe
-    /// that output is sees its end once this process closes it, not once the detached one ends.
+    /// What the stdio test runs as reims-ctl: starts a detached process that lives about 5 s,
+    /// as a start does QEMU, and returns.
     #[test]
-    fn a_detached_process_holds_no_pipe_of_this_ones_output() {
-        use std::io::Read;
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
-        use windows_sys::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE, SetStdHandle};
-        let (mut reader, writer) = std::io::pipe().unwrap();
-        // SAFETY: the pipe's write end, open until `writer` drops; this process's standard
-        // output is put back before then. nextest runs each test in a process of its own.
-        let stdout = unsafe {
-            SetHandleInformation(
-                writer.as_raw_handle(),
-                HANDLE_FLAG_INHERIT,
-                HANDLE_FLAG_INHERIT,
-            );
-            let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
-            SetStdHandle(STD_OUTPUT_HANDLE, writer.as_raw_handle());
-            stdout
-        };
-        let mut sleeper = Command::new("cmd");
-        sleeper
-            .args(["/c", "ping -n 6 127.0.0.1"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let spawned = spawn_detached(sleeper);
-        // SAFETY: as above.
-        unsafe { SetStdHandle(STD_OUTPUT_HANDLE, stdout) };
-        drop(writer);
-        spawned.unwrap();
+    fn start_a_detached_process() {
+        if std::env::var_os("REIMS_CTL_TEST_DETACH").is_some() {
+            let mut sleeper = Command::new("cmd");
+            sleeper
+                .args(["/c", "ping -n 6 127.0.0.1"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            spawn_detached(sleeper).unwrap();
+        }
+    }
+
+    /// A detached process holds no handle of its starter's standard output: a reader of the pipe
+    /// that output is, as `reims-ctl start NAME | tee`'s tee, sees its end once the starter ends,
+    /// not once the detached process does.
+    #[test]
+    fn a_detached_process_holds_no_pipe_of_its_starters_output() {
         let t = std::time::Instant::now();
-        let mut rest = Vec::new();
-        reader.read_to_end(&mut rest).unwrap();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "os::windows::tests::start_a_detached_process"])
+            .env("REIMS_CTL_TEST_DETACH", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+            "{out:?}"
+        );
         assert!(
             t.elapsed() < std::time::Duration::from_secs(3),
             "{:?}",
