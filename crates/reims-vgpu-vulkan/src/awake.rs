@@ -44,7 +44,11 @@
 //!   answered EIO, and `runtime_suspended_time` read 0 after 26 to 29 h up. Before this read, the
 //!   thread submitted there at every [`UNREAD_LOOK`] of the guest's idle, and took 0.38 to 0.53
 //!   CPU-s a pass of Geekbench 7.1.0's compute benchmark (166 s timed), against 0.03 to 0.05 on
-//!   the RX 7900 XTX, which it looks at every 1.25 s.
+//!   the RX 7900 XTX, which it looks at every 1.25 s. Measured on the Phoenix with the read, in a
+//!   pair of walks of three passes each that changed nothing else: the thread took 0.04 to 0.05
+//!   CPU-s a pass (0.40 to 0.44 without), the device's `LIBRARY_LOOKUP`s 0.047 and 0.063 s a timed
+//!   pass with the longest 35 ms (0.224 and 0.210 s, the longest 142 ms, without), and the passes
+//!   0.6 to 1.2% less wall.
 //! - **On every GPU.** No driver or GPU kind is told apart: the device's own runtime power
 //!   management, as sysfs gives it, decides. A GPU whose `control` reads anything else (`auto`, the
 //!   RX 7900 XTX's, the RX 550's, the Iris Xe's and the NVIDIA cards' on the same hosts), or that
