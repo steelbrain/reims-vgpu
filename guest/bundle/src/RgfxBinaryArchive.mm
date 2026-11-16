@@ -602,6 +602,17 @@ RGFX_LOG_UNRECOGNIZED
 	[self rgfxAdd:functionKey(fn, options)];
 }
 
++ (void)rgfxCompileVisibleFunction:(id<MTLFunction>)function descriptor:(id)descriptor archive:(id)archive
+{
+	if (![archive isKindOfClass:[RgfxBinaryArchive class]] ||
+	    ![(id)function isKindOfClass:[RgfxFunction class]])
+		return;
+	MTLFunctionOptions options = [descriptor isKindOfClass:[MTLFunctionDescriptor class]]
+	                                 ? ((MTLFunctionDescriptor *)descriptor).options
+	                                 : function.options;
+	[(RgfxBinaryArchive *)archive rgfxAddFunction:(RgfxFunction *)function options:options];
+}
+
 // Metal's archive adds a stitched library by stitching it on its device into the archive
 // (newLibraryWithStitchedDescriptor:destinationBinaryArchive:error:, measured: macOS 27), so it
 // answers what that stitch answers: NO and Metal's error for a graph Metal cannot stitch, YES for

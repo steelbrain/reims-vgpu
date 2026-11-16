@@ -255,7 +255,7 @@ functionHandleWithName: metal raises an unrecognized selector, as the AMD 5300M'
 gpuResourceID implemented
 imageblockMemoryLengthForDimensions: unsupported imageblock memory queries (not in the host's reflection)
 maxTotalThreadsPerThreadgroup implemented
-newComputePipelineStateWithAdditionalBinaryFunctions:error: unsupported binary functions
+newComputePipelineStateWithAdditionalBinaryFunctions:error: partial binary functions, where the host makes no function pointers
 newComputePipelineStateWithBinaryFunctions:error: unsupported binary functions
 newIntersectionFunctionTableWithDescriptor: unsupported ray tracing
 newVisibleFunctionTableWithDescriptor: partial function pointers, where the host makes none
@@ -431,9 +431,9 @@ argumentBuffersSupport implemented
 bufferRobustnessSupport base %base-spi
 commandBufferErrorOptions base %base-spi
 commandQueueLimit base %base-spi
-compileVisibleFunction:withDescriptor:completionHandler: partial function pointers
-compileVisibleFunction:withDescriptor:destinationBinaryArchive:error: unsupported function pointers
-compileVisibleFunction:withDescriptor:error: unsupported function pointers
+compileVisibleFunction:withDescriptor:completionHandler: partial function pointers, where the host makes none
+compileVisibleFunction:withDescriptor:destinationBinaryArchive:error: partial function pointers, where the host makes none
+compileVisibleFunction:withDescriptor:error: partial function pointers, where the host makes none
 compilerPropagatesThreadPriority: base %base-creator
 convertSparsePixelRegions:toTileRegions:withTileSize:alignmentMode:numRegions: base %base-spi
 convertSparseTileRegions:toPixelRegions:withTileSize:numRegions: base %base-spi
@@ -461,8 +461,8 @@ familyName implemented class 2 (the Macs diverge): the device name without the v
 featureProfile implemented
 featureQueries base %base-spi
 functionHandleWithBinaryFunction: unsupported function pointers
-functionHandleWithFunction: unsupported function pointers
-functionHandleWithFunction:resourceIndex: unsupported function pointers
+functionHandleWithFunction: metal raises an unrecognized selector, as the AMD 5300M's and the Intel 630's devices do, though they answer respondsToSelector: YES (measured: macOS 26.7.1, tools/oracle/oracle_binfn.m)
+functionHandleWithFunction:resourceIndex: metal raises an unrecognized selector, as the AMD 5300M's and the Intel 630's devices do, though they answer respondsToSelector: YES (measured: macOS 26.7.1, tools/oracle/oracle_binfn.m)
 genericAddressSpaceDispatchInfo base %base-spi
 getBVHBuilderLock base %base-spi
 getCompilerConnectionManager: base %base-spi

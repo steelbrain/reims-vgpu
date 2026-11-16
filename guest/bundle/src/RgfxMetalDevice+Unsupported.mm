@@ -45,12 +45,6 @@ NSError *metal4Refusal()
 
 // --- function pointers and dynamic libraries ------------------------------------------
 
-- (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function
-{
-	RGFX_UNSUPPORTED(kFunctionPointers);
-	return nil;
-}
-
 - (id<MTLFunctionHandle>)functionHandleWithBinaryFunction:(id<MTL4BinaryFunction>)function
 {
 	RGFX_UNSUPPORTED(kFunctionPointers);
@@ -268,43 +262,6 @@ NSError *metal4Refusal()
 - (id<MTLIntersectionFunctionTable>)newIntersectionFunctionTableWithDescriptor:(id)descriptor
 {
 	RGFX_UNSUPPORTED(kRayTracing);
-	return nil;
-}
-
-// Function pointers: a visible function's compile (`v40@0:8@16@24^@32`,
-// `v48@0:8@16@24@32^@40`, `v40@0:8@16@24@?32`) and a function's handle at a resource index
-// (`@32@0:8@16Q24`).
-- (void)compileVisibleFunction:(id<MTLFunction>)function
-                withDescriptor:(id)descriptor
-                         error:(NSError **)error
-{
-	RGFX_UNSUPPORTED_ERROR(error, kFunctionPointers);
-}
-
-- (void)compileVisibleFunction:(id<MTLFunction>)function
-                withDescriptor:(id)descriptor
-      destinationBinaryArchive:(id<MTLBinaryArchive>)archive
-                         error:(NSError **)error
-{
-	RGFX_UNSUPPORTED_ERROR(error, kFunctionPointers);
-}
-
-- (void)compileVisibleFunction:(id<MTLFunction>)function
-                withDescriptor:(id)descriptor
-             completionHandler:(id)completionHandler
-{
-	NSError *error = nil;
-	RGFX_UNSUPPORTED_ERROR(&error, kFunctionPointers);
-	completionHandler = [completionHandler copy];
-	RgfxRunCreation(^{
-		RgfxCallCreationHandler(completionHandler, nil, error, _cmd);
-	});
-}
-
-- (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function
-                                      resourceIndex:(NSUInteger)resourceIndex
-{
-	RGFX_UNSUPPORTED(kFunctionPointers);
 	return nil;
 }
 

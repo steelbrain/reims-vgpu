@@ -459,6 +459,41 @@ void test_function_misses()
 	CHECK(miss(vertex, binary, @[ empty ]) == nil && miss(nil, binary, @[ empty ]) == nil);
 }
 
+// The device's compile of a visible function into an archive keeps the function there, as the x86
+// Macs' archive form does (oracle_binfn, AMD 5300M and Intel 630, macOS 26.7.1), with the
+// descriptor's options, or the function's own where the descriptor is none: a visible function
+// compiled with MTLFunctionOptionCompileToBinary is then found by one made with it. Without an
+// archive, or with another device's archive or function, nothing is kept and nothing fails.
+void test_visible_compiles()
+{
+	NSError *e = nil;
+	RgfxBinaryArchive *a = archive(nil, @"arch_a", &e);
+	RgfxFunction *visible = function(@"vc_visible");
+	[visible rgfxSetFunctionType:MTLFunctionTypeVisible];
+	RgfxFunction *plain = function(@"vc_plain");
+	[plain rgfxSetFunctionType:MTLFunctionTypeVisible];
+	const MTLFunctionOptions binary =
+	    MTLFunctionOptionFailOnBinaryArchiveMiss | MTLFunctionOptionCompileToBinary;
+	MTLFunctionDescriptor *d = [MTLFunctionDescriptor functionDescriptor];
+	d.name = @"vc_visible";
+	d.options = MTLFunctionOptionCompileToBinary;
+
+	[RgfxBinaryArchive rgfxCompileVisibleFunction:visible descriptor:d archive:nil];
+	[RgfxBinaryArchive rgfxCompileVisibleFunction:visible descriptor:d archive:[NSObject new]];
+	[RgfxBinaryArchive rgfxCompileVisibleFunction:(id<MTLFunction>)[NSObject new] descriptor:d archive:a];
+	[RgfxBinaryArchive rgfxCompileVisibleFunction:nil descriptor:nil archive:a];
+	CHECK(a.keys.count == 0);
+	CHECK([RgfxBinaryArchive rgfxMissOfFunction:visible options:binary archives:@[ a ]] != nil);
+
+	[RgfxBinaryArchive rgfxCompileVisibleFunction:visible descriptor:d archive:a];
+	CHECK(a.keys.count == 1);
+	CHECK([RgfxBinaryArchive rgfxMissOfFunction:visible options:binary archives:@[ a ]] == nil);
+	// With no descriptor, the function's own options, none here: not found as a binary function.
+	[RgfxBinaryArchive rgfxCompileVisibleFunction:plain descriptor:nil archive:a];
+	CHECK(a.keys.count == 2);
+	CHECK([RgfxBinaryArchive rgfxMissOfFunction:plain options:binary archives:@[ a ]] != nil);
+}
+
 // A mesh pipeline created with MTLPipelineOptionFailOnBinaryArchiveMiss misses in every archive,
 // which holds none, naming its fragment function, or its mesh function where it has none, in the
 // x86 Macs' compiler's domain and words (oracle_mesh archive-miss*); with no archive named it is no
@@ -508,6 +543,7 @@ void rgfxArchiveTests()
 	test_archive_files();
 	test_archive_keys_and_options();
 	test_function_misses();
+	test_visible_compiles();
 	test_mesh_pipeline_misses();
 	[[NSFileManager defaultManager] removeItemAtPath:g_dir error:nil];
 }

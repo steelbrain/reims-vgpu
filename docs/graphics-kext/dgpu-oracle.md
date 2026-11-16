@@ -2539,6 +2539,37 @@ read by their keys, matched at best 10 of the 60 (m3-max-31104 and the probe abo
 a hash structure of Metal's own. Ours (`RgfxLibrary.mm`, `functionNames`) answers the given order
 reversed *(class 2: Metal's for every array of two and for some longer ones)*.
 
+## Q47: binary functions, and the device's compile of a visible function
+
+Probe: `oracle_binfn DEVICE`, 11-16, on the AMD Radeon Pro 5300M and the Intel UHD Graphics 630
+under macOS 26.7.1 (m3-max-37213 and 37214; the device's own handles and tables m3-max-37220 and
+37221). It wraps the device class's three forms of `compileVisibleFunction:withDescriptor:`, so
+each call Metal makes of them is printed. macOS 12 and 13 guests' iconservicesagent and
+`com.apple.dock.extra` send the form with an error out at start-up, from Metal's own link of
+Core Image's kernels, which the bundle answered unsupported until then (17 boots of 11-15/16).
+
+| asked | AMD | Intel |
+|---|---|---|
+| the device responds to the error, archive and handler forms | YES, YES, YES | the same |
+| `newFunctionWithDescriptor:` of a visible function with `MTLFunctionOptionCompileToBinary` | the function, options 1; Metal's library sends the error form once, with the function (options still 0) and the descriptor | the same |
+| the same of a kernel | the function, options 1; no compile sent | the same |
+| the error form, sent with a visible function and a descriptor of options 0 or 1, a nil descriptor, or a kernel | returns, the error untouched | the same |
+| the archive form, into an archive of the device | returns, the error untouched; the archive then has one key, of the function | the same |
+| the handler form | calls its handler, of one argument, with nil, on the caller's thread before it returns | the same |
+| a compute pipeline linking `binaryFunctions` (binary ones, or one made without the option) | made; the handles of its functions, dispatches through them right | the same |
+| `newComputePipelineStateWithAdditionalBinaryFunctions:error:` (a binary function, a plain one, none) | the same pipeline object each time, no error; no handle of an added function | another pipeline each time, linking the added function: its handle made, a dispatch through it right |
+| the device's `functionHandleWithFunction:` (macOS 26) and `functionHandleWithFunction:resourceIndex:` | raise an unrecognized selector, though the device responds to both | the same |
+| the device's `newVisibleFunctionTableWithDescriptor:` | a table (`GFXAAMD_MtlVisibleFunctionTable`) | a table (`MTLIGAccelVisibleFunctionTable`) |
+
+Ours (`RgfxMetalDevice.mm`, `RgfxBinaryArchive`'s `rgfxCompileVisibleFunction:descriptor:archive:`,
+`RgfxComputePipelineState.mm`), where the host makes function pointers: each compile form as the
+two Macs answer it, compiling nothing, as the host compiles a binary function where a pipeline links
+it (`test_visible_compiles`, tests/archive_tests.mm); more binary functions answer the pipeline
+itself, as the AMD's does *(class 2: the Macs diverge, and the AMD's answer makes nothing)*
+(`test_function_pointers`, tests/shell_tests.mm); the device's handles raise as the two Macs' do. The
+device's table stays unsupported: a table of the wire belongs to a pipeline
+(`FUNCTION_TABLE_CREATE`).
+
 ## Not measured
 
 - Cross-process lock waits for pending GPU work: rgk-lock's `lock_probe` (x86 matches the M3,

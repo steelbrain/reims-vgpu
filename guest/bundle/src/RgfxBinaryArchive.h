@@ -72,6 +72,22 @@ extern NSErrorDomain const RgfxBinaryArchiveMissDomain;
 /// which rgfxMissOfFunction looks up.
 - (void)rgfxAddFunction:(RgfxFunction *)fn options:(MTLFunctionOptions)options;
 
+/// The device's private compile of a visible function into `archive`
+/// (compileVisibleFunction:withDescriptor:destinationBinaryArchive:error:), whose form without an
+/// archive Metal's library sends for a function made with MTLFunctionOptionCompileToBinary and
+/// Metal's own link of Core Image's kernels sends on macOS 12 and 13 (iconservicesagent,
+/// com.apple.dock.extra). The AMD 5300M and the Intel 630 answer each form with no error whatever
+/// the function (a kernel too) and the descriptor (nil too), and the archive form adds the
+/// function to the archive (measured: macOS 26.7.1, tools/oracle/oracle_binfn.m). Nothing is
+/// compiled here: the host compiles a binary function where a pipeline links it
+/// (RGFX_LINKED_BINARY_FUNCTIONS). `archive`, where it and `function` are this device's, keeps the
+/// function as addFunctionWithDescriptor:library:error: keeps it, with the descriptor's options,
+/// or the function's own where the descriptor is no MTLFunctionDescriptor; any other archive or
+/// function is left as it is.
++ (void)rgfxCompileVisibleFunction:(nullable id<MTLFunction>)function
+                        descriptor:(nullable id)descriptor
+                           archive:(nullable id)archive;
+
 /// Metal's miss of `fn`, made by newFunctionWithDescriptor:error: with `options` and `archives`, as
 /// the AMD 5300M and the Intel 630 under macOS 26.7.1 answer it (oracle_bundle failmiss and
 /// failmiss2), nil where it is made: with MTLFunctionOptionFailOnBinaryArchiveMiss and an archive

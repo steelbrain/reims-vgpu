@@ -15820,8 +15820,9 @@ struct FunctionPointerDevice {
 // 0, and a range past its entries sets none. A handle's gpuResourceID and the pipeline's
 // functionHandleWithName: raise an unrecognized selector, as the AMD 5300M's do, but on an Apple GPU
 // a handle's gpuResourceID is 0, as the M3 Max's. A table stays NonVolatile whatever purgeable
-// state it is told, as the M3 Max's and the Intel 630's do. Where the host makes none, each is nil
-// and asks nothing.
+// state it is told, as the M3 Max's and the Intel 630's do. More binary functions answer the
+// pipeline itself, as the AMD 5300M's does. Where the host makes none, each is nil and asks
+// nothing.
 void test_function_pointers()
 {
 	Fixture fx;
@@ -15853,8 +15854,16 @@ void test_function_pointers()
 	td.functionCount = 3;
 	CHECK([cs functionHandleWithFunction:add1] == nil);
 	CHECK([cs newVisibleFunctionTableWithDescriptor:td] == nil && device.calls == 0);
+	CHECK([cs newComputePipelineStateWithAdditionalBinaryFunctions:@[ neg ] error:&err] == nil &&
+	      err.code == RgfxMetalErrorUnsupported);
 
 	fx.ser.setCarriesFunctionPointers(true);
+	// More binary functions answer the pipeline itself and ask the host nothing, as the AMD
+	// 5300M's pipeline answers (oracle_binfn, macOS 26.7.1).
+	err = nil;
+	CHECK([cs newComputePipelineStateWithAdditionalBinaryFunctions:@[ neg ] error:&err] == cs &&
+	      err == nil && device.calls == 0);
+	CHECK([cs newComputePipelineStateWithAdditionalBinaryFunctions:@[] error:&err] == cs && err == nil);
 	id<MTLFunctionHandle> h = [cs functionHandleWithFunction:add1];
 	CHECK(h != nil && device.calls == 1);
 	if (h == nil)

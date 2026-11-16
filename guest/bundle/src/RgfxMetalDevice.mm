@@ -12,6 +12,7 @@
 #include "RgfxLog.hpp"
 #include "RgfxLogOnce.hpp"
 
+#import "RgfxBinaryArchive.h"
 #import "RgfxBuffer.h"
 #import "RgfxInterop.h"
 #import "RgfxIOSurface.h"
@@ -1687,6 +1688,71 @@ RGFX_LOG_UNRECOGNIZED
 - (BOOL)supportsFunctionPointersFromRender
 {
 	return NO;
+}
+
+// The device's private compile of a visible function (`v40@0:8@16@24^@32`,
+// `v48@0:8@16@24@32^@40`, `v40@0:8@16@24@?32`), as the AMD 5300M and the Intel 630 answer it
+// (measured: macOS 26.7.1, tools/oracle/oracle_binfn.m; RgfxBinaryArchive's
+// rgfxCompileVisibleFunction:descriptor:archive:): no error, whatever the function and the
+// descriptor; the archive form keeps the function in the archive; the handler form calls its
+// handler, of one argument, with nil on the caller's thread before it returns. Metal's library
+// sends it for MTLFunctionOptionCompileToBinary, and Metal's own link of Core Image's kernels on
+// macOS 12 and 13. Where the host makes no function pointers (supportsFunctionPointers NO), each
+// answers the unsupported error as before.
+- (void)compileVisibleFunction:(id<MTLFunction>)function
+                withDescriptor:(id)descriptor
+                         error:(NSError **)error
+{
+	if (![self supportsFunctionPointers]) {
+		RGFX_UNSUPPORTED_ERROR(error, "function pointers, where the host makes none");
+		return;
+	}
+	[RgfxBinaryArchive rgfxCompileVisibleFunction:function descriptor:descriptor archive:nil];
+}
+
+- (void)compileVisibleFunction:(id<MTLFunction>)function
+                withDescriptor:(id)descriptor
+      destinationBinaryArchive:(id<MTLBinaryArchive>)archive
+                         error:(NSError **)error
+{
+	if (![self supportsFunctionPointers]) {
+		RGFX_UNSUPPORTED_ERROR(error, "function pointers, where the host makes none");
+		return;
+	}
+	[RgfxBinaryArchive rgfxCompileVisibleFunction:function descriptor:descriptor archive:archive];
+}
+
+- (void)compileVisibleFunction:(id<MTLFunction>)function
+                withDescriptor:(id)descriptor
+             completionHandler:(id)completionHandler
+{
+	NSError *error = nil;
+	if (![self supportsFunctionPointers])
+		RGFX_UNSUPPORTED_ERROR(&error, "function pointers, where the host makes none");
+	else
+		[RgfxBinaryArchive rgfxCompileVisibleFunction:function descriptor:descriptor archive:nil];
+	if (completionHandler != nil)
+		((void (^)(NSError *))completionHandler)(error);
+}
+
+// A function's handle of the device (macOS 26's functionHandleWithFunction:, and the SPI's at a
+// resource index, `@32@0:8@16Q24`): the AMD 5300M's and the Intel 630's devices raise an
+// unrecognized selector at each, answering respondsToSelector: YES (measured: macOS 26.7.1,
+// tools/oracle/oracle_binfn.m), and so does this.
+- (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function
+{
+	(void)function;
+	[self doesNotRecognizeSelector:_cmd];
+	return nil;
+}
+
+- (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function
+                                      resourceIndex:(NSUInteger)resourceIndex
+{
+	(void)function;
+	(void)resourceIndex;
+	[self doesNotRecognizeSelector:_cmd];
+	return nil;
 }
 
 - (BOOL)supportsRaytracingFromRender

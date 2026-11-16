@@ -999,7 +999,7 @@ NSError *RgfxComputeProgressError(BOOL hasProgress, NSInteger progress, BOOL has
 	                                                          serializer:_serializer]);
 }
 
-// --- unsupported: binary functions --------------------------------------------------
+// --- binary functions ----------------------------------------------------------------
 
 - (id<MTLFunctionHandle>)functionHandleWithBinaryFunction:(id<MTL4BinaryFunction>)function
 {
@@ -1007,12 +1007,20 @@ NSError *RgfxComputeProgressError(BOOL hasProgress, NSInteger progress, BOOL has
 	return nil;
 }
 
+// The pipeline itself, with no error, whatever functions it is given, as the AMD 5300M's answers
+// (measured: macOS 26.7.1, tools/oracle/oracle_binfn.m: it then has no handle of an added function).
+// The Intel 630's makes another pipeline, which links them too: the Macs diverge, and the AMD's
+// answer makes nothing. Where the host makes no function pointers, nil and the unsupported error.
 - (id<MTLComputePipelineState>)
     newComputePipelineStateWithAdditionalBinaryFunctions:(NSArray<id<MTLFunction>> *)functions
                                                    error:(__autoreleasing NSError **)error
 {
-	RGFX_UNSUPPORTED_ERROR(error, "binary functions");
-	return nil;
+	if (_serializer == nullptr || !_serializer->carriesFunctionPointers()) {
+		RGFX_UNSUPPORTED_ERROR(error, "binary functions, where the host makes no function pointers");
+		return nil;
+	}
+	(void)functions;
+	return self;
 }
 
 - (id<MTLComputePipelineState>)
