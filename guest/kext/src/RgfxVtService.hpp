@@ -7,9 +7,12 @@
  * published by it where the guest took VT_MESSAGES and the host's caps list a decoder, and
  * stopped with it.
  *
- * Its user client, RgfxVtUserClient, answers the framework's five selectors as Apple's kext of
- * the class does (AppleVideoToolboxParavirtualization.kext 15.0.0, read from the macOS 27.2.1
- * arm64e VM kernel collection; RgfxVtRoutes.hpp):
+ * Its user client, AppleVideoToolboxParavirtualizationUserClient, of the class name the guest's
+ * sandboxes let a process open (VideoToolbox's encoder and decoder XPC services' profiles and
+ * the app sandbox's name it alone, read from macOS 27's; a sandboxed process's VideoToolbox finds
+ * no paravirtual codec through a user client of another name), answers the framework's five
+ * selectors as Apple's kext of the class does (AppleVideoToolboxParavirtualization.kext 15.0.0,
+ * read from the macOS 27.2.1 arm64e VM kernel collection; RgfxVtRoutes.hpp):
  *  - 0, one scalar in, three out: sizes the client's message buffer to at least the size asked,
  *    at most RGFX_VT_MESSAGE_MAX, and answers its capacity and the process's addresses of the
  *    buffer and of its host-message queue, an IOSharedDataQueue of kRgfxVtQueueBytes;
@@ -42,7 +45,7 @@
 #include "RgfxVtRoutes.hpp"
 
 class ReimsGraphics;
-class RgfxVtUserClient;
+class AppleVideoToolboxParavirtualizationUserClient;
 
 class AppleVideoToolboxParavirtualizationDriver : public IOService {
 	OSDeclareDefaultStructors(AppleVideoToolboxParavirtualizationDriver);
@@ -59,12 +62,14 @@ public:
 	                       OSDictionary *properties, IOUserClient **handler) override;
 
 	// Selector 1: `uuid` registered for `client`; false where the routes are full.
-	bool registerUuid(const RgfxVtUserClient *client, const uint8_t *uuid);
+	bool registerUuid(const AppleVideoToolboxParavirtualizationUserClient *client,
+	                  const uint8_t *uuid);
 	// Selector 2: every registration of `uuid` for `client` let go of, and the host sent `-uui`
 	// of it where there was one.
-	void deregisterUuid(const RgfxVtUserClient *client, const uint8_t *uuid);
+	void deregisterUuid(const AppleVideoToolboxParavirtualizationUserClient *client,
+	                    const uint8_t *uuid);
 	// A client's close: each UUID it registered let go of, and the host sent `-uui` of each.
-	void deregisterAll(const RgfxVtUserClient *client);
+	void deregisterAll(const AppleVideoToolboxParavirtualizationUserClient *client);
 	// Sends the message of `length` bytes in the guest RAM runs `runs` (`count` of them) as a
 	// VT_MESSAGE, and waits for its VT_STATUS, its status into *status. Thread context only.
 	IOReturn send(const RgfxPageRun *runs, uint32_t count, uint64_t length, int32_t *status);
@@ -114,8 +119,8 @@ private:
 	uint64_t lastLend;
 };
 
-class RgfxVtUserClient : public IOUserClient {
-	OSDeclareDefaultStructors(RgfxVtUserClient);
+class AppleVideoToolboxParavirtualizationUserClient : public IOUserClient {
+	OSDeclareDefaultStructors(AppleVideoToolboxParavirtualizationUserClient);
 
 public:
 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type,

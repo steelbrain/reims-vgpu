@@ -160,7 +160,8 @@ IOReturn AppleVideoToolboxParavirtualizationDriver::newUserClient(task_t owningT
 {
 	if (type != 0 || !handler)
 		return kIOReturnBadArgument;
-	RgfxVtUserClient *client = OSTypeAlloc(RgfxVtUserClient);
+	AppleVideoToolboxParavirtualizationUserClient *client =
+	    OSTypeAlloc(AppleVideoToolboxParavirtualizationUserClient);
 	if (!client)
 		return kIOReturnNoMemory;
 	if (!client->initWithTask(owningTask, securityID, type, properties)) {
@@ -180,8 +181,8 @@ IOReturn AppleVideoToolboxParavirtualizationDriver::newUserClient(task_t owningT
 	return kIOReturnSuccess;
 }
 
-bool AppleVideoToolboxParavirtualizationDriver::registerUuid(const RgfxVtUserClient *client,
-                                                             const uint8_t *uuid)
+bool AppleVideoToolboxParavirtualizationDriver::registerUuid(
+    const AppleVideoToolboxParavirtualizationUserClient *client, const uint8_t *uuid)
 {
 	IOLockLock(lock);
 	const bool added = routes->add(uuid, client);
@@ -189,8 +190,8 @@ bool AppleVideoToolboxParavirtualizationDriver::registerUuid(const RgfxVtUserCli
 	return added;
 }
 
-void AppleVideoToolboxParavirtualizationDriver::deregisterUuid(const RgfxVtUserClient *client,
-                                                               const uint8_t *uuid)
+void AppleVideoToolboxParavirtualizationDriver::deregisterUuid(
+    const AppleVideoToolboxParavirtualizationUserClient *client, const uint8_t *uuid)
 {
 	IOLockLock(lock);
 	const bool removed = routes->remove(uuid, client);
@@ -199,7 +200,8 @@ void AppleVideoToolboxParavirtualizationDriver::deregisterUuid(const RgfxVtUserC
 		sendForget(uuid);
 }
 
-void AppleVideoToolboxParavirtualizationDriver::deregisterAll(const RgfxVtUserClient *client)
+void AppleVideoToolboxParavirtualizationDriver::deregisterAll(
+    const AppleVideoToolboxParavirtualizationUserClient *client)
 {
 	uint8_t(*held)[kRgfxVtUuidBytes] = static_cast<uint8_t(*)[kRgfxVtUuidBytes]>(
 	    IOMalloc(kRgfxVtRoutesMax * kRgfxVtUuidBytes));
@@ -298,11 +300,14 @@ void AppleVideoToolboxParavirtualizationDriver::deliver(const volatile uint8_t *
 		IOLockLock(lock);
 		const uint32_t n = routes->clientsOf(uuid, clients, kRgfxVtRoutesMax);
 		for (uint32_t i = 0; i < n; i++)
-			static_cast<const RgfxVtUserClient *>(clients[i])->retain();
+			static_cast<const AppleVideoToolboxParavirtualizationUserClient *>(clients[i])
+			    ->retain();
 		IOLockUnlock(lock);
 		for (uint32_t i = 0; i < n; i++) {
-			RgfxVtUserClient *client =
-			    const_cast<RgfxVtUserClient *>(static_cast<const RgfxVtUserClient *>(clients[i]));
+			AppleVideoToolboxParavirtualizationUserClient *client =
+			    const_cast<AppleVideoToolboxParavirtualizationUserClient *>(
+			        static_cast<const AppleVideoToolboxParavirtualizationUserClient *>(
+			            clients[i]));
 			client->deliver(delivered, length);
 			client->release();
 		}
@@ -317,11 +322,14 @@ void AppleVideoToolboxParavirtualizationDriver::deliver(const volatile uint8_t *
 	const uint32_t n = routes->count;
 	memcpy(all, routes->routes, sizeof(RgfxVtRoutes::Route) * n);
 	for (uint32_t i = 0; i < n; i++)
-		static_cast<const RgfxVtUserClient *>(all[i].client)->retain();
+		static_cast<const AppleVideoToolboxParavirtualizationUserClient *>(all[i].client)
+		    ->retain();
 	IOLockUnlock(lock);
 	for (uint32_t i = 0; i < n; i++) {
-		RgfxVtUserClient *client =
-		    const_cast<RgfxVtUserClient *>(static_cast<const RgfxVtUserClient *>(all[i].client));
+		AppleVideoToolboxParavirtualizationUserClient *client =
+		    const_cast<AppleVideoToolboxParavirtualizationUserClient *>(
+		        static_cast<const AppleVideoToolboxParavirtualizationUserClient *>(
+		            all[i].client));
 		memcpy(delivered + kRgfxVtUuidAt, all[i].uuid, kRgfxVtUuidBytes);
 		client->deliver(delivered, length);
 		client->release();
@@ -447,10 +455,11 @@ void AppleVideoToolboxParavirtualizationDriver::letGoLends()
 // MARK: - The user client
 
 #define super IOUserClient
-OSDefineMetaClassAndStructors(RgfxVtUserClient, IOUserClient);
+OSDefineMetaClassAndStructors(AppleVideoToolboxParavirtualizationUserClient, IOUserClient);
 
-bool RgfxVtUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type,
-                                    OSDictionary *properties)
+bool AppleVideoToolboxParavirtualizationUserClient::initWithTask(task_t owningTask,
+                                                                 void *securityID, UInt32 type,
+                                                                 OSDictionary *properties)
 {
 	task = owningTask;
 	service = nullptr;
@@ -484,7 +493,7 @@ bool RgfxVtUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 
 	return queueMap != nullptr;
 }
 
-bool RgfxVtUserClient::start(IOService *provider)
+bool AppleVideoToolboxParavirtualizationUserClient::start(IOService *provider)
 {
 	AppleVideoToolboxParavirtualizationDriver *owner =
 	    OSDynamicCast(AppleVideoToolboxParavirtualizationDriver, provider);
@@ -495,7 +504,7 @@ bool RgfxVtUserClient::start(IOService *provider)
 	return true;
 }
 
-void RgfxVtUserClient::letGo()
+void AppleVideoToolboxParavirtualizationUserClient::letGo()
 {
 	IOLockLock(lock);
 	const bool first = !gone;
@@ -505,7 +514,7 @@ void RgfxVtUserClient::letGo()
 		service->deregisterAll(this);
 }
 
-IOReturn RgfxVtUserClient::clientClose()
+IOReturn AppleVideoToolboxParavirtualizationUserClient::clientClose()
 {
 	letGo();
 	if (!isInactive())
@@ -513,12 +522,12 @@ IOReturn RgfxVtUserClient::clientClose()
 	return kIOReturnSuccess;
 }
 
-IOReturn RgfxVtUserClient::clientDied()
+IOReturn AppleVideoToolboxParavirtualizationUserClient::clientDied()
 {
 	return clientClose();
 }
 
-void RgfxVtUserClient::free()
+void AppleVideoToolboxParavirtualizationUserClient::free()
 {
 	if (lock)
 		letGo();
@@ -544,8 +553,8 @@ void RgfxVtUserClient::free()
 	super::free();
 }
 
-IOReturn RgfxVtUserClient::registerNotificationPort(mach_port_t port, UInt32 type,
-                                                    io_user_reference_t refCon)
+IOReturn AppleVideoToolboxParavirtualizationUserClient::registerNotificationPort(
+    mach_port_t port, UInt32 type, io_user_reference_t refCon)
 {
 	if (type != 0)
 		return kIOReturnUnsupported;
@@ -559,9 +568,9 @@ IOReturn RgfxVtUserClient::registerNotificationPort(mach_port_t port, UInt32 typ
 	return set ? kIOReturnBadArgument : kIOReturnSuccess;
 }
 
-IOReturn RgfxVtUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a,
-                                          IOExternalMethodDispatch *dispatch, OSObject *target,
-                                          void *reference)
+IOReturn AppleVideoToolboxParavirtualizationUserClient::externalMethod(
+    uint32_t selector, IOExternalMethodArguments *a, IOExternalMethodDispatch *dispatch,
+    OSObject *target, void *reference)
 {
 	if (!a || !service)
 		return kIOReturnBadArgument;
@@ -598,7 +607,7 @@ IOReturn RgfxVtUserClient::externalMethod(uint32_t selector, IOExternalMethodArg
 
 // Selector 0: the message buffer, of at least the size asked, wired and shared with the process,
 // and its runs of guest RAM, which a send's VT_MESSAGE names.
-IOReturn RgfxVtUserClient::sizeBuffer(IOExternalMethodArguments *a)
+IOReturn AppleVideoToolboxParavirtualizationUserClient::sizeBuffer(IOExternalMethodArguments *a)
 {
 	const uint64_t asked = a->scalarInput[0];
 	if (asked > RGFX_VT_MESSAGE_MAX) {
@@ -664,7 +673,7 @@ IOReturn RgfxVtUserClient::sizeBuffer(IOExternalMethodArguments *a)
 
 // Selector 3: the buffer's first `length` bytes to the host, lending it the surfaces of the IDs
 // that follow, and its status back.
-IOReturn RgfxVtUserClient::sendMessage(IOExternalMethodArguments *a)
+IOReturn AppleVideoToolboxParavirtualizationUserClient::sendMessage(IOExternalMethodArguments *a)
 {
 	const uint64_t length = a->scalarInput[0];
 	int32_t status = kRgfxVtParameterErr;
@@ -720,7 +729,7 @@ IOReturn RgfxVtUserClient::sendMessage(IOExternalMethodArguments *a)
 	return r != kIOReturnSuccess ? r : static_cast<IOReturn>(status);
 }
 
-void RgfxVtUserClient::deliver(const uint8_t *message, uint32_t length)
+void AppleVideoToolboxParavirtualizationUserClient::deliver(const uint8_t *message, uint32_t length)
 {
 	IOLockLock(lock);
 	if (!gone) {
@@ -741,7 +750,7 @@ void RgfxVtUserClient::deliver(const uint8_t *message, uint32_t length)
 	IOLockUnlock(lock);
 }
 
-void RgfxVtUserClient::deliverKept()
+void AppleVideoToolboxParavirtualizationUserClient::deliverKept()
 {
 	while (kept->getCount()) {
 		OSData *first = OSDynamicCast(OSData, kept->getObject(0));
