@@ -339,6 +339,20 @@ pub trait CommandBuffer<P: Platform>: Handle {
     /// encoders had been this one's, after this one's own; `later` is let go of uncommitted. Its
     /// encoders run nothing in either: they follow the one this fails from.
     fn fold(&self, later: P::CommandBuffer);
+    /// The platform's own, no Metal call, before the commit: `true` marks the buffer's completion
+    /// as joining the next one's of its queue, `false` takes the mark off. A marked buffer's work
+    /// may go to the GPU in one submission with the buffers of its queue committed right behind
+    /// it, the first one not marked closing it: its GPU work, its order on the queue and its GPU
+    /// times are unchanged, but it is seen complete, its handlers run and the events it signals
+    /// reach their values only once the last buffer of that submission completed. So a caller
+    /// marks only a buffer whose completion nothing observes before a later one's: a part of a
+    /// command buffer but its last that signals and waits for no event (`reims-vgpu`'s
+    /// `decode/cmdbuf.rs`). Whether the platform took the mark: `false`, the default, where it
+    /// sends each buffer on its own, as Metal sees each complete at its own end.
+    fn set_completion_joins_next(&self, joins: bool) -> bool {
+        let _ = joins;
+        false
+    }
     /// The platform's own, no Metal call: asked before the commit, the buffer's completion is
     /// exported as a sync file once it is committed ([`Self::export_completion_sync_file`]).
     /// `false` where the platform exports none, the default: the caller waits for the buffer on

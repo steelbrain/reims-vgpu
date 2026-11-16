@@ -189,6 +189,31 @@ impl CommandBuffer<FakePlatform> for Fk<kind::CommandBuffer> {
         fatal(self.act(Policy::Fatal, "fold", vec![Arg::obj(&later)]));
     }
 
+    /// Logged with `joins`, and kept on the model ([`World::joins_next`]): taken, as by the
+    /// Vulkan platform's runtime, until the buffer is committed. The fake completes a marked
+    /// buffer as told all the same; a test completes the parts as a grouped submission would.
+    ///
+    /// [`World::joins_next`]: super::super::objects::World::joins_next
+    fn set_completion_joins_next(&self, joins: bool) -> bool {
+        fatal(self.act(
+            Policy::Fatal,
+            "setCompletionJoinsNext",
+            vec![Arg::Bool(joins)],
+        ));
+        // A buffer the world holds unsubmitted still reads `NotEnqueued`, so its commit is read
+        // from the world's list.
+        let committed = self.world().committed().contains(&self.id());
+        match &mut self.state().model {
+            Model::CommandBuffer(m)
+                if m.status == CommandBufferStatus::NOT_ENQUEUED && !committed =>
+            {
+                m.joins_next = joins;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn encode_signal(
         &self,
         event: Option<EventRef<'_, FakePlatform>>,

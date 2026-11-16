@@ -1594,6 +1594,18 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         CommandBufferObject::fold(self, &later);
     }
 
+    /// The runtime's (`CommandBuffer::set_completion_joins_next`): under the exact completion
+    /// every device takes ([`crate::platform`]'s `exact_policy`), on a device whose check found
+    /// one `vkQueueSubmit` of batches that signal nothing to cost about one of its submissions,
+    /// a marked buffer's batches wait in the runtime's group for those of its queue found ready
+    /// behind them in the same pass, up to four in one kernel submission that the first unmarked
+    /// buffer closes, seen complete at its own end; the runtime announces `grouped-completion`
+    /// once per device ([`crate::answer`]). A no-op where the runtime cannot group (MoltenVK,
+    /// whose queues' failures it relays). `false` where the runtime refuses it: after the commit.
+    fn set_completion_joins_next(&self, joins: bool) -> bool {
+        self.raw.set_completion_joins_next(joins).is_ok()
+    }
+
     /// The runtime's, but once an encoder made under protection options failed it, after which
     /// Metal's GPU fires none of its signals: then sent nowhere
     /// ([`CommandBufferObject::withholds_signals`]).

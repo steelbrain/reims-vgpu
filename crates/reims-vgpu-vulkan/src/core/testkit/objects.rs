@@ -346,6 +346,10 @@ pub struct CommandBufferModel {
     /// `GPUStartTime` and `GPUEndTime` in nanoseconds, which its completed handlers learn
     /// ([`World::set_gpu_times`]); `None`, the default, for none.
     pub gpu_times_ns: Option<(u64, u64)>,
+    /// Marked to join the next command buffer's completion
+    /// (`CommandBuffer::set_completion_joins_next`), as it was last set; read by
+    /// [`World::joins_next`]. The fake completes it as told all the same.
+    pub joins_next: bool,
 }
 
 impl std::fmt::Debug for CommandBufferModel {
@@ -1447,6 +1451,16 @@ impl World {
             m.gpu_times_ns = Some((start_ns, end_ns));
         }
         true
+    }
+
+    /// Whether the command buffer `id` is marked to join the next one's completion
+    /// ([`CommandBufferModel::joins_next`]); `None` if no such live buffer.
+    pub fn joins_next(&self, id: ObjId) -> Option<bool> {
+        let h = self.find(id)?;
+        match &h.obj().state.lock().model {
+            Model::CommandBuffer(m) => Some(m.joins_next),
+            _ => None,
+        }
     }
 
     /// Completes every committed buffer successfully, in commit order.

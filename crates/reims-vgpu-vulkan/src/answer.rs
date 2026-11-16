@@ -897,21 +897,6 @@ pub fn created_or_decided<T>(
 ///   runtime announces it for none of them. Announced once per device, on the thread that lets go
 ///   of the buffer, inside its release here or on one of the runtime's as a command buffer
 ///   completes, outside every call here: it dies where it is announced;
-/// - `GroupedCompletion`: on a driver whose queue merges a submission that signals nothing into the
-///   next one (Mesa's: ANV, RADV, lavapipe), under the runtime's `CompletionPolicy::Grouped`, up
-///   to four batches of command buffers of one queue that its scheduler found ready together, or
-///   held while two or more earlier submissions of their queue ran, went to the driver in one
-///   submission, only the last signalling: each command buffer of it but the last is seen complete
-///   (its status, its completed handlers, which core's completion of the guest's work runs in, and
-///   its waits), and the event values it signals are reached, once the last completed, late by the
-///   GPU time of the batches after it, at most three, never early and in commit order, where
-///   Metal's host sees each complete at its own end. Every device here takes
-///   `CompletionPolicy::Exact` ([`crate::platform`]'s `exact_policy`), which submits each batch
-///   alone, so the runtime announces it for none of them, and a strict run on Mesa's drivers, this
-///   crate's tests among them, never dies of it. MoltenVK merges no submissions, and no fact of
-///   the hardware forces it, so a native device does not relay it. Announced once per device
-///   whatever `announce_each` asks, on the runtime's scheduler thread, outside every call here: it
-///   would die where it is announced;
 /// - `DrawDroppedUnmade`: a draw whose `VkPipeline` the driver failed to make after the draw
 ///   returned ran nothing, the command buffer running on, where Metal's draw renders, and Metal
 ///   fails the state's creation instead. Announced where the draw is recorded: in the commit, or
@@ -1324,7 +1309,7 @@ pub fn created_or_decided<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 148] = [
+pub const DIES: [rt::Degradation; 147] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1411,7 +1396,6 @@ pub const DIES: [rt::Degradation; 148] = [
     rt::Degradation::DecodedTexelPrecision,
     rt::Degradation::HeapTextureLargerThanMetal,
     rt::Degradation::HostDeallocatorDelayed,
-    rt::Degradation::GroupedCompletion,
     rt::Degradation::DrawDroppedUnmade,
     rt::Degradation::VisibilityPastEarlyMask,
     rt::Degradation::VisibilityCountPerColor,
@@ -3280,13 +3264,30 @@ mod tests {
             D::HalfOutputFastMathBlend,
             D::DeviceColorConversion,
         ];
-        // No value the guest or the host sees: `PrivatePropertiesUnknown`, Apple's private device
-        // properties the runtime has no answer of the device's for, announced where
-        // `rt::Device::private_properties` is first read, as a device's caps are. The runtime
-        // gives none there (`rt::PrivateAnswer::value` is `None`), never a value of its own, and
-        // this platform answers each of those from a stand-in its table names
-        // ([`crate::gpu::caps`]).
-        const UNSEEN: [D; 1] = [D::PrivatePropertiesUnknown];
+        // No value the guest or the host sees:
+        // - `PrivatePropertiesUnknown`, Apple's private device properties the runtime has no
+        //   answer of the device's for, announced where `rt::Device::private_properties` is first
+        //   read, as a device's caps are. The runtime gives none there
+        //   (`rt::PrivateAnswer::value` is `None`), never a value of its own, and this platform
+        //   answers each of those from a stand-in its table names ([`crate::gpu::caps`]).
+        // - `GroupedCompletion`: on a driver whose queue merges a submission that signals nothing
+        //   into the next one (Mesa's: ANV, RADV, lavapipe), up to four batches of one queue went
+        //   to the driver in one submission, only the last signalling: each command buffer of it
+        //   but the last is seen complete (its status, its handlers, its waits), and the event
+        //   values it signals are reached, once the last completed, late by the GPU time of the
+        //   batches after it, at most three, never early and in commit order. Every device here
+        //   takes `CompletionPolicy::Exact` ([`crate::platform`]'s `exact_policy`), under which the
+        //   runtime groups only the batches of a command buffer marked to join the next
+        //   (`CommandBuffer::set_completion_joins_next`, the platform's own call, no Metal one)
+        //   and closes the group with the first unmarked one behind them, seen complete at its
+        //   own end. The graphics lane marks only a guest command buffer's parts before its last
+        //   that signal and wait for no event (`reims-vgpu`'s `decode/cmdbuf.rs`), whose
+        //   completions nothing reads but its last part's, which makes the guest's record of the
+        //   whole: the guest sees its command buffer complete at its last part's own end, as
+        //   before. Announced once per device whatever `announce_each` asks, on the runtime's
+        //   scheduler thread, outside every call here: relayed there, in strict mode too, where a
+        //   kind of [`DIES`] would end the process at the first grouped submission.
+        const UNSEEN: [D; 2] = [D::PrivatePropertiesUnknown, D::GroupedCompletion];
         let relayed: Vec<D> = exact
             .chain(one_of_metals)
             .chain(PRECISION)
@@ -3313,10 +3314,9 @@ mod tests {
         // device's maths
         // and sampling, each with its bound or the runtime's record of it, the notes of the
         // runtime's native defaults off Apple's GPUs last, the device's resolve
-        // (`DeviceRoundedResolve`) among them. With these, and every device on the exact
-        // completion (`GroupedCompletion` never announced), a strict run on Mesa's drivers, this
-        // crate's tests on Linux among them, dies neither at a grouped submission nor at a
-        // resolve the device averages.
+        // (`DeviceRoundedResolve`) among them. With these, a strict run on Mesa's drivers, this
+        // crate's tests on Linux among them, dies at no resolve the device averages; nor at a
+        // grouped submission, which is relayed (`GroupedCompletion`, above).
         let natively: Vec<D> = native::NATIVE_RELAYED.iter().map(|r| r.kind).collect();
         assert_eq!(
             natively,
@@ -3367,10 +3367,10 @@ mod tests {
         // class of the device's own maths and sampling covers them: two precision notes
         // are other values, not other bits, the next two are where Apple's compiler places or
         // speculates an operation, Metal's rule for tessellation factors is not read, blending,
-        // storage, an attachment's memory read in place, a
-        // pass's tile store and when a command buffer is seen complete are neither maths nor
-        // sampling, the anisotropic emulation is a fitted model, and the band's corners are the
-        // runtime's own, whose snap to Metal's grid the hardware allows (`DeviceSubpixelSnap`).
+        // storage, an attachment's memory read in place and a pass's tile store are neither maths
+        // nor sampling, the anisotropic emulation is a fitted model, and the band's corners are
+        // the runtime's own, whose snap to Metal's grid the hardware allows
+        // (`DeviceSubpixelSnap`).
         for kind in [
             D::TessellationFactorInstance,
             D::Fp8Value,
@@ -3385,7 +3385,6 @@ mod tests {
             D::TessellationFactorEdgeCases,
             D::SnormMinimumKept,
             D::SharedExponentKept,
-            D::GroupedCompletion,
             D::DeviceSubpixelSnap,
         ] {
             assert!(DIES.contains(&kind) && !native::relayed(kind), "{kind:?}");

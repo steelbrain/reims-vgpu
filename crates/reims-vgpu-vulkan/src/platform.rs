@@ -568,7 +568,11 @@ pub const EXACT_ALL: &str = "all";
 /// submissions for no shorter run (174.6 s against 172.6 exact on the 780M, 136.0 against 136.1 on
 /// the XTX), seeing command buffers complete up to 60 and 17.5 ms after their own GPU end (2.9 and
 /// 3.6 ms exact). Nor did it buy frame rate in a guest's drag on the Iris Xe (15.7 to 17.3 frames a
-/// second, against 16.4 to 17.6 exact). So no switch takes it. Its heap
+/// second, against 16.4 to 17.6 exact). So no switch takes it. Under it the runtime groups only a
+/// command buffer its caller marks to join the next (`CommandBuffer::set_completion_joins_next`),
+/// with the batches found ready behind it, the first unmarked one closing the group and seen
+/// complete at its own end: the graphics lane marks a guest command buffer's parts before its
+/// last, whose completions the guest never sees ([`crate::answer`], `GroupedCompletion`). Its heap
 /// compression is the runtime's default (`HeapCompressionPolicy::Compressed`), which no name of
 /// [`EXACT_FORMS`] changes: on a driver whose compressed images may keep their texels apart from
 /// their bytes (ANV), a heap's colour texture that Metal keeps losslessly compressed, in a heap
